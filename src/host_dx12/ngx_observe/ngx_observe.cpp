@@ -603,7 +603,13 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
             in.mv_scale_x = ep.mv_scale_x;
             in.mv_scale_y = ep.mv_scale_y;
             in.reset = ep.reset == 0xFFFFFFFFu ? 0 : ep.reset;
-            in.depth_inverted = 0; // TLOU I: non-inverted (A13); other titles: read create flags later
+            // Argon audit #4.3: depth inversion from the DLSS create flags (1<<3), as for FG.
+            uint32_t nflags = ep.create_flags;
+            if (nflags == 0xFFFFFFFFu) {
+                std::lock_guard<std::mutex> lock(g_confirm_m);
+                nflags = g_feature_flags.Get(reinterpret_cast<uint64_t>(game_handle));
+            }
+            in.depth_inverted = nflags != 0xFFFFFFFFu && (nflags & 0x8u) ? 1u : 0u;
             na::nr::OnEvaluate(list, in);
         }
         if (motion && ep.valid && r >= 0) {
