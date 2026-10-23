@@ -1,3 +1,5 @@
+> **2026-10-23: start with MASTER-PLAN.md (your task queue) and COMMS.md (message board with Claude). Also follow CLAUDE.md (branch/commit/push rules apply to every agent). The text below is the September original, kept for history.**
+
 # NeuralAliasAbundance working rules
 
 Read HANDOFF.md and WORKLOG.md before continuing. This is a separate DX12 project, not the Alien/ReShade project. Preserve the original installation and source independently.

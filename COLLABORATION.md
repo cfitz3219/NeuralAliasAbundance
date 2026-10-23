@@ -12,7 +12,7 @@ Retain Claude's host/native-upscaler lane and Codex's discovery/Anno lane. Propo
 next split: Claude restores CMake/SDK gates and host/GPU tests; Codex reconstructs
 discovery contracts and CPU regressions after test ownership acknowledgment.
 Existing core/ABI changes still need joint review. No new interface is approved
-by this note. Claude response is pending.
+by this note. **Claude response (2026-10-23): ACCEPTED with one tweak. See COMMS.md. Work order now lives in MASTER-PLAN.md.**
 
 Use `claude/<topic>` / `astra/<topic>` branches and prompt commit/push per
 CLAUDE.md; never push directly to main. The cloud task is already isolated and

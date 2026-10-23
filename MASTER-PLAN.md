@@ -1,0 +1,105 @@
+# NeuralAliasAbundance: master plan
+
+**Written by:** Claude, 2026-10-23, at Cort's direction. Incorporates Codex/Astra's recovery review (`docs/CLAUDE-HANDOFF.md`) and roadmap (`docs/INPUT-ACQUISITION-ROADMAP.md`).
+**Audience:** Claude, Astra (Codex), and Cort.
+**Status:** ACTIVE. This is the single source of truth for *what* gets built, *by whom*, and *in what order*.
+
+> **Goal:** one injector that obtains everything DLSS needs (scene color, depth, motion vectors, jitter, camera) from as many DX12 games as possible **without per-game code**, falling back safely when it can't.
+> "Every game, no matter what" isn't a literal acceptance test. Kernel anti-cheat titles and engines that never compute depth are out of reach. We measure progress as a growing list of games where it works, and we keep the unsupported cases explicit.
+
+---
+
+## 1. How we work (read this first)
+
+| Rule | Detail |
+|---|---|
+| **Build mode now** | Cort's direction: **both agents build, nobody reviews yet.** Don't block on the other agent. Don't edit the other agent's files. |
+| **Review gate before testing** | At the end of each phase, before any Windows/GPU/game test session: **Claude reviews every Astra PR, Astra reviews every Claude PR.** Fixes land, then Cort runs the tests. |
+| **Order** | Work your tasks **top to bottom**. Phases go from *already proven possible* → *hard*. Don't start a later phase's task while an earlier task of yours is open, unless it's blocked (say so in COMMS.md). |
+| **Branches** | Claude → `claude/<task-id>-<topic>`, Astra → `astra/<task-id>-<topic>`. One branch per task. Commit and push when each task is done. Open a PR into `main` (it waits for the review gate). |
+| **Coordination files on `main`** | `MASTER-PLAN.md`, `COMMS.md`, `COLLABORATION.md` and `HANDOFF.md` may be edited **directly on `main`** (pull/rebase first, small commits, never force-push). Everything else goes through a branch + PR. |
+| **Talking to each other** | `COMMS.md` only. Append-only, newest at the bottom. Questions, blockers, "done" notices, interface requests. |
+| **Shared interfaces** | ABI 0.1 (`host_observe.h`) and `src/core/` stay frozen. Changes need a numbered proposal in COLLABORATION.md plus an ack from the other agent in COMMS.md. |
+| **Never commit** | NVIDIA SDK headers/libs/DLLs, game files, captures, `local/`. |
+| **Done means** | The task's "Done when" line is met on CI (Linux/Windows build) **or** clearly marked "needs Windows GPU" for the test session. No placeholder tests that pass by doing nothing. |
+
+### File ownership
+
+| Path | Owner |
+|---|---|
+| `CMakeLists.txt` (root), `build.ps1`, `.github/workflows/` | **Claude** (single editor) |
+| `src/host_dx12/**`, `src/runtime/**`, `src/app/**`, `tools/**`, `scripts/deploy-*` | **Claude** |
+| `tests/host/**` (GPU/host/proxy tests + stubs) | **Claude** |
+| `src/providers/discovery/**`, `src/providers/classifier/**`, `src/providers/camera/**`, `profiles/**` | **Astra** |
+| `tests/cpu/**` including `tests/cpu/CMakeLists.txt` (pulled in by root via `add_subdirectory`) | **Astra** |
+| `tests/fixture/**` (ground-truth scene) | **Astra** |
+| `src/core/**`, `host_observe.h` | **Frozen. Joint proposal required** |
+| `docs/` | Each agent edits its own docs; shared docs by proposal |
+
+---
+
+## 2. The plan
+
+Legend: **C** = Claude task, **A** = Astra task, **J** = joint task (the split is written inside it). Effort is rough engineering time.
+
+### PHASE 1: Get the foundation compiling and tested *(most important; all known-possible)*
+
+| ID | Owner | Task | Done when | Effort |
+|---|---|---|---|---|
+| **C1** | Claude | **Reconcile CMake.** Add targets for all 17 unbuilt `.cpp` files with correct deps and SDK feature gates (`NA_HAVE_NGX_SDK`, NVAPI, NVOF, PCL). Every SDK is optional: missing SDK = feature compiled out, build stays green. Add `add_subdirectory(tests/cpu)` and `tests/host`. | Configures and builds on Windows/MSVC with **no** NVIDIA SDKs present; feature gates logged. | 1–2 d |
+| **C2** | Claude | **CI.** GitHub Actions `windows-latest`: configure + build Release + run CTest excluding label `gpu`. Linux job compiles the portable core + CPU tests with GCC. | Green CI on every push/PR. | 0.5 d |
+| **A1** | Astra | **CPU regression tests** in `tests/cpu/`: frame_contract, temporal_jitter, frame_history, upload_cache, size_confirm, motion_arbiter (CPU tiers), host_observe framing/ABI static checks. Own `tests/cpu/CMakeLists.txt`. Label each test "reconstructed 2026-10" in a header comment. | Tests compile on GCC + MSVC and test real behavior, including invalid-input and loss cases. | 1–2 d |
+| **C3** | Claude | **Host/GPU tests** in `tests/host/`: hooking, capture, gpu_timing, ngx_observe + `ngx_stub`, ngx_params, ngx_optimal, overlay, proxy, sl_proxy + `sl_stub`, `dx12_fixture`. Labeled `gpu` where needed. | Build on CI; marked "needs Windows GPU" for the test session. | 2–3 d |
+| **C4** | Claude | **Fix R-001** (Astra's finding): GPU timestamp slots need a completion fence, no Present-count readiness, no reuse before completion; frequency taken from the executing queue. Regression test delays completion past 3 Presents. | Test in C3 covers it. | 0.5 d |
+| **A2** | Astra | **Discovery contract reconstruction.** From ABI 0.1 + code comments, write `src/providers/discovery/CONTRACT.md`: what the consumer receives, what's known/ambiguous/lost (B-003…B-007). List the host data the classifier will need (feeds C7/C8). | Doc pushed; requirements posted in COMMS.md for Claude. | 1 d |
+| **C5** | Claude | **Restore deploy scripts**: `scripts/generate-sl-proxy-def.ps1`, `scripts/deploy-sl-proxy.ps1` (manifest + SHA-256 + rollback). Also `tools/nr_replay.cpp` (local-only). | Scripts dry-run cleanly; documented. | 1 d |
+
+**REVIEW GATE 1 → then Windows test session 1:** full `build.ps1` with GPU tests on Cort's RTX 5070 Ti, plus a TLOU re-check that the NeuralAlias menu and DLAA takeover still work.
+
+### PHASE 2: Restore what already worked, and widen the easy coverage *(known-possible; big payoff)*
+
+| ID | Owner | Task | Done when | Effort |
+|---|---|---|---|---|
+| **C6** | Claude | **Generic "feed DLSS" backend.** Our own NGX init + DLSS-SR/DLAA feature creation + evaluate from a filled `FrameContract`. Independent of any game. Proven on the DX12 fixture first. Everything in Phases 3–4 plugs into this. | Fixture frames → DLSS output on GPU; matches an expected-quality check. | 2–4 d |
+| **A3** | Astra | **Ground-truth fixture v2** (`tests/fixture/`): camera pans, independently moving objects, animated geometry, disocclusions, transparency, HUD, camera cuts. Known depth/motion/jitter/camera for every pixel. This is the yardstick for every Phase 3 algorithm. | Fixture emits frames + truth files; CPU checker compares candidates against truth. | 2–4 d |
+| **C7** | Claude | **FSR 2/3 and XeSS call interception.** Many DX12 games without DLSS still pass labeled color/depth/motion/jitter to FSR or XeSS. Intercept those calls and route the inputs into C6. Largest coverage gain for the least risk (approach proven by community tools; GPL code = reference only, no copying). | One FSR game and one XeSS game observed with valid inputs (test session). | 4–8 d |
+| **A4** | Astra | **Upscaler detection report.** On injection, report which path a game offers: native DLSS / FSR / XeSS / none, with the evidence. Show it as an overlay status line through the existing menu API (`na::menu::Register`). | Overlay shows the detected route and why. | 1–2 d |
+
+**REVIEW GATE 2 → test session 2:** fixture DLSS, plus FSR/XeSS games.
+
+### PHASE 3: Universal discovery, the brain *(harder; core of the goal)*
+
+| ID | Owner | Task | Done when | Effort |
+|---|---|---|---|---|
+| **C8** | Claude | **Host capture H2:** PSO identity (hash at creation), per-pass render-target/SRV/UAV/DSV bindings, resource use order per command list, root constants. Delivered as new event kinds per A2's requirements (ABI minor bump, proposed first). | Events validated against the fixture's known passes. | 3–5 d |
+| **C9** | Claude | **Host capture H3:** upload/constant-buffer content snapshots at submission time (copy, never synchronous readback), labeled `app-sync-unknown`. Needed for camera matrices and jitter. | Fixture camera matrices appear in snapshots. | 2–4 d |
+| **A5** | Astra | **Signal classifier: depth + scene color (pre-HUD).** Score candidates by format, write order, clear values, value distribution, extent, pass position. Output a confidence and a reason for each. **Verify before trust** (e.g. depth must be consistent with the camera, color must contain no HUD). | ≥95% correct on fixture v2; never claims confidence on a wrong buffer. | 4–8 d |
+| **A6** | Astra | **Camera + jitter finder.** Find projection and view matrices in H3 snapshots (structure tests: perspective form, near/far, frame-to-frame continuity), detect existing jitter, detect camera cuts. | Matches fixture truth; detects cuts. | 4–8 d |
+| **A7** | Astra | **Motion-vector finder.** Identify existing MV buffers (2-channel float, ~0 when static, verified by warping the previous frame onto the current one). | Correct on fixture; no false positives. | 2–4 d |
+| **A8** | Astra | **Auto-profiles.** Once a game's layout is confirmed, save it per exe hash in `profiles/` so the next launch is instant. Invalidate on mismatch. Hand-written adapters (TLOU) become overrides. | Second launch of a fixture "game" skips discovery. | 1–2 d |
+| **A9** | Astra | **Anno 1800 diagnostics-only report:** which inputs were found, their confidence, and the unknowns. No reconstruction yet. | Report from a test session. | 1–2 d |
+
+**REVIEW GATE 3 → test session 3:** classifier output in Anno plus one more DLSS-less game.
+
+### PHASE 4: The hard parts *(save for last)*
+
+| ID | Owner | Task | Done when | Effort |
+|---|---|---|---|---|
+| **C10** | Claude | **Live motion arbiter.** Wire Tier 2 (camera reprojection from A6's matrices + A5's depth) and Tier 3 (live optical flow, A52, already in code) into the frame contract, with per-pixel provenance. | Fixture motion error within budget; provenance visible. | 3–6 d |
+| **J1** | Joint | **Jitter injection into games that never jittered.** Astra (A6) supplies *where* the projection lives and its convention. Claude writes the host-side injection (modify the matrix in the H3 upload path before submission) and keeps UI/shadow cameras untouched. | Fixture + Anno render with our jitter sequence; HUD unaffected. | 1–2 wk |
+| **C11** | Claude | **Output replacement under the HUD.** Insert DLSS output at the pre-HUD stage found by A5 and composite the HUD back on top. Fallback to the Present-stage path when the stage is uncertain. | No HUD smearing in test session. | 3–6 d |
+| **J2** | Joint | **MILESTONE: DLAA in a game that never had DLSS (Anno 1800)** at native resolution (no resolution change, which skips the hardest problem). | Cort sees DLAA working in Anno. | integration |
+| **J3** | Joint | **True upscaling (render-resolution control)** for DLSS-less games: make the engine render smaller while UI/post stay at display size. Per engine family. Astra: find the resolution control points. Claude: host patching + restore on disable. | First engine family works at Quality/Performance. | weeks |
+| **J4** | Joint | **Tier 1 motion vectors via DXIL patching** (research). Only after J2. | Research report + prototype. | weeks |
+
+**REVIEW GATE 4 → test session 4.**
+
+### On hold (exists in code, not blocking the goal)
+Frame Generation, Neural Rendering, Ray Reconstruction, Reflex/latency. Keep compiling; no new work until J2 ships.
+
+---
+
+## 3. Open questions for Cort
+1. **NVIDIA SDKs:** do you still have the DLSS/NGX SDK, NVAPI, Optical Flow SDK and Reflex/PCL locally after the crash, or do we re-download them (free NVIDIA developer account)? Needed by test session 1.
+2. **Games for testing:** TLOU Part I (native DLSS) and Anno 1800 (none). We also need **one FSR game and one XeSS game** you own for Phase 2.
+3. **Windows test host:** your desktop (RTX 5070 Ti). Confirm Visual Studio + CMake are reinstalled.
