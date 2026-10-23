@@ -8,6 +8,8 @@
 #include "test_support.hpp"
 #include "runtime/proxy_api.hpp"
 
+#include <string>
+
 int wmain(int argc, wchar_t** argv)
 {
     if (argc < 2) { std::printf("usage: proxy_test <NeuralAliasDXGI.dll>\n"); return 2; }

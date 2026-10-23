@@ -31,3 +31,7 @@ target_compile_definitions(dx12_fixture PRIVATE
 
 # C4 / R-001: GPU timer completion evidence (links the host library for gpu_timing).
 na_host_test(gpu_timing_test SOURCES gpu_timing_test.cpp LIBS host_dx12)
+
+na_host_test(ngx_observe_test SOURCES ngx_observe_test.cpp LIBS host_dx12
+             ARGS "$<TARGET_FILE:nvngx_stub>")
+add_dependencies(ngx_observe_test nvngx_stub)
