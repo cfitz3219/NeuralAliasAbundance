@@ -49,3 +49,14 @@ the current 74 source/shader files are unchanged from that baseline. Recompiled
 the two portable core implementations from Claude's actual checkout with the
 same strict flags successfully. Tracked source, shaders, third-party files,
 CMake and build.ps1 are unchanged. Documentation whitespace checks passed.
+
+## 2026-10-23 — Universal DX12 goal and Argon audit response
+
+Read the attached Argon audit following Cort's explicit direction. Removed the
+roadmap's dismissive universal-coverage acceptance framing and the older plan's
+all-game premise; updated current guidance to universal DX12 acquisition through
+active discovery, hypothesis testing and synthesis. Added C-001/M-002 and frame
+contract proposals, distinguishing measured evidence from the audit's numerical
+and exactness claims. R-101/R-104 remain fixed in their existing PRs. No production
+or ABI changes, no runtime tests claimed. Reviewed documentation links and diff
+whitespace. Recovery originals remain untouched for hash/provenance verification.

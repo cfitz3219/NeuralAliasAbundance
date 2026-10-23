@@ -18,9 +18,15 @@ Revised planning estimates for this narrower experiment: 2–4 hours to inspect 
 
 Build a separate, standalone DX11 enhancement framework with its own loader, settings window, diagnostics and optional rendering backends. Reuse the verified parts of NeuralAlias, but make Alien: Isolation an optional adapter rather than a requirement.
 
-This is possible. Automatically providing correct DLAA, DLSS Super Resolution and neural rendering in **every DX11 game** is not a defensible promise. DX11 standardizes how a game submits graphics work; it does not label which image contains motion, which matrix describes the main camera, or where the game draws its HUD. Supporting many games requires a common framework plus adapters—small modules that explain a particular engine's rendering layout.
+Current direction (2026-10-23): build a universal DX12 injector through automatic
+input discovery, convention testing, reconstruction and synthesis. The September
+DX11 architecture below is historical background. Semantic labels accelerate
+acquisition; when absent, the injector tests candidates against geometric,
+photometric and temporal evidence. See [the current acquisition roadmap](INPUT-ACQUISITION-ROADMAP.md).
 
-The product promise should be: **one independent tool, broad DX11 compatibility, explicitly tested features per game, and an expandable adapter system.** Loading successfully and enhancing correctly must be reported separately.
+Track implemented features and measured game coverage as milestones toward that
+goal. Engine adapters can accelerate progress while automatic discovery and
+profiles generalize the same capabilities across games.
 
 ## What standalone means
 

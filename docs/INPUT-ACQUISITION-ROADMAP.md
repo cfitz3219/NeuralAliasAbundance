@@ -1,23 +1,26 @@
-# Broad DX12 input acquisition
+# Universal DX12 input acquisition
 
-2026-10-23 — Codex proposal for joint review. This is an engineering roadmap,
-not implemented coverage or a promise that every DX12 game can be supported.
+2026-10-23 — revised following Cort's direction and Argon's architectural audit.
+Universal DX12 DLSS injection is the engineering goal and working design premise.
+This roadmap describes the architecture to build; coverage reports describe what
+has been implemented and measured so far.
 
-## Goal and limits
+## Goal and approach
 
-Build one injector with reusable observation, acquisition and validation layers,
-then engine/game profiles that supply the semantics DirectX does not describe.
-Aim to reduce the work needed per title. Measure coverage against an explicit
-game/build/feature matrix instead of counting algorithms or successful DLL loads.
+Build one injector that obtains or synthesizes the inputs DLSS needs across DX12
+games, without requiring hand-written per-game code. Automatically learned
+profiles cache verified discoveries; adapters can accelerate acquisition.
+Treat each missing input as a discovery or reconstruction task. Continue searching
+and testing alternatives while the original rendering path keeps the game usable.
 
-In-process hooks can observe resources, commands, shaders and accessible game
-state even when a game exposes no public integration API. They cannot guarantee
-recovery of an input that was never calculated or preserved. For example, depth
-and camera matrices recover static-scene camera motion, but not previous bone
-poses for arbitrary animated objects. Two images can also admit multiple depth
-and motion explanations. Estimates remain estimates, even when a neural model
-produces plausible results. Full SR requires controlling actual scene rendering
-resolution; shrinking a finished image does not save its original rendering cost.
+Use a closed-loop process: enumerate candidates, hypothesize conventions, evaluate
+geometric and photometric consistency, synthesize missing signals, then measure
+reconstruction quality. DX12 resources and passes provide observations even when
+the game supplies no semantic labels. Where the engine does not retain a needed
+signal, pursue reconstruction, temporal estimation or shader instrumentation.
+Maintain source and confidence metadata so the next stage can improve the result.
+True upscaling also requires engine render-resolution control; input acquisition
+and render-resolution control are both parts of the universal architecture.
 
 ## Acquisition methods to evaluate
 
@@ -31,13 +34,40 @@ resolution; shrinking a finished image does not save its original rendering cost
 | Hardware/classical optical flow and learned motion research | Estimated screen-space correspondence | Direction/scale, occlusion confidence, lighting changes, transparency, HUD contamination, latency and GPU cost |
 | Learned depth/camera or other image-based reconstruction research | Approximate inputs where native evidence is absent | Temporal consistency and measured downstream quality; never label inferred geometry as engine ground truth |
 
-Start with the recovered motion-arbitration design instead of building another
-competing fallback: trustworthy engine vectors first, camera reprojection next,
-then qualified camera-relative optical-flow residuals. The surviving contract
-explicitly rejects a residual-only fallback when camera motion is unavailable.
-Do not silently change it to make unsupported frames look supported. Preserve
-per-pixel provenance and invalid masks; a zero vector is not proof of no motion.
-Any standalone raw-flow fallback is a separate proposal with its own tests.
+## Closed-loop discovery and synthesis
+
+1. Enumerate depth, scene-color, motion and constant-buffer candidates using
+   formats, bindings, pass topology, clear boundaries and submission history.
+   Preserve main-scene depth before a later clear and scene color before HUD
+   composition, including separate UI targets and compute composition.
+2. Test matrix layout, depth direction, motion direction, axis signs, units,
+   jitter and camera-origin conventions explicitly. The search space depends on
+   the candidate; it is not a fixed eight permutations. Camera-relative rendering
+   requires testing origin deltas alongside matrices.
+3. Compare candidate warps against an unwarped baseline over multiple frames and
+   independently sampled regions. Combine photometric error with depth consistency,
+   visibility, texture support and separation from competing hypotheses. Handle
+   exposure changes, animation, disocclusion and repeated textures; low error is
+   evidence to accumulate, not a uniqueness proof. Ambiguous candidates trigger
+   further observations and experiments.
+4. Reconstruct static-scene motion from qualified depth and camera transforms.
+   Investigate camera estimation from depth and flow using robust fitting, with
+   degeneracy detection and held-out validation. Use independently verified
+   rotation-only motion for sky/background regions; clear depth alone does not
+   establish that a pixel is a skybox.
+5. Fuse optical flow where independently moving content needs it, using a
+   disagreement/visibility mask. Luma or depth disagreement can also arise from
+   lighting, occlusion or bad calibration, so it is a candidate mask rather than
+   proof of object motion. Evaluate raw de-jittered flow as a distinct fallback
+   when camera motion is still being acquired, with explicit provenance and
+   downstream quality checks.
+6. Save validated conventions and layout evidence in automatic profiles;
+   requalify after changes and resume discovery when confidence drops.
+
+The recovered arbiter currently accepts camera-relative flow residuals. Extend
+its contract with distinct raw-flow and background-motion inputs rather than
+misinterpreting residuals as complete motion. Proposed changes and test criteria
+are in [the audit response](UNIVERSAL-DX12-AUDIT-RESPONSE.md).
 
 ## Common evidence model
 
@@ -90,5 +120,6 @@ reconstruction have additional contracts and should not block the first recovere
 DLAA/SR pipeline. Source files for them are not evidence of qualified support.
 
 The next milestone is a working, measured pipeline for two different acquisition
-routes. A claim about **any** DX12 game is not an achievable acceptance test;
-expand demonstrated coverage and keep unsupported cases explicit.
+routes. Universal coverage remains the goal. Expand the game/build/feature matrix
+and adversarial fixtures at each milestone; turn every coverage gap into a
+tracked acquisition, synthesis or integration task with a measurable experiment.
