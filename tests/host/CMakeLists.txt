@@ -49,3 +49,10 @@ na_host_test(capture_test SOURCES capture_test.cpp LIBS host_capture
              ARGS "${CMAKE_CURRENT_BINARY_DIR}/capture-test-out")
 
 na_host_test(overlay_test SOURCES overlay_test.cpp LIBS host_dx12 user32)
+
+# Parameter-object tests need the NVIDIA NGX SDK headers (local SDK folder, or
+# the CI job that fetches the public DLSS repo's headers at build time).
+if(NA_HAVE_NGX_SDK)
+  na_host_test(ngx_params_test SOURCES ngx_params_test.cpp LIBS host_dx12)
+  na_host_test(ngx_optimal_test SOURCES ngx_optimal_test.cpp LIBS host_dx12)
+endif()

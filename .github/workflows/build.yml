@@ -69,6 +69,52 @@ jobs:
             build/Release/*.dll
           if-no-files-found: warn
 
+  windows-sdk:
+    name: Windows x64 (MSVC) with public NVIDIA SDK headers
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch public NVIDIA headers (never committed; COLLABORATION.md rule 5)
+        shell: pwsh
+        run: |
+          # DLSS/NGX SDK headers from github.com/NVIDIA/DLSS (pinned tag) and
+          # pclstats.h from Streamline. Optical Flow 5 headers are not public, so
+          # that gate stays off here (covered in Cort's local builds).
+          git clone --quiet --depth 1 --branch v310.9.16 --filter=blob:none --sparse https://github.com/NVIDIA/DLSS sdk-src/dlss
+          git -C sdk-src/dlss sparse-checkout set include
+          git clone --quiet --depth 1 --branch v2.14.16 --filter=blob:none --sparse https://github.com/NVIDIA-RTX/Streamline sdk-src/sl
+          git -C sdk-src/sl sparse-checkout set --no-cone /source/plugins/sl.pcl/pclstats.h
+          New-Item -ItemType Directory -Force sdk/nvidia-dlss-sdk, sdk/pclstats | Out-Null
+          Copy-Item -Recurse sdk-src/dlss/include sdk/nvidia-dlss-sdk/
+          Copy-Item sdk-src/sl/source/plugins/sl.pcl/pclstats.h sdk/pclstats/
+      - name: Configure
+        run: cmake -S . -B build -A x64 -DNA_SDK_ROOT="${{ github.workspace }}/sdk"
+      - name: Build Release
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --parallel 2>&1 | Tee-Object -FilePath build-log.txt
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            Select-String -Path build-log.txt -Pattern ': (fatal )?error [A-Z]+[0-9]+|error MSB|LINK : fatal' |
+              Select-Object -First 40 | ForEach-Object {
+                $m = ($_.Line -replace '^\s+','') -replace '\[[^\]]*\.vcxproj\]',''
+                Write-Output "::error::$m"
+              }
+          }
+          exit $code
+      - name: Test (everything not labelled gpu)
+        shell: pwsh
+        run: |
+          Select-String -Path build/CMakeCache.txt -Pattern '^NA_(SDK_ROOT|NGX_SDK_INCLUDE|PCL_INCLUDE|NVOF_INCLUDE)' | ForEach-Object { Write-Output "::notice::$($_.Line)" }
+          ctest --test-dir build -C Release --output-on-failure -LE gpu 2>&1 | Tee-Object -FilePath ctest-log.txt
+          $code = $LASTEXITCODE
+          Select-String -Path ctest-log.txt -Pattern 'Test +#\d+: .*(Passed|Failed|Skipped|Not Run|\*\*\*)|tests passed|tests failed' |
+            Select-Object -First 45 | ForEach-Object {
+              $l = $_.Line.Trim()
+              if ($l -match 'Failed|\*\*\*Exception|Not Run|tests failed') { Write-Output "::error::$l" } else { Write-Output "::notice::$l" }
+            }
+          exit $code
+
   linux:
     name: Linux (GCC) portable core + CPU tests
     runs-on: ubuntu-latest
