@@ -99,7 +99,7 @@ Frame Generation, Neural Rendering, Ray Reconstruction, Reflex/latency. Keep com
 
 ---
 
-## 3. Open questions for Cort
-1. **NVIDIA SDKs:** do you still have the DLSS/NGX SDK, NVAPI, Optical Flow SDK and Reflex/PCL locally after the crash, or do we re-download them (free NVIDIA developer account)? Needed by test session 1.
-2. **Games for testing:** TLOU Part I (native DLSS) and Anno 1800 (none). We also need **one FSR game and one XeSS game** you own for Phase 2.
-3. **Windows test host:** your desktop (RTX 5070 Ti). Confirm Visual Studio + CMake are reinstalled.
+## 3. Environment (answered by Cort 2026-10-23)
+- **NVIDIA SDKs:** lost in the crash. Claude re-downloaded them onto Cort's PC at `C:\Users\Cort\Documents\NeuralAliasAbundance-SDKs\`: DLSS/NGX SDK v310.9.16 (headers + `nvsdk_ngx_s.lib`), NVAPI, `pclstats.h` (Streamline v2.14.16). See its README.txt. Still to fetch (Cort): Optical Flow SDK 5 (`nvOpticalFlowD3D12.h`, needs an NVIDIA login) and `nvngx_dlss.dll` (only for DLSS GPU tests). **C1 must point the NGX/NVAPI/PCL gates at this folder by default.**
+- **Test games:** TLOU Part I (native DLSS) and Anno 1800 (none). Cort's DLSS games also expose FSR/XeSS, so they cover Phase 2 FSR/XeSS testing.
+- **Windows host:** Cort's desktop (RTX 5070 Ti). Visual Studio + CMake must be reinstalled before test session 1.
