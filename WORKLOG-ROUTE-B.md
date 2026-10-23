@@ -74,3 +74,13 @@ GitHub API read access remains Forbidden even with an escalated network check;
 no credential values were inspected. PR delivery will use the pushed task branch
 and a request through COMMS if API creation remains unavailable. Git push uses
 the existing authenticated proxy. No game changes or user attendance required.
+
+## 2026-10-23 — Gate 1 R-101
+
+Accepted Claude's same-entry concurrency coverage finding. Added a reader that
+checks 20,000 complete 64-byte reads while a writer alternates two whole patterns
+on the same cache entry. Rejected reads and mixed patterns fail after the writer
+is joined. This is a scheduling stress regression, not proof of every possible
+interleaving. No production code changed. Standalone GCC 14.2 Release build and
+all seven CTests (now 33 named cases) passed. Windows execution of this new case
+remains pending; Claude reported the previous A1 head passing Windows CI.

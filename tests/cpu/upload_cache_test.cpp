@@ -2,6 +2,7 @@
 #include "test_support.hpp"
 #include "core/upload_cache.hpp"
 #include <array>
+#include <atomic>
 #include <thread>
 using dx11_enhancement::UploadCache;
 int main() { return test::run({
@@ -28,6 +29,31 @@ int main() { return test::run({
         c.erase(1); CHECK(!c.contains(1)); c.create(1, 4); CHECK(!c.read(1, 0, out, 1));
         c.create(0, 4); c.create(2, 65537); CHECK(!c.contains(0) && !c.contains(2));
         CHECK(!c.read(1, 0, nullptr, 1));
+    }},
+    {"same-entry reads never contain a torn upload", [] {
+        std::array<unsigned char, 64> first{}, second{}, out{};
+        first.fill(0x11); second.fill(0x22);
+        UploadCache c; c.create(1, first.size(), first.data());
+        std::atomic<bool> started{false}, stop{false};
+        std::thread writer([&] {
+            unsigned iteration = 0;
+            do {
+                const auto& pattern = (iteration++ % 2 == 0) ? second : first;
+                c.update(1, 0, pattern.size(), pattern.data());
+                started.store(true);
+                std::this_thread::yield();
+            } while (!stop.load());
+        });
+        while (!started.load()) std::this_thread::yield();
+        unsigned rejected = 0, mixed = 0;
+        for (unsigned i = 0; i < 20000; ++i) {
+            if (!c.read(1, 0, out.data(), out.size())) ++rejected;
+            else if (out != first && out != second) ++mixed;
+            if (i % 64 == 0) std::this_thread::yield();
+        }
+        stop.store(true); writer.join();
+        // Check after joining so a failed assertion cannot strand a live thread.
+        CHECK(rejected == 0); CHECK(mixed == 0);
     }},
     {"bounded entries and isolated concurrent writers", [] {
         UploadCache c; for (uint64_t id = 1; id <= 2049; ++id) c.create(id, 4);
