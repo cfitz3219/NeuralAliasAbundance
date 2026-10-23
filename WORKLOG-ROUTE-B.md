@@ -50,6 +50,51 @@ the two portable core implementations from Claude's actual checkout with the
 same strict flags successfully. Tracked source, shaders, third-party files,
 CMake and build.ps1 are unchanged. Documentation whitespace checks passed.
 
+## A1 — 2026-10-23 — CPU regression implementation
+
+Pulled main's master plan and Claude's acknowledgment. Posted the A1 integration
+contract in COMMS on main (`35a8f78`) and created `astra/a1-cpu-regressions`.
+Reconstructed tests under the assigned `tests/cpu/` ownership: frame contract,
+jitter, frame history, upload cache, size confirmation, CPU motion arbitration,
+ABI 0.1 layout, and Windows-only actual host framing/loss. Each test is labeled
+reconstructed 2026-10; none is claimed to be the lost original. No production,
+frozen-interface, root CMake, CI, or Claude-owned test files changed.
+
+Installed CMake 3.31.6 and Ninja 1.11.1.4 in an isolated workspace tool venv.
+Standalone Release build passed with GCC 14.2 and strict warnings. Seven CTests,
+containing 32 named cases, passed. The additional six host transport cases are
+Windows CPU-only (not GPU), link the unchanged real host, and are NOT registered
+on Linux. Their test translation unit also passed a GCC syntax/object compile
+using only a test-side calling-convention spelling; no host runtime was simulated
+or executed by that check. MSVC compilation and Windows runtime validation are
+pending C1/C2; A1 acceptance remains pending those checks, rather than being
+misreported as needing a GPU. Peer review is deferred to Gate 1 per user direction.
+
+GitHub API read access remains Forbidden even with an escalated network check;
+no credential values were inspected. PR delivery will use the pushed task branch
+and a request through COMMS if API creation remains unavailable. Git push uses
+the existing authenticated proxy. No game changes or user attendance required.
+
+## 2026-10-23 — Gate 1 R-101
+
+Accepted Claude's same-entry concurrency coverage finding. Added a reader that
+checks 20,000 complete 64-byte reads while a writer alternates two whole patterns
+on the same cache entry. Rejected reads and mixed patterns fail after the writer
+is joined. This is a scheduling stress regression, not proof of every possible
+interleaving. No production code changed. Standalone GCC 14.2 Release build and
+all seven CTests (now 33 named cases) passed. Windows execution of this new case
+remains pending; Claude reported the previous A1 head passing Windows CI.
+
+## 2026-10-23 — Gate 1 R-104
+
+Accepted Claude's identity/epoch distinction. CONTRACT section 4 now keys object
+identity by (session_id, object_id) and command-list recordings by session, list
+and recording generation. Evidence retains its own epoch/provenance and requires
+fresh qualification across resync; replayed liveness does not recreate execution
+history or validate stale candidates. Checked against host_observe.h's monotonic,
+never-reused-in-session ID definition and the existing recovery table. Documentation
+only; git diff --check passed. No ABI or runtime change, no runtime test claimed.
+
 ## 2026-10-23 — Universal DX12 goal and Argon audit response
 
 Read the attached Argon audit following Cort's explicit direction. Removed the

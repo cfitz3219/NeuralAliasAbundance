@@ -1,10 +1,11 @@
-// GPU cost of the DLSS evaluate, measured in-game (A23): timestamp queries
-// recorded on the game's own command list immediately around the original
-// evaluate call, resolved into a small ring of readback buffers, and read a
-// few Presents later (the game executes the list before it presents). No
-// fences, no waits: a slot is only read once it is old enough, and a slot
-// whose stamps are still zero is skipped. Distinguishes GPU time of the DLSS
-// pass from the Present-cadence fps the footer shows.
+// GPU cost of the DLSS evaluate, measured in-game (A23; completion fixed in
+// C4 for R-001 and Gate 1 R-202): timestamp queries recorded on the game's own
+// command list around the original evaluate and resolved into a per-slot
+// readback buffer. When the host's ExecuteCommandLists detour sees that list
+// submitted, it signals the host's fence on that same queue; Poll() reads a
+// slot only after GetCompletedValue() proves that signal passed. No CPU waits,
+// no Present-count guessing. Distinguishes the DLSS pass's GPU time from the
+// Present-cadence fps.
 #pragma once
 
 #include <d3d12.h>
@@ -19,19 +20,27 @@ namespace na::gputime {
 void SetDevice(ID3D12Device* device);
 
 // Called around the original evaluate, on the game's list. Safe if the
-// device refuses query heaps: the module disables itself and returns.
+// device refuses query heaps/fences: the module disables itself and returns.
 void Begin(ID3D12GraphicsCommandList* list);
 void End(ID3D12GraphicsCommandList* list);
 
-// From the Present hook: `queue` provides the timestamp frequency; reads
-// completed slots. Cheap; call every frame.
+// From the host's ExecuteCommandLists detour, AFTER the original call returned
+// (game thread; no waits): associates measured lists with the queue that
+// executed them, signals the completion fence there, records its frequency.
+void OnExecuted(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* const* lists);
+
+// From the Present hook: reads slots whose submission fence has completed.
+// The queue argument is unused (kept for the existing call site). Cheap.
 void Poll(ID3D12CommandQueue* queue);
 
 struct Stats {
-    float last_ms;      // most recent completed evaluate
-    float avg_ms;       // exponential average
-    uint64_t samples;   // completed measurements
-    uint32_t enabled;   // 0 if the device/driver refused the queries
+    float last_ms;         // most recent completed evaluate
+    float avg_ms;          // exponential average
+    uint64_t samples;      // completed measurements
+    uint32_t enabled;      // 0 if refused by the device, disabled, device removed, or every slot quarantined
+    uint64_t skipped_busy; // Begin found no free slot (never stalls)
+    uint64_t unsupported;  // list type without timestamp support here (bundle/copy/video)
+    uint64_t quarantined;  // slots retired: never seen submitted, or not completed within kAbandonPresents
 };
 Stats GetStats();
 void SetEnabled(bool enabled);

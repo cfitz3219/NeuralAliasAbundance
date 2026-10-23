@@ -4,8 +4,8 @@
 **Audience:** Claude, Astra (Codex), and Cort.
 **Status:** ACTIVE. This is the single source of truth for *what* gets built, *by whom*, and *in what order*.
 
-> **Goal:** one injector that obtains everything DLSS needs (scene color, depth, motion vectors, jitter, camera) from as many DX12 games as possible **without per-game code**, falling back safely when it can't.
-> "Every game, no matter what" isn't a literal acceptance test. Kernel anti-cheat titles and engines that never compute depth are out of reach. We measure progress as a growing list of games where it works, and we keep the unsupported cases explicit.
+> **Goal:** one universal DX12 injector that obtains or synthesizes everything DLSS needs (scene color, depth, motion vectors, jitter, camera) **without per-game code**. Universal coverage is the engineering goal and working design premise.
+> Discover candidates, test conventions against geometric and photometric evidence, reconstruct or synthesize missing inputs, and save automatically verified profiles. Missing inputs create engineering tasks. Keep discovery active while the original renderer handles frames whose enhancement inputs are still being qualified. Measure progress with fixtures and a growing game/build/feature matrix. Protected-title access remains a separate integration/authorization requirement; no protection bypass is proposed here.
 
 ---
 
@@ -96,6 +96,7 @@ Legend: **C** = Claude task, **A** = Astra task, **J** = joint task (the split i
 
 ### On hold (exists in code, not blocking the goal)
 Frame Generation, Neural Rendering, Ray Reconstruction, Reflex/latency. Keep compiling; no new work until J2 ships.
+**Before any of them is taken off hold, the "Required before un-holding FG/NR/motion" items in section 4 must be done.**
 
 ---
 
@@ -115,3 +116,33 @@ Frame Generation, Neural Rendering, Ray Reconstruction, Reflex/latency. Keep com
 - **PR delivery:** Git push works, GitHub API returns Forbidden. Claude is asked
   in COMMS to create both task PRs. Reviews remain at Gate 1; no task code has
   been merged by Astra.
+
+---
+
+## 4. Audit notes: Gemini "Argon" architectural audit (2026-10-23)
+
+Every claim was checked against the code (and, for API rules, Microsoft's documentation) before acting. Disposition per item:
+
+| # | Claim | Verdict | Action |
+|---|---|---|---|
+| 1 | Presenter: `DO_NOT_WAIT` with V-Sync (`SyncInterval>0`) fails, dropping every generated frame | **Not a bug.** Microsoft's DXGI_PRESENT docs place no SyncInterval restriction on `DO_NOT_WAIT` (only `ALLOW_TEARING` requires SyncInterval 0 + the swap-chain flag + not exclusive fullscreen). The presenter forwards the game's own (valid) sync/flags unchanged. | Design note for FG (below): under V-Sync each extra present costs a refresh. |
+| 2 | FG/NR/live motion copy any depth format into R32_FLOAT | **Confirmed.** Invalid copy for 24-bit (D24S8) and 16-bit (D16) depth. | **Fixed** (`claude/audit-hardening`): shared `na::depth` rule; FG/NR decline with a reason, motion falls back to motion-only. Conversion → **C12**. |
+| 3 | FG feeds zero (singular) camera matrices outside TLOU | **Confirmed.** | **Fixed**: FG pauses without a validated camera. The proposed GPU "camera solver" with a synthesized 60° FOV / near 0.1 / far 1000 is **not adopted as a real camera**: field of view and near/far are not recoverable from depth + motion alone, and a guessed projection would be an estimated input mislabelled as engine truth. Kept as a research idea under J4/A6 (fit a clip→prev-clip reprojection from static pixels as a *labelled estimate* for validation/fallback). Removing the `TimingAttached` gate on `slSetConstants` camera capture → **C7b** (needs SL-version/layout evidence per game; `ValidCamera` invariants make it low-risk). |
+| 4.1 | NR rejects depth/MV of different allocation sizes (DRS/padded) | **Confirmed.** | → **C13** (compare subrect coverage, not allocation size). |
+| 4.2 | NR upsample shaders sample padded texture size, not the render subrect | **Confirmed by reading** (`GetDimensions` on the copy of the full plane). | → **C13** (pass render size + base in constants or crop the copy). |
+| 4.3 | NR hardcodes `depth_inverted = 0` | **Confirmed.** | **Fixed**: read from DLSS create flags as FG does. |
+| 4.4 | FG rejects display-resolution motion vectors (`MVLowRes == 0`) | **Confirmed.** | → **C13** (size/scale from `mv_low_res`, set MVecs subrect accordingly). |
+| 5 | Arbiter / FlowExpand `SetDescriptorHeaps` would clobber a game list's heaps | **Not a live bug**: today both record only on NeuralAlias-owned lists. **Valid rule for later.** | **Rule for C10/C11**: host passes never record on game lists, or they restore the game's heaps; C8 records `SetDescriptorHeaps` (slot 28) per list anyway (needed for binding capture), which makes a `RestoreDescriptorHeaps` helper cheap. |
+| 6.1 | `preset_profile` locked to `tlou-i.exe` | **Confirmed.** | → **C14**: use the running executable, but only as an explicit opt-in that records the user's original driver-profile value and restores it on disable (it is a persistent NVIDIA driver change that outlives the game session). |
+| 6.2 | Universal mode re-query: `slFreeResources` for Streamline titles; return `FAIL_FeatureNotFound` once from Evaluate for direct-NGX titles | **Plausible, risky.** Faking a failure can make some engines disable DLSS for the session or crash. | → **J3 experiment**, behind a setting, per engine family, with evidence; never default. |
+| 7.1 | Bindless (SM 6.6): root constants index `ResourceDescriptorHeap[]` | **Agreed.** Already in A2-R02 (root constants by value + descriptor versions). | C8 H2b must capture root constants **and** CBV/SRV writes into shader-visible heaps. |
+| 7.2 | Persistent-mapped upload heaps sub-allocated by GPU VA | **Agreed** (matches A2-R03). | C9: map GPU-VA ranges → (resource, offset) from creation/`GetGPUVirtualAddress`; snapshot bound ranges at submission, labelled `app-sync-unknown`. Hooking `Map` alone is insufficient (one Map at startup); the VA→resource table is the key. |
+| 7.3 | Depth is often cleared/overwritten late in the frame (weapons, 3D HUD) | **Agreed.** | C8/C11: depth lease taken at the end of the main geometry pass chosen by A5, not at Present. |
+
+### New / amended tasks (Claude unless noted)
+- **C7b** (Phase 2, with C7): generalize Streamline camera capture beyond TLOU (layout/version evidence first).
+- **C12** (required before un-holding FG/NR/motion): 24/16-bit depth → R32F conversion pass (SRV `R24_UNORM_X8_TYPELESS` / `R16_UNORM`, on NeuralAlias's own list at the submission boundary; requires the depth resource to allow SRVs, else decline).
+- **C13** (required before un-holding FG/NR): subrect-correct inputs (#4.1, #4.2, #4.4) with fixture tests using padded/DRS-style resources.
+- **C14** (FG phase): per-game NVIDIA driver FG preset, opt-in with restore.
+- **FG design note**: under V-Sync, generated presents each wait a refresh; FG needs refresh ≥ (multiplier × game fps) or a VRR/tearing path (`ALLOW_TEARING` only with SyncInterval 0 on a tearing-capable, non-exclusive-fullscreen chain).
+
