@@ -32,7 +32,17 @@ jobs:
           }
           exit $code
       - name: Test (everything not labelled gpu)
-        run: ctest --test-dir build -C Release --output-on-failure -LE gpu
+        shell: pwsh
+        run: |
+          ctest --test-dir build -C Release --output-on-failure -LE gpu 2>&1 | Tee-Object -FilePath ctest-log.txt
+          $code = $LASTEXITCODE
+          # Per-test verdicts as annotations (readable through the API): proves tests ran, not skipped.
+          Select-String -Path ctest-log.txt -Pattern 'Test +#\d+: .*(Passed|Failed|Skipped|Not Run|\*\*\*)|tests passed|tests failed' |
+            Select-Object -First 45 | ForEach-Object {
+              $l = $_.Line.Trim()
+              if ($l -match 'Failed|\*\*\*Exception|Not Run|tests failed') { Write-Output "::error::$l" } else { Write-Output "::notice::$l" }
+            }
+          exit $code
       - name: Report failing tests as annotations
         if: failure()
         shell: pwsh
