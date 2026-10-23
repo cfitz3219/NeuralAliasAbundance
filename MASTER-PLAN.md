@@ -4,8 +4,8 @@
 **Audience:** Claude, Astra (Codex), and Cort.
 **Status:** ACTIVE. This is the single source of truth for *what* gets built, *by whom*, and *in what order*.
 
-> **Goal:** one injector that obtains everything DLSS needs (scene color, depth, motion vectors, jitter, camera) from as many DX12 games as possible **without per-game code**, falling back safely when it can't.
-> "Every game, no matter what" isn't a literal acceptance test. Kernel anti-cheat titles and engines that never compute depth are out of reach. We measure progress as a growing list of games where it works, and we keep the unsupported cases explicit.
+> **Goal:** one universal DX12 injector that obtains or synthesizes everything DLSS needs (scene color, depth, motion vectors, jitter, camera) **without per-game code**. Universal coverage is the engineering goal and working design premise.
+> Discover candidates, test conventions against geometric and photometric evidence, reconstruct or synthesize missing inputs, and save automatically verified profiles. Missing inputs create engineering tasks. Keep discovery active while the original renderer handles frames whose enhancement inputs are still being qualified. Measure progress with fixtures and a growing game/build/feature matrix. Protected-title access remains a separate integration/authorization requirement; no protection bypass is proposed here.
 
 ---
 
