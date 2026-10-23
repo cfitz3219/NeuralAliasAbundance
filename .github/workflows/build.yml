@@ -17,9 +17,31 @@ jobs:
       - name: Configure (no NVIDIA SDKs on the runner; features gate off)
         run: cmake -S . -B build -A x64
       - name: Build Release
-        run: cmake --build build --config Release --parallel
+        shell: pwsh
+        run: |
+          # Compiler/linker errors are re-emitted as workflow annotations so agents
+          # can read them through the API (raw job logs aren't reachable from their sandboxes).
+          cmake --build build --config Release --parallel 2>&1 | Tee-Object -FilePath build-log.txt
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            Select-String -Path build-log.txt -Pattern ': (fatal )?error [A-Z]+[0-9]+|error MSB|LINK : fatal' |
+              Select-Object -First 40 | ForEach-Object {
+                $m = ($_.Line -replace '^\s+','') -replace '\[[^\]]*\.vcxproj\]',''
+                Write-Output "::error::$m"
+              }
+          }
+          exit $code
       - name: Test (everything not labelled gpu)
         run: ctest --test-dir build -C Release --output-on-failure -LE gpu
+      - name: Report failing tests as annotations
+        if: failure()
+        shell: pwsh
+        run: |
+          $log = 'build/Testing/Temporary/LastTest.log'
+          if (Test-Path $log) {
+            Select-String -Path $log -Pattern '^(FAIL|FATAL) |Test Failed|Exception' | Select-Object -First 40 |
+              ForEach-Object { Write-Output "::error::$($_.Line)" }
+          }
       - name: Summary (what got built; SDK gate states)
         shell: pwsh
         run: |

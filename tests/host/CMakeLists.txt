@@ -28,3 +28,6 @@ na_host_test(dx12_fixture SOURCES dx12_fixture.cpp LIBS abundance_core d3d12 dxg
              ARGS --output "${CMAKE_CURRENT_BINARY_DIR}/fixture-evidence")
 target_compile_definitions(dx12_fixture PRIVATE
   ABUNDANCE_SHADER_PATH=L"${PROJECT_SOURCE_DIR}/shaders/reference_scene.hlsl")
+
+# C4 / R-001: GPU timer completion evidence (links the host library for gpu_timing).
+na_host_test(gpu_timing_test SOURCES gpu_timing_test.cpp LIBS host_dx12)
