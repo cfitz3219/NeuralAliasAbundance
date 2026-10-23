@@ -1,0 +1,42 @@
+# C2 (MASTER-PLAN Phase 1): the referee between the two agents. Every push and
+# PR must configure, build and pass the non-GPU tests. GPU-labelled tests run
+# only in Cort's Windows test sessions (no GPU on hosted runners).
+name: build
+
+on:
+  push:
+    branches: ["main", "claude/**", "astra/**"]
+  pull_request:
+
+jobs:
+  windows:
+    name: Windows x64 (MSVC) build + non-GPU tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (no NVIDIA SDKs on the runner; features gate off)
+        run: cmake -S . -B build -A x64
+      - name: Build Release
+        run: cmake --build build --config Release --parallel
+      - name: Test (everything not labelled gpu)
+        run: ctest --test-dir build -C Release --output-on-failure -LE gpu
+      - name: Keep the built binaries for inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: |
+            build/Release/*.exe
+            build/Release/*.dll
+          if-no-files-found: warn
+
+  linux:
+    name: Linux (GCC) portable core + CPU tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
