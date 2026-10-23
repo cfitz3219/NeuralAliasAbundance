@@ -1,0 +1,10 @@
+; RECONSTRUCTED 2026-10-23 from the exports defined in dxgi_proxy.cpp (original file lost).
+; Maps the public DXGI names onto the proxy's Abundance* implementations.
+LIBRARY NeuralAliasDXGI
+EXPORTS
+    CreateDXGIFactory=AbundanceCreateDXGIFactory
+    CreateDXGIFactory1=AbundanceCreateDXGIFactory1
+    CreateDXGIFactory2=AbundanceCreateDXGIFactory2
+    DXGIGetDebugInterface1=AbundanceDXGIGetDebugInterface1
+    DXGIDeclareAdapterRemovalSupport=AbundanceDXGIDeclareAdapterRemovalSupport
+    AbundanceQueryProxyStatus

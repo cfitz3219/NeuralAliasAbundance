@@ -1,0 +1,174 @@
+#include "host_dx12/adapters/tlou1/apply.hpp"
+#include "host_dx12/host_boot/host_boot.hpp"
+
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+
+#include "host_dx12/fg/frame_gen.hpp"
+#include "host_dx12/hooking/vtable_hook.hpp"
+#include "host_dx12/host_boot/game_adapter.h"
+#include "host_dx12/ngx_observe/gpu_timing.hpp"
+#include "host_dx12/ngx_observe/ngx_observe.hpp"
+#include "host_dx12/nr/nr_pass.hpp"
+#include "host_dx12/overlay/na_style.hpp"
+#include "host_dx12/overlay/overlay.hpp"
+#include "host_dx12/overlay/presenter.hpp"
+#include "host_dx12/overlay/route_a_panel.hpp"
+#include "host_dx12/settings.hpp"
+
+namespace na::host {
+namespace {
+
+std::mutex g_mutex;
+Status g_status{};
+HMODULE g_self = nullptr;
+wchar_t g_ini[MAX_PATH] = {};
+
+void set_error(const char* text)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    strncpy_s(g_status.error, text, _TRUNCATE);
+}
+
+DWORD WINAPI InitThread(LPVOID)
+{
+    // Once hooks go in, this module must never unload.
+    HMODULE pinned = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                       reinterpret_cast<LPCWSTR>(&InitThread), &pinned);
+    if (!na::hooking::Initialize()) { set_error("hooking core failed to initialise"); return 0; }
+    na::settings::SetIniPath(g_ini);
+    na::settings::Load();
+    if (GetPrivateProfileIntW(L"overlay", L"enabled", 1, g_ini) == 1) {
+        wchar_t wbuf[64] = {};
+        GetPrivateProfileStringW(L"overlay", L"scale", L"1.25", wbuf, 64, g_ini);
+        na::ui::SetScale(static_cast<float>(_wtof(wbuf)));
+        char body[260] = {}, title[260] = {}, ini_a[MAX_PATH];
+        WideCharToMultiByte(CP_ACP, 0, g_ini, -1, ini_a, MAX_PATH, nullptr, nullptr);
+        GetPrivateProfileStringA("overlay", "font_body", "", body, sizeof(body), ini_a);
+        GetPrivateProfileStringA("overlay", "font_title", "", title, sizeof(title), ini_a);
+        na::ui::SetFontPaths(body, title);
+    }
+    // A61: Route A services for a DLSS game WITHOUT Streamline (the game loads
+    // nvngx_dlss.dll itself and talks to the driver's NGX core directly). The
+    // same steps the sl.interposer proxy takes, in the same order: hook the
+    // NGX core before the game reaches it, watch for the core module, wire
+    // the runtimes for Neural Rendering and Frame Generation, register the
+    // Route A pages, enable the presenter. Off unless [route_a] enabled=1.
+    bool route_a = GetPrivateProfileIntW(L"route_a", L"enabled", 0, g_ini) == 1;
+    bool route_a_started = false;
+    if (route_a) {
+        na::ngx::PreloadAndHookNgxCore();
+        na::tlou1::InitializeApply();
+        bool sync_hook = GetPrivateProfileIntW(L"observe", L"sync_loader_hook", 0, g_ini) == 1;
+        route_a_started = na::ngx::StartModuleWatch(sync_hook);
+        na::nr::Runtime rt;
+        if (na::ngx::GetRuntimeEntryPoints(&rt.create_feature, &rt.evaluate_feature, &rt.release_feature,
+                                           &rt.allocate_parameters, &rt.destroy_parameters, &rt.get_capability_parameters)) {
+            na::nr::SetRuntime(rt);
+            na::fg::Runtime fr;
+            fr.create_feature = rt.create_feature;
+            fr.evaluate_feature = rt.evaluate_feature;
+            fr.release_feature = rt.release_feature;
+            fr.allocate_parameters = rt.allocate_parameters;
+            fr.destroy_parameters = rt.destroy_parameters;
+            fr.get_capability_parameters = rt.get_capability_parameters;
+            na::fg::SetRuntime(fr);
+        }
+        na::ngx::SetDetailLogging(GetPrivateProfileIntW(L"observe", L"detail", 0, g_ini) == 1);
+        na::gputime::SetEnabled(GetPrivateProfileIntW(L"observe", L"gpu_timing", 1, g_ini) == 1);
+        na::overlay::RegisterRouteAMenu();
+        na::present::SetEnabled(GetPrivateProfileIntW(L"present", L"proxy", 1, g_ini) == 1);
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_status.route_a_enabled = 1;
+            g_status.route_a_started = route_a_started ? 1u : 0u;
+            if (!route_a_started) strncpy_s(g_status.error, "NGX module watch failed to start", _TRUNCATE);
+        }
+    }
+    // Adapter phase 1: menu sections before the overlay starts.
+    bool adapter_enabled = GetPrivateProfileIntW(L"adapter", L"enabled", 1, g_ini) == 1;
+    bool prepared = adapter_enabled && na_adapter_prepare() != 0;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_status.adapter_prepared = prepared ? 1u : 0u;
+        strncpy_s(g_status.adapter_name, na_adapter_name(), _TRUNCATE);
+    }
+    char tag[32];
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        strncpy_s(tag, g_status.tag, _TRUNCATE);
+    }
+    {
+        wchar_t status_path[MAX_PATH];
+        lstrcpynW(status_path, g_ini, MAX_PATH);
+        for (int i = lstrlenW(status_path) - 1; i >= 0; --i)
+            if (status_path[i] == L'\\' || status_path[i] == L'/') { status_path[i] = 0; break; }
+        lstrcatW(status_path, L"\\NeuralAliasHost-status.log");
+        na::overlay::SetStatusLogPath(status_path); // A55
+    }
+    bool started = na::overlay::Start(tag, nullptr);
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_status.host_started = started ? 1u : 0u;
+    }
+    if (!started) { set_error("overlay/host start failed"); return 0; }
+    if (route_a) { // A61: the DLSS call log beside the ini, as the sl proxy writes it
+        wchar_t log_path[MAX_PATH], configured[MAX_PATH] = {};
+        GetPrivateProfileStringW(L"observe", L"log", L"", configured, MAX_PATH, g_ini);
+        if (configured[0]) {
+            lstrcpynW(log_path, configured, MAX_PATH);
+        } else {
+            lstrcpynW(log_path, g_ini, MAX_PATH);
+            for (int i = lstrlenW(log_path) - 1; i >= 0; --i)
+                if (log_path[i] == L'\\' || log_path[i] == L'/') { log_path[i] = 0; break; }
+            lstrcatW(log_path, L"\\NeuralAliasHost-observe.log");
+        }
+        na::ngx::StartLogger(log_path);
+    }
+    // Adapter phase 2: subscriptions and registry after the host owns Execute/discovery.
+    if (prepared) {
+        bool ok = na_adapter_start() != 0;
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_status.adapter_started = ok ? 1u : 0u;
+        if (!ok) strncpy_s(g_status.error, "adapter start failed; host runs without it", _TRUNCATE);
+    }
+    return 0;
+}
+
+} // namespace
+
+bool StartFromIni(HMODULE self, const wchar_t* ini_name, const char* default_tag)
+{
+    g_self = self;
+    wchar_t dir[MAX_PATH] = {};
+    if (!GetModuleFileNameW(self, dir, MAX_PATH)) return false;
+    for (int i = lstrlenW(dir) - 1; i >= 0; --i)
+        if (dir[i] == L'\\' || dir[i] == L'/') { dir[i] = 0; break; }
+    wsprintfW(g_ini, L"%s\\%s", dir, ini_name);
+    if (GetFileAttributesW(g_ini) == INVALID_FILE_ATTRIBUTES) return false;
+    if (GetPrivateProfileIntW(L"host", L"enabled", 0, g_ini) != 1) return false;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_status.host_enabled = 1;
+        char tag_a[32] = {};
+        wchar_t tag_w[32] = {};
+        GetPrivateProfileStringW(L"host", L"tag", L"", tag_w, 32, g_ini);
+        if (tag_w[0]) WideCharToMultiByte(CP_ACP, 0, tag_w, -1, tag_a, 32, nullptr, nullptr);
+        strncpy_s(g_status.tag, tag_a[0] ? tag_a : (default_tag ? default_tag : "HOST"), _TRUNCATE);
+    }
+    HANDLE t = CreateThread(nullptr, 0, &InitThread, nullptr, 0, nullptr);
+    if (!t) return false;
+    CloseHandle(t);
+    return true;
+}
+
+Status GetStatus()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_status;
+}
+
+} // namespace na::host
