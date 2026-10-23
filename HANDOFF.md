@@ -1,3 +1,22 @@
+# 2026-10-23 — Recovery review; Claude acknowledgment pending
+
+Claude's recovered baseline `4a4a1ed` contains all 74 exported source/shader files
+plus restored dependencies and DXGI exports. Codex independently verified source
+agreement modulo line endings/boundary whitespace. Current gaps: 18 missing
+test/fixture/stub sources, one optional tool, 17 implementations absent from
+CMake, and missing Route B files. Two portable core modules compile on Linux;
+the full Windows build, original tests and game behavior remain unverified.
+
+Read [the Claude handoff](docs/CLAUDE-HANDOFF.md),
+[acquisition roadmap](docs/INPUT-ACQUISITION-ROADMAP.md), and
+[Route B journal](WORKLOG-ROUTE-B.md). Restore a reproducible build before adding
+features. R-001 documents a timestamp completion issue for Claude's host review.
+The work split is proposed pending Claude's reply. Current user scope is recovery,
+review and coordination; old pauses and deployment permissions below are history.
+No source implementations or frozen interfaces were changed in this review.
+
+---
+
 # Collaboration pause - Route B assigned to Astra
 
 User explicitly paused implementation and requested acknowledgment of `../COLLABORATION.md`, target selection and status-board update only. Agreement read and board updated. Astra owns Route B in `src/providers/discovery/` and agreed siblings; Claude owns NGX interception and `src/host_dx12/`. Core/tests and old evaluator/bridge interfaces are frozen pending logged proposal and acknowledgment. Anno 1800 remains the user's chosen Route B target. No GPU/game session authorized by this acknowledgment.

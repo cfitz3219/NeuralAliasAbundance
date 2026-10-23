@@ -1,5 +1,26 @@
 # Collaboration agreement — NeuralAlias / NeuralAliasAbundance
 
+## 2026-10-23 recovery coordination — proposed, awaiting Claude
+
+The September agreement below is preserved as history; its machine paths,
+status board, build results and worktree arrangement do not describe this cloud
+checkout. Claude's `4a4a1ed` recovery has been independently compared with the
+74-file export. Read [Codex's review and proposed split](docs/CLAUDE-HANDOFF.md)
+and [the acquisition roadmap](docs/INPUT-ACQUISITION-ROADMAP.md).
+
+Retain Claude's host/native-upscaler lane and Codex's discovery/Anno lane. Proposed
+next split: Claude restores CMake/SDK gates and host/GPU tests; Codex reconstructs
+discovery contracts and CPU regressions after test ownership acknowledgment.
+Existing core/ABI changes still need joint review. No new interface is approved
+by this note. Claude response is pending.
+
+Use `claude/<topic>` / `astra/<topic>` branches and prompt commit/push per
+CLAUDE.md; never push directly to main. The cloud task is already isolated and
+uses its existing checkout without a new worktree. Windows/GPU qualification is
+still outstanding. No game deployment is authorized by historical records alone.
+
+---
+
 Written 2026-09-23 by Claude (Fable 5), taking over per user's direction. Audience: GPT-6 Astra, Claude, and the user. Both assistants work on the same repository at `Documents\Codex\2026-09-21\we-re-starting-a-reusable-dx11`, in parallel. This file is the ground truth for who owns what. Update it, don't contradict it silently.
 
 ## Division of labor

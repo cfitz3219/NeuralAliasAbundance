@@ -1,0 +1,726 @@
+{
+  "format_version": 1,
+  "description": "Recovered source snapshot, not original Git history or a verified build. Extracted bytes match the documented bundle spans; original pre-export file hashes are unknown.",
+  "extraction": "UTF-8 FILE markers; preserve body bytes and line endings; remove exactly two LF export-separator bytes before each next marker. Preserve final body to EOF.",
+  "uploads": [
+    {
+      "path": "docs/recovery/originals/build.ps1",
+      "bytes": 1039,
+      "sha256": "6ad7307831916d60045fe0554faa6122176a656047bd6abaf09515963843d75c"
+    },
+    {
+      "path": "docs/recovery/originals/AGENTS.md",
+      "bytes": 1459,
+      "sha256": "b09999c2b28bcb60ec4cb509a1aa9b10f650328bb3248afac575631954d67d5a"
+    },
+    {
+      "path": "docs/recovery/originals/NeuralAliasAbundance-Feasibility-and-Plan.md",
+      "bytes": 21323,
+      "sha256": "2a7cba50be87b2cdc2a56f05b485f6f06a0c0bf84aa00f7417807d1cfcf35c98"
+    },
+    {
+      "path": "docs/recovery/originals/CMakeLists.txt",
+      "bytes": 11079,
+      "sha256": "b28e9059be374cc9423258728e8a8c7b5b8e2bfe4a01b2ffbd58b276367d42c9"
+    },
+    {
+      "path": "docs/recovery/originals/COLLABORATION.md",
+      "bytes": 15209,
+      "sha256": "3b5f3069104b6bdb266bbcbc428038c412209a5100633bccfbb9a9e114cfade1"
+    },
+    {
+      "path": "docs/recovery/originals/WORKLOG-ROUTE-A.md",
+      "bytes": 37315,
+      "sha256": "af96f228bbbc58b79ece8c00e0afcf0de8f8028824522d257b31b1cffde84baf"
+    },
+    {
+      "path": "docs/recovery/originals/README.md",
+      "bytes": 4251,
+      "sha256": "6040acc89c02df3fdf5121e9e62f8e53c8814b6cd3e55aa2533237957eed774b"
+    },
+    {
+      "path": "docs/recovery/originals/neural_alias_codebase.txt",
+      "bytes": 873188,
+      "sha256": "caacb465f24d4fa13892afdb3e680b37eccf528ed3194a74c63fe2ca2db32ea5"
+    },
+    {
+      "path": "docs/recovery/originals/WORKLOG.md",
+      "bytes": 5100,
+      "sha256": "99f0a8d6e64ce126c819e6243dbd5155234ae1eafab2c4341c53722d1b46ec4d"
+    },
+    {
+      "path": "docs/recovery/originals/HANDOFF.md",
+      "bytes": 3587,
+      "sha256": "b38d54d10db9fa2ff9244189f79e490ad4efd61c8d2977703c7fa9b66e2f3a96"
+    }
+  ],
+  "extracted_files": [
+    {
+      "path": "src/app/main.cpp",
+      "bundle_start": 160,
+      "bundle_end": 2246,
+      "bytes": 2086,
+      "sha256": "e13608671cbe9cf748cf2bc0f91b528e76fbe54bb2bf2ad27ff463a6567d7567",
+      "claude_recovery_sha256": "64c56a46c3239dde8a7c4c584afd0102d1cfb2369669b0e9d6d3bf2cc6ef9dfd",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/app/window.cpp",
+      "bundle_start": 2405,
+      "bundle_end": 7056,
+      "bytes": 4651,
+      "sha256": "066866fbe1f9bd5f7a02479df3bd9ff250c90ef45d1a04a82c36ad1c7daec469",
+      "claude_recovery_sha256": "14e49263eaff2eae759b4cf6e9d80f9417561c43aa6ef3c0225d874e2b19124f",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/core/frame_contract.cpp",
+      "bundle_start": 7224,
+      "bundle_end": 11342,
+      "bytes": 4118,
+      "sha256": "0539af104b6c32633597fe4be8ef6a30bb055067a44031fc865cdc034cff296f",
+      "claude_recovery_sha256": "c8cfd8a290226a81f817ed7c8e6569dac3de245ffabb34e7fb5380ccd93af1a9",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/core/frame_contract.hpp",
+      "bundle_start": 11510,
+      "bundle_end": 13788,
+      "bytes": 2278,
+      "sha256": "f851d5c65954810212cc46273b49411608632835896020920a02f531c1b04baf",
+      "claude_recovery_sha256": "aa444b73e0331c7985afe3c806e43d3836a182e08f7472f4d472a9442d324b47",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/core/frame_history.hpp",
+      "bundle_start": 13955,
+      "bundle_end": 16898,
+      "bytes": 2943,
+      "sha256": "1fb0bfdd1ab09bc112bee81ba89ab39de38a712437c46005a175ee8ecbf0482e",
+      "claude_recovery_sha256": "280f4d6bf2118df0180a8c4ac87638a5255af87cc59dca85df76410dfddd2713",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/core/motion_arbiter.cpp",
+      "bundle_start": 17066,
+      "bundle_end": 26511,
+      "bytes": 9445,
+      "sha256": "63abf021372cfbe32ccb1975fd155e58324683314893a7623c5497127d23d3b6",
+      "claude_recovery_sha256": "a95b866ebeeaa0acbfc08b3348a2a4ee64a6f7b3763ba07e5794e9378cc85c0e",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/core/motion_arbiter.hpp",
+      "bundle_start": 26679,
+      "bundle_end": 35097,
+      "bytes": 8418,
+      "sha256": "b47e10333578d98c1f04cf62469aade9d5b2703e360fc559fc153a578f22c46a",
+      "claude_recovery_sha256": "5081a7471e3f7b029b041ed52625a342a4817eb62ccc40cc51af4fe1ce516ebc",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/core/motion_arbiter_gpu.cpp",
+      "bundle_start": 35269,
+      "bundle_end": 57313,
+      "bytes": 22044,
+      "sha256": "719a496473e9131d25368691f71545ad82cc4712ff717d73c42427c5de572ce3",
+      "claude_recovery_sha256": "100caf932a7c193ef0caa3cb7119e59a1dd8f359cd4f53569660ce1b38674103",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/core/motion_arbiter_gpu.hpp",
+      "bundle_start": 57485,
+      "bundle_end": 62983,
+      "bytes": 5498,
+      "sha256": "a8715fc1febce7fea3c18130a8bfa58344b6b55e00ecb42f3cb0e1326f4e1ded",
+      "claude_recovery_sha256": "67587a55a59a4e34c138dbfa5b27bb66dfadc74105bb15ae979f2116ccb4c034",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/core/temporal_jitter.hpp",
+      "bundle_start": 63152,
+      "bundle_end": 64840,
+      "bytes": 1688,
+      "sha256": "e8f675bb6e1ce24196edaadcd5485dfef336be9a3c7a7724bf16493af3e0b376",
+      "claude_recovery_sha256": "4eaed1c2f9f1fefb83c616f7dc5558f5cbee8e34e582af05bb9d89ef2fe5d450",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/core/upload_cache.hpp",
+      "bundle_start": 65006,
+      "bundle_end": 68259,
+      "bytes": 3253,
+      "sha256": "b155a95161aa0fadb10f0ee7bd59646e02f85437ce71bc8c94da94174de500ef",
+      "claude_recovery_sha256": "0124fb28f63f5d733487f3ecafe332fe569ed816ab6f2eba3c2b0fb65e261c96",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/host_observe.cpp",
+      "bundle_start": 68430,
+      "bundle_end": 96862,
+      "bytes": 28432,
+      "sha256": "128b65a67ba66ab64e7a550fbaea66f52500cff236f7cdce0634e476b23f2f6a",
+      "claude_recovery_sha256": "2e92c9416655c62304ccef435ec4209a1c780c5c53587fadf132eb04500a78b0",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/host_observe.h",
+      "bundle_start": 97031,
+      "bundle_end": 121487,
+      "bytes": 24456,
+      "sha256": "e101ba560527476398d0803c1afb0f7bb223c695635e711901c4cb25535b28f9",
+      "claude_recovery_sha256": "515badbe7944155360179320f2127581f561d1e3d22dcf67fcf2fed09fa0703b",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/host_observe_internal.hpp",
+      "bundle_start": 121667,
+      "bundle_end": 123183,
+      "bytes": 1516,
+      "sha256": "d7b47cb58b1f08b226d9eb5a8055645de4f5583d4138ee13ba10867c0e2cf43a",
+      "claude_recovery_sha256": "dd5ab94d2f515cd367f77189275374b25a890d933e969b908cc50d73ff96714b",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/settings.cpp",
+      "bundle_start": 123350,
+      "bundle_end": 131335,
+      "bytes": 7985,
+      "sha256": "027706f7afa9c1b485f837b417d3a2e6b89b10f68e073586a55c05dab4e97626",
+      "claude_recovery_sha256": "00aef58893d6446642069114d6d74ca5b2bc4dcf9f595359f2bc8360c0ce105a",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/settings.hpp",
+      "bundle_start": 131502,
+      "bundle_end": 136557,
+      "bytes": 5055,
+      "sha256": "6e7300c1aa581089d8e772fd663c27ddaa53cb6eb6b43f0d160a88f7ffe54b02",
+      "claude_recovery_sha256": "5ac1a433144e7d156ba8d82219c1007bbb8c3d845e0f55d55047588d0872bcc4",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/adapters/tlou1/apply.cpp",
+      "bundle_start": 136736,
+      "bundle_end": 151654,
+      "bytes": 14918,
+      "sha256": "1d57a262e3598fdb34ed2a4f48847a2e37ad8077ecd83afbf20c9d60a3c875d5",
+      "claude_recovery_sha256": "b871b00215ceabd200f4e32c1fedec2b031d24a6fc099213195bfc0638f8e7d4",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/adapters/tlou1/apply.hpp",
+      "bundle_start": 151833,
+      "bundle_end": 152526,
+      "bytes": 693,
+      "sha256": "384321cfc732b58b4e33d7da0ebace768da93bbf4955fd7c0f00c8617c45f893",
+      "claude_recovery_sha256": "2386d96cb57dbe4c0789dbf542d5e26806cd72f8cba08b41c7b548cb0f2122fa",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/adapters/tlou1/apply_request.hpp",
+      "bundle_start": 152713,
+      "bundle_end": 154996,
+      "bytes": 2283,
+      "sha256": "aeb855417f9e99b8461fd965c551c2e6f31de90131c84feb3b937a235e8afbaa",
+      "claude_recovery_sha256": "a8b0ec0e4f69bfee4cff9022d58d43077eefd937c3dea6f74248cdeea11e0410",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/adapters/tlou1/present_batch.hpp",
+      "bundle_start": 155183,
+      "bundle_end": 155909,
+      "bytes": 726,
+      "sha256": "2cf08cecd49604c233e60abac2d27c35db380ce8adea03c388a0d2fa46cafa22",
+      "claude_recovery_sha256": "c19c8796b53f2c7457b80483a2f03fcc697f1cad33ce59957b0305f04d4dca51",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/adapters/tlou1/timing.cpp",
+      "bundle_start": 156089,
+      "bundle_end": 163753,
+      "bytes": 7664,
+      "sha256": "7fc2cf44a570ce64f616324723f84005d4ed994600f3740024f79b6b2bdecc1c",
+      "claude_recovery_sha256": "a25d5863c13a649497233785d21eee15cbb20646e8418e86df1d830a80bec7ae",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/adapters/tlou1/timing.hpp",
+      "bundle_start": 163933,
+      "bundle_end": 164361,
+      "bytes": 428,
+      "sha256": "06272d0cfafc871bb1a070a70009f5292a7e4716cc605765e878c4469e53d939",
+      "claude_recovery_sha256": "df07f2d826b015e9b35e32d1c589187b11e4ca7918ac63075a7c8b38b1ac5590",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/capture/frame_capture.cpp",
+      "bundle_start": 164541,
+      "bundle_end": 175041,
+      "bytes": 10500,
+      "sha256": "635da763aaf1894674f437689a596a11532356c33e8eb3f7fa518afef5c0e6ea",
+      "claude_recovery_sha256": "23d33ffd6d4b1aad3cd4178c0cd05fa44f2a9d5a85aed12668c8d7c32dfe4dda",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/capture/frame_capture.hpp",
+      "bundle_start": 175221,
+      "bundle_end": 177597,
+      "bytes": 2376,
+      "sha256": "85c198d6aea96133fdd4d203c36bbab2ab454201c2cfef3cc1d26049ba8d78f9",
+      "claude_recovery_sha256": "f29c7df6aa89f465687804df7b192ba25b9547a306c9396692b6bcb6fc057e84",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/color/color_space.hpp",
+      "bundle_start": 177773,
+      "bundle_end": 180227,
+      "bytes": 2454,
+      "sha256": "aba91b182b2af37cc8a88cb03bc2c79faffe2150f20cdd141e496b679b26415e",
+      "claude_recovery_sha256": "7bc6a8358b5a635aedbd926964ee587d344b4e0ad4962f8cb79d62c8f1e9a326",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/fg/camera.cpp",
+      "bundle_start": 180395,
+      "bundle_end": 181749,
+      "bytes": 1354,
+      "sha256": "b3ee119100471bf3681977b27b1d3a8acbe84eb0c689f10396dd2caa550ad34c",
+      "claude_recovery_sha256": "499b4893d11adbad3080a7ac8529c1742a9bbf1480c4dee7dd57e4eee1d1492f",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/fg/camera.hpp",
+      "bundle_start": 181917,
+      "bundle_end": 184453,
+      "bytes": 2536,
+      "sha256": "421cf3e677b3b9b2f10c2273eec71ac8e355012d23d6f5f5f3f0998e594785c8",
+      "claude_recovery_sha256": "a028bc5dba46fed755bda3dc31a184086cc2e50b369081cade03b15a7def15c2",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/fg/frame_gen.cpp",
+      "bundle_start": 184624,
+      "bundle_end": 217123,
+      "bytes": 32499,
+      "sha256": "6703197a86f2ab38f6f541b25aa62ffce31916bb53c161e3f0e993ca1c129707",
+      "claude_recovery_sha256": "30d45e545465cc29fadcb68c2459c2c3948a18c5552e669d4e6fc5175ca0a27e",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/fg/frame_gen.hpp",
+      "bundle_start": 217294,
+      "bundle_end": 223880,
+      "bytes": 6586,
+      "sha256": "a14cb3ff09e3c9f9944efe894ba7bb694b126ea21fb7af84e6e5e808c9be8365",
+      "claude_recovery_sha256": "c06f910504636e2ca321e3dab0661d2b551a23d925a7f8dd02b31977c61fe608",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/fg/preset_profile.cpp",
+      "bundle_start": 224056,
+      "bundle_end": 231213,
+      "bytes": 7157,
+      "sha256": "5dbae5b89559e544e44115e143525db8e4138dfea1db61cb0d81178da9ebc967",
+      "claude_recovery_sha256": "b76ba89bb6d370ef24ca57efa9489f41b0fb0b0b6d28b57e22bd51d48e8820c5",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/fg/preset_profile.hpp",
+      "bundle_start": 231389,
+      "bundle_end": 231942,
+      "bytes": 553,
+      "sha256": "d806c792dd6fc9b1a987a2ebc8798667275e5511338b4945204cd0e311a199df",
+      "claude_recovery_sha256": "962197720c287ee6ec7b147061005c0b1c5088d4f493cd0561c80a287947d9de",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/hooking/variant_registry.cpp",
+      "bundle_start": 232125,
+      "bundle_end": 254529,
+      "bytes": 22404,
+      "sha256": "72773dcdc213d2abe6b285e1e9a40ebb952092e9b489e21763068f86db692053",
+      "claude_recovery_sha256": "2179a8f2b9c9372f1c208843fbed70061a1b54803394bab041621f2ac653637b",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/hooking/variant_registry.hpp",
+      "bundle_start": 254712,
+      "bundle_end": 263191,
+      "bytes": 8479,
+      "sha256": "a0788632a201a4638ed4a9d42ce91d5be37d539de8480a19e7a4da8ba18e34e1",
+      "claude_recovery_sha256": "3f9faba636a9e96585c8f4d42bcb3a9de0beb39b1527723c35ec81027dc8cc2c",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/hooking/vtable_hook.cpp",
+      "bundle_start": 263369,
+      "bundle_end": 276939,
+      "bytes": 13570,
+      "sha256": "1ef45ebced5a9a1137c2c62fcd337a7073b7e6e23edacaeef0ea087fea82b2a0",
+      "claude_recovery_sha256": "a587994daeff3e45a1ac54998e50f36fa329d719c2c88e327af501ec0e34f183",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/hooking/vtable_hook.hpp",
+      "bundle_start": 277117,
+      "bundle_end": 284136,
+      "bytes": 7019,
+      "sha256": "da4512b30a1dfb7714ffe5eeae716e6723b3ff4baef88ef99dbdf381ea702ab0",
+      "claude_recovery_sha256": "ce73e39bcb3134881300dfef58310e92569aaa1f2ef5356b192f4ee022e31a3b",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/host_boot/game_adapter.h",
+      "bundle_start": 284315,
+      "bundle_end": 286144,
+      "bytes": 1829,
+      "sha256": "9fd2b88f35e48e4ad011e17c977108496a9825ba5d4a0f94445aff28c4f06470",
+      "claude_recovery_sha256": "a16995a3c847126cd54046a6616015e2a9b0c40fe8dcbd32b2813bdf12efce72",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/host_boot/host_boot.cpp",
+      "bundle_start": 286322,
+      "bundle_end": 294089,
+      "bytes": 7767,
+      "sha256": "6bb479b4331cbdb3d3be22aed4ee9b9b8f01952660dd65929a000011a9d7f3f0",
+      "claude_recovery_sha256": "0b5e4692ea23c542ca20e2d8073345543471a58b15d589cb3069f558df0f7257",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/host_boot/host_boot.hpp",
+      "bundle_start": 294267,
+      "bundle_end": 295884,
+      "bytes": 1617,
+      "sha256": "b3d4a3806f91920b30ffc5599401223ce5ee77a2287e08cfd7dfd461ae7f8f7a",
+      "claude_recovery_sha256": "2651cc781afd34e11a910e233132f9dc3d198e25b7681a230ea1c5887ac89d6c",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/latency/engine_frames.hpp",
+      "bundle_start": 296064,
+      "bundle_end": 297266,
+      "bytes": 1202,
+      "sha256": "62c345ea8f6bbac268d2cbd0e1a3e7e6fe8dd06c8d1dd1de34b2f0bb7dc86ebc",
+      "claude_recovery_sha256": "b56b15fa98ae66d9b5f6b516550833c0be8b7f326efb789250263dbcb195d3b5",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/latency/native_audit.hpp",
+      "bundle_start": 297445,
+      "bundle_end": 298253,
+      "bytes": 808,
+      "sha256": "ba1a3374fad2a883f2fa166f7ac5916c608e02e67793f5c2ae006b689e29bceb",
+      "claude_recovery_sha256": "34128b89d5523feeb24da66d050314fcb79a8a6ad747fd9974ca75e244ea6743",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/latency/nvidia_latency.cpp",
+      "bundle_start": 298434,
+      "bundle_end": 310218,
+      "bytes": 11784,
+      "sha256": "cab47b4c68b2aab7a48ac0b850cd4fe7fc940d61d5be6c88b865e4c7e2ff5805",
+      "claude_recovery_sha256": "e12648289675787b75ea141bc8ca367c0b262820bc80a7552a1e12d9ef930656",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/latency/nvidia_latency.hpp",
+      "bundle_start": 310399,
+      "bundle_end": 311806,
+      "bytes": 1407,
+      "sha256": "f8e34cfd3a17e40753a38afa31a0324ef0d0f06bc079549c2cb0614fef49af7b",
+      "claude_recovery_sha256": "1601178447111e574194582efdbe2fa6f4dddbcaf2e878200bf34e55bf16f2e4",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/latency/pcl_stats.cpp",
+      "bundle_start": 311982,
+      "bundle_end": 313524,
+      "bytes": 1542,
+      "sha256": "1c86a24cb280f22e2f564b93c24d56d854fedfee8675c302ddba96e2b4cc70a3",
+      "claude_recovery_sha256": "bdc9a39fe6e04a88ae46d0dfc2c9c3be3d479b70265fd5e99d0a02777a421d53",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/latency/pcl_stats.hpp",
+      "bundle_start": 313700,
+      "bundle_end": 314022,
+      "bytes": 322,
+      "sha256": "cb4f9d94480e45775c225c501e53339dc834c21e28f58c8b115c8f574fc7518c",
+      "claude_recovery_sha256": "7424d4f562079483afe4909a03993d22680a0fe0cb26505160a1b8eff9dd4d4a",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/latency/policy.hpp",
+      "bundle_start": 314195,
+      "bundle_end": 315569,
+      "bytes": 1374,
+      "sha256": "a543f239a3bd438df24b89c7924de1d1e724a5c205a8906e8f2024f50ebf2be2",
+      "claude_recovery_sha256": "66dade1a79cc03116f006128f6a20065de80bd32db59dc27d1538dcb39055af7",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/motion/live_flow.cpp",
+      "bundle_start": 315744,
+      "bundle_end": 358993,
+      "bytes": 43249,
+      "sha256": "ffea1856e04369fc2370d06a96c754c5d907bdb146b3566608e792a00a238bf2",
+      "claude_recovery_sha256": "e1e6c7067b105d877b4a6b3086f095deef22c18c421cc5fbbdcd7ccaa8f4c143",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/motion/live_flow.hpp",
+      "bundle_start": 359168,
+      "bundle_end": 364016,
+      "bytes": 4848,
+      "sha256": "4adc10e930ee97033a5c23a93248d95a23556c1eac919c190d04ec1151626234",
+      "claude_recovery_sha256": "38d0cfbe927749b73fd3bbb8827a4e9824ccae89d84570fb1eac8b6cd83dfec4",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/ngx_observe/gpu_timing.cpp",
+      "bundle_start": 364197,
+      "bundle_end": 368700,
+      "bytes": 4503,
+      "sha256": "9e9d93da23b0526e7d39017ee665eaed158e2b5823f4e6c995f983ebb9343476",
+      "claude_recovery_sha256": "1db8b4ca5c539dfb303e5521166b631dc3a6f7c93a609a3fca8348c1d18af7c6",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/ngx_observe/gpu_timing.hpp",
+      "bundle_start": 368881,
+      "bundle_end": 370463,
+      "bytes": 1582,
+      "sha256": "f376db39d52fbaed722144662bad58c8e1a6c3127943061c5d4364bd2342485e",
+      "claude_recovery_sha256": "4f7e0f29cbd88113015875805c1979bb6acc09f9ad034ec916c47d2c73250dc1",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/ngx_observe/ngx_observe.cpp",
+      "bundle_start": 370645,
+      "bundle_end": 445855,
+      "bytes": 75210,
+      "sha256": "4cad5a100b495aefed7da464a20a874d0558dc75309638652666544b2cc67d58",
+      "claude_recovery_sha256": "e655d64066906a58d4aa60c5fb4270281f2ce9b8241de09287ff46239fe5ff09",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/ngx_observe/ngx_observe.hpp",
+      "bundle_start": 446037,
+      "bundle_end": 461597,
+      "bytes": 15560,
+      "sha256": "eb7e5949c9a217a69f93889413f0d527e60063b62feeaff34236ec35bc071f4f",
+      "claude_recovery_sha256": "363556570a794fbe8d1e870f4665d6afa081f6b37110b28eecd2a898eb65dc38",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/ngx_observe/size_confirm.hpp",
+      "bundle_start": 461780,
+      "bundle_end": 473868,
+      "bytes": 12088,
+      "sha256": "b8ae77bf33cdfd677c58d1d23a609501cea925f306fcc1d1912d068cf68aca9b",
+      "claude_recovery_sha256": "87a7920acb0395e05711b890518f9cfd24a87d56889cc29f93fe40f11a75bd58",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/nr/nr_pass.cpp",
+      "bundle_start": 474037,
+      "bundle_end": 523791,
+      "bytes": 49754,
+      "sha256": "218bee80608555987586cec087029e4ba745a38daed0b97d1b2d59843b49bb5b",
+      "claude_recovery_sha256": "7dd60c4e81131237373be544e241be2839ef855c4349f9d3743011f9ad00ad1d",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/nr/nr_pass.hpp",
+      "bundle_start": 523960,
+      "bundle_end": 528518,
+      "bytes": 4558,
+      "sha256": "81fd9f2ba29aa4e040bcec8c0d92aa03d6784a6a0c190461965d0b6d087866d4",
+      "claude_recovery_sha256": "abda08eeac7fbc6ac26c1fe1e7f858ed5319b80e34c8ebd68abc586ec609a4c3",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/nvof/flow_expand.cpp",
+      "bundle_start": 528693,
+      "bundle_end": 538865,
+      "bytes": 10172,
+      "sha256": "8564b9bbba2ddaafbd93f99c66ac35b673041bafa26e679289b9204919d3a2f4",
+      "claude_recovery_sha256": "84115df8a715503a7be1ca90c407d5e31ccff88da4ff3ac3e3be37e94e48d5ee",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/nvof/flow_expand.hpp",
+      "bundle_start": 539040,
+      "bundle_end": 543209,
+      "bytes": 4169,
+      "sha256": "dafdde9196c2c86352c4d9cb68be387a7b7fccbcb6765f1597023abc03ec84d2",
+      "claude_recovery_sha256": "023e8fb2c59fcd3deb9355014286e150316c3a100a5e5ffc7894a3003ab1fe6a",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/nvof/nvof_flow.cpp",
+      "bundle_start": 543382,
+      "bundle_end": 553868,
+      "bytes": 10486,
+      "sha256": "fea452f4028acc838c13176155ef1103d06d7a9083065d3fefe56395b794b8ff",
+      "claude_recovery_sha256": "721b76c2e4168d160cf47464535d7350ceddad5f8f0d874d6c73a5535509b6d7",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/nvof/nvof_flow.hpp",
+      "bundle_start": 554041,
+      "bundle_end": 558994,
+      "bytes": 4953,
+      "sha256": "3fb5b09534964adf8b6debed231a2b872df972e7776c679bcfc8b4d264396301",
+      "claude_recovery_sha256": "a66325cea07f2f5ed8515d657529d8c5a2cedac9b3b3b711095be6e12bec217a",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/overlay/freeze_watchdog.cpp",
+      "bundle_start": 559176,
+      "bundle_end": 565157,
+      "bytes": 5981,
+      "sha256": "ce918164c2e567f3a957c696336123cf117f1e2264e7c461e28083135539888e",
+      "claude_recovery_sha256": "44ec2e3e5858a6679228ecc87aedc3fe5d87d848f8593d4f37dadc61c14fb205",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/overlay/freeze_watchdog.hpp",
+      "bundle_start": 565339,
+      "bundle_end": 568686,
+      "bytes": 3347,
+      "sha256": "5fb2540f638bf888e95ec990f5307d93ad47d526c77454f2cf7f59a4e58b37d8",
+      "claude_recovery_sha256": "2e94d5bca0c95cfd3bf4588b05a2f0857c1d6ab21528d1d663da375059675a56",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/overlay/menu.cpp",
+      "bundle_start": 568857,
+      "bundle_end": 572418,
+      "bytes": 3561,
+      "sha256": "70c4a7b324892289f902bd420f6be13cd8d8c91c1b05a499e0aebbbf65ece869",
+      "claude_recovery_sha256": "cc680526d1775dae1841f6923007bc5c020daa17b764f13e03d671a079d2d063",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/overlay/menu.hpp",
+      "bundle_start": 572589,
+      "bundle_end": 575340,
+      "bytes": 2751,
+      "sha256": "19218daf611ad1712b2b1664a833ab3a6947112f31c6f3fdc9a65cd2218c4d0b",
+      "claude_recovery_sha256": "9c1c4b126055193b186d20eaeb4ae512efe01d14e1b647ed7edc044d3327c7c4",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/overlay/na_style.hpp",
+      "bundle_start": 575515,
+      "bundle_end": 600381,
+      "bytes": 24866,
+      "sha256": "675543ed632e3b2d8b58ab6bbaeee654ea45e99652b2cce7f51dff3bb08e1650",
+      "claude_recovery_sha256": "a68c8d4134d78f4ce384ce0fb0d4263986aa5afb1d481ae45db38ed73e1833e9",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/overlay/overlay.cpp",
+      "bundle_start": 600555,
+      "bundle_end": 716771,
+      "bytes": 116216,
+      "sha256": "8ef6e81dc1aa837339edf29c985dd10a0f8ec52e00fd10cb4ef480676218dd8a",
+      "claude_recovery_sha256": "5c4b73eec2bd5106ad96894c71f4b3107954e40af939c444fff8b000e8e346b7",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/overlay/overlay.hpp",
+      "bundle_start": 716945,
+      "bundle_end": 725893,
+      "bytes": 8948,
+      "sha256": "c35adaa5c6dd83ccfdaa731778972910b73267a794930498d9a0c2cb2742564f",
+      "claude_recovery_sha256": "c5022ed738904b004850a63d210d5439a9a70180bf1f2ec4fb76047e0f46144c",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/overlay/presenter.cpp",
+      "bundle_start": 726069,
+      "bundle_end": 783985,
+      "bytes": 57916,
+      "sha256": "139dde63032a4e1cbf00efa7d7a72fc8132156212f7035f29f7fc2f4bdcc6979",
+      "claude_recovery_sha256": "15c7766d699bd4fa5424303a13646807c413aef546fae3156b92d5dc347c5ee6",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/overlay/presenter.hpp",
+      "bundle_start": 784161,
+      "bundle_end": 793370,
+      "bytes": 9209,
+      "sha256": "9b5b667af768b62a7edfd0ba6296f2a1aec08b724deed93f84d17ade88c80a66",
+      "claude_recovery_sha256": "665464e675d1ab80ebd9f52f6dff0ee4af6f8238ea2e34c625823607b23f4d8d",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/overlay/route_a_panel.cpp",
+      "bundle_start": 793550,
+      "bundle_end": 825880,
+      "bytes": 32330,
+      "sha256": "195565f200fba0d0d3f4bac088823534c422223db449d5bcd1b3968a11324c4b",
+      "claude_recovery_sha256": "708b6d6b27298063ca9c5b64927919c6874b278fb92520bf366ec11880039ef4",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/overlay/route_a_panel.hpp",
+      "bundle_start": 826060,
+      "bundle_end": 826278,
+      "bytes": 218,
+      "sha256": "ac2c540ad528a088f907175d2a7d90160554bc76a8dcc232fdf22ca5b3c7ca78",
+      "claude_recovery_sha256": "7b68ff2ded3c4ec5759653619385f7c7c46a21e857509f124ccf7e1dfe507092",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/sl_proxy/sl_proxy.cpp",
+      "bundle_start": 826454,
+      "bundle_end": 839152,
+      "bytes": 12698,
+      "sha256": "f9331d71a887b6e294576c1e530bf01845efacebd0ac112b08891453b98a7724",
+      "claude_recovery_sha256": "0faeb2b7570927763b5f66534169469aba3056cc230a52478df3092715183ff8",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/host_dx12/sl_proxy/sl_proxy_exports.inl",
+      "bundle_start": 839336,
+      "bundle_end": 866818,
+      "bytes": 27482,
+      "sha256": "3aa8d20ff1fb99cfae44dc3f2c0fa0d6b26f2746628c8a41ab3904e73931ab69",
+      "claude_recovery_sha256": "8e04311b68c70700ec8f3c918aba2b330baf6a371374b9ac0c5dc0e915b35745",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/runtime/dxgi_proxy.cpp",
+      "bundle_start": 866985,
+      "bundle_end": 871225,
+      "bytes": 4240,
+      "sha256": "dc310eff593f6bcbe91f68061cf350bc45de51db5f25b716e3875b05203e2852",
+      "claude_recovery_sha256": "8ed305e803d777c6f28c036cffd88dc171d4743a21fa659214eff5e5ceaac526",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "src/runtime/proxy_api.hpp",
+      "bundle_start": 871391,
+      "bundle_end": 871700,
+      "bytes": 309,
+      "sha256": "8409b17ceb3f396e7cfbc12450c3df2713b75b8d40c2462ed08394dbef6981e7",
+      "claude_recovery_sha256": "03ea266d4a56c51b85e64e6f9bfb73b5f8a7bc90d1e67c124b054f8e3f09c5e5",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    },
+    {
+      "path": "shaders/reference_scene.hlsl",
+      "bundle_start": 871869,
+      "bundle_end": 873188,
+      "bytes": 1319,
+      "sha256": "ab8a8b39c62311f4bf7c2dc565762b6b055aa5666412a64c52e14a8d9e4fcf65",
+      "claude_recovery_sha256": "dc0883efbf690d1a612ba19057f46dab28f3cb426a7f7f1b7121f19425600c99",
+      "comparison_to_claude": "line_endings_or_boundary_whitespace_only"
+    }
+  ],
+  "claude_baseline_commit": "4a4a1ed53e355843d3af498f93225fceae5761c2"
+}

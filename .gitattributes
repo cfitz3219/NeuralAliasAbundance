@@ -1,0 +1,2 @@
+# Preserve recovery evidence exactly, including original line endings.
+/docs/recovery/originals/** -text

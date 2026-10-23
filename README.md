@@ -1,5 +1,12 @@
 # NeuralAliasAbundance
 
+> **Recovery status (2026-10-23):** source recovered; full build and runtime not
+> yet revalidated. The original milestone README below is historical. Read
+> [Recovery notes](docs/RECOVERY-NOTES.md) and the
+> [independent review / Claude handoff](docs/CLAUDE-HANDOFF.md) for current gaps,
+> proposed ownership and validation. The source contains later features that the
+> text below does not describe; their presence is not a claim of working support.
+
 Standalone DX12 enhancement framework under development. No ReShade or Alien: Isolation installation is required to build or run this project.
 
 **Milestone 1 is implemented: independent project, DX12 diagnostic scene, settings preview and limited DXGI forwarding prototype. Game enhancement is not implemented yet.**
