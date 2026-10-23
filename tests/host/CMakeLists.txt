@@ -56,3 +56,6 @@ if(NA_HAVE_NGX_SDK)
   na_host_test(ngx_params_test SOURCES ngx_params_test.cpp LIBS host_dx12)
   na_host_test(ngx_optimal_test SOURCES ngx_optimal_test.cpp LIBS host_dx12)
 endif()
+
+# Argon audit #2: depth formats safe to copy as R32F (no device).
+na_host_test(depth_format_test SOURCES depth_format_test.cpp)

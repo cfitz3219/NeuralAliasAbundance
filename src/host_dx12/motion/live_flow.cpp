@@ -1,4 +1,5 @@
 #include "host_dx12/motion/live_flow.hpp"
+#include "host_dx12/depth_format.hpp"
 
 #include <d3dcompiler.h>
 #include <windows.h>
@@ -633,6 +634,8 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalRef& in)
     if (with_depth) {
         D3D12_RESOURCE_DESC dd = in.depth->GetDesc();
         if (static_cast<uint32_t>(dd.Width) != w || dd.Height != h) with_depth = false;
+        // Argon audit #2: 24/16-bit depth can't be copied as R32F; run motion-only instead.
+        if (!na::depth::PlaneZeroCopiesToR32F(dd.Format)) with_depth = false;
     }
     if (!g.motion_copy || g.ref_w != w || g.ref_h != h || g.motion_format != md.Format) {
         if (!create_texture(w, h, DXGI_FORMAT_R32_FLOAT, false, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g.depth_copy) ||
