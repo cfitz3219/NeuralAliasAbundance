@@ -1,3 +1,30 @@
+# 2026-10-23 — Universal DX12 architecture direction
+
+Cort directs universal DX12 injection as the engineering goal and working premise.
+The roadmap revision and Argon audit response are pushed in `75a098b` on
+`astra/architecture-universal-dx12`; PR creation requested through COMMS.
+C-001/M-002 propose persistent upload slicing, expanded motion synthesis and
+backend-qualified frame validation. These are proposed implementation changes;
+no frozen interface or runtime behavior changed in this revision. Coverage gaps
+feed further acquisition experiments. R-101/R-104 fixes remain in PRs #1/#2.
+
+# 2026-10-23 — Phase 1 build contributions pushed
+
+Claude accepted the work split in COMMS; MASTER-PLAN is active. A1 implementation
+is on `astra/a1-cpu-regressions` (`acb29e9`): seven portable CTests / 32 cases pass
+in GCC Release. Six additional actual host framing/loss cases await Windows/MSVC
+CPU CI. A1 is not yet accepted as cross-platform validated. A2 specification is
+on `astra/a2-discovery-contract` (`c2dff24`), including A2-R01/R02/R03 requirements
+for C7/C8/C9. Frozen interfaces and production code remain untouched.
+
+GitHub API calls return Forbidden here, so PR creation is pending; Claude has
+been asked through COMMS to create the PRs from the pushed branches. No early
+peer review or merging is requested. Gate 1 review and Windows validation remain
+outstanding before Phase 2 integration. Read COMMS for current coordination;
+older handoffs below retain their original historical qualifications.
+
+---
+
 # 2026-10-23 — Recovery review; Claude acknowledgment pending
 
 Claude's recovered baseline `4a4a1ed` contains all 74 exported source/shader files
@@ -35,4 +62,4 @@ Current UI is a preview, not persistent configuration or in-gameoverlay. Both pr
 
 Anno read-only audit: x64 PE; Steam916440build16367353; configuredDX12; FSRUpscaling0; DXGI factory imports; no staticNGXmatch, which does not exclude dynamicloading. Executable hash and qualification boundaries in docs/ANNO-1800.md. Game closed at inspection. Need resource/command-list observation with lifecycle tracking and fixture verification before diagnostics-only real-game deployment. No need to ask user to repeat title selection or approve already authorized local project development.
 
-Read WORKLOG and docs/PROVENANCE before continuing. Old broader DX11 proposal is historical; current project is DX12first. Do not promise all-game enhancement or reuse earlier narrow20-50hourNRprototype estimate for Anno's adapter discovery.
+Read WORKLOG and docs/PROVENANCE before continuing. Old broader DX11 proposal is historical; current project is DX12first. Pursue universal DX12 enhancement through discovery and synthesis; use current task estimates for Anno's discovery rather than the earlier narrow NR prototype estimate.
