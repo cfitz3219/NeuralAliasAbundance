@@ -46,10 +46,14 @@ jobs:
       - name: Deployment script tests (C5)
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Continue'   # report, don't abort, so the annotations below always run
           $proxy = Get-ChildItem build -Recurse -Filter sl.interposer.dll | Select-Object -First 1
           $stub = Get-ChildItem build -Recurse -Filter sl_interposer_real.dll | Select-Object -First 1
-          ./scripts/tests/deploy-sl-proxy.tests.ps1 -Proxy $proxy.FullName -Stub $stub.FullName 2>&1 | Tee-Object -FilePath deploy-log.txt
+          Write-Output "::notice::deploy test inputs: proxy=$($proxy.FullName) stub=$($stub.FullName)"
+          # Separate process: an exception inside the test can't kill this step before it is reported.
+          pwsh -NoProfile -File ./scripts/tests/deploy-sl-proxy.tests.ps1 -Proxy "$($proxy.FullName)" -Stub "$($stub.FullName)" *> deploy-log.txt
           $code = $LASTEXITCODE
+          Get-Content deploy-log.txt
           $fails = Select-String -Path deploy-log.txt -Pattern '^FAIL '
           $fails | ForEach-Object { Write-Output "::error::$($_.Line)" }
           if ($code -ne 0 -and -not $fails) {
