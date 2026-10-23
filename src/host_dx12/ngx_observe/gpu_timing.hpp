@@ -2,7 +2,7 @@
 // C4 for R-001 and Gate 1 R-202): timestamp queries recorded on the game's own
 // command list around the original evaluate and resolved into a per-slot
 // readback buffer. When the host's ExecuteCommandLists detour sees that list
-// submitted, it signals the host's fence on that same queue; Poll() reads a
+// submitted, it signals that slot's private fence on that same queue; Poll() reads a
 // slot only after GetCompletedValue() proves that signal passed. No CPU waits,
 // no Present-count guessing. Distinguishes the DLSS pass's GPU time from the
 // Present-cadence fps.
@@ -26,7 +26,7 @@ void End(ID3D12GraphicsCommandList* list);
 
 // From the host's ExecuteCommandLists detour, AFTER the original call returned
 // (game thread; no waits): associates measured lists with the queue that
-// executed them, signals the completion fence there, records its frequency.
+// executed them, signals each selected slot's completion fence there, records its frequency.
 void OnExecuted(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* const* lists);
 
 // From the Present hook: reads slots whose submission fence has completed.
@@ -40,7 +40,7 @@ struct Stats {
     uint32_t enabled;      // 0 if refused by the device, disabled, device removed, or every slot quarantined
     uint64_t skipped_busy; // Begin found no free slot (never stalls)
     uint64_t unsupported;  // list type without timestamp support here (bundle/copy/video)
-    uint64_t quarantined;  // slots retired: never seen submitted, or not completed within kAbandonPresents
+    uint64_t quarantined;  // slots retired: never seen submitted, or not completed within kAbandonPresents, or Signal failed
 };
 Stats GetStats();
 void SetEnabled(bool enabled);
