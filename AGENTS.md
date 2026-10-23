@@ -6,7 +6,7 @@ Read HANDOFF.md and WORKLOG.md before continuing. This is a separate DX12 projec
 
 User wants rough duration and attendance requirements for each task, plain-language explanations and a detailed append-only journal. Record actions, user reports, evidence, failures, corrections and limitations. Update HANDOFF at milestones. Do not overwrite historical qualifications.
 
-Support both existing-upscaler inputs and adapter-based inputs in the architecture. Do not claim automatic compatibility with every DX12 game. Frame Generation remains a clearly disabled placeholder until implemented and verified.
+Universal DX12 DLSS injection is the engineering goal and working design premise. Support existing-upscaler interception, automatic discovery, convention testing, reconstruction and synthesis. Missing inputs create acquisition tasks; validators protect individual submissions while discovery continues. Report measured compatibility separately from the goal. Frame Generation has recovered host code; qualify its core/backend integration and tests before reporting it operational.
 
 Keep game knowledge in adapters, resource ownership and frame identity explicit, and no synchronous GPU diagnostic readbacks in live game callbacks. Test utilities may wait/read back with that scope clearly labeled. Missing inputs or unqualified backends must keep effects unavailable.
 

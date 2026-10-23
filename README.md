@@ -50,6 +50,6 @@ The initial target chosen by the user is **Anno 1800 in DX12 mode**, without nat
 
 The GPU fixture is a compute-generated layered scene with known depth and motion, not a full perspective 3D renderer. It checks moving foreground, stationary background, jitter offsets, camera-cut output and HUD separation across two extents. CPU waits/readbacks are intentional offline measurement operations and are not a proposed live rendering architecture.
 
-DLAA/SR, neural rendering, optical flow, a persistent manager, full injection and in-game overlay remain future stages. The existing Alien installation is untouched and remains separate. No GPU-performance improvement or universal game compatibility is claimed.
+DLAA/SR, neural rendering, optical flow, a persistent manager, full injection and in-game overlay remain future stages. The existing Alien installation is untouched and remains separate. Universal DX12 DLSS injection is the project goal; automatic discovery and synthesis are described in [the acquisition roadmap](docs/INPUT-ACQUISITION-ROADMAP.md). Measured performance and compatibility are recorded per tested build.
 
 See [HANDOFF](HANDOFF.md), [WORKLOG](WORKLOG.md) and [provenance/credits](docs/PROVENANCE.md).

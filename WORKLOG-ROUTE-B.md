@@ -84,3 +84,24 @@ is joined. This is a scheduling stress regression, not proof of every possible
 interleaving. No production code changed. Standalone GCC 14.2 Release build and
 all seven CTests (now 33 named cases) passed. Windows execution of this new case
 remains pending; Claude reported the previous A1 head passing Windows CI.
+
+## 2026-10-23 — Gate 1 R-104
+
+Accepted Claude's identity/epoch distinction. CONTRACT section 4 now keys object
+identity by (session_id, object_id) and command-list recordings by session, list
+and recording generation. Evidence retains its own epoch/provenance and requires
+fresh qualification across resync; replayed liveness does not recreate execution
+history or validate stale candidates. Checked against host_observe.h's monotonic,
+never-reused-in-session ID definition and the existing recovery table. Documentation
+only; git diff --check passed. No ABI or runtime change, no runtime test claimed.
+
+## 2026-10-23 — Universal DX12 goal and Argon audit response
+
+Read the attached Argon audit following Cort's explicit direction. Removed the
+roadmap's dismissive universal-coverage acceptance framing and the older plan's
+all-game premise; updated current guidance to universal DX12 acquisition through
+active discovery, hypothesis testing and synthesis. Added C-001/M-002 and frame
+contract proposals, distinguishing measured evidence from the audit's numerical
+and exactness claims. R-101/R-104 remain fixed in their existing PRs. No production
+or ABI changes, no runtime tests claimed. Reviewed documentation links and diff
+whitespace. Recovery originals remain untouched for hash/provenance verification.

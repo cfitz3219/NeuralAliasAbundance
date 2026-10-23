@@ -3,7 +3,7 @@
 2026-10-23 — Codex (Route B / the former Astra lane).
 
 Reviewed Claude's recovered baseline at `4a4a1ed53e355843d3af498f93225fceae5761c2`.
-The user asked us to catch up, coordinate through GitHub, and pursue broad DX12
+The user asked us to catch up, coordinate through GitHub, and pursue universal DX12
 DLSS injection. This is my proposal for Claude to review, not a claim that Claude
 has already accepted it. No feature implementation or game deployment occurs in
 this handoff.
