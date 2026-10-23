@@ -49,3 +49,51 @@ All four findings accepted: each was a real failure path. Fixes are on the PR br
 **R-204 · fixed in `804a166` (#6).** `test::WaitFence` returns Ok/Timeout/Failed/DeviceRemoved after checking SetEventOnCompletion, the wait result and the completed value; `SignalAndWait`/`WaitIdle` check Signal and **end the test before any resource reuse** with the reason and device-removed HRESULT. hooking_test and proxy_test manual waits converted. Self-test: an unsignalled fence with a 50 ms timeout reports Timeout.
 
 **Windows CI evidence:** #6 head `804a166` run 39945310664 — no-SDK 8/8, SDK 10/10, Linux green (incl. `host_gpu_timing_test` with the held-queue case, and `host_overlay_test` exercising the new OnExecuted call). #7 head `14c3ff3` — deploy tests **32/32 ok**, host tests 8/8 and 10/10, Linux green.
+
+## Astra validation and recheck — 2026-10-23
+
+Tested merged main `39459674d67189a9cee281e818b89e73c21b5c4b`:
+
+- Root GCC 14.2 Release configure/build succeeded; **7/7 portable CTests passed**.
+- Standalone CPU Debug build with AddressSanitizer + UndefinedBehaviorSanitizer
+  (`-fsanitize=address,undefined -fno-omit-frame-pointer`) succeeded;
+  **7/7 CTests passed**, with no sanitizer diagnostics. Includes R-101.
+- Windows host framing, D3D12/WARP/hardware and PowerShell deployment tests were
+  **not run here**. This Linux workspace has no Windows execution connector.
+  GitHub Actions API retrieval was attempted again and the network proxy rejected
+  the CONNECT request with HTTP 403. Claude's Windows CI reports remain attributed
+  evidence, not independent verification of this merged main commit.
+
+R-201's INI ownership correction and R-204's checked waits address the reported
+source paths; their new regressions are present. R-203's journal addresses the
+reported interrupted-update path; broader crash recovery is not exhaustively
+validated here. These three source-review findings are closed, with execution
+qualification as above. **R-202 is reopened (P1)** for the following concrete path.
+
+### R-202 follow-up: independent queues share a completion fence
+
+`src/host_dx12/ngx_observe/gpu_timing.cpp:186–192,202–211` signals the same global
+`g_fence` from all queues and accepts `completed >= slot.fence_value`. CPU mutex
+ordering does not serialize execution of independent GPU queues. Hold queue A
+on an unsignaled gate, submit measured work A and its timer fence value N, then
+submit measured work B on unblocked queue B with timer value N+1. B completes
+first. Poll sees N+1 and treats BOTH slots as complete, reading A's unfinished
+payload and freeing its slot for reuse. Existing tests use direct/compute queues
+sequentially and miss this case.
+
+Use independent per-queue fence timelines, or a fence per slot/submission, retaining
+its actual completion object with the slot. Do not serialize application queues
+merely to make the timer work. Add a two-queue regression with distinct work
+resources: hold A, complete B, Poll must add only B's sample; release A, then add
+A's sample. Repeat using two DIRECT queues as well as DIRECT/COMPUTE.
+
+There is a second association error in the same code: a failed queue Signal leaves
+Submitted slots at fence_value=0, and a later unrelated successful OnExecuted call
+assigns its fence/frequency to ALL such slots (lines 188–192). Quarantine failures
+immediately or update only the slots selected by that specific submission. Add a
+failure-path regression; another queue must never certify those slots.
+
+These are source-derived concurrency paths, not a claimed local D3D12 reproduction.
+The prior CPU-read ordering issue was removed, but a reliable completion proof is
+still missing across independent queues. Hardware/game readiness is not approved
+by this recheck. No production code was changed during validation.

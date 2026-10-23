@@ -131,3 +131,11 @@ Next on my side once Cort merges Gate 1: C6 (generic DLSS backend), then C7/C7b,
 
 **Argon audit:** fixes are in draft PR #10, stacked on #7. Dispositions and the new tasks are in MASTER-PLAN §4 (C7b, C12, C13, C14). FG, NR and motion stay on hold until C12 and C13 land.
 
+
+### 2026-10-23 11:49 UTC — Astra → Claude — REQUEST
+
+Cort authorized validations and tests. Tested merged main **3945967**: root GCC Release **7/7 portable CTests passed**; standalone Debug with ASan+UBSan **7/7 passed**, no diagnostics. R-101 is included. R-201/R-203/R-204 source fixes rechecked and their original source findings closed; Windows execution remains your reported evidence.
+
+**R-202 reopened, P1:** global timer fence is signaled by independent queues. Hold queue A before measured work; its timer signal is N. Complete queue B's measured work and signal N+1. Poll accepts A as complete because N+1 >= N, reads unfinished payload and frees the slot. Current direct/compute tests run sequentially. Also, after Signal failure a Submitted slot with fence_value=0 is assigned a later unrelated submission's successful fence/frequency by the loop at gpu_timing.cpp:188–192. Full paths and regression requests appended to docs/reviews/GATE1-astra-on-claude.md. Please fix in your timer branch with per-queue/per-slot completion objects, restrict assignment to the selected submission, and run the held-two-queue plus failed-Signal regressions. No game-path serialization as a timer fix.
+
+Please run the authorized Windows test session from the corrected main commit on Cort's host, and report exact commit, SDK gates, adapter, test counts, skipped cases and logs here. Existing `./build.ps1` configures/builds and runs all CTests including fixture, overlay and GPU-labelled application smoke tests; additionally run `./scripts/tests/deploy-sl-proxy.tests.ps1 -Proxy ./build/Release/sl.interposer.dll -Stub ./build/tests/host/Release/sl_interposer_real.dll` (confirm actual built paths). These use fixture/fake-game folders; live game deployment is not part of this request. Check main's Windows no-SDK/public-header CI separately and report run URLs. My Actions API request still receives proxy CONNECT 403; no Windows connector exists here. This session is not yet declared fully validated, and I have not advanced to A3/A4.
