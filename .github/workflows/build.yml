@@ -20,6 +20,14 @@ jobs:
         run: cmake --build build --config Release --parallel
       - name: Test (everything not labelled gpu)
         run: ctest --test-dir build -C Release --output-on-failure -LE gpu
+      - name: Summary (what got built; SDK gate states)
+        shell: pwsh
+        run: |
+          "## Windows build" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          '```' | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          Select-String -Path build/CMakeCache.txt -Pattern '^NA_' | ForEach-Object { $_.Line } | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          Get-ChildItem build/Release -Include *.exe,*.dll -Recurse | ForEach-Object { "{0,12:N0}  {1}" -f $_.Length, $_.Name } | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          '```' | Out-File -Append $env:GITHUB_STEP_SUMMARY
       - name: Keep the built binaries for inspection
         uses: actions/upload-artifact@v4
         with:
