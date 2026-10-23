@@ -52,6 +52,53 @@ Check ((Get-FileHash (Join-Path $game 'sl.interposer.dll')).Hash -eq $origHash) 
 Check (-not (Test-Path $realPath)) 'sl_interposer_real.dll gone after rollback'
 Check (-not (Test-Path (Join-Path $game 'NeuralAliasSL.ini'))) 'our ini removed'
 
+# ---- Gate 1 R-201: user-owned INI files are never deleted or overwritten.
+$ini = Join-Path $game 'NeuralAliasSL.ini'
+# (a) deploy WITHOUT -Ini, user creates an INI, rollback keeps it.
+& $deploy -Action Deploy -GameDir $game -ProxyDll $Proxy -ManifestDir $manifests
+Set-Content $ini "user settings A"
+& $deploy -Action Rollback -GameDir $game -ManifestDir $manifests 3>$null
+Check ((Test-Path $ini) -and ((Get-Content -Raw $ini).Trim() -eq 'user settings A')) 'R-201a: rollback keeps a user-created INI'
+Check ((Get-FileHash (Join-Path $game 'sl.interposer.dll')).Hash -eq $origHash) 'R-201a: original restored'
+Remove-Item $ini
+# (b) deploy WITH -Ini, user edits it, redeploy -Ini is refused, rollback keeps the edit.
+& $deploy -Action Deploy -GameDir $game -ProxyDll $Proxy -Ini (Join-Path $work 'NeuralAliasSL.ini') -ManifestDir $manifests
+Set-Content $ini "user edited"
+Throws { & $deploy -Action Deploy -GameDir $game -ProxyDll $Proxy -Ini (Join-Path $work 'NeuralAliasSL.ini') -ManifestDir $manifests } 'R-201b: redeploy -Ini over a user-edited INI'
+Check ((Get-Content -Raw $ini).Trim() -eq 'user edited') 'R-201b: refused redeploy left the edit intact'
+# (c) redeploy WITHOUT -Ini leaves the edited INI alone and does not adopt it.
+& $deploy -Action Deploy -GameDir $game -ProxyDll $Proxy -ManifestDir $manifests
+& $deploy -Action Rollback -GameDir $game -ManifestDir $manifests 3>$null
+Check ((Test-Path $ini) -and ((Get-Content -Raw $ini).Trim() -eq 'user edited')) 'R-201c: rollback keeps the user-edited INI'
+Remove-Item $ini
+# (d) an INI we installed and nobody touched IS removed by rollback.
+& $deploy -Action Deploy -GameDir $game -ProxyDll $Proxy -Ini (Join-Path $work 'NeuralAliasSL.ini') -ManifestDir $manifests
+& $deploy -Action Rollback -GameDir $game -ManifestDir $manifests
+Check (-not (Test-Path $ini)) 'R-201d: rollback removes our own unchanged INI'
+
+# ---- Gate 1 R-203: interrupted updates stay recoverable.
+$proxy2 = Join-Path $work 'proxy-v2.dll'
+Copy-Item $Proxy $proxy2; Add-Content -Path $proxy2 -Value 'v2' -Encoding Ascii   # different hash, still a proxy build
+foreach ($point in 'manifest-write', 'after-proxy-copy', 'before-final-manifest') {
+    & $deploy -Action Deploy -GameDir $game -ProxyDll $Proxy -ManifestDir $manifests
+    $env:NA_DEPLOY_TEST_FAULT = $point
+    Throws { & $deploy -Action Deploy -GameDir $game -ProxyDll $proxy2 -ManifestDir $manifests } "R-203: update interrupted at $point"
+    Remove-Item Env:NA_DEPLOY_TEST_FAULT
+    $st = & $deploy -Action Status -GameDir $game -ManifestDir $manifests
+    Check ($st.InterposerMatchesManifest -and $st.RealMatchesManifest) "R-203: after fault at $point the manifest still owns what is on disk"
+    & $deploy -Action Rollback -GameDir $game -ManifestDir $manifests
+    Check ((Get-FileHash (Join-Path $game 'sl.interposer.dll')).Hash -eq $origHash) "R-203: rollback after fault at $point restores the original"
+}
+# An interrupted update can also be completed by deploying again.
+& $deploy -Action Deploy -GameDir $game -ProxyDll $Proxy -ManifestDir $manifests
+$env:NA_DEPLOY_TEST_FAULT = 'after-proxy-copy'
+try { & $deploy -Action Deploy -GameDir $game -ProxyDll $proxy2 -ManifestDir $manifests } catch { }
+Remove-Item Env:NA_DEPLOY_TEST_FAULT
+& $deploy -Action Deploy -GameDir $game -ProxyDll $proxy2 -ManifestDir $manifests
+$st = & $deploy -Action Status -GameDir $game -ManifestDir $manifests
+Check ($st.State -eq 'deployed' -and (Get-FileHash (Join-Path $game 'sl.interposer.dll')).Hash -eq (Get-FileHash $proxy2).Hash) 'R-203: redeploy completes an interrupted update'
+& $deploy -Action Rollback -GameDir $game -ManifestDir $manifests
+
 # Foreign sl_interposer_real.dll (another mod) blocks a fresh deploy.
 Copy-Item $Stub $realPath
 Throws { & $deploy -Action Deploy -GameDir $game -ProxyDll $Proxy -ManifestDir $manifests } 'deploy over a foreign sl_interposer_real.dll'
