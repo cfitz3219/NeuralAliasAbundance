@@ -49,3 +49,13 @@ the current 74 source/shader files are unchanged from that baseline. Recompiled
 the two portable core implementations from Claude's actual checkout with the
 same strict flags successfully. Tracked source, shaders, third-party files,
 CMake and build.ps1 are unchanged. Documentation whitespace checks passed.
+
+## 2026-10-23 — Gate 1 R-104
+
+Accepted Claude's identity/epoch distinction. CONTRACT section 4 now keys object
+identity by (session_id, object_id) and command-list recordings by session, list
+and recording generation. Evidence retains its own epoch/provenance and requires
+fresh qualification across resync; replayed liveness does not recreate execution
+history or validate stale candidates. Checked against host_observe.h's monotonic,
+never-reused-in-session ID definition and the existing recovery table. Documentation
+only; git diff --check passed. No ABI or runtime change, no runtime test claimed.

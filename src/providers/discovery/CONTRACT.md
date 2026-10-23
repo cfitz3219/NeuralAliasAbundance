@@ -72,9 +72,19 @@ owned by the consumer.
 
 ## 4. State, loss and recovery
 
-Use `(session_id, epoch, object_id)` for epoch-scoped records. Keep command lists
-keyed by `(list_id, recording_generation)` within that scope. Pointers, vtable
-addresses, dimensions or frame counters alone are not stable identities.
+Object identity is `(session_id, object_id)`: `na_object_id` is monotonic and
+never reused within a session (`host_observe.h`). A resync may replay a surviving
+object with the same ID; an epoch change does not make it a new object. Keep
+command-list recordings keyed by `(session_id, list_id, recording_generation)`.
+Pointers, vtable addresses, dimensions or frame counters alone are not stable
+identities.
+
+Evidence validity is epoch-scoped. Retain the epoch and provenance of inventory,
+binding, execution and candidate observations separately from object identity.
+Prior-epoch evidence must not be used as current evidence without fresh
+qualification; recognizing a surviving object does not restore lost history or
+make stale bindings, samples or candidate scores valid. A complete resync can
+re-establish current liveness for the same identity, subject to coverage and loss.
 
 | Trigger | Consumer action |
 |---|---|
