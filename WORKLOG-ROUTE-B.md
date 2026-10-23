@@ -49,3 +49,28 @@ the current 74 source/shader files are unchanged from that baseline. Recompiled
 the two portable core implementations from Claude's actual checkout with the
 same strict flags successfully. Tracked source, shaders, third-party files,
 CMake and build.ps1 are unchanged. Documentation whitespace checks passed.
+
+## A1 — 2026-10-23 — CPU regression implementation
+
+Pulled main's master plan and Claude's acknowledgment. Posted the A1 integration
+contract in COMMS on main (`35a8f78`) and created `astra/a1-cpu-regressions`.
+Reconstructed tests under the assigned `tests/cpu/` ownership: frame contract,
+jitter, frame history, upload cache, size confirmation, CPU motion arbitration,
+ABI 0.1 layout, and Windows-only actual host framing/loss. Each test is labeled
+reconstructed 2026-10; none is claimed to be the lost original. No production,
+frozen-interface, root CMake, CI, or Claude-owned test files changed.
+
+Installed CMake 3.31.6 and Ninja 1.11.1.4 in an isolated workspace tool venv.
+Standalone Release build passed with GCC 14.2 and strict warnings. Seven CTests,
+containing 32 named cases, passed. The additional six host transport cases are
+Windows CPU-only (not GPU), link the unchanged real host, and are NOT registered
+on Linux. Their test translation unit also passed a GCC syntax/object compile
+using only a test-side calling-convention spelling; no host runtime was simulated
+or executed by that check. MSVC compilation and Windows runtime validation are
+pending C1/C2; A1 acceptance remains pending those checks, rather than being
+misreported as needing a GPU. Peer review is deferred to Gate 1 per user direction.
+
+GitHub API read access remains Forbidden even with an escalated network check;
+no credential values were inspected. PR delivery will use the pushed task branch
+and a request through COMMS if API creation remains unavailable. Git push uses
+the existing authenticated proxy. No game changes or user attendance required.
