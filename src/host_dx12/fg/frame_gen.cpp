@@ -1,4 +1,5 @@
 #include "host_dx12/fg/frame_gen.hpp"
+#include "host_dx12/depth_format.hpp"
 
 #include <windows.h>
 #include <wrl/client.h>
@@ -354,6 +355,12 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
         return;
     }
     g.mv_size_mismatch.store(0, std::memory_order_relaxed);
+    if (!na::depth::PlaneZeroCopiesToR32F(dd.Format)) { // Argon audit #2: never issue an invalid depth copy
+        char buf[112];
+        snprintf(buf, sizeof(buf), "Frame Generation is not available in this game yet: it uses %s depth.", na::depth::DepthKind(dd.Format));
+        latch(buf);
+        return;
+    }
     if (!g.recording_depth || g.recording_depth->GetDesc().Width != w ||
         g.recording_depth->GetDesc().Height != h || g.recording_motion->GetDesc().Format != md.Format ||
         g.recording_motion->GetDesc().Width != md.Width || g.recording_motion->GetDesc().Height != md.Height) {
@@ -524,6 +531,13 @@ uint32_t Generate(ID3D12GraphicsCommandList* list, ID3D12Device* device, const F
     if(f.engine_frame && g.last_in.engine_frame!=f.engine_frame) {
         g.need_reset=1; g.active.store(0); g.skipped.fetch_add(1);
         set_reason("Frame Generation is paused: camera and displayed frame do not match.");
+        return 0;
+    }
+    // Argon audit #3: DLSS-G needs the real camera. Never feed zero (singular)
+    // matrices / zero near-far-FOV; without a validated camera, do not generate.
+    if (!g.last_in.camera_valid) {
+        g.need_reset = 1; g.active.store(0); g.skipped.fetch_add(1);
+        set_reason("Frame Generation is paused: the game's camera is not available for this frame.");
         return 0;
     }
 #if defined(NA_HAVE_NGX_SDK)

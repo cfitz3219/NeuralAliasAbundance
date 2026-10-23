@@ -1,0 +1,123 @@
+// Reconstructed 2026-10 (C3). Mirrors WORKLOG-ROUTE-A A3/A8/A17/A71 for the
+// sl.interposer forwarding proxy (deployed beside a Streamline game as
+// sl.interposer.dll, with the original renamed sl_interposer_real.dll):
+//   1. the PE export table carries every generated forwarder plus the typed
+//      wrappers and the identity/diagnostic exports;
+//   2. without NeuralAliasSL.ini the proxy is a pure forwarder: zero hooks;
+//   3. forwarded calls (slIsFeatureSupported, slGetNewFrameToken) reach the
+//      real interposer with arguments and out-params intact;
+//   4. typed wrappers (slInit, slSetFeatureConstants, slGetFeatureSettings,
+//      slSetConstants, slEvaluateFeature) forward untouched;
+//   5. a forwarder whose target is missing in the real DLL (slSetTag) fails to
+//      resolve cleanly instead of crashing: per-export lazy resolution.
+// Usage: sl_proxy_test <sl.interposer.dll> <sl_interposer_real.dll>
+#include "test_support.hpp"
+
+#include <string>
+#include <vector>
+
+namespace {
+struct StubState { uint32_t inits, set_consts, get_settings, set_constants, evaluates; uint32_t last_feature, last_frame, last_id; const void* last_ptr; };
+
+std::vector<std::string> ExportNames(HMODULE m)
+{
+    std::vector<std::string> names;
+    auto base = reinterpret_cast<const uint8_t*>(m);
+    auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dir.VirtualAddress) return names;
+    auto exp = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(base + dir.VirtualAddress);
+    auto rvas = reinterpret_cast<const DWORD*>(base + exp->AddressOfNames);
+    for (DWORD i = 0; i < exp->NumberOfNames; ++i) names.emplace_back(reinterpret_cast<const char*>(base + rvas[i]));
+    return names;
+}
+bool Has(const std::vector<std::string>& v, const char* n) { for (auto& s : v) if (s == n) return true; return false; }
+} // namespace
+
+int wmain(int argc, wchar_t** argv)
+{
+    if (argc < 3) { std::printf("usage: sl_proxy_test <proxy dll> <stub dll>\n"); return 2; }
+
+    // Stage both DLLs in a private folder under their deployment names.
+    wchar_t tmp[MAX_PATH]; GetTempPathW(MAX_PATH, tmp);
+    std::wstring dir = std::wstring(tmp) + L"na_sl_proxy_test_" + std::to_wstring(GetCurrentProcessId());
+    CreateDirectoryW(dir.c_str(), nullptr);
+    const std::wstring proxy_path = dir + L"\\sl.interposer.dll";
+    const std::wstring real_path = dir + L"\\sl_interposer_real.dll";
+    REQUIRE(CopyFileW(argv[1], proxy_path.c_str(), FALSE));
+    REQUIRE(CopyFileW(argv[2], real_path.c_str(), FALSE));
+    REQUIRE(GetFileAttributesW((dir + L"\\NeuralAliasSL.ini").c_str()) == INVALID_FILE_ATTRIBUTES);
+    SetDllDirectoryW(dir.c_str()); // forwarders resolve sl_interposer_real.dll from here
+
+    HMODULE proxy = LoadLibraryW(proxy_path.c_str());
+    REQUIRE(proxy != nullptr);
+
+    // 1. Export table.
+    const auto names = ExportNames(proxy);
+    std::printf("proxy exports: %zu\n", names.size());
+    CHECK(names.size() >= 260);
+    for (const char* n : {"slInit", "slSetFeatureConstants", "slGetFeatureSettings", "slSetConstants", "slEvaluateFeature",
+                          "slIsFeatureSupported", "slGetNewFrameToken", "slSetTag", "D3D12CreateDevice",
+                          "NeuralAliasSLProxyIdentity", "NeuralAliasSLProxyStats"})
+        CHECK(Has(names, n));
+
+    auto identity = reinterpret_cast<const char*(*)()>(GetProcAddress(proxy, "NeuralAliasSLProxyIdentity"));
+    REQUIRE(identity != nullptr);
+    CHECK(std::strstr(identity(), "NeuralAliasAbundance") != nullptr);
+
+    // 2. Inert without an ini: no hooks installed (give the init thread time to run).
+    auto stats = reinterpret_cast<void(*)(uint64_t*, uint64_t*, uint32_t*)>(GetProcAddress(proxy, "NeuralAliasSLProxyStats"));
+    REQUIRE(stats != nullptr);
+    Sleep(300);
+    uint64_t ev = 1, cr = 1; uint32_t hooked = 1;
+    stats(&ev, &cr, &hooked);
+    CHECK(hooked == 0 && ev == 0 && cr == 0);
+
+    // 3. Forwarded calls reach the real interposer.
+    auto supported = reinterpret_cast<int(__cdecl*)(uint32_t, const void*)>(GetProcAddress(proxy, "slIsFeatureSupported"));
+    auto token = reinterpret_cast<int(__cdecl*)(void**, const uint32_t*)>(GetProcAddress(proxy, "slGetNewFrameToken"));
+    REQUIRE(supported && token);
+    CHECK(supported(7, nullptr) == 0x5107);
+    void* tok = nullptr; const uint32_t frame = 42;
+    CHECK(token(&tok, &frame) == 0);
+    CHECK(tok != nullptr && *static_cast<uint32_t*>(tok) == 0xF7A3E);
+
+    HMODULE real = GetModuleHandleW(L"sl_interposer_real.dll");
+    REQUIRE(real != nullptr);
+    auto st = reinterpret_cast<const StubState*(__cdecl*)()>(GetProcAddress(real, "SlStubState"));
+    REQUIRE(st != nullptr);
+    CHECK(st()->last_frame == 42);
+
+    // 4. Typed wrappers forward untouched.
+    int prefs = 0;
+    auto init = reinterpret_cast<bool(__cdecl*)(const void*, int)>(GetProcAddress(proxy, "slInit"));
+    auto setfc = reinterpret_cast<bool(__cdecl*)(uint32_t, const void*, uint32_t, uint32_t)>(GetProcAddress(proxy, "slSetFeatureConstants"));
+    auto getfs = reinterpret_cast<bool(__cdecl*)(uint32_t, const void*, void*)>(GetProcAddress(proxy, "slGetFeatureSettings"));
+    auto setc = reinterpret_cast<bool(__cdecl*)(const void*, uint32_t, uint32_t)>(GetProcAddress(proxy, "slSetConstants"));
+    auto evalf = reinterpret_cast<bool(__cdecl*)(void*, uint32_t, uint32_t, uint32_t)>(GetProcAddress(proxy, "slEvaluateFeature"));
+    REQUIRE(init && setfc && getfs && setc && evalf);
+    CHECK(init(&prefs, 0x1234));
+    CHECK(st()->inits == 1 && st()->last_ptr == &prefs && st()->last_id == 0x1234);
+    int consts = 0;
+    CHECK(setfc(0, &consts, 9, 3));
+    CHECK(st()->set_consts == 1 && st()->last_ptr == &consts && st()->last_frame == 9 && st()->last_id == 3);
+    uint32_t settings = 0;
+    CHECK(getfs(0, &consts, &settings));
+    CHECK(st()->get_settings == 1 && settings == 0x5E77);
+    CHECK(setc(&consts, 11, 0));
+    CHECK(st()->set_constants == 1 && st()->last_frame == 11);
+    CHECK(evalf(nullptr, 1, 12, 0));
+    CHECK(st()->evaluates == 1 && st()->last_feature == 1 && st()->last_frame == 12);
+
+    // 5. Forwarder with a missing target: resolution fails, nothing crashes.
+    CHECK(GetProcAddress(proxy, "slSetTag") == nullptr);
+
+    stats(&ev, &cr, &hooked);
+    CHECK(hooked == 0); // still a pure forwarder
+
+    // The proxy pins nothing without the ini, so it can unload.
+    CHECK(FreeLibrary(proxy) != 0);
+    SetDllDirectoryW(nullptr);
+    return test::finish("sl_proxy_test");
+}
