@@ -202,8 +202,15 @@ int main()
     {
         test::ComPtr<ID3D12Fence> never;
         REQUIRE(SUCCEEDED(d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&never))));
-        CHECK(test::WaitFence(never.Get(), 1, d.event, 50) == test::WaitResult::Timeout);
-        CHECK(test::WaitFence(never.Get(), 0, d.event, 50) == test::WaitResult::Ok);
+        // A timed-out registration remains attached to its fence. Do not reuse
+        // the device's event for it: releasing the fence may signal that event
+        // and spuriously wake a later wait for an unrelated queue.
+        HANDLE timeout_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        REQUIRE(timeout_event != nullptr);
+        CHECK(test::WaitFence(never.Get(), 1, timeout_event, 50) == test::WaitResult::Timeout);
+        CHECK(test::WaitFence(never.Get(), 0, timeout_event, 50) == test::WaitResult::Ok);
+        never.Reset();
+        CloseHandle(timeout_event);
     }
 
     // Overlap independent queues: B's completion must never certify held A.
