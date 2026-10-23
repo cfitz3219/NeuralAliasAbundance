@@ -35,3 +35,12 @@ na_host_test(gpu_timing_test SOURCES gpu_timing_test.cpp LIBS host_dx12)
 na_host_test(ngx_observe_test SOURCES ngx_observe_test.cpp LIBS host_dx12
              ARGS "$<TARGET_FILE:nvngx_stub>")
 add_dependencies(ngx_observe_test nvngx_stub)
+
+# Stand-in for the game's renamed original interposer.
+add_library(sl_interposer_real SHARED sl_stub.cpp)
+set_target_properties(sl_interposer_real PROPERTIES PREFIX "")
+target_link_libraries(sl_interposer_real PRIVATE abundance_options)
+
+na_host_test(sl_proxy_test SOURCES sl_proxy_test.cpp LIBS user32
+             ARGS "$<TARGET_FILE:NeuralAliasSLProxy>" "$<TARGET_FILE:sl_interposer_real>")
+add_dependencies(sl_proxy_test NeuralAliasSLProxy sl_interposer_real)
