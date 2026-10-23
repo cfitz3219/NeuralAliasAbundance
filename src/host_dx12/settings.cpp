@@ -1,0 +1,164 @@
+#include "host_dx12/settings.hpp"
+
+#include <shlobj.h>
+#include <windows.h>
+
+#include <cstdio>
+#include <cwchar>
+
+// Persistence: games under Program Files run unelevated, so writes next to
+// the game DLL fail silently (A17 finding). Defaults are read from the
+// deploy-time ini beside the DLL; user changes are saved to and preferred
+// from %LOCALAPPDATA%\NeuralAlias\NeuralAliasSL.ini.
+namespace na::settings {
+namespace {
+Settings g_settings;
+wchar_t g_ini_defaults[MAX_PATH] = {};
+wchar_t g_ini_user[MAX_PATH] = {};
+std::atomic<uint32_t> g_last_save{0};
+
+void resolve_user_ini()
+{
+    if (g_ini_user[0]) return;
+    wchar_t* local = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local)) && local) {
+        wchar_t dir[MAX_PATH];
+        swprintf_s(dir, L"%s\\NeuralAlias", local);
+        CreateDirectoryW(dir, nullptr);
+        swprintf_s(g_ini_user, L"%s\\NeuralAliasSL.ini", dir);
+        CoTaskMemFree(local);
+    }
+}
+
+void load_from(const wchar_t* ini, bool only_if_present)
+{
+    if (!ini || !ini[0]) return;
+    if (only_if_present && GetFileAttributesW(ini) == INVALID_FILE_ATTRIBUTES) return;
+    g_settings.enabled.store(GetPrivateProfileIntW(L"dlss", L"enabled", 1, ini) ? 1u : 0u);
+    uint32_t mode = GetPrivateProfileIntW(L"dlss", L"mode", 0, ini);
+    if (mode >= static_cast<uint32_t>(DlssMode::Count)) mode = 0;
+    g_settings.dlss_mode.store(mode);
+    int preset = static_cast<int>(
+        GetPrivateProfileIntW(L"dlss", L"preset", static_cast<UINT>(-1), ini));
+    g_settings.preset.store((preset >= 1 && preset <= 13) ? preset : -1);
+    g_settings.ray_reconstruction.store(
+        GetPrivateProfileIntW(L"dlss", L"ray_reconstruction", 0, ini) ? 1u : 0u);
+    g_settings.text_bold.store(
+        GetPrivateProfileIntW(L"overlay", L"text_bold", 0, ini) ? 1u : 0u);
+    g_settings.win_x.store(static_cast<int32_t>(GetPrivateProfileIntW(L"overlay", L"win_x", 0, ini)));
+    g_settings.win_y.store(static_cast<int32_t>(GetPrivateProfileIntW(L"overlay", L"win_y", 0, ini)));
+    g_settings.win_w.store(static_cast<int32_t>(GetPrivateProfileIntW(L"overlay", L"win_w", 0, ini)));
+    g_settings.win_h.store(static_cast<int32_t>(GetPrivateProfileIntW(L"overlay", L"win_h", 0, ini)));
+    auto pct = [&](const wchar_t* key, uint32_t def) {
+        int v = static_cast<int>(GetPrivateProfileIntW(L"nr", key, def, ini));
+        return static_cast<uint32_t>(v < 0 ? 0 : (v > 100 ? 100 : v));
+    };
+    g_settings.nr_enabled.store(GetPrivateProfileIntW(L"nr", L"enabled", 0, ini) ? 1u : 0u);
+    g_settings.nr_intensity.store(pct(L"intensity", 100));
+    g_settings.nr_structure.store(pct(L"structure", 100));
+    g_settings.nr_tone.store(pct(L"tone", 0));
+    g_settings.nr_skin.store(pct(L"skin", 100));
+    int pw = static_cast<int>(GetPrivateProfileIntW(L"nr", L"paper_white", 200, ini));
+    g_settings.nr_paper_white.store(static_cast<uint32_t>(pw < 80 ? 80 : (pw > 1000 ? 1000 : pw)));
+    uint32_t hm = GetPrivateProfileIntW(L"nr", L"hdr_mode", 0, ini);
+    g_settings.nr_hdr_mode.store(hm > 2 ? 0 : hm);
+    g_settings.motion_enabled.store(GetPrivateProfileIntW(L"motion", L"enabled", 0, ini) ? 1u : 0u);
+    uint32_t mg = GetPrivateProfileIntW(L"motion", L"grid", 4, ini);
+    g_settings.motion_grid.store(mg == 1 || mg == 2 || mg == 4 ? mg : 4);
+    uint32_t mp = GetPrivateProfileIntW(L"motion", L"perf", 5, ini);
+    g_settings.motion_perf.store(mp == 5 || mp == 10 || mp == 20 ? mp : 5);
+    uint32_t mdz = GetPrivateProfileIntW(L"motion", L"downscale", 2, ini);
+    g_settings.motion_downscale.store(mdz == 1 || mdz == 2 || mdz == 4 ? mdz : 2);
+    int reflex = static_cast<int>(GetPrivateProfileIntW(L"latency", L"reflex", 1, ini));
+    g_settings.reflex_mode.store(reflex >= 0 && reflex <= 2 ? reflex : 1);
+    g_settings.fg_enabled.store(GetPrivateProfileIntW(L"fg", L"enabled", 0, ini) ? 1u : 0u);
+    g_settings.fg_preset.store(GetPrivateProfileIntW(L"fg", L"preset", 1, ini) == 2 ? 2u : 1u);
+    g_settings.fg_mode.store(GetPrivateProfileIntW(L"fg", L"mode", 1, ini) ? 1u : 0u);
+    uint32_t fm = GetPrivateProfileIntW(L"fg", L"multiplier", 2, ini);
+    g_settings.fg_multiplier.store(fm < 2 ? 2 : (fm > 6 ? 6 : fm));
+    uint32_t ft = GetPrivateProfileIntW(L"fg", L"target_fps", 0, ini);
+    g_settings.fg_target_fps.store(ft > 1000 ? 0 : ft);
+    g_settings.fg_frozen_at.store(GetPrivateProfileIntW(L"fg", L"frozen_at", 0, ini)); // A69
+}
+} // namespace
+
+Settings& Get() { return g_settings; }
+
+void SetIniPath(const wchar_t* path)
+{
+    if (path) wcsncpy_s(g_ini_defaults, path, _TRUNCATE);
+}
+
+const wchar_t* UserIniPath()
+{
+    resolve_user_ini();
+    return g_ini_user;
+}
+
+void Load()
+{
+    load_from(g_ini_defaults, false);
+    resolve_user_ini();
+    load_from(g_ini_user, true); // user choices win when present
+}
+
+bool Save()
+{
+    resolve_user_ini();
+    const wchar_t* ini = g_ini_user[0] ? g_ini_user : g_ini_defaults;
+    if (!ini[0]) {
+        g_last_save.store(2);
+        return false;
+    }
+    wchar_t v[32];
+    bool ok = true;
+    swprintf_s(v, L"%u", g_settings.enabled.load());
+    ok &= WritePrivateProfileStringW(L"dlss", L"enabled", v, ini) != 0;
+    swprintf_s(v, L"%u", g_settings.dlss_mode.load());
+    ok &= WritePrivateProfileStringW(L"dlss", L"mode", v, ini) != 0;
+    swprintf_s(v, L"%d", g_settings.preset.load());
+    ok &= WritePrivateProfileStringW(L"dlss", L"preset", v, ini) != 0;
+    swprintf_s(v, L"%u", g_settings.ray_reconstruction.load());
+    ok &= WritePrivateProfileStringW(L"dlss", L"ray_reconstruction", v, ini) != 0;
+    swprintf_s(v, L"%u", g_settings.text_bold.load());
+    ok &= WritePrivateProfileStringW(L"overlay", L"text_bold", v, ini) != 0;
+    struct { const wchar_t* key; int32_t value; } win[] = {
+        {L"win_x", g_settings.win_x.load()}, {L"win_y", g_settings.win_y.load()},
+        {L"win_w", g_settings.win_w.load()}, {L"win_h", g_settings.win_h.load()}};
+    for (const auto& kv : win) {
+        swprintf_s(v, L"%d", kv.value);
+        ok &= WritePrivateProfileStringW(L"overlay", kv.key, v, ini) != 0;
+    }
+    struct { const wchar_t* key; uint32_t value; } nr[] = {
+        {L"enabled", g_settings.nr_enabled.load()},   {L"intensity", g_settings.nr_intensity.load()},
+        {L"structure", g_settings.nr_structure.load()}, {L"tone", g_settings.nr_tone.load()},
+        {L"skin", g_settings.nr_skin.load()},         {L"paper_white", g_settings.nr_paper_white.load()},
+        {L"hdr_mode", g_settings.nr_hdr_mode.load()}};
+    for (const auto& kv : nr) {
+        swprintf_s(v, L"%u", kv.value);
+        ok &= WritePrivateProfileStringW(L"nr", kv.key, v, ini) != 0;
+    }
+    struct { const wchar_t* key; uint32_t value; } motion[] = {
+        {L"enabled", g_settings.motion_enabled.load()}, {L"grid", g_settings.motion_grid.load()}, {L"perf", g_settings.motion_perf.load()},
+        {L"downscale", g_settings.motion_downscale.load()}};
+    for (const auto& kv : motion) {
+        swprintf_s(v, L"%u", kv.value);
+        ok &= WritePrivateProfileStringW(L"motion", kv.key, v, ini) != 0;
+    }
+    swprintf_s(v, L"%d", g_settings.reflex_mode.load());
+    ok &= WritePrivateProfileStringW(L"latency", L"reflex", v, ini) != 0;
+    struct { const wchar_t* key; uint32_t value; } fg[] = {
+        {L"enabled", g_settings.fg_enabled.load()}, {L"mode", g_settings.fg_mode.load()}, {L"preset", g_settings.fg_preset.load()},
+        {L"multiplier", g_settings.fg_multiplier.load()}, {L"target_fps", g_settings.fg_target_fps.load()},
+        {L"frozen_at", g_settings.fg_frozen_at.load()}};
+    for (const auto& kv : fg) {
+        swprintf_s(v, L"%u", kv.value);
+        ok &= WritePrivateProfileStringW(L"fg", kv.key, v, ini) != 0;
+    }
+    g_last_save.store(ok ? 1u : 2u);
+    return ok;
+}
+
+uint32_t LastSaveResult() { return g_last_save.load(); }
+
+} // namespace na::settings

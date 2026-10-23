@@ -1,0 +1,32 @@
+# Build outputs
+/build/
+/out/
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.dll
+*.lib
+*.exp
+
+# Machine-specific / private (COLLABORATION.md rules 4-5)
+/local/
+captures/
+*.raw
+*.log
+
+# NVIDIA SDKs and runtimes are never committed
+/third_party/nvidia/
+nvsdk_ngx*.h
+nvapi*.h
+nvOpticalFlow*.h
+pclstats.h
+nvngx*.dll
+
+# Agent worktrees
+/.worktrees/
+
+# Editors
+.vs/
+.vscode/
+*.user
