@@ -44,3 +44,6 @@ target_link_libraries(sl_interposer_real PRIVATE abundance_options)
 na_host_test(sl_proxy_test SOURCES sl_proxy_test.cpp LIBS user32
              ARGS "$<TARGET_FILE:NeuralAliasSLProxy>" "$<TARGET_FILE:sl_interposer_real>")
 add_dependencies(sl_proxy_test NeuralAliasSLProxy sl_interposer_real)
+
+na_host_test(capture_test SOURCES capture_test.cpp LIBS host_capture
+             ARGS "${CMAKE_CURRENT_BINARY_DIR}/capture-test-out")
