@@ -93,10 +93,12 @@ int wmain(int argc, wchar_t** argv)
 
     // Retire everything (GPU idle first), then unload the proxy.
     {
-        test::ComPtr<ID3D12Fence> fence; device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
-        queue->Signal(fence.Get(), 1);
+        test::ComPtr<ID3D12Fence> fence;
+        REQUIRE(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))));
         HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (fence->GetCompletedValue() < 1) { fence->SetEventOnCompletion(1, ev); WaitForSingleObject(ev, 10000); }
+        REQUIRE(ev != nullptr);
+        uint64_t fv = 0;
+        test::SignalAndWait(queue.Get(), fence.Get(), fv, ev, device.Get(), "proxy device idle before unload");
         CloseHandle(ev);
     }
     chain.Reset(); queue.Reset(); device.Reset(); f0.Reset(); f1.Reset(); f2.Reset();

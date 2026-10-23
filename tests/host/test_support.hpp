@@ -22,6 +22,43 @@ inline int finish(const char* name) {
     return test::g_failures ? 1 : 0;
 }
 
+// R-204 (Gate 1): every CPU wait on the GPU is checked. A failed Signal /
+// SetEventOnCompletion, a timeout, a wait error or device removal ends the test
+// immediately (before any allocator reset or resource reuse) with the reason,
+// instead of returning as if the GPU were idle.
+enum class WaitResult { Ok, Timeout, Failed, DeviceRemoved };
+inline const char* WaitResultName(WaitResult r) {
+    switch (r) { case WaitResult::Ok: return "ok"; case WaitResult::Timeout: return "timeout";
+                 case WaitResult::Failed: return "failed"; default: return "device removed"; }
+}
+inline WaitResult WaitFence(ID3D12Fence* fence, uint64_t value, HANDLE event, DWORD timeout_ms) {
+    uint64_t done = fence->GetCompletedValue();
+    if (done == UINT64_MAX) return WaitResult::DeviceRemoved;
+    if (done >= value) return WaitResult::Ok;
+    if (FAILED(fence->SetEventOnCompletion(value, event))) return WaitResult::Failed;
+    const DWORD w = WaitForSingleObject(event, timeout_ms);
+    if (w == WAIT_TIMEOUT) return WaitResult::Timeout;
+    if (w != WAIT_OBJECT_0) return WaitResult::Failed;
+    done = fence->GetCompletedValue();
+    if (done == UINT64_MAX) return WaitResult::DeviceRemoved;
+    return done >= value ? WaitResult::Ok : WaitResult::Failed;
+}
+[[noreturn]] inline void FatalWait(const char* what, WaitResult r, ID3D12Device* device) {
+    const HRESULT reason = device ? device->GetDeviceRemovedReason() : S_OK;
+    std::printf("FATAL GPU wait (%s): %s, device removed reason 0x%08lX - stopping before any resource reuse\n",
+                what, WaitResultName(r), static_cast<unsigned long>(reason));
+    std::fflush(stdout);
+    std::exit(1);
+}
+// Signals `fence` on `queue` with ++value and waits (checked). Tests only.
+inline void SignalAndWait(ID3D12CommandQueue* queue, ID3D12Fence* fence, uint64_t& value, HANDLE event,
+                          ID3D12Device* device, const char* what, DWORD timeout_ms = 10000) {
+    ++value;
+    if (FAILED(queue->Signal(fence, value))) FatalWait(what, WaitResult::Failed, device);
+    const WaitResult r = WaitFence(fence, value, event, timeout_ms);
+    if (r != WaitResult::Ok) FatalWait(what, r, device);
+}
+
 struct Device {
     ComPtr<IDXGIFactory6> factory;
     ComPtr<ID3D12Device> device;
@@ -31,15 +68,8 @@ struct Device {
     uint64_t fence_value = 0;
     bool warp = false;
     ~Device() { if (event) CloseHandle(event); }
-    // Blocks until everything submitted so far has executed. Tests only.
-    void WaitIdle() {
-        ++fence_value;
-        queue->Signal(fence.Get(), fence_value);
-        if (fence->GetCompletedValue() < fence_value) {
-            fence->SetEventOnCompletion(fence_value, event);
-            WaitForSingleObject(event, 10000);
-        }
-    }
+    // Blocks until everything submitted so far has executed; ends the test on any failure.
+    void WaitIdle() { SignalAndWait(queue.Get(), fence.Get(), fence_value, event, device.Get(), "WaitIdle"); }
 };
 // Returns false when no D3D12 device (hardware or WARP) can be created.
 inline bool CreateDevice(Device& d, bool allow_warp = true) {
