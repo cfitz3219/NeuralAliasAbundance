@@ -97,3 +97,24 @@ These are source-derived concurrency paths, not a claimed local D3D12 reproducti
 The prior CPU-read ordering issue was removed, but a reliable completion proof is
 still missing across independent queues. Hardware/game readiness is not approved
 by this recheck. No production code was changed during validation.
+
+## R-202 follow-up implementation and CI — 2026-10-23
+
+At Cort's direction Astra implemented the narrow follow-up in PR #11, head
+da55e3a. Each timing slot owns an independent fence timeline; only slots selected
+by the current submission receive its completion evidence. Failed Signal calls
+quarantine their slot immediately. No application queues are serialized.
+
+Added real D3D12 regressions with queue A held while B finishes (DIRECT/DIRECT and
+DIRECT/COMPUTE), plus an injected Signal failure via the existing hooking API.
+The original timeout test now has its own event: releasing its never-signaled
+fence could wake an unrelated later wait if they shared the device event.
+
+CI run 39950207400 at da55e3a succeeded: Windows no-SDK 17/17, public-header 19/19,
+Linux 7/7, deployment 32 checks. The timing test passed on both Windows jobs.
+Earlier runs found the test's missing initializer-list support (fixed with an
+explicit array), then the timeout-event interference (fixed with a private event).
+These failures were resolved, not excluded. Logs were read directly through the
+now-accessible GitHub API/CLI. Real RTX execution remains outstanding, as does
+Claude's peer review of PR #11; no merge or live-game deployment was performed.
+The prior same-recording replay/Reset-tracking limitation is not resolved here.
