@@ -3,6 +3,8 @@
 #include "test_support.hpp"
 #include "host_dx12/depth_format.hpp"
 
+#include <initializer_list>
+
 int main()
 {
     using na::depth::PlaneZeroCopiesToR32F;
