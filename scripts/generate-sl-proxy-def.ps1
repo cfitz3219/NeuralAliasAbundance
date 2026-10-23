@@ -29,7 +29,7 @@ param(
         slSetConstants        = 'pinned-layout observation wrapper in sl_proxy.cpp'
         slSetFeatureConstants = 'typed wrapper in sl_proxy.cpp (A71 observation)'
     },
-    [string] $Output = (Join-Path $PSScriptRoot '..\src\host_dx12\sl_proxy\sl_proxy_exports.inl'),
+    [string] $Output = [IO.Path]::Combine($PSScriptRoot, '..', 'src', 'host_dx12', 'sl_proxy', 'sl_proxy_exports.inl'),
     [string] $Target = 'sl_interposer_real'
 )
 $ErrorActionPreference = 'Stop'

@@ -72,9 +72,10 @@ int main()
         l.list->Close();
         ID3D12CommandList* lists[] = {l.list.Get()};
         q2->ExecuteCommandLists(1, lists);
-        test::ComPtr<ID3D12Fence> f; d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f));
-        q2->Signal(f.Get(), 1);
-        if (f->GetCompletedValue() < 1) { f->SetEventOnCompletion(1, d.event); WaitForSingleObject(d.event, 10000); }
+        test::ComPtr<ID3D12Fence> f;
+        REQUIRE(SUCCEEDED(d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f))));
+        uint64_t fv = 0;
+        test::SignalAndWait(q2.Get(), f.Get(), fv, d.event, d.device.Get(), "second queue idle"); // ends the test on failure
         CHECK(f->GetCompletedValue() == 1);
         l.Reset();
         CHECK(g_calls.load() == 2);

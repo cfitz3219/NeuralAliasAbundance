@@ -1,4 +1,5 @@
 #include "host_dx12/nr/nr_pass.hpp"
+#include "host_dx12/depth_format.hpp"
 
 #include <d3dcompiler.h>
 #include <windows.h>
@@ -533,6 +534,12 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
         return;
     }
     D3D12_RESOURCE_DESC dd = in.depth->GetDesc(), md = in.motion->GetDesc();
+    if (!na::depth::PlaneZeroCopiesToR32F(dd.Format)) { // Argon audit #2: never issue an invalid depth copy
+        char buf[112];
+        snprintf(buf, sizeof(buf), "Neural Rendering is not available in this game yet: it uses %s depth.", na::depth::DepthKind(dd.Format));
+        latch(buf);
+        return;
+    }
     uint32_t w = static_cast<uint32_t>(dd.Width), h = dd.Height;
     if (static_cast<uint32_t>(md.Width) != w || md.Height != h) {
         g.skipped.fetch_add(1, std::memory_order_relaxed);
