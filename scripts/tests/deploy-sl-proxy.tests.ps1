@@ -6,8 +6,9 @@
 #>
 param([Parameter(Mandatory)][string] $Proxy, [Parameter(Mandatory)][string] $Stub)
 $ErrorActionPreference = 'Stop'
-$deploy = Join-Path $PSScriptRoot '..\deploy-sl-proxy.ps1'
-$gen = Join-Path $PSScriptRoot '..\generate-sl-proxy-def.ps1'
+if ($PSStyle) { $PSStyle.OutputRendering = 'PlainText' }
+$deploy = Join-Path (Join-Path $PSScriptRoot '..') 'deploy-sl-proxy.ps1'
+$gen = Join-Path (Join-Path $PSScriptRoot '..') 'generate-sl-proxy-def.ps1'
 $work = Join-Path ([IO.Path]::GetTempPath()) "na-deploy-test-$PID"
 $game = Join-Path $work 'Fake Game'; $manifests = Join-Path $work 'local'
 New-Item -ItemType Directory -Force $game | Out-Null

@@ -29,7 +29,7 @@ param(
     [Parameter(Mandatory)] [string] $GameDir,
     [string] $ProxyDll,
     [string] $Ini,
-    [string] $ManifestDir = (Join-Path $PSScriptRoot '..\local')
+    [string] $ManifestDir = (Join-Path (Join-Path $PSScriptRoot '..') 'local')
 )
 $ErrorActionPreference = 'Stop'
 
@@ -82,7 +82,8 @@ switch ($Action) {
             if ($PSCmdlet.ShouldProcess($orig, 'replace proxy with new build')) {
                 Copy-Item -LiteralPath $ProxyDll -Destination $orig -Force
                 if ($Ini) { Copy-Item -LiteralPath $Ini -Destination $iniDst -Force }
-                $m.proxy_sha256 = Hash $orig; $m.ini_sha256 = Hash $iniDst; $m.updated = (Get-Date).ToString('o')
+                $m.proxy_sha256 = Hash $orig; $m.ini_sha256 = Hash $iniDst
+                $m | Add-Member -NotePropertyName updated -NotePropertyValue (Get-Date).ToString('o') -Force
                 Write-Manifest $m
                 Write-Host "Updated proxy in $GameDir (original untouched)."
             }

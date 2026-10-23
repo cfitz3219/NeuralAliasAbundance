@@ -50,8 +50,14 @@ jobs:
           $stub = Get-ChildItem build -Recurse -Filter sl_interposer_real.dll | Select-Object -First 1
           ./scripts/tests/deploy-sl-proxy.tests.ps1 -Proxy $proxy.FullName -Stub $stub.FullName 2>&1 | Tee-Object -FilePath deploy-log.txt
           $code = $LASTEXITCODE
-          Select-String -Path deploy-log.txt -Pattern '^(ok|FAIL) ' | ForEach-Object {
-            if ($_.Line -like 'FAIL*') { Write-Output "::error::$($_.Line)" } else { Write-Output "::notice::$($_.Line)" } }
+          $fails = Select-String -Path deploy-log.txt -Pattern '^FAIL '
+          $fails | ForEach-Object { Write-Output "::error::$($_.Line)" }
+          if ($code -ne 0 -and -not $fails) {
+            # Script stopped on an exception: surface its last lines.
+            Get-Content deploy-log.txt | Select-Object -Last 8 | Where-Object { $_.Trim() } | ForEach-Object { Write-Output "::error::$_" }
+          }
+          $ok = (Select-String -Path deploy-log.txt -Pattern '^ok ').Count
+          Write-Output "::notice::deploy-sl-proxy tests: $ok checks ok, $($fails.Count) failed"
           exit $code
       - name: Report failing tests as annotations
         if: failure()
