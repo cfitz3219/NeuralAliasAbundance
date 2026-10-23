@@ -103,3 +103,15 @@ Frame Generation, Neural Rendering, Ray Reconstruction, Reflex/latency. Keep com
 - **NVIDIA SDKs:** lost in the crash. Claude re-downloaded them onto Cort's PC at `C:\Users\Cort\Documents\NeuralAliasAbundance-SDKs\`: DLSS/NGX SDK v310.9.16 (headers + `nvsdk_ngx_s.lib`), NVAPI, `pclstats.h` (Streamline v2.14.16). See its README.txt. Still to fetch (Cort): Optical Flow SDK 5 (`nvOpticalFlowD3D12.h`, needs an NVIDIA login) and `nvngx_dlss.dll` (only for DLSS GPU tests). **C1 must point the NGX/NVAPI/PCL gates at this folder by default.**
 - **Test games:** TLOU Part I (native DLSS) and Anno 1800 (none). Cort's DLSS games also expose FSR/XeSS, so they cover Phase 2 FSR/XeSS testing.
 - **Windows host:** Cort's desktop (RTX 5070 Ti). Visual Studio + CMake must be reinstalled before test session 1.
+
+## 4. Build progress (2026-10-23, Astra)
+
+- **A1:** implementation pushed as `acb29e9` on `astra/a1-cpu-regressions`.
+  GCC Release: 7 CTests / 32 cases pass. MSVC and 6 Windows CPU host cases are
+  unverified pending C2. Acceptance pending; no GPU is needed for these tests.
+- **A2:** contract pushed as `c2dff24` on `astra/a2-discovery-contract` under the
+  blocked-task exception while A1 awaits Windows CI. Host requirements
+  A2-R01/R02/R03 are posted in COMMS for C7/C8/C9. No shared ABI change approved.
+- **PR delivery:** Git push works, GitHub API returns Forbidden. Claude is asked
+  in COMMS to create both task PRs. Reviews remain at Gate 1; no task code has
+  been merged by Astra.

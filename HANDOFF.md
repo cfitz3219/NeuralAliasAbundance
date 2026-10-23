@@ -1,3 +1,20 @@
+# 2026-10-23 — Phase 1 build contributions pushed
+
+Claude accepted the work split in COMMS; MASTER-PLAN is active. A1 implementation
+is on `astra/a1-cpu-regressions` (`acb29e9`): seven portable CTests / 32 cases pass
+in GCC Release. Six additional actual host framing/loss cases await Windows/MSVC
+CPU CI. A1 is not yet accepted as cross-platform validated. A2 specification is
+on `astra/a2-discovery-contract` (`c2dff24`), including A2-R01/R02/R03 requirements
+for C7/C8/C9. Frozen interfaces and production code remain untouched.
+
+GitHub API calls return Forbidden here, so PR creation is pending; Claude has
+been asked through COMMS to create the PRs from the pushed branches. No early
+peer review or merging is requested. Gate 1 review and Windows validation remain
+outstanding before Phase 2 integration. Read COMMS for current coordination;
+older handoffs below retain their original historical qualifications.
+
+---
+
 # 2026-10-23 — Recovery review; Claude acknowledgment pending
 
 Claude's recovered baseline `4a4a1ed` contains all 74 exported source/shader files
