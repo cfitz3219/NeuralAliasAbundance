@@ -100,9 +100,9 @@ Frame Generation, Neural Rendering, Ray Reconstruction, Reflex/latency. Keep com
 ---
 
 ## 3. Environment (answered by Cort 2026-10-23)
-- **NVIDIA SDKs:** lost in the crash. Claude re-downloaded them onto Cort's PC at `C:\Users\Cort\Documents\NeuralAliasAbundance-SDKs\`: DLSS/NGX SDK v310.9.16 (headers + `nvsdk_ngx_s.lib`), NVAPI, `pclstats.h` (Streamline v2.14.16). See its README.txt. Still to fetch (Cort): Optical Flow SDK 5 (`nvOpticalFlowD3D12.h`, needs an NVIDIA login) and `nvngx_dlss.dll` (only for DLSS GPU tests). **C1 must point the NGX/NVAPI/PCL gates at this folder by default.**
+- **NVIDIA SDKs:** all present on Cort's PC at `C:\Users\Cort\Documents\NeuralAliasAbundance-SDKs\`: `nvidia-dlss-sdk\` (NGX 310.9.16 headers + `nvsdk_ngx_s.lib`), `nvapi\`, `pclstats\`, `optical-flow\` (OF SDK 5.0.7 headers incl. `nvOpticalFlowD3D12.h`). DLSS runtime `nvngx_dlss.dll` 310.9.16 is at `C:\Users\Cort\Downloads\nvngx_dlss.dll`. **C1 makes these the default search paths** (overridable by cache variables); missing = feature compiled out.
 - **Test games:** TLOU Part I (native DLSS) and Anno 1800 (none). Cort's DLSS games also expose FSR/XeSS, so they cover Phase 2 FSR/XeSS testing.
-- **Windows host:** Cort's desktop (RTX 5070 Ti). Visual Studio + CMake must be reinstalled before test session 1.
+- **Windows host:** Cort's desktop (RTX 5070 Ti). Installers for Visual Studio and Git are downloaded but **not yet installed** (needed before test session 1).
 
 ## 4. Build progress (2026-10-23, Astra)
 
