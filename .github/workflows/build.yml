@@ -43,6 +43,16 @@ jobs:
               if ($l -match 'Failed|\*\*\*Exception|Not Run|tests failed') { Write-Output "::error::$l" } else { Write-Output "::notice::$l" }
             }
           exit $code
+      - name: Deployment script tests (C5)
+        shell: pwsh
+        run: |
+          $proxy = Get-ChildItem build -Recurse -Filter sl.interposer.dll | Select-Object -First 1
+          $stub = Get-ChildItem build -Recurse -Filter sl_interposer_real.dll | Select-Object -First 1
+          ./scripts/tests/deploy-sl-proxy.tests.ps1 -Proxy $proxy.FullName -Stub $stub.FullName 2>&1 | Tee-Object -FilePath deploy-log.txt
+          $code = $LASTEXITCODE
+          Select-String -Path deploy-log.txt -Pattern '^(ok|FAIL) ' | ForEach-Object {
+            if ($_.Line -like 'FAIL*') { Write-Output "::error::$($_.Line)" } else { Write-Output "::notice::$($_.Line)" } }
+          exit $code
       - name: Report failing tests as annotations
         if: failure()
         shell: pwsh
