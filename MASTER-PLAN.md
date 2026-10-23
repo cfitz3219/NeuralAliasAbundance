@@ -100,9 +100,9 @@ Frame Generation, Neural Rendering, Ray Reconstruction, Reflex/latency. Keep com
 ---
 
 ## 3. Environment (answered by Cort 2026-10-23)
-- **NVIDIA SDKs:** all present on Cort's PC at `C:\Users\Cort\Documents\NeuralAliasAbundance-SDKs\`: `nvidia-dlss-sdk\` (NGX 310.9.16 headers + `nvsdk_ngx_s.lib`), `nvapi\`, `pclstats\`, `optical-flow\` (OF SDK 5.0.7 headers incl. `nvOpticalFlowD3D12.h`). DLSS runtime `nvngx_dlss.dll` 310.9.16 is at `C:\Users\Cort\Downloads\nvngx_dlss.dll`. **C1 makes these the default search paths** (overridable by cache variables); missing = feature compiled out.
+- **NVIDIA SDKs:** all present on Cort's PC at `C:\Users\Cort\Documents\NeuralAliasAbundance-SDKs\`: `nvidia-dlss-sdk\` (NGX 310.9.16 headers + `nvsdk_ngx_s.lib`), `nvapi\`, `pclstats\`, `optical-flow\` (OF SDK 5.0.7 headers incl. `nvOpticalFlowD3D12.h`). DLSS runtime `nvngx_dlss.dll` 310.9.16 lives in `nvidia-dlss-sdk\lib\Windows_x86_64\rel\`. Everything project-related stays inside this one folder. **C1 makes these the default search paths** (overridable by cache variables); missing = feature compiled out.
 - **Test games:** TLOU Part I (native DLSS) and Anno 1800 (none). Cort's DLSS games also expose FSR/XeSS, so they cover Phase 2 FSR/XeSS testing.
-- **Windows host:** Cort's desktop (RTX 5070 Ti). Installers for Visual Studio and Git are downloaded but **not yet installed** (needed before test session 1).
+- **Windows host:** Cort's desktop (RTX 5070 Ti). Visual Studio and Git are **installed** (2026-10-23).
 
 ## 4. Build progress (2026-10-23, Astra)
 
