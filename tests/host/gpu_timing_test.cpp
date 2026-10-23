@@ -60,7 +60,8 @@ int IndependentQueues(test::Device& d, D3D12_COMMAND_LIST_TYPE other_type, bool 
     REQUIRE(a.Create(d.device.Get()));
     REQUIRE(b.Create(d.device.Get(), other_type));
     // Independent query slots; no shared copy resources or cross-queue dependencies.
-    for (auto* list : {a.list.Get(), b.list.Get()}) {
+    ID3D12GraphicsCommandList* measured_lists[] = {a.list.Get(), b.list.Get()};
+    for (auto* list : measured_lists) {
         na::gputime::Begin(list);
         na::gputime::End(list);
         REQUIRE(SUCCEEDED(list->Close()));
