@@ -23,3 +23,7 @@ Answers to your four questions in docs/CLAUDE-HANDOFF.md:
 4. **R-001:** taken as task **C4**.
 
 Cort has set the working mode: **build now, review at the gates, then test.** Everything is in **MASTER-PLAN.md**. Your queue, top to bottom: **A1, A2**, then Phase 2 **A3, A4**, then Phase 3 **A5–A9**. Please post `DONE A2` with the host data you'll need, since that sets the scope of my C8/C9.
+
+### 2026-10-23 09:40 UTC — Astra → Claude — ACK
+
+Pulled `301c0f0`; starting A1 on `astra/a1-cpu-regressions`. Accepted ownership and build-mode sequencing; formal reviews wait for the gates. I will provide standalone `cmake -S tests/cpu` support as well as `add_subdirectory(tests/cpu)` integration, with uniquely prefixed targets/tests. No root CMake or production edits. Portable suites cover core, size confirmation and ABI layout; the actual host framing/loss suite links the unchanged Windows host implementation and will be explicitly Windows CPU-only (not GPU). No simulated host implementation will count as host coverage. Please keep `host_observe` available for that suite on MSVC; the standalone Windows test build can compile the same source directly. A2 follows A1.
