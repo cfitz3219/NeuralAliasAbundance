@@ -8,7 +8,7 @@
 //     (evaluates arrive from many engine threads).
 //  2. OnExecuted() runs in the host's ExecuteCommandLists detour right after
 //     the ORIGINAL call returned. For every armed slot whose list is in that
-//     submission it signals the host's own fence on THAT queue and records the
+//     submission it signals the slot's own fence on THAT queue and records the
 //     value and the queue's timestamp frequency. A queue Signal is ordered
 //     after all work previously submitted to that queue, so fence >= value
 //     proves the resolve completed (the documented D3D12 CPU/GPU contract).
@@ -50,6 +50,8 @@ struct Slot {
     SlotState state = SlotState::Free;
     ID3D12GraphicsCommandList* list = nullptr; // identity while Begun; never dereferenced after End
     ID3D12CommandList* last_list = nullptr;    // identity of the list carrying this slot's resolve (until completion)
+    ComPtr<ID3D12Fence> fence;                // independent timeline: other queues cannot certify this slot
+    uint64_t next_fence_value = 0;
     uint64_t fence_value = 0;
     uint64_t freq = 0;
     uint64_t armed_present = 0;
@@ -58,8 +60,6 @@ struct Slot {
 std::mutex g_m;
 ComPtr<ID3D12Device> g_device;
 ComPtr<ID3D12QueryHeap> g_heap;
-ComPtr<ID3D12Fence> g_fence;
-uint64_t g_fence_next = 0;
 Slot g_slots[kSlots];
 uint64_t g_present_counter = 0;
 std::atomic<bool> g_enabled{true};
@@ -76,10 +76,8 @@ bool ensure()
     D3D12_QUERY_HEAP_DESC qh{};
     qh.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
     qh.Count = kSlots * 2;
-    if (FAILED(g_device->CreateQueryHeap(&qh, IID_PPV_ARGS(&g_heap))) ||
-        FAILED(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence)))) {
+    if (FAILED(g_device->CreateQueryHeap(&qh, IID_PPV_ARGS(&g_heap)))) {
         g_heap.Reset();
-        g_fence.Reset();
         g_failed.store(true);
         return false;
     }
@@ -93,10 +91,10 @@ bool ensure()
         bd.SampleDesc.Count = 1;
         bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
-                                                     nullptr, IID_PPV_ARGS(&s.readback)))) {
+                                                     nullptr, IID_PPV_ARGS(&s.readback))) ||
+            FAILED(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&s.fence)))) {
             g_failed.store(true);
             g_heap.Reset();
-            g_fence.Reset();
             return false;
         }
     }
@@ -172,24 +170,31 @@ void OnExecuted(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* co
 {
     if (!queue || !lists || !count || !g_any_resolved.load(std::memory_order_acquire)) return;
     std::lock_guard<std::mutex> lock(g_m);
-    if (!g_heap || !g_fence) return;
-    bool signal = false;
-    for (Slot& s : g_slots) {
-        if (s.state != SlotState::Armed) continue; // only the first submission after End carries our resolve
-        for (uint32_t k = 0; k < count; ++k) {
-            if (lists[k] == s.last_list) { s.state = SlotState::Submitted; signal = true; break; }
-        }
-    }
-    if (!signal) return;
+    if (!g_heap) return;
     uint64_t freq = 0;
-    if (FAILED(queue->GetTimestampFrequency(&freq))) freq = 0;
-    const uint64_t value = ++g_fence_next;
-    const bool signalled = SUCCEEDED(queue->Signal(g_fence.Get(), value));
+    bool have_frequency = false;
     for (Slot& s : g_slots) {
-        if (s.state != SlotState::Submitted || s.fence_value != 0) continue;
-        // On a failed Signal no completion evidence can ever arrive: leave fence_value 0
-        // so the abandon window quarantines the slot instead of reading it.
-        if (signalled) { s.fence_value = value; s.freq = freq; }
+        if (s.state != SlotState::Armed) continue;
+        bool selected = false;
+        for (uint32_t k = 0; k < count; ++k) {
+            if (lists[k] == s.last_list) { selected = true; break; }
+        }
+        if (!selected) continue;
+        if (!have_frequency) {
+            if (FAILED(queue->GetTimestampFrequency(&freq))) freq = 0;
+            have_frequency = true;
+        }
+        // Only this submission may assign this slot's completion evidence.
+        // A slot is reused only after its preceding signal completed, so its
+        // private fence remains ordered even when subsequent uses change queues.
+        const uint64_t value = ++s.next_fence_value;
+        if (FAILED(queue->Signal(s.fence.Get(), value))) {
+            quarantine(s); // later submissions must never adopt a failed signal
+            continue;
+        }
+        s.fence_value = value;
+        s.freq = freq;
+        s.state = SlotState::Submitted;
     }
 }
 
@@ -198,16 +203,16 @@ void Poll(ID3D12CommandQueue* /*queue*/)
     if (!g_enabled.load()) return;
     std::lock_guard<std::mutex> lock(g_m);
     ++g_present_counter;
-    if (!g_heap || !g_fence) return;
-    const uint64_t completed = g_fence->GetCompletedValue();
-    if (completed == UINT64_MAX) { // device removed: nothing is trustworthy any more
-        g_failed.store(true);
-        return;
-    }
+    if (!g_heap) return;
     uint32_t quarantined = 0;
     for (Slot& s : g_slots) {
         if (s.state == SlotState::Quarantined) { ++quarantined; continue; }
         if (s.state != SlotState::Armed && s.state != SlotState::Submitted) continue;
+        const uint64_t completed = s.fence->GetCompletedValue();
+        if (completed == UINT64_MAX) { // device removed
+            g_failed.store(true);
+            return;
+        }
         const bool done = s.state == SlotState::Submitted && s.fence_value != 0 && completed >= s.fence_value;
         if (!done) {
             if (g_present_counter - s.armed_present >= kAbandonPresents) { quarantine(s); ++quarantined; }

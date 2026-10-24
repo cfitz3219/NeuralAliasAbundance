@@ -14,6 +14,7 @@
 //      frequency; a bundle is counted unsupported;
 //   7. R-204: the checked wait reports a timeout on a fence nobody signals.
 #include "test_support.hpp"
+#include "host_dx12/hooking/vtable_hook.hpp"
 #include "host_dx12/ngx_observe/gpu_timing.hpp"
 
 namespace {
@@ -35,6 +36,68 @@ bool Measured(test::Device& d, test::List& l, ID3D12Resource* dst, ID3D12Resourc
     RecordCopyWork(l.list.Get(), dst, src);
     na::gputime::End(l.list.Get());
     return SUCCEEDED(l.list->Close());
+}
+// Fail exactly the timer's Signal on a real queue, without faking submission.
+using SignalFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64);
+SignalFn g_signal_original = nullptr;
+ID3D12CommandQueue* g_fail_queue = nullptr;
+unsigned g_signal_failures = 0;
+HRESULT STDMETHODCALLTYPE FailSignal(ID3D12CommandQueue* queue, ID3D12Fence* fence, UINT64 value)
+{
+    if (queue == g_fail_queue) { ++g_signal_failures; return E_FAIL; }
+    return g_signal_original(queue, fence, value);
+}
+
+int IndependentQueues(test::Device& d, D3D12_COMMAND_LIST_TYPE other_type, bool fail_signal)
+{
+    D3D12_COMMAND_QUEUE_DESC desc{}; desc.Type = other_type;
+    test::ComPtr<ID3D12CommandQueue> other;
+    REQUIRE(SUCCEEDED(d.device->CreateCommandQueue(&desc, IID_PPV_ARGS(&other))));
+    test::ComPtr<ID3D12Fence> hold, other_done;
+    REQUIRE(SUCCEEDED(d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&hold))));
+    REQUIRE(SUCCEEDED(d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&other_done))));
+    test::List a, b;
+    REQUIRE(a.Create(d.device.Get()));
+    REQUIRE(b.Create(d.device.Get(), other_type));
+    // Independent query slots; no shared copy resources or cross-queue dependencies.
+    ID3D12GraphicsCommandList* measured_lists[] = {a.list.Get(), b.list.Get()};
+    for (auto* list : measured_lists) {
+        na::gputime::Begin(list);
+        na::gputime::End(list);
+        REQUIRE(SUCCEEDED(list->Close()));
+    }
+    const auto before = na::gputime::GetStats();
+    REQUIRE(SUCCEEDED(d.queue->Wait(hold.Get(), 1)));
+    void* signal_target = nullptr;
+    if (fail_signal) {
+        REQUIRE(na::hooking::Initialize());
+        signal_target = (*reinterpret_cast<void***>(d.queue.Get()))[14];
+        g_fail_queue = d.queue.Get();
+        g_signal_failures = 0;
+        REQUIRE(na::hooking::HookVTableSlot(d.queue.Get(), 14, reinterpret_cast<void*>(&FailSignal),
+                                           reinterpret_cast<void**>(&g_signal_original)));
+    }
+    Submit(d.queue.Get(), a.list.Get());
+    if (fail_signal) {
+        REQUIRE(na::hooking::Unhook(signal_target));
+        g_fail_queue = nullptr;
+        CHECK(g_signal_failures == 1);
+        CHECK(na::gputime::GetStats().quarantined == before.quarantined + 1);
+    }
+    Submit(other.Get(), b.list.Get());
+    uint64_t done_value = 0;
+    test::SignalAndWait(other.Get(), other_done.Get(), done_value, d.event, d.device.Get(), "independent queue B");
+    Polls(1);
+    CHECK(na::gputime::GetStats().samples == before.samples + 1); // A still cannot have executed
+    REQUIRE(SUCCEEDED(hold->Signal(1)));
+    d.WaitIdle();
+    Polls(1);
+    CHECK(na::gputime::GetStats().samples == before.samples + (fail_signal ? 1u : 2u));
+    if (fail_signal) na::hooking::Shutdown();
+    std::printf("independent queues: B=%s failed Signal=%s checked\n",
+                other_type == D3D12_COMMAND_LIST_TYPE_DIRECT ? "DIRECT" : "COMPUTE",
+                fail_signal ? "yes" : "no");
+    return 0;
 }
 } // namespace
 
@@ -139,9 +202,22 @@ int main()
     {
         test::ComPtr<ID3D12Fence> never;
         REQUIRE(SUCCEEDED(d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&never))));
-        CHECK(test::WaitFence(never.Get(), 1, d.event, 50) == test::WaitResult::Timeout);
-        CHECK(test::WaitFence(never.Get(), 0, d.event, 50) == test::WaitResult::Ok);
+        // A timed-out registration remains attached to its fence. Do not reuse
+        // the device's event for it: releasing the fence may signal that event
+        // and spuriously wake a later wait for an unrelated queue.
+        HANDLE timeout_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        REQUIRE(timeout_event != nullptr);
+        CHECK(test::WaitFence(never.Get(), 1, timeout_event, 50) == test::WaitResult::Timeout);
+        CHECK(test::WaitFence(never.Get(), 0, timeout_event, 50) == test::WaitResult::Ok);
+        never.Reset();
+        CloseHandle(timeout_event);
     }
+
+    // Overlap independent queues: B's completion must never certify held A.
+    REQUIRE(IndependentQueues(d, D3D12_COMMAND_LIST_TYPE_DIRECT, false) == 0);
+    REQUIRE(IndependentQueues(d, D3D12_COMMAND_LIST_TYPE_COMPUTE, false) == 0);
+    // A failed signal must never be adopted by B's subsequent submission.
+    REQUIRE(IndependentQueues(d, D3D12_COMMAND_LIST_TYPE_DIRECT, true) == 0);
 
     return test::finish("gpu_timing_test");
 }
