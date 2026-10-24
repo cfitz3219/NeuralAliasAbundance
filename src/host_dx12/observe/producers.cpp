@@ -871,6 +871,24 @@ bool g_install_ok = false;
 std::vector<void*> g_targets; // install thread only
 char g_shared_report[256] = {};
 
+// Vtable-ENTRY patching (not function patching): the device and queue
+// vtables are static tables in the runtime, shared by every object of the
+// implementation. Replacing the entry leaves the runtime's code untouched
+// (WARP crashed in an unhooked method after prologue patching of its
+// neighbours) and keeps the runtime's internal direct calls unobserved,
+// which is exactly the game-facing surface H1 describes.
+bool patch_entry(void** entry, void* detour, void** orig)
+{
+    DWORD old = 0;
+    if (!VirtualProtect(entry, sizeof(void*), PAGE_READWRITE, &old)) return false;
+    *orig = *entry;
+    InterlockedExchangePointer(entry, detour);
+    DWORD ignored = 0;
+    VirtualProtect(entry, sizeof(void*), old, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), entry, sizeof(void*));
+    return true;
+}
+
 bool hook(void* object, uint32_t slot, void* detour, void** orig, bool required)
 {
     if (!object) {
@@ -878,17 +896,16 @@ bool hook(void* object, uint32_t slot, void* detour, void** orig, bool required)
         g_c.missing.fetch_add(1);
         return true;
     }
-    // Two of our slots resolving to ONE function would route both methods to
-    // the first detour with the wrong signature: refuse the second, report it.
-    void* target = (*static_cast<void***>(object))[slot];
-    if (std::find(g_targets.begin(), g_targets.end(), target) != g_targets.end()) {
+    void** entry = &(*static_cast<void***>(object))[slot];
+    if (*entry == detour) return true; // already ours
+    // Two of our slots resolving to ONE function would be fine for entry
+    // patching, but means the runtime treats them alike: report it.
+    if (std::find(g_targets.begin(), g_targets.end(), *entry) != g_targets.end()) {
         const size_t len = std::strlen(g_shared_report);
         std::snprintf(g_shared_report + len, sizeof(g_shared_report) - len, "%u ", slot);
-        g_c.missing.fetch_add(1);
-        return true; // degraded (reported), not a failed installation
     }
-    g_targets.push_back(target);
-    if (na::hooking::HookVTableSlot(object, slot, detour, orig)) {
+    g_targets.push_back(*entry);
+    if (patch_entry(entry, detour, orig)) {
         g_c.hooks.fetch_add(1);
         return true;
     }
@@ -904,7 +921,7 @@ void* fn(F f) { return reinterpret_cast<void*>(f); }
 bool InstallProducers(ID3D12Device* device, ID3D12CommandQueue* queue, bool hook_queue_execute)
 {
     std::call_once(g_install_once, [&] {
-        if (!device || !queue || !na::hooking::Initialize()) return;
+        if (!device || !queue) return;
         ID3D12Device4* d4 = nullptr;
         ID3D12Device8* d8 = nullptr;
         device->QueryInterface(__uuidof(ID3D12Device4), reinterpret_cast<void**>(&d4));
