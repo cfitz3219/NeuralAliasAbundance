@@ -57,3 +57,13 @@ endif()
 
 na_add_cpu_test(capture_decoder)
 na_add_cpu_test(capture_validity)
+
+# Real H1 producers are optional; standalone CPU builds retain portable tests.
+if(WIN32 AND MSVC AND TARGET host_observe_producers)
+  add_executable(na_capture_consumer capture_consumer_test.cpp)
+  target_link_libraries(na_capture_consumer PRIVATE na_cpu_test_options host_observe_producers dxgi)
+  add_test(NAME na.host.capture_consumer COMMAND na_capture_consumer)
+  add_test(NAME na.host.capture_consumer_warp COMMAND na_capture_consumer --warp)
+  set_tests_properties(na.host.capture_consumer na.host.capture_consumer_warp
+    PROPERTIES LABELS "host;capture" TIMEOUT 30 SKIP_RETURN_CODE 77)
+endif()
