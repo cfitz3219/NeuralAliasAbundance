@@ -14,123 +14,17 @@
 //   8. create / evaluate failures latch off with a reason;
 //   9. Shutdown releases every handle and destroys every parameter object.
 #include "test_support.hpp"
-#include "fake_ngx_params.hpp"
+#include "fake_ngx_runtime.hpp"
 
 #include "core/frame_contract.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
 
 #include <nvsdk_ngx.h>
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
-namespace fake {
-int allocs = 0, destroys = 0, creates = 0, evals = 0;
-std::vector<uintptr_t> released;
-NVSDK_NGX_Result create_result = NVSDK_NGX_Result_Success;
-NVSDK_NGX_Result eval_result = NVSDK_NGX_Result_Success;
-bool available = true;
-std::map<std::string, test::FakeParams::Value> last_create, last_eval;
-uintptr_t last_eval_handle = 0, next_handle = 0x1000;
-
-NVSDK_NGX_Result NVSDK_CONV Optimal(NVSDK_NGX_Parameter* p)
-{
-    unsigned w = 0, h = 0;
-    int q = -1;
-    p->Get(NVSDK_NGX_Parameter_Width, &w);
-    p->Get(NVSDK_NGX_Parameter_Height, &h);
-    p->Get(NVSDK_NGX_Parameter_PerfQualityValue, &q);
-    const unsigned rw = q == NVSDK_NGX_PerfQuality_Value_MaxQuality ? w * 2 / 3 : w / 2;
-    const unsigned rh = q == NVSDK_NGX_PerfQuality_Value_MaxQuality ? h * 2 / 3 : h / 2;
-    p->Set(NVSDK_NGX_Parameter_OutWidth, rw);
-    p->Set(NVSDK_NGX_Parameter_OutHeight, rh);
-    // Old runtimes report no dynamic range: only the minimum is given here,
-    // so the backend must fall back to the optimal size for the maximum.
-    p->Set(NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Min_Render_Width, rw / 2);
-    p->Set(NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Min_Render_Height, rh / 2);
-    return NVSDK_NGX_Result_Success;
-}
-NVSDK_NGX_Result NVSDK_CONV GetCap(NVSDK_NGX_Parameter** out)
-{
-    auto* p = new test::FakeParams();
-    ++allocs;
-    p->Set(NVSDK_NGX_Parameter_SuperSampling_Available, available ? 1 : 0);
-    p->Set(NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver, 0);
-    p->Set(NVSDK_NGX_Parameter_DLSSOptimalSettingsCallback, reinterpret_cast<void*>(&Optimal));
-    *out = p;
-    return NVSDK_NGX_Result_Success;
-}
-NVSDK_NGX_Result NVSDK_CONV Alloc(NVSDK_NGX_Parameter** out)
-{
-    *out = new test::FakeParams();
-    ++allocs;
-    return NVSDK_NGX_Result_Success;
-}
-NVSDK_NGX_Result NVSDK_CONV Destroy(NVSDK_NGX_Parameter* p)
-{
-    delete static_cast<test::FakeParams*>(p);
-    ++destroys;
-    return NVSDK_NGX_Result_Success;
-}
-NVSDK_NGX_Result NVSDK_CONV Create(ID3D12GraphicsCommandList* list, NVSDK_NGX_Feature id, NVSDK_NGX_Parameter* p, NVSDK_NGX_Handle** h)
-{
-    ++creates;
-    if (!list || id != NVSDK_NGX_Feature_SuperSampling) return NVSDK_NGX_Result_FAIL_InvalidParameter;
-    if (NVSDK_NGX_FAILED(create_result)) return create_result;
-    last_create = static_cast<test::FakeParams*>(p)->values;
-    *h = reinterpret_cast<NVSDK_NGX_Handle*>(next_handle++);
-    return NVSDK_NGX_Result_Success;
-}
-NVSDK_NGX_Result NVSDK_CONV Eval(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* h, const NVSDK_NGX_Parameter* p, void*)
-{
-    ++evals;
-    if (!list || !h) return NVSDK_NGX_Result_FAIL_InvalidParameter;
-    last_eval = static_cast<const test::FakeParams*>(p)->values;
-    last_eval_handle = reinterpret_cast<uintptr_t>(h);
-    return eval_result;
-}
-NVSDK_NGX_Result NVSDK_CONV Release(NVSDK_NGX_Handle* h)
-{
-    released.push_back(reinterpret_cast<uintptr_t>(h));
-    return NVSDK_NGX_Result_Success;
-}
-na::dlss::Api MakeApi()
-{
-    na::dlss::Api a;
-    a.get_capability_parameters = reinterpret_cast<void*>(&GetCap);
-    a.allocate_parameters = reinterpret_cast<void*>(&Alloc);
-    a.destroy_parameters = reinterpret_cast<void*>(&Destroy);
-    a.create_feature = reinterpret_cast<void*>(&Create);
-    a.evaluate_feature = reinterpret_cast<void*>(&Eval);
-    a.release_feature = reinterpret_cast<void*>(&Release);
-    return a;
-}
-bool Released(uintptr_t h)
-{
-    for (uintptr_t x : released) if (x == h) return true;
-    return false;
-}
-unsigned U(const std::map<std::string, test::FakeParams::Value>& m, const char* k)
-{
-    auto it = m.find(k);
-    return it == m.end() ? 0xFFFFFFFFu : static_cast<unsigned>(it->second.u);
-}
-int I(const std::map<std::string, test::FakeParams::Value>& m, const char* k)
-{
-    auto it = m.find(k);
-    return it == m.end() ? -999 : static_cast<int>(it->second.i);
-}
-double F(const std::map<std::string, test::FakeParams::Value>& m, const char* k)
-{
-    auto it = m.find(k);
-    return it == m.end() ? -999.0 : it->second.d;
-}
-void* P(const std::map<std::string, test::FakeParams::Value>& m, const char* k)
-{
-    auto it = m.find(k);
-    return it == m.end() ? reinterpret_cast<void*>(0xDEAD) : it->second.p;
-}
-} // namespace fake
 
 namespace {
 // Never dereferenced by the backend (only NGX touches resources).
@@ -388,5 +282,174 @@ int main()
     na::dlss::Shutdown();
     CHECK(fake::allocs == fake::destroys);
     d.WaitIdle();
+
+    // ---- Gate 2 regressions (Astra R-301, R-303, R-305) ----
+    fake::available = true;
+    REQUIRE(na::dlss::Attach(d.device.Get(), fake::MakeApi()));
+    D3D12_COMMAND_QUEUE_DESC q2d{}; q2d.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    test::ComPtr<ID3D12CommandQueue> q2;
+    REQUIRE(SUCCEEDED(d.device->CreateCommandQueue(&q2d, IID_PPV_ARGS(&q2))));
+    test::ComPtr<ID3D12Fence> q2_fence;
+    REQUIRE(SUCCEEDED(d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&q2_fence))));
+    uint64_t q2_value = 0;
+    const auto kick = [&](ID3D12CommandQueue* q) {
+        test::List k; if (!k.Create(d.device.Get())) return; k.list->Close();
+        ID3D12CommandList* ls[] = {k.list.Get()};
+        q->ExecuteCommandLists(1, ls);
+        na::dlss::OnExecuted(q, 1, ls);
+    };
+    const auto view_desc = [](uint64_t view, uint32_t ow, uint32_t oh) {
+        auto e = Desc(1280, 720, ow, oh); e.view_id = view; return e;
+    };
+    std::vector<test::List> keep; // lists recorded but deliberately never executed stay alive
+    keep.reserve(64);
+
+    // R-301: two uses of ONE feature; the later one completes on queue B while
+    // the earlier one is held on queue A. Resizing must not release it.
+    {
+        test::ComPtr<ID3D12Fence> hold2;
+        REQUIRE(SUCCEEDED(d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&hold2))));
+        test::List la, lb;
+        REQUIRE(Record(d, la, view_desc(1, 1920, 1080)));
+        const uintptr_t hf = fake::last_eval_handle;
+        REQUIRE(Record(d, lb, view_desc(1, 1920, 1080)));
+        CHECK(fake::last_eval_handle == hf); // same feature
+        REQUIRE(SUCCEEDED(d.queue->Wait(hold2.Get(), 1)));
+        Submit(d.queue.Get(), la);
+        Submit(q2.Get(), lb);
+        test::SignalAndWait(q2.Get(), q2_fence.Get(), q2_value, d.event, d.device.Get(), "queue B");
+        kick(q2.Get());
+        keep.emplace_back();
+        REQUIRE(Record(d, keep.back(), view_desc(1, 2560, 1440))); // resize -> hf retired
+        CHECK(!fake::Released(hf));                                 // A still holds a use
+        CHECK(na::dlss::GetStats().features_pending == 1);
+        REQUIRE(SUCCEEDED(hold2->Signal(1)));
+        d.WaitIdle();
+        kick(d.queue.Get());
+        CHECK(fake::Released(hf));
+    }
+    // R-301: an earlier ABANDONED use stays sticky after a later tracked use completes.
+    {
+        keep.emplace_back();
+        REQUIRE(Record(d, keep.back(), view_desc(2, 1920, 1080))); // never executed
+        const uintptr_t hf = fake::last_eval_handle;
+        test::List lt;
+        REQUIRE(Record(d, lt, view_desc(2, 1920, 1080)));
+        Submit(d.queue.Get(), lt);
+        d.WaitIdle();
+        for (int i = 0; i < 600; ++i) kick(d.queue.Get()); // the unexecuted record is abandoned
+        const uint64_t leaked = na::dlss::GetStats().features_leaked;
+        test::List lr;
+        REQUIRE(Record(d, lr, view_desc(2, 2560, 1440)));
+        Submit(d.queue.Get(), lr);
+        d.WaitIdle();
+        kick(d.queue.Get());
+        CHECK(!fake::Released(hf));
+        CHECK(na::dlss::GetStats().features_leaked == leaked + 1);
+    }
+    // R-301: an UNTRACKED use (no free completion record) taints its feature for good.
+    {
+        uintptr_t hf = 0;
+        for (int i = 0; i < 40; ++i) { // more evaluations than completion records, none executed
+            keep.emplace_back();
+            REQUIRE(Record(d, keep.back(), view_desc(3, 1920, 1080)));
+            hf = fake::last_eval_handle;
+        }
+        CHECK(na::dlss::GetStats().untracked > 0);
+        for (int i = 0; i < 600; ++i) kick(d.queue.Get()); // free the records again
+        test::List lr;
+        REQUIRE(Record(d, lr, view_desc(3, 2560, 1440)));
+        Submit(d.queue.Get(), lr);
+        d.WaitIdle();
+        kick(d.queue.Get());
+        CHECK(!fake::Released(hf));
+    }
+
+    // R-303: independent views keep independent features and histories.
+    {
+        test::List v1a, v2a, v1b;
+        REQUIRE(Record(d, v1a, view_desc(11, 1920, 1080)));
+        const uintptr_t h_v1 = fake::last_eval_handle;
+        REQUIRE(Record(d, v2a, view_desc(12, 1920, 1080)));
+        const uintptr_t h_v2 = fake::last_eval_handle;
+        CHECK(h_v1 != h_v2);
+        CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 1); // new view starts fresh
+        REQUIRE(Record(d, v1b, view_desc(11, 1920, 1080)));
+        CHECK(fake::last_eval_handle == h_v1);
+        CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0); // its own history continues
+        ID3D12CommandList* ls[] = {v1a.list.Get(), v2a.list.Get(), v1b.list.Get()};
+        d.queue->ExecuteCommandLists(3, ls);
+        na::dlss::OnExecuted(d.queue.Get(), 3, ls);
+        d.WaitIdle();
+        na::dlss::ReleaseView(11); // its source was destroyed
+        kick(d.queue.Get());
+        CHECK(fake::Released(h_v1));
+        test::List v3;
+        REQUIRE(Record(d, v3, view_desc(13, 1920, 1080))); // a recreated source gets a new id
+        CHECK(fake::last_eval_handle != h_v1 && fake::last_eval_handle != h_v2);
+        CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 1);
+        Submit(d.queue.Get(), v3);
+        d.WaitIdle();
+        // A view whose frames execute on different queues restarts its history.
+        test::List w1, w2, w3;
+        REQUIRE(Record(d, w1, view_desc(14, 1920, 1080)));
+        Submit(d.queue.Get(), w1);
+        d.WaitIdle();
+        REQUIRE(Record(d, w2, view_desc(14, 1920, 1080)));
+        CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
+        Submit(q2.Get(), w2);
+        test::SignalAndWait(q2.Get(), q2_fence.Get(), q2_value, d.event, d.device.Get(), "queue hop");
+        REQUIRE(Record(d, w3, view_desc(14, 1920, 1080)));
+        CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 1);
+        Submit(d.queue.Get(), w3);
+        d.WaitIdle();
+        // Work from another device is refused before NGX sees it.
+        test::ComPtr<IDXGIAdapter> warp;
+        test::ComPtr<ID3D12Device> other_dev;
+        if (SUCCEEDED(d.factory->EnumWarpAdapter(IID_PPV_ARGS(&warp))) &&
+            SUCCEEDED(D3D12CreateDevice(warp.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&other_dev))) &&
+            other_dev.Get() != d.device.Get()) {
+            test::List lo;
+            REQUIRE(lo.Create(other_dev.Get()));
+            const int evals = fake::evals;
+            CHECK(!na::dlss::Evaluate(lo.list.Get(), view_desc(15, 1920, 1080)));
+            CHECK(fake::evals == evals);
+            CHECK(std::strstr(na::dlss::GetStats().reason, "different graphics device") != nullptr);
+            lo.list->Close();
+        } else {
+            std::printf("device-mismatch check skipped: no second distinct D3D12 device here\n");
+        }
+    }
+
+    // R-305: when every feature slot is owned, a new feature is refused; no
+    // handle is ever dropped, and every created handle is released exactly once.
+    {
+        test::ComPtr<ID3D12Fence> hold3;
+        REQUIRE(SUCCEEDED(d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&hold3))));
+        REQUIRE(SUCCEEDED(d.queue->Wait(hold3.Get(), 1)));
+        std::vector<test::List> held(24);
+        int refused = 0;
+        for (uint32_t i = 0; i < 24; ++i) {
+            if (!Record(d, held[i], view_desc(20, 1920 + 32 * i, 1080 + 18 * i))) { ++refused; continue; }
+            Submit(d.queue.Get(), held[i]);
+        }
+        CHECK(refused > 0);
+        CHECK(na::dlss::GetStats().refused_busy > 0);
+        CHECK(!na::dlss::GetCapabilities().latched_off); // capacity is transient, not a failure
+        REQUIRE(SUCCEEDED(hold3->Signal(1)));
+        d.WaitIdle();
+        kick(d.queue.Get());
+    }
+    for (int i = 0; i < 600; ++i) kick(d.queue.Get());
+    d.WaitIdle();
+    na::dlss::Shutdown();
+    {
+        // Every handle the fake ever handed out was released exactly once.
+        std::vector<uintptr_t> rel = fake::released;
+        std::sort(rel.begin(), rel.end());
+        CHECK(std::adjacent_find(rel.begin(), rel.end()) == rel.end());
+        CHECK(rel.size() == static_cast<size_t>(fake::next_handle - 0x1000));
+    }
+    CHECK(fake::allocs == fake::destroys);
     return test::finish("dlss_backend_test");
 }
