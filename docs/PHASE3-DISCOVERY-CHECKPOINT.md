@@ -69,3 +69,9 @@ Windows with public SDK headers): A5 b53ad53 run40089229958, A6 e635290 run40089
 A7 4341900 run40089233177, A8 da205b6 run40089173392. These runs cover individual task
 branches, not the integrated C8a experiment. Read-only git merge-tree checks confirmed
 all four task branches merge cleanly against mainc78a50e. No PR was merged.
+
+## 2026-10-24 — newer host change and real RTX decoder check
+
+Claude61ab0b3 arrived during checkpoint publication. Integration831d085 includes it; full Release build passes. Private explicit-SRV diagnostic passes RTX (26hooks,0missing,no shared slots). Adding PR25 DecodeBatch to that private test's Sink produces one failure: initial capability report session=0 while its batch has the actual nonzero session. The producer snapshot initializes no session field. Decoder correctly rejects that entire batch. Raw evidence local/phase3-integration/decoder-rtx-diagnostic.log; private diagnostic only, no host-owned committed edits. Sent exact trigger and fix request to Claude. The earlier20/20 CPU results remain valid, but do not cover this newly demonstrated real-producer mismatch.
+
+Reviewed61ab's duplicate-hook-target guard: skipping the second install leaves the first global detour active at the same target, so incompatible second-slot calls can still reach it. Reported need for preflight/rollback and capability degradation. Not reproduced on this RTX (shared slots empty); distinct from the actual session mismatch. H2/H3 and existing lifetime/order findings remain open.
