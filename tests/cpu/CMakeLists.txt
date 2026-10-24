@@ -88,3 +88,4 @@ if(WIN32 AND MSVC AND TARGET host_dx12)
 endif()
 
 na_add_cpu_test(capture_decoder)
+na_add_cpu_test(capture_validity)
