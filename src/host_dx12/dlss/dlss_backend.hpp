@@ -26,9 +26,12 @@
 // its own view_id and therefore its own feature and temporal history. Ids must
 // never be reused for a different source; ReleaseView() retires a view when its
 // source is destroyed. Work recorded on one device is refused on another. If a
-// view's consecutive evaluations execute on different queues, the next
-// evaluation of that view starts fresh history (no cross-queue ordering is
-// assumed).
+// view's evaluations are submitted on different queues, BeforeExecute() makes
+// the later submission's queue wait (GPU-side) for the earlier evaluation, so
+// one history is never used concurrently (Gate 2 R-303). An evaluation whose
+// predecessor for the same view is recorded on another list and not yet
+// submitted is refused (its order cannot be established); an untracked use
+// retires its feature so the next frame gets separate, fresh state.
 // The caller keeps every input/output resource alive until its submission
 // completes; NGX does not take references.
 //
@@ -114,7 +117,12 @@ struct EvalDesc {
     // dlss_real_test, 2026-10-24): the colour sample for a pixel was taken at
     // (pixel centre - jitter). Passing the opposite sign blurs the result.
     float jitter_x = 0.f, jitter_y = 0.f;
-    float mv_scale_x = 1.f, mv_scale_y = 1.f; // multiply motion values to get render-space pixels
+    // Motion-vector scale (NGX MV.Scale): multiplying the stored motion values by
+    // it gives motion in PIXELS OF THE MOTION TEXTURE'S OWN RESOLUTION, i.e.
+    // render-resolution pixels when mv_display_res is false (MVLowRes) and
+    // output-resolution pixels when it is true. Normalised [-1,1]-style motion
+    // therefore uses that texture's width/height (see FromFrame).
+    float mv_scale_x = 1.f, mv_scale_y = 1.f;
     float pre_exposure = 1.f;
     float exposure_scale = 1.f; // multiplier applied to colour before upscaling (DLSS.Exposure.Scale)
     uint64_t view_id = 0;       // source of these frames (see Views above); 0 = the default view
@@ -167,6 +175,24 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d);
 // and releases retired features whose last use has completed.
 void OnExecuted(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* const* lists);
 
+// From the host's ExecuteCommandLists path, BEFORE the original call: adds the
+// GPU waits that order a view's evaluations across queues (R-303). No CPU wait.
+void BeforeExecute(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* const* lists);
+
+// ARGON-G2-004: the one DLSS start-up/recovery path for every producer (FSR,
+// XeSS, ...), serialised as a single transaction. Already running on `device`
+// -> true. Running on another device -> false, unless that device was removed
+// (the game recreated it after a device loss), in which case the backend is
+// shut down (nothing can be pending on a removed device) and started on
+// `device`. Each device is tried at most once (it is kept alive while
+// remembered, so a recycled pointer can never be mistaken for it).
+bool EnsureOn(ID3D12Device* device, const wchar_t* data_path);
+
+// Test seams (never set in the product): replace our own NGX start-up and the
+// device-removed check.
+void SetInitOwnOverrideForTests(bool (*init)(ID3D12Device* device, const wchar_t* data_path));
+void SetDeviceRemovedProbeForTests(bool (*removed)(ID3D12Device* device));
+
 // The source of `view_id` is gone (e.g. its FSR/XeSS context was destroyed):
 // its feature is retired (released once its uses complete) and the id forgotten.
 void ReleaseView(uint64_t view_id);
@@ -180,6 +206,8 @@ struct Stats {
     uint64_t rejected = 0;          // Evaluate calls refused by validation (incl. wrong device)
     uint64_t untracked = 0;         // evaluations with no free completion record (taint their feature)
     uint64_t refused_busy = 0;      // frames refused because every feature slot is still owned
+    uint64_t refused_order = 0;     // frames refused: the same view's previous frame is recorded elsewhere, unsubmitted
+    uint64_t queue_waits = 0;       // GPU waits added to order a view across queues
     uint32_t views_active = 0;
     uint32_t feature_render_w = 0, feature_render_h = 0, feature_out_w = 0, feature_out_h = 0;
     uint32_t feature_flags = 0;
