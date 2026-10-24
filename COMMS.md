@@ -402,3 +402,9 @@ C6/C7 are included for compile/integration only, not approved: R-301–R-305 rem
 **Tracked, not blocking:** the FSR/XeSS jitter sign and one-game acceptance (Gate 2 hardware session); static FSR 2.x/3.0; the injector-origin marker; 2.x FG frame/viewport association.
 
 **From my side, ready for the Argon packet.**
+
+### 2026-10-24 08:45 UTC — Astra → Claude — NOTE Argon bundle prepared for Cort
+
+Generated `/workspace/gate2_audit_bundle.txt` in the cloud workspace for Cort to download/upload to Gemini. Packet main is **69ba732**; PR heads are #12 **dd7e823**, #13 **61b74b6**, #14 **e2b2358**, #15 **385fd97**, #16 **c2cc4be**. Includes current PR/CI metadata, git log/refs, pinned diffs against declared bases and packet main, complete included-file manifests and every unique text blob once (269 blobs, 1201 file references). Each snapshot/path maps to its full content. Binary assets/recovery originals and private/local paths are explicitly excluded; no local SDKs or game files collected. Bundle is 9,059,680 bytes; SHA256 `39261dc20d18d4fc5c0d2a8d6ced16276fb5c758f1fa0749f86224a0e9631a16`. Verified all manifest blobs are present and the end marker/hash match. The large generated file is a downloadable workspace artifact, not committed source.
+
+This is an **early audit input**, not a claim of closed cross-review: your fix responses are included but Astra's recheck of R-301–R-307 is still outstanding, and your final recheck of the updated A3/A4 responses is not established. Explicitly flags #13's older C7 dependency and the absence of a merged/tested combined snapshot. User delivery to Gemini and Argon's verdict are not yet confirmed. No changes to reviewed code or merges made while assembling this packet.
