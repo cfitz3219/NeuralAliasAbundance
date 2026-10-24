@@ -55,6 +55,7 @@ int main() { return test::run({
         p=make(); ++p.current.frame; CHECK(run(p).verdict==Verdict::Unavailable);
         p=make(); ++p.previous.epoch; CHECK(run(p).verdict==Verdict::Unavailable);
         p=make(); p.motion.completed=false; CHECK(run(p).verdict==Verdict::Unavailable);
+        p=make(); p.motion.content_version=UINT64_MAX; CHECK(run(p).verdict==Verdict::Unavailable);
         p=make(); p.previous.lifetime_valid=false; CHECK(run(p).verdict==Verdict::Unavailable);
     }},
     {"malformed and NaN values cannot be masked out", [] {

@@ -34,8 +34,9 @@ struct Report {
     size_t eligible{}, checked{}, excluded{}, out_of_bounds{};
     double mean_error{}, max_error{}, zero_motion_error{}, mean_magnitude{};
 };
+inline bool Known(uint64_t value) { return value && value!=UINT64_MAX; }
 inline bool Valid(const Frame& f) {
-    if (!f.session || !f.epoch || !f.frame || !f.width || !f.height || f.width>4096 || f.height>4096 ||
+    if (!Known(f.session) || !Known(f.epoch) || !Known(f.frame) || !f.width || !f.height || f.width>4096 || f.height>4096 ||
         !f.completed || !f.lifetime_valid || !std::isfinite(f.jitter_x) || !std::isfinite(f.jitter_y)) return false;
     const size_t n=size_t(f.width)*f.height;
     if (f.color.size()!=n || f.stable.size()!=n) return false;
@@ -71,7 +72,7 @@ inline Report Evaluate(const Frame& previous,const Frame& current,const Motion& 
         current.frame<=previous.frame || current.frame-previous.frame!=1 ||
         previous.width!=current.width || previous.height!=current.height ||
         motion.session!=current.session || motion.epoch!=current.epoch || motion.frame!=current.frame ||
-        !motion.resource || !motion.content_version || !motion.completed || !motion.lifetime_valid ||
+        !Known(motion.resource) || !Known(motion.content_version) || !motion.completed || !motion.lifetime_valid ||
         motion.values.size()!=current.color.size() ||
         !std::isfinite(convention.scale_x) || !std::isfinite(convention.scale_y) ||
         convention.scale_x==0 || convention.scale_y==0 ||
