@@ -117,16 +117,41 @@ int main() { return test::run({
         CHECK(Decode(p).valid);
         Put(p,base+offsetof(na_ev_list_op,payload_bytes),UINT32_MAX);CHECK(!Decode(p).valid);
     }},
+    {"amended operation arrays validate full payloads", [] {
+        for (uint32_t op : {uint32_t(NA_OP_RS_VIEWPORT),uint32_t(NA_OP_RS_SCISSOR),uint32_t(NA_OP_COPY_TEXTURE_REGION)}) {
+            na_ev_list_op e{};e.op=op;e.a[0]=2;
+            e.payload_stride=op==NA_OP_RS_VIEWPORT ? 24u : op==NA_OP_RS_SCISSOR ? 16u : uint32_t(sizeof(na_copy_region));
+            const uint32_t count=op==NA_OP_COPY_TEXTURE_REGION ? 1u : 2u;
+            e.payload_bytes=count*e.payload_stride;e.payload_offset=sizeof(e);
+            auto p=Packet(e,NA_EV_LIST_OP);p.resize(p.size()+e.payload_bytes);
+            Put(p,offsetof(na_event_batch,payload_bytes),uint32_t(sizeof(e)+e.payload_bytes));
+            Put(p,base+offsetof(na_event_header,size_bytes),uint32_t(sizeof(e)+e.payload_bytes));
+            CHECK(Decode(p).valid);
+            Put(p,base+offsetof(na_ev_list_op,payload_stride),uint32_t(1));CHECK(!Decode(p).valid);
+        }
+    }},
     {"H2 incomplete capture remains explicit", [] {
         na_ev_list_op e{};e.op=NA_OP_RS_VIEWPORT;e.a[0]=2;
-        CHECK(Decode(Packet(e,NA_EV_LIST_OP)).incomplete_capture);
-        e.op=NA_OP_RS_SCISSOR;CHECK(Decode(Packet(e,NA_EV_LIST_OP)).incomplete_capture);
+        CHECK(!Decode(Packet(e,NA_EV_LIST_OP)).valid);
+        e.op=NA_OP_RS_SCISSOR;CHECK(!Decode(Packet(e,NA_EV_LIST_OP)).valid);
         e.op=9999;CHECK(Decode(Packet(e,NA_EV_LIST_OP)).incomplete_capture);
         e.op=NA_OP_RESOURCE_BARRIER;e.a[0]=100;e.hdr.flags=NA_EVF_TRUNCATED;
         auto d=Decode(Packet(e,NA_EV_LIST_OP));CHECK(d.valid&&d.incomplete_capture);
     }},
 #endif
 #ifdef NA_SNAP_SYNC_APP_UNKNOWN
+    {"amended root ranges reject out of bounds references", [] {
+        na_ev_root_signature_created e{}; e.range_count=1;e.ranges_offset=sizeof(e);e.range_stride=sizeof(na_root_range);
+        CHECK(!Decode(Packet(e,NA_EV_ROOT_SIGNATURE_CREATED)).valid);
+        e.range_count=0;e.param_count=1;e.params_offset=sizeof(e);e.param_stride=sizeof(na_root_param);
+        auto p=Packet(e,NA_EV_ROOT_SIGNATURE_CREATED);p.resize(p.size()+sizeof(na_root_param));
+        Put(p,offsetof(na_event_batch,payload_bytes),uint32_t(sizeof(e)+sizeof(na_root_param)));
+        Put(p,base+offsetof(na_event_header,size_bytes),uint32_t(sizeof(e)+sizeof(na_root_param)));
+        na_root_param param{};param.param_type=NA_ROOT_TABLE;param.count=1;
+        Put(p,base+sizeof(e),param);CHECK(!Decode(p).valid);
+        param.count=0;param.first_range=UINT32_MAX;Put(p,base+sizeof(e),param);CHECK(!Decode(p).valid);
+        param.first_range=0;Put(p,base+sizeof(e),param);CHECK(Decode(p).valid);
+    }},
     {"H3 snapshots remain incomplete and bounded", [] {
         na_ev_snapshot e{};e.status=NA_SNAP_CAPTURED;e.sync=NA_SNAP_SYNC_APP_UNKNOWN;
         e.requested_bytes=4;e.captured_bytes=4;e.payload_offset=sizeof(e);

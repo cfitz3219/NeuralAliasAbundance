@@ -120,10 +120,15 @@ inline DecodedBatch DecodeBatch(const void* input, size_t readable) {
         if (h.kind == NA_EV_ROOT_SIGNATURE_CREATED) {
             na_ev_root_signature_created e{}; std::memcpy(&e,raw+position,sizeof(e));
             if (!WireArrayFits(h.size_bytes,sizeof(e),e.params_offset,e.param_stride,e.param_count,sizeof(na_root_param))) return {};
+            if (!WireArrayFits(h.size_bytes,sizeof(e),e.ranges_offset,e.range_stride,e.range_count,sizeof(na_root_range))) return {};
             for (uint32_t j=0;j<e.param_count;++j) {
                 na_root_param p{}; std::memcpy(&p,raw+position+e.params_offset+static_cast<size_t>(j)*e.param_stride,sizeof(p));
-                // ABI0.2 only carries the first range and omits table offsets.
-                if (p.param_type == NA_ROOT_TABLE) result.incomplete_capture = true;
+                if (p.param_type == NA_ROOT_TABLE) {
+                    if (p.first_range > e.range_count) return {};
+                    if (p.count > e.range_count-p.first_range && !(h.flags & NA_EVF_TRUNCATED)) return {};
+                    // Structural coverage does not establish runtime descriptor provenance.
+                    result.incomplete_capture = true;
+                }
             }
         } else if (h.kind == NA_EV_LIST_OP) {
             na_ev_list_op e{}; std::memcpy(&e,raw+position,sizeof(e));
@@ -137,11 +142,11 @@ inline DecodedBatch DecodeBatch(const void* input, size_t readable) {
                 count=e.a[0]+e.a[1];element=sizeof(na_view_ref);break;
             case NA_OP_CLEAR_RTV: case NA_OP_CLEAR_DSV: count=1;element=sizeof(na_view_ref);break;
             case NA_OP_RESOURCE_BARRIER: count=e.a[0];element=sizeof(na_barrier);break;
-            case NA_OP_RS_VIEWPORT: case NA_OP_RS_SCISSOR:
-                if(e.a[0]>1) result.incomplete_capture=true;
-                break;
+            case NA_OP_RS_VIEWPORT: count=e.a[0];element=6*sizeof(float);break;
+            case NA_OP_RS_SCISSOR: count=e.a[0];element=4*sizeof(int32_t);break;
             case NA_OP_COPY_TEXTURE_REGION:
-                result.incomplete_capture=true; // offsets/box/footprint not represented
+                count=1;element=sizeof(na_copy_region);
+                result.incomplete_capture=true; // footprint dimensions/format remain absent
                 break;
             default:
                 if(e.op<NA_OP_SET_PIPELINE || e.op>NA_OP_RS_SCISSOR) result.incomplete_capture=true;
