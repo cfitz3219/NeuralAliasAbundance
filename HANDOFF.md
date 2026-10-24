@@ -1,3 +1,22 @@
+# 2026-10-24 — Gate 2 takeover code/tests complete; PR #17 ready
+
+Cort asked Astra to finish Opus's tasks. The combined candidate is
+[PR #17](https://github.com/cfitz3219/NeuralAliasAbundance/pull/17), head
+`7b0339ad6436fb256bbe11ff70d8c88e12328bb0` on `astra/g2-completion`.
+It integrates #12–#16 and completes the remaining backend ordering/lifecycle,
+interceptor lock/exposure, provenance and regression fixes. Both push and PR CI
+are green: Linux 9/9, Windows 24/24, SDK Windows 28/28, deployment 32 checks.
+D3D12 debug-state assertions ran for exposure restoration on success and failure.
+See COMMS for exact evidence and `docs/reviews/GATE2-completion.md` on the branch
+for finding responses. Earlier task PRs remain historical records.
+
+Main's runtime code is not merged or deployed. Next gate steps are independent
+review of the takeover delta/remaining Argon audit, then RTX/runtime/game
+qualification. Fake NGX/software D3D12 CI does not substitute for that session.
+Record-ahead isolation resets history; real-runtime DRS ranges, visual/performance
+impact, FSR/XeSS jitter and physical device-loss recovery need qualification.
+No independent approval of Astra's new changes is claimed.
+
 # 2026-10-24 — Gate 2 Astra fixes validated; peer recheck pending
 
 A3 #12 is at dd7e823: optional Python discovery, explicit fixture skip when absent,
