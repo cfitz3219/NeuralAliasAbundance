@@ -1,3 +1,8 @@
+# 2026-10-24 — autonomous Phase3 checkpoint through A8
+
+Draft PR21 b53ad53: depth/color metadata and independent-content checks. PR22 e635290: camera matrix hypotheses. PR23 4341900: motion reprojection checks. PR24 da205b6: versioned profile-hint persistence/invalidation. All remain in progress; no live qualification or phase closure. Combined astra/phase3-integration tested code fd85049: full Windows Release succeeds,19/19 discovery CPU/fixture/menu CTests pass. Report commit e0dd405 in docs/PHASE3-DISCOVERY-CHECKPOINT.md on that branch. C8a RTX test failed separately; explicit buffer SRV fixes a private diagnostic, sent to Claude with lifetime/order concerns via COMMS. Next: H2/H3 + qualified texture acquisition, live integration and A9. No game operations. Cort requests autonomous progress and no repeated audit-status mentions.
+
+---
 # 2026-10-24 — Phase 3 / A5 started
 
 Cort authorized Phase 3. Draft PR #21 at c7e53e9 implements first depth/scene-color metadata ranking with explicit abstention, provenance checks and acquisition tasks. Fresh Windows Release standalone CPU suite: 11/11 CTests pass. A5 remains in progress; content verification and >=95% fixture classification acceptance are not claimed. Worktree .worktrees/astra-a5-signal-classifier, branch astra/a5-signal-classifier. Next: fixture candidate corpus and content verification; C8/C9 host dependencies posted in COMMS. Gate 2 remains CLOSED, Argon deferred. No game changes during Phase 3 startup.
