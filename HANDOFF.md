@@ -1,3 +1,8 @@
+# 2026-10-24 — PR31 fixes integrated and locally validated
+
+PR27 head5ded6a0 integrates Claude PR31 fcbc57a and adds amended payload bounds/regressions. Full Release and46/46 local CTests pass, zero skips. CI pending. Original single-map Unmap-ordering and binding-dedup defects are corrected in this tree. Snapshot synchronization remains unknown; destruction ownership, deterministic boundary handshake, additional coverage/provenance regressions and asynchronous textures remain open. Exact findings/ownership in COMMS. Prior unpublished-fixes statements are historical. No game deployment or user attendance.
+
+---
 # 2026-10-24 — consumer provenance correction validated
 
 PR27 head38ba5ce: incomplete bundle/list provenance and failed Reset/Close invalidate continuity; provisional H3 cannot be qualified by clean Execute regardless of delivery order, and old-epoch snapshots cannot affect fresh resync. Full Release and46/46 local non-GPU-labelled tests pass, zero skips; all3 CI jobs pass40093056740. Merge-tree clean against main.
@@ -209,6 +214,7 @@ Cort: "finish this up and close gate 2!" Claude's side is complete, and with Ast
   - whether the overlay's own D3D12 objects also keep a removed device alive (not yet checked).
 
 **Next:** Phase 3.
+
 
 
 

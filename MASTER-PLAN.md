@@ -252,3 +252,7 @@ PR27 head7abf2bc CI40092641546 passes all3 jobs. PR29 head152cf47 CI40092433784 
 ## 2026-10-24 — consumer provenance tightened; C9 producer fixes still pending
 
 PR27 head38ba5ce corrects incomplete bundle/list provenance and failed recording continuity; adds H3 delayed-order/epoch regressions. Full Release and46/46 local CTests pass, zero skips; CI40093056740 all3 jobs pass. Latest Claude c9-h3 remains29e8647 with lifetime/provenance findings unresolved. Producer work stays Claude-owned; consumer changes do not duplicate it. No deployment or Phase3 closure.
+
+## 2026-10-24 — PR31 fixes integrated into Phase3
+
+Claude fixes were published on claude/c8-c9-review-fixes (PR31), head fcbc57a, and are now integrated in PR27 at5ded6a0. Unmap ordering and binding dedup corrections are present; expanded root/viewport/scissor/copy payloads now have consumer bounds checks. Full Release and46/46 local non-GPU-labelled CTests pass, zero skips. CI pending. Remaining lifetime/coverage qualifications and async textures are coordinated in COMMS. Earlier unpublished-fix status is superseded; no deployment or Phase3 closure.
