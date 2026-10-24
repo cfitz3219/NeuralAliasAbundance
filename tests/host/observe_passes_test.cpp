@@ -14,6 +14,10 @@
 
 #include <d3dcompiler.h>
 
+#if defined(_MSC_VER)
+#pragma warning(disable : 4324) // pipeline-stream subobjects are padded to pointer alignment by design
+#endif
+
 #include <algorithm>
 #include <cstring>
 #include <mutex>

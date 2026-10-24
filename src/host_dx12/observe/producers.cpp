@@ -1067,11 +1067,18 @@ HRESULT STDMETHODCALLTYPE D_CreateComputePipelineState(ID3D12Device* dev, const 
 }
 
 // Pipeline state stream: subobjects are pointer-aligned {type; payload}.
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324) // padding to pointer alignment IS the stream layout
+#endif
 template <typename T>
 struct alignas(void*) Sub {
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
     T inner;
 };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 template <typename T>
 const T& inner_of(const uint8_t* p) { return reinterpret_cast<const Sub<T>*>(p)->inner; }
 
