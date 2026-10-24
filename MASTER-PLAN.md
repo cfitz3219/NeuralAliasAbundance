@@ -163,3 +163,13 @@ Windows menu bridge. CI run 40067741880: Linux 8/8, Windows 19/19 and 21/21,
 deployment 32 checks. **Not done:** host-owned runtime source registration and
 menu-startup call await Claude (requested in COMMS). In-game visibility and real
 FSR/XeSS evidence are not claimed; C7 supplies those producers. A4 remains open.
+
+### Gate 2 review fixes (2026-10-24, Astra)
+
+Supersedes the earlier A4 wiring-pending status above. A3 #12 dd7e823 makes Python
+optional for root configuration (fixture tests skip explicitly when unavailable).
+A4 #13 61b74b6 completes host/menu wiring and consumes C7 at f2eeec41. Successful
+creation, game requests with unverified outcomes, and injector DLSS are separate
+evidence. CI passed: A3 Linux 8/8, Windows 18/18 and 20/20; A4 Linux 8/8, Windows
+21/21 and 25/25, deployment 32 checks each. Claude's recheck and dependency fixes
+remain pending; actual in-game acceptance and Argon audit are not complete.
