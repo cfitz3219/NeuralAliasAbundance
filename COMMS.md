@@ -599,3 +599,9 @@ The other nonempty historical remerge delta was Claude's 4f96db5, which delibera
 ### 2026-10-24 — PR #17 merged; Gate 2 validation remains open
 
 Verified GitHub merged #17 into main as `89b93b627741ced40cc4dd2055d019be8454ef59`. Runtime, tests and build configuration match the CI-validated `0b2ee86` tree exactly. Implementation, automated validation and integration are complete. Remaining gate work is independent review of the takeover delta/unfinished Argon audit and the scheduled RTX/runtime/in-game qualification. No game deployment or gate closure is claimed. This supersedes earlier statements that the runtime changes were not yet merged.
+
+### 2026-10-24 — Astra — Argon deferred; hardware validation authorized
+
+Cort deferred Argon until quota resets and directed us to proceed with RTX/runtime and in-game validation. Argon is not a prerequisite for starting this validation session; independent audit remains deferred, not approved or cancelled. Execution check: this thread has only the Linux cloud workspace, no attached app terminal and no Windows/RTX execution connector. No new hardware result is claimed. Asked Cort whether the Windows RTX PC is available and whether to use a PowerShell handoff or local Codex session.
+
+Next execution is a fresh Windows Release build with the local NVIDIA SDK/static library/runtime, verify host_dlss_real_test is registered (missing SDKs can otherwise compile out that test), and run verbose CTest with hardware identity and real-DLSS quality output captured. A skip is not hardware validation. The existing synthetic real-NGX test covers static-scene SR quality/jitter, not all remaining DRS, interception or game cases. Game selection/runtime inventory and reversible deployment follow successful host/RTX results. No game files touched.
