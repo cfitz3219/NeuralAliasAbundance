@@ -46,6 +46,7 @@ public:
         if (!batch.valid) { foundational_bad_ = true; return; }
         if (batch.header.session != session_ || batch.header.epoch != epoch_) return;
         if (final_) { foundational_bad_ = true; return; }
+        if (batch.incomplete_capture) detail_bad_ = true;
         if (batch.unknown_foundational) foundational_bad_ = true;
         for (const auto& item : batch.events) {
             const auto& h = item.header;
