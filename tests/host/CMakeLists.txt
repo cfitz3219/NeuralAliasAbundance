@@ -91,7 +91,7 @@ endif()
 
 if(NA_HAVE_NGX_LIB)
   # Gate 2 hardware session: ARGON-G2-004 device loss with the real NGX runtime.
-  na_host_test(dlss_device_loss_test SOURCES dlss_device_loss_test.cpp LIBS host_dlss dxgi
+  na_host_test(dlss_device_loss_test SOURCES dlss_device_loss_test.cpp LIBS host_dlss d3d12 dxgi
                ARGS "${CMAKE_CURRENT_BINARY_DIR}/dlss-device-loss-test" LABELS "gpu;nvidia")
   if(NA_DLSS_DLL)
     add_custom_command(TARGET dlss_device_loss_test POST_BUILD
@@ -103,7 +103,7 @@ endif()
 # runtimes. NA_UPSCALER_RUNTIME_DIR = folder with amd_fidelityfx_dx12.dll
 # (or the loader) and libxess.dll; without it the test SKIPs.
 set(NA_UPSCALER_RUNTIME_DIR "" CACHE PATH "Folder with the official FSR / XeSS runtime DLLs (hardware session)")
-na_host_test(upscaler_jitter_test SOURCES upscaler_jitter_test.cpp LIBS dxgi
+na_host_test(upscaler_jitter_test SOURCES upscaler_jitter_test.cpp LIBS d3d12 dxgi
              ARGS "${NA_UPSCALER_RUNTIME_DIR}" LABELS "gpu")
 target_include_directories(upscaler_jitter_test SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/third_party/ffx-api" "${PROJECT_SOURCE_DIR}/src")
 
