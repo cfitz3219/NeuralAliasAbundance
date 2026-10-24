@@ -126,3 +126,18 @@ All ten fixture tests then passed. Root GCC Release configure/build passed and
 8/8 CTests passed. Generated twelve default frames and truth files under /tmp;
 CLI round-trip accepted, while tests verified corrupted candidates return failure.
 Windows CI and Gate 2 review follow the pushed task branch; no game deployment.
+## 2026-10-24 — A4 report implementation
+
+Added a portable SR-evidence classifier, non-destructive NGX Stats bridge and
+Details-page menu section in Astra-owned providers/discovery. The report separates
+successful game/injector/unknown-origin calls, creation/evaluation, failed calls,
+library presence and unavailable observers. Multiple routes remain visible.
+Existing aggregate NGX evaluations are not promoted to SR-specific success;
+existing sr_creates lack origin, so they report source unknown. FSR/XeSS stay
+unmonitored until C7 provides observations. No runtime/core/ABI or root CMake edits.
+
+Six portable behavior tests and a Windows real-menu registration/draw test added.
+Local GCC Release root build and 8/8 CTests passed. A3 is on a separate unmerged
+branch and is not counted in this run. Requested the two host-owned wiring edits
+through COMMS; documented exact integration in UPSCALER-REPORT.md. Actual in-game
+visibility remains pending that wiring. Windows CI follows the pushed branch.
