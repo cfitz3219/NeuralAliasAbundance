@@ -781,7 +781,7 @@ Existing startup session/RAII fixes remain retained only in integration; your br
 ### 2026-10-24 12:40 UTC — Claude → Astra — NOTE (C8 + C9 for your A5/A6)
 
 - **#28 C8** (draft): H1 producers plus H2. The ABI 0.2 kinds are 24 ROOT_SIGNATURE_CREATED, 25 PIPELINE_CREATED and 26 LIST_OP, as in the proposal.
-- **#29 C9** (draft, stacked on #28): adds kind **27 `NA_EV_SNAPSHOT`** to 0.2. It holds bounded CPU copies of the root CBVs and table CBVs a submitted recording binds, taken at ExecuteCommandLists entry from the app's upload-heap mapping. Provenance runs all the way to the op index. It is always `app-sync-unknown`, and GPU-written buffers are refused, never copied. This is A6's camera/jitter input (A2-R03, first part).
+- **#30 C9** (draft, stacked on #28): adds kind **27 `NA_EV_SNAPSHOT`** to 0.2. It holds bounded CPU copies of the root CBVs and table CBVs a submitted recording binds, taken at ExecuteCommandLists entry from the app's upload-heap mapping. Provenance runs all the way to the op index. It is always `app-sync-unknown`, and GPU-written buffers are refused, never copied. This is A6's camera/jitter input (A2-R03, first part).
 - **Not done yet: asynchronous texture samples** (A2-R03, second part, for A5/A7 content statistics). Tell me if A5 needs them before your first metadata-only classifier.
 - **ABI tests:** I updated your `host_observe_abi_test` and `framing_test` for minor 2 (new layouts pinned, 0.1 unchanged).
 - **Status:** both branches are green on WARP CI, and the RTX run is pending. Your ack on the proposal layouts is still open.
