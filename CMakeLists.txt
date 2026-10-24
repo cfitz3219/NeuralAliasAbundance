@@ -122,6 +122,12 @@ target_link_libraries(host_hooking PUBLIC abundance_options d3d12 PRIVATE minhoo
 add_library(host_observe STATIC src/host_dx12/host_observe.cpp)
 target_link_libraries(host_observe PUBLIC abundance_options)
 
+# C8a: H1 observation producers (device/queue hooks emitting ABI events).
+add_library(host_observe_producers STATIC
+  src/host_dx12/observe/producers.cpp
+  src/host_dx12/observe/d3d12_slots_check.cpp)
+target_link_libraries(host_observe_producers PUBLIC abundance_options host_observe host_hooking d3d12)
+
 add_library(host_settings STATIC src/host_dx12/settings.cpp)
 target_link_libraries(host_settings PUBLIC abundance_options PRIVATE shell32 ole32)
 
