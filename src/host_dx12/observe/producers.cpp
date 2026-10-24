@@ -408,15 +408,29 @@ NA_ORIG(Wait, HRESULT, ID3D12CommandQueue*, ID3D12Fence*, UINT64);
 // Recursion guard: a runtime implementing one Create* through another hooked
 // one must not produce two creations for one object.
 thread_local int t_depth = 0;
+bool trace_on()
+{
+    static const bool on = GetEnvironmentVariableW(L"NEURALALIAS_OBSERVE_TRACE", nullptr, 0) != 0;
+    return on;
+}
 struct Depth {
-    Depth() { ++t_depth; }
-    ~Depth() { --t_depth; }
+    const char* name;
+    explicit Depth(const char* n) : name(n)
+    {
+        ++t_depth;
+        if (trace_on()) { std::printf("checkpoint trace enter %s depth %d\n", name, t_depth); std::fflush(stdout); }
+    }
+    ~Depth()
+    {
+        if (trace_on()) { std::printf("checkpoint trace exit %s\n", name); std::fflush(stdout); }
+        --t_depth;
+    }
     bool outermost() const { return t_depth == 1; }
 };
 
 HRESULT STDMETHODCALLTYPE D_CreateCommandQueue(ID3D12Device* dev, const D3D12_COMMAND_QUEUE_DESC* desc, REFIID riid, void** out)
 {
-    Depth depth;
+    Depth depth("CreateCommandQueue");
     const HRESULT hr = o_CreateCommandQueue(dev, desc, riid, out);
     if (IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr) {
         const na_object_id dev_id = device_id(dev);
@@ -461,7 +475,7 @@ void list_created(ID3D12Device* dev, IUnknown* obj, D3D12_COMMAND_LIST_TYPE type
 HRESULT STDMETHODCALLTYPE D_CreateCommandList(ID3D12Device* dev, UINT mask, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* alloc,
                                               ID3D12PipelineState* pso, REFIID riid, void** out)
 {
-    Depth depth;
+    Depth depth("CreateCommandList");
     const HRESULT hr = o_CreateCommandList(dev, mask, type, alloc, pso, riid, out);
     if (IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr) list_created(dev, obj, type, alloc, true);
     return hr;
@@ -470,7 +484,7 @@ HRESULT STDMETHODCALLTYPE D_CreateCommandList(ID3D12Device* dev, UINT mask, D3D1
 HRESULT STDMETHODCALLTYPE D_CreateCommandList1(ID3D12Device4* dev, UINT mask, D3D12_COMMAND_LIST_TYPE type, D3D12_COMMAND_LIST_FLAGS flags,
                                                REFIID riid, void** out)
 {
-    Depth depth;
+    Depth depth("CreateCommandList1");
     const HRESULT hr = o_CreateCommandList1(dev, mask, type, flags, riid, out);
     if (IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr) list_created(dev, obj, type, nullptr, false);
     return hr;
@@ -478,7 +492,7 @@ HRESULT STDMETHODCALLTYPE D_CreateCommandList1(ID3D12Device4* dev, UINT mask, D3
 
 HRESULT STDMETHODCALLTYPE D_CreateDescriptorHeap(ID3D12Device* dev, const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID riid, void** out)
 {
-    Depth depth;
+    Depth depth("CreateDescriptorHeap");
     const HRESULT hr = o_CreateDescriptorHeap(dev, desc, riid, out);
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj || !desc) return hr;
@@ -618,7 +632,7 @@ void STDMETHODCALLTYPE D_CopyDescriptorsSimple(ID3D12Device* dev, UINT n, D3D12_
 HRESULT STDMETHODCALLTYPE D_CreateCommittedResource(ID3D12Device* dev, const D3D12_HEAP_PROPERTIES* p, D3D12_HEAP_FLAGS f, const D3D12_RESOURCE_DESC* d,
                                                     D3D12_RESOURCE_STATES s, const D3D12_CLEAR_VALUE* c, REFIID riid, void** out)
 {
-    Depth depth;
+    Depth depth("CreateCommittedResource");
     const HRESULT hr = o_CreateCommittedResource(dev, p, f, d, s, c, riid, out);
     if (IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr) note_resource(dev, obj, NA_CREATE_COMMITTED, nullptr, 0, p, s);
     return hr;
@@ -626,7 +640,7 @@ HRESULT STDMETHODCALLTYPE D_CreateCommittedResource(ID3D12Device* dev, const D3D
 HRESULT STDMETHODCALLTYPE D_CreateCommittedResource1(ID3D12Device4* dev, const D3D12_HEAP_PROPERTIES* p, D3D12_HEAP_FLAGS f, const D3D12_RESOURCE_DESC* d,
                                                      D3D12_RESOURCE_STATES s, const D3D12_CLEAR_VALUE* c, ID3D12ProtectedResourceSession* ps, REFIID riid, void** out)
 {
-    Depth depth;
+    Depth depth("CreateCommittedResource1");
     const HRESULT hr = o_CreateCommittedResource1(dev, p, f, d, s, c, ps, riid, out);
     if (IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr) note_resource(dev, obj, NA_CREATE_COMMITTED, nullptr, 0, p, s);
     return hr;
@@ -634,7 +648,7 @@ HRESULT STDMETHODCALLTYPE D_CreateCommittedResource1(ID3D12Device4* dev, const D
 HRESULT STDMETHODCALLTYPE D_CreateCommittedResource2(ID3D12Device8* dev, const D3D12_HEAP_PROPERTIES* p, D3D12_HEAP_FLAGS f, const D3D12_RESOURCE_DESC1* d,
                                                      D3D12_RESOURCE_STATES s, const D3D12_CLEAR_VALUE* c, ID3D12ProtectedResourceSession* ps, REFIID riid, void** out)
 {
-    Depth depth;
+    Depth depth("CreateCommittedResource2");
     const HRESULT hr = o_CreateCommittedResource2(dev, p, f, d, s, c, ps, riid, out);
     if (IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr) note_resource(dev, obj, NA_CREATE_COMMITTED, nullptr, 0, p, s);
     return hr;
@@ -655,14 +669,14 @@ void heap_created(ID3D12Device* dev, IUnknown* obj, const D3D12_HEAP_DESC* desc)
 }
 HRESULT STDMETHODCALLTYPE D_CreateHeap(ID3D12Device* dev, const D3D12_HEAP_DESC* desc, REFIID riid, void** out)
 {
-    Depth depth;
+    Depth depth("CreateHeap");
     const HRESULT hr = o_CreateHeap(dev, desc, riid, out);
     if (IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr) heap_created(dev, obj, desc);
     return hr;
 }
 HRESULT STDMETHODCALLTYPE D_CreateHeap1(ID3D12Device4* dev, const D3D12_HEAP_DESC* desc, ID3D12ProtectedResourceSession* ps, REFIID riid, void** out)
 {
-    Depth depth;
+    Depth depth("CreateHeap1");
     const HRESULT hr = o_CreateHeap1(dev, desc, ps, riid, out);
     if (IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr) heap_created(dev, obj, desc);
     return hr;
@@ -671,7 +685,7 @@ HRESULT STDMETHODCALLTYPE D_CreateHeap1(ID3D12Device4* dev, const D3D12_HEAP_DES
 HRESULT STDMETHODCALLTYPE D_CreatePlacedResource(ID3D12Device* dev, ID3D12Heap* heap, UINT64 off, const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES s,
                                                  const D3D12_CLEAR_VALUE* c, REFIID riid, void** out)
 {
-    Depth depth;
+    Depth depth("CreatePlacedResource");
     const HRESULT hr = o_CreatePlacedResource(dev, heap, off, d, s, c, riid, out);
     if (IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr) note_resource(dev, obj, NA_CREATE_PLACED, heap, off, nullptr, s);
     return hr;
@@ -679,7 +693,7 @@ HRESULT STDMETHODCALLTYPE D_CreatePlacedResource(ID3D12Device* dev, ID3D12Heap* 
 HRESULT STDMETHODCALLTYPE D_CreatePlacedResource1(ID3D12Device8* dev, ID3D12Heap* heap, UINT64 off, const D3D12_RESOURCE_DESC1* d, D3D12_RESOURCE_STATES s,
                                                   const D3D12_CLEAR_VALUE* c, REFIID riid, void** out)
 {
-    Depth depth;
+    Depth depth("CreatePlacedResource1");
     const HRESULT hr = o_CreatePlacedResource1(dev, heap, off, d, s, c, riid, out);
     if (IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr) note_resource(dev, obj, NA_CREATE_PLACED, heap, off, nullptr, s);
     return hr;
@@ -687,7 +701,7 @@ HRESULT STDMETHODCALLTYPE D_CreatePlacedResource1(ID3D12Device8* dev, ID3D12Heap
 HRESULT STDMETHODCALLTYPE D_CreateReservedResource(ID3D12Device* dev, const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES s, const D3D12_CLEAR_VALUE* c,
                                                    REFIID riid, void** out)
 {
-    Depth depth;
+    Depth depth("CreateReservedResource");
     const HRESULT hr = o_CreateReservedResource(dev, d, s, c, riid, out);
     if (IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr) note_resource(dev, obj, NA_CREATE_RESERVED, nullptr, 0, nullptr, s);
     return hr;
@@ -695,7 +709,7 @@ HRESULT STDMETHODCALLTYPE D_CreateReservedResource(ID3D12Device* dev, const D3D1
 HRESULT STDMETHODCALLTYPE D_CreateReservedResource1(ID3D12Device4* dev, const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES s, const D3D12_CLEAR_VALUE* c,
                                                     ID3D12ProtectedResourceSession* ps, REFIID riid, void** out)
 {
-    Depth depth;
+    Depth depth("CreateReservedResource1");
     const HRESULT hr = o_CreateReservedResource1(dev, d, s, c, ps, riid, out);
     if (IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr) note_resource(dev, obj, NA_CREATE_RESERVED, nullptr, 0, nullptr, s);
     return hr;
@@ -703,7 +717,7 @@ HRESULT STDMETHODCALLTYPE D_CreateReservedResource1(ID3D12Device4* dev, const D3
 
 HRESULT STDMETHODCALLTYPE D_CreateFence(ID3D12Device* dev, UINT64 initial, D3D12_FENCE_FLAGS flags, REFIID riid, void** out)
 {
-    Depth depth;
+    Depth depth("CreateFence");
     const HRESULT hr = o_CreateFence(dev, initial, flags, riid, out);
     if (IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr) {
         const na_object_id dev_id = device_id(dev);
@@ -792,6 +806,12 @@ void STDMETHODCALLTYPE D_ExecuteCommandLists(ID3D12CommandQueue* q, UINT n, ID3D
 // ---------------------------------------------------------------- snapshot
 bool snapshot()
 {
+    // Snapshot runs after start/resync publishes the current session/epoch.
+    // Query the coherent status; never emit an unscoped capability report.
+    na_observe_status status{};
+    status.size_bytes = sizeof(status);
+    if (na_observe_query_status(&status) != NA_OK || status.size_bytes < sizeof(status) ||
+        status.session == 0 || status.session == NA_UNKNOWN_U64) return false;
     // Capability report first: what this producer set observes.
     struct Report {
         na_ev_capability_report r;
@@ -802,6 +822,7 @@ bool snapshot()
     rep.r.hdr.kind = NA_EV_CAPABILITY_REPORT;
     rep.r.hdr.flags = NA_EVF_FOUNDATIONAL;
     rep.r.hdr.producer_thread = GetCurrentThreadId();
+    rep.r.session = status.session;
     rep.r.host_version_major = NA_OBSERVE_ABI_MAJOR;
     rep.r.host_version_minor = NA_OBSERVE_ABI_MINOR;
     rep.r.entry_count = NA_GROUP_COUNT_V1;
@@ -1007,3 +1028,4 @@ ProducerStats GetProducerStats()
 }
 
 } // namespace na::observe
+
