@@ -47,6 +47,7 @@ int main() { return test::run({
         s=snapshot(perspective()); s.base_offset=2; CHECK(FindMatrices(s).unavailable);
         s=snapshot(perspective()); s.base_offset=UINT64_MAX-3; CHECK(FindMatrices(s).unavailable);
         s=snapshot(perspective()); s.bytes.pop_back(); CHECK(FindMatrices(s).unavailable);
+        s=snapshot(perspective()); s.content_version=UINT64_MAX; CHECK(FindMatrices(s).unavailable);
         s=snapshot(perspective()); s.bytes.resize(1024*1024+4); CHECK(FindMatrices(s).capacity_exceeded);
     }},
     {"candidate flood never returns a truncated apparent winner", [] {

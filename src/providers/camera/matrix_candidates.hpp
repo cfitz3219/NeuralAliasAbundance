@@ -32,6 +32,7 @@ struct Scan {
     bool unavailable{}, capacity_exceeded{};
     Sync sync{Sync::Unknown};
 };
+inline bool Known(uint64_t value) { return value && value!=UINT64_MAX; }
 inline bool Near(double a, double b, double epsilon = 1e-5) { return std::abs(a-b) <= epsilon; }
 inline bool Finite(const Matrix& m) {
     for (double v : m) if (!std::isfinite(v)) return false;
@@ -74,7 +75,7 @@ inline bool RigidView(const Matrix& m, Candidate& c) {
 }
 inline Scan FindMatrices(const Snapshot& s) {
     Scan result{}; result.sync = s.sync;
-    if (!s.session || !s.epoch || !s.submission || !s.resource || !s.content_version ||
+    if (!Known(s.session) || !Known(s.epoch) || !Known(s.submission) || !Known(s.resource) || !Known(s.content_version) ||
         !s.complete || !s.lifetime_valid || s.sync == Sync::Unknown || s.base_offset % 4 ||
         s.bytes.size() % 4 || s.bytes.size() < 64 ||
         s.base_offset > std::numeric_limits<uint64_t>::max()-s.bytes.size()) {
@@ -121,8 +122,9 @@ inline Continuity CompareViews(const Snapshot& previous_scope, const Candidate& 
     double max_translation, double max_rotation_radians) {
     if (!adjacent_frames || !previous_scope.complete || !current_scope.complete || !previous_scope.lifetime_valid ||
         !current_scope.lifetime_valid || previous_scope.sync == Sync::Unknown || current_scope.sync == Sync::Unknown ||
-        !previous_scope.session || !previous_scope.epoch || !previous_scope.resource || !previous_scope.submission ||
-        !previous_scope.content_version || !current_scope.content_version ||
+        !Known(previous_scope.session) || !Known(previous_scope.epoch) || !Known(previous_scope.resource) ||
+        !Known(previous_scope.submission) || !Known(current_scope.submission) ||
+        !Known(previous_scope.content_version) || !Known(current_scope.content_version) ||
         previous_scope.session != current_scope.session || previous_scope.epoch != current_scope.epoch ||
         previous_scope.resource != current_scope.resource || current_scope.submission <= previous_scope.submission ||
         previous.byte_offset != current.byte_offset || previous.layout != current.layout ||
