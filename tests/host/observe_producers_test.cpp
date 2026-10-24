@@ -15,6 +15,7 @@
 #include "host_dx12/observe/producers.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -22,6 +23,11 @@
 namespace {
 std::mutex g_m;
 std::vector<std::vector<uint8_t>> g_events;
+std::atomic<unsigned> g_invalid_reports{0};
+struct ObserveSession {
+    bool running = false;
+    ~ObserveSession() { if (running) na_observe_stop(); }
+};
 
 void __cdecl Sink(const na_event_batch* b, void*)
 {
@@ -31,6 +37,14 @@ void __cdecl Sink(const na_event_batch* b, void*)
     while (used < b->payload_bytes) {
         const auto* h = reinterpret_cast<const na_event_header*>(p + used);
         if (h->size_bytes < sizeof(na_event_header)) break;
+        if (h->size_bytes > b->payload_bytes - used) { ++g_invalid_reports; break; }
+        if (h->kind == NA_EV_CAPABILITY_REPORT) {
+            na_ev_capability_report report{};
+            if (h->size_bytes < sizeof(report)) { ++g_invalid_reports; break; }
+            std::memcpy(&report,p+used,sizeof(report));
+            if (!report.session || report.session != b->session || h->epoch != b->epoch)
+                ++g_invalid_reports;
+        }
         g_events.emplace_back(p + used, p + used + h->size_bytes);
         used += h->size_bytes;
     }
@@ -86,7 +100,9 @@ int main()
     std::printf("checkpoint 1\n"); std::fflush(stdout);
     na_observe_config cfg{};
     cfg.size_bytes = sizeof(cfg);
+    ObserveSession session;
     REQUIRE(na_observe_start(&cfg, &Sink, nullptr) == NA_OK);
+    session.running = true;
 
     std::printf("checkpoint 2\n"); std::fflush(stdout);
     // Resources, heaps.
@@ -137,7 +153,15 @@ int main()
     dev->CreateShaderResourceView(placed.Get(), nullptr, s3);          // version 2
     D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{cbuf->GetGPUVirtualAddress() + 256, 256};
     dev->CreateConstantBufferView(&cbv, D3D12_CPU_DESCRIPTOR_HANDLE{s0.ptr + 4 * inc});
-    dev->CreateShaderResourceView(early.Get(), nullptr, D3D12_CPU_DESCRIPTOR_HANDLE{s0.ptr + 5 * inc}); // unobserved resource
+    // Buffers have UNKNOWN resource format, so no typed default SRV exists.
+    // Keep the resource unobserved while supplying a valid buffer view.
+    D3D12_SHADER_RESOURCE_VIEW_DESC early_srv{};
+    early_srv.Format = DXGI_FORMAT_R32_UINT;
+    early_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    early_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    early_srv.Buffer.NumElements = 4096 / sizeof(uint32_t);
+    dev->CreateShaderResourceView(early.Get(), &early_srv, D3D12_CPU_DESCRIPTOR_HANDLE{s0.ptr + 5 * inc});
+    REQUIRE(SUCCEEDED(dev->GetDeviceRemovedReason()));
     dev->CopyDescriptorsSimple(3, D3D12_CPU_DESCRIPTOR_HANDLE{srv_heap->GetCPUDescriptorHandleForHeapStart().ptr + inc},
                                s3, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     dev->CreateRenderTargetView(rt.Get(), nullptr, rtv_heap->GetCPUDescriptorHandleForHeapStart());
@@ -171,13 +195,20 @@ int main()
     std::printf("checkpoint 5\n"); std::fflush(stdout);
     // Retirement: the last reference goes away.
     placed.Reset();
+    REQUIRE(na_observe_resync() == NA_OK);
     REQUIRE(na_observe_stop() == NA_OK);
+    session.running = false;
+    CHECK(g_invalid_reports.load() == 0);
 
     std::printf("checkpoint 6\n"); std::fflush(stdout);
     // ---- decode ----
     {
         auto reports = All<na_ev_capability_report>(NA_EV_CAPABILITY_REPORT);
-        CHECK(!reports.empty());
+        CHECK(reports.size() == 2); // initial snapshot and resync
+        if (reports.size() == 2) {
+            CHECK(reports[0].session != 0 && reports[0].session == reports[1].session);
+            CHECK(reports[0].hdr.epoch < reports[1].hdr.epoch);
+        }
         auto fences = All<na_ev_fence_created>(NA_EV_FENCE_CREATED);
         bool pre_in_snapshot = false, post = false;
         for (const auto& f : fences) {
@@ -290,3 +321,4 @@ int main()
     CHECK(st.unresolved_handles == 0);
     return test::finish("observe_producers_test");
 }
+

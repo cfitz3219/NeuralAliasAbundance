@@ -806,6 +806,12 @@ void STDMETHODCALLTYPE D_ExecuteCommandLists(ID3D12CommandQueue* q, UINT n, ID3D
 // ---------------------------------------------------------------- snapshot
 bool snapshot()
 {
+    // Snapshot runs after start/resync publishes the current session/epoch.
+    // Query the coherent status; never emit an unscoped capability report.
+    na_observe_status status{};
+    status.size_bytes = sizeof(status);
+    if (na_observe_query_status(&status) != NA_OK || status.size_bytes < sizeof(status) ||
+        status.session == 0 || status.session == NA_UNKNOWN_U64) return false;
     // Capability report first: what this producer set observes.
     struct Report {
         na_ev_capability_report r;
@@ -816,6 +822,7 @@ bool snapshot()
     rep.r.hdr.kind = NA_EV_CAPABILITY_REPORT;
     rep.r.hdr.flags = NA_EVF_FOUNDATIONAL;
     rep.r.hdr.producer_thread = GetCurrentThreadId();
+    rep.r.session = status.session;
     rep.r.host_version_major = NA_OBSERVE_ABI_MAJOR;
     rep.r.host_version_minor = NA_OBSERVE_ABI_MINOR;
     rep.r.entry_count = NA_GROUP_COUNT_V1;
@@ -1021,3 +1028,4 @@ ProducerStats GetProducerStats()
 }
 
 } // namespace na::observe
+
