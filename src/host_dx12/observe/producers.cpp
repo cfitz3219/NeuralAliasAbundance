@@ -983,14 +983,14 @@ bool snapshot()
     // GPU-written data, unhooked variants, pre-installation objects).
     const bool device_gaps = g_c.missing.load() > 0 || g_unhooked_devices.load() > 0;
     const bool lists = g_lists_hooked.load();
-    const uint32_t creation = device_gaps ? NA_CAP_PARTIAL : NA_CAP_SUPPORTED;
-    const uint32_t recorded = lists ? NA_CAP_PARTIAL : NA_CAP_UNSUPPORTED; // bundles/indirect/variants: never complete
+    const uint32_t creation = static_cast<uint32_t>(device_gaps ? NA_CAP_PARTIAL : NA_CAP_SUPPORTED);
+    const uint32_t recorded = static_cast<uint32_t>(lists ? NA_CAP_PARTIAL : NA_CAP_UNSUPPORTED); // bundles/indirect/variants: never complete
+    const uint32_t queue_cap = static_cast<uint32_t>(g_unhooked_queues.load() ? NA_CAP_PARTIAL : NA_CAP_SUPPORTED);
     const uint32_t support[NA_GROUP_COUNT_V1] = {
         NA_CAP_SUPPORTED /* session */, creation /* resource */, NA_CAP_PARTIAL /* descriptor: CPU record-time view */,
-        lists ? NA_CAP_PARTIAL : NA_CAP_UNSUPPORTED /* list reset/close */,
-        g_unhooked_queues.load() ? NA_CAP_PARTIAL : NA_CAP_SUPPORTED /* queue */, NA_CAP_UNSUPPORTED /* swapchain: not emitted yet */,
+        recorded /* list reset/close */, queue_cap /* queue */, NA_CAP_UNSUPPORTED /* swapchain: not emitted yet */,
         creation /* pipeline */, recorded /* pass */, recorded /* resource use */, recorded /* CPU constants */,
-        lists ? NA_CAP_PARTIAL : NA_CAP_UNSUPPORTED /* snapshot: upload-heap CBVs, app-sync-unknown */};
+        recorded /* snapshot: upload-heap CBVs, app-sync-unknown */};
     for (uint32_t g = 0; g < NA_GROUP_COUNT_V1; ++g) {
         rep.entries[g].group = g;
         rep.entries[g].support = support[g];
