@@ -1838,6 +1838,7 @@ bool InstallProducers(ID3D12Device* device, ID3D12CommandQueue* queue, bool hook
         if (ok) na::observe_internal::SetSnapshotProvider(&snapshot);
         g_install_ok = ok;
     });
+    if (g_install_ok) g_active.store(true, std::memory_order_release);
     return g_install_ok;
 }
 
@@ -1910,6 +1911,14 @@ void ExecuteEnd(const ExecuteToken& t, ID3D12CommandQueue* queue, uint32_t count
     }
     na::observe_internal::Emit(&ex, NA_GROUP_QUEUE);
 }
+
+namespace {
+std::atomic<bool> g_requested{false};
+std::atomic<bool> g_active{false};
+} // namespace
+void RequestInstall(bool requested) { g_requested.store(requested); }
+bool InstallRequested() { return g_requested.load(); }
+bool ProducersActive() { return g_active.load(std::memory_order_acquire); }
 
 na_object_id IdOf(const void* object) { return lookup(object); }
 

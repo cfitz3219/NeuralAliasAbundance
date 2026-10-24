@@ -41,6 +41,12 @@ namespace na::observe {
 // detour instead. Idempotent; returns false if a required hook failed.
 bool InstallProducers(ID3D12Device* device, ID3D12CommandQueue* queue, bool hook_queue_execute);
 
+// Game host wiring: [observe] producers=1 requests installation; the overlay
+// installs on its throwaway device/queue and then reports ProducersActive().
+void RequestInstall(bool requested);
+bool InstallRequested();
+bool ProducersActive();
+
 // ExecuteCommandLists observation for a host that owns the hook: Begin before
 // the original call, End after it (R3 ambiguity is decided at End).
 struct ExecuteToken {
