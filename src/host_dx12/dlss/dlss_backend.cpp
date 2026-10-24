@@ -555,13 +555,24 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
         return false;
     }
     View& view = g.views[vi];
-    // R-303: order this view's evaluations on the GPU.
+    const uint32_t flags = flags_for(d);
+    // Dynamic resolution: a smaller render size fits the view's existing feature.
+    const Feature* cur = view.feature >= 0 ? &g.features[view.feature] : nullptr;
+    // ARGON-G2-001: create at the source's maximum render size, so dynamic
+    // resolution anywhere up to it keeps the same feature and history.
+    const uint32_t create_w = d.max_render_w ? d.max_render_w : d.render_w;
+    const uint32_t create_h = d.max_render_h ? d.max_render_h : d.render_h;
+    const bool fits = cur && cur->out_w == d.out_w && cur->out_h == d.out_h && cur->flags == flags &&
+                      cur->quality == d.quality && create_w <= cur->render_w && create_h <= cur->render_h;
+    // R-303: order this view's evaluations on the GPU. The hazard is the NGX
+    // feature's own history state, so it applies only while the view keeps the
+    // feature its previous evaluation used; a new feature starts from reset.
     ComPtr<ID3D12Fence> wait_fence;
     uint64_t wait_value = 0;
     ID3D12CommandQueue* wait_queue = nullptr;
     if (view.last_rec >= 0) {
         Record& pr = g.recs[view.last_rec];
-        if (pr.gen == view.last_rec_gen && pr.state != RecState::Free) {
+        if (fits && pr.gen == view.last_rec_gen && pr.state != RecState::Free && pr.feature == view.feature) {
             if (pr.state == RecState::Recorded && pr.list != list) {
                 ++g.stats.refused_order;
                 set_reason(g.stats.reason, "The previous frame of this view is not submitted yet; this frame is left to the game's upscaler.");
@@ -574,15 +585,6 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
             }
         }
     }
-    const uint32_t flags = flags_for(d);
-    // Dynamic resolution: a smaller render size fits the view's existing feature.
-    const Feature* cur = view.feature >= 0 ? &g.features[view.feature] : nullptr;
-    // ARGON-G2-001: create at the source's maximum render size, so dynamic
-    // resolution anywhere up to it keeps the same feature and history.
-    const uint32_t create_w = d.max_render_w ? d.max_render_w : d.render_w;
-    const uint32_t create_h = d.max_render_h ? d.max_render_h : d.render_h;
-    const bool fits = cur && cur->out_w == d.out_w && cur->out_h == d.out_h && cur->flags == flags &&
-                      cur->quality == d.quality && create_w <= cur->render_w && create_h <= cur->render_h;
     NVSDK_NGX_Parameter* p = EP();
     if (!fits) {
         // R-305: secure a slot BEFORE giving up the current feature, so no handle is ever lost.
