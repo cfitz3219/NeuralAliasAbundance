@@ -21,9 +21,10 @@ namespace na::ffx {
 
 // FSR's jitterOffset and DLSS's Jitter.Offset are both documented as the
 // sub-pixel offset applied to the camera projection, so they carry the same
-// sign; DLSS's convention was measured in C6 (sample = pixel centre - jitter).
-// The FSR side is NOT measured yet: it is scheduled for the Gate 2 hardware
-// session with AMD's official runtime DLL (FSR also runs on NVIDIA GPUs).
+// sign. MEASURED (Gate 2 hardware session, 2026-10-24, RTX 5070 Ti, AMD's
+// official amd_fidelityfx_dx12.dll 1.0.1.41314, upscaler_jitter_test): FSR
+// expects sample = pixel centre - jitter on both axes (+3.3 dB over bilinear;
+// every other convention lost), the same as DLSS (C6) -> sign +1 per axis.
 constexpr float kFsrToDlssJitterSign = 1.0f;
 
 bool D3D12State(uint32_t ffx, D3D12_RESOURCE_STATES* out)
