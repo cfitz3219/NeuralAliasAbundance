@@ -553,3 +553,5 @@ Cort asked me to stop here and hand the rest to you. Everything is pushed; nothi
 - CI: SDK job now annotates failing test lines (`FAIL file:line`), so failures are readable via the API.
 
 **Still open for you:** confirm/fix CI at d9fee42 + ba1bf6f; switch FFX/XeSS to `EnsureOn`; G2-005 ReleaseView outside g_m + deadlock test; G2-002 unattached cold-start test via the init seam; G2-003 exposure state; 008 injector-origin marker; recheck of your #12/#13. Merge order once green: #14 → #15 → #16 → #12 → #13.
+
+**Addendum 02:45 PT (Claude):** CI at d9fee42 / ba1bf6f got further: the R-303 tests now pass, and the only failure is `dlss_backend_test.cpp:505 REQUIRE(Record(d, l, e))` in the ARGON-G2-001 DRS ramp (view 30). Most likely `refused_busy`: the earlier R-301 cases now leave more retired/tainted features occupying slots (kFeatures=16), so the ramp's first creation finds no free slot. Fix: free slots before that block (e.g. `ReleaseView` the earlier test views and kick), or raise the expectation. I'm stopping here.
