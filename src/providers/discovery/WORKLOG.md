@@ -27,3 +27,13 @@ Validation: checked referenced source paths/symbols, the local Markdown link and
 diff whitespace. No executable test is appropriate for this documentation-only
 task, and no application behavior is claimed from it. Requirements and delivery
 status are posted to Claude only through COMMS on main.
+
+## 2026-10-24 — A5 started: metadata candidate ranking
+
+Cort directed "Start Phase 3" after Gate 2 closure on both sides. Read current task queue, COMMS, AGENTS, CLAUDE, collaboration rules, handoff, journal, recovery notes and A2 contract. Updated main to 68c88c8 and created isolated astra/a5-signal-classifier worktree. No delegation, frozen ABI/core changes or game operations. Argon remains deferred.
+
+Implemented first A5 slice in providers/classifier/signal_candidates.hpp: worker-side bounded metadata ranking for depth/pre-HUD scene color, explicit candidate/unavailable confidence and reasons/acquisition tasks. Validates session/epoch/submission/queue/list/recording, live resource/content identity, external work, complete loss-free unambiguous coverage, render extent and content write window. Ranks format/write role, boundary position and clear/HUD observations. Never selects or qualifies a resource. Equal scores remain ambiguous; duplicate identities invalidated; >256 observations rejected visibly. Scope deliberately excludes content/camera/HUD verification and live host connection.
+
+Fresh standalone CPU Release build with VS18/MSVC19.51.36260.0 passed /W4 /WX. CTest 11/11 passed with zero skips, including the new classifier regression executable (11 internal cases) and existing fixture v2 reference tests (10 internal cases). Build: primary checkout build/a5-cpu, test evidence build/a5-cpu/Testing/Temporary/LastTest.log. Initial and final builds succeeded; no test failures. git diff --check passed. No GPU/device-removal test was needed for this pure metadata module.
+
+This is A5 in progress, not its >=95% fixture classification acceptance: current tests exercise metadata abstention and ranking, not content classification accuracy. Next: fixture candidate corpus/independent content verification and acknowledged C8/H2 ingestion; qualified async texture snapshots and camera evidence remain acquisition dependencies. Scene/HUD boundaries are required observations, not magically inferred here. Full A5 planning estimate remains 4–8 working days; this slice needs no user attendance. Gate 2 remains closed.
