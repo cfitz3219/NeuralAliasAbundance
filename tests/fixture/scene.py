@@ -95,6 +95,8 @@ def render(frame, width=96, height=64):
             on_screen = 0 <= old_p[0]+prev['jitter'][0] < width and 0 <= old_p[1]+prev['jitter'][1] < height
             old_opaque = next(hit for hit in hits(prev, previous_geometry, old_p) if hit[0][7] == 1.0)
             visible = on_screen and old_opaque[0][0] == ident
+            # Opaque material correspondence only: this mask does not say
+            # blended scene_color has stable foreground-glass coverage.
             valid = not reset and visible
             base = color(ident, opaque[1])
             glass = next((hit for hit in layers if hit[0][7] < 1.0 and hit[0][1] < z), None)

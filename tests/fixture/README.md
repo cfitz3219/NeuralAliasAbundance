@@ -51,7 +51,7 @@ encoding and not the numerical oracle). Current frame metadata includes:
 | scene_color / composite_color | RGB | Scene before / after HUD |
 | depth / motion | 1 / XY | Opaque-surface normalized depth and material motion |
 | surface_id | integer | 1 background, 2 moving rigid object, 3 deforming object |
-| history_valid | bool | Correspondence is on-screen and visible in previous frame; false on reset |
+| history_valid | bool | Opaque correspondence is on-screen and visible in previous frame; false on reset; not blended-color validity |
 | disocclusion | bool | Prior opaque correspondence occluded or outside the viewport; false on reset |
 | hud | bool | Pixels touched by screen-space HUD |
 | transparent_alpha | 1 | 0 absent, 0.35 foreground blend |
@@ -62,7 +62,20 @@ Visibility uses continuous previous-frame material positions, not a nearest-pixe
 raster lookup. A newly exposed opaque pixel still has geometrical motion but no
 usable temporal sample; `history_valid` records that distinction. Transparent
 pixels contain two motions, so consumers must use the alpha/validity data rather
-than describe opaque motion as exact motion of the blended color. Cuts zero both
+than describe opaque motion as exact motion of the blended color.
+
+At a moving glass boundary, foreground alpha coverage can appear or disappear
+between frames while the underlying opaque material remains visible. In that
+case `history_valid` may stay true even though the reprojected `scene_color`
+contains a different foreground contribution. `transparent_history_valid` tracks
+the glass material itself, not stability of the composite along opaque motion.
+Neither mask is a blended-color confidence/reactive mask. Consumers evaluating
+temporal color must separately account for changing foreground coverage and the
+two correspondences; the fixture currently exports no composite-validity mask.
+This is an explicit limitation of the color oracle at alpha-blend boundaries,
+not an instruction to invalidate correct opaque geometry correspondence.
+
+Cuts zero both
 motion planes and invalidate history. The baseline intentionally uses planar
 geometry, fixed orientation, linear SDR and a simple alpha layer; it does not yet
 cover rotating cameras/sky, skinned 3D meshes, HDR exposure changes or GPU passes.
