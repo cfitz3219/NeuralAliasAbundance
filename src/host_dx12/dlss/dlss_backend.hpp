@@ -13,9 +13,22 @@
 //
 // GPU safety: nothing here waits on the GPU. A feature that has to be
 // recreated (output size, quality, flags or a larger render size) is retired
-// and released only after the host's fence proves the GPU finished the last
-// evaluation that used it. Each tracked evaluation has its own fence, so work
-// on independent queues can never vouch for another queue (Gate 1 R-202).
+// and released only after the host's fences prove the GPU finished EVERY
+// evaluation that used it (Gate 2 R-301). Each tracked evaluation has its own
+// fence, so work on independent queues can never vouch for another queue
+// (Gate 1 R-202). A use whose completion can never be proven (never seen
+// submitted, Signal failed, or no free record) marks the feature tainted for
+// good: it is released only at Shutdown. Every created handle stays owned
+// until it is released exactly once (R-305): when no feature slot is free, a
+// new feature is refused for that frame instead.
+//
+// Views (R-303): each source of frames (an FSR/XeSS context, a game view) has
+// its own view_id and therefore its own feature and temporal history. Ids must
+// never be reused for a different source; ReleaseView() retires a view when its
+// source is destroyed. Work recorded on one device is refused on another. If a
+// view's consecutive evaluations execute on different queues, the next
+// evaluation of that view starts fresh history (no cross-queue ordering is
+// assumed).
 // The caller keeps every input/output resource alive until its submission
 // completes; NGX does not take references.
 //
@@ -100,6 +113,7 @@ struct EvalDesc {
     float mv_scale_x = 1.f, mv_scale_y = 1.f; // multiply motion values to get render-space pixels
     float pre_exposure = 1.f;
     float exposure_scale = 1.f; // multiplier applied to colour before upscaling (DLSS.Exposure.Scale)
+    uint64_t view_id = 0;       // source of these frames (see Views above); 0 = the default view
     Quality quality = Quality::MaxQuality;
     bool reset = false;
     bool hdr = false;            // linear HDR colour (IsHDR)
@@ -149,14 +163,20 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d);
 // and releases retired features whose last use has completed.
 void OnExecuted(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* const* lists);
 
+// The source of `view_id` is gone (e.g. its FSR/XeSS context was destroyed):
+// its feature is retired (released once its uses complete) and the id forgotten.
+void ReleaseView(uint64_t view_id);
+
 struct Stats {
     uint64_t evaluates = 0;         // successful EvaluateFeature calls
     uint64_t features_created = 0;
     uint64_t features_released = 0; // retired handles actually released
-    uint64_t features_pending = 0;  // retired, waiting for GPU completion
-    uint64_t features_leaked = 0;   // retired with an untracked last use; freed only at Shutdown
-    uint64_t rejected = 0;          // Evaluate calls refused by validation
-    uint64_t untracked = 0;         // evaluations with no free completion record
+    uint64_t features_pending = 0;  // retired, waiting for GPU completion of every use
+    uint64_t features_leaked = 0;   // retired with a use that can never be proven complete; freed only at Shutdown
+    uint64_t rejected = 0;          // Evaluate calls refused by validation (incl. wrong device)
+    uint64_t untracked = 0;         // evaluations with no free completion record (taint their feature)
+    uint64_t refused_busy = 0;      // frames refused because every feature slot is still owned
+    uint32_t views_active = 0;
     uint32_t feature_render_w = 0, feature_render_h = 0, feature_out_w = 0, feature_out_h = 0;
     uint32_t feature_flags = 0;
     int32_t last_ngx_result = 0;
