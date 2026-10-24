@@ -258,9 +258,14 @@ int main(int argc, char** argv)
             const uint64_t replaced = na::ffx::GetStats().replaced, barriers = na::ffx::GetStats().barriers;
             auto u = UpscaleDesc(l.list.Get());
             u.reset = false;
-            u.output.state = FFX_API_RESOURCE_STATE_COMMON;
+            // A real texture: the barrier is recorded on a real list.
+            auto out_tex = test::CreateTexture(d.device.Get(), 1920, 1080, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                               D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+            REQUIRE(out_tex);
+            u.output = Res(reinterpret_cast<uintptr_t>(out_tex.Get()), FFX_API_RESOURCE_STATE_COMMON);
             CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK);
             CHECK(na::ffx::GetStats().replaced == replaced + 1 && na::ffx::GetStats().barriers == barriers + 1);
+            CHECK(fake::P(fake::last_eval, NVSDK_NGX_Parameter_Output) == out_tex.Get());
         }
         // ARGON-G2-001: dynamic resolution inside the context's maxRenderSize keeps one feature and its history.
         {
