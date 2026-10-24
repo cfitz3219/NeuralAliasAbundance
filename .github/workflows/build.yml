@@ -107,6 +107,11 @@ jobs:
           New-Item -ItemType Directory -Force sdk/nvidia-dlss-sdk, sdk/pclstats | Out-Null
           Copy-Item -Recurse sdk-src/dlss/include sdk/nvidia-dlss-sdk/
           Copy-Item sdk-src/sl/source/plugins/sl.pcl/pclstats.h sdk/pclstats/
+          # Intel XeSS public headers: only to cross-check our own ABI declarations (C7b).
+          git clone --quiet --depth 1 --branch v3.0.2 --filter=blob:none --sparse https://github.com/intel/xess sdk-src/xess
+          git -C sdk-src/xess sparse-checkout set inc
+          New-Item -ItemType Directory -Force sdk/xess | Out-Null
+          Copy-Item -Recurse sdk-src/xess/inc sdk/xess/
       - name: Configure
         run: cmake -S . -B build -A x64 -DNA_SDK_ROOT="${{ github.workspace }}/sdk"
       - name: Build Release
@@ -125,7 +130,7 @@ jobs:
       - name: Test (everything not labelled gpu)
         shell: pwsh
         run: |
-          Select-String -Path build/CMakeCache.txt -Pattern '^NA_(SDK_ROOT|NGX_SDK_INCLUDE|PCL_INCLUDE|NVOF_INCLUDE)' | ForEach-Object { Write-Output "::notice::$($_.Line)" }
+          Select-String -Path build/CMakeCache.txt -Pattern '^NA_(SDK_ROOT|NGX_SDK_INCLUDE|PCL_INCLUDE|NVOF_INCLUDE|XESS_INCLUDE)' | ForEach-Object { Write-Output "::notice::$($_.Line)" }
           ctest --test-dir build -C Release --output-on-failure -LE gpu 2>&1 | Tee-Object -FilePath ctest-log.txt
           $code = $LASTEXITCODE
           Select-String -Path ctest-log.txt -Pattern 'Test +#\d+: .*(Passed|Failed|Skipped|Not Run|\*\*\*)|tests passed|tests failed' |
