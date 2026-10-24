@@ -139,11 +139,10 @@ struct Record {
     uint64_t recorded_at = 0;          // OnExecuted counter when recorded
     uint64_t gen = 0;                  // unique per use of this slot
     ID3D12CommandQueue* queue = nullptr; // identity: where it was submitted
-    // R-303: the same view's previous evaluation, still running elsewhere when
-    // this one was recorded; BeforeExecute makes the submitting queue wait on it.
-    ComPtr<ID3D12Fence> wait_fence;
-    uint64_t wait_value = 0;
-    ID3D12CommandQueue* wait_queue = nullptr;
+    // R-303: the same view's previous evaluation on the same feature (record
+    // slot + generation). BeforeExecute orders this one after it on the GPU.
+    int pred = -1;
+    uint64_t pred_gen = 0;
 };
 
 // R-301/R-305: every created handle lives in exactly one slot until released.
@@ -555,22 +554,15 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
     // R-303: order this view's evaluations on the GPU. The hazard is the NGX
     // feature's own history state, so it applies only while the view keeps the
     // feature its previous evaluation used; a new feature starts from reset.
-    ComPtr<ID3D12Fence> wait_fence;
-    uint64_t wait_value = 0;
-    ID3D12CommandQueue* wait_queue = nullptr;
-    if (view.last_rec >= 0) {
-        Record& pr = g.recs[view.last_rec];
-        if (fits && pr.gen == view.last_rec_gen && pr.state != RecState::Free && pr.feature == view.feature) {
-            if (pr.state == RecState::Recorded && pr.list != list) {
-                ++g.stats.refused_order;
-                set_reason(g.stats.reason, "The previous frame of this view is not submitted yet; this frame is left to the game's upscaler.");
-                return false;
-            }
-            if (pr.state == RecState::Submitted && pr.fence->GetCompletedValue() < pr.value) {
-                wait_fence = pr.fence;
-                wait_value = pr.value;
-                wait_queue = pr.queue;
-            }
+    // The predecessor is remembered here and the order is enforced when this
+    // evaluation is submitted (BeforeExecute), where the queues are known.
+    int pred = -1;
+    uint64_t pred_gen = 0;
+    if (fits && view.last_rec >= 0) {
+        const Record& pr = g.recs[view.last_rec];
+        if (pr.gen == view.last_rec_gen && pr.state != RecState::Free && pr.feature == view.feature) {
+            pred = view.last_rec;
+            pred_gen = pr.gen;
         }
     }
     NVSDK_NGX_Parameter* p = EP();
@@ -670,9 +662,8 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
         rec.view = vi;
         rec.recorded_at = g.exec_calls;
         rec.gen = ++g.rec_gen;
-        rec.wait_fence = wait_fence;
-        rec.wait_value = wait_value;
-        rec.wait_queue = wait_queue;
+        rec.pred = pred;
+        rec.pred_gen = pred_gen;
         view.last_rec = ri;
         view.last_rec_gen = rec.gen;
         ++ft.outstanding;
@@ -727,17 +718,34 @@ void BeforeExecute(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList*
     if (!queue || !lists || !count || !g_any_attached.load(std::memory_order_acquire)) return;
     std::lock_guard<std::mutex> lock(g.m);
     if (!g.attached) return;
-    for (Record& rec : g.recs) {
-        if (rec.state != RecState::Recorded || !rec.wait_fence) continue;
-        bool in_submission = false;
+    const auto index_of = [&](ID3D12CommandList* l) -> int {
         for (uint32_t k = 0; k < count; ++k)
-            if (lists[k] == rec.list) { in_submission = true; break; }
-        if (!in_submission) continue;
-        // Same queue: already ordered. Finished: nothing to wait for.
-        if (rec.wait_queue != queue && rec.wait_fence->GetCompletedValue() < rec.wait_value) {
-            if (SUCCEEDED(queue->Wait(rec.wait_fence.Get(), rec.wait_value))) ++g.stats.queue_waits;
+            if (lists[k] == l) return static_cast<int>(k);
+        return -1;
+    };
+    for (Record& rec : g.recs) {
+        if (rec.state != RecState::Recorded || rec.pred < 0) continue;
+        const int self = index_of(rec.list);
+        if (self < 0) continue;
+        const Record& pr = g.recs[rec.pred];
+        const bool live = pr.gen == rec.pred_gen && pr.state != RecState::Free;
+        rec.pred = -1;
+        if (!live) continue; // the previous evaluation already completed
+        if (pr.state == RecState::Submitted) {
+            // Same queue: already ordered. Finished: nothing to wait for.
+            if (pr.queue != queue && pr.fence->GetCompletedValue() < pr.value &&
+                SUCCEEDED(queue->Wait(pr.fence.Get(), pr.value)))
+                ++g.stats.queue_waits;
+            continue;
         }
-        rec.wait_fence.Reset();
+        // Still unsubmitted: fine when it runs earlier in this same submission
+        // (or on the same list). Otherwise the game submitted this view's
+        // frames out of order; nothing recorded can be reordered now, so the
+        // view's next frame restarts its history.
+        const int at = index_of(pr.list);
+        if (at >= 0 && at <= self) continue;
+        ++g.stats.order_violations;
+        if (rec.view >= 0) g.views[rec.view].needs_reset = true;
     }
 }
 

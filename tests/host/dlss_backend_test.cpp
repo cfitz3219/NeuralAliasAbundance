@@ -427,19 +427,31 @@ int main()
             CHECK(test::WaitFence(q2_fence.Get(), q2_value, d.event, 10000) == test::WaitResult::Ok);
             d.WaitIdle();
         }
-        // R-303: record-ahead. B is recorded while A (same view, another list)
-        // is not submitted yet: B's order can't be established, so it is refused.
+        // R-303: record-ahead. A and B (same view, separate lists) recorded
+        // before either is submitted: in order is fine, out of order is counted
+        // and the view's next frame restarts its history.
         {
             test::List a, b;
             REQUIRE(Record(d, a, view_desc(16, 1920, 1080)));
-            const uint64_t refused = na::dlss::GetStats().refused_order;
-            CHECK(!Record(d, b, view_desc(16, 1920, 1080)));
-            CHECK(na::dlss::GetStats().refused_order == refused + 1);
+            REQUIRE(Record(d, b, view_desc(16, 1920, 1080)));
+            CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
+            const uint64_t violations = na::dlss::GetStats().order_violations;
             Submit(d.queue.Get(), a);
+            Submit(d.queue.Get(), b); // in order
             d.WaitIdle();
-            test::List c;
-            CHECK(Record(d, c, view_desc(16, 1920, 1080))); // after A is submitted: fine
+            CHECK(na::dlss::GetStats().order_violations == violations);
+            test::List c, e2;
+            REQUIRE(Record(d, c, view_desc(16, 1920, 1080)));
+            CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
+            REQUIRE(Record(d, e2, view_desc(16, 1920, 1080)));
+            Submit(d.queue.Get(), e2); // BEFORE its predecessor c
+            CHECK(na::dlss::GetStats().order_violations == violations + 1);
             Submit(d.queue.Get(), c);
+            d.WaitIdle();
+            test::List f;
+            REQUIRE(Record(d, f, view_desc(16, 1920, 1080)));
+            CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 1); // history restarted
+            Submit(d.queue.Get(), f);
             d.WaitIdle();
         }
         // Work from another device is refused before NGX sees it.
