@@ -114,7 +114,12 @@ int main(int argc, char** argv)
     // 3. The game recreates its device on the same adapter.
     // (Our execute hook ran on the removed device in step 2; that is where the
     // backend notices the removal and lets go of it.)
-    std::printf("step 3: backend attached after removal: %d\n", na::dlss::GetCapabilities().attached ? 1 : 0);
+    // The game's next Present runs the host's Present hook, which lets go of a
+    // removed device; this is that call.
+    const bool released = na::dlss::ReleaseIfDeviceRemoved();
+    std::printf("step 3: Present-path release: %d, backend attached after removal: %d\n", released ? 1 : 0,
+                na::dlss::GetCapabilities().attached ? 1 : 0);
+    CHECK(released);
     Gpu g2;
     const bool opened = Open(adapter.Get(), g2);
     const HRESULT fresh = g2.device ? g2.device->GetDeviceRemovedReason() : E_FAIL;

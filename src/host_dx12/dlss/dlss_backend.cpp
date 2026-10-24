@@ -723,6 +723,17 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
 
 static void on_executed_locked(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* const* lists);
 
+bool ReleaseIfDeviceRemoved()
+{
+    if (!g_any_attached.load(std::memory_order_acquire)) return false;
+    {
+        std::lock_guard<std::mutex> lock(g.m);
+        if (!g.attached || !g.device || g.device->GetDeviceRemovedReason() == S_OK) return false;
+    }
+    Shutdown(); // see OnExecuted: a removed device must not stay pinned
+    return true;
+}
+
 void OnExecuted(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* const* lists)
 {
     if (!queue || !lists || !count || !g_any_attached.load(std::memory_order_acquire)) return;
