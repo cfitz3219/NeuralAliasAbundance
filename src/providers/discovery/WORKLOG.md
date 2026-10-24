@@ -47,3 +47,7 @@ Added portable content_checks.hpp. Depth corroboration uses independently known 
 Added 6 C++ negative-path cases and anonymous C++/Python fixture transport. 396 candidate decisions across 36 base scenes plus 8 opaque-HUD/wrong-camera cases matched expected verdicts. Includes shadow/clear/wrong-depth-convention, scene/composite/postprocess/history decoys, shuffled anonymous IDs, camera cuts and three extents. Full CPU/fixture Release suite 13/13 passed, zero skips; no initial failures. Explicit second controlled translucent-HUD probe provides content visibility absent from baseline opaque HUD; this is synthetic evidence, not a claim of live host acquisition. No end-to-end A5 accuracy claim.
 
 Checkpoint complete; A5 live integration remains dependent on C8/C9 and asynchronous texture sampling. Proceeding with independent A6 camera candidate scanning under the task-queue dependency exception, with no attendance needed. No game operations or GPU diagnostic waits.
+
+## 2026-10-24 — unknown-sentinel hardening
+
+Consumer self-review found that nonzero checks alone accepted UINT64_MAX, used by the host as an unknown marker. Explicitly reject that sentinel in identity/version/scope evidence and add regressions. Fresh Release build and 13/13 CTests pass after this correction. No frozen host ABI or game change.

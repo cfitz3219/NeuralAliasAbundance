@@ -35,6 +35,13 @@ int main() { return test::run({
         w = window(); w.order_unambiguous = false; unavailable(w, depth());
         w = window(); w.coverage_complete = false; unavailable(w, depth());
     }},
+    {"wire unknown sentinels are not positive identity evidence", [] {
+        auto w = window(); auto o = depth(); w.scope.recording = UINT64_MAX; o.scope = w.scope;
+        unavailable(w,o);
+        o = depth(); o.content_version = UINT64_MAX; unavailable(window(),o);
+        w = window(); w.scene_end = UINT64_MAX; w.hud_begin = 0;
+        o = depth(); o.last_write = UINT64_MAX; unavailable(w,o);
+    }},
     {"released injector and unknown content cannot become candidates", [] {
         auto o = depth(); o.alive = false; unavailable(window(), o);
         o = depth(); o.external_work = false; unavailable(window(), o);

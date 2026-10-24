@@ -25,7 +25,7 @@ inline bool SameSample(const SampleIdentity& a, const SampleIdentity& b) {
         a.subresource == b.subresource && a.width == b.width && a.height == b.height;
 }
 inline bool Ready(const SampleIdentity& s) {
-    return ValidScope(s.scope) && s.resource && s.version && s.width && s.height &&
+    return ValidScope(s.scope) && Known(s.resource) && Known(s.version) && s.width && s.height &&
         s.width <= 4096 && s.height <= 4096 && s.completed && s.lifetime_valid && s.coverage_complete;
 }
 inline bool Finite(const Vec3& p) {

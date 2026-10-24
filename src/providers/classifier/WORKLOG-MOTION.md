@@ -18,3 +18,7 @@ Unavailable. No runtime visibility/semantic-confidence claim. Evidence under pri
 build/a7-cpu/Testing/Temporary/LastTest.log. A7 remains in progress pending capture and
 resource-candidate integration. Full A7 estimate2–4 working days; no attendance needed
 for this checkpoint.
+
+## 2026-10-24 — unknown-sentinel hardening
+
+Consumer self-review found that nonzero checks alone accepted UINT64_MAX, used by the host as an unknown marker. Explicitly reject that sentinel in identity/version/scope evidence and add regressions. Fresh Release build and 12/12 CTests pass after this correction. No frozen host ABI or game change.
