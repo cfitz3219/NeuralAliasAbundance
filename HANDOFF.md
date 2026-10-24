@@ -1,3 +1,13 @@
+# 2026-10-24 — A3 fixture implemented; CI green
+
+PR #11 is merged. Claude reports RTX session 2 at dceaaab: 21/21 CTests,
+explicit RTX 5070 Ti adapter and passing cross-queue timing regressions; 32 deploy
+checks. A3 is now draft PR #12 at e57e830: portable scene/truth export and strict
+candidate checker, ten analytical/adversarial checks. Verified CI: Linux 8/8,
+Windows 18/18 and 20/20, deployment 32 checks. No live-game deployment or C6 GPU
+integration is claimed. See COMMS for the fixture handoff and evidence links.
+Gate 2 review remains pending; A4 is the next Astra task, C6 is Claude's.
+
 # 2026-10-23 — Universal DX12 architecture direction
 
 Cort directs universal DX12 injection as the engineering goal and working premise.

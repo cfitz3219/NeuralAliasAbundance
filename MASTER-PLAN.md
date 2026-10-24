@@ -146,3 +146,12 @@ Every claim was checked against the code (and, for API rules, Microsoft's docume
 - **C14** (FG phase): per-game NVIDIA driver FG preset, opt-in with restore.
 - **FG design note**: under V-Sync, generated presents each wait a refresh; FG needs refresh ≥ (multiplier × game fps) or a VRR/tearing path (`ALLOW_TEARING` only with SyncInterval 0 on a tearing-capable, non-exclusive-fullscreen chain).
 
+
+## 5. A3 build progress (2026-10-24, Astra)
+
+A3 portable ground-truth generator and CPU candidate checker are implemented in
+draft PR #12 (`astra/a3-ground-truth-fixture`, e57e830). CI run 40067259102 passes
+Linux 8/8, Windows no-SDK 18/18, public-header 20/20 and deployment 32 checks.
+Scene/truth output and ten analytical/adversarial checks are documented in
+`tests/fixture/README.md` on the branch. C6 GPU upload/evaluation remains Claude's
+integration task; Gate 2 peer review is pending. Next Astra task: A4.
