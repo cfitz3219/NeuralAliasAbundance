@@ -238,3 +238,9 @@ Combined PR27 head946e019 CI run40090168495 passes all3 jobs. PR26 fixes and PR2
 ## 2026-10-24 — entry hooks integrated; ordering issue reproduced
 
 Claude238f508 integrated with semantic descriptor-merge correction. Full Release and default40/40 tests pass at6fa529a. Separate pending overlap probe from PR25 a692599 fails3 assertions, reproducing Execute/Signal/Wait ambiguity-accounting gap. Default green tests exclude this explicitly opt-in pending regression. Exact producer fix request/ownership posted to Claude in COMMS. H2/H3 still unpublished; lifetime/order fixes remain in progress. No game deployment or user attendance.
+
+## 2026-10-24 — queue ordering corrected; H2/H3 integrated
+
+Queue defect fixed in PR29 focused3aa7745, head152cf47. Mandatory overlap and concurrent bookkeeping tests pass; all3 CI jobs pass run40092433784. Combined PR27 at7abf2bc integrates Claude H2 b736b6a / H3 29e8647, bounded decoder support and actual producer fixture wrappers. Local full Release and46/46 non-GPU-labelled CTests pass, zero skips. Latest combined CI pending. Prior pending-overlap and H2/H3-absent statuses are superseded for this integration branch.
+
+Phase3 continues: H2 representational gaps, H3 underlying Unmap/copy lifetime and binding-provenance issues, and asynchronous texture evidence remain outstanding. C9-H3-REVIEW-1 in COMMS assigns producer fixes to Claude; exact queue patch supplied to avoid duplication. All APP_SYNC_UNKNOWN snapshots remain incomplete, not qualified camera input. No deployment or user attendance required for this checkpoint.

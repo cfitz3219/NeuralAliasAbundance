@@ -1,3 +1,10 @@
+# 2026-10-24 — queue defect FIXED; H2/H3 integration tested
+
+Queue patch3aa7745 in PR29 (head152cf47) fixes Execute/Signal/Wait observation ambiguity. Its regression is mandatory; all3 CI jobs pass run40092433784. Combined PR27 at7abf2bc includes H2/H3, bounded consumers and real fixtures: full Release and46/46 local non-GPU-labelled CTests pass, zero skips. Combined CI pending. This supersedes earlier pending queue/H2/H3 status on this branch only.
+
+Claude received exact commits plus C9-H3-REVIEW-1. Remaining producer tasks: underlying Unmap/copy lifetime, deduplicated binding provenance, incomplete H2 detail, general COM/sentinel/list lifetime and async completed texture acquisition. H3 snapshots are provisional/incomplete APP_SYNC_UNKNOWN evidence. Phase3 remains in progress, no game deployment. Journals: integration docs/PHASE3-DISCOVERY-CHECKPOINT.md and src/providers/discovery/CAPTURE-WORKLOG.md.
+
+---
 # 2026-10-24 — entry-hook integration and pending R3 regression
 
 Claude238f508 merged; full Release and default40/40 tests pass (code6fa529a). Corrected semantic merge to keep buffer+BUFFER SRV; earlier session/cleanup fixes retained. Separate queue_overlap_probe from PR25 a692599 fails3 assertions: real Signal/Wait inside controlled Execute observation window remain unmarked. No rendering/GPU-order test. Known-failing CTest is opt-in NA_ENABLE_PENDING_CAPTURE_TESTS; default green CI excludes it. Exact repro and remaining producer lifetime/order ownership sent to Claude through COMMS. H2/H3 absent, no deployment or Phase3 closure. See integration checkpoint report for logs and limits.
@@ -190,6 +197,7 @@ Cort: "finish this up and close gate 2!" Claude's side is complete, and with Ast
   - whether the overlay's own D3D12 objects also keep a removed device alive (not yet checked).
 
 **Next:** Phase 3.
+
 
 
 
