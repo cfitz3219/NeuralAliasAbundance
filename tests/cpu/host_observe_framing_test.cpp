@@ -33,7 +33,7 @@ struct Capture {
         std::unique_lock<std::mutex> lock(c.mutex);
         ++c.calls;
         try {
-            CHECK(b->header_bytes >= sizeof(*b)); CHECK(b->abi_major == 0 && b->abi_minor == 1);
+            CHECK(b->header_bytes >= sizeof(*b)); CHECK(b->abi_major == 0 && b->abi_minor == NA_OBSERVE_ABI_MINOR);
             CHECK(b->session != 0); CHECK(b->payload_bytes % 8 == 0);
             const auto s=status(); CHECK(s.session == b->session); // status is sink-safe
             const auto* payload=reinterpret_cast<const unsigned char*>(b)+b->header_bytes;
@@ -91,7 +91,7 @@ int main() { return test::run({
     {"lifecycle, exact batch framing, final delivery and no post-stop callbacks", [] {
         Session s; CHECK(na_observe_stop() == NA_E_STATE); CHECK(na_observe_resync() == NA_E_STATE);
         CHECK(na_observe_start(nullptr,nullptr,nullptr) == NA_E_ARG);
-        uint16_t major=99, minor=99; CHECK(na_observe_abi(&major,&minor) == NA_OK && major == 0 && minor == 1);
+        uint16_t major=99, minor=99; CHECK(na_observe_abi(&major,&minor) == NA_OK && major == 0 && minor == NA_OBSERVE_ABI_MINOR);
         CHECK(na_observe_abi(nullptr,&minor) == NA_E_ARG);
         s.start(); CHECK(na_observe_start(nullptr,Capture::sink,&s.capture) == NA_E_STATE);
         eventually([] { return status().inventory_invalid == 0; });

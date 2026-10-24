@@ -109,6 +109,8 @@ target_include_directories(upscaler_jitter_test SYSTEM PRIVATE "${PROJECT_SOURCE
 
 # C8a: H1 producers on a real device (WARP on CI).
 na_host_test(observe_producers_test SOURCES observe_producers_test.cpp LIBS host_observe_producers dxgi)
+# C8b: a frame with known passes must come back as exactly those ops (ABI 0.2).
+na_host_test(observe_passes_test SOURCES observe_passes_test.cpp LIBS host_observe_producers d3d12 d3dcompiler dxgi)
 
 # C7a: FSR 3.1+ interception against a stand-in FidelityFX runtime DLL.
 add_library(ffx_stub SHARED ffx_stub.cpp)
