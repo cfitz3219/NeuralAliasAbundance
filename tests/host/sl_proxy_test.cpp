@@ -13,11 +13,14 @@
 // Usage: sl_proxy_test <sl.interposer.dll> <sl_interposer_real.dll>
 #include "test_support.hpp"
 
+#include <cstddef>
+#include <cstring>
+
 #include <string>
 #include <vector>
 
 namespace {
-struct StubState { uint32_t inits, set_consts, get_settings, set_constants, evaluates; uint32_t last_feature, last_frame, last_id; const void* last_ptr; };
+struct StubState { uint32_t inits, set_consts, get_settings, set_constants, evaluates; uint32_t last_feature, last_frame, last_id; const void* last_ptr; uint64_t wide[5]; };
 
 std::vector<std::string> ExportNames(HMODULE m)
 {
@@ -109,6 +112,53 @@ int wmain(int argc, wchar_t** argv)
     CHECK(st()->set_constants == 1 && st()->last_frame == 11);
     CHECK(evalf(nullptr, 1, 12, 0));
     CHECK(st()->evaluates == 1 && st()->last_feature == 1 && st()->last_frame == 12);
+
+    {
+        auto layout = reinterpret_cast<uint32_t(*)(uint64_t*)>(GetProcAddress(proxy, "NeuralAliasSLProxyLayout"));
+        REQUIRE(layout != nullptr);
+        uint64_t blocks = 0;
+        CHECK(layout(&blocks) == 1 && blocks == 1); // 1.x constants seen (camera itself invalid -> rejected by FG)
+    }
+
+    // 4b. C7b: Streamline 2.x signatures pass through at full width and its
+    // Constants / FrameToken / ViewportHandle are recognised by type GUID.
+    {
+        auto init2 = reinterpret_cast<uint64_t(__cdecl*)(const void*, uint64_t)>(GetProcAddress(proxy, "slInit"));
+        const uint64_t sdk_version = 0x0002000E0010C0DEull; // 2.x kSDKVersion-shaped: high bits set
+        init2(&prefs, sdk_version);
+        CHECK(st()->wide[1] == sdk_version); // 1.x-typed wrappers truncated this to 32 bits
+
+        auto eval2 = reinterpret_cast<uint64_t(__cdecl*)(uint32_t, const void*, const void**, uint32_t, void*)>(GetProcAddress(proxy, "slEvaluateFeature"));
+        const void* inputs[1] = {&consts};
+        void* cmd = reinterpret_cast<void*>(0x00007FF612345678ull);
+        eval2(1, reinterpret_cast<const void*>(0x00007FF6AABBCCDDull), inputs, 1, cmd);
+        CHECK(st()->wide[1] == 0x00007FF6AABBCCDDull && st()->wide[2] == reinterpret_cast<uintptr_t>(inputs) && st()->wide[4] == reinterpret_cast<uintptr_t>(cmd));
+
+        // A 2.x-shaped Constants block, FrameToken (vptr first) and ViewportHandle.
+        struct alignas(8) Header { void* next; uint8_t guid[16]; size_t version; };
+        struct alignas(8) Constants2 { Header h; float body[103]; uint8_t flags[7]; uint8_t pad; float sep; } c2{};
+        static_assert(offsetof(Constants2, body) == 32 && offsetof(Constants2, flags) == 444, "2.x layout");
+        const uint8_t cguid[16] = {0xd7, 0x5a, 0xd3, 0xdc, 0x4a, 0x4e, 0xad, 0x4b, 0xa9, 0x0c, 0xe0, 0xc4, 0x9e, 0xb2, 0x3a, 0xfe};
+        memcpy(c2.h.guid, cguid, 16);
+        c2.h.version = 2;
+        struct Token { virtual uint32_t value() const { return 77; } Header h; } token;
+        const uint8_t tguid[16] = {0x35, 0x0f, 0x0a, 0x83, 0x84, 0xdb, 0x71, 0x41, 0xa8, 0x04, 0x59, 0xb2, 0x06, 0x49, 0x9b, 0x18};
+        memcpy(token.h.guid, tguid, 16);
+        struct Viewport { Header h; uint32_t value; } vp{};
+        const uint8_t vguid[16] = {0x35, 0x64, 0x1b, 0x17, 0x3c, 0x9b, 0xc8, 0x4f, 0x99, 0x94, 0xfb, 0xe5, 0x25, 0x69, 0xaa, 0xa4};
+        memcpy(vp.h.guid, vguid, 16);
+        vp.value = 3;
+        auto stub_ret = reinterpret_cast<void(__cdecl*)(uint64_t)>(GetProcAddress(real, "SlStubSetConstantsReturn"));
+        REQUIRE(stub_ret != nullptr);
+        stub_ret(0); // sl::Result::eOk
+        auto setc2 = reinterpret_cast<uint64_t(__cdecl*)(const void*, const void*, const void*)>(GetProcAddress(proxy, "slSetConstants"));
+        CHECK(setc2(&c2, &token, &vp) == 0);
+        CHECK(st()->wide[1] == reinterpret_cast<uintptr_t>(&token) && st()->wide[2] == reinterpret_cast<uintptr_t>(&vp));
+        auto layout = reinterpret_cast<uint32_t(*)(uint64_t*)>(GetProcAddress(proxy, "NeuralAliasSLProxyLayout"));
+        uint64_t blocks = 0;
+        CHECK(layout(&blocks) == 2 && blocks == 2);
+        stub_ret(1);
+    }
 
     // 5. Forwarder with a missing target: resolution fails, nothing crashes.
     CHECK(GetProcAddress(proxy, "slSetTag") == nullptr);
