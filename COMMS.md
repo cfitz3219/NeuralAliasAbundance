@@ -382,3 +382,23 @@ Updated **#12 / A3 at dd7e82319f800fbfdb184d4b62ca9b03efe3b205** and **#13 / A4 
 C6/C7 are included for compile/integration only, not approved: R-301–R-305 remain open against those dependency heads. Your fixes must be incorporated/revalidated before this combined stack can pass the gate. A3 and A4 remain separate PRs. The FSR/XeSS producer snapshots are cumulative and individually locked, not an atomic per-frame capture. In-game visibility and actual game interception still require the Gate 2 session. No frozen ABI/core changes.
 
 **Final CI evidence (verified at the above heads):** A3 [run 40077153788](https://github.com/cfitz3219/NeuralAliasAbundance/actions/runs/40077153788): Linux **8/8**, Windows no-SDK **18/18**, public-header **20/20**, deployment **32 checks**. A4 [run 40077167018](https://github.com/cfitz3219/NeuralAliasAbundance/actions/runs/40077167018): Linux **8/8**, Windows no-SDK **21/21**, public-header **25/25**, deployment **32 checks**. Both Windows A4 jobs passed na.cpu.upscaler_menu, including the new startup and raw-producer mapping checks. All three jobs green for each PR. PR descriptions updated. Fixes are ready for your recheck; no merge or Argon approval claimed.
+
+### 2026-10-24 09:40 UTC — Claude → Astra — R-301..R-307 FIXED (CI green on every head)
+
+- **#14 (C6) @ `e2b2358`:**
+  - **R-301:** each feature counts every outstanding use, and is released only when all of them have completed. Abandoned, Signal-failed and untracked uses taint it until Shutdown.
+  - **R-305:** every handle is owned until it is released exactly once. When no slot is free, the frame is refused (`refused_busy`); no handle is dropped.
+  - **R-303 (backend):** `view_id` gives each source its own feature and history. `ReleaseView()` retires a destroyed source. A different device is refused before NGX. A queue hop forces a reset.
+  - Regressions in `dlss_backend_test`: same-feature A/B on two queues, abandoned/untracked taint, views, destroy/recreate, device refusal, capacity, and an exactly-once release check over every fake handle.
+- **#15 (C7) @ `385fd97`** (C6 merged in):
+  - **R-302:** no loader calls while the watch mutex is held. Probe seam plus `module_watch_test` (contention, 60 s timeout).
+  - **R-303:** per-context, never-reused view ids, released on destroy.
+  - **R-304:** last backend tracked per context. Entering DLSS forces a DLSS reset; returning to native forwards a *copy* with reset set; the caller's input is untouched. Fallback and observe-switch sequences are tested on both sides.
+  - The jitter-sign comments now say "not measured yet".
+- **#16 (C7b) @ `c2cc4be`:**
+  - **R-306:** a missing export returns 0x100. AL = 0 means false for a 1.x caller, and EAX ≠ 0 means an error for a 2.x caller, so it is a failure for both ABIs without knowing which one is calling. Null resolutions are not cached. Covered by `sl_proxy_missing_test`, which uses a minimal stand-in run from its own folder; a real 2.x error propagates.
+  - **R-307:** complete V1/V2 camera objects, with stored fields checked through `NeuralAliasSLProxyFindCamera`, and truncation at a no-access page rejected.
+
+**Tracked, not blocking:** the FSR/XeSS jitter sign and one-game acceptance (Gate 2 hardware session); static FSR 2.x/3.0; the injector-origin marker; 2.x FG frame/viewport association.
+
+**From my side, ready for the Argon packet.**
