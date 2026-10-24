@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 
@@ -150,6 +151,7 @@ struct State {
     Stats stats{};
 };
 State g;
+std::atomic<bool> g_any_attached{false}; // hot-path filter for OnExecuted (every game submission)
 
 void set_reason(char* dst, const char* text) { std::snprintf(dst, 128, "%s", text ? text : ""); }
 
@@ -345,6 +347,7 @@ bool Attach(ID3D12Device* device, const Api& api)
     }
     g.attached = true;
     g.caps.attached = true;
+    g_any_attached.store(true, std::memory_order_release);
     read_caps_locked();
     return g.caps.available;
 #else
@@ -405,6 +408,7 @@ void Shutdown()
     for (Retired& t : g.retired) t = Retired{};
     g.api = Api{};
     g.attached = g.own = g.latched = false;
+    g_any_attached.store(false, std::memory_order_release);
     g.cap_params = g.eval_params = g.feature = nullptr;
     g.f_render_w = g.f_render_h = g.f_out_w = g.f_out_h = g.f_flags = 0;
     g.f_last_serial = 0;
@@ -592,7 +596,7 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
 
 void OnExecuted(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* const* lists)
 {
-    if (!queue || !lists || !count) return;
+    if (!queue || !lists || !count || !g_any_attached.load(std::memory_order_acquire)) return;
     std::lock_guard<std::mutex> lock(g.m);
     if (!g.attached) return;
     ++g.exec_calls;

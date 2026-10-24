@@ -17,6 +17,7 @@
 #include "host_dx12/overlay/presenter.hpp"
 #include "host_dx12/overlay/route_a_panel.hpp"
 #include "host_dx12/settings.hpp"
+#include "host_dx12/upscalers/ffx_intercept.hpp"
 
 namespace na::host {
 namespace {
@@ -87,6 +88,14 @@ DWORD WINAPI InitThread(LPVOID)
             g_status.route_a_started = route_a_started ? 1u : 0u;
             if (!route_a_started) strncpy_s(g_status.error, "NGX module watch failed to start", _TRUNCATE);
         }
+    }
+    // C7a: FSR 3.1+ (FidelityFX API) interception. Observing is on by default
+    // (read-only: records what the game gives FSR); replacing FSR's output with
+    // DLSS is opt-in via [fsr] replace=1. Off entirely with [fsr] enabled=0.
+    if (GetPrivateProfileIntW(L"fsr", L"enabled", 1, g_ini) == 1) {
+        na::ffx::SetMode(GetPrivateProfileIntW(L"fsr", L"replace", 0, g_ini) == 1 ? na::ffx::Mode::ReplaceWithDlss
+                                                                                  : na::ffx::Mode::Observe);
+        na::ffx::StartModuleWatch();
     }
     // Adapter phase 1: menu sections before the overlay starts.
     bool adapter_enabled = GetPrivateProfileIntW(L"adapter", L"enabled", 1, g_ini) == 1;

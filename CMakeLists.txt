@@ -172,7 +172,7 @@ else()
   message(STATUS "Game adapter: none (host stub)")
 endif()
 target_link_libraries(host_dx12
-  PUBLIC abundance_options host_hooking host_settings host_capture host_nvof core_gpu imgui nvapi_headers
+  PUBLIC abundance_options host_hooking host_settings host_capture host_nvof core_gpu imgui nvapi_headers host_dlss host_upscalers
          d3d12 dxgi d3dcompiler user32 gdi32 shell32 ole32 bcrypt dbghelp winmm)
 if(NA_HAVE_NGX_SDK)
   target_compile_definitions(host_dx12 PUBLIC NA_HAVE_NGX_SDK)
@@ -217,6 +217,13 @@ if(NA_HAVE_NGX_LIB)
   endif()
 endif()
 message(STATUS "DLSS backend (C6): headers=${NA_HAVE_NGX_SDK}  own NGX instance=${NA_HAVE_NGX_LIB}  nvngx_dlss.dll='${NA_DLSS_DLL}'")
+
+# ------------------------------------------------------------- host_upscalers
+# C7a: FSR 3.1+ interception via the game's FidelityFX API DLL (MIT headers
+# vendored in third_party/ffx-api). Feeds the C6 backend in replace mode.
+add_library(host_upscalers STATIC src/host_dx12/upscalers/ffx_intercept.cpp)
+target_include_directories(host_upscalers SYSTEM PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ffx-api")
+target_link_libraries(host_upscalers PUBLIC abundance_options host_hooking host_dlss d3d12)
 
 # -------------------------------------------------------------- deliverables
 # Standalone manager / diagnostic exe.

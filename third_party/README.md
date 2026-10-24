@@ -8,6 +8,7 @@ Re-vendored 2026-10-23 after the crash, at the same pins the original project re
 | Dear ImGui | v1.92.9b | f1cc2ae15e53a861a874c3034aae6798fde194ab | MIT | core + Win32/DX12 backends |
 | Streamline | v1.1.1 | 5bac43f464f53bc0583bab8df506b788d8d14c3c | MIT | `include/` headers only |
 | NVAPI | 2026-10 main | 70d337db9186e968eab622f7e786de7e437faf3d | MIT | headers only (`nvapi.h`, `NvApiDriverSettings.h`, …); the runtime is the driver's `nvapi64.dll`, loaded dynamically |
+| FidelityFX SDK (ffx-api) | main 2026-06-24 | 60f4ea81909200d8542eca14dccb2628b763a9a3 | MIT | 3 headers only (`ffx_api.h`, `ffx_api_types.h`, `ffx_upscale.h`), SDK layout kept so relative includes work; the runtime is the game's own `amd_fidelityfx_*_dx12.dll` (C7) |
 
 Streamline rule (unchanged): TLOU ships interposer 1.4.7; no public 1.4.7 tag exists. Wrappers may forward
 without interpreting SL structs; interpreting any field requires runtime validation evidence first.

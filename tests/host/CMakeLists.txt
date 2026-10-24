@@ -74,3 +74,12 @@ if(NA_HAVE_NGX_LIB)
       COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:dlss_real_test>")
   endif()
 endif()
+
+# C7a: FSR 3.1+ interception against a stand-in FidelityFX runtime DLL.
+add_library(ffx_stub SHARED ffx_stub.cpp)
+set_target_properties(ffx_stub PROPERTIES PREFIX "")
+target_include_directories(ffx_stub SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/third_party/ffx-api")
+target_link_libraries(ffx_stub PRIVATE abundance_options)
+na_host_test(ffx_intercept_test SOURCES ffx_intercept_test.cpp LIBS host_upscalers dxgi
+             ARGS "$<TARGET_FILE:ffx_stub>")
+add_dependencies(ffx_intercept_test ffx_stub)
