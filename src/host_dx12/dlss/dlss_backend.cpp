@@ -721,11 +721,29 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
 #endif
 }
 
+static void on_executed_locked(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* const* lists);
+
 void OnExecuted(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* const* lists)
 {
     if (!queue || !lists || !count || !g_any_attached.load(std::memory_order_acquire)) return;
-    std::lock_guard<std::mutex> lock(g.m);
-    if (!g.attached) return;
+    {
+        std::lock_guard<std::mutex> lock(g.m);
+        if (!g.attached) return;
+        if (!g.device || g.device->GetDeviceRemovedReason() == S_OK) {
+            on_executed_locked(queue, count, lists);
+            return;
+        }
+    }
+    // Hardware session (G2-004): the bound device was removed. D3D12 devices
+    // are per-adapter singletons, so while we (or NGX) hold it the game's
+    // D3D12CreateDevice gets the SAME removed device back and can never
+    // recover. Nothing can still run on a removed device: shut down now,
+    // releasing NGX and every reference; EnsureOn restarts on the new device.
+    Shutdown();
+}
+
+static void on_executed_locked(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* const* lists)
+{
     ++g.exec_calls;
     for (Record& rec : g.recs) {
         if (rec.state != RecState::Recorded) continue;

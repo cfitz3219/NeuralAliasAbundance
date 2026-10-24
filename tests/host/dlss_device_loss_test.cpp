@@ -112,14 +112,17 @@ int main(int argc, char** argv)
     } // the "game" releases everything it held on device 1
 
     // 3. The game recreates its device on the same adapter.
+    // (Our execute hook ran on the removed device in step 2; that is where the
+    // backend notices the removal and lets go of it.)
+    std::printf("step 3: backend attached after removal: %d\n", na::dlss::GetCapabilities().attached ? 1 : 0);
     Gpu g2;
-    REQUIRE(Open(adapter.Get(), g2));
-    const HRESULT fresh = g2.device->GetDeviceRemovedReason();
-    const bool same = g2.device.Get() == old_ptr && fresh != S_OK;
+    const bool opened = Open(adapter.Get(), g2);
+    const HRESULT fresh = g2.device ? g2.device->GetDeviceRemovedReason() : E_FAIL;
+    const bool same = !opened || fresh != S_OK;
     std::printf("step 3: new device %p (old %p), removed reason 0x%08lX -> %s\n", static_cast<void*>(g2.device.Get()),
                 static_cast<void*>(old_ptr), static_cast<unsigned long>(fresh),
                 fresh == S_OK ? "LIVE new device" : "STILL THE REMOVED DEVICE (something pins it)");
-    CHECK(fresh == S_OK);
+    CHECK(opened && fresh == S_OK);
     if (same) {
         // Diagnose: does releasing the backend's reference free it?
         na::dlss::Shutdown();
