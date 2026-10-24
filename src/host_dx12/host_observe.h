@@ -34,7 +34,7 @@ extern "C" {
 #endif
 
 #define NA_OBSERVE_ABI_MAJOR 0
-#define NA_OBSERVE_ABI_MINOR 1
+#define NA_OBSERVE_ABI_MINOR 2 /* 0.2 (C8): H2 kinds 24-26 appended */
 
 typedef uint64_t na_object_id;  /* opaque, monotonic, never reused in a session */
 typedef uint64_t na_epoch;
@@ -88,7 +88,12 @@ typedef enum na_event_kind {
     NA_EV_EPOCH_BEGIN             = 20,
     NA_EV_INVENTORY_COMPLETE      = 21, /* validity boundary (R4) */
     NA_EV_ORDER_AMBIGUITY_RANGE   = 22, /* retroactive revocation (R3) */
-    NA_EV_DEVICE_CREATED          = 23
+    NA_EV_DEVICE_CREATED          = 23,
+    /* ---- ABI 0.2 (C8 / H2), append-only; 0.1 consumers skip them ---- */
+    NA_EV_ROOT_SIGNATURE_CREATED  = 24, /* NA_GROUP_PIPELINE, foundational */
+    NA_EV_PIPELINE_CREATED        = 25, /* NA_GROUP_PIPELINE, foundational */
+    NA_EV_LIST_OP                 = 26, /* PASS / RESOURCE_USE / CPU_CONSTANTS */
+    NA_EV_SNAPSHOT                = 27  /* NA_GROUP_SNAPSHOT (C9 / H3) */
 } na_event_kind;
 
 /* ---- Event header flags ---- */
@@ -434,6 +439,167 @@ typedef struct na_ev_inventory_complete {
     uint32_t complete;         /* 1 = baseline coherent; 0 = failed, retry */
     uint32_t objects_in_snapshot;
 } na_ev_inventory_complete;
+
+/* =====================================================================
+ * ABI 0.2 (C8 / H2) — append-only additions. Same R1/R2 rules: decode via
+ * size_bytes, arrays only through offset/stride, unknown = NA_UNKNOWN_*.
+ * ===================================================================== */
+
+/* Root signature: one entry per root parameter. */
+typedef enum na_root_param_type {
+    NA_ROOT_TABLE = 0, NA_ROOT_CONSTANTS = 1, NA_ROOT_CBV = 2, NA_ROOT_SRV = 3, NA_ROOT_UAV = 4
+} na_root_param_type;
+typedef struct na_root_param {
+    uint32_t param_type;       /* na_root_param_type */
+    uint32_t visibility;       /* D3D12_SHADER_VISIBILITY */
+    uint32_t shader_register;  /* constants/root views; tables: first range */
+    uint32_t register_space;
+    uint32_t count;            /* constants: 32-bit values; tables: range count */
+    uint32_t range_type;       /* tables: first range D3D12_DESCRIPTOR_RANGE_TYPE, else NA_UNKNOWN_U32 */
+    uint32_t range_descriptors;/* tables: first range descriptor count (UINT_MAX = unbounded) */
+    uint32_t _pad;
+} na_root_param;
+typedef struct na_ev_root_signature_created {
+    na_event_header hdr;
+    na_object_id root_signature;
+    na_object_id device;
+    uint64_t blob_hash;        /* FNV-1a 64 of the serialized blob */
+    uint64_t blob_bytes;
+    uint32_t flags;            /* D3D12_ROOT_SIGNATURE_FLAGS, or NA_UNKNOWN_U32 */
+    uint32_t param_count;      /* 0 + NA_EVF_METHOD_UNOBSERVED when not decodable */
+    uint32_t params_offset;
+    uint32_t param_stride;     /* >= sizeof(na_root_param) */
+} na_ev_root_signature_created;
+
+typedef enum na_shader_stage {
+    NA_STAGE_VS = 0, NA_STAGE_PS = 1, NA_STAGE_DS = 2, NA_STAGE_HS = 3, NA_STAGE_GS = 4,
+    NA_STAGE_CS = 5, NA_STAGE_AS = 6, NA_STAGE_MS = 7, NA_STAGE_COUNT = 8
+} na_shader_stage;
+typedef enum na_pipeline_kind {
+    NA_PIPELINE_GRAPHICS = 1, NA_PIPELINE_COMPUTE = 2, NA_PIPELINE_STREAM = 3
+} na_pipeline_kind;
+typedef struct na_ev_pipeline_created {
+    na_event_header hdr;
+    na_object_id pipeline;
+    na_object_id device;
+    na_object_id root_signature;   /* 0 = none given (embedded) / unobserved */
+    uint32_t pipeline_kind;        /* na_pipeline_kind */
+    uint32_t rt_count;
+    uint64_t stage_hash[NA_STAGE_COUNT];  /* FNV-1a 64 of bytecode; 0 = stage absent */
+    uint32_t stage_bytes[NA_STAGE_COUNT];
+    uint32_t rtv_formats[8];
+    uint32_t dsv_format;
+    uint32_t sample_count;
+    uint32_t depth_enable;         /* 0/1 or NA_UNKNOWN_U32 */
+    uint32_t depth_write;          /* 0/1 (D3D12_DEPTH_WRITE_MASK_ALL) or NA_UNKNOWN_U32 */
+    uint32_t depth_func;           /* D3D12_COMPARISON_FUNC or NA_UNKNOWN_U32 */
+    uint32_t blend_enable_mask;    /* bit i = RT i blends; NA_UNKNOWN_U32 if unobserved */
+} na_ev_pipeline_created;
+
+/* One recorded command-list operation. op_index starts at 1 for every
+ * recording (recording_generation as in LIST_RESET). a[] meaning per op:
+ *   SET_PIPELINE            a0 pipeline
+ *   SET_ROOT_SIGNATURE      a0 root signature, a1 0=graphics 1=compute
+ *   SET_DESCRIPTOR_HEAPS    a0 CBV/SRV/UAV heap, a1 sampler heap
+ *   SET_ROOT_TABLE          a0 heap, a1 slot, a2 slot_version, a3 param, a4 0=gfx 1=compute
+ *   SET_ROOT_CONSTANTS      a0 param, a1 dest offset (32-bit units), a2 count, a3 0=gfx 1=compute;
+ *                           payload = count * 4 bytes BY VALUE
+ *   SET_ROOT_VIEW           a0 resource (or UNKNOWN), a1 byte offset (or UNKNOWN), a2 param,
+ *                           a3 view kind (NA_DESC_CBV/SRV/UAV), a4 0=gfx 1=compute
+ *   OM_SET_RENDER_TARGETS   a0 rt count, a1 has dsv; payload = (rt count [+1 dsv last]) na_view_ref
+ *   CLEAR_RTV               payload = 1 na_view_ref, a0..a1 = clear colour (4 floats, raw bits)
+ *   CLEAR_DSV               payload = 1 na_view_ref, a0 flags, a1 depth (float bits), a2 stencil
+ *   DRAW                    a0 vertex count, a1 instance count
+ *   DRAW_INDEXED            a0 index count, a1 instance count
+ *   DISPATCH                a0 x, a1 y, a2 z
+ *   EXECUTE_INDIRECT        a0 max commands; effects unobserved (flag set)
+ *   EXECUTE_BUNDLE          a0 bundle list id; contents unobserved (flag set)
+ *   COPY_RESOURCE           a0 dst, a1 src
+ *   COPY_BUFFER_REGION      a0 dst, a1 dst offset, a2 src, a3 src offset, a4 bytes
+ *   COPY_TEXTURE_REGION     a0 dst, a1 dst subresource (NA_UNKNOWN_U32 = footprint), a2 src, a3 src subresource
+ *   RESOLVE                 a0 dst, a1 dst sub, a2 src, a3 src sub, a4 format
+ *   RESOURCE_BARRIER        a0 barrier count; payload = na_barrier array
+ *   RS_VIEWPORT             a0 count; a1 = x|y (float bits lo/hi), a2 = w|h, a3 = min|max depth
+ *   RS_SCISSOR              a0 count; a1 = left|top, a2 = right|bottom (int32 lo/hi)
+ * Ops recorded while the list's current implementation is not fully hooked,
+ * or before its Reset was observed, carry NA_EVF_METHOD_UNOBSERVED. */
+typedef enum na_list_op_code {
+    NA_OP_SET_PIPELINE = 1, NA_OP_SET_ROOT_SIGNATURE = 2, NA_OP_SET_DESCRIPTOR_HEAPS = 3,
+    NA_OP_SET_ROOT_TABLE = 4, NA_OP_SET_ROOT_CONSTANTS = 5, NA_OP_SET_ROOT_VIEW = 6,
+    NA_OP_OM_SET_RENDER_TARGETS = 7, NA_OP_CLEAR_RTV = 8, NA_OP_CLEAR_DSV = 9,
+    NA_OP_DRAW = 10, NA_OP_DRAW_INDEXED = 11, NA_OP_DISPATCH = 12, NA_OP_EXECUTE_INDIRECT = 13,
+    NA_OP_EXECUTE_BUNDLE = 14, NA_OP_COPY_RESOURCE = 15, NA_OP_COPY_BUFFER_REGION = 16,
+    NA_OP_COPY_TEXTURE_REGION = 17, NA_OP_RESOLVE = 18, NA_OP_RESOURCE_BARRIER = 19,
+    NA_OP_RS_VIEWPORT = 20, NA_OP_RS_SCISSOR = 21
+} na_list_op_code;
+typedef struct na_view_ref {       /* a descriptor as used, resolved at record time */
+    na_object_id heap;             /* 0 = handle outside every observed heap */
+    uint32_t slot;
+    uint32_t descriptor_kind;      /* na_descriptor_kind of the slot's last write */
+    uint64_t slot_version;         /* version at record time */
+    na_object_id resource;         /* from the slot's last observed write; UNKNOWN if none */
+    uint32_t format;
+    uint32_t first_subresource;
+} na_view_ref;
+typedef struct na_barrier {
+    uint32_t barrier_type;         /* D3D12_RESOURCE_BARRIER_TYPE */
+    uint32_t barrier_flags;        /* D3D12_RESOURCE_BARRIER_FLAGS */
+    na_object_id resource;         /* transition / UAV resource; aliasing: before */
+    na_object_id resource_after;   /* aliasing only, else 0 */
+    uint32_t subresource;
+    uint32_t state_before;         /* transitions; else NA_UNKNOWN_U32 */
+    uint32_t state_after;
+    uint32_t _pad;
+} na_barrier;
+typedef struct na_ev_list_op {
+    na_event_header hdr;
+    na_object_id list;
+    uint64_t recording_generation; /* NA_UNKNOWN_U64 if the Reset was not observed */
+    uint64_t op_index;
+    uint32_t op;                   /* na_list_op_code */
+    uint32_t payload_offset;       /* from event start; 0 = none */
+    uint32_t payload_bytes;
+    uint32_t payload_stride;       /* element size for arrays, else 0 */
+    uint64_t a[6];
+} na_ev_list_op;
+
+/* C9 / H3: bounded CPU copy of constant data a submitted recording binds,
+ * taken at the submission boundary (ExecuteCommandLists entry) from the
+ * application's own CPU mapping of an UPLOAD-heap buffer. The application may
+ * still be writing that memory: every snapshot is APP_SYNC_UNKNOWN; it is
+ * never an atomic or execution-time capture. GPU-written memory is not
+ * captured (status GPU_WRITTEN). */
+typedef enum na_snapshot_binding {
+    NA_SNAP_ROOT_CBV = 1,      /* SET_ROOT_VIEW (CBV) */
+    NA_SNAP_TABLE_CBV = 2      /* CBV descriptor reached through SET_ROOT_TABLE */
+} na_snapshot_binding;
+typedef enum na_snapshot_status {
+    NA_SNAP_CAPTURED = 0,      /* bytes follow (possibly truncated, see flags) */
+    NA_SNAP_NOT_MAPPED = 1,    /* no observed live CPU mapping of the buffer */
+    NA_SNAP_GPU_WRITTEN = 2,   /* not an upload heap: CPU view is not GPU-time data */
+    NA_SNAP_UNRESOLVED = 3,    /* binding did not resolve to an observed buffer */
+    NA_SNAP_BUDGET = 4         /* per-submission byte/count budget exhausted */
+} na_snapshot_status;
+#define NA_SNAP_SYNC_APP_UNKNOWN 1u
+typedef struct na_ev_snapshot {
+    na_event_header hdr;
+    uint64_t snapshot_id;          /* per session, monotonic */
+    na_object_id queue;
+    uint64_t queue_ticket;         /* the ExecuteCommandLists occurrence */
+    na_object_id list;
+    uint64_t recording_generation;
+    uint64_t op_index;             /* the LIST_OP that bound it */
+    na_object_id resource;
+    uint64_t offset;               /* byte offset in the resource */
+    uint32_t binding;              /* na_snapshot_binding */
+    uint32_t param;                /* root parameter index */
+    uint32_t compute;              /* 0 graphics / 1 compute */
+    uint32_t sync;                 /* NA_SNAP_SYNC_* (always APP_UNKNOWN) */
+    uint32_t requested_bytes;      /* CBV size, or the host default for root CBVs */
+    uint32_t captured_bytes;
+    uint32_t payload_offset;       /* from event start; 0 when nothing captured */
+    uint32_t status;               /* na_snapshot_status */
+} na_ev_snapshot;
 
 /* ---- Batch framing (R2) ----
  * A batch is one contiguous host-owned allocation:

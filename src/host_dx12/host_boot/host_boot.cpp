@@ -19,6 +19,7 @@
 #include "host_dx12/settings.hpp"
 #include "host_dx12/upscalers/ffx_intercept.hpp"
 #include "host_dx12/upscalers/xess_intercept.hpp"
+#include "host_dx12/observe/producers.hpp"
 
 namespace na::host {
 namespace {
@@ -125,6 +126,9 @@ DWORD WINAPI InitThread(LPVOID)
         lstrcatW(status_path, L"\\NeuralAliasHost-status.log");
         na::overlay::SetStatusLogPath(status_path); // A55
     }
+    // C8: discovery observation producers (H1/H2). Off by default until a
+    // consumer (A5 classifier) runs; [observe] producers=1 turns them on.
+    na::observe::RequestInstall(GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1);
     bool started = na::overlay::Start(tag, nullptr);
     {
         std::lock_guard<std::mutex> lock(g_mutex);

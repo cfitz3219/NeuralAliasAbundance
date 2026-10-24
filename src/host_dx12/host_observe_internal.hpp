@@ -22,6 +22,9 @@ namespace na::observe_internal {
 // counter on drop. Returns false when the event was dropped (loss recorded).
 bool Emit(const void* event_bytes, uint32_t group);
 
+// True while a consumer is started: producers skip building events otherwise.
+bool Started();
+
 // Snapshot provider used by start()/resync(): must Emit() the inventory
 // baseline (foundational events) and return true when the baseline is
 // coherent and complete. Absent provider => empty snapshot, complete.

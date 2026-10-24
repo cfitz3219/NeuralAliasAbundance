@@ -107,6 +107,13 @@ na_host_test(upscaler_jitter_test SOURCES upscaler_jitter_test.cpp LIBS d3d12 dx
              ARGS "${NA_UPSCALER_RUNTIME_DIR}" LABELS "gpu")
 target_include_directories(upscaler_jitter_test SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/third_party/ffx-api" "${PROJECT_SOURCE_DIR}/src")
 
+# C8a: H1 producers on a real device (WARP on CI).
+na_host_test(observe_producers_test SOURCES observe_producers_test.cpp LIBS host_observe_producers dxgi)
+# C8b: a frame with known passes must come back as exactly those ops (ABI 0.2).
+na_host_test(observe_passes_test SOURCES observe_passes_test.cpp LIBS host_observe_producers d3d12 d3dcompiler dxgi)
+# C9: constant-buffer snapshots at submission (app-sync-unknown).
+na_host_test(observe_snapshot_test SOURCES observe_snapshot_test.cpp LIBS host_observe_producers d3d12 dxgi)
+
 # C7a: FSR 3.1+ interception against a stand-in FidelityFX runtime DLL.
 add_library(ffx_stub SHARED ffx_stub.cpp)
 set_target_properties(ffx_stub PROPERTIES PREFIX "")

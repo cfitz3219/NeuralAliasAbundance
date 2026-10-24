@@ -19,6 +19,7 @@
 
 #include "host_dx12/capture/frame_capture.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
+#include "host_dx12/observe/producers.hpp"
 #include "host_dx12/upscalers/ffx_intercept.hpp"
 #include "host_dx12/upscalers/xess_intercept.hpp"
 #include "host_dx12/color/color_space.hpp"
@@ -1900,6 +1901,9 @@ void STDMETHODCALLTYPE DetourExecute(ID3D12CommandQueue* q, UINT n,
         }
     }
     g_exec_active.fetch_add(1, std::memory_order_acq_rel);
+    // C8: H1/H2 observation of the game's submissions ([observe] producers=1).
+    const na::observe::ExecuteToken obs_token =
+        na::observe::ProducersActive() ? na::observe::ExecuteBegin(q, n, lists) : na::observe::ExecuteToken{};
     ExecuteSubscriber* sub = g_exec_sub.load(std::memory_order_acquire);
     if (sub) {
         ExecuteContext ctx{q, n, lists, g_exec_ticket.fetch_add(1, std::memory_order_relaxed) + 1, uncovered, sub->user};
@@ -1916,6 +1920,7 @@ void STDMETHODCALLTYPE DetourExecute(ID3D12CommandQueue* q, UINT n,
         na::gputime::OnExecuted(q, n, lists); // R-202: completion fence on the queue that ran the lists
         na::dlss::OnExecuted(q, n, lists);    // C6: completion evidence before retired DLSS features are released
     }
+    if (obs_token.queue_state) na::observe::ExecuteEnd(obs_token, q, n, lists);
     g_exec_active.fetch_sub(1, std::memory_order_acq_rel);
 }
 
@@ -2006,6 +2011,8 @@ bool Start(const char* route_tag, PanelFn controls)
                                             reinterpret_cast<void*>(&DetourSetColorSpace1),
                                             reinterpret_cast<void**>(&g_orig_set_color_space));
             }
+            if (ok && na::observe::InstallRequested()) // C8: observation producers on the same throwaway objects
+                na::observe::InstallProducers(dev.Get(), queue.Get(), /*hook_queue_execute=*/false);
             if (ok) {
                 na::present::Originals o;
                 o.present = g_orig_present;
