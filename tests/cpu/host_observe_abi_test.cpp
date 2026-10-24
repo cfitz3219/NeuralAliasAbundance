@@ -35,6 +35,8 @@ CHECK_EVENT(na_ev_inventory_complete, 48);
 CHECK_EVENT(na_ev_root_signature_created, 80);
 CHECK_EVENT(na_ev_pipeline_created, 216);
 CHECK_EVENT(na_ev_list_op, 120);
+CHECK_EVENT(na_ev_snapshot, 128);
+static_assert(NA_EV_SNAPSHOT == 27 && offsetof(na_ev_snapshot, binding) == 96);
 static_assert(sizeof(na_root_param) == 32 && sizeof(na_view_ref) == 40 && sizeof(na_barrier) == 40);
 static_assert(offsetof(na_ev_list_op, a) == 72 && offsetof(na_ev_pipeline_created, stage_hash) == 64);
 static_assert(NA_EV_ROOT_SIGNATURE_CREATED == 24 && NA_EV_PIPELINE_CREATED == 25 && NA_EV_LIST_OP == 26);

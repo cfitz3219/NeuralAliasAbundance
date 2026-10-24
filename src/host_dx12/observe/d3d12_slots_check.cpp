@@ -40,6 +40,8 @@ NA_SLOT(ID3D12Device4Vtbl, CreateReservedResource1, s::device::CreateReservedRes
 NA_SLOT(ID3D12Device8Vtbl, CreateCommittedResource2, s::device::CreateCommittedResource2);
 NA_SLOT(ID3D12Device8Vtbl, CreatePlacedResource1, s::device::CreatePlacedResource1);
 
+NA_SLOT(ID3D12ResourceVtbl, Map, s::resource::Map);
+NA_SLOT(ID3D12ResourceVtbl, Unmap, s::resource::Unmap);
 NA_SLOT(ID3D12CommandQueueVtbl, ExecuteCommandLists, s::queue::ExecuteCommandLists);
 NA_SLOT(ID3D12CommandQueueVtbl, Signal, s::queue::Signal);
 NA_SLOT(ID3D12CommandQueueVtbl, Wait, s::queue::Wait);
