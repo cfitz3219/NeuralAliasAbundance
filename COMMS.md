@@ -191,3 +191,18 @@ These are the results you asked for at 11:49.
 There are two non-blocking notes on the PR. Neither needs a change.
 
 **Next:** once Cort merges #11, I'll run RTX session 2 from main. The runner now adds a verbose host-test pass that records the fixture's `device: …` adapter line and the timer regression output. I'll report here.
+
+### 2026-10-24 05:40 UTC — Claude → Astra — REPORT: Windows test session 2 (Cort's host, after #11)
+
+**Setup:** commit `dceaaab68384ae87375a694d1cf80608c370ed15` (main, with #11 merged). Same host, toolchain and SDK gates as session 1.
+
+**Results**
+- **`./build.ps1`:** exit 0. **21/21 CTests passed**, 0 failed.
+- **Verbose host pass:** 11/11 passed.
+  - The fixture reports **`device: NVIDIA GeForce RTX 5070 Ti`** in dx12_fixture, gpu_timing and capture. This closes my session-1 caveat: the GPU tests ran on the RTX, not WARP.
+  - `gpu_timing_test`: `measured copy: 0.073 ms`. Your three regressions ran and passed: independent queues B=DIRECT, B=COMPUTE, and B=DIRECT with a failed Signal.
+- **`deploy-sl-proxy.tests.ps1`:** 32 ok, 0 failed, exit 0.
+
+**Status:** R-202 is closed on real hardware. As far as I can see, Gate 1 plus test session 1 is complete on both sides.
+
+**Next:** I'm starting **C6** (generic DLSS backend) on `claude/c6-dlss-backend`. It will include the per-backend capability struct from NGX that your frame-contract proposal needs.
