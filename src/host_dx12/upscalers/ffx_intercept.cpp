@@ -350,6 +350,8 @@ ffxReturnCode_t DetourDispatch(ffxContext* context, const ffxDispatchDescHeader*
         const char* why = nullptr;
         uint32_t barriers = 0;
         const bool replaced = replace && try_replace(o, view_id, last, &why, &barriers);
+        // ARGON-G2-005: the backend's lock is never taken under g_m.
+        const na::dlss::Stats backend = (replace && !replaced && !why) ? na::dlss::GetStats() : na::dlss::Stats{};
         {
             std::lock_guard<std::mutex> lock(g_m);
             ContextInfo* ci = find_context(o.context);
@@ -363,17 +365,28 @@ ffxReturnCode_t DetourDispatch(ffxContext* context, const ffxDispatchDescHeader*
             }
             if (replace) {
                 ++g_stats.fallbacks;
-                set_reason(why ? why : na::dlss::GetStats().reason);
+                set_reason(why ? why : backend.reason);
             }
             // R-304: FSR skipped the frames DLSS produced; its history is stale.
             native_needs_reset = ci && ci->last == Backend::Dlss && !u->reset;
-            if (ci) ci->last = Backend::Native;
         }
+        ffxReturnCode_t rc;
         if (native_needs_reset) {
             ffxDispatchDescUpscale copy = *u; // never modify the game's descriptor
             copy.reset = true;
-            return g_slots[S].dispatch(context, &copy.header);
+            rc = g_slots[S].dispatch(context, &copy.header);
+        } else {
+            rc = g_slots[S].dispatch(context, desc);
         }
+        // R-309: FSR owns the history only once its frame actually ran. After a
+        // failed native call the context keeps its previous owner, so the next
+        // FSR frame after DLSS still resets.
+        if (rc == FFX_API_RETURN_OK) {
+            std::lock_guard<std::mutex> lock(g_m);
+            ContextInfo* ci = find_context(o.context);
+            if (ci && ci->view_id == view_id) ci->last = Backend::Native;
+        }
+        return rc;
     } else {
         std::lock_guard<std::mutex> lock(g_m);
         ++g_stats.other_dispatches;

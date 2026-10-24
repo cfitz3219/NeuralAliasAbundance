@@ -227,6 +227,15 @@ int main(int argc, char** argv)
             CHECK(fb.reset == false);  // caller's descriptor untouched
             CHECK(dispatch(&ctx, &fb.header) == FFX_API_RETURN_OK && last_reset() == 0); // FSR continues
             CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK && dlss_reset() == 1);  // back to DLSS
+            // R-309: a FAILED native frame does not hand the history to FSR:
+            // the next FSR frame after DLSS still resets.
+            auto fail_next = reinterpret_cast<void (*)()>(reinterpret_cast<void*>(GetProcAddress(stub, "StubFailNextDispatch")));
+            REQUIRE(fail_next != nullptr);
+            fail_next();
+            CHECK(dispatch(&ctx, &fb.header) == FFX_API_RETURN_ERROR && last_reset() == 1);
+            CHECK(dispatch(&ctx, &fb.header) == FFX_API_RETURN_OK && last_reset() == 1); // still owed
+            CHECK(dispatch(&ctx, &fb.header) == FFX_API_RETURN_OK && last_reset() == 0); // now FSR's
+            CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK && dlss_reset() == 1);  // back to DLSS
             na::ffx::SetMode(na::ffx::Mode::Observe);
             CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK && last_reset() == 1); // mode change
             CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK && last_reset() == 0);

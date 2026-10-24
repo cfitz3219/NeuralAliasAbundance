@@ -263,6 +263,7 @@ template <int S>
 Result DetourExecute(Context c, ID3D12GraphicsCommandList* list, const D3D12ExecuteParams* p)
 {
     bool native_needs_reset = false;
+    uint64_t native_view = 0; // R-309: the context whose native call is about to run
     if (p) {
         std::unique_lock<std::mutex> lock(g_m);
         Observation o;
@@ -319,6 +320,8 @@ Result DetourExecute(Context c, ID3D12GraphicsCommandList* list, const D3D12Exec
                 else replaced = na::dlss::Evaluate(list, d);
             }
         }
+        // ARGON-G2-005: the backend's lock is never taken under g_m.
+        const na::dlss::Stats backend = (replace && !replaced && !why) ? na::dlss::GetStats() : na::dlss::Stats{};
         lock.lock();
         ContextInfo* ci = find(c);
         if (ci && ci->view_id != view_id) ci = nullptr; // destroyed and recreated meanwhile
@@ -330,18 +333,27 @@ Result DetourExecute(Context c, ID3D12GraphicsCommandList* list, const D3D12Exec
         }
         if (replace) {
             ++g_stats.fallbacks;
-            set_reason(why ? why : na::dlss::GetStats().reason);
+            set_reason(why ? why : backend.reason);
         }
         // R-304: XeSS skipped the frames DLSS produced; its history is stale.
         native_needs_reset = ci && ci->last == Backend::Dlss && !p->resetHistory;
-        if (ci) ci->last = Backend::Native;
+        native_view = ci ? view_id : 0;
     }
+    Result rc;
     if (native_needs_reset) {
         D3D12ExecuteParams copy = *p; // never modify the game's parameters
         copy.resetHistory = 1;
-        return g_slots[S].execute(c, list, &copy);
+        rc = g_slots[S].execute(c, list, &copy);
+    } else {
+        rc = g_slots[S].execute(c, list, p);
     }
-    return g_slots[S].execute(c, list, p);
+    // R-309: XeSS owns the history only once its frame actually ran; after a
+    // failed native call the next XeSS frame after DLSS still resets.
+    if (rc == kSuccess && native_view) {
+        std::lock_guard<std::mutex> relock(g_m);
+        if (ContextInfo* ci = find(c); ci && ci->view_id == native_view) ci->last = Backend::Native;
+    }
+    return rc;
 }
 
 template <int S>

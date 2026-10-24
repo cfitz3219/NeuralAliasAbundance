@@ -12,6 +12,7 @@ int g_creates = 0, g_destroys = 0, g_dispatches = 0, g_upscale_dispatches = 0, g
 uintptr_t g_next = 0x7000;
 float g_last_jitter_x = 0;
 int g_last_reset = -1;
+bool g_fail_next = false; // R-309: the next upscale dispatch fails
 } // namespace
 
 extern "C" {
@@ -52,6 +53,10 @@ FFX_API_ENTRY ffxReturnCode_t ffxDispatch(ffxContext* context, const ffxDispatch
         ++g_upscale_dispatches;
         g_last_jitter_x = reinterpret_cast<const ffxDispatchDescUpscale*>(desc)->jitterOffset.x;
         g_last_reset = reinterpret_cast<const ffxDispatchDescUpscale*>(desc)->reset ? 1 : 0;
+        if (g_fail_next) {
+            g_fail_next = false;
+            return FFX_API_RETURN_ERROR;
+        }
     }
     return FFX_API_RETURN_OK;
 }
@@ -69,4 +74,5 @@ __declspec(dllexport) int StubCounts(int which)
 }
 __declspec(dllexport) float StubLastJitterX() { return g_last_jitter_x; }
 __declspec(dllexport) int StubLastReset() { return g_last_reset; }
+__declspec(dllexport) void StubFailNextDispatch() { g_fail_next = true; }
 }

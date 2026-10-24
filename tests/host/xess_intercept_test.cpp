@@ -179,6 +179,14 @@ int main(int argc, char** argv)
             CHECK(fb.resetHistory == 0); // caller's parameters untouched
             CHECK(execute(ctx, l.list.Get(), &fb) == kSuccess && last_reset() == 0);
             CHECK(execute(ctx, l.list.Get(), &p) == kSuccess && dlss_reset() == 1);
+            // R-309: a FAILED native frame does not hand the history to XeSS.
+            auto fail_next = reinterpret_cast<void (*)()>(reinterpret_cast<void*>(GetProcAddress(stub, "XessStubFailNextExecute")));
+            REQUIRE(fail_next != nullptr);
+            fail_next();
+            CHECK(execute(ctx, l.list.Get(), &fb) != kSuccess && last_reset() == 1);
+            CHECK(execute(ctx, l.list.Get(), &fb) == kSuccess && last_reset() == 1); // still owed
+            CHECK(execute(ctx, l.list.Get(), &fb) == kSuccess && last_reset() == 0);
+            CHECK(execute(ctx, l.list.Get(), &p) == kSuccess && dlss_reset() == 1);
             na::xess::SetMode(na::xess::Mode::Observe);
             CHECK(execute(ctx, l.list.Get(), &p) == kSuccess && last_reset() == 1);
             CHECK(execute(ctx, l.list.Get(), &p) == kSuccess && last_reset() == 0);
