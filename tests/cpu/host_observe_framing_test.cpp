@@ -1,5 +1,6 @@
 // reconstructed 2026-10 — exercises the REAL host transport on Windows; no GPU.
 #include "test_support.hpp"
+#include "providers/discovery/capture_decoder.hpp"
 #include "host_dx12/host_observe.h"
 #include "host_dx12/host_observe_internal.hpp"
 #include <atomic>
@@ -35,6 +36,9 @@ struct Capture {
         try {
             CHECK(b->header_bytes >= sizeof(*b)); CHECK(b->abi_major == 0 && b->abi_minor == 1);
             CHECK(b->session != 0); CHECK(b->payload_bytes % 8 == 0);
+            // Allocation extent is guaranteed by the real host callback contract.
+            const auto decoded=na::discovery::DecodeBatch(b,static_cast<size_t>(b->header_bytes)+b->payload_bytes);
+            CHECK(decoded.valid && decoded.events.size() == b->event_count);
             const auto s=status(); CHECK(s.session == b->session); // status is sink-safe
             const auto* payload=reinterpret_cast<const unsigned char*>(b)+b->header_bytes;
             size_t offset=0; uint32_t count=0; bool complete=false;

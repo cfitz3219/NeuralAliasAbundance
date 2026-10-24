@@ -54,3 +54,37 @@ if(WIN32 AND MSVC AND TARGET host_dx12)
   target_link_libraries(na_cpu_upscaler_menu PRIVATE host_dx12)
   set_tests_properties(na.cpu.upscaler_menu PROPERTIES LABELS "cpu;windows")
 endif()
+
+na_add_cpu_test(capture_decoder)
+na_add_cpu_test(capture_validity)
+
+# Real H1 producers are optional; standalone CPU builds retain portable tests.
+if(WIN32 AND MSVC AND TARGET host_observe_producers)
+  add_executable(na_capture_consumer capture_consumer_test.cpp)
+  target_link_libraries(na_capture_consumer PRIVATE na_cpu_test_options host_observe_producers dxgi)
+  add_test(NAME na.host.capture_consumer COMMAND na_capture_consumer)
+  add_test(NAME na.host.capture_consumer_warp COMMAND na_capture_consumer --warp)
+  set_tests_properties(na.host.capture_consumer na.host.capture_consumer_warp
+    PROPERTIES LABELS "host;capture" TIMEOUT 30 SKIP_RETURN_CODE 77)
+endif()
+
+# Pending producer R3 fix: always build the reproducible diagnostic when C8
+# exists, but register its known-failing regression only when explicitly enabled.
+# This is not counted among the default passing tests. See CAPTURE-WORKLOG.md.
+option(NA_ENABLE_PENDING_CAPTURE_TESTS "Run pending producer ordering regressions" OFF)
+if(WIN32 AND MSVC AND TARGET host_observe_producers)
+  add_executable(na_queue_overlap_probe queue_overlap_probe.cpp)
+  target_include_directories(na_queue_overlap_probe PRIVATE "${NA_CPU_ROOT}/tests/host")
+  target_link_libraries(na_queue_overlap_probe PRIVATE na_cpu_test_options host_observe_producers dxgi)
+  if(NA_ENABLE_PENDING_CAPTURE_TESTS)
+    add_test(NAME na.host.queue_overlap_pending COMMAND na_queue_overlap_probe)
+    set_tests_properties(na.host.queue_overlap_pending PROPERTIES LABELS "host;pending" TIMEOUT 30 SKIP_RETURN_CODE 77)
+  endif()
+endif()
+
+if(WIN32 AND MSVC AND TARGET host_observe_producers AND EXISTS "${NA_CPU_ROOT}/tests/host/observe_passes_test.cpp")
+  add_executable(na_h2_capture_decoder h2_capture_decoder_test.cpp)
+  target_link_libraries(na_h2_capture_decoder PRIVATE na_cpu_test_options host_observe_producers d3dcompiler dxgi)
+  add_test(NAME na.host.h2_capture_decoder COMMAND na_h2_capture_decoder)
+  set_tests_properties(na.host.h2_capture_decoder PROPERTIES LABELS "host;capture" TIMEOUT 60 SKIP_RETURN_CODE 77)
+endif()
