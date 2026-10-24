@@ -109,12 +109,12 @@ class FixtureTests(unittest.TestCase):
 
     def test_checker_rejects_wrong_units_depth_and_masks(self):
         truth = self.frames[3]
-        for name in ('motion', 'depth', 'history_valid', 'scene_color', 'transparent_motion', 'camera'):
+        for name in ('motion', 'depth', 'history_valid', 'scene_color', 'transparent_motion', 'camera', 'previous_camera'):
             candidate = copy.deepcopy(truth)
             if name in ('motion', 'transparent_motion'):
                 candidate['planes'][name] = [[-x*2, -y*2] for x, y in candidate['planes'][name]]
-            elif name == 'camera':
-                candidate['camera']['jitter'][0] += 0.25
+            elif name in ('camera', 'previous_camera'):
+                candidate[name]['jitter'][0] += 0.25
             elif name == 'history_valid':
                 candidate['planes'][name] = [False]*len(candidate['planes'][name])
             elif name == 'scene_color':
@@ -125,13 +125,15 @@ class FixtureTests(unittest.TestCase):
 
     def test_malformed_or_mismatched_candidates(self):
         truth = self.frames[3]
-        for mutation in ('nan', 'length', 'dimensions', 'frame', 'convention'):
+        for mutation in ('nan', 'length', 'dimensions', 'frame', 'convention', 'root', 'planes'):
             candidate = copy.deepcopy(truth)
             if mutation == 'nan': candidate['planes']['depth'][0] = math.nan
             if mutation == 'length': candidate['planes']['motion'].pop()
             if mutation == 'dimensions': candidate['width'] = 0
             if mutation == 'frame': candidate['frame'] = 4
             if mutation == 'convention': candidate['conventions']['motion'] = 'UV'
+            if mutation == 'root': candidate = []
+            if mutation == 'planes': candidate['planes'] = []
             with self.assertRaises(ValueError): compare(truth, candidate)
 
     def test_export_and_cli_exit_codes(self):

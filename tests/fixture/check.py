@@ -10,24 +10,29 @@ COMPONENTS = dict(scene_color=3, depth=1, motion=2, history_valid=0,
 
 
 def validate(data):
-    if data.get('schema') != SCHEMA:
+    if not isinstance(data, dict) or data.get('schema') != SCHEMA:
         raise ValueError('unsupported schema')
     for key in ('width', 'height', 'frame'):
         if type(data.get(key)) is not int:
             raise ValueError('invalid '+key)
     if not (16 <= data['width'] <= 1024 and 16 <= data['height'] <= 1024 and 0 <= data['frame'] < 120):
         raise ValueError('invalid frame/dimensions')
-    cam = data.get('camera', {})
-    for name, count in dict(position=3, focal=2, principal=2, jitter=2, view=16, projection=16).items():
-        values = cam.get(name)
-        if not isinstance(values, list) or len(values) != count or any(
-                type(v) not in (int, float) or not math.isfinite(v) for v in values):
-            raise ValueError('missing/invalid camera '+name)
-    for name in ('near', 'far'):
-        if type(cam.get(name)) not in (int, float) or not math.isfinite(cam[name]):
-            raise ValueError('missing/invalid camera '+name)
-    if not 0 < cam['near'] < cam['far']:
-        raise ValueError('invalid near/far range')
+    if type(data.get('reset')) is not bool or not isinstance(data.get('planes'), dict):
+        raise ValueError('invalid reset or planes')
+    for camera_name in ('camera', 'previous_camera'):
+        cam = data.get(camera_name, {})
+        if not isinstance(cam, dict):
+            raise ValueError('invalid '+camera_name)
+        for name, count in dict(position=3, focal=2, principal=2, jitter=2, view=16, projection=16).items():
+            values = cam.get(name)
+            if not isinstance(values, list) or len(values) != count or any(
+                    type(v) not in (int, float) or not math.isfinite(v) for v in values):
+                raise ValueError('missing/invalid camera '+name)
+        for name in ('near', 'far'):
+            if type(cam.get(name)) not in (int, float) or not math.isfinite(cam[name]):
+                raise ValueError('missing/invalid camera '+name)
+        if not 0 < cam['near'] < cam['far']:
+            raise ValueError('invalid near/far range')
     n = data['width']*data['height']
     for name, components in COMPONENTS.items():
         values = data.get('planes', {}).get(name)
@@ -73,10 +78,11 @@ def compare(truth, candidate, tolerance=1e-4):
             errors += error > (0.0 if components == 0 else tolerance)
         result[name] = dict(checked=checked, errors=errors, max_error=maximum)
     camera_errors = 0
-    for name in ('position', 'focal', 'principal', 'jitter', 'view', 'projection', 'near', 'far'):
-        a, b = truth['camera'][name], candidate['camera'][name]
-        if not isinstance(a, list): a, b = [a], [b]
-        camera_errors += sum(abs(x-y) > tolerance for x, y in zip(a, b))
+    for camera_name in ('camera', 'previous_camera'):
+        for name in ('position', 'focal', 'principal', 'jitter', 'view', 'projection', 'near', 'far'):
+            a, b = truth[camera_name][name], candidate[camera_name][name]
+            if not isinstance(a, list): a, b = [a], [b]
+            camera_errors += sum(abs(x-y) > tolerance for x, y in zip(a, b))
     return dict(passed=camera_errors == 0 and all(r['errors'] == 0 for r in result.values()),
                 camera_errors=camera_errors, planes=result)
 
