@@ -230,3 +230,7 @@ PR25 at1311ea0 now tracks authoritative status loss, inventory/capability bounda
 ## 2026-10-24 — capture defects corrected, real consumer round trip passing
 
 User-authorized fixes delivered in PR26 (1a81e1b, head0701da3): explicit buffer SRV, RAII stop, coherent capability session and startup/resync regressions. Combined22/22 selected tests now pass including RTX producer test. PR25 adds actual producer/decoder/validity round trip, passing RTX and forced WARP. Combined draft PR27 head946e019 runs full integration CI. Phase3 remains in progress for H2/H3, content acquisition and remaining host lifecycle/order findings. No game deployment or user attendance.
+
+## 2026-10-24 — corrected capture integration CI green
+
+Combined PR27 head946e019 CI run40090168495 passes all3 jobs. PR26 fixes and PR25 consumer heads also pass all3. Local broad suite40/40 non-GPU-labelled tests passes, zero skips, including RTX and explicit WARP consumer round trips. Both reproduced capture defects are corrected; remaining Phase3 acquisition/host review work stays open. Exact handoff and evidence in COMMS; no user attendance or game changes.

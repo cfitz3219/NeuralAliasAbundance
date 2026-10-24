@@ -1,3 +1,8 @@
+# 2026-10-24 — capture baseline fully green
+
+Both user-requested defects fixed (patch1a81e1b, PR26). Local broad suite40/40 passes, zero skips, including RTX producer and RTX/WARP consumer round trips. Combined PR27 head946e019 CI40090168495 passes Linux + both Windows jobs; PR26 head0701da3 and PR25 head8f447fc CI also green. Exact fix commits sent to Claude in COMMS; latest Claude d7e1af0 is CI annotations only. No PR merged or game deployment. Continue H2/H3/content acquisition and separate shared-target/lifetime/order findings; this does not close Phase3.
+
+---
 # 2026-10-24 — both reproduced capture defects FIXED
 
 Cort authorized direct fixes. PR26 head0701da3, focused patch1a81e1b fixes typed buffer SRV, test failure cleanup and capability session. Committed RTX producer test now passes;22/22 combined selected tests pass. PR25 head8f447fc adds real producer-to-decoder-to-validity tests: RTX and forced WARP both pass. Combined draft PR27 head946e019 publishes the integration for CI. Claude received exact fix commits via COMMS; no duplicate work requested. Remaining shared-target/lifetime/order findings and H2/H3/texture acquisition are still open. No game changes or Phase3 closure.
@@ -180,6 +185,7 @@ Cort: "finish this up and close gate 2!" Claude's side is complete, and with Ast
   - whether the overlay's own D3D12 objects also keep a removed device alive (not yet checked).
 
 **Next:** Phase 3.
+
 
 
 
