@@ -6,7 +6,7 @@
 
 namespace na::discovery {
 enum class Upscaler : uint32_t { Dlss, Fsr, Xess };
-enum class Detection { Unobserved, ModuleOnly, FailedCalls, InjectorOnly, SourceUnknown, Created, Evaluated };
+enum class Detection { Unobserved, ModuleOnly, FailedCalls, InjectorOnly, SourceUnknown, Requested, Created, Evaluated };
 struct UpscalerEvidence {
     bool observer_available = false;
     bool module_seen = false;
@@ -16,6 +16,8 @@ struct UpscalerEvidence {
     uint64_t unknown_creates = 0, unknown_evaluates = 0;
     uint64_t injector_creates = 0, injector_evaluates = 0;
     uint64_t failed_game_calls = 0, failed_unknown_calls = 0;
+    // Calls intercepted before their outcome is known, including replacement.
+    uint64_t game_requests = 0;
 };
 using UpscalerSnapshot = std::array<UpscalerEvidence, 3>;
 struct UpscalerRow {
@@ -49,6 +51,7 @@ inline UpscalerReport DescribeUpscalers(const UpscalerSnapshot& snapshot)
         } else if (e.game_creates) {
             row.detection = Detection::Created; row.badge = "GAME CREATED";
             row.reason = "Successful game SR creation observed; evaluation not established.";
+        // Unknown origin outranks injector-only evidence.
         } else if (e.unknown_creates || e.unknown_evaluates) {
             row.detection = Detection::SourceUnknown; row.badge = "SOURCE UNKNOWN";
             row.reason = "Successful SR calls observed; game versus injector source is unverified.";
@@ -56,6 +59,9 @@ inline UpscalerReport DescribeUpscalers(const UpscalerSnapshot& snapshot)
         } else if (e.injector_creates || e.injector_evaluates) {
             row.detection = Detection::InjectorOnly; row.badge = "INJECTOR";
             row.reason = "Only injector-origin SR calls observed; game integration is unconfirmed.";
+        } else if (e.game_requests) {
+            row.detection = Detection::Requested; row.badge = "GAME REQUESTS";
+            row.reason = "Game SR requests observed; successful native evaluation is unverified.";
         } else if (e.failed_game_calls || e.failed_unknown_calls) {
             row.detection = Detection::FailedCalls; row.badge = "CALL FAILED";
             row.reason = "An SR call failed; no successful game integration has been observed.";
@@ -76,6 +82,8 @@ inline UpscalerReport DescribeUpscalers(const UpscalerSnapshot& snapshot)
             row.reason += " Historical evidence; the observer is not currently available.";
         if (row.game_observed || row.detection == Detection::SourceUnknown)
             row.reason += " Current-frame inputs and activity are not qualified by this report.";
+        if (e.game_requests && row.detection != Detection::Requested)
+            row.reason += " Game SR requests observed; successful native evaluation is unverified.";
         if ((e.failed_game_calls || e.failed_unknown_calls) && row.detection != Detection::FailedCalls)
             row.reason += " Failed calls were also observed.";
     }

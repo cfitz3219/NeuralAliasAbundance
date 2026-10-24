@@ -3,6 +3,18 @@
 #include "providers/discovery/upscaler_report.hpp"
 using namespace na::discovery;
 int main() { return test::run({
+    {"requests and replacements are not successful native evaluations", [] {
+        UpscalerSnapshot s{}; s[1].observer_available = true; s[1].game_requests = 5;
+        auto r = DescribeUpscalers(s);
+        CHECK(r.game_routes == 0 && r.rows[1].detection == Detection::Requested);
+        s[0].injector_evaluates = 5;
+        r = DescribeUpscalers(s);
+        CHECK(r.rows[0].detection == Detection::InjectorOnly && r.game_routes == 0);
+        s[1].game_creates = 1;
+        r = DescribeUpscalers(s);
+        CHECK(r.game_routes == 2 && r.rows[1].detection == Detection::Created);
+        CHECK(r.rows[1].reason.find("native evaluation is unverified") != std::string::npos);
+    }},
     {"absence of observation is not absence of integration", [] {
         UpscalerSnapshot s{};
         auto r = DescribeUpscalers(s);

@@ -6,6 +6,7 @@
 // Copy rules: docs/UI-STYLE.md (plain language, one sentence per instruction,
 // requested and confirmed state kept distinct).
 #include "host_dx12/overlay/route_a_panel.hpp"
+#include "providers/discovery/upscaler_menu.hpp"
 
 #include <shlobj.h>
 #include <windows.h>
@@ -607,6 +608,8 @@ void RegisterRouteAMenu()
     na::menu::Register({"Connection", Availability::Available, nullptr, &DrawConnectionRow, Page::Details});
     na::menu::Register({"Save pictures for analysis", Availability::Available, nullptr, &DrawCaptureRow,
                         Page::Details});
+    if (!na::discovery::RegisterUpscalerReport())
+        OutputDebugStringA("NeuralAlias: could not register Upscaler detection menu.\n");
 }
 
 } // namespace na::overlay

@@ -147,6 +147,7 @@ target_link_libraries(host_nvof PUBLIC abundance_options d3d12 d3dcompiler)
 # ngx_observe <-> nr/fg/motion <-> latency <-> tlou1), so they form one library.
 set(NA_GAME_ADAPTER_LIB "" CACHE STRING "CMake target implementing game_adapter.h; empty = host stub (no adapter)")
 add_library(host_dx12 STATIC
+  src/providers/discovery/upscaler_menu.cpp
   src/host_dx12/ngx_observe/ngx_observe.cpp
   src/host_dx12/ngx_observe/gpu_timing.cpp
   src/host_dx12/overlay/overlay.cpp

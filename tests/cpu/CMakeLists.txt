@@ -45,7 +45,7 @@ endif()
 # A4 portable report + Windows compile/registration/draw test for its real bridge.
 na_add_cpu_test(upscaler_report)
 if(WIN32 AND MSVC AND TARGET host_dx12)
-  na_add_cpu_test(upscaler_menu "${NA_CPU_ROOT}/src/providers/discovery/upscaler_menu.cpp")
+  na_add_cpu_test(upscaler_menu)
   target_link_libraries(na_cpu_upscaler_menu PRIVATE host_dx12)
   set_tests_properties(na.cpu.upscaler_menu PROPERTIES LABELS "cpu;windows")
 endif()
