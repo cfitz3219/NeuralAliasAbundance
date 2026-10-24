@@ -155,6 +155,11 @@ bool Attach(ID3D12Device* device, const Api& api);
 void Shutdown();
 
 Capabilities GetCapabilities();
+// ARGON-G2-004: which device the backend runs on, and whether that device has
+// been removed (the game will recreate it). After removal no GPU work can be
+// pending, so Shutdown() is safe and the backend can start again on the new one.
+bool IsBoundTo(ID3D12Device* device);
+bool BoundDeviceRemoved();
 bool QueryOptimal(uint32_t out_w, uint32_t out_h, Quality q, OptimalSettings* out);
 
 // Records DLSS into `list` (open, DIRECT or COMPUTE). Creates or recreates the

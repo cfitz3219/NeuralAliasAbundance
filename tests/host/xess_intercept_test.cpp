@@ -215,6 +215,18 @@ int main(int argc, char** argv)
             CHECK(execute(early, l.list.Get(), &p) == kSuccess);
             CHECK(na::xess::GetStats().replaced == replaced + 1);
         }
+        // ARGON-G2-006: re-initialising an existing context restarts DLSS history.
+        {
+            auto p = Exec();
+            p.resetHistory = 0;
+            CHECK(execute(ctx, l.list.Get(), &p) == kSuccess);
+            CHECK(execute(ctx, l.list.Get(), &p) == kSuccess && fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
+            REQUIRE(init(ctx, &ip) == kSuccess);
+            CHECK(execute(ctx, l.list.Get(), &p) == kSuccess && fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 1);
+            fake::eval_hook = [] { (void)na::xess::GetStats(); }; // ARGON-G2-005 for XeSS
+            CHECK(execute(ctx, l.list.Get(), &p) == kSuccess);
+            fake::eval_hook = nullptr;
+        }
         // ARGON-G2-001: dynamic input size keeps one feature (created at the output size) and its history.
         {
             const int creates = fake::creates;

@@ -126,7 +126,6 @@ Observation g_last{};
 bool g_have_last = false;
 Stats g_stats{};
 std::atomic<uint32_t> g_mode{static_cast<uint32_t>(Mode::Observe)};
-bool g_dlss_init_tried = false;
 
 void set_reason(const char* why) { std::snprintf(g_stats.reason, sizeof(g_stats.reason), "%s", why ? why : ""); }
 
@@ -149,16 +148,27 @@ ContextInfo* find_or_add(Context c)
     return nullptr; // table full: executes report context_known=false
 }
 
-bool ensure_dlss_locked(ID3D12Device* device, ID3D12GraphicsCommandList* list)
+// ARGON-G2-004/005: DLSS start-up, serialised on its own mutex and never under
+// the interceptor's g_m (UI GetStats() never waits on NGX). Retries for every
+// new device; if the game recreated its device after the old one was removed,
+// the backend is shut down (nothing can be pending on a removed device) and
+// started again on the new one.
+std::mutex g_init_m;
+ID3D12Device* g_tried_device = nullptr; // identity of the last device InitOwn was tried on
+
+bool ensure_dlss(ID3D12Device* device)
 {
+    if (!device) return false;
+    std::lock_guard<std::mutex> lock(g_init_m);
     const na::dlss::Capabilities c = na::dlss::GetCapabilities();
-    if (c.attached) return c.available && !c.latched_off;
-    // ARGON-G2-002: a context created before our hooks has no recorded device;
-    // the game's command list knows it.
-    Microsoft::WRL::ComPtr<ID3D12Device> from_list;
-    if (!device && list && SUCCEEDED(list->GetDevice(IID_PPV_ARGS(&from_list)))) device = from_list.Get();
-    if (g_dlss_init_tried || !device) return false;
-    g_dlss_init_tried = true;
+    if (c.attached) {
+        if (na::dlss::IsBoundTo(device)) return c.available && !c.latched_off;
+        if (!na::dlss::BoundDeviceRemoved()) return false; // another live device owns DLSS: refuse
+        na::dlss::Shutdown();
+        g_tried_device = nullptr;
+    }
+    if (g_tried_device == device) return false; // already failed on this device
+    g_tried_device = device;
     wchar_t path[MAX_PATH] = {};
     const DWORD n = GetTempPathW(MAX_PATH, path);
     if (!n || n > MAX_PATH - 20) return false;
@@ -193,6 +203,7 @@ Result DetourInit(Context c, const D3D12InitParams* p)
     ++g_stats.contexts_initialized;
     if (ContextInfo* ci = find_or_add(c)) {
         ci->initialized = true;
+        ci->last = Backend::None; // ARGON-G2-006: (re)Init starts fresh DLSS history
         ci->flags = p->initFlags;
         ci->quality = p->qualitySetting;
         ci->out_w = p->outputResolution.x;
@@ -253,7 +264,7 @@ Result DetourExecute(Context c, ID3D12GraphicsCommandList* list, const D3D12Exec
 {
     bool native_needs_reset = false;
     if (p) {
-        std::lock_guard<std::mutex> lock(g_m);
+        std::unique_lock<std::mutex> lock(g_m);
         Observation o;
         o.serial = ++g_stats.executes;
         o.context = c;
@@ -289,31 +300,37 @@ Result DetourExecute(Context c, ID3D12GraphicsCommandList* list, const D3D12Exec
             if (b.x || b.y) o.nonzero_bases = true;
         g_last = o;
         g_have_last = true;
-        ContextInfo* ci = find(c);
-        if (static_cast<Mode>(g_mode.load(std::memory_order_relaxed)) == Mode::ReplaceWithDlss) {
+        uint64_t view_id = 0;
+        Backend last = Backend::None;
+        if (const ContextInfo* ci0 = find(c)) { view_id = ci0->view_id; last = ci0->last; }
+        const bool replace = static_cast<Mode>(g_mode.load(std::memory_order_relaxed)) == Mode::ReplaceWithDlss;
+        lock.unlock(); // ARGON-G2-005: NGX start-up and evaluation run without g_m
+        bool replaced = false;
+        const char* why = nullptr;
+        if (replace) {
             na::dlss::EvalDesc d;
-            const char* why = nullptr;
-            const bool mapped = ToDlss(o, &d, &why);
-            if (mapped && ci) {
-                d.view_id = ci->view_id;
-                if (ci->last != Backend::Dlss) d.reset = true; // R-304: DLSS did not see the previous frame
+            if (ToDlss(o, &d, &why)) {
+                d.view_id = view_id;
+                if (last != Backend::Dlss) d.reset = true; // R-304 / G2-006: DLSS did not see the previous frame
+                Microsoft::WRL::ComPtr<ID3D12Device> from_list;
+                ID3D12Device* dev = o.device; // ARGON-G2-002: fall back to the list's device
+                if (!dev && list && SUCCEEDED(list->GetDevice(IID_PPV_ARGS(&from_list)))) dev = from_list.Get();
+                if (!ensure_dlss(dev)) why = "DLSS could not start on this device.";
+                else replaced = na::dlss::Evaluate(list, d);
             }
-            if (!mapped) {
-                ++g_stats.fallbacks;
-                set_reason(why);
-            } else if (!ensure_dlss_locked(o.device, list)) {
-                ++g_stats.fallbacks;
-                const na::dlss::Capabilities caps = na::dlss::GetCapabilities();
-                set_reason(caps.reason[0] ? caps.reason : "DLSS could not start on this device.");
-            } else if (!na::dlss::Evaluate(list, d)) {
-                ++g_stats.fallbacks;
-                set_reason(na::dlss::GetStats().reason);
-            } else {
-                ++g_stats.replaced;
-                set_reason("");
-                if (ci) ci->last = Backend::Dlss;
-                return kSuccess; // DLSS wrote XeSS's output on the game's list
-            }
+        }
+        lock.lock();
+        ContextInfo* ci = find(c);
+        if (ci && ci->view_id != view_id) ci = nullptr; // destroyed and recreated meanwhile
+        if (replaced) {
+            ++g_stats.replaced;
+            set_reason("");
+            if (ci) ci->last = Backend::Dlss;
+            return kSuccess; // DLSS wrote XeSS's output on the game's list
+        }
+        if (replace) {
+            ++g_stats.fallbacks;
+            set_reason(why ? why : na::dlss::GetStats().reason);
         }
         // R-304: XeSS skipped the frames DLSS produced; its history is stale.
         native_needs_reset = ci && ci->last == Backend::Dlss && !p->resetHistory;
@@ -422,7 +439,7 @@ void ResetForTests()
     g_stats.hooked_functions = functions;
     g_last = Observation{};
     g_have_last = false;
-    g_dlss_init_tried = false;
+    { std::lock_guard<std::mutex> il(g_init_m); g_tried_device = nullptr; }
 }
 
 } // namespace na::xess

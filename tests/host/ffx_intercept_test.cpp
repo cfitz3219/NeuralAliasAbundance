@@ -253,6 +253,17 @@ int main(int argc, char** argv)
             CHECK(fake::last_eval_handle != h_ctx && fake::last_eval_handle != h_ctx2 && dlss_reset() == 1);
             CHECK(destroy(&ctx3, nullptr) == FFX_API_RETURN_OK);
         }
+        // ARGON-G2-005: DLSS evaluation runs without the interceptor's lock, so a
+        // stats read (the menu) from inside it cannot wait on it. With the old
+        // locking this self-deadlocks on the same thread.
+        {
+            fake::eval_hook = [] { (void)na::ffx::GetStats(); (void)na::ffx::LastObservation(nullptr); };
+            const uint64_t replaced = na::ffx::GetStats().replaced;
+            auto u = UpscaleDesc(l.list.Get());
+            CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK);
+            CHECK(na::ffx::GetStats().replaced == replaced + 1);
+            fake::eval_hook = nullptr;
+        }
         // ARGON-G2-003: a COMMON output is transitioned to UAV and back, not refused.
         {
             const uint64_t replaced = na::ffx::GetStats().replaced, barriers = na::ffx::GetStats().barriers;

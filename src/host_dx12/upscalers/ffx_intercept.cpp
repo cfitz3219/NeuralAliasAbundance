@@ -132,7 +132,6 @@ Observation g_last{};
 bool g_have_last = false;
 Stats g_stats{};
 std::atomic<uint32_t> g_mode{static_cast<uint32_t>(Mode::Observe)};
-bool g_dlss_init_tried = false;
 
 void set_reason(const char* why) { std::snprintf(g_stats.reason, sizeof(g_stats.reason), "%s", why ? why : ""); }
 
@@ -194,40 +193,50 @@ Observation observe_locked(ffxContext* ctx, const ffxDispatchDescUpscale& u)
     return o;
 }
 
-bool ensure_dlss_locked(ID3D12GraphicsCommandList* list)
+// ARGON-G2-004/005: DLSS start-up, serialised on its own mutex and never under
+// the interceptor's g_m (UI GetStats() never waits on NGX). Retries for every
+// new device; if the game recreated its device after the old one was removed,
+// the backend is shut down (nothing can be pending on a removed device) and
+// started again on the new one.
+std::mutex g_init_m;
+ID3D12Device* g_tried_device = nullptr; // identity of the last device InitOwn was tried on
+
+bool ensure_dlss(ID3D12Device* device)
 {
+    if (!device) return false;
+    std::lock_guard<std::mutex> lock(g_init_m);
     const na::dlss::Capabilities c = na::dlss::GetCapabilities();
-    if (c.attached) return c.available && !c.latched_off;
-    if (g_dlss_init_tried) return false;
-    g_dlss_init_tried = true;
-    Microsoft::WRL::ComPtr<ID3D12Device> dev;
-    if (!list || FAILED(list->GetDevice(IID_PPV_ARGS(&dev)))) return false;
+    if (c.attached) {
+        if (na::dlss::IsBoundTo(device)) return c.available && !c.latched_off;
+        if (!na::dlss::BoundDeviceRemoved()) return false; // another live device owns DLSS: refuse
+        na::dlss::Shutdown();
+        g_tried_device = nullptr;
+    }
+    if (g_tried_device == device) return false; // already failed on this device
+    g_tried_device = device;
     wchar_t path[MAX_PATH] = {};
     const DWORD n = GetTempPathW(MAX_PATH, path);
     if (!n || n > MAX_PATH - 20) return false;
     wcscat_s(path, L"NeuralAlias-ngx");
     CreateDirectoryW(path, nullptr);
-    return na::dlss::InitOwn(dev.Get(), path);
+    return na::dlss::InitOwn(device, path);
 }
 
 // True when DLSS produced this frame (FSR must then be skipped).
-bool try_replace_locked(const Observation& o, ContextInfo* ci)
+// Runs WITHOUT g_m (ARGON-G2-005). On failure *why is the reason.
+bool try_replace(const Observation& o, uint64_t view_id, Backend last, const char** why_out, uint32_t* barriers)
 {
     na::dlss::EvalDesc d;
     const char* why = nullptr;
     if (!ToDlss(o, &d, &why)) {
-        ++g_stats.fallbacks;
-        set_reason(why);
+        *why_out = why;
         return false;
     }
-    if (ci) {
-        d.view_id = ci->view_id;
-        if (ci->last != Backend::Dlss) d.reset = true; // R-304: DLSS did not see the previous frame
-    }
-    if (!ensure_dlss_locked(o.list)) {
-        ++g_stats.fallbacks;
-        const na::dlss::Capabilities c = na::dlss::GetCapabilities();
-        set_reason(c.reason[0] ? c.reason : "DLSS could not start on this device.");
+    d.view_id = view_id;
+    if (last != Backend::Dlss) d.reset = true; // R-304: DLSS did not see the previous frame
+    Microsoft::WRL::ComPtr<ID3D12Device> dev;
+    if (!o.list || FAILED(o.list->GetDevice(IID_PPV_ARGS(&dev))) || !ensure_dlss(dev.Get())) {
+        *why_out = "DLSS could not start on this device.";
         return false;
     }
     // ARGON-G2-003: move resources into DLSS's states and back afterwards.
@@ -258,13 +267,10 @@ bool try_replace_locked(const Observation& o, ContextInfo* ci)
     const bool ok = na::dlss::Evaluate(o.list, d);
     if (n) o.list->ResourceBarrier(n, back); // restore exactly what FSR was promised
     if (!ok) {
-        ++g_stats.fallbacks;
-        set_reason(na::dlss::GetStats().reason);
+        *why_out = nullptr; // reason is in na::dlss::GetStats()
         return false;
     }
-    g_stats.barriers += n;
-    ++g_stats.replaced;
-    set_reason("");
+    *barriers = n;
     return true;
 }
 
@@ -330,13 +336,34 @@ ffxReturnCode_t DetourDispatch(ffxContext* context, const ffxDispatchDescHeader*
     if (desc && desc->type == FFX_API_DISPATCH_DESC_TYPE_UPSCALE) {
         const auto* u = reinterpret_cast<const ffxDispatchDescUpscale*>(desc);
         bool native_needs_reset = false;
+        Observation o;
+        uint64_t view_id = 0;
+        Backend last = Backend::None;
+        bool replace = false;
         {
             std::lock_guard<std::mutex> lock(g_m);
-            const Observation o = observe_locked(context, *u);
+            o = observe_locked(context, *u);
+            if (const ContextInfo* ci = find_context(o.context)) { view_id = ci->view_id; last = ci->last; }
+            replace = static_cast<Mode>(g_mode.load(std::memory_order_relaxed)) == Mode::ReplaceWithDlss;
+        }
+        // ARGON-G2-005: NGX start-up and evaluation run without g_m.
+        const char* why = nullptr;
+        uint32_t barriers = 0;
+        const bool replaced = replace && try_replace(o, view_id, last, &why, &barriers);
+        {
+            std::lock_guard<std::mutex> lock(g_m);
             ContextInfo* ci = find_context(o.context);
-            if (static_cast<Mode>(g_mode.load(std::memory_order_relaxed)) == Mode::ReplaceWithDlss && try_replace_locked(o, ci)) {
+            if (ci && ci->view_id != view_id) ci = nullptr; // destroyed and recreated meanwhile
+            if (replaced) {
+                ++g_stats.replaced;
+                g_stats.barriers += barriers;
+                set_reason("");
                 if (ci) ci->last = Backend::Dlss;
                 return FFX_API_RETURN_OK; // DLSS wrote FSR's output on the game's list
+            }
+            if (replace) {
+                ++g_stats.fallbacks;
+                set_reason(why ? why : na::dlss::GetStats().reason);
             }
             // R-304: FSR skipped the frames DLSS produced; its history is stale.
             native_needs_reset = ci && ci->last == Backend::Dlss && !u->reset;
@@ -454,7 +481,7 @@ void ResetForTests()
     g_stats.hooked_functions = functions;
     g_last = Observation{};
     g_have_last = false;
-    g_dlss_init_tried = false;
+    { std::lock_guard<std::mutex> il(g_init_m); g_tried_device = nullptr; }
 }
 
 } // namespace na::ffx
