@@ -70,7 +70,7 @@ int main()
     auto early = test::CreateBuffer(dev, 4096, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
     REQUIRE(early);
 
-    std::printf("checkpoint 0\n", 0); std::fflush(stdout);
+    std::printf("checkpoint 0\n"); std::fflush(stdout);
     REQUIRE(na::observe::InstallProducers(dev, d.queue.Get(), /*hook_queue_execute=*/true));
     const auto st0 = na::observe::GetProducerStats();
     std::printf("hooks installed %u, optional missing %u\n", st0.hooks_installed, st0.hooks_missing);
@@ -82,12 +82,12 @@ int main()
     const na_object_id fence_pre_id = na::observe::IdOf(fence_pre.Get());
     CHECK(fence_pre_id != 0);
 
-    std::printf("checkpoint 1\n", 1); std::fflush(stdout);
+    std::printf("checkpoint 1\n"); std::fflush(stdout);
     na_observe_config cfg{};
     cfg.size_bytes = sizeof(cfg);
     REQUIRE(na_observe_start(&cfg, &Sink, nullptr) == NA_OK);
 
-    std::printf("checkpoint 2\n", 2); std::fflush(stdout);
+    std::printf("checkpoint 2\n"); std::fflush(stdout);
     // Resources, heaps.
     D3D12_HEAP_DESC hd{};
     hd.SizeInBytes = 1 << 20;
@@ -116,7 +116,7 @@ int main()
         CHECK(!na::observe::ResolveGpuVa(cbuf->GetGPUVirtualAddress() + 65536 + 4096 * 64, &r, &off) || r != cbuf_id);
     }
 
-    std::printf("checkpoint 3\n", 3); std::fflush(stdout);
+    std::printf("checkpoint 3\n"); std::fflush(stdout);
     // Descriptor heaps and writes.
     D3D12_DESCRIPTOR_HEAP_DESC dhd{};
     dhd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -141,7 +141,7 @@ int main()
                                s3, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     dev->CreateRenderTargetView(rt.Get(), nullptr, rtv_heap->GetCPUDescriptorHandleForHeapStart());
 
-    std::printf("checkpoint 4\n", 4); std::fflush(stdout);
+    std::printf("checkpoint 4\n"); std::fflush(stdout);
     // Command list + execution on the queue created before installation.
     test::ComPtr<ID3D12CommandAllocator> alloc;
     test::ComPtr<ID3D12GraphicsCommandList> list;
@@ -158,12 +158,12 @@ int main()
     REQUIRE(SUCCEEDED(d.queue->Wait(fence.Get(), 1)));
     d.WaitIdle();
 
-    std::printf("checkpoint 5\n", 5); std::fflush(stdout);
+    std::printf("checkpoint 5\n"); std::fflush(stdout);
     // Retirement: the last reference goes away.
     placed.Reset();
     REQUIRE(na_observe_stop() == NA_OK);
 
-    std::printf("checkpoint 6\n", 6); std::fflush(stdout);
+    std::printf("checkpoint 6\n"); std::fflush(stdout);
     // ---- decode ----
     {
         auto reports = All<na_ev_capability_report>(NA_EV_CAPABILITY_REPORT);
