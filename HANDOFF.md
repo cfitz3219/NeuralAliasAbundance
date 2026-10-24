@@ -1,3 +1,8 @@
+# 2026-10-24 — Gate 2 RTX tests passed; no game deployment
+
+Fresh Release build of main 4839fc3: 30/30 CTests passed, no skips, on RTX 5070 Ti / driver 621.01. Real NGX 310.9.16.0 ran 128 evaluations; synthetic SR quality 17.68 dB versus 11.25 dB bilinear. A3's ten checks and exposure-state debug assertions passed. Evidence: local/gate2-rtx-20261024/ctest-verbose.log. Detailed journal: .worktrees/astra-g2-rtx-validation/WORKLOG.md, commit 5fde822 (push blocked by missing Git credentials).
+
+Argon remains deferred; Gate 2 remains open for independent audit, real-runtime DRS and game qualification. Stand-in interception tests do not establish game compatibility. No game deployment occurred or is authorized by this session.
 # Current status — Gate 2 code merged
 
 PR #17 is merged into main at `89b93b6`. Its runtime/build/test tree matches the validated `0b2ee86` candidate. Code, automated tests and integration are complete. Independent delta/Argon review and RTX/runtime/in-game qualification remain before gate closure. Earlier unmerged status below is historical.
@@ -121,3 +126,4 @@ Current UI is a preview, not persistent configuration or in-gameoverlay. Both pr
 Anno read-only audit: x64 PE; Steam916440build16367353; configuredDX12; FSRUpscaling0; DXGI factory imports; no staticNGXmatch, which does not exclude dynamicloading. Executable hash and qualification boundaries in docs/ANNO-1800.md. Game closed at inspection. Need resource/command-list observation with lifecycle tracking and fixture verification before diagnostics-only real-game deployment. No need to ask user to repeat title selection or approve already authorized local project development.
 
 Read WORKLOG and docs/PROVENANCE before continuing. Old broader DX11 proposal is historical; current project is DX12first. Pursue universal DX12 enhancement through discovery and synthesis; use current task estimates for Anno's discovery rather than the earlier narrow NR prototype estimate.
+
