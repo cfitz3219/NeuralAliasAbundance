@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -852,6 +853,9 @@ bool snapshot()
 std::once_flag g_install_once;
 bool g_install_ok = false;
 
+std::vector<void*> g_targets; // install thread only
+char g_shared_report[256] = {};
+
 bool hook(void* object, uint32_t slot, void* detour, void** orig, bool required)
 {
     if (!object) {
@@ -859,6 +863,16 @@ bool hook(void* object, uint32_t slot, void* detour, void** orig, bool required)
         g_c.missing.fetch_add(1);
         return true;
     }
+    // Two of our slots resolving to ONE function would route both methods to
+    // the first detour with the wrong signature: refuse the second, report it.
+    void* target = (*static_cast<void***>(object))[slot];
+    if (std::find(g_targets.begin(), g_targets.end(), target) != g_targets.end()) {
+        const size_t len = std::strlen(g_shared_report);
+        std::snprintf(g_shared_report + len, sizeof(g_shared_report) - len, "%u ", slot);
+        g_c.missing.fetch_add(1);
+        return true; // degraded (reported), not a failed installation
+    }
+    g_targets.push_back(target);
     if (na::hooking::HookVTableSlot(object, slot, detour, orig)) {
         g_c.hooks.fetch_add(1);
         return true;
@@ -994,6 +1008,7 @@ ProducerStats GetProducerStats()
     s.ambiguous_executes = g_c.ambiguous.load();
     s.hooks_installed = g_c.hooks.load();
     s.hooks_missing = g_c.missing.load();
+    s.shared_target_slots = g_shared_report;
     return s;
 }
 
