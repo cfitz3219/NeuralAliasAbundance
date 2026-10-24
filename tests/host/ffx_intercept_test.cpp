@@ -204,6 +204,51 @@ int main(int argc, char** argv)
             CHECK(counts(3) == fsr_before + 1);
             CHECK(na::ffx::GetStats().unknown_context == 1 && std::strstr(na::ffx::GetStats().reason, "before"));
         }
+        auto last_reset = reinterpret_cast<int (*)()>(reinterpret_cast<void*>(GetProcAddress(stub, "StubLastReset")));
+        REQUIRE(last_reset != nullptr);
+        const auto dlss_reset = [] { return fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset); };
+        // R-304: switching between DLSS and FSR forces a reset on whichever side
+        // missed frames; uninterrupted runs keep history. The game's own
+        // descriptor (reset=false) is never modified.
+        {
+            auto u = UpscaleDesc(l.list.Get());
+            u.reset = false;
+            CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK && dlss_reset() == 1); // FSR ran last
+            CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK && dlss_reset() == 0); // DLSS continues
+            auto fb = u;
+            fb.output.state = FFX_API_RESOURCE_STATE_COMMON; // forces the FSR fallback
+            const int fsr_before = counts(3);
+            CHECK(dispatch(&ctx, &fb.header) == FFX_API_RETURN_OK && counts(3) == fsr_before + 1);
+            CHECK(last_reset() == 1);  // FSR missed the DLSS frames
+            CHECK(fb.reset == false);  // caller's descriptor untouched
+            CHECK(dispatch(&ctx, &fb.header) == FFX_API_RETURN_OK && last_reset() == 0); // FSR continues
+            CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK && dlss_reset() == 1);  // back to DLSS
+            na::ffx::SetMode(na::ffx::Mode::Observe);
+            CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK && last_reset() == 1); // mode change
+            CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK && last_reset() == 0);
+            na::ffx::SetMode(na::ffx::Mode::ReplaceWithDlss);
+        }
+        // R-303: two contexts of the same size keep separate DLSS histories, and a
+        // destroyed-then-recreated context never inherits the old one.
+        {
+            ffxContext ctx2 = nullptr;
+            REQUIRE(create(&ctx2, &cd.header, nullptr) == FFX_API_RETURN_OK && ctx2);
+            auto u = UpscaleDesc(l.list.Get());
+            u.reset = false;
+            CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK);
+            const uintptr_t h_ctx = fake::last_eval_handle;
+            CHECK(dispatch(&ctx2, &u.header) == FFX_API_RETURN_OK);
+            const uintptr_t h_ctx2 = fake::last_eval_handle;
+            CHECK(h_ctx2 != h_ctx && dlss_reset() == 1);
+            CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK);
+            CHECK(fake::last_eval_handle == h_ctx && dlss_reset() == 0);
+            CHECK(destroy(&ctx2, nullptr) == FFX_API_RETURN_OK);
+            ffxContext ctx3 = nullptr;
+            REQUIRE(create(&ctx3, &cd.header, nullptr) == FFX_API_RETURN_OK && ctx3);
+            CHECK(dispatch(&ctx3, &u.header) == FFX_API_RETURN_OK);
+            CHECK(fake::last_eval_handle != h_ctx && fake::last_eval_handle != h_ctx2 && dlss_reset() == 1);
+            CHECK(destroy(&ctx3, nullptr) == FFX_API_RETURN_OK);
+        }
         l.list->Close();
         na::dlss::Shutdown();
     } else {
@@ -223,7 +268,8 @@ int main(int argc, char** argv)
 
     // 5. Destroy forgets the context.
     ffxContext gone = ctx;
-    CHECK(destroy(&ctx, nullptr) == FFX_API_RETURN_OK && counts(1) == 1);
+    const int destroys_before = counts(1);
+    CHECK(destroy(&ctx, nullptr) == FFX_API_RETURN_OK && counts(1) == destroys_before + 1);
     {
         auto u = UpscaleDesc(reinterpret_cast<void*>(0x99));
         CHECK(dispatch(&gone, &u.header) == FFX_API_RETURN_OK);
@@ -231,6 +277,6 @@ int main(int argc, char** argv)
         REQUIRE(na::ffx::LastObservation(&o));
         CHECK(!o.context_known);
     }
-    CHECK(na::ffx::GetStats().contexts_destroyed == 1);
+    CHECK(na::ffx::GetStats().contexts_destroyed == static_cast<uint64_t>(counts(1)));
     return test::finish("ffx_intercept_test");
 }

@@ -22,7 +22,8 @@ namespace na::ffx {
 // FSR's jitterOffset and DLSS's Jitter.Offset are both documented as the
 // sub-pixel offset applied to the camera projection, so they carry the same
 // sign; DLSS's convention was measured in C6 (sample = pixel centre - jitter).
-// The FSR side is confirmed in the C7 RTX session (FSR runs on NVIDIA GPUs).
+// The FSR side is NOT measured yet: it is scheduled for the Gate 2 hardware
+// session with AMD's official runtime DLL (FSR also runs on NVIDIA GPUs).
 constexpr float kFsrToDlssJitterSign = 1.0f;
 
 bool ToDlss(const Observation& o, na::dlss::EvalDesc* out, const char** reason)
@@ -93,12 +94,20 @@ struct Slot {
 };
 Slot g_slots[kSlots];
 
+// Which upscaler produced this context's previous frame (R-304).
+enum class Backend : uint8_t { None, Native, Dlss };
+
 struct ContextInfo {
     ffxContext context = nullptr;
     bool upscale = false;
     uint32_t flags = 0;
     uint32_t max_render_w = 0, max_render_h = 0, max_upscale_w = 0, max_upscale_h = 0;
+    uint64_t view_id = 0;           // R-303: this context's own DLSS view (never reused)
+    Backend last = Backend::None;
 };
+// FFX view ids: tag in the high bits, a counter that never repeats in the process.
+constexpr uint64_t kViewTag = 1ull << 40;
+std::atomic<uint64_t> g_next_view{1};
 
 std::mutex g_m;
 ContextInfo g_contexts[kMaxContexts];
@@ -185,7 +194,7 @@ bool ensure_dlss_locked(ID3D12GraphicsCommandList* list)
 }
 
 // True when DLSS produced this frame (FSR must then be skipped).
-bool try_replace_locked(const Observation& o)
+bool try_replace_locked(const Observation& o, ContextInfo* ci)
 {
     na::dlss::EvalDesc d;
     const char* why = nullptr;
@@ -193,6 +202,10 @@ bool try_replace_locked(const Observation& o)
         ++g_stats.fallbacks;
         set_reason(why);
         return false;
+    }
+    if (ci) {
+        d.view_id = ci->view_id;
+        if (ci->last != Backend::Dlss) d.reset = true; // R-304: DLSS did not see the previous frame
     }
     if (!ensure_dlss_locked(o.list)) {
         ++g_stats.fallbacks;
@@ -217,6 +230,7 @@ ffxReturnCode_t DetourCreateContext(ffxContext* context, ffxCreateContextDescHea
     if (r != FFX_API_RETURN_OK || !context || !*context) return r;
     ContextInfo info;
     info.context = *context;
+    info.view_id = kViewTag | g_next_view.fetch_add(1, std::memory_order_relaxed);
     for (const ffxApiHeader* h = desc; h; h = h->pNext) {
         if (h->type != FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE) continue;
         const auto* u = reinterpret_cast<const ffxCreateContextDescUpscale*>(h);
@@ -244,7 +258,10 @@ ffxReturnCode_t DetourDestroyContext(ffxContext* context, const ffxAllocationCal
     {
         std::lock_guard<std::mutex> lock(g_m);
         if (context)
-            if (ContextInfo* ci = find_context(*context)) *ci = ContextInfo{};
+            if (ContextInfo* ci = find_context(*context)) {
+                na::dlss::ReleaseView(ci->view_id); // R-303: its DLSS history ends with it
+                *ci = ContextInfo{};
+            }
         ++g_stats.contexts_destroyed;
     }
     return g_slots[S].destroy(context, mem);
@@ -267,10 +284,24 @@ ffxReturnCode_t DetourDispatch(ffxContext* context, const ffxDispatchDescHeader*
 {
     if (desc && desc->type == FFX_API_DISPATCH_DESC_TYPE_UPSCALE) {
         const auto* u = reinterpret_cast<const ffxDispatchDescUpscale*>(desc);
-        std::lock_guard<std::mutex> lock(g_m);
-        const Observation o = observe_locked(context, *u);
-        if (static_cast<Mode>(g_mode.load(std::memory_order_relaxed)) == Mode::ReplaceWithDlss && try_replace_locked(o))
-            return FFX_API_RETURN_OK; // DLSS wrote FSR's output on the game's list
+        bool native_needs_reset = false;
+        {
+            std::lock_guard<std::mutex> lock(g_m);
+            const Observation o = observe_locked(context, *u);
+            ContextInfo* ci = find_context(o.context);
+            if (static_cast<Mode>(g_mode.load(std::memory_order_relaxed)) == Mode::ReplaceWithDlss && try_replace_locked(o, ci)) {
+                if (ci) ci->last = Backend::Dlss;
+                return FFX_API_RETURN_OK; // DLSS wrote FSR's output on the game's list
+            }
+            // R-304: FSR skipped the frames DLSS produced; its history is stale.
+            native_needs_reset = ci && ci->last == Backend::Dlss && !u->reset;
+            if (ci) ci->last = Backend::Native;
+        }
+        if (native_needs_reset) {
+            ffxDispatchDescUpscale copy = *u; // never modify the game's descriptor
+            copy.reset = true;
+            return g_slots[S].dispatch(context, &copy.header);
+        }
     } else {
         std::lock_guard<std::mutex> lock(g_m);
         ++g_stats.other_dispatches;

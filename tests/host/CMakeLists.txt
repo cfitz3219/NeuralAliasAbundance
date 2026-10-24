@@ -96,3 +96,9 @@ if(NA_XESS_INCLUDE AND EXISTS "${NA_XESS_INCLUDE}/xess/xess_d3d12.h")
   na_host_test(xess_abi_test SOURCES xess_abi_test.cpp LIBS d3d12)
   target_include_directories(xess_abi_test SYSTEM PRIVATE "${NA_XESS_INCLUDE}")
 endif()
+
+# Gate 2 R-302: watcher registration vs. loader notifications (no deadlock).
+na_host_test(module_watch_test SOURCES module_watch_test.cpp LIBS host_upscalers
+             ARGS "$<TARGET_FILE:sl_interposer_real>" "$<TARGET_FILE:ffx_stub>")
+add_dependencies(module_watch_test sl_interposer_real ffx_stub)
+set_tests_properties(host_module_watch_test PROPERTIES TIMEOUT 60)

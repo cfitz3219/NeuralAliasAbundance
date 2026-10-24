@@ -18,4 +18,12 @@ void StopModuleWatches(); // joins the worker; hooks stay
 // File-name part of `name` equals one of `names` (case-insensitive).
 bool NameMatches(const wchar_t* name, size_t len, const wchar_t* const* names);
 
+// Gate 2 R-302 test seam. The loader-notification callback runs under the
+// Windows loader lock and takes the watcher's mutex, so the watcher must NEVER
+// call into the loader while holding that mutex. `probe` (tests only) runs
+// right before every loader call the watcher makes; WatchLockHeldByThisThread()
+// tells it whether that rule is being broken.
+void SetLoaderCallProbeForTests(void (*probe)());
+bool WatchLockHeldByThisThread();
+
 } // namespace na::upscalers

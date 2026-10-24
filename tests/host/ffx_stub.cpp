@@ -11,6 +11,7 @@ namespace {
 int g_creates = 0, g_destroys = 0, g_dispatches = 0, g_upscale_dispatches = 0, g_configures = 0, g_queries = 0;
 uintptr_t g_next = 0x7000;
 float g_last_jitter_x = 0;
+int g_last_reset = -1;
 } // namespace
 
 extern "C" {
@@ -50,6 +51,7 @@ FFX_API_ENTRY ffxReturnCode_t ffxDispatch(ffxContext* context, const ffxDispatch
     if (desc->type == FFX_API_DISPATCH_DESC_TYPE_UPSCALE) {
         ++g_upscale_dispatches;
         g_last_jitter_x = reinterpret_cast<const ffxDispatchDescUpscale*>(desc)->jitterOffset.x;
+        g_last_reset = reinterpret_cast<const ffxDispatchDescUpscale*>(desc)->reset ? 1 : 0;
     }
     return FFX_API_RETURN_OK;
 }
@@ -66,4 +68,5 @@ __declspec(dllexport) int StubCounts(int which)
     }
 }
 __declspec(dllexport) float StubLastJitterX() { return g_last_jitter_x; }
+__declspec(dllexport) int StubLastReset() { return g_last_reset; }
 }

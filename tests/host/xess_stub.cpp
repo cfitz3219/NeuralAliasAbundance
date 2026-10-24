@@ -6,7 +6,7 @@
 using namespace na::xess::abi;
 
 namespace {
-int g_creates = 0, g_inits = 0, g_executes = 0, g_destroys = 0, g_scales = 0;
+int g_creates = 0, g_inits = 0, g_executes = 0, g_destroys = 0, g_scales = 0, g_last_reset = -1;
 uintptr_t g_next = 0x9000;
 } // namespace
 
@@ -29,6 +29,7 @@ __declspec(dllexport) Result xessD3D12Execute(Context c, ID3D12GraphicsCommandLi
 {
     if (!c || !list || !p) return kErrorInvalidArgument;
     ++g_executes;
+    g_last_reset = p->resetHistory ? 1 : 0;
     return kSuccess;
 }
 __declspec(dllexport) Result xessDestroyContext(Context c)
@@ -56,5 +57,6 @@ __declspec(dllexport) Result xessSetExposureMultiplier(Context c, float m)
     return kSuccess;
 }
 __declspec(dllexport) int XessStubExecutes() { return g_executes; }
+__declspec(dllexport) int XessStubLastReset() { return g_last_reset; }
 __declspec(dllexport) int XessStubCreates() { return g_creates + g_destroys * 1000; }
 }

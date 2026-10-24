@@ -19,7 +19,20 @@ constexpr ULONG kLdrLoaded = 1;
 struct Watch { const wchar_t* const* names; InstallFn install; };
 struct Pending { HMODULE module; InstallFn install; };
 
-std::mutex g_m; // watches + pending (never held while installing)
+std::mutex g_m; // watches + pending; NEVER held across a loader call (R-302)
+std::atomic<DWORD> g_m_owner{0};         // thread holding g_m (test seam)
+std::atomic<void (*)()> g_probe{nullptr}; // tests: runs before each loader call
+
+struct WatchLock { // g_m plus owner tracking
+    WatchLock() { g_m.lock(); g_m_owner.store(GetCurrentThreadId(), std::memory_order_relaxed); }
+    ~WatchLock() { g_m_owner.store(0, std::memory_order_relaxed); g_m.unlock(); }
+    WatchLock(const WatchLock&) = delete;
+    WatchLock& operator=(const WatchLock&) = delete;
+};
+void before_loader_call()
+{
+    if (void (*p)() = g_probe.load(std::memory_order_acquire)) p();
+}
 std::vector<Watch> g_watches;
 std::vector<Pending> g_pending;
 PVOID g_cookie = nullptr;
@@ -32,7 +45,7 @@ VOID CALLBACK LdrNotify(ULONG reason, const LdrLoaded* data, PVOID)
     const size_t len = data->BaseDllName->Length / sizeof(wchar_t);
     bool queued = false;
     {
-        std::lock_guard<std::mutex> lock(g_m);
+        WatchLock lock; // under the loader lock: only queue, never call the loader
         for (const Watch& w : g_watches)
             if (NameMatches(data->BaseDllName->Buffer, len, w.names)) {
                 g_pending.push_back({static_cast<HMODULE>(data->DllBase), w.install});
@@ -48,11 +61,12 @@ DWORD WINAPI Worker(LPVOID)
         WaitForSingleObject(g_event, 1000);
         std::vector<Pending> work;
         {
-            std::lock_guard<std::mutex> lock(g_m);
+            WatchLock lock;
             work.swap(g_pending);
         }
         for (const Pending& p : work) {
             HMODULE pinned = nullptr; // keep the module mapped while hooked
+            before_loader_call();
             if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(p.module), &pinned))
                 p.install(pinned);
         }
@@ -63,6 +77,7 @@ DWORD WINAPI Worker(LPVOID)
 bool start_locked_free()
 {
     if (g_thread) return true;
+    before_loader_call();
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     auto reg = ntdll ? reinterpret_cast<LdrRegisterFn>(reinterpret_cast<void*>(GetProcAddress(ntdll, "LdrRegisterDllNotification"))) : nullptr;
     if (!reg) return false;
@@ -105,11 +120,17 @@ bool AddModuleWatch(const wchar_t* const* names, InstallFn install)
     if (!names || !install) return false;
     std::lock_guard<std::mutex> start_lock(g_start_m);
     if (!start_locked_free()) return false;
+    // R-302: look modules up BEFORE taking g_m (GetModuleHandleW takes the
+    // loader lock; the notification callback holds the loader lock and wants g_m).
+    std::vector<HMODULE> already;
+    for (const wchar_t* const* k = names; *k; ++k) {
+        before_loader_call();
+        if (HMODULE m = GetModuleHandleW(*k)) already.push_back(m);
+    }
     {
-        std::lock_guard<std::mutex> lock(g_m);
+        WatchLock lock;
         g_watches.push_back({names, install});
-        for (const wchar_t* const* k = names; *k; ++k)
-            if (HMODULE m = GetModuleHandleW(*k)) g_pending.push_back({m, install});
+        for (HMODULE m : already) g_pending.push_back({m, install});
     }
     SetEvent(g_event);
     return true;
@@ -134,9 +155,12 @@ void StopModuleWatches()
         CloseHandle(g_event);
         g_event = nullptr;
     }
-    std::lock_guard<std::mutex> lock(g_m);
+    WatchLock lock;
     g_watches.clear();
     g_pending.clear();
 }
+
+void SetLoaderCallProbeForTests(void (*probe)()) { g_probe.store(probe, std::memory_order_release); }
+bool WatchLockHeldByThisThread() { return g_m_owner.load(std::memory_order_relaxed) == GetCurrentThreadId(); }
 
 } // namespace na::upscalers
