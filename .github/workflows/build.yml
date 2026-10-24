@@ -131,7 +131,7 @@ jobs:
         shell: pwsh
         run: |
           Select-String -Path build/CMakeCache.txt -Pattern '^NA_(SDK_ROOT|NGX_SDK_INCLUDE|PCL_INCLUDE|NVOF_INCLUDE|XESS_INCLUDE)' | ForEach-Object { Write-Output "::notice::$($_.Line)" }
-          ctest --test-dir build -C Release --output-on-failure -LE gpu 2>&1 | Tee-Object -FilePath ctest-log.txt
+          ctest --test-dir build -C Release --output-on-failure -LE gpu --verbose 2>&1 | Tee-Object -FilePath ctest-log.txt
           $code = $LASTEXITCODE
           Select-String -Path ctest-log.txt -Pattern 'Test +#\d+: .*(Passed|Failed|Skipped|Not Run|\*\*\*)|tests passed|tests failed' |
             Select-Object -First 45 | ForEach-Object {

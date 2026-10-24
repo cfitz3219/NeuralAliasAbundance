@@ -141,3 +141,18 @@ Local GCC Release root build and 8/8 CTests passed. A3 is on a separate unmerged
 branch and is not counted in this run. Requested the two host-owned wiring edits
 through COMMS; documented exact integration in UPSCALER-REPORT.md. Actual in-game
 visibility remains pending that wiring. Windows CI follows the pushed branch.
+
+## 2026-10-24 — Gate 2 takeover and combined implementation
+
+Cort requested that Astra finish Opus's tasks. Integrated the latest #12–#16
+heads on astra/g2-completion, resolving append-only journal and CPU-test CMake
+conflicts by retaining both contributions. Recorded ownership in COMMS on main.
+Completed shared backend lifecycle/lock ordering, cold XeSS initialization,
+exposure transitions/restoration, injector provenance and record-ahead isolation.
+Added deterministic concurrency, completion-capacity, reversed-submission,
+resource-state and origin regressions. Preserved the handed-off loader-watch,
+native-failure reset and Streamline fixes. Details and qualification boundaries
+are in docs/reviews/GATE2-completion.md. Local Release build/9 tests passed;
+initial integrated SDK Windows run passed 28 tests. PR #17 holds the combined
+candidate; final-head Windows validation continues. No game deployment or gate
+closure. Hardware/runtime evidence and independent audit remain outstanding.

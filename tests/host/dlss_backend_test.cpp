@@ -166,6 +166,7 @@ int main()
         CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 1); // new feature -> reset
         CHECK(fake::U(fake::last_eval, NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width) == 1280);
     }
+    CHECK(fake::last_create_injector && fake::last_eval_injector);
     const uintptr_t h1 = fake::last_eval_handle;
     Submit(d.queue.Get(), l1);
     d.WaitIdle();

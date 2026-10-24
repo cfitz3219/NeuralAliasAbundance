@@ -347,6 +347,7 @@ int main(int argc, char** argv)
             REQUIRE(color && depth && motion && output && exposure);
             test::ComPtr<ID3D12DebugCommandList> debug_list;
             states.list.As(&debug_list);
+            std::printf("exposure state test: debug assertions %s, failed-evaluate=%d\n", debug_list ? "enabled" : "unavailable", failure);
             static ID3D12DebugCommandList* probe_list = nullptr;
             static ID3D12Resource* probe_exposure = nullptr;
             probe_list = debug_list.Get(); probe_exposure = exposure.Get();
