@@ -1792,6 +1792,11 @@ void* fn(F f) { return reinterpret_cast<void*>(f); }
 
 } // namespace
 
+namespace {
+std::atomic<bool> g_requested{false};
+std::atomic<bool> g_active{false};
+} // namespace
+
 bool InstallProducers(ID3D12Device* device, ID3D12CommandQueue* queue, bool hook_queue_execute)
 {
     std::call_once(g_install_once, [&] {
@@ -1912,10 +1917,6 @@ void ExecuteEnd(const ExecuteToken& t, ID3D12CommandQueue* queue, uint32_t count
     na::observe_internal::Emit(&ex, NA_GROUP_QUEUE);
 }
 
-namespace {
-std::atomic<bool> g_requested{false};
-std::atomic<bool> g_active{false};
-} // namespace
 void RequestInstall(bool requested) { g_requested.store(requested); }
 bool InstallRequested() { return g_requested.load(); }
 bool ProducersActive() { return g_active.load(std::memory_order_acquire); }
