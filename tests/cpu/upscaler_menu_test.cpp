@@ -26,6 +26,9 @@ int main() { return test::run({
         CHECK(r.rows[0].detection == na::discovery::Detection::InjectorOnly);
         CHECK(r.rows[1].detection == na::discovery::Detection::Requested);
         CHECK(r.rows[2].detection == na::discovery::Detection::Requested);
+        dlss = {}; // backend reset must not erase marked observer history
+        r = na::discovery::DescribeHostUpscalers(ngx, fsr, xess, dlss);
+        CHECK(r.rows[0].detection == na::discovery::Detection::InjectorOnly);
         fsr.upscale_contexts = 1; xess.contexts_initialized = 1; ngx.sr_creates_unknown = 1;
         r = na::discovery::DescribeHostUpscalers(ngx, fsr, xess, dlss);
         CHECK(r.game_routes == 6);

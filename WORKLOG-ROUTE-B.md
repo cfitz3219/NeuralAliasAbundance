@@ -156,3 +156,9 @@ are in docs/reviews/GATE2-completion.md. Local Release build/9 tests passed;
 initial integrated SDK Windows run passed 28 tests. PR #17 holds the combined
 candidate; final-head Windows validation continues. No game deployment or gate
 closure. Hardware/runtime evidence and independent audit remain outstanding.
+
+Follow-up validation caught a missing public declaration for the FFX state helper
+used by the new regression; added it in 5f22820. Preserved marked injector
+creation evidence after a backend stats reset without summing overlapping
+producer counts, with a report-bridge regression. SDK CI now emits verbose test
+output so real D3D12 debug-state assertion availability is visible in the logs.

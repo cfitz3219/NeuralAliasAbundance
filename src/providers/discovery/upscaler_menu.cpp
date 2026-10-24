@@ -6,6 +6,7 @@
 #include "host_dx12/overlay/menu.hpp"
 #include "host_dx12/overlay/na_style.hpp"
 #include <cstring>
+#include <algorithm>
 
 namespace na::discovery {
 UpscalerReport ReadUpscalerReport()
@@ -23,7 +24,9 @@ UpscalerReport DescribeHostUpscalers(const na::ngx::Stats& ngx, const na::ffx::S
     // Only explicitly unmarked creations remain unknown. Marked backend calls
     // are counted once through C6, even when the NGX observer also saw them.
     dlss.unknown_creates = ngx.sr_creates_unknown;
-    dlss.injector_creates = backend.features_created;
+    // These producers overlap and can reset at different times. Keep the
+    // larger observed count as evidence, never sum them as distinct creations.
+    dlss.injector_creates = (std::max)(backend.features_created, ngx.sr_creates_injector);
     dlss.injector_evaluates = backend.evaluates;
     auto& f = snapshot[1];
     f.observer_available = fsr.hooked_functions != 0;
