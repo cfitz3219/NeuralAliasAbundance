@@ -1,3 +1,13 @@
+# 2026-10-24 — Argon joins the gate review process
+
+Cort has added Gemini Argon as independent final auditor after Astra/Claude
+cross-review and fixes, starting at Gate 2. MASTER-PLAN and COLLABORATION define
+packet contents, exact-commit scope, finding responses and gate closure. Routine
+CI continues during development. No direct Gemini connector is available here;
+prepare a repo-linked packet for Cort's Argon session when cross-review completes.
+Do not claim Argon access or approval before delivery and a returned verdict.
+Gate 2 is not yet ready for Argon; its phase work/cross-reviews are still pending.
+
 # 2026-10-24 — A3 fixture implemented; CI green
 
 PR #11 is merged. Claude reports RTX session 2 at dceaaab: 21/21 CTests,
