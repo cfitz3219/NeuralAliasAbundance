@@ -256,3 +256,7 @@ PR27 head38ba5ce corrects incomplete bundle/list provenance and failed recording
 ## 2026-10-24 — PR31 fixes integrated into Phase3
 
 Claude fixes were published on claude/c8-c9-review-fixes (PR31), head fcbc57a, and are now integrated in PR27 at5ded6a0. Unmap ordering and binding dedup corrections are present; expanded root/viewport/scissor/copy payloads now have consumer bounds checks. Full Release and46/46 local non-GPU-labelled CTests pass, zero skips. CI pending. Remaining lifetime/coverage qualifications and async textures are coordinated in COMMS. Earlier unpublished-fix status is superseded; no deployment or Phase3 closure.
+
+## 2026-10-24 — integrated PR31 CI confirmed
+
+PR27 5ded6a0 all3 CI jobs pass40143583237, alongside local46/46 tests. Supersedes latest-CI-pending checkpoint. Remaining snapshot lifetime/coverage qualifications and async texture acquisition continue with Claude; no Phase3 closure or deployment.

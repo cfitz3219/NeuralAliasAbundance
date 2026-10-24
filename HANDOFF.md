@@ -1,3 +1,8 @@
+# 2026-10-24 — PR31 integration CI confirmed
+
+PR27 5ded6a0 passes all3 CI jobs40143583237 and local46/46 CTests, zero skips. This supersedes latest-CI-pending below. Claude's fixes are integrated; remaining lifetime/coverage qualifications and async textures remain tracked in COMMS. No deployment or user action needed for this checkpoint.
+
+---
 # 2026-10-24 — PR31 fixes integrated and locally validated
 
 PR27 head5ded6a0 integrates Claude PR31 fcbc57a and adds amended payload bounds/regressions. Full Release and46/46 local CTests pass, zero skips. CI pending. Original single-map Unmap-ordering and binding-dedup defects are corrected in this tree. Snapshot synchronization remains unknown; destruction ownership, deterministic boundary handshake, additional coverage/provenance regressions and asynchronous textures remain open. Exact findings/ownership in COMMS. Prior unpublished-fixes statements are historical. No game deployment or user attendance.
@@ -214,6 +219,7 @@ Cort: "finish this up and close gate 2!" Claude's side is complete, and with Ast
   - whether the overlay's own D3D12 objects also keep a removed device alive (not yet checked).
 
 **Next:** Phase 3.
+
 
 
 
