@@ -248,3 +248,7 @@ Phase3 continues: H2 representational gaps, H3 underlying Unmap/copy lifetime an
 ## 2026-10-24 — queue/H2/H3 checkpoint CI confirmed
 
 PR27 head7abf2bc CI40092641546 passes all3 jobs. PR29 head152cf47 CI40092433784 passes all3; PR25 head1e1e467 CI40092363582 succeeds. Local combined46/46 remains the tested hardware/fixture evidence. Prior latest-CI-pending entries are superseded for these exact heads. Remaining Phase3 acquisition and producer lifetime/provenance work is unchanged; no merge/deployment.
+
+## 2026-10-24 — consumer provenance tightened; C9 producer fixes still pending
+
+PR27 head38ba5ce corrects incomplete bundle/list provenance and failed recording continuity; adds H3 delayed-order/epoch regressions. Full Release and46/46 local CTests pass, zero skips; CI40093056740 all3 jobs pass. Latest Claude c9-h3 remains29e8647 with lifetime/provenance findings unresolved. Producer work stays Claude-owned; consumer changes do not duplicate it. No deployment or Phase3 closure.

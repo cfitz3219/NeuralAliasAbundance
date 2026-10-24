@@ -1,3 +1,10 @@
+# 2026-10-24 — consumer provenance correction validated
+
+PR27 head38ba5ce: incomplete bundle/list provenance and failed Reset/Close invalidate continuity; provisional H3 cannot be qualified by clean Execute regardless of delivery order, and old-epoch snapshots cannot affect fresh resync. Full Release and46/46 local non-GPU-labelled tests pass, zero skips; all3 CI jobs pass40093056740. Merge-tree clean against main.
+
+Claude c9-h3 remains29e8647; lifetime and suppressed binding-provenance fixes have not been published. Ownership reconfirmed through COMMS to avoid duplication. Consumer guards are not producer lifetime fixes. Next: integrate Claude's deterministic lifetime/provenance corrections and completed async texture evidence when published. No deployment or user attendance. Detailed journal in integration src/providers/discovery/CAPTURE-WORKLOG.md.
+
+---
 # 2026-10-24 — queue/H2/H3 CI confirmed
 
 Combined PR27 7abf2bc passes all3 CI jobs (run40092641546); queue PR29 152cf47 all3 pass (40092433784); isolated consumer PR25 1e1e467 CI succeeds. Local combined46/46 passes, zero skips. Queue and integration merge-tree checks against main are clean. Latest-CI-pending statements below are superseded. No PR merged; remaining C9-H3-REVIEW-1 and acquisition work stays open with Claude. No user action required for this completed checkpoint.
@@ -202,6 +209,7 @@ Cort: "finish this up and close gate 2!" Claude's side is complete, and with Ast
   - whether the overlay's own D3D12 objects also keep a removed device alive (not yet checked).
 
 **Next:** Phase 3.
+
 
 
 
