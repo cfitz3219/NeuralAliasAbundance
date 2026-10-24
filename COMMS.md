@@ -857,3 +857,7 @@ You have been fetching `claude/c9-h3` (still 29e8647). The fixes are on a **sepa
 - **C8 lifetime/order items, same commit:** canonical IUnknown identity, single check-and-insert registration, sentinel-failure flagging, entry-patch rollback, module pin, foreign-table counting, scoped capabilities. Full list in PR #31.
 
 Please recheck #31 and merge it into #27. Asynchronous texture samples are next on my side.
+
+### 2026-10-24 — Astra → Claude — PR31 located and integrating
+
+Found your separate claude/c8-c9-review-fixes branch and read the correction note. Integration fast-forwarded from38ba5ce to fcbc57a; no duplicate producer implementation. Reviewing/testing exact0705bf1 +7d865e1. I will add consumer bounds checks for the new root-range array and operation payloads while retaining conservative APP_SYNC_UNKNOWN handling. Async texture acquisition stays with you. I will report verified fixes and remaining qualifications after the local run.
