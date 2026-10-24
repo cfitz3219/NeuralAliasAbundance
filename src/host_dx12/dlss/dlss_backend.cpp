@@ -1,5 +1,6 @@
 // C6: generic DLSS Super Resolution / DLAA backend. See dlss_backend.hpp.
 #include "host_dx12/dlss/dlss_backend.hpp"
+#include "host_dx12/dlss/call_origin.hpp"
 
 #include "core/frame_contract.hpp"
 
@@ -180,6 +181,9 @@ struct State {
     Stats stats{};
 };
 State g;
+std::recursive_mutex g_life_m; // serializes all public lifecycle mutations
+ComPtr<ID3D12Device> g_tried_device;
+std::atomic<void (*)()> g_release_view_hook{nullptr};
 std::atomic<bool> g_any_attached{false}; // hot-path filter for OnExecuted (every game submission)
 
 void set_reason(char* dst, const char* text) { std::snprintf(dst, 128, "%s", text ? text : ""); }
@@ -225,7 +229,7 @@ void use_ended(int f, bool done)
 void collect_locked()
 {
     for (Record& r : g.recs) {
-        if (r.state == RecState::Submitted && r.fence->GetCompletedValue() >= r.value) {
+        if (r.state == RecState::Submitted && r.fence->GetCompletedValue() != UINT64_MAX && r.fence->GetCompletedValue() >= r.value) {
             use_ended(r.feature, true);
             free_record(r);
         } else if (r.state == RecState::Recorded && g.exec_calls - r.recorded_at > kAbandonCalls) {
@@ -332,8 +336,9 @@ void OwnShutdown(ID3D12Device* device);
 
 bool Attach(ID3D12Device* device, const Api& api)
 {
+    std::lock_guard<std::recursive_mutex> life(g_life_m);
     std::lock_guard<std::mutex> lock(g.m);
-    if (g.attached) return g.caps.available && !g.latched;
+    if (g.attached) return g.device.Get() == device && g.caps.available && !g.latched;
     g.caps = Capabilities{};
     if (!device || !api.get_capability_parameters || !api.allocate_parameters || !api.destroy_parameters ||
         !api.create_feature || !api.evaluate_feature || !api.release_feature) {
@@ -394,10 +399,11 @@ bool Attach(ID3D12Device* device, const Api& api)
 
 bool InitOwn(ID3D12Device* device, const wchar_t* data_path)
 {
+    std::lock_guard<std::recursive_mutex> life(g_life_m);
 #if defined(NA_HAVE_NGX_SDK) && defined(NA_HAVE_NGX_LIB)
     {
         std::lock_guard<std::mutex> lock(g.m);
-        if (g.attached) return g.caps.available && !g.latched;
+        if (g.attached) return g.device.Get() == device && g.caps.available && !g.latched;
     }
     Api api;
     char reason[128] = {};
@@ -426,6 +432,8 @@ bool InitOwn(ID3D12Device* device, const wchar_t* data_path)
 
 void Shutdown()
 {
+    std::lock_guard<std::recursive_mutex> life(g_life_m);
+    g_tried_device.Reset();
     std::lock_guard<std::mutex> lock(g.m);
 #if defined(NA_HAVE_NGX_SDK)
     if (g.attached) {
@@ -454,6 +462,18 @@ void Shutdown()
     g.exec_calls = 0;
     g.caps = Capabilities{};
     g.stats = Stats{};
+}
+
+bool IsBoundTo(ID3D12Device* device)
+{
+    std::lock_guard<std::mutex> lock(g.m);
+    return g.attached && device && g.device.Get() == device;
+}
+
+bool BoundDeviceRemoved()
+{
+    std::lock_guard<std::mutex> lock(g.m);
+    return g.attached && g.device && g.device->GetDeviceRemovedReason() != S_OK;
 }
 
 Capabilities GetCapabilities()
@@ -503,6 +523,7 @@ bool QueryOptimal(uint32_t out_w, uint32_t out_h, Quality q, OptimalSettings* ou
 
 bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
 {
+    const InjectorCallScope origin;
     std::lock_guard<std::mutex> lock(g.m);
     if (!list) return false;
     if (const char* bad = Validate(d)) {
@@ -549,21 +570,33 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
     // resolution anywhere up to it keeps the same feature and history.
     const uint32_t create_w = d.max_render_w ? d.max_render_w : d.render_w;
     const uint32_t create_h = d.max_render_h ? d.max_render_h : d.render_h;
-    const bool fits = cur && cur->out_w == d.out_w && cur->out_h == d.out_h && cur->flags == flags &&
+    bool fits = cur && !cur->tainted && cur->out_w == d.out_w && cur->out_h == d.out_h && cur->flags == flags &&
                       cur->quality == d.quality && create_w <= cur->render_w && create_h <= cur->render_h;
-    // R-303: order this view's evaluations on the GPU. The hazard is the NGX
-    // feature's own history state, so it applies only while the view keeps the
-    // feature its previous evaluation used; a new feature starts from reset.
-    // The predecessor is remembered here and the order is enforced when this
-    // evaluation is submitted (BeforeExecute), where the queues are known.
+    // A submitted predecessor supplies a fence dependency. A predecessor on
+    // this same list is ordered by the list itself. Separate unsubmitted lists
+    // may execute in either order: give the new recording independent history
+    // NOW, before emitting NGX work. Resetting a future frame cannot repair a
+    // concurrent use of one feature's internal resources.
     int pred = -1;
     uint64_t pred_gen = 0;
     if (fits && view.last_rec >= 0) {
         const Record& pr = g.recs[view.last_rec];
         if (pr.gen == view.last_rec_gen && pr.state != RecState::Free && pr.feature == view.feature) {
-            pred = view.last_rec;
-            pred_gen = pr.gen;
+            if (pr.state == RecState::Recorded && pr.list != list) {
+                fits = false;
+            } else {
+                pred = view.last_rec;
+                pred_gen = pr.gen;
+            }
         }
+    }
+    // Reserve completion capacity before NGX can record any GPU commands.
+    bool record_available = false;
+    for (const Record& rec : g.recs) record_available |= rec.state == RecState::Free;
+    if (!record_available) {
+        ++g.stats.refused_busy;
+        set_reason(g.stats.reason, "DLSS completion tracking is full; this frame uses the game's upscaler.");
+        return false;
     }
     NVSDK_NGX_Parameter* p = EP();
     if (!fits) {
@@ -750,8 +783,6 @@ void BeforeExecute(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList*
 }
 
 namespace {
-std::mutex g_life_m;                 // EnsureOn is one transaction for every producer
-ComPtr<ID3D12Device> g_tried_device; // kept alive: a recycled pointer can't impersonate it
 std::atomic<bool (*)(ID3D12Device*, const wchar_t*)> g_init_override{nullptr};
 std::atomic<bool (*)(ID3D12Device*)> g_removed_probe{nullptr};
 bool device_removed(ID3D12Device* d)
@@ -767,7 +798,7 @@ void SetDeviceRemovedProbeForTests(bool (*removed)(ID3D12Device*)) { g_removed_p
 bool EnsureOn(ID3D12Device* device, const wchar_t* data_path)
 {
     if (!device) return false;
-    std::lock_guard<std::mutex> life(g_life_m);
+    std::lock_guard<std::recursive_mutex> life(g_life_m);
     ComPtr<ID3D12Device> bound;
     bool available = false;
     {
@@ -778,8 +809,9 @@ bool EnsureOn(ID3D12Device* device, const wchar_t* data_path)
         }
     }
     if (bound) {
-        if (bound.Get() == device) return available;
-        if (!device_removed(bound.Get())) return false; // another live device owns DLSS
+        const bool removed = device_removed(bound.Get());
+        if (bound.Get() == device && !removed) return available;
+        if (!removed) return false; // another live device owns DLSS
         Shutdown();                                     // nothing can be pending on a removed device
         g_tried_device.Reset();
     }
@@ -789,8 +821,11 @@ bool EnsureOn(ID3D12Device* device, const wchar_t* data_path)
     return InitOwn(device, data_path);
 }
 
+void SetReleaseViewHookForTests(void (*hook)()) { g_release_view_hook.store(hook); }
+
 void ReleaseView(uint64_t view_id)
 {
+    if (auto hook = g_release_view_hook.load()) hook();
     std::lock_guard<std::mutex> lock(g.m);
     const int vi = find_view_locked(view_id, false);
     if (vi < 0) return;

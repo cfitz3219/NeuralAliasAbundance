@@ -2,6 +2,7 @@
 // and FSR-interception tests). Records creates/evaluates/releases and the
 // parameter values each call saw. Needs the NGX SDK headers.
 #pragma once
+#include "host_dx12/dlss/call_origin.hpp"
 #include "fake_ngx_params.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
 
@@ -20,6 +21,8 @@ inline NVSDK_NGX_Result eval_result = NVSDK_NGX_Result_Success;
 inline bool available = true;
 inline std::map<std::string, test::FakeParams::Value> last_create, last_eval;
 inline uintptr_t last_eval_handle = 0, next_handle = 0x1000;
+inline bool last_create_injector = false, last_eval_injector = false;
+inline void (*eval_hook)() = nullptr; // runs inside EvaluateFeature (tests of lock ordering)
 
 inline NVSDK_NGX_Result NVSDK_CONV Optimal(NVSDK_NGX_Parameter* p)
 {
@@ -63,6 +66,7 @@ inline NVSDK_NGX_Result NVSDK_CONV Destroy(NVSDK_NGX_Parameter* p)
 inline NVSDK_NGX_Result NVSDK_CONV Create(ID3D12GraphicsCommandList* list, NVSDK_NGX_Feature id, NVSDK_NGX_Parameter* p, NVSDK_NGX_Handle** h)
 {
     ++creates;
+    last_create_injector = na::dlss::IsInjectorCall();
     if (!list || id != NVSDK_NGX_Feature_SuperSampling) return NVSDK_NGX_Result_FAIL_InvalidParameter;
     if (NVSDK_NGX_FAILED(create_result)) return create_result;
     last_create = static_cast<test::FakeParams*>(p)->values;
@@ -72,6 +76,8 @@ inline NVSDK_NGX_Result NVSDK_CONV Create(ID3D12GraphicsCommandList* list, NVSDK
 inline NVSDK_NGX_Result NVSDK_CONV Eval(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* h, const NVSDK_NGX_Parameter* p, void*)
 {
     ++evals;
+    last_eval_injector = na::dlss::IsInjectorCall();
+    if (eval_hook) eval_hook();
     if (!list || !h) return NVSDK_NGX_Result_FAIL_InvalidParameter;
     last_eval = static_cast<const test::FakeParams*>(p)->values;
     last_eval_handle = reinterpret_cast<uintptr_t>(h);

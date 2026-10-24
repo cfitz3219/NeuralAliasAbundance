@@ -24,6 +24,26 @@ void Probe()
     if (na::upscalers::WatchLockHeldByThisThread()) g_violations.fetch_add(1);
 }
 void Install(HMODULE) { g_installs.fetch_add(1); SetEvent(g_installed); }
+// R-308: a module that loads AFTER the already-loaded lookup but before the
+// watch would have been registered under the old order.
+DWORD g_main = 0;
+const char* g_late_path = nullptr;
+std::atomic<int> g_main_probes{0}, g_late_installs{0};
+std::atomic<HMODULE> g_late_module{nullptr}, g_late_seen{nullptr};
+HANDLE g_late_installed = nullptr;
+void LateProbe()
+{
+    Probe();
+    if (GetCurrentThreadId() != g_main) return;          // ignore the worker's pins
+    if (g_main_probes.fetch_add(1) == 1)                   // after the lookup of the FIRST name
+        g_late_module.store(LoadLibraryA(g_late_path));    // ... the watched DLL loads
+}
+void LateInstall(HMODULE m)
+{
+    g_late_installs.fetch_add(1);
+    g_late_seen.store(m);
+    SetEvent(g_late_installed);
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -53,6 +73,26 @@ int main(int argc, char** argv)
     stop.store(true);
     loader.join();
     CHECK(g_violations.load() == 0);
+
+    // 3. R-308: the target loads between its own lookup and the end of
+    // registration. The watch is already registered, so the load notification
+    // queues it; the installer runs exactly once.
+    {
+        g_main = GetCurrentThreadId();
+        g_late_path = argv[1];
+        g_late_installed = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        REQUIRE(g_late_installed != nullptr);
+        REQUIRE(GetModuleHandleA("sl_interposer_real.dll") == nullptr); // the stress loop unloaded it
+        static const wchar_t* const kLate[] = {L"sl_interposer_real.dll", L"na_never_loaded.dll", nullptr};
+        na::upscalers::SetLoaderCallProbeForTests(&LateProbe);
+        REQUIRE(na::upscalers::AddModuleWatch(kLate, &LateInstall));
+        REQUIRE(g_late_module.load() != nullptr);
+        CHECK(WaitForSingleObject(g_late_installed, 5000) == WAIT_OBJECT_0);
+        Sleep(200); // a duplicate would land here
+        CHECK(g_late_installs.load() == 1);
+        CHECK(g_late_seen.load() == g_late_module.load());
+        na::upscalers::SetLoaderCallProbeForTests(&Probe);
+    }
     std::printf("module_watch: %d probes, %d installs, 0 lock violations expected (%d)\n", g_probes.load(),
                 g_installs.load(), g_violations.load());
     na::upscalers::SetLoaderCallProbeForTests(nullptr);

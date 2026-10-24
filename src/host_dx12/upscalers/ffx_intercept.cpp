@@ -36,7 +36,8 @@ bool D3D12State(uint32_t ffx, D3D12_RESOURCE_STATES* out)
     case FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ: *out = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE; return true;
     case FFX_API_RESOURCE_STATE_COPY_SRC: *out = D3D12_RESOURCE_STATE_COPY_SOURCE; return true;
     case FFX_API_RESOURCE_STATE_COPY_DEST: *out = D3D12_RESOURCE_STATE_COPY_DEST; return true;
-    case FFX_API_RESOURCE_STATE_GENERIC_READ: *out = D3D12_RESOURCE_STATE_GENERIC_READ; return true;
+    case FFX_API_RESOURCE_STATE_GENERIC_READ:
+        *out = D3D12_RESOURCE_STATE_COPY_SOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE; return true;
     default: return false;
     }
 }
@@ -58,7 +59,7 @@ bool ToDlss(const Observation& o, na::dlss::EvalDesc* out, const char** reason)
     // replace path transitions to DLSS's states around the evaluation and back.
     D3D12_RESOURCE_STATES s{};
     if (!D3D12State(o.color_state, &s) || !D3D12State(o.depth_state, &s) || !D3D12State(o.motion_state, &s) ||
-        !D3D12State(o.output_state, &s))
+        !D3D12State(o.output_state, &s) || (o.exposure && !D3D12State(o.exposure_state, &s)))
         return fail("FSR described a resource state NeuralAlias cannot translate for DLSS.");
     if (o.context_flags & FFX_UPSCALE_ENABLE_DEPTH_INFINITE) {
         // DLSS takes raw depth; infinite far plane changes nothing it relies on.
@@ -132,7 +133,6 @@ Observation g_last{};
 bool g_have_last = false;
 Stats g_stats{};
 std::atomic<uint32_t> g_mode{static_cast<uint32_t>(Mode::Observe)};
-bool g_dlss_init_tried = false;
 
 void set_reason(const char* why) { std::snprintf(g_stats.reason, sizeof(g_stats.reason), "%s", why ? why : ""); }
 
@@ -172,6 +172,7 @@ Observation observe_locked(ffxContext* ctx, const ffxDispatchDescUpscale& u)
     o.depth_state = u.depth.state;
     o.motion_state = u.motionVectors.state;
     o.output_state = u.output.state;
+    o.exposure_state = u.exposure.state;
     o.render_w = u.renderSize.width;
     o.render_h = u.renderSize.height;
     o.upscale_w = u.upscaleSize.width;
@@ -194,40 +195,32 @@ Observation observe_locked(ffxContext* ctx, const ffxDispatchDescUpscale& u)
     return o;
 }
 
-bool ensure_dlss_locked(ID3D12GraphicsCommandList* list)
+// All producers share one backend lifecycle transaction; never hold g_m here.
+bool ensure_dlss(ID3D12Device* device)
 {
-    const na::dlss::Capabilities c = na::dlss::GetCapabilities();
-    if (c.attached) return c.available && !c.latched_off;
-    if (g_dlss_init_tried) return false;
-    g_dlss_init_tried = true;
-    Microsoft::WRL::ComPtr<ID3D12Device> dev;
-    if (!list || FAILED(list->GetDevice(IID_PPV_ARGS(&dev)))) return false;
     wchar_t path[MAX_PATH] = {};
     const DWORD n = GetTempPathW(MAX_PATH, path);
     if (!n || n > MAX_PATH - 20) return false;
     wcscat_s(path, L"NeuralAlias-ngx");
     CreateDirectoryW(path, nullptr);
-    return na::dlss::InitOwn(dev.Get(), path);
+    return na::dlss::EnsureOn(device, path);
 }
 
 // True when DLSS produced this frame (FSR must then be skipped).
-bool try_replace_locked(const Observation& o, ContextInfo* ci)
+// Runs WITHOUT g_m (ARGON-G2-005). On failure *why is the reason.
+bool try_replace(const Observation& o, uint64_t view_id, Backend last, const char** why_out, uint32_t* barriers)
 {
     na::dlss::EvalDesc d;
     const char* why = nullptr;
     if (!ToDlss(o, &d, &why)) {
-        ++g_stats.fallbacks;
-        set_reason(why);
+        *why_out = why;
         return false;
     }
-    if (ci) {
-        d.view_id = ci->view_id;
-        if (ci->last != Backend::Dlss) d.reset = true; // R-304: DLSS did not see the previous frame
-    }
-    if (!ensure_dlss_locked(o.list)) {
-        ++g_stats.fallbacks;
-        const na::dlss::Capabilities c = na::dlss::GetCapabilities();
-        set_reason(c.reason[0] ? c.reason : "DLSS could not start on this device.");
+    d.view_id = view_id;
+    if (last != Backend::Dlss) d.reset = true; // R-304: DLSS did not see the previous frame
+    Microsoft::WRL::ComPtr<ID3D12Device> dev;
+    if (!o.list || FAILED(o.list->GetDevice(IID_PPV_ARGS(&dev))) || !ensure_dlss(dev.Get())) {
+        *why_out = "DLSS could not start on this device.";
         return false;
     }
     // ARGON-G2-003: move resources into DLSS's states and back afterwards.
@@ -237,10 +230,40 @@ bool try_replace_locked(const Observation& o, ContextInfo* ci)
         {o.depth, o.depth_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE},
         {o.motion, o.motion_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE},
         {o.output, o.output_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS},
+        {o.exposure, o.exposure_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE},
     };
-    D3D12_RESOURCE_BARRIER to[4] = {}, back[4] = {};
+    D3D12_RESOURCE_BARRIER to[5] = {}, back[5] = {};
+    if (o.list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT &&
+        o.list->GetType() != D3D12_COMMAND_LIST_TYPE_COMPUTE) {
+        *why_out = "DLSS requires a graphics or compute command list.";
+        return false;
+    }
+    // FFX declares whole-resource states. Reject aliased roles with conflicting
+    // requirements before recording any transitions (subresource views need C13).
+    for (size_t i = 0; i < 5; ++i) {
+        if (!wants[i].r) continue;
+        D3D12_RESOURCE_STATES state{};
+        D3D12State(wants[i].ffx, &state);
+        if (o.list->GetType() == D3D12_COMMAND_LIST_TYPE_COMPUTE &&
+            (state & D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)) {
+            *why_out = "FSR's graphics resource state cannot be restored on a compute list.";
+            return false;
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (wants[i].r == wants[j].r &&
+                (wants[i].ffx != wants[j].ffx || wants[i].dlss != wants[j].dlss)) {
+                *why_out = "FSR resource roles require conflicting states.";
+                return false;
+            }
+        }
+    }
     UINT n = 0;
-    for (const Want& w : wants) {
+    for (size_t i = 0; i < 5; ++i) {
+        const Want& w = wants[i];
+        if (!w.r) continue;
+        bool duplicate = false;
+        for (size_t j = 0; j < i; ++j) duplicate |= wants[j].r == w.r;
+        if (duplicate) continue;
         D3D12_RESOURCE_STATES game{};
         D3D12State(w.ffx, &game);
         // Already readable by compute (or already a UAV for the output): no barrier.
@@ -258,13 +281,10 @@ bool try_replace_locked(const Observation& o, ContextInfo* ci)
     const bool ok = na::dlss::Evaluate(o.list, d);
     if (n) o.list->ResourceBarrier(n, back); // restore exactly what FSR was promised
     if (!ok) {
-        ++g_stats.fallbacks;
-        set_reason(na::dlss::GetStats().reason);
+        *why_out = nullptr; // reason is in na::dlss::GetStats()
         return false;
     }
-    g_stats.barriers += n;
-    ++g_stats.replaced;
-    set_reason("");
+    *barriers = n;
     return true;
 }
 
@@ -300,15 +320,17 @@ ffxReturnCode_t DetourCreateContext(ffxContext* context, ffxCreateContextDescHea
 template <int S>
 ffxReturnCode_t DetourDestroyContext(ffxContext* context, const ffxAllocationCallbacks* mem)
 {
+    uint64_t view = 0;
     {
         std::lock_guard<std::mutex> lock(g_m);
         if (context)
             if (ContextInfo* ci = find_context(*context)) {
-                na::dlss::ReleaseView(ci->view_id); // R-303: its DLSS history ends with it
+                view = ci->view_id;
                 *ci = ContextInfo{};
             }
         ++g_stats.contexts_destroyed;
     }
+    if (view) na::dlss::ReleaseView(view); // backend calls never nest under g_m
     return g_slots[S].destroy(context, mem);
 }
 
@@ -330,23 +352,57 @@ ffxReturnCode_t DetourDispatch(ffxContext* context, const ffxDispatchDescHeader*
     if (desc && desc->type == FFX_API_DISPATCH_DESC_TYPE_UPSCALE) {
         const auto* u = reinterpret_cast<const ffxDispatchDescUpscale*>(desc);
         bool native_needs_reset = false;
+        Observation o;
+        uint64_t view_id = 0;
+        Backend last = Backend::None;
+        bool replace = false;
         {
             std::lock_guard<std::mutex> lock(g_m);
-            const Observation o = observe_locked(context, *u);
+            o = observe_locked(context, *u);
+            if (const ContextInfo* ci = find_context(o.context)) { view_id = ci->view_id; last = ci->last; }
+            replace = static_cast<Mode>(g_mode.load(std::memory_order_relaxed)) == Mode::ReplaceWithDlss;
+        }
+        // ARGON-G2-005: NGX start-up and evaluation run without g_m.
+        const char* why = nullptr;
+        uint32_t barriers = 0;
+        const bool replaced = replace && try_replace(o, view_id, last, &why, &barriers);
+        // ARGON-G2-005: the backend's lock is never taken under g_m.
+        const na::dlss::Stats backend = (replace && !replaced && !why) ? na::dlss::GetStats() : na::dlss::Stats{};
+        {
+            std::lock_guard<std::mutex> lock(g_m);
             ContextInfo* ci = find_context(o.context);
-            if (static_cast<Mode>(g_mode.load(std::memory_order_relaxed)) == Mode::ReplaceWithDlss && try_replace_locked(o, ci)) {
+            if (ci && ci->view_id != view_id) ci = nullptr; // destroyed and recreated meanwhile
+            if (replaced) {
+                ++g_stats.replaced;
+                g_stats.barriers += barriers;
+                set_reason("");
                 if (ci) ci->last = Backend::Dlss;
                 return FFX_API_RETURN_OK; // DLSS wrote FSR's output on the game's list
             }
+            if (replace) {
+                ++g_stats.fallbacks;
+                set_reason(why ? why : backend.reason);
+            }
             // R-304: FSR skipped the frames DLSS produced; its history is stale.
             native_needs_reset = ci && ci->last == Backend::Dlss && !u->reset;
-            if (ci) ci->last = Backend::Native;
         }
+        ffxReturnCode_t rc;
         if (native_needs_reset) {
             ffxDispatchDescUpscale copy = *u; // never modify the game's descriptor
             copy.reset = true;
-            return g_slots[S].dispatch(context, &copy.header);
+            rc = g_slots[S].dispatch(context, &copy.header);
+        } else {
+            rc = g_slots[S].dispatch(context, desc);
         }
+        // R-309: FSR owns the history only once its frame actually ran. After a
+        // failed native call the context keeps its previous owner, so the next
+        // FSR frame after DLSS still resets.
+        if (rc == FFX_API_RETURN_OK) {
+            std::lock_guard<std::mutex> lock(g_m);
+            ContextInfo* ci = find_context(o.context);
+            if (ci && ci->view_id == view_id) ci->last = Backend::Native;
+        }
+        return rc;
     } else {
         std::lock_guard<std::mutex> lock(g_m);
         ++g_stats.other_dispatches;
@@ -454,7 +510,6 @@ void ResetForTests()
     g_stats.hooked_functions = functions;
     g_last = Observation{};
     g_have_last = false;
-    g_dlss_init_tried = false;
 }
 
 } // namespace na::ffx

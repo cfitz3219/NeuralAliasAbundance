@@ -107,7 +107,9 @@ struct Stats {
     uint32_t fg_seen;           // 0/1 the game created a Frame Generation feature (id 11)
     // A30 menu evidence: successful DLSS super-resolution feature creations
     // and the sizes the LAST one was created with (0xFFFFFFFF = not read).
-    uint64_t sr_creates;
+    uint64_t sr_creates; // aggregate successful SR creations
+    uint64_t sr_creates_unknown; // unmarked origin, never inferred from aggregate differences
+    uint64_t sr_creates_injector; // explicitly marked backend calls
     uint32_t last_sr_in_w, last_sr_in_h, last_sr_out_w, last_sr_out_h;
     // A42: creation failures and the fallback that keeps DLSS running.
     uint64_t create_failures;   // creations the runtime refused (after fallback)

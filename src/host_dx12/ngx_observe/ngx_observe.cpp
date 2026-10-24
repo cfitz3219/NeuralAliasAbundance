@@ -1,3 +1,4 @@
+#include "host_dx12/dlss/call_origin.hpp"
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 
 #include "host_dx12/nr/nr_pass.hpp"
@@ -178,6 +179,7 @@ std::atomic<uint32_t> g_rr_seen{0};
 std::atomic<uint32_t> g_fg_seen{0};
 std::atomic<HMODULE> g_hooked_module{nullptr};
 std::atomic<uint64_t> g_sr_creates{0};
+std::atomic<uint64_t> g_sr_creates_unknown{0}, g_sr_creates_injector{0};
 std::atomic<uint32_t> g_last_sr_in_w{0}, g_last_sr_in_h{0}, g_last_sr_out_w{0}, g_last_sr_out_h{0};
 std::atomic<uint64_t> g_create_failures{0}, g_create_recovered{0};
 std::atomic<uint32_t> g_preset_rejected{0}, g_quality_rejected{0};
@@ -251,6 +253,21 @@ uint32_t resolve_frames(void* const* raw, uint32_t n, CreateFrame* out, uint32_t
 NgxResult CreateFeatureImpl(CoreSlot& s, void* cmd_list, uint32_t feature_id, void* params, void** out_handle)
 {
     const PfnCreateFeature g_orig_create = s.create; // this module's original
+    // C6 owns these settings/history. Do not apply game overrides, remember its
+    // handle as the game's Apply target, or classify its creation as unknown.
+    if (na::dlss::IsInjectorCall()) {
+        const NgxResult r = g_orig_create(cmd_list, feature_id, params, out_handle);
+        g_creates.fetch_add(1, std::memory_order_relaxed);
+        if (r == 1 && feature_id == 1) {
+            g_sr_creates_injector.fetch_add(1, std::memory_order_release);
+            g_sr_creates.fetch_add(1, std::memory_order_release);
+        }
+        if (r != 1) g_create_failures.fetch_add(1, std::memory_order_relaxed);
+        push_record(CallKind::CreateFeature, r, feature_id, 0,
+                    out_handle && *out_handle ? reinterpret_cast<uint64_t>(*out_handle) : 0,
+                    reinterpret_cast<uint64_t>(cmd_list));
+        return r;
+    }
     void* raw_frames[24] = {};
     USHORT raw_n = 0;
     if (feature_id == 1) raw_n = RtlCaptureStackBackTrace(1, 24, raw_frames, nullptr); // A66/A71: evidence, resolved later
@@ -290,6 +307,7 @@ NgxResult CreateFeatureImpl(CoreSlot& s, void* cmd_list, uint32_t feature_id, vo
         g_last_sr_out_w.store(ep.out_width, std::memory_order_relaxed);
         g_last_sr_out_h.store(ep.out_height, std::memory_order_relaxed);
         g_sr_creates.fetch_add(1, std::memory_order_release);
+        g_sr_creates_unknown.fetch_add(1, std::memory_order_release);
         if (out_handle) g_last_sr_handle.store(*out_handle, std::memory_order_release); // A46 apply target
         if (ep.valid) { // A63: what a re-creation from scratch needs
             std::lock_guard<std::mutex> lock(g_reapply_mutex);
@@ -435,6 +453,10 @@ NgxResult create_from_snapshot_locked(CoreSlot& s, void* cmd_list, void** out_ha
 
 NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, const void* params, void* callback)
 {
+    if (na::dlss::IsInjectorCall()) {
+        g_evaluates.fetch_add(1, std::memory_order_relaxed);
+        return s.evaluate(cmd_list, handle, params, callback);
+    }
     auto* list = static_cast<ID3D12GraphicsCommandList*>(cmd_list);
     const void* game_handle = handle; // A66: identity as the game sees it (creation records use the same)
     // A46: forward to our re-created feature when the game's handle is mapped.
@@ -1394,6 +1416,8 @@ Stats GetStats()
     s.hooked_functions = g_hooked.load(std::memory_order_relaxed);
     s.module_attached = g_module_attached.load(std::memory_order_acquire);
     s.sr_creates = g_sr_creates.load(std::memory_order_acquire);
+    s.sr_creates_unknown = g_sr_creates_unknown.load(std::memory_order_acquire);
+    s.sr_creates_injector = g_sr_creates_injector.load(std::memory_order_acquire);
     s.create_failures = g_create_failures.load(std::memory_order_relaxed);
     s.create_recovered = g_create_recovered.load(std::memory_order_relaxed);
     s.preset_rejected = g_preset_rejected.load(std::memory_order_acquire);

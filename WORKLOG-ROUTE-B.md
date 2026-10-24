@@ -106,21 +106,6 @@ and exactness claims. R-101/R-104 remain fixed in their existing PRs. No product
 or ABI changes, no runtime tests claimed. Reviewed documentation links and diff
 whitespace. Recovery originals remain untouched for hash/provenance verification.
 
-## 2026-10-24 — A4 report implementation
-
-Added a portable SR-evidence classifier, non-destructive NGX Stats bridge and
-Details-page menu section in Astra-owned providers/discovery. The report separates
-successful game/injector/unknown-origin calls, creation/evaluation, failed calls,
-library presence and unavailable observers. Multiple routes remain visible.
-Existing aggregate NGX evaluations are not promoted to SR-specific success;
-existing sr_creates lack origin, so they report source unknown. FSR/XeSS stay
-unmonitored until C7 provides observations. No runtime/core/ABI or root CMake edits.
-
-Six portable behavior tests and a Windows real-menu registration/draw test added.
-Local GCC Release root build and 8/8 CTests passed. A3 is on a separate unmerged
-branch and is not counted in this run. Requested the two host-owned wiring edits
-through COMMS; documented exact integration in UPSCALER-REPORT.md. Actual in-game
-visibility remains pending that wiring. Windows CI follows the pushed branch.
 ## 2026-10-24 — A3 ground-truth fixture v2
 
 After Claude's #11 approval and reported RTX session 2 (21/21 plus 32 deployment
@@ -141,3 +126,39 @@ All ten fixture tests then passed. Root GCC Release configure/build passed and
 8/8 CTests passed. Generated twelve default frames and truth files under /tmp;
 CLI round-trip accepted, while tests verified corrupted candidates return failure.
 Windows CI and Gate 2 review follow the pushed task branch; no game deployment.
+## 2026-10-24 — A4 report implementation
+
+Added a portable SR-evidence classifier, non-destructive NGX Stats bridge and
+Details-page menu section in Astra-owned providers/discovery. The report separates
+successful game/injector/unknown-origin calls, creation/evaluation, failed calls,
+library presence and unavailable observers. Multiple routes remain visible.
+Existing aggregate NGX evaluations are not promoted to SR-specific success;
+existing sr_creates lack origin, so they report source unknown. FSR/XeSS stay
+unmonitored until C7 provides observations. No runtime/core/ABI or root CMake edits.
+
+Six portable behavior tests and a Windows real-menu registration/draw test added.
+Local GCC Release root build and 8/8 CTests passed. A3 is on a separate unmerged
+branch and is not counted in this run. Requested the two host-owned wiring edits
+through COMMS; documented exact integration in UPSCALER-REPORT.md. Actual in-game
+visibility remains pending that wiring. Windows CI follows the pushed branch.
+
+## 2026-10-24 — Gate 2 takeover and combined implementation
+
+Cort requested that Astra finish Opus's tasks. Integrated the latest #12–#16
+heads on astra/g2-completion, resolving append-only journal and CPU-test CMake
+conflicts by retaining both contributions. Recorded ownership in COMMS on main.
+Completed shared backend lifecycle/lock ordering, cold XeSS initialization,
+exposure transitions/restoration, injector provenance and record-ahead isolation.
+Added deterministic concurrency, completion-capacity, reversed-submission,
+resource-state and origin regressions. Preserved the handed-off loader-watch,
+native-failure reset and Streamline fixes. Details and qualification boundaries
+are in docs/reviews/GATE2-completion.md. Local Release build/9 tests passed;
+initial integrated SDK Windows run passed 28 tests. PR #17 holds the combined
+candidate; final-head Windows validation continues. No game deployment or gate
+closure. Hardware/runtime evidence and independent audit remain outstanding.
+
+Follow-up validation caught a missing public declaration for the FFX state helper
+used by the new regression; added it in 5f22820. Preserved marked injector
+creation evidence after a backend stats reset without summing overlapping
+producer counts, with a report-bridge regression. SDK CI now emits verbose test
+output so real D3D12 debug-state assertion availability is visible in the logs.

@@ -52,6 +52,7 @@ struct Observation {
     ID3D12Resource* reactive = nullptr;
     ID3D12Resource* transparency = nullptr;
     ID3D12Resource* output = nullptr;
+    uint32_t exposure_state = 0;
     uint32_t color_state = 0, depth_state = 0, motion_state = 0, output_state = 0; // FFX_API_RESOURCE_STATE_*
     uint32_t render_w = 0, render_h = 0, upscale_w = 0, upscale_h = 0;
     float jitter_x = 0, jitter_y = 0;
@@ -66,6 +67,8 @@ struct Observation {
 
 // Pure conversion used by the replace path (and tests). Returns false with a
 // plain-language reason when these inputs cannot drive DLSS faithfully.
+// Exact whole-resource state translation; false for unsupported FFX states.
+bool D3D12State(uint32_t ffx, D3D12_RESOURCE_STATES* out);
 bool ToDlss(const Observation& o, na::dlss::EvalDesc* out, const char** reason);
 
 // Hooks the FidelityFX API exports `module` provides (each module keeps its

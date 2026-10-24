@@ -18,9 +18,12 @@
 
 #if defined(NA_HAVE_NGX_SDK)
 #include "fake_ngx_runtime.hpp"
+#include "lock_order_probe.hpp"
 #endif
 
 #include <cstring>
+#include <d3d12sdklayers.h>
+#include <vector>
 
 namespace {
 ID3D12Resource* Fake(uintptr_t v) { return reinterpret_cast<ID3D12Resource*>(v); }
@@ -108,10 +111,17 @@ int main(int argc, char** argv)
         CHECK(na::ffx::ToDlss(o, &d, &why));
         o = GoodObservation(); o.color_state = FFX_API_RESOURCE_STATE_COPY_DEST;
         CHECK(na::ffx::ToDlss(o, &d, &why));
+        D3D12_RESOURCE_STATES generic{};
+        CHECK(na::ffx::D3D12State(FFX_API_RESOURCE_STATE_GENERIC_READ, &generic));
+        CHECK(generic == (D3D12_RESOURCE_STATE_COPY_SOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
         o = GoodObservation(); o.output_state = 0x4000; // no D3D12 equivalent
         CHECK(!na::ffx::ToDlss(o, &d, &why) && why && std::strstr(why, "translate"));
         o = GoodObservation(); o.max_render_w = 1280; o.max_render_h = 720; o.render_w = 1000; o.render_h = 562;
         CHECK(na::ffx::ToDlss(o, &d, &why) && d.max_render_w == 1280 && d.render_w == 1000 && d.quality == na::dlss::Quality::MaxQuality);
+        o = GoodObservation(); o.exposure = Fake(0x50); o.exposure_state = FFX_API_RESOURCE_STATE_COPY_DEST;
+        CHECK(na::ffx::ToDlss(o, &d, &why) && d.exposure == Fake(0x50));
+        o.exposure_state = 0x4000;
+        CHECK(!na::ffx::ToDlss(o, &d, &why));
         o = GoodObservation(); o.motion = nullptr;
         CHECK(!na::ffx::ToDlss(o, &d, &why) && why);
         o = GoodObservation(); o.jitter_x = 4.f; // out of range -> DLSS validation refuses
@@ -175,6 +185,8 @@ int main(int argc, char** argv)
     // 4. Replace mode.
     na::ffx::SetMode(na::ffx::Mode::ReplaceWithDlss);
 #if defined(NA_HAVE_NGX_SDK)
+    test::ComPtr<ID3D12Debug> debug;
+    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) debug->EnableDebugLayer();
     test::Device d;
     if (test::CreateDevice(d)) {
         REQUIRE(na::dlss::Attach(d.device.Get(), fake::MakeApi()));
@@ -227,6 +239,15 @@ int main(int argc, char** argv)
             CHECK(fb.reset == false);  // caller's descriptor untouched
             CHECK(dispatch(&ctx, &fb.header) == FFX_API_RETURN_OK && last_reset() == 0); // FSR continues
             CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK && dlss_reset() == 1);  // back to DLSS
+            // R-309: a FAILED native frame does not hand the history to FSR:
+            // the next FSR frame after DLSS still resets.
+            auto fail_next = reinterpret_cast<void (*)()>(reinterpret_cast<void*>(GetProcAddress(stub, "StubFailNextDispatch")));
+            REQUIRE(fail_next != nullptr);
+            fail_next();
+            CHECK(dispatch(&ctx, &fb.header) == FFX_API_RETURN_ERROR && last_reset() == 1);
+            CHECK(dispatch(&ctx, &fb.header) == FFX_API_RETURN_OK && last_reset() == 1); // still owed
+            CHECK(dispatch(&ctx, &fb.header) == FFX_API_RETURN_OK && last_reset() == 0); // now FSR's
+            CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK && dlss_reset() == 1);  // back to DLSS
             na::ffx::SetMode(na::ffx::Mode::Observe);
             CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK && last_reset() == 1); // mode change
             CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK && last_reset() == 0);
@@ -253,6 +274,17 @@ int main(int argc, char** argv)
             CHECK(fake::last_eval_handle != h_ctx && fake::last_eval_handle != h_ctx2 && dlss_reset() == 1);
             CHECK(destroy(&ctx3, nullptr) == FFX_API_RETURN_OK);
         }
+        // ARGON-G2-005: DLSS evaluation runs without the interceptor's lock, so a
+        // stats read (the menu) from inside it cannot wait on it. With the old
+        // locking this self-deadlocks on the same thread.
+        {
+            fake::eval_hook = [] { (void)na::ffx::GetStats(); (void)na::ffx::LastObservation(nullptr); };
+            const uint64_t replaced = na::ffx::GetStats().replaced;
+            auto u = UpscaleDesc(l.list.Get());
+            CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK);
+            CHECK(na::ffx::GetStats().replaced == replaced + 1);
+            fake::eval_hook = nullptr;
+        }
         // ARGON-G2-003: a COMMON output is transitioned to UAV and back, not refused.
         {
             const uint64_t replaced = na::ffx::GetStats().replaced, barriers = na::ffx::GetStats().barriers;
@@ -267,6 +299,18 @@ int main(int argc, char** argv)
             CHECK(na::ffx::GetStats().replaced == replaced + 1 && na::ffx::GetStats().barriers == barriers + 1);
             CHECK(fake::P(fake::last_eval, NVSDK_NGX_Parameter_Output) == out_tex.Get());
         }
+        l.list->Close();
+        na::dlss::Shutdown();
+        REQUIRE(l.Create(d.device.Get()));
+        REQUIRE(na::dlss::Attach(d.device.Get(), fake::MakeApi()));
+        ffxContext victim = nullptr;
+        REQUIRE(create(&victim, &cd.header, nullptr) == FFX_API_RETURN_OK);
+        auto concurrent = UpscaleDesc(l.list.Get());
+        ffxReturnCode_t eval_result = FFX_API_RETURN_ERROR, destroy_result = FFX_API_RETURN_ERROR;
+        lock_probe::Run([&] { eval_result = dispatch(&ctx, &concurrent.header); },
+                        [&] { destroy_result = destroy(&victim, nullptr); },
+                        [] { (void)na::ffx::GetStats(); });
+        CHECK(eval_result == FFX_API_RETURN_OK && destroy_result == FFX_API_RETURN_OK);
         // ARGON-G2-001: dynamic resolution inside the context's maxRenderSize keeps one feature and its history.
         {
             const int creates = fake::creates;
@@ -282,6 +326,69 @@ int main(int argc, char** argv)
         }
         l.list->Close();
         na::dlss::Shutdown();
+        // G2-003: execute real transitions, assert exposure state at NGX entry
+        // and after return, for both success and failed evaluation/fallback.
+        test::ComPtr<ID3D12InfoQueue> info;
+        d.device.As(&info);
+        for (int failure = 0; failure < 2; ++failure) {
+            REQUIRE(na::dlss::Attach(d.device.Get(), fake::MakeApi()));
+            test::List states;
+            REQUIRE(states.Create(d.device.Get()));
+            auto color = test::CreateTexture(d.device.Get(), 1280, 720, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_FLAG_NONE);
+            auto depth = test::CreateTexture(d.device.Get(), 1280, 720, DXGI_FORMAT_R32_FLOAT,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_FLAG_NONE);
+            auto motion = test::CreateTexture(d.device.Get(), 1280, 720, DXGI_FORMAT_R16G16_FLOAT,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_FLAG_NONE);
+            auto output = test::CreateTexture(d.device.Get(), 1920, 1080, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+            auto exposure = test::CreateTexture(d.device.Get(), 1, 1, DXGI_FORMAT_R32_FLOAT,
+                D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
+            REQUIRE(color && depth && motion && output && exposure);
+            test::ComPtr<ID3D12DebugCommandList> debug_list;
+            states.list.As(&debug_list);
+            std::printf("exposure state test: debug assertions %s, failed-evaluate=%d\n", debug_list ? "enabled" : "unavailable", failure);
+            static ID3D12DebugCommandList* probe_list = nullptr;
+            static ID3D12Resource* probe_exposure = nullptr;
+            probe_list = debug_list.Get(); probe_exposure = exposure.Get();
+            if (info) info->ClearStoredMessages();
+            fake::eval_hook = [] {
+                if (probe_list) CHECK(probe_list->AssertResourceState(probe_exposure, 0,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+            };
+            auto u = UpscaleDesc(states.list.Get());
+            u.color = Res(reinterpret_cast<uintptr_t>(color.Get()), FFX_API_RESOURCE_STATE_COMPUTE_READ);
+            u.depth = Res(reinterpret_cast<uintptr_t>(depth.Get()), FFX_API_RESOURCE_STATE_COMPUTE_READ);
+            u.motionVectors = Res(reinterpret_cast<uintptr_t>(motion.Get()), FFX_API_RESOURCE_STATE_COMPUTE_READ);
+            u.output = Res(reinterpret_cast<uintptr_t>(output.Get()), FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+            u.exposure = Res(reinterpret_cast<uintptr_t>(exposure.Get()), FFX_API_RESOURCE_STATE_COPY_DEST);
+            const int native0 = counts(3), eval0 = fake::evals;
+            fake::eval_result = failure ? NVSDK_NGX_Result_FAIL_InvalidParameter : NVSDK_NGX_Result_Success;
+            CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK);
+            CHECK(fake::evals == eval0 + 1 && counts(3) == native0 + failure);
+            if (debug_list) CHECK(debug_list->AssertResourceState(exposure.Get(), 0, D3D12_RESOURCE_STATE_COPY_DEST));
+            fake::eval_hook = nullptr;
+            fake::eval_result = NVSDK_NGX_Result_Success;
+            REQUIRE(SUCCEEDED(states.list->Close()));
+            ID3D12CommandList* lists[] = {states.list.Get()};
+            na::dlss::BeforeExecute(d.queue.Get(), 1, lists);
+            d.queue->ExecuteCommandLists(1, lists);
+            na::dlss::OnExecuted(d.queue.Get(), 1, lists);
+            d.WaitIdle();
+            if (info) {
+                for (UINT64 i = 0; i < info->GetNumStoredMessagesAllowedByRetrievalFilter(); ++i) {
+                    SIZE_T bytes = 0; info->GetMessage(i, nullptr, &bytes);
+                    std::vector<unsigned char> storage(bytes);
+                    auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+                    if (SUCCEEDED(info->GetMessage(i, message, &bytes))) {
+                        const bool error = message->Severity <= D3D12_MESSAGE_SEVERITY_ERROR;
+                        if (error) std::printf("D3D12: %s\n", message->pDescription);
+                        CHECK(!error);
+                    }
+                }
+            } else std::printf("exposure debug-state assertions unavailable; real barrier submission checked\n");
+            na::dlss::Shutdown();
+        }
     } else {
         std::printf("replace-mode checks skipped: no D3D12 device\n");
     }

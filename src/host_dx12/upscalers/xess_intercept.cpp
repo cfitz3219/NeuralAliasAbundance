@@ -126,7 +126,6 @@ Observation g_last{};
 bool g_have_last = false;
 Stats g_stats{};
 std::atomic<uint32_t> g_mode{static_cast<uint32_t>(Mode::Observe)};
-bool g_dlss_init_tried = false;
 
 void set_reason(const char* why) { std::snprintf(g_stats.reason, sizeof(g_stats.reason), "%s", why ? why : ""); }
 
@@ -149,22 +148,15 @@ ContextInfo* find_or_add(Context c)
     return nullptr; // table full: executes report context_known=false
 }
 
-bool ensure_dlss_locked(ID3D12Device* device, ID3D12GraphicsCommandList* list)
+// All producers share one backend lifecycle transaction; never hold g_m here.
+bool ensure_dlss(ID3D12Device* device)
 {
-    const na::dlss::Capabilities c = na::dlss::GetCapabilities();
-    if (c.attached) return c.available && !c.latched_off;
-    // ARGON-G2-002: a context created before our hooks has no recorded device;
-    // the game's command list knows it.
-    Microsoft::WRL::ComPtr<ID3D12Device> from_list;
-    if (!device && list && SUCCEEDED(list->GetDevice(IID_PPV_ARGS(&from_list)))) device = from_list.Get();
-    if (g_dlss_init_tried || !device) return false;
-    g_dlss_init_tried = true;
     wchar_t path[MAX_PATH] = {};
     const DWORD n = GetTempPathW(MAX_PATH, path);
     if (!n || n > MAX_PATH - 20) return false;
     wcscat_s(path, L"NeuralAlias-ngx");
     CreateDirectoryW(path, nullptr);
-    return na::dlss::InitOwn(device, path);
+    return na::dlss::EnsureOn(device, path);
 }
 
 template <int S>
@@ -193,6 +185,7 @@ Result DetourInit(Context c, const D3D12InitParams* p)
     ++g_stats.contexts_initialized;
     if (ContextInfo* ci = find_or_add(c)) {
         ci->initialized = true;
+        ci->last = Backend::None; // ARGON-G2-006: (re)Init starts fresh DLSS history
         ci->flags = p->initFlags;
         ci->quality = p->qualitySetting;
         ci->out_w = p->outputResolution.x;
@@ -204,14 +197,16 @@ Result DetourInit(Context c, const D3D12InitParams* p)
 template <int S>
 Result DetourDestroy(Context c)
 {
+    uint64_t view = 0;
     {
         std::lock_guard<std::mutex> lock(g_m);
         if (ContextInfo* ci = find(c)) {
-            na::dlss::ReleaseView(ci->view_id); // R-303: its DLSS history ends with it
+            view = ci->view_id;
             *ci = ContextInfo{};
         }
         ++g_stats.contexts_destroyed;
     }
+    if (view) na::dlss::ReleaseView(view); // backend calls never nest under g_m
     return g_slots[S].destroy(c);
 }
 
@@ -252,8 +247,9 @@ template <int S>
 Result DetourExecute(Context c, ID3D12GraphicsCommandList* list, const D3D12ExecuteParams* p)
 {
     bool native_needs_reset = false;
+    uint64_t native_view = 0; // R-309: the context whose native call is about to run
     if (p) {
-        std::lock_guard<std::mutex> lock(g_m);
+        std::unique_lock<std::mutex> lock(g_m);
         Observation o;
         o.serial = ++g_stats.executes;
         o.context = c;
@@ -289,42 +285,59 @@ Result DetourExecute(Context c, ID3D12GraphicsCommandList* list, const D3D12Exec
             if (b.x || b.y) o.nonzero_bases = true;
         g_last = o;
         g_have_last = true;
-        ContextInfo* ci = find(c);
-        if (static_cast<Mode>(g_mode.load(std::memory_order_relaxed)) == Mode::ReplaceWithDlss) {
+        uint64_t view_id = 0;
+        Backend last = Backend::None;
+        if (const ContextInfo* ci0 = find(c)) { view_id = ci0->view_id; last = ci0->last; }
+        const bool replace = static_cast<Mode>(g_mode.load(std::memory_order_relaxed)) == Mode::ReplaceWithDlss;
+        lock.unlock(); // ARGON-G2-005: NGX start-up and evaluation run without g_m
+        bool replaced = false;
+        const char* why = nullptr;
+        if (replace) {
             na::dlss::EvalDesc d;
-            const char* why = nullptr;
-            const bool mapped = ToDlss(o, &d, &why);
-            if (mapped && ci) {
-                d.view_id = ci->view_id;
-                if (ci->last != Backend::Dlss) d.reset = true; // R-304: DLSS did not see the previous frame
+            if (ToDlss(o, &d, &why)) {
+                d.view_id = view_id;
+                if (last != Backend::Dlss) d.reset = true; // R-304 / G2-006: DLSS did not see the previous frame
+                Microsoft::WRL::ComPtr<ID3D12Device> from_list;
+                ID3D12Device* dev = o.device; // ARGON-G2-002: fall back to the list's device
+                if (!dev && list && SUCCEEDED(list->GetDevice(IID_PPV_ARGS(&from_list)))) dev = from_list.Get();
+                if (!ensure_dlss(dev)) why = "DLSS could not start on this device.";
+                else replaced = na::dlss::Evaluate(list, d);
             }
-            if (!mapped) {
-                ++g_stats.fallbacks;
-                set_reason(why);
-            } else if (!ensure_dlss_locked(o.device, list)) {
-                ++g_stats.fallbacks;
-                const na::dlss::Capabilities caps = na::dlss::GetCapabilities();
-                set_reason(caps.reason[0] ? caps.reason : "DLSS could not start on this device.");
-            } else if (!na::dlss::Evaluate(list, d)) {
-                ++g_stats.fallbacks;
-                set_reason(na::dlss::GetStats().reason);
-            } else {
-                ++g_stats.replaced;
-                set_reason("");
-                if (ci) ci->last = Backend::Dlss;
-                return kSuccess; // DLSS wrote XeSS's output on the game's list
-            }
+        }
+        // ARGON-G2-005: the backend's lock is never taken under g_m.
+        const na::dlss::Stats backend = (replace && !replaced && !why) ? na::dlss::GetStats() : na::dlss::Stats{};
+        lock.lock();
+        ContextInfo* ci = find(c);
+        if (ci && ci->view_id != view_id) ci = nullptr; // destroyed and recreated meanwhile
+        if (replaced) {
+            ++g_stats.replaced;
+            set_reason("");
+            if (ci) ci->last = Backend::Dlss;
+            return kSuccess; // DLSS wrote XeSS's output on the game's list
+        }
+        if (replace) {
+            ++g_stats.fallbacks;
+            set_reason(why ? why : backend.reason);
         }
         // R-304: XeSS skipped the frames DLSS produced; its history is stale.
         native_needs_reset = ci && ci->last == Backend::Dlss && !p->resetHistory;
-        if (ci) ci->last = Backend::Native;
+        native_view = ci ? view_id : 0;
     }
+    Result rc;
     if (native_needs_reset) {
         D3D12ExecuteParams copy = *p; // never modify the game's parameters
         copy.resetHistory = 1;
-        return g_slots[S].execute(c, list, &copy);
+        rc = g_slots[S].execute(c, list, &copy);
+    } else {
+        rc = g_slots[S].execute(c, list, p);
     }
-    return g_slots[S].execute(c, list, p);
+    // R-309: XeSS owns the history only once its frame actually ran; after a
+    // failed native call the next XeSS frame after DLSS still resets.
+    if (rc == kSuccess && native_view) {
+        std::lock_guard<std::mutex> relock(g_m);
+        if (ContextInfo* ci = find(c); ci && ci->view_id == native_view) ci->last = Backend::Native;
+    }
+    return rc;
 }
 
 template <int S>
@@ -422,7 +435,6 @@ void ResetForTests()
     g_stats.hooked_functions = functions;
     g_last = Observation{};
     g_have_last = false;
-    g_dlss_init_tried = false;
 }
 
 } // namespace na::xess

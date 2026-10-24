@@ -6,6 +6,7 @@
 #include "host_dx12/overlay/menu.hpp"
 #include "host_dx12/overlay/na_style.hpp"
 #include <cstring>
+#include <algorithm>
 
 namespace na::discovery {
 UpscalerReport ReadUpscalerReport()
@@ -20,11 +21,12 @@ UpscalerReport DescribeHostUpscalers(const na::ngx::Stats& ngx, const na::ffx::S
     auto& dlss = snapshot[0];
     dlss.observer_available = ngx.hooked_functions != 0;
     dlss.module_seen = ngx.module_attached != 0 || ngx.core_preloaded != 0;
-    // sr_creates counts successful SR creation specifically. The current host
-    // does not prove game/injector origin; C6/C7 must supply that provenance.
-    // evaluates/create_failures span feature types and are deliberately unused.
-    dlss.unknown_creates = ngx.sr_creates;
-    dlss.injector_creates = backend.features_created;
+    // Only explicitly unmarked creations remain unknown. Marked backend calls
+    // are counted once through C6, even when the NGX observer also saw them.
+    dlss.unknown_creates = ngx.sr_creates_unknown;
+    // These producers overlap and can reset at different times. Keep the
+    // larger observed count as evidence, never sum them as distinct creations.
+    dlss.injector_creates = (std::max)(backend.features_created, ngx.sr_creates_injector);
     dlss.injector_evaluates = backend.evaluates;
     auto& f = snapshot[1];
     f.observer_available = fsr.hooked_functions != 0;

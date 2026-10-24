@@ -17,7 +17,7 @@
 // evaluation that used it (Gate 2 R-301). Each tracked evaluation has its own
 // fence, so work on independent queues can never vouch for another queue
 // (Gate 1 R-202). A use whose completion can never be proven (never seen
-// submitted, Signal failed, or no free record) marks the feature tainted for
+// submitted, or Signal failed) marks the feature tainted for
 // good: it is released only at Shutdown. Every created handle stays owned
 // until it is released exactly once (R-305): when no feature slot is free, a
 // new feature is refused for that frame instead.
@@ -29,10 +29,11 @@
 // view's evaluations are submitted on different queues, BeforeExecute() makes
 // the later submission's queue wait (GPU-side) for the earlier evaluation, so
 // one history is never used concurrently (Gate 2 R-303). Frames recorded
-// ahead on separate lists are fine when submitted in order (same submission or
-// later ones); a frame submitted BEFORE its predecessor cannot be reordered, so
-// it is counted (order_violations) and the view's next frame resets. An
-// untracked use retires its feature so the next frame gets separate state.
+// ahead on separate lists use separate features with reset history while the
+// predecessor is unsubmitted. This permits reversed submission without racing
+// one feature's mutable GPU state. Completion-record exhaustion refuses before
+// recording NGX work. Command lists must not be reset/replayed before tracking
+// their submission and completion; raw list identity is not a recording epoch.
 // Ordering applies per feature: a view that moves to a new feature starts
 // from reset and is not ordered against the old one.
 // The caller keeps every input/output resource alive until its submission
@@ -166,6 +167,11 @@ bool Attach(ID3D12Device* device, const Api& api);
 void Shutdown();
 
 Capabilities GetCapabilities();
+// ARGON-G2-004: which device the backend runs on, and whether that device has
+// been removed (the game will recreate it). After removal no GPU work can be
+// pending, so Shutdown() is safe and the backend can start again on the new one.
+bool IsBoundTo(ID3D12Device* device);
+bool BoundDeviceRemoved();
 bool QueryOptimal(uint32_t out_w, uint32_t out_h, Quality q, OptimalSettings* out);
 
 // Records DLSS into `list` (open, DIRECT or COMPUTE). Creates or recreates the
@@ -199,6 +205,8 @@ void SetDeviceRemovedProbeForTests(bool (*removed)(ID3D12Device* device));
 // The source of `view_id` is gone (e.g. its FSR/XeSS context was destroyed):
 // its feature is retired (released once its uses complete) and the id forgotten.
 void ReleaseView(uint64_t view_id);
+// Test synchronization point before ReleaseView acquires the backend lock.
+void SetReleaseViewHookForTests(void (*hook)());
 
 struct Stats {
     uint64_t evaluates = 0;         // successful EvaluateFeature calls
@@ -208,7 +216,7 @@ struct Stats {
     uint64_t features_leaked = 0;   // retired with a use that can never be proven complete; freed only at Shutdown
     uint64_t rejected = 0;          // Evaluate calls refused by validation (incl. wrong device)
     uint64_t untracked = 0;         // evaluations with no free completion record (taint their feature)
-    uint64_t refused_busy = 0;      // frames refused because every feature slot is still owned
+    uint64_t refused_busy = 0;      // frames refused because feature/completion capacity is full
     uint64_t order_violations = 0;  // a view's frame submitted before its previous one: next frame resets
     uint64_t queue_waits = 0;       // GPU waits added to order a view across queues
     uint32_t views_active = 0;

@@ -57,6 +57,7 @@ VOID CALLBACK LdrNotify(ULONG reason, const LdrLoaded* data, PVOID)
 
 DWORD WINAPI Worker(LPVOID)
 {
+    std::vector<Pending> done; // worker-only: (module, installer) pairs already installed
     while (!g_stop.load(std::memory_order_acquire)) {
         WaitForSingleObject(g_event, 1000);
         std::vector<Pending> work;
@@ -65,10 +66,16 @@ DWORD WINAPI Worker(LPVOID)
             work.swap(g_pending);
         }
         for (const Pending& p : work) {
+            bool seen = false; // pinned modules never unload, so a base address is stable
+            for (const Pending& d : done) seen = seen || (d.module == p.module && d.install == p.install);
+            if (seen) continue;
             HMODULE pinned = nullptr; // keep the module mapped while hooked
             before_loader_call();
             if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(p.module), &pinned))
+            {
+                done.push_back(p);
                 p.install(pinned);
+            }
         }
     }
     return 0;
@@ -120,8 +127,16 @@ bool AddModuleWatch(const wchar_t* const* names, InstallFn install)
     if (!names || !install) return false;
     std::lock_guard<std::mutex> start_lock(g_start_m);
     if (!start_locked_free()) return false;
-    // R-302: look modules up BEFORE taking g_m (GetModuleHandleW takes the
-    // loader lock; the notification callback holds the loader lock and wants g_m).
+    // R-308: register the watch FIRST, so a module that loads at any point
+    // after this is seen by the notification callback; then look up modules
+    // that were already loaded. A module caught by both is queued twice and
+    // the worker installs it once.
+    {
+        WatchLock lock;
+        g_watches.push_back({names, install});
+    }
+    // R-302: the lookups run WITHOUT g_m (GetModuleHandleW takes the loader
+    // lock; the notification callback holds the loader lock and wants g_m).
     std::vector<HMODULE> already;
     for (const wchar_t* const* k = names; *k; ++k) {
         before_loader_call();
@@ -129,7 +144,6 @@ bool AddModuleWatch(const wchar_t* const* names, InstallFn install)
     }
     {
         WatchLock lock;
-        g_watches.push_back({names, install});
         for (HMODULE m : already) g_pending.push_back({m, install});
     }
     SetEvent(g_event);
