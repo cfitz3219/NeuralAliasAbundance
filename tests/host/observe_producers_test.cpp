@@ -62,6 +62,7 @@ uint32_t CountKind(uint32_t kind)
 
 int main()
 {
+    SetEnvironmentVariableW(L"NEURALALIAS_OBSERVE_TRACE", L"1");
     test::Device d;
     if (!test::CreateDevice(d)) return test::SkipNoDevice("observe_producers_test");
     ID3D12Device* dev = d.device.Get();
