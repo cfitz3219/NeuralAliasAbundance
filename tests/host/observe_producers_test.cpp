@@ -321,4 +321,3 @@ int main()
     CHECK(st.unresolved_handles == 0);
     return test::finish("observe_producers_test");
 }
-
