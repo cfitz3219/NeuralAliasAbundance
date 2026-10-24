@@ -311,26 +311,27 @@ int main()
     std::vector<test::List> keep; // lists recorded but deliberately never executed stay alive
     keep.reserve(64);
 
-    // R-301: two uses of ONE feature; the later one completes on queue B while
-    // the earlier one is held on queue A. Resizing must not release it.
+    // R-301: two uses of ONE feature, the earlier held on queue A, the later
+    // submitted on queue B (which, by R-303, waits for A). Resizing while both
+    // are outstanding must not release the feature.
     {
         test::ComPtr<ID3D12Fence> hold2;
         REQUIRE(SUCCEEDED(d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&hold2))));
         test::List la, lb;
         REQUIRE(Record(d, la, view_desc(1, 1920, 1080)));
         const uintptr_t hf = fake::last_eval_handle;
-        REQUIRE(Record(d, lb, view_desc(1, 1920, 1080)));
-        CHECK(fake::last_eval_handle == hf); // same feature
         REQUIRE(SUCCEEDED(d.queue->Wait(hold2.Get(), 1)));
         Submit(d.queue.Get(), la);
+        REQUIRE(Record(d, lb, view_desc(1, 1920, 1080)));
+        CHECK(fake::last_eval_handle == hf); // same feature
         Submit(q2.Get(), lb);
-        test::SignalAndWait(q2.Get(), q2_fence.Get(), q2_value, d.event, d.device.Get(), "queue B");
         kick(q2.Get());
         keep.emplace_back();
         REQUIRE(Record(d, keep.back(), view_desc(1, 2560, 1440))); // resize -> hf retired
-        CHECK(!fake::Released(hf));                                 // A still holds a use
+        CHECK(!fake::Released(hf));                                 // both uses still pending
         CHECK(na::dlss::GetStats().features_pending == 1);
         REQUIRE(SUCCEEDED(hold2->Signal(1)));
+        test::SignalAndWait(q2.Get(), q2_fence.Get(), q2_value, d.event, d.device.Get(), "queue B");
         d.WaitIdle();
         kick(d.queue.Get());
         CHECK(fake::Released(hf));
@@ -340,11 +341,13 @@ int main()
         keep.emplace_back();
         REQUIRE(Record(d, keep.back(), view_desc(2, 1920, 1080))); // never executed
         const uintptr_t hf = fake::last_eval_handle;
-        test::List lt;
+        for (int i = 0; i < 600; ++i) kick(d.queue.Get()); // the unexecuted record is abandoned
+        test::List lt; // R-303: allowed again once the unsubmitted predecessor is abandoned
         REQUIRE(Record(d, lt, view_desc(2, 1920, 1080)));
+        CHECK(fake::last_eval_handle == hf);
         Submit(d.queue.Get(), lt);
         d.WaitIdle();
-        for (int i = 0; i < 600; ++i) kick(d.queue.Get()); // the unexecuted record is abandoned
+        kick(d.queue.Get());
         const uint64_t leaked = na::dlss::GetStats().features_leaked;
         test::List lr;
         REQUIRE(Record(d, lr, view_desc(2, 2560, 1440)));
@@ -356,13 +359,18 @@ int main()
     }
     // R-301: an UNTRACKED use (no free completion record) taints its feature for good.
     {
+        // More evaluations than completion records, all on ONE list (R-303
+        // allows that) which is never executed.
         uintptr_t hf = 0;
-        for (int i = 0; i < 40; ++i) { // more evaluations than completion records, none executed
-            keep.emplace_back();
-            REQUIRE(Record(d, keep.back(), view_desc(3, 1920, 1080)));
+        keep.emplace_back();
+        REQUIRE(keep.back().Create(d.device.Get()));
+        const uint64_t untracked0 = na::dlss::GetStats().untracked;
+        for (int i = 0; i < 40 && na::dlss::GetStats().untracked == untracked0; ++i) {
+            REQUIRE(na::dlss::Evaluate(keep.back().list.Get(), view_desc(3, 1920, 1080)));
             hf = fake::last_eval_handle;
         }
-        CHECK(na::dlss::GetStats().untracked > 0);
+        keep.back().list->Close();
+        CHECK(na::dlss::GetStats().untracked == untracked0 + 1);
         for (int i = 0; i < 600; ++i) kick(d.queue.Get()); // free the records again
         test::List lr;
         REQUIRE(Record(d, lr, view_desc(3, 2560, 1440)));
