@@ -515,7 +515,7 @@ int main()
         CHECK(inits.load() == 1);
         CHECK(na::dlss::EnsureOn(d.device.Get(), L".")); // already running here
         // Another LIVE device never takes DLSS over.
-        ID3D12Device* other = reinterpret_cast<ID3D12Device*>(0x1234);
+        ID3D12Device* other = reinterpret_cast<ID3D12Device*>(static_cast<uintptr_t>(0x1234));
         na::dlss::SetDeviceRemovedProbeForTests([](ID3D12Device*) { return false; });
         CHECK(!na::dlss::EnsureOn(other, L"."));
         CHECK(na::dlss::GetCapabilities().attached && inits.load() == 1);
