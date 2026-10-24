@@ -458,7 +458,19 @@ typedef struct na_root_param {
     uint32_t range_type;       /* tables: first range D3D12_DESCRIPTOR_RANGE_TYPE, else NA_UNKNOWN_U32 */
     uint32_t range_descriptors;/* tables: first range descriptor count (UINT_MAX = unbounded) */
     uint32_t _pad;
+    /* 0.2 amendment (C8 review): every range of a table, see na_root_range. */
+    uint32_t first_range;      /* tables: index of its first range in the event's range array */
+    uint32_t _pad2;
 } na_root_param;
+typedef struct na_root_range {
+    uint32_t range_type;       /* D3D12_DESCRIPTOR_RANGE_TYPE */
+    uint32_t num_descriptors;  /* UINT_MAX = unbounded */
+    uint32_t base_register;
+    uint32_t register_space;
+    uint32_t table_offset;     /* descriptors from the table start, APPEND resolved;
+                                  NA_UNKNOWN_U32 after an unbounded range */
+    uint32_t flags;            /* D3D12_DESCRIPTOR_RANGE_FLAGS (1.1), else 0 */
+} na_root_range;
 typedef struct na_ev_root_signature_created {
     na_event_header hdr;
     na_object_id root_signature;
@@ -469,6 +481,10 @@ typedef struct na_ev_root_signature_created {
     uint32_t param_count;      /* 0 + NA_EVF_METHOD_UNOBSERVED when not decodable */
     uint32_t params_offset;
     uint32_t param_stride;     /* >= sizeof(na_root_param) */
+    uint32_t range_count;      /* all tables' ranges, in parameter order */
+    uint32_t ranges_offset;
+    uint32_t range_stride;     /* >= sizeof(na_root_range) */
+    uint32_t _pad;
 } na_ev_root_signature_created;
 
 typedef enum na_shader_stage {
@@ -516,11 +532,14 @@ typedef struct na_ev_pipeline_created {
  *   EXECUTE_BUNDLE          a0 bundle list id; contents unobserved (flag set)
  *   COPY_RESOURCE           a0 dst, a1 src
  *   COPY_BUFFER_REGION      a0 dst, a1 dst offset, a2 src, a3 src offset, a4 bytes
- *   COPY_TEXTURE_REGION     a0 dst, a1 dst subresource (NA_UNKNOWN_U32 = footprint), a2 src, a3 src subresource
+ *   COPY_TEXTURE_REGION     a0 dst, a1 dst subresource (NA_UNKNOWN_U32 = footprint), a2 src, a3 src subresource;
+ *                           payload = 1 na_copy_region (destination point, source box, footprint offsets)
  *   RESOLVE                 a0 dst, a1 dst sub, a2 src, a3 src sub, a4 format
  *   RESOURCE_BARRIER        a0 barrier count; payload = na_barrier array
- *   RS_VIEWPORT             a0 count; a1 = x|y (float bits lo/hi), a2 = w|h, a3 = min|max depth
- *   RS_SCISSOR              a0 count; a1 = left|top, a2 = right|bottom (int32 lo/hi)
+ *   RS_VIEWPORT             a0 count; a1 = x|y (float bits lo/hi), a2 = w|h, a3 = min|max depth (first);
+ *                           payload = every viewport as 6 floats (x, y, w, h, min, max)
+ *   RS_SCISSOR              a0 count; a1 = left|top, a2 = right|bottom (int32 lo/hi) (first);
+ *                           payload = every rectangle as 4 int32 (left, top, right, bottom)
  * Ops recorded while the list's current implementation is not fully hooked,
  * or before its Reset was observed, carry NA_EVF_METHOD_UNOBSERVED. */
 typedef enum na_list_op_code {
@@ -541,6 +560,13 @@ typedef struct na_view_ref {       /* a descriptor as used, resolved at record t
     uint32_t format;
     uint32_t first_subresource;
 } na_view_ref;
+typedef struct na_copy_region {
+    uint32_t dst_x, dst_y, dst_z;
+    uint32_t has_box;              /* 0 = whole source */
+    uint32_t box[6];               /* left, top, front, right, bottom, back */
+    uint64_t dst_footprint_offset; /* footprint copies (subresource UNKNOWN) */
+    uint64_t src_footprint_offset;
+} na_copy_region;
 typedef struct na_barrier {
     uint32_t barrier_type;         /* D3D12_RESOURCE_BARRIER_TYPE */
     uint32_t barrier_flags;        /* D3D12_RESOURCE_BARRIER_FLAGS */
@@ -568,7 +594,11 @@ typedef struct na_ev_list_op {
  * application's own CPU mapping of an UPLOAD-heap buffer. The application may
  * still be writing that memory: every snapshot is APP_SYNC_UNKNOWN; it is
  * never an atomic or execution-time capture. GPU-written memory is not
- * captured (status GPU_WRITTEN). */
+ * captured (status GPU_WRITTEN). The snapshot is taken at the occurrence's
+ * ENTRY, before its ordering is final: queue_ticket names the occurrence, and
+ * its NA_EV_QUEUE_EXECUTE (plus any ORDER_AMBIGUITY_RANGE) is authoritative
+ * for ordering; a snapshot never proves clean ordering on its own. Every
+ * binding is reported separately (no de-duplication across bindings). */
 typedef enum na_snapshot_binding {
     NA_SNAP_ROOT_CBV = 1,      /* SET_ROOT_VIEW (CBV) */
     NA_SNAP_TABLE_CBV = 2      /* CBV descriptor reached through SET_ROOT_TABLE */
