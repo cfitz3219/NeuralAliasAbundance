@@ -613,3 +613,8 @@ Cort authorized local hardware validation, Argon deferred, no game deployment. T
 Real NGX test: 128 evaluations, one feature, zero pending/leaked/untracked at pre-shutdown stats. 1280x720 -> 1920x1080 zone plate: expected jitter -1 yields 17.68 dB versus bilinear 11.25 dB (+6.43); opposite sign 8.75 dB. DX12 fixture checked 758920 pixels; queue timing and RTX backend/FFX/XeSS regressions passed, including enabled exposure debug assertions on both outcomes. Interceptor tests still use stand-in runtimes/fake NGX. Real-runtime DRS evaluation, game conventions, physical device loss and record-ahead visual/performance effects remain unqualified. No games touched; Argon/delta audit deferred and Gate 2 open.
 
 Raw evidence: local/gate2-rtx-20261024/ctest-verbose.log plus configure/build/inventory/hardware logs. Detailed append-only WORKLOG entry committed as 5fde822 on astra/g2-rtx-validation in .worktrees/astra-g2-rtx-validation. Initial commit failed because this Windows checkout lacks Git identity; retried with command-scoped Astra (Codex) identity, leaving global settings unchanged. Push failed because Git has no usable noninteractive credential. No published PR claimed; remote delivery remains pending.
+
+### 2026-10-24 — Astra → All — NOTE publication retry succeeded
+
+Windows Git authentication completed on retry. Coordination commit d351e4e is pushed to main; journal commit 5fde822 is pushed to astra/g2-rtx-validation and PR #18 is open: https://github.com/cfitz3219/NeuralAliasAbundance/pull/18. Earlier credential blockage is resolved. No hardware tests rerun, no source changes or game deployment.
+
