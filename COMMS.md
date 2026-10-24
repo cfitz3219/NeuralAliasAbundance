@@ -581,3 +581,17 @@ Cort reported #17 was not mergeable after earlier task PRs were merged into main
 ### 2026-10-24 — Astra — audit of GitHub Accept Both conflict resolutions
 
 Cort reported repeatedly using Accept Both during merges. Inspected the recent #12/#14/#16/#13 merge commits and the manual resolution c9d084f using git show --remerge-diff. The manual resolution concatenated both tests/cpu/CMakeLists.txt alternatives with only one trailing endif, leaving the Windows/menu if unclosed and incorrectly nesting fixture registration. The WORKLOG alternatives were independent entries and were retained safely. The other four inspected PR merge commits introduced no additional manual-resolution delta. PR #17 at 0b2ee86 already corrects the CMake blocks; all source/build/test files match the validated 7b0339a tree and fresh local tests passed 9/9. No further source patch is needed for this finding. Main still needs #17's correction; prior merges need not be undone.
+
+### 2026-10-24 — Astra — complete PR #12–#16 conflict-resolution rescan
+
+Cort clarified that Accept Both was used on earlier task PRs, and requested all of #12–#16 be rescanned. Fetched all branch refs and checked each PR's actual base, head, merge commit, and resulting main tree. Examined all 13 merge commits in their combined head histories since baseline 69ba732 with --remerge-diff, including earlier branch synchronization merges, rather than only the final GitHub merge commits.
+
+| PR | Result |
+|---|---|
+| #12, head 1973c43 / merge 755deb5 | No additional manual-resolution damage found. Fixture inclusion was subsequently broken by #13's CMake combination, not this merge. |
+| #13, head c9d084f / merge bcbd0ac | Confirmed Accept Both-style removal of markers joined two if blocks with only one endif. Journal concatenation safely retained both entries. PR #17 already restores separate complete fixture and menu blocks. Earlier merges 9fb8bf6 and 6579108 have no manual-resolution delta. |
+| #14, head d9fee42 / merge d4bb950 | No additional manual-resolution damage found. Known backend implementation findings remain addressed in #17. |
+| #15, head ba1bf6f / merge 5c6edc0 | Important integration issue: base was claude/c6-dlss-backend, not main. It merged after #14 reached main, so 5c6edc0 is not in main's ancestry. Main acquired an older C7 snapshot through A4; latest loader-watch, native-success history, lock and BeforeExecute wiring fixes were absent. #17 includes the latest C7 head and preserves/completes these fixes. This is a branch-target/timing issue, not evidence of Accept Both damage. |
+| #16, head 70e6f99 / merge 30340e1 | No additional manual-resolution damage found; complete missing-runtime Streamline regression retained. |
+
+The other nonempty historical remerge delta was Claude's 4f96db5, which deliberately selects the newer per-view/per-feature backend over obsolete singleton fields; it is not blind concatenation. All five PR heads are ancestors of #17. Its runtime/build/test files remain identical to validated 7b0339a. Refreshed CI at 0b2ee86 is green for both push 40084121073 and PR 40084123692: Linux and both Windows configurations. No new source patch is required beyond existing #17; main still needs those repairs. This audit concerns merge damage/integration, not a claim that tests prove every runtime behavior.
