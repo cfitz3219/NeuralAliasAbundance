@@ -218,7 +218,7 @@ if(NA_HAVE_NGX_LIB)
 endif()
 set(NA_XESS_INCLUDE "" CACHE PATH "Intel XeSS SDK inc dir (xess/xess_d3d12.h), ABI cross-check only")
 if(NOT NA_XESS_INCLUDE AND EXISTS "${NA_SDK_ROOT}/xess/inc/xess/xess_d3d12.h")
-  set(NA_XESS_INCLUDE "${NA_SDK_ROOT}/xess/inc")
+  set(NA_XESS_INCLUDE "${NA_SDK_ROOT}/xess/inc" CACHE PATH "Intel XeSS SDK inc dir (xess/xess_d3d12.h), ABI cross-check only" FORCE)
 endif()
 message(STATUS "DLSS backend (C6): headers=${NA_HAVE_NGX_SDK}  own NGX instance=${NA_HAVE_NGX_LIB}  nvngx_dlss.dll='${NA_DLSS_DLL}'")
 
