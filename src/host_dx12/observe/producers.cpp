@@ -380,7 +380,6 @@ uint32_t descriptor_increment(ID3D12Device* dev, D3D12_DESCRIPTOR_HEAP_TYPE type
 #define NA_ORIG(name, ret, ...) using name##_fn = ret(STDMETHODCALLTYPE*)(__VA_ARGS__); name##_fn o_##name = nullptr
 
 NA_ORIG(CreateCommandQueue, HRESULT, ID3D12Device*, const D3D12_COMMAND_QUEUE_DESC*, REFIID, void**);
-NA_ORIG(CreateCommandAllocator, HRESULT, ID3D12Device*, D3D12_COMMAND_LIST_TYPE, REFIID, void**);
 NA_ORIG(CreateCommandList, HRESULT, ID3D12Device*, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator*, ID3D12PipelineState*, REFIID, void**);
 NA_ORIG(CreateCommandList1, HRESULT, ID3D12Device4*, UINT, D3D12_COMMAND_LIST_TYPE, D3D12_COMMAND_LIST_FLAGS, REFIID, void**);
 NA_ORIG(CreateDescriptorHeap, HRESULT, ID3D12Device*, const D3D12_DESCRIPTOR_HEAP_DESC*, REFIID, void**);
@@ -433,14 +432,6 @@ HRESULT STDMETHODCALLTYPE D_CreateCommandQueue(ID3D12Device* dev, const D3D12_CO
     return hr;
 }
 
-HRESULT STDMETHODCALLTYPE D_CreateCommandAllocator(ID3D12Device* dev, D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out)
-{
-    Depth depth;
-    const HRESULT hr = o_CreateCommandAllocator(dev, type, riid, out);
-    if (IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr) register_object(obj, NA_OBJ_ALLOCATOR); // id only: ABI 0.1 has no allocator event
-    return hr;
-}
-
 void list_created(ID3D12Device* dev, IUnknown* obj, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* alloc, bool open)
 {
     const na_object_id dev_id = device_id(dev);
@@ -448,7 +439,10 @@ void list_created(ID3D12Device* dev, IUnknown* obj, D3D12_COMMAND_LIST_TYPE type
     init_header(e, NA_EV_LIST_CREATED, NA_EVF_FOUNDATIONAL);
     e.list = register_object(obj, NA_OBJ_LIST);
     e.device = dev_id;
-    e.initial_allocator = alloc ? lookup(alloc) : 0;
+    // Allocators have no creation event in ABI 0.1; they get an id when first used.
+    na_object_id alloc_id = alloc ? lookup(alloc) : 0;
+    if (alloc && !alloc_id) alloc_id = register_object(alloc, NA_OBJ_ALLOCATOR);
+    e.initial_allocator = alloc_id;
     e.list_type = type;
     e.is_bundle = type == D3D12_COMMAND_LIST_TYPE_BUNDLE ? 1u : 0u;
     e.initially_open = open ? 1u : 0u;
@@ -895,7 +889,7 @@ bool InstallProducers(ID3D12Device* device, ID3D12CommandQueue* queue, bool hook
         device->QueryInterface(__uuidof(ID3D12Device4), reinterpret_cast<void**>(&d4));
         device->QueryInterface(__uuidof(ID3D12Device8), reinterpret_cast<void**>(&d8));
 #define NA_HOOK(obj, ns, name, req) hook(obj, sl::ns::name, fn(&D_##name), reinterpret_cast<void**>(&o_##name), req)
-        bool ok = NA_HOOK(device, device, CreateCommandQueue, true) && NA_HOOK(device, device, CreateCommandAllocator, true) &&
+        bool ok = NA_HOOK(device, device, CreateCommandQueue, true) &&
                   NA_HOOK(device, device, CreateCommandList, true) && NA_HOOK(device, device, CreateDescriptorHeap, true) &&
                   NA_HOOK(device, device, CreateConstantBufferView, true) && NA_HOOK(device, device, CreateShaderResourceView, true) &&
                   NA_HOOK(device, device, CreateUnorderedAccessView, true) && NA_HOOK(device, device, CreateRenderTargetView, true) &&
