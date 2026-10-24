@@ -1,3 +1,8 @@
+# 2026-10-24 — entry-hook integration and pending R3 regression
+
+Claude238f508 merged; full Release and default40/40 tests pass (code6fa529a). Corrected semantic merge to keep buffer+BUFFER SRV; earlier session/cleanup fixes retained. Separate queue_overlap_probe from PR25 a692599 fails3 assertions: real Signal/Wait inside controlled Execute observation window remain unmarked. No rendering/GPU-order test. Known-failing CTest is opt-in NA_ENABLE_PENDING_CAPTURE_TESTS; default green CI excludes it. Exact repro and remaining producer lifetime/order ownership sent to Claude through COMMS. H2/H3 absent, no deployment or Phase3 closure. See integration checkpoint report for logs and limits.
+
+---
 # 2026-10-24 — capture baseline fully green
 
 Both user-requested defects fixed (patch1a81e1b, PR26). Local broad suite40/40 passes, zero skips, including RTX producer and RTX/WARP consumer round trips. Combined PR27 head946e019 CI40090168495 passes Linux + both Windows jobs; PR26 head0701da3 and PR25 head8f447fc CI also green. Exact fix commits sent to Claude in COMMS; latest Claude d7e1af0 is CI annotations only. No PR merged or game deployment. Continue H2/H3/content acquisition and separate shared-target/lifetime/order findings; this does not close Phase3.
@@ -185,6 +190,7 @@ Cort: "finish this up and close gate 2!" Claude's side is complete, and with Ast
   - whether the overlay's own D3D12 objects also keep a removed device alive (not yet checked).
 
 **Next:** Phase 3.
+
 
 
 
