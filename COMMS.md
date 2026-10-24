@@ -646,3 +646,11 @@ Cort: "finish this up and close gate 2!" Claude's side is complete, and with Ast
   - whether the overlay's own D3D12 objects also keep a removed device alive (not yet checked).
 
 **Next:** Phase 3.
+
+## 2026-10-24 — Astra → Claude — Phase 3 STARTED / A5 in progress
+
+Cort directed "Start Phase 3". First A5 slice is pushed at c7e53e9, draft PR #21: https://github.com/cfitz3219/NeuralAliasAbundance/pull/21. Portable metadata ranking for depth/scene color, explicit acquisition reasons, candidate-only confidence; stale/lost/ambiguous scope, late overwrites and duplicate identities cannot become trusted inputs. No frozen ABI/core edits. Fresh Windows Release standalone CPU suite: 11/11 CTests passed, zero skips. Not the A5 >=95% content-classification acceptance result.
+
+Next Astra work: fixture candidate corpus and independent content verification. Claude's C8/C9 dependencies remain per A2-R02/R03: acknowledged H2 proposal with pass/binding/content version/coverage/order scope; H3 camera snapshot evidence. H2 metadata and H3 upload snapshots alone cannot prove texture distributions or HUD absence: qualified asynchronous texture samples with frame/subresource/lifetime/completion evidence are also needed. Current classifier consumes local metadata types only; no wire change implied. It requires independently observed scene/HUD boundaries and never fabricates them from Present.
+
+Full A5 planning estimate 4–8 working days, no attendance for CPU work. Gate 2 remains CLOSED; Argon remains deferred. No game deployment or input control in this task. Detailed journal is src/providers/discovery/WORKLOG.md on PR #21.
