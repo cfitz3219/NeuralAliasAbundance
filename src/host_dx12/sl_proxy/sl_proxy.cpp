@@ -175,6 +175,20 @@ Fwd5 resolve_fwd(const char* name)
     if (!real) real = LoadLibraryW(L"sl_interposer_real.dll");
     return real ? reinterpret_cast<Fwd5>(reinterpret_cast<void*>(GetProcAddress(real, name))) : nullptr;
 }
+// Resolution is retried until it succeeds (a failed lookup is never cached).
+Fwd5 cached_fwd(std::atomic<Fwd5>& slot, const char* name)
+{
+    Fwd5 f = slot.load(std::memory_order_acquire);
+    if (!f && (f = resolve_fwd(name)) != nullptr) slot.store(f, std::memory_order_release);
+    return f;
+}
+// Gate 2 R-306: what a wrapper returns when the real Streamline function is
+// missing (no real interposer, or no such export), so nothing ran. It must be
+// a FAILURE for both ABIs without knowing which one the caller uses:
+//   SL 1.x returns bool  -> the caller tests AL:  0x100 has AL == 0  -> false.
+//   SL 2.x returns sl::Result -> the caller tests EAX against eOk (0):
+//                           0x100 != 0 -> an error (no defined Result uses 256).
+constexpr uint64_t kNotExecuted = 0x100;
 
 // Guarded copies (no C++ objects in these frames: SEH only).
 size_t guarded_copy(void* dst, const void* src, size_t n)
@@ -212,14 +226,16 @@ extern "C" __declspec(dllexport) uint64_t __cdecl slInit(uintptr_t prefs, uintpt
     // hook the NGX core here, on the game thread, outside the loader lock.
     if (observe_enabled(nullptr, 0, nullptr, 0) && na::hooking::Initialize())
         na::ngx::PreloadAndHookNgxCore();
-    static Fwd5 real = resolve_fwd("slInit");
-    return real ? real(prefs, app_or_sdk_version, c, d, e) : 0;
+    static std::atomic<Fwd5> real_slot{nullptr};
+    const Fwd5 real = cached_fwd(real_slot, "slInit");
+    return real ? real(prefs, app_or_sdk_version, c, d, e) : kNotExecuted;
 }
 
 extern "C" __declspec(dllexport) uint64_t __cdecl slSetConstants(uintptr_t constants, uintptr_t frame, uintptr_t view, uintptr_t d, uintptr_t e)
 {
-    static Fwd5 real = resolve_fwd("slSetConstants");
-    if (!real) return 0;
+    static std::atomic<Fwd5> real_slot{nullptr};
+    const Fwd5 real = cached_fwd(real_slot, "slSetConstants");
+    if (!real) return kNotExecuted;
     const uint64_t ret = real(constants, frame, view, d, e);
     if (!constants) return ret;
     // Which ABI? Only 2.x Constants carry the Constants type GUID.
@@ -254,8 +270,9 @@ extern "C" __declspec(dllexport) uint64_t __cdecl slSetConstants(uintptr_t const
 
 extern "C" __declspec(dllexport) uint64_t __cdecl slEvaluateFeature(uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e)
 {
-    static Fwd5 real = resolve_fwd("slEvaluateFeature");
-    if (!real) return 0;
+    static std::atomic<Fwd5> real_slot{nullptr};
+    const Fwd5 real = cached_fwd(real_slot, "slEvaluateFeature");
+    if (!real) return kNotExecuted;
     // 1.x: (void* list, Feature, uint32 frame, uint32 viewport): the explicit
     // frame/viewport scope lets the NGX evaluate find this frame's camera.
     // 2.x: (Feature, const FrameToken&, inputs**, uint32, CommandBuffer*): the
@@ -274,24 +291,36 @@ extern "C" __declspec(dllexport) uint64_t __cdecl slEvaluateFeature(uintptr_t a,
 
 extern "C" __declspec(dllexport) uint64_t __cdecl slSetFeatureConstants(uintptr_t feature, uintptr_t consts, uintptr_t c, uintptr_t d, uintptr_t e)
 {
-    static Fwd5 real = resolve_fwd("slSetFeatureConstants");
+    static std::atomic<Fwd5> real_slot{nullptr};
+    const Fwd5 real = cached_fwd(real_slot, "slSetFeatureConstants");
     if (observe_enabled(nullptr, 0, nullptr, 0)) {
         void* frames[24] = {};
         USHORT n = RtlCaptureStackBackTrace(1, 24, frames, nullptr);
         na::ngx::RecordSlCall(1, static_cast<uint32_t>(feature), reinterpret_cast<const void*>(consts), frames, n);
     }
-    return real ? real(feature, consts, c, d, e) : 0;
+    return real ? real(feature, consts, c, d, e) : kNotExecuted;
 }
 
 extern "C" __declspec(dllexport) uint64_t __cdecl slGetFeatureSettings(uintptr_t feature, uintptr_t consts, uintptr_t settings, uintptr_t d, uintptr_t e)
 {
-    static Fwd5 real = resolve_fwd("slGetFeatureSettings");
+    static std::atomic<Fwd5> real_slot{nullptr};
+    const Fwd5 real = cached_fwd(real_slot, "slGetFeatureSettings");
     if (observe_enabled(nullptr, 0, nullptr, 0)) {
         void* frames[24] = {};
         USHORT n = RtlCaptureStackBackTrace(1, 24, frames, nullptr);
         na::ngx::RecordSlCall(2, static_cast<uint32_t>(feature), reinterpret_cast<const void*>(consts), frames, n);
     }
-    return real ? real(feature, consts, settings, d, e) : 0;
+    return real ? real(feature, consts, settings, d, e) : kNotExecuted;
+}
+
+// Gate 2 R-307 diagnostics: the camera recorded for (engine frame + 1, viewport),
+// copied into `out` (sizeof(na::fg::Camera) bytes). False when none was stored.
+extern "C" __declspec(dllexport) bool NeuralAliasSLProxyFindCamera(uint64_t frame_plus_one, uint32_t viewport, void* out)
+{
+    na::fg::Camera c{};
+    if (!out || !na::fg::FindCamera(frame_plus_one, viewport, c)) return false;
+    memcpy(out, &c, sizeof(c));
+    return true;
 }
 
 // C7b diagnostics: which Streamline Constants ABI this game uses (0 unknown,

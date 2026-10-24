@@ -45,6 +45,20 @@ na_host_test(sl_proxy_test SOURCES sl_proxy_test.cpp LIBS user32
              ARGS "$<TARGET_FILE:NeuralAliasSLProxy>" "$<TARGET_FILE:sl_interposer_real>")
 add_dependencies(sl_proxy_test NeuralAliasSLProxy sl_interposer_real)
 
+# Gate 2 R-306: missing real exports must not look like success to 1.x or 2.x
+# callers. The minimal stand-in and the test exe share their own folder, so
+# the proxy's sl_interposer_real.dll lookup (exe folder first) finds this one.
+add_library(sl_interposer_real_min SHARED sl_stub_min.cpp)
+set_target_properties(sl_interposer_real_min PROPERTIES PREFIX "" OUTPUT_NAME sl_interposer_real
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/slmin" LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/slmin"
+  ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/slmin")
+target_link_libraries(sl_interposer_real_min PRIVATE abundance_options)
+na_host_test(sl_proxy_missing_test SOURCES sl_proxy_missing_test.cpp LIBS user32
+             ARGS "$<TARGET_FILE:NeuralAliasSLProxy>")
+set_target_properties(sl_proxy_missing_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/slmin")
+add_dependencies(sl_proxy_missing_test NeuralAliasSLProxy sl_interposer_real_min)
+
+
 na_host_test(capture_test SOURCES capture_test.cpp LIBS host_capture
              ARGS "${CMAKE_CURRENT_BINARY_DIR}/capture-test-out")
 

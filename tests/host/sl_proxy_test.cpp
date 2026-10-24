@@ -12,6 +12,7 @@
 //      resolve cleanly instead of crashing: per-export lazy resolution.
 // Usage: sl_proxy_test <sl.interposer.dll> <sl_interposer_real.dll>
 #include "test_support.hpp"
+#include "host_dx12/fg/camera.hpp"
 
 #include <cstddef>
 #include <cstring>
@@ -21,6 +22,27 @@
 
 namespace {
 struct StubState { uint32_t inits, set_consts, get_settings, set_constants, evaluates; uint32_t last_feature, last_frame, last_id; const void* last_ptr; uint64_t wide[5]; };
+
+// A camera fg::ValidCamera accepts: inverse matrix pairs, finite values, 0/1 flags.
+na::fg::Camera ValidTestCamera(float seed)
+{
+    na::fg::Camera c{};
+    const float s = 2.0f + seed;
+    float v2c[16] = {s, 0, 0, 0, 0, s, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    float c2v[16] = {1 / s, 0, 0, 0, 0, 1 / s, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    float id[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    memcpy(c.view_to_clip, v2c, sizeof(v2c));
+    memcpy(c.clip_to_view, c2v, sizeof(c2v));
+    memcpy(c.clip_to_lens, id, sizeof(id));
+    memcpy(c.clip_to_previous, id, sizeof(id));
+    memcpy(c.previous_to_clip, id, sizeof(id));
+    c.jitter[0] = 0.25f; c.jitter[1] = -0.125f;
+    c.motion_scale[0] = 1.f; c.motion_scale[1] = 1.f;
+    c.position[0] = seed; c.forward[2] = 1.f; c.up[1] = 1.f; c.right[0] = 1.f;
+    c.near_plane = 0.1f; c.far_plane = 1000.f; c.fov = 1.0f; c.aspect = 1.777f; c.invalid_motion = 0.f;
+    c.inverted = 1; c.reset = 0; c.jittered = 1;
+    return c;
+}
 
 std::vector<std::string> ExportNames(HMODULE m)
 {
@@ -108,7 +130,9 @@ int wmain(int argc, wchar_t** argv)
     uint32_t settings = 0;
     CHECK(getfs(0, &consts, &settings));
     CHECK(st()->get_settings == 1 && settings == 0x5E77);
-    CHECK(setc(&consts, 11, 0));
+    na::fg::Camera cam1 = ValidTestCamera(1.f); // a COMPLETE 1.x Constants object (R-307)
+    REQUIRE(na::fg::ValidCamera(cam1));
+    CHECK(setc(&cam1, 11, 0));
     CHECK(st()->set_constants == 1 && st()->last_frame == 11);
     CHECK(evalf(nullptr, 1, 12, 0));
     CHECK(st()->evaluates == 1 && st()->last_feature == 1 && st()->last_frame == 12);
@@ -117,7 +141,35 @@ int wmain(int argc, wchar_t** argv)
         auto layout = reinterpret_cast<uint32_t(*)(uint64_t*)>(GetProcAddress(proxy, "NeuralAliasSLProxyLayout"));
         REQUIRE(layout != nullptr);
         uint64_t blocks = 0;
-        CHECK(layout(&blocks) == 1 && blocks == 1); // 1.x constants seen (camera itself invalid -> rejected by FG)
+        CHECK(layout(&blocks) == 1 && blocks == 1);
+        auto find = reinterpret_cast<bool(*)(uint64_t, uint32_t, void*)>(GetProcAddress(proxy, "NeuralAliasSLProxyFindCamera"));
+        REQUIRE(find != nullptr);
+        na::fg::Camera got{};
+        CHECK(find(12, 0, &got)); // stored under engine frame 11 + 1, viewport 0
+        CHECK(got.position[0] == 1.f && got.view_to_clip[0] == 3.f && got.near_plane == 0.1f && got.inverted == 1 && got.jittered == 1);
+        CHECK(!find(12, 1, &got)); // another viewport: nothing
+
+        // Truncated input: an object that ends at an inaccessible page is
+        // rejected (guarded copy fails), never partially decoded.
+        SYSTEM_INFO si{}; GetSystemInfo(&si);
+        uint8_t* pages = static_cast<uint8_t*>(VirtualAlloc(nullptr, si.dwPageSize * 2, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        REQUIRE(pages != nullptr);
+        DWORD old_protect = 0;
+        REQUIRE(VirtualProtect(pages + si.dwPageSize, si.dwPageSize, PAGE_NOACCESS, &old_protect));
+        uint8_t* tail = pages + si.dwPageSize - 100; // 100 readable bytes, a 1.x block needs 432
+        memcpy(tail, &cam1, 100);
+        CHECK(setc(tail, 13, 0));
+        CHECK(layout(&blocks) == 1 && blocks == 1); // not counted
+        CHECK(!find(14, 0, &got));
+        // A 2.x header (Constants GUID) whose body runs into the inaccessible page.
+        uint8_t* tail2 = pages + si.dwPageSize - 64;
+        memset(tail2, 0, 64);
+        const uint8_t cguid_t[16] = {0xd7, 0x5a, 0xd3, 0xdc, 0x4a, 0x4e, 0xad, 0x4b, 0xa9, 0x0c, 0xe0, 0xc4, 0x9e, 0xb2, 0x3a, 0xfe};
+        memcpy(tail2 + 8, cguid_t, 16);
+        CHECK(setc(tail2, 15, 0));
+        CHECK(layout(&blocks) == 1 && blocks == 1);
+        CHECK(!find(16, 0, &got));
+        VirtualFree(pages, 0, MEM_RELEASE);
     }
 
     // 4b. C7b: Streamline 2.x signatures pass through at full width and its
@@ -141,6 +193,11 @@ int wmain(int argc, wchar_t** argv)
         const uint8_t cguid[16] = {0xd7, 0x5a, 0xd3, 0xdc, 0x4a, 0x4e, 0xad, 0x4b, 0xa9, 0x0c, 0xe0, 0xc4, 0x9e, 0xb2, 0x3a, 0xfe};
         memcpy(c2.h.guid, cguid, 16);
         c2.h.version = 2;
+        {   // a valid camera in the 2.x body: same fields, 7 flag bytes, no notRenderingGameFrames
+            const na::fg::Camera cam2 = ValidTestCamera(2.f);
+            memcpy(c2.body, &cam2, sizeof(c2.body));
+            c2.flags[0] = 1; c2.flags[1] = 0; c2.flags[2] = 0; c2.flags[3] = 0; c2.flags[4] = 0; c2.flags[5] = 0; c2.flags[6] = 1;
+        }
         // FrameToken: vtable pointer first (operator uint32_t is entry 0), then BaseStructure.
         struct Token { const void* const* vtbl; Header h; } frame_token{};
         using TokenOp = uint32_t(__cdecl*)(const void*);
@@ -160,6 +217,14 @@ int wmain(int argc, wchar_t** argv)
         CHECK(st()->wide[1] == reinterpret_cast<uintptr_t>(&frame_token) && st()->wide[2] == reinterpret_cast<uintptr_t>(&vp));
         auto layout = reinterpret_cast<uint32_t(*)(uint64_t*)>(GetProcAddress(proxy, "NeuralAliasSLProxyLayout"));
         uint64_t blocks = 0;
+        CHECK(layout(&blocks) == 2 && blocks == 2);
+        auto find2 = reinterpret_cast<bool(*)(uint64_t, uint32_t, void*)>(GetProcAddress(proxy, "NeuralAliasSLProxyFindCamera"));
+        na::fg::Camera got2{};
+        CHECK(find2(78, 3, &got2)); // FrameToken 77 + 1, ViewportHandle value 3
+        CHECK(got2.position[0] == 2.f && got2.view_to_clip[0] == 4.f && got2.inverted == 1 && got2.jittered == 1 && got2.not_game == 0);
+        // A nonzero 2.x runtime error is passed back untouched and nothing is recorded.
+        stub_ret(7);
+        CHECK(setc2(&c2, &frame_token, &vp) == 7);
         CHECK(layout(&blocks) == 2 && blocks == 2);
         stub_ret(1);
     }
