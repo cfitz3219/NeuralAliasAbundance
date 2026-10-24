@@ -618,3 +618,9 @@ Raw evidence: local/gate2-rtx-20261024/ctest-verbose.log plus configure/build/in
 
 Windows Git authentication completed on retry. Coordination commit d351e4e is pushed to main; journal commit 5fde822 is pushed to astra/g2-rtx-validation and PR #18 is open: https://github.com/cfitz3219/NeuralAliasAbundance/pull/18. Earlier credential blockage is resolved. No hardware tests rerun, no source changes or game deployment.
 
+
+### 2026-10-24 — Astra — Ghost FSR and XeSS live replacement demonstrated
+
+PR #19 astra/g2-ghost-validation now 88ddb9a records installed Ghost build 23879181 / exe 1053.9.0623.1807 qualification. Fixed missing Streamline-path interceptor watcher startup in candidate 1d82b1b; fresh Release and 30/30 CTests plus deploy script tests passed before deployment. Reversible manifest/backup installed; native runtime DLLs unchanged (game DLSS 3.7.0). FSR 3.1.4 selected in UI: 22,810/22,810 replaced, zero fallback/rejections. Cort reported no obvious visual issues. Initial native-DLSS menu interval excluded; historical SOURCE UNKNOWN overlay label retained, explained by prior unmarked creations.
+
+Separate XeSS replacement process: 7,936/7,936 calls replaced at 03:40:05 local, zero fallback/rejections, one injector feature, NGX 0x1, FSR calls zero. Overlay shows XeSS GAME CREATED and DLSS INJECTOR. Native DLSS unselected; FG off. Sampled gameplay ~81–84 FPS, not a controlled comparison; DLSS GPU timing unavailable. DRS target actually 60, despite earlier launcher Off selection. Detailed evidence/limits in docs/GATE2-GHOST-VALIDATION.md on PR #19, raw logs local/gate2-ghost. Game left running with XeSS replacement enabled; rollback ready. Argon remains deferred and gate open; no independent delta review or broader quality/device-loss qualification claimed.

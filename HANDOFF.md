@@ -127,3 +127,9 @@ Anno read-only audit: x64 PE; Steam916440build16367353; configuredDX12; FSRUpsca
 
 Read WORKLOG and docs/PROVENANCE before continuing. Old broader DX11 proposal is historical; current project is DX12first. Pursue universal DX12 enhancement through discovery and synthesis; use current task estimates for Anno's discovery rather than the earlier narrow NR prototype estimate.
 
+
+## 2026-10-24 — Ghost Gate 2 live validation milestone
+
+PR #19 / astra/g2-ghost-validation at 88ddb9a contains current report and append-only journal. Candidate 1d82b1b is deployed reversibly to Ghost of Tsushima, build 23879181. FSR 3.1.4: 22,810 successful replacements, zero fallback/rejections; user's visual report no obvious issues. Separate XeSS session: 7,936 successful replacements, zero fallback/rejections; overlay confirms DLSS INJECTOR and XeSS integration. Native DLSS unselected, FG off, Argon deferred. Actual game DRS target 60. Sampled XeSS gameplay ~83 FPS, GPU timing unavailable; no controlled performance/quality comparison. FSR overlay retains unknown historical native-menu evidence, so logs carry its replacement proof.
+
+Game currently running XeSS with xess.replace=1 / fsr.replace=0. Original Streamline backed up and preserved as sl_interposer_real.dll. Manifest and rollback.ps1 under local/gate2-ghost; close game before rollback. Report: .worktrees/astra-g2-ghost/docs/GATE2-GHOST-VALIDATION.md. Both routes demonstrated in this installed build; Gate 2 remains open for independent review, deferred Argon and remaining visual/lifecycle coverage.
