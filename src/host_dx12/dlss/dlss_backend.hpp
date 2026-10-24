@@ -28,10 +28,13 @@
 // source is destroyed. Work recorded on one device is refused on another. If a
 // view's evaluations are submitted on different queues, BeforeExecute() makes
 // the later submission's queue wait (GPU-side) for the earlier evaluation, so
-// one history is never used concurrently (Gate 2 R-303). An evaluation whose
-// predecessor for the same view is recorded on another list and not yet
-// submitted is refused (its order cannot be established); an untracked use
-// retires its feature so the next frame gets separate, fresh state.
+// one history is never used concurrently (Gate 2 R-303). Frames recorded
+// ahead on separate lists are fine when submitted in order (same submission or
+// later ones); a frame submitted BEFORE its predecessor cannot be reordered, so
+// it is counted (order_violations) and the view's next frame resets. An
+// untracked use retires its feature so the next frame gets separate state.
+// Ordering applies per feature: a view that moves to a new feature starts
+// from reset and is not ordered against the old one.
 // The caller keeps every input/output resource alive until its submission
 // completes; NGX does not take references.
 //
@@ -211,7 +214,7 @@ struct Stats {
     uint64_t rejected = 0;          // Evaluate calls refused by validation (incl. wrong device)
     uint64_t untracked = 0;         // evaluations with no free completion record (taint their feature)
     uint64_t refused_busy = 0;      // frames refused because every feature slot is still owned
-    uint64_t refused_order = 0;     // frames refused: the same view's previous frame is recorded elsewhere, unsubmitted
+    uint64_t order_violations = 0;  // a view's frame submitted before its previous one: next frame resets
     uint64_t queue_waits = 0;       // GPU waits added to order a view across queues
     uint32_t views_active = 0;
     uint32_t feature_render_w = 0, feature_render_h = 0, feature_out_w = 0, feature_out_h = 0;
