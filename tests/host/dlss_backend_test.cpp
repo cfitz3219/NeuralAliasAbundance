@@ -440,6 +440,29 @@ int main()
         d.WaitIdle();
         kick(d.queue.Get());
     }
+    // ARGON-G2-001: dynamic resolution up AND down within the stated maximum
+    // keeps one feature and one history (reset only on the first frame).
+    {
+        const uint64_t created = na::dlss::GetStats().features_created;
+        const uint32_t widths[10] = {960, 1000, 1114, 1200, 1280, 1180, 1050, 1280, 990, 1114};
+        for (int i = 0; i < 10; ++i) {
+            auto e = Desc(widths[i], widths[i] * 9 / 16, 1920, 1080);
+            e.view_id = 30;
+            e.max_render_w = 1280; e.max_render_h = 720;
+            e.quality = na::dlss::QualityForScale(1280, 720, 1920, 1080); // from the maximum, fixed per source
+            test::List l;
+            REQUIRE(Record(d, l, e));
+            CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == (i == 0 ? 1 : 0));
+            CHECK(fake::U(fake::last_eval, NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width) == widths[i]);
+            if (i == 0) CHECK(fake::U(fake::last_create, NVSDK_NGX_Parameter_Width) == 1280); // created at the maximum
+            Submit(d.queue.Get(), l);
+            d.WaitIdle();
+        }
+        CHECK(na::dlss::GetStats().features_created == created + 1);
+        auto too_big = Desc(1300, 731, 1920, 1080);
+        too_big.max_render_w = 1280; too_big.max_render_h = 720;
+        CHECK(na::dlss::Validate(too_big) != nullptr);
+    }
     for (int i = 0; i < 600; ++i) kick(d.queue.Get());
     d.WaitIdle();
     na::dlss::Shutdown();

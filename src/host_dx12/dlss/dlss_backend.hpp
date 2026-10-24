@@ -105,6 +105,10 @@ struct EvalDesc {
     ID3D12Resource* output = nullptr;
     ID3D12Resource* exposure = nullptr; // optional 1x1 exposure texture
     uint32_t render_w = 0, render_h = 0; // valid region of colour/depth (top-left)
+    // ARGON-G2-001: largest render size this source will use (dynamic resolution).
+    // The feature is created at this size once; per-frame render sizes up to it
+    // reuse the feature and its history. 0 = use render_w/render_h.
+    uint32_t max_render_w = 0, max_render_h = 0;
     uint32_t out_w = 0, out_h = 0;
     // Jitter in render-space pixels. Convention (measured on RTX hardware,
     // dlss_real_test, 2026-10-24): the colour sample for a pixel was taken at
