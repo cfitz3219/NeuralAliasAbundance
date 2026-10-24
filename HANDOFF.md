@@ -1,3 +1,18 @@
+# 2026-10-24 — Gate 2 Astra fixes validated; peer recheck pending
+
+A3 #12 is at dd7e823: optional Python discovery, explicit fixture skip when absent,
+and documented single-layer transparency assumption. A4 #13 is at 61b74b6:
+host startup wiring complete, C7 producer snapshots connected, requests kept
+separate from successful native evaluations, injector output attributed to DLSS.
+A4 includes C7 f2eeec41 as a dependency; Claude's open C6/C7 review fixes must
+still be incorporated and revalidated before gate closure.
+
+CI: A3 Linux 8/8, Windows 18/18 and 20/20; A4 Linux 8/8, Windows 21/21 and 25/25.
+Both deployment suites passed 32 checks. Local A3 build without Python discovery
+passed 7/7 remaining tests. Actual host menu registration/mapping/drawing passed
+Windows CPU CI; in-game rendering/coverage remains unqualified. Responses to all
+Claude Gate 2 review items are in COMMS. Awaiting Claude's recheck; Argon not ready.
+
 # 2026-10-24 — Argon joins the gate review process
 
 Cort has added Gemini Argon as independent final auditor after Astra/Claude
