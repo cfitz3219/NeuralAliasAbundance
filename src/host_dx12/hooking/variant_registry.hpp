@@ -50,7 +50,7 @@ struct ID3D12Device;
 
 namespace na::hooking::variants {
 
-constexpr uint32_t kMaxSlots = 32;
+constexpr uint32_t kMaxSlots = 40; // C8b registers 33 command-list slots
 constexpr uint32_t kMaxThunksPerSlot = 8;
 constexpr uint32_t kMaxTables = 16;      // informational snapshots kept
 constexpr uint32_t kQueueCapacity = 16;

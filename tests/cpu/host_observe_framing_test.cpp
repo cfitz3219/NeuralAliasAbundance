@@ -34,7 +34,7 @@ struct Capture {
         std::unique_lock<std::mutex> lock(c.mutex);
         ++c.calls;
         try {
-            CHECK(b->header_bytes >= sizeof(*b)); CHECK(b->abi_major == 0 && b->abi_minor == 1);
+            CHECK(b->header_bytes >= sizeof(*b)); CHECK(b->abi_major == 0 && b->abi_minor == NA_OBSERVE_ABI_MINOR);
             CHECK(b->session != 0); CHECK(b->payload_bytes % 8 == 0);
             // Allocation extent is guaranteed by the real host callback contract.
             const auto decoded=na::discovery::DecodeBatch(b,static_cast<size_t>(b->header_bytes)+b->payload_bytes);
@@ -95,7 +95,7 @@ int main() { return test::run({
     {"lifecycle, exact batch framing, final delivery and no post-stop callbacks", [] {
         Session s; CHECK(na_observe_stop() == NA_E_STATE); CHECK(na_observe_resync() == NA_E_STATE);
         CHECK(na_observe_start(nullptr,nullptr,nullptr) == NA_E_ARG);
-        uint16_t major=99, minor=99; CHECK(na_observe_abi(&major,&minor) == NA_OK && major == 0 && minor == 1);
+        uint16_t major=99, minor=99; CHECK(na_observe_abi(&major,&minor) == NA_OK && major == 0 && minor == NA_OBSERVE_ABI_MINOR);
         CHECK(na_observe_abi(nullptr,&minor) == NA_E_ARG);
         s.start(); CHECK(na_observe_start(nullptr,Capture::sink,&s.capture) == NA_E_STATE);
         eventually([] { return status().inventory_invalid == 0; });

@@ -179,7 +179,7 @@ else()
   message(STATUS "Game adapter: none (host stub)")
 endif()
 target_link_libraries(host_dx12
-  PUBLIC abundance_options host_hooking host_settings host_capture host_nvof core_gpu imgui nvapi_headers host_dlss host_upscalers
+  PUBLIC abundance_options host_hooking host_settings host_capture host_nvof core_gpu imgui nvapi_headers host_dlss host_upscalers host_observe_producers
          d3d12 dxgi d3dcompiler user32 gdi32 shell32 ole32 bcrypt dbghelp winmm)
 if(NA_HAVE_NGX_SDK)
   target_compile_definitions(host_dx12 PUBLIC NA_HAVE_NGX_SDK)
