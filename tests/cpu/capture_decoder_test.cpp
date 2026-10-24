@@ -88,4 +88,3 @@ int main() { return test::run({
         CHECK(!Decode(Packet(c,NA_EV_CAPABILITY_REPORT)).valid);
     }},
 }); }
-
