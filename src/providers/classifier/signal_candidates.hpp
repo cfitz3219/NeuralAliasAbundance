@@ -20,8 +20,10 @@ inline bool SameScope(const Scope& a, const Scope& b) {
         a.submission == b.submission && a.queue == b.queue &&
         a.list == b.list && a.recording == b.recording;
 }
+inline bool Known(uint64_t value) { return value && value != UINT64_MAX; }
 inline bool ValidScope(const Scope& s) {
-    return s.session && s.epoch && s.submission && s.queue && s.list && s.recording;
+    return Known(s.session) && Known(s.epoch) && Known(s.submission) &&
+        Known(s.queue) && Known(s.list) && Known(s.recording);
 }
 struct Window {
     Scope scope{};
@@ -64,13 +66,13 @@ inline Candidate Describe(Signal signal, const Window& w, const Observation& o) 
         reject("Missing or mismatched session/epoch/submission/queue/recording identity");
     if (!w.coverage_complete || !w.order_unambiguous || !w.loss_free)
         reject("Incomplete, lost, or ambiguous execution evidence; reacquire history");
-    if (!o.resource || !o.content_version || !o.alive || !o.external_work)
+    if (!Known(o.resource) || !Known(o.content_version) || !o.alive || !o.external_work)
         reject("Missing live resource/content identity or observation is injector work");
     if (!w.width || !w.height || !o.width || !o.height ||
         o.width != w.width || o.height != w.height)
         reject("Render extent missing or different; acquire subrect/scale evidence");
-    if (!w.scene_end || (w.hud_begin && w.hud_begin <= w.scene_end) ||
-        !o.first_write || o.last_write < o.first_write || o.last_write > w.scene_end)
+    if (!Known(w.scene_end) || w.hud_begin == UINT64_MAX || (w.hud_begin && w.hud_begin <= w.scene_end) ||
+        !Known(o.first_write) || !Known(o.last_write) || o.last_write < o.first_write || o.last_write > w.scene_end)
         reject("No intact content version at scene boundary; acquire earlier snapshot");
     if (o.clear_known && !std::isfinite(o.clear_value))
         reject("Non-finite clear observation");
