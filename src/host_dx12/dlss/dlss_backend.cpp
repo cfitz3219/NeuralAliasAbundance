@@ -523,6 +523,7 @@ bool QueryOptimal(uint32_t out_w, uint32_t out_h, Quality q, OptimalSettings* ou
 
 bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
 {
+    const InjectorCallScope origin;
     std::lock_guard<std::mutex> lock(g.m);
     if (!list) return false;
     if (const char* bad = Validate(d)) {
@@ -617,7 +618,6 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
         p->Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, static_cast<int>(flags));
         p->Set(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
         NVSDK_NGX_Handle* h = nullptr;
-        const InjectorCallScope origin;
         const NVSDK_NGX_Result r = reinterpret_cast<PfnCreate>(g.api.create_feature)(list, NVSDK_NGX_Feature_SuperSampling, p, &h);
         g.stats.last_ngx_result = static_cast<int32_t>(r);
         if (NVSDK_NGX_FAILED(r) || !h) {

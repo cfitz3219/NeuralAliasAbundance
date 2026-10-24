@@ -453,6 +453,10 @@ NgxResult create_from_snapshot_locked(CoreSlot& s, void* cmd_list, void** out_ha
 
 NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, const void* params, void* callback)
 {
+    if (na::dlss::IsInjectorCall()) {
+        g_evaluates.fetch_add(1, std::memory_order_relaxed);
+        return s.evaluate(cmd_list, handle, params, callback);
+    }
     auto* list = static_cast<ID3D12GraphicsCommandList*>(cmd_list);
     const void* game_handle = handle; // A66: identity as the game sees it (creation records use the same)
     // A46: forward to our re-created feature when the game's handle is mapped.

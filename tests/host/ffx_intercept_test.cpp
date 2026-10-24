@@ -111,6 +111,9 @@ int main(int argc, char** argv)
         CHECK(na::ffx::ToDlss(o, &d, &why));
         o = GoodObservation(); o.color_state = FFX_API_RESOURCE_STATE_COPY_DEST;
         CHECK(na::ffx::ToDlss(o, &d, &why));
+        D3D12_RESOURCE_STATES generic{};
+        CHECK(na::ffx::D3D12State(FFX_API_RESOURCE_STATE_GENERIC_READ, &generic));
+        CHECK(generic == (D3D12_RESOURCE_STATE_COPY_SOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
         o = GoodObservation(); o.output_state = 0x4000; // no D3D12 equivalent
         CHECK(!na::ffx::ToDlss(o, &d, &why) && why && std::strstr(why, "translate"));
         o = GoodObservation(); o.max_render_w = 1280; o.max_render_h = 720; o.render_w = 1000; o.render_h = 562;

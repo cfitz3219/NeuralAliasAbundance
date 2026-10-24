@@ -130,7 +130,8 @@ int wmain(int argc, wchar_t** argv)
     {
         na::dlss::InjectorCallScope outer;
         { na::dlss::InjectorCallScope inner;
-          CHECK(create(fake_list, 1, nullptr, &handle) == 1); }
+          CHECK(create(fake_list, 1, nullptr, &handle) == 1);
+          CHECK(eval(fake_list, handle, nullptr, nullptr) == 1); }
         CHECK(na::dlss::IsInjectorCall());
     }
     CHECK(!na::dlss::IsInjectorCall());

@@ -17,7 +17,7 @@
 // evaluation that used it (Gate 2 R-301). Each tracked evaluation has its own
 // fence, so work on independent queues can never vouch for another queue
 // (Gate 1 R-202). A use whose completion can never be proven (never seen
-// submitted, Signal failed, or no free record) marks the feature tainted for
+// submitted, or Signal failed) marks the feature tainted for
 // good: it is released only at Shutdown. Every created handle stays owned
 // until it is released exactly once (R-305): when no feature slot is free, a
 // new feature is refused for that frame instead.
@@ -216,7 +216,7 @@ struct Stats {
     uint64_t features_leaked = 0;   // retired with a use that can never be proven complete; freed only at Shutdown
     uint64_t rejected = 0;          // Evaluate calls refused by validation (incl. wrong device)
     uint64_t untracked = 0;         // evaluations with no free completion record (taint their feature)
-    uint64_t refused_busy = 0;      // frames refused because every feature slot is still owned
+    uint64_t refused_busy = 0;      // frames refused because feature/completion capacity is full
     uint64_t order_violations = 0;  // a view's frame submitted before its previous one: next frame resets
     uint64_t queue_waits = 0;       // GPU waits added to order a view across queues
     uint32_t views_active = 0;
