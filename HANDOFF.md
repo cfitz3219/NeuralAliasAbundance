@@ -1,3 +1,8 @@
+# 2026-10-24 — latest host9655c85 and validity integration
+
+Integrated9655c85; allocator-hook removal does not fix committed RTX test (0xc0000409). Private explicit-SRV diagnostic still reproduces cap session0 mismatch; shared-target/lifetime/order fixes remain absent. PR25 now1311ea0 adds conservative status/capability/loss validity tracking. Standalone12/12 and combined9cd8a76 full Release +21/21 discovery CPU/fixture/menu tests pass. These exclude the separate failing host test. See COMMS and CAPTURE-WORKLOG.md. H2/H3/texture evidence remain pending; no game changes or attendance needed.
+
+---
 # 2026-10-24 — Phase3 capture consumer integrated
 
 Claude's latest published host branch remains5727047. New draft PR25 head46e92a6 adds bounded ABI0.1 structural decoding, exercised by real host transport callbacks. Standalone11/11; combined full Release at59f1463 with20/20 discovery CPU/fixture/menu tests pass. Host descriptor-test/lifetime/order findings remain pending; H2/H3 and completed texture sampling still needed. No game changes or Phase3 closure. See COMMS and PR25's CAPTURE-WORKLOG.md for evidence and limitations.
@@ -170,4 +175,5 @@ Cort: "finish this up and close gate 2!" Claude's side is complete, and with Ast
   - whether the overlay's own D3D12 objects also keep a removed device alive (not yet checked).
 
 **Next:** Phase 3.
+
 
