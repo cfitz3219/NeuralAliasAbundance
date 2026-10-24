@@ -260,3 +260,7 @@ Claude fixes were published on claude/c8-c9-review-fixes (PR31), head fcbc57a, a
 ## 2026-10-24 — integrated PR31 CI confirmed
 
 PR27 5ded6a0 all3 CI jobs pass40143583237, alongside local46/46 tests. Supersedes latest-CI-pending checkpoint. Remaining snapshot lifetime/coverage qualifications and async texture acquisition continue with Claude; no Phase3 closure or deployment.
+
+## 2026-10-24 — repeated-binding provenance regression green
+
+No newer Claude lifetime/coverage/async-texture commits at all-branch fetch. PR27 b55de74 adds default snapshot_bindings test: RTX8 records/8 associations across same-address root/table bindings in two lists, with payload ownership verified after overwrite/Unmap. Full Release succeeds; targeted test passes. All3 CI jobs pass40144391920. Existing47-test default suite now includes this regression; no claim of a new local full-suite run (previous46/46 remains recorded separately). Remaining producer lifetime/coverage and async acquisition stay Claude-owned; no deployment.

@@ -1,3 +1,8 @@
+# 2026-10-24 — repeated-binding provenance regression verified
+
+PR27 b55de74 adds default snapshot_bindings test:8 same-address snapshots retain8 distinct list/op/param/size associations and owned bytes. Full Release and targeted RTX test pass; all3 CI jobs pass40144391920. No newer Claude producer/acquisition commits beyond fcbc57a at all-branch fetch. Remaining lifetime/coverage and async texture work stay with Claude. No deployment or user action. Journal in integration src/providers/discovery/CAPTURE-WORKLOG.md.
+
+---
 # 2026-10-24 — PR31 integration CI confirmed
 
 PR27 5ded6a0 passes all3 CI jobs40143583237 and local46/46 CTests, zero skips. This supersedes latest-CI-pending below. Claude's fixes are integrated; remaining lifetime/coverage qualifications and async textures remain tracked in COMMS. No deployment or user action needed for this checkpoint.
@@ -219,6 +224,7 @@ Cort: "finish this up and close gate 2!" Claude's side is complete, and with Ast
   - whether the overlay's own D3D12 objects also keep a removed device alive (not yet checked).
 
 **Next:** Phase 3.
+
 
 
 
