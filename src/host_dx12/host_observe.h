@@ -92,7 +92,8 @@ typedef enum na_event_kind {
     /* ---- ABI 0.2 (C8 / H2), append-only; 0.1 consumers skip them ---- */
     NA_EV_ROOT_SIGNATURE_CREATED  = 24, /* NA_GROUP_PIPELINE, foundational */
     NA_EV_PIPELINE_CREATED        = 25, /* NA_GROUP_PIPELINE, foundational */
-    NA_EV_LIST_OP                 = 26  /* PASS / RESOURCE_USE / CPU_CONSTANTS */
+    NA_EV_LIST_OP                 = 26, /* PASS / RESOURCE_USE / CPU_CONSTANTS */
+    NA_EV_SNAPSHOT                = 27  /* NA_GROUP_SNAPSHOT (C9 / H3) */
 } na_event_kind;
 
 /* ---- Event header flags ---- */
@@ -561,6 +562,44 @@ typedef struct na_ev_list_op {
     uint32_t payload_stride;       /* element size for arrays, else 0 */
     uint64_t a[6];
 } na_ev_list_op;
+
+/* C9 / H3: bounded CPU copy of constant data a submitted recording binds,
+ * taken at the submission boundary (ExecuteCommandLists entry) from the
+ * application's own CPU mapping of an UPLOAD-heap buffer. The application may
+ * still be writing that memory: every snapshot is APP_SYNC_UNKNOWN; it is
+ * never an atomic or execution-time capture. GPU-written memory is not
+ * captured (status GPU_WRITTEN). */
+typedef enum na_snapshot_binding {
+    NA_SNAP_ROOT_CBV = 1,      /* SET_ROOT_VIEW (CBV) */
+    NA_SNAP_TABLE_CBV = 2      /* CBV descriptor reached through SET_ROOT_TABLE */
+} na_snapshot_binding;
+typedef enum na_snapshot_status {
+    NA_SNAP_CAPTURED = 0,      /* bytes follow (possibly truncated, see flags) */
+    NA_SNAP_NOT_MAPPED = 1,    /* no observed live CPU mapping of the buffer */
+    NA_SNAP_GPU_WRITTEN = 2,   /* not an upload heap: CPU view is not GPU-time data */
+    NA_SNAP_UNRESOLVED = 3,    /* binding did not resolve to an observed buffer */
+    NA_SNAP_BUDGET = 4         /* per-submission byte/count budget exhausted */
+} na_snapshot_status;
+#define NA_SNAP_SYNC_APP_UNKNOWN 1u
+typedef struct na_ev_snapshot {
+    na_event_header hdr;
+    uint64_t snapshot_id;          /* per session, monotonic */
+    na_object_id queue;
+    uint64_t queue_ticket;         /* the ExecuteCommandLists occurrence */
+    na_object_id list;
+    uint64_t recording_generation;
+    uint64_t op_index;             /* the LIST_OP that bound it */
+    na_object_id resource;
+    uint64_t offset;               /* byte offset in the resource */
+    uint32_t binding;              /* na_snapshot_binding */
+    uint32_t param;                /* root parameter index */
+    uint32_t compute;              /* 0 graphics / 1 compute */
+    uint32_t sync;                 /* NA_SNAP_SYNC_* (always APP_UNKNOWN) */
+    uint32_t requested_bytes;      /* CBV size, or the host default for root CBVs */
+    uint32_t captured_bytes;
+    uint32_t payload_offset;       /* from event start; 0 when nothing captured */
+    uint32_t status;               /* na_snapshot_status */
+} na_ev_snapshot;
 
 /* ---- Batch framing (R2) ----
  * A batch is one contiguous host-owned allocation:

@@ -46,6 +46,15 @@ struct ListState {
     std::atomic<uint64_t> op_index{0};
     std::atomic<bool> recording_observed{false}; // this recording began under observation
     std::atomic<bool> coverage_complete{false};  // the list's current table is fully hooked
+    // C9: constant-data bindings of the current recording, snapshotted at submission.
+    struct Binding {
+        uint32_t kind = 0, param = 0, compute = 0, size = 0;
+        uint64_t op_index = 0, offset = 0;
+        na_object_id resource = 0; // 0 = unresolved
+    };
+    std::mutex bind_m;
+    std::vector<Binding> bindings;
+    const void* root_sig[2] = {nullptr, nullptr}; // graphics, compute (recording thread)
 };
 
 struct Obj {
@@ -54,6 +63,7 @@ struct Obj {
     std::vector<uint8_t> created;          // creation event, replayed by the snapshot
     std::unique_ptr<QueueState> queue;     // queues
     std::unique_ptr<ListState> list;       // command lists
+    std::vector<na_root_param> root_params; // root signatures (C9 table resolution)
 };
 
 struct DescHeap {
@@ -67,6 +77,8 @@ struct DescHeap {
         na_object_id resource = NA_UNKNOWN_U64;
         uint32_t format = NA_UNKNOWN_U32;
         uint32_t first_sub = NA_UNKNOWN_U32;
+        uint64_t cbv_offset = 0; // CBV: byte offset in `resource`
+        uint32_t cbv_size = 0;   // CBV: SizeInBytes
     };
     std::vector<SlotInfo> info; // last observed write per slot (record-time CPU view)
 };
@@ -81,6 +93,13 @@ std::shared_mutex g_m; // registry, heaps, VA table. Never held across a D3D12 c
 std::unordered_map<const void*, Obj> g_objs;
 std::vector<std::unique_ptr<DescHeap>> g_heaps;
 std::vector<VaRange> g_va; // sorted by begin
+struct BufferInfo {
+    uint32_t heap_type = NA_UNKNOWN_U32;
+    uint64_t width = 0;
+    uint8_t* cpu = nullptr; // live CPU mapping of subresource 0 (Map/Unmap observed)
+    uint32_t maps = 0;
+};
+std::unordered_map<na_object_id, BufferInfo> g_buffers; // under g_m
 std::atomic<uint64_t> g_next_id{1};
 
 struct Counters {
@@ -152,6 +171,7 @@ void RetireSentinel::retire(const void* key, na_object_id id, uint32_t kind)
         g_heaps.erase(std::remove_if(g_heaps.begin(), g_heaps.end(), [&](const std::unique_ptr<DescHeap>& h) { return h->id == id; }),
                       g_heaps.end());
         g_va.erase(std::remove_if(g_va.begin(), g_va.end(), [&](const VaRange& r) { return r.resource == id; }), g_va.end());
+        g_buffers.erase(id);
     }
     g_c.live.fetch_sub(1);
     g_c.retired.fetch_add(1);
@@ -271,6 +291,12 @@ void note_resource(ID3D12Device* dev, IUnknown* obj, uint32_t creation_kind, ID3
     e.initial_state = initial;
     e.heap_type = heap_type;
     remember_creation(obj, e);
+    if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        std::unique_lock<std::shared_mutex> lock(g_m);
+        BufferInfo& bi = g_buffers[id];
+        bi.heap_type = heap_type;
+        bi.width = d.Width;
+    }
     if (va) {
         std::unique_lock<std::shared_mutex> lock(g_m);
         VaRange r{va, va + d.Width, id, obj};
@@ -339,7 +365,7 @@ void note_descriptor_write(D3D12_CPU_DESCRIPTOR_HANDLE dst, uint32_t kind, IUnkn
             e.resource = NA_UNKNOWN_U64; // resource-backed, but created before observation
             e.hdr.flags |= NA_EVF_METHOD_UNOBSERVED;
         }
-        h->info[slot] = DescHeap::SlotInfo{kind, e.resource, format, first_sub};
+        h->info[slot] = DescHeap::SlotInfo{kind, e.resource, format, first_sub, 0, 0};
     }
     e.descriptor_kind = kind;
     e.format = format;
@@ -582,7 +608,8 @@ void STDMETHODCALLTYPE D_CreateConstantBufferView(ID3D12Device* dev, const D3D12
         e.heap = dh->id;
         e.slot = slot;
         e.slot_version = ++dh->versions[slot];
-        dh->info[slot] = DescHeap::SlotInfo{NA_DESC_CBV, desc && desc->BufferLocation ? (known ? res : NA_UNKNOWN_U64) : 0, NA_UNKNOWN_U32, 0};
+        dh->info[slot] = DescHeap::SlotInfo{NA_DESC_CBV, desc && desc->BufferLocation ? (known ? res : NA_UNKNOWN_U64) : 0, NA_UNKNOWN_U32, 0,
+                                            known ? off : 0, desc ? desc->SizeInBytes : 0};
     }
     e.descriptor_kind = NA_DESC_CBV;
     e.resource = desc && desc->BufferLocation ? (known ? res : NA_UNKNOWN_U64) : 0;
@@ -827,7 +854,7 @@ HRESULT STDMETHODCALLTYPE D_Wait(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v
 
 void STDMETHODCALLTYPE D_ExecuteCommandLists(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists)
 {
-    const ExecuteToken t = ExecuteBegin(q);
+    const ExecuteToken t = ExecuteBegin(q, n, lists);
     o_ExecuteCommandLists(q, n, lists);
     ExecuteEnd(t, q, n, lists);
 }
@@ -850,10 +877,13 @@ bool snapshot()
     rep.r.entry_count = NA_GROUP_COUNT_V1;
     rep.r.entries_offset = offsetof(Report, entries);
     rep.r.entry_stride = sizeof(na_cap_entry);
+    // PARTIAL = observed with documented gaps (bundles, ExecuteIndirect,
+    // GPU-written data, unhooked variants, pre-installation objects).
     const uint32_t support[NA_GROUP_COUNT_V1] = {
-        NA_CAP_SUPPORTED, NA_CAP_SUPPORTED, NA_CAP_PARTIAL /* CPU-side record-time descriptors */, NA_CAP_PARTIAL /* reset/close: C8b */,
-        NA_CAP_SUPPORTED, NA_CAP_UNSUPPORTED, NA_CAP_UNSUPPORTED, NA_CAP_UNSUPPORTED, NA_CAP_UNSUPPORTED, NA_CAP_UNSUPPORTED,
-        NA_CAP_UNSUPPORTED};
+        NA_CAP_SUPPORTED /* session */, NA_CAP_SUPPORTED /* resource */, NA_CAP_PARTIAL /* descriptor: CPU record-time view */,
+        NA_CAP_PARTIAL /* list */, NA_CAP_SUPPORTED /* queue */, NA_CAP_UNSUPPORTED /* swapchain: overlay-owned, not emitted yet */,
+        NA_CAP_SUPPORTED /* pipeline */, NA_CAP_PARTIAL /* pass */, NA_CAP_PARTIAL /* resource use */,
+        NA_CAP_PARTIAL /* CPU constants */, NA_CAP_PARTIAL /* snapshot: upload-heap CBVs, app-sync-unknown */};
     for (uint32_t g = 0; g < NA_GROUP_COUNT_V1; ++g) {
         rep.entries[g].group = g;
         rep.entries[g].support = support[g];
@@ -1018,6 +1048,7 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
         if (it != g_objs.end()) {
             const auto* b = reinterpret_cast<const uint8_t*>(&ev);
             it->second.created.assign(b, b + ev.e.hdr.size_bytes);
+            it->second.root_params.assign(ev.p, ev.p + ev.e.param_count);
         }
     }
     na::observe_internal::Emit(&ev, NA_GROUP_PIPELINE);
@@ -1195,6 +1226,22 @@ ListState* list_state_locked(const void* l, na_object_id* id)
     return it->second.list.get();
 }
 
+template <typename F>
+void with_list_state(const void* l, F&& f)
+{
+    std::shared_lock<std::shared_mutex> lock(g_m);
+    na_object_id id = 0;
+    if (ListState* ls = list_state_locked(l, &id)) f(*ls);
+}
+
+constexpr uint32_t kRootCbvBytes = 512; // a root CBV has no size: capture this much (bounded by the buffer)
+
+void add_binding(ListState& ls, const ListState::Binding& b)
+{
+    std::lock_guard<std::mutex> lock(ls.bind_m);
+    if (ls.bindings.size() < 4096) ls.bindings.push_back(b);
+}
+
 // A list first met through a recorded op (created before installation).
 void preexisting_list(ID3D12GraphicsCommandList* l)
 {
@@ -1357,6 +1404,11 @@ struct On<sl::list::Reset> {
                 if (ls->generation_known.load()) ls->generation.fetch_add(1);
                 ls->op_index.store(0);
                 ls->recording_observed.store(true);
+                {
+                    std::lock_guard<std::mutex> bl(ls->bind_m);
+                    ls->bindings.clear();
+                }
+                ls->root_sig[0] = ls->root_sig[1] = nullptr;
                 ls->coverage_complete.store(cov == na::hooking::variants::Coverage::Complete);
             }
             gen = ls->generation_known.load() ? ls->generation.load() : NA_UNKNOWN_U64;
@@ -1542,7 +1594,9 @@ template <uint32_t Compute>
 void root_sig(GL* l, ID3D12RootSignature* rs)
 {
     Rec r;
-    if (begin_op(l, &r)) emit_op(r, NA_OP_SET_ROOT_SIGNATURE, {id_or_unknown(rs), Compute});
+    if (!begin_op(l, &r)) return;
+    emit_op(r, NA_OP_SET_ROOT_SIGNATURE, {id_or_unknown(rs), Compute});
+    with_list_state(l, [&](ListState& ls) { ls.root_sig[Compute] = rs; });
 }
 template <>
 struct On<sl::list::SetComputeRootSignature> { static void run(GL* l, ID3D12RootSignature* rs) { root_sig<1>(l, rs); } };
@@ -1558,9 +1612,35 @@ void root_table(GL* l, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE h)
     uint64_t version = 0;
     {
         std::shared_lock<std::shared_mutex> lock(g_m);
-        if (DescHeap* dh = heap_for_gpu_locked(h.ptr, &slot)) {
+        DescHeap* dh = heap_for_gpu_locked(h.ptr, &slot);
+        if (dh) {
             heap = dh->id;
             version = dh->versions[slot];
+        }
+        // C9: CBV ranges of this table (first range, per the bound root signature).
+        na_object_id lid = 0;
+        ListState* ls = list_state_locked(l, &lid);
+        if (dh && ls && ls->root_sig[Compute]) {
+            auto it = g_objs.find(ls->root_sig[Compute]);
+            if (it != g_objs.end() && param < it->second.root_params.size()) {
+                const na_root_param& rp = it->second.root_params[param];
+                if (rp.param_type == NA_ROOT_TABLE && rp.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_CBV) {
+                    const uint32_t n = std::min<uint32_t>(rp.range_descriptors, 8);
+                    for (uint32_t k = 0; k < n && slot + k < dh->count; ++k) {
+                        const DescHeap::SlotInfo& si = dh->info[slot + k];
+                        if (si.kind != NA_DESC_CBV) continue;
+                        ListState::Binding b;
+                        b.kind = NA_SNAP_TABLE_CBV;
+                        b.param = param;
+                        b.compute = Compute;
+                        b.size = si.cbv_size;
+                        b.op_index = r.op_index;
+                        b.offset = si.cbv_offset;
+                        b.resource = si.resource == NA_UNKNOWN_U64 ? 0 : si.resource;
+                        add_binding(*ls, b);
+                    }
+                }
+            }
         }
     }
     emit_op(r, NA_OP_SET_ROOT_TABLE, {heap, heap ? slot : uint64_t{NA_UNKNOWN_U32}, heap ? version : NA_UNKNOWN_U64, param, Compute}, nullptr, 0, 0,
@@ -1596,6 +1676,17 @@ void root_view(GL* l, UINT param, D3D12_GPU_VIRTUAL_ADDRESS va)
     {
         std::shared_lock<std::shared_mutex> lock(g_m);
         known = resolve_va_locked(va, &res, &off);
+    }
+    if (Kind == NA_DESC_CBV) {
+        ListState::Binding b;
+        b.kind = NA_SNAP_ROOT_CBV;
+        b.param = param;
+        b.compute = Compute;
+        b.size = kRootCbvBytes;
+        b.op_index = r.op_index;
+        b.offset = known ? off : 0;
+        b.resource = known ? res : 0;
+        with_list_state(l, [&](ListState& ls) { add_binding(ls, b); });
     }
     // A bare GPU VA is never an identity (A2-R02): unresolved -> UNKNOWN.
     emit_op(r, NA_OP_SET_ROOT_VIEW, {known ? res : NA_UNKNOWN_U64, known ? off : NA_UNKNOWN_U64, param, Kind, Compute}, nullptr, 0, 0,
@@ -1738,6 +1829,175 @@ bool register_list_slots()
                                            static_cast<uint32_t>(sizeof(specs) / sizeof(specs[0])));
 }
 
+// ---------------------------------------------------- C9: CPU mappings
+using MapFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Resource*, UINT, const D3D12_RANGE*, void**);
+using UnmapFn = void(STDMETHODCALLTYPE*)(ID3D12Resource*, UINT, const D3D12_RANGE*);
+MapFn o_Map[2] = {};
+UnmapFn o_Unmap[2] = {};
+
+void note_map(ID3D12Resource* r, void* cpu)
+{
+    const na_object_id id = lookup(r);
+    if (!id) return;
+    std::unique_lock<std::shared_mutex> lock(g_m);
+    auto it = g_buffers.find(id);
+    if (it == g_buffers.end()) return;
+    it->second.cpu = static_cast<uint8_t*>(cpu);
+    ++it->second.maps;
+}
+void note_unmap(ID3D12Resource* r)
+{
+    const na_object_id id = lookup(r);
+    if (!id) return;
+    std::unique_lock<std::shared_mutex> lock(g_m);
+    auto it = g_buffers.find(id);
+    if (it == g_buffers.end() || !it->second.maps) return;
+    if (--it->second.maps == 0) it->second.cpu = nullptr;
+}
+template <int I>
+HRESULT STDMETHODCALLTYPE D_Map(ID3D12Resource* r, UINT sub, const D3D12_RANGE* range, void** out)
+{
+    const HRESULT hr = o_Map[I](r, sub, range, out);
+    if (SUCCEEDED(hr) && sub == 0 && out && *out) note_map(r, *out);
+    return hr;
+}
+template <int I>
+void STDMETHODCALLTYPE D_Unmap(ID3D12Resource* r, UINT sub, const D3D12_RANGE* range)
+{
+    o_Unmap[I](r, sub, range);
+    if (sub == 0) note_unmap(r);
+}
+
+std::atomic<uint64_t> g_snapshot_id{0};
+
+// Bounded copies of every constant-data binding of the submitted recordings,
+// at the submission boundary. APP_SYNC_UNKNOWN always.
+void snapshot_submission(na_object_id qid, uint64_t ticket, uint32_t count, ID3D12CommandList* const* lists)
+{
+    if (!na::observe_internal::Started() || !lists) return;
+    constexpr uint32_t kMaxSnaps = 64, kMaxBytes = 4096, kBudget = 64 * 1024;
+    struct Out {
+        na_ev_snapshot e;
+        uint8_t bytes[kMaxBytes];
+    };
+    static thread_local Out o; // 4 KiB: kept off the game's stack
+    std::vector<std::pair<na_object_id, uint64_t>> seen;
+    uint32_t snaps = 0, total = 0;
+    bool budget_reported = false;
+    for (uint32_t li = 0; li < count; ++li) {
+        std::vector<ListState::Binding> binds;
+        na_object_id lid = 0;
+        uint64_t gen = NA_UNKNOWN_U64;
+        {
+            std::shared_lock<std::shared_mutex> lock(g_m);
+            ListState* ls = lists[li] ? list_state_locked(lists[li], &lid) : nullptr;
+            if (!ls) continue;
+            gen = ls->generation_known.load() ? ls->generation.load() : NA_UNKNOWN_U64;
+            std::lock_guard<std::mutex> bl(ls->bind_m);
+            binds = ls->bindings;
+        }
+        for (const ListState::Binding& b : binds) {
+            const auto key = std::make_pair(b.resource, b.offset);
+            if (b.resource && std::find(seen.begin(), seen.end(), key) != seen.end()) continue;
+            if (b.resource) seen.push_back(key);
+            const bool over = snaps >= kMaxSnaps || total >= kBudget;
+            if (over && budget_reported) return;
+            std::memset(&o.e, 0, sizeof(o.e));
+            o.e.hdr.kind = NA_EV_SNAPSHOT;
+            o.e.hdr.thread_seq = ++t_seq;
+            o.e.hdr.producer_thread = GetCurrentThreadId();
+            o.e.snapshot_id = g_snapshot_id.fetch_add(1) + 1;
+            o.e.queue = qid;
+            o.e.queue_ticket = ticket;
+            o.e.list = lid;
+            o.e.recording_generation = gen;
+            o.e.op_index = b.op_index;
+            o.e.resource = b.resource;
+            o.e.offset = b.offset;
+            o.e.binding = b.kind;
+            o.e.param = b.param;
+            o.e.compute = b.compute;
+            o.e.sync = NA_SNAP_SYNC_APP_UNKNOWN;
+            o.e.requested_bytes = b.size;
+            uint32_t n = 0;
+            if (over) {
+                o.e.status = NA_SNAP_BUDGET;
+                budget_reported = true;
+            } else if (!b.resource) {
+                o.e.status = NA_SNAP_UNRESOLVED;
+            } else {
+                std::shared_lock<std::shared_mutex> lock(g_m); // Unmap waits for the copy
+                auto it = g_buffers.find(b.resource);
+                if (it == g_buffers.end()) o.e.status = NA_SNAP_UNRESOLVED;
+                else if (it->second.heap_type != D3D12_HEAP_TYPE_UPLOAD) o.e.status = NA_SNAP_GPU_WRITTEN;
+                else if (!it->second.cpu) o.e.status = NA_SNAP_NOT_MAPPED;
+                else if (b.offset >= it->second.width) o.e.status = NA_SNAP_UNRESOLVED;
+                else {
+                    const uint64_t avail = it->second.width - b.offset;
+                    n = static_cast<uint32_t>(std::min<uint64_t>({b.size, kMaxBytes, avail, kBudget - total}));
+                    std::memcpy(o.bytes, it->second.cpu + b.offset, n);
+                    o.e.status = NA_SNAP_CAPTURED;
+                }
+            }
+            o.e.captured_bytes = n;
+            if (n < b.size && o.e.status == NA_SNAP_CAPTURED) o.e.hdr.flags |= NA_EVF_TRUNCATED;
+            o.e.payload_offset = n ? static_cast<uint32_t>(offsetof(Out, bytes)) : 0u;
+            const uint32_t padded = (n + 7u) & ~7u;
+            if (padded > n) std::memset(o.bytes + n, 0, padded - n);
+            o.e.hdr.size_bytes = static_cast<uint32_t>(offsetof(Out, bytes) + padded);
+            ++snaps;
+            total += n;
+            na::observe_internal::Emit(&o, NA_GROUP_SNAPSHOT);
+        }
+    }
+}
+
+void install_map_hooks(ID3D12Device* device)
+{
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = 65536;
+    bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource* committed = nullptr;
+    ID3D12Resource* placed = nullptr;
+    ID3D12Heap* heap = nullptr;
+    device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&committed));
+    D3D12_HEAP_DESC hd{};
+    hd.SizeInBytes = 65536;
+    hd.Properties.Type = D3D12_HEAP_TYPE_UPLOAD;
+    hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+    if (SUCCEEDED(device->CreateHeap(&hd, IID_PPV_ARGS(&heap))))
+        device->CreatePlacedResource(heap, 0, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&placed));
+    void* first_map = nullptr;
+    int used = 0;
+    for (ID3D12Resource* r : {committed, placed}) {
+        if (!r || used >= 2) continue;
+        void* target = (*reinterpret_cast<void***>(r))[sl::resource::Map];
+        if (target == first_map) continue; // same implementation: already covered
+        bool ok = false;
+        if (used == 0)
+            ok = na::hooking::HookVTableSlot(r, sl::resource::Map, reinterpret_cast<void*>(&D_Map<0>), reinterpret_cast<void**>(&o_Map[0])) &&
+                 na::hooking::HookVTableSlot(r, sl::resource::Unmap, reinterpret_cast<void*>(&D_Unmap<0>), reinterpret_cast<void**>(&o_Unmap[0]));
+        else
+            ok = na::hooking::HookVTableSlot(r, sl::resource::Map, reinterpret_cast<void*>(&D_Map<1>), reinterpret_cast<void**>(&o_Map[1])) &&
+                 na::hooking::HookVTableSlot(r, sl::resource::Unmap, reinterpret_cast<void*>(&D_Unmap<1>), reinterpret_cast<void**>(&o_Unmap[1]));
+        if (ok) {
+            if (!first_map) first_map = target;
+            ++used;
+            g_c.hooks.fetch_add(2);
+        } else {
+            g_c.missing.fetch_add(2);
+        }
+    }
+    if (placed) placed->Release();
+    if (heap) heap->Release();
+    if (committed) committed->Release();
+}
+
 std::once_flag g_install_once;
 bool g_install_ok = false;
 bool g_lists_hooked = false;
@@ -1839,6 +2099,9 @@ bool InstallProducers(ID3D12Device* device, ID3D12CommandQueue* queue, bool hook
                 na::hooking::variants::StartDiscoveryThread(nullptr, nullptr);
             }
             g_lists_hooked = reg;
+            // C9: Map/Unmap of buffers, hooked on the implementations a
+            // committed and a placed upload buffer use (variants get own thunks).
+            if (reg) install_map_hooks(device);
         }
         if (ok) na::observe_internal::SetSnapshotProvider(&snapshot);
         g_install_ok = ok;
@@ -1847,7 +2110,7 @@ bool InstallProducers(ID3D12Device* device, ID3D12CommandQueue* queue, bool hook
     return g_install_ok;
 }
 
-ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue)
+ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* const* lists)
 {
     ExecuteToken t;
     na_object_id qid = 0;
@@ -1860,6 +2123,7 @@ ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue)
         qs->overlap_gen.fetch_add(1);
     }
     t.overlap_gen = qs->overlap_gen.load();
+    snapshot_submission(qid, t.ticket, count, lists); // C9: at the submission boundary
     return t;
 }
 

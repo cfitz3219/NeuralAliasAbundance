@@ -55,7 +55,8 @@ struct ExecuteToken {
     bool overlapped_at_entry = false;
     void* queue_state = nullptr;
 };
-ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue);
+// Begin also takes the C9 constant-data snapshots of the submitted recordings.
+ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* const* lists);
 void ExecuteEnd(const ExecuteToken& token, ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* const* lists);
 
 // Identity of an observed object (0 = unknown). Any interface pointer of it.
