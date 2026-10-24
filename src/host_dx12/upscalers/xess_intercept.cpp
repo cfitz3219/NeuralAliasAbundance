@@ -6,6 +6,8 @@
 #include "host_dx12/upscalers/module_watch.hpp"
 #include "host_dx12/upscalers/xess_abi.hpp"
 
+#include <wrl/client.h>
+
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -14,8 +16,9 @@
 namespace na::xess {
 
 // XeSS's jitter (after its jitter scale) is the projection offset in pixels,
-// like DLSS's (C6 measured: sample = pixel centre - jitter). Confirmed or
-// corrected in the C7 RTX session (XeSS also runs on NVIDIA GPUs).
+// like DLSS's (C6 measured: sample = pixel centre - jitter). NOT measured yet:
+// scheduled for the Gate 2 hardware session with Intel's official runtime DLL
+// (XeSS also runs on NVIDIA GPUs).
 constexpr float kXessToDlssJitterSign = 1.0f;
 
 bool ToDlss(const Observation& o, na::dlss::EvalDesc* out, const char** reason)
@@ -61,9 +64,20 @@ bool ToDlss(const Observation& o, na::dlss::EvalDesc* out, const char** reason)
     const float scale = (o.exposure_scale > 0.f ? o.exposure_scale : 1.f) * (o.exposure_multiplier > 0.f ? o.exposure_multiplier : 1.f);
     d.exposure_scale = scale;
     d.reset = o.reset;
-    d.quality = o.quality == kNativeAA && o.in_w == o.out_w && o.in_h == o.out_h
-                    ? na::dlss::Quality::DLAA
-                    : na::dlss::QualityForScale(o.in_w, o.in_h, o.out_w, o.out_h);
+    // ARGON-G2-001: the game's chosen XeSS mode fixes the DLSS mode, and the
+    // feature is created at the output size (XeSS states no maximum render
+    // size; it is never larger than the output), so dynamic resolution never
+    // recreates or resets DLSS.
+    switch (o.quality) {
+    case kUltraPerformance: d.quality = na::dlss::Quality::UltraPerformance; break;
+    case kPerformance: d.quality = na::dlss::Quality::MaxPerformance; break;
+    case kBalanced: d.quality = na::dlss::Quality::Balanced; break;
+    case kNativeAA: d.quality = na::dlss::Quality::DLAA; break;
+    default: d.quality = na::dlss::Quality::MaxQuality; break; // Quality, UltraQuality, UltraQualityPlus
+    }
+    if (d.quality == na::dlss::Quality::DLAA && (o.in_w != o.out_w || o.in_h != o.out_h)) d.quality = na::dlss::Quality::MaxQuality;
+    d.max_render_w = d.quality == na::dlss::Quality::DLAA ? o.in_w : o.out_w;
+    d.max_render_h = d.quality == na::dlss::Quality::DLAA ? o.in_h : o.out_h;
     if (const char* bad = na::dlss::Validate(d)) return fail(bad);
     *out = d;
     if (reason) *reason = nullptr;
@@ -89,7 +103,11 @@ struct Slot {
 };
 Slot g_slots[kSlots];
 
+enum class Backend : uint8_t { None, Native, Dlss }; // R-304: who produced the previous frame
+
 struct ContextInfo {
+    uint64_t view_id = 0;           // R-303: this context's own DLSS view (never reused)
+    Backend last = Backend::None;
     Context context = nullptr;
     ID3D12Device* device = nullptr; // identity; the game owns it
     bool initialized = false;
@@ -98,6 +116,9 @@ struct ContextInfo {
     uint32_t out_w = 0, out_h = 0;
     float jitter_scale_x = 1, jitter_scale_y = 1, velocity_scale_x = 1, velocity_scale_y = 1, exposure_multiplier = 1;
 };
+
+constexpr uint64_t kViewTag = 2ull << 40;
+std::atomic<uint64_t> g_next_view{1};
 
 std::mutex g_m;
 ContextInfo g_contexts[kMaxContexts];
@@ -122,15 +143,20 @@ ContextInfo* find_or_add(Context c)
         if (!ci.context) {
             ci = ContextInfo{};
             ci.context = c;
+            ci.view_id = kViewTag | g_next_view.fetch_add(1, std::memory_order_relaxed);
             return &ci;
         }
     return nullptr; // table full: executes report context_known=false
 }
 
-bool ensure_dlss_locked(ID3D12Device* device)
+bool ensure_dlss_locked(ID3D12Device* device, ID3D12GraphicsCommandList* list)
 {
     const na::dlss::Capabilities c = na::dlss::GetCapabilities();
     if (c.attached) return c.available && !c.latched_off;
+    // ARGON-G2-002: a context created before our hooks has no recorded device;
+    // the game's command list knows it.
+    Microsoft::WRL::ComPtr<ID3D12Device> from_list;
+    if (!device && list && SUCCEEDED(list->GetDevice(IID_PPV_ARGS(&from_list)))) device = from_list.Get();
     if (g_dlss_init_tried || !device) return false;
     g_dlss_init_tried = true;
     wchar_t path[MAX_PATH] = {};
@@ -149,8 +175,10 @@ Result DetourCreate(ID3D12Device* device, Context* out)
     std::lock_guard<std::mutex> lock(g_m);
     ++g_stats.contexts_created;
     if (ContextInfo* ci = find_or_add(*out)) {
+        const uint64_t view = ci->view_id; // keep the id assigned by find_or_add
         *ci = ContextInfo{};
         ci->context = *out;
+        ci->view_id = view;
         ci->device = device;
     }
     return r;
@@ -178,7 +206,10 @@ Result DetourDestroy(Context c)
 {
     {
         std::lock_guard<std::mutex> lock(g_m);
-        if (ContextInfo* ci = find(c)) *ci = ContextInfo{};
+        if (ContextInfo* ci = find(c)) {
+            na::dlss::ReleaseView(ci->view_id); // R-303: its DLSS history ends with it
+            *ci = ContextInfo{};
+        }
         ++g_stats.contexts_destroyed;
     }
     return g_slots[S].destroy(c);
@@ -220,6 +251,7 @@ Result DetourSetExposureMultiplier(Context c, float m)
 template <int S>
 Result DetourExecute(Context c, ID3D12GraphicsCommandList* list, const D3D12ExecuteParams* p)
 {
+    bool native_needs_reset = false;
     if (p) {
         std::lock_guard<std::mutex> lock(g_m);
         Observation o;
@@ -257,13 +289,19 @@ Result DetourExecute(Context c, ID3D12GraphicsCommandList* list, const D3D12Exec
             if (b.x || b.y) o.nonzero_bases = true;
         g_last = o;
         g_have_last = true;
+        ContextInfo* ci = find(c);
         if (static_cast<Mode>(g_mode.load(std::memory_order_relaxed)) == Mode::ReplaceWithDlss) {
             na::dlss::EvalDesc d;
             const char* why = nullptr;
-            if (!ToDlss(o, &d, &why)) {
+            const bool mapped = ToDlss(o, &d, &why);
+            if (mapped && ci) {
+                d.view_id = ci->view_id;
+                if (ci->last != Backend::Dlss) d.reset = true; // R-304: DLSS did not see the previous frame
+            }
+            if (!mapped) {
                 ++g_stats.fallbacks;
                 set_reason(why);
-            } else if (!ensure_dlss_locked(o.device)) {
+            } else if (!ensure_dlss_locked(o.device, list)) {
                 ++g_stats.fallbacks;
                 const na::dlss::Capabilities caps = na::dlss::GetCapabilities();
                 set_reason(caps.reason[0] ? caps.reason : "DLSS could not start on this device.");
@@ -273,9 +311,18 @@ Result DetourExecute(Context c, ID3D12GraphicsCommandList* list, const D3D12Exec
             } else {
                 ++g_stats.replaced;
                 set_reason("");
+                if (ci) ci->last = Backend::Dlss;
                 return kSuccess; // DLSS wrote XeSS's output on the game's list
             }
         }
+        // R-304: XeSS skipped the frames DLSS produced; its history is stale.
+        native_needs_reset = ci && ci->last == Backend::Dlss && !p->resetHistory;
+        if (ci) ci->last = Backend::Native;
+    }
+    if (native_needs_reset) {
+        D3D12ExecuteParams copy = *p; // never modify the game's parameters
+        copy.resetHistory = 1;
+        return g_slots[S].execute(c, list, &copy);
     }
     return g_slots[S].execute(c, list, p);
 }

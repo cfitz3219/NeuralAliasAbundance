@@ -87,6 +87,7 @@ struct Stats {
     uint64_t replaced = 0;      // frames DLSS produced instead of FSR
     uint64_t fallbacks = 0;     // replace requested but FSR ran (reason below)
     uint64_t unknown_context = 0;
+    uint64_t barriers = 0;      // state transitions added around DLSS (ARGON-G2-003)
     char reason[128] = {};      // last fallback reason
 };
 Stats GetStats();

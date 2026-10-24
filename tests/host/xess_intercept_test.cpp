@@ -164,6 +164,71 @@ int main(int argc, char** argv)
             CHECK(executes() == before + 1); // fell back to XeSS
             CHECK(na::xess::GetStats().fallbacks == 1 && std::strstr(na::xess::GetStats().reason, "depth"));
         }
+        auto last_reset = reinterpret_cast<int (*)()>(reinterpret_cast<void*>(GetProcAddress(stub, "XessStubLastReset")));
+        REQUIRE(last_reset != nullptr);
+        const auto dlss_reset = [] { return fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset); };
+        // R-304: backend switches force a reset on the side that missed frames.
+        {
+            auto p = Exec();
+            p.resetHistory = 0;
+            CHECK(execute(ctx, l.list.Get(), &p) == kSuccess && dlss_reset() == 1); // XeSS ran last
+            CHECK(execute(ctx, l.list.Get(), &p) == kSuccess && dlss_reset() == 0);
+            auto fb = p;
+            fb.pDepthTexture = nullptr; // forces the XeSS fallback
+            CHECK(execute(ctx, l.list.Get(), &fb) == kSuccess && last_reset() == 1);
+            CHECK(fb.resetHistory == 0); // caller's parameters untouched
+            CHECK(execute(ctx, l.list.Get(), &fb) == kSuccess && last_reset() == 0);
+            CHECK(execute(ctx, l.list.Get(), &p) == kSuccess && dlss_reset() == 1);
+            na::xess::SetMode(na::xess::Mode::Observe);
+            CHECK(execute(ctx, l.list.Get(), &p) == kSuccess && last_reset() == 1);
+            CHECK(execute(ctx, l.list.Get(), &p) == kSuccess && last_reset() == 0);
+            na::xess::SetMode(na::xess::Mode::ReplaceWithDlss);
+        }
+        // R-303: separate contexts, separate histories; recreation starts fresh.
+        {
+            Context ctx2 = nullptr;
+            REQUIRE(create(device_ptr, &ctx2) == kSuccess && ctx2);
+            REQUIRE(init(ctx2, &ip) == kSuccess);
+            auto p = Exec();
+            p.resetHistory = 0;
+            CHECK(execute(ctx, l.list.Get(), &p) == kSuccess);
+            const uintptr_t h1 = fake::last_eval_handle;
+            CHECK(execute(ctx2, l.list.Get(), &p) == kSuccess);
+            const uintptr_t h2 = fake::last_eval_handle;
+            CHECK(h1 != h2 && dlss_reset() == 1);
+            CHECK(execute(ctx, l.list.Get(), &p) == kSuccess && fake::last_eval_handle == h1 && dlss_reset() == 0);
+            CHECK(destroy(ctx2) == kSuccess);
+            Context ctx3 = nullptr;
+            REQUIRE(create(device_ptr, &ctx3) == kSuccess && ctx3);
+            REQUIRE(init(ctx3, &ip) == kSuccess);
+            CHECK(execute(ctx3, l.list.Get(), &p) == kSuccess);
+            CHECK(fake::last_eval_handle != h1 && fake::last_eval_handle != h2 && dlss_reset() == 1);
+            CHECK(destroy(ctx3) == kSuccess);
+        }
+        // ARGON-G2-002: a context XeSS created before our hooks (no device recorded)
+        // still replaces: the device comes from the game's command list.
+        {
+            Context early = reinterpret_cast<Context>(0xABC0);
+            REQUIRE(init(early, &ip) == kSuccess); // first seen at Init
+            const uint64_t replaced = na::xess::GetStats().replaced;
+            auto p = Exec();
+            CHECK(execute(early, l.list.Get(), &p) == kSuccess);
+            CHECK(na::xess::GetStats().replaced == replaced + 1);
+        }
+        // ARGON-G2-001: dynamic input size keeps one feature (created at the output size) and its history.
+        {
+            const int creates = fake::creates;
+            const uint32_t widths[10] = {960, 1000, 1114, 1200, 1280, 1180, 1050, 1280, 990, 1114};
+            for (int i = 0; i < 10; ++i) {
+                auto p = Exec();
+                p.resetHistory = 0;
+                p.inputWidth = widths[i];
+                p.inputHeight = widths[i] * 9 / 16;
+                CHECK(execute(ctx, l.list.Get(), &p) == kSuccess);
+                if (i) CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
+            }
+            CHECK(fake::creates <= creates + 1);
+        }
         l.list->Close();
         na::dlss::Shutdown();
     }

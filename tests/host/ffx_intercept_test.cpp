@@ -104,10 +104,14 @@ int main(int argc, char** argv)
         CHECK(na::ffx::ToDlss(o, &d, &why) && d.pre_exposure == 1.f);
         o = GoodObservation(); o.context_known = false;
         CHECK(!na::ffx::ToDlss(o, &d, &why) && why && std::strstr(why, "before"));
-        o = GoodObservation(); o.output_state = FFX_API_RESOURCE_STATE_COMMON;
-        CHECK(!na::ffx::ToDlss(o, &d, &why) && why && std::strstr(why, "UAV"));
+        o = GoodObservation(); o.output_state = FFX_API_RESOURCE_STATE_COMMON; // ARGON-G2-003: transitioned, not refused
+        CHECK(na::ffx::ToDlss(o, &d, &why));
         o = GoodObservation(); o.color_state = FFX_API_RESOURCE_STATE_COPY_DEST;
-        CHECK(!na::ffx::ToDlss(o, &d, &why) && why);
+        CHECK(na::ffx::ToDlss(o, &d, &why));
+        o = GoodObservation(); o.output_state = 0x4000; // no D3D12 equivalent
+        CHECK(!na::ffx::ToDlss(o, &d, &why) && why && std::strstr(why, "translate"));
+        o = GoodObservation(); o.max_render_w = 1280; o.max_render_h = 720; o.render_w = 1000; o.render_h = 562;
+        CHECK(na::ffx::ToDlss(o, &d, &why) && d.max_render_w == 1280 && d.render_w == 1000 && d.quality == na::dlss::Quality::MaxQuality);
         o = GoodObservation(); o.motion = nullptr;
         CHECK(!na::ffx::ToDlss(o, &d, &why) && why);
         o = GoodObservation(); o.jitter_x = 4.f; // out of range -> DLSS validation refuses
@@ -191,10 +195,10 @@ int main(int argc, char** argv)
         {
             const int fsr_before = counts(3);
             auto u = UpscaleDesc(l.list.Get());
-            u.output.state = FFX_API_RESOURCE_STATE_COMMON;
+            u.output.state = 0x4000; // untranslatable
             CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK);
             CHECK(counts(3) == fsr_before + 1); // fell back to FSR
-            CHECK(na::ffx::GetStats().fallbacks == 1 && std::strstr(na::ffx::GetStats().reason, "UAV"));
+            CHECK(na::ffx::GetStats().fallbacks == 1 && std::strstr(na::ffx::GetStats().reason, "translate"));
         }
         {
             ffxContext unknown = reinterpret_cast<ffxContext>(0x5555);
@@ -203,6 +207,78 @@ int main(int argc, char** argv)
             CHECK(dispatch(&unknown, &u.header) == FFX_API_RETURN_OK);
             CHECK(counts(3) == fsr_before + 1);
             CHECK(na::ffx::GetStats().unknown_context == 1 && std::strstr(na::ffx::GetStats().reason, "before"));
+        }
+        auto last_reset = reinterpret_cast<int (*)()>(reinterpret_cast<void*>(GetProcAddress(stub, "StubLastReset")));
+        REQUIRE(last_reset != nullptr);
+        const auto dlss_reset = [] { return fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset); };
+        // R-304: switching between DLSS and FSR forces a reset on whichever side
+        // missed frames; uninterrupted runs keep history. The game's own
+        // descriptor (reset=false) is never modified.
+        {
+            auto u = UpscaleDesc(l.list.Get());
+            u.reset = false;
+            CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK && dlss_reset() == 1); // FSR ran last
+            CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK && dlss_reset() == 0); // DLSS continues
+            auto fb = u;
+            fb.motionVectors.resource = nullptr; // forces the FSR fallback
+            const int fsr_before = counts(3);
+            CHECK(dispatch(&ctx, &fb.header) == FFX_API_RETURN_OK && counts(3) == fsr_before + 1);
+            CHECK(last_reset() == 1);  // FSR missed the DLSS frames
+            CHECK(fb.reset == false);  // caller's descriptor untouched
+            CHECK(dispatch(&ctx, &fb.header) == FFX_API_RETURN_OK && last_reset() == 0); // FSR continues
+            CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK && dlss_reset() == 1);  // back to DLSS
+            na::ffx::SetMode(na::ffx::Mode::Observe);
+            CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK && last_reset() == 1); // mode change
+            CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK && last_reset() == 0);
+            na::ffx::SetMode(na::ffx::Mode::ReplaceWithDlss);
+        }
+        // R-303: two contexts of the same size keep separate DLSS histories, and a
+        // destroyed-then-recreated context never inherits the old one.
+        {
+            ffxContext ctx2 = nullptr;
+            REQUIRE(create(&ctx2, &cd.header, nullptr) == FFX_API_RETURN_OK && ctx2);
+            auto u = UpscaleDesc(l.list.Get());
+            u.reset = false;
+            CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK);
+            const uintptr_t h_ctx = fake::last_eval_handle;
+            CHECK(dispatch(&ctx2, &u.header) == FFX_API_RETURN_OK);
+            const uintptr_t h_ctx2 = fake::last_eval_handle;
+            CHECK(h_ctx2 != h_ctx && dlss_reset() == 1);
+            CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK);
+            CHECK(fake::last_eval_handle == h_ctx && dlss_reset() == 0);
+            CHECK(destroy(&ctx2, nullptr) == FFX_API_RETURN_OK);
+            ffxContext ctx3 = nullptr;
+            REQUIRE(create(&ctx3, &cd.header, nullptr) == FFX_API_RETURN_OK && ctx3);
+            CHECK(dispatch(&ctx3, &u.header) == FFX_API_RETURN_OK);
+            CHECK(fake::last_eval_handle != h_ctx && fake::last_eval_handle != h_ctx2 && dlss_reset() == 1);
+            CHECK(destroy(&ctx3, nullptr) == FFX_API_RETURN_OK);
+        }
+        // ARGON-G2-003: a COMMON output is transitioned to UAV and back, not refused.
+        {
+            const uint64_t replaced = na::ffx::GetStats().replaced, barriers = na::ffx::GetStats().barriers;
+            auto u = UpscaleDesc(l.list.Get());
+            u.reset = false;
+            // A real texture: the barrier is recorded on a real list.
+            auto out_tex = test::CreateTexture(d.device.Get(), 1920, 1080, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                               D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+            REQUIRE(out_tex);
+            u.output = Res(reinterpret_cast<uintptr_t>(out_tex.Get()), FFX_API_RESOURCE_STATE_COMMON);
+            CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK);
+            CHECK(na::ffx::GetStats().replaced == replaced + 1 && na::ffx::GetStats().barriers == barriers + 1);
+            CHECK(fake::P(fake::last_eval, NVSDK_NGX_Parameter_Output) == out_tex.Get());
+        }
+        // ARGON-G2-001: dynamic resolution inside the context's maxRenderSize keeps one feature and its history.
+        {
+            const int creates = fake::creates;
+            const uint32_t widths[10] = {960, 1000, 1114, 1200, 1280, 1180, 1050, 1280, 990, 1114};
+            for (int i = 0; i < 10; ++i) {
+                auto u = UpscaleDesc(l.list.Get());
+                u.reset = false;
+                u.renderSize = {widths[i], widths[i] * 9 / 16};
+                CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK);
+                CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
+            }
+            CHECK(fake::creates == creates); // created once at 1280x720 earlier, never again
         }
         l.list->Close();
         na::dlss::Shutdown();
@@ -213,7 +289,7 @@ int main(int argc, char** argv)
     {
         const int fsr_before = counts(3);
         auto u = UpscaleDesc(reinterpret_cast<void*>(0x99));
-        u.output.state = FFX_API_RESOURCE_STATE_COMMON; // refused before DLSS is consulted
+        u.output.state = 0x4000; // refused before DLSS is consulted
         CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK);
         CHECK(counts(3) == fsr_before + 1); // no SDK: always FSR
         CHECK(na::ffx::GetStats().fallbacks == 1);
@@ -223,7 +299,8 @@ int main(int argc, char** argv)
 
     // 5. Destroy forgets the context.
     ffxContext gone = ctx;
-    CHECK(destroy(&ctx, nullptr) == FFX_API_RETURN_OK && counts(1) == 1);
+    const int destroys_before = counts(1);
+    CHECK(destroy(&ctx, nullptr) == FFX_API_RETURN_OK && counts(1) == destroys_before + 1);
     {
         auto u = UpscaleDesc(reinterpret_cast<void*>(0x99));
         CHECK(dispatch(&gone, &u.header) == FFX_API_RETURN_OK);
@@ -231,6 +308,6 @@ int main(int argc, char** argv)
         REQUIRE(na::ffx::LastObservation(&o));
         CHECK(!o.context_known);
     }
-    CHECK(na::ffx::GetStats().contexts_destroyed == 1);
+    CHECK(na::ffx::GetStats().contexts_destroyed == static_cast<uint64_t>(counts(1)));
     return test::finish("ffx_intercept_test");
 }
