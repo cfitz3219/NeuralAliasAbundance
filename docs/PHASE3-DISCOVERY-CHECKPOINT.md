@@ -61,3 +61,11 @@ identity, failed-sentinel attachment behavior, concurrent first-registration/que
 lifetime and sync/execute overlap accounting. These are not claimed fixed or reproduced
 by the descriptor experiment. H2/H3 remain unavailable at this checkpoint, so live
 classifier integration and A9 Anno diagnostics cannot yet provide trustworthy results.
+
+## Final CI confirmation
+
+Final task-head CI completed successfully on all three jobs (Linux GCC, Windows MSVC,
+Windows with public SDK headers): A5 b53ad53 run40089229958, A6 e635290 run40089230956,
+A7 4341900 run40089233177, A8 da205b6 run40089173392. These runs cover individual task
+branches, not the integrated C8a experiment. Read-only git merge-tree checks confirmed
+all four task branches merge cleanly against mainc78a50e. No PR was merged.
