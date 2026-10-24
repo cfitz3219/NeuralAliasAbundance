@@ -1,3 +1,8 @@
+# 2026-10-24 — queue/H2/H3 CI confirmed
+
+Combined PR27 7abf2bc passes all3 CI jobs (run40092641546); queue PR29 152cf47 all3 pass (40092433784); isolated consumer PR25 1e1e467 CI succeeds. Local combined46/46 passes, zero skips. Queue and integration merge-tree checks against main are clean. Latest-CI-pending statements below are superseded. No PR merged; remaining C9-H3-REVIEW-1 and acquisition work stays open with Claude. No user action required for this completed checkpoint.
+
+---
 # 2026-10-24 — queue defect FIXED; H2/H3 integration tested
 
 Queue patch3aa7745 in PR29 (head152cf47) fixes Execute/Signal/Wait observation ambiguity. Its regression is mandatory; all3 CI jobs pass run40092433784. Combined PR27 at7abf2bc includes H2/H3, bounded consumers and real fixtures: full Release and46/46 local non-GPU-labelled CTests pass, zero skips. Combined CI pending. This supersedes earlier pending queue/H2/H3 status on this branch only.
@@ -197,6 +202,7 @@ Cort: "finish this up and close gate 2!" Claude's side is complete, and with Ast
   - whether the overlay's own D3D12 objects also keep a removed device alive (not yet checked).
 
 **Next:** Phase 3.
+
 
 
 

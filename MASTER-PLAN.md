@@ -244,3 +244,7 @@ Claude238f508 integrated with semantic descriptor-merge correction. Full Release
 Queue defect fixed in PR29 focused3aa7745, head152cf47. Mandatory overlap and concurrent bookkeeping tests pass; all3 CI jobs pass run40092433784. Combined PR27 at7abf2bc integrates Claude H2 b736b6a / H3 29e8647, bounded decoder support and actual producer fixture wrappers. Local full Release and46/46 non-GPU-labelled CTests pass, zero skips. Latest combined CI pending. Prior pending-overlap and H2/H3-absent statuses are superseded for this integration branch.
 
 Phase3 continues: H2 representational gaps, H3 underlying Unmap/copy lifetime and binding-provenance issues, and asynchronous texture evidence remain outstanding. C9-H3-REVIEW-1 in COMMS assigns producer fixes to Claude; exact queue patch supplied to avoid duplication. All APP_SYNC_UNKNOWN snapshots remain incomplete, not qualified camera input. No deployment or user attendance required for this checkpoint.
+
+## 2026-10-24 — queue/H2/H3 checkpoint CI confirmed
+
+PR27 head7abf2bc CI40092641546 passes all3 jobs. PR29 head152cf47 CI40092433784 passes all3; PR25 head1e1e467 CI40092363582 succeeds. Local combined46/46 remains the tested hardware/fixture evidence. Prior latest-CI-pending entries are superseded for these exact heads. Remaining Phase3 acquisition and producer lifetime/provenance work is unchanged; no merge/deployment.
