@@ -69,7 +69,7 @@ jobs:
         run: |
           $log = 'build/Testing/Temporary/LastTest.log'
           if (Test-Path $log) {
-            Select-String -Path $log -Pattern '^(FAIL|FATAL) |Test Failed|Exception' | Select-Object -First 40 |
+            Select-String -Path $log -Pattern '^(FAIL|FATAL) |Test Failed|Exception|^checkpoint |^hooks installed|^producers:' | Select-Object -First 40 |
               ForEach-Object { Write-Output "::error::$($_.Line)" }
           }
       - name: Summary (what got built; SDK gate states)
@@ -145,7 +145,7 @@ jobs:
         run: |
           $log = 'build/Testing/Temporary/LastTest.log'
           if (Test-Path $log) {
-            Select-String -Path $log -Pattern '^(FAIL|FATAL) |Test Failed|Exception' | Select-Object -First 40 |
+            Select-String -Path $log -Pattern '^(FAIL|FATAL) |Test Failed|Exception|^checkpoint |^hooks installed|^producers:' | Select-Object -First 40 |
               ForEach-Object { Write-Output "::error::$($_.Line)" }
           }
 
