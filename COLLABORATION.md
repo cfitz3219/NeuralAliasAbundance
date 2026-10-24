@@ -1,5 +1,85 @@
 # Collaboration agreement — NeuralAlias / NeuralAliasAbundance
 
+## 2026-10-24 — Argon independent gate audit (Cort's direction)
+
+This supplements the accepted Astra/Claude ownership split. **Gemini Argon is the
+independent third auditor at each gate, starting with Gate 2.** Gate 1's completed
+reviews/tests remain historical; this does not claim Argon reviewed them.
+
+### Sequence and responsibilities
+
+1. Astra and Claude finish the phase and cross-review each other's PRs.
+2. Authors address findings; the other agent checks the fixes. Run relevant
+   regressions and collect CI evidence. Record any unresolved questions explicitly.
+3. Astra assembles the Argon handoff; Claude checks that his work and qualifications
+   are included. Give Argon the entire repository context and the complete gate
+   change set, not just excerpts selected by the authors.
+4. Argon audits the exact snapshot independently for architectural and functional
+   defects, synchronization/lifetime errors, input assumptions, test gaps, and
+   consistency with the universal DX12 acquisition/synthesis goal. Ask for new
+   failure paths as well as scrutiny of our fixes; do not treat our prior approval
+   as evidence that a component is correct.
+5. Authors answer every finding with a fix commit and regression evidence, or a
+   reasoned disagreement supported by source/API/runtime evidence. The peer checks
+   fixes; send affected changes and responses back to Argon. Unresolved blocking
+   findings or disagreements go to Cort rather than silently disappearing.
+6. Record Argon's verdict against the final audited commit(s), then run the
+   scheduled Windows/GPU/game validation and close the gate. Fixes prompted by that
+   session receive peer review and an Argon delta audit when they materially change
+   the audited implementation. Ordinary development tests/CI are never postponed
+   to wait for a gate audit.
+
+Argon is an auditor, not a new code owner. Existing branches, ownership and frozen
+interface rules remain in effect. An audit recommendation is evaluated as a
+technical finding; it does not by itself authorize unrelated implementation,
+interface changes or game deployment. Additional review improves defect detection;
+passing it is not proof of universal compatibility or freedom from bugs.
+
+### Access and handoff
+
+No Gemini tool/session is connected to Astra's workspace at adoption time. Cort
+can give the packet to his Gemini/Argon session using repository access or a source
+bundle. Do not claim access was granted or the audit ran until confirmed. Prefer
+read access; no write credential is needed for an audit. Never put credentials,
+private SDKs, runtime DLLs, game files or private captures in the handoff. If direct
+Gemini access becomes available, retain the same packet and verdict records.
+
+Post packet links, delivery status, Argon's returned findings and author responses
+through **COMMS.md**. Preserve an imported audit's attribution; distinguish its
+claims from verified findings and Cort's instructions. At a gate, record audit
+status explicitly: `not ready`, `ready for Argon`, `delivered`, `findings open`, or
+`audit complete`. Silence and elapsed time are not an audit verdict.
+
+### Required packet contents
+
+- Gate number, universal-DX12 objective, scope and acceptance criteria.
+- Base commit, candidate/integration commit, and every included PR with exact head
+  SHA. Link full trees and diffs. If PRs are unmerged, provide each branch snapshot
+  and the intended combined snapshot/merge order; main alone may omit the work.
+- Task/owner inventory, shared interfaces, architecture, and known limitations.
+- Both peer reviews, finding dispositions, fix commits and remaining disagreements.
+- Reproducible build/test commands, CI run URLs and tested SHAs; distinguish mocks,
+  software adapters and real RTX/game runs. Include failures, skips and unrun checks.
+- Concrete request: audit the whole gate and relevant surrounding code; report
+  each issue with `ARGON-G<gate>-<number>`, severity, file/line at the audited SHA,
+  reproducible trigger, impact, proposed correction and a regression that detects it.
+- Final verdict: `clear`, `changes required`, or `insufficient evidence`, with the
+  exact audited snapshot. Later commits are not covered by an earlier verdict.
+
+A reusable prompt for the handoff:
+
+> You are Argon, the independent third auditor for NeuralAliasAbundance Gate N.
+> Astra and Claude have completed the attached cross-reviews and responses.
+> Audit the full pinned repository/change set and relevant surrounding architecture.
+> Pursue the universal DX12 goal through concrete engineering; distinguish current
+> implementation gaps from feasibility claims. Independently test our assumptions
+> and the adequacy of our tests. Separate demonstrated bugs, plausible risks and
+> questions; support findings with precise source/API evidence and a failure path.
+> Return numbered findings and a verdict for the exact snapshot. State what you
+> could not access or execute. Do not infer success from our reports alone.
+
+---
+
 ## 2026-10-23 recovery coordination — proposed, awaiting Claude
 
 The September agreement below is preserved as history; its machine paths,

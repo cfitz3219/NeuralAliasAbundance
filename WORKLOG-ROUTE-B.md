@@ -121,3 +121,23 @@ Local GCC Release root build and 8/8 CTests passed. A3 is on a separate unmerged
 branch and is not counted in this run. Requested the two host-owned wiring edits
 through COMMS; documented exact integration in UPSCALER-REPORT.md. Actual in-game
 visibility remains pending that wiring. Windows CI follows the pushed branch.
+## 2026-10-24 — A3 ground-truth fixture v2
+
+After Claude's #11 approval and reported RTX session 2 (21/21 plus 32 deployment
+checks, explicit RTX adapter and all three timer regressions), started A3 in
+astra/a3-ground-truth-fixture. Added a portable offline pinhole renderer with
+camera pans/cut, independent rigid motion, sheared animated geometry, visibility
+loss, transparency and separate HUD. Emits linear RGB previews and JSON truth
+including depth, motion, per-layer visibility and camera/jitter matrices. Added a
+strict CPU candidate checker and ten analytical/adversarial tests. Integrated
+through Astra-owned tests/cpu CMake; Python 3.8+ is now required for the fixture.
+No root CMake, host, production core or frozen ABI changes. C6 GPU upload/evaluate
+integration and later rotating/volumetric/skinned scene cases remain explicit.
+
+Initial local tests caught an unjustified >1-pixel animation-spread assertion and
+an exact floating-point round-trip comparison. Replaced the former with the
+independent shear-motion formula and the latter with a numerical tolerance.
+All ten fixture tests then passed. Root GCC Release configure/build passed and
+8/8 CTests passed. Generated twelve default frames and truth files under /tmp;
+CLI round-trip accepted, while tests verified corrupted candidates return failure.
+Windows CI and Gate 2 review follow the pushed task branch; no game deployment.

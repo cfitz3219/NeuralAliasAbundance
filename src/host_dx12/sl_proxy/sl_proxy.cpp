@@ -1,7 +1,7 @@
 #include "host_dx12/fg/camera.hpp"
-#include "host_dx12/adapters/tlou1/timing.hpp"
 #include "host_dx12/adapters/tlou1/apply.hpp"
 #include "host_dx12/adapters/tlou1/timing.hpp"
+#include "host_dx12/sl_proxy/sl_abi.hpp"
 // Route A: sl.interposer.dll stand-in for Streamline titles.
 //
 // Every export is a PE forwarder (see sl_proxy_exports.inl) to sl_interposer_real.dll,
@@ -25,7 +25,9 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 
 #include "host_dx12/fg/frame_gen.hpp"
@@ -156,95 +158,177 @@ extern "C" __declspec(dllexport) const char* NeuralAliasSLProxyIdentity()
     return "NeuralAliasAbundance sl.interposer forwarding proxy 0.3.0";
 }
 
-// Typed wrapper for slInit (SL 1.x: bool slInit(const sl::Preferences&, int)).
-// The Preferences struct is passed through untouched (its 1.4.7 layout is
-// unverified â€” we never read it). Belt-and-braces for the NGX attach: if the
-// game reaches slInit before the init thread finished, hook the NGX core
-// synchronously here, on the game thread, outside the loader lock.
+// C7b: ABI-neutral wrappers. Streamline 1.x and 2.x share these export names
+// but not their signatures (2.x passes FrameToken& / ViewportHandle& /
+// uint64_t sdkVersion where 1.x passed 32-bit values, and returns sl::Result,
+// 0 = ok, where 1.x returned bool). Every wrapper therefore takes and forwards
+// five full-width integer arguments and returns the full RAX value, which is
+// exact for both on x64 (integer/pointer args in RCX, RDX, R8, R9, then the
+// stack; a fifth slot a 4-argument caller did not pass is caller stack memory
+// that the real function ignores). Arguments are interpreted only where the
+// ABI can be proven from the data itself (sl_abi.hpp).
 namespace {
-using SlInitFn = bool(__cdecl*)(const void* prefs, int app_id);
-SlInitFn resolve_real_slinit()
+using Fwd5 = uint64_t(__cdecl*)(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+Fwd5 resolve_fwd(const char* name)
 {
     HMODULE real = GetModuleHandleW(L"sl_interposer_real.dll");
     if (!real) real = LoadLibraryW(L"sl_interposer_real.dll");
-    if (!real) return nullptr;
-    return reinterpret_cast<SlInitFn>(
-        reinterpret_cast<void*>(GetProcAddress(real, "slInit")));
+    return real ? reinterpret_cast<Fwd5>(reinterpret_cast<void*>(GetProcAddress(real, name))) : nullptr;
 }
+// Resolution is retried until it succeeds (a failed lookup is never cached).
+Fwd5 cached_fwd(std::atomic<Fwd5>& slot, const char* name)
+{
+    Fwd5 f = slot.load(std::memory_order_acquire);
+    if (!f && (f = resolve_fwd(name)) != nullptr) slot.store(f, std::memory_order_release);
+    return f;
+}
+// Gate 2 R-306: what a wrapper returns when the real Streamline function is
+// missing (no real interposer, or no such export), so nothing ran. It must be
+// a FAILURE for both ABIs without knowing which one the caller uses:
+//   SL 1.x returns bool  -> the caller tests AL:  0x100 has AL == 0  -> false.
+//   SL 2.x returns sl::Result -> the caller tests EAX against eOk (0):
+//                           0x100 != 0 -> an error (no defined Result uses 256).
+constexpr uint64_t kNotExecuted = 0x100;
+
+// Guarded copies (no C++ objects in these frames: SEH only).
+size_t guarded_copy(void* dst, const void* src, size_t n)
+{
+    __try {
+        memcpy(dst, src, n);
+        return n;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+// SL 2.x FrameToken: virtual operator uint32_t() is its first vtable entry.
+bool frame_token_value(const void* token, uint32_t* out)
+{
+    uint8_t head[8 + na::sl::kHeaderSize] = {};
+    if (!token || guarded_copy(head, token, sizeof(head)) != sizeof(head)) return false;
+    if (!na::sl::HasType(head + 8, na::sl::kHeaderSize, na::sl::kFrameTokenGuid)) return false;
+    __try {
+        using Op = uint32_t(__cdecl*)(const void*);
+        *out = (*reinterpret_cast<Op const* const*>(token))[0](token);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+std::atomic<uint32_t> g_sl_layout{0};     // na::sl::Layout last seen in slSetConstants
+std::atomic<uint64_t> g_sl_camera_seen{0}; // camera blocks decoded (any layout)
 } // namespace
 
-extern "C" __declspec(dllexport) bool __cdecl slInit(const void* prefs, int app_id)
+extern "C" __declspec(dllexport) uint64_t __cdecl slInit(uintptr_t prefs, uintptr_t app_or_sdk_version, uintptr_t c, uintptr_t d, uintptr_t e)
 {
-    // Only when observation is enabled by the ini â€” otherwise the proxy must
-    // stay a pure forwarder with zero hooks.
+    // Only when observation is enabled by the ini; otherwise the proxy must
+    // stay a pure forwarder with zero hooks. Belt-and-braces for the NGX attach:
+    // hook the NGX core here, on the game thread, outside the loader lock.
     if (observe_enabled(nullptr, 0, nullptr, 0) && na::hooking::Initialize())
         na::ngx::PreloadAndHookNgxCore();
-    SlInitFn real = resolve_real_slinit();
-    return real ? real(prefs, app_id) : false;
+    static std::atomic<Fwd5> real_slot{nullptr};
+    const Fwd5 real = cached_fwd(real_slot, "slInit");
+    return real ? real(prefs, app_or_sdk_version, c, d, e) : kNotExecuted;
 }
 
-// A71: typed wrappers for the two Streamline calls that carry the game's DLSS
-// settings (SL 1.x: bool slSetFeatureConstants(Feature, const void* consts,
-// uint32_t frameIndex, uint32_t id); bool slGetFeatureSettings(Feature,
-// const void* consts, void* settings)). Arguments pass through untouched; the
-// call is recorded with its thread and 24 raw return addresses so the game's
-// settings-apply path (synchronous, in game code) is visible in the status
-// log. Nothing in the constants block is interpreted (layout unverified).
-namespace {
-using SlSetFeatureConstantsFn = bool(__cdecl*)(uint32_t, const void*, uint32_t, uint32_t);
-using SlGetFeatureSettingsFn = bool(__cdecl*)(uint32_t, const void*, void*);
-template <typename Fn> Fn resolve_real(const char* name)
+extern "C" __declspec(dllexport) uint64_t __cdecl slSetConstants(uintptr_t constants, uintptr_t frame, uintptr_t view, uintptr_t d, uintptr_t e)
 {
-    HMODULE real = GetModuleHandleW(L"sl_interposer_real.dll");
-    if (!real) real = LoadLibraryW(L"sl_interposer_real.dll");
-    return real ? reinterpret_cast<Fn>(reinterpret_cast<void*>(GetProcAddress(real, name))) : nullptr;
-}
-} // namespace
-
-namespace {
-bool copy_camera(na::fg::Camera& out,const void* in) {
-    __try { memcpy(&out,in,sizeof(out)); return true; }
-    __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
-}
-}
-extern "C" __declspec(dllexport) bool __cdecl slSetConstants(const void* constants, uint32_t frame, uint32_t view) {
-    using Fn=bool(__cdecl*)(const void*,uint32_t,uint32_t);
-    static Fn real=resolve_real<Fn>("slSetConstants");
-    const bool ok=real && real(constants,frame,view);
-    if (ok && constants && na::tlou1::TimingAttached()) {
-        na::fg::Camera copy{};
-        if (!copy_camera(copy,constants)) return ok;
-        na::fg::RecordCamera(uint64_t(frame)+1,view,copy);
+    static std::atomic<Fwd5> real_slot{nullptr};
+    const Fwd5 real = cached_fwd(real_slot, "slSetConstants");
+    if (!real) return kNotExecuted;
+    const uint64_t ret = real(constants, frame, view, d, e);
+    if (!constants) return ret;
+    // Which ABI? Only 2.x Constants carry the Constants type GUID.
+    uint8_t buf[na::sl::kV2ConstantsSize + 1] = {};
+    size_t got = guarded_copy(buf, reinterpret_cast<const void*>(constants), na::sl::kHeaderSize);
+    if (got && na::sl::HasType(buf, got, na::sl::kConstantsGuid))
+        got = guarded_copy(buf, reinterpret_cast<const void*>(constants), na::sl::kV2ConstantsSize);
+    else
+        got = guarded_copy(buf, reinterpret_cast<const void*>(constants), na::sl::kV1ConstantsSize);
+    na::fg::Camera cam{};
+    const na::sl::Layout layout = na::sl::DecodeConstants(buf, got, cam);
+    if (layout == na::sl::Layout::Unknown) return ret;
+    uint32_t frame_index = 0, viewport = 0;
+    bool ok = false;
+    if (layout == na::sl::Layout::V1) {
+        ok = (ret & 0xFFu) != 0; // bool
+        frame_index = static_cast<uint32_t>(frame);
+        viewport = static_cast<uint32_t>(view);
+    } else {
+        ok = static_cast<uint32_t>(ret) == 0; // sl::Result::eOk
+        uint8_t vh[na::sl::kHeaderSize + 4] = {};
+        const size_t vgot = view ? guarded_copy(vh, reinterpret_cast<const void*>(view), sizeof(vh)) : 0;
+        ok = ok && frame_token_value(reinterpret_cast<const void*>(frame), &frame_index) &&
+             na::sl::ViewportValue(vh, vgot, &viewport);
     }
-    return ok;
-}
-extern "C" __declspec(dllexport) bool __cdecl slEvaluateFeature(void* list,uint32_t feature,uint32_t frame,uint32_t view) {
-    using Fn=bool(__cdecl*)(void*,uint32_t,uint32_t,uint32_t);
-    static Fn real=resolve_real<Fn>("slEvaluateFeature");
-    na::fg::EvaluationScope scope(frame,view);
-    return real && real(list,feature,frame,view);
+    if (!ok) return ret;
+    g_sl_layout.store(static_cast<uint32_t>(layout), std::memory_order_relaxed);
+    g_sl_camera_seen.fetch_add(1, std::memory_order_relaxed);
+    na::fg::RecordCamera(uint64_t(frame_index) + 1, viewport, cam); // validated inside (ValidCamera)
+    return ret;
 }
 
-extern "C" __declspec(dllexport) bool __cdecl slSetFeatureConstants(uint32_t feature, const void* consts, uint32_t frame_index, uint32_t id)
+extern "C" __declspec(dllexport) uint64_t __cdecl slEvaluateFeature(uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e)
 {
-    static SlSetFeatureConstantsFn real = resolve_real<SlSetFeatureConstantsFn>("slSetFeatureConstants");
+    static std::atomic<Fwd5> real_slot{nullptr};
+    const Fwd5 real = cached_fwd(real_slot, "slEvaluateFeature");
+    if (!real) return kNotExecuted;
+    // 1.x: (void* list, Feature, uint32 frame, uint32 viewport): the explicit
+    // frame/viewport scope lets the NGX evaluate find this frame's camera.
+    // 2.x: (Feature, const FrameToken&, inputs**, uint32, CommandBuffer*): the
+    // viewport travels inside `inputs`; no scope (FG then waits for a camera
+    // it can match, which is the safe behaviour).
+    const uint32_t layout = g_sl_layout.load(std::memory_order_relaxed);
+    uint32_t token_frame = 0;
+    const bool v1 = layout == static_cast<uint32_t>(na::sl::Layout::V1) ||
+                    (layout == 0 && (c >> 32) == 0 && (d >> 32) == 0 && !frame_token_value(reinterpret_cast<const void*>(b), &token_frame));
+    if (v1) {
+        na::fg::EvaluationScope scope(static_cast<uint32_t>(c), static_cast<uint32_t>(d));
+        return real(a, b, c, d, e);
+    }
+    return real(a, b, c, d, e);
+}
+
+extern "C" __declspec(dllexport) uint64_t __cdecl slSetFeatureConstants(uintptr_t feature, uintptr_t consts, uintptr_t c, uintptr_t d, uintptr_t e)
+{
+    static std::atomic<Fwd5> real_slot{nullptr};
+    const Fwd5 real = cached_fwd(real_slot, "slSetFeatureConstants");
     if (observe_enabled(nullptr, 0, nullptr, 0)) {
         void* frames[24] = {};
         USHORT n = RtlCaptureStackBackTrace(1, 24, frames, nullptr);
-        na::ngx::RecordSlCall(1, feature, consts, frames, n);
+        na::ngx::RecordSlCall(1, static_cast<uint32_t>(feature), reinterpret_cast<const void*>(consts), frames, n);
     }
-    return real ? real(feature, consts, frame_index, id) : false;
+    return real ? real(feature, consts, c, d, e) : kNotExecuted;
 }
 
-extern "C" __declspec(dllexport) bool __cdecl slGetFeatureSettings(uint32_t feature, const void* consts, void* settings)
+extern "C" __declspec(dllexport) uint64_t __cdecl slGetFeatureSettings(uintptr_t feature, uintptr_t consts, uintptr_t settings, uintptr_t d, uintptr_t e)
 {
-    static SlGetFeatureSettingsFn real = resolve_real<SlGetFeatureSettingsFn>("slGetFeatureSettings");
+    static std::atomic<Fwd5> real_slot{nullptr};
+    const Fwd5 real = cached_fwd(real_slot, "slGetFeatureSettings");
     if (observe_enabled(nullptr, 0, nullptr, 0)) {
         void* frames[24] = {};
         USHORT n = RtlCaptureStackBackTrace(1, 24, frames, nullptr);
-        na::ngx::RecordSlCall(2, feature, consts, frames, n);
+        na::ngx::RecordSlCall(2, static_cast<uint32_t>(feature), reinterpret_cast<const void*>(consts), frames, n);
     }
-    return real ? real(feature, consts, settings) : false;
+    return real ? real(feature, consts, settings, d, e) : kNotExecuted;
+}
+
+// Gate 2 R-307 diagnostics: the camera recorded for (engine frame + 1, viewport),
+// copied into `out` (sizeof(na::fg::Camera) bytes). False when none was stored.
+extern "C" __declspec(dllexport) bool NeuralAliasSLProxyFindCamera(uint64_t frame_plus_one, uint32_t viewport, void* out)
+{
+    na::fg::Camera c{};
+    if (!out || !na::fg::FindCamera(frame_plus_one, viewport, c)) return false;
+    memcpy(out, &c, sizeof(c));
+    return true;
+}
+
+// C7b diagnostics: which Streamline Constants ABI this game uses (0 unknown,
+// 1 = 1.x, 2 = 2.x) and how many camera blocks were decoded.
+extern "C" __declspec(dllexport) uint32_t NeuralAliasSLProxyLayout(uint64_t* out_camera_blocks)
+{
+    if (out_camera_blocks) *out_camera_blocks = g_sl_camera_seen.load(std::memory_order_relaxed);
+    return g_sl_layout.load(std::memory_order_relaxed);
 }
 
 // Diagnostic export so tests/tools outside this DLL can read observation

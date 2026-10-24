@@ -1,3 +1,47 @@
+# 2026-10-24 — Gate 2 takeover code/tests complete; PR #17 ready
+
+Cort asked Astra to finish Opus's tasks. The combined candidate is
+[PR #17](https://github.com/cfitz3219/NeuralAliasAbundance/pull/17), head
+`7b0339ad6436fb256bbe11ff70d8c88e12328bb0` on `astra/g2-completion`.
+It integrates #12–#16 and completes the remaining backend ordering/lifecycle,
+interceptor lock/exposure, provenance and regression fixes. Both push and PR CI
+are green: Linux 9/9, Windows 24/24, SDK Windows 28/28, deployment 32 checks.
+D3D12 debug-state assertions ran for exposure restoration on success and failure.
+See COMMS for exact evidence and `docs/reviews/GATE2-completion.md` on the branch
+for finding responses. Earlier task PRs remain historical records.
+
+Main's runtime code is not merged or deployed. Next gate steps are independent
+review of the takeover delta/remaining Argon audit, then RTX/runtime/game
+qualification. Fake NGX/software D3D12 CI does not substitute for that session.
+Record-ahead isolation resets history; real-runtime DRS ranges, visual/performance
+impact, FSR/XeSS jitter and physical device-loss recovery need qualification.
+No independent approval of Astra's new changes is claimed.
+
+# 2026-10-24 — Gate 2 Astra fixes validated; peer recheck pending
+
+A3 #12 is at dd7e823: optional Python discovery, explicit fixture skip when absent,
+and documented single-layer transparency assumption. A4 #13 is at 61b74b6:
+host startup wiring complete, C7 producer snapshots connected, requests kept
+separate from successful native evaluations, injector output attributed to DLSS.
+A4 includes C7 f2eeec41 as a dependency; Claude's open C6/C7 review fixes must
+still be incorporated and revalidated before gate closure.
+
+CI: A3 Linux 8/8, Windows 18/18 and 20/20; A4 Linux 8/8, Windows 21/21 and 25/25.
+Both deployment suites passed 32 checks. Local A3 build without Python discovery
+passed 7/7 remaining tests. Actual host menu registration/mapping/drawing passed
+Windows CPU CI; in-game rendering/coverage remains unqualified. Responses to all
+Claude Gate 2 review items are in COMMS. Awaiting Claude's recheck; Argon not ready.
+
+# 2026-10-24 — Argon joins the gate review process
+
+Cort has added Gemini Argon as independent final auditor after Astra/Claude
+cross-review and fixes, starting at Gate 2. MASTER-PLAN and COLLABORATION define
+packet contents, exact-commit scope, finding responses and gate closure. Routine
+CI continues during development. No direct Gemini connector is available here;
+prepare a repo-linked packet for Cort's Argon session when cross-review completes.
+Do not claim Argon access or approval before delivery and a returned verdict.
+Gate 2 is not yet ready for Argon; its phase work/cross-reviews are still pending.
+
 # 2026-10-24 — A3 fixture implemented; CI green
 
 PR #11 is merged. Claude reports RTX session 2 at dceaaab: 21/21 CTests,

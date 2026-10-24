@@ -24,7 +24,7 @@ jobs:
           cmake --build build --config Release --parallel 2>&1 | Tee-Object -FilePath build-log.txt
           $code = $LASTEXITCODE
           if ($code -ne 0) {
-            Select-String -Path build-log.txt -Pattern ': (fatal )?error [A-Z]+[0-9]+|error MSB|LINK : fatal' |
+            Select-String -Path build-log.txt -Pattern ': (fatal )?error [A-Z]+[0-9]+|error MSB|LINK : fatal|: warning C[0-9]+' |
               Select-Object -First 40 | ForEach-Object {
                 $m = ($_.Line -replace '^\s+','') -replace '\[[^\]]*\.vcxproj\]',''
                 Write-Output "::error::$m"
@@ -120,7 +120,7 @@ jobs:
           cmake --build build --config Release --parallel 2>&1 | Tee-Object -FilePath build-log.txt
           $code = $LASTEXITCODE
           if ($code -ne 0) {
-            Select-String -Path build-log.txt -Pattern ': (fatal )?error [A-Z]+[0-9]+|error MSB|LINK : fatal' |
+            Select-String -Path build-log.txt -Pattern ': (fatal )?error [A-Z]+[0-9]+|error MSB|LINK : fatal|: warning C[0-9]+' |
               Select-Object -First 40 | ForEach-Object {
                 $m = ($_.Line -replace '^\s+','') -replace '\[[^\]]*\.vcxproj\]',''
                 Write-Output "::error::$m"
@@ -139,6 +139,15 @@ jobs:
               if ($l -match 'Failed|\*\*\*Exception|Not Run|tests failed') { Write-Output "::error::$l" } else { Write-Output "::notice::$l" }
             }
           exit $code
+      - name: Report failing tests as annotations
+        if: failure()
+        shell: pwsh
+        run: |
+          $log = 'build/Testing/Temporary/LastTest.log'
+          if (Test-Path $log) {
+            Select-String -Path $log -Pattern '^(FAIL|FATAL) |Test Failed|Exception' | Select-Object -First 40 |
+              ForEach-Object { Write-Output "::error::$($_.Line)" }
+          }
 
   linux:
     name: Linux (GCC) portable core + CPU tests

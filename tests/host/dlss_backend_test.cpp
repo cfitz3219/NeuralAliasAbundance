@@ -22,6 +22,8 @@
 #include <nvsdk_ngx.h>
 
 #include <algorithm>
+#include <atomic>
+#include <thread>
 #include <cstring>
 #include <vector>
 
@@ -77,8 +79,9 @@ bool Record(test::Device& d, test::List& l, const na::dlss::EvalDesc& e)
 void Submit(ID3D12CommandQueue* q, test::List& l)
 {
     ID3D12CommandList* lists[] = {l.list.Get()};
+    na::dlss::BeforeExecute(q, 1, lists); // what the host's execute detour does, before
     q->ExecuteCommandLists(1, lists);
-    na::dlss::OnExecuted(q, 1, lists); // what the host's execute detour does
+    na::dlss::OnExecuted(q, 1, lists);    // ... and after the original call
 }
 } // namespace
 
@@ -112,6 +115,10 @@ int main()
         f = GoodFrame(); f.motion_space = abundance::MotionSpace::pixels_current_to_previous; f.motion.extent = f.output;
         CHECK(na::dlss::FromFrame(f, r, Quality::MaxQuality, &e, &why));
         CHECK(e.mv_display_res && e.mv_scale_x == 1.f);
+        // ARGON-G2-009: normalised motion at OUTPUT resolution scales by the output extent.
+        f = GoodFrame(); f.motion.extent = f.output; // normalized_current_to_previous
+        CHECK(na::dlss::FromFrame(f, r, Quality::MaxQuality, &e, &why));
+        CHECK(e.mv_display_res && e.mv_scale_x == 1920.f && e.mv_scale_y == 1080.f);
     }
 
     // Evaluate before any runtime: refused with a reason, nothing recorded.
@@ -304,26 +311,27 @@ int main()
     std::vector<test::List> keep; // lists recorded but deliberately never executed stay alive
     keep.reserve(64);
 
-    // R-301: two uses of ONE feature; the later one completes on queue B while
-    // the earlier one is held on queue A. Resizing must not release it.
+    // R-301: two uses of ONE feature, the earlier held on queue A, the later
+    // submitted on queue B (which, by R-303, waits for A). Resizing while both
+    // are outstanding must not release the feature.
     {
         test::ComPtr<ID3D12Fence> hold2;
         REQUIRE(SUCCEEDED(d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&hold2))));
         test::List la, lb;
         REQUIRE(Record(d, la, view_desc(1, 1920, 1080)));
         const uintptr_t hf = fake::last_eval_handle;
-        REQUIRE(Record(d, lb, view_desc(1, 1920, 1080)));
-        CHECK(fake::last_eval_handle == hf); // same feature
         REQUIRE(SUCCEEDED(d.queue->Wait(hold2.Get(), 1)));
         Submit(d.queue.Get(), la);
+        REQUIRE(Record(d, lb, view_desc(1, 1920, 1080)));
+        CHECK(fake::last_eval_handle == hf); // same feature
         Submit(q2.Get(), lb);
-        test::SignalAndWait(q2.Get(), q2_fence.Get(), q2_value, d.event, d.device.Get(), "queue B");
         kick(q2.Get());
         keep.emplace_back();
         REQUIRE(Record(d, keep.back(), view_desc(1, 2560, 1440))); // resize -> hf retired
-        CHECK(!fake::Released(hf));                                 // A still holds a use
+        CHECK(!fake::Released(hf));                                 // both uses still pending
         CHECK(na::dlss::GetStats().features_pending == 1);
         REQUIRE(SUCCEEDED(hold2->Signal(1)));
+        test::SignalAndWait(q2.Get(), q2_fence.Get(), q2_value, d.event, d.device.Get(), "queue B");
         d.WaitIdle();
         kick(d.queue.Get());
         CHECK(fake::Released(hf));
@@ -333,11 +341,13 @@ int main()
         keep.emplace_back();
         REQUIRE(Record(d, keep.back(), view_desc(2, 1920, 1080))); // never executed
         const uintptr_t hf = fake::last_eval_handle;
-        test::List lt;
+        for (int i = 0; i < 600; ++i) kick(d.queue.Get()); // the unexecuted record is abandoned
+        test::List lt; // R-303: allowed again once the unsubmitted predecessor is abandoned
         REQUIRE(Record(d, lt, view_desc(2, 1920, 1080)));
+        CHECK(fake::last_eval_handle == hf);
         Submit(d.queue.Get(), lt);
         d.WaitIdle();
-        for (int i = 0; i < 600; ++i) kick(d.queue.Get()); // the unexecuted record is abandoned
+        kick(d.queue.Get());
         const uint64_t leaked = na::dlss::GetStats().features_leaked;
         test::List lr;
         REQUIRE(Record(d, lr, view_desc(2, 2560, 1440)));
@@ -349,13 +359,18 @@ int main()
     }
     // R-301: an UNTRACKED use (no free completion record) taints its feature for good.
     {
+        // More evaluations than completion records, all on ONE list (R-303
+        // allows that) which is never executed.
         uintptr_t hf = 0;
-        for (int i = 0; i < 40; ++i) { // more evaluations than completion records, none executed
-            keep.emplace_back();
-            REQUIRE(Record(d, keep.back(), view_desc(3, 1920, 1080)));
+        keep.emplace_back();
+        REQUIRE(keep.back().Create(d.device.Get()));
+        const uint64_t untracked0 = na::dlss::GetStats().untracked;
+        for (int i = 0; i < 40 && na::dlss::GetStats().untracked == untracked0; ++i) {
+            REQUIRE(na::dlss::Evaluate(keep.back().list.Get(), view_desc(3, 1920, 1080)));
             hf = fake::last_eval_handle;
         }
-        CHECK(na::dlss::GetStats().untracked > 0);
+        keep.back().list->Close();
+        CHECK(na::dlss::GetStats().untracked == untracked0 + 1);
         for (int i = 0; i < 600; ++i) kick(d.queue.Get()); // free the records again
         test::List lr;
         REQUIRE(Record(d, lr, view_desc(3, 2560, 1440)));
@@ -390,19 +405,55 @@ int main()
         CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 1);
         Submit(d.queue.Get(), v3);
         d.WaitIdle();
-        // A view whose frames execute on different queues restarts its history.
-        test::List w1, w2, w3;
-        REQUIRE(Record(d, w1, view_desc(14, 1920, 1080)));
-        Submit(d.queue.Get(), w1);
-        d.WaitIdle();
-        REQUIRE(Record(d, w2, view_desc(14, 1920, 1080)));
-        CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
-        Submit(q2.Get(), w2);
-        test::SignalAndWait(q2.Get(), q2_fence.Get(), q2_value, d.event, d.device.Get(), "queue hop");
-        REQUIRE(Record(d, w3, view_desc(14, 1920, 1080)));
-        CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 1);
-        Submit(d.queue.Get(), w3);
-        d.WaitIdle();
+        // R-303: the same view submitted on another queue while its previous
+        // frame is still held: the second queue WAITS on the GPU for it.
+        {
+            test::ComPtr<ID3D12Fence> hold4;
+            REQUIRE(SUCCEEDED(d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&hold4))));
+            test::List w1, w2;
+            REQUIRE(Record(d, w1, view_desc(14, 1920, 1080)));
+            REQUIRE(SUCCEEDED(d.queue->Wait(hold4.Get(), 1)));
+            Submit(d.queue.Get(), w1);                      // A: held on queue 1
+            REQUIRE(Record(d, w2, view_desc(14, 1920, 1080)));
+            CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0); // history continues, in order
+            const uint64_t waits = na::dlss::GetStats().queue_waits;
+            Submit(q2.Get(), w2);                           // B: queue 2
+            CHECK(na::dlss::GetStats().queue_waits == waits + 1);
+            ++q2_value;
+            REQUIRE(SUCCEEDED(q2->Signal(q2_fence.Get(), q2_value)));
+            Sleep(50);
+            CHECK(q2_fence->GetCompletedValue() < q2_value); // B cannot finish before A
+            REQUIRE(SUCCEEDED(hold4->Signal(1)));
+            CHECK(test::WaitFence(q2_fence.Get(), q2_value, d.event, 10000) == test::WaitResult::Ok);
+            d.WaitIdle();
+        }
+        // R-303: record-ahead. A and B (same view, separate lists) recorded
+        // before either is submitted: in order is fine, out of order is counted
+        // and the view's next frame restarts its history.
+        {
+            test::List a, b;
+            REQUIRE(Record(d, a, view_desc(16, 1920, 1080)));
+            REQUIRE(Record(d, b, view_desc(16, 1920, 1080)));
+            CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
+            const uint64_t violations = na::dlss::GetStats().order_violations;
+            Submit(d.queue.Get(), a);
+            Submit(d.queue.Get(), b); // in order
+            d.WaitIdle();
+            CHECK(na::dlss::GetStats().order_violations == violations);
+            test::List c, e2;
+            REQUIRE(Record(d, c, view_desc(16, 1920, 1080)));
+            CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
+            REQUIRE(Record(d, e2, view_desc(16, 1920, 1080)));
+            Submit(d.queue.Get(), e2); // BEFORE its predecessor c
+            CHECK(na::dlss::GetStats().order_violations == violations + 1);
+            Submit(d.queue.Get(), c);
+            d.WaitIdle();
+            test::List f;
+            REQUIRE(Record(d, f, view_desc(16, 1920, 1080)));
+            CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 1); // history restarted
+            Submit(d.queue.Get(), f);
+            d.WaitIdle();
+        }
         // Work from another device is refused before NGX sees it.
         test::ComPtr<IDXGIAdapter> warp;
         test::ComPtr<ID3D12Device> other_dev;
@@ -465,6 +516,35 @@ int main()
     }
     for (int i = 0; i < 600; ++i) kick(d.queue.Get());
     d.WaitIdle();
+    na::dlss::Shutdown();
+    // ARGON-G2-004: one start-up transaction for every producer.
+    {
+        static std::atomic<int> inits{0};
+        static ID3D12Device* attach_to = nullptr;
+        attach_to = d.device.Get();
+        na::dlss::SetInitOwnOverrideForTests([](ID3D12Device*, const wchar_t*) {
+            inits.fetch_add(1);
+            Sleep(20); // widen the window a racing producer would need
+            return na::dlss::Attach(attach_to, fake::MakeApi());
+        });
+        // Two producers starting at once: exactly one start-up.
+        std::thread p1([&] { na::dlss::EnsureOn(d.device.Get(), L"."); });
+        std::thread p2([&] { na::dlss::EnsureOn(d.device.Get(), L"."); });
+        p1.join();
+        p2.join();
+        CHECK(inits.load() == 1);
+        CHECK(na::dlss::EnsureOn(d.device.Get(), L".")); // already running here
+        // Another LIVE device never takes DLSS over.
+        ID3D12Device* foreign = reinterpret_cast<ID3D12Device*>(static_cast<uintptr_t>(0x1234));
+        na::dlss::SetDeviceRemovedProbeForTests([](ID3D12Device*) { return false; });
+        CHECK(!na::dlss::EnsureOn(foreign, L"."));
+        CHECK(na::dlss::GetCapabilities().attached && inits.load() == 1);
+        // After the bound device is removed, a new device restarts DLSS once.
+        na::dlss::SetDeviceRemovedProbeForTests([](ID3D12Device*) { return true; });
+        CHECK(na::dlss::EnsureOn(d.device.Get(), L".")); // still bound to the same pointer: no restart
+        na::dlss::SetDeviceRemovedProbeForTests(nullptr);
+        na::dlss::SetInitOwnOverrideForTests(nullptr);
+    }
     na::dlss::Shutdown();
     {
         // Every handle the fake ever handed out was released exactly once.

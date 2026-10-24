@@ -137,6 +137,12 @@ struct Record {
     int feature = -1;                  // feature slot this evaluation used
     int view = -1;                     // view slot it belongs to
     uint64_t recorded_at = 0;          // OnExecuted counter when recorded
+    uint64_t gen = 0;                  // unique per use of this slot
+    ID3D12CommandQueue* queue = nullptr; // identity: where it was submitted
+    // R-303: the same view's previous evaluation on the same feature (record
+    // slot + generation). BeforeExecute orders this one after it on the GPU.
+    int pred = -1;
+    uint64_t pred_gen = 0;
 };
 
 // R-301/R-305: every created handle lives in exactly one slot until released.
@@ -154,7 +160,8 @@ struct View {
     uint64_t id = 0;
     int feature = -1;
     bool needs_reset = true;
-    ID3D12CommandQueue* last_queue = nullptr; // identity: queue that executed its last evaluation
+    int last_rec = -1;          // record of its most recent evaluation (R-303)
+    uint64_t last_rec_gen = 0;
 };
 
 struct State {
@@ -169,6 +176,7 @@ struct State {
     View views[kViews];
     Record recs[kRecords];
     uint64_t exec_calls = 0;
+    uint64_t rec_gen = 0;
     Stats stats{};
 };
 State g;
@@ -194,6 +202,15 @@ void release_handle(void* h)
 }
 #endif
 
+void free_record(Record& r)
+{
+    ComPtr<ID3D12Fence> fence = std::move(r.fence);
+    const uint64_t next = r.next_value;
+    r = Record{};
+    r.fence = std::move(fence);
+    r.next_value = next;
+}
+
 // A tracked use of feature slot `f` finished (done) or can never be proven (lost).
 void use_ended(int f, bool done)
 {
@@ -210,10 +227,10 @@ void collect_locked()
     for (Record& r : g.recs) {
         if (r.state == RecState::Submitted && r.fence->GetCompletedValue() >= r.value) {
             use_ended(r.feature, true);
-            r = Record{std::move(r.fence), r.next_value};
+            free_record(r);
         } else if (r.state == RecState::Recorded && g.exec_calls - r.recorded_at > kAbandonCalls) {
             use_ended(r.feature, false); // never seen submitted
-            r = Record{std::move(r.fence), r.next_value};
+            free_record(r);
         }
     }
     for (Feature& f : g.features) {
@@ -534,6 +551,20 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
     const uint32_t create_h = d.max_render_h ? d.max_render_h : d.render_h;
     const bool fits = cur && cur->out_w == d.out_w && cur->out_h == d.out_h && cur->flags == flags &&
                       cur->quality == d.quality && create_w <= cur->render_w && create_h <= cur->render_h;
+    // R-303: order this view's evaluations on the GPU. The hazard is the NGX
+    // feature's own history state, so it applies only while the view keeps the
+    // feature its previous evaluation used; a new feature starts from reset.
+    // The predecessor is remembered here and the order is enforced when this
+    // evaluation is submitted (BeforeExecute), where the queues are known.
+    int pred = -1;
+    uint64_t pred_gen = 0;
+    if (fits && view.last_rec >= 0) {
+        const Record& pr = g.recs[view.last_rec];
+        if (pr.gen == view.last_rec_gen && pr.state != RecState::Free && pr.feature == view.feature) {
+            pred = view.last_rec;
+            pred_gen = pr.gen;
+        }
+    }
     NVSDK_NGX_Parameter* p = EP();
     if (!fits) {
         // R-305: secure a slot BEFORE giving up the current feature, so no handle is ever lost.
@@ -622,19 +653,30 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
     }
     view.needs_reset = false;
     bool tracked = false;
-    for (Record& rec : g.recs) {
+    for (int ri = 0; ri < static_cast<int>(kRecords); ++ri) {
+        Record& rec = g.recs[ri];
         if (rec.state != RecState::Free) continue;
         rec.state = RecState::Recorded;
         rec.list = list;
         rec.feature = view.feature;
         rec.view = vi;
         rec.recorded_at = g.exec_calls;
+        rec.gen = ++g.rec_gen;
+        rec.pred = pred;
+        rec.pred_gen = pred_gen;
+        view.last_rec = ri;
+        view.last_rec_gen = rec.gen;
         ++ft.outstanding;
         tracked = true;
         break;
     }
     if (!tracked) {
-        ft.tainted = true; // R-301: an untracked use is never forgotten
+        // R-301: an untracked use is never forgotten; R-303: its order can't be
+        // enforced either, so the view's next frame gets a separate feature.
+        ft.tainted = true;
+        retire_feature_locked(view.feature);
+        view.feature = -1;
+        view.last_rec = -1;
         ++g.stats.untracked;
     }
     ++g.stats.evaluates;
@@ -658,23 +700,93 @@ void OnExecuted(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* co
         for (uint32_t k = 0; k < count; ++k)
             if (lists[k] == rec.list) { in_submission = true; break; }
         if (!in_submission) continue;
-        if (rec.view >= 0) {
-            View& v = g.views[rec.view];
-            // A view whose evaluations hop between queues has no guaranteed GPU
-            // order between frames: the next frame starts fresh history.
-            if (v.last_queue && v.last_queue != queue) v.needs_reset = true;
-            v.last_queue = queue;
-        }
+        rec.queue = queue;
         const uint64_t value = ++rec.next_value;
         if (FAILED(queue->Signal(rec.fence.Get(), value))) {
             use_ended(rec.feature, false); // completion can never be proven
-            rec = Record{std::move(rec.fence), rec.next_value};
+            free_record(rec);
             continue;
         }
         rec.value = value;
         rec.state = RecState::Submitted;
     }
     collect_locked();
+}
+
+void BeforeExecute(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* const* lists)
+{
+    if (!queue || !lists || !count || !g_any_attached.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> lock(g.m);
+    if (!g.attached) return;
+    const auto index_of = [&](ID3D12CommandList* l) -> int {
+        for (uint32_t k = 0; k < count; ++k)
+            if (lists[k] == l) return static_cast<int>(k);
+        return -1;
+    };
+    for (Record& rec : g.recs) {
+        if (rec.state != RecState::Recorded || rec.pred < 0) continue;
+        const int self = index_of(rec.list);
+        if (self < 0) continue;
+        const Record& pr = g.recs[rec.pred];
+        const bool live = pr.gen == rec.pred_gen && pr.state != RecState::Free;
+        rec.pred = -1;
+        if (!live) continue; // the previous evaluation already completed
+        if (pr.state == RecState::Submitted) {
+            // Same queue: already ordered. Finished: nothing to wait for.
+            if (pr.queue != queue && pr.fence->GetCompletedValue() < pr.value &&
+                SUCCEEDED(queue->Wait(pr.fence.Get(), pr.value)))
+                ++g.stats.queue_waits;
+            continue;
+        }
+        // Still unsubmitted: fine when it runs earlier in this same submission
+        // (or on the same list). Otherwise the game submitted this view's
+        // frames out of order; nothing recorded can be reordered now, so the
+        // view's next frame restarts its history.
+        const int at = index_of(pr.list);
+        if (at >= 0 && at <= self) continue;
+        ++g.stats.order_violations;
+        if (rec.view >= 0) g.views[rec.view].needs_reset = true;
+    }
+}
+
+namespace {
+std::mutex g_life_m;                 // EnsureOn is one transaction for every producer
+ComPtr<ID3D12Device> g_tried_device; // kept alive: a recycled pointer can't impersonate it
+std::atomic<bool (*)(ID3D12Device*, const wchar_t*)> g_init_override{nullptr};
+std::atomic<bool (*)(ID3D12Device*)> g_removed_probe{nullptr};
+bool device_removed(ID3D12Device* d)
+{
+    if (auto probe = g_removed_probe.load(std::memory_order_acquire)) return probe(d);
+    return d && d->GetDeviceRemovedReason() != S_OK;
+}
+} // namespace
+
+void SetInitOwnOverrideForTests(bool (*init)(ID3D12Device*, const wchar_t*)) { g_init_override.store(init); }
+void SetDeviceRemovedProbeForTests(bool (*removed)(ID3D12Device*)) { g_removed_probe.store(removed); }
+
+bool EnsureOn(ID3D12Device* device, const wchar_t* data_path)
+{
+    if (!device) return false;
+    std::lock_guard<std::mutex> life(g_life_m);
+    ComPtr<ID3D12Device> bound;
+    bool available = false;
+    {
+        std::lock_guard<std::mutex> lock(g.m);
+        if (g.attached) {
+            bound = g.device;
+            available = g.caps.available && !g.latched;
+        }
+    }
+    if (bound) {
+        if (bound.Get() == device) return available;
+        if (!device_removed(bound.Get())) return false; // another live device owns DLSS
+        Shutdown();                                     // nothing can be pending on a removed device
+        g_tried_device.Reset();
+    }
+    if (g_tried_device.Get() == device) return false; // already failed on this device
+    g_tried_device = device;
+    if (auto init = g_init_override.load(std::memory_order_acquire)) return init(device, data_path);
+    return InitOwn(device, data_path);
 }
 
 void ReleaseView(uint64_t view_id)
