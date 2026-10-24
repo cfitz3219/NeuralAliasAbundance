@@ -172,7 +172,7 @@ else()
   message(STATUS "Game adapter: none (host stub)")
 endif()
 target_link_libraries(host_dx12
-  PUBLIC abundance_options host_hooking host_settings host_capture host_nvof core_gpu imgui nvapi_headers
+  PUBLIC abundance_options host_hooking host_settings host_capture host_nvof core_gpu imgui nvapi_headers host_dlss host_upscalers
          d3d12 dxgi d3dcompiler user32 gdi32 shell32 ole32 bcrypt dbghelp winmm)
 if(NA_HAVE_NGX_SDK)
   target_compile_definitions(host_dx12 PUBLIC NA_HAVE_NGX_SDK)
@@ -216,7 +216,22 @@ if(NA_HAVE_NGX_LIB)
     target_link_libraries(host_dlss PUBLIC "${NA_NGX_LIB}")
   endif()
 endif()
+set(NA_XESS_INCLUDE "" CACHE PATH "Intel XeSS SDK inc dir (xess/xess_d3d12.h), ABI cross-check only")
+if(NOT NA_XESS_INCLUDE AND EXISTS "${NA_SDK_ROOT}/xess/inc/xess/xess_d3d12.h")
+  set(NA_XESS_INCLUDE "${NA_SDK_ROOT}/xess/inc" CACHE PATH "Intel XeSS SDK inc dir (xess/xess_d3d12.h), ABI cross-check only" FORCE)
+endif()
 message(STATUS "DLSS backend (C6): headers=${NA_HAVE_NGX_SDK}  own NGX instance=${NA_HAVE_NGX_LIB}  nvngx_dlss.dll='${NA_DLSS_DLL}'")
+
+# ------------------------------------------------------------- host_upscalers
+# C7: FSR 3.1+ (FidelityFX API, MIT headers vendored in third_party/ffx-api)
+# and XeSS (our own ABI declarations; Intel's headers are only used, when
+# present, to cross-check them) interception. Both feed the C6 backend.
+add_library(host_upscalers STATIC
+  src/host_dx12/upscalers/module_watch.cpp
+  src/host_dx12/upscalers/ffx_intercept.cpp
+  src/host_dx12/upscalers/xess_intercept.cpp)
+target_include_directories(host_upscalers SYSTEM PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ffx-api")
+target_link_libraries(host_upscalers PUBLIC abundance_options host_hooking host_dlss d3d12)
 
 # -------------------------------------------------------------- deliverables
 # Standalone manager / diagnostic exe.

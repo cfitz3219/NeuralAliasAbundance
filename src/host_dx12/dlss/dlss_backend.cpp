@@ -456,6 +456,18 @@ void Shutdown()
     g.stats = Stats{};
 }
 
+bool IsBoundTo(ID3D12Device* device)
+{
+    std::lock_guard<std::mutex> lock(g.m);
+    return g.attached && device && g.device.Get() == device;
+}
+
+bool BoundDeviceRemoved()
+{
+    std::lock_guard<std::mutex> lock(g.m);
+    return g.attached && g.device && g.device->GetDeviceRemovedReason() != S_OK;
+}
+
 Capabilities GetCapabilities()
 {
     std::lock_guard<std::mutex> lock(g.m);

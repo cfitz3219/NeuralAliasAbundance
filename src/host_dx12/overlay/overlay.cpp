@@ -18,6 +18,7 @@
 #include <imgui_impl_win32.h>
 
 #include "host_dx12/capture/frame_capture.hpp"
+#include "host_dx12/dlss/dlss_backend.hpp"
 #include "host_dx12/color/color_space.hpp"
 #include "host_dx12/fg/frame_gen.hpp"
 #include "host_dx12/fg/preset_profile.hpp"
@@ -1888,13 +1889,17 @@ void STDMETHODCALLTYPE DetourExecute(ID3D12CommandQueue* q, UINT n,
     if (sub) {
         ExecuteContext ctx{q, n, lists, g_exec_ticket.fetch_add(1, std::memory_order_relaxed) + 1, uncovered, sub->user};
         if (sub->begin) sub->begin(&ctx);
+        na::dlss::BeforeExecute(q, n, lists); // R-303: wait for this view's previous DLSS frame on another queue
         na::nr::Execute(q, n, lists, ForwardWithFgInputs);
         na::gputime::OnExecuted(q, n, lists); // R-202: completion fence on the queue that ran the lists
+        na::dlss::OnExecuted(q, n, lists);    // C6: completion evidence before retired DLSS features are released
         if (sub->end) sub->end(&ctx);
         g_exec_scoped.fetch_add(1, std::memory_order_relaxed);
     } else {
+        na::dlss::BeforeExecute(q, n, lists); // R-303: wait for this view's previous DLSS frame on another queue
         na::nr::Execute(q, n, lists, ForwardWithFgInputs);
         na::gputime::OnExecuted(q, n, lists); // R-202: completion fence on the queue that ran the lists
+        na::dlss::OnExecuted(q, n, lists);    // C6: completion evidence before retired DLSS features are released
     }
     g_exec_active.fetch_sub(1, std::memory_order_acq_rel);
 }
