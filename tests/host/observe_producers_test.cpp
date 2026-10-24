@@ -67,7 +67,7 @@ int main()
     ID3D12Device* dev = d.device.Get();
 
     // Created BEFORE installation: unknown to the producers.
-    auto early = test::CreateBuffer(dev, 4096, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
+    auto early = test::CreateTexture(dev, 16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_NONE); // a texture: a buffer SRV needs a desc
     REQUIRE(early);
 
     std::printf("checkpoint 0\n"); std::fflush(stdout);
