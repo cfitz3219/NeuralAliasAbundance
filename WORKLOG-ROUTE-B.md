@@ -105,3 +105,19 @@ contract proposals, distinguishing measured evidence from the audit's numerical
 and exactness claims. R-101/R-104 remain fixed in their existing PRs. No production
 or ABI changes, no runtime tests claimed. Reviewed documentation links and diff
 whitespace. Recovery originals remain untouched for hash/provenance verification.
+
+## 2026-10-24 — A4 report implementation
+
+Added a portable SR-evidence classifier, non-destructive NGX Stats bridge and
+Details-page menu section in Astra-owned providers/discovery. The report separates
+successful game/injector/unknown-origin calls, creation/evaluation, failed calls,
+library presence and unavailable observers. Multiple routes remain visible.
+Existing aggregate NGX evaluations are not promoted to SR-specific success;
+existing sr_creates lack origin, so they report source unknown. FSR/XeSS stay
+unmonitored until C7 provides observations. No runtime/core/ABI or root CMake edits.
+
+Six portable behavior tests and a Windows real-menu registration/draw test added.
+Local GCC Release root build and 8/8 CTests passed. A3 is on a separate unmerged
+branch and is not counted in this run. Requested the two host-owned wiring edits
+through COMMS; documented exact integration in UPSCALER-REPORT.md. Actual in-game
+visibility remains pending that wiring. Windows CI follows the pushed branch.
