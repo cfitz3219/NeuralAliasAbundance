@@ -10,6 +10,7 @@
 //   5. destroyed contexts are forgotten.
 #include "test_support.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
+#include "host_dx12/hooking/vtable_hook.hpp"
 #include "host_dx12/upscalers/ffx_intercept.hpp"
 
 #include <Kits/FidelityFX/api/include/ffx_api.h>
@@ -120,7 +121,13 @@ int main(int argc, char** argv)
     REQUIRE(argc > 1);
     HMODULE stub = LoadLibraryA(argv[1]);
     REQUIRE(stub != nullptr);
-    CHECK(na::ffx::InstallForModule(stub) == 5);
+    const uint32_t installed = na::ffx::InstallForModule(stub);
+    if (installed != 5) {
+        char err[256] = {};
+        na::hooking::LastError(err, sizeof(err));
+        std::printf("InstallForModule hooked %u (hooking: %s)\n", installed, err);
+    }
+    CHECK(installed == 5);
     CHECK(na::ffx::InstallForModule(stub) == 0); // idempotent
     CHECK(na::ffx::GetStats().modules_hooked == 1 && na::ffx::GetStats().hooked_functions == 5);
     auto create = reinterpret_cast<PfnFfxCreateContext>(reinterpret_cast<void*>(GetProcAddress(stub, "ffxCreateContext")));

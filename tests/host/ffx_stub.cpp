@@ -8,7 +8,7 @@
 #include <cstdint>
 
 namespace {
-int g_creates = 0, g_destroys = 0, g_dispatches = 0, g_upscale_dispatches = 0;
+int g_creates = 0, g_destroys = 0, g_dispatches = 0, g_upscale_dispatches = 0, g_configures = 0, g_queries = 0;
 uintptr_t g_next = 0x7000;
 float g_last_jitter_x = 0;
 } // namespace
@@ -29,8 +29,20 @@ FFX_API_ENTRY ffxReturnCode_t ffxDestroyContext(ffxContext* context, const ffxAl
     *context = nullptr;
     return FFX_API_RETURN_OK;
 }
-FFX_API_ENTRY ffxReturnCode_t ffxConfigure(ffxContext*, const ffxConfigureDescHeader*) { return FFX_API_RETURN_OK; }
-FFX_API_ENTRY ffxReturnCode_t ffxQuery(ffxContext*, ffxQueryDescHeader*) { return FFX_API_RETURN_OK; }
+// Distinct, non-trivial bodies: identical tiny functions would be folded to one
+// address by the linker (and are too short to patch), unlike a real runtime.
+FFX_API_ENTRY ffxReturnCode_t ffxConfigure(ffxContext* context, const ffxConfigureDescHeader* desc)
+{
+    if (!context || !desc) return FFX_API_RETURN_ERROR_PARAMETER;
+    g_configures += static_cast<int>(desc->type & 1u) + 1;
+    return FFX_API_RETURN_OK;
+}
+FFX_API_ENTRY ffxReturnCode_t ffxQuery(ffxContext* context, ffxQueryDescHeader* desc)
+{
+    if (!desc) return FFX_API_RETURN_ERROR_PARAMETER;
+    g_queries += context ? 2 : 3;
+    return FFX_API_RETURN_OK;
+}
 FFX_API_ENTRY ffxReturnCode_t ffxDispatch(ffxContext* context, const ffxDispatchDescHeader* desc)
 {
     if (!context || !desc) return FFX_API_RETURN_ERROR_PARAMETER;
@@ -48,6 +60,8 @@ __declspec(dllexport) int StubCounts(int which)
     case 0: return g_creates;
     case 1: return g_destroys;
     case 2: return g_dispatches;
+    case 4: return g_configures;
+    case 5: return g_queries;
     default: return g_upscale_dispatches;
     }
 }

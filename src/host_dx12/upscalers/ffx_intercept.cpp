@@ -295,19 +295,22 @@ uint32_t install_slot(HMODULE m)
         {"ffxQuery", reinterpret_cast<void*>(&DetourQuery<S>), reinterpret_cast<void**>(&slot.query)},
         {"ffxDispatch", reinterpret_cast<void*>(&DetourDispatch<S>), reinterpret_cast<void**>(&slot.dispatch)},
     };
-    // Dispatch and CreateContext are the ones that matter; require both so a
-    // module that merely shares a name never gets half-hooked.
-    if (!GetProcAddress(m, "ffxDispatch") || !GetProcAddress(m, "ffxCreateContext")) return 0;
+    // Create, Destroy and Dispatch are required (their detours keep the context
+    // table honest); Configure and Query are pass-through and hooked when possible.
+    if (!GetProcAddress(m, "ffxDispatch") || !GetProcAddress(m, "ffxCreateContext") || !GetProcAddress(m, "ffxDestroyContext"))
+        return 0;
     if (!na::hooking::BeginInstall()) return 0;
     uint32_t hooked = 0;
-    for (const Spec& s : specs) {
+    for (size_t i = 0; i < sizeof(specs) / sizeof(specs[0]); ++i) {
+        const Spec& s = specs[i];
         void* target = reinterpret_cast<void*>(GetProcAddress(m, s.name));
-        if (target && na::hooking::PrepareHook(target, s.detour, s.original)) ++hooked;
-    }
-    // Every detour forwards to its own original, so all five must be prepared.
-    if (hooked != 5) {
-        na::hooking::AbandonInstall();
-        return 0;
+        const bool required = i == 0 || i == 1 || i == 4;
+        if (target && na::hooking::PrepareHook(target, s.detour, s.original)) {
+            ++hooked;
+        } else if (required) {
+            na::hooking::AbandonInstall();
+            return 0;
+        }
     }
     slot.hooked.store(hooked, std::memory_order_relaxed);
     slot.module.store(m, std::memory_order_release);
