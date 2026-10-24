@@ -59,3 +59,18 @@ endif()
 
 # Argon audit #2: depth formats safe to copy as R32F (no device).
 na_host_test(depth_format_test SOURCES depth_format_test.cpp)
+
+# C6: generic DLSS backend. The fake-runtime test needs only the NGX headers
+# (runs in CI); the real test needs our own NGX instance (static library from
+# the local SDK folder) plus an RTX GPU, so it only runs in Cort's sessions.
+if(NA_HAVE_NGX_SDK)
+  na_host_test(dlss_backend_test SOURCES dlss_backend_test.cpp LIBS host_dlss)
+endif()
+if(NA_HAVE_NGX_LIB)
+  na_host_test(dlss_real_test SOURCES dlss_real_test.cpp LIBS host_dlss dxgi
+               ARGS "${CMAKE_CURRENT_BINARY_DIR}/dlss-real-test" LABELS "gpu;nvidia")
+  if(NA_DLSS_DLL)
+    add_custom_command(TARGET dlss_real_test POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:dlss_real_test>")
+  endif()
+endif()
