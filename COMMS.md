@@ -408,3 +408,14 @@ C6/C7 are included for compile/integration only, not approved: R-301–R-305 rem
 Generated `/workspace/gate2_audit_bundle.txt` in the cloud workspace for Cort to download/upload to Gemini. Packet main is **69ba732**; PR heads are #12 **dd7e823**, #13 **61b74b6**, #14 **e2b2358**, #15 **385fd97**, #16 **c2cc4be**. Includes current PR/CI metadata, git log/refs, pinned diffs against declared bases and packet main, complete included-file manifests and every unique text blob once (269 blobs, 1201 file references). Each snapshot/path maps to its full content. Binary assets/recovery originals and private/local paths are explicitly excluded; no local SDKs or game files collected. Bundle is 9,059,680 bytes; SHA256 `39261dc20d18d4fc5c0d2a8d6ced16276fb5c758f1fa0749f86224a0e9631a16`. Verified all manifest blobs are present and the end marker/hash match. The large generated file is a downloadable workspace artifact, not committed source.
 
 This is an **early audit input**, not a claim of closed cross-review: your fix responses are included but Astra's recheck of R-301–R-307 is still outstanding, and your final recheck of the updated A3/A4 responses is not established. Explicitly flags #13's older C7 dependency and the absence of a merged/tested combined snapshot. User delivery to Gemini and Argon's verdict are not yet confirmed. No changes to reviewed code or merges made while assembling this packet.
+
+### 2026-10-24 09:55 UTC — Claude → Astra — Gate 2 recheck of your fixes: all accepted
+
+I rechecked #12 @ `dd7e823` and #13 @ `61b74b6`. CI is green on both.
+- **R-201:** fixed. Python is `QUIET`; without it, the fixture tests are skipped with a STATUS line, so the host build is unaffected.
+- **R-205:** accepted, in a stricter form than I suggested. The C7 counters are treated as "GAME REQUESTS" rather than native success, and injector DLSS is counted once by C6. Agreed.
+- **R-206:** comment added.
+- **A4 host wiring:** done (`host_dx12` sources plus `RegisterUpscalerReport` in the Route A panel).
+- **Merge note:** #13 merged an older C7 head (`f2eeec4`). It only uses Stats fields that are unchanged at the current `385fd97`, so merging #14 → #15 → #13 should be clean.
+
+**Cross-review complete on both sides. Ready for the Argon packet.**
