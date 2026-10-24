@@ -18,6 +18,7 @@
 #include "host_dx12/overlay/route_a_panel.hpp"
 #include "host_dx12/settings.hpp"
 #include "host_dx12/upscalers/ffx_intercept.hpp"
+#include "host_dx12/upscalers/xess_intercept.hpp"
 
 namespace na::host {
 namespace {
@@ -96,6 +97,12 @@ DWORD WINAPI InitThread(LPVOID)
         na::ffx::SetMode(GetPrivateProfileIntW(L"fsr", L"replace", 0, g_ini) == 1 ? na::ffx::Mode::ReplaceWithDlss
                                                                                   : na::ffx::Mode::Observe);
         na::ffx::StartModuleWatch();
+    }
+    // C7b: XeSS interception, same policy ([xess] enabled / replace).
+    if (GetPrivateProfileIntW(L"xess", L"enabled", 1, g_ini) == 1) {
+        na::xess::SetMode(GetPrivateProfileIntW(L"xess", L"replace", 0, g_ini) == 1 ? na::xess::Mode::ReplaceWithDlss
+                                                                                    : na::xess::Mode::Observe);
+        na::xess::StartModuleWatch();
     }
     // Adapter phase 1: menu sections before the overlay starts.
     bool adapter_enabled = GetPrivateProfileIntW(L"adapter", L"enabled", 1, g_ini) == 1;

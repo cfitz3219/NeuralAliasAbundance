@@ -3,6 +3,7 @@
 
 #include "host_dx12/dlss/dlss_backend.hpp"
 #include "host_dx12/hooking/vtable_hook.hpp"
+#include "host_dx12/upscalers/module_watch.hpp"
 
 #include <Kits/FidelityFX/api/include/ffx_api.h>
 #include <Kits/FidelityFX/upscalers/include/ffx_upscale.h>
@@ -15,7 +16,6 @@
 #include <cstring>
 #include <initializer_list>
 #include <mutex>
-#include <vector>
 
 namespace na::ffx {
 
@@ -70,12 +70,7 @@ bool ToDlss(const Observation& o, na::dlss::EvalDesc* out, const char** reason)
     d.mv_jittered = (o.context_flags & FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION) != 0;
     d.mv_display_res = (o.context_flags & FFX_UPSCALE_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS) != 0;
     d.auto_exposure = (o.context_flags & FFX_UPSCALE_ENABLE_AUTO_EXPOSURE) != 0;
-    // Quality mode closest to the game's scale factor (DLSS accepts the exact
-    // render size; the mode only selects its internal model/preset).
-    const double ratio = static_cast<double>(ow) / static_cast<double>(o.render_w);
-    using Q = na::dlss::Quality;
-    d.quality = ratio <= 1.01 ? Q::DLAA : ratio < 1.6 ? Q::MaxQuality : ratio < 1.85 ? Q::Balanced : ratio < 2.5 ? Q::MaxPerformance : Q::UltraPerformance;
-    if (d.quality == Q::DLAA && (d.render_w != ow || d.render_h != oh)) d.quality = Q::MaxQuality;
+    d.quality = na::dlss::QualityForScale(d.render_w, d.render_h, ow, oh);
     if (const char* bad = na::dlss::Validate(d)) return fail(bad);
     *out = d;
     if (reason) *reason = nullptr;
@@ -326,68 +321,15 @@ using InstallFn = uint32_t (*)(HMODULE);
 constexpr InstallFn kInstall[kSlots] = {&install_slot<0>, &install_slot<1>, &install_slot<2>, &install_slot<3>};
 std::mutex g_install_m;
 
-// ---- module watch (same pattern as the NGX watcher: notification only queues) ----
-struct UnicodeStr { USHORT Length, MaximumLength; PWSTR Buffer; };
-struct LdrLoaded { ULONG Flags; const UnicodeStr* FullDllName; const UnicodeStr* BaseDllName; PVOID DllBase; ULONG SizeOfImage; };
-using LdrNotifyFn = VOID(CALLBACK*)(ULONG reason, const LdrLoaded* data, PVOID ctx);
-using LdrRegisterFn = LONG(NTAPI*)(ULONG, LdrNotifyFn, PVOID, PVOID*);
-using LdrUnregisterFn = LONG(NTAPI*)(PVOID);
-constexpr ULONG kLdrLoaded = 1;
-
-PVOID g_cookie = nullptr;
-HANDLE g_watch_thread = nullptr, g_watch_event = nullptr;
-std::atomic<bool> g_watch_stop{false};
-std::mutex g_pending_m;
-std::vector<HMODULE> g_pending;
-
-VOID CALLBACK LdrNotify(ULONG reason, const LdrLoaded* data, PVOID)
-{
-    if (reason != kLdrLoaded || !data || !data->BaseDllName || !data->BaseDllName->Buffer) return;
-    if (!IsFfxModuleName(data->BaseDllName->Buffer, data->BaseDllName->Length / sizeof(wchar_t))) return;
-    {
-        std::lock_guard<std::mutex> lock(g_pending_m);
-        g_pending.push_back(static_cast<HMODULE>(data->DllBase));
-    }
-    SetEvent(g_watch_event);
-}
-
-DWORD WINAPI WatchThread(LPVOID)
-{
-    while (!g_watch_stop.load(std::memory_order_acquire)) {
-        WaitForSingleObject(g_watch_event, 1000);
-        std::vector<HMODULE> work;
-        {
-            std::lock_guard<std::mutex> lock(g_pending_m);
-            work.swap(g_pending);
-        }
-        for (HMODULE m : work) {
-            HMODULE pinned = nullptr; // keep the module mapped while hooked
-            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(m), &pinned))
-                InstallForModule(pinned);
-        }
-    }
-    return 0;
-}
+constexpr const wchar_t* kModuleNames[] = {L"amd_fidelityfx_dx12.dll", L"amd_fidelityfx_loader_dx12.dll", nullptr};
+void install_cb(HMODULE m) { InstallForModule(m); }
 
 } // namespace
 
 void SetMode(Mode m) { g_mode.store(static_cast<uint32_t>(m), std::memory_order_relaxed); }
 Mode GetMode() { return static_cast<Mode>(g_mode.load(std::memory_order_relaxed)); }
 
-bool IsFfxModuleName(const wchar_t* name, size_t len)
-{
-    if (!name) return false;
-    // Compare the file-name part case-insensitively.
-    size_t start = len;
-    while (start > 0 && name[start - 1] != L'\\' && name[start - 1] != L'/') --start;
-    const wchar_t* base = name + start;
-    const size_t n = len - start;
-    for (const wchar_t* known : {L"amd_fidelityfx_dx12.dll", L"amd_fidelityfx_loader_dx12.dll"}) {
-        const size_t k = wcslen(known);
-        if (n == k && _wcsnicmp(base, known, k) == 0) return true;
-    }
-    return false;
-}
+bool IsFfxModuleName(const wchar_t* name, size_t len) { return na::upscalers::NameMatches(name, len, kModuleNames); }
 
 uint32_t InstallForModule(HMODULE module)
 {
@@ -409,55 +351,8 @@ uint32_t InstallForModule(HMODULE module)
     return 0; // all slots used
 }
 
-bool StartModuleWatch()
-{
-    if (g_watch_thread) return true;
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    auto reg = ntdll ? reinterpret_cast<LdrRegisterFn>(reinterpret_cast<void*>(GetProcAddress(ntdll, "LdrRegisterDllNotification"))) : nullptr;
-    if (!reg) return false;
-    g_watch_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!g_watch_event) return false;
-    g_watch_stop.store(false, std::memory_order_release);
-    if (reg(0, &LdrNotify, nullptr, &g_cookie) != 0) {
-        CloseHandle(g_watch_event);
-        g_watch_event = nullptr;
-        return false;
-    }
-    for (const wchar_t* known : {L"amd_fidelityfx_dx12.dll", L"amd_fidelityfx_loader_dx12.dll"}) {
-        if (HMODULE m = GetModuleHandleW(known)) {
-            std::lock_guard<std::mutex> lock(g_pending_m);
-            g_pending.push_back(m);
-        }
-    }
-    SetEvent(g_watch_event);
-    g_watch_thread = CreateThread(nullptr, 0, &WatchThread, nullptr, 0, nullptr);
-    if (!g_watch_thread) {
-        StopModuleWatch();
-        return false;
-    }
-    return true;
-}
-
-void StopModuleWatch()
-{
-    if (g_cookie) {
-        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-        if (auto unreg = ntdll ? reinterpret_cast<LdrUnregisterFn>(reinterpret_cast<void*>(GetProcAddress(ntdll, "LdrUnregisterDllNotification"))) : nullptr)
-            unreg(g_cookie);
-        g_cookie = nullptr;
-    }
-    if (g_watch_thread) {
-        g_watch_stop.store(true, std::memory_order_release);
-        SetEvent(g_watch_event);
-        WaitForSingleObject(g_watch_thread, 5000);
-        CloseHandle(g_watch_thread);
-        g_watch_thread = nullptr;
-    }
-    if (g_watch_event) {
-        CloseHandle(g_watch_event);
-        g_watch_event = nullptr;
-    }
-}
+bool StartModuleWatch() { return na::upscalers::AddModuleWatch(kModuleNames, &install_cb); }
+void StopModuleWatch() { na::upscalers::StopModuleWatches(); }
 
 bool LastObservation(Observation* out)
 {

@@ -34,6 +34,18 @@ const char* QualityName(Quality q)
     return "Unknown";
 }
 
+Quality QualityForScale(uint32_t render_w, uint32_t render_h, uint32_t out_w, uint32_t out_h)
+{
+    if (!render_w || !render_h) return Quality::MaxQuality;
+    if (render_w == out_w && render_h == out_h) return Quality::DLAA;
+    const double ratio = static_cast<double>(out_w) / static_cast<double>(render_w);
+    // Nominal DLSS ratios: Quality 1.5, Balanced 1.72, Performance 2.0, Ultra Performance 3.0.
+    if (ratio < 1.6) return Quality::MaxQuality;
+    if (ratio < 1.85) return Quality::Balanced;
+    if (ratio < 2.5) return Quality::MaxPerformance;
+    return Quality::UltraPerformance;
+}
+
 const char* Validate(const EvalDesc& d)
 {
     if (!d.color || !d.depth || !d.motion || !d.output) return "DLSS needs colour, depth, motion and an output texture.";
@@ -46,6 +58,7 @@ const char* Validate(const EvalDesc& d)
     if (!std::isfinite(d.mv_scale_x) || !std::isfinite(d.mv_scale_y) || d.mv_scale_x == 0.f || d.mv_scale_y == 0.f)
         return "Motion-vector scale is missing or invalid.";
     if (!std::isfinite(d.pre_exposure) || d.pre_exposure <= 0.f) return "Pre-exposure must be a positive number.";
+    if (!std::isfinite(d.exposure_scale) || d.exposure_scale <= 0.f) return "Exposure scale must be a positive number.";
     if (static_cast<int>(d.quality) < 0 || static_cast<int>(d.quality) > 5) return "Unknown DLSS quality mode.";
     return nullptr;
 }
@@ -549,7 +562,7 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
     p->Set(NVSDK_NGX_Parameter_MV_Scale_X, d.mv_scale_x);
     p->Set(NVSDK_NGX_Parameter_MV_Scale_Y, d.mv_scale_y);
     p->Set(NVSDK_NGX_Parameter_DLSS_Pre_Exposure, d.pre_exposure);
-    p->Set(NVSDK_NGX_Parameter_DLSS_Exposure_Scale, 1.0f);
+    p->Set(NVSDK_NGX_Parameter_DLSS_Exposure_Scale, d.exposure_scale);
     p->Set(NVSDK_NGX_Parameter_Reset, (d.reset || g.f_needs_reset) ? 1 : 0);
     p->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, d.render_w);
     p->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, d.render_h);

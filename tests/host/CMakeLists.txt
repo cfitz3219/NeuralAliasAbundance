@@ -83,3 +83,16 @@ target_link_libraries(ffx_stub PRIVATE abundance_options)
 na_host_test(ffx_intercept_test SOURCES ffx_intercept_test.cpp LIBS host_upscalers dxgi
              ARGS "$<TARGET_FILE:ffx_stub>")
 add_dependencies(ffx_intercept_test ffx_stub)
+
+# C7b: XeSS interception against a stand-in libxess.dll (built from our ABI).
+add_library(xess_stub SHARED xess_stub.cpp)
+set_target_properties(xess_stub PROPERTIES PREFIX "")
+target_link_libraries(xess_stub PRIVATE abundance_options d3d12)
+na_host_test(xess_intercept_test SOURCES xess_intercept_test.cpp LIBS host_upscalers dxgi
+             ARGS "$<TARGET_FILE:xess_stub>")
+add_dependencies(xess_intercept_test xess_stub)
+# Our XeSS declarations vs Intel's official headers (compile-time checks).
+if(NA_XESS_INCLUDE AND EXISTS "${NA_XESS_INCLUDE}/xess/xess_d3d12.h")
+  na_host_test(xess_abi_test SOURCES xess_abi_test.cpp LIBS d3d12)
+  target_include_directories(xess_abi_test SYSTEM PRIVATE "${NA_XESS_INCLUDE}")
+endif()

@@ -43,6 +43,10 @@ enum class Quality : int {
     DLAA = 5,
 };
 const char* QualityName(Quality q);
+// The quality mode whose scale factor is closest to output/render (DLSS uses
+// the exact render size given; the mode only selects its internal model).
+// Equal sizes -> DLAA.
+Quality QualityForScale(uint32_t render_w, uint32_t render_h, uint32_t out_w, uint32_t out_h);
 
 // NGX entry points, typed opaquely so this header stays SDK-free. Each is the
 // matching NVSDK_NGX_D3D12_* function (EvaluateFeature may be the _C variant:
@@ -95,6 +99,7 @@ struct EvalDesc {
     float jitter_x = 0.f, jitter_y = 0.f;
     float mv_scale_x = 1.f, mv_scale_y = 1.f; // multiply motion values to get render-space pixels
     float pre_exposure = 1.f;
+    float exposure_scale = 1.f; // multiplier applied to colour before upscaling (DLSS.Exposure.Scale)
     Quality quality = Quality::MaxQuality;
     bool reset = false;
     bool hdr = false;            // linear HDR colour (IsHDR)
