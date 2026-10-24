@@ -9,7 +9,7 @@
 // Pass: NGX starts, DLSS is available, every frame evaluates, the output is
 // finite and not flat, and for at least one jitter sign convention DLSS beats
 // the bilinear baseline (PSNR). Both conventions are reported, which also
-// pins down the sign NGX expects (evidence for A3/C7).
+// pins down the sign NGX expects (evidence for A3/C7): sample = centre - jitter.
 // SKIP (77) only when the machine has no NVIDIA GPU.
 #include "test_support.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
@@ -287,6 +287,9 @@ int main(int argc, char** argv)
     }
     CHECK(all_ok);
     CHECK(best > psnr_bilinear);
+    // Session 3 (2026-10-24, RTX 5070 Ti): sign -1 gave +6.4 dB, sign +1 gave -2.5 dB.
+    // The EvalDesc convention documents -1; a change here means NGX or our mapping changed.
+    CHECK(best_sign == -1);
     std::printf("DLSS quality check: best %.2f dB with jitter sign %+d vs bilinear %.2f dB -> %s\n", best, best_sign,
                 psnr_bilinear, best > psnr_bilinear ? "better" : "NOT better");
     const auto st = na::dlss::GetStats();

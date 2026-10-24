@@ -89,7 +89,10 @@ struct EvalDesc {
     ID3D12Resource* exposure = nullptr; // optional 1x1 exposure texture
     uint32_t render_w = 0, render_h = 0; // valid region of colour/depth (top-left)
     uint32_t out_w = 0, out_h = 0;
-    float jitter_x = 0.f, jitter_y = 0.f; // pixels, render space, as the engine applied it
+    // Jitter in render-space pixels. Convention (measured on RTX hardware,
+    // dlss_real_test, 2026-10-24): the colour sample for a pixel was taken at
+    // (pixel centre - jitter). Passing the opposite sign blurs the result.
+    float jitter_x = 0.f, jitter_y = 0.f;
     float mv_scale_x = 1.f, mv_scale_y = 1.f; // multiply motion values to get render-space pixels
     float pre_exposure = 1.f;
     Quality quality = Quality::MaxQuality;
