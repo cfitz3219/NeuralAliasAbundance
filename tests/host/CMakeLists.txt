@@ -64,7 +64,7 @@ na_host_test(depth_format_test SOURCES depth_format_test.cpp)
 # (runs in CI); the real test needs our own NGX instance (static library from
 # the local SDK folder) plus an RTX GPU, so it only runs in Cort's sessions.
 if(NA_HAVE_NGX_SDK)
-  na_host_test(dlss_backend_test SOURCES dlss_backend_test.cpp LIBS host_dlss)
+  na_host_test(dlss_backend_test SOURCES dlss_backend_test.cpp LIBS host_dlss dxgi)
 endif()
 if(NA_HAVE_NGX_LIB)
   na_host_test(dlss_real_test SOURCES dlss_real_test.cpp LIBS host_dlss dxgi
