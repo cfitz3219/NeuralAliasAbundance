@@ -122,3 +122,10 @@ if(WIN32 AND MSVC AND TARGET host_observe_producers AND EXISTS "${NA_CPU_ROOT}/t
   add_test(NAME na.host.h3_capture_decoder COMMAND na_h3_capture_decoder)
   set_tests_properties(na.host.h3_capture_decoder PROPERTIES LABELS "host;capture" TIMEOUT 60 SKIP_RETURN_CODE 77)
 endif()
+
+if(WIN32 AND MSVC AND TARGET host_observe_producers AND EXISTS "${NA_CPU_ROOT}/tests/host/observe_snapshot_test.cpp")
+  add_executable(na_snapshot_bindings snapshot_bindings_test.cpp)
+  target_link_libraries(na_snapshot_bindings PRIVATE na_cpu_test_options host_observe_producers dxgi)
+  add_test(NAME na.host.snapshot_bindings COMMAND na_snapshot_bindings)
+  set_tests_properties(na.host.snapshot_bindings PROPERTIES LABELS "host;capture" TIMEOUT 30 SKIP_RETURN_CODE 77)
+endif()
