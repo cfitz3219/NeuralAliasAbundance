@@ -1,3 +1,8 @@
+# 2026-10-24 — both reproduced capture defects FIXED
+
+Cort authorized direct fixes. PR26 head0701da3, focused patch1a81e1b fixes typed buffer SRV, test failure cleanup and capability session. Committed RTX producer test now passes;22/22 combined selected tests pass. PR25 head8f447fc adds real producer-to-decoder-to-validity tests: RTX and forced WARP both pass. Combined draft PR27 head946e019 publishes the integration for CI. Claude received exact fix commits via COMMS; no duplicate work requested. Remaining shared-target/lifetime/order findings and H2/H3/texture acquisition are still open. No game changes or Phase3 closure.
+
+---
 # 2026-10-24 — latest host9655c85 and validity integration
 
 Integrated9655c85; allocator-hook removal does not fix committed RTX test (0xc0000409). Private explicit-SRV diagnostic still reproduces cap session0 mismatch; shared-target/lifetime/order fixes remain absent. PR25 now1311ea0 adds conservative status/capability/loss validity tracking. Standalone12/12 and combined9cd8a76 full Release +21/21 discovery CPU/fixture/menu tests pass. These exclude the separate failing host test. See COMMS and CAPTURE-WORKLOG.md. H2/H3/texture evidence remain pending; no game changes or attendance needed.
@@ -175,5 +180,6 @@ Cort: "finish this up and close gate 2!" Claude's side is complete, and with Ast
   - whether the overlay's own D3D12 objects also keep a removed device alive (not yet checked).
 
 **Next:** Phase 3.
+
 
 

@@ -226,3 +226,7 @@ Checked Claude5727047 and integrated latest checkpoints. Draft PR25 at46e92a6 ad
 ## 2026-10-24 — Phase3 capture validity checkpoint
 
 PR25 at1311ea0 now tracks authoritative status loss, inventory/capability boundaries, epoch changes and retroactive ambiguity. Standalone12/12; combined9cd8a76 full Release and21/21 discovery CPU/fixture/menu tests pass. Claude9655c85 integrated; committed RTX producer test still fails0xc0000409 and explicit-SRV private diagnostic still exposes capability session0 mismatch. Concrete corrections remain in COMMS. Phase3 remains in progress, no live deployment.
+
+## 2026-10-24 — capture defects corrected, real consumer round trip passing
+
+User-authorized fixes delivered in PR26 (1a81e1b, head0701da3): explicit buffer SRV, RAII stop, coherent capability session and startup/resync regressions. Combined22/22 selected tests now pass including RTX producer test. PR25 adds actual producer/decoder/validity round trip, passing RTX and forced WARP. Combined draft PR27 head946e019 runs full integration CI. Phase3 remains in progress for H2/H3, content acquisition and remaining host lifecycle/order findings. No game deployment or user attendance.
