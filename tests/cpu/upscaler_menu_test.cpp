@@ -20,12 +20,13 @@ int main() { return test::run({
         fsr.upscale_dispatches = 8; fsr.replaced = 5; fsr.fallbacks = 3;
         xess.executes = 9; xess.replaced = 9;
         dlss.evaluates = 14;
+        ngx.sr_creates = ngx.sr_creates_injector = 14; // observed C6 calls must not become unknown
         r = na::discovery::DescribeHostUpscalers(ngx, fsr, xess, dlss);
         CHECK(r.game_routes == 0);
         CHECK(r.rows[0].detection == na::discovery::Detection::InjectorOnly);
         CHECK(r.rows[1].detection == na::discovery::Detection::Requested);
         CHECK(r.rows[2].detection == na::discovery::Detection::Requested);
-        fsr.upscale_contexts = 1; xess.contexts_initialized = 1; ngx.sr_creates = 1;
+        fsr.upscale_contexts = 1; xess.contexts_initialized = 1; ngx.sr_creates_unknown = 1;
         r = na::discovery::DescribeHostUpscalers(ngx, fsr, xess, dlss);
         CHECK(r.game_routes == 6);
         CHECK(r.rows[0].detection == na::discovery::Detection::SourceUnknown);

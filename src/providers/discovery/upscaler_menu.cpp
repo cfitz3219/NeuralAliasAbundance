@@ -20,10 +20,9 @@ UpscalerReport DescribeHostUpscalers(const na::ngx::Stats& ngx, const na::ffx::S
     auto& dlss = snapshot[0];
     dlss.observer_available = ngx.hooked_functions != 0;
     dlss.module_seen = ngx.module_attached != 0 || ngx.core_preloaded != 0;
-    // sr_creates counts successful SR creation specifically. The current host
-    // does not prove game/injector origin; C6/C7 must supply that provenance.
-    // evaluates/create_failures span feature types and are deliberately unused.
-    dlss.unknown_creates = ngx.sr_creates;
+    // Only explicitly unmarked creations remain unknown. Marked backend calls
+    // are counted once through C6, even when the NGX observer also saw them.
+    dlss.unknown_creates = ngx.sr_creates_unknown;
     dlss.injector_creates = backend.features_created;
     dlss.injector_evaluates = backend.evaluates;
     auto& f = snapshot[1];

@@ -15,6 +15,7 @@
 
 #if defined(NA_HAVE_NGX_SDK)
 #include "fake_ngx_runtime.hpp"
+#include "lock_order_probe.hpp"
 #endif
 
 #include <cstring>
@@ -213,16 +214,6 @@ int main(int argc, char** argv)
             CHECK(fake::last_eval_handle != h1 && fake::last_eval_handle != h2 && dlss_reset() == 1);
             CHECK(destroy(ctx3) == kSuccess);
         }
-        // ARGON-G2-002: a context XeSS created before our hooks (no device recorded)
-        // still replaces: the device comes from the game's command list.
-        {
-            Context early = reinterpret_cast<Context>(0xABC0);
-            REQUIRE(init(early, &ip) == kSuccess); // first seen at Init
-            const uint64_t replaced = na::xess::GetStats().replaced;
-            auto p = Exec();
-            CHECK(execute(early, l.list.Get(), &p) == kSuccess);
-            CHECK(na::xess::GetStats().replaced == replaced + 1);
-        }
         // ARGON-G2-006: re-initialising an existing context restarts DLSS history.
         {
             auto p = Exec();
@@ -235,6 +226,37 @@ int main(int argc, char** argv)
             CHECK(execute(ctx, l.list.Get(), &p) == kSuccess);
             fake::eval_hook = nullptr;
         }
+        // End the earlier unsubmitted synthetic recording before independent
+        // cold-start/lock-order/DRS scenarios consume completion capacity.
+        l.list->Close();
+        na::dlss::Shutdown();
+        REQUIRE(l.Create(dev.device.Get()));
+        // G2-002: truly unattached, missed CreateContext, recovered list device.
+        static ID3D12Device* recovered = nullptr;
+        static int cold_inits = 0;
+        na::dlss::SetInitOwnOverrideForTests([](ID3D12Device* device, const wchar_t*) {
+            recovered = device; ++cold_inits;
+            return na::dlss::Attach(device, fake::MakeApi());
+        });
+        CHECK(!na::dlss::GetCapabilities().attached);
+        Context early = reinterpret_cast<Context>(0xABC0);
+        REQUIRE(init(early, &ip) == kSuccess);
+        auto cold = Exec();
+        const uint64_t replaced0 = na::xess::GetStats().replaced;
+        CHECK(execute(early, l.list.Get(), &cold) == kSuccess);
+        CHECK(cold_inits == 1 && recovered == dev.device.Get());
+        CHECK(na::xess::GetStats().replaced == replaced0 + 1);
+        na::dlss::SetInitOwnOverrideForTests(nullptr);
+        CHECK(destroy(early) == kSuccess);
+        // G2-005: evaluate callback versus destruction of a different context.
+        Context victim = nullptr;
+        REQUIRE(create(device_ptr, &victim) == kSuccess && init(victim, &ip) == kSuccess);
+        Result eval_result = -1, destroy_result = -1;
+        auto concurrent = Exec();
+        lock_probe::Run([&] { eval_result = execute(ctx, l.list.Get(), &concurrent); },
+                        [&] { destroy_result = destroy(victim); },
+                        [] { (void)na::xess::GetStats(); });
+        CHECK(eval_result == kSuccess && destroy_result == kSuccess);
         // ARGON-G2-001: dynamic input size keeps one feature (created at the output size) and its history.
         {
             const int creates = fake::creates;

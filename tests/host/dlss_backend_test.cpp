@@ -342,9 +342,9 @@ int main()
         REQUIRE(Record(d, keep.back(), view_desc(2, 1920, 1080))); // never executed
         const uintptr_t hf = fake::last_eval_handle;
         for (int i = 0; i < 600; ++i) kick(d.queue.Get()); // the unexecuted record is abandoned
-        test::List lt; // R-303: allowed again once the unsubmitted predecessor is abandoned
+        test::List lt; // Lost completion proof requires a new independent feature
         REQUIRE(Record(d, lt, view_desc(2, 1920, 1080)));
-        CHECK(fake::last_eval_handle == hf);
+        CHECK(fake::last_eval_handle != hf);
         Submit(d.queue.Get(), lt);
         d.WaitIdle();
         kick(d.queue.Get());
@@ -355,30 +355,30 @@ int main()
         d.WaitIdle();
         kick(d.queue.Get());
         CHECK(!fake::Released(hf));
-        CHECK(na::dlss::GetStats().features_leaked == leaked + 1);
+        CHECK(na::dlss::GetStats().features_leaked == leaked);
     }
-    // R-301: an UNTRACKED use (no free completion record) taints its feature for good.
+    // Completion capacity exhaustion refuses BEFORE NGX records an untracked use.
     {
-        // More evaluations than completion records, all on ONE list (R-303
-        // allows that) which is never executed.
-        uintptr_t hf = 0;
         keep.emplace_back();
         REQUIRE(keep.back().Create(d.device.Get()));
-        const uint64_t untracked0 = na::dlss::GetStats().untracked;
-        for (int i = 0; i < 40 && na::dlss::GetStats().untracked == untracked0; ++i) {
-            REQUIRE(na::dlss::Evaluate(keep.back().list.Get(), view_desc(3, 1920, 1080)));
-            hf = fake::last_eval_handle;
+        bool refused = false;
+        for (int i = 0; i < 40; ++i) {
+            const int evals = fake::evals;
+            if (!na::dlss::Evaluate(keep.back().list.Get(), view_desc(3, 1920, 1080))) {
+                CHECK(fake::evals == evals);
+                refused = true;
+                break;
+            }
         }
+        CHECK(refused && na::dlss::GetStats().untracked == 0);
         keep.back().list->Close();
-        CHECK(na::dlss::GetStats().untracked == untracked0 + 1);
-        for (int i = 0; i < 600; ++i) kick(d.queue.Get()); // free the records again
-        test::List lr;
-        REQUIRE(Record(d, lr, view_desc(3, 2560, 1440)));
-        Submit(d.queue.Get(), lr);
-        d.WaitIdle();
-        kick(d.queue.Get());
-        CHECK(!fake::Released(hf));
+        for (int i = 0; i < 600; ++i) kick(d.queue.Get());
     }
+    // Each scenario owns a fresh backend; abandoned views must not consume the
+    // independent-view or DRS scenario's finite capacity.
+    d.WaitIdle();
+    na::dlss::Shutdown();
+    REQUIRE(na::dlss::Attach(d.device.Get(), fake::MakeApi()));
 
     // R-303: independent views keep independent features and histories.
     {
@@ -389,12 +389,15 @@ int main()
         const uintptr_t h_v2 = fake::last_eval_handle;
         CHECK(h_v1 != h_v2);
         CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 1); // new view starts fresh
+        Submit(d.queue.Get(), v1a);
+        d.WaitIdle();
         REQUIRE(Record(d, v1b, view_desc(11, 1920, 1080)));
         CHECK(fake::last_eval_handle == h_v1);
         CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0); // its own history continues
-        ID3D12CommandList* ls[] = {v1a.list.Get(), v2a.list.Get(), v1b.list.Get()};
-        d.queue->ExecuteCommandLists(3, ls);
-        na::dlss::OnExecuted(d.queue.Get(), 3, ls);
+        ID3D12CommandList* ls[] = {v2a.list.Get(), v1b.list.Get()};
+        na::dlss::BeforeExecute(d.queue.Get(), 2, ls);
+        d.queue->ExecuteCommandLists(2, ls);
+        na::dlss::OnExecuted(d.queue.Get(), 2, ls);
         d.WaitIdle();
         na::dlss::ReleaseView(11); // its source was destroyed
         kick(d.queue.Get());
@@ -427,31 +430,30 @@ int main()
             CHECK(test::WaitFence(q2_fence.Get(), q2_value, d.event, 10000) == test::WaitResult::Ok);
             d.WaitIdle();
         }
-        // R-303: record-ahead. A and B (same view, separate lists) recorded
-        // before either is submitted: in order is fine, out of order is counted
-        // and the view's next frame restarts its history.
+        // R-303: independently recorded lists may submit in reverse order.
+        // They must NEVER share a mutable NGX feature while order is unknown.
         {
             test::List a, b;
             REQUIRE(Record(d, a, view_desc(16, 1920, 1080)));
+            const uintptr_t ha = fake::last_eval_handle;
             REQUIRE(Record(d, b, view_desc(16, 1920, 1080)));
-            CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
-            const uint64_t violations = na::dlss::GetStats().order_violations;
-            Submit(d.queue.Get(), a);
-            Submit(d.queue.Get(), b); // in order
+            const uintptr_t hb = fake::last_eval_handle;
+            CHECK(hb != ha);
+            CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 1);
+            test::ComPtr<ID3D12Fence> held;
+            REQUIRE(SUCCEEDED(d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&held))));
+            REQUIRE(SUCCEEDED(d.queue->Wait(held.Get(), 1)));
+            Submit(d.queue.Get(), b); // later recorded frame submitted first, held
+            Submit(q2.Get(), a);
+            test::SignalAndWait(q2.Get(), q2_fence.Get(), q2_value, d.event, d.device.Get(), "record-ahead independent feature");
+            CHECK(!fake::Released(hb));
+            REQUIRE(SUCCEEDED(held->Signal(1)));
             d.WaitIdle();
-            CHECK(na::dlss::GetStats().order_violations == violations);
-            test::List c, e2;
-            REQUIRE(Record(d, c, view_desc(16, 1920, 1080)));
+            test::List next;
+            REQUIRE(Record(d, next, view_desc(16, 1920, 1080)));
+            CHECK(fake::last_eval_handle == hb);
             CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
-            REQUIRE(Record(d, e2, view_desc(16, 1920, 1080)));
-            Submit(d.queue.Get(), e2); // BEFORE its predecessor c
-            CHECK(na::dlss::GetStats().order_violations == violations + 1);
-            Submit(d.queue.Get(), c);
-            d.WaitIdle();
-            test::List f;
-            REQUIRE(Record(d, f, view_desc(16, 1920, 1080)));
-            CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 1); // history restarted
-            Submit(d.queue.Get(), f);
+            Submit(d.queue.Get(), next);
             d.WaitIdle();
         }
         // Work from another device is refused before NGX sees it.
@@ -491,6 +493,9 @@ int main()
         d.WaitIdle();
         kick(d.queue.Get());
     }
+    d.WaitIdle();
+    na::dlss::Shutdown();
+    REQUIRE(na::dlss::Attach(d.device.Get(), fake::MakeApi()));
     // ARGON-G2-001: dynamic resolution up AND down within the stated maximum
     // keeps one feature and one history (reset only on the first frame).
     {
@@ -539,9 +544,23 @@ int main()
         na::dlss::SetDeviceRemovedProbeForTests([](ID3D12Device*) { return false; });
         CHECK(!na::dlss::EnsureOn(foreign, L"."));
         CHECK(na::dlss::GetCapabilities().attached && inits.load() == 1);
-        // After the bound device is removed, a new device restarts DLSS once.
-        na::dlss::SetDeviceRemovedProbeForTests([](ID3D12Device*) { return true; });
-        CHECK(na::dlss::EnsureOn(d.device.Get(), L".")); // still bound to the same pointer: no restart
+        // Deterministic recovery interleaving: simulate removal until the first
+        // producer's initializer establishes the replacement generation.
+        static std::atomic<bool> removed{true};
+        na::dlss::SetDeviceRemovedProbeForTests([](ID3D12Device*) { return removed.load(); });
+        na::dlss::SetInitOwnOverrideForTests([](ID3D12Device* device, const wchar_t*) {
+            inits.fetch_add(1);
+            Sleep(20);
+            const bool ok = na::dlss::Attach(device, fake::MakeApi());
+            removed.store(false);
+            return ok;
+        });
+        bool recovered1 = false, recovered2 = false;
+        std::thread r1([&] { recovered1 = na::dlss::EnsureOn(d.device.Get(), L"."); });
+        std::thread r2([&] { recovered2 = na::dlss::EnsureOn(d.device.Get(), L"."); });
+        r1.join(); r2.join();
+        CHECK(recovered1 && recovered2 && inits.load() == 2);
+        CHECK(na::dlss::IsBoundTo(d.device.Get()));
         na::dlss::SetDeviceRemovedProbeForTests(nullptr);
         na::dlss::SetInitOwnOverrideForTests(nullptr);
     }

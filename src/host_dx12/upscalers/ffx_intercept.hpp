@@ -52,6 +52,7 @@ struct Observation {
     ID3D12Resource* reactive = nullptr;
     ID3D12Resource* transparency = nullptr;
     ID3D12Resource* output = nullptr;
+    uint32_t exposure_state = 0;
     uint32_t color_state = 0, depth_state = 0, motion_state = 0, output_state = 0; // FFX_API_RESOURCE_STATE_*
     uint32_t render_w = 0, render_h = 0, upscale_w = 0, upscale_h = 0;
     float jitter_x = 0, jitter_y = 0;

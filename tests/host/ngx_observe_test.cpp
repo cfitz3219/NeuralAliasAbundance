@@ -15,6 +15,7 @@
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 
 #include <cwchar>
+#include "host_dx12/dlss/call_origin.hpp"
 
 namespace {
 struct StubState { // mirror of ngx_stub.cpp State
@@ -123,6 +124,23 @@ int wmain(int argc, wchar_t** argv)
         if (recs[i].kind == static_cast<uint32_t>(na::ngx::CallKind::Init)) CHECK(recs[i].app_id == 0xABCDEFull);
     CHECK(na::ngx::DrainRecords(recs, 64) == 0);
 
+    // G2-008: nested marked calls count as injector evidence only; the marker
+    // unwinds so a subsequent unmarked call retains unknown provenance.
+    const auto origin0 = na::ngx::GetStats();
+    {
+        na::dlss::InjectorCallScope outer;
+        { na::dlss::InjectorCallScope inner;
+          CHECK(create(fake_list, 1, nullptr, &handle) == 1); }
+        CHECK(na::dlss::IsInjectorCall());
+    }
+    CHECK(!na::dlss::IsInjectorCall());
+    auto origin1 = na::ngx::GetStats();
+    CHECK(origin1.sr_creates_injector == origin0.sr_creates_injector + 1);
+    CHECK(origin1.sr_creates_unknown == origin0.sr_creates_unknown);
+    CHECK(create(fake_list, 1, nullptr, &handle) == 1);
+    origin1 = na::ngx::GetStats();
+    CHECK(origin1.sr_creates_unknown == origin0.sr_creates_unknown + 1);
+    CHECK(origin1.sr_creates == origin0.sr_creates + 2);
     na::hooking::Shutdown();
     return test::finish("ngx_observe_test");
 }

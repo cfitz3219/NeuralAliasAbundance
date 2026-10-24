@@ -29,10 +29,11 @@
 // view's evaluations are submitted on different queues, BeforeExecute() makes
 // the later submission's queue wait (GPU-side) for the earlier evaluation, so
 // one history is never used concurrently (Gate 2 R-303). Frames recorded
-// ahead on separate lists are fine when submitted in order (same submission or
-// later ones); a frame submitted BEFORE its predecessor cannot be reordered, so
-// it is counted (order_violations) and the view's next frame resets. An
-// untracked use retires its feature so the next frame gets separate state.
+// ahead on separate lists use separate features with reset history while the
+// predecessor is unsubmitted. This permits reversed submission without racing
+// one feature's mutable GPU state. Completion-record exhaustion refuses before
+// recording NGX work. Command lists must not be reset/replayed before tracking
+// their submission and completion; raw list identity is not a recording epoch.
 // Ordering applies per feature: a view that moves to a new feature starts
 // from reset and is not ordered against the old one.
 // The caller keeps every input/output resource alive until its submission
@@ -204,6 +205,8 @@ void SetDeviceRemovedProbeForTests(bool (*removed)(ID3D12Device* device));
 // The source of `view_id` is gone (e.g. its FSR/XeSS context was destroyed):
 // its feature is retired (released once its uses complete) and the id forgotten.
 void ReleaseView(uint64_t view_id);
+// Test synchronization point before ReleaseView acquires the backend lock.
+void SetReleaseViewHookForTests(void (*hook)());
 
 struct Stats {
     uint64_t evaluates = 0;         // successful EvaluateFeature calls

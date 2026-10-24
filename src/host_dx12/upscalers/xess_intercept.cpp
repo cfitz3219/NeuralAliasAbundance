@@ -148,33 +148,15 @@ ContextInfo* find_or_add(Context c)
     return nullptr; // table full: executes report context_known=false
 }
 
-// ARGON-G2-004/005: DLSS start-up, serialised on its own mutex and never under
-// the interceptor's g_m (UI GetStats() never waits on NGX). Retries for every
-// new device; if the game recreated its device after the old one was removed,
-// the backend is shut down (nothing can be pending on a removed device) and
-// started again on the new one.
-std::mutex g_init_m;
-ID3D12Device* g_tried_device = nullptr; // identity of the last device InitOwn was tried on
-
+// All producers share one backend lifecycle transaction; never hold g_m here.
 bool ensure_dlss(ID3D12Device* device)
 {
-    if (!device) return false;
-    std::lock_guard<std::mutex> lock(g_init_m);
-    const na::dlss::Capabilities c = na::dlss::GetCapabilities();
-    if (c.attached) {
-        if (na::dlss::IsBoundTo(device)) return c.available && !c.latched_off;
-        if (!na::dlss::BoundDeviceRemoved()) return false; // another live device owns DLSS: refuse
-        na::dlss::Shutdown();
-        g_tried_device = nullptr;
-    }
-    if (g_tried_device == device) return false; // already failed on this device
-    g_tried_device = device;
     wchar_t path[MAX_PATH] = {};
     const DWORD n = GetTempPathW(MAX_PATH, path);
     if (!n || n > MAX_PATH - 20) return false;
     wcscat_s(path, L"NeuralAlias-ngx");
     CreateDirectoryW(path, nullptr);
-    return na::dlss::InitOwn(device, path);
+    return na::dlss::EnsureOn(device, path);
 }
 
 template <int S>
@@ -215,14 +197,16 @@ Result DetourInit(Context c, const D3D12InitParams* p)
 template <int S>
 Result DetourDestroy(Context c)
 {
+    uint64_t view = 0;
     {
         std::lock_guard<std::mutex> lock(g_m);
         if (ContextInfo* ci = find(c)) {
-            na::dlss::ReleaseView(ci->view_id); // R-303: its DLSS history ends with it
+            view = ci->view_id;
             *ci = ContextInfo{};
         }
         ++g_stats.contexts_destroyed;
     }
+    if (view) na::dlss::ReleaseView(view); // backend calls never nest under g_m
     return g_slots[S].destroy(c);
 }
 
@@ -451,7 +435,6 @@ void ResetForTests()
     g_stats.hooked_functions = functions;
     g_last = Observation{};
     g_have_last = false;
-    { std::lock_guard<std::mutex> il(g_init_m); g_tried_device = nullptr; }
 }
 
 } // namespace na::xess

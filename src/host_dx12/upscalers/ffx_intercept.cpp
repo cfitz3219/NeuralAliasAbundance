@@ -58,7 +58,7 @@ bool ToDlss(const Observation& o, na::dlss::EvalDesc* out, const char** reason)
     // replace path transitions to DLSS's states around the evaluation and back.
     D3D12_RESOURCE_STATES s{};
     if (!D3D12State(o.color_state, &s) || !D3D12State(o.depth_state, &s) || !D3D12State(o.motion_state, &s) ||
-        !D3D12State(o.output_state, &s))
+        !D3D12State(o.output_state, &s) || (o.exposure && !D3D12State(o.exposure_state, &s)))
         return fail("FSR described a resource state NeuralAlias cannot translate for DLSS.");
     if (o.context_flags & FFX_UPSCALE_ENABLE_DEPTH_INFINITE) {
         // DLSS takes raw depth; infinite far plane changes nothing it relies on.
@@ -171,6 +171,7 @@ Observation observe_locked(ffxContext* ctx, const ffxDispatchDescUpscale& u)
     o.depth_state = u.depth.state;
     o.motion_state = u.motionVectors.state;
     o.output_state = u.output.state;
+    o.exposure_state = u.exposure.state;
     o.render_w = u.renderSize.width;
     o.render_h = u.renderSize.height;
     o.upscale_w = u.upscaleSize.width;
@@ -193,33 +194,15 @@ Observation observe_locked(ffxContext* ctx, const ffxDispatchDescUpscale& u)
     return o;
 }
 
-// ARGON-G2-004/005: DLSS start-up, serialised on its own mutex and never under
-// the interceptor's g_m (UI GetStats() never waits on NGX). Retries for every
-// new device; if the game recreated its device after the old one was removed,
-// the backend is shut down (nothing can be pending on a removed device) and
-// started again on the new one.
-std::mutex g_init_m;
-ID3D12Device* g_tried_device = nullptr; // identity of the last device InitOwn was tried on
-
+// All producers share one backend lifecycle transaction; never hold g_m here.
 bool ensure_dlss(ID3D12Device* device)
 {
-    if (!device) return false;
-    std::lock_guard<std::mutex> lock(g_init_m);
-    const na::dlss::Capabilities c = na::dlss::GetCapabilities();
-    if (c.attached) {
-        if (na::dlss::IsBoundTo(device)) return c.available && !c.latched_off;
-        if (!na::dlss::BoundDeviceRemoved()) return false; // another live device owns DLSS: refuse
-        na::dlss::Shutdown();
-        g_tried_device = nullptr;
-    }
-    if (g_tried_device == device) return false; // already failed on this device
-    g_tried_device = device;
     wchar_t path[MAX_PATH] = {};
     const DWORD n = GetTempPathW(MAX_PATH, path);
     if (!n || n > MAX_PATH - 20) return false;
     wcscat_s(path, L"NeuralAlias-ngx");
     CreateDirectoryW(path, nullptr);
-    return na::dlss::InitOwn(device, path);
+    return na::dlss::EnsureOn(device, path);
 }
 
 // True when DLSS produced this frame (FSR must then be skipped).
@@ -246,10 +229,40 @@ bool try_replace(const Observation& o, uint64_t view_id, Backend last, const cha
         {o.depth, o.depth_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE},
         {o.motion, o.motion_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE},
         {o.output, o.output_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS},
+        {o.exposure, o.exposure_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE},
     };
-    D3D12_RESOURCE_BARRIER to[4] = {}, back[4] = {};
+    D3D12_RESOURCE_BARRIER to[5] = {}, back[5] = {};
+    if (o.list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT &&
+        o.list->GetType() != D3D12_COMMAND_LIST_TYPE_COMPUTE) {
+        *why_out = "DLSS requires a graphics or compute command list.";
+        return false;
+    }
+    // FFX declares whole-resource states. Reject aliased roles with conflicting
+    // requirements before recording any transitions (subresource views need C13).
+    for (size_t i = 0; i < 5; ++i) {
+        if (!wants[i].r) continue;
+        D3D12_RESOURCE_STATES state{};
+        D3D12State(wants[i].ffx, &state);
+        if (o.list->GetType() == D3D12_COMMAND_LIST_TYPE_COMPUTE &&
+            (state & D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)) {
+            *why_out = "FSR's graphics resource state cannot be restored on a compute list.";
+            return false;
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (wants[i].r == wants[j].r &&
+                (wants[i].ffx != wants[j].ffx || wants[i].dlss != wants[j].dlss)) {
+                *why_out = "FSR resource roles require conflicting states.";
+                return false;
+            }
+        }
+    }
     UINT n = 0;
-    for (const Want& w : wants) {
+    for (size_t i = 0; i < 5; ++i) {
+        const Want& w = wants[i];
+        if (!w.r) continue;
+        bool duplicate = false;
+        for (size_t j = 0; j < i; ++j) duplicate |= wants[j].r == w.r;
+        if (duplicate) continue;
         D3D12_RESOURCE_STATES game{};
         D3D12State(w.ffx, &game);
         // Already readable by compute (or already a UAV for the output): no barrier.
@@ -306,15 +319,17 @@ ffxReturnCode_t DetourCreateContext(ffxContext* context, ffxCreateContextDescHea
 template <int S>
 ffxReturnCode_t DetourDestroyContext(ffxContext* context, const ffxAllocationCallbacks* mem)
 {
+    uint64_t view = 0;
     {
         std::lock_guard<std::mutex> lock(g_m);
         if (context)
             if (ContextInfo* ci = find_context(*context)) {
-                na::dlss::ReleaseView(ci->view_id); // R-303: its DLSS history ends with it
+                view = ci->view_id;
                 *ci = ContextInfo{};
             }
         ++g_stats.contexts_destroyed;
     }
+    if (view) na::dlss::ReleaseView(view); // backend calls never nest under g_m
     return g_slots[S].destroy(context, mem);
 }
 
@@ -494,7 +509,6 @@ void ResetForTests()
     g_stats.hooked_functions = functions;
     g_last = Observation{};
     g_have_last = false;
-    { std::lock_guard<std::mutex> il(g_init_m); g_tried_device = nullptr; }
 }
 
 } // namespace na::ffx
