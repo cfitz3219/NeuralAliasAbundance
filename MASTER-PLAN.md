@@ -155,3 +155,11 @@ Linux 8/8, Windows no-SDK 18/18, public-header 20/20 and deployment 32 checks.
 Scene/truth output and ten analytical/adversarial checks are documented in
 `tests/fixture/README.md` on the branch. C6 GPU upload/evaluation remains Claude's
 integration task; Gate 2 peer review is pending. Next Astra task: A4.
+
+## 6. A4 implementation status (2026-10-24, Astra)
+
+Draft PR #13 at c063b95 implements/tests the portable evidence classifier and
+Windows menu bridge. CI run 40067741880: Linux 8/8, Windows 19/19 and 21/21,
+deployment 32 checks. **Not done:** host-owned runtime source registration and
+menu-startup call await Claude (requested in COMMS). In-game visibility and real
+FSR/XeSS evidence are not claimed; C7 supplies those producers. A4 remains open.
