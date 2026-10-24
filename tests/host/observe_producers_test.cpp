@@ -146,17 +146,26 @@ int main()
     test::ComPtr<ID3D12CommandAllocator> alloc;
     test::ComPtr<ID3D12GraphicsCommandList> list;
     REQUIRE(SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))));
+    std::printf("checkpoint 4.0\n"); std::fflush(stdout);
     REQUIRE(SUCCEEDED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr, IID_PPV_ARGS(&list))));
+    std::printf("checkpoint 4.1\n"); std::fflush(stdout);
     const float clear[4] = {0, 0, 0, 1};
     list->ClearRenderTargetView(rtv_heap->GetCPUDescriptorHandleForHeapStart(), clear, 0, nullptr);
+    std::printf("checkpoint 4.2\n"); std::fflush(stdout);
     REQUIRE(SUCCEEDED(list->Close()));
+    std::printf("checkpoint 4.3\n"); std::fflush(stdout);
     test::ComPtr<ID3D12Fence> fence;
     REQUIRE(SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))));
+    std::printf("checkpoint 4.4\n"); std::fflush(stdout);
     ID3D12CommandList* lists[] = {list.Get()};
     d.queue->ExecuteCommandLists(1, lists);
+    std::printf("checkpoint 4.5\n"); std::fflush(stdout);
     REQUIRE(SUCCEEDED(d.queue->Signal(fence.Get(), 1)));
+    std::printf("checkpoint 4.6\n"); std::fflush(stdout);
     REQUIRE(SUCCEEDED(d.queue->Wait(fence.Get(), 1)));
+    std::printf("checkpoint 4.7\n"); std::fflush(stdout);
     d.WaitIdle();
+    std::printf("checkpoint 4.8\n"); std::fflush(stdout);
 
     std::printf("checkpoint 5\n"); std::fflush(stdout);
     // Retirement: the last reference goes away.
