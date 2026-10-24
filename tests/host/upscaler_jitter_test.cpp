@@ -85,7 +85,6 @@ double Psnr(const std::vector<float>& a, const std::vector<double>& truth, uint3
     const double mse = se / static_cast<double>(n);
     return mse <= 0 ? 99.0 : 10.0 * std::log10(1.0 / mse);
 }
-} // namespace
 
 constexpr uint32_t kRw = 1280, kRh = 720, kOw = 1920, kOh = 1080, kFrames = 48, kBorder = 16;
 const double kZone = 900.0 * 3.14159265358979 / 0.7071;
