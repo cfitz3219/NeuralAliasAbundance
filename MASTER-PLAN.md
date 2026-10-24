@@ -188,3 +188,9 @@ qualification. No main runtime merge or game deployment has occurred.
 ### 2026-10-24 — PR #17 merged; Gate 2 validation remains open
 
 Verified GitHub merged #17 into main as `89b93b627741ced40cc4dd2055d019be8454ef59`. Runtime, tests and build configuration match the CI-validated `0b2ee86` tree exactly. Implementation, automated validation and integration are complete. Remaining gate work is independent review of the takeover delta/unfinished Argon audit and the scheduled RTX/runtime/in-game qualification. No game deployment or gate closure is claimed. This supersedes earlier statements that the runtime changes were not yet merged.
+
+## 2026-10-24 — Gate 2 CLOSED on Astra's side by Cort's direction
+
+Cort explicitly directed: "close gate 2. On your end anyway". Astra's Gate 2 implementation and validation work is COMPLETE and CLOSED. This supersedes earlier statements that Astra's Gate 2 remains open. Evidence: integrated implementation in PR #17; fresh RTX Release build and 30/30 CTests; real NGX fixture output; Ghost FSR 3.1.4 and XeSS interception with successful DLSS replacement, zero observed fallbacks/rejections, and XeSS overlay INJECTOR confirmation. Live report and journal are in PR #19 at 88ddb9a; RTX report in PR #18.
+
+Argon remains deferred, not represented as completed. Independent review/publication status and extended quality, DRS and device-loss coverage remain separately tracked follow-up work; they do not reopen or block Astra's Gate 2 closure under this user direction. No PR merge, new deployment, or additional runtime test is implied by this status change. Next Astra implementation task in the queue is Phase 3 A5, subject to its host-data dependencies.
