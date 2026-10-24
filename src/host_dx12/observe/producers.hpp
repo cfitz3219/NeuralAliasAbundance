@@ -58,6 +58,10 @@ struct ExecuteToken {
     std::shared_ptr<void> queue_state;
     na_object_id queue_id = 0;
 };
+// C9b: the game host's original ExecuteCommandLists, used to submit the host's
+// own sample copies without re-entering the host's execute detour.
+void SetExecuteForwarder(void(__stdcall* fwd)(ID3D12CommandQueue*, unsigned int, ID3D12CommandList* const*));
+
 // Begin also takes the C9 constant-data snapshots of the submitted recordings.
 ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue, uint32_t count = 0, ID3D12CommandList* const* lists = nullptr);
 void ExecuteEnd(const ExecuteToken& token, ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* const* lists);
