@@ -1,7 +1,7 @@
 # NeuralAliasAbundance: master plan
 
 **Written by:** Claude, 2026-10-23, at Cort's direction. Incorporates Codex/Astra's recovery review (`docs/CLAUDE-HANDOFF.md`) and roadmap (`docs/INPUT-ACQUISITION-ROADMAP.md`).
-**Audience:** Claude, Astra (Codex), and Cort.
+**Audience:** Claude, Astra (Codex), Gemini Argon (independent gate auditor), and Cort.
 **Status:** ACTIVE. This is the single source of truth for *what* gets built, *by whom*, and *in what order*.
 
 > **Goal:** one universal DX12 injector that obtains or synthesizes everything DLSS needs (scene color, depth, motion vectors, jitter, camera) **without per-game code**. Universal coverage is the engineering goal and working design premise.
@@ -14,11 +14,11 @@
 | Rule | Detail |
 |---|---|
 | **Build mode now** | Cort's direction: **both agents build, nobody reviews yet.** Don't block on the other agent. Don't edit the other agent's files. |
-| **Review gate before testing** | At the end of each phase, before any Windows/GPU/game test session: **Claude reviews every Astra PR, Astra reviews every Claude PR.** Fixes land, then Cort runs the tests. |
+| **Review gate sequence** | Starting at Gate 2: **Claude reviews every Astra PR; Astra reviews every Claude PR**. Authors resolve findings and run regressions, then **Gemini Argon audits the full gate snapshot and surrounding architecture**. Resolve/recheck findings, then run the scheduled Windows/GPU/game session and close the gate. Routine developer tests and CI continue throughout. |
 | **Order** | Work your tasks **top to bottom**. Phases go from *already proven possible* → *hard*. Don't start a later phase's task while an earlier task of yours is open, unless it's blocked (say so in COMMS.md). |
 | **Branches** | Claude → `claude/<task-id>-<topic>`, Astra → `astra/<task-id>-<topic>`. One branch per task. Commit and push when each task is done. Open a PR into `main` (it waits for the review gate). |
 | **Coordination files on `main`** | `MASTER-PLAN.md`, `COMMS.md`, `COLLABORATION.md` and `HANDOFF.md` may be edited **directly on `main`** (pull/rebase first, small commits, never force-push). Everything else goes through a branch + PR. |
-| **Talking to each other** | `COMMS.md` only. Append-only, newest at the bottom. Questions, blockers, "done" notices, interface requests. |
+| **Talking to each other** | `COMMS.md` only. Append-only, newest at the bottom. Questions, blockers, done notices, interface requests and Argon handoff/audit status. Argon receives a commit-pinned review packet after cross-review; see COLLABORATION.md. |
 | **Shared interfaces** | ABI 0.1 (`host_observe.h`) and `src/core/` stay frozen. Changes need a numbered proposal in COLLABORATION.md plus an ack from the other agent in COMMS.md. |
 | **Never commit** | NVIDIA SDK headers/libs/DLLs, game files, captures, `local/`. |
 | **Done means** | The task's "Done when" line is met on CI (Linux/Windows build) **or** clearly marked "needs Windows GPU" for the test session. No placeholder tests that pass by doing nothing. |
@@ -65,7 +65,7 @@ Legend: **C** = Claude task, **A** = Astra task, **J** = joint task (the split i
 | **C7** | Claude | **FSR 2/3 and XeSS call interception.** Many DX12 games without DLSS still pass labeled color/depth/motion/jitter to FSR or XeSS. Intercept those calls and route the inputs into C6. Largest coverage gain for the least risk (approach proven by community tools; GPL code = reference only, no copying). | One FSR game and one XeSS game observed with valid inputs (test session). | 4–8 d |
 | **A4** | Astra | **Upscaler detection report.** On injection, report which path a game offers: native DLSS / FSR / XeSS / none, with the evidence. Show it as an overlay status line through the existing menu API (`na::menu::Register`). | Overlay shows the detected route and why. | 1–2 d |
 
-**REVIEW GATE 2 → test session 2:** fixture DLSS, plus FSR/XeSS games.
+**REVIEW GATE 2:** Astra ↔ Claude cross-review → fixes/regressions → Argon independent audit → resolve/recheck findings → test session 2 (fixture DLSS plus FSR/XeSS games) → close gate.
 
 ### PHASE 3: Universal discovery, the brain *(harder; core of the goal)*
 
@@ -79,7 +79,7 @@ Legend: **C** = Claude task, **A** = Astra task, **J** = joint task (the split i
 | **A8** | Astra | **Auto-profiles.** Once a game's layout is confirmed, save it per exe hash in `profiles/` so the next launch is instant. Invalidate on mismatch. Hand-written adapters (TLOU) become overrides. | Second launch of a fixture "game" skips discovery. | 1–2 d |
 | **A9** | Astra | **Anno 1800 diagnostics-only report:** which inputs were found, their confidence, and the unknowns. No reconstruction yet. | Report from a test session. | 1–2 d |
 
-**REVIEW GATE 3 → test session 3:** classifier output in Anno plus one more DLSS-less game.
+**REVIEW GATE 3:** cross-review → fixes/regressions → Argon audit → resolve/recheck findings → test session 3 (classifier output in Anno plus one more DLSS-less game) → close gate.
 
 ### PHASE 4: The hard parts *(save for last)*
 
@@ -92,7 +92,7 @@ Legend: **C** = Claude task, **A** = Astra task, **J** = joint task (the split i
 | **J3** | Joint | **True upscaling (render-resolution control)** for DLSS-less games: make the engine render smaller while UI/post stay at display size. Per engine family. Astra: find the resolution control points. Claude: host patching + restore on disable. | First engine family works at Quality/Performance. | weeks |
 | **J4** | Joint | **Tier 1 motion vectors via DXIL patching** (research). Only after J2. | Research report + prototype. | weeks |
 
-**REVIEW GATE 4 → test session 4.**
+**REVIEW GATE 4:** cross-review → fixes/regressions → Argon audit → resolve/recheck findings → test session 4 → close gate.
 
 ### On hold (exists in code, not blocking the goal)
 Frame Generation, Neural Rendering, Ray Reconstruction, Reflex/latency. Keep compiling; no new work until J2 ships.
@@ -146,3 +146,20 @@ Every claim was checked against the code (and, for API rules, Microsoft's docume
 - **C14** (FG phase): per-game NVIDIA driver FG preset, opt-in with restore.
 - **FG design note**: under V-Sync, generated presents each wait a refresh; FG needs refresh ≥ (multiplier × game fps) or a VRR/tearing path (`ALLOW_TEARING` only with SyncInterval 0 on a tearing-capable, non-exclusive-fullscreen chain).
 
+
+## 5. A3 build progress (2026-10-24, Astra)
+
+A3 portable ground-truth generator and CPU candidate checker are implemented in
+draft PR #12 (`astra/a3-ground-truth-fixture`, e57e830). CI run 40067259102 passes
+Linux 8/8, Windows no-SDK 18/18, public-header 20/20 and deployment 32 checks.
+Scene/truth output and ten analytical/adversarial checks are documented in
+`tests/fixture/README.md` on the branch. C6 GPU upload/evaluation remains Claude's
+integration task; Gate 2 peer review is pending. Next Astra task: A4.
+
+## 6. A4 implementation status (2026-10-24, Astra)
+
+Draft PR #13 at c063b95 implements/tests the portable evidence classifier and
+Windows menu bridge. CI run 40067741880: Linux 8/8, Windows 19/19 and 21/21,
+deployment 32 checks. **Not done:** host-owned runtime source registration and
+menu-startup call await Claude (requested in COMMS). In-game visibility and real
+FSR/XeSS evidence are not claimed; C7 supplies those producers. A4 remains open.
