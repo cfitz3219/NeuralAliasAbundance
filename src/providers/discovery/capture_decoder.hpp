@@ -18,7 +18,7 @@ struct DecodedEvent { na_event_header header{}; size_t offset{}; };
 struct DecodedBatch {
     bool valid{};
     bool unknown_foundational{};
-    bool incomplete_capture{}; // Known H2 layout cannot represent all recorded details.
+    bool incomplete_capture{}; // Structurally valid bytes do not establish complete evidence.
     na_event_batch header{};
     // Owned bytes; offsets never refer into the callback's borrowed allocation.
     std::vector<unsigned char> bytes;
@@ -95,6 +95,16 @@ inline DecodedBatch DecodeBatch(const void* input, size_t readable) {
         if (h.kind == NA_EV_QUEUE_EXECUTE) {
             na_ev_queue_execute e{}; std::memcpy(&e, raw + position, sizeof(e));
             if (!WireArrayFits(h.size_bytes, sizeof(e), e.refs_offset, e.ref_stride, e.list_count, sizeof(na_list_ref))) return {};
+            if (e.contains_bundles) result.incomplete_capture = true;
+            for (uint32_t j=0; j<e.list_count; ++j) {
+                na_list_ref ref{};
+                std::memcpy(&ref, raw+position+e.refs_offset+static_cast<size_t>(j)*e.ref_stride, sizeof(ref));
+                if (!ref.list || ref.list==NA_UNKNOWN_U64 || ref.recording_generation==NA_UNKNOWN_U64)
+                    result.incomplete_capture = true;
+            }
+        } else if (h.kind == NA_EV_LIST_RESET || h.kind == NA_EV_LIST_CLOSE) {
+            na_ev_list_reset_close e{}; std::memcpy(&e, raw+position, sizeof(e));
+            if (e.hresult < 0 || (e.list_flags & NA_LISTF_RESET_FAILED)) result.incomplete_capture = true;
         } else if (h.kind == NA_EV_CAPABILITY_REPORT) {
             na_ev_capability_report e{}; std::memcpy(&e, raw + position, sizeof(e));
             if (e.session != b.session || !WireArrayFits(h.size_bytes, sizeof(e), e.entries_offset,
