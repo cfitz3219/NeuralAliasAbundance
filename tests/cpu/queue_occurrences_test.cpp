@@ -14,7 +14,8 @@ int main(){return test::run({
         QueueOccurrences q; constexpr unsigned n=8;std::atomic<unsigned> ready{0},bad{0};
         std::vector<std::thread> threads;std::vector<uint64_t> tickets(n);
         for(unsigned i=0;i<n;++i)threads.emplace_back([&,i]{auto t=q.Begin();tickets[i]=t.ticket;++ready;while(ready.load()!=n)std::this_thread::yield();if(!q.End(t))++bad;});
-        for(auto& t:threads)t.join();CHECK(bad.load()==0);
+        for (auto& t : threads) { t.join(); }
+        CHECK(bad.load()==0);
         for(unsigned i=0;i<n;++i)for(unsigned j=i+1;j<n;++j)CHECK(tickets[i]!=tickets[j]);
         auto after=q.Begin();CHECK(!q.End(after));
     }},
