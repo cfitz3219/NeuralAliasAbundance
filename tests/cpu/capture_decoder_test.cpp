@@ -54,6 +54,17 @@ int main() { return test::run({
         p=good; Put(p,base+offsetof(na_ev_queue_execute,refs_offset),uint32_t(8)); CHECK(!Decode(p).valid);
         p=good; Put(p,base+offsetof(na_ev_queue_execute,ref_stride),uint32_t(0)); CHECK(!Decode(p).valid);
     }},
+    {"execute reference identity and generation must be known", [] {
+        na_ev_queue_execute e{}; e.list_count=1; e.refs_offset=sizeof(e); e.ref_stride=sizeof(na_list_ref);
+        auto p=Packet(e,NA_EV_QUEUE_EXECUTE); p.resize(p.size()+sizeof(na_list_ref));
+        Put(p,offsetof(na_event_batch,payload_bytes),uint32_t(sizeof(e)+sizeof(na_list_ref)));
+        Put(p,base+offsetof(na_event_header,size_bytes),uint32_t(sizeof(e)+sizeof(na_list_ref)));
+        for (auto ref : {na_list_ref{0,1},na_list_ref{NA_UNKNOWN_U64,1},na_list_ref{8,NA_UNKNOWN_U64}}) {
+            Put(p,base+sizeof(e),ref); auto d=Decode(p); CHECK(d.valid && d.incomplete_capture);
+        }
+        Put(p,base+sizeof(e),na_list_ref{8,0}); auto d=Decode(p);
+        CHECK(d.valid && !d.incomplete_capture); // initial generation zero is legal
+    }},
     {"malformed tail discards earlier valid events", [] {
         auto p=Packet(na_ev_resource_created{},NA_EV_RESOURCE_CREATED);
         const size_t second=p.size(); p.resize(second+sizeof(na_event_header));

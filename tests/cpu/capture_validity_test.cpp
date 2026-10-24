@@ -86,6 +86,39 @@ int main() { return test::run({
         s.epoch=2; ++s.detail_dropped; Snapshot(2).Send(v,s); CHECK(!v.CaptureContiguous());
         s.epoch=3; Snapshot(3).Send(v,s); CHECK(v.CaptureContiguous());
     }},
+    {"bundle and failed recording evidence cannot stay contiguous", [] {
+        for (int mode=0; mode<3; ++mode) {
+            CaptureValidity v; auto s=Status(); Snapshot().Send(v,s); CHECK(v.CaptureContiguous());
+            Batch b;
+            if (mode==0) {
+                na_ev_queue_execute e{}; e.queue=9; e.queue_ticket=1; e.contains_bundles=1;
+                b.Add(e,NA_EV_QUEUE_EXECUTE);
+            } else {
+                na_ev_list_reset_close e{}; e.list=8; e.recording_generation=1; e.hresult=-1;
+                b.Add(e,mode==1 ? NA_EV_LIST_RESET : NA_EV_LIST_CLOSE);
+            }
+            b.Send(v,s); CHECK(v.InventoryConsistent() && !v.CaptureContiguous());
+        }
+    }},
+#ifdef NA_SNAP_SYNC_APP_UNKNOWN
+    {"provisional H3 cannot be qualified by a later clean execute", [] {
+        for (bool reverse : {false,true}) {
+            CaptureValidity v; auto s=Status(); Snapshot().Send(v,s); CHECK(v.CaptureContiguous());
+            Batch snapshot,execute;
+            na_ev_snapshot e{}; e.queue=9; e.queue_ticket=1; e.list=8;
+            e.recording_generation=1; e.status=NA_SNAP_NOT_MAPPED; e.sync=NA_SNAP_SYNC_APP_UNKNOWN;
+            snapshot.Add(e,NA_EV_SNAPSHOT);
+            na_ev_queue_execute q{}; q.queue=9; q.queue_ticket=1;
+            execute.Add(q,NA_EV_QUEUE_EXECUTE);
+            if (reverse) { execute.Send(v,s); snapshot.Send(v,s); }
+            else { snapshot.Send(v,s); execute.Send(v,s); }
+            CHECK(v.InventoryConsistent() && !v.CaptureContiguous());
+            v.ObserveStatus(s); CHECK(!v.CaptureContiguous());
+            s.epoch=2; Snapshot(2).Send(v,s); CHECK(v.CaptureContiguous());
+            snapshot.Send(v,s); CHECK(v.CaptureContiguous()); // stale snapshot cannot poison new epoch
+        }
+    }},
+#endif
     {"new session discards old readiness", [] {
         CaptureValidity v; auto s=Status(); Snapshot().Send(v,s); CHECK(v.InventoryConsistent());
         s.session=43; v.ObserveStatus(s); CHECK(!v.InventoryConsistent() && v.Session()==43);
