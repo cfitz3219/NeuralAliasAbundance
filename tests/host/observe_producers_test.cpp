@@ -73,7 +73,7 @@ int main()
     std::printf("checkpoint 0\n"); std::fflush(stdout);
     REQUIRE(na::observe::InstallProducers(dev, d.queue.Get(), /*hook_queue_execute=*/true));
     const auto st0 = na::observe::GetProducerStats();
-    std::printf("hooks installed %u, optional missing %u\n", st0.hooks_installed, st0.hooks_missing);
+    std::printf("hooks installed %u, optional missing %u, shared-target slots [%s]\n", st0.hooks_installed, st0.hooks_missing, st0.shared_target_slots);
     CHECK(st0.hooks_installed >= 20);
 
     // Created after installation but before start: must arrive in the snapshot.

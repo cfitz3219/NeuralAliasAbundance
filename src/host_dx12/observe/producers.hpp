@@ -69,7 +69,8 @@ struct ProducerStats {
     uint64_t executes;
     uint64_t ambiguous_executes;
     uint32_t hooks_installed;
-    uint32_t hooks_missing;        // optional interfaces the device does not expose
+    uint32_t hooks_missing;        // optional interfaces the device does not expose / refused slots
+    const char* shared_target_slots; // slots refused because another hooked slot has the same function
 };
 ProducerStats GetProducerStats();
 
