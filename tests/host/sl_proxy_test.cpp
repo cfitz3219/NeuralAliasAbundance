@@ -142,12 +142,12 @@ int wmain(int argc, wchar_t** argv)
         memcpy(c2.h.guid, cguid, 16);
         c2.h.version = 2;
         // FrameToken: vtable pointer first (operator uint32_t is entry 0), then BaseStructure.
-        struct Token { const void* const* vtbl; Header h; } token{};
+        struct Token { const void* const* vtbl; Header h; } frame_token{};
         using TokenOp = uint32_t(__cdecl*)(const void*);
         static const TokenOp token_vtbl[1] = {[](const void*) -> uint32_t { return 77; }};
-        token.vtbl = reinterpret_cast<const void* const*>(token_vtbl);
+        frame_token.vtbl = reinterpret_cast<const void* const*>(token_vtbl);
         const uint8_t tguid[16] = {0x35, 0x0f, 0x0a, 0x83, 0x84, 0xdb, 0x71, 0x41, 0xa8, 0x04, 0x59, 0xb2, 0x06, 0x49, 0x9b, 0x18};
-        memcpy(token.h.guid, tguid, 16);
+        memcpy(frame_token.h.guid, tguid, 16);
         struct Viewport { Header h; uint32_t value; } vp{};
         const uint8_t vguid[16] = {0x35, 0x64, 0x1b, 0x17, 0x3c, 0x9b, 0xc8, 0x4f, 0x99, 0x94, 0xfb, 0xe5, 0x25, 0x69, 0xaa, 0xa4};
         memcpy(vp.h.guid, vguid, 16);
@@ -156,8 +156,8 @@ int wmain(int argc, wchar_t** argv)
         REQUIRE(stub_ret != nullptr);
         stub_ret(0); // sl::Result::eOk
         auto setc2 = reinterpret_cast<uint64_t(__cdecl*)(const void*, const void*, const void*)>(GetProcAddress(proxy, "slSetConstants"));
-        CHECK(setc2(&c2, &token, &vp) == 0);
-        CHECK(st()->wide[1] == reinterpret_cast<uintptr_t>(&token) && st()->wide[2] == reinterpret_cast<uintptr_t>(&vp));
+        CHECK(setc2(&c2, &frame_token, &vp) == 0);
+        CHECK(st()->wide[1] == reinterpret_cast<uintptr_t>(&frame_token) && st()->wide[2] == reinterpret_cast<uintptr_t>(&vp));
         auto layout = reinterpret_cast<uint32_t(*)(uint64_t*)>(GetProcAddress(proxy, "NeuralAliasSLProxyLayout"));
         uint64_t blocks = 0;
         CHECK(layout(&blocks) == 2 && blocks == 2);
