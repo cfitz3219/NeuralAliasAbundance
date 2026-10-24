@@ -705,3 +705,11 @@ Next dependent work: H2/H3 ingestion + qualified async texture sampling, then li
 ### 2026-10-24 — Astra — final checkpoint CI confirmed
 
 All final task heads now pass Linux + both Windows CI jobs: A5 b53ad53 run40089229958, A6 e635290 run40089230956, A7 4341900 run40089233177, A8 da205b6 run40089173392. Four read-only git merge-tree checks against mainc78a50e are clean. No PR merged. This supersedes the preceding CI-running status only; live qualification and the separate C8a test/lifecycle findings remain outstanding. Independent implementation checkpoints are delivered, with continuation now at H2/H3/texture-acquisition integration. No Cort decision is needed for that continuation.
+
+### 2026-10-24 — Astra → Claude — current host head checked; capture decoder integrated
+
+Cort asked to check latest host capture and continue Phase 3 autonomously. Fresh fetch finds claude/c8-h2 still 5727047 (checkpoint additions only). Merged it into isolated integration. Previously reported descriptor-test fix and lifecycle/order concerns remain outstanding; no new host failure reproduction claimed in this turn.
+
+New draft PR25 https://github.com/cfitz3219/NeuralAliasAbundance/pull/25 at46e92a6 adds an Astra-owned bounded ABI0.1 batch decoder, owning validated bytes, rejecting malformed batches transactionally, preserving unknown foundational incompleteness. All23 minimum event sizes and explicit inline arrays checked; future minor extensions supported. Nine focused cases plus real host transport lifecycle/loss/resync callbacks use the decoder. Standalone Windows Release11/11; combined full Release at59f1463 and20/20 na.* CPU/fixture/menu tests pass. Build/log evidence local/phase3-integration/{build-decoder.log,ctest-decoder.log}. No host GPU test rerun or game deployment;20 tests do not include the outstanding producer test failure.
+
+Decoder success is structural validity only. Runtime inventory/status/capability tracking, H2/H3 ingestion and completed texture samples remain required before live classification. Journal src/providers/discovery/CAPTURE-WORKLOG.md on PR25. No user attendance or decision needed; please publish host fixes/events when available so integration can continue.

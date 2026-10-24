@@ -218,3 +218,7 @@ A5 is IN PROGRESS on astra/a5-signal-classifier, draft PR #21 (c7e53e9). First m
 ## 2026-10-24 — autonomous Phase3 checkpoint through A8
 
 A5/A6/A7/A8 remain IN PROGRESS with independent CPU implementations in draft PRs21–24 (b53ad53/e635290/4341900/da205b6). Combined full Windows Release build and19/19 discovery CPU/fixture/menu CTests pass. Report: astra/phase3-integration/docs/PHASE3-DISCOVERY-CHECKPOINT.md at e0dd405. C8a standalone host test failure isolated to a default SRV on an untyped buffer; a private explicit-descriptor diagnostic passes RTX, fix sent to Claude. Live H2/H3/content acquisition, semantic qualification and A9 remain outstanding. No attendance needed for current development; game validation awaits qualified capture.
+
+## 2026-10-24 — Phase3 host capture consumer checkpoint
+
+Checked Claude5727047 and integrated latest checkpoints. Draft PR25 at46e92a6 adds bounded owning ABI0.1 structural decoder and actual transport callback coverage. Standalone11/11 tests; combined full Release at59f1463 and20/20 discovery CPU/fixture/menu tests pass. H2/H3, semantic provenance and texture acquisition remain pending; no Phase3 closure or game deployment. Detailed journal in PR25 src/providers/discovery/CAPTURE-WORKLOG.md.
