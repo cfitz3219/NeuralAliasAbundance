@@ -1,0 +1,13 @@
+# Capture decoder integration journal
+
+## 2026-10-24 — ABI 0.1 consumer boundary
+
+Fetched Claude's branch: latest remains 5727047 (test checkpoints). H2/H3 additions and the previously supplied explicit-buffer-SRV fix are not published there. Merged those checkpoints into the isolated integration branch; first merge attempt failed for missing identity without changing files, then succeeded with command-scoped identity.
+
+Added capture_decoder.hpp in Astra's discovery lane. This is a bounded worker/offline structural decoder, not an inventory tracker or resource classifier. It copies valid batches into owned storage, checks all 23 known event minimum sizes, exact payload/count/epoch framing, identity-bearing session/epoch records and overflow-safe explicit inline array offsets/strides. Unknown optional events survive as opaque records; unknown foundational events remain explicitly flagged. Any malformed tail discards all batch output. Future minor fields are allowed; major mismatch is rejected. Policy limits are 4 MiB and 65,536 events per batch; exceeding either requires caller loss/invalidation handling, not silent truncation.
+
+Nine focused regression cases cover every truncation of a resource batch, all known minimum sizes, malformed tails, unaligned input ownership, future minor versions and inline strides, unknown foundational records, identity mismatches and overflowing counts. Integrated the decoder into the existing real Windows transport test callback: lifecycle, loss, snapshot/resync and final batches all decode successfully. No GPU, hooks or game deployment in this test.
+
+Fresh standalone MSVC Release build: 11/11 CTests pass. Initial configure did not find Python; reconfigured with the bundled Python before the reported suite, so fixture.reference ran and passed. Self-review removed an unjustified natural-alignment restriction on inline arrays: the ABI only requires minimum strides and bounded explicit offsets, and decoding uses memcpy. Added a stride-20 capability regression. No frozen ABI or Claude-owned implementation changed.
+
+Remaining work: authoritative status-counter/inventory/capability state, H2 execution provenance, H3 and completed texture samples. Decode success is only structural validity; it never means loss-free capture, complete inventory, ordered submissions, GPU completion or qualified DLSS inputs. A worker integration must inspect status/capabilities and unknown_foundational before deriving evidence. The borrowed callback allocation's extent is guaranteed by the host; offline callers must independently supply their actual allocation extent. No live runtime consumer registration yet.

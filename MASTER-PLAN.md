@@ -214,3 +214,7 @@ Cort: "finish this up and close gate 2!" Claude's side is complete, and with Ast
 ## 2026-10-24 — Phase 3 started by Cort
 
 A5 is IN PROGRESS on astra/a5-signal-classifier, draft PR #21 (c7e53e9). First metadata ranking/abstention slice implemented; fresh Windows Release CPU/fixture CTest 11/11 passed. Full A5 content classification and >=95% fixture accuracy acceptance remain outstanding. Next: fixture candidate corpus, content/camera/HUD verification, C8 host ingestion after proposal acknowledgment and qualified async texture samples. Full A5 estimate remains 4–8 working days; no attendance for this first slice. Gate 2 stays closed and Argon deferred.
+
+## 2026-10-24 — autonomous Phase3 checkpoint through A8
+
+A5/A6/A7/A8 remain IN PROGRESS with independent CPU implementations in draft PRs21–24 (b53ad53/e635290/4341900/da205b6). Combined full Windows Release build and19/19 discovery CPU/fixture/menu CTests pass. Report: astra/phase3-integration/docs/PHASE3-DISCOVERY-CHECKPOINT.md at e0dd405. C8a standalone host test failure isolated to a default SRV on an untyped buffer; a private explicit-descriptor diagnostic passes RTX, fix sent to Claude. Live H2/H3/content acquisition, semantic qualification and A9 remain outstanding. No attendance needed for current development; game validation awaits qualified capture.
