@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <cstring>
 #include <type_traits>
-static_assert(NA_OBSERVE_ABI_MAJOR == 0 && NA_OBSERVE_ABI_MINOR == 1);
+static_assert(NA_OBSERVE_ABI_MAJOR == 0 && NA_OBSERVE_ABI_MINOR == 2); // 0.2 = C8 (H2) append-only
 static_assert(sizeof(na_event_header) == 32 && alignof(na_event_header) == 8);
 static_assert(sizeof(na_event_batch) == 40 && offsetof(na_event_batch, payload_bytes) == 24);
 static_assert(sizeof(na_list_ref) == 16 && offsetof(na_list_ref, recording_generation) == 8);
@@ -31,6 +31,13 @@ CHECK_EVENT(na_ev_present, 64);
 CHECK_EVENT(na_ev_loss_mark, 40);
 CHECK_EVENT(na_ev_epoch_begin, 48);
 CHECK_EVENT(na_ev_inventory_complete, 48);
+// ABI 0.2 (C8 / H2) additions; 0.1 layouts above are unchanged.
+CHECK_EVENT(na_ev_root_signature_created, 80);
+CHECK_EVENT(na_ev_pipeline_created, 216);
+CHECK_EVENT(na_ev_list_op, 120);
+static_assert(sizeof(na_root_param) == 32 && sizeof(na_view_ref) == 40 && sizeof(na_barrier) == 40);
+static_assert(offsetof(na_ev_list_op, a) == 72 && offsetof(na_ev_pipeline_created, stage_hash) == 64);
+static_assert(NA_EV_ROOT_SIGNATURE_CREATED == 24 && NA_EV_PIPELINE_CREATED == 25 && NA_EV_LIST_OP == 26);
 #undef CHECK_EVENT
 int main() { return test::run({
     {"little-endian wire and explicit inline-array offset", [] {
