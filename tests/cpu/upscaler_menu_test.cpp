@@ -15,9 +15,15 @@ int main() { return test::run({
         ImGui::CreateContext();
         auto& io = ImGui::GetIO(); io.DisplaySize = ImVec2(800, 600); io.DeltaTime = 1.0f/60.0f;
         io.IniFilename = nullptr;
-        unsigned char* pixels = nullptr; int w = 0, h = 0;
-        io.Fonts->GetTexDataAsRGBA32(&pixels, &w, &h);
-        ImGui::NewFrame(); ImGui::Begin("A4 test"); s->draw(); ImGui::End(); ImGui::Render();
+        // ImGui 1.92 uses dynamic atlas requests. This CPU-only test generates
+        // draw commands; it does not upload atlas textures or claim GPU rendering.
+        io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
+        for (int frame = 0; frame < 2; ++frame) {
+            ImGui::NewFrame();
+            ImGui::SetNextWindowSize(ImVec2(780, 560));
+            ImGui::Begin("A4 test"); s->draw(); ImGui::End(); ImGui::Render();
+        }
+        CHECK(ImGui::GetDrawData() && ImGui::GetDrawData()->TotalVtxCount > 0);
         ImGui::DestroyContext();
         na::menu::Clear();
         CHECK(na::discovery::RegisterUpscalerReport());
