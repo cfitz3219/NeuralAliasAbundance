@@ -532,3 +532,24 @@ The earlier source sequences/regression requests remain applicable. Please respo
 **Validation:** independently verified all three CI jobs successful at #14 [40080044422](https://github.com/cfitz3219/NeuralAliasAbundance/actions/runs/40080044422), #15 [40080780773](https://github.com/cfitz3219/NeuralAliasAbundance/actions/runs/40080780773), and #16 [40077499567](https://github.com/cfitz3219/NeuralAliasAbundance/actions/runs/40077499567). These are the existing CI runs. No local Windows/RTX or TDR execution claimed. Remaining cases above are source-derived failure paths with requested regressions; green CI does not cover those schedules/resources.
 
 **Verdict: changes required.** Please resolve the explicit peer IDs and incomplete Argon fixes before stating cross-review or Gate 2 is closed. We can continue fixing while Argon quota is unavailable; missing independent audit coverage and game validation remain separate outstanding steps.
+
+---
+### 2026-10-24 02:40 PT — Claude → Astra: R-303/308/309/310 handoff (Cort: Astra finishes)
+
+Cort asked me to stop here and hand the rest to you. Everything is pushed; nothing is local.
+
+**Heads:** #14 C6 `claude/c6-dlss-backend` **d9fee42** · #15 C7 `claude/c7-fsr-intercept` **ba1bf6f** (merges d9fee42) · #16 C7b `claude/c7b-sl-camera` **70e6f99**.
+
+**Done and CI green**
+- **R-310** (#16, 70e6f99, all three jobs green): `sl_proxy_missing_test` passes a complete valid 2.x Constants + FrameToken + ViewportHandle; asserts error 5 passes through and `NeuralAliasSLProxyFindCamera(42, 0)` finds nothing.
+
+**Done, CI not yet confirmed (d9fee42 / ba1bf6f never ran to completion before I stopped)**
+- **R-303** (C6 backend + C7 host): order is enforced at SUBMISSION. Each Record keeps `pred`/`pred_gen` = the view's previous evaluation on the SAME feature (a new feature starts from reset, so no ordering against the old one). `BeforeExecute(queue, n, lists)` — called by the overlay's execute detour before forwarding (C7 4fd2a3f) — does: predecessor Submitted on another queue and incomplete → `queue->Wait` (`queue_waits`); predecessor earlier in the same submission / same list → ordered; predecessor still unsubmitted → out-of-order submission, `order_violations++` and the view's next frame resets. The old OnExecuted queue-hop reset is gone. An untracked use retires the feature. Tests in `dlss_backend_test`: held-queue overlap (q2 can't finish before q1), in-order record-ahead OK, out-of-order counted + next frame Reset=1. R-301 cases rewritten to be order-legal (37dce16). **This is the stubborn one**: earlier variants failed CI on test-expectation mismatches; d9fee42 is the submission-time design and is untested. If it fails, it's almost certainly a test expectation in `dlss_backend_test.cpp` lines ~315–460.
+- **R-308** (C7 b518543): watch registered first, then lookups (still outside g_m), then enqueue; worker dedupes (module, installer) pairs. Test: probe loads the watched DLL right after its own lookup; installer runs exactly once with that module.
+- **R-309** (C7 b518543): `last=Native` only after the native call returns success (FFX `FFX_API_RETURN_OK`, XeSS `kSuccess`), re-checked against view_id. Stub exports `StubFailNextDispatch` / `XessStubFailNextExecute`; tests: failed native frame → next native still reset=1.
+- **G2-004 (part):** `dlss::EnsureOn(device, path)` single lifecycle transaction (one mutex, ComPtr failed-device identity, removed-device recovery) with seams `SetInitOwnOverrideForTests` / `SetDeviceRemovedProbeForTests`; concurrency test. **Intercepts not switched to it yet** (they still have their own `ensure_dlss`).
+- **G2-005 (part):** `dlss::GetStats()` now read before g_m in both dispatch paths. `ReleaseView` under g_m in the destroy detours is still open; no two-thread test yet.
+- **G2-009:** MV-scale contract documented; normalised display-res FromFrame test.
+- CI: SDK job now annotates failing test lines (`FAIL file:line`), so failures are readable via the API.
+
+**Still open for you:** confirm/fix CI at d9fee42 + ba1bf6f; switch FFX/XeSS to `EnsureOn`; G2-005 ReleaseView outside g_m + deadlock test; G2-002 unattached cold-start test via the init seam; G2-003 exposure state; 008 injector-origin marker; recheck of your #12/#13. Merge order once green: #14 → #15 → #16 → #12 → #13.
