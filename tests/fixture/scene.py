@@ -105,6 +105,9 @@ def render(frame, width=96, height=64):
                 base = [(1-alpha)*v + alpha*t for v, t in zip(base, tint)]
                 glass_mv, glass_old_p = motion_for(glass, previous_geometry, prev, p)
                 glass_z = glass[0][1]
+                # Exact for this scene's single, nearest glass layer. Adding
+                # another layer requires checking prior-frame surface identity
+                # and occlusion, as the opaque correspondence above does.
                 glass_valid = not reset and 0 <= glass_old_p[0]+prev['jitter'][0] < width and 0 <= glass_old_p[1]+prev['jitter'][1] < height
                 glass_z = cam['far']/(cam['far']-cam['near']) - cam['near']*cam['far']/((cam['far']-cam['near'])*glass_z)
             hud = x < width//3 and y < height//8
