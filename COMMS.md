@@ -595,3 +595,7 @@ Cort clarified that Accept Both was used on earlier task PRs, and requested all 
 | #16, head 70e6f99 / merge 30340e1 | No additional manual-resolution damage found; complete missing-runtime Streamline regression retained. |
 
 The other nonempty historical remerge delta was Claude's 4f96db5, which deliberately selects the newer per-view/per-feature backend over obsolete singleton fields; it is not blind concatenation. All five PR heads are ancestors of #17. Its runtime/build/test files remain identical to validated 7b0339a. Refreshed CI at 0b2ee86 is green for both push 40084121073 and PR 40084123692: Linux and both Windows configurations. No new source patch is required beyond existing #17; main still needs those repairs. This audit concerns merge damage/integration, not a claim that tests prove every runtime behavior.
+
+### 2026-10-24 — PR #17 merged; Gate 2 validation remains open
+
+Verified GitHub merged #17 into main as `89b93b627741ced40cc4dd2055d019be8454ef59`. Runtime, tests and build configuration match the CI-validated `0b2ee86` tree exactly. Implementation, automated validation and integration are complete. Remaining gate work is independent review of the takeover delta/unfinished Argon audit and the scheduled RTX/runtime/in-game qualification. No game deployment or gate closure is claimed. This supersedes earlier statements that the runtime changes were not yet merged.

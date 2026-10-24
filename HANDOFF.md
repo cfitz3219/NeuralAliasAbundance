@@ -1,3 +1,7 @@
+# Current status — Gate 2 code merged
+
+PR #17 is merged into main at `89b93b6`. Its runtime/build/test tree matches the validated `0b2ee86` candidate. Code, automated tests and integration are complete. Independent delta/Argon review and RTX/runtime/in-game qualification remain before gate closure. Earlier unmerged status below is historical.
+
 # 2026-10-24 — Gate 2 takeover code/tests complete; PR #17 ready
 
 Cort asked Astra to finish Opus's tasks. The combined candidate is

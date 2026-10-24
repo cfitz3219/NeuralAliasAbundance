@@ -184,3 +184,7 @@ links and finding responses. C6/C7/C7b implementation ownership for this
 completion task transferred to Astra; future phase ownership is unchanged.
 Gate 2 remains open for independent delta/Argon review and RTX/runtime/game
 qualification. No main runtime merge or game deployment has occurred.
+
+### 2026-10-24 — PR #17 merged; Gate 2 validation remains open
+
+Verified GitHub merged #17 into main as `89b93b627741ced40cc4dd2055d019be8454ef59`. Runtime, tests and build configuration match the CI-validated `0b2ee86` tree exactly. Implementation, automated validation and integration are complete. Remaining gate work is independent review of the takeover delta/unfinished Argon audit and the scheduled RTX/runtime/in-game qualification. No game deployment or gate closure is claimed. This supersedes earlier statements that the runtime changes were not yet merged.
