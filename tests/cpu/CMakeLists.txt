@@ -54,3 +54,6 @@ if(WIN32 AND MSVC AND TARGET host_dx12)
   target_link_libraries(na_cpu_upscaler_menu PRIVATE host_dx12)
   set_tests_properties(na.cpu.upscaler_menu PROPERTIES LABELS "cpu;windows")
 endif()
+
+na_add_cpu_test(capture_decoder)
+
