@@ -24,6 +24,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 
 #include "host_dx12/host_observe.h"
 
@@ -47,7 +48,9 @@ struct ExecuteToken {
     uint64_t ticket = 0;
     uint64_t overlap_gen = 0;
     bool overlapped_at_entry = false;
-    void* queue_state = nullptr;
+    // Retains bookkeeping through finalization; not a COM reference or GPU lifetime.
+    std::shared_ptr<void> queue_state;
+    na_object_id queue_id = 0;
 };
 ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue);
 void ExecuteEnd(const ExecuteToken& token, ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* const* lists);

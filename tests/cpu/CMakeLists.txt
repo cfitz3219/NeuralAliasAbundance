@@ -100,16 +100,11 @@ if(WIN32 AND MSVC AND TARGET host_observe_producers)
     PROPERTIES LABELS "host;capture" TIMEOUT 30 SKIP_RETURN_CODE 77)
 endif()
 
-# Pending producer R3 fix: always build the reproducible diagnostic when C8
-# exists, but register its known-failing regression only when explicitly enabled.
-# This is not counted among the default passing tests. See CAPTURE-WORKLOG.md.
-option(NA_ENABLE_PENDING_CAPTURE_TESTS "Run pending producer ordering regressions" OFF)
+# R3 regression is mandatory once real producers are present.
 if(WIN32 AND MSVC AND TARGET host_observe_producers)
   add_executable(na_queue_overlap_probe queue_overlap_probe.cpp)
-  target_include_directories(na_queue_overlap_probe PRIVATE "${NA_CPU_ROOT}/tests/host")
   target_link_libraries(na_queue_overlap_probe PRIVATE na_cpu_test_options host_observe_producers dxgi)
-  if(NA_ENABLE_PENDING_CAPTURE_TESTS)
-    add_test(NAME na.host.queue_overlap_pending COMMAND na_queue_overlap_probe)
-    set_tests_properties(na.host.queue_overlap_pending PROPERTIES LABELS "host;pending" TIMEOUT 30 SKIP_RETURN_CODE 77)
-  endif()
+  add_test(NAME na.host.queue_overlap COMMAND na_queue_overlap_probe)
+  set_tests_properties(na.host.queue_overlap PROPERTIES LABELS "host;capture" TIMEOUT 30 SKIP_RETURN_CODE 77)
 endif()
+na_add_cpu_test(queue_occurrences)

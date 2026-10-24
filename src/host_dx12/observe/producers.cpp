@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <d3d12.h>
 
+#include "queue_occurrences.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -28,9 +29,7 @@ constexpr GUID kSentinelGuid = {0x6e2b39a4, 0x1c0d, 0x4c55, {0x9a, 0x3f, 0x2f, 0
 
 // ---------------------------------------------------------------- registry
 struct QueueState {
-    std::atomic<uint64_t> ticket{0};
-    std::atomic<uint32_t> inflight{0};
-    std::atomic<uint64_t> overlap_gen{0};
+    QueueOccurrences occurrences;
 };
 
 struct ListState {
@@ -42,7 +41,7 @@ struct Obj {
     na_object_id id = 0;
     uint32_t kind = 0;
     std::vector<uint8_t> created;          // creation event, replayed by the snapshot
-    std::unique_ptr<QueueState> queue;     // queues
+    std::shared_ptr<QueueState> queue;     // queues
     std::unique_ptr<ListState> list;       // command lists
 };
 
@@ -159,7 +158,7 @@ na_object_id register_object(IUnknown* object, uint32_t kind)
         o = Obj{};
         o.id = id;
         o.kind = kind;
-        if (kind == NA_OBJ_QUEUE) o.queue = std::make_unique<QueueState>();
+        if (kind == NA_OBJ_QUEUE) o.queue = std::make_shared<QueueState>();
         if (kind == NA_OBJ_LIST) o.list = std::make_unique<ListState>();
     }
     g_c.live.fetch_add(1);
@@ -734,14 +733,18 @@ HRESULT STDMETHODCALLTYPE D_CreateFence(ID3D12Device* dev, UINT64 initial, D3D12
 }
 
 // ------------------------------------------------------------------ queues
-QueueState* queue_state(ID3D12CommandQueue* q, na_object_id* id)
+std::shared_ptr<QueueState> queue_state(ID3D12CommandQueue* q, na_object_id* id)
 {
+    // Serialize first-use registration so two callers cannot replace the queue
+    // sentinel/state before either receives its retained token.
+    static std::mutex registration;
+    std::lock_guard<std::mutex> first_use(registration);
     {
         std::shared_lock<std::shared_mutex> lock(g_m);
         auto it = g_objs.find(q);
         if (it != g_objs.end() && it->second.queue) {
             *id = it->second.id;
-            return it->second.queue.get();
+            return it->second.queue;
         }
     }
     // A queue created before installation: identity from now on, flagged.
@@ -758,41 +761,42 @@ QueueState* queue_state(ID3D12CommandQueue* q, na_object_id* id)
     std::shared_lock<std::shared_mutex> lock(g_m);
     auto it = g_objs.find(q);
     *id = qid;
-    return (it != g_objs.end() && it->second.queue) ? it->second.queue.get() : nullptr;
+    return (it != g_objs.end() && it->second.queue) ? it->second.queue : nullptr;
 }
 
-void sync_event(uint32_t kind, ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 value, HRESULT hr, uint64_t ticket)
+// All queue operation kinds share the same entry/exit linearization.
+bool end_occurrence(const ExecuteToken& t)
 {
+    auto qs = std::static_pointer_cast<QueueState>(t.queue_state);
+    return !qs || qs->occurrences.End({t.ticket,t.overlap_gen,t.overlapped_at_entry});
+}
+void sync_event(uint32_t kind, const ExecuteToken& t, ID3D12Fence* f, UINT64 value, HRESULT hr)
+{
+    const bool ambiguous = end_occurrence(t);
     na_ev_queue_sync e;
-    init_header(e, kind, 0);
-    na_object_id qid = 0;
-    queue_state(q, &qid);
-    e.queue = qid;
+    init_header(e, kind, ambiguous ? NA_EVF_ORDER_AMBIGUOUS : 0u);
+    e.queue = t.queue_id;
     e.fence = lookup(f);
     e.value = value;
-    e.queue_ticket = ticket;
+    e.queue_ticket = t.ticket;
     e.hresult = hr;
-    // H1 WAIT-CORRELATION RULE: no game-fence wait is correlated to a source.
+    // Failed calls still consume an occurrence, but establish no dependency.
+    // H1 game-fence waits never imply a cross-queue ordering edge.
     e.provenance = kind == NA_EV_QUEUE_SIGNAL ? NA_FENCE_PROV_OBSERVED_QUEUE_SIGNAL : NA_FENCE_PROV_UNKNOWN;
     emit(e, NA_GROUP_QUEUE);
 }
-
 HRESULT STDMETHODCALLTYPE D_Signal(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v)
 {
-    na_object_id qid = 0;
-    QueueState* qs = queue_state(q, &qid);
-    const uint64_t ticket = qs ? qs->ticket.fetch_add(1) + 1 : 0;
+    const auto token = ExecuteBegin(q);
     const HRESULT hr = o_Signal(q, f, v);
-    sync_event(NA_EV_QUEUE_SIGNAL, q, f, v, hr, ticket);
+    sync_event(NA_EV_QUEUE_SIGNAL, token, f, v, hr);
     return hr;
 }
 HRESULT STDMETHODCALLTYPE D_Wait(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v)
 {
-    na_object_id qid = 0;
-    QueueState* qs = queue_state(q, &qid);
-    const uint64_t ticket = qs ? qs->ticket.fetch_add(1) + 1 : 0;
+    const auto token = ExecuteBegin(q);
     const HRESULT hr = o_Wait(q, f, v);
-    sync_event(NA_EV_QUEUE_WAIT, q, f, v, hr, ticket);
+    sync_event(NA_EV_QUEUE_WAIT, token, f, v, hr);
     return hr;
 }
 
@@ -954,26 +958,22 @@ ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue)
 {
     ExecuteToken t;
     na_object_id qid = 0;
-    auto* qs = queue ? queue_state(queue, &qid) : nullptr;
+    auto qs = queue ? queue_state(queue, &qid) : nullptr;
     if (!qs) return t;
+    const auto occurrence = qs->occurrences.Begin();
     t.queue_state = qs;
-    t.ticket = qs->ticket.fetch_add(1) + 1;
-    if (qs->inflight.fetch_add(1) > 0) {
-        t.overlapped_at_entry = true;
-        qs->overlap_gen.fetch_add(1);
-    }
-    t.overlap_gen = qs->overlap_gen.load();
+    t.queue_id = qid;
+    t.ticket = occurrence.ticket;
+    t.overlap_gen = occurrence.generation;
+    t.overlapped_at_entry = occurrence.overlapped;
     return t;
 }
 
 void ExecuteEnd(const ExecuteToken& t, ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* const* lists)
 {
-    auto* qs = static_cast<QueueState*>(t.queue_state);
-    if (!qs) return;
-    // R3: ambiguous if another occurrence entered during our window, or we
-    // entered while another was inside.
-    const bool ambiguous = t.overlapped_at_entry || qs->overlap_gen.load() != t.overlap_gen;
-    qs->inflight.fetch_sub(1);
+    if (!t.queue_state) return;
+    (void)queue;
+    const bool ambiguous = end_occurrence(t);
     g_c.executes.fetch_add(1);
     if (ambiguous) g_c.ambiguous.fetch_add(1);
 
@@ -989,9 +989,7 @@ void ExecuteEnd(const ExecuteToken& t, ID3D12CommandQueue* queue, uint32_t count
     ex.e.hdr.thread_seq = ++t_seq;
     ex.e.hdr.producer_thread = GetCurrentThreadId();
     ex.e.hdr.flags = (ambiguous ? NA_EVF_ORDER_AMBIGUOUS : 0u) | (n < count ? NA_EVF_TRUNCATED : 0u);
-    na_object_id qid = 0;
-    queue_state(queue, &qid);
-    ex.e.queue = qid;
+    ex.e.queue = t.queue_id;
     ex.e.queue_ticket = t.ticket;
     ex.e.list_count = n;
     ex.e.refs_offset = offsetof(Exec, refs);
