@@ -135,8 +135,8 @@ int wmain(int argc, wchar_t** argv)
         CHECK(st()->wide[1] == 0x00007FF6AABBCCDDull && st()->wide[2] == reinterpret_cast<uintptr_t>(inputs) && st()->wide[4] == reinterpret_cast<uintptr_t>(cmd));
 
         // A 2.x-shaped Constants block, FrameToken (vptr first) and ViewportHandle.
-        struct alignas(8) Header { void* next; uint8_t guid[16]; size_t version; };
-        struct alignas(8) Constants2 { Header h; float body[103]; uint8_t flags[7]; uint8_t pad; float sep; } c2{};
+        struct Header { void* next; uint8_t guid[16]; size_t version; };
+        struct Constants2 { Header h; float body[103]; uint8_t flags[7]; uint8_t pad; float sep; } c2{};
         static_assert(offsetof(Constants2, body) == 32 && offsetof(Constants2, flags) == 444, "2.x layout");
         const uint8_t cguid[16] = {0xd7, 0x5a, 0xd3, 0xdc, 0x4a, 0x4e, 0xad, 0x4b, 0xa9, 0x0c, 0xe0, 0xc4, 0x9e, 0xb2, 0x3a, 0xfe};
         memcpy(c2.h.guid, cguid, 16);
