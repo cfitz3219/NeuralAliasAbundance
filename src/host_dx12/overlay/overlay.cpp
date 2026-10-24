@@ -2217,4 +2217,3 @@ void SetStatusLogPath(const wchar_t* path)
 int SwapChainColorSpace() { return g_color_space.load(std::memory_order_acquire); }
 
 } // namespace na::overlay
-
