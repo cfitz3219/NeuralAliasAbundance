@@ -19,6 +19,8 @@
 
 #include "host_dx12/capture/frame_capture.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
+#include "host_dx12/upscalers/ffx_intercept.hpp"
+#include "host_dx12/upscalers/xess_intercept.hpp"
 #include "host_dx12/color/color_space.hpp"
 #include "host_dx12/fg/frame_gen.hpp"
 #include "host_dx12/fg/preset_profile.hpp"
@@ -359,6 +361,17 @@ void write_status_line()
     if (f == INVALID_HANDLE_VALUE) return;
     DWORD written = 0;
     WriteFile(f, line, static_cast<DWORD>(n), &written, nullptr);
+    // Worker-thread snapshots only: no GPU waits or readbacks in callbacks.
+    const auto fsr = na::ffx::GetStats();
+    const auto xess = na::xess::GetStats();
+    const auto dlss = na::dlss::GetStats();
+    char upscalers[1024];
+    int un = snprintf(upscalers, sizeof(upscalers),
+        "upscalers fsr_hooks=%u fsr_contexts=%llu fsr_dispatches=%llu fsr_replaced=%llu fsr_fallbacks=%llu fsr_reason=\"%s\" xess_hooks=%u xess_inits=%llu xess_executes=%llu xess_replaced=%llu xess_fallbacks=%llu xess_reason=\"%s\" injector_evals=%llu injector_creates=%llu rejected=%llu ngx_result=0x%X reason=\"%s\"\r\n",
+        fsr.hooked_functions, fsr.upscale_contexts, fsr.upscale_dispatches, fsr.replaced, fsr.fallbacks, fsr.reason,
+        xess.hooked_functions, xess.contexts_initialized, xess.executes, xess.replaced, xess.fallbacks, xess.reason,
+        dlss.evaluates, dlss.features_created, dlss.rejected, static_cast<unsigned>(dlss.last_ngx_result), dlss.reason);
+    if (un > 0) WriteFile(f, upscalers, static_cast<DWORD>((std::min)(un, static_cast<int>(sizeof(upscalers) - 1))), &written, nullptr);
     char pacing[256];
     int pn = snprintf(pacing, sizeof(pacing), "present_boundary returned=%llu thread=%lu hr=0x%08lX game_latency_handle=0x%llX queue=0x%llX\r\n",
                       static_cast<unsigned long long>(g_present_returns.load()), g_present_caller.load(),
@@ -2204,3 +2217,4 @@ void SetStatusLogPath(const wchar_t* path)
 int SwapChainColorSpace() { return g_color_space.load(std::memory_order_acquire); }
 
 } // namespace na::overlay
+

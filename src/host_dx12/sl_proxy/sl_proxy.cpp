@@ -42,6 +42,8 @@
 #include "host_dx12/overlay/overlay.hpp"
 #include "host_dx12/overlay/route_a_panel.hpp"
 #include "host_dx12/settings.hpp"
+#include "host_dx12/upscalers/ffx_intercept.hpp"
+#include "host_dx12/upscalers/xess_intercept.hpp"
 #include "sl_proxy_exports.inl"
 
 namespace {
@@ -89,6 +91,18 @@ DWORD WINAPI InitThread(LPVOID)
     // read by the NGX layer live; the overlay edits and saves them.
     na::settings::SetIniPath(ini);
     na::settings::Load();
+    // Gate 2: the Streamline entry point also hosts non-native upscalers.
+    // Observe by default; replacement remains an explicit per-provider opt-in.
+    if (GetPrivateProfileIntW(L"fsr", L"enabled", 1, ini) == 1) {
+        na::ffx::SetMode(GetPrivateProfileIntW(L"fsr", L"replace", 0, ini) == 1
+            ? na::ffx::Mode::ReplaceWithDlss : na::ffx::Mode::Observe);
+        na::ffx::StartModuleWatch();
+    }
+    if (GetPrivateProfileIntW(L"xess", L"enabled", 1, ini) == 1) {
+        na::xess::SetMode(GetPrivateProfileIntW(L"xess", L"replace", 0, ini) == 1
+            ? na::xess::Mode::ReplaceWithDlss : na::xess::Mode::Observe);
+        na::xess::StartModuleWatch();
+    }
     na::latency::Initialize();
     na::fg::preset::Initialize();
     // Deterministic attach: hook the driver's NGX core before Streamline
@@ -352,3 +366,4 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
     }
     return TRUE;
 }
+
