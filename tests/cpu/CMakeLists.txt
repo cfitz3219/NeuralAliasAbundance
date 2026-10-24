@@ -49,6 +49,17 @@ endif()
 
 # A4 portable report + Windows compile/registration/draw test for its real bridge.
 na_add_cpu_test(upscaler_report)
+na_add_cpu_test(signal_candidates)
+na_add_cpu_test(content_checks)
+add_executable(na_signal_corpus signal_corpus.cpp)
+target_link_libraries(na_signal_corpus PRIVATE na_cpu_test_options)
+find_package(Python3 3.8 QUIET COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME na.fixture.signal_content
+    COMMAND "${Python3_EXECUTABLE}" "${NA_CPU_ROOT}/tests/fixture/test_signal_content.py"
+      --runner "$<TARGET_FILE:na_signal_corpus>")
+  set_tests_properties(na.fixture.signal_content PROPERTIES LABELS "cpu;fixture" TIMEOUT 120)
+endif()
 if(WIN32 AND MSVC AND TARGET host_dx12)
   na_add_cpu_test(upscaler_menu)
   target_link_libraries(na_cpu_upscaler_menu PRIVATE host_dx12)
