@@ -45,6 +45,11 @@ constexpr uint32_t Signal = 14;
 constexpr uint32_t Wait = 15;
 } // namespace queue
 
+namespace resource {
+constexpr uint32_t Map = 8;
+constexpr uint32_t Unmap = 9;
+} // namespace resource
+
 // ID3D12GraphicsCommandList
 namespace list {
 constexpr uint32_t Close = 9;

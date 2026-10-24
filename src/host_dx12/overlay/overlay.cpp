@@ -1903,7 +1903,7 @@ void STDMETHODCALLTYPE DetourExecute(ID3D12CommandQueue* q, UINT n,
     g_exec_active.fetch_add(1, std::memory_order_acq_rel);
     // C8: H1/H2 observation of the game's submissions ([observe] producers=1).
     const na::observe::ExecuteToken obs_token =
-        na::observe::ProducersActive() ? na::observe::ExecuteBegin(q) : na::observe::ExecuteToken{};
+        na::observe::ProducersActive() ? na::observe::ExecuteBegin(q, n, lists) : na::observe::ExecuteToken{};
     ExecuteSubscriber* sub = g_exec_sub.load(std::memory_order_acquire);
     if (sub) {
         ExecuteContext ctx{q, n, lists, g_exec_ticket.fetch_add(1, std::memory_order_relaxed) + 1, uncovered, sub->user};
