@@ -80,6 +80,41 @@ int main() { return test::run({
         Put(p,base+offsetof(na_event_header,size_bytes),uint32_t(sizeof(c)+40));
         CHECK(Decode(p).valid);
     }},
+#if NA_OBSERVE_ABI_MINOR >= 2
+    {"H2 minimum sizes and explicit root arrays", [] {
+        for(uint32_t kind=24;kind<=26;++kind) {
+            auto p=Packet(na_ev_resource_created{},kind);
+            p.resize(base+sizeof(na_event_header));
+            Put(p,offsetof(na_event_batch,payload_bytes),uint32_t(sizeof(na_event_header)));
+            Put(p,base+offsetof(na_event_header,size_bytes),uint32_t(sizeof(na_event_header)));
+            CHECK(!Decode(p).valid);
+        }
+        na_ev_root_signature_created e{}; e.param_count=1; e.params_offset=sizeof(e);e.param_stride=sizeof(na_root_param);
+        auto p=Packet(e,NA_EV_ROOT_SIGNATURE_CREATED);CHECK(!Decode(p).valid);
+        p.resize(base+sizeof(e)+sizeof(na_root_param));
+        Put(p,offsetof(na_event_batch,payload_bytes),uint32_t(sizeof(e)+sizeof(na_root_param)));
+        Put(p,base+offsetof(na_event_header,size_bytes),uint32_t(sizeof(e)+sizeof(na_root_param)));
+        CHECK(Decode(p).valid && Decode(p).incomplete_capture); // zero param_type = TABLE
+    }},
+    {"H2 list payload sizes cannot exceed captured bytes", [] {
+        na_ev_list_op e{};e.op=NA_OP_SET_ROOT_CONSTANTS;e.a[2]=1;
+        CHECK(!Decode(Packet(e,NA_EV_LIST_OP)).valid);
+        e.payload_offset=sizeof(e);e.payload_bytes=4;e.payload_stride=4;
+        auto p=Packet(e,NA_EV_LIST_OP);p.resize(base+sizeof(e)+8);
+        Put(p,offsetof(na_event_batch,payload_bytes),uint32_t(sizeof(e)+8));
+        Put(p,base+offsetof(na_event_header,size_bytes),uint32_t(sizeof(e)+8));
+        CHECK(Decode(p).valid);
+        Put(p,base+offsetof(na_ev_list_op,payload_bytes),UINT32_MAX);CHECK(!Decode(p).valid);
+    }},
+    {"H2 incomplete capture remains explicit", [] {
+        na_ev_list_op e{};e.op=NA_OP_RS_VIEWPORT;e.a[0]=2;
+        CHECK(Decode(Packet(e,NA_EV_LIST_OP)).incomplete_capture);
+        e.op=NA_OP_RS_SCISSOR;CHECK(Decode(Packet(e,NA_EV_LIST_OP)).incomplete_capture);
+        e.op=9999;CHECK(Decode(Packet(e,NA_EV_LIST_OP)).incomplete_capture);
+        e.op=NA_OP_RESOURCE_BARRIER;e.a[0]=100;e.hdr.flags=NA_EVF_TRUNCATED;
+        auto d=Decode(Packet(e,NA_EV_LIST_OP));CHECK(d.valid&&d.incomplete_capture);
+    }},
+#endif
     {"identity records and capability arrays checked", [] {
         na_ev_epoch_begin e{}; e.session=42; e.epoch=7;
         auto p=Packet(e,NA_EV_EPOCH_BEGIN); CHECK(Decode(p).valid);

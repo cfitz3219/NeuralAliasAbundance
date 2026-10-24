@@ -18,6 +18,7 @@ struct DecodedEvent { na_event_header header{}; size_t offset{}; };
 struct DecodedBatch {
     bool valid{};
     bool unknown_foundational{};
+    bool incomplete_capture{}; // Known H2 layout cannot represent all recorded details.
     na_event_batch header{};
     // Owned bytes; offsets never refer into the callback's borrowed allocation.
     std::vector<unsigned char> bytes;
@@ -49,6 +50,11 @@ inline size_t KnownEventSize(uint32_t kind) {
     NA_SIZE(NA_EV_INVENTORY_COMPLETE, na_ev_inventory_complete);
     NA_SIZE(NA_EV_ORDER_AMBIGUITY_RANGE, na_ev_order_ambiguity_range);
     NA_SIZE(NA_EV_DEVICE_CREATED, na_ev_device_created);
+#if NA_OBSERVE_ABI_MINOR >= 2
+    NA_SIZE(NA_EV_ROOT_SIGNATURE_CREATED, na_ev_root_signature_created);
+    NA_SIZE(NA_EV_PIPELINE_CREATED, na_ev_pipeline_created);
+    NA_SIZE(NA_EV_LIST_OP, na_ev_list_op);
+#endif
 #undef NA_SIZE
     default: return 0;
     }
@@ -97,6 +103,43 @@ inline DecodedBatch DecodeBatch(const void* input, size_t readable) {
             na_ev_inventory_complete e{}; std::memcpy(&e, raw + position, sizeof(e));
             if (e.epoch != b.epoch) return {};
         }
+#if NA_OBSERVE_ABI_MINOR >= 2
+        if (h.kind == NA_EV_ROOT_SIGNATURE_CREATED) {
+            na_ev_root_signature_created e{}; std::memcpy(&e,raw+position,sizeof(e));
+            if (!WireArrayFits(h.size_bytes,sizeof(e),e.params_offset,e.param_stride,e.param_count,sizeof(na_root_param))) return {};
+            for (uint32_t j=0;j<e.param_count;++j) {
+                na_root_param p{}; std::memcpy(&p,raw+position+e.params_offset+static_cast<size_t>(j)*e.param_stride,sizeof(p));
+                // ABI0.2 only carries the first range and omits table offsets.
+                if (p.param_type == NA_ROOT_TABLE) result.incomplete_capture = true;
+            }
+        } else if (h.kind == NA_EV_LIST_OP) {
+            na_ev_list_op e{}; std::memcpy(&e,raw+position,sizeof(e));
+            if (e.payload_bytes && (e.payload_offset < sizeof(e) || e.payload_offset > h.size_bytes ||
+                e.payload_bytes > h.size_bytes-e.payload_offset)) return {};
+            uint64_t count=0; size_t element=0;
+            switch (e.op) {
+            case NA_OP_SET_ROOT_CONSTANTS: count=e.a[2];element=4;break;
+            case NA_OP_OM_SET_RENDER_TARGETS:
+                if(e.a[0]>8 || e.a[1]>1) return {};
+                count=e.a[0]+e.a[1];element=sizeof(na_view_ref);break;
+            case NA_OP_CLEAR_RTV: case NA_OP_CLEAR_DSV: count=1;element=sizeof(na_view_ref);break;
+            case NA_OP_RESOURCE_BARRIER: count=e.a[0];element=sizeof(na_barrier);break;
+            case NA_OP_RS_VIEWPORT: case NA_OP_RS_SCISSOR:
+                if(e.a[0]>1) result.incomplete_capture=true;
+                break;
+            case NA_OP_COPY_TEXTURE_REGION:
+                result.incomplete_capture=true; // offsets/box/footprint not represented
+                break;
+            default:
+                if(e.op<NA_OP_SET_PIPELINE || e.op>NA_OP_RS_SCISSOR) result.incomplete_capture=true;
+            }
+            if(element && count) {
+                if(e.payload_bytes && (e.payload_stride<element || e.payload_bytes%e.payload_stride)) return {};
+                if(h.flags&NA_EVF_TRUNCATED) result.incomplete_capture=true;
+                else if(!e.payload_stride || count>e.payload_bytes/e.payload_stride) return {};
+            }
+        }
+#endif
         if (!minimum && (h.flags & NA_EVF_FOUNDATIONAL)) result.unknown_foundational = true;
         result.events.push_back({h, position});
         position += h.size_bytes;
