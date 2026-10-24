@@ -134,6 +134,15 @@ jobs:
               if ($l -match 'Failed|\*\*\*Exception|Not Run|tests failed') { Write-Output "::error::$l" } else { Write-Output "::notice::$l" }
             }
           exit $code
+      - name: Report failing tests as annotations
+        if: failure()
+        shell: pwsh
+        run: |
+          $log = 'build/Testing/Temporary/LastTest.log'
+          if (Test-Path $log) {
+            Select-String -Path $log -Pattern '^(FAIL|FATAL) |Test Failed|Exception' | Select-Object -First 40 |
+              ForEach-Object { Write-Output "::error::$($_.Line)" }
+          }
 
   linux:
     name: Linux (GCC) portable core + CPU tests

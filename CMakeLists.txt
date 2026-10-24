@@ -183,6 +183,41 @@ if(NA_HAVE_PCL_STATS)
   target_include_directories(host_dx12 SYSTEM PRIVATE "${NA_PCL_INCLUDE}")
 endif()
 
+# ---------------------------------------------------------------- host_dlss
+# C6: generic DLSS Super Resolution / DLAA backend. Game-independent; needs
+# the NGX SDK headers to do anything (stub otherwise). Our OWN NGX instance
+# additionally needs the NGX static library from the local SDK folder (never
+# committed; the public-headers CI job has none, so it builds Attach-only).
+set(NA_NGX_LIB "" CACHE FILEPATH "NVIDIA NGX static library (nvsdk_ngx_s.lib, /MT)")
+if(NOT NA_NGX_LIB AND EXISTS "${NA_SDK_ROOT}/nvidia-dlss-sdk/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib")
+  set(NA_NGX_LIB "${NA_SDK_ROOT}/nvidia-dlss-sdk/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib")
+endif()
+set(NA_NGX_LIB_DEBUG "${NA_SDK_ROOT}/nvidia-dlss-sdk/lib/Windows_x86_64/x64/nvsdk_ngx_s_dbg.lib")
+set(NA_DLSS_DLL "" CACHE FILEPATH "nvngx_dlss.dll copied beside DLSS executables (tests)")
+if(NOT NA_DLSS_DLL AND EXISTS "${NA_SDK_ROOT}/nvidia-dlss-sdk/lib/Windows_x86_64/rel/nvngx_dlss.dll")
+  set(NA_DLSS_DLL "${NA_SDK_ROOT}/nvidia-dlss-sdk/lib/Windows_x86_64/rel/nvngx_dlss.dll")
+endif()
+set(NA_HAVE_NGX_LIB OFF)
+if(NA_HAVE_NGX_SDK AND NA_NGX_LIB AND EXISTS "${NA_NGX_LIB}")
+  set(NA_HAVE_NGX_LIB ON)
+endif()
+add_library(host_dlss STATIC src/host_dx12/dlss/dlss_backend.cpp)
+target_link_libraries(host_dlss PUBLIC abundance_options abundance_core d3d12)
+if(NA_HAVE_NGX_SDK)
+  target_compile_definitions(host_dlss PUBLIC NA_HAVE_NGX_SDK)
+  target_include_directories(host_dlss SYSTEM PUBLIC "${NA_NGX_SDK_INCLUDE}")
+endif()
+if(NA_HAVE_NGX_LIB)
+  target_sources(host_dlss PRIVATE src/host_dx12/dlss/dlss_own_ngx.cpp)
+  target_compile_definitions(host_dlss PUBLIC NA_HAVE_NGX_LIB)
+  if(EXISTS "${NA_NGX_LIB_DEBUG}")
+    target_link_libraries(host_dlss PUBLIC "$<IF:$<CONFIG:Debug>,${NA_NGX_LIB_DEBUG},${NA_NGX_LIB}>")
+  else()
+    target_link_libraries(host_dlss PUBLIC "${NA_NGX_LIB}")
+  endif()
+endif()
+message(STATUS "DLSS backend (C6): headers=${NA_HAVE_NGX_SDK}  own NGX instance=${NA_HAVE_NGX_LIB}  nvngx_dlss.dll='${NA_DLSS_DLL}'")
+
 # -------------------------------------------------------------- deliverables
 # Standalone manager / diagnostic exe.
 add_executable(NeuralAliasAbundance src/app/main.cpp src/app/window.cpp)
