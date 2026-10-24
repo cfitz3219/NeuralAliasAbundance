@@ -163,4 +163,3 @@ int main() { return test::run({
         CHECK(status().session != first && status().epoch == 1); s.stop();
     }},
 }); }
-

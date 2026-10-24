@@ -107,4 +107,3 @@ inline DecodedBatch DecodeBatch(const void* input, size_t readable) {
     return result;
 }
 } // namespace na::discovery
-
