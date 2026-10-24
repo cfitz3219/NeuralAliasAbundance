@@ -67,6 +67,8 @@ struct Observation {
 
 // Pure conversion used by the replace path (and tests). Returns false with a
 // plain-language reason when these inputs cannot drive DLSS faithfully.
+// Exact whole-resource state translation; false for unsupported FFX states.
+bool D3D12State(uint32_t ffx, D3D12_RESOURCE_STATES* out);
 bool ToDlss(const Observation& o, na::dlss::EvalDesc* out, const char** reason);
 
 // Hooks the FidelityFX API exports `module` provides (each module keeps its
