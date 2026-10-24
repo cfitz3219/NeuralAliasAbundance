@@ -12,8 +12,10 @@
 #include "host_dx12/host_observe.h"
 #include "host_dx12/observe/producers.hpp"
 
+#include <atomic>
 #include <cstring>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -103,6 +105,42 @@ int main()
     // pre-submission contents.
     std::memset(cpu + 512, 0xEE, 64);
     d.WaitIdle();
+
+    // C9-H3-REVIEW-1 #1 regression: an Unmap racing a snapshot copy must wait
+    // until the copy has finished with the mapped pointer.
+    struct Race {
+        ID3D12Resource* buffer;
+        std::thread unmapper;
+        std::atomic<bool> returned{false};
+        bool returned_during_copy = true;
+        bool fired = false;
+    } race{upload.Get(), {}, {}, true, false};
+    na::observe::SetSnapshotCopyProbeForTests(
+        [](void* user) {
+            auto* r = static_cast<Race*>(user);
+            if (r->fired) return;
+            r->fired = true;
+            r->unmapper = std::thread([r] {
+                r->buffer->Unmap(0, nullptr);
+                r->returned.store(true);
+            });
+            Sleep(150); // ample time for an unsynchronised Unmap to finish
+            r->returned_during_copy = r->returned.load();
+        },
+        &race);
+    REQUIRE(SUCCEEDED(alloc->Reset()));
+    REQUIRE(SUCCEEDED(list->Reset(alloc.Get(), nullptr)));
+    list->SetGraphicsRootSignature(rs.Get());
+    list->SetGraphicsRootConstantBufferView(0, upload->GetGPUVirtualAddress() + 512);
+    REQUIRE(SUCCEEDED(list->Close()));
+    d.queue->ExecuteCommandLists(1, ls);
+    na::observe::SetSnapshotCopyProbeForTests(nullptr, nullptr);
+    if (race.unmapper.joinable()) race.unmapper.join();
+    d.WaitIdle();
+    std::printf("unmap race: probe fired %d, unmap returned during copy %d, after %d\n", race.fired, race.returned_during_copy, race.returned.load());
+    CHECK(race.fired);
+    CHECK(!race.returned_during_copy);
+    CHECK(race.returned.load());
     REQUIRE(na_observe_stop() == NA_OK);
 
     const na_object_id upload_id = na::observe::IdOf(upload.Get()), gpu_id = na::observe::IdOf(gpu.Get()),
@@ -113,14 +151,19 @@ int main()
     std::lock_guard<std::mutex> lock(g_m);
     for (const auto& e : g_events) {
         const auto* x = reinterpret_cast<const na_ev_queue_execute*>(e.data());
-        if (x->hdr.kind == NA_EV_QUEUE_EXECUTE && x->list_count == 1) exec_ticket = x->queue_ticket;
+        if (x->hdr.kind == NA_EV_QUEUE_EXECUTE && x->list_count == 1 && !exec_ticket) exec_ticket = x->queue_ticket;
     }
     int snaps = 0;
     for (const auto& e : g_events) {
         const auto* s = reinterpret_cast<const na_ev_snapshot*>(e.data());
         if (s->hdr.kind != NA_EV_SNAPSHOT) continue;
         ++snaps;
-        CHECK(s->sync == NA_SNAP_SYNC_APP_UNKNOWN && s->list == list_id && s->recording_generation == 2 && s->queue_ticket == exec_ticket);
+        CHECK(s->sync == NA_SNAP_SYNC_APP_UNKNOWN && s->list == list_id);
+        if (s->recording_generation == 3) { // the raced submission: copied before the Unmap went through
+            CHECK(s->status == NA_SNAP_CAPTURED && s->captured_bytes > 0);
+            continue;
+        }
+        CHECK(s->recording_generation == 2 && s->queue_ticket == exec_ticket);
         const uint8_t* bytes = s->payload_offset ? e.data() + s->payload_offset : nullptr;
         if (s->resource == upload_id && s->binding == NA_SNAP_ROOT_CBV)
             root_ok = s->status == NA_SNAP_CAPTURED && s->offset == 512 && s->param == 0 && s->op_index == 3 && s->captured_bytes >= 64 &&
@@ -132,11 +175,10 @@ int main()
         if (s->resource == unmapped_id) unmapped_ok = s->status == NA_SNAP_NOT_MAPPED && s->captured_bytes == 0 && s->offset == 256;
     }
     std::printf("snapshots: %d (root %d table %d gpu-written %d not-mapped %d)\n", snaps, root_ok, table_ok, gpu_ok, unmapped_ok);
-    CHECK(snaps == 4);
+    CHECK(snaps == 5); // 4 from the first submission + the raced root CBV
     CHECK(root_ok);
     CHECK(table_ok);
     CHECK(gpu_ok);
     CHECK(unmapped_ok);
-    upload->Unmap(0, nullptr);
-    return test::finish("observe_snapshot_test");
+    return test::finish("observe_snapshot_test"); // the race already unmapped the buffer
 }

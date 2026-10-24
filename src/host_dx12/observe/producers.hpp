@@ -62,6 +62,10 @@ struct ExecuteToken {
 ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue, uint32_t count = 0, ID3D12CommandList* const* lists = nullptr);
 void ExecuteEnd(const ExecuteToken& token, ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* const* lists);
 
+// Tests: `probe` runs inside each snapshot copy while the copy holds the
+// buffer's mapping (C9-H3-REVIEW-1 race regression). nullptr removes it.
+void SetSnapshotCopyProbeForTests(void (*probe)(void* user), void* user);
+
 // Identity of an observed object (0 = unknown). Any interface pointer of it.
 na_object_id IdOf(const void* object);
 

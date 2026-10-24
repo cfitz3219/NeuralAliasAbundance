@@ -226,6 +226,10 @@ int main()
         rs_ok = r->param_count == 3 && p[0].param_type == NA_ROOT_CONSTANTS && p[0].count == 4 && p[0].shader_register == 0 &&
                 p[1].param_type == NA_ROOT_TABLE && p[1].range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && p[1].range_descriptors == 1 &&
                 p[1].visibility == D3D12_SHADER_VISIBILITY_PIXEL && p[2].param_type == NA_ROOT_CBV && p[2].shader_register == 1;
+        // 0.2 amendment: every table range with its resolved offset.
+        const auto* rg = reinterpret_cast<const na_root_range*>(e.data() + r->ranges_offset);
+        CHECK(r->range_count == 1 && r->range_stride == sizeof(na_root_range) && p[1].first_range == 0 &&
+              rg[0].range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && rg[0].num_descriptors == 1 && rg[0].table_offset == 0);
     }
     CHECK(rs_ok);
     // Pipelines.
@@ -299,6 +303,9 @@ int main()
         const auto* om = reinterpret_cast<const na_view_ref*>(payload(ops[3]));
         CHECK(ops[3]->a[0] == 1 && ops[3]->a[1] == 1 && ops[3]->payload_bytes == 2 * sizeof(na_view_ref) && om[0].resource == color_id &&
               om[0].format == NA_UNKNOWN_U32 && om[1].resource == depth_id);
+        float vp4[6] = {};
+        std::memcpy(vp4, payload(ops[4]), sizeof(vp4));
+        CHECK(ops[4]->payload_bytes == 24 && ops[4]->payload_stride == 24 && vp4[2] == static_cast<float>(W) && vp4[3] == static_cast<float>(H));
         CHECK(ops[5]->a[0] == rs_id && ops[5]->a[1] == 0);
         CHECK(ops[6]->a[0] == srvh_id);
         CHECK(ops[7]->a[0] == gpso_id);
