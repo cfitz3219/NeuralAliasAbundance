@@ -188,6 +188,14 @@ void OnExecuted(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* co
 // GPU waits that order a view's evaluations across queues (R-303). No CPU wait.
 void BeforeExecute(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* const* lists);
 
+// Hardware session (G2-004): if the bound device was removed, shut DLSS down
+// now and release every reference to it (true). D3D12 devices are per-adapter
+// singletons: while anything holds a removed device, the game's
+// D3D12CreateDevice returns that same removed device, so it could never
+// recover. Called from the host's Present path (every game presents, and
+// Present is where games learn of the removal) and from OnExecuted.
+bool ReleaseIfDeviceRemoved();
+
 // ARGON-G2-004: the one DLSS start-up/recovery path for every producer (FSR,
 // XeSS, ...), serialised as a single transaction. Already running on `device`
 // -> true. Running on another device -> false, unless that device was removed

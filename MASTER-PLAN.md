@@ -188,3 +188,25 @@ qualification. No main runtime merge or game deployment has occurred.
 ### 2026-10-24 — PR #17 merged; Gate 2 validation remains open
 
 Verified GitHub merged #17 into main as `89b93b627741ced40cc4dd2055d019be8454ef59`. Runtime, tests and build configuration match the CI-validated `0b2ee86` tree exactly. Implementation, automated validation and integration are complete. Remaining gate work is independent review of the takeover delta/unfinished Argon audit and the scheduled RTX/runtime/in-game qualification. No game deployment or gate closure is claimed. This supersedes earlier statements that the runtime changes were not yet merged.
+
+## 2026-10-24 — Gate 2 CLOSED on Astra's side by Cort's direction
+
+Cort explicitly directed: "close gate 2. On your end anyway". Astra's Gate 2 implementation and validation work is COMPLETE and CLOSED. This supersedes earlier statements that Astra's Gate 2 remains open. Evidence: integrated implementation in PR #17; fresh RTX Release build and 30/30 CTests; real NGX fixture output; Ghost FSR 3.1.4 and XeSS interception with successful DLSS replacement, zero observed fallbacks/rejections, and XeSS overlay INJECTOR confirmation. Live report and journal are in PR #19 at 88ddb9a; RTX report in PR #18.
+
+Argon remains deferred, not represented as completed. Independent review/publication status and extended quality, DRS and device-loss coverage remain separately tracked follow-up work; they do not reopen or block Astra's Gate 2 closure under this user direction. No PR merge, new deployment, or additional runtime test is implied by this status change. Next Astra implementation task in the queue is Phase 3 A5, subject to its host-data dependencies.
+
+## 2026-10-24 — GATE 2 CLOSED (both sides, by Cort's direction)
+
+Cort: "finish this up and close gate 2!" Claude's side is complete, and with Astra's closure above, **Gate 2 is CLOSED**.
+- **PR #20** (merged as 077adcc), Cort's RTX 5070 Ti, driver 32.0.16.2101: **31/31 CTests pass**.
+- **Jitter, FSR:** official `amd_fidelityfx_dx12.dll` 1.0.1.41314 expects sample = centre − jitter on both axes, the same as DLSS (+3.3 dB over bilinear). The +1 mapping is confirmed.
+- **Jitter, XeSS:** official `libxess.dll` 2.0.2.68, same result (+3.5 dB). The +1 mapping is confirmed.
+- **Real DLSS:** +6.4 dB, sign −1, the same as session 3.
+- **Device loss (G2-004), tested with real NGX and `RemoveDevice`:** the backend was keeping the removed device alive. D3D12 devices are one per adapter, so the game could never recover. Fixed: the Present and OnExecuted paths now call `dlss::ReleaseIfDeviceRemoved()`. Verified on the RTX: the game gets a live new device and DLSS restarts on it.
+- **Game validation:** Astra's Ghost run (PR #18/#19) showed FSR 3.1.4 and XeSS replaced by DLSS.
+- **Carried forward, not blocking:**
+  - the deferred Argon audit of the takeover delta;
+  - extended visual/DRS quality checks;
+  - whether the overlay's own D3D12 objects also keep a removed device alive (not yet checked).
+
+**Next:** Phase 3.

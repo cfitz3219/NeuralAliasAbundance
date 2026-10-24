@@ -618,3 +618,31 @@ Raw evidence: local/gate2-rtx-20261024/ctest-verbose.log plus configure/build/in
 
 Windows Git authentication completed on retry. Coordination commit d351e4e is pushed to main; journal commit 5fde822 is pushed to astra/g2-rtx-validation and PR #18 is open: https://github.com/cfitz3219/NeuralAliasAbundance/pull/18. Earlier credential blockage is resolved. No hardware tests rerun, no source changes or game deployment.
 
+
+### 2026-10-24 — Astra — Ghost FSR and XeSS live replacement demonstrated
+
+PR #19 astra/g2-ghost-validation now 88ddb9a records installed Ghost build 23879181 / exe 1053.9.0623.1807 qualification. Fixed missing Streamline-path interceptor watcher startup in candidate 1d82b1b; fresh Release and 30/30 CTests plus deploy script tests passed before deployment. Reversible manifest/backup installed; native runtime DLLs unchanged (game DLSS 3.7.0). FSR 3.1.4 selected in UI: 22,810/22,810 replaced, zero fallback/rejections. Cort reported no obvious visual issues. Initial native-DLSS menu interval excluded; historical SOURCE UNKNOWN overlay label retained, explained by prior unmarked creations.
+
+Separate XeSS replacement process: 7,936/7,936 calls replaced at 03:40:05 local, zero fallback/rejections, one injector feature, NGX 0x1, FSR calls zero. Overlay shows XeSS GAME CREATED and DLSS INJECTOR. Native DLSS unselected; FG off. Sampled gameplay ~81–84 FPS, not a controlled comparison; DLSS GPU timing unavailable. DRS target actually 60, despite earlier launcher Off selection. Detailed evidence/limits in docs/GATE2-GHOST-VALIDATION.md on PR #19, raw logs local/gate2-ghost. Game left running with XeSS replacement enabled; rollback ready. Argon remains deferred and gate open; no independent delta review or broader quality/device-loss qualification claimed.
+
+## 2026-10-24 — Gate 2 CLOSED on Astra's side by Cort's direction
+
+Cort explicitly directed: "close gate 2. On your end anyway". Astra's Gate 2 implementation and validation work is COMPLETE and CLOSED. This supersedes earlier statements that Astra's Gate 2 remains open. Evidence: integrated implementation in PR #17; fresh RTX Release build and 30/30 CTests; real NGX fixture output; Ghost FSR 3.1.4 and XeSS interception with successful DLSS replacement, zero observed fallbacks/rejections, and XeSS overlay INJECTOR confirmation. Live report and journal are in PR #19 at 88ddb9a; RTX report in PR #18.
+
+Argon remains deferred, not represented as completed. Independent review/publication status and extended quality, DRS and device-loss coverage remain separately tracked follow-up work; they do not reopen or block Astra's Gate 2 closure under this user direction. No PR merge, new deployment, or additional runtime test is implied by this status change. Next Astra implementation task in the queue is Phase 3 A5, subject to its host-data dependencies.
+
+## 2026-10-24 — GATE 2 CLOSED (both sides, by Cort's direction)
+
+Cort: "finish this up and close gate 2!" Claude's side is complete, and with Astra's closure above, **Gate 2 is CLOSED**.
+- **PR #20** (merged as 077adcc), Cort's RTX 5070 Ti, driver 32.0.16.2101: **31/31 CTests pass**.
+- **Jitter, FSR:** official `amd_fidelityfx_dx12.dll` 1.0.1.41314 expects sample = centre − jitter on both axes, the same as DLSS (+3.3 dB over bilinear). The +1 mapping is confirmed.
+- **Jitter, XeSS:** official `libxess.dll` 2.0.2.68, same result (+3.5 dB). The +1 mapping is confirmed.
+- **Real DLSS:** +6.4 dB, sign −1, the same as session 3.
+- **Device loss (G2-004), tested with real NGX and `RemoveDevice`:** the backend was keeping the removed device alive. D3D12 devices are one per adapter, so the game could never recover. Fixed: the Present and OnExecuted paths now call `dlss::ReleaseIfDeviceRemoved()`. Verified on the RTX: the game gets a live new device and DLSS restarts on it.
+- **Game validation:** Astra's Ghost run (PR #18/#19) showed FSR 3.1.4 and XeSS replaced by DLSS.
+- **Carried forward, not blocking:**
+  - the deferred Argon audit of the takeover delta;
+  - extended visual/DRS quality checks;
+  - whether the overlay's own D3D12 objects also keep a removed device alive (not yet checked).
+
+**Next:** Phase 3.

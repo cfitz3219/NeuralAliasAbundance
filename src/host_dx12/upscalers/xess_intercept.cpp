@@ -16,9 +16,10 @@
 namespace na::xess {
 
 // XeSS's jitter (after its jitter scale) is the projection offset in pixels,
-// like DLSS's (C6 measured: sample = pixel centre - jitter). NOT measured yet:
-// scheduled for the Gate 2 hardware session with Intel's official runtime DLL
-// (XeSS also runs on NVIDIA GPUs).
+// like DLSS's. MEASURED (Gate 2 hardware session, 2026-10-24, RTX 5070 Ti,
+// Intel's official libxess.dll 2.0.2.68, upscaler_jitter_test): XeSS expects
+// sample = pixel centre - jitter on both axes (+3.5 dB over bilinear; every
+// other convention lost), the same as DLSS (C6) -> sign +1 per axis.
 constexpr float kXessToDlssJitterSign = 1.0f;
 
 bool ToDlss(const Observation& o, na::dlss::EvalDesc* out, const char** reason)
