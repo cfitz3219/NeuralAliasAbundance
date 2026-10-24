@@ -104,10 +104,14 @@ int main(int argc, char** argv)
         CHECK(na::ffx::ToDlss(o, &d, &why) && d.pre_exposure == 1.f);
         o = GoodObservation(); o.context_known = false;
         CHECK(!na::ffx::ToDlss(o, &d, &why) && why && std::strstr(why, "before"));
-        o = GoodObservation(); o.output_state = FFX_API_RESOURCE_STATE_COMMON;
-        CHECK(!na::ffx::ToDlss(o, &d, &why) && why && std::strstr(why, "UAV"));
+        o = GoodObservation(); o.output_state = FFX_API_RESOURCE_STATE_COMMON; // ARGON-G2-003: transitioned, not refused
+        CHECK(na::ffx::ToDlss(o, &d, &why));
         o = GoodObservation(); o.color_state = FFX_API_RESOURCE_STATE_COPY_DEST;
-        CHECK(!na::ffx::ToDlss(o, &d, &why) && why);
+        CHECK(na::ffx::ToDlss(o, &d, &why));
+        o = GoodObservation(); o.output_state = 0x4000; // no D3D12 equivalent
+        CHECK(!na::ffx::ToDlss(o, &d, &why) && why && std::strstr(why, "translate"));
+        o = GoodObservation(); o.max_render_w = 1280; o.max_render_h = 720; o.render_w = 1000; o.render_h = 562;
+        CHECK(na::ffx::ToDlss(o, &d, &why) && d.max_render_w == 1280 && d.render_w == 1000 && d.quality == na::dlss::Quality::MaxQuality);
         o = GoodObservation(); o.motion = nullptr;
         CHECK(!na::ffx::ToDlss(o, &d, &why) && why);
         o = GoodObservation(); o.jitter_x = 4.f; // out of range -> DLSS validation refuses
@@ -191,10 +195,10 @@ int main(int argc, char** argv)
         {
             const int fsr_before = counts(3);
             auto u = UpscaleDesc(l.list.Get());
-            u.output.state = FFX_API_RESOURCE_STATE_COMMON;
+            u.output.state = 0x4000; // untranslatable
             CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK);
             CHECK(counts(3) == fsr_before + 1); // fell back to FSR
-            CHECK(na::ffx::GetStats().fallbacks == 1 && std::strstr(na::ffx::GetStats().reason, "UAV"));
+            CHECK(na::ffx::GetStats().fallbacks == 1 && std::strstr(na::ffx::GetStats().reason, "translate"));
         }
         {
             ffxContext unknown = reinterpret_cast<ffxContext>(0x5555);
@@ -216,7 +220,7 @@ int main(int argc, char** argv)
             CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK && dlss_reset() == 1); // FSR ran last
             CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK && dlss_reset() == 0); // DLSS continues
             auto fb = u;
-            fb.output.state = FFX_API_RESOURCE_STATE_COMMON; // forces the FSR fallback
+            fb.motionVectors.resource = nullptr; // forces the FSR fallback
             const int fsr_before = counts(3);
             CHECK(dispatch(&ctx, &fb.header) == FFX_API_RETURN_OK && counts(3) == fsr_before + 1);
             CHECK(last_reset() == 1);  // FSR missed the DLSS frames
@@ -249,6 +253,28 @@ int main(int argc, char** argv)
             CHECK(fake::last_eval_handle != h_ctx && fake::last_eval_handle != h_ctx2 && dlss_reset() == 1);
             CHECK(destroy(&ctx3, nullptr) == FFX_API_RETURN_OK);
         }
+        // ARGON-G2-003: a COMMON output is transitioned to UAV and back, not refused.
+        {
+            const uint64_t replaced = na::ffx::GetStats().replaced, barriers = na::ffx::GetStats().barriers;
+            auto u = UpscaleDesc(l.list.Get());
+            u.reset = false;
+            u.output.state = FFX_API_RESOURCE_STATE_COMMON;
+            CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK);
+            CHECK(na::ffx::GetStats().replaced == replaced + 1 && na::ffx::GetStats().barriers == barriers + 1);
+        }
+        // ARGON-G2-001: dynamic resolution inside the context's maxRenderSize keeps one feature and its history.
+        {
+            const int creates = fake::creates;
+            const uint32_t widths[10] = {960, 1000, 1114, 1200, 1280, 1180, 1050, 1280, 990, 1114};
+            for (int i = 0; i < 10; ++i) {
+                auto u = UpscaleDesc(l.list.Get());
+                u.reset = false;
+                u.renderSize = {widths[i], widths[i] * 9 / 16};
+                CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK);
+                CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
+            }
+            CHECK(fake::creates == creates); // created once at 1280x720 earlier, never again
+        }
         l.list->Close();
         na::dlss::Shutdown();
     } else {
@@ -258,7 +284,7 @@ int main(int argc, char** argv)
     {
         const int fsr_before = counts(3);
         auto u = UpscaleDesc(reinterpret_cast<void*>(0x99));
-        u.output.state = FFX_API_RESOURCE_STATE_COMMON; // refused before DLSS is consulted
+        u.output.state = 0x4000; // refused before DLSS is consulted
         CHECK(dispatch(&ctx, &u.header) == FFX_API_RETURN_OK);
         CHECK(counts(3) == fsr_before + 1); // no SDK: always FSR
         CHECK(na::ffx::GetStats().fallbacks == 1);

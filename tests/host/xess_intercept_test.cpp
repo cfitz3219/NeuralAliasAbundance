@@ -205,6 +205,30 @@ int main(int argc, char** argv)
             CHECK(fake::last_eval_handle != h1 && fake::last_eval_handle != h2 && dlss_reset() == 1);
             CHECK(destroy(ctx3) == kSuccess);
         }
+        // ARGON-G2-002: a context XeSS created before our hooks (no device recorded)
+        // still replaces: the device comes from the game's command list.
+        {
+            Context early = reinterpret_cast<Context>(0xABC0);
+            REQUIRE(init(early, &ip) == kSuccess); // first seen at Init
+            const uint64_t replaced = na::xess::GetStats().replaced;
+            auto p = Exec();
+            CHECK(execute(early, l.list.Get(), &p) == kSuccess);
+            CHECK(na::xess::GetStats().replaced == replaced + 1);
+        }
+        // ARGON-G2-001: dynamic input size keeps one feature (created at the output size) and its history.
+        {
+            const int creates = fake::creates;
+            const uint32_t widths[10] = {960, 1000, 1114, 1200, 1280, 1180, 1050, 1280, 990, 1114};
+            for (int i = 0; i < 10; ++i) {
+                auto p = Exec();
+                p.resetHistory = 0;
+                p.inputWidth = widths[i];
+                p.inputHeight = widths[i] * 9 / 16;
+                CHECK(execute(ctx, l.list.Get(), &p) == kSuccess);
+                if (i) CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
+            }
+            CHECK(fake::creates <= creates + 1);
+        }
         l.list->Close();
         na::dlss::Shutdown();
     }

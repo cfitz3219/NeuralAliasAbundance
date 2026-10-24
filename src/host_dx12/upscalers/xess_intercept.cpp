@@ -6,6 +6,8 @@
 #include "host_dx12/upscalers/module_watch.hpp"
 #include "host_dx12/upscalers/xess_abi.hpp"
 
+#include <wrl/client.h>
+
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -62,9 +64,20 @@ bool ToDlss(const Observation& o, na::dlss::EvalDesc* out, const char** reason)
     const float scale = (o.exposure_scale > 0.f ? o.exposure_scale : 1.f) * (o.exposure_multiplier > 0.f ? o.exposure_multiplier : 1.f);
     d.exposure_scale = scale;
     d.reset = o.reset;
-    d.quality = o.quality == kNativeAA && o.in_w == o.out_w && o.in_h == o.out_h
-                    ? na::dlss::Quality::DLAA
-                    : na::dlss::QualityForScale(o.in_w, o.in_h, o.out_w, o.out_h);
+    // ARGON-G2-001: the game's chosen XeSS mode fixes the DLSS mode, and the
+    // feature is created at the output size (XeSS states no maximum render
+    // size; it is never larger than the output), so dynamic resolution never
+    // recreates or resets DLSS.
+    switch (o.quality) {
+    case kUltraPerformance: d.quality = na::dlss::Quality::UltraPerformance; break;
+    case kPerformance: d.quality = na::dlss::Quality::MaxPerformance; break;
+    case kBalanced: d.quality = na::dlss::Quality::Balanced; break;
+    case kNativeAA: d.quality = na::dlss::Quality::DLAA; break;
+    default: d.quality = na::dlss::Quality::MaxQuality; break; // Quality, UltraQuality, UltraQualityPlus
+    }
+    if (d.quality == na::dlss::Quality::DLAA && (o.in_w != o.out_w || o.in_h != o.out_h)) d.quality = na::dlss::Quality::MaxQuality;
+    d.max_render_w = d.quality == na::dlss::Quality::DLAA ? o.in_w : o.out_w;
+    d.max_render_h = d.quality == na::dlss::Quality::DLAA ? o.in_h : o.out_h;
     if (const char* bad = na::dlss::Validate(d)) return fail(bad);
     *out = d;
     if (reason) *reason = nullptr;
@@ -136,10 +149,14 @@ ContextInfo* find_or_add(Context c)
     return nullptr; // table full: executes report context_known=false
 }
 
-bool ensure_dlss_locked(ID3D12Device* device)
+bool ensure_dlss_locked(ID3D12Device* device, ID3D12GraphicsCommandList* list)
 {
     const na::dlss::Capabilities c = na::dlss::GetCapabilities();
     if (c.attached) return c.available && !c.latched_off;
+    // ARGON-G2-002: a context created before our hooks has no recorded device;
+    // the game's command list knows it.
+    Microsoft::WRL::ComPtr<ID3D12Device> from_list;
+    if (!device && list && SUCCEEDED(list->GetDevice(IID_PPV_ARGS(&from_list)))) device = from_list.Get();
     if (g_dlss_init_tried || !device) return false;
     g_dlss_init_tried = true;
     wchar_t path[MAX_PATH] = {};
@@ -284,7 +301,7 @@ Result DetourExecute(Context c, ID3D12GraphicsCommandList* list, const D3D12Exec
             if (!mapped) {
                 ++g_stats.fallbacks;
                 set_reason(why);
-            } else if (!ensure_dlss_locked(o.device)) {
+            } else if (!ensure_dlss_locked(o.device, list)) {
                 ++g_stats.fallbacks;
                 const na::dlss::Capabilities caps = na::dlss::GetCapabilities();
                 set_reason(caps.reason[0] ? caps.reason : "DLSS could not start on this device.");

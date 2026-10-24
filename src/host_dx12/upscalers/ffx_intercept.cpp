@@ -26,6 +26,21 @@ namespace na::ffx {
 // session with AMD's official runtime DLL (FSR also runs on NVIDIA GPUs).
 constexpr float kFsrToDlssJitterSign = 1.0f;
 
+bool D3D12State(uint32_t ffx, D3D12_RESOURCE_STATES* out)
+{
+    switch (ffx) {
+    case FFX_API_RESOURCE_STATE_COMMON: *out = D3D12_RESOURCE_STATE_COMMON; return true;
+    case FFX_API_RESOURCE_STATE_UNORDERED_ACCESS: *out = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; return true;
+    case FFX_API_RESOURCE_STATE_COMPUTE_READ: *out = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE; return true;
+    case FFX_API_RESOURCE_STATE_PIXEL_READ: *out = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE; return true;
+    case FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ: *out = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE; return true;
+    case FFX_API_RESOURCE_STATE_COPY_SRC: *out = D3D12_RESOURCE_STATE_COPY_SOURCE; return true;
+    case FFX_API_RESOURCE_STATE_COPY_DEST: *out = D3D12_RESOURCE_STATE_COPY_DEST; return true;
+    case FFX_API_RESOURCE_STATE_GENERIC_READ: *out = D3D12_RESOURCE_STATE_GENERIC_READ; return true;
+    default: return false;
+    }
+}
+
 bool ToDlss(const Observation& o, na::dlss::EvalDesc* out, const char** reason)
 {
     const auto fail = [&](const char* why) {
@@ -39,14 +54,12 @@ bool ToDlss(const Observation& o, na::dlss::EvalDesc* out, const char** reason)
     const uint32_t ow = o.upscale_w ? o.upscale_w : o.max_upscale_w;
     const uint32_t oh = o.upscale_h ? o.upscale_h : o.max_upscale_h;
     if (!o.render_w || !o.render_h || !ow || !oh) return fail("FSR's render or output size is missing.");
-    // DLSS reads inputs as shader resources and writes its output as a UAV.
-    // FSR's states are passed by the game; only the matching layout is handled
-    // without adding barriers to the game's list.
-    const uint32_t kRead = FFX_API_RESOURCE_STATE_COMPUTE_READ;
-    if (!(o.color_state & kRead) || !(o.depth_state & kRead) || !(o.motion_state & kRead))
-        return fail("FSR's inputs are not in a shader-readable state DLSS can use as-is.");
-    if (o.output_state != FFX_API_RESOURCE_STATE_UNORDERED_ACCESS)
-        return fail("FSR's output is not in the writable (UAV) state DLSS needs.");
+    // ARGON-G2-003: any FSR state that has a D3D12 equivalent is accepted; the
+    // replace path transitions to DLSS's states around the evaluation and back.
+    D3D12_RESOURCE_STATES s{};
+    if (!D3D12State(o.color_state, &s) || !D3D12State(o.depth_state, &s) || !D3D12State(o.motion_state, &s) ||
+        !D3D12State(o.output_state, &s))
+        return fail("FSR described a resource state NeuralAlias cannot translate for DLSS.");
     if (o.context_flags & FFX_UPSCALE_ENABLE_DEPTH_INFINITE) {
         // DLSS takes raw depth; infinite far plane changes nothing it relies on.
     }
@@ -71,7 +84,11 @@ bool ToDlss(const Observation& o, na::dlss::EvalDesc* out, const char** reason)
     d.mv_jittered = (o.context_flags & FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION) != 0;
     d.mv_display_res = (o.context_flags & FFX_UPSCALE_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS) != 0;
     d.auto_exposure = (o.context_flags & FFX_UPSCALE_ENABLE_AUTO_EXPOSURE) != 0;
-    d.quality = na::dlss::QualityForScale(d.render_w, d.render_h, ow, oh);
+    // ARGON-G2-001: the context's maximum render size fixes the feature size and
+    // quality mode, so dynamic resolution never recreates or resets DLSS.
+    d.max_render_w = (o.max_render_w >= o.render_w && o.max_render_w <= ow) ? o.max_render_w : o.render_w;
+    d.max_render_h = (o.max_render_h >= o.render_h && o.max_render_h <= oh) ? o.max_render_h : o.render_h;
+    d.quality = na::dlss::QualityForScale(d.max_render_w, d.max_render_h, ow, oh);
     if (const char* bad = na::dlss::Validate(d)) return fail(bad);
     *out = d;
     if (reason) *reason = nullptr;
@@ -213,11 +230,39 @@ bool try_replace_locked(const Observation& o, ContextInfo* ci)
         set_reason(c.reason[0] ? c.reason : "DLSS could not start on this device.");
         return false;
     }
-    if (!na::dlss::Evaluate(o.list, d)) {
+    // ARGON-G2-003: move resources into DLSS's states and back afterwards.
+    struct Want { ID3D12Resource* r; uint32_t ffx; D3D12_RESOURCE_STATES dlss; };
+    const Want wants[] = {
+        {o.color, o.color_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE},
+        {o.depth, o.depth_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE},
+        {o.motion, o.motion_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE},
+        {o.output, o.output_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS},
+    };
+    D3D12_RESOURCE_BARRIER to[4] = {}, back[4] = {};
+    UINT n = 0;
+    for (const Want& w : wants) {
+        D3D12_RESOURCE_STATES game{};
+        D3D12State(w.ffx, &game);
+        // Already readable by compute (or already a UAV for the output): no barrier.
+        if (game == w.dlss || (w.dlss == D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE &&
+                               (game & D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) && game != D3D12_RESOURCE_STATE_GENERIC_READ))
+            continue;
+        to[n].Type = back[n].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        to[n].Transition.pResource = back[n].Transition.pResource = w.r;
+        to[n].Transition.Subresource = back[n].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        to[n].Transition.StateBefore = back[n].Transition.StateAfter = game;
+        to[n].Transition.StateAfter = back[n].Transition.StateBefore = w.dlss;
+        ++n;
+    }
+    if (n) o.list->ResourceBarrier(n, to);
+    const bool ok = na::dlss::Evaluate(o.list, d);
+    if (n) o.list->ResourceBarrier(n, back); // restore exactly what FSR was promised
+    if (!ok) {
         ++g_stats.fallbacks;
         set_reason(na::dlss::GetStats().reason);
         return false;
     }
+    g_stats.barriers += n;
     ++g_stats.replaced;
     set_reason("");
     return true;
