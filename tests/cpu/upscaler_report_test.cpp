@@ -37,6 +37,8 @@ int main() { return test::run({
         UpscalerSnapshot s{}; s[0].injector_evaluates = 100;
         auto r = DescribeUpscalers(s);
         CHECK(r.game_routes == 0 && r.rows[0].detection == Detection::InjectorOnly);
+        CHECK(r.rows[0].reason.find("Historical evidence") == std::string::npos);
+        CHECK(r.rows[0].reason.find("observer is not currently available") == std::string::npos);
         s[0].unknown_creates = 1;
         r = DescribeUpscalers(s);
         CHECK(r.game_routes == 0 && r.rows[0].detection == Detection::SourceUnknown);

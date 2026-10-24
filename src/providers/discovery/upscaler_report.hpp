@@ -78,7 +78,10 @@ inline UpscalerReport DescribeUpscalers(const UpscalerSnapshot& snapshot)
             if (!report.summary.empty()) report.summary += " / ";
             report.summary += names[i];
         }
-        if (!e.observer_available && row.detection != Detection::Unobserved)
+        // This flag describes the native-call observer. Injector counters are
+        // an independent producer and do not depend on native API hooks.
+        if (!e.observer_available && row.detection != Detection::Unobserved &&
+            row.detection != Detection::InjectorOnly)
             row.reason += " Historical evidence; the observer is not currently available.";
         if (row.game_observed || row.detection == Detection::SourceUnknown)
             row.reason += " Current-frame inputs and activity are not qualified by this report.";

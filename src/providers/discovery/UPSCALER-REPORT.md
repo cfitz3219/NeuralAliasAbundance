@@ -22,6 +22,10 @@ NGX `sr_creates` remains SOURCE UNKNOWN until origin instrumentation is availabl
 generic NGX evaluations and failures span feature types and are not used.
 C6's own `features_created` / `evaluates` are injector-origin DLSS evidence.
 Unknown-origin evidence outranks injector-only evidence in that row.
+An injector-only row does not inherit a "native observer unavailable" warning:
+C6 supplies that evidence independently of NGX hooks. Aggregate NGX creates still
+cannot be separated into native and injector calls without producer-side origin
+instrumentation; subtracting C6 counters would not establish that provenance.
 
 FSR `upscale_contexts` and XeSS `contexts_initialized` prove successful game
 creation/initialization. Hook/module counters describe observation availability
@@ -34,7 +38,7 @@ The report never drains observation records or changes replacement settings.
 
 ## Runtime integration and validation
 
-The A4 branch includes C7 at f2eeec41 and must integrate after C6/C7. Their open
+The A4 branch includes C7 at 13a8a59 and must integrate after C6/C7. Their open
 review findings still require author fixes; this dependency is not approval.
 `upscaler_menu.cpp` is compiled into `host_dx12`. `RegisterRouteAMenu()` registers
 the report after Clear and existing sections, reporting registration failure to
