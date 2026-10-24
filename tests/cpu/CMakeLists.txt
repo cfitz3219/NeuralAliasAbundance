@@ -41,3 +41,8 @@ if(WIN32 AND MSVC)
 else()
   message(STATUS "A1: host transport framing/loss runtime test requires Windows/MSVC; NOT executed by portable ABI checks")
 endif()
+
+# A3 is Astra-owned; works in root and standalone CPU builds.
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../fixture/CMakeLists.txt")
+  add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../fixture" "${CMAKE_CURRENT_BINARY_DIR}/fixture")
+endif()
