@@ -140,7 +140,7 @@ Every claim was checked against the code (and, for API rules, Microsoft's docume
 | 7.3 | Depth is often cleared/overwritten late in the frame (weapons, 3D HUD) | **Agreed.** | C8/C11: depth lease taken at the end of the main geometry pass chosen by A5, not at Present. |
 
 ### New / amended tasks (Claude unless noted)
-- **C7b** (Phase 2, with C7): generalize Streamline camera capture beyond TLOU (layout/version evidence first).
+- **C7b** (Phase 2, with C7): generalize Streamline camera capture beyond TLOU (layout/version evidence first). **Done 2026-10-24** (`claude/c7b-sl-camera`): the TLOU-only gate is removed; SL 1.x vs 2.x Constants are told apart by the 2.x type GUID; FrameToken/ViewportHandle are read only after GUID checks; `ValidCamera` still gates every record. Also fixed a latent C5 bug: the proxy's typed wrappers used 1.x signatures and would have truncated 2.x pointer and 64-bit arguments (slInit sdkVersion, slEvaluateFeature FrameToken&); all wrappers now forward five full-width arguments.
 - **C12** (required before un-holding FG/NR/motion): 24/16-bit depth → R32F conversion pass (SRV `R24_UNORM_X8_TYPELESS` / `R16_UNORM`, on NeuralAlias's own list at the submission boundary; requires the depth resource to allow SRVs, else decline).
 - **C13** (required before un-holding FG/NR): subrect-correct inputs (#4.1, #4.2, #4.4) with fixture tests using padded/DRS-style resources.
 - **C14** (FG phase): per-game NVIDIA driver FG preset, opt-in with restore.
