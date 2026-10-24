@@ -51,6 +51,9 @@ const char* Validate(const EvalDesc& d)
     if (!d.color || !d.depth || !d.motion || !d.output) return "DLSS needs colour, depth, motion and an output texture.";
     if (!d.render_w || !d.render_h || !d.out_w || !d.out_h) return "DLSS was given an empty render or output size.";
     if (d.render_w > d.out_w || d.render_h > d.out_h) return "DLSS cannot make the picture smaller (render larger than output).";
+    if ((d.max_render_w && d.max_render_w < d.render_w) || (d.max_render_h && d.max_render_h < d.render_h))
+        return "This frame is larger than the game's stated maximum render size.";
+    if (d.max_render_w > d.out_w || d.max_render_h > d.out_h) return "The maximum render size is larger than the output.";
     if (d.quality == Quality::DLAA && (d.render_w != d.out_w || d.render_h != d.out_h))
         return "DLAA needs the render size to equal the output size.";
     if (!std::isfinite(d.jitter_x) || !std::isfinite(d.jitter_y) || std::fabs(d.jitter_x) > 1.f || std::fabs(d.jitter_y) > 1.f)
@@ -525,8 +528,12 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
     const uint32_t flags = flags_for(d);
     // Dynamic resolution: a smaller render size fits the view's existing feature.
     const Feature* cur = view.feature >= 0 ? &g.features[view.feature] : nullptr;
+    // ARGON-G2-001: create at the source's maximum render size, so dynamic
+    // resolution anywhere up to it keeps the same feature and history.
+    const uint32_t create_w = d.max_render_w ? d.max_render_w : d.render_w;
+    const uint32_t create_h = d.max_render_h ? d.max_render_h : d.render_h;
     const bool fits = cur && cur->out_w == d.out_w && cur->out_h == d.out_h && cur->flags == flags &&
-                      cur->quality == d.quality && d.render_w <= cur->render_w && d.render_h <= cur->render_h;
+                      cur->quality == d.quality && create_w <= cur->render_w && create_h <= cur->render_h;
     NVSDK_NGX_Parameter* p = EP();
     if (!fits) {
         // R-305: secure a slot BEFORE giving up the current feature, so no handle is ever lost.
@@ -539,8 +546,8 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
         p->Reset();
         p->Set(NVSDK_NGX_Parameter_CreationNodeMask, 1u);
         p->Set(NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
-        p->Set(NVSDK_NGX_Parameter_Width, d.render_w);
-        p->Set(NVSDK_NGX_Parameter_Height, d.render_h);
+        p->Set(NVSDK_NGX_Parameter_Width, create_w);
+        p->Set(NVSDK_NGX_Parameter_Height, create_h);
         p->Set(NVSDK_NGX_Parameter_OutWidth, d.out_w);
         p->Set(NVSDK_NGX_Parameter_OutHeight, d.out_h);
         p->Set(NVSDK_NGX_Parameter_PerfQualityValue, static_cast<int>(d.quality));
@@ -559,8 +566,8 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
         Feature& nf = g.features[slot];
         nf = Feature{};
         nf.handle = h;
-        nf.render_w = d.render_w;
-        nf.render_h = d.render_h;
+        nf.render_w = create_w;
+        nf.render_h = create_h;
         nf.out_w = d.out_w;
         nf.out_h = d.out_h;
         nf.flags = flags;
@@ -569,8 +576,8 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
         view.feature = slot;
         view.needs_reset = true;
         ++g.stats.features_created;
-        g.stats.feature_render_w = d.render_w;
-        g.stats.feature_render_h = d.render_h;
+        g.stats.feature_render_w = create_w;
+        g.stats.feature_render_h = create_h;
         g.stats.feature_out_w = d.out_w;
         g.stats.feature_out_h = d.out_h;
         g.stats.feature_flags = flags;
