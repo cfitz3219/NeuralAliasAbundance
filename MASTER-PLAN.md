@@ -210,3 +210,7 @@ Cort: "finish this up and close gate 2!" Claude's side is complete, and with Ast
   - whether the overlay's own D3D12 objects also keep a removed device alive (not yet checked).
 
 **Next:** Phase 3.
+
+## 2026-10-24 — Phase 3 started by Cort
+
+A5 is IN PROGRESS on astra/a5-signal-classifier, draft PR #21 (c7e53e9). First metadata ranking/abstention slice implemented; fresh Windows Release CPU/fixture CTest 11/11 passed. Full A5 content classification and >=95% fixture accuracy acceptance remain outstanding. Next: fixture candidate corpus, content/camera/HUD verification, C8 host ingestion after proposal acknowledgment and qualified async texture samples. Full A5 estimate remains 4–8 working days; no attendance for this first slice. Gate 2 stays closed and Argon deferred.

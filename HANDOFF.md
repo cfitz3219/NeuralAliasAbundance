@@ -1,3 +1,8 @@
+# 2026-10-24 — Phase 3 / A5 started
+
+Cort authorized Phase 3. Draft PR #21 at c7e53e9 implements first depth/scene-color metadata ranking with explicit abstention, provenance checks and acquisition tasks. Fresh Windows Release standalone CPU suite: 11/11 CTests pass. A5 remains in progress; content verification and >=95% fixture classification acceptance are not claimed. Worktree .worktrees/astra-a5-signal-classifier, branch astra/a5-signal-classifier. Next: fixture candidate corpus and content verification; C8/C9 host dependencies posted in COMMS. Gate 2 remains CLOSED, Argon deferred. No game changes during Phase 3 startup.
+
+---
 # 2026-10-24 — Gate 2 RTX tests passed; no game deployment
 
 Fresh Release build of main 4839fc3: 30/30 CTests passed, no skips, on RTX 5070 Ti / driver 621.01. Real NGX 310.9.16.0 ran 128 evaluations; synthetic SR quality 17.68 dB versus 11.25 dB bilinear. A3's ten checks and exposure-state debug assertions passed. Evidence: local/gate2-rtx-20261024/ctest-verbose.log. Detailed journal: .worktrees/astra-g2-rtx-validation/WORKLOG.md, commit 5fde822 (push blocked by missing Git credentials).
