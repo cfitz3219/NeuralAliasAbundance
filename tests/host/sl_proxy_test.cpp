@@ -141,7 +141,11 @@ int wmain(int argc, wchar_t** argv)
         const uint8_t cguid[16] = {0xd7, 0x5a, 0xd3, 0xdc, 0x4a, 0x4e, 0xad, 0x4b, 0xa9, 0x0c, 0xe0, 0xc4, 0x9e, 0xb2, 0x3a, 0xfe};
         memcpy(c2.h.guid, cguid, 16);
         c2.h.version = 2;
-        struct Token { virtual uint32_t value() const { return 77; } Header h; } token;
+        // FrameToken: vtable pointer first (operator uint32_t is entry 0), then BaseStructure.
+        struct Token { const void* const* vtbl; Header h; } token{};
+        using TokenOp = uint32_t(__cdecl*)(const void*);
+        static const TokenOp token_vtbl[1] = {[](const void*) -> uint32_t { return 77; }};
+        token.vtbl = reinterpret_cast<const void* const*>(token_vtbl);
         const uint8_t tguid[16] = {0x35, 0x0f, 0x0a, 0x83, 0x84, 0xdb, 0x71, 0x41, 0xa8, 0x04, 0x59, 0xb2, 0x06, 0x49, 0x9b, 0x18};
         memcpy(token.h.guid, tguid, 16);
         struct Viewport { Header h; uint32_t value; } vp{};
