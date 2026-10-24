@@ -52,3 +52,29 @@ running device-removal/GPU tests. `na.cpu.signal_candidates` covers stale scope,
 loss, ambiguity, overwrites, extent/format mismatches, unknown values, duplicate
 identity, capacity failure, color HUD uncertainty and ranking without promotion.
 Existing A3 reference tests remain the oracle's own tests, not A5 accuracy tests.
+
+## Content corroboration checkpoint
+
+`content_checks.hpp` checks completed, lifetime-valid, fully scoped samples against
+independent evidence. Depth is tested by projecting independently known visible
+opaque world points through a supplied camera (including pixel position and
+explicit forward/reverse convention). World positions reconstructed from the
+candidate depth are prohibited as circular evidence. Color is tested against
+known linear premultiplied source-over composition witnesses. Unknown tone mapping,
+blend rules, geometry or camera must remain missing evidence.
+
+Results are Unavailable, Contradicted or Consistent **with the supplied evidence**;
+none promotes a candidate to a production DLSS input. Opaque/near-opaque foreground
+leaves underlying pixels unresolved. Multiple independently captured compositions
+of the same scene version can expose them. Witness provenance and actual source
+associations are caller obligations; synthetic fixture identities are not host proof.
+
+The offline fixture transport receives anonymous candidates, world geometry and
+composition probes; labels stay in the Python scorer. The second controlled probe
+uses translucent HUD over the same fixture scene. This additional experiment is
+explicitly generated for qualification, not a claim that the current live host can
+capture equivalent evidence. 396 decisions across 44 scene/probe cases matched the
+expected results (zero false Consistent results); this is content-check validation,
+not >=95% end-to-end automatic-discovery acceptance. Existing metadata ranking and
+content corroboration remain separate until independently sourced host evidence
+can connect them. Next independent work: camera candidate discovery for A6.
