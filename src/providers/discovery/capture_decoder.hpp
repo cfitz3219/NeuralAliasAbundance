@@ -55,6 +55,9 @@ inline size_t KnownEventSize(uint32_t kind) {
     NA_SIZE(NA_EV_PIPELINE_CREATED, na_ev_pipeline_created);
     NA_SIZE(NA_EV_LIST_OP, na_ev_list_op);
 #endif
+#ifdef NA_SNAP_SYNC_APP_UNKNOWN
+    NA_SIZE(NA_EV_SNAPSHOT, na_ev_snapshot);
+#endif
 #undef NA_SIZE
     default: return 0;
     }
@@ -138,6 +141,18 @@ inline DecodedBatch DecodeBatch(const void* input, size_t readable) {
                 if(h.flags&NA_EVF_TRUNCATED) result.incomplete_capture=true;
                 else if(!e.payload_stride || count>e.payload_bytes/e.payload_stride) return {};
             }
+        }
+#endif
+#ifdef NA_SNAP_SYNC_APP_UNKNOWN
+        if (h.kind == NA_EV_SNAPSHOT) {
+            na_ev_snapshot e{}; std::memcpy(&e,raw+position,sizeof(e));
+            if (e.captured_bytes > e.requested_bytes ||
+                (e.status != NA_SNAP_CAPTURED && e.captured_bytes)) return {};
+            if (e.captured_bytes && (e.payload_offset < sizeof(e) || e.payload_offset > h.size_bytes ||
+                e.captured_bytes > h.size_bytes-e.payload_offset)) return {};
+            // C9 provides no independent application-write synchronization or
+            // GPU completion. Keep these bytes available for offline hypotheses.
+            result.incomplete_capture = true;
         }
 #endif
         if (!minimum && (h.flags & NA_EVF_FOUNDATIONAL)) result.unknown_foundational = true;

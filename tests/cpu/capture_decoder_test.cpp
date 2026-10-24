@@ -115,6 +115,19 @@ int main() { return test::run({
         auto d=Decode(Packet(e,NA_EV_LIST_OP));CHECK(d.valid&&d.incomplete_capture);
     }},
 #endif
+#ifdef NA_SNAP_SYNC_APP_UNKNOWN
+    {"H3 snapshots remain incomplete and bounded", [] {
+        na_ev_snapshot e{};e.status=NA_SNAP_CAPTURED;e.sync=NA_SNAP_SYNC_APP_UNKNOWN;
+        e.requested_bytes=4;e.captured_bytes=4;e.payload_offset=sizeof(e);
+        auto p=Packet(e,NA_EV_SNAPSHOT);CHECK(!Decode(p).valid);
+        p.resize(base+sizeof(e)+8);
+        Put(p,offsetof(na_event_batch,payload_bytes),uint32_t(sizeof(e)+8));
+        Put(p,base+offsetof(na_event_header,size_bytes),uint32_t(sizeof(e)+8));
+        CHECK(Decode(p).valid && Decode(p).incomplete_capture);
+        auto valid=p;Put(p,base+offsetof(na_ev_snapshot,status),uint32_t(NA_SNAP_NOT_MAPPED));CHECK(!Decode(p).valid);
+        p=valid;Put(p,base+offsetof(na_ev_snapshot,captured_bytes),UINT32_MAX);CHECK(!Decode(p).valid);
+    }},
+#endif
     {"identity records and capability arrays checked", [] {
         na_ev_epoch_begin e{}; e.session=42; e.epoch=7;
         auto p=Packet(e,NA_EV_EPOCH_BEGIN); CHECK(Decode(p).valid);
