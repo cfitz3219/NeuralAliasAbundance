@@ -2311,6 +2311,7 @@ std::atomic<uint32_t> g_workers_started{0};  // stats
 std::atomic<bool> g_samples_quit{false};     // set at teardown: the worker stops before any static it reads is destroyed
 std::atomic<bool> g_worker_paused{false};    // test seam: no maintenance ticks
 std::atomic<bool> g_fail_worker_start{false}; // test seam: thread creation fails
+std::atomic<bool> g_fail_sample_signal{false}; // test seam: the host fence signal is refused after the copy was submitted
 std::thread* g_worker = nullptr;             // immortal, never detached: teardown waits on its own handle
 void (*g_acquire_probe)() = nullptr;         // test seam: after the game's submission returned, before servicing
 constexpr size_t kMaxSamples = 8;     // every entry counts, released-in-flight included
@@ -2607,7 +2608,7 @@ void start_copy_locked(Sample& s, ID3D12Resource* res, ID3D12CommandQueue* q, D3
         if (fwd) fwd(q, 1, ls);
         else q->ExecuteCommandLists(1, ls);
         submitted = true;
-        s.signaled = SUCCEEDED(q->Signal(s.fence, s.fence_value));
+        s.signaled = !g_fail_sample_signal.load() && SUCCEEDED(q->Signal(s.fence, s.fence_value));
     }
     t_host_work = false;
     dev->Release();
@@ -2973,6 +2974,7 @@ na_object_id IdOf(const void* object) { return lookup(object); }
 void SetSampleAcquireProbeForTests(void (*probe)()) { g_acquire_probe = probe; }
 void SetSampleWorkerPausedForTests(bool paused) { g_worker_paused.store(paused, std::memory_order_release); }
 void SetSampleWorkerStartFailsForTests(bool fail) { g_fail_worker_start.store(fail); }
+void SetSampleSignalFailsForTests(bool fail) { g_fail_sample_signal.store(fail); }
 
 void SetUnmapBoundaryProbeForTests(void (*probe)(void* user), void* user)
 {

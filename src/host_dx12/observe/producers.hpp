@@ -81,6 +81,8 @@ void SetSampleAcquireProbeForTests(void (*probe)());
 void SetSampleWorkerPausedForTests(bool paused);
 // Tests: the sample worker thread fails to start (requests must be refused).
 void SetSampleWorkerStartFailsForTests(bool fail);
+// Tests: the host fence Signal after a submitted sample copy fails (quarantine path).
+void SetSampleSignalFailsForTests(bool fail);
 
 // Identity of an observed object (0 = unknown). Any interface pointer of it.
 na_object_id IdOf(const void* object);

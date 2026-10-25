@@ -25,12 +25,20 @@
 //      whole subresource copied.
 // C9B-REVIEW-4: a worker that cannot start refuses the request (nothing armed,
 //   no worker), and the next request starts it.
+// Gate 3 producer qualification (previously source-reviewed only):
+//   R3 interleaving: while the host is between the game's evidence submission
+//      and its copy, another thread's submission on the same queue is blocked;
+//   signal failure: copy submitted but the fence signal refused -> FAILED /
+//      SUBMIT_FAILED, entry quarantined (kept) even after release;
+//   plane count: a two-plane depth-stencil resource (D24S8) is refused whole.
 #include "test_support.hpp"
 #include "host_dx12/host_observe.h"
 #include "host_dx12/host_observe_samples.h"
 #include "host_dx12/observe/producers.hpp"
 
+#include <atomic>
 #include <cstdlib>
+#include <thread>
 #include <cstring>
 #include <vector>
 
@@ -40,6 +48,18 @@ void __cdecl Sink(const na_event_batch*, void*) {}
 // #2 boundary probe: runs after the game's ExecuteCommandLists returned and
 // before servicing. Counts references (the host's must already be there) and
 // drops the game's last one.
+// R3 interleaving probe: runs on the submitting thread while it holds the
+// queue's submission lock, between the game's submission and the host copy.
+HANDLE g_b_go = nullptr;
+std::atomic<bool> g_b_started{false}, g_b_returned{false}, g_b_blocked_during_copy{false};
+void InterleaveProbe()
+{
+    SetEvent(g_b_go);
+    for (int i = 0; i < 1000 && !g_b_started.load(); ++i) Sleep(1);
+    Sleep(50); // ample time for an unserialized submission to complete
+    g_b_blocked_during_copy.store(g_b_started.load() && !g_b_returned.load());
+}
+
 test::ComPtr<ID3D12Resource> g_victim;
 ULONG g_refs_at_boundary = 0;
 bool g_dropped = false;
@@ -313,6 +333,91 @@ int main()
         CHECK(ai.status == NA_SAMPLE_READY && ai.state_before == D3D12_RESOURCE_STATE_COPY_SOURCE);
         na_observe_sample_release(t_acq);
         d.WaitIdle();
+        CHECK(dev->GetDeviceRemovedReason() == S_OK);
+    }
+
+    // ---- Gate 3: R3 interleaving (deterministic: B can only finish early if unserialized) ----
+    {
+        test::ComPtr<ID3D12CommandAllocator> alloc_b;
+        test::ComPtr<ID3D12GraphicsCommandList> list_b;
+        REQUIRE(SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc_b))));
+        REQUIRE(SUCCEEDED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc_b.Get(), nullptr, IID_PPV_ARGS(&list_b))));
+        REQUIRE(SUCCEEDED(list_b->Close()));
+        g_b_go = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        REQUIRE(g_b_go);
+        std::thread b([&] {
+            WaitForSingleObject(g_b_go, 5000);
+            ID3D12CommandList* lb[] = {list_b.Get()};
+            g_b_started.store(true);
+            d.queue->ExecuteCommandLists(1, lb); // must wait for the host copy
+            g_b_returned.store(true);
+        });
+        const uint64_t t_il = Request(color_id);
+        REQUIRE(t_il);
+        record([&] {
+            D3D12_RESOURCE_BARRIER bb = test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &bb);
+            bb = test::Transition(color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->ResourceBarrier(1, &bb);
+        });
+        na::observe::SetSampleAcquireProbeForTests(&InterleaveProbe);
+        d.queue->ExecuteCommandLists(1, ls);
+        na::observe::SetSampleAcquireProbeForTests(nullptr);
+        b.join();
+        CloseHandle(g_b_go);
+        const na_sample_info ii = WaitDone(t_il);
+        std::printf("interleaving: other thread started %d, blocked during copy %d, returned after %d; sample status %u state_before 0x%x\n",
+                    g_b_started.load() ? 1 : 0, g_b_blocked_during_copy.load() ? 1 : 0, g_b_returned.load() ? 1 : 0, ii.status, ii.state_before);
+        CHECK(g_b_started.load() && g_b_blocked_during_copy.load() && g_b_returned.load());
+        CHECK(ii.status == NA_SAMPLE_READY && ii.state_before == D3D12_RESOURCE_STATE_RENDER_TARGET);
+        na_observe_sample_release(t_il);
+        d.WaitIdle();
+        CHECK(dev->GetDeviceRemovedReason() == S_OK);
+    }
+
+    // ---- Gate 3: plane count (D24S8 has two planes) ----
+    {
+        auto ds = test::CreateTexture(dev, 32, 16, DXGI_FORMAT_D24_UNORM_S8_UINT, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+        REQUIRE(ds);
+        const na_object_id dsid = na::observe::IdOf(ds.Get());
+        REQUIRE(dsid);
+        const uint64_t t_pl = Request(dsid); // whole: only the plane rule can refuse it
+        REQUIRE(t_pl);
+        record([&] {
+            D3D12_RESOURCE_BARRIER bb = test::Transition(ds.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+            list->ResourceBarrier(1, &bb);
+        });
+        d.queue->ExecuteCommandLists(1, ls);
+        const na_sample_info pi = WaitDone(t_pl);
+        std::printf("plane count: D24S8 whole request status %u reason %u\n", pi.status, pi.reason);
+        CHECK(pi.status == NA_SAMPLE_FAILED && pi.reason == NA_SAMPLE_E_UNSUPPORTED);
+        na_observe_sample_release(t_pl);
+        d.WaitIdle();
+    }
+
+    // ---- Gate 3: signal failure -> quarantine ----
+    {
+        const uint64_t live0 = na::observe::GetProducerStats().samples_live;
+        const uint64_t t_sf = Request(color_id);
+        REQUIRE(t_sf);
+        record([&] {
+            D3D12_RESOURCE_BARRIER bb = test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &bb);
+            bb = test::Transition(color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->ResourceBarrier(1, &bb);
+        });
+        na::observe::SetSampleSignalFailsForTests(true);
+        d.queue->ExecuteCommandLists(1, ls);
+        na::observe::SetSampleSignalFailsForTests(false);
+        const na_sample_info si2 = Poll(t_sf);
+        CHECK(si2.status == NA_SAMPLE_FAILED && si2.reason == NA_SAMPLE_E_SUBMIT_FAILED);
+        CHECK(na_observe_sample_release(t_sf) == NA_OK);
+        d.WaitIdle();
+        Sleep(30); // several worker ticks
+        const uint64_t live1 = na::observe::GetProducerStats().samples_live;
+        std::printf("signal failure: status %u reason %u, quarantined after release %d (live %llu -> %llu)\n", si2.status, si2.reason,
+                    live1 == live0 + 1 ? 1 : 0, static_cast<unsigned long long>(live0), static_cast<unsigned long long>(live1));
+        CHECK(live1 == live0 + 1); // never freed without completion proof
         CHECK(dev->GetDeviceRemovedReason() == S_OK);
     }
 
