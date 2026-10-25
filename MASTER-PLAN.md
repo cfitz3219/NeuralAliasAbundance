@@ -272,3 +272,7 @@ All Claude branches checked. New67b7744 is integrated in PR27 a171f40, preservin
 ## 2026-10-24 — C9b combined CI confirmed
 
 PR27 a171f40 all3 CI jobs pass40146126274. Local48/48 passes. Supersedes pending CI above, not C9B-R1–R6 live-use blockers. No deployment; producer correction ownership remains Claude.
+
+## 2026-10-24 — C9b fixes integrated and rechecked
+
+All branches checked; PR33 head688c0ec integrated into PR27 at6cd9d11. Full Release and48/48 local tests pass, zero skips. Original R1 repeated cancellation and R5 borrowed pointer corrected; retention/quarantine, queue locking, evidence and shape checks present. C9B-REVIEW-2 retains four changes-required findings: worker proliferation/static lifetime, raw source acquisition, scope validation deferred to maintenance, typeless depth partial-copy gate. Producer fixes remain Claude-owned; no live consumer or deployment. Latest CI pending.
