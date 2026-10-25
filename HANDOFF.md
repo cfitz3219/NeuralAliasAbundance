@@ -1,3 +1,8 @@
+# 2026-10-24 — PR34 checkpoint with known worker failure
+
+PR27 a5b11f2 integrates629ad9b. Full Release/default48/48 local tests and all3 CI jobs40149217862 pass. Separate RTX na_sample_worker_wakeup FAILS1 assertion: second request after idle does not time out. Default suite explicitly excludes it; enable NA_ENABLE_PENDING_SAMPLE_TESTS or run target directly. Claude owns missing notification and remaining teardown proof. Acquisition/scope/typeless-depth fixes reviewed positively; no live consumer/deployment. Report: integration docs/C9B-REVIEW.md and COMMS.
+
+---
 # 2026-10-24 — C9b fix CI confirmed
 
 PR27 6cd9d11 passes all3 CI jobs40147665279 and local48/48. Supersedes latest-CI-pending below; four C9B-REVIEW-2 findings remain with Claude. No live consumer enablement or deployment.
@@ -244,6 +249,7 @@ Cort: "finish this up and close gate 2!" Claude's side is complete, and with Ast
   - whether the overlay's own D3D12 objects also keep a removed device alive (not yet checked).
 
 **Next:** Phase 3.
+
 
 
 

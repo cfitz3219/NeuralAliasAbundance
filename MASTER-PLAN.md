@@ -280,3 +280,7 @@ All branches checked; PR33 head688c0ec integrated into PR27 at6cd9d11. Full Rele
 ## 2026-10-24 — C9b fix integration CI confirmed
 
 PR27 6cd9d11 all3 CI jobs pass40147665279, alongside local48/48. Latest-CI-pending superseded. Four C9B-REVIEW-2 findings remain; no live enablement or deployment.
+
+## 2026-10-24 — PR34 verified; pending worker regression reproduced
+
+PR27 a5b11f2 integrates Claude629ad9b. Full Release/default48/48 local tests and all3 CI jobs40149217862 pass. Separate na_sample_worker_wakeup diagnostic FAILS on RTX: warmup timeout works; second20ms request after idle remains ARMED after~1s. Default CI explicitly excludes this known failure (NA_ENABLE_PENDING_SAMPLE_TESTS opt-in). Acquisition, immediate scope, typeless-depth and singleton guard reviewed/tested; remaining worker wakeup and bounded-teardown proof belong to Claude. No live consumer/deployment. Exact repro/report in COMMS and integration docs/C9B-REVIEW.md.
