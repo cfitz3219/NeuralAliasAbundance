@@ -474,6 +474,12 @@ bool run_snapshot()
 namespace na::observe_internal {
 
 bool Emit(const void* event_bytes, uint32_t group) { return emit_ring(event_bytes, group); }
+void CurrentScope(na_session_id* session, na_epoch* epoch)
+{
+    const bool on = Started();
+    if (session) *session = on ? g_host.session.load(std::memory_order_acquire) : 0;
+    if (epoch) *epoch = on ? g_host.epoch.load(std::memory_order_acquire) : 0;
+}
 bool Started() { return g_host.started.load(std::memory_order_acquire) && !g_host.stopping.load(std::memory_order_acquire); }
 void SetSnapshotProvider(SnapshotFn fn) { g_host.snapshot = std::move(fn); }
 void TestForceFoundationalOverflow(bool enable)

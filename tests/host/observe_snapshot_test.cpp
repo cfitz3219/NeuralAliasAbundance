@@ -112,9 +112,13 @@ int main()
         ID3D12Resource* buffer;
         std::thread unmapper;
         std::atomic<bool> returned{false};
+        HANDLE entered;            // set by Unmap right before it contends for the mapping lock
+        bool reached_boundary = false;
         bool returned_during_copy = true;
         bool fired = false;
-    } race{upload.Get(), {}, {}, true, false};
+    } race{upload.Get(), {}, {}, CreateEventW(nullptr, TRUE, FALSE, nullptr), false, true, false};
+    REQUIRE(race.entered != nullptr);
+    na::observe::SetUnmapBoundaryProbeForTests([](void* user) { SetEvent(static_cast<Race*>(user)->entered); }, &race);
     na::observe::SetSnapshotCopyProbeForTests(
         [](void* user) {
             auto* r = static_cast<Race*>(user);
@@ -124,7 +128,9 @@ int main()
                 r->buffer->Unmap(0, nullptr);
                 r->returned.store(true);
             });
-            Sleep(150); // ample time for an unsynchronised Unmap to finish
+            // Explicit handshake: the unmapper has reached the contested lock.
+            r->reached_boundary = WaitForSingleObject(r->entered, 5000) == WAIT_OBJECT_0;
+            Sleep(50); // it is now blocked (or, if unsynchronised, would have finished)
             r->returned_during_copy = r->returned.load();
         },
         &race);
@@ -136,9 +142,13 @@ int main()
     d.queue->ExecuteCommandLists(1, ls);
     na::observe::SetSnapshotCopyProbeForTests(nullptr, nullptr);
     if (race.unmapper.joinable()) race.unmapper.join();
+    na::observe::SetUnmapBoundaryProbeForTests(nullptr, nullptr);
+    CloseHandle(race.entered);
     d.WaitIdle();
-    std::printf("unmap race: probe fired %d, unmap returned during copy %d, after %d\n", race.fired, race.returned_during_copy, race.returned.load());
+    std::printf("unmap race: probe fired %d, boundary reached %d, unmap returned during copy %d, after %d\n", race.fired, race.reached_boundary,
+                race.returned_during_copy, race.returned.load());
     CHECK(race.fired);
+    CHECK(race.reached_boundary);
     CHECK(!race.returned_during_copy);
     CHECK(race.returned.load());
     REQUIRE(na_observe_stop() == NA_OK);

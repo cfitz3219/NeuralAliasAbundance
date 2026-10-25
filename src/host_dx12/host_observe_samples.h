@@ -18,11 +18,27 @@
  *  - The content is therefore the subresource as the GPU left it at the end
  *    of that submission (queue + ticket reported), not at an arbitrary pass.
  *  - READY only after the host fence has completed (completion evidence, not
- *    a delay). The data stays valid until the consumer RELEASES the token,
- *    or until it EXPIRES (not released within the expiry after READY), or
- *    the device is lost (DEVICE_LOST; no data).
- *  - The host owns every GPU object involved; the consumer only reads the
- *    mapped bytes between a READY poll and release.
+ *    a delay); a host-owned worker (never a game callback) observes the
+ *    fence, copies the readback into host memory and frees the GPU objects.
+ *  - Consumers never receive a borrowed pointer (C9B-R5): na_observe_sample_read
+ *    copies the READY bytes into the CALLER's buffer, which the caller owns.
+ *    READY data is kept until release or expiry (not read within expiry_ms).
+ *  - Eligibility (C9B-R4): every list of the submission must be observed with
+ *    complete hook coverage and complete barrier evidence (no truncated batch,
+ *    no evidence overflow); the subresource's last recorded transition must be
+ *    a completed (not BEGIN_ONLY) transition to a state other than COMMON
+ *    (COMMON permits implicit promotion); simultaneous-access resources are
+ *    never sampled.
+ *  - Ordering (C9B-R3): while any request is armed, the host serializes each
+ *    observed submission on that queue with the copy that may follow it, so
+ *    nothing observed can be submitted between them; an occurrence found
+ *    ORDER_AMBIGUOUS is never sampled. queue/queue_ticket name it exactly.
+ *  - Lifetime (C9B-R2): the source is acquired from a submission that just
+ *    referenced it (the application must keep it alive while that work runs)
+ *    and held until the host fence completes.
+ *  - Leases are scoped to the session and epoch of the request: stop or
+ *    resync ends them (SESSION_ENDED).
+ *  - The host owns every GPU object involved.
  */
 #ifndef NA_HOST_OBSERVE_SAMPLES_H
 #define NA_HOST_OBSERVE_SAMPLES_H
@@ -51,7 +67,11 @@ typedef enum na_sample_reason {
     NA_SAMPLE_E_UNSUPPORTED = 2,       /* buffer / MSAA / reserved / too large */
     NA_SAMPLE_E_RETIRED = 3,           /* resource destroyed before the copy */
     NA_SAMPLE_E_HOST_OBJECTS = 4,      /* host could not create its copy objects */
-    NA_SAMPLE_E_TIMEOUT = 5            /* stayed ARMED past arm_timeout_ms */
+    NA_SAMPLE_E_TIMEOUT = 5,           /* stayed ARMED past arm_timeout_ms */
+    NA_SAMPLE_E_SESSION_ENDED = 6,     /* observation stopped or resynced */
+    NA_SAMPLE_E_SUBMIT_FAILED = 7      /* host fence signal failed after the copy was
+                                          submitted: objects are quarantined until the
+                                          device is removed, never freed early */
 } na_sample_reason;
 
 typedef struct na_sample_request {
@@ -77,14 +97,19 @@ typedef struct na_sample_info {
     uint64_t queue_ticket;
     uint32_t state_before;      /* the recorded state the copy transitioned from */
     uint32_t _pad;
-    const void* data;           /* READY only; valid until release/expiry */
+    na_session_id session;      /* scope of the lease */
+    na_epoch epoch;
 } na_sample_info;
 
 /* Returns NA_OK and a nonzero token, or an NA_E_* error (no token). */
 int __cdecl na_observe_sample_request(const na_sample_request* request, uint64_t* out_token);
 /* Fills info (size_bytes rule as na_observe_query_status). Any thread. */
 int __cdecl na_observe_sample_poll(uint64_t token, na_sample_info* info);
-/* Cancels an armed request or releases a finished one; idempotent. */
+/* Copies READY data (data_bytes, rows row_pitch apart) into the caller's
+ * buffer; NA_E_STATE unless READY, NA_E_ARG if capacity is too small. */
+int __cdecl na_observe_sample_read(uint64_t token, void* dst, uint64_t capacity, uint64_t* written);
+/* Cancels an armed request or releases a finished one; idempotent. A sample
+ * whose copy may still run on the GPU is freed only after completion. */
 int __cdecl na_observe_sample_release(uint64_t token);
 
 #ifdef __cplusplus

@@ -1,21 +1,24 @@
-// C9b (A2-R03 second part): asynchronous resource content samples on a real
-// device (WARP on CI). Checks:
-//   - an armed sample is copied at the end of the first submission whose
-//     recorded transitions establish the subresource's state; READY only after
-//     the host fence completed; exact clear colour / depth value; queue,
-//     ticket and the state it transitioned from are reported;
-//   - a subrect is copied with its own extent and row pitch;
-//   - a submission without state evidence leaves the request ARMED; release
-//     then cancels it; an unknown resource is refused;
-//   - the game's resource is left in the state it was in (the next game
-//     barrier from that state executes cleanly on the GPU);
-//   - READY data expires when not released in time.
+// C9b (A2-R03 second part) on a real device (WARP on CI), including the
+// adversarial cases from C9B-REVIEW-1:
+//   happy path: exact colour / depth, subrect extent, provenance; the caller
+//     reads into ITS OWN buffer (R5: no borrowed pointers);
+//   R1: release twice while the copy is stalled on the GPU -> the entry is
+//     kept until completion, then freed by the worker;
+//   R2: the game drops its last reference while the host copy is stalled ->
+//     the host's reference keeps the source alive; correct data;
+//   R4: truncated barrier batch, BEGIN_ONLY split barrier and a last state of
+//     COMMON leave requests ARMED (no stale StateBefore);
+//   R6: subresource out of range and a misaligned BC subrect are refused
+//     before anything reaches the GPU;
+//   scope: stop() ends armed leases (SESSION_ENDED); requests need a session;
+//   the game's states are restored; READY data expires when not released.
 #include "test_support.hpp"
 #include "host_dx12/host_observe.h"
 #include "host_dx12/host_observe_samples.h"
 #include "host_dx12/observe/producers.hpp"
 
 #include <cstring>
+#include <vector>
 
 namespace {
 void __cdecl Sink(const na_event_batch*, void*) {}
@@ -27,16 +30,33 @@ na_sample_info Poll(uint64_t token)
     if (na_observe_sample_poll(token, &i) != NA_OK) i.status = 0;
     return i;
 }
-
-na_sample_info WaitReady(uint64_t token)
+na_sample_info WaitDone(uint64_t token, int ms = 5000)
 {
     na_sample_info i{};
-    for (int k = 0; k < 500; ++k) {
+    for (int k = 0; k < ms / 5; ++k) {
         i = Poll(token);
         if (i.status != NA_SAMPLE_ARMED && i.status != NA_SAMPLE_IN_FLIGHT) break;
-        Sleep(10);
+        Sleep(5);
     }
     return i;
+}
+std::vector<uint8_t> Read(uint64_t token, const na_sample_info& i)
+{
+    std::vector<uint8_t> v(static_cast<size_t>(i.data_bytes));
+    uint64_t got = 0;
+    if (v.empty() || na_observe_sample_read(token, v.data(), v.size(), &got) != NA_OK || got != v.size()) v.clear();
+    return v;
+}
+uint64_t Request(na_object_id res, uint32_t sub = 0, uint32_t x = 0, uint32_t y = 0, uint32_t w = 0, uint32_t h = 0, uint32_t expiry = 0)
+{
+    na_sample_request r{};
+    r.size_bytes = sizeof(r);
+    r.resource = res;
+    r.subresource = sub;
+    r.x = x; r.y = y; r.width = w; r.height = h;
+    r.expiry_ms = expiry;
+    uint64_t t = 0;
+    return na_observe_sample_request(&r, &t) == NA_OK ? t : 0;
 }
 } // namespace
 
@@ -46,6 +66,12 @@ int main()
     if (!test::CreateDevice(d)) return test::SkipNoDevice("observe_sample_test");
     ID3D12Device* dev = d.device.Get();
     REQUIRE(na::observe::InstallProducers(dev, d.queue.Get(), /*hook_queue_execute=*/true));
+    {
+        na_sample_request r{};
+        r.size_bytes = sizeof(r);
+        uint64_t t = 0;
+        CHECK(na_observe_sample_request(&r, &t) == NA_E_STATE); // no session yet
+    }
     na_observe_config cfg{};
     cfg.size_bytes = sizeof(cfg);
     REQUIRE(na_observe_start(&cfg, &Sink, nullptr) == NA_OK);
@@ -53,8 +79,8 @@ int main()
     const uint32_t W = 64, H = 32;
     auto color = test::CreateTexture(dev, W, H, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     auto depth = test::CreateTexture(dev, 32, 16, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
-    auto idle = test::CreateTexture(dev, 8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_NONE);
-    REQUIRE(color && depth && idle);
+    auto bc = test::CreateTexture(dev, 16, 16, DXGI_FORMAT_BC1_UNORM, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_NONE);
+    REQUIRE(color && depth && bc);
     test::ComPtr<ID3D12DescriptorHeap> rtvh, dsvh;
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvh))));
@@ -62,111 +88,175 @@ int main()
     REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dsvh))));
     dev->CreateRenderTargetView(color.Get(), nullptr, rtvh->GetCPUDescriptorHandleForHeapStart());
     dev->CreateDepthStencilView(depth.Get(), nullptr, dsvh->GetCPUDescriptorHandleForHeapStart());
+    const na_object_id color_id = na::observe::IdOf(color.Get()), depth_id = na::observe::IdOf(depth.Get()), bc_id = na::observe::IdOf(bc.Get());
+    REQUIRE(color_id && depth_id && bc_id);
+    CHECK(Request(0xDEAD0000ull) == 0);
 
-    const na_object_id color_id = na::observe::IdOf(color.Get()), depth_id = na::observe::IdOf(depth.Get()), idle_id = na::observe::IdOf(idle.Get());
-    REQUIRE(color_id && depth_id && idle_id);
-
-    // Requests armed BEFORE the submission.
-    na_sample_request rq{};
-    rq.size_bytes = sizeof(rq);
-    rq.resource = color_id;
-    uint64_t t_color = 0, t_sub = 0, t_depth = 0, t_idle = 0, t_bad = 0;
-    REQUIRE(na_observe_sample_request(&rq, &t_color) == NA_OK && t_color);
-    na_sample_request sub = rq;
-    sub.x = 8; sub.y = 4; sub.width = 16; sub.height = 8;
-    REQUIRE(na_observe_sample_request(&sub, &t_sub) == NA_OK);
-    na_sample_request dq = rq;
-    dq.resource = depth_id;
-    REQUIRE(na_observe_sample_request(&dq, &t_depth) == NA_OK);
-    na_sample_request iq = rq;
-    iq.resource = idle_id;
-    REQUIRE(na_observe_sample_request(&iq, &t_idle) == NA_OK);
-    na_sample_request bad = rq;
-    bad.resource = 0xDEAD0000ull;
-    CHECK(na_observe_sample_request(&bad, &t_bad) == NA_E_ARG && t_bad == 0);
-    CHECK(Poll(t_color).status == NA_SAMPLE_ARMED);
-
-    // The game's frame: transitions recorded, clears.
     test::ComPtr<ID3D12CommandAllocator> alloc;
     test::ComPtr<ID3D12GraphicsCommandList> list;
     REQUIRE(SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))));
     REQUIRE(SUCCEEDED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr, IID_PPV_ARGS(&list))));
     REQUIRE(SUCCEEDED(list->Close()));
-    REQUIRE(SUCCEEDED(list->Reset(alloc.Get(), nullptr)));
-    D3D12_RESOURCE_BARRIER b[2] = {test::Transition(color.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
-                                   test::Transition(depth.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_DEPTH_WRITE)};
-    list->ResourceBarrier(2, b);
-    const float clear[4] = {0.25f, 0.5f, 0.75f, 1.0f};
-    list->ClearRenderTargetView(rtvh->GetCPUDescriptorHandleForHeapStart(), clear, 0, nullptr);
-    list->ClearDepthStencilView(dsvh->GetCPUDescriptorHandleForHeapStart(), D3D12_CLEAR_FLAG_DEPTH, 0.375f, 0, 0, nullptr);
-    REQUIRE(SUCCEEDED(list->Close()));
     ID3D12CommandList* ls[] = {list.Get()};
-    d.queue->ExecuteCommandLists(1, ls);
+    const auto record = [&](auto&& body) {
+        d.WaitIdle();
+        REQUIRE(SUCCEEDED(alloc->Reset()));
+        REQUIRE(SUCCEEDED(list->Reset(alloc.Get(), nullptr)));
+        body();
+        REQUIRE(SUCCEEDED(list->Close()));
+    };
 
-    const na_sample_info ci = WaitReady(t_color);
+    // ---- happy path ----
+    const uint64_t t_color = Request(color_id), t_sub = Request(color_id, 0, 8, 4, 16, 8), t_depth = Request(depth_id);
+    const uint64_t t_bad_sub = Request(color_id, 5);          // R6: only 1 mip, 1 slice
+    const uint64_t t_bc = Request(bc_id, 0, 2, 0, 4, 4);      // R6: BC subrect origin not 4-aligned
+    REQUIRE(t_color && t_sub && t_depth && t_bad_sub && t_bc);
+    CHECK(Poll(t_color).status == NA_SAMPLE_ARMED);
+    record([&] {
+        D3D12_RESOURCE_BARRIER b[3] = {test::Transition(color.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
+                                       test::Transition(depth.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_DEPTH_WRITE),
+                                       test::Transition(bc.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)};
+        list->ResourceBarrier(3, b);
+        const float clear[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+        list->ClearRenderTargetView(rtvh->GetCPUDescriptorHandleForHeapStart(), clear, 0, nullptr);
+        list->ClearDepthStencilView(dsvh->GetCPUDescriptorHandleForHeapStart(), D3D12_CLEAR_FLAG_DEPTH, 0.375f, 0, 0, nullptr);
+    });
+    d.queue->ExecuteCommandLists(1, ls);
+    const na_sample_info ci = WaitDone(t_color);
     std::printf("color sample: status %u reason %u %ux%u pitch %u state_before 0x%x ticket %llu\n", ci.status, ci.reason, ci.width, ci.height,
                 ci.row_pitch, ci.state_before, static_cast<unsigned long long>(ci.queue_ticket));
-    CHECK(ci.status == NA_SAMPLE_READY && ci.width == W && ci.height == H && ci.data && ci.row_pitch >= W * 4);
-    CHECK(ci.state_before == D3D12_RESOURCE_STATE_RENDER_TARGET && ci.queue == na::observe::IdOf(d.queue.Get()) && ci.queue_ticket != 0);
-    if (ci.status == NA_SAMPLE_READY && ci.data) {
-        const auto* px = static_cast<const uint8_t*>(ci.data);
-        bool all = true;
-        for (uint32_t y = 0; y < H; ++y)
+    CHECK(ci.status == NA_SAMPLE_READY && ci.width == W && ci.height == H && ci.row_pitch >= W * 4 && ci.state_before == D3D12_RESOURCE_STATE_RENDER_TARGET);
+    CHECK(ci.queue == na::observe::IdOf(d.queue.Get()) && ci.queue_ticket != 0 && ci.session != 0);
+    {
+        const auto px = Read(t_color, ci);
+        bool all = !px.empty();
+        for (uint32_t y = 0; all && y < H; ++y)
             for (uint32_t x = 0; x < W; ++x) {
-                const uint8_t* p = px + y * ci.row_pitch + x * 4;
+                const uint8_t* p = px.data() + y * ci.row_pitch + x * 4;
                 all = all && p[0] >= 63 && p[0] <= 65 && p[1] >= 127 && p[1] <= 129 && p[2] >= 190 && p[2] <= 192 && p[3] == 255;
             }
         CHECK(all);
+        uint8_t tiny[4];
+        uint64_t got = 0;
+        CHECK(na_observe_sample_read(t_color, tiny, sizeof(tiny), &got) == NA_E_ARG && got == 0); // too small: refused, nothing written
     }
-    const na_sample_info si = WaitReady(t_sub);
-    CHECK(si.status == NA_SAMPLE_READY && si.x == 8 && si.y == 4 && si.width == 16 && si.height == 8 && si.data);
-    if (si.data) CHECK(static_cast<const uint8_t*>(si.data)[1] >= 127 && static_cast<const uint8_t*>(si.data)[1] <= 129);
-    const na_sample_info di = WaitReady(t_depth);
+    const na_sample_info si = WaitDone(t_sub);
+    CHECK(si.status == NA_SAMPLE_READY && si.x == 8 && si.y == 4 && si.width == 16 && si.height == 8);
+    const na_sample_info di = WaitDone(t_depth);
     std::printf("depth sample: status %u %ux%u state_before 0x%x\n", di.status, di.width, di.height, di.state_before);
-    CHECK(di.status == NA_SAMPLE_READY && di.state_before == D3D12_RESOURCE_STATE_DEPTH_WRITE && di.data);
-    if (di.data) {
+    CHECK(di.status == NA_SAMPLE_READY && di.state_before == D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    {
+        const auto px = Read(t_depth, di);
         float v = 0;
-        std::memcpy(&v, static_cast<const uint8_t*>(di.data) + 5 * di.row_pitch + 7 * 4, 4);
+        if (px.size() >= 5 * di.row_pitch + 8 * 4) std::memcpy(&v, px.data() + 5 * di.row_pitch + 7 * 4, 4);
         CHECK(v == 0.375f);
     }
-    // No state evidence for `idle` in that submission: still armed. Release cancels.
-    CHECK(Poll(t_idle).status == NA_SAMPLE_ARMED);
-    CHECK(na_observe_sample_release(t_idle) == NA_OK);
-    CHECK(Poll(t_idle).status == 0); // gone
-    CHECK(na_observe_sample_release(t_color) == NA_OK && na_observe_sample_release(t_color) == NA_OK); // idempotent
-    CHECK(na_observe_sample_release(t_sub) == NA_OK);
+    CHECK(WaitDone(t_bad_sub).status == NA_SAMPLE_FAILED && Poll(t_bad_sub).reason == NA_SAMPLE_E_UNSUPPORTED);
+    CHECK(WaitDone(t_bc).status == NA_SAMPLE_FAILED && Poll(t_bc).reason == NA_SAMPLE_E_UNSUPPORTED);
+    for (uint64_t t : {t_color, t_sub, t_depth, t_bad_sub, t_bc}) na_observe_sample_release(t);
+    CHECK(na_observe_sample_release(t_color) == NA_OK); // idempotent
 
-    // The game continues from the states it left: RT -> COPY_SOURCE and
-    // DEPTH_WRITE -> COMMON must be valid, i.e. the host restored them.
-    REQUIRE(SUCCEEDED(alloc->Reset()));
-    REQUIRE(SUCCEEDED(list->Reset(alloc.Get(), nullptr)));
-    D3D12_RESOURCE_BARRIER b2[2] = {test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                                    test::Transition(depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COMMON)};
-    list->ResourceBarrier(2, b2);
-    REQUIRE(SUCCEEDED(list->Close()));
+    // ---- R4: no stale state ----
+    {
+        // (a) last explicit state COMMON (implicit promotion possible) -> stays armed
+        const uint64_t t_common = Request(color_id);
+        record([&] {
+            D3D12_RESOURCE_BARRIER b = test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON);
+            list->ResourceBarrier(1, &b);
+        });
+        d.queue->ExecuteCommandLists(1, ls);
+        d.WaitIdle();
+        Sleep(20);
+        CHECK(Poll(t_common).status == NA_SAMPLE_ARMED);
+        // (b) a split barrier counts only once completed: BEGIN_ONLY then
+        //     END_ONLY -> the END state is the evidence.
+        record([&] {
+            D3D12_RESOURCE_BARRIER b = test::Transition(color.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->ResourceBarrier(1, &b);
+            D3D12_RESOURCE_BARRIER s = test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            s.Flags = D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY;
+            list->ResourceBarrier(1, &s);
+            s.Flags = D3D12_RESOURCE_BARRIER_FLAG_END_ONLY;
+            list->ResourceBarrier(1, &s);
+        });
+        d.queue->ExecuteCommandLists(1, ls);
+        const na_sample_info sp = WaitDone(t_common);
+        CHECK(sp.status == NA_SAMPLE_READY && sp.state_before == D3D12_RESOURCE_STATE_COPY_SOURCE);
+        na_observe_sample_release(t_common);
+        // (c) truncated barrier batch (more transitions than the host records)
+        //     -> the recording's evidence is invalid, the request stays armed.
+        std::vector<test::ComPtr<ID3D12Resource>> many;
+        for (int i = 0; i < 70; ++i)
+            many.push_back(test::CreateTexture(dev, 4, 4, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_NONE));
+        const uint64_t t_trunc = Request(color_id);
+        record([&] {
+            std::vector<D3D12_RESOURCE_BARRIER> bs;
+            bs.push_back(test::Transition(color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET));
+            for (auto& r : many) bs.push_back(test::Transition(r.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE));
+            list->ResourceBarrier(static_cast<UINT>(bs.size()), bs.data());
+        });
+        d.queue->ExecuteCommandLists(1, ls);
+        d.WaitIdle();
+        Sleep(20);
+        CHECK(Poll(t_trunc).status == NA_SAMPLE_ARMED);
+        na_observe_sample_release(t_trunc);
+        // color is RENDER_TARGET again.
+    }
+
+    // ---- R1 + R2: stalled copy, double release, game drops its reference ----
+    {
+        auto victim = test::CreateTexture(dev, 16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        const na_object_id vid = na::observe::IdOf(victim.Get());
+        test::ComPtr<ID3D12Fence> hold;
+        REQUIRE(SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&hold))));
+        const uint64_t t_r1 = Request(color_id), t_r2 = Request(vid);
+        REQUIRE(t_r1 && t_r2);
+        const uint64_t live_before = na::observe::GetProducerStats().samples_live;
+        d.WaitIdle();
+        REQUIRE(SUCCEEDED(alloc->Reset()));
+        REQUIRE(SUCCEEDED(list->Reset(alloc.Get(), nullptr)));
+        D3D12_RESOURCE_BARRIER b[2] = {test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                                       test::Transition(victim.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)};
+        list->ResourceBarrier(2, b);
+        REQUIRE(SUCCEEDED(list->Close()));
+        REQUIRE(SUCCEEDED(d.queue->Wait(hold.Get(), 1)));   // stall everything after this
+        d.queue->ExecuteCommandLists(1, ls);                 // game work + both host copies queue up behind it
+        Sleep(30);
+        CHECK(Poll(t_r1).status == NA_SAMPLE_IN_FLIGHT && Poll(t_r2).status == NA_SAMPLE_IN_FLIGHT);
+        CHECK(na_observe_sample_release(t_r1) == NA_OK && na_observe_sample_release(t_r1) == NA_OK); // R1: twice
+        Sleep(30);
+        CHECK(na::observe::GetProducerStats().samples_live == live_before); // still held: the GPU has not run it
+        victim.Reset();                                      // R2: the game's last reference goes away
+        REQUIRE(SUCCEEDED(hold->Signal(1)));
+        d.WaitIdle();
+        const na_sample_info r2 = WaitDone(t_r2);
+        CHECK(r2.status == NA_SAMPLE_READY && r2.state_before == D3D12_RESOURCE_STATE_COPY_SOURCE);
+        na_observe_sample_release(t_r2);
+        for (int k = 0; k < 200 && na::observe::GetProducerStats().samples_live != 0; ++k) Sleep(5);
+        CHECK(na::observe::GetProducerStats().samples_live == 0); // freed after completion
+        CHECK(dev->GetDeviceRemovedReason() == S_OK);
+    }
+
+    // ---- states restored; expiry ----
+    record([&] {
+        D3D12_RESOURCE_BARRIER b = test::Transition(color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        list->ResourceBarrier(1, &b);
+    });
+    const uint64_t t_exp = Request(color_id, 0, 0, 0, 0, 0, 50);
     d.queue->ExecuteCommandLists(1, ls);
+    CHECK(WaitDone(t_exp).status == NA_SAMPLE_READY);
+    Sleep(150);
+    CHECK(Poll(t_exp).status == NA_SAMPLE_EXPIRED);
+    na_observe_sample_release(t_exp);
     d.WaitIdle();
     CHECK(dev->GetDeviceRemovedReason() == S_OK);
 
-    // Expiry: READY data not released in time goes away.
-    Sleep(60);
-    na_sample_request eq = rq;
-    eq.expiry_ms = 50;
-    eq.resource = color_id;
-    uint64_t t_exp = 0;
-    REQUIRE(na_observe_sample_request(&eq, &t_exp) == NA_OK);
-    REQUIRE(SUCCEEDED(alloc->Reset()));
-    REQUIRE(SUCCEEDED(list->Reset(alloc.Get(), nullptr)));
-    D3D12_RESOURCE_BARRIER b3 = test::Transition(color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    list->ResourceBarrier(1, &b3);
-    REQUIRE(SUCCEEDED(list->Close()));
-    d.queue->ExecuteCommandLists(1, ls);
-    CHECK(WaitReady(t_exp).status == NA_SAMPLE_READY);
-    Sleep(120);
-    CHECK(Poll(t_exp).status == NA_SAMPLE_EXPIRED);
-    na_observe_sample_release(t_exp);
-    na_observe_sample_release(t_depth);
-    d.WaitIdle();
+    // ---- scope: stop ends armed leases ----
+    const uint64_t t_scope = Request(color_id);
+    REQUIRE(t_scope);
     REQUIRE(na_observe_stop() == NA_OK);
+    const na_sample_info sc = WaitDone(t_scope);
+    CHECK(sc.status == NA_SAMPLE_FAILED && sc.reason == NA_SAMPLE_E_SESSION_ENDED);
+    na_observe_sample_release(t_scope);
     return test::finish("observe_sample_test");
 }

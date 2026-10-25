@@ -57,6 +57,7 @@ struct ExecuteToken {
     // Retains bookkeeping through finalization; not a COM reference or GPU lifetime.
     std::shared_ptr<void> queue_state;
     na_object_id queue_id = 0;
+    bool submit_locked = false; // C9B-R3: holds the queue's submission lock until End
 };
 // C9b: the game host's original ExecuteCommandLists, used to submit the host's
 // own sample copies without re-entering the host's execute detour.
@@ -69,6 +70,9 @@ void ExecuteEnd(const ExecuteToken& token, ID3D12CommandQueue* queue, uint32_t c
 // Tests: `probe` runs inside each snapshot copy while the copy holds the
 // buffer's mapping (C9-H3-REVIEW-1 race regression). nullptr removes it.
 void SetSnapshotCopyProbeForTests(void (*probe)(void* user), void* user);
+// Tests: `probe` runs inside Unmap right before it contends for the mapping
+// lock (explicit boundary handshake for the race regression).
+void SetUnmapBoundaryProbeForTests(void (*probe)(void* user), void* user);
 
 // Identity of an observed object (0 = unknown). Any interface pointer of it.
 na_object_id IdOf(const void* object);
@@ -89,6 +93,7 @@ struct ProducerStats {
     uint32_t hooks_installed;
     uint32_t hooks_missing;        // optional interfaces the device does not expose / refused slots
     const char* shared_target_slots; // slots refused because another hooked slot has the same function
+    uint64_t samples_live;           // C9b entries incl. released ones awaiting GPU completion
 };
 ProducerStats GetProducerStats();
 

@@ -24,6 +24,8 @@ bool Emit(const void* event_bytes, uint32_t group);
 
 // True while a consumer is started: producers skip building events otherwise.
 bool Started();
+// Current session and epoch (0, 0 when stopped): sample leases are scoped to them.
+void CurrentScope(na_session_id* session, na_epoch* epoch);
 
 // Snapshot provider used by start()/resync(): must Emit() the inventory
 // baseline (foundational events) and return true when the baseline is

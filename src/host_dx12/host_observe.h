@@ -566,6 +566,10 @@ typedef struct na_copy_region {
     uint32_t box[6];               /* left, top, front, right, bottom, back */
     uint64_t dst_footprint_offset; /* footprint copies (subresource UNKNOWN) */
     uint64_t src_footprint_offset;
+    /* footprint layout, 0 when that side is a subresource index:
+       format, width, height, depth, row pitch */
+    uint32_t dst_footprint[5];
+    uint32_t src_footprint[5];
 } na_copy_region;
 typedef struct na_barrier {
     uint32_t barrier_type;         /* D3D12_RESOURCE_BARRIER_TYPE */
