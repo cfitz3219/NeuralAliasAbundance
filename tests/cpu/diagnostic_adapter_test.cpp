@@ -6,6 +6,70 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <d3dcompiler.h>
+
+// Real GPU work through the production adapter. Test-only idle waits keep
+// allocator reuse valid; the adapter itself must remain fully asynchronous.
+static int RenderProbe(test::Device& d) {
+    D3D12_ROOT_PARAMETER parameter{};parameter.ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
+    D3D12_ROOT_SIGNATURE_DESC rd{1,&parameter,0,nullptr,D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+    test::ComPtr<ID3DBlob> root_blob,error,vs,ps;
+    REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rd,D3D_ROOT_SIGNATURE_VERSION_1,&root_blob,&error)));
+    test::ComPtr<ID3D12RootSignature> root;
+    REQUIRE(SUCCEEDED(d.device->CreateRootSignature(0,root_blob->GetBufferPointer(),root_blob->GetBufferSize(),IID_PPV_ARGS(&root))));
+    const char* shader=R"(
+cbuffer Camera : register(b0) { row_major float4x4 vp; };
+float4 VS(uint id:SV_VertexID):SV_Position {
+    float2 uv=float2((id<<1)&2,id&2);return mul(vp,float4((uv*2-1)*4,3+uv.x,1));
+}
+float4 PS(float4 p:SV_Position):SV_Target {return float4(p.xy/128,0.25,1);}
+)";
+    REQUIRE(SUCCEEDED(D3DCompile(shader,std::strlen(shader),nullptr,nullptr,nullptr,"VS","vs_5_0",0,0,&vs,&error)));
+    REQUIRE(SUCCEEDED(D3DCompile(shader,std::strlen(shader),nullptr,nullptr,nullptr,"PS","ps_5_0",0,0,&ps,&error)));
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};pd.pRootSignature=root.Get();
+    pd.VS={vs->GetBufferPointer(),vs->GetBufferSize()};pd.PS={ps->GetBufferPointer(),ps->GetBufferSize()};
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask=D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask=UINT_MAX;pd.RasterizerState.FillMode=D3D12_FILL_MODE_SOLID;pd.RasterizerState.CullMode=D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable=TRUE;pd.DepthStencilState.DepthEnable=TRUE;
+    pd.DepthStencilState.DepthWriteMask=D3D12_DEPTH_WRITE_MASK_ALL;pd.DepthStencilState.DepthFunc=D3D12_COMPARISON_FUNC_LESS;
+    pd.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;pd.NumRenderTargets=1;
+    pd.RTVFormats[0]=DXGI_FORMAT_R8G8B8A8_UNORM;pd.DSVFormat=DXGI_FORMAT_D32_FLOAT;pd.SampleDesc.Count=1;
+    test::ComPtr<ID3D12PipelineState> pipeline;REQUIRE(SUCCEEDED(d.device->CreateGraphicsPipelineState(&pd,IID_PPV_ARGS(&pipeline))));
+    auto depth=test::CreateTexture(d.device.Get(),128,128,DXGI_FORMAT_D32_FLOAT,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    auto color=test::CreateTexture(d.device.Get(),128,128,DXGI_FORMAT_R8G8B8A8_UNORM,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    auto camera=test::CreateBuffer(d.device.Get(),256,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+    REQUIRE(depth && color && camera);
+    void* cpu=nullptr;REQUIRE(SUCCEEDED(camera->Map(0,nullptr,&cpu)));std::memset(cpu,0,256);
+    const float matrix[]={1.3f,0,0,0,0,1.8f,0,0,0,0,30.0f/29.9f,-3.0f/29.9f,0,0,1,0};
+    std::memcpy(cpu,matrix,sizeof(matrix));
+    test::ComPtr<ID3D12DescriptorHeap> rt_heap,ds_heap;
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,1,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
+    REQUIRE(SUCCEEDED(d.device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&rt_heap))));hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+    REQUIRE(SUCCEEDED(d.device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&ds_heap))));
+    const auto rt=rt_heap->GetCPUDescriptorHandleForHeapStart(),ds=ds_heap->GetCPUDescriptorHandleForHeapStart();
+    d.device->CreateRenderTargetView(color.Get(),nullptr,rt);d.device->CreateDepthStencilView(depth.Get(),nullptr,ds);
+    test::ComPtr<ID3D12CommandAllocator> allocator;test::ComPtr<ID3D12GraphicsCommandList> list;
+    REQUIRE(SUCCEEDED(d.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator))));
+    REQUIRE(SUCCEEDED(d.device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,IID_PPV_ARGS(&list))));
+    REQUIRE(SUCCEEDED(list->Close()));
+    const auto start=GetTickCount64();
+    while(GetTickCount64()-start<4500) {
+        REQUIRE(SUCCEEDED(allocator->Reset()));REQUIRE(SUCCEEDED(list->Reset(allocator.Get(),nullptr)));
+        D3D12_RESOURCE_BARRIER barriers[]={test::Transition(depth.Get(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_DEPTH_WRITE),
+            test::Transition(color.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_RENDER_TARGET)};
+        list->ResourceBarrier(2,barriers);list->SetPipelineState(pipeline.Get());list->SetGraphicsRootSignature(root.Get());
+        list->SetGraphicsRootConstantBufferView(0,camera->GetGPUVirtualAddress());
+        D3D12_VIEWPORT viewport{0,0,128,128,0,1};D3D12_RECT scissor{0,0,128,128};
+        list->RSSetViewports(1,&viewport);list->RSSetScissorRects(1,&scissor);list->OMSetRenderTargets(1,&rt,FALSE,&ds);
+        const float clear[]={0,0,0,1};list->ClearRenderTargetView(rt,clear,0,nullptr);list->ClearDepthStencilView(ds,D3D12_CLEAR_FLAG_DEPTH,1,0,0,nullptr);
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);list->DrawInstanced(3,1,0,0);
+        for(auto& b:barriers) std::swap(b.Transition.StateBefore,b.Transition.StateAfter);
+        list->ResourceBarrier(2,barriers);REQUIRE(SUCCEEDED(list->Close()));
+        ID3D12CommandList* lists[]={list.Get()};d.queue->ExecuteCommandLists(1,lists);d.WaitIdle();Sleep(20);
+    }
+    camera->Unmap(0,nullptr);
+    return 0;
+}
 
 int main() {
     wchar_t exe[MAX_PATH]{};GetModuleFileNameW(nullptr,exe,MAX_PATH);
@@ -47,6 +111,7 @@ int main() {
     fixture.event.hdr.size_bytes=sizeof(fixture);
     fixture.matrix[0]=fixture.matrix[5]=fixture.matrix[10]=fixture.matrix[15]=1;
     REQUIRE(na::observe_internal::Emit(&fixture,NA_GROUP_SNAPSHOT));
+    REQUIRE(RenderProbe(d)==0);
     // Stop drains the real transport, including its final batch, before freeing context.
     na_adapter_stop();na_adapter_stop();
     std::ifstream file(log);const std::string text((std::istreambuf_iterator<char>(file)),{});
@@ -58,8 +123,9 @@ int main() {
     CHECK(text.find("\"execution_qualified\":false")!=std::string::npos);
     CHECK(text.find("\"signal\":\"depth\"")!=std::string::npos);
     CHECK(text.find("\"signal\":\"scene_color\"")!=std::string::npos);
-    CHECK(text.find("Missing or mismatched session/epoch/submission/queue/recording identity")!=std::string::npos);
-    CHECK(text.find("No intact content version at scene boundary; acquire earlier snapshot")!=std::string::npos);
-    CHECK(text.find("\"confidence\":\"candidate\"")==std::string::npos);
+    CHECK(text.find("\"confidence\":\"candidate\"")!=std::string::npos);
+    CHECK(text.find("\"matched_execution\":true")!=std::string::npos);
+    CHECK(text.find("\"scalar_decoded\":true")!=std::string::npos);
+    CHECK(text.find("\"type\":\"gpu_camera_hypothesis\"")!=std::string::npos);
     return test::finish("diagnostic_adapter");
 }

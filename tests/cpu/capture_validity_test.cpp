@@ -36,6 +36,12 @@ Batch Snapshot(uint64_t epoch=1,uint32_t support=NA_CAP_SUPPORTED) {
 }
 }
 int main() { return test::run({
+    {"known pipeline with unknown optional fields keeps inventory identity", [] {
+        CaptureValidity v;auto s=Status();Snapshot().Send(v,s);Batch b;
+        na_ev_pipeline_created e{};e.pipeline=99;e.depth_enable=NA_UNKNOWN_U32;
+        e.hdr.flags=NA_EVF_FOUNDATIONAL|NA_EVF_METHOD_UNOBSERVED;
+        b.Add(e,NA_EV_PIPELINE_CREATED);b.Send(v,s);CHECK(v.InventoryConsistent() && v.CaptureContiguous());
+    }},
     {"preexisting creation unknown fields are not inventory loss but truncation is", [] {
         for(bool truncated:{false,true}) {
             CaptureValidity v;auto s=Status();Snapshot().Send(v,s);Batch b;

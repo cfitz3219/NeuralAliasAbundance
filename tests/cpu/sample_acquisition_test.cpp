@@ -7,7 +7,7 @@ struct Fake : SampleApi {
     na_sample_info info{};
     std::vector<uint8_t> bytes;
     uint64_t next=1; unsigned reads=0,releases=0;
-    bool fail_read=false,short_read=false,fail_request=false;
+    bool fail_read=false,short_read=false,fail_request=false,buffer=false;
     Fake() {
         info.status=NA_SAMPLE_READY; info.session=1; info.epoch=2; info.resource=3;
         info.queue=9; info.queue_ticket=17; info.width=2; info.height=2; info.format=40;
@@ -16,7 +16,9 @@ struct Fake : SampleApi {
         std::memcpy(bytes.data(),values,8); std::memcpy(bytes.data()+256,values+2,8);
     }
     int Request(const na_sample_request& r,uint64_t& t) override {
-        CHECK(r.width==0 && r.height==0); if(fail_request) return NA_E_STATE;
+        if(buffer) CHECK(r.width==64 && r.height==1 && r.x==256 && r.y==1);
+        else CHECK(r.width==0 && r.height==0);
+        if(fail_request) return NA_E_STATE;
         t=next++; return NA_OK;
     }
     int Poll(uint64_t,na_sample_info& i) override { i=info; return NA_OK; }
@@ -28,6 +30,18 @@ struct Fake : SampleApi {
 };
 static SamplePlan plan() { return {3,0,2,2,40}; }
 int main() { return test::run({
+    {"buffer leases preserve 64-bit offsets and reject wrong completion ranges", [] {
+        for(int mode=0;mode<4;++mode) {
+            Fake f;f.buffer=true;SampleAcquisition a(f);a.Scope(1,2);
+            SamplePlan p{3,0,64,1,0,true,(1ull<<32)+256};CHECK(a.Begin(p));
+            f.info.format=0;f.info.width=64;f.info.height=1;f.info.x=256;f.info.y=1;
+            f.info.row_pitch=64;f.info.data_bytes=64;f.bytes.resize(64);
+            if(mode==1) ++f.info.x;if(mode==2) f.info.y=0;if(mode==3) ++f.info.row_pitch;
+            const auto out=a.Pump();CHECK(out.size()==1 && out[0].plan.offset==p.offset);
+            CHECK((out[0].status==AcquisitionStatus::Ready)==(mode==0));
+            CHECK(out[0].bytes.size()==(mode==0?64u:0u));
+        }
+    }},
     {"16-bit scalar samples preserve padded rows and explicit interpretation", [] {
         AcquiredSample s{};s.status=AcquisitionStatus::Ready;s.info.status=NA_SAMPLE_READY;s.info.width=2;s.info.height=2;
         s.info.row_pitch=8;s.info.data_bytes=12;s.bytes.resize(12);
