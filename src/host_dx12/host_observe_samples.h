@@ -42,8 +42,10 @@
  *
  * Packed depth-stencil (D24S8, D32S8X24 and typeless families): the request
  * names a plane-0 subresource (mip/array index); only the depth plane is
- * transitioned and copied, and na_sample_info.format is that plane's copy
- * format (e.g. R32_TYPELESS / R24G8_TYPELESS), not the packed resource format.
+ * transitioned and copied. na_sample_info.format describes the copied bytes:
+ * R24_UNORM_X8_TYPELESS (D24S8 family: 24-bit UNORM depth in the low bits of
+ * each 32-bit texel) or R32_FLOAT (D32S8X24 family). Both families' plane-0
+ * footprints are R32_TYPELESS in D3D12, which would be ambiguous.
  *
  * Buffer ranges (C10, execution-time constant data): for a BUFFER resource,
  * x | (y << 32) is the byte offset, width the byte count (1..65536), height 0

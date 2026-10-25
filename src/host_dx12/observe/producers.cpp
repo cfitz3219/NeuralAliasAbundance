@@ -2524,6 +2524,23 @@ bool depth_resource(const D3D12_RESOURCE_DESC& d)
     return depth_format(d.Format) || (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
 }
 
+// The copyable footprint of plane 0 is R32_TYPELESS for BOTH packed families,
+// but the bits differ (24-bit UNORM in the low bits vs a 32-bit float), so the
+// sample reports an unambiguous format describing the copied bytes.
+DXGI_FORMAT depth_plane_format(DXGI_FORMAT f)
+{
+    switch (f) {
+    case DXGI_FORMAT_D24_UNORM_S8_UINT: case DXGI_FORMAT_R24G8_TYPELESS:
+    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS: case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+        return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: case DXGI_FORMAT_R32G8X24_TYPELESS:
+    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS: case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+        return DXGI_FORMAT_R32_FLOAT;
+    default:
+        return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
 // Validates the request against the resource (C9B-R6). Fills the region.
 uint32_t validate_locked(Sample& s, ID3D12Device* dev, const D3D12_RESOURCE_DESC& d)
 {
@@ -2716,7 +2733,7 @@ void start_copy_locked(Sample& s, ID3D12Resource* res, ID3D12CommandQueue* q, D3
     }
     s.row_pitch = fp.Footprint.RowPitch;
     s.bytes = total;
-    s.format = s.planar ? fp.Footprint.Format : d.Format; // planar: the copied plane's format
+    s.format = s.planar ? depth_plane_format(d.Format) : d.Format;
     s.queue = qid;
     s.ticket = ticket;
     s.state_before = state;

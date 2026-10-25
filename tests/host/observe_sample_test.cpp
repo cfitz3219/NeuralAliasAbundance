@@ -501,7 +501,8 @@ int main()
             std::printf("packed depth %s: status %u reason %u plane format %u %ux%u state_before 0x%x depth %.6f\n", k ? "D32S8X24" : "D24S8", pi.status,
                         pi.reason, pi.format, pi.width, pi.height, pi.state_before, v);
             CHECK(pi.status == NA_SAMPLE_READY && pi.width == 32 && pi.height == 16 && pi.state_before == D3D12_RESOURCE_STATE_DEPTH_READ);
-            CHECK(pi.format != static_cast<uint32_t>(fmts[k])); // the copied plane's format, not the packed resource's
+            // Unambiguous plane format (both footprints are R32_TYPELESS in D3D12).
+            CHECK(pi.format == static_cast<uint32_t>(k ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R24_UNORM_X8_TYPELESS));
             CHECK(v > 0.37499 && v < 0.37501);
             na_observe_sample_release(t_pl);
             d.WaitIdle();
