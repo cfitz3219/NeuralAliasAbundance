@@ -1,3 +1,10 @@
+## 2026-10-24 — Production acquisition/depth checkpoint
+
+PR27 e55c191 includes Claude PR37 ab625be and new bounded worker-side SampleAcquisition/HostSampleApi, exact actual queue/ticket camera association and temporal depth corroboration. RTX fixture acquires two completed32x16 D32 samples (3968 bytes each), validates496 pixels with16 border exclusions. CPU ownership/expiry/cancellation/shape/row-layout and temporal scope/reset/reverse-Z tests pass. Fixture-v2 temporal corpus:30 valid pairs consistent,30 corrupted contradicted,6 camera-cut unavailable; no world-position/visibility oracle supplied. Sparse finite MV sentinel follow-up fixed with explicit outlier accounting. Full Release and53/53 non-GPU-labelled local CTests pass, zero skips. Latest CI pending.
+
+Claude accepted prior R2–R6. PR37 Signal-failure quarantine and plane rejection tests pass; interleaving probe is still timing-assisted, refinement requested. Claude owns off-by-default read-only host activation/worker, Astra owns evidence consumers/A5/A9. R1 still needs qualified live camera/frame association, semantic corroboration/visibility and preserved pre-HUD color; submission-end bytes cannot recover overwritten scene contents. A5 >=95% end-to-end fixture acceptance and A9 actual Anno report remain open; temporal agreement is not their substitute. No game deployment, live activation or effect promotion. Journal and interface: integration src/providers/discovery/{CAPTURE-WORKLOG.md,PRODUCTION-EVIDENCE.md}.
+
+---
 ## 2026-10-24 — Consumer corrections CI confirmed
 
 PR27 e631083 passes all3 CI jobs40150308066 (Linux, Windows, Windows with public NVIDIA SDK headers), alongside full Release/local49/49 zero skips. Merge-tree is clean against current main; all-branch fetch found no later Claude producer revision than c15881d. Supersedes latest-CI-pending above. Cross-review requested for R2–R6 corrections; R1 production evidence/A5 acceptance/A9 and Claude's adversarial producer qualifications remain open. No live consumer enablement or deployment; no user attendance required for this checkpoint.
