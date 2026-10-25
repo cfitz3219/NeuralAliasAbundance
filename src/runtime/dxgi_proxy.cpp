@@ -23,6 +23,7 @@ template<class Function> Function resolve(const char* name) {
     return module?reinterpret_cast<Function>(GetProcAddress(module,name)):nullptr;
 }
 HRESULT factory(const char* name,REFIID iid,void** result) {
+    na::host::WaitForObserveInstall(); // G3-03: game objects created under observation
     if(!result) return E_POINTER;
     *result=nullptr;
     using Function=HRESULT(WINAPI*)(REFIID,void**);
@@ -38,6 +39,7 @@ extern "C" HRESULT WINAPI AbundanceCreateDXGIFactory1(REFIID iid,void** result) 
     return factory("CreateDXGIFactory1",iid,result);
 }
 extern "C" HRESULT WINAPI AbundanceCreateDXGIFactory2(UINT flags,REFIID iid,void** result) {
+    na::host::WaitForObserveInstall(); // G3-03
     if(!result) return E_POINTER;
     *result=nullptr;
     using Function=HRESULT(WINAPI*)(UINT,REFIID,void**);
