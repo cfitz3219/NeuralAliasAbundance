@@ -1958,11 +1958,13 @@ struct On<sl::list::OMSetRenderTargets> {
                 // Single range: consecutive descriptors from rts[0].
                 const D3D12_CPU_DESCRIPTOR_HANDLE h = single ? D3D12_CPU_DESCRIPTOR_HANDLE{rts[0].ptr + static_cast<SIZE_T>(i) * descriptor_increment_cached(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)} : rts[i];
                 uint32_t slot = 0;
-                refs[m++] = view_ref_locked(heap_for_cpu_locked(h.ptr, &slot), slot);
+                DescHeap* heap = heap_for_cpu_locked(h.ptr, &slot);
+                refs[m++] = view_ref_locked(heap, slot);
             }
             if (dsv) {
                 uint32_t slot = 0;
-                refs[m++] = view_ref_locked(heap_for_cpu_locked(dsv->ptr, &slot), slot);
+                DescHeap* heap = heap_for_cpu_locked(dsv->ptr, &slot);
+                refs[m++] = view_ref_locked(heap, slot);
             }
         }
         emit_op(r, NA_OP_OM_SET_RENDER_TARGETS, {std::min<UINT>(n, 8), dsv ? 1u : 0u}, refs, m * static_cast<uint32_t>(sizeof(na_view_ref)), sizeof(na_view_ref), 0,
