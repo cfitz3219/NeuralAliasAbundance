@@ -43,3 +43,22 @@ explicitly reviewed pass-boundary mechanism; do not relabel final color.
 Claude owns the off-by-default read-only host activation/worker integration.
 Astra owns these consumers, fixture accuracy evidence and the Anno report.
 No game deployment or live activation is part of this checkpoint.
+
+## Completion path for diagnostic confirmation
+
+`classifier/production_checks.hpp` now combines metadata and content checks:
+`ConfirmDepth` ties the main-scene write to temporal depth evidence;
+`ConfirmSceneColor` checks a preserved source actually consumed by the final
+composition against final color outside bounded later overlay draws; and
+`ConfirmMotion` derives the visibility estimate from depth/camera agreement
+before evaluating candidate vectors. The latter requires no oracle stable mask.
+Color requires no foreground/alpha oracle. H2 must establish source/version,
+presentation lineage, complete write coverage and overlay bounds; missing
+evidence returns Unavailable rather than inventing those facts.
+
+`Confirmation::Supported` means a diagnostic candidate supported by that
+observed model, never a trusted DLSS input. The three APIs return explicit
+reasons/coverage and accept observable data rather than fixture-only truth.
+Unknown camera association and overwritten scene sources remain legitimate
+per-game unknowns to report. A5's fixed fixture-v2 acceptance measurement is in
+docs/A5-ACCEPTANCE.md; generic host acquisition accuracy is a separate metric.
