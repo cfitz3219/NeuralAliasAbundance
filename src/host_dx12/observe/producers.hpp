@@ -59,8 +59,7 @@ struct ExecuteToken {
     std::shared_ptr<void> queue_state;
     na_object_id queue_id = 0;
     bool submit_locked = false; // C9B-R3: holds the queue's submission lock until End
-    uint64_t nested_generation = 0;
-    bool nested_unlocked = false;
+    bool nested_unlocked = false; // this occurrence bypassed serialization (nested in a forwarded submission)
 };
 // C9b: the game host's original ExecuteCommandLists, used to submit the host's
 // own sample copies without re-entering the host's execute detour.

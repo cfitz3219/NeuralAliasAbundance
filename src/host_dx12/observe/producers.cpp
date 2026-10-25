@@ -140,10 +140,20 @@ thread_local bool t_host_work = false;
 // one (driver/runtime re-entry, on ANY queue) takes no lock, so two threads
 // re-entering each other's queues can never deadlock.
 thread_local int t_submit_depth = 0;
-// Any bypassed queue operation can signal an application fence before another
-// queue's copy. Conservatively invalidate outstanding sample provenance across
-// queues; a later clean submission can acquire fresh evidence.
-std::atomic<uint64_t> g_nested_generation{0};
+// Copy ordering window (ASTRA-P3-R8 follow-up, per queue): from the start of
+// the evidence submission until the host copy is submitted, no other operation
+// may start on that queue. Unlocked operations (nested re-entry from another
+// thread's forwarded submission, or a submitter that began before any sample
+// was armed) are detected because every observed operation begins an
+// occurrence and takes a ticket. Once the copy is submitted, the queue's FIFO
+// order puts every later operation (including application fence signals)
+// after it, so later operations cannot invalidate it.
+thread_local QueueState* t_service_qs = nullptr;
+thread_local uint64_t t_service_ticket = 0;
+bool ordering_window_intact()
+{
+    return t_service_qs && t_service_qs->occurrences.LastTicket() == t_service_ticket;
+}
 
 std::atomic<bool> g_lists_hooked{false};
 void** g_device_table = nullptr; // the device table whose entries are ours
@@ -973,7 +983,7 @@ bool end_occurrence(const ExecuteToken& t)
 {
     auto qs = std::static_pointer_cast<QueueState>(t.queue_state);
     const bool overlap = !qs || qs->occurrences.End({t.ticket,t.overlap_gen,t.overlapped_at_entry});
-    return overlap || t.nested_unlocked || g_nested_generation.load() != t.nested_generation;
+    return overlap || t.nested_unlocked; // a nested occurrence bypassed serialization
 }
 void sync_event(uint32_t kind, const ExecuteToken& t, ID3D12Fence* f, UINT64 value, HRESULT hr)
 {
@@ -2327,7 +2337,7 @@ struct Sample {
     bool buffer = false;              // C10: upload-heap buffer range (execution-time constant data)
     uint64_t offset = 0;              // buffer byte offset (x | y << 32)
     bool planar = false;              // packed depth-stencil: plane 0 (depth) copied
-    uint64_t nested_generation = 0;   // clean from submit entry through GPU completion
+    bool order_ambiguous = false;     // another operation began on the queue before the copy was submitted
     bool gpu_objects() const { return readback || alloc || list || fence || source; }
 };
 // C9B-REVIEW-2 #1: the sample store is immortal (never destroyed), so the
@@ -2410,8 +2420,6 @@ void worker_tick_locked()
         const bool in_scope = session && session == s.session && epoch == s.epoch;
         if (s.fence) {
             const uint64_t done = s.fence->GetCompletedValue();
-            if (s.status == NA_SAMPLE_IN_FLIGHT && s.nested_generation != g_nested_generation.load())
-                fail(s, NA_SAMPLE_FAILED, NA_SAMPLE_E_ORDER_AMBIGUOUS);
             if (done == UINT64_MAX) { // device removed: nothing can still run
                 free_gpu_objects(s);
                 if (s.status == NA_SAMPLE_IN_FLIGHT || s.status == NA_SAMPLE_FAILED) fail(s, NA_SAMPLE_DEVICE_LOST, NA_SAMPLE_OK);
@@ -2629,6 +2637,8 @@ void start_buffer_copy_locked(Sample& s, ID3D12Resource* res, ID3D12Device* dev,
         if (fwd) fwd(q, 1, ls);
         else q->ExecuteCommandLists(1, ls);
         submitted = true;
+        // An operation that began before this point may precede the copy.
+        if (!ordering_window_intact()) s.order_ambiguous = true;
         s.signaled = !g_fail_sample_signal.load() && SUCCEEDED(q->Signal(s.fence, s.fence_value));
     }
     t_host_work = false;
@@ -2648,6 +2658,7 @@ void start_buffer_copy_locked(Sample& s, ID3D12Resource* res, ID3D12Device* dev,
     s.ticket = ticket;
     s.state_before = D3D12_RESOURCE_STATE_GENERIC_READ;
     if (!s.signaled) return fail(s, NA_SAMPLE_FAILED, NA_SAMPLE_E_SUBMIT_FAILED); // quarantined, see worker
+    if (s.order_ambiguous) return fail(s, NA_SAMPLE_FAILED, NA_SAMPLE_E_ORDER_AMBIGUOUS); // objects stay until the fence
     s.status = NA_SAMPLE_IN_FLIGHT;
 }
 
@@ -2731,6 +2742,8 @@ void start_copy_locked(Sample& s, ID3D12Resource* res, ID3D12CommandQueue* q, D3
         if (fwd) fwd(q, 1, ls);
         else q->ExecuteCommandLists(1, ls);
         submitted = true;
+        // An operation that began before this point may precede the copy.
+        if (!ordering_window_intact()) s.order_ambiguous = true;
         s.signaled = !g_fail_sample_signal.load() && SUCCEEDED(q->Signal(s.fence, s.fence_value));
     }
     t_host_work = false;
@@ -2746,6 +2759,7 @@ void start_copy_locked(Sample& s, ID3D12Resource* res, ID3D12CommandQueue* q, D3
     s.ticket = ticket;
     s.state_before = state;
     if (!s.signaled) return fail(s, NA_SAMPLE_FAILED, NA_SAMPLE_E_SUBMIT_FAILED); // quarantined, see worker
+    if (s.order_ambiguous) return fail(s, NA_SAMPLE_FAILED, NA_SAMPLE_E_ORDER_AMBIGUOUS); // objects stay until the fence
     s.status = NA_SAMPLE_IN_FLIGHT;
 }
 
@@ -2871,12 +2885,14 @@ void acquire_sample_sources(ID3D12CommandQueue* q, uint32_t count, ID3D12Command
 // submission lock: copies for every armed sample whose state this
 // submission's evidence establishes (C9B-R4) and whose source was acquired
 // before the submission (C9B-REVIEW-2 #2).
-void service_samples(ID3D12CommandQueue* q, na_object_id qid, uint64_t ticket, uint32_t count, ID3D12CommandList* const* lists,
-                     uint64_t nested_generation)
+void service_samples(ID3D12CommandQueue* q, QueueState* qs, na_object_id qid, uint64_t ticket, uint32_t count, ID3D12CommandList* const* lists)
 {
     if (t_prerefs.empty()) return;
     if (g_acquire_probe) g_acquire_probe();
-    if (g_nested_generation.load() != nested_generation) return;
+    t_service_qs = qs;
+    t_service_ticket = ticket;
+    struct Reset { ~Reset() { t_service_qs = nullptr; } } reset;
+    if (!ordering_window_intact()) return; // another operation began on this queue: no copy (stays armed)
     const D3D12_COMMAND_LIST_TYPE type = q->GetDesc().Type;
     std::vector<ListState::StateNote> notes;
     const bool notes_ok = submission_notes(count, lists, notes);
@@ -2887,7 +2903,7 @@ void service_samples(ID3D12CommandQueue* q, na_object_id qid, uint64_t ticket, u
     na::observe_internal::CurrentScope(&session, &epoch);
     std::lock_guard<std::mutex> lock(g_samples_m);
     for (auto& sp : g_samples) {
-        if (g_nested_generation.load() != nested_generation) break;
+        if (!ordering_window_intact()) break;
         Sample& s = *sp;
         if (s.status != NA_SAMPLE_ARMED || s.released || !scope_check_locked(s, session, epoch)) continue;
         auto pre = std::find_if(t_prerefs.begin(), t_prerefs.end(), [&](const PreRef& p) { return p.token == s.token; });
@@ -2896,7 +2912,6 @@ void service_samples(ID3D12CommandQueue* q, na_object_id qid, uint64_t ticket, u
         if (!sample_eligible(s, notes_ok, notes, binds, type, &state)) continue;
         ID3D12Resource* res = pre->res;
         t_prerefs.erase(pre);
-        s.nested_generation = nested_generation;
         start_copy_locked(s, res, q, type, state, qid, ticket);
     }
     recount_armed_locked();
@@ -3071,17 +3086,14 @@ ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue, uint32_t count, ID3D12Comma
     // QueueOccurrences). Nested occurrences never service samples.
     if (t_submit_depth > 0 && !t_host_work) {
         g_c.nested_unlocked.fetch_add(1);
-        g_nested_generation.fetch_add(1);
         t.nested_unlocked = true;
     }
     if (!t_host_work && t_submit_depth == 0 && g_armed.load(std::memory_order_acquire)) { // C9B-R3
         qs->submit_m.lock();
         ++t_submit_depth;
         t.submit_locked = true;
-        t.nested_generation = g_nested_generation.load();
         acquire_sample_sources(queue, count, lists); // before the original runs (C9B-REVIEW-2 #2)
     }
-    if (!t.submit_locked) t.nested_generation = g_nested_generation.load();
     const auto occurrence = qs->occurrences.Begin();
     t.queue_state = qs;
     t.queue_id = qid;
@@ -3141,7 +3153,7 @@ void ExecuteEnd(const ExecuteToken& t, ID3D12CommandQueue* queue, uint32_t count
     // C9b: only a clean occurrence whose submission we serialized is sampled;
     // nothing observed can run on this queue between it and the host copy.
     if (!t_host_work && t.submit_locked && !ambiguous)
-        service_samples(queue, t.queue_id, t.ticket, count, lists, t.nested_generation);
+        service_samples(queue, std::static_pointer_cast<QueueState>(t.queue_state).get(), t.queue_id, t.ticket, count, lists);
     if (t.submit_locked) drop_prerefs(); // unused references (ambiguous, released, no evidence)
     unlock_submission(t);
 }

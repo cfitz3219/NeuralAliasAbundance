@@ -14,6 +14,13 @@ public:
         ++active_;
         return {++ticket_, generation_, overlap};
     }
+    // The ticket of the most recent occurrence to begin on this queue. If it is
+    // still a given submission's ticket, no other operation has started on the
+    // queue since that submission began (host copies create no occurrence).
+    uint64_t LastTicket() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return ticket_;
+    }
     bool End(const Token& t) {
         std::lock_guard<std::mutex> lock(mutex_);
         const bool ambiguous = t.overlapped || t.generation != generation_;

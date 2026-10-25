@@ -38,7 +38,9 @@
 //      the GPU read (not the submission-time CPU bytes); an unbound range stays
 //      armed;
 //   R8: two threads each holding their queue's submission lock re-enter the
-//      other queue: no deadlock, neither sample gains ordering qualification.
+//      other queue: no deadlock, and since each re-entry began inside the
+//      other queue's copy window, neither sample is copied (both stay ARMED);
+//      a nested operation after a copy was submitted leaves it READY.
 #include "test_support.hpp"
 #include "host_dx12/host_observe.h"
 #include "host_dx12/host_observe_samples.h"
@@ -569,8 +571,11 @@ int main()
         CHECK(Poll(t_unbound).status == NA_SAMPLE_ARMED); // no submission bound that range: no evidence
         na_observe_sample_release(t_cb);
         na_observe_sample_release(t_unbound);
-        // A bypassed operation while a copy is pending invalidates provenance
-        // even after ExecuteEnd returned. GPU ownership still lasts to its fence.
+        // A bypassed operation that begins AFTER the copy was submitted is
+        // FIFO-ordered after the copy on that queue (as is any application fence
+        // signal), so it cannot change the bytes the copy reads: still READY.
+        // (An operation inside the window before the copy is the cross-queue
+        // case above, which leaves the samples ARMED.)
         test::ComPtr<ID3D12Fence> pending_hold, nested_fence;
         REQUIRE(SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&pending_hold))));
         REQUIRE(SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&nested_fence))));
@@ -586,9 +591,9 @@ int main()
         na::observe::ExecuteEnd(outer, d.queue.Get(), 0, nullptr);
         REQUIRE(SUCCEEDED(pending_hold->Signal(1)));
         d.WaitIdle();
-        const auto invalid = WaitDone(pending);
-        CHECK(invalid.status == NA_SAMPLE_FAILED && invalid.reason == NA_SAMPLE_E_ORDER_AMBIGUOUS);
-        std::printf("pending camera copy after nested queue signal: status %u reason %u\n", invalid.status, invalid.reason);
+        const auto after = WaitDone(pending);
+        CHECK(after.status == NA_SAMPLE_READY);
+        std::printf("pending camera copy, nested queue signal after the copy was submitted: status %u reason %u\n", after.status, after.reason);
         na_observe_sample_release(pending);
         na_observe_sample_release(still_armed);
         // Wait for this test's deferred GPU ownership to drain before the next
