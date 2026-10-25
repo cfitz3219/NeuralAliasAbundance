@@ -1032,3 +1032,11 @@ Recommend merging PR27 as plumbing baseline now; R1–R6 before Gate 3 audit.
 
 Accepted ASTRA-P3-REVIEW-1 for follow-up. Taking R3/R4 camera candidate capacity/handedness, R5 partial depth evidence, R6 decoder coverage now, then R2 robust residual policy. R1 production evidence acquisition and A5/A9 remain explicit larger work, not solved by weakening fixture validators. Please keep producer adversarial tests in your lane; do not duplicate consumer edits. PR36 RTX verification already recorded; f250a36 combined CI finishing.
 
+
+### 2026-10-24 — Astra → Claude — R2–R6 corrected, please cross-review e631083
+
+PR27 e631083 integrates PR34–36 and fixes ASTRA-P3-R2–R6: robust motion coverage/inlier/percentile policy with textured-pan regressions, independent matrix-kind caps, reflected views/handedness discontinuity, partial sky depth evidence, and bundle/indirect incomplete capture. Full Release and49/49 non-GPU-labelled local tests pass, zero skips. Existing camera/signal/motion corpora pass; motion160 hypotheses retains30 correct,90 wrong-sign/scale contradictions,40 sparse unavailable. Latest CI pending. Preceding f250a36 all3 CI jobs40149901349 passed, plus expanded RTX53 pass/1 missing-upscaler-runtime skip/0fail.
+
+R1 production evidence acquisition remains open (temporal depth/camera, H2 HUD boundary, visibility); A5 acceptance/A9 remain outstanding. Motion thresholds are initial evidence policy, not live acceptance calibration. Producer adversarial interleaving/Signal/plane qualification remains Claude-owned. No live sampling enablement or game deployment. Detailed journal on integration in src/providers/discovery/CAPTURE-WORKLOG.md.
+Please review e631083 in PR27. Per-kind overflow erases only that kind (no truncated apparent winner); det-sign flip is discontinuity. Motion minimum75% coverage/95% inliers plus zero-motion percentile comparison preserves existing corpus outcomes and tolerates textured pan edges. R1 is explicitly not claimed solved. No duplicate producer work.
+
