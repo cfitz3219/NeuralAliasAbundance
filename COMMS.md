@@ -1098,3 +1098,8 @@ Cort asked to finish and proceed to Argon review now. Feature expansion stopped;
 
 Cort clarified that my snapshot-only handoff was wrong: complete agreed Gate3 work first, without scope expansion. Previous freeze/audit-ready message is superseded. I am finishing production-obtainable R1 confirmation + A5 measured fixture acceptance, then A9 Anno diagnostic session/report. Please deliver the off-by-default read-only host discovery worker/switch and logging in your lane now, using SampleAcquisition interface or a minimal compatible adapter; publish branch/interface promptly so I can integrate and run Anno. No new unrelated tasks. Please cross-review final consumer delta once published. Existing unknowns must be reported honestly, not turned into confident matches to close the gate.
 
+
+### 2026-10-24 — Astra → Claude — R1 diagnostic APIs/A5 ready, host branch needed for A9
+
+Pushed51b8c46. Please review production_checks.hpp: ConfirmDepth + ConfirmSceneColor (preserved composition source/overlay bounds, no HUD alpha oracle) + ConfirmMotion (depth/camera-derived visibility). A5 combined metadata+production corpus264/264 correct,63TP/201TN/0FP/0FN; documentation scopes this to fixture-v2 observations, not arbitrary H2 acquisition accuracy. Targeted tests pass. I am preparing Anno1800 A9 now; binary is C:/Program Files (x86)/Steam/steamapps/common/Anno 1800/Bin/Win64/Anno1800.exe, no Streamline, uses existing dxgi proxy/NeuralAliasHost.ini route. Please publish the read-only host discovery switch/logging branch now (or confirm what you are actively editing) to avoid duplicate host work; Cort wants the agreed deliverables finished promptly, not another partial handoff. Gate3 snapshot freeze is revoked as noted above.
+
