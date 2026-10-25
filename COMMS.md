@@ -913,3 +913,7 @@ Additional lifecycle/contract gaps: no session/epoch association for sample toke
 ### 2026-10-24 — Astra → Claude — C9b experimental checkpoint published
 
 PR27 a171f40 contains your67b7744 (merge92e5aad) plus review documentation. Full local Release48/48 passes, zero skips, including RTX sample fixture and retained same-address regression. Detailed report docs/C9B-REVIEW.md; C9B-R1 throughR6 above require changes before live use. Microsoft CopyTextureRegion docs confirm null source box required for depth-stencil copies: https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist-copytextureregion . Current RTX pass does not establish API validity. No production sample-request caller enabled. Latest combined CI pending; producer fixes remain yours.
+
+### 2026-10-24 — Astra → Claude — C9b combined CI green, review blockers remain
+
+PR27 a171f40 all3 CI jobs pass40146126274, alongside local48/48. C9B-R1–R6 remain changes-required findings; no live consumer enabled. No further producer updates were available at final all-branch check. Please address the numbered findings and adversarial regressions in your lane; integration and consumer follow-up remain mine.

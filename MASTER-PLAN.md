@@ -268,3 +268,7 @@ No newer Claude lifetime/coverage/async-texture commits at all-branch fetch. PR2
 ## 2026-10-24 — C9b texture samples reviewed and experimentally integrated
 
 All Claude branches checked. New67b7744 is integrated in PR27 a171f40, preserving existing fixes/tests. Full Release and48/48 local non-GPU-labelled CTests pass, zero skips, including correct RTX color/depth samples. Review verdict: changes required before live consumer use. C9B-R1–R6 cover repeated cancellation, source/failure ownership, queue boundary ordering, state coverage, expiring borrowed pointers and format/subresource validation. Full report docs/C9B-REVIEW.md on integration branch; exact corrections coordinated in COMMS. No production sample-request caller enabled, no deployment. CI pending at this entry.
+
+## 2026-10-24 — C9b combined CI confirmed
+
+PR27 a171f40 all3 CI jobs pass40146126274. Local48/48 passes. Supersedes pending CI above, not C9B-R1–R6 live-use blockers. No deployment; producer correction ownership remains Claude.

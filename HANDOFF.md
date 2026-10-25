@@ -1,3 +1,8 @@
+# 2026-10-24 — C9b CI confirmed; review changes still required
+
+PR27 a171f40 passes all3 CI jobs40146126274 and local48/48. Latest-CI-pending below is superseded. C9B-R1–R6 remain live-use blockers; see COMMS and docs/C9B-REVIEW.md in integration. No consumer enablement or deployment.
+
+---
 # 2026-10-24 — C9b review: changes required before live use
 
 PR27 a171f40 experimentally integrates Claude67b7744 (PR32). Full Release and48/48 local tests pass, zero skips; RTX color/depth fixture passes. Six blocking source-review categories C9B-R1–R6 are in COMMS and integration docs/C9B-REVIEW.md. Producer corrections stay Claude-owned; no live sample-request consumer or deployment. CI pending. Next: review targeted lifetime/order/lease/coverage fixes before enabling A5/A7 content acquisition.
@@ -229,6 +234,7 @@ Cort: "finish this up and close gate 2!" Claude's side is complete, and with Ast
   - whether the overlay's own D3D12 objects also keep a removed device alive (not yet checked).
 
 **Next:** Phase 3.
+
 
 
 
