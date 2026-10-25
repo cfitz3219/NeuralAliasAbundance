@@ -23,6 +23,8 @@
 //      is never serviced by a submission in the next one;
 //   #4 typeless depth (R32_TYPELESS + ALLOW_DEPTH_STENCIL): partial refused,
 //      whole subresource copied.
+// C9B-REVIEW-4: a worker that cannot start refuses the request (nothing armed,
+//   no worker), and the next request starts it.
 #include "test_support.hpp"
 #include "host_dx12/host_observe.h"
 #include "host_dx12/host_observe_samples.h"
@@ -118,6 +120,13 @@ int main()
     const na_object_id color_id = na::observe::IdOf(color.Get()), depth_id = na::observe::IdOf(depth.Get()), bc_id = na::observe::IdOf(bc.Get());
     REQUIRE(color_id && depth_id && bc_id);
     CHECK(Request(0xDEAD0000ull) == 0);
+    // C9B-REVIEW-4: the worker cannot start -> refused, nothing armed, no worker; a later request retries.
+    na::observe::SetSampleWorkerStartFailsForTests(true);
+    CHECK(Request(color_id) == 0);
+    std::printf("worker start failure: request refused, live %llu, workers %u\n",
+                static_cast<unsigned long long>(na::observe::GetProducerStats().samples_live), na::observe::GetProducerStats().sample_workers_started);
+    CHECK(na::observe::GetProducerStats().samples_live == 0 && na::observe::GetProducerStats().sample_workers_started == 0);
+    na::observe::SetSampleWorkerStartFailsForTests(false);
 
     test::ComPtr<ID3D12CommandAllocator> alloc;
     test::ComPtr<ID3D12GraphicsCommandList> list;

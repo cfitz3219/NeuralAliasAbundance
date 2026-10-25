@@ -79,6 +79,8 @@ void SetUnmapBoundaryProbeForTests(void (*probe)(void* user), void* user);
 // operation are exercised without the worker masking the window.
 void SetSampleAcquireProbeForTests(void (*probe)());
 void SetSampleWorkerPausedForTests(bool paused);
+// Tests: the sample worker thread fails to start (requests must be refused).
+void SetSampleWorkerStartFailsForTests(bool fail);
 
 // Identity of an observed object (0 = unknown). Any interface pointer of it.
 na_object_id IdOf(const void* object);

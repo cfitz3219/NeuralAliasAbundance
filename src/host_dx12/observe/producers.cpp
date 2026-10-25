@@ -6,6 +6,7 @@
 
 #include "queue_occurrences.hpp"
 #include <algorithm>
+#include <system_error>
 #include <chrono>
 #include <condition_variable>
 #include <thread>
@@ -2309,7 +2310,8 @@ bool g_worker_started = false;               // under g_samples_m: exactly one w
 std::atomic<uint32_t> g_workers_started{0};  // stats
 std::atomic<bool> g_samples_quit{false};     // set at teardown: the worker stops before any static it reads is destroyed
 std::atomic<bool> g_worker_paused{false};    // test seam: no maintenance ticks
-HANDLE g_worker_thread = nullptr;            // duplicated handle: teardown waits for the worker to exit
+std::atomic<bool> g_fail_worker_start{false}; // test seam: thread creation fails
+std::thread* g_worker = nullptr;             // immortal, never detached: teardown waits on its own handle
 void (*g_acquire_probe)() = nullptr;         // test seam: after the game's submission returned, before servicing
 constexpr size_t kMaxSamples = 8;     // every entry counts, released-in-flight included
 constexpr uint64_t kMaxSampleBytes = 64ull << 20;
@@ -2424,28 +2426,28 @@ void worker_tick_locked()
 struct WorkerQuiesce {
     ~WorkerQuiesce()
     {
-        if (!g_worker_thread) return;
-        if (WaitForSingleObject(g_worker_thread, 0) != WAIT_OBJECT_0) {
+        if (!g_worker) return;
+        // The thread object is immortal and never detached, so its handle is
+        // valid for the whole process: there is no failure path without one.
+        const HANDLE h = static_cast<HANDLE>(g_worker->native_handle());
+        if (WaitForSingleObject(h, 0) != WAIT_OBJECT_0) {
             {
                 std::lock_guard<std::mutex> lock(g_samples_m);
                 g_samples_quit.store(true, std::memory_order_release);
             }
             g_samples_cv.notify_all();
-            WaitForSingleObject(g_worker_thread, INFINITE);
+            WaitForSingleObject(h, INFINITE);
         }
-        CloseHandle(g_worker_thread);
-        g_worker_thread = nullptr;
     }
 };
 
-void ensure_worker_locked()
+// False when the worker could not be started (the request is then refused).
+bool ensure_worker_locked()
 {
-    if (g_worker_started) return; // exactly once, whatever the thread object's state
-    g_worker_started = true;
-    static WorkerQuiesce quiesce;
+    if (g_worker_started) return true; // exactly once, whatever the thread object's state
+    static WorkerQuiesce quiesce;      // constructed before the thread can exist
     (void)quiesce;
-    g_workers_started.fetch_add(1);
-    std::thread worker([] {
+    auto body = [] {
         std::unique_lock<std::mutex> lock(g_samples_m);
         for (;;) {
             if (g_samples_quit.load(std::memory_order_acquire)) return;
@@ -2454,11 +2456,17 @@ void ensure_worker_locked()
             if (g_samples_quit.load(std::memory_order_acquire)) return;
             if (!g_worker_paused.load(std::memory_order_acquire)) worker_tick_locked();
         }
-    });
-    HANDLE h = nullptr;
-    if (DuplicateHandle(GetCurrentProcess(), static_cast<HANDLE>(worker.native_handle()), GetCurrentProcess(), &h, SYNCHRONIZE, FALSE, 0))
-        g_worker_thread = h;
-    worker.detach(); // never joined: quiesce waits on the duplicated handle at teardown
+    };
+    try {
+        if (g_fail_worker_start.load()) throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again));
+        g_worker = new std::thread(body); // immortal: never joined, detached or destroyed
+    } catch (...) {
+        g_worker = nullptr;
+        return false; // not started: a later request retries
+    }
+    g_worker_started = true;
+    g_workers_started.fetch_add(1);
+    return true;
 }
 
 bool state_ok_for_queue(uint32_t state, D3D12_COMMAND_LIST_TYPE type)
@@ -2964,6 +2972,7 @@ na_object_id IdOf(const void* object) { return lookup(object); }
 
 void SetSampleAcquireProbeForTests(void (*probe)()) { g_acquire_probe = probe; }
 void SetSampleWorkerPausedForTests(bool paused) { g_worker_paused.store(paused, std::memory_order_release); }
+void SetSampleWorkerStartFailsForTests(bool fail) { g_fail_worker_start.store(fail); }
 
 void SetUnmapBoundaryProbeForTests(void (*probe)(void* user), void* user)
 {
@@ -3038,9 +3047,12 @@ extern "C" int __cdecl na_observe_sample_request(const na_sample_request* r, uin
     s->session = session;
     s->epoch = epoch;
     *out_token = s->token;
+    if (!ensure_worker_locked()) { // no maintenance possible: refuse rather than arm an unserviced lease
+        *out_token = 0;
+        return NA_E_STATE;
+    }
     g_samples.push_back(std::move(s));
     recount_armed_locked();
-    ensure_worker_locked();
     g_samples_cv.notify_one(); // C9B-REVIEW-3 #1: an idle worker waits for exactly this
     return NA_OK;
 }
