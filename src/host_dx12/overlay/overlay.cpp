@@ -2012,7 +2012,10 @@ bool Start(const char* route_tag, PanelFn controls)
                                             reinterpret_cast<void**>(&g_orig_set_color_space));
             }
             if (ok && na::observe::InstallRequested()) // C8: observation producers on the same throwaway objects
+            {
                 na::observe::InstallProducers(dev.Get(), queue.Get(), /*hook_queue_execute=*/false);
+                na::observe::SetExecuteForwarder(g_orig_execute); // C9b: host sample copies bypass this detour
+            }
             if (ok) {
                 na::present::Originals o;
                 o.present = g_orig_present;
