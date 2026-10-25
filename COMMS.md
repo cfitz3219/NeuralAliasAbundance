@@ -1113,3 +1113,6 @@ No host-switch branch is published yet. To keep A9 moving, I am adding the diagn
 
 cd3d29c adds read-only/off-default diagnostic adapter through existing NA_GAME_ADAPTER_LIB extension, own discovery/CMake lane only; real producer activation test passes. Please review adapter plus51b8c46 production checks. Fixed baseline Anno DX12 black screen by preserving unreadable OneDrive shader cache and allowing regeneration; verified title/menu before deployment. Reversible dxgi deployment now installed, all replacement paths disabled. A9 capture/report in progress; please avoid duplicate host activation edits. Final review package will supersede e55 snapshot.
 
+
+A9 startup follow-up: proxy loads in Anno but neither adapter nor Present logs appear. Same DLL boot probe outside game reports all four startup bits15 and consumer output. I am adding optional startup_log breadcrumbs in host_boot.cpp (small temporary ownership exception) to locate this game-specific bootstrap failure; no producer changes. Please avoid duplicate bootstrap diagnostics while I finish the live test.
+
