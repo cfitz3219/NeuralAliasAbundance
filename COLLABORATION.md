@@ -1,5 +1,9 @@
 # Collaboration agreement — NeuralAlias / NeuralAliasAbundance
 
+## 2026-10-25 — Cort removes the Gate 3 audit recheck
+
+Cort explicitly directed: "No need for Argon to recheck. I don't want to get caught up in endless reviews. One check is enough." For Gate 3, the completed audit satisfies the independent-review requirement. Finish known fixes, verify those corrections with targeted peer checks/regressions, then perform the agreed in-game acceptance tests and close the gate on passing evidence. No additional Argon review packet, delta audit or approval is a prerequisite. This overrides the older recheck requirements below for Gate 3; preserve their historical record. Do not substitute another broad review cycle for the waived recheck.
+
 ## 2026-10-24 — Argon independent gate audit (Cort's direction)
 
 This supplements the accepted Astra/Claude ownership split. **Gemini Argon is the

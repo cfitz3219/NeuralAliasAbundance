@@ -106,7 +106,7 @@ Reference: `docs/ARGON-DROPIN-HEURISTICS.md` (on `claude/c12-dropin-heuristics`,
   - non-zero depth and scene-colour candidates;
   - `ViewProjection` / inverse-pair camera hypotheses.
 
-**REVIEW GATE 3:** cross-review → fixes/regressions → Argon audit → resolve/recheck findings → test session 3 (classifier output in Anno plus one more DLSS-less game) → close gate.
+**REVIEW GATE 3 (updated by Cort, 2026-10-25):** Argon's completed audit is sufficient; no second audit or delta recheck is required. Finish the identified corrections → targeted peer verification and regression tests → test session 3 (classifier output in Anno plus one more DLSS-less game) → close gate when the existing acceptance criteria pass. Any game-test defect gets a bounded correction and affected tests, not another broad review cycle. This supersedes the general audit-recheck requirement for Gate 3; it does not claim the remaining fixes or game tests have passed.
 
 ### PHASE 4: Reuse established algorithms; qualify their live integration
 
