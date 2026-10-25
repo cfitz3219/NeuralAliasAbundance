@@ -77,6 +77,14 @@ public:
         if (SampleId(session) && SampleId(epoch)) { session_=session; epoch_=epoch; }
     }
     size_t Pending() const { return leases_.size(); }
+    // Retirement invalidates every pending range of this resource. Releasing
+    // an in-flight token leaves fence-owned GPU cleanup with the host.
+    void Retire(uint64_t resource) noexcept {
+        for(auto it=leases_.begin();it!=leases_.end();) {
+            if(it->plan.resource==resource) {api_.Release(it->token);it=leases_.erase(it);}
+            else ++it;
+        }
+    }
     bool Begin(const SamplePlan& p) {
         if (!session_ || !SampleId(p.resource) || !p.width || !p.height || leases_.size()==4) return false;
         if(p.buffer ? (p.width>65536 || p.height!=1 || p.format || p.subresource || p.offset>UINT64_MAX-p.width) :
