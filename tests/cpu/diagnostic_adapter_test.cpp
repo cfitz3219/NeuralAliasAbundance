@@ -28,6 +28,9 @@ int main() {
     CHECK(na_adapter_start()==0);
     auto resource=test::CreateBuffer(d.device.Get(),4096,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_STATE_COMMON);
     REQUIRE(resource);
+    auto candidate=test::CreateTexture(d.device.Get(),128,128,DXGI_FORMAT_D32_FLOAT,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE,D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    REQUIRE(candidate);
     // Mixed-status fixture through the real transport: 32 unavailable records
     // followed by a captured matrix must not suppress all structural scans.
     struct SnapshotFixture { na_ev_snapshot event; float matrix[16]; } fixture{};
@@ -53,5 +56,10 @@ int main() {
     CHECK(text.find("\"confirmed_inputs\":0")!=std::string::npos);
     CHECK(text.find("\"hypotheses\":2")!=std::string::npos);
     CHECK(text.find("\"execution_qualified\":false")!=std::string::npos);
+    CHECK(text.find("\"signal\":\"depth\"")!=std::string::npos);
+    CHECK(text.find("\"signal\":\"scene_color\"")!=std::string::npos);
+    CHECK(text.find("Missing or mismatched session/epoch/submission/queue/recording identity")!=std::string::npos);
+    CHECK(text.find("No intact content version at scene boundary; acquire earlier snapshot")!=std::string::npos);
+    CHECK(text.find("\"confidence\":\"candidate\"")==std::string::npos);
     return test::finish("diagnostic_adapter");
 }

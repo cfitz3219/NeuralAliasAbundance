@@ -53,6 +53,21 @@ na::classifier::Format Format(uint32_t f) {
     return na::classifier::Format::Unknown;
 }
 template<class T> T Read(const unsigned char* p) { T value{};std::memcpy(&value,p,sizeof(value));return value; }
+void JsonStrings(FILE* out,const std::vector<std::string>& strings) {
+    std::fputc('[',out);
+    bool first=true;
+    for(const auto& text:strings) {
+        if(!first) std::fputc(',',out);first=false;
+        std::fputc('"',out);
+        for(unsigned char ch:text) {
+            if(ch=='"' || ch=='\\') {std::fputc('\\',out);std::fputc(ch,out);}
+            else if(ch<32) std::fprintf(out,"\\u%04x",static_cast<unsigned>(ch));
+            else std::fputc(ch,out);
+        }
+        std::fputc('"',out);
+    }
+    std::fputc(']',out);
+}
 void Report(Consumer& c,const na_observe_status& status,const char* phase) {
     if(!c.log || c.reports>=180) return;
     ++c.reports;
@@ -68,8 +83,26 @@ void Report(Consumer& c,const na_observe_status& status,const char* phase) {
         const auto& r=pair.second;
         if(r.info.width<128 || r.info.height<128 || r.info.width>4096 || r.info.height>4096 ||
             r.info.resource_flags==NA_UNKNOWN_U64 || !(r.info.resource_flags&3)) continue;
-        std::fprintf(c.log,"{\"type\":\"resource_candidate\",\"resource\":%llu,\"format\":%u,\"width\":%llu,\"height\":%u,\"depth_writes\":%llu,\"color_writes\":%llu,\"confidence\":\"unavailable\",\"reason\":\"creation permits render-target/depth use; actual content role and submission association unconfirmed\"}\n",
-            pair.first,r.info.format,r.info.width,r.info.height,r.depth_writes,r.color_writes);
+        na::classifier::Window window{};
+        window.scope.session=status.session;window.scope.epoch=status.epoch;
+        window.coverage_complete=c.validity.CaptureContiguous() && !c.overflow;
+        window.loss_free=!status.foundational_dropped && !status.detail_dropped;
+        // Inventory dimensions and recording-time writes are not a scene
+        // boundary, executing list, or preserved content version. Leave these
+        // missing fields unknown and let the same A5 classifier explain them.
+        na::classifier::Observation observation{};
+        observation.scope=window.scope;observation.resource=pair.first;
+        observation.width=static_cast<uint32_t>(r.info.width);observation.height=r.info.height;
+        observation.format=Format(r.info.format);observation.alive=true;
+        observation.depth_write=r.depth_writes!=0;observation.color_write=r.color_writes!=0;
+        for(auto signal:{na::classifier::Signal::Depth,na::classifier::Signal::SceneColor}) {
+            const auto result=na::classifier::Describe(signal,window,observation);
+            std::fprintf(c.log,"{\"type\":\"resource_candidate\",\"signal\":\"%s\",\"resource\":%llu,\"format\":%u,\"width\":%llu,\"height\":%u,\"depth_writes\":%llu,\"color_writes\":%llu,\"confidence\":\"%s\",\"acquisition_score\":%u,\"reasons\":",
+                signal==na::classifier::Signal::Depth?"depth":"scene_color",pair.first,r.info.format,r.info.width,r.info.height,r.depth_writes,r.color_writes,
+                result.confidence==na::classifier::Confidence::Candidate?"candidate":"unavailable",result.acquisition_score);
+            JsonStrings(c.log,result.reasons);std::fputs(",\"acquisition_tasks\":",c.log);
+            JsonStrings(c.log,result.acquisition_tasks);std::fputs("}\n",c.log);
+        }
         if(++emitted==24) break;
     }
     std::fflush(c.log);
