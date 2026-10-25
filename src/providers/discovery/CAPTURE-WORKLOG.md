@@ -212,3 +212,28 @@ completed copy to drain before measuring that case. Prior six related tests
 passed; final full build/suite running. Raw logs under local/phase3-integration,
 review2-negative-test.log and review2-final-ctest.log. No deployment or new Anno
 qualification claimed; Claude has been asked to review the final correction.
+
+## 2026-10-25 — Final peer check and PR39 review
+
+Claude accepted R9–R13 at90f165b and conditionally cleared the Argon handoff
+once Astra accepted PR39. Reviewed52cde25: the per-queue LastTicket check spans
+submission entry through the native copy forward. Interference before servicing
+leaves requests armed; interference during copy submission produces
+ORDER_AMBIGUOUS with fence-owned cleanup. Operations starting after the copy's
+submission are FIFO-ordered after it and no longer revoke completed provenance.
+Nested queue events remain explicitly ambiguous. This supersedes9085418's
+unnecessarily global invalidation; its historical negative-control results are
+retained, with the post-copy expectation now correctly READY.
+
+No blocking finding remains in this review. Claude's P3 SampleFormat note is an
+explicit unsupported boundary, not a false decode: plans currently cover resource
+formats19/20 and44/45; other view-only family formats are not silently interpreted.
+The host returns41/46 for the supported packed resources. No runtime expansion
+is needed for the declared tests/Anno resource formats. Argon should independently
+scrutinize the ordering window and unsupported-format boundary.
+
+CI40170612165 passes all3 jobs at52cde258dc1ab6d1dc112996206af98f8d16bb6e.
+Full local Release validation is recorded in the final package. No game deployed
+or restarted, and historical Anno evidence remains pinned to9e1b140.
+
+Final local result: full Release build and61/61 default CTests passed, zero failures/skips, on the RTX5070Ti PC. Includes cross-queue, post-copy FIFO, packed-depth and buffer-copy regressions. No additional runtime changes after52cde25.

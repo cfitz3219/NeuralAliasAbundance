@@ -18,3 +18,20 @@ Build with `NA_GAME_ADAPTER_LIB=na_discovery_diagnostics` for this optional diag
 Final local validation: full Release build and61/61 non-GPU-labelled CTests passed,zero skips/failures,including explicit active-EXE and active-DLL process-exit regressions. Logs are retained under local/phase3-integration. Source9e1b140 passed all3 CI jobs40158744541. The mixed-status adapter regression also passed. No tests ran concurrently with the final game session.
 
 
+
+## 2026-10-25 — Final review accepted; ready for Argon
+
+This supersedes the pending-peer-check status above. Claude accepted90f165b's
+R9–R13 fixes and cleared the handoff conditional on acceptance of PR39. Astra
+reviewed and accepted52cde25: queue-local ticket checks reject interference up to
+the copy submission, while later FIFO-ordered operations do not invalidate its
+bytes. The pre-copy cross-queue regression remains ARMED; the post-copy nested
+Signal regression correctly remains READY. This replaces the overly broad
+global invalidation in9085418. CI40170612165 has all3 jobs successful.
+
+The P3 SampleFormat family note remains a documented unsupported-plan boundary:
+resource formats19/20 and44/45 are supported with explicit41/46 plane returns;
+other view-family identifiers are not silently decoded. No blocking finding or
+peer disagreement remains. Exact final source, local test result, both review
+records and hashes are in the regenerated Argon package. Audit status is
+**ready for Argon**, not delivered/audited, and Gate3 is not closed.
