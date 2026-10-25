@@ -2297,12 +2297,19 @@ struct Sample {
     bool released = false;            // consumer released; freed once the GPU is done
     bool gpu_objects() const { return readback || alloc || list || fence || source; }
 };
-std::mutex g_samples_m;
-std::condition_variable g_samples_cv;
-std::vector<std::unique_ptr<Sample>> g_samples;
+// C9B-REVIEW-2 #1: the sample store is immortal (never destroyed), so the
+// detached worker can never touch a destroyed mutex/vector during CRT
+// teardown; entries still holding D3D objects at exit are deliberately leaked.
+std::mutex& g_samples_m = *new std::mutex;
+std::condition_variable& g_samples_cv = *new std::condition_variable;
+std::vector<std::unique_ptr<Sample>>& g_samples = *new std::vector<std::unique_ptr<Sample>>;
 std::atomic<uint64_t> g_next_token{1};
 std::atomic<uint32_t> g_armed{0}; // armed requests: submissions on observed queues serialize while > 0
-std::thread g_sample_worker;
+bool g_worker_started = false;               // under g_samples_m: exactly one worker per process
+std::atomic<uint32_t> g_workers_started{0};  // stats
+std::atomic<bool> g_samples_quit{false};     // set at teardown: the worker stops before any static it reads is destroyed
+std::atomic<bool> g_worker_paused{false};    // test seam: no maintenance ticks
+void (*g_acquire_probe)() = nullptr;         // test seam: after the game's submission returned, before servicing
 constexpr size_t kMaxSamples = 8;     // every entry counts, released-in-flight included
 constexpr uint64_t kMaxSampleBytes = 64ull << 20;
 
@@ -2333,6 +2340,25 @@ void fail(Sample& s, uint32_t status, uint32_t reason)
     s.reason = reason;
     s.data.clear();
     s.data.shrink_to_fit();
+}
+
+// C9B-REVIEW-2 #3: scope is checked at every operation's linearization point
+// (service, poll, read, worker), not only on the maintenance tick. Under
+// g_samples_m. Returns whether the entry is still in its session/epoch; an
+// out-of-scope live entry is failed on the spot.
+bool scope_check_locked(Sample& s, na_session_id session, na_epoch epoch)
+{
+    const bool in_scope = session && session == s.session && epoch == s.epoch;
+    if (!in_scope && (s.status == NA_SAMPLE_ARMED || s.status == NA_SAMPLE_READY || s.status == NA_SAMPLE_IN_FLIGHT))
+        fail(s, NA_SAMPLE_FAILED, NA_SAMPLE_E_SESSION_ENDED);
+    return in_scope;
+}
+bool scope_check_locked(Sample& s)
+{
+    na_session_id session = 0;
+    na_epoch epoch = 0;
+    na::observe_internal::CurrentScope(&session, &epoch);
+    return scope_check_locked(s, session, epoch);
 }
 
 // Host-owned worker (C9B review): completion, readback, expiry, scope and
@@ -2369,8 +2395,7 @@ void worker_tick_locked()
             }
             // !signaled: quarantined (SUBMIT_FAILED) until the device is removed.
         }
-        if (!in_scope && (s.status == NA_SAMPLE_ARMED || s.status == NA_SAMPLE_READY || s.status == NA_SAMPLE_IN_FLIGHT))
-            fail(s, NA_SAMPLE_FAILED, NA_SAMPLE_E_SESSION_ENDED);
+        scope_check_locked(s, session, epoch);
         const uint32_t expiry = s.req.expiry_ms ? s.req.expiry_ms : 2000;
         if (s.status == NA_SAMPLE_READY && now - s.ready_at > expiry) fail(s, NA_SAMPLE_EXPIRED, NA_SAMPLE_OK);
         const uint32_t arm = s.req.arm_timeout_ms ? s.req.arm_timeout_ms : 5000;
@@ -2384,17 +2409,45 @@ void worker_tick_locked()
     recount_armed_locked();
 }
 
+// Teardown quiescence (C9B-REVIEW-2 #1). A function-local static constructed
+// when the worker starts, i.e. after every namespace-scope static it reads, so
+// it is destroyed before them. Its destructor sets the quit flag and then
+// waits (bounded) for the worker to leave its current tick: once it has the
+// lock, the worker can never tick again. Bounded because at process exit the
+// OS may already have terminated the worker (possibly while it held the lock):
+// then nothing can run and giving up is safe.
+struct WorkerQuiesce {
+    ~WorkerQuiesce()
+    {
+        g_samples_quit.store(true, std::memory_order_release);
+        g_samples_cv.notify_all();
+        for (int i = 0; i < 100; ++i) {
+            if (g_samples_m.try_lock()) {
+                g_samples_m.unlock();
+                return;
+            }
+            Sleep(1);
+        }
+    }
+};
+
 void ensure_worker_locked()
 {
-    if (g_sample_worker.joinable()) return;
-    g_sample_worker = std::thread([] {
+    if (g_worker_started) return; // exactly once, whatever the thread object's state
+    g_worker_started = true;
+    static WorkerQuiesce quiesce;
+    (void)quiesce;
+    g_workers_started.fetch_add(1);
+    std::thread([] {
         std::unique_lock<std::mutex> lock(g_samples_m);
         for (;;) {
-            g_samples_cv.wait_for(lock, std::chrono::milliseconds(2));
-            worker_tick_locked();
+            if (g_samples_quit.load(std::memory_order_acquire)) return;
+            if (g_samples.empty()) g_samples_cv.wait(lock, [] { return !g_samples.empty() || g_samples_quit.load(); });
+            else g_samples_cv.wait_for(lock, std::chrono::milliseconds(2));
+            if (g_samples_quit.load(std::memory_order_acquire)) return;
+            if (!g_worker_paused.load(std::memory_order_acquire)) worker_tick_locked();
         }
-    });
-    g_sample_worker.detach(); // process lifetime (the module is pinned)
+    }).detach(); // never joined: the store above is immortal and quiesce stops it at teardown
 }
 
 bool state_ok_for_queue(uint32_t state, D3D12_COMMAND_LIST_TYPE type)
@@ -2417,6 +2470,13 @@ bool depth_format(DXGI_FORMAT f)
 {
     return f == DXGI_FORMAT_D32_FLOAT || f == DXGI_FORMAT_D16_UNORM || f == DXGI_FORMAT_D24_UNORM_S8_UINT || f == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
 }
+// C9B-REVIEW-2 #4: a depth-stencil resource is recognised by its flag, not its
+// format: R32_TYPELESS / R16_TYPELESS with ALLOW_DEPTH_STENCIL carry the same
+// whole-subresource copy restriction as the typed D formats.
+bool depth_resource(const D3D12_RESOURCE_DESC& d)
+{
+    return depth_format(d.Format) || (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+}
 
 // Validates the request against the resource (C9B-R6). Fills the region.
 uint32_t validate_locked(Sample& s, ID3D12Device* dev, const D3D12_RESOURCE_DESC& d)
@@ -2436,7 +2496,7 @@ uint32_t validate_locked(Sample& s, ID3D12Device* dev, const D3D12_RESOURCE_DESC
     s.w = whole ? sub_w : std::min(s.req.width, sub_w - s.x);
     s.h = whole ? sub_h : std::min(s.req.height, sub_h - s.y);
     const bool partial = s.x || s.y || s.w != sub_w || s.h != sub_h;
-    if (depth_format(d.Format) && partial) return NA_SAMPLE_E_UNSUPPORTED; // depth: whole subresource only
+    if (depth_resource(d) && partial) return NA_SAMPLE_E_UNSUPPORTED; // depth/stencil: whole subresource only
     if (block_compressed(d.Format)) { // 4x4 blocks: origin aligned, extent aligned unless it ends at the edge
         const auto aligned = [](uint32_t v) { return (v & 3u) == 0; };
         if (!aligned(s.x) || !aligned(s.y) || (!aligned(s.w) && s.x + s.w != sub_w) || (!aligned(s.h) && s.y + s.h != sub_h))
@@ -2447,18 +2507,11 @@ uint32_t validate_locked(Sample& s, ID3D12Device* dev, const D3D12_RESOURCE_DESC
 
 // Records and submits the host's copy for one armed sample (caller holds the
 // queue's submission lock and g_samples_m). `state` is established evidence.
-void start_copy_locked(Sample& s, ID3D12CommandQueue* q, D3D12_COMMAND_LIST_TYPE type, uint32_t state, na_object_id qid, uint64_t ticket)
+// `res` is the reference acquired BEFORE the game's submission (see
+// acquire_sample_sources); ownership passes to the sample.
+void start_copy_locked(Sample& s, ID3D12Resource* res, ID3D12CommandQueue* q, D3D12_COMMAND_LIST_TYPE type, uint32_t state, na_object_id qid,
+                       uint64_t ticket)
 {
-    ID3D12Resource* res = nullptr;
-    {
-        // The submission that just ran referenced this resource through a
-        // recorded barrier; the application must keep it alive while that
-        // work runs, so acquiring a reference here is safe (C9B-R2).
-        std::shared_lock<std::shared_mutex> lock(g_m);
-        auto it = g_res_keys.find(s.req.resource);
-        if (it != g_res_keys.end()) static_cast<IUnknown*>(const_cast<void*>(it->second))->QueryInterface(IID_PPV_ARGS(&res));
-    }
-    if (!res) return fail(s, NA_SAMPLE_FAILED, NA_SAMPLE_E_RETIRED);
     s.source = res; // held until the host fence completes
     ID3D12Device* dev = nullptr;
     q->GetDevice(IID_PPV_ARGS(&dev));
@@ -2553,40 +2606,111 @@ void start_copy_locked(Sample& s, ID3D12CommandQueue* q, D3D12_COMMAND_LIST_TYPE
     s.status = NA_SAMPLE_IN_FLIGHT;
 }
 
-// End of a clean (non-ambiguous) game submission, under the queue's
-// submission lock: copies for every armed sample whose state this
-// submission's evidence establishes (C9B-R4).
-void service_samples(ID3D12CommandQueue* q, na_object_id qid, uint64_t ticket, uint32_t count, ID3D12CommandList* const* lists)
+// The submission's resource-state evidence (C9B-R4): false when any list
+// cannot be vouched for, which makes the whole submission ineligible.
+bool submission_notes(uint32_t count, ID3D12CommandList* const* lists, std::vector<ListState::StateNote>& notes)
 {
-    if (!q || !lists || !count || g_armed.load(std::memory_order_acquire) == 0) return;
+    if (!lists || !count) return false;
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    for (uint32_t i = 0; i < count; ++i) {
+        na_object_id lid = 0;
+        ListState* ls = lists[i] ? list_state_locked(lists[i], &lid) : nullptr;
+        if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
+        std::lock_guard<std::mutex> bl(ls->bind_m);
+        if (!ls->evidence_complete) return false;
+        notes.insert(notes.end(), ls->states.begin(), ls->states.end());
+    }
+    return true;
+}
+bool last_state(const std::vector<ListState::StateNote>& notes, const Sample& s, uint32_t* state)
+{
+    bool found = false;
+    for (const auto& n : notes)
+        if (n.resource == s.req.resource && (n.subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES || n.subresource == s.req.subresource)) {
+            found = true;
+            *state = n.state_after;
+        }
+    return found;
+}
+
+// Source references acquired before the game's submission is forwarded
+// (C9B-REVIEW-2 #2), owned by the submitting thread until ExecuteEnd.
+struct PreRef {
+    uint64_t token;
+    ID3D12Resource* res;
+};
+thread_local std::vector<PreRef> t_prerefs;
+
+void drop_prerefs()
+{
+    for (auto& p : t_prerefs) p.res->Release();
+    t_prerefs.clear();
+}
+
+// ExecuteBegin, under the queue's submission lock and BEFORE the original
+// ExecuteCommandLists runs. Every candidate resource is referenced by a
+// recorded barrier in a list being submitted, and that work cannot have run
+// yet, so the application is obliged to keep the resource alive right now:
+// taking our own reference here is defined. After the forward returns it no
+// longer is: the GPU may finish and another thread may observe its fence and
+// release the resource before we could acquire it.
+void acquire_sample_sources(ID3D12CommandQueue* q, uint32_t count, ID3D12CommandList* const* lists)
+{
+    drop_prerefs();
+    if (!q || g_armed.load(std::memory_order_acquire) == 0) return;
     const D3D12_COMMAND_LIST_TYPE type = q->GetDesc().Type;
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE) return;
     std::vector<ListState::StateNote> notes;
+    if (!submission_notes(count, lists, notes)) return;
+    std::vector<std::pair<uint64_t, na_object_id>> want;
     {
-        std::shared_lock<std::shared_mutex> rl(g_m);
-        for (uint32_t i = 0; i < count; ++i) {
-            na_object_id lid = 0;
-            ListState* ls = lists[i] ? list_state_locked(lists[i], &lid) : nullptr;
-            // Any list we cannot vouch for makes the whole submission ineligible.
-            if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return;
-            std::lock_guard<std::mutex> bl(ls->bind_m);
-            if (!ls->evidence_complete) return;
-            notes.insert(notes.end(), ls->states.begin(), ls->states.end());
+        na_session_id session = 0;
+        na_epoch epoch = 0;
+        na::observe_internal::CurrentScope(&session, &epoch);
+        std::lock_guard<std::mutex> lock(g_samples_m);
+        for (auto& sp : g_samples) {
+            Sample& s = *sp;
+            if (s.status != NA_SAMPLE_ARMED || s.released || !scope_check_locked(s, session, epoch)) continue;
+            uint32_t state = kStateUnknown;
+            if (last_state(notes, s, &state) && state_ok_for_queue(state, type)) want.push_back({s.token, s.req.resource});
         }
+        recount_armed_locked();
     }
+    if (want.empty()) return;
+    std::shared_lock<std::shared_mutex> lock(g_m);
+    for (const auto& w : want) {
+        auto it = g_res_keys.find(w.second);
+        ID3D12Resource* res = nullptr;
+        if (it != g_res_keys.end()) static_cast<IUnknown*>(const_cast<void*>(it->second))->QueryInterface(IID_PPV_ARGS(&res));
+        if (res) t_prerefs.push_back({w.first, res});
+    }
+}
+
+// End of a clean (non-ambiguous) game submission, under the queue's
+// submission lock: copies for every armed sample whose state this
+// submission's evidence establishes (C9B-R4) and whose source was acquired
+// before the submission (C9B-REVIEW-2 #2).
+void service_samples(ID3D12CommandQueue* q, na_object_id qid, uint64_t ticket, uint32_t count, ID3D12CommandList* const* lists)
+{
+    if (t_prerefs.empty()) return;
+    if (g_acquire_probe) g_acquire_probe();
+    const D3D12_COMMAND_LIST_TYPE type = q->GetDesc().Type;
+    std::vector<ListState::StateNote> notes;
+    if (!submission_notes(count, lists, notes)) return; // (prerefs dropped by the caller)
+    na_session_id session = 0;
+    na_epoch epoch = 0;
+    na::observe_internal::CurrentScope(&session, &epoch);
     std::lock_guard<std::mutex> lock(g_samples_m);
     for (auto& sp : g_samples) {
         Sample& s = *sp;
-        if (s.status != NA_SAMPLE_ARMED || s.released) continue;
-        bool found = false;
+        if (s.status != NA_SAMPLE_ARMED || s.released || !scope_check_locked(s, session, epoch)) continue;
+        auto pre = std::find_if(t_prerefs.begin(), t_prerefs.end(), [&](const PreRef& p) { return p.token == s.token; });
+        if (pre == t_prerefs.end()) continue; // armed after the submission began: no safe reference, stays armed
         uint32_t state = kStateUnknown;
-        for (const auto& n : notes)
-            if (n.resource == s.req.resource && (n.subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES || n.subresource == s.req.subresource)) {
-                found = true;
-                state = n.state_after;
-            }
-        if (!found || !state_ok_for_queue(state, type)) continue; // no usable evidence here: stays armed
-        start_copy_locked(s, q, type, state, qid, ticket);
+        if (!last_state(notes, s, &state) || !state_ok_for_queue(state, type)) continue;
+        ID3D12Resource* res = pre->res;
+        t_prerefs.erase(pre);
+        start_copy_locked(s, res, q, type, state, qid, ticket);
     }
     recount_armed_locked();
     g_samples_cv.notify_one();
@@ -2756,6 +2880,7 @@ ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue, uint32_t count, ID3D12Comma
     if (!t_host_work && g_armed.load(std::memory_order_acquire)) { // C9B-R3
         qs->submit_m.lock();
         t.submit_locked = true;
+        acquire_sample_sources(queue, count, lists); // before the original runs (C9B-REVIEW-2 #2)
     }
     const auto occurrence = qs->occurrences.Begin();
     t.queue_state = qs;
@@ -2816,6 +2941,7 @@ void ExecuteEnd(const ExecuteToken& t, ID3D12CommandQueue* queue, uint32_t count
     // C9b: only a clean occurrence whose submission we serialized is sampled;
     // nothing observed can run on this queue between it and the host copy.
     if (!t_host_work && t.submit_locked && !ambiguous) service_samples(queue, t.queue_id, t.ticket, count, lists);
+    if (t.submit_locked) drop_prerefs(); // unused references (ambiguous, released, no evidence)
     unlock_submission(t);
 }
 
@@ -2824,6 +2950,9 @@ bool InstallRequested() { return g_requested.load(); }
 bool ProducersActive() { return g_active.load(std::memory_order_acquire); }
 
 na_object_id IdOf(const void* object) { return lookup(object); }
+
+void SetSampleAcquireProbeForTests(void (*probe)()) { g_acquire_probe = probe; }
+void SetSampleWorkerPausedForTests(bool paused) { g_worker_paused.store(paused, std::memory_order_release); }
 
 void SetUnmapBoundaryProbeForTests(void (*probe)(void* user), void* user)
 {
@@ -2868,6 +2997,7 @@ ProducerStats GetProducerStats()
         std::lock_guard<std::mutex> lock(g_samples_m);
         s.samples_live = g_samples.size();
     }
+    s.sample_workers_started = g_workers_started.load();
     return s;
 }
 
@@ -2911,6 +3041,8 @@ extern "C" int __cdecl na_observe_sample_poll(uint64_t token, na_sample_info* in
     for (auto& sp : g_samples) {
         Sample& s = *sp;
         if (s.token != token || s.released) continue;
+        scope_check_locked(s); // C9B-REVIEW-2 #3: report the scope as of now
+        recount_armed_locked();
         na_sample_info out{};
         out.size_bytes = static_cast<uint32_t>(std::min<size_t>(info->size_bytes, sizeof(na_sample_info)));
         out.status = s.status;
@@ -2944,6 +3076,7 @@ extern "C" int __cdecl na_observe_sample_read(uint64_t token, void* dst, uint64_
     for (auto& sp : g_samples) {
         Sample& s = *sp;
         if (s.token != token || s.released) continue;
+        scope_check_locked(s); // C9B-REVIEW-2 #3: stale-scope data is never handed out
         if (s.status != NA_SAMPLE_READY) return NA_E_STATE;
         if (capacity < s.data.size()) return NA_E_ARG;
         std::memcpy(dst, s.data.data(), s.data.size()); // the caller owns its copy

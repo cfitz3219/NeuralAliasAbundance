@@ -73,6 +73,12 @@ void SetSnapshotCopyProbeForTests(void (*probe)(void* user), void* user);
 // Tests: `probe` runs inside Unmap right before it contends for the mapping
 // lock (explicit boundary handshake for the race regression).
 void SetUnmapBoundaryProbeForTests(void (*probe)(void* user), void* user);
+// Tests (C9B-REVIEW-2): `probe` runs after the game's submission returned and
+// before armed samples are serviced (the R2 acquisition boundary); pausing
+// stops the sample worker's maintenance ticks so scope checks at each
+// operation are exercised without the worker masking the window.
+void SetSampleAcquireProbeForTests(void (*probe)());
+void SetSampleWorkerPausedForTests(bool paused);
 
 // Identity of an observed object (0 = unknown). Any interface pointer of it.
 na_object_id IdOf(const void* object);
@@ -94,6 +100,7 @@ struct ProducerStats {
     uint32_t hooks_missing;        // optional interfaces the device does not expose / refused slots
     const char* shared_target_slots; // slots refused because another hooked slot has the same function
     uint64_t samples_live;           // C9b entries incl. released ones awaiting GPU completion
+    uint32_t sample_workers_started; // C9B-REVIEW-2 #1: at most 1 per process
 };
 ProducerStats GetProducerStats();
 

@@ -12,6 +12,17 @@
 //     before anything reaches the GPU;
 //   scope: stop() ends armed leases (SESSION_ENDED); requests need a session;
 //   the game's states are restored; READY data expires when not released.
+// C9B-REVIEW-2:
+//   #1 one worker for the whole process however many requests; the process
+//      exits cleanly with live entries and the worker running;
+//   #2 the source reference exists BEFORE the game's submission returns: at
+//      that boundary the game drops its last reference and the copy still
+//      succeeds;
+//   #3 with the worker paused (no maintenance tick to mask it): READY data is
+//      refused right after stop(), and a request armed in an earlier session
+//      is never serviced by a submission in the next one;
+//   #4 typeless depth (R32_TYPELESS + ALLOW_DEPTH_STENCIL): partial refused,
+//      whole subresource copied.
 #include "test_support.hpp"
 #include "host_dx12/host_observe.h"
 #include "host_dx12/host_observe_samples.h"
@@ -23,6 +34,21 @@
 
 namespace {
 void __cdecl Sink(const na_event_batch*, void*) {}
+
+// #2 boundary probe: runs after the game's ExecuteCommandLists returned and
+// before servicing. Counts references (the host's must already be there) and
+// drops the game's last one.
+test::ComPtr<ID3D12Resource> g_victim;
+ULONG g_refs_at_boundary = 0;
+bool g_dropped = false;
+void AcquireProbe()
+{
+    if (!g_victim) return;
+    g_victim->AddRef();
+    g_refs_at_boundary = g_victim->Release();
+    g_victim.Reset();
+    g_dropped = true;
+}
 
 na_sample_info Poll(uint64_t token)
 {
@@ -258,6 +284,98 @@ int main()
     d.WaitIdle();
     CHECK(dev->GetDeviceRemovedReason() == S_OK);
 
+    // ---- C9B-REVIEW-2 #2: source acquired before the game's submission ----
+    {
+        g_victim = test::CreateTexture(dev, 16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        REQUIRE(g_victim);
+        const na_object_id vid = na::observe::IdOf(g_victim.Get());
+        const uint64_t t_acq = Request(vid);
+        REQUIRE(vid && t_acq);
+        record([&] {
+            D3D12_RESOURCE_BARRIER b = test::Transition(g_victim.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &b);
+        });
+        na::observe::SetSampleAcquireProbeForTests(&AcquireProbe);
+        d.queue->ExecuteCommandLists(1, ls);
+        na::observe::SetSampleAcquireProbeForTests(nullptr);
+        std::printf("acquire boundary: references at the boundary %lu, game reference dropped %d\n", g_refs_at_boundary, g_dropped ? 1 : 0);
+        CHECK(g_dropped && g_refs_at_boundary >= 2); // the host's reference predates the boundary
+        const na_sample_info ai = WaitDone(t_acq);
+        CHECK(ai.status == NA_SAMPLE_READY && ai.state_before == D3D12_RESOURCE_STATE_COPY_SOURCE);
+        na_observe_sample_release(t_acq);
+        d.WaitIdle();
+        CHECK(dev->GetDeviceRemovedReason() == S_OK);
+    }
+
+    // ---- C9B-REVIEW-2 #3: scope at each operation (worker paused) ----
+    {
+        const auto bounce = [&] { // evidence: RENDER_TARGET; the resource ends where it started
+            D3D12_RESOURCE_BARRIER b = test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &b);
+            b = test::Transition(color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->ResourceBarrier(1, &b);
+        };
+        // (a) READY data, then stop(): read refused at once, poll reports the end.
+        const uint64_t t_ready = Request(color_id);
+        REQUIRE(t_ready);
+        record(bounce);
+        d.queue->ExecuteCommandLists(1, ls);
+        const na_sample_info ri = WaitDone(t_ready);
+        CHECK(ri.status == NA_SAMPLE_READY);
+        na::observe::SetSampleWorkerPausedForTests(true);
+        REQUIRE(na_observe_stop() == NA_OK);
+        {
+            std::vector<uint8_t> buf(static_cast<size_t>(ri.data_bytes ? ri.data_bytes : 1));
+            uint64_t got = 0;
+            CHECK(na_observe_sample_read(t_ready, buf.data(), buf.size(), &got) == NA_E_STATE && got == 0);
+            const na_sample_info pi = Poll(t_ready);
+            std::printf("scope after stop: read refused, poll status %u reason %u\n", pi.status, pi.reason);
+            CHECK(pi.status == NA_SAMPLE_FAILED && pi.reason == NA_SAMPLE_E_SESSION_ENDED);
+        }
+        na_observe_sample_release(t_ready);
+        // (b) armed in session N, submission with evidence in session N+1:
+        //     never serviced (no host copy, no queue ticket).
+        REQUIRE(na_observe_start(&cfg, &Sink, nullptr) == NA_OK);
+        const uint64_t t_old = Request(color_id);
+        REQUIRE(t_old);
+        REQUIRE(na_observe_stop() == NA_OK);
+        REQUIRE(na_observe_start(&cfg, &Sink, nullptr) == NA_OK);
+        record(bounce);
+        d.queue->ExecuteCommandLists(1, ls);
+        d.WaitIdle();
+        const na_sample_info oi = Poll(t_old);
+        std::printf("scope across restart: status %u reason %u ticket %llu\n", oi.status, oi.reason, static_cast<unsigned long long>(oi.queue_ticket));
+        CHECK(oi.status == NA_SAMPLE_FAILED && oi.reason == NA_SAMPLE_E_SESSION_ENDED && oi.queue_ticket == 0);
+        na::observe::SetSampleWorkerPausedForTests(false);
+        na_observe_sample_release(t_old);
+    }
+
+    // ---- C9B-REVIEW-2 #4: typeless depth ----
+    {
+        auto tdepth = test::CreateTexture(dev, 32, 16, DXGI_FORMAT_R32_TYPELESS, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+        REQUIRE(tdepth);
+        const na_object_id tid = na::observe::IdOf(tdepth.Get());
+        REQUIRE(tid);
+        const uint64_t t_part = Request(tid, 0, 0, 0, 8, 8), t_whole = Request(tid);
+        REQUIRE(t_part && t_whole);
+        record([&] {
+            D3D12_RESOURCE_BARRIER b = test::Transition(tdepth.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+            list->ResourceBarrier(1, &b);
+        });
+        d.queue->ExecuteCommandLists(1, ls);
+        const na_sample_info pi = WaitDone(t_part), wi = WaitDone(t_whole);
+        std::printf("typeless depth: partial status %u reason %u, whole status %u %ux%u\n", pi.status, pi.reason, wi.status, wi.width, wi.height);
+        CHECK(pi.status == NA_SAMPLE_FAILED && pi.reason == NA_SAMPLE_E_UNSUPPORTED);
+        CHECK(wi.status == NA_SAMPLE_READY && wi.width == 32 && wi.height == 16);
+        na_observe_sample_release(t_part);
+        na_observe_sample_release(t_whole);
+        d.WaitIdle();
+    }
+
+    // ---- C9B-REVIEW-2 #1: one worker ----
+    std::printf("sample workers started: %u\n", na::observe::GetProducerStats().sample_workers_started);
+    CHECK(na::observe::GetProducerStats().sample_workers_started == 1);
+
     // ---- scope: stop ends armed leases ----
     const uint64_t t_scope = Request(color_id);
     REQUIRE(t_scope);
@@ -265,5 +383,11 @@ int main()
     const na_sample_info sc = WaitDone(t_scope);
     CHECK(sc.status == NA_SAMPLE_FAILED && sc.reason == NA_SAMPLE_E_SESSION_ENDED);
     na_observe_sample_release(t_scope);
+
+    // ---- C9B-REVIEW-2 #1: clean teardown with a live entry and the worker running ----
+    REQUIRE(na_observe_start(&cfg, &Sink, nullptr) == NA_OK);
+    CHECK(Request(color_id) != 0);
+    REQUIRE(na_observe_stop() == NA_OK);
+    std::printf("teardown: exiting with %llu live sample(s)\n", static_cast<unsigned long long>(na::observe::GetProducerStats().samples_live));
     return test::finish("observe_sample_test");
 }
