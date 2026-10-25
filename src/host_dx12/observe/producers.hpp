@@ -123,6 +123,11 @@ struct ProducerStats {
     uint64_t preexisting_heaps;      // G3-03: descriptor heaps registered lazily in SetDescriptorHeaps
     uint64_t sample_known_state;     // G3-06: copies whose state came from an earlier submission / creation
     uint64_t known_state_clears;     // G3-06: known-state store dropped by an incomplete submission
+    // G3-06 review: why carried states may be unreadable right now.
+    uint32_t known_store_disabled;   // an unobservable submission path was seen (unhooked/unregistered queue)
+    uint32_t known_unknown_inflight; // incomplete submissions currently between Begin and End
+    uint64_t known_entries;          // eligible textures in the store
+    uint64_t unhooked_queues;        // queues whose table differs from the hooked one
 };
 ProducerStats GetProducerStats();
 

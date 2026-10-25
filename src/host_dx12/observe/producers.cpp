@@ -228,7 +228,9 @@ void known_clear_locked()
 // self_marks: marks the asking submission itself holds on this resource.
 bool known_state(na_object_id res, uint32_t sub, na_object_id qid, uint32_t self_marks, uint32_t* state)
 {
-    if (g_known_disabled.load() || g_unhooked_queues.load() || g_unhooked_devices.load()) return false;
+    // An unhooked queue's submissions are unobserved. (An unhooked device only
+    // leaves resources unregistered, and unregistered resources are never eligible.)
+    if (g_known_disabled.load() || g_unhooked_queues.load()) return false;
     std::lock_guard<std::mutex> lock(g_known_m);
     if (g_unknown_inflight) return false;
     auto it = g_known.find(res);
@@ -3730,6 +3732,13 @@ ProducerStats GetProducerStats()
     s.preexisting_heaps = g_c.preexisting_heaps.load();
     s.sample_known_state = g_c.sample_known_state.load();
     s.known_state_clears = g_c.known_clears.load();
+    s.known_store_disabled = g_known_disabled.load() ? 1u : 0u;
+    s.unhooked_queues = g_unhooked_queues.load();
+    {
+        std::lock_guard<std::mutex> lock(g_known_m);
+        s.known_unknown_inflight = g_unknown_inflight;
+        s.known_entries = g_known.size();
+    }
     return s;
 }
 
