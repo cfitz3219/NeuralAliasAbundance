@@ -192,3 +192,23 @@ after additional format/owned-batch/moving-motion regressions. No game deploymen
 PR38 review found nested cross-queue Signal can precede the copy after the outer
 occurrence ends, despite READY result; sent Claude exact trigger and requested
 producer correction. Peer review remains pending, not audit-ready yet.
+
+## 2026-10-24 — PR38 nested ordering qualification correction
+
+Cross-review found a remaining early-Signal window: bypassed nested queue
+operations could run before another queue's sample copy, after its occurrence
+had ended. Added a global nested-operation generation carried from submit entry
+through GPU completion. Nested events are ambiguous; pre-copy requests remain
+armed, while affected in-flight samples fail ORDER_AMBIGUOUS. GPU references
+remain fence-owned. Conservative cross-queue invalidation may lose otherwise
+valid samples but never promotes uncertain ordering. Later clean submissions
+can retry. No synchronous GPU waits added to live callbacks.
+
+RTX regression has a post-Signal handshake for both contending threads and a
+separate stalled camera-copy case. Against77f49ef producer code both assertions
+fail (incorrect READY); fixed code passes. Initial test run exposed a test-only
+cleanup race in the later quarantine count, fixed by waiting for the released
+completed copy to drain before measuring that case. Prior six related tests
+passed; final full build/suite running. Raw logs under local/phase3-integration,
+review2-negative-test.log and review2-final-ctest.log. No deployment or new Anno
+qualification claimed; Claude has been asked to review the final correction.

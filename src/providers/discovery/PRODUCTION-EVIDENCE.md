@@ -9,8 +9,8 @@ Outputs retain the **returned** session, epoch, queue and queue ticket, resource
 subresource and format. A request does not identify the eventual submission.
 Callers must also bound retained outputs; the four-lease limit is not an output
 history budget. Numeric decode supports D32_FLOAT/R32_FLOAT and explicit R24_UNORM_X8_TYPELESS,
-including padded rows with an unpadded final row. Typeless/packed formats need
-explicit view interpretation before a decoder can be added.
+including padded rows with an unpadded final row. Other typeless/packed formats
+still need an explicit view interpretation before a decoder can be added.
 
 `AcquireDepthFrame` requires a separately established camera/frame association
 for the exact returned queue/ticket. It refuses request-time or stale camera

@@ -58,6 +58,10 @@
  * APP_SYNC_UNKNOWN CPU bytes). Reported: format 0, width = bytes, height 1,
  * row_pitch = bytes, state_before GENERIC_READ, queue/queue_ticket of that
  * submission. Other heaps: NA_SAMPLE_E_UNSUPPORTED.
+ * A nested queue operation bypassing serialization invalidates pending sample
+ * provenance across queues. A pre-copy request stays ARMED for a later clean
+ * submission; an in-flight copy fails ORDER_AMBIGUOUS and retains its GPU
+ * objects until completion. This deliberately sacrifices coverage for safety.
  */
 #ifndef NA_HOST_OBSERVE_SAMPLES_H
 #define NA_HOST_OBSERVE_SAMPLES_H
@@ -88,9 +92,11 @@ typedef enum na_sample_reason {
     NA_SAMPLE_E_HOST_OBJECTS = 4,      /* host could not create its copy objects */
     NA_SAMPLE_E_TIMEOUT = 5,           /* stayed ARMED past arm_timeout_ms */
     NA_SAMPLE_E_SESSION_ENDED = 6,     /* observation stopped or resynced */
-    NA_SAMPLE_E_SUBMIT_FAILED = 7      /* host fence signal failed after the copy was
+    NA_SAMPLE_E_SUBMIT_FAILED = 7,     /* host fence signal failed after the copy was
                                           submitted: objects are quarantined until the
                                           device is removed, never freed early */
+    NA_SAMPLE_E_ORDER_AMBIGUOUS = 8    /* nested queue operation bypassed copy ordering;
+                                         GPU objects retained until fence completion */
 } na_sample_reason;
 
 typedef struct na_sample_request {

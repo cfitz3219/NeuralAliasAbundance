@@ -38,7 +38,7 @@
 //      the GPU read (not the submission-time CPU bytes); an unbound range stays
 //      armed;
 //   R8: two threads each holding their queue's submission lock re-enter the
-//      other queue: no deadlock, both samples complete.
+//      other queue: no deadlock, neither sample gains ordering qualification.
 #include "test_support.hpp"
 #include "host_dx12/host_observe.h"
 #include "host_dx12/host_observe_samples.h"
@@ -73,6 +73,7 @@ void InterleaveProbe()
 // (what a driver re-entering another queue does).
 thread_local int t_role = 0;
 std::atomic<int> g_cross_arrived{0};
+std::atomic<int> g_cross_signaled{0};
 ID3D12CommandQueue* g_cross_queue[2] = {};
 test::ComPtr<ID3D12Fence> g_cross_fence[2];
 void CrossProbe()
@@ -81,6 +82,8 @@ void CrossProbe()
     for (int i = 0; i < 2000 && g_cross_arrived.load() < 2; ++i) Sleep(1);
     const int other = 1 - t_role;
     g_cross_queue[other]->Signal(g_cross_fence[other].Get(), 1);
+    ++g_cross_signaled;
+    for (int i = 0; i < 2000 && g_cross_signaled.load() < 2; ++i) Sleep(1);
 }
 
 test::ComPtr<ID3D12Resource> g_victim;
@@ -444,11 +447,12 @@ int main()
         a.join();
         b.join();
         na::observe::SetSampleAcquireProbeForTests(nullptr);
-        const na_sample_info c1 = WaitDone(t1), c2 = WaitDone(t2);
+        const na_sample_info c1 = Poll(t1), c2 = Poll(t2);
         const uint64_t nested = na::observe::GetProducerStats().nested_unlocked - nested0;
         std::printf("cross-queue re-entry: both threads finished, nested ops without lock %llu, samples %u/%u\n",
                     static_cast<unsigned long long>(nested), c1.status, c2.status);
-        CHECK(nested >= 2 && c1.status == NA_SAMPLE_READY && c2.status == NA_SAMPLE_READY);
+        CHECK(g_cross_signaled.load() == 2 && nested >= 2);
+        CHECK(c1.status == NA_SAMPLE_ARMED && c2.status == NA_SAMPLE_ARMED);
         na_observe_sample_release(t1);
         na_observe_sample_release(t2);
         test::ComPtr<ID3D12Fence> f;
@@ -565,6 +569,32 @@ int main()
         CHECK(Poll(t_unbound).status == NA_SAMPLE_ARMED); // no submission bound that range: no evidence
         na_observe_sample_release(t_cb);
         na_observe_sample_release(t_unbound);
+        // A bypassed operation while a copy is pending invalidates provenance
+        // even after ExecuteEnd returned. GPU ownership still lasts to its fence.
+        test::ComPtr<ID3D12Fence> pending_hold, nested_fence;
+        REQUIRE(SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&pending_hold))));
+        REQUIRE(SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&nested_fence))));
+        REQUIRE(SUCCEEDED(d.queue->Wait(pending_hold.Get(), 1)));
+        const uint64_t pending = Request(cbid, 0, 256, 0, 64, 1);
+        const uint64_t still_armed = Request(cbid, 0, 2048, 0, 64, 1);
+        REQUIRE(pending && still_armed);
+        d.queue->ExecuteCommandLists(1, ls);
+        CHECK(Poll(pending).status == NA_SAMPLE_IN_FLIGHT);
+        const auto outer = na::observe::ExecuteBegin(d.queue.Get());
+        REQUIRE(outer.submit_locked);
+        REQUIRE(SUCCEEDED(d.queue->Signal(nested_fence.Get(), 1)));
+        na::observe::ExecuteEnd(outer, d.queue.Get(), 0, nullptr);
+        REQUIRE(SUCCEEDED(pending_hold->Signal(1)));
+        d.WaitIdle();
+        const auto invalid = WaitDone(pending);
+        CHECK(invalid.status == NA_SAMPLE_FAILED && invalid.reason == NA_SAMPLE_E_ORDER_AMBIGUOUS);
+        std::printf("pending camera copy after nested queue signal: status %u reason %u\n", invalid.status, invalid.reason);
+        na_observe_sample_release(pending);
+        na_observe_sample_release(still_armed);
+        // Wait for this test's deferred GPU ownership to drain before the next
+        // case measures its deliberately quarantined entry count.
+        for (int i = 0; i < 500 && na::observe::GetProducerStats().samples_live; ++i) Sleep(2);
+        CHECK(na::observe::GetProducerStats().samples_live == 0);
         cb->Unmap(0, nullptr);
         CHECK(dev->GetDeviceRemovedReason() == S_OK);
     }
