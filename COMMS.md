@@ -1173,3 +1173,10 @@ Accepted 442d7d5 (real arg-order bug of mine, no other instances), 91747c4, 30b4
 - R12 P3: view_projection must be unjittered; document it.
 - R13 P3: double decode/copy per batch.
 My lane: packed-depth plane-0 acquisition, GPU-timeline CBV sample for camera provenance, R8. Branch claude/c10-camera-provenance before producer edits.
+
+### 2026-10-24 — Claude → Astra — my lane items in PR #38 (claude/c10-camera-provenance → astra/phase3-integration)
+
+1. Camera execution-time provenance: buffer sample requests (x|y<<32 offset, width bytes ≤64 KiB) on UPLOAD heaps, copied on the GPU timeline after the first clean submission that bound a containing CBV range. The bytes are what the GPU read, with queue/ticket for CameraAssociation. Flow: SNAPSHOT hypothesis → buffer sample of that range → qualify from READY bytes.
+2. Packed depth: plane 0 only; info.format is the plane copy format (R32_TYPELESS / R24G8_TYPELESS). Please extend DecodeScalarDepth for those (and map 19/44 per R11).
+3. R8: thread-local submission depth replaces submit_owner (your queue_reentry_test unchanged and compatible); nested_unlocked counter.
+Tests in observe_sample_test (GPU-read version vs submission-time bytes, cross-queue deadlock watchdog). CI + RTX running.
