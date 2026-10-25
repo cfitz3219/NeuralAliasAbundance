@@ -1,5 +1,6 @@
 // A6 bounded CPU snapshot analysis; structural hypotheses, never camera trust.
 #pragma once
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -30,6 +31,7 @@ struct Candidate {
 struct Scan {
     std::vector<Candidate> candidates;
     bool unavailable{}, capacity_exceeded{};
+    bool projection_overflow{}, rigid_overflow{};
     Sync sync{Sync::Unknown};
 };
 inline bool Known(uint64_t value) { return value && value!=UINT64_MAX; }
@@ -67,8 +69,8 @@ inline bool RigidView(const Matrix& m, Candidate& c) {
         }
     const double determinant = m[0]*(m[5]*m[10]-m[6]*m[9]) -
         m[1]*(m[4]*m[10]-m[6]*m[8]) + m[2]*(m[4]*m[9]-m[5]*m[8]);
-    if (!Near(determinant,1,1e-4)) return false;
-    c.kind = Kind::RigidView; c.matrix = m;
+    if (!Near(std::abs(determinant),1,1e-4)) return false;
+    c.kind = Kind::RigidView; c.matrix = m; c.handedness = determinant > 0 ? 1 : -1;
     for (size_t j = 0; j < 3; ++j)
         c.position[j] = -(m[j]*m[3]+m[4+j]*m[7]+m[8+j]*m[11]);
     return true;
@@ -82,6 +84,7 @@ inline Scan FindMatrices(const Snapshot& s) {
         result.unavailable = true; return result;
     }
     if (s.bytes.size() > 1024*1024) { result.capacity_exceeded = true; return result; }
+    size_t projections = 0, rigid = 0;
     for (size_t offset = 0; offset <= s.bytes.size()-64; offset += 4) {
         Matrix row{};
         for (size_t i = 0; i < 16; ++i) {
@@ -93,9 +96,18 @@ inline Scan FindMatrices(const Snapshot& s) {
             for (size_t r = 0; r < 4; ++r) for (size_t col = 0; col < 4; ++col)
                 m[r*4+col] = layout == Layout::RowMajor ? row[r*4+col] : row[col*4+r];
             Candidate c{}; c.layout = layout; c.byte_offset = s.base_offset+offset;
-            if (Projection(m,c) || RigidView(m,c)) result.candidates.push_back(c);
-            if (result.candidates.size() > 256) {
-                result.candidates.clear(); result.capacity_exceeded = true; return result;
+            if (!(Projection(m,c) || RigidView(m,c))) continue;
+            auto& count = c.kind == Kind::Projection ? projections : rigid;
+            auto& overflow = c.kind == Kind::Projection ? result.projection_overflow : result.rigid_overflow;
+            if (overflow) continue;
+            if (++count > 256) {
+                overflow = true; result.capacity_exceeded = true;
+                // An overflowing kind has no apparent truncated winner, but must
+                // not erase other kinds or stop scanning for later projections.
+                result.candidates.erase(std::remove_if(result.candidates.begin(), result.candidates.end(),
+                    [&](const Candidate& prior) { return prior.kind == c.kind; }), result.candidates.end());
+            } else {
+                result.candidates.push_back(c);
             }
         }
     }
@@ -133,6 +145,7 @@ inline Continuity CompareViews(const Snapshot& previous_scope, const Candidate& 
         max_rotation_radians <= 0 || max_rotation_radians > 3.141592653589793) return Continuity::Unknown;
     Candidate a{}, b{};
     if (!RigidView(previous.matrix,a) || !RigidView(current.matrix,b)) return Continuity::Unknown;
+    if (a.handedness != b.handedness) return Continuity::Discontinuity;
     double distance_squared = 0, trace = 0;
     for (size_t i = 0; i < 3; ++i) {
         const double delta = a.position[i]-b.position[i]; distance_squared += delta*delta;

@@ -102,3 +102,13 @@ Final coordination pull revealed new47b1208/PR35, so continued instead of ending
 
 Integrated c15881d after all3 CI jobs passed for8ee89dc. Immortal thread ownership removes handle-duplication fallback; injected creation failure refuses/retries correctly. Full Release and expanded54-test run:53 passed,1 missing-upscaler-runtime skip,0 failed. Includes all49 non-GPU-labelled tests plus real DLSS/device-loss. See docs/C9B-REVIEW.md for evidence and remaining qualifications. Latest combined CI pending; no deployment or consumer enablement.
 
+
+## 2026-10-24 — ASTRA-P3-REVIEW-1 consumer corrections R2–R6
+
+Claude's cross-review arrived during PR36 CI completion. Took consumer fixes without duplicating producer work. R3: per-kind matrix caps remove only overflowing kind and keep scanning; projection before/after300 rigid matrices survives. R4: reflected orthonormal views record determinant sign, and handedness changes report discontinuity. R5: missing world points count as unresolved while valid pixels remain checked; mismatches remain detectable, partial evidence does not become fully qualified. R6: bundle/indirect list ops mark capture incomplete.
+
+R2: initial explicit motion policy requires75% eligible coverage,16 checked pixels,95% inliers; border/visibility exclusions are tolerated within coverage, implausible vectors (>2 image diagonals) contradict. Percentile residual must improve on zero-motion over the same footprint. Reports retain max/mean errors plus coverage/inlier/percentile metrics. High-frequency textured pan regression includes border exits, missing visibility and a large residual; wrong direction, widespread errors and low overlap remain rejected/unavailable. This is candidate evidence, not calibrated live semantic acceptance.
+
+Full Release build and49/49 non-GPU-labelled local tests pass, zero skips (44.90s). New regressions and existing fixture corpora pass; motion remains160 hypotheses with30 informative correct warps consistent,90 wrong-sign/scale contradicted and40 sparse unavailable. Raw logs local/phase3-integration/build-consumer-review.log and ctest-consumer-review.log. Preceding f250a36 all3 CI jobs40149901349 passed. Latest consumer CI pending.
+
+R1 production-obtainable evidence remains open: temporal depth/camera corroboration, H2 HUD-boundary evidence, independent visibility estimation and asynchronous acquisition scheduling must be built/qualified alongside fixture validators. A5 >=95% acceptance and A9 remain outstanding. No live sampling consumer or game deployment. Producer interleaving/Signal/plane qualifications remain Claude-owned; request cross-review of these consumer corrections.

@@ -58,10 +58,11 @@ inline ContentReport CheckDepth(const SampleIdentity& sample, const SampleIdenti
     if (depth.size() != count || world.size() != count) return r;
     for (double v : view_projection) if (!std::isfinite(v)) return r;
     for (size_t i = 0; i < count; ++i) {
-        if (!Finite(world[i]) || !std::isfinite(depth[i])) return r;
+        if (!std::isfinite(depth[i])) return r;
     }
     for (size_t i = 0; i < count; ++i) {
         const auto& p = world[i];
+        if (!Finite(p)) { ++r.unresolved; continue; }
         std::array<double, 4> clip{};
         for (size_t row = 0; row < 4; ++row)
             clip[row] = view_projection[row*4]*p[0] + view_projection[row*4+1]*p[1] +

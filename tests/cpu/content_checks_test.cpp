@@ -5,6 +5,14 @@ static SampleIdentity key() { return {{1,2,3,4,5,6},7,8,0,1,1,true,true,true}; }
 static Matrix projection() { return {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}; }
 static CompositionWitness witness() { return {key(), {{{0.4,0.5,0.6}}}, {{{0.1,0.1,0.1}}}, {0.5}}; }
 int main() { return test::run({
+    {"sky leaves partial depth evidence available without qualifying missing pixels", [] {
+        auto k=key(); k.width=2;
+        const std::vector<Vec3> world={{{-0.5,0,0.5}},{{std::nan(""),0,0}}};
+        const auto partial=CheckDepth(k,k,{0.5,1},world,projection(),0,0,false);
+        CHECK(partial.checked==1 && partial.unresolved==1 && partial.result==ContentResult::Unavailable);
+        const auto bad=CheckDepth(k,k,{0.8,1},world,projection(),0,0,false);
+        CHECK(bad.checked==1 && bad.unresolved==1 && bad.result==ContentResult::Contradicted);
+    }},
     {"depth checks independent world position and camera", [] {
         CHECK(CheckDepth(key(),key(),{0.5},{{{0,0,0.5}}},projection(),0,0,false).result == ContentResult::Consistent);
         CHECK(CheckDepth(key(),key(),{0.8},{{{0,0,0.5}}},projection(),0,0,false).result == ContentResult::Contradicted);

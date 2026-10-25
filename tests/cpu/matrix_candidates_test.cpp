@@ -38,7 +38,7 @@ int main() { return test::run({
     {"rigid view recovers position but object transforms stay hypotheses", [] {
         Candidate c{}; CHECK(RigidView(view(2),c)); NEAR(c.position[0],2,1e-9);
         auto m=view(); m[0]=2; CHECK(!RigidView(m,c));
-        m=view(); m[0]=-1; CHECK(!RigidView(m,c));
+        m=view(); m[0]=-1; CHECK(RigidView(m,c) && c.handedness==-1);
         CHECK(FindMatrices(snapshot(view())).candidates.size()==2); // symmetric layout ambiguity
     }},
     {"snapshot losses unknown sync alignment and overflow fail visibly", [] {
@@ -54,6 +54,25 @@ int main() { return test::run({
         auto s=snapshot(view()); const auto bytes=s.bytes;
         for (unsigned i=0;i<300;++i) s.bytes.insert(s.bytes.end(),bytes.begin(),bytes.end());
         const auto r=FindMatrices(s); CHECK(r.capacity_exceeded && r.candidates.empty());
+    }},
+    {"rigid overflow preserves projections before and after flood", [] {
+        for (bool first : {false,true}) {
+            auto s=snapshot(view()); const auto bytes=s.bytes;
+            for (unsigned i=0;i<300;++i) s.bytes.insert(s.bytes.end(),bytes.begin(),bytes.end());
+            const auto p=snapshot(perspective());
+            if (first) s.bytes.insert(s.bytes.begin(),p.bytes.begin(),p.bytes.end());
+            else s.bytes.insert(s.bytes.end(),p.bytes.begin(),p.bytes.end());
+            const auto r=FindMatrices(s);
+            CHECK(r.capacity_exceeded && r.rigid_overflow && !r.projection_overflow);
+            CHECK(r.candidates.size()==1 && r.candidates[0].kind==Kind::Projection);
+        }
+    }},
+    {"handedness changes cannot appear continuous", [] {
+        auto prior=snapshot(view()), next=prior; ++next.submission; ++next.content_version;
+        auto reflected=view(); reflected[10]=-1;
+        Candidate a{},b{}; CHECK(RigidView(view(),a)); CHECK(RigidView(reflected,b));
+        CHECK(CompareViews(prior,a,next,b,true,1,3)==Continuity::Discontinuity);
+        CHECK(CompareViews(prior,b,next,b,true,1,3)==Continuity::Continuous);
     }},
     {"jitter measurement requires matching independent reference", [] {
         Candidate reference{},current{}; CHECK(Projection(perspective(),reference));

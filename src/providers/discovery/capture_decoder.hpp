@@ -136,6 +136,9 @@ inline DecodedBatch DecodeBatch(const void* input, size_t readable) {
                 e.payload_bytes > h.size_bytes-e.payload_offset)) return {};
             uint64_t count=0; size_t element=0;
             switch (e.op) {
+            case NA_OP_EXECUTE_BUNDLE: case NA_OP_EXECUTE_INDIRECT:
+                result.incomplete_capture=true; // Nested recording / GPU argument provenance not established.
+                break;
             case NA_OP_SET_ROOT_CONSTANTS: count=e.a[2];element=4;break;
             case NA_OP_OM_SET_RENDER_TARGETS:
                 if(e.a[0]>8 || e.a[1]>1) return {};

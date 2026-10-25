@@ -33,7 +33,10 @@ struct Report {
     Verdict verdict{Verdict::Unavailable};
     size_t eligible{}, checked{}, excluded{}, out_of_bounds{};
     double mean_error{}, max_error{}, zero_motion_error{}, mean_magnitude{};
+    double coverage{}, inlier_fraction{}, percentile_error{}, zero_percentile_error{};
 };
+// Initial worker-side evidence policy, not calibrated live-game acceptance.
+struct Policy { double minimum_coverage{0.75}, minimum_inliers{0.95}; };
 inline bool Known(uint64_t value) { return value && value!=UINT64_MAX; }
 inline bool Valid(const Frame& f) {
     if (!Known(f.session) || !Known(f.epoch) || !Known(f.frame) || !f.width || !f.height || f.width>4096 || f.height>4096 ||
@@ -65,7 +68,7 @@ inline double Error(const Color& a,const Color& b) {
     return (std::abs(a[0]-b[0])+std::abs(a[1]-b[1])+std::abs(a[2]-b[2]))/3;
 }
 inline Report Evaluate(const Frame& previous,const Frame& current,const Motion& motion,
-    const Convention& convention,double tolerance=0.01) {
+    const Convention& convention,double tolerance=0.01,Policy policy={}) {
     Report r{};
     if (!Valid(previous) || !Valid(current) || current.reset ||
         previous.session!=current.session || previous.epoch!=current.epoch ||
@@ -76,20 +79,28 @@ inline Report Evaluate(const Frame& previous,const Frame& current,const Motion& 
         motion.values.size()!=current.color.size() ||
         !std::isfinite(convention.scale_x) || !std::isfinite(convention.scale_y) ||
         convention.scale_x==0 || convention.scale_y==0 ||
-        !std::isfinite(tolerance) || tolerance<=0 || tolerance>0.1) return r;
+        !std::isfinite(tolerance) || tolerance<=0 || tolerance>0.1 ||
+        !std::isfinite(policy.minimum_coverage) || policy.minimum_coverage<=0 || policy.minimum_coverage>1 ||
+        !std::isfinite(policy.minimum_inliers) || policy.minimum_inliers<=0 || policy.minimum_inliers>1) return r;
     for (const auto& v:motion.values) for (double c:v) if (!std::isfinite(c)) return r;
     const double jitter_x=previous.jitter_x-current.jitter_x;
     const double jitter_y=previous.jitter_y-current.jitter_y;
+    std::vector<double> errors, baselines;
+    size_t inliers=0, implausible=0;
+    const double max_motion=2*std::hypot(double(current.width),double(current.height));
     for (size_t i=0;i<current.color.size();++i) {
         if (!current.stable[i]) continue;
         ++r.eligible;
         const double x=double(i%current.width),y=double(i/current.width);
         const double mx=motion.values[i][0]*convention.scale_x;
         const double my=motion.values[i][1]*convention.scale_y;
+        if (!std::isfinite(mx) || !std::isfinite(my) || std::hypot(mx,my)>max_motion) {
+            ++implausible; ++r.out_of_bounds; continue;
+        }
         const double px=x+mx+(convention.includes_jitter ? 0 : jitter_x);
         const double py=y+my+(convention.includes_jitter ? 0 : jitter_y);
-        // Compare on the SAME independently visible footprint. A candidate cannot
-        // improve its residual by sending difficult pixels off screen.
+        // Compare candidate and zero motion on the SAME footprint. Border exits
+        // are exclusions; minimum coverage prevents off-screen evasion.
         if (!std::isfinite(px) || !std::isfinite(py) || px<0 || py<0 || px>previous.width-1 || py>previous.height-1) {
             ++r.out_of_bounds; continue;
         }
@@ -99,6 +110,8 @@ inline Report Evaluate(const Frame& previous,const Frame& current,const Motion& 
         }
         ++r.checked;
         const double error=Error(current.color[i],warped);
+        errors.push_back(error); baselines.push_back(Error(current.color[i],zero));
+        if (error<=tolerance) ++inliers;
         r.mean_error+=error; r.max_error=std::max(r.max_error,error);
         r.zero_motion_error+=Error(current.color[i],zero);
         r.mean_magnitude+=std::hypot(mx,my);
@@ -108,11 +121,17 @@ inline Report Evaluate(const Frame& previous,const Frame& current,const Motion& 
         r.zero_motion_error/=static_cast<double>(r.checked);
         r.mean_magnitude/=static_cast<double>(r.checked);
     }
-    if (r.out_of_bounds) { r.verdict=Verdict::Contradicted; return r; }
-    if (r.checked<16 || r.excluded || !r.eligible) return r;
+    if (implausible) { r.verdict=Verdict::Contradicted; return r; }
+    if (r.eligible) r.coverage=double(r.checked)/double(r.eligible);
+    if (r.checked) r.inlier_fraction=double(inliers)/double(r.checked);
+    if (r.checked<16 || !r.eligible || r.coverage<policy.minimum_coverage) return r;
     if (!std::isfinite(r.mean_error) || !std::isfinite(r.zero_motion_error) || !std::isfinite(r.mean_magnitude)) return r;
-    if (r.max_error>tolerance) r.verdict=Verdict::Contradicted;
-    else if (r.zero_motion_error<=tolerance || r.zero_motion_error-r.mean_error<tolerance)
+    const size_t rank=static_cast<size_t>(std::ceil(policy.minimum_inliers*double(r.checked)))-1;
+    std::nth_element(errors.begin(),errors.begin()+rank,errors.end());
+    std::nth_element(baselines.begin(),baselines.begin()+rank,baselines.end());
+    r.percentile_error=errors[rank]; r.zero_percentile_error=baselines[rank];
+    if (r.inlier_fraction<policy.minimum_inliers) r.verdict=Verdict::Contradicted;
+    else if (r.zero_percentile_error<=tolerance || r.zero_percentile_error-r.percentile_error<tolerance)
         r.verdict=Verdict::Ambiguous; // static/flat scenes cannot identify an MV buffer
     else r.verdict=Verdict::Consistent;
     return r;

@@ -2,14 +2,16 @@
 
 matrix_candidates.hpp scans float32 CPU snapshots (4-byte aligned, at most 1 MiB)
 for perspective projection and rigid-view matrix hypotheses in row/column storage.
-At most 256 hypotheses are returned; overload discards the result explicitly.
+At most 256 hypotheses per kind are returned. Overflow discards that kind and
+sets its explicit overflow flag, while scanning continues for the other kind.
 Snapshots retain session/epoch/submission/resource/content identity and synchronization
 status. App-sync-unknown stays unknown: copying CPU bytes does not prove GPU values.
 No wire ABI or host memory access is introduced.
 
 Perspective coverage: conventional D3D normalized depth, left/right handed,
 forward/reverse depth, finite/infinite far, off-axis offsets. Rigid views require
-orthonormal rotation with determinant +1. Unsupported shapes remain undiscovered;
+orthonormal axes with determinant +1 or -1, recorded as handedness. A handedness
+change is a discontinuity. Unsupported shapes remain undiscovered;
 this includes packed 3x4, oblique projection, arbitrary combined view-projection,
 non-float32 or scaled coordinate conventions. Those are acquisition work, not
 claims of absence. Object transforms/shadow cameras may have identical structure.

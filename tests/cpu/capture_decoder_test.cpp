@@ -135,6 +135,10 @@ int main() { return test::run({
         CHECK(!Decode(Packet(e,NA_EV_LIST_OP)).valid);
         e.op=NA_OP_RS_SCISSOR;CHECK(!Decode(Packet(e,NA_EV_LIST_OP)).valid);
         e.op=9999;CHECK(Decode(Packet(e,NA_EV_LIST_OP)).incomplete_capture);
+        for (auto op : {NA_OP_EXECUTE_BUNDLE,NA_OP_EXECUTE_INDIRECT}) {
+            e.op=op; const auto nested=Decode(Packet(e,NA_EV_LIST_OP));
+            CHECK(nested.valid && nested.incomplete_capture);
+        }
         e.op=NA_OP_RESOURCE_BARRIER;e.a[0]=100;e.hdr.flags=NA_EVF_TRUNCATED;
         auto d=Decode(Packet(e,NA_EV_LIST_OP));CHECK(d.valid&&d.incomplete_capture);
     }},

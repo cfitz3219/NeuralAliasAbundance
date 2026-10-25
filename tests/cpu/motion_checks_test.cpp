@@ -46,9 +46,29 @@ int main() { return test::run({
         auto p=make(); for (auto& v:p.motion.values) v={1000,1000};
         const auto r=run(p); CHECK(r.verdict==Verdict::Contradicted && r.out_of_bounds>0);
     }},
-    {"one bad correspondence is not diluted by a large correct image", [] {
+    {"isolated outliers are reported while widespread errors contradict", [] {
         auto p=make(); p.motion.values[8*32+8]={0,0};
+        CHECK(run(p).verdict==Verdict::Consistent && run(p).inlier_fraction<1);
+        for (unsigned y=4;y<10;++y) for(unsigned x=5;x<26;++x) p.motion.values[y*32+x]={0,0};
         CHECK(run(p).verdict==Verdict::Contradicted);
+    }},
+    {"textured pan tolerates border exits sparse visibility and residual outliers", [] {
+        auto p=make(1,0);
+        for (unsigned y=0;y<24;++y) for(unsigned x=0;x<32;++x) {
+            const double v=double((x*37+y*61+x*y*13)%101)/100;
+            p.previous.color[y*32+x]={v,1-v,v*v};
+            p.current.stable[y*32+x]=1;
+        }
+        for (unsigned y=0;y<24;++y) for(unsigned x=0;x<32;++x)
+            p.current.color[y*32+x]=p.previous.color[y*32+std::min(x+1,31u)];
+        p.previous.stable[8*32+8]=0;
+        p.current.color[10*32+10]={3,3,3};
+        const auto r=run(p);
+        CHECK(r.verdict==Verdict::Consistent && r.out_of_bounds==24 && r.excluded>0);
+        CHECK(r.coverage>0.9 && r.inlier_fraction>0.95 && r.max_error>1);
+        CHECK(run(p,{-1,1,false}).verdict==Verdict::Contradicted);
+        for (auto& v:p.motion.values) v={20,0};
+        CHECK(run(p).verdict==Verdict::Unavailable); // plausible but insufficient overlap
     }},
     {"cut gaps epochs and uncompleted snapshots require reacquisition", [] {
         auto p=make(); p.current.reset=true; CHECK(run(p).verdict==Verdict::Unavailable);
