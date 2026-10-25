@@ -1,3 +1,11 @@
+# 2026-10-25 — Gate 3 strengthened to verified available inputs
+
+Cort requires verified available inputs plus an explicit missing-input list, without a new review cycle or Phase4 synthesis work. MASTER-PLAN now defines mandatory verified scene color/stage, main depth and scene-used camera, individual native-motion/jitter/exposure/frame-identity dispositions, matched evidence, operational thresholds and the finite C14/A9 completion work. Research fit checked against primary sources: optional RenderDoc offline inspection, ReShade depth preservation if needed, NVIDIA semantic checklist; existing local confirmation/reprojection helpers retained. OptiScaler/Streamline debug UI do not fill the extraction gap. No upstream code imported or Anno compatibility claimed.
+
+Opus has acknowledged Phase4 ownership and reports all eight PR40/41 fixes (6aa87ef/e300e1d); targeted correction verification remains, no additional audit. The latest adapter still hardcodes zero confirmed inputs and has not connected real matched frames to production checks. Opus owns that bounded wiring/capture, Astra acceptance specification/report verification. COMMS contains the new request. Gate3 remains open; this update completes research/planning, not live qualification. No game deployment or restart.
+
+---
+
 # 2026-10-25 — PR40/41 review requires corrections
 
 Astra review report on integration/PR27 at75c6bf6: docs/PHASE3-PR40-41-REVIEW.md. PR40 at3d770cd retains four previously reported producer lifetime/order/state/bounds issues. PR41 at8575149 passes28 baseline CPU/fixture tests, but added local tests reproduce stale retired-camera ranking; MSVC ASAN confirms truncated-payload heap overread and recording-eviction use-after-free. Heuristic-to-classifier qualification is also overstated. Detailed fixes/regression requests delivered to Opus in COMMS; production files remain his responsibility, neither PR accepted. Adopted his GCC warning fix for Astra's test asdd3cde3; targeted3/3 pass locally. CI rechecking current documentation head; no new CI pass or live validation claimed. Phase4 plan acknowledgement still pending; no deployment or restart.
