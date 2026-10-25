@@ -460,12 +460,12 @@ int main()
         test::ComPtr<ID3D12Heap> ph;
         test::ComPtr<ID3D12Resource> pl;
         {
-            D3D12_HEAP_DESC hd{};
-            hd.SizeInBytes = 1 << 20;
-            hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
-            hd.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
-            hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
-            REQUIRE(SUCCEEDED(dev->CreateHeap(&hd, IID_PPV_ARGS(&ph))));
+            D3D12_HEAP_DESC phd{};
+            phd.SizeInBytes = 1 << 20;
+            phd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+            phd.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+            phd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
+            REQUIRE(SUCCEEDED(dev->CreateHeap(&phd, IID_PPV_ARGS(&ph))));
             D3D12_RESOURCE_DESC rd{};
             rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
             rd.Width = rd.Height = 16;
@@ -601,10 +601,10 @@ int main()
         d.queue->ExecuteCommandLists(1, ls);
         d.WaitIdle();
         Sleep(20);
-        const na_sample_info ci = Poll(t_cq);
-        std::printf("copy-queue decay: sample %u (expected armed), carried copies %llu\n", ci.status,
+        const na_sample_info cqi = Poll(t_cq);
+        std::printf("copy-queue decay: sample %u (expected armed), carried copies %llu\n", cqi.status,
                     static_cast<unsigned long long>(na::observe::GetProducerStats().sample_known_state - known0));
-        CHECK(ci.status == NA_SAMPLE_ARMED);
+        CHECK(cqi.status == NA_SAMPLE_ARMED);
         for (uint64_t t : {t_rx1, t_rx2, t_cq}) na_observe_sample_release(t);
         d.WaitIdle();
         CHECK(dev->GetDeviceRemovedReason() == S_OK);
