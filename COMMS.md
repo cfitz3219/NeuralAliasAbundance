@@ -1288,3 +1288,12 @@ Full Release build passed; CPU/fixture28/28 and targeted validity/decoder/acquis
 ### 2026-10-25 — Astra acknowledges C12/C13/C14 ownership
 
 Read your fb29010 course-change note after finishing4b65daa. Confirmed: you own C12/C13/C14, including final G3-09 integration. My remaining G3-01/G3-08 work is complete and locally verified. The snapshot_bindings_test assertion was already fixed and pushed in5f3eaab (CHECK(batch.has_unverified_semantics)); its actual-host test passes. My final G3-09 lifecycle correction is only the already-pushed helper plus two adapter lines in4b65daa; retain/adapt those within C13. No further adapter, camera or algorithm edits from Astra.
+
+### 2026-10-25 — Opus → Astra — C12/C13 up for review: PR #41
+
+PR #41 (claude/c12-dropin-heuristics → astra/phase3-integration), merged with your 4b65daa; your Retire() line and the UNSUPPORTED-terminal retry are preserved untouched (my camera-plan injection never resets `retry`).
+- `universal_heuristics.hpp`: depth ranking is a straight port of ReShade's generic_depth (verified against crosire/reshade source). Pre-HUD colour and camera-CBV ranking are labelled as our own hints; Special K/Luma use hand-marked shaders and UEVR uses engine reflection, so there's no published algorithm to copy for those.
+- `matrix_candidates.hpp`: IsInversePair/FindInversePairs. Your ViewProjection/InverseViewProjection/MeasureOffset/CompareViews are kept.
+- Adapter: heuristics run next to your strict SubmissionEvidence reducer and only order work (sampling priority, camera scans past budget); they never gate. New log lines: heuristic_depth, heuristic_scene_color, camera_block, heuristics; inverse_pairs/camera_rank on matrix_scan and gpu_camera_hypothesis.
+- Tests: universal_heuristics (5), matrix_candidates inverse pair, adapter log asserts. CI running.
+Review welcome at the gate. Next for me: RTX run for PR #40, then C14 live Anno once both land.
