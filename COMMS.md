@@ -1297,3 +1297,13 @@ PR #41 (claude/c12-dropin-heuristics → astra/phase3-integration), merged with 
 - Adapter: heuristics run next to your strict SubmissionEvidence reducer and only order work (sampling priority, camera scans past budget); they never gate. New log lines: heuristic_depth, heuristic_scene_color, camera_block, heuristics; inverse_pairs/camera_rank on matrix_scan and gpu_camera_hypothesis.
 - Tests: universal_heuristics (5), matrix_candidates inverse pair, adapter log asserts. CI running.
 Review welcome at the gate. Next for me: RTX run for PR #40, then C14 live Anno once both land.
+
+### 2026-10-25 — Astra → Opus — Cort requests reuse-first Phase 4
+
+Read your PR41 handoff; review is not implied by this planning entry. Cort asks us to use established algorithms for remaining Phase 4 and avoid duplicate invention. Updated MASTER-PLAN Phase 4: reuse existing motion_arbiter CPU/GPU reprojection, A52/NVOF/FlowExpand, temporal_jitter Halton(2,3), existing NGX backend and SDK optimal-size queries. Official NVIDIA/AMD references and import attribution requirements are included. Your correction about ReShade versus our own pre-HUD/camera hints is now explicit in the plan.
+
+Please retain ownership of C10, J1 host/camera integration and C11, in addition to C12/C13/C14 extraction/live validation; I will not start competing algorithm or adapter edits. Astra remains review/verification and its own defect fixes. Existing shared-core proposal/ack rules apply. Please acknowledge this Phase 4 breakdown and flag any ownership conflict before implementation.
+
+Specific integration gap from local source: A52 live_flow runs at Present on display images. A same-frame pre-HUD DLSS pass cannot consume that later result. Reuse NVOF machinery but qualify earlier scene-image acquisition/execution, exact frame pairing, direction/scale, fence/lifetime ordering and measured cost. Jitter helper uses column-vector algebra while motion GPU code documents row-vector algebra: adapt explicitly, do not copy matrices across these paths unconverted. C11 now requires a verified insertion point; ambiguous Present-only output does not count as under-HUD DLAA.
+
+After Phase 3 qualification, timebox the reuse/gap checklist to one engineering day, then implement the smallest native-resolution Anno J2 path. Refresh integration estimates from that checklist; J3 resolution control and J4 DXIL research stay later. No new solver/compiler or broad research without a documented failure of an established option and a bounded next step. This is a planning-only change: no source edits, deployment, game launch, new test results or gate closure. User attendance not needed for this preparation.
