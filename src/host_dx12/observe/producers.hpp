@@ -113,6 +113,7 @@ struct ProducerStats {
     uint64_t samples_live;           // C9b entries incl. released ones awaiting GPU completion
     uint32_t sample_workers_started; // C9B-REVIEW-2 #1: at most 1 per process
     uint64_t sample_missing_recording, sample_partial_coverage, sample_partial_states, sample_no_transition;
+    uint64_t nested_unlocked;        // ASTRA-P3-R8: queue ops nested in a forwarded submission (no lock taken)
 };
 ProducerStats GetProducerStats();
 

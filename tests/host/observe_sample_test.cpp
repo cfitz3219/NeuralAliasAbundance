@@ -30,7 +30,15 @@
 //      and its copy, another thread's submission on the same queue is blocked;
 //   signal failure: copy submitted but the fence signal refused -> FAILED /
 //      SUBMIT_FAILED, entry quarantined (kept) even after release;
-//   plane count: a two-plane depth-stencil resource (D24S8) is refused whole.
+//   packed depth: D24S8 / D32S8X24 copy plane 0 (depth) only, reported in the
+//      plane's own format, with the cleared depth value;
+//   C10 execution-time constant data: an upload-buffer range bound by the
+//      submission is copied on the GPU timeline after it; when the CPU rewrites
+//      the range between submission and execution, the sample holds the version
+//      the GPU read (not the submission-time CPU bytes); an unbound range stays
+//      armed;
+//   R8: two threads each holding their queue's submission lock re-enter the
+//      other queue: no deadlock, both samples complete.
 #include "test_support.hpp"
 #include "host_dx12/host_observe.h"
 #include "host_dx12/host_observe_samples.h"
@@ -58,6 +66,21 @@ void InterleaveProbe()
     for (int i = 0; i < 1000 && !g_b_started.load(); ++i) Sleep(1);
     Sleep(50); // ample time for an unserialized submission to complete
     g_b_blocked_during_copy.store(g_b_started.load() && !g_b_returned.load());
+}
+
+// R8 probe: each submitting thread, holding its own queue's submission lock,
+// waits for the other, then performs an observed queue op on the OTHER queue
+// (what a driver re-entering another queue does).
+thread_local int t_role = 0;
+std::atomic<int> g_cross_arrived{0};
+ID3D12CommandQueue* g_cross_queue[2] = {};
+test::ComPtr<ID3D12Fence> g_cross_fence[2];
+void CrossProbe()
+{
+    ++g_cross_arrived;
+    for (int i = 0; i < 2000 && g_cross_arrived.load() < 2; ++i) Sleep(1);
+    const int other = 1 - t_role;
+    g_cross_queue[other]->Signal(g_cross_fence[other].Get(), 1);
 }
 
 test::ComPtr<ID3D12Resource> g_victim;
@@ -375,24 +398,174 @@ int main()
         CHECK(dev->GetDeviceRemovedReason() == S_OK);
     }
 
-    // ---- Gate 3: plane count (D24S8 has two planes) ----
+    // ---- ASTRA-P3-R8: cross-queue re-entry while both queues hold submission locks ----
     {
-        auto ds = test::CreateTexture(dev, 32, 16, DXGI_FORMAT_D24_UNORM_S8_UINT, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
-        REQUIRE(ds);
-        const na_object_id dsid = na::observe::IdOf(ds.Get());
-        REQUIRE(dsid);
-        const uint64_t t_pl = Request(dsid); // whole: only the plane rule can refuse it
-        REQUIRE(t_pl);
+        D3D12_COMMAND_QUEUE_DESC qd{};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        test::ComPtr<ID3D12CommandQueue> q2;
+        REQUIRE(SUCCEEDED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q2))));
+        test::ComPtr<ID3D12CommandAllocator> alloc2;
+        test::ComPtr<ID3D12GraphicsCommandList> list2;
+        REQUIRE(SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc2))));
+        REQUIRE(SUCCEEDED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc2.Get(), nullptr, IID_PPV_ARGS(&list2))));
+        auto tex2 = test::CreateTexture(dev, 16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        REQUIRE(tex2);
+        REQUIRE(SUCCEEDED(list2->Close()));
+        REQUIRE(SUCCEEDED(alloc2->Reset()));
+        REQUIRE(SUCCEEDED(list2->Reset(alloc2.Get(), nullptr))); // a recording that begins under observation
+        {
+            D3D12_RESOURCE_BARRIER bb = test::Transition(tex2.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list2->ResourceBarrier(1, &bb);
+            REQUIRE(SUCCEEDED(list2->Close()));
+        }
         record([&] {
-            D3D12_RESOURCE_BARRIER bb = test::Transition(ds.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+            D3D12_RESOURCE_BARRIER bb = test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &bb);
+            bb = test::Transition(color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
             list->ResourceBarrier(1, &bb);
         });
-        d.queue->ExecuteCommandLists(1, ls);
-        const na_sample_info pi = WaitDone(t_pl);
-        std::printf("plane count: D24S8 whole request status %u reason %u\n", pi.status, pi.reason);
-        CHECK(pi.status == NA_SAMPLE_FAILED && pi.reason == NA_SAMPLE_E_UNSUPPORTED);
-        na_observe_sample_release(t_pl);
+        REQUIRE(SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_cross_fence[0]))));
+        REQUIRE(SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_cross_fence[1]))));
+        g_cross_queue[0] = d.queue.Get();
+        g_cross_queue[1] = q2.Get();
+        const uint64_t t1 = Request(color_id), t2 = Request(na::observe::IdOf(tex2.Get()));
+        REQUIRE(t1 && t2);
+        const uint64_t nested0 = na::observe::GetProducerStats().nested_unlocked;
+        na::observe::SetSampleAcquireProbeForTests(&CrossProbe);
+        std::atomic<int> done{0};
+        std::thread a([&] { t_role = 0; ID3D12CommandList* l1[] = {list.Get()}; d.queue->ExecuteCommandLists(1, l1); ++done; });
+        std::thread b([&] { t_role = 1; ID3D12CommandList* l2[] = {list2.Get()}; q2->ExecuteCommandLists(1, l2); ++done; });
+        for (int i = 0; i < 1000 && done.load() < 2; ++i) Sleep(10);
+        if (done.load() < 2) { // the pre-R8 code deadlocks here: never hang the suite
+            std::printf("FATAL cross-queue re-entry deadlock (both submission locks held)\n");
+            std::fflush(stdout);
+            TerminateProcess(GetCurrentProcess(), 1);
+        }
+        a.join();
+        b.join();
+        na::observe::SetSampleAcquireProbeForTests(nullptr);
+        const na_sample_info c1 = WaitDone(t1), c2 = WaitDone(t2);
+        const uint64_t nested = na::observe::GetProducerStats().nested_unlocked - nested0;
+        std::printf("cross-queue re-entry: both threads finished, nested ops without lock %llu, samples %u/%u\n",
+                    static_cast<unsigned long long>(nested), c1.status, c2.status);
+        CHECK(nested >= 2 && c1.status == NA_SAMPLE_READY && c2.status == NA_SAMPLE_READY);
+        na_observe_sample_release(t1);
+        na_observe_sample_release(t2);
+        test::ComPtr<ID3D12Fence> f;
+        REQUIRE(SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f))));
+        REQUIRE(SUCCEEDED(q2->Signal(f.Get(), 1)));
+        for (int i = 0; i < 500 && f->GetCompletedValue() < 1; ++i) Sleep(2);
         d.WaitIdle();
+        g_cross_fence[0].Reset();
+        g_cross_fence[1].Reset();
+        CHECK(dev->GetDeviceRemovedReason() == S_OK);
+    }
+
+    // ---- packed depth-stencil: plane 0 (depth) copied, stencil untouched ----
+    {
+        test::ComPtr<ID3D12DescriptorHeap> pdsv;
+        D3D12_DESCRIPTOR_HEAP_DESC pd{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&pd, IID_PPV_ARGS(&pdsv))));
+        const UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        const DXGI_FORMAT fmts[2] = {DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT};
+        for (int k = 0; k < 2; ++k) {
+            auto ds = test::CreateTexture(dev, 32, 16, fmts[k], D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+            REQUIRE(ds);
+            const D3D12_CPU_DESCRIPTOR_HANDLE h{pdsv->GetCPUDescriptorHandleForHeapStart().ptr + k * inc};
+            dev->CreateDepthStencilView(ds.Get(), nullptr, h);
+            const na_object_id dsid = na::observe::IdOf(ds.Get());
+            REQUIRE(dsid);
+            const uint64_t t_pl = Request(dsid);
+            REQUIRE(t_pl);
+            record([&] {
+                list->ClearDepthStencilView(h, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.375f, 0x5A, 0, nullptr);
+                D3D12_RESOURCE_BARRIER bb = test::Transition(ds.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_DEPTH_READ);
+                list->ResourceBarrier(1, &bb);
+            });
+            d.queue->ExecuteCommandLists(1, ls);
+            const na_sample_info pi = WaitDone(t_pl);
+            double v = -1;
+            const auto px = pi.status == NA_SAMPLE_READY ? Read(t_pl, pi) : std::vector<uint8_t>{};
+            if (px.size() >= 5 * pi.row_pitch + 8 * 4) {
+                uint32_t raw = 0;
+                std::memcpy(&raw, px.data() + 5 * pi.row_pitch + 7 * 4, 4);
+                if (pi.format == DXGI_FORMAT_R32_TYPELESS || pi.format == DXGI_FORMAT_R32_FLOAT || pi.format == DXGI_FORMAT_D32_FLOAT) {
+                    float f = 0;
+                    std::memcpy(&f, &raw, 4);
+                    v = f;
+                } else if (pi.format == DXGI_FORMAT_R24G8_TYPELESS || pi.format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS ||
+                           pi.format == DXGI_FORMAT_D24_UNORM_S8_UINT) {
+                    v = double(raw & 0xFFFFFFu) / double(0xFFFFFF);
+                }
+            }
+            std::printf("packed depth %s: status %u reason %u plane format %u %ux%u state_before 0x%x depth %.6f\n", k ? "D32S8X24" : "D24S8", pi.status,
+                        pi.reason, pi.format, pi.width, pi.height, pi.state_before, v);
+            CHECK(pi.status == NA_SAMPLE_READY && pi.width == 32 && pi.height == 16 && pi.state_before == D3D12_RESOURCE_STATE_DEPTH_READ);
+            CHECK(pi.format != static_cast<uint32_t>(fmts[k])); // the copied plane's format, not the packed resource's
+            CHECK(v > 0.37499 && v < 0.37501);
+            na_observe_sample_release(t_pl);
+            d.WaitIdle();
+        }
+        CHECK(dev->GetDeviceRemovedReason() == S_OK);
+    }
+
+    // ---- C10: execution-time constant data (upload buffer range) ----
+    {
+        D3D12_ROOT_PARAMETER param{};
+        param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        param.Descriptor = {0, 0};
+        D3D12_ROOT_SIGNATURE_DESC rsd{1, &param, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        test::ComPtr<ID3DBlob> blob, err;
+        REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err)));
+        test::ComPtr<ID3D12RootSignature> rs;
+        REQUIRE(SUCCEEDED(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rs))));
+        auto cb = test::CreateBuffer(dev, 4096, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        REQUIRE(cb);
+        float* cpu = nullptr;
+        REQUIRE(SUCCEEDED(cb->Map(0, nullptr, reinterpret_cast<void**>(&cpu))));
+        for (int i = 0; i < 16; ++i) cpu[64 + i] = float(i + 1); // version A at byte 256 (submission time)
+        const na_object_id cbid = na::observe::IdOf(cb.Get());
+        REQUIRE(cbid);
+        {
+            na_sample_request bad{};
+            bad.size_bytes = sizeof(bad);
+            bad.resource = cbid;
+            uint64_t tok = 0;
+            CHECK(na_observe_sample_request(&bad, &tok) == NA_E_ARG); // buffer: width (byte count) required
+        }
+        const uint64_t t_cb = Request(cbid, 0, 256, 0, 64, 1), t_unbound = Request(cbid, 0, 2048, 0, 64, 1);
+        REQUIRE(t_cb && t_unbound);
+        record([&] {
+            list->SetGraphicsRootSignature(rs.Get());
+            list->SetGraphicsRootConstantBufferView(0, cb->GetGPUVirtualAddress() + 256);
+        });
+        test::ComPtr<ID3D12Fence> hold;
+        REQUIRE(SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&hold))));
+        REQUIRE(SUCCEEDED(d.queue->Wait(hold.Get(), 1))); // the GPU has not executed anything below yet
+        d.queue->ExecuteCommandLists(1, ls);
+        for (int i = 0; i < 16; ++i) cpu[64 + i] = float(100 + i); // version B: what the GPU will actually read
+        REQUIRE(SUCCEEDED(hold->Signal(1)));
+        d.WaitIdle();
+        const na_sample_info bi = WaitDone(t_cb);
+        const auto bytes = bi.status == NA_SAMPLE_READY ? Read(t_cb, bi) : std::vector<uint8_t>{};
+        bool is_b = bytes.size() == 64, is_a = bytes.size() == 64;
+        for (int i = 0; i < 16 && bytes.size() == 64; ++i) {
+            float f = 0;
+            std::memcpy(&f, bytes.data() + i * 4, 4);
+            is_b = is_b && f == float(100 + i);
+            is_a = is_a && f == float(i + 1);
+        }
+        std::printf("buffer sample: status %u reason %u offset %u bytes %u format %u state_before 0x%x ticket %llu; execution-time version %s; unbound range status %u\n",
+                    bi.status, bi.reason, bi.x, bi.width, bi.format, bi.state_before, static_cast<unsigned long long>(bi.queue_ticket),
+                    is_b ? "B (GPU-read)" : (is_a ? "A (submission-time, WRONG)" : "neither"), Poll(t_unbound).status);
+        CHECK(bi.status == NA_SAMPLE_READY && bi.x == 256 && bi.width == 64 && bi.format == 0 && bi.state_before == D3D12_RESOURCE_STATE_GENERIC_READ);
+        CHECK(bi.queue == na::observe::IdOf(d.queue.Get()) && bi.queue_ticket != 0);
+        CHECK(is_b);
+        CHECK(Poll(t_unbound).status == NA_SAMPLE_ARMED); // no submission bound that range: no evidence
+        na_observe_sample_release(t_cb);
+        na_observe_sample_release(t_unbound);
+        cb->Unmap(0, nullptr);
+        CHECK(dev->GetDeviceRemovedReason() == S_OK);
     }
 
     // ---- Gate 3: signal failure -> quarantine ----

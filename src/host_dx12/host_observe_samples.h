@@ -39,6 +39,23 @@
  *  - Leases are scoped to the session and epoch of the request: stop or
  *    resync ends them (SESSION_ENDED).
  *  - The host owns every GPU object involved.
+ *
+ * Packed depth-stencil (D24S8, D32S8X24 and typeless families): the request
+ * names a plane-0 subresource (mip/array index); only the depth plane is
+ * transitioned and copied, and na_sample_info.format is that plane's copy
+ * format (e.g. R32_TYPELESS / R24G8_TYPELESS), not the packed resource format.
+ *
+ * Buffer ranges (C10, execution-time constant data): for a BUFFER resource,
+ * x | (y << 32) is the byte offset, width the byte count (1..65536), height 0
+ * or 1, subresource 0. Only UPLOAD-heap buffers (permanently GENERIC_READ, not
+ * GPU-writable) are copied, at the end of the first clean submission whose
+ * observed recordings bound a constant-buffer range containing it. The copy
+ * is queued before the application can signal its own fence for that work,
+ * so the application may not rewrite the range until the copy has run: the
+ * bytes are those the submission's GPU work read (unlike NA_EV_SNAPSHOT's
+ * APP_SYNC_UNKNOWN CPU bytes). Reported: format 0, width = bytes, height 1,
+ * row_pitch = bytes, state_before GENERIC_READ, queue/queue_ticket of that
+ * submission. Other heaps: NA_SAMPLE_E_UNSUPPORTED.
  */
 #ifndef NA_HOST_OBSERVE_SAMPLES_H
 #define NA_HOST_OBSERVE_SAMPLES_H
@@ -64,7 +81,7 @@ typedef enum na_sample_status {
 typedef enum na_sample_reason {
     NA_SAMPLE_OK = 0,
     NA_SAMPLE_E_UNKNOWN_RESOURCE = 1,  /* not an observed resource */
-    NA_SAMPLE_E_UNSUPPORTED = 2,       /* buffer / MSAA / reserved / too large */
+    NA_SAMPLE_E_UNSUPPORTED = 2,       /* non-upload buffer / MSAA / reserved / too large */
     NA_SAMPLE_E_RETIRED = 3,           /* resource destroyed before the copy */
     NA_SAMPLE_E_HOST_OBJECTS = 4,      /* host could not create its copy objects */
     NA_SAMPLE_E_TIMEOUT = 5,           /* stayed ARMED past arm_timeout_ms */
