@@ -55,7 +55,9 @@ int main() { return test::run({
             SamplePlan p{3,0,64,1,0,true,(1ull<<32)+256};CHECK(a.Begin(p));
             f.info.format=0;f.info.width=64;f.info.height=1;f.info.x=256;f.info.y=1;
             f.info.row_pitch=64;f.info.data_bytes=64;f.bytes.resize(64);
-            if(mode==1) ++f.info.x;if(mode==2) f.info.y=0;if(mode==3) ++f.info.row_pitch;
+            if(mode==1) ++f.info.x;
+            if(mode==2) f.info.y=0;
+            if(mode==3) ++f.info.row_pitch;
             const auto out=a.Pump();CHECK(out.size()==1 && out[0].plan.offset==p.offset);
             CHECK((out[0].status==AcquisitionStatus::Ready)==(mode==0));
             CHECK(out[0].bytes.size()==(mode==0?64u:0u));
