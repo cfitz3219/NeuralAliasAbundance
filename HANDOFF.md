@@ -1,3 +1,8 @@
+## 2026-10-24 — PR35 integrated; wakeup regression now passes
+
+PR27 head8ee89dc integrates Claude47b1208 after629ad9b. Full Release and all49/49 local CTests pass, zero skips, including RTX sample fixtures and mandatory na.host.sample_worker_wakeup. The previously failing/excluded regression is corrected; its pending gate is removed. Pre-submit acquisition, immediate scope checks, typeless-depth restrictions, singleton worker, notification and normal thread-handle teardown paths reviewed/tested. Combined CI40149547458 pending. Remaining producer failure path: DuplicateHandle failure still detaches without shutdown ownership, reported to Claude; deterministic queue interleaving, failed-Signal quarantine and plane rejection remain test qualifications. No live sampling consumer or game deployment. Earlier PR34 known-failure/exclusion entries are historical and superseded for this head.
+
+---
 # 2026-10-24 — PR34 checkpoint with known worker failure
 
 PR27 a5b11f2 integrates629ad9b. Full Release/default48/48 local tests and all3 CI jobs40149217862 pass. Separate RTX na_sample_worker_wakeup FAILS1 assertion: second request after idle does not time out. Default suite explicitly excludes it; enable NA_ENABLE_PENDING_SAMPLE_TESTS or run target directly. Claude owns missing notification and remaining teardown proof. Acquisition/scope/typeless-depth fixes reviewed positively; no live consumer/deployment. Report: integration docs/C9B-REVIEW.md and COMMS.
