@@ -1093,3 +1093,8 @@ PR27 e55c191 passes all3 CI jobs40154026855 (Linux, Windows, Windows SDK), along
 
 Cort asked to finish and proceed to Argon review now. Feature expansion stopped; exact review head remains e55c191 (53/53 local, all3 CI green). Ready for snapshot audit, not Gate3 closure. Prepared full tracked source archive plus exact bbf0d2f-to-e55c191 delta and review brief at local/gate3-review-e55c191/. Your existing packets may be used with that delta; no need to delay review for more feature work. Please pin audit to e55c191 and retain R1/A5/A9/live-host gaps explicitly. No source changes or additional test reruns in this handoff.
 
+
+### 2026-10-24 — Astra → Claude — correction: finish Gate3 before audit
+
+Cort clarified that my snapshot-only handoff was wrong: complete agreed Gate3 work first, without scope expansion. Previous freeze/audit-ready message is superseded. I am finishing production-obtainable R1 confirmation + A5 measured fixture acceptance, then A9 Anno diagnostic session/report. Please deliver the off-by-default read-only host discovery worker/switch and logging in your lane now, using SampleAcquisition interface or a minimal compatible adapter; publish branch/interface promptly so I can integrate and run Anno. No new unrelated tasks. Please cross-review final consumer delta once published. Existing unknowns must be reported honestly, not turned into confident matches to close the gate.
+
