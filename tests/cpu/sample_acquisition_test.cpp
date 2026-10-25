@@ -30,6 +30,25 @@ struct Fake : SampleApi {
 };
 static SamplePlan plan() { return {3,0,2,2,40}; }
 int main() { return test::run({
+    {"timeout releases its lease and the same resource can complete on retry", [] {
+        Fake f;SampleAcquisition a(f);a.Scope(1,2);CHECK(a.Begin(plan()));
+        f.info.status=NA_SAMPLE_FAILED;f.info.reason=NA_SAMPLE_E_TIMEOUT;
+        auto out=a.Pump();CHECK(out.size()==1 && out[0].status==AcquisitionStatus::HostFailure);
+        CHECK(out[0].plan.resource==3 && a.Pending()==0 && f.releases==1 && f.reads==0);
+        CHECK(a.Begin(plan()));f.info.status=NA_SAMPLE_READY;f.info.reason=0;
+        out=a.Pump();CHECK(out.size()==1 && out[0].status==AcquisitionStatus::Ready);
+        CHECK(f.releases==2 && f.reads==1);
+    }},
+    {"retirement cancels pending ranges without reading or releasing other resources", [] {
+        Fake f;SampleAcquisition a(f);a.Scope(1,2);
+        CHECK(a.Begin(plan()));auto sub=plan();sub.subresource=1;CHECK(a.Begin(sub));
+        auto other=plan();other.resource=4;CHECK(a.Begin(other));
+        a.Retire(3);CHECK(a.Pending()==1 && f.releases==2 && f.reads==0);
+        a.Retire(3);CHECK(f.releases==2);
+        f.info.resource=4;auto out=a.Pump();CHECK(out.size()==1 && out[0].plan.resource==4);
+        CHECK(out[0].status==AcquisitionStatus::Ready && f.releases==3);
+        a.Clear();CHECK(f.releases==3);
+    }},
     {"buffer leases preserve 64-bit offsets and reject wrong completion ranges", [] {
         for(int mode=0;mode<4;++mode) {
             Fake f;f.buffer=true;SampleAcquisition a(f);a.Scope(1,2);

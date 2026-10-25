@@ -137,6 +137,7 @@ void __cdecl Sink(const na_event_batch* batch,void* user) {
             }
             case NA_EV_OBJECT_RETIRED: {
                 const auto e=Read<na_ev_object_retired>(p);c.resources.erase(e.object);c.records.erase(e.object);
+                c.acquisition.Retire(e.object);
                 for(auto it=c.retry.begin();it!=c.retry.end();) it=it->first.first==e.object?c.retry.erase(it):std::next(it);
                 for(auto it=c.scanned.begin();it!=c.scanned.end();) it=it->first.first==e.object?c.scanned.erase(it):std::next(it);
                 for(auto it=c.camera_plans.begin();it!=c.camera_plans.end();) it=it->first.first==e.object?c.camera_plans.erase(it):std::next(it);
@@ -229,6 +230,7 @@ void __cdecl Sink(const na_event_batch* batch,void* user) {
             else ++c.failed_samples;
             auto& retry=c.retry[{sample.plan.resource,sample.plan.offset}];
             if(sample.status==na::discovery::AcquisitionStatus::Ready) {retry.failures=0;retry.due=now+30000;}
+            else if(sample.info.reason==NA_SAMPLE_E_UNSUPPORTED) retry.due=UINT64_MAX;
             else {retry.failures=std::min(retry.failures+1,5u);retry.due=now+(1000ull<<retry.failures);}
             const auto* matched=c.execution.Match(sample.info.queue,sample.info.queue_ticket,sample.info.resource,sample.info.subresource);
             if(matched && sample.status==na::discovery::AcquisitionStatus::Ready) ++c.matched_samples;
