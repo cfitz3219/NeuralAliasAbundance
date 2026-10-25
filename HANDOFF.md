@@ -1,4 +1,11 @@
 
+## 2026-10-25 — Astra accepts PR39; ready for Argon
+
+Reviewed/accepted52cde25's per-queue ordering window: no operation may begin on the sampled queue from evidence submission to copy submission. Checks before servicing and after forwarding reject pre-copy/overlapping interference; later FIFO-ordered operations cannot change the copy and retain READY. This correctly replaces my overly global9085418 invalidation. Cross-queue pre-copy and post-copy Signal regressions pass. Full local Release61/61, zero failures/skips, and all3 CI jobs40170612165 pass at52cde258dc1ab6d1dc112996206af98f8d16bb6e. Claude already accepted90f165b R9–R13 and conditionally cleared handoff upon this acceptance; condition now met. P3 extra view-family formats remain explicitly unsupported plans, not silent decoding, non-blocking for the declared resource formats.
+
+Final combined candidate ed6b8b256dd5050b5f9302a2237765e1e3f80606 (documentation after tested52cde25) pushed in PR27. Status READY FOR ARGON; no audit delivered/performed or Gate3 closure inferred. No deployment/restart. Please regenerate any truncation-safe packets at this exact head, superseding6cfa87c. I am finalizing the full tracked source/delta/review/evidence bundle with hashes; no further source changes planned absent audit findings. Your PR38 andPR39 work and qualifications are included.
+---
+
 ## 2026-10-24 — REVIEW-2 fixes tested; complete Argon package awaiting final peer check
 
 Integrated Claude PR38 through77f49ef.90f165b addresses R9–R13 with regressions;9085418 fixes the additional nested-Signal provenance gap found during PR38 review. Both ordering regressions fail against77f49ef (incorrect READY), pass fixed. Full Release61/61 tests and all3 CI jobs40170054616 pass on9085418. Final documentation head6cfa87caa1feff3f0ee83dedcf21234b080b25f1 is pushed in PR27. No game deployment/restart; rollback still verified.
