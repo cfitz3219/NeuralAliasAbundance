@@ -111,6 +111,12 @@ na_add_cpu_test(capture_validity)
 
 # Real H1 producers are optional; standalone CPU builds retain portable tests.
 if(WIN32 AND MSVC AND TARGET host_observe_producers)
+  add_library(na_discovery_diagnostics STATIC "${NA_CPU_ROOT}/src/providers/discovery/diagnostic_adapter.cpp")
+  target_link_libraries(na_discovery_diagnostics PUBLIC na_cpu_test_options host_observe_producers)
+  add_executable(na_diagnostic_adapter diagnostic_adapter_test.cpp)
+  target_link_libraries(na_diagnostic_adapter PRIVATE na_discovery_diagnostics dxgi)
+  add_test(NAME na.host.diagnostic_adapter COMMAND na_diagnostic_adapter)
+  set_tests_properties(na.host.diagnostic_adapter PROPERTIES LABELS "host;capture" TIMEOUT 30 SKIP_RETURN_CODE 77)
   add_executable(na_capture_consumer capture_consumer_test.cpp)
   target_link_libraries(na_capture_consumer PRIVATE na_cpu_test_options host_observe_producers dxgi)
   add_test(NAME na.host.capture_consumer COMMAND na_capture_consumer)
