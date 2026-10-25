@@ -108,7 +108,7 @@ struct Feed {
     }
     void Draw(uint64_t vertices) { na_ev_list_op e{}; e.op = NA_OP_DRAW; e.a[0] = vertices; e.a[1] = 1; Op(e); }
     void Dispatch() { na_ev_list_op e{}; e.op = NA_OP_DISPATCH; e.a[0] = e.a[1] = e.a[2] = 8; Op(e); }
-    void Execute() {
+    void Execute(uint64_t list = 5, uint64_t gen = 0) {
         struct {
             na_ev_queue_execute e;
             na_list_ref ref;
@@ -118,8 +118,8 @@ struct Feed {
         x.e.list_count = 1;
         x.e.refs_offset = offsetof(decltype(x), ref);
         x.e.ref_stride = sizeof(na_list_ref);
-        x.ref.list = 5;
-        x.ref.recording_generation = generation;
+        x.ref.list = list;
+        x.ref.recording_generation = gen ? gen : generation;
         x.e.hdr.kind = NA_EV_QUEUE_EXECUTE;
         // Send the whole struct as the event (refs follow the fixed part).
         na_ev_queue_execute head = x.e;
@@ -242,6 +242,61 @@ int main() {
              CHECK(!blocks.empty() && blocks[0].resource == 20 && blocks[0].offset == 256 && blocks[0].draws == 161 && blocks[0].share > 0.99);
              for (size_t i = 1; i < blocks.size(); ++i) CHECK(blocks[i].resource == 21 && blocks[i].draws * 4 < blocks[0].draws);
              CHECK(f.h.CameraRank(20, 256) == 1 && f.h.CameraRank(21, 0) == 0);
+         }},
+        {"R41-1: a truncated target array with a wide stride reads only the carried prefix", [] {
+             Feed f;
+             f.Reset();
+             // Advertises 2 RTVs with a 2-element stride but carries one stride of bytes.
+             std::vector<unsigned char> payload(2 * sizeof(na_view_ref));
+             na_view_ref v{};
+             v.resource = 6;
+             v.descriptor_kind = NA_DESC_RTV;
+             std::memcpy(payload.data(), &v, sizeof(v));
+             na_ev_list_op e{};
+             e.op = NA_OP_OM_SET_RENDER_TARGETS;
+             e.a[0] = 2;
+             e.hdr.flags = NA_EVF_TRUNCATED;
+             f.Op(e, payload.data(), payload.size(), static_cast<uint32_t>(payload.size()));
+             f.SetPipeline(10);
+             f.Draw(3);
+             f.Execute();
+             CHECK(f.h.Stats().draws == 1); // reached without reading past the payload (ASAN-checked)
+         }},
+        {"R41-2: an evicted list returning at capacity keeps its own recording", [] {
+             Feed f;
+             const auto OpOn = [&](uint64_t list, uint32_t kind) {
+                 na_ev_list_op e{};
+                 e.op = kind;
+                 e.a[0] = 10;
+                 e.list = list;
+                 e.recording_generation = 1;
+                 e.op_index = 1;
+                 f.Event(e, NA_EV_LIST_OP);
+             };
+             for (uint64_t list = 1; list <= 4097; ++list) OpOn(list, NA_OP_SET_PIPELINE);
+             OpOn(1, NA_OP_SET_PIPELINE); // list 1 was evicted; it must not evict itself
+             OpOn(1, NA_OP_DRAW);
+             f.Execute(1, 1);
+             CHECK(f.h.Stats().draws == 1);
+         }},
+        {"R41-4: a retired camera buffer leaves the camera ranking", [] {
+             Feed f;
+             f.Swapchain(1920, 1080);
+             f.Resource(3, 1920, 1080, 40);
+             f.Resource(4, 2048, 2048, 40);
+             f.Resource(6, 1920, 1080, 10);
+             f.Pipeline(10, 1, 1, 0);
+             f.Pipeline(11, 0, 0, 1);
+             f.Frame();
+             f.Frame();
+             bool before = false;
+             for (const auto& b : f.h.RankCameraBlocks(4)) before = before || b.resource == 20;
+             CHECK(before);
+             na_ev_object_retired r{};
+             r.object = 20;
+             f.Event(r, NA_EV_OBJECT_RETIRED);
+             for (const auto& b : f.h.RankCameraBlocks(4)) CHECK(b.resource != 20);
+             CHECK(f.h.CameraRank(20, 256, 4) == 0);
          }},
         {"unknown pipelines and dispatches weaken reasons but never zero the ranking", [] {
              Feed f;

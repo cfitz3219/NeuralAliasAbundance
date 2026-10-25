@@ -103,41 +103,27 @@ void Report(Consumer& c,const na_observe_status& status,const char* phase) {
         }
         if(++emitted==24) break;
     }
-    // C13: rankings from the established heuristics, always produced. The
-    // classifier verdict for each is computed from the heuristic's observed
-    // execution identity (queue/ticket/list/generation/write span).
-    const auto ToWindow=[&](const na::discovery::ExecutionIdentity& id,uint32_t w,uint32_t h) {
-        na::classifier::Window window{};
-        window.scope={status.session,status.epoch,id.ticket,id.queue,id.list,id.generation};
-        window.width=w;window.height=h;window.scene_end=id.scene_end ? id.scene_end : id.last_write;
-        window.hud_begin=id.hud_begin>window.scene_end ? id.hud_begin : 0;
-        window.coverage_complete=c.validity.CaptureContiguous() && !c.overflow;
-        window.order_unambiguous=true;window.loss_free=!status.foundational_dropped && !status.detail_dropped;
-        return window;
-    };
-    const auto Verdict=[&](na::classifier::Signal signal,const na::discovery::ExecutionIdentity& id,uint64_t resource,uint32_t w,uint32_t h,uint32_t format) {
-        const auto window=ToWindow(id,w,h);
-        na::classifier::Observation o{};
-        o.scope=window.scope;o.resource=resource;o.content_version=id.ticket;o.width=w;o.height=h;o.format=Format(format);
-        o.alive=o.external_work=true;o.depth_write=signal==na::classifier::Signal::Depth;o.color_write=!o.depth_write;
-        o.first_write=id.first_write;o.last_write=std::min(id.last_write,window.scene_end);
-        return na::classifier::Describe(signal,window,o);
+    // C13: rankings from the established heuristics, always produced and always
+    // unqualified: they order acquisition work and are never classifier evidence.
+    // reducer_match reports whether the strict SubmissionEvidence reducer
+    // independently qualified the same queue/ticket/resource; only that path
+    // feeds the classifier (the "signal" lines above).
+    const auto ReducerMatch=[&](const na::discovery::ExecutionIdentity& id,uint64_t resource) {
+        return id.ticket && c.execution.Match(id.queue,id.ticket,resource,0)!=nullptr;
     };
     unsigned rank=0;
     for(const auto& d:c.heuristics.RankDepth(5)) {
-        const auto v=Verdict(na::classifier::Signal::Depth,d.last,d.resource,d.width,d.height,d.format);
-        std::fprintf(c.log,"{\"type\":\"heuristic_depth\",\"rank\":%u,\"resource\":%llu,\"width\":%u,\"height\":%u,\"format\":%u,\"score\":%.6g,\"draws\":%llu,\"vertices\":%llu,\"clears\":%llu,\"best_segment_draws\":%llu,\"aspect_match\":%s,\"exact_match\":%s,\"queue\":%llu,\"ticket\":%llu,\"list\":%llu,\"generation\":%llu,\"classifier\":\"%s\",\"reasons\":",
+        std::fprintf(c.log,"{\"type\":\"heuristic_depth\",\"rank\":%u,\"resource\":%llu,\"width\":%u,\"height\":%u,\"format\":%u,\"score\":%.6g,\"draws\":%llu,\"vertices\":%llu,\"clears\":%llu,\"best_segment_draws\":%llu,\"aspect_match\":%s,\"exact_match\":%s,\"queue\":%llu,\"ticket\":%llu,\"list\":%llu,\"generation\":%llu,\"qualified\":false,\"reducer_match\":%s,\"reasons\":",
             ++rank,d.resource,d.width,d.height,d.format,d.score,d.draws,d.vertices,d.clears,d.best_segment_draws,d.aspect_match?"true":"false",d.exact_match?"true":"false",
-            d.last.queue,d.last.ticket,d.last.list,d.last.generation,v.confidence==na::classifier::Confidence::Candidate?"candidate":"unavailable");
-        JsonStrings(c.log,d.reasons);std::fputs(",\"classifier_reasons\":",c.log);JsonStrings(c.log,v.reasons);std::fputs("}\n",c.log);
+            d.last.queue,d.last.ticket,d.last.list,d.last.generation,ReducerMatch(d.last,d.resource)?"true":"false");
+        JsonStrings(c.log,d.reasons);std::fputs("}\n",c.log);
     }
     rank=0;
     for(const auto& k:c.heuristics.RankSceneColor(5)) {
-        const auto v=Verdict(na::classifier::Signal::SceneColor,k.last,k.resource,k.width,k.height,k.format);
-        std::fprintf(c.log,"{\"type\":\"heuristic_scene_color\",\"rank\":%u,\"resource\":%llu,\"width\":%u,\"height\":%u,\"format\":%u,\"score\":%.6g,\"draws\":%llu,\"hud_draws\":%llu,\"written_before_hud\":%s,\"receives_hud\":%s,\"queue\":%llu,\"ticket\":%llu,\"list\":%llu,\"generation\":%llu,\"classifier\":\"%s\",\"reasons\":",
+        std::fprintf(c.log,"{\"type\":\"heuristic_scene_color\",\"rank\":%u,\"resource\":%llu,\"width\":%u,\"height\":%u,\"format\":%u,\"score\":%.6g,\"draws\":%llu,\"hud_draws\":%llu,\"written_before_hud\":%s,\"receives_hud\":%s,\"queue\":%llu,\"ticket\":%llu,\"list\":%llu,\"generation\":%llu,\"qualified\":false,\"reducer_match\":%s,\"reasons\":",
             ++rank,k.resource,k.width,k.height,k.format,k.score,k.draws,k.hud_draws,k.written_before_hud?"true":"false",k.receives_hud?"true":"false",
-            k.last.queue,k.last.ticket,k.last.list,k.last.generation,v.confidence==na::classifier::Confidence::Candidate?"candidate":"unavailable");
-        JsonStrings(c.log,k.reasons);std::fputs(",\"classifier_reasons\":",c.log);JsonStrings(c.log,v.reasons);std::fputs("}\n",c.log);
+            k.last.queue,k.last.ticket,k.last.list,k.last.generation,ReducerMatch(k.last,k.resource)?"true":"false");
+        JsonStrings(c.log,k.reasons);std::fputs("}\n",c.log);
     }
     rank=0;
     for(const auto& b:c.heuristics.RankCameraBlocks(5))

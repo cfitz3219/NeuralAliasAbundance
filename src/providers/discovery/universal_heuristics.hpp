@@ -113,6 +113,15 @@ public:
                 frame_.color.erase(id);
                 last_.depth.erase(id);
                 last_.color.erase(id);
+                PurgeCbv(frame_.cbv, id);
+                PurgeCbv(last_.cbv, id);
+                for (auto& rec : recordings_) {
+                    PurgeCbv(rec.second.cbv_draws, id);
+                    rec.second.spans.erase(id);
+                    for (auto& table : rec.second.root_cbv)
+                        for (auto it = table.begin(); it != table.end();)
+                            it = it->second.first == id ? table.erase(it) : std::next(it);
+                }
                 break;
             }
             case NA_EV_LIST_RESET: {
@@ -120,7 +129,7 @@ public:
                 Recording& r = recordings_[e.list];
                 r = Recording{};
                 r.generation = e.recording_generation;
-                Trim();
+                Trim(e.list);
                 break;
             }
             case NA_EV_LIST_OP: Op(Load<na_ev_list_op>(p), p); break;
@@ -310,8 +319,18 @@ private:
         const double w_ratio = static_cast<double>(swap_w_) / w, h_ratio = static_cast<double>(swap_h_) / h;
         return std::abs(delta) <= 0.1 && w_ratio <= 1.85 && w_ratio >= 0.5 && h_ratio <= 1.85 && h_ratio >= 0.5;
     }
-    void Trim() {
-        while (recordings_.size() > kMaxRecordings) recordings_.erase(recordings_.begin());
+    // Evicts the lowest list IDs over the cap, never `keep` (the recording the
+    // caller is holding a reference to).
+    void Trim(uint64_t keep) {
+        auto it = recordings_.begin();
+        while (recordings_.size() > kMaxRecordings && it != recordings_.end())
+            it = it->first == keep ? std::next(it) : recordings_.erase(it);
+    }
+    static bool PayloadHolds(const na_ev_list_op& e, uint64_t at, uint64_t bytes) {
+        return at + bytes <= e.payload_bytes && uint64_t{e.payload_offset} + at + bytes <= e.hdr.size_bytes;
+    }
+    template <class Map> static void PurgeCbv(Map& m, uint64_t resource) {
+        for (auto it = m.lower_bound({resource, 0}); it != m.end() && it->first.first == resource;) it = m.erase(it);
     }
     Span* SpanFor(Recording& r, uint64_t resource) {
         if (!resource || resource == NA_UNKNOWN_U64) return nullptr;
@@ -325,7 +344,7 @@ private:
         if (r.generation != e.recording_generation) {
             r = Recording{};
             r.generation = e.recording_generation;
-            Trim();
+            Trim(e.list);
         }
         r.last_op = e.op_index;
         switch (e.op) {
@@ -340,14 +359,18 @@ private:
         case NA_OP_OM_SET_RENDER_TARGETS: {
             r.targets.clear();
             const uint64_t count = std::min<uint64_t>(e.a[0] + e.a[1], 9);
-            for (uint64_t k = 0; k < count; ++k) {
-                if (e.payload_offset + (k + 1) * sizeof(na_view_ref) > e.hdr.size_bytes || !e.payload_stride) break;
-                r.targets.push_back(Load<na_view_ref>(p + e.payload_offset + k * e.payload_stride));
+            // A truncated op may advertise more targets than it carries, and the
+            // stride can exceed the packed size: bound every element by what is
+            // actually present (payload_bytes and the event size).
+            for (uint64_t k = 0; k < count && e.payload_stride >= sizeof(na_view_ref); ++k) {
+                const uint64_t at = k * e.payload_stride;
+                if (!PayloadHolds(e, at, sizeof(na_view_ref))) break;
+                r.targets.push_back(Load<na_view_ref>(p + e.payload_offset + at));
             }
             break;
         }
         case NA_OP_CLEAR_DSV: {
-            if (e.payload_bytes < sizeof(na_view_ref)) break;
+            if (!PayloadHolds(e, 0, sizeof(na_view_ref))) break;
             const auto v = Load<na_view_ref>(p + e.payload_offset);
             if (!(e.a[0] & 1)) break; // stencil-only clear
             if (Span* s = SpanFor(r, v.resource)) {
