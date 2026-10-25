@@ -55,9 +55,19 @@ public:
         for (const auto& item : batch.events) {
             const auto& h = item.header;
             const auto* event = batch.bytes.data()+item.offset;
-            if (h.flags & (NA_EVF_TRUNCATED | NA_EVF_METHOD_UNOBSERVED)) {
-                if (h.flags & NA_EVF_FOUNDATIONAL) foundational_bad_ = true;
-                detail_bad_ = true;
+            const bool known_creation = h.kind==NA_EV_DEVICE_CREATED || h.kind==NA_EV_QUEUE_CREATED ||
+                h.kind==NA_EV_LIST_CREATED || h.kind==NA_EV_SWAPCHAIN_CREATED || h.kind==NA_EV_RESOURCE_CREATED ||
+                h.kind==NA_EV_DESCRIPTOR_HEAP_CREATED || h.kind==NA_EV_RESOURCE_HEAP_CREATED || h.kind==NA_EV_FENCE_CREATED ||
+                h.kind==NA_EV_PIPELINE_CREATED || h.kind==NA_EV_ROOT_SIGNATURE_CREATED;
+            // Explicit unknown creation fields do not mean a lost object. H3
+            // partial bytes/synchronization are scoped to that snapshot, not H2.
+            if ((h.flags & NA_EVF_TRUNCATED) && h.kind!=NA_EV_SNAPSHOT) {
+                if(h.flags & NA_EVF_FOUNDATIONAL) foundational_bad_=true;
+                detail_bad_=true;
+            }
+            if ((h.flags & NA_EVF_METHOD_UNOBSERVED) && h.kind!=NA_EV_SNAPSHOT &&
+                !known_creation) {
+                detail_bad_=true;
             }
             if (h.flags & NA_EVF_ORDER_AMBIGUOUS) detail_bad_ = true;
             if (h.kind == NA_EV_EPOCH_BEGIN) {

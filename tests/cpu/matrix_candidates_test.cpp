@@ -18,6 +18,24 @@ static Snapshot snapshot(const Matrix& m, bool transpose=false) {
     return s;
 }
 int main() { return test::run({
+    {"combined and inverse perspective views survive rotation translation and transpose", [] {
+        for(bool reverse:{false,true}) for(bool column:{false,true}) {
+            Matrix v{0.8,0,0.6,-12,0,1,0,3,-0.6,0,0.8,-20,0,0,0,1};
+            const auto p=perspective(reverse);Matrix vp{};
+            for(size_t r=0;r<4;++r) for(size_t c=0;c<4;++c) for(size_t k=0;k<4;++k) vp[r*4+c]+=p[r*4+k]*v[k*4+c];
+            for(bool inverted:{false,true}) {
+                Matrix m=vp;if(inverted) CHECK(Invert(vp,m));
+                auto s=snapshot(m,column);s.complete=false;
+                CHECK(FindMatrices(s).unavailable);
+                const auto scan=FindMatrices(s,true);CHECK(!scan.unavailable && scan.partial_capture);
+                bool found=false;for(const auto& c:scan.candidates) if(c.kind==(inverted?Kind::InverseViewProjection:Kind::ViewProjection) &&
+                    c.layout==(column?Layout::ColumnMajor:Layout::RowMajor)) {found=true;NEAR(c.near_plane,0.1,0.0001);}
+                CHECK(found);
+            }
+        }
+        Candidate c{};Matrix shear{1,2,3,4,5,6,7,8,9,10,11,12,0,0,1,0};
+        CHECK(!ViewProjection(shear,c) && !InverseViewProjection(shear,c));
+    }},
     {"projection conventions and layouts recover near far", [] {
         for (bool reverse : {false,true}) for (double sign : {-1.0,1.0}) for (bool column : {false,true}) {
             const auto r=FindMatrices(snapshot(perspective(reverse,sign),column));

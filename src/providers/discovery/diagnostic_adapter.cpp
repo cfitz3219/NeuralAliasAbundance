@@ -6,6 +6,7 @@
 #include "capture_validity.hpp"
 #include "sample_acquisition.hpp"
 #include "resource_formats.hpp"
+#include "submission_evidence.hpp"
 #include "providers/classifier/signal_candidates.hpp"
 #include "providers/camera/matrix_candidates.hpp"
 #include <cstdio>
@@ -25,10 +26,17 @@ struct Consumer {
     na::discovery::CaptureValidity validity;
     na::discovery::HostSampleApi api;
     na::discovery::SampleAcquisition acquisition{api};
+    na::discovery::SubmissionEvidence execution;
     std::map<uint64_t,Resource> resources;
     std::map<uint64_t,Record> records;
-    std::set<uint64_t> sampled;
+    struct Retry {uint64_t due{};unsigned failures{};};
+    std::map<std::pair<uint64_t,uint64_t>,Retry> retry;
+    std::map<std::pair<uint64_t,uint64_t>,uint64_t> scanned;
+    std::map<std::pair<uint64_t,uint64_t>,na::discovery::SamplePlan> camera_plans;
+    uint64_t scan_window{},scan_count{},matched_samples{},attempts{},failed_samples{};
     FILE* log{};
+    std::wstring evidence_dir;
+    uint64_t saved_bytes{};
     uint64_t session{},epoch{},batches{},events{},malformed{},submissions{},presents{},snapshots{},matrices{},samples{},last_log{},last_sample{};
     bool overflow{}; unsigned reports{};
     uint64_t draws{}, binds{}, unresolved_views{}, captured_snapshots{}, truncated_snapshots{}, unmapped_snapshots{}, gpu_snapshots{}, matrix_scans{};
@@ -65,7 +73,7 @@ void JsonStrings(FILE* out,const std::vector<std::string>& strings) {
     std::fputc(']',out);
 }
 void Report(Consumer& c,const na_observe_status& status,const char* phase) {
-    if(!c.log || c.reports>=180) return;
+    if(!c.log) return;
     ++c.reports;
     const auto health=na::observe::GetProducerStats();
     std::fprintf(c.log,"{\"type\":\"capture_health\",\"draws\":%llu,\"binds\":%llu,\"unresolved_views\":%llu,\"captured_snapshots\":%llu,\"truncated_snapshots\":%llu,\"unmapped_snapshots\":%llu,\"gpu_snapshots\":%llu,\"sample_missing_recording\":%llu,\"sample_partial_coverage\":%llu,\"sample_partial_states\":%llu,\"sample_no_transition\":%llu}\n",
@@ -75,32 +83,29 @@ void Report(Consumer& c,const na_observe_status& status,const char* phase) {
         phase,status.session,status.epoch,c.batches,c.events,c.submissions,c.presents,c.resources.size(),c.snapshots,c.matrices,c.samples,c.malformed,
         c.validity.InventoryConsistent()?"true":"false",c.validity.CaptureContiguous()?"true":"false",c.overflow?"true":"false",status.foundational_dropped,status.detail_dropped);
     unsigned emitted=0;
-    for(const auto& pair:c.resources) {
+    for(const auto& pair:c.execution.Latest()) {
         const auto& r=pair.second;
-        if(r.info.width<128 || r.info.height<128 || r.info.width>4096 || r.info.height>4096 ||
-            r.info.resource_flags==NA_UNKNOWN_U64 || !(r.info.resource_flags&3)) continue;
-        na::classifier::Window window{};
-        window.scope.session=status.session;window.scope.epoch=status.epoch;
-        window.coverage_complete=c.validity.CaptureContiguous() && !c.overflow;
-        window.loss_free=!status.foundational_dropped && !status.detail_dropped;
-        // Inventory dimensions and recording-time writes are not a scene
-        // boundary, executing list, or preserved content version. Leave these
-        // missing fields unknown and let the same A5 classifier explain them.
-        na::classifier::Observation observation{};
-        observation.scope=window.scope;observation.resource=pair.first;
-        observation.width=static_cast<uint32_t>(r.info.width);observation.height=r.info.height;
-        observation.format=Format(r.info.format);observation.alive=true;
-        observation.depth_write=r.depth_writes!=0;observation.color_write=r.color_writes!=0;
+        auto window=r.window;
+        window.loss_free=window.loss_free && c.validity.InventoryConsistent() && !c.overflow;
+        const auto& observation=r.observation;
         for(auto signal:{na::classifier::Signal::Depth,na::classifier::Signal::SceneColor}) {
             const auto result=na::classifier::Describe(signal,window,observation);
-            std::fprintf(c.log,"{\"type\":\"resource_candidate\",\"signal\":\"%s\",\"resource\":%llu,\"format\":%u,\"width\":%llu,\"height\":%u,\"depth_writes\":%llu,\"color_writes\":%llu,\"confidence\":\"%s\",\"acquisition_score\":%u,\"reasons\":",
-                signal==na::classifier::Signal::Depth?"depth":"scene_color",pair.first,r.info.format,r.info.width,r.info.height,r.depth_writes,r.color_writes,
+            if((signal==na::classifier::Signal::Depth && !observation.depth_write) ||
+                (signal==na::classifier::Signal::SceneColor && !observation.color_write)) continue;
+            std::fprintf(c.log,"{\"type\":\"resource_candidate\",\"signal\":\"%s\",\"resource\":%llu,\"format\":%u,\"width\":%u,\"height\":%u,\"queue\":%llu,\"ticket\":%llu,\"list\":%llu,\"generation\":%llu,\"first_write\":%llu,\"last_write\":%llu,\"content_version\":%llu,\"boundary\":\"recording_end\",\"hud_qualified\":false,\"confidence\":\"%s\",\"acquisition_score\":%u,\"reasons\":",
+                signal==na::classifier::Signal::Depth?"depth":"scene_color",observation.resource,r.format,observation.width,observation.height,
+                window.scope.queue,window.scope.submission,window.scope.list,window.scope.recording,observation.first_write,observation.last_write,observation.content_version,
                 result.confidence==na::classifier::Confidence::Candidate?"candidate":"unavailable",result.acquisition_score);
             JsonStrings(c.log,result.reasons);std::fputs(",\"acquisition_tasks\":",c.log);
             JsonStrings(c.log,result.acquisition_tasks);std::fputs("}\n",c.log);
         }
         if(++emitted==24) break;
     }
+    std::fprintf(c.log,"{\"type\":\"acquisition_progress\",\"attempts\":%llu,\"pending\":%zu,\"failures\":%llu,\"matched_texture_samples\":%llu,\"executed_resources\":%zu,\"camera_ranges\":%zu}\n",
+        c.attempts,c.acquisition.Pending(),c.failed_samples,c.matched_samples,c.execution.Latest().size(),c.camera_plans.size());
+    const auto& evidence=c.execution.Stats();
+    std::fprintf(c.log,"{\"type\":\"execution_reducer\",\"executions\":%llu,\"resource_versions\":%llu,\"rejected\":%llu,\"evicted_pending\":%llu,\"sequence_gaps\":%llu,\"unknown_pipeline\":%llu,\"unknown_view\":%llu}\n",
+        evidence.executions,evidence.accepted,evidence.rejected,evidence.evicted,evidence.sequence_gaps,evidence.unknown_pipeline,evidence.unknown_view);
     std::fflush(c.log);
 }
 void __cdecl Sink(const na_event_batch* batch,void* user) {
@@ -111,13 +116,16 @@ void __cdecl Sink(const na_event_batch* batch,void* user) {
         const size_t bytes=size_t(batch->header_bytes)+batch->payload_bytes;
         const auto decoded=na::discovery::DecodeBatch(batch,bytes);
         c.validity.Consume(decoded,status);
+        c.execution.Consume(decoded,status);
         ++c.batches;
         if(!decoded.valid) {++c.malformed;return;}
         if(batch->session!=status.session || batch->epoch!=status.epoch) return;
         if(c.session!=status.session || c.epoch!=status.epoch) {
-            c.resources.clear();c.records.clear();c.sampled.clear();
+            c.resources.clear();c.records.clear();c.retry.clear();c.scanned.clear();c.camera_plans.clear();
             c.session=status.session;c.epoch=status.epoch;c.acquisition.Scope(c.session,c.epoch);
         }
+        const uint64_t now=GetTickCount64();
+        if(now-c.scan_window>=100) {c.scan_window=now;c.scan_count=0;}
         for(const auto& item:decoded.events) {
             ++c.events;const auto* p=decoded.bytes.data()+item.offset;
             switch(item.header.kind) {
@@ -127,7 +135,14 @@ void __cdecl Sink(const na_event_batch* batch,void* user) {
                 else c.overflow=true;
                 break;
             }
-            case NA_EV_OBJECT_RETIRED: {const auto e=Read<na_ev_object_retired>(p);c.resources.erase(e.object);c.records.erase(e.object);break;}
+            case NA_EV_OBJECT_RETIRED: {
+                const auto e=Read<na_ev_object_retired>(p);c.resources.erase(e.object);c.records.erase(e.object);
+                c.acquisition.Retire(e.object);
+                for(auto it=c.retry.begin();it!=c.retry.end();) it=it->first.first==e.object?c.retry.erase(it):std::next(it);
+                for(auto it=c.scanned.begin();it!=c.scanned.end();) it=it->first.first==e.object?c.scanned.erase(it):std::next(it);
+                for(auto it=c.camera_plans.begin();it!=c.camera_plans.end();) it=it->first.first==e.object?c.camera_plans.erase(it):std::next(it);
+                break;
+            }
             case NA_EV_PRESENT: ++c.presents;break;
             case NA_EV_QUEUE_EXECUTE: ++c.submissions;break;
             case NA_EV_LIST_OP: {
@@ -165,42 +180,94 @@ void __cdecl Sink(const na_event_batch* batch,void* user) {
                 // Count captured records, not all statuses: a repeating stream
                 // of unmapped bindings must not phase-lock every scan away
                 // from the few usable snapshots.
-                if(e.status==NA_SNAP_CAPTURED && e.captured_bytes>=64 && e.captured_bytes<=4096 && c.captured_snapshots%32==1) {
+                const auto key=std::make_pair(e.resource,e.offset);
+                const auto prior=c.scanned.find(key);
+                if(e.status==NA_SNAP_CAPTURED && e.captured_bytes>=64 && e.captured_bytes<=4096 && c.scan_count<4 &&
+                    (prior==c.scanned.end() || now-prior->second>=2000)) {
+                    if(c.scanned.size()==4096 && prior==c.scanned.end()) c.scanned.erase(c.scanned.begin());
+                    c.scanned[key]=now;++c.scan_count;
                     na::camera::Snapshot s{status.session,status.epoch,e.queue_ticket,e.resource,e.snapshot_id,e.offset,
                         na::camera::Sync::AppSyncUnknown,(e.hdr.flags&(NA_EVF_TRUNCATED|NA_EVF_METHOD_UNOBSERVED))==0,true,{}};
                     s.bytes.assign(p+e.payload_offset,p+e.payload_offset+e.captured_bytes);
-                    const auto scan=na::camera::FindMatrices(s);++c.matrix_scans;
+                    const auto scan=na::camera::FindMatrices(s,true);++c.matrix_scans;
                     c.matrices+=scan.candidates.size();
-                    if(c.matrix_scans<=16 || (!scan.candidates.empty() && c.matrix_scans<=256))
-                        std::fprintf(c.log,"{\"type\":\"matrix_scan\",\"resource\":%llu,\"queue\":%llu,\"ticket\":%llu,\"snapshot\":%llu,\"bytes\":%u,\"flags\":%u,\"hypotheses\":%zu,\"unavailable\":%s,\"execution_qualified\":false}\n",
-                            e.resource,e.queue,e.queue_ticket,e.snapshot_id,e.captured_bytes,e.hdr.flags,scan.candidates.size(),scan.unavailable?"true":"false");
+                    if(!scan.candidates.empty() && c.camera_plans.size()<256)
+                        c.camera_plans[key]={e.resource,0,e.captured_bytes,1,0,true,e.offset};
+                    std::fprintf(c.log,"{\"type\":\"matrix_scan\",\"resource\":%llu,\"offset\":%llu,\"queue\":%llu,\"ticket\":%llu,\"snapshot\":%llu,\"bytes\":%u,\"flags\":%u,\"hypotheses\":%zu,\"unavailable\":%s,\"partial\":%s,\"execution_qualified\":false}\n",
+                        e.resource,e.offset,e.queue,e.queue_ticket,e.snapshot_id,e.captured_bytes,e.hdr.flags,scan.candidates.size(),scan.unavailable?"true":"false",scan.partial_capture?"true":"false");
                 }
                 break;
             }
             default:break;
             }
         }
-        const uint64_t now=GetTickCount64();
-        if(c.reports<180 && now-c.last_sample>=2000 && c.sampled.size()<32) {
+        if(now-c.last_sample>=500) {
             c.last_sample=now;
+            std::vector<na::discovery::SamplePlan> plans;
+            for(const auto& pair:c.camera_plans) plans.push_back(pair.second);
             for(const auto& pair:c.resources) {
                 const auto& r=pair.second;
-                if(c.sampled.count(pair.first) || (!r.depth_writes && !r.color_writes) || r.info.resource_flags==NA_UNKNOWN_U64 || !(r.info.resource_flags&3) || r.info.width<128 || r.info.height<128 ||
+                if((!r.depth_writes && !r.color_writes) || r.info.resource_flags==NA_UNKNOWN_U64 || !(r.info.resource_flags&3) || r.info.width<128 || r.info.height<128 ||
                     r.info.width>4096 || r.info.height>4096 || r.info.sample_count!=1 || Format(r.info.format)==na::classifier::Format::Unknown) continue;
-                if(c.acquisition.Begin({pair.first,0,static_cast<uint32_t>(r.info.width),r.info.height,r.info.format})) c.sampled.insert(pair.first);
+                plans.push_back({pair.first,0,static_cast<uint32_t>(r.info.width),r.info.height,r.info.format});
+            }
+            // Oldest due first: persistent failures cannot monopolize slots or
+            // blacklist future resources after a lifetime attempt cap.
+            std::stable_sort(plans.begin(),plans.end(),[&](const auto& a,const auto& b) {
+                const auto x=c.retry.find({a.resource,a.offset}),y=c.retry.find({b.resource,b.offset});
+                return (x==c.retry.end()?0:x->second.due)<(y==c.retry.end()?0:y->second.due);
+            });
+            for(const auto& plan:plans) {
                 if(c.acquisition.Pending()==4) break;
+                auto& retry=c.retry[{plan.resource,plan.offset}];if(now<retry.due) continue;
+                ++c.attempts;
+                if(c.acquisition.Begin(plan)) retry.due=now+30000;
+                else {retry.failures=std::min(retry.failures+1,5u);retry.due=now+(1000ull<<retry.failures);}
             }
         }
         for(const auto& sample:c.acquisition.Pump()) {
             if(sample.status==na::discovery::AcquisitionStatus::Ready) ++c.samples;
+            else ++c.failed_samples;
+            auto& retry=c.retry[{sample.plan.resource,sample.plan.offset}];
+            if(sample.status==na::discovery::AcquisitionStatus::Ready) {retry.failures=0;retry.due=now+30000;}
+            else if(sample.info.reason==NA_SAMPLE_E_UNSUPPORTED) retry.due=UINT64_MAX;
+            else {retry.failures=std::min(retry.failures+1,5u);retry.due=now+(1000ull<<retry.failures);}
+            const auto* matched=c.execution.Match(sample.info.queue,sample.info.queue_ticket,sample.info.resource,sample.info.subresource);
+            if(matched && sample.status==na::discovery::AcquisitionStatus::Ready) ++c.matched_samples;
+            if(sample.plan.buffer && sample.status==na::discovery::AcquisitionStatus::Ready) {
+                na::camera::Snapshot s{status.session,status.epoch,sample.info.queue_ticket,sample.info.resource,sample.info.queue_ticket,sample.plan.offset,
+                    na::camera::Sync::IndependentlyVerified,true,true,sample.bytes};
+                const auto scan=na::camera::FindMatrices(s);
+                for(const auto& candidate:scan.candidates) {
+                    std::fprintf(c.log,"{\"type\":\"gpu_camera_hypothesis\",\"resource\":%llu,\"offset\":%llu,\"queue\":%llu,\"ticket\":%llu,\"kind\":%u,\"layout\":%u,\"near\":%.9g,\"far\":%.9g,\"main_camera_qualified\":false,\"matrix\":[",
+                        sample.info.resource,candidate.byte_offset,sample.info.queue,sample.info.queue_ticket,static_cast<unsigned>(candidate.kind),static_cast<unsigned>(candidate.layout),
+                        candidate.near_plane,std::isfinite(candidate.far_plane)?candidate.far_plane:0);
+                    for(size_t k=0;k<16;++k) std::fprintf(c.log,"%s%.12g",k?",":"",candidate.matrix[k]);
+                    std::fputs("]}\n",c.log);
+                }
+            }
+            char evidence_file[128]{};
+            if(!c.evidence_dir.empty() && sample.status==na::discovery::AcquisitionStatus::Ready &&
+                sample.bytes.size()<=(128ull<<20)-c.saved_bytes) {
+                sprintf_s(evidence_file,"sample-%llu-%llu-%llu-%llu.bin",sample.info.session,sample.info.queue,sample.info.queue_ticket,sample.info.resource);
+                const std::string name=evidence_file;const auto path=c.evidence_dir+L"\\"+std::wstring(name.begin(),name.end());
+                FILE* file=GetFileAttributesW(path.c_str())==INVALID_FILE_ATTRIBUTES?_wfsopen(path.c_str(),L"wb",_SH_DENYWR):nullptr;
+                if(file) {
+                    const auto written=std::fwrite(sample.bytes.data(),1,sample.bytes.size(),file);std::fclose(file);
+                    c.saved_bytes+=written;
+                    if(written!=sample.bytes.size()) {DeleteFileW(path.c_str());evidence_file[0]=0;}
+                } else evidence_file[0]=0;
+            }
             std::vector<double> values;const bool scalar=na::discovery::DecodeScalarDepth(sample,values);
             double low=0,high=0;if(scalar && !values.empty()) {const auto mm=std::minmax_element(values.begin(),values.end());low=*mm.first;high=*mm.second;}
             // Scalar range is a diagnostic statistic, not a camera-qualified depth verdict.
-            std::fprintf(c.log,"{\"type\":\"sample\",\"resource\":%llu,\"queue\":%llu,\"ticket\":%llu,\"status\":%u,\"host_status\":%u,\"reason\":%u,\"format\":%u,\"bytes\":%llu,\"scalar_decoded\":%s,\"min\":%.9g,\"max\":%.9g}\n",
+            std::fprintf(c.log,"{\"type\":\"sample\",\"resource\":%llu,\"queue\":%llu,\"ticket\":%llu,\"status\":%u,\"host_status\":%u,\"reason\":%u,\"format\":%u,\"bytes\":%llu,\"scalar_decoded\":%s,\"min\":%.9g,\"max\":%.9g,\"matched_execution\":%s,\"list\":%llu,\"generation\":%llu,\"width\":%u,\"height\":%u,\"row_pitch\":%u,\"evidence_file\":\"%s\"}\n",
                 sample.info.resource,sample.info.queue,sample.info.queue_ticket,static_cast<unsigned>(sample.status),sample.info.status,sample.info.reason,sample.info.format,sample.info.data_bytes,
-                scalar?"true":"false",std::isfinite(low)?low:0,std::isfinite(high)?high:0);
+                scalar?"true":"false",std::isfinite(low)?low:0,std::isfinite(high)?high:0,
+                matched?"true":"false",matched?matched->window.scope.list:0,matched?matched->window.scope.recording:0,
+                sample.info.width,sample.info.height,sample.info.row_pitch,evidence_file);
         }
-        if(now-c.last_log>=2000 || (batch->batch_flags&NA_BATCHF_FINAL)) {
+        if(now-c.last_log>=(c.reports<180?2000u:10000u) || (batch->batch_flags&NA_BATCHF_FINAL)) {
             c.last_log=now;Report(c,status,(batch->batch_flags&NA_BATCHF_FINAL)?"stopped":"observing");
         }
     } catch(...) {
@@ -219,6 +286,8 @@ extern "C" int na_adapter_start() {
     wchar_t path[MAX_PATH]{};GetPrivateProfileStringW(L"discovery",L"log",L"",path,MAX_PATH,ini_path);
     if(!path[0]) return 0;
     auto* c=new Consumer;
+    wchar_t evidence_dir[MAX_PATH]{};GetPrivateProfileStringW(L"discovery",L"evidence_dir",L"",evidence_dir,MAX_PATH,ini_path);
+    c->evidence_dir=evidence_dir; // optional pre-created local directory; at most 128 MiB per session
     c->log=_wfsopen(path,L"w",_SH_DENYWR); // Permit live readers; refuse a second writer.
     if(!c->log) {delete c;return 0;}
     for(unsigned n=0;n<200 && !na::observe::ProducersActive();++n) Sleep(10); // host init thread only

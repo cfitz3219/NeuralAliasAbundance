@@ -10,7 +10,7 @@
 
 namespace na::camera {
 using Matrix = std::array<double, 16>;
-enum class Kind { Projection, RigidView };
+enum class Kind { Projection, RigidView, ViewProjection, InverseViewProjection };
 enum class Layout { RowMajor, ColumnMajor };
 enum class Sync { Unknown, AppSyncUnknown, IndependentlyVerified };
 struct Snapshot {
@@ -30,8 +30,8 @@ struct Candidate {
 };
 struct Scan {
     std::vector<Candidate> candidates;
-    bool unavailable{}, capacity_exceeded{};
-    bool projection_overflow{}, rigid_overflow{};
+    bool unavailable{}, capacity_exceeded{}, partial_capture{};
+    bool projection_overflow{}, rigid_overflow{}, combined_overflow{}, inverse_overflow{};
     Sync sync{Sync::Unknown};
 };
 inline bool Known(uint64_t value) { return value && value!=UINT64_MAX; }
@@ -75,30 +75,85 @@ inline bool RigidView(const Matrix& m, Candidate& c) {
         c.position[j] = -(m[j]*m[3]+m[4+j]*m[7]+m[8+j]*m[11]);
     return true;
 }
-inline Scan FindMatrices(const Snapshot& s) {
-    Scan result{}; result.sync = s.sync;
+inline bool Invert(const Matrix& m,Matrix& inverse) {
+    if(!Finite(m)) return false;
+    double a[4][8]{};
+    for(size_t r=0;r<4;++r) for(size_t col=0;col<4;++col) {a[r][col]=m[r*4+col];a[r][col+4]=r==col?1:0;}
+    for(size_t col=0;col<4;++col) {
+        size_t pivot=col;for(size_t r=col+1;r<4;++r) if(std::abs(a[r][col])>std::abs(a[pivot][col])) pivot=r;
+        if(std::abs(a[pivot][col])<1e-10) return false;
+        for(size_t k=0;k<8;++k) std::swap(a[pivot][k],a[col][k]);
+        const auto divisor=a[col][col];for(double& v:a[col]) v/=divisor;
+        for(size_t r=0;r<4;++r) if(r!=col) {const auto factor=a[r][col];for(size_t k=0;k<8;++k) a[r][k]-=factor*a[col][k];}
+    }
+    for(size_t r=0;r<4;++r) for(size_t col=0;col<4;++col) inverse[r*4+col]=a[r][col+4];
+    return Finite(inverse);
+}
+// Perspective times a rigid transform has a unit projective direction, a
+// parallel depth row, and orthogonal horizontal/vertical axes after removing
+// off-axis terms. This rejects arbitrary invertible matrices. Object MVPs can
+// also satisfy it: the result remains a hypothesis, never main-camera proof.
+inline bool ViewProjection(const Matrix& m,Candidate& c) {
+    if(!Finite(m)) return false;
+    double norm=0;for(size_t j=0;j<3;++j) norm+=m[12+j]*m[12+j];
+    if(!Near(norm,1,2e-3)) return false;
+    double depth=0,xoffset=0,yoffset=0;
+    for(size_t j=0;j<3;++j) {depth+=m[8+j]*m[12+j];xoffset+=m[j]*m[12+j];yoffset+=m[4+j]*m[12+j];}
+    depth/=norm;xoffset/=norm;yoffset/=norm;
+    if(std::abs(xoffset)>2 || std::abs(yoffset)>2) return false;
+    std::array<double,3> x{},y{};double xx=0,yy=0,xy=0;
+    for(size_t j=0;j<3;++j) {
+        if(!Near(m[8+j],depth*m[12+j],2e-4*std::max(1.0,std::abs(depth)))) return false;
+        x[j]=m[j]-xoffset*m[12+j];y[j]=m[4+j]-yoffset*m[12+j];
+        xx+=x[j]*x[j];yy+=y[j]*y[j];xy+=x[j]*y[j];
+    }
+    if(xx<1e-8 || yy<1e-8 || xx>1e8 || yy>1e8 || std::abs(xy)>2e-3*std::sqrt(xx*yy)) return false;
+    Matrix projection{std::sqrt(xx/norm),0,xoffset,0,0,std::sqrt(yy/norm),yoffset,0,0,0,depth,(m[11]-depth*m[15])/std::sqrt(norm),0,0,1,0};
+    Candidate p{};if(!Projection(projection,p)) return false;
+    c=p;c.kind=Kind::ViewProjection;c.matrix=m;
+    const double tx=(m[3]-xoffset*m[15])/std::sqrt(xx),ty=(m[7]-yoffset*m[15])/std::sqrt(yy);
+    for(size_t j=0;j<3;++j) c.position[j]=-(x[j]/std::sqrt(xx)*tx+y[j]/std::sqrt(yy)*ty+m[12+j]*m[15]);
+    return true;
+}
+inline bool InverseViewProjection(const Matrix& m,Candidate& c) {
+    // Perspective inverse has a zero in the third row's first three entries
+    // only before view multiplication; general inverse VP needs full inversion.
+    Matrix inverse{};if(!Invert(m,inverse) || !ViewProjection(inverse,c)) return false;
+    c.kind=Kind::InverseViewProjection;c.matrix=m;return true;
+}
+inline Scan FindMatrices(const Snapshot& s,bool allow_partial_hypotheses=false) {
+    Scan result{}; result.sync = s.sync;result.partial_capture=!s.complete;
     if (!Known(s.session) || !Known(s.epoch) || !Known(s.submission) || !Known(s.resource) || !Known(s.content_version) ||
-        !s.complete || !s.lifetime_valid || s.sync == Sync::Unknown || s.base_offset % 4 ||
+        (!s.complete && !allow_partial_hypotheses) || !s.lifetime_valid || s.sync == Sync::Unknown || s.base_offset % 4 ||
         s.bytes.size() % 4 || s.bytes.size() < 64 ||
         s.base_offset > std::numeric_limits<uint64_t>::max()-s.bytes.size()) {
         result.unavailable = true; return result;
     }
     if (s.bytes.size() > 1024*1024) { result.capacity_exceeded = true; return result; }
-    size_t projections = 0, rigid = 0;
+    std::array<size_t,4> counts{};
     for (size_t offset = 0; offset <= s.bytes.size()-64; offset += 4) {
         Matrix row{};
         for (size_t i = 0; i < 16; ++i) {
             float value{}; std::memcpy(&value,s.bytes.data()+offset+i*4,4);
             row[i] = value;
         }
+        Matrix transposed{};
+        for(size_t r=0;r<4;++r) for(size_t col=0;col<4;++col) transposed[r*4+col]=row[col*4+r];
+        Candidate simple{};
+        const bool has_simple=Projection(row,simple) || RigidView(row,simple) ||
+            Projection(transposed,simple) || RigidView(transposed,simple);
         for (Layout layout : {Layout::RowMajor,Layout::ColumnMajor}) {
             Matrix m{};
             for (size_t r = 0; r < 4; ++r) for (size_t col = 0; col < 4; ++col)
                 m[r*4+col] = layout == Layout::RowMajor ? row[r*4+col] : row[col*4+r];
-            Candidate c{}; c.layout = layout; c.byte_offset = s.base_offset+offset;
-            if (!(Projection(m,c) || RigidView(m,c))) continue;
-            auto& count = c.kind == Kind::Projection ? projections : rigid;
-            auto& overflow = c.kind == Kind::Projection ? result.projection_overflow : result.rigid_overflow;
+            Candidate c{};
+            if (!(Projection(m,c) || RigidView(m,c) ||
+                (!has_simple && (ViewProjection(m,c) || InverseViewProjection(m,c))))) continue;
+            c.layout = layout;c.byte_offset = s.base_offset+offset;
+            auto& count = counts[static_cast<size_t>(c.kind)];
+            auto& overflow = c.kind == Kind::Projection ? result.projection_overflow :
+                c.kind == Kind::RigidView ? result.rigid_overflow :
+                c.kind == Kind::ViewProjection ? result.combined_overflow : result.inverse_overflow;
             if (overflow) continue;
             if (++count > 256) {
                 overflow = true; result.capacity_exceeded = true;

@@ -7,7 +7,7 @@ struct Fake : SampleApi {
     na_sample_info info{};
     std::vector<uint8_t> bytes;
     uint64_t next=1; unsigned reads=0,releases=0;
-    bool fail_read=false,short_read=false,fail_request=false;
+    bool fail_read=false,short_read=false,fail_request=false,buffer=false;
     Fake() {
         info.status=NA_SAMPLE_READY; info.session=1; info.epoch=2; info.resource=3;
         info.queue=9; info.queue_ticket=17; info.width=2; info.height=2; info.format=40;
@@ -16,7 +16,9 @@ struct Fake : SampleApi {
         std::memcpy(bytes.data(),values,8); std::memcpy(bytes.data()+256,values+2,8);
     }
     int Request(const na_sample_request& r,uint64_t& t) override {
-        CHECK(r.width==0 && r.height==0); if(fail_request) return NA_E_STATE;
+        if(buffer) CHECK(r.width==64 && r.height==1 && r.x==256 && r.y==1);
+        else CHECK(r.width==0 && r.height==0);
+        if(fail_request) return NA_E_STATE;
         t=next++; return NA_OK;
     }
     int Poll(uint64_t,na_sample_info& i) override { i=info; return NA_OK; }
@@ -28,6 +30,55 @@ struct Fake : SampleApi {
 };
 static SamplePlan plan() { return {3,0,2,2,40}; }
 int main() { return test::run({
+    {"timeout releases its lease and the same resource can complete on retry", [] {
+        Fake f;SampleAcquisition a(f);a.Scope(1,2);CHECK(a.Begin(plan()));
+        f.info.status=NA_SAMPLE_FAILED;f.info.reason=NA_SAMPLE_E_TIMEOUT;
+        auto out=a.Pump();CHECK(out.size()==1 && out[0].status==AcquisitionStatus::HostFailure);
+        CHECK(out[0].plan.resource==3 && a.Pending()==0 && f.releases==1 && f.reads==0);
+        CHECK(a.Begin(plan()));f.info.status=NA_SAMPLE_READY;f.info.reason=0;
+        out=a.Pump();CHECK(out.size()==1 && out[0].status==AcquisitionStatus::Ready);
+        CHECK(f.releases==2 && f.reads==1);
+    }},
+    {"retirement cancels pending ranges without reading or releasing other resources", [] {
+        Fake f;SampleAcquisition a(f);a.Scope(1,2);
+        CHECK(a.Begin(plan()));auto sub=plan();sub.subresource=1;CHECK(a.Begin(sub));
+        auto other=plan();other.resource=4;CHECK(a.Begin(other));
+        a.Retire(3);CHECK(a.Pending()==1 && f.releases==2 && f.reads==0);
+        a.Retire(3);CHECK(f.releases==2);
+        f.info.resource=4;auto out=a.Pump();CHECK(out.size()==1 && out[0].plan.resource==4);
+        CHECK(out[0].status==AcquisitionStatus::Ready && f.releases==3);
+        a.Clear();CHECK(f.releases==3);
+    }},
+    {"buffer leases preserve 64-bit offsets and reject wrong completion ranges", [] {
+        for(int mode=0;mode<4;++mode) {
+            Fake f;f.buffer=true;SampleAcquisition a(f);a.Scope(1,2);
+            SamplePlan p{3,0,64,1,0,true,(1ull<<32)+256};CHECK(a.Begin(p));
+            f.info.format=0;f.info.width=64;f.info.height=1;f.info.x=256;f.info.y=1;
+            f.info.row_pitch=64;f.info.data_bytes=64;f.bytes.resize(64);
+            if(mode==1) ++f.info.x;if(mode==2) f.info.y=0;if(mode==3) ++f.info.row_pitch;
+            const auto out=a.Pump();CHECK(out.size()==1 && out[0].plan.offset==p.offset);
+            CHECK((out[0].status==AcquisitionStatus::Ready)==(mode==0));
+            CHECK(out[0].bytes.size()==(mode==0?64u:0u));
+        }
+    }},
+    {"16-bit scalar samples preserve padded rows and explicit interpretation", [] {
+        AcquiredSample s{};s.status=AcquisitionStatus::Ready;s.info.status=NA_SAMPLE_READY;s.info.width=2;s.info.height=2;
+        s.info.row_pitch=8;s.info.data_bytes=12;s.bytes.resize(12);
+        const uint16_t raw[]={0,65535,32768,16384};
+        std::memcpy(s.bytes.data(),raw,4);std::memcpy(s.bytes.data()+8,raw+2,4);
+        std::vector<double> values;
+        for(uint32_t format:{55u,56u}) {
+            s.info.format=format;CHECK(DecodeScalarDepth(s,values));
+            NEAR(values[0],0,1e-9);NEAR(values[1],1,1e-9);NEAR(values[2],32768.0/65535,1e-9);
+        }
+        const uint16_t half[]={0x0001,0x3c00,0x3800,0xbc00};
+        std::memcpy(s.bytes.data(),half,4);std::memcpy(s.bytes.data()+8,half+2,4);
+        s.info.format=54;CHECK(DecodeScalarDepth(s,values));
+        NEAR(values[0],std::ldexp(1.0,-24),1e-12);NEAR(values[1],1,1e-9);
+        NEAR(values[2],0.5,1e-9);NEAR(values[3],-1,1e-9);
+        s.info.format=53;CHECK(!DecodeScalarDepth(s,values));
+        s.info.format=54;s.bytes.pop_back();CHECK(!DecodeScalarDepth(s,values));
+    }},
     {"common HDR and packed-depth inventory formats are acquisition candidates", [] {
         using na::classifier::Format;
         CHECK(ResourceFormat(19)==Format::Depth && ResourceFormat(44)==Format::Depth);
@@ -89,3 +140,4 @@ int main() { return test::run({
         CHECK(!DecodeScalarDepth(out[0],depth));
     }}
 }); }
+

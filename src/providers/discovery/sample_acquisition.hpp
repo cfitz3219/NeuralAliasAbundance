@@ -11,6 +11,8 @@
 #endif
 #include <algorithm>
 #include <cstring>
+#include <cmath>
+#include <limits>
 #include <vector>
 
 namespace na::discovery {
@@ -31,11 +33,14 @@ struct HostSampleApi final : SampleApi {
 struct SamplePlan {
     uint64_t resource{};
     uint32_t subresource{}, width{}, height{}, format{};
+    bool buffer{};
+    uint64_t offset{};
 };
 enum class AcquisitionStatus { Ready, HostFailure, ScopeMismatch, ShapeMismatch, ReadFailure };
 struct AcquiredSample {
     AcquisitionStatus status{AcquisitionStatus::HostFailure};
     na_sample_info info{}; // Actual completion identity; never request-time identity.
+    SamplePlan plan{}; // Retained even when the host returns a failed/empty info.
     std::vector<uint8_t> bytes;
 };
 inline bool SampleId(uint64_t id) { return id && id != UINT64_MAX; }
@@ -72,11 +77,21 @@ public:
         if (SampleId(session) && SampleId(epoch)) { session_=session; epoch_=epoch; }
     }
     size_t Pending() const { return leases_.size(); }
+    // Retirement invalidates every pending range of this resource. Releasing
+    // an in-flight token leaves fence-owned GPU cleanup with the host.
+    void Retire(uint64_t resource) noexcept {
+        for(auto it=leases_.begin();it!=leases_.end();) {
+            if(it->plan.resource==resource) {api_.Release(it->token);it=leases_.erase(it);}
+            else ++it;
+        }
+    }
     bool Begin(const SamplePlan& p) {
-        if (!session_ || !SampleId(p.resource) || !p.width || !p.height ||
-            p.width>4096 || p.height>4096 || !p.format || leases_.size()==4) return false;
-        for (const auto& l:leases_) if (l.plan.resource==p.resource && l.plan.subresource==p.subresource) return false;
+        if (!session_ || !SampleId(p.resource) || !p.width || !p.height || leases_.size()==4) return false;
+        if(p.buffer ? (p.width>65536 || p.height!=1 || p.format || p.subresource || p.offset>UINT64_MAX-p.width) :
+            (p.width>4096 || p.height>4096 || !p.format || p.offset)) return false;
+        for (const auto& l:leases_) if (l.plan.resource==p.resource && l.plan.subresource==p.subresource && l.plan.offset==p.offset) return false;
         na_sample_request r{}; r.size_bytes=sizeof(r); r.resource=p.resource; r.subresource=p.subresource;
+        if(p.buffer) {r.x=static_cast<uint32_t>(p.offset);r.y=static_cast<uint32_t>(p.offset>>32);r.width=p.width;r.height=1;}
         r.arm_timeout_ms=1000; r.expiry_ms=2000; // whole subresource, including depth restrictions
         uint64_t token=0;
         if (api_.Request(r,token)!=NA_OK || !SampleId(token)) { if(token) api_.Release(token); return false; }
@@ -85,7 +100,7 @@ public:
     std::vector<AcquiredSample> Pump() {
         std::vector<AcquiredSample> out; out.reserve(leases_.size());
         for (auto it=leases_.begin();it!=leases_.end();) {
-            AcquiredSample s{}; s.info.size_bytes=sizeof(s.info);
+            AcquiredSample s{}; s.info.size_bytes=sizeof(s.info);s.plan=it->plan;
             const int rc=api_.Poll(it->token,s.info);
             if (rc==NA_OK && s.info.session==session_ && s.info.epoch==epoch_ &&
                 (s.info.status==NA_SAMPLE_ARMED || s.info.status==NA_SAMPLE_IN_FLIGHT)) { ++it; continue; }
@@ -93,8 +108,10 @@ public:
             else if (s.info.session!=session_ || s.info.epoch!=epoch_) s.status=AcquisitionStatus::ScopeMismatch;
             else if (s.info.resource!=it->plan.resource || s.info.subresource!=it->plan.subresource ||
                 s.info.width!=it->plan.width || s.info.height!=it->plan.height || s.info.format!=SampleFormat(it->plan.format) ||
-                s.info.x || s.info.y || !SampleId(s.info.queue) || !SampleId(s.info.queue_ticket) ||
-                !s.info.row_pitch || !s.info.data_bytes || s.info.data_bytes>max_bytes) s.status=AcquisitionStatus::ShapeMismatch;
+                s.info.x!=static_cast<uint32_t>(it->plan.offset) || s.info.y!=static_cast<uint32_t>(it->plan.offset>>32) ||
+                !SampleId(s.info.queue) || !SampleId(s.info.queue_ticket) ||
+                !s.info.row_pitch || !s.info.data_bytes || s.info.data_bytes>max_bytes ||
+                (it->plan.buffer && (s.info.data_bytes!=it->plan.width || s.info.row_pitch!=it->plan.width))) s.status=AcquisitionStatus::ShapeMismatch;
             else {
                 s.bytes.resize(static_cast<size_t>(s.info.data_bytes));
                 uint64_t written=0;
@@ -113,15 +130,26 @@ public:
 inline bool DecodeScalarDepth(const AcquiredSample& s,std::vector<double>& depth) {
     depth.clear();
     const auto& i=s.info;
+    const uint32_t pixel_bytes=(i.format==54 || i.format==55 || i.format==56) ? 2u : 4u;
     if (s.status!=AcquisitionStatus::Ready || i.status!=NA_SAMPLE_READY || i.data_bytes!=s.bytes.size() ||
-        (i.format!=40 && i.format!=41 && i.format!=46) || // D32_FLOAT / R32_FLOAT / R24_UNORM_X8_TYPELESS
+        (i.format!=40 && i.format!=41 && i.format!=46 && i.format!=54 && i.format!=55 && i.format!=56) ||
         !i.width || !i.height || i.width>4096 || i.height>4096 ||
-        uint64_t(i.width)*4>i.row_pitch ||
-        uint64_t(i.row_pitch)*(i.height-1)+uint64_t(i.width)*4>s.bytes.size()) return false;
+        uint64_t(i.width)*pixel_bytes>i.row_pitch ||
+        uint64_t(i.row_pitch)*(i.height-1)+uint64_t(i.width)*pixel_bytes>s.bytes.size()) return false;
     depth.reserve(size_t(i.width)*i.height);
     for(uint32_t y=0;y<i.height;++y) for(uint32_t x=0;x<i.width;++x) {
-        const auto* pixel=s.bytes.data()+size_t(y)*i.row_pitch+size_t(x)*4;
-        if(i.format==46) {
+        const auto* pixel=s.bytes.data()+size_t(y)*i.row_pitch+size_t(x)*pixel_bytes;
+        if(pixel_bytes==2) {
+            uint16_t raw{};std::memcpy(&raw,pixel,2);
+            if(i.format!=54) depth.push_back(double(raw)/65535.0);
+            else {
+                const unsigned exponent=(raw>>10)&31u, mantissa=raw&1023u;
+                double value=exponent==0 ? std::ldexp(double(mantissa),-24) :
+                    exponent==31 ? (mantissa ? std::numeric_limits<double>::quiet_NaN() :
+                        std::numeric_limits<double>::infinity()) : std::ldexp(double(1024u+mantissa),int(exponent)-25);
+                depth.push_back((raw&0x8000u) ? -value : value);
+            }
+        } else if(i.format==46) {
             uint32_t raw{};std::memcpy(&raw,pixel,4);
             depth.push_back(double(raw & 0xFFFFFFu)/double(0xFFFFFFu));
         } else {
