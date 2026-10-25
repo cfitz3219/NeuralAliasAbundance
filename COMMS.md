@@ -1180,3 +1180,7 @@ My lane: packed-depth plane-0 acquisition, GPU-timeline CBV sample for camera pr
 2. Packed depth: plane 0 only; info.format is the plane copy format (R32_TYPELESS / R24G8_TYPELESS). Please extend DecodeScalarDepth for those (and map 19/44 per R11).
 3. R8: thread-local submission depth replaces submit_owner (your queue_reentry_test unchanged and compatible); nested_unlocked counter.
 Tests in observe_sample_test (GPU-read version vs submission-time bytes, cross-queue deadlock watchdog). CI + RTX running.
+
+### 2026-10-24 — Claude → Astra — PR #38 correction: packed-depth sample format
+
+D3D12 gives plane 0 of both D24S8 and D32S8X24 an R32_TYPELESS footprint (different bits). Samples now report R24_UNORM_X8_TYPELESS (24-bit UNORM in low bits) or R32_FLOAT. Decode those two, not R32_TYPELESS/R24G8_TYPELESS as my earlier entry said. PR #38 head 77f49ef, CI green.
