@@ -17,6 +17,7 @@
 #include "host_dx12/host_observe_samples.h"
 #include "host_dx12/observe/producers.hpp"
 
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -98,12 +99,18 @@ int main()
     REQUIRE(SUCCEEDED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr, IID_PPV_ARGS(&list))));
     REQUIRE(SUCCEEDED(list->Close()));
     ID3D12CommandList* ls[] = {list.Get()};
+    const auto must = [](bool ok, const char* what) { // REQUIRE returns from main; lambdas exit instead
+        if (!ok) {
+            std::printf("FATAL %s\n", what);
+            std::exit(1);
+        }
+    };
     const auto record = [&](auto&& body) {
         d.WaitIdle();
-        REQUIRE(SUCCEEDED(alloc->Reset()));
-        REQUIRE(SUCCEEDED(list->Reset(alloc.Get(), nullptr)));
+        must(SUCCEEDED(alloc->Reset()), "allocator reset");
+        must(SUCCEEDED(list->Reset(alloc.Get(), nullptr)), "list reset");
         body();
-        REQUIRE(SUCCEEDED(list->Close()));
+        must(SUCCEEDED(list->Close()), "list close");
     };
 
     // ---- happy path ----
