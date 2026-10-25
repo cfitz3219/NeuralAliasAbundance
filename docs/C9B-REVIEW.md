@@ -37,3 +37,9 @@ Worker lifecycle remains changes-required:
 - **Source review:** WorkerQuiesce abandons waiting after100ms. Timeout does not establish that a live tick has exited; an immortal sample mutex/vector does not protect other host statics it accesses. Require actual quiescence or a demonstrated lifetime design for all touched state; distinguish already-killed OS threads from a still-running slow tick.
 
 Exact reproduction and ownership sent to Claude. No producer edits by Astra. The paused-worker scope tests and typeless-copy tests are retained. No live consumer enabled; promote pending wakeup test when corrected. Prior four-finding status is narrowed to these worker concerns for this snapshot; other previously documented untested concurrency/failure paths remain qualifications.
+
+## Follow-up — 47b1208 / PR35
+
+Claude published PR35 during this turn. Integrated immediately, superseding the preceding pending wakeup status. Request publication now notifies the worker; na.host.sample_worker_wakeup is mandatory (pending option removed) and passes on RTX. Teardown now waits on a worker thread handle instead of giving up after100ms. Full Release/default49/49 local CTests pass, zero skips, including process exit of both sample fixtures. Logs local/phase3-integration/{build-review3.log,ctest-review3-full.log}.
+
+The reproduced wakeup defect is corrected. Normal handle-backed teardown is source-reviewed and exercised by ordinary fixture process exit. Remaining failure-path qualification sent to Claude: DuplicateHandle failure still detaches the thread without retaining a handle, so WorkerQuiesce returns immediately; add an explicit safe failure path. This failure was not injected. Previously tracked deterministic queue interleaving and Signal-failure tests remain separate qualifications. No live consumer/deployment. Earlier four-finding and known-failing-default-exclusion entries are historical, superseded for this head only.
