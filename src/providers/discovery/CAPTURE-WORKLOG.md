@@ -87,3 +87,9 @@ Source review found six blocking categories: repeated in-flight cancellation fre
 All Claude branches checked; new c9b-review-fixes688c0ec (PR33) integrated by fast-forward. Full Release and48/48 local default non-GPU tests pass, zero skips, including updated adversarial RTX fixture. Logs build-c9b-fixes.log and ctest-c9b-fixes-full.log under local/phase3-integration. R1/R5 original defects corrected; other fixes present with narrower remaining qualifications. No producer edits by Astra.
 
 C9B-REVIEW-2 sent to Claude: detached-thread singleton guard launches another worker per request; raw source acquisition still needs ownership proof; scope validation is deferred to worker maintenance; typeless depth partial copies bypass typed-format check. Also distinguish source-reviewed queue interleaving and untested Signal failure/plane rejection from tested paths. Full dispositions appended docs/C9B-REVIEW.md. No live consumer enabled; next integration depends on producer corrections. Latest combined CI pending.
+
+## 2026-10-24 — PR34 integration and new worker reproduction
+
+All branches checked; integrated629ad9b. Full Release builds. New standalone RTX worker-wakeup diagnostic reproduces missing notification: warmup20ms timeout succeeds, second request after idle remains ARMED after~1s (1 assertion fails). Added test-only target and explicit opt-in pending registration; default passing tests do not cover this unresolved failure. No GPU work or producer changes in diagnostic. Logs build-c9b-review2.log,build-worker-wakeup.log,worker-wakeup.log under local/phase3-integration.
+
+Review accepts pre-submit acquisition, operation-time scope checks, typeless depth gate and singleton guard in inspected paths. Worker bounded teardown remains unproven; source review plus exact wakeup repro sent to Claude. Full baseline suite running at this entry. No live consumer/deployment; tests and findings do not close Phase3.

@@ -27,3 +27,13 @@ Changes still required before live use (source-level findings, not reproduced fa
 - Typeless depth: depth_format checks typed depth formats only. Partial R32_TYPELESS/R16_TYPELESS resources with ALLOW_DEPTH_STENCIL are not rejected; depth restrictions must consider resource flags. Add refusal tests before GPU submission.
 
 Cross-thread queue interleaving remains untested deterministically. The current fixture does not visibly inject host Signal failure or planar rejection despite broad coverage claims. Findings and non-overlapping producer ownership posted in COMMS. No live sample-request consumer or deployment enabled; additive interface remains experimental. This section supersedes the initial six-finding disposition only where explicitly noted.
+
+## Recheck — 629ad9b / PR34
+
+Integrated Claude PR34 by fast-forward. Pre-submit source references replace post-forward acquisition; scope checks run at acquire/service/poll/read; ALLOW_DEPTH_STENCIL enforces whole typeless-depth copies. Worker count now has a stable started guard and the fixture asserts one worker. These address the acquisition/scope/typeless findings in the reviewed paths. No blanket concurrency or teardown qualification.
+
+Worker lifecycle remains changes-required:
+- **Reproduced:** after the worker reaches empty-store wait, request publication never notifies it. New diagnostic tests/cpu/sample_worker_wakeup_test.cpp confirms the first20ms request times out, releases it, allows idle, then observes the second20ms request still ARMED after~1s. RTX5070Ti,1 failed assertion, exactly one worker. No GPU submissions. Log local/phase3-integration/worker-wakeup.log. Build target na_sample_worker_wakeup; optionally register with NA_ENABLE_PENDING_SAMPLE_TESTS=ON. Default passing tests explicitly exclude this known failure until correction.
+- **Source review:** WorkerQuiesce abandons waiting after100ms. Timeout does not establish that a live tick has exited; an immortal sample mutex/vector does not protect other host statics it accesses. Require actual quiescence or a demonstrated lifetime design for all touched state; distinguish already-killed OS threads from a still-running slow tick.
+
+Exact reproduction and ownership sent to Claude. No producer edits by Astra. The paused-worker scope tests and typeless-copy tests are retained. No live consumer enabled; promote pending wakeup test when corrected. Prior four-finding status is narrowed to these worker concerns for this snapshot; other previously documented untested concurrency/failure paths remain qualifications.
