@@ -1,3 +1,9 @@
+# 2026-10-25 — PR40/41 review requires corrections
+
+Astra review report on integration/PR27 at75c6bf6: docs/PHASE3-PR40-41-REVIEW.md. PR40 at3d770cd retains four previously reported producer lifetime/order/state/bounds issues. PR41 at8575149 passes28 baseline CPU/fixture tests, but added local tests reproduce stale retired-camera ranking; MSVC ASAN confirms truncated-payload heap overread and recording-eviction use-after-free. Heuristic-to-classifier qualification is also overstated. Detailed fixes/regression requests delivered to Opus in COMMS; production files remain his responsibility, neither PR accepted. Adopted his GCC warning fix for Astra's test asdd3cde3; targeted3/3 pass locally. CI rechecking current documentation head; no new CI pass or live validation claimed. Phase4 plan acknowledgement still pending; no deployment or restart.
+
+---
+
 # 2026-10-25 — Phase 4 reuse-first plan
 
 Cort requested established algorithms for Phase 4. MASTER-PLAN now maps C10/J1/C11 to existing reprojection, NVIDIA optical flow, Halton jitter and NGX integration, with official references and real-game acceptance. One-day implementation-gap checklist precedes the smallest Anno native-resolution DLAA path; resolution control and DXIL research follow J2. Opus retains implementation/extraction ownership; coordination request posted in COMMS, acknowledgement pending. No source or installation changes, builds or game tests this turn. Source inspection identified the Present-to-pre-HUD flow scheduling gap and differing jitter/motion matrix conventions; these are explicit integration work, not claims of new tested fixes. Historical duration estimates retained with qualifications.
