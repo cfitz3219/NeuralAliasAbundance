@@ -23,6 +23,7 @@ int main() {
     test::Device d;if(!test::CreateDevice(d)) return test::SkipNoDevice("diagnostic_adapter");
     REQUIRE(na::observe::InstallProducers(d.device.Get(),d.queue.Get(),true));
     REQUIRE(na_adapter_start()==1);
+    { std::ifstream live(log);CHECK(live.is_open()); }
     CHECK(na_adapter_start()==0);
     auto resource=test::CreateBuffer(d.device.Get(),4096,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_STATE_COMMON);
     REQUIRE(resource);

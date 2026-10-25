@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #include <mutex>
 
 #include "host_dx12/fg/frame_gen.hpp"
@@ -29,14 +30,29 @@ Status g_status{};
 HMODULE g_self = nullptr;
 wchar_t g_ini[MAX_PATH] = {};
 
+// Optional worker-side startup diagnostics, including failures before Present.
+void boot_log(const char* message)
+{
+    wchar_t path[MAX_PATH]{};
+    GetPrivateProfileStringW(L"host", L"startup_log", L"", path, MAX_PATH, g_ini);
+    if (!path[0]) return;
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, path, L"a") == 0 && file) {
+        std::fprintf(file, "pid=%lu %s\n", GetCurrentProcessId(), message);
+        std::fclose(file);
+    }
+}
+
 void set_error(const char* text)
 {
+    boot_log(text);
     std::lock_guard<std::mutex> lock(g_mutex);
     strncpy_s(g_status.error, text, _TRUNCATE);
 }
 
 DWORD WINAPI InitThread(LPVOID)
 {
+    boot_log("host init thread entered");
     // Once hooks go in, this module must never unload.
     HMODULE pinned = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
@@ -108,6 +124,7 @@ DWORD WINAPI InitThread(LPVOID)
     // Adapter phase 1: menu sections before the overlay starts.
     bool adapter_enabled = GetPrivateProfileIntW(L"adapter", L"enabled", 1, g_ini) == 1;
     bool prepared = adapter_enabled && na_adapter_prepare() != 0;
+    boot_log(prepared ? "adapter prepared" : "adapter not prepared");
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_status.adapter_prepared = prepared ? 1u : 0u;
@@ -130,6 +147,7 @@ DWORD WINAPI InitThread(LPVOID)
     // consumer (A5 classifier) runs; [observe] producers=1 turns them on.
     na::observe::RequestInstall(GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1);
     bool started = na::overlay::Start(tag, nullptr);
+    boot_log(started ? "overlay started" : "overlay start failed");
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_status.host_started = started ? 1u : 0u;
@@ -151,6 +169,7 @@ DWORD WINAPI InitThread(LPVOID)
     // Adapter phase 2: subscriptions and registry after the host owns Execute/discovery.
     if (prepared) {
         bool ok = na_adapter_start() != 0;
+        boot_log(ok ? "adapter started" : "adapter start failed");
         std::lock_guard<std::mutex> lock(g_mutex);
         g_status.adapter_started = ok ? 1u : 0u;
         if (!ok) strncpy_s(g_status.error, "adapter start failed; host runs without it", _TRUNCATE);

@@ -8,6 +8,7 @@
 #include "providers/classifier/signal_candidates.hpp"
 #include "providers/camera/matrix_candidates.hpp"
 #include <cstdio>
+#include <share.h>
 #include <map>
 #include <set>
 #include <string>
@@ -60,8 +61,9 @@ void Report(Consumer& c,const na_observe_status& status,const char* phase) {
     unsigned emitted=0;
     for(const auto& pair:c.resources) {
         const auto& r=pair.second;
-        if((!r.depth_writes && !r.color_writes) || r.info.width<128 || r.info.height<128) continue;
-        std::fprintf(c.log,"{\"type\":\"resource_candidate\",\"resource\":%llu,\"format\":%u,\"width\":%llu,\"height\":%u,\"depth_writes\":%llu,\"color_writes\":%llu,\"confidence\":\"unconfirmed_candidate\",\"reason\":\"observed render-target/depth use; missing independent semantic association\"}\n",
+        if(r.info.width<128 || r.info.height<128 || r.info.width>4096 || r.info.height>4096 ||
+            r.info.resource_flags==NA_UNKNOWN_U64 || !(r.info.resource_flags&3)) continue;
+        std::fprintf(c.log,"{\"type\":\"resource_candidate\",\"resource\":%llu,\"format\":%u,\"width\":%llu,\"height\":%u,\"depth_writes\":%llu,\"color_writes\":%llu,\"confidence\":\"unavailable\",\"reason\":\"creation permits render-target/depth use; actual content role and submission association unconfirmed\"}\n",
             pair.first,r.info.format,r.info.width,r.info.height,r.depth_writes,r.color_writes);
         if(++emitted==24) break;
     }
@@ -132,7 +134,7 @@ void __cdecl Sink(const na_event_batch* batch,void* user) {
             c.last_sample=now;
             for(const auto& pair:c.resources) {
                 const auto& r=pair.second;
-                if(c.sampled.count(pair.first) || (!r.depth_writes && !r.color_writes) || r.info.width<128 || r.info.height<128 ||
+                if(c.sampled.count(pair.first) || r.info.resource_flags==NA_UNKNOWN_U64 || !(r.info.resource_flags&3) || r.info.width<128 || r.info.height<128 ||
                     r.info.width>4096 || r.info.height>4096 || r.info.sample_count!=1 || Format(r.info.format)==na::classifier::Format::Unknown) continue;
                 if(c.acquisition.Begin({pair.first,0,static_cast<uint32_t>(r.info.width),r.info.height,r.info.format})) c.sampled.insert(pair.first);
                 if(c.acquisition.Pending()==4) break;
@@ -166,7 +168,8 @@ extern "C" int na_adapter_start() {
     wchar_t path[MAX_PATH]{};GetPrivateProfileStringW(L"discovery",L"log",L"",path,MAX_PATH,ini_path);
     if(!path[0]) return 0;
     auto* c=new Consumer;
-    if(_wfopen_s(&c->log,path,L"w") || !c->log) {delete c;return 0;}
+    c->log=_wfsopen(path,L"w",_SH_DENYWR); // Permit live readers; refuse a second writer.
+    if(!c->log) {delete c;return 0;}
     for(unsigned n=0;n<200 && !na::observe::ProducersActive();++n) Sleep(10); // host init thread only
     if(!na::observe::ProducersActive()) {std::fputs("{\"type\":\"error\",\"reason\":\"producers unavailable\"}\n",c->log);std::fclose(c->log);delete c;return 0;}
     na_observe_config cfg{};cfg.size_bytes=sizeof(cfg);
