@@ -124,7 +124,7 @@ std::atomic<uint32_t> g_initialized{0};
 std::atomic<uint32_t> g_gamepad_hooked{0};
 std::atomic<bool> g_stopping{false};
 std::atomic<float> g_fps{0.0f}, g_frame_ms{0.0f}, g_mouse_x{0.0f}, g_mouse_y{0.0f};
-const char* g_route_tag = "";
+char g_route_tag[64]{};
 PanelFn g_controls = nullptr;
 char g_game_name[96] = {};
 // Evidence freshness for the menu: presents since the evaluate counter moved.
@@ -1928,7 +1928,8 @@ void STDMETHODCALLTYPE DetourExecute(ID3D12CommandQueue* q, UINT n,
 
 bool Start(const char* route_tag, PanelFn controls)
 {
-    g_route_tag = route_tag ? route_tag : "";
+    // Start is called with a bootstrap-local buffer; own the overlay label.
+    snprintf(g_route_tag, sizeof(g_route_tag), "%s", route_tag ? route_tag : "");
     g_controls = controls;
     g_stopping.store(false);
 

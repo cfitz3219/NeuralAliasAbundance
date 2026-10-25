@@ -30,6 +30,7 @@ struct Consumer {
     FILE* log{};
     uint64_t session{},epoch{},batches{},events{},malformed{},submissions{},presents{},snapshots{},matrices{},samples{},last_log{},last_sample{};
     bool overflow{}; unsigned reports{};
+    uint64_t draws{}, binds{}, unresolved_views{}, captured_snapshots{}, truncated_snapshots{}, unmapped_snapshots{}, gpu_snapshots{};
 };
 // The host owns process lifetime. No destructors race its callback at exit.
 Consumer*& consumer() { static auto* slot=new Consumer*(nullptr);return *slot; }
@@ -55,6 +56,10 @@ template<class T> T Read(const unsigned char* p) { T value{};std::memcpy(&value,
 void Report(Consumer& c,const na_observe_status& status,const char* phase) {
     if(!c.log || c.reports>=180) return;
     ++c.reports;
+    const auto health=na::observe::GetProducerStats();
+    std::fprintf(c.log,"{\"type\":\"capture_health\",\"draws\":%llu,\"binds\":%llu,\"unresolved_views\":%llu,\"captured_snapshots\":%llu,\"truncated_snapshots\":%llu,\"unmapped_snapshots\":%llu,\"gpu_snapshots\":%llu,\"sample_missing_recording\":%llu,\"sample_partial_coverage\":%llu,\"sample_partial_states\":%llu,\"sample_no_transition\":%llu}\n",
+        c.draws,c.binds,c.unresolved_views,c.captured_snapshots,c.truncated_snapshots,c.unmapped_snapshots,c.gpu_snapshots,
+        health.sample_missing_recording,health.sample_partial_coverage,health.sample_partial_states,health.sample_no_transition);
     std::fprintf(c.log,"{\"type\":\"summary\",\"phase\":\"%s\",\"read_only\":true,\"session\":%llu,\"epoch\":%llu,\"batches\":%llu,\"events\":%llu,\"submissions\":%llu,\"presents\":%llu,\"resources\":%zu,\"snapshots\":%llu,\"matrix_hypotheses\":%llu,\"ready_samples\":%llu,\"malformed\":%llu,\"inventory_consistent\":%s,\"capture_contiguous\":%s,\"overflow\":%s,\"foundational_dropped\":%llu,\"detail_dropped\":%llu,\"confirmed_inputs\":0,\"unknowns\":[\"camera execution-time association\",\"preserved pre-HUD composition lineage\",\"motion semantic confirmation\"]}\n",
         phase,status.session,status.epoch,c.batches,c.events,c.submissions,c.presents,c.resources.size(),c.snapshots,c.matrices,c.samples,c.malformed,
         c.validity.InventoryConsistent()?"true":"false",c.validity.CaptureContiguous()?"true":"false",c.overflow?"true":"false",status.foundational_dropped,status.detail_dropped);
@@ -103,10 +108,16 @@ void __cdecl Sink(const na_event_batch* batch,void* user) {
                 if(rec.generation!=e.recording_generation) {rec={};rec.generation=e.recording_generation;}
                 rec.incomplete=rec.incomplete || (e.hdr.flags&(NA_EVF_METHOD_UNOBSERVED|NA_EVF_TRUNCATED|NA_EVF_ORDER_AMBIGUOUS));
                 if(e.op==NA_OP_OM_SET_RENDER_TARGETS && !(e.hdr.flags&NA_EVF_TRUNCATED)) {
+                    ++c.binds;
                     rec.targets.clear();
                     const uint64_t count=e.a[0]+e.a[1];
-                    for(uint64_t k=0;k<count;++k) rec.targets.push_back(Read<na_view_ref>(p+e.payload_offset+k*e.payload_stride));
+                    for(uint64_t k=0;k<count;++k) {
+                        auto view=Read<na_view_ref>(p+e.payload_offset+k*e.payload_stride);
+                        if(!view.resource || view.resource==NA_UNKNOWN_U64) ++c.unresolved_views;
+                        rec.targets.push_back(view);
+                    }
                 } else if(e.op==NA_OP_DRAW || e.op==NA_OP_DRAW_INDEXED) {
+                    ++c.draws;
                     for(const auto& view:rec.targets) {
                         const auto found=c.resources.find(view.resource);if(found==c.resources.end()) continue;
                         if(view.descriptor_kind==NA_DESC_DSV) ++found->second.depth_writes;
@@ -117,6 +128,10 @@ void __cdecl Sink(const na_event_batch* batch,void* user) {
             }
             case NA_EV_SNAPSHOT: {
                 ++c.snapshots;const auto e=Read<na_ev_snapshot>(p);
+                c.captured_snapshots+=e.status==NA_SNAP_CAPTURED;
+                c.truncated_snapshots+=(e.hdr.flags&NA_EVF_TRUNCATED)!=0;
+                c.unmapped_snapshots+=e.status==NA_SNAP_NOT_MAPPED;
+                c.gpu_snapshots+=e.status==NA_SNAP_GPU_WRITTEN;
                 // Bounded structural hypotheses only; APP_SYNC_UNKNOWN is never upgraded.
                 if(e.status==NA_SNAP_CAPTURED && e.captured_bytes>=64 && e.captured_bytes<=4096 && c.snapshots%32==0) {
                     na::camera::Snapshot s{status.session,status.epoch,e.queue_ticket,e.resource,e.snapshot_id,e.offset,
@@ -134,7 +149,7 @@ void __cdecl Sink(const na_event_batch* batch,void* user) {
             c.last_sample=now;
             for(const auto& pair:c.resources) {
                 const auto& r=pair.second;
-                if(c.sampled.count(pair.first) || r.info.resource_flags==NA_UNKNOWN_U64 || !(r.info.resource_flags&3) || r.info.width<128 || r.info.height<128 ||
+                if(c.sampled.count(pair.first) || (!r.depth_writes && !r.color_writes) || r.info.resource_flags==NA_UNKNOWN_U64 || !(r.info.resource_flags&3) || r.info.width<128 || r.info.height<128 ||
                     r.info.width>4096 || r.info.height>4096 || r.info.sample_count!=1 || Format(r.info.format)==na::classifier::Format::Unknown) continue;
                 if(c.acquisition.Begin({pair.first,0,static_cast<uint32_t>(r.info.width),r.info.height,r.info.format})) c.sampled.insert(pair.first);
                 if(c.acquisition.Pending()==4) break;

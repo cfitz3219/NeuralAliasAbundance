@@ -45,6 +45,7 @@ struct QueueState {
     // C9B-R3: while a sample is armed, each observed submission on this queue
     // holds this from ExecuteBegin to the end of the host copy that may follow.
     std::mutex submit_m;
+    std::atomic<DWORD> submit_owner{0};
 };
 
 struct ListState {
@@ -122,6 +123,7 @@ std::unordered_map<na_object_id, const void*> g_res_keys; // resource id -> cano
 std::atomic<uint64_t> g_next_id{1};
 
 struct Counters {
+    std::atomic<uint64_t> sample_missing_recording{0}, sample_partial_coverage{0}, sample_partial_states{0}, sample_no_transition{0};
     std::atomic<uint64_t> live{0}, created{0}, retired{0}, writes{0}, copies{0}, unresolved{0}, sentinel_fail{0},
         executes{0}, ambiguous{0};
     std::atomic<uint32_t> hooks{0}, missing{0};
@@ -942,7 +944,10 @@ std::shared_ptr<QueueState> queue_state(ID3D12CommandQueue* q, na_object_id* id)
 void unlock_submission(const ExecuteToken& t)
 {
     if (!t.submit_locked) return;
-    if (auto qs = std::static_pointer_cast<QueueState>(t.queue_state)) qs->submit_m.unlock();
+    if (auto qs = std::static_pointer_cast<QueueState>(t.queue_state)) {
+        qs->submit_owner.store(0, std::memory_order_release);
+        qs->submit_m.unlock();
+    }
 }
 bool end_occurrence(const ExecuteToken& t)
 {
@@ -2637,9 +2642,10 @@ bool submission_notes(uint32_t count, ID3D12CommandList* const* lists, std::vect
     for (uint32_t i = 0; i < count; ++i) {
         na_object_id lid = 0;
         ListState* ls = lists[i] ? list_state_locked(lists[i], &lid) : nullptr;
-        if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
+        if (!ls || !ls->recording_observed.load()) { ++g_c.sample_missing_recording; return false; }
+        if (!ls->coverage_complete.load()) { ++g_c.sample_partial_coverage; return false; }
         std::lock_guard<std::mutex> bl(ls->bind_m);
-        if (!ls->evidence_complete) return false;
+        if (!ls->evidence_complete) { ++g_c.sample_partial_states; return false; }
         notes.insert(notes.end(), ls->states.begin(), ls->states.end());
     }
     return true;
@@ -2695,6 +2701,7 @@ void acquire_sample_sources(ID3D12CommandQueue* q, uint32_t count, ID3D12Command
             if (s.status != NA_SAMPLE_ARMED || s.released || !scope_check_locked(s, session, epoch)) continue;
             uint32_t state = kStateUnknown;
             if (last_state(notes, s, &state) && state_ok_for_queue(state, type)) want.push_back({s.token, s.req.resource});
+            else ++g_c.sample_no_transition;
         }
         recount_armed_locked();
     }
@@ -2899,8 +2906,14 @@ ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue, uint32_t count, ID3D12Comma
     na_object_id qid = 0;
     auto qs = queue ? queue_state(queue, &qid) : nullptr;
     if (!qs) return t;
-    if (!t_host_work && g_armed.load(std::memory_order_acquire)) { // C9B-R3
+    // A runtime may re-enter Wait/Signal while forwarding Execute on this
+    // thread. The outer scope already excludes other threads. Observe the
+    // nested occurrence (making both ambiguous), without reacquiring its
+    // nonrecursive mutex or replacing the outer pre-submit references.
+    if (!t_host_work && g_armed.load(std::memory_order_acquire) &&
+        qs->submit_owner.load(std::memory_order_acquire) != GetCurrentThreadId()) { // C9B-R3
         qs->submit_m.lock();
+        qs->submit_owner.store(GetCurrentThreadId(), std::memory_order_release);
         t.submit_locked = true;
         acquire_sample_sources(queue, count, lists); // before the original runs (C9B-REVIEW-2 #2)
     }
@@ -3022,6 +3035,10 @@ ProducerStats GetProducerStats()
         s.samples_live = g_samples.size();
     }
     s.sample_workers_started = g_workers_started.load();
+    s.sample_missing_recording = g_c.sample_missing_recording.load();
+    s.sample_partial_coverage = g_c.sample_partial_coverage.load();
+    s.sample_partial_states = g_c.sample_partial_states.load();
+    s.sample_no_transition = g_c.sample_no_transition.load();
     return s;
 }
 

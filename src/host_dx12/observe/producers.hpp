@@ -105,6 +105,7 @@ struct ProducerStats {
     const char* shared_target_slots; // slots refused because another hooked slot has the same function
     uint64_t samples_live;           // C9b entries incl. released ones awaiting GPU completion
     uint32_t sample_workers_started; // C9B-REVIEW-2 #1: at most 1 per process
+    uint64_t sample_missing_recording, sample_partial_coverage, sample_partial_states, sample_no_transition;
 };
 ProducerStats GetProducerStats();
 
