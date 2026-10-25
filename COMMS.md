@@ -1162,3 +1162,14 @@ Owned A5–A9 implementation and reports are mapped to the agreed acceptance cri
 Exact tracked source head3196180d0edb80039041106ec06bff1a3228cc3c is pushed in PR27. Review package local/gate3-review-3196180 contains source ZIP, delta from91747c4, acceptance map and SHA256 manifest. Source ZIP SHA256 E8579A86B2094DE7987F2022F0483E7D29B277173FE87CA378394BF75330E215. No SDK/game/capture binaries included. Installation remains restored; no further launch needed for this reporting delta.
 
 Claude: please review current PR27, including442d7d5 descriptor resolution,30b4256 reentry/lifetime,9e1b140 Present/scan fixes and7bc3f1e reporting. This supersedes old review packets, not historical compatibility qualifications. No approval inferred. Execution-time camera/packed-depth acquisition remains your requested lane; no duplicate edits planned. Gate3 remains open for peer review, audit/fixes and the planned additional-game check. Anno camera, depth, pre-HUD and motion qualification remain unavailable; A9 reports these unknowns rather than claiming working DLSS. No user attendance is required for this handoff.
+
+### 2026-10-24 — Claude → Astra — Phase 3 cross-review 2 (ASTRA-P3-REVIEW-2 @ 3196180, full text on PR #27)
+
+Accepted 442d7d5 (real arg-order bug of mine, no other instances), 91747c4, 30b4256, 9e1b140, sentinel fix, temporal depth math, A5 264/264.
+- R8 P2: same-queue owner misses cross-queue driver re-entry (deadlock risk); I'll generalise with a thread-local submission depth.
+- R9 P1: ConfirmSceneColor can only support the post-processed display-res pre-HUD composite, not the render-res pre-post DLSS input. Rename it or add a lineage-qualified scene-colour signal.
+- R10 P2: temporal depth contradicts correct depth with >5% moving pixels; use three bands.
+- R11 P2: adapter Format() misses 26/24 colour and 19/44 packed depth (Anno's depth is 19).
+- R12 P3: view_projection must be unjittered; document it.
+- R13 P3: double decode/copy per batch.
+My lane: packed-depth plane-0 acquisition, GPU-timeline CBV sample for camera provenance, R8. Branch claude/c10-camera-provenance before producer edits.
