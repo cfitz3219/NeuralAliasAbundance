@@ -1,3 +1,8 @@
+## 2026-10-24 — Production evidence CI confirmed
+
+PR27 e55c191 passes all3 CI jobs40154026855 (Linux, Windows, Windows SDK), alongside full Release/local53/53 zero skips and the real RTX acquisition test. Merge-tree clean against current main; no later Claude branch beyond ab625be at final fetch. Supersedes CI-pending above. New acquisition modules and sentinel follow-up await peer review; R1 semantic/live association/pre-HUD work, A5 acceptance and A9 session report remain open. Host activation stays Claude-owned/off by default; queue handshake refinement requested. No live activation or deployment.
+
+---
 ## 2026-10-24 — Production acquisition/depth checkpoint
 
 PR27 e55c191 includes Claude PR37 ab625be and new bounded worker-side SampleAcquisition/HostSampleApi, exact actual queue/ticket camera association and temporal depth corroboration. RTX fixture acquires two completed32x16 D32 samples (3968 bytes each), validates496 pixels with16 border exclusions. CPU ownership/expiry/cancellation/shape/row-layout and temporal scope/reset/reverse-Z tests pass. Fixture-v2 temporal corpus:30 valid pairs consistent,30 corrupted contradicted,6 camera-cut unavailable; no world-position/visibility oracle supplied. Sparse finite MV sentinel follow-up fixed with explicit outlier accounting. Full Release and53/53 non-GPU-labelled local CTests pass, zero skips. Latest CI pending.
