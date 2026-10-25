@@ -72,6 +72,13 @@ struct ListState {
     };
     std::vector<StateNote> states;
     bool evidence_complete = true; // C9B-R4: no truncated batch / overflow in this recording (under bind_m)
+    // G3-06 review: resources this recording references (render/depth targets,
+    // clears, copies, resolves, barriers), under bind_m. A carried state is
+    // only used for a resource the submitted work references (the application
+    // must keep it alive until that work runs); copy-queue submissions decay
+    // every resource they reference. Bounded; overflow clears uses_complete.
+    std::vector<na_object_id> uses;
+    bool uses_complete = true;
 };
 
 struct Obj {
@@ -143,33 +150,57 @@ struct Counters {
     std::atomic<uint32_t> hooks{0}, missing{0};
 } g_c;
 
+std::atomic<uint64_t> g_unhooked_devices{0}, g_unhooked_queues{0};
+std::atomic<bool> g_known_disabled{false}; // a submission could not be observed: carried states are never trusted
+
 // ---------------------------------------------- G3-06: known resource states
 // Explicit transition state carried across submissions, so a sample does not
 // need a barrier in the very submission it follows. A wrong StateBefore in the
-// host's copy barrier would be invalid GPU work, so the record is used only
-// when it is provably current:
-//  - it came from a creation state or from complete, observed recordings;
-//  - every transition of the resource was recorded by ONE queue: same-queue
-//    CPU submission order is GPU order, cross-queue order is not (a resource
-//    transitioned by a second queue is permanently excluded);
-//  - an observed submission whose recordings are incomplete may have
-//    transitioned anything: every record is dropped; an order-ambiguous one
-//    poisons the resources it transitioned.
-// Pending split barriers (BEGIN_ONLY) and COMMON are never usable.
+// host's copy barrier would be invalid GPU work, so a record is used only when
+// it is provably current (Gate 3 review, PR40 items 1-4):
+//  - Eligibility: committed, non-simultaneous-access textures registered at
+//    creation. Placed/reserved (aliasable, so no wildcard aliasing barrier can
+//    reach the store), buffers (implicit decay) and resources first met after
+//    installation never get an entry. The store is capped; a texture that
+//    does not fit is simply not eligible (fail-safe).
+//  - Evidence is captured from the recordings BEFORE the submission is
+//    forwarded (a list may be reset as soon as ExecuteCommandLists returns).
+//  - While a submission is in flight (Begin..End), every resource it
+//    transitions (and, on a copy queue, every resource it references) is
+//    marked; a marked record is never read by another submission.
+//  - Publication at End applies the captured transitions only when this
+//    submission was the sole marker of that resource from its Begin to its
+//    End, nothing order-ambiguous happened and no store clear intervened.
+//    Otherwise the record becomes unknown. Copy-queue submissions decay every
+//    resource they reference to COMMON (unknown).
+//  - A submission whose recordings are incomplete may transition anything:
+//    the store is reset at its Begin and nothing is readable or publishable
+//    until it ends.
+//  - Any unobservable submission path (an unhooked queue or device, a queue
+//    that could not be registered) disables the store for the process.
+//  - Records belong to the queue that last transitioned them; another queue
+//    never reads them (cross-queue order needs fences we do not track). A
+//    partial transition on a second queue makes the other subresources unknown.
+// Pending split barriers (BEGIN_ONLY), aliased resources and COMMON are never usable.
+constexpr uint32_t kStatePending = 0xFFFFFFFFu;
 struct ResKnown {
-    bool poisoned = false;
+    uint32_t in_flight = 0; // submissions between Begin and End that mark it
+    uint64_t mark_seq = 0;  // incremented on every mark
     na_object_id queue = 0; // last queue that transitioned it; 0 = creation state only
     bool has_all = false;
-    uint32_t all = 0;
+    uint32_t all = kStatePending;
     std::unordered_map<uint32_t, uint32_t> subs;
 };
-constexpr uint32_t kStatePending = 0xFFFFFFFFu;
+constexpr size_t kMaxKnown = 65536, kMaxKnownSubs = 64;
 std::mutex g_known_m;
 std::unordered_map<na_object_id, ResKnown> g_known; // under g_known_m (never taken before g_m or g_samples_m)
+uint64_t g_known_epoch = 0;     // under g_known_m: incremented by every store reset
+uint32_t g_unknown_inflight = 0; // under g_known_m: incomplete submissions between Begin and End
 
 void known_created(na_object_id id, uint32_t state)
 {
     std::lock_guard<std::mutex> lock(g_known_m);
+    if (g_known.size() >= kMaxKnown && !g_known.count(id)) return; // not eligible
     ResKnown k;
     k.has_all = true;
     k.all = state;
@@ -180,19 +211,28 @@ void known_forget(na_object_id id)
     std::lock_guard<std::mutex> lock(g_known_m);
     g_known.erase(id);
 }
-void known_clear()
+void known_reset_locked(ResKnown& k)
 {
-    std::lock_guard<std::mutex> lock(g_known_m);
-    if (!g_known.empty()) {
-        g_known.clear();
-        g_c.known_clears.fetch_add(1);
-    }
+    k.queue = 0;
+    k.has_all = false;
+    k.all = kStatePending;
+    k.subs.clear();
 }
-bool known_state(na_object_id res, uint32_t sub, na_object_id qid, uint32_t* state)
+// Entries stay (eligibility and in-flight marks are kept); states become unknown.
+void known_clear_locked()
 {
+    for (auto& kv : g_known) known_reset_locked(kv.second);
+    ++g_known_epoch;
+    g_c.known_clears.fetch_add(1);
+}
+// self_marks: marks the asking submission itself holds on this resource.
+bool known_state(na_object_id res, uint32_t sub, na_object_id qid, uint32_t self_marks, uint32_t* state)
+{
+    if (g_known_disabled.load() || g_unhooked_queues.load() || g_unhooked_devices.load()) return false;
     std::lock_guard<std::mutex> lock(g_known_m);
+    if (g_unknown_inflight) return false;
     auto it = g_known.find(res);
-    if (it == g_known.end() || it->second.poisoned || (it->second.queue && it->second.queue != qid)) return false;
+    if (it == g_known.end() || it->second.in_flight > self_marks || (it->second.queue && it->second.queue != qid)) return false;
     auto s = it->second.subs.find(sub);
     const uint32_t v = s != it->second.subs.end() ? s->second : (it->second.has_all ? it->second.all : kStatePending);
     if (v == kStatePending || v == D3D12_RESOURCE_STATE_COMMON) return false;
@@ -227,7 +267,6 @@ bool ordering_window_intact()
 std::atomic<bool> g_lists_hooked{false};
 void** g_device_table = nullptr; // the device table whose entries are ours
 void** g_queue_table = nullptr;
-std::atomic<uint64_t> g_unhooked_devices{0}, g_unhooked_queues{0};
 
 template <typename E>
 void init_header(E& e, uint32_t kind, uint32_t flags)
@@ -1619,6 +1658,28 @@ void with_list_state(const void* l, F&& f)
     if (ListState* ls = list_state_locked(l, &id)) f(*ls);
 }
 
+constexpr size_t kMaxListUses = 4096;
+void add_use_locked(ListState& ls, na_object_id id)
+{
+    if (!id || id == NA_UNKNOWN_U64 || (!ls.uses.empty() && ls.uses.back() == id)) return;
+    if (ls.uses.size() >= kMaxListUses) { // compact before giving up (targets are rebound often)
+        std::sort(ls.uses.begin(), ls.uses.end());
+        ls.uses.erase(std::unique(ls.uses.begin(), ls.uses.end()), ls.uses.end());
+        if (ls.uses.size() >= kMaxListUses * 3 / 4) {
+            ls.uses_complete = false;
+            return;
+        }
+    }
+    ls.uses.push_back(id);
+}
+void note_uses(const void* l, std::initializer_list<na_object_id> ids)
+{
+    with_list_state(l, [&](ListState& ls) {
+        std::lock_guard<std::mutex> bl(ls.bind_m);
+        for (na_object_id id : ids) add_use_locked(ls, id);
+    });
+}
+
 constexpr uint32_t kRootCbvBytes = 512; // a root CBV has no size: capture this much (bounded by the buffer)
 
 void add_binding(ListState& ls, const ListState::Binding& b)
@@ -1797,6 +1858,8 @@ struct On<sl::list::Reset> {
                     ls->bindings.clear();
                     ls->states.clear();
                     ls->evidence_complete = true;
+                    ls->uses.clear();
+                    ls->uses_complete = true;
                 }
                 ls->root_sig[0] = ls->root_sig[1] = nullptr;
                 ls->coverage_complete.store(cov == na::hooking::variants::Coverage::Complete);
@@ -1865,7 +1928,10 @@ struct On<sl::list::CopyBufferRegion> {
     static void run(GL* l, ID3D12Resource* dst, UINT64 doff, ID3D12Resource* src, UINT64 soff, UINT64 n)
     {
         Rec r;
-        if (begin_op(l, &r)) emit_op(r, NA_OP_COPY_BUFFER_REGION, {resource_id(dst), doff, resource_id(src), soff, n}, nullptr, 0, 0, 0, NA_GROUP_RESOURCE_USE);
+        if (!begin_op(l, &r)) return;
+        const na_object_id d = resource_id(dst), s = resource_id(src);
+        emit_op(r, NA_OP_COPY_BUFFER_REGION, {d, doff, s, soff, n}, nullptr, 0, 0, 0, NA_GROUP_RESOURCE_USE);
+        note_uses(l, {d, s});
     }
 };
 template <>
@@ -1899,8 +1965,9 @@ struct On<sl::list::CopyTextureRegion> {
         };
         fpinfo(dst, &cr.dst_footprint_offset, cr.dst_footprint);
         fpinfo(src, &cr.src_footprint_offset, cr.src_footprint);
-        emit_op(r, NA_OP_COPY_TEXTURE_REGION, {resource_id(dst->pResource), sub(dst), resource_id(src->pResource), sub(src)}, &cr, sizeof(cr),
-                sizeof(cr), 0, NA_GROUP_RESOURCE_USE);
+        const na_object_id d = resource_id(dst->pResource), s = resource_id(src->pResource);
+        emit_op(r, NA_OP_COPY_TEXTURE_REGION, {d, sub(dst), s, sub(src)}, &cr, sizeof(cr), sizeof(cr), 0, NA_GROUP_RESOURCE_USE);
+        note_uses(l, {d, s});
     }
 };
 template <>
@@ -1908,7 +1975,10 @@ struct On<sl::list::CopyResource> {
     static void run(GL* l, ID3D12Resource* dst, ID3D12Resource* src)
     {
         Rec r;
-        if (begin_op(l, &r)) emit_op(r, NA_OP_COPY_RESOURCE, {resource_id(dst), resource_id(src)}, nullptr, 0, 0, 0, NA_GROUP_RESOURCE_USE);
+        if (!begin_op(l, &r)) return;
+        const na_object_id d = resource_id(dst), s = resource_id(src);
+        emit_op(r, NA_OP_COPY_RESOURCE, {d, s}, nullptr, 0, 0, 0, NA_GROUP_RESOURCE_USE);
+        note_uses(l, {d, s});
     }
 };
 template <>
@@ -1916,7 +1986,10 @@ struct On<sl::list::ResolveSubresource> {
     static void run(GL* l, ID3D12Resource* dst, UINT ds, ID3D12Resource* src, UINT ss, DXGI_FORMAT f)
     {
         Rec r;
-        if (begin_op(l, &r)) emit_op(r, NA_OP_RESOLVE, {resource_id(dst), ds, resource_id(src), ss, static_cast<uint64_t>(f)}, nullptr, 0, 0, 0, NA_GROUP_RESOURCE_USE);
+        if (!begin_op(l, &r)) return;
+        const na_object_id d = resource_id(dst), s = resource_id(src);
+        emit_op(r, NA_OP_RESOLVE, {d, ds, s, ss, static_cast<uint64_t>(f)}, nullptr, 0, 0, 0, NA_GROUP_RESOURCE_USE);
+        note_uses(l, {d, s});
     }
 };
 template <>
@@ -2002,24 +2075,45 @@ struct On<sl::list::ResourceBarrier> {
         // event is limited to 64 entries (it stays flagged TRUNCATED). An
         // overflow of the recording's evidence store still invalidates it
         // (C9B-R4). BEGIN_ONLY leaves the state pending until its END_ONLY half.
+        // Aliasing barriers make the named resources' states unknown (both
+        // sides). Only placed/reserved resources alias, and those never enter
+        // the carried-state store, so a null (wildcard) aliasing barrier needs
+        // no store-wide action. Allocation is bounded by the 8192-entry
+        // recording store before anything proportional to n is reserved.
+        constexpr size_t kMaxStates = 8192;
         std::vector<ListState::StateNote> add;
-        add.reserve(n);
-        for (uint32_t i = 0; i < n; ++i) {
-            if (b[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) continue;
-            const na_object_id id = i < m ? out[i].resource : resource_id(b[i].Transition.pResource);
-            if (!id || id == NA_UNKNOWN_U64) continue;
-            const bool begin_only = (b[i].Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY) != 0;
-            add.push_back({id, b[i].Transition.Subresource, begin_only ? kStatePending : static_cast<uint32_t>(b[i].Transition.StateAfter)});
+        std::vector<na_object_id> used;
+        add.reserve(std::min<size_t>(n, kMaxStates));
+        used.reserve(std::min<size_t>(n, 2 * kMaxListUses));
+        bool overflow = false;
+        for (uint32_t i = 0; i < n && !overflow; ++i) {
+            const auto push = [&](na_object_id id, uint32_t subresource, uint32_t state) {
+                if (add.size() >= kMaxStates) overflow = true;
+                else add.push_back({id, subresource, state});
+            };
+            const auto known_id = [](na_object_id id) { return id && id != NA_UNKNOWN_U64; };
+            if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
+                const na_object_id id = i < m ? out[i].resource : resource_id(b[i].Transition.pResource);
+                if (!known_id(id)) continue;
+                const bool begin_only = (b[i].Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY) != 0;
+                push(id, b[i].Transition.Subresource, begin_only ? kStatePending : static_cast<uint32_t>(b[i].Transition.StateAfter));
+                if (used.size() < 2 * kMaxListUses) used.push_back(id);
+            } else if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) {
+                const na_object_id before = i < m ? out[i].resource : resource_id(b[i].Aliasing.pResourceBefore);
+                const na_object_id after = i < m ? out[i].resource_after : resource_id(b[i].Aliasing.pResourceAfter);
+                for (na_object_id id : {before, after})
+                    if (known_id(id)) push(id, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, kStatePending);
+            } else {
+                const na_object_id id = i < m ? out[i].resource : resource_id(b[i].UAV.pResource);
+                if (known_id(id) && used.size() < 2 * kMaxListUses) used.push_back(id);
+            }
         }
         with_list_state(l, [&](ListState& ls) {
             std::lock_guard<std::mutex> bl(ls.bind_m);
-            for (const auto& a : add) {
-                if (ls.states.size() >= 8192) {
-                    ls.evidence_complete = false;
-                    break;
-                }
-                ls.states.push_back(a);
-            }
+            if (overflow || ls.states.size() + add.size() > kMaxStates) ls.evidence_complete = false;
+            else ls.states.insert(ls.states.end(), add.begin(), add.end());
+            for (na_object_id id : used) add_use_locked(ls, id);
+            if (used.size() >= 2 * kMaxListUses) ls.uses_complete = false;
         });
     }
 };
@@ -2194,6 +2288,10 @@ struct On<sl::list::OMSetRenderTargets> {
         }
         emit_op(r, NA_OP_OM_SET_RENDER_TARGETS, {std::min<UINT>(n, 8), dsv ? 1u : 0u}, refs, m * static_cast<uint32_t>(sizeof(na_view_ref)), sizeof(na_view_ref), 0,
                 NA_GROUP_RESOURCE_USE);
+        with_list_state(l, [&](ListState& ls) {
+            std::lock_guard<std::mutex> bl(ls.bind_m);
+            for (uint32_t i = 0; i < m; ++i) add_use_locked(ls, refs[i].resource);
+        });
     }
 };
 template <>
@@ -2204,6 +2302,7 @@ struct On<sl::list::ClearDepthStencilView> {
         if (!begin_op(l, &r)) return;
         const na_view_ref v = cpu_ref(h);
         emit_op(r, NA_OP_CLEAR_DSV, {static_cast<uint64_t>(f), float_bits(depth, 0.f), stencil}, &v, sizeof(v), sizeof(v), 0, NA_GROUP_RESOURCE_USE);
+        note_uses(l, {v.resource});
     }
 };
 template <>
@@ -2216,6 +2315,7 @@ struct On<sl::list::ClearRenderTargetView> {
         const float z[4] = {0, 0, 0, 0};
         const float* cc = c ? c : z;
         emit_op(r, NA_OP_CLEAR_RTV, {float_bits(cc[0], cc[1]), float_bits(cc[2], cc[3])}, &v, sizeof(v), sizeof(v), 0, NA_GROUP_RESOURCE_USE);
+        note_uses(l, {v.resource});
     }
 };
 template <>
@@ -2993,36 +3093,146 @@ void start_copy_locked(Sample& s, ID3D12Resource* res, ID3D12CommandQueue* q, D3
     s.status = NA_SAMPLE_IN_FLIGHT;
 }
 
-// The submission's resource-state evidence (C9B-R4): false when any list
-// cannot be vouched for, which makes the whole submission ineligible.
-bool submission_notes(uint32_t count, ID3D12CommandList* const* lists, std::vector<ListState::StateNote>& notes)
+// A submission's evidence, captured from its recordings BEFORE it is forwarded
+// (Gate 3 review PR40 #2: a list may be reset as soon as ExecuteCommandLists
+// returns, so nothing is reread afterwards). Shared by sampling (Begin/End)
+// and the known-state store. Every accumulation is bounded before allocation.
+struct SubmissionCapture {
+    bool lists = false;    // the submission carried command lists
+    bool notes_ok = false; // C9B-R4: every list observed, fully covered, evidence complete
+    bool uses_ok = false;  // every referenced resource recorded
+    uint32_t reject = 0;   // first reason notes_ok is false: 1 missing recording, 2 partial coverage, 3 partial states
+    std::vector<ListState::StateNote> notes;
+    std::vector<ListState::Binding> binds;
+    std::vector<na_object_id> uses; // sorted, unique
+    struct Mark {
+        na_object_id id;
+        uint64_t seq;
+        bool alone; // no other submission held a mark when this one was taken
+    };
+    std::vector<Mark> marks; // under g_known_m
+    uint64_t epoch = 0;
+    bool in_store = false, tainted = false, unknown_marked = false, copy_queue = false;
+    uint32_t SelfMarks(na_object_id id) const
+    {
+        uint32_t n = 0;
+        for (const auto& m : marks) n += m.id == id;
+        return n;
+    }
+};
+constexpr size_t kMaxSubmissionNotes = 65536, kMaxSubmissionBinds = 16384, kMaxSubmissionUses = 65536;
+
+void capture_submission(uint32_t count, ID3D12CommandList* const* lists, SubmissionCapture& c)
 {
-    if (!lists || !count) return false;
+    if (!lists || !count) return;
+    c.lists = true;
+    bool notes_ok = true, uses_ok = true;
+    const auto reject = [&](uint32_t why) {
+        if (notes_ok) c.reject = why;
+        notes_ok = uses_ok = false;
+    };
     std::shared_lock<std::shared_mutex> rl(g_m);
     for (uint32_t i = 0; i < count; ++i) {
         na_object_id lid = 0;
         ListState* ls = lists[i] ? list_state_locked(lists[i], &lid) : nullptr;
-        if (!ls || !ls->recording_observed.load()) { ++g_c.sample_missing_recording; return false; }
-        if (!ls->coverage_complete.load()) { ++g_c.sample_partial_coverage; return false; }
+        if (!ls || !ls->recording_observed.load()) {
+            reject(1);
+            continue;
+        }
+        if (!ls->coverage_complete.load()) reject(2);
         std::lock_guard<std::mutex> bl(ls->bind_m);
-        if (!ls->evidence_complete) { ++g_c.sample_partial_states; return false; }
-        notes.insert(notes.end(), ls->states.begin(), ls->states.end());
+        if (!ls->evidence_complete || c.notes.size() + ls->states.size() > kMaxSubmissionNotes) {
+            if (notes_ok) c.reject = 3;
+            notes_ok = false;
+        } else if (notes_ok) {
+            c.notes.insert(c.notes.end(), ls->states.begin(), ls->states.end());
+        }
+        const size_t room = kMaxSubmissionBinds - std::min(kMaxSubmissionBinds, c.binds.size());
+        c.binds.insert(c.binds.end(), ls->bindings.begin(), ls->bindings.begin() + std::min(room, ls->bindings.size()));
+        if (!ls->uses_complete || c.uses.size() + ls->uses.size() > kMaxSubmissionUses) uses_ok = false;
+        else if (uses_ok) c.uses.insert(c.uses.end(), ls->uses.begin(), ls->uses.end());
     }
-    return true;
+    if (!notes_ok) c.notes.clear();
+    std::sort(c.uses.begin(), c.uses.end());
+    c.uses.erase(std::unique(c.uses.begin(), c.uses.end()), c.uses.end());
+    c.notes_ok = notes_ok;
+    c.uses_ok = uses_ok;
 }
-// C10: constant-data bindings recorded in the submission's observed lists.
-void submission_bindings(uint32_t count, ID3D12CommandList* const* lists, std::vector<ListState::Binding>& binds)
+
+// Begin, before forwarding: mark what this submission may change.
+void known_mark(SubmissionCapture& c, bool copy_queue)
 {
-    if (!lists) return;
-    std::shared_lock<std::shared_mutex> rl(g_m);
-    for (uint32_t i = 0; i < count; ++i) {
-        na_object_id lid = 0;
-        ListState* ls = lists[i] ? list_state_locked(lists[i], &lid) : nullptr;
-        if (!ls || !ls->recording_observed.load()) continue;
-        std::lock_guard<std::mutex> bl(ls->bind_m);
-        binds.insert(binds.end(), ls->bindings.begin(), ls->bindings.end());
+    if (!c.lists) return; // queue sync operations change no state
+    std::lock_guard<std::mutex> lock(g_known_m);
+    c.in_store = true;
+    c.copy_queue = copy_queue;
+    if (!c.notes_ok || (copy_queue && !c.uses_ok)) { // may transition/decay anything
+        known_clear_locked();
+        ++g_unknown_inflight;
+        c.unknown_marked = true;
+        return;
+    }
+    c.epoch = g_known_epoch;
+    c.tainted = g_unknown_inflight > 0;
+    std::vector<na_object_id> ids;
+    ids.reserve(c.notes.size() + (copy_queue ? c.uses.size() : 0));
+    for (const auto& n : c.notes) ids.push_back(n.resource);
+    if (copy_queue) ids.insert(ids.end(), c.uses.begin(), c.uses.end());
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    for (na_object_id id : ids) {
+        auto it = g_known.find(id);
+        if (it == g_known.end()) continue; // not eligible
+        ResKnown& k = it->second;
+        c.marks.push_back({id, ++k.mark_seq, k.in_flight == 0});
+        ++k.in_flight;
     }
 }
+
+// End, after forwarding: publish the captured transitions where provably ordered.
+void known_publish(SubmissionCapture& c, na_object_id qid, bool ambiguous)
+{
+    if (!c.in_store) return;
+    std::lock_guard<std::mutex> lock(g_known_m);
+    if (c.unknown_marked) {
+        --g_unknown_inflight;
+        return;
+    }
+    const bool valid = !ambiguous && !c.tainted && c.epoch == g_known_epoch && !c.copy_queue;
+    std::vector<na_object_id> good;
+    for (const auto& m : c.marks) {
+        auto it = g_known.find(m.id);
+        if (it == g_known.end()) continue; // retired meanwhile
+        if (valid && m.alone && it->second.mark_seq == m.seq) good.push_back(m.id);
+        else known_reset_locked(it->second); // overlapped / ambiguous / cleared / copy-queue decay
+    }
+    std::sort(good.begin(), good.end());
+    std::vector<na_object_id> claimed; // ids whose queue ownership was settled in this publication
+    for (const auto& n : c.notes) {
+        if (!std::binary_search(good.begin(), good.end(), n.resource)) continue;
+        ResKnown& k = g_known[n.resource];
+        if (std::find(claimed.begin(), claimed.end(), n.resource) == claimed.end()) {
+            claimed.push_back(n.resource);
+            if (k.queue && k.queue != qid) known_reset_locked(k); // another queue's timeline: start over
+            k.queue = qid;
+        }
+        if (n.subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) {
+            k.has_all = true;
+            k.all = n.state_after;
+            k.subs.clear();
+        } else if (k.subs.size() >= kMaxKnownSubs && !k.subs.count(n.subresource)) {
+            known_reset_locked(k);
+            k.queue = qid;
+        } else {
+            k.subs[n.subresource] = n.state_after;
+        }
+    }
+    for (const auto& m : c.marks) {
+        auto it = g_known.find(m.id);
+        if (it != g_known.end() && it->second.in_flight) --it->second.in_flight;
+    }
+}
+
 // A buffer sample is eligible when the submission bound a range containing it.
 bool binding_covers(const std::vector<ListState::Binding>& binds, const Sample& s)
 {
@@ -3030,9 +3240,6 @@ bool binding_covers(const std::vector<ListState::Binding>& binds, const Sample& 
         if (b.resource == s.req.resource && b.offset <= s.offset && s.req.width <= b.size && s.offset - b.offset <= b.size - s.req.width) return true;
     return false;
 }
-bool sample_eligible(const Sample& s, bool notes_ok, const std::vector<ListState::StateNote>& notes,
-                     const std::vector<ListState::Binding>& binds, D3D12_COMMAND_LIST_TYPE type, na_object_id qid, uint32_t* state,
-                     bool* from_known = nullptr);
 
 bool last_state(const std::vector<ListState::StateNote>& notes, const Sample& s, uint32_t* state)
 {
@@ -3045,61 +3252,23 @@ bool last_state(const std::vector<ListState::StateNote>& notes, const Sample& s,
     return found;
 }
 
-bool sample_eligible(const Sample& s, bool notes_ok, const std::vector<ListState::StateNote>& notes,
-                     const std::vector<ListState::Binding>& binds, D3D12_COMMAND_LIST_TYPE type, na_object_id qid, uint32_t* state,
-                     bool* from_known)
+bool sample_eligible(const Sample& s, const SubmissionCapture& c, D3D12_COMMAND_LIST_TYPE type, na_object_id qid, uint32_t* state,
+                     bool* from_known = nullptr)
 {
     if (s.buffer) {
         *state = D3D12_RESOURCE_STATE_GENERIC_READ;
-        return binding_covers(binds, s);
+        return binding_covers(c.binds, s);
     }
     *state = kStateUnknown;
-    if (!notes_ok) return false; // unobserved/incomplete recordings may have transitioned it
-    if (last_state(notes, s, state)) return state_ok_for_queue(*state, type);
-    // G3-06: no transition in this (complete) submission, so the state is the
-    // provably current one carried from earlier submissions on this queue.
-    if (!known_state(s.req.resource, s.req.subresource, qid, state) || !state_ok_for_queue(*state, type)) return false;
+    if (!c.notes_ok) return false; // unobserved/incomplete recordings may have transitioned it
+    if (last_state(c.notes, s, state)) return state_ok_for_queue(*state, type);
+    // G3-06: no transition in this (complete) submission. A carried state is
+    // used only for a resource this submission references, so the application
+    // is obliged to keep it alive while we take our reference (review PR40 #1).
+    if (!std::binary_search(c.uses.begin(), c.uses.end(), s.req.resource)) return false;
+    if (!known_state(s.req.resource, s.req.subresource, qid, c.SelfMarks(s.req.resource), state) || !state_ok_for_queue(*state, type)) return false;
     if (from_known) *from_known = true;
     return true;
-}
-
-// G3-06: carries this submission's explicit transitions into the known-state
-// store (any observed submission, sampled or not). Queue sync operations
-// (no lists) change no state.
-void known_apply(uint32_t count, ID3D12CommandList* const* lists, na_object_id qid, bool ambiguous)
-{
-    if (!lists || !count) return;
-    std::vector<ListState::StateNote> notes;
-    bool complete = true;
-    {
-        std::shared_lock<std::shared_mutex> rl(g_m);
-        for (uint32_t i = 0; i < count && complete; ++i) {
-            na_object_id lid = 0;
-            ListState* ls = lists[i] ? list_state_locked(lists[i], &lid) : nullptr;
-            if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) {
-                complete = false;
-                break;
-            }
-            std::lock_guard<std::mutex> bl(ls->bind_m);
-            if (!ls->evidence_complete) complete = false;
-            else notes.insert(notes.end(), ls->states.begin(), ls->states.end());
-        }
-    }
-    if (!complete) return known_clear();
-    if (notes.empty()) return;
-    std::lock_guard<std::mutex> lock(g_known_m);
-    for (const auto& n : notes) {
-        ResKnown& k = g_known[n.resource];
-        if (ambiguous || (k.queue && k.queue != qid)) k.poisoned = true; // unknown order / second queue
-        k.queue = qid;
-        if (n.subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) {
-            k.has_all = true;
-            k.all = n.state_after;
-            k.subs.clear();
-        } else {
-            k.subs[n.subresource] = n.state_after;
-        }
-    }
 }
 
 // Source references acquired before the game's submission is forwarded
@@ -3123,16 +3292,15 @@ void drop_prerefs()
 // taking our own reference here is defined. After the forward returns it no
 // longer is: the GPU may finish and another thread may observe its fence and
 // release the resource before we could acquire it.
-void acquire_sample_sources(ID3D12CommandQueue* q, na_object_id qid, uint32_t count, ID3D12CommandList* const* lists)
+void acquire_sample_sources(ID3D12CommandQueue* q, na_object_id qid, D3D12_COMMAND_LIST_TYPE type, const SubmissionCapture& cap)
 {
     drop_prerefs();
     if (!q || g_armed.load(std::memory_order_acquire) == 0) return;
-    const D3D12_COMMAND_LIST_TYPE type = q->GetDesc().Type;
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE) return;
-    std::vector<ListState::StateNote> notes;
-    const bool notes_ok = submission_notes(count, lists, notes);
-    std::vector<ListState::Binding> binds;
-    submission_bindings(count, lists, binds);
+    if (!cap.lists) return;
+    if (cap.reject == 1) ++g_c.sample_missing_recording;
+    else if (cap.reject == 2) ++g_c.sample_partial_coverage;
+    else if (cap.reject == 3) ++g_c.sample_partial_states;
     std::vector<std::pair<uint64_t, na_object_id>> want;
     {
         na_session_id session = 0;
@@ -3143,7 +3311,7 @@ void acquire_sample_sources(ID3D12CommandQueue* q, na_object_id qid, uint32_t co
             Sample& s = *sp;
             if (s.status != NA_SAMPLE_ARMED || s.released || !scope_check_locked(s, session, epoch)) continue;
             uint32_t state = kStateUnknown;
-            if (sample_eligible(s, notes_ok, notes, binds, type, qid, &state)) want.push_back({s.token, s.req.resource});
+            if (sample_eligible(s, cap, type, qid, &state)) want.push_back({s.token, s.req.resource});
             else ++g_c.sample_no_transition;
         }
         recount_armed_locked();
@@ -3162,7 +3330,7 @@ void acquire_sample_sources(ID3D12CommandQueue* q, na_object_id qid, uint32_t co
 // submission lock: copies for every armed sample whose state this
 // submission's evidence establishes (C9B-R4) and whose source was acquired
 // before the submission (C9B-REVIEW-2 #2).
-void service_samples(ID3D12CommandQueue* q, QueueState* qs, na_object_id qid, uint64_t ticket, uint32_t count, ID3D12CommandList* const* lists)
+void service_samples(ID3D12CommandQueue* q, QueueState* qs, na_object_id qid, uint64_t ticket, D3D12_COMMAND_LIST_TYPE type, const SubmissionCapture& cap)
 {
     if (t_prerefs.empty()) return;
     if (g_acquire_probe) g_acquire_probe();
@@ -3170,11 +3338,8 @@ void service_samples(ID3D12CommandQueue* q, QueueState* qs, na_object_id qid, ui
     t_service_ticket = ticket;
     struct Reset { ~Reset() { t_service_qs = nullptr; } } reset;
     if (!ordering_window_intact()) return; // another operation began on this queue: no copy (stays armed)
-    const D3D12_COMMAND_LIST_TYPE type = q->GetDesc().Type;
-    std::vector<ListState::StateNote> notes;
-    const bool notes_ok = submission_notes(count, lists, notes);
-    std::vector<ListState::Binding> binds;
-    submission_bindings(count, lists, binds); // (unused prerefs are dropped by the caller)
+    // Eligibility uses the evidence captured before the forward (the lists may
+    // already be reset); unused prerefs are dropped by the caller.
     na_session_id session = 0;
     na_epoch epoch = 0;
     na::observe_internal::CurrentScope(&session, &epoch);
@@ -3187,7 +3352,7 @@ void service_samples(ID3D12CommandQueue* q, QueueState* qs, na_object_id qid, ui
         if (pre == t_prerefs.end()) continue; // armed after the submission began: no safe reference, stays armed
         uint32_t state = kStateUnknown;
         bool from_known = false;
-        if (!sample_eligible(s, notes_ok, notes, binds, type, qid, &state, &from_known)) continue;
+        if (!sample_eligible(s, cap, type, qid, &state, &from_known)) continue;
         if (from_known) g_c.sample_known_state.fetch_add(1);
         ID3D12Resource* res = pre->res;
         t_prerefs.erase(pre);
@@ -3361,7 +3526,10 @@ ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue, uint32_t count, ID3D12Comma
     ExecuteToken t;
     na_object_id qid = 0;
     auto qs = queue ? queue_state(queue, &qid) : nullptr;
-    if (!qs) return t;
+    if (!qs) {
+        if (lists && count && !t_host_work) g_known_disabled.store(true); // its transitions are unobservable
+        return t;
+    }
     // A runtime may re-enter Wait/Signal (on this or another queue) while
     // forwarding a submission on this thread. Observe the nested occurrence
     // without taking any submission lock or replacing the outer pre-submit
@@ -3371,11 +3539,24 @@ ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue, uint32_t count, ID3D12Comma
         g_c.nested_unlocked.fetch_add(1);
         t.nested_unlocked = true;
     }
+    // Evidence for sampling and the known-state store, captured before the
+    // original runs (review PR40 #2); the store marks what it may change.
+    std::shared_ptr<SubmissionCapture> cap; // none for queue sync operations and host work
+    D3D12_COMMAND_LIST_TYPE type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (!t_host_work && lists && count) {
+        cap = std::make_shared<SubmissionCapture>();
+        type = queue->GetDesc().Type;
+        capture_submission(count, lists, *cap);
+        known_mark(*cap, type == D3D12_COMMAND_LIST_TYPE_COPY);
+    }
+    t.capture = cap;
+    t.list_type = static_cast<uint32_t>(type);
     if (!t_host_work && t_submit_depth == 0 && g_armed.load(std::memory_order_acquire)) { // C9B-R3
         qs->submit_m.lock();
         ++t_submit_depth;
         t.submit_locked = true;
-        acquire_sample_sources(queue, qid, count, lists); // before the original runs (C9B-REVIEW-2 #2)
+        static const SubmissionCapture kNoLists;
+        acquire_sample_sources(queue, qid, type, cap ? *cap : kNoLists); // before the original runs (C9B-REVIEW-2 #2)
     }
     const auto occurrence = qs->occurrences.Begin();
     t.queue_state = qs;
@@ -3435,10 +3616,12 @@ void ExecuteEnd(const ExecuteToken& t, ID3D12CommandQueue* queue, uint32_t count
     na::observe_internal::Emit(&ex, NA_GROUP_QUEUE);
     // C9b: only a clean occurrence whose submission we serialized is sampled;
     // nothing observed can run on this queue between it and the host copy.
-    if (!t_host_work && t.submit_locked && !ambiguous)
-        service_samples(queue, std::static_pointer_cast<QueueState>(t.queue_state).get(), t.queue_id, t.ticket, count, lists);
+    const auto cap = std::static_pointer_cast<SubmissionCapture>(t.capture);
+    const auto type = static_cast<D3D12_COMMAND_LIST_TYPE>(t.list_type);
+    if (!t_host_work && t.submit_locked && !ambiguous && cap)
+        service_samples(queue, std::static_pointer_cast<QueueState>(t.queue_state).get(), t.queue_id, t.ticket, type, *cap);
     if (t.submit_locked) drop_prerefs(); // unused references (ambiguous, released, no evidence)
-    if (!t_host_work) known_apply(count, lists, t.queue_id, ambiguous); // G3-06, after servicing (pre-submission states)
+    if (cap) known_publish(*cap, t.queue_id, ambiguous); // G3-06, after servicing (pre-submission states)
     unlock_submission(t);
 }
 

@@ -453,15 +453,53 @@ int main()
             REQUIRE(SUCCEEDED(q2->Signal(f.Get(), 1)));
             for (int i = 0; i < 500 && f->GetCompletedValue() < 1; ++i) Sleep(2);
         }
+        // (d) review PR40 #1: carried state, but the sampled submission never
+        //     references it -> no reference may be taken, stays armed
+        auto nr = test::CreateTexture(dev, 16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        // (e) review PR40 #3: placed (aliasable) texture in a definite state -> never carried
+        test::ComPtr<ID3D12Heap> ph;
+        test::ComPtr<ID3D12Resource> pl;
+        {
+            D3D12_HEAP_DESC hd{};
+            hd.SizeInBytes = 1 << 20;
+            hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+            hd.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+            hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
+            REQUIRE(SUCCEEDED(dev->CreateHeap(&hd, IID_PPV_ARGS(&ph))));
+            D3D12_RESOURCE_DESC rd{};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            rd.Width = rd.Height = 16;
+            rd.DepthOrArraySize = rd.MipLevels = 1;
+            rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            rd.SampleDesc.Count = 1;
+            rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            REQUIRE(SUCCEEDED(dev->CreatePlacedResource(ph.Get(), 0, &rd, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&pl))));
+        }
+        REQUIRE(nr && pl);
+        test::ComPtr<ID3D12DescriptorHeap> krtv;
+        D3D12_DESCRIPTOR_HEAP_DESC khd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&khd, IID_PPV_ARGS(&krtv))));
+        const UINT kinc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        D3D12_CPU_DESCRIPTOR_HANDLE krt[4];
+        ID3D12Resource* const bound[4] = {kt.Get(), ct.Get(), mq.Get(), pl.Get()};
+        for (UINT i = 0; i < 4; ++i) {
+            krt[i] = krtv->GetCPUDescriptorHandleForHeapStart();
+            krt[i].ptr += static_cast<SIZE_T>(i) * kinc;
+            dev->CreateRenderTargetView(bound[i], nullptr, krt[i]);
+        }
         const uint64_t t_kt = Request(na::observe::IdOf(kt.Get())), t_ct = Request(na::observe::IdOf(ct.Get())),
-                       t_mq = Request(na::observe::IdOf(mq.Get()));
-        REQUIRE(t_kt && t_ct && t_mq);
-        record([&] {}); // a complete submission with no barriers at all
+                       t_mq = Request(na::observe::IdOf(mq.Get())), t_nr = Request(na::observe::IdOf(nr.Get())),
+                       t_pl = Request(na::observe::IdOf(pl.Get()));
+        REQUIRE(t_kt && t_ct && t_mq && t_nr && t_pl);
+        record([&] { list->OMSetRenderTargets(4, krt, FALSE, nullptr); }); // references, no barriers at all
         d.queue->ExecuteCommandLists(1, ls);
         const na_sample_info ki = WaitDone(t_kt), cti = WaitDone(t_ct);
         d.WaitIdle();
         Sleep(20);
-        const na_sample_info mi = Poll(t_mq);
+        const na_sample_info mi = Poll(t_mq), ni = Poll(t_nr), pi = Poll(t_pl);
+        std::printf("carried-state premises: unreferenced %u, placed %u (both expected armed)\n", ni.status, pi.status);
+        CHECK(ni.status == NA_SAMPLE_ARMED);
+        CHECK(pi.status == NA_SAMPLE_ARMED);
         const uint64_t used = na::observe::GetProducerStats().sample_known_state - known0;
         std::printf("known state: earlier submission %u (0x%x), creation state %u (0x%x), second-queue resource %u, carried copies %llu\n", ki.status,
                     ki.state_before, cti.status, cti.state_before, mi.status, static_cast<unsigned long long>(used));
@@ -469,7 +507,105 @@ int main()
         CHECK(cti.status == NA_SAMPLE_READY && cti.state_before == D3D12_RESOURCE_STATE_RENDER_TARGET);
         CHECK(mi.status == NA_SAMPLE_ARMED); // transitioned by two queues: never carried
         CHECK(used >= 2);
-        for (uint64_t t : {t_kt, t_ct, t_mq}) na_observe_sample_release(t);
+        for (uint64_t t : {t_kt, t_ct, t_mq, t_nr, t_pl}) na_observe_sample_release(t);
+        d.WaitIdle();
+        CHECK(dev->GetDeviceRemovedReason() == S_OK);
+    }
+
+    // ---- Gate 3 review PR40 #2/#3: evidence captured before the forward; copy-queue decay ----
+    {
+        const uint64_t known0 = na::observe::GetProducerStats().sample_known_state;
+        auto rx = test::CreateTexture(dev, 16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        auto cq = test::CreateTexture(dev, 16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_NONE);
+        auto cqd = test::CreateTexture(dev, 16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_NONE);
+        auto tmp = test::CreateTexture(dev, 16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
+        REQUIRE(rx && cq && cqd && tmp);
+        test::ComPtr<ID3D12DescriptorHeap> xrtv;
+        D3D12_DESCRIPTOR_HEAP_DESC xhd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&xhd, IID_PPV_ARGS(&xrtv))));
+        const D3D12_CPU_DESCRIPTOR_HANDLE xrt = xrtv->GetCPUDescriptorHandleForHeapStart();
+        dev->CreateRenderTargetView(rx.Get(), nullptr, xrt);
+        // (a) the submitted list is reset and re-recorded (other allocator) after
+        //     ExecuteCommandLists returned, before the host services/publishes.
+        test::ComPtr<ID3D12CommandAllocator> alloc2;
+        REQUIRE(SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc2))));
+        static ID3D12GraphicsCommandList* s_reuse_list;
+        static ID3D12CommandAllocator* s_reuse_alloc;
+        static ID3D12Resource* s_reuse_res;
+        static int s_reused;
+        s_reuse_list = list.Get();
+        s_reuse_alloc = alloc2.Get();
+        s_reuse_res = rx.Get();
+        s_reused = 0;
+        na::observe::SetSampleAcquireProbeForTests([] {
+            if (s_reused++) return;
+            if (FAILED(s_reuse_list->Reset(s_reuse_alloc, nullptr))) return;
+            D3D12_RESOURCE_BARRIER b = test::Transition(s_reuse_res, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            s_reuse_list->ResourceBarrier(1, &b); // recorded, never submitted
+            s_reuse_list->Close();
+        });
+        const uint64_t t_rx1 = Request(na::observe::IdOf(rx.Get()));
+        REQUIRE(t_rx1);
+        record([&] {
+            D3D12_RESOURCE_BARRIER b = test::Transition(rx.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->ResourceBarrier(1, &b);
+        });
+        d.queue->ExecuteCommandLists(1, ls);
+        const na_sample_info r1 = WaitDone(t_rx1);
+        na::observe::SetSampleAcquireProbeForTests(nullptr);
+        d.WaitIdle();
+        // The carried state must be the submitted RENDER_TARGET, not the re-recorded COPY_SOURCE.
+        const uint64_t t_rx2 = Request(na::observe::IdOf(rx.Get()));
+        REQUIRE(t_rx2);
+        record([&] { list->OMSetRenderTargets(1, &xrt, FALSE, nullptr); });
+        d.queue->ExecuteCommandLists(1, ls);
+        const na_sample_info r2 = WaitDone(t_rx2);
+        d.WaitIdle();
+        std::printf("reset after submit: probe ran %d, sampled %u (0x%x), carried %u (0x%x)\n", s_reused, r1.status, r1.state_before, r2.status,
+                    r2.state_before);
+        CHECK(s_reused >= 1);
+        CHECK(r1.status == NA_SAMPLE_READY && r1.state_before == D3D12_RESOURCE_STATE_RENDER_TARGET);
+        CHECK(r2.status == NA_SAMPLE_READY && r2.state_before == D3D12_RESOURCE_STATE_RENDER_TARGET);
+        // (b) copy-queue decay: COPY_SOURCE on the direct queue, then read by a
+        //     copy queue (decays to COMMON) -> never carried afterwards.
+        record([&] {
+            D3D12_RESOURCE_BARRIER b = test::Transition(cq.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &b);
+        });
+        d.queue->ExecuteCommandLists(1, ls);
+        d.WaitIdle();
+        {
+            D3D12_COMMAND_QUEUE_DESC qd{};
+            qd.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+            test::ComPtr<ID3D12CommandQueue> cqq;
+            test::ComPtr<ID3D12CommandAllocator> ca;
+            test::ComPtr<ID3D12GraphicsCommandList> cl;
+            REQUIRE(SUCCEEDED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&cqq))));
+            REQUIRE(SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(&ca))));
+            REQUIRE(SUCCEEDED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, ca.Get(), nullptr, IID_PPV_ARGS(&cl))));
+            REQUIRE(SUCCEEDED(cl->Close()));
+            REQUIRE(SUCCEEDED(ca->Reset()));
+            REQUIRE(SUCCEEDED(cl->Reset(ca.Get(), nullptr)));
+            cl->CopyResource(cqd.Get(), cq.Get());
+            REQUIRE(SUCCEEDED(cl->Close()));
+            ID3D12CommandList* cls[] = {cl.Get()};
+            cqq->ExecuteCommandLists(1, cls);
+            test::ComPtr<ID3D12Fence> f;
+            REQUIRE(SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f))));
+            REQUIRE(SUCCEEDED(cqq->Signal(f.Get(), 1)));
+            for (int i = 0; i < 500 && f->GetCompletedValue() < 1; ++i) Sleep(2);
+        }
+        const uint64_t t_cq = Request(na::observe::IdOf(cq.Get()));
+        REQUIRE(t_cq);
+        record([&] { list->CopyResource(tmp.Get(), cq.Get()); }); // references cq, no barrier
+        d.queue->ExecuteCommandLists(1, ls);
+        d.WaitIdle();
+        Sleep(20);
+        const na_sample_info ci = Poll(t_cq);
+        std::printf("copy-queue decay: sample %u (expected armed), carried copies %llu\n", ci.status,
+                    static_cast<unsigned long long>(na::observe::GetProducerStats().sample_known_state - known0));
+        CHECK(ci.status == NA_SAMPLE_ARMED);
+        for (uint64_t t : {t_rx1, t_rx2, t_cq}) na_observe_sample_release(t);
         d.WaitIdle();
         CHECK(dev->GetDeviceRemovedReason() == S_OK);
     }

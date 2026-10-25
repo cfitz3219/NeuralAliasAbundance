@@ -60,6 +60,9 @@ struct ExecuteToken {
     na_object_id queue_id = 0;
     bool submit_locked = false; // C9B-R3: holds the queue's submission lock until End
     bool nested_unlocked = false; // this occurrence bypassed serialization (nested in a forwarded submission)
+    // Evidence captured before forwarding (sampling + known-state store); opaque here.
+    std::shared_ptr<void> capture;
+    uint32_t list_type = 0; // D3D12_COMMAND_LIST_TYPE of the queue
 };
 // C9b: the game host's original ExecuteCommandLists, used to submit the host's
 // own sample copies without re-entering the host's execute detour.
