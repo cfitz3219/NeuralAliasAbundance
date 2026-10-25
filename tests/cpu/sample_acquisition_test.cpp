@@ -28,6 +28,24 @@ struct Fake : SampleApi {
 };
 static SamplePlan plan() { return {3,0,2,2,40}; }
 int main() { return test::run({
+    {"16-bit scalar samples preserve padded rows and explicit interpretation", [] {
+        AcquiredSample s{};s.status=AcquisitionStatus::Ready;s.info.status=NA_SAMPLE_READY;s.info.width=2;s.info.height=2;
+        s.info.row_pitch=8;s.info.data_bytes=12;s.bytes.resize(12);
+        const uint16_t raw[]={0,65535,32768,16384};
+        std::memcpy(s.bytes.data(),raw,4);std::memcpy(s.bytes.data()+8,raw+2,4);
+        std::vector<double> values;
+        for(uint32_t format:{55u,56u}) {
+            s.info.format=format;CHECK(DecodeScalarDepth(s,values));
+            NEAR(values[0],0,1e-9);NEAR(values[1],1,1e-9);NEAR(values[2],32768.0/65535,1e-9);
+        }
+        const uint16_t half[]={0x0001,0x3c00,0x3800,0xbc00};
+        std::memcpy(s.bytes.data(),half,4);std::memcpy(s.bytes.data()+8,half+2,4);
+        s.info.format=54;CHECK(DecodeScalarDepth(s,values));
+        NEAR(values[0],std::ldexp(1.0,-24),1e-12);NEAR(values[1],1,1e-9);
+        NEAR(values[2],0.5,1e-9);NEAR(values[3],-1,1e-9);
+        s.info.format=53;CHECK(!DecodeScalarDepth(s,values));
+        s.info.format=54;s.bytes.pop_back();CHECK(!DecodeScalarDepth(s,values));
+    }},
     {"common HDR and packed-depth inventory formats are acquisition candidates", [] {
         using na::classifier::Format;
         CHECK(ResourceFormat(19)==Format::Depth && ResourceFormat(44)==Format::Depth);
@@ -89,3 +107,4 @@ int main() { return test::run({
         CHECK(!DecodeScalarDepth(out[0],depth));
     }}
 }); }
+

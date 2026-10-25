@@ -105,7 +105,7 @@ int main() { return test::run({
         p.resize(base+sizeof(e)+sizeof(na_root_param));
         Put(p,offsetof(na_event_batch,payload_bytes),uint32_t(sizeof(e)+sizeof(na_root_param)));
         Put(p,base+offsetof(na_event_header,size_bytes),uint32_t(sizeof(e)+sizeof(na_root_param)));
-        CHECK(Decode(p).valid && Decode(p).incomplete_capture); // zero param_type = TABLE
+        CHECK(Decode(p).valid && !Decode(p).incomplete_capture && Decode(p).has_unverified_semantics); // zero param_type = TABLE
     }},
     {"H2 list payload sizes cannot exceed captured bytes", [] {
         na_ev_list_op e{};e.op=NA_OP_SET_ROOT_CONSTANTS;e.a[2]=1;
@@ -156,14 +156,14 @@ int main() { return test::run({
         param.count=0;param.first_range=UINT32_MAX;Put(p,base+sizeof(e),param);CHECK(!Decode(p).valid);
         param.first_range=0;Put(p,base+sizeof(e),param);CHECK(Decode(p).valid);
     }},
-    {"H3 snapshots remain incomplete and bounded", [] {
+    {"H3 snapshots remain semantically provisional and bounded", [] {
         na_ev_snapshot e{};e.status=NA_SNAP_CAPTURED;e.sync=NA_SNAP_SYNC_APP_UNKNOWN;
         e.requested_bytes=4;e.captured_bytes=4;e.payload_offset=sizeof(e);
         auto p=Packet(e,NA_EV_SNAPSHOT);CHECK(!Decode(p).valid);
         p.resize(base+sizeof(e)+8);
         Put(p,offsetof(na_event_batch,payload_bytes),uint32_t(sizeof(e)+8));
         Put(p,base+offsetof(na_event_header,size_bytes),uint32_t(sizeof(e)+8));
-        CHECK(Decode(p).valid && Decode(p).incomplete_capture);
+        CHECK(Decode(p).valid && !Decode(p).incomplete_capture && Decode(p).has_unverified_semantics);
         auto valid=p;Put(p,base+offsetof(na_ev_snapshot,status),uint32_t(NA_SNAP_NOT_MAPPED));CHECK(!Decode(p).valid);
         p=valid;Put(p,base+offsetof(na_ev_snapshot,captured_bytes),UINT32_MAX);CHECK(!Decode(p).valid);
     }},

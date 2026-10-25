@@ -8,7 +8,7 @@ std::atomic<unsigned> invalid{0},h2_events{0},incomplete{0};
 void __cdecl Sink(const na_event_batch* b,void*) {
     const auto decoded=na::discovery::DecodeBatch(b,static_cast<size_t>(b->header_bytes)+b->payload_bytes);
     if(!decoded.valid)++invalid;
-    if(decoded.incomplete_capture)++incomplete;
+    if(decoded.has_unverified_semantics)++incomplete;
     for(const auto& e:decoded.events)if(e.header.kind>=24&&e.header.kind<=26)++h2_events;
     downstream(b,downstream_user);
 }
@@ -26,6 +26,6 @@ int main() {
     if(result) return result;
     CHECK(decoder_bridge::invalid.load()==0);
     CHECK(decoder_bridge::h2_events.load()>0);
-    CHECK(decoder_bridge::incomplete.load()>0); // root table range layout is incomplete
+    CHECK(decoder_bridge::incomplete.load()>0); // root table binding semantics require local verification
     return test::finish("h2_capture_decoder");
 }

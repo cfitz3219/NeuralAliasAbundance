@@ -11,6 +11,8 @@
 #endif
 #include <algorithm>
 #include <cstring>
+#include <cmath>
+#include <limits>
 #include <vector>
 
 namespace na::discovery {
@@ -113,15 +115,26 @@ public:
 inline bool DecodeScalarDepth(const AcquiredSample& s,std::vector<double>& depth) {
     depth.clear();
     const auto& i=s.info;
+    const uint32_t pixel_bytes=(i.format==54 || i.format==55 || i.format==56) ? 2u : 4u;
     if (s.status!=AcquisitionStatus::Ready || i.status!=NA_SAMPLE_READY || i.data_bytes!=s.bytes.size() ||
-        (i.format!=40 && i.format!=41 && i.format!=46) || // D32_FLOAT / R32_FLOAT / R24_UNORM_X8_TYPELESS
+        (i.format!=40 && i.format!=41 && i.format!=46 && i.format!=54 && i.format!=55 && i.format!=56) ||
         !i.width || !i.height || i.width>4096 || i.height>4096 ||
-        uint64_t(i.width)*4>i.row_pitch ||
-        uint64_t(i.row_pitch)*(i.height-1)+uint64_t(i.width)*4>s.bytes.size()) return false;
+        uint64_t(i.width)*pixel_bytes>i.row_pitch ||
+        uint64_t(i.row_pitch)*(i.height-1)+uint64_t(i.width)*pixel_bytes>s.bytes.size()) return false;
     depth.reserve(size_t(i.width)*i.height);
     for(uint32_t y=0;y<i.height;++y) for(uint32_t x=0;x<i.width;++x) {
-        const auto* pixel=s.bytes.data()+size_t(y)*i.row_pitch+size_t(x)*4;
-        if(i.format==46) {
+        const auto* pixel=s.bytes.data()+size_t(y)*i.row_pitch+size_t(x)*pixel_bytes;
+        if(pixel_bytes==2) {
+            uint16_t raw{};std::memcpy(&raw,pixel,2);
+            if(i.format!=54) depth.push_back(double(raw)/65535.0);
+            else {
+                const unsigned exponent=(raw>>10)&31u, mantissa=raw&1023u;
+                double value=exponent==0 ? std::ldexp(double(mantissa),-24) :
+                    exponent==31 ? (mantissa ? std::numeric_limits<double>::quiet_NaN() :
+                        std::numeric_limits<double>::infinity()) : std::ldexp(double(1024u+mantissa),int(exponent)-25);
+                depth.push_back((raw&0x8000u) ? -value : value);
+            }
+        } else if(i.format==46) {
             uint32_t raw{};std::memcpy(&raw,pixel,4);
             depth.push_back(double(raw & 0xFFFFFFu)/double(0xFFFFFFu));
         } else {

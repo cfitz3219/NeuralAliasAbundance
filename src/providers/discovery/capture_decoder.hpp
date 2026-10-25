@@ -19,6 +19,7 @@ struct DecodedBatch {
     bool valid{};
     bool unknown_foundational{};
     bool incomplete_capture{}; // Structurally valid bytes do not establish complete evidence.
+    bool has_unverified_semantics{}; // Local qualification caveats, not missing stream events.
     na_event_batch header{};
     // Owned bytes; offsets never refer into the callback's borrowed allocation.
     std::vector<unsigned char> bytes;
@@ -127,7 +128,7 @@ inline DecodedBatch DecodeBatch(const void* input, size_t readable) {
                     if (p.first_range > e.range_count) return {};
                     if (p.count > e.range_count-p.first_range && !(h.flags & NA_EVF_TRUNCATED)) return {};
                     // Structural coverage does not establish runtime descriptor provenance.
-                    result.incomplete_capture = true;
+                    result.has_unverified_semantics = true;
                 }
             }
         } else if (h.kind == NA_EV_LIST_OP) {
@@ -149,7 +150,7 @@ inline DecodedBatch DecodeBatch(const void* input, size_t readable) {
             case NA_OP_RS_SCISSOR: count=e.a[0];element=4*sizeof(int32_t);break;
             case NA_OP_COPY_TEXTURE_REGION:
                 count=1;element=sizeof(na_copy_region);
-                result.incomplete_capture=true; // footprint dimensions/format remain absent
+                result.has_unverified_semantics=true; // Copy lineage needs operation-specific interpretation.
                 break;
             default:
                 if(e.op<NA_OP_SET_PIPELINE || e.op>NA_OP_RS_SCISSOR) result.incomplete_capture=true;
@@ -170,7 +171,7 @@ inline DecodedBatch DecodeBatch(const void* input, size_t readable) {
                 e.captured_bytes > h.size_bytes-e.payload_offset)) return {};
             // C9 provides no independent application-write synchronization or
             // GPU completion. Keep these bytes available for offline hypotheses.
-            result.incomplete_capture = true;
+            result.has_unverified_semantics = true;
         }
 #endif
         if (!minimum && (h.flags & NA_EVF_FOUNDATIONAL)) result.unknown_foundational = true;

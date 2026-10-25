@@ -36,6 +36,16 @@ Batch Snapshot(uint64_t epoch=1,uint32_t support=NA_CAP_SUPPORTED) {
 }
 }
 int main() { return test::run({
+    {"preexisting creation unknown fields are not inventory loss but truncation is", [] {
+        for(bool truncated:{false,true}) {
+            CaptureValidity v;auto s=Status();Snapshot().Send(v,s);Batch b;
+            na_ev_swapchain_created e{};e.swapchain=77;
+            e.hdr.flags=NA_EVF_FOUNDATIONAL|NA_EVF_PREEXISTING|NA_EVF_METHOD_UNOBSERVED;
+            if(truncated) e.hdr.flags|=NA_EVF_TRUNCATED;
+            b.Add(e,NA_EV_SWAPCHAIN_CREATED);b.Send(v,s);
+            CHECK(v.InventoryConsistent()==!truncated);CHECK(v.CaptureContiguous()==!truncated);
+        }
+    }},
     {"owned decoded batches preserve validity and malformed rejection", [] {
         auto b=Snapshot();std::memcpy(b.bytes.data(),&b.header,sizeof(b.header));
         auto decoded=DecodeBatch(b.bytes.data(),b.bytes.size());
@@ -108,7 +118,7 @@ int main() { return test::run({
         }
     }},
 #ifdef NA_SNAP_SYNC_APP_UNKNOWN
-    {"provisional H3 cannot be qualified by a later clean execute", [] {
+    {"provisional H3 does not poison unrelated H2 stream continuity", [] {
         for (bool reverse : {false,true}) {
             CaptureValidity v; auto s=Status(); Snapshot().Send(v,s); CHECK(v.CaptureContiguous());
             Batch snapshot,execute;
@@ -119,8 +129,8 @@ int main() { return test::run({
             execute.Add(q,NA_EV_QUEUE_EXECUTE);
             if (reverse) { execute.Send(v,s); snapshot.Send(v,s); }
             else { snapshot.Send(v,s); execute.Send(v,s); }
-            CHECK(v.InventoryConsistent() && !v.CaptureContiguous());
-            v.ObserveStatus(s); CHECK(!v.CaptureContiguous());
+            CHECK(v.InventoryConsistent() && v.CaptureContiguous());
+            v.ObserveStatus(s); CHECK(v.CaptureContiguous());
             s.epoch=2; Snapshot(2).Send(v,s); CHECK(v.CaptureContiguous());
             snapshot.Send(v,s); CHECK(v.CaptureContiguous()); // stale snapshot cannot poison new epoch
         }
