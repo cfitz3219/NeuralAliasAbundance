@@ -1729,20 +1729,24 @@ HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flag
 {
     if (na::present::IsPresentThread()) return g_orig_present(sc, sync, flags); // never re-entered by design; safety
     na::dlss::ReleaseIfDeviceRemoved(); // G2-004: never pin a removed device across the game's recovery
-    if (flags & DXGI_PRESENT_TEST) return g_orig_present(sc, sync, flags);      // A62: occlusion query, nothing is shown
-    if (na::present::Proxied(sc)) return presenter_present(sc, sync, flags, nullptr);
-    on_present(sc);
-    return g_orig_present(sc, sync, flags);
+    if (!(flags & DXGI_PRESENT_TEST) && na::present::Proxied(sc)) return presenter_present(sc, sync, flags, nullptr);
+    const auto observed = na::observe::PresentBegin(sc);
+    if (!(flags & DXGI_PRESENT_TEST)) on_present(sc);
+    const HRESULT result = g_orig_present(sc, sync, flags);
+    na::observe::PresentEnd(observed,sync,flags,result);
+    return result;
 }
 HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT flags,
                                          const DXGI_PRESENT_PARAMETERS* pp)
 {
     if (na::present::IsPresentThread()) return g_orig_present1(sc, sync, flags, pp);
     na::dlss::ReleaseIfDeviceRemoved(); // G2-004: never pin a removed device across the game's recovery
-    if (flags & DXGI_PRESENT_TEST) return g_orig_present1(sc, sync, flags, pp);
-    if (na::present::Proxied(sc)) return presenter_present(sc, sync, flags, pp);
-    on_present(sc);
-    return g_orig_present1(sc, sync, flags, pp);
+    if (!(flags & DXGI_PRESENT_TEST) && na::present::Proxied(sc)) return presenter_present(sc, sync, flags, pp);
+    const auto observed = na::observe::PresentBegin(sc);
+    if (!(flags & DXGI_PRESENT_TEST)) on_present(sc);
+    const HRESULT result = g_orig_present1(sc, sync, flags, pp);
+    na::observe::PresentEnd(observed,sync,flags,result);
+    return result;
 }
 HRESULT STDMETHODCALLTYPE DetourGetBuffer(IDXGISwapChain* sc, UINT index, REFIID riid, void** out)
 {

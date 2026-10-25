@@ -3,6 +3,7 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <dxgi1_4.h>
 
 #include "queue_occurrences.hpp"
 #include <algorithm>
@@ -83,6 +84,7 @@ struct Obj {
     std::vector<na_root_param> root_params; // root signatures (C9 table resolution)
     std::vector<na_root_range> root_ranges;
     bool retirement_unobservable = false;   // the sentinel could not be attached
+    uint64_t present_ordinal = 0;
 };
 
 struct DescHeap {
@@ -249,6 +251,15 @@ void attach_sentinel(IUnknown* object, const void* key, na_object_id id, uint32_
         attached = SUCCEEDED(d3d->SetPrivateDataInterface(kSentinelGuid, s));
         s->Release(); // the object now holds the only reference (or it is gone)
         d3d->Release();
+    }
+    if (!attached) {
+        IDXGIObject* dxgi = nullptr;
+        if (SUCCEEDED(object->QueryInterface(IID_PPV_ARGS(&dxgi))) && dxgi) {
+            auto* s = new RetireSentinel(key, id, kind);
+            attached = SUCCEEDED(dxgi->SetPrivateDataInterface(kSentinelGuid, s));
+            s->Release();
+            dxgi->Release();
+        }
     }
     if (attached) return;
     // Review: no retirement will ever be observed for this identity. Its
@@ -2981,6 +2992,46 @@ void ExecuteEnd(const ExecuteToken& t, ID3D12CommandQueue* queue, uint32_t count
 }
 
 void RequestInstall(bool requested) { g_requested.store(requested); }
+PresentToken PresentBegin(IDXGISwapChain* chain)
+{
+    PresentToken token;
+    if (!chain || !ProducersActive()) return token;
+    bool created = false;
+    token.swapchain = ensure_registered(chain, NA_OBJ_SWAPCHAIN, &created);
+    if (created) {
+        na_ev_swapchain_created e;
+        init_header(e, NA_EV_SWAPCHAIN_CREATED, NA_EVF_FOUNDATIONAL | NA_EVF_PREEXISTING | NA_EVF_METHOD_UNOBSERVED);
+        e.swapchain = token.swapchain;
+        // Creation queue, resize history and color-space calls were not observed.
+        e.color_space = e.buffer_generation = NA_UNKNOWN_U32;
+        e.buffer_count = e.format = e.width = e.height = NA_UNKNOWN_U32;
+        DXGI_SWAP_CHAIN_DESC d{};
+        if (SUCCEEDED(chain->GetDesc(&d))) {
+            e.buffer_count=d.BufferCount;e.format=d.BufferDesc.Format;
+            e.width=d.BufferDesc.Width;e.height=d.BufferDesc.Height;
+        }
+        remember_creation(chain,e);emit(e,NA_GROUP_SWAPCHAIN);
+    }
+    IDXGISwapChain3* sc3 = nullptr;
+    if (SUCCEEDED(chain->QueryInterface(IID_PPV_ARGS(&sc3))) && sc3) {
+        token.index=sc3->GetCurrentBackBufferIndex();sc3->Release();
+    }
+    const void* key=canon(chain);
+    {
+        std::unique_lock<std::shared_mutex> lock(g_m);
+        auto it=g_objs.find(key);
+        if(it!=g_objs.end() && it->second.id==token.swapchain) token.ordinal=++it->second.present_ordinal;
+    }
+    return token;
+}
+void PresentEnd(const PresentToken& token,uint32_t sync,uint32_t flags,int32_t result)
+{
+    if(!token.swapchain || !token.ordinal) return;
+    na_ev_present e;init_header(e,NA_EV_PRESENT,0);
+    e.swapchain=token.swapchain;e.present_ordinal=token.ordinal;e.hresult=result;
+    e.sync_interval=sync;e.present_flags=flags;e.backbuffer_index=token.index;
+    emit(e,NA_GROUP_SWAPCHAIN);
+}
 bool InstallRequested() { return g_requested.load(); }
 bool ProducersActive() { return g_active.load(std::memory_order_acquire); }
 

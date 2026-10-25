@@ -32,6 +32,7 @@ struct ID3D12Device;
 struct ID3D12CommandQueue;
 struct ID3D12CommandList;
 struct ID3D12Resource;
+struct IDXGISwapChain;
 
 namespace na::observe {
 
@@ -66,6 +67,12 @@ void SetExecuteForwarder(void(__stdcall* fwd)(ID3D12CommandQueue*, unsigned int,
 // Begin also takes the C9 constant-data snapshots of the submitted recordings.
 ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue, uint32_t count = 0, ID3D12CommandList* const* lists = nullptr);
 void ExecuteEnd(const ExecuteToken& token, ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* const* lists);
+
+// Actual presentation call boundary only; no queue, camera or frame ownership
+// is inferred from the ordinal. The caller retains the chain through End.
+struct PresentToken { na_object_id swapchain{}; uint64_t ordinal{}; uint32_t index{NA_UNKNOWN_U32}; };
+PresentToken PresentBegin(IDXGISwapChain* chain);
+void PresentEnd(const PresentToken& token, uint32_t sync, uint32_t flags, int32_t result);
 
 // Tests: `probe` runs inside each snapshot copy while the copy holds the
 // buffer's mapping (C9-H3-REVIEW-1 race regression). nullptr removes it.

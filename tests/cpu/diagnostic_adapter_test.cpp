@@ -2,6 +2,7 @@
 #include "../host/test_support.hpp"
 #include "host_dx12/host_boot/game_adapter.h"
 #include "host_dx12/observe/producers.hpp"
+#include "host_dx12/host_observe_internal.hpp"
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -27,6 +28,22 @@ int main() {
     CHECK(na_adapter_start()==0);
     auto resource=test::CreateBuffer(d.device.Get(),4096,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_STATE_COMMON);
     REQUIRE(resource);
+    // Mixed-status fixture through the real transport: 32 unavailable records
+    // followed by a captured matrix must not suppress all structural scans.
+    struct SnapshotFixture { na_ev_snapshot event; float matrix[16]; } fixture{};
+    fixture.event.hdr.kind=NA_EV_SNAPSHOT;
+    fixture.event.hdr.size_bytes=sizeof(na_ev_snapshot);
+    fixture.event.resource=na::observe::IdOf(resource.Get());
+    fixture.event.queue=na::observe::IdOf(d.queue.Get());
+    fixture.event.queue_ticket=1;fixture.event.requested_bytes=64;
+    fixture.event.sync=NA_SNAP_SYNC_APP_UNKNOWN;
+    fixture.event.status=NA_SNAP_NOT_MAPPED;
+    for(unsigned i=1;i<=32;++i){fixture.event.snapshot_id=i;REQUIRE(na::observe_internal::Emit(&fixture,NA_GROUP_SNAPSHOT));}
+    fixture.event.snapshot_id=33;fixture.event.status=NA_SNAP_CAPTURED;
+    fixture.event.captured_bytes=64;fixture.event.payload_offset=offsetof(SnapshotFixture,matrix);
+    fixture.event.hdr.size_bytes=sizeof(fixture);
+    fixture.matrix[0]=fixture.matrix[5]=fixture.matrix[10]=fixture.matrix[15]=1;
+    REQUIRE(na::observe_internal::Emit(&fixture,NA_GROUP_SNAPSHOT));
     // Stop drains the real transport, including its final batch, before freeing context.
     na_adapter_stop();na_adapter_stop();
     std::ifstream file(log);const std::string text((std::istreambuf_iterator<char>(file)),{});
@@ -34,5 +51,7 @@ int main() {
     CHECK(text.find("\"phase\":\"stopped\"")!=std::string::npos);
     CHECK(text.find("\"malformed\":0")!=std::string::npos);
     CHECK(text.find("\"confirmed_inputs\":0")!=std::string::npos);
+    CHECK(text.find("\"hypotheses\":2")!=std::string::npos);
+    CHECK(text.find("\"execution_qualified\":false")!=std::string::npos);
     return test::finish("diagnostic_adapter");
 }

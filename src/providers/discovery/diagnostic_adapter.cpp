@@ -30,7 +30,7 @@ struct Consumer {
     FILE* log{};
     uint64_t session{},epoch{},batches{},events{},malformed{},submissions{},presents{},snapshots{},matrices{},samples{},last_log{},last_sample{};
     bool overflow{}; unsigned reports{};
-    uint64_t draws{}, binds{}, unresolved_views{}, captured_snapshots{}, truncated_snapshots{}, unmapped_snapshots{}, gpu_snapshots{};
+    uint64_t draws{}, binds{}, unresolved_views{}, captured_snapshots{}, truncated_snapshots{}, unmapped_snapshots{}, gpu_snapshots{}, matrix_scans{};
 };
 // The host owns process lifetime. No destructors race its callback at exit.
 Consumer*& consumer() { static auto* slot=new Consumer*(nullptr);return *slot; }
@@ -133,11 +133,18 @@ void __cdecl Sink(const na_event_batch* batch,void* user) {
                 c.unmapped_snapshots+=e.status==NA_SNAP_NOT_MAPPED;
                 c.gpu_snapshots+=e.status==NA_SNAP_GPU_WRITTEN;
                 // Bounded structural hypotheses only; APP_SYNC_UNKNOWN is never upgraded.
-                if(e.status==NA_SNAP_CAPTURED && e.captured_bytes>=64 && e.captured_bytes<=4096 && c.snapshots%32==0) {
+                // Count captured records, not all statuses: a repeating stream
+                // of unmapped bindings must not phase-lock every scan away
+                // from the few usable snapshots.
+                if(e.status==NA_SNAP_CAPTURED && e.captured_bytes>=64 && e.captured_bytes<=4096 && c.captured_snapshots%32==1) {
                     na::camera::Snapshot s{status.session,status.epoch,e.queue_ticket,e.resource,e.snapshot_id,e.offset,
                         na::camera::Sync::AppSyncUnknown,(e.hdr.flags&(NA_EVF_TRUNCATED|NA_EVF_METHOD_UNOBSERVED))==0,true,{}};
                     s.bytes.assign(p+e.payload_offset,p+e.payload_offset+e.captured_bytes);
-                    c.matrices+=na::camera::FindMatrices(s).candidates.size();
+                    const auto scan=na::camera::FindMatrices(s);++c.matrix_scans;
+                    c.matrices+=scan.candidates.size();
+                    if(c.matrix_scans<=16 || (!scan.candidates.empty() && c.matrix_scans<=256))
+                        std::fprintf(c.log,"{\"type\":\"matrix_scan\",\"resource\":%llu,\"queue\":%llu,\"ticket\":%llu,\"snapshot\":%llu,\"bytes\":%u,\"flags\":%u,\"hypotheses\":%zu,\"unavailable\":%s,\"execution_qualified\":false}\n",
+                            e.resource,e.queue,e.queue_ticket,e.snapshot_id,e.captured_bytes,e.hdr.flags,scan.candidates.size(),scan.unavailable?"true":"false");
                 }
                 break;
             }
