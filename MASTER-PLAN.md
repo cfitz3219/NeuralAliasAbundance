@@ -276,3 +276,7 @@ PR27 a171f40 all3 CI jobs pass40146126274. Local48/48 passes. Supersedes pending
 ## 2026-10-24 — C9b fixes integrated and rechecked
 
 All branches checked; PR33 head688c0ec integrated into PR27 at6cd9d11. Full Release and48/48 local tests pass, zero skips. Original R1 repeated cancellation and R5 borrowed pointer corrected; retention/quarantine, queue locking, evidence and shape checks present. C9B-REVIEW-2 retains four changes-required findings: worker proliferation/static lifetime, raw source acquisition, scope validation deferred to maintenance, typeless depth partial-copy gate. Producer fixes remain Claude-owned; no live consumer or deployment. Latest CI pending.
+
+## 2026-10-24 — C9b fix integration CI confirmed
+
+PR27 6cd9d11 all3 CI jobs pass40147665279, alongside local48/48. Latest-CI-pending superseded. Four C9B-REVIEW-2 findings remain; no live enablement or deployment.

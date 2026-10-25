@@ -1,3 +1,8 @@
+# 2026-10-24 — C9b fix CI confirmed
+
+PR27 6cd9d11 passes all3 CI jobs40147665279 and local48/48. Supersedes latest-CI-pending below; four C9B-REVIEW-2 findings remain with Claude. No live consumer enablement or deployment.
+
+---
 # 2026-10-24 — C9b fixes rechecked; narrower blockers remain
 
 PR27 6cd9d11 integrates Claude688c0ec. Full Release and48/48 local tests pass, zero skips; CI pending. R1/R5 original defects corrected. Four C9B-REVIEW-2 findings remain with Claude: worker lifecycle, safe source acquisition, operation-time scope validation, typeless depth restrictions. Report docs/C9B-REVIEW.md on integration; exact evidence/ownership in COMMS. No live consumer enabled or deployment.
@@ -239,6 +244,7 @@ Cort: "finish this up and close gate 2!" Claude's side is complete, and with Ast
   - whether the overlay's own D3D12 objects also keep a removed device alive (not yet checked).
 
 **Next:** Phase 3.
+
 
 
 
