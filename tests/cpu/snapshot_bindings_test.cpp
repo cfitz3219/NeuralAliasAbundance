@@ -72,7 +72,7 @@ int main() {
             if(item.header.kind==NA_EV_QUEUE_EXECUTE){++executes;continue;}
             if(item.header.kind!=NA_EV_SNAPSHOT)continue;
             na_ev_snapshot s{};std::memcpy(&s,raw,sizeof(s));++count;
-            CHECK(batch.incomplete_capture);
+            CHECK(batch.has_unverified_semantics);
             CHECK(s.resource==resource && s.offset==0 && (s.list==a || s.list==b));
             CHECK(s.queue==token.queue_id && s.queue_ticket==token.ticket && s.recording_generation==2);
             CHECK(s.status==NA_SNAP_CAPTURED && s.sync==NA_SNAP_SYNC_APP_UNKNOWN);
