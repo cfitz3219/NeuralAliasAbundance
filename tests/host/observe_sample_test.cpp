@@ -503,13 +503,6 @@ int main()
         const uint64_t used = na::observe::GetProducerStats().sample_known_state - known0;
         std::printf("known state: earlier submission %u (0x%x), creation state %u (0x%x), second-queue resource %u, carried copies %llu\n", ki.status,
                     ki.state_before, cti.status, cti.state_before, mi.status, static_cast<unsigned long long>(used));
-        if (ki.status != NA_SAMPLE_READY || cti.status != NA_SAMPLE_READY) {
-            const auto ps = na::observe::GetProducerStats();
-            std::printf("FAIL known-state gates: disabled %u unhooked_queues %llu unknown_inflight %u entries %llu clears %llu | ki %u/%u cti %u/%u\n",
-                        ps.known_store_disabled, static_cast<unsigned long long>(ps.unhooked_queues), ps.known_unknown_inflight,
-                        static_cast<unsigned long long>(ps.known_entries), static_cast<unsigned long long>(ps.known_state_clears), ki.status, ki.reason,
-                        cti.status, cti.reason);
-        }
         CHECK(ki.status == NA_SAMPLE_READY && ki.state_before == D3D12_RESOURCE_STATE_RENDER_TARGET);
         CHECK(cti.status == NA_SAMPLE_READY && cti.state_before == D3D12_RESOURCE_STATE_RENDER_TARGET);
         CHECK(mi.status == NA_SAMPLE_ARMED); // transitioned by two queues: never carried

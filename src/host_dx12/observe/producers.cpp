@@ -554,10 +554,12 @@ void note_resource(ID3D12Device* dev, IUnknown* obj, uint32_t creation_kind, ID3
         bi.width = d.Width;
         bi.cpu_visible = cpu_visible;
     }
-    // G3-06: a texture created in a definite state keeps it until its first
-    // transition (simultaneous-access textures decay and are never sampled).
-    if (d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && !(d.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) &&
-        initial != D3D12_RESOURCE_STATE_COMMON)
+    // G3-06: committed, non-simultaneous textures are eligible for carried
+    // state from creation (a COMMON creation state is recorded but never
+    // usable until an explicit transition). Placed/reserved resources alias
+    // and are never eligible; simultaneous-access textures decay.
+    if (creation_kind == NA_CREATE_COMMITTED && d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+        !(d.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS))
         known_created(id, static_cast<uint32_t>(initial));
     if (va) {
         std::unique_lock<std::shared_mutex> lock(g_m);
