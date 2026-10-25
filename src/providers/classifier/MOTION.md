@@ -10,7 +10,9 @@ Reports include checked/excluded/out-of-bounds counts, maximum and mean color er
 zero-motion baseline error, magnitude, coverage, inlier fraction and percentile errors.
 Default policy requires 75% eligible coverage, at least 16 checked pixels and 95%
 inliers within tolerance. Border exits and unavailable interpolation are exclusions;
-vectors longer than twice the image diagonal contradict the candidate. Too little
+vectors longer than twice the image diagonal count against the inlier budget
+(reported as implausible), so a sparse finite sky sentinel does not veto the
+whole buffer while widespread sentinels contradict it. Too little
 coverage remains unavailable, so off-screen evasion cannot establish consistency.
 The inlier percentile must also improve on zero motion on the same footprint.
 These initial thresholds need corpus/live calibration; they are not gate acceptance.

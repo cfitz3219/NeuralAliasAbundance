@@ -31,7 +31,7 @@ struct Convention {
 enum class Verdict { Unavailable, Contradicted, Ambiguous, Consistent };
 struct Report {
     Verdict verdict{Verdict::Unavailable};
-    size_t eligible{}, checked{}, excluded{}, out_of_bounds{};
+    size_t eligible{}, checked{}, excluded{}, out_of_bounds{}, implausible{};
     double mean_error{}, max_error{}, zero_motion_error{}, mean_magnitude{};
     double coverage{}, inlier_fraction{}, percentile_error{}, zero_percentile_error{};
 };
@@ -86,7 +86,7 @@ inline Report Evaluate(const Frame& previous,const Frame& current,const Motion& 
     const double jitter_x=previous.jitter_x-current.jitter_x;
     const double jitter_y=previous.jitter_y-current.jitter_y;
     std::vector<double> errors, baselines;
-    size_t inliers=0, implausible=0;
+    size_t inliers=0;
     const double max_motion=2*std::hypot(double(current.width),double(current.height));
     for (size_t i=0;i<current.color.size();++i) {
         if (!current.stable[i]) continue;
@@ -95,7 +95,7 @@ inline Report Evaluate(const Frame& previous,const Frame& current,const Motion& 
         const double mx=motion.values[i][0]*convention.scale_x;
         const double my=motion.values[i][1]*convention.scale_y;
         if (!std::isfinite(mx) || !std::isfinite(my) || std::hypot(mx,my)>max_motion) {
-            ++implausible; ++r.out_of_bounds; continue;
+            ++r.implausible; ++r.out_of_bounds; continue;
         }
         const double px=x+mx+(convention.includes_jitter ? 0 : jitter_x);
         const double py=y+my+(convention.includes_jitter ? 0 : jitter_y);
@@ -121,9 +121,14 @@ inline Report Evaluate(const Frame& previous,const Frame& current,const Motion& 
         r.zero_motion_error/=static_cast<double>(r.checked);
         r.mean_magnitude/=static_cast<double>(r.checked);
     }
-    if (implausible) { r.verdict=Verdict::Contradicted; return r; }
     if (r.eligible) r.coverage=double(r.checked)/double(r.eligible);
-    if (r.checked) r.inlier_fraction=double(inliers)/double(r.checked);
+    // Finite sky sentinels are outliers, not an automatic whole-buffer veto.
+    // They still consume the inlier budget and cannot improve the residual by
+    // disappearing into ordinary visibility exclusions.
+    if (r.checked+r.implausible) r.inlier_fraction=double(inliers)/double(r.checked+r.implausible);
+    if (r.eligible && double(r.implausible)/double(r.eligible)>1-policy.minimum_inliers) {
+        r.verdict=Verdict::Contradicted; return r;
+    }
     if (r.checked<16 || !r.eligible || r.coverage<policy.minimum_coverage) return r;
     if (!std::isfinite(r.mean_error) || !std::isfinite(r.zero_motion_error) || !std::isfinite(r.mean_magnitude)) return r;
     const size_t rank=static_cast<size_t>(std::ceil(policy.minimum_inliers*double(r.checked)))-1;

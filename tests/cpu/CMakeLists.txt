@@ -31,6 +31,14 @@ na_add_cpu_test(matrix_candidates)
 add_executable(na_camera_corpus camera_corpus.cpp)
 target_link_libraries(na_camera_corpus PRIVATE na_cpu_test_options)
 find_package(Python3 3.8 QUIET COMPONENTS Interpreter)
+add_executable(na_temporal_depth_corpus temporal_depth_corpus.cpp)
+target_link_libraries(na_temporal_depth_corpus PRIVATE na_cpu_test_options)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME na.fixture.temporal_depth
+    COMMAND "${Python3_EXECUTABLE}" "${NA_CPU_ROOT}/tests/fixture/test_temporal_depth.py"
+      --runner "$<TARGET_FILE:na_temporal_depth_corpus>")
+  set_tests_properties(na.fixture.temporal_depth PROPERTIES LABELS "cpu;fixture" TIMEOUT 120)
+endif()
 if(Python3_Interpreter_FOUND)
   add_test(NAME na.fixture.camera_candidates
     COMMAND "${Python3_EXECUTABLE}" "${NA_CPU_ROOT}/tests/fixture/test_camera_candidates.py"

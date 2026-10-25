@@ -46,6 +46,13 @@ int main() { return test::run({
         auto p=make(); for (auto& v:p.motion.values) v={1000,1000};
         const auto r=run(p); CHECK(r.verdict==Verdict::Contradicted && r.out_of_bounds>0);
     }},
+    {"finite sentinel is a counted outlier instead of a whole-image veto", [] {
+        auto p=make(); p.motion.values[8*32+8]={65504,65504};
+        const auto r=run(p);
+        CHECK(r.verdict==Verdict::Consistent && r.implausible==1 && r.inlier_fraction<1);
+        for(unsigned y=4;y<10;++y) for(unsigned x=5;x<26;++x) p.motion.values[y*32+x]={65504,65504};
+        CHECK(run(p).verdict==Verdict::Contradicted);
+    }},
     {"isolated outliers are reported while widespread errors contradict", [] {
         auto p=make(); p.motion.values[8*32+8]={0,0};
         CHECK(run(p).verdict==Verdict::Consistent && run(p).inlier_fraction<1);
