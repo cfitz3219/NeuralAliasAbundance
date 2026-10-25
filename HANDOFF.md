@@ -1,4 +1,11 @@
 
+## 2026-10-24 — Final planned Anno verification completed; installation restored
+
+PR27 source9e1b140, report head6a674c3. Fixed/proved nonzero RTV/DSV descriptor resolution and actual driver Wait re-entry startup crash; normal in-game exit verified twice. Final planned single launch PID37488 rendered coastal gameplay and read-only overlay, logged16,419 transport Presents,12 completed texture samples and captured-buffer matrix scans. Normal Save and Exit returned0 at04:03:07Z; rollback verified.61/61 local tests and all3 source CI jobs40158744541 pass. Full A9 metrics, qualifications and hashes are appended in integration docs/A9-ANNO-DIAGNOSTICS.md; local evidence gate3-anno-final-verification. No further Anno launch scheduled for these checks.
+
+Not Gate3 closure: camera execution-time provenance, packed-depth acquisition, preserved pre-HUD lineage, motion corroboration and complete capture remain unavailable. Latest capture has4,592 detail drops and conservative inventory-invalid status from explicitly unobserved swapchain creation provenance;0 malformed/foundational drops. Do not promote samples/Presents into qualified DLSS inputs. Review the current code, not917/e55 packets. Claude branch stillab625be at all-branch fetch; no later camera/provenance fixes found.
+---
+
 ## 2026-10-24 — Anno A9 delivered; final implementation review at91747c4
 
 PR27 now includes production_checks APIs,264/264 combined fixture acceptance,read-only live adapter,actual Anno report and a reproduced transport exit correction. Full Release/58 of58 local non-GPU-labelled tests pass,zero skips/failures; latest CI pending. A9 rendered capture:139414 submissions,21664 live resource records,3315759 snapshot events,0 malformed/drops,0 confirmed inputs. Follow-up inventory records/8 arm timeouts are documented; no completed samples or qualified frame/camera/pre-HUD evidence. Both deployment manifests verify rollback. Baseline DX12 black-screen fixed by preserving unreadable OneDrive shader cache and regenerating it; game executable/settings preserved.
@@ -311,4 +318,5 @@ Cort: "finish this up and close gate 2!" Claude's side is complete, and with Ast
 ## 2026-10-24 — Final Anno review-head CI confirmed
 
 PR27 head91747c480898a88bdc994dcef3f350d812a3f4b2 passes all3 CI jobs40156916140 (Linux,Windows,Windows with public NVIDIA SDK headers). Full Release/local58 of58 passes and merge-tree is clean against main. Supersedes latest-CI-pending above; compatibility findings and review requirements unchanged. Exact source archive and e55c191 delta are at local/gate3-review-91747c4/. Archive SHA256 DE1B474F3F076D0161F0FAEF9F78C3B5414EAB63B9C6F1CC2EED87B508860C08. Both game deployment files absent at final verification; no live diagnostic installation.
+
 
