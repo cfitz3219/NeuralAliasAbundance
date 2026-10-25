@@ -130,14 +130,12 @@ if(WIN32 AND MSVC AND TARGET host_observe_producers AND EXISTS "${NA_CPU_ROOT}/t
   set_tests_properties(na.host.snapshot_bindings PROPERTIES LABELS "host;capture" TIMEOUT 30 SKIP_RETURN_CODE 77)
 endif()
 
-# Known producer wakeup gap at629ad9b. Buildable reproduction, excluded from
-# default passing tests until Claude's fix is integrated; then promote it.
+# Producer wakeup regression (Astra, C9B-REVIEW-3): a request must wake an idle
+# sample worker. Fixed in claude/c9b-review-3 and registered by default.
 if(WIN32 AND MSVC AND TARGET host_observe_producers AND EXISTS "${NA_CPU_ROOT}/src/host_dx12/host_observe_samples.h")
   add_executable(na_sample_worker_wakeup sample_worker_wakeup_test.cpp)
   target_link_libraries(na_sample_worker_wakeup PRIVATE na_cpu_test_options host_observe_producers dxgi)
-  option(NA_ENABLE_PENDING_SAMPLE_TESTS "Register unresolved sample producer regressions" OFF)
-  if(NA_ENABLE_PENDING_SAMPLE_TESTS)
-    add_test(NAME na.host.sample_worker_wakeup_pending COMMAND na_sample_worker_wakeup)
-    set_tests_properties(na.host.sample_worker_wakeup_pending PROPERTIES LABELS "host;capture" TIMEOUT 15 SKIP_RETURN_CODE 77)
-  endif()
+  # Astra's C9B-REVIEW-3 regression, promoted with the fix (request wakes an idle worker).
+  add_test(NAME na.host.sample_worker_wakeup COMMAND na_sample_worker_wakeup)
+  set_tests_properties(na.host.sample_worker_wakeup PROPERTIES LABELS "host;capture" TIMEOUT 15 SKIP_RETURN_CODE 77)
 endif()

@@ -2309,6 +2309,7 @@ bool g_worker_started = false;               // under g_samples_m: exactly one w
 std::atomic<uint32_t> g_workers_started{0};  // stats
 std::atomic<bool> g_samples_quit{false};     // set at teardown: the worker stops before any static it reads is destroyed
 std::atomic<bool> g_worker_paused{false};    // test seam: no maintenance ticks
+HANDLE g_worker_thread = nullptr;            // duplicated handle: teardown waits for the worker to exit
 void (*g_acquire_probe)() = nullptr;         // test seam: after the game's submission returned, before servicing
 constexpr size_t kMaxSamples = 8;     // every entry counts, released-in-flight included
 constexpr uint64_t kMaxSampleBytes = 64ull << 20;
@@ -2409,25 +2410,31 @@ void worker_tick_locked()
     recount_armed_locked();
 }
 
-// Teardown quiescence (C9B-REVIEW-2 #1). A function-local static constructed
-// when the worker starts, i.e. after every namespace-scope static it reads, so
-// it is destroyed before them. Its destructor sets the quit flag and then
-// waits (bounded) for the worker to leave its current tick: once it has the
-// lock, the worker can never tick again. Bounded because at process exit the
-// OS may already have terminated the worker (possibly while it held the lock):
-// then nothing can run and giving up is safe.
+// Teardown quiescence (C9B-REVIEW-2 #1, C9B-REVIEW-3 #2). A function-local
+// static constructed when the worker starts, i.e. after every namespace-scope
+// static the worker reads, so it is destroyed before them. Its destructor
+// returns only once the worker THREAD HAS EXITED, which is the proof that no
+// tick is in progress or can start:
+//  - worker already gone (the OS terminates every other thread before DLL
+//    static destruction at process exit, possibly while it held the lock):
+//    the handle is signaled, nothing to do, the lock is never touched;
+//  - worker alive (EXE exit(), static destruction before ExitProcess): it is
+//    not holding the lock forever, so we take it, set quit under it (no lost
+//    wakeup against the predicate wait), and wait for the thread to exit.
 struct WorkerQuiesce {
     ~WorkerQuiesce()
     {
-        g_samples_quit.store(true, std::memory_order_release);
-        g_samples_cv.notify_all();
-        for (int i = 0; i < 100; ++i) {
-            if (g_samples_m.try_lock()) {
-                g_samples_m.unlock();
-                return;
+        if (!g_worker_thread) return;
+        if (WaitForSingleObject(g_worker_thread, 0) != WAIT_OBJECT_0) {
+            {
+                std::lock_guard<std::mutex> lock(g_samples_m);
+                g_samples_quit.store(true, std::memory_order_release);
             }
-            Sleep(1);
+            g_samples_cv.notify_all();
+            WaitForSingleObject(g_worker_thread, INFINITE);
         }
+        CloseHandle(g_worker_thread);
+        g_worker_thread = nullptr;
     }
 };
 
@@ -2438,7 +2445,7 @@ void ensure_worker_locked()
     static WorkerQuiesce quiesce;
     (void)quiesce;
     g_workers_started.fetch_add(1);
-    std::thread([] {
+    std::thread worker([] {
         std::unique_lock<std::mutex> lock(g_samples_m);
         for (;;) {
             if (g_samples_quit.load(std::memory_order_acquire)) return;
@@ -2447,7 +2454,11 @@ void ensure_worker_locked()
             if (g_samples_quit.load(std::memory_order_acquire)) return;
             if (!g_worker_paused.load(std::memory_order_acquire)) worker_tick_locked();
         }
-    }).detach(); // never joined: the store above is immortal and quiesce stops it at teardown
+    });
+    HANDLE h = nullptr;
+    if (DuplicateHandle(GetCurrentProcess(), static_cast<HANDLE>(worker.native_handle()), GetCurrentProcess(), &h, SYNCHRONIZE, FALSE, 0))
+        g_worker_thread = h;
+    worker.detach(); // never joined: quiesce waits on the duplicated handle at teardown
 }
 
 bool state_ok_for_queue(uint32_t state, D3D12_COMMAND_LIST_TYPE type)
@@ -3030,6 +3041,7 @@ extern "C" int __cdecl na_observe_sample_request(const na_sample_request* r, uin
     g_samples.push_back(std::move(s));
     recount_armed_locked();
     ensure_worker_locked();
+    g_samples_cv.notify_one(); // C9B-REVIEW-3 #1: an idle worker waits for exactly this
     return NA_OK;
 }
 
