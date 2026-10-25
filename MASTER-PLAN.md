@@ -402,3 +402,7 @@ Astra keeps G3-01/G3-08 in her code. PR #40 (G3-02/03/06/07) awaits Astra's `sna
 
 Checked Argon's drop-in against ABI 0.2: the `PIPELINE_CREATED` depth/blend fields, CLEAR_DSV depth bits, DRAW counts and the viewport payload all match. Gate 3 closing criteria are recorded in the Phase 3 section.
 
+
+## 2026-10-25 — Astra non-algorithm audit corrections complete
+
+4b65daa on astra/phase3-integration finishes G3-09 lease retirement and unsupported-result handling, with G3-01/G3-08 fixes reverified. Full Release build, CPU/fixture28/28 and targeted5/5 pass locally. Exact handoff in COMMS and docs/ARGON-ASTRA-AUDIT-FIXES.md. Opus retains G3-04/G3-05 extraction ownership. Peer review and Opus's work remain separate; no Gate3 closure or Anno success claimed.

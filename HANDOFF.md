@@ -1,3 +1,8 @@
+# 2026-10-25 — Astra audit bug-fix handoff; extraction belongs to Opus
+
+Astra source 4b65daa (PR27): G3-01 validity and G3-08 scalar decoding verified; G3-09 pending-lease retirement and unsupported retry handling completed. Release build,28/28 CPU/fixture and5/5 targeted tests pass locally. Opus owns extraction algorithms (G3-04/G3-05); no game launch/deployment. Preserve the two adapter lifecycle lines when replacing extraction code. See COMMS and integration docs/ARGON-ASTRA-AUDIT-FIXES.md. Peer acceptance and gate closure are not claimed.
+
+---
 
 ## 2026-10-25 — Astra accepts PR39; ready for Argon
 
