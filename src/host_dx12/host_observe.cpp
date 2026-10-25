@@ -104,7 +104,23 @@ struct HostState {
     std::atomic<bool> force_foundational_overflow{false};
 };
 
-HostState g_host;
+// The pinned runtime can receive DLL teardown after Windows has terminated
+// every other thread. Never destroy a joinable std::thread or its held locks
+// in that case. Explicit stop still joins and releases each session normally.
+HostState& g_host = *new HostState;
+
+struct ProcessExitQuiesce {
+    ~ProcessExitQuiesce()
+    {
+        if (!g_host.worker.joinable()) return;
+        const HANDLE thread = static_cast<HANDLE>(g_host.worker.native_handle());
+        // DLL process-detach: a terminated worker may have held any lock.
+        if (WaitForSingleObject(thread, 0) == WAIT_OBJECT_0) return;
+        // EXE CRT teardown: the worker is alive; drain before other globals
+        // are destroyed. This guard is registered by start, after globals.
+        na_observe_stop();
+    }
+};
 
 void status_lock()
 {
@@ -502,6 +518,8 @@ int __cdecl na_observe_abi(uint16_t* out_major, uint16_t* out_minor)
 int __cdecl na_observe_start(const na_observe_config* cfg, na_event_sink sink, void* user)
 {
     if (!sink) return NA_E_ARG;
+    static ProcessExitQuiesce process_exit;
+    (void)process_exit;
     uint32_t budget_mib = kDefaultBudgetMiB;
     if (cfg) {
         if (cfg->size_bytes < 8 || cfg->size_bytes > 4096) return NA_E_ABI;
