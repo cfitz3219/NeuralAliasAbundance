@@ -264,3 +264,7 @@ PR27 5ded6a0 all3 CI jobs pass40143583237, alongside local46/46 tests. Supersede
 ## 2026-10-24 — repeated-binding provenance regression green
 
 No newer Claude lifetime/coverage/async-texture commits at all-branch fetch. PR27 b55de74 adds default snapshot_bindings test: RTX8 records/8 associations across same-address root/table bindings in two lists, with payload ownership verified after overwrite/Unmap. Full Release succeeds; targeted test passes. All3 CI jobs pass40144391920. Existing47-test default suite now includes this regression; no claim of a new local full-suite run (previous46/46 remains recorded separately). Remaining producer lifetime/coverage and async acquisition stay Claude-owned; no deployment.
+
+## 2026-10-24 — C9b texture samples reviewed and experimentally integrated
+
+All Claude branches checked. New67b7744 is integrated in PR27 a171f40, preserving existing fixes/tests. Full Release and48/48 local non-GPU-labelled CTests pass, zero skips, including correct RTX color/depth samples. Review verdict: changes required before live consumer use. C9B-R1–R6 cover repeated cancellation, source/failure ownership, queue boundary ordering, state coverage, expiring borrowed pointers and format/subresource validation. Full report docs/C9B-REVIEW.md on integration branch; exact corrections coordinated in COMMS. No production sample-request caller enabled, no deployment. CI pending at this entry.

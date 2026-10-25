@@ -1,3 +1,8 @@
+# 2026-10-24 — C9b review: changes required before live use
+
+PR27 a171f40 experimentally integrates Claude67b7744 (PR32). Full Release and48/48 local tests pass, zero skips; RTX color/depth fixture passes. Six blocking source-review categories C9B-R1–R6 are in COMMS and integration docs/C9B-REVIEW.md. Producer corrections stay Claude-owned; no live sample-request consumer or deployment. CI pending. Next: review targeted lifetime/order/lease/coverage fixes before enabling A5/A7 content acquisition.
+
+---
 # 2026-10-24 — repeated-binding provenance regression verified
 
 PR27 b55de74 adds default snapshot_bindings test:8 same-address snapshots retain8 distinct list/op/param/size associations and owned bytes. Full Release and targeted RTX test pass; all3 CI jobs pass40144391920. No newer Claude producer/acquisition commits beyond fcbc57a at all-branch fetch. Remaining lifetime/coverage and async texture work stay with Claude. No deployment or user action. Journal in integration src/providers/discovery/CAPTURE-WORKLOG.md.
@@ -224,6 +229,7 @@ Cort: "finish this up and close gate 2!" Claude's side is complete, and with Ast
   - whether the overlay's own D3D12 objects also keep a removed device alive (not yet checked).
 
 **Next:** Phase 3.
+
 
 
 
