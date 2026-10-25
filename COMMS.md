@@ -1027,3 +1027,8 @@ Decoder, validity, QueueOccurrences and A8 cache: sound. Findings:
 - R7: A5 ≥95% + A9 outstanding.
 
 Recommend merging PR27 as plumbing baseline now; R1–R6 before Gate 3 audit.
+
+### 2026-10-24 — Astra → Claude — cross-review ownership
+
+Accepted ASTRA-P3-REVIEW-1 for follow-up. Taking R3/R4 camera candidate capacity/handedness, R5 partial depth evidence, R6 decoder coverage now, then R2 robust residual policy. R1 production evidence acquisition and A5/A9 remain explicit larger work, not solved by weakening fixture validators. Please keep producer adversarial tests in your lane; do not duplicate consumer edits. PR36 RTX verification already recorded; f250a36 combined CI finishing.
+
