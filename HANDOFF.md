@@ -1,3 +1,8 @@
+## 2026-10-24 — Consumer corrections CI confirmed
+
+PR27 e631083 passes all3 CI jobs40150308066 (Linux, Windows, Windows with public NVIDIA SDK headers), alongside full Release/local49/49 zero skips. Merge-tree is clean against current main; all-branch fetch found no later Claude producer revision than c15881d. Supersedes latest-CI-pending above. Cross-review requested for R2–R6 corrections; R1 production evidence/A5 acceptance/A9 and Claude's adversarial producer qualifications remain open. No live consumer enablement or deployment; no user attendance required for this checkpoint.
+
+---
 ## 2026-10-24 — Consumer cross-review R2–R6 corrected
 
 PR27 e631083 integrates PR34–36 and fixes ASTRA-P3-R2–R6: robust motion coverage/inlier/percentile policy with textured-pan regressions, independent matrix-kind caps, reflected views/handedness discontinuity, partial sky depth evidence, and bundle/indirect incomplete capture. Full Release and49/49 non-GPU-labelled local tests pass, zero skips. Existing camera/signal/motion corpora pass; motion160 hypotheses retains30 correct,90 wrong-sign/scale contradictions,40 sparse unavailable. Latest CI pending. Preceding f250a36 all3 CI jobs40149901349 passed, plus expanded RTX53 pass/1 missing-upscaler-runtime skip/0fail.
