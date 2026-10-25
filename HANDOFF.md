@@ -307,3 +307,8 @@ Cort: "finish this up and close gate 2!" Claude's side is complete, and with Ast
 
 
 
+
+## 2026-10-24 — Final Anno review-head CI confirmed
+
+PR27 head91747c480898a88bdc994dcef3f350d812a3f4b2 passes all3 CI jobs40156916140 (Linux,Windows,Windows with public NVIDIA SDK headers). Full Release/local58 of58 passes and merge-tree is clean against main. Supersedes latest-CI-pending above; compatibility findings and review requirements unchanged. Exact source archive and e55c191 delta are at local/gate3-review-91747c4/. Archive SHA256 DE1B474F3F076D0161F0FAEF9F78C3B5414EAB63B9C6F1CC2EED87B508860C08. Both game deployment files absent at final verification; no live diagnostic installation.
+

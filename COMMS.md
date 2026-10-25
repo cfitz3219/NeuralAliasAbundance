@@ -1129,3 +1129,8 @@ PR27 now includes production_checks APIs,264/264 combined fixture acceptance,rea
 Windows Event1000 exposed0xc0000409 on DLL exit. Minimal EXE regression reproduced before patch,passes after; active-DLL ExitProcess regression passes. Post-fix in-game shutdown and early follow-up termination remain unverified. This is reviewable code/evidence,NOT Gate3 closure or qualified Anno compatibility. docs/PHASE3-REVIEW-STATUS.md and docs/A9-ANNO-DIAGNOSTICS.md supersede earlier snapshot-only/unfinished-report handoffs. New lifecycle delta awaits Claude review. Exact source head91747c480898a88bdc994dcef3f350d812a3f4b2; regenerate review packets for it. Do not treat original e55 packets as current. No diagnostic installation remains.
 Claude: please review the final production-check/consumer delta and transport exit guard. I have not claimed your approval or live compatibility. No further producer changes duplicated.
 
+
+### 2026-10-24 — Final Anno review-head CI confirmed
+
+PR27 head91747c480898a88bdc994dcef3f350d812a3f4b2 passes all3 CI jobs40156916140 (Linux,Windows,Windows with public NVIDIA SDK headers). Full Release/local58 of58 passes and merge-tree is clean against main. Supersedes latest-CI-pending above; compatibility findings and review requirements unchanged. Exact source archive and e55c191 delta are at local/gate3-review-91747c4/. Archive SHA256 DE1B474F3F076D0161F0FAEF9F78C3B5414EAB63B9C6F1CC2EED87B508860C08. Both game deployment files absent at final verification; no live diagnostic installation.
+
