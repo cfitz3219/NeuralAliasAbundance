@@ -5,6 +5,7 @@
 **Status:** ACTIVE. This is the single source of truth for *what* gets built, *by whom*, and *in what order*.
 
 > **Goal:** one universal DX12 injector that obtains or synthesizes everything DLSS needs (scene color, depth, motion vectors, jitter, camera) **without per-game code**. Universal coverage is the engineering goal and working design premise.
+> **Course change (2026-10-25, Cort):** discovery uses **established, field-proven algorithms first**: ReShade `generic_depth` depth scoring, UEVR/Geo-11 combined view-projection and inverse-pair camera detection, and Special K/Luma pre-HUD boundary tracking (reference: `docs/ARGON-DROPIN-HEURISTICS.md`). Our own verification checks stay as secondary corroboration and logging, never as all-or-nothing gates that report zero in real games.
 > Discover candidates, test conventions against geometric and photometric evidence, reconstruct or synthesize missing inputs, and save automatically verified profiles. Missing inputs create engineering tasks. Keep discovery active while the original renderer handles frames whose enhancement inputs are still being qualified. Measure progress with fixtures and a growing game/build/feature matrix. Protected-title access remains a separate integration/authorization requirement; no protection bypass is proposed here.
 
 ---
@@ -30,7 +31,8 @@
 | `CMakeLists.txt` (root), `build.ps1`, `.github/workflows/` | **Claude** (single editor) |
 | `src/host_dx12/**`, `src/runtime/**`, `src/app/**`, `tools/**`, `scripts/deploy-*` | **Claude** |
 | `tests/host/**` (GPU/host/proxy tests + stubs) | **Claude** |
-| `src/providers/discovery/**`, `src/providers/classifier/**`, `src/providers/camera/**`, `profiles/**` | **Astra** |
+| `src/providers/discovery/**`, `src/providers/classifier/**`, `src/providers/camera/**`, `profiles/**` | **Astra**, except the two files below |
+| `src/providers/camera/matrix_candidates.hpp`, `src/providers/discovery/diagnostic_adapter.cpp` (and their tests) | **Claude** (transferred 2026-10-25 by Cort for the drop-in algorithms, C12/C13) |
 | `tests/cpu/**` including `tests/cpu/CMakeLists.txt` (pulled in by root via `add_subdirectory`) | **Astra** |
 | `tests/fixture/**` (ground-truth scene) | **Astra** |
 | `src/core/**`, `host_observe.h` | **Frozen. Joint proposal required** |
@@ -78,6 +80,31 @@ Legend: **C** = Claude task, **A** = Astra task, **J** = joint task (the split i
 | **A7** | Astra | **Motion-vector finder.** Identify existing MV buffers (2-channel float, ~0 when static, verified by warping the previous frame onto the current one). | Correct on fixture; no false positives. | 2–4 d |
 | **A8** | Astra | **Auto-profiles.** Once a game's layout is confirmed, save it per exe hash in `profiles/` so the next launch is instant. Invalidate on mismatch. Hand-written adapters (TLOU) become overrides. | Second launch of a fixture "game" skips discovery. | 1–2 d |
 | **A9** | Astra | **Anno 1800 diagnostics-only report:** which inputs were found, their confidence, and the unknowns. No reconstruction yet. | Report from a test session. | 1–2 d |
+
+#### Phase 3 course change: established algorithms (2026-10-25)
+
+Reference: `docs/ARGON-DROPIN-HEURISTICS.md` (on `claude/c12-dropin-heuristics`, merged with C12). Astra's fixture classifiers (A5–A7) stay in the tree as secondary corroboration; the live discovery path is C12/C13.
+
+| ID | Owner | Task | Done when | Effort |
+|---|---|---|---|---|
+| **C12** | Claude | **Drop-in camera finder** in `matrix_candidates.hpp`. Adds a combined `ViewProjection` detector (jitter stripped, near/far, handedness, camera position) and `ViewProj × InvViewProj ≈ I` inverse-pair matching beside the existing `Projection`/`RigidView`. Closes **G3-05**. | Existing matrix tests pass unchanged. New tests cover rotated, jittered, reversed-Z and camera-relative VP matrices and inverse pairs, with no false positives on object transforms. | 1–2 d |
+| **C13** | Claude | **Drop-in render-graph tracker** in `diagnostic_adapter.cpp`, made up of four parts. Closes **G3-04** and **G3-09**. | Existing adapter test passes. New recorded-graph tests yield populated depth/scene-colour candidates and a HUD boundary. | 2–3 d |
+| | | • ReShade `generic_depth` scoring: draws, vertices, clears, mid-frame clears, swapchain aspect match. | | |
+| | | • Special K/Luma pre-HUD boundary: PSO depth/blend state, `scene_end`/`hud_begin`. | | |
+| | | • Real `Window`/`Observation` from `QUEUE_EXECUTE` (queue, ticket, list, generation). | | |
+| | | • CBV draw-broadcast counter to find the per-frame camera CBV, and a sampling retry for timed-out resources. | | |
+| **C14** | Claude | **Live verification in Anno 1800** with C12/C13, PR #40 (G3-02/03/06/07) and Astra's G3-01/G3-08. One reversible run. | Report shows the Gate 3 criteria below. | 1 d |
+| **G3-01, G3-08** | Astra | Argon findings in Astra's code: scoped capture validity (00591f6), and 16-bit depth decode. | CI green, including a fix for `snapshot_bindings_test`. | in progress |
+
+**Gate 3 closing criteria (Argon, 2026-10-25):**
+- All G3-01…G3-09 landed. Claude owns G3-02/03/04/05/06/07/09; Astra owns G3-01/08.
+- Full CI suite green.
+- One Anno 1800 run plus one other DLSS-less title showing all of the following:
+  - `InventoryConsistent` true;
+  - captured snapshots above 90% of upload bindings;
+  - `unresolved_views` near zero;
+  - non-zero depth and scene-colour candidates;
+  - `ViewProjection` / inverse-pair camera hypotheses.
 
 **REVIEW GATE 3:** cross-review → fixes/regressions → Argon audit → resolve/recheck findings → test session 3 (classifier output in Anno plus one more DLSS-less game) → close gate.
 
@@ -361,3 +388,17 @@ I will integrate producer fixes, exercise the real transport-to-candidate-to-sam
 ## 2026-10-25 — ownership change directed by Cort
 
 Cort stopped Astra's discovery/in-game continuation. Opus owns implementation of established extraction algorithms using the supplied drop_in_c_heuristics_for_astra_and_opus.md reference. Astra's scope is restricted to Argon's findings in Astra's existing code; no new extraction algorithms, producer integration or Anno deployment. Prior Astra live-completion plan is superseded. Existing committed work is retained for Opus; audit findings remain open until their respective fixes are verified.
+
+## 2026-10-25 — Claude: plan updated for the established-algorithms course change
+
+Per Cort, discovery now drops in Argon's compiled field-proven algorithms (`docs/ARGON-DROPIN-HEURISTICS.md`: ReShade generic_depth, UEVR/Geo-11 VP + inverse pairs, Special K/Luma pre-HUD) instead of inventing new gates.
+
+Ownership follows Astra's 2026-10-25 entry: `matrix_candidates.hpp` and `diagnostic_adapter.cpp` transfer to Claude. New Claude tasks:
+- C12 camera finder (closes G3-05);
+- C13 render-graph tracker (closes G3-04 and G3-09);
+- C14 live Anno verification.
+
+Astra keeps G3-01/G3-08 in her code. PR #40 (G3-02/03/06/07) awaits Astra's `snapshot_bindings_test` one-line fix on the base.
+
+Checked Argon's drop-in against ABI 0.2: the `PIPELINE_CREATED` depth/blend fields, CLEAR_DSV depth bits, DRAW counts and the viewport payload all match. Gate 3 closing criteria are recorded in the Phase 3 section.
+
