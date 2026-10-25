@@ -14,3 +14,16 @@ Full Release and48/48 local non-GPU-labelled CTests pass, zero skips. RTX5070Ti 
 Additional gaps: tokens have no session/epoch scope; observation stop/resync leaves requests active; cancelled in-flight allocations are excluded from the8-sample live cap; completed readback Map can occur during service_samples in a live submission callback. Move completion/readback service into an explicitly owned worker and bound all retained allocations.
 
 Sent exact findings and ownership to Claude through main COMMS, C9B-REVIEW-1. Producer fixes stay with Claude to avoid duplication. Consumer adaptation waits for a stable, safe ownership/state contract. No interface approval or Phase3 closure. Prior PR31 corrections and same-address binding test remain preserved.
+
+## Recheck — 688c0ec / C9B-REVIEW-2
+
+Claude PR33 (5a299fc implementation,688c0ec warning fix) integrated by fast-forward. Full Release and48/48 local non-GPU-labelled tests pass, zero skips. Logs local/phase3-integration/{build-c9b-fixes.log,ctest-c9b-fixes-full.log}. Existing repeated-binding test is preserved. The original R1 repeat-cancellation and R5 borrowed-pointer defects are corrected in inspected paths. Retention after acquisition, failed-signal quarantine, queue locking, coverage gating, format/plane validation and owned reads are present. The updated fixture exercises stalled double-release/source retention, truncated/COMMON evidence, invalid subresource/BC rectangle, expiry and delayed scope invalidation.
+
+Changes still required before live use (source-level findings, not reproduced failures):
+
+- Worker startup2387–2397: detach makes joinable false, so each accepted request starts a permanent2ms worker. A stable singleton guard and explicit shutdown/static-lifetime protocol are required. Module pinning is not static-data lifetime management.
+- Source acquisition2450: raw registry QI occurs after forwarding game submission; retaining afterward does not establish safe acquisition during concurrent destruction. Define a lifetime protocol and test release at acquisition, not only after the host already owns the source. Exact triggering possibilities depend on application synchronization/queue coverage; no crash was induced.
+- Scope: service_samples/poll/read do not revalidate session/epoch at use. They can act on stale ARMED/READY entries until worker maintenance runs. Add immediate stop/resync/read/service tests, not only WaitDone after stop.
+- Typeless depth: depth_format checks typed depth formats only. Partial R32_TYPELESS/R16_TYPELESS resources with ALLOW_DEPTH_STENCIL are not rejected; depth restrictions must consider resource flags. Add refusal tests before GPU submission.
+
+Cross-thread queue interleaving remains untested deterministically. The current fixture does not visibly inject host Signal failure or planar rejection despite broad coverage claims. Findings and non-overlapping producer ownership posted in COMMS. No live sample-request consumer or deployment enabled; additive interface remains experimental. This section supersedes the initial six-finding disposition only where explicitly noted.
