@@ -7,9 +7,13 @@
 namespace na::classifier {
 struct CameraAssociation {
     uint64_t session{},epoch{},queue{},ticket{},frame{};
-    Matrix view_projection{}; // Exact D3D [0,1] convention, including reverse Z.
+    // UNJITTERED D3D [0,1] view-projection, including reverse Z. Jitter is
+    // supplied separately in pixels; a captured jittered projection must be
+    // unjittered using an independently established convention before use.
+    Matrix view_projection{};
     double jitter_x{},jitter_y{},clear_depth{1};
     bool qualified{},complete{},reset{};
+    bool view_projection_unjittered{}; // Explicit caller assertion; unknown fails closed.
 };
 struct DepthFrame {
     CameraAssociation camera;
@@ -19,7 +23,7 @@ struct DepthFrame {
 };
 inline bool AcquireDepthFrame(const discovery::AcquiredSample& sample,const CameraAssociation& c,DepthFrame& out) {
     out={}; const auto& i=sample.info;
-    if (!c.qualified || !c.complete || !Known(c.frame) || c.session!=i.session || c.epoch!=i.epoch ||
+    if (!c.qualified || !c.complete || !c.view_projection_unjittered || !Known(c.frame) || c.session!=i.session || c.epoch!=i.epoch ||
         c.queue!=i.queue || c.ticket!=i.queue_ticket || !Known(c.session) || !Known(c.epoch) ||
         !Known(c.queue) || !Known(c.ticket) || !Known(i.resource) ||
         !std::isfinite(c.jitter_x) || !std::isfinite(c.jitter_y) ||
@@ -65,7 +69,7 @@ struct TemporalDepthReport {
 };
 inline bool ValidDepthFrame(const DepthFrame& f) {
     const auto& c=f.camera;
-    if(!c.complete || !c.qualified || !Known(c.session) || !Known(c.epoch) || !Known(c.frame) ||
+    if(!c.complete || !c.qualified || !c.view_projection_unjittered || !Known(c.session) || !Known(c.epoch) || !Known(c.frame) ||
         !Known(c.queue) || !Known(c.ticket) || !Known(f.resource) || !f.width || !f.height ||
         f.width>4096 || f.height>4096 || f.depth.size()!=size_t(f.width)*f.height ||
         !std::isfinite(c.jitter_x) || !std::isfinite(c.jitter_y) || (c.clear_depth!=0 && c.clear_depth!=1)) return false;
@@ -128,8 +132,10 @@ inline TemporalDepthReport CheckTemporalDepth(const DepthFrame& previous,const D
     if(r.eligible) r.coverage=double(r.checked)/double(r.eligible);
     if(r.checked) r.inlier_fraction=double(r.inliers)/double(r.checked);
     if(r.checked<16 || r.coverage<0.75) return r;
-    if(r.inlier_fraction<0.95) r.verdict=TemporalVerdict::Contradicted;
-    else if(double(r.excited)<0.25*double(r.checked)) r.verdict=TemporalVerdict::Uninformative;
+    // Moving geometry can disagree with a valid static-surface hypothesis.
+    // Only gross disagreement contradicts; the middle band remains unknown.
+    if(r.inlier_fraction<0.50) r.verdict=TemporalVerdict::Contradicted;
+    else if(r.inlier_fraction<0.80 || double(r.excited)<0.25*double(r.checked)) r.verdict=TemporalVerdict::Uninformative;
     else r.verdict=TemporalVerdict::Consistent;
     return r;
 }

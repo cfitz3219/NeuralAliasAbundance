@@ -50,7 +50,10 @@ struct ColorBoundary {
     // depth-disabled blended draws. No HUD alpha/foreground oracle is required.
     std::vector<OverlayRect> overlays;
 };
-inline ConfirmationReport ConfirmSceneColor(const Window& window,const Observation& observation,
+// This confirms the preserved display-space composition source, NOT the
+// render-resolution pre-post-processing DLSS color input. That separate input
+// requires render-pass/post-process lineage not established by image agreement.
+inline ConfirmationReport ConfirmPreHudComposite(const Window& window,const Observation& observation,
     const ColorFrame& source,const ColorBoundary& boundary,double tolerance=0.001) {
     ConfirmationReport out{};out.reason="Acquire preserved scene source, presentation lineage and bounded overlay writes";
     const auto candidate=Describe(Signal::SceneColor,window,observation);

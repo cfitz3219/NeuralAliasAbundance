@@ -36,6 +36,13 @@ Batch Snapshot(uint64_t epoch=1,uint32_t support=NA_CAP_SUPPORTED) {
 }
 }
 int main() { return test::run({
+    {"owned decoded batches preserve validity and malformed rejection", [] {
+        auto b=Snapshot();std::memcpy(b.bytes.data(),&b.header,sizeof(b.header));
+        auto decoded=DecodeBatch(b.bytes.data(),b.bytes.size());
+        b.bytes.clear(); // caller input may already have expired
+        CaptureValidity v;v.Consume(decoded,Status());CHECK(v.CaptureContiguous());
+        v.Consume(DecodeBatch(nullptr,0),Status());CHECK(!v.InventoryConsistent());
+    }},
     {"callback completion and capability scope are mandatory", [] {
         CaptureValidity v; auto s=Status(); s.inventory_invalid=1; Snapshot().Send(v,s);
         CHECK(!v.InventoryConsistent()); s.inventory_invalid=0; v.ObserveStatus(s);

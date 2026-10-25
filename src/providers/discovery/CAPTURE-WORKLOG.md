@@ -175,3 +175,20 @@ User resumed after physical-Escape interruption; prior pending deployment had al
 Replaced the generic per-resource unavailable placeholder with the actual A5 Describe result for depth and scene color, including score, reasons and acquisition tasks. Inventory dimensions/recording writes are not promoted into executing scope, scene boundary or preserved content versions. The real-transport activation test now includes a depth-eligible texture and checks both classifier reports, missing-scope/boundary reasons and absence of false candidate promotion. Release DLL/adapter builds pass; production_checks,264-case production_classifier and diagnostic_adapter tests all pass. Parsed the emitted JSONL successfully. No new game deployment or restart; this is report-only follow-up to the recorded9e1b140 session.
 
 PHASE3-ASTRA-COMPLETION.md maps A5–A9 and R1 check implementations to their actual criteria, preserving acquisition/compatibility limits and remaining cross-review/audit/additional-game gate work. This corrects the repeated conflation of an unknown A9 outcome with a missing A9 deliverable. No claim of qualified Anno inputs or gate closure. Exact source review package prepared after commit; Claude coordination follows.
+
+## 2026-10-24 — REVIEW-2 consumer corrections and PR38 integration
+
+Reviewed Claude's full review at3196180 and integrated PR38 through77f49ef.
+R9: renamed production color confirmation to ConfirmPreHudComposite and scoped
+A5's fixture score to its actual composition-source semantics, not DLSS input.
+R10: temporal depth uses contradiction<50%, uninformative50–80%, consistency>=80%
+plus excitation; added15%/35%/60% moving-depth cases and motion regression.
+R11: mapped packed depth19/44 and HDR24/26, require explicit plane-format returns,
+and decode padded R24 depth while rejecting arbitrary typeless bytes.
+R12: explicit fail-closed unjittered-matrix assertion, test fixtures set it from
+known construction. R13: reuse owned DecodeBatch result in CaptureValidity.
+Release build and61/61 default tests passed; five targeted tests passed again
+after additional format/owned-batch/moving-motion regressions. No game deployment.
+PR38 review found nested cross-queue Signal can precede the copy after the outer
+occurrence ends, despite READY result; sent Claude exact trigger and requested
+producer correction. Peer review remains pending, not audit-ready yet.

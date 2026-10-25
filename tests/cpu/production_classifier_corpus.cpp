@@ -11,7 +11,7 @@ int main() {
     CameraAssociation cameras[2];
     for(unsigned k=0;k<2;++k) {
         auto& c=cameras[k];c.session=1;c.epoch=2;c.queue=4;c.ticket=frame-1+k;c.frame=frame-1+k;
-        c.qualified=c.complete=true;c.reset=k && reset;
+        c.view_projection_unjittered=true;c.qualified=c.complete=true;c.reset=k && reset;
         for(auto& v:c.view_projection) std::cin>>v;
         std::cin>>c.jitter_x>>c.jitter_y;
     }
@@ -45,7 +45,7 @@ int main() {
             ColorFrame color{idn,{}};color.color.resize(n);
             for(auto& p:color.color) for(auto& v:p) std::cin>>v;
             boundary.consumed_source={scope,scene_source,frame,0,width,height,true,true,true};
-            result=ConfirmSceneColor(window,o,color,boundary);
+            result=ConfirmPreHudComposite(window,o,color,boundary);
         }
         if(!std::cin) return 2;
         std::cout<<id<<' '<<static_cast<int>(result.result)<<' '<<result.checked<<' '<<result.mismatches<<'\n';

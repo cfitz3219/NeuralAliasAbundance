@@ -52,7 +52,7 @@ int main() {
         // is known. Live host code must establish this, not infer it from time.
         na::classifier::CameraAssociation camera{};
         camera.session=scope.session;camera.epoch=scope.epoch;camera.queue=s.info.queue;camera.ticket=s.info.queue_ticket;
-        camera.frame=frame+1;camera.qualified=camera.complete=true;
+        camera.frame=frame+1;camera.view_projection_unjittered=true;camera.qualified=camera.complete=true;
         camera.view_projection={{1,0,0,frame?-0.0625:0,0,1,0,0,0,0,1,frame?0.05:0,0,0,0,1}};
         REQUIRE(na::classifier::AcquireDepthFrame(s,camera,frames[frame]));
         d.WaitIdle(); // test-only allocator lifetime, never in production callback

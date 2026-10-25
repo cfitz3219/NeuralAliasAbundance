@@ -3,10 +3,30 @@
 #include "providers/classifier/temporal_depth.hpp"
 using namespace na::classifier;
 static DepthFrame frame(uint64_t id=10) {
-    DepthFrame f{}; f.camera={1,2,3,id,id,{{1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1}},0,0,1,true,true,false};
+    DepthFrame f{}; f.camera={1,2,3,id,id,{{1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1}},0,0,1,true,true,false,true};
     f.resource=4; f.width=16; f.height=8; f.depth.assign(128,0.4); return f;
 }
 int main() { return test::run({
+    {"moving surfaces use three bands instead of vetoing valid depth", [] {
+        const auto p=frame();
+        for(unsigned changed : {18u,42u,72u}) {
+            auto c=frame(11);c.camera.view_projection[3]=-0.125;
+            unsigned n=0;
+            for(size_t i=0;i<c.depth.size() && n<changed;++i)
+                if(i%16!=15) {c.depth[i]=0.6;++n;}
+            const auto r=CheckTemporalDepth(p,c);
+            CHECK(r.checked==120 && r.inliers==120-changed);
+            CHECK(r.verdict==(changed==18 ? TemporalVerdict::Consistent :
+                changed==42 ? TemporalVerdict::Uninformative : TemporalVerdict::Contradicted));
+        }
+    }},
+    {"unknown or jittered matrix convention cannot qualify depth", [] {
+        auto p=frame(),c=frame(11);c.camera.view_projection[3]=-0.125;
+        c.camera.view_projection_unjittered=false;
+        CHECK(CheckTemporalDepth(p,c).verdict==TemporalVerdict::Unavailable);
+        c.camera.view_projection_unjittered=true;p.camera.view_projection_unjittered=false;
+        CHECK(CheckTemporalDepth(p,c).verdict==TemporalVerdict::Unavailable);
+    }},
     {"translated camera corroborates independent depth versions and estimates overlap", [] {
         const auto p=frame(); auto c=frame(11); c.camera.view_projection[3]=-0.125;
         const auto r=CheckTemporalDepth(p,c);

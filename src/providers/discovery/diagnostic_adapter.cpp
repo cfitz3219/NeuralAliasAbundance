@@ -5,6 +5,7 @@
 #include "host_dx12/observe/producers.hpp"
 #include "capture_validity.hpp"
 #include "sample_acquisition.hpp"
+#include "resource_formats.hpp"
 #include "providers/classifier/signal_candidates.hpp"
 #include "providers/camera/matrix_candidates.hpp"
 #include <cstdio>
@@ -45,12 +46,7 @@ void PathFromModule() {
     wcscat_s(ini_path,L"NeuralAliasHost.ini");
 }
 na::classifier::Format Format(uint32_t f) {
-    if(f==40 || f==45 || f==55 || f==20) return na::classifier::Format::Depth;
-    if(f==39 || f==41 || f==53 || f==54 || f==56) return na::classifier::Format::ScalarFloat;
-    if(f==2 || f==10) return na::classifier::Format::ColorFloat;
-    if(f==28 || f==29 || f==87 || f==91) return na::classifier::Format::ColorUnorm;
-    if(f==16 || f==34) return na::classifier::Format::TwoChannelFloat;
-    return na::classifier::Format::Unknown;
+    return na::discovery::ResourceFormat(f);
 }
 template<class T> T Read(const unsigned char* p) { T value{};std::memcpy(&value,p,sizeof(value));return value; }
 void JsonStrings(FILE* out,const std::vector<std::string>& strings) {
@@ -114,7 +110,7 @@ void __cdecl Sink(const na_event_batch* batch,void* user) {
         if(na_observe_query_status(&status)!=NA_OK) return;
         const size_t bytes=size_t(batch->header_bytes)+batch->payload_bytes;
         const auto decoded=na::discovery::DecodeBatch(batch,bytes);
-        c.validity.Consume(batch,bytes,status);
+        c.validity.Consume(decoded,status);
         ++c.batches;
         if(!decoded.valid) {++c.malformed;return;}
         if(batch->session!=status.session || batch->epoch!=status.epoch) return;

@@ -8,7 +8,7 @@ Stop/resync must call `Clear`/`Scope`; the backend outlives the collector.
 Outputs retain the **returned** session, epoch, queue and queue ticket, resource,
 subresource and format. A request does not identify the eventual submission.
 Callers must also bound retained outputs; the four-lease limit is not an output
-history budget. Numeric decode currently supports D32_FLOAT/R32_FLOAT only,
+history budget. Numeric decode supports D32_FLOAT/R32_FLOAT and explicit R24_UNORM_X8_TYPELESS,
 including padded rows with an unpadded final row. Typeless/packed formats need
 explicit view interpretation before a decoder can be added.
 
@@ -22,7 +22,7 @@ snapshots cannot set `qualified` by themselves.
 without fixture world positions or a supplied visibility mask. It checks scope,
 adjacency, queue ordering, extents, finite values, invertibility, resets, sky,
 overlap and discontinuous interpolation footprints. Initial evidence thresholds
-are 16 checked pixels, 75% eligible coverage, 95% agreement and camera-induced
+are 16 checked pixels, 75% eligible coverage, 80% agreement and camera-induced
 motion on at least 25% of checked pixels. Stationary/jitter-only pairs remain
 uninformative. Reverse-Z is represented by the actual projection, not guessed.
 
@@ -48,7 +48,7 @@ No game deployment or live activation is part of this checkpoint.
 
 `classifier/production_checks.hpp` now combines metadata and content checks:
 `ConfirmDepth` ties the main-scene write to temporal depth evidence;
-`ConfirmSceneColor` checks a preserved source actually consumed by the final
+`ConfirmPreHudComposite` checks a preserved source actually consumed by the final
 composition against final color outside bounded later overlay draws; and
 `ConfirmMotion` derives the visibility estimate from depth/camera agreement
 before evaluating candidate vectors. The latter requires no oracle stable mask.
@@ -62,3 +62,16 @@ reasons/coverage and accept observable data rather than fixture-only truth.
 Unknown camera association and overwritten scene sources remain legitimate
 per-game unknowns to report. A5's fixed fixture-v2 acceptance measurement is in
 docs/A5-ACCEPTANCE.md; generic host acquisition accuracy is a separate metric.
+
+## REVIEW-2 corrections
+
+Packed D32S8/D24S8 plans require the host to report plane 0 as R32_FLOAT /
+R24_UNORM_X8_TYPELESS respectively; arbitrary typeless bytes still refuse decode.
+The temporal checker contradicts below50% agreement, abstains from50% to80%,
+and requires80% plus excitation for Consistent. This tolerates moving surfaces
+without marking their pixels as agreed. The camera must explicitly assert
+view_projection_unjittered; unknown/jittered captures cannot silently double-apply
+jitter. A6/J1 callers must establish that convention before setting the assertion.
+ConfirmPreHudComposite qualifies display-space pre-HUD composition only, not a
+render-resolution pre-post-processing DLSS color input. The fixture's preserved
+color is that composition source; see A5-ACCEPTANCE for the scope of its score.

@@ -39,6 +39,13 @@ struct AcquiredSample {
     std::vector<uint8_t> bytes;
 };
 inline bool SampleId(uint64_t id) { return id && id != UINT64_MAX; }
+// Packed depth plane 0 is returned with an explicit interpretation by the host.
+// Do not accept arbitrary typeless payloads based on their byte size.
+inline uint32_t SampleFormat(uint32_t resource_format) {
+    if(resource_format==19 || resource_format==20) return 41; // D32S8 family -> R32_FLOAT
+    if(resource_format==44 || resource_format==45) return 46; // D24S8 family -> R24_UNORM_X8_TYPELESS
+    return resource_format;
+}
 
 // Single worker owns this object and its backend; backend must outlive it.
 // At most four whole-subresource leases, each at most 64 MiB. Consumers own
@@ -85,7 +92,7 @@ public:
             if (rc!=NA_OK || s.info.status!=NA_SAMPLE_READY) s.status=AcquisitionStatus::HostFailure;
             else if (s.info.session!=session_ || s.info.epoch!=epoch_) s.status=AcquisitionStatus::ScopeMismatch;
             else if (s.info.resource!=it->plan.resource || s.info.subresource!=it->plan.subresource ||
-                s.info.width!=it->plan.width || s.info.height!=it->plan.height || s.info.format!=it->plan.format ||
+                s.info.width!=it->plan.width || s.info.height!=it->plan.height || s.info.format!=SampleFormat(it->plan.format) ||
                 s.info.x || s.info.y || !SampleId(s.info.queue) || !SampleId(s.info.queue_ticket) ||
                 !s.info.row_pitch || !s.info.data_bytes || s.info.data_bytes>max_bytes) s.status=AcquisitionStatus::ShapeMismatch;
             else {
@@ -101,20 +108,25 @@ public:
     }
 };
 
-// Exact scalar float decoding only; typeless/packed/planar data requires an
-// explicit qualified view interpretation, never guessed from byte count.
+// Scalar float or explicitly identified 24-bit depth plane; never infer a
+// typeless/packed interpretation from byte count.
 inline bool DecodeScalarDepth(const AcquiredSample& s,std::vector<double>& depth) {
     depth.clear();
     const auto& i=s.info;
     if (s.status!=AcquisitionStatus::Ready || i.status!=NA_SAMPLE_READY || i.data_bytes!=s.bytes.size() ||
-        (i.format!=40 && i.format!=41) || // D32_FLOAT / R32_FLOAT
+        (i.format!=40 && i.format!=41 && i.format!=46) || // D32_FLOAT / R32_FLOAT / R24_UNORM_X8_TYPELESS
         !i.width || !i.height || i.width>4096 || i.height>4096 ||
         uint64_t(i.width)*4>i.row_pitch ||
         uint64_t(i.row_pitch)*(i.height-1)+uint64_t(i.width)*4>s.bytes.size()) return false;
     depth.reserve(size_t(i.width)*i.height);
     for(uint32_t y=0;y<i.height;++y) for(uint32_t x=0;x<i.width;++x) {
-        float value{}; std::memcpy(&value,s.bytes.data()+size_t(y)*i.row_pitch+size_t(x)*4,4);
-        depth.push_back(value);
+        const auto* pixel=s.bytes.data()+size_t(y)*i.row_pitch+size_t(x)*4;
+        if(i.format==46) {
+            uint32_t raw{};std::memcpy(&raw,pixel,4);
+            depth.push_back(double(raw & 0xFFFFFFu)/double(0xFFFFFFu));
+        } else {
+            float value{};std::memcpy(&value,pixel,4);depth.push_back(value);
+        }
     }
     return true; // Numeric validity is assessed by the evidence check, not hidden.
 }

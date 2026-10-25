@@ -6,13 +6,19 @@ positives and zero false negatives**. `Supported` is a diagnostic corroborated
 candidate; it does not authorize effect submission or claim universal semantics.
 
 This measures `Describe` metadata gating followed by `ConfirmDepth` or
-`ConfirmSceneColor` in `src/providers/classifier/production_checks.hpp`, not only
+`ConfirmPreHudComposite` in `src/providers/classifier/production_checks.hpp`, not only
 the older oracle-assisted content checks. The scorer provides no class label to
 the C++ classifier. Candidate IDs and ordering are randomized deterministically.
 
 Corpus: fixture-v2 frames1–11 at64x48,96x64 and160x96, eight candidates per case:
 main depth, preserved scene color, shadow depth, clear depth, wrong depth
 convention, HUD final color, stale history and unrelated postprocess color.
+Here the fixture's "preserved scene color" is exactly the display-space source
+of final HUD composition: the fixture has no intervening tone-map/upscale chain.
+The checker is therefore named `ConfirmPreHudComposite`. Its positive result
+does not qualify render-resolution, pre-post-processing color for DLSS. That
+separate semantic input still requires render-pass and post-process lineage;
+the 264-case score does not measure that acquisition or qualification.
 Camera cuts require depth abstention; scene-color evidence remains current.
 Observations contain producing version/write order, the composition source
 identity and overlay scissor bounds from the fixture's render graph. Content

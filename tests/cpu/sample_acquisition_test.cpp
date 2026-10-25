@@ -1,6 +1,7 @@
 // reconstructed 2026-10: worker ownership, completion provenance and packed rows.
 #include "test_support.hpp"
 #include "providers/discovery/sample_acquisition.hpp"
+#include "providers/discovery/resource_formats.hpp"
 using namespace na::discovery;
 struct Fake : SampleApi {
     na_sample_info info{};
@@ -27,6 +28,30 @@ struct Fake : SampleApi {
 };
 static SamplePlan plan() { return {3,0,2,2,40}; }
 int main() { return test::run({
+    {"common HDR and packed-depth inventory formats are acquisition candidates", [] {
+        using na::classifier::Format;
+        CHECK(ResourceFormat(19)==Format::Depth && ResourceFormat(44)==Format::Depth);
+        CHECK(ResourceFormat(26)==Format::ColorFloat && ResourceFormat(24)==Format::ColorUnorm);
+        CHECK(ResourceFormat(0)==Format::Unknown);
+    }},
+    {"packed depth plans require the host's explicit plane format and padded decoding", [] {
+        for(uint32_t resource_format : {19u,20u,44u,45u}) {
+            Fake f; SampleAcquisition a(f);a.Scope(1,2);
+            auto p=plan();p.format=resource_format;CHECK(a.Begin(p));
+            f.info.format=SampleFormat(resource_format);
+            if(f.info.format==46) {
+                const uint32_t words[]={0xAA000000u,0x55FFFFFFu,0xCC800000u,0xDD400000u};
+                std::memcpy(f.bytes.data(),words,8);std::memcpy(f.bytes.data()+256,words+2,8);
+            }
+            auto out=a.Pump();CHECK(out.size()==1 && out[0].status==AcquisitionStatus::Ready);
+            std::vector<double> depth;CHECK(DecodeScalarDepth(out[0],depth));
+            if(f.info.format==46) {NEAR(depth[0],0,1e-7);NEAR(depth[1],1,1e-7);NEAR(depth[2],0.5,1e-7);}
+            else NEAR(depth[3],0.4,1e-6);
+            out[0].info.format=39;CHECK(!DecodeScalarDepth(out[0],depth));
+        }
+        Fake f;SampleAcquisition a(f);a.Scope(1,2);auto p=plan();p.format=19;CHECK(a.Begin(p));
+        f.info.format=19;CHECK(a.Pump()[0].status==AcquisitionStatus::ShapeMismatch);
+    }},
     {"pending leases never read and completion keeps actual ticket and owned padded rows", [] {
         Fake f; SampleAcquisition a(f); a.Scope(1,2); CHECK(a.Begin(plan()));
         f.info.status=NA_SAMPLE_IN_FLIGHT; CHECK(a.Pump().empty() && f.reads==0);

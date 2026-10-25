@@ -40,9 +40,13 @@ public:
         host_invalid_ = s.inventory_invalid != 0;
     }
     void Consume(const void* bytes, size_t size, const na_observe_status& status) {
+        Consume(DecodeBatch(bytes,size),status);
+    }
+    // Only an unmodified DecodeBatch result; its owned bytes stay alive for
+    // this call. Reuse worker decoding instead of copying snapshot payloads twice.
+    void Consume(const DecodedBatch& batch, const na_observe_status& status) {
         ObserveStatus(status);
         if (!status_valid_) return;
-        const auto batch = DecodeBatch(bytes,size);
         if (!batch.valid) { foundational_bad_ = true; return; }
         if (batch.header.session != session_ || batch.header.epoch != epoch_) return;
         if (final_) { foundational_bad_ = true; return; }
