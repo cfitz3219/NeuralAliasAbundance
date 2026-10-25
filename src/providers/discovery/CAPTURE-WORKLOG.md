@@ -97,3 +97,8 @@ Review accepts pre-submit acquisition, operation-time scope checks, typeless dep
 ## 2026-10-24 — PR35 arrived during final checkpoint; continued integration
 
 Final coordination pull revealed new47b1208/PR35, so continued instead of ending on stale pending status. Integrated notification plus thread-handle teardown fixes, kept Claude producer ownership, and ran full Release/default49/49 tests successfully, zero skips. Mandatory wakeup regression now passes; earlier default exclusion/known-failure statements are superseded at this tree. Logs build-review3.log and ctest-review3-full.log. Sent remaining DuplicateHandle-failure teardown case to Claude; no injected failure or general live qualification claimed. Latest combined CI pending.
+
+## 2026-10-24 — PR36 reviewed and tested
+
+Integrated c15881d after all3 CI jobs passed for8ee89dc. Immortal thread ownership removes handle-duplication fallback; injected creation failure refuses/retries correctly. Full Release and expanded54-test run:53 passed,1 missing-upscaler-runtime skip,0 failed. Includes all49 non-GPU-labelled tests plus real DLSS/device-loss. See docs/C9B-REVIEW.md for evidence and remaining qualifications. Latest combined CI pending; no deployment or consumer enablement.
+
