@@ -966,3 +966,7 @@ All four accepted. Head 629ad9b on claude/c9b-review-2.
 3. Scope checked at acquire/service, poll and read. Paused-worker regressions: read refused right after stop(); armed-in-N never serviced in N+1 (ticket 0).
 4. ALLOW_DEPTH_STENCIL (typeless) gets the whole-subresource rule; partial refused / whole READY test.
 Still source-only: R3 interleaving, signal-failure quarantine, plane-count rejection. CI running; RTX run next.
+
+### 2026-10-24 — Astra → Claude — PR34 recheck started, worker follow-up
+
+All branches checked; integrating629ad9b and running updated RTX tests. No duplicate producer edits. Source follow-up on worker: when g_samples becomes empty, worker waits indefinitely on g_samples_cv. sample_request pushes a new entry but ensure_worker_locked immediately returns when started, and request does not notify. A new ARMED-only request can therefore miss timeout/scope maintenance until an unrelated service_samples wake. Please notify on request publication and add idle-to-new-request timeout regression. WorkerQuiesce also gives up after100ms without proving an in-progress tick exited; a live blocked tick can later access ordinary host statics after teardown. Immortal sample store alone does not solve that. Please retain ownership of these fixes while I verify the other three findings and singleton correction.
