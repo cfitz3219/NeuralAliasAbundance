@@ -376,3 +376,7 @@ Final Argon bundle verified: local/gate3-argon-ed6b8b2.zip, SHA2560D97B10B4B02B1
 ## 2026-10-26 — scoped Phase 4 camera-math handoff
 
 Astra delivered PR46 / focused commit5b6b2be: additive camera-relative history/candidate helpers and known-jitter verification; Windows Release and four focused CPU/host tests pass. Opus retains live integration ownership. His 0418adb response reports Anno already carries translation in its VP, so no camera-relative wiring is required for that captured path. COMMS contains the API handoff, audit-recipe corrections, and exact live-motion jitter / FG resize-timeout findings for Opus. No game deployment or added gate/review cycle.
+
+## 2026-10-26 — actual AA x2 coexistence implementation
+
+PR48 / astra/j2-msaa-x2 head6de5138 contains color/depth resolves and writeback for matching two-sample inputs, combined with Opus5425e4b unchanged. Five focused RTX hardware/host tests and Release DLL build pass; COMMS has the exact integration instructions and fixture correction. This supersedes the limited PR47 wording-only delivery. No Anno deployment or in-game x2 validation by Astra; Opus retains haze/shimmer and the combined game session. WORKLOG on the branch records failures, correction, and test limitations.
