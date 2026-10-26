@@ -3,7 +3,7 @@
 // Discovery (the adapter's UniversalHeuristics) publishes the scene depth and
 // the scene colour drawn with it (na::observe::SetLiveSelection). At each game
 // submission this module finds the LAST list in the batch that drew the scene
-// (it references both), and inserts ONE NeuralAlias command list right after
+// (it binds that colour as a render target with that depth), and inserts ONE NeuralAlias command list right after
 // it in the same ExecuteCommandLists call. The game's own lists are never
 // edited, so no game command-list state has to be restored. The inserted list:
 //   1. copies depth plane 0 into an R32F texture (DLSS and the motion arbiter);

@@ -380,7 +380,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     }
     int scene = -1;
     for (UINT i = 0; i < count; ++i)
-        if (lists[i] && na::observe::ListReferences(lists[i], color_id) && na::observe::ListReferences(lists[i], depth_id)) scene = static_cast<int>(i);
+        if (lists[i] && na::observe::ListRendersTo(lists[i], color_id, depth_id)) scene = static_cast<int>(i); // the last list that drew the scene (not a later one that merely transitions it)
     ID3D12GraphicsCommandList* ours = nullptr;
     if (scene < 0) {
         ++g.stats.no_scene_list;

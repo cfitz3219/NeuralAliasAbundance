@@ -79,6 +79,8 @@ struct ListState {
     // every resource they reference. Bounded; overflow clears uses_complete.
     std::vector<na_object_id> uses;
     bool uses_complete = true;
+    // (render target, depth) pairs bound together by OMSetRenderTargets in this recording (under bind_m).
+    std::vector<std::pair<na_object_id, na_object_id>> targets;
 };
 
 struct Obj {
@@ -1864,6 +1866,7 @@ struct On<sl::list::Reset> {
                     ls->evidence_complete = true;
                     ls->uses.clear();
                     ls->uses_complete = true;
+                    ls->targets.clear();
                 }
                 ls->root_sig[0] = ls->root_sig[1] = nullptr;
                 ls->coverage_complete.store(cov == na::hooking::variants::Coverage::Complete);
@@ -2295,6 +2298,12 @@ struct On<sl::list::OMSetRenderTargets> {
         with_list_state(l, [&](ListState& ls) {
             std::lock_guard<std::mutex> bl(ls.bind_m);
             for (uint32_t i = 0; i < m; ++i) add_use_locked(ls, refs[i].resource);
+            if (dsv && m > 0 && ls.targets.size() < 4096) {
+                const na_object_id ds = refs[m - 1].resource;
+                for (uint32_t i = 0; i + 1 < m; ++i)
+                    if (ds && refs[i].resource && (ls.targets.empty() || ls.targets.back() != std::make_pair(refs[i].resource, ds)))
+                        ls.targets.push_back({refs[i].resource, ds});
+            }
         });
     }
 };
@@ -3700,6 +3709,16 @@ bool ListReferences(ID3D12CommandList* list, na_object_id id)
     if (!ls || !ls->recording_observed.load()) return false;
     std::lock_guard<std::mutex> bl(ls->bind_m);
     return std::find(ls->uses.begin(), ls->uses.end(), id) != ls->uses.end();
+}
+bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id depth)
+{
+    if (!color || !depth) return false;
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return std::find(ls->targets.begin(), ls->targets.end(), std::make_pair(color, depth)) != ls->targets.end();
 }
 bool ListLastState(ID3D12CommandList* list, na_object_id id, uint32_t* state)
 {
