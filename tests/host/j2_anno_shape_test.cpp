@@ -5,7 +5,9 @@
 //     scene drawn into slice 1 while slice 0 holds something else and the scene list never
 //     transitions colour or depth: their states are carried from an earlier
 //     submission (the known-state store);
-//   - the camera sits in a 768-byte DESCRIPTOR-TABLE CBV at +336, inverse at +400;
+//   - the camera sits in a 768-byte DESCRIPTOR-TABLE CBV at +336, its inverse NOT
+//     adjacent (+208: Anno run 7 found the camera but J1 never jittered, because
+//     the inverse was assumed to sit 64 bytes away);
 //   - a depth pre-pass in an EARLIER batch, with its own root signature (a root
 //     CBV), binds its own copy of the camera: J1 must jitter both identically.
 // The DLAA list must close (no latch), DLSS gets the frame, the result lands in
@@ -194,10 +196,10 @@ int main()
         M inv{};
         Inverse(vp, inv);
         Store(cpu + kBlock + kVp, vp);
-        Store(cpu + kBlock + kVp + 64, inv);
+        Store(cpu + kBlock + kVp - 128, inv);
         for (int i = 0; i < 300; ++i) cpu[kBlock + i] = static_cast<uint8_t>(i * 13); // other constants before the camera
         Store(cpu + kPre + kVp, vp); // the pre-pass's own copy of the camera
-        Store(cpu + kPre + kVp + 64, inv);
+        Store(cpu + kPre + kVp - 128, inv);
         prepass.Reset(); // earlier batch: depth only, its own root signature
         prepass.list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
         prepass.list->SetGraphicsRootSignature(rs_pre.Get());
@@ -248,6 +250,7 @@ int main()
     st = na::j2::GetStats();
     CHECK(st.frames == 2 && fake::evals == evals0 + 2);
     CHECK(st.jitter_writes >= 2);
+    CHECK(st.camera_inv_delta == -128 && st.camera_learned_hits >= 1);
     CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
     const double jx = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_X), jy = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_Y);
     CHECK((jx != 0.0 || jy != 0.0) && std::fabs(jx) < 0.5 && std::fabs(jy) < 0.5);

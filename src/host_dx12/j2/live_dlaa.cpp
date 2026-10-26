@@ -60,6 +60,7 @@ struct State {
     uint64_t submitted_frame = 0;   // last interval that actually submitted DLAA
     int64_t camera_offset = -1; // learned offset of the ViewProjection inside its block
     int64_t camera_param = -1;  // learned root parameter that binds the camera block
+    int64_t camera_inv_delta = 64; // learned byte distance from the ViewProjection to its inverse
     bool camera_table = false;  // ... through a descriptor table
     // J1: this frame's injected camera jitter (see jitter_batch).
     struct Jitter {
@@ -236,7 +237,7 @@ bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& bytes,
         na::camera::Candidate c{};
         if (!na::camera::ViewProjection(m, c)) continue;
         if (!slot && !same_camera(m)) continue;
-        for (int64_t d : {64, -64}) {
+        for (int64_t d : {g.camera_inv_delta}) { // the learned inverse position (Anno: not adjacent)
             const int64_t io = g.camera_offset + d;
             if (io < 0 || static_cast<uint64_t>(io) + 64 > n) continue;
             const auto inv = na::camera::LoadMatrix(bytes, static_cast<size_t>(io), layout);
@@ -347,7 +348,7 @@ bool check_learned(const std::vector<uint8_t>& bytes, na::camera::Matrix* vp, bo
         const auto m = na::camera::LoadMatrix(bytes, static_cast<size_t>(g.camera_offset), layout);
         na::camera::Candidate c{};
         if (!na::camera::ViewProjection(m, c)) continue;
-        for (int64_t d : {64, -64}) {
+        for (int64_t d : {g.camera_inv_delta}) { // the learned inverse position (Anno: not adjacent)
             const int64_t off = g.camera_offset + d;
             if (off < 0 || static_cast<uint64_t>(off) + 64 > n) continue;
             if (na::camera::IsInversePair(m, na::camera::LoadMatrix(bytes, static_cast<size_t>(off), layout))) {
@@ -421,6 +422,7 @@ bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth
         s.sync = na::camera::Sync::AppSyncUnknown;
         s.bytes.assign(bytes.begin(), bytes.begin() + n);
         if (learned(o) && check_learned(s.bytes, vp, reversed)) {
+            ++g.stats.camera_learned_hits;
             const size_t lo = static_cast<size_t>(g.camera_offset);
             g_injected = g.jit.valid && lo + 64 <= s.bytes.size() &&
                          (!std::memcmp(s.bytes.data() + lo, g.jit.jvp[0], 64) || !std::memcmp(s.bytes.data() + lo, g.jit.jvp[1], 64));
@@ -432,6 +434,9 @@ bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth
             if (c.kind == na::camera::Kind::ViewProjection) ++g_cd.vp;
             if (c.kind != na::camera::Kind::ViewProjection || !c.has_inverse_pair) continue;
             g.camera_offset = static_cast<int64_t>(c.byte_offset);
+            g.camera_inv_delta = static_cast<int64_t>(c.inverse_byte_offset) - static_cast<int64_t>(c.byte_offset);
+            g.stats.camera_inv_delta = g.camera_inv_delta;
+            ++g.stats.camera_scans;
             g.camera_param = static_cast<int64_t>(o->param);
             g.camera_table = o->table;
             g.stats.camera_offset = c.byte_offset;
@@ -623,6 +628,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     e.reset = cam.camera_cut || resize || g.resume_reset;
     e.hdr = is_float_color(cf);
     e.depth_inverted = reversed;
+    g.stats.depth_reversed = reversed;
     e.auto_exposure = true;
     const bool evaluated = na::dlss::Evaluate(l, e);
     if (!evaluated) ++g.stats.dlss_failed;
