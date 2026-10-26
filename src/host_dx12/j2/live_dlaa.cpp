@@ -467,7 +467,14 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         if (dr) reason(dr);
         else if (record(lists, static_cast<UINT>(scene), depth_id, color_id, &ours)) {
             ++g.stats.frames;
-            reason("Live DLAA is running.");
+            g.stats.later_passes = na::observe::ListTargetsAfter(lists[scene], color_id, depth_id);
+            if (g.stats.later_passes) {
+                char why[160];
+                std::snprintf(why, sizeof why, "Live DLAA is running (inserted after the scene list; it draws %u other targets after the scene).", g.stats.later_passes);
+                reason(why);
+            } else {
+                reason("Live DLAA is running.");
+            }
         }
     }
     g.stats.active = ours != nullptr;

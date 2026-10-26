@@ -39,7 +39,7 @@ struct Consumer {
     FILE* log{};
     std::wstring evidence_dir;
     uint64_t saved_bytes{};
-    uint64_t session{},epoch{},batches{},events{},malformed{},submissions{},presents{},snapshots{},matrices{},samples{},last_log{},last_sample{};
+    uint64_t session{},epoch{},batches{},events{},malformed{},submissions{},presents{},snapshots{},matrices{},samples{},last_log{},last_sample{},last_pick{};
     bool overflow{}; unsigned reports{};
     uint64_t draws{}, binds{}, unresolved_views{}, captured_snapshots{}, truncated_snapshots{}, unmapped_snapshots{}, gpu_snapshots{}, matrix_scans{};
 };
@@ -73,6 +73,27 @@ void JsonStrings(FILE* out,const std::vector<std::string>& strings) {
         std::fputc('"',out);
     }
     std::fputc(']',out);
+}
+void PublishLivePicks(Consumer& c) {
+    // J2: depth with a positive generic_depth score; colour among the targets drawn
+    // with that depth. Several can be (a G-buffer and the lit scene, Anno: RGBA16F
+    // in a later list and R11G11B10F earlier): of those with at least a quarter of
+    // the strongest pairing, the one written last in the frame is the scene colour
+    // that the post-processing reads.
+    const auto d=c.heuristics.RankDepth(1);
+    const uint64_t depth=!d.empty() && d[0].score>0 ? d[0].resource : 0;
+    uint64_t color=0;
+    if(depth) {
+        const auto ks=c.heuristics.RankSceneColor(8);
+        uint64_t strongest=0;
+        for(const auto& k:ks) if(k.paired_depth==depth && k.paired_draws>strongest) strongest=k.paired_draws;
+        uint64_t best_ticket=0;
+        for(const auto& k:ks) {
+            if(k.paired_depth!=depth || !strongest || k.paired_draws*4<strongest) continue;
+            if(!color || k.last.ticket>best_ticket) {color=k.resource;best_ticket=k.last.ticket;}
+        }
+    }
+    na::observe::SetLiveSelection(depth,color);
 }
 void Report(Consumer& c,const na_observe_status& status,const char* phase) {
     if(!c.log) return;
@@ -124,14 +145,6 @@ void Report(Consumer& c,const na_observe_status& status,const char* phase) {
             ++rank,k.resource,k.width,k.height,k.format,k.score,k.draws,k.hud_draws,k.written_before_hud?"true":"false",k.receives_hud?"true":"false",k.paired_depth,k.paired_draws,
             k.last.queue,k.last.ticket,k.last.list,k.last.generation,ReducerMatch(k.last,k.resource)?"true":"false");
         JsonStrings(c.log,k.reasons);std::fputs("}\n",c.log);
-    }
-    {
-        // J2: publish the live picks (depth with a positive generic_depth score;
-        // colour only when it was drawn with that depth). Read by the live DLAA path.
-        const auto d=c.heuristics.RankDepth(1);const auto k=c.heuristics.RankSceneColor(1);
-        const uint64_t depth=!d.empty() && d[0].score>0 ? d[0].resource : 0;
-        const uint64_t color=depth && !k.empty() && k[0].paired_draws ? k[0].resource : 0;
-        na::observe::SetLiveSelection(depth,color);
     }
     rank=0;
     for(const auto& b:c.heuristics.RankCameraBlocks(5))
@@ -326,6 +339,7 @@ void __cdecl Sink(const na_event_batch* batch,void* user) {
                 matched?"true":"false",matched?matched->window.scope.list:0,matched?matched->window.scope.recording:0,
                 sample.info.width,sample.info.height,sample.info.row_pitch,evidence_file);
         }
+        if(now-c.last_pick>=250) {c.last_pick=now;PublishLivePicks(c);} // not tied to the log cadence (resizes, menus)
         if(now-c.last_log>=(c.reports<180?2000u:10000u) || (batch->batch_flags&NA_BATCHF_FINAL)) {
             c.last_log=now;Report(c,status,(batch->batch_flags&NA_BATCHF_FINAL)?"stopped":"observing");
         }
