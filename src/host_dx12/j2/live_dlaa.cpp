@@ -371,6 +371,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         forward(queue, count, lists);
         return;
     }
+    const na::observe::HostWorkScope host; // our objects and our list are never observed as the game's
     std::unique_lock<std::mutex> lock(g.m);
     ++g.stats.submissions;
     uint64_t depth_id = 0, color_id = 0;

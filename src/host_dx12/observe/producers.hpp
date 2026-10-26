@@ -107,6 +107,17 @@ bool ListReferences(ID3D12CommandList* list, na_object_id id);            // the
 bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id depth);
 bool ListLastState(ID3D12CommandList* list, na_object_id id, uint32_t* state); // last whole-resource transition in it
 uint32_t ReadBuffer(na_object_id res, uint64_t offset, void* dst, uint32_t n); // CPU-visible buffer bytes (0 = unavailable)
+// While alive on this thread, D3D12 objects created and commands recorded are the
+// host's own (never observed as the game's), e.g. J2's inserted command list.
+class HostWorkScope {
+public:
+    HostWorkScope();
+    ~HostWorkScope();
+    HostWorkScope(const HostWorkScope&) = delete;
+    HostWorkScope& operator=(const HostWorkScope&) = delete;
+private:
+    bool prev_;
+};
 ID3D12Resource* AcquireResource(na_object_id id);                         // AddRef'd, or null
 // Current discovery picks (written by the discovery adapter, read by J2).
 void SetLiveSelection(uint64_t depth, uint64_t color);

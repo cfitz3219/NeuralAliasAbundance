@@ -3766,6 +3766,8 @@ uint32_t ReadBuffer(na_object_id res, uint64_t offset, void* dst, uint32_t n)
     reread->Release();
     return ok ? n : 0;
 }
+HostWorkScope::HostWorkScope() : prev_(t_host_work) { t_host_work = true; }
+HostWorkScope::~HostWorkScope() { t_host_work = prev_; }
 ID3D12Resource* AcquireResource(na_object_id id)
 {
     std::shared_lock<std::shared_mutex> lock(g_m);
