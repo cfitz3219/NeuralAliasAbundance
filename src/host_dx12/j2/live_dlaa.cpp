@@ -266,7 +266,10 @@ bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& bytes,
 // must see the same jittered camera as the scene, or depth tests disagree.
 void jitter_batch(ID3D12CommandList* const* lists, UINT count)
 {
-    if (!g.jitter_on || g.camera_param < 0 || g.camera_offset < 0 || !g.stats.active || !g.w) return;
+    // Only while DLAA is producing frames: the previous game frame submitted one
+    // (a batch without the scene must not count as "not running").
+    const bool running = g.submitted_frame && g.frame == g.submitted_frame + 1;
+    if (!g.jitter_on || g.camera_param < 0 || g.camera_offset < 0 || !running || !g.w) return;
     struct JB { uint64_t res, off; uint32_t size; bool slot; };
     std::map<std::pair<uint64_t, uint64_t>, JB> blocks;
     for (UINT i = 0; i < count && blocks.size() < 256; ++i) {
