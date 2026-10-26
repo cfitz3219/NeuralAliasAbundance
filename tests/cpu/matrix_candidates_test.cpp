@@ -107,5 +107,29 @@ int main() { return test::run({
         CHECK(CompareViews(prior,a,next,b,true,0.5,0.5)==Continuity::Discontinuity);
         CHECK(CompareViews(prior,a,next,b,false,0.5,0.5)==Continuity::Unknown);
         ++next.epoch; CHECK(CompareViews(prior,a,next,b,true,0.5,0.5)==Continuity::Unknown);
+    }},
+    {"C12: a view-projection stored with its inverse is marked as an inverse pair", [] {
+        Matrix v{0.8,0,0.6,-12,0,1,0,3,-0.6,0,0.8,-20,0,0,0,1};
+        const auto p=perspective(true);Matrix vp{};
+        for(size_t r=0;r<4;++r) for(size_t c=0;c<4;++c) for(size_t k=0;k<4;++k) vp[r*4+c]+=p[r*4+k]*v[k*4+c];
+        Matrix inv{};CHECK(Invert(vp,inv));
+        CHECK(IsInversePair(vp,inv) && !IsInversePair(vp,vp));
+        for(bool column:{false,true}) {
+            // [VP][InvVP] packed like a per-view constant buffer (16-byte registers).
+            auto s=snapshot(vp,column);const auto si=snapshot(inv,column);
+            s.bytes.insert(s.bytes.end(),si.bytes.begin(),si.bytes.end());
+            const auto scan=FindMatrices(s);
+            bool paired=false;
+            for(const auto& c:scan.candidates)
+                if(c.kind==Kind::ViewProjection && c.layout==(column?Layout::ColumnMajor:Layout::RowMajor) && c.byte_offset==16)
+                    paired=c.has_inverse_pair && c.inverse_byte_offset==16+64;
+            CHECK(paired && scan.inverse_pairs>=1);
+        }
+        // Alone, or next to an unrelated matrix, a view-projection has no pair.
+        auto lone=snapshot(vp);const Matrix other{2,0,0,1,0,3,0,2,0,0,4,3,0,0,0,1};const auto so=snapshot(other);
+        lone.bytes.insert(lone.bytes.end(),so.bytes.begin(),so.bytes.end());
+        const auto none=FindMatrices(lone);
+        bool any=false;for(const auto& c:none.candidates) if(c.kind==Kind::ViewProjection && c.byte_offset==16) any=c.has_inverse_pair;
+        CHECK(!any);
     }}
 }); }

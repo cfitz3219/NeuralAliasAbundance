@@ -27,11 +27,17 @@ struct Candidate {
     double near_plane{}, far_plane{}, handedness{};
     bool reversed{};
     std::array<double, 3> position{};
+    // C12: the candidate's inverse was found in the same snapshot (M x M' = I).
+    // Engines that reconstruct positions from depth upload a camera matrix
+    // together with its inverse; object constants rarely carry one.
+    bool has_inverse_pair{};
+    uint64_t inverse_byte_offset{};
 };
 struct Scan {
     std::vector<Candidate> candidates;
     bool unavailable{}, capacity_exceeded{}, partial_capture{};
     bool projection_overflow{}, rigid_overflow{}, combined_overflow{}, inverse_overflow{};
+    uint32_t inverse_pairs{}; // candidates with a matching inverse (C12)
     Sync sync{Sync::Unknown};
 };
 inline bool Known(uint64_t value) { return value && value!=UINT64_MAX; }
@@ -121,6 +127,39 @@ inline bool InverseViewProjection(const Matrix& m,Candidate& c) {
     Matrix inverse{};if(!Invert(m,inverse) || !ViewProjection(inverse,c)) return false;
     c.kind=Kind::InverseViewProjection;c.matrix=m;return true;
 }
+// C12: A x B within `tol` of the identity (row-major storage).
+inline bool IsInversePair(const Matrix& a,const Matrix& b,double tol=1.5e-2) {
+    if(!Finite(a) || !Finite(b)) return false;
+    for(size_t r=0;r<4;++r) for(size_t col=0;col<4;++col) {
+        double v=0;for(size_t k=0;k<4;++k) v+=a[r*4+k]*b[k*4+col];
+        if(!std::isfinite(v) || std::abs(v-(r==col?1.0:0.0))>tol) return false;
+    }
+    return true;
+}
+inline Matrix LoadMatrix(const std::vector<uint8_t>& bytes,size_t offset,Layout layout) {
+    Matrix m{};
+    for(size_t r=0;r<4;++r) for(size_t col=0;col<4;++col) {
+        float v{};std::memcpy(&v,bytes.data()+offset+(layout==Layout::RowMajor ? r*4+col : col*4+r)*4,4);
+        m[r*4+col]=v;
+    }
+    return m;
+}
+// Marks candidates whose inverse lies in the same snapshot, searched at 16-byte
+// steps (constant-buffer register packing) within 4 KiB of the candidate.
+inline void FindInversePairs(const Snapshot& s,Scan& result) {
+    if(s.bytes.size()<128) return;
+    for(auto& c:result.candidates) {
+        const uint64_t local=c.byte_offset-s.base_offset;
+        const uint64_t lo=local>4096 ? ((local-4096)&~uint64_t(15)) : 0;
+        const uint64_t hi=std::min<uint64_t>(s.bytes.size()-64,local+4096);
+        for(uint64_t off=lo;off<=hi;off+=16) {
+            if(off+64>local && off<local+64) continue; // overlaps the candidate itself
+            if(IsInversePair(c.matrix,LoadMatrix(s.bytes,static_cast<size_t>(off),c.layout))) {
+                c.has_inverse_pair=true;c.inverse_byte_offset=s.base_offset+off;++result.inverse_pairs;break;
+            }
+        }
+    }
+}
 inline Scan FindMatrices(const Snapshot& s,bool allow_partial_hypotheses=false) {
     Scan result{}; result.sync = s.sync;result.partial_capture=!s.complete;
     if (!Known(s.session) || !Known(s.epoch) || !Known(s.submission) || !Known(s.resource) || !Known(s.content_version) ||
@@ -166,6 +205,7 @@ inline Scan FindMatrices(const Snapshot& s,bool allow_partial_hypotheses=false) 
             }
         }
     }
+    FindInversePairs(s,result); // C12
     return result;
 }
 

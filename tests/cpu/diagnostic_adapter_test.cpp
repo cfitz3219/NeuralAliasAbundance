@@ -127,5 +127,8 @@ int main() {
     CHECK(text.find("\"matched_execution\":true")!=std::string::npos);
     CHECK(text.find("\"scalar_decoded\":true")!=std::string::npos);
     CHECK(text.find("\"type\":\"gpu_camera_hypothesis\"")!=std::string::npos);
+    CHECK(text.find("\"type\":\"heuristics\"")!=std::string::npos);     // C13 rankings always reported
+    CHECK(text.find("\"inverse_pairs\":")!=std::string::npos);
+    CHECK(text.find("classifier_reasons")==std::string::npos);            // R41-3: rankings never claim classifier evidence
     return test::finish("diagnostic_adapter");
 }

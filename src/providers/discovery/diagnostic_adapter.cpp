@@ -7,6 +7,7 @@
 #include "sample_acquisition.hpp"
 #include "resource_formats.hpp"
 #include "submission_evidence.hpp"
+#include "universal_heuristics.hpp"
 #include "providers/classifier/signal_candidates.hpp"
 #include "providers/camera/matrix_candidates.hpp"
 #include <cstdio>
@@ -27,6 +28,7 @@ struct Consumer {
     na::discovery::HostSampleApi api;
     na::discovery::SampleAcquisition acquisition{api};
     na::discovery::SubmissionEvidence execution;
+    na::discovery::UniversalHeuristics heuristics; // C13: established-algorithm ranking (never gates)
     std::map<uint64_t,Resource> resources;
     std::map<uint64_t,Record> records;
     struct Retry {uint64_t due{};unsigned failures{};};
@@ -101,6 +103,35 @@ void Report(Consumer& c,const na_observe_status& status,const char* phase) {
         }
         if(++emitted==24) break;
     }
+    // C13: rankings from the established heuristics, always produced and always
+    // unqualified: they order acquisition work and are never classifier evidence.
+    // reducer_match reports whether the strict SubmissionEvidence reducer
+    // independently qualified the same queue/ticket/resource; only that path
+    // feeds the classifier (the "signal" lines above).
+    const auto ReducerMatch=[&](const na::discovery::ExecutionIdentity& id,uint64_t resource) {
+        return id.ticket && c.execution.Match(id.queue,id.ticket,resource,0)!=nullptr;
+    };
+    unsigned rank=0;
+    for(const auto& d:c.heuristics.RankDepth(5)) {
+        std::fprintf(c.log,"{\"type\":\"heuristic_depth\",\"rank\":%u,\"resource\":%llu,\"width\":%u,\"height\":%u,\"format\":%u,\"score\":%.6g,\"draws\":%llu,\"vertices\":%llu,\"clears\":%llu,\"best_segment_draws\":%llu,\"aspect_match\":%s,\"exact_match\":%s,\"queue\":%llu,\"ticket\":%llu,\"list\":%llu,\"generation\":%llu,\"qualified\":false,\"reducer_match\":%s,\"reasons\":",
+            ++rank,d.resource,d.width,d.height,d.format,d.score,d.draws,d.vertices,d.clears,d.best_segment_draws,d.aspect_match?"true":"false",d.exact_match?"true":"false",
+            d.last.queue,d.last.ticket,d.last.list,d.last.generation,ReducerMatch(d.last,d.resource)?"true":"false");
+        JsonStrings(c.log,d.reasons);std::fputs("}\n",c.log);
+    }
+    rank=0;
+    for(const auto& k:c.heuristics.RankSceneColor(5)) {
+        std::fprintf(c.log,"{\"type\":\"heuristic_scene_color\",\"rank\":%u,\"resource\":%llu,\"width\":%u,\"height\":%u,\"format\":%u,\"score\":%.6g,\"draws\":%llu,\"hud_draws\":%llu,\"written_before_hud\":%s,\"receives_hud\":%s,\"queue\":%llu,\"ticket\":%llu,\"list\":%llu,\"generation\":%llu,\"qualified\":false,\"reducer_match\":%s,\"reasons\":",
+            ++rank,k.resource,k.width,k.height,k.format,k.score,k.draws,k.hud_draws,k.written_before_hud?"true":"false",k.receives_hud?"true":"false",
+            k.last.queue,k.last.ticket,k.last.list,k.last.generation,ReducerMatch(k.last,k.resource)?"true":"false");
+        JsonStrings(c.log,k.reasons);std::fputs("}\n",c.log);
+    }
+    rank=0;
+    for(const auto& b:c.heuristics.RankCameraBlocks(5))
+        std::fprintf(c.log,"{\"type\":\"camera_block\",\"rank\":%u,\"resource\":%llu,\"offset\":%llu,\"draws\":%llu,\"recordings\":%llu,\"share\":%.4f}\n",
+            ++rank,b.resource,b.offset,b.draws,b.recordings,b.share);
+    const auto& hs=c.heuristics.Stats();
+    std::fprintf(c.log,"{\"type\":\"heuristics\",\"frames\":%llu,\"executions\":%llu,\"draws\":%llu,\"hud_boundaries\":%llu,\"unknown_pipelines\":%llu,\"unmatched_lists\":%llu,\"swapchain_width\":%u,\"swapchain_height\":%u}\n",
+        hs.frames,hs.executions,hs.draws,hs.hud_boundaries,hs.unknown_pipelines,hs.unmatched_lists,c.heuristics.SwapchainWidth(),c.heuristics.SwapchainHeight());
     std::fprintf(c.log,"{\"type\":\"acquisition_progress\",\"attempts\":%llu,\"pending\":%zu,\"failures\":%llu,\"matched_texture_samples\":%llu,\"executed_resources\":%zu,\"camera_ranges\":%zu}\n",
         c.attempts,c.acquisition.Pending(),c.failed_samples,c.matched_samples,c.execution.Latest().size(),c.camera_plans.size());
     const auto& evidence=c.execution.Stats();
@@ -117,6 +148,7 @@ void __cdecl Sink(const na_event_batch* batch,void* user) {
         const auto decoded=na::discovery::DecodeBatch(batch,bytes);
         c.validity.Consume(decoded,status);
         c.execution.Consume(decoded,status);
+        c.heuristics.Consume(decoded,status);
         ++c.batches;
         if(!decoded.valid) {++c.malformed;return;}
         if(batch->session!=status.session || batch->epoch!=status.epoch) return;
@@ -182,7 +214,13 @@ void __cdecl Sink(const na_event_batch* batch,void* user) {
                 // from the few usable snapshots.
                 const auto key=std::make_pair(e.resource,e.offset);
                 const auto prior=c.scanned.find(key);
-                if(e.status==NA_SNAP_CAPTURED && e.captured_bytes>=64 && e.captured_bytes<=4096 && c.scan_count<4 &&
+                // C13: the top-ranked per-frame camera blocks are scanned even when
+                // the general budget is spent (still at most every 2 s each), and
+                // get a GPU-timeline buffer sample plan (C10).
+                const size_t camera_rank=c.heuristics.CameraRank(e.resource,e.offset,4);
+                if(camera_rank && e.captured_bytes>=64 && c.camera_plans.size()<256 && !c.camera_plans.count(key))
+                    c.camera_plans[key]={e.resource,0,std::min<uint32_t>(e.captured_bytes,4096),1,0,true,e.offset};
+                if(e.status==NA_SNAP_CAPTURED && e.captured_bytes>=64 && e.captured_bytes<=4096 && (c.scan_count<4 || camera_rank) &&
                     (prior==c.scanned.end() || now-prior->second>=2000)) {
                     if(c.scanned.size()==4096 && prior==c.scanned.end()) c.scanned.erase(c.scanned.begin());
                     c.scanned[key]=now;++c.scan_count;
@@ -193,8 +231,9 @@ void __cdecl Sink(const na_event_batch* batch,void* user) {
                     c.matrices+=scan.candidates.size();
                     if(!scan.candidates.empty() && c.camera_plans.size()<256)
                         c.camera_plans[key]={e.resource,0,e.captured_bytes,1,0,true,e.offset};
-                    std::fprintf(c.log,"{\"type\":\"matrix_scan\",\"resource\":%llu,\"offset\":%llu,\"queue\":%llu,\"ticket\":%llu,\"snapshot\":%llu,\"bytes\":%u,\"flags\":%u,\"hypotheses\":%zu,\"unavailable\":%s,\"partial\":%s,\"execution_qualified\":false}\n",
-                        e.resource,e.offset,e.queue,e.queue_ticket,e.snapshot_id,e.captured_bytes,e.hdr.flags,scan.candidates.size(),scan.unavailable?"true":"false",scan.partial_capture?"true":"false");
+                    std::fprintf(c.log,"{\"type\":\"matrix_scan\",\"resource\":%llu,\"offset\":%llu,\"queue\":%llu,\"ticket\":%llu,\"snapshot\":%llu,\"bytes\":%u,\"flags\":%u,\"hypotheses\":%zu,\"inverse_pairs\":%u,\"camera_rank\":%zu,\"unavailable\":%s,\"partial\":%s,\"execution_qualified\":false}\n",
+                        e.resource,e.offset,e.queue,e.queue_ticket,e.snapshot_id,e.captured_bytes,e.hdr.flags,scan.candidates.size(),scan.inverse_pairs,camera_rank,
+                        scan.unavailable?"true":"false",scan.partial_capture?"true":"false");
                 }
                 break;
             }
@@ -204,6 +243,13 @@ void __cdecl Sink(const na_event_batch* batch,void* user) {
         if(now-c.last_sample>=500) {
             c.last_sample=now;
             std::vector<na::discovery::SamplePlan> plans;
+            std::map<std::pair<uint64_t,uint64_t>,unsigned> priority; // lower = sooner (C13 ranking)
+            {
+                unsigned p=0;
+                for(const auto& d:c.heuristics.RankDepth(2)) if(d.score>0) priority.emplace(std::make_pair(d.resource,uint64_t{0}),++p);
+                for(const auto& k:c.heuristics.RankSceneColor(2)) priority.emplace(std::make_pair(k.resource,uint64_t{0}),++p);
+                for(const auto& b:c.heuristics.RankCameraBlocks(4)) priority.emplace(std::make_pair(b.resource,b.offset),++p);
+            }
             for(const auto& pair:c.camera_plans) plans.push_back(pair.second);
             for(const auto& pair:c.resources) {
                 const auto& r=pair.second;
@@ -213,9 +259,13 @@ void __cdecl Sink(const na_event_batch* batch,void* user) {
             }
             // Oldest due first: persistent failures cannot monopolize slots or
             // blacklist future resources after a lifetime attempt cap.
+            const auto Priority=[&](const na::discovery::SamplePlan& plan) {
+                const auto it=priority.find({plan.resource,plan.offset});return it==priority.end() ? 1000u : it->second;
+            };
             std::stable_sort(plans.begin(),plans.end(),[&](const auto& a,const auto& b) {
                 const auto x=c.retry.find({a.resource,a.offset}),y=c.retry.find({b.resource,b.offset});
-                return (x==c.retry.end()?0:x->second.due)<(y==c.retry.end()?0:y->second.due);
+                const uint64_t da=x==c.retry.end()?0:x->second.due,db=y==c.retry.end()?0:y->second.due;
+                return da!=db ? da<db : Priority(a)<Priority(b); // oldest due first, then heuristic rank
             });
             for(const auto& plan:plans) {
                 if(c.acquisition.Pending()==4) break;
@@ -239,9 +289,10 @@ void __cdecl Sink(const na_event_batch* batch,void* user) {
                     na::camera::Sync::IndependentlyVerified,true,true,sample.bytes};
                 const auto scan=na::camera::FindMatrices(s);
                 for(const auto& candidate:scan.candidates) {
-                    std::fprintf(c.log,"{\"type\":\"gpu_camera_hypothesis\",\"resource\":%llu,\"offset\":%llu,\"queue\":%llu,\"ticket\":%llu,\"kind\":%u,\"layout\":%u,\"near\":%.9g,\"far\":%.9g,\"main_camera_qualified\":false,\"matrix\":[",
+                    std::fprintf(c.log,"{\"type\":\"gpu_camera_hypothesis\",\"resource\":%llu,\"offset\":%llu,\"queue\":%llu,\"ticket\":%llu,\"kind\":%u,\"layout\":%u,\"near\":%.9g,\"far\":%.9g,\"inverse_pair\":%s,\"camera_rank\":%zu,\"main_camera_qualified\":false,\"matrix\":[",
                         sample.info.resource,candidate.byte_offset,sample.info.queue,sample.info.queue_ticket,static_cast<unsigned>(candidate.kind),static_cast<unsigned>(candidate.layout),
-                        candidate.near_plane,std::isfinite(candidate.far_plane)?candidate.far_plane:0);
+                        candidate.near_plane,std::isfinite(candidate.far_plane)?candidate.far_plane:0,candidate.has_inverse_pair?"true":"false",
+                        c.heuristics.CameraRank(sample.info.resource,sample.plan.offset,4));
                     for(size_t k=0;k<16;++k) std::fprintf(c.log,"%s%.12g",k?",":"",candidate.matrix[k]);
                     std::fputs("]}\n",c.log);
                 }
