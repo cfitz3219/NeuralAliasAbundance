@@ -194,6 +194,8 @@ int main()
     na::j2::SetEnabled(false);
     d.WaitIdle();
     na::j2::Shutdown();
+    na::dlss::Shutdown(); // GPU idle (WaitIdle above): release the fake runtime's features before exit
+    na::dlss::SetInitOwnOverrideForTests(nullptr);
     na_observe_stop(); // the transport thread must not outlive main
     return test::finish("j2_live_test");
 }

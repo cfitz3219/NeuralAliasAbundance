@@ -158,7 +158,13 @@ bool find_camera(ID3D12CommandList* scene, na::camera::Matrix* vp, bool* reverse
     for (const auto& o : order) {
         const uint32_t n = na::observe::ReadBuffer(o.second.first, o.second.second, bytes.data(), kBlockBytes);
         if (n < 128) continue;
+        // An in-process read at submission time, inside the submitting call:
+        // its scope is known (FindMatrices rejects snapshots without one).
         na::camera::Snapshot s{};
+        s.session = s.epoch = 1;
+        s.submission = s.content_version = g.frame + 1;
+        s.resource = o.second.first;
+        s.base_offset = 0; // offsets are relative to the block
         s.complete = s.lifetime_valid = true;
         s.sync = na::camera::Sync::AppSyncUnknown;
         s.bytes.assign(bytes.begin(), bytes.begin() + n);
