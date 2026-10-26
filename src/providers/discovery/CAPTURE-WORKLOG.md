@@ -1,0 +1,239 @@
+# Capture decoder integration journal
+
+## 2026-10-24 — ABI 0.1 consumer boundary
+
+Fetched Claude's branch: latest remains 5727047 (test checkpoints). H2/H3 additions and the previously supplied explicit-buffer-SRV fix are not published there. Merged those checkpoints into the isolated integration branch; first merge attempt failed for missing identity without changing files, then succeeded with command-scoped identity.
+
+Added capture_decoder.hpp in Astra's discovery lane. This is a bounded worker/offline structural decoder, not an inventory tracker or resource classifier. It copies valid batches into owned storage, checks all 23 known event minimum sizes, exact payload/count/epoch framing, identity-bearing session/epoch records and overflow-safe explicit inline array offsets/strides. Unknown optional events survive as opaque records; unknown foundational events remain explicitly flagged. Any malformed tail discards all batch output. Future minor fields are allowed; major mismatch is rejected. Policy limits are 4 MiB and 65,536 events per batch; exceeding either requires caller loss/invalidation handling, not silent truncation.
+
+Nine focused regression cases cover every truncation of a resource batch, all known minimum sizes, malformed tails, unaligned input ownership, future minor versions and inline strides, unknown foundational records, identity mismatches and overflowing counts. Integrated the decoder into the existing real Windows transport test callback: lifecycle, loss, snapshot/resync and final batches all decode successfully. No GPU, hooks or game deployment in this test.
+
+Fresh standalone MSVC Release build: 11/11 CTests pass. Initial configure did not find Python; reconfigured with the bundled Python before the reported suite, so fixture.reference ran and passed. Self-review removed an unjustified natural-alignment restriction on inline arrays: the ABI only requires minimum strides and bounded explicit offsets, and decoding uses memcpy. Added a stride-20 capability regression. No frozen ABI or Claude-owned implementation changed.
+
+Remaining work: authoritative status-counter/inventory/capability state, H2 execution provenance, H3 and completed texture samples. Decode success is only structural validity; it never means loss-free capture, complete inventory, ordered submissions, GPU completion or qualified DLSS inputs. A worker integration must inspect status/capabilities and unknown_foundational before deriving evidence. The borrowed callback allocation's extent is guaranteed by the host; offline callers must independently supply their actual allocation extent. No live runtime consumer registration yet.
+
+## 2026-10-24 — authoritative validity tracking
+
+Added CaptureValidity, a serialized worker-side conservative gate using coherent status queries and decoded batches. It separately reports baseline inventory consistency, continuous capture history and supported capability groups. Foundation loss/malformed/unknown foundational records remain invalid until a new observed epoch; detail loss and retroactive ambiguity revoke history. FINAL closes readiness. Status counter rollback, old-epoch queries, missing capability groups, partial support, duplicate boundaries and incomplete status cannot authorize evidence. New-epoch loss counter deltas cannot disappear into a reset baseline. First attachment after historical losses conservatively requests another resync. Fresh status is required after callback completion and before use; the class cannot detect a caller supplying stale status. It makes no resource, frame, synchronization or input qualification claim.
+
+Nine validity regression cases pass alongside the existing decoder/transport/fixture suite: fresh standalone MSVC Release12/12. Initial implementation reset counter baselines on epoch change; self-review corrected that potential hidden-loss race and added its regression before commit. This layer remains offline/worker groundwork, not registered into the runtime.
+
+Fetched Claude9655c85: allocator hook removed, but explicit SRV/session/collision fixes remain absent. Full combined build passes; committed RTX producer CTest still exits0xc0000409 after checkpoint4,25hooks,0missing,shared slots empty. Log local/phase3-integration/ctest-host-9655.log. Earlier PR25 head46e92a6 CI run40089660505 completed success; that does not cover the new validity changes until new CI runs.
+
+## 2026-10-24 — real producer/consumer round trip
+
+Added optional host integration test target when host_observe_producers is available. It runs the real producer through DecodeBatch and CaptureValidity at startup, resync and FINAL, creates observed and unobserved resource views with valid descriptors, checks hardware health and enforces unavailable H2 PASS capability. Runs independently on the hardware adapter and explicitly selected WARP. This is a controlled test program, no game injection or live GPU readback. CPU standalone builds omit this host target explicitly through its CMake condition.
+
+After applying the user-authorized host fixes1a81e1b in PR26, combined e08d2de full Release build passes and both na.host.capture_consumer and na.host.capture_consumer_warp pass with zero skips. The preceding combined df18a4e run passed21 discovery CPU/fixture/menu tests plus the corrected committed producer test (22/22). This replaces the earlier session-mismatch failure for the corrected snapshot only. Future H2/H3, resource/frame provenance and lifetime/order review findings are still required for live classification.
+
+## 2026-10-24 — entry-hook integration and reproduced R3 ordering gap
+
+Claude238f508 includes direct vtable-entry hooks (d3e3302) plus a texture substitute for the formerly invalid SRV. The combined merge1407803 preserves the tested unobserved buffer/explicit BUFFER SRV pair; blindly accepting the textual merge would create a texture with a buffer view. Session and RAII fixes remain intact. Full Release builds and3/3 targeted tests pass: RTX producer, RTX consumer, WARP consumer. No H2/H3 ABI additions yet. Producer canonical identity/sentinel attachment/registration ownership and sync-overlap fixes remain Claude-owned, coordinated in main COMMS.
+
+Added queue_overlap_probe.cpp: real Signal and Wait calls inside a manually controlled host-owned ExecuteBegin/End window. No ExecuteCommandLists or rendering work is submitted; this isolates R3 hook-window bookkeeping, not actual GPU ordering. At1407803 on RTX the execute ticket1 and signal/wait tickets2/3 all have flags0, and no ambiguity range is emitted:3 assertions FAIL. It proves the previously source-level sync/execute overlap finding in this controlled integration path. This is independent of the corrected descriptor/session defects.
+
+The diagnostic target na_queue_overlap_probe builds when C8 exists. It is intentionally not in default passing tests while its producer fix is pending. Run it directly, or configure NA_ENABLE_PENDING_CAPTURE_TESTS=ON and run na.host.queue_overlap_pending to reproduce. Do not describe default green CI as covering this unresolved regression. Once Claude's producer patch arrives, enable this regression by default and remove the pending switch. Raw initial evidence local/phase3-integration/queue-overlap-probe.log. No producer lifecycle source edited by Astra in this checkpoint.
+
+## 2026-10-24 — H2 ABI0.2 integration and queue-fix follow-up
+
+Claude published H2 through b736b6a. Combined8027316 merges it with queue fix3aa7745 (user-authorized, PR29). Default queue regression now passes; prior opt-in/pending status is superseded on this corrected integration. Execute/Signal/Wait share finalization, so events are stamped only after their observed window closes. Internal shared tokens retain queue bookkeeping; no GPU synchronization proof is implied.
+
+Added conditional ABI0.2 structural decoding for root signatures, pipelines and list operations, with explicit root-array and typed payload bounds. Malformed lengths/counts are rejected. Truncation and known representational gaps set incomplete_capture and invalidate contiguous evidence. Root tables omit offsets/full ranges; viewport/scissor arrays retain only first element; texture-copy offsets/box/footprint are absent. These remain acquisition/producer amendment tasks, not trustworthy complete pass evidence. No frozen ABI edit by Astra. Three new synthetic H2 cases cover short structs, root arrays, payload bounds and incomplete shapes.
+
+New h2_capture_decoder_test wraps Claude's actual pass fixture callback through DecodeBatch without modifying his source, retaining all original fixture assertions. It verifies structural acceptance plus explicit incomplete root-table evidence. Full combined Release and44/44 default non-GPU-labelled CTests pass, zero skips, including the now-default ordering probe, real H2 fixture and its decoder wrapper. Raw logs local/phase3-integration/{build-h2-final.log,ctest-h2-full.log}. H3/content completion and unrelated COM/sentinel/list lifetime findings remain open. No deployment or game input control.
+
+## 2026-10-24 — H3 structural integration and full regression
+
+Merged Claude C9 29e8647 at6b0b890, preserving shared queue occurrence tokens and default zero-list arguments for Signal/Wait. Added bounded kind27 decoding, malformed payload tests and actual H3 snapshot fixture wrapper. All snapshots remain incomplete_capture, including CAPTURED, because APP_SYNC_UNKNOWN is not coherent camera input. No runtime signal registration or game deployment.
+
+Full Release succeeds; targeted7/7 and default non-GPU-labelled46/46 CTests pass, zero skips, on this Windows RTX machine (includes explicit WARP consumer). Logs local/phase3-integration/{build-h3-decoder.log,ctest-h3-decoder.log,ctest-h3-full.log}. Serial fixture success does not test concurrent Unmap. C9-H3-REVIEW-1 sent in main COMMS: original Unmap precedes the metadata lock, so snapshot memcpy is not protected by that lock; dedup suppresses distinct binding provenance; snapshots precede final queue overlap status. These remain Claude-owned fixes and qualification limits.
+
+Queue PR29 initial Linux CI failed GCC misleading-indentation in the portable test loop. Fixed by152cf47 and merged; no production behavior change. H2 integration briefly duplicated its CMake target when merging the isolated consumer branch; corrected05d2f3c before successful rebuild. Latest CI pending at this checkpoint. Queue fix3aa7745 supersedes prior pending-overlap status; its regression is mandatory and passing.
+
+## 2026-10-24 — consumer provenance continuation while C9 fixes remain unpublished
+
+Fresh fetch still has Claude c9-h3 at29e8647. Posted ownership confirmation to COMMS: Claude retains snapshot lifetime/binding provenance and acquisition work; Astra advances consumer checks without duplicating host changes.
+
+New regression demonstrated CaptureContiguous remained true for an execute explicitly containing unobserved bundles. Decoder now marks bundle submissions, unknown list identity/generation, and failed Reset/Close records as incomplete evidence while preserving structural/inventory validity. Initial generation zero remains legal. Added regression across bundle/failed reset/failed close plus unknown identity/generation. Provisional H3 regression verifies that clean Execute before or after the snapshot cannot restore readiness, status refresh cannot clear it, and stale old-epoch snapshots cannot poison a fresh resync. This is conservative consumer behavior, not a repair of producer pointer lifetime.
+
+Initial targeted build used a nonexistent target name na_capture_validity_test; corrected to na_cpu_capture_validity. New regression then failed as intended (10 cases pass,1 fails), log local/phase3-integration/ctest-provenance-before.log. After correction full Release succeeds and46/46 default non-GPU-labelled CTests pass, zero skips, including RTX/WARP and actual H2/H3 wrappers. Logs build-provenance.log and ctest-provenance-full.log in that same local directory. CI pending at publication. No frozen ABI/producer edits, no deployment or live qualification.
+
+## 2026-10-24 — PR31 snapshot fixes integrated and amended consumer checked
+
+Claude published fixes on a separate branch claude/c8-c9-review-fixes, PR31, not the unchanged c9-h3 branch. Integrated head fcbc57a (0705bf1 implementation,7d865e1 warning correction) by fast-forward. This supersedes prior fixes-unpublished status. Confirmed Unmap metadata invalidation precedes original call; snapshot binding dedup removed; root ranges and full viewport/scissor arrays added. Queue/session fixes preserved. Initial12/12 targeted tests pass, including real H3 race fixture and wrapper.
+
+Extended decoder bounds checks to range arrays and table indices, with explicit truncated-array handling, and typed viewport/scissor/copy payloads. New synthetic tests cover malformed range references and valid/invalid operation strides. Current-tree structural integration only: earlier0.2 shorter root records are rejected, not mixed-version compatible. Tables and APP_SYNC_UNKNOWN snapshots remain incomplete evidence; footprint dimensions/format remain absent.
+
+First full run45/46 passed; failure was my overly broad test edit changing unknown-op expectation to invalid instead of valid-incomplete. Corrected that expectation. Final full Release and46/46 default non-GPU-labelled CTests pass, zero skips, including RTX/WARP. Logs local/phase3-integration/{build-review-fixes.log,ctest-review-fixes.log,build-review-decoder-final.log,ctest-review-full.log,ctest-review-final.log}. No game deployment or driver-removal test.
+
+Sent review qualifications to Claude: Sleep-based race test lacks entered-boundary handshake; SEH is not destruction lifetime ownership; same-address distinct binding regression still needed; table ranges cap8 entries without coverage flag; extended copy footprints lack dimensions/row pitch/format. Async textures remain Claude-owned. These are separate from the corrected single-map Unmap ordering and removed dedup. No blanket lifecycle or Phase3 closure claim.
+
+## 2026-10-24 — direct repeated-binding provenance regression
+
+Checked all remote branches and current COMMS; no newer lifetime/coverage/async-texture implementation beyond fcbc57a. Coordinated new independent test in tests/cpu/snapshot_bindings_test.cpp; no producer edits or duplicate acquisition work.
+
+The test records two actual D3D12 lists, each with two root CBVs and two table CBVs all sharing one resource/address. Table views request256 and512 bytes. Calls the host ExecuteBegin/End seam with both lists (controlled observation boundary, no ExecuteCommandLists or GPU work), then overwrites/unmaps source memory. Owning decoder must retain8 records with8 distinct list/op/param/size associations, correct generation/queue/ticket and original copied bytes. Every snapshot remains APP_SYNC_UNKNOWN/incomplete. This directly covers the removed address-only dedup bug; no old-producer negative-control run performed.
+
+Full Release build passes and new default na.host.snapshot_bindings test passes on RTX5070Ti,8 records/8 associations/0 failures. Logs local/phase3-integration/{build-bindings.log,ctest-bindings.log}. Existing executable behavior unchanged; previous46/46 baseline remains separately recorded. CI for the new combined head pending. Remaining ownership/destruction lifetime, deterministic race seam, coverage flags and asynchronous texture sampling stay Claude-owned. No game deployment or Phase3 closure.
+
+## 2026-10-24 — C9b asynchronous texture review and controlled integration
+
+Fetched all Claude branches; new c9b-texture-samples67b7744 (PR32) is based on5ded6a0. Merged experimentally into integration92e5aad, retaining b55de74 repeated-binding regression. Full Release and48/48 default non-GPU-labelled tests pass, zero skips; RTX sample fixture gives correct color/depth and subrect results. Evidence local/phase3-integration/{build-c9b.log,ctest-c9b-sample.log,ctest-c9b-full.log}.
+
+Source review found six blocking categories: repeated in-flight cancellation frees too early; source/failure-path ownership; original-plus-copy ordering; incomplete transition evidence; expiry of borrowed pointers; resource shape/copy validation. Full evidence and targeted fix/test requests in docs/C9B-REVIEW.md and main COMMS. Verified depth source-box requirement against Microsoft documentation. No dangerous negative-control GPU failures induced. No production sample_request callers; integration remains experimental and no live A5/A7 consumer was enabled. Producer corrections remain Claude-owned. No deployment or completion claim. CI pending for combined checkpoint.
+
+## 2026-10-24 — C9b six-finding fixes rechecked
+
+All Claude branches checked; new c9b-review-fixes688c0ec (PR33) integrated by fast-forward. Full Release and48/48 local default non-GPU tests pass, zero skips, including updated adversarial RTX fixture. Logs build-c9b-fixes.log and ctest-c9b-fixes-full.log under local/phase3-integration. R1/R5 original defects corrected; other fixes present with narrower remaining qualifications. No producer edits by Astra.
+
+C9B-REVIEW-2 sent to Claude: detached-thread singleton guard launches another worker per request; raw source acquisition still needs ownership proof; scope validation is deferred to worker maintenance; typeless depth partial copies bypass typed-format check. Also distinguish source-reviewed queue interleaving and untested Signal failure/plane rejection from tested paths. Full dispositions appended docs/C9B-REVIEW.md. No live consumer enabled; next integration depends on producer corrections. Latest combined CI pending.
+
+## 2026-10-24 — PR34 integration and new worker reproduction
+
+All branches checked; integrated629ad9b. Full Release builds. New standalone RTX worker-wakeup diagnostic reproduces missing notification: warmup20ms timeout succeeds, second request after idle remains ARMED after~1s (1 assertion fails). Added test-only target and explicit opt-in pending registration; default passing tests do not cover this unresolved failure. No GPU work or producer changes in diagnostic. Logs build-c9b-review2.log,build-worker-wakeup.log,worker-wakeup.log under local/phase3-integration.
+
+Review accepts pre-submit acquisition, operation-time scope checks, typeless depth gate and singleton guard in inspected paths. Worker bounded teardown remains unproven; source review plus exact wakeup repro sent to Claude. Full baseline suite running at this entry. No live consumer/deployment; tests and findings do not close Phase3.
+
+## 2026-10-24 — PR35 arrived during final checkpoint; continued integration
+
+Final coordination pull revealed new47b1208/PR35, so continued instead of ending on stale pending status. Integrated notification plus thread-handle teardown fixes, kept Claude producer ownership, and ran full Release/default49/49 tests successfully, zero skips. Mandatory wakeup regression now passes; earlier default exclusion/known-failure statements are superseded at this tree. Logs build-review3.log and ctest-review3-full.log. Sent remaining DuplicateHandle-failure teardown case to Claude; no injected failure or general live qualification claimed. Latest combined CI pending.
+
+## 2026-10-24 — PR36 reviewed and tested
+
+Integrated c15881d after all3 CI jobs passed for8ee89dc. Immortal thread ownership removes handle-duplication fallback; injected creation failure refuses/retries correctly. Full Release and expanded54-test run:53 passed,1 missing-upscaler-runtime skip,0 failed. Includes all49 non-GPU-labelled tests plus real DLSS/device-loss. See docs/C9B-REVIEW.md for evidence and remaining qualifications. Latest combined CI pending; no deployment or consumer enablement.
+
+
+## 2026-10-24 — ASTRA-P3-REVIEW-1 consumer corrections R2–R6
+
+Claude's cross-review arrived during PR36 CI completion. Took consumer fixes without duplicating producer work. R3: per-kind matrix caps remove only overflowing kind and keep scanning; projection before/after300 rigid matrices survives. R4: reflected orthonormal views record determinant sign, and handedness changes report discontinuity. R5: missing world points count as unresolved while valid pixels remain checked; mismatches remain detectable, partial evidence does not become fully qualified. R6: bundle/indirect list ops mark capture incomplete.
+
+R2: initial explicit motion policy requires75% eligible coverage,16 checked pixels,95% inliers; border/visibility exclusions are tolerated within coverage, implausible vectors (>2 image diagonals) contradict. Percentile residual must improve on zero-motion over the same footprint. Reports retain max/mean errors plus coverage/inlier/percentile metrics. High-frequency textured pan regression includes border exits, missing visibility and a large residual; wrong direction, widespread errors and low overlap remain rejected/unavailable. This is candidate evidence, not calibrated live semantic acceptance.
+
+Full Release build and49/49 non-GPU-labelled local tests pass, zero skips (44.90s). New regressions and existing fixture corpora pass; motion remains160 hypotheses with30 informative correct warps consistent,90 wrong-sign/scale contradicted and40 sparse unavailable. Raw logs local/phase3-integration/build-consumer-review.log and ctest-consumer-review.log. Preceding f250a36 all3 CI jobs40149901349 passed. Latest consumer CI pending.
+
+R1 production-obtainable evidence remains open: temporal depth/camera corroboration, H2 HUD-boundary evidence, independent visibility estimation and asynchronous acquisition scheduling must be built/qualified alongside fixture validators. A5 >=95% acceptance and A9 remain outstanding. No live sampling consumer or game deployment. Producer interleaving/Signal/plane qualifications remain Claude-owned; request cross-review of these consumer corrections.
+
+## 2026-10-24 — Production acquisition/depth slice and PR37 integration
+
+Fetched all Claude branches and PR27 review. Initially no updates; ab625be/PR37 and R2–R6 acceptance arrived during work. Integrated PR37, reviewed and ran new producer fixture on RTX. Signal-failure quarantine and D24S8 refusal now exercised. Ordering probe remains timing-assisted: started flag precedes ExecuteCommandLists and Sleep50 does not prove the second thread reached its lock. Requested a lock-entry/negative-control refinement in COMMS, preserving Claude ownership. No blanket deterministic-concurrency closure claimed.
+
+Added SampleAcquisition with real HostSampleApi adapter: max4 whole-subresource leases, explicit scope cancellation, polling without waits, completed owned copies, exact returned queue/ticket/format/region checks and bounded64MiB payloads. Scalar decoder handles D32/R32 float padded rows and unpadded final row; typeless/packed interpretation remains unsupported. Added temporal_depth: exact camera/sample association, adjacent scoped frames, explicit projection convention, reprojection/coverage/inlier evidence and provisional static-surface agreement maps. No fixture world positions or supplied visibility mask needed. Stationary/jitter-only pairs cannot establish depth semantics; no qualified-input/effect promotion.
+
+CPU regressions cover pending/expiry/short-read/stale scope/shape/refusal/retry/cancellation/bounds, decoding and temporal camera/reset/queue/invalid/sky/reverse-Z cases. New RTX end-to-end test acquires two32x16 D32 samples and corroborates496 pixels with16 border exclusions. First test failed by timeout: fixture initial command-list creation lacked a Reset-established observed generation. Corrected fixture Close/Reset before recording; no producer defect inferred. Updated host sample fixture passes. Full Release +52/52 non-GPU-labelled local CTests pass, zero skips (48.00s). Final decoder metadata consistency tightening rebuilt and all3 affected tests passed. Logs local/phase3-integration/{build-production-evidence.log,ctest-production-evidence.log,build-acquisition-final.log,acquisition-lasttest.log}.
+
+Cort relayed Gate3 priorities/Claude's host activation offer. Coordinated Claude ownership of off-by-default read-only host worker/switch; Astra owns R1 consumers/A5/A9. R1 remains open: qualified camera/frame mapping, semantic depth/visibility evidence and pre-HUD color. Submission-end samples cannot recover overwritten pre-HUD content. A5 acceptance and A9 live Anno report are not claimed complete. Interface/limits in src/providers/discovery/PRODUCTION-EVIDENCE.md (earlier COMMS shorthand docs/PRODUCTION-EVIDENCE.md was an incorrect path). No game deployment, live activation or ABI change. Latest combined CI pending; request peer review.
+
+## 2026-10-24 — Temporal corpus and sparse motion sentinel follow-up
+
+Added66 fixture-v2 temporal pairs at64x48,96x64,160x96 using depth/camera only:30 uncorrupted pairs Consistent,30 deliberately corrupted pairs Contradicted,6 camera-cut pairs Unavailable. This measures temporal agreement, not A5 semantic accuracy. Added robust handling of sparse finite implausible motion: counts against inlier budget instead of a whole-buffer veto, with a regression retaining rejection for widespread sentinels. Existing160 motion hypotheses keep their dispositions. Full Release build and53/53 non-GPU-labelled local tests pass, zero skips (51.61s); logs local/phase3-integration/{build-temporal-corpus.log,build-temporal-corpus-final.log,ctest-production-final.log,temporal-corpus-lasttest.log}. Earlier52-test evidence remains historical. Latest combined CI pending. Coordinated cross-review and host ownership through COMMS; concurrent append conflict there resolved by preserving both messages and rebasing, no force push.
+
+
+## 2026-10-24 — Finish bounded R1 diagnostic paths and A5 measurement
+
+Cort corrected my premature snapshot-only handoff; continuing agreed Gate3 deliverables before review, without expanding scope. Added production_checks combining metadata + temporal depth confirmation, preserved-source/final-color corroboration outside observed overlay bounds (no HUD alpha/foreground oracle), and depth/camera-derived motion visibility (no oracle stable mask). Supported remains diagnostic evidence, never automatic effect trust. Missing real-game observations return explicit unknowns. Combined A5 fixture-v2 scorer:264/264 correct,63 TP/201 TN/0 FP/0 FN at3 extents/11 frames/8 anonymous candidates; includes camera-cut abstention. Meets >=95% on this declared fixture scope; H2 acquisition accuracy in arbitrary games is not measured by it. Details/reproduction docs/A5-ACCEPTANCE.md. Targeted production checker and corpus tests pass. First unit build had an unqualified sibling namespace in the test only; corrected namespace alias, rebuilt successfully. Raw metric JSON local/phase3-integration/a5-acceptance.json. Anno1800 found at C:/Program Files (x86)/Steam/steamapps/common/Anno 1800/Bin/Win64. Host worker/switch requested from Claude; A9 session/report next when integrated. No game files modified at this point.
+
+
+## 2026-10-24 — A9 diagnostic adapter qualified before game deployment
+
+Added off-by-default read-only consumer through existing NA_GAME_ADAPTER_LIB extension; no producer/host-boot edits. Transport-worker metadata and bounded asynchronous samples (four pending,32 distinct resources,180 summary reports) produce diagnostic JSONL, never effect input. Camera hypotheses remain APP_SYNC_UNKNOWN, semantic confirmations remain unavailable. Real-producer activation test verifies default-off, read-only refusal, repeated start/stop and drained final report. Release diagnostic DLL built; 55/55 preceding suite passed and new adapter test passed. Previous Computer Use stopped on physical Escape; no deployment occurred. Cort explicitly resumed, authorized reversible deployment/capture/rollback, and restarted Anno into DX12. Verified DeviceType DX12 and loaded system d3d12/D3D12Core modules. A9 capture follows; no live success claimed yet.
+
+## 2026-10-24 — Anno baseline black-screen investigation
+
+Before diagnostic deployment, Cort reported repeated black-screen launches after switching DX12. Latest game log confirms RTX5070Ti D3D12 feature12.0 creation, startup complete, then repeated shader reads failing error362 (cloud file provider not running) from OneDrive Documents/Anno1800/shaders/precompiled. No dxgi.dll present in game directory; no NeuralAlias deployment. With game closed, renamed only shaders to shaders.backup-20261024 inside verified Anno documents directory and created empty shaders for regeneration. Preserved engine.ini copy in local/gate3-anno-20261024; kept DX12/settings/save data unchanged. Relaunch verification pending. Save placeholders also logged cloud-provider errors; cache reset cannot repair those.
+Verification: fresh-cache DX12 launch reached rendered Anno1800 title screen (v18.4.1412158) at approximately19:51 local. Baseline black-screen resolved in this run. Original cloud shader cache retained; no driver/security/OneDrive settings changed.
+
+A9 first rendered capture completed and rollback verified.73 reports,139414 submissions,21664 final resource records,3315759 snapshot events,0 malformed/drops,0 candidates/samples/confirmations; complete capture remained false. Overlay showed game-owned output,zero DLSS features/passes,picture controls unavailable. Diagnostic candidate scheduler required resolved draw bindings; added capability-only inventory acquisition for render/depth-eligible textures with confidence unavailable, no semantic promotion. Added live-reader sharing regression and optional worker-side bootstrap log with PID. Full Release/56 of56 non-GPU-labelled tests passed before inventory adjustment; two targeted adapter/real-acquisition tests pass after it. Follow-up reversible capture underway. Raw local logs retained; A9 report records first-session limits. A concurrent local test run overlaps performance observations; no benchmark claim.
+
+
+Final A9 correction: Event1000 revealed exit fail-fast in deployed DLL, so prior normal-exit wording only describes the UI action. Minimal active-transport process reproduced0xc0000409; fixed process-lifetime state/exit quiescence and regression passes. Active-DLL ExitProcess regression also passes. Follow-up inventory capture yielded35 distinct eligible texture records,8 arm timeouts,0 completed samples; both deployments restored. Unexplained early follow-up termination and no post-fix in-game shutdown are explicitly unqualified. Final full Release and58/58 non-GPU-labelled CTests pass,zero skips/failures; logs local/phase3-integration/build-a9-exit.log and ctest-a9-exit.log. No extra driver-visible device-loss run during game work. A9 and PHASE3-REVIEW-STATUS document conditional production checks,fixture264/264 acceptance,live unknowns and gate/review boundaries. No Gate3 closure claimed.
+
+
+## 2026-10-24 — Nonzero render-target descriptor regression
+Cort requested actual Anno qualification and in-game exit verification. Found unsequenced argument reads in OMSetRenderTargets producer: view_ref_locked(heap_for_cpu_locked(handle,&slot),slot) could pass slot0 before lookup writes slot. New real-RTX test uses RTV slots3/4 and DSVslot2, both contiguous and separate ranges; failed all4 assertions before fix,passed after explicit heap-then-slot sequencing. This fixes wrong resource binding identity without upgrading semantic confidence. Further sampling/coverage diagnostics and in-game test continue; coordinated ownership through COMMS.
+
+
+### 2026-10-24 — Actual Anno startup fail-fast isolated and corrected
+
+Two diagnostic launches terminated before gameplay; directly observed PID8584 exit0xC0000409. Restored baseline reached title/menu, UI quit returned0. All manifests rolled back. Built a local debugger probe using Microsoft's signed DbgEng NuGet binaries (local artifacts only), rebuilt Release with symbols, and captured actual Anno stack: ucrtbase terminate -> std::_Mutex_base::lock -> ExecuteBegin -> D_Wait -> DXGI/D3D12 runtime -> FG/NR forwarding -> DetourExecute. Driver Wait re-enters the same queue on the submitting thread while a sample is armed. This is distinct from the earlier global-thread exit defect.
+
+New RTX queue_reentry test reproduces resource-deadlock exception before correction. Queue lock now records owning thread; same-thread nested occurrences skip reacquisition and preserve outer source references. Both nested Wait and outer Execute remain order-ambiguous; no sample is promoted/copied for this scope. Other threads still acquire the same mutex. Regression passes after correction; full Release build and eight related sample/occurrence/descriptor/DLL-exit tests pass. Live retest pending, not an exit verification claim.
+
+Also own the bootstrap route label in overlay storage (caller supplies a stack buffer), and add bounded capture-health counters to distinguish unresolved views, snapshot statuses and sample refusal causes. Sampling again prioritizes observed writes, preventing startup inventory from consuming the entire resource budget. No qualification thresholds weakened. Claude notified of ownership and requested camera/provenance work; no newer branch at fetch.
+
+### 2026-10-24 — Present transport and sparse captured-snapshot scanning
+
+Connected actual non-proxied Present/Present1 boundaries to the existing ABI. Tokens record chain identity, entry ordinal/index and the actual result/flags, including failed/test attempts. Swapchain retirement uses IDXGIObject private-data ownership; unobserved creation queue, resize generation and color space remain unknown. No frame/camera/buffer ownership is inferred. New real-DXGI regression verifies success/test and invalid-sync failure, ordinals, unknown metadata and retirement. Full Release and61/61 default tests pass.
+
+Captured snapshot scanning now strides over captured records rather than all statuses, preventing a repeating set of unmapped bindings from suppressing every eligible scan. Added bounded matrix-scan evidence with execution_qualified=false; no provenance upgrade. Extended real-transport adapter test injects32 unmapped snapshots followed by a captured identity matrix and verifies structural hypotheses remain unqualified. Targeted adapter test passes after extension. Live verification follows in a fresh reversible session. Earlier30b4256 gameplay session now has a full A9 addendum:12 completed samples,7 timeouts,normal exit0,restored manifest;9,467 detail drops remain explicitly recorded.
+
+### 2026-10-24 — One planned verification launch completed, no restart
+
+User resumed after physical-Escape interruption; prior pending deployment had already been rolled back. Deployed9e1b140 with a new manifest. Verified real gameplay, read-only overlay,16,419 transport Presents,12 completed samples and captured-buffer matrix-scan records. No camera hypothesis/qualified input; provenance/coverage gaps remain. Normal UI exit PID37488 code0,04:03:07Z; installation rollback verified. A9 addendum records exact metrics, drops, unknowns and hashes. Source all3 CI jobs40158744541 green. No further launch required to repeat these checks, and no claim of Gate3 closure. Claude's branch remainsab625be at fetch; latest ownership/results go to COMMS.
+
+### 2026-10-24 — Finish live classifier reasons and owned Phase 3 handoff
+
+Replaced the generic per-resource unavailable placeholder with the actual A5 Describe result for depth and scene color, including score, reasons and acquisition tasks. Inventory dimensions/recording writes are not promoted into executing scope, scene boundary or preserved content versions. The real-transport activation test now includes a depth-eligible texture and checks both classifier reports, missing-scope/boundary reasons and absence of false candidate promotion. Release DLL/adapter builds pass; production_checks,264-case production_classifier and diagnostic_adapter tests all pass. Parsed the emitted JSONL successfully. No new game deployment or restart; this is report-only follow-up to the recorded9e1b140 session.
+
+PHASE3-ASTRA-COMPLETION.md maps A5–A9 and R1 check implementations to their actual criteria, preserving acquisition/compatibility limits and remaining cross-review/audit/additional-game gate work. This corrects the repeated conflation of an unknown A9 outcome with a missing A9 deliverable. No claim of qualified Anno inputs or gate closure. Exact source review package prepared after commit; Claude coordination follows.
+
+## 2026-10-24 — REVIEW-2 consumer corrections and PR38 integration
+
+Reviewed Claude's full review at3196180 and integrated PR38 through77f49ef.
+R9: renamed production color confirmation to ConfirmPreHudComposite and scoped
+A5's fixture score to its actual composition-source semantics, not DLSS input.
+R10: temporal depth uses contradiction<50%, uninformative50–80%, consistency>=80%
+plus excitation; added15%/35%/60% moving-depth cases and motion regression.
+R11: mapped packed depth19/44 and HDR24/26, require explicit plane-format returns,
+and decode padded R24 depth while rejecting arbitrary typeless bytes.
+R12: explicit fail-closed unjittered-matrix assertion, test fixtures set it from
+known construction. R13: reuse owned DecodeBatch result in CaptureValidity.
+Release build and61/61 default tests passed; five targeted tests passed again
+after additional format/owned-batch/moving-motion regressions. No game deployment.
+PR38 review found nested cross-queue Signal can precede the copy after the outer
+occurrence ends, despite READY result; sent Claude exact trigger and requested
+producer correction. Peer review remains pending, not audit-ready yet.
+
+## 2026-10-24 — PR38 nested ordering qualification correction
+
+Cross-review found a remaining early-Signal window: bypassed nested queue
+operations could run before another queue's sample copy, after its occurrence
+had ended. Added a global nested-operation generation carried from submit entry
+through GPU completion. Nested events are ambiguous; pre-copy requests remain
+armed, while affected in-flight samples fail ORDER_AMBIGUOUS. GPU references
+remain fence-owned. Conservative cross-queue invalidation may lose otherwise
+valid samples but never promotes uncertain ordering. Later clean submissions
+can retry. No synchronous GPU waits added to live callbacks.
+
+RTX regression has a post-Signal handshake for both contending threads and a
+separate stalled camera-copy case. Against77f49ef producer code both assertions
+fail (incorrect READY); fixed code passes. Initial test run exposed a test-only
+cleanup race in the later quarantine count, fixed by waiting for the released
+completed copy to drain before measuring that case. Prior six related tests
+passed; final full build/suite running. Raw logs under local/phase3-integration,
+review2-negative-test.log and review2-final-ctest.log. No deployment or new Anno
+qualification claimed; Claude has been asked to review the final correction.
+
+## 2026-10-25 — Final peer check and PR39 review
+
+Claude accepted R9–R13 at90f165b and conditionally cleared the Argon handoff
+once Astra accepted PR39. Reviewed52cde25: the per-queue LastTicket check spans
+submission entry through the native copy forward. Interference before servicing
+leaves requests armed; interference during copy submission produces
+ORDER_AMBIGUOUS with fence-owned cleanup. Operations starting after the copy's
+submission are FIFO-ordered after it and no longer revoke completed provenance.
+Nested queue events remain explicitly ambiguous. This supersedes9085418's
+unnecessarily global invalidation; its historical negative-control results are
+retained, with the post-copy expectation now correctly READY.
+
+No blocking finding remains in this review. Claude's P3 SampleFormat note is an
+explicit unsupported boundary, not a false decode: plans currently cover resource
+formats19/20 and44/45; other view-only family formats are not silently interpreted.
+The host returns41/46 for the supported packed resources. No runtime expansion
+is needed for the declared tests/Anno resource formats. Argon should independently
+scrutinize the ordering window and unsupported-format boundary.
+
+CI40170612165 passes all3 jobs at52cde258dc1ab6d1dc112996206af98f8d16bb6e.
+Full local Release validation is recorded in the final package. No game deployed
+or restarted, and historical Anno evidence remains pinned to9e1b140.
+
+Final local result: full Release build and61/61 default CTests passed, zero failures/skips, on the RTX5070Ti PC. Includes cross-queue, post-copy FIFO, packed-depth and buffer-copy regressions. No additional runtime changes after52cde25.

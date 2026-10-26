@@ -19,6 +19,7 @@
 
 #include "host_dx12/capture/frame_capture.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
+#include "host_dx12/observe/producers.hpp"
 #include "host_dx12/upscalers/ffx_intercept.hpp"
 #include "host_dx12/upscalers/xess_intercept.hpp"
 #include "host_dx12/color/color_space.hpp"
@@ -123,7 +124,7 @@ std::atomic<uint32_t> g_initialized{0};
 std::atomic<uint32_t> g_gamepad_hooked{0};
 std::atomic<bool> g_stopping{false};
 std::atomic<float> g_fps{0.0f}, g_frame_ms{0.0f}, g_mouse_x{0.0f}, g_mouse_y{0.0f};
-const char* g_route_tag = "";
+char g_route_tag[64]{};
 PanelFn g_controls = nullptr;
 char g_game_name[96] = {};
 // Evidence freshness for the menu: presents since the evaluate counter moved.
@@ -1728,20 +1729,24 @@ HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flag
 {
     if (na::present::IsPresentThread()) return g_orig_present(sc, sync, flags); // never re-entered by design; safety
     na::dlss::ReleaseIfDeviceRemoved(); // G2-004: never pin a removed device across the game's recovery
-    if (flags & DXGI_PRESENT_TEST) return g_orig_present(sc, sync, flags);      // A62: occlusion query, nothing is shown
-    if (na::present::Proxied(sc)) return presenter_present(sc, sync, flags, nullptr);
-    on_present(sc);
-    return g_orig_present(sc, sync, flags);
+    if (!(flags & DXGI_PRESENT_TEST) && na::present::Proxied(sc)) return presenter_present(sc, sync, flags, nullptr);
+    const auto observed = na::observe::PresentBegin(sc);
+    if (!(flags & DXGI_PRESENT_TEST)) on_present(sc);
+    const HRESULT result = g_orig_present(sc, sync, flags);
+    na::observe::PresentEnd(observed,sync,flags,result);
+    return result;
 }
 HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT flags,
                                          const DXGI_PRESENT_PARAMETERS* pp)
 {
     if (na::present::IsPresentThread()) return g_orig_present1(sc, sync, flags, pp);
     na::dlss::ReleaseIfDeviceRemoved(); // G2-004: never pin a removed device across the game's recovery
-    if (flags & DXGI_PRESENT_TEST) return g_orig_present1(sc, sync, flags, pp);
-    if (na::present::Proxied(sc)) return presenter_present(sc, sync, flags, pp);
-    on_present(sc);
-    return g_orig_present1(sc, sync, flags, pp);
+    if (!(flags & DXGI_PRESENT_TEST) && na::present::Proxied(sc)) return presenter_present(sc, sync, flags, pp);
+    const auto observed = na::observe::PresentBegin(sc);
+    if (!(flags & DXGI_PRESENT_TEST)) on_present(sc);
+    const HRESULT result = g_orig_present1(sc, sync, flags, pp);
+    na::observe::PresentEnd(observed,sync,flags,result);
+    return result;
 }
 HRESULT STDMETHODCALLTYPE DetourGetBuffer(IDXGISwapChain* sc, UINT index, REFIID riid, void** out)
 {
@@ -1900,6 +1905,9 @@ void STDMETHODCALLTYPE DetourExecute(ID3D12CommandQueue* q, UINT n,
         }
     }
     g_exec_active.fetch_add(1, std::memory_order_acq_rel);
+    // C8: H1/H2 observation of the game's submissions ([observe] producers=1).
+    const na::observe::ExecuteToken obs_token =
+        na::observe::ProducersActive() ? na::observe::ExecuteBegin(q, n, lists) : na::observe::ExecuteToken{};
     ExecuteSubscriber* sub = g_exec_sub.load(std::memory_order_acquire);
     if (sub) {
         ExecuteContext ctx{q, n, lists, g_exec_ticket.fetch_add(1, std::memory_order_relaxed) + 1, uncovered, sub->user};
@@ -1916,6 +1924,7 @@ void STDMETHODCALLTYPE DetourExecute(ID3D12CommandQueue* q, UINT n,
         na::gputime::OnExecuted(q, n, lists); // R-202: completion fence on the queue that ran the lists
         na::dlss::OnExecuted(q, n, lists);    // C6: completion evidence before retired DLSS features are released
     }
+    if (obs_token.queue_state) na::observe::ExecuteEnd(obs_token, q, n, lists);
     g_exec_active.fetch_sub(1, std::memory_order_acq_rel);
 }
 
@@ -1923,7 +1932,8 @@ void STDMETHODCALLTYPE DetourExecute(ID3D12CommandQueue* q, UINT n,
 
 bool Start(const char* route_tag, PanelFn controls)
 {
-    g_route_tag = route_tag ? route_tag : "";
+    // Start is called with a bootstrap-local buffer; own the overlay label.
+    snprintf(g_route_tag, sizeof(g_route_tag), "%s", route_tag ? route_tag : "");
     g_controls = controls;
     g_stopping.store(false);
 
@@ -2005,6 +2015,11 @@ bool Start(const char* route_tag, PanelFn controls)
                 na::hooking::HookVTableSlot(sc3.Get(), kSwap3SetColorSpace1Slot,
                                             reinterpret_cast<void*>(&DetourSetColorSpace1),
                                             reinterpret_cast<void**>(&g_orig_set_color_space));
+            }
+            if (ok && na::observe::InstallRequested()) // C8: observation producers on the same throwaway objects
+            {
+                na::observe::InstallProducers(dev.Get(), queue.Get(), /*hook_queue_execute=*/false);
+                na::observe::SetExecuteForwarder(g_orig_execute); // C9b: host sample copies bypass this detour
             }
             if (ok) {
                 na::present::Originals o;
