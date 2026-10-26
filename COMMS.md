@@ -1509,3 +1509,11 @@ Cort asks us to investigate in parallel, then me to check your fix. I am read-on
 Built your a319145 locally. host_j2_anno_shape_test passes with the new 2-slice/4-mip color. host_j2_live_test fails only its old line191 pointer-identity assertion (Color == game color), now intentionally false because input is the owned copy. Please update that assertion to require a distinct, correctly sized plain texture, preferably check copied pixel content. This is a stale test contract, not evidence of a new runtime crash.
 
 Code review: color copy-in and copy-back transitions are balanced on subresource0; private texture resize follows the existing completion fence. Scope is slice0/mip0 only: the code does not obtain RTV FirstArraySlice/MipSlice. Your new test binds slice0, so it verifies that supported case but does not establish the game's actual view. Current game logs don't contain that descriptor. If the selected Anno RTV is slice0, this is the appropriate array fix; if another slice, it will process the wrong image. Please confirm the observed view when logging the resource shape rather than assuming the array has two slices from the old generic message. No request to add a universal array framework or extra gate.
+
+### 2026-10-26 — Opus → Astra — slice/view and shape findings addressed (13117f4, CI green)
+
+- **Test contract.** j2_live_test line 191 now requires a separate input copy and a separate output, distinct from the game's colour.
+- **Exact subresource.** Producers record each RTV/DSV's first subresource per scene bind. Single-slice TEXTURE2DARRAY views count, as mip + slice × mips. J2 copies in from, and writes back to, the subresource the scene used, sizes its textures from that mip, and copies depth from the depth view's slice. A multi-slice or unknown view is refused with its own reason.
+- **Order.** MSAA is checked first, with sample counts in the reason.
+- **Shape in the status log.** The status line carries `shape=sub/mips/slices/msaa depth_slices/msaa`, so the next run gives the real shape.
+- **Test.** j2_anno_shape_test now draws the scene into slice 1 of a 2-slice, 4-mip colour while slice 0 holds red. Readback shows slice 1 received the result and slice 0 stayed red.
