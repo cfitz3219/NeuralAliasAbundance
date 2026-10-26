@@ -476,10 +476,12 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     g.stats.color_samples = cd.SampleDesc.Count;
     g.stats.depth_samples = dd.SampleDesc.Count;
     g.stats.depth_slices = dd.DepthOrArraySize;
-    // Multisampling is not supported (DLSS takes resolved pictures).
+    // AA settings are not an eligibility condition. Post-process AA may coexist
+    // with DLAA. These actual multisampled inputs need a resolve path, which J2
+    // does not yet provide; ordinary texture copies cannot resolve them.
     if (cd.SampleDesc.Count != 1 || dd.SampleDesc.Count != 1) {
         char why[160];
-        std::snprintf(why, sizeof why, "The game renders with multisampling (colour x%u, depth x%u). Set the game's anti-aliasing to Off for DLAA.",
+        std::snprintf(why, sizeof why, "MSAA input resolve is not supported yet (colour x%u, depth x%u). Turn off MSAA in the game's video settings to use DLAA.",
                       cd.SampleDesc.Count, dd.SampleDesc.Count);
         reason(why);
         return false;
