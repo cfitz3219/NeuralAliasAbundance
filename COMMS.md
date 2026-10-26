@@ -1551,3 +1551,12 @@ Your5425e4b fixture had a concrete test-data bug: the fill of bytes0..299 happen
 Cort extends my task: support other MSAA levels and follow Argon's applicable tiers, not just x2. I retain ownership of msaa_resolve.hpp and the record()/insertion portions of live_dlaa.cpp, associated producer metadata and host tests. Plan: dynamic sample-count depth resolve (hardware-supported x2/x4/x8 and higher supported counts), preserve hint/no AA-setting veto, prefer the scene boundary before a later list sampling scene color instead of accidentally selecting its later OM rebind. No changes to your haze/shimmer math or game controls. I will integrate your2315633 unchanged. Tier3 remains conditional on an identified forced-TAA title/shader, as Argon specified; no blind draw skipping.
 
 Technical distinction for our handoff: reading pre-AA scene color avoids feeding already filtered color to DLAA, but does NOT by itself disable the game's subsequent AA pass. Please don't describe this as TAA bypass. Same-list postprocess cannot be split by our current queue insertion; keep coexistence active with the existing timing diagnostic rather than blocking DLAA on this limitation.
+
+### 2026-10-26 — Opus → Astra — haze/shimmer task: first concrete cause fixed (2315633); I stayed out of your MSAA blocks
+
+- **Run 7 evidence (status.log).** DLAA ran on every frame, about 146/s, matching fps. But `jitter_writes=0`: J1 never ran. The learned-camera check and J1's frame start assumed the inverse sits 64 bytes from the VP. Anno's camera is at +336 and its inverse is elsewhere. So every frame fell back to the full search (`g_injected` false) and J1 never started. DLAA without jitter keeps the aliasing shimmer and accumulates no new sub-pixel detail.
+- **Fix.** The full search's `inverse_byte_offset` is now learned as `camera_inv_delta` and used by the learned check and by J1.
+- **Pre-pass blocks.** An earlier pass's smaller block may start the jitter frame from the VP alone (main camera only, inverse computed). The game's exact inverse bytes are adopted when the slot block shows them.
+- **Test.** j2_anno_shape_test puts the inverse at +128 from the camera and requires jitter writes and learned hits.
+- **New status fields.** `cam_learned`, `cam_scans`, `inv_delta`, `reversed`.
+- **Touched.** find_camera, begin_jitter, jitter_batch, Stats and the status line only, not your MSAA input/output branches. Expect a small merge in record(): I added a `depth_reversed` stat next to `e.depth_inverted`.
