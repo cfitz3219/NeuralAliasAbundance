@@ -52,7 +52,10 @@ struct State {
     uint64_t frame = 0;
     int64_t camera_offset = -1; // learned offset of the ViewProjection inside its block
     Stats stats;
-} g;
+};
+// Never destroyed: at process exit the observation hooks' own state may already
+// be gone, and releasing D3D12 objects then would call into them.
+State& g = *new State;
 
 void reason(const char* r) { std::snprintf(g.stats.reason, sizeof(g.stats.reason), "%s", r); }
 
@@ -233,21 +236,6 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         reason("Scene depth does not match the colour size or is not 32-bit depth.");
         return false;
     }
-    na::camera::Matrix vp{};
-    bool reversed = false;
-    if (!find_camera(lists[scene], &vp, &reversed)) {
-        ++g.stats.no_camera;
-        g.camera_offset = -1; // relearn
-        char why[160];
-        std::snprintf(why, sizeof why, "Waiting: no camera matrix with its inverse (cbv binds %zu, blocks %zu, read %zu, matrices %zu, view-proj %zu).",
-                      g_cd.binds, g_cd.blocks, g_cd.read, g_cd.cands, g_cd.vp);
-        reason(why);
-        return false;
-    }
-    const double zero[2] = {0, 0}; // no jitter injected yet (J1)
-    const na::camera::CameraFrame cam = g.tracker.Update(vp, ++g.frame, w, h, zero);
-    if (!cam.valid) { ++g.stats.no_camera; reason("The camera matrix could not be inverted."); return false; }
-    if (cam.camera_cut) ++g.stats.cuts;
 
     // Ring slot (never wait) and size/format changes (only once the GPU is done with the old set).
     const UINT64 done = g.fence->GetCompletedValue();
@@ -269,6 +257,22 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         g.w = w; g.h = h; g.color_format = cd.Format;
         g.tracker.Reset();
     }
+    // Camera after the size check: a resize resets the tracker, which must precede this frame's update.
+    na::camera::Matrix vp{};
+    bool reversed = false;
+    if (!find_camera(lists[scene], &vp, &reversed)) {
+        ++g.stats.no_camera;
+        g.camera_offset = -1; // relearn
+        char why[160];
+        std::snprintf(why, sizeof why, "Waiting: no camera matrix with its inverse (cbv binds %zu, blocks %zu, read %zu, matrices %zu, view-proj %zu).",
+                      g_cd.binds, g_cd.blocks, g_cd.read, g_cd.cands, g_cd.vp);
+        reason(why);
+        return false;
+    }
+    const double zero[2] = {0, 0}; // no jitter injected yet (J1)
+    const na::camera::CameraFrame cam = g.tracker.Update(vp, ++g.frame, w, h, zero);
+    if (!cam.valid) { ++g.stats.no_camera; reason("The camera matrix could not be inverted."); return false; }
+    if (cam.camera_cut) ++g.stats.cuts;
     if (FAILED(s.alloc->Reset()) || FAILED(s.list->Reset(s.alloc.Get(), nullptr))) { reason("Could not reset the DLAA command list."); return false; }
     ID3D12GraphicsCommandList* l = s.list.Get();
     std::vector<D3D12_RESOURCE_BARRIER> b;
@@ -433,7 +437,9 @@ void Shutdown()
     g.depth32.Reset(); g.motion.Reset(); g.provenance.Reset(); g.output.Reset();
     for (auto& s : g.slots) { s.list.Reset(); s.alloc.Reset(); s.fence_value = 0; }
     g.fence.Reset(); g.queue.Reset(); g.device.Reset();
+    g.arbiter = na::motion::gpu::Arbiter{};
     g.arbiter_ok = false;
+    g.tracker.Reset();
     g.w = g.h = 0;
 }
 
