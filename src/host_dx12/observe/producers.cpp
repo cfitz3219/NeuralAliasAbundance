@@ -72,6 +72,13 @@ struct ListState {
     };
     std::vector<StateNote> states;
     bool evidence_complete = true; // C9B-R4: no truncated batch / overflow in this recording (under bind_m)
+    // G3-06 review: resources this recording references (render/depth targets,
+    // clears, copies, resolves, barriers), under bind_m. A carried state is
+    // only used for a resource the submitted work references (the application
+    // must keep it alive until that work runs); copy-queue submissions decay
+    // every resource they reference. Bounded; overflow clears uses_complete.
+    std::vector<na_object_id> uses;
+    bool uses_complete = true;
 };
 
 struct Obj {
@@ -118,18 +125,122 @@ struct BufferInfo {
     uint64_t width = 0;
     uint8_t* cpu = nullptr; // live CPU mapping of subresource 0 (Map/Unmap observed)
     uint32_t maps = 0;
+    // G3-02: CPU-visible memory (UPLOAD, or CUSTOM with a CPU page property),
+    // and whether the application has mapped it (or it predates observation).
+    bool cpu_visible = false;
+    bool ever_mapped = false;
 };
+// UPLOAD, or a CUSTOM heap the CPU can address (WRITE_COMBINE / WRITE_BACK).
+bool cpu_visible_heap(const D3D12_HEAP_PROPERTIES& p)
+{
+    return p.Type == D3D12_HEAP_TYPE_UPLOAD ||
+           (p.Type == D3D12_HEAP_TYPE_CUSTOM && (p.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE ||
+                                                 p.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
+}
 std::unordered_map<na_object_id, BufferInfo> g_buffers; // under g_m
 std::unordered_map<na_object_id, const void*> g_res_keys; // resource id -> canonical object (C9b), under g_m
 std::atomic<uint64_t> g_next_id{1};
 
 struct Counters {
     std::atomic<uint64_t> nested_unlocked{0};
+    std::atomic<uint64_t> snap_reread{0}, preexisting_resources{0}, preexisting_heaps{0}, sample_known_state{0}, known_clears{0};
     std::atomic<uint64_t> sample_missing_recording{0}, sample_partial_coverage{0}, sample_partial_states{0}, sample_no_transition{0};
     std::atomic<uint64_t> live{0}, created{0}, retired{0}, writes{0}, copies{0}, unresolved{0}, sentinel_fail{0},
         executes{0}, ambiguous{0};
     std::atomic<uint32_t> hooks{0}, missing{0};
 } g_c;
+
+std::atomic<uint64_t> g_unhooked_devices{0}, g_unhooked_queues{0};
+std::atomic<bool> g_known_disabled{false}; // a submission could not be observed: carried states are never trusted
+
+// ---------------------------------------------- G3-06: known resource states
+// Explicit transition state carried across submissions, so a sample does not
+// need a barrier in the very submission it follows. A wrong StateBefore in the
+// host's copy barrier would be invalid GPU work, so a record is used only when
+// it is provably current (Gate 3 review, PR40 items 1-4):
+//  - Eligibility: committed, non-simultaneous-access textures registered at
+//    creation. Placed/reserved (aliasable, so no wildcard aliasing barrier can
+//    reach the store), buffers (implicit decay) and resources first met after
+//    installation never get an entry. The store is capped; a texture that
+//    does not fit is simply not eligible (fail-safe).
+//  - Evidence is captured from the recordings BEFORE the submission is
+//    forwarded (a list may be reset as soon as ExecuteCommandLists returns).
+//  - While a submission is in flight (Begin..End), every resource it
+//    transitions (and, on a copy queue, every resource it references) is
+//    marked; a marked record is never read by another submission.
+//  - Publication at End applies the captured transitions only when this
+//    submission was the sole marker of that resource from its Begin to its
+//    End, nothing order-ambiguous happened and no store clear intervened.
+//    Otherwise the record becomes unknown. Copy-queue submissions decay every
+//    resource they reference to COMMON (unknown).
+//  - A submission whose recordings are incomplete may transition anything:
+//    the store is reset at its Begin and nothing is readable or publishable
+//    until it ends.
+//  - Any unobservable submission path (an unhooked queue or device, a queue
+//    that could not be registered) disables the store for the process.
+//  - Records belong to the queue that last transitioned them; another queue
+//    never reads them (cross-queue order needs fences we do not track). A
+//    partial transition on a second queue makes the other subresources unknown.
+// Pending split barriers (BEGIN_ONLY), aliased resources and COMMON are never usable.
+constexpr uint32_t kStatePending = 0xFFFFFFFFu;
+struct ResKnown {
+    uint32_t in_flight = 0; // submissions between Begin and End that mark it
+    uint64_t mark_seq = 0;  // incremented on every mark
+    na_object_id queue = 0; // last queue that transitioned it; 0 = creation state only
+    bool has_all = false;
+    uint32_t all = kStatePending;
+    std::unordered_map<uint32_t, uint32_t> subs;
+};
+constexpr size_t kMaxKnown = 65536, kMaxKnownSubs = 64;
+std::mutex g_known_m;
+std::unordered_map<na_object_id, ResKnown> g_known; // under g_known_m (never taken before g_m or g_samples_m)
+uint64_t g_known_epoch = 0;     // under g_known_m: incremented by every store reset
+uint32_t g_unknown_inflight = 0; // under g_known_m: incomplete submissions between Begin and End
+
+void known_created(na_object_id id, uint32_t state)
+{
+    std::lock_guard<std::mutex> lock(g_known_m);
+    if (g_known.size() >= kMaxKnown && !g_known.count(id)) return; // not eligible
+    ResKnown k;
+    k.has_all = true;
+    k.all = state;
+    g_known[id] = std::move(k);
+}
+void known_forget(na_object_id id)
+{
+    std::lock_guard<std::mutex> lock(g_known_m);
+    g_known.erase(id);
+}
+void known_reset_locked(ResKnown& k)
+{
+    k.queue = 0;
+    k.has_all = false;
+    k.all = kStatePending;
+    k.subs.clear();
+}
+// Entries stay (eligibility and in-flight marks are kept); states become unknown.
+void known_clear_locked()
+{
+    for (auto& kv : g_known) known_reset_locked(kv.second);
+    ++g_known_epoch;
+    g_c.known_clears.fetch_add(1);
+}
+// self_marks: marks the asking submission itself holds on this resource.
+bool known_state(na_object_id res, uint32_t sub, na_object_id qid, uint32_t self_marks, uint32_t* state)
+{
+    // An unhooked queue's submissions are unobserved. (An unhooked device only
+    // leaves resources unregistered, and unregistered resources are never eligible.)
+    if (g_known_disabled.load() || g_unhooked_queues.load()) return false;
+    std::lock_guard<std::mutex> lock(g_known_m);
+    if (g_unknown_inflight) return false;
+    auto it = g_known.find(res);
+    if (it == g_known.end() || it->second.in_flight > self_marks || (it->second.queue && it->second.queue != qid)) return false;
+    auto s = it->second.subs.find(sub);
+    const uint32_t v = s != it->second.subs.end() ? s->second : (it->second.has_all ? it->second.all : kStatePending);
+    if (v == kStatePending || v == D3D12_RESOURCE_STATE_COMMON) return false;
+    *state = v;
+    return true;
+}
 
 thread_local uint64_t t_seq = 0;
 // C9b: set while the host records/submits its OWN sample copies, so none of
@@ -158,7 +269,6 @@ bool ordering_window_intact()
 std::atomic<bool> g_lists_hooked{false};
 void** g_device_table = nullptr; // the device table whose entries are ours
 void** g_queue_table = nullptr;
-std::atomic<uint64_t> g_unhooked_devices{0}, g_unhooked_queues{0};
 
 template <typename E>
 void init_header(E& e, uint32_t kind, uint32_t flags)
@@ -251,6 +361,7 @@ void RetireSentinel::retire(const void* key, na_object_id id, uint32_t kind)
         g_buffers.erase(id);
         g_res_keys.erase(id);
     }
+    if (kind == NA_OBJ_RESOURCE) known_forget(id);
     g_c.live.fetch_sub(1);
     g_c.retired.fetch_add(1);
     na_ev_object_retired e;
@@ -401,8 +512,15 @@ void note_resource(ID3D12Device* dev, IUnknown* obj, uint32_t creation_kind, ID3
     const D3D12_RESOURCE_DESC d = res->GetDesc();
     const uint64_t va = d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? res->GetGPUVirtualAddress() : 0;
     uint32_t heap_type = NA_UNKNOWN_U32;
-    if (props) heap_type = props->Type;
-    else if (heap) heap_type = heap->GetDesc().Properties.Type;
+    bool cpu_visible = false;
+    if (props) {
+        heap_type = props->Type;
+        cpu_visible = cpu_visible_heap(*props);
+    } else if (heap) {
+        const D3D12_HEAP_PROPERTIES hp = heap->GetDesc().Properties;
+        heap_type = hp.Type;
+        cpu_visible = cpu_visible_heap(hp);
+    }
     res->Release();
 
     const na_object_id dev_id = device_id(dev);
@@ -434,13 +552,89 @@ void note_resource(ID3D12Device* dev, IUnknown* obj, uint32_t creation_kind, ID3
         BufferInfo& bi = g_buffers[id];
         bi.heap_type = heap_type;
         bi.width = d.Width;
+        bi.cpu_visible = cpu_visible;
     }
+    // G3-06: committed, non-simultaneous textures are eligible for carried
+    // state from creation (a COMMON creation state is recorded but never
+    // usable until an explicit transition). Placed/reserved resources alias
+    // and are never eligible; simultaneous-access textures decay.
+    if (creation_kind == NA_CREATE_COMMITTED && d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+        !(d.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS))
+        known_created(id, static_cast<uint32_t>(initial));
     if (va) {
         std::unique_lock<std::shared_mutex> lock(g_m);
         VaRange r{va, va + d.Width, id, obj};
         g_va.insert(std::upper_bound(g_va.begin(), g_va.end(), r, [](const VaRange& a, const VaRange& b) { return a.begin < b.begin; }), r);
     }
     emit(e, NA_GROUP_RESOURCE);
+}
+
+// G3-03: a resource created before the producers were installed, first met in
+// a recorded barrier or copy. The object is live (the application just passed
+// it), so it is registered PREEXISTING with what the runtime still reports;
+// creation-time facts (initial state, creation kind, placement) stay UNKNOWN.
+na_object_id ensure_resource_registered(ID3D12Resource* res)
+{
+    if (!res) return 0;
+    if (const na_object_id known = lookup(res)) return known;
+    if (t_host_work) return 0; // host-owned objects are never the game's
+    bool created = false;
+    const na_object_id id = ensure_registered(res, NA_OBJ_RESOURCE, &created);
+    if (!created) return id;
+    g_c.preexisting_resources.fetch_add(1);
+    const D3D12_RESOURCE_DESC d = res->GetDesc();
+    D3D12_HEAP_PROPERTIES hp{};
+    D3D12_HEAP_FLAGS hf{};
+    const bool has_heap = SUCCEEDED(res->GetHeapProperties(&hp, &hf)); // fails for reserved resources
+    na_object_id dev_id = 0;
+    ID3D12Device* dev = nullptr;
+    if (SUCCEEDED(res->GetDevice(IID_PPV_ARGS(&dev))) && dev) {
+        dev_id = device_id(dev);
+        dev->Release();
+    }
+    const uint64_t va = d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? res->GetGPUVirtualAddress() : 0;
+    na_ev_resource_created e;
+    init_header(e, NA_EV_RESOURCE_CREATED, NA_EVF_FOUNDATIONAL | NA_EVF_PREEXISTING | NA_EVF_METHOD_UNOBSERVED);
+    e.resource = id;
+    e.device = dev_id;
+    e.heap = 0;
+    e.heap_offset = NA_UNKNOWN_U64;
+    e.dimension = d.Dimension;
+    e.format = d.Format;
+    e.width = d.Width;
+    e.height = d.Height;
+    e.depth_or_array = d.DepthOrArraySize;
+    e.mip_levels = d.MipLevels;
+    e.sample_count = d.SampleDesc.Count;
+    e.creation_kind = NA_UNKNOWN_U32;
+    e.resource_flags = d.Flags;
+    e.initial_state = NA_UNKNOWN_U32;
+    e.heap_type = has_heap ? static_cast<uint32_t>(hp.Type) : NA_UNKNOWN_U32;
+    remember_creation(res, e);
+    {
+        std::unique_lock<std::shared_mutex> lock(g_m);
+        g_res_keys[id] = canon(res);
+        if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            BufferInfo& bi = g_buffers[id];
+            bi.heap_type = e.heap_type;
+            bi.width = d.Width;
+            bi.cpu_visible = has_heap && cpu_visible_heap(hp);
+            bi.ever_mapped = bi.cpu_visible; // it may have been mapped before we could see it
+        }
+        if (va) {
+            VaRange r{va, va + d.Width, id, res};
+            g_va.insert(std::upper_bound(g_va.begin(), g_va.end(), r, [](const VaRange& a, const VaRange& b) { return a.begin < b.begin; }), r);
+        }
+    }
+    emit(e, NA_GROUP_RESOURCE);
+    return id;
+}
+// Resource id for a recorded op: registered lazily on first sight.
+na_object_id resource_id(ID3D12Resource* r)
+{
+    if (!r) return 0;
+    const na_object_id id = ensure_resource_registered(r);
+    return id ? id : NA_UNKNOWN_U64;
 }
 
 bool resolve_va_locked(uint64_t va, na_object_id* resource, uint64_t* offset)
@@ -684,6 +878,7 @@ HRESULT STDMETHODCALLTYPE D_CreateCommandList1(ID3D12Device4* dev, UINT mask, D3
     return hr;
 }
 
+void register_heap(ID3D12Device* dev, IUnknown* obj, ID3D12DescriptorHeap* h, const D3D12_DESCRIPTOR_HEAP_DESC& d, na_object_id id, uint32_t flags);
 HRESULT STDMETHODCALLTYPE D_CreateDescriptorHeap(ID3D12Device* dev, const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID riid, void** out)
 {
     Depth depth("CreateDescriptorHeap");
@@ -692,12 +887,20 @@ HRESULT STDMETHODCALLTYPE D_CreateDescriptorHeap(ID3D12Device* dev, const D3D12_
     if (!obj || !desc) return hr;
     ID3D12DescriptorHeap* h = nullptr;
     if (FAILED(obj->QueryInterface(__uuidof(ID3D12DescriptorHeap), reinterpret_cast<void**>(&h))) || !h) return hr;
+    register_heap(dev, obj, h, *desc, register_object(obj, NA_OBJ_DESCRIPTOR_HEAP), NA_EVF_FOUNDATIONAL);
+    h->Release();
+    return hr;
+}
+
+// Builds the heap record and its creation event. `h` is borrowed.
+void register_heap(ID3D12Device* dev, IUnknown* obj, ID3D12DescriptorHeap* h, const D3D12_DESCRIPTOR_HEAP_DESC& d, na_object_id id, uint32_t flags)
+{
+    const D3D12_DESCRIPTOR_HEAP_DESC* desc = &d;
     auto dh = std::make_unique<DescHeap>();
     dh->key = obj;
     dh->cpu_start = h->GetCPUDescriptorHandleForHeapStart().ptr;
     const bool visible = (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0;
     dh->gpu_start = visible ? h->GetGPUDescriptorHandleForHeapStart().ptr : 0;
-    h->Release();
     dh->increment = descriptor_increment(dev, desc->Type);
     dh->count = desc->NumDescriptors;
     dh->type = desc->Type;
@@ -705,8 +908,8 @@ HRESULT STDMETHODCALLTYPE D_CreateDescriptorHeap(ID3D12Device* dev, const D3D12_
     dh->info.assign(desc->NumDescriptors, DescHeap::SlotInfo{});
     const na_object_id dev_id = device_id(dev);
     na_ev_descriptor_heap_created e;
-    init_header(e, NA_EV_DESCRIPTOR_HEAP_CREATED, NA_EVF_FOUNDATIONAL);
-    e.heap = register_object(obj, NA_OBJ_DESCRIPTOR_HEAP);
+    init_header(e, NA_EV_DESCRIPTOR_HEAP_CREATED, flags);
+    e.heap = id;
     e.device = dev_id;
     e.heap_kind = desc->Type;
     e.descriptor_count = desc->NumDescriptors;
@@ -721,7 +924,28 @@ HRESULT STDMETHODCALLTYPE D_CreateDescriptorHeap(ID3D12Device* dev, const D3D12_
     }
     remember_creation(obj, e);
     emit(e, NA_GROUP_DESCRIPTOR);
-    return hr;
+}
+
+// G3-03: a shader-visible heap created before installation, first met in
+// SetDescriptorHeaps. Its range becomes resolvable; descriptors written before
+// installation stay UNKNOWN (their contents cannot be read back), later
+// writes resolve normally.
+void ensure_heap_registered(ID3D12DescriptorHeap* h)
+{
+    if (!h || t_host_work) return;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_m);
+        for (auto& dh : g_heaps)
+            if (dh->key == h) return;
+    }
+    bool created = false;
+    const na_object_id id = ensure_registered(h, NA_OBJ_DESCRIPTOR_HEAP, &created);
+    if (!created) return;
+    ID3D12Device* dev = nullptr;
+    if (FAILED(h->GetDevice(IID_PPV_ARGS(&dev))) || !dev) return;
+    g_c.preexisting_heaps.fetch_add(1);
+    register_heap(dev, h, h, h->GetDesc(), id, NA_EVF_FOUNDATIONAL | NA_EVF_PREEXISTING | NA_EVF_METHOD_UNOBSERVED);
+    dev->Release();
 }
 
 void STDMETHODCALLTYPE D_CreateConstantBufferView(ID3D12Device* dev, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE h)
@@ -1438,6 +1662,28 @@ void with_list_state(const void* l, F&& f)
     if (ListState* ls = list_state_locked(l, &id)) f(*ls);
 }
 
+constexpr size_t kMaxListUses = 4096;
+void add_use_locked(ListState& ls, na_object_id id)
+{
+    if (!id || id == NA_UNKNOWN_U64 || (!ls.uses.empty() && ls.uses.back() == id)) return;
+    if (ls.uses.size() >= kMaxListUses) { // compact before giving up (targets are rebound often)
+        std::sort(ls.uses.begin(), ls.uses.end());
+        ls.uses.erase(std::unique(ls.uses.begin(), ls.uses.end()), ls.uses.end());
+        if (ls.uses.size() >= kMaxListUses * 3 / 4) {
+            ls.uses_complete = false;
+            return;
+        }
+    }
+    ls.uses.push_back(id);
+}
+void note_uses(const void* l, std::initializer_list<na_object_id> ids)
+{
+    with_list_state(l, [&](ListState& ls) {
+        std::lock_guard<std::mutex> bl(ls.bind_m);
+        for (na_object_id id : ids) add_use_locked(ls, id);
+    });
+}
+
 constexpr uint32_t kRootCbvBytes = 512; // a root CBV has no size: capture this much (bounded by the buffer)
 
 void add_binding(ListState& ls, const ListState::Binding& b)
@@ -1616,6 +1862,8 @@ struct On<sl::list::Reset> {
                     ls->bindings.clear();
                     ls->states.clear();
                     ls->evidence_complete = true;
+                    ls->uses.clear();
+                    ls->uses_complete = true;
                 }
                 ls->root_sig[0] = ls->root_sig[1] = nullptr;
                 ls->coverage_complete.store(cov == na::hooking::variants::Coverage::Complete);
@@ -1684,7 +1932,10 @@ struct On<sl::list::CopyBufferRegion> {
     static void run(GL* l, ID3D12Resource* dst, UINT64 doff, ID3D12Resource* src, UINT64 soff, UINT64 n)
     {
         Rec r;
-        if (begin_op(l, &r)) emit_op(r, NA_OP_COPY_BUFFER_REGION, {id_or_unknown(dst), doff, id_or_unknown(src), soff, n}, nullptr, 0, 0, 0, NA_GROUP_RESOURCE_USE);
+        if (!begin_op(l, &r)) return;
+        const na_object_id d = resource_id(dst), s = resource_id(src);
+        emit_op(r, NA_OP_COPY_BUFFER_REGION, {d, doff, s, soff, n}, nullptr, 0, 0, 0, NA_GROUP_RESOURCE_USE);
+        note_uses(l, {d, s});
     }
 };
 template <>
@@ -1718,8 +1969,9 @@ struct On<sl::list::CopyTextureRegion> {
         };
         fpinfo(dst, &cr.dst_footprint_offset, cr.dst_footprint);
         fpinfo(src, &cr.src_footprint_offset, cr.src_footprint);
-        emit_op(r, NA_OP_COPY_TEXTURE_REGION, {id_or_unknown(dst->pResource), sub(dst), id_or_unknown(src->pResource), sub(src)}, &cr, sizeof(cr),
-                sizeof(cr), 0, NA_GROUP_RESOURCE_USE);
+        const na_object_id d = resource_id(dst->pResource), s = resource_id(src->pResource);
+        emit_op(r, NA_OP_COPY_TEXTURE_REGION, {d, sub(dst), s, sub(src)}, &cr, sizeof(cr), sizeof(cr), 0, NA_GROUP_RESOURCE_USE);
+        note_uses(l, {d, s});
     }
 };
 template <>
@@ -1727,7 +1979,10 @@ struct On<sl::list::CopyResource> {
     static void run(GL* l, ID3D12Resource* dst, ID3D12Resource* src)
     {
         Rec r;
-        if (begin_op(l, &r)) emit_op(r, NA_OP_COPY_RESOURCE, {id_or_unknown(dst), id_or_unknown(src)}, nullptr, 0, 0, 0, NA_GROUP_RESOURCE_USE);
+        if (!begin_op(l, &r)) return;
+        const na_object_id d = resource_id(dst), s = resource_id(src);
+        emit_op(r, NA_OP_COPY_RESOURCE, {d, s}, nullptr, 0, 0, 0, NA_GROUP_RESOURCE_USE);
+        note_uses(l, {d, s});
     }
 };
 template <>
@@ -1735,7 +1990,10 @@ struct On<sl::list::ResolveSubresource> {
     static void run(GL* l, ID3D12Resource* dst, UINT ds, ID3D12Resource* src, UINT ss, DXGI_FORMAT f)
     {
         Rec r;
-        if (begin_op(l, &r)) emit_op(r, NA_OP_RESOLVE, {id_or_unknown(dst), ds, id_or_unknown(src), ss, static_cast<uint64_t>(f)}, nullptr, 0, 0, 0, NA_GROUP_RESOURCE_USE);
+        if (!begin_op(l, &r)) return;
+        const na_object_id d = resource_id(dst), s = resource_id(src);
+        emit_op(r, NA_OP_RESOLVE, {d, ds, s, ss, static_cast<uint64_t>(f)}, nullptr, 0, 0, 0, NA_GROUP_RESOURCE_USE);
+        note_uses(l, {d, s});
     }
 };
 template <>
@@ -1800,38 +2058,66 @@ struct On<sl::list::ResourceBarrier> {
             o.state_before = o.state_after = NA_UNKNOWN_U32;
             switch (b[i].Type) {
             case D3D12_RESOURCE_BARRIER_TYPE_TRANSITION:
-                o.resource = id_or_unknown(b[i].Transition.pResource);
+                o.resource = resource_id(b[i].Transition.pResource);
                 o.subresource = b[i].Transition.Subresource;
                 o.state_before = b[i].Transition.StateBefore;
                 o.state_after = b[i].Transition.StateAfter;
                 break;
             case D3D12_RESOURCE_BARRIER_TYPE_ALIASING:
-                o.resource = id_or_unknown(b[i].Aliasing.pResourceBefore);
-                o.resource_after = id_or_unknown(b[i].Aliasing.pResourceAfter);
+                o.resource = resource_id(b[i].Aliasing.pResourceBefore);
+                o.resource_after = resource_id(b[i].Aliasing.pResourceAfter);
                 break;
             default:
-                o.resource = id_or_unknown(b[i].UAV.pResource);
+                o.resource = resource_id(b[i].UAV.pResource);
                 break;
             }
         }
         emit_op(r, NA_OP_RESOURCE_BARRIER, {n}, out, m * static_cast<uint32_t>(sizeof(na_barrier)), sizeof(na_barrier), m < n ? NA_EVF_TRUNCATED : 0u,
                 NA_GROUP_RESOURCE_USE);
         // C9b: state evidence for sample copies (explicit transitions only).
-        // C9B-R4: a truncated batch or an evidence overflow invalidates the
-        // recording's evidence; BEGIN_ONLY leaves the state pending (unknown)
-        // until its END_ONLY half.
+        // G3-06: the host records EVERY transition of the call; only the wire
+        // event is limited to 64 entries (it stays flagged TRUNCATED). An
+        // overflow of the recording's evidence store still invalidates it
+        // (C9B-R4). BEGIN_ONLY leaves the state pending until its END_ONLY half.
+        // Aliasing barriers make the named resources' states unknown (both
+        // sides). Only placed/reserved resources alias, and those never enter
+        // the carried-state store, so a null (wildcard) aliasing barrier needs
+        // no store-wide action. Allocation is bounded by the 8192-entry
+        // recording store before anything proportional to n is reserved.
+        constexpr size_t kMaxStates = 8192;
+        std::vector<ListState::StateNote> add;
+        std::vector<na_object_id> used;
+        add.reserve(std::min<size_t>(n, kMaxStates));
+        used.reserve(std::min<size_t>(n, 2 * kMaxListUses));
+        bool overflow = false;
+        for (uint32_t i = 0; i < n && !overflow; ++i) {
+            const auto push = [&](na_object_id id, uint32_t subresource, uint32_t state) {
+                if (add.size() >= kMaxStates) overflow = true;
+                else add.push_back({id, subresource, state});
+            };
+            const auto known_id = [](na_object_id id) { return id && id != NA_UNKNOWN_U64; };
+            if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
+                const na_object_id id = i < m ? out[i].resource : resource_id(b[i].Transition.pResource);
+                if (!known_id(id)) continue;
+                const bool begin_only = (b[i].Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY) != 0;
+                push(id, b[i].Transition.Subresource, begin_only ? kStatePending : static_cast<uint32_t>(b[i].Transition.StateAfter));
+                if (used.size() < 2 * kMaxListUses) used.push_back(id);
+            } else if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) {
+                const na_object_id before = i < m ? out[i].resource : resource_id(b[i].Aliasing.pResourceBefore);
+                const na_object_id after = i < m ? out[i].resource_after : resource_id(b[i].Aliasing.pResourceAfter);
+                for (na_object_id id : {before, after})
+                    if (known_id(id)) push(id, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, kStatePending);
+            } else {
+                const na_object_id id = i < m ? out[i].resource : resource_id(b[i].UAV.pResource);
+                if (known_id(id) && used.size() < 2 * kMaxListUses) used.push_back(id);
+            }
+        }
         with_list_state(l, [&](ListState& ls) {
             std::lock_guard<std::mutex> bl(ls.bind_m);
-            if (m < n) ls.evidence_complete = false;
-            for (uint32_t i = 0; i < m; ++i) {
-                if (out[i].barrier_type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || !out[i].resource || out[i].resource == NA_UNKNOWN_U64) continue;
-                if (ls.states.size() >= 8192) {
-                    ls.evidence_complete = false;
-                    break;
-                }
-                const bool begin_only = (out[i].barrier_flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY) != 0;
-                ls.states.push_back({out[i].resource, out[i].subresource, begin_only ? 0xFFFFFFFFu : out[i].state_after});
-            }
+            if (overflow || ls.states.size() + add.size() > kMaxStates) ls.evidence_complete = false;
+            else ls.states.insert(ls.states.end(), add.begin(), add.end());
+            for (na_object_id id : used) add_use_locked(ls, id);
+            if (used.size() >= 2 * kMaxListUses) ls.uses_complete = false;
         });
     }
 };
@@ -1849,6 +2135,7 @@ struct On<sl::list::SetDescriptorHeaps> {
     {
         Rec r;
         if (!begin_op(l, &r)) return;
+        for (UINT i = 0; h && i < n; ++i) ensure_heap_registered(h[i]); // G3-03
         na_object_id res = 0, smp = 0;
         for (UINT i = 0; h && i < n; ++i) {
             if (!h[i]) continue;
@@ -2005,6 +2292,10 @@ struct On<sl::list::OMSetRenderTargets> {
         }
         emit_op(r, NA_OP_OM_SET_RENDER_TARGETS, {std::min<UINT>(n, 8), dsv ? 1u : 0u}, refs, m * static_cast<uint32_t>(sizeof(na_view_ref)), sizeof(na_view_ref), 0,
                 NA_GROUP_RESOURCE_USE);
+        with_list_state(l, [&](ListState& ls) {
+            std::lock_guard<std::mutex> bl(ls.bind_m);
+            for (uint32_t i = 0; i < m; ++i) add_use_locked(ls, refs[i].resource);
+        });
     }
 };
 template <>
@@ -2015,6 +2306,7 @@ struct On<sl::list::ClearDepthStencilView> {
         if (!begin_op(l, &r)) return;
         const na_view_ref v = cpu_ref(h);
         emit_op(r, NA_OP_CLEAR_DSV, {static_cast<uint64_t>(f), float_bits(depth, 0.f), stencil}, &v, sizeof(v), sizeof(v), 0, NA_GROUP_RESOURCE_USE);
+        note_uses(l, {v.resource});
     }
 };
 template <>
@@ -2027,6 +2319,7 @@ struct On<sl::list::ClearRenderTargetView> {
         const float z[4] = {0, 0, 0, 0};
         const float* cc = c ? c : z;
         emit_op(r, NA_OP_CLEAR_RTV, {float_bits(cc[0], cc[1]), float_bits(cc[2], cc[3])}, &v, sizeof(v), sizeof(v), 0, NA_GROUP_RESOURCE_USE);
+        note_uses(l, {v.resource});
     }
 };
 template <>
@@ -2121,6 +2414,7 @@ void note_map(ID3D12Resource* r, void* cpu)
     auto it = g_buffers.find(id);
     if (it == g_buffers.end()) return;
     it->second.cpu = static_cast<uint8_t*>(cpu);
+    it->second.ever_mapped = true;
     ++it->second.maps;
 }
 std::atomic<void (*)(void*)> g_unmap_probe{nullptr}; // tests: Unmap reached the contested lock
@@ -2139,7 +2433,7 @@ template <int I>
 HRESULT STDMETHODCALLTYPE D_Map(ID3D12Resource* r, UINT sub, const D3D12_RANGE* range, void** out)
 {
     const HRESULT hr = o_Map[I](r, sub, range, out);
-    if (SUCCEEDED(hr) && sub == 0 && out && *out) note_map(r, *out);
+    if (!t_host_work && SUCCEEDED(hr) && sub == 0 && out && *out) note_map(r, *out); // host reads are not the app's mapping
     return hr;
 }
 // C9-H3-REVIEW-1 #1: the mapping is forgotten BEFORE the runtime unmaps it.
@@ -2148,7 +2442,7 @@ HRESULT STDMETHODCALLTYPE D_Map(ID3D12Resource* r, UINT sub, const D3D12_RANGE* 
 template <int I>
 void STDMETHODCALLTYPE D_Unmap(ID3D12Resource* r, UINT sub, const D3D12_RANGE* range)
 {
-    if (sub == 0) note_unmap(r);
+    if (sub == 0 && !t_host_work) note_unmap(r);
     o_Unmap[I](r, sub, range);
 }
 
@@ -2229,21 +2523,60 @@ void snapshot_submission(na_object_id qid, uint64_t ticket, uint32_t count, ID3D
             } else if (!b.resource) {
                 o.e.status = NA_SNAP_UNRESOLVED;
             } else {
-                std::shared_lock<std::shared_mutex> lock(g_m); // Unmap waits for the copy
-                auto it = g_buffers.find(b.resource);
-                if (it == g_buffers.end()) o.e.status = NA_SNAP_UNRESOLVED;
-                else if (it->second.heap_type != D3D12_HEAP_TYPE_UPLOAD) o.e.status = NA_SNAP_GPU_WRITTEN;
-                else if (!it->second.cpu) o.e.status = NA_SNAP_NOT_MAPPED;
-                else if (b.offset >= it->second.width) o.e.status = NA_SNAP_UNRESOLVED;
-                else {
-                    const uint64_t avail = it->second.width - b.offset;
-                    n = static_cast<uint32_t>(std::min<uint64_t>({b.size, kMaxBytes, avail, kBudget - total}));
-                    if (auto probe = g_copy_probe.load(std::memory_order_acquire)) probe(g_copy_probe_user.load());
-                    if (guarded_copy(o.bytes, it->second.cpu + b.offset, n)) {
+                ID3D12Resource* reread = nullptr; // G3-02: host read of an app-unmapped buffer
+                {
+                    std::shared_lock<std::shared_mutex> lock(g_m); // Unmap waits for the copy
+                    auto it = g_buffers.find(b.resource);
+                    if (it == g_buffers.end()) o.e.status = NA_SNAP_UNRESOLVED;
+                    else if (!it->second.cpu_visible) o.e.status = NA_SNAP_GPU_WRITTEN;
+                    else if (b.offset >= it->second.width) o.e.status = NA_SNAP_UNRESOLVED;
+                    else if (!it->second.cpu && !it->second.ever_mapped) o.e.status = NA_SNAP_NOT_MAPPED; // never written by the CPU
+                    else {
+                        const uint64_t avail = it->second.width - b.offset;
+                        n = static_cast<uint32_t>(std::min<uint64_t>({b.size, kMaxBytes, avail, kBudget - total}));
+                        if (it->second.cpu) {
+                            if (auto probe = g_copy_probe.load(std::memory_order_acquire)) probe(g_copy_probe_user.load());
+                            if (guarded_copy(o.bytes, it->second.cpu + b.offset, n)) {
+                                o.e.status = NA_SNAP_CAPTURED;
+                            } else {
+                                n = 0;
+                                o.e.status = NA_SNAP_UNRESOLVED;
+                            }
+                        } else {
+                            // The app mapped, wrote and unmapped it before this
+                            // submission (or mapped it before observation began).
+                            // The resource is bound by a list being submitted, so
+                            // it is alive: take a reference and map it read-only
+                            // ourselves, outside g_m (Map/Unmap are free-threaded
+                            // and reference counted by the runtime).
+                            auto key = g_res_keys.find(b.resource);
+                            if (key != g_res_keys.end())
+                                static_cast<IUnknown*>(const_cast<void*>(key->second))->QueryInterface(IID_PPV_ARGS(&reread));
+                            if (!reread) {
+                                n = 0;
+                                o.e.status = NA_SNAP_NOT_MAPPED;
+                            }
+                        }
+                    }
+                }
+                if (reread) {
+                    bool ok = false;
+                    t_host_work = true; // not the application's mapping: no Map/Unmap bookkeeping
+                    const D3D12_RANGE rr{static_cast<SIZE_T>(b.offset), static_cast<SIZE_T>(b.offset + n)};
+                    void* p = nullptr;
+                    if (SUCCEEDED(reread->Map(0, &rr, &p)) && p) {
+                        ok = guarded_copy(o.bytes, static_cast<const uint8_t*>(p) + b.offset, n);
+                        const D3D12_RANGE none{0, 0}; // nothing written by the CPU
+                        reread->Unmap(0, &none);
+                    }
+                    t_host_work = false;
+                    reread->Release();
+                    if (ok) {
                         o.e.status = NA_SNAP_CAPTURED;
+                        g_c.snap_reread.fetch_add(1);
                     } else {
                         n = 0;
-                        o.e.status = NA_SNAP_UNRESOLVED;
+                        o.e.status = NA_SNAP_NOT_MAPPED;
                     }
                 }
             }
@@ -2356,7 +2689,8 @@ std::atomic<bool> g_fail_worker_start{false}; // test seam: thread creation fail
 std::atomic<bool> g_fail_sample_signal{false}; // test seam: the host fence signal is refused after the copy was submitted
 std::thread* g_worker = nullptr;             // immortal, never detached: teardown waits on its own handle
 void (*g_acquire_probe)() = nullptr;         // test seam: after the game's submission returned, before servicing
-constexpr size_t kMaxSamples = 8;     // every entry counts, released-in-flight included
+constexpr size_t kMaxSamples = 8;     // active leases (released-in-flight included, quarantined excluded)
+constexpr size_t kMaxSampleEntries = 64; // hard ceiling including quarantined entries (G3-07)
 constexpr uint64_t kMaxSampleBytes = 64ull << 20;
 
 void recount_armed_locked()
@@ -2763,36 +3097,146 @@ void start_copy_locked(Sample& s, ID3D12Resource* res, ID3D12CommandQueue* q, D3
     s.status = NA_SAMPLE_IN_FLIGHT;
 }
 
-// The submission's resource-state evidence (C9B-R4): false when any list
-// cannot be vouched for, which makes the whole submission ineligible.
-bool submission_notes(uint32_t count, ID3D12CommandList* const* lists, std::vector<ListState::StateNote>& notes)
+// A submission's evidence, captured from its recordings BEFORE it is forwarded
+// (Gate 3 review PR40 #2: a list may be reset as soon as ExecuteCommandLists
+// returns, so nothing is reread afterwards). Shared by sampling (Begin/End)
+// and the known-state store. Every accumulation is bounded before allocation.
+struct SubmissionCapture {
+    bool lists = false;    // the submission carried command lists
+    bool notes_ok = false; // C9B-R4: every list observed, fully covered, evidence complete
+    bool uses_ok = false;  // every referenced resource recorded
+    uint32_t reject = 0;   // first reason notes_ok is false: 1 missing recording, 2 partial coverage, 3 partial states
+    std::vector<ListState::StateNote> notes;
+    std::vector<ListState::Binding> binds;
+    std::vector<na_object_id> uses; // sorted, unique
+    struct Mark {
+        na_object_id id;
+        uint64_t seq;
+        bool alone; // no other submission held a mark when this one was taken
+    };
+    std::vector<Mark> marks; // under g_known_m
+    uint64_t epoch = 0;
+    bool in_store = false, tainted = false, unknown_marked = false, copy_queue = false;
+    uint32_t SelfMarks(na_object_id id) const
+    {
+        uint32_t n = 0;
+        for (const auto& m : marks) n += m.id == id;
+        return n;
+    }
+};
+constexpr size_t kMaxSubmissionNotes = 65536, kMaxSubmissionBinds = 16384, kMaxSubmissionUses = 65536;
+
+void capture_submission(uint32_t count, ID3D12CommandList* const* lists, SubmissionCapture& c)
 {
-    if (!lists || !count) return false;
+    if (!lists || !count) return;
+    c.lists = true;
+    bool notes_ok = true, uses_ok = true;
+    const auto reject = [&](uint32_t why) {
+        if (notes_ok) c.reject = why;
+        notes_ok = uses_ok = false;
+    };
     std::shared_lock<std::shared_mutex> rl(g_m);
     for (uint32_t i = 0; i < count; ++i) {
         na_object_id lid = 0;
         ListState* ls = lists[i] ? list_state_locked(lists[i], &lid) : nullptr;
-        if (!ls || !ls->recording_observed.load()) { ++g_c.sample_missing_recording; return false; }
-        if (!ls->coverage_complete.load()) { ++g_c.sample_partial_coverage; return false; }
+        if (!ls || !ls->recording_observed.load()) {
+            reject(1);
+            continue;
+        }
+        if (!ls->coverage_complete.load()) reject(2);
         std::lock_guard<std::mutex> bl(ls->bind_m);
-        if (!ls->evidence_complete) { ++g_c.sample_partial_states; return false; }
-        notes.insert(notes.end(), ls->states.begin(), ls->states.end());
+        if (!ls->evidence_complete || c.notes.size() + ls->states.size() > kMaxSubmissionNotes) {
+            if (notes_ok) c.reject = 3;
+            notes_ok = false;
+        } else if (notes_ok) {
+            c.notes.insert(c.notes.end(), ls->states.begin(), ls->states.end());
+        }
+        const size_t room = kMaxSubmissionBinds - std::min(kMaxSubmissionBinds, c.binds.size());
+        c.binds.insert(c.binds.end(), ls->bindings.begin(), ls->bindings.begin() + std::min(room, ls->bindings.size()));
+        if (!ls->uses_complete || c.uses.size() + ls->uses.size() > kMaxSubmissionUses) uses_ok = false;
+        else if (uses_ok) c.uses.insert(c.uses.end(), ls->uses.begin(), ls->uses.end());
     }
-    return true;
+    if (!notes_ok) c.notes.clear();
+    std::sort(c.uses.begin(), c.uses.end());
+    c.uses.erase(std::unique(c.uses.begin(), c.uses.end()), c.uses.end());
+    c.notes_ok = notes_ok;
+    c.uses_ok = uses_ok;
 }
-// C10: constant-data bindings recorded in the submission's observed lists.
-void submission_bindings(uint32_t count, ID3D12CommandList* const* lists, std::vector<ListState::Binding>& binds)
+
+// Begin, before forwarding: mark what this submission may change.
+void known_mark(SubmissionCapture& c, bool copy_queue)
 {
-    if (!lists) return;
-    std::shared_lock<std::shared_mutex> rl(g_m);
-    for (uint32_t i = 0; i < count; ++i) {
-        na_object_id lid = 0;
-        ListState* ls = lists[i] ? list_state_locked(lists[i], &lid) : nullptr;
-        if (!ls || !ls->recording_observed.load()) continue;
-        std::lock_guard<std::mutex> bl(ls->bind_m);
-        binds.insert(binds.end(), ls->bindings.begin(), ls->bindings.end());
+    if (!c.lists) return; // queue sync operations change no state
+    std::lock_guard<std::mutex> lock(g_known_m);
+    c.in_store = true;
+    c.copy_queue = copy_queue;
+    if (!c.notes_ok || (copy_queue && !c.uses_ok)) { // may transition/decay anything
+        known_clear_locked();
+        ++g_unknown_inflight;
+        c.unknown_marked = true;
+        return;
+    }
+    c.epoch = g_known_epoch;
+    c.tainted = g_unknown_inflight > 0;
+    std::vector<na_object_id> ids;
+    ids.reserve(c.notes.size() + (copy_queue ? c.uses.size() : 0));
+    for (const auto& n : c.notes) ids.push_back(n.resource);
+    if (copy_queue) ids.insert(ids.end(), c.uses.begin(), c.uses.end());
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    for (na_object_id id : ids) {
+        auto it = g_known.find(id);
+        if (it == g_known.end()) continue; // not eligible
+        ResKnown& k = it->second;
+        c.marks.push_back({id, ++k.mark_seq, k.in_flight == 0});
+        ++k.in_flight;
     }
 }
+
+// End, after forwarding: publish the captured transitions where provably ordered.
+void known_publish(SubmissionCapture& c, na_object_id qid, bool ambiguous)
+{
+    if (!c.in_store) return;
+    std::lock_guard<std::mutex> lock(g_known_m);
+    if (c.unknown_marked) {
+        --g_unknown_inflight;
+        return;
+    }
+    const bool valid = !ambiguous && !c.tainted && c.epoch == g_known_epoch && !c.copy_queue;
+    std::vector<na_object_id> good;
+    for (const auto& m : c.marks) {
+        auto it = g_known.find(m.id);
+        if (it == g_known.end()) continue; // retired meanwhile
+        if (valid && m.alone && it->second.mark_seq == m.seq) good.push_back(m.id);
+        else known_reset_locked(it->second); // overlapped / ambiguous / cleared / copy-queue decay
+    }
+    std::sort(good.begin(), good.end());
+    std::vector<na_object_id> claimed; // ids whose queue ownership was settled in this publication
+    for (const auto& n : c.notes) {
+        if (!std::binary_search(good.begin(), good.end(), n.resource)) continue;
+        ResKnown& k = g_known[n.resource];
+        if (std::find(claimed.begin(), claimed.end(), n.resource) == claimed.end()) {
+            claimed.push_back(n.resource);
+            if (k.queue && k.queue != qid) known_reset_locked(k); // another queue's timeline: start over
+            k.queue = qid;
+        }
+        if (n.subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) {
+            k.has_all = true;
+            k.all = n.state_after;
+            k.subs.clear();
+        } else if (k.subs.size() >= kMaxKnownSubs && !k.subs.count(n.subresource)) {
+            known_reset_locked(k);
+            k.queue = qid;
+        } else {
+            k.subs[n.subresource] = n.state_after;
+        }
+    }
+    for (const auto& m : c.marks) {
+        auto it = g_known.find(m.id);
+        if (it != g_known.end() && it->second.in_flight) --it->second.in_flight;
+    }
+}
+
 // A buffer sample is eligible when the submission bound a range containing it.
 bool binding_covers(const std::vector<ListState::Binding>& binds, const Sample& s)
 {
@@ -2800,8 +3244,6 @@ bool binding_covers(const std::vector<ListState::Binding>& binds, const Sample& 
         if (b.resource == s.req.resource && b.offset <= s.offset && s.req.width <= b.size && s.offset - b.offset <= b.size - s.req.width) return true;
     return false;
 }
-bool sample_eligible(const Sample& s, bool notes_ok, const std::vector<ListState::StateNote>& notes,
-                     const std::vector<ListState::Binding>& binds, D3D12_COMMAND_LIST_TYPE type, uint32_t* state);
 
 bool last_state(const std::vector<ListState::StateNote>& notes, const Sample& s, uint32_t* state)
 {
@@ -2814,15 +3256,23 @@ bool last_state(const std::vector<ListState::StateNote>& notes, const Sample& s,
     return found;
 }
 
-bool sample_eligible(const Sample& s, bool notes_ok, const std::vector<ListState::StateNote>& notes,
-                     const std::vector<ListState::Binding>& binds, D3D12_COMMAND_LIST_TYPE type, uint32_t* state)
+bool sample_eligible(const Sample& s, const SubmissionCapture& c, D3D12_COMMAND_LIST_TYPE type, na_object_id qid, uint32_t* state,
+                     bool* from_known = nullptr)
 {
     if (s.buffer) {
         *state = D3D12_RESOURCE_STATE_GENERIC_READ;
-        return binding_covers(binds, s);
+        return binding_covers(c.binds, s);
     }
     *state = kStateUnknown;
-    return notes_ok && last_state(notes, s, state) && state_ok_for_queue(*state, type);
+    if (!c.notes_ok) return false; // unobserved/incomplete recordings may have transitioned it
+    if (last_state(c.notes, s, state)) return state_ok_for_queue(*state, type);
+    // G3-06: no transition in this (complete) submission. A carried state is
+    // used only for a resource this submission references, so the application
+    // is obliged to keep it alive while we take our reference (review PR40 #1).
+    if (!std::binary_search(c.uses.begin(), c.uses.end(), s.req.resource)) return false;
+    if (!known_state(s.req.resource, s.req.subresource, qid, c.SelfMarks(s.req.resource), state) || !state_ok_for_queue(*state, type)) return false;
+    if (from_known) *from_known = true;
+    return true;
 }
 
 // Source references acquired before the game's submission is forwarded
@@ -2846,16 +3296,15 @@ void drop_prerefs()
 // taking our own reference here is defined. After the forward returns it no
 // longer is: the GPU may finish and another thread may observe its fence and
 // release the resource before we could acquire it.
-void acquire_sample_sources(ID3D12CommandQueue* q, uint32_t count, ID3D12CommandList* const* lists)
+void acquire_sample_sources(ID3D12CommandQueue* q, na_object_id qid, D3D12_COMMAND_LIST_TYPE type, const SubmissionCapture& cap)
 {
     drop_prerefs();
     if (!q || g_armed.load(std::memory_order_acquire) == 0) return;
-    const D3D12_COMMAND_LIST_TYPE type = q->GetDesc().Type;
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE) return;
-    std::vector<ListState::StateNote> notes;
-    const bool notes_ok = submission_notes(count, lists, notes);
-    std::vector<ListState::Binding> binds;
-    submission_bindings(count, lists, binds);
+    if (!cap.lists) return;
+    if (cap.reject == 1) ++g_c.sample_missing_recording;
+    else if (cap.reject == 2) ++g_c.sample_partial_coverage;
+    else if (cap.reject == 3) ++g_c.sample_partial_states;
     std::vector<std::pair<uint64_t, na_object_id>> want;
     {
         na_session_id session = 0;
@@ -2866,7 +3315,7 @@ void acquire_sample_sources(ID3D12CommandQueue* q, uint32_t count, ID3D12Command
             Sample& s = *sp;
             if (s.status != NA_SAMPLE_ARMED || s.released || !scope_check_locked(s, session, epoch)) continue;
             uint32_t state = kStateUnknown;
-            if (sample_eligible(s, notes_ok, notes, binds, type, &state)) want.push_back({s.token, s.req.resource});
+            if (sample_eligible(s, cap, type, qid, &state)) want.push_back({s.token, s.req.resource});
             else ++g_c.sample_no_transition;
         }
         recount_armed_locked();
@@ -2885,7 +3334,7 @@ void acquire_sample_sources(ID3D12CommandQueue* q, uint32_t count, ID3D12Command
 // submission lock: copies for every armed sample whose state this
 // submission's evidence establishes (C9B-R4) and whose source was acquired
 // before the submission (C9B-REVIEW-2 #2).
-void service_samples(ID3D12CommandQueue* q, QueueState* qs, na_object_id qid, uint64_t ticket, uint32_t count, ID3D12CommandList* const* lists)
+void service_samples(ID3D12CommandQueue* q, QueueState* qs, na_object_id qid, uint64_t ticket, D3D12_COMMAND_LIST_TYPE type, const SubmissionCapture& cap)
 {
     if (t_prerefs.empty()) return;
     if (g_acquire_probe) g_acquire_probe();
@@ -2893,11 +3342,8 @@ void service_samples(ID3D12CommandQueue* q, QueueState* qs, na_object_id qid, ui
     t_service_ticket = ticket;
     struct Reset { ~Reset() { t_service_qs = nullptr; } } reset;
     if (!ordering_window_intact()) return; // another operation began on this queue: no copy (stays armed)
-    const D3D12_COMMAND_LIST_TYPE type = q->GetDesc().Type;
-    std::vector<ListState::StateNote> notes;
-    const bool notes_ok = submission_notes(count, lists, notes);
-    std::vector<ListState::Binding> binds;
-    submission_bindings(count, lists, binds); // (unused prerefs are dropped by the caller)
+    // Eligibility uses the evidence captured before the forward (the lists may
+    // already be reset); unused prerefs are dropped by the caller.
     na_session_id session = 0;
     na_epoch epoch = 0;
     na::observe_internal::CurrentScope(&session, &epoch);
@@ -2909,7 +3355,9 @@ void service_samples(ID3D12CommandQueue* q, QueueState* qs, na_object_id qid, ui
         auto pre = std::find_if(t_prerefs.begin(), t_prerefs.end(), [&](const PreRef& p) { return p.token == s.token; });
         if (pre == t_prerefs.end()) continue; // armed after the submission began: no safe reference, stays armed
         uint32_t state = kStateUnknown;
-        if (!sample_eligible(s, notes_ok, notes, binds, type, &state)) continue;
+        bool from_known = false;
+        if (!sample_eligible(s, cap, type, qid, &state, &from_known)) continue;
+        if (from_known) g_c.sample_known_state.fetch_add(1);
         ID3D12Resource* res = pre->res;
         t_prerefs.erase(pre);
         start_copy_locked(s, res, q, type, state, qid, ticket);
@@ -3057,6 +3505,9 @@ bool InstallProducers(ID3D12Device* device, ID3D12CommandQueue* queue, bool hook
         // tables; the variant registry hooks their concrete functions.
         if (ok) {
             const bool reg = na::hooking::Initialize() && register_list_slots();
+            // G3-07: the device hooks are live; host warm-up/probe objects
+            // are not the game's (no ids, sentinels, events or counters).
+            t_host_work = true;
             if (reg) {
                 na::hooking::variants::WarmUpCommandLists(device);
                 na::hooking::variants::StartDiscoveryThread(nullptr, nullptr);
@@ -3065,6 +3516,7 @@ bool InstallProducers(ID3D12Device* device, ID3D12CommandQueue* queue, bool hook
             // C9: Map/Unmap of buffers, hooked on the implementations a
             // committed and a placed upload buffer use (variants get own thunks).
             if (reg) install_map_hooks(device);
+            t_host_work = false;
         }
         if (ok) na::observe_internal::SetSnapshotProvider(&snapshot);
         g_install_ok = ok;
@@ -3078,7 +3530,10 @@ ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue, uint32_t count, ID3D12Comma
     ExecuteToken t;
     na_object_id qid = 0;
     auto qs = queue ? queue_state(queue, &qid) : nullptr;
-    if (!qs) return t;
+    if (!qs) {
+        if (lists && count && !t_host_work) g_known_disabled.store(true); // its transitions are unobservable
+        return t;
+    }
     // A runtime may re-enter Wait/Signal (on this or another queue) while
     // forwarding a submission on this thread. Observe the nested occurrence
     // without taking any submission lock or replacing the outer pre-submit
@@ -3088,11 +3543,24 @@ ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue, uint32_t count, ID3D12Comma
         g_c.nested_unlocked.fetch_add(1);
         t.nested_unlocked = true;
     }
+    // Evidence for sampling and the known-state store, captured before the
+    // original runs (review PR40 #2); the store marks what it may change.
+    std::shared_ptr<SubmissionCapture> cap; // none for queue sync operations and host work
+    D3D12_COMMAND_LIST_TYPE type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (!t_host_work && lists && count) {
+        cap = std::make_shared<SubmissionCapture>();
+        type = queue->GetDesc().Type;
+        capture_submission(count, lists, *cap);
+        known_mark(*cap, type == D3D12_COMMAND_LIST_TYPE_COPY);
+    }
+    t.capture = cap;
+    t.list_type = static_cast<uint32_t>(type);
     if (!t_host_work && t_submit_depth == 0 && g_armed.load(std::memory_order_acquire)) { // C9B-R3
         qs->submit_m.lock();
         ++t_submit_depth;
         t.submit_locked = true;
-        acquire_sample_sources(queue, count, lists); // before the original runs (C9B-REVIEW-2 #2)
+        static const SubmissionCapture kNoLists;
+        acquire_sample_sources(queue, qid, type, cap ? *cap : kNoLists); // before the original runs (C9B-REVIEW-2 #2)
     }
     const auto occurrence = qs->occurrences.Begin();
     t.queue_state = qs;
@@ -3152,9 +3620,12 @@ void ExecuteEnd(const ExecuteToken& t, ID3D12CommandQueue* queue, uint32_t count
     na::observe_internal::Emit(&ex, NA_GROUP_QUEUE);
     // C9b: only a clean occurrence whose submission we serialized is sampled;
     // nothing observed can run on this queue between it and the host copy.
-    if (!t_host_work && t.submit_locked && !ambiguous)
-        service_samples(queue, std::static_pointer_cast<QueueState>(t.queue_state).get(), t.queue_id, t.ticket, count, lists);
+    const auto cap = std::static_pointer_cast<SubmissionCapture>(t.capture);
+    const auto type = static_cast<D3D12_COMMAND_LIST_TYPE>(t.list_type);
+    if (!t_host_work && t.submit_locked && !ambiguous && cap)
+        service_samples(queue, std::static_pointer_cast<QueueState>(t.queue_state).get(), t.queue_id, t.ticket, type, *cap);
     if (t.submit_locked) drop_prerefs(); // unused references (ambiguous, released, no evidence)
+    if (cap) known_publish(*cap, t.queue_id, ambiguous); // G3-06, after servicing (pre-submission states)
     unlock_submission(t);
 }
 
@@ -3258,6 +3729,18 @@ ProducerStats GetProducerStats()
     s.sample_partial_states = g_c.sample_partial_states.load();
     s.sample_no_transition = g_c.sample_no_transition.load();
     s.nested_unlocked = g_c.nested_unlocked.load();
+    s.snapshots_reread = g_c.snap_reread.load();
+    s.preexisting_resources = g_c.preexisting_resources.load();
+    s.preexisting_heaps = g_c.preexisting_heaps.load();
+    s.sample_known_state = g_c.sample_known_state.load();
+    s.known_state_clears = g_c.known_clears.load();
+    s.known_store_disabled = g_known_disabled.load() ? 1u : 0u;
+    s.unhooked_queues = g_unhooked_queues.load();
+    {
+        std::lock_guard<std::mutex> lock(g_known_m);
+        s.known_unknown_inflight = g_unknown_inflight;
+        s.known_entries = g_known.size();
+    }
     return s;
 }
 
@@ -3290,7 +3773,12 @@ extern "C" int __cdecl na_observe_sample_request(const na_sample_request* r, uin
     // largest constant buffer view), height 0 or 1, subresource 0.
     if (buffer && (!r->width || r->width > 65536 || r->height > 1 || r->subresource)) return NA_E_ARG;
     std::lock_guard<std::mutex> lock(g_samples_m);
-    if (g_samples.size() >= kMaxSamples) return NA_E_STATE; // released-in-flight entries count too
+    // G3-07: a released, quarantined (SUBMIT_FAILED) entry is kept until the
+    // device is removed but no longer holds one of the consumer's leases.
+    size_t active = 0;
+    for (const auto& e : g_samples)
+        active += (e->released && e->status == NA_SAMPLE_FAILED && e->reason == NA_SAMPLE_E_SUBMIT_FAILED) ? 0u : 1u;
+    if (active >= kMaxSamples || g_samples.size() >= kMaxSampleEntries) return NA_E_STATE; // released-in-flight entries count too
     auto s = std::make_unique<Sample>();
     s->token = g_next_token.fetch_add(1);
     s->req = *r;

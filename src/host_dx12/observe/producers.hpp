@@ -60,6 +60,9 @@ struct ExecuteToken {
     na_object_id queue_id = 0;
     bool submit_locked = false; // C9B-R3: holds the queue's submission lock until End
     bool nested_unlocked = false; // this occurrence bypassed serialization (nested in a forwarded submission)
+    // Evidence captured before forwarding (sampling + known-state store); opaque here.
+    std::shared_ptr<void> capture;
+    uint32_t list_type = 0; // D3D12_COMMAND_LIST_TYPE of the queue
 };
 // C9b: the game host's original ExecuteCommandLists, used to submit the host's
 // own sample copies without re-entering the host's execute detour.
@@ -115,6 +118,16 @@ struct ProducerStats {
     uint32_t sample_workers_started; // C9B-REVIEW-2 #1: at most 1 per process
     uint64_t sample_missing_recording, sample_partial_coverage, sample_partial_states, sample_no_transition;
     uint64_t nested_unlocked;        // ASTRA-P3-R8: queue ops nested in a forwarded submission (no lock taken)
+    uint64_t snapshots_reread;       // G3-02: app-unmapped upload buffers captured by a host read-only Map
+    uint64_t preexisting_resources;  // G3-03: resources registered lazily on first sight
+    uint64_t preexisting_heaps;      // G3-03: descriptor heaps registered lazily in SetDescriptorHeaps
+    uint64_t sample_known_state;     // G3-06: copies whose state came from an earlier submission / creation
+    uint64_t known_state_clears;     // G3-06: known-state store dropped by an incomplete submission
+    // G3-06 review: why carried states may be unreadable right now.
+    uint32_t known_store_disabled;   // an unobservable submission path was seen (unhooked/unregistered queue)
+    uint32_t known_unknown_inflight; // incomplete submissions currently between Begin and End
+    uint64_t known_entries;          // eligible textures in the store
+    uint64_t unhooked_queues;        // queues whose table differs from the hooked one
 };
 ProducerStats GetProducerStats();
 

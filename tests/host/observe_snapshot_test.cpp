@@ -7,7 +7,11 @@
 //   - the snapshot reflects what the CPU wrote BEFORE the submission even if
 //     the buffer is rewritten afterwards;
 //   - default-heap buffer -> GPU_WRITTEN, no bytes;
-//   - upload buffer never mapped -> NOT_MAPPED, no bytes.
+//   - upload buffer never mapped -> NOT_MAPPED, no bytes;
+//   - G3-02: an upload buffer the application mapped and then UNMAPPED before
+//     the submission is still captured (host read-only Map), with the bytes
+//     the CPU last wrote; a CPU-visible CUSTOM heap (the custom equivalent of
+//     UPLOAD) is captured like UPLOAD, not reported GPU_WRITTEN.
 #include "test_support.hpp"
 #include "host_dx12/host_observe.h"
 #include "host_dx12/observe/producers.hpp"
@@ -151,12 +155,40 @@ int main()
     CHECK(race.reached_boundary);
     CHECK(!race.returned_during_copy);
     CHECK(race.returned.load());
+    // G3-02: the race above unmapped `upload` (the app's only mapping). A later
+    // submission binding it is captured anyway; so is a CUSTOM-heap buffer.
+    D3D12_HEAP_PROPERTIES chp = dev->GetCustomHeapProperties(0, D3D12_HEAP_TYPE_UPLOAD);
+    D3D12_RESOURCE_DESC cbd{};
+    cbd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    cbd.Width = 4096;
+    cbd.Height = cbd.DepthOrArraySize = cbd.MipLevels = 1;
+    cbd.SampleDesc.Count = 1;
+    cbd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    test::ComPtr<ID3D12Resource> custom;
+    REQUIRE(SUCCEEDED(dev->CreateCommittedResource(&chp, D3D12_HEAP_FLAG_NONE, &cbd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&custom))));
+    uint8_t* ccpu = nullptr;
+    REQUIRE(SUCCEEDED(custom->Map(0, nullptr, reinterpret_cast<void**>(&ccpu))));
+    float cam[16];
+    Matrix(cam, 7.0f);
+    std::memcpy(ccpu + 256, cam, sizeof(cam));
+    const uint64_t reread0 = na::observe::GetProducerStats().snapshots_reread;
+    REQUIRE(SUCCEEDED(alloc->Reset()));
+    REQUIRE(SUCCEEDED(list->Reset(alloc.Get(), nullptr)));
+    list->SetGraphicsRootSignature(rs.Get());
+    list->SetGraphicsRootConstantBufferView(0, upload->GetGPUVirtualAddress() + 512);
+    list->SetGraphicsRootConstantBufferView(2, custom->GetGPUVirtualAddress() + 256);
+    REQUIRE(SUCCEEDED(list->Close()));
+    d.queue->ExecuteCommandLists(1, ls);
+    d.WaitIdle();
+    const uint64_t rereads = na::observe::GetProducerStats().snapshots_reread - reread0;
+    custom->Unmap(0, nullptr);
     REQUIRE(na_observe_stop() == NA_OK);
 
+    const na_object_id custom_id = na::observe::IdOf(custom.Get());
     const na_object_id upload_id = na::observe::IdOf(upload.Get()), gpu_id = na::observe::IdOf(gpu.Get()),
                        unmapped_id = na::observe::IdOf(unmapped.Get()), list_id = na::observe::IdOf(list.Get());
     CHECK(upload_id && gpu_id && unmapped_id && list_id);
-    bool root_ok = false, table_ok = false, gpu_ok = false, unmapped_ok = false;
+    bool root_ok = false, table_ok = false, gpu_ok = false, unmapped_ok = false, reread_ok = false, custom_ok = false;
     uint64_t exec_ticket = 0;
     std::lock_guard<std::mutex> lock(g_m);
     for (const auto& e : g_events) {
@@ -173,6 +205,17 @@ int main()
             CHECK(s->status == NA_SNAP_CAPTURED && s->captured_bytes > 0);
             continue;
         }
+        if (s->recording_generation == 4) { // G3-02: after the application's Unmap
+            const uint8_t* b4 = s->payload_offset ? e.data() + s->payload_offset : nullptr;
+            if (s->resource == upload_id) {
+                bool all_ee = b4 && s->captured_bytes >= 64;
+                for (int i = 0; all_ee && i < 64; ++i) all_ee = b4[i] == 0xEE; // what the CPU last wrote at 512
+                reread_ok = s->status == NA_SNAP_CAPTURED && all_ee;
+            }
+            if (s->resource == custom_id)
+                custom_ok = s->status == NA_SNAP_CAPTURED && s->captured_bytes >= 64 && b4 && std::memcmp(b4, cam, 64) == 0;
+            continue;
+        }
         CHECK(s->recording_generation == 2 && s->queue_ticket == exec_ticket);
         const uint8_t* bytes = s->payload_offset ? e.data() + s->payload_offset : nullptr;
         if (s->resource == upload_id && s->binding == NA_SNAP_ROOT_CBV)
@@ -185,7 +228,11 @@ int main()
         if (s->resource == unmapped_id) unmapped_ok = s->status == NA_SNAP_NOT_MAPPED && s->captured_bytes == 0 && s->offset == 256;
     }
     std::printf("snapshots: %d (root %d table %d gpu-written %d not-mapped %d)\n", snaps, root_ok, table_ok, gpu_ok, unmapped_ok);
-    CHECK(snaps == 5); // 4 from the first submission + the raced root CBV
+    std::printf("unmapped-before-submit re-read %d (host maps %llu), custom upload heap %d\n", reread_ok,
+                static_cast<unsigned long long>(rereads), custom_ok);
+    CHECK(snaps == 7); // 4 from the first submission + the raced root CBV + 2 after the Unmap
+    CHECK(reread_ok && rereads >= 1);
+    CHECK(custom_ok && custom_id != 0);
     CHECK(root_ok);
     CHECK(table_ok);
     CHECK(gpu_ok);

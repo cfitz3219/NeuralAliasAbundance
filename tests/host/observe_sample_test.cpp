@@ -41,6 +41,18 @@
 //      other queue: no deadlock, and since each re-entry began inside the
 //      other queue's copy window, neither sample is copied (both stay ARMED);
 //      a nested operation after a copy was submitted leaves it READY.
+// Argon Gate 3 (G3-03/06/07):
+//   G3-03: a texture and a shader-visible heap created BEFORE the producers
+//      were installed are registered on first sight (barrier, SetDescriptorHeaps)
+//      and the texture can be sampled;
+//   G3-06: a barrier batch larger than the 64-entry wire event still provides
+//      evidence for its 71st transition; overflowing a recording's evidence
+//      store still leaves requests armed; a state set in an EARLIER submission
+//      on the same queue, or a texture's creation state, is used when the
+//      sampled submission has no barrier; a resource also transitioned on a
+//      second queue is never sampled from carried state;
+//   G3-07: host warm-up objects are not registered as game objects; a
+//      released quarantined entry no longer consumes one of the 8 leases.
 #include "test_support.hpp"
 #include "host_dx12/host_observe.h"
 #include "host_dx12/host_observe_samples.h"
@@ -142,7 +154,22 @@ int main()
     test::Device d;
     if (!test::CreateDevice(d)) return test::SkipNoDevice("observe_sample_test");
     ID3D12Device* dev = d.device.Get();
+    // G3-03: objects the game created before the producers were installed.
+    auto pre = test::CreateTexture(dev, 16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    test::ComPtr<ID3D12DescriptorHeap> pre_heap;
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC phd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        REQUIRE(pre && SUCCEEDED(dev->CreateDescriptorHeap(&phd, IID_PPV_ARGS(&pre_heap))));
+    }
     REQUIRE(na::observe::InstallProducers(dev, d.queue.Get(), /*hook_queue_execute=*/true));
+    {
+        // G3-07: warm-up lists/allocators and map-hook probe buffers (at least
+        // ten objects) are host work, not game objects.
+        const auto st = na::observe::GetProducerStats();
+        std::printf("after install: objects created %llu live %llu\n", static_cast<unsigned long long>(st.objects_created),
+                    static_cast<unsigned long long>(st.objects_live));
+        CHECK(st.objects_created < 8);
+    }
     {
         na_sample_request r{};
         r.size_bytes = sizeof(r);
@@ -273,23 +300,42 @@ int main()
         const na_sample_info sp = WaitDone(t_common);
         CHECK(sp.status == NA_SAMPLE_READY && sp.state_before == D3D12_RESOURCE_STATE_COPY_SOURCE);
         na_observe_sample_release(t_common);
-        // (c) truncated barrier batch (more transitions than the host records)
-        //     -> the recording's evidence is invalid, the request stays armed.
+        // (c) G3-06: a batch larger than the 64-entry wire event. The event is
+        //     TRUNCATED, but the host records every transition: the colour
+        //     transition at index 70 (beyond the wire limit) is evidence.
         std::vector<test::ComPtr<ID3D12Resource>> many;
         for (int i = 0; i < 70; ++i)
             many.push_back(test::CreateTexture(dev, 4, 4, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_NONE));
-        const uint64_t t_trunc = Request(color_id);
+        const uint64_t t_big = Request(color_id);
         record([&] {
             std::vector<D3D12_RESOURCE_BARRIER> bs;
-            bs.push_back(test::Transition(color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET));
             for (auto& r : many) bs.push_back(test::Transition(r.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE));
+            bs.push_back(test::Transition(color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET));
+            list->ResourceBarrier(static_cast<UINT>(bs.size()), bs.data());
+        });
+        d.queue->ExecuteCommandLists(1, ls);
+        const na_sample_info big = WaitDone(t_big);
+        std::printf("71-barrier batch: sample status %u state_before 0x%x\n", big.status, big.state_before);
+        CHECK(big.status == NA_SAMPLE_READY && big.state_before == D3D12_RESOURCE_STATE_RENDER_TARGET);
+        na_observe_sample_release(t_big);
+        // (d) overflowing the recording's evidence store (8192 transitions)
+        //     -> the evidence is invalid, the request stays armed.
+        const uint64_t t_over = Request(color_id);
+        record([&] {
+            std::vector<D3D12_RESOURCE_BARRIER> bs;
+            bs.push_back(test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE));
+            for (int k = 0; k < 4150; ++k) {
+                bs.push_back(test::Transition(many[0].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON));
+                bs.push_back(test::Transition(many[0].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE));
+            }
+            bs.push_back(test::Transition(color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET));
             list->ResourceBarrier(static_cast<UINT>(bs.size()), bs.data());
         });
         d.queue->ExecuteCommandLists(1, ls);
         d.WaitIdle();
         Sleep(20);
-        CHECK(Poll(t_trunc).status == NA_SAMPLE_ARMED);
-        na_observe_sample_release(t_trunc);
+        CHECK(Poll(t_over).status == NA_SAMPLE_ARMED);
+        na_observe_sample_release(t_over);
         // color is RENDER_TARGET again.
     }
 
@@ -340,6 +386,229 @@ int main()
     na_observe_sample_release(t_exp);
     d.WaitIdle();
     CHECK(dev->GetDeviceRemovedReason() == S_OK);
+
+    // ---- G3-03: objects created before installation, registered on first sight ----
+    {
+        CHECK(na::observe::IdOf(pre.Get()) == 0 && na::observe::IdOf(pre_heap.Get()) == 0);
+        record([&] {
+            ID3D12DescriptorHeap* hs[] = {pre_heap.Get()};
+            list->SetDescriptorHeaps(1, hs);
+            D3D12_RESOURCE_BARRIER bb = test::Transition(pre.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->ResourceBarrier(1, &bb);
+        });
+        const na_object_id pre_id = na::observe::IdOf(pre.Get()), heap_id = na::observe::IdOf(pre_heap.Get());
+        const auto st = na::observe::GetProducerStats();
+        std::printf("preexisting: texture id %llu heap id %llu (registered resources %llu heaps %llu)\n", static_cast<unsigned long long>(pre_id),
+                    static_cast<unsigned long long>(heap_id), static_cast<unsigned long long>(st.preexisting_resources),
+                    static_cast<unsigned long long>(st.preexisting_heaps));
+        CHECK(pre_id != 0 && heap_id != 0 && st.preexisting_resources >= 1 && st.preexisting_heaps >= 1);
+        // The registered texture is sampleable: the recording above (closed,
+        // not yet submitted) transitions it to RENDER_TARGET.
+        const uint64_t t_pre = Request(pre_id);
+        REQUIRE(t_pre);
+        d.queue->ExecuteCommandLists(1, ls);
+        const na_sample_info pi = WaitDone(t_pre);
+        std::printf("preexisting texture sample: status %u state_before 0x%x\n", pi.status, pi.state_before);
+        CHECK(pi.status == NA_SAMPLE_READY && pi.state_before == D3D12_RESOURCE_STATE_RENDER_TARGET);
+        na_observe_sample_release(t_pre);
+        d.WaitIdle();
+    }
+
+    // ---- G3-06: state carried from earlier submissions / creation, one queue only ----
+    {
+        const uint64_t known0 = na::observe::GetProducerStats().sample_known_state;
+        // (a) transitioned in an earlier submission; the sampled one has no barrier
+        auto kt = test::CreateTexture(dev, 16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        // (b) created in a definite state, never transitioned
+        auto ct = test::CreateTexture(dev, 16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        // (c) transitioned on this queue, then on a second queue
+        auto mq = test::CreateTexture(dev, 16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        REQUIRE(kt && ct && mq);
+        record([&] {
+            D3D12_RESOURCE_BARRIER bb[2] = {test::Transition(kt.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
+                                            test::Transition(mq.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET)};
+            list->ResourceBarrier(2, bb);
+        });
+        d.queue->ExecuteCommandLists(1, ls); // no samples armed: only history
+        d.WaitIdle();
+        {
+            D3D12_COMMAND_QUEUE_DESC qd{};
+            qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            test::ComPtr<ID3D12CommandQueue> q2;
+            test::ComPtr<ID3D12CommandAllocator> a2;
+            test::ComPtr<ID3D12GraphicsCommandList> l2;
+            REQUIRE(SUCCEEDED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q2))));
+            REQUIRE(SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a2))));
+            REQUIRE(SUCCEEDED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, a2.Get(), nullptr, IID_PPV_ARGS(&l2))));
+            REQUIRE(SUCCEEDED(l2->Close()));
+            REQUIRE(SUCCEEDED(a2->Reset()));
+            REQUIRE(SUCCEEDED(l2->Reset(a2.Get(), nullptr)));
+            D3D12_RESOURCE_BARRIER bb = test::Transition(mq.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            l2->ResourceBarrier(1, &bb);
+            REQUIRE(SUCCEEDED(l2->Close()));
+            ID3D12CommandList* l2s[] = {l2.Get()};
+            q2->ExecuteCommandLists(1, l2s);
+            test::ComPtr<ID3D12Fence> f;
+            REQUIRE(SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f))));
+            REQUIRE(SUCCEEDED(q2->Signal(f.Get(), 1)));
+            for (int i = 0; i < 500 && f->GetCompletedValue() < 1; ++i) Sleep(2);
+        }
+        // (d) review PR40 #1: carried state, but the sampled submission never
+        //     references it -> no reference may be taken, stays armed
+        auto nr = test::CreateTexture(dev, 16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        // (e) review PR40 #3: placed (aliasable) texture in a definite state -> never carried
+        test::ComPtr<ID3D12Heap> ph;
+        test::ComPtr<ID3D12Resource> pl;
+        {
+            D3D12_HEAP_DESC phd{};
+            phd.SizeInBytes = 1 << 20;
+            phd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+            phd.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+            phd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
+            REQUIRE(SUCCEEDED(dev->CreateHeap(&phd, IID_PPV_ARGS(&ph))));
+            D3D12_RESOURCE_DESC rd{};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            rd.Width = rd.Height = 16;
+            rd.DepthOrArraySize = rd.MipLevels = 1;
+            rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            rd.SampleDesc.Count = 1;
+            rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            REQUIRE(SUCCEEDED(dev->CreatePlacedResource(ph.Get(), 0, &rd, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&pl))));
+        }
+        REQUIRE(nr && pl);
+        test::ComPtr<ID3D12DescriptorHeap> krtv;
+        D3D12_DESCRIPTOR_HEAP_DESC khd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&khd, IID_PPV_ARGS(&krtv))));
+        const UINT kinc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        D3D12_CPU_DESCRIPTOR_HANDLE krt[4];
+        ID3D12Resource* const bound[4] = {kt.Get(), ct.Get(), mq.Get(), pl.Get()};
+        for (UINT i = 0; i < 4; ++i) {
+            krt[i] = krtv->GetCPUDescriptorHandleForHeapStart();
+            krt[i].ptr += static_cast<SIZE_T>(i) * kinc;
+            dev->CreateRenderTargetView(bound[i], nullptr, krt[i]);
+        }
+        const uint64_t t_kt = Request(na::observe::IdOf(kt.Get())), t_ct = Request(na::observe::IdOf(ct.Get())),
+                       t_mq = Request(na::observe::IdOf(mq.Get())), t_nr = Request(na::observe::IdOf(nr.Get())),
+                       t_pl = Request(na::observe::IdOf(pl.Get()));
+        REQUIRE(t_kt && t_ct && t_mq && t_nr && t_pl);
+        record([&] { list->OMSetRenderTargets(4, krt, FALSE, nullptr); }); // references, no barriers at all
+        d.queue->ExecuteCommandLists(1, ls);
+        const na_sample_info ki = WaitDone(t_kt), cti = WaitDone(t_ct);
+        d.WaitIdle();
+        Sleep(20);
+        const na_sample_info mi = Poll(t_mq), ni = Poll(t_nr), pi = Poll(t_pl);
+        std::printf("carried-state premises: unreferenced %u, placed %u (both expected armed)\n", ni.status, pi.status);
+        CHECK(ni.status == NA_SAMPLE_ARMED);
+        CHECK(pi.status == NA_SAMPLE_ARMED);
+        const uint64_t used = na::observe::GetProducerStats().sample_known_state - known0;
+        std::printf("known state: earlier submission %u (0x%x), creation state %u (0x%x), second-queue resource %u, carried copies %llu\n", ki.status,
+                    ki.state_before, cti.status, cti.state_before, mi.status, static_cast<unsigned long long>(used));
+        CHECK(ki.status == NA_SAMPLE_READY && ki.state_before == D3D12_RESOURCE_STATE_RENDER_TARGET);
+        CHECK(cti.status == NA_SAMPLE_READY && cti.state_before == D3D12_RESOURCE_STATE_RENDER_TARGET);
+        CHECK(mi.status == NA_SAMPLE_ARMED); // transitioned by two queues: never carried
+        CHECK(used >= 2);
+        for (uint64_t t : {t_kt, t_ct, t_mq, t_nr, t_pl}) na_observe_sample_release(t);
+        d.WaitIdle();
+        CHECK(dev->GetDeviceRemovedReason() == S_OK);
+    }
+
+    // ---- Gate 3 review PR40 #2/#3: evidence captured before the forward; copy-queue decay ----
+    {
+        const uint64_t known0 = na::observe::GetProducerStats().sample_known_state;
+        auto rx = test::CreateTexture(dev, 16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        auto cq = test::CreateTexture(dev, 16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_NONE);
+        auto cqd = test::CreateTexture(dev, 16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_NONE);
+        auto tmp = test::CreateTexture(dev, 16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
+        REQUIRE(rx && cq && cqd && tmp);
+        test::ComPtr<ID3D12DescriptorHeap> xrtv;
+        D3D12_DESCRIPTOR_HEAP_DESC xhd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&xhd, IID_PPV_ARGS(&xrtv))));
+        const D3D12_CPU_DESCRIPTOR_HANDLE xrt = xrtv->GetCPUDescriptorHandleForHeapStart();
+        dev->CreateRenderTargetView(rx.Get(), nullptr, xrt);
+        // (a) the submitted list is reset and re-recorded (other allocator) after
+        //     ExecuteCommandLists returned, before the host services/publishes.
+        test::ComPtr<ID3D12CommandAllocator> alloc2;
+        REQUIRE(SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc2))));
+        static ID3D12GraphicsCommandList* s_reuse_list;
+        static ID3D12CommandAllocator* s_reuse_alloc;
+        static ID3D12Resource* s_reuse_res;
+        static int s_reused;
+        s_reuse_list = list.Get();
+        s_reuse_alloc = alloc2.Get();
+        s_reuse_res = rx.Get();
+        s_reused = 0;
+        na::observe::SetSampleAcquireProbeForTests([] {
+            if (s_reused++) return;
+            if (FAILED(s_reuse_list->Reset(s_reuse_alloc, nullptr))) return;
+            D3D12_RESOURCE_BARRIER b = test::Transition(s_reuse_res, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            s_reuse_list->ResourceBarrier(1, &b); // recorded, never submitted
+            s_reuse_list->Close();
+        });
+        const uint64_t t_rx1 = Request(na::observe::IdOf(rx.Get()));
+        REQUIRE(t_rx1);
+        record([&] {
+            D3D12_RESOURCE_BARRIER b = test::Transition(rx.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->ResourceBarrier(1, &b);
+        });
+        d.queue->ExecuteCommandLists(1, ls);
+        const na_sample_info r1 = WaitDone(t_rx1);
+        na::observe::SetSampleAcquireProbeForTests(nullptr);
+        d.WaitIdle();
+        // The carried state must be the submitted RENDER_TARGET, not the re-recorded COPY_SOURCE.
+        const uint64_t t_rx2 = Request(na::observe::IdOf(rx.Get()));
+        REQUIRE(t_rx2);
+        record([&] { list->OMSetRenderTargets(1, &xrt, FALSE, nullptr); });
+        d.queue->ExecuteCommandLists(1, ls);
+        const na_sample_info r2 = WaitDone(t_rx2);
+        d.WaitIdle();
+        std::printf("reset after submit: probe ran %d, sampled %u (0x%x), carried %u (0x%x)\n", s_reused, r1.status, r1.state_before, r2.status,
+                    r2.state_before);
+        CHECK(s_reused >= 1);
+        CHECK(r1.status == NA_SAMPLE_READY && r1.state_before == D3D12_RESOURCE_STATE_RENDER_TARGET);
+        CHECK(r2.status == NA_SAMPLE_READY && r2.state_before == D3D12_RESOURCE_STATE_RENDER_TARGET);
+        // (b) copy-queue decay: COPY_SOURCE on the direct queue, then read by a
+        //     copy queue (decays to COMMON) -> never carried afterwards.
+        record([&] {
+            D3D12_RESOURCE_BARRIER b = test::Transition(cq.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &b);
+        });
+        d.queue->ExecuteCommandLists(1, ls);
+        d.WaitIdle();
+        {
+            D3D12_COMMAND_QUEUE_DESC qd{};
+            qd.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+            test::ComPtr<ID3D12CommandQueue> cqq;
+            test::ComPtr<ID3D12CommandAllocator> ca;
+            test::ComPtr<ID3D12GraphicsCommandList> cl;
+            REQUIRE(SUCCEEDED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&cqq))));
+            REQUIRE(SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(&ca))));
+            REQUIRE(SUCCEEDED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, ca.Get(), nullptr, IID_PPV_ARGS(&cl))));
+            REQUIRE(SUCCEEDED(cl->Close()));
+            REQUIRE(SUCCEEDED(ca->Reset()));
+            REQUIRE(SUCCEEDED(cl->Reset(ca.Get(), nullptr)));
+            cl->CopyResource(cqd.Get(), cq.Get());
+            REQUIRE(SUCCEEDED(cl->Close()));
+            ID3D12CommandList* cls[] = {cl.Get()};
+            cqq->ExecuteCommandLists(1, cls);
+            test::ComPtr<ID3D12Fence> f;
+            REQUIRE(SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f))));
+            REQUIRE(SUCCEEDED(cqq->Signal(f.Get(), 1)));
+            for (int i = 0; i < 500 && f->GetCompletedValue() < 1; ++i) Sleep(2);
+        }
+        const uint64_t t_cq = Request(na::observe::IdOf(cq.Get()));
+        REQUIRE(t_cq);
+        record([&] { list->CopyResource(tmp.Get(), cq.Get()); }); // references cq, no barrier
+        d.queue->ExecuteCommandLists(1, ls);
+        d.WaitIdle();
+        Sleep(20);
+        const na_sample_info cqi = Poll(t_cq);
+        std::printf("copy-queue decay: sample %u (expected armed), carried copies %llu\n", cqi.status,
+                    static_cast<unsigned long long>(na::observe::GetProducerStats().sample_known_state - known0));
+        CHECK(cqi.status == NA_SAMPLE_ARMED);
+        for (uint64_t t : {t_rx1, t_rx2, t_cq}) na_observe_sample_release(t);
+        d.WaitIdle();
+        CHECK(dev->GetDeviceRemovedReason() == S_OK);
+    }
 
     // ---- C9B-REVIEW-2 #2: source acquired before the game's submission ----
     {
@@ -627,6 +896,15 @@ int main()
         std::printf("signal failure: status %u reason %u, quarantined after release %d (live %llu -> %llu)\n", si2.status, si2.reason,
                     live1 == live0 + 1 ? 1 : 0, static_cast<unsigned long long>(live0), static_cast<unsigned long long>(live1));
         CHECK(live1 == live0 + 1); // never freed without completion proof
+        // G3-07: the released quarantined entry no longer holds a lease: all 8
+        // remain available to the consumer.
+        std::vector<uint64_t> leases;
+        for (int i = 0; i < 8; ++i) leases.push_back(Request(color_id));
+        int granted = 0;
+        for (uint64_t t : leases) granted += t ? 1 : 0;
+        std::printf("leases with a quarantined entry live: %d of 8 granted\n", granted);
+        CHECK(granted == 8);
+        for (uint64_t t : leases) na_observe_sample_release(t);
         CHECK(dev->GetDeviceRemovedReason() == S_OK);
     }
 
