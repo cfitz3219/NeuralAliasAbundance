@@ -481,6 +481,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         reason(why);
         return false;
     }
+    g_jit_cam.valid = na::camera::DecomposeViewProjection(vp, g_jit_cam.geo); // J1: the main camera, for earlier batches next frame
     // Ring slot (never wait) and size/format changes (only once the GPU is done with the old set).
     const UINT64 done = g.fence->GetCompletedValue();
     Slot& s = g.slots[g.slot];
