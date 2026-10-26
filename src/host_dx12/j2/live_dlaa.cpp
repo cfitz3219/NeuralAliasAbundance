@@ -74,6 +74,7 @@ struct State {
         uint8_t vp[2][64], inv[2][64];       // original matrices as stored (row / column layout)
         uint8_t jvp[2][64], jinv[2][64];     // jittered replacements
         uint32_t phase = 0;
+        int layout = 0;                      // 0 row-major, 1 column-major (as the game stores it)
     } jit;
     bool jitter_on = true;
     Stats stats;
@@ -241,37 +242,49 @@ bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& bytes,
         na::camera::Candidate c{};
         if (!na::camera::ViewProjection(m, c)) continue;
         if (!slot && !same_camera(m)) continue;
-        for (int64_t d : {g.camera_inv_delta}) { // the learned inverse position (Anno: not adjacent)
-            const int64_t io = g.camera_offset + d;
-            if (io < 0 || static_cast<uint64_t>(io) + 64 > n) continue;
-            const auto inv = na::camera::LoadMatrix(bytes, static_cast<size_t>(io), layout);
-            if (!na::camera::IsInversePair(m, inv)) continue;
-            g_jit_cam.valid = na::camera::DecomposeViewProjection(m, g_jit_cam.geo);
-            const neural_alias::JitterSample js = neural_alias::temporal_jitter(++g.jit.phase, kJitterPhases);
-            std::array<double, 16> src{};
-            for (int i = 0; i < 16; ++i) src[i] = m[i];
-            const auto jm = neural_alias::jitter_projection(src, js, g.w, g.h);
-            na::camera::Matrix jvp{}, jinv{};
-            for (int i = 0; i < 16; ++i) jvp[i] = jm[i];
-            if (!na::camera::Invert(jvp, jinv)) return false;
-            auto& j = g.jit;
-            j.res = res;
-            j.off = off;
-            j.px[0] = js.x_pixels;
-            j.px[1] = js.y_pixels;
-            for (int l = 0; l < 2; ++l) {
-                const auto L = l ? na::camera::Layout::ColumnMajor : na::camera::Layout::RowMajor;
-                store_matrix(m, L, j.vp[l]);
-                store_matrix(inv, L, j.inv[l]);
-                store_matrix(jvp, L, j.jvp[l]);
-                store_matrix(jinv, L, j.jinv[l]);
+        // The inverse at its learned position. A block from the camera slot must
+        // carry it; another block (an earlier pass with a smaller constant buffer)
+        // may start the frame from the ViewProjection alone, the inverse being
+        // computed; the game's own inverse copy is adopted when the slot block shows it.
+        const int64_t io = g.camera_offset + g.camera_inv_delta;
+        const bool inv_here = io >= 0 && static_cast<uint64_t>(io) + 64 <= n;
+        na::camera::Matrix inv{};
+        if (inv_here) {
+            inv = na::camera::LoadMatrix(bytes, static_cast<size_t>(io), layout);
+            if (!na::camera::IsInversePair(m, inv)) {
+                if (slot) continue;
+                if (!na::camera::Invert(m, inv)) continue;
             }
-            // Keep the bytes exactly as the game stored them for matching (float round trip).
-            std::memcpy(j.vp[layout == na::camera::Layout::RowMajor ? 0 : 1], bytes.data() + g.camera_offset, 64);
-            std::memcpy(j.inv[layout == na::camera::Layout::RowMajor ? 0 : 1], bytes.data() + io, 64);
-            j.valid = true;
-            return true;
+        } else {
+            if (slot || !na::camera::Invert(m, inv)) continue;
         }
+        g_jit_cam.valid = na::camera::DecomposeViewProjection(m, g_jit_cam.geo);
+        const neural_alias::JitterSample js = neural_alias::temporal_jitter(++g.jit.phase, kJitterPhases);
+        std::array<double, 16> src{};
+        for (int i = 0; i < 16; ++i) src[i] = m[i];
+        const auto jm = neural_alias::jitter_projection(src, js, g.w, g.h);
+        na::camera::Matrix jvp{}, jinv{};
+        for (int i = 0; i < 16; ++i) jvp[i] = jm[i];
+        if (!na::camera::Invert(jvp, jinv)) return false;
+        auto& j = g.jit;
+        j.res = res;
+        j.off = off;
+        j.px[0] = js.x_pixels;
+        j.px[1] = js.y_pixels;
+        j.layout = layout == na::camera::Layout::RowMajor ? 0 : 1;
+        for (int l = 0; l < 2; ++l) {
+            const auto L = l ? na::camera::Layout::ColumnMajor : na::camera::Layout::RowMajor;
+            store_matrix(m, L, j.vp[l]);
+            store_matrix(inv, L, j.inv[l]);
+            store_matrix(jvp, L, j.jvp[l]);
+            store_matrix(jinv, L, j.jinv[l]);
+        }
+        // Keep the bytes exactly as the game stored them for matching (float round trip).
+        std::memcpy(j.vp[j.layout], bytes.data() + g.camera_offset, 64);
+        if (inv_here && na::camera::IsInversePair(m, na::camera::LoadMatrix(bytes, static_cast<size_t>(io), layout)))
+            std::memcpy(j.inv[j.layout], bytes.data() + io, 64);
+        j.valid = true;
+        return true;
     }
     return false;
 }
@@ -319,6 +332,15 @@ void jitter_batch(ID3D12CommandList* const* lists, UINT count)
             if (g.jit.valid && holds(g.jit.jvp)) continue; // already jittered by an earlier batch of this frame
             if (g.jit.valid) continue;                     // a different matrix (another camera): leave it
             if (!begin_jitter(k->res, k->off, view, k->slot)) continue;
+        }
+        if (k->slot) { // adopt the game's exact inverse bytes (they may differ from a computed inverse)
+            const int64_t vo = g.camera_offset, io = vo + g.camera_inv_delta;
+            if (io >= 0 && static_cast<uint64_t>(io) + 64 <= n && static_cast<uint64_t>(vo) + 64 <= n &&
+                !std::memcmp(view.data() + vo, g.jit.vp[g.jit.layout], 64) && std::memcmp(view.data() + io, g.jit.inv[g.jit.layout], 64)) {
+                const auto L = g.jit.layout ? na::camera::Layout::ColumnMajor : na::camera::Layout::RowMajor;
+                if (na::camera::IsInversePair(na::camera::LoadMatrix(view, static_cast<size_t>(vo), L), na::camera::LoadMatrix(view, static_cast<size_t>(io), L)))
+                    std::memcpy(g.jit.inv[g.jit.layout], view.data() + io, 64);
+            }
         }
         for (size_t o = 0; o + 64 <= n; o += 16)
             for (int l = 0; l < 2; ++l) {
