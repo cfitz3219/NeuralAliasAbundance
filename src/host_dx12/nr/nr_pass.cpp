@@ -176,6 +176,7 @@ struct State {
     void* feature = nullptr;
     uint32_t feat_w = 0, feat_h = 0, feat_hdr = 0;
     DXGI_FORMAT feat_format = DXGI_FORMAT_UNKNOWN;
+    uint32_t feat_model = 0; // na::settings nr_model the feature was created with
     uint32_t feature_pending = 0;       // created this frame; evaluate from the next
     UINT64 feature_fence = 0;
     // Status.
@@ -380,7 +381,8 @@ NVSDK_NGX_Parameter* P() { return static_cast<NVSDK_NGX_Parameter*>(g.params); }
 bool ensure_feature_locked(uint32_t w, uint32_t h, bool hdr, DXGI_FORMAT bb_format)
 {
 #if defined(NA_HAVE_NGX_SDK)
-    if (g.feature && g.feat_w == w && g.feat_h == h && g.feat_hdr == (hdr ? 1u : 0u) && g.feat_format == bb_format)
+    const uint32_t model = na::settings::Get().nr_model.load();
+    if (g.feature && g.feat_w == w && g.feat_h == h && g.feat_hdr == (hdr ? 1u : 0u) && g.feat_format == bb_format && g.feat_model == model)
         return true;
     release_feature_locked();
     if (!g.params) {
@@ -415,7 +417,8 @@ bool ensure_feature_locked(uint32_t w, uint32_t h, bool hdr, DXGI_FORMAT bb_form
     p->Set("DLSSNR.Enabled", 1u);
     p->Set("DLSSNR.Width", w);
     p->Set("DLSSNR.Height", h);
-    p->Set("DLSSNR.Hint.Render.Preset", 0u);
+    // 310.9.x: preset 2 = newer model (the runtime's default), 1 = original model.
+    p->Set("DLSSNR.Hint.Render.Preset", model == 1 ? 1u : 2u);
     p->Set("DLSSNR.Style", 0u);
     p->Set("DLSSNR.Intensity", st.nr_intensity.load() / 100.f);
     p->Set("DLSSNR.LocalStructureStrength", st.nr_structure.load() / 100.f);
@@ -436,6 +439,7 @@ bool ensure_feature_locked(uint32_t w, uint32_t h, bool hdr, DXGI_FORMAT bb_form
     g.feat_h = h;
     g.feat_hdr = hdr ? 1u : 0u;
     g.feat_format = bb_format;
+    g.feat_model = model;
     g.feature_pending = 1;
     g.reset_pending = true;
     return true;
@@ -811,7 +815,7 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer, DXGI_COLOR
     // All eight in-flight frames can reference the same work textures and
     // feature. Replacing them requires the LAST submission, not just this slot.
     const bool work_changes = !g.color_in || g.width != w || g.height != h || g.hdr.load() != (hdr ? 1u : 0u) ||
-        g.hdr_mode_used != shader_mode || g.feat_format != bb.Format;
+        g.hdr_mode_used != shader_mode || g.feat_format != bb.Format || (g.feature && g.feat_model != st.nr_model.load());
     const bool scaled_changes = scaled && (!g.depth_up || g.depth_up->GetDesc().Width != w || g.depth_up->GetDesc().Height != h ||
         !g.motion_up || g.motion_up->GetDesc().Format != g.motion_format);
     if ((work_changes || scaled_changes) && completed < g.fence_next - 1) {

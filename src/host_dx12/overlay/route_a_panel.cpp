@@ -341,6 +341,18 @@ void DrawNeuralRenderingRows()
         pct_row("Tone", "Local contrast. Off at zero.", st.nr_tone);
         pct_row("Skin", "Protects skin from over-processing.", st.nr_skin);
         RowDivider();
+        // NVIDIA's runtime (310.9.x) carries two models, chosen at creation by
+        // DLSSNR.Hint.Render.Preset: 2 = the newer default, 1 = the original.
+        static const char* kModels[] = {"Newer (faster, subtler)", "Original (stronger, slower)"};
+        int model = static_cast<int>(st.nr_model.load());
+        BeginRow("Model", "NVIDIA ships two Neural Rendering models. The original changes the picture more and costs roughly twice the time.",
+                 DropdownWidth());
+        if (Combo("nrmodel", &model, kModels, 2, DropdownWidth())) {
+            st.nr_model.store(static_cast<uint32_t>(model));
+            na::settings::Save();
+        }
+        EndRow();
+        RowDivider();
         static const char* kHdrModes[] = {"Automatic", "HDR picture", "Standard picture"};
         int hm = static_cast<int>(st.nr_hdr_mode.load());
         BeginRow("Picture type", "Automatic follows the game's HDR setting. Change only if the picture looks wrong.",

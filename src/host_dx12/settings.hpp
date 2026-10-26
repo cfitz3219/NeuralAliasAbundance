@@ -69,6 +69,7 @@ struct Settings {
     std::atomic<uint32_t> nr_tone{0};
     std::atomic<uint32_t> nr_skin{100};
     std::atomic<uint32_t> nr_paper_white{200}; // nits, HDR chains only
+    std::atomic<uint32_t> nr_model{0};         // 0 newer model (NVIDIA default: faster, subtler), 1 original model (stronger, slower)
     std::atomic<uint32_t> nr_hdr_mode{0};      // 0 auto (swap chain colour space), 1 force HDR10, 2 force SDR
     // A52: live hardware optical flow ([motion] section). Experimental, off by default.
     std::atomic<uint32_t> motion_enabled{0};
