@@ -197,13 +197,45 @@ int main()
     CHECK((fake::I(fake::last_create, NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags) & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) != 0);
     CHECK((fake::I(fake::last_create, NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags) & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) != 0);
     CHECK(st.frames == 1 && st.camera_offset == 80);
+
+    // A second matching batch in the same game frame is not another DLAA frame.
+    // Nor does an unrelated/unknown queue's presentation advance this view.
+    na::j2::OnPresent(nullptr);
+    frame(0.25);
+    CHECK(g_forwarded.size() == 2 && fake::evals == evals0 + 1);
+    CHECK(na::j2::GetStats().frames == 1 && na::j2::GetStats().duplicate_submissions == 1);
+
+    na::j2::OnPresent(d.queue.Get());
+    const auto cuts_before_failure = na::j2::GetStats().cuts;
+    fake::eval_result = NVSDK_NGX_Result_FAIL_InvalidParameter;
+    frame(500); // would be a camera cut, but this DLSS attempt never submits
+    CHECK(g_forwarded.size() == 2);
+    CHECK(na::j2::GetStats().frames == 1 && na::j2::GetStats().cuts == cuts_before_failure);
+    // Recover the deliberately failed fake backend without resetting J2 history.
+    na::dlss::Shutdown();
+    fake::eval_result = NVSDK_NGX_Result_Success;
+    REQUIRE(na::dlss::Attach(dev, fake::MakeApi()));
     frame(0.5); // camera moved a little: same history
     st = na::j2::GetStats();
     std::printf("frame 2: forwarded %zu, frames %llu, cuts %llu, reset %d\n", g_forwarded.size(), static_cast<unsigned long long>(st.frames),
                 static_cast<unsigned long long>(st.cuts), fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset));
-    CHECK(g_forwarded.size() == 3 && st.frames == 2 && fake::evals == evals0 + 2);
+    CHECK(g_forwarded.size() == 3 && st.frames == 2 && fake::evals == evals0 + 3);
+    CHECK(st.cuts == cuts_before_failure); // the failed camera x=500 did not enter history
+    // The recreated backend resets its own feature; the next normal frame does not.
+    na::j2::OnPresent(d.queue.Get());
+    frame(1.0);
     CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
+    na::j2::OnPresent(d.queue.Get());
     frame(500); // teleport: history reset
+    CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 1);
+    na::j2::OnPresent(d.queue.Get());
+    na::observe::SetLiveSelection(0, 0);
+    frame(500.5); // an unprocessed game frame must not advance camera history
+    const auto before_gap = na::j2::GetStats().frames;
+    na::j2::OnPresent(d.queue.Get());
+    na::observe::SetLiveSelection(na::observe::IdOf(depth.Get()), na::observe::IdOf(color.Get()));
+    frame(501);
+    CHECK(na::j2::GetStats().frames == before_gap + 1);
     CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 1);
     CHECK(dev->GetDeviceRemovedReason() == S_OK);
     na::j2::SetEnabled(false);

@@ -1685,6 +1685,7 @@ void on_present(IDXGISwapChain* sc)
     std::lock_guard<std::mutex> lock(g_state.mutex);
     ID3D12CommandQueue* queue = nullptr;
     if (!present_prelude(sc, queue)) return;
+    na::j2::OnPresent(queue); // one game-frame boundary, never a TEST Present
     UINT idx = real_index(sc);
     if (idx < g_state.frames.size()) {
         ComPtr<ID3D12Resource> bb; // A71: this frame only
@@ -1712,6 +1713,7 @@ HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_
         return g_orig_present(sc, sync, flags);
     }
     na::present::PresentArgs a;
+    na::j2::OnPresent(queue); // game call only; the presenter's generated frames bypass this
     g_present_caller.store(GetCurrentThreadId());
     g_present_queue_identity.store(reinterpret_cast<uintptr_t>(queue));
     a.sc = sc;

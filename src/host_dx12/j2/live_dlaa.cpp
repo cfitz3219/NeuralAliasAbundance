@@ -53,7 +53,8 @@ struct State {
     na::motion::gpu::Arbiter arbiter;
     bool arbiter_ok = false;
     na::camera::CameraTracker tracker;
-    uint64_t frame = 0;
+    uint64_t frame = 1;             // game Present interval, not Execute attempt
+    uint64_t submitted_frame = 0;   // last interval that actually submitted DLAA
     int64_t camera_offset = -1; // learned offset of the ViewProjection inside its block
     int64_t camera_param = -1;  // learned root parameter that binds the camera block
     bool camera_table = false;  // ... through a descriptor table
@@ -237,7 +238,7 @@ bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth
         // its scope is known (FindMatrices rejects snapshots without one).
         na::camera::Snapshot s{};
         s.session = s.epoch = 1;
-        s.submission = s.content_version = g.frame + 1;
+        s.submission = s.content_version = g.frame;
         s.resource = o->resource;
         s.base_offset = 0; // offsets are relative to the block
         s.complete = s.lifetime_valid = true;
@@ -270,8 +271,13 @@ na::motion::Mat4 to_mat4(const na::camera::Matrix& m)
 
 // Records the DLAA list for this frame. Returns false (nothing recorded worth
 // submitting) when a precondition fails.
+struct PendingHistory {
+    na::camera::CameraTracker tracker;
+    bool cut = false;
+};
+
 bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, na_object_id color_id,
-            ID3D12GraphicsCommandList** out_list)
+            ID3D12GraphicsCommandList** out_list, PendingHistory& pending)
 {
     uint32_t sc = 0, sd = 0;
     if (!state_after(lists, scene, color_id, &sc) || !state_after(lists, scene, depth_id, &sd)) {
@@ -321,12 +327,15 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             return false;
         }
         g.w = w; g.h = h; g.color_format = cd.Format;
-        g.tracker.Reset();
+        g.resume_reset = true; // remains pending if this recording is not submitted
     }
     const double zero[2] = {0, 0}; // no jitter injected yet (J1)
-    const na::camera::CameraFrame cam = g.tracker.Update(vp, ++g.frame, w, h, zero);
+    pending.tracker = g.tracker;
+    // A skipped game frame breaks the sequence of input pictures seen by DLSS.
+    if (g.resume_reset || (g.submitted_frame && g.frame != g.submitted_frame + 1)) pending.tracker.Reset();
+    const na::camera::CameraFrame cam = pending.tracker.Update(vp, g.frame, w, h, zero);
     if (!cam.valid) { ++g.stats.no_camera; reason("The camera matrix could not be inverted."); return false; }
-    if (cam.camera_cut) ++g.stats.cuts;
+    pending.cut = cam.camera_cut;
     if (FAILED(s.alloc->Reset()) || FAILED(s.list->Reset(s.alloc.Get(), nullptr))) { reason("Could not reset the DLAA command list."); return false; }
     ID3D12GraphicsCommandList* l = s.list.Get();
     std::vector<D3D12_RESOURCE_BARRIER> b;
@@ -383,7 +392,6 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     e.quality = na::dlss::Quality::DLAA;
     e.view_id = kViewId;
     e.reset = cam.camera_cut || resize || g.resume_reset;
-    g.resume_reset = false;
     e.hdr = is_float_color(cd.Format);
     e.depth_inverted = reversed;
     e.auto_exposure = true;
@@ -427,6 +435,12 @@ void SetPaused(bool paused)
 }
 bool Paused() { return g.paused.load(); }
 
+void OnPresent(ID3D12CommandQueue* queue)
+{
+    std::lock_guard<std::mutex> lock(g.m);
+    if (queue && g.queue.Get() == queue) ++g.frame;
+}
+
 void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists, ExecuteFn forward)
 {
     if (!g.enabled.load(std::memory_order_relaxed) || g.paused.load(std::memory_order_relaxed) || !queue || !lists || !count) {
@@ -436,6 +450,12 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     const na::observe::HostWorkScope host; // our objects and our list are never observed as the game's
     std::unique_lock<std::mutex> lock(g.m);
     ++g.stats.submissions;
+    if (g.submitted_frame == g.frame) {
+        ++g.stats.duplicate_submissions;
+        lock.unlock();
+        forward(queue, count, lists);
+        return;
+    }
     uint64_t depth_id = 0, color_id = 0;
     na::observe::GetLiveSelection(&depth_id, &color_id);
     if (!depth_id || !color_id) {
@@ -449,6 +469,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     for (UINT i = 0; i < count; ++i)
         if (lists[i] && na::observe::ListRendersTo(lists[i], color_id, depth_id)) scene = static_cast<int>(i); // the last list that drew the scene (not a later one that merely transitions it)
     ID3D12GraphicsCommandList* ours = nullptr;
+    PendingHistory pending;
     if (scene < 0) {
         ++g.stats.no_scene_list;
     } else if (!ensure_device(queue)) {
@@ -465,10 +486,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
             dr = "No folder for DLSS data.";
         }
         if (dr) reason(dr);
-        else if (record(lists, static_cast<UINT>(scene), depth_id, color_id, &ours)) {
-            ++g.stats.frames;
-            reason("Live DLAA is running.");
-        }
+        else record(lists, static_cast<UINT>(scene), depth_id, color_id, &ours, pending);
     }
     g.stats.active = ours != nullptr;
     if (!ours) {
@@ -483,6 +501,14 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     g.slot = (g.slot + 1) % kRing;
     na::dlss::BeforeExecute(queue, n2, batch.data());
     forward(queue, n2, batch.data());
+    // The void D3D12 forward has now submitted our list. Failed recording/NGX
+    // attempts above must never replace the previous submitted camera.
+    g.tracker = pending.tracker;
+    g.submitted_frame = g.frame;
+    g.resume_reset = false;
+    ++g.stats.frames;
+    if (pending.cut) ++g.stats.cuts;
+    reason("Live DLAA is running.");
     na::dlss::OnExecuted(queue, n2, batch.data());
     s.fence_value = g.fence_next++;
     queue->Signal(g.fence.Get(), s.fence_value);
@@ -503,6 +529,9 @@ void Shutdown()
     g.arbiter = na::motion::gpu::Arbiter{};
     g.arbiter_ok = false;
     g.tracker.Reset();
+    g.frame = 1;
+    g.submitted_frame = 0;
+    g.resume_reset = false;
     g.w = g.h = 0;
 }
 
