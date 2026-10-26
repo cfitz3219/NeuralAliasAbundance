@@ -73,7 +73,9 @@ float4 mulrow(float4 p, float4x4 m) {
 // ReprojectPixel (motion_arbiter.cpp:69-97)
 bool reproject(uint x, uint y, float depth, out float2 v, out bool offscreen) {
     v = 0; offscreen = false;
-    if (!finite1(depth) || depth < 0.0 || depth > 1.0 || depth == depth_clear) return false;
+    if (!finite1(depth) || depth < 0.0 || depth > 1.0) return false;
+    // Sky / no geometry: a point just inside the far plane (rotation moves it; motion_arbiter.cpp).
+    if (depth == depth_clear) depth = depth_clear == 0.0 ? 1e-6 : 0.999999;
     if (!finite2(jitter_cur)) return false;
     float px = (float)x + 0.5 - jitter_cur.x;
     float py = (float)y + 0.5 - jitter_cur.y;
