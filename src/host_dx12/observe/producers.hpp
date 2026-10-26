@@ -22,6 +22,7 @@
 // Constant-buffer views resolve their GPU virtual address through the buffer
 // VA table; overlapping (aliased) ranges resolve to UNKNOWN, never a guess.
 #pragma once
+#include <vector>
 
 #include <cstdint>
 #include <memory>
@@ -97,6 +98,17 @@ void SetSampleSignalFailsForTests(bool fail);
 
 // Identity of an observed object (0 = unknown). Any interface pointer of it.
 na_object_id IdOf(const void* object);
+
+// J2 live consumer support (called from inside a game submission; bounded, no waits).
+struct LiveBinding { na_object_id resource; uint64_t offset; uint32_t size; uint64_t op_index; };
+std::vector<LiveBinding> ListRootConstantBuffers(ID3D12CommandList* list); // graphics root CBVs of the recording
+bool ListReferences(ID3D12CommandList* list, na_object_id id);            // the recording referenced the resource
+bool ListLastState(ID3D12CommandList* list, na_object_id id, uint32_t* state); // last whole-resource transition in it
+uint32_t ReadBuffer(na_object_id res, uint64_t offset, void* dst, uint32_t n); // CPU-visible buffer bytes (0 = unavailable)
+ID3D12Resource* AcquireResource(na_object_id id);                         // AddRef'd, or null
+// Current discovery picks (written by the discovery adapter, read by J2).
+void SetLiveSelection(uint64_t depth, uint64_t color);
+void GetLiveSelection(uint64_t* depth, uint64_t* color);
 
 // Buffer GPU VA -> (resource id, offset). False when unknown or ambiguous.
 bool ResolveGpuVa(uint64_t va, na_object_id* resource, uint64_t* offset);

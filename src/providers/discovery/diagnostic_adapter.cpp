@@ -125,6 +125,14 @@ void Report(Consumer& c,const na_observe_status& status,const char* phase) {
             k.last.queue,k.last.ticket,k.last.list,k.last.generation,ReducerMatch(k.last,k.resource)?"true":"false");
         JsonStrings(c.log,k.reasons);std::fputs("}\n",c.log);
     }
+    {
+        // J2: publish the live picks (depth with a positive generic_depth score;
+        // colour only when it was drawn with that depth). Read by the live DLAA path.
+        const auto d=c.heuristics.RankDepth(1);const auto k=c.heuristics.RankSceneColor(1);
+        const uint64_t depth=!d.empty() && d[0].score>0 ? d[0].resource : 0;
+        const uint64_t color=depth && !k.empty() && k[0].paired_draws ? k[0].resource : 0;
+        na::observe::SetLiveSelection(depth,color);
+    }
     rank=0;
     for(const auto& b:c.heuristics.RankCameraBlocks(5))
         std::fprintf(c.log,"{\"type\":\"camera_block\",\"rank\":%u,\"resource\":%llu,\"offset\":%llu,\"draws\":%llu,\"recordings\":%llu,\"share\":%.4f}\n",

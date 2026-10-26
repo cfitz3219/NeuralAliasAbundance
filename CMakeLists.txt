@@ -165,6 +165,7 @@ add_library(host_dx12 STATIC
   src/host_dx12/fg/frame_gen.cpp
   src/host_dx12/fg/preset_profile.cpp
   src/host_dx12/nr/nr_pass.cpp
+  src/host_dx12/j2/live_dlaa.cpp
   src/host_dx12/motion/live_flow.cpp
   src/host_dx12/latency/nvidia_latency.cpp
   src/host_dx12/latency/pcl_stats.cpp

@@ -3675,6 +3675,93 @@ bool ProducersActive() { return g_active.load(std::memory_order_acquire); }
 
 na_object_id IdOf(const void* object) { return lookup(object); }
 
+// ---------------------------------------------------------------- J2 live consumer support
+// Called by the live DLAA path from inside a game submission (the lists are
+// being submitted, so every resource they reference is alive). Bounded, no waits.
+std::vector<LiveBinding> ListRootConstantBuffers(ID3D12CommandList* list)
+{
+    std::vector<LiveBinding> out;
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return out;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    out.reserve(std::min<size_t>(ls->bindings.size(), 4096));
+    for (const auto& b : ls->bindings)
+        if (b.resource && b.kind == NA_SNAP_ROOT_CBV && !b.compute) out.push_back({b.resource, b.offset, b.size, b.op_index});
+    return out;
+}
+bool ListReferences(ID3D12CommandList* list, na_object_id id)
+{
+    if (!id) return false;
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return std::find(ls->uses.begin(), ls->uses.end(), id) != ls->uses.end();
+}
+bool ListLastState(ID3D12CommandList* list, na_object_id id, uint32_t* state)
+{
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    if (!ls->evidence_complete) return false;
+    for (auto it = ls->states.rbegin(); it != ls->states.rend(); ++it) {
+        if (it->resource != id) continue;
+        if (it->subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) return false; // per-subresource: not handled
+        if (it->state_after == kStatePending) return false;
+        *state = it->state_after;
+        return true;
+    }
+    return false;
+}
+uint32_t ReadBuffer(na_object_id res, uint64_t offset, void* dst, uint32_t n)
+{
+    if (!res || !dst || !n) return 0;
+    ID3D12Resource* reread = nullptr;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_m);
+        auto it = g_buffers.find(res);
+        if (it == g_buffers.end() || !it->second.cpu_visible || offset >= it->second.width) return 0;
+        n = static_cast<uint32_t>(std::min<uint64_t>(n, it->second.width - offset));
+        if (it->second.cpu) return guarded_copy(dst, it->second.cpu + offset, n) ? n : 0;
+        if (!it->second.ever_mapped) return 0;
+        auto key = g_res_keys.find(res);
+        if (key != g_res_keys.end()) static_cast<IUnknown*>(const_cast<void*>(key->second))->QueryInterface(IID_PPV_ARGS(&reread));
+    }
+    if (!reread) return 0;
+    bool ok = false;
+    const bool was_host = t_host_work;
+    t_host_work = true;
+    const D3D12_RANGE rr{static_cast<SIZE_T>(offset), static_cast<SIZE_T>(offset + n)};
+    void* p = nullptr;
+    if (SUCCEEDED(reread->Map(0, &rr, &p)) && p) {
+        ok = guarded_copy(dst, static_cast<const uint8_t*>(p) + offset, n);
+        const D3D12_RANGE none{0, 0};
+        reread->Unmap(0, &none);
+    }
+    t_host_work = was_host;
+    reread->Release();
+    return ok ? n : 0;
+}
+ID3D12Resource* AcquireResource(na_object_id id)
+{
+    std::shared_lock<std::shared_mutex> lock(g_m);
+    auto key = g_res_keys.find(id);
+    if (key == g_res_keys.end()) return nullptr;
+    ID3D12Resource* r = nullptr;
+    static_cast<IUnknown*>(const_cast<void*>(key->second))->QueryInterface(IID_PPV_ARGS(&r));
+    return r;
+}
+namespace {
+std::atomic<uint64_t> g_live_depth{0}, g_live_color{0};
+}
+void SetLiveSelection(uint64_t depth, uint64_t color) { g_live_depth.store(depth); g_live_color.store(color); }
+void GetLiveSelection(uint64_t* depth, uint64_t* color) { *depth = g_live_depth.load(); *color = g_live_color.load(); }
+
 void SetSampleAcquireProbeForTests(void (*probe)()) { g_acquire_probe = probe; }
 void SetSampleWorkerPausedForTests(bool paused) { g_worker_paused.store(paused, std::memory_order_release); }
 void SetSampleWorkerStartFailsForTests(bool fail) { g_fail_worker_start.store(fail); }

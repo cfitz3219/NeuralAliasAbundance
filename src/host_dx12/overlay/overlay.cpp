@@ -31,6 +31,7 @@
 #include "host_dx12/ngx_observe/gpu_timing.hpp"
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 #include "host_dx12/nr/nr_pass.hpp"
+#include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/overlay/menu.hpp"
 #include "host_dx12/overlay/na_style.hpp"
 #include "host_dx12/overlay/presenter.hpp"
@@ -380,6 +381,20 @@ void write_status_line()
                       static_cast<unsigned long long>(g_game_latency_handle.load()),
                       static_cast<unsigned long long>(g_present_queue_identity.load()));
     if (pn > 0) WriteFile(f, pacing, static_cast<DWORD>(pn), &written, nullptr);
+    {
+        const auto j2 = na::j2::GetStats();
+        uint64_t sel_depth = 0, sel_color = 0;
+        na::observe::GetLiveSelection(&sel_depth, &sel_color);
+        char jl[480];
+        int jn = snprintf(jl, sizeof(jl),
+            "j2 on=%u active=%u depth=%llu color=%llu submissions=%llu frames=%llu no_selection=%llu no_scene_list=%llu no_state=%llu no_camera=%llu busy=%llu dlss_failed=%llu cuts=%llu camera_offset=%llu size=%ux%u format=%u \"%s\"\r\n",
+            na::j2::Enabled() ? 1u : 0u, j2.active ? 1u : 0u, static_cast<unsigned long long>(sel_depth), static_cast<unsigned long long>(sel_color),
+            static_cast<unsigned long long>(j2.submissions), static_cast<unsigned long long>(j2.frames), static_cast<unsigned long long>(j2.no_selection),
+            static_cast<unsigned long long>(j2.no_scene_list), static_cast<unsigned long long>(j2.no_state), static_cast<unsigned long long>(j2.no_camera),
+            static_cast<unsigned long long>(j2.busy), static_cast<unsigned long long>(j2.dlss_failed), static_cast<unsigned long long>(j2.cuts),
+            static_cast<unsigned long long>(j2.camera_offset), j2.width, j2.height, j2.color_format, j2.reason);
+        if (jn > 0) WriteFile(f, jl, static_cast<DWORD>((std::min)(jn, static_cast<int>(sizeof(jl) - 1))), &written, nullptr);
+    }
     const auto latency = na::latency::GetStats();
     char lm[900];
     int ln = snprintf(lm, sizeof(lm), "latency request=%d available=%u confirmed=%u game_sleep=%u native_n=%llu native_ms=%.2f set=%d query=%d foreground=%u vrr=%u cpl_vsync=%u iflip=%u sync=%u flags=0x%X ready_ms=%.2f ready_p95=%.2f real_age_ms=%.2f real_age_p95=%.2f interval_ms=%.2f interval_p95=%.2f present_ms=%.2f backlog=%u\r\n", na::settings::Get().reflex_mode.load(), latency.available, latency.low_latency, latency.game_sleep, static_cast<unsigned long long>(latency.native_samples), latency.native_render_ms, latency.set_result, latency.query_result, latency.foreground, latency.fullscreen_vrr, latency.vsync_override, latency.independent_flip, pr.requested_sync, pr.requested_flags, pr.ready_age.mean, pr.ready_age.p95, pr.real_age.mean, pr.real_age.p95, pr.submit_interval.mean, pr.submit_interval.p95, pr.present_call.mean, pr.backlog);
@@ -1861,6 +1876,12 @@ void STDMETHODCALLTYPE ForwardWithFgInputs(ID3D12CommandQueue* q, UINT n, ID3D12
 {
     na::fg::Execute(q, n, lists, g_orig_execute);
 }
+// J2: live DLAA may insert its list after the game's scene list, then the
+// batch continues through Neural Rendering / Frame Generation as before.
+void STDMETHODCALLTYPE ForwardThroughNr(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists)
+{
+    na::nr::Execute(q, n, lists, ForwardWithFgInputs);
+}
 void STDMETHODCALLTYPE DetourExecute(ID3D12CommandQueue* q, UINT n,
                                      ID3D12CommandList* const* lists)
 {
@@ -1913,14 +1934,14 @@ void STDMETHODCALLTYPE DetourExecute(ID3D12CommandQueue* q, UINT n,
         ExecuteContext ctx{q, n, lists, g_exec_ticket.fetch_add(1, std::memory_order_relaxed) + 1, uncovered, sub->user};
         if (sub->begin) sub->begin(&ctx);
         na::dlss::BeforeExecute(q, n, lists); // R-303: wait for this view's previous DLSS frame on another queue
-        na::nr::Execute(q, n, lists, ForwardWithFgInputs);
+        na::j2::Execute(q, n, lists, ForwardThroughNr);
         na::gputime::OnExecuted(q, n, lists); // R-202: completion fence on the queue that ran the lists
         na::dlss::OnExecuted(q, n, lists);    // C6: completion evidence before retired DLSS features are released
         if (sub->end) sub->end(&ctx);
         g_exec_scoped.fetch_add(1, std::memory_order_relaxed);
     } else {
         na::dlss::BeforeExecute(q, n, lists); // R-303: wait for this view's previous DLSS frame on another queue
-        na::nr::Execute(q, n, lists, ForwardWithFgInputs);
+        na::j2::Execute(q, n, lists, ForwardThroughNr);
         na::gputime::OnExecuted(q, n, lists); // R-202: completion fence on the queue that ran the lists
         na::dlss::OnExecuted(q, n, lists);    // C6: completion evidence before retired DLSS features are released
     }

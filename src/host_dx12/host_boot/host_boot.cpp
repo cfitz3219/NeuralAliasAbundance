@@ -1,5 +1,6 @@
 #include "host_dx12/adapters/tlou1/apply.hpp"
 #include "host_dx12/host_boot/host_boot.hpp"
+#include "host_dx12/j2/live_dlaa.hpp"
 
 #include <atomic>
 #include <cstdlib>
@@ -157,6 +158,9 @@ DWORD WINAPI InitThread(LPVOID)
     // C8: discovery observation producers (H1/H2). Off by default until a
     // consumer (A5 classifier) runs; [observe] producers=1 turns them on.
     na::observe::RequestInstall(GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1);
+    // J2 live DLAA (needs the producers and the discovery adapter): off unless [j2] enabled=1.
+    na::j2::SetEnabled(GetPrivateProfileIntW(L"j2", L"enabled", 0, g_ini) == 1 &&
+                       GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1);
     bool started = na::overlay::Start(tag, nullptr);
     signal_install_attempted(); // producers were installed (or could not be) inside Start
     boot_log(started ? "overlay started" : "overlay start failed");

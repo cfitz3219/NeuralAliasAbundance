@@ -81,6 +81,8 @@ na_host_test(nr_depth_test SOURCES nr_depth_test.cpp LIBS host_dx12)
 # the local SDK folder) plus an RTX GPU, so it only runs in Cort's sessions.
 if(NA_HAVE_NGX_SDK)
   na_host_test(dlss_backend_test SOURCES dlss_backend_test.cpp LIBS host_dlss dxgi)
+  # J2 live DLAA end to end (discovery picks -> inserted DLAA list) on the fake runtime.
+  na_host_test(j2_live_test SOURCES j2_live_test.cpp LIBS host_dx12 dxgi)
 endif()
 if(NA_HAVE_NGX_LIB)
   na_host_test(dlss_real_test SOURCES dlss_real_test.cpp LIBS host_dlss dxgi
