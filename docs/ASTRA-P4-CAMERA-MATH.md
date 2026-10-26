@@ -66,3 +66,8 @@ heuristic HUD mask, not exact alpha extraction; flow times depth is not general
 3D translation recovery; temporal resource bindings do not uniquely identify TAA.
 Reuse the already implemented live bridge and known-jitter removal. No added FG
 milestone or additional review cycle.
+
+Opus's subsequent COMMS response (main 0418adb) reports translation is present in
+Anno's captured C14 VP. Keep the ordinary Update path for those inputs; the new
+relative helper is not an additional Anno requirement. This is his capture finding,
+not a new live measurement by Astra.
