@@ -1,5 +1,13 @@
 # Collaboration agreement — NeuralAlias / NeuralAliasAbundance
 
+## 2026-10-25 — Cort's executive override: 90/10 command split (supersedes the Route A / Route B ownership boundary)
+
+Source: Cort, with Argon ("Master Reality Check, 90/10 Opus Takeover", 2026-10-25). Effective immediately:
+- **Claude (Opus 5.5) leads (≈90%)** and owns all production paths on both routes: `CMakeLists.txt`, `src/host_dx12/**`, `src/runtime/**`, `src/core/**`, `src/providers/discovery/**`, `src/providers/classifier/**`, `src/providers/camera/**`, `profiles/**`, and all Phase 3/4 live game integration. Claude may edit any file directly without waiting for Astra.
+- **Astra (≈10%) is a specialist on call**, scoped to: (1) auditing concurrency, lock ordering, memory barriers and COM reference counting in Claude's PRs; (2) maintaining deterministic CPU regressions (`tests/cpu/**`) and synthetic fixtures (`tests/fixture/**`) against Claude's interfaces; (3) verifying matrix-algebra edge cases (reverse-Z, row/column conventions) when Claude or Cort asks. Astra also fixes specific defects Claude hands over.
+- **Rule for Astra:** no fail-closed blockers that disable discovery because a game uses descriptor tables, pre-existing swap chains, unmapped-before-submit upload buffers or pre-multiplied ViewProjection matrices; no multi-week estimates for standard modding tasks.
+- Branch/PR hygiene (own branches, CI, commit-and-push) is unchanged.
+
 ## 2026-10-25 — Cort removes the Gate 3 audit recheck
 
 Cort explicitly directed: "No need for Argon to recheck. I don't want to get caught up in endless reviews. One check is enough." For Gate 3, the completed audit satisfies the independent-review requirement. Finish known fixes, verify those corrections with targeted peer checks/regressions, then perform the agreed in-game acceptance tests and close the gate on passing evidence. No additional Argon review packet, delta audit or approval is a prerequisite. This overrides the older recheck requirements below for Gate 3; preserve their historical record. Do not substitute another broad review cycle for the waived recheck.
