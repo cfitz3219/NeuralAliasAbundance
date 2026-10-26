@@ -380,3 +380,7 @@ Astra delivered PR46 / focused commit5b6b2be: additive camera-relative history/c
 ## 2026-10-26 — actual AA x2 coexistence implementation
 
 PR48 / astra/j2-msaa-x2 head6de5138 contains color/depth resolves and writeback for matching two-sample inputs, combined with Opus5425e4b unchanged. Five focused RTX hardware/host tests and Release DLL build pass; COMMS has the exact integration instructions and fixture correction. This supersedes the limited PR47 wording-only delivery. No Anno deployment or in-game x2 validation by Astra; Opus retains haze/shimmer and the combined game session. WORKLOG on the branch records failures, correction, and test limitations.
+
+## 2026-10-26 — AA coexistence expanded beyond x2
+
+PR48 head8ca1c08 generalizes sample counts, handles color/depth independently and prefers a pre-postprocess list boundary using observed scene-color readers. Includes Opus2315633 unchanged. Release DLL and17 executed RTX tests pass, including real NVIDIA DLAA x2/x4/x8;3 unsupported x16 tests skip. docs/AA-COEXISTENCE.md on the branch separates applicable Argon tiers, same-list limitations, optional forced-TAA bypass, and gameplay evidence still outstanding. Exact integration handoff in COMMS. No Astra game deployment; Opus retains haze/shimmer and the combined session.
