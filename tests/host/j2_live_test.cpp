@@ -150,7 +150,12 @@ int main()
         g_forwarded.clear();
         std::printf("step: execute (camera x %.1f)\n", cam_x);
         na::j2::Execute(d.queue.Get(), 2, lists, &Forward);
-        std::printf("step: wait idle (forwarded %zu)\n", g_forwarded.size());
+        const auto js = na::j2::GetStats();
+        const auto ds = na::dlss::GetStats();
+        std::printf("step: forwarded %zu | j2 frames %llu sel %llu scene %llu state %llu cam %llu busy %llu dlss %llu \"%s\" | dlss evals %llu rejected %llu \"%s\"\n",
+                    g_forwarded.size(), (unsigned long long)js.frames, (unsigned long long)js.no_selection, (unsigned long long)js.no_scene_list,
+                    (unsigned long long)js.no_state, (unsigned long long)js.no_camera, (unsigned long long)js.busy, (unsigned long long)js.dlss_failed,
+                    js.reason, (unsigned long long)ds.evaluates, (unsigned long long)ds.rejected, ds.reason);
         d.WaitIdle();
         return 0;
     };
@@ -189,5 +194,6 @@ int main()
     na::j2::SetEnabled(false);
     d.WaitIdle();
     na::j2::Shutdown();
+    na_observe_stop(); // the transport thread must not outlive main
     return test::finish("j2_live_test");
 }
