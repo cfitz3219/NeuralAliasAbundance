@@ -188,9 +188,11 @@ int main()
                 static_cast<unsigned long long>(st.frames), static_cast<unsigned long long>(st.camera_offset), st.reason);
     CHECK(g_forwarded.size() == 3 && g_forwarded[0] == scene.list.Get() && g_forwarded[2] == consumer.list.Get());
     CHECK(fake::evals == evals0 + 1);
-    CHECK(fake::P(fake::last_eval, NVSDK_NGX_Parameter_Color) == color.Get());
+    // DLSS reads J2's plain copy of the scene colour (slice 0 / mip 0) and writes a separate output.
+    void* in_color = fake::P(fake::last_eval, NVSDK_NGX_Parameter_Color);
     void* out = fake::P(fake::last_eval, NVSDK_NGX_Parameter_Output);
-    CHECK(out && out != color.Get());
+    CHECK(in_color && in_color != color.Get());
+    CHECK(out && out != color.Get() && out != in_color);
     CHECK(fake::P(fake::last_eval, NVSDK_NGX_Parameter_Depth) && fake::P(fake::last_eval, NVSDK_NGX_Parameter_Depth) != depth.Get()); // R32F copy
     CHECK(fake::P(fake::last_eval, NVSDK_NGX_Parameter_MotionVectors) != nullptr);
     CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 1);
