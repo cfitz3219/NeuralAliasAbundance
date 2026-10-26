@@ -62,6 +62,8 @@ struct Stats {
     uint32_t later_passes = 0;
     uint64_t jitter_writes = 0;   // J1: camera matrices replaced by jittered copies    // other render targets bound after the scene in the same list (insertion may be late)
     uint32_t width = 0, height = 0, color_format = 0;
+    // Shape of the selected resources (reported even when J2 refuses them).
+    uint32_t color_sub = 0, color_mips = 0, color_slices = 0, color_samples = 0, depth_slices = 0, depth_samples = 0;
     bool active = false;          // the last batch with the scene was processed
     char reason[160] = {};
 };

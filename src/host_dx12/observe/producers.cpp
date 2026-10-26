@@ -80,7 +80,13 @@ struct ListState {
     std::vector<na_object_id> uses;
     bool uses_complete = true;
     // (render target, depth target or 0) per OMSetRenderTargets in this recording, in order (under bind_m).
-    std::vector<std::pair<na_object_id, na_object_id>> targets;
+    struct Target {
+        na_object_id rt = 0, ds = 0;
+        uint32_t rt_sub = 0; // the render-target view's first subresource (mip + slice); NA_UNKNOWN_U32 if not one slice
+        uint32_t ds_sub = 0; // the depth view's first subresource, likewise
+        bool same(na_object_id r, na_object_id d) const { return rt == r && ds == d; }
+    };
+    std::vector<Target> targets;
 };
 
 struct Obj {
@@ -1014,6 +1020,12 @@ void STDMETHODCALLTYPE D_CreateRenderTargetView(ID3D12Device* dev, ID3D12Resourc
     o_CreateRenderTargetView(dev, r, d, h);
     uint32_t first = NA_UNKNOWN_U32, count = NA_UNKNOWN_U32;
     if (!d || d->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) { first = d ? d->Texture2D.MipSlice : 0; count = 1; }
+    else if (r && d->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY && d->Texture2DArray.ArraySize == 1) {
+        // One slice of an array: subresource = mip + slice * mip count (plane 0).
+        const D3D12_RESOURCE_DESC rd = r->GetDesc();
+        first = d->Texture2DArray.MipSlice + d->Texture2DArray.FirstArraySlice * rd.MipLevels;
+        count = 1;
+    }
     note_descriptor_write(h, NA_DESC_RTV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count);
 }
 
@@ -1022,6 +1034,11 @@ void STDMETHODCALLTYPE D_CreateDepthStencilView(ID3D12Device* dev, ID3D12Resourc
     o_CreateDepthStencilView(dev, r, d, h);
     uint32_t first = NA_UNKNOWN_U32, count = NA_UNKNOWN_U32;
     if (!d || d->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2D) { first = d ? d->Texture2D.MipSlice : 0; count = 1; }
+    else if (r && d->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DARRAY && d->Texture2DArray.ArraySize == 1) {
+        const D3D12_RESOURCE_DESC rd = r->GetDesc();
+        first = d->Texture2DArray.MipSlice + d->Texture2DArray.FirstArraySlice * rd.MipLevels; // plane 0
+        count = 1;
+    }
     note_descriptor_write(h, NA_DESC_DSV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count);
 }
 
@@ -2305,10 +2322,12 @@ struct On<sl::list::OMSetRenderTargets> {
             for (uint32_t i = 0; i < m; ++i) add_use_locked(ls, refs[i].resource);
             if (m > 0 && ls.targets.size() < 4096) {
                 const na_object_id ds = dsv ? refs[m - 1].resource : 0; // 0: no depth target
+                const uint32_t ds_sub = dsv ? refs[m - 1].first_subresource : 0;
                 const uint32_t rts = dsv ? m - 1 : m;
                 for (uint32_t i = 0; i < rts; ++i)
-                    if (refs[i].resource && (ls.targets.empty() || ls.targets.back() != std::make_pair(refs[i].resource, ds)))
-                        ls.targets.push_back({refs[i].resource, ds});
+                    if (refs[i].resource && (ls.targets.empty() || !ls.targets.back().same(refs[i].resource, ds) ||
+                                             ls.targets.back().rt_sub != refs[i].first_subresource))
+                        ls.targets.push_back({refs[i].resource, ds, refs[i].first_subresource, ds_sub}); // UNKNOWN: a view J2 cannot place
             }
         });
     }
@@ -3734,7 +3753,21 @@ bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id dep
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return false;
     std::lock_guard<std::mutex> bl(ls->bind_m);
-    return std::find(ls->targets.begin(), ls->targets.end(), std::make_pair(color, depth)) != ls->targets.end();
+    return std::any_of(ls->targets.begin(), ls->targets.end(), [&](const ListState::Target& t) { return t.same(color, depth); });
+}
+bool ListSceneSubresource(ID3D12CommandList* list, na_object_id color, na_object_id depth, uint32_t* sub, uint32_t* depth_sub)
+{
+    if (!sub || !depth_sub) return false;
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    auto last = std::find_if(ls->targets.rbegin(), ls->targets.rend(), [&](const ListState::Target& t) { return t.same(color, depth); });
+    if (last == ls->targets.rend()) return false;
+    *sub = last->rt_sub;
+    *depth_sub = last->ds_sub;
+    return true;
 }
 uint32_t ListTargetsAfter(ID3D12CommandList* list, na_object_id color, na_object_id depth)
 {
@@ -3743,12 +3776,11 @@ uint32_t ListTargetsAfter(ID3D12CommandList* list, na_object_id color, na_object
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return 0;
     std::lock_guard<std::mutex> bl(ls->bind_m);
-    const auto pair = std::make_pair(color, depth);
-    auto last = std::find(ls->targets.rbegin(), ls->targets.rend(), pair);
+    auto last = std::find_if(ls->targets.rbegin(), ls->targets.rend(), [&](const ListState::Target& t) { return t.same(color, depth); });
     if (last == ls->targets.rend()) return 0;
     std::vector<na_object_id> others;
     for (auto it = last.base(); it != ls->targets.end(); ++it)
-        if (it->first != color && std::find(others.begin(), others.end(), it->first) == others.end()) others.push_back(it->first);
+        if (it->rt != color && std::find(others.begin(), others.end(), it->rt) == others.end()) others.push_back(it->rt);
     return static_cast<uint32_t>(others.size());
 }
 bool ListLastState(ID3D12CommandList* list, na_object_id id, uint32_t* state)

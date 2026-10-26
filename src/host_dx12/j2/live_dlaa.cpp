@@ -101,12 +101,12 @@ void add(std::vector<D3D12_RESOURCE_BARRIER>& v, ID3D12Resource* r, UINT before,
 {
     if (before != after) v.push_back(transition(r, before, after));
 }
-// Subresource 0 only (the scene colour may carry a mip chain we never touch).
-void add0(std::vector<D3D12_RESOURCE_BARRIER>& v, ID3D12Resource* r, UINT before, UINT after)
+// One subresource only (the scene's mip / slice; the rest of the texture is never touched).
+void addsub(std::vector<D3D12_RESOURCE_BARRIER>& v, ID3D12Resource* r, UINT sub, UINT before, UINT after)
 {
     if (before == after) return;
     D3D12_RESOURCE_BARRIER b = transition(r, before, after);
-    b.Transition.Subresource = 0;
+    b.Transition.Subresource = sub;
     v.push_back(b);
 }
 void flush(ID3D12GraphicsCommandList* l, std::vector<D3D12_RESOURCE_BARRIER>& v)
@@ -471,13 +471,12 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     depth.Attach(na::observe::AcquireResource(depth_id));
     if (!color || !depth) { reason("Scene resources are not available."); return false; }
     const D3D12_RESOURCE_DESC cd = color->GetDesc(), dd = depth->GetDesc();
-    const uint32_t w = static_cast<uint32_t>(cd.Width), h = cd.Height;
-    if (dd.Width != cd.Width || dd.Height != cd.Height || !na::depth::PlaneZeroCopiesToR32F(dd.Format)) {
-        reason("Scene depth does not match the colour size or is not 32-bit depth.");
-        return false;
-    }
-    // Arrays and mip chains are fine: J2 works on slice 0 / mip 0 through its own
-    // plain copy. Multisampling is not (DLSS takes resolved pictures).
+    g.stats.color_mips = cd.MipLevels ? cd.MipLevels : 1;
+    g.stats.color_slices = cd.DepthOrArraySize;
+    g.stats.color_samples = cd.SampleDesc.Count;
+    g.stats.depth_samples = dd.SampleDesc.Count;
+    g.stats.depth_slices = dd.DepthOrArraySize;
+    // Multisampling is not supported (DLSS takes resolved pictures).
     if (cd.SampleDesc.Count != 1 || dd.SampleDesc.Count != 1) {
         char why[160];
         std::snprintf(why, sizeof why, "The game renders with multisampling (colour x%u, depth x%u). Set the game's anti-aliasing to Off for DLAA.",
@@ -485,8 +484,24 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         reason(why);
         return false;
     }
-    if (cd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
-        reason("The scene colour is not a 2D texture.");
+    if (cd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || dd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+        reason("The scene colour or depth is not a 2D texture.");
+        return false;
+    }
+    // The subresources (mip + slice) the scene pass rendered into, from its views:
+    // arrays and mip chains are fine, J2 works on exactly that one through its own copies.
+    uint32_t csub = 0, dsub = 0;
+    if (!na::observe::ListSceneSubresource(lists[scene], color_id, depth_id, &csub, &dsub) || csub == 0xFFFFFFFFu || dsub == 0xFFFFFFFFu) {
+        reason("The scene is drawn through a view NeuralAlias cannot place (several array slices at once, or an unusual view).");
+        return false;
+    }
+    g.stats.color_sub = csub;
+    const uint32_t cmip = csub % g.stats.color_mips;
+    const uint32_t dmip = dsub % (dd.MipLevels ? dd.MipLevels : 1u);
+    const uint32_t w = (std::max)(1u, static_cast<uint32_t>(cd.Width >> cmip)), h = (std::max)(1u, cd.Height >> cmip);
+    if ((std::max)(1u, static_cast<uint32_t>(dd.Width >> dmip)) != w || (std::max)(1u, dd.Height >> dmip) != h ||
+        !na::depth::PlaneZeroCopiesToR32F(dd.Format)) {
+        reason("Scene depth does not match the colour size or is not 32-bit depth.");
         return false;
     }
     const DXGI_FORMAT cf = typed(cd.Format); // our copies' format
@@ -542,13 +557,14 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // 1. depth plane 0 -> R32F; scene colour slice 0 / mip 0 -> our plain copy
     add(b, depth.Get(), sd, SRC);
     add(b, g.depth32.Get(), NPSR, DST);
-    add0(b, color.Get(), sc, SRC);
+    addsub(b, color.Get(), csub, sc, SRC);
     add(b, g.color_in.Get(), NPSR, DST);
     flush(l, b);
     {
         D3D12_TEXTURE_COPY_LOCATION cs{}, cdst{};
         cs.Type = cdst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        cs.pResource = color.Get(); // subresource 0: mip 0, slice 0
+        cs.pResource = color.Get(); // the subresource the scene was drawn into
+        cs.SubresourceIndex = csub;
         cdst.pResource = g.color_in.Get();
         l->CopyTextureRegion(&cdst, 0, 0, 0, &cs, nullptr);
     }
@@ -556,7 +572,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
     src.Type = dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     src.pResource = depth.Get();
-    src.SubresourceIndex = 0;
+    src.SubresourceIndex = dsub; // plane 0 of the slice / mip the scene used
     dst.pResource = g.depth32.Get();
     dst.SubresourceIndex = 0;
     l->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
@@ -614,17 +630,18 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (evaluated) {
         b.push_back(uav_barrier(g.output.Get()));
         add(b, g.output.Get(), UAV, SRC);
-        add0(b, color.Get(), SRC, DST);
+        addsub(b, color.Get(), csub, SRC, DST);
         flush(l, b);
         D3D12_TEXTURE_COPY_LOCATION cs{}, cdst{};
         cs.Type = cdst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         cs.pResource = g.output.Get();
-        cdst.pResource = color.Get(); // subresource 0: mip 0 of the scene colour
+        cdst.pResource = color.Get(); // back into the scene's subresource
+        cdst.SubresourceIndex = csub;
         l->CopyTextureRegion(&cdst, 0, 0, 0, &cs, nullptr);
         add(b, g.output.Get(), SRC, UAV);
-        add0(b, color.Get(), DST, sc);
+        addsub(b, color.Get(), csub, DST, sc);
     } else {
-        add0(b, color.Get(), SRC, sc);
+        addsub(b, color.Get(), csub, SRC, sc);
     }
     add(b, g.motion.Get(), NPSR, UAV);
     flush(l, b);

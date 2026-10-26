@@ -1,7 +1,8 @@
 // J2 on Anno's shape (the run that crashed, 2026-10-26): the path the game takes,
 // not the convenient one.
 //   - submissions go through ExecuteBegin/End around J2, as the overlay does;
-//   - the scene colour is a 2-slice ARRAY with a MIP CHAIN (RGBA16F, 4 mips) and the scene list never
+//   - the scene colour is a 2-slice ARRAY with a MIP CHAIN (RGBA16F, 4 mips), the
+//     scene drawn into slice 1 while slice 0 holds something else and the scene list never
 //     transitions colour or depth: their states are carried from an earlier
 //     submission (the known-state store);
 //   - the camera sits in a 768-byte DESCRIPTOR-TABLE CBV at +336, inverse at +400;
@@ -120,8 +121,19 @@ int main()
     D3D12_RENDER_TARGET_VIEW_DESC rvd{};
     rvd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     rvd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
-    rvd.Texture2DArray.ArraySize = 1; // slice 0, mip 0
+    rvd.Texture2DArray.ArraySize = 1;
+    rvd.Texture2DArray.FirstArraySlice = 1; // the scene is drawn into SLICE 1 (mip 0): subresource 4
     dev->CreateRenderTargetView(color.Get(), &rvd, rtv);
+    // Slice 0 holds something else (red) that DLAA must never touch.
+    test::ComPtr<ID3D12DescriptorHeap> rtvh0;
+    D3D12_DESCRIPTOR_HEAP_DESC hd0{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd0, IID_PPV_ARGS(&rtvh0))));
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv0 = rtvh0->GetCPUDescriptorHandleForHeapStart();
+    {
+        D3D12_RENDER_TARGET_VIEW_DESC v0 = rvd;
+        v0.Texture2DArray.FirstArraySlice = 0;
+        dev->CreateRenderTargetView(color.Get(), &v0, rtv0);
+    }
     D3D12_DEPTH_STENCIL_VIEW_DESC dvd{};
     dvd.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
     dvd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
@@ -165,6 +177,8 @@ int main()
         D3D12_RESOURCE_BARRIER in[2] = {test::Transition(color.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
                                         test::Transition(depth.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_DEPTH_WRITE)};
         setup.list->ResourceBarrier(2, in);
+        const float red[4] = {1, 0, 0, 1};
+        setup.list->ClearRenderTargetView(rtv0, red, 0, nullptr);
         REQUIRE(SUCCEEDED(setup.list->Close()));
         ID3D12CommandList* l[] = {setup.list.Get()};
         Submit(q, 1, l, false);
@@ -242,6 +256,46 @@ int main()
         Store(orig, Camera(0.5));
         CHECK(std::memcmp(cpu + kPre + kVp, orig, 64) != 0);                // the earlier pre-pass batch was jittered...
         CHECK(std::memcmp(cpu + kPre + kVp, cpu + kBlock + kVp, 64) == 0); // ...exactly like the scene's camera
+    }
+    // Content: the result went into slice 1 (the fake DLSS leaves its output zero),
+    // and slice 0 kept its red.
+    {
+        d.WaitIdle();
+        const D3D12_RESOURCE_DESC cdsc = color->GetDesc();
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[5]{};
+        UINT64 total = 0;
+        dev->GetCopyableFootprints(&cdsc, 0, 5, 0, fp, nullptr, nullptr, &total);
+        auto rb = test::CreateBuffer(dev, total, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        REQUIRE(rb);
+        test::List c;
+        REQUIRE(c.Create(dev));
+        D3D12_RESOURCE_BARRIER tb = test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        c.list->ResourceBarrier(1, &tb);
+        for (UINT sub : {0u, 4u}) {
+            D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+            src.pResource = color.Get();
+            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src.SubresourceIndex = sub;
+            dst.pResource = rb.Get();
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint = fp[sub];
+            c.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        }
+        tb = test::Transition(color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        c.list->ResourceBarrier(1, &tb);
+        REQUIRE(SUCCEEDED(c.list->Close()));
+        ID3D12CommandList* cl[] = {c.list.Get()};
+        q->ExecuteCommandLists(1, cl);
+        d.WaitIdle();
+        uint8_t* p = nullptr;
+        REQUIRE(SUCCEEDED(rb->Map(0, nullptr, reinterpret_cast<void**>(&p))));
+        uint16_t s0[4], s1[4];
+        std::memcpy(s0, p + fp[0].Offset + fp[0].Footprint.RowPitch * 5 + 8 * 7, 8);
+        std::memcpy(s1, p + fp[4].Offset + fp[4].Footprint.RowPitch * 5 + 8 * 7, 8);
+        rb->Unmap(0, nullptr);
+        std::printf("slice 0 pixel %04X %04X %04X %04X, slice 1 pixel %04X %04X %04X %04X\n", s0[0], s0[1], s0[2], s0[3], s1[0], s1[1], s1[2], s1[3]);
+        CHECK(s0[0] == 0x3C00 && s0[1] == 0 && s0[2] == 0); // red (1.0 in half float) untouched
+        CHECK(s1[0] == 0 && s1[1] == 0 && s1[2] == 0);      // the scene's clear (0.2,0.3,0.4) was replaced by the DLAA result
     }
     CHECK(dev->GetDeviceRemovedReason() == S_OK);
     na::j2::SetEnabled(false);

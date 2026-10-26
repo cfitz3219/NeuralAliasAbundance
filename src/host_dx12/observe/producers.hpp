@@ -109,6 +109,10 @@ std::vector<LiveBinding> ListRootConstantBuffers(ID3D12CommandList* list); // gr
 bool ListReferences(ID3D12CommandList* list, na_object_id id);            // the recording referenced the resource
 // True when the recording bound `color` as a render target together with `depth` as its depth target.
 bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id depth);
+// The subresources (mip + array slice; depth: plane 0) the last bind of `color`
+// with `depth` in this recording rendered into, from the views' first
+// subresources. NA_UNKNOWN_U32 = a view spanning several slices or unusual.
+bool ListSceneSubresource(ID3D12CommandList* list, na_object_id color, na_object_id depth, uint32_t* sub, uint32_t* depth_sub);
 // Distinct other render targets bound in this recording after its last bind of
 // `color` with `depth` (later passes in the same list, e.g. post-processing that
 // may consume the scene colour before a list-boundary insertion).
