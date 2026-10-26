@@ -41,6 +41,7 @@ struct State {
     std::atomic<bool> configured{false};
     std::atomic<bool> paused{false}; // the user's on/off switch in the overlay
     bool resume_reset = false;       // history is stale after a pause
+    bool latched = false;            // stopped for this session after a failure (reason kept)
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> queue;
     ComPtr<ID3D12Fence> fence;
@@ -97,6 +98,14 @@ D3D12_RESOURCE_BARRIER uav_barrier(ID3D12Resource* r)
 void add(std::vector<D3D12_RESOURCE_BARRIER>& v, ID3D12Resource* r, UINT before, UINT after)
 {
     if (before != after) v.push_back(transition(r, before, after));
+}
+// Subresource 0 only (the scene colour may carry a mip chain we never touch).
+void add0(std::vector<D3D12_RESOURCE_BARRIER>& v, ID3D12Resource* r, UINT before, UINT after)
+{
+    if (before == after) return;
+    D3D12_RESOURCE_BARRIER b = transition(r, before, after);
+    b.Transition.Subresource = 0;
+    v.push_back(b);
 }
 void flush(ID3D12GraphicsCommandList* l, std::vector<D3D12_RESOURCE_BARRIER>& v)
 {
@@ -411,6 +420,10 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         reason("Scene depth does not match the colour size or is not 32-bit depth.");
         return false;
     }
+    if (cd.SampleDesc.Count != 1 || dd.SampleDesc.Count != 1 || cd.DepthOrArraySize != 1 || cd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+        reason("The scene colour or depth is multisampled or an array; DLAA here needs plain textures.");
+        return false;
+    }
 
     // Camera first (nothing is allocated for a frame that cannot run); the tracker
     // update comes after the size check, because a resize resets the tracker.
@@ -459,7 +472,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // 1. depth plane 0 -> R32F
     add(b, depth.Get(), sd, SRC);
     add(b, g.depth32.Get(), NPSR, DST);
-    add(b, color.Get(), sc, color_read);
+    add0(b, color.Get(), sc, color_read);
     flush(l, b);
     D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
     src.Type = dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -489,7 +502,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     }
     if (!have_motion) {
         l->Close();
-        reason("Motion vectors could not be built.");
+        reason("Stopped: motion vectors could not be built.");
+        g.latched = true;
         return false;
     }
     b.push_back(uav_barrier(g.motion.Get()));
@@ -518,20 +532,31 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (evaluated) {
         b.push_back(uav_barrier(g.output.Get()));
         add(b, g.output.Get(), UAV, SRC);
-        add(b, color.Get(), color_read, DST);
+        add0(b, color.Get(), color_read, DST);
         flush(l, b);
-        l->CopyResource(color.Get(), g.output.Get());
+        D3D12_TEXTURE_COPY_LOCATION cs{}, cdst{};
+        cs.Type = cdst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        cs.pResource = g.output.Get();
+        cdst.pResource = color.Get(); // subresource 0: mip 0 of the scene colour
+        l->CopyTextureRegion(&cdst, 0, 0, 0, &cs, nullptr);
         add(b, g.output.Get(), SRC, UAV);
-        add(b, color.Get(), DST, sc);
+        add0(b, color.Get(), DST, sc);
     } else {
-        add(b, color.Get(), color_read, sc);
+        add0(b, color.Get(), color_read, sc);
     }
     add(b, g.motion.Get(), NPSR, UAV);
     flush(l, b);
-    if (FAILED(l->Close())) { reason("Could not close the DLAA command list."); return false; }
-    if (!evaluated) {
-        reason("DLSS refused the frame (see DLSS details).");
-        return false; // nothing useful to submit
+    if (FAILED(l->Close()) || !evaluated) {
+        // Never retried: a rejected list or a refusal repeats every frame. Stop for
+        // this session and say exactly what was being processed.
+        char why[160];
+        std::snprintf(why, sizeof why, "Stopped: %s (colour fmt %u mips %u state 0x%X, depth fmt %u state 0x%X). %s",
+                      evaluated ? "the DLAA command list was rejected" : "DLSS refused the frame",
+                      static_cast<unsigned>(cd.Format), static_cast<unsigned>(cd.MipLevels), sc, static_cast<unsigned>(dd.Format), sd,
+                      na::dlss::GetStats().reason);
+        reason(why);
+        g.latched = true;
+        return false;
     }
     g.stats.width = w;
     g.stats.height = h;
@@ -560,6 +585,12 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     }
     const na::observe::HostWorkScope host; // our objects and our list are never observed as the game's
     std::unique_lock<std::mutex> lock(g.m);
+    if (g.latched) {
+        g.stats.active = false;
+        lock.unlock();
+        forward(queue, count, lists);
+        return;
+    }
     ++g.stats.submissions;
     uint64_t depth_id = 0, color_id = 0;
     na::observe::GetLiveSelection(&depth_id, &color_id);
