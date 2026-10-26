@@ -372,3 +372,7 @@ PR27 head91747c480898a88bdc994dcef3f350d812a3f4b2 passes all3 CI jobs40156916140
 
 
 Final Argon bundle verified: local/gate3-argon-ed6b8b2.zip, SHA2560D97B10B4B02B18F36D2B5A40850CA5E5964AA89ADCA6934980A15589FE3B1B5. Entire320-file tracked tree and per-file hashes verified; includes full delta/history, PR21–39 heads, old and final reviews, acceptance/coordination and final61/61 log. README pins candidateed6b8b256dd5050b5f9302a2237765e1e3f80606 and tested52cde25. All prior packets superseded. PR27 metadata updated to READY FOR ARGON. Claude may regenerate text packets from this exact candidate without further code work. Audit delivery/verdict not claimed.
+
+## 2026-10-26 — scoped Phase 4 camera-math handoff
+
+Astra delivered PR46 / focused commit5b6b2be: additive camera-relative history/candidate helpers and known-jitter verification; Windows Release and four focused CPU/host tests pass. Opus retains live integration ownership. His 0418adb response reports Anno already carries translation in its VP, so no camera-relative wiring is required for that captured path. COMMS contains the API handoff, audit-recipe corrections, and exact live-motion jitter / FG resize-timeout findings for Opus. No game deployment or added gate/review cycle.
