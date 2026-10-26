@@ -71,13 +71,19 @@ public:
         if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors)) ||
             FAILED(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root_)))) return false;
         static const char* depth_shader = R"(
-Texture2DMS<float, 2> source : register(t0);
+Texture2DMS<float> source : register(t0);
 RWTexture2D<float> target : register(u0);
 cbuffer Params : register(b0) { uint width; uint height; uint reverse_z; };
 [numthreads(8,8,1)] void main(uint3 p : SV_DispatchThreadID) {
     if (p.x >= width || p.y >= height) return;
-    float a = source.Load(p.xy, 0), b = source.Load(p.xy, 1);
-    target[p.xy] = reverse_z ? max(a,b) : min(a,b);
+    uint source_width, source_height, samples;
+    source.GetDimensions(source_width, source_height, samples);
+    float nearest = source.Load(p.xy, 0);
+    for (uint sample = 1; sample < samples; ++sample) {
+        float depth = source.Load(p.xy, sample);
+        nearest = reverse_z ? max(nearest, depth) : min(nearest, depth);
+    }
+    target[p.xy] = nearest;
 })";
         Ptr<ID3DBlob> cs, vs, ps;
         if (!compile(depth_shader, "main", "cs_5_0", cs)) return false;
@@ -135,8 +141,8 @@ float4 pixel(float4 pos : SV_Position) : SV_Target { return source.Load(int3(int
         list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
     }
 
-    // CopyTextureRegion cannot expand 1 sample to 2. Draw an unblended fullscreen
-    // triangle into precisely the game's selected RTV slice, writing both samples.
+    // CopyTextureRegion cannot expand a plain texture to MSAA. Draw an unblended
+    // fullscreen triangle into the selected RTV slice, writing all its samples.
     void WriteColor(ID3D12GraphicsCommandList* list, ID3D12Resource* source,
                     ID3D12Resource* target, UINT slice, UINT width, UINT height, UINT slot) {
         D3D12_SHADER_RESOURCE_VIEW_DESC srv{};

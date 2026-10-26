@@ -5,7 +5,7 @@
 #include <vector>
 #include <cmath>
 
-int main(int argc, char**) {
+int main(int argc, char** argv) {
     test::ComPtr<ID3D12Debug> debug;
     if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) debug->EnableDebugLayer();
     test::Device d;
@@ -13,11 +13,19 @@ int main(int argc, char**) {
     auto* dev = d.device.Get();
     test::ComPtr<ID3D12InfoQueue> info; dev->QueryInterface(IID_PPV_ARGS(&info));
     constexpr UINT W = 16, H = 16;
+    const UINT samples = argc > 1 ? UINT(std::atoi(argv[1])) : 2;
+    const bool stencil = argc < 3;
+    for (auto format : {DXGI_FORMAT_R16G16B16A16_FLOAT, stencil ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : DXGI_FORMAT_D32_FLOAT}) {
+        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels{format, samples, D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 0};
+        REQUIRE(SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,&levels,sizeof levels)));
+        if (!levels.NumQualityLevels) { printf("SKIP: hardware format %u does not support x%u\n",unsigned(format),samples); return test::kSkip; }
+    }
+    printf("testing x%u, depth %s\n",samples,stencil?"32+stencil":"32");
     D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; desc.Width = W; desc.Height = H;
-    desc.MipLevels = desc.DepthOrArraySize = 1; desc.SampleDesc.Count = 2;
-    const bool stencil = argc == 1;
+    desc.MipLevels = desc.DepthOrArraySize = 1; desc.SampleDesc.Count = samples;
+
     desc.Format = stencil ? DXGI_FORMAT_R32G8X24_TYPELESS : DXGI_FORMAT_R32_TYPELESS;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
     test::ComPtr<ID3D12Resource> depth, color;
@@ -32,7 +40,7 @@ int main(int argc, char**) {
     auto reverse = test::CreateTexture(dev,W,H,DXGI_FORMAT_R32_FLOAT,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     REQUIRE(plain && normal && reverse);
     na::j2::MsaaResolve resolver;
-    REQUIRE(resolver.Init(dev,W,H,desc.Format,depth_desc,{2,0},2));
+    REQUIRE(resolver.Init(dev,W,H,desc.Format,depth_desc,{samples,0},2));
     test::ComPtr<ID3D12DescriptorHeap> dh, rh;
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_DSV,1,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
     REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&dh))));
@@ -44,11 +52,13 @@ int main(int argc, char**) {
     const char* shader=R"(
 float4 vs(uint i:SV_VertexID):SV_Position { float2 uv=float2((i<<1)&2,i&2); return float4(uv*float2(2,-2)+float2(-1,1),0,1); }
 struct Output { float4 color:SV_Target; float depth:SV_Depth; };
-Output ps(uint sample:SV_SampleIndex) { Output o; o.color=sample?float4(0,0,1,1):float4(1,0,0,1); o.depth=sample?0.75:0.25; return o; }
+Output ps(uint sample:SV_SampleIndex) { Output o; o.color=(sample & 1)?float4(0,0,1,1):float4(1,0,0,1); o.depth=SAMPLES==2?((sample & 1)?0.75:0.25):(sample<2?0.5:((sample & 1)?0.75:0.25)); return o; }
 )";
+    char sample_text[16]; sprintf_s(sample_text, "%u", samples);
+    D3D_SHADER_MACRO macros[] = {{"SAMPLES",sample_text},{nullptr,nullptr}};
     test::ComPtr<ID3DBlob> vs,ps,blob,err;
-    REQUIRE(SUCCEEDED(D3DCompile(shader,strlen(shader),nullptr,nullptr,nullptr,"vs","vs_5_0",0,0,&vs,&err)));
-    REQUIRE(SUCCEEDED(D3DCompile(shader,strlen(shader),nullptr,nullptr,nullptr,"ps","ps_5_0",0,0,&ps,&err)));
+    REQUIRE(SUCCEEDED(D3DCompile(shader,strlen(shader),nullptr,macros,nullptr,"vs","vs_5_0",0,0,&vs,&err)));
+    REQUIRE(SUCCEEDED(D3DCompile(shader,strlen(shader),nullptr,macros,nullptr,"ps","ps_5_0",0,0,&ps,&err)));
     D3D12_ROOT_SIGNATURE_DESC rd{}; rd.Flags=D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rd,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&err)));
     test::ComPtr<ID3D12RootSignature> root;
@@ -63,7 +73,7 @@ Output ps(uint sample:SV_SampleIndex) { Output o; o.color=sample?float4(0,0,1,1)
     gp.DepthStencilState.DepthEnable=TRUE; gp.DepthStencilState.DepthWriteMask=D3D12_DEPTH_WRITE_MASK_ALL;
     gp.DepthStencilState.DepthFunc=D3D12_COMPARISON_FUNC_ALWAYS;
     gp.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE; gp.NumRenderTargets=1; gp.RTVFormats[0]=desc.Format;
-    gp.DSVFormat=dv.Format; gp.SampleDesc={2,0};
+    gp.DSVFormat=dv.Format; gp.SampleDesc={samples,0};
     test::ComPtr<ID3D12PipelineState> pso;
     REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&gp,IID_PPV_ARGS(&pso))));
     test::List l; REQUIRE(l.Create(dev));

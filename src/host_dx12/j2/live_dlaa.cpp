@@ -53,7 +53,7 @@ struct State {
     ComPtr<ID3D12Resource> depth32, motion, provenance, output;
     ComPtr<ID3D12Resource> color_in; // plain copy of the scene colour's first slice / mip (DLSS input)
     MsaaResolve msaa;
-    UINT samples = 1, sample_quality = 0, depth_quality = 0;
+    UINT samples = 1, depth_samples = 1, sample_quality = 0, depth_quality = 0;
     DXGI_FORMAT depth_format = DXGI_FORMAT_UNKNOWN;
     uint32_t w = 0, h = 0;
     DXGI_FORMAT color_format = DXGI_FORMAT_UNKNOWN;
@@ -507,15 +507,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     g.stats.color_samples = cd.SampleDesc.Count;
     g.stats.depth_samples = dd.SampleDesc.Count;
     g.stats.depth_slices = dd.DepthOrArraySize;
-    // AA settings are not an eligibility condition. Resolve matching x2 MSAA
-    // inputs; keep the existing plain-texture path for single-sample rendering.
-    if (cd.SampleDesc.Count != dd.SampleDesc.Count || (cd.SampleDesc.Count != 1 && cd.SampleDesc.Count != 2)) {
-        char why[160];
-        std::snprintf(why, sizeof why, "This sample-count combination is not supported (colour x%u, depth x%u). DLAA supports matching Off or x2 MSAA inputs.",
-                      cd.SampleDesc.Count, dd.SampleDesc.Count);
-        reason(why);
-        return false;
-    }
+    // AA settings are not an eligibility condition. Each input is converted
+    // independently: a game may already have resolved color but retain MSAA depth.
     if (cd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || dd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
         reason("The scene colour or depth is not a 2D texture.");
         return false;
@@ -537,7 +530,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         return false;
     }
     const DXGI_FORMAT cf = typed(cd.Format); // our copies' format
-    const bool msaa = cd.SampleDesc.Count == 2;
+    const bool color_msaa = cd.SampleDesc.Count > 1, depth_msaa = dd.SampleDesc.Count > 1;
 
     // Camera first (nothing is allocated for a frame that cannot run); the tracker
     // update comes after the size check, because a resize resets the tracker.
@@ -560,22 +553,22 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (s.fence_value && done < s.fence_value) { ++g.stats.busy; reason("Skipped: the previous use of this frame slot is still running."); return false; }
     const bool resize = !g.output || !g.color_in || g.w != w || g.h != h || g.color_format != cf ||
                         g.samples != cd.SampleDesc.Count || g.sample_quality != cd.SampleDesc.Quality ||
-                        g.depth_quality != dd.SampleDesc.Quality || g.depth_format != dd.Format;
+                        g.depth_samples != dd.SampleDesc.Count || g.depth_quality != dd.SampleDesc.Quality || g.depth_format != dd.Format;
     if (resize) {
         if (done + 1 < g.fence_next) { ++g.stats.busy; reason("Waiting for the previous picture size to finish."); return false; }
         if (!uav_store(cf) || !uav_store(DXGI_FORMAT_R32G32_FLOAT)) { reason("This scene colour format cannot be written by DLSS here."); return false; }
         g.msaa = MsaaResolve{};
-        if (msaa) {
+        if (color_msaa || depth_msaa) {
             D3D12_FEATURE_DATA_FORMAT_SUPPORT support{cf};
             if (FAILED(g.device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof support)) ||
-                !(support.Support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE) ||
+                (color_msaa && !(support.Support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE)) ||
                 !g.msaa.Init(g.device.Get(), w, h, cf, dd, cd.SampleDesc, kRing)) {
                 g.output.Reset();
-                reason("Could not prepare the x2 MSAA resolve pipeline.");
+                reason("Could not prepare the MSAA resolve pipeline.");
                 return false;
             }
         }
-        if (!texture(w, h, DXGI_FORMAT_R32_FLOAT, msaa, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g.depth32) ||
+        if (!texture(w, h, DXGI_FORMAT_R32_FLOAT, depth_msaa, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g.depth32) ||
             !texture(w, h, DXGI_FORMAT_R32G32_FLOAT, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.motion) ||
             !texture(w, h, DXGI_FORMAT_R8_UINT, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.provenance) ||
             !texture(w, h, cf, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.output) ||
@@ -586,7 +579,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         }
         g.w = w; g.h = h; g.color_format = cf;
         g.samples = cd.SampleDesc.Count; g.sample_quality = cd.SampleDesc.Quality;
-        g.depth_quality = dd.SampleDesc.Quality; g.depth_format = dd.Format;
+        g.depth_samples = dd.SampleDesc.Count; g.depth_quality = dd.SampleDesc.Quality; g.depth_format = dd.Format;
         g.resume_reset = true; // remains pending if this recording is not submitted
     }
     const double zero[2] = {0, 0};
@@ -603,14 +596,14 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     constexpr UINT NPSR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, SRC = D3D12_RESOURCE_STATE_COPY_SOURCE,
                    DST = D3D12_RESOURCE_STATE_COPY_DEST, UAV = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     // 1. Copy or resolve exactly the scene views into single-sample DLSS inputs.
-    const UINT color_source = msaa ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE : SRC;
-    const UINT color_dest = msaa ? D3D12_RESOURCE_STATE_RESOLVE_DEST : DST;
+    const UINT color_source = color_msaa ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE : SRC;
+    const UINT color_dest = color_msaa ? D3D12_RESOURCE_STATE_RESOLVE_DEST : DST;
     addsub(b, depth.Get(), dsub, sd, SRC);
-    add(b, g.depth32.Get(), NPSR, msaa ? UAV : DST);
+    add(b, g.depth32.Get(), NPSR, depth_msaa ? UAV : DST);
     addsub(b, color.Get(), csub, sc, color_source);
     add(b, g.color_in.Get(), NPSR, color_dest);
     flush(l, b);
-    if (msaa) {
+    if (color_msaa) {
         l->ResolveSubresource(g.color_in.Get(), 0, color.Get(), csub, cf);
     } else {
         D3D12_TEXTURE_COPY_LOCATION cs{}, cdst{};
@@ -625,11 +618,11 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     src.Type = dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     src.pResource = depth.Get();
     src.SubresourceIndex = dsub; // plane 0 of the slice / mip the scene used
-    dst.pResource = msaa ? g.msaa.DepthCopy() : g.depth32.Get();
+    dst.pResource = depth_msaa ? g.msaa.DepthCopy() : g.depth32.Get();
     dst.SubresourceIndex = 0;
     l->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     addsub(b, depth.Get(), dsub, SRC, sd);
-    if (msaa) {
+    if (depth_msaa) {
         addsub(b, g.msaa.DepthCopy(), 0, DST, NPSR);
         flush(l, b);
         g.msaa.ResolveDepth(l, g.depth32.Get(), w, h, reversed, g.slot);
@@ -689,12 +682,12 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // 5. result -> scene colour, everything back to the game's states
     if (evaluated) {
         b.push_back(uav_barrier(g.output.Get()));
-        const UINT output_read = msaa ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : SRC;
-        const UINT color_write = msaa ? D3D12_RESOURCE_STATE_RENDER_TARGET : DST;
+        const UINT output_read = color_msaa ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : SRC;
+        const UINT color_write = color_msaa ? D3D12_RESOURCE_STATE_RENDER_TARGET : DST;
         add(b, g.output.Get(), UAV, output_read);
         addsub(b, color.Get(), csub, color_source, color_write);
         flush(l, b);
-        if (msaa) {
+        if (color_msaa) {
             g.msaa.WriteColor(l, g.output.Get(), color.Get(), csub / g.stats.color_mips, w, h, g.slot);
         } else {
             D3D12_TEXTURE_COPY_LOCATION cs{}, cdst{};
@@ -801,8 +794,17 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         return;
     }
     int scene = -1;
-    for (UINT i = 0; i < count; ++i)
-        if (lists[i] && na::observe::ListRendersTo(lists[i], color_id, depth_id)) scene = static_cast<int>(i); // the last list that drew the scene (not a later one that merely transitions it)
+    bool before_reader = false;
+    for (UINT i = 0; i < count; ++i) {
+        // Prefer the last scene writer BEFORE the first explicit downstream
+        // reader (AA, tonemap, etc.). A postprocess list may rebind the scene RTV
+        // at its end; that rebind must not move us past its earlier read.
+        if (scene >= 0 && na::observe::ListSamplesTexture(lists[i], color_id)) {
+            before_reader = true;
+            break;
+        }
+        if (lists[i] && na::observe::ListRendersTo(lists[i], color_id, depth_id)) scene = static_cast<int>(i);
+    }
     ID3D12GraphicsCommandList* ours = nullptr;
     PendingHistory pending;
     if (scene < 0) {
@@ -850,6 +852,8 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         char why[160];
         std::snprintf(why, sizeof why, "Live DLAA is running (inserted after the scene list; it draws %u other targets after the scene).", g.stats.later_passes);
         reason(why);
+    } else if (before_reader) {
+        reason("Live DLAA is running before a later scene-colour reader; game AA remains enabled.");
     } else {
         reason("Live DLAA is running.");
     }

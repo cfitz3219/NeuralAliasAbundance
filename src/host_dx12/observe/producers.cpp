@@ -87,6 +87,9 @@ struct ListState {
         bool same(na_object_id r, na_object_id d) const { return rt == r && ds == d; }
     };
     std::vector<Target> targets;
+    // Explicit bounded SRV-table observations are a pass-order hint, not proof
+    // of a particular AA shader or a requirement for DLAA eligibility.
+    std::vector<na_object_id> sampled_textures;
 };
 
 struct Obj {
@@ -1897,6 +1900,7 @@ struct On<sl::list::Reset> {
                     ls->uses.clear();
                     ls->uses_complete = true;
                     ls->targets.clear();
+                    ls->sampled_textures.clear();
                 }
                 ls->root_sig[0] = ls->root_sig[1] = nullptr;
                 ls->coverage_complete.store(cov == na::hooking::variants::Coverage::Complete);
@@ -2217,6 +2221,18 @@ void root_table(GL* l, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE h)
                     const auto& rr = it->second.root_ranges;
                     for (uint32_t q = 0; q < rp.count && rp.first_range + q < rr.size(); ++q) {
                         const na_root_range& range = rr[rp.first_range + q];
+                        if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && range.table_offset != NA_UNKNOWN_U32) {
+                            std::lock_guard<std::mutex> bl(ls->bind_m);
+                            for (uint32_t k = 0; k < std::min<uint32_t>(range.num_descriptors, 64); ++k) {
+                                const uint64_t index = uint64_t(slot) + range.table_offset + k;
+                                if (index >= dh->count) break;
+                                const auto& si = dh->info[static_cast<size_t>(index)];
+                                if (si.kind == NA_DESC_SRV && si.resource && si.resource != NA_UNKNOWN_U64 &&
+                                    ls->sampled_textures.size() < 256 &&
+                                    std::find(ls->sampled_textures.begin(), ls->sampled_textures.end(), si.resource) == ls->sampled_textures.end())
+                                    ls->sampled_textures.push_back(si.resource);
+                            }
+                        }
                         if (range.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_CBV || range.table_offset == NA_UNKNOWN_U32) continue;
                         const uint32_t n = std::min<uint32_t>(range.num_descriptors, 8);
                         const bool cut = range.num_descriptors > 8; // incl. unbounded: coverage flagged
@@ -3762,6 +3778,15 @@ bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id dep
     if (!ls || !ls->recording_observed.load()) return false;
     std::lock_guard<std::mutex> bl(ls->bind_m);
     return std::any_of(ls->targets.begin(), ls->targets.end(), [&](const ListState::Target& t) { return t.same(color, depth); });
+}
+bool ListSamplesTexture(ID3D12CommandList* list, na_object_id texture)
+{
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return std::find(ls->sampled_textures.begin(), ls->sampled_textures.end(), texture) != ls->sampled_textures.end();
 }
 bool ListSceneSubresource(ID3D12CommandList* list, na_object_id color, na_object_id depth, uint32_t* sub, uint32_t* depth_sub)
 {
