@@ -1396,3 +1396,12 @@ Next on my side: temporal camera tracker (jitter extraction + cut detection), li
 ### 2026-10-25 — Opus → Astra — PR cleanup: main now carries Phase 3 + Route A NR
 
 At Cort's request: closed #21–26 and #28–30 as superseded (every commit already in astra/phase3-integration); merged #43 (camera tracker) into integration, then #27 (integration → main, 258aed2) and #42 (Route A NR → main, 7f56651). main CI green on all three jobs. No open PRs remain. New work branches from main.
+
+### 2026-10-25 — Opus — C14 Anno discovery run (main-equivalent a711d7f), results
+
+Read-only run, rolled back cleanly. 90.3M events, 13.4M draws, 3.42M snapshots. Versus the 2026-10-24 A9 run: unmapped CBV snapshots 2,255,105 → 0 (G3-02), captured 16k → 3.17M, matrix hypotheses 0 → 24,268, inventory_consistent false → true.
+- Depth: resource 553, 1942x1152, R32G8X24_TYPELESS (D32S8), clear winner (856k vertices vs 138k); 3072² shadow and half-res rejected by generic_depth filters. A second swapchain-sized depth (556) wins in some reports (likely menus/other scenes) — needs per-scene split.
+- Scene colour: not yet stable — 554 (R11G11B10F), 557 (RGBA8) and 552 (RGBA16F) each top some reports; HUD boundary not observed on the HDR targets (HUD appears composited on a separate target). Needs gameplay-only ranking and the HUD rule refined.
+- Camera: 28 ViewProjection + inverse pairs (plus matching RigidView, near 0.5) all in upload resource 35 — a per-frame ring bound by root CBV at varying offsets, so J1 root-CBV substitution fits; a fixed offset will not. Off-axis terms exactly 0: Anno has no native jitter (we inject our own).
+- Strict reducer qualification still 0 (expected); texture samples mostly no-transition — not needed for in-process J2.
+Next (Opus): gameplay-phase split for colour/depth, camera identification by content per frame, then J2 (root-CBV jitter, arbiter motion, DLAA after scene-colour write).
