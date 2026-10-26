@@ -46,6 +46,12 @@ struct EvalInputs {
     float mv_scale_x = 0, mv_scale_y = 0;
     uint32_t reset = 0;
     uint32_t depth_inverted = 0;
+    // Subrect origins (0xFFFFFFFF = not supplied: treated as 0) and whether
+    // motion vectors are at the render size (DLSS MVLowRes). Only the
+    // rendered region is copied, so padded / dynamic-resolution inputs work.
+    uint32_t depth_base_x = 0xFFFFFFFFu, depth_base_y = 0xFFFFFFFFu;
+    uint32_t mv_base_x = 0xFFFFFFFFu, mv_base_y = 0xFFFFFFFFu;
+    uint32_t mv_low_res = 1;
 };
 
 // True when the evaluate detour should read parameters and call OnEvaluate.
@@ -84,6 +90,10 @@ struct Stats {
 Stats GetStats();
 // Clears a latch so the pass may try again (e.g. after the user re-enables).
 void ResetLatch();
+// Test seam (C12): builds the pass's device objects (compiling every shader) and
+// records the 24/16-bit depth -> R32F conversion of a region on `list`.
+bool RecordDepthToR32ForTests(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, DXGI_FORMAT view, ID3D12Resource* out,
+                              uint32_t bx, uint32_t by, uint32_t w, uint32_t h);
 void Shutdown(); // releases the feature and all resources (game exit / tests)
 
 } // namespace na::nr

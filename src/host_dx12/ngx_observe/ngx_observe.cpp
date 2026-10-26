@@ -632,6 +632,9 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
                 nflags = g_feature_flags.Get(reinterpret_cast<uint64_t>(game_handle));
             }
             in.depth_inverted = nflags != 0xFFFFFFFFu && (nflags & 0x8u) ? 1u : 0u;
+            in.mv_low_res = nflags != 0xFFFFFFFFu && (nflags & 0x2u) ? 1u : 0u;
+            in.depth_base_x = ep.depth_base_x; in.depth_base_y = ep.depth_base_y;
+            in.mv_base_x = ep.mv_base_x; in.mv_base_y = ep.mv_base_y;
             na::nr::OnEvaluate(list, in);
         }
         if (motion && ep.valid && r >= 0) {

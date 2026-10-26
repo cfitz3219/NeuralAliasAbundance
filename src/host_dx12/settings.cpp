@@ -62,6 +62,7 @@ void load_from(const wchar_t* ini, bool only_if_present)
     g_settings.nr_paper_white.store(static_cast<uint32_t>(pw < 80 ? 80 : (pw > 1000 ? 1000 : pw)));
     uint32_t hm = GetPrivateProfileIntW(L"nr", L"hdr_mode", 0, ini);
     g_settings.nr_hdr_mode.store(hm > 2 ? 0 : hm);
+    g_settings.nr_model.store(GetPrivateProfileIntW(L"nr", L"model", 0, ini) == 1 ? 1u : 0u);
     g_settings.motion_enabled.store(GetPrivateProfileIntW(L"motion", L"enabled", 0, ini) ? 1u : 0u);
     uint32_t mg = GetPrivateProfileIntW(L"motion", L"grid", 4, ini);
     g_settings.motion_grid.store(mg == 1 || mg == 2 || mg == 4 ? mg : 4);
@@ -133,7 +134,7 @@ bool Save()
         {L"enabled", g_settings.nr_enabled.load()},   {L"intensity", g_settings.nr_intensity.load()},
         {L"structure", g_settings.nr_structure.load()}, {L"tone", g_settings.nr_tone.load()},
         {L"skin", g_settings.nr_skin.load()},         {L"paper_white", g_settings.nr_paper_white.load()},
-        {L"hdr_mode", g_settings.nr_hdr_mode.load()}};
+        {L"hdr_mode", g_settings.nr_hdr_mode.load()}, {L"model", g_settings.nr_model.load()}};
     for (const auto& kv : nr) {
         swprintf_s(v, L"%u", kv.value);
         ok &= WritePrivateProfileStringW(L"nr", kv.key, v, ini) != 0;
