@@ -50,6 +50,8 @@ struct ColorCandidate {
     uint32_t width{}, height{}, format{};
     uint64_t draws{}, vertices{}, hud_draws{};
     bool aspect_match{}, written_before_hud{}, receives_hud{};
+    uint64_t paired_depth{};       // depth resource this target was drawn with most
+    uint64_t paired_draws{};       // draws into this target with the selected (top-ranked) depth bound
     double score{};
     ExecutionIdentity last;
     std::vector<std::string> reasons;
@@ -191,9 +193,18 @@ public:
     // Scene colour (pre-HUD): render targets written by 3D draws before an
     // observed HUD boundary rank first; the target that receives the HUD is
     // the composite (it holds scene + HUD) and is ranked below them.
+    // Scene colour: the render target drawn together with the selected depth
+    // buffer is the 3D scene (generic rule; in Anno it separates the HDR scene
+    // target from earlier passes and from the UI target). Pre-HUD and HUD
+    // composite hints refine it.
     std::vector<ColorCandidate> RankSceneColor(size_t n) const {
         const Frame& f = Scored();
         std::vector<ColorCandidate> out;
+        uint64_t top_depth = 0;
+        {
+            const auto d = RankDepth(1);
+            if (!d.empty() && d[0].score > 0) top_depth = d[0].resource;
+        }
         for (const auto& kv : f.color) {
             ColorCandidate c{};
             const auto& t = kv.second;
@@ -206,7 +217,17 @@ public:
             c.aspect_match = AspectMatch(c.width, c.height);
             c.written_before_hud = t.before_hud;
             c.receives_hud = t.hud_draws != 0;
+            uint64_t most = 0;
+            for (const auto& w : t.with_depth) if (w.second > most) { most = w.second; c.paired_depth = w.first; }
+            const auto paired = top_depth ? t.with_depth.find(top_depth) : t.with_depth.end();
+            c.paired_draws = paired != t.with_depth.end() ? paired->second : 0;
             double s = static_cast<double>(c.vertices) + 1.0;
+            if (c.paired_draws) {
+                s *= 1e6; // decisive: any target drawn with the selected depth outranks every target that never was
+                c.reasons.emplace_back("Drawn together with the selected depth buffer");
+            } else if (top_depth) {
+                c.reasons.emplace_back("Never drawn with the selected depth buffer");
+            }
             if (swap_w_ && !c.aspect_match) {
                 s *= 0.05;
                 c.reasons.emplace_back("Aspect ratio differs from swapchain");
@@ -261,6 +282,7 @@ private:
         uint64_t first{}, last{}, draws{}, indirect{}, vertices{}, clears{}, mid_clears{}, segment{}, best_segment{}, hud_draws{};
         uint64_t segment_vertices{}, best_segment_vertices{};
         bool depth{}, color{}, depth_known{true};
+        std::map<uint64_t, uint64_t> with_depth; // colour targets: depth resource -> draws drawn with it bound (bounded)
     };
     struct Recording {
         uint64_t generation{}, pipeline{}, last_op{};
@@ -279,6 +301,7 @@ private:
     struct ColorStat {
         uint64_t draws{}, vertices{}, hud_draws{};
         bool before_hud{};
+        std::map<uint64_t, uint64_t> with_depth;
         ExecutionIdentity last;
     };
     struct CbvStat { uint64_t draws{}, recordings{}; };
@@ -397,6 +420,9 @@ private:
             for (const auto& v : r.targets)
                 if (v.descriptor_kind == NA_DESC_DSV && v.resource && v.resource != NA_UNKNOWN_U64) has_dsv = true;
             const bool depth_tested = has_dsv && (!known || ps->second.depth_enable != 0);
+            uint64_t bound_depth = 0; // the depth-stencil bound for this draw (written or only tested)
+            for (const auto& v : r.targets)
+                if (v.descriptor_kind == NA_DESC_DSV && v.resource && v.resource != NA_UNKNOWN_U64) bound_depth = v.resource;
             // Special K / Luma: alpha-blended, depth-disabled, no depth target.
             const bool hud = known && !depth_tested && ps->second.depth_enable == 0 && ps->second.blend != 0 &&
                              ps->second.blend != NA_UNKNOWN_U32;
@@ -423,6 +449,7 @@ private:
                     s->last = e.op_index;
                 } else if (v.descriptor_kind == NA_DESC_RTV) {
                     s->color = true;
+                    if (!hud && bound_depth && (s->with_depth.size() < 8 || s->with_depth.count(bound_depth))) ++s->with_depth[bound_depth];
                     if (hud) {
                         ++s->hud_draws;
                     } else {
@@ -488,6 +515,8 @@ private:
                     c.draws += s.draws;
                     c.vertices += s.vertices;
                     c.hud_draws += s.hud_draws;
+                    for (const auto& w : s.with_depth)
+                        if (c.with_depth.size() < 16 || c.with_depth.count(w.first)) c.with_depth[w.first] += w.second;
                     if (r.hud_begin && s.last && s.last <= r.scene_end && s.last < r.hud_begin) c.before_hud = true;
                     if (s.draws) c.last = id;
                 }

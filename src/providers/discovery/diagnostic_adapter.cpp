@@ -120,8 +120,8 @@ void Report(Consumer& c,const na_observe_status& status,const char* phase) {
     }
     rank=0;
     for(const auto& k:c.heuristics.RankSceneColor(5)) {
-        std::fprintf(c.log,"{\"type\":\"heuristic_scene_color\",\"rank\":%u,\"resource\":%llu,\"width\":%u,\"height\":%u,\"format\":%u,\"score\":%.6g,\"draws\":%llu,\"hud_draws\":%llu,\"written_before_hud\":%s,\"receives_hud\":%s,\"queue\":%llu,\"ticket\":%llu,\"list\":%llu,\"generation\":%llu,\"qualified\":false,\"reducer_match\":%s,\"reasons\":",
-            ++rank,k.resource,k.width,k.height,k.format,k.score,k.draws,k.hud_draws,k.written_before_hud?"true":"false",k.receives_hud?"true":"false",
+        std::fprintf(c.log,"{\"type\":\"heuristic_scene_color\",\"rank\":%u,\"resource\":%llu,\"width\":%u,\"height\":%u,\"format\":%u,\"score\":%.6g,\"draws\":%llu,\"hud_draws\":%llu,\"written_before_hud\":%s,\"receives_hud\":%s,\"paired_depth\":%llu,\"paired_draws\":%llu,\"queue\":%llu,\"ticket\":%llu,\"list\":%llu,\"generation\":%llu,\"qualified\":false,\"reducer_match\":%s,\"reasons\":",
+            ++rank,k.resource,k.width,k.height,k.format,k.score,k.draws,k.hud_draws,k.written_before_hud?"true":"false",k.receives_hud?"true":"false",k.paired_depth,k.paired_draws,
             k.last.queue,k.last.ticket,k.last.list,k.last.generation,ReducerMatch(k.last,k.resource)?"true":"false");
         JsonStrings(c.log,k.reasons);std::fputs("}\n",c.log);
     }

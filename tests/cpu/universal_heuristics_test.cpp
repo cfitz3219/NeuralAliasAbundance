@@ -298,6 +298,32 @@ int main() {
              for (const auto& b : f.h.RankCameraBlocks(4)) CHECK(b.resource != 20);
              CHECK(f.h.CameraRank(20, 256, 4) == 0);
          }},
+        {"scene colour is the target drawn with the selected depth, not a bigger earlier pass (Anno pattern)", [] {
+             Feed f;
+             f.Swapchain(1920, 1080);
+             f.Resource(3, 1920, 1080, 40);
+             f.Resource(6, 1920, 1080, 10);  // HDR scene colour (drawn with depth 3)
+             f.Resource(8, 1920, 1080, 26);  // earlier full-screen pass, more geometry, no depth
+             f.Resource(7, 1920, 1080, 28);
+             f.Pipeline(10, 1, 1, 0);
+             f.Pipeline(11, 0, 0, 1);
+             for (int frame = 0; frame < 3; ++frame) {
+                 f.Reset();
+                 f.SetPipeline(10);
+                 f.Targets({8}, 0);
+                 for (int i = 0; i < 200; ++i) f.Draw(5000);   // 1M vertices, no depth bound
+                 f.Targets({6}, 3);
+                 for (int i = 0; i < 100; ++i) f.Draw(1000);   // 100k vertices with the scene depth
+                 f.SetPipeline(11);
+                 f.Targets({7}, 0);
+                 f.Draw(6);
+                 f.Execute();
+                 f.Present();
+             }
+             const auto c = f.h.RankSceneColor(2);
+             CHECK(c.size() == 2 && c[0].resource == 6 && c[0].paired_depth == 3 && c[0].paired_draws == 100);
+             CHECK(c[1].resource == 8 && c[1].paired_draws == 0);
+         }},
         {"unknown pipelines and dispatches weaken reasons but never zero the ranking", [] {
              Feed f;
              f.Swapchain(1920, 1080);
