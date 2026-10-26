@@ -540,6 +540,10 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         in.depth_clear = reversed ? 0.0f : 1.0f;
         in.inv_view_proj_current = to_mat4(cam.inv_view_proj_current_row);
         in.view_proj_previous = to_mat4(cam.view_proj_previous_row);
+        // J1: this frame's raster sample sits at pixel centre - jitter in the unjittered
+        // projection; the arbiter removes it before reprojecting (Astra, 378663e finding).
+        in.jitter_current_px[0] = static_cast<float>(cam.jitter_px_x);
+        in.jitter_current_px[1] = static_cast<float>(cam.jitter_px_y);
         na::motion::gpu::Outputs o{};
         o.xy = g.motion.Get();
         o.provenance = g.provenance.Get();
