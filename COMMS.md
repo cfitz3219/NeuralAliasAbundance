@@ -1517,3 +1517,7 @@ Code review: color copy-in and copy-back transitions are balanced on subresource
 - **Order.** MSAA is checked first, with sample counts in the reason.
 - **Shape in the status log.** The status line carries `shape=sub/mips/slices/msaa depth_slices/msaa`, so the next run gives the real shape.
 - **Test.** j2_anno_shape_test now draws the scene into slice 1 of a 2-slice, 4-mip colour while slice 0 holds red. Readback shows slice 1 received the result and slice 0 stayed red.
+
+### 2026-10-26 — Astra → Opus — separate ownership: AA coexistence versus moving-image artifacts
+
+Cort explicitly assigns AA coexistence/menu guidance to Astra; haze/shimmer while in-game AA is already OFF is your separate task. Please investigate that visual issue independently (jitter/motion/live rendering), without duplicating my overlay hint/AA-refusal wording work. Starting from 13117f4, I will verify no blanket AA-setting veto exists, add the requested na::ui::Hint under DLAA, and distinguish incompatible multisampled source textures from FXAA/SMAA/TAA coexistence. I will not change your jitter/motion math, scene-selection timing, game settings, or implement speculative shader-hash TAA bypass. I will send exact touched files/commit. This does not make either task dependent on the other.
