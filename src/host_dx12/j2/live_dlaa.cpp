@@ -144,8 +144,11 @@ bool state_after(ID3D12CommandList* const* lists, UINT last, na_object_id id, ui
 
 // This frame's camera: the most-bound constant block in the scene list that
 // holds a perspective ViewProjection together with its inverse.
+struct CamDiag { size_t binds = 0, blocks = 0, read = 0, vp = 0, cands = 0; } g_cd;
+
 bool find_camera(ID3D12CommandList* scene, na::camera::Matrix* vp, bool* reversed)
 {
+    g_cd = {};
     const auto binds = na::observe::ListRootConstantBuffers(scene);
     std::map<std::pair<uint64_t, uint64_t>, uint32_t> count;
     for (const auto& b : binds) ++count[{b.resource, b.offset}];
@@ -154,10 +157,13 @@ bool find_camera(ID3D12CommandList* scene, na::camera::Matrix* vp, bool* reverse
     for (const auto& kv : count) order.push_back({kv.second, kv.first});
     std::stable_sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
     if (order.size() > kMaxBlocks) order.resize(kMaxBlocks);
+    g_cd.binds = binds.size();
+    g_cd.blocks = order.size();
     std::vector<uint8_t> bytes(kBlockBytes);
     for (const auto& o : order) {
         const uint32_t n = na::observe::ReadBuffer(o.second.first, o.second.second, bytes.data(), kBlockBytes);
         if (n < 128) continue;
+        ++g_cd.read;
         // An in-process read at submission time, inside the submitting call:
         // its scope is known (FindMatrices rejects snapshots without one).
         na::camera::Snapshot s{};
@@ -185,7 +191,9 @@ bool find_camera(ID3D12CommandList* scene, na::camera::Matrix* vp, bool* reverse
             continue;
         }
         const auto scan = na::camera::FindMatrices(s);
+        g_cd.cands += scan.candidates.size();
         for (const auto& c : scan.candidates) {
+            if (c.kind == na::camera::Kind::ViewProjection) ++g_cd.vp;
             if (c.kind != na::camera::Kind::ViewProjection || !c.has_inverse_pair) continue;
             g.camera_offset = static_cast<int64_t>(c.byte_offset);
             g.stats.camera_offset = c.byte_offset;
@@ -230,7 +238,10 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (!find_camera(lists[scene], &vp, &reversed)) {
         ++g.stats.no_camera;
         g.camera_offset = -1; // relearn
-        reason("Waiting: no camera matrix with its inverse in the scene pass.");
+        char why[160];
+        std::snprintf(why, sizeof why, "Waiting: no camera matrix with its inverse (cbv binds %zu, blocks %zu, read %zu, matrices %zu, view-proj %zu).",
+                      g_cd.binds, g_cd.blocks, g_cd.read, g_cd.cands, g_cd.vp);
+        reason(why);
         return false;
     }
     const double zero[2] = {0, 0}; // no jitter injected yet (J1)
