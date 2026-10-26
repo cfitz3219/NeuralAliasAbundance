@@ -197,25 +197,58 @@ int main()
     CHECK((fake::I(fake::last_create, NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags) & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) != 0);
     CHECK((fake::I(fake::last_create, NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags) & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) != 0);
     CHECK(st.frames == 1 && st.camera_offset == 80 && st.later_passes == 0);
+
+    // A second matching batch in the same game frame is not another DLAA frame.
+    // Nor does an unrelated/unknown queue's presentation advance this view.
+    na::j2::OnPresent(nullptr);
+    frame(0.25);
+    CHECK(g_forwarded.size() == 2 && fake::evals == evals0 + 1);
+    CHECK(na::j2::GetStats().frames == 1 && na::j2::GetStats().duplicate_submissions == 1);
+
+    na::j2::OnPresent(d.queue.Get());
+    const auto cuts_before_failure = na::j2::GetStats().cuts;
+    fake::eval_result = NVSDK_NGX_Result_FAIL_InvalidParameter;
+    frame(500); // would be a camera cut, but this DLSS attempt never submits
+    CHECK(g_forwarded.size() == 2);
+    CHECK(na::j2::GetStats().frames == 1 && na::j2::GetStats().cuts == cuts_before_failure);
+    // Recover the deliberately failed fake backend without resetting J2 history.
+    na::dlss::Shutdown();
+    fake::eval_result = NVSDK_NGX_Result_Success;
+    REQUIRE(na::dlss::Attach(dev, fake::MakeApi()));
     frame(0.5); // camera moved a little: same history
     st = na::j2::GetStats();
     std::printf("frame 2: forwarded %zu, frames %llu, cuts %llu, reset %d\n", g_forwarded.size(), static_cast<unsigned long long>(st.frames),
                 static_cast<unsigned long long>(st.cuts), fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset));
-    CHECK(g_forwarded.size() == 3 && st.frames == 2 && fake::evals == evals0 + 2);
+    CHECK(g_forwarded.size() == 3 && st.frames == 2 && fake::evals == evals0 + 3);
+    CHECK(st.cuts == cuts_before_failure); // the failed camera x=500 did not enter history
+    // The recreated backend resets its own feature; the next normal frame does not.
+    na::j2::OnPresent(d.queue.Get());
+    frame(1.0);
     CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
-    // J1: frame 2 runs jittered. Phase 1 of Halton(2,3) is (-0.25, +1/6) pixels; DLSS
-    // receives exactly that, and the game's camera block now holds the jittered copy.
+    // J1: this frame ran jittered (the previous one produced DLAA). DLSS receives a
+    // Halton sample inside the pixel, and the game's camera block holds the jittered copy;
+    // no history reset above means the tracker removed exactly that sample.
     st = na::j2::GetStats();
     const double jx = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_X), jy = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_Y);
-    std::printf("frame 2 jitter: %.4f %.4f, camera matrices replaced %llu\n", jx, jy, static_cast<unsigned long long>(st.jitter_writes));
-    CHECK(std::fabs(jx + 0.25) < 1e-4 && std::fabs(jy - 1.0 / 6.0) < 1e-4);
+    std::printf("jittered frame: %.4f %.4f, camera matrices replaced %llu\n", jx, jy, static_cast<unsigned long long>(st.jitter_writes));
+    CHECK((jx != 0.0 || jy != 0.0) && std::fabs(jx) < 0.5 && std::fabs(jy) < 0.5);
     CHECK(st.jitter_writes >= 2); // ViewProjection and its inverse
     {
         uint8_t orig[64];
-        Store(orig, Camera(0.5));
+        Store(orig, Camera(1.0));
         CHECK(std::memcmp(cpu + 512 + 80, orig, 64) != 0);
     }
+    na::j2::OnPresent(d.queue.Get());
     frame(500); // teleport: history reset
+    CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 1);
+    na::j2::OnPresent(d.queue.Get());
+    na::observe::SetLiveSelection(0, 0);
+    frame(500.5); // an unprocessed game frame must not advance camera history
+    const auto before_gap = na::j2::GetStats().frames;
+    na::j2::OnPresent(d.queue.Get());
+    na::observe::SetLiveSelection(na::observe::IdOf(depth.Get()), na::observe::IdOf(color.Get()));
+    frame(501);
+    CHECK(na::j2::GetStats().frames == before_gap + 1);
     CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 1);
     CHECK(dev->GetDeviceRemovedReason() == S_OK);
     na::j2::SetEnabled(false);

@@ -5,7 +5,9 @@
 // submission this module finds the LAST list in the batch that drew the scene
 // (it binds that colour as a render target with that depth), and inserts ONE NeuralAlias command list right after
 // it in the same ExecuteCommandLists call. The game's own lists are never
-// edited, so no game command-list state has to be restored. The inserted list:
+// edited, so no game command-list state has to be restored. At most one batch
+// receives DLAA between game Presents; scene-boundary selection remains the
+// caller's existing integration policy. The inserted list:
 //   1. copies depth plane 0 into an R32F texture (DLSS and the motion arbiter);
 //   2. finds this frame's camera ViewProjection (with its inverse) in the
 //      scene list's root constant buffers, tracks it (na::camera::CameraTracker:
@@ -34,6 +36,11 @@ bool Configured();          // enabled at start-up (the overlay shows its sectio
 void SetPaused(bool paused); // the overlay's on/off switch (history resets on resume)
 bool Paused();
 
+// Called once at the game view's non-TEST Present boundary, including while
+// paused. Presenter-generated frames must not call this. Single-view J2 uses
+// its execution queue; other queues do not advance its camera history.
+void OnPresent(ID3D12CommandQueue* queue);
+
 // Wraps the forward of a game ExecuteCommandLists (after observation began
 // for it). Forwards the original batch unchanged unless a frame is processed.
 void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists, ExecuteFn forward);
@@ -41,6 +48,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
 struct Stats {
     uint64_t submissions = 0;     // batches seen while enabled
     uint64_t frames = 0;          // DLAA frames inserted
+    uint64_t duplicate_submissions = 0; // later batches in an already processed game frame
     uint64_t no_selection = 0;    // discovery has not chosen depth + colour yet
     uint64_t no_scene_list = 0;   // batch without the scene list
     uint64_t no_state = 0;        // resource state at the scene list's end not established
