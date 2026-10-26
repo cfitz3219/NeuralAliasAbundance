@@ -60,7 +60,10 @@ struct Stats {
     uint64_t cuts = 0;            // camera cuts (history reset)
     uint64_t camera_offset = 0;   // byte offset of the camera matrix inside its constant block
     uint32_t later_passes = 0;
-    uint64_t jitter_writes = 0;   // J1: camera matrices replaced by jittered copies    // other render targets bound after the scene in the same list (insertion may be late)
+    uint64_t jitter_writes = 0;   // J1: camera matrices replaced by jittered copies
+    uint64_t camera_learned_hits = 0, camera_scans = 0; // camera found at the learned slot / by a full search
+    int64_t camera_inv_delta = 0; // bytes from the ViewProjection to its inverse in the camera block
+    bool depth_reversed = false;  // reverse-Z as classified from the camera    // other render targets bound after the scene in the same list (insertion may be late)
     uint32_t width = 0, height = 0, color_format = 0;
     // Shape of the selected resources (reported even when J2 refuses them).
     uint32_t color_sub = 0, color_mips = 0, color_slices = 0, color_samples = 0, depth_slices = 0, depth_samples = 0;
