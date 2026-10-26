@@ -50,6 +50,7 @@ struct State {
     uint32_t slot = 0;
     // Our textures (render size == output size: DLAA).
     ComPtr<ID3D12Resource> depth32, motion, provenance, output;
+    ComPtr<ID3D12Resource> color_in; // plain copy of the scene colour's first slice / mip (DLSS input)
     uint32_t w = 0, h = 0;
     DXGI_FORMAT color_format = DXGI_FORMAT_UNKNOWN;
     na::motion::gpu::Arbiter arbiter;
@@ -129,6 +130,18 @@ bool texture(UINT w, UINT h, DXGI_FORMAT fmt, bool uav, D3D12_RESOURCE_STATES st
     d.Flags = uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
     out.Reset();
     return SUCCEEDED(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, state, nullptr, IID_PPV_ARGS(&out)));
+}
+// A typed format for our own copies of a (possibly typeless) game texture.
+DXGI_FORMAT typed(DXGI_FORMAT f)
+{
+    switch (f) {
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+    default: return f;
+    }
 }
 bool uav_store(DXGI_FORMAT fmt)
 {
@@ -463,10 +476,20 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         reason("Scene depth does not match the colour size or is not 32-bit depth.");
         return false;
     }
-    if (cd.SampleDesc.Count != 1 || dd.SampleDesc.Count != 1 || cd.DepthOrArraySize != 1 || cd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
-        reason("The scene colour or depth is multisampled or an array; DLAA here needs plain textures.");
+    // Arrays and mip chains are fine: J2 works on slice 0 / mip 0 through its own
+    // plain copy. Multisampling is not (DLSS takes resolved pictures).
+    if (cd.SampleDesc.Count != 1 || dd.SampleDesc.Count != 1) {
+        char why[160];
+        std::snprintf(why, sizeof why, "The game renders with multisampling (colour x%u, depth x%u). Set the game's anti-aliasing to Off for DLAA.",
+                      cd.SampleDesc.Count, dd.SampleDesc.Count);
+        reason(why);
         return false;
     }
+    if (cd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+        reason("The scene colour is not a 2D texture.");
+        return false;
+    }
+    const DXGI_FORMAT cf = typed(cd.Format); // our copies' format
 
     // Camera first (nothing is allocated for a frame that cannot run); the tracker
     // update comes after the size check, because a resize resets the tracker.
@@ -487,19 +510,20 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     Slot& s = g.slots[g.slot];
     if (done == UINT64_MAX) { reason("Device removed."); return false; }
     if (s.fence_value && done < s.fence_value) { ++g.stats.busy; reason("Skipped: the previous use of this frame slot is still running."); return false; }
-    const bool resize = !g.output || g.w != w || g.h != h || g.color_format != cd.Format;
+    const bool resize = !g.output || !g.color_in || g.w != w || g.h != h || g.color_format != cf;
     if (resize) {
         if (done + 1 < g.fence_next) { ++g.stats.busy; reason("Waiting for the previous picture size to finish."); return false; }
-        if (!uav_store(cd.Format) || !uav_store(DXGI_FORMAT_R32G32_FLOAT)) { reason("This scene colour format cannot be written by DLSS here."); return false; }
+        if (!uav_store(cf) || !uav_store(DXGI_FORMAT_R32G32_FLOAT)) { reason("This scene colour format cannot be written by DLSS here."); return false; }
         if (!texture(w, h, DXGI_FORMAT_R32_FLOAT, false, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g.depth32) ||
             !texture(w, h, DXGI_FORMAT_R32G32_FLOAT, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.motion) ||
             !texture(w, h, DXGI_FORMAT_R8_UINT, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.provenance) ||
-            !texture(w, h, cd.Format, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.output)) {
+            !texture(w, h, cf, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.output) ||
+            !texture(w, h, cf, false, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g.color_in)) {
             g.output.Reset();
             reason("Could not allocate the DLAA working textures.");
             return false;
         }
-        g.w = w; g.h = h; g.color_format = cd.Format;
+        g.w = w; g.h = h; g.color_format = cf;
         g.resume_reset = true; // remains pending if this recording is not submitted
     }
     const double zero[2] = {0, 0};
@@ -515,12 +539,20 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     std::vector<D3D12_RESOURCE_BARRIER> b;
     constexpr UINT NPSR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, SRC = D3D12_RESOURCE_STATE_COPY_SOURCE,
                    DST = D3D12_RESOURCE_STATE_COPY_DEST, UAV = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    const UINT color_read = (sc & NPSR) ? sc : NPSR; // already readable by compute: keep the game's state
-    // 1. depth plane 0 -> R32F
+    // 1. depth plane 0 -> R32F; scene colour slice 0 / mip 0 -> our plain copy
     add(b, depth.Get(), sd, SRC);
     add(b, g.depth32.Get(), NPSR, DST);
-    add0(b, color.Get(), sc, color_read);
+    add0(b, color.Get(), sc, SRC);
+    add(b, g.color_in.Get(), NPSR, DST);
     flush(l, b);
+    {
+        D3D12_TEXTURE_COPY_LOCATION cs{}, cdst{};
+        cs.Type = cdst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        cs.pResource = color.Get(); // subresource 0: mip 0, slice 0
+        cdst.pResource = g.color_in.Get();
+        l->CopyTextureRegion(&cdst, 0, 0, 0, &cs, nullptr);
+    }
+    add(b, g.color_in.Get(), DST, NPSR);
     D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
     src.Type = dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     src.pResource = depth.Get();
@@ -562,7 +594,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     flush(l, b);
     // 4. DLSS at native resolution
     na::dlss::EvalDesc e{};
-    e.color = color.Get();
+    e.color = g.color_in.Get();
     e.depth = g.depth32.Get();
     e.motion = g.motion.Get();
     e.output = g.output.Get();
@@ -573,7 +605,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     e.jitter_x = static_cast<float>(cam.jitter_px_x); // DLSS: colour sampled at pixel centre - jitter
     e.jitter_y = static_cast<float>(cam.jitter_px_y);
     e.reset = cam.camera_cut || resize || g.resume_reset;
-    e.hdr = is_float_color(cd.Format);
+    e.hdr = is_float_color(cf);
     e.depth_inverted = reversed;
     e.auto_exposure = true;
     const bool evaluated = na::dlss::Evaluate(l, e);
@@ -582,7 +614,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (evaluated) {
         b.push_back(uav_barrier(g.output.Get()));
         add(b, g.output.Get(), UAV, SRC);
-        add0(b, color.Get(), color_read, DST);
+        add0(b, color.Get(), SRC, DST);
         flush(l, b);
         D3D12_TEXTURE_COPY_LOCATION cs{}, cdst{};
         cs.Type = cdst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -592,7 +624,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         add(b, g.output.Get(), SRC, UAV);
         add0(b, color.Get(), DST, sc);
     } else {
-        add0(b, color.Get(), color_read, sc);
+        add0(b, color.Get(), SRC, sc);
     }
     add(b, g.motion.Get(), NPSR, UAV);
     flush(l, b);
@@ -601,8 +633,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         // A rejected list repeats every frame and may cost the device: stop for this
         // session and say exactly what was being processed. Never retried.
         char why[160];
-        std::snprintf(why, sizeof why, "Stopped: the DLAA command list was rejected (colour fmt %u mips %u state 0x%X, depth fmt %u state 0x%X). %s",
-                      static_cast<unsigned>(cd.Format), static_cast<unsigned>(cd.MipLevels), sc, static_cast<unsigned>(dd.Format), sd,
+        std::snprintf(why, sizeof why, "Stopped: the DLAA list was rejected (colour fmt %u mips %u slices %u state 0x%X, depth fmt %u state 0x%X). %s",
+                      static_cast<unsigned>(cd.Format), static_cast<unsigned>(cd.MipLevels), static_cast<unsigned>(cd.DepthOrArraySize), sc, static_cast<unsigned>(dd.Format), sd,
                       na::dlss::GetStats().reason);
         reason(why);
         g.latched = true;
@@ -752,7 +784,7 @@ Stats GetStats()
 void Shutdown()
 {
     std::lock_guard<std::mutex> lock(g.m);
-    g.depth32.Reset(); g.motion.Reset(); g.provenance.Reset(); g.output.Reset();
+    g.depth32.Reset(); g.motion.Reset(); g.provenance.Reset(); g.output.Reset(); g.color_in.Reset();
     for (auto& s : g.slots) { s.list.Reset(); s.alloc.Reset(); s.fence_value = 0; }
     g.fence.Reset(); g.queue.Reset(); g.device.Reset();
     g.arbiter = na::motion::gpu::Arbiter{};

@@ -1,7 +1,7 @@
 // J2 on Anno's shape (the run that crashed, 2026-10-26): the path the game takes,
 // not the convenient one.
 //   - submissions go through ExecuteBegin/End around J2, as the overlay does;
-//   - the scene colour has a MIP CHAIN (RGBA16F, 4 mips) and the scene list never
+//   - the scene colour is a 2-slice ARRAY with a MIP CHAIN (RGBA16F, 4 mips) and the scene list never
 //     transitions colour or depth: their states are carried from an earlier
 //     submission (the known-state store);
 //   - the camera sits in a 768-byte DESCRIPTOR-TABLE CBV at +336, inverse at +400;
@@ -99,8 +99,8 @@ int main()
         td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         td.Width = W;
         td.Height = H;
-        td.DepthOrArraySize = 1;
-        td.MipLevels = 4; // Anno-like: a mip chain on the scene colour
+        td.DepthOrArraySize = 2; // an array (Anno run 6: "multisampled or an array")
+        td.MipLevels = 4;        // and a mip chain (Anno run 4: the rejected list)
         td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         td.SampleDesc.Count = 1;
         td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
@@ -119,7 +119,8 @@ int main()
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvh->GetCPUDescriptorHandleForHeapStart(), dsv = dsvh->GetCPUDescriptorHandleForHeapStart();
     D3D12_RENDER_TARGET_VIEW_DESC rvd{};
     rvd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    rvd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    rvd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+    rvd.Texture2DArray.ArraySize = 1; // slice 0, mip 0
     dev->CreateRenderTargetView(color.Get(), &rvd, rtv);
     D3D12_DEPTH_STENCIL_VIEW_DESC dvd{};
     dvd.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
