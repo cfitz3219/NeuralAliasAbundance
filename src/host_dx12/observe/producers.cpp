@@ -1026,6 +1026,10 @@ void STDMETHODCALLTYPE D_CreateRenderTargetView(ID3D12Device* dev, ID3D12Resourc
         first = d->Texture2DArray.MipSlice + d->Texture2DArray.FirstArraySlice * rd.MipLevels;
         count = 1;
     }
+    else if (d->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMS) { first = 0; count = 1; }
+    else if (d->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY && d->Texture2DMSArray.ArraySize == 1) {
+        first = d->Texture2DMSArray.FirstArraySlice; count = 1; // MSAA textures have exactly one mip
+    }
     note_descriptor_write(h, NA_DESC_RTV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count);
 }
 
@@ -1038,6 +1042,10 @@ void STDMETHODCALLTYPE D_CreateDepthStencilView(ID3D12Device* dev, ID3D12Resourc
         const D3D12_RESOURCE_DESC rd = r->GetDesc();
         first = d->Texture2DArray.MipSlice + d->Texture2DArray.FirstArraySlice * rd.MipLevels; // plane 0
         count = 1;
+    }
+    else if (d->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMS) { first = 0; count = 1; }
+    else if (d->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY && d->Texture2DMSArray.ArraySize == 1) {
+        first = d->Texture2DMSArray.FirstArraySlice; count = 1;
     }
     note_descriptor_write(h, NA_DESC_DSV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count);
 }

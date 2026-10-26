@@ -1,4 +1,5 @@
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/j2/msaa_resolve.hpp"
 
 #include "core/motion_arbiter_gpu.hpp"
 #include "core/temporal_jitter.hpp"
@@ -51,6 +52,9 @@ struct State {
     // Our textures (render size == output size: DLAA).
     ComPtr<ID3D12Resource> depth32, motion, provenance, output;
     ComPtr<ID3D12Resource> color_in; // plain copy of the scene colour's first slice / mip (DLSS input)
+    MsaaResolve msaa;
+    UINT samples = 1, sample_quality = 0, depth_quality = 0;
+    DXGI_FORMAT depth_format = DXGI_FORMAT_UNKNOWN;
     uint32_t w = 0, h = 0;
     DXGI_FORMAT color_format = DXGI_FORMAT_UNKNOWN;
     na::motion::gpu::Arbiter arbiter;
@@ -476,12 +480,11 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     g.stats.color_samples = cd.SampleDesc.Count;
     g.stats.depth_samples = dd.SampleDesc.Count;
     g.stats.depth_slices = dd.DepthOrArraySize;
-    // AA settings are not an eligibility condition. Post-process AA may coexist
-    // with DLAA. These actual multisampled inputs need a resolve path, which J2
-    // does not yet provide; ordinary texture copies cannot resolve them.
-    if (cd.SampleDesc.Count != 1 || dd.SampleDesc.Count != 1) {
+    // AA settings are not an eligibility condition. Resolve matching x2 MSAA
+    // inputs; keep the existing plain-texture path for single-sample rendering.
+    if (cd.SampleDesc.Count != dd.SampleDesc.Count || (cd.SampleDesc.Count != 1 && cd.SampleDesc.Count != 2)) {
         char why[160];
-        std::snprintf(why, sizeof why, "MSAA input resolve is not supported yet (colour x%u, depth x%u). Turn off MSAA in the game's video settings to use DLAA.",
+        std::snprintf(why, sizeof why, "This sample-count combination is not supported (colour x%u, depth x%u). DLAA supports matching Off or x2 MSAA inputs.",
                       cd.SampleDesc.Count, dd.SampleDesc.Count);
         reason(why);
         return false;
@@ -507,6 +510,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         return false;
     }
     const DXGI_FORMAT cf = typed(cd.Format); // our copies' format
+    const bool msaa = cd.SampleDesc.Count == 2;
 
     // Camera first (nothing is allocated for a frame that cannot run); the tracker
     // update comes after the size check, because a resize resets the tracker.
@@ -527,11 +531,24 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     Slot& s = g.slots[g.slot];
     if (done == UINT64_MAX) { reason("Device removed."); return false; }
     if (s.fence_value && done < s.fence_value) { ++g.stats.busy; reason("Skipped: the previous use of this frame slot is still running."); return false; }
-    const bool resize = !g.output || !g.color_in || g.w != w || g.h != h || g.color_format != cf;
+    const bool resize = !g.output || !g.color_in || g.w != w || g.h != h || g.color_format != cf ||
+                        g.samples != cd.SampleDesc.Count || g.sample_quality != cd.SampleDesc.Quality ||
+                        g.depth_quality != dd.SampleDesc.Quality || g.depth_format != dd.Format;
     if (resize) {
         if (done + 1 < g.fence_next) { ++g.stats.busy; reason("Waiting for the previous picture size to finish."); return false; }
         if (!uav_store(cf) || !uav_store(DXGI_FORMAT_R32G32_FLOAT)) { reason("This scene colour format cannot be written by DLSS here."); return false; }
-        if (!texture(w, h, DXGI_FORMAT_R32_FLOAT, false, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g.depth32) ||
+        g.msaa = MsaaResolve{};
+        if (msaa) {
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT support{cf};
+            if (FAILED(g.device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof support)) ||
+                !(support.Support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE) ||
+                !g.msaa.Init(g.device.Get(), w, h, cf, dd, cd.SampleDesc, kRing)) {
+                g.output.Reset();
+                reason("Could not prepare the x2 MSAA resolve pipeline.");
+                return false;
+            }
+        }
+        if (!texture(w, h, DXGI_FORMAT_R32_FLOAT, msaa, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g.depth32) ||
             !texture(w, h, DXGI_FORMAT_R32G32_FLOAT, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.motion) ||
             !texture(w, h, DXGI_FORMAT_R8_UINT, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.provenance) ||
             !texture(w, h, cf, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.output) ||
@@ -541,6 +558,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             return false;
         }
         g.w = w; g.h = h; g.color_format = cf;
+        g.samples = cd.SampleDesc.Count; g.sample_quality = cd.SampleDesc.Quality;
+        g.depth_quality = dd.SampleDesc.Quality; g.depth_format = dd.Format;
         g.resume_reset = true; // remains pending if this recording is not submitted
     }
     const double zero[2] = {0, 0};
@@ -556,13 +575,17 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     std::vector<D3D12_RESOURCE_BARRIER> b;
     constexpr UINT NPSR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, SRC = D3D12_RESOURCE_STATE_COPY_SOURCE,
                    DST = D3D12_RESOURCE_STATE_COPY_DEST, UAV = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    // 1. depth plane 0 -> R32F; scene colour slice 0 / mip 0 -> our plain copy
-    add(b, depth.Get(), sd, SRC);
-    add(b, g.depth32.Get(), NPSR, DST);
-    addsub(b, color.Get(), csub, sc, SRC);
-    add(b, g.color_in.Get(), NPSR, DST);
+    // 1. Copy or resolve exactly the scene views into single-sample DLSS inputs.
+    const UINT color_source = msaa ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE : SRC;
+    const UINT color_dest = msaa ? D3D12_RESOURCE_STATE_RESOLVE_DEST : DST;
+    addsub(b, depth.Get(), dsub, sd, SRC);
+    add(b, g.depth32.Get(), NPSR, msaa ? UAV : DST);
+    addsub(b, color.Get(), csub, sc, color_source);
+    add(b, g.color_in.Get(), NPSR, color_dest);
     flush(l, b);
-    {
+    if (msaa) {
+        l->ResolveSubresource(g.color_in.Get(), 0, color.Get(), csub, cf);
+    } else {
         D3D12_TEXTURE_COPY_LOCATION cs{}, cdst{};
         cs.Type = cdst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         cs.pResource = color.Get(); // the subresource the scene was drawn into
@@ -570,16 +593,23 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         cdst.pResource = g.color_in.Get();
         l->CopyTextureRegion(&cdst, 0, 0, 0, &cs, nullptr);
     }
-    add(b, g.color_in.Get(), DST, NPSR);
+    add(b, g.color_in.Get(), color_dest, NPSR);
     D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
     src.Type = dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     src.pResource = depth.Get();
     src.SubresourceIndex = dsub; // plane 0 of the slice / mip the scene used
-    dst.pResource = g.depth32.Get();
+    dst.pResource = msaa ? g.msaa.DepthCopy() : g.depth32.Get();
     dst.SubresourceIndex = 0;
     l->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-    add(b, g.depth32.Get(), DST, NPSR);
-    add(b, depth.Get(), SRC, sd);
+    addsub(b, depth.Get(), dsub, SRC, sd);
+    if (msaa) {
+        addsub(b, g.msaa.DepthCopy(), 0, DST, NPSR);
+        flush(l, b);
+        g.msaa.ResolveDepth(l, g.depth32.Get(), w, h, reversed, g.slot);
+        b.push_back(uav_barrier(g.depth32.Get()));
+        add(b, g.depth32.Get(), UAV, NPSR);
+        addsub(b, g.msaa.DepthCopy(), 0, NPSR, DST);
+    } else add(b, g.depth32.Get(), DST, NPSR);
     flush(l, b);
     // 2/3. camera motion vectors
     bool have_motion = false;
@@ -631,19 +661,25 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // 5. result -> scene colour, everything back to the game's states
     if (evaluated) {
         b.push_back(uav_barrier(g.output.Get()));
-        add(b, g.output.Get(), UAV, SRC);
-        addsub(b, color.Get(), csub, SRC, DST);
+        const UINT output_read = msaa ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : SRC;
+        const UINT color_write = msaa ? D3D12_RESOURCE_STATE_RENDER_TARGET : DST;
+        add(b, g.output.Get(), UAV, output_read);
+        addsub(b, color.Get(), csub, color_source, color_write);
         flush(l, b);
-        D3D12_TEXTURE_COPY_LOCATION cs{}, cdst{};
-        cs.Type = cdst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        cs.pResource = g.output.Get();
-        cdst.pResource = color.Get(); // back into the scene's subresource
-        cdst.SubresourceIndex = csub;
-        l->CopyTextureRegion(&cdst, 0, 0, 0, &cs, nullptr);
-        add(b, g.output.Get(), SRC, UAV);
-        addsub(b, color.Get(), csub, DST, sc);
+        if (msaa) {
+            g.msaa.WriteColor(l, g.output.Get(), color.Get(), csub / g.stats.color_mips, w, h, g.slot);
+        } else {
+            D3D12_TEXTURE_COPY_LOCATION cs{}, cdst{};
+            cs.Type = cdst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            cs.pResource = g.output.Get();
+            cdst.pResource = color.Get(); // back into the scene's subresource
+            cdst.SubresourceIndex = csub;
+            l->CopyTextureRegion(&cdst, 0, 0, 0, &cs, nullptr);
+        }
+        add(b, g.output.Get(), output_read, UAV);
+        addsub(b, color.Get(), csub, color_write, sc);
     } else {
-        addsub(b, color.Get(), csub, SRC, sc);
+        addsub(b, color.Get(), csub, color_source, sc);
     }
     add(b, g.motion.Get(), NPSR, UAV);
     flush(l, b);
@@ -804,6 +840,7 @@ void Shutdown()
 {
     std::lock_guard<std::mutex> lock(g.m);
     g.depth32.Reset(); g.motion.Reset(); g.provenance.Reset(); g.output.Reset(); g.color_in.Reset();
+    g.msaa = MsaaResolve{};
     for (auto& s : g.slots) { s.list.Reset(); s.alloc.Reset(); s.fence_value = 0; }
     g.fence.Reset(); g.queue.Reset(); g.device.Reset();
     g.arbiter = na::motion::gpu::Arbiter{};
