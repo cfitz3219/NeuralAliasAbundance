@@ -210,9 +210,9 @@ int main(int argc, char**)
         const M vp = Camera(cam_x);
         M inv{};
         Inverse(vp, inv);
+        for (int i = 0; i < 300; ++i) cpu[kBlock + i] = static_cast<uint8_t>(i * 13); // other constants before the camera
         Store(cpu + kBlock + kVp, vp);
         Store(cpu + kBlock + kVp - 128, inv);
-        for (int i = 0; i < 300; ++i) cpu[kBlock + i] = static_cast<uint8_t>(i * 13); // other constants before the camera
         Store(cpu + kPre + kVp, vp); // the pre-pass's own copy of the camera
         Store(cpu + kPre + kVp - 128, inv);
         prepass.Reset(); // earlier batch: depth only, its own root signature
@@ -263,7 +263,7 @@ int main(int argc, char**)
     CHECK(std::strncmp(st.reason, "Stopped", 7) != 0); // the list closed: no latch
     REQUIRE(frame(0.5) == 0);
     st = na::j2::GetStats();
-    CHECK(st.frames == 2 && fake::evals == evals0 + 2);
+    REQUIRE(st.frames == 2 && fake::evals == evals0 + 2);
     for (const char* key : {NVSDK_NGX_Parameter_Color, NVSDK_NGX_Parameter_Depth}) {
         auto* input = static_cast<ID3D12Resource*>(fake::P(fake::last_eval, key));
         REQUIRE(input);
