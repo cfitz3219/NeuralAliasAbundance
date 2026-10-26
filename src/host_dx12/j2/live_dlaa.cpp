@@ -546,7 +546,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         cs.Type = cdst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         cs.pResource = g.output.Get();
         cdst.pResource = color.Get(); // subresource 0: mip 0 of the scene colour
-        l->CopyTextureRegion(&cdst, 0, 0, 0, &cs, nullptr);
+        l->CopyResource(color.Get(), g.output.Get()); // TEMP: the pre-fix copy, to reproduce the Anno crash
         add(b, g.output.Get(), SRC, UAV);
         add0(b, color.Get(), DST, sc);
     } else {
