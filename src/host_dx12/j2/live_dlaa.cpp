@@ -36,6 +36,9 @@ struct Slot {
 struct State {
     std::mutex m;
     std::atomic<bool> enabled{false};
+    std::atomic<bool> configured{false};
+    std::atomic<bool> paused{false}; // the user's on/off switch in the overlay
+    bool resume_reset = false;       // history is stale after a pause
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> queue;
     ComPtr<ID3D12Fence> fence;
@@ -142,7 +145,8 @@ bool state_after(ID3D12CommandList* const* lists, UINT last, na_object_id id, ui
 {
     for (int i = static_cast<int>(last); i >= 0; --i)
         if (na::observe::ListLastState(lists[i], id, st)) return true;
-    return false;
+    // Not transitioned in this batch up to the scene: the state it carried in.
+    return na::observe::KnownStateInCurrentSubmission(id, st);
 }
 
 // This frame's camera: the most-bound constant block in the scene list that
@@ -328,7 +332,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     e.render_h = e.max_render_h = e.out_h = h;
     e.quality = na::dlss::Quality::DLAA;
     e.view_id = kViewId;
-    e.reset = cam.camera_cut || resize;
+    e.reset = cam.camera_cut || resize || g.resume_reset;
+    g.resume_reset = false;
     e.hdr = is_float_color(cd.Format);
     e.depth_inverted = reversed;
     e.auto_exposure = true;
@@ -362,12 +367,19 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
 
 } // namespace
 
-void SetEnabled(bool on) { g.enabled.store(on); }
+void SetEnabled(bool on) { g.enabled.store(on); g.configured.store(on); }
 bool Enabled() { return g.enabled.load(); }
+bool Configured() { return g.configured.load(); }
+void SetPaused(bool paused)
+{
+    if (!paused && g.paused.load()) { std::lock_guard<std::mutex> lock(g.m); g.resume_reset = true; }
+    g.paused.store(paused);
+}
+bool Paused() { return g.paused.load(); }
 
 void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists, ExecuteFn forward)
 {
-    if (!g.enabled.load(std::memory_order_relaxed) || !queue || !lists || !count) {
+    if (!g.enabled.load(std::memory_order_relaxed) || g.paused.load(std::memory_order_relaxed) || !queue || !lists || !count) {
         forward(queue, count, lists);
         return;
     }

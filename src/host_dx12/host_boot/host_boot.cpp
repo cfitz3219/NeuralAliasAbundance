@@ -153,6 +153,9 @@ DWORD WINAPI InitThread(LPVOID)
         for (int i = lstrlenW(status_path) - 1; i >= 0; --i)
             if (status_path[i] == L'\\' || status_path[i] == L'/') { status_path[i] = 0; break; }
         lstrcatW(status_path, L"\\NeuralAliasHost-status.log");
+        // The game folder may not be writable (Program Files): [host] status_log overrides.
+        wchar_t custom[MAX_PATH] = {};
+        if (GetPrivateProfileStringW(L"host", L"status_log", L"", custom, MAX_PATH, g_ini) > 0) lstrcpynW(status_path, custom, MAX_PATH);
         na::overlay::SetStatusLogPath(status_path); // A55
     }
     // C8: discovery observation producers (H1/H2). Off by default until a
@@ -161,6 +164,7 @@ DWORD WINAPI InitThread(LPVOID)
     // J2 live DLAA (needs the producers and the discovery adapter): off unless [j2] enabled=1.
     na::j2::SetEnabled(GetPrivateProfileIntW(L"j2", L"enabled", 0, g_ini) == 1 &&
                        GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1);
+    if (na::j2::Configured()) na::overlay::RegisterLiveDlaaMenu();
     bool started = na::overlay::Start(tag, nullptr);
     signal_install_attempted(); // producers were installed (or could not be) inside Start
     boot_log(started ? "overlay started" : "overlay start failed");

@@ -63,6 +63,10 @@ struct ExecuteToken {
     bool nested_unlocked = false; // this occurrence bypassed serialization (nested in a forwarded submission)
     // Evidence captured before forwarding (sampling + known-state store); opaque here.
     std::shared_ptr<void> capture;
+    // The thread's previous current submission, restored at End (nesting).
+    const void* prev_cap = nullptr;
+    na_object_id prev_qid = 0;
+    bool cur_set = false;
     uint32_t list_type = 0; // D3D12_COMMAND_LIST_TYPE of the queue
 };
 // C9b: the game host's original ExecuteCommandLists, used to submit the host's
@@ -107,6 +111,10 @@ bool ListReferences(ID3D12CommandList* list, na_object_id id);            // the
 bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id depth);
 bool ListLastState(ID3D12CommandList* list, na_object_id id, uint32_t* state); // last whole-resource transition in it
 uint32_t ReadBuffer(na_object_id res, uint64_t offset, void* dst, uint32_t n); // CPU-visible buffer bytes (0 = unavailable)
+// The state `id` (whole resource) carried into the submission this thread is
+// forwarding right now, from the known-state store (earlier submissions /
+// creation). False when not provable. Only for host work inside that forward.
+bool KnownStateInCurrentSubmission(na_object_id id, uint32_t* state);
 // While alive on this thread, D3D12 objects created and commands recorded are the
 // host's own (never observed as the game's), e.g. J2's inserted command list.
 class HostWorkScope {

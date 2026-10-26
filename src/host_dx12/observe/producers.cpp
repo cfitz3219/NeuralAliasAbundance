@@ -248,6 +248,11 @@ thread_local uint64_t t_seq = 0;
 // C9b: set while the host records/submits its OWN sample copies, so none of
 // that self-generated work is reported as the game's.
 thread_local bool t_host_work = false;
+// The submission this thread is forwarding (ExecuteBegin..ExecuteEnd), for
+// host work done inside that forward (J2) that asks for carried state.
+struct SubmissionCapture;
+thread_local const SubmissionCapture* t_cur_cap = nullptr;
+thread_local na_object_id t_cur_qid = 0;
 // ASTRA-P3-R8: number of submission locks this thread holds, i.e. whether it is
 // inside a forwarded game submission. Any observed queue operation nested in
 // one (driver/runtime re-entry, on ANY queue) takes no lock, so two threads
@@ -3563,6 +3568,11 @@ ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue, uint32_t count, ID3D12Comma
         known_mark(*cap, type == D3D12_COMMAND_LIST_TYPE_COPY);
     }
     t.capture = cap;
+    t.prev_cap = static_cast<const void*>(t_cur_cap);
+    t.prev_qid = t_cur_qid;
+    t_cur_cap = cap.get();
+    t_cur_qid = qid;
+    t.cur_set = true;
     t.list_type = static_cast<uint32_t>(type);
     if (!t_host_work && t_submit_depth == 0 && g_armed.load(std::memory_order_acquire)) { // C9B-R3
         qs->submit_m.lock();
@@ -3583,6 +3593,10 @@ ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue, uint32_t count, ID3D12Comma
 
 void ExecuteEnd(const ExecuteToken& t, ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* const* lists)
 {
+    if (t.cur_set) {
+        t_cur_cap = static_cast<const SubmissionCapture*>(t.prev_cap);
+        t_cur_qid = t.prev_qid;
+    }
     if (!t.queue_state) return;
     if (g_lists_hooked && lists)
         for (uint32_t i = 0; i < count; ++i)
@@ -3765,6 +3779,21 @@ uint32_t ReadBuffer(na_object_id res, uint64_t offset, void* dst, uint32_t n)
     t_host_work = was_host;
     reread->Release();
     return ok ? n : 0;
+}
+bool KnownStateInCurrentSubmission(na_object_id id, uint32_t* state)
+{
+    const SubmissionCapture* c = t_cur_cap;
+    if (!c || !state || !id || !c->in_store || c->unknown_marked || c->copy_queue) return false;
+    if (g_known_disabled.load() || g_unhooked_queues.load()) return false;
+    std::lock_guard<std::mutex> lock(g_known_m);
+    if (g_unknown_inflight) return false;
+    auto it = g_known.find(id);
+    if (it == g_known.end() || !it->second.subs.empty() || !it->second.has_all) return false; // per-subresource: not handled
+    if (it->second.in_flight > c->SelfMarks(id) || (it->second.queue && it->second.queue != t_cur_qid)) return false;
+    const uint32_t v = it->second.all;
+    if (v == kStatePending || v == D3D12_RESOURCE_STATE_COMMON) return false;
+    *state = v;
+    return true;
 }
 HostWorkScope::HostWorkScope() : prev_(t_host_work) { t_host_work = true; }
 HostWorkScope::~HostWorkScope() { t_host_work = prev_; }

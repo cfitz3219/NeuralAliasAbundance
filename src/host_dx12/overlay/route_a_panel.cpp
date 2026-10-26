@@ -19,6 +19,7 @@
 
 #include "host_dx12/capture/frame_capture.hpp"
 #include "host_dx12/fg/frame_gen.hpp"
+#include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/fg/preset_profile.hpp"
 #include "host_dx12/motion/live_flow.hpp"
 #include "host_dx12/overlay/presenter.hpp"
@@ -599,7 +600,38 @@ void DrawCaptureRow()
     }
 }
 
+// J2: live DLAA for games without an upscaler. A switch to compare with and
+// without, and what it is doing (or waiting for) right now.
+void DrawLiveDlaa()
+{
+    using namespace na::ui;
+    const na::j2::Stats st = na::j2::GetStats();
+    BeginGroupBox("Live DLAA");
+    bool on = !na::j2::Paused();
+    BeginRow("NeuralAlias DLAA (test)", "NVIDIA DLSS at full resolution on this game's 3D picture. Switch off to compare.", SwitchWidth());
+    if (Switch("j2", &on)) na::j2::SetPaused(!on);
+    EndRow();
+    char buf[320];
+    if (!on) {
+        StatusLine(0, "Off: you are seeing the game's own picture.");
+    } else if (st.active) {
+        std::snprintf(buf, sizeof buf, "Running: %ux%u, %llu frames improved so far.", st.width, st.height,
+                      static_cast<unsigned long long>(st.frames));
+        StatusLine(1, buf);
+    } else {
+        std::snprintf(buf, sizeof buf, "Not running yet: %s (%llu frames improved so far)", st.reason[0] ? st.reason : "starting.",
+                      static_cast<unsigned long long>(st.frames));
+        StatusLine(2, buf);
+    }
+    EndGroupBox();
+}
+
 } // namespace
+
+void RegisterLiveDlaaMenu()
+{
+    na::menu::Register({"Live DLAA", na::menu::Availability::Available, nullptr, &DrawLiveDlaa, na::menu::Page::Picture});
+}
 
 void RegisterRouteAMenu()
 {

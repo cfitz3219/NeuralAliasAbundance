@@ -28,8 +28,11 @@ namespace na::j2 {
 
 using ExecuteFn = void(__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 
-void SetEnabled(bool on);
+void SetEnabled(bool on);   // from the INI at start-up
 bool Enabled();
+bool Configured();          // enabled at start-up (the overlay shows its section)
+void SetPaused(bool paused); // the overlay's on/off switch (history resets on resume)
+bool Paused();
 
 // Wraps the forward of a game ExecuteCommandLists (after observation began
 // for it). Forwards the original batch unchanged unless a frame is processed.
