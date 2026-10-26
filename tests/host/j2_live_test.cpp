@@ -71,10 +71,12 @@ void Store(uint8_t* dst, const M& m)
 
 int main()
 {
+    setvbuf(stdout, nullptr, _IONBF, 0); // progress survives a timeout kill
     test::Device d;
     if (!test::CreateDevice(d)) return test::SkipNoDevice("j2_live_test");
     ID3D12Device* dev = d.device.Get();
     g_queue = d.queue.Get();
+    std::printf("step: install producers\n");
     REQUIRE(na::observe::InstallProducers(dev, d.queue.Get(), /*hook_queue_execute=*/true));
     na_observe_config cfg{};
     cfg.size_bytes = sizeof(cfg);
@@ -146,7 +148,9 @@ int main()
         REQUIRE(SUCCEEDED(consumer.list->Close()));
         ID3D12CommandList* lists[] = {scene.list.Get(), consumer.list.Get()};
         g_forwarded.clear();
+        std::printf("step: execute (camera x %.1f)\n", cam_x);
         na::j2::Execute(d.queue.Get(), 2, lists, &Forward);
+        std::printf("step: wait idle (forwarded %zu)\n", g_forwarded.size());
         d.WaitIdle();
         return 0;
     };

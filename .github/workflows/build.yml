@@ -38,9 +38,9 @@ jobs:
           $code = $LASTEXITCODE
           # Per-test verdicts as annotations (readable through the API): proves tests ran, not skipped.
           Select-String -Path ctest-log.txt -Pattern 'Test +#\d+: .*(Passed|Failed|Skipped|Not Run|\*\*\*)|tests passed|tests failed' |
-            Select-Object -First 45 | ForEach-Object {
+            ForEach-Object {
               $l = $_.Line.Trim()
-              if ($l -match 'Failed|\*\*\*Exception|Not Run|tests failed') { Write-Output "::error::$l" } else { Write-Output "::notice::$l" }
+              if ($l -match 'Failed|Timeout|\*\*\*|Not Run|tests failed') { Write-Output "::error::$l" }
             }
           exit $code
       - name: Deployment script tests (C5)
@@ -69,8 +69,17 @@ jobs:
         run: |
           $log = 'build/Testing/Temporary/LastTest.log'
           if (Test-Path $log) {
-            Select-String -Path $log -Pattern '^(FAIL|FATAL) |Test Failed|Exception|^checkpoint |^hooks installed|^producers:' | Select-Object -Last 9 |
-              ForEach-Object { Write-Output "::error::$($_.Line)" }
+            # Last output lines of every failed / timed-out test, named (raw job logs are not readable by agents).
+            $lines = Get-Content $log
+            $name = ''; $buf = New-Object System.Collections.Generic.List[string]
+            foreach ($l in $lines) {
+              if ($l -match '^\d+/\d+ (Testing|Test): (\S+)') { $name = $Matches[2]; $buf.Clear(); continue }
+              if ($l -match '^Test (Failed|Timeout)|^Test time .*|^"\S+" end time') {
+                if ($l -match 'Failed|Timeout') { $buf | Select-Object -Last 12 | ForEach-Object { Write-Output "::error::[$name] $_" }; Write-Output "::error::[$name] $l" }
+                continue
+              }
+              if ($l.Trim()) { $buf.Add($l) }
+            }
           }
       - name: Summary (what got built; SDK gate states)
         shell: pwsh
@@ -134,9 +143,9 @@ jobs:
           ctest --test-dir build -C Release --output-on-failure -LE gpu --verbose 2>&1 | Tee-Object -FilePath ctest-log.txt
           $code = $LASTEXITCODE
           Select-String -Path ctest-log.txt -Pattern 'Test +#\d+: .*(Passed|Failed|Skipped|Not Run|\*\*\*)|tests passed|tests failed' |
-            Select-Object -First 45 | ForEach-Object {
+            ForEach-Object {
               $l = $_.Line.Trim()
-              if ($l -match 'Failed|\*\*\*Exception|Not Run|tests failed') { Write-Output "::error::$l" } else { Write-Output "::notice::$l" }
+              if ($l -match 'Failed|Timeout|\*\*\*|Not Run|tests failed') { Write-Output "::error::$l" }
             }
           exit $code
       - name: Report failing tests as annotations
@@ -145,8 +154,17 @@ jobs:
         run: |
           $log = 'build/Testing/Temporary/LastTest.log'
           if (Test-Path $log) {
-            Select-String -Path $log -Pattern '^(FAIL|FATAL) |Test Failed|Exception|^checkpoint |^hooks installed|^producers:' | Select-Object -Last 9 |
-              ForEach-Object { Write-Output "::error::$($_.Line)" }
+            # Last output lines of every failed / timed-out test, named (raw job logs are not readable by agents).
+            $lines = Get-Content $log
+            $name = ''; $buf = New-Object System.Collections.Generic.List[string]
+            foreach ($l in $lines) {
+              if ($l -match '^\d+/\d+ (Testing|Test): (\S+)') { $name = $Matches[2]; $buf.Clear(); continue }
+              if ($l -match '^Test (Failed|Timeout)|^Test time .*|^"\S+" end time') {
+                if ($l -match 'Failed|Timeout') { $buf | Select-Object -Last 12 | ForEach-Object { Write-Output "::error::[$name] $_" }; Write-Output "::error::[$name] $l" }
+                continue
+              }
+              if ($l.Trim()) { $buf.Add($l) }
+            }
           }
 
   linux:
