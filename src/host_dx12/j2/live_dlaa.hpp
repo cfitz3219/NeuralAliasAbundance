@@ -49,7 +49,8 @@ struct Stats {
     uint64_t dlss_failed = 0;     // DLSS refused the frame (reason in na::dlss::GetStats)
     uint64_t cuts = 0;            // camera cuts (history reset)
     uint64_t camera_offset = 0;   // byte offset of the camera matrix inside its constant block
-    uint32_t later_passes = 0;    // other render targets bound after the scene in the same list (insertion may be late)
+    uint32_t later_passes = 0;
+    uint64_t jitter_writes = 0;   // J1: camera matrices replaced by jittered copies    // other render targets bound after the scene in the same list (insertion may be late)
     uint32_t width = 0, height = 0, color_format = 0;
     bool active = false;          // the last batch with the scene was processed
     char reason[160] = {};

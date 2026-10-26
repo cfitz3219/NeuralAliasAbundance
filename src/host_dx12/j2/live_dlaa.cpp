@@ -1,6 +1,7 @@
 #include "host_dx12/j2/live_dlaa.hpp"
 
 #include "core/motion_arbiter_gpu.hpp"
+#include "core/temporal_jitter.hpp"
 #include "host_dx12/depth_format.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
 #include "host_dx12/observe/producers.hpp"
@@ -57,6 +58,16 @@ struct State {
     int64_t camera_offset = -1; // learned offset of the ViewProjection inside its block
     int64_t camera_param = -1;  // learned root parameter that binds the camera block
     bool camera_table = false;  // ... through a descriptor table
+    // J1: this frame's injected camera jitter (see jitter_batch).
+    struct Jitter {
+        bool valid = false;
+        uint64_t res = 0, off = 0;           // the camera block it was found in
+        double px[2] = {0, 0};               // sample, render pixels (DLSS: colour sampled at centre - jitter)
+        uint8_t vp[2][64], inv[2][64];       // original matrices as stored (row / column layout)
+        uint8_t jvp[2][64], jinv[2][64];     // jittered replacements
+        uint32_t phase = 0;
+    } jit;
+    bool jitter_on = true;
     Stats stats;
 };
 // Never destroyed: at process exit the observation hooks' own state may already
@@ -152,6 +163,109 @@ bool state_after(ID3D12CommandList* const* lists, UINT last, na_object_id id, ui
     return na::observe::KnownStateInCurrentSubmission(id, st);
 }
 
+// ---- J1: camera jitter ---------------------------------------------------
+// DLAA needs a different sub-pixel sample every frame. Anno (like most games
+// without temporal AA) renders with a fixed camera, so J1 shifts it: before a
+// batch is forwarded, the camera ViewProjection and its inverse in the bound
+// constant buffers are replaced by jittered copies (core/temporal_jitter.hpp,
+// Halton 2,3 over 8 phases, DLSS's recommendation for DLAA). The same
+// replacement goes into every bound block that holds an identical copy, so a
+// depth pre-pass in an earlier batch and the scene agree. J2 then reports the
+// known sample to the camera tracker (which removes it exactly) and to DLSS.
+// Runs only while DLAA is producing frames, so the shake is never left
+// unresolved on screen.
+constexpr uint32_t kJitterPhases = 8;
+
+void store_matrix(const na::camera::Matrix& m, na::camera::Layout layout, uint8_t out[64])
+{
+    for (size_t r = 0; r < 4; ++r)
+        for (size_t c = 0; c < 4; ++c) {
+            const float v = static_cast<float>(m[r * 4 + c]);
+            std::memcpy(out + (layout == na::camera::Layout::RowMajor ? r * 4 + c : c * 4 + r) * 4, &v, 4);
+        }
+}
+
+// A camera block's bytes hold a VP + inverse at the learned offset: start this frame's jitter.
+bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& bytes)
+{
+    const size_t n = bytes.size();
+    if (g.camera_offset < 0 || static_cast<uint64_t>(g.camera_offset) + 64 > n || !g.w || !g.h) return false;
+    for (auto layout : {na::camera::Layout::RowMajor, na::camera::Layout::ColumnMajor}) {
+        const auto m = na::camera::LoadMatrix(bytes, static_cast<size_t>(g.camera_offset), layout);
+        na::camera::Candidate c{};
+        if (!na::camera::ViewProjection(m, c)) continue;
+        for (int64_t d : {64, -64}) {
+            const int64_t io = g.camera_offset + d;
+            if (io < 0 || static_cast<uint64_t>(io) + 64 > n) continue;
+            const auto inv = na::camera::LoadMatrix(bytes, static_cast<size_t>(io), layout);
+            if (!na::camera::IsInversePair(m, inv)) continue;
+            const neural_alias::JitterSample js = neural_alias::temporal_jitter(++g.jit.phase, kJitterPhases);
+            std::array<double, 16> src{};
+            for (int i = 0; i < 16; ++i) src[i] = m[i];
+            const auto jm = neural_alias::jitter_projection(src, js, g.w, g.h);
+            na::camera::Matrix jvp{}, jinv{};
+            for (int i = 0; i < 16; ++i) jvp[i] = jm[i];
+            if (!na::camera::Invert(jvp, jinv)) return false;
+            auto& j = g.jit;
+            j.res = res;
+            j.off = off;
+            j.px[0] = js.x_pixels;
+            j.px[1] = js.y_pixels;
+            for (int l = 0; l < 2; ++l) {
+                const auto L = l ? na::camera::Layout::ColumnMajor : na::camera::Layout::RowMajor;
+                store_matrix(m, L, j.vp[l]);
+                store_matrix(inv, L, j.inv[l]);
+                store_matrix(jvp, L, j.jvp[l]);
+                store_matrix(jinv, L, j.jinv[l]);
+            }
+            // Keep the bytes exactly as the game stored them for matching (float round trip).
+            std::memcpy(j.vp[layout == na::camera::Layout::RowMajor ? 0 : 1], bytes.data() + g.camera_offset, 64);
+            std::memcpy(j.inv[layout == na::camera::Layout::RowMajor ? 0 : 1], bytes.data() + io, 64);
+            j.valid = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Replaces this frame's VP / inverse in every bound block of the learned camera slot.
+void jitter_batch(ID3D12CommandList* const* lists, UINT count)
+{
+    if (!g.jitter_on || g.camera_param < 0 || g.camera_offset < 0 || !g.stats.active || !g.w) return;
+    std::map<std::pair<uint64_t, uint64_t>, uint32_t> blocks;
+    for (UINT i = 0; i < count; ++i) {
+        if (!lists[i]) continue;
+        for (const auto& b : na::observe::ListRootConstantBuffers(lists[i]))
+            if (b.param == static_cast<uint32_t>(g.camera_param) && b.table == g.camera_table) {
+                const uint32_t sz = b.table && b.size ? b.size : kBlockBytes;
+                blocks[{b.resource, b.offset}] = sz < kMaxBlockRead ? sz : kMaxBlockRead;
+            }
+        if (blocks.size() >= 64) break;
+    }
+    std::vector<uint8_t> bytes(kMaxBlockRead);
+    for (const auto& kv : blocks) {
+        const uint32_t n = na::observe::ReadBuffer(kv.first.first, kv.first.second, bytes.data(), kv.second);
+        if (n < 128) continue;
+        std::vector<uint8_t> view(bytes.begin(), bytes.begin() + n);
+        const size_t lo = static_cast<size_t>(g.camera_offset);
+        const bool ours = g.jit.valid && lo + 64 <= n &&
+                          (!std::memcmp(view.data() + lo, g.jit.jvp[0], 64) || !std::memcmp(view.data() + lo, g.jit.jvp[1], 64));
+        if (ours) continue; // already jittered (another batch of this frame bound it too)
+        const bool same_frame = g.jit.valid && lo + 64 <= n &&
+                                (!std::memcmp(view.data() + lo, g.jit.vp[0], 64) || !std::memcmp(view.data() + lo, g.jit.vp[1], 64));
+        if (!same_frame && !begin_jitter(kv.first.first, kv.first.second, view)) continue;
+        // Replace every identical copy of this frame's VP / inverse in the block.
+        for (size_t o = 0; o + 64 <= n; o += 16)
+            for (int l = 0; l < 2; ++l) {
+                const uint8_t* rep = nullptr;
+                if (!std::memcmp(view.data() + o, g.jit.vp[l], 64)) rep = g.jit.jvp[l];
+                else if (!std::memcmp(view.data() + o, g.jit.inv[l], 64)) rep = g.jit.jinv[l];
+                if (rep && na::observe::WriteBuffer(kv.first.first, kv.first.second + o, rep, 64) == 64) ++g.stats.jitter_writes;
+                if (rep) break;
+            }
+    }
+}
+
 // This frame's camera: a constant buffer holding a perspective ViewProjection
 // together with its inverse, bound in this batch up to the scene list. Root CBVs
 // and CBVs reached through descriptor tables both count (Anno binds its camera
@@ -186,9 +300,12 @@ bool check_learned(const std::vector<uint8_t>& bytes, na::camera::Matrix* vp, bo
     return false;
 }
 
+bool g_injected = false; // the camera found this frame carries J1's jitter (g.jit.px)
+
 bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, na::camera::Matrix* vp, bool* reversed)
 {
     g_cd = {};
+    g_injected = false;
     // Lists to search: the scene list, then earlier lists using the depth, then the others.
     std::vector<std::pair<uint32_t, UINT>> order_lists;
     for (int i = static_cast<int>(scene); i >= 0; --i) {
@@ -243,7 +360,12 @@ bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth
         s.complete = s.lifetime_valid = true;
         s.sync = na::camera::Sync::AppSyncUnknown;
         s.bytes.assign(bytes.begin(), bytes.begin() + n);
-        if (learned(o) && check_learned(s.bytes, vp, reversed)) return true;
+        if (learned(o) && check_learned(s.bytes, vp, reversed)) {
+            const size_t lo = static_cast<size_t>(g.camera_offset);
+            g_injected = g.jit.valid && lo + 64 <= s.bytes.size() &&
+                         (!std::memcmp(s.bytes.data() + lo, g.jit.jvp[0], 64) || !std::memcmp(s.bytes.data() + lo, g.jit.jvp[1], 64));
+            return true;
+        }
         const auto scan = na::camera::FindMatrices(s);
         g_cd.cands += scan.candidates.size();
         for (const auto& c : scan.candidates) {
@@ -323,8 +445,9 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         g.w = w; g.h = h; g.color_format = cd.Format;
         g.tracker.Reset();
     }
-    const double zero[2] = {0, 0}; // no jitter injected yet (J1)
-    const na::camera::CameraFrame cam = g.tracker.Update(vp, ++g.frame, w, h, zero);
+    const double zero[2] = {0, 0};
+    const double* injected = g_injected ? g.jit.px : zero; // J1: the exact sample we injected (removed from the matrix)
+    const na::camera::CameraFrame cam = g.tracker.Update(vp, ++g.frame, w, h, injected);
     if (!cam.valid) { ++g.stats.no_camera; reason("The camera matrix could not be inverted."); return false; }
     if (cam.camera_cut) ++g.stats.cuts;
     if (FAILED(s.alloc->Reset()) || FAILED(s.list->Reset(s.alloc.Get(), nullptr))) { reason("Could not reset the DLAA command list."); return false; }
@@ -382,6 +505,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     e.render_h = e.max_render_h = e.out_h = h;
     e.quality = na::dlss::Quality::DLAA;
     e.view_id = kViewId;
+    e.jitter_x = static_cast<float>(cam.jitter_px_x); // DLSS: colour sampled at pixel centre - jitter
+    e.jitter_y = static_cast<float>(cam.jitter_px_y);
     e.reset = cam.camera_cut || resize || g.resume_reset;
     g.resume_reset = false;
     e.hdr = is_float_color(cd.Format);
@@ -438,6 +563,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     ++g.stats.submissions;
     uint64_t depth_id = 0, color_id = 0;
     na::observe::GetLiveSelection(&depth_id, &color_id);
+    jitter_batch(lists, count); // J1, before anything in this batch is forwarded
     if (!depth_id || !color_id) {
         ++g.stats.no_selection;
         reason("Waiting for discovery to choose the scene depth and colour.");
@@ -478,6 +604,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         }
     }
     g.stats.active = ours != nullptr;
+    if (scene >= 0) g.jit.valid = false; // the scene closes this frame's jitter: the next camera block starts a new sample
     if (!ours) {
         lock.unlock();
         forward(queue, count, lists);

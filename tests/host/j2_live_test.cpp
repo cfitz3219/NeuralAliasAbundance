@@ -203,6 +203,18 @@ int main()
                 static_cast<unsigned long long>(st.cuts), fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset));
     CHECK(g_forwarded.size() == 3 && st.frames == 2 && fake::evals == evals0 + 2);
     CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
+    // J1: frame 2 runs jittered. Phase 1 of Halton(2,3) is (-0.25, +1/6) pixels; DLSS
+    // receives exactly that, and the game's camera block now holds the jittered copy.
+    st = na::j2::GetStats();
+    const double jx = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_X), jy = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_Y);
+    std::printf("frame 2 jitter: %.4f %.4f, camera matrices replaced %llu\n", jx, jy, static_cast<unsigned long long>(st.jitter_writes));
+    CHECK(std::fabs(jx + 0.25) < 1e-4 && std::fabs(jy - 1.0 / 6.0) < 1e-4);
+    CHECK(st.jitter_writes >= 2); // ViewProjection and its inverse
+    {
+        uint8_t orig[64];
+        Store(orig, Camera(0.5));
+        CHECK(std::memcmp(cpu + 512 + 80, orig, 64) != 0);
+    }
     frame(500); // teleport: history reset
     CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 1);
     CHECK(dev->GetDeviceRemovedReason() == S_OK);
