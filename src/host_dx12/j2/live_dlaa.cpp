@@ -486,7 +486,9 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
             dr = "No folder for DLSS data.";
         }
         if (dr) reason(dr);
-        else record(lists, static_cast<UINT>(scene), depth_id, color_id, &ours, pending);
+        else if (record(lists, static_cast<UINT>(scene), depth_id, color_id, &ours, pending)) {
+            g.stats.later_passes = na::observe::ListTargetsAfter(lists[scene], color_id, depth_id);
+        }
     }
     g.stats.active = ours != nullptr;
     if (!ours) {
@@ -508,7 +510,13 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     g.resume_reset = false;
     ++g.stats.frames;
     if (pending.cut) ++g.stats.cuts;
-    reason("Live DLAA is running.");
+    if (g.stats.later_passes) {
+        char why[160];
+        std::snprintf(why, sizeof why, "Live DLAA is running (inserted after the scene list; it draws %u other targets after the scene).", g.stats.later_passes);
+        reason(why);
+    } else {
+        reason("Live DLAA is running.");
+    }
     na::dlss::OnExecuted(queue, n2, batch.data());
     s.fence_value = g.fence_next++;
     queue->Signal(g.fence.Get(), s.fence_value);

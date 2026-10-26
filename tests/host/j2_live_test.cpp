@@ -196,7 +196,7 @@ int main()
     CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 1);
     CHECK((fake::I(fake::last_create, NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags) & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) != 0);
     CHECK((fake::I(fake::last_create, NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags) & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) != 0);
-    CHECK(st.frames == 1 && st.camera_offset == 80);
+    CHECK(st.frames == 1 && st.camera_offset == 80 && st.later_passes == 0);
 
     // A second matching batch in the same game frame is not another DLAA frame.
     // Nor does an unrelated/unknown queue's presentation advance this view.

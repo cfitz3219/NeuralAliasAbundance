@@ -109,6 +109,10 @@ std::vector<LiveBinding> ListRootConstantBuffers(ID3D12CommandList* list); // gr
 bool ListReferences(ID3D12CommandList* list, na_object_id id);            // the recording referenced the resource
 // True when the recording bound `color` as a render target together with `depth` as its depth target.
 bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id depth);
+// Distinct other render targets bound in this recording after its last bind of
+// `color` with `depth` (later passes in the same list, e.g. post-processing that
+// may consume the scene colour before a list-boundary insertion).
+uint32_t ListTargetsAfter(ID3D12CommandList* list, na_object_id color, na_object_id depth);
 bool ListLastState(ID3D12CommandList* list, na_object_id id, uint32_t* state); // last whole-resource transition in it
 uint32_t ReadBuffer(na_object_id res, uint64_t offset, void* dst, uint32_t n); // CPU-visible buffer bytes (0 = unavailable)
 // The state `id` (whole resource) carried into the submission this thread is
