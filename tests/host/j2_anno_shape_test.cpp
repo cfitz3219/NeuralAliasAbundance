@@ -4,7 +4,9 @@
 //   - the scene colour has a MIP CHAIN (RGBA16F, 4 mips) and the scene list never
 //     transitions colour or depth: their states are carried from an earlier
 //     submission (the known-state store);
-//   - the camera sits in a 768-byte DESCRIPTOR-TABLE CBV at +336, inverse at +400.
+//   - the camera sits in a 768-byte DESCRIPTOR-TABLE CBV at +336, inverse at +400;
+//   - a depth pre-pass in an EARLIER batch, with its own root signature (a root
+//     CBV), binds its own copy of the camera: J1 must jitter both identically.
 // The DLAA list must close (no latch), DLSS gets the frame, the result lands in
 // mip 0, J1 jitters the next frame, and the device survives.
 #include "test_support.hpp"
@@ -139,12 +141,23 @@ int main()
         REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err)));
         REQUIRE(SUCCEEDED(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rs))));
     }
+    test::ComPtr<ID3D12RootSignature> rs_pre; // the pre-pass's own root signature: one root CBV
+    {
+        D3D12_ROOT_PARAMETER p{};
+        p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC rd{1, &p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+        test::ComPtr<ID3DBlob> blob, err;
+        REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err)));
+        REQUIRE(SUCCEEDED(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rs_pre))));
+    }
+    constexpr uint32_t kPre = 2048;
     uint8_t* cpu = nullptr;
     REQUIRE(SUCCEEDED(cb->Map(0, nullptr, reinterpret_cast<void**>(&cpu))) && cpu);
 
     // An earlier submission leaves colour in RENDER_TARGET and depth in DEPTH_WRITE.
-    test::List setup, scene, consumer;
-    REQUIRE(setup.Create(dev) && scene.Create(dev) && consumer.Create(dev));
+    test::List setup, scene, consumer, prepass;
+    REQUIRE(setup.Create(dev) && scene.Create(dev) && consumer.Create(dev) && prepass.Create(dev));
     REQUIRE(SUCCEEDED(setup.list->Close()));
     {
         setup.Reset(); // recorded after a Reset, like a game's reused list
@@ -156,7 +169,7 @@ int main()
         Submit(q, 1, l, false);
         d.WaitIdle();
     }
-    REQUIRE(SUCCEEDED(scene.list->Close()) && SUCCEEDED(consumer.list->Close()));
+    REQUIRE(SUCCEEDED(scene.list->Close()) && SUCCEEDED(consumer.list->Close()) && SUCCEEDED(prepass.list->Close()));
     na::j2::SetEnabled(true);
     na::observe::SetLiveSelection(na::observe::IdOf(depth.Get()), na::observe::IdOf(color.Get()));
     const auto frame = [&](double cam_x) {
@@ -168,6 +181,17 @@ int main()
         Store(cpu + kBlock + kVp, vp);
         Store(cpu + kBlock + kVp + 64, inv);
         for (int i = 0; i < 300; ++i) cpu[kBlock + i] = static_cast<uint8_t>(i * 13); // other constants before the camera
+        Store(cpu + kPre + kVp, vp); // the pre-pass's own copy of the camera
+        Store(cpu + kPre + kVp + 64, inv);
+        prepass.Reset(); // earlier batch: depth only, its own root signature
+        prepass.list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+        prepass.list->SetGraphicsRootSignature(rs_pre.Get());
+        prepass.list->SetGraphicsRootConstantBufferView(0, cb->GetGPUVirtualAddress() + kPre);
+        REQUIRE(SUCCEEDED(prepass.list->Close()));
+        {
+            ID3D12CommandList* pl[] = {prepass.list.Get()};
+            Submit(q, 1, pl, true);
+        }
         scene.Reset(); // no colour/depth transitions in the scene list: carried state
         scene.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
         const float clear[4] = {0.2f, 0.3f, 0.4f, 1};
@@ -212,6 +236,12 @@ int main()
     CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
     const double jx = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_X), jy = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_Y);
     CHECK((jx != 0.0 || jy != 0.0) && std::fabs(jx) < 0.5 && std::fabs(jy) < 0.5);
+    {
+        uint8_t orig[64];
+        Store(orig, Camera(0.5));
+        CHECK(std::memcmp(cpu + kPre + kVp, orig, 64) != 0);                // the earlier pre-pass batch was jittered...
+        CHECK(std::memcmp(cpu + kPre + kVp, cpu + kBlock + kVp, 64) == 0); // ...exactly like the scene's camera
+    }
     CHECK(dev->GetDeviceRemovedReason() == S_OK);
     na::j2::SetEnabled(false);
     d.WaitIdle();

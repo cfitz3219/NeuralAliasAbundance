@@ -196,7 +196,25 @@ void store_matrix(const na::camera::Matrix& m, na::camera::Layout layout, uint8_
 }
 
 // A camera block's bytes hold a VP + inverse at the learned offset: start this frame's jitter.
-bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& bytes)
+// Last main camera the jitter started from (a block outside the learned camera
+// slot may start a frame only if it shows that same camera, not a light's).
+struct { bool valid = false; na::camera::VpGeometry geo{}; } g_jit_cam;
+
+bool same_camera(const na::camera::Matrix& m)
+{
+    na::camera::VpGeometry v{};
+    if (!g_jit_cam.valid || !na::camera::DecomposeViewProjection(m, v)) return false;
+    const auto& p = g_jit_cam.geo;
+    double dot = 0, d2 = 0, len2 = 0;
+    for (int j = 0; j < 3; ++j) {
+        dot += v.forward[j] * p.forward[j];
+        d2 += (v.position[j] - p.position[j]) * (v.position[j] - p.position[j]);
+        len2 += p.position[j] * p.position[j];
+    }
+    return dot > 0.98 && std::abs(v.sy - p.sy) <= 0.05 * std::abs(p.sy) && d2 <= 0.01 * len2 + 100.0;
+}
+
+bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& bytes, bool slot)
 {
     const size_t n = bytes.size();
     if (g.camera_offset < 0 || static_cast<uint64_t>(g.camera_offset) + 64 > n || !g.w || !g.h) return false;
@@ -204,11 +222,13 @@ bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& bytes)
         const auto m = na::camera::LoadMatrix(bytes, static_cast<size_t>(g.camera_offset), layout);
         na::camera::Candidate c{};
         if (!na::camera::ViewProjection(m, c)) continue;
+        if (!slot && !same_camera(m)) continue;
         for (int64_t d : {64, -64}) {
             const int64_t io = g.camera_offset + d;
             if (io < 0 || static_cast<uint64_t>(io) + 64 > n) continue;
             const auto inv = na::camera::LoadMatrix(bytes, static_cast<size_t>(io), layout);
             if (!na::camera::IsInversePair(m, inv)) continue;
+            g_jit_cam.valid = na::camera::DecomposeViewProjection(m, g_jit_cam.geo);
             const neural_alias::JitterSample js = neural_alias::temporal_jitter(++g.jit.phase, kJitterPhases);
             std::array<double, 16> src{};
             for (int i = 0; i < 16; ++i) src[i] = m[i];
@@ -238,39 +258,53 @@ bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& bytes)
     return false;
 }
 
-// Replaces this frame's VP / inverse in every bound block of the learned camera slot.
+// Replaces this frame's VP / inverse in the bound constant buffers of this batch.
+// The frame's sample starts at the first block holding a VP + inverse at the
+// learned offset (blocks of the learned camera slot are tried first); then every
+// exact copy of that VP / inverse in ANY bound block of the batch is replaced,
+// because an earlier pass (a depth pre-pass, often with its own root signature)
+// must see the same jittered camera as the scene, or depth tests disagree.
 void jitter_batch(ID3D12CommandList* const* lists, UINT count)
 {
     if (!g.jitter_on || g.camera_param < 0 || g.camera_offset < 0 || !g.stats.active || !g.w) return;
-    std::map<std::pair<uint64_t, uint64_t>, uint32_t> blocks;
-    for (UINT i = 0; i < count; ++i) {
+    struct JB { uint64_t res, off; uint32_t size; bool slot; };
+    std::map<std::pair<uint64_t, uint64_t>, JB> blocks;
+    for (UINT i = 0; i < count && blocks.size() < 256; ++i) {
         if (!lists[i]) continue;
-        for (const auto& b : na::observe::ListRootConstantBuffers(lists[i]))
-            if (b.param == static_cast<uint32_t>(g.camera_param) && b.table == g.camera_table) {
-                const uint32_t sz = b.table && b.size ? b.size : kBlockBytes;
-                blocks[{b.resource, b.offset}] = sz < kMaxBlockRead ? sz : kMaxBlockRead;
-            }
-        if (blocks.size() >= 64) break;
+        for (const auto& b : na::observe::ListRootConstantBuffers(lists[i])) {
+            const uint32_t sz = b.table && b.size ? b.size : kBlockBytes;
+            JB& k = blocks[{b.resource, b.offset}];
+            k.res = b.resource;
+            k.off = b.offset;
+            k.size = sz < kMaxBlockRead ? sz : kMaxBlockRead;
+            k.slot = k.slot || (b.param == static_cast<uint32_t>(g.camera_param) && b.table == g.camera_table);
+            if (blocks.size() >= 256) break;
+        }
     }
+    std::vector<const JB*> order;
+    for (const auto& kv : blocks) order.push_back(&kv.second);
+    std::stable_sort(order.begin(), order.end(), [](const JB* a, const JB* b) { return a->slot && !b->slot; });
     std::vector<uint8_t> bytes(kMaxBlockRead);
-    for (const auto& kv : blocks) {
-        const uint32_t n = na::observe::ReadBuffer(kv.first.first, kv.first.second, bytes.data(), kv.second);
-        if (n < 128) continue;
+    for (const JB* k : order) {
+        const uint32_t n = na::observe::ReadBuffer(k->res, k->off, bytes.data(), k->size);
+        if (n < 64) continue;
         std::vector<uint8_t> view(bytes.begin(), bytes.begin() + n);
-        const size_t lo = static_cast<size_t>(g.camera_offset);
-        const bool ours = g.jit.valid && lo + 64 <= n &&
-                          (!std::memcmp(view.data() + lo, g.jit.jvp[0], 64) || !std::memcmp(view.data() + lo, g.jit.jvp[1], 64));
-        if (ours) continue; // already jittered (another batch of this frame bound it too)
-        const bool same_frame = g.jit.valid && lo + 64 <= n &&
-                                (!std::memcmp(view.data() + lo, g.jit.vp[0], 64) || !std::memcmp(view.data() + lo, g.jit.vp[1], 64));
-        if (!same_frame && !begin_jitter(kv.first.first, kv.first.second, view)) continue;
-        // Replace every identical copy of this frame's VP / inverse in the block.
+        const auto holds = [&](const uint8_t (&m)[2][64]) {
+            for (size_t o = 0; o + 64 <= n; o += 16)
+                if (!std::memcmp(view.data() + o, m[0], 64) || !std::memcmp(view.data() + o, m[1], 64)) return true;
+            return false;
+        };
+        if (!g.jit.valid || !holds(g.jit.vp)) {
+            if (g.jit.valid && holds(g.jit.jvp)) continue; // already jittered by an earlier batch of this frame
+            if (g.jit.valid) continue;                     // a different matrix (another camera): leave it
+            if (!begin_jitter(k->res, k->off, view, k->slot)) continue;
+        }
         for (size_t o = 0; o + 64 <= n; o += 16)
             for (int l = 0; l < 2; ++l) {
                 const uint8_t* rep = nullptr;
                 if (!std::memcmp(view.data() + o, g.jit.vp[l], 64)) rep = g.jit.jvp[l];
                 else if (!std::memcmp(view.data() + o, g.jit.inv[l], 64)) rep = g.jit.jinv[l];
-                if (rep && na::observe::WriteBuffer(kv.first.first, kv.first.second + o, rep, 64) == 64) ++g.stats.jitter_writes;
+                if (rep && na::observe::WriteBuffer(k->res, k->off + o, rep, 64) == 64) ++g.stats.jitter_writes;
                 if (rep) break;
             }
     }
@@ -590,6 +624,18 @@ void SetPaused(bool paused)
     g.paused.store(paused);
 }
 bool Paused() { return g.paused.load(); }
+void SetJitter(bool on)
+{
+    std::lock_guard<std::mutex> lock(g.m);
+    if (g.jitter_on != on) g.resume_reset = true; // the input sequence changes character
+    g.jitter_on = on;
+    if (!on) g.jit.valid = false;
+}
+bool Jitter()
+{
+    std::lock_guard<std::mutex> lock(g.m);
+    return g.jitter_on;
+}
 
 void OnPresent(ID3D12CommandQueue* queue)
 {

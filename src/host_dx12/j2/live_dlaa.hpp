@@ -35,6 +35,8 @@ bool Enabled();
 bool Configured();          // enabled at start-up (the overlay shows its section)
 void SetPaused(bool paused); // the overlay's on/off switch (history resets on resume)
 bool Paused();
+void SetJitter(bool on);     // the overlay's camera-jitter switch (J1), on by default
+bool Jitter();
 
 // Called once at the game view's non-TEST Present boundary, including while
 // paused. Presenter-generated frames must not call this. Single-view J2 uses

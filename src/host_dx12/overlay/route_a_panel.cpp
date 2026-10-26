@@ -611,6 +611,10 @@ void DrawLiveDlaa()
     BeginRow("NeuralAlias DLAA (test)", "NVIDIA DLSS at full resolution on this game's 3D picture. Switch off to compare.", SwitchWidth());
     if (Switch("j2", &on)) na::j2::SetPaused(!on);
     EndRow();
+    bool jit = na::j2::Jitter();
+    BeginRow("Camera jitter", "Shifts the camera by a fraction of a pixel each frame so DLAA can sharpen as well as smooth. Switch off if the picture shimmers or flickers.", SwitchWidth());
+    if (Switch("j2jit", &jit)) na::j2::SetJitter(jit);
+    EndRow();
     char buf[320];
     if (!on) {
         StatusLine(0, "Off: you are seeing the game's own picture.");
