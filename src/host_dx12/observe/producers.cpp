@@ -3711,7 +3711,8 @@ std::vector<LiveBinding> ListRootConstantBuffers(ID3D12CommandList* list)
     std::lock_guard<std::mutex> bl(ls->bind_m);
     out.reserve(std::min<size_t>(ls->bindings.size(), 4096));
     for (const auto& b : ls->bindings)
-        if (b.resource && b.kind == NA_SNAP_ROOT_CBV && !b.compute) out.push_back({b.resource, b.offset, b.size, b.op_index});
+        if (b.resource && (b.kind == NA_SNAP_ROOT_CBV || b.kind == NA_SNAP_TABLE_CBV) && !b.compute)
+            out.push_back({b.resource, b.offset, b.size, b.op_index, b.param, b.kind == NA_SNAP_TABLE_CBV});
     return out;
 }
 bool ListReferences(ID3D12CommandList* list, na_object_id id)

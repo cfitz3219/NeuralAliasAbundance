@@ -99,16 +99,29 @@ int main()
     dvd.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
     dvd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
     dev->CreateDepthStencilView(depth.Get(), &dvd, dsv);
-    // Root signature: one graphics root CBV (b0).
+    // Root signature: a root CBV (b0, junk constants) and a descriptor table with
+    // one CBV (b1): Anno binds its camera through a table, so the test does too.
     test::ComPtr<ID3D12RootSignature> rs;
     {
-        D3D12_ROOT_PARAMETER p{};
-        p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-        p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        D3D12_ROOT_SIGNATURE_DESC rd{1, &p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+        D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 1, 0, 0};
+        D3D12_ROOT_PARAMETER p[2]{};
+        p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        p[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[1].DescriptorTable.NumDescriptorRanges = 1;
+        p[1].DescriptorTable.pDescriptorRanges = &range;
+        p[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC rd{2, p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
         test::ComPtr<ID3DBlob> blob, err;
         REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err)));
         REQUIRE(SUCCEEDED(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rs))));
+    }
+    test::ComPtr<ID3D12DescriptorHeap> cbvh;
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC chd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&chd, IID_PPV_ARGS(&cbvh))));
+        D3D12_CONSTANT_BUFFER_VIEW_DESC cv{cb->GetGPUVirtualAddress() + 512, 256};
+        dev->CreateConstantBufferView(&cv, cbvh->GetCPUDescriptorHandleForHeapStart());
     }
     uint8_t* cpu = nullptr;
     REQUIRE(SUCCEEDED(cb->Map(0, nullptr, reinterpret_cast<void**>(&cpu))) && cpu); // persistent, like a game's upload ring
@@ -136,8 +149,10 @@ int main()
         scene.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
         scene.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
         scene.list->SetGraphicsRootSignature(rs.Get());
-        for (int i = 0; i < 3; ++i) scene.list->SetGraphicsRootConstantBufferView(0, va + 512); // camera: most bound
-        scene.list->SetGraphicsRootConstantBufferView(0, va + 1024);
+        ID3D12DescriptorHeap* heaps[] = {cbvh.Get()};
+        scene.list->SetDescriptorHeaps(1, heaps);
+        for (int i = 0; i < 3; ++i) scene.list->SetGraphicsRootConstantBufferView(0, va + 1024); // junk: most bound
+        scene.list->SetGraphicsRootDescriptorTable(1, cbvh->GetGPUDescriptorHandleForHeapStart()); // camera (table CBV)
         D3D12_RESOURCE_BARRIER out = test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         scene.list->ResourceBarrier(1, &out);
         REQUIRE(SUCCEEDED(scene.list->Close()));

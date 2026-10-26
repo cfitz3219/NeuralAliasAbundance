@@ -104,8 +104,8 @@ void SetSampleSignalFailsForTests(bool fail);
 na_object_id IdOf(const void* object);
 
 // J2 live consumer support (called from inside a game submission; bounded, no waits).
-struct LiveBinding { na_object_id resource; uint64_t offset; uint32_t size; uint64_t op_index; };
-std::vector<LiveBinding> ListRootConstantBuffers(ID3D12CommandList* list); // graphics root CBVs of the recording
+struct LiveBinding { na_object_id resource; uint64_t offset; uint32_t size; uint64_t op_index; uint32_t param = 0; bool table = false; };
+std::vector<LiveBinding> ListRootConstantBuffers(ID3D12CommandList* list); // graphics CBVs of the recording: root CBVs and CBVs reached through descriptor tables
 bool ListReferences(ID3D12CommandList* list, na_object_id id);            // the recording referenced the resource
 // True when the recording bound `color` as a render target together with `depth` as its depth target.
 bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id depth);

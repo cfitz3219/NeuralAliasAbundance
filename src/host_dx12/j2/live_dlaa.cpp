@@ -24,7 +24,8 @@ namespace {
 
 constexpr uint32_t kRing = 6;            // frames in flight before a slot is reused (never waited on)
 constexpr uint32_t kBlockBytes = 512;    // root CBVs have no size: read this much (the producer's own bound)
-constexpr size_t kMaxBlocks = 384;       // unique constant blocks examined per frame
+constexpr size_t kMaxBlocks = 256;       // unique constant blocks examined per frame (until the camera slot is learned)
+constexpr uint32_t kMaxBlockRead = 1024; // bytes read from one constant buffer
 constexpr uint64_t kViewId = 0x4A32;     // DLSS view for this source ("J2")
 
 struct Slot {
@@ -54,6 +55,8 @@ struct State {
     na::camera::CameraTracker tracker;
     uint64_t frame = 0;
     int64_t camera_offset = -1; // learned offset of the ViewProjection inside its block
+    int64_t camera_param = -1;  // learned root parameter that binds the camera block
+    bool camera_table = false;  // ... through a descriptor table
     Stats stats;
 };
 // Never destroyed: at process exit the observation hooks' own state may already
@@ -149,26 +152,85 @@ bool state_after(ID3D12CommandList* const* lists, UINT last, na_object_id id, ui
     return na::observe::KnownStateInCurrentSubmission(id, st);
 }
 
-// This frame's camera: the most-bound constant block in the scene list that
-// holds a perspective ViewProjection together with its inverse.
-struct CamDiag { size_t binds = 0, blocks = 0, read = 0, vp = 0, cands = 0; } g_cd;
+// This frame's camera: a constant buffer holding a perspective ViewProjection
+// together with its inverse, bound in this batch up to the scene list. Root CBVs
+// and CBVs reached through descriptor tables both count (Anno binds its camera
+// through a table). Lists that use the scene depth are searched first, then the
+// rest; within that, the binding slot that held the camera last time leads.
+struct CamDiag { size_t lists = 0, binds = 0, blocks = 0, read = 0, vp = 0, cands = 0; } g_cd;
 
-bool find_camera(ID3D12CommandList* scene, na::camera::Matrix* vp, bool* reversed)
+struct Block {
+    uint64_t resource = 0, offset = 0;
+    uint32_t size = 0, param = 0, uses = 0, list_rank = 0;
+    bool table = false;
+};
+
+bool check_learned(const std::vector<uint8_t>& bytes, na::camera::Matrix* vp, bool* reversed)
+{
+    const size_t n = bytes.size();
+    if (g.camera_offset < 0 || static_cast<uint64_t>(g.camera_offset) + 64 > n) return false;
+    for (auto layout : {na::camera::Layout::RowMajor, na::camera::Layout::ColumnMajor}) {
+        const auto m = na::camera::LoadMatrix(bytes, static_cast<size_t>(g.camera_offset), layout);
+        na::camera::Candidate c{};
+        if (!na::camera::ViewProjection(m, c)) continue;
+        for (int64_t d : {64, -64}) {
+            const int64_t off = g.camera_offset + d;
+            if (off < 0 || static_cast<uint64_t>(off) + 64 > n) continue;
+            if (na::camera::IsInversePair(m, na::camera::LoadMatrix(bytes, static_cast<size_t>(off), layout))) {
+                *vp = m;
+                *reversed = c.reversed;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, na::camera::Matrix* vp, bool* reversed)
 {
     g_cd = {};
-    const auto binds = na::observe::ListRootConstantBuffers(scene);
-    std::map<std::pair<uint64_t, uint64_t>, uint32_t> count;
-    for (const auto& b : binds) ++count[{b.resource, b.offset}];
-    std::vector<std::pair<uint32_t, std::pair<uint64_t, uint64_t>>> order;
-    order.reserve(count.size());
-    for (const auto& kv : count) order.push_back({kv.second, kv.first});
-    std::stable_sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    // Lists to search: the scene list, then earlier lists using the depth, then the others.
+    std::vector<std::pair<uint32_t, UINT>> order_lists;
+    for (int i = static_cast<int>(scene); i >= 0; --i) {
+        if (!lists[i]) continue;
+        const uint32_t rank = static_cast<UINT>(i) == scene ? 0u : (na::observe::ListReferences(lists[i], depth_id) ? 1u : 2u);
+        order_lists.push_back({rank, static_cast<UINT>(i)});
+    }
+    std::stable_sort(order_lists.begin(), order_lists.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::map<std::pair<uint64_t, uint64_t>, Block> blocks;
+    for (const auto& ol : order_lists) {
+        const auto binds = na::observe::ListRootConstantBuffers(lists[ol.second]);
+        if (binds.empty()) continue;
+        ++g_cd.lists;
+        g_cd.binds += binds.size();
+        for (const auto& b : binds) {
+            Block& k = blocks[{b.resource, b.offset}];
+            if (!k.uses) {
+                k.resource = b.resource;
+                k.offset = b.offset;
+                k.size = b.table && b.size ? b.size : kBlockBytes;
+                k.param = b.param;
+                k.table = b.table;
+                k.list_rank = ol.first;
+            }
+            ++k.uses;
+        }
+    }
+    std::vector<const Block*> order;
+    order.reserve(blocks.size());
+    for (const auto& kv : blocks) order.push_back(&kv.second);
+    const auto learned = [](const Block* b) { return g.camera_param >= 0 && b->param == static_cast<uint32_t>(g.camera_param) && b->table == g.camera_table; };
+    std::stable_sort(order.begin(), order.end(), [&](const Block* a, const Block* b) {
+        if (learned(a) != learned(b)) return learned(a);
+        if (a->list_rank != b->list_rank) return a->list_rank < b->list_rank;
+        return a->uses > b->uses;
+    });
     if (order.size() > kMaxBlocks) order.resize(kMaxBlocks);
-    g_cd.binds = binds.size();
     g_cd.blocks = order.size();
-    std::vector<uint8_t> bytes(kBlockBytes);
-    for (const auto& o : order) {
-        const uint32_t n = na::observe::ReadBuffer(o.second.first, o.second.second, bytes.data(), kBlockBytes);
+    std::vector<uint8_t> bytes(kMaxBlockRead);
+    for (const Block* o : order) {
+        const uint32_t want = o->size < kMaxBlockRead ? o->size : kMaxBlockRead;
+        const uint32_t n = na::observe::ReadBuffer(o->resource, o->offset, bytes.data(), want);
         if (n < 128) continue;
         ++g_cd.read;
         // An in-process read at submission time, inside the submitting call:
@@ -176,33 +238,20 @@ bool find_camera(ID3D12CommandList* scene, na::camera::Matrix* vp, bool* reverse
         na::camera::Snapshot s{};
         s.session = s.epoch = 1;
         s.submission = s.content_version = g.frame + 1;
-        s.resource = o.second.first;
+        s.resource = o->resource;
         s.base_offset = 0; // offsets are relative to the block
         s.complete = s.lifetime_valid = true;
         s.sync = na::camera::Sync::AppSyncUnknown;
         s.bytes.assign(bytes.begin(), bytes.begin() + n);
-        if (g.camera_offset >= 0 && static_cast<uint64_t>(g.camera_offset) + 128 <= n) {
-            // Learned layout: check just that offset (both memory layouts).
-            for (auto layout : {na::camera::Layout::RowMajor, na::camera::Layout::ColumnMajor}) {
-                const auto m = na::camera::LoadMatrix(s.bytes, static_cast<size_t>(g.camera_offset), layout);
-                na::camera::Candidate c{};
-                if (!na::camera::ViewProjection(m, c)) continue;
-                bool pair = false;
-                for (int64_t d : {64, -64}) {
-                    const int64_t off = g.camera_offset + d;
-                    if (off < 0 || static_cast<uint64_t>(off) + 64 > n) continue;
-                    pair = pair || na::camera::IsInversePair(m, na::camera::LoadMatrix(s.bytes, static_cast<size_t>(off), layout));
-                }
-                if (pair) { *vp = m; *reversed = c.reversed; return true; }
-            }
-            continue;
-        }
+        if (learned(o) && check_learned(s.bytes, vp, reversed)) return true;
         const auto scan = na::camera::FindMatrices(s);
         g_cd.cands += scan.candidates.size();
         for (const auto& c : scan.candidates) {
             if (c.kind == na::camera::Kind::ViewProjection) ++g_cd.vp;
             if (c.kind != na::camera::Kind::ViewProjection || !c.has_inverse_pair) continue;
             g.camera_offset = static_cast<int64_t>(c.byte_offset);
+            g.camera_param = static_cast<int64_t>(o->param);
+            g.camera_table = o->table;
             g.stats.camera_offset = c.byte_offset;
             *vp = c.matrix;
             *reversed = c.reversed;
@@ -241,6 +290,19 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         return false;
     }
 
+    // Camera first (nothing is allocated for a frame that cannot run); the tracker
+    // update comes after the size check, because a resize resets the tracker.
+    na::camera::Matrix vp{};
+    bool reversed = false;
+    if (!find_camera(lists, scene, depth_id, &vp, &reversed)) {
+        ++g.stats.no_camera;
+        g.camera_offset = g.camera_param = -1; // relearn
+        char why[160];
+        std::snprintf(why, sizeof why, "Waiting for the camera (lists %zu, binds %zu, blocks %zu, read %zu, matrices %zu, view-proj %zu).",
+                      g_cd.lists, g_cd.binds, g_cd.blocks, g_cd.read, g_cd.cands, g_cd.vp);
+        reason(why);
+        return false;
+    }
     // Ring slot (never wait) and size/format changes (only once the GPU is done with the old set).
     const UINT64 done = g.fence->GetCompletedValue();
     Slot& s = g.slots[g.slot];
@@ -260,18 +322,6 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         }
         g.w = w; g.h = h; g.color_format = cd.Format;
         g.tracker.Reset();
-    }
-    // Camera after the size check: a resize resets the tracker, which must precede this frame's update.
-    na::camera::Matrix vp{};
-    bool reversed = false;
-    if (!find_camera(lists[scene], &vp, &reversed)) {
-        ++g.stats.no_camera;
-        g.camera_offset = -1; // relearn
-        char why[160];
-        std::snprintf(why, sizeof why, "Waiting: no camera matrix with its inverse (cbv binds %zu, blocks %zu, read %zu, matrices %zu, view-proj %zu).",
-                      g_cd.binds, g_cd.blocks, g_cd.read, g_cd.cands, g_cd.vp);
-        reason(why);
-        return false;
     }
     const double zero[2] = {0, 0}; // no jitter injected yet (J1)
     const na::camera::CameraFrame cam = g.tracker.Update(vp, ++g.frame, w, h, zero);
