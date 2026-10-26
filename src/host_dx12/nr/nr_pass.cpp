@@ -37,7 +37,7 @@ Texture2D<float4> t_a : register(t0);
 Texture2D<float4> t_b : register(t1);
 Texture2D<float4> t_c : register(t2);
 RWTexture2D<float4> u_out : register(u0);
-cbuffer C : register(b0) { float paper_white; uint width; uint height; uint mode; };
+cbuffer C : register(b0) { float paper_white; uint width; uint height; uint mode; uint src_w; uint src_h; };
 
 static const float m1 = 0.1593017578125, m2 = 78.84375, c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;
 float3 pq_to_nits(float3 e) {
@@ -67,16 +67,23 @@ SamplerState s_linear : register(s0);
 [numthreads(8, 8, 1)]
 void upsample_depth(uint3 id : SV_DispatchThreadID) {
     if (id.x >= width || id.y >= height) return;
-    uint sw, sh; t_a.GetDimensions(sw, sh);
+    uint sw = src_w, sh = src_h; // the rendered region, not the (padded) allocation
     uint2 src = uint2(min((id.x * sw) / width, sw - 1), min((id.y * sh) / height, sh - 1));
     u_out[id.xy] = t_a[src];
 }
 [numthreads(8, 8, 1)]
 void upsample_motion(uint3 id : SV_DispatchThreadID) {
     if (id.x >= width || id.y >= height) return;
-    uint sw, sh; t_a.GetDimensions(sw, sh);
+    uint sw = src_w, sh = src_h;
     uint2 src = uint2(min((id.x * sw) / width, sw - 1), min((id.y * sh) / height, sh - 1));
     u_out[id.xy] = t_a[src];
+}
+// Argon audit #2 / C12: 24-bit (R24_UNORM_X8 view) or 16-bit (R16_UNORM view)
+// depth -> R32F, for the rendered region starting at (src_w, src_h).
+[numthreads(8, 8, 1)]
+void depth_to_r32(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= width || id.y >= height) return;
+    u_out[id.xy] = t_a[id.xy + uint2(src_w, src_h)].rrrr;
 }
 [numthreads(8, 8, 1)]
 void hdr_to_sdr(uint3 id : SV_DispatchThreadID) {
@@ -101,7 +108,9 @@ void sdr_to_hdr(uint3 id : SV_DispatchThreadID) {
 }
 )";
 
-struct Constants { float paper_white; uint32_t width, height, mode; };
+struct Constants { float paper_white; uint32_t width, height, mode, src_w, src_h; };
+constexpr UINT kConstants = sizeof(Constants) / 4;
+constexpr uint32_t kEvalSlots = 64; // descriptor groups for evaluate-time depth conversion (ring)
 
 constexpr uint32_t kRing = 8; // A63: was 4; a game running 3+ frames ahead made the pass skip alternate frames (flicker)
 
@@ -120,6 +129,7 @@ struct Frame {
 struct PendingInputs {
     ID3D12CommandList* list = nullptr; // identity only; never dereferenced/retained
     EvalInputs in{};
+    uint32_t valid_w = 0, valid_h = 0; // rendered region copied to (0,0) of the copies
     ComPtr<ID3D12Resource> depth, motion;
 };
 
@@ -155,7 +165,9 @@ struct State {
     ComPtr<ID3D12Resource> hdr_out;                   // UAV at rest (HDR only; back-buffer format)
     uint32_t hdr_mode_used = 0;                       // A60: shader mode of the current resources (1 PQ, 2 scRGB)
     DXGI_FORMAT motion_format = DXGI_FORMAT_UNKNOWN;
-    uint32_t in_w = 0, in_h = 0;         // depth/motion extent
+    uint32_t in_w = 0, in_h = 0;         // depth/motion rendered extent (region at (0,0) of the copies)
+    ComPtr<ID3D12PipelineState> pso_depth_r32; // C12 conversion
+    uint32_t eval_slot = 0;
     EvalInputs last_in{};
     uint32_t have_inputs = 0;
     uint32_t inputs_fresh = 0;          // a DLSS input copy was SUBMITTED since the last Present
@@ -281,7 +293,7 @@ bool ensure_device_locked(ID3D12Device* dev)
     params[0].DescriptorTable.pDescriptorRanges = ranges;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[1].Constants.Num32BitValues = 4;
+    params[1].Constants.Num32BitValues = kConstants;
     params[1].Constants.ShaderRegister = 0;
     params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_STATIC_SAMPLER_DESC samp{};
@@ -298,12 +310,13 @@ bool ensure_device_locked(ID3D12Device* dev)
     if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err))) return false;
     if (FAILED(dev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&g.root)))) return false;
     if (!compile("hdr_to_sdr", g.pso_hdr_to_sdr) || !compile("sdr_to_hdr", g.pso_sdr_to_hdr) ||
-        !compile("upsample_depth", g.pso_up_depth) || !compile("upsample_motion", g.pso_up_motion))
+        !compile("upsample_depth", g.pso_up_depth) || !compile("upsample_motion", g.pso_up_motion) ||
+        !compile("depth_to_r32", g.pso_depth_r32))
         return false;
 
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = 16 * kRing;
+    hd.NumDescriptors = 16 * kRing + 4 * kEvalSlots;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g.heap)))) return false;
     g.heap_stride = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -522,6 +535,34 @@ bool WantsInputs()
            !g.latched.load(std::memory_order_acquire);
 }
 
+// C12: records the typed-view depth -> R32F conversion of the region
+// (bx, by, w, h) of `depth` (NON_PIXEL_SHADER_RESOURCE, stays so) into (0,0) of
+// `out` (R32F UAV-capable, NON_PIXEL_SHADER_RESOURCE -> left in COPY_DEST).
+// Changes the list's descriptor heaps, root signature and pipeline. Caller holds g.m.
+void record_depth_to_r32_locked(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, DXGI_FORMAT view, ID3D12Resource* out,
+                                uint32_t bx, uint32_t by, uint32_t w, uint32_t h)
+{
+    const uint32_t slot = 16 * kRing + 4 * (g.eval_slot++ % kEvalSlots);
+    write_srv(slot + 0, depth, view);
+    write_srv(slot + 1, depth, view);
+    write_srv(slot + 2, depth, view);
+    write_uav(slot + 3, out, DXGI_FORMAT_R32_FLOAT);
+    D3D12_RESOURCE_BARRIER pre = transition(out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    list->ResourceBarrier(1, &pre);
+    ID3D12DescriptorHeap* heaps[] = {g.heap.Get()};
+    const Constants c{0.f, w, h, 0u, bx, by};
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetComputeRootSignature(g.root.Get());
+    list->SetPipelineState(g.pso_depth_r32.Get());
+    list->SetComputeRootDescriptorTable(0, table_gpu(slot));
+    list->SetComputeRoot32BitConstants(1, kConstants, &c, 0);
+    list->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+    D3D12_RESOURCE_BARRIER done[2] = {
+        uav_barrier(out),
+        transition(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST)};
+    list->ResourceBarrier(2, done);
+}
+
 void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
 {
     if (!list || !in.depth || !in.motion) return;
@@ -534,17 +575,40 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
         return;
     }
     D3D12_RESOURCE_DESC dd = in.depth->GetDesc(), md = in.motion->GetDesc();
-    if (!na::depth::PlaneZeroCopiesToR32F(dd.Format)) { // Argon audit #2: never issue an invalid depth copy
-        char buf[112];
-        snprintf(buf, sizeof(buf), "Neural Rendering is not available in this game yet: it uses %s depth.", na::depth::DepthKind(dd.Format));
+    // Argon audit #2 / C12: 32-bit depth is copied; 24/16-bit depth is converted
+    // to R32F by a compute pass through a typed view (never an invalid copy).
+    const bool copy_depth = na::depth::PlaneZeroCopiesToR32F(dd.Format);
+    DXGI_FORMAT depth_view = DXGI_FORMAT_UNKNOWN;
+    switch (dd.Format) {
+    // Only typeless resources may be viewed with another format; a fully typed
+    // D24_UNORM_S8_UINT / D16_UNORM resource cannot be read by a shader.
+    case DXGI_FORMAT_R24G8_TYPELESS: depth_view = DXGI_FORMAT_R24_UNORM_X8_TYPELESS; break;
+    case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_R16_UNORM: depth_view = DXGI_FORMAT_R16_UNORM; break;
+    default: break;
+    }
+    if (!copy_depth && (depth_view == DXGI_FORMAT_UNKNOWN || (dd.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "Neural Rendering is not available in this game yet: its %s depth cannot be read by a shader.",
+                 na::depth::DepthKind(dd.Format));
         latch(buf);
         return;
     }
-    uint32_t w = static_cast<uint32_t>(dd.Width), h = dd.Height;
-    if (static_cast<uint32_t>(md.Width) != w || md.Height != h) {
+    // Argon audit #4.1/#4.2: only the rendered region (subrect) is used, so
+    // padded allocations and dynamic resolution work. Motion vectors must be
+    // render-sized (MVLowRes) for the region to match the depth region.
+    const uint32_t rw = in.render_w, rh = in.render_h;
+    const uint32_t dbx = in.depth_base_x == 0xFFFFFFFFu ? 0 : in.depth_base_x, dby = in.depth_base_y == 0xFFFFFFFFu ? 0 : in.depth_base_y;
+    const uint32_t mbx = in.mv_base_x == 0xFFFFFFFFu ? 0 : in.mv_base_x, mby = in.mv_base_y == 0xFFFFFFFFu ? 0 : in.mv_base_y;
+    const auto fits = [](const D3D12_RESOURCE_DESC& d, uint64_t bx, uint64_t by, uint64_t w, uint64_t h) {
+        return w && h && bx + w <= d.Width && by + h <= d.Height;
+    };
+    if (!rw || !rh || rw == 0xFFFFFFFFu || rh == 0xFFFFFFFFu || !in.mv_low_res || !fits(dd, dbx, dby, rw, rh) || !fits(md, mbx, mby, rw, rh)) {
         g.skipped.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    // Copies are allocated at the source allocation size (no per-frame churn
+    // under dynamic resolution); the region lands at (0,0).
+    const uint32_t w = static_cast<uint32_t>(dd.Width), h = dd.Height;
     PendingInputs* pending = nullptr;
     for (auto& p : g.pending) if (p.list == list) { pending = &p; break; }
     if (!pending) for (auto& p : g.pending) if (!p.list) { pending = &p; break; }
@@ -552,37 +616,56 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
         latch("Neural Rendering stopped: too many unsubmitted input lists.");
         return;
     }
+    const bool need_uav = !copy_depth;
     if (!g.recording_depth || !g.recording_motion || g.recording_depth->GetDesc().Width != w ||
-        g.recording_depth->GetDesc().Height != h || g.recording_motion->GetDesc().Format != md.Format) {
-        // Depth: the game's depth plane copied into a plain float texture.
-        if (!create_texture(w, h, DXGI_FORMAT_R32_FLOAT, false, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g.recording_depth) ||
-            !create_texture(w, h, md.Format, false, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g.recording_motion)) {
+        g.recording_depth->GetDesc().Height != h || g.recording_motion->GetDesc().Format != md.Format ||
+        g.recording_motion->GetDesc().Width != md.Width || g.recording_motion->GetDesc().Height != md.Height ||
+        (need_uav && !(g.recording_depth->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) {
+        // Depth: the game's depth plane as a plain float texture (UAV-capable when converted).
+        if (!create_texture(w, h, DXGI_FORMAT_R32_FLOAT, need_uav, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g.recording_depth) ||
+            !create_texture(static_cast<UINT>(md.Width), md.Height, md.Format, false, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g.recording_motion)) {
             latch("Neural Rendering could not allocate its motion buffers.");
             return;
         }
     }
-    D3D12_RESOURCE_BARRIER pre[4] = {
-        transition(in.depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
-        transition(in.motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
-        transition(g.recording_depth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
-        transition(g.recording_motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)};
-    pre[0].Transition.Subresource = 0; // depth plane only
-    list->ResourceBarrier(4, pre);
     D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
     src.Type = dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    src.pResource = in.depth;
-    src.SubresourceIndex = 0;
-    dst.pResource = g.recording_depth.Get();
-    dst.SubresourceIndex = 0;
-    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-    list->CopyResource(g.recording_motion.Get(), in.motion);
+    if (copy_depth) {
+        D3D12_RESOURCE_BARRIER pre[4] = {
+            transition(in.depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            transition(in.motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            transition(g.recording_depth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
+            transition(g.recording_motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)};
+        pre[0].Transition.Subresource = 0; // depth plane only
+        list->ResourceBarrier(4, pre);
+        src.pResource = in.depth;
+        dst.pResource = g.recording_depth.Get();
+        const D3D12_BOX dbox{dbx, dby, 0, dbx + rw, dby + rh, 1};
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, &dbox);
+    } else {
+        // C12: typed SRV of the depth plane -> R32F UAV. The DLSS evaluate that
+        // just ran already changed this list's descriptor heaps/root state, and
+        // the caller must restore them after it (NGX/FFX contract), so this
+        // pass records in that same window.
+        record_depth_to_r32_locked(list, in.depth, depth_view, g.recording_depth.Get(), dbx, dby, rw, rh);
+        D3D12_RESOURCE_BARRIER pre[2] = {
+            transition(in.motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            transition(g.recording_motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)};
+        list->ResourceBarrier(2, pre);
+    }
+    src.pResource = in.motion;
+    dst.pResource = g.recording_motion.Get();
+    const D3D12_BOX mbox{mbx, mby, 0, mbx + rw, mby + rh, 1};
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, &mbox);
     D3D12_RESOURCE_BARRIER post[4] = {
-        transition(in.depth, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
         transition(in.motion, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
         transition(g.recording_depth.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-        transition(g.recording_motion.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
-    post[0].Transition.Subresource = 0;
-    list->ResourceBarrier(4, post);
+        transition(g.recording_motion.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        transition(in.depth, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
+    post[3].Transition.Subresource = 0;
+    list->ResourceBarrier(copy_depth ? 4 : 3, post);
+    pending->valid_w = rw;
+    pending->valid_h = rh;
     if (!pending->list) g.pending_count.fetch_add(1, std::memory_order_release);
     pending->list = list;
     pending->in = in;
@@ -619,8 +702,8 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
             g.last_in = p.in;
             g.depth_copy = p.depth;
             g.motion_copy = p.motion;
-            g.in_w = static_cast<uint32_t>(p.depth->GetDesc().Width);
-            g.in_h = p.depth->GetDesc().Height;
+            g.in_w = p.valid_w;
+            g.in_h = p.valid_h;
             g.motion_format = p.motion->GetDesc().Format;
             g.have_inputs = 1;
             if (g.inputs_fresh) g.input_overwrites.fetch_add(1, std::memory_order_relaxed);
@@ -786,7 +869,7 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer, DXGI_COLOR
     if (run) {
         ID3D12DescriptorHeap* heaps[] = {g.heap.Get()};
         uint32_t slot = g.frame_index * 16;
-        Constants c{static_cast<float>(st.nr_paper_white.load()), w, h, shader_mode};
+        Constants c{static_cast<float>(st.nr_paper_white.load()), w, h, shader_mode, g.in_w, g.in_h};
         if (scaled) {
             // Phase 4: render-size depth/MV -> display size (nearest / bilinear).
             write_srv(slot + 8, g.depth_copy.Get(), DXGI_FORMAT_R32_FLOAT);
@@ -799,7 +882,7 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer, DXGI_COLOR
             write_uav(slot + 15, g.motion_up.Get(), g.motion_format);
             g.list->SetDescriptorHeaps(1, heaps);
             g.list->SetComputeRootSignature(g.root.Get());
-            g.list->SetComputeRoot32BitConstants(1, 4, &c, 0);
+            g.list->SetComputeRoot32BitConstants(1, kConstants, &c, 0);
             g.list->SetPipelineState(g.pso_up_depth.Get());
             g.list->SetComputeRootDescriptorTable(0, table_gpu(slot + 8));
             g.list->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
@@ -826,7 +909,7 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer, DXGI_COLOR
             g.list->SetComputeRootSignature(g.root.Get());
             g.list->SetPipelineState(g.pso_hdr_to_sdr.Get());
             g.list->SetComputeRootDescriptorTable(0, table_gpu(slot));
-            g.list->SetComputeRoot32BitConstants(1, 4, &c, 0);
+            g.list->SetComputeRoot32BitConstants(1, kConstants, &c, 0);
             g.list->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
             D3D12_RESOURCE_BARRIER b2[2] = {
                 uav_barrier(g.color_in.Get()),
@@ -886,7 +969,7 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer, DXGI_COLOR
             g.list->SetComputeRootSignature(g.root.Get());
             g.list->SetPipelineState(g.pso_sdr_to_hdr.Get());
             g.list->SetComputeRootDescriptorTable(0, table_gpu(slot + 4));
-            g.list->SetComputeRoot32BitConstants(1, 4, &c, 0);
+            g.list->SetComputeRoot32BitConstants(1, kConstants, &c, 0);
             g.list->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
             D3D12_RESOURCE_BARRIER b4[3] = {
                 uav_barrier(g.hdr_out.Get()),
@@ -973,6 +1056,17 @@ void ResetLatch()
     g.reset_pending = true;
     g.latched.store(0, std::memory_order_release);
     set_reason("Neural Rendering is off.");
+}
+
+bool RecordDepthToR32ForTests(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, DXGI_FORMAT view, ID3D12Resource* out,
+                              uint32_t bx, uint32_t by, uint32_t w, uint32_t h)
+{
+    if (!list || !depth || !out) return false;
+    std::lock_guard<std::mutex> lock(g.m);
+    ComPtr<ID3D12Device> dev;
+    if (FAILED(list->GetDevice(IID_PPV_ARGS(&dev))) || !ensure_device_locked(dev.Get())) return false;
+    record_depth_to_r32_locked(list, depth, view, out, bx, by, w, h);
+    return true;
 }
 
 void Shutdown()
