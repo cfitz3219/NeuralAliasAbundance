@@ -145,7 +145,9 @@ int main()
     // An earlier submission leaves colour in RENDER_TARGET and depth in DEPTH_WRITE.
     test::List setup, scene, consumer;
     REQUIRE(setup.Create(dev) && scene.Create(dev) && consumer.Create(dev));
+    REQUIRE(SUCCEEDED(setup.list->Close()));
     {
+        setup.Reset(); // recorded after a Reset, like a game's reused list
         D3D12_RESOURCE_BARRIER in[2] = {test::Transition(color.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
                                         test::Transition(depth.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_DEPTH_WRITE)};
         setup.list->ResourceBarrier(2, in);
@@ -187,6 +189,10 @@ int main()
         Submit(q, 2, lists, true);
         na::j2::OnPresent(q);
         d.WaitIdle();
+        const auto ps = na::observe::GetProducerStats();
+        std::printf("producers: known disabled %u unknown_inflight %u entries %llu unhooked_queues %llu clears %llu sample_known %llu\n",
+                    ps.known_store_disabled, ps.known_unknown_inflight, (unsigned long long)ps.known_entries, (unsigned long long)ps.unhooked_queues,
+                    (unsigned long long)ps.known_state_clears, (unsigned long long)ps.sample_known_state);
         const auto js = na::j2::GetStats();
         std::printf("frame x=%.1f: forwarded %zu, frames %llu, state %llu, camera %llu, offset %llu, jitter writes %llu, \"%s\"\n", cam_x,
                     g_forwarded.size(), (unsigned long long)js.frames, (unsigned long long)js.no_state, (unsigned long long)js.no_camera,
