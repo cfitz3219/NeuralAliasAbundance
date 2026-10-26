@@ -145,7 +145,9 @@ int main()
     // An earlier submission leaves colour in RENDER_TARGET and depth in DEPTH_WRITE.
     test::List setup, scene, consumer;
     REQUIRE(setup.Create(dev) && scene.Create(dev) && consumer.Create(dev));
+    REQUIRE(SUCCEEDED(setup.list->Close()));
     {
+        setup.Reset(); // recorded after a Reset, like a game's reused list
         D3D12_RESOURCE_BARRIER in[2] = {test::Transition(color.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
                                         test::Transition(depth.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_DEPTH_WRITE)};
         setup.list->ResourceBarrier(2, in);
