@@ -92,7 +92,10 @@ int main(int argc, char** argv)
     const UINT depth_samples = argc > 2 ? UINT(std::atoi(argv[2])) : samples;
     const bool msaa = samples > 1;
     const bool real_ngx = argc > 3 && std::strcmp(argv[3], "--real") == 0;
-    const bool post_reader = argc > 3 && !real_ngx;
+    // --planes: depth's two planes (depth, stencil) are transitioned by separate
+    // per-subresource barriers, as Sniper Elite Resistance does.
+    const bool planes = argc > 3 && std::strcmp(argv[3], "--planes") == 0;
+    const bool post_reader = argc > 3 && !real_ngx && !planes;
     test::Device d;
     if (!test::CreateDevice(d)) return test::SkipNoDevice("j2_anno_shape_test");
     if (real_ngx) {
@@ -269,9 +272,16 @@ int main(int argc, char** argv)
     REQUIRE(SUCCEEDED(setup.list->Close()));
     {
         setup.Reset(); // recorded after a Reset, like a game's reused list
-        D3D12_RESOURCE_BARRIER in[2] = {test::Transition(color.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
+        D3D12_RESOURCE_BARRIER in[3] = {test::Transition(color.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
                                         test::Transition(depth.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_DEPTH_WRITE)};
-        setup.list->ResourceBarrier(2, in);
+        if (planes) { // plane 0 (depth) and plane 1 (stencil) as separate subresources
+            const D3D12_RESOURCE_DESC ddsc = depth->GetDesc();
+            const UINT per_plane = UINT(ddsc.MipLevels ? ddsc.MipLevels : 1) * ddsc.DepthOrArraySize;
+            in[1].Transition.Subresource = 0;
+            in[2] = test::Transition(depth.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+            in[2].Transition.Subresource = per_plane; // first subresource of plane 1
+        }
+        setup.list->ResourceBarrier(planes ? 3 : 2, in);
         const float red[4] = {1, 0, 0, 1};
         setup.list->ClearRenderTargetView(rtv0, red, 0, nullptr);
         REQUIRE(SUCCEEDED(setup.list->Close()));

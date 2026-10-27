@@ -424,12 +424,14 @@ bool ensure_device(ID3D12CommandQueue* q)
 
 // The resource state at the end of the scene list: its last whole-resource
 // transition there, else in an earlier list of the same batch.
-bool state_after(ID3D12CommandList* const* lists, UINT last, na_object_id id, uint32_t* st)
+// State of subresource `sub` after lists[0..last]. Barriers may name that
+// subresource alone (depth vs stencil plane, one mip or slice) or all of them.
+bool state_after(ID3D12CommandList* const* lists, UINT last, na_object_id id, uint32_t sub, uint32_t* st)
 {
     for (int i = static_cast<int>(last); i >= 0; --i)
-        if (na::observe::ListLastState(lists[i], id, st)) return true;
+        if (na::observe::ListLastStateSub(lists[i], id, sub, st)) return true;
     // Not transitioned in this batch up to the scene: the state it carried in.
-    return na::observe::KnownStateInCurrentSubmission(id, st);
+    return na::observe::KnownSubStateInCurrentSubmission(id, sub, st);
 }
 
 // ---- J1: camera jitter ---------------------------------------------------
@@ -806,12 +808,6 @@ struct PendingHistory {
 bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, na_object_id color_id,
             ID3D12GraphicsCommandList** out_list, PendingHistory& pending)
 {
-    uint32_t sc = 0, sd = 0;
-    if (!state_after(lists, scene, color_id, &sc) || !state_after(lists, scene, depth_id, &sd)) {
-        ++g.stats.no_state;
-        reason("Waiting: the scene colour/depth state at the end of the scene pass is not established.");
-        return false;
-    }
     ComPtr<ID3D12Resource> color, depth;
     color.Attach(na::observe::AcquireResource(color_id));
     depth.Attach(na::observe::AcquireResource(depth_id));
@@ -833,6 +829,16 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     uint32_t csub = 0, dsub = 0;
     if (!na::observe::ListSceneSubresource(lists[scene], color_id, depth_id, &csub, &dsub) || csub == 0xFFFFFFFFu || dsub == 0xFFFFFFFFu) {
         reason("The scene is drawn through a view NeuralAlias cannot place (several array slices at once, or an unusual view).");
+        return false;
+    }
+    // States of exactly the two subresources J2 copies from and restores.
+    uint32_t sc = 0, sd = 0;
+    const bool have_sc = state_after(lists, scene, color_id, csub, &sc), have_sd = state_after(lists, scene, depth_id, dsub, &sd);
+    if (!have_sc || !have_sd) {
+        ++g.stats.no_state;
+        if (!have_sc) ++g.stats.no_state_color; else ++g.stats.no_state_depth;
+        reason(!have_sc ? "Waiting: the scene colour's state at the end of the scene pass is not established."
+                        : "Waiting: the scene depth's state at the end of the scene pass is not established.");
         return false;
     }
     g.stats.color_sub = csub;

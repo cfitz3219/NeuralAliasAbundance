@@ -3877,6 +3877,26 @@ uint32_t ListTargetsAfter(ID3D12CommandList* list, na_object_id color, na_object
         if (it->rt != color && std::find(others.begin(), others.end(), it->rt) == others.end()) others.push_back(it->rt);
     return static_cast<uint32_t>(others.size());
 }
+// State of ONE subresource after `list`: the last barrier naming that subresource
+// or all of them. Games commonly transition depth and stencil planes (or mips,
+// array slices) separately; the whole-resource query refuses those.
+bool ListLastStateSub(ID3D12CommandList* list, na_object_id id, uint32_t sub, uint32_t* state)
+{
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    if (!ls->evidence_complete) return false;
+    for (auto it = ls->states.rbegin(); it != ls->states.rend(); ++it) {
+        if (it->resource != id) continue;
+        if (it->subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && it->subresource != sub) continue; // another plane/mip/slice
+        if (it->state_after == kStatePending) return false;
+        *state = it->state_after;
+        return true;
+    }
+    return false;
+}
 bool ListLastState(ID3D12CommandList* list, na_object_id id, uint32_t* state)
 {
     std::shared_lock<std::shared_mutex> rl(g_m);
@@ -3950,6 +3970,22 @@ uint32_t ReadBuffer(na_object_id res, uint64_t offset, void* dst, uint32_t n)
     t_host_work = was_host;
     reread->Release();
     return ok ? n : 0;
+}
+bool KnownSubStateInCurrentSubmission(na_object_id id, uint32_t sub, uint32_t* state)
+{
+    const SubmissionCapture* c = t_cur_cap;
+    if (!c || !state || !id || !c->in_store || c->unknown_marked || c->copy_queue) return false;
+    if (g_known_disabled.load() || g_unhooked_queues.load()) return false;
+    std::lock_guard<std::mutex> lock(g_known_m);
+    if (g_unknown_inflight) return false;
+    auto it = g_known.find(id);
+    if (it == g_known.end()) return false;
+    if (it->second.in_flight > c->SelfMarks(id) || (it->second.queue && it->second.queue != t_cur_qid)) return false;
+    auto s = it->second.subs.find(sub);
+    const uint32_t v = s != it->second.subs.end() ? s->second : (it->second.has_all ? it->second.all : kStatePending);
+    if (v == kStatePending || v == D3D12_RESOURCE_STATE_COMMON) return false;
+    *state = v;
+    return true;
 }
 bool KnownStateInCurrentSubmission(na_object_id id, uint32_t* state)
 {

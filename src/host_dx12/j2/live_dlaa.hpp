@@ -66,6 +66,7 @@ struct Stats {
     uint64_t no_selection = 0;    // discovery has not chosen depth + colour yet
     uint64_t no_scene_list = 0;   // batch without the scene list
     uint64_t no_state = 0;        // resource state at the scene list's end not established
+    uint64_t no_state_color = 0, no_state_depth = 0; // which one was unknown
     uint64_t no_camera = 0;       // no camera ViewProjection + inverse in the scene list
     uint64_t busy = 0;            // ring slot / resize still in flight
     uint64_t dlss_failed = 0;     // DLSS refused the frame (reason in na::dlss::GetStats)
