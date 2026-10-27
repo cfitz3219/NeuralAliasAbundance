@@ -88,6 +88,7 @@ struct State {
     // recorded INTO the game's list at the moment it binds the scene colour for
     // reading, then the game's state is restored. Explicitly enabled in settings.
     bool inline_mode = false;
+    bool inline_sample_locked = false; // NGX recorded: no new raster sample may start this frame
     struct LearnedInsertion { uint64_t color = 0, depth = 0; na::j2::InsertionDecision decision; };
     LearnedInsertion insertion_frame, insertion_learned;
     char insertion_trace[2048] = {};
@@ -110,6 +111,7 @@ struct State {
     // J1: this frame's injected camera jitter (see jitter_batch).
     struct Jitter {
         bool valid = false;
+        bool applied = false;
         uint64_t res = 0, off = 0;           // the camera block it was found in
         double px[2] = {0, 0};               // sample, render pixels (DLSS: colour sampled at centre - jitter)
         uint8_t vp[2][64], inv[2][64];       // original matrices as stored (row / column layout)
@@ -570,6 +572,7 @@ bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& bytes,
         for (int i = 0; i < 16; ++i) jvp[i] = jm[i];
         if (!na::camera::Invert(jvp, jinv)) return false;
         auto& j = g.jit;
+        j.applied = false;
         j.res = res;
         j.off = off;
         j.px[0] = js.x_pixels;
@@ -619,10 +622,11 @@ void jitter_batch(ID3D12CommandList* const* lists, UINT count)
     // Only while DLAA is producing frames: the previous game frame submitted one
     // (a batch without the scene must not count as "not running").
     const bool running = g.submitted_frame && g.frame == g.submitted_frame + 1;
-    // Inline mode: DLAA's parameters are fixed when the game RECORDS its list, the
-    // camera block is jittered when it SUBMITS; until both are tied to one frame,
-    // inline DLAA runs without J1 jitter (stage 1).
-    if (!g.jitter_on || g.inline_mode || g.camera_param < 0 || g.camera_offset < 0 || !running || !g.w) return;
+    // Inline NGX parameters are fixed at recording. An earlier submitted camera
+    // batch may start the sample; recording then freezes that choice. Never start
+    // a new sample at submission after NGX already recorded zero jitter.
+    if (!g.jitter_on || (g.inline_mode && g.inline_sample_locked && !g.jit.valid) ||
+        g.camera_param < 0 || g.camera_offset < 0 || !running || !g.w) return;
     struct JB { uint64_t res, off; uint32_t size; bool slot; };
     std::map<std::pair<uint64_t, uint64_t>, JB> blocks;
     for (UINT i = 0; i < count && blocks.size() < 256; ++i) {
@@ -688,7 +692,10 @@ void jitter_batch(ID3D12CommandList* const* lists, UINT count)
                 if (!std::memcmp(view.data() + o, g.jit.vp[l], 64)) rep = g.jit.jvp[l];
                 else if (!std::memcmp(view.data() + o, g.jit.inv[l], 64)) rep = g.jit.jinv[l];
                 else if (l == 0 && g.jit.has_proj && !std::memcmp(view.data() + o, g.jit.proj, 64)) { rep = g.jit.jproj; ++g.stats.jitter_proj_writes; }
-                if (rep && na::observe::WriteBuffer(k->res, k->off + o, rep, 64) == 64) ++g.stats.jitter_writes;
+                if (rep && na::observe::WriteBuffer(k->res, k->off + o, rep, 64) == 64) {
+                    ++g.stats.jitter_writes;
+                    if (rep == g.jit.jvp[l]) g.jit.applied = true;
+                }
                 if (rep) break;
             }
     }
@@ -834,6 +841,9 @@ bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth
             g.stats.camera_offset = c.byte_offset;
             *vp = c.matrix;
             *reversed = c.reversed;
+            const size_t lo = static_cast<size_t>(c.byte_offset);
+            g_injected = g.jit.valid && lo + 64 <= s.bytes.size() &&
+                         (!std::memcmp(s.bytes.data() + lo, g.jit.jvp[0], 64) || !std::memcmp(s.bytes.data() + lo, g.jit.jvp[1], 64));
             return true;
         }
     }
@@ -1065,6 +1075,10 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     e.view_id = kViewId;
     e.jitter_x = static_cast<float>(cam.jitter_px_x); // DLSS: colour sampled at pixel centre - jitter
     e.jitter_y = static_cast<float>(cam.jitter_px_y);
+    if (inl) {
+        g.stats.inline_jitter_x = e.jitter_x;
+        g.stats.inline_jitter_y = e.jitter_y;
+    }
     e.reset = cam.camera_cut || resize || g.resume_reset;
     e.hdr = is_float_color(cf);
     e.depth_inverted = reversed;
@@ -1214,6 +1228,12 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     if (g.inl_frame == g.frame || g.inl.valid) return; // one per frame; the previous one is not submitted yet
     if (!na::observe::ListStateRestorable(l)) { ++g.stats.inline_refused; reason("The scene list's state cannot be restored after DLAA (a bundle ran); left untouched."); return; }
     ID3D12CommandList* one[1] = {l};
+    // The depth/earlier scene batches must already have established this frame's
+    // raster sample. Apply that SAME sample to camera copies in this recording
+    // before reading its camera and recording motion/NGX parameters.
+    if (g.jit.valid && g.jit.applied) jitter_batch(one, 1);
+    else g.jit.valid = false;
+    g.inline_sample_locked = true;
     PendingHistory pending;
     ID3D12GraphicsCommandList* out = nullptr;
     bool touched = false;
@@ -1297,12 +1317,18 @@ void OnPresent(ID3D12CommandQueue* queue)
         if (g.inline_mode) {
             ++g.stats.inline_presents;
             if (g.submitted_frame == g.frame) ++g.stats.inline_covered;
+            else if (g.insertion_frame.decision.writes)
+                std::snprintf(g.stats.insertion_last_miss, sizeof g.stats.insertion_last_miss,
+                    "frame=%llu learned_transition=%u actual_transition=%u camera=%llu reason=%.150s",
+                    (unsigned long long)g.frame, g.insertion_learned.decision.final_transition,
+                    g.insertion_frame.decision.final_transition, (unsigned long long)g.stats.no_camera, g.stats.reason);
             g.stats.active = g.submitted_frame == g.frame;
         }
         if (g.insertion_frame.color) g.insertion_learned = g.insertion_frame;
         g.insertion_frame = {};
         ++g.frame;
         g.jit.valid = false; // J1: the next camera block starts a new jitter sample
+        g.inline_sample_locked = false;
         if (g.scene_batches_cur) {
             g.batch_hist[g.batch_hist_n++ % 16] = static_cast<uint8_t>(g.scene_batches_cur > 255 ? 255 : g.scene_batches_cur);
             uint32_t votes[256] = {};
@@ -1386,6 +1412,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         if (g.inl.valid)
             for (UINT i = 0; i < count && !has; ++i)
                 has = lists[i] == g.inl.list && na::observe::ListRecording(lists[i]) == g.inl.rec;
+        jitter_batch(lists, count);
         lock.unlock();
         forward(queue, count, lists);
         if (!has) return;
@@ -1396,6 +1423,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         if (g.inl.history.cut) ++g.stats.cuts;
         ++g.stats.frames;
         ++g.stats.inline_frames;
+        if (g.stats.inline_jitter_x != 0 || g.stats.inline_jitter_y != 0) ++g.stats.inline_jittered;
         g.stats.active = true;
         g.slots[g.inl.slot].fence_value = g.fence_next++;
         queue->Signal(g.fence.Get(), g.slots[g.inl.slot].fence_value);
@@ -1548,6 +1576,7 @@ void Shutdown()
     g.insertion_frame = g.insertion_learned = {};
     g.inl = State::InlinePending{};
     g.inl_frame = 0;
+    g.inline_sample_locked = false;
     g.resume_reset = false;
     g.w = g.h = 0;
 }

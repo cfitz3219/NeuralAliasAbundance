@@ -104,7 +104,8 @@ int main(int argc, char** argv)
     // (Sniper Elite Resistance); DLAA must be recorded inside it, before the post
     // pass binds the colour for reading, and the game's state handed back.
     const bool inline_copy = argc > 3 && std::strcmp(argv[3], "--inline-copy") == 0;
-    const bool inline_list = inline_copy || (argc > 3 && std::strcmp(argv[3], "--inline") == 0);
+    const bool inline_record_first = argc > 3 && std::strcmp(argv[3], "--inline-record-first") == 0;
+    const bool inline_list = inline_record_first || inline_copy || (argc > 3 && std::strcmp(argv[3], "--inline") == 0);
     const bool post_reader = argc > 3 && !real_ngx && !planes && !split && !inline_list;
     test::Device d;
     if (!test::CreateDevice(d)) return test::SkipNoDevice("j2_anno_shape_test");
@@ -376,6 +377,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
     na::observe::SetLiveSelection(na::observe::IdOf(depth.Get()), na::observe::IdOf(color.Get()));
     const auto frame = [&](double cam_x) {
         d.WaitIdle();
+        const int frame_evals = fake::evals;
         if (inline_list) {
             // Pooled list objects alternate between an early write-only job and
             // the final scene/post job. Learning by object identity fails here.
@@ -403,7 +405,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         prepass.list->SetGraphicsRootSignature(rs_pre.Get());
         prepass.list->SetGraphicsRootConstantBufferView(0, cb->GetGPUVirtualAddress() + kPre);
         REQUIRE(SUCCEEDED(prepass.list->Close()));
-        {
+        if (!inline_record_first) {
             ID3D12CommandList* pl[] = {prepass.list.Get()};
             Submit(q, 1, pl, true);
         }
@@ -485,8 +487,25 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         REQUIRE(SUCCEEDED(consumer.list->Close()));
         g_forwarded.clear();
         if (inline_list) {
+            if (inline_record_first) {
+                ID3D12CommandList* pl[] = {prepass.list.Get()};
+                Submit(q, 1, pl, true); // cannot change the sample already recorded by NGX
+            }
             ID3D12CommandList* one[] = {scene.list.Get()};
             Submit(q, 1, one, true);
+            if (fake::evals > frame_evals) {
+                const double jx = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_X);
+                const double jy = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_Y);
+                uint8_t original[64]; Store(original, vp);
+                const auto f = [](const uint8_t* p, size_t i) { float v; std::memcpy(&v, p + i * 4, 4); return double(v); };
+                for (size_t block : {size_t(kBlock), size_t(kPre)}) {
+                    const auto* raster = cpu + block + kVp;
+                    const double dx = (f(raster, 3) / f(raster, 15) - f(original, 3) / f(original, 15)) * W / 2;
+                    const double dy = -(f(raster, 7) / f(raster, 15) - f(original, 7) / f(original, 15)) * H / 2;
+                    REQUIRE(std::abs(dx - jx) < 0.001 && std::abs(dy - jy) < 0.001);
+                }
+                if (inline_record_first) REQUIRE(jx == 0 && jy == 0);
+            }
         } else if (split) {
             scene2.Reset(); // more of the scene in a second submission (same camera, same targets)
             scene2.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
@@ -533,6 +552,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         CHECK(evaluations() >= evals0 + 2);
         CHECK(g_forwarded.size() == 1);              // no J2 list was inserted
         CHECK(is.inline_refused == 0);
+        if (!inline_record_first) CHECK(is.jitter_writes >= 2);
         CHECK(dev->GetDeviceRemovedReason() == S_OK); // the game's list (with our work and the restored state) ran
         return test::finish("j2_anno_shape_test (inline)");
     }

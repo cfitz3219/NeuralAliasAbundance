@@ -477,10 +477,16 @@ void write_status_line()
         WriteFile(f, "j2_frame", 8, &written, nullptr);
         WriteFile(f, j2.insertion_frame_trace, trace_len, &written, nullptr);
         WriteFile(f, "\r\n", 2, &written, nullptr);
-        const int nc = snprintf(coverage, sizeof coverage, "j2_coverage presents=%llu covered=%llu later_writes=%llu\r\n",
+        const int nc = snprintf(coverage, sizeof coverage, "j2_coverage presents=%llu covered=%llu later_writes=%llu jittered=%llu jitter=(%.4f,%.4f)\r\n",
             (unsigned long long)j2.inline_presents, (unsigned long long)j2.inline_covered,
-            (unsigned long long)j2.inline_late_writes);
+            (unsigned long long)j2.inline_late_writes, (unsigned long long)j2.inline_jittered,
+            j2.inline_jitter_x, j2.inline_jitter_y);
         if (nc > 0) WriteFile(f, coverage, static_cast<DWORD>(nc), &written, nullptr);
+        if (j2.insertion_last_miss[0]) {
+            WriteFile(f, "j2_last_miss ", 13, &written, nullptr);
+            WriteFile(f, j2.insertion_last_miss, static_cast<DWORD>(std::strlen(j2.insertion_last_miss)), &written, nullptr);
+            WriteFile(f, "\r\n", 2, &written, nullptr);
+        }
         char il[320];
         const int ni = snprintf(il, sizeof il, "j2_insertion traces=%llu changed=%llu list=%llu writes=%u reads=%u final=%u destination=%llu pipeline=%llu explicit_inline=%u\r\n",
             (unsigned long long)j2.insertion_traces, (unsigned long long)j2.insertion_changes,
