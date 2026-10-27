@@ -657,6 +657,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (!evaluated) ++g.stats.dlss_failed;
     // Diagnostic branch only: arm.txt contains an output folder. No rendering parameters change.
     static ULONGLONG last_probe = 0;
+    static wchar_t capture_folder[MAX_PATH] = {};
     if (GetTickCount64() - last_probe > 1000) {
         last_probe = GetTickCount64();
         FILE* arm = nullptr;
@@ -664,7 +665,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             wchar_t folder[MAX_PATH] = {};
             if (fgetws(folder, MAX_PATH, arm)) {
                 folder[wcscspn(folder, L"\r\n")] = 0;
-                if (!na::capture::Pending()) na::capture::Request(8, folder);
+                if (!na::capture::Pending()) { wcscpy_s(capture_folder, folder); na::capture::Request(8, folder); }
             }
             fclose(arm);
             DeleteFileW(L"C:/Users/Cort/NeuralAliasAbundance/local/blur-isolation/arm.txt");
@@ -678,7 +679,18 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         ci.render_w = ci.out_w = w; ci.render_h = ci.out_h = h;
         ci.jitter_x = e.jitter_x; ci.jitter_y = e.jitter_y;
         ci.mv_scale_x = ci.mv_scale_y = 1.0f; ci.reset = e.reset;
-        na::capture::OnEvaluate(l, ci);
+        const auto index = na::capture::GetStats().frames_evaluated;
+        if (na::capture::OnEvaluate(l, ci)) {
+            wchar_t path[MAX_PATH] = {}; swprintf_s(path, L"%s/frame%u-camera.txt", capture_folder, index);
+            FILE* f = nullptr;
+            if (_wfopen_s(&f, path, L"wt") == 0 && f) {
+                for (const auto* matrix : { &cam.inv_view_proj_current_row, &cam.view_proj_previous_row, &cam.view_proj_current_row }) {
+                    for (double v : *matrix) fprintf(f, "%.17g ", v);
+                    fprintf(f, "\n");
+                }
+                fclose(f);
+            }
+        }
     }
 
     // 5. result -> scene colour, everything back to the game's states

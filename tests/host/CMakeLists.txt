@@ -148,3 +148,9 @@ na_host_test(module_watch_test SOURCES module_watch_test.cpp LIBS host_upscalers
              ARGS "$<TARGET_FILE:sl_interposer_real>" "$<TARGET_FILE:ffx_stub>")
 add_dependencies(module_watch_test sl_interposer_real ffx_stub)
 set_tests_properties(host_module_watch_test PROPERTIES TIMEOUT 60)
+
+# Temporary capture branch only: manual diagnostic, not a CI acceptance test.
+add_executable(blur_replay blur_replay.cpp)
+target_link_libraries(blur_replay PRIVATE abundance_options host_dlss dxgi)
+target_include_directories(blur_replay PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+add_custom_command(TARGET blur_replay POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:blur_replay>")
