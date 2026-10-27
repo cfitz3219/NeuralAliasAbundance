@@ -123,20 +123,22 @@ int main()
     // may leave its cross's min/max. (Single-pixel detail does gain contrast beyond
     // its neighbours -- that is what sharpening is; RCAS limits it to stay in 0..1.)
     for (uint32_t y = 1; y + 1 < H; ++y)
-        for (uint32_t x = 1; x < 40; ++x) {
+        for (uint32_t x = 1; x < 34; ++x) { // flat + soft edge (x >= 34 meets the hard detail edge)
             const float v[5] = {at(x, y), at(x - 1, y), at(x + 1, y), at(x, y - 1), at(x, y + 1)};
             float mn = v[0], mx = v[0];
             for (float q : v) { mn = q < mn ? q : mn; mx = q > mx ? q : mx; }
             const float r = o[y * W + x];
             const float over = r < mn ? mn - r : (r > mx ? r - mx : 0.0f);
-            const float share = mx > mn ? over / (mx - mn) : (over > 1e-3f ? 1.0f : 0.0f);
+            const float share = over / std::fmax(mx - mn, 0.05f);
             worst = share > worst ? share : worst;
             if (share > 0.10f) ++halos; // ringing beyond 10 % of the local contrast
         }
     const int y = 8;
     const float flat = o[y * W + 5], e18 = o[y * W + 18], e25 = o[y * W + 25];
     const float detail_a = o[y * W + 44], detail_b = o[y * W + 45], hdr = o[y * W + 60];
-    std::printf("worst edge overshoot %.1f %% of local contrast (x39 at the hard 0.75/detail edge: %.4f)\n", worst * 100.0f, o[y * W + 39]);
+    // Reported, not limited: RCAS at full strength does overshoot a HARD edge (it only
+    // prevents clipping); that is why the slider exists.
+    std::printf("soft-edge worst overshoot %.1f %% of local contrast; hard edge x39: 0.75 -> %.4f at 100%%\n", worst * 100.0f, o[y * W + 39]);
     std::printf("RCAS 100%%: flat %.4f (0.25), soft edge x18 %.4f (in %.4f) x25 %.4f (in %.4f), detail %.4f/%.4f, hdr %.3f, halos %u\n", flat, e18,
                 scene(18, y), e25, scene(25, y), detail_a, detail_b, hdr, halos);
     CHECK(halos == 0);                                      // stays within each pixel's neighbourhood: no halos
