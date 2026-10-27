@@ -1190,13 +1190,19 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         // Scene drawing after our DLAA (this frame's insertion was too early): counted so
         // the next frame inserts after it, and reported (post_scene).
         if (dsel && csel && !g.reader_seen_cur) {
-            bool scene_here = false;
+            // A batch that CLEARS the colour starts the image over (a repeat or another
+            // view), not more of the same scene: not counted. A depth clear alone is
+            // fine (first-person weapons are drawn that way onto the same image).
+            bool scene_here = false, restarts = false;
             for (UINT i = 0; i < count; ++i) {
                 if (!lists[i]) continue;
                 if (na::observe::ListSamplesTexture(lists[i], csel)) { g.reader_seen_cur = true; break; }
-                if (na::observe::ListRendersTo(lists[i], csel, dsel)) scene_here = true;
+                if (na::observe::ListRendersTo(lists[i], csel, dsel)) {
+                    scene_here = true;
+                    if (na::observe::ListClearsTarget(lists[i], csel)) restarts = true;
+                }
             }
-            if (scene_here) { ++g.scene_batches_cur; ++g.stats.post_scene_batches; }
+            if (scene_here && !restarts) { ++g.scene_batches_cur; ++g.stats.post_scene_batches; }
         }
         lock.unlock();
         forward(queue, count, lists);

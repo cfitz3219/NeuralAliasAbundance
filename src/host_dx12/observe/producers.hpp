@@ -111,6 +111,8 @@ bool ListReferences(ID3D12CommandList* list, na_object_id id);            // the
 bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id depth);
 // An explicit SRV-table binding referenced the texture. Positive ordering hint
 // only: unobserved/bindless/late descriptor changes are not ruled out by false.
+// True when this recording cleared `target` with ClearRenderTargetView.
+bool ListClearsTarget(ID3D12CommandList* list, na_object_id target);
 bool ListSamplesTexture(ID3D12CommandList* list, na_object_id texture);
 // The subresources (mip + array slice; depth: plane 0) the last bind of `color`
 // with `depth` in this recording rendered into, from the views' first

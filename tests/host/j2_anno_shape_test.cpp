@@ -392,7 +392,7 @@ int main(int argc, char** argv)
         if (split) {
             scene2.Reset(); // more of the scene in a second submission (same camera, same targets)
             scene2.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
-            scene2.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
+            scene2.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr); // weapon-style depth clear: same image
             ID3D12DescriptorHeap* heaps3[] = {cbvh.Get()};
             scene2.list->SetDescriptorHeaps(1, heaps3);
             scene2.list->SetGraphicsRootSignature(rs.Get());

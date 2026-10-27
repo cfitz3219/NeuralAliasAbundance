@@ -90,6 +90,7 @@ struct ListState {
     // Explicit bounded SRV-table observations are a pass-order hint, not proof
     // of a particular AA shader or a requirement for DLAA eligibility.
     std::vector<na_object_id> sampled_textures;
+    std::vector<na_object_id> cleared; // render targets this recording cleared (ClearRenderTargetView)
 };
 
 struct Obj {
@@ -1999,6 +2000,7 @@ struct On<sl::list::Reset> {
                     ls->uses_complete = true;
                     ls->targets.clear();
                     ls->sampled_textures.clear();
+                    ls->cleared.clear();
                 }
                 ls->root_sig[0] = ls->root_sig[1] = nullptr;
                 ls->coverage_complete.store(cov == na::hooking::variants::Coverage::Complete);
@@ -2476,6 +2478,11 @@ struct On<sl::list::ClearRenderTargetView> {
         const float* cc = c ? c : z;
         emit_op(r, NA_OP_CLEAR_RTV, {float_bits(cc[0], cc[1]), float_bits(cc[2], cc[3])}, &v, sizeof(v), sizeof(v), 0, NA_GROUP_RESOURCE_USE);
         note_uses(l, {v.resource});
+        with_list_state(l, [&](ListState& ls) {
+            std::lock_guard<std::mutex> bl(ls.bind_m);
+            if (v.resource && ls.cleared.size() < 64 && std::find(ls.cleared.begin(), ls.cleared.end(), v.resource) == ls.cleared.end())
+                ls.cleared.push_back(v.resource);
+        });
     }
 };
 template <>
@@ -3876,6 +3883,15 @@ bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id dep
     if (!ls || !ls->recording_observed.load()) return false;
     std::lock_guard<std::mutex> bl(ls->bind_m);
     return std::any_of(ls->targets.begin(), ls->targets.end(), [&](const ListState::Target& t) { return t.same(color, depth); });
+}
+bool ListClearsTarget(ID3D12CommandList* list, na_object_id target)
+{
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return std::find(ls->cleared.begin(), ls->cleared.end(), target) != ls->cleared.end();
 }
 bool ListSamplesTexture(ID3D12CommandList* list, na_object_id texture)
 {
