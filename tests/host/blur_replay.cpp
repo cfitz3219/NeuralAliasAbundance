@@ -11,7 +11,7 @@ int main(int argc,char**argv){
  REQUIRE(na::dlss::InitOwn(dev,L"."));
  constexpr unsigned W=3440,H=1440;
  DXGI_FORMAT fmts[]={DXGI_FORMAT_R16G16B16A16_FLOAT,DXGI_FORMAT_R32_FLOAT,DXGI_FORMAT_R32G32_FLOAT};
- const char* names[]={"color","depth","motion"};
+ const char* names[]={"color","depth",mode=="composed-motion" ? "motion-corrected" : "motion"};
  test::ComPtr<ID3D12Resource> tex[3],up[3];D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[3]{};UINT64 sizes[3]{};
  std::vector<char> data[8][3];float jit[8][2]{};
  for(int k=0;k<3;k++){
@@ -36,3 +36,4 @@ int main(int argc,char**argv){
  }
  void*p=nullptr;REQUIRE(SUCCEEDED(rb->Map(0,nullptr,&p)));std::ofstream f(dest,std::ios::binary);f.write(static_cast<char*>(p),std::streamsize(so));f.close();rb->Unmap(0,nullptr);na::dlss::Shutdown();printf("replay %s: 64 evaluations, output %s\n",mode.c_str(),dest.c_str());return 0;
 }
+
