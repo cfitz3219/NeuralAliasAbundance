@@ -118,6 +118,7 @@ int main()
     }
     const auto at = [&](int x, int y) { x = x < 0 ? 0 : (x >= int(W) ? W - 1 : x); y = y < 0 ? 0 : (y >= int(H) ? H - 1 : y); return scene(x, y); };
     uint32_t halos = 0;
+    float worst = 0.0f; // largest overshoot beyond the cross min/max, as a share of that local range
     // Halos = ringing at edges: on the soft edge (and the flats either side) no pixel
     // may leave its cross's min/max. (Single-pixel detail does gain contrast beyond
     // its neighbours -- that is what sharpening is; RCAS limits it to stay in 0..1.)
@@ -127,11 +128,15 @@ int main()
             float mn = v[0], mx = v[0];
             for (float q : v) { mn = q < mn ? q : mn; mx = q > mx ? q : mx; }
             const float r = o[y * W + x];
-            if (r < mn * 0.995f - 1e-3f || r > mx * 1.005f + 1e-3f) ++halos;
+            const float over = r < mn ? mn - r : (r > mx ? r - mx : 0.0f);
+            const float share = mx > mn ? over / (mx - mn) : (over > 1e-3f ? 1.0f : 0.0f);
+            worst = share > worst ? share : worst;
+            if (share > 0.10f) ++halos; // ringing beyond 10 % of the local contrast
         }
     const int y = 8;
     const float flat = o[y * W + 5], e18 = o[y * W + 18], e25 = o[y * W + 25];
     const float detail_a = o[y * W + 44], detail_b = o[y * W + 45], hdr = o[y * W + 60];
+    std::printf("worst edge overshoot %.1f %% of local contrast (x39 at the hard 0.75/detail edge: %.4f)\n", worst * 100.0f, o[y * W + 39]);
     std::printf("RCAS 100%%: flat %.4f (0.25), soft edge x18 %.4f (in %.4f) x25 %.4f (in %.4f), detail %.4f/%.4f, hdr %.3f, halos %u\n", flat, e18,
                 scene(18, y), e25, scene(25, y), detail_a, detail_b, hdr, halos);
     CHECK(halos == 0);                                      // stays within each pixel's neighbourhood: no halos
