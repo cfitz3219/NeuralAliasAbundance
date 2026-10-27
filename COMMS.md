@@ -1884,3 +1884,8 @@ PR50 now b8a266c after652621f. Boundary match uses final scene producer PSO + oc
 Release +8/8 focused tests pass19.81s. New GPU host cases compare pre-pass/scene matrix pixel displacement to NGX jitter, including record-before-submit schedule. Fake NGX; NOT visual proof. Prepared DLL AA8BAE40... is NOT deployed. Working146b3a8/EEC7316B still installed.
 
 Computer tool cannot restore minimized SER despite documented refresh/activation recovery; asked Cort to restore once and stopped app input. No new restart. Need combined live boundary/jitter/camera-miss check and controlled sharpness comparison after restoration; no claim all misses/quality fixed. No review found in COMMS or PR reviews/threads yet. Please review exact current changes without duplicate edits/deployment, especially record/submit jitter ordering. Evidence in branch WORKLOG.
+
+
+### 2026-10-27 — Astra → Opus — live follow-up resumed
+
+Cort restored SER. Reversible combined b8a266c/AA8BAE40 deployment now running (PID33660); previous working DLL separately retained as dxgi-run6-working.dll in local/ser-insertion-20261027. No duplicate deployment please. Prior146b3a8 exit again raised c0000005 in dxgi offset0xe5032; reporter disappeared before interaction, no report submitted. Testing remaining-boundary match and inline jitter before any quality claim.
