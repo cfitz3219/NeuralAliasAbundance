@@ -3,6 +3,7 @@
 **Written by:** Claude, 2026-10-23, at Cort's direction. Incorporates Codex/Astra's recovery review (`docs/CLAUDE-HANDOFF.md`) and roadmap (`docs/INPUT-ACQUISITION-ROADMAP.md`).
 **Audience:** Claude, Astra (Codex), Gemini Argon (independent gate auditor), and Cort.
 **Status:** ACTIVE. This is the single source of truth for *what* gets built, *by whom*, and *in what order*.
+**Where we are (2026-10-26):** Phases 1–3 are done. **Live DLAA runs in Anno 1800** (J2, PR #44), a game with no DLSS of its own, and Cort has confirmed it in the game. Next is Phase 4: lock in DLAA, then Reflex, then Frame Generation, then a second-game check for universality, then DLSS upscaling. See §2, Phase 4.
 
 > **Goal:** one universal DX12 injector that obtains or synthesizes everything DLSS needs (scene color, depth, motion vectors, jitter, camera) **without per-game code**. Universal coverage is the engineering goal and working design premise.
 > **Course change (2026-10-25, Cort):** discovery uses **established, field-proven algorithms first**: ReShade `generic_depth` depth scoring, UEVR/Geo-11 combined view-projection and inverse-pair camera detection, and Special K/Luma pre-HUD boundary tracking (reference: `docs/ARGON-DROPIN-HEURISTICS.md`). Our own verification checks stay as secondary corroboration and logging, never as all-or-nothing gates that report zero in real games.
@@ -148,7 +149,45 @@ This is a bounded primary-source assessment, not a claim that no other solution 
 
 **REVIEW GATE 3 (updated by Cort, 2026-10-25):** Argon's completed audit is sufficient; no second audit or delta recheck is required. Finish the identified corrections → targeted peer verification and regression tests → test session 3 (classifier output in Anno plus one more DLSS-less game) → close gate when the existing acceptance criteria pass. Any game-test defect gets a bounded correction and affected tests, not another broad review cycle. This supersedes the general audit-recheck requirement for Gate 3; it does not claim the remaining fixes or game tests have passed.
 
-### PHASE 4: Reuse established algorithms; qualify their live integration
+### PHASE 3 and J2: DONE in Anno (Cort, 2026-10-26)
+
+Gate 3 is closed by Cort's direction. Running DLAA in Anno is a stronger proof than the paper criteria: the game's scene colour, main depth and camera were found live and fed through a successful DLSS evaluation, and the corrected result was displayed. The detailed Phase 3 criteria above are kept as history.
+
+**J2 (native DLAA in Anno)** is working and confirmed in the game. It has had no formal review gate yet; that is P4-0 below.
+
+What J2 delivered (PR #44, which carries #45, #46 and #48):
+- One NeuralAlias command list is inserted after the last game list that bound scene colour and depth together. History is advanced per Present, with at most one DLAA submission per frame.
+- The camera is learned from root and descriptor-table CBVs, including the offsets of the inverse and the projection.
+- J1 jitter: Halton(2,3) with 8 phases is written into the game's view-projection, inverse and projection. Jitter is passed to DLSS and removed from motion exactly.
+- Motion is camera reprojection composed in double precision. Sky pixels are reprojected at the far plane.
+- MSAA resolve (Astra), plus array, mip and subresource-correct colour/depth copies.
+- Negative texture LOD bias (`[j2] mip_bias`, default −1) on mip-mapped samplers and static samplers. This is what removed the still-texture blur.
+- RCAS sharpener (AMD FSR1, MIT) with a menu slider, applied before the HUD.
+- Debug views (motion, fine motion, depth) and a status line with full counters.
+- One-click install/rollback scripts (`NA-anno-dlaa.cmd`, `NA-anno-dlaa-rollback.cmd`).
+
+### PHASE 4: Feature set on the live route: lock in DLAA → Reflex → Frame Generation → second game → upscaling (Cort, 2026-10-26)
+
+Rules carried forward:
+- Reuse what already exists: the latency module, FG/presenter, NVOF, temporal_jitter, the NGX backend. Do not write new generators or solvers.
+- Each item gets its own **feature review gate**: Astra cross-review, then fixes, then Argon audit, then a single game test.
+- Restart counts follow an explicit test plan; Cort wants as few launches as possible.
+- Ownership follows the 90/10 split: Opus implements, and Astra reviews, verifies and owns the items marked for her.
+
+| ID | Owner | Task | Done when |
+|---|---|---|---|
+| **P4-0** | Opus; Astra review | **Lock in DLAA.** (a) Feature review gate for PR #44, then merge. (b) Motion for moving objects: carts, ships and people currently get camera motion only. Reuse NVOF / `motion/live_flow` on the pre-HUD scene image with per-pixel provenance (old C10). (c) Find and fix the 3–4 s freeze at map load in the observation layer. (d) Re-check the earlier flicker report. (e) Confirm the last mip-bias refinements (point-mip samplers skipped, bias set at boot) in the game. | PR #44 merged. Moving objects show no smear in the motion debug view. The load freeze is gone or measured and explained. One test run confirms all of this. |
+| **P4-1** | Opus; Astra review | **Reflex (latency).** Reuse `src/host_dx12/latency/` (NVAPI sleep mode and markers, PCL stats). Replace its TLOU-only timing adapter with J2's frame boundaries: simulation start at the previous Present, render submit at the scene submission, present markers at Present. Never override a game that already calls Reflex (`external_owner`). | The Reflex on/off/boost switch is in the menu. Measured PC latency drops in Anno. No added stutter or frame-rate loss. Disable/exit are clean. |
+| **P4-2** | Opus; Astra review + fixture tests | **Frame Generation.** Reuse `src/host_dx12/fg/` and the presenter, fed from J2's colour, depth, motion and jitter-free camera. Requires P4-0(b), because FG is very sensitive to moving-object motion, and P4-1, because NVIDIA requires Reflex with FG. Generated frames must not warp the HUD: interpolate the pre-HUD image and recomposite, or use the SDK's UI handling if that proves sufficient. The held safety items must be done first (§4): **C12-depth** (24/16-bit depth conversion; J2 currently declines those formats), **C13-subrect** (padded/DRS inputs), the V-Sync/VRR present-pacing note, and the opt-in driver preset with restore. | FG 2x in Anno with a stable HUD and no warping on moving objects or the camera. Correct pacing on VRR and with V-Sync. Latency stays acceptable with Reflex on. Disable/resize/exit are clean. |
+| **P4-3** | Astra report + verification; Opus fixes | **Second-game check (universality).** Run the same DLAA build, with no game-specific code, on one more DLSS-less DX12 game. Report which inputs were found and how. Any failure becomes a bounded, generic fix, not a per-game adapter. | DLAA works in a second game, or a precise list of generic gaps with owners. |
+| **P4-4** | Joint; ownership agreed in COMMS before edits | **DLSS upscaling (old J3).** Make the game render below output size, using SDK optimal render sizes and the engine's own resolution controls where they are discovered. Restore extents, viewports and the bias (`log2(render/display) − 1`) on disable. | Quality/Performance modes work in the first supported engine family. Resize/disable are restored correctly. Actual coverage is recorded honestly. |
+| **J4** | Joint, research only | DXIL motion injection, only if a demonstrated need remains after P4-0(b). | A timeboxed feasibility report. |
+
+**Still on hold:** Neural Rendering and Ray Reconstruction stay on hold until P4-2 ships.
+
+**Superseded by the above:** old C10 is now P4-0(b); J1 and C11 were delivered in J2; old J3 is now P4-4. The reuse sources and boundaries listed in §2 under the 2026-10-25 Phase 4 still apply.
+
+### PHASE 4 (2026-10-25 version, superseded 2026-10-26; kept for history)
 
 **2026-10-25, Cort's direction:** reuse first. Do not build another jitter generator, optical-flow solver, temporal upscaler or shader compiler. Start from the existing implementations listed below, and official SDK contracts. Phase 3 extraction remains Opus's work; this planning update does not close Gate 3 or start a game deployment.
 
@@ -174,10 +213,6 @@ This is a bounded primary-source assessment, not a claim that no other solution 
 **Ownership/attendance (updated 2026-10-25, Cort's 90/10 override — see COLLABORATION.md):** Opus leads and owns all production paths on both routes; Astra is a scoped specialist (concurrency/COM audits, CPU tests and fixtures, matrix-math verification on request, specific handed-over fixes). Previously: Opus owns motion, jitter host integration, output insertion and all transferred extraction code. Astra reviews/tests agreed changes and fixes its own defects; shared-core changes still require the existing proposal/ack process. Planning, code and automated tests need no user attendance. Reserve a rough 30–60 minute game validation window once a candidate is ready; user presence only for login or unavailable desktop input, and restart counts must follow an explicit test plan.
 
 **REVIEW GATE 4:** cross-review → fixes/regressions → Argon audit → resolve/recheck findings → test session 4 → close gate.
-
-### On hold (exists in code, not blocking the goal)
-Frame Generation, Neural Rendering, Ray Reconstruction, Reflex/latency. Keep compiling; no new work until J2 ships.
-**Before any of them is taken off hold, the "Required before un-holding FG/NR/motion" items in section 4 must be done.**
 
 ---
 
