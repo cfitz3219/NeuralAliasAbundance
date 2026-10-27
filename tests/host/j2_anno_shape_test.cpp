@@ -64,6 +64,11 @@ bool Inverse(const M& m, M& inv)
     return true;
 }
 // Reverse-Z perspective (infinite-ish far) times a rotated, translated view.
+M Proj()
+{
+    const double n = 0.5, f = 5000.0, sy = 1.0 / std::tan(0.45), sx = sy / 2.0;
+    return M{sx, 0, 0, 0, 0, sy, 0, 0, 0, 0, n / (n - f), n * f / (f - n), 0, 0, 1, 0};
+}
 M Camera(double x)
 {
     const double n = 0.5, f = 5000.0, sy = 1.0 / std::tan(0.45), sx = sy / 2.0;
@@ -244,6 +249,7 @@ int main(int argc, char** argv)
     }
     REQUIRE(SUCCEEDED(scene.list->Close()) && SUCCEEDED(consumer.list->Close()) && SUCCEEDED(prepass.list->Close()));
     na::j2::SetEnabled(true);
+    na::j2::SetJitter(true); // J1 is off by default in the game; the tests exercise it
     na::observe::SetLiveSelection(na::observe::IdOf(depth.Get()), na::observe::IdOf(color.Get()));
     const auto frame = [&](double cam_x) {
         d.WaitIdle();
@@ -254,6 +260,7 @@ int main(int argc, char** argv)
         for (int i = 0; i < 300; ++i) cpu[kBlock + i] = static_cast<uint8_t>(i * 13); // other constants before the camera
         Store(cpu + kBlock + kVp, vp);
         Store(cpu + kBlock + kVp + 128, inv);
+        Store(cpu + kBlock + kVp + 192, Proj()); // the camera's own projection, in the same block
         Store(cpu + kPre + kVp, vp); // the pre-pass's own copy of the camera
         Store(cpu + kPre + kVp + 128, inv);
         prepass.Reset(); // earlier batch: depth only, its own root signature
@@ -334,6 +341,7 @@ int main(int argc, char** argv)
     }
     CHECK(st.jitter_writes >= 2);
     CHECK(st.camera_inv_delta == 128 && st.camera_learned_hits >= 1);
+    CHECK(st.camera_proj_delta == 192 && st.jitter_proj_writes >= 1); // the separate projection is jittered too
     if (!real_ngx) {
     CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
     const double jx = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_X), jy = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_Y);

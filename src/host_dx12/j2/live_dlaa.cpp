@@ -12,6 +12,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -65,6 +66,7 @@ struct State {
     int64_t camera_offset = -1; // learned offset of the ViewProjection inside its block
     int64_t camera_param = -1;  // learned root parameter that binds the camera block
     int64_t camera_inv_delta = 64; // learned byte distance from the ViewProjection to its inverse
+    int64_t camera_proj_delta = INT64_MIN; // learned distance to the camera's own projection matrix (none = INT64_MIN)
     bool camera_table = false;  // ... through a descriptor table
     // J1: this frame's injected camera jitter (see jitter_batch).
     struct Jitter {
@@ -73,10 +75,12 @@ struct State {
         double px[2] = {0, 0};               // sample, render pixels (DLSS: colour sampled at centre - jitter)
         uint8_t vp[2][64], inv[2][64];       // original matrices as stored (row / column layout)
         uint8_t jvp[2][64], jinv[2][64];     // jittered replacements
+        bool has_proj = false;               // the camera's separate projection matrix (same block)
+        uint8_t proj[64], jproj[64];         // as the game stores it / jittered
         uint32_t phase = 0;
         int layout = 0;                      // 0 row-major, 1 column-major (as the game stores it)
     } jit;
-    bool jitter_on = true;
+    bool jitter_on = false; // J1 off by default until it measurably helps (Cort, 2026-10-26: sharper without)
     Stats stats;
 };
 // Never destroyed: at process exit the observation hooks' own state may already
@@ -214,6 +218,21 @@ void store_matrix(const na::camera::Matrix& m, na::camera::Layout layout, uint8_
         }
 }
 
+// P is this camera's projection when P^-1 * VP is a rigid view (VP = P * V).
+bool is_projection_of(const na::camera::Matrix& p, const na::camera::Matrix& vp)
+{
+    na::camera::Matrix pinv{}, v{};
+    if (!na::camera::Invert(p, pinv)) return false;
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c) {
+            double a = 0;
+            for (int k = 0; k < 4; ++k) a += pinv[r * 4 + k] * vp[k * 4 + c];
+            v[r * 4 + c] = a;
+        }
+    na::camera::Candidate cand{};
+    return na::camera::RigidView(v, cand);
+}
+
 // A camera block's bytes hold a VP + inverse at the learned offset: start this frame's jitter.
 // Last main camera the jitter started from (a block outside the learned camera
 // slot may start a frame only if it shows that same camera, not a light's).
@@ -283,6 +302,22 @@ bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& bytes,
         std::memcpy(j.vp[j.layout], bytes.data() + g.camera_offset, 64);
         if (inv_here && na::camera::IsInversePair(m, na::camera::LoadMatrix(bytes, static_cast<size_t>(io), layout)))
             std::memcpy(j.inv[j.layout], bytes.data() + io, 64);
+        // The camera's separate projection (passes that multiply by P themselves): T * P.
+        j.has_proj = false;
+        const int64_t po = g.camera_proj_delta == INT64_MIN ? -1 : g.camera_offset + g.camera_proj_delta;
+        if (po >= 0 && static_cast<uint64_t>(po) + 64 <= n) {
+            const auto pm = na::camera::LoadMatrix(bytes, static_cast<size_t>(po), layout);
+            if (is_projection_of(pm, m)) {
+                std::array<double, 16> ps{};
+                for (int i = 0; i < 16; ++i) ps[i] = pm[i];
+                const auto jp = neural_alias::jitter_projection(ps, js, g.w, g.h);
+                na::camera::Matrix jpm{};
+                for (int i = 0; i < 16; ++i) jpm[i] = jp[i];
+                std::memcpy(j.proj, bytes.data() + po, 64);
+                store_matrix(jpm, layout, j.jproj);
+                j.has_proj = true;
+            }
+        }
         j.valid = true;
         return true;
     }
@@ -347,6 +382,7 @@ void jitter_batch(ID3D12CommandList* const* lists, UINT count)
                 const uint8_t* rep = nullptr;
                 if (!std::memcmp(view.data() + o, g.jit.vp[l], 64)) rep = g.jit.jvp[l];
                 else if (!std::memcmp(view.data() + o, g.jit.inv[l], 64)) rep = g.jit.jinv[l];
+                else if (l == 0 && g.jit.has_proj && !std::memcmp(view.data() + o, g.jit.proj, 64)) { rep = g.jit.jproj; ++g.stats.jitter_proj_writes; }
                 if (rep && na::observe::WriteBuffer(k->res, k->off + o, rep, 64) == 64) ++g.stats.jitter_writes;
                 if (rep) break;
             }
@@ -461,6 +497,13 @@ bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth
             if (c.kind != na::camera::Kind::ViewProjection || !c.has_inverse_pair) continue;
             g.camera_offset = static_cast<int64_t>(c.byte_offset);
             g.camera_inv_delta = static_cast<int64_t>(c.inverse_byte_offset) - static_cast<int64_t>(c.byte_offset);
+            g.camera_proj_delta = INT64_MIN;
+            for (const auto& pc : scan.candidates)
+                if (pc.kind == na::camera::Kind::Projection && pc.layout == c.layout && is_projection_of(pc.matrix, c.matrix)) {
+                    g.camera_proj_delta = static_cast<int64_t>(pc.byte_offset) - static_cast<int64_t>(c.byte_offset);
+                    break;
+                }
+            g.stats.camera_proj_delta = g.camera_proj_delta == INT64_MIN ? 0 : g.camera_proj_delta;
             g.stats.camera_inv_delta = g.camera_inv_delta;
             ++g.stats.camera_scans;
             g.camera_param = static_cast<int64_t>(o->param);

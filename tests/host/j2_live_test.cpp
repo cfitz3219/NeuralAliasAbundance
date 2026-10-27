@@ -176,6 +176,7 @@ int main()
     };
 
     na::j2::SetEnabled(true);
+    na::j2::SetJitter(true); // J1 is off by default in the game; the tests exercise it
     // No discovery picks yet: untouched.
     na::observe::SetLiveSelection(0, 0);
     frame(0);
