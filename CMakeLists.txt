@@ -166,6 +166,7 @@ add_library(host_dx12 STATIC
   src/host_dx12/fg/preset_profile.cpp
   src/host_dx12/nr/nr_pass.cpp
   src/host_dx12/j2/live_dlaa.cpp
+  src/host_dx12/j2/nis_sharpen.cpp
   src/host_dx12/motion/live_flow.cpp
   src/host_dx12/latency/nvidia_latency.cpp
   src/host_dx12/latency/pcl_stats.cpp
@@ -179,6 +180,8 @@ else()
   target_sources(host_dx12 PRIVATE src/host_dx12/host_boot/adapter_stub.cpp)
   message(STATUS "Game adapter: none (host stub)")
 endif()
+# NVIDIA Image Scaling (MIT, vendored): sharpen-only stage of J2's Sharpness slider.
+target_include_directories(host_dx12 SYSTEM PRIVATE third_party/nis)
 target_link_libraries(host_dx12
   PUBLIC abundance_options host_hooking host_settings host_capture host_nvof core_gpu imgui nvapi_headers host_dlss host_upscalers host_observe_producers
          d3d12 dxgi d3dcompiler user32 gdi32 shell32 ole32 bcrypt dbghelp winmm)

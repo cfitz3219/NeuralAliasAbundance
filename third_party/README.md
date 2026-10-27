@@ -9,6 +9,7 @@ Re-vendored 2026-10-23 after the crash, at the same pins the original project re
 | Streamline | v1.1.1 | 5bac43f464f53bc0583bab8df506b788d8d14c3c | MIT | `include/` headers only |
 | NVAPI | 2026-10 main | 70d337db9186e968eab622f7e786de7e437faf3d | MIT | headers only (`nvapi.h`, `NvApiDriverSettings.h`, …); the runtime is the driver's `nvapi64.dll`, loaded dynamically |
 | FidelityFX SDK (ffx-api) | main 2026-06-24 | 60f4ea81909200d8542eca14dccb2628b763a9a3 | MIT | 3 headers only (`ffx_api.h`, `ffx_api_types.h`, `ffx_upscale.h`), SDK layout kept so relative includes work; the runtime is the game's own `amd_fidelityfx_*_dx12.dll` (C7) |
+| NVIDIA Image Scaling (NIS) | v1.0.3 | 35e13ba316c98eeecf16f37eae70ce88019911f6 | MIT | `NIS_Scaler.h`, `NIS_Config.h`, `NIS_Main.hlsl` (reference), `licence.txt`; `nis_scaler_embed.hpp` is generated from `NIS_Scaler.h` by `make_embed.py` (J2 Sharpness 101–200 %: sharpen-only, compiled at run time) |
 
 Streamline rule (unchanged): TLOU ships interposer 1.4.7; no public 1.4.7 tag exists. Wrappers may forward
 without interpreting SL structs; interpreting any field requires runtime validation evidence first.

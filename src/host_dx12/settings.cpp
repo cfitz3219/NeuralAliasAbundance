@@ -58,7 +58,7 @@ void load_from(const wchar_t* ini, bool only_if_present)
     g_settings.nr_intensity.store(pct(L"intensity", 100));
     {
         const int v = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpness", 100, ini));
-        g_settings.j2_sharpness.store(static_cast<uint32_t>(v < 0 ? 0 : (v > 100 ? 100 : v)));
+        g_settings.j2_sharpness.store(static_cast<uint32_t>(v < 0 ? 0 : (v > 200 ? 200 : v))); // 101..200 adds NIS
         // [j2] preset: a letter J..M (NGX value = letter - 'A' + 1), "default", or a number.
         wchar_t pz[16] = {};
         GetPrivateProfileStringW(L"j2", L"preset", L"L", pz, 16, ini);

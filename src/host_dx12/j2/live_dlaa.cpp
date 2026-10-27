@@ -1,5 +1,6 @@
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/msaa_resolve.hpp"
+#include "host_dx12/j2/nis_sharpen.hpp"
 
 #include "core/motion_arbiter_gpu.hpp"
 #include "core/temporal_jitter.hpp"
@@ -394,6 +395,8 @@ bool rcas_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Resou
     l->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
     return true;
 }
+// 101..200 %: NVIDIA Image Scaling sharpen-only on top of full-strength RCAS.
+na::j2::NisSharpen g_nis;
 bool rcas_record(ID3D12GraphicsCommandList* l, uint32_t percent, DXGI_FORMAT fmt)
 {
     return g.sharp && rcas_dispatch(l, g.output.Get(), g.sharp.Get(), g.w, g.h, percent, fmt, g.slot);
@@ -1008,10 +1011,28 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             debug_record(l, dv, cf); // replaces the DLAA result with the debug picture
         } else if (const uint32_t pct = na::settings::Get().j2_sharpness.load(std::memory_order_relaxed)) {
             // RCAS: output -> sharp, then back into output so the write-back path is unchanged.
+            // Above 100 %, NIS sharpens sharp -> output instead of the copy.
             b.push_back(uav_barrier(g.output.Get()));
             add(b, g.output.Get(), UAV, NPSR);
             flush(l, b);
-            if (rcas_record(l, pct, cf)) {
+            if (pct > 100 && rcas_record(l, 100, cf)) {
+                b.push_back(uav_barrier(g.sharp.Get()));
+                add(b, g.sharp.Get(), UAV, NPSR);
+                add(b, g.output.Get(), NPSR, UAV);
+                flush(l, b);
+                if (g_nis.Dispatch(g.device.Get(), l, g.sharp.Get(), g.output.Get(), g.w, g.h, cf, is_float_color(cf), pct, g.slot)) {
+                    ++g.stats.nis_frames;
+                    add(b, g.sharp.Get(), NPSR, UAV);
+                } else { // NIS unavailable: keep the RCAS result
+                    add(b, g.output.Get(), UAV, DST);
+                    add(b, g.sharp.Get(), NPSR, SRC);
+                    flush(l, b);
+                    l->CopyResource(g.output.Get(), g.sharp.Get());
+                    add(b, g.output.Get(), DST, UAV);
+                    add(b, g.sharp.Get(), SRC, UAV);
+                }
+                ++g.stats.sharpened_frames;
+            } else if (pct <= 100 && rcas_record(l, pct, cf)) {
                 b.push_back(uav_barrier(g.sharp.Get()));
                 add(b, g.sharp.Get(), UAV, SRC);
                 add(b, g.output.Get(), NPSR, DST);
@@ -1094,6 +1115,13 @@ bool RecordRcasForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, I
     if (!g.device) g.device = device;
     if (g.device.Get() != device) return false;
     return rcas_dispatch(list, in, out, w, h, percent, fmt, 0);
+}
+bool RecordNisForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* in, ID3D12Resource* out,
+                       uint32_t w, uint32_t h, uint32_t percent, DXGI_FORMAT fmt, bool hdr)
+{
+    std::lock_guard<std::mutex> lock(g.m);
+    if (percent > 100 && !g_nis.WaitCompiled()) return false;
+    return g_nis.Dispatch(device, list, in, out, w, h, fmt, hdr, percent, 0);
 }
 void SetDebugView(int mode) { g_debug_view.store(mode < 0 || mode > 3 ? 0 : mode); }
 int DebugView() { return g_debug_view.load(); }
@@ -1241,6 +1269,7 @@ void Shutdown()
     g.arbiter = na::motion::gpu::Arbiter{};
     g_dbg = DebugPass{};
     g_rcas = RcasPass{};
+    g_nis.Reset();
     g.arbiter_ok = false;
     g.tracker.Reset();
     g.frame = 1;
