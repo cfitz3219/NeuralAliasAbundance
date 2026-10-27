@@ -1,6 +1,7 @@
 #include "host_dx12/j2/live_dlaa.hpp"
 
 #include "core/motion_arbiter_gpu.hpp"
+#include "host_dx12/capture/frame_capture.hpp"
 #include "core/temporal_jitter.hpp"
 #include "host_dx12/depth_format.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
@@ -654,6 +655,32 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     e.auto_exposure = true;
     const bool evaluated = na::dlss::Evaluate(l, e);
     if (!evaluated) ++g.stats.dlss_failed;
+    // Diagnostic branch only: arm.txt contains an output folder. No rendering parameters change.
+    static ULONGLONG last_probe = 0;
+    if (GetTickCount64() - last_probe > 1000) {
+        last_probe = GetTickCount64();
+        FILE* arm = nullptr;
+        if (_wfopen_s(&arm, L"C:/Users/Cort/NeuralAliasAbundance/local/blur-isolation/arm.txt", L"rt") == 0 && arm) {
+            wchar_t folder[MAX_PATH] = {};
+            if (fgetws(folder, MAX_PATH, arm)) {
+                folder[wcscspn(folder, L"\r\n")] = 0;
+                if (!na::capture::Pending()) na::capture::Request(8, folder);
+            }
+            fclose(arm);
+            DeleteFileW(L"C:/Users/Cort/NeuralAliasAbundance/local/blur-isolation/arm.txt");
+        }
+    }
+    if (evaluated && na::capture::Pending()) {
+        b.push_back(uav_barrier(g.output.Get()));
+        flush(l, b);
+        na::capture::EvalInputs ci{};
+        ci.color = e.color; ci.depth = e.depth; ci.motion = e.motion; ci.output = e.output;
+        ci.render_w = ci.out_w = w; ci.render_h = ci.out_h = h;
+        ci.jitter_x = e.jitter_x; ci.jitter_y = e.jitter_y;
+        ci.mv_scale_x = ci.mv_scale_y = 1.0f; ci.reset = e.reset;
+        na::capture::OnEvaluate(l, ci);
+    }
+
     // 5. result -> scene colour, everything back to the game's states
     if (evaluated) {
         b.push_back(uav_barrier(g.output.Get()));

@@ -24,6 +24,8 @@ struct Plane {
 };
 
 struct Frame {
+    ComPtr<ID3D12CommandAllocator> present_alloc;
+    ComPtr<ID3D12GraphicsCommandList> present_list;
     uint32_t index = 0;
     EvalInputs in{};
     std::vector<Plane> planes; // color, depth, motion, dlss_output, backbuffer
@@ -239,12 +241,15 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer)
     std::lock_guard<std::mutex> lock(g.m);
     if (!g.current || !g.device) return;
     std::unique_ptr<Frame> f = std::move(g.current);
-    g.alloc->Reset();
-    g.list->Reset(g.alloc.Get(), nullptr);
+    // Capture lists/allocators live with their frame until its fence completes.
+    if (FAILED(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&f->present_alloc))) ||
+        FAILED(g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, f->present_alloc.Get(), nullptr,
+                                           IID_PPV_ARGS(&f->present_list)))) { ++g.errors; return; }
+    auto* capture_list = f->present_list.Get();
     if (backbuffer)
-        record_plane(g.list.Get(), backbuffer, D3D12_RESOURCE_STATE_PRESENT, "backbuffer", f->planes[4]);
-    g.list->Close();
-    ID3D12CommandList* lists[] = {g.list.Get()};
+        record_plane(capture_list, backbuffer, D3D12_RESOURCE_STATE_PRESENT, "backbuffer", f->planes[4]);
+    capture_list->Close();
+    ID3D12CommandList* lists[] = {capture_list};
     queue->ExecuteCommandLists(1, lists);
     f->fence_value = g.fence_next++;
     queue->Signal(g.fence.Get(), f->fence_value);
