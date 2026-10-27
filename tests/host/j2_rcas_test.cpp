@@ -1,7 +1,8 @@
 // J2 sharpening (RCAS, AMD FidelityFX FSR1 algorithm) on a real D3D12 device:
 //   - 0 % records nothing (the DLAA result is left exactly as it is);
 //   - 100 % raises contrast across a soft edge and in fine detail;
-//   - no halos: every output pixel stays inside the min/max of its 5-tap cross;
+//   - no halos: across a soft edge every output pixel stays inside the min/max of
+//     its 5-tap cross; single-pixel detail gains contrast (never below zero);
 //   - flat areas stay flat; HDR values above 1 survive (Reinhard round trip).
 #include "test_support.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
@@ -117,8 +118,11 @@ int main()
     }
     const auto at = [&](int x, int y) { x = x < 0 ? 0 : (x >= int(W) ? W - 1 : x); y = y < 0 ? 0 : (y >= int(H) ? H - 1 : y); return scene(x, y); };
     uint32_t halos = 0;
+    // Halos = ringing at edges: on the soft edge (and the flats either side) no pixel
+    // may leave its cross's min/max. (Single-pixel detail does gain contrast beyond
+    // its neighbours -- that is what sharpening is; RCAS limits it to stay in 0..1.)
     for (uint32_t y = 1; y + 1 < H; ++y)
-        for (uint32_t x = 1; x + 1 < W; ++x) {
+        for (uint32_t x = 1; x < 40; ++x) {
             const float v[5] = {at(x, y), at(x - 1, y), at(x + 1, y), at(x, y - 1), at(x, y + 1)};
             float mn = v[0], mx = v[0];
             for (float q : v) { mn = q < mn ? q : mn; mx = q > mx ? q : mx; }
@@ -133,7 +137,8 @@ int main()
     CHECK(halos == 0);                                      // stays within each pixel's neighbourhood: no halos
     CHECK(std::fabs(flat - 0.25f) < 2e-3f);                 // flat stays flat
     CHECK(e18 < scene(18, y) - 0.003f && e25 > scene(25, y) + 0.003f); // the soft edge gets steeper (crisper)
-    CHECK(std::fabs(detail_a - detail_b) >= std::fabs(scene(44, y) - scene(45, y)) - 0.01f); // detail never loses contrast
+    CHECK(std::fabs(detail_a - detail_b) > std::fabs(scene(44, y) - scene(45, y)) + 0.05f); // fine detail gains contrast
+    CHECK(detail_a >= 0.0f && detail_b >= 0.0f);           // ...without going negative
     CHECK(std::fabs(hdr - 4.0f) < 0.05f);                   // HDR above 1 survives
     return test::finish("j2_rcas_test");
 }
