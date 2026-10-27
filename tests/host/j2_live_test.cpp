@@ -246,12 +246,21 @@ int main()
     CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 1);
     na::j2::OnPresent(d.queue.Get());
     na::observe::SetLiveSelection(0, 0);
-    frame(500.5); // an unprocessed game frame must not advance camera history
+    frame(500.5); // an unprocessed game frame must not advance camera history...
     const auto before_gap = na::j2::GetStats().frames;
     na::j2::OnPresent(d.queue.Get());
     na::observe::SetLiveSelection(na::observe::IdOf(depth.Get()), na::observe::IdOf(color.Get()));
-    frame(501);
+    frame(500.6);
     CHECK(na::j2::GetStats().frames == before_gap + 1);
+    // ...but it does not reset either: DLSS's history and the tracker's previous
+    // camera are both the last evaluated frame, so motion stays correct.
+    CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
+    // A long gap (more than 4 unprocessed game frames) starts over.
+    na::observe::SetLiveSelection(0, 0);
+    for (int k = 0; k < 6; ++k) { na::j2::OnPresent(d.queue.Get()); frame(500.7); }
+    na::j2::OnPresent(d.queue.Get());
+    na::observe::SetLiveSelection(na::observe::IdOf(depth.Get()), na::observe::IdOf(color.Get()));
+    frame(501);
     CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 1);
     // Debug views (motion / fine motion / depth) record and close cleanly.
     for (int dv = 1; dv <= 3; ++dv) {
