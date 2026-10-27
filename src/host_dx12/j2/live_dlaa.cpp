@@ -1219,7 +1219,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         return;
     }
     int scene = -1;
-    bool before_reader = false;
+    bool before_reader = false, restarts = false;
     for (UINT i = 0; i < count; ++i) {
         // Prefer the last scene writer BEFORE the first explicit downstream
         // reader (AA, tonemap, etc.). A postprocess list may rebind the scene RTV
@@ -1228,9 +1228,13 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
             before_reader = true;
             break;
         }
-        if (lists[i] && na::observe::ListRendersTo(lists[i], color_id, depth_id)) scene = static_cast<int>(i);
+        if (lists[i] && na::observe::ListRendersTo(lists[i], color_id, depth_id)) {
+            scene = static_cast<int>(i);
+            if (na::observe::ListClearsTarget(lists[i], color_id)) restarts = true;
+        }
     }
-    if (scene >= 0 && !g.reader_seen_cur) ++g.scene_batches_cur;
+    // A batch that clears the colour starts the image over: it is scene batch 1 again.
+    if (scene >= 0 && !g.reader_seen_cur) g.scene_batches_cur = restarts ? 1 : g.scene_batches_cur + 1;
     if (before_reader) g.reader_seen_cur = true;
     // More scene batches are expected this frame (the last frame had them) and
     // post-processing has not started: DLAA waits for the last one.
