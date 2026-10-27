@@ -95,7 +95,10 @@ int main(int argc, char** argv)
     // --planes: depth's two planes (depth, stencil) are transitioned by separate
     // per-subresource barriers, as Sniper Elite Resistance does.
     const bool planes = argc > 3 && std::strcmp(argv[3], "--planes") == 0;
-    const bool post_reader = argc > 3 && !real_ngx && !planes;
+    // --split: the scene is drawn across two submissions per frame (Sniper Elite
+    // Resistance); DLAA must follow the second one, before the post pass.
+    const bool split = argc > 3 && std::strcmp(argv[3], "--split") == 0;
+    const bool post_reader = argc > 3 && !real_ngx && !planes && !split;
     test::Device d;
     if (!test::CreateDevice(d)) return test::SkipNoDevice("j2_anno_shape_test");
     if (real_ngx) {
@@ -304,8 +307,9 @@ int main(int argc, char** argv)
     REQUIRE(SUCCEEDED(cb->Map(0, nullptr, reinterpret_cast<void**>(&cpu))) && cpu);
 
     // An earlier submission leaves colour in RENDER_TARGET and depth in DEPTH_WRITE.
-    test::List setup, scene, consumer, prepass;
-    REQUIRE(setup.Create(dev) && scene.Create(dev) && consumer.Create(dev) && prepass.Create(dev));
+    test::List setup, scene, consumer, prepass, scene2;
+    REQUIRE(setup.Create(dev) && scene.Create(dev) && consumer.Create(dev) && prepass.Create(dev) && scene2.Create(dev));
+    REQUIRE(SUCCEEDED(scene2.list->Close()));
     REQUIRE(SUCCEEDED(setup.list->Close()));
     {
         setup.Reset(); // recorded after a Reset, like a game's reused list
@@ -384,9 +388,25 @@ int main(int argc, char** argv)
             consumer.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
         }
         REQUIRE(SUCCEEDED(consumer.list->Close()));
-        ID3D12CommandList* lists[] = {scene.list.Get(), consumer.list.Get()};
         g_forwarded.clear();
-        Submit(q, 2, lists, true);
+        if (split) {
+            scene2.Reset(); // more of the scene in a second submission (same camera, same targets)
+            scene2.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+            scene2.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
+            ID3D12DescriptorHeap* heaps3[] = {cbvh.Get()};
+            scene2.list->SetDescriptorHeaps(1, heaps3);
+            scene2.list->SetGraphicsRootSignature(rs.Get());
+            scene2.list->SetGraphicsRootDescriptorTable(0, cbvh->GetGPUDescriptorHandleForHeapStart());
+            REQUIRE(SUCCEEDED(scene2.list->Close()));
+            ID3D12CommandList* first[] = {scene.list.Get()};
+            Submit(q, 1, first, true);
+            ID3D12CommandList* second[] = {scene2.list.Get(), consumer.list.Get()};
+            g_forwarded.clear();
+            Submit(q, 2, second, true);
+        } else {
+            ID3D12CommandList* lists[] = {scene.list.Get(), consumer.list.Get()};
+            Submit(q, 2, lists, true);
+        }
         na::j2::OnPresent(q);
         d.WaitIdle();
         const auto ps = na::observe::GetProducerStats();
@@ -401,6 +421,19 @@ int main(int argc, char** argv)
     };
     const auto evaluations = [&]() -> uint64_t { return real_ngx ? na::dlss::GetStats().evaluates : uint64_t(fake::evals); };
     const uint64_t evals0 = evaluations();
+    if (split) {
+        for (int f = 0; f < 4; ++f) REQUIRE(frame(0.25 * f) == 0);
+        const auto ss = na::j2::GetStats();
+        std::printf("split: frames %llu, scene batches %u (max %u), waited %llu, after DLAA %llu, last forward %zu lists\n",
+                    (unsigned long long)ss.frames, ss.scene_batches, ss.scene_batches_max, (unsigned long long)ss.waited_batches,
+                    (unsigned long long)ss.post_scene_batches, g_forwarded.size());
+        CHECK(ss.scene_batches == 2);
+        CHECK(ss.post_scene_batches == 1);          // only the first frame (nothing learned yet) was early
+        CHECK(ss.waited_batches >= 3);              // frames 2..4 skip the first scene submission...
+        CHECK(ss.frames == 4 && evaluations() == evals0 + 4);
+        CHECK(g_forwarded.size() == 3 && g_forwarded[0] == scene2.list.Get() && g_forwarded[2] == consumer.list.Get()); // ...and follow the second
+        return test::finish("j2_anno_shape_test (split)");
+    }
     REQUIRE(frame(0) == 0);
     auto st = na::j2::GetStats();
     CHECK(g_forwarded.size() == 3 && st.frames == 1 && evaluations() == evals0 + 1);

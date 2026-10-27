@@ -68,6 +68,11 @@ struct State {
     na::camera::CameraTracker tracker;
     uint64_t frame = 1;             // game Present interval, not Execute attempt
     uint64_t submitted_frame = 0;   // last interval that actually submitted DLAA
+    // Games may draw the scene across several submissions per frame (Sniper Elite
+    // Resistance). DLAA belongs after the LAST of them, before post-processing
+    // reads the colour. Counted per frame; the previous frame's count is the target.
+    uint32_t scene_batches_cur = 0, scene_batches_target = 0;
+    bool reader_seen_cur = false;   // post-processing already sampled the colour this frame
     int64_t camera_offset = -1; // learned offset of the ViewProjection inside its block
     int64_t camera_param = -1;  // learned root parameter that binds the camera block
     int64_t camera_inv_delta = 64; // learned byte distance from the ViewProjection to its inverse
@@ -1152,6 +1157,13 @@ void OnPresent(ID3D12CommandQueue* queue)
     if (queue && g.queue.Get() == queue) {
         ++g.frame;
         g.jit.valid = false; // J1: the next camera block starts a new jitter sample
+        if (g.scene_batches_cur) {
+            g.scene_batches_target = g.scene_batches_cur;
+            g.stats.scene_batches = g.scene_batches_cur;
+            if (g.scene_batches_cur > g.stats.scene_batches_max) g.stats.scene_batches_max = g.scene_batches_cur;
+        }
+        g.scene_batches_cur = 0;
+        g.reader_seen_cur = false;
     }
 }
 
@@ -1172,10 +1184,19 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     ++g.stats.submissions;
     if (g.submitted_frame == g.frame) {
         ++g.stats.duplicate_submissions;
-        if (g.jitter_on) {
-            uint64_t dsel = 0, csel = 0;
-            na::observe::GetLiveSelection(&dsel, &csel);
-            count_post_dlaa(lists, 0, count, dsel); // later batches of a frame whose DLAA already ran
+        uint64_t dsel = 0, csel = 0;
+        na::observe::GetLiveSelection(&dsel, &csel);
+        if (g.jitter_on) count_post_dlaa(lists, 0, count, dsel); // later batches of a frame whose DLAA already ran
+        // Scene drawing after our DLAA (this frame's insertion was too early): counted so
+        // the next frame inserts after it, and reported (post_scene).
+        if (dsel && csel && !g.reader_seen_cur) {
+            bool scene_here = false;
+            for (UINT i = 0; i < count; ++i) {
+                if (!lists[i]) continue;
+                if (na::observe::ListSamplesTexture(lists[i], csel)) { g.reader_seen_cur = true; break; }
+                if (na::observe::ListRendersTo(lists[i], csel, dsel)) scene_here = true;
+            }
+            if (scene_here) { ++g.scene_batches_cur; ++g.stats.post_scene_batches; }
         }
         lock.unlock();
         forward(queue, count, lists);
@@ -1197,16 +1218,23 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         // Prefer the last scene writer BEFORE the first explicit downstream
         // reader (AA, tonemap, etc.). A postprocess list may rebind the scene RTV
         // at its end; that rebind must not move us past its earlier read.
-        if (scene >= 0 && na::observe::ListSamplesTexture(lists[i], color_id)) {
+        if (lists[i] && (scene >= 0 || g.scene_batches_cur) && na::observe::ListSamplesTexture(lists[i], color_id)) {
             before_reader = true;
             break;
         }
         if (lists[i] && na::observe::ListRendersTo(lists[i], color_id, depth_id)) scene = static_cast<int>(i);
     }
+    if (scene >= 0 && !g.reader_seen_cur) ++g.scene_batches_cur;
+    if (before_reader) g.reader_seen_cur = true;
+    // More scene batches are expected this frame (the last frame had them) and
+    // post-processing has not started: DLAA waits for the last one.
+    const bool wait_later = scene >= 0 && !before_reader && g.scene_batches_cur < g.scene_batches_target;
     ID3D12GraphicsCommandList* ours = nullptr;
     PendingHistory pending;
     if (scene < 0) {
         ++g.stats.no_scene_list;
+    } else if (wait_later) {
+        ++g.stats.waited_batches;
     } else if (!ensure_device(queue)) {
         // reason set
     } else {
@@ -1225,8 +1253,8 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
             g.stats.later_passes = na::observe::ListTargetsAfter(lists[scene], color_id, depth_id);
         }
     }
-    g.stats.active = ours != nullptr;
-    if (scene >= 0) g.jit.valid = false; // the scene closes this frame's jitter: the next camera block starts a new sample
+    if (!wait_later) g.stats.active = ours != nullptr;
+    if (scene >= 0 && !wait_later) g.jit.valid = false; // the scene closes this frame's jitter: the next camera block starts a new sample
     if (!ours) {
         lock.unlock();
         forward(queue, count, lists);
@@ -1282,6 +1310,8 @@ void Shutdown()
     g.tracker.Reset();
     g.frame = 1;
     g.submitted_frame = 0;
+    g.scene_batches_cur = g.scene_batches_target = 0;
+    g.reader_seen_cur = false;
     g.resume_reset = false;
     g.w = g.h = 0;
 }

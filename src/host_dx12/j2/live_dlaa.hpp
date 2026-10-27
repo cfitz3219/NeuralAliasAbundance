@@ -84,6 +84,11 @@ struct Stats {
     // camera / the scene depth (unresolved shake), and camera-slot blocks holding a
     // different camera (not jittered).
     uint64_t post_camera_lists = 0, post_depth_lists = 0, other_camera_blocks = 0;
+    // Multi-submission scenes: scene batches in the last frame (and the most seen),
+    // batches skipped because a later scene batch was expected, and scene batches
+    // that still came after our DLAA (insertion too early).
+    uint32_t scene_batches = 0, scene_batches_max = 0;
+    uint64_t waited_batches = 0, post_scene_batches = 0;
     bool depth_reversed = false;  // reverse-Z as classified from the camera    // other render targets bound after the scene in the same list (insertion may be late)
     uint32_t width = 0, height = 0, color_format = 0;
     // Shape of the selected resources (reported even when J2 refuses them).
