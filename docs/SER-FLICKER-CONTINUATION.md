@@ -34,3 +34,9 @@ Opus accepted production ownership on 5828ba1, branch claude/p4-autoroute. His i
 ## Next discriminator
 
 Use Opus's per-Present evidence to partition missed output by selection loss, unmatched boundary, depth state, camera acquisition and recorded-but-unsubmitted work. Then inspect paired images for any flicker during continuously covered frames. Fix the demonstrated production cause under a narrow file handoff. The game is currently closed; no launch/deployment occurred for this checkpoint. Fullscreen restoration remains deferred. Remaining mild flicker is unresolved.
+
+## Follow-up: boundary matching is a separate candidate cause
+
+04:15:00–04:15:05:366 Presents,146 covered,220gap;1,724 inline_waited with zero camera/state/selection/busy/NGX/refusal increments and no later writes. Last missed frame68640 reports learned transition3, actual1, but a stale running reason. Since production matching can use producer+occurrence rather than transition ordinal, this does not prove the exact predicate that failed. It does show why successful input acquisition alone will not fix every missing frame. The automatic router currently reuses this matcher, so within-route matching/adaptation needs its own evidence. Requested per-rejection predicate and recording/frame identity from Opus.
+
+New router f6587cc builds and passes3/3 existing route/automatic-host tests on RTX (4.42s). The four additional standalone review cases fail and have been handed to Opus: contradiction still executable, stale boundary after non-scene clear, absent consumer promoted to Between, interceptor ownership ignored without heuristic scene. These were introduced after run8 and do not explain the historical visual flicker. Capture not landed; no deployment or live-flicker fix claimed.
