@@ -87,7 +87,7 @@ struct Stats {
     // Multi-submission scenes: scene batches in the last frame (and the most seen),
     // batches skipped because a later scene batch was expected, and scene batches
     // that still came after our DLAA (insertion too early).
-    uint32_t scene_batches = 0, scene_batches_max = 0;
+    uint32_t scene_batches = 0, scene_batches_max = 0, scene_batches_target = 0;
     uint64_t waited_batches = 0, post_scene_batches = 0;
     bool depth_reversed = false;  // reverse-Z as classified from the camera    // other render targets bound after the scene in the same list (insertion may be late)
     uint32_t width = 0, height = 0, color_format = 0;

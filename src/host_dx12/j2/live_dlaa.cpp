@@ -71,8 +71,13 @@ struct State {
     // Games may draw the scene across several submissions per frame (Sniper Elite
     // Resistance). DLAA belongs after the LAST of them, before post-processing
     // reads the colour. Counted per frame; the previous frame's count is the target.
+    // The target is the most common count over the last 16 frames (ties: the
+    // smaller), so one odd frame cannot make DLAA alternate early/late/missing.
+    // Mid-frame readers of the colour (refraction, reflections) do not end the
+    // scene: Sniper Elite Resistance samples it between its scene submissions.
     uint32_t scene_batches_cur = 0, scene_batches_target = 0;
-    bool reader_seen_cur = false;   // post-processing already sampled the colour this frame
+    uint8_t batch_hist[16] = {};
+    uint32_t batch_hist_n = 0;
     int64_t camera_offset = -1; // learned offset of the ViewProjection inside its block
     int64_t camera_param = -1;  // learned root parameter that binds the camera block
     int64_t camera_inv_delta = 64; // learned byte distance from the ViewProjection to its inverse
@@ -912,8 +917,12 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     const double zero[2] = {0, 0};
     const double* injected = g_injected ? g.jit.px : zero; // J1: the exact sample we injected (removed from the matrix)
     pending.tracker = g.tracker;
-    // A skipped game frame breaks the sequence of input pictures seen by DLSS.
-    if (g.resume_reset || (g.submitted_frame && g.frame != g.submitted_frame + 1)) pending.tracker.Reset();
+    // DLSS's history is the last frame it evaluated, and the tracker's previous
+    // camera is that same frame, so motion stays correct across a few skipped game
+    // frames (a frame whose scene submissions differed): no reset, no visible
+    // restart. A long gap (or resume/resize) starts over.
+    constexpr uint64_t kMaxGapFrames = 4;
+    if (g.resume_reset || (g.submitted_frame && g.frame > g.submitted_frame + kMaxGapFrames)) pending.tracker.Reset();
     const na::camera::CameraFrame cam = pending.tracker.Update(vp, g.frame, w, h, injected);
     if (!cam.valid) { ++g.stats.no_camera; reason("The camera matrix could not be inverted."); return false; }
     pending.cut = cam.camera_cut;
@@ -1158,12 +1167,18 @@ void OnPresent(ID3D12CommandQueue* queue)
         ++g.frame;
         g.jit.valid = false; // J1: the next camera block starts a new jitter sample
         if (g.scene_batches_cur) {
-            g.scene_batches_target = g.scene_batches_cur;
+            g.batch_hist[g.batch_hist_n++ % 16] = static_cast<uint8_t>(g.scene_batches_cur > 255 ? 255 : g.scene_batches_cur);
+            uint32_t votes[256] = {};
+            const uint32_t n = g.batch_hist_n < 16 ? g.batch_hist_n : 16;
+            for (uint32_t i = 0; i < n; ++i) ++votes[g.batch_hist[i]];
+            uint32_t best = 0;
+            for (uint32_t c = 1; c < 256; ++c) if (votes[c] > votes[best]) best = c;
+            g.scene_batches_target = best;
             g.stats.scene_batches = g.scene_batches_cur;
+            g.stats.scene_batches_target = best;
             if (g.scene_batches_cur > g.stats.scene_batches_max) g.stats.scene_batches_max = g.scene_batches_cur;
         }
         g.scene_batches_cur = 0;
-        g.reader_seen_cur = false;
     }
 }
 
@@ -1189,14 +1204,13 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         if (g.jitter_on) count_post_dlaa(lists, 0, count, dsel); // later batches of a frame whose DLAA already ran
         // Scene drawing after our DLAA (this frame's insertion was too early): counted so
         // the next frame inserts after it, and reported (post_scene).
-        if (dsel && csel && !g.reader_seen_cur) {
+        if (dsel && csel) {
             // A batch that CLEARS the colour starts the image over (a repeat or another
             // view), not more of the same scene: not counted. A depth clear alone is
             // fine (first-person weapons are drawn that way onto the same image).
             bool scene_here = false, restarts = false;
             for (UINT i = 0; i < count; ++i) {
                 if (!lists[i]) continue;
-                if (na::observe::ListSamplesTexture(lists[i], csel)) { g.reader_seen_cur = true; break; }
                 if (na::observe::ListRendersTo(lists[i], csel, dsel)) {
                     scene_here = true;
                     if (na::observe::ListClearsTarget(lists[i], csel)) restarts = true;
@@ -1224,7 +1238,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         // Prefer the last scene writer BEFORE the first explicit downstream
         // reader (AA, tonemap, etc.). A postprocess list may rebind the scene RTV
         // at its end; that rebind must not move us past its earlier read.
-        if (lists[i] && (scene >= 0 || g.scene_batches_cur) && na::observe::ListSamplesTexture(lists[i], color_id)) {
+        if (lists[i] && scene >= 0 && na::observe::ListSamplesTexture(lists[i], color_id)) {
             before_reader = true;
             break;
         }
@@ -1234,11 +1248,10 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         }
     }
     // A batch that clears the colour starts the image over: it is scene batch 1 again.
-    if (scene >= 0 && !g.reader_seen_cur) g.scene_batches_cur = restarts ? 1 : g.scene_batches_cur + 1;
-    if (before_reader) g.reader_seen_cur = true;
+    if (scene >= 0) g.scene_batches_cur = restarts ? 1 : g.scene_batches_cur + 1;
     // More scene batches are expected this frame (the last frame had them) and
     // post-processing has not started: DLAA waits for the last one.
-    const bool wait_later = scene >= 0 && !before_reader && g.scene_batches_cur < g.scene_batches_target;
+    const bool wait_later = scene >= 0 && g.scene_batches_cur < g.scene_batches_target;
     ID3D12GraphicsCommandList* ours = nullptr;
     PendingHistory pending;
     if (scene < 0) {
@@ -1321,7 +1334,7 @@ void Shutdown()
     g.frame = 1;
     g.submitted_frame = 0;
     g.scene_batches_cur = g.scene_batches_target = 0;
-    g.reader_seen_cur = false;
+    g.batch_hist_n = 0;
     g.resume_reset = false;
     g.w = g.h = 0;
 }
