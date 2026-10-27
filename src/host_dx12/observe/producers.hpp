@@ -109,6 +109,9 @@ std::vector<LiveBinding> ListRootConstantBuffers(ID3D12CommandList* list); // gr
 bool ListReferences(ID3D12CommandList* list, na_object_id id);            // the recording referenced the resource
 // True when the recording bound `color` as a render target together with `depth` as its depth target.
 bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id depth);
+// An explicit SRV-table binding referenced the texture. Positive ordering hint
+// only: unobserved/bindless/late descriptor changes are not ruled out by false.
+bool ListSamplesTexture(ID3D12CommandList* list, na_object_id texture);
 // The subresources (mip + array slice; depth: plane 0) the last bind of `color`
 // with `depth` in this recording rendered into, from the views' first
 // subresources. NA_UNKNOWN_U32 = a view spanning several slices or unusual.

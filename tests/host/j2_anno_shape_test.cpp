@@ -80,20 +80,37 @@ void Store(uint8_t* dst, const M& m)
 }
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
     setvbuf(stdout, nullptr, _IONBF, 0);
+    const UINT samples = argc > 1 ? UINT(std::atoi(argv[1])) : 1;
+    const UINT depth_samples = argc > 2 ? UINT(std::atoi(argv[2])) : samples;
+    const bool msaa = samples > 1;
+    const bool real_ngx = argc > 3 && std::strcmp(argv[3], "--real") == 0;
+    const bool post_reader = argc > 3 && !real_ngx;
     test::Device d;
     if (!test::CreateDevice(d)) return test::SkipNoDevice("j2_anno_shape_test");
+    if (real_ngx) {
+        test::ComPtr<IDXGIAdapter1> adapter;
+        DXGI_ADAPTER_DESC1 desc{};
+        REQUIRE(SUCCEEDED(d.factory->EnumAdapterByLuid(d.device->GetAdapterLuid(), IID_PPV_ARGS(&adapter))));
+        REQUIRE(SUCCEEDED(adapter->GetDesc1(&desc)));
+        if (desc.VendorId != 0x10DE) { printf("SKIP: real DLAA needs NVIDIA hardware\n"); return test::kSkip; }
+    }
     ID3D12Device* dev = d.device.Get();
     ID3D12CommandQueue* q = d.queue.Get();
     REQUIRE(na::observe::InstallProducers(dev, q, /*hook_queue_execute=*/false));
     na_observe_config cfg{};
     cfg.size_bytes = sizeof(cfg);
     REQUIRE(na_observe_start(&cfg, &Sink, nullptr) == NA_OK);
-    na::dlss::SetInitOwnOverrideForTests([](ID3D12Device* device, const wchar_t*) { return na::dlss::Attach(device, fake::MakeApi()); });
+    if (!real_ngx) na::dlss::SetInitOwnOverrideForTests([](ID3D12Device* device, const wchar_t*) { return na::dlss::Attach(device, fake::MakeApi()); });
 
     constexpr uint32_t W = 64, H = 32;
+    for (auto pair : {std::make_pair(DXGI_FORMAT_R16G16B16A16_FLOAT,samples), std::make_pair(DXGI_FORMAT_D32_FLOAT_S8X24_UINT,depth_samples)}) {
+        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels{pair.first,pair.second,D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE,0};
+        REQUIRE(SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,&levels,sizeof levels)));
+        if (!levels.NumQualityLevels) { printf("SKIP: hardware does not support sample count %u\n",pair.second); return test::kSkip; }
+    }
     test::ComPtr<ID3D12Resource> color;
     {
         D3D12_HEAP_PROPERTIES hp{};
@@ -103,13 +120,22 @@ int main()
         td.Width = W;
         td.Height = H;
         td.DepthOrArraySize = 2; // an array (Anno run 6: "multisampled or an array")
-        td.MipLevels = 4;        // and a mip chain (Anno run 4: the rejected list)
+        td.MipLevels = msaa ? 1 : 4;        // and a mip chain (Anno run 4: the rejected list)
         td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-        td.SampleDesc.Count = 1;
+        td.SampleDesc.Count = samples;
         td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         REQUIRE(SUCCEEDED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&color))));
     }
     auto depth = test::CreateTexture(dev, W, H, DXGI_FORMAT_R32G8X24_TYPELESS, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    if (depth_samples > 1) {
+        depth.Reset();
+        D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        auto dd = color->GetDesc();
+        dd.DepthOrArraySize = 1; dd.MipLevels = 1; dd.SampleDesc.Count = depth_samples; dd.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
+        dd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+        REQUIRE(SUCCEEDED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &dd,
+            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&depth))));
+    }
     auto cb = test::CreateBuffer(dev, 4096, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     REQUIRE(depth && cb);
     test::ComPtr<ID3D12DescriptorHeap> rtvh, dsvh, cbvh;
@@ -125,6 +151,11 @@ int main()
     rvd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
     rvd.Texture2DArray.ArraySize = 1;
     rvd.Texture2DArray.FirstArraySlice = 1; // the scene is drawn into SLICE 1 (mip 0): subresource 4
+    if (msaa) {
+        rvd = {}; rvd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        rvd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY;
+        rvd.Texture2DMSArray.ArraySize = 1; rvd.Texture2DMSArray.FirstArraySlice = 1;
+    }
     dev->CreateRenderTargetView(color.Get(), &rvd, rtv);
     // Slice 0 holds something else (red) that DLAA must never touch.
     test::ComPtr<ID3D12DescriptorHeap> rtvh0;
@@ -133,12 +164,12 @@ int main()
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv0 = rtvh0->GetCPUDescriptorHandleForHeapStart();
     {
         D3D12_RENDER_TARGET_VIEW_DESC v0 = rvd;
-        v0.Texture2DArray.FirstArraySlice = 0;
+        if (msaa) v0.Texture2DMSArray.FirstArraySlice = 0; else v0.Texture2DArray.FirstArraySlice = 0;
         dev->CreateRenderTargetView(color.Get(), &v0, rtv0);
     }
     D3D12_DEPTH_STENCIL_VIEW_DESC dvd{};
     dvd.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
-    dvd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    dvd.ViewDimension = depth_samples > 1 ? D3D12_DSV_DIMENSION_TEXTURE2DMS : D3D12_DSV_DIMENSION_TEXTURE2D;
     dev->CreateDepthStencilView(depth.Get(), &dvd, dsv);
     constexpr uint32_t kBlock = 1024, kVp = 336;
     D3D12_CONSTANT_BUFFER_VIEW_DESC cv{cb->GetGPUVirtualAddress() + kBlock, 768};
@@ -167,6 +198,31 @@ int main()
         REQUIRE(SUCCEEDED(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rs_pre))));
     }
     constexpr uint32_t kPre = 2048;
+    // A downstream consumer reads the scene then rebinds its RTV/depth. That
+    // final bind must not move DLAA after the read. GPU copy stands in for the
+    // consumer's filtering; readback below checks what the consumer received.
+    auto post_color = test::CreateTexture(dev, W, H, DXGI_FORMAT_R16G16B16A16_FLOAT,
+        D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_FLAG_NONE);
+    REQUIRE(post_color);
+    test::ComPtr<ID3D12DescriptorHeap> post_heap;
+    test::ComPtr<ID3D12RootSignature> post_root;
+    if (post_reader) {
+        REQUIRE(!msaa);
+        REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&chd, IID_PPV_ARGS(&post_heap))));
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2DArray.MipLevels = 1; srv.Texture2DArray.FirstArraySlice = 1; srv.Texture2DArray.ArraySize = 1;
+        dev->CreateShaderResourceView(color.Get(), &srv, post_heap->GetCPUDescriptorHandleForHeapStart());
+        D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+        D3D12_ROOT_PARAMETER p{}; p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p.DescriptorTable = {1, &range};
+        D3D12_ROOT_SIGNATURE_DESC rd{1, &p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        test::ComPtr<ID3DBlob> blob, error;
+        REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)));
+        REQUIRE(SUCCEEDED(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&post_root))));
+    }
     uint8_t* cpu = nullptr;
     REQUIRE(SUCCEEDED(cb->Map(0, nullptr, reinterpret_cast<void**>(&cpu))) && cpu);
 
@@ -195,9 +251,9 @@ int main()
         const M vp = Camera(cam_x);
         M inv{};
         Inverse(vp, inv);
+        for (int i = 0; i < 300; ++i) cpu[kBlock + i] = static_cast<uint8_t>(i * 13); // other constants before the camera
         Store(cpu + kBlock + kVp, vp);
         Store(cpu + kBlock + kVp + 128, inv);
-        for (int i = 0; i < 300; ++i) cpu[kBlock + i] = static_cast<uint8_t>(i * 13); // other constants before the camera
         Store(cpu + kPre + kVp, vp); // the pre-pass's own copy of the camera
         Store(cpu + kPre + kVp + 128, inv);
         prepass.Reset(); // earlier batch: depth only, its own root signature
@@ -224,6 +280,23 @@ int main()
         consumer.list->ResourceBarrier(1, &rd);
         D3D12_RESOURCE_BARRIER back = test::Transition(color.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         consumer.list->ResourceBarrier(1, &back);
+        if (post_reader) {
+            ID3D12DescriptorHeap* heaps2[] = {post_heap.Get()};
+            consumer.list->SetDescriptorHeaps(1, heaps2);
+            consumer.list->SetGraphicsRootSignature(post_root.Get());
+            consumer.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart());
+            D3D12_RESOURCE_BARRIER b[] = {
+                test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                test::Transition(post_color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)};
+            consumer.list->ResourceBarrier(2, b);
+            D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+            src.Type = dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src.pResource = color.Get(); src.SubresourceIndex = 4; dst.pResource = post_color.Get();
+            consumer.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            for (auto& t : b) std::swap(t.Transition.StateBefore, t.Transition.StateAfter);
+            consumer.list->ResourceBarrier(2, b);
+            consumer.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+        }
         REQUIRE(SUCCEEDED(consumer.list->Close()));
         ID3D12CommandList* lists[] = {scene.list.Get(), consumer.list.Get()};
         g_forwarded.clear();
@@ -240,20 +313,32 @@ int main()
                     (unsigned long long)js.camera_offset, (unsigned long long)js.jitter_writes, js.reason);
         return 0;
     };
-    const int evals0 = fake::evals;
-    frame(0);
+    const auto evaluations = [&]() -> uint64_t { return real_ngx ? na::dlss::GetStats().evaluates : uint64_t(fake::evals); };
+    const uint64_t evals0 = evaluations();
+    REQUIRE(frame(0) == 0);
     auto st = na::j2::GetStats();
-    CHECK(g_forwarded.size() == 3 && st.frames == 1 && fake::evals == evals0 + 1);
+    CHECK(g_forwarded.size() == 3 && st.frames == 1 && evaluations() == evals0 + 1);
     CHECK(st.camera_offset == kVp);
     CHECK(std::strncmp(st.reason, "Stopped", 7) != 0); // the list closed: no latch
-    frame(0.5);
+    REQUIRE(frame(0.5) == 0);
     st = na::j2::GetStats();
-    CHECK(st.frames == 2 && fake::evals == evals0 + 2);
+    REQUIRE(st.frames == 2 && evaluations() == evals0 + 2);
+    CHECK(g_forwarded.size() == 3 && g_forwarded[0] == scene.list.Get() && g_forwarded[2] == consumer.list.Get());
+    if (post_reader) CHECK(std::strstr(st.reason, "before a later scene-colour reader") != nullptr);
+    if (!real_ngx) for (const char* key : {NVSDK_NGX_Parameter_Color, NVSDK_NGX_Parameter_Depth}) {
+        auto* input = static_cast<ID3D12Resource*>(fake::P(fake::last_eval, key));
+        REQUIRE(input);
+        const auto input_desc = input->GetDesc();
+        CHECK(input_desc.SampleDesc.Count == 1 && input_desc.MipLevels == 1 && input_desc.DepthOrArraySize == 1);
+        CHECK(input_desc.Width == W && input_desc.Height == H);
+    }
     CHECK(st.jitter_writes >= 2);
     CHECK(st.camera_inv_delta == 128 && st.camera_learned_hits >= 1);
+    if (!real_ngx) {
     CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
     const double jx = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_X), jy = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_Y);
     CHECK((jx != 0.0 || jy != 0.0) && std::fabs(jx) < 0.5 && std::fabs(jy) < 0.5);
+    }
     {
         uint8_t orig[64];
         Store(orig, Camera(0.5));
@@ -264,27 +349,46 @@ int main()
     // and slice 0 kept its red.
     {
         d.WaitIdle();
-        const D3D12_RESOURCE_DESC cdsc = color->GetDesc();
+        test::ComPtr<ID3D12Resource> readable = color;
+        const UINT scene_sub = msaa ? 1u : 4u;
+        if (msaa) {
+            auto desc = color->GetDesc(); desc.SampleDesc.Count = 1; desc.Alignment = 0;
+            D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            readable.Reset();
+            REQUIRE(SUCCEEDED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&readable))));
+        }
+        const D3D12_RESOURCE_DESC cdsc = readable->GetDesc();
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[5]{};
         UINT64 total = 0;
-        dev->GetCopyableFootprints(&cdsc, 0, 5, 0, fp, nullptr, nullptr, &total);
+        dev->GetCopyableFootprints(&cdsc, 0, scene_sub + 1, 0, fp, nullptr, nullptr, &total);
         auto rb = test::CreateBuffer(dev, total, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
         REQUIRE(rb);
         test::List c;
         REQUIRE(c.Create(dev));
-        D3D12_RESOURCE_BARRIER tb = test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        if (msaa) {
+            D3D12_RESOURCE_BARRIER b[] = {
+                test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE),
+                test::Transition(readable.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_DEST)};
+            c.list->ResourceBarrier(2, b);
+            for (UINT sub : {0u, 1u}) c.list->ResolveSubresource(readable.Get(), sub, color.Get(), sub, cdsc.Format);
+            for (auto& t : b) std::swap(t.Transition.StateBefore, t.Transition.StateAfter);
+            c.list->ResourceBarrier(2, b);
+        }
+        D3D12_RESOURCE_BARRIER tb = test::Transition(readable.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
         c.list->ResourceBarrier(1, &tb);
-        for (UINT sub : {0u, 4u}) {
+        for (UINT sub : {0u, scene_sub}) {
             D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
-            src.pResource = color.Get();
+            src.pResource = readable.Get();
             src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
             src.SubresourceIndex = sub;
+            if (post_reader && sub == scene_sub) { src.pResource = post_color.Get(); src.SubresourceIndex = 0; }
             dst.pResource = rb.Get();
             dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
             dst.PlacedFootprint = fp[sub];
             c.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         }
-        tb = test::Transition(color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        tb = test::Transition(readable.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         c.list->ResourceBarrier(1, &tb);
         REQUIRE(SUCCEEDED(c.list->Close()));
         ID3D12CommandList* cl[] = {c.list.Get()};
@@ -294,11 +398,14 @@ int main()
         REQUIRE(SUCCEEDED(rb->Map(0, nullptr, reinterpret_cast<void**>(&p))));
         uint16_t s0[4], s1[4];
         std::memcpy(s0, p + fp[0].Offset + fp[0].Footprint.RowPitch * 5 + 8 * 7, 8);
-        std::memcpy(s1, p + fp[4].Offset + fp[4].Footprint.RowPitch * 5 + 8 * 7, 8);
+        std::memcpy(s1, p + fp[scene_sub].Offset + fp[scene_sub].Footprint.RowPitch * 5 + 8 * 7, 8);
         rb->Unmap(0, nullptr);
         std::printf("slice 0 pixel %04X %04X %04X %04X, slice 1 pixel %04X %04X %04X %04X\n", s0[0], s0[1], s0[2], s0[3], s1[0], s1[1], s1[2], s1[3]);
         CHECK(s0[0] == 0x3C00 && s0[1] == 0 && s0[2] == 0); // red (1.0 in half float) untouched
-        CHECK(s1[0] == 0 && s1[1] == 0 && s1[2] == 0);      // the scene's clear (0.2,0.3,0.4) was replaced by the DLAA result
+        if (real_ngx) {
+            for (UINT channel = 0; channel < 3; ++channel) CHECK((s1[channel] & 0x7c00) != 0x7c00); // finite output
+            CHECK(s1[0] || s1[1] || s1[2]); // NVIDIA produced non-black scene output
+        } else CHECK(s1[0] == 0 && s1[1] == 0 && s1[2] == 0);      // the scene's clear (0.2,0.3,0.4) was replaced by the DLAA result
     }
     CHECK(dev->GetDeviceRemovedReason() == S_OK);
     na::j2::SetEnabled(false);
