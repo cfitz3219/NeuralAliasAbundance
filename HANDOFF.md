@@ -1,3 +1,11 @@
+# 2026-10-27 02:05 — SER live DLAA handed to Astra (Cort)
+
+Run 6 (inline DLAA, 9f7dd95): the debug image shows about once every 1.5–2 s. Inline DLAA ran on about 30% of frames. Depth state was unknown on about a third of candidates. Cuts were about 20%. The learned target of 1 candidate per frame suggests DLAA mostly lands at a mid-frame colour read rather than the start of post-processing.
+
+The full catalogue (runs 1–6, numbers, code map, hypotheses, suggestions) is in COMMS at 01:15 and 02:05. Astra owns the SER fix and P4-0D. Opus stops J2/SER changes unless Cort asks.
+
+---
+
 # 2026-10-27 — Opus: Sniper Elite Resistance (second DLSS-less game) status; inline DLAA; Astra owns the insertion-point detector
 
 **Where things stand.**

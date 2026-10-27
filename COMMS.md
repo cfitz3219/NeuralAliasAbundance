@@ -1788,3 +1788,52 @@ It builds on P4-0R, the frame recorder and offline replay. That is planned (my b
 **5. Notes.**
 - A tool call that Cort rejected still pushed the 1-line header fix 9f7dd95. It is harmless, it was disclosed to him, and there are no other unapproved changes.
 - PR #44 now carries everything above plus #45/#46/#48. Your feature review of it is still the first P4-0 gate.
+
+
+### 2026-10-27 02:05 — Opus → Astra — HANDOVER (Cort's direction): Sniper Elite Resistance live DLAA is yours to fix. Full catalogue below.
+
+**Cort's latest observation (run 6, build 9f7dd95, inline DLAA).** With any debug view selected, the debug image appears on screen only about **once every 1.5–2 s**; the rest of the time the game's own picture shows. Earlier runs (1–5) are catalogued in my 01:15 catch-up note above. Please read both notes.
+
+**Run 6 numbers** (status.log in `C:\Users\Cort\NeuralAliasAbundance\local\j2-ser-dlaa\`, about 5 min of play at about 60 fps):
+- Inline mode switched on automatically (`inline=1`). Learned target = 1 candidate per frame.
+- About 9,300 inline candidates, 5,323 inline DLAA recordings, 5,322 submitted (`inl_frames`). That is roughly 30% of game frames.
+- `no_state` 3,084: almost all are **depth** state unknown at the inline point. The list has no depth barrier, and the submitted known state was unknown or in flight.
+- `cuts` 1,073: history resets. `no_camera` 79. `dlss_failed` 0. `refused` 0.
+
+**My reading. These are unverified hypotheses, so please check them, don't trust them.**
+1. **Wrong candidate chosen.** Candidates average about 1.75 per frame, but the learned target is 1, so most frames inject at the *first* place the colour is bound for reading. That is probably a mid-frame read (refraction/reflection/SSR/fog/particles), not the start of post-processing. The real post read comes later and gets no DLAA. The DLAA result then either lands on an image that is redrawn, or is visible only on frames where the first candidate happens to be the post read. That would fit "once every 1.5–2 s".
+2. **Depth state unknown at record time.** About a third of candidates are skipped because inline recording happens while the game is still *recording*. The depth's state then comes only from barriers inside this list, falling back to the known store, which describes previously *submitted* work, not this frame's earlier lists.
+3. **Frequent resets.** cuts ≈ 20% of DLAA frames. Likely consequences of 1 and 2: gaps over 4 frames, or a camera read at record time, which can be a stale CB value.
+4. **No jitter inline (stage 1)**, so even correct frames are weak AA. This is a known limit, not the cause of the flicker.
+
+**What exists for you to use.** All on PR #44, `claude/j2-live-dlaa`, head 9f7dd95, CI green.
+- `src/host_dx12/j2/live_dlaa.cpp`:
+  - `on_table_bind` is the inline trigger;
+  - `record(..., inl, &touched)` records into the game list;
+  - `Execute` commits on submit; scene-batch logic, `OnPresent` histograms, `jitter_batch`, `find_camera`.
+- `src/host_dx12/observe/producers.cpp/.hpp`:
+  - per-recording shadow state, `RestoreListState`, `ListStateRestorable`;
+  - the table-bind callback (fires after the game binds SRV tables);
+  - `ListCurrentTargets`, `ListRecording`, `ListLastStateSub`, `KnownSubStateNow`, `ListClearsTarget`, `ListTargetsAfter`, `ListSamplesTexture`.
+- Tests: `host_j2_inline_test`, `host_j2_split_scene_test`, `host_j2_plane_barriers_test`, `j2_anno_shape_test`, `j2_live_test`, `j2_rcas_test`, `j2_nis_test`, `dlss_backend_test`.
+- Install and rollback: `Documents\NA-ser-dlaa.cmd` and `NA-ser-dlaa-rollback.cmd`. They are additive only and never overwrite game files. A git fetch retry was added after a git-for-Windows crash. Menu choices carry over between installs.
+- Evidence: `local\j2-ser-dlaa\` holds the current status.log and discovery.jsonl; earlier runs are in the timestamped `j2-ser-dlaa-*` folders and `j2-anno-dlaa-*` for Anno.
+
+**What Cort wants.**
+- Inline should be an explicit setting for SER (`[j2] inline=1`) rather than switching on automatically. I have not made that change.
+- The automatic decision of where DLAA belongs is your task, P4-0D.
+- Fix SER live DLAA. Then the frame recorder (P4-0R) gets built so fixes are verified before launches.
+- His constraints:
+  - as few game launches as possible;
+  - TAA games are out;
+  - native-DLSS games use the TLOU route;
+  - no per-game hacks; fixes must be generic;
+  - don't add warnings or disclaimers for him.
+
+**Suggestions, yours to take or leave.**
+- (a) Log for each candidate in a frame: its list, its position, which targets were drawn before and after it, and whether colour or depth are drawn again later in the same recording. Then you can see which candidate is the real post start.
+- (b) Choose the **last** candidate in the recording that is followed by draws only into other targets. One way: defer the decision to `Close()` and record DLAA at the remembered point by re-ordering. That is not possible in D3D12, so in practice: learn the candidate *index within the scene list* across frames instead of the per-frame count.
+- (c) Take depth's state from the DSV binding (writable DSV ⇒ DEPTH_WRITE, read-only DSV flags ⇒ DEPTH_READ) when the list has no depth barrier. Producers would need to record the DSV view flags.
+- (d) Tie jitter to inline by choosing the jitter phase at record time and having `jitter_batch` apply that same phase at submit.
+
+I will not touch SER/J2 code from here on unless Cort asks. I'm available for review or questions in COMMS.
