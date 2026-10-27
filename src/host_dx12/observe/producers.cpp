@@ -2076,7 +2076,7 @@ void note_draw(GL* l) {
     if (!ls) return;
     std::lock_guard<std::mutex> bl(ls->bind_m);
     for (uint32_t i = 0; i < ls->cur_nrt; ++i)
-        if (ls->cur_rts[i]) ls->insertion.Add({ls->cur_rts[i], 0, reinterpret_cast<uint64_t>(ls->pso), true});
+        if (ls->cur_rts[i]) ls->insertion.Add({ls->cur_rts[i], 0, reinterpret_cast<uint64_t>(ls->pso), true, na::j2::Op::DrawWrite});
     auto pipeline = g_objs.find(canon(ls->pso));
     if (ls->cur_ds && ls->cur_ds_sub != NA_UNKNOWN_U32 && pipeline != g_objs.end() &&
         pipeline->second.created.size() >= sizeof(na_ev_pipeline_created)) {
@@ -2576,7 +2576,7 @@ struct On<sl::list::ClearRenderTargetView> {
         note_uses(l, {v.resource});
         with_list_state(l, [&](ListState& ls) {
             std::lock_guard<std::mutex> bl(ls.bind_m);
-            if (v.resource) ls.insertion.Add({v.resource, 0, 0, true});
+            if (v.resource) ls.insertion.Add({v.resource, 0, 0, true, na::j2::Op::ClearWrite});
             if (v.resource && ls.cleared.size() < 64 && std::find(ls.cleared.begin(), ls.cleared.end(), v.resource) == ls.cleared.end())
                 ls.cleared.push_back(v.resource);
         });
@@ -2614,7 +2614,7 @@ void before_read_transition(GL* l, UINT count, const D3D12_RESOURCE_BARRIER* bar
             auto* ls = list_state_locked(l, &lid);
             if (!ls) return;
             std::lock_guard<std::mutex> bl(ls->bind_m);
-            ls->insertion.Add({color, 0, UINT64_MAX, false});
+            ls->insertion.Add({color, 0, UINT64_MAX, false, na::j2::Op::Barrier});
         }
         if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, true);
         break; // our pass runs before the whole original barrier batch
@@ -2634,7 +2634,7 @@ void before_texture_copy(GL* l, ID3D12Resource* dst, ID3D12Resource* src)
         auto* ls = list_state_locked(l, &lid);
         if (!ls) return;
         std::lock_guard<std::mutex> bl(ls->bind_m);
-        ls->insertion.Add({source, destination, 0, false});
+        ls->insertion.Add({source, destination, 0, false, na::j2::Op::CopyRead});
     }
     if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, true);
 }
@@ -2648,7 +2648,7 @@ void after_texture_copy(GL* l, ID3D12Resource* dst)
     auto* ls = list_state_locked(l, &lid);
     if (!ls) return;
     std::lock_guard<std::mutex> bl(ls->bind_m);
-    ls->insertion.Add({destination, 0, 0, true});
+    ls->insertion.Add({destination, 0, 0, true, na::j2::Op::CopyWrite});
 }
 
 void before_shader_use(GL* l, bool compute)
@@ -2692,7 +2692,10 @@ void before_shader_use(GL* l, bool compute)
                 }
             }
         }
-        if (reads_color) ls->insertion.Add({color, destination, reinterpret_cast<uint64_t>(ls->pso), false});
+        if (reads_color)
+            ls->insertion.Add({color, destination, reinterpret_cast<uint64_t>(ls->pso), false,
+                               compute ? na::j2::Op::ComputeRead : na::j2::Op::GraphicsRead,
+                               reinterpret_cast<uint64_t>(ls->root_sig[compute])});
     }
     if (reads_color) if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, compute);
 }
@@ -4114,6 +4117,24 @@ na::j2::InsertionDecision ListInsertionDecision(ID3D12CommandList* list, na_obje
     if (!ls || !ls->recording_observed.load()) return {};
     std::lock_guard<std::mutex> bl(ls->bind_m);
     return ls->insertion.Analyze(color);
+}
+na::j2::ConsumerSignature ListConsumerSignature(ID3D12CommandList* list, na_object_id color)
+{
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return {};
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return ls->insertion.AnalyzeConsumer(color);
+}
+na::j2::LiveConsumer ListLiveConsumer(ID3D12CommandList* list, na_object_id color)
+{
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return {};
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return ls->insertion.Live(color);
 }
 void SetTableBindCallback(TableBindCallback cb) { g_table_cb.store(cb, std::memory_order_release); }
 bool ListCurrentTargets(ID3D12CommandList* list, na_object_id* rt, na_object_id* ds)

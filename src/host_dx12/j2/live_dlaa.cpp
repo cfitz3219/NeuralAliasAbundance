@@ -104,7 +104,7 @@ struct State {
     uint64_t dlss_tried_frame = ~0ull; // one early start attempt per frame
     bool inline_sample_locked = false; // NGX recorded: no new raster sample may start this frame
     bool inline_camera_submitted = false; // an earlier depth/camera batch may already be executing
-    struct LearnedInsertion { uint64_t color = 0, depth = 0; na::j2::InsertionDecision decision; };
+    struct LearnedInsertion { uint64_t color = 0, depth = 0; na::j2::InsertionDecision decision; na::j2::ConsumerSignature consumer; };
     LearnedInsertion insertion_frame, insertion_learned;
     char insertion_trace[2048] = {};
     size_t insertion_trace_used = 0;
@@ -1148,7 +1148,9 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         ci.route = static_cast<uint32_t>(inl ? na::j2::Route::Inline : na::j2::Route::Between);
         ci.route_mode = static_cast<uint32_t>(g.router.Mode());
         ci.history_generation = rd.history_generation;
-        ci.insertion_signature = inl ? rd.signature : 0;
+        // Inline: the learned post-entry consumer pipeline when the consumer anchor is in use,
+        // else the route's boundary signature.
+        ci.insertion_signature = inl ? (g.insertion_learned.consumer.consumer_pso ? g.insertion_learned.consumer.consumer_pso : rd.signature) : 0;
         ci.color_sub = csub;
         ci.width = w;
         ci.height = h;
@@ -1285,8 +1287,44 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
                          (na::observe::ListLastStateSub(l, color_id, csub, &cst) && !(cst & D3D12_RESOURCE_STATE_RENDER_TARGET));
     if (!reading) return;
     ++g.stats.inline_candidates;
+    if (g.inl_frame == g.frame) return; // one DLAA per frame: later candidates are post-processing
     const auto current = na::observe::ListInsertionDecision(l, color_id);
     const auto& learned = g.insertion_learned;
+    using CS = na::j2::ConsumerSignature;
+    const CS& anchor = learned.consumer;
+    // An MSAA depth resolve draws (render target, viewport, topology), which the state
+    // restore does not cover; just before the game's own draw that would change its
+    // raster state, so graphics anchors with MSAA depth stay on the boundary matcher.
+    const bool raster_safe = anchor.op != na::j2::Op::GraphicsRead || g.depth_samples <= 1;
+    const bool consumer_anchor = learned.color == color_id && learned.depth == depth_id && raster_safe &&
+        (anchor.mode == CS::UniqueConsumer || anchor.mode == CS::ProducerConsumer || anchor.mode == CS::CopyDestination);
+    uint32_t matched_mode = CS::Legacy;
+    if (consumer_anchor) {
+        // P4-0D: fire before the ACTUAL learned consumer (draw/dispatch/copy), whatever
+        // number of mid-scene readers ran earlier. Barriers are not consumers: wait.
+        const auto live = na::observe::ListLiveConsumer(l, color_id);
+        if (!live.valid) return;
+        if (const char* why = na::j2::MatchConsumer(anchor, live)) {
+            ++g.stats.consumer_skips; // normal for mid-scene readers; the last one explains a missed frame
+            std::snprintf(g.frame_reject_text, sizeof g.frame_reject_text,
+                "anchor=%s last_skip=\"%s\" learned{op=%u pso=%llu root=%llu producer=%llu dst=%llu} actual{op=%u pso=%llu root=%llu producer=%llu dst=%llu since_write=%u}",
+                na::j2::ModeName(anchor.mode), why, static_cast<unsigned>(anchor.op), (unsigned long long)anchor.consumer_pso,
+                (unsigned long long)anchor.consumer_root, (unsigned long long)anchor.producer_pso, (unsigned long long)anchor.destination,
+                static_cast<unsigned>(live.op), (unsigned long long)live.pso, (unsigned long long)live.root,
+                (unsigned long long)live.producer_pso, (unsigned long long)live.destination, live.since_write);
+            return;
+        }
+        matched_mode = anchor.mode;
+        if (g.inl.valid) {
+            ++g.stats.inline_waited;
+            ++g.stats.inline_rejects[Stats::kRejPending];
+            if (!g.frame_rejects++)
+                std::snprintf(g.frame_reject_text, sizeof g.frame_reject_text, "anchor=%s reject=previous recording not submitted",
+                              na::j2::ModeName(anchor.mode));
+            return;
+        }
+        g.stats.inline_target = learned.decision.final_candidate;
+    } else {
     // Optional passes change the absolute transition ordinal. Match the producer
     // of the learned final scene boundary, retaining an occurrence only among
     // boundaries from that same producer (not unrelated intermediate reads).
@@ -1326,6 +1364,8 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
         }
         return;
     }
+    if (!learned.consumer.mode || learned.consumer.mode == CS::Legacy) ++g.stats.consumer_cold;
+    } // legacy boundary matcher
     if (!na::observe::ListStateRestorable(l)) { ++g.stats.inline_refused; reason("The scene list's state cannot be restored after DLAA (a bundle ran); left untouched."); return; }
     ID3D12CommandList* one[1] = {l};
     // The depth/earlier scene batches must already have established this frame's
@@ -1362,6 +1402,7 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     g.inl.valid = true;
     g.inl_frame = g.frame;
     ++g.stats.inline_recorded;
+    ++g.stats.consumer_matched[matched_mode < 5 ? matched_mode : 4];
 }
 
 } // namespace
@@ -1460,17 +1501,27 @@ void OnPresent(ID3D12CommandQueue* queue)
                 // earlier success string); else no candidate reached the matcher.
                 std::snprintf(g.stats.insertion_last_miss, sizeof g.stats.insertion_last_miss,
                     "frame=%llu rejects=%u %s", (unsigned long long)g.frame, g.frame_rejects,
-                    g.frame_rejects ? g.frame_reject_text
-                                    : "no candidate reached the matcher (no read of the scene colour after its last write was seen in a scene recording)");
+                    g.frame_reject_text[0] ? g.frame_reject_text
+                                           : "no candidate reached the matcher (no read of the scene colour after its last write was seen in a scene recording)");
             if (g.insertion_frame.decision.writes && g.submitted_frame != g.frame) {
                 char why[200];
                 std::snprintf(why, sizeof why, "Inline DLAA missed this frame (%s).",
-                              g.frame_rejects ? "the scene boundary did not match the learned one; see j2_last_miss" : "no boundary candidate");
+                              g.frame_reject_text[0] ? "the scene boundary did not match the learned one; see j2_last_miss" : "no boundary candidate");
                 reason(why); // not the previous frame's "running" text
             }
             g.stats.active = g.submitted_frame == g.frame;
         }
-        if (g.insertion_frame.color) g.insertion_learned = g.insertion_frame;
+        if (g.insertion_frame.color) {
+            const auto& a = g.insertion_learned.consumer;
+            const auto& b = g.insertion_frame.consumer;
+            if (g.insertion_learned.color && (a.mode != b.mode || a.op != b.op || a.consumer_pso != b.consumer_pso ||
+                                              a.producer_pso != b.producer_pso || a.destination != b.destination))
+                ++g.stats.consumer_changes;
+            g.insertion_learned = g.insertion_frame;
+            g.stats.consumer_mode = b.mode;
+            g.stats.consumer_pso = b.consumer_pso;
+            std::snprintf(g.stats.consumer_why, sizeof g.stats.consumer_why, "%s", b.why);
+        }
         g.insertion_frame = {};
         ++g.frame;
         g.jit.valid = false; // J1: the next camera block starts a new jitter sample
@@ -1564,7 +1615,9 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         if (decision.writes) {
             if (g.insertion_frame.decision.final_candidate != decision.final_candidate)
                 ++g.stats.insertion_changes;
-            g.insertion_frame = {selected_color, selected_depth, decision};
+            // Learned in SUBMISSION order from recordings actually submitted (Astra #4);
+            // a recording that is never submitted cannot replace the learned anchor.
+            g.insertion_frame = {selected_color, selected_depth, decision, na::observe::ListConsumerSignature(lists[i], selected_color)};
         }
         ++g.stats.insertion_traces;
         if (decision.candidates) {

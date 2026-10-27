@@ -118,6 +118,10 @@ bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id dep
 using TableBindCallback = void (*)(ID3D12GraphicsCommandList* list, const na_object_id* srvs, uint32_t count, bool compute);
 void SetTableBindCallback(TableBindCallback cb);
 na::j2::InsertionDecision ListInsertionDecision(ID3D12CommandList* list, na_object_id color);
+// P4-0D consumer anchor: the first actual consumer of `color` after its final write in
+// this recording (learned at submission), and the latest event as seen by a live trigger.
+na::j2::ConsumerSignature ListConsumerSignature(ID3D12CommandList* list, na_object_id color);
+na::j2::LiveConsumer ListLiveConsumer(ID3D12CommandList* list, na_object_id color);
 // Re-applies the game's descriptor heaps, root signatures, every root argument and the
 // pipeline state of this recording. False (nothing issued) if the state is not fully
 // known (unobserved recording, a bundle was executed).

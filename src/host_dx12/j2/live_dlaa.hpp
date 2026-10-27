@@ -116,6 +116,14 @@ struct Stats {
                                    kRejCandidate, kRejDestination, kRejPipeline, kRejPending, kRejCount };
     uint64_t inline_rejects[kRejCount] = {};
     uint32_t inline_frame_rejects = 0; // rejections in the last closed frame
+    // P4-0D consumer anchor (first actual consumer after the final scene write).
+    uint32_t consumer_mode = 0;           // learned mode (insertion_trace.hpp ConsumerSignature::Mode)
+    uint64_t consumer_pso = 0;            // learned consumer pipeline (0 for copies)
+    uint64_t consumer_matched[5] = {};    // inline recordings per anchor mode (index = mode; 4 = legacy matcher)
+    uint64_t consumer_skips = 0;          // consumers seen before the anchor matched (mid-scene readers, other passes)
+    uint64_t consumer_changes = 0;        // learned signature changes (mode change, new post shader)
+    uint64_t consumer_cold = 0;           // inline frames with no consumer signature yet (legacy matcher used)
+    char consumer_why[96] = {};           // why the learned mode was chosen
     bool depth_reversed = false;  // reverse-Z as classified from the camera    // other render targets bound after the scene in the same list (insertion may be late)
     uint32_t width = 0, height = 0, color_format = 0;
     // Shape of the selected resources (reported even when J2 refuses them).

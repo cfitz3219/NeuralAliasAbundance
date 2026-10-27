@@ -510,6 +510,16 @@ void write_status_line()
                 (unsigned long long)rj[4], (unsigned long long)rj[5], (unsigned long long)rj[6], (unsigned long long)rj[7],
                 (unsigned long long)rj[8], j2.inline_frame_rejects);
             if (nrej > 0) WriteFile(f, rl, static_cast<DWORD>((std::min)(nrej, static_cast<int>(sizeof rl - 1))), &written, nullptr);
+            static const char* kAnchor[] = {"none", "unique-consumer", "producer+consumer", "copy-destination", "legacy-boundary"};
+            char al[400];
+            const int na2 = snprintf(al, sizeof al,
+                "j2_anchor mode=%s pso=%llu matched{unique=%llu pair=%llu copy=%llu legacy=%llu} skips=%llu changes=%llu cold=%llu why=\"%s\"\r\n",
+                kAnchor[j2.consumer_mode < 5 ? j2.consumer_mode : 0], (unsigned long long)j2.consumer_pso,
+                (unsigned long long)j2.consumer_matched[1], (unsigned long long)j2.consumer_matched[2],
+                (unsigned long long)j2.consumer_matched[3], (unsigned long long)j2.consumer_matched[4],
+                (unsigned long long)j2.consumer_skips, (unsigned long long)j2.consumer_changes,
+                (unsigned long long)j2.consumer_cold, j2.consumer_why);
+            if (na2 > 0) WriteFile(f, al, static_cast<DWORD>((std::min)(na2, static_cast<int>(sizeof al - 1))), &written, nullptr);
             const auto cs = na::capture::j2::GetStats();
             if (cs.requested) {
                 char cl[300];

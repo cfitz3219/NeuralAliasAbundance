@@ -6,10 +6,77 @@
 namespace na::j2 {
 // CPU-only recording evidence; never retains game objects or waits for the GPU.
 // A read binding is an insertion candidate, not proof of an AA/tonemap shader.
+// Operation kinds (P4-0D consumer anchor). Op::Unknown events are classified from
+// the legacy fields: write -> draw write, pipeline UINT64_MAX -> barrier, pipeline 0
+// -> copy read, otherwise a graphics read.
+enum class Op : uint8_t {
+    Unknown = 0, DrawWrite, ClearWrite, CopyWrite,  // writes
+    Barrier,                                        // RT -> read transition (not a consumer)
+    GraphicsRead, ComputeRead, CopyRead             // actual consumers
+};
 struct InsertionEvent {
     uint64_t resource = 0, destination = 0, pipeline = 0;
     bool write = false;
+    Op op = Op::Unknown;
+    uint64_t root = 0; // root signature of a shader consumer (0 = unknown / copy)
 };
+inline Op ClassifyOp(const InsertionEvent& e)
+{
+    if (e.op != Op::Unknown) return e.op;
+    if (e.write) return Op::DrawWrite;
+    if (e.pipeline == UINT64_MAX) return Op::Barrier;
+    return e.pipeline ? Op::GraphicsRead : Op::CopyRead;
+}
+inline bool IsConsumer(Op op) { return op == Op::GraphicsRead || op == Op::ComputeRead || op == Op::CopyRead; }
+
+// P4-0D (Argon's PostEntryPSO, with Astra's corrections): the first ACTUAL consumer of
+// the selected colour after its final write in a recording, learned from completed,
+// submitted recordings and matched in a later one. A predictor, not an invariant.
+struct ConsumerSignature {
+    enum Mode : uint8_t {
+        None = 0,
+        UniqueConsumer = 1,   // its shader PSO never read the colour earlier in the recording
+        ProducerConsumer = 2, // shared PSO, but the (final producer, consumer) pair never occurred earlier
+        CopyDestination = 3,  // copy/resolve consumer: no PSO; its destination never received an earlier copy
+        Legacy = 4            // ambiguous: fall back to the existing boundary matcher
+    };
+    Mode mode = None;
+    Op op = Op::Unknown;
+    uint64_t consumer_pso = 0, consumer_root = 0, destination = 0, producer_pso = 0;
+    const char* why = "no consumer of the colour after its final write";
+};
+// The latest event of a recording, as seen at a live trigger.
+struct LiveConsumer {
+    bool valid = false;        // the latest event is an actual consumer of the colour
+    bool after_write = false;  // a write of the colour precedes it in this recording
+    Op op = Op::Unknown;
+    uint64_t pso = 0, root = 0, destination = 0, producer_pso = 0;
+    uint32_t since_write = 0;  // consumers since the last write, this one included
+};
+inline const char* ModeName(ConsumerSignature::Mode m)
+{
+    switch (m) {
+    case ConsumerSignature::UniqueConsumer: return "unique-consumer";
+    case ConsumerSignature::ProducerConsumer: return "producer+consumer";
+    case ConsumerSignature::CopyDestination: return "copy-destination";
+    case ConsumerSignature::Legacy: return "legacy-boundary";
+    default: return "none";
+    }
+}
+// nullptr = matches; else the name of the failing predicate. Legacy/None never match here.
+inline const char* MatchConsumer(const ConsumerSignature& sig, const LiveConsumer& live)
+{
+    if (sig.mode == ConsumerSignature::None || sig.mode == ConsumerSignature::Legacy) return "no consumer signature";
+    if (!live.valid) return "not a consumer";
+    if (!live.after_write) return "no scene write before it";
+    if (live.op != sig.op) return "different consumer operation";
+    if (sig.mode == ConsumerSignature::CopyDestination)
+        return live.destination == sig.destination ? nullptr : "different copy destination";
+    if (live.pso != sig.consumer_pso) return "different consumer pipeline";
+    if (sig.consumer_root && live.root && live.root != sig.consumer_root) return "different consumer root signature";
+    if (sig.mode == ConsumerSignature::ProducerConsumer && live.producer_pso != sig.producer_pso) return "different final producer";
+    return nullptr;
+}
 struct InsertionDecision {
     uint32_t candidates = 0, final_candidate = 0, writes = 0;
     uint32_t all_reads = 0;
@@ -58,6 +125,76 @@ public:
             }
         }
         return result;
+    }
+    ConsumerSignature AnalyzeConsumer(uint64_t color) const {
+        ConsumerSignature sig;
+        if (!complete_ || !color) { sig.why = complete_ ? "no colour" : "trace truncated"; return sig; }
+        int last_write = -1;
+        for (int i = 0; i < static_cast<int>(events_.size()); ++i)
+            if (events_[i].resource == color && events_[i].write) last_write = i;
+        if (last_write < 0) { sig.why = "the colour was not written in this recording"; return sig; }
+        const InsertionEvent* first = nullptr;
+        for (size_t i = static_cast<size_t>(last_write) + 1; i < events_.size() && !first; ++i) {
+            const auto& e = events_[i];
+            if (e.resource == color && !e.write && IsConsumer(ClassifyOp(e)) && e.destination != color) first = &e;
+        }
+        if (!first) return sig; // only barriers / nothing after the final write
+        sig.op = ClassifyOp(*first);
+        sig.consumer_pso = sig.op == Op::CopyRead ? 0 : first->pipeline;
+        sig.consumer_root = first->root;
+        sig.destination = first->destination;
+        sig.producer_pso = events_[static_cast<size_t>(last_write)].pipeline;
+        // Earlier consumers (before the final write), each with the producer that preceded it.
+        bool same_consumer = false, same_pair = false, same_copy = false;
+        uint64_t writer = 0;
+        for (int i = 0; i < last_write; ++i) {
+            const auto& e = events_[static_cast<size_t>(i)];
+            if (e.resource != color) continue;
+            if (e.write) { writer = e.pipeline; continue; }
+            const Op op = ClassifyOp(e);
+            if (!IsConsumer(op) || e.destination == color || op != sig.op) continue;
+            if (op == Op::CopyRead) { same_copy |= e.destination == sig.destination; continue; }
+            if (e.pipeline == sig.consumer_pso) {
+                same_consumer = true;
+                same_pair |= writer == sig.producer_pso;
+            }
+        }
+        if (sig.op == Op::CopyRead) {
+            sig.mode = same_copy ? ConsumerSignature::Legacy : ConsumerSignature::CopyDestination;
+            sig.why = same_copy ? "copy consumer repeats an earlier copy to the same destination" : "copy consumer";
+        } else if (!sig.consumer_pso || sig.consumer_pso == UINT64_MAX) {
+            sig.mode = ConsumerSignature::Legacy;
+            sig.why = "consumer pipeline unknown";
+        } else if (!same_consumer) {
+            sig.mode = ConsumerSignature::UniqueConsumer;
+            sig.why = "consumer pipeline never read the colour earlier";
+        } else if (sig.producer_pso && !same_pair) {
+            sig.mode = ConsumerSignature::ProducerConsumer;
+            sig.why = "consumer pipeline also read mid-scene; final producer distinguishes it";
+        } else {
+            sig.mode = ConsumerSignature::Legacy;
+            sig.why = "consumer pipeline and producer both repeat mid-scene (ambiguous)";
+        }
+        return sig;
+    }
+    LiveConsumer Live(uint64_t color) const {
+        LiveConsumer live;
+        if (!complete_ || !color || events_.empty()) return live;
+        const auto& e = events_.back();
+        if (e.resource != color || e.write) return live;
+        live.op = ClassifyOp(e);
+        if (!IsConsumer(live.op) || e.destination == color) return live;
+        live.valid = true;
+        live.pso = live.op == Op::CopyRead ? 0 : e.pipeline;
+        live.root = e.root;
+        live.destination = e.destination;
+        for (size_t i = events_.size(); i-- > 0;) {
+            const auto& p = events_[i];
+            if (p.resource != color) continue;
+            if (p.write) { live.after_write = true; live.producer_pso = p.pipeline; break; }
+            if (IsConsumer(ClassifyOp(p)) && p.destination != color) ++live.since_write;
+        }
+        return live;
     }
 private:
     std::vector<InsertionEvent> events_;

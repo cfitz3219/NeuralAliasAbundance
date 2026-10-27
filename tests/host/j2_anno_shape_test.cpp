@@ -504,7 +504,9 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             scene.list->ResourceBarrier(1, &rd2);
             scene.list->OMSetRenderTargets(1, &post_rtv, FALSE, nullptr);
             scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart()); // final scene binding
-            REQUIRE(fake::evals == evals_before_read + (na::j2::GetStats().inline_mode ? 1 : 0)); // final read transition injected, binding did not
+            // Legacy boundary matcher: injected at the final read transition. Consumer anchor
+            // (P4-0D): injected just before the final actual consumer (below). Never twice.
+            REQUIRE(fake::evals <= evals_before_read + 1);
             if (inline_copy) {
                 D3D12_RESOURCE_BARRIER cbars[] = {
                     test::Transition(color.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
@@ -518,6 +520,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                 for (auto& b : cbars) std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
                 scene.list->ResourceBarrier(2, cbars);
             } else scene.list->DrawInstanced(3, 1, 0, 0); // final actual read
+            REQUIRE(fake::evals == evals_before_read + (na::j2::GetStats().inline_mode ? 1 : 0)); // exactly one, before the final consumer ran
             std::swap(rd2.Transition.StateBefore, rd2.Transition.StateAfter);
             scene.list->ResourceBarrier(1, &rd2);
         }
@@ -650,6 +653,14 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                     is.inline_mode, (unsigned long long)is.inline_candidates, (unsigned long long)is.inline_recorded,
                     (unsigned long long)is.frames, (unsigned long long)is.inline_frames, (unsigned long long)is.inline_refused,
                     (unsigned long long)(evaluations() - evals0), g_forwarded.size(), is.reason);
+        std::printf("anchor: mode %u matched unique %llu pair %llu copy %llu legacy %llu skips %llu why \"%s\"\n", is.consumer_mode,
+                    (unsigned long long)is.consumer_matched[1], (unsigned long long)is.consumer_matched[2],
+                    (unsigned long long)is.consumer_matched[3], (unsigned long long)is.consumer_matched[4],
+                    (unsigned long long)is.consumer_skips, is.consumer_why);
+        // The intermediate and final post draws share a PSO AND producer (clears): ambiguous,
+        // so the boundary matcher stays in use. A copy consumer anchors on its destination.
+        if (inline_copy) CHECK(is.consumer_mode == 3 && is.consumer_matched[3] >= 1);
+        else CHECK(is.consumer_mode == 4 && is.consumer_matched[4] == is.inline_recorded);
         CHECK(is.inline_target == 3); // intermediate transition + draw, then final transition
         CHECK(is.inline_mode == 1);                  // detected on the first frame
         CHECK(is.inline_frames >= 2);                // frames 2.. ran DLAA inside the game's list
