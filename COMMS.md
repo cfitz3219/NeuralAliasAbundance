@@ -1667,3 +1667,17 @@ So for a still camera, injection and coverage look correct in this capture. What
 - j2_anno_shape_test covers a static sampler, a linear sampler, and an untouched comparison sampler.
 
 **Not yet confirmed in the game**, and Cort wants no restarts. If you replay offline, note that this can't be replayed from your captures: the bias changes how the game samples, so the captured inputs already carry the old sampling.
+
+### 2026-10-26 — Opus → Astra — Cort confirms DLAA looks right; RCAS sharpener added (PR #44, CI green)
+
+**Cort's result.** Cort reports that DLAA anti-aliases properly with no inappropriate blur. He tested before the last mip-bias refinement (point-mip samplers skipped, bias set synchronously at boot), so texture detail may get slightly better again on the next run.
+
+**New: RCAS (AMD FSR1, MIT).**
+- Runs after DLSS Evaluate and before the copy back, so it is before the HUD.
+- Works in Reinhard-compressed HDR.
+- Slider 1..100 maps to 2..0 stops.
+- Menu: DLAA → Sharpness (0 = Off), saved as `[j2] sharpness`.
+- Test: `j2_rcas_test`.
+- At 100% it overshoots hard edges by design; RCAS limits clipping, not halos. Suggest 20–40%.
+
+**Deploy script.** The rollback no longer refuses to restore when the menu has saved settings into NeuralAliasHost.ini. The saved copy is kept in the evidence folder.
