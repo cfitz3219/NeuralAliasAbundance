@@ -18,6 +18,7 @@
 #include <imgui.h>
 
 #include "host_dx12/capture/frame_capture.hpp"
+#include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/fg/frame_gen.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/observe/producers.hpp"
@@ -690,6 +691,25 @@ void DrawLiveDlaa()
                       rt.mode ? ", forced in settings" : "", rt.state ? "" : ", still learning",
                       rt.mode ? "override" : "automatic", rt.reason, rt.missing[0] ? " Missing: " : "", rt.missing);
         StatusLine(0, pl);
+    }
+    {
+        // Evidence capture: N consecutive DLAA frames (inputs, DLAA output, presented
+        // picture) for analysis. Also on the capture key (F8 by default) and the ini.
+        const auto cs = na::capture::j2::GetStats();
+        const uint32_t n = na::settings::Get().j2_capture_frames.load();
+        char lbl[64];
+        std::snprintf(lbl, sizeof lbl, "Capture %u frames", n);
+        BeginRow("Capture DLAA frames", "Saves what DLAA was given, what it produced and the picture you saw, for the next few frames, to LocalAppData\\NeuralAlias\\captures. Large files; for diagnosis only.", ButtonWidth(lbl));
+        ImGui::BeginDisabled(!on || na::capture::j2::Armed());
+        if (Button(lbl)) na::capture::j2::RequestTimestamped(n);
+        ImGui::EndDisabled();
+        EndRow();
+        if (cs.requested) {
+            char cl[200];
+            std::snprintf(cl, sizeof cl, "Capture: %u of %u recorded, %u saved, %u skipped (busy), %u without the presented picture, %u errors.",
+                          cs.recorded, cs.requested, cs.written, cs.dropped_busy + cs.discarded + cs.retired, cs.without_present, cs.errors);
+            StatusLine(0, cl);
+        }
     }
     char buf[320];
     if (!on) {

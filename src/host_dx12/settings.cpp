@@ -128,6 +128,12 @@ void Load()
         if (g_ini_defaults[0]) GetPrivateProfileStringW(L"j2", L"route", L"auto", rt, 16, g_ini_defaults);
         g_settings.j2_route.store(!_wcsicmp(rt, L"between") ? 1u : (!_wcsicmp(rt, L"inline") ? 2u : 0u));
     }
+    if (g_ini_defaults[0]) { // evidence capture: per game, diagnostic
+        const UINT f = GetPrivateProfileIntW(L"j2", L"capture_frames", 30, g_ini_defaults);
+        g_settings.j2_capture_frames.store(f < 1 ? 1u : (f > 240 ? 240u : f));
+        g_settings.j2_capture_key.store(GetPrivateProfileIntW(L"j2", L"capture_key", 0x77, g_ini_defaults) & 0xFFu);
+        g_settings.j2_capture_after_s.store(GetPrivateProfileIntW(L"j2", L"capture_after_seconds", 0, g_ini_defaults));
+    }
 }
 
 bool Save()

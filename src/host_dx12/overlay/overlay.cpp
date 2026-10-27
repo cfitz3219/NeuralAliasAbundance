@@ -18,6 +18,7 @@
 #include <imgui_impl_win32.h>
 
 #include "host_dx12/capture/frame_capture.hpp"
+#include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/upscalers/ffx_intercept.hpp"
@@ -938,6 +939,11 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         g_open.store(!g_open.load(std::memory_order_relaxed), std::memory_order_release);
         return 0;
     }
+    if (msg == WM_KEYDOWN && !(lp & (1 << 30)) && na::j2::Enabled()) {
+        const uint32_t key = na::settings::Get().j2_capture_key.load(std::memory_order_relaxed);
+        if (key && wp == key && !na::capture::j2::Armed()) // J2 evidence capture, N consecutive frames
+            na::capture::j2::RequestTimestamped(na::settings::Get().j2_capture_frames.load());
+    }
     if (msg == kMsgCursorShow) {
         GetClipCursor(&g_saved_clip);
         g_saved_clip_valid = true;
@@ -1704,6 +1710,17 @@ void process_frame(ID3D12CommandQueue* queue, ID3D12Resource* frame)
     na::nr::OnPresent(queue, frame, cs);      // live Neural Rendering (before capture and the menu)
     na::motion::OnPresent(queue, frame, cs);  // A52: live optical flow (after NR, before capture)
     if (na::capture::Pending()) na::capture::OnPresent(queue, frame); // phase-1 capture
+    {
+        // J2 evidence capture: the presented image joins this frame's evaluation (if one
+        // was captured). Executed unhooked so J2 never observes our copy as game work.
+        static bool auto_armed = false;
+        const uint32_t after = na::settings::Get().j2_capture_after_s.load(std::memory_order_relaxed);
+        if (!auto_armed && after && na::j2::Enabled()) {
+            auto_armed = true;
+            na::capture::j2::RequestTimestamped(na::settings::Get().j2_capture_frames.load(), after * 1000u);
+        }
+        na::capture::j2::OnPresent(queue, frame, g_orig_execute);
+    }
 }
 
 // Common prelude of a game Present: bookkeeping, lazy init, timing. Returns

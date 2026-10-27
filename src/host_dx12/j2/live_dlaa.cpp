@@ -2,6 +2,7 @@
 #include "host_dx12/j2/msaa_resolve.hpp"
 #include "host_dx12/j2/nis_sharpen.hpp"
 #include "host_dx12/j2/route_selector.hpp"
+#include "host_dx12/capture/j2_capture.hpp"
 
 #include "core/motion_arbiter_gpu.hpp"
 #include "core/temporal_jitter.hpp"
@@ -45,6 +46,7 @@ struct Slot {
 struct PendingHistory {
     na::camera::CameraTracker tracker;
     bool cut = false;
+    uint32_t capture = 0; // J2 evidence capture token for this evaluation (0 = none)
 };
 
 struct State {
@@ -495,6 +497,7 @@ void apply_route_locked(ID3D12CommandQueue* queue)
     if (d.history_generation != g.route_gen_applied) {
         g.route_gen_applied = d.history_generation;
         g.resume_reset = true;   // output of the old route must not feed the new one
+        if (g.inl.valid) na::capture::j2::Discard(g.inl.history.capture, true);
         g.inl.valid = false;     // an inline recording from the old route is not committed
         g.scene_batches_target = 0;
     }
@@ -1124,6 +1127,41 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     e.auto_exposure = true;
     const bool evaluated = na::dlss::Evaluate(l, e);
     if (!evaluated) ++g.stats.dlss_failed;
+    if (evaluated && na::capture::j2::Armed()) {
+        // Evidence capture: copied in this same list right after the evaluate, so the GPU
+        // order makes them exactly this evaluation's inputs and raw DLSS output.
+        na::capture::j2::Planes cp;
+        cp.color = g.color_in.Get();
+        cp.depth = g.depth32.Get();
+        cp.motion = g.motion.Get();
+        cp.output = g.output.Get();
+        na::capture::j2::Identity ci;
+        ci.present_ordinal = g.frame;
+        ci.submission = g.stats.submissions;
+        ci.recording = inl ? na::observe::ListRecording(inl) : 0;
+        ci.view_color = color_id;
+        ci.view_depth = depth_id;
+        ci.view_id = static_cast<uint32_t>(kViewId);
+        const auto& rd = g.router.Current();
+        ci.route = static_cast<uint32_t>(inl ? na::j2::Route::Inline : na::j2::Route::Between);
+        ci.route_mode = static_cast<uint32_t>(g.router.Mode());
+        ci.history_generation = rd.history_generation;
+        ci.insertion_signature = inl ? rd.signature : 0;
+        ci.color_sub = csub;
+        ci.width = w;
+        ci.height = h;
+        ci.color_format = static_cast<uint32_t>(cf);
+        ci.jitter_x = e.jitter_x;
+        ci.jitter_y = e.jitter_y;
+        ci.mv_scale_x = e.mv_scale_x;
+        ci.mv_scale_y = e.mv_scale_y;
+        ci.reset = e.reset ? 1u : 0u;
+        ci.camera_cut = cam.camera_cut ? 1u : 0u;
+        ci.preset = static_cast<uint32_t>(e.preset);
+        ci.sharpness = na::settings::Get().j2_sharpness.load(std::memory_order_relaxed);
+        ci.debug_view = static_cast<uint32_t>(g_debug_view.load(std::memory_order_relaxed));
+        pending.capture = na::capture::j2::RecordEvaluation(l, cp, ci);
+    }
     if (evaluated) {
         const int dv = g_debug_view.load(std::memory_order_relaxed);
         if (dv >= 1 && dv <= 3) {
@@ -1284,10 +1322,11 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     if (touched && !na::observe::RestoreListState(l)) {
         // Checked as restorable above; this cannot normally happen. Stop for the session.
         g.latched = true;
+        na::capture::j2::Discard(pending.capture, true);
         reason("Stopped: the game's list state could not be restored after inline DLAA.");
         return;
     }
-    if (!ok) return;
+    if (!ok) { na::capture::j2::Discard(pending.capture, true); return; } // the game's list still runs our copies
     g.slot = (g.slot + 1) % kRing;
     g.inl.list = l;
     g.inl.rec = rec;
@@ -1359,6 +1398,7 @@ void OnPresent(ID3D12CommandQueue* queue)
             o.executed = g.submitted_frame == g.frame;
             const uint64_t late = g.stats.inline_late_writes + g.stats.post_scene_batches;
             o.later_scene_write = o.executed && late > g.route_prev_late;
+            na::capture::j2::OnFrameClosed(g.frame, late - g.route_prev_late); // evidence capture identity
             o.camera_missed = g.stats.no_camera > g.route_prev_no_camera;
             o.depth_state_missed = g.stats.no_state > g.route_prev_no_state;
             g.route_prev_late = late;
@@ -1538,6 +1578,8 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         g.stats.active = true;
         g.slots[g.inl.slot].fence_value = g.fence_next++;
         queue->Signal(g.fence.Get(), g.slots[g.inl.slot].fence_value);
+        na::capture::j2::Submitted(g.inl.history.capture, queue, g.stats.submissions);
+        g.inl.history.capture = 0;
         g.inl.valid = false;
         reason("Live DLAA is running inside the game's scene list (post-processing shares it).");
         return;
@@ -1625,6 +1667,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     if (!wait_later) g.stats.active = ours != nullptr;
     if (scene >= 0 && !wait_later) g.jit.valid = false; // the scene closes this frame's jitter: the next camera block starts a new sample
     if (!ours) {
+        na::capture::j2::Discard(pending.capture, false); // our list is reset before any GPU use
         lock.unlock();
         forward(queue, count, lists);
         return;
@@ -1656,6 +1699,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     na::dlss::OnExecuted(queue, n2, batch.data());
     s.fence_value = g.fence_next++;
     queue->Signal(g.fence.Get(), s.fence_value);
+    na::capture::j2::Submitted(pending.capture, queue, g.stats.submissions);
 }
 
 Stats GetStats()

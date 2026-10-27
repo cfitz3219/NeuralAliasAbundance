@@ -18,6 +18,7 @@
 #include "host_dx12/dlss/dlss_backend.hpp"
 #include "host_dx12/host_observe.h"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/observe/producers.hpp"
 
 #include <d3dcompiler.h>
@@ -25,10 +26,35 @@
 #include <cmath>
 #include <cstring>
 #include <vector>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <windows.h>
 
 namespace {
 void __cdecl Sink(const na_event_batch*, void*) {}
 std::vector<ID3D12CommandList*> g_forwarded;
+void __stdcall PlainExecute(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists) { q->ExecuteCommandLists(n, lists); }
+long FileSize(const std::wstring& path)
+{
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"rb") || !f) return -1;
+    std::fseek(f, 0, SEEK_END);
+    const long n = std::ftell(f);
+    std::fclose(f);
+    return n;
+}
+std::string ReadText(const std::wstring& path)
+{
+    std::string out;
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"rb") || !f) return out;
+    char buf[4096];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) out.append(buf, n);
+    std::fclose(f);
+    return out;
+}
 void __stdcall Forward(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists)
 {
     g_forwarded.assign(lists, lists + n);
@@ -383,6 +409,25 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
     na::j2::SetEnabled(true);
     na::j2::SetJitter(true); // J1 is off by default in the game; the tests exercise it
     na::observe::SetLiveSelection(na::observe::IdOf(depth.Get()), na::observe::IdOf(color.Get()));
+    // Auto modes also exercise the J2 evidence capture: 3 consecutive evaluations, each
+    // with its own slot, joined by the presented image (a stand-in in PRESENT state).
+    const bool capture = auto_inline || auto_between;
+    test::ComPtr<ID3D12Resource> presented;
+    std::wstring cap_dir;
+    if (capture) {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC pd{};
+        pd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        pd.Width = W; pd.Height = H; pd.DepthOrArraySize = 1; pd.MipLevels = 1;
+        pd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        pd.SampleDesc.Count = 1;
+        REQUIRE(SUCCEEDED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &pd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&presented))));
+        wchar_t tmp[MAX_PATH];
+        REQUIRE(GetTempPathW(MAX_PATH, tmp) > 0);
+        cap_dir = std::wstring(tmp) + L"na_j2_capture_" + std::to_wstring(GetCurrentProcessId()) + (auto_inline ? L"_inline" : L"_between");
+        na::capture::j2::Request(3, cap_dir.c_str(), 0);
+    }
     const auto frame = [&](double cam_x, bool unpatched_prepass = false) {
         d.WaitIdle();
         const int frame_evals = fake::evals;
@@ -539,6 +584,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             Submit(q, 2, lists, true);
         }
         na::j2::OnPresent(q);
+        if (capture) na::capture::j2::OnPresent(q, presented.Get(), &PlainExecute);
         d.WaitIdle();
         const auto ps = na::observe::GetProducerStats();
         std::printf("producers: known disabled %u unknown_inflight %u entries %llu unhooked_queues %llu clears %llu sample_known %llu\n",
@@ -567,6 +613,31 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         else CHECK(as.inline_frames == 0 && g_forwarded.size() == 3);
         CHECK(as.route.contribution_established == 0);           // lineage not observed: unknown
         CHECK(dev->GetDeviceRemovedReason() == S_OK);
+        // Evidence capture: written only after each slot's fences completed.
+        d.WaitIdle();
+        na::capture::j2::Shutdown();
+        const auto cs = na::capture::j2::GetStats();
+        std::printf("capture: recorded %u submitted %u written %u busy %u discarded %u retired %u no-present %u errors %u\n",
+                    cs.recorded, cs.submitted, cs.written, cs.dropped_busy, cs.discarded, cs.retired, cs.without_present, cs.errors);
+        CHECK(cs.recorded == 3 && cs.submitted == 3 && cs.written == 3);
+        CHECK(cs.without_present == 0 && cs.errors == 0 && cs.retired == 0);
+        uint64_t prev_ordinal = 0;
+        for (int i = 0; i < 3; ++i) {
+            wchar_t base[32];
+            swprintf_s(base, L"\\%05d-", i);
+            const std::wstring b = cap_dir + base;
+            for (const wchar_t* plane : {L"color", L"depth", L"motion", L"dlssout", L"present"})
+                CHECK(FileSize(b + plane + L".raw") > 0);
+            const std::string meta = ReadText(b + L"meta.json");
+            CHECK(meta.find(auto_inline ? "\"route\": 2," : "\"route\": 1,") != std::string::npos);
+            CHECK(meta.find("\"frame_closed\": true") != std::string::npos);
+            const size_t at = meta.find("\"present_ordinal\": ");
+            CHECK(at != std::string::npos);
+            const uint64_t ordinal = at == std::string::npos ? 0 : std::strtoull(meta.c_str() + at + 19, nullptr, 10);
+            if (i) CHECK(ordinal == prev_ordinal + 1); // consecutive frames, one slot each
+            prev_ordinal = ordinal;
+        }
+        CHECK(FileSize(cap_dir + L"\\00003-meta.json") < 0); // bounded: exactly the requested frames
         return test::finish(auto_inline ? "j2_anno_shape_test (auto-inline)" : "j2_anno_shape_test (auto-between)");
     }
     if (inline_list) {
