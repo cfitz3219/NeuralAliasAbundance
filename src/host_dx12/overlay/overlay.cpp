@@ -504,12 +504,12 @@ void write_status_line()
         {
             const auto& rj = j2.inline_rejects;
             char rl[400];
-            const int nr = snprintf(rl, sizeof rl,
+            const int nrej = snprintf(rl, sizeof rl,
                 "j2_inline_rejects no_learned=%llu resource=%llu writer=%llu occurrence=%llu transition=%llu candidate=%llu destination=%llu pipeline=%llu pending=%llu last_frame=%u\r\n",
                 (unsigned long long)rj[0], (unsigned long long)rj[1], (unsigned long long)rj[2], (unsigned long long)rj[3],
                 (unsigned long long)rj[4], (unsigned long long)rj[5], (unsigned long long)rj[6], (unsigned long long)rj[7],
                 (unsigned long long)rj[8], j2.inline_frame_rejects);
-            if (nr > 0) WriteFile(f, rl, static_cast<DWORD>((std::min)(nr, static_cast<int>(sizeof rl - 1))), &written, nullptr);
+            if (nrej > 0) WriteFile(f, rl, static_cast<DWORD>((std::min)(nrej, static_cast<int>(sizeof rl - 1))), &written, nullptr);
             const auto cs = na::capture::j2::GetStats();
             if (cs.requested) {
                 char cl[300];
