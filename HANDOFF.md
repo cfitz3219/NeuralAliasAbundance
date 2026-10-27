@@ -432,3 +432,12 @@ PR50 astra/insertion-detector head23b268a (production146b3a8), stacked on PR44/9
 ## 2026-10-27 — remaining SER misses/quality follow-up prepared
 
 PR50 b8a266c adds producer-based boundary matching and coherent inline raster/NGX jitter, including full-scan injected-matrix recognition. Release and8/8 focused tests pass; live verification pending. Prepared DLL AA8BAE40569ED63B0F379307B72935449372BE5C341E16A8084F36F656EBA61E not deployed. Current working146b3a8/EEC7316B stays installed. Desktop tool could not restore minimized game1052424 after documented recovery; user asked asynchronously to restore once. Resume with fresh window binding, combine reversible deployment/restart, measure misses/late writes/jitter and visual quality. Opus review not present in COMMS/PR reviews at latest check; focused review requested. Do not report remaining misses/image quality complete from fixture results.
+
+
+## 2026-10-27 — Astra: SER run8, insertion and record-first jitter
+
+Supersedes earlier minimized-game/live-blocked status. PR50 head7b28ffc; production90144fc DLL3F2765A21C7B875B7F4D58D3CA22907C65EB80B6BEE234CAB576E77F69951904 deployed in SER bin. GamePID35488 left running, DLAAOn, jitterOn, debugOff, sharpness0, presetK, Homeclosed. Original and run6/run7 DLL backups plus manifest/logs in C:/Users/Cort/NeuralAliasAbundance/local/ser-insertion-20261027. Worktree astra-insertion-detector clean/pushed.
+
+Run7:10985/10985 sampled gameplay frames covered, later writes0, jitter0. Run8 record-first scheduling correction:3024/3024 sampled gameplay frames covered and nonzero selected-camera-buffer/NGX jitter; later writes0. Fine-motion diagnostic black on stationary scene with jitterOn, depth output reaches image. Eight focused tests pass including record-first matrix/NGX alignment and previously-submitted-unpatched-camera case. Sharpness0 removes added grit; normal/native still comparison completed.
+
+Not complete: independent all-pass raster jitter displacement, moving-image quality, and exit crash (run7 c0000005 dxgi0xe55e3). Existing capture utility is currently native-NGX-observer-wired; a focused J2 input capture would settle full raster jitter alignment, without implementing the separate full recorder. No Opus review found in COMMS or PR50; request posted. Do not claim universal compatibility or all quality issues solved. No crash report sent.
