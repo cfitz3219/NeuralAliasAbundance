@@ -111,6 +111,21 @@ bool ListReferences(ID3D12CommandList* list, na_object_id id);            // the
 bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id depth);
 // An explicit SRV-table binding referenced the texture. Positive ordering hint
 // only: unobserved/bindless/late descriptor changes are not ruled out by false.
+// Inline insertion (J2). Called on the recording thread right after the game binds
+// a descriptor table that contains SRVs (the resources listed), with no observer
+// locks held; host work recorded into `list` from the callback must run under a
+// HostWorkScope and end with RestoreListState(list).
+using TableBindCallback = void (*)(ID3D12GraphicsCommandList* list, const na_object_id* srvs, uint32_t count, bool compute);
+void SetTableBindCallback(TableBindCallback cb);
+// Re-applies the game's descriptor heaps, root signatures, every root argument and the
+// pipeline state of this recording. False (nothing issued) if the state is not fully
+// known (unobserved recording, a bundle was executed).
+bool RestoreListState(ID3D12GraphicsCommandList* list);
+bool ListStateRestorable(ID3D12CommandList* list); // RestoreListState would succeed
+// First render target and depth currently bound in the recording.
+bool ListCurrentTargets(ID3D12CommandList* list, na_object_id* rt, na_object_id* ds);
+// Identity of the list's current recording (changes on every Reset); 0 if unknown.
+uint64_t ListRecording(ID3D12CommandList* list);
 // True when this recording cleared `target` with ClearRenderTargetView.
 bool ListClearsTarget(ID3D12CommandList* list, na_object_id target);
 bool ListSamplesTexture(ID3D12CommandList* list, na_object_id texture);
@@ -131,6 +146,9 @@ bool KnownStateInCurrentSubmission(na_object_id id, uint32_t* state);
 // Per-subresource variants (depth/stencil planes, mips and array slices transitioned
 // separately): the state of subresource `sub` only.
 bool KnownSubStateInCurrentSubmission(na_object_id id, uint32_t sub, uint32_t* state);
+// The subresource's state after all work submitted so far (no submission context:
+// for host work recorded during the game's recording). False when unknown/in flight.
+bool KnownSubStateNow(na_object_id id, uint32_t sub, uint32_t* state);
 bool ListLastStateSub(ID3D12CommandList* list, na_object_id id, uint32_t sub, uint32_t* state);
 // Texture LOD bias added to the game's mip-mapped samplers (sampler descriptors
 // and root-signature static samplers) created from now on; 0 = off. For J2 DLAA

@@ -94,6 +94,9 @@ if(NA_HAVE_NGX_SDK)
   # The scene drawn across two submissions per frame (Sniper Elite Resistance).
   add_test(NAME host_j2_split_scene_test COMMAND j2_anno_shape_test 1 1 --split)
   set_tests_properties(host_j2_split_scene_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS host)
+  # Scene + post-processing in one command list: DLAA recorded inside it (inline).
+  add_test(NAME host_j2_inline_test COMMAND j2_anno_shape_test 1 1 --inline)
+  set_tests_properties(host_j2_inline_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS host)
   na_host_test(j2_msaa_resolve_test SOURCES j2_msaa_resolve_test.cpp LIBS host_dx12 dxgi)
   add_test(NAME host_j2_msaa_depth32_test COMMAND j2_msaa_resolve_test 2 --depth32)
   set_tests_properties(host_j2_msaa_depth32_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS host)

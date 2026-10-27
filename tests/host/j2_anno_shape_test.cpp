@@ -98,7 +98,11 @@ int main(int argc, char** argv)
     // --split: the scene is drawn across two submissions per frame (Sniper Elite
     // Resistance); DLAA must follow the second one, before the post pass.
     const bool split = argc > 3 && std::strcmp(argv[3], "--split") == 0;
-    const bool post_reader = argc > 3 && !real_ngx && !planes && !split;
+    // --inline: the scene and its post-processing are recorded in ONE command list
+    // (Sniper Elite Resistance); DLAA must be recorded inside it, before the post
+    // pass binds the colour for reading, and the game's state handed back.
+    const bool inline_list = argc > 3 && std::strcmp(argv[3], "--inline") == 0;
+    const bool post_reader = argc > 3 && !real_ngx && !planes && !split && !inline_list;
     test::Device d;
     if (!test::CreateDevice(d)) return test::SkipNoDevice("j2_anno_shape_test");
     if (real_ngx) {
@@ -286,7 +290,7 @@ int main(int argc, char** argv)
     REQUIRE(post_color);
     test::ComPtr<ID3D12DescriptorHeap> post_heap;
     test::ComPtr<ID3D12RootSignature> post_root;
-    if (post_reader) {
+    if (post_reader || inline_list) {
         REQUIRE(!msaa);
         REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&chd, IID_PPV_ARGS(&post_heap))));
         D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
@@ -302,6 +306,18 @@ int main(int argc, char** argv)
         test::ComPtr<ID3DBlob> blob, error;
         REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)));
         REQUIRE(SUCCEEDED(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&post_root))));
+    }
+    // Inline mode: the post pass draws into its own target (another resource).
+    test::ComPtr<ID3D12Resource> post_rt;
+    test::ComPtr<ID3D12DescriptorHeap> post_rtvh;
+    D3D12_CPU_DESCRIPTOR_HANDLE post_rtv{};
+    if (inline_list) {
+        post_rt = test::CreateTexture(dev, W, H, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        REQUIRE(post_rt);
+        D3D12_DESCRIPTOR_HEAP_DESC phd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&phd, IID_PPV_ARGS(&post_rtvh))));
+        post_rtv = post_rtvh->GetCPUDescriptorHandleForHeapStart();
+        dev->CreateRenderTargetView(post_rt.Get(), nullptr, post_rtv);
     }
     uint8_t* cpu = nullptr;
     REQUIRE(SUCCEEDED(cb->Map(0, nullptr, reinterpret_cast<void**>(&cpu))) && cpu);
@@ -364,6 +380,17 @@ int main(int argc, char** argv)
         scene.list->SetDescriptorHeaps(1, heaps);
         scene.list->SetGraphicsRootSignature(rs.Get());
         for (int i = 0; i < 3; ++i) scene.list->SetGraphicsRootDescriptorTable(0, cbvh->GetGPUDescriptorHandleForHeapStart());
+        if (inline_list) { // ...then, in the SAME list, post-processing reads the colour
+            D3D12_RESOURCE_BARRIER rd2 = test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            scene.list->ResourceBarrier(1, &rd2);
+            scene.list->OMSetRenderTargets(1, &post_rtv, FALSE, nullptr); // the post pass's own target
+            ID3D12DescriptorHeap* ph[] = {post_heap.Get()};
+            scene.list->SetDescriptorHeaps(1, ph);
+            scene.list->SetGraphicsRootSignature(post_root.Get());
+            scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart()); // inline point
+            std::swap(rd2.Transition.StateBefore, rd2.Transition.StateAfter);
+            scene.list->ResourceBarrier(1, &rd2);
+        }
         REQUIRE(SUCCEEDED(scene.list->Close()));
         consumer.Reset(); // a post pass reads the colour, then hands it back as a render target
         D3D12_RESOURCE_BARRIER rd = test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -389,7 +416,10 @@ int main(int argc, char** argv)
         }
         REQUIRE(SUCCEEDED(consumer.list->Close()));
         g_forwarded.clear();
-        if (split) {
+        if (inline_list) {
+            ID3D12CommandList* one[] = {scene.list.Get()};
+            Submit(q, 1, one, true);
+        } else if (split) {
             scene2.Reset(); // more of the scene in a second submission (same camera, same targets)
             scene2.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
             scene2.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr); // weapon-style depth clear: same image
@@ -421,6 +451,22 @@ int main(int argc, char** argv)
     };
     const auto evaluations = [&]() -> uint64_t { return real_ngx ? na::dlss::GetStats().evaluates : uint64_t(fake::evals); };
     const uint64_t evals0 = evaluations();
+    if (inline_list) {
+        for (int f = 0; f < 4; ++f) REQUIRE(frame(0.25 * f) == 0);
+        const auto is = na::j2::GetStats();
+        std::printf("inline: mode %u, candidates %llu, recorded %llu, frames %llu (inline %llu), refused %llu, evals %llu, forwarded %zu, \"%s\"\n",
+                    is.inline_mode, (unsigned long long)is.inline_candidates, (unsigned long long)is.inline_recorded,
+                    (unsigned long long)is.frames, (unsigned long long)is.inline_frames, (unsigned long long)is.inline_refused,
+                    (unsigned long long)(evaluations() - evals0), g_forwarded.size(), is.reason);
+        CHECK(is.inline_mode == 1);                  // detected on the first frame
+        CHECK(is.inline_frames >= 2);                // frames 2.. ran DLAA inside the game's list
+        CHECK(is.inline_recorded == is.inline_frames);
+        CHECK(evaluations() >= evals0 + 2);
+        CHECK(g_forwarded.size() == 1);              // no J2 list was inserted
+        CHECK(is.inline_refused == 0);
+        CHECK(dev->GetDeviceRemovedReason() == S_OK); // the game's list (with our work and the restored state) ran
+        return test::finish("j2_anno_shape_test (inline)");
+    }
     if (split) {
         for (int f = 0; f < 4; ++f) REQUIRE(frame(0.25 * f) == 0);
         const auto ss = na::j2::GetStats();

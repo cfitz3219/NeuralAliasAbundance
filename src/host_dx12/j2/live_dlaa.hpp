@@ -89,6 +89,9 @@ struct Stats {
     // that still came after our DLAA (insertion too early).
     uint32_t scene_batches = 0, scene_batches_max = 0, scene_batches_target = 0;
     uint64_t waited_batches = 0, post_scene_batches = 0;
+    // Inline insertion (post-processing recorded in the scene's own list).
+    uint32_t inline_mode = 0, inline_target = 0;
+    uint64_t inline_candidates = 0, inline_waited = 0, inline_recorded = 0, inline_frames = 0, inline_refused = 0;
     bool depth_reversed = false;  // reverse-Z as classified from the camera    // other render targets bound after the scene in the same list (insertion may be late)
     uint32_t width = 0, height = 0, color_format = 0;
     // Shape of the selected resources (reported even when J2 refuses them).

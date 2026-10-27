@@ -41,6 +41,11 @@ struct Slot {
     UINT64 fence_value = 0;
 };
 
+struct PendingHistory {
+    na::camera::CameraTracker tracker;
+    bool cut = false;
+};
+
 struct State {
     std::mutex m;
     std::atomic<bool> enabled{false};
@@ -78,6 +83,24 @@ struct State {
     uint32_t scene_batches_cur = 0, scene_batches_target = 0;
     uint8_t batch_hist[16] = {};
     uint32_t batch_hist_n = 0;
+    // Inline insertion (games that record the end of the scene AND their
+    // post-processing in one command list, Sniper Elite Resistance): DLAA is
+    // recorded INTO the game's list at the moment it binds the scene colour for
+    // reading, then the game's state is restored. Detected automatically.
+    bool inline_mode = false;
+    const void* inl_last_list = nullptr; // one candidate per recording
+    uint64_t inl_last_rec = 0;
+    uint32_t inl_cands_cur = 0, inl_target = 0; // colour readers per frame (learned like scene batches)
+    uint8_t inl_hist[16] = {};
+    uint32_t inl_hist_n = 0;
+    uint64_t inl_frame = 0; // last frame an inline DLAA was recorded
+    struct InlinePending {
+        const void* list = nullptr;
+        uint64_t rec = 0, frame = 0;
+        uint32_t slot = 0;
+        PendingHistory history;
+        bool valid = false;
+    } inl;
     int64_t camera_offset = -1; // learned offset of the ViewProjection inside its block
     int64_t camera_param = -1;  // learned root parameter that binds the camera block
     int64_t camera_inv_delta = 64; // learned byte distance from the ViewProjection to its inverse
@@ -432,6 +455,18 @@ bool ensure_device(ID3D12CommandQueue* q)
     return true;
 }
 
+// DLSS on J2's device (our own NGX instance, data in %TEMP%\NeuralAlias-ngx).
+bool dlss_on()
+{
+    wchar_t path[MAX_PATH] = {};
+    const DWORD n = GetTempPathW(MAX_PATH, path);
+    if (!n || n >= MAX_PATH - 20) { reason("No folder for DLSS data."); return false; }
+    wcscat_s(path, L"NeuralAlias-ngx");
+    CreateDirectoryW(path, nullptr);
+    if (!na::dlss::EnsureOn(g.device.Get(), path)) { reason("DLSS did not start on this device (see DLSS details)."); return false; }
+    return true;
+}
+
 // The resource state at the end of the scene list: its last whole-resource
 // transition there, else in an earlier list of the same batch.
 // State of subresource `sub` after lists[0..last]. Barriers may name that
@@ -583,7 +618,10 @@ void jitter_batch(ID3D12CommandList* const* lists, UINT count)
     // Only while DLAA is producing frames: the previous game frame submitted one
     // (a batch without the scene must not count as "not running").
     const bool running = g.submitted_frame && g.frame == g.submitted_frame + 1;
-    if (!g.jitter_on || g.camera_param < 0 || g.camera_offset < 0 || !running || !g.w) return;
+    // Inline mode: DLAA's parameters are fixed when the game RECORDS its list, the
+    // camera block is jittered when it SUBMITS; until both are tied to one frame,
+    // inline DLAA runs without J1 jitter (stage 1).
+    if (!g.jitter_on || g.inline_mode || g.camera_param < 0 || g.camera_offset < 0 || !running || !g.w) return;
     struct JB { uint64_t res, off; uint32_t size; bool slot; };
     std::map<std::pair<uint64_t, uint64_t>, JB> blocks;
     for (UINT i = 0; i < count && blocks.size() < 256; ++i) {
@@ -810,13 +848,12 @@ na::motion::Mat4 to_mat4(const na::camera::Matrix& m)
 
 // Records the DLAA list for this frame. Returns false (nothing recorded worth
 // submitting) when a precondition fails.
-struct PendingHistory {
-    na::camera::CameraTracker tracker;
-    bool cut = false;
-};
-
+// inl: record INTO this game command list (inline insertion, during the game's
+// recording) instead of J2's own list; *touched reports whether anything was
+// recorded into it (the caller then restores the game's state).
 bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, na_object_id color_id,
-            ID3D12GraphicsCommandList** out_list, PendingHistory& pending)
+            ID3D12GraphicsCommandList** out_list, PendingHistory& pending, ID3D12GraphicsCommandList* inl = nullptr,
+            bool* touched = nullptr)
 {
     ComPtr<ID3D12Resource> color, depth;
     color.Attach(na::observe::AcquireResource(color_id));
@@ -843,7 +880,12 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     }
     // States of exactly the two subresources J2 copies from and restores.
     uint32_t sc = 0, sd = 0;
-    const bool have_sc = state_after(lists, scene, color_id, csub, &sc), have_sd = state_after(lists, scene, depth_id, dsub, &sd);
+    // Inline: the state recorded so far in this list, else the state all submitted work left.
+    const auto state_now = [&](na_object_id id, uint32_t sub, uint32_t* st) {
+        return na::observe::ListLastStateSub(inl, id, sub, st) || na::observe::KnownSubStateNow(id, sub, st);
+    };
+    const bool have_sc = inl ? state_now(color_id, csub, &sc) : state_after(lists, scene, color_id, csub, &sc);
+    const bool have_sd = inl ? state_now(depth_id, dsub, &sd) : state_after(lists, scene, depth_id, dsub, &sd);
     if (!have_sc || !have_sd) {
         ++g.stats.no_state;
         if (!have_sc) ++g.stats.no_state_color; else ++g.stats.no_state_depth;
@@ -926,8 +968,9 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     const na::camera::CameraFrame cam = pending.tracker.Update(vp, g.frame, w, h, injected);
     if (!cam.valid) { ++g.stats.no_camera; reason("The camera matrix could not be inverted."); return false; }
     pending.cut = cam.camera_cut;
-    if (FAILED(s.alloc->Reset()) || FAILED(s.list->Reset(s.alloc.Get(), nullptr))) { reason("Could not reset the DLAA command list."); return false; }
-    ID3D12GraphicsCommandList* l = s.list.Get();
+    if (!inl && (FAILED(s.alloc->Reset()) || FAILED(s.list->Reset(s.alloc.Get(), nullptr)))) { reason("Could not reset the DLAA command list."); return false; }
+    ID3D12GraphicsCommandList* l = inl ? inl : s.list.Get();
+    if (touched) *touched = true;
     std::vector<D3D12_RESOURCE_BARRIER> b;
     constexpr UINT NPSR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, SRC = D3D12_RESOURCE_STATE_COPY_SOURCE,
                    DST = D3D12_RESOURCE_STATE_COPY_DEST, UAV = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -995,7 +1038,12 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         have_motion = g.arbiter.Dispatch(l, in, o, g.slot);
     }
     if (!have_motion) {
-        l->Close();
+        if (inl) { // hand the game's list back with the scene colour in its own state
+            addsub(b, color.Get(), csub, color_source, sc);
+            flush(l, b);
+        } else {
+            l->Close();
+        }
         reason("Stopped: motion vectors could not be built.");
         g.latched = true;
         return false;
@@ -1092,7 +1140,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     }
     add(b, g.motion.Get(), NPSR, UAV);
     flush(l, b);
-    const bool closed = SUCCEEDED(l->Close());
+    const bool closed = inl ? true : SUCCEEDED(l->Close()); // the game closes its own list
     if (!closed) {
         // A rejected list repeats every frame and may cost the device: stop for this
         // session and say exactly what was being processed. Never retried.
@@ -1117,9 +1165,75 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     return true;
 }
 
+// Inline insertion point: the game binds a descriptor table with SRVs on one of
+// its lists while recording. When those SRVs include the scene colour, this list
+// drew the scene (colour + depth), and the colour is no longer being drawn into
+// (another target is bound, or it has been transitioned for reading), the scene
+// is complete: post-processing is about to read it. DLAA is recorded here, into
+// the game's list, and the game's state is put back. One candidate per recording;
+// the frame's LAST candidate is used (learned per frame like scene batches),
+// because a game may also read the colour mid-frame (refraction).
+void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint32_t n, bool)
+{
+    if (!g.enabled.load(std::memory_order_relaxed) || g.paused.load(std::memory_order_relaxed)) return;
+    uint64_t depth_id = 0, color_id = 0;
+    na::observe::GetLiveSelection(&depth_id, &color_id);
+    if (!color_id || !depth_id) return;
+    bool hit = false;
+    for (uint32_t i = 0; i < n && !hit; ++i) hit = srvs[i] == color_id;
+    if (!hit) return;
+    const na::observe::HostWorkScope host; // our commands in the game's list are not the game's
+    std::lock_guard<std::mutex> lock(g.m);
+    if (!g.inline_mode || g.latched || !g.device) return;
+    if (!na::observe::ListRendersTo(l, color_id, depth_id)) return; // the scene was not drawn in this recording
+    const uint64_t rec = na::observe::ListRecording(l);
+    if (!rec || (g.inl_last_list == l && g.inl_last_rec == rec)) return;
+    uint32_t csub = 0, dsub = 0, cst = 0;
+    if (!na::observe::ListSceneSubresource(l, color_id, depth_id, &csub, &dsub)) return;
+    na_object_id cur_rt = 0, cur_ds = 0;
+    na::observe::ListCurrentTargets(l, &cur_rt, &cur_ds);
+    const bool reading = cur_rt != color_id ||
+                         (na::observe::ListLastStateSub(l, color_id, csub, &cst) && !(cst & D3D12_RESOURCE_STATE_RENDER_TARGET));
+    if (!reading) return;
+    g.inl_last_list = l;
+    g.inl_last_rec = rec;
+    ++g.inl_cands_cur;
+    ++g.stats.inline_candidates;
+    if (g.inl_target && g.inl_cands_cur < g.inl_target) { ++g.stats.inline_waited; return; }
+    if (g.inl_frame == g.frame || g.inl.valid) return; // one per frame; the previous one is not submitted yet
+    if (!na::observe::ListStateRestorable(l)) { ++g.stats.inline_refused; reason("The scene list's state cannot be restored after DLAA (a bundle ran); left untouched."); return; }
+    ID3D12CommandList* one[1] = {l};
+    PendingHistory pending;
+    ID3D12GraphicsCommandList* out = nullptr;
+    bool touched = false;
+    const uint32_t slot = g.slot;
+    const bool ok = record(one, 0, depth_id, color_id, &out, pending, l, &touched);
+    if (touched && !na::observe::RestoreListState(l)) {
+        // Checked as restorable above; this cannot normally happen. Stop for the session.
+        g.latched = true;
+        reason("Stopped: the game's list state could not be restored after inline DLAA.");
+        return;
+    }
+    if (!ok) return;
+    g.slot = (g.slot + 1) % kRing;
+    g.inl.list = l;
+    g.inl.rec = rec;
+    g.inl.frame = g.frame;
+    g.inl.slot = slot;
+    g.inl.history = pending;
+    g.inl.valid = true;
+    g.inl_frame = g.frame;
+    ++g.stats.inline_recorded;
+}
+
 } // namespace
 
-void SetEnabled(bool on) { g.enabled.store(on); g.configured.store(on); }
+void SetEnabled(bool on)
+{
+    g.enabled.store(on);
+    g.configured.store(on);
+    if (on) na::observe::SetTableBindCallback(&on_table_bind);
+}
 bool Enabled() { return g.enabled.load(); }
 bool Configured() { return g.configured.load(); }
 void SetPaused(bool paused)
@@ -1179,6 +1293,17 @@ void OnPresent(ID3D12CommandQueue* queue)
             if (g.scene_batches_cur > g.stats.scene_batches_max) g.stats.scene_batches_max = g.scene_batches_cur;
         }
         g.scene_batches_cur = 0;
+        if (g.inl_cands_cur) {
+            g.inl_hist[g.inl_hist_n++ % 16] = static_cast<uint8_t>(g.inl_cands_cur > 255 ? 255 : g.inl_cands_cur);
+            uint32_t votes[256] = {};
+            const uint32_t n = g.inl_hist_n < 16 ? g.inl_hist_n : 16;
+            for (uint32_t i = 0; i < n; ++i) ++votes[g.inl_hist[i]];
+            uint32_t best = 0;
+            for (uint32_t c = 1; c < 256; ++c) if (votes[c] > votes[best]) best = c;
+            g.inl_target = best;
+            g.stats.inline_target = best;
+        }
+        g.inl_cands_cur = 0;
     }
 }
 
@@ -1197,6 +1322,30 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         return;
     }
     ++g.stats.submissions;
+    if (g.inline_mode) {
+        // Inline mode: no J2 list is inserted; DLAA is already inside the game's list.
+        // Its history is committed when that list is actually submitted.
+        bool has = false;
+        if (g.inl.valid)
+            for (UINT i = 0; i < count && !has; ++i)
+                has = lists[i] == g.inl.list && na::observe::ListRecording(lists[i]) == g.inl.rec;
+        lock.unlock();
+        forward(queue, count, lists);
+        if (!has) return;
+        lock.lock();
+        g.tracker = g.inl.history.tracker;
+        g.submitted_frame = g.frame;
+        g.resume_reset = false;
+        if (g.inl.history.cut) ++g.stats.cuts;
+        ++g.stats.frames;
+        ++g.stats.inline_frames;
+        g.stats.active = true;
+        g.slots[g.inl.slot].fence_value = g.fence_next++;
+        queue->Signal(g.fence.Get(), g.slots[g.inl.slot].fence_value);
+        g.inl.valid = false;
+        reason("Live DLAA is running inside the game's scene list (post-processing shares it).");
+        return;
+    }
     if (g.submitted_frame == g.frame) {
         ++g.stats.duplicate_submissions;
         uint64_t dsel = 0, csel = 0;
@@ -1247,6 +1396,18 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
             if (na::observe::ListClearsTarget(lists[i], color_id)) restarts = true;
         }
     }
+    // The scene list itself goes on to READ the colour (post-processing recorded in the
+    // same command list): DLAA between lists would land after that read and never be
+    // seen (Sniper Elite Resistance). Switch to inline insertion from the next frame.
+    if (scene >= 0 && !g.inline_mode && na::observe::ListSamplesTexture(lists[scene], color_id) &&
+        na::observe::ListTargetsAfter(lists[scene], color_id, depth_id) > 0 && ensure_device(queue) && dlss_on()) {
+        g.inline_mode = true;
+        g.stats.inline_mode = 1;
+        reason("The game records post-processing in the scene's own list: switching to inline DLAA.");
+        lock.unlock();
+        forward(queue, count, lists);
+        return;
+    }
     // A batch that clears the colour starts the image over: it is scene batch 1 again.
     if (scene >= 0) g.scene_batches_cur = restarts ? 1 : g.scene_batches_cur + 1;
     // More scene batches are expected this frame (the last frame had them) and
@@ -1261,18 +1422,9 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     } else if (!ensure_device(queue)) {
         // reason set
     } else {
-        const char* dr = nullptr;
-        wchar_t path[MAX_PATH] = {};
-        const DWORD n = GetTempPathW(MAX_PATH, path);
-        if (n && n < MAX_PATH - 20) {
-            wcscat_s(path, L"NeuralAlias-ngx");
-            CreateDirectoryW(path, nullptr);
-            if (!na::dlss::EnsureOn(g.device.Get(), path)) dr = "DLSS did not start on this device (see DLSS details).";
-        } else {
-            dr = "No folder for DLSS data.";
-        }
-        if (dr) reason(dr);
-        else if (record(lists, static_cast<UINT>(scene), depth_id, color_id, &ours, pending)) {
+        if (!dlss_on()) {
+            // reason set
+        } else if (record(lists, static_cast<UINT>(scene), depth_id, color_id, &ours, pending)) {
             g.stats.later_passes = na::observe::ListTargetsAfter(lists[scene], color_id, depth_id);
         }
     }
@@ -1335,6 +1487,13 @@ void Shutdown()
     g.submitted_frame = 0;
     g.scene_batches_cur = g.scene_batches_target = 0;
     g.batch_hist_n = 0;
+    g.inline_mode = false;
+    g.inl = State::InlinePending{};
+    g.inl_last_list = nullptr;
+    g.inl_last_rec = 0;
+    g.inl_cands_cur = g.inl_target = 0;
+    g.inl_hist_n = 0;
+    g.inl_frame = 0;
     g.resume_reset = false;
     g.w = g.h = 0;
 }

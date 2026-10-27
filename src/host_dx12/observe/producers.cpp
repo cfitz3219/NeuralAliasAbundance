@@ -91,6 +91,21 @@ struct ListState {
     // of a particular AA shader or a requirement for DLAA eligibility.
     std::vector<na_object_id> sampled_textures;
     std::vector<na_object_id> cleared; // render targets this recording cleared (ClearRenderTargetView)
+    // Inline insertion (J2): the game's pipeline state in this recording, so host
+    // work recorded INTO the game's list can hand the list back exactly as the game
+    // left it. Written by the recording thread's observers (host calls are not
+    // observed), under bind_m.
+    struct RootArg {
+        uint8_t type = 0; // 0 unset, 1 table, 2 CBV, 3 SRV, 4 UAV, 5 constants
+        uint64_t value = 0;
+        std::vector<uint32_t> consts;
+    };
+    ID3D12PipelineState* pso = nullptr;
+    ID3D12DescriptorHeap* heaps[2] = {nullptr, nullptr};
+    uint32_t nheaps = 0;
+    std::vector<RootArg> args[2]; // [graphics, compute], by root parameter
+    na_object_id cur_rt = 0, cur_ds = 0; // currently bound first render target / depth
+    bool restorable = true;              // false after work whose state effects we cannot replay
 };
 
 struct Obj {
@@ -1969,7 +1984,6 @@ template <>
 struct On<sl::list::Reset> {
     static void run(GL* l, HRESULT hr, ID3D12CommandAllocator* alloc, ID3D12PipelineState* pso)
     {
-        (void)pso;
         if (t_host_work) return;
         na_object_id id = 0;
         bool known = false;
@@ -2001,6 +2015,13 @@ struct On<sl::list::Reset> {
                     ls->targets.clear();
                     ls->sampled_textures.clear();
                     ls->cleared.clear();
+                    ls->pso = pso;
+                    ls->heaps[0] = ls->heaps[1] = nullptr;
+                    ls->nheaps = 0;
+                    ls->args[0].clear();
+                    ls->args[1].clear();
+                    ls->cur_rt = ls->cur_ds = 0;
+                    ls->restorable = true;
                 }
                 ls->root_sig[0] = ls->root_sig[1] = nullptr;
                 ls->coverage_complete.store(cov == na::hooking::variants::Coverage::Complete);
@@ -2175,7 +2196,9 @@ struct On<sl::list::SetPipelineState> {
     static void run(GL* l, ID3D12PipelineState* p)
     {
         Rec r;
-        if (begin_op(l, &r)) emit_op(r, NA_OP_SET_PIPELINE, {id_or_unknown(p)});
+        if (!begin_op(l, &r)) return;
+        emit_op(r, NA_OP_SET_PIPELINE, {id_or_unknown(p)});
+        with_list_state(l, [&](ListState& ls) { std::lock_guard<std::mutex> bl(ls.bind_m); ls.pso = p; });
     }
 };
 template <>
@@ -2263,7 +2286,9 @@ struct On<sl::list::ExecuteBundle> {
     static void run(GL* l, ID3D12GraphicsCommandList* bundle)
     {
         Rec r;
-        if (begin_op(l, &r)) emit_op(r, NA_OP_EXECUTE_BUNDLE, {id_or_unknown(bundle)}, nullptr, 0, 0, NA_EVF_METHOD_UNOBSERVED);
+        if (!begin_op(l, &r)) return;
+        emit_op(r, NA_OP_EXECUTE_BUNDLE, {id_or_unknown(bundle)}, nullptr, 0, 0, NA_EVF_METHOD_UNOBSERVED);
+        with_list_state(l, [&](ListState& ls) { std::lock_guard<std::mutex> bl(ls.bind_m); ls.restorable = false; }); // a bundle's state changes are not observed
     }
 };
 template <>
@@ -2281,6 +2306,11 @@ struct On<sl::list::SetDescriptorHeaps> {
                 if (dh->key == h[i]) (dh->type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? smp : res) = dh->id;
         }
         emit_op(r, NA_OP_SET_DESCRIPTOR_HEAPS, {res, smp});
+        with_list_state(l, [&](ListState& ls) {
+            std::lock_guard<std::mutex> bl(ls.bind_m);
+            ls.nheaps = 0;
+            for (UINT i = 0; h && i < n && i < 2; ++i) ls.heaps[ls.nheaps++] = h[i];
+        });
     }
 };
 template <uint32_t Compute>
@@ -2289,12 +2319,38 @@ void root_sig(GL* l, ID3D12RootSignature* rs)
     Rec r;
     if (!begin_op(l, &r)) return;
     emit_op(r, NA_OP_SET_ROOT_SIGNATURE, {id_or_unknown(rs), Compute});
-    with_list_state(l, [&](ListState& ls) { ls.root_sig[Compute] = rs; });
+    with_list_state(l, [&](ListState& ls) {
+        const bool changed = ls.root_sig[Compute] != rs;
+        ls.root_sig[Compute] = rs;
+        std::lock_guard<std::mutex> bl(ls.bind_m);
+        if (changed) ls.args[Compute].clear(); // a different root signature invalidates every root argument
+    });
 }
 template <>
 struct On<sl::list::SetComputeRootSignature> { static void run(GL* l, ID3D12RootSignature* rs) { root_sig<1>(l, rs); } };
 template <>
 struct On<sl::list::SetGraphicsRootSignature> { static void run(GL* l, ID3D12RootSignature* rs) { root_sig<0>(l, rs); } };
+void shadow_arg(GL* l, uint32_t compute, UINT param, uint8_t type, uint64_t value, const void* consts = nullptr, UINT count = 0, UINT dest = 0)
+{
+    if (param >= 64) return;
+    with_list_state(l, [&](ListState& ls) {
+        std::lock_guard<std::mutex> bl(ls.bind_m);
+        auto& v = ls.args[compute];
+        if (v.size() <= param) v.resize(param + 1);
+        ListState::RootArg& a = v[param];
+        if (type == 5) {
+            if (a.type != 5) a.consts.clear();
+            if (dest + count > 64) return;
+            if (a.consts.size() < dest + count) a.consts.resize(dest + count, 0u);
+            std::memcpy(a.consts.data() + dest, consts, count * 4u);
+        } else {
+            a.consts.clear();
+        }
+        a.type = type;
+        a.value = value;
+    });
+}
+std::atomic<TableBindCallback> g_table_cb{nullptr};
 template <uint32_t Compute>
 void root_table(GL* l, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE h)
 {
@@ -2303,6 +2359,9 @@ void root_table(GL* l, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE h)
     na_object_id heap = 0;
     uint32_t slot = 0;
     uint64_t version = 0;
+    na_object_id srvs[64];
+    uint32_t nsrv = 0;
+    shadow_arg(l, Compute, param, 1, h.ptr);
     {
         std::shared_lock<std::shared_mutex> lock(g_m);
         DescHeap* dh = heap_for_gpu_locked(h.ptr, &slot);
@@ -2327,6 +2386,7 @@ void root_table(GL* l, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE h)
                                 const uint64_t index = uint64_t(slot) + range.table_offset + k;
                                 if (index >= dh->count) break;
                                 const auto& si = dh->info[static_cast<size_t>(index)];
+                                if (si.kind == NA_DESC_SRV && si.resource && si.resource != NA_UNKNOWN_U64 && nsrv < 64) srvs[nsrv++] = si.resource;
                                 if (si.kind == NA_DESC_SRV && si.resource && si.resource != NA_UNKNOWN_U64 &&
                                     ls->sampled_textures.size() < 256 &&
                                     std::find(ls->sampled_textures.begin(), ls->sampled_textures.end(), si.resource) == ls->sampled_textures.end())
@@ -2357,6 +2417,8 @@ void root_table(GL* l, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE h)
     }
     emit_op(r, NA_OP_SET_ROOT_TABLE, {heap, heap ? slot : uint64_t{NA_UNKNOWN_U32}, heap ? version : NA_UNKNOWN_U64, param, Compute}, nullptr, 0, 0,
             heap ? 0u : NA_EVF_METHOD_UNOBSERVED);
+    // Inline insertion point (J2): the game binds textures for reading, no locks held.
+    if (nsrv) if (TableBindCallback cb = g_table_cb.load(std::memory_order_acquire)) cb(l, srvs, nsrv, Compute != 0);
 }
 template <>
 struct On<sl::list::SetComputeRootDescriptorTable> { static void run(GL* l, UINT p, D3D12_GPU_DESCRIPTOR_HANDLE h) { root_table<1>(l, p, h); } };
@@ -2368,6 +2430,7 @@ void root_consts(GL* l, UINT param, UINT count, const void* data, UINT dest)
     Rec r;
     if (!begin_op(l, &r) || !data) return;
     emit_op(r, NA_OP_SET_ROOT_CONSTANTS, {param, dest, count, Compute}, data, count * 4u, 4u, 0, NA_GROUP_CPU_CONSTANTS);
+    shadow_arg(l, Compute, param, 5, 0, data, count, dest);
 }
 template <>
 struct On<sl::list::SetComputeRoot32BitConstant> { static void run(GL* l, UINT p, UINT v, UINT d) { root_consts<1>(l, p, 1, &v, d); } };
@@ -2382,6 +2445,7 @@ void root_view(GL* l, UINT param, D3D12_GPU_VIRTUAL_ADDRESS va)
 {
     Rec r;
     if (!begin_op(l, &r)) return;
+    shadow_arg(l, Compute, param, Kind == NA_DESC_CBV ? 2 : (Kind == NA_DESC_SRV ? 3 : 4), va);
     na_object_id res = 0;
     uint64_t off = 0;
     bool known = false;
@@ -2443,6 +2507,9 @@ struct On<sl::list::OMSetRenderTargets> {
                 NA_GROUP_RESOURCE_USE);
         with_list_state(l, [&](ListState& ls) {
             std::lock_guard<std::mutex> bl(ls.bind_m);
+            const uint32_t nrt = dsv ? (m ? m - 1 : 0) : m;
+            ls.cur_rt = nrt ? refs[0].resource : 0;
+            ls.cur_ds = dsv && m ? refs[m - 1].resource : 0;
             for (uint32_t i = 0; i < m; ++i) add_use_locked(ls, refs[i].resource);
             if (m > 0 && ls.targets.size() < 4096) {
                 const na_object_id ds = dsv ? refs[m - 1].resource : 0; // 0: no depth target
@@ -3884,6 +3951,80 @@ bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id dep
     std::lock_guard<std::mutex> bl(ls->bind_m);
     return std::any_of(ls->targets.begin(), ls->targets.end(), [&](const ListState::Target& t) { return t.same(color, depth); });
 }
+void SetTableBindCallback(TableBindCallback cb) { g_table_cb.store(cb, std::memory_order_release); }
+bool ListCurrentTargets(ID3D12CommandList* list, na_object_id* rt, na_object_id* ds)
+{
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    if (rt) *rt = ls->cur_rt;
+    if (ds) *ds = ls->cur_ds;
+    return true;
+}
+uint64_t ListRecording(ID3D12CommandList* list)
+{
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load() || !ls->generation_known.load()) return 0;
+    return ls->generation.load() + 1; // never 0
+}
+bool ListStateRestorable(ID3D12CommandList* l)
+{
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = l ? list_state_locked(l, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return ls->restorable;
+}
+bool RestoreListState(ID3D12GraphicsCommandList* l)
+{
+    // Snapshot under the locks, issue the calls without them (these calls run
+    // under the caller's HostWorkScope, so they are not observed as the game's).
+    ID3D12PipelineState* pso = nullptr;
+    ID3D12DescriptorHeap* heaps[2] = {};
+    uint32_t nheaps = 0;
+    const void* rs[2] = {};
+    std::vector<ListState::RootArg> args[2];
+    {
+        std::shared_lock<std::shared_mutex> rl(g_m);
+        na_object_id lid = 0;
+        ListState* ls = l ? list_state_locked(l, &lid) : nullptr;
+        if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
+        std::lock_guard<std::mutex> bl(ls->bind_m);
+        if (!ls->restorable) return false;
+        pso = ls->pso;
+        nheaps = ls->nheaps;
+        heaps[0] = ls->heaps[0];
+        heaps[1] = ls->heaps[1];
+        rs[0] = ls->root_sig[0];
+        rs[1] = ls->root_sig[1];
+        args[0] = ls->args[0];
+        args[1] = ls->args[1];
+    }
+    if (nheaps) l->SetDescriptorHeaps(nheaps, heaps);
+    for (uint32_t c = 0; c < 2; ++c) {
+        if (!rs[c]) continue;
+        auto* sig = static_cast<ID3D12RootSignature*>(const_cast<void*>(rs[c]));
+        if (c) l->SetComputeRootSignature(sig); else l->SetGraphicsRootSignature(sig);
+        for (UINT p = 0; p < args[c].size(); ++p) {
+            const ListState::RootArg& a = args[c][p];
+            switch (a.type) {
+            case 1: { D3D12_GPU_DESCRIPTOR_HANDLE h{a.value}; if (c) l->SetComputeRootDescriptorTable(p, h); else l->SetGraphicsRootDescriptorTable(p, h); break; }
+            case 2: if (c) l->SetComputeRootConstantBufferView(p, a.value); else l->SetGraphicsRootConstantBufferView(p, a.value); break;
+            case 3: if (c) l->SetComputeRootShaderResourceView(p, a.value); else l->SetGraphicsRootShaderResourceView(p, a.value); break;
+            case 4: if (c) l->SetComputeRootUnorderedAccessView(p, a.value); else l->SetGraphicsRootUnorderedAccessView(p, a.value); break;
+            case 5: if (!a.consts.empty()) { if (c) l->SetComputeRoot32BitConstants(p, static_cast<UINT>(a.consts.size()), a.consts.data(), 0); else l->SetGraphicsRoot32BitConstants(p, static_cast<UINT>(a.consts.size()), a.consts.data(), 0); } break;
+            default: break;
+            }
+        }
+    }
+    if (pso) l->SetPipelineState(pso);
+    return true;
+}
 bool ListClearsTarget(ID3D12CommandList* list, na_object_id target)
 {
     std::shared_lock<std::shared_mutex> rl(g_m);
@@ -4023,6 +4164,19 @@ uint32_t ReadBuffer(na_object_id res, uint64_t offset, void* dst, uint32_t n)
     t_host_work = was_host;
     reread->Release();
     return ok ? n : 0;
+}
+bool KnownSubStateNow(na_object_id id, uint32_t sub, uint32_t* state)
+{
+    if (!state || !id || g_known_disabled.load() || g_unhooked_queues.load()) return false;
+    std::lock_guard<std::mutex> lock(g_known_m);
+    if (g_unknown_inflight) return false;
+    auto it = g_known.find(id);
+    if (it == g_known.end() || it->second.in_flight) return false;
+    auto s = it->second.subs.find(sub);
+    const uint32_t v = s != it->second.subs.end() ? s->second : (it->second.has_all ? it->second.all : kStatePending);
+    if (v == kStatePending || v == D3D12_RESOURCE_STATE_COMMON) return false;
+    *state = v;
+    return true;
 }
 bool KnownSubStateInCurrentSubmission(na_object_id id, uint32_t sub, uint32_t* state)
 {
