@@ -6,6 +6,7 @@
 #include <dxgi1_4.h>
 
 #include "queue_occurrences.hpp"
+#include "host_dx12/j2/insertion_trace.hpp"
 #include <algorithm>
 #include <system_error>
 #include <chrono>
@@ -87,6 +88,7 @@ struct ListState {
         bool same(na_object_id r, na_object_id d) const { return rt == r && ds == d; }
     };
     std::vector<Target> targets;
+    na::j2::InsertionTrace insertion;
     // Explicit bounded SRV-table observations are a pass-order hint, not proof
     // of a particular AA shader or a requirement for DLAA eligibility.
     std::vector<na_object_id> sampled_textures;
@@ -105,6 +107,9 @@ struct ListState {
     uint32_t nheaps = 0;
     std::vector<RootArg> args[2]; // [graphics, compute], by root parameter
     na_object_id cur_rt = 0, cur_ds = 0; // currently bound first render target / depth
+    na_object_id cur_rts[8] = {};
+    uint32_t cur_nrt = 0;
+    uint32_t cur_ds_sub = NA_UNKNOWN_U32;
     bool restorable = true;              // false after work whose state effects we cannot replay
 };
 
@@ -2013,6 +2018,7 @@ struct On<sl::list::Reset> {
                     ls->uses.clear();
                     ls->uses_complete = true;
                     ls->targets.clear();
+                    ls->insertion.Reset();
                     ls->sampled_textures.clear();
                     ls->cleared.clear();
                     ls->pso = pso;
@@ -2021,6 +2027,7 @@ struct On<sl::list::Reset> {
                     ls->args[0].clear();
                     ls->args[1].clear();
                     ls->cur_rt = ls->cur_ds = 0;
+                    ls->cur_nrt = 0;
                     ls->restorable = true;
                 }
                 ls->root_sig[0] = ls->root_sig[1] = nullptr;
@@ -2061,12 +2068,29 @@ struct On<sl::list::Close> {
         emit(e, NA_GROUP_LIST);
     }
 };
+void note_draw(GL* l) {
+    std::shared_lock<std::shared_mutex> lock(g_m);
+    na_object_id id = 0;
+    auto* ls = list_state_locked(l, &id);
+    if (!ls) return;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    for (uint32_t i = 0; i < ls->cur_nrt; ++i)
+        if (ls->cur_rts[i]) ls->insertion.Add({ls->cur_rts[i], 0, 0, true});
+    auto pipeline = g_objs.find(canon(ls->pso));
+    if (ls->cur_ds && ls->cur_ds_sub != NA_UNKNOWN_U32 && pipeline != g_objs.end() &&
+        pipeline->second.created.size() >= sizeof(na_ev_pipeline_created)) {
+        const auto* p = reinterpret_cast<const na_ev_pipeline_created*>(pipeline->second.created.data());
+        if (p->depth_enable == 1 && p->depth_write == 1 && ls->states.size() < 4096)
+            ls->states.push_back({ls->cur_ds, ls->cur_ds_sub, D3D12_RESOURCE_STATE_DEPTH_WRITE});
+    }
+}
 template <>
 struct On<sl::list::DrawInstanced> {
     static void run(GL* l, UINT v, UINT i, UINT, UINT)
     {
         Rec r;
         if (begin_op(l, &r)) emit_op(r, NA_OP_DRAW, {v, i});
+        if (r.list) note_draw(l);
     }
 };
 template <>
@@ -2075,6 +2099,7 @@ struct On<sl::list::DrawIndexedInstanced> {
     {
         Rec r;
         if (begin_op(l, &r)) emit_op(r, NA_OP_DRAW_INDEXED, {n, i});
+        if (r.list) note_draw(l);
     }
 };
 template <>
@@ -2417,6 +2442,14 @@ void root_table(GL* l, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE h)
     }
     emit_op(r, NA_OP_SET_ROOT_TABLE, {heap, heap ? slot : uint64_t{NA_UNKNOWN_U32}, heap ? version : NA_UNKNOWN_U64, param, Compute}, nullptr, 0, 0,
             heap ? 0u : NA_EVF_METHOD_UNOBSERVED);
+    with_list_state(l, [&](ListState& ls) {
+        std::lock_guard<std::mutex> bl(ls.bind_m);
+        for (uint32_t i = 0; i < nsrv; ++i) {
+            bool duplicate = false;
+            for (uint32_t j = 0; j < i; ++j) duplicate |= srvs[j] == srvs[i];
+            if (!duplicate) ls.insertion.Add({srvs[i], Compute ? 0 : ls.cur_rt, reinterpret_cast<uint64_t>(ls.pso), false});
+        }
+    });
     // Inline insertion point (J2): the game binds textures for reading, no locks held.
     if (nsrv) if (TableBindCallback cb = g_table_cb.load(std::memory_order_acquire)) cb(l, srvs, nsrv, Compute != 0);
 }
@@ -2509,7 +2542,10 @@ struct On<sl::list::OMSetRenderTargets> {
             std::lock_guard<std::mutex> bl(ls.bind_m);
             const uint32_t nrt = dsv ? (m ? m - 1 : 0) : m;
             ls.cur_rt = nrt ? refs[0].resource : 0;
+            ls.cur_nrt = nrt;
+            for (uint32_t i = 0; i < nrt; ++i) ls.cur_rts[i] = refs[i].resource;
             ls.cur_ds = dsv && m ? refs[m - 1].resource : 0;
+            ls.cur_ds_sub = dsv && m ? refs[m - 1].first_subresource : NA_UNKNOWN_U32;
             for (uint32_t i = 0; i < m; ++i) add_use_locked(ls, refs[i].resource);
             if (m > 0 && ls.targets.size() < 4096) {
                 const na_object_id ds = dsv ? refs[m - 1].resource : 0; // 0: no depth target
@@ -2532,6 +2568,11 @@ struct On<sl::list::ClearDepthStencilView> {
         const na_view_ref v = cpu_ref(h);
         emit_op(r, NA_OP_CLEAR_DSV, {static_cast<uint64_t>(f), float_bits(depth, 0.f), stencil}, &v, sizeof(v), sizeof(v), 0, NA_GROUP_RESOURCE_USE);
         note_uses(l, {v.resource});
+        if ((f & D3D12_CLEAR_FLAG_DEPTH) && v.resource && v.first_subresource != NA_UNKNOWN_U32)
+            with_list_state(l, [&](ListState& ls) {
+                std::lock_guard<std::mutex> bl(ls.bind_m);
+                if (ls.states.size() < 4096) ls.states.push_back({v.resource, v.first_subresource, D3D12_RESOURCE_STATE_DEPTH_WRITE});
+            });
     }
 };
 template <>
@@ -2547,6 +2588,7 @@ struct On<sl::list::ClearRenderTargetView> {
         note_uses(l, {v.resource});
         with_list_state(l, [&](ListState& ls) {
             std::lock_guard<std::mutex> bl(ls.bind_m);
+            if (v.resource) ls.insertion.Add({v.resource, 0, 0, true});
             if (v.resource && ls.cleared.size() < 64 && std::find(ls.cleared.begin(), ls.cleared.end(), v.resource) == ls.cleared.end())
                 ls.cleared.push_back(v.resource);
         });
@@ -3950,6 +3992,15 @@ bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id dep
     if (!ls || !ls->recording_observed.load()) return false;
     std::lock_guard<std::mutex> bl(ls->bind_m);
     return std::any_of(ls->targets.begin(), ls->targets.end(), [&](const ListState::Target& t) { return t.same(color, depth); });
+}
+na::j2::InsertionDecision ListInsertionDecision(ID3D12CommandList* list, na_object_id color)
+{
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return {};
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return ls->insertion.Analyze(color);
 }
 void SetTableBindCallback(TableBindCallback cb) { g_table_cb.store(cb, std::memory_order_release); }
 bool ListCurrentTargets(ID3D12CommandList* list, na_object_id* rt, na_object_id* ds)

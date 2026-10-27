@@ -1,3 +1,4 @@
+#include "host_dx12/j2/insertion_trace.hpp"
 // C8a: H1 observation PRODUCERS. host_observe is the transport (ABI 0.1,
 // frozen); this module hooks the D3D12 device/queue methods that create and
 // use the objects the ABI describes and emits its events:
@@ -116,6 +117,7 @@ bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id dep
 // HostWorkScope and end with RestoreListState(list).
 using TableBindCallback = void (*)(ID3D12GraphicsCommandList* list, const na_object_id* srvs, uint32_t count, bool compute);
 void SetTableBindCallback(TableBindCallback cb);
+na::j2::InsertionDecision ListInsertionDecision(ID3D12CommandList* list, na_object_id color);
 // Re-applies the game's descriptor heaps, root signatures, every root argument and the
 // pipeline state of this recording. False (nothing issued) if the state is not fully
 // known (unobserved recording, a bundle was executed).

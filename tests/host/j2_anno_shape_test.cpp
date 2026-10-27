@@ -1,3 +1,4 @@
+#include "host_dx12/settings.hpp"
 // J2 on Anno's shape (the run that crashed, 2026-10-26): the path the game takes,
 // not the convenient one.
 //   - submissions go through ExecuteBegin/End around J2, as the overlay does;
@@ -347,6 +348,7 @@ int main(int argc, char** argv)
         d.WaitIdle();
     }
     REQUIRE(SUCCEEDED(scene.list->Close()) && SUCCEEDED(consumer.list->Close()) && SUCCEEDED(prepass.list->Close()));
+    na::settings::Get().j2_inline.store(inline_list);
     na::j2::SetEnabled(true);
     na::j2::SetJitter(true); // J1 is off by default in the game; the tests exercise it
     na::observe::SetLiveSelection(na::observe::IdOf(depth.Get()), na::observe::IdOf(color.Get()));
@@ -387,7 +389,17 @@ int main(int argc, char** argv)
             ID3D12DescriptorHeap* ph[] = {post_heap.Get()};
             scene.list->SetDescriptorHeaps(1, ph);
             scene.list->SetGraphicsRootSignature(post_root.Get());
-            scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart()); // inline point
+            const int evals_before_read = fake::evals;
+            scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart()); // intermediate read
+            REQUIRE(fake::evals == evals_before_read); // must NEVER process the incomplete scene
+            std::swap(rd2.Transition.StateBefore, rd2.Transition.StateAfter);
+            scene.list->ResourceBarrier(1, &rd2);
+            scene.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+            scene.list->ClearRenderTargetView(rtv, clear, 0, nullptr); // actual later scene write
+            std::swap(rd2.Transition.StateBefore, rd2.Transition.StateAfter);
+            scene.list->ResourceBarrier(1, &rd2);
+            scene.list->OMSetRenderTargets(1, &post_rtv, FALSE, nullptr);
+            scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart()); // final scene read
             std::swap(rd2.Transition.StateBefore, rd2.Transition.StateAfter);
             scene.list->ResourceBarrier(1, &rd2);
         }
@@ -458,6 +470,7 @@ int main(int argc, char** argv)
                     is.inline_mode, (unsigned long long)is.inline_candidates, (unsigned long long)is.inline_recorded,
                     (unsigned long long)is.frames, (unsigned long long)is.inline_frames, (unsigned long long)is.inline_refused,
                     (unsigned long long)(evaluations() - evals0), g_forwarded.size(), is.reason);
+        CHECK(is.inline_target == 2);
         CHECK(is.inline_mode == 1);                  // detected on the first frame
         CHECK(is.inline_frames >= 2);                // frames 2.. ran DLAA inside the game's list
         CHECK(is.inline_recorded == is.inline_frames);

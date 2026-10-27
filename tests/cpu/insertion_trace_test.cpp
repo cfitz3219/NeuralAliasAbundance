@@ -1,0 +1,35 @@
+#include "host_dx12/j2/insertion_trace.hpp"
+#include <cstdio>
+
+int main() {
+    int failures = 0;
+    const auto check = [&](bool ok, const char* what) { if (!ok) { std::printf("FAIL: %s\n", what); ++failures; } };
+    na::j2::InsertionTrace trace;
+    trace.Add({1, 0, 0, true}); // scene
+    trace.Add({1, 2, 10, false}); // intermediate refraction
+    trace.Add({1, 0, 0, true}); // more scene: invalidates first read
+    check(trace.Analyze(1).final_candidate == 0, "an intermediate read is not final");
+    trace.Add({1, 3, 20, false}); // postprocessing
+    trace.Add({1, 4, 30, false}); // subsequent compositor must not move insertion later
+    auto d = trace.Analyze(1);
+    check(d.final_candidate == 2 && d.candidates == 3 && d.pipeline == 20 && d.destination == 3,
+          "first read after final scene write selected");
+    check(trace.Analyze(2).final_candidate == 0, "selection change does not inherit old evidence");
+    trace.Add({1, 0, 0, true}); // late restart/clear
+    check(trace.Analyze(1).final_candidate == 0, "late clear invalidates candidate");
+    trace.Reset();
+    trace.Add({1, 2, 10, false});
+    check(trace.Analyze(1).candidates == 0, "reads before scene writes are not candidates");
+    trace.Add({1, 0, 0, true});
+    trace.Add({1, 1, 10, false});
+    check(trace.Analyze(1).candidates == 0, "scene self bindings not postprocessing");
+    trace.Add({1, 2, 10, false});
+    trace.Add({1, 2, 10, false});
+    check(trace.Analyze(1).final_candidate == 1, "repeated bindings do not choose a later read");
+    for (int i = 0; i < 8192; ++i) trace.Add({9, 0, 0, true});
+    check(trace.Analyze(1).final_candidate == 0, "truncation cannot invent finality");
+    trace.Reset();
+    trace.Add({1, 0, 0, true}); trace.Add({1, 2, 10, false});
+    check(trace.Analyze(1).final_candidate == 1, "new recording recovers from overflow");
+    return failures ? 1 : 0;
+}

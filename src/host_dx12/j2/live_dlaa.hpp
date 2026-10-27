@@ -91,6 +91,9 @@ struct Stats {
     uint64_t waited_batches = 0, post_scene_batches = 0;
     // Inline insertion (post-processing recorded in the scene's own list).
     uint32_t inline_mode = 0, inline_target = 0;
+    uint64_t insertion_list = 0, insertion_destination = 0, insertion_pipeline = 0;
+    uint32_t insertion_reads = 0, insertion_final = 0, insertion_writes = 0;
+    uint64_t insertion_traces = 0, insertion_changes = 0;
     uint64_t inline_candidates = 0, inline_waited = 0, inline_recorded = 0, inline_frames = 0, inline_refused = 0;
     bool depth_reversed = false;  // reverse-Z as classified from the camera    // other render targets bound after the scene in the same list (insertion may be late)
     uint32_t width = 0, height = 0, color_format = 0;

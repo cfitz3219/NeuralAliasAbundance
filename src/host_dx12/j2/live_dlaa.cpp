@@ -86,13 +86,10 @@ struct State {
     // Inline insertion (games that record the end of the scene AND their
     // post-processing in one command list, Sniper Elite Resistance): DLAA is
     // recorded INTO the game's list at the moment it binds the scene colour for
-    // reading, then the game's state is restored. Detected automatically.
+    // reading, then the game's state is restored. Explicitly enabled in settings.
     bool inline_mode = false;
-    const void* inl_last_list = nullptr; // one candidate per recording
-    uint64_t inl_last_rec = 0;
-    uint32_t inl_cands_cur = 0, inl_target = 0; // colour readers per frame (learned like scene batches)
-    uint8_t inl_hist[16] = {};
-    uint32_t inl_hist_n = 0;
+    struct LearnedInsertion { uint64_t color = 0, depth = 0; na::j2::InsertionDecision decision; };
+    std::map<uint64_t, LearnedInsertion> insertion_by_list;
     uint64_t inl_frame = 0; // last frame an inline DLAA was recorded
     struct InlinePending {
         const void* list = nullptr;
@@ -1170,9 +1167,9 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
 // drew the scene (colour + depth), and the colour is no longer being drawn into
 // (another target is bound, or it has been transitioned for reading), the scene
 // is complete: post-processing is about to read it. DLAA is recorded here, into
-// the game's list, and the game's state is put back. One candidate per recording;
-// the frame's LAST candidate is used (learned per frame like scene batches),
-// because a game may also read the colour mid-frame (refraction).
+// the game's list, and the game's state is put back. The prior submitted
+// recording teaches the first read after its final scene write. Intermediate
+// reads are retained as evidence, never hidden by a one-candidate shortcut.
 void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint32_t n, bool)
 {
     if (!g.enabled.load(std::memory_order_relaxed) || g.paused.load(std::memory_order_relaxed)) return;
@@ -1187,7 +1184,7 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     if (!g.inline_mode || g.latched || !g.device) return;
     if (!na::observe::ListRendersTo(l, color_id, depth_id)) return; // the scene was not drawn in this recording
     const uint64_t rec = na::observe::ListRecording(l);
-    if (!rec || (g.inl_last_list == l && g.inl_last_rec == rec)) return;
+    if (!rec) return;
     uint32_t csub = 0, dsub = 0, cst = 0;
     if (!na::observe::ListSceneSubresource(l, color_id, depth_id, &csub, &dsub)) return;
     na_object_id cur_rt = 0, cur_ds = 0;
@@ -1195,11 +1192,16 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     const bool reading = cur_rt != color_id ||
                          (na::observe::ListLastStateSub(l, color_id, csub, &cst) && !(cst & D3D12_RESOURCE_STATE_RENDER_TARGET));
     if (!reading) return;
-    g.inl_last_list = l;
-    g.inl_last_rec = rec;
-    ++g.inl_cands_cur;
     ++g.stats.inline_candidates;
-    if (g.inl_target && g.inl_cands_cur < g.inl_target) { ++g.stats.inline_waited; return; }
+    const auto current = na::observe::ListInsertionDecision(l, color_id);
+    const auto learned = g.insertion_by_list.find(na::observe::IdOf(l));
+    if (learned == g.insertion_by_list.end() || learned->second.color != color_id || learned->second.depth != depth_id ||
+        !learned->second.decision.final_candidate || current.candidates != learned->second.decision.final_candidate ||
+        current.destination != learned->second.decision.destination || current.pipeline != learned->second.decision.pipeline) {
+        ++g.stats.inline_waited;
+        return;
+    }
+    g.stats.inline_target = learned->second.decision.final_candidate;
     if (g.inl_frame == g.frame || g.inl.valid) return; // one per frame; the previous one is not submitted yet
     if (!na::observe::ListStateRestorable(l)) { ++g.stats.inline_refused; reason("The scene list's state cannot be restored after DLAA (a bundle ran); left untouched."); return; }
     ID3D12CommandList* one[1] = {l};
@@ -1293,17 +1295,6 @@ void OnPresent(ID3D12CommandQueue* queue)
             if (g.scene_batches_cur > g.stats.scene_batches_max) g.stats.scene_batches_max = g.scene_batches_cur;
         }
         g.scene_batches_cur = 0;
-        if (g.inl_cands_cur) {
-            g.inl_hist[g.inl_hist_n++ % 16] = static_cast<uint8_t>(g.inl_cands_cur > 255 ? 255 : g.inl_cands_cur);
-            uint32_t votes[256] = {};
-            const uint32_t n = g.inl_hist_n < 16 ? g.inl_hist_n : 16;
-            for (uint32_t i = 0; i < n; ++i) ++votes[g.inl_hist[i]];
-            uint32_t best = 0;
-            for (uint32_t c = 1; c < 256; ++c) if (votes[c] > votes[best]) best = c;
-            g.inl_target = best;
-            g.stats.inline_target = best;
-        }
-        g.inl_cands_cur = 0;
     }
 }
 
@@ -1322,6 +1313,27 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         return;
     }
     ++g.stats.submissions;
+    uint64_t selected_depth = 0, selected_color = 0;
+    na::observe::GetLiveSelection(&selected_depth, &selected_color);
+    if (selected_color && selected_depth) for (UINT i = 0; i < count; ++i) {
+        if (!lists[i] || !na::observe::ListRendersTo(lists[i], selected_color, selected_depth)) continue;
+        const auto id = na::observe::IdOf(lists[i]);
+        if (g.insertion_by_list.size() >= 256 && !g.insertion_by_list.count(id)) g.insertion_by_list.clear();
+        const auto decision = na::observe::ListInsertionDecision(lists[i], selected_color);
+        const auto previous = g.insertion_by_list.find(id);
+        if (previous != g.insertion_by_list.end() && previous->second.decision.final_candidate != decision.final_candidate)
+            ++g.stats.insertion_changes;
+        g.insertion_by_list[id] = {selected_color, selected_depth, decision};
+        ++g.stats.insertion_traces;
+        if (decision.candidates) {
+            g.stats.insertion_list = id;
+            g.stats.insertion_reads = decision.candidates;
+            g.stats.insertion_final = decision.final_candidate;
+            g.stats.insertion_writes = decision.writes;
+            g.stats.insertion_destination = decision.destination;
+            g.stats.insertion_pipeline = decision.pipeline;
+        }
+    }
     if (g.inline_mode) {
         // Inline mode: no J2 list is inserted; DLAA is already inside the game's list.
         // Its history is committed when that list is actually submitted.
@@ -1399,11 +1411,11 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     // The scene list itself goes on to READ the colour (post-processing recorded in the
     // same command list): DLAA between lists would land after that read and never be
     // seen (Sniper Elite Resistance). Switch to inline insertion from the next frame.
-    if (scene >= 0 && !g.inline_mode && na::observe::ListSamplesTexture(lists[scene], color_id) &&
+    if (scene >= 0 && na::settings::Get().j2_inline.load() && !g.inline_mode && na::observe::ListSamplesTexture(lists[scene], color_id) &&
         na::observe::ListTargetsAfter(lists[scene], color_id, depth_id) > 0 && ensure_device(queue) && dlss_on()) {
         g.inline_mode = true;
         g.stats.inline_mode = 1;
-        reason("The game records post-processing in the scene's own list: switching to inline DLAA.");
+        reason("The game records post-processing in the scene's own list: using the configured inline DLAA path.");
         lock.unlock();
         forward(queue, count, lists);
         return;
@@ -1488,11 +1500,8 @@ void Shutdown()
     g.scene_batches_cur = g.scene_batches_target = 0;
     g.batch_hist_n = 0;
     g.inline_mode = false;
+    g.insertion_by_list.clear();
     g.inl = State::InlinePending{};
-    g.inl_last_list = nullptr;
-    g.inl_last_rec = 0;
-    g.inl_cands_cur = g.inl_target = 0;
-    g.inl_hist_n = 0;
     g.inl_frame = 0;
     g.resume_reset = false;
     g.w = g.h = 0;
