@@ -55,6 +55,10 @@ void load_from(const wchar_t* ini, bool only_if_present)
     };
     g_settings.nr_enabled.store(GetPrivateProfileIntW(L"nr", L"enabled", 0, ini) ? 1u : 0u);
     g_settings.nr_intensity.store(pct(L"intensity", 100));
+    {
+        const int v = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpness", 0, ini));
+        g_settings.j2_sharpness.store(static_cast<uint32_t>(v < 0 ? 0 : (v > 100 ? 100 : v)));
+    }
     g_settings.nr_structure.store(pct(L"structure", 100));
     g_settings.nr_tone.store(pct(L"tone", 0));
     g_settings.nr_skin.store(pct(L"skin", 100));
@@ -146,6 +150,8 @@ bool Save()
         swprintf_s(v, L"%u", kv.value);
         ok &= WritePrivateProfileStringW(L"motion", kv.key, v, ini) != 0;
     }
+    swprintf_s(v, L"%u", g_settings.j2_sharpness.load());
+    ok &= WritePrivateProfileStringW(L"j2", L"sharpness", v, ini) != 0;
     swprintf_s(v, L"%d", g_settings.reflex_mode.load());
     ok &= WritePrivateProfileStringW(L"latency", L"reflex", v, ini) != 0;
     struct { const wchar_t* key; uint32_t value; } fg[] = {

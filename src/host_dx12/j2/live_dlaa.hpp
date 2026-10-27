@@ -38,6 +38,10 @@ bool Paused();
 // Debug view (replaces the DLAA result): 0 off, 1 motion vectors, 2 fine motion
 // (sub-pixel), 3 depth.
 void SetDebugView(int mode);
+// Test hook: records the RCAS sharpening pass from `in` (NON_PIXEL_SHADER_RESOURCE)
+// into `out` (UNORDERED_ACCESS). percent 0 records nothing and returns false.
+bool RecordRcasForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* in, ID3D12Resource* out,
+                        uint32_t w, uint32_t h, uint32_t percent, DXGI_FORMAT fmt);
 int DebugView();
 void SetJitter(bool on);     // the overlay's camera-jitter switch (J1), on by default
 bool Jitter();
@@ -64,6 +68,7 @@ struct Stats {
     uint64_t cuts = 0;            // camera cuts (history reset)
     uint64_t camera_offset = 0;   // byte offset of the camera matrix inside its constant block
     uint32_t later_passes = 0;
+    uint64_t sharpened_frames = 0; // RCAS applied to the DLAA result
     uint64_t jitter_writes = 0;   // J1: camera matrices replaced by jittered copies
     uint64_t camera_learned_hits = 0, camera_scans = 0; // camera found at the learned slot / by a full search
     int64_t camera_inv_delta = 0; // bytes from the ViewProjection to its inverse in the camera block

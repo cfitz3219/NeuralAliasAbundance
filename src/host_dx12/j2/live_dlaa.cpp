@@ -6,6 +6,7 @@
 #include "host_dx12/depth_format.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
 #include "host_dx12/observe/producers.hpp"
+#include "host_dx12/settings.hpp"
 #include "providers/camera/camera_tracker.hpp"
 
 #include <windows.h>
@@ -13,6 +14,7 @@
 #include <d3dcompiler.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <atomic>
 #include <cstdio>
@@ -54,6 +56,7 @@ struct State {
     // Our textures (render size == output size: DLAA).
     ComPtr<ID3D12Resource> depth32, motion, provenance, output;
     ComPtr<ID3D12Resource> color_in; // plain copy of the scene colour's first slice / mip (DLSS input)
+    ComPtr<ID3D12Resource> sharp;    // RCAS output (when sharpening is on)
     MsaaResolve msaa;
     UINT samples = 1, depth_samples = 1, sample_quality = 0, depth_quality = 0;
     DXGI_FORMAT depth_format = DXGI_FORMAT_UNKNOWN;
@@ -270,6 +273,130 @@ bool debug_record(ID3D12GraphicsCommandList* l, int mode, DXGI_FORMAT out_format
     l->SetComputeRoot32BitConstants(1, 4, k, 0);
     l->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
     return true;
+}
+
+// ---- Sharpening: RCAS (Robust Contrast-Adaptive Sharpening) ------------------
+// AMD FidelityFX Super Resolution 1 "RCAS" (ffx_fsr1.h, MIT licence, (c) Advanced
+// Micro Devices): a 5-tap cross whose sharpening lobe is limited so the result
+// never leaves the local min/max (no ringing / halos), with its noise detection
+// (FSR_RCAS_DENOISE) so flat noisy areas are not amplified. Runs on the DLAA
+// result before the game's tonemap and HUD, in a Reinhard-compressed copy of the
+// HDR values (RCAS expects 0..1), expanded back afterwards. Slider 1..100 maps to
+// RCAS sharpness 2..0 stops (100 = strongest); 0 skips the pass entirely.
+struct RcasPass {
+    ComPtr<ID3D12RootSignature> root;
+    ComPtr<ID3D12PipelineState> pso;
+    ComPtr<ID3D12DescriptorHeap> heap;
+    UINT inc = 0;
+    bool tried = false, ok = false;
+} g_rcas;
+constexpr char kRcasHlsl[] = R"(
+Texture2D<float4> t_in : register(t0);
+RWTexture2D<float4> u_out : register(u0);
+cbuffer C : register(b0) { float con; uint w; uint h; uint pad; };
+#define RCAS_LIMIT (0.25 - (1.0 / 16.0))
+float3 fwd(float3 x) { x = max(x, 0.0); return x / (1.0 + x); }
+float3 inv(float3 t) { t = min(t, 0.99990); return t / (1.0 - t); }
+float3 tap(int2 p) { p = clamp(p, int2(0, 0), int2(w - 1, h - 1)); return fwd(t_in[p].rgb); }
+float min3(float a, float b, float c) { return min(a, min(b, c)); }
+float max3(float a, float b, float c) { return max(a, max(b, c)); }
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= w || id.y >= h) return;
+    int2 p = int2(id.xy);
+    //    b
+    //  d e f
+    //    h
+    float3 b = tap(p + int2(0, -1)), d = tap(p + int2(-1, 0)), e = tap(p), f = tap(p + int2(1, 0)), hh = tap(p + int2(0, 1));
+    float alpha = t_in[p].a;
+    // Luma times 2 (FSR1) for noise detection.
+    float bL = b.b * 0.5 + (b.r * 0.5 + b.g), dL = d.b * 0.5 + (d.r * 0.5 + d.g), eL = e.b * 0.5 + (e.r * 0.5 + e.g);
+    float fL = f.b * 0.5 + (f.r * 0.5 + f.g), hL = hh.b * 0.5 + (hh.r * 0.5 + hh.g);
+    float nz = 0.25 * bL + 0.25 * dL + 0.25 * fL + 0.25 * hL - eL;
+    float range = max3(max3(bL, dL, eL), fL, hL) - min3(min3(bL, dL, eL), fL, hL);
+    nz = saturate(abs(nz) / max(range, 1e-6));
+    nz = -0.5 * nz + 1.0;
+    float3 mn4 = min(min(min(b, d), f), hh), mx4 = max(max(max(b, d), f), hh);
+    float2 peakC = float2(1.0, -1.0 * 4.0);
+    float3 hitMin = min(mn4, e) / max(4.0 * mx4, 1e-6);
+    float3 hitMax = (peakC.x - max(mx4, e)) / (4.0 * mn4 + peakC.y);
+    float3 lobeRGB = max(-hitMin, hitMax);
+    float lobe = max(-RCAS_LIMIT, min(max3(lobeRGB.r, lobeRGB.g, lobeRGB.b), 0.0)) * con;
+    lobe *= nz;
+    float rcpL = 1.0 / (4.0 * lobe + 1.0);
+    float3 o = (lobe * b + lobe * d + lobe * hh + lobe * f + e) * rcpL;
+    u_out[p] = float4(inv(o), alpha);
+})";
+bool rcas_init()
+{
+    if (g_rcas.tried) return g_rcas.ok;
+    g_rcas.tried = true;
+    D3D12_DESCRIPTOR_RANGE r[2]{};
+    r[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    r[0].NumDescriptors = 1;
+    r[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    r[1].NumDescriptors = 1;
+    r[1].OffsetInDescriptorsFromTableStart = 1;
+    D3D12_ROOT_PARAMETER p[2]{};
+    p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    p[0].DescriptorTable.NumDescriptorRanges = 2;
+    p[0].DescriptorTable.pDescriptorRanges = r;
+    p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    p[1].Constants.Num32BitValues = 4;
+    D3D12_ROOT_SIGNATURE_DESC rd{2, p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ComPtr<ID3DBlob> sig, err, code;
+    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
+        FAILED(g.device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&g_rcas.root))))
+        return false;
+    if (FAILED(D3DCompile(kRcasHlsl, sizeof(kRcasHlsl) - 1, "j2_rcas.hlsl", nullptr, nullptr, "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err)))
+        return false;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = g_rcas.root.Get();
+    pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+    if (FAILED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_rcas.pso)))) return false;
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRing * 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    if (FAILED(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_rcas.heap)))) return false;
+    g_rcas.inc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    g_rcas.ok = true;
+    return true;
+}
+// RCAS from `in` (readable, NON_PIXEL_SHADER_RESOURCE) into `out` (UNORDERED_ACCESS).
+bool rcas_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Resource* out, uint32_t w, uint32_t h, uint32_t percent,
+                   DXGI_FORMAT fmt, UINT slot)
+{
+    if (!percent || !in || !out || !rcas_init()) return false;
+    const UINT base = slot * 2;
+    D3D12_CPU_DESCRIPTOR_HANDLE c = g_rcas.heap->GetCPUDescriptorHandleForHeapStart();
+    c.ptr += static_cast<SIZE_T>(base) * g_rcas.inc;
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = fmt;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Texture2D.MipLevels = 1;
+    g.device->CreateShaderResourceView(in, &sv, c);
+    c.ptr += g_rcas.inc;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+    uv.Format = fmt;
+    uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    g.device->CreateUnorderedAccessView(out, nullptr, &uv, c);
+    D3D12_GPU_DESCRIPTOR_HANDLE gh = g_rcas.heap->GetGPUDescriptorHandleForHeapStart();
+    gh.ptr += static_cast<UINT64>(base) * g_rcas.inc;
+    ID3D12DescriptorHeap* heaps[] = {g_rcas.heap.Get()};
+    l->SetDescriptorHeaps(1, heaps);
+    l->SetComputeRootSignature(g_rcas.root.Get());
+    l->SetPipelineState(g_rcas.pso.Get());
+    l->SetComputeRootDescriptorTable(0, gh);
+    const float stops = 2.0f * (1.0f - static_cast<float>(percent > 100 ? 100 : percent) / 100.0f);
+    const float con = std::exp2(-stops);
+    uint32_t k[4] = {0, w, h, 0};
+    std::memcpy(&k[0], &con, 4);
+    l->SetComputeRoot32BitConstants(1, 4, k, 0);
+    l->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+    return true;
+}
+bool rcas_record(ID3D12GraphicsCommandList* l, uint32_t percent, DXGI_FORMAT fmt)
+{
+    return g.sharp && rcas_dispatch(l, g.output.Get(), g.sharp.Get(), g.w, g.h, percent, fmt, g.slot);
 }
 
 bool ensure_device(ID3D12CommandQueue* q)
@@ -757,7 +884,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             !texture(w, h, DXGI_FORMAT_R32G32_FLOAT, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.motion) ||
             !texture(w, h, DXGI_FORMAT_R8_UINT, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.provenance) ||
             !texture(w, h, cf, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.output) ||
-            !texture(w, h, cf, false, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g.color_in)) {
+            !texture(w, h, cf, false, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g.color_in) ||
+            !texture(w, h, cf, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.sharp)) {
             g.output.Reset();
             reason("Could not allocate the DLAA working textures.");
             return false;
@@ -877,6 +1005,24 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             b.push_back(uav_barrier(g.output.Get()));
             flush(l, b);
             debug_record(l, dv, cf); // replaces the DLAA result with the debug picture
+        } else if (const uint32_t pct = na::settings::Get().j2_sharpness.load(std::memory_order_relaxed)) {
+            // RCAS: output -> sharp, then back into output so the write-back path is unchanged.
+            b.push_back(uav_barrier(g.output.Get()));
+            add(b, g.output.Get(), UAV, NPSR);
+            flush(l, b);
+            if (rcas_record(l, pct, cf)) {
+                b.push_back(uav_barrier(g.sharp.Get()));
+                add(b, g.sharp.Get(), UAV, SRC);
+                add(b, g.output.Get(), NPSR, DST);
+                flush(l, b);
+                l->CopyResource(g.output.Get(), g.sharp.Get());
+                add(b, g.sharp.Get(), SRC, UAV);
+                add(b, g.output.Get(), DST, UAV);
+                ++g.stats.sharpened_frames;
+            } else {
+                add(b, g.output.Get(), NPSR, UAV);
+            }
+            flush(l, b);
         }
     }
     // 5. result -> scene colour, everything back to the game's states
@@ -940,6 +1086,14 @@ void SetPaused(bool paused)
     g.paused.store(paused);
 }
 bool Paused() { return g.paused.load(); }
+bool RecordRcasForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* in, ID3D12Resource* out,
+                        uint32_t w, uint32_t h, uint32_t percent, DXGI_FORMAT fmt)
+{
+    std::lock_guard<std::mutex> lock(g.m);
+    if (!g.device) g.device = device;
+    if (g.device.Get() != device) return false;
+    return rcas_dispatch(list, in, out, w, h, percent, fmt, 0);
+}
 void SetDebugView(int mode) { g_debug_view.store(mode < 0 || mode > 3 ? 0 : mode); }
 int DebugView() { return g_debug_view.load(); }
 void SetJitter(bool on)
@@ -1079,12 +1233,13 @@ Stats GetStats()
 void Shutdown()
 {
     std::lock_guard<std::mutex> lock(g.m);
-    g.depth32.Reset(); g.motion.Reset(); g.provenance.Reset(); g.output.Reset(); g.color_in.Reset();
+    g.depth32.Reset(); g.motion.Reset(); g.provenance.Reset(); g.output.Reset(); g.color_in.Reset(); g.sharp.Reset();
     g.msaa = MsaaResolve{};
     for (auto& s : g.slots) { s.list.Reset(); s.alloc.Reset(); s.fence_value = 0; }
     g.fence.Reset(); g.queue.Reset(); g.device.Reset();
     g.arbiter = na::motion::gpu::Arbiter{};
     g_dbg = DebugPass{};
+    g_rcas = RcasPass{};
     g.arbiter_ok = false;
     g.tracker.Reset();
     g.frame = 1;

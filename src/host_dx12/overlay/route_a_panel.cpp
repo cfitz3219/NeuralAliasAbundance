@@ -613,6 +613,17 @@ void DrawLiveDlaa()
     if (Switch("j2", &on)) na::j2::SetPaused(!on);
     EndRow();
     Hint("For sharpest results and best FPS, set Anti-Aliasing to Off in the game's video settings.");
+    {
+        na::settings::Settings& ss = na::settings::Get();
+        int sharp = static_cast<int>(ss.j2_sharpness.load());
+        BeginRow("Sharpness", "RCAS sharpening after DLAA (AMD FidelityFX RCAS): restores crispness without halos; the HUD is never sharpened. 0 = off.", S(220));
+        ImGui::SetNextItemWidth(S(220));
+        if (ImGui::SliderInt("##j2sharp", &sharp, 0, 100, sharp ? "%d%%" : "Off")) {
+            ss.j2_sharpness.store(static_cast<uint32_t>(sharp));
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) na::settings::Save();
+        EndRow();
+    }
     bool jit = na::j2::Jitter();
     BeginRow("Camera jitter", "Shifts the camera by a fraction of a pixel each frame so DLAA can sharpen as well as smooth. Switch off if the picture shimmers or flickers.", SwitchWidth());
     if (Switch("j2jit", &jit)) na::j2::SetJitter(jit);

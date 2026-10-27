@@ -83,6 +83,7 @@ if(NA_HAVE_NGX_SDK)
   na_host_test(dlss_backend_test SOURCES dlss_backend_test.cpp LIBS host_dlss dxgi)
   # J2 live DLAA end to end (discovery picks -> inserted DLAA list) on the fake runtime.
   na_host_test(j2_live_test SOURCES j2_live_test.cpp LIBS host_dx12 dxgi)
+  na_host_test(j2_rcas_test SOURCES j2_rcas_test.cpp LIBS host_dx12 dxgi)
   na_host_test(j2_anno_shape_test SOURCES j2_anno_shape_test.cpp LIBS host_dx12 dxgi)
   add_test(NAME host_j2_msaa_shape_test COMMAND j2_anno_shape_test 2)
   set_tests_properties(host_j2_msaa_shape_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS host)
