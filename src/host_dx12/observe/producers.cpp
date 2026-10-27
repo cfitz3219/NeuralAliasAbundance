@@ -1072,7 +1072,16 @@ bool sampler_wants_bias(const SD& d)
     // are data/UI lookups and stay as they are. No mips (MaxLOD 0): nothing to bias.
     const bool aniso = D3D12_DECODE_IS_ANISOTROPIC_FILTER(d.Filter);
     const bool linear_min = D3D12_DECODE_MIN_FILTER(d.Filter) == D3D12_FILTER_TYPE_LINEAR;
-    return (aniso || linear_min) && d.MaxLOD > 0.0f;
+    // Screen-space passes (bloom/blur mip chains, SSAO, depth of field, tonemap
+    // LUTs) sample with CLAMP/BORDER addressing; biasing those makes the whole
+    // image harsh and noisy (Sniper Elite Resistance: every sampler is static).
+    // Surface textures tile (WRAP/MIRROR). So a linear sampler is biased only
+    // when it tiles; anisotropic filtering is a surface-texture choice anyway.
+    const auto tiles = [](D3D12_TEXTURE_ADDRESS_MODE m) {
+        return m == D3D12_TEXTURE_ADDRESS_MODE_WRAP || m == D3D12_TEXTURE_ADDRESS_MODE_MIRROR || m == D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE;
+    };
+    const bool surface = aniso || (linear_min && (tiles(d.AddressU) || tiles(d.AddressV)));
+    return surface && d.MaxLOD > 0.0f;
 }
 float biased(float lod, float bias) { const float v = lod + bias; return v < -16.0f ? -16.0f : (v > 15.99f ? 15.99f : v); }
 

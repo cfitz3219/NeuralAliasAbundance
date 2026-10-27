@@ -40,6 +40,7 @@ struct Consumer {
     std::wstring evidence_dir;
     uint64_t saved_bytes{};
     uint64_t session{},epoch{},batches{},events{},malformed{},submissions{},presents{},snapshots{},matrices{},samples{},last_log{},last_sample{},last_pick{};
+    uint64_t live_depth{},live_color{},pick_challenger{}; unsigned pick_streak{}; // J2 pick hysteresis
     bool overflow{}; unsigned reports{};
     uint64_t draws{}, binds{}, unresolved_views{}, captured_snapshots{}, truncated_snapshots{}, unmapped_snapshots{}, gpu_snapshots{}, matrix_scans{};
 };
@@ -80,20 +81,44 @@ void PublishLivePicks(Consumer& c) {
     // in a later list and R11G11B10F earlier): of those with at least a quarter of
     // the strongest pairing, the one written last in the frame is the scene colour
     // that the post-processing reads.
+    //
+    // Stability (Sniper Elite Resistance flipped every second between its lit
+    // HDR target and an 8-bit G-buffer target of the same submission, and every
+    // flip restarted DLAA): when the qualifying set holds a floating-point
+    // colour target, only those compete (a lit scene is HDR; albedo is not);
+    // equal tickets are decided by the stronger pairing; and a published pick
+    // is kept until a different answer has persisted for 2 s (8 publications).
     const auto d=c.heuristics.RankDepth(1);
     const uint64_t depth=!d.empty() && d[0].score>0 ? d[0].resource : 0;
     uint64_t color=0;
     if(depth) {
         const auto ks=c.heuristics.RankSceneColor(8);
+        const auto is_float=[](uint32_t f){return f==2||f==10||f==26;}; // RGBA32F, RGBA16F, R11G11B10F
         uint64_t strongest=0;
+        bool any_float=false;
         for(const auto& k:ks) if(k.paired_depth==depth && k.paired_draws>strongest) strongest=k.paired_draws;
-        uint64_t best_ticket=0;
+        for(const auto& k:ks) if(k.paired_depth==depth && strongest && k.paired_draws*4>=strongest && is_float(k.format)) any_float=true;
+        uint64_t best_ticket=0,best_pair=0;
         for(const auto& k:ks) {
             if(k.paired_depth!=depth || !strongest || k.paired_draws*4<strongest) continue;
-            if(!color || k.last.ticket>best_ticket) {color=k.resource;best_ticket=k.last.ticket;}
+            if(any_float && !is_float(k.format)) continue;
+            if(!color || k.last.ticket>best_ticket || (k.last.ticket==best_ticket && k.paired_draws>best_pair)) {
+                color=k.resource;best_ticket=k.last.ticket;best_pair=k.paired_draws;
+            }
         }
     }
-    na::observe::SetLiveSelection(depth,color);
+    constexpr unsigned kSwitchAfter=8; // publications (250 ms each)
+    if(depth!=c.live_depth || !c.live_color) {
+        c.live_depth=depth;c.live_color=color;c.pick_streak=0;c.pick_challenger=0; // first pick or new depth: immediate
+    } else if(color!=c.live_color) {
+        // A different answer (including the current pick no longer qualifying) must persist.
+        const uint64_t challenger=color;
+        if(challenger==c.pick_challenger) ++c.pick_streak; else {c.pick_challenger=challenger;c.pick_streak=1;}
+        if(c.pick_streak>=kSwitchAfter) {c.live_color=color;c.pick_streak=0;c.pick_challenger=0;}
+    } else {
+        c.pick_streak=0;c.pick_challenger=0;
+    }
+    na::observe::SetLiveSelection(c.live_depth,c.live_depth?c.live_color:0);
 }
 void Report(Consumer& c,const na_observe_status& status,const char* phase) {
     if(!c.log) return;

@@ -225,6 +225,21 @@ int main(int argc, char** argv)
         uint64_t after2 = 0;
         na::observe::MipBiasCounts(&after2, nullptr);
         CHECK(after2 == after); // shadow comparison sampler untouched
+        // A clamped linear sampler (screen-space post-processing) is left alone too.
+        sd.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        sd.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        dev->CreateSampler(&sd, h2);
+        uint64_t after3 = 0;
+        na::observe::MipBiasCounts(&after3, nullptr);
+        CHECK(after3 == after2);
+        // ...while an anisotropic one is biased whatever its addressing.
+        sd.Filter = D3D12_FILTER_ANISOTROPIC;
+        sd.MaxAnisotropy = 8;
+        dev->CreateSampler(&sd, h2);
+        uint64_t after4 = 0;
+        na::observe::MipBiasCounts(&after4, nullptr);
+        CHECK(after4 == after3 + 1);
         na::observe::SetSamplerMipBias(0.0f);
     }
     test::ComPtr<ID3D12RootSignature> rs_pre; // the pre-pass's own root signature: one root CBV

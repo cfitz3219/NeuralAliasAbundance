@@ -141,21 +141,28 @@ bool g_window_dirty = false;
 // read raw input on a hidden window or through GetRawInputBuffer, poll
 // GetAsyncKeyState/GetKeyboardState, or track GetCursorPos deltas and
 // re-centre with SetCursorPos. These user32 entry points are hooked once at
-// Start; calls from OUR render thread pass through (the menu needs the real
-// cursor), everything else sees a frozen cursor, no buttons and no keys.
+// Start. Only the overlay's OWN reads pass through (it needs the real cursor):
+// t_overlay_input is set while the menu is being drawn. It used to exempt the
+// whole render thread, but that is the game's thread too (it calls Present),
+// and many games poll input there: Sniper Elite Resistance fired its gun on
+// every menu click. Everything the game calls sees a frozen cursor, no buttons
+// and no keys.
 using PfnGetRawInputData = UINT(WINAPI*)(HRAWINPUT, UINT, LPVOID, PUINT, UINT);
 using PfnGetRawInputBuffer = UINT(WINAPI*)(PRAWINPUT, PUINT, UINT);
 using PfnGetCursorPos = BOOL(WINAPI*)(LPPOINT);
 using PfnSetCursorPos = BOOL(WINAPI*)(int, int);
 using PfnGetAsyncKeyState = SHORT(WINAPI*)(int);
 using PfnGetKeyboardState = BOOL(WINAPI*)(PBYTE);
+using PfnGetKeyState = SHORT(WINAPI*)(int);
 PfnGetRawInputData g_orig_get_raw_input_data = nullptr;
 PfnGetRawInputBuffer g_orig_get_raw_input_buffer = nullptr;
 PfnGetCursorPos g_orig_get_cursor_pos = nullptr;
 PfnSetCursorPos g_orig_set_cursor_pos = nullptr;
 PfnGetAsyncKeyState g_orig_get_async_key_state = nullptr;
 PfnGetKeyboardState g_orig_get_keyboard_state = nullptr;
-void* g_input_hook_targets[6] = {};
+PfnGetKeyState g_orig_get_key_state = nullptr;
+void* g_input_hook_targets[7] = {};
+thread_local bool t_overlay_input = false; // the overlay itself is reading input (menu drawing)
 std::atomic<uint32_t> g_input_hooks{0};
 std::atomic<DWORD> g_render_thread{0};
 std::atomic<LONG> g_frozen_x{0}, g_frozen_y{0}; // what the game sees as the cursor while open
@@ -163,7 +170,7 @@ std::atomic<LONG> g_frozen_x{0}, g_frozen_y{0}; // what the game sees as the cur
 inline bool lock_input_for_this_thread()
 {
     return g_open.load(std::memory_order_acquire) && g_initialized.load(std::memory_order_acquire) &&
-           GetCurrentThreadId() != g_render_thread.load(std::memory_order_relaxed);
+           !t_overlay_input;
 }
 void neutralise_raw(RAWINPUT* ri)
 {
@@ -224,20 +231,85 @@ BOOL WINAPI DetourGetKeyboardState(PBYTE state)
     if (r && state && lock_input_for_this_thread()) memset(state, 0, 256);
     return r;
 }
+SHORT WINAPI DetourGetKeyState(int vk)
+{
+    // Mouse buttons and keys read through GetKeyState (VK_LBUTTON is common for "fire").
+    if (lock_input_for_this_thread()) return 0;
+    return g_orig_get_key_state(vk);
+}
+// DirectInput 8 (keyboard/mouse through IDirectInputDevice8::GetDeviceState /
+// GetDeviceData). The device methods live in dinput8.dll and are shared by
+// every device, so they are hooked once, found through a keyboard device of
+// our own (A and W interfaces). Locked: state reads as all-zero (no keys, no
+// buttons, no motion) and buffered events are drained and dropped.
+using PfnDI8Create = HRESULT(WINAPI*)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
+using PfnDIGetDeviceState = HRESULT(STDMETHODCALLTYPE*)(void*, DWORD, LPVOID);
+using PfnDIGetDeviceData = HRESULT(STDMETHODCALLTYPE*)(void*, DWORD, void*, LPDWORD, DWORD);
+constexpr int kDiSlots = 2; // [0] W, [1] A
+PfnDIGetDeviceState g_orig_di_state[kDiSlots] = {};
+PfnDIGetDeviceData g_orig_di_data[kDiSlots] = {};
+void* g_di_targets[kDiSlots * 2] = {};
+template <int I>
+HRESULT STDMETHODCALLTYPE DetourDIGetDeviceState(void* self, DWORD cb, LPVOID data)
+{
+    const HRESULT r = g_orig_di_state[I](self, cb, data);
+    if (SUCCEEDED(r) && data && cb && lock_input_for_this_thread()) memset(data, 0, cb);
+    return r;
+}
+template <int I>
+HRESULT STDMETHODCALLTYPE DetourDIGetDeviceData(void* self, DWORD cb, void* events, LPDWORD inout, DWORD flags)
+{
+    const HRESULT r = g_orig_di_data[I](self, cb, events, inout, flags);
+    if (SUCCEEDED(r) && inout && lock_input_for_this_thread()) *inout = 0; // drained, not delivered
+    return r;
+}
+void install_dinput_hooks()
+{
+    HMODULE m = LoadLibraryW(L"dinput8.dll"); // pinned: the hooked code must stay loaded
+    if (!m) return;
+    auto create = reinterpret_cast<PfnDI8Create>(GetProcAddress(m, "DirectInput8Create"));
+    if (!create) return;
+    static const GUID kIID_DI8W = {0xBF798031, 0x483A, 0x4DA2, {0xAA, 0x99, 0x5D, 0x64, 0xED, 0x36, 0x97, 0x00}};
+    static const GUID kIID_DI8A = {0xBF798030, 0x483A, 0x4DA2, {0xAA, 0x99, 0x5D, 0x64, 0xED, 0x36, 0x97, 0x00}};
+    static const GUID kSysKeyboard = {0x6F1D2B61, 0xD5A0, 0x11CF, {0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00}};
+    using PfnCreateDevice = HRESULT(STDMETHODCALLTYPE*)(void*, REFGUID, void**, void*);
+    const GUID* iids[kDiSlots] = {&kIID_DI8W, &kIID_DI8A};
+    void* states[kDiSlots] = {reinterpret_cast<void*>(&DetourDIGetDeviceState<0>), reinterpret_cast<void*>(&DetourDIGetDeviceState<1>)};
+    void* datas[kDiSlots] = {reinterpret_cast<void*>(&DetourDIGetDeviceData<0>), reinterpret_cast<void*>(&DetourDIGetDeviceData<1>)};
+    for (int i = 0; i < kDiSlots; ++i) {
+        void* di = nullptr;
+        if (FAILED(create(GetModuleHandleW(nullptr), 0x0800, *iids[i], &di, nullptr)) || !di) continue;
+        void** di_vt = *reinterpret_cast<void***>(di);
+        void* dev = nullptr;
+        if (SUCCEEDED(reinterpret_cast<PfnCreateDevice>(di_vt[3])(di, kSysKeyboard, &dev, nullptr)) && dev) {
+            void** vt = *reinterpret_cast<void***>(dev);
+            void* st = vt[9], *dt = vt[10]; // GetDeviceState, GetDeviceData
+            // The A and W interfaces may share one implementation: hook each function once.
+            bool st_done = false, dt_done = false;
+            for (void* t : g_di_targets) { st_done |= t == st; dt_done |= t == dt; }
+            if (!st_done && na::hooking::HookFunction(st, states[i], reinterpret_cast<void**>(&g_orig_di_state[i]))) g_di_targets[i * 2] = st;
+            if (!dt_done && na::hooking::HookFunction(dt, datas[i], reinterpret_cast<void**>(&g_orig_di_data[i]))) g_di_targets[i * 2 + 1] = dt;
+            static_cast<IUnknown*>(dev)->Release();
+        }
+        static_cast<IUnknown*>(di)->Release();
+    }
+}
 void install_input_hooks()
 {
+    install_dinput_hooks();
     HMODULE u = GetModuleHandleW(L"user32.dll");
     if (!u) return;
-    struct { const char* name; void* detour; void** original; } specs[6] = {
+    struct { const char* name; void* detour; void** original; } specs[7] = {
         {"GetRawInputData", reinterpret_cast<void*>(&DetourGetRawInputData), reinterpret_cast<void**>(&g_orig_get_raw_input_data)},
         {"GetRawInputBuffer", reinterpret_cast<void*>(&DetourGetRawInputBuffer), reinterpret_cast<void**>(&g_orig_get_raw_input_buffer)},
         {"GetCursorPos", reinterpret_cast<void*>(&DetourGetCursorPos), reinterpret_cast<void**>(&g_orig_get_cursor_pos)},
         {"SetCursorPos", reinterpret_cast<void*>(&DetourSetCursorPos), reinterpret_cast<void**>(&g_orig_set_cursor_pos)},
         {"GetAsyncKeyState", reinterpret_cast<void*>(&DetourGetAsyncKeyState), reinterpret_cast<void**>(&g_orig_get_async_key_state)},
         {"GetKeyboardState", reinterpret_cast<void*>(&DetourGetKeyboardState), reinterpret_cast<void**>(&g_orig_get_keyboard_state)},
+        {"GetKeyState", reinterpret_cast<void*>(&DetourGetKeyState), reinterpret_cast<void**>(&g_orig_get_key_state)},
     };
     uint32_t n = 0;
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < 7; ++i) {
         void* target = reinterpret_cast<void*>(GetProcAddress(u, specs[i].name));
         if (target && na::hooking::HookFunction(target, specs[i].detour, specs[i].original)) {
             g_input_hook_targets[i] = target;
@@ -251,6 +323,10 @@ void install_input_hooks()
 }
 void remove_input_hooks()
 {
+    for (void*& t : g_di_targets) {
+        if (t) na::hooking::Unhook(t);
+        t = nullptr;
+    }
     for (void*& t : g_input_hook_targets) {
         if (t) na::hooking::Unhook(t);
         t = nullptr;
@@ -1497,7 +1573,14 @@ void draw_panel(bool just_opened)
 
 void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_opened, ID3D12Resource* frame = nullptr)
 {
-    g_render_thread.store(GetCurrentThreadId(), std::memory_order_relaxed); // input hooks pass this thread through
+    g_render_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    // Only the overlay's own input reads (apply_input, the ImGui Win32 backend)
+    // pass the input lock; the game's reads on this same thread do not.
+    struct OverlayInputScope {
+        bool prev = t_overlay_input;
+        OverlayInputScope() { t_overlay_input = true; }
+        ~OverlayInputScope() { t_overlay_input = prev; }
+    } overlay_input_scope;
     UINT idx = frame ? static_cast<UINT>(g_frames.load() % g_state.frames.size()) : real_index(sc);
     if (idx >= g_state.frames.size()) return;
     FrameCtx& f = g_state.frames[idx];
