@@ -31,5 +31,18 @@ int main() {
     trace.Reset();
     trace.Add({1, 0, 0, true}); trace.Add({1, 2, 10, false});
     check(trace.Analyze(1).final_candidate == 1, "new recording recovers from overflow");
+    uint32_t transition = 0;
+    for (int extra_reads : {0, 5}) {
+        trace.Reset();
+        trace.Add({1, 0, 0, true});
+        trace.Add({1, 0, UINT64_MAX, false});
+        for (int i = 0; i < extra_reads; ++i) trace.Add({1, 2, 10, false});
+        trace.Add({1, 0, 0, true});
+        trace.Add({1, 0, UINT64_MAX, false});
+        const auto final = trace.Analyze(1);
+        if (!transition) transition = final.final_transition;
+        check(final.final_transition == transition && transition == 2,
+              "variable shader reads do not change final transition identity");
+    }
     return failures ? 1 : 0;
 }
