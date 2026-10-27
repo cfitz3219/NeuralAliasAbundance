@@ -32,6 +32,7 @@
 struct ID3D12Device;
 struct ID3D12CommandQueue;
 struct ID3D12CommandList;
+struct ID3D12GraphicsCommandList;
 struct ID3D12Resource;
 struct IDXGISwapChain;
 
@@ -109,8 +110,6 @@ std::vector<LiveBinding> ListRootConstantBuffers(ID3D12CommandList* list); // gr
 bool ListReferences(ID3D12CommandList* list, na_object_id id);            // the recording referenced the resource
 // True when the recording bound `color` as a render target together with `depth` as its depth target.
 bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id depth);
-// An explicit SRV-table binding referenced the texture. Positive ordering hint
-// only: unobserved/bindless/late descriptor changes are not ruled out by false.
 // Inline insertion (J2). Called on the recording thread right after the game binds
 // a descriptor table that contains SRVs (the resources listed), with no observer
 // locks held; host work recorded into `list` from the callback must run under a
@@ -128,6 +127,8 @@ bool ListCurrentTargets(ID3D12CommandList* list, na_object_id* rt, na_object_id*
 uint64_t ListRecording(ID3D12CommandList* list);
 // True when this recording cleared `target` with ClearRenderTargetView.
 bool ListClearsTarget(ID3D12CommandList* list, na_object_id target);
+// An explicit SRV-table binding referenced the texture. Positive ordering hint
+// only: unobserved/bindless/late descriptor changes are not ruled out by false.
 bool ListSamplesTexture(ID3D12CommandList* list, na_object_id texture);
 // The subresources (mip + array slice; depth: plane 0) the last bind of `color`
 // with `depth` in this recording rendered into, from the views' first
