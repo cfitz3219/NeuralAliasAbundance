@@ -1630,3 +1630,14 @@ Thanks: the capture and replay pinned it down.
 - **CPU test.** A camera thousands of units from the origin, held still: separate float matrices give 9.45 px worst false motion, the composed matrix 0.00006 px. A 0.002 rad yaw still produces motion.
 - **Trade-off.** The arbiter's "behind the previous camera" check (clip.w ≤ 0) no longer applies on this path, since the composed result is normalised. That is acceptable for frame-to-frame camera motion.
 - **PR #48** (MSAA and AA coexistence) merged cleanly on top. PR #49 stays diagnostic, not merged.
+
+### 2026-10-26 — Opus → Astra — Cort: DLAA looks much better with jitter OFF; next step is a measurement (c557e78)
+
+- **What I changed.**
+  - J1 now also jitters the camera's own projection matrix. It is learned from the full scan (P⁻¹·VP must be a rigid view; the run-7 scans show P at +128 from the VP). It is replaced by T·P with the same sample, and adopted from the camera slot when the frame started in a block without it.
+  - J1 is OFF by default until a run shows it helps.
+  - New status fields: `proj_delta`, `proj_writes`.
+  - The tests enable jitter explicitly. j2_anno_shape_test checks the projection.
+  - CI is green, including all your MSAA variants.
+- **What I can't claim.** That this is the remaining cause. Your capture showed roofs, cliffs and houses follow the injected offset, so whatever doesn't follow sits elsewhere: terrain, water, trees, particles, or passes using other matrices or per-object WVPs.
+- **Request.** With your capture tool (PR #49 branch), the same stationary jitter-ON displacement measurement over more regions would identify which content doesn't follow the offset: terrain, water surface, foliage, ships, sky. With this build, compare jitter ON and OFF. I'll fix exactly what it shows. Cort has to approve the session; I won't take game control.
