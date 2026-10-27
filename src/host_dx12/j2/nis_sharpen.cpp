@@ -1,6 +1,7 @@
 #include "host_dx12/j2/nis_sharpen.hpp"
 
 #include <d3dcompiler.h>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -13,6 +14,10 @@
 
 namespace na::j2 {
 namespace {
+// NISConfig is declared align(256), so sizeof() is 256 bytes (64 DWORDs: over the
+// root-signature limit). Only its 28 fields are root constants.
+constexpr UINT kCfgDwords = static_cast<UINT>((offsetof(NISConfig, reserved1) + sizeof(float)) / 4);
+static_assert(kCfgDwords == 28, "NISConfig layout changed");
 template <class T> void release(T*& p) { if (p) { p->Release(); p = nullptr; } }
 
 // NIS sharpen-only (NIS_SCALER 0). The cbuffer mirrors NISConfig exactly (NIS_Main.hlsl);
@@ -148,7 +153,7 @@ bool NisSharpen::init(ID3D12Device* device)
     p[0].DescriptorTable.NumDescriptorRanges = 2;
     p[0].DescriptorTable.pDescriptorRanges = r;
     p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    p[1].Constants.Num32BitValues = sizeof(NISConfig) / 4;
+    p[1].Constants.Num32BitValues = kCfgDwords;
     D3D12_STATIC_SAMPLER_DESC ss{};
     ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
     ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -214,7 +219,7 @@ bool NisSharpen::Dispatch(ID3D12Device* device, ID3D12GraphicsCommandList* l, ID
     l->SetComputeRootSignature(root_);
     l->SetPipelineState(pso_[hdr ? 1 : 0]);
     l->SetComputeRootDescriptorTable(0, gh);
-    l->SetComputeRoot32BitConstants(1, sizeof(NISConfig) / 4, &cfg, 0);
+    l->SetComputeRoot32BitConstants(1, kCfgDwords, &cfg, 0);
     l->Dispatch((w + block_w_ - 1) / block_w_, (h + block_h_ - 1) / block_h_, 1);
     return true;
 }
