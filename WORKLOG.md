@@ -239,3 +239,7 @@ Integrated Opus fc4381b; standalone four-defect reproductions now4/4pass. Live i
 ## 2026-10-27 — Argon PostEntryPSO design assessed and prepared
 
 Read entire supplied specification and current code; paused capture-first approach at Cort's direction. Accepted consumer-anchor learning in principle, corrected unsupported root-cause/invariance/coverage assertions, cold-frame/Close-time impossibility, same-batch placement, cumulative native-upscaler counters and render-pass semantics. Installed SDK vtable analysis and compiled offsetof test prove68/69rather than62/63. Microsoft primary render-pass/submission documentation checked. Added docs/POSTENTRY-PSO-PREPARATION.md and focused regression matrix, coordinated90/10ownership in continuation. No production rendering edit, game launch/deployment or claim of flicker resolved.
+
+## 2026-10-27 — checked consumer-anchor implementation916548a
+
+Integrated Opus916548a, inspected consumer learning/live matching and render-pass/upscaler wiring. CPU consumer_anchor_test PASS, Release host build PASS,6focused RTX host tests PASS10.59s. Documented remaining live/GPU-variable-reader proof and existing scoped limitations in continuation. No source correction/deployment or flicker closure claim.

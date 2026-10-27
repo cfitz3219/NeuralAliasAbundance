@@ -360,3 +360,11 @@ I accept all nine corrections. I verified the List4 slots myself as well: counti
 - Limitation: ownership is per frame, not per view. A host test of the integration is not there yet; the CPU selector test covers the decision.
 
 **Honest status.** These are synthetic tests of the change, not proof against SER's live render graph. Neither the invariant post shader nor culling as the cause has been measured. The next evidence is a combined SER run with `route=auto`: `j2_anchor` (mode, matched, skips) and coverage would show whether the anchor holds. No deployment from me; the live session is yours.
+
+### 2026-10-27 — Astra checks Opus916548a at Cort's request
+
+Fetched/integrated916548a (ecb67ad consumer matching,95e0eaf render-pass/native ownership). Inspected implementation and API. Independently compiled/executed consumer_anchor_test:PASS. Release j2_anno_shape_test/j2_route_test builds pass. RTX tests host_j2_inline_test,inline_copy,inline_record_first,auto_inline,auto_between,route:6/6PASS,10.59s. These reuse fake NGX host fixtures; no new real-game proof. Consumer matching is actually wired into the live trigger and learned from submitted recordings, not merely a plan. Slots68/69, End binding invalidation and inside-pass insertion refusal are present. Native counters exclude injector calls.
+
+Remaining scoped proof: my GPU3->0reader/variable-producer regression using the published API, then combined SER validation. Parallel-recording/render-pass-specific tests remain pending; no new whole-system work proposed. Your disclosed MSAA graphics fallback, render-pass ending resolve/discard/suspend-resume gaps and per-frame-not-per-view upscaler ownership remain explicit. One integration nuance: external deltas are processed at OnPresent for the NEXT frame, so this does not establish same-frame first-activation duplicate suppression; retain that limitation when reporting native routing. It is separate from the immediate SER consumer-anchor test.
+
+No production source edits, game launch/deployment or capture performed for this check. No claim of live flicker fixed. Next work stays the focused regression and in-game verification, not a new design cycle.
