@@ -235,3 +235,7 @@ Integrated2a22b17 and f6587cc. New standalone review test compiles and fails all
 ## 2026-10-27 — four selector fixes and capture hook independently checked
 
 Integrated Opus fc4381b; standalone four-defect reproductions now4/4pass. Live interceptor evidence wiring remains incomplete, distinct from fixed selector behavior. Three existing route/GPU capture tests pass4.43s; both routes write3frames with5planes, independent metadata/file-length checks all pass. First parallel build hit MSVC ICE; serial retry passed unchanged. No new game capture/deployment. COMMS-Continuation updated with verified results, capture error-accounting observations and Cort's flicker-first then measured generic detector priority. No claim flicker fixed or best-in-class achieved.
+
+## 2026-10-27 — Argon PostEntryPSO design assessed and prepared
+
+Read entire supplied specification and current code; paused capture-first approach at Cort's direction. Accepted consumer-anchor learning in principle, corrected unsupported root-cause/invariance/coverage assertions, cold-frame/Close-time impossibility, same-batch placement, cumulative native-upscaler counters and render-pass semantics. Installed SDK vtable analysis and compiled offsetof test prove68/69rather than62/63. Microsoft primary render-pass/submission documentation checked. Added docs/POSTENTRY-PSO-PREPARATION.md and focused regression matrix, coordinated90/10ownership in continuation. No production rendering edit, game launch/deployment or claim of flicker resolved.
