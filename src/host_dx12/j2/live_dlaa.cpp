@@ -90,6 +90,8 @@ struct State {
     bool inline_mode = false;
     struct LearnedInsertion { uint64_t color = 0, depth = 0; na::j2::InsertionDecision decision; };
     LearnedInsertion insertion_frame, insertion_learned;
+    char insertion_trace[2048] = {};
+    size_t insertion_trace_used = 0;
     uint64_t inl_frame = 0; // last frame an inline DLAA was recorded
     struct InlinePending {
         const void* list = nullptr;
@@ -1193,8 +1195,11 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     ++g.stats.inline_candidates;
     const auto current = na::observe::ListInsertionDecision(l, color_id);
     const auto& learned = g.insertion_learned;
+    const bool ordinal_matches = learned.decision.final_transition
+        ? current.final_transition == learned.decision.final_transition
+        : current.candidates == learned.decision.final_candidate;
     if (learned.color != color_id || learned.depth != depth_id ||
-        !learned.decision.final_candidate || current.candidates != learned.decision.final_candidate ||
+        !learned.decision.final_candidate || !ordinal_matches ||
         current.destination != learned.decision.destination || current.pipeline != learned.decision.pipeline) {
         ++g.stats.inline_waited;
         return;
@@ -1280,6 +1285,9 @@ void OnPresent(ID3D12CommandQueue* queue)
 {
     std::lock_guard<std::mutex> lock(g.m);
     if (queue && g.queue.Get() == queue) {
+        std::memcpy(g.stats.insertion_frame_trace, g.insertion_trace, sizeof g.insertion_trace);
+        g.insertion_trace[0] = 0;
+        g.insertion_trace_used = 0;
         if (g.inline_mode) {
             ++g.stats.inline_presents;
             if (g.submitted_frame == g.frame) ++g.stats.inline_covered;
@@ -1323,9 +1331,17 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     uint64_t selected_depth = 0, selected_color = 0;
     na::observe::GetLiveSelection(&selected_depth, &selected_color);
     if (selected_color && selected_depth) for (UINT i = 0; i < count; ++i) {
-        if (!lists[i] || !na::observe::ListRendersTo(lists[i], selected_color, selected_depth)) continue;
+        if (!lists[i]) continue;
         const auto id = na::observe::IdOf(lists[i]);
         const auto decision = na::observe::ListInsertionDecision(lists[i], selected_color);
+        if ((decision.writes || decision.all_reads) && g.insertion_trace_used < sizeof g.insertion_trace - 160) {
+            const int n = std::snprintf(g.insertion_trace + g.insertion_trace_used, sizeof g.insertion_trace - g.insertion_trace_used,
+                " L%llu:w%u/r%u/f%u/d%llu/p%llu%s", (unsigned long long)id, decision.writes,
+                decision.all_reads, decision.final_candidate, (unsigned long long)decision.destination,
+                (unsigned long long)decision.pipeline, g.inl.valid && g.inl.list == lists[i] ? "*" : "");
+            if (n > 0) g.insertion_trace_used += static_cast<size_t>(n);
+        }
+        if (!na::observe::ListRendersTo(lists[i], selected_color, selected_depth)) continue;
         // Command-list objects are pooled/reused. Learn the last scene-writing
         // recording in SUBMISSION order across this frame, not the prior job
         // assigned to this particular object. A later write-only list invalidates

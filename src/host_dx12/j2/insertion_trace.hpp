@@ -11,6 +11,8 @@ struct InsertionEvent {
 };
 struct InsertionDecision {
     uint32_t candidates = 0, final_candidate = 0, writes = 0;
+    uint32_t all_reads = 0;
+    uint32_t transitions = 0, final_transition = 0;
     uint64_t destination = 0, pipeline = 0;
 };
 class InsertionTrace {
@@ -25,9 +27,12 @@ public:
         if (!complete_ || !color) return result;
         for (const auto& event : events_) {
             if (event.resource != color) continue;
+            if (!event.write) ++result.all_reads;
+            if (!event.write && event.pipeline == UINT64_MAX) ++result.transitions;
             if (event.write) {
                 ++result.writes;
                 result.final_candidate = 0; // later geometry invalidates earlier reads
+                result.final_transition = 0;
                 result.destination = result.pipeline = 0;
             } else if (result.writes && event.destination != color) {
                 ++result.candidates;
@@ -35,6 +40,7 @@ public:
                 // later reads can already be HUD/compositing on processed content.
                 if (!result.final_candidate) {
                     result.final_candidate = result.candidates;
+                    result.final_transition = event.pipeline == UINT64_MAX ? result.transitions : 0;
                     result.destination = event.destination;
                     result.pipeline = event.pipeline;
                 }

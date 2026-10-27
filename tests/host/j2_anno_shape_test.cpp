@@ -103,7 +103,8 @@ int main(int argc, char** argv)
     // --inline: the scene and its post-processing are recorded in ONE command list
     // (Sniper Elite Resistance); DLAA must be recorded inside it, before the post
     // pass binds the colour for reading, and the game's state handed back.
-    const bool inline_list = argc > 3 && std::strcmp(argv[3], "--inline") == 0;
+    const bool inline_copy = argc > 3 && std::strcmp(argv[3], "--inline-copy") == 0;
+    const bool inline_list = inline_copy || (argc > 3 && std::strcmp(argv[3], "--inline") == 0);
     const bool post_reader = argc > 3 && !real_ngx && !planes && !split && !inline_list;
     test::Device d;
     if (!test::CreateDevice(d)) return test::SkipNoDevice("j2_anno_shape_test");
@@ -441,8 +442,20 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             scene.list->ResourceBarrier(1, &rd2);
             scene.list->OMSetRenderTargets(1, &post_rtv, FALSE, nullptr);
             scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart()); // final scene binding
-            REQUIRE(fake::evals == evals_before_read); // cannot inject on binding
-            scene.list->DrawInstanced(3, 1, 0, 0); // final actual read
+            REQUIRE(fake::evals == evals_before_read + (na::j2::GetStats().inline_mode ? 1 : 0)); // final read transition injected, binding did not
+            if (inline_copy) {
+                D3D12_RESOURCE_BARRIER cbars[] = {
+                    test::Transition(color.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    test::Transition(post_rt.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST)};
+                scene.list->ResourceBarrier(2, cbars);
+                D3D12_TEXTURE_COPY_LOCATION from{}, to{};
+                from.Type = to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                from.pResource = color.Get(); from.SubresourceIndex = 4;
+                to.pResource = post_rt.Get();
+                scene.list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+                for (auto& b : cbars) std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+                scene.list->ResourceBarrier(2, cbars);
+            } else scene.list->DrawInstanced(3, 1, 0, 0); // final actual read
             std::swap(rd2.Transition.StateBefore, rd2.Transition.StateAfter);
             scene.list->ResourceBarrier(1, &rd2);
         }
@@ -513,7 +526,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                     is.inline_mode, (unsigned long long)is.inline_candidates, (unsigned long long)is.inline_recorded,
                     (unsigned long long)is.frames, (unsigned long long)is.inline_frames, (unsigned long long)is.inline_refused,
                     (unsigned long long)(evaluations() - evals0), g_forwarded.size(), is.reason);
-        CHECK(is.inline_target == 2);
+        CHECK(is.inline_target == 3); // intermediate transition + draw, then final transition
         CHECK(is.inline_mode == 1);                  // detected on the first frame
         CHECK(is.inline_frames >= 2);                // frames 2.. ran DLAA inside the game's list
         CHECK(is.inline_recorded == is.inline_frames);

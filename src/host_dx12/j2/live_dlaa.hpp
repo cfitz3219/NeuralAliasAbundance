@@ -61,6 +61,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
 
 struct Stats {
     uint64_t inline_presents = 0, inline_covered = 0, inline_late_writes = 0;
+    char insertion_frame_trace[2048] = {};
     uint64_t submissions = 0;     // batches seen while enabled
     uint64_t frames = 0;          // DLAA frames inserted
     uint64_t duplicate_submissions = 0; // later batches in an already processed game frame

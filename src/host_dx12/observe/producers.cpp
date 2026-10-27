@@ -7,6 +7,7 @@
 
 #include "queue_occurrences.hpp"
 #include "host_dx12/j2/insertion_trace.hpp"
+#include <tuple>
 #include <algorithm>
 #include <system_error>
 #include <chrono>
@@ -2591,6 +2592,65 @@ struct On<sl::list::ExecuteIndirect> {
 };
 
 // Resolve bindings at use time: a table bind may precede PSO/target changes.
+void before_read_transition(GL* l, UINT count, const D3D12_RESOURCE_BARRIER* barriers)
+{
+    if (t_host_work || !na::observe_internal::Started() || !barriers) return;
+    uint64_t depth = 0, color = 0;
+    GetLiveSelection(&depth, &color);
+    if (!color) return;
+    constexpr UINT reads = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                           D3D12_RESOURCE_STATE_COPY_SOURCE | D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+    for (UINT i = 0; i < count; ++i) {
+        const auto& b = barriers[i];
+        if (b.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || b.Flags != D3D12_RESOURCE_BARRIER_FLAG_NONE ||
+            !(b.Transition.StateBefore & D3D12_RESOURCE_STATE_RENDER_TARGET) || !(b.Transition.StateAfter & reads) ||
+            resource_id(b.Transition.pResource) != color) continue;
+        uint32_t cs = 0, ds = 0;
+        if (!ListSceneSubresource(l, color, depth, &cs, &ds) ||
+            (b.Transition.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && b.Transition.Subresource != cs)) continue;
+        {
+            std::shared_lock<std::shared_mutex> lock(g_m);
+            na_object_id lid = 0;
+            auto* ls = list_state_locked(l, &lid);
+            if (!ls) return;
+            std::lock_guard<std::mutex> bl(ls->bind_m);
+            ls->insertion.Add({color, 0, UINT64_MAX, false});
+        }
+        if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, true);
+        break; // our pass runs before the whole original barrier batch
+    }
+}
+
+void before_texture_copy(GL* l, ID3D12Resource* dst, ID3D12Resource* src)
+{
+    if (t_host_work || !na::observe_internal::Started() || !dst || !src) return;
+    uint64_t depth = 0, color = 0;
+    GetLiveSelection(&depth, &color);
+    const auto source = resource_id(src), destination = resource_id(dst);
+    if (!color || source != color) return;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_m);
+        na_object_id lid = 0;
+        auto* ls = list_state_locked(l, &lid);
+        if (!ls) return;
+        std::lock_guard<std::mutex> bl(ls->bind_m);
+        ls->insertion.Add({source, destination, 0, false});
+    }
+    if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, true);
+}
+
+void after_texture_copy(GL* l, ID3D12Resource* dst)
+{
+    if (t_host_work || !na::observe_internal::Started() || !dst) return;
+    const auto destination = resource_id(dst);
+    std::shared_lock<std::shared_mutex> lock(g_m);
+    na_object_id lid = 0;
+    auto* ls = list_state_locked(l, &lid);
+    if (!ls) return;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    ls->insertion.Add({destination, 0, 0, true});
+}
+
 void before_shader_use(GL* l, bool compute)
 {
     if (t_host_work || !na::observe_internal::Started()) return;
@@ -2651,9 +2711,26 @@ struct ListHook<Slot, R(A...)> {
         na::hooking::variants::CallScope scope(l, Slot);
         auto fn = reinterpret_cast<Pfn>(orig[I]);
         if constexpr (std::is_void_v<R>) {
+            if constexpr (Slot == sl::list::ResourceBarrier)
+                if (scope.outermost && !scope.ambiguous) before_read_transition(l, a...);
+            if constexpr (Slot == sl::list::CopyResource || Slot == sl::list::ResolveSubresource || Slot == sl::list::CopyTextureRegion) {
+                if (scope.outermost && !scope.ambiguous) {
+                    auto args = std::forward_as_tuple(a...);
+                    if constexpr (Slot == sl::list::CopyResource) before_texture_copy(l, std::get<0>(args), std::get<1>(args));
+                    else if constexpr (Slot == sl::list::ResolveSubresource) before_texture_copy(l, std::get<0>(args), std::get<2>(args));
+                    else if (std::get<0>(args) && std::get<4>(args)) before_texture_copy(l, std::get<0>(args)->pResource, std::get<4>(args)->pResource);
+                }
+            }
             if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced || Slot == sl::list::Dispatch)
                 if (scope.outermost && !scope.ambiguous) before_shader_use(l, Slot == sl::list::Dispatch);
             fn(l, a...);
+            if constexpr (Slot == sl::list::CopyResource || Slot == sl::list::ResolveSubresource || Slot == sl::list::CopyTextureRegion) {
+                if (scope.outermost && !scope.ambiguous) {
+                    auto args = std::forward_as_tuple(a...);
+                    if constexpr (Slot == sl::list::CopyTextureRegion) { if (std::get<0>(args)) after_texture_copy(l, std::get<0>(args)->pResource); }
+                    else after_texture_copy(l, std::get<0>(args));
+                }
+            }
             if (scope.outermost && !scope.ambiguous) On<Slot>::run(l, a...);
         } else {
             const R r = fn(l, a...);
