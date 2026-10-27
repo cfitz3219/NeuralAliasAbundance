@@ -2076,7 +2076,7 @@ void note_draw(GL* l) {
     if (!ls) return;
     std::lock_guard<std::mutex> bl(ls->bind_m);
     for (uint32_t i = 0; i < ls->cur_nrt; ++i)
-        if (ls->cur_rts[i]) ls->insertion.Add({ls->cur_rts[i], 0, 0, true});
+        if (ls->cur_rts[i]) ls->insertion.Add({ls->cur_rts[i], 0, reinterpret_cast<uint64_t>(ls->pso), true});
     auto pipeline = g_objs.find(canon(ls->pso));
     if (ls->cur_ds && ls->cur_ds_sub != NA_UNKNOWN_U32 && pipeline != g_objs.end() &&
         pipeline->second.created.size() >= sizeof(na_ev_pipeline_created)) {

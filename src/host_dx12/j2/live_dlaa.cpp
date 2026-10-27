@@ -1195,7 +1195,13 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     ++g.stats.inline_candidates;
     const auto current = na::observe::ListInsertionDecision(l, color_id);
     const auto& learned = g.insertion_learned;
-    const bool ordinal_matches = learned.decision.final_transition
+    // Optional passes change the absolute transition ordinal. Match the producer
+    // of the learned final scene boundary, retaining an occurrence only among
+    // boundaries from that same producer (not unrelated intermediate reads).
+    const bool ordinal_matches = learned.decision.final_transition && learned.decision.boundary_writer
+        ? current.boundary_writer == learned.decision.boundary_writer &&
+          current.writer_occurrence == learned.decision.writer_occurrence
+        : learned.decision.final_transition
         ? current.final_transition == learned.decision.final_transition
         : current.candidates == learned.decision.final_candidate;
     if (learned.color != color_id || learned.depth != depth_id ||
@@ -1336,9 +1342,10 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         const auto decision = na::observe::ListInsertionDecision(lists[i], selected_color);
         if ((decision.writes || decision.all_reads) && g.insertion_trace_used < sizeof g.insertion_trace - 160) {
             const int n = std::snprintf(g.insertion_trace + g.insertion_trace_used, sizeof g.insertion_trace - g.insertion_trace_used,
-                " L%llu:w%u/r%u/f%u/d%llu/p%llu%s", (unsigned long long)id, decision.writes,
+                " L%llu:w%u/r%u/f%u/d%llu/p%llu/b%llu:%u%s", (unsigned long long)id, decision.writes,
                 decision.all_reads, decision.final_candidate, (unsigned long long)decision.destination,
-                (unsigned long long)decision.pipeline, g.inl.valid && g.inl.list == lists[i] ? "*" : "");
+                (unsigned long long)decision.pipeline, (unsigned long long)decision.boundary_writer,
+                decision.writer_occurrence, g.inl.valid && g.inl.list == lists[i] ? "*" : "");
             if (n > 0) g.insertion_trace_used += static_cast<size_t>(n);
         }
         if (!na::observe::ListRendersTo(lists[i], selected_color, selected_depth)) continue;

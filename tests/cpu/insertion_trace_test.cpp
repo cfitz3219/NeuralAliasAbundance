@@ -44,5 +44,22 @@ int main() {
         check(final.final_transition == transition && transition == 2,
               "variable shader reads do not change final transition identity");
     }
+    for (int optional_passes : {0, 1, 4}) {
+        trace.Reset();
+        for (int i = 0; i < optional_passes; ++i) {
+            trace.Add({1, 0, 100, true});
+            trace.Add({1, 0, UINT64_MAX, false});
+        }
+        trace.Add({1, 0, 200, true});
+        trace.Add({1, 0, UINT64_MAX, false});
+        auto final = trace.Analyze(1);
+        check(final.boundary_writer == 200 && final.writer_occurrence == 1,
+              "optional intermediate passes do not shift final producer identity");
+        trace.Add({1, 0, 200, true});
+        trace.Add({1, 0, UINT64_MAX, false});
+        final = trace.Analyze(1);
+        check(final.boundary_writer == 200 && final.writer_occurrence == 2,
+              "repeated producer boundaries remain distinguishable");
+    }
     return failures ? 1 : 0;
 }
