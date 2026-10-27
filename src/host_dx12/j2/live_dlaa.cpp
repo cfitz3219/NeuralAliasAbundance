@@ -376,6 +376,24 @@ void jitter_batch(ID3D12CommandList* const* lists, UINT count)
                 if (na::camera::IsInversePair(na::camera::LoadMatrix(view, static_cast<size_t>(vo), L), na::camera::LoadMatrix(view, static_cast<size_t>(io), L)))
                     std::memcpy(g.jit.inv[g.jit.layout], view.data() + io, 64);
             }
+            // ...and the camera's projection, if the frame started in a block without it.
+            const int64_t po = g.camera_proj_delta == INT64_MIN ? -1 : vo + g.camera_proj_delta;
+            if (!g.jit.has_proj && po >= 0 && static_cast<uint64_t>(po) + 64 <= n && static_cast<uint64_t>(vo) + 64 <= n &&
+                !std::memcmp(view.data() + vo, g.jit.vp[g.jit.layout], 64)) {
+                const auto L = g.jit.layout ? na::camera::Layout::ColumnMajor : na::camera::Layout::RowMajor;
+                const auto vm = na::camera::LoadMatrix(view, static_cast<size_t>(vo), L);
+                const auto pm = na::camera::LoadMatrix(view, static_cast<size_t>(po), L);
+                if (is_projection_of(pm, vm)) {
+                    std::array<double, 16> ps{};
+                    for (int i = 0; i < 16; ++i) ps[i] = pm[i];
+                    const auto jp = neural_alias::jitter_projection(ps, neural_alias::JitterSample{g.jit.px[0], g.jit.px[1]}, g.w, g.h);
+                    na::camera::Matrix jpm{};
+                    for (int i = 0; i < 16; ++i) jpm[i] = jp[i];
+                    std::memcpy(g.jit.proj, view.data() + po, 64);
+                    store_matrix(jpm, L, g.jit.jproj);
+                    g.jit.has_proj = true;
+                }
+            }
         }
         for (size_t o = 0; o + 64 <= n; o += 16)
             for (int l = 0; l < 2; ++l) {
