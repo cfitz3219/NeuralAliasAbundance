@@ -126,6 +126,12 @@ uint32_t ReadBuffer(na_object_id res, uint64_t offset, void* dst, uint32_t n); /
 // forwarding right now, from the known-state store (earlier submissions /
 // creation). False when not provable. Only for host work inside that forward.
 bool KnownStateInCurrentSubmission(na_object_id id, uint32_t* state);
+// Texture LOD bias added to the game's mip-mapped samplers (sampler descriptors
+// and root-signature static samplers) created from now on; 0 = off. For J2 DLAA
+// with jitter (temporal reconstruction needs sharper per-frame texture samples).
+void SetSamplerMipBias(float bias);
+float SamplerMipBias();
+void MipBiasCounts(uint64_t* samplers, uint64_t* static_samplers);
 // While alive on this thread, D3D12 objects created and commands recorded are the
 // host's own (never observed as the game's), e.g. J2's inserted command list.
 class HostWorkScope {

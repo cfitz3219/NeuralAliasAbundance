@@ -20,6 +20,7 @@
 #include "host_dx12/capture/frame_capture.hpp"
 #include "host_dx12/fg/frame_gen.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/observe/producers.hpp"
 #include "host_dx12/fg/preset_profile.hpp"
 #include "host_dx12/motion/live_flow.hpp"
 #include "host_dx12/overlay/presenter.hpp"
@@ -616,6 +617,14 @@ void DrawLiveDlaa()
     BeginRow("Camera jitter", "Shifts the camera by a fraction of a pixel each frame so DLAA can sharpen as well as smooth. Switch off if the picture shimmers or flickers.", SwitchWidth());
     if (Switch("j2jit", &jit)) na::j2::SetJitter(jit);
     EndRow();
+    {
+        uint64_t ns = 0, nst = 0;
+        na::observe::MipBiasCounts(&ns, &nst);
+        char tb[200];
+        std::snprintf(tb, sizeof tb, "Texture detail: mip bias %.1f on %llu samplers + %llu built-in samplers (set at game start, [j2] mip_bias).",
+                      na::observe::SamplerMipBias(), static_cast<unsigned long long>(ns), static_cast<unsigned long long>(nst));
+        StatusLine(0, tb);
+    }
     char buf[320];
     if (!on) {
         StatusLine(0, "Off: you are seeing the game's own picture.");

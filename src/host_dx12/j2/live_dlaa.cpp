@@ -80,7 +80,7 @@ struct State {
         uint32_t phase = 0;
         int layout = 0;                      // 0 row-major, 1 column-major (as the game stores it)
     } jit;
-    bool jitter_on = false; // J1 off by default until it measurably helps (Cort, 2026-10-26: sharper without)
+    bool jitter_on = true; // DLAA needs jitter (with the texture mip bias set at start-up)
     Stats stats;
 };
 // Never destroyed: at process exit the observation hooks' own state may already

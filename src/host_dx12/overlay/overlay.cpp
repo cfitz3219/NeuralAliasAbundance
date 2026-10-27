@@ -383,16 +383,18 @@ void write_status_line()
     if (pn > 0) WriteFile(f, pacing, static_cast<DWORD>(pn), &written, nullptr);
     {
         const auto j2 = na::j2::GetStats();
+        uint64_t mb_s = 0, mb_st = 0;
+        na::observe::MipBiasCounts(&mb_s, &mb_st);
         uint64_t sel_depth = 0, sel_color = 0;
         na::observe::GetLiveSelection(&sel_depth, &sel_color);
         char jl[1024];
         int jn = snprintf(jl, sizeof(jl),
-            "j2 on=%u active=%u depth=%llu color=%llu submissions=%llu frames=%llu no_selection=%llu no_scene_list=%llu no_state=%llu no_camera=%llu busy=%llu dlss_failed=%llu cuts=%llu camera_offset=%llu later_passes=%u duplicates=%llu jitter_writes=%llu cam_learned=%llu cam_scans=%llu inv_delta=%lld proj_delta=%lld proj_writes=%llu post_cam=%llu post_depth=%llu other_cam=%llu reversed=%u shape=sub%u/mips%u/slices%u/msaa%u depth_slices%u/msaa%u size=%ux%u format=%u \"%s\"\r\n",
+            "j2 on=%u active=%u depth=%llu color=%llu submissions=%llu frames=%llu no_selection=%llu no_scene_list=%llu no_state=%llu no_camera=%llu busy=%llu dlss_failed=%llu cuts=%llu camera_offset=%llu later_passes=%u duplicates=%llu jitter_writes=%llu cam_learned=%llu cam_scans=%llu inv_delta=%lld proj_delta=%lld proj_writes=%llu mip_bias=%.2f biased_samplers=%llu biased_static=%llu post_cam=%llu post_depth=%llu other_cam=%llu reversed=%u shape=sub%u/mips%u/slices%u/msaa%u depth_slices%u/msaa%u size=%ux%u format=%u \"%s\"\r\n",
             na::j2::Enabled() ? 1u : 0u, j2.active ? 1u : 0u, static_cast<unsigned long long>(sel_depth), static_cast<unsigned long long>(sel_color),
             static_cast<unsigned long long>(j2.submissions), static_cast<unsigned long long>(j2.frames), static_cast<unsigned long long>(j2.no_selection),
             static_cast<unsigned long long>(j2.no_scene_list), static_cast<unsigned long long>(j2.no_state), static_cast<unsigned long long>(j2.no_camera),
             static_cast<unsigned long long>(j2.busy), static_cast<unsigned long long>(j2.dlss_failed), static_cast<unsigned long long>(j2.cuts),
-            static_cast<unsigned long long>(j2.camera_offset), j2.later_passes, static_cast<unsigned long long>(j2.duplicate_submissions), static_cast<unsigned long long>(j2.jitter_writes), static_cast<unsigned long long>(j2.camera_learned_hits), static_cast<unsigned long long>(j2.camera_scans), static_cast<long long>(j2.camera_inv_delta), static_cast<long long>(j2.camera_proj_delta), static_cast<unsigned long long>(j2.jitter_proj_writes), static_cast<unsigned long long>(j2.post_camera_lists), static_cast<unsigned long long>(j2.post_depth_lists), static_cast<unsigned long long>(j2.other_camera_blocks), j2.depth_reversed ? 1u : 0u, j2.color_sub, j2.color_mips, j2.color_slices, j2.color_samples, j2.depth_slices, j2.depth_samples, j2.width, j2.height, j2.color_format, j2.reason);
+            static_cast<unsigned long long>(j2.camera_offset), j2.later_passes, static_cast<unsigned long long>(j2.duplicate_submissions), static_cast<unsigned long long>(j2.jitter_writes), static_cast<unsigned long long>(j2.camera_learned_hits), static_cast<unsigned long long>(j2.camera_scans), static_cast<long long>(j2.camera_inv_delta), static_cast<long long>(j2.camera_proj_delta), static_cast<unsigned long long>(j2.jitter_proj_writes), na::observe::SamplerMipBias(), static_cast<unsigned long long>(mb_s), static_cast<unsigned long long>(mb_st), static_cast<unsigned long long>(j2.post_camera_lists), static_cast<unsigned long long>(j2.post_depth_lists), static_cast<unsigned long long>(j2.other_camera_blocks), j2.depth_reversed ? 1u : 0u, j2.color_sub, j2.color_mips, j2.color_slices, j2.color_samples, j2.depth_slices, j2.depth_samples, j2.width, j2.height, j2.color_format, j2.reason);
         if (jn > 0) WriteFile(f, jl, static_cast<DWORD>((std::min)(jn, static_cast<int>(sizeof(jl) - 1))), &written, nullptr);
     }
     const auto latency = na::latency::GetStats();

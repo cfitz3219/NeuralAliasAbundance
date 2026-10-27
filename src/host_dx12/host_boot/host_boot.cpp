@@ -165,6 +165,14 @@ DWORD WINAPI InitThread(LPVOID)
     na::j2::SetEnabled(GetPrivateProfileIntW(L"j2", L"enabled", 0, g_ini) == 1 &&
                        GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1);
     if (na::j2::Configured()) na::overlay::RegisterLiveDlaaMenu();
+    // J2 DLAA reconstructs texture detail over frames: sample textures one mip
+    // sharper (DLSS/FSR guidance: log2(render/display) - 1 = -1 at native).
+    // [j2] mip_bias overrides; 0 turns it off. Samplers created before this point keep theirs.
+    if (na::j2::Configured()) {
+        wchar_t mb[32] = {};
+        GetPrivateProfileStringW(L"j2", L"mip_bias", L"-1.0", mb, 32, g_ini);
+        na::observe::SetSamplerMipBias(static_cast<float>(_wtof(mb)));
+    }
     bool started = na::overlay::Start(tag, nullptr);
     signal_install_attempted(); // producers were installed (or could not be) inside Start
     boot_log(started ? "overlay started" : "overlay start failed");

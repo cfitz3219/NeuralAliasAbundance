@@ -187,10 +187,42 @@ int main(int argc, char** argv)
         p.DescriptorTable.NumDescriptorRanges = 1;
         p.DescriptorTable.pDescriptorRanges = &range;
         p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        D3D12_ROOT_SIGNATURE_DESC rd{1, &p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+        // A mip-mapped static sampler: J2's texture mip bias must re-serialise the root signature cleanly.
+        D3D12_STATIC_SAMPLER_DESC ss{};
+        ss.Filter = D3D12_FILTER_ANISOTROPIC;
+        ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        ss.MaxAnisotropy = 8;
+        ss.MaxLOD = D3D12_FLOAT32_MAX;
+        ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        na::observe::SetSamplerMipBias(-1.0f);
+        D3D12_ROOT_SIGNATURE_DESC rd{1, &p, 1, &ss, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
         test::ComPtr<ID3DBlob> blob, err;
         REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err)));
         REQUIRE(SUCCEEDED(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rs))));
+        uint64_t biased = 0, biased_static = 0;
+        na::observe::MipBiasCounts(&biased, &biased_static);
+        CHECK(biased_static >= 1); // the static sampler got the bias and the rebuilt root signature was accepted
+        // ...and a mip-mapped sampler descriptor, but never a comparison (shadow) sampler.
+        test::ComPtr<ID3D12DescriptorHeap> sh;
+        D3D12_DESCRIPTOR_HEAP_DESC shd{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&shd, IID_PPV_ARGS(&sh))));
+        D3D12_SAMPLER_DESC sd{};
+        sd.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        sd.MaxLOD = D3D12_FLOAT32_MAX;
+        dev->CreateSampler(&sd, sh->GetCPUDescriptorHandleForHeapStart());
+        uint64_t after = 0;
+        na::observe::MipBiasCounts(&after, nullptr);
+        CHECK(after == biased + 1);
+        sd.Filter = D3D12_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR;
+        sd.ComparisonFunc = D3D12_COMPARISON_FUNC_LESS;
+        D3D12_CPU_DESCRIPTOR_HANDLE h2 = sh->GetCPUDescriptorHandleForHeapStart();
+        h2.ptr += dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+        dev->CreateSampler(&sd, h2);
+        uint64_t after2 = 0;
+        na::observe::MipBiasCounts(&after2, nullptr);
+        CHECK(after2 == after); // shadow comparison sampler untouched
+        na::observe::SetSamplerMipBias(0.0f);
     }
     test::ComPtr<ID3D12RootSignature> rs_pre; // the pre-pass's own root signature: one root CBV
     {

@@ -1053,9 +1053,35 @@ void STDMETHODCALLTYPE D_CreateDepthStencilView(ID3D12Device* dev, ID3D12Resourc
     note_descriptor_write(h, NA_DESC_DSV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count);
 }
 
+// Texture LOD (mip) bias for temporal reconstruction (J2 DLAA): with jitter and
+// accumulation, textures must be sampled one mip sharper than for a single
+// frame, or every frame is already low-passed and the accumulated picture loses
+// texture detail (wood planks, roof tiles). Applied to samplers that actually
+// use mips (linear / anisotropic mip filtering, MaxLOD > 0); never to
+// comparison (shadow) samplers or point-mip lookups. 0 = off.
+std::atomic<float> g_mip_bias{0.0f};
+std::atomic<uint64_t> g_biased_samplers{0}, g_biased_static{0};
+template <typename SD>
+bool sampler_wants_bias(const SD& d)
+{
+    if (D3D12_DECODE_FILTER_REDUCTION(d.Filter) == D3D12_FILTER_REDUCTION_TYPE_COMPARISON) return false;
+    const bool aniso = D3D12_DECODE_IS_ANISOTROPIC_FILTER(d.Filter);
+    const bool linear_mip = D3D12_DECODE_MIP_FILTER(d.Filter) == D3D12_FILTER_TYPE_LINEAR;
+    return (aniso || linear_mip) && d.MaxLOD > 0.0f;
+}
+float biased(float lod, float bias) { const float v = lod + bias; return v < -16.0f ? -16.0f : (v > 15.99f ? 15.99f : v); }
+
 void STDMETHODCALLTYPE D_CreateSampler(ID3D12Device* dev, const D3D12_SAMPLER_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
 {
-    o_CreateSampler(dev, d, h);
+    const float bias = g_mip_bias.load(std::memory_order_relaxed);
+    if (d && bias != 0.0f && !t_host_work && sampler_wants_bias(*d)) {
+        D3D12_SAMPLER_DESC m = *d;
+        m.MipLODBias = biased(m.MipLODBias, bias);
+        o_CreateSampler(dev, &m, h);
+        g_biased_samplers.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        o_CreateSampler(dev, d, h);
+    }
     note_descriptor_write(h, NA_DESC_SAMPLER, nullptr, NA_UNKNOWN_U32, NA_UNKNOWN_U32, NA_UNKNOWN_U32);
 }
 
@@ -1413,7 +1439,37 @@ NA_ORIG(CreatePipelineState, HRESULT, ID3D12Device2*, const D3D12_PIPELINE_STATE
 HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, const void* blob, SIZE_T size, REFIID riid, void** out)
 {
     Depth depth("CreateRootSignature");
-    const HRESULT hr = o_CreateRootSignature(dev, mask, blob, size, riid, out);
+    // Mip bias for static samplers: re-serialise the root signature with biased
+    // samplers (versions 1.0 / 1.1; anything else is passed through unchanged).
+    ID3DBlob* rebuilt = nullptr;
+    const float bias = g_mip_bias.load(std::memory_order_relaxed);
+    if (blob && size && bias != 0.0f && !t_host_work && depth.outermost()) {
+        ID3D12VersionedRootSignatureDeserializer* rd = nullptr;
+        const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* u = nullptr;
+        if (SUCCEEDED(D3D12CreateVersionedRootSignatureDeserializer(blob, size, IID_PPV_ARGS(&rd))) && rd &&
+            (u = rd->GetUnconvertedRootSignatureDesc()) != nullptr &&
+            (u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 || u->Version == D3D_ROOT_SIGNATURE_VERSION_1_1)) {
+            D3D12_VERSIONED_ROOT_SIGNATURE_DESC copy = *u;
+            const UINT ns = u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 ? u->Desc_1_0.NumStaticSamplers : u->Desc_1_1.NumStaticSamplers;
+            const D3D12_STATIC_SAMPLER_DESC* src = u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 ? u->Desc_1_0.pStaticSamplers : u->Desc_1_1.pStaticSamplers;
+            std::vector<D3D12_STATIC_SAMPLER_DESC> ss(src, src + ns);
+            uint32_t changed = 0;
+            for (auto& x : ss)
+                if (sampler_wants_bias(x)) { x.MipLODBias = biased(x.MipLODBias, bias); ++changed; }
+            if (changed) {
+                if (u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0) copy.Desc_1_0.pStaticSamplers = ss.data();
+                else copy.Desc_1_1.pStaticSamplers = ss.data();
+                ID3DBlob* err = nullptr;
+                if (SUCCEEDED(D3D12SerializeVersionedRootSignature(&copy, &rebuilt, &err)) && rebuilt) g_biased_static.fetch_add(changed, std::memory_order_relaxed);
+                else if (rebuilt) { rebuilt->Release(); rebuilt = nullptr; }
+                if (err) err->Release();
+            }
+        }
+        if (rd) rd->Release();
+    }
+    const HRESULT hr = rebuilt ? o_CreateRootSignature(dev, mask, rebuilt->GetBufferPointer(), rebuilt->GetBufferSize(), riid, out)
+                               : o_CreateRootSignature(dev, mask, blob, size, riid, out);
+    if (rebuilt) rebuilt->Release();
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj) return hr;
     constexpr uint32_t kMaxParams = 64, kMaxRanges = 256;
@@ -3904,6 +3960,13 @@ bool KnownStateInCurrentSubmission(na_object_id id, uint32_t* state)
     if (v == kStatePending || v == D3D12_RESOURCE_STATE_COMMON) return false;
     *state = v;
     return true;
+}
+void SetSamplerMipBias(float bias) { g_mip_bias.store(bias, std::memory_order_relaxed); }
+float SamplerMipBias() { return g_mip_bias.load(std::memory_order_relaxed); }
+void MipBiasCounts(uint64_t* samplers, uint64_t* static_samplers)
+{
+    if (samplers) *samplers = g_biased_samplers.load(std::memory_order_relaxed);
+    if (static_samplers) *static_samplers = g_biased_static.load(std::memory_order_relaxed);
 }
 HostWorkScope::HostWorkScope() : prev_(t_host_work) { t_host_work = true; }
 HostWorkScope::~HostWorkScope() { t_host_work = prev_; }
