@@ -62,7 +62,9 @@ struct NisSharpen::Compiled {
     std::atomic<int> state{0}; // 0 running, 1 ok, -1 failed
     std::vector<uint8_t> code[2];
     uint32_t bw = 32, bh = 32;
+    std::string error; // written by the compile thread before state is set
 };
+namespace { std::string g_nis_error; }
 
 bool NisSharpen::start_compile()
 {
@@ -82,10 +84,12 @@ bool NisSharpen::start_compile()
                 const HRESULT hr = patched ? D3DCompile(src.data(), src.size(), "j2_nis_sharpen.hlsl", nullptr, nullptr, "main", "cs_5_0",
                                                         D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &cerr)
                                            : E_FAIL; // the vendored NIS text no longer has the store we wrap
-                if (cerr) {
-                    if (FAILED(hr)) OutputDebugStringA(static_cast<const char*>(cerr->GetBufferPointer()));
-                    release(cerr);
+                if (FAILED(hr)) {
+                    c->error = patched ? "NIS shader compile failed: " : "NIS source no longer has the wrapped store";
+                    if (cerr) c->error.append(static_cast<const char*>(cerr->GetBufferPointer()), cerr->GetBufferSize());
+                    OutputDebugStringA(c->error.c_str());
                 }
+                release(cerr);
                 if (FAILED(hr) || !code) { release(code); c->state.store(-1); return; }
                 const uint8_t* b = static_cast<const uint8_t*>(code->GetBufferPointer());
                 c->code[hdr].assign(b, b + code->GetBufferSize());
@@ -105,6 +109,12 @@ bool NisSharpen::WaitCompiled()
     if (!start_compile()) return false;
     while (compiled_->state.load() == 0) std::this_thread::sleep_for(std::chrono::milliseconds(5));
     return compiled_->state.load() == 1;
+}
+
+const char* NisSharpen::Error() const
+{
+    if (compiled_ && compiled_->state.load() == -1) return compiled_->error.c_str();
+    return g_nis_error.c_str();
 }
 
 void NisSharpen::Amount(uint32_t percent, float* sharpness, float* mix)
@@ -152,15 +162,15 @@ bool NisSharpen::init(ID3D12Device* device)
                         SUCCEEDED(device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&root_)));
     release(sig);
     release(err);
-    if (!sig_ok) return false;
+    if (!sig_ok) { g_nis_error = "NIS root signature failed"; return false; }
     for (int hdr = 0; hdr < 2; ++hdr) {
         D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
         pd.pRootSignature = root_;
         pd.CS = {compiled_->code[hdr].data(), compiled_->code[hdr].size()};
-        if (FAILED(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso_[hdr])))) return false;
+        if (FAILED(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso_[hdr])))) { g_nis_error = "NIS pipeline creation failed"; return false; }
     }
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRing * 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
-    if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap_)))) return false;
+    if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap_)))) { g_nis_error = "NIS descriptor heap failed"; return false; }
     inc_ = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     ok_ = true;
     return true;

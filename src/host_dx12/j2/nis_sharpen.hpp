@@ -30,6 +30,8 @@ public:
     // Until they are ready Dispatch returns false and RCAS alone is shown.
     // Tests call WaitCompiled() to make the next Dispatch deterministic.
     bool WaitCompiled();
+    // Why the pass is unavailable (compiler or creation error), empty when fine.
+    const char* Error() const;
 
     void Reset();
     static constexpr uint32_t kRing = 8;

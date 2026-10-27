@@ -1120,8 +1120,10 @@ bool RecordNisForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID
                        uint32_t w, uint32_t h, uint32_t percent, DXGI_FORMAT fmt, bool hdr)
 {
     std::lock_guard<std::mutex> lock(g.m);
-    if (percent > 100 && !g_nis.WaitCompiled()) return false;
-    return g_nis.Dispatch(device, list, in, out, w, h, fmt, hdr, percent, 0);
+    if (percent > 100 && !g_nis.WaitCompiled()) { std::printf("%s\n", g_nis.Error()); return false; }
+    const bool ok = g_nis.Dispatch(device, list, in, out, w, h, fmt, hdr, percent, 0);
+    if (!ok && percent > 100) std::printf("NIS dispatch refused: %s\n", g_nis.Error());
+    return ok;
 }
 void SetDebugView(int mode) { g_debug_view.store(mode < 0 || mode > 3 ? 0 : mode); }
 int DebugView() { return g_debug_view.load(); }
