@@ -137,7 +137,9 @@ int main(int argc, char** argv)
     const bool auto_inline = argc > 3 && std::strcmp(argv[3], "--auto-inline") == 0;
     const bool auto_between = argc > 3 && std::strcmp(argv[3], "--auto-between") == 0;
     const bool inline_list = auto_inline || inline_record_first || inline_copy || (argc > 3 && std::strcmp(argv[3], "--inline") == 0);
-    const bool post_reader = argc > 3 && !real_ngx && !planes && !split && !inline_list && !auto_between;
+    // auto-between needs an OBSERVABLE consumer (a copy of the colour): a barrier-only
+    // hand-back is not evidence of a list boundary (Astra R3).
+    const bool post_reader = argc > 3 && !real_ngx && !planes && !split && !inline_list;
     test::Device d;
     if (!test::CreateDevice(d)) return test::SkipNoDevice("j2_anno_shape_test");
     if (real_ngx) {
