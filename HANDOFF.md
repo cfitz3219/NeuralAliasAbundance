@@ -1,3 +1,27 @@
+# 2026-10-27 — Opus: Sniper Elite Resistance (second DLSS-less game) status; inline DLAA; Astra owns the insertion-point detector
+
+**Where things stand.**
+- Anno DLAA works and Cort has confirmed it in the game.
+- Sniper Elite Resistance (DX12, no DLSS, no TAA, FXAA-style post filter only) is the P4-3 second game. It has exposed six generic gaps, each fixed in general code with its own test, all on PR #44 (`claude/j2-live-dlaa`).
+- Latest head 9f7dd95, CI green, **not yet run in the game**.
+
+**Latest SER finding.** DLAA ran steadily: 3 scene submissions per frame, about 14,000 DLAA frames, only 7 restarts. Yet nothing changed on screen, not even the debug views. The game records the end of its scene and its post-processing in **one command list** (later_passes = 9), so DLAA inserted between lists lands after the post pass has already read the colour.
+
+**Fix built: inline DLAA.**
+- DLAA is recorded inside the game's own list, at the game's SRV bind of the scene colour, and the game's full pipeline state is then restored.
+- Stage 1 runs without J1 jitter: DLSS parameters are fixed at record time, while jitter is written at submit time.
+- Test: `host_j2_inline_test`.
+- **Open decision for Cort:** auto-switch to inline vs. an explicit `[j2] inline=1` setting in the SER installer. He prefers the setting and wants Astra to own detection.
+
+**Assigned to Astra (Cort):** P4-0D, an insertion-point detector that always knows where DLAA belongs in any game. See MASTER-PLAN and COMMS. It pairs with P4-0R (frame recorder and replay, planned, built after SER works).
+
+**Rules Cort clarified.**
+- Games with TAA are out of scope for J2 (Metro EE was dropped).
+- Games that already have DLSS go on the TLOU route automatically.
+- One mistake to note: a command Cort rejected still pushed the 1-line header fix 9f7dd95. It is harmless, but it was disclosed to him.
+
+---
+
 # 2026-10-25 — Gate 3 strengthened to verified available inputs
 
 Cort requires verified available inputs plus an explicit missing-input list, without a new review cycle or Phase4 synthesis work. MASTER-PLAN now defines mandatory verified scene color/stage, main depth and scene-used camera, individual native-motion/jitter/exposure/frame-identity dispositions, matched evidence, operational thresholds and the finite C14/A9 completion work. Research fit checked against primary sources: optional RenderDoc offline inspection, ReShade depth preservation if needed, NVIDIA semantic checklist; existing local confirmation/reprojection helpers retained. OptiScaler/Streamline debug UI do not fill the extraction gap. No upstream code imported or Anno compatibility claimed.

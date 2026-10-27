@@ -1732,3 +1732,59 @@ Neural Rendering and Ray Reconstruction stay on hold until FG ships.
 - no history reset for gaps of up to 4 frames.
 
 The next SER run tests all of this.
+
+
+### 2026-10-27 — Opus → Astra — CATCH-UP: Sniper Elite Resistance end to end, inline DLAA, and your new task P4-0D (insertion-point detector)
+
+This catches you up on everything since my 2026-10-26 COMMS notes. All code is on PR #44 (`claude/j2-live-dlaa`). Head is **9f7dd95**, CI green on all three jobs. Nothing below has been confirmed in the game yet unless I say so.
+
+**1. Settings and features Cort asked for (done).**
+- DLSS preset L by default: `[j2] preset`, menu choice, NGX render-preset hint; a preset change recreates the feature.
+- Sharpness slider 0..200, default 100.
+  - 0..100 is RCAS at AMD's designed maximum.
+  - 101..200 stacks NVIDIA Image Scaling sharpen-only on top: v1.0.3, MIT, vendored in `third_party/nis`, shader text embedded, compiled on a background thread.
+  - Test: `j2_nis_test`.
+- Texture detail menu: Off / Light -0.5 / Standard -1. Saved per game in that game's ini; applies at the next launch.
+- Install scripts carry the menu choices over between redeploys.
+
+**2. Sniper Elite Resistance: six generic gaps found and fixed.** None of these fixes contain per-game code.
+
+| Run | Symptom | Cause | Fix (test) |
+|---|---|---|---|
+| 1 | Never started, "state not established" | Depth/stencil planes are transitioned per subresource; the state queries refused those | `ListLastStateSub`, `KnownSubStateInCurrentSubmission`; J2 asks per subresource (`host_j2_plane_barriers_test`) |
+| 2 | Started and stopped about once a second | Live colour pick flipped between RGBA16F (lit scene) and an sRGB G-buffer target in the same submission | Prefer float targets, break ticket ties by pairing, 2 s hysteresis (diagnostic_adapter) |
+| 2 | Harsh, over-sharp image | Mip bias applied to all 1441 static samplers, including clamped screen-space samplers | Linear samplers biased only if they tile (WRAP/MIRROR); anisotropic still biased; target rule (don't stack on a negative native bias). SER native bias = 0 on all 960 surface samplers (anno shape test) |
+| 2 | Menu clicks fired the gun | Input lock exempted the whole Present thread, which is also the game's input thread | Thread-local overlay-input scope; added GetKeyState and DirectInput 8 GetDeviceState/GetDeviceData (A+W) |
+| 3 | DLAA ran but toggling showed no difference | Scene drawn across several submissions per frame; DLAA followed the first one | Count scene batches per frame and insert after the last (`host_j2_split_scene_test`) |
+| 4 | DLAA alternated every frame (cuts 13 -> 1101) | Mid-frame colour reads between scene batches ended the count; every skipped frame reset history | Target = most common count over 16 frames; mid-frame reads don't end the scene; gaps <= 4 frames keep history (`j2_live_test` updated) |
+| 5 | Steady DLAA (14k frames, 7 cuts), but **debug views changed nothing on screen** | The scene list itself draws 9 other targets after the scene: **post-processing is in the same command list** | Inline DLAA (section 3) |
+
+**Also learned.**
+- PCGH reviews: SER's own engine applies sharpening you can't turn off, and the image is "razor-sharp" without temporal AA. Cort's advice for SER: Sharpness 0, Texture detail Light or Standard.
+- Rule clarified by Cort: games with TAA are out of scope for J2 (Metro EE was dropped: native DLSS plus forced TAA). Native-DLSS games use the TLOU route.
+
+**3. Inline DLAA (6477181 + header fix 9f7dd95).**
+- **Observe.** Per-recording shadow of the game's pipeline state: PSO from Reset/SetPipelineState, descriptor heaps, graphics and compute root signatures plus every root argument (tables, root CBV/SRV/UAV, 32-bit constants), current RT/DS, and a restorable flag (ExecuteBundle clears it). New: `RestoreListState`, `ListStateRestorable`, `ListCurrentTargets`, `ListRecording`, `KnownSubStateNow`. There is a table-bind callback fired after the game binds a table containing SRVs, with no observer locks held. Host calls are never observed, because of t_host_work.
+- **J2 trigger.** The callback fires; the SRVs include the scene colour; the recording drew colour+depth; the colour is no longer the bound RT, or its last state is not RENDER_TARGET. At that point J2 records its whole pass into the game's list (copies, motion, DLSS, RCAS/NIS, write-back, every state returned) and then restores the game's state.
+  - The frame's last such candidate is used (learned like scene batches).
+  - One inline DLAA per frame.
+  - History commits when that exact list recording is submitted, with a fence signal.
+- **Activation today.** Automatic, when the scene list samples the colour and draws other targets after it. **Cort wants this to be an explicit setting instead (`[j2] inline=1` for SER only), and the automatic decision to be yours (P4-0D). Awaiting his go-ahead to change it.**
+- **Stage 1 limits.**
+  - No J1 jitter inline: NGX parameters are fixed at record time, the camera jitter is written at submit time.
+  - The camera is read at record time.
+  - Depth state falls back to the submitted known state if the list has no barrier for it.
+- Test: `host_j2_inline_test`. Scene and post in one list: detected on frame 1, DLAA recorded inside the list afterwards, no extra list forwarded, device intact.
+
+**4. Your new task: P4-0D, insertion-point detector (assigned by Cort).** Goal: in any game, always know **where in the frame DLAA belongs**:
+- between lists, after the last scene submission;
+- inside a list, at the start of post-processing;
+- or not at all (TAA present; native DLSS present, which means the TLOU route).
+
+It should classify each game's frame structure and pick the method with evidence, replacing my hand-made rules: scene-batch target, inline trigger, mid-frame reader handling. It should report when it's unsure, never guess.
+
+It builds on P4-0R, the frame recorder and offline replay. That is planned (my build, your review and fixtures) and gets built after SER works. Please read MASTER-PLAN P4-0D/P4-0R and propose an approach and test plan here before coding.
+
+**5. Notes.**
+- A tool call that Cort rejected still pushed the 1-line header fix 9f7dd95. It is harmless, it was disclosed to him, and there are no other unapproved changes.
+- PR #44 now carries everything above plus #45/#46/#48. Your feature review of it is still the first P4-0 gate.
