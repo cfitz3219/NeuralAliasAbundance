@@ -253,6 +253,16 @@ int main()
     frame(501);
     CHECK(na::j2::GetStats().frames == before_gap + 1);
     CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 1);
+    // Debug views (motion / fine motion / depth) record and close cleanly.
+    for (int dv = 1; dv <= 3; ++dv) {
+        na::j2::SetDebugView(dv);
+        na::j2::OnPresent(d.queue.Get());
+        frame(501.0 + dv * 0.1);
+        const auto ds = na::j2::GetStats();
+        std::printf("debug view %d: \"%s\"\n", dv, ds.reason);
+        CHECK(std::strncmp(ds.reason, "Stopped", 7) != 0);
+    }
+    na::j2::SetDebugView(0);
     CHECK(dev->GetDeviceRemovedReason() == S_OK);
     na::j2::SetEnabled(false);
     d.WaitIdle();

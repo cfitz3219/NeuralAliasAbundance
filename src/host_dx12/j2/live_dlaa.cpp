@@ -10,6 +10,7 @@
 
 #include <windows.h>
 #include <wrl/client.h>
+#include <d3dcompiler.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -164,6 +165,111 @@ bool is_float_color(DXGI_FORMAT f)
 {
     return f == DXGI_FORMAT_R16G16B16A16_FLOAT || f == DXGI_FORMAT_R11G11B10_FLOAT || f == DXGI_FORMAT_R32G32B32A32_FLOAT ||
            f == DXGI_FORMAT_R32G32B32_FLOAT;
+}
+
+// ---- Debug view (Argon's motion-vector audit) ---------------------------------
+// Replaces the DLAA result with a picture of what DLAA was given, so it can be
+// judged in the game: 1 motion (hue = direction, brightness = speed, 4 px = full;
+// black = no motion), 2 fine motion (0.2 px = full: reveals sub-pixel false
+// motion on a still camera), 3 depth (banded). Magenta = non-finite motion.
+std::atomic<int> g_debug_view{0};
+struct DebugPass {
+    ComPtr<ID3D12RootSignature> root;
+    ComPtr<ID3D12PipelineState> pso;
+    ComPtr<ID3D12DescriptorHeap> heap;
+    UINT inc = 0;
+    bool tried = false, ok = false;
+} g_dbg;
+constexpr char kDebugHlsl[] = R"(
+Texture2D<float2> t_mv : register(t0);
+Texture2D<float> t_depth : register(t1);
+RWTexture2D<float4> u_out : register(u0);
+cbuffer C : register(b0) { uint mode; float scale; uint w; uint h; };
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= w || id.y >= h) return;
+    float3 c;
+    if (mode == 3) {
+        float d = t_depth[id.xy];
+        c = frac(d * float3(1.0, 16.0, 256.0));
+    } else {
+        float2 v = t_mv[id.xy];
+        if (any(isnan(v)) || any(isinf(v))) { c = float3(1, 0, 1); }
+        else {
+            float a = atan2(v.y, v.x) / 6.2831853;
+            float3 hue = saturate(abs(frac(a + float3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0);
+            c = hue * saturate(length(v) * scale);
+        }
+    }
+    u_out[id.xy] = float4(c, 1.0);
+})";
+bool debug_init()
+{
+    if (g_dbg.tried) return g_dbg.ok;
+    g_dbg.tried = true;
+    D3D12_DESCRIPTOR_RANGE r[2]{};
+    r[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    r[0].NumDescriptors = 2;
+    r[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    r[1].NumDescriptors = 1;
+    r[1].OffsetInDescriptorsFromTableStart = 2;
+    D3D12_ROOT_PARAMETER p[2]{};
+    p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    p[0].DescriptorTable.NumDescriptorRanges = 2;
+    p[0].DescriptorTable.pDescriptorRanges = r;
+    p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    p[1].Constants.Num32BitValues = 4;
+    D3D12_ROOT_SIGNATURE_DESC rd{2, p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ComPtr<ID3DBlob> sig, err, code;
+    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
+        FAILED(g.device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&g_dbg.root))))
+        return false;
+    if (FAILED(D3DCompile(kDebugHlsl, sizeof(kDebugHlsl) - 1, "j2_debug.hlsl", nullptr, nullptr, "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err)))
+        return false;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = g_dbg.root.Get();
+    pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+    if (FAILED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_dbg.pso)))) return false;
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRing * 3, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    if (FAILED(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_dbg.heap)))) return false;
+    g_dbg.inc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    g_dbg.ok = true;
+    return true;
+}
+// Writes the debug picture into g.output (UNORDERED_ACCESS); motion and depth32 are readable (NPSR).
+bool debug_record(ID3D12GraphicsCommandList* l, int mode, DXGI_FORMAT out_format)
+{
+    if (!debug_init()) return false;
+    const UINT base = g.slot * 3;
+    D3D12_CPU_DESCRIPTOR_HANDLE c = g_dbg.heap->GetCPUDescriptorHandleForHeapStart();
+    c.ptr += static_cast<SIZE_T>(base) * g_dbg.inc;
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Texture2D.MipLevels = 1;
+    sv.Format = DXGI_FORMAT_R32G32_FLOAT;
+    g.device->CreateShaderResourceView(g.motion.Get(), &sv, c);
+    c.ptr += g_dbg.inc;
+    sv.Format = DXGI_FORMAT_R32_FLOAT;
+    g.device->CreateShaderResourceView(g.depth32.Get(), &sv, c);
+    c.ptr += g_dbg.inc;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+    uv.Format = out_format;
+    uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    g.device->CreateUnorderedAccessView(g.output.Get(), nullptr, &uv, c);
+    D3D12_GPU_DESCRIPTOR_HANDLE gh = g_dbg.heap->GetGPUDescriptorHandleForHeapStart();
+    gh.ptr += static_cast<UINT64>(base) * g_dbg.inc;
+    ID3D12DescriptorHeap* heaps[] = {g_dbg.heap.Get()};
+    l->SetDescriptorHeaps(1, heaps);
+    l->SetComputeRootSignature(g_dbg.root.Get());
+    l->SetPipelineState(g_dbg.pso.Get());
+    l->SetComputeRootDescriptorTable(0, gh);
+    const float scale = mode == 2 ? 5.0f : 0.25f;
+    uint32_t k[4] = {static_cast<uint32_t>(mode), 0, g.w, g.h};
+    std::memcpy(&k[1], &scale, 4);
+    l->SetComputeRoot32BitConstants(1, 4, k, 0);
+    l->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
+    return true;
 }
 
 bool ensure_device(ID3D12CommandQueue* q)
@@ -765,6 +871,14 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     e.auto_exposure = true;
     const bool evaluated = na::dlss::Evaluate(l, e);
     if (!evaluated) ++g.stats.dlss_failed;
+    if (evaluated) {
+        const int dv = g_debug_view.load(std::memory_order_relaxed);
+        if (dv >= 1 && dv <= 3) {
+            b.push_back(uav_barrier(g.output.Get()));
+            flush(l, b);
+            debug_record(l, dv, cf); // replaces the DLAA result with the debug picture
+        }
+    }
     // 5. result -> scene colour, everything back to the game's states
     if (evaluated) {
         b.push_back(uav_barrier(g.output.Get()));
@@ -826,6 +940,8 @@ void SetPaused(bool paused)
     g.paused.store(paused);
 }
 bool Paused() { return g.paused.load(); }
+void SetDebugView(int mode) { g_debug_view.store(mode < 0 || mode > 3 ? 0 : mode); }
+int DebugView() { return g_debug_view.load(); }
 void SetJitter(bool on)
 {
     std::lock_guard<std::mutex> lock(g.m);
@@ -968,6 +1084,7 @@ void Shutdown()
     for (auto& s : g.slots) { s.list.Reset(); s.alloc.Reset(); s.fence_value = 0; }
     g.fence.Reset(); g.queue.Reset(); g.device.Reset();
     g.arbiter = na::motion::gpu::Arbiter{};
+    g_dbg = DebugPass{};
     g.arbiter_ok = false;
     g.tracker.Reset();
     g.frame = 1;

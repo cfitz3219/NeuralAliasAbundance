@@ -35,6 +35,10 @@ bool Enabled();
 bool Configured();          // enabled at start-up (the overlay shows its section)
 void SetPaused(bool paused); // the overlay's on/off switch (history resets on resume)
 bool Paused();
+// Debug view (replaces the DLAA result): 0 off, 1 motion vectors, 2 fine motion
+// (sub-pixel), 3 depth.
+void SetDebugView(int mode);
+int DebugView();
 void SetJitter(bool on);     // the overlay's camera-jitter switch (J1), on by default
 bool Jitter();
 

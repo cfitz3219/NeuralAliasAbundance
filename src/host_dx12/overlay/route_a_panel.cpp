@@ -618,6 +618,14 @@ void DrawLiveDlaa()
     if (Switch("j2jit", &jit)) na::j2::SetJitter(jit);
     EndRow();
     {
+        static const char* kViews[] = {"Off (normal picture)", "Motion vectors", "Fine motion (sub-pixel)", "Depth"};
+        int dv = na::j2::DebugView();
+        BeginRow("Debug view", "Shows what DLAA is given instead of its result. Motion: colour = direction, brightness = speed, black = still. Fine motion makes tiny false motion visible. Magenta = broken values.", S(220));
+        ImGui::SetNextItemWidth(S(220));
+        if (ImGui::Combo("##j2dbg", &dv, kViews, 4)) na::j2::SetDebugView(dv);
+        EndRow();
+    }
+    {
         uint64_t ns = 0, nst = 0;
         na::observe::MipBiasCounts(&ns, &nst);
         char tb[200];

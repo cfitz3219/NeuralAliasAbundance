@@ -1064,10 +1064,15 @@ std::atomic<uint64_t> g_biased_samplers{0}, g_biased_static{0};
 template <typename SD>
 bool sampler_wants_bias(const SD& d)
 {
-    if (D3D12_DECODE_FILTER_REDUCTION(d.Filter) == D3D12_FILTER_REDUCTION_TYPE_COMPARISON) return false;
+    // Standard filtering only: comparison (shadow maps) and min/max reductions
+    // (depth pyramids) are data lookups, never biased.
+    if (D3D12_DECODE_FILTER_REDUCTION(d.Filter) != D3D12_FILTER_REDUCTION_TYPE_STANDARD) return false;
+    // Material textures: anisotropic, or linear minification (with linear OR point
+    // mip selection: the bias moves the chosen mip either way). All-point samplers
+    // are data/UI lookups and stay as they are. No mips (MaxLOD 0): nothing to bias.
     const bool aniso = D3D12_DECODE_IS_ANISOTROPIC_FILTER(d.Filter);
-    const bool linear_mip = D3D12_DECODE_MIP_FILTER(d.Filter) == D3D12_FILTER_TYPE_LINEAR;
-    return (aniso || linear_mip) && d.MaxLOD > 0.0f;
+    const bool linear_min = D3D12_DECODE_MIN_FILTER(d.Filter) == D3D12_FILTER_TYPE_LINEAR;
+    return (aniso || linear_min) && d.MaxLOD > 0.0f;
 }
 float biased(float lod, float bias) { const float v = lod + bias; return v < -16.0f ? -16.0f : (v > 15.99f ? 15.99f : v); }
 

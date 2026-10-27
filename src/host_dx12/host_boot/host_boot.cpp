@@ -165,14 +165,6 @@ DWORD WINAPI InitThread(LPVOID)
     na::j2::SetEnabled(GetPrivateProfileIntW(L"j2", L"enabled", 0, g_ini) == 1 &&
                        GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1);
     if (na::j2::Configured()) na::overlay::RegisterLiveDlaaMenu();
-    // J2 DLAA reconstructs texture detail over frames: sample textures one mip
-    // sharper (DLSS/FSR guidance: log2(render/display) - 1 = -1 at native).
-    // [j2] mip_bias overrides; 0 turns it off. Samplers created before this point keep theirs.
-    if (na::j2::Configured()) {
-        wchar_t mb[32] = {};
-        GetPrivateProfileStringW(L"j2", L"mip_bias", L"-1.0", mb, 32, g_ini);
-        na::observe::SetSamplerMipBias(static_cast<float>(_wtof(mb)));
-    }
     bool started = na::overlay::Start(tag, nullptr);
     signal_install_attempted(); // producers were installed (or could not be) inside Start
     boot_log(started ? "overlay started" : "overlay start failed");
@@ -229,6 +221,15 @@ bool StartFromIni(HMODULE self, const wchar_t* ini_name, const char* default_tag
     if (GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1 &&
         GetPrivateProfileIntW(L"observe", L"early_install", 1, g_ini) == 1)
         g_install_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    // J2 DLAA reconstructs texture detail over frames: the game's mip-mapped
+    // samplers sample one mip sharper (temporal-upscaler rule log2(render/display) - 1
+    // = -1 at native). Set here, synchronously at load, before any hook can see the
+    // game's first sampler. [j2] mip_bias overrides; 0 turns it off.
+    if (GetPrivateProfileIntW(L"j2", L"enabled", 0, g_ini) == 1 && GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1) {
+        wchar_t mb[32] = {};
+        GetPrivateProfileStringW(L"j2", L"mip_bias", L"-1.0", mb, 32, g_ini);
+        na::observe::SetSamplerMipBias(static_cast<float>(_wtof(mb)));
+    }
     HANDLE t = CreateThread(nullptr, 0, &InitThread, nullptr, 0, nullptr);
     if (!t) {
         signal_install_attempted();
