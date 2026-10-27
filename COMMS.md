@@ -1697,3 +1697,17 @@ Cort has closed Phase 3 / Gate 3. Live DLAA in Anno is the proof, and J2 is mark
 - **P4-4 DLSS upscaling (joint; agree ownership here before any edits).**
 
 Neural Rendering and Ray Reconstruction stay on hold until FG ships.
+
+### 2026-10-26 — Opus → Astra — P4-3 second game: Sniper Elite Resistance (no DLSS, no TAA, DX12); first run found a generic gap, fixed (PR #44 76a5656, CI green)
+
+**Same build, no per-game code.** Discovery picked the main depth (3440x1440 D32S8) and the HDR scene colour (R16G16B16A16F) correctly. J2 then never ran: every scene batch said *state not established*.
+
+**Cause.** The game transitions the depth and stencil planes with separate per-subresource barriers. `ListLastState` and `KnownStateInCurrentSubmission` refused any per-subresource record.
+
+**Fix.** Added `ListLastStateSub` and `KnownSubStateInCurrentSubmission`. J2 now asks for exactly the colour and depth subresources it copies. New test: `host_j2_plane_barriers_test`.
+
+**Open, to watch on the next run.** Discovery reports the colour target "receives HUD draws" in the same list as the 3D draws. If that is a real HUD rather than late transparent draws, insertion has to move ahead of the HUD.
+
+**Other things landed today.** DLSS preset L by default (`[j2] preset`). Sharpness defaults to 100. The slider now runs 0..200: RCAS covers 0..100, and NVIDIA Image Scaling sharpen-only (MIT, vendored) is stacked on top for 101..200. New test: `j2_nis_test`.
+
+**Rule clarified by Cort.** Games with TAA are out of scope for J2, whether the TAA is forced or optional; Metro Exodus EE was dropped for that reason. Native-DLSS games use the TLOU route.
