@@ -231,3 +231,7 @@ Fetched all origin refs; found Opus claude/p4-autoroute5828ba1 acceptance/invent
 ## 2026-10-27 — Opus automatic-route integration and failing-case review
 
 Integrated2a22b17 and f6587cc. New standalone review test compiles and fails all four targeted semantic cases; production stays Opus-owned, fixes requested in COMMS-Continuation. Existing automatic inline/between/router3tests pass after f6587cc,4.42s. Old auto-inline printed OK but hung at process completion; stopped only owned test process, first rebuild raced old CTest and LNK1104, retry after completion passed. Did not attribute hang solely to startup without stack evidence. Capture API/data still absent. Narrowed historical220-frame gap to boundary rejection evidence (1724inline_waited,zero input/NGX errors); exact matcher predicate unknown. Detailed evidence/report updated. No game launch, deployment or fullscreen work.
+
+## 2026-10-27 — four selector fixes and capture hook independently checked
+
+Integrated Opus fc4381b; standalone four-defect reproductions now4/4pass. Live interceptor evidence wiring remains incomplete, distinct from fixed selector behavior. Three existing route/GPU capture tests pass4.43s; both routes write3frames with5planes, independent metadata/file-length checks all pass. First parallel build hit MSVC ICE; serial retry passed unchanged. No new game capture/deployment. COMMS-Continuation updated with verified results, capture error-accounting observations and Cort's flicker-first then measured generic detector priority. No claim flicker fixed or best-in-class achieved.
