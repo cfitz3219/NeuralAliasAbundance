@@ -153,16 +153,24 @@ bool NisSharpen::init(ID3D12Device* device)
     ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
     ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     ss.MaxLOD = D3D12_FLOAT32_MAX;
+    ss.MaxAnisotropy = 1;
     ss.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
     ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_ROOT_SIGNATURE_DESC rd{2, p, 1, &ss, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     ID3DBlob* sig = nullptr;
     ID3DBlob* err = nullptr;
-    const bool sig_ok = SUCCEEDED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) &&
-                        SUCCEEDED(device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&root_)));
+    HRESULT shr = D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
+    HRESULT chr = E_FAIL;
+    if (SUCCEEDED(shr)) chr = device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&root_));
+    if (FAILED(shr) || FAILED(chr)) {
+        char m[96];
+        std::snprintf(m, sizeof m, "NIS root signature failed (serialize 0x%08X, create 0x%08X) ", static_cast<unsigned>(shr), static_cast<unsigned>(chr));
+        g_nis_error = m;
+        if (err) g_nis_error.append(static_cast<const char*>(err->GetBufferPointer()), err->GetBufferSize());
+    }
     release(sig);
     release(err);
-    if (!sig_ok) { g_nis_error = "NIS root signature failed"; return false; }
+    if (FAILED(shr) || FAILED(chr)) return false;
     for (int hdr = 0; hdr < 2; ++hdr) {
         D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
         pd.pRootSignature = root_;
