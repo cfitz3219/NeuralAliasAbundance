@@ -97,6 +97,7 @@ struct State {
     uint64_t route_prev_late = 0, route_prev_post_scene = 0, route_prev_no_camera = 0, route_prev_no_state = 0;
     uint32_t route_gen_applied = 0;
     bool dlss_ready = false;
+    uint64_t dlss_tried_frame = ~0ull; // one early start attempt per frame
     bool inline_sample_locked = false; // NGX recorded: no new raster sample may start this frame
     bool inline_camera_submitted = false; // an earlier depth/camera batch may already be executing
     struct LearnedInsertion { uint64_t color = 0, depth = 0; na::j2::InsertionDecision decision; };
@@ -486,7 +487,10 @@ bool dlss_on()
 void apply_route_locked(ID3D12CommandQueue* queue)
 {
     const auto& d = g.router.Current();
-    g.inline_mode = d.route == na::j2::Route::Inline;
+    // Inline is armed only after at least one scene frame was observed under this
+    // decision: the trigger matches the boundary learned from a completed frame, and
+    // a list recorded before any frame closed has nothing to match (legacy timing).
+    g.inline_mode = d.route == na::j2::Route::Inline && d.scene_frames > 0;
     g.stats.inline_mode = g.inline_mode ? 1u : 0u;
     if (d.history_generation != g.route_gen_applied) {
         g.route_gen_applied = d.history_generation;
@@ -494,10 +498,13 @@ void apply_route_locked(ID3D12CommandQueue* queue)
         g.inl.valid = false;     // an inline recording from the old route is not committed
         g.scene_batches_target = 0;
     }
-    if (g.inline_mode && !g.dlss_ready) {
-        // Ready before the game RECORDS the next scene list (the inline trigger runs then).
-        if (!g.device && queue) ensure_device(queue);
-        if (g.device) g.dlss_ready = dlss_on();
+    // Ready before the game RECORDS the next scene list (the inline trigger runs then).
+    // Only from Execute (queue given): it runs inside a host-work scope, so NGX's own
+    // submissions are not routed back into J2. From Present they would re-enter
+    // Execute while g.m is held.
+    if (queue && d.route == na::j2::Route::Inline && !g.dlss_ready) {
+        if (!g.device) ensure_device(queue);
+        if (g.device) dlss_on();
     }
 }
 
@@ -1456,7 +1463,15 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
                 sig = (sig ^ v) * 1099511628211ull;
             sum.boundary_signature = decision.final_candidate ? sig : 0;
             g.frame_agg.AddList(sum);
-            if (sum.renders_scene && !g.device) ensure_device(queue); // Present must be attributable to learn
+            if (sum.renders_scene) {
+                // Present must be attributable to learn, and every route needs DLSS:
+                // start it here (host-work scope), never from Present.
+                if (!g.device) ensure_device(queue);
+                if (g.device && g.queue.Get() == queue && !g.dlss_ready && g.dlss_tried_frame != g.frame) {
+                    g.dlss_tried_frame = g.frame;
+                    dlss_on();
+                }
+            }
         }
         if ((decision.writes || decision.all_reads) && g.insertion_trace_used < sizeof g.insertion_trace - 160) {
             const int n = std::snprintf(g.insertion_trace + g.insertion_trace_used, sizeof g.insertion_trace - g.insertion_trace_used,
@@ -1672,6 +1687,7 @@ void Shutdown()
     g.route_prev_late = g.route_prev_post_scene = g.route_prev_no_camera = g.route_prev_no_state = 0;
     g.route_gen_applied = 0;
     g.dlss_ready = false;
+    g.dlss_tried_frame = ~0ull;
     g.insertion_frame = g.insertion_learned = {};
     g.inl = State::InlinePending{};
     g.inl_frame = 0;
