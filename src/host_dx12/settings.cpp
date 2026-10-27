@@ -64,7 +64,6 @@ void load_from(const wchar_t* ini, bool only_if_present)
         double mbv = _wtof(mb);
         mbv = mbv < -4.0 ? -4.0 : (mbv > 0.0 ? 0.0 : mbv);
         g_settings.j2_mip_bias_x100.store(static_cast<int32_t>(mbv * 100.0 + (mbv < 0 ? -0.5 : 0.5)));
-        g_settings.j2_inline.store(GetPrivateProfileIntW(L"j2", L"inline", 0, ini) != 0);
         // [j2] preset: a letter J..M (NGX value = letter - 'A' + 1), "default", or a number.
         wchar_t pz[16] = {};
         GetPrivateProfileStringW(L"j2", L"preset", L"L", pz, 16, ini);
@@ -120,6 +119,9 @@ void Load()
     load_from(g_ini_defaults, false);
     resolve_user_ini();
     load_from(g_ini_user, true); // user choices win when present
+    // Insertion mode is an explicit per-game deployment choice, never inherited
+    // from another game's global menu preferences.
+    g_settings.j2_inline.store(g_ini_defaults[0] && GetPrivateProfileIntW(L"j2", L"inline", 0, g_ini_defaults) != 0);
 }
 
 bool Save()
