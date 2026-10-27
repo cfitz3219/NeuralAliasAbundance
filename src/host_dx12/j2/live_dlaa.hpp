@@ -65,6 +65,10 @@ struct Stats {
     int64_t camera_inv_delta = 0; // bytes from the ViewProjection to its inverse in the camera block
     int64_t camera_proj_delta = 0; // bytes to the camera's separate projection matrix (0 = none found)
     uint64_t jitter_proj_writes = 0; // J1: projection matrices replaced by jittered copies
+    // J1 coverage: lists drawn after this frame's DLAA that still use the jittered
+    // camera / the scene depth (unresolved shake), and camera-slot blocks holding a
+    // different camera (not jittered).
+    uint64_t post_camera_lists = 0, post_depth_lists = 0, other_camera_blocks = 0;
     bool depth_reversed = false;  // reverse-Z as classified from the camera    // other render targets bound after the scene in the same list (insertion may be late)
     uint32_t width = 0, height = 0, color_format = 0;
     // Shape of the selected resources (reported even when J2 refuses them).

@@ -365,7 +365,7 @@ void jitter_batch(ID3D12CommandList* const* lists, UINT count)
         };
         if (!g.jit.valid || !holds(g.jit.vp)) {
             if (g.jit.valid && holds(g.jit.jvp)) continue; // already jittered by an earlier batch of this frame
-            if (g.jit.valid) continue;                     // a different matrix (another camera): leave it
+            if (g.jit.valid) { ++g.stats.other_camera_blocks; continue; } // a different matrix (another camera): leave it
             if (!begin_jitter(k->res, k->off, view, k->slot)) continue;
         }
         if (k->slot) { // adopt the game's exact inverse bytes (they may differ from a computed inverse)
@@ -404,6 +404,24 @@ void jitter_batch(ID3D12CommandList* const* lists, UINT count)
                 if (rep && na::observe::WriteBuffer(k->res, k->off + o, rep, 64) == 64) ++g.stats.jitter_writes;
                 if (rep) break;
             }
+    }
+}
+
+// J1 coverage diagnostics: work drawn AFTER this frame's DLAA that still uses the
+// jittered camera or the (jittered) scene depth gets the shake without DLAA
+// resolving it (shimmer). Counted per list.
+void count_post_dlaa(ID3D12CommandList* const* lists, UINT first, UINT count, na_object_id depth_id)
+{
+    const size_t lo = g.camera_offset >= 0 ? static_cast<size_t>(g.camera_offset) : 0;
+    std::vector<uint8_t> bytes(64);
+    for (UINT i = first; i < count; ++i) {
+        if (!lists[i]) continue;
+        if (depth_id && na::observe::ListReferences(lists[i], depth_id)) ++g.stats.post_depth_lists;
+        if (g.camera_offset < 0) continue;
+        for (const auto& b : na::observe::ListRootConstantBuffers(lists[i])) {
+            if (na::observe::ReadBuffer(b.resource, b.offset + lo, bytes.data(), 64) != 64) continue;
+            if (!std::memcmp(bytes.data(), g.jit.jvp[0], 64) || !std::memcmp(bytes.data(), g.jit.jvp[1], 64)) { ++g.stats.post_camera_lists; break; }
+        }
     }
 }
 
@@ -847,6 +865,11 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     ++g.stats.submissions;
     if (g.submitted_frame == g.frame) {
         ++g.stats.duplicate_submissions;
+        if (g.jitter_on) {
+            uint64_t dsel = 0, csel = 0;
+            na::observe::GetLiveSelection(&dsel, &csel);
+            count_post_dlaa(lists, 0, count, dsel); // later batches of a frame whose DLAA already ran
+        }
         lock.unlock();
         forward(queue, count, lists);
         return;
@@ -909,6 +932,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     g.slot = (g.slot + 1) % kRing;
     na::dlss::BeforeExecute(queue, n2, batch.data());
     forward(queue, n2, batch.data());
+    if (g.jitter_on) count_post_dlaa(lists, static_cast<UINT>(scene) + 1, count, depth_id); // same batch, after the DLAA list
     // The void D3D12 forward has now submitted our list. Failed recording/NGX
     // attempts above must never replace the previous submitted camera.
     g.tracker = pending.tracker;
