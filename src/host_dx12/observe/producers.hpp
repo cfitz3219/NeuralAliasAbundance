@@ -111,8 +111,8 @@ std::vector<LiveBinding> ListRootConstantBuffers(ID3D12CommandList* list); // gr
 bool ListReferences(ID3D12CommandList* list, na_object_id id);            // the recording referenced the resource
 // True when the recording bound `color` as a render target together with `depth` as its depth target.
 bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id depth);
-// Inline insertion (J2). Called on the recording thread right after the game binds
-// a descriptor table that contains SRVs (the resources listed), with no observer
+// Inline insertion (J2). Called on the recording thread before a draw/dispatch uses
+// bound SRVs (the resources listed), with no observer
 // locks held; host work recorded into `list` from the callback must run under a
 // HostWorkScope and end with RestoreListState(list).
 using TableBindCallback = void (*)(ID3D12GraphicsCommandList* list, const na_object_id* srvs, uint32_t count, bool compute);

@@ -20,6 +20,7 @@
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/observe/producers.hpp"
 
+#include <d3dcompiler.h>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -309,6 +310,7 @@ int main(int argc, char** argv)
         REQUIRE(SUCCEEDED(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&post_root))));
     }
     // Inline mode: the post pass draws into its own target (another resource).
+    test::ComPtr<ID3D12PipelineState> post_pso;
     test::ComPtr<ID3D12Resource> post_rt;
     test::ComPtr<ID3D12DescriptorHeap> post_rtvh;
     D3D12_CPU_DESCRIPTOR_HANDLE post_rtv{};
@@ -319,6 +321,25 @@ int main(int argc, char** argv)
         REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&phd, IID_PPV_ARGS(&post_rtvh))));
         post_rtv = post_rtvh->GetCPUDescriptorHandleForHeapStart();
         dev->CreateRenderTargetView(post_rt.Get(), nullptr, post_rtv);
+        const char* shader = R"(
+Texture2DArray<float4> image : register(t0);
+float4 VS(uint id : SV_VertexID) : SV_Position { float2 p=float2((id<<1)&2,id&2); return float4(p*2-1,0,1); }
+float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(pos.xy),0,0)); }
+)";
+        test::ComPtr<ID3DBlob> vs, ps, err;
+        REQUIRE(SUCCEEDED(D3DCompile(shader, std::strlen(shader), nullptr, nullptr, nullptr, "VS", "vs_5_0", 0, 0, &vs, &err)));
+        REQUIRE(SUCCEEDED(D3DCompile(shader, std::strlen(shader), nullptr, nullptr, nullptr, "PS", "ps_5_0", 0, 0, &ps, &err)));
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = post_root.Get();
+        pd.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+        pd.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.SampleMask = UINT_MAX; pd.SampleDesc.Count = 1;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets = 1; pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&post_pso))));
     }
     uint8_t* cpu = nullptr;
     REQUIRE(SUCCEEDED(cb->Map(0, nullptr, reinterpret_cast<void**>(&cpu))) && cpu);
@@ -389,8 +410,16 @@ int main(int argc, char** argv)
             ID3D12DescriptorHeap* ph[] = {post_heap.Get()};
             scene.list->SetDescriptorHeaps(1, ph);
             scene.list->SetGraphicsRootSignature(post_root.Get());
+            scene.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            D3D12_VIEWPORT viewport{0, 0, float(W), float(H), 0, 1};
+            D3D12_RECT scissor{0, 0, LONG(W), LONG(H)};
+            scene.list->RSSetViewports(1, &viewport);
+            scene.list->RSSetScissorRects(1, &scissor);
             const int evals_before_read = fake::evals;
-            scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart()); // intermediate read
+            scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart()); // binding alone is not a read
+            REQUIRE(fake::evals == evals_before_read);
+            scene.list->SetPipelineState(post_pso.Get()); // shader chosen AFTER the table
+            scene.list->DrawInstanced(3, 1, 0, 0); // intermediate actual read
             REQUIRE(fake::evals == evals_before_read); // must NEVER process the incomplete scene
             std::swap(rd2.Transition.StateBefore, rd2.Transition.StateAfter);
             scene.list->ResourceBarrier(1, &rd2);
@@ -399,7 +428,9 @@ int main(int argc, char** argv)
             std::swap(rd2.Transition.StateBefore, rd2.Transition.StateAfter);
             scene.list->ResourceBarrier(1, &rd2);
             scene.list->OMSetRenderTargets(1, &post_rtv, FALSE, nullptr);
-            scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart()); // final scene read
+            scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart()); // final scene binding
+            REQUIRE(fake::evals == evals_before_read); // cannot inject on binding
+            scene.list->DrawInstanced(3, 1, 0, 0); // final actual read
             std::swap(rd2.Transition.StateBefore, rd2.Transition.StateAfter);
             scene.list->ResourceBarrier(1, &rd2);
         }

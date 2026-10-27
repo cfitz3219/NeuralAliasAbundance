@@ -2384,8 +2384,6 @@ void root_table(GL* l, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE h)
     na_object_id heap = 0;
     uint32_t slot = 0;
     uint64_t version = 0;
-    na_object_id srvs[64];
-    uint32_t nsrv = 0;
     shadow_arg(l, Compute, param, 1, h.ptr);
     {
         std::shared_lock<std::shared_mutex> lock(g_m);
@@ -2411,7 +2409,6 @@ void root_table(GL* l, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE h)
                                 const uint64_t index = uint64_t(slot) + range.table_offset + k;
                                 if (index >= dh->count) break;
                                 const auto& si = dh->info[static_cast<size_t>(index)];
-                                if (si.kind == NA_DESC_SRV && si.resource && si.resource != NA_UNKNOWN_U64 && nsrv < 64) srvs[nsrv++] = si.resource;
                                 if (si.kind == NA_DESC_SRV && si.resource && si.resource != NA_UNKNOWN_U64 &&
                                     ls->sampled_textures.size() < 256 &&
                                     std::find(ls->sampled_textures.begin(), ls->sampled_textures.end(), si.resource) == ls->sampled_textures.end())
@@ -2442,16 +2439,6 @@ void root_table(GL* l, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE h)
     }
     emit_op(r, NA_OP_SET_ROOT_TABLE, {heap, heap ? slot : uint64_t{NA_UNKNOWN_U32}, heap ? version : NA_UNKNOWN_U64, param, Compute}, nullptr, 0, 0,
             heap ? 0u : NA_EVF_METHOD_UNOBSERVED);
-    with_list_state(l, [&](ListState& ls) {
-        std::lock_guard<std::mutex> bl(ls.bind_m);
-        for (uint32_t i = 0; i < nsrv; ++i) {
-            bool duplicate = false;
-            for (uint32_t j = 0; j < i; ++j) duplicate |= srvs[j] == srvs[i];
-            if (!duplicate) ls.insertion.Add({srvs[i], Compute ? 0 : ls.cur_rt, reinterpret_cast<uint64_t>(ls.pso), false});
-        }
-    });
-    // Inline insertion point (J2): the game binds textures for reading, no locks held.
-    if (nsrv) if (TableBindCallback cb = g_table_cb.load(std::memory_order_acquire)) cb(l, srvs, nsrv, Compute != 0);
 }
 template <>
 struct On<sl::list::SetComputeRootDescriptorTable> { static void run(GL* l, UINT p, D3D12_GPU_DESCRIPTOR_HANDLE h) { root_table<1>(l, p, h); } };
@@ -2603,6 +2590,53 @@ struct On<sl::list::ExecuteIndirect> {
     }
 };
 
+// Resolve bindings at use time: a table bind may precede PSO/target changes.
+void before_shader_use(GL* l, bool compute)
+{
+    if (t_host_work || !na::observe_internal::Started()) return;
+    uint64_t depth = 0, color = 0;
+    GetLiveSelection(&depth, &color);
+    if (!color) return;
+    bool reads_color = false;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_m);
+        na_object_id lid = 0;
+        auto* ls = list_state_locked(l, &lid);
+        if (!ls) return;
+        std::lock_guard<std::mutex> bl(ls->bind_m);
+        const auto signature = g_objs.find(canon(ls->root_sig[compute]));
+        if (signature == g_objs.end()) return;
+        na_object_id destination = compute ? 0 : ls->cur_rt;
+        const auto& params = signature->second.root_params;
+        const auto& ranges = signature->second.root_ranges;
+        for (size_t p = 0; p < ls->args[compute].size() && p < params.size(); ++p) {
+            const auto& arg = ls->args[compute][p];
+            if (arg.type != 1 || params[p].param_type != NA_ROOT_TABLE) continue;
+            uint32_t slot = 0;
+            auto* heap = heap_for_gpu_locked(arg.value, &slot);
+            if (!heap) continue;
+            bool bound = false;
+            for (uint32_t h = 0; h < ls->nheaps; ++h) bound |= heap->key == ls->heaps[h];
+            if (!bound) continue;
+            for (uint32_t r = 0; r < params[p].count && params[p].first_range + r < ranges.size(); ++r) {
+                const auto& range = ranges[params[p].first_range + r];
+                if (range.table_offset == NA_UNKNOWN_U32) continue;
+                for (uint32_t k = 0; k < std::min<uint32_t>(range.num_descriptors, 64); ++k) {
+                    const uint64_t index = uint64_t(slot) + range.table_offset + k;
+                    if (index >= heap->count) break;
+                    const auto& info = heap->info[static_cast<size_t>(index)];
+                    if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && info.kind == NA_DESC_SRV)
+                        reads_color |= info.resource == color;
+                    if (compute && !destination && range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV && info.kind == NA_DESC_UAV)
+                        destination = info.resource;
+                }
+            }
+        }
+        if (reads_color) ls->insertion.Add({color, destination, reinterpret_cast<uint64_t>(ls->pso), false});
+    }
+    if (reads_color) if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, compute);
+}
+
 // Thunk pools (variant registry, A48/A49): one detour per implementation variant.
 constexpr uint32_t kThunks = 4;
 template <uint32_t Slot, typename Sig>
@@ -2617,6 +2651,8 @@ struct ListHook<Slot, R(A...)> {
         na::hooking::variants::CallScope scope(l, Slot);
         auto fn = reinterpret_cast<Pfn>(orig[I]);
         if constexpr (std::is_void_v<R>) {
+            if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced || Slot == sl::list::Dispatch)
+                if (scope.outermost && !scope.ambiguous) before_shader_use(l, Slot == sl::list::Dispatch);
             fn(l, a...);
             if (scope.outermost && !scope.ambiguous) On<Slot>::run(l, a...);
         } else {

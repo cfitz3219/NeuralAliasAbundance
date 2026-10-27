@@ -1162,15 +1162,11 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     return true;
 }
 
-// Inline insertion point: the game binds a descriptor table with SRVs on one of
-// its lists while recording. When those SRVs include the scene colour, this list
-// drew the scene (colour + depth), and the colour is no longer being drawn into
-// (another target is bound, or it has been transitioned for reading), the scene
-// is complete: post-processing is about to read it. DLAA is recorded here, into
-// the game's list, and the game's state is put back. The prior submitted
-// recording teaches the first read after its final scene write. Intermediate
-// reads are retained as evidence, never hidden by a one-candidate shortcut.
-void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint32_t n, bool)
+// Inline insertion runs immediately before a draw/dispatch whose bound SRVs
+// include scene colour. The consuming PSO/targets are now established; bindings
+// alone are not reads. Prior recordings teach the first use after the final
+// scene write. The host restores game state before forwarding the real call.
+void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint32_t n, bool compute)
 {
     if (!g.enabled.load(std::memory_order_relaxed) || g.paused.load(std::memory_order_relaxed)) return;
     uint64_t depth_id = 0, color_id = 0;
@@ -1189,7 +1185,7 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     if (!na::observe::ListSceneSubresource(l, color_id, depth_id, &csub, &dsub)) return;
     na_object_id cur_rt = 0, cur_ds = 0;
     na::observe::ListCurrentTargets(l, &cur_rt, &cur_ds);
-    const bool reading = cur_rt != color_id ||
+    const bool reading = compute || cur_rt != color_id ||
                          (na::observe::ListLastStateSub(l, color_id, csub, &cst) && !(cst & D3D12_RESOURCE_STATE_RENDER_TARGET));
     if (!reading) return;
     ++g.stats.inline_candidates;
