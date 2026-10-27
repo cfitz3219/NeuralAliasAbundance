@@ -72,6 +72,22 @@ inline Matrix TransposeMatrix(const Matrix& m) {
     for (size_t r = 0; r < 4; ++r) for (size_t c = 0; c < 4; ++c) t[r * 4 + c] = m[c * 4 + r];
     return t;
 }
+// Current clip/NDC -> previous clip in ONE matrix, composed in double (row-vector:
+// p_prev = p_cur * InvVPcur * VPprev). Uploading InvVPcur and VPprev separately
+// as floats and chaining them per pixel through large world coordinates loses
+// precision: Anno's still camera produced ~0.09 px of false motion, which DLAA
+// accumulated into a persistent blur (Astra, docs/ANNO-BLUR-DIAGNOSIS.md).
+// Composed first, a still camera gives exactly identity.
+inline Matrix ComposeReprojectionRow(const Matrix& inv_view_proj_current_row, const Matrix& view_proj_previous_row) {
+    Matrix m{};
+    for (size_t r = 0; r < 4; ++r)
+        for (size_t c = 0; c < 4; ++c) {
+            double v = 0;
+            for (size_t k = 0; k < 4; ++k) v += inv_view_proj_current_row[r * 4 + k] * view_proj_previous_row[k * 4 + c];
+            m[r * 4 + c] = v;
+        }
+    return m;
+}
 
 // Exact inverse of core/temporal_jitter.hpp for a KNOWN pixel offset.
 // Unknown native jitter still needs a baseline; decomposition alone cannot

@@ -1,7 +1,10 @@
 // reconstructed 2026-10 — independent numerical truth and per-pixel provenance.
 #include "test_support.hpp"
 #include "core/motion_arbiter.hpp"
+#include <array>
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <utility>
 using namespace na::motion;
@@ -37,6 +40,34 @@ Mat4 inverse(const Mat4& m) {
     Mat4 o{}; for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) o.m[r*4+c] = static_cast<float>(a[r][c+4]);
     return o;
 }
+// Double-precision row-vector camera far from the origin (like Anno's world).
+using D16 = std::array<double, 16>;
+D16 cam_row_d(double yaw, double px, double pz) {
+    const double n = .1, f = 1000;
+    const double P[16] = {1,0,0,0, 0,1,0,0, 0,0,f/(f-n),-f*n/(f-n), 0,0,1,0};
+    const double c = std::cos(yaw), s = std::sin(yaw);
+    double V[16] = {c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1};
+    const double pos[3] = {px, 40, pz};
+    for (int r = 0; r < 3; ++r) V[r*4+3] = -(V[r*4]*pos[0] + V[r*4+1]*pos[1] + V[r*4+2]*pos[2]);
+    D16 M{}, o{};
+    for (int r = 0; r < 4; ++r) for (int k = 0; k < 4; ++k) for (int q = 0; q < 4; ++q) M[r*4+k] += P[r*4+q]*V[q*4+k];
+    for (int r = 0; r < 4; ++r) for (int k = 0; k < 4; ++k) o[k*4+r] = M[r*4+k]; // row-vector
+    return o;
+}
+D16 inverse_d(const D16& m) {
+    double a[4][8]{};
+    for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) { a[r][c] = m[r*4+c]; a[r][c+4] = r == c; }
+    for (int c = 0; c < 4; ++c) {
+        int p = c; for (int r = c+1; r < 4; ++r) if (std::fabs(a[r][c]) > std::fabs(a[p][c])) p = r;
+        for (int k = 0; k < 8; ++k) std::swap(a[c][k], a[p][k]);
+        const double d = a[c][c]; for (double& v : a[c]) v /= d;
+        for (int r = 0; r < 4; ++r) if (r != c) { const double f = a[r][c]; for (int k = 0; k < 8; ++k) a[r][k] -= f*a[c][k]; }
+    }
+    D16 o{}; for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) o[r*4+c] = a[r][c+4];
+    return o;
+}
+Mat4 f4(const D16& d) { Mat4 o{}; for (int i = 0; i < 16; ++i) o.m[i] = static_cast<float>(d[i]); return o; }
+D16 mul_d(const D16& a, const D16& b) { D16 o{}; for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) for (int k = 0; k < 4; ++k) o[r*4+c] += a[r*4+k]*b[k*4+c]; return o; }
 }
 int main() { return test::run({
     {"camera reprojection direction and raster jitter", [] {
@@ -69,6 +100,35 @@ int main() { return test::run({
         CHECK(std::fabs(x) < 0.1f && std::fabs(y) < 0.05f);
         t.depth_inverted = true; t.depth_clear = 0; // reverse-Z clear value is also sky
         CHECK(ReprojectPixel(t, 128, 128, 64, 64, 0.f, &x, &y, &off));
+    }},
+    {"a still camera far from the origin: composed reprojection gives zero motion (Anno blur)", [] {
+        // Anno-like: camera thousands of units from the origin, still. Two separate
+        // float matrices chained through world space give sub-pixel false motion;
+        // one matrix composed in double gives none.
+        const D16 vp = cam_row_d(0.7, 4200.0, -6100.0), inv = inverse_d(vp);
+        float depth = .9995f, x = 0, y = 0; bool off = false;
+        auto t = camera(&depth);
+        float worst_sep = 0, worst_comp = 0;
+        for (uint32_t py = 100; py < 1440; py += 331)
+            for (uint32_t px = 50; px < 3440; px += 617) {
+                t.inv_view_proj_current = f4(inv);
+                t.view_proj_previous = f4(vp);
+                if (ReprojectPixel(t, 3440, 1440, px, py, depth, &x, &y, &off)) worst_sep = std::max(worst_sep, std::max(std::fabs(x), std::fabs(y)));
+                D16 id{}; id[0] = id[5] = id[10] = id[15] = 1;
+                t.inv_view_proj_current = f4(mul_d(inv, vp));
+                t.view_proj_previous = f4(id);
+                CHECK(ReprojectPixel(t, 3440, 1440, px, py, depth, &x, &y, &off));
+                worst_comp = std::max(worst_comp, std::max(std::fabs(x), std::fabs(y)));
+            }
+        std::printf("still camera: worst false motion separate %.5f px, composed %.5f px\n", worst_sep, worst_comp);
+        CHECK(worst_comp < 0.002f);
+        // And it still moves correctly: yaw by 0.002 rad between frames.
+        const D16 prev = cam_row_d(0.702, 4200.0, -6100.0);
+        D16 id{}; id[0] = id[5] = id[10] = id[15] = 1;
+        t.inv_view_proj_current = f4(mul_d(inv, prev));
+        t.view_proj_previous = f4(id);
+        CHECK(ReprojectPixel(t, 3440, 1440, 1720, 720, depth, &x, &y, &off));
+        CHECK(std::fabs(x) > 1.0f);
     }},
     {"engine priority and per-pixel validity fallbacks", [] {
         float engine[]{4,5, 6,7, 8,9}, valid[]{1,0,std::numeric_limits<float>::quiet_NaN()};

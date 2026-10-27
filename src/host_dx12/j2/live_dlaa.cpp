@@ -613,8 +613,15 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         in.depth = g.depth32.Get();
         in.tier2_valid_flag = true;
         in.depth_clear = reversed ? 0.0f : 1.0f;
-        in.inv_view_proj_current = to_mat4(cam.inv_view_proj_current_row);
-        in.view_proj_previous = to_mat4(cam.view_proj_previous_row);
+        // One composed current->previous clip matrix (double, then float); the
+        // arbiter's second matrix is identity. Never chain two float matrices
+        // through world space (false motion on a still camera -> DLAA blur).
+        in.inv_view_proj_current = to_mat4(na::camera::ComposeReprojectionRow(cam.inv_view_proj_current_row, cam.view_proj_previous_row));
+        {
+            na::camera::Matrix id{};
+            id[0] = id[5] = id[10] = id[15] = 1.0;
+            in.view_proj_previous = to_mat4(id);
+        }
         // J1: this frame's raster sample sits at pixel centre - jitter in the unjittered
         // projection; the arbiter removes it before reprojecting (Astra, 378663e finding).
         in.jitter_current_px[0] = static_cast<float>(cam.jitter_px_x);
