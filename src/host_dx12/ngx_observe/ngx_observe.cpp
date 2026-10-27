@@ -180,6 +180,7 @@ std::atomic<uint32_t> g_fg_seen{0};
 std::atomic<HMODULE> g_hooked_module{nullptr};
 std::atomic<uint64_t> g_sr_creates{0};
 std::atomic<uint64_t> g_sr_creates_unknown{0}, g_sr_creates_injector{0};
+std::atomic<uint64_t> g_evaluates_external{0}; // the game's own evaluations (never the injector's)
 std::atomic<uint32_t> g_last_sr_in_w{0}, g_last_sr_in_h{0}, g_last_sr_out_w{0}, g_last_sr_out_h{0};
 std::atomic<uint64_t> g_create_failures{0}, g_create_recovered{0};
 std::atomic<uint32_t> g_preset_rejected{0}, g_quality_rejected{0};
@@ -524,6 +525,7 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
     NgxResult r = s.evaluate(cmd_list, handle, params, callback);
     na::gputime::End(list);
     g_evaluates.fetch_add(1, std::memory_order_relaxed);
+    g_evaluates_external.fetch_add(1, std::memory_order_release);
     bool detail = g_detail.load(std::memory_order_relaxed);
     bool capture = na::capture::Pending();
     bool nr = na::nr::WantsInputs();
@@ -1421,6 +1423,7 @@ Stats GetStats()
     s.sr_creates = g_sr_creates.load(std::memory_order_acquire);
     s.sr_creates_unknown = g_sr_creates_unknown.load(std::memory_order_acquire);
     s.sr_creates_injector = g_sr_creates_injector.load(std::memory_order_acquire);
+    s.evaluates_external = g_evaluates_external.load(std::memory_order_acquire);
     s.create_failures = g_create_failures.load(std::memory_order_relaxed);
     s.create_recovered = g_create_recovered.load(std::memory_order_relaxed);
     s.preset_rejected = g_preset_rejected.load(std::memory_order_acquire);

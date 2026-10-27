@@ -3,6 +3,9 @@
 #include "host_dx12/j2/nis_sharpen.hpp"
 #include "host_dx12/j2/route_selector.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
+#include "host_dx12/ngx_observe/ngx_observe.hpp"
+#include "host_dx12/upscalers/ffx_intercept.hpp"
+#include "host_dx12/upscalers/xess_intercept.hpp"
 
 #include "core/motion_arbiter_gpu.hpp"
 #include "core/temporal_jitter.hpp"
@@ -99,6 +102,7 @@ struct State {
     uint64_t route_prev_late = 0, route_prev_post_scene = 0, route_prev_no_camera = 0, route_prev_no_state = 0;
     uint32_t route_gen_applied = 0;
     bool dlss_ready = false;
+    uint64_t route_prev_external = 0; // the game's own upscaler evaluations so far (NGX + FSR + XeSS)
     uint32_t frame_rejects = 0;       // inline trigger rejections in the current frame
     char frame_reject_text[320] = {}; // the frame's first rejection, with both boundaries
     uint64_t dlss_tried_frame = ~0ull; // one early start attempt per frame
@@ -1366,7 +1370,7 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     }
     if (!learned.consumer.mode || learned.consumer.mode == CS::Legacy) ++g.stats.consumer_cold;
     } // legacy boundary matcher
-    if (!na::observe::ListStateRestorable(l)) { ++g.stats.inline_refused; reason("The scene list's state cannot be restored after DLAA (a bundle ran); left untouched."); return; }
+    if (!na::observe::ListStateRestorable(l)) { ++g.stats.inline_refused; reason("The scene list's state cannot be restored after DLAA here (a bundle ran, or inside a render pass); left untouched."); return; }
     ID3D12CommandList* one[1] = {l};
     // The depth/earlier scene batches must already have established this frame's
     // raster sample. Apply that SAME sample to camera copies in this recording
@@ -1466,6 +1470,16 @@ void OnPresent(ID3D12CommandQueue* queue)
             na::capture::j2::OnFrameClosed(g.frame, late - g.route_prev_late); // evidence capture identity
             o.camera_missed = g.stats.no_camera > g.route_prev_no_camera;
             o.depth_state_missed = g.stats.no_state > g.route_prev_no_state;
+            {
+                // Current-frame ownership by a supported upscaler: the GAME's own evaluations
+                // this frame (J2's NGX calls are marked as injector calls and excluded).
+                // Lifetime/creation counts are not ownership; when the game stops
+                // evaluating, the selector relearns from structure.
+                const uint64_t external = na::ngx::GetStats().evaluates_external + na::ffx::GetStats().upscale_dispatches +
+                                          na::xess::GetStats().executes;
+                o.interceptor = external > g.route_prev_external;
+                g.route_prev_external = external;
+            }
             g.route_prev_late = late;
             g.route_prev_no_camera = g.stats.no_camera;
             g.route_prev_no_state = g.stats.no_state;

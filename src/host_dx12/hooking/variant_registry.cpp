@@ -353,10 +353,19 @@ uint32_t WarmUpCommandLists(ID3D12Device* device, uint32_t type_mask)
         ComPtr<ID3D12GraphicsCommandList> list;
         if (FAILED(device->CreateCommandAllocator(types[t], IID_PPV_ARGS(&alloc)))) continue;
         if (FAILED(device->CreateCommandList(0, types[t], alloc.Get(), nullptr, IID_PPV_ARGS(&list)))) continue;
-        EnsureObject(Kind::CommandList, list.Get()); ++ensured;
+        // List4 (render passes) only through its own interface pointer, and only when
+        // that kind has registered slots.
+        const auto ensure = [&]() {
+            EnsureObject(Kind::CommandList, list.Get());
+            ++ensured;
+            if (!R(Kind::CommandList4).pub_slot_count.load(std::memory_order_acquire)) return;
+            ComPtr<ID3D12GraphicsCommandList4> l4;
+            if (SUCCEEDED(list.As(&l4)) && l4) EnsureObject(Kind::CommandList4, l4.Get());
+        };
+        ensure();
         list->Close();
-        if (SUCCEEDED(list->Reset(alloc.Get(), nullptr))) { EnsureObject(Kind::CommandList, list.Get()); ++ensured; list->Close(); }
-        if (SUCCEEDED(list->Reset(alloc.Get(), nullptr))) { EnsureObject(Kind::CommandList, list.Get()); ++ensured; list->Close(); }
+        if (SUCCEEDED(list->Reset(alloc.Get(), nullptr))) { ensure(); list->Close(); }
+        if (SUCCEEDED(list->Reset(alloc.Get(), nullptr))) { ensure(); list->Close(); }
     }
     return ensured;
 }

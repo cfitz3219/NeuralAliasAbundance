@@ -85,6 +85,10 @@ constexpr uint32_t OMSetRenderTargets = 46;
 constexpr uint32_t ClearDepthStencilView = 47;
 constexpr uint32_t ClearRenderTargetView = 48;
 constexpr uint32_t ExecuteIndirect = 59;
+// ID3D12GraphicsCommandList4 (Kind::CommandList4; verified against the SDK vtable:
+// List1 adds 60-65, List2 66, List3 67). NOT 62/63 (OMSetDepthBounds/SetSamplePositions).
+constexpr uint32_t BeginRenderPass = 68;
+constexpr uint32_t EndRenderPass = 69;
 } // namespace list
 
 } // namespace na::observe::slots

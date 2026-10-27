@@ -110,6 +110,7 @@ struct Stats {
     uint64_t sr_creates; // aggregate successful SR creations
     uint64_t sr_creates_unknown; // unmarked origin, never inferred from aggregate differences
     uint64_t sr_creates_injector; // explicitly marked backend calls
+    uint64_t evaluates_external;  // evaluations by the game (injector calls excluded): current upscaler ownership
     uint32_t last_sr_in_w, last_sr_in_h, last_sr_out_w, last_sr_out_h;
     // A42: creation failures and the fallback that keeps DLSS running.
     uint64_t create_failures;   // creations the runtime refused (after fallback)

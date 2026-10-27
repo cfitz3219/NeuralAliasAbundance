@@ -112,6 +112,7 @@ struct ListState {
     uint32_t cur_nrt = 0;
     uint32_t cur_ds_sub = NA_UNKNOWN_U32;
     bool restorable = true;              // false after work whose state effects we cannot replay
+    bool in_render_pass = false;         // between BeginRenderPass and EndRenderPass (no host copy/dispatch allowed)
 };
 
 struct Obj {
@@ -2030,6 +2031,7 @@ struct On<sl::list::Reset> {
                     ls->cur_rt = ls->cur_ds = 0;
                     ls->cur_nrt = 0;
                     ls->restorable = true;
+                    ls->in_render_pass = false;
                 }
                 ls->root_sig[0] = ls->root_sig[1] = nullptr;
                 ls->coverage_complete.store(cov == na::hooking::variants::Coverage::Complete);
@@ -2501,6 +2503,26 @@ template <>
 struct On<sl::list::SetComputeRootUnorderedAccessView> { static void run(GL* l, UINT p, D3D12_GPU_VIRTUAL_ADDRESS a) { root_view<NA_DESC_UAV, 1>(l, p, a); } };
 template <>
 struct On<sl::list::SetGraphicsRootUnorderedAccessView> { static void run(GL* l, UINT p, D3D12_GPU_VIRTUAL_ADDRESS a) { root_view<NA_DESC_UAV, 0>(l, p, a); } };
+// Current targets + target history of a recording (OMSetRenderTargets and BeginRenderPass).
+// refs: render targets, then the depth view last when has_dsv.
+void set_targets_locked(ListState& ls, const na_view_ref* refs, uint32_t m, bool has_dsv)
+{
+    const uint32_t nrt = has_dsv ? (m ? m - 1 : 0) : m;
+    ls.cur_rt = nrt ? refs[0].resource : 0;
+    ls.cur_nrt = nrt;
+    for (uint32_t i = 0; i < nrt; ++i) ls.cur_rts[i] = refs[i].resource;
+    ls.cur_ds = has_dsv && m ? refs[m - 1].resource : 0;
+    ls.cur_ds_sub = has_dsv && m ? refs[m - 1].first_subresource : NA_UNKNOWN_U32;
+    for (uint32_t i = 0; i < m; ++i) add_use_locked(ls, refs[i].resource);
+    if (m > 0 && ls.targets.size() < 4096) {
+        const na_object_id ds = has_dsv ? refs[m - 1].resource : 0; // 0: no depth target
+        const uint32_t ds_sub = has_dsv ? refs[m - 1].first_subresource : 0;
+        for (uint32_t i = 0; i < nrt; ++i)
+            if (refs[i].resource && (ls.targets.empty() || !ls.targets.back().same(refs[i].resource, ds) ||
+                                     ls.targets.back().rt_sub != refs[i].first_subresource))
+                ls.targets.push_back({refs[i].resource, ds, refs[i].first_subresource, ds_sub}); // UNKNOWN: a view J2 cannot place
+    }
+}
 template <>
 struct On<sl::list::OMSetRenderTargets> {
     static void run(GL* l, UINT n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, BOOL single, const D3D12_CPU_DESCRIPTOR_HANDLE* dsv)
@@ -2528,22 +2550,7 @@ struct On<sl::list::OMSetRenderTargets> {
                 NA_GROUP_RESOURCE_USE);
         with_list_state(l, [&](ListState& ls) {
             std::lock_guard<std::mutex> bl(ls.bind_m);
-            const uint32_t nrt = dsv ? (m ? m - 1 : 0) : m;
-            ls.cur_rt = nrt ? refs[0].resource : 0;
-            ls.cur_nrt = nrt;
-            for (uint32_t i = 0; i < nrt; ++i) ls.cur_rts[i] = refs[i].resource;
-            ls.cur_ds = dsv && m ? refs[m - 1].resource : 0;
-            ls.cur_ds_sub = dsv && m ? refs[m - 1].first_subresource : NA_UNKNOWN_U32;
-            for (uint32_t i = 0; i < m; ++i) add_use_locked(ls, refs[i].resource);
-            if (m > 0 && ls.targets.size() < 4096) {
-                const na_object_id ds = dsv ? refs[m - 1].resource : 0; // 0: no depth target
-                const uint32_t ds_sub = dsv ? refs[m - 1].first_subresource : 0;
-                const uint32_t rts = dsv ? m - 1 : m;
-                for (uint32_t i = 0; i < rts; ++i)
-                    if (refs[i].resource && (ls.targets.empty() || !ls.targets.back().same(refs[i].resource, ds) ||
-                                             ls.targets.back().rt_sub != refs[i].first_subresource))
-                        ls.targets.push_back({refs[i].resource, ds, refs[i].first_subresource, ds_sub}); // UNKNOWN: a view J2 cannot place
-            }
+            set_targets_locked(ls, refs, m, dsv != nullptr);
         });
     }
 };
@@ -2588,6 +2595,82 @@ struct On<sl::list::ExecuteIndirect> {
     {
         Rec r;
         if (begin_op(l, &r)) emit_op(r, NA_OP_EXECUTE_INDIRECT, {max}, nullptr, 0, 0, NA_EVF_METHOD_UNOBSERVED);
+    }
+};
+
+// ID3D12GraphicsCommandList4 render passes (Kind::CommandList4). BeginRenderPass binds
+// the attachments (and may clear them); EndRenderPass leaves bindings UNDEFINED
+// (Microsoft's contract), so current bindings are cleared, history kept. Host
+// copies/dispatches are illegal inside a pass: ListStateRestorable is false there.
+template <>
+struct On<sl::list::BeginRenderPass> {
+    static void run(GL* l, UINT n, const D3D12_RENDER_PASS_RENDER_TARGET_DESC* rts, const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC* ds,
+                    D3D12_RENDER_PASS_FLAGS)
+    {
+        Rec r;
+        if (!begin_op(l, &r)) return;
+        na_view_ref refs[9];
+        uint32_t m = 0;
+        {
+            std::shared_lock<std::shared_mutex> lock(g_m);
+            for (UINT i = 0; rts && i < n && i < 8; ++i) {
+                uint32_t slot = 0;
+                refs[m++] = view_ref_locked(heap_for_cpu_locked(rts[i].cpuDescriptor.ptr, &slot), slot);
+            }
+            if (ds) {
+                uint32_t slot = 0;
+                refs[m++] = view_ref_locked(heap_for_cpu_locked(ds->cpuDescriptor.ptr, &slot), slot);
+            }
+        }
+        const uint32_t nrt = ds ? (m ? m - 1 : 0) : m;
+        emit_op(r, NA_OP_OM_SET_RENDER_TARGETS, {nrt, ds ? 1u : 0u}, refs, m * static_cast<uint32_t>(sizeof(na_view_ref)), sizeof(na_view_ref), 0,
+                NA_GROUP_RESOURCE_USE);
+        // Beginning clears are clears of those attachments (as separate ops, like the Clear* calls).
+        for (uint32_t i = 0; i < nrt; ++i) {
+            if (rts[i].BeginningAccess.Type != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR) continue;
+            Rec rc;
+            if (!begin_op(l, &rc)) break;
+            const FLOAT* c = rts[i].BeginningAccess.Clear.ClearValue.Color;
+            emit_op(rc, NA_OP_CLEAR_RTV, {float_bits(c[0], c[1]), float_bits(c[2], c[3])}, &refs[i], sizeof(refs[i]), sizeof(refs[i]), 0, NA_GROUP_RESOURCE_USE);
+        }
+        const bool depth_clear = ds && ds->DepthBeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR;
+        if (depth_clear) {
+            Rec rc;
+            if (begin_op(l, &rc)) {
+                const auto& v = ds->DepthBeginningAccess.Clear.ClearValue.DepthStencil;
+                emit_op(rc, NA_OP_CLEAR_DSV, {static_cast<uint64_t>(D3D12_CLEAR_FLAG_DEPTH), float_bits(v.Depth, 0.f), v.Stencil}, &refs[m - 1],
+                        sizeof(refs[m - 1]), sizeof(refs[m - 1]), 0, NA_GROUP_RESOURCE_USE);
+            }
+        }
+        with_list_state(l, [&](ListState& ls) {
+            std::lock_guard<std::mutex> bl(ls.bind_m);
+            set_targets_locked(ls, refs, m, ds != nullptr);
+            ls.in_render_pass = true;
+            for (uint32_t i = 0; i < nrt; ++i) {
+                if (rts[i].BeginningAccess.Type != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR || !refs[i].resource) continue;
+                ls.insertion.Add({refs[i].resource, 0, 0, true, na::j2::Op::ClearWrite});
+                if (ls.cleared.size() < 64 && std::find(ls.cleared.begin(), ls.cleared.end(), refs[i].resource) == ls.cleared.end())
+                    ls.cleared.push_back(refs[i].resource);
+            }
+            if (depth_clear && refs[m - 1].resource && refs[m - 1].first_subresource != NA_UNKNOWN_U32 && ls.states.size() < 4096)
+                ls.states.push_back({refs[m - 1].resource, refs[m - 1].first_subresource, D3D12_RESOURCE_STATE_DEPTH_WRITE});
+        });
+    }
+};
+template <>
+struct On<sl::list::EndRenderPass> {
+    static void run(GL* l)
+    {
+        Rec r;
+        if (!begin_op(l, &r)) return;
+        with_list_state(l, [&](ListState& ls) {
+            std::lock_guard<std::mutex> bl(ls.bind_m);
+            ls.in_render_pass = false;
+            ls.cur_rt = ls.cur_ds = 0; // attachments are not bound after the pass
+            ls.cur_nrt = 0;
+            for (auto& t : ls.cur_rts) t = 0;
+            ls.cur_ds_sub = NA_UNKNOWN_U32;
+        });
     }
 };
 
@@ -2786,6 +2869,28 @@ bool register_list_slots()
     };
     return na::hooking::variants::Register(na::hooking::variants::Kind::CommandList, specs,
                                            static_cast<uint32_t>(sizeof(specs) / sizeof(specs[0])));
+}
+// Render passes: optional, own kind (snapshotted only through a List4 pointer).
+bool register_list4_slots()
+{
+    namespace L = sl::list;
+    const na::hooking::variants::SlotSpec specs[] = {
+        ListHook<L::BeginRenderPass, void(UINT, const D3D12_RENDER_PASS_RENDER_TARGET_DESC*, const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC*,
+                                          D3D12_RENDER_PASS_FLAGS)>::spec(),
+        ListHook<L::EndRenderPass, void()>::spec(),
+    };
+    return na::hooking::variants::Register(na::hooking::variants::Kind::CommandList4, specs,
+                                           static_cast<uint32_t>(sizeof(specs) / sizeof(specs[0])));
+}
+// The List4 interface of a submitted list, noted for render-pass coverage.
+void note_list4(ID3D12CommandList* list)
+{
+    if (!na::hooking::variants::Active(na::hooking::variants::Kind::CommandList4)) return;
+    ID3D12GraphicsCommandList4* l4 = nullptr;
+    if (SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&l4))) && l4) {
+        na::hooking::variants::NoteObject(na::hooking::variants::Kind::CommandList4, l4);
+        l4->Release();
+    }
 }
 
 // ---------------------------------------------------- C9: CPU mappings
@@ -3893,6 +3998,7 @@ bool InstallProducers(ID3D12Device* device, ID3D12CommandQueue* queue, bool hook
         // tables; the variant registry hooks their concrete functions.
         if (ok) {
             const bool reg = na::hooking::Initialize() && register_list_slots();
+            if (reg) register_list4_slots(); // optional: render-pass observation
             // G3-07: the device hooks are live; host warm-up/probe objects
             // are not the game's (no ids, sentinels, events or counters).
             t_host_work = true;
@@ -3974,7 +4080,10 @@ void ExecuteEnd(const ExecuteToken& t, ID3D12CommandQueue* queue, uint32_t count
     if (!t.queue_state) return;
     if (g_lists_hooked && lists)
         for (uint32_t i = 0; i < count; ++i)
-            if (lists[i]) na::hooking::variants::NoteObject(na::hooking::variants::Kind::CommandList, lists[i]);
+            if (lists[i]) {
+                na::hooking::variants::NoteObject(na::hooking::variants::Kind::CommandList, lists[i]);
+                note_list4(lists[i]);
+            }
     const bool ambiguous = end_occurrence(t);
     g_c.executes.fetch_add(1);
     if (ambiguous) g_c.ambiguous.fetch_add(1);
@@ -4163,7 +4272,7 @@ bool ListStateRestorable(ID3D12CommandList* l)
     ListState* ls = l ? list_state_locked(l, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
     std::lock_guard<std::mutex> bl(ls->bind_m);
-    return ls->restorable;
+    return ls->restorable && !ls->in_render_pass;
 }
 bool RestoreListState(ID3D12GraphicsCommandList* l)
 {
@@ -4180,7 +4289,7 @@ bool RestoreListState(ID3D12GraphicsCommandList* l)
         ListState* ls = l ? list_state_locked(l, &lid) : nullptr;
         if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
         std::lock_guard<std::mutex> bl(ls->bind_m);
-        if (!ls->restorable) return false;
+        if (!ls->restorable || ls->in_render_pass) return false;
         pso = ls->pso;
         nheaps = ls->nheaps;
         heaps[0] = ls->heaps[0];
