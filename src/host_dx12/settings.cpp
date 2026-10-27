@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <cwchar>
+#include <cwctype>
 
 // Persistence: games under Program Files run unelevated, so writes next to
 // the game DLL fail silently (A17 finding). Defaults are read from the
@@ -56,8 +57,16 @@ void load_from(const wchar_t* ini, bool only_if_present)
     g_settings.nr_enabled.store(GetPrivateProfileIntW(L"nr", L"enabled", 0, ini) ? 1u : 0u);
     g_settings.nr_intensity.store(pct(L"intensity", 100));
     {
-        const int v = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpness", 0, ini));
+        const int v = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpness", 100, ini));
         g_settings.j2_sharpness.store(static_cast<uint32_t>(v < 0 ? 0 : (v > 100 ? 100 : v)));
+        // [j2] preset: a letter J..M (NGX value = letter - 'A' + 1), "default", or a number.
+        wchar_t pz[16] = {};
+        GetPrivateProfileStringW(L"j2", L"preset", L"L", pz, 16, ini);
+        uint32_t pv = 12;
+        if (pz[0] >= L'0' && pz[0] <= L'9') pv = static_cast<uint32_t>(_wtoi(pz));
+        else if (!_wcsicmp(pz, L"default")) pv = 0;
+        else if (pz[0] && !pz[1]) { const wchar_t c = towupper(pz[0]); pv = (c >= L'A' && c <= L'Z') ? static_cast<uint32_t>(c - L'A' + 1) : 12; }
+        g_settings.j2_preset.store(pv > 26 ? 12 : pv);
     }
     g_settings.nr_structure.store(pct(L"structure", 100));
     g_settings.nr_tone.store(pct(L"tone", 0));
@@ -152,6 +161,12 @@ bool Save()
     }
     swprintf_s(v, L"%u", g_settings.j2_sharpness.load());
     ok &= WritePrivateProfileStringW(L"j2", L"sharpness", v, ini) != 0;
+    {
+        const uint32_t pv = g_settings.j2_preset.load();
+        if (pv >= 1 && pv <= 26) swprintf_s(v, L"%c", static_cast<wchar_t>(L'A' + pv - 1));
+        else swprintf_s(v, L"default");
+        ok &= WritePrivateProfileStringW(L"j2", L"preset", v, ini) != 0;
+    }
     swprintf_s(v, L"%d", g_settings.reflex_mode.load());
     ok &= WritePrivateProfileStringW(L"latency", L"reflex", v, ini) != 0;
     struct { const wchar_t* key; uint32_t value; } fg[] = {

@@ -624,6 +624,22 @@ void DrawLiveDlaa()
         if (ImGui::IsItemDeactivatedAfterEdit()) na::settings::Save();
         EndRow();
     }
+    {
+        // DLSS render preset. NGX values: J 10, K 11, L 12, M 13; 0 = NVIDIA's default.
+        static const char* kPresets[] = {"L (default)", "M", "K", "J", "NVIDIA default"};
+        static const uint32_t kValues[] = {12, 13, 11, 10, 0};
+        na::settings::Settings& ss = na::settings::Get();
+        const uint32_t cur = ss.j2_preset.load();
+        int idx = 0;
+        for (int i = 0; i < 5; ++i) if (kValues[i] == cur) idx = i;
+        BeginRow("DLSS preset", "Which DLSS model runs. L and M are the newest (DLSS 4.5) transformer models; K and J are the earlier transformer models. Changing it restarts DLAA's history for one frame.", S(220));
+        ImGui::SetNextItemWidth(S(220));
+        if (ImGui::Combo("##j2preset", &idx, kPresets, 5)) {
+            ss.j2_preset.store(kValues[idx]);
+            na::settings::Save();
+        }
+        EndRow();
+    }
     bool jit = na::j2::Jitter();
     BeginRow("Camera jitter", "Shifts the camera by a fraction of a pixel each frame so DLAA can sharpen as well as smooth. Switch off if the picture shimmers or flickers.", SwitchWidth());
     if (Switch("j2jit", &jit)) na::j2::SetJitter(jit);

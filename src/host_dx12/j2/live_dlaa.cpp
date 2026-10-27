@@ -989,6 +989,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     e.render_w = e.max_render_w = e.out_w = w;
     e.render_h = e.max_render_h = e.out_h = h;
     e.quality = na::dlss::Quality::DLAA;
+    e.preset = na::settings::Get().j2_preset.load(); // Cort: preset L by default
     e.view_id = kViewId;
     e.jitter_x = static_cast<float>(cam.jitter_px_x); // DLSS: colour sampled at pixel centre - jitter
     e.jitter_y = static_cast<float>(cam.jitter_px_y);

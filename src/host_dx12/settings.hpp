@@ -65,7 +65,8 @@ struct Settings {
     // Neural Rendering (A30, [nr] section). Off by default; percentages 0..100.
     std::atomic<uint32_t> nr_enabled{0};
     std::atomic<uint32_t> nr_intensity{100};
-    std::atomic<uint32_t> j2_sharpness{0}; // J2 DLAA: RCAS sharpening 0..100 (0 = off)
+    std::atomic<uint32_t> j2_sharpness{100}; // J2 DLAA: RCAS sharpening 0..100 (0 = off; Cort's default 100)
+    std::atomic<uint32_t> j2_preset{12};     // J2 DLAA: DLSS render preset ([j2] preset=L; 12 = L, 0 = NVIDIA default)
     std::atomic<uint32_t> nr_structure{100};
     std::atomic<uint32_t> nr_tone{0};
     std::atomic<uint32_t> nr_skin{100};
