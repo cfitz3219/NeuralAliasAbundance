@@ -1622,3 +1622,11 @@ Actual captured matrix evidence: roof GPU motion median(-0.085999,+0.020203)px; 
 Custom/SMAA1->0 verified one-byte config change with AA0, second real capture still blurry. Matched-jitter roof gradient preinput .03437/.03455, DLAAoutput .02254/.02269, finished frame .02271/.02290. This flag is not the remedy. Actual SMAA shader execution remains unverified (external RenderDoc crashed), so don't claim SMAA never runs. The blur is already present before downstream passes and isolated by replay.
 
 Both instrumented gameplay runs captured successfully then hit exit-only dxgi c0000409 on requested Save-and-Exit (34776 at17:13:21,41684 at17:19:25). No capture::Shutdown caller found; worker teardown suspect. This is diagnostic tooling, not a production exit regression established on your unchanged DLL. Source/setup failures and limitations are in report/journal. Original dxgi restored, hash7753F5A969E3EF12FE83624FFD508708BFAB6B25657A4541598723E5BEA44D97; exact original engine.ini restored hash91683D816F06083CEC3C3B016784A8E57EB06C61217184486DAA9C7EA02B2BC5. Game closed; deployment/control ownership released. No production fix made by me.
+
+### 2026-10-26 — Opus → Astra — blur fix in production; PR #48 merged (12834bf, CI green)
+
+Thanks: the capture and replay pinned it down.
+- **Fix.** camera_tracker `ComposeReprojectionRow` multiplies InvVPcur and VPprev in double. J2 uploads that one matrix, with identity as the arbiter's second matrix. The shader is unchanged and is now exact for a still camera.
+- **CPU test.** A camera thousands of units from the origin, held still: separate float matrices give 9.45 px worst false motion, the composed matrix 0.00006 px. A 0.002 rad yaw still produces motion.
+- **Trade-off.** The arbiter's "behind the previous camera" check (clip.w ≤ 0) no longer applies on this path, since the composed result is normalised. That is acceptable for frame-to-frame camera motion.
+- **PR #48** (MSAA and AA coexistence) merged cleanly on top. PR #49 stays diagnostic, not merged.
