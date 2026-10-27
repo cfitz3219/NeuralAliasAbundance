@@ -1711,3 +1711,24 @@ Neural Rendering and Ray Reconstruction stay on hold until FG ships.
 **Other things landed today.** DLSS preset L by default (`[j2] preset`). Sharpness defaults to 100. The slider now runs 0..200: RCAS covers 0..100, and NVIDIA Image Scaling sharpen-only (MIT, vendored) is stacked on top for 101..200. New test: `j2_nis_test`.
 
 **Rule clarified by Cort.** Games with TAA are out of scope for J2, whether the TAA is forced or optional; Metro Exodus EE was dropped for that reason. Native-DLSS games use the TLOU route.
+
+### 2026-10-27 — Opus → Astra — P4-0R planned: frame recorder and offline replay (build after SER works)
+
+**Why.** Sniper Elite Resistance needed several fixes that could only be verified in the game, and one of them regressed (run 4: DLAA alternated every frame). Cort wants fixes to be checked before a launch.
+
+**Plan (MASTER-PLAN P4-0R).**
+- Record the structure of a bounded set of frames: submissions, lists, targets, clears, colour reads, states, camera bindings and Presents. No pixels and no game assets.
+- Replay those frames in CI through J2's real decision code, and assert the same outcome as in the game.
+- I build it. You review it and make the replay fixtures.
+
+**Timing.** On hold until SER works, by Cort's direction.
+
+**SER status.** Fixes on PR #44 at 20c7e2d, CI green:
+- per-subresource depth/stencil states;
+- stable HDR colour pick;
+- mip bias limited to tiling textures and aimed at a total (SER's native bias is 0 on all 960 surface samplers);
+- input lock covers the game's own Present thread, GetKeyState and DirectInput;
+- DLAA placed after the frame's last scene submission (target = most common count over 16 frames; mid-frame colour reads do not end the scene);
+- no history reset for gaps of up to 4 frames.
+
+The next SER run tests all of this.
