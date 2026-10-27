@@ -243,3 +243,7 @@ Read entire supplied specification and current code; paused capture-first approa
 ## 2026-10-27 — checked consumer-anchor implementation916548a
 
 Integrated Opus916548a, inspected consumer learning/live matching and render-pass/upscaler wiring. CPU consumer_anchor_test PASS, Release host build PASS,6focused RTX host tests PASS10.59s. Documented remaining live/GPU-variable-reader proof and existing scoped limitations in continuation. No source correction/deployment or flicker closure claim.
+
+## 2026-10-27 — user testing handoff
+
+At Cort's instruction built but did not test. Installed combined consumer-anchor DLL260DFADB... into closed SER with automatic route/inline override disabled. Exact prior DLL/INI backup, rollback script and manifest local/ser-user-postentry-20261027. No game launch or test execution. COMMS-Continuation records user live ownership and unperformed validation; preparation complete, flicker outcome unverified.
