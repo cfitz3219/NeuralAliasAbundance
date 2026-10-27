@@ -136,6 +136,10 @@ bool ListLastStateSub(ID3D12CommandList* list, na_object_id id, uint32_t sub, ui
 void SetSamplerMipBias(float bias);
 float SamplerMipBias();
 void MipBiasCounts(uint64_t* samplers, uint64_t* static_samplers);
+// The game's own MipLODBias on surface-texture samplers (recorded whether or
+// not NeuralAlias biases): how many are negative / zero / positive, and range.
+struct NativeBiasStats { uint64_t negative = 0, zero = 0, positive = 0; float min = 0.0f, max = 0.0f; };
+void NativeMipBiases(NativeBiasStats* s);
 // While alive on this thread, D3D12 objects created and commands recorded are the
 // host's own (never observed as the game's), e.g. J2's inserted command list.
 class HostWorkScope {

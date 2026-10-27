@@ -240,6 +240,28 @@ int main(int argc, char** argv)
         uint64_t after4 = 0;
         na::observe::MipBiasCounts(&after4, nullptr);
         CHECK(after4 == after3 + 1);
+        // Aim for a total: a game's own -1.5 is already past -1 (left alone); its -0.5
+        // is brought to -1 (biased); the native values are recorded either way.
+        na::observe::NativeBiasStats n0;
+        na::observe::NativeMipBiases(&n0);
+        sd.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        sd.MaxAnisotropy = 1;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        sd.MipLODBias = -1.5f;
+        dev->CreateSampler(&sd, h2);
+        uint64_t after5 = 0;
+        na::observe::MipBiasCounts(&after5, nullptr);
+        CHECK(after5 == after4);
+        sd.MipLODBias = -0.5f;
+        dev->CreateSampler(&sd, h2);
+        uint64_t after6 = 0;
+        na::observe::MipBiasCounts(&after6, nullptr);
+        CHECK(after6 == after5 + 1);
+        na::observe::NativeBiasStats n1;
+        na::observe::NativeMipBiases(&n1);
+        CHECK(n1.negative == n0.negative + 2);
+        CHECK(n1.min <= -1.5f);
+        sd.MipLODBias = 0.0f;
         na::observe::SetSamplerMipBias(0.0f);
     }
     test::ComPtr<ID3D12RootSignature> rs_pre; // the pre-pass's own root signature: one root CBV

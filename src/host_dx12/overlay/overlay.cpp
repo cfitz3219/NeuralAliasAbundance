@@ -472,6 +472,12 @@ void write_status_line()
             static_cast<unsigned long long>(j2.busy), static_cast<unsigned long long>(j2.dlss_failed), static_cast<unsigned long long>(j2.cuts),
             static_cast<unsigned long long>(j2.camera_offset), j2.later_passes, static_cast<unsigned long long>(j2.duplicate_submissions), static_cast<unsigned long long>(j2.jitter_writes), static_cast<unsigned long long>(j2.camera_learned_hits), static_cast<unsigned long long>(j2.camera_scans), static_cast<long long>(j2.camera_inv_delta), static_cast<long long>(j2.camera_proj_delta), static_cast<unsigned long long>(j2.jitter_proj_writes), na::observe::SamplerMipBias(), static_cast<unsigned long long>(mb_s), static_cast<unsigned long long>(mb_st), static_cast<unsigned long long>(j2.post_camera_lists), static_cast<unsigned long long>(j2.post_depth_lists), static_cast<unsigned long long>(j2.other_camera_blocks), j2.depth_reversed ? 1u : 0u, dlss.feature_preset, na::settings::Get().j2_sharpness.load(), static_cast<unsigned long long>(j2.nis_frames), j2.color_sub, j2.color_mips, j2.color_slices, j2.color_samples, j2.depth_slices, j2.depth_samples, j2.width, j2.height, j2.color_format, j2.reason);
         if (jn > 0) WriteFile(f, jl, static_cast<DWORD>((std::min)(jn, static_cast<int>(sizeof(jl) - 1))), &written, nullptr);
+        na::observe::NativeBiasStats nbs;
+        na::observe::NativeMipBiases(&nbs);
+        char nl[200];
+        const int nn = snprintf(nl, sizeof nl, "mip_native below0=%llu at0=%llu above0=%llu min=%.2f max=%.2f (game's own bias on surface samplers)\r\n",
+                                static_cast<unsigned long long>(nbs.negative), static_cast<unsigned long long>(nbs.zero), static_cast<unsigned long long>(nbs.positive), nbs.min, nbs.max);
+        if (nn > 0) WriteFile(f, nl, static_cast<DWORD>(nn), &written, nullptr);
     }
     const auto latency = na::latency::GetStats();
     char lm[900];

@@ -1083,12 +1083,36 @@ bool sampler_wants_bias(const SD& d)
     const bool surface = aniso || (linear_min && (tiles(d.AddressU) || tiles(d.AddressV)));
     return surface && d.MaxLOD > 0.0f;
 }
-float biased(float lod, float bias) { const float v = lod + bias; return v < -16.0f ? -16.0f : (v > 15.99f ? 15.99f : v); }
+float clamp_lod(float v) { return v < -16.0f ? -16.0f : (v > 15.99f ? 15.99f : v); }
+// Target-based bias (Cort, aiming for a total of `target`, e.g. -1): a sampler
+// with a neutral or positive native bias gets NVIDIA's NativeBias + target; one
+// the game already biases negative is brought to `target` at most and never
+// past it (no stacking -1 on top of the game's own sharpening).
+float biased(float native, float target)
+{
+    if (target == 0.0f) return native;
+    if (native >= 0.0f) return clamp_lod(native + target);
+    return native < target ? native : target;
+}
+// The game's own biases on surface samplers, observed whether or not we bias.
+std::mutex g_native_m;
+uint64_t g_native_neg = 0, g_native_zero = 0, g_native_pos = 0;
+float g_native_min = 0.0f, g_native_max = 0.0f;
+void note_native(float b)
+{
+    std::lock_guard<std::mutex> lock(g_native_m);
+    const bool first = !(g_native_neg || g_native_zero || g_native_pos);
+    if (b < 0.0f) ++g_native_neg; else if (b > 0.0f) ++g_native_pos; else ++g_native_zero;
+    if (first || b < g_native_min) g_native_min = b;
+    if (first || b > g_native_max) g_native_max = b;
+}
 
 void STDMETHODCALLTYPE D_CreateSampler(ID3D12Device* dev, const D3D12_SAMPLER_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
 {
     const float bias = g_mip_bias.load(std::memory_order_relaxed);
-    if (d && bias != 0.0f && !t_host_work && sampler_wants_bias(*d)) {
+    const bool surface = d && !t_host_work && sampler_wants_bias(*d);
+    if (surface) note_native(d->MipLODBias);
+    if (surface && bias != 0.0f && biased(d->MipLODBias, bias) != d->MipLODBias) {
         D3D12_SAMPLER_DESC m = *d;
         m.MipLODBias = biased(m.MipLODBias, bias);
         o_CreateSampler(dev, &m, h);
@@ -1457,7 +1481,7 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
     // samplers (versions 1.0 / 1.1; anything else is passed through unchanged).
     ID3DBlob* rebuilt = nullptr;
     const float bias = g_mip_bias.load(std::memory_order_relaxed);
-    if (blob && size && bias != 0.0f && !t_host_work && depth.outermost()) {
+    if (blob && size && !t_host_work && depth.outermost()) { // also when off: native biases are recorded
         ID3D12VersionedRootSignatureDeserializer* rd = nullptr;
         const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* u = nullptr;
         if (SUCCEEDED(D3D12CreateVersionedRootSignatureDeserializer(blob, size, IID_PPV_ARGS(&rd))) && rd &&
@@ -1469,7 +1493,11 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
             std::vector<D3D12_STATIC_SAMPLER_DESC> ss(src, src + ns);
             uint32_t changed = 0;
             for (auto& x : ss)
-                if (sampler_wants_bias(x)) { x.MipLODBias = biased(x.MipLODBias, bias); ++changed; }
+                if (sampler_wants_bias(x)) {
+                    note_native(x.MipLODBias);
+                    const float nb = biased(x.MipLODBias, bias);
+                    if (nb != x.MipLODBias) { x.MipLODBias = nb; ++changed; }
+                }
             if (changed) {
                 if (u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0) copy.Desc_1_0.pStaticSamplers = ss.data();
                 else copy.Desc_1_1.pStaticSamplers = ss.data();
@@ -4013,6 +4041,13 @@ bool KnownStateInCurrentSubmission(na_object_id id, uint32_t* state)
 }
 void SetSamplerMipBias(float bias) { g_mip_bias.store(bias, std::memory_order_relaxed); }
 float SamplerMipBias() { return g_mip_bias.load(std::memory_order_relaxed); }
+void NativeMipBiases(NativeBiasStats* s)
+{
+    if (!s) return;
+    std::lock_guard<std::mutex> lock(g_native_m);
+    s->negative = g_native_neg; s->zero = g_native_zero; s->positive = g_native_pos;
+    s->min = g_native_min; s->max = g_native_max;
+}
 void MipBiasCounts(uint64_t* samplers, uint64_t* static_samplers)
 {
     if (samplers) *samplers = g_biased_samplers.load(std::memory_order_relaxed);

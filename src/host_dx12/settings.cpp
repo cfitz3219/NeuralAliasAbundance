@@ -59,6 +59,11 @@ void load_from(const wchar_t* ini, bool only_if_present)
     {
         const int v = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpness", 100, ini));
         g_settings.j2_sharpness.store(static_cast<uint32_t>(v < 0 ? 0 : (v > 200 ? 200 : v))); // 101..200 adds NIS
+        wchar_t mb[32] = {};
+        GetPrivateProfileStringW(L"j2", L"mip_bias", L"-1.0", mb, 32, ini);
+        double mbv = _wtof(mb);
+        mbv = mbv < -4.0 ? -4.0 : (mbv > 0.0 ? 0.0 : mbv);
+        g_settings.j2_mip_bias_x100.store(static_cast<int32_t>(mbv * 100.0 + (mbv < 0 ? -0.5 : 0.5)));
         // [j2] preset: a letter J..M (NGX value = letter - 'A' + 1), "default", or a number.
         wchar_t pz[16] = {};
         GetPrivateProfileStringW(L"j2", L"preset", L"L", pz, 16, ini);
@@ -166,6 +171,8 @@ bool Save()
         if (pv >= 1 && pv <= 26) swprintf_s(v, L"%c", static_cast<wchar_t>(L'A' + pv - 1));
         else swprintf_s(v, L"default");
         ok &= WritePrivateProfileStringW(L"j2", L"preset", v, ini) != 0;
+        swprintf_s(v, L"%.2f", g_settings.j2_mip_bias_x100.load() / 100.0);
+        ok &= WritePrivateProfileStringW(L"j2", L"mip_bias", v, ini) != 0;
     }
     swprintf_s(v, L"%d", g_settings.reflex_mode.load());
     ok &= WritePrivateProfileStringW(L"latency", L"reflex", v, ini) != 0;

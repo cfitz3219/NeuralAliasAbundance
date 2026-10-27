@@ -653,11 +653,32 @@ void DrawLiveDlaa()
         EndRow();
     }
     {
+        // Texture detail (negative mip bias, NVIDIA DLSS guide 3.5: -1 at native).
+        // Games build their samplers at load, so a change applies at the next start;
+        // the setting lives in this game's own NeuralAliasHost.ini (per game).
+        static const char* kDetail[] = {"Off (game's own)", "Light (-0.5)", "Standard (-1, NVIDIA)"};
+        static const int kDetailX100[] = {0, -50, -100};
+        na::settings::Settings& ss = na::settings::Get();
+        const int cur = ss.j2_mip_bias_x100.load();
+        int idx = 2;
+        for (int i = 0; i < 3; ++i) if (kDetailX100[i] == cur) idx = i;
+        BeginRow("Texture detail", "Samples surface textures sharper so DLAA can rebuild their full detail (NVIDIA's DLSS guide recommends -1 at native resolution). Very fine patterns such as fabric weaves can shimmer at -1; Light is gentler. Screen effects are never changed. Applies at the next game start, remembered for this game.", S(220));
+        ImGui::SetNextItemWidth(S(220));
+        if (ImGui::Combo("##j2detail", &idx, kDetail, 3)) {
+            ss.j2_mip_bias_x100.store(kDetailX100[idx]);
+            na::settings::Save();
+        }
+        EndRow();
         uint64_t ns = 0, nst = 0;
         na::observe::MipBiasCounts(&ns, &nst);
-        char tb[200];
-        std::snprintf(tb, sizeof tb, "Texture detail: mip bias %.1f on %llu samplers + %llu built-in samplers (set at game start, [j2] mip_bias).",
-                      na::observe::SamplerMipBias(), static_cast<unsigned long long>(ns), static_cast<unsigned long long>(nst));
+        na::observe::NativeBiasStats nb;
+        na::observe::NativeMipBiases(&nb);
+        char tb[320];
+        const float active = na::observe::SamplerMipBias();
+        std::snprintf(tb, sizeof tb, "Now: %.1f on %llu samplers + %llu built-in%s. Game's own bias on its surface textures: %llu below 0, %llu at 0, %llu above (range %.2f..%.2f).",
+                      active, static_cast<unsigned long long>(ns), static_cast<unsigned long long>(nst),
+                      (static_cast<int>(active * -100.0f + 0.5f) == -cur) ? "" : " (your new choice applies at the next game start)",
+                      static_cast<unsigned long long>(nb.negative), static_cast<unsigned long long>(nb.zero), static_cast<unsigned long long>(nb.positive), nb.min, nb.max);
         StatusLine(0, tb);
     }
     char buf[320];
