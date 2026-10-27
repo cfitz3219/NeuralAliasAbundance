@@ -384,3 +384,9 @@ PR48 / astra/j2-msaa-x2 head6de5138 contains color/depth resolves and writeback 
 ## 2026-10-26 — AA coexistence expanded beyond x2
 
 PR48 head8ca1c08 generalizes sample counts, handles color/depth independently and prefers a pre-postprocess list boundary using observed scene-color readers. Includes Opus2315633 unchanged. Release DLL and17 executed RTX tests pass, including real NVIDIA DLAA x2/x4/x8;3 unsupported x16 tests skip. docs/AA-COEXISTENCE.md on the branch separates applicable Argon tiers, same-list limitations, optional forced-TAA bypass, and gameplay evidence still outstanding. Exact integration handoff in COMMS. No Astra game deployment; Opus retains haze/shimmer and the combined session.
+
+## 2026-10-26 — Anno stationary blur isolated; diagnostic rollback complete
+
+Astra diagnostic PR49/3b62c78 preserves real captures' analysis and manual replay tooling only (do not merge/deploy). Measured raster jitter agrees with submitted offsets. Generated stationary motion is false due to numerical precision loss in separate float camera transforms; replaying the same inputs with motion derived from double-composed transforms restores fine detail. SMAA saved-flag0 comparison does not remove blur; actual shader execution remains unverified. Exact metrics and limitations: branch docs/ANNO-BLUR-DIAGNOSIS.md and COMMS. Opus retains production fix and moving-camera verification.
+
+Original game DLL7753F5A9... and exact engine.ini91683D81... restored and verified. Game closed. Capture tooling caused exit-only c0000409 after both successful captures; not production-qualified. No rendering correction remains deployed, no new review cycle requested.
