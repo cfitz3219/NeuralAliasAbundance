@@ -501,6 +501,24 @@ void write_status_line()
             WriteFile(f, j2.insertion_last_miss, static_cast<DWORD>(std::strlen(j2.insertion_last_miss)), &written, nullptr);
             WriteFile(f, "\r\n", 2, &written, nullptr);
         }
+        {
+            const auto& rj = j2.inline_rejects;
+            char rl[400];
+            const int nr = snprintf(rl, sizeof rl,
+                "j2_inline_rejects no_learned=%llu resource=%llu writer=%llu occurrence=%llu transition=%llu candidate=%llu destination=%llu pipeline=%llu pending=%llu last_frame=%u\r\n",
+                (unsigned long long)rj[0], (unsigned long long)rj[1], (unsigned long long)rj[2], (unsigned long long)rj[3],
+                (unsigned long long)rj[4], (unsigned long long)rj[5], (unsigned long long)rj[6], (unsigned long long)rj[7],
+                (unsigned long long)rj[8], j2.inline_frame_rejects);
+            if (nr > 0) WriteFile(f, rl, static_cast<DWORD>((std::min)(nr, static_cast<int>(sizeof rl - 1))), &written, nullptr);
+            const auto cs = na::capture::j2::GetStats();
+            if (cs.requested) {
+                char cl[300];
+                const int nc2 = snprintf(cl, sizeof cl, "j2_capture requested=%u recorded=%u submitted=%u written=%u busy=%u discarded=%u retired=%u no_present=%u errors=%u dir=\"%S\"\r\n",
+                    cs.requested, cs.recorded, cs.submitted, cs.written, cs.dropped_busy, cs.discarded, cs.retired, cs.without_present, cs.errors,
+                    na::capture::j2::Directory());
+                if (nc2 > 0) WriteFile(f, cl, static_cast<DWORD>((std::min)(nc2, static_cast<int>(sizeof cl - 1))), &written, nullptr);
+            }
+        }
         char il[320];
         const int ni = snprintf(il, sizeof il, "j2_insertion traces=%llu changed=%llu list=%llu writes=%u reads=%u final=%u destination=%llu pipeline=%llu explicit_inline=%u\r\n",
             (unsigned long long)j2.insertion_traces, (unsigned long long)j2.insertion_changes,

@@ -90,6 +90,13 @@ public:
             // Written outside the scene pass (e.g. a full-screen composite into it):
             // any consumer seen before this point read an earlier version.
             consumer_after_last_write_ = false;
+            if (s.clears_color) {
+                // The image was restarted outside the depth-paired scene pass: the
+                // earlier list's in-list boundary no longer describes the final image
+                // (Astra R2). Ordinary composites into it keep the association.
+                obs_.boundary_inside_list = false;
+                obs_.inline_signature = 0;
+            }
         }
     }
     FrameObservation& Observation()
@@ -156,6 +163,19 @@ public:
     // Close one frame. The returned decision applies to the NEXT frame.
     const RouteDecision& OnFrame(const FrameObservation& o)
     {
+        if (o.interceptor && mode_ == RouteMode::Auto) {
+            // A supported upscaler handler owns the view: explicit ownership, honoured at
+            // once and without heuristic scene discovery or voting, so J2 never runs a
+            // duplicate (Astra R4).
+            if (d_.route != Route::Interceptor) set_route(Route::Interceptor, kInterceptorSignature, "upscaler call owns the view");
+            d_.state = RouteState::Active;
+            d_.matches = d_.observed = 0;
+            last_proposal_ = Route::Interceptor;
+            last_sig_ = kInterceptorSignature;
+            d_.reason = "A supported upscaler call serves this view.";
+            d_.missing = "";
+            return d_;
+        }
         if (!o.scene) return d_; // menus/loading: not a scene frame, nothing learned
         ++d_.scene_frames;
         if (o.native_jitter) ++d_.native_jitter_frames;
@@ -176,19 +196,20 @@ public:
         }
         if (mode_ != RouteMode::Auto) return d_; // overrides never relearn
 
-        Route proposal = Route::Between;
-        uint64_t sig = kBetweenSignature;
-        const char* why = o.consumer_in_later_list
-            ? "The scene completes at a command-list boundary; a later list reads it."
-            : "The scene completes at a command-list boundary (its consumer is not observed).";
-        if (o.interceptor) {
-            proposal = Route::Interceptor;
-            sig = kInterceptorSignature;
-            why = "A supported upscaler call serves this view.";
-        } else if (o.boundary_inside_list) {
+        // Positive boundary evidence only (Astra R3): a usable in-list boundary, or a
+        // later list that reads the final scene version. No observed consumer is NOT a
+        // list boundary (same-list bindless post-processing would be invisible).
+        Route proposal = Route::None;
+        uint64_t sig = 0;
+        const char* why = "No usable boundary observed: the scene's consumer is not visible.";
+        if (o.boundary_inside_list) {
             proposal = Route::Inline;
             sig = o.inline_signature ? o.inline_signature : kInlineSignature;
             why = "Post-processing is recorded in the scene's own list: insertion inside that list.";
+        } else if (o.consumer_in_later_list) {
+            proposal = Route::Between;
+            sig = kBetweenSignature;
+            why = "The scene completes at a command-list boundary; a later list reads it.";
         }
 
         if (proposal == last_proposal_ && sig == last_sig_) ++d_.matches;
@@ -196,13 +217,33 @@ public:
         ++d_.observed;
 
         if (d_.state == RouteState::Active && contradiction) {
-            // A hard contradiction invalidates the active signature: relearn. The
-            // current route keeps running only if the new evidence re-confirms it.
+            // A hard contradiction invalidates the active placement: stop executing it
+            // (route none, new history generation) and relearn from scratch (Astra R1).
+            // Already-recorded GPU work keeps its own lifetime in J2's ring.
+            set_route(Route::None, 0, "contradiction: the scene was written again after our insertion");
             d_.state = RouteState::Observe;
             d_.observed = 1;
-            d_.change = "contradiction: the scene was written again after our insertion";
+            d_.matches = 1;
             d_.reason = "Relearning after a contradiction.";
-            if (proposal == d_.route && sig == d_.signature) d_.matches = 1; // must re-confirm from scratch
+            return d_;
+        }
+        if (proposal == Route::None) {
+            // Nothing to accept. An active route tolerates a few such frames (a missed
+            // observation); otherwise keep observing and report what is missing.
+            if (d_.state == RouteState::Active) {
+                if (d_.matches < kMatchesToAccept) return d_;
+                set_route(Route::None, 0, "boundary no longer observed");
+                d_.state = RouteState::Observe;
+                d_.observed = 0;
+                d_.reason = why;
+                return d_;
+            }
+            if (d_.observed >= kWindowFrames) {
+                ++d_.unstable_windows;
+                d_.observed = 0;
+                d_.reason = "No usable boundary within 120 scene frames; still observing.";
+            } else d_.reason = why;
+            return d_;
         }
         if (d_.state == RouteState::Active) {
             if (proposal == d_.route) {

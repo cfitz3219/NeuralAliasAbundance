@@ -99,6 +99,8 @@ struct State {
     uint64_t route_prev_late = 0, route_prev_post_scene = 0, route_prev_no_camera = 0, route_prev_no_state = 0;
     uint32_t route_gen_applied = 0;
     bool dlss_ready = false;
+    uint32_t frame_rejects = 0;       // inline trigger rejections in the current frame
+    char frame_reject_text[320] = {}; // the frame's first rejection, with both boundaries
     uint64_t dlss_tried_frame = ~0ull; // one early start attempt per frame
     bool inline_sample_locked = false; // NGX recorded: no new raster sample may start this frame
     bool inline_camera_submitted = false; // an earlier depth/camera batch may already be executing
@@ -1288,20 +1290,42 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     // Optional passes change the absolute transition ordinal. Match the producer
     // of the learned final scene boundary, retaining an occurrence only among
     // boundaries from that same producer (not unrelated intermediate reads).
-    const bool ordinal_matches = learned.decision.final_transition && learned.decision.boundary_writer
-        ? current.boundary_writer == learned.decision.boundary_writer &&
-          current.writer_occurrence == learned.decision.writer_occurrence
-        : learned.decision.final_transition
-        ? current.final_transition == learned.decision.final_transition
-        : current.candidates == learned.decision.final_candidate;
-    if (learned.color != color_id || learned.depth != depth_id ||
-        !learned.decision.final_candidate || !ordinal_matches ||
-        current.destination != learned.decision.destination || current.pipeline != learned.decision.pipeline) {
+    // Same predicates as before, evaluated one by one so a rejection names its cause.
+    using S = Stats;
+    uint32_t rej = S::kRejCount;
+    if (!learned.decision.final_candidate || !learned.color) rej = S::kRejNoLearned;
+    else if (learned.color != color_id || learned.depth != depth_id) rej = S::kRejResource;
+    else if (learned.decision.final_transition && learned.decision.boundary_writer) {
+        if (current.boundary_writer != learned.decision.boundary_writer) rej = S::kRejWriter;
+        else if (current.writer_occurrence != learned.decision.writer_occurrence) rej = S::kRejOccurrence;
+    } else if (learned.decision.final_transition) {
+        if (current.final_transition != learned.decision.final_transition) rej = S::kRejTransition;
+    } else if (current.candidates != learned.decision.final_candidate) rej = S::kRejCandidate;
+    if (rej == S::kRejCount && current.destination != learned.decision.destination) rej = S::kRejDestination;
+    if (rej == S::kRejCount && current.pipeline != learned.decision.pipeline) rej = S::kRejPipeline;
+    if (rej == S::kRejCount) g.stats.inline_target = learned.decision.final_candidate;
+    if (rej == S::kRejCount && (g.inl_frame == g.frame || g.inl.valid)) {
+        // Already inserted this frame (normal for later candidates) or the previous
+        // recording was never submitted (a real stall): only the latter is a rejection.
+        if (g.inl.valid && g.inl_frame != g.frame) rej = S::kRejPending;
+        else return;
+    }
+    if (rej != S::kRejCount) {
         ++g.stats.inline_waited;
+        ++g.stats.inline_rejects[rej];
+        if (!g.frame_rejects++) {
+            static const char* kWhy[] = {"no learned boundary", "different scene colour/depth", "different boundary writer",
+                                         "different writer occurrence", "different transition ordinal", "different candidate ordinal",
+                                         "different consumer destination", "different consumer pipeline", "previous recording not submitted"};
+            std::snprintf(g.frame_reject_text, sizeof g.frame_reject_text,
+                "reject=%s learned{writer=%llu occ=%u tr=%u cand=%u dst=%llu pso=%llu} actual{writer=%llu occ=%u tr=%u cand=%u dst=%llu pso=%llu}",
+                kWhy[rej], (unsigned long long)learned.decision.boundary_writer, learned.decision.writer_occurrence,
+                learned.decision.final_transition, learned.decision.final_candidate, (unsigned long long)learned.decision.destination,
+                (unsigned long long)learned.decision.pipeline, (unsigned long long)current.boundary_writer, current.writer_occurrence,
+                current.final_transition, current.candidates, (unsigned long long)current.destination, (unsigned long long)current.pipeline);
+        }
         return;
     }
-    g.stats.inline_target = learned.decision.final_candidate;
-    if (g.inl_frame == g.frame || g.inl.valid) return; // one per frame; the previous one is not submitted yet
     if (!na::observe::ListStateRestorable(l)) { ++g.stats.inline_refused; reason("The scene list's state cannot be restored after DLAA (a bundle ran); left untouched."); return; }
     ID3D12CommandList* one[1] = {l};
     // The depth/earlier scene batches must already have established this frame's
@@ -1432,10 +1456,18 @@ void OnPresent(ID3D12CommandQueue* queue)
             ++g.stats.inline_presents;
             if (g.submitted_frame == g.frame) ++g.stats.inline_covered;
             else if (g.insertion_frame.decision.writes)
+                // The reason recorded at rejection time this frame (never a recycled
+                // earlier success string); else no candidate reached the matcher.
                 std::snprintf(g.stats.insertion_last_miss, sizeof g.stats.insertion_last_miss,
-                    "frame=%llu learned_transition=%u actual_transition=%u camera=%llu reason=%.150s",
-                    (unsigned long long)g.frame, g.insertion_learned.decision.final_transition,
-                    g.insertion_frame.decision.final_transition, (unsigned long long)g.stats.no_camera, g.stats.reason);
+                    "frame=%llu rejects=%u %s", (unsigned long long)g.frame, g.frame_rejects,
+                    g.frame_rejects ? g.frame_reject_text
+                                    : "no candidate reached the matcher (no read of the scene colour after its last write was seen in a scene recording)");
+            if (g.insertion_frame.decision.writes && g.submitted_frame != g.frame) {
+                char why[200];
+                std::snprintf(why, sizeof why, "Inline DLAA missed this frame (%s).",
+                              g.frame_rejects ? "the scene boundary did not match the learned one; see j2_last_miss" : "no boundary candidate");
+                reason(why); // not the previous frame's "running" text
+            }
             g.stats.active = g.submitted_frame == g.frame;
         }
         if (g.insertion_frame.color) g.insertion_learned = g.insertion_frame;
@@ -1444,6 +1476,9 @@ void OnPresent(ID3D12CommandQueue* queue)
         g.jit.valid = false; // J1: the next camera block starts a new jitter sample
         g.inline_sample_locked = false;
         g.inline_camera_submitted = false;
+        g.stats.inline_frame_rejects = g.frame_rejects;
+        g.frame_rejects = 0;
+        g.frame_reject_text[0] = 0;
         if (g.scene_batches_cur) {
             g.batch_hist[g.batch_hist_n++ % 16] = static_cast<uint8_t>(g.scene_batches_cur > 255 ? 255 : g.scene_batches_cur);
             uint32_t votes[256] = {};
@@ -1732,6 +1767,8 @@ void Shutdown()
     g.route_gen_applied = 0;
     g.dlss_ready = false;
     g.dlss_tried_frame = ~0ull;
+    g.frame_rejects = 0;
+    g.frame_reject_text[0] = 0;
     g.insertion_frame = g.insertion_learned = {};
     g.inl = State::InlinePending{};
     g.inl_frame = 0;

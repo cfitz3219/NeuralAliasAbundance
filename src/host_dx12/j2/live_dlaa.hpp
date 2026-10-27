@@ -110,6 +110,12 @@ struct Stats {
     uint32_t insertion_reads = 0, insertion_final = 0, insertion_writes = 0;
     uint64_t insertion_traces = 0, insertion_changes = 0;
     uint64_t inline_candidates = 0, inline_waited = 0, inline_recorded = 0, inline_frames = 0, inline_refused = 0;
+    // Why the inline trigger rejected a candidate (Astra: narrow matcher predicates).
+    // Index = InlineReject; the frame's first rejection is also in insertion_last_miss.
+    enum InlineReject : uint32_t { kRejNoLearned = 0, kRejResource, kRejWriter, kRejOccurrence, kRejTransition,
+                                   kRejCandidate, kRejDestination, kRejPipeline, kRejPending, kRejCount };
+    uint64_t inline_rejects[kRejCount] = {};
+    uint32_t inline_frame_rejects = 0; // rejections in the last closed frame
     bool depth_reversed = false;  // reverse-Z as classified from the camera    // other render targets bound after the scene in the same list (insertion may be late)
     uint32_t width = 0, height = 0, color_format = 0;
     // Shape of the selected resources (reported even when J2 refuses them).

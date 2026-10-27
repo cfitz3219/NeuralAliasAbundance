@@ -68,8 +68,10 @@ int main()
         CHECK(!o2.consumer_in_later_list);
         RouteSelector rs;
         for (int i = 0; i < 3; ++i) rs.OnFrame(o2);
+        CHECK(rs.Current().route == Route::None); // no consumer observed is not a boundary (R3)
+        CHECK(rs.Current().missing[0] != 0);
+        for (int i = 0; i < 3; ++i) rs.OnFrame(o);
         CHECK(rs.Current().route == Route::Between);
-        CHECK(rs.Current().missing[0] != 0); // consumer not observed: honest, still a list boundary
     }
     // 4. A mid-read scene list, then a scene list that post-processes itself -> Inline.
     {
@@ -101,15 +103,18 @@ int main()
         FrameObservation bad = frame({scene_and_post(1)});
         bad.executed = true;
         bad.later_scene_write = true;
+        const uint32_t gen0 = rs.Current().history_generation;
         rs.OnFrame(bad);
         CHECK(rs.Current().contradictions == 1 && rs.Current().placement_consistent == 0);
         CHECK(rs.Current().state == RouteState::Observe); // relearning
-        // The structure is now actually between-list: it switches after 3 matches, once.
+        CHECK(rs.Current().route == Route::None);          // and NOT still executing the invalid boundary (R1)
+        CHECK(rs.Current().history_generation == gen0 + 1);
+        // The structure is now actually between-list: it is accepted after 3 matches, once.
         const auto between = frame({scene_list(), reader()});
         const uint32_t gen = rs.Current().history_generation;
         rs.OnFrame(between);
         rs.OnFrame(between);
-        CHECK(rs.Current().route == Route::Inline); // not yet: no switch mid-learning
+        CHECK(rs.Current().route == Route::None); // not yet: learning
         rs.OnFrame(between);
         CHECK(rs.Current().route == Route::Between && rs.Current().history_generation == gen + 1);
     }
@@ -160,13 +165,44 @@ int main()
         for (int i = 0; i < 3; ++i) rs.OnFrame(frame({scene_list(), reader()}));
         CHECK(rs.Current().route == Route::Between);
     }
-    // 12. Interceptor: a supported upscaler call owns the view.
+    // 12. Interceptor: a supported upscaler call owns the view, at once, even when no
+    //     scene was discovered heuristically (R4).
     {
         RouteSelector rs;
-        FrameObservation o = frame({scene_list(), reader()});
+        FrameObservation o;
         o.interceptor = true;
-        for (int i = 0; i < 3; ++i) rs.OnFrame(o);
-        CHECK(rs.Current().route == Route::Interceptor);
+        rs.OnFrame(o);
+        CHECK(rs.Current().route == Route::Interceptor && rs.Current().state == RouteState::Active);
+        // Ownership ends: J2 relearns from structure, with a new history generation.
+        const uint32_t gen = rs.Current().history_generation;
+        const auto inl = frame({scene_and_post(9)});
+        for (int i = 0; i < 3; ++i) rs.OnFrame(inl);
+        CHECK(rs.Current().route == Route::Inline && rs.Current().history_generation == gen + 1);
+    }
+    // 13. An image restarted (colour clear) outside the depth-paired scene list drops the
+    //     earlier list's in-list boundary (R2); an ordinary composite does not.
+    {
+        ListSummary clear;
+        clear.color_writes = 1;
+        clear.clears_color = true;
+        const auto o = frame({scene_and_post(17), clear});
+        CHECK(!o.boundary_inside_list && o.inline_signature == 0);
+        ListSummary composite;
+        composite.color_writes = 1;
+        const auto o2 = frame({scene_and_post(17), composite});
+        CHECK(o2.boundary_inside_list && o2.inline_signature == 17);
+    }
+    // 14. An active route whose boundary disappears (no consumer observed any more)
+    //     tolerates a couple of frames, then stops instead of running blind.
+    {
+        RouteSelector rs;
+        for (int i = 0; i < 3; ++i) rs.OnFrame(frame({scene_list(), reader()}));
+        CHECK(rs.Current().route == Route::Between);
+        rs.OnFrame(frame({scene_list()}));
+        rs.OnFrame(frame({scene_list()}));
+        CHECK(rs.Current().route == Route::Between);
+        rs.OnFrame(frame({scene_list()}));
+        CHECK(rs.Current().route == Route::None && rs.Current().missing[0] != 0);
     }
     if (g_failures) { std::printf("j2_route_test: FAILED (%d failures)\n", g_failures); return 1; }
     std::printf("j2_route_test: OK\n");
