@@ -375,6 +375,18 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
     na::observe::SetLiveSelection(na::observe::IdOf(depth.Get()), na::observe::IdOf(color.Get()));
     const auto frame = [&](double cam_x) {
         d.WaitIdle();
+        if (inline_list) {
+            // Pooled list objects alternate between an early write-only job and
+            // the final scene/post job. Learning by object identity fails here.
+            std::swap(scene, scene2);
+            scene2.Reset();
+            scene2.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+            const float early[4] = {0, 0, 0, 1};
+            scene2.list->ClearRenderTargetView(rtv, early, 0, nullptr);
+            REQUIRE(SUCCEEDED(scene2.list->Close()));
+            ID3D12CommandList* first[] = {scene2.list.Get()};
+            Submit(q, 1, first, true);
+        }
         std::memset(cpu, 0, 4096);
         const M vp = Camera(cam_x);
         M inv{};
