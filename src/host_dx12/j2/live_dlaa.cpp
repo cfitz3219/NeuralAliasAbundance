@@ -89,6 +89,7 @@ struct State {
     // reading, then the game's state is restored. Explicitly enabled in settings.
     bool inline_mode = false;
     bool inline_sample_locked = false; // NGX recorded: no new raster sample may start this frame
+    bool inline_camera_submitted = false; // an earlier depth/camera batch may already be executing
     struct LearnedInsertion { uint64_t color = 0, depth = 0; na::j2::InsertionDecision decision; };
     LearnedInsertion insertion_frame, insertion_learned;
     char insertion_trace[2048] = {};
@@ -1231,7 +1232,11 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     // The depth/earlier scene batches must already have established this frame's
     // raster sample. Apply that SAME sample to camera copies in this recording
     // before reading its camera and recording motion/NGX parameters.
-    if (g.jit.valid && g.jit.applied) jitter_batch(one, 1);
+    // Recording can precede ALL camera submissions. In that order establish the
+    // sample here; Execute patches the earlier recorded pre-pass to this same
+    // sample before forwarding it. Do not start late after an unpatched camera
+    // batch has already been forwarded to the GPU.
+    if ((g.jit.valid && g.jit.applied) || !g.inline_camera_submitted) jitter_batch(one, 1);
     else g.jit.valid = false;
     g.inline_sample_locked = true;
     PendingHistory pending;
@@ -1329,6 +1334,7 @@ void OnPresent(ID3D12CommandQueue* queue)
         ++g.frame;
         g.jit.valid = false; // J1: the next camera block starts a new jitter sample
         g.inline_sample_locked = false;
+        g.inline_camera_submitted = false;
         if (g.scene_batches_cur) {
             g.batch_hist[g.batch_hist_n++ % 16] = static_cast<uint8_t>(g.scene_batches_cur > 255 ? 255 : g.scene_batches_cur);
             uint32_t votes[256] = {};
@@ -1413,6 +1419,10 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
             for (UINT i = 0; i < count && !has; ++i)
                 has = lists[i] == g.inl.list && na::observe::ListRecording(lists[i]) == g.inl.rec;
         jitter_batch(lists, count);
+        for (UINT i = 0; i < count; ++i)
+            if (lists[i] && na::observe::ListReferences(lists[i], selected_depth) &&
+                !na::observe::ListRootConstantBuffers(lists[i]).empty())
+                g.inline_camera_submitted = true;
         lock.unlock();
         forward(queue, count, lists);
         if (!has) return;
@@ -1577,6 +1587,7 @@ void Shutdown()
     g.inl = State::InlinePending{};
     g.inl_frame = 0;
     g.inline_sample_locked = false;
+    g.inline_camera_submitted = false;
     g.resume_reset = false;
     g.w = g.h = 0;
 }

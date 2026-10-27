@@ -375,7 +375,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
     na::j2::SetEnabled(true);
     na::j2::SetJitter(true); // J1 is off by default in the game; the tests exercise it
     na::observe::SetLiveSelection(na::observe::IdOf(depth.Get()), na::observe::IdOf(color.Get()));
-    const auto frame = [&](double cam_x) {
+    const auto frame = [&](double cam_x, bool unpatched_prepass = false) {
         d.WaitIdle();
         const int frame_evals = fake::evals;
         if (inline_list) {
@@ -405,9 +405,14 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         prepass.list->SetGraphicsRootSignature(rs_pre.Get());
         prepass.list->SetGraphicsRootConstantBufferView(0, cb->GetGPUVirtualAddress() + kPre);
         REQUIRE(SUCCEEDED(prepass.list->Close()));
-        if (!inline_record_first) {
+        if (!inline_record_first || unpatched_prepass) {
+            if (unpatched_prepass) std::memset(cpu + kPre + kVp, 0, 64);
             ID3D12CommandList* pl[] = {prepass.list.Get()};
             Submit(q, 1, pl, true);
+            if (unpatched_prepass) {
+                d.WaitIdle(); // test-only: finish the unrecognized camera batch
+                Store(cpu + kPre + kVp, vp);
+            }
         }
         scene.Reset(); // no colour/depth transitions in the scene list: carried state
         scene.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
@@ -487,7 +492,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         REQUIRE(SUCCEEDED(consumer.list->Close()));
         g_forwarded.clear();
         if (inline_list) {
-            if (inline_record_first) {
+            if (inline_record_first && !unpatched_prepass) {
                 ID3D12CommandList* pl[] = {prepass.list.Get()};
                 Submit(q, 1, pl, true); // cannot change the sample already recorded by NGX
             }
@@ -504,7 +509,8 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                     const double dy = -(f(raster, 7) / f(raster, 15) - f(original, 7) / f(original, 15)) * H / 2;
                     REQUIRE(std::abs(dx - jx) < 0.001 && std::abs(dy - jy) < 0.001);
                 }
-                if (inline_record_first) REQUIRE(jx == 0 && jy == 0);
+                if (unpatched_prepass) REQUIRE(jx == 0 && jy == 0);
+                else if (inline_record_first && cam_x >= 0.5) REQUIRE(jx != 0 || jy != 0);
             }
         } else if (split) {
             scene2.Reset(); // more of the scene in a second submission (same camera, same targets)
@@ -540,6 +546,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
     const uint64_t evals0 = evaluations();
     if (inline_list) {
         for (int f = 0; f < 4; ++f) REQUIRE(frame(0.25 * f) == 0);
+        if (inline_record_first) REQUIRE(frame(1.0, true) == 0);
         const auto is = na::j2::GetStats();
         std::printf("inline: mode %u, candidates %llu, recorded %llu, frames %llu (inline %llu), refused %llu, evals %llu, forwarded %zu, \"%s\"\n",
                     is.inline_mode, (unsigned long long)is.inline_candidates, (unsigned long long)is.inline_recorded,
@@ -552,7 +559,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         CHECK(evaluations() >= evals0 + 2);
         CHECK(g_forwarded.size() == 1);              // no J2 list was inserted
         CHECK(is.inline_refused == 0);
-        if (!inline_record_first) CHECK(is.jitter_writes >= 2);
+        CHECK(is.jitter_writes >= 2);
         CHECK(dev->GetDeviceRemovedReason() == S_OK); // the game's list (with our work and the restored state) ran
         return test::finish("j2_anno_shape_test (inline)");
     }
