@@ -60,6 +60,16 @@ void OnPresent(ID3D12CommandQueue* queue);
 void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists, ExecuteFn forward);
 
 struct Stats {
+    // Automatic route selection (route_selector.hpp). route: 0 none, 1 between,
+    // 2 inline, 3 interceptor; state: 0 observing, 1 active; mode: 0 auto,
+    // 1 forced between, 2 forced inline. placement_consistent = executed frames with
+    // no later write to the selected version (NOT proof of display); contribution is
+    // established only when lineage to the presented image was observed.
+    struct Route {
+        uint32_t route = 0, state = 0, mode = 0, matches = 0, observed = 0, generation = 0, contribution_established = 0;
+        uint64_t changes = 0, scene_frames = 0, executed_frames = 0, placement_consistent = 0, contradictions = 0, unstable_windows = 0;
+        char reason[160] = {}, missing[128] = {}, change[96] = {};
+    } route;
     uint64_t inline_presents = 0, inline_covered = 0, inline_late_writes = 0;
     uint64_t inline_jittered = 0;
     float inline_jitter_x = 0, inline_jitter_y = 0;

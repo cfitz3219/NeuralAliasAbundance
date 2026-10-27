@@ -1,6 +1,7 @@
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/msaa_resolve.hpp"
 #include "host_dx12/j2/nis_sharpen.hpp"
+#include "host_dx12/j2/route_selector.hpp"
 
 #include "core/motion_arbiter_gpu.hpp"
 #include "core/temporal_jitter.hpp"
@@ -87,7 +88,15 @@ struct State {
     // post-processing in one command list, Sniper Elite Resistance): DLAA is
     // recorded INTO the game's list at the moment it binds the scene colour for
     // reading, then the game's state is restored. Explicitly enabled in settings.
-    bool inline_mode = false;
+    bool inline_mode = false; // mirrors the route selector's Inline decision
+    // Automatic route selection (COMMS-Continuation step 2): the selector decides
+    // between-list / inline / none per view from per-frame structure; Execute and
+    // the inline trigger only carry out its decision.
+    na::j2::RouteSelector router;
+    na::j2::FrameAggregator frame_agg;
+    uint64_t route_prev_late = 0, route_prev_post_scene = 0, route_prev_no_camera = 0, route_prev_no_state = 0;
+    uint32_t route_gen_applied = 0;
+    bool dlss_ready = false;
     bool inline_sample_locked = false; // NGX recorded: no new raster sample may start this frame
     bool inline_camera_submitted = false; // an earlier depth/camera batch may already be executing
     struct LearnedInsertion { uint64_t color = 0, depth = 0; na::j2::InsertionDecision decision; };
@@ -468,7 +477,28 @@ bool dlss_on()
     wcscat_s(path, L"NeuralAlias-ngx");
     CreateDirectoryW(path, nullptr);
     if (!na::dlss::EnsureOn(g.device.Get(), path)) { reason("DLSS did not start on this device (see DLSS details)."); return false; }
+    g.dlss_ready = true;
     return true;
+}
+
+// Carry out the route selector's decision (under g.m): inline mode for the inline
+// trigger, device + DLSS ready for it, and a history reset when the route changes.
+void apply_route_locked(ID3D12CommandQueue* queue)
+{
+    const auto& d = g.router.Current();
+    g.inline_mode = d.route == na::j2::Route::Inline;
+    g.stats.inline_mode = g.inline_mode ? 1u : 0u;
+    if (d.history_generation != g.route_gen_applied) {
+        g.route_gen_applied = d.history_generation;
+        g.resume_reset = true;   // output of the old route must not feed the new one
+        g.inl.valid = false;     // an inline recording from the old route is not committed
+        g.scene_batches_target = 0;
+    }
+    if (g.inline_mode && !g.dlss_ready) {
+        // Ready before the game RECORDS the next scene list (the inline trigger runs then).
+        if (!g.device && queue) ensure_device(queue);
+        if (g.device) g.dlss_ready = dlss_on();
+    }
 }
 
 // The resource state at the end of the scene list: its last whole-resource
@@ -1316,6 +1346,38 @@ void OnPresent(ID3D12CommandQueue* queue)
 {
     std::lock_guard<std::mutex> lock(g.m);
     if (queue && g.queue.Get() == queue) {
+        {
+            // Route selector: close this frame's structure + outcome.
+            na::j2::FrameObservation& o = g.frame_agg.Observation();
+            o.executed = g.submitted_frame == g.frame;
+            const uint64_t late = g.stats.inline_late_writes + g.stats.post_scene_batches;
+            o.later_scene_write = o.executed && late > g.route_prev_late;
+            o.camera_missed = g.stats.no_camera > g.route_prev_no_camera;
+            o.depth_state_missed = g.stats.no_state > g.route_prev_no_state;
+            g.route_prev_late = late;
+            g.route_prev_no_camera = g.stats.no_camera;
+            g.route_prev_no_state = g.stats.no_state;
+            const auto& d = g.router.OnFrame(o);
+            g.frame_agg.Reset();
+            auto& r = g.stats.route;
+            r.route = static_cast<uint32_t>(d.route);
+            r.state = static_cast<uint32_t>(d.state);
+            r.mode = static_cast<uint32_t>(g.router.Mode());
+            r.matches = d.matches;
+            r.observed = d.observed;
+            r.generation = d.history_generation;
+            r.changes = d.route_changes;
+            r.scene_frames = d.scene_frames;
+            r.executed_frames = d.executed_frames;
+            r.placement_consistent = d.placement_consistent;
+            r.contradictions = d.contradictions;
+            r.unstable_windows = d.unstable_windows;
+            r.contribution_established = d.contribution_established ? 1u : 0u;
+            std::snprintf(r.reason, sizeof r.reason, "%s", d.reason);
+            std::snprintf(r.missing, sizeof r.missing, "%s", d.missing);
+            std::snprintf(r.change, sizeof r.change, "%s", d.change);
+            apply_route_locked(nullptr);
+        }
         std::memcpy(g.stats.insertion_frame_trace, g.insertion_trace, sizeof g.insertion_trace);
         g.insertion_trace[0] = 0;
         g.insertion_trace_used = 0;
@@ -1366,12 +1428,36 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         return;
     }
     ++g.stats.submissions;
+    {
+        // [j2] route=auto|between|inline (diagnostic overrides); legacy inline=1 = inline override.
+        const uint32_t rm = na::settings::Get().j2_route.load();
+        const na::j2::RouteMode mode = rm == 1 ? na::j2::RouteMode::ForceBetween
+                                     : (rm == 2 || na::settings::Get().j2_inline.load()) ? na::j2::RouteMode::ForceInline
+                                     : na::j2::RouteMode::Auto;
+        g.router.SetMode(mode);
+        apply_route_locked(queue);
+    }
     uint64_t selected_depth = 0, selected_color = 0;
     na::observe::GetLiveSelection(&selected_depth, &selected_color);
     if (selected_color && selected_depth) for (UINT i = 0; i < count; ++i) {
         if (!lists[i]) continue;
         const auto id = na::observe::IdOf(lists[i]);
         const auto decision = na::observe::ListInsertionDecision(lists[i], selected_color);
+        {
+            // Structure for the route selector, in submission order.
+            na::j2::ListSummary sum;
+            sum.renders_scene = na::observe::ListRendersTo(lists[i], selected_color, selected_depth);
+            sum.color_writes = decision.writes;
+            sum.reads = decision.all_reads;
+            sum.reads_after_last_write = decision.final_candidate ? 1u : 0u;
+            sum.clears_color = sum.renders_scene && na::observe::ListClearsTarget(lists[i], selected_color);
+            uint64_t sig = 1469598103934665603ull; // FNV-1a over the boundary's identity
+            for (uint64_t v : {decision.boundary_writer, static_cast<uint64_t>(decision.writer_occurrence), decision.destination, decision.pipeline})
+                sig = (sig ^ v) * 1099511628211ull;
+            sum.boundary_signature = decision.final_candidate ? sig : 0;
+            g.frame_agg.AddList(sum);
+            if (sum.renders_scene && !g.device) ensure_device(queue); // Present must be attributable to learn
+        }
         if ((decision.writes || decision.all_reads) && g.insertion_trace_used < sizeof g.insertion_trace - 160) {
             const int n = std::snprintf(g.insertion_trace + g.insertion_trace_used, sizeof g.insertion_trace - g.insertion_trace_used,
                 " L%llu:w%u/r%u/f%u/d%llu/p%llu/b%llu:%u%s", (unsigned long long)id, decision.writes,
@@ -1441,6 +1527,16 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         reason("Live DLAA is running inside the game's scene list (post-processing shares it).");
         return;
     }
+    if (g.router.Current().route != na::j2::Route::Between) {
+        // Observing, or a route that J2 does not run between lists (none / interceptor).
+        const auto& d = g.router.Current();
+        char why[200];
+        std::snprintf(why, sizeof why, "%s %s", d.route == na::j2::Route::None ? "Choosing where DLAA belongs:" : "Route:", d.reason);
+        reason(why);
+        lock.unlock();
+        forward(queue, count, lists);
+        return;
+    }
     if (g.submitted_frame == g.frame) {
         ++g.stats.duplicate_submissions;
         uint64_t dsel = 0, csel = 0;
@@ -1490,18 +1586,6 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
             scene = static_cast<int>(i);
             if (na::observe::ListClearsTarget(lists[i], color_id)) restarts = true;
         }
-    }
-    // The scene list itself goes on to READ the colour (post-processing recorded in the
-    // same command list): DLAA between lists would land after that read and never be
-    // seen (Sniper Elite Resistance). Switch to inline insertion from the next frame.
-    if (scene >= 0 && na::settings::Get().j2_inline.load() && !g.inline_mode && na::observe::ListSamplesTexture(lists[scene], color_id) &&
-        na::observe::ListTargetsAfter(lists[scene], color_id, depth_id) > 0 && ensure_device(queue) && dlss_on()) {
-        g.inline_mode = true;
-        g.stats.inline_mode = 1;
-        reason("The game records post-processing in the scene's own list: using the configured inline DLAA path.");
-        lock.unlock();
-        forward(queue, count, lists);
-        return;
     }
     // A batch that clears the colour starts the image over: it is scene batch 1 again.
     if (scene >= 0) g.scene_batches_cur = restarts ? 1 : g.scene_batches_cur + 1;
@@ -1583,6 +1667,11 @@ void Shutdown()
     g.scene_batches_cur = g.scene_batches_target = 0;
     g.batch_hist_n = 0;
     g.inline_mode = false;
+    g.router.Reset();
+    g.frame_agg.Reset();
+    g.route_prev_late = g.route_prev_post_scene = g.route_prev_no_camera = g.route_prev_no_state = 0;
+    g.route_gen_applied = 0;
+    g.dlss_ready = false;
     g.insertion_frame = g.insertion_learned = {};
     g.inl = State::InlinePending{};
     g.inl_frame = 0;

@@ -1,3 +1,4 @@
+#include "host_dx12/settings.hpp"
 // J2 live DLAA end to end against a fake NGX runtime on a real D3D12 device
 // (WARP-capable): discovery picks -> scene list detection -> camera from the
 // scene list's root constant buffer (ViewProjection at +80, inverse at +144,
@@ -176,6 +177,7 @@ int main()
     };
 
     na::j2::SetEnabled(true);
+    na::settings::Get().j2_route.store(1); // fixed between-list route: frame-1 expectations (selector tested separately)
     na::j2::SetJitter(true); // J1 is off by default in the game; the tests exercise it
     // No discovery picks yet: untouched.
     na::observe::SetLiveSelection(0, 0);

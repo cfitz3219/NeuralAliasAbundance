@@ -105,8 +105,13 @@ int main(int argc, char** argv)
     // pass binds the colour for reading, and the game's state handed back.
     const bool inline_copy = argc > 3 && std::strcmp(argv[3], "--inline-copy") == 0;
     const bool inline_record_first = argc > 3 && std::strcmp(argv[3], "--inline-record-first") == 0;
-    const bool inline_list = inline_record_first || inline_copy || (argc > 3 && std::strcmp(argv[3], "--inline") == 0);
-    const bool post_reader = argc > 3 && !real_ngx && !planes && !split && !inline_list;
+    // --auto-inline / --auto-between: no override; the route selector must choose the
+    // route from the frame structure (inline for scene+post in one list, between for
+    // the Anno shape) after its learning frames.
+    const bool auto_inline = argc > 3 && std::strcmp(argv[3], "--auto-inline") == 0;
+    const bool auto_between = argc > 3 && std::strcmp(argv[3], "--auto-between") == 0;
+    const bool inline_list = auto_inline || inline_record_first || inline_copy || (argc > 3 && std::strcmp(argv[3], "--inline") == 0);
+    const bool post_reader = argc > 3 && !real_ngx && !planes && !split && !inline_list && !auto_between;
     test::Device d;
     if (!test::CreateDevice(d)) return test::SkipNoDevice("j2_anno_shape_test");
     if (real_ngx) {
@@ -371,7 +376,10 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         d.WaitIdle();
     }
     REQUIRE(SUCCEEDED(scene.list->Close()) && SUCCEEDED(consumer.list->Close()) && SUCCEEDED(prepass.list->Close()));
-    na::settings::Get().j2_inline.store(inline_list);
+    na::settings::Get().j2_inline.store(inline_list && !auto_inline);
+    // Fixed-route tests force between-list insertion so their frame-1 expectations hold;
+    // the auto modes exercise the selector.
+    na::settings::Get().j2_route.store((auto_inline || auto_between || inline_list) ? 0u : 1u);
     na::j2::SetEnabled(true);
     na::j2::SetJitter(true); // J1 is off by default in the game; the tests exercise it
     na::observe::SetLiveSelection(na::observe::IdOf(depth.Get()), na::observe::IdOf(color.Get()));
@@ -544,6 +552,23 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
     };
     const auto evaluations = [&]() -> uint64_t { return real_ngx ? na::dlss::GetStats().evaluates : uint64_t(fake::evals); };
     const uint64_t evals0 = evaluations();
+    if (auto_inline || auto_between) {
+        for (int f = 0; f < 7; ++f) REQUIRE(frame(0.25 * f) == 0);
+        const auto as = na::j2::GetStats();
+        std::printf("auto: route %u state %u mode %u gen %u matches %u scene frames %llu, frames %llu (inline %llu), \"%s\" / \"%s\"\n",
+                    as.route.route, as.route.state, as.route.mode, as.route.generation, as.route.matches,
+                    (unsigned long long)as.route.scene_frames, (unsigned long long)as.frames, (unsigned long long)as.inline_frames,
+                    as.route.reason, as.reason);
+        CHECK(as.route.mode == 0);                               // no override
+        CHECK(as.route.route == (auto_inline ? 2u : 1u));        // chosen from the structure
+        CHECK(as.route.state == 1 && as.route.generation == 1);  // learned once, no oscillation
+        CHECK(as.frames >= 2 && as.frames <= 4);                 // not before the learning frames
+        if (auto_inline) CHECK(as.inline_frames == as.frames && g_forwarded.size() == 1);
+        else CHECK(as.inline_frames == 0 && g_forwarded.size() == 3);
+        CHECK(as.route.contribution_established == 0);           // lineage not observed: unknown
+        CHECK(dev->GetDeviceRemovedReason() == S_OK);
+        return test::finish(auto_inline ? "j2_anno_shape_test (auto-inline)" : "j2_anno_shape_test (auto-between)");
+    }
     if (inline_list) {
         for (int f = 0; f < 4; ++f) REQUIRE(frame(0.25 * f) == 0);
         if (inline_record_first) REQUIRE(frame(1.0, true) == 0);

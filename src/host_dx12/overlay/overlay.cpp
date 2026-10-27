@@ -482,6 +482,19 @@ void write_status_line()
             (unsigned long long)j2.inline_late_writes, (unsigned long long)j2.inline_jittered,
             j2.inline_jitter_x, j2.inline_jitter_y);
         if (nc > 0) WriteFile(f, coverage, static_cast<DWORD>(nc), &written, nullptr);
+        {
+            static const char* kRoutes[] = {"none", "between", "inline", "interceptor"};
+            static const char* kModes[] = {"auto", "forced-between", "forced-inline"};
+            const auto& rt = j2.route;
+            char rl[640];
+            const int nr = snprintf(rl, sizeof rl,
+                "j2_route mode=%s route=%s state=%s matches=%u observed=%u gen=%u changes=%llu scene_frames=%llu executed=%llu placement_consistent=%llu contradictions=%llu unstable=%llu contribution=%s reason=\"%s\" missing=\"%s\" change=\"%s\"\r\n",
+                kModes[rt.mode < 3 ? rt.mode : 0], kRoutes[rt.route < 4 ? rt.route : 0], rt.state ? "active" : "observing", rt.matches, rt.observed,
+                rt.generation, (unsigned long long)rt.changes, (unsigned long long)rt.scene_frames, (unsigned long long)rt.executed_frames,
+                (unsigned long long)rt.placement_consistent, (unsigned long long)rt.contradictions, (unsigned long long)rt.unstable_windows,
+                rt.contribution_established ? "established" : "unknown", rt.reason, rt.missing, rt.change);
+            if (nr > 0) WriteFile(f, rl, static_cast<DWORD>((std::min)(nr, static_cast<int>(sizeof rl - 1))), &written, nullptr);
+        }
         if (j2.insertion_last_miss[0]) {
             WriteFile(f, "j2_last_miss ", 13, &written, nullptr);
             WriteFile(f, j2.insertion_last_miss, static_cast<DWORD>(std::strlen(j2.insertion_last_miss)), &written, nullptr);

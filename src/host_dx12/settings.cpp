@@ -122,6 +122,12 @@ void Load()
     // Insertion mode is an explicit per-game deployment choice, never inherited
     // from another game's global menu preferences.
     g_settings.j2_inline.store(g_ini_defaults[0] && GetPrivateProfileIntW(L"j2", L"inline", 0, g_ini_defaults) != 0);
+    // Route choice is per game too: automatic unless this game's ini forces one (diagnosis).
+    {
+        wchar_t rt[16] = {};
+        if (g_ini_defaults[0]) GetPrivateProfileStringW(L"j2", L"route", L"auto", rt, 16, g_ini_defaults);
+        g_settings.j2_route.store(!_wcsicmp(rt, L"between") ? 1u : (!_wcsicmp(rt, L"inline") ? 2u : 0u));
+    }
 }
 
 bool Save()

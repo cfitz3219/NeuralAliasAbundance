@@ -681,6 +681,16 @@ void DrawLiveDlaa()
                       static_cast<unsigned long long>(nb.negative), static_cast<unsigned long long>(nb.zero), static_cast<unsigned long long>(nb.positive), nb.min, nb.max);
         StatusLine(0, tb);
     }
+    {
+        // Where DLAA is placed in this game's frame, chosen automatically (or forced in the ini).
+        const auto& rt = st.route;
+        static const char* kWhere[] = {"not placed yet", "between the game's command lists", "inside the game's scene list", "handled by the game's own upscaler call"};
+        char pl[360];
+        std::snprintf(pl, sizeof pl, "Placement: %s%s%s (%s). %s%s%s", kWhere[rt.route < 4 ? rt.route : 0],
+                      rt.mode ? ", forced in settings" : "", rt.state ? "" : ", still learning",
+                      rt.mode ? "override" : "automatic", rt.reason, rt.missing[0] ? " Missing: " : "", rt.missing);
+        StatusLine(0, pl);
+    }
     char buf[320];
     if (!on) {
         StatusLine(0, "Off: you are seeing the game's own picture.");
