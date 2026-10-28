@@ -64,8 +64,10 @@ void __stdcall Forward(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* 
 void Submit(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists, bool j2)
 {
     const na::observe::ExecuteToken t = na::observe::ExecuteBegin(q, n, lists);
+    na::dlss::BeforeExecute(q, n, lists); // as the overlay: DLSS completion tracking of inline recordings
     if (j2) na::j2::Execute(q, n, lists, &Forward);
     else q->ExecuteCommandLists(n, lists);
+    na::dlss::OnExecuted(q, n, lists);
     na::observe::ExecuteEnd(t, q, n, lists);
 }
 using M = std::array<double, 16>;
