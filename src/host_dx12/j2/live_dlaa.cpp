@@ -600,10 +600,31 @@ bool same_camera(const na::camera::Matrix& m)
     return dot > 0.98 && std::abs(v.sy - p.sy) <= 0.05 * std::abs(p.sy) && d2 <= 0.01 * len2 + 100.0;
 }
 
-bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& bytes, bool slot)
+bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& in_bytes, bool slot)
 {
-    const size_t n = bytes.size();
+    const size_t n = in_bytes.size();
     if (g.camera_offset < 0 || static_cast<uint64_t>(g.camera_offset) + 64 > n || !g.w || !g.h) return false;
+    // The jittered matrices are written into the game's own buffer. A game that only
+    // re-uploads its camera when something changed (Sniper Elite 5: camera still, menu
+    // cursor) leaves LAST frame's jittered bytes there; jittering those again every frame
+    // adds the offsets up and the whole picture slides (Cort: "slow drift upwards").
+    // So a block that still holds the previous sample starts from that sample's originals.
+    std::vector<uint8_t> bytes = in_bytes;
+    {
+        const size_t co = static_cast<size_t>(g.camera_offset);
+        const int64_t io64 = g.camera_offset + g.camera_inv_delta;
+        const int64_t po64 = g.camera_proj_delta == INT64_MIN ? -1 : g.camera_offset + g.camera_proj_delta;
+        for (int l = 0; l < 2; ++l)
+            if (!std::memcmp(bytes.data() + co, g.jit.jvp[l], 64)) {
+                std::memcpy(bytes.data() + co, g.jit.vp[l], 64);
+                if (io64 >= 0 && static_cast<uint64_t>(io64) + 64 <= n && !std::memcmp(bytes.data() + io64, g.jit.jinv[l], 64))
+                    std::memcpy(bytes.data() + io64, g.jit.inv[l], 64);
+                if (g.jit.has_proj && po64 >= 0 && static_cast<uint64_t>(po64) + 64 <= n && !std::memcmp(bytes.data() + po64, g.jit.jproj, 64))
+                    std::memcpy(bytes.data() + po64, g.jit.proj, 64);
+                ++g.stats.jitter_rebased;
+                break;
+            }
+    }
     for (auto layout : {na::camera::Layout::RowMajor, na::camera::Layout::ColumnMajor}) {
         const auto m = na::camera::LoadMatrix(bytes, static_cast<size_t>(g.camera_offset), layout);
         na::camera::Candidate c{};
@@ -1338,7 +1359,14 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
             using V = na::j2::ConsumerProfile::Verdict;
             const V v = g.profile.Judge(live_class, live_producer, live_context);
             if (v == V::Rejected) { ++g.stats.barrier_vetoes; return; }
-            if (v == V::Ambiguous) { ++g.stats.barrier_ambiguous_skips; return; }
+            // Ambiguous (the pattern was seen both mid-scene and at completion, and the
+            // context does not separate them): the boundary matcher below is the
+            // distinguishing check: it fires only when the writer pipeline, its
+            // occurrence, destination and pipeline all equal the learned boundary. A
+            // wrong fire is still a contradiction that demotes this pattern
+            // (fired_at_barrier). Skipping outright here cost Sniper Elite 5 59% of its
+            // frames (post-processing there is never seen as a consumer).
+            if (v == V::Ambiguous) ++g.stats.barrier_ambiguous_skips;
             if (v == V::AcceptedWithProducer || v == V::AcceptedQualified) { by_class = true; matched_mode = kByBarrier; }
         } else if (live.valid && live.after_write && raster_safe && g.scene_w) {
             live_class = na::j2::MakeClass(live.raw, g.scene_w, g.scene_h);
