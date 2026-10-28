@@ -75,7 +75,12 @@ jobs:
             foreach ($l in $lines) {
               if ($l -match '^\d+/\d+ (Testing|Test): (\S+)') { $name = $Matches[2]; $buf.Clear(); continue }
               if ($l -match '^Test (Failed|Timeout)|^Test time .*|^"\S+" end time') {
-                if ($l -match 'Failed|Timeout') { $buf | Select-Object -Last 12 | ForEach-Object { Write-Output "::error::[$name] $_" }; Write-Output "::error::[$name] $l" }
+                if ($l -match 'Failed|Timeout') {
+                  # Last 12 lines, or the whole exit-watchdog dump when there is one (main thread first).
+                  $wd = $buf.FindIndex({ param($x) $x -match 'exit watchdog: still running' })
+                  $tail = if ($wd -ge 0) { $buf.GetRange($wd, $buf.Count - $wd) } else { $buf | Select-Object -Last 12 }
+                  $tail | Select-Object -First 80 | ForEach-Object { Write-Output "::error::[$name] $_" }; Write-Output "::error::[$name] $l"
+                }
                 continue
               }
               if ($l.Trim()) { $buf.Add($l) }
@@ -160,7 +165,12 @@ jobs:
             foreach ($l in $lines) {
               if ($l -match '^\d+/\d+ (Testing|Test): (\S+)') { $name = $Matches[2]; $buf.Clear(); continue }
               if ($l -match '^Test (Failed|Timeout)|^Test time .*|^"\S+" end time') {
-                if ($l -match 'Failed|Timeout') { $buf | Select-Object -Last 12 | ForEach-Object { Write-Output "::error::[$name] $_" }; Write-Output "::error::[$name] $l" }
+                if ($l -match 'Failed|Timeout') {
+                  # Last 12 lines, or the whole exit-watchdog dump when there is one (main thread first).
+                  $wd = $buf.FindIndex({ param($x) $x -match 'exit watchdog: still running' })
+                  $tail = if ($wd -ge 0) { $buf.GetRange($wd, $buf.Count - $wd) } else { $buf | Select-Object -Last 12 }
+                  $tail | Select-Object -First 80 | ForEach-Object { Write-Output "::error::[$name] $_" }; Write-Output "::error::[$name] $l"
+                }
                 continue
               }
               if ($l.Trim()) { $buf.Add($l) }

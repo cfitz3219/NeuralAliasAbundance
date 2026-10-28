@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <dbghelp.h>
 #include <tlhelp32.h>
 
@@ -17,6 +18,7 @@ namespace test {
 using Microsoft::WRL::ComPtr;
 constexpr int kSkip = 77;
 inline int g_failures = 0;
+inline DWORD g_main_thread = GetCurrentThreadId(); // initialised on the thread that runs main()
 #define CHECK(cond) do { if (!(cond)) { std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); ++test::g_failures; } } while (0)
 #define REQUIRE(cond) do { if (!(cond)) { std::printf("FATAL %s:%d: %s\n", __FILE__, __LINE__, #cond); return 1; } } while (0)
 // Exit watchdog (diagnostic, 2026-10-28): a test that has reported its result but has
@@ -38,15 +40,20 @@ inline void DumpThreadStacks() {
     const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     THREADENTRY32 te{}; te.dwSize = sizeof te;
+    // Two passes: the main (exiting) thread first, then the rest; idle thread-pool
+    // workers (NtWaitForWorkViaWorkerFactory) are skipped so the dump stays short.
+    for (int pass = 0; pass < 2; ++pass)
     for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
         if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+        if ((te.th32ThreadID == g_main_thread) != (pass == 0)) continue;
         HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
         if (!th) continue;
         SuspendThread(th);
         CONTEXT ctx{}; ctx.ContextFlags = CONTEXT_FULL;
         if (GetThreadContext(th, &ctx)) {
-            std::printf("exit watchdog: thread %lu\n", te.th32ThreadID);
             STACKFRAME64 f{};
+            std::string lines;
+            bool idle_pool = false;
             f.AddrPC.Offset = ctx.Rip; f.AddrPC.Mode = AddrModeFlat;
             f.AddrFrame.Offset = ctx.Rbp; f.AddrFrame.Mode = AddrModeFlat;
             f.AddrStack.Offset = ctx.Rsp; f.AddrStack.Mode = AddrModeFlat;
@@ -59,8 +66,12 @@ inline void DumpThreadStacks() {
                 auto* si = reinterpret_cast<SYMBOL_INFO*>(buf); si->SizeOfStruct = sizeof(SYMBOL_INFO); si->MaxNameLen = 255;
                 DWORD64 disp = 0;
                 const bool named = from_addr(proc, pc, &disp, si) != FALSE;
-                std::printf("  %s+0x%llx %s\n", m, static_cast<unsigned long long>(pc - base), named ? si->Name : "");
+                char line[512];
+                std::snprintf(line, sizeof line, "  %s+0x%llx %s\n", m, static_cast<unsigned long long>(pc - base), named ? si->Name : "");
+                lines += line;
+                if (i == 0 && named && std::strcmp(si->Name, "NtWaitForWorkViaWorkerFactory") == 0) idle_pool = true;
             }
+            if (!idle_pool) std::printf("exit watchdog: thread %lu%s\n%s", te.th32ThreadID, te.th32ThreadID == g_main_thread ? " (main)" : "", lines.c_str());
         }
         ResumeThread(th);
         CloseHandle(th);
