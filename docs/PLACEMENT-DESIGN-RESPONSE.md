@@ -319,3 +319,40 @@ Proceed with Fable’s direction, with this bounded implementation:
 4. Keep both routes under one frame/view evaluation and jitter decision.
 
 **This is a credible improvement over the failed single-anchor approach. It is not yet a complete “proof-based” solution as written—but the corrections are focused, and they do not require starting over.**
+
+---
+
+## Opus's revision after Astra's response — 2026-10-27
+
+All five corrections are accepted. They change the specification as follows; where a correction and the original text differ, this section governs.
+
+**1. The frame's last scene list is a prediction, not a fact.** Agreed. Within one submission batch the existing code already does the right thing: it inserts after the last scene writer that precedes the first observed reader in that batch *(source: the `before_reader` scan in Execute)*, so a consumer in the same batch is placed before, not after. Across batches, "this is the last scene list" comes from the batch histogram and is a prediction. The spec now says so: between-list insertion is **placement before an observed consumer when one is in the batch**, else **placement after a predicted last scene list**, counted separately (`between_observed` / `between_predicted`). A later scene write after a predicted placement is a contradiction and demotes the prediction, as today.
+
+**2. The class key is a fingerprint; collisions are resolved by context; persisted keys are structural.** Agreed.
+- The key stays cheap (op kind, root, destination size/format class, scene-colour SRV count), but a class seen as both post-entry and temporary is **ambiguous** and is qualified by the preceding producer, which the existing `ProducerConsumer` mode already does. An ambiguous class without a distinguishing producer is not accepted.
+- For a saved profile, the root-signature object id is replaced by a **structural hash of the root layout** (parameter types, ranges, register spaces), which producers already parse *(source: `root_params` / `root_ranges` in `g_objs`)*. Object ids remain the live key within a session.
+- History-texture reads: the SRV count covers the scene colour only. Whether a separate history texture is read is not in the key. Adding "number of view-sized SRVs other than the scene colour" is cheap from the same table walk and goes into the essential key.
+
+**3. A later write does not by itself make the earlier consumer temporary.** Agreed, and this is the most important correction. The rule becomes: a consumer is temporary only if, after the later write, **the original colour is observed being consumed again** this frame. If the later write is a clear or reuse with no subsequent observed read of the original before Present, the earlier consumer (typically a copy or resolve) was the real exit of the scene, and the displayed image follows its destination.
+- This needs minimal lineage: the trace already records copy/resolve destinations of the colour as writes *(source: `after_texture_copy`)*. The essential addition is to extend the read check in `before_shader_use` from "the scene colour" to "the scene colour or a texture derived from it this frame" (bounded set, cleared at Present), so a read of the copy counts as continuation of the chain. That is the "relevant scene chain", not a reconstruction of every resource.
+- Essential, not deferred: items 5 (lineage) and 1 (classes) in the step list merge into one first step.
+
+**4. One execution owner per frame and view.** Agreed. The spec now states it explicitly, all from existing fields *(source)*:
+- one DLAA evaluation per frame: `inl_frame == frame` or `submitted_frame == frame` blocks both the inline trigger and between-list insertion;
+- one jitter sample per frame: the sample established at the first camera batch (`g.jit`), applied by whichever route records;
+- a recorded but unsubmitted inline recording expires at Present: its slot is released, its capture token discarded (`Discard(token, true)`), the frame counted as a miss, and `inl.valid` cleared so the next frame can record. Today `inl.valid` persists until submitted, which the `pending` rejection counter already exposes; this makes the expiry explicit.
+
+**5. Weaker proof, stated as such.**
+- **Capture pairs are supporting evidence, not proof.** A presented image correlating with our output also correlates with the native scene. The usable comparison is three-way: presented vs our output vs our input (the pre-DLAA colour). If the presented image matches the output better than the input, after allowing for the game's tonemap, that supports contribution; it does not establish it. Contribution is established only by observed lineage (item 3 extended to the back buffer) — and the doc now says so in §1.3.
+- **Acceptance rule made consistent:** a class is accepted after **3** post-entry observations with no temporary observation, so a genuinely new post shader costs up to 3 missed inline frames (fewer when the between-list path covers them). "One missed frame" is withdrawn.
+- **Luma PR #206 was closed,** and its discussion questions some of the sizing and detection assumptions; it is reference material for the *kind* of signal (shader structure, bound-resource shape), not proof that the technique is established upstream. Noted in §1.1.
+
+**Revised essential steps.**
+1. Class key (with structural root hash and the extra view-sized-SRV count), per-class profile with 3-hit acceptance and producer qualification for ambiguous classes, **plus** minimal lineage: derived-texture set per frame and the "consumed again after the write" rule. CPU tests: the α/β/γ traces, the copy-then-clear branch, the shared-class collision.
+2. Trigger matches on class; Execute decides per list (observed consumer before / predicted last list after, counted separately); Present labels, promotes, demotes and expires unsubmitted inline work. Host tests: existing cases, alternation α/γ, copy-branch continuation.
+3. Status lines: `j2_profile …`, `between_observed/predicted`, `expired_inline`; retire the 16-frame gate.
+4. HUD consistency statistic, log only.
+
+Optional, unchanged in substance: lineage extended to the presented buffer (contribution), the three-way capture comparison tool, PSV0 parsing, raster-state shadowing for MSAA-depth inline.
+
+Ready to build on Cort's word; Astra owns the regressions named above. The SER fix (d6af504) is independent of this and should be confirmed in a run first.
