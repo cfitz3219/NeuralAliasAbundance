@@ -130,6 +130,7 @@ struct Obj {
     // same[i]: the game's own object is already correct for level i (nothing to swap).
     // Immutable once published; owns a reference on every twin. A twin is never one of
     // the game's own objects (see D_CreateRootSignature), so twins cannot form cycles.
+    // Never destroyed inside another D3D12 object's destruction: see ReleaseTwinsLater.
     struct Twins { IUnknown* obj[3] = {}; bool same[3] = {}; ~Twins() { for (auto* o : obj) if (o) o->Release(); } };
     std::shared_ptr<Twins> twins;
     bool retirement_unobservable = false;   // the sentinel could not be attached
@@ -163,7 +164,36 @@ std::shared_mutex g_m; // registry, heaps, VA table. Never held across a D3D12 c
 // Never destroyed: at process exit an entry's twins must not be Released (a twin's last
 // Release can retire an object through its sentinel, which takes g_m and walks this map).
 std::unordered_map<const void*, Obj>& g_objs = *new std::unordered_map<const void*, Obj>();
+void ReleaseTwinsLater(std::shared_ptr<Obj::Twins>&& t); // live mip bias: see the definition
+void ReleaseParkedTwins();
 std::atomic<uint64_t> g_mip_shared_skips{0}; // twin levels dropped: D3D12 returned one of the game's own root signatures
+// Twins whose owner retired. The retirement sentinel runs INSIDE the D3D12 runtime's
+// destruction of the owner (private data is released as the object dies, under the
+// runtime's own locks: root signatures live in a per-device dedup cache, pipelines in
+// the device's object list). Releasing another root signature or pipeline from there
+// re-enters that destruction path and can wait on the lock the runtime already holds:
+// the host J2 tests exited "ok" and then never returned (028a182..783fb26). So the
+// sentinel only parks the twins here; they are released at the next safe point (a
+// creation hook or ExecuteCommandLists, which run in the game's call, not inside the
+// runtime's teardown of an object). Twins still parked at process exit are leaked.
+std::mutex g_twin_grave_m;
+std::vector<std::shared_ptr<Obj::Twins>>& g_twin_grave = *new std::vector<std::shared_ptr<Obj::Twins>>();
+void ReleaseTwinsLater(std::shared_ptr<Obj::Twins>&& t)
+{
+    if (!t) return;
+    std::lock_guard<std::mutex> lk(g_twin_grave_m);
+    g_twin_grave.push_back(std::move(t));
+}
+void ReleaseParkedTwins()
+{
+    std::vector<std::shared_ptr<Obj::Twins>> dead;
+    {
+        std::lock_guard<std::mutex> lk(g_twin_grave_m);
+        if (g_twin_grave.empty()) return;
+        dead.swap(g_twin_grave);
+    }
+    dead.clear(); // plain Release calls from the game's own call stack
+}
 std::vector<std::unique_ptr<DescHeap>> g_heaps;
 std::vector<VaRange> g_va; // sorted by begin
 struct BufferInfo {
@@ -402,7 +432,7 @@ private:
 void RetireSentinel::retire(const void* key, na_object_id id, uint32_t kind)
 {
     g_retire_gen.fetch_add(1, std::memory_order_acq_rel);
-    std::shared_ptr<Obj::Twins> drop; // released after g_m: a twin's Release is a D3D12 call
+    std::shared_ptr<Obj::Twins> drop; // parked, never released here (we are inside the owner's destruction)
     {
         std::unique_lock<std::shared_mutex> lock(g_m);
         auto it = g_objs.find(key);
@@ -413,6 +443,7 @@ void RetireSentinel::retire(const void* key, na_object_id id, uint32_t kind)
         g_buffers.erase(id);
         g_res_keys.erase(id);
     }
+    ReleaseTwinsLater(std::move(drop));
     if (kind == NA_OBJ_RESOURCE) known_forget(id);
     g_c.live.fetch_sub(1);
     g_c.retired.fetch_add(1);
@@ -476,6 +507,7 @@ na_object_id register_object(IUnknown* object, uint32_t kind)
         drop = std::move(o.twins);
         o = fresh_obj(id, kind);
     }
+    ReleaseTwinsLater(std::move(drop));
     g_c.live.fetch_add(1);
     g_c.created.fetch_add(1);
     attach_sentinel(object, key, id, kind);
@@ -500,6 +532,7 @@ na_object_id ensure_registered(IUnknown* object, uint32_t kind, bool* created)
         if (it != g_objs.end()) { g_c.live.fetch_sub(1); drop = std::move(it->second.twins); }
         g_objs[key] = fresh_obj(id, kind);
     }
+    ReleaseTwinsLater(std::move(drop));
     *created = true;
     g_c.live.fetch_add(1);
     g_c.created.fetch_add(1);
@@ -1397,6 +1430,7 @@ HRESULT STDMETHODCALLTYPE D_Wait(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v
 
 void STDMETHODCALLTYPE D_ExecuteCommandLists(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists)
 {
+    ReleaseParkedTwins();
     const ExecuteToken t = ExecuteBegin(q, n, lists);
     o_ExecuteCommandLists(q, n, lists);
     ExecuteEnd(t, q, n, lists);
@@ -1746,6 +1780,7 @@ template <typename Make>
 void make_pso_twins(IUnknown* pso, const void* rs, Make make)
 {
     if (!pso || !g_mip_live_enabled.load(std::memory_order_relaxed)) return;
+    ReleaseParkedTwins();
     const auto rt = rs_twins_of(rs);
     std::shared_ptr<Obj::Twins> pt;
     if (!rs) {
