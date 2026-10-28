@@ -372,3 +372,21 @@ No production source edits, game launch/deployment or capture performed for this
 ### 2026-10-27 — Astra hands testing to Cort
 
 Cort explicitly says finish preparation, DO NOT TEST, he will test. Built combined cc76ad2/production95e0eaf DLL successfully; no tests run or game launched. Game was closed. Reversibly installed DLL260DFADBDB1B97AEFF56C423A637C2BE41C18F69864B82246CA06F852EE0E7F7 in SER, set per-game inline=0 and route=auto. Other settings preserved. Previous DLL3F2765A2 and exact INI saved in local/ser-user-postentry-20261027 with rollback.ps1 and manifest. Original earlier installation backups remain intact. Cort owns live session now; neither agent should launch/deploy/control it concurrently. Deferred additional GPU regression execution and in-game verification to honor his request; do not represent those as completed. Await his observations before another rendering correction.
+
+### 2026-10-27 — Opus → Astra — SER live run of 4fc5a86: anchor regressed coverage; fixed (d6af504, 5032acd; CI green)
+
+Cort's run of 4fc5a86 (`route=auto`) showed DLAA cycling faster than he could see. From his status.log:
+- **Coverage was 75,920/109,958 (69%).** Your runs 7/8 with the boundary matcher alone reached 96–98%. Later writes were 0.
+- **`j2_anchor changes=55,420`:** the learned consumer signature changed on about half of all frames. Over the 376 samples, the mode was `none` in 236 ("no consumer after its final write") and `unique-consumer` in 140, across 9 different PSOs.
+- **Most frequent skip:** learned `{op 5, pso …6144, root …1136, dst 1426}`, while the actual consumer was `{op 5, root …2368, dst 1559}`.
+- **Reading (not yet proven):** SER's post pass sits in the scene's own list on some frames and in a later list on others. Several PSO variants also serve the same root signature and destination. An anchor learned from one kind of frame misses the other kind entirely, because there is no in-frame fallback once the barrier has passed.
+
+**Fix (d6af504).**
+- The anchor takes over only after 16 consecutive identical signatures.
+- Any frame the anchor misses hands control back to the boundary matcher.
+- The status line shows `streak=` and `fallbacks=`.
+- In SER this should restore boundary-matcher behaviour (96–98%). The anchor stays dormant there unless the structure stabilises.
+
+**Harness (5032acd).** `j2_anno_shape_test` now calls DLSS `BeforeExecute`/`OnExecuted` around each submission, as the overlay does. The 22-frame copy run had exposed this: without those calls the backend ran out of feature slots after ~16 inline frames. It was a test gap; production is unaffected.
+
+Takeaway: in SER the PostEntryPSO invariant does not hold as specified. Exact-PSO identity varies, and so does which list holds the post pass. Whether a (root, destination) key, or matching in the later list, would be stable is an open question for capture evidence, not something to guess at.
