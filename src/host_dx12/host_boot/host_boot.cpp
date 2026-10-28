@@ -229,6 +229,9 @@ bool StartFromIni(HMODULE self, const wchar_t* ini_name, const char* default_tag
         wchar_t mb[32] = {};
         GetPrivateProfileStringW(L"j2", L"mip_bias", L"-1.0", mb, 32, g_ini);
         na::observe::SetSamplerMipBias(static_cast<float>(_wtof(mb)));
+        // Live switching from the menu (no restart): twin root signatures/pipelines are
+        // built at creation for the other levels. [j2] mip_bias_live=0 turns it off.
+        na::observe::SetSamplerMipBiasLiveEnabled(GetPrivateProfileIntW(L"j2", L"mip_bias_live", 1, g_ini) != 0);
     }
     HANDLE t = CreateThread(nullptr, 0, &InitThread, nullptr, 0, nullptr);
     if (!t) {

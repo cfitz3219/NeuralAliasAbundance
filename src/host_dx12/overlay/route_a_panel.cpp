@@ -663,10 +663,13 @@ void DrawLiveDlaa()
         const int cur = ss.j2_mip_bias_x100.load();
         int idx = 2;
         for (int i = 0; i < 3; ++i) if (kDetailX100[i] == cur) idx = i;
-        BeginRow("Texture detail", "Samples surface textures sharper so DLAA can rebuild their full detail (NVIDIA's DLSS guide recommends -1 at native resolution). Very fine patterns such as fabric weaves can shimmer at -1; Light is gentler. Screen effects are never changed. Applies at the next game start, remembered for this game.", S(220));
+        const auto ml = na::observe::GetMipLiveStats();
+        const bool live = ml.enabled && (ml.twin_pipelines > 0 || ml.twin_root_signatures > 0);
+        BeginRow("Texture detail", "Samples surface textures sharper so DLAA can rebuild their full detail (NVIDIA's DLSS guide recommends -1 at native resolution). Very fine patterns such as fabric weaves can shimmer at -1; Light is gentler. Screen effects are never changed. Switches live (from the next frame); remembered for this game.", S(220));
         ImGui::SetNextItemWidth(S(220));
         if (ImGui::Combo("##j2detail", &idx, kDetail, 3)) {
             ss.j2_mip_bias_x100.store(kDetailX100[idx]);
+            na::observe::SetSamplerMipBiasLive(kDetailX100[idx] / 100.0f);
             na::settings::Save();
         }
         EndRow();
@@ -674,15 +677,16 @@ void DrawLiveDlaa()
         na::observe::MipBiasCounts(&ns, &nst);
         na::observe::NativeBiasStats nb;
         na::observe::NativeMipBiases(&nb);
-        char tb[320];
+        char tb[400];
         const float active = na::observe::SamplerMipBias();
-        std::snprintf(tb, sizeof tb, "Now: %.1f on %llu samplers + %llu built-in%s. Game's own bias on its surface textures: %llu below 0, %llu at 0, %llu above (range %.2f..%.2f).",
-                      active, static_cast<unsigned long long>(ns), static_cast<unsigned long long>(nst),
-                      (static_cast<int>(active * -100.0f + 0.5f) == -cur) ? "" : " (your new choice applies at the next game start)",
-                      static_cast<unsigned long long>(nb.negative), static_cast<unsigned long long>(nb.zero), static_cast<unsigned long long>(nb.positive), nb.min, nb.max);
+        std::snprintf(tb, sizeof tb, "Now: %.1f (game loaded at %.1f; %llu root signatures and %llu pipelines prepared for switching, %llu fixed, %llu fall-backs). Game's own bias on its surface textures: %llu below 0, %llu at 0, %llu above.",
+                      active, ml.game_bias, static_cast<unsigned long long>(ml.twin_root_signatures), static_cast<unsigned long long>(ml.twin_pipelines),
+                      static_cast<unsigned long long>(ml.untwinned_pipelines), static_cast<unsigned long long>(ml.fallbacks),
+                      static_cast<unsigned long long>(nb.negative), static_cast<unsigned long long>(nb.zero), static_cast<unsigned long long>(nb.positive));
         StatusLine(0, tb);
-        if (static_cast<int>(active * -100.0f + 0.5f) != -cur)
-            StatusLine(2, "Restart the game to see this change: the game builds its texture samplers when it loads, so the new detail level is not visible until the next start.");
+        (void)ns; (void)nst;
+        if (!live && static_cast<int>(ml.game_bias * -100.0f + 0.5f) != -cur)
+            StatusLine(2, "Live switching is not available in this session (no prepared pipelines): restart the game to see this change.");
     }
     {
         // Where DLAA is placed in this game's frame, chosen automatically (or forced in the ini).

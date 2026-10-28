@@ -165,6 +165,17 @@ bool ListLastStateSub(ID3D12CommandList* list, na_object_id id, uint32_t sub, ui
 // and root-signature static samplers) created from now on; 0 = off. For J2 DLAA
 // with jitter (temporal reconstruction needs sharper per-frame texture samples).
 void SetSamplerMipBias(float bias);
+// Live mip bias (no restart): the game's root signatures and pipelines get twins at
+// creation for the other menu levels (0, -0.5, -1); each command-list recording binds the
+// twins of the level selected when it was Reset. SamplerMipBias() reports that level.
+void SetSamplerMipBiasLive(float bias);
+void SetSamplerMipBiasLiveEnabled(bool on); // before the game creates its pipelines
+struct MipLiveStats {
+    bool enabled = false;
+    float game_bias = 0, live_bias = 0;
+    uint64_t twin_root_signatures = 0, twin_pipelines = 0, untwinned_pipelines = 0, fallbacks = 0, twin_failures = 0;
+};
+MipLiveStats GetMipLiveStats();
 float SamplerMipBias();
 void MipBiasCounts(uint64_t* samplers, uint64_t* static_samplers);
 // The game's own MipLODBias on surface-texture samplers (recorded whether or

@@ -308,6 +308,50 @@ int main(int argc, char** argv)
         CHECK(n1.negative == n0.negative + 2);
         CHECK(n1.min <= -1.5f);
         sd.MipLODBias = 0.0f;
+        // Live switching (Cort: compare without a restart): with live twins enabled, a
+        // root signature with a biased static sampler gets twins for the two other menu
+        // levels, and so does a pipeline built on it; a recording reset after the switch
+        // binds the twins and runs.
+        {
+            na::observe::SetSamplerMipBiasLiveEnabled(true);
+            const auto m0 = na::observe::GetMipLiveStats();
+            test::ComPtr<ID3D12RootSignature> lrs;
+            REQUIRE(SUCCEEDED(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&lrs))));
+            const char* cs = "[numthreads(1,1,1)] void CS() {}";
+            test::ComPtr<ID3DBlob> csb, cse;
+            REQUIRE(SUCCEEDED(D3DCompile(cs, std::strlen(cs), nullptr, nullptr, nullptr, "CS", "cs_5_0", 0, 0, &csb, &cse)));
+            D3D12_COMPUTE_PIPELINE_STATE_DESC cd{};
+            cd.pRootSignature = lrs.Get();
+            cd.CS = {csb->GetBufferPointer(), csb->GetBufferSize()};
+            test::ComPtr<ID3D12PipelineState> lpso;
+            REQUIRE(SUCCEEDED(dev->CreateComputePipelineState(&cd, IID_PPV_ARGS(&lpso))));
+            const auto m1 = na::observe::GetMipLiveStats();
+            std::printf("mip live: root twins %llu pipeline twins %llu failures %llu\n", (unsigned long long)(m1.twin_root_signatures - m0.twin_root_signatures),
+                        (unsigned long long)(m1.twin_pipelines - m0.twin_pipelines), (unsigned long long)m1.twin_failures);
+            CHECK(m1.twin_root_signatures == m0.twin_root_signatures + 2); // levels 0 and -0.5 (the game's is -1)
+            CHECK(m1.twin_pipelines == m0.twin_pipelines + 2);
+            CHECK(m1.twin_failures == 0);
+            na::observe::SetSamplerMipBiasLive(-0.5f);
+            CHECK(na::observe::SamplerMipBias() == -0.5f);
+            test::ComPtr<ID3D12CommandAllocator> la;
+            test::ComPtr<ID3D12GraphicsCommandList> ll;
+            REQUIRE(SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&la))));
+            REQUIRE(SUCCEEDED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, la.Get(), nullptr, IID_PPV_ARGS(&ll))));
+            REQUIRE(SUCCEEDED(ll->Close()));
+            REQUIRE(SUCCEEDED(la->Reset()));
+            REQUIRE(SUCCEEDED(ll->Reset(la.Get(), nullptr))); // latches -0.5
+            ll->SetComputeRootSignature(lrs.Get());
+            ll->SetPipelineState(lpso.Get());
+            ll->Dispatch(1, 1, 1);
+            REQUIRE(SUCCEEDED(ll->Close()));
+            ID3D12CommandList* one[] = {ll.Get()};
+            q->ExecuteCommandLists(1, one);
+            d.WaitIdle();
+            CHECK(dev->GetDeviceRemovedReason() == S_OK); // twin root signature + twin pipeline matched
+            CHECK(na::observe::GetMipLiveStats().fallbacks == 0);
+            na::observe::SetSamplerMipBiasLive(-1.0f); // back to the game's own objects
+            na::observe::SetSamplerMipBiasLiveEnabled(false);
+        }
         na::observe::SetSamplerMipBias(0.0f);
     }
     test::ComPtr<ID3D12RootSignature> rs_pre; // the pre-pass's own root signature: one root CBV
