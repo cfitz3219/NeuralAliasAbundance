@@ -520,6 +520,14 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                 for (auto& b : cbars) std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
                 scene.list->ResourceBarrier(2, cbars);
             } else scene.list->DrawInstanced(3, 1, 0, 0); // final actual read
+            if (fake::evals != evals_before_read + (na::j2::GetStats().inline_mode ? 1 : 0)) {
+                const auto ds = na::j2::GetStats();
+                std::printf("MISS evals=%d before=%d streak=%u skips=%llu cands=%llu waited=%llu refused=%llu rec=%llu no_camera=%llu no_state=%llu busy=%llu pending=%llu reason=\"%s\"\n",
+                            fake::evals, evals_before_read, ds.consumer_streak, (unsigned long long)ds.consumer_skips,
+                            (unsigned long long)ds.inline_candidates, (unsigned long long)ds.inline_waited, (unsigned long long)ds.inline_refused,
+                            (unsigned long long)ds.inline_recorded, (unsigned long long)ds.no_camera, (unsigned long long)ds.no_state,
+                            (unsigned long long)ds.busy, (unsigned long long)ds.inline_rejects[8], ds.reason);
+            }
             REQUIRE(fake::evals == evals_before_read + (na::j2::GetStats().inline_mode ? 1 : 0)); // exactly one, before the final consumer ran
             std::swap(rd2.Transition.StateBefore, rd2.Transition.StateAfter);
             scene.list->ResourceBarrier(1, &rd2);
