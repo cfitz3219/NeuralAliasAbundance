@@ -1,3 +1,35 @@
+# 2026-10-27 02:05 — SER live DLAA handed to Astra (Cort)
+
+Run 6 (inline DLAA, 9f7dd95): the debug image shows about once every 1.5–2 s. Inline DLAA ran on about 30% of frames. Depth state was unknown on about a third of candidates. Cuts were about 20%. The learned target of 1 candidate per frame suggests DLAA mostly lands at a mid-frame colour read rather than the start of post-processing.
+
+The full catalogue (runs 1–6, numbers, code map, hypotheses, suggestions) is in COMMS at 01:15 and 02:05. Astra owns the SER fix and P4-0D. Opus stops J2/SER changes unless Cort asks.
+
+---
+
+# 2026-10-27 — Opus: Sniper Elite Resistance (second DLSS-less game) status; inline DLAA; Astra owns the insertion-point detector
+
+**Where things stand.**
+- Anno DLAA works and Cort has confirmed it in the game.
+- Sniper Elite Resistance (DX12, no DLSS, no TAA, FXAA-style post filter only) is the P4-3 second game. It has exposed six generic gaps, each fixed in general code with its own test, all on PR #44 (`claude/j2-live-dlaa`).
+- Latest head 9f7dd95, CI green, **not yet run in the game**.
+
+**Latest SER finding.** DLAA ran steadily: 3 scene submissions per frame, about 14,000 DLAA frames, only 7 restarts. Yet nothing changed on screen, not even the debug views. The game records the end of its scene and its post-processing in **one command list** (later_passes = 9), so DLAA inserted between lists lands after the post pass has already read the colour.
+
+**Fix built: inline DLAA.**
+- DLAA is recorded inside the game's own list, at the game's SRV bind of the scene colour, and the game's full pipeline state is then restored.
+- Stage 1 runs without J1 jitter: DLSS parameters are fixed at record time, while jitter is written at submit time.
+- Test: `host_j2_inline_test`.
+- **Open decision for Cort:** auto-switch to inline vs. an explicit `[j2] inline=1` setting in the SER installer. He prefers the setting and wants Astra to own detection.
+
+**Assigned to Astra (Cort):** P4-0D, an insertion-point detector that always knows where DLAA belongs in any game. See MASTER-PLAN and COMMS. It pairs with P4-0R (frame recorder and replay, planned, built after SER works).
+
+**Rules Cort clarified.**
+- Games with TAA are out of scope for J2 (Metro EE was dropped).
+- Games that already have DLSS go on the TLOU route automatically.
+- One mistake to note: a command Cort rejected still pushed the 1-line header fix 9f7dd95. It is harmless, but it was disclosed to him.
+
+---
+
 # 2026-10-25 — Gate 3 strengthened to verified available inputs
 
 Cort requires verified available inputs plus an explicit missing-input list, without a new review cycle or Phase4 synthesis work. MASTER-PLAN now defines mandatory verified scene color/stage, main depth and scene-used camera, individual native-motion/jitter/exposure/frame-identity dispositions, matched evidence, operational thresholds and the finite C14/A9 completion work. Research fit checked against primary sources: optional RenderDoc offline inspection, ReShade depth preservation if needed, NVIDIA semantic checklist; existing local confirmation/reprojection helpers retained. OptiScaler/Streamline debug UI do not fill the extraction gap. No upstream code imported or Anno compatibility claimed.
@@ -376,3 +408,40 @@ Final Argon bundle verified: local/gate3-argon-ed6b8b2.zip, SHA2560D97B10B4B02B1
 ## 2026-10-26 — scoped Phase 4 camera-math handoff
 
 Astra delivered PR46 / focused commit5b6b2be: additive camera-relative history/candidate helpers and known-jitter verification; Windows Release and four focused CPU/host tests pass. Opus retains live integration ownership. His 0418adb response reports Anno already carries translation in its VP, so no camera-relative wiring is required for that captured path. COMMS contains the API handoff, audit-recipe corrections, and exact live-motion jitter / FG resize-timeout findings for Opus. No game deployment or added gate/review cycle.
+
+## 2026-10-26 — actual AA x2 coexistence implementation
+
+PR48 / astra/j2-msaa-x2 head6de5138 contains color/depth resolves and writeback for matching two-sample inputs, combined with Opus5425e4b unchanged. Five focused RTX hardware/host tests and Release DLL build pass; COMMS has the exact integration instructions and fixture correction. This supersedes the limited PR47 wording-only delivery. No Anno deployment or in-game x2 validation by Astra; Opus retains haze/shimmer and the combined game session. WORKLOG on the branch records failures, correction, and test limitations.
+
+## 2026-10-26 — AA coexistence expanded beyond x2
+
+PR48 head8ca1c08 generalizes sample counts, handles color/depth independently and prefers a pre-postprocess list boundary using observed scene-color readers. Includes Opus2315633 unchanged. Release DLL and17 executed RTX tests pass, including real NVIDIA DLAA x2/x4/x8;3 unsupported x16 tests skip. docs/AA-COEXISTENCE.md on the branch separates applicable Argon tiers, same-list limitations, optional forced-TAA bypass, and gameplay evidence still outstanding. Exact integration handoff in COMMS. No Astra game deployment; Opus retains haze/shimmer and the combined session.
+
+## 2026-10-26 — Anno stationary blur isolated; diagnostic rollback complete
+
+Astra diagnostic PR49/3b62c78 preserves real captures' analysis and manual replay tooling only (do not merge/deploy). Measured raster jitter agrees with submitted offsets. Generated stationary motion is false due to numerical precision loss in separate float camera transforms; replaying the same inputs with motion derived from double-composed transforms restores fine detail. SMAA saved-flag0 comparison does not remove blur; actual shader execution remains unverified. Exact metrics and limitations: branch docs/ANNO-BLUR-DIAGNOSIS.md and COMMS. Opus retains production fix and moving-camera verification.
+
+Original game DLL7753F5A9... and exact engine.ini91683D81... restored and verified. Game closed. Capture tooling caused exit-only c0000409 after both successful captures; not production-qualified. No rendering correction remains deployed, no new review cycle requested.
+
+
+## 2026-10-27 — SER insertion milestone
+
+PR50 astra/insertion-detector head23b268a (production146b3a8), stacked on PR44/9f7dd95. Scene RT→read transitions now provide stable inline boundary when bound-SRV detection misses final consumers; pooled command-list learning operates across submitted frame. Real Devil's Cauldron run6:6167/6170 gameplay Presents covered (99.95%), depth diagnostic visibly reaches full scene while HUD stays intact. Normal picture restored, DLAA enabled, game left running with working DLL EEC7316B. Original DLL/INI backups and hashes: local/ser-insertion-20261027/manifest.json; run6-status.log evidence. No new restart needed. Rare changed boundaries remain (later writes9→27); not100% coverage, full temporal quality or universal insertion qualification. Inline jitter and previous exit-crash qualification remain outstanding. Opus asked for focused PR50 review through COMMS; no duplicate deployment. WORKLOG on branch has tests and exact measurements.
+
+
+## 2026-10-27 — remaining SER misses/quality follow-up prepared
+
+PR50 b8a266c adds producer-based boundary matching and coherent inline raster/NGX jitter, including full-scan injected-matrix recognition. Release and8/8 focused tests pass; live verification pending. Prepared DLL AA8BAE40569ED63B0F379307B72935449372BE5C341E16A8084F36F656EBA61E not deployed. Current working146b3a8/EEC7316B stays installed. Desktop tool could not restore minimized game1052424 after documented recovery; user asked asynchronously to restore once. Resume with fresh window binding, combine reversible deployment/restart, measure misses/late writes/jitter and visual quality. Opus review not present in COMMS/PR reviews at latest check; focused review requested. Do not report remaining misses/image quality complete from fixture results.
+
+
+## 2026-10-27 — Astra: SER run8, insertion and record-first jitter
+
+Supersedes earlier minimized-game/live-blocked status. PR50 head7b28ffc; production90144fc DLL3F2765A21C7B875B7F4D58D3CA22907C65EB80B6BEE234CAB576E77F69951904 deployed in SER bin. GamePID35488 left running, DLAAOn, jitterOn, debugOff, sharpness0, presetK, Homeclosed. Original and run6/run7 DLL backups plus manifest/logs in C:/Users/Cort/NeuralAliasAbundance/local/ser-insertion-20261027. Worktree astra-insertion-detector clean/pushed.
+
+Run7:10985/10985 sampled gameplay frames covered, later writes0, jitter0. Run8 record-first scheduling correction:3024/3024 sampled gameplay frames covered and nonzero selected-camera-buffer/NGX jitter; later writes0. Fine-motion diagnostic black on stationary scene with jitterOn, depth output reaches image. Eight focused tests pass including record-first matrix/NGX alignment and previously-submitted-unpatched-camera case. Sharpness0 removes added grit; normal/native still comparison completed.
+
+Not complete: independent all-pass raster jitter displacement, moving-image quality, and exit crash (run7 c0000005 dxgi0xe55e3). Existing capture utility is currently native-NGX-observer-wired; a focused J2 input capture would settle full raster jitter alignment, without implementing the separate full recorder. No Opus review found in COMMS or PR50; request posted. Do not claim universal compatibility or all quality issues solved. No crash report sent.
+
+### 2026-10-28 — Astra milestone: Sniper combined placement candidate
+
+PR54 (astra/sniper-consistent-placement, 371adc3) includes pending Opus PR53 plus complete-frame profile collection, same-frame separate-list consumer fallback, cross-list producer qualification and barrier entry-state evidence. Release NeuralAliasDXGI builds. No local tests/game execution/deployment; Cort tests. Both Documents installers will fetch this branch. Next evidence: user runs each game, compare j2_summary scene/missed/placed_before_scene_work and j2_profile between_observed; assess visible flicker. Do not call live coverage fixed before that evidence. Detailed journal is on the production branch WORKLOG; COMMS records ownership and log corrections.
