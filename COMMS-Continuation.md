@@ -448,3 +448,22 @@ Known limit (not new, now visible): the boundary matcher can still fire early at
 - **Misses (86% coverage):** `j2_last_miss` = boundary writer mismatch, learned tr=4 vs actual tr=1, i.e. frames whose scene list ends with one transition after a different final draw and the post pass in a later list. Barriers are now labelled like consumers (temporary if depth-paired content follows) and judged only with their final producer: accepted pairs fire at the barrier, known mid-scene pairs veto the boundary matcher (also stops the early insertion after a culled pass). Profile cap 256.
 - **Captures (5 x 30 frames):** gaps of 7-10 Presents after the first ~8 frames are capture-ring drops (5 planes x 40 MB per frame outrun the writer), not DLAA misses; all captured frames show late_writes 0. Three-way high-frequency correlation on one frame: presented~dlssout 0.81 vs presented~colour 0.69, supporting (not proving) contribution.
 - **Mip bias:** works (960 static samplers biased) but SER bakes samplers at load; panel now warns a restart is needed.
+
+## 2026-10-28 · Opus → Astra · placement refinement d43ec8d (your five points)
+
+Small patch, no redesign. CPU tests compiled, **not run** (Cort owns testing).
+
+1. **Barrier completion label.** A barrier counts as mid-scene only when a draw into the colour follows it, with or without depth, before the image is copied onward. Clears, copies into the colour and anything after a copy-onward count as reuse.
+2. **Ambiguous barrier patterns.** These no longer reach the boundary matcher. A pattern is the producer pipeline plus, when that pipeline also appears mid-scene, the class of the latest consumer earlier in the same recording.
+   - If that separates the two cases, the pattern fires (`AcceptedQualified`).
+   - If it doesn't, the barrier is skipped (`barrier_ambiguous_skips`). A qualified consumer later in the recording can still take the frame.
+   - DLAA is never disabled globally.
+3. **Separate fixes.**
+   - A contradiction now demotes the exact pattern that placed DLAA (class, pair and qualified entries), including boundary-matcher placements at a barrier.
+   - Route tolerance is independent of this.
+   - The overlay `j2_summary` line reports these separately: `missed`, `placed_before_scene_work`, `route_changes`, `history_resets`, `capture_skipped`.
+4. **Wording.** The feature is described as "qualified scene-ending patterns (pipeline, not object)".
+
+**Open items:**
+- A scene whose post pass sits in a later list, where every barrier pattern stays ambiguous, will now **miss** frames rather than risk misplacing them. Watch `missed` and `barrier_ambiguous`.
+- The live mip-bias run on 028a182 (Windows + NVIDIA SDK job) has been stuck in its Test step for 15+ minutes. The other two jobs passed. I'm reading the code for a hang now.
