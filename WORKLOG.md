@@ -261,3 +261,11 @@ Source fixes:
 - At an inline colour barrier callback, use the first selected-subresource transition's StateBefore in that batch as entry-state evidence. Depth read-only use no longer loses an available explicit state just because prior GPU work is in flight. END_ONLY and aliasing do not provide such entry evidence.
 
 Build: Release NeuralAliasDXGI target completed with installed NVIDIA SDKs. Initial target name na_host_dx12 was wrong (MSB1009); corrected to host_dx12, then built the actual NeuralAliasDXGI DLL. git diff --check clean. No tests executed per Cort's instruction. Live coverage and visual flicker remain unverified until his run; these are concrete implementation fixes, not a claim of 100% coverage. Existing unknown input/consumer cases still report a miss rather than inventing resource states or placing after a consumed image.
+
+### 2026-10-28 — Astra: focused depth/drift repair after failed SE5 run
+
+Cort confirmed 8cbc62d regression: drift persists, DLAA engagement much worse. Installer receipt/hash prove current build; scene9786/executed1916/missed7870; depth refusal attempts12816, NGX failures0. Stopped broader work, retained it in stash named astra: unfinished broader placement-camera changes; set aside for measured depth/drift repair. Cort now explicitly authorizes automated CPU/DX12 regression runs, leaving games to him.
+
+Reproduced old single-sample jitter rebasing drift with rotating upload ranges; replaced by exact per-resource/offset write ledger. Reproduced placed-depth carried-state exclusion on RTX5070Ti by restoring old eligibility predicate (expected failure), then restored fixed predicate; named/wildcard alias cases and three-way state lookup checked. Added explicit live refusal facts because prior log cannot identify the game's allocation kind/precise state-store failure. Source corrections and controlled repros are proven, live causal completeness is not. Full details, old-path drift numbers, initial fixture failures/corrections and vendor guidance links: docs/SNIPER-DEPTH-DRIFT-REPAIR.md.
+
+Release NeuralAliasDXGI build and focused12/12 tests passed (34.90s). No game run/deployment. Preparing a pinned installer candidate; do not claim both live problems or all known gaps closed until user evidence confirms them.

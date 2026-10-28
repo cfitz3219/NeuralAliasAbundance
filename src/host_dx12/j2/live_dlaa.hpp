@@ -96,6 +96,7 @@ struct Stats {
     int64_t camera_proj_delta = 0; // bytes to the camera's separate projection matrix (0 = none found)
     uint64_t jitter_proj_writes = 0; // J1: projection matrices replaced by jittered copies
     uint64_t jitter_rebased = 0;     // frames whose camera block still held the previous sample (game did not re-upload)
+    char depth_state_evidence[256] = {}; // last refusal's recording/store facts, not an inferred cause
     // J1 coverage: lists drawn after this frame's DLAA that still use the jittered
     // camera / the scene depth (unresolved shake), and camera-slot blocks holding a
     // different camera (not jittered).

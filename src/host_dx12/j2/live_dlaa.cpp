@@ -3,6 +3,7 @@
 #include "host_dx12/j2/nis_sharpen.hpp"
 #include "host_dx12/j2/route_selector.hpp"
 #include "host_dx12/j2/consumer_profile.hpp"
+#include "host_dx12/j2/jitter_writes.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 #include "host_dx12/upscalers/ffx_intercept.hpp"
@@ -118,6 +119,7 @@ struct State {
     // accepted class, else the boundary matcher decides as before.
     na::j2::ConsumerProfile profile;
     SceneInput waiting_scene;
+    JitterWrites jitter_writes;
     std::vector<na::j2::ColorEvent> frame_seq; // this frame's writes/consumers of the colour, submission order
     bool frame_seq_complete = true;
     uint64_t scene_color_id = 0;
@@ -550,8 +552,11 @@ void apply_route_locked(ID3D12CommandQueue* queue)
 // subresource alone (depth vs stencil plane, one mip or slice) or all of them.
 bool state_after(ID3D12CommandList* const* lists, UINT last, na_object_id id, uint32_t sub, uint32_t* st)
 {
-    for (int i = static_cast<int>(last); i >= 0; --i)
-        if (na::observe::ListLastStateSub(lists[i], id, sub, st)) return true;
+    for (int i = static_cast<int>(last); i >= 0; --i) {
+        const auto evidence = na::observe::ListStateSub(lists[i], id, sub, st);
+        if (evidence == na::observe::StateLookup::Known) return true;
+        if (evidence == na::observe::StateLookup::Unavailable) return false;
+    }
     // Not transitioned in this batch up to the scene: the state it carried in.
     return na::observe::KnownSubStateInCurrentSubmission(id, sub, st);
 }
@@ -616,27 +621,8 @@ bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& in_byt
 {
     const size_t n = in_bytes.size();
     if (g.camera_offset < 0 || static_cast<uint64_t>(g.camera_offset) + 64 > n || !g.w || !g.h) return false;
-    // The jittered matrices are written into the game's own buffer. A game that only
-    // re-uploads its camera when something changed (Sniper Elite 5: camera still, menu
-    // cursor) leaves LAST frame's jittered bytes there; jittering those again every frame
-    // adds the offsets up and the whole picture slides (Cort: "slow drift upwards").
-    // So a block that still holds the previous sample starts from that sample's originals.
-    std::vector<uint8_t> bytes = in_bytes;
-    {
-        const size_t co = static_cast<size_t>(g.camera_offset);
-        const int64_t io64 = g.camera_offset + g.camera_inv_delta;
-        const int64_t po64 = g.camera_proj_delta == INT64_MIN ? -1 : g.camera_offset + g.camera_proj_delta;
-        for (int l = 0; l < 2; ++l)
-            if (!std::memcmp(bytes.data() + co, g.jit.jvp[l], 64)) {
-                std::memcpy(bytes.data() + co, g.jit.vp[l], 64);
-                if (io64 >= 0 && static_cast<uint64_t>(io64) + 64 <= n && !std::memcmp(bytes.data() + io64, g.jit.jinv[l], 64))
-                    std::memcpy(bytes.data() + io64, g.jit.inv[l], 64);
-                if (g.jit.has_proj && po64 >= 0 && static_cast<uint64_t>(po64) + 64 <= n && !std::memcmp(bytes.data() + po64, g.jit.jproj, 64))
-                    std::memcpy(bytes.data() + po64, g.jit.proj, 64);
-                ++g.stats.jitter_rebased;
-                break;
-            }
-    }
+    // jitter_batch has normalized this exact buffer range using the write ledger.
+    const auto& bytes = in_bytes;
     for (auto layout : {na::camera::Layout::RowMajor, na::camera::Layout::ColumnMajor}) {
         const auto m = na::camera::LoadMatrix(bytes, static_cast<size_t>(g.camera_offset), layout);
         na::camera::Candidate c{};
@@ -744,6 +730,7 @@ void jitter_batch(ID3D12CommandList* const* lists, UINT count)
         const uint32_t n = na::observe::ReadBuffer(k->res, k->off, bytes.data(), k->size);
         if (n < 64) continue;
         std::vector<uint8_t> view(bytes.begin(), bytes.begin() + n);
+        g.stats.jitter_rebased += g.jitter_writes.Normalize(k->res, k->off, view.data(), view.size());
         const auto holds = [&](const uint8_t (&m)[2][64]) {
             for (size_t o = 0; o + 64 <= n; o += 16)
                 if (!std::memcmp(view.data() + o, m[0], 64) || !std::memcmp(view.data() + o, m[1], 64)) return true;
@@ -787,7 +774,9 @@ void jitter_batch(ID3D12CommandList* const* lists, UINT count)
                 if (!std::memcmp(view.data() + o, g.jit.vp[l], 64)) rep = g.jit.jvp[l];
                 else if (!std::memcmp(view.data() + o, g.jit.inv[l], 64)) rep = g.jit.jinv[l];
                 else if (l == 0 && g.jit.has_proj && !std::memcmp(view.data() + o, g.jit.proj, 64)) { rep = g.jit.jproj; ++g.stats.jitter_proj_writes; }
-                if (rep && na::observe::WriteBuffer(k->res, k->off + o, rep, 64) == 64) {
+                if (rep && g.jitter_writes.Apply(k->res, k->off + o, view.data() + o, rep, [&] {
+                    return na::observe::WriteBuffer(k->res, k->off + o, rep, 64) == 64;
+                })) {
                     ++g.stats.jitter_writes;
                     if (rep == g.jit.jvp[l]) g.jit.applied = true;
                 }
@@ -989,7 +978,9 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     uint32_t sc = 0, sd = 0;
     // Inline: the state recorded so far in this list, else the state all submitted work left.
     const auto state_now = [&](na_object_id id, uint32_t sub, uint32_t* st) {
-        return na::observe::ListLastStateSub(inl, id, sub, st) || na::observe::KnownSubStateNow(id, sub, st);
+        const auto evidence = na::observe::ListStateSub(inl, id, sub, st);
+        return evidence == na::observe::StateLookup::Known ||
+               (evidence == na::observe::StateLookup::Absent && na::observe::KnownSubStateNow(id, sub, st));
     };
     const auto entry_state = [&](na_object_id id, uint32_t sub, uint32_t* st) {
         return prefix ? state_after(lists, prefix - 1, id, sub, st)
@@ -1000,6 +991,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (!have_sc || !have_sd) {
         ++g.stats.no_state;
         if (!have_sc) ++g.stats.no_state_color; else ++g.stats.no_state_depth;
+        if (!have_sd) na::observe::DescribeStateEvidence(inl ? inl : saved ? nullptr : lists[scene], depth_id, dsub,
+                                                        g.stats.depth_state_evidence, sizeof g.stats.depth_state_evidence);
         reason(!have_sc ? "Waiting: the scene colour's state at the end of the scene pass is not established."
                         : "Waiting: the scene depth's state at the end of the scene pass is not established.");
         return false;
@@ -2066,6 +2059,7 @@ void Shutdown()
     g.frame_reject_text[0] = 0;
     g.profile.Clear();
     g.waiting_scene = {};
+    g.jitter_writes.Clear();
     g.frame_seq.clear();
     g.frame_seq_complete = true;
     g.scene_color_id = 0;

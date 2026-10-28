@@ -642,11 +642,11 @@ void note_resource(ID3D12Device* dev, IUnknown* obj, uint32_t creation_kind, ID3
         bi.width = d.Width;
         bi.cpu_visible = cpu_visible;
     }
-    // G3-06: committed, non-simultaneous textures are eligible for carried
-    // state from creation (a COMMON creation state is recorded but never
-    // usable until an explicit transition). Placed/reserved resources alias
-    // and are never eligible; simultaneous-access textures decay.
-    if (creation_kind == NA_CREATE_COMMITTED && d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+    // Placed textures also have persistent states. Named aliasing barriers
+    // invalidate their entries; wildcard barriers invalidate the whole store.
+    // Reserved/tiled and simultaneous-access resources remain outside this store.
+    if ((creation_kind == NA_CREATE_COMMITTED ||
+         (creation_kind == NA_CREATE_PLACED && (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))) && d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
         !(d.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS))
         known_created(id, static_cast<uint32_t>(initial));
     if (va) {
@@ -2467,9 +2467,9 @@ struct On<sl::list::ResourceBarrier> {
         // overflow of the recording's evidence store still invalidates it
         // (C9B-R4). BEGIN_ONLY leaves the state pending until its END_ONLY half.
         // Aliasing barriers make the named resources' states unknown (both
-        // sides). Only placed/reserved resources alias, and those never enter
-        // the carried-state store, so a null (wildcard) aliasing barrier needs
-        // no store-wide action. Allocation is bounded by the 8192-entry
+        // sides). A wildcard alias can name ANY placed resource, so it marks
+        // this recording incomplete and invalidates carried states at submission.
+        // Allocation is bounded by the 8192-entry
         // recording store before anything proportional to n is reserved.
         constexpr size_t kMaxStates = 8192;
         std::vector<ListState::StateNote> add;
@@ -2490,6 +2490,7 @@ struct On<sl::list::ResourceBarrier> {
                 push(id, b[i].Transition.Subresource, begin_only ? kStatePending : static_cast<uint32_t>(b[i].Transition.StateAfter));
                 if (used.size() < 2 * kMaxListUses) used.push_back(id);
             } else if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) {
+                if (!b[i].Aliasing.pResourceBefore || !b[i].Aliasing.pResourceAfter) overflow = true;
                 const na_object_id before = i < m ? out[i].resource : resource_id(b[i].Aliasing.pResourceBefore);
                 const na_object_id after = i < m ? out[i].resource_after : resource_id(b[i].Aliasing.pResourceAfter);
                 for (na_object_id id : {before, after})
@@ -4783,22 +4784,26 @@ uint32_t ListTargetsAfter(ID3D12CommandList* list, na_object_id color, na_object
 // State of ONE subresource after `list`: the last barrier naming that subresource
 // or all of them. Games commonly transition depth and stencil planes (or mips,
 // array slices) separately; the whole-resource query refuses those.
-bool ListLastStateSub(ID3D12CommandList* list, na_object_id id, uint32_t sub, uint32_t* state)
+StateLookup ListStateSub(ID3D12CommandList* list, na_object_id id, uint32_t sub, uint32_t* state)
 {
     std::shared_lock<std::shared_mutex> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
-    if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
+    if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return StateLookup::Unavailable;
     std::lock_guard<std::mutex> bl(ls->bind_m);
-    if (!ls->evidence_complete) return false;
+    if (!ls->evidence_complete) return StateLookup::Unavailable;
     for (auto it = ls->states.rbegin(); it != ls->states.rend(); ++it) {
         if (it->resource != id) continue;
         if (it->subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && it->subresource != sub) continue; // another plane/mip/slice
-        if (it->state_after == kStatePending) return false;
+        if (it->state_after == kStatePending) return StateLookup::Unavailable;
         *state = it->state_after;
-        return true;
+        return StateLookup::Known;
     }
-    return false;
+    return StateLookup::Absent;
+}
+bool ListLastStateSub(ID3D12CommandList* list, na_object_id id, uint32_t sub, uint32_t* state)
+{
+    return ListStateSub(list, id, sub, state) == StateLookup::Known;
 }
 bool ListLastState(ID3D12CommandList* list, na_object_id id, uint32_t* state)
 {
@@ -4886,6 +4891,38 @@ bool KnownSubStateNow(na_object_id id, uint32_t sub, uint32_t* state)
     if (v == kStatePending || v == D3D12_RESOURCE_STATE_COMMON) return false;
     *state = v;
     return true;
+}
+void DescribeStateEvidence(ID3D12CommandList* list, na_object_id id, uint32_t sub, char* text, size_t capacity)
+{
+    uint32_t kind = NA_UNKNOWN_U32;
+    bool covered = false, complete = false;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_m);
+        const auto key = g_res_keys.find(id);
+        if (key != g_res_keys.end()) {
+            const auto obj = g_objs.find(key->second);
+            if (obj != g_objs.end() && obj->second.created.size() >= sizeof(na_ev_resource_created))
+                kind = reinterpret_cast<const na_ev_resource_created*>(obj->second.created.data())->creation_kind;
+        }
+        na_object_id lid = 0;
+        auto* ls = list ? list_state_locked(list, &lid) : nullptr;
+        if (ls) {
+            std::lock_guard<std::mutex> bl(ls->bind_m);
+            covered = ls->recording_observed.load() && ls->coverage_complete.load();
+            complete = ls->evidence_complete;
+        }
+    }
+    std::lock_guard<std::mutex> lock(g_known_m);
+    const auto k = g_known.find(id);
+    uint32_t value = kStatePending;
+    if (k != g_known.end()) {
+        const auto s = k->second.subs.find(sub);
+        value = s != k->second.subs.end() ? s->second : k->second.has_all ? k->second.all : kStatePending;
+    }
+    std::snprintf(text, capacity, "kind=%u list_covered=%u list_complete=%u registered=%u state=0x%x marks=%u unknown_submissions=%u disabled=%u unhooked_queues=%llu",
+                  kind, covered ? 1u : 0u, complete ? 1u : 0u, k != g_known.end() ? 1u : 0u, value,
+                  k != g_known.end() ? k->second.in_flight : 0u, g_unknown_inflight,
+                  g_known_disabled.load() ? 1u : 0u, static_cast<unsigned long long>(g_unhooked_queues.load()));
 }
 bool KnownSubStateInCurrentSubmission(na_object_id id, uint32_t sub, uint32_t* state)
 {
