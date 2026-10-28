@@ -8,6 +8,10 @@ on:
     branches: ["main", "claude/**", "astra/**"]
   pull_request:
 
+permissions:
+  contents: read
+  pull-requests: write # failing-test output is posted on the branch's PR (annotations cap at 10 lines)
+
 jobs:
   windows:
     name: Windows x64 (MSVC) build + non-GPU tests
@@ -66,7 +70,10 @@ jobs:
       - name: Report failing tests as annotations
         if: failure()
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          $posted = $false
           $log = 'build/Testing/Temporary/LastTest.log'
           if (Test-Path $log) {
             # Last output lines of every failed / timed-out test, named (raw job logs are not readable by agents).
@@ -79,7 +86,14 @@ jobs:
                   # Last 12 lines, or the whole exit-watchdog dump when there is one (main thread first).
                   $wd = $buf.FindIndex({ param($x) $x -match 'exit watchdog: still running' })
                   $tail = if ($wd -ge 0) { $buf.GetRange($wd, $buf.Count - $wd) } else { $buf | Select-Object -Last 12 }
-                  $tail | Select-Object -First 80 | ForEach-Object { Write-Output "::error::[$name] $_" }; Write-Output "::error::[$name] $l"
+                  $tail | Select-Object -First 12 | ForEach-Object { Write-Output "::error::[$name] $_" }; Write-Output "::error::[$name] $l"
+                  if ($wd -ge 0 -and -not $posted) {
+                    # GitHub keeps only 10 error annotations per step, so the first watchdog dump goes on the PR.
+                    $body = "**Exit watchdog on ``$name`` (" + '${{ github.sha }}' + ")**`n`n``````text`n" + (($tail | Select-Object -First 120) -join "`n") + "`n``````"
+                    $body | Set-Content -Path watchdog.md
+                    gh pr comment '${{ github.ref_name }}' --body-file watchdog.md 2>&1 | Write-Output
+                    $posted = $true
+                  }
                 }
                 continue
               }
@@ -145,7 +159,7 @@ jobs:
         shell: pwsh
         run: |
           Select-String -Path build/CMakeCache.txt -Pattern '^NA_(SDK_ROOT|NGX_SDK_INCLUDE|PCL_INCLUDE|NVOF_INCLUDE|XESS_INCLUDE)' | ForEach-Object { Write-Output "::notice::$($_.Line)" }
-          ctest --test-dir build -C Release --output-on-failure -LE gpu --verbose 2>&1 | Tee-Object -FilePath ctest-log.txt
+          ctest --test-dir build -C Release --output-on-failure -LE gpu --verbose -j 4 2>&1 | Tee-Object -FilePath ctest-log.txt
           $code = $LASTEXITCODE
           Select-String -Path ctest-log.txt -Pattern 'Test +#\d+: .*(Passed|Failed|Skipped|Not Run|\*\*\*)|tests passed|tests failed' |
             ForEach-Object {
@@ -156,7 +170,10 @@ jobs:
       - name: Report failing tests as annotations
         if: failure()
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          $posted = $false
           $log = 'build/Testing/Temporary/LastTest.log'
           if (Test-Path $log) {
             # Last output lines of every failed / timed-out test, named (raw job logs are not readable by agents).
@@ -169,7 +186,14 @@ jobs:
                   # Last 12 lines, or the whole exit-watchdog dump when there is one (main thread first).
                   $wd = $buf.FindIndex({ param($x) $x -match 'exit watchdog: still running' })
                   $tail = if ($wd -ge 0) { $buf.GetRange($wd, $buf.Count - $wd) } else { $buf | Select-Object -Last 12 }
-                  $tail | Select-Object -First 80 | ForEach-Object { Write-Output "::error::[$name] $_" }; Write-Output "::error::[$name] $l"
+                  $tail | Select-Object -First 12 | ForEach-Object { Write-Output "::error::[$name] $_" }; Write-Output "::error::[$name] $l"
+                  if ($wd -ge 0 -and -not $posted) {
+                    # GitHub keeps only 10 error annotations per step, so the first watchdog dump goes on the PR.
+                    $body = "**Exit watchdog on ``$name`` (" + '${{ github.sha }}' + ")**`n`n``````text`n" + (($tail | Select-Object -First 120) -join "`n") + "`n``````"
+                    $body | Set-Content -Path watchdog.md
+                    gh pr comment '${{ github.ref_name }}' --body-file watchdog.md 2>&1 | Write-Output
+                    $posted = $true
+                  }
                 }
                 continue
               }
