@@ -272,6 +272,37 @@ int main()
     CHECK(fake::allocs == fake::destroys);
     CHECK(!na::dlss::GetCapabilities().attached);
 
+    // Render preset: requested at creation for the mode in use (J2: preset L = 12);
+    // the default is NVIDIA's own; changing the preset recreates the feature.
+    REQUIRE(na::dlss::Attach(d.device.Get(), fake::MakeApi()));
+    {
+        const int c0 = fake::creates;
+        test::List pl;
+        auto e = Desc(1920, 1080, 1920, 1080);
+        e.quality = Quality::DLAA;
+        e.preset = NVSDK_NGX_DLSS_Hint_Render_Preset_L;
+        REQUIRE(Record(d, pl, e));
+        CHECK(fake::creates == c0 + 1);
+        CHECK(fake::U(fake::last_create, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA) == NVSDK_NGX_DLSS_Hint_Render_Preset_L);
+        CHECK(na::dlss::GetStats().feature_preset == NVSDK_NGX_DLSS_Hint_Render_Preset_L);
+        Submit(d.queue.Get(), pl);
+        d.WaitIdle();
+        test::List same;
+        REQUIRE(Record(d, same, e));
+        CHECK(fake::creates == c0 + 1); // same preset: same feature
+        Submit(d.queue.Get(), same);
+        d.WaitIdle();
+        test::List def;
+        e.preset = 0;
+        REQUIRE(Record(d, def, e));
+        CHECK(fake::creates == c0 + 2); // preset changed: recreated
+        CHECK(fake::U(fake::last_create, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA) == NVSDK_NGX_DLSS_Hint_Render_Preset_Default);
+        Submit(d.queue.Get(), def);
+        d.WaitIdle();
+    }
+    na::dlss::Shutdown();
+    CHECK(fake::allocs == fake::destroys);
+
     // Create failure latches too; unavailable runtime refuses to evaluate.
     REQUIRE(na::dlss::Attach(d.device.Get(), fake::MakeApi()));
     fake::create_result = NVSDK_NGX_Result_FAIL_OutOfDate;

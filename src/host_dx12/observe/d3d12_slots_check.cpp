@@ -79,3 +79,5 @@ NA_SLOT(ID3D12GraphicsCommandListVtbl, OMSetRenderTargets, s::list::OMSetRenderT
 NA_SLOT(ID3D12GraphicsCommandListVtbl, ClearDepthStencilView, s::list::ClearDepthStencilView);
 NA_SLOT(ID3D12GraphicsCommandListVtbl, ClearRenderTargetView, s::list::ClearRenderTargetView);
 NA_SLOT(ID3D12GraphicsCommandListVtbl, ExecuteIndirect, s::list::ExecuteIndirect);
+NA_SLOT(ID3D12GraphicsCommandList4Vtbl, BeginRenderPass, s::list::BeginRenderPass);
+NA_SLOT(ID3D12GraphicsCommandList4Vtbl, EndRenderPass, s::list::EndRenderPass);

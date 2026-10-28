@@ -152,7 +152,7 @@ struct Feature {
     bool retired = false;      // no longer current for any view
     uint32_t outstanding = 0;  // tracked evaluations not yet proven complete
     bool tainted = false;      // some use can never be proven complete: release only at Shutdown
-    uint32_t render_w = 0, render_h = 0, out_w = 0, out_h = 0, flags = 0;
+    uint32_t render_w = 0, render_h = 0, out_w = 0, out_h = 0, flags = 0, preset = 0;
     Quality quality = Quality::MaxQuality;
 };
 
@@ -571,7 +571,7 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
     const uint32_t create_w = d.max_render_w ? d.max_render_w : d.render_w;
     const uint32_t create_h = d.max_render_h ? d.max_render_h : d.render_h;
     bool fits = cur && !cur->tainted && cur->out_w == d.out_w && cur->out_h == d.out_h && cur->flags == flags &&
-                      cur->quality == d.quality && create_w <= cur->render_w && create_h <= cur->render_h;
+                      cur->quality == d.quality && cur->preset == d.preset && create_w <= cur->render_w && create_h <= cur->render_h;
     // A submitted predecessor supplies a fence dependency. A predecessor on
     // this same list is ordered by the list itself. Separate unsubmitted lists
     // may execute in either order: give the new recording independent history
@@ -617,6 +617,15 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
         p->Set(NVSDK_NGX_Parameter_PerfQualityValue, static_cast<int>(d.quality));
         p->Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, static_cast<int>(flags));
         p->Set(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
+        {   // Every mode's hint: NGX reads the one matching PerfQualityValue.
+            const unsigned int pr = d.preset ? d.preset : static_cast<unsigned int>(NVSDK_NGX_DLSS_Hint_Render_Preset_Default);
+            p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, pr);
+            p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality, pr);
+            p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, pr);
+            p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance, pr);
+            p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, pr);
+            p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality, pr);
+        }
         NVSDK_NGX_Handle* h = nullptr;
         const NVSDK_NGX_Result r = reinterpret_cast<PfnCreate>(g.api.create_feature)(list, NVSDK_NGX_Feature_SuperSampling, p, &h);
         g.stats.last_ngx_result = static_cast<int32_t>(r);
@@ -636,6 +645,7 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
         nf.out_h = d.out_h;
         nf.flags = flags;
         nf.quality = d.quality;
+        nf.preset = d.preset;
         retire_feature_locked(view.feature); // released once every use of it has completed
         view.feature = slot;
         view.needs_reset = true;
@@ -645,6 +655,7 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
         g.stats.feature_out_w = d.out_w;
         g.stats.feature_out_h = d.out_h;
         g.stats.feature_flags = flags;
+        g.stats.feature_preset = d.preset;
         collect_locked(); // the retired feature may already be free of uses
     }
     Feature& ft = g.features[view.feature];

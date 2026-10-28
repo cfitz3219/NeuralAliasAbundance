@@ -65,6 +65,16 @@ struct Settings {
     // Neural Rendering (A30, [nr] section). Off by default; percentages 0..100.
     std::atomic<uint32_t> nr_enabled{0};
     std::atomic<uint32_t> nr_intensity{100};
+    std::atomic<uint32_t> j2_sharpness{100}; // J2 DLAA sharpening 0..200: RCAS 0..100, + NIS 101..200 (0 = off; Cort's default 100)
+    std::atomic<int32_t> j2_mip_bias_x100{-100}; // J2 texture detail: [j2] mip_bias x 100 (0, -50, -100); read at game start
+    std::atomic<bool> j2_inline{false}; // legacy [j2] inline=1: same as route=inline (diagnostic override)
+    std::atomic<uint32_t> j2_route{0};  // [j2] route: 0 auto (default), 1 between, 2 inline (diagnostic overrides)
+    // J2 evidence capture ([j2] per game): frames per capture, hotkey (virtual-key code),
+    // and an optional automatic capture N seconds after start (0 = only on request).
+    std::atomic<uint32_t> j2_capture_frames{30};
+    std::atomic<uint32_t> j2_capture_key{0x77}; // F8
+    std::atomic<uint32_t> j2_capture_after_s{0};
+    std::atomic<uint32_t> j2_preset{12};     // J2 DLAA: DLSS render preset ([j2] preset=L; 12 = L, 0 = NVIDIA default)
     std::atomic<uint32_t> nr_structure{100};
     std::atomic<uint32_t> nr_tone{0};
     std::atomic<uint32_t> nr_skin{100};

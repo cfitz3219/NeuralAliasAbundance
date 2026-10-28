@@ -131,6 +131,9 @@ struct EvalDesc {
     float exposure_scale = 1.f; // multiplier applied to colour before upscaling (DLSS.Exposure.Scale)
     uint64_t view_id = 0;       // source of these frames (see Views above); 0 = the default view
     Quality quality = Quality::MaxQuality;
+    // DLSS render preset (NVSDK_NGX_DLSS_Hint_Render_Preset_*: 10 J, 11 K, 12 L, 13 M);
+    // 0 = NVIDIA's default for the quality mode. Applied when the feature is created.
+    uint32_t preset = 0;
     bool reset = false;
     bool hdr = false;            // linear HDR colour (IsHDR)
     bool depth_inverted = false; // reversed-Z
@@ -230,6 +233,7 @@ struct Stats {
     uint32_t views_active = 0;
     uint32_t feature_render_w = 0, feature_render_h = 0, feature_out_w = 0, feature_out_h = 0;
     uint32_t feature_flags = 0;
+    uint32_t feature_preset = 0; // render preset requested at creation (0 = default)
     int32_t last_ngx_result = 0;
     char reason[128] = {};
 };

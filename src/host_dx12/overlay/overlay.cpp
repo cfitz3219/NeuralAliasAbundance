@@ -18,6 +18,7 @@
 #include <imgui_impl_win32.h>
 
 #include "host_dx12/capture/frame_capture.hpp"
+#include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/upscalers/ffx_intercept.hpp"
@@ -31,6 +32,7 @@
 #include "host_dx12/ngx_observe/gpu_timing.hpp"
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 #include "host_dx12/nr/nr_pass.hpp"
+#include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/overlay/menu.hpp"
 #include "host_dx12/overlay/na_style.hpp"
 #include "host_dx12/overlay/presenter.hpp"
@@ -140,21 +142,28 @@ bool g_window_dirty = false;
 // read raw input on a hidden window or through GetRawInputBuffer, poll
 // GetAsyncKeyState/GetKeyboardState, or track GetCursorPos deltas and
 // re-centre with SetCursorPos. These user32 entry points are hooked once at
-// Start; calls from OUR render thread pass through (the menu needs the real
-// cursor), everything else sees a frozen cursor, no buttons and no keys.
+// Start. Only the overlay's OWN reads pass through (it needs the real cursor):
+// t_overlay_input is set while the menu is being drawn. It used to exempt the
+// whole render thread, but that is the game's thread too (it calls Present),
+// and many games poll input there: Sniper Elite Resistance fired its gun on
+// every menu click. Everything the game calls sees a frozen cursor, no buttons
+// and no keys.
 using PfnGetRawInputData = UINT(WINAPI*)(HRAWINPUT, UINT, LPVOID, PUINT, UINT);
 using PfnGetRawInputBuffer = UINT(WINAPI*)(PRAWINPUT, PUINT, UINT);
 using PfnGetCursorPos = BOOL(WINAPI*)(LPPOINT);
 using PfnSetCursorPos = BOOL(WINAPI*)(int, int);
 using PfnGetAsyncKeyState = SHORT(WINAPI*)(int);
 using PfnGetKeyboardState = BOOL(WINAPI*)(PBYTE);
+using PfnGetKeyState = SHORT(WINAPI*)(int);
 PfnGetRawInputData g_orig_get_raw_input_data = nullptr;
 PfnGetRawInputBuffer g_orig_get_raw_input_buffer = nullptr;
 PfnGetCursorPos g_orig_get_cursor_pos = nullptr;
 PfnSetCursorPos g_orig_set_cursor_pos = nullptr;
 PfnGetAsyncKeyState g_orig_get_async_key_state = nullptr;
 PfnGetKeyboardState g_orig_get_keyboard_state = nullptr;
-void* g_input_hook_targets[6] = {};
+PfnGetKeyState g_orig_get_key_state = nullptr;
+void* g_input_hook_targets[7] = {};
+thread_local bool t_overlay_input = false; // the overlay itself is reading input (menu drawing)
 std::atomic<uint32_t> g_input_hooks{0};
 std::atomic<DWORD> g_render_thread{0};
 std::atomic<LONG> g_frozen_x{0}, g_frozen_y{0}; // what the game sees as the cursor while open
@@ -162,7 +171,7 @@ std::atomic<LONG> g_frozen_x{0}, g_frozen_y{0}; // what the game sees as the cur
 inline bool lock_input_for_this_thread()
 {
     return g_open.load(std::memory_order_acquire) && g_initialized.load(std::memory_order_acquire) &&
-           GetCurrentThreadId() != g_render_thread.load(std::memory_order_relaxed);
+           !t_overlay_input;
 }
 void neutralise_raw(RAWINPUT* ri)
 {
@@ -223,20 +232,85 @@ BOOL WINAPI DetourGetKeyboardState(PBYTE state)
     if (r && state && lock_input_for_this_thread()) memset(state, 0, 256);
     return r;
 }
+SHORT WINAPI DetourGetKeyState(int vk)
+{
+    // Mouse buttons and keys read through GetKeyState (VK_LBUTTON is common for "fire").
+    if (lock_input_for_this_thread()) return 0;
+    return g_orig_get_key_state(vk);
+}
+// DirectInput 8 (keyboard/mouse through IDirectInputDevice8::GetDeviceState /
+// GetDeviceData). The device methods live in dinput8.dll and are shared by
+// every device, so they are hooked once, found through a keyboard device of
+// our own (A and W interfaces). Locked: state reads as all-zero (no keys, no
+// buttons, no motion) and buffered events are drained and dropped.
+using PfnDI8Create = HRESULT(WINAPI*)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
+using PfnDIGetDeviceState = HRESULT(STDMETHODCALLTYPE*)(void*, DWORD, LPVOID);
+using PfnDIGetDeviceData = HRESULT(STDMETHODCALLTYPE*)(void*, DWORD, void*, LPDWORD, DWORD);
+constexpr int kDiSlots = 2; // [0] W, [1] A
+PfnDIGetDeviceState g_orig_di_state[kDiSlots] = {};
+PfnDIGetDeviceData g_orig_di_data[kDiSlots] = {};
+void* g_di_targets[kDiSlots * 2] = {};
+template <int I>
+HRESULT STDMETHODCALLTYPE DetourDIGetDeviceState(void* self, DWORD cb, LPVOID data)
+{
+    const HRESULT r = g_orig_di_state[I](self, cb, data);
+    if (SUCCEEDED(r) && data && cb && lock_input_for_this_thread()) memset(data, 0, cb);
+    return r;
+}
+template <int I>
+HRESULT STDMETHODCALLTYPE DetourDIGetDeviceData(void* self, DWORD cb, void* events, LPDWORD inout, DWORD flags)
+{
+    const HRESULT r = g_orig_di_data[I](self, cb, events, inout, flags);
+    if (SUCCEEDED(r) && inout && lock_input_for_this_thread()) *inout = 0; // drained, not delivered
+    return r;
+}
+void install_dinput_hooks()
+{
+    HMODULE m = LoadLibraryW(L"dinput8.dll"); // pinned: the hooked code must stay loaded
+    if (!m) return;
+    auto create = reinterpret_cast<PfnDI8Create>(GetProcAddress(m, "DirectInput8Create"));
+    if (!create) return;
+    static const GUID kIID_DI8W = {0xBF798031, 0x483A, 0x4DA2, {0xAA, 0x99, 0x5D, 0x64, 0xED, 0x36, 0x97, 0x00}};
+    static const GUID kIID_DI8A = {0xBF798030, 0x483A, 0x4DA2, {0xAA, 0x99, 0x5D, 0x64, 0xED, 0x36, 0x97, 0x00}};
+    static const GUID kSysKeyboard = {0x6F1D2B61, 0xD5A0, 0x11CF, {0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00}};
+    using PfnCreateDevice = HRESULT(STDMETHODCALLTYPE*)(void*, REFGUID, void**, void*);
+    const GUID* iids[kDiSlots] = {&kIID_DI8W, &kIID_DI8A};
+    void* states[kDiSlots] = {reinterpret_cast<void*>(&DetourDIGetDeviceState<0>), reinterpret_cast<void*>(&DetourDIGetDeviceState<1>)};
+    void* datas[kDiSlots] = {reinterpret_cast<void*>(&DetourDIGetDeviceData<0>), reinterpret_cast<void*>(&DetourDIGetDeviceData<1>)};
+    for (int i = 0; i < kDiSlots; ++i) {
+        void* di = nullptr;
+        if (FAILED(create(GetModuleHandleW(nullptr), 0x0800, *iids[i], &di, nullptr)) || !di) continue;
+        void** di_vt = *reinterpret_cast<void***>(di);
+        void* dev = nullptr;
+        if (SUCCEEDED(reinterpret_cast<PfnCreateDevice>(di_vt[3])(di, kSysKeyboard, &dev, nullptr)) && dev) {
+            void** vt = *reinterpret_cast<void***>(dev);
+            void* st = vt[9], *dt = vt[10]; // GetDeviceState, GetDeviceData
+            // The A and W interfaces may share one implementation: hook each function once.
+            bool st_done = false, dt_done = false;
+            for (void* t : g_di_targets) { st_done |= t == st; dt_done |= t == dt; }
+            if (!st_done && na::hooking::HookFunction(st, states[i], reinterpret_cast<void**>(&g_orig_di_state[i]))) g_di_targets[i * 2] = st;
+            if (!dt_done && na::hooking::HookFunction(dt, datas[i], reinterpret_cast<void**>(&g_orig_di_data[i]))) g_di_targets[i * 2 + 1] = dt;
+            static_cast<IUnknown*>(dev)->Release();
+        }
+        static_cast<IUnknown*>(di)->Release();
+    }
+}
 void install_input_hooks()
 {
+    install_dinput_hooks();
     HMODULE u = GetModuleHandleW(L"user32.dll");
     if (!u) return;
-    struct { const char* name; void* detour; void** original; } specs[6] = {
+    struct { const char* name; void* detour; void** original; } specs[7] = {
         {"GetRawInputData", reinterpret_cast<void*>(&DetourGetRawInputData), reinterpret_cast<void**>(&g_orig_get_raw_input_data)},
         {"GetRawInputBuffer", reinterpret_cast<void*>(&DetourGetRawInputBuffer), reinterpret_cast<void**>(&g_orig_get_raw_input_buffer)},
         {"GetCursorPos", reinterpret_cast<void*>(&DetourGetCursorPos), reinterpret_cast<void**>(&g_orig_get_cursor_pos)},
         {"SetCursorPos", reinterpret_cast<void*>(&DetourSetCursorPos), reinterpret_cast<void**>(&g_orig_set_cursor_pos)},
         {"GetAsyncKeyState", reinterpret_cast<void*>(&DetourGetAsyncKeyState), reinterpret_cast<void**>(&g_orig_get_async_key_state)},
         {"GetKeyboardState", reinterpret_cast<void*>(&DetourGetKeyboardState), reinterpret_cast<void**>(&g_orig_get_keyboard_state)},
+        {"GetKeyState", reinterpret_cast<void*>(&DetourGetKeyState), reinterpret_cast<void**>(&g_orig_get_key_state)},
     };
     uint32_t n = 0;
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < 7; ++i) {
         void* target = reinterpret_cast<void*>(GetProcAddress(u, specs[i].name));
         if (target && na::hooking::HookFunction(target, specs[i].detour, specs[i].original)) {
             g_input_hook_targets[i] = target;
@@ -250,6 +324,10 @@ void install_input_hooks()
 }
 void remove_input_hooks()
 {
+    for (void*& t : g_di_targets) {
+        if (t) na::hooking::Unhook(t);
+        t = nullptr;
+    }
     for (void*& t : g_input_hook_targets) {
         if (t) na::hooking::Unhook(t);
         t = nullptr;
@@ -380,6 +458,104 @@ void write_status_line()
                       static_cast<unsigned long long>(g_game_latency_handle.load()),
                       static_cast<unsigned long long>(g_present_queue_identity.load()));
     if (pn > 0) WriteFile(f, pacing, static_cast<DWORD>(pn), &written, nullptr);
+    {
+        const auto j2 = na::j2::GetStats();
+        uint64_t mb_s = 0, mb_st = 0;
+        na::observe::MipBiasCounts(&mb_s, &mb_st);
+        uint64_t sel_depth = 0, sel_color = 0;
+        na::observe::GetLiveSelection(&sel_depth, &sel_color);
+        char jl[1536];
+        int jn = snprintf(jl, sizeof(jl),
+            "j2 on=%u active=%u depth=%llu color=%llu submissions=%llu frames=%llu no_selection=%llu no_scene_list=%llu no_state=%llu (colour %llu depth %llu) no_camera=%llu busy=%llu dlss_failed=%llu cuts=%llu camera_offset=%llu later_passes=%u duplicates=%llu jitter_writes=%llu cam_learned=%llu cam_scans=%llu inv_delta=%lld proj_delta=%lld proj_writes=%llu mip_bias=%.2f biased_samplers=%llu biased_static=%llu post_cam=%llu post_depth=%llu other_cam=%llu reversed=%u preset=%u sharpness=%u nis_frames=%llu scene_batches=%u/%u target=%u waited=%llu post_scene=%llu inline=%u/%u cands=%llu inl_wait=%llu inl_rec=%llu inl_frames=%llu inl_refused=%llu shape=sub%u/mips%u/slices%u/msaa%u depth_slices%u/msaa%u size=%ux%u format=%u \"%s\"\r\n",
+            na::j2::Enabled() ? 1u : 0u, j2.active ? 1u : 0u, static_cast<unsigned long long>(sel_depth), static_cast<unsigned long long>(sel_color),
+            static_cast<unsigned long long>(j2.submissions), static_cast<unsigned long long>(j2.frames), static_cast<unsigned long long>(j2.no_selection),
+            static_cast<unsigned long long>(j2.no_scene_list), static_cast<unsigned long long>(j2.no_state), static_cast<unsigned long long>(j2.no_state_color), static_cast<unsigned long long>(j2.no_state_depth), static_cast<unsigned long long>(j2.no_camera),
+            static_cast<unsigned long long>(j2.busy), static_cast<unsigned long long>(j2.dlss_failed), static_cast<unsigned long long>(j2.cuts),
+            static_cast<unsigned long long>(j2.camera_offset), j2.later_passes, static_cast<unsigned long long>(j2.duplicate_submissions), static_cast<unsigned long long>(j2.jitter_writes), static_cast<unsigned long long>(j2.camera_learned_hits), static_cast<unsigned long long>(j2.camera_scans), static_cast<long long>(j2.camera_inv_delta), static_cast<long long>(j2.camera_proj_delta), static_cast<unsigned long long>(j2.jitter_proj_writes), na::observe::SamplerMipBias(), static_cast<unsigned long long>(mb_s), static_cast<unsigned long long>(mb_st), static_cast<unsigned long long>(j2.post_camera_lists), static_cast<unsigned long long>(j2.post_depth_lists), static_cast<unsigned long long>(j2.other_camera_blocks), j2.depth_reversed ? 1u : 0u, dlss.feature_preset, na::settings::Get().j2_sharpness.load(), static_cast<unsigned long long>(j2.nis_frames), j2.scene_batches, j2.scene_batches_max, j2.scene_batches_target, static_cast<unsigned long long>(j2.waited_batches), static_cast<unsigned long long>(j2.post_scene_batches), j2.inline_mode, j2.inline_target, static_cast<unsigned long long>(j2.inline_candidates), static_cast<unsigned long long>(j2.inline_waited), static_cast<unsigned long long>(j2.inline_recorded), static_cast<unsigned long long>(j2.inline_frames), static_cast<unsigned long long>(j2.inline_refused), j2.color_sub, j2.color_mips, j2.color_slices, j2.color_samples, j2.depth_slices, j2.depth_samples, j2.width, j2.height, j2.color_format, j2.reason);
+        if (jn > 0) WriteFile(f, jl, static_cast<DWORD>((std::min)(jn, static_cast<int>(sizeof(jl) - 1))), &written, nullptr);
+        char coverage[256];
+        const DWORD trace_len = static_cast<DWORD>(std::strlen(j2.insertion_frame_trace));
+        WriteFile(f, "j2_frame", 8, &written, nullptr);
+        WriteFile(f, j2.insertion_frame_trace, trace_len, &written, nullptr);
+        WriteFile(f, "\r\n", 2, &written, nullptr);
+        const int nc = snprintf(coverage, sizeof coverage, "j2_coverage presents=%llu covered=%llu later_writes=%llu jittered=%llu jitter=(%.4f,%.4f)\r\n",
+            (unsigned long long)j2.inline_presents, (unsigned long long)j2.inline_covered,
+            (unsigned long long)j2.inline_late_writes, (unsigned long long)j2.inline_jittered,
+            j2.inline_jitter_x, j2.inline_jitter_y);
+        if (nc > 0) WriteFile(f, coverage, static_cast<DWORD>(nc), &written, nullptr);
+        {
+            static const char* kRoutes[] = {"none", "between", "inline", "interceptor"};
+            static const char* kModes[] = {"auto", "forced-between", "forced-inline"};
+            const auto& rt = j2.route;
+            char rl[640];
+            const int nroute = snprintf(rl, sizeof rl,
+                "j2_route mode=%s route=%s state=%s matches=%u observed=%u gen=%u changes=%llu scene_frames=%llu executed=%llu placement_consistent=%llu contradictions=%llu unstable=%llu contribution=%s reason=\"%s\" missing=\"%s\" change=\"%s\"\r\n",
+                kModes[rt.mode < 3 ? rt.mode : 0], kRoutes[rt.route < 4 ? rt.route : 0], rt.state ? "active" : "observing", rt.matches, rt.observed,
+                rt.generation, (unsigned long long)rt.changes, (unsigned long long)rt.scene_frames, (unsigned long long)rt.executed_frames,
+                (unsigned long long)rt.placement_consistent, (unsigned long long)rt.contradictions, (unsigned long long)rt.unstable_windows,
+                rt.contribution_established ? "established" : "unknown", rt.reason, rt.missing, rt.change);
+            if (nroute > 0) WriteFile(f, rl, static_cast<DWORD>((std::min)(nroute, static_cast<int>(sizeof rl - 1))), &written, nullptr);
+        }
+        if (j2.insertion_last_miss[0]) {
+            WriteFile(f, "j2_last_miss ", 13, &written, nullptr);
+            WriteFile(f, j2.insertion_last_miss, static_cast<DWORD>(std::strlen(j2.insertion_last_miss)), &written, nullptr);
+            WriteFile(f, "\r\n", 2, &written, nullptr);
+        }
+        {
+            const auto& rj = j2.inline_rejects;
+            char rl[400];
+            const int nrej = snprintf(rl, sizeof rl,
+                "j2_inline_rejects no_learned=%llu resource=%llu writer=%llu occurrence=%llu transition=%llu candidate=%llu destination=%llu pipeline=%llu pending=%llu last_frame=%u\r\n",
+                (unsigned long long)rj[0], (unsigned long long)rj[1], (unsigned long long)rj[2], (unsigned long long)rj[3],
+                (unsigned long long)rj[4], (unsigned long long)rj[5], (unsigned long long)rj[6], (unsigned long long)rj[7],
+                (unsigned long long)rj[8], j2.inline_frame_rejects);
+            if (nrej > 0) WriteFile(f, rl, static_cast<DWORD>((std::min)(nrej, static_cast<int>(sizeof rl - 1))), &written, nullptr);
+            char al[700];
+            const int na2 = snprintf(al, sizeof al,
+                "j2_profile accepted=%u rejected=%u ambiguous=%u entries=%u matched{class=%llu pair=%llu barrier=%llu legacy=%llu} rejected_skips=%llu barrier_vetoes=%llu barrier_ambiguous=%llu contradictions{class=%llu barrier=%llu} labelled=%llu unlabelled=%llu expired=%llu between{observed=%llu predicted=%llu} note=\"%s\"\r\n",
+                j2.profile_accepted, j2.profile_rejected, j2.profile_ambiguous, j2.profile_entries,
+                (unsigned long long)j2.class_matched, (unsigned long long)j2.class_pair_matched, (unsigned long long)j2.barrier_matched,
+                (unsigned long long)j2.legacy_matched, (unsigned long long)j2.class_rejected_skips, (unsigned long long)j2.barrier_vetoes,
+                (unsigned long long)j2.barrier_ambiguous_skips, (unsigned long long)j2.class_contradictions, (unsigned long long)j2.barrier_contradictions,
+                (unsigned long long)j2.labelled_frames, (unsigned long long)j2.unlabelled_frames, (unsigned long long)j2.expired_inline,
+                (unsigned long long)j2.between_observed, (unsigned long long)j2.between_predicted, j2.class_note);
+            if (na2 > 0) WriteFile(f, al, static_cast<DWORD>((std::min)(na2, static_cast<int>(sizeof al - 1))), &written, nullptr);
+            const auto cs = na::capture::j2::GetStats();
+            {
+                // Four separate outcomes (Astra): frames without DLAA, DLAA placed before more
+                // scene work, route changes / history resets, captures the recorder skipped.
+                const auto& rt = j2.route;
+                char sl[320];
+                const int ns2 = snprintf(sl, sizeof sl,
+                    "j2_summary scene_frames=%llu missed=%llu placed_before_scene_work=%llu route_changes=%llu history_resets=%llu capture_skipped=%u\r\n",
+                    (unsigned long long)rt.scene_frames,
+                    (unsigned long long)(rt.scene_frames > rt.executed_frames ? rt.scene_frames - rt.executed_frames : 0),
+                    (unsigned long long)rt.contradictions, (unsigned long long)rt.changes, (unsigned long long)j2.history_resets,
+                    cs.dropped_busy);
+                if (ns2 > 0) WriteFile(f, sl, static_cast<DWORD>((std::min)(ns2, static_cast<int>(sizeof sl - 1))), &written, nullptr);
+            }
+            if (cs.requested) {
+                char cl[300];
+                const int nc2 = snprintf(cl, sizeof cl, "j2_capture requested=%u recorded=%u submitted=%u written=%u busy=%u discarded=%u retired=%u no_present=%u errors=%u dir=\"%S\"\r\n",
+                    cs.requested, cs.recorded, cs.submitted, cs.written, cs.dropped_busy, cs.discarded, cs.retired, cs.without_present, cs.errors,
+                    na::capture::j2::Directory());
+                if (nc2 > 0) WriteFile(f, cl, static_cast<DWORD>((std::min)(nc2, static_cast<int>(sizeof cl - 1))), &written, nullptr);
+            }
+        }
+        char il[320];
+        const int ni = snprintf(il, sizeof il, "j2_insertion traces=%llu changed=%llu list=%llu writes=%u reads=%u final=%u destination=%llu pipeline=%llu explicit_inline=%u\r\n",
+            (unsigned long long)j2.insertion_traces, (unsigned long long)j2.insertion_changes,
+            (unsigned long long)j2.insertion_list, j2.insertion_writes, j2.insertion_reads, j2.insertion_final,
+            (unsigned long long)j2.insertion_destination, (unsigned long long)j2.insertion_pipeline,
+            na::settings::Get().j2_inline.load() ? 1u : 0u);
+        if (ni > 0) WriteFile(f, il, static_cast<DWORD>((std::min)(ni, static_cast<int>(sizeof il - 1))), &written, nullptr);
+        na::observe::NativeBiasStats nbs;
+        na::observe::NativeMipBiases(&nbs);
+        char nl[200];
+        const int nn = snprintf(nl, sizeof nl, "mip_native below0=%llu at0=%llu above0=%llu min=%.2f max=%.2f (game's own bias on surface samplers)\r\n",
+                                static_cast<unsigned long long>(nbs.negative), static_cast<unsigned long long>(nbs.zero), static_cast<unsigned long long>(nbs.positive), nbs.min, nbs.max);
+        if (nn > 0) WriteFile(f, nl, static_cast<DWORD>(nn), &written, nullptr);
+    }
     const auto latency = na::latency::GetStats();
     char lm[900];
     int ln = snprintf(lm, sizeof(lm), "latency request=%d available=%u confirmed=%u game_sleep=%u native_n=%llu native_ms=%.2f set=%d query=%d foreground=%u vrr=%u cpl_vsync=%u iflip=%u sync=%u flags=0x%X ready_ms=%.2f ready_p95=%.2f real_age_ms=%.2f real_age_p95=%.2f interval_ms=%.2f interval_p95=%.2f present_ms=%.2f backlog=%u\r\n", na::settings::Get().reflex_mode.load(), latency.available, latency.low_latency, latency.game_sleep, static_cast<unsigned long long>(latency.native_samples), latency.native_render_ms, latency.set_result, latency.query_result, latency.foreground, latency.fullscreen_vrr, latency.vsync_override, latency.independent_flip, pr.requested_sync, pr.requested_flags, pr.ready_age.mean, pr.ready_age.p95, pr.real_age.mean, pr.real_age.p95, pr.submit_interval.mean, pr.submit_interval.p95, pr.present_call.mean, pr.backlog);
@@ -803,6 +979,11 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     if (msg == WM_KEYDOWN && wp == VK_HOME && !(lp & (1 << 30))) {
         g_open.store(!g_open.load(std::memory_order_relaxed), std::memory_order_release);
         return 0;
+    }
+    if (msg == WM_KEYDOWN && !(lp & (1 << 30)) && na::j2::Enabled()) {
+        const uint32_t key = na::settings::Get().j2_capture_key.load(std::memory_order_relaxed);
+        if (key && wp == key && !na::capture::j2::Armed()) // J2 evidence capture, N consecutive frames
+            na::capture::j2::RequestTimestamped(na::settings::Get().j2_capture_frames.load());
     }
     if (msg == kMsgCursorShow) {
         GetClipCursor(&g_saved_clip);
@@ -1480,7 +1661,14 @@ void draw_panel(bool just_opened)
 
 void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_opened, ID3D12Resource* frame = nullptr)
 {
-    g_render_thread.store(GetCurrentThreadId(), std::memory_order_relaxed); // input hooks pass this thread through
+    g_render_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    // Only the overlay's own input reads (apply_input, the ImGui Win32 backend)
+    // pass the input lock; the game's reads on this same thread do not.
+    struct OverlayInputScope {
+        bool prev = t_overlay_input;
+        OverlayInputScope() { t_overlay_input = true; }
+        ~OverlayInputScope() { t_overlay_input = prev; }
+    } overlay_input_scope;
     UINT idx = frame ? static_cast<UINT>(g_frames.load() % g_state.frames.size()) : real_index(sc);
     if (idx >= g_state.frames.size()) return;
     FrameCtx& f = g_state.frames[idx];
@@ -1563,6 +1751,17 @@ void process_frame(ID3D12CommandQueue* queue, ID3D12Resource* frame)
     na::nr::OnPresent(queue, frame, cs);      // live Neural Rendering (before capture and the menu)
     na::motion::OnPresent(queue, frame, cs);  // A52: live optical flow (after NR, before capture)
     if (na::capture::Pending()) na::capture::OnPresent(queue, frame); // phase-1 capture
+    {
+        // J2 evidence capture: the presented image joins this frame's evaluation (if one
+        // was captured). Executed unhooked so J2 never observes our copy as game work.
+        static bool auto_armed = false;
+        const uint32_t after = na::settings::Get().j2_capture_after_s.load(std::memory_order_relaxed);
+        if (!auto_armed && after && na::j2::Enabled()) {
+            auto_armed = true;
+            na::capture::j2::RequestTimestamped(na::settings::Get().j2_capture_frames.load(), after * 1000u);
+        }
+        na::capture::j2::OnPresent(queue, frame, g_orig_execute);
+    }
 }
 
 // Common prelude of a game Present: bookkeeping, lazy init, timing. Returns
@@ -1670,6 +1869,7 @@ void on_present(IDXGISwapChain* sc)
     std::lock_guard<std::mutex> lock(g_state.mutex);
     ID3D12CommandQueue* queue = nullptr;
     if (!present_prelude(sc, queue)) return;
+    na::j2::OnPresent(queue); // one game-frame boundary, never a TEST Present
     UINT idx = real_index(sc);
     if (idx < g_state.frames.size()) {
         ComPtr<ID3D12Resource> bb; // A71: this frame only
@@ -1697,6 +1897,7 @@ HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_
         return g_orig_present(sc, sync, flags);
     }
     na::present::PresentArgs a;
+    na::j2::OnPresent(queue); // game call only; the presenter's generated frames bypass this
     g_present_caller.store(GetCurrentThreadId());
     g_present_queue_identity.store(reinterpret_cast<uintptr_t>(queue));
     a.sc = sc;
@@ -1861,6 +2062,12 @@ void STDMETHODCALLTYPE ForwardWithFgInputs(ID3D12CommandQueue* q, UINT n, ID3D12
 {
     na::fg::Execute(q, n, lists, g_orig_execute);
 }
+// J2: live DLAA may insert its list after the game's scene list, then the
+// batch continues through Neural Rendering / Frame Generation as before.
+void STDMETHODCALLTYPE ForwardThroughNr(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists)
+{
+    na::nr::Execute(q, n, lists, ForwardWithFgInputs);
+}
 void STDMETHODCALLTYPE DetourExecute(ID3D12CommandQueue* q, UINT n,
                                      ID3D12CommandList* const* lists)
 {
@@ -1913,14 +2120,14 @@ void STDMETHODCALLTYPE DetourExecute(ID3D12CommandQueue* q, UINT n,
         ExecuteContext ctx{q, n, lists, g_exec_ticket.fetch_add(1, std::memory_order_relaxed) + 1, uncovered, sub->user};
         if (sub->begin) sub->begin(&ctx);
         na::dlss::BeforeExecute(q, n, lists); // R-303: wait for this view's previous DLSS frame on another queue
-        na::nr::Execute(q, n, lists, ForwardWithFgInputs);
+        na::j2::Execute(q, n, lists, ForwardThroughNr);
         na::gputime::OnExecuted(q, n, lists); // R-202: completion fence on the queue that ran the lists
         na::dlss::OnExecuted(q, n, lists);    // C6: completion evidence before retired DLSS features are released
         if (sub->end) sub->end(&ctx);
         g_exec_scoped.fetch_add(1, std::memory_order_relaxed);
     } else {
         na::dlss::BeforeExecute(q, n, lists); // R-303: wait for this view's previous DLSS frame on another queue
-        na::nr::Execute(q, n, lists, ForwardWithFgInputs);
+        na::j2::Execute(q, n, lists, ForwardThroughNr);
         na::gputime::OnExecuted(q, n, lists); // R-202: completion fence on the queue that ran the lists
         na::dlss::OnExecuted(q, n, lists);    // C6: completion evidence before retired DLSS features are released
     }

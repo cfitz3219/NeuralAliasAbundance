@@ -381,9 +381,11 @@ bool drain_locked(Chain& c, DWORD timeout_ms)
     return c.jcv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] { return c.backlog == 0; });
 }
 
-void release_size_dependent_locked(Chain& c)
+// Returns false (and keeps everything) when the GPU or the presenter thread
+// could not be drained in time: nothing size-dependent may be freed then.
+bool release_size_dependent_locked(Chain& c)
 {
-    if (!drain_locked(c, 2000) || !wait_fence(c, c.last_signal.load(), 2000) || !wait_presentation(c,c.presentation_last.load(),2000)) return;
+    if (!drain_locked(c, 2000) || !wait_fence(c, c.last_signal.load(), 2000) || !wait_presentation(c,c.presentation_last.load(),2000)) return false;
     if (!c.proxies.empty()) g_proxied.fetch_sub(1, std::memory_order_relaxed);
     c.proxies.clear();
     for (Slot& s : c.slots) {
@@ -396,6 +398,7 @@ void release_size_dependent_locked(Chain& c)
     c.ready = false;
     c.queues_bound=false;
     c.virtual_index = 0;
+    return true;
 }
 
 // Copies `tex` into the real current back buffer and presents. `state` is
@@ -754,8 +757,10 @@ void BeforeResize(IDXGISwapChain* sc)
     }
     if (!c) return;
     std::lock_guard<std::mutex> lock(c->m);
-    release_size_dependent_locked(*c);
-    fg::Shutdown(); // the feature is bound to the old size; it is re-created on the next frame
+    // The feature is bound to the old size and is re-created on the next frame,
+    // but only once draining succeeded: on a timeout its GPU work may still be
+    // running, so FG keeps its feature and copies (ASTRA-P4-3).
+    if (release_size_dependent_locked(*c)) fg::Shutdown();
 }
 
 HRESULT Present(const PresentArgs& a)

@@ -1,5 +1,6 @@
 #include "host_dx12/adapters/tlou1/apply.hpp"
 #include "host_dx12/host_boot/host_boot.hpp"
+#include "host_dx12/j2/live_dlaa.hpp"
 
 #include <atomic>
 #include <cstdlib>
@@ -152,11 +153,18 @@ DWORD WINAPI InitThread(LPVOID)
         for (int i = lstrlenW(status_path) - 1; i >= 0; --i)
             if (status_path[i] == L'\\' || status_path[i] == L'/') { status_path[i] = 0; break; }
         lstrcatW(status_path, L"\\NeuralAliasHost-status.log");
+        // The game folder may not be writable (Program Files): [host] status_log overrides.
+        wchar_t custom[MAX_PATH] = {};
+        if (GetPrivateProfileStringW(L"host", L"status_log", L"", custom, MAX_PATH, g_ini) > 0) lstrcpynW(status_path, custom, MAX_PATH);
         na::overlay::SetStatusLogPath(status_path); // A55
     }
     // C8: discovery observation producers (H1/H2). Off by default until a
     // consumer (A5 classifier) runs; [observe] producers=1 turns them on.
     na::observe::RequestInstall(GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1);
+    // J2 live DLAA (needs the producers and the discovery adapter): off unless [j2] enabled=1.
+    na::j2::SetEnabled(GetPrivateProfileIntW(L"j2", L"enabled", 0, g_ini) == 1 &&
+                       GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1);
+    if (na::j2::Configured()) na::overlay::RegisterLiveDlaaMenu();
     bool started = na::overlay::Start(tag, nullptr);
     signal_install_attempted(); // producers were installed (or could not be) inside Start
     boot_log(started ? "overlay started" : "overlay start failed");
@@ -213,6 +221,18 @@ bool StartFromIni(HMODULE self, const wchar_t* ini_name, const char* default_tag
     if (GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1 &&
         GetPrivateProfileIntW(L"observe", L"early_install", 1, g_ini) == 1)
         g_install_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    // J2 DLAA reconstructs texture detail over frames: the game's mip-mapped
+    // samplers sample one mip sharper (temporal-upscaler rule log2(render/display) - 1
+    // = -1 at native). Set here, synchronously at load, before any hook can see the
+    // game's first sampler. [j2] mip_bias overrides; 0 turns it off.
+    if (GetPrivateProfileIntW(L"j2", L"enabled", 0, g_ini) == 1 && GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1) {
+        wchar_t mb[32] = {};
+        GetPrivateProfileStringW(L"j2", L"mip_bias", L"-1.0", mb, 32, g_ini);
+        na::observe::SetSamplerMipBias(static_cast<float>(_wtof(mb)));
+        // Live switching from the menu (no restart): twin root signatures/pipelines are
+        // built at creation for the other levels. [j2] mip_bias_live=0 turns it off.
+        na::observe::SetSamplerMipBiasLiveEnabled(GetPrivateProfileIntW(L"j2", L"mip_bias_live", 1, g_ini) != 0);
+    }
     HANDLE t = CreateThread(nullptr, 0, &InitThread, nullptr, 0, nullptr);
     if (!t) {
         signal_install_attempted();

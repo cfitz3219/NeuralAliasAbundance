@@ -22,7 +22,11 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <stdexcept>
+#include <vector>
 
 namespace na::camera {
 
@@ -68,6 +72,95 @@ inline Matrix TransposeMatrix(const Matrix& m) {
     for (size_t r = 0; r < 4; ++r) for (size_t c = 0; c < 4; ++c) t[r * 4 + c] = m[c * 4 + r];
     return t;
 }
+// Current clip/NDC -> previous clip in ONE matrix, composed in double (row-vector:
+// p_prev = p_cur * InvVPcur * VPprev). Uploading InvVPcur and VPprev separately
+// as floats and chaining them per pixel through large world coordinates loses
+// precision: Anno's still camera produced ~0.09 px of false motion, which DLAA
+// accumulated into a persistent blur (Astra, docs/ANNO-BLUR-DIAGNOSIS.md).
+// Composed first, a still camera gives exactly identity.
+inline Matrix ComposeReprojectionRow(const Matrix& inv_view_proj_current_row, const Matrix& view_proj_previous_row) {
+    Matrix m{};
+    for (size_t r = 0; r < 4; ++r)
+        for (size_t c = 0; c < 4; ++c) {
+            double v = 0;
+            for (size_t k = 0; k < 4; ++k) v += inv_view_proj_current_row[r * 4 + k] * view_proj_previous_row[k * 4 + c];
+            m[r * 4 + c] = v;
+        }
+    return m;
+}
+
+// Exact inverse of core/temporal_jitter.hpp for a KNOWN pixel offset.
+// Unknown native jitter still needs a baseline; decomposition alone cannot
+// distinguish jitter from a deliberately off-centre projection.
+inline Matrix UnjitterViewProjection(const Matrix& m, double x_px, double y_px,
+                                    uint32_t width, uint32_t height) {
+    if (!width || !height) throw std::invalid_argument("zero render extent");
+    Matrix result = m;
+    const double dx = 2.0 * x_px / width, dy = -2.0 * y_px / height;
+    for (size_t c = 0; c < 4; ++c) {
+        result[c] -= dx * m[12 + c];
+        result[4 + c] -= dy * m[12 + c];
+    }
+    return result;
+}
+
+// Column-vector algebra. A point reconstructed relative to the CURRENT origin
+// becomes previous-relative by adding current_origin - previous_origin.
+// Thus previous_relative_vp * T(delta), NOT T(delta) * previous_relative_vp.
+// Transpose the returned matrix when passing it to the row-vector arbiter.
+inline Matrix ComposeCameraRelativeViewProj(const Matrix& previous_relative_vp,
+                                           const std::array<double, 3>& delta_world_pos) {
+    Matrix result = previous_relative_vp;
+    for (size_t r = 0; r < 4; ++r)
+        for (size_t c = 0; c < 3; ++c)
+            result[r * 4 + 3] += previous_relative_vp[r * 4 + c] * delta_world_pos[c];
+    return result;
+}
+
+struct CameraByteRange { size_t offset{}, size{}; };
+struct CameraOriginCandidate {
+    size_t offset{};
+    std::array<double, 3> previous{}, current{}, delta{};
+};
+
+// Candidate generation only: caller supplies consecutive snapshots of the SAME
+// camera block/layout and excludes all known matrix ranges. Scan float-aligned
+// triples to cover packed float3 and float4 slots; keep every plausible match
+// rather than silently choosing the first smooth vector as the camera origin.
+inline std::vector<CameraOriginCandidate> FindCameraOriginCandidates(
+    const std::vector<uint8_t>& previous, const std::vector<uint8_t>& current,
+    const Matrix& relative_vp, const std::vector<CameraByteRange>& excluded,
+    double max_translation) {
+    std::vector<CameraOriginCandidate> result;
+    VpGeometry geometry{};
+    if (!std::isfinite(max_translation) || max_translation <= 0 ||
+        !DecomposeViewProjection(relative_vp, geometry)) return result;
+    for (double p : geometry.position) if (std::abs(p) > 1e-6) return result;
+    const size_t size = std::min(previous.size(), current.size());
+    for (size_t offset = 0; offset <= size && size - offset >= 12; offset += 4) {
+        bool overlap = false;
+        for (const auto& range : excluded) {
+            if (range.size && range.offset < offset + 12 &&
+                (range.offset >= offset || range.size > offset - range.offset)) overlap = true;
+        }
+        if (overlap) continue;
+        CameraOriginCandidate candidate{};
+        candidate.offset = offset;
+        double distance2 = 0;
+        for (size_t i = 0; i < 3; ++i) {
+            float a{}, b{};
+            std::memcpy(&a, previous.data() + offset + 4 * i, 4);
+            std::memcpy(&b, current.data() + offset + 4 * i, 4);
+            candidate.previous[i] = a;
+            candidate.current[i] = b;
+            candidate.delta[i] = double(b) - double(a);
+            distance2 += candidate.delta[i] * candidate.delta[i];
+        }
+        if (std::isfinite(distance2) && distance2 > 0 && std::sqrt(distance2) <= max_translation)
+            result.push_back(candidate);
+    }
+    return result;
+}
 
 class CameraTracker {
 public:
@@ -83,16 +176,23 @@ public:
     CameraFrame Update(const Matrix& m, uint64_t frame, uint32_t width, uint32_t height,
                        const double* injected_px = nullptr) { return Update(m, frame, width, height, injected_px, Limits{}); }
     CameraFrame Update(const Matrix& m, uint64_t frame, uint32_t width, uint32_t height,
-                       const double* injected_px, const Limits& lim) {
+                       const double* injected_px, const Limits& lim,
+                       const std::array<double, 3>* world_origin = nullptr) {
         CameraFrame f{};
         VpGeometry g{};
         if (!width || !height || !DecomposeViewProjection(m, g)) return f;
+        if (world_origin) {
+            for (double p : *world_origin) if (!std::isfinite(p)) return f;
+            // The supplied origin is identified by the caller, not by the scan.
+            for (size_t i = 0; i < 3; ++i) g.position[i] += (*world_origin)[i];
+        }
         f.fov_y = 2.0 * std::atan(1.0 / g.sy);
         f.aspect = g.sy / g.sx;
         f.position = g.position;
         f.forward = g.forward;
         // Cut detection against the previous accepted frame.
-        bool cut = !have_ || frame <= last_frame_ || frame - last_frame_ > lim.max_frame_gap;
+        bool cut = !have_ || bool(world_origin) != previous_relative_ ||
+                   frame <= last_frame_ || frame - last_frame_ > lim.max_frame_gap;
         if (!cut) {
             double d2 = 0, dot = 0;
             for (size_t j = 0; j < 3; ++j) {
@@ -120,27 +220,38 @@ public:
             f.jitter_px_x = jx * double(width) * 0.5;
             f.jitter_px_y = -jy * double(height) * 0.5;
         }
-        f.unjittered = m;
-        for (size_t c = 0; c < 4; ++c) {
-            f.unjittered[c] -= jx * m[12 + c];
-            f.unjittered[4 + c] -= jy * m[12 + c];
-        }
+        f.unjittered = UnjitterViewProjection(m, f.jitter_px_x, f.jitter_px_y, width, height);
         f.view_proj_current_row = TransposeMatrix(f.unjittered);
         if (!Invert(f.view_proj_current_row, f.inv_view_proj_current_row)) return f;
         f.camera_cut = cut;
         f.view_proj_previous_row = cut ? f.view_proj_current_row : prev_vp_row_;
+        if (world_origin && !cut) {
+            std::array<double, 3> delta{};
+            for (size_t i = 0; i < 3; ++i) delta[i] = (*world_origin)[i] - previous_origin_[i];
+            f.view_proj_previous_row = TransposeMatrix(ComposeCameraRelativeViewProj(
+                TransposeMatrix(prev_vp_row_), delta));
+        }
         f.valid = true;
         prev_ = g;
         prev_fov_ = f.fov_y;
         prev_vp_row_ = f.view_proj_current_row;
         last_frame_ = frame;
         have_ = true;
+        previous_relative_ = world_origin != nullptr;
+        if (world_origin) previous_origin_ = *world_origin;
         return f;
+    }
+    CameraFrame UpdateCameraRelative(const Matrix& m, const std::array<double, 3>& world_origin,
+                                    uint64_t frame, uint32_t width, uint32_t height,
+                                    const double* injected_px = nullptr) {
+        return Update(m, frame, width, height, injected_px, Limits{}, &world_origin);
     }
     void Reset() { have_ = false; }
 
 private:
     bool have_ = false;
+    bool previous_relative_ = false;
+    std::array<double, 3> previous_origin_{};
     uint64_t last_frame_ = 0;
     VpGeometry prev_{};
     double prev_fov_ = 0, mean_dx_ = 0, mean_dy_ = 0;

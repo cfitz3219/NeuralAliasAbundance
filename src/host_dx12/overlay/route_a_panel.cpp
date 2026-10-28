@@ -18,7 +18,10 @@
 #include <imgui.h>
 
 #include "host_dx12/capture/frame_capture.hpp"
+#include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/fg/frame_gen.hpp"
+#include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/observe/producers.hpp"
 #include "host_dx12/fg/preset_profile.hpp"
 #include "host_dx12/motion/live_flow.hpp"
 #include "host_dx12/overlay/presenter.hpp"
@@ -599,7 +602,142 @@ void DrawCaptureRow()
     }
 }
 
+// J2: live DLAA for games without an upscaler. A switch to compare with and
+// without, and what it is doing (or waiting for) right now.
+void DrawLiveDlaa()
+{
+    using namespace na::ui;
+    const na::j2::Stats st = na::j2::GetStats();
+    BeginGroupBox("Live DLAA");
+    bool on = !na::j2::Paused();
+    BeginRow("NeuralAlias DLAA (test)", "NVIDIA DLSS at full resolution on this game's 3D picture. Switch off to compare.", SwitchWidth());
+    if (Switch("j2", &on)) na::j2::SetPaused(!on);
+    EndRow();
+    Hint("For sharpest results and best FPS, set Anti-Aliasing to Off in the game's video settings.");
+    {
+        na::settings::Settings& ss = na::settings::Get();
+        int sharp = static_cast<int>(ss.j2_sharpness.load());
+        BeginRow("Sharpness", "Sharpening after DLAA; the HUD is never sharpened. 0-100%: AMD RCAS (halo-free, up to its designed maximum). 101-200%: NVIDIA Image Scaling sharpening added on top for extra bite; edge outlines can appear near 200%. 0 = off.", S(220));
+        ImGui::SetNextItemWidth(S(220));
+        if (ImGui::SliderInt("##j2sharp", &sharp, 0, 200, sharp ? (sharp > 100 ? "%d%% (RCAS + NIS)" : "%d%%") : "Off")) {
+            ss.j2_sharpness.store(static_cast<uint32_t>(sharp));
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) na::settings::Save();
+        EndRow();
+    }
+    {
+        // DLSS render preset. NGX values: J 10, K 11, L 12, M 13; 0 = NVIDIA's default.
+        static const char* kLivePresets[] = {"L (default)", "M", "K", "J", "NVIDIA default"};
+        static const uint32_t kLiveValues[] = {12, 13, 11, 10, 0};
+        na::settings::Settings& ss = na::settings::Get();
+        const uint32_t cur = ss.j2_preset.load();
+        int idx = 0;
+        for (int i = 0; i < 5; ++i) if (kLiveValues[i] == cur) idx = i;
+        BeginRow("DLSS preset", "Which DLSS model runs. L and M are the newest (DLSS 4.5) transformer models; K and J are the earlier transformer models. Changing it restarts DLAA's history for one frame.", S(220));
+        ImGui::SetNextItemWidth(S(220));
+        if (ImGui::Combo("##j2preset", &idx, kLivePresets, 5)) {
+            ss.j2_preset.store(kLiveValues[idx]);
+            na::settings::Save();
+        }
+        EndRow();
+    }
+    bool jit = na::j2::Jitter();
+    BeginRow("Camera jitter", "Shifts the camera by a fraction of a pixel each frame so DLAA can sharpen as well as smooth. Switch off if the picture shimmers or flickers.", SwitchWidth());
+    if (Switch("j2jit", &jit)) na::j2::SetJitter(jit);
+    EndRow();
+    {
+        static const char* kViews[] = {"Off (normal picture)", "Motion vectors", "Fine motion (sub-pixel)", "Depth"};
+        int dv = na::j2::DebugView();
+        BeginRow("Debug view", "Shows what DLAA is given instead of its result. Motion: colour = direction, brightness = speed, black = still. Fine motion makes tiny false motion visible. Magenta = broken values.", S(220));
+        ImGui::SetNextItemWidth(S(220));
+        if (ImGui::Combo("##j2dbg", &dv, kViews, 4)) na::j2::SetDebugView(dv);
+        EndRow();
+    }
+    {
+        // Texture detail (negative mip bias, NVIDIA DLSS guide 3.5: -1 at native).
+        // Games build their samplers at load, so a change applies at the next start;
+        // the setting lives in this game's own NeuralAliasHost.ini (per game).
+        static const char* kDetail[] = {"Off (game's own)", "Light (-0.5)", "Standard (-1, NVIDIA)"};
+        static const int kDetailX100[] = {0, -50, -100};
+        na::settings::Settings& ss = na::settings::Get();
+        const int cur = ss.j2_mip_bias_x100.load();
+        int idx = 2;
+        for (int i = 0; i < 3; ++i) if (kDetailX100[i] == cur) idx = i;
+        const auto ml = na::observe::GetMipLiveStats();
+        const bool live = ml.enabled && (ml.twin_pipelines > 0 || ml.twin_root_signatures > 0);
+        BeginRow("Texture detail", "Samples surface textures sharper so DLAA can rebuild their full detail (NVIDIA's DLSS guide recommends -1 at native resolution). Very fine patterns such as fabric weaves can shimmer at -1; Light is gentler. Screen effects are never changed. Switches live (from the next frame); remembered for this game.", S(220));
+        ImGui::SetNextItemWidth(S(220));
+        if (ImGui::Combo("##j2detail", &idx, kDetail, 3)) {
+            ss.j2_mip_bias_x100.store(kDetailX100[idx]);
+            na::observe::SetSamplerMipBiasLive(kDetailX100[idx] / 100.0f);
+            na::settings::Save();
+        }
+        EndRow();
+        uint64_t ns = 0, nst = 0;
+        na::observe::MipBiasCounts(&ns, &nst);
+        na::observe::NativeBiasStats nb;
+        na::observe::NativeMipBiases(&nb);
+        char tb[400];
+        const float active = na::observe::SamplerMipBias();
+        std::snprintf(tb, sizeof tb, "Now: %.1f (game loaded at %.1f; %llu root signatures and %llu pipelines prepared for switching, %llu fixed, %llu fall-backs). Game's own bias on its surface textures: %llu below 0, %llu at 0, %llu above.",
+                      active, ml.game_bias, static_cast<unsigned long long>(ml.twin_root_signatures), static_cast<unsigned long long>(ml.twin_pipelines),
+                      static_cast<unsigned long long>(ml.untwinned_pipelines), static_cast<unsigned long long>(ml.fallbacks),
+                      static_cast<unsigned long long>(nb.negative), static_cast<unsigned long long>(nb.zero), static_cast<unsigned long long>(nb.positive));
+        StatusLine(0, tb);
+        (void)ns; (void)nst;
+        if (!live && static_cast<int>(ml.game_bias * -100.0f + 0.5f) != -cur)
+            StatusLine(2, "Live switching is not available in this session (no prepared pipelines): restart the game to see this change.");
+    }
+    {
+        // Where DLAA is placed in this game's frame, chosen automatically (or forced in the ini).
+        const auto& rt = st.route;
+        static const char* kWhere[] = {"not placed yet", "between the game's command lists", "inside the game's scene list", "handled by the game's own upscaler call"};
+        char pl[360];
+        std::snprintf(pl, sizeof pl, "Placement: %s%s%s (%s). %s%s%s", kWhere[rt.route < 4 ? rt.route : 0],
+                      rt.mode ? ", forced in settings" : "", rt.state ? "" : ", still learning",
+                      rt.mode ? "override" : "automatic", rt.reason, rt.missing[0] ? " Missing: " : "", rt.missing);
+        StatusLine(0, pl);
+    }
+    {
+        // Evidence capture: N consecutive DLAA frames (inputs, DLAA output, presented
+        // picture) for analysis. Also on the capture key (F8 by default) and the ini.
+        const auto cs = na::capture::j2::GetStats();
+        const uint32_t n = na::settings::Get().j2_capture_frames.load();
+        char lbl[64];
+        std::snprintf(lbl, sizeof lbl, "Capture %u frames", n);
+        BeginRow("Capture DLAA frames", "Saves what DLAA was given, what it produced and the picture you saw, for the next few frames, to LocalAppData\\NeuralAlias\\captures. Large files; for diagnosis only.", ButtonWidth(lbl));
+        ImGui::BeginDisabled(!on || na::capture::j2::Armed());
+        if (Button(lbl)) na::capture::j2::RequestTimestamped(n);
+        ImGui::EndDisabled();
+        EndRow();
+        if (cs.requested) {
+            char cl[200];
+            std::snprintf(cl, sizeof cl, "Capture: %u of %u recorded, %u saved, %u skipped (busy), %u without the presented picture, %u errors.",
+                          cs.recorded, cs.requested, cs.written, cs.dropped_busy + cs.discarded + cs.retired, cs.without_present, cs.errors);
+            StatusLine(0, cl);
+        }
+    }
+    char buf[320];
+    if (!on) {
+        StatusLine(0, "Off: you are seeing the game's own picture.");
+    } else if (st.active) {
+        std::snprintf(buf, sizeof buf, "Running: %ux%u, %llu frames improved so far.", st.width, st.height,
+                      static_cast<unsigned long long>(st.frames));
+        StatusLine(1, buf);
+    } else {
+        std::snprintf(buf, sizeof buf, "Not running yet: %s (%llu frames improved so far)", st.reason[0] ? st.reason : "starting.",
+                      static_cast<unsigned long long>(st.frames));
+        StatusLine(2, buf);
+    }
+    EndGroupBox();
+}
+
 } // namespace
+
+void RegisterLiveDlaaMenu()
+{
+    na::menu::Register({"Live DLAA", na::menu::Availability::Available, nullptr, &DrawLiveDlaa, na::menu::Page::Picture});
+}
 
 void RegisterRouteAMenu()
 {

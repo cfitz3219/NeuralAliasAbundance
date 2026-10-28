@@ -6,6 +6,8 @@
 #include <dxgi1_4.h>
 
 #include "queue_occurrences.hpp"
+#include "host_dx12/j2/insertion_trace.hpp"
+#include <tuple>
 #include <algorithm>
 #include <system_error>
 #include <chrono>
@@ -16,6 +18,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -79,6 +82,39 @@ struct ListState {
     // every resource they reference. Bounded; overflow clears uses_complete.
     std::vector<na_object_id> uses;
     bool uses_complete = true;
+    // (render target, depth target or 0) per OMSetRenderTargets in this recording, in order (under bind_m).
+    struct Target {
+        na_object_id rt = 0, ds = 0;
+        uint32_t rt_sub = 0; // the render-target view's first subresource (mip + slice); NA_UNKNOWN_U32 if not one slice
+        uint32_t ds_sub = 0; // the depth view's first subresource, likewise
+        bool same(na_object_id r, na_object_id d) const { return rt == r && ds == d; }
+    };
+    std::vector<Target> targets;
+    na::j2::InsertionTrace insertion;
+    // Explicit bounded SRV-table observations are a pass-order hint, not proof
+    // of a particular AA shader or a requirement for DLAA eligibility.
+    std::vector<na_object_id> sampled_textures;
+    std::vector<na_object_id> cleared; // render targets this recording cleared (ClearRenderTargetView)
+    // Inline insertion (J2): the game's pipeline state in this recording, so host
+    // work recorded INTO the game's list can hand the list back exactly as the game
+    // left it. Written by the recording thread's observers (host calls are not
+    // observed), under bind_m.
+    struct RootArg {
+        uint8_t type = 0; // 0 unset, 1 table, 2 CBV, 3 SRV, 4 UAV, 5 constants
+        uint64_t value = 0;
+        std::vector<uint32_t> consts;
+    };
+    ID3D12PipelineState* pso = nullptr;
+    ID3D12DescriptorHeap* heaps[2] = {nullptr, nullptr};
+    uint32_t nheaps = 0;
+    std::vector<RootArg> args[2]; // [graphics, compute], by root parameter
+    na_object_id cur_rt = 0, cur_ds = 0; // currently bound first render target / depth
+    na_object_id cur_rts[8] = {};
+    uint32_t cur_nrt = 0;
+    uint32_t cur_ds_sub = NA_UNKNOWN_U32;
+    bool restorable = true;              // false after work whose state effects we cannot replay
+    bool in_render_pass = false;         // between BeginRenderPass and EndRenderPass (no host copy/dispatch allowed)
+    int8_t mip_level = -1;               // live mip bias: twin level latched at Reset (-1 = the game's own objects)
 };
 
 struct Obj {
@@ -89,6 +125,11 @@ struct Obj {
     std::unique_ptr<ListState> list;       // command lists
     std::vector<na_root_param> root_params; // root signatures (C9 table resolution)
     std::vector<na_root_range> root_ranges;
+    uint64_t root_hash = 0;                 // structural layout hash (role classes; stable across sessions)
+    // Live mip bias: per-level twins of a root signature / pipeline state (index = level).
+    // same[i]: the game's own object is already correct for level i (nothing to swap).
+    struct Twins { IUnknown* obj[3] = {}; bool same[3] = {}; ~Twins() { for (auto* o : obj) if (o) o->Release(); } };
+    std::shared_ptr<Twins> twins;
     bool retirement_unobservable = false;   // the sentinel could not be attached
     uint64_t present_ordinal = 0;
 };
@@ -117,7 +158,9 @@ struct VaRange {
 };
 
 std::shared_mutex g_m; // registry, heaps, VA table. Never held across a D3D12 call.
-std::unordered_map<const void*, Obj> g_objs;
+// Never destroyed: at process exit an entry's twins must not be Released (a twin's last
+// Release can retire an object through its sentinel, which takes g_m and walks this map).
+std::unordered_map<const void*, Obj>& g_objs = *new std::unordered_map<const void*, Obj>();
 std::vector<std::unique_ptr<DescHeap>> g_heaps;
 std::vector<VaRange> g_va; // sorted by begin
 struct BufferInfo {
@@ -246,6 +289,11 @@ thread_local uint64_t t_seq = 0;
 // C9b: set while the host records/submits its OWN sample copies, so none of
 // that self-generated work is reported as the game's.
 thread_local bool t_host_work = false;
+// The submission this thread is forwarding (ExecuteBegin..ExecuteEnd), for
+// host work done inside that forward (J2) that asks for carried state.
+struct SubmissionCapture;
+thread_local const SubmissionCapture* t_cur_cap = nullptr;
+thread_local na_object_id t_cur_qid = 0;
 // ASTRA-P3-R8: number of submission locks this thread holds, i.e. whether it is
 // inside a forwarded game submission. Any observed queue operation nested in
 // one (driver/runtime re-entry, on ANY queue) takes no lock, so two threads
@@ -351,10 +399,11 @@ private:
 void RetireSentinel::retire(const void* key, na_object_id id, uint32_t kind)
 {
     g_retire_gen.fetch_add(1, std::memory_order_acq_rel);
+    std::shared_ptr<Obj::Twins> drop; // released after g_m: a twin's Release is a D3D12 call
     {
         std::unique_lock<std::shared_mutex> lock(g_m);
         auto it = g_objs.find(key);
-        if (it != g_objs.end() && it->second.id == id) g_objs.erase(it);
+        if (it != g_objs.end() && it->second.id == id) { drop = std::move(it->second.twins); g_objs.erase(it); }
         g_heaps.erase(std::remove_if(g_heaps.begin(), g_heaps.end(), [&](const std::unique_ptr<DescHeap>& h) { return h->id == id; }),
                       g_heaps.end());
         g_va.erase(std::remove_if(g_va.begin(), g_va.end(), [&](const VaRange& r) { return r.resource == id; }), g_va.end());
@@ -416,10 +465,12 @@ na_object_id register_object(IUnknown* object, uint32_t kind)
     if (!object) return 0;
     const void* key = canon(object);
     const na_object_id id = g_next_id.fetch_add(1);
+    std::shared_ptr<Obj::Twins> drop; // stale entry's twins, released after g_m
     {
         std::unique_lock<std::shared_mutex> lock(g_m);
         Obj& o = g_objs[key];
         if (o.id) g_c.live.fetch_sub(1); // address reused without a retirement we saw
+        drop = std::move(o.twins);
         o = fresh_obj(id, kind);
     }
     g_c.live.fetch_add(1);
@@ -437,12 +488,13 @@ na_object_id ensure_registered(IUnknown* object, uint32_t kind, bool* created)
     if (!object) return 0;
     const void* key = canon(object);
     na_object_id id = 0;
+    std::shared_ptr<Obj::Twins> drop; // stale entry's twins, released after g_m
     {
         std::unique_lock<std::shared_mutex> lock(g_m);
         auto it = g_objs.find(key);
         if (it != g_objs.end() && it->second.kind == kind) return it->second.id;
         id = g_next_id.fetch_add(1);
-        if (it != g_objs.end()) g_c.live.fetch_sub(1);
+        if (it != g_objs.end()) { g_c.live.fetch_sub(1); drop = std::move(it->second.twins); }
         g_objs[key] = fresh_obj(id, kind);
     }
     *created = true;
@@ -1007,6 +1059,16 @@ void STDMETHODCALLTYPE D_CreateRenderTargetView(ID3D12Device* dev, ID3D12Resourc
     o_CreateRenderTargetView(dev, r, d, h);
     uint32_t first = NA_UNKNOWN_U32, count = NA_UNKNOWN_U32;
     if (!d || d->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) { first = d ? d->Texture2D.MipSlice : 0; count = 1; }
+    else if (r && d->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY && d->Texture2DArray.ArraySize == 1) {
+        // One slice of an array: subresource = mip + slice * mip count (plane 0).
+        const D3D12_RESOURCE_DESC rd = r->GetDesc();
+        first = d->Texture2DArray.MipSlice + d->Texture2DArray.FirstArraySlice * rd.MipLevels;
+        count = 1;
+    }
+    else if (d->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMS) { first = 0; count = 1; }
+    else if (d->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY && d->Texture2DMSArray.ArraySize == 1) {
+        first = d->Texture2DMSArray.FirstArraySlice; count = 1; // MSAA textures have exactly one mip
+    }
     note_descriptor_write(h, NA_DESC_RTV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count);
 }
 
@@ -1015,12 +1077,101 @@ void STDMETHODCALLTYPE D_CreateDepthStencilView(ID3D12Device* dev, ID3D12Resourc
     o_CreateDepthStencilView(dev, r, d, h);
     uint32_t first = NA_UNKNOWN_U32, count = NA_UNKNOWN_U32;
     if (!d || d->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2D) { first = d ? d->Texture2D.MipSlice : 0; count = 1; }
+    else if (r && d->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DARRAY && d->Texture2DArray.ArraySize == 1) {
+        const D3D12_RESOURCE_DESC rd = r->GetDesc();
+        first = d->Texture2DArray.MipSlice + d->Texture2DArray.FirstArraySlice * rd.MipLevels; // plane 0
+        count = 1;
+    }
+    else if (d->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMS) { first = 0; count = 1; }
+    else if (d->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY && d->Texture2DMSArray.ArraySize == 1) {
+        first = d->Texture2DMSArray.FirstArraySlice; count = 1;
+    }
     note_descriptor_write(h, NA_DESC_DSV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count);
+}
+
+// Texture LOD (mip) bias for temporal reconstruction (J2 DLAA): with jitter and
+// accumulation, textures must be sampled one mip sharper than for a single
+// frame, or every frame is already low-passed and the accumulated picture loses
+// texture detail (wood planks, roof tiles). Applied to samplers that actually
+// use mips (linear / anisotropic mip filtering, MaxLOD > 0); never to
+// comparison (shadow) samplers or point-mip lookups. 0 = off.
+std::atomic<float> g_mip_bias{0.0f};
+// Live mip bias (Cort: compare without restarting). The game's static samplers are baked
+// into its root signatures and pipelines at load, so every root signature and pipeline
+// gets twins built at creation for the other menu levels; command lists are switched to
+// the twins of the level latched at their Reset. Levels = the menu's choices.
+constexpr float kMipLevels[3] = {0.0f, -0.5f, -1.0f};
+std::atomic<int> g_mip_game_level{0};      // level the game's own objects are built with (0 = no bias unless J2 sets it)
+std::atomic<int> g_mip_live_level{0};      // level selected in the menu
+std::atomic<bool> g_mip_switched{false};   // a level other than the game's has been selected (enables lookups)
+std::atomic<bool> g_mip_live_enabled{false}; // twins are built only when J2 enables live switching
+std::atomic<uint64_t> g_mip_twin_rs{0}, g_mip_twin_pso{0}, g_mip_untwinned{0}, g_mip_fallbacks{0}, g_mip_twin_fail{0};
+int nearest_mip_level(float b)
+{
+    int best = 0;
+    for (int i = 1; i < 3; ++i) if (std::fabs(b - kMipLevels[i]) < std::fabs(b - kMipLevels[best])) best = i;
+    return best;
+}
+std::atomic<uint64_t> g_biased_samplers{0}, g_biased_static{0};
+template <typename SD>
+bool sampler_wants_bias(const SD& d)
+{
+    // Standard filtering only: comparison (shadow maps) and min/max reductions
+    // (depth pyramids) are data lookups, never biased.
+    if (D3D12_DECODE_FILTER_REDUCTION(d.Filter) != D3D12_FILTER_REDUCTION_TYPE_STANDARD) return false;
+    // Material textures: anisotropic, or linear minification (with linear OR point
+    // mip selection: the bias moves the chosen mip either way). All-point samplers
+    // are data/UI lookups and stay as they are. No mips (MaxLOD 0): nothing to bias.
+    const bool aniso = D3D12_DECODE_IS_ANISOTROPIC_FILTER(d.Filter);
+    const bool linear_min = D3D12_DECODE_MIN_FILTER(d.Filter) == D3D12_FILTER_TYPE_LINEAR;
+    // Screen-space passes (bloom/blur mip chains, SSAO, depth of field, tonemap
+    // LUTs) sample with CLAMP/BORDER addressing; biasing those makes the whole
+    // image harsh and noisy (Sniper Elite Resistance: every sampler is static).
+    // Surface textures tile (WRAP/MIRROR). So a linear sampler is biased only
+    // when it tiles; anisotropic filtering is a surface-texture choice anyway.
+    const auto tiles = [](D3D12_TEXTURE_ADDRESS_MODE m) {
+        return m == D3D12_TEXTURE_ADDRESS_MODE_WRAP || m == D3D12_TEXTURE_ADDRESS_MODE_MIRROR || m == D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE;
+    };
+    const bool surface = aniso || (linear_min && (tiles(d.AddressU) || tiles(d.AddressV)));
+    return surface && d.MaxLOD > 0.0f;
+}
+float clamp_lod(float v) { return v < -16.0f ? -16.0f : (v > 15.99f ? 15.99f : v); }
+// Target-based bias (Cort, aiming for a total of `target`, e.g. -1): a sampler
+// with a neutral or positive native bias gets NVIDIA's NativeBias + target; one
+// the game already biases negative is brought to `target` at most and never
+// past it (no stacking -1 on top of the game's own sharpening).
+float biased(float native, float target)
+{
+    if (target == 0.0f) return native;
+    if (native >= 0.0f) return clamp_lod(native + target);
+    return native < target ? native : target;
+}
+// The game's own biases on surface samplers, observed whether or not we bias.
+std::mutex g_native_m;
+uint64_t g_native_neg = 0, g_native_zero = 0, g_native_pos = 0;
+float g_native_min = 0.0f, g_native_max = 0.0f;
+void note_native(float b)
+{
+    std::lock_guard<std::mutex> lock(g_native_m);
+    const bool first = !(g_native_neg || g_native_zero || g_native_pos);
+    if (b < 0.0f) ++g_native_neg; else if (b > 0.0f) ++g_native_pos; else ++g_native_zero;
+    if (first || b < g_native_min) g_native_min = b;
+    if (first || b > g_native_max) g_native_max = b;
 }
 
 void STDMETHODCALLTYPE D_CreateSampler(ID3D12Device* dev, const D3D12_SAMPLER_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
 {
-    o_CreateSampler(dev, d, h);
+    const float bias = g_mip_bias.load(std::memory_order_relaxed);
+    const bool surface = d && !t_host_work && sampler_wants_bias(*d);
+    if (surface) note_native(d->MipLODBias);
+    if (surface && bias != 0.0f && biased(d->MipLODBias, bias) != d->MipLODBias) {
+        D3D12_SAMPLER_DESC m = *d;
+        m.MipLODBias = biased(m.MipLODBias, bias);
+        o_CreateSampler(dev, &m, h);
+        g_biased_samplers.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        o_CreateSampler(dev, d, h);
+    }
     note_descriptor_write(h, NA_DESC_SAMPLER, nullptr, NA_UNKNOWN_U32, NA_UNKNOWN_U32, NA_UNKNOWN_U32);
 }
 
@@ -1378,7 +1529,75 @@ NA_ORIG(CreatePipelineState, HRESULT, ID3D12Device2*, const D3D12_PIPELINE_STATE
 HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, const void* blob, SIZE_T size, REFIID riid, void** out)
 {
     Depth depth("CreateRootSignature");
-    const HRESULT hr = o_CreateRootSignature(dev, mask, blob, size, riid, out);
+    // Mip bias for static samplers: re-serialise the root signature with biased
+    // samplers (versions 1.0 / 1.1; anything else is passed through unchanged). The game
+    // gets the startup level; twins for the other menu levels are built right after.
+    ID3DBlob* rebuilt = nullptr;
+    const int game_level = g_mip_game_level.load(std::memory_order_relaxed);
+    ID3DBlob* level_blob[3] = {};
+    bool level_same[3] = {true, true, true};
+    bool decodable = false;
+    if (blob && size && !t_host_work && depth.outermost()) { // also when off: native biases are recorded
+        ID3D12VersionedRootSignatureDeserializer* rd = nullptr;
+        const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* u = nullptr;
+        if (SUCCEEDED(D3D12CreateVersionedRootSignatureDeserializer(blob, size, IID_PPV_ARGS(&rd))) && rd &&
+            (u = rd->GetUnconvertedRootSignatureDesc()) != nullptr &&
+            (u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 || u->Version == D3D_ROOT_SIGNATURE_VERSION_1_1)) {
+            decodable = true;
+            const UINT ns = u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 ? u->Desc_1_0.NumStaticSamplers : u->Desc_1_1.NumStaticSamplers;
+            const D3D12_STATIC_SAMPLER_DESC* src = u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 ? u->Desc_1_0.pStaticSamplers : u->Desc_1_1.pStaticSamplers;
+            for (UINT i = 0; i < ns; ++i) if (sampler_wants_bias(src[i])) note_native(src[i].MipLODBias);
+            const bool live = g_mip_live_enabled.load(std::memory_order_relaxed);
+            for (int level = 0; level < 3; ++level) {
+                if (level != game_level && !live) continue;
+                D3D12_VERSIONED_ROOT_SIGNATURE_DESC copy = *u;
+                std::vector<D3D12_STATIC_SAMPLER_DESC> ss(src, src + ns);
+                uint32_t changed = 0;
+                for (auto& x : ss)
+                    if (sampler_wants_bias(x)) {
+                        const float nb = biased(x.MipLODBias, kMipLevels[level]);
+                        if (nb != x.MipLODBias) { x.MipLODBias = nb; ++changed; }
+                    }
+                if (!changed) continue; // the original blob is right for this level
+                if (u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0) copy.Desc_1_0.pStaticSamplers = ss.data();
+                else copy.Desc_1_1.pStaticSamplers = ss.data();
+                ID3DBlob* b = nullptr;
+                ID3DBlob* err = nullptr;
+                if (SUCCEEDED(D3D12SerializeVersionedRootSignature(&copy, &b, &err)) && b) {
+                    level_blob[level] = b;
+                    level_same[level] = false;
+                    if (level == game_level) g_biased_static.fetch_add(changed, std::memory_order_relaxed);
+                } else if (b) b->Release();
+                if (err) err->Release();
+            }
+            if (level_blob[game_level]) { rebuilt = level_blob[game_level]; rebuilt->AddRef(); }
+        }
+        if (rd) rd->Release();
+    }
+    const HRESULT hr = rebuilt ? o_CreateRootSignature(dev, mask, rebuilt->GetBufferPointer(), rebuilt->GetBufferSize(), riid, out)
+                               : o_CreateRootSignature(dev, mask, blob, size, riid, out);
+    if (rebuilt) rebuilt->Release();
+    std::shared_ptr<Obj::Twins> rs_twins;
+    if (decodable && SUCCEEDED(hr) && out && *out) {
+        // Twins for the other levels: same as the game's blob -> nothing to swap.
+        for (int level = 0; level < 3; ++level) {
+            if (level == game_level) continue;
+            const bool same_as_game = level_same[level] && level_same[game_level];
+            if (same_as_game) continue; // marked below if any other level needs twins
+            if (!rs_twins) rs_twins = std::make_shared<Obj::Twins>();
+            const void* bytes = level_blob[level] ? level_blob[level]->GetBufferPointer() : blob;
+            const SIZE_T n = level_blob[level] ? level_blob[level]->GetBufferSize() : size;
+            ID3D12RootSignature* twin = nullptr;
+            if (SUCCEEDED(o_CreateRootSignature(dev, mask, bytes, n, IID_PPV_ARGS(&twin))) && twin) {
+                rs_twins->obj[level] = twin;
+                g_mip_twin_rs.fetch_add(1, std::memory_order_relaxed);
+            } else g_mip_twin_fail.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (rs_twins)
+            for (int level = 0; level < 3; ++level)
+                rs_twins->same[level] = level == game_level || (level_same[level] && level_same[game_level]);
+    }
+    for (auto* b : level_blob) if (b) b->Release();
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj) return hr;
     constexpr uint32_t kMaxParams = 64, kMaxRanges = 256;
@@ -1477,10 +1696,60 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
             it->second.created.assign(raw, raw + ev.e.hdr.size_bytes);
             it->second.root_params.assign(params, params + ev.e.param_count);
             it->second.root_ranges.assign(ranges, ranges + nranges);
+            rs_twins.swap(it->second.twins); // any previous set is released after g_m (end of scope)
+            // Structural hash of the layout (parameter and range records), not the object:
+            // identical layouts created in another session hash the same.
+            uint64_t layout_hash = 1469598103934665603ull;
+            const auto mix = [&layout_hash](const void* data, size_t len) {
+                for (size_t b = 0; b < len; ++b) layout_hash = (layout_hash ^ static_cast<const uint8_t*>(data)[b]) * 1099511628211ull;
+            };
+            mix(params, ev.e.param_count * sizeof(na_root_param));
+            mix(ranges, nranges * sizeof(na_root_range));
+            it->second.root_hash = layout_hash ? layout_hash : 1;
         }
     }
     na::observe_internal::Emit(&ev, NA_GROUP_PIPELINE);
     return hr;
+}
+
+// Live mip bias: the root signature's twins (null when it needs none).
+std::shared_ptr<Obj::Twins> rs_twins_of(const void* rs)
+{
+    if (!rs) return nullptr;
+    std::shared_lock<std::shared_mutex> lock(g_m);
+    const auto it = g_objs.find(canon(rs));
+    return it == g_objs.end() ? nullptr : it->second.twins;
+}
+// Builds pipeline twins with `make(level, twin_rs)` for every level whose root-signature
+// twin differs; levels whose root signature is unchanged need no twin (same[]).
+// A pipeline without a known root signature gets an empty twin set (never swapped:
+// a list using it falls back to the game's objects).
+template <typename Make>
+void make_pso_twins(IUnknown* pso, const void* rs, Make make)
+{
+    if (!pso || !g_mip_live_enabled.load(std::memory_order_relaxed)) return;
+    const auto rt = rs_twins_of(rs);
+    std::shared_ptr<Obj::Twins> pt;
+    if (!rs) {
+        pt = std::make_shared<Obj::Twins>(); // embedded root signature: not swappable
+        pt->same[g_mip_game_level.load()] = true;
+        g_mip_untwinned.fetch_add(1, std::memory_order_relaxed);
+    } else if (rt) {
+        pt = std::make_shared<Obj::Twins>();
+        for (int level = 0; level < 3; ++level) {
+            if (rt->same[level]) { pt->same[level] = true; continue; }
+            if (!rt->obj[level]) continue; // twin root signature failed: no swap for this level
+            IUnknown* twin = make(level, static_cast<ID3D12RootSignature*>(rt->obj[level]));
+            if (twin) { pt->obj[level] = twin; g_mip_twin_pso.fetch_add(1, std::memory_order_relaxed); }
+            else g_mip_twin_fail.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else return; // root signature needs no twins: the pipeline needs none either
+    {
+        std::unique_lock<std::shared_mutex> lock(g_m);
+        const auto it = g_objs.find(canon(pso));
+        if (it != g_objs.end()) pt.swap(it->second.twins);
+    }
+    pt.reset(); // a replaced set (if any) is released outside g_m
 }
 
 HRESULT STDMETHODCALLTYPE D_CreateGraphicsPipelineState(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, REFIID riid, void** out)
@@ -1504,6 +1773,13 @@ HRESULT STDMETHODCALLTYPE D_CreateGraphicsPipelineState(ID3D12Device* dev, const
     depth_blend(e, d->DepthStencilState.DepthEnable, d->DepthStencilState.DepthWriteMask, d->DepthStencilState.DepthFunc);
     blend_mask(e, d->BlendState);
     emit_pipeline(dev, obj, e, d->pRootSignature);
+    make_pso_twins(obj, d->pRootSignature, [&](int, ID3D12RootSignature* trs) -> IUnknown* {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC c = *d;
+        c.pRootSignature = trs;
+        c.CachedPSO = {}; // the cache belongs to the game's variant
+        ID3D12PipelineState* t = nullptr;
+        return SUCCEEDED(o_CreateGraphicsPipelineState(dev, &c, IID_PPV_ARGS(&t))) ? t : nullptr;
+    });
     return hr;
 }
 
@@ -1522,6 +1798,13 @@ HRESULT STDMETHODCALLTYPE D_CreateComputePipelineState(ID3D12Device* dev, const 
     e.blend_enable_mask = 0;
     bytecode(e, NA_STAGE_CS, d->CS);
     emit_pipeline(dev, obj, e, d->pRootSignature);
+    make_pso_twins(obj, d->pRootSignature, [&](int, ID3D12RootSignature* trs) -> IUnknown* {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC c = *d;
+        c.pRootSignature = trs;
+        c.CachedPSO = {};
+        ID3D12PipelineState* t = nullptr;
+        return SUCCEEDED(o_CreateComputePipelineState(dev, &c, IID_PPV_ARGS(&t))) ? t : nullptr;
+    });
     return hr;
 }
 
@@ -1587,6 +1870,7 @@ HRESULT STDMETHODCALLTYPE D_CreatePipelineState(ID3D12Device2* dev, const D3D12_
     ID3D12RootSignature* rs = nullptr;
     const auto* p = static_cast<const uint8_t*>(d->pPipelineStateSubobjectStream);
     size_t at = 0;
+    size_t rs_offset = SIZE_MAX, cached_offset = SIZE_MAX; // live mip bias: subobjects patched in the twins
     bool saw_depth = false;
     while (at + sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) <= d->SizeInBytes) {
         const auto type = *reinterpret_cast<const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE*>(p + at);
@@ -1597,7 +1881,8 @@ HRESULT STDMETHODCALLTYPE D_CreatePipelineState(ID3D12Device2* dev, const D3D12_
         }
         const uint8_t* s = p + at;
         switch (type) {
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: rs = inner_of<ID3D12RootSignature*>(s); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: rs = inner_of<ID3D12RootSignature*>(s); rs_offset = at; break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO: cached_offset = at; break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: bytecode(e, NA_STAGE_VS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS: bytecode(e, NA_STAGE_PS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS: bytecode(e, NA_STAGE_DS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
@@ -1635,6 +1920,17 @@ HRESULT STDMETHODCALLTYPE D_CreatePipelineState(ID3D12Device2* dev, const D3D12_
     if (!saw_depth && e.stage_hash[NA_STAGE_CS] == 0) depth_blend(e, TRUE, D3D12_DEPTH_WRITE_MASK_ALL, D3D12_COMPARISON_FUNC_LESS);
     if (e.blend_enable_mask == NA_UNKNOWN_U32 && e.stage_hash[NA_STAGE_CS] == 0) e.blend_enable_mask = 0; // default: no blending
     emit_pipeline(dev, obj, e, rs);
+    if (rs_offset != SIZE_MAX)
+        make_pso_twins(obj, rs, [&](int, ID3D12RootSignature* trs) -> IUnknown* {
+            // Copy the stream, point its root-signature subobject at the twin, drop any cache.
+            std::vector<uint8_t> copy(p, p + d->SizeInBytes);
+            std::memcpy(copy.data() + rs_offset + offsetof(Sub<ID3D12RootSignature*>, inner), &trs, sizeof(trs));
+            if (cached_offset != SIZE_MAX) std::memset(copy.data() + cached_offset + offsetof(Sub<D3D12_CACHED_PIPELINE_STATE>, inner), 0, sizeof(D3D12_CACHED_PIPELINE_STATE));
+            D3D12_PIPELINE_STATE_STREAM_DESC c{d->SizeInBytes, copy.data()};
+            ID3D12PipelineState* t = nullptr;
+            return SUCCEEDED(o_CreatePipelineState(dev, &c, IID_PPV_ARGS(&t))) ? t : nullptr;
+        });
+    else make_pso_twins(obj, nullptr, [](int, ID3D12RootSignature*) -> IUnknown* { return nullptr; });
     return hr;
 }
 
@@ -1835,7 +2131,6 @@ template <>
 struct On<sl::list::Reset> {
     static void run(GL* l, HRESULT hr, ID3D12CommandAllocator* alloc, ID3D12PipelineState* pso)
     {
-        (void)pso;
         if (t_host_work) return;
         na_object_id id = 0;
         bool known = false;
@@ -1864,6 +2159,19 @@ struct On<sl::list::Reset> {
                     ls->evidence_complete = true;
                     ls->uses.clear();
                     ls->uses_complete = true;
+                    ls->targets.clear();
+                    ls->insertion.Reset();
+                    ls->sampled_textures.clear();
+                    ls->cleared.clear();
+                    ls->pso = pso;
+                    ls->heaps[0] = ls->heaps[1] = nullptr;
+                    ls->nheaps = 0;
+                    ls->args[0].clear();
+                    ls->args[1].clear();
+                    ls->cur_rt = ls->cur_ds = 0;
+                    ls->cur_nrt = 0;
+                    ls->restorable = true;
+                    ls->in_render_pass = false;
                 }
                 ls->root_sig[0] = ls->root_sig[1] = nullptr;
                 ls->coverage_complete.store(cov == na::hooking::variants::Coverage::Complete);
@@ -1903,12 +2211,35 @@ struct On<sl::list::Close> {
         emit(e, NA_GROUP_LIST);
     }
 };
+void note_draw(GL* l) {
+    std::shared_lock<std::shared_mutex> lock(g_m);
+    na_object_id id = 0;
+    auto* ls = list_state_locked(l, &id);
+    if (!ls) return;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    uint64_t sel_depth = 0, sel_color = 0;
+    GetLiveSelection(&sel_depth, &sel_color);
+    for (uint32_t i = 0; i < ls->cur_nrt; ++i)
+        if (ls->cur_rts[i]) {
+            na::j2::InsertionEvent ev{ls->cur_rts[i], 0, reinterpret_cast<uint64_t>(ls->pso), true, na::j2::Op::DrawWrite};
+            ev.with_depth = sel_depth && ls->cur_ds == sel_depth; // scene content, not a reuse of the texture
+            ls->insertion.Add(ev);
+        }
+    auto pipeline = g_objs.find(canon(ls->pso));
+    if (ls->cur_ds && ls->cur_ds_sub != NA_UNKNOWN_U32 && pipeline != g_objs.end() &&
+        pipeline->second.created.size() >= sizeof(na_ev_pipeline_created)) {
+        const auto* p = reinterpret_cast<const na_ev_pipeline_created*>(pipeline->second.created.data());
+        if (p->depth_enable == 1 && p->depth_write == 1 && ls->states.size() < 4096)
+            ls->states.push_back({ls->cur_ds, ls->cur_ds_sub, D3D12_RESOURCE_STATE_DEPTH_WRITE});
+    }
+}
 template <>
 struct On<sl::list::DrawInstanced> {
     static void run(GL* l, UINT v, UINT i, UINT, UINT)
     {
         Rec r;
         if (begin_op(l, &r)) emit_op(r, NA_OP_DRAW, {v, i});
+        if (r.list) note_draw(l);
     }
 };
 template <>
@@ -1917,6 +2248,7 @@ struct On<sl::list::DrawIndexedInstanced> {
     {
         Rec r;
         if (begin_op(l, &r)) emit_op(r, NA_OP_DRAW_INDEXED, {n, i});
+        if (r.list) note_draw(l);
     }
 };
 template <>
@@ -2038,7 +2370,9 @@ struct On<sl::list::SetPipelineState> {
     static void run(GL* l, ID3D12PipelineState* p)
     {
         Rec r;
-        if (begin_op(l, &r)) emit_op(r, NA_OP_SET_PIPELINE, {id_or_unknown(p)});
+        if (!begin_op(l, &r)) return;
+        emit_op(r, NA_OP_SET_PIPELINE, {id_or_unknown(p)});
+        with_list_state(l, [&](ListState& ls) { std::lock_guard<std::mutex> bl(ls.bind_m); ls.pso = p; });
     }
 };
 template <>
@@ -2126,7 +2460,9 @@ struct On<sl::list::ExecuteBundle> {
     static void run(GL* l, ID3D12GraphicsCommandList* bundle)
     {
         Rec r;
-        if (begin_op(l, &r)) emit_op(r, NA_OP_EXECUTE_BUNDLE, {id_or_unknown(bundle)}, nullptr, 0, 0, NA_EVF_METHOD_UNOBSERVED);
+        if (!begin_op(l, &r)) return;
+        emit_op(r, NA_OP_EXECUTE_BUNDLE, {id_or_unknown(bundle)}, nullptr, 0, 0, NA_EVF_METHOD_UNOBSERVED);
+        with_list_state(l, [&](ListState& ls) { std::lock_guard<std::mutex> bl(ls.bind_m); ls.restorable = false; }); // a bundle's state changes are not observed
     }
 };
 template <>
@@ -2144,6 +2480,11 @@ struct On<sl::list::SetDescriptorHeaps> {
                 if (dh->key == h[i]) (dh->type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? smp : res) = dh->id;
         }
         emit_op(r, NA_OP_SET_DESCRIPTOR_HEAPS, {res, smp});
+        with_list_state(l, [&](ListState& ls) {
+            std::lock_guard<std::mutex> bl(ls.bind_m);
+            ls.nheaps = 0;
+            for (UINT i = 0; h && i < n && i < 2; ++i) ls.heaps[ls.nheaps++] = h[i];
+        });
     }
 };
 template <uint32_t Compute>
@@ -2152,12 +2493,38 @@ void root_sig(GL* l, ID3D12RootSignature* rs)
     Rec r;
     if (!begin_op(l, &r)) return;
     emit_op(r, NA_OP_SET_ROOT_SIGNATURE, {id_or_unknown(rs), Compute});
-    with_list_state(l, [&](ListState& ls) { ls.root_sig[Compute] = rs; });
+    with_list_state(l, [&](ListState& ls) {
+        const bool changed = ls.root_sig[Compute] != rs;
+        ls.root_sig[Compute] = rs;
+        std::lock_guard<std::mutex> bl(ls.bind_m);
+        if (changed) ls.args[Compute].clear(); // a different root signature invalidates every root argument
+    });
 }
 template <>
 struct On<sl::list::SetComputeRootSignature> { static void run(GL* l, ID3D12RootSignature* rs) { root_sig<1>(l, rs); } };
 template <>
 struct On<sl::list::SetGraphicsRootSignature> { static void run(GL* l, ID3D12RootSignature* rs) { root_sig<0>(l, rs); } };
+void shadow_arg(GL* l, uint32_t compute, UINT param, uint8_t type, uint64_t value, const void* consts = nullptr, UINT count = 0, UINT dest = 0)
+{
+    if (param >= 64) return;
+    with_list_state(l, [&](ListState& ls) {
+        std::lock_guard<std::mutex> bl(ls.bind_m);
+        auto& v = ls.args[compute];
+        if (v.size() <= param) v.resize(param + 1);
+        ListState::RootArg& a = v[param];
+        if (type == 5) {
+            if (a.type != 5) a.consts.clear();
+            if (dest + count > 64) return;
+            if (a.consts.size() < dest + count) a.consts.resize(dest + count, 0u);
+            std::memcpy(a.consts.data() + dest, consts, count * 4u);
+        } else {
+            a.consts.clear();
+        }
+        a.type = type;
+        a.value = value;
+    });
+}
+std::atomic<TableBindCallback> g_table_cb{nullptr};
 template <uint32_t Compute>
 void root_table(GL* l, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE h)
 {
@@ -2166,6 +2533,7 @@ void root_table(GL* l, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE h)
     na_object_id heap = 0;
     uint32_t slot = 0;
     uint64_t version = 0;
+    shadow_arg(l, Compute, param, 1, h.ptr);
     {
         std::shared_lock<std::shared_mutex> lock(g_m);
         DescHeap* dh = heap_for_gpu_locked(h.ptr, &slot);
@@ -2184,6 +2552,18 @@ void root_table(GL* l, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE h)
                     const auto& rr = it->second.root_ranges;
                     for (uint32_t q = 0; q < rp.count && rp.first_range + q < rr.size(); ++q) {
                         const na_root_range& range = rr[rp.first_range + q];
+                        if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && range.table_offset != NA_UNKNOWN_U32) {
+                            std::lock_guard<std::mutex> bl(ls->bind_m);
+                            for (uint32_t k = 0; k < std::min<uint32_t>(range.num_descriptors, 64); ++k) {
+                                const uint64_t index = uint64_t(slot) + range.table_offset + k;
+                                if (index >= dh->count) break;
+                                const auto& si = dh->info[static_cast<size_t>(index)];
+                                if (si.kind == NA_DESC_SRV && si.resource && si.resource != NA_UNKNOWN_U64 &&
+                                    ls->sampled_textures.size() < 256 &&
+                                    std::find(ls->sampled_textures.begin(), ls->sampled_textures.end(), si.resource) == ls->sampled_textures.end())
+                                    ls->sampled_textures.push_back(si.resource);
+                            }
+                        }
                         if (range.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_CBV || range.table_offset == NA_UNKNOWN_U32) continue;
                         const uint32_t n = std::min<uint32_t>(range.num_descriptors, 8);
                         const bool cut = range.num_descriptors > 8; // incl. unbounded: coverage flagged
@@ -2219,6 +2599,7 @@ void root_consts(GL* l, UINT param, UINT count, const void* data, UINT dest)
     Rec r;
     if (!begin_op(l, &r) || !data) return;
     emit_op(r, NA_OP_SET_ROOT_CONSTANTS, {param, dest, count, Compute}, data, count * 4u, 4u, 0, NA_GROUP_CPU_CONSTANTS);
+    shadow_arg(l, Compute, param, 5, 0, data, count, dest);
 }
 template <>
 struct On<sl::list::SetComputeRoot32BitConstant> { static void run(GL* l, UINT p, UINT v, UINT d) { root_consts<1>(l, p, 1, &v, d); } };
@@ -2233,6 +2614,7 @@ void root_view(GL* l, UINT param, D3D12_GPU_VIRTUAL_ADDRESS va)
 {
     Rec r;
     if (!begin_op(l, &r)) return;
+    shadow_arg(l, Compute, param, Kind == NA_DESC_CBV ? 2 : (Kind == NA_DESC_SRV ? 3 : 4), va);
     na_object_id res = 0;
     uint64_t off = 0;
     bool known = false;
@@ -2267,6 +2649,26 @@ template <>
 struct On<sl::list::SetComputeRootUnorderedAccessView> { static void run(GL* l, UINT p, D3D12_GPU_VIRTUAL_ADDRESS a) { root_view<NA_DESC_UAV, 1>(l, p, a); } };
 template <>
 struct On<sl::list::SetGraphicsRootUnorderedAccessView> { static void run(GL* l, UINT p, D3D12_GPU_VIRTUAL_ADDRESS a) { root_view<NA_DESC_UAV, 0>(l, p, a); } };
+// Current targets + target history of a recording (OMSetRenderTargets and BeginRenderPass).
+// refs: render targets, then the depth view last when has_dsv.
+void set_targets_locked(ListState& ls, const na_view_ref* refs, uint32_t m, bool has_dsv)
+{
+    const uint32_t nrt = has_dsv ? (m ? m - 1 : 0) : m;
+    ls.cur_rt = nrt ? refs[0].resource : 0;
+    ls.cur_nrt = nrt;
+    for (uint32_t i = 0; i < nrt; ++i) ls.cur_rts[i] = refs[i].resource;
+    ls.cur_ds = has_dsv && m ? refs[m - 1].resource : 0;
+    ls.cur_ds_sub = has_dsv && m ? refs[m - 1].first_subresource : NA_UNKNOWN_U32;
+    for (uint32_t i = 0; i < m; ++i) add_use_locked(ls, refs[i].resource);
+    if (m > 0 && ls.targets.size() < 4096) {
+        const na_object_id ds = has_dsv ? refs[m - 1].resource : 0; // 0: no depth target
+        const uint32_t ds_sub = has_dsv ? refs[m - 1].first_subresource : 0;
+        for (uint32_t i = 0; i < nrt; ++i)
+            if (refs[i].resource && (ls.targets.empty() || !ls.targets.back().same(refs[i].resource, ds) ||
+                                     ls.targets.back().rt_sub != refs[i].first_subresource))
+                ls.targets.push_back({refs[i].resource, ds, refs[i].first_subresource, ds_sub}); // UNKNOWN: a view J2 cannot place
+    }
+}
 template <>
 struct On<sl::list::OMSetRenderTargets> {
     static void run(GL* l, UINT n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, BOOL single, const D3D12_CPU_DESCRIPTOR_HANDLE* dsv)
@@ -2294,7 +2696,7 @@ struct On<sl::list::OMSetRenderTargets> {
                 NA_GROUP_RESOURCE_USE);
         with_list_state(l, [&](ListState& ls) {
             std::lock_guard<std::mutex> bl(ls.bind_m);
-            for (uint32_t i = 0; i < m; ++i) add_use_locked(ls, refs[i].resource);
+            set_targets_locked(ls, refs, m, dsv != nullptr);
         });
     }
 };
@@ -2307,6 +2709,11 @@ struct On<sl::list::ClearDepthStencilView> {
         const na_view_ref v = cpu_ref(h);
         emit_op(r, NA_OP_CLEAR_DSV, {static_cast<uint64_t>(f), float_bits(depth, 0.f), stencil}, &v, sizeof(v), sizeof(v), 0, NA_GROUP_RESOURCE_USE);
         note_uses(l, {v.resource});
+        if ((f & D3D12_CLEAR_FLAG_DEPTH) && v.resource && v.first_subresource != NA_UNKNOWN_U32)
+            with_list_state(l, [&](ListState& ls) {
+                std::lock_guard<std::mutex> bl(ls.bind_m);
+                if (ls.states.size() < 4096) ls.states.push_back({v.resource, v.first_subresource, D3D12_RESOURCE_STATE_DEPTH_WRITE});
+            });
     }
 };
 template <>
@@ -2320,6 +2727,12 @@ struct On<sl::list::ClearRenderTargetView> {
         const float* cc = c ? c : z;
         emit_op(r, NA_OP_CLEAR_RTV, {float_bits(cc[0], cc[1]), float_bits(cc[2], cc[3])}, &v, sizeof(v), sizeof(v), 0, NA_GROUP_RESOURCE_USE);
         note_uses(l, {v.resource});
+        with_list_state(l, [&](ListState& ls) {
+            std::lock_guard<std::mutex> bl(ls.bind_m);
+            if (v.resource) ls.insertion.Add({v.resource, 0, 0, true, na::j2::Op::ClearWrite});
+            if (v.resource && ls.cleared.size() < 64 && std::find(ls.cleared.begin(), ls.cleared.end(), v.resource) == ls.cleared.end())
+                ls.cleared.push_back(v.resource);
+        });
     }
 };
 template <>
@@ -2330,6 +2743,335 @@ struct On<sl::list::ExecuteIndirect> {
         if (begin_op(l, &r)) emit_op(r, NA_OP_EXECUTE_INDIRECT, {max}, nullptr, 0, 0, NA_EVF_METHOD_UNOBSERVED);
     }
 };
+
+// ID3D12GraphicsCommandList4 render passes (Kind::CommandList4). BeginRenderPass binds
+// the attachments (and may clear them); EndRenderPass leaves bindings UNDEFINED
+// (Microsoft's contract), so current bindings are cleared, history kept. Host
+// copies/dispatches are illegal inside a pass: ListStateRestorable is false there.
+template <>
+struct On<sl::list::BeginRenderPass> {
+    static void run(GL* l, UINT n, const D3D12_RENDER_PASS_RENDER_TARGET_DESC* rts, const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC* ds,
+                    D3D12_RENDER_PASS_FLAGS)
+    {
+        Rec r;
+        if (!begin_op(l, &r)) return;
+        na_view_ref refs[9];
+        uint32_t m = 0;
+        {
+            std::shared_lock<std::shared_mutex> lock(g_m);
+            for (UINT i = 0; rts && i < n && i < 8; ++i) {
+                uint32_t slot = 0;
+                refs[m++] = view_ref_locked(heap_for_cpu_locked(rts[i].cpuDescriptor.ptr, &slot), slot);
+            }
+            if (ds) {
+                uint32_t slot = 0;
+                refs[m++] = view_ref_locked(heap_for_cpu_locked(ds->cpuDescriptor.ptr, &slot), slot);
+            }
+        }
+        const uint32_t nrt = ds ? (m ? m - 1 : 0) : m;
+        emit_op(r, NA_OP_OM_SET_RENDER_TARGETS, {nrt, ds ? 1u : 0u}, refs, m * static_cast<uint32_t>(sizeof(na_view_ref)), sizeof(na_view_ref), 0,
+                NA_GROUP_RESOURCE_USE);
+        // Beginning clears are clears of those attachments (as separate ops, like the Clear* calls).
+        for (uint32_t i = 0; i < nrt; ++i) {
+            if (rts[i].BeginningAccess.Type != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR) continue;
+            Rec rc;
+            if (!begin_op(l, &rc)) break;
+            const FLOAT* c = rts[i].BeginningAccess.Clear.ClearValue.Color;
+            emit_op(rc, NA_OP_CLEAR_RTV, {float_bits(c[0], c[1]), float_bits(c[2], c[3])}, &refs[i], sizeof(refs[i]), sizeof(refs[i]), 0, NA_GROUP_RESOURCE_USE);
+        }
+        const bool depth_clear = ds && ds->DepthBeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR;
+        if (depth_clear) {
+            Rec rc;
+            if (begin_op(l, &rc)) {
+                const auto& v = ds->DepthBeginningAccess.Clear.ClearValue.DepthStencil;
+                emit_op(rc, NA_OP_CLEAR_DSV, {static_cast<uint64_t>(D3D12_CLEAR_FLAG_DEPTH), float_bits(v.Depth, 0.f), v.Stencil}, &refs[m - 1],
+                        sizeof(refs[m - 1]), sizeof(refs[m - 1]), 0, NA_GROUP_RESOURCE_USE);
+            }
+        }
+        with_list_state(l, [&](ListState& ls) {
+            std::lock_guard<std::mutex> bl(ls.bind_m);
+            set_targets_locked(ls, refs, m, ds != nullptr);
+            ls.in_render_pass = true;
+            for (uint32_t i = 0; i < nrt; ++i) {
+                if (rts[i].BeginningAccess.Type != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR || !refs[i].resource) continue;
+                ls.insertion.Add({refs[i].resource, 0, 0, true, na::j2::Op::ClearWrite});
+                if (ls.cleared.size() < 64 && std::find(ls.cleared.begin(), ls.cleared.end(), refs[i].resource) == ls.cleared.end())
+                    ls.cleared.push_back(refs[i].resource);
+            }
+            if (depth_clear && refs[m - 1].resource && refs[m - 1].first_subresource != NA_UNKNOWN_U32 && ls.states.size() < 4096)
+                ls.states.push_back({refs[m - 1].resource, refs[m - 1].first_subresource, D3D12_RESOURCE_STATE_DEPTH_WRITE});
+        });
+    }
+};
+template <>
+struct On<sl::list::EndRenderPass> {
+    static void run(GL* l)
+    {
+        Rec r;
+        if (!begin_op(l, &r)) return;
+        with_list_state(l, [&](ListState& ls) {
+            std::lock_guard<std::mutex> bl(ls.bind_m);
+            ls.in_render_pass = false;
+            ls.cur_rt = ls.cur_ds = 0; // attachments are not bound after the pass
+            ls.cur_nrt = 0;
+            for (auto& t : ls.cur_rts) t = 0;
+            ls.cur_ds_sub = NA_UNKNOWN_U32;
+        });
+    }
+};
+
+// Width/height/format of a resource from its recorded creation (no COM calls under g_m).
+bool resource_dims_locked(na_object_id id, uint32_t* w, uint32_t* h, uint32_t* fmt)
+{
+    const auto key = g_res_keys.find(id);
+    if (key == g_res_keys.end()) return false;
+    const auto o = g_objs.find(key->second);
+    if (o == g_objs.end() || o->second.created.size() < sizeof(na_ev_resource_created)) return false;
+    const auto* e = reinterpret_cast<const na_ev_resource_created*>(o->second.created.data());
+    if (e->hdr.kind != NA_EV_RESOURCE_CREATED || e->dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return false;
+    *w = static_cast<uint32_t>(e->width);
+    *h = e->height;
+    *fmt = e->format;
+    return true;
+}
+// Minimal lineage (Astra #3): textures copied/resolved from the scene colour this frame
+// (and from those), so a read of the copy counts as continuation of the scene chain.
+// Bounded; reset by J2 at each Present.
+std::mutex g_derived_m;
+na_object_id g_derived[16] = {};
+std::atomic<uint32_t> g_derived_n{0}; // read without the lock as a fast "nothing derived" check
+bool is_derived_any(const na_object_id* ids, uint32_t n)
+{
+    if (!n || !g_derived_n.load(std::memory_order_relaxed)) return false; // the common case: no copy of the scene yet
+    std::lock_guard<std::mutex> lk(g_derived_m);
+    const uint32_t m = g_derived_n.load(std::memory_order_relaxed);
+    for (uint32_t k = 0; k < n; ++k)
+        for (uint32_t i = 0; i < m; ++i) if (ids[k] && g_derived[i] == ids[k]) return true;
+    return false;
+}
+bool is_derived(na_object_id id) { return is_derived_any(&id, 1); }
+void add_derived(na_object_id id)
+{
+    if (!id) return;
+    std::lock_guard<std::mutex> lk(g_derived_m);
+    const uint32_t m = g_derived_n.load(std::memory_order_relaxed);
+    for (uint32_t i = 0; i < m; ++i) if (g_derived[i] == id) return;
+    if (m < 16) { g_derived[m] = id; g_derived_n.store(m + 1, std::memory_order_release); }
+}
+
+// Resolve bindings at use time: a table bind may precede PSO/target changes.
+void before_read_transition(GL* l, UINT count, const D3D12_RESOURCE_BARRIER* barriers)
+{
+    if (t_host_work || !na::observe_internal::Started() || !barriers) return;
+    uint64_t depth = 0, color = 0;
+    GetLiveSelection(&depth, &color);
+    if (!color) return;
+    constexpr UINT reads = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                           D3D12_RESOURCE_STATE_COPY_SOURCE | D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+    for (UINT i = 0; i < count; ++i) {
+        const auto& b = barriers[i];
+        if (b.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || b.Flags != D3D12_RESOURCE_BARRIER_FLAG_NONE ||
+            !(b.Transition.StateBefore & D3D12_RESOURCE_STATE_RENDER_TARGET) || !(b.Transition.StateAfter & reads) ||
+            resource_id(b.Transition.pResource) != color) continue;
+        uint32_t cs = 0, ds = 0;
+        if (!ListSceneSubresource(l, color, depth, &cs, &ds) ||
+            (b.Transition.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && b.Transition.Subresource != cs)) continue;
+        {
+            std::shared_lock<std::shared_mutex> lock(g_m);
+            na_object_id lid = 0;
+            auto* ls = list_state_locked(l, &lid);
+            if (!ls) return;
+            std::lock_guard<std::mutex> bl(ls->bind_m);
+            ls->insertion.Add({color, 0, UINT64_MAX, false, na::j2::Op::Barrier});
+        }
+        if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, true);
+        break; // our pass runs before the whole original barrier batch
+    }
+}
+
+void before_texture_copy(GL* l, ID3D12Resource* dst, ID3D12Resource* src)
+{
+    if (t_host_work || !na::observe_internal::Started() || !dst || !src) return;
+    uint64_t depth = 0, color = 0;
+    GetLiveSelection(&depth, &color);
+    const auto source = resource_id(src), destination = resource_id(dst);
+    if (!color) return;
+    const bool from_color = source == color;
+    if (!from_color && !is_derived(source)) return;
+    add_derived(destination); // lineage: the copy carries the scene on
+    {
+        std::shared_lock<std::shared_mutex> lock(g_m);
+        na_object_id lid = 0;
+        auto* ls = list_state_locked(l, &lid);
+        if (!ls) return;
+        std::lock_guard<std::mutex> bl(ls->bind_m);
+        na::j2::InsertionEvent ev{color, destination, 0, false, from_color ? na::j2::Op::CopyRead : na::j2::Op::DerivedRead};
+        resource_dims_locked(destination, &ev.dst_w, &ev.dst_h, &ev.dst_fmt);
+        ev.color_srvs = from_color ? 1 : 0;
+        ls->insertion.Add(ev);
+    }
+    if (from_color) if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, true);
+}
+
+void after_texture_copy(GL* l, ID3D12Resource* dst)
+{
+    if (t_host_work || !na::observe_internal::Started() || !dst) return;
+    const auto destination = resource_id(dst);
+    std::shared_lock<std::shared_mutex> lock(g_m);
+    na_object_id lid = 0;
+    auto* ls = list_state_locked(l, &lid);
+    if (!ls) return;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    ls->insertion.Add({destination, 0, 0, true, na::j2::Op::CopyWrite});
+}
+
+void before_shader_use(GL* l, bool compute)
+{
+    if (t_host_work || !na::observe_internal::Started()) return;
+    uint64_t depth = 0, color = 0;
+    GetLiveSelection(&depth, &color);
+    if (!color) return;
+    bool reads_color = false;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_m);
+        na_object_id lid = 0;
+        auto* ls = list_state_locked(l, &lid);
+        if (!ls) return;
+        std::lock_guard<std::mutex> bl(ls->bind_m);
+        const auto signature = g_objs.find(canon(ls->root_sig[compute]));
+        if (signature == g_objs.end()) return;
+        na_object_id destination = compute ? 0 : ls->cur_rt;
+        uint8_t color_srvs = 0;
+        na_object_id srv_ids[16] = {};
+        uint32_t nsrv = 0;
+        bool reads_derived = false;
+        const auto& params = signature->second.root_params;
+        const auto& ranges = signature->second.root_ranges;
+        for (size_t p = 0; p < ls->args[compute].size() && p < params.size(); ++p) {
+            const auto& arg = ls->args[compute][p];
+            if (arg.type != 1 || params[p].param_type != NA_ROOT_TABLE) continue;
+            uint32_t slot = 0;
+            auto* heap = heap_for_gpu_locked(arg.value, &slot);
+            if (!heap) continue;
+            bool bound = false;
+            for (uint32_t h = 0; h < ls->nheaps; ++h) bound |= heap->key == ls->heaps[h];
+            if (!bound) continue;
+            for (uint32_t r = 0; r < params[p].count && params[p].first_range + r < ranges.size(); ++r) {
+                const auto& range = ranges[params[p].first_range + r];
+                if (range.table_offset == NA_UNKNOWN_U32) continue;
+                for (uint32_t k = 0; k < std::min<uint32_t>(range.num_descriptors, 64); ++k) {
+                    const uint64_t index = uint64_t(slot) + range.table_offset + k;
+                    if (index >= heap->count) break;
+                    const auto& info = heap->info[static_cast<size_t>(index)];
+                    if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && info.kind == NA_DESC_SRV) {
+                        if (info.resource == color) {
+                            reads_color = true;
+                            if (color_srvs < 255) ++color_srvs;
+                        } else if (info.resource) {
+                            if (nsrv < 16) srv_ids[nsrv++] = info.resource;
+                        }
+                    }
+                    if (compute && !destination && range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV && info.kind == NA_DESC_UAV)
+                        destination = info.resource;
+                }
+            }
+        }
+        if (reads_color) {
+            // Role-class inputs (only for the few draws that read the scene colour).
+            na::j2::InsertionEvent ev{color, destination, reinterpret_cast<uint64_t>(ls->pso), false,
+                                      compute ? na::j2::Op::ComputeRead : na::j2::Op::GraphicsRead,
+                                      signature->second.root_hash};
+            ev.color_srvs = color_srvs;
+            resource_dims_locked(destination, &ev.dst_w, &ev.dst_h, &ev.dst_fmt);
+            uint32_t cw = 0, ch = 0, cf = 0;
+            if (resource_dims_locked(color, &cw, &ch, &cf))
+                for (uint32_t si = 0; si < nsrv; ++si) {
+                    uint32_t sw = 0, sh = 0, sf = 0;
+                    if (resource_dims_locked(srv_ids[si], &sw, &sh, &sf) && sw == cw && sh == ch && ev.view_srvs < 255) ++ev.view_srvs;
+                }
+            ls->insertion.Add(ev);
+        } else {
+            reads_derived = is_derived_any(srv_ids, nsrv);
+            if (reads_derived) // lineage only: the scene chain continues through a copy
+                ls->insertion.Add({color, destination, reinterpret_cast<uint64_t>(ls->pso), false, na::j2::Op::DerivedRead});
+        }
+    }
+    if (reads_color) if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, compute);
+}
+
+// ---- Live mip bias: bind the twins of the level latched at this recording's Reset.
+// A pipeline without a twin for that level (pipeline-library loads, embedded root
+// signatures) switches the recording back to the game's own objects: the state shadow
+// re-binds the game's root signatures and arguments first, so pipeline and root
+// signature always match.
+template <typename T>
+T* mip_swap_locked(int level, T* obj, bool pso, bool* untwinned)
+{
+    if (level < 0 || !obj) return obj;
+    const auto it = g_objs.find(canon(obj));
+    if (it == g_objs.end()) {
+        // Unknown pipeline: ours (host work, e.g. DLAA's own passes) is left alone; the
+        // game's (a pipeline-library load) has no twin.
+        if (pso && !t_host_work) *untwinned = true;
+        return obj;
+    }
+    if (!it->second.twins) return obj; // its root signature needs no twins
+    const auto& t = *it->second.twins;
+    if (t.same[level]) return obj;
+    if (t.obj[level]) return static_cast<T*>(t.obj[level]);
+    *untwinned = true;
+    return obj;
+}
+void mip_on_pso(GL* l, ID3D12PipelineState*& p)
+{
+    if (!g_mip_switched.load(std::memory_order_relaxed) || !p) return;
+    bool fallback = false;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_m);
+        na_object_id lid = 0;
+        ListState* ls = list_state_locked(l, &lid);
+        if (!ls) return;
+        std::lock_guard<std::mutex> bl(ls->bind_m);
+        if (ls->mip_level < 0) return;
+        bool untwinned = false;
+        ID3D12PipelineState* t = mip_swap_locked(ls->mip_level, p, true, &untwinned);
+        if (untwinned) { ls->mip_level = -1; fallback = true; }
+        else p = t;
+    }
+    if (fallback) {
+        g_mip_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        const HostWorkScope host;
+        RestoreListState(l); // re-binds the game's own root signatures + arguments (latch now -1)
+    }
+}
+void mip_on_rs(GL* l, ID3D12RootSignature*& r)
+{
+    if (!g_mip_switched.load(std::memory_order_relaxed) || !r) return;
+    std::shared_lock<std::shared_mutex> lock(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list_state_locked(l, &lid);
+    if (!ls) return;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    bool untwinned = false;
+    r = mip_swap_locked(ls->mip_level, r, false, &untwinned);
+}
+void mip_on_reset(GL* l, ID3D12PipelineState*& p)
+{
+    if (!g_mip_switched.load(std::memory_order_relaxed)) return;
+    const int live = g_mip_live_level.load(std::memory_order_relaxed), game = g_mip_game_level.load(std::memory_order_relaxed);
+    std::shared_lock<std::shared_mutex> lock(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list_state_locked(l, &lid);
+    if (!ls) return;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    ls->mip_level = static_cast<int8_t>(live != game ? live : -1);
+    if (ls->mip_level >= 0 && p) {
+        bool untwinned = false;
+        ID3D12PipelineState* t = mip_swap_locked(ls->mip_level, p, true, &untwinned);
+        if (untwinned) ls->mip_level = -1; // nothing bound yet: simply record with the game's objects
+        else p = t;
+    }
+}
 
 // Thunk pools (variant registry, A48/A49): one detour per implementation variant.
 constexpr uint32_t kThunks = 4;
@@ -2344,8 +3086,34 @@ struct ListHook<Slot, R(A...)> {
     {
         na::hooking::variants::CallScope scope(l, Slot);
         auto fn = reinterpret_cast<Pfn>(orig[I]);
+        // Live mip bias: substitute twins before forwarding (also for host re-binds).
+        if constexpr (Slot == sl::list::SetPipelineState) { auto&& t = std::forward_as_tuple(a...); mip_on_pso(l, std::get<0>(t)); }
+        if constexpr (Slot == sl::list::SetGraphicsRootSignature || Slot == sl::list::SetComputeRootSignature) {
+            auto&& t = std::forward_as_tuple(a...);
+            mip_on_rs(l, std::get<0>(t));
+        }
+        if constexpr (Slot == sl::list::Reset) { auto&& t = std::forward_as_tuple(a...); mip_on_reset(l, std::get<1>(t)); }
         if constexpr (std::is_void_v<R>) {
+            if constexpr (Slot == sl::list::ResourceBarrier)
+                if (scope.outermost && !scope.ambiguous) before_read_transition(l, a...);
+            if constexpr (Slot == sl::list::CopyResource || Slot == sl::list::ResolveSubresource || Slot == sl::list::CopyTextureRegion) {
+                if (scope.outermost && !scope.ambiguous) {
+                    auto args = std::forward_as_tuple(a...);
+                    if constexpr (Slot == sl::list::CopyResource) before_texture_copy(l, std::get<0>(args), std::get<1>(args));
+                    else if constexpr (Slot == sl::list::ResolveSubresource) before_texture_copy(l, std::get<0>(args), std::get<2>(args));
+                    else if (std::get<0>(args) && std::get<4>(args)) before_texture_copy(l, std::get<0>(args)->pResource, std::get<4>(args)->pResource);
+                }
+            }
+            if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced || Slot == sl::list::Dispatch)
+                if (scope.outermost && !scope.ambiguous) before_shader_use(l, Slot == sl::list::Dispatch);
             fn(l, a...);
+            if constexpr (Slot == sl::list::CopyResource || Slot == sl::list::ResolveSubresource || Slot == sl::list::CopyTextureRegion) {
+                if (scope.outermost && !scope.ambiguous) {
+                    auto args = std::forward_as_tuple(a...);
+                    if constexpr (Slot == sl::list::CopyTextureRegion) { if (std::get<0>(args)) after_texture_copy(l, std::get<0>(args)->pResource); }
+                    else after_texture_copy(l, std::get<0>(args));
+                }
+            }
             if (scope.outermost && !scope.ambiguous) On<Slot>::run(l, a...);
         } else {
             const R r = fn(l, a...);
@@ -2398,6 +3166,28 @@ bool register_list_slots()
     };
     return na::hooking::variants::Register(na::hooking::variants::Kind::CommandList, specs,
                                            static_cast<uint32_t>(sizeof(specs) / sizeof(specs[0])));
+}
+// Render passes: optional, own kind (snapshotted only through a List4 pointer).
+bool register_list4_slots()
+{
+    namespace L = sl::list;
+    const na::hooking::variants::SlotSpec specs[] = {
+        ListHook<L::BeginRenderPass, void(UINT, const D3D12_RENDER_PASS_RENDER_TARGET_DESC*, const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC*,
+                                          D3D12_RENDER_PASS_FLAGS)>::spec(),
+        ListHook<L::EndRenderPass, void()>::spec(),
+    };
+    return na::hooking::variants::Register(na::hooking::variants::Kind::CommandList4, specs,
+                                           static_cast<uint32_t>(sizeof(specs) / sizeof(specs[0])));
+}
+// The List4 interface of a submitted list, noted for render-pass coverage.
+void note_list4(ID3D12CommandList* list)
+{
+    if (!na::hooking::variants::Active(na::hooking::variants::Kind::CommandList4)) return;
+    ID3D12GraphicsCommandList4* l4 = nullptr;
+    if (SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&l4))) && l4) {
+        na::hooking::variants::NoteObject(na::hooking::variants::Kind::CommandList4, l4);
+        l4->Release();
+    }
 }
 
 // ---------------------------------------------------- C9: CPU mappings
@@ -3505,6 +4295,7 @@ bool InstallProducers(ID3D12Device* device, ID3D12CommandQueue* queue, bool hook
         // tables; the variant registry hooks their concrete functions.
         if (ok) {
             const bool reg = na::hooking::Initialize() && register_list_slots();
+            if (reg) register_list4_slots(); // optional: render-pass observation
             // G3-07: the device hooks are live; host warm-up/probe objects
             // are not the game's (no ids, sentinels, events or counters).
             t_host_work = true;
@@ -3554,6 +4345,11 @@ ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue, uint32_t count, ID3D12Comma
         known_mark(*cap, type == D3D12_COMMAND_LIST_TYPE_COPY);
     }
     t.capture = cap;
+    t.prev_cap = static_cast<const void*>(t_cur_cap);
+    t.prev_qid = t_cur_qid;
+    t_cur_cap = cap.get();
+    t_cur_qid = qid;
+    t.cur_set = true;
     t.list_type = static_cast<uint32_t>(type);
     if (!t_host_work && t_submit_depth == 0 && g_armed.load(std::memory_order_acquire)) { // C9B-R3
         qs->submit_m.lock();
@@ -3574,10 +4370,17 @@ ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue, uint32_t count, ID3D12Comma
 
 void ExecuteEnd(const ExecuteToken& t, ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* const* lists)
 {
+    if (t.cur_set) {
+        t_cur_cap = static_cast<const SubmissionCapture*>(t.prev_cap);
+        t_cur_qid = t.prev_qid;
+    }
     if (!t.queue_state) return;
     if (g_lists_hooked && lists)
         for (uint32_t i = 0; i < count; ++i)
-            if (lists[i]) na::hooking::variants::NoteObject(na::hooking::variants::Kind::CommandList, lists[i]);
+            if (lists[i]) {
+                na::hooking::variants::NoteObject(na::hooking::variants::Kind::CommandList, lists[i]);
+                note_list4(lists[i]);
+            }
     const bool ambiguous = end_occurrence(t);
     g_c.executes.fetch_add(1);
     if (ambiguous) g_c.ambiguous.fetch_add(1);
@@ -3674,6 +4477,400 @@ bool InstallRequested() { return g_requested.load(); }
 bool ProducersActive() { return g_active.load(std::memory_order_acquire); }
 
 na_object_id IdOf(const void* object) { return lookup(object); }
+
+// ---------------------------------------------------------------- J2 live consumer support
+// Called by the live DLAA path from inside a game submission (the lists are
+// being submitted, so every resource they reference is alive). Bounded, no waits.
+std::vector<LiveBinding> ListRootConstantBuffers(ID3D12CommandList* list)
+{
+    std::vector<LiveBinding> out;
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return out;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    out.reserve(std::min<size_t>(ls->bindings.size(), 4096));
+    for (const auto& b : ls->bindings)
+        if (b.resource && (b.kind == NA_SNAP_ROOT_CBV || b.kind == NA_SNAP_TABLE_CBV) && !b.compute)
+            out.push_back({b.resource, b.offset, b.size, b.op_index, b.param, b.kind == NA_SNAP_TABLE_CBV});
+    return out;
+}
+bool ListReferences(ID3D12CommandList* list, na_object_id id)
+{
+    if (!id) return false;
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return std::find(ls->uses.begin(), ls->uses.end(), id) != ls->uses.end();
+}
+bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id depth)
+{
+    if (!color || !depth) return false;
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return std::any_of(ls->targets.begin(), ls->targets.end(), [&](const ListState::Target& t) { return t.same(color, depth); });
+}
+na::j2::InsertionDecision ListInsertionDecision(ID3D12CommandList* list, na_object_id color)
+{
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return {};
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return ls->insertion.Analyze(color);
+}
+na::j2::ConsumerSignature ListConsumerSignature(ID3D12CommandList* list, na_object_id color)
+{
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return {};
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return ls->insertion.AnalyzeConsumer(color);
+}
+bool ListColorEvents(ID3D12CommandList* list, na_object_id color, std::vector<na::j2::ColorEvent>& out)
+{
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return ls->insertion.ColorEvents(color, out);
+}
+void ResetDerived()
+{
+    std::lock_guard<std::mutex> lk(g_derived_m);
+    g_derived_n.store(0, std::memory_order_release);
+}
+na::j2::LiveConsumer ListLiveConsumer(ID3D12CommandList* list, na_object_id color)
+{
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return {};
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return ls->insertion.Live(color);
+}
+void SetTableBindCallback(TableBindCallback cb) { g_table_cb.store(cb, std::memory_order_release); }
+bool ListCurrentTargets(ID3D12CommandList* list, na_object_id* rt, na_object_id* ds)
+{
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    if (rt) *rt = ls->cur_rt;
+    if (ds) *ds = ls->cur_ds;
+    return true;
+}
+uint64_t ListRecording(ID3D12CommandList* list)
+{
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load() || !ls->generation_known.load()) return 0;
+    return ls->generation.load() + 1; // never 0
+}
+bool ListStateRestorable(ID3D12CommandList* l)
+{
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = l ? list_state_locked(l, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return ls->restorable && !ls->in_render_pass;
+}
+bool RestoreListState(ID3D12GraphicsCommandList* l)
+{
+    // Snapshot under the locks, issue the calls without them (these calls run
+    // under the caller's HostWorkScope, so they are not observed as the game's).
+    ID3D12PipelineState* pso = nullptr;
+    ID3D12DescriptorHeap* heaps[2] = {};
+    uint32_t nheaps = 0;
+    const void* rs[2] = {};
+    std::vector<ListState::RootArg> args[2];
+    {
+        std::shared_lock<std::shared_mutex> rl(g_m);
+        na_object_id lid = 0;
+        ListState* ls = l ? list_state_locked(l, &lid) : nullptr;
+        if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
+        std::lock_guard<std::mutex> bl(ls->bind_m);
+        if (!ls->restorable || ls->in_render_pass) return false;
+        pso = ls->pso;
+        nheaps = ls->nheaps;
+        heaps[0] = ls->heaps[0];
+        heaps[1] = ls->heaps[1];
+        rs[0] = ls->root_sig[0];
+        rs[1] = ls->root_sig[1];
+        args[0] = ls->args[0];
+        args[1] = ls->args[1];
+    }
+    if (nheaps) l->SetDescriptorHeaps(nheaps, heaps);
+    for (uint32_t c = 0; c < 2; ++c) {
+        if (!rs[c]) continue;
+        auto* sig = static_cast<ID3D12RootSignature*>(const_cast<void*>(rs[c]));
+        if (c) l->SetComputeRootSignature(sig); else l->SetGraphicsRootSignature(sig);
+        for (UINT p = 0; p < args[c].size(); ++p) {
+            const ListState::RootArg& a = args[c][p];
+            switch (a.type) {
+            case 1: { D3D12_GPU_DESCRIPTOR_HANDLE h{a.value}; if (c) l->SetComputeRootDescriptorTable(p, h); else l->SetGraphicsRootDescriptorTable(p, h); break; }
+            case 2: if (c) l->SetComputeRootConstantBufferView(p, a.value); else l->SetGraphicsRootConstantBufferView(p, a.value); break;
+            case 3: if (c) l->SetComputeRootShaderResourceView(p, a.value); else l->SetGraphicsRootShaderResourceView(p, a.value); break;
+            case 4: if (c) l->SetComputeRootUnorderedAccessView(p, a.value); else l->SetGraphicsRootUnorderedAccessView(p, a.value); break;
+            case 5: if (!a.consts.empty()) { if (c) l->SetComputeRoot32BitConstants(p, static_cast<UINT>(a.consts.size()), a.consts.data(), 0); else l->SetGraphicsRoot32BitConstants(p, static_cast<UINT>(a.consts.size()), a.consts.data(), 0); } break;
+            default: break;
+            }
+        }
+    }
+    if (pso) l->SetPipelineState(pso);
+    return true;
+}
+bool ListClearsTarget(ID3D12CommandList* list, na_object_id target)
+{
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return std::find(ls->cleared.begin(), ls->cleared.end(), target) != ls->cleared.end();
+}
+bool ListSamplesTexture(ID3D12CommandList* list, na_object_id texture)
+{
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return std::find(ls->sampled_textures.begin(), ls->sampled_textures.end(), texture) != ls->sampled_textures.end();
+}
+bool ListSceneSubresource(ID3D12CommandList* list, na_object_id color, na_object_id depth, uint32_t* sub, uint32_t* depth_sub)
+{
+    if (!sub || !depth_sub) return false;
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    auto last = std::find_if(ls->targets.rbegin(), ls->targets.rend(), [&](const ListState::Target& t) { return t.same(color, depth); });
+    if (last == ls->targets.rend()) return false;
+    *sub = last->rt_sub;
+    *depth_sub = last->ds_sub;
+    return true;
+}
+uint32_t ListTargetsAfter(ID3D12CommandList* list, na_object_id color, na_object_id depth)
+{
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return 0;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    auto last = std::find_if(ls->targets.rbegin(), ls->targets.rend(), [&](const ListState::Target& t) { return t.same(color, depth); });
+    if (last == ls->targets.rend()) return 0;
+    std::vector<na_object_id> others;
+    for (auto it = last.base(); it != ls->targets.end(); ++it)
+        if (it->rt != color && std::find(others.begin(), others.end(), it->rt) == others.end()) others.push_back(it->rt);
+    return static_cast<uint32_t>(others.size());
+}
+// State of ONE subresource after `list`: the last barrier naming that subresource
+// or all of them. Games commonly transition depth and stencil planes (or mips,
+// array slices) separately; the whole-resource query refuses those.
+bool ListLastStateSub(ID3D12CommandList* list, na_object_id id, uint32_t sub, uint32_t* state)
+{
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    if (!ls->evidence_complete) return false;
+    for (auto it = ls->states.rbegin(); it != ls->states.rend(); ++it) {
+        if (it->resource != id) continue;
+        if (it->subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && it->subresource != sub) continue; // another plane/mip/slice
+        if (it->state_after == kStatePending) return false;
+        *state = it->state_after;
+        return true;
+    }
+    return false;
+}
+bool ListLastState(ID3D12CommandList* list, na_object_id id, uint32_t* state)
+{
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    if (!ls->evidence_complete) return false;
+    for (auto it = ls->states.rbegin(); it != ls->states.rend(); ++it) {
+        if (it->resource != id) continue;
+        if (it->subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) return false; // per-subresource: not handled
+        if (it->state_after == kStatePending) return false;
+        *state = it->state_after;
+        return true;
+    }
+    return false;
+}
+uint32_t WriteBuffer(na_object_id res, uint64_t offset, const void* src, uint32_t n)
+{
+    if (!res || !src || !n) return 0;
+    ID3D12Resource* rewrite = nullptr;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_m);
+        auto it = g_buffers.find(res);
+        if (it == g_buffers.end() || !it->second.cpu_visible || offset >= it->second.width || it->second.width - offset < n) return 0;
+        if (it->second.cpu) return guarded_copy(it->second.cpu + offset, src, n) ? n : 0;
+        if (!it->second.ever_mapped) return 0;
+        auto key = g_res_keys.find(res);
+        if (key != g_res_keys.end()) static_cast<IUnknown*>(const_cast<void*>(key->second))->QueryInterface(IID_PPV_ARGS(&rewrite));
+    }
+    if (!rewrite) return 0;
+    bool ok = false;
+    const bool was_host = t_host_work;
+    t_host_work = true;
+    const D3D12_RANGE none{0, 0};
+    void* p = nullptr;
+    if (SUCCEEDED(rewrite->Map(0, &none, &p)) && p) {
+        ok = guarded_copy(static_cast<uint8_t*>(p) + offset, src, n);
+        const D3D12_RANGE written{static_cast<SIZE_T>(offset), static_cast<SIZE_T>(offset + n)};
+        rewrite->Unmap(0, &written);
+    }
+    t_host_work = was_host;
+    rewrite->Release();
+    return ok ? n : 0;
+}
+uint32_t ReadBuffer(na_object_id res, uint64_t offset, void* dst, uint32_t n)
+{
+    if (!res || !dst || !n) return 0;
+    ID3D12Resource* reread = nullptr;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_m);
+        auto it = g_buffers.find(res);
+        if (it == g_buffers.end() || !it->second.cpu_visible || offset >= it->second.width) return 0;
+        n = static_cast<uint32_t>(std::min<uint64_t>(n, it->second.width - offset));
+        if (it->second.cpu) return guarded_copy(dst, it->second.cpu + offset, n) ? n : 0;
+        if (!it->second.ever_mapped) return 0;
+        auto key = g_res_keys.find(res);
+        if (key != g_res_keys.end()) static_cast<IUnknown*>(const_cast<void*>(key->second))->QueryInterface(IID_PPV_ARGS(&reread));
+    }
+    if (!reread) return 0;
+    bool ok = false;
+    const bool was_host = t_host_work;
+    t_host_work = true;
+    const D3D12_RANGE rr{static_cast<SIZE_T>(offset), static_cast<SIZE_T>(offset + n)};
+    void* p = nullptr;
+    if (SUCCEEDED(reread->Map(0, &rr, &p)) && p) {
+        ok = guarded_copy(dst, static_cast<const uint8_t*>(p) + offset, n);
+        const D3D12_RANGE none{0, 0};
+        reread->Unmap(0, &none);
+    }
+    t_host_work = was_host;
+    reread->Release();
+    return ok ? n : 0;
+}
+bool KnownSubStateNow(na_object_id id, uint32_t sub, uint32_t* state)
+{
+    if (!state || !id || g_known_disabled.load() || g_unhooked_queues.load()) return false;
+    std::lock_guard<std::mutex> lock(g_known_m);
+    if (g_unknown_inflight) return false;
+    auto it = g_known.find(id);
+    if (it == g_known.end() || it->second.in_flight) return false;
+    auto s = it->second.subs.find(sub);
+    const uint32_t v = s != it->second.subs.end() ? s->second : (it->second.has_all ? it->second.all : kStatePending);
+    if (v == kStatePending || v == D3D12_RESOURCE_STATE_COMMON) return false;
+    *state = v;
+    return true;
+}
+bool KnownSubStateInCurrentSubmission(na_object_id id, uint32_t sub, uint32_t* state)
+{
+    const SubmissionCapture* c = t_cur_cap;
+    if (!c || !state || !id || !c->in_store || c->unknown_marked || c->copy_queue) return false;
+    if (g_known_disabled.load() || g_unhooked_queues.load()) return false;
+    std::lock_guard<std::mutex> lock(g_known_m);
+    if (g_unknown_inflight) return false;
+    auto it = g_known.find(id);
+    if (it == g_known.end()) return false;
+    if (it->second.in_flight > c->SelfMarks(id) || (it->second.queue && it->second.queue != t_cur_qid)) return false;
+    auto s = it->second.subs.find(sub);
+    const uint32_t v = s != it->second.subs.end() ? s->second : (it->second.has_all ? it->second.all : kStatePending);
+    if (v == kStatePending || v == D3D12_RESOURCE_STATE_COMMON) return false;
+    *state = v;
+    return true;
+}
+bool KnownStateInCurrentSubmission(na_object_id id, uint32_t* state)
+{
+    const SubmissionCapture* c = t_cur_cap;
+    if (!c || !state || !id || !c->in_store || c->unknown_marked || c->copy_queue) return false;
+    if (g_known_disabled.load() || g_unhooked_queues.load()) return false;
+    std::lock_guard<std::mutex> lock(g_known_m);
+    if (g_unknown_inflight) return false;
+    auto it = g_known.find(id);
+    if (it == g_known.end() || !it->second.subs.empty() || !it->second.has_all) return false; // per-subresource: not handled
+    if (it->second.in_flight > c->SelfMarks(id) || (it->second.queue && it->second.queue != t_cur_qid)) return false;
+    const uint32_t v = it->second.all;
+    if (v == kStatePending || v == D3D12_RESOURCE_STATE_COMMON) return false;
+    *state = v;
+    return true;
+}
+void SetSamplerMipBias(float bias)
+{
+    // Startup value: the game's own objects are built at the nearest menu level.
+    const int level = nearest_mip_level(bias);
+    g_mip_bias.store(kMipLevels[level], std::memory_order_relaxed);
+    g_mip_game_level.store(level, std::memory_order_relaxed);
+    g_mip_live_level.store(level, std::memory_order_relaxed);
+}
+float SamplerMipBias() { return kMipLevels[g_mip_live_level.load(std::memory_order_relaxed)]; }
+void SetSamplerMipBiasLive(float bias)
+{
+    const int level = nearest_mip_level(bias);
+    g_mip_live_level.store(level, std::memory_order_relaxed);
+    if (level != g_mip_game_level.load(std::memory_order_relaxed)) g_mip_switched.store(true, std::memory_order_release);
+}
+void SetSamplerMipBiasLiveEnabled(bool on) { g_mip_live_enabled.store(on, std::memory_order_relaxed); }
+MipLiveStats GetMipLiveStats()
+{
+    MipLiveStats m;
+    m.enabled = g_mip_live_enabled.load(std::memory_order_relaxed);
+    m.game_bias = kMipLevels[g_mip_game_level.load(std::memory_order_relaxed)];
+    m.live_bias = kMipLevels[g_mip_live_level.load(std::memory_order_relaxed)];
+    m.twin_root_signatures = g_mip_twin_rs.load(std::memory_order_relaxed);
+    m.twin_pipelines = g_mip_twin_pso.load(std::memory_order_relaxed);
+    m.untwinned_pipelines = g_mip_untwinned.load(std::memory_order_relaxed);
+    m.fallbacks = g_mip_fallbacks.load(std::memory_order_relaxed);
+    m.twin_failures = g_mip_twin_fail.load(std::memory_order_relaxed);
+    return m;
+}
+void NativeMipBiases(NativeBiasStats* s)
+{
+    if (!s) return;
+    std::lock_guard<std::mutex> lock(g_native_m);
+    s->negative = g_native_neg; s->zero = g_native_zero; s->positive = g_native_pos;
+    s->min = g_native_min; s->max = g_native_max;
+}
+void MipBiasCounts(uint64_t* samplers, uint64_t* static_samplers)
+{
+    if (samplers) *samplers = g_biased_samplers.load(std::memory_order_relaxed);
+    if (static_samplers) *static_samplers = g_biased_static.load(std::memory_order_relaxed);
+}
+HostWorkScope::HostWorkScope() : prev_(t_host_work) { t_host_work = true; }
+HostWorkScope::~HostWorkScope() { t_host_work = prev_; }
+ID3D12Resource* AcquireResource(na_object_id id)
+{
+    std::shared_lock<std::shared_mutex> lock(g_m);
+    auto key = g_res_keys.find(id);
+    if (key == g_res_keys.end()) return nullptr;
+    ID3D12Resource* r = nullptr;
+    static_cast<IUnknown*>(const_cast<void*>(key->second))->QueryInterface(IID_PPV_ARGS(&r));
+    return r;
+}
+namespace {
+std::atomic<uint64_t> g_live_depth{0}, g_live_color{0};
+}
+void SetLiveSelection(uint64_t depth, uint64_t color) { g_live_depth.store(depth); g_live_color.store(color); }
+void GetLiveSelection(uint64_t* depth, uint64_t* color) { *depth = g_live_depth.load(); *color = g_live_color.load(); }
 
 void SetSampleAcquireProbeForTests(void (*probe)()) { g_acquire_probe = probe; }
 void SetSampleWorkerPausedForTests(bool paused) { g_worker_paused.store(paused, std::memory_order_release); }

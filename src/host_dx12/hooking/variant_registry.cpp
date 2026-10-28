@@ -71,8 +71,8 @@ std::atomic<bool> g_stop{false};
 std::atomic<bool> g_admission_closed{false};
 std::atomic<uint32_t> g_producers_active{0};        // A50: NoteObject producers between admission and write
 std::atomic<HANDLE> g_pause_producer_for_test{nullptr};
-void (*g_idle)(void*) = nullptr;
-void* g_idle_user = nullptr;
+std::atomic<void (*)(void*)> g_idle{nullptr};
+std::atomic<void*> g_idle_user{nullptr};
 
 Registry& R(Kind k) { return g_reg[static_cast<uint32_t>(k) < kKinds ? static_cast<uint32_t>(k) : 0]; }
 
@@ -264,7 +264,7 @@ DWORD WINAPI DiscoveryThread(LPVOID)
     while (!g_stop.load(std::memory_order_acquire)) {
         WaitForSingleObject(g_queue_event, 250);
         DrainQueueNow();
-        if (g_idle) g_idle(g_idle_user);
+        if (auto idle = g_idle.load(std::memory_order_acquire)) idle(g_idle_user.load(std::memory_order_relaxed));
     }
     return 0;
 }
@@ -353,10 +353,19 @@ uint32_t WarmUpCommandLists(ID3D12Device* device, uint32_t type_mask)
         ComPtr<ID3D12GraphicsCommandList> list;
         if (FAILED(device->CreateCommandAllocator(types[t], IID_PPV_ARGS(&alloc)))) continue;
         if (FAILED(device->CreateCommandList(0, types[t], alloc.Get(), nullptr, IID_PPV_ARGS(&list)))) continue;
-        EnsureObject(Kind::CommandList, list.Get()); ++ensured;
+        // List4 (render passes) only through its own interface pointer, and only when
+        // that kind has registered slots.
+        const auto ensure = [&]() {
+            EnsureObject(Kind::CommandList, list.Get());
+            ++ensured;
+            if (!R(Kind::CommandList4).pub_slot_count.load(std::memory_order_acquire)) return;
+            ComPtr<ID3D12GraphicsCommandList4> l4;
+            if (SUCCEEDED(list.As(&l4)) && l4) EnsureObject(Kind::CommandList4, l4.Get());
+        };
+        ensure();
         list->Close();
-        if (SUCCEEDED(list->Reset(alloc.Get(), nullptr))) { EnsureObject(Kind::CommandList, list.Get()); ++ensured; list->Close(); }
-        if (SUCCEEDED(list->Reset(alloc.Get(), nullptr))) { EnsureObject(Kind::CommandList, list.Get()); ++ensured; list->Close(); }
+        if (SUCCEEDED(list->Reset(alloc.Get(), nullptr))) { ensure(); list->Close(); }
+        if (SUCCEEDED(list->Reset(alloc.Get(), nullptr))) { ensure(); list->Close(); }
     }
     return ensured;
 }
@@ -413,9 +422,17 @@ uint32_t DrainQueueNow()
 
 bool StartDiscoveryThread(void (*idle)(void*), void* user)
 {
-    if (g_thread) return true;
-    g_idle = idle;
-    g_idle_user = user;
+    if (g_thread) {
+        // Started earlier without a consumer (the observation producers start
+        // it first under [observe] early_install): adopt this one.
+        if (idle && !g_idle.load(std::memory_order_acquire)) {
+            g_idle_user.store(user, std::memory_order_relaxed);
+            g_idle.store(idle, std::memory_order_release);
+        }
+        return true;
+    }
+    g_idle_user.store(user, std::memory_order_relaxed);
+    g_idle.store(idle, std::memory_order_release);
     if (!g_queue_event) g_queue_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!g_queue_event) return false;
     g_stop.store(false, std::memory_order_release);
@@ -444,8 +461,8 @@ bool StopDiscoveryThread(uint32_t timeout_ms)
     if (WaitForSingleObject(g_thread, remaining) != WAIT_OBJECT_0) return false; // worker still active: keep everything
     CloseHandle(g_thread);
     g_thread = nullptr;
-    g_idle = nullptr;
-    g_idle_user = nullptr;
+    g_idle.store(nullptr, std::memory_order_release);
+    g_idle_user.store(nullptr, std::memory_order_relaxed);
     return true;
 }
 

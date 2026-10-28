@@ -66,11 +66,17 @@ bool ValidateConfig(const Config& cfg)
            cfg.residual_snap_px >= 0.0f && cfg.residual_max_px >= cfg.residual_snap_px;
 }
 
+constexpr float kSkyDepth = 0.999999f, kSkyDepthReversed = 1e-6f;
+
 bool ReprojectPixel(const Tier2Input& t2, uint32_t width, uint32_t height, uint32_t x, uint32_t y,
                     float depth, float* vx, float* vy, bool* offscreen)
 {
     if (!vx || !vy || width == 0 || height == 0 || x >= width || y >= height) return false;
-    if (!std::isfinite(depth) || depth < 0.0f || depth > 1.0f || depth == t2.depth_clear) return false;
+    if (!std::isfinite(depth) || depth < 0.0f || depth > 1.0f) return false;
+    // Sky / no geometry (the clear value): reproject a point just inside the far
+    // plane instead of giving up, so camera ROTATION moves the sky correctly
+    // (translation barely moves something that far). Argon P4-4.
+    if (depth == t2.depth_clear) depth = t2.depth_clear == 0.0f ? kSkyDepthReversed : kSkyDepth;
     if (!finite2(t2.jitter_current_px[0], t2.jitter_current_px[1])) return false;
     // The raster sample at this pixel center was taken under the current
     // frame's jitter: in the UNJITTERED projection it sits at
