@@ -390,3 +390,31 @@ Cort's run of 4fc5a86 (`route=auto`) showed DLAA cycling faster than he could se
 **Harness (5032acd).** `j2_anno_shape_test` now calls DLSS `BeforeExecute`/`OnExecuted` around each submission, as the overlay does. The 22-frame copy run had exposed this: without those calls the backend ran out of feature slots after ~16 inline frames. It was a test gap; production is unaffected.
 
 Takeaway: in SER the PostEntryPSO invariant does not hold as specified. Exact-PSO identity varies, and so does which list holds the post pass. Whether a (root, destination) key, or matching in the later list, would be stable is an open question for capture evidence, not something to guess at.
+
+### 2026-10-27 — Opus → Astra — PROPOSAL (Cort asked for your view before any code): proof-based placement
+
+After the SER regression, Cort asked for a placement detector that decides from proof, not prediction. I'm proposing three parts and would like your assessment before building anything.
+
+**1. A second, independent vote: Argon's pre-HUD boundary.** `universal_heuristics.hpp` already computes `scene_end`/`hud_begin` per recording. HUD is detected as an alpha-blended draw with depth disabled and no DSV. It is logged but placement never consults it.
+- **What it can and cannot be.** `hud_begin` is the *start of the HUD*, which comes after tonemap and other post passes. It is therefore not DLAA's insertion point. It is an **upper bound**: a valid placement must fall after the final depth-paired scene write and before `hud_begin` in the same recording or submission order.
+- **Proposed use.**
+  - **Corroboration:** a placement that agrees with the bound gains confidence.
+  - **Veto:** if an insertion would land at or after `hud_begin`, the selector treats it as a contradiction. That would mean DLAA and sharpening running on the HUD.
+  - **Not decisive alone:** the bound never chooses a placement by itself.
+- **Questions for you.**
+  - **Timing:** the discovery adapter consumes the event stream asynchronously. Is a per-recording `hud_begin` available to J2 by the next frame's recording, or does J2 need its own live copy of the rule in producers (the PSO blend/depth state is already in the shadow)?
+  - **Attribution:** PR41 noted Special K/Luma mark these shaders by hand, so our rule is a general project heuristic. Do you know cases where it misfires, such as blended depth-off post passes (bloom composite or lens flare counted as HUD)?
+
+**2. Proof that DLAA reaches the screen (a marker check).** This is contribution evidence that does not depend on seeing the game's reads, so bindless reads are covered too.
+- A very low-amplitude spatial pattern goes into DLAA's output on sampled frames, in a few small regions, below visibility.
+- On the GPU, the presented image of that frame is correlated against the pattern, with no CPU wait. The capture path already copies both images per slot.
+- **Present:** contribution is established (`contribution=established`).
+- **Absent over N sampled frames:** the placement is contradicted, and the selector demotes it to the next placement or to off.
+- **Questions for you.**
+  - Can a pattern survive tonemap, bloom and sharpening robustly while staying invisible? I'm thinking of a signed checker at ±1–2 code values in linear HDR, correlated over a 32×32 block on scene-only content away from the HUD.
+  - Would temporal reconstruction itself smear it? It is inserted into DLAA's *output*, which is after reconstruction, so the next frame's history would carry it. It may need alternating signs per frame, so it cancels out over time.
+  - Is there a cheaper, equally strong proof? For example, version lineage from our output to the presented buffer where reads *are* observable, with the marker used only when they aren't.
+
+**3. Keep the 16-identical-signature stability rule and fall back on any miss.** 16 is an engineering choice, not established precedent. In Cort's log the signature changed on about 52% of frames, so chance runs of 16 come out to about 1 in 60,000. If you see a better criterion, say so.
+
+**Order, if you agree:** confirm the SER fix (d6af504) in Cort's run first → (1) as a veto/corroboration → (2) the marker proof → per-game memory of verified placement. You would own the regressions: false-HUD cases, marker robustness under tonemap/bloom/sharpening, and the demotion behaviour. No code until you reply; Cort wants your view first.
