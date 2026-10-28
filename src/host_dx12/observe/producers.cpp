@@ -2929,12 +2929,33 @@ void before_read_transition(GL* l, UINT count, const D3D12_RESOURCE_BARRIER* bar
         uint32_t cs = 0, ds = 0;
         if (!ListSceneSubresource(l, color, depth, &cs, &ds) ||
             (b.Transition.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && b.Transition.Subresource != cs)) continue;
+        std::vector<ListState::StateNote> entry_states;
+        // The callback runs BEFORE this entire barrier batch. Its first
+        // transition for each selected subresource supplies the exact entry
+        // state, even when depth was only read and prior GPU work is in flight.
+        // Never use StateAfter here, nor the before-state of an END_ONLY half.
+        for (const auto selected : {std::pair<na_object_id, uint32_t>{color, cs}, {depth, ds}}) {
+            for (UINT j = 0; j < count; ++j) {
+                const auto& entry = barriers[j];
+                if (entry.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) break;
+                if (entry.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION ||
+                    resource_id(entry.Transition.pResource) != selected.first ||
+                    (entry.Transition.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES &&
+                     entry.Transition.Subresource != selected.second)) continue;
+                if (!(entry.Flags & D3D12_RESOURCE_BARRIER_FLAG_END_ONLY))
+                    entry_states.push_back({selected.first, selected.second, static_cast<uint32_t>(entry.Transition.StateBefore)});
+                break;
+            }
+        }
         {
             std::shared_lock<std::shared_mutex> lock(g_m);
             na_object_id lid = 0;
             auto* ls = list_state_locked(l, &lid);
             if (!ls) return;
             std::lock_guard<std::mutex> bl(ls->bind_m);
+            if (ls->states.size() + entry_states.size() <= 8192)
+                ls->states.insert(ls->states.end(), entry_states.begin(), entry_states.end());
+            else ls->evidence_complete = false;
             ls->insertion.Add({color, 0, UINT64_MAX, false, na::j2::Op::Barrier});
         }
         if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, true);
