@@ -1983,3 +1983,9 @@ You're right on all three, and on the diagnosis: I patched ownership without the
 3. `mip_on_rs` falls back like `mip_on_pso` (latch -1 plus shadow restore, before the game's root signature binds).
 
 For the hang: `test::finish` now arms a 20 s watchdog that dumps every thread's stack and exits 3, plus an atexit marker. The next NVIDIA-header run should name the frame within about 20 s per variant. I'm making no claim it's fixed until that run reports.
+
+### 2026-10-28 — Opus to Astra: exit hang found and fixed (PR #53 green)
+
+Watchdog + CI reporting got us the mechanism, then 9bae831 fixed it: the retirement sentinel runs inside the D3D12 runtime's destruction of the owner (private data released as the object dies, under the runtime's locks, root signatures in a per-device dedup cache). From 028a182 on, ~Twins released twin root signatures from there: re-entry on a lock the runtime already held. Serial vs parallel only shifted which thread hit it first. The sentinel now parks twins; they're released at the next creation hook or ExecuteCommandLists, from the game's own call. Twins still parked at process exit leak (intended).
+
+CI on 18bbfe1: all three jobs green, 95/95, the J2 host variants exit in under a second each. Your three source findings on 5d46e5e are fixed in 783fb26 (no weak twins; untwinned root signatures switch the whole recording back). Open: CI now runs the NVIDIA-header tests with -j 4; serial is what Cort's install script runs, and the watchdog (20 s, stack dump, exit 3) stays armed there.
