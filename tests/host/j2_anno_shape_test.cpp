@@ -432,7 +432,13 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         cap_dir = std::wstring(tmp) + L"na_j2_capture_" + std::to_wstring(GetCurrentProcessId()) + (auto_inline ? L"_inline" : L"_between");
         na::capture::j2::Request(3, cap_dir.c_str(), 0);
     }
+    int frame_no = 0;
     const auto frame = [&](double cam_x, bool unpatched_prepass = false) {
+        // Copy case: every 4th frame the LAST scene write comes from a different pipeline
+        // (another object drawn last). The boundary matcher keys on the final writer, so it
+        // rejects that frame and the next (safely: no early insertion); the learned consumer
+        // class (the copy) must cover both.
+        const bool other_writer = inline_copy && (frame_no++ % 4 == 3);
         d.WaitIdle();
         const int frame_evals = fake::evals;
         if (inline_list) {
@@ -502,6 +508,11 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             scene.list->ResourceBarrier(1, &rd2);
             scene.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
             scene.list->ClearRenderTargetView(rtv, clear, 0, nullptr); // actual later scene write
+            if (other_writer) { // the final scene write is a draw with another pipeline
+                scene.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+                scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart());
+                scene.list->DrawInstanced(3, 1, 0, 0);
+            }
             std::swap(rd2.Transition.StateBefore, rd2.Transition.StateAfter);
             scene.list->ResourceBarrier(1, &rd2);
             scene.list->OMSetRenderTargets(1, &post_rtv, FALSE, nullptr);
@@ -675,8 +686,11 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         // colour again -> temporary; the copy is the post entry -> its class is accepted after
         // 3 labelled frames and triggers from then on. Draw case: intermediate and final reads
         // share one class AND one producer (clears) -> ambiguous -> the boundary matcher.
-        if (inline_copy) CHECK(is.profile_accepted >= 1 && is.class_matched >= 10 && is.legacy_matched >= 1 &&
-                               is.class_contradictions == 0 && is.class_rejected_skips >= 10);
+        // The boundary matcher fires first (at the final transition) whenever it matches; the
+        // class trigger covers the frames where the final writer changed.
+        if (inline_copy) CHECK(is.profile_accepted >= 1 && is.class_matched >= 3 && is.legacy_matched >= 8 &&
+                               is.class_contradictions == 0 && is.class_rejected_skips >= 10 &&
+                               is.inline_recorded == static_cast<uint64_t>(frames - 1)); // only the cold first frame missed
         else CHECK(is.profile_ambiguous >= 1 && is.legacy_matched == is.inline_recorded && is.class_matched == 0);
         CHECK(is.inline_target == 3); // intermediate transition + draw, then final transition
         CHECK(is.inline_mode == 1);                  // detected on the first frame
