@@ -105,7 +105,12 @@ int main()
         bad.later_scene_write = true;
         const uint32_t gen0 = rs.Current().history_generation;
         rs.OnFrame(bad);
-        CHECK(rs.Current().contradictions == 1 && rs.Current().placement_consistent == 0);
+        // One contradiction: a misplaced frame, tolerated (no route drop, no history reset).
+        CHECK(rs.Current().contradictions == 1 && rs.Current().route == Route::Inline && rs.Current().history_generation == gen0);
+        rs.OnFrame(bad);
+        CHECK(rs.Current().route == Route::Inline);
+        rs.OnFrame(bad); // the third within the window: the route itself is wrong
+        CHECK(rs.Current().contradictions == 3 && rs.Current().placement_consistent == 0);
         CHECK(rs.Current().state == RouteState::Observe); // relearning
         CHECK(rs.Current().route == Route::None);          // and NOT still executing the invalid boundary (R1)
         CHECK(rs.Current().history_generation == gen0 + 1);
@@ -191,6 +196,19 @@ int main()
         composite.color_writes = 1;
         const auto o2 = frame({scene_and_post(17), composite});
         CHECK(o2.boundary_inside_list && o2.inline_signature == 17);
+    }
+    // 15. Isolated contradictions spread over time never drop the route (SER flicker).
+    {
+        RouteSelector rs;
+        for (int i = 0; i < 3; ++i) rs.OnFrame(frame({scene_and_post(1)}));
+        for (int k = 0; k < 10; ++k) {
+            FrameObservation bad = frame({scene_and_post(1)});
+            bad.executed = true;
+            bad.later_scene_write = true;
+            rs.OnFrame(bad);
+            for (int i = 0; i < 100; ++i) { FrameObservation ok = frame({scene_and_post(1)}); ok.executed = true; rs.OnFrame(ok); }
+        }
+        CHECK(rs.Current().route == Route::Inline && rs.Current().route_changes == 1 && rs.Current().contradictions == 10);
     }
     // 14. An active route whose boundary disappears (no consumer observed any more)
     //     tolerates a couple of frames, then stops instead of running blind.

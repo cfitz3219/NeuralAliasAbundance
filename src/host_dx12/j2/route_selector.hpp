@@ -132,6 +132,13 @@ class RouteSelector {
 public:
     static constexpr uint32_t kMatchesToAccept = 3;  // engineering defaults (COMMS-Continuation)
     static constexpr uint32_t kWindowFrames = 120;
+    // A single contradiction is a misplaced FRAME (the trigger's fault, handled by the
+    // trigger: the class profile demotes, the boundary matcher relearns next frame), not
+    // proof that the ROUTE is wrong. Only repeated contradictions drop the route: dropping
+    // it stops DLAA for the relearning frames and resets history, which is visible as
+    // on/off flicker (SER 2026-10-27: 24 single contradictions -> 49 route changes).
+    static constexpr uint32_t kContradictionsToDrop = 3;
+    static constexpr uint32_t kContradictionWindow = 60; // scene frames
 
     void SetMode(RouteMode m)
     {
@@ -216,7 +223,20 @@ public:
         else { d_.matches = 1; last_proposal_ = proposal; last_sig_ = sig; }
         ++d_.observed;
 
+        // Contradictions within the recent window (older ones age out).
+        if (contradiction) {
+            if (recent_contradictions_ == 0 || d_.scene_frames - first_contradiction_frame_ > kContradictionWindow) {
+                recent_contradictions_ = 0;
+                first_contradiction_frame_ = d_.scene_frames;
+            }
+            ++recent_contradictions_;
+        }
+        if (d_.state == RouteState::Active && contradiction && recent_contradictions_ < kContradictionsToDrop) {
+            d_.change = "contradiction tolerated (one misplaced frame; the trigger relearns)";
+            contradiction = false;
+        }
         if (d_.state == RouteState::Active && contradiction) {
+            recent_contradictions_ = 0;
             // A hard contradiction invalidates the active placement: stop executing it
             // (route none, new history generation) and relearn from scratch (Astra R1).
             // Already-recorded GPU work keeps its own lifetime in J2's ring.
@@ -292,6 +312,8 @@ private:
     }
     RouteMode mode_ = RouteMode::Auto;
     RouteDecision d_;
+    uint32_t recent_contradictions_ = 0;
+    uint64_t first_contradiction_frame_ = 0;
     Route last_proposal_ = Route::None;
     uint64_t last_sig_ = 0;
 };
