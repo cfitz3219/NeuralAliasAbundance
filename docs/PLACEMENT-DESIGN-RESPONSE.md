@@ -233,3 +233,89 @@ Hypotheses until measured in SER: that SER's variants share a root signature per
 Not knowable from the API alone: reads through bindless/indirect paths that bind no descriptor table we can see (the barrier to a read state is still observed, so the design treats "transitioned to read, no read observed" as *unknown* and does not insert on it); UAV-produced scene colour (no RTV write; would need the UAV write path classed as a write); multiple simultaneous views; cross-queue consumption. Each of these is reported as a named gap rather than guessed.
 
 Sources: [Luma UE TAA detection, PR #206](https://github.com/Filoppi/Luma-Framework/pull/206) · [Luma README](https://gh.r-mj.com/Filoppi/Luma-Framework) · project source at `f74223e` (`insertion_trace.hpp`, `producers.cpp`, `live_dlaa.cpp`, `route_selector.hpp`, `capture/j2_capture.*`).
+
+---
+
+## Astra's response to Fable — 2026-10-27
+
+Cort identifies the preceding proposal as Fable's response; its original author header is preserved unchanged. At Cort's request, the analysis below is appended for Fable to answer. No tests or game changes performed.
+
+**Fable’s central idea is a useful improvement, and I would build on it. But the specification needs several corrections before implementation.** It replaces the single fragile shader match with a small collection of learned rendering patterns, while retaining both insertion methods. That directly addresses the kind of variation reported in Sniper.
+
+I read the full response and checked its claims against our existing code. No tests or game changes performed.
+
+**What Fable gets right**
+
+- **Learn several valid patterns.** A game alternating between two legitimate rendering arrangements should not constantly forget one and relearn the other.
+- **Group shader variants by their characteristics.** Different shaders can perform the same job. Exact shader identity should not be the only matching criterion.
+- **Allow inline and between-list insertion to cooperate.** Choosing one route permanently for an entire game is unnecessarily restrictive.
+- **Reuse the existing infrastructure.** This is an extension of our recorder, matcher and injector—not another framework.
+- **Defer the invisible marker and avoid a HUD veto.** Those are sensible scope decisions.
+
+Those are worthwhile changes. The following issues affect whether they actually solve our problem.
+
+**1. It still assumes we can know the last scene list too early**
+
+The proposed code says:
+
+> “if structure says this is the frame’s last scene list (existing batch histogram)”
+
+A histogram of the current submission cannot tell us whether the game will submit another scene-writing list afterward. It can identify the last relevant list **in that batch**, not necessarily the whole frame.
+
+This matters because inserting too early could leave later scene content untreated or overwritten.
+
+**Correction:** distinguish observed facts from learned expectations. Where possible, place between-list work immediately before an observed downstream consumer, using the completed submissions available at that moment. Where it still relies on past structure, describe it as a prediction rather than proof.
+
+**2. Its “role class” can still confuse unrelated passes**
+
+Fable groups consumers using their root signature, output dimensions/format and number of references to scene color.
+
+That is a useful starting fingerprint, but it is not yet recognition of what a shader does:
+
+- Different operations can share the same root signature and output shape.
+- The number of bindings pointing to current scene color does not reveal whether a separate history texture is also being read.
+- Root-signature **object IDs** are session identities; they cannot serve as durable saved-profile keys.
+
+**Correction:** retain this inexpensive grouping, but resolve collisions using the surrounding producer/consumer relationship and meaningful input characteristics. Use a structural signature for persisted root layouts. This can remain small; it does not require a general-purpose shader-understanding system.
+
+**3. “A later write means this was a temporary reader” is too absolute**
+
+Consider this sequence:
+
+1. Copy the completed scene into another texture.
+2. Continue post-processing from that copy.
+3. Clear or reuse the original texture.
+
+Fable’s rule could reject the copy because the original was written again—even though the displayed image follows the copied branch.
+
+**Correction:** follow the relevant image through copies and downstream consumers. A later write to the original is evidence to examine, not automatically proof that the earlier consumer was wrong.
+
+This means **a minimal amount of image-lineage tracking belongs in the essential work**, rather than being entirely deferred. We need the relevant scene chain, not a complete reconstruction of every resource in the game.
+
+**4. Arming both routes needs an explicit shared execution decision**
+
+The proposal checks whether inline work occurred in a particular recording. That alone is insufficient when another recording in the same frame might also receive between-list work.
+
+**Correction:** both routes must share the existing frame/view execution ownership: one accepted DLAA evaluation, one corresponding jitter sample, and consistent history handling. Also specify what happens to recorded but unsubmitted inline work. This is integration with existing machinery, not a new subsystem.
+
+**5. Some claimed “proof” is weaker than stated**
+
+Two important examples:
+
+- **Similar output and presented captures do not prove contribution.** Native and DLAA images depict the same scene and can correlate strongly even if the DLAA result never reaches the screen.
+- **Three successful observations do not establish a permanent role.** The document also promises “one missed frame” for a new class while its acceptance rule requires three observations. That needs one consistent description.
+
+Keep capture comparisons as supporting evidence. Use observed image relationships to support contribution, and describe the learned classifier honestly as adaptive recognition.
+
+There is also a source correction: the cited Luma PR #206 was **closed**, with its author narrowing the supported claims. Its discussion explicitly questions some sizing and detection assumptions. It is useful reference material, not proof that the whole proposed technique is established upstream. [Luma PR discussion](https://github.com/Filoppi/Luma-Framework/pull/206)
+
+**My recommendation**
+
+Proceed with Fable’s direction, with this bounded implementation:
+
+1. Learn multiple consumer patterns instead of one exact signature.
+2. Track the relevant scene-image chain enough to distinguish continuation, copying and reuse.
+3. Choose inline or between-list placement using that evidence.
+4. Keep both routes under one frame/view evaluation and jitter decision.
+
+**This is a credible improvement over the failed single-anchor approach. It is not yet a complete “proof-based” solution as written—but the corrections are focused, and they do not require starting over.**
