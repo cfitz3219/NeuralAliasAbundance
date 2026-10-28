@@ -158,7 +158,9 @@ struct VaRange {
 };
 
 std::shared_mutex g_m; // registry, heaps, VA table. Never held across a D3D12 call.
-std::unordered_map<const void*, Obj> g_objs;
+// Never destroyed: at process exit an entry's twins must not be Released (a twin's last
+// Release can retire an object through its sentinel, which takes g_m and walks this map).
+std::unordered_map<const void*, Obj>& g_objs = *new std::unordered_map<const void*, Obj>();
 std::vector<std::unique_ptr<DescHeap>> g_heaps;
 std::vector<VaRange> g_va; // sorted by begin
 struct BufferInfo {
@@ -397,10 +399,11 @@ private:
 void RetireSentinel::retire(const void* key, na_object_id id, uint32_t kind)
 {
     g_retire_gen.fetch_add(1, std::memory_order_acq_rel);
+    std::shared_ptr<Obj::Twins> drop; // released after g_m: a twin's Release is a D3D12 call
     {
         std::unique_lock<std::shared_mutex> lock(g_m);
         auto it = g_objs.find(key);
-        if (it != g_objs.end() && it->second.id == id) g_objs.erase(it);
+        if (it != g_objs.end() && it->second.id == id) { drop = std::move(it->second.twins); g_objs.erase(it); }
         g_heaps.erase(std::remove_if(g_heaps.begin(), g_heaps.end(), [&](const std::unique_ptr<DescHeap>& h) { return h->id == id; }),
                       g_heaps.end());
         g_va.erase(std::remove_if(g_va.begin(), g_va.end(), [&](const VaRange& r) { return r.resource == id; }), g_va.end());
@@ -462,10 +465,12 @@ na_object_id register_object(IUnknown* object, uint32_t kind)
     if (!object) return 0;
     const void* key = canon(object);
     const na_object_id id = g_next_id.fetch_add(1);
+    std::shared_ptr<Obj::Twins> drop; // stale entry's twins, released after g_m
     {
         std::unique_lock<std::shared_mutex> lock(g_m);
         Obj& o = g_objs[key];
         if (o.id) g_c.live.fetch_sub(1); // address reused without a retirement we saw
+        drop = std::move(o.twins);
         o = fresh_obj(id, kind);
     }
     g_c.live.fetch_add(1);
@@ -483,12 +488,13 @@ na_object_id ensure_registered(IUnknown* object, uint32_t kind, bool* created)
     if (!object) return 0;
     const void* key = canon(object);
     na_object_id id = 0;
+    std::shared_ptr<Obj::Twins> drop; // stale entry's twins, released after g_m
     {
         std::unique_lock<std::shared_mutex> lock(g_m);
         auto it = g_objs.find(key);
         if (it != g_objs.end() && it->second.kind == kind) return it->second.id;
         id = g_next_id.fetch_add(1);
-        if (it != g_objs.end()) g_c.live.fetch_sub(1);
+        if (it != g_objs.end()) { g_c.live.fetch_sub(1); drop = std::move(it->second.twins); }
         g_objs[key] = fresh_obj(id, kind);
     }
     *created = true;
@@ -1690,7 +1696,7 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
             it->second.created.assign(raw, raw + ev.e.hdr.size_bytes);
             it->second.root_params.assign(params, params + ev.e.param_count);
             it->second.root_ranges.assign(ranges, ranges + nranges);
-            it->second.twins = rs_twins;
+            rs_twins.swap(it->second.twins); // any previous set is released after g_m (end of scope)
             // Structural hash of the layout (parameter and range records), not the object:
             // identical layouts created in another session hash the same.
             uint64_t layout_hash = 1469598103934665603ull;
@@ -1738,9 +1744,12 @@ void make_pso_twins(IUnknown* pso, const void* rs, Make make)
             else g_mip_twin_fail.fetch_add(1, std::memory_order_relaxed);
         }
     } else return; // root signature needs no twins: the pipeline needs none either
-    std::unique_lock<std::shared_mutex> lock(g_m);
-    const auto it = g_objs.find(canon(pso));
-    if (it != g_objs.end()) it->second.twins = pt;
+    {
+        std::unique_lock<std::shared_mutex> lock(g_m);
+        const auto it = g_objs.find(canon(pso));
+        if (it != g_objs.end()) pt.swap(it->second.twins);
+    }
+    pt.reset(); // a replaced set (if any) is released outside g_m
 }
 
 HRESULT STDMETHODCALLTYPE D_CreateGraphicsPipelineState(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, REFIID riid, void** out)
