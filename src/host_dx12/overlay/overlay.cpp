@@ -513,8 +513,9 @@ void write_status_line()
             static const char* kAnchor[] = {"none", "unique-consumer", "producer+consumer", "copy-destination", "legacy-boundary"};
             char al[400];
             const int na2 = snprintf(al, sizeof al,
-                "j2_anchor mode=%s pso=%llu matched{unique=%llu pair=%llu copy=%llu legacy=%llu} skips=%llu changes=%llu cold=%llu why=\"%s\"\r\n",
+                "j2_anchor mode=%s pso=%llu streak=%u fallbacks=%llu matched{unique=%llu pair=%llu copy=%llu legacy=%llu} skips=%llu changes=%llu cold=%llu why=\"%s\"\r\n",
                 kAnchor[j2.consumer_mode < 5 ? j2.consumer_mode : 0], (unsigned long long)j2.consumer_pso,
+                j2.consumer_streak, (unsigned long long)j2.consumer_fallbacks,
                 (unsigned long long)j2.consumer_matched[1], (unsigned long long)j2.consumer_matched[2],
                 (unsigned long long)j2.consumer_matched[3], (unsigned long long)j2.consumer_matched[4],
                 (unsigned long long)j2.consumer_skips, (unsigned long long)j2.consumer_changes,

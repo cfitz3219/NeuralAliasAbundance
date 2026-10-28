@@ -123,6 +123,8 @@ struct Stats {
     uint64_t consumer_skips = 0;          // consumers seen before the anchor matched (mid-scene readers, other passes)
     uint64_t consumer_changes = 0;        // learned signature changes (mode change, new post shader)
     uint64_t consumer_cold = 0;           // inline frames with no consumer signature yet (legacy matcher used)
+    uint64_t consumer_fallbacks = 0;      // frames the anchor was in charge and missed -> boundary matcher again
+    uint32_t consumer_streak = 0;         // consecutive frames with the same consumer signature (anchor needs 16)
     char consumer_why[96] = {};           // why the learned mode was chosen
     bool depth_reversed = false;  // reverse-Z as classified from the camera    // other render targets bound after the scene in the same list (insertion may be late)
     uint32_t width = 0, height = 0, color_format = 0;

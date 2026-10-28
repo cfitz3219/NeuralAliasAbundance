@@ -646,7 +646,10 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         return test::finish(auto_inline ? "j2_anno_shape_test (auto-inline)" : "j2_anno_shape_test (auto-between)");
     }
     if (inline_list) {
-        for (int f = 0; f < 4; ++f) REQUIRE(frame(0.25 * f) == 0);
+        // The copy case runs long enough for the consumer anchor's stability gate (16
+        // identical signatures) to hand over from the boundary matcher.
+        const int frames = inline_copy ? 22 : 4;
+        for (int f = 0; f < frames; ++f) REQUIRE(frame(0.25 * (f % 4)) == 0);
         if (inline_record_first) REQUIRE(frame(1.0, true) == 0);
         const auto is = na::j2::GetStats();
         std::printf("inline: mode %u, candidates %llu, recorded %llu, frames %llu (inline %llu), refused %llu, evals %llu, forwarded %zu, \"%s\"\n",
@@ -659,7 +662,8 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                     (unsigned long long)is.consumer_skips, is.consumer_why);
         // The intermediate and final post draws share a PSO AND producer (clears): ambiguous,
         // so the boundary matcher stays in use. A copy consumer anchors on its destination.
-        if (inline_copy) CHECK(is.consumer_mode == 3 && is.consumer_matched[3] >= 1);
+        if (inline_copy) CHECK(is.consumer_mode == 3 && is.consumer_matched[3] >= 1 && is.consumer_matched[4] >= 14 &&
+                               is.consumer_streak >= 16 && is.consumer_fallbacks == 0); // boundary matcher first, anchor once stable
         else CHECK(is.consumer_mode == 4 && is.consumer_matched[4] == is.inline_recorded);
         CHECK(is.inline_target == 3); // intermediate transition + draw, then final transition
         CHECK(is.inline_mode == 1);                  // detected on the first frame

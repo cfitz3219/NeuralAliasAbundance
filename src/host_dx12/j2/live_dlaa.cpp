@@ -38,6 +38,7 @@ constexpr uint32_t kRing = 6;            // frames in flight before a slot is re
 constexpr uint32_t kBlockBytes = 512;    // root CBVs have no size: read this much (the producer's own bound)
 constexpr size_t kMaxBlocks = 256;       // unique constant blocks examined per frame (until the camera slot is learned)
 constexpr uint32_t kMaxBlockRead = 1024; // bytes read from one constant buffer
+constexpr uint32_t kAnchorStableFrames = 16; // identical consumer signatures before the anchor replaces the boundary matcher
 constexpr uint64_t kViewId = 0x4A32;     // DLSS view for this source ("J2")
 
 struct Slot {
@@ -102,6 +103,12 @@ struct State {
     uint64_t route_prev_late = 0, route_prev_post_scene = 0, route_prev_no_camera = 0, route_prev_no_state = 0;
     uint32_t route_gen_applied = 0;
     bool dlss_ready = false;
+    // Consumer anchor stability: consecutive submitted frames whose final scene
+    // recording produced the SAME consumer signature. The anchor is used only after
+    // kAnchorStableFrames; otherwise the boundary matcher runs (SER 2026-10-27: the
+    // post pass alternates between the scene's own list and a later list, so an
+    // anchor learned from one frame missed ~30% of frames).
+    uint32_t anchor_streak = 0;
     uint64_t route_prev_external = 0; // the game's own upscaler evaluations so far (NGX + FSR + XeSS)
     uint32_t frame_rejects = 0;       // inline trigger rejections in the current frame
     char frame_reject_text[320] = {}; // the frame's first rejection, with both boundaries
@@ -1301,6 +1308,7 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     // raster state, so graphics anchors with MSAA depth stay on the boundary matcher.
     const bool raster_safe = anchor.op != na::j2::Op::GraphicsRead || g.depth_samples <= 1;
     const bool consumer_anchor = learned.color == color_id && learned.depth == depth_id && raster_safe &&
+        g.anchor_streak >= kAnchorStableFrames &&
         (anchor.mode == CS::UniqueConsumer || anchor.mode == CS::ProducerConsumer || anchor.mode == CS::CopyDestination);
     uint32_t matched_mode = CS::Legacy;
     if (consumer_anchor) {
@@ -1509,6 +1517,12 @@ void OnPresent(ID3D12CommandQueue* queue)
         g.insertion_trace_used = 0;
         if (g.inline_mode) {
             ++g.stats.inline_presents;
+            if (g.submitted_frame != g.frame && g.anchor_streak >= kAnchorStableFrames) {
+                // The anchor was in charge and this frame got no DLAA: back to the boundary
+                // matcher until the signature is stable again (never trade coverage for it).
+                g.anchor_streak = 0;
+                ++g.stats.consumer_fallbacks;
+            }
             if (g.submitted_frame == g.frame) ++g.stats.inline_covered;
             else if (g.insertion_frame.decision.writes)
                 // The reason recorded at rejection time this frame (never a recycled
@@ -1528,9 +1542,13 @@ void OnPresent(ID3D12CommandQueue* queue)
         if (g.insertion_frame.color) {
             const auto& a = g.insertion_learned.consumer;
             const auto& b = g.insertion_frame.consumer;
-            if (g.insertion_learned.color && (a.mode != b.mode || a.op != b.op || a.consumer_pso != b.consumer_pso ||
-                                              a.producer_pso != b.producer_pso || a.destination != b.destination))
-                ++g.stats.consumer_changes;
+            const bool same = g.insertion_learned.color && a.mode == b.mode && a.op == b.op && a.consumer_pso == b.consumer_pso &&
+                              a.producer_pso == b.producer_pso && a.destination == b.destination;
+            if (g.insertion_learned.color && !same) ++g.stats.consumer_changes;
+            const bool usable = b.mode == na::j2::ConsumerSignature::UniqueConsumer || b.mode == na::j2::ConsumerSignature::ProducerConsumer ||
+                                b.mode == na::j2::ConsumerSignature::CopyDestination;
+            g.anchor_streak = !usable ? 0 : (same ? g.anchor_streak + 1 : 1);
+            g.stats.consumer_streak = g.anchor_streak;
             g.insertion_learned = g.insertion_frame;
             g.stats.consumer_mode = b.mode;
             g.stats.consumer_pso = b.consumer_pso;
