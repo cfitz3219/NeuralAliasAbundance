@@ -59,6 +59,7 @@ struct LiveConsumer {
     uint64_t pso = 0, root = 0, destination = 0, producer_pso = 0;
     uint32_t since_write = 0;  // consumers since the last write, this one included
     InsertionEvent raw;        // the event itself (role-class inputs)
+    bool barrier = false;      // the latest event is a RT -> read transition (producer_pso/after_write filled)
 };
 inline const char* ModeName(ConsumerSignature::Mode m)
 {
@@ -200,6 +201,15 @@ public:
         const auto& e = events_.back();
         if (e.resource != color || e.write) return live;
         live.op = ClassifyOp(e);
+        if (live.op == Op::Barrier) {
+            live.barrier = true;
+            live.raw = e;
+            for (size_t i = events_.size(); i-- > 0;) {
+                const auto& p = events_[i];
+                if (p.resource == color && p.write) { live.after_write = true; live.producer_pso = p.pipeline; break; }
+            }
+            return live;
+        }
         if (!IsConsumer(live.op) || e.destination == color) return live;
         live.valid = true;
         live.raw = e;
@@ -227,7 +237,7 @@ public:
                 ColorEvent c;
                 c.write = true; c.op = op; c.with_depth = e.with_depth;
                 out.push_back(c);
-            } else if (IsConsumer(op) && e.destination != color) {
+            } else if ((IsConsumer(op) && e.destination != color) || op == Op::Barrier) {
                 ColorEvent c;
                 c.op = op; c.raw = e; c.producer = producer;
                 out.push_back(c);

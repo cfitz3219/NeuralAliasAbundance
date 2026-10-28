@@ -108,6 +108,36 @@ int main()
         check(p.Judge(k, kGeo) != ConsumerProfile::Verdict::Accepted && p.Judge(k, kGeo) != ConsumerProfile::Verdict::AcceptedWithProducer,
               "demoted after a later scene write");
     }
+    // Scene completion at a barrier, learned per final producer (post pass in a later list,
+    // final draw from a consistent pipeline; mid-scene barriers follow other pipelines).
+    {
+        ColorEvent bar; bar.op = Op::Barrier;
+        const auto frame_seq = [&](bool water) {
+            std::vector<ColorEvent> v{write(true, kGeo)};
+            ColorEvent b1 = bar; b1.producer = kGeo;
+            if (water) { v.push_back(b1); v.push_back(water ? consumer(kRootWater, 300, W / 2, H / 2, 10, kGeo) : ColorEvent{}); }
+            v.push_back(write(true, kGeo2));
+            ColorEvent b2 = bar; b2.producer = kGeo2;
+            v.push_back(b2);
+            v.push_back(tonemap(400, kGeo2)); // in a later list
+            return v;
+        };
+        std::vector<Labelled> l;
+        LabelFrame(frame_seq(true), W, H, l);
+        check(l.size() == 4 && l[0].role == Role::Temporary && l[0].cls.op == Op::Barrier && l[2].role == Role::PostEntry &&
+              l[2].cls.op == Op::Barrier && l[3].role == Role::PostEntry, "mid barrier temporary, final barrier and tonemap post entries");
+        ConsumerProfile p;
+        for (uint64_t f = 1; f <= 4; ++f) learn(p, frame_seq(f % 2 == 1), f);
+        ClassKey bk; bk.op = Op::Barrier;
+        check(p.Judge(bk, kGeo2) == ConsumerProfile::Verdict::AcceptedWithProducer, "barrier after the final producer accepted");
+        check(p.Judge(bk, kGeo) == ConsumerProfile::Verdict::Rejected, "barrier after a mid-scene producer rejected (vetoes the boundary matcher)");
+        check(p.Judge(bk, 0) == ConsumerProfile::Verdict::Unknown, "a barrier is never accepted without its producer");
+        // A barrier never counts as the colour being consumed again.
+        std::vector<ColorEvent> seq{write(), consumer(0, 0, W, H, 10, kGeo, Op::CopyRead), write(false, 0, Op::ClearWrite)};
+        ColorEvent b3 = bar; b3.producer = 0; seq.push_back(b3);
+        LabelFrame(seq, W, H, l);
+        check(l[0].role == Role::PostEntry, "a later barrier does not make the copy temporary");
+    }
     // Bounded: many distinct classes never grow past the cap.
     {
         ConsumerProfile p;

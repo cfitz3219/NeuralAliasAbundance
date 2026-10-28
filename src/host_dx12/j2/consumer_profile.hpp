@@ -66,16 +66,33 @@ inline void LabelFrame(const std::vector<ColorEvent>& seq, uint32_t scene_w, uin
 {
     out.clear();
     bool post_found = false;
+    // Consumers and barriers are labelled separately: a barrier (RT -> read transition)
+    // is not a consumer, so it never counts as "the colour consumed again".
+    const auto consumes = [](const ColorEvent& e) { return !e.write && e.op != Op::Barrier; };
+    bool post_barrier_found = false;
     for (size_t i = 0; i < seq.size(); ++i) {
         const ColorEvent& c = seq[i];
         if (c.write) continue;
+        if (c.op == Op::Barrier) {
+            // A barrier is temporary when scene content (depth-paired write) follows it;
+            // the first one with none after it is where the scene completed.
+            bool scene_after = false;
+            for (size_t j = i + 1; j < seq.size() && !scene_after; ++j) scene_after = seq[j].write && seq[j].with_depth;
+            Labelled l;
+            l.cls.op = Op::Barrier;
+            l.producer = c.producer;
+            l.role = scene_after ? Role::Temporary : (post_barrier_found ? Role::Later : Role::PostEntry);
+            if (!scene_after) post_barrier_found = true;
+            out.push_back(l);
+            continue;
+        }
         // The next write after this consumer, and whether the colour is consumed again after it.
         size_t w = i + 1;
         while (w < seq.size() && !seq[w].write) ++w;
         bool temporary = false;
         if (w < seq.size()) {
             bool consumed_after = false;
-            for (size_t j = w + 1; j < seq.size() && !consumed_after; ++j) consumed_after = !seq[j].write;
+            for (size_t j = w + 1; j < seq.size() && !consumed_after; ++j) consumed_after = consumes(seq[j]);
             // Scene content (depth-paired draw) after it, or the colour read again: the
             // image continued; a clear/reuse with no later read leaves this as the exit.
             bool scene_after = false;
@@ -94,7 +111,7 @@ inline void LabelFrame(const std::vector<ColorEvent>& seq, uint32_t scene_w, uin
 class ConsumerProfile {
 public:
     static constexpr uint32_t kAcceptHits = 3;
-    static constexpr size_t kMaxEntries = 64;
+    static constexpr size_t kMaxEntries = 256; // SER needed more than 64 (classes + barrier/producer pairs)
     struct Entry {
         ClassKey cls;
         uint64_t producer = 0; // 0: the class itself; else the (class, producer) qualification
@@ -116,6 +133,14 @@ public:
     }
     Verdict Judge(const ClassKey& cls, uint64_t producer) const
     {
+        if (cls.op == Op::Barrier) {
+            // All barriers share one class: only the (barrier, final producer) pair can
+            // identify the scene's completion, never the class alone.
+            const Entry* pair = producer ? find(cls, producer) : nullptr;
+            if (!pair) return Verdict::Unknown;
+            if (pair->temp == 0) return pair->post >= kAcceptHits ? Verdict::AcceptedWithProducer : Verdict::Unknown;
+            return pair->post == 0 ? Verdict::Rejected : Verdict::Ambiguous;
+        }
         const Entry* plain = find(cls, 0);
         if (!plain) return Verdict::Unknown;
         if (plain->temp == 0) return plain->post >= kAcceptHits ? Verdict::Accepted : Verdict::Unknown;
@@ -134,7 +159,8 @@ public:
     uint32_t AcceptedCount() const
     {
         uint32_t n = 0;
-        for (const auto& x : e_) n += !x.producer && x.temp == 0 && x.post >= kAcceptHits;
+        for (const auto& x : e_) n += x.cls.op == Op::Barrier ? (x.producer && x.temp == 0 && x.post >= kAcceptHits)
+                                                              : (!x.producer && x.temp == 0 && x.post >= kAcceptHits);
         return n;
     }
     uint32_t RejectedCount() const

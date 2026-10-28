@@ -1311,7 +1311,7 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     // fire when its class is accepted by the profile. A class known to be a temporary
     // reader blocks the boundary matcher too (a fact from earlier frames). Otherwise the
     // boundary matcher below decides exactly as before, so coverage never drops below it.
-    enum : uint32_t { kByClass = 1, kByPair = 2, kByLegacy = 4 };
+    enum : uint32_t { kByClass = 1, kByPair = 2, kByBarrier = 3, kByLegacy = 4 };
     uint32_t matched_mode = kByLegacy;
     bool by_class = false;
     na::j2::ClassKey live_class;
@@ -1321,7 +1321,17 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
         // An MSAA depth resolve draws (render target, viewport, topology), which the state
         // restore does not cover: graphics consumers with MSAA depth stay on the boundary matcher.
         const bool raster_safe = live.op != na::j2::Op::GraphicsRead || g.depth_samples <= 1;
-        if (live.valid && live.after_write && raster_safe && g.scene_w) {
+        if (live.barrier && live.after_write) {
+            // Scene completion learned per final producer: the barrier after the last
+            // scene draw of a given pipeline. Accepted pairs fire here (same timing as the
+            // boundary matcher); pairs known to be mid-scene veto the boundary matcher.
+            live_class.op = na::j2::Op::Barrier;
+            live_producer = live.producer_pso;
+            using V = na::j2::ConsumerProfile::Verdict;
+            const V v = g.profile.Judge(live_class, live_producer);
+            if (v == V::Rejected) { ++g.stats.barrier_vetoes; return; }
+            if (v == V::AcceptedWithProducer) { by_class = true; matched_mode = kByBarrier; }
+        } else if (live.valid && live.after_write && raster_safe && g.scene_w) {
             live_class = na::j2::MakeClass(live.raw, g.scene_w, g.scene_h);
             live_producer = live.producer_pso;
             using V = na::j2::ConsumerProfile::Verdict;
@@ -1427,6 +1437,7 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     ++g.stats.inline_recorded;
     if (matched_mode == kByClass) ++g.stats.class_matched;
     else if (matched_mode == kByPair) ++g.stats.class_pair_matched;
+    else if (matched_mode == kByBarrier) ++g.stats.barrier_matched;
     else ++g.stats.legacy_matched;
     g.class_fired = by_class;
     g.fired_class = live_class;

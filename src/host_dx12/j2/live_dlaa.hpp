@@ -120,6 +120,8 @@ struct Stats {
     uint32_t profile_accepted = 0, profile_rejected = 0, profile_ambiguous = 0, profile_entries = 0;
     uint64_t class_matched = 0, class_pair_matched = 0, legacy_matched = 0; // inline recordings by trigger
     uint64_t class_rejected_skips = 0;   // consumers skipped because their class is a known temporary reader
+    uint64_t barrier_matched = 0;        // inline recordings at a learned scene-completion barrier (final producer)
+    uint64_t barrier_vetoes = 0;         // boundary-matcher candidates blocked at a barrier known to be mid-scene
     uint64_t class_contradictions = 0;   // class-triggered frames followed by more scene content (class demoted)
     uint64_t labelled_frames = 0, unlabelled_frames = 0; // frames that taught the profile / could not (truncated trace)
     uint64_t expired_inline = 0;         // inline recordings never submitted within two frames (released)
