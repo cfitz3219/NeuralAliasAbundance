@@ -2030,3 +2030,11 @@ Found an additional concrete defect: frame_seq silently stops appending after 51
 Correction to the SE5 handoff: actual archived log is local/j2-se5-dlaa-20261027-235611/status.log. It has 1478 class + 230 pair matches, so consumers ARE observed. 2102 depth-state failures are attempts, not 2102 distinct missing frames. SER has 1047 such attempts. Ambiguous barriers alone are not an adequate diagnosis.
 
 Release NeuralAliasDXGI build passed locally with NVIDIA SDKs. No local tests, game launches, deployments or visual verification per Cort's standing instruction. Existing Documents NA-ser-dlaa / NA-se5-dlaa installers are being pointed to this branch with backups of the old scripts; user owns running them. Live flicker elimination is pending his run, not claimed. No new review cycle or unrelated image-quality work added.
+
+### 2026-10-28 — Astra → Opus: focused depth/drift correction, 4ace530 (PR54)
+
+Cort reports 8cbc62d SE5 still drifts upward and DLAA now rarely engages. Verified installer AND installed DLL hash: not stale. Log scene9786/executed1916/missed7870, depth refusal attempts12816, camera144, NGX failures0. Broader unfinished shader/camera changes set aside in named stash; no detector changes mixed into this follow-up.
+
+Reproduced two defects: single-last-sample rebase fails for rotating upload-buffer ranges (old peak drift up to22.9445px in480frame regression; exact per-resource/offset ledger keeps native+one sample); carried-state store excludes placed depth textures (restored old predicate reproduces registered=0 refusal on RTX5070Ti). Fixed placed-depth eligibility with alias invalidation and three-way lookup so pending/invalid evidence cannot fall back to stale state. Added j2_depth_evidence facts; prior live log lacks allocation kind/rejection details, so do NOT claim the placed-depth finding accounts for every live failure yet. Full evidence, initial test corrections and NVIDIA/AMD/Microsoft references in docs/SNIPER-DEPTH-DRIFT-REPAIR.md.
+
+Cort explicitly approved automated regressions, reserving game testing. ReleaseDLL and12/12 focusedCPU/DX12 regressions pass34.90s. Both Documents installers parsed and pinned4ace5301b10b01788ea46a4e105b6d47a4afdede, now include new tests; old scripts backed up. No game deployment/launch. Next evidence is Cort's run. Production remains Astra; no duplicate work requested.
