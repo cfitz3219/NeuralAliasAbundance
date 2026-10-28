@@ -128,17 +128,9 @@ struct Obj {
     uint64_t root_hash = 0;                 // structural layout hash (role classes; stable across sessions)
     // Live mip bias: per-level twins of a root signature / pipeline state (index = level).
     // same[i]: the game's own object is already correct for level i (nothing to swap).
-    // weak[level]: the twin is itself one of the game's objects (D3D12 returns the same
-    // root signature for identical bytes). We hold no reference on it: two game root
-    // signatures would otherwise hold each other as twins and never be destroyed. Its
-    // retirement clears the entry (weak_key) and that level falls back to the game's objects.
-    struct Twins {
-        IUnknown* obj[3] = {};
-        bool same[3] = {};
-        bool weak[3] = {};
-        const void* weak_key[3] = {};
-        ~Twins() { for (int i = 0; i < 3; ++i) if (obj[i] && !weak[i]) obj[i]->Release(); }
-    };
+    // Immutable once published; owns a reference on every twin. A twin is never one of
+    // the game's own objects (see D_CreateRootSignature), so twins cannot form cycles.
+    struct Twins { IUnknown* obj[3] = {}; bool same[3] = {}; ~Twins() { for (auto* o : obj) if (o) o->Release(); } };
     std::shared_ptr<Twins> twins;
     bool retirement_unobservable = false;   // the sentinel could not be attached
     uint64_t present_ordinal = 0;
@@ -171,7 +163,7 @@ std::shared_mutex g_m; // registry, heaps, VA table. Never held across a D3D12 c
 // Never destroyed: at process exit an entry's twins must not be Released (a twin's last
 // Release can retire an object through its sentinel, which takes g_m and walks this map).
 std::unordered_map<const void*, Obj>& g_objs = *new std::unordered_map<const void*, Obj>();
-std::atomic<uint64_t> g_mip_weak_twins{0}; // twins that are the game's own root signatures (non-owning)
+std::atomic<uint64_t> g_mip_shared_skips{0}; // twin levels dropped: D3D12 returned one of the game's own root signatures
 std::vector<std::unique_ptr<DescHeap>> g_heaps;
 std::vector<VaRange> g_va; // sorted by begin
 struct BufferInfo {
@@ -415,11 +407,6 @@ void RetireSentinel::retire(const void* key, na_object_id id, uint32_t kind)
         std::unique_lock<std::shared_mutex> lock(g_m);
         auto it = g_objs.find(key);
         if (it != g_objs.end() && it->second.id == id) { drop = std::move(it->second.twins); g_objs.erase(it); }
-        if (g_mip_weak_twins.load(std::memory_order_relaxed)) // a game object that served as another's twin
-            for (auto& kv : g_objs)
-                if (auto* t = kv.second.twins.get())
-                    for (int level = 0; level < 3; ++level)
-                        if (t->weak[level] && t->weak_key[level] == key) { t->obj[level] = nullptr; t->weak[level] = false; t->weak_key[level] = nullptr; }
         g_heaps.erase(std::remove_if(g_heaps.begin(), g_heaps.end(), [&](const std::unique_ptr<DescHeap>& h) { return h->id == id; }),
                       g_heaps.end());
         g_va.erase(std::remove_if(g_va.begin(), g_va.end(), [&](const VaRange& r) { return r.resource == id; }), g_va.end());
@@ -1605,20 +1592,23 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
             const SIZE_T n = level_blob[level] ? level_blob[level]->GetBufferSize() : size;
             ID3D12RootSignature* twin = nullptr;
             if (SUCCEEDED(o_CreateRootSignature(dev, mask, bytes, n, IID_PPV_ARGS(&twin))) && twin) {
-                rs_twins->obj[level] = twin;
-                g_mip_twin_rs.fetch_add(1, std::memory_order_relaxed);
+                // D3D12 returns the same object for identical bytes: a twin that is one of
+                // the game's own root signatures is not kept (holding it could make two game
+                // root signatures own each other). That level has no twin: recordings at it
+                // fall back to the game's objects.
                 const void* tkey = canon(twin);
                 bool game_obj = false;
                 {
                     std::shared_lock<std::shared_mutex> lock(g_m);
                     game_obj = g_objs.find(tkey) != g_objs.end();
                 }
-                if (game_obj) { // same object as one of the game's root signatures: no reference (no cycle)
-                    rs_twins->weak[level] = true;
-                    rs_twins->weak_key[level] = tkey;
-                    g_mip_weak_twins.fetch_add(1, std::memory_order_relaxed);
+                if (game_obj) {
                     twin->Release();
+                    g_mip_shared_skips.fetch_add(1, std::memory_order_relaxed);
+                    continue;
                 }
+                rs_twins->obj[level] = twin;
+                g_mip_twin_rs.fetch_add(1, std::memory_order_relaxed);
             } else g_mip_twin_fail.fetch_add(1, std::memory_order_relaxed);
         }
         if (rs_twins)
@@ -3075,13 +3065,26 @@ void mip_on_pso(GL* l, ID3D12PipelineState*& p)
 void mip_on_rs(GL* l, ID3D12RootSignature*& r)
 {
     if (!g_mip_switched.load(std::memory_order_relaxed) || !r) return;
-    std::shared_lock<std::shared_mutex> lock(g_m);
-    na_object_id lid = 0;
-    ListState* ls = list_state_locked(l, &lid);
-    if (!ls) return;
-    std::lock_guard<std::mutex> bl(ls->bind_m);
-    bool untwinned = false;
-    r = mip_swap_locked(ls->mip_level, r, false, &untwinned);
+    bool fallback = false;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_m);
+        na_object_id lid = 0;
+        ListState* ls = list_state_locked(l, &lid);
+        if (!ls) return;
+        std::lock_guard<std::mutex> bl(ls->bind_m);
+        if (ls->mip_level < 0) return;
+        bool untwinned = false;
+        ID3D12RootSignature* t = mip_swap_locked(ls->mip_level, r, false, &untwinned);
+        if (untwinned) { ls->mip_level = -1; fallback = true; } // r (the game's) is bound as is
+        else r = t;
+    }
+    if (fallback) {
+        // A pipeline twin may be bound: switch the whole recording to the game's objects
+        // (as mip_on_pso does) before the game's root signature goes in.
+        g_mip_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        const HostWorkScope host;
+        RestoreListState(l);
+    }
 }
 void mip_on_reset(GL* l, ID3D12PipelineState*& p)
 {
