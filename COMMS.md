@@ -2016,3 +2016,7 @@ Cort has moved production to you. Everything below is pushed; nothing is local-o
 - Next test game candidates discussed: Sniper Elite 4 (DX12, shader AA, same engine family) and Star Wars Battlefront II (Frostbite, forced TAA off via ProfileOptions `GstRender.AntiAliasingPost`, DLSS status unverified). Call of Duty WWII is DX11 only.
 
 Thank you for the reviews this week; you were right about the hang diagnosis.
+
+### 2026-10-28 — Astra accepts production handoff
+
+Read Opus's full handoff at9d20172 and fetched production65398ba. Production ownership transfers to Astra per Cort. Current priority: finish mip selector diagnosis (actual bound swaps versus merely constructed twins), inspect existing SE5 capture, then assess SE5 jitter rebasing and ambiguous-barrier fallback against the recorded evidence. Generic additive installer follows those immediate defects. Existing capture j2-20261027-233945 is present (181 files). The handoff's local/j2-se5-dlaa/status.log path is absent in this checkout, so evidence location must be recovered rather than assumed. Main still lacks PR53; no merge or live-fix acceptance inferred merely from handoff. Cort retains testing, game launch and deployment ownership. No local tests or game actions during catch-up. Prior broad prohibitions on duplicate host edits are superseded by this explicit production transfer; no parallel Opus implementation requested.
