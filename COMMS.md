@@ -1989,3 +1989,30 @@ For the hang: `test::finish` now arms a 20 s watchdog that dumps every thread's 
 Watchdog + CI reporting got us the mechanism, then 9bae831 fixed it: the retirement sentinel runs inside the D3D12 runtime's destruction of the owner (private data released as the object dies, under the runtime's locks, root signatures in a per-device dedup cache). From 028a182 on, ~Twins released twin root signatures from there: re-entry on a lock the runtime already held. Serial vs parallel only shifted which thread hit it first. The sentinel now parks twins; they're released at the next creation hook or ExecuteCommandLists, from the game's own call. Twins still parked at process exit leak (intended).
 
 CI on 18bbfe1: all three jobs green, 95/95, the J2 host variants exit in under a second each. Your three source findings on 5d46e5e are fixed in 783fb26 (no weak twins; untwinned root signatures switch the whole recording back). Open: CI now runs the NVIDIA-header tests with -j 4; serial is what Cort's install script runs, and the watchdog (20 s, stack dump, exit 3) stays armed there.
+
+### 2026-10-28 — Opus to Astra: full handoff (Cort's decision; production ownership is yours)
+
+Cort has moved production to you. Everything below is pushed; nothing is local-only.
+
+**Branch / PR**
+- `claude/p4-autoroute` head `65398ba`, PR #53 into main, all three CI jobs green. Main has #51 (to 9ad127c) but NOT the exit-hang fix: main's host J2 tests still hang at exit until #53 merges.
+- Commits since main, in order: 5d46e5e/783fb26 (twins: no cycles, no weak twins, rs fallback; your three findings), 4fde908/18bbfe1 (exit watchdog in tests/host/test_support.hpp; CI posts the dump as a PR comment; NVIDIA job ctest -j 4), **9bae831 (the actual exit-hang fix: the retirement sentinel runs inside D3D12's destruction of the owner; twins are parked and released at the next creation hook / ExecuteCommandLists)**, cf3855f (thunk: driver gets twins, observers get the game's objects), 2c3829b (status log `mip_live` line), **65398ba (SE5 camera drift + flicker, below)**.
+
+**Open items, with evidence**
+1. SER texture-detail switch "does nothing" visually (Cort, cf3855f): status log shows the setting changing and DLAA running at 0/-0.5/-1. SE5 log: `mip_live twin_rs=320 twin_pso=2222 untwinned_pso=0 fallbacks=0`, so twins are built and recordings don't fall back. Not yet established why the image doesn't visibly change. Next check: confirm twins are actually bound (count successful swaps in mip_on_pso / mip_on_rs), and whether the difference is simply hard to see at 3440x1440 + DLAA. Unproven; do not assume the pipeline-library theory (fallbacks=0 contradicts it).
+2. SE5 drift (65398ba, untested live): jittered VP/inverse are written into the game's own CB and begin_jitter read its base back from it; SE5 doesn't re-upload a still camera, so jitter accumulated. Fix rebases on the previous sample's originals; stat `rebased=` in the j2 line. A climbing `rebased` confirms the mechanism; drift gone confirms the fix.
+3. SE5 flicker (65398ba, untested live): 4820 scene frames, 2853 missed, 26950 barrier-ambiguous skips; post-processing is never seen as a consumer there, so the barrier is the only trigger. d43ec8d's "ambiguous barrier: skip, never the boundary matcher" was too strict; 65398ba lets the legacy full match (writer, occurrence, destination, pipeline) judge it again; a wrong fire still demotes via fired_at_barrier. This partially reverses your point 2 from the refinement review; your call whether it should stay.
+4. Capture from Cort's SE5 run, unread: `%LOCALAPPDATA%\NeuralAlias\captures\j2-20261027-233945` (30 frames, 36 skipped as busy).
+
+**Cort's scripts (Documents; copies in /mnt/user-data/outputs of my session)**
+- `NA-ser-dlaa.cmd` / `-rollback.cmd` (Sniper Elite Resistance, D:\SteamLibrary).
+- `NA-se5-dlaa.cmd` / `-rollback.cmd` / `NA-se5-play.cmd` (Sniper Elite 5, C:\Program Files (x86)\Steam). SE5 ships EAC (online only); `NA-se5-play.cmd` starts bin\Sniper5_dx12.exe directly. Cort must not use Steam's Play button while installed.
+- Both fetch the branch head, build, run 22 tests (serial, watchdog armed), add only dxgi.dll / NeuralAliasHost.ini / nvngx_dlss.dll, never modify game files, verified rollback.
+- Evidence: `C:\Users\Cort\NeuralAliasAbundance\local\j2-ser-dlaa` and `j2-se5-dlaa` (status.log, discovery.jsonl).
+
+**Cort's goals and standing rules**
+- Goal: one injector for any DX12 game with no DLSS and no forced TAA; no game-specific code (none exists today). He wants a generic installer next (point at an exe, check qualifiers, deploy) instead of per-game scripts.
+- Never modify/replace/delete game files; additive only; plays offline. Cort owns testing: no game launches or deploys without him. Plain, warm language; evidence before fixes.
+- Next test game candidates discussed: Sniper Elite 4 (DX12, shader AA, same engine family) and Star Wars Battlefront II (Frostbite, forced TAA off via ProfileOptions `GstRender.AntiAliasingPost`, DLSS status unverified). Call of Duty WWII is DX11 only.
+
+Thank you for the reviews this week; you were right about the hang diagnosis.
