@@ -555,6 +555,14 @@ void write_status_line()
         const int nn = snprintf(nl, sizeof nl, "mip_native below0=%llu at0=%llu above0=%llu min=%.2f max=%.2f (game's own bias on surface samplers)\r\n",
                                 static_cast<unsigned long long>(nbs.negative), static_cast<unsigned long long>(nbs.zero), static_cast<unsigned long long>(nbs.positive), nbs.min, nbs.max);
         if (nn > 0) WriteFile(f, nl, static_cast<DWORD>(nn), &written, nullptr);
+        // Live texture detail: were twins built, and do recordings use them or fall back?
+        const auto ml = na::observe::GetMipLiveStats();
+        char ml_line[300];
+        const int mn = snprintf(ml_line, sizeof ml_line, "mip_live enabled=%u now=%.2f game=%.2f twin_rs=%llu twin_pso=%llu untwinned_pso=%llu fallbacks=%llu twin_failures=%llu\r\n",
+                                ml.enabled ? 1u : 0u, na::observe::SamplerMipBias(), ml.game_bias, (unsigned long long)ml.twin_root_signatures,
+                                (unsigned long long)ml.twin_pipelines, (unsigned long long)ml.untwinned_pipelines, (unsigned long long)ml.fallbacks,
+                                (unsigned long long)ml.twin_failures);
+        if (mn > 0) WriteFile(f, ml_line, static_cast<DWORD>(mn), &written, nullptr);
     }
     const auto latency = na::latency::GetStats();
     char lm[900];
