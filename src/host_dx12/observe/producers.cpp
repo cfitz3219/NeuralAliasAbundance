@@ -3152,13 +3152,30 @@ struct ListHook<Slot, R(A...)> {
     {
         na::hooking::variants::CallScope scope(l, Slot);
         auto fn = reinterpret_cast<Pfn>(orig[I]);
-        // Live mip bias: substitute twins before forwarding (also for host re-binds).
-        if constexpr (Slot == sl::list::SetPipelineState) { auto&& t = std::forward_as_tuple(a...); mip_on_pso(l, std::get<0>(t)); }
-        if constexpr (Slot == sl::list::SetGraphicsRootSignature || Slot == sl::list::SetComputeRootSignature) {
-            auto&& t = std::forward_as_tuple(a...);
-            mip_on_rs(l, std::get<0>(t));
-        }
-        if constexpr (Slot == sl::list::Reset) { auto&& t = std::forward_as_tuple(a...); mip_on_reset(l, std::get<1>(t)); }
+        // Live mip bias: the DRIVER gets the twin of the latched level; the OBSERVER always
+        // gets the game's own object. Twins are not in the registry (no root layout, no
+        // pipeline identity), so observing them blinded colour-read detection, producer
+        // pipelines and the learned profile at every level except the game's own.
+        constexpr bool kMipSlot = Slot == sl::list::SetPipelineState || Slot == sl::list::SetGraphicsRootSignature ||
+                                  Slot == sl::list::SetComputeRootSignature || Slot == sl::list::Reset;
+        if constexpr (kMipSlot) {
+            const std::tuple<std::decay_t<A>...> game{a...}; // what the game passed
+            {
+                auto&& t = std::forward_as_tuple(a...);
+                if constexpr (Slot == sl::list::SetPipelineState) mip_on_pso(l, std::get<0>(t));
+                else if constexpr (Slot == sl::list::Reset) mip_on_reset(l, std::get<1>(t));
+                else mip_on_rs(l, std::get<0>(t));
+            }
+            if constexpr (std::is_void_v<R>) {
+                fn(l, a...);
+                if (scope.outermost && !scope.ambiguous) std::apply([&](auto... g) { On<Slot>::run(l, g...); }, game);
+                return;
+            } else {
+                const R r = fn(l, a...);
+                if (scope.outermost && !scope.ambiguous) std::apply([&](auto... g) { On<Slot>::run(l, r, g...); }, game);
+                return r;
+            }
+        } else
         if constexpr (std::is_void_v<R>) {
             if constexpr (Slot == sl::list::ResourceBarrier)
                 if (scope.outermost && !scope.ambiguous) before_read_transition(l, a...);
