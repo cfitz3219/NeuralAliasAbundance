@@ -122,6 +122,10 @@ na::j2::InsertionDecision ListInsertionDecision(ID3D12CommandList* list, na_obje
 // this recording (learned at submission), and the latest event as seen by a live trigger.
 na::j2::ConsumerSignature ListConsumerSignature(ID3D12CommandList* list, na_object_id color);
 na::j2::LiveConsumer ListLiveConsumer(ID3D12CommandList* list, na_object_id color);
+// Placement design: the recording's writes and actual consumers of `color` in order (false:
+// unobserved or truncated). ResetDerived clears the per-frame lineage set (J2, at Present).
+bool ListColorEvents(ID3D12CommandList* list, na_object_id color, std::vector<na::j2::ColorEvent>& out);
+void ResetDerived();
 // Re-applies the game's descriptor heaps, root signatures, every root argument and the
 // pipeline state of this recording. False (nothing issued) if the state is not fully
 // known (unobserved recording, a bundle was executed).

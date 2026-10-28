@@ -524,8 +524,8 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             } else scene.list->DrawInstanced(3, 1, 0, 0); // final actual read
             if (fake::evals != evals_before_read + (na::j2::GetStats().inline_mode ? 1 : 0)) {
                 const auto ds = na::j2::GetStats();
-                std::printf("MISS evals=%d before=%d streak=%u skips=%llu cands=%llu waited=%llu refused=%llu rec=%llu no_camera=%llu no_state=%llu busy=%llu pending=%llu reason=\"%s\"\n",
-                            fake::evals, evals_before_read, ds.consumer_streak, (unsigned long long)ds.consumer_skips,
+                std::printf("MISS evals=%d before=%d accepted=%u rejected_skips=%llu cands=%llu waited=%llu refused=%llu rec=%llu no_camera=%llu no_state=%llu busy=%llu pending=%llu reason=\"%s\"\n",
+                            fake::evals, evals_before_read, ds.profile_accepted, (unsigned long long)ds.class_rejected_skips,
                             (unsigned long long)ds.inline_candidates, (unsigned long long)ds.inline_waited, (unsigned long long)ds.inline_refused,
                             (unsigned long long)ds.inline_recorded, (unsigned long long)ds.no_camera, (unsigned long long)ds.no_state,
                             (unsigned long long)ds.busy, (unsigned long long)ds.inline_rejects[8], ds.reason);
@@ -666,15 +666,18 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                     is.inline_mode, (unsigned long long)is.inline_candidates, (unsigned long long)is.inline_recorded,
                     (unsigned long long)is.frames, (unsigned long long)is.inline_frames, (unsigned long long)is.inline_refused,
                     (unsigned long long)(evaluations() - evals0), g_forwarded.size(), is.reason);
-        std::printf("anchor: mode %u matched unique %llu pair %llu copy %llu legacy %llu skips %llu why \"%s\"\n", is.consumer_mode,
-                    (unsigned long long)is.consumer_matched[1], (unsigned long long)is.consumer_matched[2],
-                    (unsigned long long)is.consumer_matched[3], (unsigned long long)is.consumer_matched[4],
-                    (unsigned long long)is.consumer_skips, is.consumer_why);
-        // The intermediate and final post draws share a PSO AND producer (clears): ambiguous,
-        // so the boundary matcher stays in use. A copy consumer anchors on its destination.
-        if (inline_copy) CHECK(is.consumer_mode == 3 && is.consumer_matched[3] >= 1 && is.consumer_matched[4] >= 14 &&
-                               is.consumer_streak >= 16 && is.consumer_fallbacks == 0); // boundary matcher first, anchor once stable
-        else CHECK(is.consumer_mode == 4 && is.consumer_matched[4] == is.inline_recorded);
+        std::printf("profile: accepted %u rejected %u ambiguous %u matched class %llu pair %llu legacy %llu rejected_skips %llu contradictions %llu labelled %llu note \"%s\"\n",
+                    is.profile_accepted, is.profile_rejected, is.profile_ambiguous, (unsigned long long)is.class_matched,
+                    (unsigned long long)is.class_pair_matched, (unsigned long long)is.legacy_matched,
+                    (unsigned long long)is.class_rejected_skips, (unsigned long long)is.class_contradictions,
+                    (unsigned long long)is.labelled_frames, is.class_note);
+        // Copy case: the intermediate draw read is followed by a clear and the copy reads the
+        // colour again -> temporary; the copy is the post entry -> its class is accepted after
+        // 3 labelled frames and triggers from then on. Draw case: intermediate and final reads
+        // share one class AND one producer (clears) -> ambiguous -> the boundary matcher.
+        if (inline_copy) CHECK(is.profile_accepted >= 1 && is.class_matched >= 10 && is.legacy_matched >= 1 &&
+                               is.class_contradictions == 0 && is.class_rejected_skips >= 10);
+        else CHECK(is.profile_ambiguous >= 1 && is.legacy_matched == is.inline_recorded && is.class_matched == 0);
         CHECK(is.inline_target == 3); // intermediate transition + draw, then final transition
         CHECK(is.inline_mode == 1);                  // detected on the first frame
         CHECK(is.inline_frames >= 2);                // frames 2.. ran DLAA inside the game's list

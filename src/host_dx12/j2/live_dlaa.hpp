@@ -116,16 +116,15 @@ struct Stats {
                                    kRejCandidate, kRejDestination, kRejPipeline, kRejPending, kRejCount };
     uint64_t inline_rejects[kRejCount] = {};
     uint32_t inline_frame_rejects = 0; // rejections in the last closed frame
-    // P4-0D consumer anchor (first actual consumer after the final scene write).
-    uint32_t consumer_mode = 0;           // learned mode (insertion_trace.hpp ConsumerSignature::Mode)
-    uint64_t consumer_pso = 0;            // learned consumer pipeline (0 for copies)
-    uint64_t consumer_matched[5] = {};    // inline recordings per anchor mode (index = mode; 4 = legacy matcher)
-    uint64_t consumer_skips = 0;          // consumers seen before the anchor matched (mid-scene readers, other passes)
-    uint64_t consumer_changes = 0;        // learned signature changes (mode change, new post shader)
-    uint64_t consumer_cold = 0;           // inline frames with no consumer signature yet (legacy matcher used)
-    uint64_t consumer_fallbacks = 0;      // frames the anchor was in charge and missed -> boundary matcher again
-    uint32_t consumer_streak = 0;         // consecutive frames with the same consumer signature (anchor needs 16)
-    char consumer_why[96] = {};           // why the learned mode was chosen
+    // Placement profile (role classes; docs/PLACEMENT-DESIGN-RESPONSE.md, Opus's revision).
+    uint32_t profile_accepted = 0, profile_rejected = 0, profile_ambiguous = 0, profile_entries = 0;
+    uint64_t class_matched = 0, class_pair_matched = 0, legacy_matched = 0; // inline recordings by trigger
+    uint64_t class_rejected_skips = 0;   // consumers skipped because their class is a known temporary reader
+    uint64_t class_contradictions = 0;   // class-triggered frames followed by more scene content (class demoted)
+    uint64_t labelled_frames = 0, unlabelled_frames = 0; // frames that taught the profile / could not (truncated trace)
+    uint64_t expired_inline = 0;         // inline recordings never submitted within two frames (released)
+    uint64_t between_observed = 0, between_predicted = 0; // between-list placements before an observed reader / after a predicted last scene list
+    char class_note[200] = {};            // latest consumer class not accepted (explains a missed frame)
     bool depth_reversed = false;  // reverse-Z as classified from the camera    // other render targets bound after the scene in the same list (insertion may be late)
     uint32_t width = 0, height = 0, color_format = 0;
     // Shape of the selected resources (reported even when J2 refuses them).

@@ -123,6 +123,7 @@ struct Obj {
     std::unique_ptr<ListState> list;       // command lists
     std::vector<na_root_param> root_params; // root signatures (C9 table resolution)
     std::vector<na_root_range> root_ranges;
+    uint64_t root_hash = 0;                 // structural layout hash (role classes; stable across sessions)
     bool retirement_unobservable = false;   // the sentinel could not be attached
     uint64_t present_ordinal = 0;
 };
@@ -1633,6 +1634,15 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
             it->second.created.assign(raw, raw + ev.e.hdr.size_bytes);
             it->second.root_params.assign(params, params + ev.e.param_count);
             it->second.root_ranges.assign(ranges, ranges + nranges);
+            // Structural hash of the layout (parameter and range records), not the object:
+            // identical layouts created in another session hash the same.
+            uint64_t layout_hash = 1469598103934665603ull;
+            const auto mix = [&layout_hash](const void* data, size_t len) {
+                for (size_t b = 0; b < len; ++b) layout_hash = (layout_hash ^ static_cast<const uint8_t*>(data)[b]) * 1099511628211ull;
+            };
+            mix(params, ev.e.param_count * sizeof(na_root_param));
+            mix(ranges, nranges * sizeof(na_root_range));
+            it->second.root_hash = layout_hash ? layout_hash : 1;
         }
     }
     na::observe_internal::Emit(&ev, NA_GROUP_PIPELINE);
@@ -2077,8 +2087,14 @@ void note_draw(GL* l) {
     auto* ls = list_state_locked(l, &id);
     if (!ls) return;
     std::lock_guard<std::mutex> bl(ls->bind_m);
+    uint64_t sel_depth = 0, sel_color = 0;
+    GetLiveSelection(&sel_depth, &sel_color);
     for (uint32_t i = 0; i < ls->cur_nrt; ++i)
-        if (ls->cur_rts[i]) ls->insertion.Add({ls->cur_rts[i], 0, reinterpret_cast<uint64_t>(ls->pso), true, na::j2::Op::DrawWrite});
+        if (ls->cur_rts[i]) {
+            na::j2::InsertionEvent ev{ls->cur_rts[i], 0, reinterpret_cast<uint64_t>(ls->pso), true, na::j2::Op::DrawWrite};
+            ev.with_depth = sel_depth && ls->cur_ds == sel_depth; // scene content, not a reuse of the texture
+            ls->insertion.Add(ev);
+        }
     auto pipeline = g_objs.find(canon(ls->pso));
     if (ls->cur_ds && ls->cur_ds_sub != NA_UNKNOWN_U32 && pipeline != g_objs.end() &&
         pipeline->second.created.size() >= sizeof(na_ev_pipeline_created)) {
@@ -2674,6 +2690,45 @@ struct On<sl::list::EndRenderPass> {
     }
 };
 
+// Width/height/format of a resource from its recorded creation (no COM calls under g_m).
+bool resource_dims_locked(na_object_id id, uint32_t* w, uint32_t* h, uint32_t* fmt)
+{
+    const auto key = g_res_keys.find(id);
+    if (key == g_res_keys.end()) return false;
+    const auto o = g_objs.find(key->second);
+    if (o == g_objs.end() || o->second.created.size() < sizeof(na_ev_resource_created)) return false;
+    const auto* e = reinterpret_cast<const na_ev_resource_created*>(o->second.created.data());
+    if (e->hdr.kind != NA_EV_RESOURCE_CREATED || e->dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return false;
+    *w = static_cast<uint32_t>(e->width);
+    *h = e->height;
+    *fmt = e->format;
+    return true;
+}
+// Minimal lineage (Astra #3): textures copied/resolved from the scene colour this frame
+// (and from those), so a read of the copy counts as continuation of the scene chain.
+// Bounded; reset by J2 at each Present.
+std::mutex g_derived_m;
+na_object_id g_derived[16] = {};
+std::atomic<uint32_t> g_derived_n{0}; // read without the lock as a fast "nothing derived" check
+bool is_derived_any(const na_object_id* ids, uint32_t n)
+{
+    if (!n || !g_derived_n.load(std::memory_order_relaxed)) return false; // the common case: no copy of the scene yet
+    std::lock_guard<std::mutex> lk(g_derived_m);
+    const uint32_t m = g_derived_n.load(std::memory_order_relaxed);
+    for (uint32_t k = 0; k < n; ++k)
+        for (uint32_t i = 0; i < m; ++i) if (ids[k] && g_derived[i] == ids[k]) return true;
+    return false;
+}
+bool is_derived(na_object_id id) { return is_derived_any(&id, 1); }
+void add_derived(na_object_id id)
+{
+    if (!id) return;
+    std::lock_guard<std::mutex> lk(g_derived_m);
+    const uint32_t m = g_derived_n.load(std::memory_order_relaxed);
+    for (uint32_t i = 0; i < m; ++i) if (g_derived[i] == id) return;
+    if (m < 16) { g_derived[m] = id; g_derived_n.store(m + 1, std::memory_order_release); }
+}
+
 // Resolve bindings at use time: a table bind may precede PSO/target changes.
 void before_read_transition(GL* l, UINT count, const D3D12_RESOURCE_BARRIER* barriers)
 {
@@ -2710,16 +2765,22 @@ void before_texture_copy(GL* l, ID3D12Resource* dst, ID3D12Resource* src)
     uint64_t depth = 0, color = 0;
     GetLiveSelection(&depth, &color);
     const auto source = resource_id(src), destination = resource_id(dst);
-    if (!color || source != color) return;
+    if (!color) return;
+    const bool from_color = source == color;
+    if (!from_color && !is_derived(source)) return;
+    add_derived(destination); // lineage: the copy carries the scene on
     {
         std::shared_lock<std::shared_mutex> lock(g_m);
         na_object_id lid = 0;
         auto* ls = list_state_locked(l, &lid);
         if (!ls) return;
         std::lock_guard<std::mutex> bl(ls->bind_m);
-        ls->insertion.Add({source, destination, 0, false, na::j2::Op::CopyRead});
+        na::j2::InsertionEvent ev{color, destination, 0, false, from_color ? na::j2::Op::CopyRead : na::j2::Op::DerivedRead};
+        resource_dims_locked(destination, &ev.dst_w, &ev.dst_h, &ev.dst_fmt);
+        ev.color_srvs = from_color ? 1 : 0;
+        ls->insertion.Add(ev);
     }
-    if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, true);
+    if (from_color) if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, true);
 }
 
 void after_texture_copy(GL* l, ID3D12Resource* dst)
@@ -2750,6 +2811,10 @@ void before_shader_use(GL* l, bool compute)
         const auto signature = g_objs.find(canon(ls->root_sig[compute]));
         if (signature == g_objs.end()) return;
         na_object_id destination = compute ? 0 : ls->cur_rt;
+        uint8_t color_srvs = 0;
+        na_object_id srv_ids[16] = {};
+        uint32_t nsrv = 0;
+        bool reads_derived = false;
         const auto& params = signature->second.root_params;
         const auto& ranges = signature->second.root_ranges;
         for (size_t p = 0; p < ls->args[compute].size() && p < params.size(); ++p) {
@@ -2768,17 +2833,38 @@ void before_shader_use(GL* l, bool compute)
                     const uint64_t index = uint64_t(slot) + range.table_offset + k;
                     if (index >= heap->count) break;
                     const auto& info = heap->info[static_cast<size_t>(index)];
-                    if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && info.kind == NA_DESC_SRV)
-                        reads_color |= info.resource == color;
+                    if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && info.kind == NA_DESC_SRV) {
+                        if (info.resource == color) {
+                            reads_color = true;
+                            if (color_srvs < 255) ++color_srvs;
+                        } else if (info.resource) {
+                            if (nsrv < 16) srv_ids[nsrv++] = info.resource;
+                        }
+                    }
                     if (compute && !destination && range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV && info.kind == NA_DESC_UAV)
                         destination = info.resource;
                 }
             }
         }
-        if (reads_color)
-            ls->insertion.Add({color, destination, reinterpret_cast<uint64_t>(ls->pso), false,
-                               compute ? na::j2::Op::ComputeRead : na::j2::Op::GraphicsRead,
-                               reinterpret_cast<uint64_t>(ls->root_sig[compute])});
+        if (reads_color) {
+            // Role-class inputs (only for the few draws that read the scene colour).
+            na::j2::InsertionEvent ev{color, destination, reinterpret_cast<uint64_t>(ls->pso), false,
+                                      compute ? na::j2::Op::ComputeRead : na::j2::Op::GraphicsRead,
+                                      signature->second.root_hash};
+            ev.color_srvs = color_srvs;
+            resource_dims_locked(destination, &ev.dst_w, &ev.dst_h, &ev.dst_fmt);
+            uint32_t cw = 0, ch = 0, cf = 0;
+            if (resource_dims_locked(color, &cw, &ch, &cf))
+                for (uint32_t si = 0; si < nsrv; ++si) {
+                    uint32_t sw = 0, sh = 0, sf = 0;
+                    if (resource_dims_locked(srv_ids[si], &sw, &sh, &sf) && sw == cw && sh == ch && ev.view_srvs < 255) ++ev.view_srvs;
+                }
+            ls->insertion.Add(ev);
+        } else {
+            reads_derived = is_derived_any(srv_ids, nsrv);
+            if (reads_derived) // lineage only: the scene chain continues through a copy
+                ls->insertion.Add({color, destination, reinterpret_cast<uint64_t>(ls->pso), false, na::j2::Op::DerivedRead});
+        }
     }
     if (reads_color) if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, compute);
 }
@@ -4235,6 +4321,20 @@ na::j2::ConsumerSignature ListConsumerSignature(ID3D12CommandList* list, na_obje
     if (!ls || !ls->recording_observed.load()) return {};
     std::lock_guard<std::mutex> bl(ls->bind_m);
     return ls->insertion.AnalyzeConsumer(color);
+}
+bool ListColorEvents(ID3D12CommandList* list, na_object_id color, std::vector<na::j2::ColorEvent>& out)
+{
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return ls->insertion.ColorEvents(color, out);
+}
+void ResetDerived()
+{
+    std::lock_guard<std::mutex> lk(g_derived_m);
+    g_derived_n.store(0, std::memory_order_release);
 }
 na::j2::LiveConsumer ListLiveConsumer(ID3D12CommandList* list, na_object_id color)
 {

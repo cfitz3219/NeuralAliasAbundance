@@ -12,13 +12,19 @@ namespace na::j2 {
 enum class Op : uint8_t {
     Unknown = 0, DrawWrite, ClearWrite, CopyWrite,  // writes
     Barrier,                                        // RT -> read transition (not a consumer)
-    GraphicsRead, ComputeRead, CopyRead             // actual consumers
+    GraphicsRead, ComputeRead, CopyRead,            // actual consumers
+    DerivedRead                                     // read of a texture copied from the colour this frame (lineage only)
 };
 struct InsertionEvent {
     uint64_t resource = 0, destination = 0, pipeline = 0;
     bool write = false;
     Op op = Op::Unknown;
-    uint64_t root = 0; // root signature of a shader consumer (0 = unknown / copy)
+    uint64_t root = 0;      // structural hash of the consumer's root-signature layout (0 = unknown / copy)
+    // Role-class inputs of a consumer (placement design, docs/PLACEMENT-DESIGN-RESPONSE.md):
+    uint32_t dst_w = 0, dst_h = 0, dst_fmt = 0; // destination texture (0 = unknown / buffer)
+    uint8_t color_srvs = 0;  // descriptors of the scene colour in the bound tables
+    uint8_t view_srvs = 0;   // other view-sized textures read alongside (history etc.)
+    bool with_depth = false; // write: the selected scene depth was bound (scene content, not reuse)
 };
 inline Op ClassifyOp(const InsertionEvent& e)
 {
@@ -52,6 +58,7 @@ struct LiveConsumer {
     Op op = Op::Unknown;
     uint64_t pso = 0, root = 0, destination = 0, producer_pso = 0;
     uint32_t since_write = 0;  // consumers since the last write, this one included
+    InsertionEvent raw;        // the event itself (role-class inputs)
 };
 inline const char* ModeName(ConsumerSignature::Mode m)
 {
@@ -84,6 +91,15 @@ struct InsertionDecision {
     uint64_t destination = 0, pipeline = 0;
     uint64_t boundary_writer = 0;
     uint32_t writer_occurrence = 0;
+    uint32_t derived_reads = 0; // reads of textures copied from the colour this frame
+};
+// A write or an actual consumer of the selected colour, in recording order (frame labelling).
+struct ColorEvent {
+    bool write = false;
+    Op op = Op::Unknown;
+    bool with_depth = false;   // write with the scene depth bound
+    InsertionEvent raw;        // the consumer's class inputs (consumers only)
+    uint64_t producer = 0;     // consumer: pipeline of the preceding write in this recording
 };
 class InsertionTrace {
 public:
@@ -99,6 +115,7 @@ public:
         std::map<uint64_t, uint32_t> writer_reads;
         for (const auto& event : events_) {
             if (event.resource != color) continue;
+            if (event.op == Op::DerivedRead) { ++result.derived_reads; continue; } // lineage only
             if (!event.write) ++result.all_reads;
             if (!event.write && event.pipeline == UINT64_MAX) ++result.transitions;
             if (event.write) {
@@ -185,6 +202,7 @@ public:
         live.op = ClassifyOp(e);
         if (!IsConsumer(live.op) || e.destination == color) return live;
         live.valid = true;
+        live.raw = e;
         live.pso = live.op == Op::CopyRead ? 0 : e.pipeline;
         live.root = e.root;
         live.destination = e.destination;
@@ -195,6 +213,27 @@ public:
             if (IsConsumer(ClassifyOp(p)) && p.destination != color) ++live.since_write;
         }
         return live;
+    }
+    // Writes and actual consumers of the colour (barriers and lineage reads omitted).
+    // Returns false when the trace is truncated (the caller must treat the frame as unknown).
+    bool ColorEvents(uint64_t color, std::vector<ColorEvent>& out) const {
+        if (!complete_ || !color) return complete_;
+        uint64_t producer = 0;
+        for (const auto& e : events_) {
+            if (e.resource != color) continue;
+            const Op op = ClassifyOp(e);
+            if (e.write) {
+                producer = e.pipeline;
+                ColorEvent c;
+                c.write = true; c.op = op; c.with_depth = e.with_depth;
+                out.push_back(c);
+            } else if (IsConsumer(op) && e.destination != color) {
+                ColorEvent c;
+                c.op = op; c.raw = e; c.producer = producer;
+                out.push_back(c);
+            }
+        }
+        return true;
     }
 private:
     std::vector<InsertionEvent> events_;
