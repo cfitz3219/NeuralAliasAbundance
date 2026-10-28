@@ -6,14 +6,19 @@
 //    kind, structural root-signature hash, destination size class relative to the scene,
 //    destination format, scene-colour descriptor count and other view-sized inputs. Shader
 //    variants of one pass share a class; exact PSO identity is not part of it.
-//  * Frames are labelled at Present from the submission-ordered writes and consumers of
-//    the colour (LabelFrame). A consumer is TEMPORARY only when a later write follows it
-//    AND either the colour is consumed again afterwards or that write is scene content
-//    (scene depth bound). A copy followed by a clear/reuse with no further consumption is
-//    the scene's real exit (Astra's copy-then-clear case).
+//  * Frames are labelled at Present from the submission-ordered writes, consumers and
+//    RT->read barriers of the colour (LabelFrame). Scene construction CONTINUES after a
+//    point when a draw into the colour follows (with or without a depth attachment) before
+//    the image has been copied onward; clears/copies into the colour, and anything after a
+//    copy onward, are reuse of the texture (Astra's copy-then-clear case).
 //  * The profile accepts a class after kAcceptHits post-entry observations with no
 //    temporary one. A class seen in both roles is ambiguous and is accepted only together
 //    with the producer (pipeline of the preceding scene write) that distinguishes it.
+//  * Barriers are learned as QUALIFIED SCENE-ENDING PATTERNS: the drawing pipeline of the
+//    last write before the barrier (a pipeline, not a game object: many objects can share
+//    one), and, when that pipeline also appears mid-scene, the class of the latest consumer
+//    earlier in the same recording as extra context. A pattern that stays ambiguous is
+//    never handed to the boundary matcher.
 // Pure CPU, bounded, no D3D12.
 #include <cstdint>
 #include <vector>
@@ -60,29 +65,52 @@ inline ClassKey MakeClass(const InsertionEvent& e, uint32_t scene_w, uint32_t sc
 
 // One frame's writes and consumers of the colour in SUBMISSION order (all lists).
 enum class Role : uint8_t { Temporary = 0, PostEntry = 1, Later = 2 }; // Later: after the post entry (bloom, HUD...)
-struct Labelled { ClassKey cls; uint64_t producer = 0; Role role = Role::Temporary; };
+struct Labelled { ClassKey cls; uint64_t producer = 0; uint64_t context = 0; Role role = Role::Temporary; };
+
+inline uint64_t ClassHash(const ClassKey& k)
+{
+    uint64_t h = 1469598103934665603ull;
+    for (uint64_t v : {uint64_t(k.op), k.root, uint64_t(k.w_class), uint64_t(k.h_class), uint64_t(k.fmt), uint64_t(k.color_srvs), uint64_t(k.view_srvs)})
+        h = (h ^ v) * 1099511628211ull;
+    return h ? h : 1;
+}
+// Qualification key of a barrier pattern: producer pipeline + context (never 0, never the bare producer).
+inline uint64_t Qualified(uint64_t producer, uint64_t context)
+{
+    const uint64_t q = (producer * 0x9E3779B97F4A7C15ull) ^ (context | 1) ^ 0xA5A5A5A5A5A5A5A5ull;
+    return q && q != producer ? q : 3;
+}
 
 inline void LabelFrame(const std::vector<ColorEvent>& seq, uint32_t scene_w, uint32_t scene_h, std::vector<Labelled>& out)
 {
     out.clear();
     bool post_found = false;
-    // Consumers and barriers are labelled separately: a barrier (RT -> read transition)
-    // is not a consumer, so it never counts as "the colour consumed again".
-    const auto consumes = [](const ColorEvent& e) { return !e.write && e.op != Op::Barrier; };
     bool post_barrier_found = false;
+    // A barrier (RT -> read transition) is not a consumer: it never counts as "the colour
+    // consumed again", and never as copying the image onward.
+    const auto consumes = [](const ColorEvent& e) { return !e.write && e.op != Op::Barrier; };
+    // Scene construction continues after `from`: a draw into the colour (depth attachment
+    // or not) before the image is copied onward. Clears/copies into the colour are reuse.
+    const auto continued = [&](size_t from) {
+        for (size_t j = from; j < seq.size(); ++j) {
+            if (!seq[j].write && seq[j].op == Op::CopyRead) return false; // copied onward: later writes are reuse
+            if (seq[j].write && seq[j].op == Op::DrawWrite) return true;
+        }
+        return false;
+    };
+    uint64_t list_context = 0; // class of the latest consumer earlier in the current recording
     for (size_t i = 0; i < seq.size(); ++i) {
         const ColorEvent& c = seq[i];
+        if (c.list_start) list_context = 0;
         if (c.write) continue;
         if (c.op == Op::Barrier) {
-            // A barrier is temporary when scene content (depth-paired write) follows it;
-            // the first one with none after it is where the scene completed.
-            bool scene_after = false;
-            for (size_t j = i + 1; j < seq.size() && !scene_after; ++j) scene_after = seq[j].write && seq[j].with_depth;
+            const bool temporary = continued(i + 1);
             Labelled l;
             l.cls.op = Op::Barrier;
             l.producer = c.producer;
-            l.role = scene_after ? Role::Temporary : (post_barrier_found ? Role::Later : Role::PostEntry);
-            if (!scene_after) post_barrier_found = true;
+            l.context = list_context;
+            l.role = temporary ? Role::Temporary : (post_barrier_found ? Role::Later : Role::PostEntry);
+            if (!temporary) post_barrier_found = true;
             out.push_back(l);
             continue;
         }
@@ -93,17 +121,22 @@ inline void LabelFrame(const std::vector<ColorEvent>& seq, uint32_t scene_w, uin
         if (w < seq.size()) {
             bool consumed_after = false;
             for (size_t j = w + 1; j < seq.size() && !consumed_after; ++j) consumed_after = consumes(seq[j]);
-            // Scene content (depth-paired draw) after it, or the colour read again: the
-            // image continued; a clear/reuse with no later read leaves this as the exit.
-            bool scene_after = false;
-            for (size_t j = w; j < seq.size() && !scene_after; ++j) scene_after = seq[j].write && seq[j].with_depth;
-            temporary = consumed_after || scene_after;
+            if (c.op == Op::CopyRead) {
+                // A copy carries the image onward: only depth-paired scene content after it
+                // (a mid-scene snapshot) or a later read of the original makes it temporary.
+                bool scene_after = false;
+                for (size_t j = w; j < seq.size() && !scene_after; ++j) scene_after = seq[j].write && seq[j].with_depth;
+                temporary = consumed_after || scene_after;
+            } else {
+                temporary = consumed_after || continued(i + 1);
+            }
         }
         Labelled l;
         l.cls = MakeClass(c.raw, scene_w, scene_h);
         l.producer = c.producer;
         l.role = temporary ? Role::Temporary : (post_found ? Role::Later : Role::PostEntry);
         if (!temporary) post_found = true;
+        list_context = ClassHash(l.cls);
         out.push_back(l);
     }
 }
@@ -118,7 +151,7 @@ public:
         uint32_t post = 0, temp = 0;
         uint64_t last_frame = 0;
     };
-    enum class Verdict : uint8_t { Unknown = 0, Accepted, AcceptedWithProducer, Rejected, Ambiguous };
+    enum class Verdict : uint8_t { Unknown = 0, Accepted, AcceptedWithProducer, AcceptedQualified, Rejected, Ambiguous };
 
     void Clear() { e_.clear(); }
     void Observe(const Labelled& l, uint64_t frame)
@@ -130,16 +163,25 @@ public:
             x.last_frame = frame;
             if (!l.producer) break;
         }
+        if (l.cls.op == Op::Barrier && l.producer) { // the qualified pattern (pipeline + context)
+            Entry& q = find_or_add(l.cls, Qualified(l.producer, l.context), frame);
+            if (l.role == Role::PostEntry) ++q.post; else ++q.temp;
+            q.last_frame = frame;
+        }
     }
-    Verdict Judge(const ClassKey& cls, uint64_t producer) const
+    Verdict Judge(const ClassKey& cls, uint64_t producer, uint64_t context = 0) const
     {
         if (cls.op == Op::Barrier) {
-            // All barriers share one class: only the (barrier, final producer) pair can
-            // identify the scene's completion, never the class alone.
+            // All barriers share one class: only the pattern (producer pipeline, then the
+            // context when that pipeline also appears mid-scene) can identify completion.
             const Entry* pair = producer ? find(cls, producer) : nullptr;
             if (!pair) return Verdict::Unknown;
             if (pair->temp == 0) return pair->post >= kAcceptHits ? Verdict::AcceptedWithProducer : Verdict::Unknown;
-            return pair->post == 0 ? Verdict::Rejected : Verdict::Ambiguous;
+            if (pair->post == 0) return Verdict::Rejected;
+            const Entry* q = find(cls, Qualified(producer, context));
+            if (q && q->temp == 0 && q->post >= kAcceptHits) return Verdict::AcceptedQualified;
+            if (q && q->post == 0 && q->temp > 0) return Verdict::Rejected;
+            return Verdict::Ambiguous; // seen both mid-scene and at completion; context does not separate them
         }
         const Entry* plain = find(cls, 0);
         if (!plain) return Verdict::Unknown;
@@ -151,10 +193,12 @@ public:
     }
     // A class that was accepted and then followed by more scene content: demote it now
     // (a later scene write is a fact, not a vote).
-    void Contradict(const ClassKey& cls, uint64_t producer, uint64_t frame)
+    // The specific pattern that failed loses its acceptance (pair and qualified entry).
+    void Contradict(const ClassKey& cls, uint64_t producer, uint64_t frame, uint64_t context = 0)
     {
         find_or_add(cls, 0, frame).temp += kAcceptHits;
         if (producer) find_or_add(cls, producer, frame).temp += kAcceptHits;
+        if (cls.op == Op::Barrier && producer) find_or_add(cls, Qualified(producer, context), frame).temp += kAcceptHits;
     }
     uint32_t AcceptedCount() const
     {

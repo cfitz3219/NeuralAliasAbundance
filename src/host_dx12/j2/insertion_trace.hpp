@@ -60,6 +60,8 @@ struct LiveConsumer {
     uint32_t since_write = 0;  // consumers since the last write, this one included
     InsertionEvent raw;        // the event itself (role-class inputs)
     bool barrier = false;      // the latest event is a RT -> read transition (producer_pso/after_write filled)
+    bool has_prior = false;    // barrier: an actual consumer of the colour earlier in this recording
+    InsertionEvent prior;      // ...the latest such consumer (barrier context)
 };
 inline const char* ModeName(ConsumerSignature::Mode m)
 {
@@ -100,7 +102,8 @@ struct ColorEvent {
     Op op = Op::Unknown;
     bool with_depth = false;   // write with the scene depth bound
     InsertionEvent raw;        // the consumer's class inputs (consumers only)
-    uint64_t producer = 0;     // consumer: pipeline of the preceding write in this recording
+    uint64_t producer = 0;     // consumer/barrier: pipeline of the preceding write in this recording
+    bool list_start = false;   // first event of a recording (frame sequences span several lists)
 };
 class InsertionTrace {
 public:
@@ -206,7 +209,9 @@ public:
             live.raw = e;
             for (size_t i = events_.size(); i-- > 0;) {
                 const auto& p = events_[i];
-                if (p.resource == color && p.write) { live.after_write = true; live.producer_pso = p.pipeline; break; }
+                if (p.resource != color) continue;
+                if (p.write && !live.after_write) { live.after_write = true; live.producer_pso = p.pipeline; }
+                if (!p.write && IsConsumer(ClassifyOp(p)) && p.destination != color) { live.has_prior = true; live.prior = p; break; }
             }
             return live;
         }
@@ -229,6 +234,7 @@ public:
     bool ColorEvents(uint64_t color, std::vector<ColorEvent>& out) const {
         if (!complete_ || !color) return complete_;
         uint64_t producer = 0;
+        bool first = true;
         for (const auto& e : events_) {
             if (e.resource != color) continue;
             const Op op = ClassifyOp(e);
@@ -236,10 +242,12 @@ public:
                 producer = e.pipeline;
                 ColorEvent c;
                 c.write = true; c.op = op; c.with_depth = e.with_depth;
+                c.list_start = first; first = false;
                 out.push_back(c);
             } else if ((IsConsumer(op) && e.destination != color) || op == Op::Barrier) {
                 ColorEvent c;
                 c.op = op; c.raw = e; c.producer = producer;
+                c.list_start = first; first = false;
                 out.push_back(c);
             }
         }

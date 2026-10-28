@@ -122,6 +122,9 @@ struct Stats {
     uint64_t class_rejected_skips = 0;   // consumers skipped because their class is a known temporary reader
     uint64_t barrier_matched = 0;        // inline recordings at a learned scene-completion barrier (final producer)
     uint64_t barrier_vetoes = 0;         // boundary-matcher candidates blocked at a barrier known to be mid-scene
+    uint64_t barrier_ambiguous_skips = 0; // barriers whose pattern is seen both mid-scene and at completion (boundary matcher not allowed)
+    uint64_t barrier_contradictions = 0;  // barrier placements followed by more scene work (that pattern demoted)
+    uint64_t history_resets = 0;          // DLAA history restarted because the route changed
     uint64_t class_contradictions = 0;   // class-triggered frames followed by more scene content (class demoted)
     uint64_t labelled_frames = 0, unlabelled_frames = 0; // frames that taught the profile / could not (truncated trace)
     uint64_t expired_inline = 0;         // inline recordings never submitted within two frames (released)

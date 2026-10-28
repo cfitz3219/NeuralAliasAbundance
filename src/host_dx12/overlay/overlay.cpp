@@ -510,16 +510,30 @@ void write_status_line()
                 (unsigned long long)rj[4], (unsigned long long)rj[5], (unsigned long long)rj[6], (unsigned long long)rj[7],
                 (unsigned long long)rj[8], j2.inline_frame_rejects);
             if (nrej > 0) WriteFile(f, rl, static_cast<DWORD>((std::min)(nrej, static_cast<int>(sizeof rl - 1))), &written, nullptr);
-            char al[512];
+            char al[700];
             const int na2 = snprintf(al, sizeof al,
-                "j2_profile accepted=%u rejected=%u ambiguous=%u entries=%u matched{class=%llu pair=%llu barrier=%llu legacy=%llu} rejected_skips=%llu barrier_vetoes=%llu contradictions=%llu labelled=%llu unlabelled=%llu expired=%llu between{observed=%llu predicted=%llu} note=\"%s\"\r\n",
+                "j2_profile accepted=%u rejected=%u ambiguous=%u entries=%u matched{class=%llu pair=%llu barrier=%llu legacy=%llu} rejected_skips=%llu barrier_vetoes=%llu barrier_ambiguous=%llu contradictions{class=%llu barrier=%llu} labelled=%llu unlabelled=%llu expired=%llu between{observed=%llu predicted=%llu} note=\"%s\"\r\n",
                 j2.profile_accepted, j2.profile_rejected, j2.profile_ambiguous, j2.profile_entries,
                 (unsigned long long)j2.class_matched, (unsigned long long)j2.class_pair_matched, (unsigned long long)j2.barrier_matched,
-                (unsigned long long)j2.legacy_matched, (unsigned long long)j2.class_rejected_skips, (unsigned long long)j2.barrier_vetoes, (unsigned long long)j2.class_contradictions,
+                (unsigned long long)j2.legacy_matched, (unsigned long long)j2.class_rejected_skips, (unsigned long long)j2.barrier_vetoes,
+                (unsigned long long)j2.barrier_ambiguous_skips, (unsigned long long)j2.class_contradictions, (unsigned long long)j2.barrier_contradictions,
                 (unsigned long long)j2.labelled_frames, (unsigned long long)j2.unlabelled_frames, (unsigned long long)j2.expired_inline,
                 (unsigned long long)j2.between_observed, (unsigned long long)j2.between_predicted, j2.class_note);
             if (na2 > 0) WriteFile(f, al, static_cast<DWORD>((std::min)(na2, static_cast<int>(sizeof al - 1))), &written, nullptr);
             const auto cs = na::capture::j2::GetStats();
+            {
+                // Four separate outcomes (Astra): frames without DLAA, DLAA placed before more
+                // scene work, route changes / history resets, captures the recorder skipped.
+                const auto& rt = j2.route;
+                char sl[320];
+                const int ns2 = snprintf(sl, sizeof sl,
+                    "j2_summary scene_frames=%llu missed=%llu placed_before_scene_work=%llu route_changes=%llu history_resets=%llu capture_skipped=%u\r\n",
+                    (unsigned long long)rt.scene_frames,
+                    (unsigned long long)(rt.scene_frames > rt.executed_frames ? rt.scene_frames - rt.executed_frames : 0),
+                    (unsigned long long)rt.contradictions, (unsigned long long)rt.changes, (unsigned long long)j2.history_resets,
+                    cs.dropped_busy);
+                if (ns2 > 0) WriteFile(f, sl, static_cast<DWORD>((std::min)(ns2, static_cast<int>(sizeof sl - 1))), &written, nullptr);
+            }
             if (cs.requested) {
                 char cl[300];
                 const int nc2 = snprintf(cl, sizeof cl, "j2_capture requested=%u recorded=%u submitted=%u written=%u busy=%u discarded=%u retired=%u no_present=%u errors=%u dir=\"%S\"\r\n",

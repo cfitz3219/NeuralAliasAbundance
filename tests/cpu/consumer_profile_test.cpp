@@ -138,6 +138,48 @@ int main()
         LabelFrame(seq, W, H, l);
         check(l[0].role == Role::PostEntry, "a later barrier does not make the copy temporary");
     }
+    // Astra's refinement cases (placement review).
+    {
+        ColorEvent bar; bar.op = Op::Barrier;
+        const auto B = [&](uint64_t producer, bool list_start = false) { ColorEvent b = bar; b.producer = producer; b.list_start = list_start; return b; };
+        std::vector<Labelled> l;
+        // (1) A barrier followed by scene-colour drawing WITHOUT a depth attachment: temporary.
+        LabelFrame({write(true, kGeo), B(kGeo), write(false, kGeo2), B(kGeo2), tonemap(400, kGeo2)}, W, H, l);
+        check(l[0].role == Role::Temporary && l[1].role == Role::PostEntry, "barrier before depth-less scene drawing is temporary");
+        // (2) Completed scene copied onward, then the original cleared/reused: the barrier
+        //     before the copy is the completion, the copy the exit.
+        LabelFrame({write(true, kGeo), B(kGeo), consumer(0, 0, W, H, 10, kGeo, Op::CopyRead), write(false, 0, Op::ClearWrite), write(false, kGeo2)}, W, H, l);
+        check(l[0].role == Role::PostEntry && l[1].role == Role::PostEntry, "copy onward then clear/reuse: completion and exit kept");
+        // (3) The same producer pipeline mid-scene and at completion: ambiguous unless the
+        //     context (latest consumer earlier in the recording) separates the two.
+        ConsumerProfile p;
+        ClassKey bk; bk.op = Op::Barrier;
+        for (uint64_t f = 1; f <= 4; ++f)
+            learn(p, {write(true, kGeo, Op::DrawWrite), B(kGeo, false), water(), write(true, kGeo), B(kGeo), tonemap(400, kGeo)}, f);
+        check(p.Judge(bk, kGeo, 0) == ConsumerProfile::Verdict::Rejected || p.Judge(bk, kGeo, 0) == ConsumerProfile::Verdict::Ambiguous,
+              "same pipeline at the mid barrier (no prior consumer) is not accepted");
+        const uint64_t water_ctx = ClassHash(cls_of(water()));
+        check(p.Judge(bk, kGeo, water_ctx) == ConsumerProfile::Verdict::AcceptedQualified, "completion separated by context (after the water read)");
+        // ...and when the water pass is culled the context no longer separates: ambiguous, never the boundary matcher.
+        ConsumerProfile p2;
+        for (uint64_t f = 1; f <= 4; ++f) learn(p2, {write(true, kGeo), B(kGeo), write(true, kGeo), B(kGeo), tonemap(400, kGeo)}, f);
+        check(p2.Judge(bk, kGeo, 0) == ConsumerProfile::Verdict::Ambiguous, "indistinguishable barriers stay ambiguous");
+        // (4) A previously accepted barrier pattern contradicted by later scene work loses its acceptance.
+        ConsumerProfile p3;
+        for (uint64_t f = 1; f <= 3; ++f) learn(p3, {write(true, kGeo2), B(kGeo2), tonemap(400, kGeo2)}, f);
+        check(p3.Judge(bk, kGeo2, ClassHash(cls_of(tonemap(400)))) != ConsumerProfile::Verdict::Unknown, "pattern learned");
+        check(p3.Judge(bk, kGeo2, 0) == ConsumerProfile::Verdict::AcceptedWithProducer, "accepted before the contradiction");
+        p3.Contradict(bk, kGeo2, 4, 0);
+        const auto v = p3.Judge(bk, kGeo2, 0);
+        check(v != ConsumerProfile::Verdict::AcceptedWithProducer && v != ConsumerProfile::Verdict::AcceptedQualified,
+              "contradicted pattern is no longer accepted (ambiguous -> boundary matcher not allowed)");
+        // (5) Post-processing consumer in a later command list: the scene list's final barrier
+        //     and the later list's consumer are both learned as the frame's completion.
+        ConsumerProfile p4;
+        for (uint64_t f = 1; f <= 3; ++f) learn(p4, {write(true, kGeo, Op::DrawWrite), B(kGeo2), tonemap(400, kGeo2)}, f);
+        check(p4.Judge(bk, kGeo2, 0) == ConsumerProfile::Verdict::AcceptedWithProducer &&
+              p4.Judge(cls_of(tonemap(401)), kGeo2) == ConsumerProfile::Verdict::Accepted, "gamma frame: barrier pattern and later-list consumer accepted");
+    }
     // Bounded: many distinct classes never grow past the cap.
     {
         ConsumerProfile p;

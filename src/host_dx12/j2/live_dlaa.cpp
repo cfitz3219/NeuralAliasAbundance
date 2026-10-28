@@ -114,6 +114,7 @@ struct State {
     bool class_fired = false;                   // this frame's DLAA was triggered by a class
     na::j2::ClassKey fired_class;
     uint64_t fired_producer = 0;
+    uint64_t fired_context = 0;
     uint64_t route_prev_late_class = 0;
     uint64_t route_prev_external = 0; // the game's own upscaler evaluations so far (NGX + FSR + XeSS)
     uint32_t frame_rejects = 0;       // inline trigger rejections in the current frame
@@ -515,6 +516,7 @@ void apply_route_locked(ID3D12CommandQueue* queue)
     g.stats.inline_mode = g.inline_mode ? 1u : 0u;
     if (d.history_generation != g.route_gen_applied) {
         g.route_gen_applied = d.history_generation;
+        if (d.history_generation > 1) ++g.stats.history_resets; // the first route is not a reset
         g.resume_reset = true;   // output of the old route must not feed the new one
         if (g.inl.valid) na::capture::j2::Discard(g.inl.history.capture, true);
         g.inl.valid = false;     // an inline recording from the old route is not committed
@@ -1315,22 +1317,29 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     uint32_t matched_mode = kByLegacy;
     bool by_class = false;
     na::j2::ClassKey live_class;
-    uint64_t live_producer = 0;
+    uint64_t live_producer = 0, live_context = 0;
+    bool fired_at_barrier = false; // the event being judged is a barrier (whichever trigger fires)
     {
         const auto live = na::observe::ListLiveConsumer(l, color_id);
         // An MSAA depth resolve draws (render target, viewport, topology), which the state
         // restore does not cover: graphics consumers with MSAA depth stay on the boundary matcher.
         const bool raster_safe = live.op != na::j2::Op::GraphicsRead || g.depth_samples <= 1;
         if (live.barrier && live.after_write) {
-            // Scene completion learned per final producer: the barrier after the last
-            // scene draw of a given pipeline. Accepted pairs fire here (same timing as the
-            // boundary matcher); pairs known to be mid-scene veto the boundary matcher.
+            // Qualified scene-ending pattern: the drawing pipeline of the last write before
+            // this barrier, plus (when that pipeline also appears mid-scene) the class of
+            // the latest consumer earlier in this recording. Accepted -> fire here (boundary
+            // matcher timing); known mid-scene -> veto; seen in both roles and not separated
+            // by the context -> the boundary matcher is NOT allowed to fire here either; a
+            // qualified consumer later in this recording may still take the frame.
             live_class.op = na::j2::Op::Barrier;
             live_producer = live.producer_pso;
+            live_context = live.has_prior && g.scene_w ? na::j2::ClassHash(na::j2::MakeClass(live.prior, g.scene_w, g.scene_h)) : 0;
+            fired_at_barrier = true;
             using V = na::j2::ConsumerProfile::Verdict;
-            const V v = g.profile.Judge(live_class, live_producer);
+            const V v = g.profile.Judge(live_class, live_producer, live_context);
             if (v == V::Rejected) { ++g.stats.barrier_vetoes; return; }
-            if (v == V::AcceptedWithProducer) { by_class = true; matched_mode = kByBarrier; }
+            if (v == V::Ambiguous) { ++g.stats.barrier_ambiguous_skips; return; }
+            if (v == V::AcceptedWithProducer || v == V::AcceptedQualified) { by_class = true; matched_mode = kByBarrier; }
         } else if (live.valid && live.after_write && raster_safe && g.scene_w) {
             live_class = na::j2::MakeClass(live.raw, g.scene_w, g.scene_h);
             live_producer = live.producer_pso;
@@ -1439,9 +1448,12 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     else if (matched_mode == kByPair) ++g.stats.class_pair_matched;
     else if (matched_mode == kByBarrier) ++g.stats.barrier_matched;
     else ++g.stats.legacy_matched;
-    g.class_fired = by_class;
+    // Remember what placed this frame's DLAA, so a later scene write demotes exactly that
+    // pattern/class - including a boundary-matcher placement at a barrier.
+    g.class_fired = by_class || fired_at_barrier;
     g.fired_class = live_class;
     g.fired_producer = live_producer;
+    g.fired_context = live_context;
 }
 
 } // namespace
@@ -1574,8 +1586,11 @@ void OnPresent(ID3D12CommandQueue* queue)
             }
             // A class-triggered DLAA followed by more scene content: demote that class now.
             if (g.class_fired && g.submitted_frame == g.frame && g.stats.inline_late_writes + g.stats.post_scene_batches > g.route_prev_late_class) {
-                g.profile.Contradict(g.fired_class, g.fired_producer, g.frame);
-                ++g.stats.class_contradictions;
+                // The route tolerates an isolated misplacement; the pattern that caused it
+                // does not keep its acceptance.
+                g.profile.Contradict(g.fired_class, g.fired_producer, g.frame, g.fired_context);
+                if (g.fired_class.op == na::j2::Op::Barrier) ++g.stats.barrier_contradictions;
+                else ++g.stats.class_contradictions;
             }
             g.route_prev_late_class = g.stats.inline_late_writes + g.stats.post_scene_batches;
             g.class_fired = false;
