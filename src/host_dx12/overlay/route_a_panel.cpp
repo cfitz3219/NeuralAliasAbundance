@@ -681,6 +681,8 @@ void DrawLiveDlaa()
                       (static_cast<int>(active * -100.0f + 0.5f) == -cur) ? "" : " (your new choice applies at the next game start)",
                       static_cast<unsigned long long>(nb.negative), static_cast<unsigned long long>(nb.zero), static_cast<unsigned long long>(nb.positive), nb.min, nb.max);
         StatusLine(0, tb);
+        if (static_cast<int>(active * -100.0f + 0.5f) != -cur)
+            StatusLine(2, "Restart the game to see this change: the game builds its texture samplers when it loads, so the new detail level is not visible until the next start.");
     }
     {
         // Where DLAA is placed in this game's frame, chosen automatically (or forced in the ini).
