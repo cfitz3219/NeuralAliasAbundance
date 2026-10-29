@@ -404,6 +404,27 @@ void announce_pending()
 }
 // A55 status log (discovery thread only).
 wchar_t g_status_log[MAX_PATH] = {};
+bool g_menu_diagnostics = false;
+void menu_note(const char* text) {
+    if (!g_menu_diagnostics || !g_status_log[0]) return;
+    HANDLE f = CreateFileW(g_status_log, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(f, text, static_cast<DWORD>(strlen(text)), &written, nullptr);
+    CloseHandle(f);
+}
+int menu_fault(EXCEPTION_POINTERS* exception) {
+    if (g_menu_diagnostics) {
+        char row[180];
+        snprintf(row, sizeof(row), "menu_fault code=0x%08lX address=%p thread=%lu\r\n",
+                 exception->ExceptionRecord->ExceptionCode, exception->ExceptionRecord->ExceptionAddress, GetCurrentThreadId());
+        menu_note(row);
+        wchar_t path[MAX_PATH]{};
+        if (swprintf_s(path, L"%s.menu.dmp", g_status_log) > 0)
+            na::freeze::WriteMiniDump(path, exception);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 ULONGLONG g_status_last_tick = 0;
 void write_status_line()
 {
@@ -1674,6 +1695,7 @@ void draw_panel(bool just_opened)
 
 void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_opened, ID3D12Resource* frame = nullptr)
 {
+    if (just_opened) menu_note("menu_open: render entry\r\n");
     g_render_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
     // Only the overlay's own input reads (apply_input, the ImGui Win32 backend)
     // pass the input lock; the game's reads on this same thread do not.
@@ -1700,6 +1722,7 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     } else if (!acquire_back_buffer_locked(sc, idx, back_buffer)) return;
 
     apply_input(just_opened);
+    if (just_opened) menu_note("menu_open: input applied\r\n");
     // A42: the hardware cursor is the menu cursor. A43 safety nets, checked
     // every frame: if the game re-hid it, draw ImGui's software cursor at the
     // same position instead; if the game re-clipped it to a point (mouse-look
@@ -1718,6 +1741,7 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     ImGui::NewFrame();
     draw_panel(just_opened);
     ImGui::Render();
+    if (just_opened) menu_note("menu_open: draw data built\r\n");
 
     ImDrawData* draw = ImGui::GetDrawData();
     // New glyphs can update an EXISTING font atlas. The private upload queue
@@ -1743,6 +1767,7 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     ID3D12DescriptorHeap* heaps[] = {g_state.srv_heap.Get()};
     g_state.list->SetDescriptorHeaps(1, heaps);
     ImGui_ImplDX12_RenderDrawData(draw, g_state.list.Get());
+    if (just_opened) menu_note("menu_open: GPU draw recorded\r\n");
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     g_state.list->ResourceBarrier(1, &b);
@@ -1753,6 +1778,12 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     queue->Signal(g_state.fence.Get(), f.fence_value);
     g_menu_draw_marker.store(f.fence_value);
     g_frames.fetch_add(1, std::memory_order_relaxed);
+    if (just_opened) menu_note("menu_open: GPU draw submitted\r\n");
+}
+
+void render_with_fault_receipt(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_opened, ID3D12Resource* frame) {
+    __try { render_locked(sc, queue, just_opened, frame); }
+    __except (menu_fault(GetExceptionInformation())) {} // filter always continues the original exception
 }
 
 // The finished frame (real back buffer on the old path, the game's proxy on
@@ -1872,7 +1903,7 @@ void menu_step(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool open, ID3D12R
     if (just_opened && g_state.hwnd) PostMessageW(g_state.hwnd, kMsgCursorShow, 0, 0);
     if (just_closed && g_state.hwnd) PostMessageW(g_state.hwnd, kMsgCursorRestore, 0, 0);
     if (!open) return;
-    render_locked(sc, queue, just_opened, frame);
+    render_with_fault_receipt(sc, queue, just_opened, frame);
 }
 
 // Old path (no presenter): everything on the real back buffer, then the
@@ -2450,6 +2481,8 @@ void SetStatusLogPath(const wchar_t* path)
     else g_status_log[0] = 0;
     g_status_last_tick = 0;
 }
+
+void SetMenuDiagnostics(bool enabled) { g_menu_diagnostics = enabled; }
 
 int SwapChainColorSpace() { return g_color_space.load(std::memory_order_acquire); }
 

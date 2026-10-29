@@ -66,6 +66,8 @@ struct Stats {
 Stats GetStats();
 
 void SetOpen(bool open);
+// Opt-in local fault receipt for user-owned game testing; never handles a fault.
+void SetMenuDiagnostics(bool enabled);
 
 // A63 experiment (Astra's request): ask the game to rebuild its picture
 // pipeline by nudging its window size by one pixel and back a few frames

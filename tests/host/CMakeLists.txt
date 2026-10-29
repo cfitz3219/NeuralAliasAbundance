@@ -15,6 +15,7 @@ endfunction()
 
 na_host_test(fg_profile_test SOURCES fg_profile_test.cpp LIBS host_settings nvapi_headers)
 na_host_test(pbz_settings_test SOURCES pbz_settings_test.cpp LIBS host_settings)
+na_host_test(route_a_menu_test SOURCES route_a_menu_test.cpp LIBS host_dx12)
 
 # Fake NGX runtime (the one non-driver name ngx_observe accepts).
 add_library(nvngx_stub SHARED ngx_stub.cpp)
@@ -66,6 +67,8 @@ na_host_test(capture_test SOURCES capture_test.cpp LIBS host_capture
              ARGS "${CMAKE_CURRENT_BINARY_DIR}/capture-test-out")
 
 na_host_test(overlay_test SOURCES overlay_test.cpp LIBS host_dx12 user32)
+add_test(NAME host_overlay_hardware_test COMMAND overlay_test --hardware)
+set_tests_properties(host_overlay_hardware_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "host;gpu")
 
 # Parameter-object tests need the NVIDIA NGX SDK headers (local SDK folder, or
 # the CI job that fetches the public DLSS repo's headers at build time).
@@ -159,7 +162,8 @@ endif()
 set(NA_UPSCALER_RUNTIME_DIR "" CACHE PATH "Folder with the official FSR / XeSS runtime DLLs (hardware session)")
 na_host_test(upscaler_jitter_test SOURCES upscaler_jitter_test.cpp LIBS d3d12 dxgi
              ARGS "${NA_UPSCALER_RUNTIME_DIR}" LABELS "gpu")
-target_include_directories(upscaler_jitter_test SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/third_party/ffx-api" "${PROJECT_SOURCE_DIR}/src")
+target_include_directories(upscaler_jitter_test SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/third_party/ffx-api")
+target_include_directories(upscaler_jitter_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
 
 # C8a: H1 producers on a real device (WARP on CI).
 na_host_test(observe_producers_test SOURCES observe_producers_test.cpp LIBS host_observe_producers dxgi)

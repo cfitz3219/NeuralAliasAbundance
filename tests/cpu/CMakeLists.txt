@@ -8,8 +8,9 @@ get_filename_component(NA_CPU_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
 find_package(Threads REQUIRED)
 add_library(na_cpu_test_options INTERFACE)
 target_compile_features(na_cpu_test_options INTERFACE cxx_std_17)
-# Test the recovered headers without imposing new warnings policy on frozen code.
-target_include_directories(na_cpu_test_options SYSTEM INTERFACE "${NA_CPU_ROOT}/src")
+# Project headers are editable dependencies, not external SDK headers. This
+# interface also reaches the production host through the discovery adapter.
+target_include_directories(na_cpu_test_options INTERFACE "${NA_CPU_ROOT}/src")
 target_link_libraries(na_cpu_test_options INTERFACE Threads::Threads)
 if(MSVC)
   target_compile_options(na_cpu_test_options INTERFACE /W4 /WX /permissive- /utf-8)

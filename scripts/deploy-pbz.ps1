@@ -93,6 +93,7 @@ enabled=1
 tag=PHANTOM BLADE ZERO
 status_log=$UserRoot\status.log
 startup_log=$UserRoot\startup.log
+menu_diagnostics=1
 [route_a]
 enabled=1
 [observe]

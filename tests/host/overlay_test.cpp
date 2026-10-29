@@ -12,6 +12,8 @@
 #include "host_dx12/hooking/vtable_hook.hpp"
 #include "host_dx12/overlay/overlay.hpp"
 #include "host_dx12/overlay/route_a_panel.hpp"
+#include "host_dx12/settings.hpp"
+#include <filesystem>
 
 #include <atomic>
 
@@ -26,12 +28,24 @@ LRESULT CALLBACK GameWndProc(HWND h, UINT m, WPARAM w, LPARAM l)
 void Pump() { MSG msg; while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); } }
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
-    SetEnvironmentVariableW(L"NEURALALIAS_TEST_WARP", L"1");
+    const bool hardware = argc > 1 && !strcmp(argv[1], "--hardware");
+    SetEnvironmentVariableW(L"NEURALALIAS_TEST_WARP", hardware ? nullptr : L"1");
+    wchar_t temp[MAX_PATH]{}, ini[MAX_PATH]{}, scope[64]{};
+    GetTempPathW(MAX_PATH, temp);
+    swprintf_s(ini,L"%sNA-overlay-test-%lu.ini",temp,GetCurrentProcessId());
+    swprintf_s(scope,L"OverlayTest-%lu",GetCurrentProcessId());
+    WritePrivateProfileStringW(L"settings",L"scope",scope,ini);
+    WritePrivateProfileStringW(L"dlss",L"enabled",L"0",ini);
+    WritePrivateProfileStringW(L"dlss",L"mode",L"4",ini);
+    WritePrivateProfileStringW(L"fg",L"preset",L"3",ini);
+    na::settings::SetIniPath(ini); na::settings::Load();
     test::Device d;
     // The game device must be WARP too (vtables are per driver).
-    {
+    if (hardware) {
+        if (!test::CreateDevice(d, false)) return test::SkipNoDevice("overlay_hardware_test");
+    } else {
         if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&d.factory)))) return test::SkipNoDevice("overlay_test");
         test::ComPtr<IDXGIAdapter> warp;
         if (FAILED(d.factory->EnumWarpAdapter(IID_PPV_ARGS(&warp))) ||
@@ -126,5 +140,8 @@ int main()
     sc.Reset(); sc1.Reset();
     DestroyWindow(hwnd);
     na::hooking::Shutdown();
+    DeleteFileW(na::settings::UserIniPath());
+    std::filesystem::remove(std::filesystem::path(na::settings::UserIniPath()).parent_path());
+    DeleteFileW(ini);
     return test::finish("overlay_test");
 }

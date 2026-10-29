@@ -159,6 +159,7 @@ DWORD WINAPI InitThread(LPVOID)
         wchar_t custom[MAX_PATH] = {};
         if (GetPrivateProfileStringW(L"host", L"status_log", L"", custom, MAX_PATH, g_ini) > 0) lstrcpynW(status_path, custom, MAX_PATH);
         na::overlay::SetStatusLogPath(status_path); // A55
+        na::overlay::SetMenuDiagnostics(GetPrivateProfileIntW(L"host", L"menu_diagnostics", 0, g_ini) == 1);
     }
     // C8: discovery observation producers (H1/H2). Off by default until a
     // consumer (A5 classifier) runs; [observe] producers=1 turns them on.
