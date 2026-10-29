@@ -434,6 +434,7 @@ NgxResult CreateFeatureImpl(CoreSlot& s, void* cmd_list, uint32_t feature_id, vo
     g_creates.fetch_add(1, std::memory_order_relaxed);
     uint64_t handle =
         (out_handle && *out_handle) ? reinterpret_cast<uint64_t>(*out_handle) : 0;
+    ep.preset_hint = CreatePresetHint(feature_id, params); // what the runtime was finally handed (after any A42 retry)
     push_record(CallKind::CreateFeature, r, feature_id, 0, handle,
                 reinterpret_cast<uint64_t>(cmd_list), &ep);
     return r;
@@ -972,10 +973,10 @@ DWORD WINAPI LoggerThread(LPVOID)
                     static_cast<unsigned long long>(r.params.output),
                     static_cast<unsigned long long>(r.params.exposure));
                 std::fprintf(g_log_file,
-                             " subrect=%ux%u pq=%u cflags=0x%X ovr=%u",
+                             " subrect=%ux%u pq=%u cflags=0x%X ovr=%u preset=%u",
                              r.params.subrect_width, r.params.subrect_height,
                              r.params.perf_quality, r.params.create_flags,
-                             r.params.overridden);
+                             r.params.overridden, r.params.preset_hint);
             }
             std::fputc('\n', g_log_file);
         }
@@ -1120,6 +1121,32 @@ uint32_t GetSlCallRecords(uint64_t after_seq, SlCallRecord* out, uint32_t capaci
 void RequestReapply()
 {
     if (g_last_sr_handle.load(std::memory_order_acquire)) g_reapply_pending.store(1, std::memory_order_release);
+}
+
+uint32_t CreatePresetHint(uint32_t feature_id, void* ngx_parameter)
+{
+#if defined(NA_HAVE_NGX_SDK)
+    if (!ngx_parameter || (feature_id != 1u && feature_id != kFeatureRayReconstruction)) return 0;
+    auto* p = static_cast<NVSDK_NGX_Parameter*>(ngx_parameter);
+    int pq = -1;
+    p->Get(NVSDK_NGX_Parameter_PerfQualityValue, &pq);
+    const bool rr = feature_id == kFeatureRayReconstruction;
+    const char* key = nullptr;
+    switch (pq) {
+    case NVSDK_NGX_PerfQuality_Value_MaxPerf: key = rr ? NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Performance : NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance; break;
+    case NVSDK_NGX_PerfQuality_Value_Balanced: key = rr ? NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced : NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced; break;
+    case NVSDK_NGX_PerfQuality_Value_MaxQuality: key = rr ? NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality : NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality; break;
+    case NVSDK_NGX_PerfQuality_Value_UltraPerformance: key = rr ? NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraPerformance : NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance; break;
+    case NVSDK_NGX_PerfQuality_Value_UltraQuality: key = rr ? NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraQuality : NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality; break;
+    case NVSDK_NGX_PerfQuality_Value_DLAA: key = rr ? NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA : NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA; break;
+    default: return 0;
+    }
+    unsigned int v = 0;
+    return p->Get(key, &v) == NVSDK_NGX_Result_Success ? v : 0u;
+#else
+    (void)feature_id; (void)ngx_parameter;
+    return 0;
+#endif
 }
 
 bool ApplyCreateOverrides(void* ngx_parameter) { return ApplyCreateOverridesForFeature(1u, ngx_parameter); }

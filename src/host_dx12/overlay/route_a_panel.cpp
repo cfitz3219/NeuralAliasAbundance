@@ -271,7 +271,14 @@ void DrawPicture()
         }
         EndRow();
         ImGui::EndDisabled();
-        if (ngx.preset_rejected) {
+        // The NVIDIA app's "DLSS Override - Model presets" replaces whatever preset
+        // the game or NeuralAlias asks for: every choice here would look the same.
+        const auto drv = na::fg::preset::GetUpscalerOverrides();
+        if (rr_upscaler ? drv.RrForced() : drv.SrForced()) {
+            StatusLine(2, rr_upscaler
+                ? "The NVIDIA app is overriding the Ray Reconstruction model for this game, so changing it here has no effect. Turn off DLSS Override (Ray Reconstruction) in the NVIDIA app to use this setting."
+                : "The NVIDIA app is overriding the DLSS model for this game, so J, K, L and M all look the same. Turn off DLSS Override (Super Resolution model presets) in the NVIDIA app to use this setting.");
+        } else if (ngx.preset_rejected) {
             // The runtime refused a preset hint; the detour already reset the
             // setting in memory (A42). Persist it and say so.
             static bool saved = false;

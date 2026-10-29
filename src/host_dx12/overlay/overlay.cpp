@@ -733,6 +733,14 @@ void write_status_line()
     const auto fpreset = na::fg::preset::GetStatus();
     ln = snprintf(lm, sizeof(lm), "fg_driver_preset requested=%u stored=%u result=%d pending=%u restart=%u (profile request; active model unverified)\r\n", fpreset.requested, fpreset.stored, fpreset.result, fpreset.pending ? 1u : 0u, fpreset.restart ? 1u : 0u);
     if (ln > 0) WriteFile(f, lm, static_cast<DWORD>(ln), &written, nullptr);
+    const auto drv = na::fg::preset::GetUpscalerOverrides();
+    const auto optc = na::ngx::GetOptimalStats();
+    const auto ngxs = na::ngx::GetStats();
+    ln = snprintf(lm, sizeof(lm), "dlss_control driver_read=%u sr_override=%u sr_preset=0x%X sr_global=%u rr_override=%u rr_preset=0x%X rr_global=%u preset_setting=%d rr_preset_setting=%d optimal_calls=%llu last_query=%ux%u game_asks_size=%u\r\n",
+                  drv.available ? 1u : 0u, drv.sr_enabled, drv.sr_preset, drv.sr_global ? 1u : 0u, drv.rr_enabled, drv.rr_preset, drv.rr_global ? 1u : 0u,
+                  na::settings::Get().preset.load(), na::settings::Get().rr_preset.load(), static_cast<unsigned long long>(optc.calls), optc.last_user_w, optc.last_user_h,
+                  na::ngx::OptimalQueriedFor(ngxs.last_sr_out_w, ngxs.last_sr_out_h) ? 1u : 0u);
+    if (ln > 0) WriteFile(f, lm, static_cast<DWORD>(ln), &written, nullptr);
     write_menu_progress(f);
     char nr_line[256];
     // Read a bounded receipt ring on the logging worker, never write a file

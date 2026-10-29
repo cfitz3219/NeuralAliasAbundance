@@ -108,6 +108,7 @@ DWORD WINAPI InitThread(LPVOID)
     bool route_a_started = false;
     if (route_a) {
         na::fg::preset::Initialize();
+        na::fg::preset::ReadUpscalerOverrides(); // read-only: does the NVIDIA app force a DLSS preset?
         na::ngx::PreloadAndHookNgxCore();
         na::tlou1::InitializeApply();
         bool sync_hook = GetPrivateProfileIntW(L"observe", L"sync_loader_hook", 0, g_ini) == 1;
