@@ -28,7 +28,7 @@ bool changed_this_run = false;
 std::atomic<uint32_t> desired{1};
 constexpr NvU32 ids[] = {NGX_DLSS_FG_OVERRIDE_ID, NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_ID};
 
-bool load_api() {
+bool initialize_api() {
     auto module = LoadLibraryExW(L"nvapi64.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!module) return false;
     auto query = reinterpret_cast<Query>(reinterpret_cast<void*>(GetProcAddress(module, "nvapi_QueryInterface")));
@@ -39,6 +39,14 @@ bool load_api() {
     set = reinterpret_cast<decltype(set)>(query(0x577dd202));
     erase = reinterpret_cast<decltype(erase)>(query(0xe4a26362));
     return create && destroy && load && save && find && get && set && erase;
+}
+bool load_api() {
+    // Menu refresh and the FG profile worker may run concurrently. Publish
+    // immutable function pointers once; don't rewrite them on every refresh.
+    static std::once_flag once;
+    static bool ready=false;
+    std::call_once(once,[]{ready=initialize_api();});
+    return ready;
 }
 
 NvAPI_Status apply(uint32_t selection, uint32_t& stored, bool& changed, bool read_only = false, bool restore = false) {
@@ -193,7 +201,7 @@ void ReadUpscalerOverrides() {
     auto query = module ? reinterpret_cast<Query>(reinterpret_cast<void*>(GetProcAddress(module, "nvapi_QueryInterface"))) : nullptr;
     auto get_global = query ? reinterpret_cast<GetGlobal>(query(0x617bff9f)) : nullptr; // NvAPI_DRS_GetCurrentGlobalProfile
     NvDRSSessionHandle session = nullptr;
-    if (create(&session) != NVAPI_OK) return;
+    if (create(&session) != NVAPI_OK) {std::lock_guard<std::mutex> lock(upscaler_mutex);upscaler_overrides=out;return;}
     if (load(session) == NVAPI_OK) {
         out.available = true;
         wchar_t path[MAX_PATH]{}; GetModuleFileNameW(nullptr, path, MAX_PATH);

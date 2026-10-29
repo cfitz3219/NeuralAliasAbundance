@@ -198,9 +198,9 @@ void DrawPicture()
     // say so where it is seen first, not only under the preset row.
     {
         const auto drv = na::fg::preset::GetUpscalerOverrides();
-        if (enabled && conn == Conn::Connected && (ngx.active_upscaler == 13 ? drv.RrForced() : drv.SrForced())) {
+        if (state == 1 && enabled && conn == Conn::Connected && (ngx.active_upscaler == 13 ? drv.RrForced() : drv.SrForced())) {
             state = 2;
-            text = "The NVIDIA app is overriding the DLSS model for this game. Set its DLSS Override to \"Use 3D app setting\" so NeuralAlias can control it (details under DLSS preset).";
+            text = "A driver DLSS model override is enabled. In the NVIDIA app, set DLSS Override to \"Use 3D app setting\", then restart the game (details under DLSS preset).";
         }
     }
     StatusBanner(state, text);
@@ -285,8 +285,8 @@ void DrawPicture()
         const auto drv = na::fg::preset::GetUpscalerOverrides();
         if (rr_upscaler ? drv.RrForced() : drv.SrForced()) {
             StatusLine(2, rr_upscaler
-                ? "The NVIDIA app is overriding the Ray Reconstruction model, so NeuralAlias cannot control it. In the NVIDIA app, open this game's settings and set DLSS Override (Ray Reconstruction) to \"Use 3D app setting\", then restart the game."
-                : "The NVIDIA app is overriding the DLSS model, so NeuralAlias cannot control it. In the NVIDIA app, open this game's settings and set DLSS Override (Super Resolution model presets) to \"Use 3D app setting\", then restart the game.");
+                ? "A driver Ray Reconstruction model override is enabled and may replace this preset request. In the NVIDIA app, open this game's settings and set DLSS Override (Ray Reconstruction) to \"Use 3D app setting\", then restart the game."
+                : "A driver DLSS model override is enabled and may replace this preset request. In the NVIDIA app, open this game's settings and set DLSS Override (Super Resolution model presets) to \"Use 3D app setting\", then restart the game.");
         } else if (ngx.preset_rejected) {
             // The runtime refused a preset hint; the detour already reset the
             // setting in memory (A42). Persist it and say so.
