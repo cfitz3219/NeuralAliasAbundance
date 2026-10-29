@@ -493,3 +493,6 @@ PR61/4179c84 integrated with thread-safeNVAPIinitialization andnonmaskingwarning
 
 ### 2026-10-29 - Argon useful Route A changes fc04ba5
 Reviewed/integrated Opus PR62; public parameter paths and stable per-original callbacks tested. Full Release,13focused tests, final3NGX and additive deployment fixture pass. Documents/NA-pbz-update.cmd targets packagefc04ba5 (DLL DAE4F35B...), repair from actual installedfe952b5 verified by hash and receipt. Native game DLLs unchanged. No game launch/deployment. Private late-population/SL query coverage not claimed; legacy duplicateNR retry ambiguity remains. COMMS and production docs/PBZ-PRE-FG-NR.md contain dispositions. User owns live results.
+
+### 2026-10-29 - Corrected PBZ package after failed update
+Home unavailable because fc04ba5 update removed old install then failed on mistakenly manifested Repair.log, leaving no injector. Corrected existing fc04ba5 package with installerb61a244; runtime unchanged. Explicit payload manifest, preflight before rollback, PS5.1 defaults fixed; actual package validation with locked transcript passes plus fixture regression. User reruns NA-pbz-update.cmd with PBZ closed. No autonomous deployment. See COMMS and preserved local/pbz-package-home-failure-20261029.
