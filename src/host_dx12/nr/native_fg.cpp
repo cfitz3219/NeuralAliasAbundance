@@ -63,7 +63,7 @@ struct InputStates {
         for(auto* r:inputs) {
             bool duplicate=false;for(uint32_t i=0;i<count;++i)duplicate|=resources[i]==r;
             if(duplicate)continue;
-            resources[count]=r;if(!states::Read(l,r,original[count]))return;++count;
+            resources[count]=r;if(!states::Read(l,r,original[count]) || !states::CanTransitionOn(l->GetType(),original[count]))return;++count;
         }
         D3D12_RESOURCE_STATES observed{};
         states::Read(l,f.color.resource,observed);status.color_state=static_cast<uint32_t>(observed);

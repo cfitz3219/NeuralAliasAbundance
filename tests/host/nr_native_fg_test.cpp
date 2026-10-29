@@ -157,6 +157,10 @@ int Frame(uint64_t id,uint32_t w= W,DXGI_FORMAT fmt=DXGI_FORMAT_R32G32B32A32_FLO
 }
 }
 int main(){
+    CHECK(na::nr::states::CanTransitionOn(D3D12_COMMAND_LIST_TYPE_COMPUTE,D3D12_RESOURCE_STATE_COMMON));
+    CHECK(na::nr::states::CanTransitionOn(D3D12_COMMAND_LIST_TYPE_COMPUTE,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+    CHECK(!na::nr::states::CanTransitionOn(D3D12_COMMAND_LIST_TYPE_COMPUTE,D3D12_RESOURCE_STATE_RENDER_TARGET));
+    CHECK(!na::nr::states::CanTransitionOn(D3D12_COMMAND_LIST_TYPE_COMPUTE,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
     ComPtr<ID3D12Debug> debug;if(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))debug->EnableDebugLayer();
     if(!test::CreateDevice(d))return test::SkipNoDevice("nr_native_fg_test");ComPtr<ID3D12InfoQueue> info;d.device.As(&info);
     REQUIRE(na::nr::states::InstallEnhancedInvalidation());

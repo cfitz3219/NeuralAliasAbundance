@@ -26,6 +26,10 @@ NvAPI_Status __cdecl put(NvDRSSessionHandle, NvDRSProfileHandle, NVDRS_SETTING* 
 NvAPI_Status __cdecl remove(NvDRSSessionHandle, NvDRSProfileHandle, NvU32 id) { pending.erase(id); return NVAPI_OK; }
 }
 int main() {
+    UpscalerOverrides overrides;overrides.available=true;overrides.sr_preset=13;overrides.rr_preset=6;
+    CHECK(!overrides.SrForced() && !overrides.RrForced());
+    overrides.sr_enabled=overrides.rr_enabled=1;CHECK(overrides.SrForced() && overrides.RrForced());
+    overrides.sr_preset=overrides.rr_preset=0;CHECK(!overrides.SrForced() && !overrides.RrForced());
     create=make; destroy=close; load=read; save=write; find=lookup; get=fetch; set=put; erase=remove;
     wcscpy_s(target_exe, L"PBZ.exe");
     wchar_t temp[MAX_PATH]{}; GetTempPathW(MAX_PATH, temp);

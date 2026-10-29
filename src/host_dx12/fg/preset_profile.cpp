@@ -177,21 +177,21 @@ Status GetStatus() { std::lock_guard<std::mutex> lock(mutex); return status; }
 namespace {
 std::mutex upscaler_mutex;
 UpscalerOverrides upscaler_overrides;
-bool read_dword(NvDRSSessionHandle session, NvDRSProfileHandle profile, NvU32 id, uint32_t& value, bool& user_set) {
+bool read_dword(NvDRSSessionHandle session, NvDRSProfileHandle profile, NvU32 id, uint32_t& value, bool& inherited) {
     NVDRS_SETTING s{}; s.version = NVDRS_SETTING_VER;
     if (get(session, profile, id, &s) != NVAPI_OK) return false;
     value = s.u32CurrentValue;
-    user_set = !s.isCurrentPredefined;
+    inherited = s.settingLocation == NVDRS_GLOBAL_PROFILE_LOCATION || s.settingLocation == NVDRS_BASE_PROFILE_LOCATION;
     return true;
 }
 }
 void ReadUpscalerOverrides() {
     UpscalerOverrides out{};
     if (!load_api()) { std::lock_guard<std::mutex> lock(upscaler_mutex); upscaler_overrides = out; return; }
-    using GetBase = NvAPI_Status(__cdecl*)(NvDRSSessionHandle, NvDRSProfileHandle*);
+    using GetGlobal = NvAPI_Status(__cdecl*)(NvDRSSessionHandle, NvDRSProfileHandle*);
     auto module = GetModuleHandleW(L"nvapi64.dll");
     auto query = module ? reinterpret_cast<Query>(reinterpret_cast<void*>(GetProcAddress(module, "nvapi_QueryInterface"))) : nullptr;
-    auto get_base = query ? reinterpret_cast<GetBase>(query(0xda8466a0)) : nullptr; // NvAPI_DRS_GetBaseProfile
+    auto get_global = query ? reinterpret_cast<GetGlobal>(query(0x617bff9f)) : nullptr; // NvAPI_DRS_GetCurrentGlobalProfile
     NvDRSSessionHandle session = nullptr;
     if (create(&session) != NVAPI_OK) return;
     if (load(session) == NVAPI_OK) {
@@ -202,14 +202,14 @@ void ReadUpscalerOverrides() {
         NvDRSProfileHandle profiles[2] = {};
         NVDRS_APPLICATION app{}; app.version = NVDRS_APPLICATION_VER;
         if (find(session, exe, &profiles[0], &app) != NVAPI_OK) profiles[0] = nullptr;
-        if (!get_base || get_base(session, &profiles[1]) != NVAPI_OK) profiles[1] = nullptr;
-        // The game's own profile wins over the global one, as in the driver.
-        for (int i = 1; i >= 0; --i) {
-            if (!profiles[i]) continue;
+        if (!get_global || get_global(session, &profiles[1]) != NVAPI_OK) profiles[1] = nullptr;
+        // GetSetting on the game profile returns its effective inherited value.
+        const int i=profiles[0]?0:1;
+        if (profiles[i]) {
             uint32_t v = 0; bool user = false;
-            if (read_dword(session, profiles[i], NGX_DLSS_SR_OVERRIDE_ID, v, user)) { out.sr_enabled = v; out.sr_global = i == 1; }
+            if (read_dword(session, profiles[i], NGX_DLSS_SR_OVERRIDE_ID, v, user)) { out.sr_enabled = v; out.sr_global = i == 1 || user; }
             if (read_dword(session, profiles[i], NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION_ID, v, user)) out.sr_preset = v;
-            if (read_dword(session, profiles[i], NGX_DLSS_RR_OVERRIDE_ID, v, user)) { out.rr_enabled = v; out.rr_global = i == 1; }
+            if (read_dword(session, profiles[i], NGX_DLSS_RR_OVERRIDE_ID, v, user)) { out.rr_enabled = v; out.rr_global = i == 1 || user; }
             if (read_dword(session, profiles[i], NGX_DLSS_RR_OVERRIDE_RENDER_PRESET_SELECTION_ID, v, user)) out.rr_preset = v;
         }
     }

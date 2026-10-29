@@ -94,7 +94,19 @@ int main()
         CHECK(na::ngx::OptimalQueriedFor(3439, 1439));
         CHECK(!na::ngx::OptimalQueriedFor(1920, 1080));
     }
-    auto with_out = [](test::FakeParams& p) { p.Set(NVSDK_NGX_Parameter_OutWidth, 3440u); p.Set(NVSDK_NGX_Parameter_OutHeight, 1440u); };
+    { // Even a matching display probe does not prove the game used our answer.
+        test::FakeParams p;p.Set(NVSDK_NGX_Parameter_OutWidth,3440u);p.Set(NVSDK_NGX_Parameter_OutHeight,1440u);
+        p.Set(NVSDK_NGX_Parameter_Width,1146u);p.Set(NVSDK_NGX_Parameter_Height,480u);
+        p.Set(NVSDK_NGX_Parameter_PerfQualityValue,int(NVSDK_NGX_PerfQuality_Value_UltraPerformance));
+        CHECK(na::ngx::ApplyCreateOverrides(&p));
+        CHECK(p.I(NVSDK_NGX_Parameter_PerfQualityValue)==NVSDK_NGX_PerfQuality_Value_UltraPerformance);
+    }
+    auto with_out = [&](test::FakeParams& p) {
+        p.Set(NVSDK_NGX_Parameter_OutWidth, 3440u); p.Set(NVSDK_NGX_Parameter_OutHeight, 1440u);
+        auto q=static_cast<na::settings::DlssMode>(st.dlss_mode.load());
+        auto size=[&](unsigned v){return q==na::settings::DlssMode::DLAA?v:(static_cast<unsigned>(v*na::settings::ScaleForMode(q)+.5f)+7u)&~7u;};
+        p.Set(NVSDK_NGX_Parameter_Width,size(3440));p.Set(NVSDK_NGX_Parameter_Height,size(1440));
+    };
 
     // ---- ApplyCreateOverrides.
     {

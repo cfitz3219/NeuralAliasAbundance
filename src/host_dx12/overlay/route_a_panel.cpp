@@ -148,7 +148,7 @@ void DrawPicture()
     // A game that never asks DLSS which render size to use picks it itself
     // (PBZ renders 1146x480 for 3440x1440 whatever we answer). Then only the
     // game's own video settings change the resolution; NeuralAlias controls presets.
-    const bool game_sets_size = valid_size(ngx.last_sr_out_w, ngx.last_sr_out_h) &&
+    const bool game_sets_size = !na::tlou1::GetApplyStatus().available && valid_size(ngx.last_sr_out_w, ngx.last_sr_out_h) &&
                                 !na::ngx::OptimalQueriedFor(ngx.last_sr_out_w, ngx.last_sr_out_h);
     if (game_sets_size) follow_game = true;
     unsigned rw = 0, rh = 0;
@@ -276,8 +276,8 @@ void DrawPicture()
         const auto drv = na::fg::preset::GetUpscalerOverrides();
         if (rr_upscaler ? drv.RrForced() : drv.SrForced()) {
             StatusLine(2, rr_upscaler
-                ? "The NVIDIA app is overriding the Ray Reconstruction model for this game, so changing it here has no effect. Turn off DLSS Override (Ray Reconstruction) in the NVIDIA app to use this setting."
-                : "The NVIDIA app is overriding the DLSS model for this game, so J, K, L and M all look the same. Turn off DLSS Override (Super Resolution model presets) in the NVIDIA app to use this setting.");
+                ? "A driver Ray Reconstruction model override is configured. It may replace this preset request. Check DLSS Override in the NVIDIA app."
+                : "A driver DLSS model override is configured. It may replace this preset request. Check DLSS Override (Super Resolution model presets) in the NVIDIA app.");
         } else if (ngx.preset_rejected) {
             // The runtime refused a preset hint; the detour already reset the
             // setting in memory (A42). Persist it and say so.

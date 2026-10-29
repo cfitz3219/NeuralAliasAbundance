@@ -574,6 +574,10 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
         bool wrote = write_preset_only(const_cast<void*>(params));
         NgxResult cr = wrote ? s.create(cmd_list, 1u, const_cast<void*>(params), &new_handle) : -1;
         if (cr != 1) cr = create_from_snapshot_locked(s, cmd_list, &new_handle, &own_params); // A63 fallback
+        EvalParams reapply_params{};
+        auto* used_params=own_params?own_params:const_cast<void*>(params);
+        ReadEvalParams(used_params,&reapply_params);
+        reapply_params.preset_hint=CreatePresetHint(1u,used_params);
         if (cr == 1 && new_handle) {
             // Find the game's key for this handle (the original game handle, or the one already mapped).
             const void* game_key = handle;
@@ -610,7 +614,7 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
         } else {
             g_reapply_failures.fetch_add(1, std::memory_order_relaxed);
         }
-        push_record(CallKind::CreateFeature, cr, 1u, 0, reinterpret_cast<uint64_t>(new_handle), reinterpret_cast<uint64_t>(cmd_list));
+        push_record(CallKind::CreateFeature, cr, 1u, 0, reinterpret_cast<uint64_t>(new_handle), reinterpret_cast<uint64_t>(cmd_list),&reapply_params);
     }
     if (g_retired_count.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lock(g_reapply_mutex);
@@ -1182,8 +1186,14 @@ bool ApplyCreateOverridesForFeature(uint32_t feature_id, void* ngx_parameter)
     unsigned int create_out_w = 0, create_out_h = 0;
     p->Get(NVSDK_NGX_Parameter_OutWidth, &create_out_w);
     p->Get(NVSDK_NGX_Parameter_OutHeight, &create_out_h);
+    unsigned int input_w=0,input_h=0;
+    p->Get(NVSDK_NGX_Parameter_Width,&input_w);p->Get(NVSDK_NGX_Parameter_Height,&input_h);
+    auto expected=[&](unsigned int extent){return mode==na::settings::DlssMode::DLAA?extent:
+        (static_cast<unsigned int>(extent*na::settings::ScaleForMode(mode)+0.5f)+7u)&~7u;};
+    const bool size_matches=input_w && input_h && create_out_w<=16384 && create_out_h<=16384 &&
+        input_w==expected(create_out_w) && input_h==expected(create_out_h);
     if (!na::settings::Get().follow_game_resolution.load(std::memory_order_acquire) &&
-        OptimalQueriedFor(create_out_w, create_out_h)) {
+        OptimalQueriedFor(create_out_w, create_out_h) && size_matches) {
         p->Set(NVSDK_NGX_Parameter_PerfQualityValue, pq);
         wrote = true;
     }

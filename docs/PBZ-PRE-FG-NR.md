@@ -176,3 +176,27 @@ compute, route ownership before first evaluate, native ID0, malformed sequences.
 NVIDIA model/actual PBZ display continuity still require Cort's test. No game
 launch/control/deployment. Opus owns resolution/model selection; Astra changed
 only the native route registration line in ngx_observe's FG creation branch.
+
+## Opus PR60 integration review (2026-10-29)
+Integrated012beda/aa88e76. Accepted actual-display target computation, preset-only
+Apply for PBZ's engine-owned size, preset logging and read-only driver override
+inspection. Corrected findings: only relabel quality when actual creation input
+matches the selected target; don't treat a display-size query as consumption;
+require driver override enable plus selection; use current global profile API
+and effective game-profile inheritance, not base-profile substitution; don't
+claim a configured override proves the active model or identical appearance;
+preserve existing engine-adapter controls. Added missing preset logging for the
+in-place Apply path, which bypasses CreateFeatureImpl.
+
+Accepted Opus's compute-state recommendation: validate observed states against
+compute-legal bits before recording any input transition. COMMON/PRESENT is legal;
+RT/depth/pixel-only states cannot be transitioned by this compute list.
+
+Legacy duplicate NR concern is real, but his global-Present deduplication rule
+is not adopted: multiple frames can be queued and generated Presents can
+interleave. A burst of calls alone does not prove duplicated picture content.
+No claim that this retry ambiguity is solved; image-write or explicit frame-tag
+provenance is needed to distinguish it. No guessed cache reuse was introduced.
+
+Full Release build +24focused tests pass9.61s; after final logging/adapter changes,
+6affected tests pass1.57s. No live game test, deployment or driver-profile writes.
