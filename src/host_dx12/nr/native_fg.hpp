@@ -20,6 +20,7 @@ struct Status {
     float last_ms=0,avg_ms=0;
     uint32_t gpu_samples=0;
     uint32_t input_states_known=0,color_state=0,hudless_state=0;
+    uint32_t input_states[4]{},input_evidence[4]{},illegal_state_mask=0;
     uint32_t backbuffer_is_swapchain=0,output_real_is_swapchain=0,output_real_present=0;
     uint64_t frame_id=0;
     uint32_t identity_mode=0,multi_count=0,multi_index=0,list_type=0;

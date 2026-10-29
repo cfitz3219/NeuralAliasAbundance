@@ -9,7 +9,7 @@ void* barrier_original[8]{};
 template<unsigned I> void STDMETHODCALLTYPE Enhanced(ID3D12GraphicsCommandList7* list,UINT count,const D3D12_BARRIER_GROUP* groups){
     // Enhanced layouts are a different contract. Never reuse a legacy state
     // across them; a subsequent observed legacy transition can qualify again.
-    Reset(list);
+    InvalidateEnhanced(list);
     reinterpret_cast<void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList7*,UINT,const D3D12_BARRIER_GROUP*)>(barrier_original[I])(list,count,groups);
 }
 struct Entry { ID3D12Resource* resource; D3D12_RESOURCE_STATES state; bool known; };
@@ -17,6 +17,7 @@ struct Entry { ID3D12Resource* resource; D3D12_RESOURCE_STATES state; bool known
 // Private data follows Reset/destruction; no resources or global locks retained.
 struct State final:IUnknown {
     std::atomic<ULONG> refs{1};std::vector<Entry> entries;
+    Evidence absent=Evidence::NoTransition;
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id,void** p) override {
         if(!p)return E_POINTER;*p=nullptr;if(id!=__uuidof(IUnknown))return E_NOINTERFACE;*p=this;AddRef();return S_OK;
     }
@@ -37,10 +38,14 @@ bool InstallEnhancedInvalidation(){
     return Register(Kind::CommandList7,&spec,1);
 }
 void Reset(ID3D12GraphicsCommandList* list){if(list)list->SetPrivateDataInterface(key,nullptr);}
+void InvalidateEnhanced(ID3D12GraphicsCommandList* list){
+    if(!list)return;auto* s=Get(list,true);if(!s)return;
+    s->entries.clear();s->absent=Evidence::EnhancedInvalidated;s->Release();
+}
 void Observe(ID3D12GraphicsCommandList* list,UINT count,const D3D12_RESOURCE_BARRIER* barriers) {
     if(!list || !count || !barriers)return;auto* s=Get(list,true);if(!s)return;
     for(UINT i=0;i<count;++i){const auto& b=barriers[i];
-        if(b.Type==D3D12_RESOURCE_BARRIER_TYPE_ALIASING){s->entries.clear();continue;}
+        if(b.Type==D3D12_RESOURCE_BARRIER_TYPE_ALIASING){s->entries.clear();s->absent=Evidence::AliasingInvalidated;continue;}
         if(b.Type!=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION ||
            (b.Transition.Subresource!=0 && b.Transition.Subresource!=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES))continue;
         Entry* e=nullptr;for(auto& v:s->entries)if(v.resource==b.Transition.pResource){e=&v;break;}
@@ -48,17 +53,24 @@ void Observe(ID3D12GraphicsCommandList* list,UINT count,const D3D12_RESOURCE_BAR
         e->state=b.Transition.StateAfter;e->known=b.Flags!=D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY;
     }s->Release();
 }
-bool Read(ID3D12GraphicsCommandList* list,ID3D12Resource* r,D3D12_RESOURCE_STATES& state) {
-    if(!list)return false;
+Evidence Inspect(ID3D12GraphicsCommandList* list,ID3D12Resource* r,D3D12_RESOURCE_STATES& state) {
+    state=static_cast<D3D12_RESOURCE_STATES>(~0u); // unknown is NOT COMMON
+    if(!list || !r)return Evidence::NoTransition;
     using namespace na::hooking::variants;
     if(Active(Kind::CommandList7)) {ID3D12GraphicsCommandList7* extended=nullptr;
         if(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&extended)))){
             const auto coverage=CoverageOf(Kind::CommandList7,extended);extended->Release();
-            if(coverage!=Coverage::Complete)return false;
+            if(coverage!=Coverage::Complete)return Evidence::UncoveredList;
         }
     }
-    auto* s=Get(list,false);if(!s)return false;bool found=false;
-    for(const auto& v:s->entries)if(v.resource==r){found=v.known;state=v.state;break;}
-    s->Release();return found;
+    auto* s=Get(list,false);if(!s)return Evidence::NoTransition;auto result=s->absent;
+    for(const auto& v:s->entries)if(v.resource==r){result=v.known?Evidence::Known:Evidence::SplitPending;if(v.known)state=v.state;break;}
+    s->Release();return result;
 }
+bool Read(ID3D12GraphicsCommandList* list,ID3D12Resource* r,D3D12_RESOURCE_STATES& state){return Inspect(list,r,state)==Evidence::Known;}
+const char* Name(Evidence e){switch(e){
+case Evidence::Known:return "observed";case Evidence::NoTransition:return "no_transition";
+case Evidence::SplitPending:return "split_pending";case Evidence::EnhancedInvalidated:return "enhanced_invalidated";
+case Evidence::AliasingInvalidated:return "aliasing_invalidated";case Evidence::UncoveredList:return "uncovered_list";
+}return "unknown";}
 }

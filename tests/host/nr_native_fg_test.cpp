@@ -138,6 +138,28 @@ int Frame(uint64_t id,uint32_t w= W,DXGI_FORMAT fmt=DXGI_FORMAT_R32G32B32A32_FLO
     test::FakeParams p;Params(p,b,h,depth.Get(),mv.Get(),id,w);na::nr::native::Prepare(list.list.Get());
     na::nr::native::MarkSwapchainBuffer(b.texture.Get());
     na::settings::Get().nr_enabled=enabled;const auto before=evaluates;
+    if(id==0){
+        // Diagnostic-only observations: do not submit these artificial barriers.
+        using E=na::nr::states::Evidence;
+        auto split=guides[0];split.Flags=D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY;
+        na::nr::states::Observe(list.list.Get(),1,&split);
+        na::nr::native::Before(list.list.Get(),&core,&fg,&p,Runtime());
+        const auto missing=na::nr::native::GetStatus();
+        CHECK(evaluates==before && !missing.input_states_known);
+        CHECK(missing.input_evidence[0]==static_cast<unsigned>(E::Known));
+        CHECK(missing.input_evidence[2]==static_cast<unsigned>(E::SplitPending));
+        CHECK(missing.input_evidence[3]==static_cast<unsigned>(E::Known));
+        CHECK(missing.input_states[2]==~0u && missing.color_state==static_cast<unsigned>(ReadState));
+        na::nr::states::InvalidateEnhanced(list.list.Get());
+        D3D12_RESOURCE_STATES observed{};
+        CHECK(na::nr::states::Inspect(list.list.Get(),depth.Get(),observed)==E::EnhancedInvalidated);
+        CHECK(static_cast<unsigned>(observed)==~0u);
+        na::nr::states::Reset(list.list.Get());
+        CHECK(na::nr::states::Inspect(list.list.Get(),depth.Get(),observed)==E::NoTransition);
+        D3D12_RESOURCE_BARRIER colors[]={test::Transition(b.texture.Get(),D3D12_RESOURCE_STATE_COPY_DEST,ReadState),test::Transition(h.texture.Get(),D3D12_RESOURCE_STATE_COPY_DEST,ReadState)};
+        na::nr::states::Observe(list.list.Get(),2,colors);
+        na::nr::states::Observe(list.list.Get(),2,guides);
+    }
     for(uint32_t m=1;m<=(legacy_pair?1u:3u);++m){
         if(!legacy_pair){p.Set("DLSSG.MultiFrameCount",3u);p.Set("DLSSG.MultiFrameIndex",m);}
         na::nr::native::Before(list.list.Get(),&core,&fg,&p,Runtime());}

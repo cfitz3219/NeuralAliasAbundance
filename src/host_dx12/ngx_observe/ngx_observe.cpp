@@ -1334,15 +1334,15 @@ void SetOriginalOptimalCallbackRRForTest(void* original_callback)
 }
 
 namespace {
-int32_t optimal_settings_common(void* ngx_parameter, void* orig);
+int32_t optimal_settings_common(void* ngx_parameter, void* orig, bool rr);
 }
 int32_t OptimalSettingsCallback(void* ngx_parameter)
 {
-    return optimal_settings_common(ngx_parameter, g_orig_optimal.load(std::memory_order_acquire));
+    return optimal_settings_common(ngx_parameter, g_orig_optimal.load(std::memory_order_acquire), false);
 }
 int32_t OptimalSettingsCallbackRR(void* ngx_parameter)
 {
-    return optimal_settings_common(ngx_parameter, g_orig_optimal_rr.load(std::memory_order_acquire));
+    return optimal_settings_common(ngx_parameter, g_orig_optimal_rr.load(std::memory_order_acquire), true);
 }
 
 namespace {
@@ -1350,32 +1350,35 @@ namespace {
 // not retarget callbacks already handed out. Never recycle retained pointers.
 constexpr size_t kOptimalBindings = 32;
 std::array<std::atomic<void*>, kOptimalBindings> g_opt_originals{};
+std::array<bool, kOptimalBindings> g_opt_rr{};
 std::mutex g_opt_bind_mutex;
 template<size_t I> int32_t __cdecl BoundOptimal(void* p)
 {
-    return optimal_settings_common(p, g_opt_originals[I].load(std::memory_order_acquire));
+    void* original=g_opt_originals[I].load(std::memory_order_acquire);
+    return optimal_settings_common(p, original, g_opt_rr[I]);
 }
 template<size_t... I> auto optimal_thunks(std::index_sequence<I...>)
 {
     return std::array<PfnOptimalCallback, sizeof...(I)>{&BoundOptimal<I>...};
 }
 const auto g_opt_thunks = optimal_thunks(std::make_index_sequence<kOptimalBindings>{});
-void* bind_optimal(void* original)
+void* bind_optimal(void* original, bool rr)
 {
     for (auto thunk : g_opt_thunks)
         if (original == reinterpret_cast<void*>(thunk)) return original;
     std::lock_guard<std::mutex> lock(g_opt_bind_mutex);
     for (size_t i = 0; i < kOptimalBindings; ++i) {
         void* stored = g_opt_originals[i].load(std::memory_order_acquire);
-        if (stored == original) return reinterpret_cast<void*>(g_opt_thunks[i]);
+        if (stored == original && g_opt_rr[i] == rr) return reinterpret_cast<void*>(g_opt_thunks[i]);
         if (!stored) {
+            g_opt_rr[i]=rr;
             g_opt_originals[i].store(original, std::memory_order_release);
             return reinterpret_cast<void*>(g_opt_thunks[i]);
         }
     }
     return original; // full: retain the runtime answer, never misroute it
 }
-int32_t optimal_settings_common(void* ngx_parameter, void* orig)
+int32_t optimal_settings_common(void* ngx_parameter, void* orig, bool rr)
 {
     int32_t r = 1; // NVSDK_NGX_Result_Success when no original (tests)
     if (orig) r = reinterpret_cast<PfnOptimalCallback>(orig)(ngx_parameter);
@@ -1427,7 +1430,7 @@ int32_t optimal_settings_common(void* ngx_parameter, void* orig)
         c = {};
         c.sequence = seq; c.user_w = user_w; c.user_h = user_h; c.perf_quality = static_cast<int32_t>(pq);
         c.native_w = native_w; c.native_h = native_h; c.out_w = out_w; c.out_h = out_h;
-        c.overridden = overridden ? 1u : 0u; c.rr = orig == g_orig_optimal_rr.load(std::memory_order_acquire) && orig ? 1u : 0u;
+        c.overridden = overridden ? 1u : 0u; c.rr = rr ? 1u : 0u;
         g_opt_log_seq.store(seq, std::memory_order_release);
     }
 #else
@@ -1509,7 +1512,7 @@ void swap_optimal_callbacks(void* params, int path)
                                 NVSDK_NGX_Parameter_DLSSDOptimalSettingsCallback}) {
             void* cb = nullptr;
             if (p->Get(key, &cb) != NVSDK_NGX_Result_Success || !cb) continue;
-            void* replacement = bind_optimal(cb);
+            void* replacement = bind_optimal(cb, std::strcmp(key,NVSDK_NGX_Parameter_DLSSDOptimalSettingsCallback)==0);
             if (replacement == cb) continue;
             p->Set(key, replacement);
             swapped = true;

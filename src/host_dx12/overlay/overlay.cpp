@@ -576,6 +576,12 @@ void write_status_line()
             static_cast<unsigned long long>(native.frame_id),native.input_states_known,native.color_state,native.hudless_state,
             native.backbuffer_is_swapchain,native.output_real_present,native.output_real_is_swapchain,native.identity_mode,native.multi_index,native.multi_count,native.list_type);
         if(state_bytes>0)WriteFile(f,fg_inputs,static_cast<DWORD>((std::min)(state_bytes,static_cast<int>(sizeof(fg_inputs)-1))),&written,nullptr);
+        const char* names[]={"color","hudless","depth","motion"};
+        for(unsigned i=0;i<4;++i){
+            const int bytes_input=snprintf(fg_inputs,sizeof(fg_inputs),"nr_pre_fg_state input=%s state=0x%x evidence=%s illegal_on_queue=%u\r\n",
+                names[i],native.input_states[i],na::nr::states::Name(static_cast<na::nr::states::Evidence>(native.input_evidence[i])),(native.illegal_state_mask>>i)&1u);
+            if(bytes_input>0)WriteFile(f,fg_inputs,static_cast<DWORD>((std::min)(bytes_input,static_cast<int>(sizeof(fg_inputs)-1))),&written,nullptr);
+        }
     }
     // Worker-thread snapshots only: no GPU waits or readbacks in callbacks.
     const auto fsr = na::ffx::GetStats();

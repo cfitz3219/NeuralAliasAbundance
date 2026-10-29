@@ -60,14 +60,21 @@ struct InputStates {
     bool ready=false;
     InputStates(ID3D12GraphicsCommandList* l,const FgContract& f):list(l) {
         ID3D12Resource* inputs[]={f.color.resource,f.hudless.resource,f.depth.resource,f.motion.resource};
+        bool all_known=true;status.illegal_state_mask=0;
+        for(uint32_t i=0;i<4;++i){
+            D3D12_RESOURCE_STATES state{};auto evidence=states::Inspect(l,inputs[i],state);
+            status.input_states[i]=static_cast<uint32_t>(state);
+            status.input_evidence[i]=static_cast<uint32_t>(evidence);
+            if(evidence!=states::Evidence::Known)all_known=false;
+            else if(!states::CanTransitionOn(l->GetType(),state)){status.illegal_state_mask|=1u<<i;all_known=false;}
+        }
+        status.color_state=status.input_states[0];status.hudless_state=status.input_states[1];
+        if(!all_known)return; // publish ALL input evidence before any early exit
         for(auto* r:inputs) {
             bool duplicate=false;for(uint32_t i=0;i<count;++i)duplicate|=resources[i]==r;
             if(duplicate)continue;
             resources[count]=r;if(!states::Read(l,r,original[count]) || !states::CanTransitionOn(l->GetType(),original[count]))return;++count;
         }
-        D3D12_RESOURCE_STATES observed{};
-        states::Read(l,f.color.resource,observed);status.color_state=static_cast<uint32_t>(observed);
-        states::Read(l,f.hudless.resource,observed);status.hudless_state=static_cast<uint32_t>(observed);
         for(uint32_t i=0;i<count;++i)if(original[i]!=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
             Barrier(list,resources[i],original[i],D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         ready=true;
