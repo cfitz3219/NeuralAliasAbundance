@@ -39,3 +39,26 @@ A new RTX regression reproduced a Present dependency cycle: producer work waits 
 Opus independently identified the same cycle and an overlay fence mismatch in COMMS d2f837d. Overlay draws now track ImGui's vertex/index slot separately from the swapchain/allocator slot, resetting the counter at both backend initialization sites. NR's active status persists across brief generated-frame gaps instead of alternating with a false menus/videos diagnosis. The exact corrupted glyph image was not captured; its live resolution still needs Cort's visual check.
 
 Release build and5/5 focused tests pass5.39s, including actual RTX queue/toggle and overlay checks. The model is simulated in the regression. Seven regular depth witnesses and two restart witnesses match; all submissions complete; no queued NR cross-queue waits. These tests demonstrate the repaired code mechanism, not an in-game dependency trace or actual NVIDIA NR image quality. The final patch was sent to Opus for review in COMMS. User-run package is `Documents/NA-PBZ-package-64aa191` (DLL SHA256AC81674F2F1E859BCF07FF50FF38E4D7C61D3800F2107AFAD8429D996B2E6C5E), reverting installed b2ee8ae before adding the repair. No game deployment by Astra.
+
+## 2026-10-29: response to Opus's final review (96bd112)
+
+Opus approves the 64aa191 GPU-cycle, off/on retirement and ImGui ring fixes. Those automated results remain valid. The review does not establish complete NR/native-FG image quality.
+
+Additional repairs:
+- A per-recording private-data token invalidates unsubmitted NR copies on successful command-list Reset or final destruction. The existing variant-aware Reset thunk is reused, with a Reset-only install when the full observer is off. No timeout guesses, COM list retention, CPU GPU waits or new per-game logic. Reaping occurs before reuse/publication. A reset callback only invalidates an atomic token, avoiding a lock cycle with our own command-list Reset.
+- Execute publishes snapshot receipts only. Consumer resource pointers/extents are assigned when OnPresent selects the input.
+- Output-queue deferrals now increment skipped/busy counters and show a waiting reason. Empty ImGui slot arrays cannot reach modulo. The status writer allows concurrent menu diagnostic writes.
+- Successfully created FG handles are tracked per NGX core and removed on release/shutdown. Their evaluations are forwarded separately: stale SR/RR keys retained in a reused FG parameter object must not publish fresh NR copies or disturb resolution confirmation.
+- Read-only `native_fg_inputs` status counters distinguish FG creation from actual evaluation, count available colour/depth/motion, HUDLess and distortion resources, and report list type/colour allocation/format. These are availability observations, not proof of frame pairing or image quality. `nr_route=present` states the current route honestly.
+
+Validation: Release build; 10/10 focused tests passed in 10.16 seconds, including real RTX queue/toggle tests, 40 reset/discarded recordings followed by successful depth witnesses, FG contract separation, WARP/RTX overlay, depth conversion and full observer producer/pass tests. One intermediate compilation failed due to a local variable name collision in the status writer; corrected before the final successful build. No game launched or installation modified. Evidence: local/pbz-nr-toggle-freeze-20261029/review-build.log and review-tests.log. NR tests use a fake model, not NVIDIA image-quality verification.
+
+### Still open: NR before native Frame Generation
+
+The current Present path can process a picture after native FG has already consumed its source, and selecting the newest completed snapshot does not establish picture identity. FIFO alone does not solve generated presents, dropped frames or multiple viewports. The claim that newest always means current with FG off is also not generally established.
+
+Pre-FG evaluation is the right insertion candidate, but changing only DLSSG.Backbuffer is incomplete when FG also uses HUDLess/UI. NVIDIA's pinned DLSSG definitions require HUDLess and the full backbuffer to agree outside UI; they describe alpha recomposition and an optional distortion field because post-processed colour can be misaligned with guides. Replacing the full image with HUDLess would remove the HUD. Inputs must also be restored to the FG entry states, and NR feature/textures/descriptors retained through actual submission completion; sharing a command list does not remove those lifetime obligations.
+
+Next evidence is the actual native_fg_inputs line from the user's PBZ run. Use it to qualify the pre-FG entry, then implement consistent full/HUD-free colour treatment and explicit output/frame association. This package does NOT implement that insertion route or claim all displayed/generated frames receive NR. The user retains game testing; no additional review gate is imposed.
+
+References: locally pinned nvsdk_ngx_defs_dlssg.h (HUDLess/UI/distortion and input/output subrect definitions), nvsdk_ngx_helpers_dlssg_d3d.h; NVIDIA [DLSS-G integration guide](https://github.com/NVIDIA-RTX/Streamline/blob/main/docs/ProgrammingGuideDLSS_G.md) and [Streamline resource lifecycle guide](https://github.com/NVIDIA-RTX/Streamline/blob/main/docs/ProgrammingGuide.md).

@@ -179,6 +179,34 @@ confirm::FeatureFlags g_feature_flags; // A68: creation flags per game handle (g
 std::atomic<uint32_t> g_rr_seen{0};
 std::atomic<uint32_t> g_active_upscaler{0}; // 1 or 13: the game's most recent successful upscaler creation
 std::atomic<uint32_t> g_fg_seen{0};
+struct FgHandle { const CoreSlot* core = nullptr; const void* handle = nullptr; };
+FgHandle g_fg_handles[32]; // guarded by g_confirm_m; do not infer an evaluate from a creation
+std::atomic<uint64_t> g_fg_evaluates{0}, g_fg_with_inputs{0}, g_fg_with_hudless{0}, g_fg_with_distortion{0};
+std::atomic<uint32_t> g_fg_list_type{0xFFFFFFFFu}, g_fg_color_format{0}, g_fg_color_w{0}, g_fg_color_h{0};
+
+void inspect_fg_inputs(void* command_list, const void* raw)
+{
+    g_fg_evaluates.fetch_add(1, std::memory_order_relaxed);
+#if defined(NA_HAVE_NGX_SDK)
+    if (!raw) return;
+    __try {
+        const auto* p = static_cast<const NVSDK_NGX_Parameter*>(raw);
+        ID3D12Resource *color = nullptr, *depth = nullptr, *motion = nullptr, *hudless = nullptr, *distortion = nullptr;
+        p->Get("DLSSG.Backbuffer", &color); p->Get("DLSSG.Depth", &depth); p->Get("DLSSG.MVecs", &motion);
+        p->Get("DLSSG.HUDLess", &hudless); p->Get("DLSSG.BidirectionalDistortionField", &distortion);
+        if (command_list) g_fg_list_type.store(static_cast<ID3D12GraphicsCommandList*>(command_list)->GetType());
+        if (color) {
+            const auto desc = color->GetDesc();
+            g_fg_color_format.store(desc.Format); g_fg_color_w.store(static_cast<uint32_t>(desc.Width)); g_fg_color_h.store(desc.Height);
+        }
+        if (command_list && color && depth && motion) g_fg_with_inputs.fetch_add(1);
+        if (hudless) g_fg_with_hudless.fetch_add(1);
+        if (distortion) g_fg_with_distortion.fetch_add(1);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { /* diagnostics must not interrupt native FG */ }
+#else
+    (void)command_list; (void)raw;
+#endif
+}
 std::atomic<HMODULE> g_hooked_module{nullptr};
 std::atomic<uint64_t> g_sr_creates{0};
 std::atomic<uint64_t> g_sr_creates_unknown{0}, g_sr_creates_injector{0};
@@ -306,6 +334,12 @@ NgxResult CreateFeatureImpl(CoreSlot& s, void* cmd_list, uint32_t feature_id, vo
         if (r == 1) g_create_recovered.fetch_add(1, std::memory_order_relaxed);
     }
     if (r != 1) g_create_failures.fetch_add(1, std::memory_order_relaxed);
+    if (r == 1 && feature_id == 11 && out_handle && *out_handle) {
+        std::lock_guard<std::mutex> lock(g_confirm_m);
+        for (auto& entry : g_fg_handles) if (!entry.handle || (entry.core == &s && entry.handle == *out_handle)) {
+            entry = {&s, *out_handle}; break;
+        }
+    }
     if (r == 1 && (feature_id == 1 || feature_id == kFeatureRayReconstruction))
         g_active_upscaler.store(feature_id, std::memory_order_release); // the game's upscaler NOW
     if (r == 1 && feature_id == kFeatureRayReconstruction) {
@@ -482,6 +516,23 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
         return s.evaluate(cmd_list, handle, params, callback);
     }
     auto* list = static_cast<ID3D12GraphicsCommandList*>(cmd_list);
+    bool native_fg = false;
+    {
+        std::lock_guard<std::mutex> lock(g_confirm_m);
+        for (const auto& entry : g_fg_handles) if (entry.core == &s && entry.handle == handle) { native_fg = true; break; }
+    }
+    if (native_fg) {
+        inspect_fg_inputs(cmd_list, params); // no GPU work or rendering changes
+        const NgxResult result = s.evaluate(cmd_list, handle, params, callback);
+        g_evaluates.fetch_add(1, std::memory_order_relaxed);
+        g_evaluates_external.fetch_add(1, std::memory_order_release);
+        push_record(CallKind::EvaluateFeature, result, 11u, 0, reinterpret_cast<uint64_t>(handle),
+                    reinterpret_cast<uint64_t>(cmd_list));
+        // A reused parameter object may still contain SR/RR keys. FG must
+        // never publish those stale keys as a new upscaler input snapshot or
+        // advance the SR/RR size-confirmation monitor.
+        return result;
+    }
     const void* game_handle = handle; // A66: identity as the game sees it (creation records use the same)
     // A46: forward to our re-created feature when the game's handle is mapped.
     if (const void* ours = mapped_handle(handle)) handle = ours;
@@ -702,6 +753,7 @@ NgxResult ReleaseFeatureImpl(CoreSlot& s, void* handle)
     {
         std::lock_guard<std::mutex> lock(g_confirm_m);
         g_feature_flags.Erase(reinterpret_cast<uint64_t>(handle)); // A68: a released handle value may be reused
+        for (auto& entry : g_fg_handles) if (entry.core == &s && entry.handle == handle) entry = {};
     }
     // A46: the game releases ITS handle; if we replaced that feature, release
     // ours instead (the game's original was retired already) and drop the map.
@@ -737,6 +789,10 @@ NgxResult ReleaseFeatureImpl(CoreSlot& s, void* handle)
 NgxResult Shutdown1Impl(CoreSlot& s, void* device)
 {
     NgxResult r = s.shutdown1(device);
+    if (r == 1) {
+        std::lock_guard<std::mutex> lock(g_confirm_m);
+        for (auto& entry : g_fg_handles) if (entry.core == &s) entry = {};
+    }
     g_shutdowns.fetch_add(1, std::memory_order_relaxed);
     push_record(CallKind::Shutdown, r, 0, 0, 0, 0);
     return r;
@@ -1509,6 +1565,10 @@ Stats GetStats()
     s.rr_seen = g_rr_seen.load(std::memory_order_acquire);
     s.active_upscaler = g_active_upscaler.load(std::memory_order_acquire);
     s.fg_seen = g_fg_seen.load(std::memory_order_acquire);
+    s.fg_evaluates = g_fg_evaluates.load(); s.fg_with_inputs = g_fg_with_inputs.load();
+    s.fg_with_hudless = g_fg_with_hudless.load(); s.fg_with_distortion = g_fg_with_distortion.load();
+    s.fg_list_type = g_fg_list_type.load(); s.fg_color_format = g_fg_color_format.load();
+    s.fg_color_w = g_fg_color_w.load(); s.fg_color_h = g_fg_color_h.load();
     s.inits = g_inits.load(std::memory_order_relaxed);
     s.creates = g_creates.load(std::memory_order_relaxed);
     s.evaluates = g_evaluates.load(std::memory_order_relaxed);

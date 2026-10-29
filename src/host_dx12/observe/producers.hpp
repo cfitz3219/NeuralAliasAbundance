@@ -45,6 +45,9 @@ namespace na::observe {
 // ExecuteCommandLists hook and passes false, calling ExecuteBegin/End from its
 // detour instead. Idempotent; returns false if a required hook failed.
 bool InstallProducers(ID3D12Device* device, ID3D12CommandQueue* queue, bool hook_queue_execute);
+// Lightweight recording lifetime hook when the full graphics observer is off.
+// Install-thread only; shares the Reset thunk with the full observer.
+bool InstallListResetTracking(ID3D12Device* device, void (*listener)(ID3D12GraphicsCommandList*));
 
 // Game host wiring: [observe] producers=1 requests installation; the overlay
 // installs on its throwaway device/queue and then reports ProducersActive().

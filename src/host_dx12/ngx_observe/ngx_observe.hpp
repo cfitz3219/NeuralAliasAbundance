@@ -117,6 +117,8 @@ struct Stats {
     // yet. Follows in-game toggles (ray reconstruction on/off re-creates DLSS).
     uint32_t active_upscaler;
     uint32_t fg_seen;           // 0/1 the game created a Frame Generation feature (id 11)
+    uint64_t fg_evaluates, fg_with_inputs, fg_with_hudless, fg_with_distortion;
+    uint32_t fg_list_type, fg_color_format, fg_color_w, fg_color_h;
     // A30 menu evidence: successful DLSS super-resolution feature creations
     // and the sizes the LAST one was created with (0xFFFFFFFF = not read).
     uint64_t sr_creates; // aggregate successful SR creations

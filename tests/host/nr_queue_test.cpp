@@ -4,6 +4,7 @@
 #include "fake_ngx_params.hpp"
 #include "host_dx12/nr/nr_pass.hpp"
 #include "host_dx12/settings.hpp"
+#include "host_dx12/observe/producers.hpp"
 #include <d3d12sdklayers.h>
 #include <cmath>
 #include <memory>
@@ -102,7 +103,7 @@ void CheckWitness(size_t index, float value) {
 }
 }
 
-int main(int argc, char**) {
+int main(int argc, char** argv) {
     test::ComPtr<ID3D12Debug> debug;
     if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) debug->EnableDebugLayer();
     if (!test::CreateDevice(d)) return test::SkipNoDevice("nr_queue_test");
@@ -119,6 +120,37 @@ int main(int argc, char**) {
         reinterpret_cast<void*>(Alloc), reinterpret_cast<void*>(Destroy), reinterpret_cast<void*>(Caps)};
     na::settings::Get().nr_enabled = 1; na::nr::SetRuntime(rt);
     auto present = [&](ID3D12CommandQueue* queue) { na::nr::OnPresent(queue, back.Get(), DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709); };
+    if (argc > 1 && std::strcmp(argv[1], "--discard-recording") == 0) {
+        REQUIRE(na::observe::InstallListResetTracking(d.device.Get(), na::nr::OnCommandListReset));
+        // More than the entire slot pool: neither discarded lists nor reset
+        // lists may exhaust it or publish copies that were never executed.
+        for (int i = 0; i < 40; ++i) {
+            test::List recording; REQUIRE(recording.Create(d.device.Get()));
+            na::nr::EvalInputs in{}; in.depth = depth.Get(); in.motion = motion.Get();
+            in.render_w = in.out_w = W; in.render_h = in.out_h = H;
+            in.mv_scale_x = in.mv_scale_y = 1.f;
+            na::nr::OnEvaluate(recording.list.Get(), in);
+            REQUIRE(SUCCEEDED(recording.list->Close()));
+            if ((i % 2) == 0) {
+                REQUIRE(SUCCEEDED(recording.list->Reset(recording.alloc.Get(), nullptr)));
+                REQUIRE(SUCCEEDED(recording.list->Close()));
+                ID3D12CommandList* submitted[] = {recording.list.Get()};
+                na::nr::Execute(d.queue.Get(), 1, submitted, Forward);
+                Drain(d.queue.Get());
+                CHECK(na::nr::GetStats().input_submitted == 0);
+            } // odd recordings die without execution
+        }
+        CHECK(na::nr::GetStats().inputs_seen == 40);
+        CHECK(na::nr::GetStats().skipped == 0);
+        REQUIRE(Input(d.queue.Get(), depth.Get(), motion.Get(), .1f) == 0);
+        Drain(d.queue.Get()); present(output.Get()); Drain(output.Get());
+        REQUIRE(Input(d.queue.Get(), depth.Get(), motion.Get(), .2f) == 0);
+        Drain(d.queue.Get()); present(output.Get()); Drain(output.Get());
+        CHECK(na::nr::GetStats().active == 1);
+        CheckWitness(0, .2f);
+        na::nr::Shutdown();
+        return test::finish("nr_discard_recording_test");
+    }
     if (argc > 1) {
         REQUIRE(Input(d.queue.Get(), depth.Get(), motion.Get(), .1f) == 0);
         Drain(d.queue.Get()); present(output.Get()); Drain(output.Get());

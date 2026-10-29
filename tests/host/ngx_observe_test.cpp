@@ -16,6 +16,9 @@
 
 #include <cwchar>
 #include "host_dx12/dlss/call_origin.hpp"
+#if defined(NA_HAVE_NGX_SDK)
+#include "fake_ngx_params.hpp"
+#endif
 
 namespace {
 struct StubState { // mirror of ngx_stub.cpp State
@@ -143,6 +146,24 @@ int wmain(int argc, wchar_t** argv)
     origin1 = na::ngx::GetStats();
     CHECK(origin1.sr_creates_unknown == origin0.sr_creates_unknown + 1);
     CHECK(origin1.sr_creates == origin0.sr_creates + 2);
+#if defined(NA_HAVE_NGX_SDK)
+    // Native FG uses a different parameter contract. Even when its object
+    // retains upscaler keys, it must never be read as another SR/RR frame.
+    test::FakeParams fg_params;
+    fg_params.Set(NVSDK_NGX_Parameter_Width, 123u);
+    void* fg_handle = nullptr;
+    CHECK(create(nullptr, 11, &fg_params, &fg_handle) == 1);
+    const auto fg0 = na::ngx::GetStats();
+    const auto reads = fg_params.non_fg_reads;
+    na::ngx::SetDetailLogging(true);
+    CHECK(eval(nullptr, fg_handle, &fg_params, nullptr) == 1);
+    CHECK(fg_params.non_fg_reads == reads);
+    CHECK(na::ngx::GetStats().fg_evaluates == fg0.fg_evaluates + 1);
+    CHECK(release(fg_handle) == 1);
+    // Released identities must not remain classified as FG.
+    CHECK(eval(nullptr, fg_handle, nullptr, nullptr) == 1);
+    CHECK(na::ngx::GetStats().fg_evaluates == fg0.fg_evaluates + 1);
+#endif
     na::hooking::Shutdown();
     return test::finish("ngx_observe_test");
 }

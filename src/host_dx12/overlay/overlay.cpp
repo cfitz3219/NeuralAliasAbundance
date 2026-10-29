@@ -539,10 +539,17 @@ void write_status_line()
                      static_cast<unsigned long long>(pr.late), static_cast<unsigned long long>(pr.dropped),
                      static_cast<unsigned long long>(pr.vetoed), static_cast<unsigned long long>(pr.generated_dropped), pr.chain_releases, pr.chain_flags, pr.orphaned);
     if (n <= 0) return;
-    HANDLE f = CreateFileW(g_status_log, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE f = CreateFileW(g_status_log, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return;
     DWORD written = 0;
     WriteFile(f, line, static_cast<DWORD>(n), &written, nullptr);
+    char fg_inputs[320];
+    const int fg_input_bytes = snprintf(fg_inputs, sizeof(fg_inputs),
+        "native_fg_inputs evaluates=%llu available_resources=%llu hudless=%llu distortion=%llu list_type=%u color_format=%u allocation=%ux%u nr_route=present\r\n",
+        static_cast<unsigned long long>(ngx.fg_evaluates), static_cast<unsigned long long>(ngx.fg_with_inputs),
+        static_cast<unsigned long long>(ngx.fg_with_hudless), static_cast<unsigned long long>(ngx.fg_with_distortion),
+        ngx.fg_list_type, ngx.fg_color_format, ngx.fg_color_w, ngx.fg_color_h);
+    if (fg_input_bytes > 0) WriteFile(f, fg_inputs, static_cast<DWORD>(fg_input_bytes), &written, nullptr);
     // Worker-thread snapshots only: no GPU waits or readbacks in callbacks.
     const auto fsr = na::ffx::GetStats();
     const auto xess = na::xess::GetStats();
@@ -1802,6 +1809,7 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     UINT idx = frame ? static_cast<UINT>(g_frames.load() % g_state.frames.size()) : real_index(sc);
     if (idx >= g_state.frames.size()) return;
     FrameCtx& f = g_state.frames[idx];
+    if (g_state.imgui_slot_fences.empty()) return;
     const size_t imgui_slot = g_state.imgui_draws % g_state.imgui_slot_fences.size();
     if (g_state.fence->GetCompletedValue() < g_state.imgui_slot_fences[imgui_slot]) return;
     // Never wait for game-queue work from inside its Present callback. A
@@ -2397,6 +2405,7 @@ bool Start(const char* route_tag, PanelFn controls)
                 na::observe::InstallProducers(dev.Get(), queue.Get(), /*hook_queue_execute=*/false);
                 na::observe::SetExecuteForwarder(g_orig_execute); // C9b: host sample copies bypass this detour
             }
+            if (ok) na::observe::InstallListResetTracking(dev.Get(), na::nr::OnCommandListReset);
             if (ok) {
                 na::present::Originals o;
                 o.present = g_orig_present;

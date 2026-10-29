@@ -59,6 +59,9 @@ bool WantsInputs();
 // Inside the DLSS evaluate detour, after the original evaluate, on the
 // game's open list: copies depth + motion into our textures.
 void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in);
+// Called after a successful Reset, including when observation is disabled.
+// No host lock or GPU wait: invalidates only this list's private-data token.
+void OnCommandListReset(ID3D12GraphicsCommandList* list);
 
 // Wrap the actual queue forward. Recording a future list is NOT a ready frame.
 // Publish its inputs only after submission, serialized with OnPresent. Different

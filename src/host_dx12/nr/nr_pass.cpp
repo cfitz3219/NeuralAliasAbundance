@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <memory>
 
 #include "host_dx12/color/color_space.hpp"
 #include "host_dx12/settings.hpp"
@@ -129,6 +130,7 @@ struct Frame {
 
 struct PendingInputs {
     ID3D12CommandList* list = nullptr; // identity only; never dereferenced/retained
+    std::shared_ptr<std::atomic<bool>> recording;
     UINT64 submitted = 0; // retain copies until their producer has finished
     UINT64 consumed = 0; // last NR submission reading these copies
     uint64_t serial = 0;
@@ -200,6 +202,40 @@ struct State {
 State g;
 thread_local bool internal_submit = false;
 
+// Private data follows the COM object's lifetime without retaining the list.
+// Reset invalidates the same token; an address reused by a new list cannot
+// accidentally publish an old recording. The destructor takes no host lock.
+const GUID kRecordingToken = {0x82ba377c, 0x702d, 0x452d, {0xa1,0x5e,0x4c,0x88,0x91,0x2f,0x76,0x10}};
+class RecordingToken final : public IUnknown {
+public:
+    explicit RecordingToken(std::shared_ptr<std::atomic<bool>> valid) : valid_(std::move(valid)) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (id != __uuidof(IUnknown)) return E_NOINTERFACE;
+        *out = static_cast<IUnknown*>(this); AddRef(); return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG n = --refs_;
+        if (!n) { valid_->store(false, std::memory_order_release); delete this; }
+        return n;
+    }
+    void Invalidate() { valid_->store(false, std::memory_order_release); }
+private:
+    std::atomic<ULONG> refs_{1};
+    std::shared_ptr<std::atomic<bool>> valid_;
+};
+void discard_invalid_recordings_locked()
+{
+    for (auto& p : g.pending) if (p.list && p.recording && !p.recording->load(std::memory_order_acquire)) {
+        p.list = nullptr;
+        p.serial = 0; // these copies were never submitted
+        p.recording.reset();
+        g.pending_count.fetch_sub(1, std::memory_order_release);
+    }
+}
+
 void submit_locked(ID3D12CommandQueue* queue, UINT n, ID3D12CommandList* const* lists)
 {
     // Our list can re-enter the host's Execute hook while g.m is held.
@@ -221,7 +257,7 @@ void latch(const char* text)
 }
 
 // Shared by successful evaluation AND the restore-only failure submission.
-// Wait only for values already signalled; these are GPU waits, never CPU waits.
+// Completion admission happens before recording; this helper inserts no waits.
 bool submit_frame_locked(ID3D12CommandQueue* queue, Frame& f)
 {
     // OnPresent admits only completed cross-queue inputs/output work. Never
@@ -641,6 +677,7 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
     // under dynamic resolution); the region lands at (0,0).
     const uint32_t w = static_cast<uint32_t>(dd.Width), h = dd.Height;
     PendingInputs* pending = nullptr;
+    discard_invalid_recordings_locked();
     for (auto& p : g.pending) if (p.list == list) { pending = &p; break; }
     const auto output_done = g.fence->GetCompletedValue();
     if (!pending) for (auto& p : g.pending) {
@@ -660,6 +697,14 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
         return;
     }
     const bool need_uav = !copy_depth;
+    if (!pending->list) {
+        auto valid = std::make_shared<std::atomic<bool>>(true);
+        auto* token = new RecordingToken(valid);
+        const HRESULT hr = list->SetPrivateDataInterface(kRecordingToken, token);
+        token->Release();
+        if (FAILED(hr)) { g.skipped.fetch_add(1); set_reason("Neural Rendering could not track this input recording."); return; }
+        pending->recording = std::move(valid);
+    }
     if (!pending->fence && FAILED(g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&pending->fence)))) {
         latch("Neural Rendering could not prepare input synchronization."); return;
     }
@@ -721,6 +766,16 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
     g.inputs_seen.fetch_add(1, std::memory_order_relaxed);
 }
 
+void OnCommandListReset(ID3D12GraphicsCommandList* list)
+{
+    IUnknown* raw = nullptr;
+    UINT bytes = sizeof(raw);
+    if (list && SUCCEEDED(list->GetPrivateData(kRecordingToken, &bytes, &raw)) && raw) {
+        static_cast<RecordingToken*>(raw)->Invalidate();
+        raw->Release();
+    }
+}
+
 void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists, ExecuteFn forward)
 {
     if (internal_submit || !g.pending_count.load(std::memory_order_acquire)) {
@@ -728,6 +783,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         return;
     }
     std::unique_lock<std::mutex> lock(g.m);
+    discard_invalid_recordings_locked();
     bool found = false;
     for (UINT i = 0; i < count; ++i)
         for (const auto& p : g.pending) if (p.list && p.list == lists[i]) found = true;
@@ -748,13 +804,6 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         if (ordered) {
             p.serial = ++g.input_value;
             p.queue = queue;
-            g.ready = &p;
-            g.last_in = p.in;
-            g.depth_copy = p.depth;
-            g.motion_copy = p.motion;
-            g.in_w = p.valid_w;
-            g.in_h = p.valid_h;
-            g.motion_format = p.motion->GetDesc().Format;
             g.have_inputs = 1;
             if (g.inputs_fresh) g.input_overwrites.fetch_add(1, std::memory_order_relaxed);
             g.inputs_fresh = 1;
@@ -833,7 +882,11 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer, DXGI_COLOR
         if (!g.active.load()) set_reason("Neural Rendering is waiting for completed game inputs.");
         return;
     }
-    if (g.output_queue && g.output_queue.Get() != queue && g.fence->GetCompletedValue() < g.fence_next - 1) return;
+    if (g.output_queue && g.output_queue.Get() != queue && g.fence->GetCompletedValue() < g.fence_next - 1) {
+        g.skipped.fetch_add(1); g.busy_slots.fetch_add(1); g.active.store(0);
+        set_reason("Neural Rendering is waiting for its previous picture queue.");
+        return;
+    }
     g.ready = completed_input;
     g.last_in = g.ready->in;
     g.depth_copy = g.ready->depth; g.motion_copy = g.ready->motion;
