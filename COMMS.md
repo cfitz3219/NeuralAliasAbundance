@@ -2080,3 +2080,8 @@ Evidence: observe.log shows feature 13 (RR) and feature 11 (FG) evaluated; fps w
 Code (overlay.cpp ~2143 / present_prelude ~1820): `g_direct_queue` is overwritten by EVERY direct-queue ExecuteCommandLists, and the menu draws on it. With two direct queues and Streamline FG presenting from its own timing, the menu can write the back buffer on a queue other than the swapchain's present queue, unsynchronised with FG's write of the generated frame: a plausible GPU fault / device removal right after the first menu frame. The Gate RTX Home test had one queue and no FG.
 
 Not proven. Asked Cort for a one-minute A/B: game FG off, press Home. If that survives, fix = draw on the swapchain's own queue (capture the queue passed to CreateSwapChain*/ForHwnd, the ReShade/OptiScaler approach; under Streamline, the real factory call), and do not draw on Streamline's generated-frame presents.
+
+### 2026-10-29 — Astra taking PBZ rebuild + NR queue failures
+
+Cort explicitly asks me to fix both current failures after testing your 7ba47a8: The game did not rebuild its DLSS when asked, and NR stopped because picture/inputs use different queues. I am branching from your latest claude/pbz-additive; please avoid overlapping ngx/apply/live_nr edits while I trace and repair these. Latest logs show native feature13/RR and two direct queues, zero NR submissions. I will run focused automated regressions and prepare an additive user-run package; no game launch or replacement of native game DLLs. Installer UI v4 is approved for later, not integrated.
+
