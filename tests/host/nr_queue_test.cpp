@@ -102,7 +102,7 @@ void CheckWitness(size_t index, float value) {
 }
 }
 
-int main() {
+int main(int argc, char**) {
     test::ComPtr<ID3D12Debug> debug;
     if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) debug->EnableDebugLayer();
     if (!test::CreateDevice(d)) return test::SkipNoDevice("nr_queue_test");
@@ -119,8 +119,42 @@ int main() {
         reinterpret_cast<void*>(Alloc), reinterpret_cast<void*>(Destroy), reinterpret_cast<void*>(Caps)};
     na::settings::Get().nr_enabled = 1; na::nr::SetRuntime(rt);
     auto present = [&](ID3D12CommandQueue* queue) { na::nr::OnPresent(queue, back.Get(), DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709); };
+    if (argc > 1) {
+        REQUIRE(Input(d.queue.Get(), depth.Get(), motion.Get(), .1f) == 0);
+        Drain(d.queue.Get()); present(output.Get()); Drain(output.Get());
+        REQUIRE(Input(d.queue.Get(), depth.Get(), motion.Get(), .2f) == 0);
+        Drain(d.queue.Get()); present(output.Get()); Drain(output.Get());
+        CHECK(na::nr::GetStats().active == 1);
+        na::settings::Get().nr_enabled = 0; present(output.Get());
+        na::settings::Get().nr_enabled = 1; na::nr::ResetLatch();
+        // Older completed input must remain usable while the newest one is
+        // gated by the original Present. This is the actual off/on lifecycle.
+        REQUIRE(Input(d.queue.Get(), depth.Get(), motion.Get(), .3f) == 0);
+        Drain(d.queue.Get());
+        // Native FG can release the next render submission only through work
+        // queued by the original Present, AFTER our Present callback returns.
+        test::ComPtr<ID3D12Fence> released, finished;
+        REQUIRE(SUCCEEDED(d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&released))));
+        REQUIRE(SUCCEEDED(d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&finished))));
+        REQUIRE(SUCCEEDED(d.queue->Wait(released.Get(), 1)));
+        REQUIRE(Input(d.queue.Get(), depth.Get(), motion.Get(), .25f) == 0);
+        present(output.Get());
+        REQUIRE(SUCCEEDED(output->Signal(released.Get(), 1))); // original Present
+        REQUIRE(SUCCEEDED(output->Signal(finished.Get(), 1)));
+        HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        auto result = test::WaitFence(finished.Get(), 1, ev, 100);
+        CHECK(result == test::WaitResult::Ok);
+        std::printf("Present dependency: %s; NR submitted=%llu\n", test::WaitResultName(result), na::nr::GetStats().gpu_submitted);
+        released->Signal(1); // bounded cleanup even on the old implementation
+        Drain(d.queue.Get()); Drain(output.Get()); CloseHandle(ev);
+        present(output.Get()); Drain(output.Get());
+        CHECK(na::nr::GetStats().active == 1 && na::nr::GetStats().evaluates == 2);
+        CheckWitness(0, .2f); CheckWitness(1, .25f);
+        na::nr::Shutdown();
+        return test::finish("nr_present_dependency_test");
+    }
     REQUIRE(Input(d.queue.Get(), depth.Get(), motion.Get(), .1f) == 0);
-    present(output.Get()); // feature creation
+    Drain(d.queue.Get()); present(output.Get()); // feature creation
     Drain(d.queue.Get()); Drain(output.Get());
     REQUIRE(!na::nr::GetStats().latched_off);
 
@@ -129,21 +163,20 @@ int main() {
     REQUIRE(probe_event);
     REQUIRE(SUCCEEDED(d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate))));
     REQUIRE(SUCCEEDED(d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&probe))));
-    // A deliberately late producer: NR must return on the CPU, but its GPU
-    // submission cannot complete until the copied inputs actually exist.
+    // A late producer: NR defers without queuing a wait on the present queue.
     REQUIRE(SUCCEEDED(d.queue->Wait(gate.Get(), 1)));
     REQUIRE(Input(d.queue.Get(), depth.Get(), motion.Get(), .25f) == 0); present(output.Get());
     REQUIRE(SUCCEEDED(output->Signal(probe.Get(), 1)));
     auto wait = test::WaitFence(probe.Get(), 1, probe_event, 60);
-    CHECK(wait == test::WaitResult::Timeout);
-    REQUIRE(SUCCEEDED(gate->Signal(1))); Drain(d.queue.Get()); Drain(output.Get()); CheckWitness(0, .25f);
+    CHECK(wait == test::WaitResult::Ok); // pending input must not stall Present
+    REQUIRE(SUCCEEDED(gate->Signal(1))); Drain(d.queue.Get()); present(output.Get()); Drain(output.Get()); CheckWitness(0, .25f);
 
     // A deliberately late consumer: the next producer must finish without
     // overwriting the snapshot NR will read. This also avoids an FG dependency
     // cycle when the presentation queue itself waits for that next producer.
     REQUIRE(SUCCEEDED(output->Wait(probe.Get(), 2))); // game/FG dependency on a future producer submission
     REQUIRE(SUCCEEDED(output->Wait(gate.Get(), 2)));
-    REQUIRE(Input(d.queue.Get(), depth.Get(), motion.Get(), .5f) == 0); present(output.Get());
+    REQUIRE(Input(d.queue.Get(), depth.Get(), motion.Get(), .5f) == 0); Drain(d.queue.Get()); present(output.Get());
     REQUIRE(Input(d.queue.Get(), depth.Get(), motion.Get(), .75f) == 0);
     REQUIRE(SUCCEEDED(d.queue->Signal(probe.Get(), 2)));
     ResetEvent(probe_event);
@@ -152,7 +185,7 @@ int main() {
     present(output.Get()); Drain(output.Get()); CheckWitness(2, .75f);
 
     // Both queues may change. Their previously submitted work remains ordered.
-    REQUIRE(Input(alternate.Get(), depth.Get(), motion.Get(), .9f) == 0); present(d.queue.Get());
+    REQUIRE(Input(alternate.Get(), depth.Get(), motion.Get(), .9f) == 0); Drain(alternate.Get()); present(d.queue.Get());
     Drain(alternate.Get()); Drain(d.queue.Get()); CheckWitness(3, .9f);
     REQUIRE(Input(d.queue.Get(), depth.Get(), motion.Get(), .6f) == 0); present(d.queue.Get()); Drain(d.queue.Get()); CheckWitness(4, .6f);
     const auto waits_before = na::nr::GetStats().cross_queue_waits;
@@ -160,25 +193,24 @@ int main() {
     CHECK(na::nr::GetStats().cross_queue_waits == waits_before); // steady same-queue fast path
     const auto before_idle = na::nr::GetStats(); present(d.queue.Get());
     CHECK(na::nr::GetStats().evaluates == before_idle.evaluates);
-    CHECK(na::nr::GetStats().missing_inputs == before_idle.missing_inputs + 1);
+    CHECK(na::nr::GetStats().active == before_idle.active); // generated presents keep a stable status
 
     // Scaled modes (including Ultra Performance) use the same synchronized inputs.
     auto small_depth = test::CreateTexture(d.device.Get(), W / 2, H / 2, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_FLAG_NONE);
     auto small_motion = test::CreateTexture(d.device.Get(), W / 2, H / 2, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_FLAG_NONE);
-    REQUIRE(Input(alternate.Get(), small_depth.Get(), small_motion.Get(), .3f) == 0); present(output.Get());
+    REQUIRE(Input(alternate.Get(), small_depth.Get(), small_motion.Get(), .3f) == 0); Drain(alternate.Get()); present(output.Get());
     Drain(alternate.Get()); Drain(output.Get()); CheckWitness(6, .3f);
 
-    // Failure recovery records restoration barriers too: it must wait for the
-    // producer, even though it does not count as a successful NR evaluation.
+    // Even failure recovery must defer the pass until producer completion.
     fail_evaluate = true;
     REQUIRE(SUCCEEDED(alternate->Wait(gate.Get(), 3)));
     REQUIRE(Input(alternate.Get(), small_depth.Get(), small_motion.Get(), .8f) == 0); present(output.Get());
     REQUIRE(SUCCEEDED(output->Signal(probe.Get(), 3))); ResetEvent(probe_event);
-    wait = test::WaitFence(probe.Get(), 3, probe_event, 60); CHECK(wait == test::WaitResult::Timeout);
-    REQUIRE(SUCCEEDED(gate->Signal(3))); Drain(alternate.Get()); Drain(output.Get());
+    wait = test::WaitFence(probe.Get(), 3, probe_event, 60); CHECK(wait == test::WaitResult::Ok);
+    REQUIRE(SUCCEEDED(gate->Signal(3))); Drain(alternate.Get()); present(output.Get()); Drain(output.Get());
     auto s = na::nr::GetStats();
     CHECK(s.latched_off && s.evaluates == 7 && s.gpu_submitted == 9 && s.gpu_completed == 9);
-    CHECK(s.input_submitted == s.input_completed && s.cross_queue_waits > 0);
+    CHECK(s.input_submitted == s.input_completed && s.cross_queue_waits == 0);
     std::printf("NR evals=%llu submitted/completed=%llu/%llu input=%llu/%llu cross_queue_waits=%llu\n",
         s.evaluates, s.gpu_submitted, s.gpu_completed, s.input_submitted, s.input_completed, s.cross_queue_waits);
     na::nr::Shutdown(); lists.clear(); uploads.clear(); witnesses.clear();

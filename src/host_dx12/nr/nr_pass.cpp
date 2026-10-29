@@ -131,6 +131,7 @@ struct PendingInputs {
     ID3D12CommandList* list = nullptr; // identity only; never dereferenced/retained
     UINT64 submitted = 0; // retain copies until their producer has finished
     UINT64 consumed = 0; // last NR submission reading these copies
+    uint64_t serial = 0;
     ComPtr<ID3D12Fence> fence;
     ComPtr<ID3D12CommandQueue> queue;
     EvalInputs in{};
@@ -165,6 +166,7 @@ struct State {
     std::atomic<uint32_t> pending_count{0};
     ComPtr<ID3D12CommandQueue> output_queue;
     UINT64 input_value = 0;
+    uint64_t last_consumed_input = 0;
     uint64_t cross_queue_waits = 0;
     ComPtr<ID3D12Resource> depth_up, motion_up;       // UAV at rest (display size, scaled modes only)
     ComPtr<ID3D12Resource> color_in;                  // NPSR at rest
@@ -222,18 +224,8 @@ void latch(const char* text)
 // Wait only for values already signalled; these are GPU waits, never CPU waits.
 bool submit_frame_locked(ID3D12CommandQueue* queue, Frame& f)
 {
-    if (g.ready && g.ready->queue.Get() != queue) {
-        if (FAILED(queue->Wait(g.ready->fence.Get(), g.ready->submitted))) {
-            g.signal_failed = true; latch("Neural Rendering stopped: input queue wait failed."); return false;
-        }
-        ++g.cross_queue_waits;
-    }
-    if (g.output_queue && g.output_queue.Get() != queue && g.fence_next > 1) {
-        if (FAILED(queue->Wait(g.fence.Get(), g.fence_next - 1))) {
-            g.signal_failed = true; latch("Neural Rendering stopped: output queue wait failed."); return false;
-        }
-        ++g.cross_queue_waits;
-    }
+    // OnPresent admits only completed cross-queue inputs/output work. Never
+    // queue a dependency behind the original Present that must release it.
     ID3D12CommandList* lists[] = {g.list.Get()};
     submit_locked(queue, 1, lists);
     g.output_queue = queue;
@@ -655,8 +647,12 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
         // Never reuse a recorded, GPU-busy, or still-unconsumed published
         // snapshot. In particular, recording the next list must not change
         // the inputs a concurrent Present is about to read.
-        if (!p.list && !(g.inputs_fresh && g.ready == &p) && p.consumed <= output_done &&
+        if (!p.list && p.serial <= g.last_consumed_input && p.consumed <= output_done &&
             (!p.fence || p.submitted <= p.fence->GetCompletedValue())) { pending = &p; break; }
+    }
+    if (!pending) for (auto& p : g.pending) {
+        if (!p.list && p.consumed <= output_done && p.fence && p.submitted <= p.fence->GetCompletedValue() &&
+            (!pending || p.serial < pending->serial)) pending = &p; // bounded eviction of oldest unread copy
     }
     if (!pending) {
         g.skipped.fetch_add(1, std::memory_order_relaxed);
@@ -750,7 +746,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         if (!p.list || p.list != lists[i]) continue;
         const bool ordered = !g.signal_failed && SUCCEEDED(queue->Signal(p.fence.Get(), ++p.submitted));
         if (ordered) {
-            ++g.input_value;
+            p.serial = ++g.input_value;
             p.queue = queue;
             g.ready = &p;
             g.last_in = p.in;
@@ -780,7 +776,7 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer, DXGI_COLOR
         g.active.store(0, std::memory_order_release);
         std::unique_lock<std::mutex> lock(g.m, std::try_to_lock);
         if (!lock.owns_lock()) return;
-        g.inputs_fresh = 0; g.reset_pending = true;
+        g.inputs_fresh = 0; g.last_consumed_input = g.input_value; g.reset_pending = true;
         // Free the expensive feature/work images after their OWN GPU fence.
         // Keep the small input-copy set: recorded game lists can still refer
         // to it. No wait, working-set trim or process-wide cache purge.
@@ -812,14 +808,39 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer, DXGI_COLOR
     // motion): only a frame the game rendered through DLSS is processed.
     // Menu-only frames, loading screens and videos pass untouched.
     if (!g.inputs_fresh) {
+        // Native FG presents multiple pictures per real DLSS frame. A gap
+        // between fresh inputs is normal, not an NR failure or menu detection.
+        if (g.last_evaluate_tick && GetTickCount64() - g.last_evaluate_tick < 500) return;
         g.reset_pending = true;
         g.missing_inputs.fetch_add(1, std::memory_order_relaxed);
-        set_reason("Neural Rendering is paused: the game is not drawing through DLSS right now (menus, videos).");
+        set_reason("Neural Rendering is waiting for a new DLSS frame.");
         g.active.store(0, std::memory_order_release);
         g.skipped.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    g.inputs_fresh = 0;
+    // A native FG queue may release the producer only AFTER original Present.
+    // Queue::Wait here would put that release behind our own wait and deadlock.
+    // Keep the snapshot pending and return so the game can make progress.
+    PendingInputs* completed_input = nullptr;
+    for (auto& p : g.pending) {
+        if (!p.list && p.serial > g.last_consumed_input && p.fence &&
+            (p.queue.Get() == queue || p.fence->GetCompletedValue() >= p.submitted) &&
+            (!completed_input || p.serial > completed_input->serial)) completed_input = &p;
+    }
+    if (!completed_input) {
+        g.skipped.fetch_add(1, std::memory_order_relaxed);
+        if (GetTickCount64() - g.last_evaluate_tick >= 500) g.active.store(0);
+        if (!g.active.load()) set_reason("Neural Rendering is waiting for completed game inputs.");
+        return;
+    }
+    if (g.output_queue && g.output_queue.Get() != queue && g.fence->GetCompletedValue() < g.fence_next - 1) return;
+    g.ready = completed_input;
+    g.last_in = g.ready->in;
+    g.depth_copy = g.ready->depth; g.motion_copy = g.ready->motion;
+    g.in_w = g.ready->valid_w; g.in_h = g.ready->valid_h;
+    g.motion_format = g.ready->motion->GetDesc().Format;
+    g.last_consumed_input = g.ready->serial;
+    g.inputs_fresh = g.input_value > g.last_consumed_input;
     const uint64_t signature = st.nr_intensity.load() | (uint64_t(st.nr_structure.load()) << 8) |
         (uint64_t(st.nr_tone.load()) << 16) | (uint64_t(st.nr_skin.load()) << 24) | (uint64_t(st.nr_paper_white.load()) << 32);
     if (signature != g.setting_signature || GetTickCount64() - g.last_evaluate_tick > 250) g.reset_pending = true;
@@ -1149,6 +1170,7 @@ void Shutdown()
     g.ready = nullptr;
     g.output_queue.Reset();
     g.input_value = 0;
+    g.last_consumed_input = 0;
     g.cross_queue_waits = 0;
     g.depth_up.Reset();
     g.motion_up.Reset();

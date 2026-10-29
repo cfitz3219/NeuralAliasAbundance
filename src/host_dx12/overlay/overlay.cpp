@@ -908,6 +908,8 @@ struct State {
     HANDLE fence_event = nullptr;
     UINT64 fence_next = 1;
     std::vector<FrameCtx> frames;
+    uint64_t imgui_draws = 0;
+    std::vector<UINT64> imgui_slot_fences;
     UINT rtv_stride = 0, srv_stride = 0;
     std::vector<bool> srv_used;
     HWND hwnd = nullptr;
@@ -1393,6 +1395,8 @@ bool ensure_init_locked(IDXGISwapChain* sc)
             info.SrvDescriptorAllocFn = &SrvAlloc;
             info.SrvDescriptorFreeFn = &SrvFree;
             if (!ImGui_ImplDX12_Init(&info) || !ImGui_ImplDX12_CreateDeviceObjects()) { g_state.imgui_ready = false; return false; }
+            g_state.imgui_draws = 0;
+            g_state.imgui_slot_fences.assign(g_state.frames.size(), 0);
         }
         return true;
     }
@@ -1462,6 +1466,8 @@ bool ensure_init_locked(IDXGISwapChain* sc)
     info.SrvDescriptorAllocFn = &SrvAlloc;
     info.SrvDescriptorFreeFn = &SrvFree;
     if (!ImGui_ImplDX12_Init(&info)) return false;
+    g_state.imgui_draws = 0;
+    g_state.imgui_slot_fences.assign(g_state.frames.size(), 0);
     // Compile/create the menu pipelines before this chain can start generating
     // frames. Do not first initialize the renderer during the transition from
     // the presentation worker to an inline Home frame.
@@ -1796,6 +1802,8 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     UINT idx = frame ? static_cast<UINT>(g_frames.load() % g_state.frames.size()) : real_index(sc);
     if (idx >= g_state.frames.size()) return;
     FrameCtx& f = g_state.frames[idx];
+    const size_t imgui_slot = g_state.imgui_draws % g_state.imgui_slot_fences.size();
+    if (g_state.fence->GetCompletedValue() < g_state.imgui_slot_fences[imgui_slot]) return;
     // Never wait for game-queue work from inside its Present callback. A
     // driver/engine may release that work only after the callback returns.
     // If this allocator is still in use, skip this overlay draw and retry.
@@ -1833,6 +1841,7 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     if (just_opened) menu_note("menu_open: draw data built\r\n");
 
     ImDrawData* draw = ImGui::GetDrawData();
+    if (draw->DisplaySize.x <= 0 || draw->DisplaySize.y <= 0) return;
     // New glyphs can update an EXISTING font atlas. The private upload queue
     // must not write it while an older game-queue menu draw is sampling it.
     // A completion check (not a wait) protects all atlas updates/destruction.
@@ -1856,6 +1865,7 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     ID3D12DescriptorHeap* heaps[] = {g_state.srv_heap.Get()};
     g_state.list->SetDescriptorHeaps(1, heaps);
     ImGui_ImplDX12_RenderDrawData(draw, g_state.list.Get());
+    ++g_state.imgui_draws; // backend advances once per RenderDrawData, even if submission fails
     if (just_opened) menu_note("menu_open: GPU draw recorded\r\n");
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
@@ -1864,6 +1874,7 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     ID3D12CommandList* lists[] = {g_state.list.Get()};
     g_orig_execute(queue, 1, lists);
     f.fence_value = g_state.fence_next++;
+    g_state.imgui_slot_fences[imgui_slot] = f.fence_value;
     queue->Signal(g_state.fence.Get(), f.fence_value);
     g_menu_draw_marker.store(f.fence_value);
     g_frames.fetch_add(1, std::memory_order_relaxed);

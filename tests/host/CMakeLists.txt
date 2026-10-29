@@ -76,6 +76,8 @@ if(NA_HAVE_NGX_SDK)
   na_host_test(ngx_params_test SOURCES ngx_params_test.cpp LIBS host_dx12)
   na_host_test(ngx_optimal_test SOURCES ngx_optimal_test.cpp LIBS host_dx12)
   na_host_test(nr_queue_test SOURCES nr_queue_test.cpp LIBS host_dx12)
+  add_test(NAME host_nr_present_dependency_test COMMAND nr_queue_test --present-dependency)
+  set_tests_properties(host_nr_present_dependency_test PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77 LABELS host)
 endif()
 
 # Argon audit #2: depth formats safe to copy as R32F (no device).

@@ -415,13 +415,14 @@ void DrawNeuralRenderingRows()
     if (Switch("nr", &on)) {
         st.nr_enabled.store(on ? 1u : 0u);
         if (on) na::nr::ResetLatch();
+        nr = na::nr::GetStats();
         na::settings::Save();
     }
     ImGui::EndDisabled();
     EndRow();
     if (on) {
         int state = nr.latched_off ? 2 : (nr.active ? 1 : 0);
-        StatusLine(state, nr.reason);
+        StatusLine(state, nr.active ? "Neural Rendering is active." : nr.reason);
         if (nr.gpu_samples) {
             snprintf(buf, sizeof(buf), "Graphics-card time for Neural Rendering: %.1f ms per frame (average %.1f ms).",
                      nr.last_ms, nr.avg_ms);

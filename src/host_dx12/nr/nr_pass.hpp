@@ -62,7 +62,8 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in);
 
 // Wrap the actual queue forward. Recording a future list is NOT a ready frame.
 // Publish its inputs only after submission, serialized with OnPresent. Different
-// producer/presentation queues use a GPU wait before NR reads each snapshot.
+// producer/presentation queues use only already-completed snapshots; a busy
+// producer is deferred without inserting any wait into the presentation queue.
 // Snapshots are not reused until both copies and NR have completed; game queues
 // never wait for NR. The host
 // calls this for every ExecuteCommandLists; test hosts
