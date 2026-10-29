@@ -89,6 +89,7 @@ endif()
 na_host_test(depth_format_test SOURCES depth_format_test.cpp)
 # Neural Rendering input preparation: shaders build; 24/16-bit depth -> R32F for a subrect.
 na_host_test(nr_depth_test SOURCES nr_depth_test.cpp LIBS host_dx12)
+na_host_test(nr_fg_composition_test SOURCES nr_fg_composition_test.cpp LIBS host_dx12)
 
 # C6: generic DLSS backend. The fake-runtime test needs only the NGX headers
 # (runs in CI); the real test needs our own NGX instance (static library from
