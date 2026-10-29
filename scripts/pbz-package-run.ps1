@@ -15,6 +15,8 @@ try {
     $previous=if(Test-Path -LiteralPath $previousFile) { (Get-Content -Raw -LiteralPath $previousFile).Trim() } else { $null }
     if($Action -eq 'Repair') {
         if(-not $previous) { throw 'No previous package recorded for repair.' }
+        # Verify replacement before removing the currently installed package.
+        & (Join-Path $PSScriptRoot 'deploy-pbz.ps1') -Action Validate -PackageRoot $PSScriptRoot
         $oldManifest=Join-Path $previous 'state\deployment.json'
         if(Test-Path -LiteralPath $oldManifest) {
             $old=Get-Content -Raw -LiteralPath $oldManifest | ConvertFrom-Json

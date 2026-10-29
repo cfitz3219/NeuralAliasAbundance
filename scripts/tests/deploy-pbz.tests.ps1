@@ -27,6 +27,20 @@ $args=@{GameRoot=$game;PackageRoot=$pkg;StateRoot=$state;UserRoot=$user;ProfileT
 & $script @args -Action Install
 $m=Get-Content -Raw (Join-Path $state 'deployment.json') | ConvertFrom-Json
 Check ($m.state -eq 'installed') 'install did not complete'
+# Reproduce fc04ba5 packaging failure: a transcript entered the payload manifest.
+# Preflight must reject it without touching the current installation/receipt.
+$packagePath=Join-Path $pkg 'package.json'
+$validManifest=Get-Content $packagePath -Raw
+$badManifest=$validManifest | ConvertFrom-Json
+$badManifest.payload += [PSCustomObject]@{name='Repair.log';sha256='not-a-payload'}
+$badManifest | ConvertTo-Json -Depth 4 | Set-Content $packagePath
+$logStream=[IO.File]::Open((Join-Path $pkg 'Repair.log'),[IO.FileMode]::Create,[IO.FileAccess]::Write,[IO.FileShare]::None)
+$refusedLog=$false
+try { & $script @args -Action Validate } catch { $refusedLog=$true; Check ($_.Exception.Message -like '*Not a package payload*') 'wrong transcript rejection' } finally { $logStream.Dispose() }
+Check $refusedLog 'transcript accepted as payload'
+Check ((Get-Content (Join-Path $state 'deployment.json') -Raw | ConvertFrom-Json).state -eq 'installed') 'preflight changed installation state'
+$validManifest | Set-Content $packagePath
+& $script @args -Action Validate
 foreach($e in $m.files) { Check ((Get-FileHash $e.destination).Hash -eq $e.after_hash) 'installed hash mismatch' }
 # Additive only: every file the game shipped is byte-identical while installed.
 foreach($p in $before.Keys) { Check ((Get-FileHash $p).Hash -eq $before[$p]) 'install changed a game file' }

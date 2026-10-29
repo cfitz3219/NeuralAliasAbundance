@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Install','Rollback','Status')][string]$Action = 'Install',
+    [ValidateSet('Install','Rollback','Status','Validate')][string]$Action = 'Install',
     [string]$GameRoot = 'C:\Program Files (x86)\Steam\steamapps\common\PBZ',
     [string]$PackageRoot = $PSScriptRoot,
     [string]$StateRoot = (Join-Path $PSScriptRoot 'state'),
@@ -71,15 +71,11 @@ if ($Action -eq 'Rollback') {
     Restore (Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json)
     return
 }
-if (Test-Path -LiteralPath $manifestPath) {
-    $prior = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
-    if ($prior.state -ne 'restored') { throw 'An installation already exists. Use Status or Rollback first.' }
-    $archive = Join-Path $StateRoot ('previous-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' + [guid]::NewGuid().ToString('N').Substring(0,8))
-    New-Item -ItemType Directory -Path $archive | Out-Null
-    Get-ChildItem -LiteralPath $StateRoot -File | ForEach-Object { Move-Item -LiteralPath $_.FullName -Destination $archive }
-}
 $package = Get-Content -Raw -LiteralPath (Join-Path $PackageRoot 'package.json') | ConvertFrom-Json
 foreach ($f in $package.payload) {
+    if ($f.name -notin @('NeuralAliasDXGI.dll','NAProfile.exe','nvngx_dlssnr.dll','NVIDIA-NR-LICENSE.txt','deploy-pbz.ps1','pbz-package-run.ps1','README.md','ENGINEERING-NOTES.md','repair-from.txt')) {
+        throw "Not a package payload file: $($f.name). Logs and deployment state must not enter the payload manifest."
+    }
     if ((Hash (Join-Path $PackageRoot $f.name)) -ne $f.sha256) { throw "Package file mismatch: $($f.name)" }
 }
 foreach ($f in @('nvngx_dlssnr.dll')) {
@@ -87,6 +83,14 @@ foreach ($f in @('nvngx_dlssnr.dll')) {
     if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'NVIDIA Corporation') { throw "NVIDIA signature invalid: $f" }
 }
 if (-not (Test-Path -LiteralPath (Join-Path $GameRoot 'platform\steam\PBZ.exe'))) { throw 'Phantom Blade Zero executable not found.' }
+if ($Action -eq 'Validate') { Write-Host 'Replacement package validated; installation unchanged.'; return }
+if (Test-Path -LiteralPath $manifestPath) {
+    $prior = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+    if ($prior.state -ne 'restored') { throw 'An installation already exists. Use Status or Rollback first.' }
+    $archive = Join-Path $StateRoot ('previous-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' + [guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Path $archive | Out-Null
+    Get-ChildItem -LiteralPath $StateRoot -File | ForEach-Object { Move-Item -LiteralPath $_.FullName -Destination $archive }
+}
 & $helper status PBZ.exe
 if ($LASTEXITCODE -ne 0) { throw 'Phantom Blade Zero NVIDIA profile was not found.' }
 New-Item -ItemType Directory -Force -Path $StateRoot,$UserRoot | Out-Null
