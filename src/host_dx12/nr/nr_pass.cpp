@@ -14,6 +14,7 @@
 
 #include "host_dx12/color/color_space.hpp"
 #include "host_dx12/settings.hpp"
+#include "host_dx12/hooking/variant_registry.hpp"
 
 #if defined(NA_HAVE_NGX_SDK)
 #pragma warning(push, 3)
@@ -677,6 +678,12 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
     // under dynamic resolution); the region lands at (0,0).
     const uint32_t w = static_cast<uint32_t>(dd.Width), h = dd.Height;
     PendingInputs* pending = nullptr;
+    using namespace na::hooking::variants;
+    if (Active(Kind::CommandList) && CoverageOf(Kind::CommandList, list) != Coverage::Complete) {
+        g.skipped.fetch_add(1);
+        set_reason("Neural Rendering is waiting for a tracked input command list.");
+        return;
+    }
     discard_invalid_recordings_locked();
     for (auto& p : g.pending) if (p.list == list) { pending = &p; break; }
     const auto output_done = g.fence->GetCompletedValue();

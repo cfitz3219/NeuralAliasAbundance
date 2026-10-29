@@ -4383,8 +4383,9 @@ bool InstallListResetTracking(ID3D12Device* device, void (*listener)(ID3D12Graph
             !na::hooking::variants::Register(na::hooking::variants::Kind::CommandList, &spec, 1)) return false;
         g_reset_registered = true;
     }
-    return na::hooking::variants::WarmUpCommandLists(device) != 0 &&
-           na::hooking::variants::StartDiscoveryThread(nullptr, nullptr);
+    // The lightweight NR tracker is warmed only at initialization. Do not
+    // suspend game/Streamline threads to install new hooks during playback.
+    return na::hooking::variants::WarmUpCommandLists(device) != 0;
 }
 
 bool InstallProducers(ID3D12Device* device, ID3D12CommandQueue* queue, bool hook_queue_execute)

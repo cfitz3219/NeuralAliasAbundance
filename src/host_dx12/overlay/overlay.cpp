@@ -1462,7 +1462,10 @@ bool ensure_init_locked(IDXGISwapChain* sc)
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
+    // Gameplay Space/Enter must not activate the last mouse-focused switch.
+    // Keep controller navigation; text fields still receive keyboard input.
+    io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
     io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
     na::ui::SetBoldText(na::settings::Get().text_bold.load() != 0);
     na::ui::ApplyStyle();
@@ -2273,9 +2276,12 @@ void STDMETHODCALLTYPE DetourExecute(ID3D12CommandQueue* q, UINT n,
     if (na::hooking::variants::Active(Kind::CommandList)) { // inert until an adapter registers slots
         for (UINT i = 0; i < n; ++i) {
             if (!lists[i]) continue;
-            if (na::hooking::variants::NoteObject(Kind::CommandList, lists[i]) != na::hooking::variants::Coverage::Complete) {
+            const auto coverage = na::observe::ProducersActive()
+                ? na::hooking::variants::NoteObject(Kind::CommandList, lists[i])
+                : na::hooking::variants::CoverageOf(Kind::CommandList, lists[i]);
+            if (coverage != na::hooking::variants::Coverage::Complete) {
                 ++uncovered;
-                seen_push(SeenKind::List, lists[i]);
+                if (na::observe::ProducersActive()) seen_push(SeenKind::List, lists[i]);
             }
         }
     }
