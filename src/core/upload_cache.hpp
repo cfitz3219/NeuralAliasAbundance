@@ -48,7 +48,8 @@ public:
         e.mapped=static_cast<const unsigned char*>(data);e.offset=size_t(offset);e.length=size_t(size);
     }
     void unmap(uint64_t id){std::lock_guard lock(mutex_);auto it=entries_.find(id);if(it==entries_.end())return;auto& e=it->second;
-        if(e.mapped)update(id,e.offset,e.length,e.mapped);e.mapped=nullptr;
+        if(e.mapped)update(id,e.offset,e.length,e.mapped);
+        e.mapped=nullptr;
     }
     bool read(uint64_t id,uint64_t offset,void* data,size_t size)const {
         std::lock_guard lock(mutex_);
