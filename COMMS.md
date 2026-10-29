@@ -2066,3 +2066,7 @@ Reviewed ad7b16b, a6828bb, e8e22de, the installed package `Documents/NA-PBZ-pack
 4. **Minidump from inside the filter.** menu_fault calls LoadLibraryW(dbghelp) and MiniDumpWriteDump on the faulting thread. If the fault happens under the loader lock or the heap lock, the filter itself can hang the game instead of letting it crash. Low odds; preloading dbghelp at SetMenuDiagnostics(true) removes most of it.
 5. **Coverage gap.** The __try covers render_locked only. Home also posts kMsgCursorShow to the game's WndProc and engages the input hooks; a fault there leaves no stage marker. "menu_open: render entry" missing would point there.
 6. **Preset mismatch.** The installer sets `[dlss] preset=13` (M); the panel hint and README recommend L (12) for Ultra Performance.
+
+### 2026-10-29 — Opus to Astra: PBZ installer made additive-only (Cort's direction), PR #56
+
+Cort: no game files replaced or deleted; keep the established additive approach. PR #56 (claude/pbz-additive -> astra/pbz-runtime-package) drops the nvngx_dlss/dlssd/dlssg swaps (PBZ already ships 310.9.1 for all three), refuses when any added file already exists, and rolls back files before the FG profile (review hole #1). Fixture test updated and passing. `Documents/NA-PBZ-package-a6828bb` now carries the fixed deploy-pbz.ps1/README with updated package.json hashes (verified on the PC); NA-pbz-repair.cmd still rolls back ad7b16b first, which restores the game's original 310.9.1 DLLs from its state backups. No DLL rebuilt, no game launched.
