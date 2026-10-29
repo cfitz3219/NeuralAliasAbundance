@@ -198,6 +198,7 @@ struct State {
     std::atomic<uint32_t> active{0}, latched{0}, hdr{0};
     std::atomic<uint64_t> evaluates{0}, skipped{0};
     std::atomic<uint64_t> inputs_seen{0}, input_overwrites{0}, missing_inputs{0}, busy_slots{0};
+    std::atomic<uint64_t> untracked_lists{0};
     std::atomic<float> last_ms{0.f}, avg_ms{0.f};
     std::atomic<uint32_t> samples{0};
     char reason[96] = "Neural Rendering is off.";
@@ -684,6 +685,7 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
     using namespace na::hooking::variants;
     if (Active(Kind::CommandList) && CoverageOf(Kind::CommandList, list) != Coverage::Complete) {
         g.skipped.fetch_add(1);
+        g.untracked_lists.fetch_add(1, std::memory_order_relaxed);
         set_reason("Neural Rendering is waiting for a tracked input command list.");
         return;
     }
@@ -1174,6 +1176,7 @@ Stats GetStats()
     s.input_overwrites = g.input_overwrites.load();
     s.missing_inputs = g.missing_inputs.load();
     s.busy_slots = g.busy_slots.load();
+    s.untracked_lists = g.untracked_lists.load();
     s.last_ms = g.last_ms.load();
     s.avg_ms = g.avg_ms.load();
     s.gpu_samples = g.samples.load(std::memory_order_relaxed);

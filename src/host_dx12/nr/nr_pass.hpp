@@ -89,6 +89,7 @@ struct Stats {
     uint64_t evaluates;         // NR evaluates submitted
     uint64_t skipped;           // frames skipped (no inputs / extent mismatch)
     uint64_t inputs_seen, input_overwrites, missing_inputs, busy_slots;
+    uint64_t untracked_lists;  // initialization-only Reset tracking did not cover this implementation
     uint64_t gpu_submitted, gpu_completed;
     uint64_t input_submitted, input_completed, cross_queue_waits;
     float last_ms, avg_ms;      // GPU time of the whole pass (transform + NR)

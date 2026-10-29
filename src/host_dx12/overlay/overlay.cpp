@@ -708,9 +708,10 @@ void write_status_line()
     if (ln > 0) WriteFile(f, lm, static_cast<DWORD>(ln), &written, nullptr);
     write_menu_progress(f);
     char nr_line[256];
-    int nn = snprintf(nr_line, sizeof(nr_line), "nr_inputs seen=%llu overwritten=%llu missing=%llu allocator_busy=%llu\r\n",
+    int nn = snprintf(nr_line, sizeof(nr_line), "nr_inputs seen=%llu overwritten=%llu missing=%llu allocator_busy=%llu untracked_list=%llu\r\n",
                       static_cast<unsigned long long>(nr.inputs_seen), static_cast<unsigned long long>(nr.input_overwrites),
-                      static_cast<unsigned long long>(nr.missing_inputs), static_cast<unsigned long long>(nr.busy_slots));
+                      static_cast<unsigned long long>(nr.missing_inputs), static_cast<unsigned long long>(nr.busy_slots),
+                      static_cast<unsigned long long>(nr.untracked_lists));
     if (nn > 0) WriteFile(f, nr_line, static_cast<DWORD>(nn), &written, nullptr);
     nn = snprintf(nr_line, sizeof(nr_line), "nr_queue_sync input_submitted=%llu input_completed=%llu gpu_waits=%llu\r\n",
                   static_cast<unsigned long long>(nr.input_submitted), static_cast<unsigned long long>(nr.input_completed),
