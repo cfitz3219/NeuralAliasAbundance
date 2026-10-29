@@ -746,8 +746,8 @@ void write_status_line()
     {
         static uint64_t opt_logged = 0;
         na::ngx::OptimalCall calls[16];
-        const uint32_t n = na::ngx::GetOptimalCalls(opt_logged, calls, 16);
-        for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t opt_n = na::ngx::GetOptimalCalls(opt_logged, calls, 16);
+        for (uint32_t i = 0; i < opt_n; ++i) {
             const auto& c = calls[i];
             ln = snprintf(lm, sizeof(lm), "dlss_optimal_call seq=%llu rr=%u asked=%ux%u pq=%d nvidia=%ux%u returned=%ux%u overridden=%u\r\n",
                           static_cast<unsigned long long>(c.sequence), c.rr, c.user_w, c.user_h, c.perf_quality,
