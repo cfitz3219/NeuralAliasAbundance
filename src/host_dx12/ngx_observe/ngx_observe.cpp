@@ -29,6 +29,7 @@
 #include <nvsdk_ngx_defs.h>
 #include <nvsdk_ngx_defs_dlssd.h> // Ray Reconstruction: preset keys and DLSSDOptimalSettingsCallback
 #include <nvsdk_ngx_params.h>
+#include "host_dx12/nr/fg_contract.hpp"
 #pragma warning(pop)
 #endif
 
@@ -191,17 +192,16 @@ void inspect_fg_inputs(void* command_list, const void* raw)
     if (!raw) return;
     __try {
         const auto* p = static_cast<const NVSDK_NGX_Parameter*>(raw);
-        ID3D12Resource *color = nullptr, *depth = nullptr, *motion = nullptr, *hudless = nullptr, *distortion = nullptr;
-        p->Get("DLSSG.Backbuffer", &color); p->Get("DLSSG.Depth", &depth); p->Get("DLSSG.MVecs", &motion);
-        p->Get("DLSSG.HUDLess", &hudless); p->Get("DLSSG.BidirectionalDistortionField", &distortion);
+        const auto frame = na::nr::ReadFgContract(p);
+        auto* color = frame.color.resource;
         if (command_list) g_fg_list_type.store(static_cast<ID3D12GraphicsCommandList*>(command_list)->GetType());
         if (color) {
             const auto desc = color->GetDesc();
             g_fg_color_format.store(desc.Format); g_fg_color_w.store(static_cast<uint32_t>(desc.Width)); g_fg_color_h.store(desc.Height);
         }
-        if (command_list && color && depth && motion) g_fg_with_inputs.fetch_add(1);
-        if (hudless) g_fg_with_hudless.fetch_add(1);
-        if (distortion) g_fg_with_distortion.fetch_add(1);
+        if (command_list && color && frame.depth.resource && frame.motion.resource) g_fg_with_inputs.fetch_add(1);
+        if (frame.hudless.resource) g_fg_with_hudless.fetch_add(1);
+        if (frame.distortion.resource) g_fg_with_distortion.fetch_add(1);
     } __except (EXCEPTION_EXECUTE_HANDLER) { /* diagnostics must not interrupt native FG */ }
 #else
     (void)command_list; (void)raw;
