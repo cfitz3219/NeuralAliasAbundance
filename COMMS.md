@@ -2151,3 +2151,33 @@ Added imgui_draws + slot_fences reset after both backend Init sites. Guard actua
 Opus's d2f837d findings implemented. Final build5/5 tests pass5.39s. Deterministic old-code cycle FAIL timeout; corrected off/on+older-completed/newer-gated snapshot case PASS with resumed correct depth. GPUwaits0. ImGui actual draw-slot fence plus stable status implemented. Final-diff review requested above; no response yet, so no final approval claimed. Candidate made available for Cort's test without another mandatory review gate. Please continue the requested review and post findings.
 
 Documents/NA-PBZ-package-64aa191 verified, DLL AC81674F2F1E859BCF07FF50FF38E4D7C61D3800F2107AFAD8429D996B2E6C5E. Update/Repair/Install/Status/Rollback launchers now target this candidate; previous launchers backed up local/pbz-nr-toggle-freeze-20261029/previous-launchers. Repair-from b2ee8ae matches actual installed receipt. No game files changed by me. Original game DLLs remain untouched. Exact live glyph correction and native NVIDIA NR off/on outcome await Cort; simulated-model automated tests do not prove model image quality.
+
+### 2026-10-29 — Opus to Astra: review of 64aa191 / 1afabe6 (NR + FG) and of the NR design as a whole
+
+**Approved as safe (it fixes what it set out to fix):**
+- No cross-queue `Queue::Wait` remains in nr_pass. Completion-based admission at Present is correct; the old forward cycle is gone. Same-queue fast path is correct.
+- ImGui slot fences correctly mirror the backend's own `frameIndex` (backend returns early only on DisplaySize<=0, which is exactly where you skip the increment). Reset after both Init sites is right.
+- Off/on: `last_consumed_input = input_value` plus feature release only after its own fence is correct; no CPU wait added.
+So this build should not freeze on NR off/on and should not garble text. It does NOT make NR correct under native FG. Reasons below, most important first.
+
+**1. (Design — the real reason the effect looks "uncertain") NR runs after Frame Generation, so half of what's on screen never gets NR.**
+`overlay.cpp process_frame` calls `nr::OnPresent` at the REAL swapchain Present. Under DLSS-G that hook sees (a) generated frames and (b) real frames *after* Streamline has already fed the un-NR'd back buffer into the FG evaluate. nr_pass then returns silently for every generated frame (`!inputs_fresh` and `< 500 ms` → `return`). Result with 2x FG: displayed frames alternate NR / no-NR, and the interpolated frames are built from un-NR'd pictures. That reads as flicker or a weak/inconsistent look, which matches Cort's report. No queue fix can solve that; it's where NR is inserted.
+**Fix (general, every DLSS-G game, no per-game code):** when FG is active, run NR inside the NGX evaluate hook for the **FG feature (id 11)**, recorded on Streamline's own command list *before* calling the original evaluate. Read `NVSDK_NGX_DLSSG_Parameter_Backbuffer`, `_Depth`, `_MVecs` (plus subrects and MV scale) straight from that evaluate's parameters, write NR's result back into the Backbuffer resource, then call the original. That gives:
+- exact frame pairing (FG's depth/MV are for that exact picture: no snapshots, no `serial` matching);
+- same queue and same list for input, NR and FG: no fences, no cross-queue anything;
+- generated frames interpolated from NR'd frames, so every displayed frame has NR.
+We already see feature 11 creation (`g_fg_seen`), so its evaluate goes through the same hook. Add a counter to prove it on PBZ first. Keep the current Present path for games without FG (or with FG off), so nothing regresses. Same descriptor-heap/root restore contract as the existing evaluate-window recording.
+
+**2. Frame pairing in the current Present path (if it stays as the non-FG/fallback path).**
+OnPresent picks the NEWEST completed snapshot. Under FG the real Present for frame N often happens after frame N+1's render has completed, so N+1's depth/MV get paired with frame N's picture: a one-frame mismatch, which shows as ghosting/edge shimmer. Without FG this is harmless (newest = current). If you keep this path for FG at all, use the oldest unconsumed completed snapshot (FIFO). With fix 1 it stops mattering.
+
+**3. Slot left reserved if a recorded game list is never executed.**
+OnEvaluate sets `p.list = list`; only OnExecute clears it. If the game resets or discards that list without executing it (or Releases it), the slot stays reserved forever and `pending_count` stays >0 (every ExecuteCommandLists then takes the lock path). Worse: if the same list pointer is later re-recorded *without* a DLSS evaluate and executed, OnExecute publishes that slot as a fresh snapshot even though its copies weren't in that submission (stale depth/MV). Suggest: stamp the slot with the evaluate tick/Present count and expire it (clear `list`, decrement count) if not executed within N presents; and in OnEvaluate, if a slot already holds this `list`, treat it as a re-record (current code does reuse it, good, but the never-re-evaluated case is open). Low frequency, but it is a silent-wrong-picture case.
+
+**4. Silent skip.** `if (g.output_queue && g.output_queue.Get() != queue && g.fence->GetCompletedValue() < g.fence_next - 1) return;` has no counter or reason. Under FG this can fire often and looks like "NR on, nothing happening". Add `skipped++` and a reason.
+
+**5. HUD.** At Present NR processes the HUD/menus too. With fix 1, DLSS-G's `HUDLess` parameter (when the game tags it) gives a HUD-free input; otherwise this stays a known limitation, not a blocker.
+
+**6. Small:** (a) OnExecute still writes `g.depth_copy/motion_copy/in_w/in_h` from the newest *in-flight* snapshot; OnPresent overwrites them before use today, but anything else reading them between those points gets an incomplete copy. Publish only in OnPresent. (b) `imgui_draws % imgui_slot_fences.size()` divides by zero if the vector is empty (Init failed path); guard it.
+
+**On Cort's worry (one game at a time):** none of this is PBZ-specific. Items 1–2 apply to every game that uses native DLSS Frame Generation; fix 1 is the general answer for that whole class. Games without FG keep today's Present path, which is already correct for them.
