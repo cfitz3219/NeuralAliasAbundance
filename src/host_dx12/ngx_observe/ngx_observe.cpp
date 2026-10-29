@@ -55,6 +55,7 @@ using PfnEvaluateFeature = NgxResult(__cdecl*)(void* cmd_list, const void* handl
 using PfnReleaseFeature = NgxResult(__cdecl*)(void* handle);
 using PfnShutdown1 = NgxResult(__cdecl*)(void* device);
 using PfnGetCapParams = NgxResult(__cdecl*)(void** out_params);
+using PfnPopulateParams = NgxResult(__cdecl*)(void* params); // NVSDK_NGX_D3D12_PopulateParameters_Impl
 
 // A43: one set of ORIGINAL entry points PER HOOKED MODULE. Session 6 root
 // cause: a single shared set was overwritten each time another module with
@@ -73,6 +74,8 @@ struct CoreSlot {
     PfnReleaseFeature release = nullptr;
     PfnShutdown1 shutdown1 = nullptr;
     PfnGetCapParams getcap = nullptr;
+    PfnGetCapParams getparams = nullptr;   // NVSDK_NGX_D3D12_GetParameters (deprecated path)
+    PfnPopulateParams populate = nullptr;  // AllocateParameters + PopulateParameters_Impl path
     std::atomic<uint32_t> hooked{0};       // exports hooked in this module
     std::atomic<uint32_t> init_succeeded{0}; // the game initialised THIS core
 };
@@ -1288,6 +1291,7 @@ using PfnOptimalCallback = int32_t(__cdecl*)(void* params);
 std::atomic<void*> g_orig_optimal{nullptr};
 std::atomic<void*> g_orig_optimal_rr{nullptr}; // Ray Reconstruction's DLSSDOptimalSettingsCallback
 std::atomic<uint64_t> g_opt_calls{0};
+std::atomic<uint64_t> g_cap_swaps[3]{}; // optimal-callback swaps per path: capability, populate, get-parameters
 // Every display size anyone asked DLSS's optimal-settings callback about (a
 // few distinct sizes: the game's real output, probes such as 1000x1000).
 // A game that never asks about its own output size picks its render size
@@ -1402,6 +1406,7 @@ OptimalStats GetOptimalStats()
     s.last_user_w = g_opt_user_w.load(); s.last_user_h = g_opt_user_h.load();
     s.last_out_w = g_opt_out_w.load(); s.last_out_h = g_opt_out_h.load();
     s.last_overridden = g_opt_overridden.load();
+    s.swaps_capability = g_cap_swaps[0].load(); s.swaps_populate = g_cap_swaps[1].load(); s.swaps_getparams = g_cap_swaps[2].load();
     return s;
 }
 
@@ -1409,12 +1414,36 @@ namespace {
 // After the runtime hands out capability parameters, swap the optimal-
 // settings callback pointer inside them for ours (idempotent: never
 // re-capture our own pointer as the "original").
+void swap_optimal_callbacks(void* params, int path);
 int32_t GetCapabilityParametersImpl(CoreSlot& s, void** out_params)
 {
     int32_t r = s.getcap(out_params);
+    if (r >= 0 && out_params && *out_params) swap_optimal_callbacks(*out_params, 0);
+    return r;
+}
+// The callback pointers are also placed into game-owned parameter objects by
+// AllocateParameters + PopulateParameters_Impl (the SDK's current path) and by
+// the deprecated GetParameters. A game or Streamline using either never saw our
+// GetCapabilityParameters swap, so its render size came straight from NVIDIA's
+// callback (Argon review: PBZ kept 1146x480 through every rebuild).
+int32_t PopulateParametersImpl(CoreSlot& s, void* params)
+{
+    int32_t r = s.populate(params);
+    if (r >= 0 && params) swap_optimal_callbacks(params, 1);
+    return r;
+}
+int32_t GetParametersImpl(CoreSlot& s, void** out_params)
+{
+    int32_t r = s.getparams(out_params);
+    if (r >= 0 && out_params && *out_params) swap_optimal_callbacks(*out_params, 2);
+    return r;
+}
+void swap_optimal_callbacks(void* params, int path)
+{
 #if defined(NA_HAVE_NGX_SDK)
-    if (r >= 0 && out_params && *out_params) {
-        auto* p = static_cast<NVSDK_NGX_Parameter*>(*out_params);
+    {
+        auto* p = static_cast<NVSDK_NGX_Parameter*>(params);
+        bool swapped = false;
         void* cb = nullptr;
         if (p->Get(NVSDK_NGX_Parameter_DLSSOptimalSettingsCallback, &cb) ==
                 NVSDK_NGX_Result_Success && cb &&
@@ -1422,6 +1451,7 @@ int32_t GetCapabilityParametersImpl(CoreSlot& s, void** out_params)
             g_orig_optimal.store(cb, std::memory_order_release);
             p->Set(NVSDK_NGX_Parameter_DLSSOptimalSettingsCallback,
                    reinterpret_cast<void*>(&OptimalSettingsCallback));
+            swapped = true;
         }
         // Ray Reconstruction asks its own callback for the render size (games with
         // ray tracing on, e.g. Phantom Blade Zero): same takeover, same rule.
@@ -1432,12 +1462,17 @@ int32_t GetCapabilityParametersImpl(CoreSlot& s, void** out_params)
             g_orig_optimal_rr.store(rr_cb, std::memory_order_release);
             p->Set(NVSDK_NGX_Parameter_DLSSDOptimalSettingsCallback,
                    reinterpret_cast<void*>(&OptimalSettingsCallbackRR));
+            swapped = true;
         }
+        if (swapped && path >= 0 && path < 3) g_cap_swaps[path].fetch_add(1, std::memory_order_relaxed);
     }
+#else
+    (void)params; (void)path;
 #endif
-    return r;
 }
 template <int S> int32_t __cdecl DetourGetCapabilityParameters(void** out) { return GetCapabilityParametersImpl(g_slots[S], out); }
+template <int S> int32_t __cdecl DetourPopulateParameters(void* p) { return PopulateParametersImpl(g_slots[S], p); }
+template <int S> int32_t __cdecl DetourGetParameters(void** out) { return GetParametersImpl(g_slots[S], out); }
 
 // Base file name of a module name or full path.
 const wchar_t* base_name(const wchar_t* name, size_t len, size_t* out_len)
@@ -1560,6 +1595,8 @@ template <int S> uint32_t install_slot(HMODULE ngx_module)
         {"NVSDK_NGX_D3D12_ReleaseFeature", reinterpret_cast<void*>(&DetourReleaseFeature<S>), reinterpret_cast<void**>(&slot.release)},
         {"NVSDK_NGX_D3D12_Shutdown1", reinterpret_cast<void*>(&DetourShutdown1<S>), reinterpret_cast<void**>(&slot.shutdown1)},
         {"NVSDK_NGX_D3D12_GetCapabilityParameters", reinterpret_cast<void*>(&DetourGetCapabilityParameters<S>), reinterpret_cast<void**>(&slot.getcap)},
+        {"NVSDK_NGX_D3D12_PopulateParameters_Impl", reinterpret_cast<void*>(&DetourPopulateParameters<S>), reinterpret_cast<void**>(&slot.populate)},
+        {"NVSDK_NGX_D3D12_GetParameters", reinterpret_cast<void*>(&DetourGetParameters<S>), reinterpret_cast<void**>(&slot.getparams)},
     };
     // A45 installation transaction (answers A43-NGX-ACK finding 2): every
     // original is prepared and published, then the slot's module record is

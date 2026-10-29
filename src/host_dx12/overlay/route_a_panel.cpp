@@ -177,7 +177,7 @@ void DrawPicture()
         text = engine_apply.reason;
     } else if (game_sets_size) {
         state = 1;
-        snprintf(buf, sizeof(buf), "This game chooses its own render resolution (%ux%u now). Pick Performance, Balanced or Quality in the game's video settings; NeuralAlias sets the DLSS preset.", rw, rh);
+        snprintf(buf, sizeof(buf), "This game has not asked DLSS for its render size in a way NeuralAlias can change (%ux%u now). Pick Performance, Balanced or Quality in the game's video settings; NeuralAlias sets the DLSS preset.", rw, rh);
         text = buf;
     } else if (follow_game) {
         state = 1;
@@ -244,7 +244,7 @@ void DrawPicture()
         }
     }
     ImGui::EndDisabled();
-    Hint(game_sets_size ? "This game sets its render resolution itself, so the picture mode is chosen in the game's video settings." :
+    Hint(game_sets_size ? "NeuralAlias has not seen this game ask DLSS for a render size, so the picture mode is chosen in the game's video settings." :
          follow_game ? "Picture mode follows the game's video settings, including Ultra Performance." : kModeHelp[mode]);
 
     // Preset + Apply. (A46: the disabled Sharpness row is gone until a

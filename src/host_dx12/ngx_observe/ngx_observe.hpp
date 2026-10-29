@@ -82,6 +82,7 @@ struct OptimalStats {
     uint32_t last_user_w, last_user_h;   // what the game asked about
     uint32_t last_out_w, last_out_h;     // what we answered
     uint32_t last_overridden;   // 1 if we rewrote the answer
+    uint64_t swaps_capability, swaps_populate, swaps_getparams; // where our callback was installed
 };
 OptimalStats GetOptimalStats();
 // True if the optimal-settings callback was ever asked about this display size
