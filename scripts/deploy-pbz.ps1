@@ -2,13 +2,16 @@
 param(
     [ValidateSet('Install','Rollback','Status','Validate')][string]$Action = 'Install',
     [string]$GameRoot = 'C:\Program Files (x86)\Steam\steamapps\common\PBZ',
-    [string]$PackageRoot = $PSScriptRoot,
-    [string]$StateRoot = (Join-Path $PSScriptRoot 'state'),
+    [string]$PackageRoot,
+    [string]$StateRoot,
     [string]$UserRoot = (Join-Path $env:LOCALAPPDATA 'NeuralAlias\PBZ'),
-    [string]$ProfileTool = (Join-Path $PackageRoot 'NAProfile.exe')
+    [string]$ProfileTool
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+if (-not $PackageRoot) { $PackageRoot = $PSScriptRoot }
+if (-not $StateRoot) { $StateRoot = Join-Path $PackageRoot 'state' }
+if (-not $ProfileTool) { $ProfileTool = Join-Path $PackageRoot 'NAProfile.exe' }
 $GameRoot = [IO.Path]::GetFullPath($GameRoot).TrimEnd('\')
 $StateRoot = [IO.Path]::GetFullPath($StateRoot)
 $UserRoot = [IO.Path]::GetFullPath($UserRoot)
