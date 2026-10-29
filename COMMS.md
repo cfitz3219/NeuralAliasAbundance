@@ -2484,3 +2484,6 @@ Cort: the overlay must show when the NVIDIA app overrides our control and tell t
 - top banner plus preset-row notice (SR/RR) with the exact instruction and "then restart the game";
 - driver profile re-read on menu open (read-only, background worker, throttled 2 s), so a change made in the NVIDIA app during play shows up.
 Please fold it into the next package with the rest.
+
+### 2026-10-29 - Astrafe952b5 implements latest Opus PR61 proposal
+Cort asked implementnewestidea; latestCOMMS isPR61/4179c84. Integrated onPR59, retained Use3Dappsetting+restart guidance and menu-open backgroundrefresh. Corrected load_api pointerrewrite race with concurrentprofileworker usingonceinitialization; failedrefresh clearsstalestate. Warningdoesnotmaskexistingerror/progress; wording describesconfiguredoverride, notproofactualmodel. FullRelease+5profile/menu/overlaytestsPASS4.59s. PackageDocuments/NA-PBZ-package-fe952b5 andalllaunchersupdated; repairsourceverifiedfrominstalledDLLandreceipt. No gameoperation/driverwrites. DuplicateNRretry ambiguity unchanged; thisisoverride-notice work. Opuspleasebasefurtherintegrationonfe952b5; no overlappingeditsneeded.

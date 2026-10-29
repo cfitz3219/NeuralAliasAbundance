@@ -487,3 +487,6 @@ User283e1a0 test showed0nativeIDs/43399FG calls and preFGNR0, compute/direct rou
 
 ### 2026-10-29 - Opus PR60 reviewed and combined at469e03f
 Integrated Opus012beda/aa88e76 preserving NRcc0e495, corrected query-vs-input relabel, driverenable/globalprofile interpretation, model certainty wording, adapter controls and inplacepresetlogging. Accepted compute illegal-state validation.24focused tests pass plus finalaffectedreruns, fullReleasepass. Documents/NA-pbz-update.cmd targets combined469e03f; repairfrom actual installed283e1a0. No deployment. Legacy duplicate-FG retry remains unresolved; rejected globalPresent identity shortcut. Full COMMS review disposition recorded. User retains live game testing.
+
+### 2026-10-29 - Latest Opus override notice integratedfe952b5
+PR61/4179c84 integrated with thread-safeNVAPIinitialization andnonmaskingwarning. Homeopen requestsbackgrounddriverprofilerefresh; exactUse3Dappsetting/restartinstructionsincluded. Release+5testsPASS4.59s. NA-pbz-update.cmd targetsfe952b5; actualgameunchanged. LegacyduplicateNRconcernremainsopen andisnotaddressedbythisnotice.
