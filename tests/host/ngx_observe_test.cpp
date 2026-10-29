@@ -16,6 +16,7 @@
 
 #include <cwchar>
 #include "host_dx12/dlss/call_origin.hpp"
+#include "host_dx12/settings.hpp"
 #if defined(NA_HAVE_NGX_SDK)
 #include "fake_ngx_params.hpp"
 #endif
@@ -37,6 +38,10 @@ using PfnState = const StubState*(__cdecl*)();
 using PfnSetResults = void(__cdecl*)(int32_t, int32_t);
 
 bool Name(const wchar_t* s) { return na::ngx::IsNgxCoreModuleName(s, std::wcslen(s)); }
+#if defined(NA_HAVE_NGX_SDK)
+int32_t __cdecl OptimalA(void* p) { static_cast<NVSDK_NGX_Parameter*>(p)->Set("witness", 11u); return 1; }
+int32_t __cdecl OptimalB(void* p) { static_cast<NVSDK_NGX_Parameter*>(p)->Set("witness", 22u); return 1; }
+#endif
 } // namespace
 
 int wmain(int argc, wchar_t** argv)
@@ -167,6 +172,57 @@ int wmain(int argc, wchar_t** argv)
     // Released identities must not remain classified as FG.
     CHECK(eval(nullptr, fg_handle, nullptr, nullptr) == 1);
     CHECK(na::ngx::GetStats().fg_evaluates == fg0.fg_evaluates + 1);
+#endif
+#if defined(NA_HAVE_NGX_SDK)
+    // Exercise actual patched exports, including empty allocation, failures,
+    // re-acquisition, SR/RR and distinct original callback implementations.
+    auto query_config = reinterpret_cast<void(__cdecl*)(void*, int32_t)>(GetProcAddress(stub, "NgxStubSetQuery"));
+    using Query = int32_t(__cdecl*)(void**);
+    using Callback = int32_t(__cdecl*)(void*);
+    const char* sr_key = "DLSSOptimalSettingsCallback";
+    const char* rr_key = "DLSSDOptimalSettingsCallback";
+    na::settings::Get().enabled = 0;
+    void* retained = nullptr;
+    for (const char* name : {"NVSDK_NGX_D3D12_GetCapabilityParameters", "NVSDK_NGX_D3D12_GetParameters", "NVSDK_NGX_D3D12_AllocateParameters"}) {
+        auto query = reinterpret_cast<Query>(GetProcAddress(stub, name));
+        CHECK(query && query_config);
+        test::FakeParams params;
+        void* out = nullptr;
+        query_config(&params, 1);
+        CHECK(query(&out) == 1 && out == &params);
+        CHECK(!params.Has(sr_key)); // no invented callback on empty allocation
+        params.Set(sr_key, reinterpret_cast<void*>(&OptimalA));
+        params.Set(rr_key, reinterpret_cast<void*>(&OptimalB));
+        query_config(&params, static_cast<int32_t>(NVSDK_NGX_Result_Fail));
+        CHECK(query(&out) == static_cast<int32_t>(NVSDK_NGX_Result_Fail));
+        void* a = nullptr; params.Get(sr_key, &a);
+        CHECK(a == reinterpret_cast<void*>(&OptimalA));
+        query_config(&params, 1);
+        CHECK(query(&out) == 1);
+        params.Get(sr_key, &a);
+        void* b = nullptr; params.Get(rr_key, &b);
+        CHECK(a != reinterpret_cast<void*>(&OptimalA) && b != reinterpret_cast<void*>(&OptimalB));
+        CHECK(query(&out) == 1);
+        void* again = nullptr; params.Get(sr_key, &again);
+        CHECK(again == a); // idempotent, never wraps a wrapper
+        test::FakeParams request;
+        CHECK(reinterpret_cast<Callback>(a)(&request) == 1 && request.U("witness") == 11);
+        CHECK(reinterpret_cast<Callback>(b)(&request) == 1 && request.U("witness") == 22);
+        retained = a;
+    }
+    test::FakeParams after;
+    after.Set(sr_key, reinterpret_cast<void*>(&OptimalB));
+    query_config(&after, 1);
+    void* other = nullptr;
+    auto cap_query = reinterpret_cast<Query>(GetProcAddress(stub, "NVSDK_NGX_D3D12_GetCapabilityParameters"));
+    CHECK(cap_query(&other) == 1);
+    after.Get(sr_key, &other);
+    CHECK(reinterpret_cast<Callback>(other)(&after) == 1 && after.U("witness") == 22);
+    // A later SR callback must not retarget the retained SR pointer from A.
+    CHECK(reinterpret_cast<Callback>(retained)(&after) == 1 && after.U("witness") == 11);
+    query_config(nullptr, 1);
+    const auto opt = na::ngx::GetOptimalStats();
+    CHECK(opt.swaps_capability && opt.swaps_getparams && opt.swaps_allocate);
 #endif
     na::hooking::Shutdown();
     return test::finish("ngx_observe_test");

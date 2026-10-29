@@ -200,3 +200,15 @@ provenance is needed to distinguish it. No guessed cache reuse was introduced.
 
 Full Release build +24focused tests pass9.61s; after final logging/adapter changes,
 6affected tests pass1.57s. No live game test, deployment or driver-profile writes.
+
+## 2026-10-29 - Argon Route A implementation disposition
+
+Integrated Opus PR62 f88bce6, corrected before release. Public D3D12 GetCapabilityParameters, GetParameters and AllocateParameters now wrap existing SR/RR optimal callbacks. Empty allocations stay empty. Failed acquisition leaves returned parameters untouched. Permanent per-original thunks preserve forwarding across multiple runtime callbacks and repeated acquisition (32 distinct targets; exhaustion preserves the runtime callback). Path counters appear in dlss_control.
+
+Removed the proposed private PopulateParameters_Impl hook: its declaration is absent from the pinned public SDK, and our core-module filter excludes feature snippets where this export is found. Allocation followed by later population is therefore NOT claimed covered. No guessed vtable[11] hook or incorrect Streamline struct prefix. PBZ's additive package does not replace sl.interposer; a proxy-only optimal-settings wrapper would not cover it. Actual display-size queries and consumed creation sizes still determine mode availability. No query is not evidence that PBZ calculates sizes independently.
+
+Retained already-implemented overlay draw-slot fencing, completion admission without cross-queue waits, and pre-native-FG NR. Rejected reusing real-frame depth/MV on generated images: stale guides do not match those images. Two buffers alone do not prove GPU lifetime safety. Retained distinct SR and RR preset domains. Legacy same-picture FG retry identity ambiguity remains open; this change does not claim to resolve it or live flicker.
+
+Validation: full Windows Release build; 13 focused CPU/DX12 tests PASS (5.95s), final 3 NGX tests PASS (0.88s) after adding cross-original SR forwarding witness; additive installer/rollback fixture PASS. Actual hooked-export test covers SR/RR, all three public acquisition paths, empty parameters, failure, idempotence and retained callbacks after parameter destruction. Existing NR direct/compute GPU and overlay tests use controlled fixtures; no PBZ quality proof.
+
+Source authority: pinned NVIDIA nvsdk_ngx.h public parameter acquisition declarations, nvsdk_ngx_params.h typed virtual Get/Set, nvsdk_ngx_defs_dlssd.h RR preset domain. Argon's supplied universal_dlss_route_a_architecture_fixes.md is reviewed design input, not an authoritative ABI definition.
