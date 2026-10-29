@@ -151,14 +151,18 @@ int wmain(int argc, wchar_t** argv)
     // retains upscaler keys, it must never be read as another SR/RR frame.
     test::FakeParams fg_params;
     fg_params.Set(NVSDK_NGX_Parameter_Width, 123u);
+    fg_params.Set("DLSSG.UserInterfaceRecompositionEnabled", 1u);
+    fg_params.Set("DLSSG.BackbufferFrameID", 0ull); // zero is a supplied identity
     void* fg_handle = nullptr;
     CHECK(create(nullptr, 11, &fg_params, &fg_handle) == 1);
     const auto fg0 = na::ngx::GetStats();
+    CHECK(fg0.fg_last_create_uir == 1);
     const auto reads = fg_params.non_fg_reads;
     na::ngx::SetDetailLogging(true);
     CHECK(eval(nullptr, fg_handle, &fg_params, nullptr) == 1);
     CHECK(fg_params.non_fg_reads == reads);
     CHECK(na::ngx::GetStats().fg_evaluates == fg0.fg_evaluates + 1);
+    CHECK(na::ngx::GetStats().fg_with_frame_id == fg0.fg_with_frame_id + 1);
     CHECK(release(fg_handle) == 1);
     // Released identities must not remain classified as FG.
     CHECK(eval(nullptr, fg_handle, nullptr, nullptr) == 1);

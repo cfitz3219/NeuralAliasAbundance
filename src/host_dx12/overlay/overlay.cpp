@@ -550,6 +550,11 @@ void write_status_line()
         static_cast<unsigned long long>(ngx.fg_with_hudless), static_cast<unsigned long long>(ngx.fg_with_distortion),
         ngx.fg_list_type, ngx.fg_color_format, ngx.fg_color_w, ngx.fg_color_h);
     if (fg_input_bytes > 0) WriteFile(f, fg_inputs, static_cast<DWORD>(fg_input_bytes), &written, nullptr);
+    const int fg_contract_bytes = snprintf(fg_inputs, sizeof(fg_inputs),
+        "native_fg_contract frame_id_calls=%llu alpha_calls=%llu ui_calls=%llu last_create_uir=%u\r\n",
+        static_cast<unsigned long long>(ngx.fg_with_frame_id), static_cast<unsigned long long>(ngx.fg_with_alpha),
+        static_cast<unsigned long long>(ngx.fg_with_ui), ngx.fg_last_create_uir);
+    if (fg_contract_bytes > 0) WriteFile(f, fg_inputs, static_cast<DWORD>(fg_contract_bytes), &written, nullptr);
     // Worker-thread snapshots only: no GPU waits or readbacks in callbacks.
     const auto fsr = na::ffx::GetStats();
     const auto xess = na::xess::GetStats();

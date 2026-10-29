@@ -184,6 +184,22 @@ struct FgHandle { const CoreSlot* core = nullptr; const void* handle = nullptr; 
 FgHandle g_fg_handles[32]; // guarded by g_confirm_m; do not infer an evaluate from a creation
 std::atomic<uint64_t> g_fg_evaluates{0}, g_fg_with_inputs{0}, g_fg_with_hudless{0}, g_fg_with_distortion{0};
 std::atomic<uint32_t> g_fg_list_type{0xFFFFFFFFu}, g_fg_color_format{0}, g_fg_color_w{0}, g_fg_color_h{0};
+std::atomic<uint64_t> g_fg_with_frame_id{0}, g_fg_with_alpha{0}, g_fg_with_ui{0};
+std::atomic<uint32_t> g_fg_last_create_uir{UINT32_MAX};
+
+uint32_t inspect_fg_create_uir(const void* raw)
+{
+    uint32_t value = UINT32_MAX;
+#if defined(NA_HAVE_NGX_SDK)
+    __try {
+        if (raw) na::nr::FgRead(static_cast<const NVSDK_NGX_Parameter*>(raw),
+                               "DLSSG.UserInterfaceRecompositionEnabled", &value);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { value = UINT32_MAX; }
+#else
+    (void)raw;
+#endif
+    return value;
+}
 
 void inspect_fg_inputs(void* command_list, const void* raw)
 {
@@ -202,6 +218,9 @@ void inspect_fg_inputs(void* command_list, const void* raw)
         if (command_list && color && frame.depth.resource && frame.motion.resource) g_fg_with_inputs.fetch_add(1);
         if (frame.hudless.resource) g_fg_with_hudless.fetch_add(1);
         if (frame.distortion.resource) g_fg_with_distortion.fetch_add(1);
+        if (frame.has_frame_id) g_fg_with_frame_id.fetch_add(1);
+        if (frame.alpha.resource) g_fg_with_alpha.fetch_add(1);
+        if (frame.ui.resource) g_fg_with_ui.fetch_add(1);
     } __except (EXCEPTION_EXECUTE_HANDLER) { /* diagnostics must not interrupt native FG */ }
 #else
     (void)command_list; (void)raw;
@@ -335,6 +354,7 @@ NgxResult CreateFeatureImpl(CoreSlot& s, void* cmd_list, uint32_t feature_id, vo
     }
     if (r != 1) g_create_failures.fetch_add(1, std::memory_order_relaxed);
     if (r == 1 && feature_id == 11 && out_handle && *out_handle) {
+        g_fg_last_create_uir.store(inspect_fg_create_uir(params));
         std::lock_guard<std::mutex> lock(g_confirm_m);
         for (auto& entry : g_fg_handles) if (!entry.handle || (entry.core == &s && entry.handle == *out_handle)) {
             entry = {&s, *out_handle}; break;
@@ -1569,6 +1589,8 @@ Stats GetStats()
     s.fg_with_hudless = g_fg_with_hudless.load(); s.fg_with_distortion = g_fg_with_distortion.load();
     s.fg_list_type = g_fg_list_type.load(); s.fg_color_format = g_fg_color_format.load();
     s.fg_color_w = g_fg_color_w.load(); s.fg_color_h = g_fg_color_h.load();
+    s.fg_with_frame_id = g_fg_with_frame_id.load(); s.fg_with_alpha = g_fg_with_alpha.load();
+    s.fg_with_ui = g_fg_with_ui.load(); s.fg_last_create_uir = g_fg_last_create_uir.load();
     s.inits = g_inits.load(std::memory_order_relaxed);
     s.creates = g_creates.load(std::memory_order_relaxed);
     s.evaluates = g_evaluates.load(std::memory_order_relaxed);
