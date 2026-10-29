@@ -743,6 +743,19 @@ void write_status_line()
                   static_cast<unsigned long long>(optc.swaps_capability), static_cast<unsigned long long>(optc.swaps_allocate),
                   static_cast<unsigned long long>(optc.swaps_getparams));
     if (ln > 0) WriteFile(f, lm, static_cast<DWORD>(ln), &written, nullptr);
+    {
+        static uint64_t opt_logged = 0;
+        na::ngx::OptimalCall calls[16];
+        const uint32_t n = na::ngx::GetOptimalCalls(opt_logged, calls, 16);
+        for (uint32_t i = 0; i < n; ++i) {
+            const auto& c = calls[i];
+            ln = snprintf(lm, sizeof(lm), "dlss_optimal_call seq=%llu rr=%u asked=%ux%u pq=%d nvidia=%ux%u returned=%ux%u overridden=%u\r\n",
+                          static_cast<unsigned long long>(c.sequence), c.rr, c.user_w, c.user_h, c.perf_quality,
+                          c.native_w, c.native_h, c.out_w, c.out_h, c.overridden);
+            if (ln > 0) WriteFile(f, lm, static_cast<DWORD>(ln), &written, nullptr);
+            opt_logged = c.sequence;
+        }
+    }
     write_menu_progress(f);
     char nr_line[256];
     // Read a bounded receipt ring on the logging worker, never write a file

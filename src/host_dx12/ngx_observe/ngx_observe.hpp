@@ -88,6 +88,17 @@ OptimalStats GetOptimalStats();
 // True if the optimal-settings callback was ever asked about this display size
 // (+-1 px). False means no query observed here; another interface may be in use.
 bool OptimalQueriedFor(uint32_t out_w, uint32_t out_h);
+// One optimal-settings callback answer (bounded ring, newest kept).
+struct OptimalCall {
+    uint64_t sequence = 0;
+    uint32_t user_w = 0, user_h = 0;     // size asked about (display or a reference size)
+    int32_t perf_quality = -1;           // quality mode the caller asked for
+    uint32_t native_w = 0, native_h = 0; // NVIDIA's answer
+    uint32_t out_w = 0, out_h = 0;       // what the caller received
+    uint32_t overridden = 0, rr = 0;     // 1 = we changed the answer; 1 = Ray Reconstruction callback
+};
+// Copies answers with sequence > after (oldest first) into out; returns count.
+uint32_t GetOptimalCalls(uint64_t after, OptimalCall* out, uint32_t max);
 // The preset hint a creation hands the runtime for its own quality slot (after
 // our overrides). 0 = default/none. Logged per creation as preset=.
 uint32_t CreatePresetHint(uint32_t feature_id, void* ngx_parameter);

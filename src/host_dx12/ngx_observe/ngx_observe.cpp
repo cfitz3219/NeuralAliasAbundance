@@ -1292,6 +1292,14 @@ using PfnOptimalCallback = int32_t(__cdecl*)(void* params);
 std::atomic<void*> g_orig_optimal{nullptr};
 std::atomic<void*> g_orig_optimal_rr{nullptr}; // Ray Reconstruction's DLSSDOptimalSettingsCallback
 std::atomic<uint64_t> g_opt_calls{0};
+// Every optimal-settings answer, so a log shows what each caller asked
+// (display or reference size, quality value), what NVIDIA answered and what we
+// returned. UE-style engines may query a reference size (e.g. 1000x1000) per
+// quality mode and derive their screen percentage from the answer.
+constexpr uint32_t kOptLog = 16;
+OptimalCall g_opt_log[kOptLog];
+std::atomic<uint64_t> g_opt_log_seq{0};
+std::mutex g_opt_log_m;
 std::atomic<uint64_t> g_cap_swaps[3]{}; // optimal-callback swaps per path: capability, allocate, get-parameters
 // Every display size anyone asked DLSS's optimal-settings callback about (a
 // few distinct sizes: the game's real output, probes such as 1000x1000).
@@ -1382,6 +1390,9 @@ int32_t optimal_settings_common(void* ngx_parameter, void* orig)
     p->Get(NVSDK_NGX_Parameter_OutHeight, &out_h);
     g_opt_user_w.store(user_w); g_opt_user_h.store(user_h);
     note_opt_size(user_w, user_h);
+    int pq = -1;
+    p->Get(NVSDK_NGX_Parameter_PerfQualityValue, &pq);
+    const unsigned int native_w = out_w, native_h = out_h; // NVIDIA's own answer, before ours
 
     bool enabled = na::settings::Get().enabled.load(std::memory_order_acquire) != 0;
     auto mode = static_cast<na::settings::DlssMode>(
@@ -1409,12 +1420,36 @@ int32_t optimal_settings_common(void* ngx_parameter, void* orig)
     }
     g_opt_out_w.store(out_w); g_opt_out_h.store(out_h);
     g_opt_overridden.store(overridden ? 1u : 0u);
+    {
+        std::lock_guard<std::mutex> lock(g_opt_log_m);
+        const uint64_t seq = g_opt_log_seq.load(std::memory_order_relaxed) + 1;
+        OptimalCall& c = g_opt_log[seq % kOptLog];
+        c = {};
+        c.sequence = seq; c.user_w = user_w; c.user_h = user_h; c.perf_quality = static_cast<int32_t>(pq);
+        c.native_w = native_w; c.native_h = native_h; c.out_w = out_w; c.out_h = out_h;
+        c.overridden = overridden ? 1u : 0u; c.rr = orig == g_orig_optimal_rr.load(std::memory_order_acquire) && orig ? 1u : 0u;
+        g_opt_log_seq.store(seq, std::memory_order_release);
+    }
 #else
     (void)ngx_parameter;
 #endif
     return r;
 }
 } // namespace
+
+uint32_t GetOptimalCalls(uint64_t after, OptimalCall* out, uint32_t max)
+{
+    std::lock_guard<std::mutex> lock(g_opt_log_m);
+    const uint64_t last = g_opt_log_seq.load(std::memory_order_acquire);
+    uint64_t first = after + 1;
+    if (last >= kOptLog && first < last - kOptLog + 1) first = last - kOptLog + 1;
+    uint32_t n = 0;
+    for (uint64_t q = first; q <= last && n < max; ++q) {
+        const OptimalCall& c = g_opt_log[q % kOptLog];
+        if (c.sequence == q) out[n++] = c;
+    }
+    return n;
+}
 
 bool OptimalQueriedFor(uint32_t out_w, uint32_t out_h)
 {
