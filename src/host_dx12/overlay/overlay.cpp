@@ -754,11 +754,14 @@ void write_status_line()
     // itself: every thread's stack, a minidump, and Frame Generation off for
     // the next launch.
     static na::freeze::Watchdog watchdog(10000);
-    if (watchdog.Check(pr.presents_game, now)) {
+    // Native-FG games bypass our optional presenter, whose presents_game
+    // remains zero. The host counter advances on both presentation routes.
+    const uint64_t host_presents = g_presents.load(std::memory_order_relaxed);
+    if (watchdog.Check(host_presents, now)) {
         char hl[400];
         int m = snprintf(hl, sizeof(hl), "%02u:%02u:%02u FREEZE detected: the game's presents have not advanced for %llu ms (game_presents=%llu real_presents=%llu fg_active=%u count=%u backlog=%u). Thread stacks follow (innermost first).\r\n",
                          t.wHour, t.wMinute, t.wSecond, static_cast<unsigned long long>(watchdog.StalledMs(now)),
-                         static_cast<unsigned long long>(pr.presents_game), static_cast<unsigned long long>(pr.presents_real), fg.active, fg.last_count, pr.backlog);
+                         static_cast<unsigned long long>(host_presents), static_cast<unsigned long long>(pr.presents_real), fg.active, fg.last_count, pr.backlog);
         if (m > 0) WriteFile(f, hl, static_cast<DWORD>(m), &written, nullptr);
         static na::freeze::Capture cap; // static: not on this thread's stack
         na::freeze::CaptureAllThreads(&cap);
@@ -915,6 +918,7 @@ struct State {
     HANDLE fence_event = nullptr;
     UINT64 fence_next = 1;
     std::vector<FrameCtx> frames;
+    UINT backbuffer_count = 0;
     uint64_t imgui_draws = 0;
     std::vector<UINT64> imgui_slot_fences;
     UINT rtv_stride = 0, srv_stride = 0;
@@ -1334,7 +1338,11 @@ bool ensure_buffers_locked(IDXGISwapChain* sc)
     if (g_state.buffers_ready) return true;
     DXGI_SWAP_CHAIN_DESC desc{};
     if (FAILED(sc->GetDesc(&desc))) return false;
-    UINT count = desc.BufferCount;
+    g_state.backbuffer_count = desc.BufferCount;
+    // Draw-resource lifetime follows submitted overlay draws, not the native
+    // FG swapchain's image index. Allow a short GPU backlog without dropping
+    // the menu, while keeping every allocator/RTV/ImGui slot fenced together.
+    UINT count = (std::max)(8u, desc.BufferCount);
     if (g_state.frames.size() != count) {
         g_state.frames.clear();
         g_state.frames.resize(count);
@@ -1363,14 +1371,14 @@ bool ensure_buffers_locked(IDXGISwapChain* sc)
 
 // The current real back buffer for THIS frame only: fetched, its RTV
 // (re)written, used, and released by the caller before the Present returns.
-bool acquire_back_buffer_locked(IDXGISwapChain* sc, UINT idx, ComPtr<ID3D12Resource>& out)
+bool acquire_back_buffer_locked(IDXGISwapChain* sc, UINT idx, D3D12_CPU_DESCRIPTOR_HANDLE target_rtv, ComPtr<ID3D12Resource>& out)
 {
-    if (idx >= g_state.frames.size()) return false;
+    if (idx >= g_state.backbuffer_count) return false;
     if (FAILED(real_get_buffer(sc, idx, IID_PPV_ARGS(&out)))) return false;
     D3D12_RENDER_TARGET_VIEW_DESC rtv{};
     rtv.Format = g_state.format;
     rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-    g_state.device->CreateRenderTargetView(out.Get(), &rtv, g_state.frames[idx].rtv);
+    g_state.device->CreateRenderTargetView(out.Get(), &rtv, target_rtv);
     return true;
 }
 
@@ -1806,11 +1814,11 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
         OverlayInputScope() { t_overlay_input = true; }
         ~OverlayInputScope() { t_overlay_input = prev; }
     } overlay_input_scope;
-    UINT idx = frame ? static_cast<UINT>(g_frames.load() % g_state.frames.size()) : real_index(sc);
-    if (idx >= g_state.frames.size()) return;
-    FrameCtx& f = g_state.frames[idx];
+    UINT idx = frame ? 0 : real_index(sc);
+    if (!frame && idx >= g_state.backbuffer_count) return;
     if (g_state.imgui_slot_fences.empty()) return;
     const size_t imgui_slot = g_state.imgui_draws % g_state.imgui_slot_fences.size();
+    FrameCtx& f = g_state.frames[imgui_slot];
     if (g_state.fence->GetCompletedValue() < g_state.imgui_slot_fences[imgui_slot]) return;
     // Never wait for game-queue work from inside its Present callback. A
     // driver/engine may release that work only after the callback returns.
@@ -1824,7 +1832,7 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
         rtv.Format = g_state.format;
         rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
         g_state.device->CreateRenderTargetView(frame, &rtv, f.rtv);
-    } else if (!acquire_back_buffer_locked(sc, idx, back_buffer)) return;
+    } else if (!acquire_back_buffer_locked(sc, idx, f.rtv, back_buffer)) return;
 
     apply_input(just_opened);
     if (just_opened) menu_note("menu_open: input applied\r\n");
@@ -2031,7 +2039,7 @@ void on_present(IDXGISwapChain* sc)
     if (!present_prelude(sc, queue)) return;
     na::j2::OnPresent(queue); // one game-frame boundary, never a TEST Present
     UINT idx = real_index(sc);
-    if (idx < g_state.frames.size()) {
+    if (idx < g_state.backbuffer_count) {
         ComPtr<ID3D12Resource> bb; // A71: this frame only
         if (SUCCEEDED(real_get_buffer(sc, idx, IID_PPV_ARGS(&bb)))) process_frame(queue, bb.Get());
     }
