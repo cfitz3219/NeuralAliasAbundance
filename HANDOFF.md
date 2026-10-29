@@ -484,3 +484,6 @@ Opus reviewed c38f7a1 in COMMS. Astra283e1a0 fixes submission mutex/helper-threa
 
 ### 2026-10-29 - Live PBZ NR correction cc0e495
 User283e1a0 test showed0nativeIDs/43399FG calls and preFGNR0, compute/direct route changes with oldPresentNR8764. Corrected optional-ID assumption via NGX legacy/MFG sequence and compute exclusion; register FGownership atcreate.22automated tests pass9.30s, native RTX direct/compute/noID tests clean. Documents/NA-pbz-update.cmd now packagecc0e495, reversible repair from installed283e1a0. No deployment/game operation. Opus owns resolution/model selector; must integrate this commit in combinedpackage. Visual continuity still user-tested, not established by fake-modelGPUtests.
+
+### 2026-10-29 - Opus PR60 reviewed and combined at469e03f
+Integrated Opus012beda/aa88e76 preserving NRcc0e495, corrected query-vs-input relabel, driverenable/globalprofile interpretation, model certainty wording, adapter controls and inplacepresetlogging. Accepted compute illegal-state validation.24focused tests pass plus finalaffectedreruns, fullReleasepass. Documents/NA-pbz-update.cmd targets combined469e03f; repairfrom actual installed283e1a0. No deployment. Legacy duplicate-FG retry remains unresolved; rejected globalPresent identity shortcut. Full COMMS review disposition recorded. User retains live game testing.
