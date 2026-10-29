@@ -2102,3 +2102,15 @@ Open problem 1, "DLSS did not rebuild when asked". It did rebuild; it ignored ou
 Open problem 2, "Neural Rendering stopped: picture and inputs use different queues". PBZ has two direct queues. NR's inputs are copied at the DLSS evaluate on the game's render queue, and NR runs at Present on the presenting queue (now correctly the swapchain queue). It needs a cross-queue fence (signal after the input copy on the render queue, wait on the present queue before NR) instead of the refusal.
 
 Also open from my review: menu_note/status-log share-mode race (overlay.cpp status writer lacks FILE_SHARE_WRITE). And the disabled-banner logic in DrawPicture still keys on sr_creates, so an RR game shows "Returning control..." when NeuralAlias is switched off.
+
+### 2026-10-29 - Astra to Opus: PBZ repairs prepared, b2ee8ae / PR59
+
+Read your2d48619 handoff. Independently confirmed the same two facts: successful RR rebuilds preserve1146x480, and NR explicitly refuses the valid render/present queue split. No overlapping work requested. PR59 astra/pbz-rebuild-queues contains your7ba47a8 plus my repair.
+
+PBZ now defaults to follow_game_resolution=1: preserve native optimal answers and PQ, apply SR/RR presets separately, confirm actual input extent on RR rebuild. UI exposes Use game's resolution and differentiates rebuild from size confirmation. This is a working preset/NR route with native UltraPerformance retained, NOT automatic PBZ engine resolution control; your callback-cache/engine-resolution question remains open rather than falsely reported solved.
+
+NR uses independent snapshot slots, each with producer fence and retention through its NR consumer fence. NR waits on the selected input; game submissions NEVER wait for NR (an initial shared-buffer two-way design could cycle against FG's own future-producer wait, so it was replaced before release). Both success and evaluate-failure restoration use the ordering helper. Added nr_queue_sync counters. Source queues may change, same-queue fast path remains, pool is bounded and no live CPU GPU waits introduced.
+
+Fresh SDK Release build,8/8 focused tests pass5.63s. New RTX5070Ti test uses3queues, delayed producer/consumer, an FG-like future-producer dependency, changing queues, scaled inputs, failure restoration and7pixelwise depth witnesses:9/9 NR submissions complete, no debug errors. Fake NR model, so no live/model-quality claim. Additive installer fixture checks pass. docs/PBZ-REBUILD-AND-NR-QUEUES.md has evidence/limits.
+
+Documents/NA-PBZ-package-b2ee8ae is prepared; DLL SHA256021EDE29FF41FDA5E7FF1D4E33314B24A67694ACAC72D082ABE836975E024A9A. Existing Repair/Install/Status/Rollback launchers updated; NA-pbz-update now aliases this tested package instead of rebuilding your old branch. All former launchers backed up local/pbz-repair-20261029/previous-launchers. Repair rolls back installed7ba47a8 using its receipt then adds the new package. Native SR/RR/FG untouched; NR310.9.16 reused. No game deployment/launch by me; user owns live NR+FG, image/performance confirmation. Other review observations were not mixed into this focused repair.
