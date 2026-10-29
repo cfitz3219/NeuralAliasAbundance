@@ -1148,7 +1148,14 @@ bool ApplyCreateOverridesForFeature(uint32_t feature_id, void* ngx_parameter)
     // Some engines cache their render scale and never query optimal settings
     // on a resize (PBZ). A preset-only request must preserve both that scale
     // and the game's matching quality value, rather than label low-res DLAA.
-    if (!na::settings::Get().follow_game_resolution.load(std::memory_order_acquire)) {
+    // Only when the game takes its render size from DLSS's optimal settings:
+    // otherwise its input stays at the size IT chose, and labelling that input
+    // with our mode (e.g. Balanced on an Ultra Performance input) is just wrong.
+    unsigned int create_out_w = 0, create_out_h = 0;
+    p->Get(NVSDK_NGX_Parameter_OutWidth, &create_out_w);
+    p->Get(NVSDK_NGX_Parameter_OutHeight, &create_out_h);
+    if (!na::settings::Get().follow_game_resolution.load(std::memory_order_acquire) &&
+        OptimalQueriedFor(create_out_w, create_out_h)) {
         p->Set(NVSDK_NGX_Parameter_PerfQualityValue, pq);
         wrote = true;
     }
@@ -1243,6 +1250,23 @@ using PfnOptimalCallback = int32_t(__cdecl*)(void* params);
 std::atomic<void*> g_orig_optimal{nullptr};
 std::atomic<void*> g_orig_optimal_rr{nullptr}; // Ray Reconstruction's DLSSDOptimalSettingsCallback
 std::atomic<uint64_t> g_opt_calls{0};
+// Every display size anyone asked DLSS's optimal-settings callback about (a
+// few distinct sizes: the game's real output, probes such as 1000x1000).
+// A game that never asks about its own output size picks its render size
+// itself, so our answer cannot change it (PBZ: 1146x480 = 3440x1440 / 3).
+constexpr uint32_t kOptSizes = 16;
+std::atomic<uint64_t> g_opt_sizes[kOptSizes]{};
+void note_opt_size(uint32_t w, uint32_t h)
+{
+    if (!w || !h) return;
+    const uint64_t v = (uint64_t(w) << 32) | h;
+    for (auto& e : g_opt_sizes) {
+        uint64_t cur = e.load(std::memory_order_acquire);
+        if (cur == v) return;
+        if (!cur && e.compare_exchange_strong(cur, v, std::memory_order_acq_rel)) return;
+        if (cur == v) return;
+    }
+}
 std::atomic<uint32_t> g_opt_user_w{0}, g_opt_user_h{0}, g_opt_out_w{0},
     g_opt_out_h{0}, g_opt_overridden{0};
 
@@ -1285,6 +1309,7 @@ int32_t optimal_settings_common(void* ngx_parameter, void* orig)
     p->Get(NVSDK_NGX_Parameter_OutWidth, &out_w);
     p->Get(NVSDK_NGX_Parameter_OutHeight, &out_h);
     g_opt_user_w.store(user_w); g_opt_user_h.store(user_h);
+    note_opt_size(user_w, user_h);
 
     bool enabled = na::settings::Get().enabled.load(std::memory_order_acquire) != 0;
     auto mode = static_cast<na::settings::DlssMode>(
@@ -1318,6 +1343,19 @@ int32_t optimal_settings_common(void* ngx_parameter, void* orig)
     return r;
 }
 } // namespace
+
+bool OptimalQueriedFor(uint32_t out_w, uint32_t out_h)
+{
+    if (!out_w || !out_h || out_w == 0xFFFFFFFFu || out_h == 0xFFFFFFFFu) return false;
+    for (const auto& e : g_opt_sizes) {
+        const uint64_t v = e.load(std::memory_order_acquire);
+        if (!v) break;
+        const uint32_t w = uint32_t(v >> 32), h = uint32_t(v);
+        // The generic rebuild nudges the window by one pixel; count that as the same display.
+        if (w + 1 >= out_w && w <= out_w + 1 && h + 1 >= out_h && h <= out_h + 1) return true;
+    }
+    return false;
+}
 
 OptimalStats GetOptimalStats()
 {

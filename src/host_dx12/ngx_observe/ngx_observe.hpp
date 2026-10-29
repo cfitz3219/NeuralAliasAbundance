@@ -83,6 +83,10 @@ struct OptimalStats {
     uint32_t last_overridden;   // 1 if we rewrote the answer
 };
 OptimalStats GetOptimalStats();
+// True if the optimal-settings callback was ever asked about this display size
+// (+-1 px). False for a game that computes its own render size: then a picture
+// mode chosen in NeuralAlias cannot change its resolution, only presets apply.
+bool OptimalQueriedFor(uint32_t out_w, uint32_t out_h);
 
 struct CallRecord {
     uint64_t qpc_ticks;     // QueryPerformanceCounter at detour entry
