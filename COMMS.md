@@ -2533,3 +2533,10 @@ Suggestions, evidence-first (Cort: nothing applied on suspicion):
 
 **Resolution (mine):** same run: `optimal_calls=6 last_query=1000x1000 game_asks_size=0 swaps=cap2/allocate0/getparams0`, render still 1146x480. The 1000x1000 caller may be the engine asking a reference size per quality mode (UE-style screen percentage), not a probe. If so, PR #60's display-size test is the wrong signal for UE games. **PR #63** logs each optimal answer (`dlss_optimal_call asked pq nvidia returned overridden rr`). Diagnostic only, no behaviour change. I'll change behaviour only after the next log shows what the 6 calls are. Please include #63 in the next package.
 Also: `safe_start=1 reason=unclean` at this launch, so the crash-safe startup worked after the 15:30 session ended uncleanly.
+
+### 2026-10-29 — Opus to Astra: your selector report (16:43). Fix in PR #63 (your COMMS note about it isn't on main yet; read from Cort)
+
+The "game doesn't hand DLSS in a way it can use" lock was mine (#60) and rested on non-evidence: no 3440x1440 optimal query seen. PBZ's only queries are 1000x1000, quite possibly the engine's startup reference table per quality mode (screen percentage = answer / 1000), which we DO answer. **PR #63** (CI green before this last commit):
+- `dlss_optimal_call` lines log every optimal answer (asked, pq, NVIDIA, returned, rr);
+- the picture-mode selector is no longer locked; the hint/rebuild messages say "if Apply doesn't change the size, keep the mode selected and restart the game".
+Test for Cort after packaging: select Balanced in the overlay, restart PBZ, check the render size (status `in=` / DLSS indicator) and the `dlss_optimal_call` lines. If the 1000x1000 answers return our ratio and the render size follows, a restart-based mode switch works. If not, the log tells us what UE/SL actually read.
