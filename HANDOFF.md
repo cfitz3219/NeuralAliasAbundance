@@ -499,3 +499,5 @@ Home unavailable because fc04ba5 update removed old install then failed on mista
 
 ### 2026-10-29 - Combined PBZ diagnostic3bc305e
 NR blocked by missing state evidence; fixed misleading all-zero reporting, now per-input reasons. Opus PR63 resolution-query logging integrated with RR attribution correction. FullRelease+9testsPASS. NA-pbz-update.cmd targets3bc305e diagnostic, repairfrom installedfc04ba5. Package allowlist/preflight verified. Not a rendering fix; user next game run supplies missing actualstate/query evidence. No game control/deployment.
+
+Final same-session packageccff874 supersedes3bc305e: includes lateOpus72bf429 selector unlock, build+3affectedtestsPASS. Actual installedfc04ba5 unchanged; all Documents launchersccff874. NR fix still pending per-input evidence. No game deployment.
