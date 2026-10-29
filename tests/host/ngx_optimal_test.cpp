@@ -65,6 +65,24 @@ int main()
     CHECK(p.U(NVSDK_NGX_Parameter_OutWidth) == 2293u);
     CHECK(!p.Has(NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Max_Render_Width));
 
+    // Ray Reconstruction asks its own callback (DLSSDOptimalSettingsCallback):
+    // same parameters, same mode-to-size rule, its own original forwarded.
+    g_orig_result = NVSDK_NGX_Result_Success;
+    na::ngx::SetOriginalOptimalCallbackRRForTest(reinterpret_cast<void*>(&FakeOriginal));
+    st.dlss_mode.store(static_cast<uint32_t>(M::Performance));
+    const int32_t calls_before = g_orig_calls;
+    Ask(p);
+    CHECK(na::ngx::OptimalSettingsCallbackRR(&p) == NVSDK_NGX_Result_Success);
+    CHECK(g_orig_calls == calls_before + 1);
+    CHECK(p.U(NVSDK_NGX_Parameter_OutWidth) == 1720u && p.U(NVSDK_NGX_Parameter_OutHeight) == 720u);
+    CHECK(p.U(NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Min_Render_Width) == 1720u);
+    st.dlss_mode.store(static_cast<uint32_t>(M::UltraPerformance));
+    Ask(p);
+    CHECK(na::ngx::OptimalSettingsCallbackRR(&p) == NVSDK_NGX_Result_Success);
+    CHECK(p.U(NVSDK_NGX_Parameter_OutWidth) == 1152u && p.U(NVSDK_NGX_Parameter_OutHeight) == 480u); // 3440/3 -> 1147 -> 8-aligned
+    std::printf("RR Ultra Performance -> %ux%u\n", p.U(NVSDK_NGX_Parameter_OutWidth), p.U(NVSDK_NGX_Parameter_OutHeight));
+    na::ngx::SetOriginalOptimalCallbackRRForTest(nullptr);
+
     na::ngx::SetOriginalOptimalCallbackForTest(nullptr);
     st.dlss_mode.store(0);
     return test::finish("ngx_optimal_test");

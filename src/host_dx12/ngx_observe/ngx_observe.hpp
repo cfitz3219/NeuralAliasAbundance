@@ -61,12 +61,20 @@ struct EvalParams {
 //    parameters is replaced with ours, which calls the original and then, per
 //    settings.resolution_mode, rewrites OutWidth/OutHeight and the dynamic
 //    min/max so the ENGINE renders at native (DLAA) or a chosen ratio.
-bool ApplyCreateOverrides(void* ngx_parameter);
-// The replacement callback itself (exposed for tests): `original` is the
-// runtime's callback (may be null in tests), `ngx_parameter` the params.
+bool ApplyCreateOverrides(void* ngx_parameter); // DLSS Super Resolution (feature 1)
+// The game's upscaler, whichever it creates: feature 1 (Super Resolution) or 13
+// (Ray Reconstruction, which upscales too and has its own preset keys D/E/F).
+// Any other feature (Frame Generation, ...) is left untouched: returns false.
+bool ApplyCreateOverridesForFeature(uint32_t feature_id, void* ngx_parameter);
+// The replacement callbacks (exposed for tests): Super Resolution's
+// DLSSOptimalSettingsCallback and Ray Reconstruction's DLSSDOptimalSettingsCallback.
+// Both use the same parameters (Width/Height in, OutWidth/OutHeight and the dynamic
+// min/max out), so the same mode-to-size rule applies.
 int32_t OptimalSettingsCallback(void* ngx_parameter);
-// Test hook: installs `original_callback` as the forwarded callback.
+int32_t OptimalSettingsCallbackRR(void* ngx_parameter);
+// Test hooks: install `original_callback` as the forwarded callback.
 void SetOriginalOptimalCallbackForTest(void* original_callback);
+void SetOriginalOptimalCallbackRRForTest(void* original_callback);
 
 struct OptimalStats {
     uint64_t calls;             // times our callback ran
@@ -216,6 +224,7 @@ void RequestReapply();
 // A42 fallback helpers (exposed for tests): clear all six preset hint keys
 // to Default; write back a quality value.
 bool StripPresetHints(void* ngx_parameter);
+bool StripRrPresetHints(void* ngx_parameter); // Ray Reconstruction's six keys to Default
 bool RestoreQualityValue(void* ngx_parameter, uint32_t perf_quality);
 
 // Per-evaluate parameter reads + log records are diagnostics; off by default

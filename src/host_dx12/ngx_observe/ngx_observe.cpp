@@ -27,6 +27,7 @@
 #include <d3d12.h>
 #pragma warning(push, 3)
 #include <nvsdk_ngx_defs.h>
+#include <nvsdk_ngx_defs_dlssd.h> // Ray Reconstruction: preset keys and DLSSDOptimalSettingsCallback
 #include <nvsdk_ngx_params.h>
 #pragma warning(pop)
 #endif
@@ -277,7 +278,9 @@ NgxResult CreateFeatureImpl(CoreSlot& s, void* cmd_list, uint32_t feature_id, vo
     if (feature_id == 11) g_fg_seen.store(1, std::memory_order_release); // NVSDK_NGX_Feature_FrameGeneration
     EvalParams before{};
     ReadEvalParams(params, &before); // the game's own quality value, for the fallback
-    bool overrode = ApplyCreateOverrides(params); // takeover step: write hints
+    // Takeover step: write hints into the game's UPSCALER, whichever it creates
+    // (Super Resolution or Ray Reconstruction); other features are left alone.
+    bool overrode = ApplyCreateOverridesForFeature(feature_id, params);
     EvalParams ep{};
     ReadEvalParams(params, &ep); // read before: capture inputs even on failure
     ep.overridden = overrode ? 1u : 0u;
@@ -287,10 +290,12 @@ NgxResult CreateFeatureImpl(CoreSlot& s, void* cmd_list, uint32_t feature_id, vo
     // made the creation fail, retry without the preset hints; if that still
     // fails, retry with the game's own quality value. Never leave the game
     // without DLSS because of a hint.
-    if (r != 1 && feature_id == 1 && overrode) {
-        if (StripPresetHints(params)) {
+    if (r != 1 && (feature_id == 1 || feature_id == kFeatureRayReconstruction) && overrode) {
+        const bool rr = feature_id == kFeatureRayReconstruction;
+        if (rr ? StripRrPresetHints(params) : StripPresetHints(params)) {
             g_preset_rejected.store(1, std::memory_order_release);
-            na::settings::Get().preset.store(-1, std::memory_order_release); // menu saves this
+            if (rr) na::settings::Get().rr_preset.store(0, std::memory_order_release); // menu saves this
+            else na::settings::Get().preset.store(-1, std::memory_order_release);
             r = g_orig_create(cmd_list, feature_id, params, out_handle);
         }
         if (r != 1 && before.perf_quality != 0xFFFFFFFFu && RestoreQualityValue(params, before.perf_quality)) {
@@ -300,6 +305,15 @@ NgxResult CreateFeatureImpl(CoreSlot& s, void* cmd_list, uint32_t feature_id, vo
         if (r == 1) g_create_recovered.fetch_add(1, std::memory_order_relaxed);
     }
     if (r != 1) g_create_failures.fetch_add(1, std::memory_order_relaxed);
+    if (r == 1 && feature_id == kFeatureRayReconstruction) {
+        // Ray Reconstruction upscales too: the size it was created with is the menu's
+        // "active" evidence, as for Super Resolution. (Not the A46/A63 re-creation
+        // snapshot, which rebuilds a Super Resolution feature.)
+        g_last_sr_in_w.store(ep.in_width, std::memory_order_relaxed);
+        g_last_sr_in_h.store(ep.in_height, std::memory_order_relaxed);
+        g_last_sr_out_w.store(ep.out_width, std::memory_order_relaxed);
+        g_last_sr_out_h.store(ep.out_height, std::memory_order_relaxed);
+    }
     if (r == 1 && feature_id == 1) { // NVSDK_NGX_Result_Success, DLSS super resolution
         // A30: evidence for the menu's "active" state â€” the size the game
         // actually created its DLSS feature with (poison 0xFFFFFFFF = unread).
@@ -1011,10 +1025,13 @@ void RequestReapply()
     if (g_last_sr_handle.load(std::memory_order_acquire)) g_reapply_pending.store(1, std::memory_order_release);
 }
 
-bool ApplyCreateOverrides(void* ngx_parameter)
+bool ApplyCreateOverrides(void* ngx_parameter) { return ApplyCreateOverridesForFeature(1u, ngx_parameter); }
+
+bool ApplyCreateOverridesForFeature(uint32_t feature_id, void* ngx_parameter)
 {
 #if defined(NA_HAVE_NGX_SDK)
     if (!ngx_parameter) return false;
+    if (feature_id != 1u && feature_id != kFeatureRayReconstruction) return false; // FG and others: not ours
     if (!na::settings::Get().enabled.load(std::memory_order_acquire)) return false;
     auto* p = static_cast<NVSDK_NGX_Parameter*>(ngx_parameter);
     bool wrote = false;
@@ -1033,6 +1050,21 @@ bool ApplyCreateOverrides(void* ngx_parameter)
     }
     p->Set(NVSDK_NGX_Parameter_PerfQualityValue, pq);
     wrote = true;
+    if (feature_id == kFeatureRayReconstruction) {
+        // Ray Reconstruction reads its own preset keys; only D, E and F are usable
+        // (the SDK marks the rest "do not use, reverts to default").
+        const int32_t rp = na::settings::Get().rr_preset.load(std::memory_order_acquire);
+        if (rp >= 4 && rp <= 6) {
+            const unsigned int v = static_cast<unsigned int>(rp);
+            p->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA, v);
+            p->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality, v);
+            p->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced, v);
+            p->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Performance, v);
+            p->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraPerformance, v);
+            p->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraQuality, v);
+        }
+        return wrote;
+    }
     int32_t preset = na::settings::Get().preset.load(std::memory_order_acquire);
     if (preset >= 1 && preset <= 13) {
         const unsigned int v = static_cast<unsigned int>(preset);
@@ -1044,6 +1076,26 @@ bool ApplyCreateOverrides(void* ngx_parameter)
         p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality, v);
     }
     return wrote;
+#else
+    (void)feature_id;
+    (void)ngx_parameter;
+    return false;
+#endif
+}
+
+bool StripRrPresetHints(void* ngx_parameter)
+{
+#if defined(NA_HAVE_NGX_SDK)
+    if (!ngx_parameter) return false;
+    auto* p = static_cast<NVSDK_NGX_Parameter*>(ngx_parameter);
+    const unsigned int def = NVSDK_NGX_RayReconstruction_Hint_Render_Preset_Default;
+    p->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA, def);
+    p->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality, def);
+    p->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced, def);
+    p->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Performance, def);
+    p->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraPerformance, def);
+    p->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraQuality, def);
+    return true;
 #else
     (void)ngx_parameter;
     return false;
@@ -1085,6 +1137,7 @@ bool RestoreQualityValue(void* ngx_parameter, uint32_t perf_quality)
 namespace {
 using PfnOptimalCallback = int32_t(__cdecl*)(void* params);
 std::atomic<void*> g_orig_optimal{nullptr};
+std::atomic<void*> g_orig_optimal_rr{nullptr}; // Ray Reconstruction's DLSSDOptimalSettingsCallback
 std::atomic<uint64_t> g_opt_calls{0};
 std::atomic<uint32_t> g_opt_user_w{0}, g_opt_user_h{0}, g_opt_out_w{0},
     g_opt_out_h{0}, g_opt_overridden{0};
@@ -1096,12 +1149,28 @@ void SetOriginalOptimalCallbackForTest(void* original_callback)
 {
     g_orig_optimal.store(original_callback, std::memory_order_release);
 }
+void SetOriginalOptimalCallbackRRForTest(void* original_callback)
+{
+    g_orig_optimal_rr.store(original_callback, std::memory_order_release);
+}
 
+namespace {
+int32_t optimal_settings_common(void* ngx_parameter, void* orig);
+}
 int32_t OptimalSettingsCallback(void* ngx_parameter)
 {
+    return optimal_settings_common(ngx_parameter, g_orig_optimal.load(std::memory_order_acquire));
+}
+int32_t OptimalSettingsCallbackRR(void* ngx_parameter)
+{
+    return optimal_settings_common(ngx_parameter, g_orig_optimal_rr.load(std::memory_order_acquire));
+}
+
+namespace {
+int32_t optimal_settings_common(void* ngx_parameter, void* orig)
+{
     int32_t r = 1; // NVSDK_NGX_Result_Success when no original (tests)
-    if (void* orig = g_orig_optimal.load(std::memory_order_acquire))
-        r = reinterpret_cast<PfnOptimalCallback>(orig)(ngx_parameter);
+    if (orig) r = reinterpret_cast<PfnOptimalCallback>(orig)(ngx_parameter);
     g_opt_calls.fetch_add(1, std::memory_order_relaxed);
 #if defined(NA_HAVE_NGX_SDK)
     if (!ngx_parameter || r < 0) return r;
@@ -1144,6 +1213,7 @@ int32_t OptimalSettingsCallback(void* ngx_parameter)
 #endif
     return r;
 }
+} // namespace
 
 OptimalStats GetOptimalStats()
 {
@@ -1172,6 +1242,16 @@ int32_t GetCapabilityParametersImpl(CoreSlot& s, void** out_params)
             g_orig_optimal.store(cb, std::memory_order_release);
             p->Set(NVSDK_NGX_Parameter_DLSSOptimalSettingsCallback,
                    reinterpret_cast<void*>(&OptimalSettingsCallback));
+        }
+        // Ray Reconstruction asks its own callback for the render size (games with
+        // ray tracing on, e.g. Phantom Blade Zero): same takeover, same rule.
+        void* rr_cb = nullptr;
+        if (p->Get(NVSDK_NGX_Parameter_DLSSDOptimalSettingsCallback, &rr_cb) ==
+                NVSDK_NGX_Result_Success && rr_cb &&
+            rr_cb != reinterpret_cast<void*>(&OptimalSettingsCallbackRR)) {
+            g_orig_optimal_rr.store(rr_cb, std::memory_order_release);
+            p->Set(NVSDK_NGX_Parameter_DLSSDOptimalSettingsCallback,
+                   reinterpret_cast<void*>(&OptimalSettingsCallbackRR));
         }
     }
 #endif

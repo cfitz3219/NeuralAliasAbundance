@@ -112,6 +112,15 @@ static int preset_index(int value)
         if (kPresetValues[i] == value) return i;
     return 0;
 }
+// Ray Reconstruction's own presets: the SDK marks only D, E and F usable.
+static const char* kRrPresets[] = {"Automatic", "D (transformer)", "E (latest transformer)", "F (Ray Reconstruction 2)"};
+static const int kRrPresetValues[] = {0, 4, 5, 6};
+static int rr_preset_index(int value)
+{
+    for (int i = 1; i < 4; ++i)
+        if (kRrPresetValues[i] == value) return i;
+    return 0;
+}
 
 void DrawPicture()
 {
@@ -197,15 +206,30 @@ void DrawPicture()
     BeginGroupBox("picture-group");
     {
         ImGui::BeginDisabled(!enabled || blocked || engine_busy);
-        int preset = st.preset.load();
-        int sel = preset_index(preset);
-        BeginRow("DLSS preset",
-                 "Leave on Automatic unless a particular preset looks better.\nJ and K suit DLAA, Quality and Balanced; L and M are meant for Performance modes.",
-                 DropdownWidth());
-        if (Combo("preset", &sel, kPresets, 5, DropdownWidth())) {
-            st.preset.store(kPresetValues[sel]);
-            note_request();
-            na::settings::Save();
+        // The game's upscaler decides which preset list applies: Ray Reconstruction
+        // (feature 13) has its own keys and only presets D/E/F.
+        const bool rr_upscaler = ngx.rr_seen != 0 && ngx.sr_creates == 0;
+        int sel = 0;
+        if (rr_upscaler) {
+            sel = rr_preset_index(st.rr_preset.load());
+            BeginRow("Ray Reconstruction preset",
+                     "This game upscales with Ray Reconstruction, which has its own models.\nLeave on Automatic unless one looks better. E is required by games that use its depth-of-field guide.",
+                     DropdownWidth());
+            if (Combo("rr_preset", &sel, kRrPresets, 4, DropdownWidth())) {
+                st.rr_preset.store(kRrPresetValues[sel]);
+                note_request();
+                na::settings::Save();
+            }
+        } else {
+            sel = preset_index(st.preset.load());
+            BeginRow("DLSS preset",
+                     "Leave on Automatic unless a particular preset looks better.\nJ and K suit DLAA, Quality and Balanced; L and M are meant for Performance modes.",
+                     DropdownWidth());
+            if (Combo("preset", &sel, kPresets, 5, DropdownWidth())) {
+                st.preset.store(kPresetValues[sel]);
+                note_request();
+                na::settings::Save();
+            }
         }
         EndRow();
         ImGui::EndDisabled();
@@ -219,7 +243,7 @@ void DrawPicture()
             Hint("Automatic lets NVIDIA's software choose.");
         } else {
             snprintf(buf, sizeof(buf), "Preset %s requested. Whether NVIDIA's software uses it is not confirmed.",
-                     kPresets[sel]);
+                     rr_upscaler ? kRrPresets[sel] : kPresets[sel]);
             Hint(buf);
         }
         if (ngx.quality_rejected)
