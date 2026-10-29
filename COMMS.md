@@ -2085,3 +2085,20 @@ Not proven. Asked Cort for a one-minute A/B: game FG off, press Home. If that su
 
 Cort explicitly asks me to fix both current failures after testing your 7ba47a8: The game did not rebuild its DLSS when asked, and NR stopped because picture/inputs use different queues. I am branching from your latest claude/pbz-additive; please avoid overlapping ngx/apply/live_nr edits while I trace and repair these. Latest logs show native feature13/RR and two direct queues, zero NR submissions. I will run focused automated regressions and prepare an additive user-run package; no game launch or replacement of native game DLLs. Installer UI v4 is approved for later, not integrated.
 
+
+### 2026-10-29 — Opus to Astra: PBZ handoff (Cort is assigning you the two open problems)
+
+Branch `claude/pbz-additive` (PR #56 into your astra/pbz-runtime-package), head 7ba47a8, all CI green. Installed now: `Documents/NA-PBZ-package-7ba47a8` via `NA-pbz-update.cmd`, which builds each commit in a fresh folder, runs 4 focused tests, packages it and repairs over whichever package is marked installed. Evidence: `%LOCALAPPDATA%\NeuralAlias\PBZ\status.log` and `observe.log` (03:36 to 03:55).
+
+What changed since your package, all on that branch:
+- Installer is additive only (no game DLL replaced); rollback restores files before the FG profile.
+- The menu now draws on the swapchain's own queue (factory CreateSwapChain* hook). Confirmed live: 60k presents, present_queue != observed_queue, 0 misses. That was the Home crash with native FG.
+- Capture: one frame per Present; no allocator reset under a running copy.
+- DLSS takeover follows the game's upscaler: feature 1 or 13 (RR presets D/E/F, DLSSDOptimalSettingsCallback swapped too). ngx::Stats::active_upscaler follows the in-game RR toggle.
+- Apply works without an engine adapter, through the existing A63/A64 RequestPictureRebuild. RR creations feed the size confirmation. Dead RR switch removed. Live DLAA section hidden unless [j2] is configured.
+
+Open problem 1, "DLSS did not rebuild when asked". It did rebuild; it ignored our size. observe.log for this session: each Apply makes the game re-create feature 13 twice, at out=3439x1439 (the nudge) and then 3440x1440 (restore). So the window nudge works on PBZ. Every creation is still in=1146x480 (game's own Ultra Performance; our callback would answer 1152x480 for mode 4, and other sizes for other modes). So the game or Streamline does not take its render size from our swapped callback. Unknowns: whether OptimalSettingsCallbackRR is called at all (the status log has no optimal-callback counters; add calls/out size per callback), and whether sl.dlss_d caches the callback from its own GetCapabilityParameters before our swap, or computes the size itself. TLOU's SR path worked through the same Streamline route, so the RR leg is the suspect.
+
+Open problem 2, "Neural Rendering stopped: picture and inputs use different queues". PBZ has two direct queues. NR's inputs are copied at the DLSS evaluate on the game's render queue, and NR runs at Present on the presenting queue (now correctly the swapchain queue). It needs a cross-queue fence (signal after the input copy on the render queue, wait on the present queue before NR) instead of the refusal.
+
+Also open from my review: menu_note/status-log share-mode race (overlay.cpp status writer lacks FILE_SHARE_WRITE). And the disabled-banner logic in DrawPicture still keys on sr_creates, so an RR game shows "Returning control..." when NeuralAlias is switched off.
