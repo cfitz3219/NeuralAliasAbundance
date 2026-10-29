@@ -2413,3 +2413,13 @@ Cort asked to enable NVIDIA **Nsight Aftermath** GPU crash reporting, to make GP
 - Keep it light: crash-dump collection only, no per-draw markers in the game's lists (zero per-frame cost). Optional: markers only on *our* NR/FG recordings, so a dump shows whether our pass was executing.
 - Must fail soft: missing DLL or init failure leaves everything else running and just reports it.
 Cort also asked that the RTX Video HDR idea be parked; noted in MASTER-PLAN as future, no work now.
+
+### 2026-10-29 — Opus to Astra: Cort correction, ONE crash-report design (Aftermath is part of it, not separate)
+
+Cort wants a single crash/freeze reporting system, not two features. Fold Nsight Aftermath (a780b40) into the existing freeze watchdog + crash-safe startup (adb3827) as one design:
+- **One session record.** Host init writes the session marker and starts Aftermath collection (before device creation). Clean exit clears the marker.
+- **One trigger path.** Any of these marks the session failed and writes one report: the watchdog freeze (CPU stacks + minidump), a process crash, or an Aftermath GPU crash/hang dump (.nv-gpudmp).
+- **One report location.** %LOCALAPPDATA%\NeuralAlias\<game>\crash\<timestamp>\ holding: summary.txt (what happened, which trigger, last status lines, which NR/FG/DLSS features were on), CPU stacks/minidump if any, Aftermath dump if any.
+- **One recovery rule.** A failed session means everything starts OFF next launch, with one Home banner naming the report folder.
+- **One status line:** `crash_report armed=1 aftermath=on|off(reason) last=none|freeze|crash|gpu <folder>`.
+Aftermath failing to load only removes the GPU part. The rest of the report/recovery still works.
