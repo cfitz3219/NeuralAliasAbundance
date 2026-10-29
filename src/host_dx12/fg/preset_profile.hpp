@@ -26,5 +26,9 @@ struct UpscalerOverrides {
     bool RrForced() const { return available && rr_enabled == 1 && rr_preset != 0; }
 };
 void ReadUpscalerOverrides(); // init thread only (DRS session); never writes
+// Menu thread: ask a background worker to re-read the overrides (throttled to
+// one read per 2 s), so a change made in the NVIDIA app while the game runs is
+// reflected when the menu is opened. Never blocks; never writes.
+void RequestUpscalerOverridesRefresh();
 UpscalerOverrides GetUpscalerOverrides();
 }

@@ -194,6 +194,15 @@ void DrawPicture()
                  kModes[mode]);
         text = buf;
     }
+    // An NVIDIA app override takes DLSS model control away from NeuralAlias;
+    // say so where it is seen first, not only under the preset row.
+    {
+        const auto drv = na::fg::preset::GetUpscalerOverrides();
+        if (enabled && conn == Conn::Connected && (ngx.active_upscaler == 13 ? drv.RrForced() : drv.SrForced())) {
+            state = 2;
+            text = "The NVIDIA app is overriding the DLSS model for this game. Set its DLSS Override to \"Use 3D app setting\" so NeuralAlias can control it (details under DLSS preset).";
+        }
+    }
     StatusBanner(state, text);
 
     // Master switch.
@@ -276,8 +285,8 @@ void DrawPicture()
         const auto drv = na::fg::preset::GetUpscalerOverrides();
         if (rr_upscaler ? drv.RrForced() : drv.SrForced()) {
             StatusLine(2, rr_upscaler
-                ? "A driver Ray Reconstruction model override is configured. It may replace this preset request. Check DLSS Override in the NVIDIA app."
-                : "A driver DLSS model override is configured. It may replace this preset request. Check DLSS Override (Super Resolution model presets) in the NVIDIA app.");
+                ? "The NVIDIA app is overriding the Ray Reconstruction model, so NeuralAlias cannot control it. In the NVIDIA app, open this game's settings and set DLSS Override (Ray Reconstruction) to \"Use 3D app setting\", then restart the game."
+                : "The NVIDIA app is overriding the DLSS model, so NeuralAlias cannot control it. In the NVIDIA app, open this game's settings and set DLSS Override (Super Resolution model presets) to \"Use 3D app setting\", then restart the game.");
         } else if (ngx.preset_rejected) {
             // The runtime refused a preset hint; the detour already reset the
             // setting in memory (A42). Persist it and say so.

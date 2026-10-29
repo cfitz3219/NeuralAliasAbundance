@@ -217,6 +217,31 @@ void ReadUpscalerOverrides() {
     std::lock_guard<std::mutex> lock(upscaler_mutex); upscaler_overrides = out;
 }
 UpscalerOverrides GetUpscalerOverrides() { std::lock_guard<std::mutex> lock(upscaler_mutex); return upscaler_overrides; }
+namespace {
+std::atomic<HANDLE> refresh_event{nullptr};
+std::atomic<ULONGLONG> last_refresh{0};
+std::once_flag refresh_once;
+DWORD WINAPI refresh_worker(void*) {
+    for (;;) {
+        HANDLE e = refresh_event.load();
+        if (!e || WaitForSingleObject(e, INFINITE) != WAIT_OBJECT_0) return 0;
+        ReadUpscalerOverrides();
+    }
+}
+}
+void RequestUpscalerOverridesRefresh() {
+    const ULONGLONG now = GetTickCount64();
+    ULONGLONG prev = last_refresh.load();
+    if (now - prev < 2000 || !last_refresh.compare_exchange_strong(prev, now)) return;
+    std::call_once(refresh_once, [] {
+        HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!e) return;
+        refresh_event.store(e);
+        HANDLE t = CreateThread(nullptr, 0, refresh_worker, nullptr, 0, nullptr);
+        if (t) CloseHandle(t); else { refresh_event.store(nullptr); CloseHandle(e); }
+    });
+    if (HANDLE e = refresh_event.load()) SetEvent(e);
+}
 }
 
 #ifdef NA_PROFILE_CLI

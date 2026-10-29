@@ -1675,6 +1675,7 @@ void draw_details_technical()
 
 void draw_panel(bool just_opened)
 {
+    if (just_opened) na::fg::preset::RequestUpscalerOverridesRefresh(); // NVIDIA app changes made while playing
     using namespace na::ui;
     using na::menu::Page;
     ImGuiIO& io = ImGui::GetIO();
