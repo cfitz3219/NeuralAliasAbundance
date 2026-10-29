@@ -247,3 +247,8 @@ Integrated Opus916548a, inspected consumer learning/live matching and render-pas
 ## 2026-10-27 — user testing handoff
 
 At Cort's instruction built but did not test. Installed combined consumer-anchor DLL260DFADB... into closed SER with automatic route/inline override disabled. Exact prior DLL/INI backup, rollback script and manifest local/ser-user-postentry-20261027. No game launch or test execution. COMMS-Continuation records user live ownership and unperformed validation; preparation complete, flicker outcome unverified.
+
+## 2026-10-29 — Installer design documentation only
+
+Recorded Cort's complete carousel/feature-selector/action-bar/overlay requirements in docs/INSTALLER-CAROUSEL-DESIGN.md. Separated assistant suggestions and earlier installer reuse ideas from user requirements; noted unresolved presentation choices without creating implementation tasks. User explicitly says not to build yet. No code/game/deployment changes or tests; documentation inspection only. No user attendance required.
+
