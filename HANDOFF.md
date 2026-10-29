@@ -496,3 +496,6 @@ Reviewed/integrated Opus PR62; public parameter paths and stable per-original ca
 
 ### 2026-10-29 - Corrected PBZ package after failed update
 Home unavailable because fc04ba5 update removed old install then failed on mistakenly manifested Repair.log, leaving no injector. Corrected existing fc04ba5 package with installerb61a244; runtime unchanged. Explicit payload manifest, preflight before rollback, PS5.1 defaults fixed; actual package validation with locked transcript passes plus fixture regression. User reruns NA-pbz-update.cmd with PBZ closed. No autonomous deployment. See COMMS and preserved local/pbz-package-home-failure-20261029.
+
+### 2026-10-29 - Combined PBZ diagnostic3bc305e
+NR blocked by missing state evidence; fixed misleading all-zero reporting, now per-input reasons. Opus PR63 resolution-query logging integrated with RR attribution correction. FullRelease+9testsPASS. NA-pbz-update.cmd targets3bc305e diagnostic, repairfrom installedfc04ba5. Package allowlist/preflight verified. Not a rendering fix; user next game run supplies missing actualstate/query evidence. No game control/deployment.
