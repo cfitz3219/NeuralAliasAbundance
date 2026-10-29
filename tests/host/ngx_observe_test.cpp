@@ -107,6 +107,7 @@ int wmain(int argc, wchar_t** argv)
     CHECK(s1.releases - s0.releases == 1);
     CHECK(s1.shutdowns - s0.shutdowns == 1);
     CHECK(s1.rr_seen == 1); // feature 13 = Ray Reconstruction was requested (even though it failed)
+    CHECK(s1.active_upscaler == 1); // ...but the game's CURRENT upscaler is the one that was created: Super Resolution
     CHECK(s1.module_attached == 1);
     CHECK(state()->inits == 1 && state()->creates == 2 && state()->evaluates == 6);
 

@@ -177,6 +177,7 @@ std::mutex g_confirm_m;
 confirm::Monitor g_confirm;
 confirm::FeatureFlags g_feature_flags; // A68: creation flags per game handle (guarded by g_confirm_m)
 std::atomic<uint32_t> g_rr_seen{0};
+std::atomic<uint32_t> g_active_upscaler{0}; // 1 or 13: the game's most recent successful upscaler creation
 std::atomic<uint32_t> g_fg_seen{0};
 std::atomic<HMODULE> g_hooked_module{nullptr};
 std::atomic<uint64_t> g_sr_creates{0};
@@ -305,6 +306,8 @@ NgxResult CreateFeatureImpl(CoreSlot& s, void* cmd_list, uint32_t feature_id, vo
         if (r == 1) g_create_recovered.fetch_add(1, std::memory_order_relaxed);
     }
     if (r != 1) g_create_failures.fetch_add(1, std::memory_order_relaxed);
+    if (r == 1 && (feature_id == 1 || feature_id == kFeatureRayReconstruction))
+        g_active_upscaler.store(feature_id, std::memory_order_release); // the game's upscaler NOW
     if (r == 1 && feature_id == kFeatureRayReconstruction) {
         // Ray Reconstruction upscales too: the size it was created with is the menu's
         // "active" evidence, as for Super Resolution. (Not the A46/A63 re-creation
@@ -1497,6 +1500,7 @@ Stats GetStats()
     Stats s{};
     s.core_preloaded = g_core_preloaded.load(std::memory_order_acquire);
     s.rr_seen = g_rr_seen.load(std::memory_order_acquire);
+    s.active_upscaler = g_active_upscaler.load(std::memory_order_acquire);
     s.fg_seen = g_fg_seen.load(std::memory_order_acquire);
     s.inits = g_inits.load(std::memory_order_relaxed);
     s.creates = g_creates.load(std::memory_order_relaxed);

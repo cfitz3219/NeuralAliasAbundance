@@ -208,7 +208,7 @@ void DrawPicture()
         ImGui::BeginDisabled(!enabled || blocked || engine_busy);
         // The game's upscaler decides which preset list applies: Ray Reconstruction
         // (feature 13) has its own keys and only presets D/E/F.
-        const bool rr_upscaler = ngx.rr_seen != 0 && ngx.sr_creates == 0;
+        const bool rr_upscaler = ngx.active_upscaler == 13; // what the game uses NOW (follows its RR toggle)
         int sel = 0;
         if (rr_upscaler) {
             sel = rr_preset_index(st.rr_preset.load());
@@ -256,7 +256,7 @@ void DrawPicture()
         static bool rebuild_refused = false;
         static uint32_t rebuild_attempts_at = 0;
         // Any game upscaler counts: plain DLSS (feature 1) or Ray Reconstruction (13).
-        const bool have_upscaler = ngx.sr_creates != 0 || ngx.rr_seen != 0;
+        const bool have_upscaler = ngx.active_upscaler != 0;
         // A game with a hand-written engine adapter (TLOU) changes its own picture
         // mode; every other game gets the generic rebuild (A63/A64): the window is
         // nudged by one pixel and back, the engine re-creates its render targets and
@@ -272,7 +272,7 @@ void DrawPicture()
             // Plain DLSS can take a new PRESET in place (A46). A size change, or any
             // change while the game uses Ray Reconstruction, needs the game to
             // re-create its DLSS feature.
-            const bool in_place = size_matches && ngx.sr_creates != 0 && !rr_upscaler;
+            const bool in_place = size_matches && ngx.active_upscaler == 1;
             if (in_place) {
                 na::ngx::RequestReapply();
                 g_apply_ok_at = ngx.reapplies;
@@ -563,13 +563,14 @@ void DrawDlssInUseRow()
 {
     using namespace na::ui;
     na::ngx::Stats ngx = na::ngx::GetStats();
-    const bool rr = ngx.rr_seen != 0, sr = ngx.sr_creates != 0;
-    const char* badge = rr && sr ? "BOTH SEEN" : rr ? "RAY RECONSTRUCTION" : sr ? "SUPER RESOLUTION" : "NOT YET SEEN";
+    // The upscaler the game is using NOW (its most recent DLSS creation): many games
+    // offer ray reconstruction as a toggle, and switching it re-creates DLSS.
+    const bool rr = ngx.active_upscaler == 13, sr = ngx.active_upscaler == 1;
+    const char* badge = rr ? "RAY RECONSTRUCTION" : sr ? "SUPER RESOLUTION" : "NOT YET SEEN";
     const char* help =
-        rr && sr ? "The game has used both: plain DLSS upscaling and Ray Reconstruction (its ray-traced DLSS). It switches when its ray-tracing settings change."
-        : rr     ? "The game upscales with Ray Reconstruction, the DLSS that also cleans up its ray-traced lighting. Turning ray reconstruction off in the game's settings switches it to plain DLSS."
-        : sr     ? "The game upscales with plain DLSS Super Resolution."
-                 : "The game has not started DLSS yet. Enable DLSS in its video settings.";
+        rr   ? "The game is using Ray Reconstruction now (its ray-traced DLSS, switched on in its settings). Turn it off there and the game switches to plain DLSS; NeuralAlias follows either way."
+        : sr ? "The game is using plain DLSS Super Resolution now. If it offers Ray Reconstruction, turning that on switches DLSS over; NeuralAlias follows either way."
+             : "The game has not started DLSS yet. Enable DLSS in its video settings.";
     BeginRow("DLSS in use", help, BadgeWidth(badge));
     Badge(badge);
     EndRow();

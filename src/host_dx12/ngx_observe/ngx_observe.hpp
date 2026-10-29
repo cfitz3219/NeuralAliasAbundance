@@ -111,7 +111,11 @@ struct Stats {
     uint32_t hooked_functions;  // how many exports were found and hooked
     uint32_t module_attached;   // 0/1
     uint32_t core_preloaded;    // 0/1 PreloadAndHookNgxCore succeeded
-    uint32_t rr_seen;           // 0/1 the game created a Ray Reconstruction feature
+    uint32_t rr_seen;           // 0/1 the game created a Ray Reconstruction feature (ever)
+    // The game's CURRENT upscaler: the feature id of its most recent successful
+    // upscaler creation, 1 (Super Resolution) or 13 (Ray Reconstruction); 0 = none
+    // yet. Follows in-game toggles (ray reconstruction on/off re-creates DLSS).
+    uint32_t active_upscaler;
     uint32_t fg_seen;           // 0/1 the game created a Frame Generation feature (id 11)
     // A30 menu evidence: successful DLSS super-resolution feature creations
     // and the sizes the LAST one was created with (0xFFFFFFFF = not read).
