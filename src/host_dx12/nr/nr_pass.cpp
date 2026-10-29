@@ -1,4 +1,5 @@
 #include "host_dx12/nr/nr_pass.hpp"
+#include "host_dx12/nr/fg_composition.hpp"
 #include "host_dx12/depth_format.hpp"
 
 #include <d3dcompiler.h>
@@ -151,6 +152,7 @@ struct State {
     std::atomic<uint32_t> wants_inputs{0};
     // Device objects (game device).
     ComPtr<ID3D12Device> device;
+    bool device_ready = false;
     ComPtr<ID3D12GraphicsCommandList> list;
     Frame frames[kRing];
     uint32_t frame_index = 0;
@@ -337,7 +339,8 @@ bool compile(const char* entry, ComPtr<ID3D12PipelineState>& pso)
 
 bool ensure_device_locked(ID3D12Device* dev)
 {
-    if (g.device) return true;
+    if (g.device) return g.device_ready && g.device.Get() == dev;
+    g.device_ready = false;
     g.device = dev;
     for (Frame& f : g.frames)
         if (FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&f.alloc)))) return false;
@@ -402,8 +405,12 @@ bool ensure_device_locked(ID3D12Device* dev)
     bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
     bd.SampleDesc.Count = 1;
     bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    return SUCCEEDED(dev->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
+    g.device_ready = SUCCEEDED(dev->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
                                                   nullptr, IID_PPV_ARGS(&g.query_readback)));
+    // Prepare the separate FG composition route here, away from the native
+    // FG callback. Failure must not disable the existing non-FG NR route.
+    if (g.device_ready) PrepareFgComposition(dev);
+    return g.device_ready;
 }
 
 void write_srv(uint32_t slot, ID3D12Resource* r, DXGI_FORMAT fmt)
@@ -1274,6 +1281,7 @@ void Shutdown()
     for (Frame& f : g.frames) { f.alloc.Reset(); f.depth.Reset(); f.motion.Reset(); f.fence_value = 0; }
     g.fence.Reset();
     g.device.Reset();
+    g.device_ready = false;
     g.have_inputs = 0;
     g.inputs_fresh = 0;
     g.in_w = g.in_h = g.width = g.height = 0;

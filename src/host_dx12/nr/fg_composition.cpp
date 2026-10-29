@@ -60,11 +60,12 @@ std::mutex cache_mutex;
 ComPtr<ID3D12Device> cached_device;
 ComPtr<ID3D12RootSignature> cached_root;
 ComPtr<ID3D12PipelineState> cached_pipeline;
-bool Pipeline(ID3D12Device* device, ComPtr<ID3D12RootSignature>& root, ComPtr<ID3D12PipelineState>& pipeline) {
+bool Pipeline(ID3D12Device* device, ComPtr<ID3D12RootSignature>& root, ComPtr<ID3D12PipelineState>& pipeline, bool prepare) {
     std::lock_guard<std::mutex> lock(cache_mutex);
     if (cached_device.Get() == device && cached_pipeline) {
         root = cached_root; pipeline = cached_pipeline; return true;
     }
+    if (!prepare) return false;
     D3D12_DESCRIPTOR_RANGE ranges[2]{};
     ranges[0] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV,4,0,0,0};
     ranges[1] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV,2,0,0,4};
@@ -97,6 +98,25 @@ bool Output(ID3D12Device* device,uint32_t w,uint32_t h,DXGI_FORMAT format,ComPtr
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,nullptr,IID_PPV_ARGS(&out)));
 }
 }
+bool PrepareFgComposition(ID3D12Device* device) {
+    if (!device) return false;
+    ComPtr<ID3D12RootSignature> root;
+    ComPtr<ID3D12PipelineState> pipeline;
+    return Pipeline(device,root,pipeline,true);
+}
+bool FgComposition::SetCompletion(ID3D12Fence* fence,uint64_t value) {
+    if (!recorded_ || !fence || !value || value==UINT64_MAX ||
+        (completion_ && (completion_.Get()!=fence || value<completion_value_))) return false;
+    completion_=fence; completion_value_=value; return true;
+}
+bool FgComposition::TryRecycle() {
+    if (!recorded_ || !completion_) return false;
+    const auto done=completion_->GetCompletedValue();
+    if (done==UINT64_MAX || done<completion_value_) return false;
+    for (auto& input:inputs_) input.Reset();
+    recorded_=false; outputs_readable_=true; completion_.Reset(); completion_value_=0;
+    return true;
+}
 bool FgComposition::Record(ID3D12GraphicsCommandList* list,uint32_t w,uint32_t h,
     CompositionSurface b,CompositionSurface h0,CompositionSurface e,CompositionSurface a,UiComposition mode) {
     if (recorded_ || !list || !w || !h || !Fits(b,w,h) || !Fits(h0,w,h) || !Fits(e,w,h)) return false;
@@ -113,10 +133,20 @@ bool FgComposition::Record(ID3D12GraphicsCommandList* list,uint32_t w,uint32_t h
             !(af==DXGI_FORMAT_R8_UNORM || af==DXGI_FORMAT_R16_UNORM || af==DXGI_FORMAT_R16_FLOAT || af==DXGI_FORMAT_R32_FLOAT)) return false;
     }
     ComPtr<ID3D12Device> device;
-    if (FAILED(list->GetDevice(IID_PPV_ARGS(&device))) || !Pipeline(device.Get(),root_,pipeline_) ||
-        !Output(device.Get(),w,h,bf,full_) || !Output(device.Get(),w,h,hf,hudless_)) return false;
+    if (FAILED(list->GetDevice(IID_PPV_ARGS(&device))) ||
+        !Pipeline(device.Get(),root_,pipeline_,false)) return false;
+    if (!full_ || device_.Get()!=device.Get() || full_->GetDesc().Width!=w || full_->GetDesc().Height!=h ||
+        full_->GetDesc().Format!=bf || hudless_->GetDesc().Format!=hf) {
+        // Build replacements transactionally. An allocation failure leaves a
+        // retired packet reusable, without half replacing its output pair.
+        ComPtr<ID3D12Resource> full,hudless;
+        if (!Output(device.Get(),w,h,bf,full) || !Output(device.Get(),w,h,hf,hudless)) return false;
+        full_=full; hudless_=hudless; outputs_readable_=false;
+    }
+    if (device_.Get()!=device.Get()) heap_.Reset();
+    device_=device;
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,6,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
-    if (FAILED(device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&heap_)))) return false;
+    if (!heap_ && FAILED(device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&heap_)))) return false;
     auto cpu=heap_->GetCPUDescriptorHandleForHeapStart();
     const auto stride=device->GetDescriptorHandleIncrementSize(hd.Type);
     CompositionSurface sources[]={b,h0,e,a};
@@ -133,6 +163,15 @@ bool FgComposition::Record(ID3D12GraphicsCommandList* list,uint32_t w,uint32_t h
         device->CreateUnorderedAccessView(out,nullptr,&uav,cpu); cpu.ptr+=stride;
     }
     const Constants c{w,h,static_cast<uint32_t>(mode),0,b.x,b.y,h0.x,h0.y,e.x,e.y,a.x,a.y};
+    if (outputs_readable_) {
+        D3D12_RESOURCE_BARRIER reuse[2]{};
+        for (uint32_t i=0;i<2;++i) {
+            reuse[i].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            reuse[i].Transition={outputs[i],D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+        }
+        list->ResourceBarrier(2,reuse);
+    }
     ID3D12DescriptorHeap* heaps[]={heap_.Get()}; list->SetDescriptorHeaps(1,heaps);
     list->SetComputeRootSignature(root_.Get()); list->SetPipelineState(pipeline_.Get());
     list->SetComputeRootDescriptorTable(0,heap_->GetGPUDescriptorHandleForHeapStart());

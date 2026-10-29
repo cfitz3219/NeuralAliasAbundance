@@ -70,9 +70,21 @@ int Check(test::Device& d,UiComposition mode) {
         src.pResource=outputs[i]; src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         dst.pResource=readback[i].Get(); dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint=fp[i];
         list.list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
+        std::swap(barrier.Transition.StateBefore,barrier.Transition.StateAfter);
+        list.list->ResourceBarrier(1,&barrier); // return to the packet's documented resting state
     }
     REQUIRE(SUCCEEDED(list.list->Close()));
-    ID3D12CommandList* lists[]={list.list.Get()}; d.queue->ExecuteCommandLists(1,lists); d.WaitIdle();
+    test::ComPtr<ID3D12Fence> gate,completed;
+    REQUIRE(SUCCEEDED(d.device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&gate))));
+    REQUIRE(SUCCEEDED(d.device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&completed))));
+    CHECK(!packet.TryRecycle()); // no submission receipt yet
+    REQUIRE(SUCCEEDED(d.queue->Wait(gate.Get(),1)));
+    ID3D12CommandList* lists[]={list.list.Get()}; d.queue->ExecuteCommandLists(1,lists);
+    REQUIRE(SUCCEEDED(d.queue->Signal(completed.Get(),1)));
+    REQUIRE(packet.SetCompletion(completed.Get(),1));
+    CHECK(!packet.TryRecycle()); // actual GPU use held behind the test gate
+    CHECK(!packet.Record(list.list.Get(),3,2,b.surface,h.surface,e.surface,a.surface,mode));
+    REQUIRE(SUCCEEDED(gate->Signal(1))); d.WaitIdle();
     REQUIRE(d.device->GetDeviceRemovedReason()==S_OK);
     for(uint32_t i=0;i<2;++i) {
         void* data=nullptr; REQUIRE(SUCCEEDED(readback[i]->Map(0,nullptr,&data)));
@@ -83,6 +95,21 @@ int Check(test::Device& d,UiComposition mode) {
         }
         readback[i]->Unmap(0,nullptr);
     }
+    REQUIRE(packet.TryRecycle());
+    list.Reset();
+    REQUIRE(packet.Record(list.list.Get(),3,2,b.surface,h.surface,e.surface,a.surface,mode));
+    CHECK(packet.Full()==outputs[0] && packet.Hudless()==outputs[1]); // same committed textures, not fresh allocations
+    REQUIRE(SUCCEEDED(list.list->Close())); d.queue->ExecuteCommandLists(1,lists);
+    REQUIRE(SUCCEEDED(d.queue->Signal(completed.Get(),2)));
+    REQUIRE(packet.SetCompletion(completed.Get(),2)); d.WaitIdle();
+    REQUIRE(packet.TryRecycle());
+    list.Reset();
+    REQUIRE(packet.Record(list.list.Get(),2,1,b.surface,h.surface,e.surface,a.surface,mode));
+    CHECK(packet.Full()->GetDesc().Width==2 && packet.Hudless()->GetDesc().Height==1);
+    REQUIRE(SUCCEEDED(list.list->Close())); d.queue->ExecuteCommandLists(1,lists);
+    REQUIRE(SUCCEEDED(d.queue->Signal(completed.Get(),3)));
+    REQUIRE(packet.SetCompletion(completed.Get(),3)); d.WaitIdle();
+    REQUIRE(packet.TryRecycle());
     std::printf("composition mode %u: transparent/translucent/opaque, independent origins, HDR values and alpha checked\n",static_cast<unsigned>(mode));
     return 0;
 }
@@ -90,6 +117,7 @@ int main() {
     test::ComPtr<ID3D12Debug> debug;
     if(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) debug->EnableDebugLayer();
     test::Device d; if(!test::CreateDevice(d)) return test::SkipNoDevice("nr_fg_composition_test");
+    REQUIRE(na::nr::PrepareFgComposition(d.device.Get()));
     test::ComPtr<ID3D12InfoQueue> info; d.device.As(&info);
     for(auto mode:{UiComposition::EqualPixels,UiComposition::AlphaRed,UiComposition::UiAlpha}) if(int r=Check(d,mode)) return r;
     if(info) for(UINT64 i=0;i<info->GetNumStoredMessages();++i) {
