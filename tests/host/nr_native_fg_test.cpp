@@ -151,7 +151,7 @@ int main(){
     CHECK(na::nr::native::GetStatus().gpu_samples>0);
     REQUIRE(Frame(1,W,DXGI_FORMAT_R32G32B32A32_FLOAT,true)==0); // discard and retry same identity
     REQUIRE(Frame(1)==0);
-    for(uint64_t i=2;i<24;++i)REQUIRE(Frame(i,i%2?W:W+2)==0); // pool recycling + quality/extent changes
+    for(uint64_t i=2;i<24;++i)REQUIRE(Frame(i,i<18 || i%2?W:W+2)==0); // stable feature pool recycling, then quality/extent changes
     REQUIRE(Frame(24,W,DXGI_FORMAT_R32G32B32A32_FLOAT,false,false,false)==0);
     REQUIRE(Frame(25)==0); // off/on
     fail=true;REQUIRE(Frame(26)==0);fail=false;REQUIRE(Frame(26)==0); // failed recorded evaluation retires before retry

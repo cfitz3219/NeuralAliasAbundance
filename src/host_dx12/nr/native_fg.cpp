@@ -55,6 +55,7 @@ struct Feature {
     ComPtr<ID3D12Device> device;
     DXGI_FORMAT format=DXGI_FORMAT_UNKNOWN;
     const void* core=nullptr;
+    uint64_t signature=0,last_frame=0;
     ~Feature() {
         na::dlss::InjectorCallScope origin;
         if(handle && rt.release_feature) reinterpret_cast<ObjectFn>(rt.release_feature)(handle);
@@ -297,6 +298,12 @@ void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,
         ctx->feature=packet->feature;
     } else packet->feature=ctx->feature;
     auto& n=*packet->feature; auto* p=n.params;const auto& st=settings::Get();
+    const uint64_t signature=st.nr_intensity.load() | (uint64_t(st.nr_structure.load())<<8) |
+        (uint64_t(st.nr_tone.load())<<16) | (uint64_t(st.nr_skin.load())<<24) | (uint64_t(st.nr_paper_white.load())<<32);
+    // A skipped real image or changed reconstruction settings invalidates NR's
+    // temporal history even when the game's own FG history did not reset.
+    n.reset=n.reset || signature!=n.signature || f.frame_id-n.last_frame!=1;
+    n.signature=signature;
     packet->refs[0]=f.color.resource;packet->refs[1]=f.hudless.resource;packet->refs[2]=f.depth.resource;packet->refs[3]=f.motion.resource;
     if(!packet->queries) {
         D3D12_QUERY_HEAP_DESC qd{D3D12_QUERY_HEAP_TYPE_TIMESTAMP,2,0};
@@ -317,7 +324,7 @@ void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,
     const FgRegion compact{0,0,n.w,n.h,15};SetRegion(p,"Color",mode?compact:f.hudless.region);
     SetRegion(p,"Depth",f.depth.region);SetRegion(p,"MVec",f.motion.region);SetRegion(p,"Output",compact);
     if(!Good(reinterpret_cast<EvaluateFn>(n.rt.evaluate_feature)(list,n.handle,p,nullptr))){n.reset=true;ctx->feature.reset();Reason("Neural Rendering pre-FG evaluation failed.");return;}
-    n.reset=false;++status.evaluates;
+    n.reset=false;n.last_frame=f.frame_id;++status.evaluates;
     Barrier(list,n.nr.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     const bool converted=!mode || packet->output.Record(list,true,original,n.nr.Get(),n.color.Get(),n.enhanced.Get(),mode,static_cast<float>(st.nr_paper_white.load()));
     const bool composed=converted && packet->composition.Record(list,n.w,n.h,{f.color.resource,f.color.region.x,f.color.region.y},

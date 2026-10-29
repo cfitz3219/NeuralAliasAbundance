@@ -2251,6 +2251,9 @@ ULONG STDMETHODCALLTYPE DetourRelease(IUnknown* obj)
 HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT count, UINT w,
                                               UINT h, DXGI_FORMAT fmt, UINT flags)
 {
+    // Reset may have retired the native FG recording without another Present.
+    // Drop its completed image references before DXGI checks ResizeBuffers.
+    na::nr::native::Maintain();
     {
         std::lock_guard<std::mutex> lock(g_state.mutex);
         if (g_state.swapchain == sc) release_buffers_locked();
@@ -2261,6 +2264,7 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT count, UI
 HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags,
                                                const UINT* node_masks, IUnknown* const* queues)
 {
+    na::nr::native::Maintain();
     {
         std::lock_guard<std::mutex> lock(g_state.mutex);
         if (g_state.swapchain == sc) release_buffers_locked();
