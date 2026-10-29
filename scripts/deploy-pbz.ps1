@@ -69,7 +69,7 @@ if ($Action -eq 'Rollback') {
 if (Test-Path -LiteralPath $manifestPath) {
     $prior = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
     if ($prior.state -ne 'restored') { throw 'An installation already exists. Use Status or Rollback first.' }
-    $archive = Join-Path $StateRoot ('previous-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    $archive = Join-Path $StateRoot ('previous-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' + [guid]::NewGuid().ToString('N').Substring(0,8))
     New-Item -ItemType Directory -Path $archive | Out-Null
     Get-ChildItem -LiteralPath $StateRoot -File | ForEach-Object { Move-Item -LiteralPath $_.FullName -Destination $archive }
 }

@@ -47,7 +47,7 @@ Copy-Item (Join-Path $pkg 'nvngx_dlss.dll') $changed -Force
 $collision=Join-Path $game 'platform\steam\nvngx_dlssnr.dll.na-stage'
 'unrelated stage' | Set-Content $collision
 $failed=$false
-try { & $script @args -Action Install } catch { $failed=$true }
+try { & $script @args -Action Install } catch { $failed=$true; Check ($_.Exception.Message -like '*Unfinished staging file*') 'failure occurred before the intended staging collision' }
 Check $failed 'injected install failure did not fail'
 foreach($p in $before.Keys) { Check ((Get-FileHash $p).Hash -eq $before[$p]) 'failed install did not restore original' }
 Check (-not(Test-Path (Join-Path $game 'platform\steam\dxgi.dll'))) 'failed install left proxy'
