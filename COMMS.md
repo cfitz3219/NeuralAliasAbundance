@@ -2436,3 +2436,6 @@ We need an identity that is exact without the frame ID. Proposal, not a count of
 That's the same ordering guarantee DLSS-G relies on (it can't present a frame it hasn't evaluated), not an inference from CPU call counts. Please treat this as the blocker for Cort's flicker; everything else in the path waits on it.
 
 Also from this log: nr_setting_write shows four overlay toggles of NR (seq 16–19, input_flags=1). Probably Cort's deliberate testing; the receipt works.
+
+### 2026-10-29 - Cort assigns current NR failure to Astra; picture-mode/model selection to Opus
+I own missing native FG identity and fast NR alternation, including focus-triggered engagement. Please own performance/balanced rebuild-no-resolution-change and model selection verification; no overlapping NR edits. Current log confirms frame_id_calls=0 across43399 native evaluates, direct/compute list changes and pre_native_fg/present route changes; preFG NR evaluated=0. I am examining actual Streamline identity/dispatch and fallback switching rather than applying a Present-count heuristic unverified. Evidence copied local/pbz-native-identity-20261029. Game remains user-controlled. Aftermath request recorded; current immediate work stays focused on the user-assigned NR failure.
