@@ -2,6 +2,7 @@
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 
 #include "host_dx12/nr/nr_pass.hpp"
+#include "host_dx12/nr/native_fg.hpp"
 #include "host_dx12/motion/live_flow.hpp"
 
 #include "host_dx12/capture/frame_capture.hpp"
@@ -135,26 +136,30 @@ void push_record(CallKind kind, int32_t result, uint32_t feature_id,
 // A43: once the game has initialised a core, the live NR pass must create
 // its feature through THAT core's entry points (one-time work at Init, not
 // per frame; SetRuntime only stores pointers under the pass's mutex).
-void on_core_initialised(CoreSlot& s)
+na::nr::Runtime core_runtime(CoreSlot& s)
 {
     HMODULE m = s.module.load(std::memory_order_acquire);
-    if (!m) return; // cannot happen after A45 (module published before enable); never consume the notification without it
-    if (s.init_succeeded.exchange(1, std::memory_order_acq_rel)) return; // first success only
     na::nr::Runtime rt;
+    if (!m) return rt;
     rt.create_feature = reinterpret_cast<void*>(s.create);
     rt.evaluate_feature = reinterpret_cast<void*>(s.evaluate);
     rt.release_feature = reinterpret_cast<void*>(s.release);
     rt.allocate_parameters = reinterpret_cast<void*>(GetProcAddress(m, "NVSDK_NGX_D3D12_AllocateParameters"));
     rt.destroy_parameters = reinterpret_cast<void*>(GetProcAddress(m, "NVSDK_NGX_D3D12_DestroyParameters"));
     rt.get_capability_parameters = reinterpret_cast<void*>(s.getcap);
-    na::nr::SetRuntime(rt);
+    return rt;
+}
+void on_core_initialised(CoreSlot& s)
+{
+    if (!s.module.load() || s.init_succeeded.exchange(1)) return;
+    na::nr::SetRuntime(core_runtime(s));
 }
 
 NgxResult InitExtImpl(CoreSlot& s, unsigned long long app_id, const wchar_t* data_path, void* device,
                       uint32_t sdk_version, const void* params)
 {
     NgxResult r = s.init_ext(app_id, data_path, device, sdk_version, params);
-    if (r == 1) on_core_initialised(s);
+    if (r == 1) { on_core_initialised(s); na::nr::native::PrepareDevice(static_cast<ID3D12Device*>(device)); }
     g_inits.fetch_add(1, std::memory_order_relaxed);
     push_record(CallKind::Init, r, 0, app_id, 0, 0);
     return r;
@@ -164,7 +169,7 @@ NgxResult InitProjectIdImpl(CoreSlot& s, const char* project_id, uint32_t engine
                             const wchar_t* data_path, void* device, uint32_t sdk_version, const void* params)
 {
     NgxResult r = s.init_pid(project_id, engine_type, engine_version, data_path, device, sdk_version, params);
-    if (r == 1) on_core_initialised(s);
+    if (r == 1) { on_core_initialised(s); na::nr::native::PrepareDevice(static_cast<ID3D12Device*>(device)); }
     g_inits.fetch_add(1, std::memory_order_relaxed);
     push_record(CallKind::Init, r, 0, 0, 0, 0);
     return r;
@@ -354,6 +359,8 @@ NgxResult CreateFeatureImpl(CoreSlot& s, void* cmd_list, uint32_t feature_id, vo
     }
     if (r != 1) g_create_failures.fetch_add(1, std::memory_order_relaxed);
     if (r == 1 && feature_id == 11 && out_handle && *out_handle) {
+        na::nr::native::Release(&s,*out_handle); // new feature incarnation, even if the core reuses a handle address
+        na::nr::native::Prepare(static_cast<ID3D12GraphicsCommandList*>(cmd_list));
         g_fg_last_create_uir.store(inspect_fg_create_uir(params));
         std::lock_guard<std::mutex> lock(g_confirm_m);
         for (auto& entry : g_fg_handles) if (!entry.handle || (entry.core == &s && entry.handle == *out_handle)) {
@@ -542,7 +549,8 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
         for (const auto& entry : g_fg_handles) if (entry.core == &s && entry.handle == handle) { native_fg = true; break; }
     }
     if (native_fg) {
-        inspect_fg_inputs(cmd_list, params); // no GPU work or rendering changes
+        inspect_fg_inputs(cmd_list, params);
+        na::nr::native::Before(list,&s,handle,params,core_runtime(s));
         const NgxResult result = s.evaluate(cmd_list, handle, params, callback);
         g_evaluates.fetch_add(1, std::memory_order_relaxed);
         g_evaluates_external.fetch_add(1, std::memory_order_release);
@@ -770,6 +778,7 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
 
 NgxResult ReleaseFeatureImpl(CoreSlot& s, void* handle)
 {
+    na::nr::native::Release(&s,handle);
     {
         std::lock_guard<std::mutex> lock(g_confirm_m);
         g_feature_flags.Erase(reinterpret_cast<uint64_t>(handle)); // A68: a released handle value may be reused
@@ -808,6 +817,9 @@ NgxResult ReleaseFeatureImpl(CoreSlot& s, void* handle)
 
 NgxResult Shutdown1Impl(CoreSlot& s, void* device)
 {
+    na::nr::native::CoreShutdown(&s);
+    na::nr::OnRuntimeShutdown(core_runtime(s));
+    s.init_succeeded.store(0);
     NgxResult r = s.shutdown1(device);
     if (r == 1) {
         std::lock_guard<std::mutex> lock(g_confirm_m);

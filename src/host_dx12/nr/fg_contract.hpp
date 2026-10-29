@@ -19,6 +19,7 @@ struct FgContract {
     FgSurface color, hudless, depth, motion, ui, alpha, distortion, real_output, generated_output;
     unsigned long long frame_id=0;
     uint32_t multi_index=0, multi_count=0, reset=0, hdr=0, depth_inverted=0;
+    uint32_t camera_motion=1, motion_jittered=0;
     float motion_x=0, motion_y=0;
     bool has_frame_id=false, has_multi_index=false, has_multi_count=false;
     bool has_motion_x=false, has_motion_y=false, has_hdr=false;
@@ -56,6 +57,7 @@ inline FgContract ReadFgContract(const NVSDK_NGX_Parameter* p) {
     f.has_motion_y=FgRead(p,"DLSSG.MvecScaleY",&f.motion_y);
     f.has_hdr=FgRead(p,"DLSSG.ColorBuffersHDR",&f.hdr);
     FgRead(p,"DLSSG.Reset",&f.reset); FgRead(p,"DLSSG.DepthInverted",&f.depth_inverted);
+    FgRead(p,"DLSSG.CameraMotionIncluded",&f.camera_motion);FgRead(p,"DLSSG.MvecJittered",&f.motion_jittered);
     return f;
 }
 } // namespace na::nr

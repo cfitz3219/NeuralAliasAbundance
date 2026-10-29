@@ -20,7 +20,8 @@ std::vector<Witness> witnesses;
 std::vector<std::unique_ptr<test::List>> lists;
 std::vector<test::ComPtr<ID3D12Resource>> uploads;
 test::FakeParams caps;
-int32_t __cdecl Alloc(void** out) { *out = new test::FakeParams; return NVSDK_NGX_Result_Success; }
+test::FakeParams* last_allocated=nullptr;
+int32_t __cdecl Alloc(void** out) { *out = last_allocated = new test::FakeParams; return NVSDK_NGX_Result_Success; }
 int32_t __cdecl Destroy(void* p) { ++destroys_a; delete static_cast<test::FakeParams*>(p); return NVSDK_NGX_Result_Success; }
 int32_t __cdecl DestroyB(void* p) { ++destroys_b; delete static_cast<test::FakeParams*>(p); return NVSDK_NGX_Result_Success; }
 int32_t __cdecl Caps(void** out) { caps.Set("DLSSNR.Available", 1); *out = &caps; return NVSDK_NGX_Result_Success; }
@@ -131,6 +132,34 @@ int main(int argc, char** argv) {
         reinterpret_cast<void*>(Alloc), reinterpret_cast<void*>(Destroy), reinterpret_cast<void*>(Caps)};
     na::settings::Get().nr_enabled = 1; na::nr::SetRuntime(rt);
     auto present = [&](ID3D12CommandQueue* queue) { na::nr::OnPresent(queue, back.Get(), DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709); };
+    if(argc>1 && std::strcmp(argv[1],"--runtime-shutdown")==0) {
+        REQUIRE(Input(d.queue.Get(),depth.Get(),motion.Get(),.1f)==0);Drain(d.queue.Get());present(output.Get());Drain(output.Get());
+        na::nr::OnRuntimeShutdown(rt);delete last_allocated;last_allocated=nullptr; // fake core's shutdown owns its allocations
+        CHECK(!na::nr::HasRuntime());CHECK(releases_a==0 && destroys_a==0);
+        auto rt_b=rt;rt_b.evaluate_feature=reinterpret_cast<void*>(EvaluateB);rt_b.release_feature=reinterpret_cast<void*>(ReleaseB);rt_b.destroy_parameters=reinterpret_cast<void*>(DestroyB);
+        na::nr::SetRuntime(rt_b);
+        REQUIRE(Input(d.queue.Get(),depth.Get(),motion.Get(),.5f)==0);Drain(d.queue.Get());present(output.Get());Drain(output.Get());
+        REQUIRE(Input(d.queue.Get(),depth.Get(),motion.Get(),.75f)==0);Drain(d.queue.Get());present(output.Get());Drain(output.Get());
+        CHECK(evals_b==1);CheckWitness(0,.75f);na::nr::Shutdown();
+        CHECK(releases_a==0 && destroys_a==0 && releases_b==1 && destroys_b==1);
+        return test::finish("nr_runtime_shutdown_test");
+    }
+    if(argc>1 && std::strcmp(argv[1],"--device-migrate")==0) {
+        REQUIRE(Input(d.queue.Get(),depth.Get(),motion.Get(),.1f)==0);Drain(d.queue.Get());present(output.Get());Drain(output.Get());
+        test::ComPtr<IDXGIAdapter> warp;REQUIRE(SUCCEEDED(d.factory->EnumWarpAdapter(IID_PPV_ARGS(&warp))));
+        test::ComPtr<ID3D12Device> device;REQUIRE(SUCCEEDED(D3D12CreateDevice(warp.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device))));
+        if(device.Get()==d.device.Get())return test::kSkip;
+        test::List next;REQUIRE(next.Create(device.Get()));
+        auto in=test::CreateTexture(device.Get(),W,H,DXGI_FORMAT_R16_UNORM,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_FLAG_NONE);
+        auto out=test::CreateTexture(device.Get(),W,H,DXGI_FORMAT_R32_FLOAT,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        REQUIRE(na::nr::RecordDepthToR32ForTests(next.list.Get(),in.Get(),DXGI_FORMAT_R16_UNORM,out.Get(),0,0,W,H));
+        CHECK(releases_a==1 && destroys_a==1);REQUIRE(SUCCEEDED(next.list->Close()));
+        test::ComPtr<ID3D12CommandQueue> queue;D3D12_COMMAND_QUEUE_DESC desc{};REQUIRE(SUCCEEDED(device->CreateCommandQueue(&desc,IID_PPV_ARGS(&queue))));
+        test::ComPtr<ID3D12Fence> fence;REQUIRE(SUCCEEDED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence))));
+        ID3D12CommandList* submitted[]={next.list.Get()};queue->ExecuteCommandLists(1,submitted);uint64_t value=0;
+        test::SignalAndWait(queue.Get(),fence.Get(),value,d.event,device.Get(),"device migration");CHECK(device->GetDeviceRemovedReason()==S_OK);
+        na::nr::Shutdown();return test::finish("nr_device_migrate_test");
+    }
     if (argc > 1 && std::strcmp(argv[1], "--runtime-owner") == 0) {
         REQUIRE(Input(d.queue.Get(),depth.Get(),motion.Get(),.1f)==0);
         Drain(d.queue.Get()); present(output.Get()); Drain(output.Get()); // runtime A created feature/params

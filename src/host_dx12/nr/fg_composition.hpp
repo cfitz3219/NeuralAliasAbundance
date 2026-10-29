@@ -36,6 +36,9 @@ public:
     // which joins their completion before supplying this final receipt.
     bool SetCompletion(ID3D12Fence* fence, uint64_t value);
     bool TryRecycle(); // nonblocking; never accepts an unsubmitted recording
+    // Owner has established that no recorded or submitted use remains. Keep
+    // cached outputs, but do not pin old game buffers across ResizeBuffers.
+    void ReleaseInputs() { for (auto& input : inputs_) input.Reset(); }
     ID3D12Resource* Full() const { return full_.Get(); }
     ID3D12Resource* Hudless() const { return hudless_.Get(); }
 private:

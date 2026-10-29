@@ -1,21 +1,6 @@
-// Live Neural Rendering pass (phase 3 of docs/NR-INSERTION-DESIGN.md, A30).
-//
-// Runs NVIDIA's neural renderer (NGX feature 18, "DLSSNR" community
-// contract) on the finished frame at Present, on the game's direct queue,
-// using the game's own NGX instance (entry points handed in by the proxy).
-// Depth and motion vectors are copied into NeuralAlias-owned textures at the
-// DLSS evaluate (the game's buffers rotate), published at queue submission.
-// Scaled modes upsample depth/motion to the display extent before evaluation.
-//
-// Colour handling (docs/NR-TLOU-I-REPLAY.md): NR is proven on display-encoded
-// SDR. An HDR10 (PQ, RGB10A2) chain is decoded by a compute pass
-// (PQ -> nits / paper white -> sRGB-encoded RGBA16F) before NR and
-// re-encoded after. SDR chains are processed in their own format.
-//
-// Safety: any NGX or D3D failure latches the pass OFF with a reason; the
-// frame is then presented untouched. Never waits on the CPU in hooks. All
-// settings come from na::settings (menu + ini); nothing runs unless
-// `nr_enabled` is set and the runtime entry points are present.
+// NR routing: native_fg.hpp handles paired real-frame processing before native FG.
+// This module provides the non-FG Present fallback and submitted input snapshots.
+// Design, primary sources, automated evidence and limits: docs/PBZ-PRE-FG-NR.md.
 #pragma once
 
 #include <d3d12.h>
@@ -35,6 +20,8 @@ struct Runtime {
     void* destroy_parameters = nullptr;  // NVSDK_NGX_D3D12_DestroyParameters
     void* get_capability_parameters = nullptr; // NVSDK_NGX_D3D12_GetCapabilityParameters
 };
+// Called before the owning NGX core shuts down; never call its freed objects again.
+void OnRuntimeShutdown(const Runtime& runtime);
 void SetRuntime(const Runtime& rt);
 bool HasRuntime();
 

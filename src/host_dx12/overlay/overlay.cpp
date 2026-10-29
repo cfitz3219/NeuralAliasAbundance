@@ -1,3 +1,4 @@
+#include "host_dx12/nr/native_fg.hpp"
 #include "host_dx12/adapters/tlou1/timing.hpp"
 #include "host_dx12/adapters/tlou1/apply.hpp"
 #include "host_dx12/overlay/overlay.hpp"
@@ -548,16 +549,25 @@ void write_status_line()
     WriteFile(f, line, static_cast<DWORD>(n), &written, nullptr);
     char fg_inputs[320];
     const int fg_input_bytes = snprintf(fg_inputs, sizeof(fg_inputs),
-        "native_fg_inputs evaluates=%llu available_resources=%llu hudless=%llu distortion=%llu list_type=%u color_format=%u allocation=%ux%u nr_route=present\r\n",
+        "native_fg_inputs evaluates=%llu available_resources=%llu hudless=%llu distortion=%llu list_type=%u color_format=%u allocation=%ux%u nr_route=%s\r\n",
         static_cast<unsigned long long>(ngx.fg_evaluates), static_cast<unsigned long long>(ngx.fg_with_inputs),
         static_cast<unsigned long long>(ngx.fg_with_hudless), static_cast<unsigned long long>(ngx.fg_with_distortion),
-        ngx.fg_list_type, ngx.fg_color_format, ngx.fg_color_w, ngx.fg_color_h);
+        ngx.fg_list_type, ngx.fg_color_format, ngx.fg_color_w, ngx.fg_color_h,na::nr::native::OwnsRoute()?"pre_native_fg":"present");
     if (fg_input_bytes > 0) WriteFile(f, fg_inputs, static_cast<DWORD>(fg_input_bytes), &written, nullptr);
     const int fg_contract_bytes = snprintf(fg_inputs, sizeof(fg_inputs),
         "native_fg_contract frame_id_calls=%llu alpha_calls=%llu ui_calls=%llu last_create_uir=%u\r\n",
         static_cast<unsigned long long>(ngx.fg_with_frame_id), static_cast<unsigned long long>(ngx.fg_with_alpha),
         static_cast<unsigned long long>(ngx.fg_with_ui), ngx.fg_last_create_uir);
     if (fg_contract_bytes > 0) WriteFile(f, fg_inputs, static_cast<DWORD>(fg_contract_bytes), &written, nullptr);
+    if (na::nr::native::OwnsRoute()) {
+        const auto native=na::nr::native::GetStatus();
+        const int bytes=snprintf(fg_inputs,sizeof(fg_inputs),
+            "nr_pre_fg evaluated=%llu reused=%llu submissions=%llu retired=%llu skipped=%llu gpu_ms=%.3f samples=%u reason=%s\r\n",
+            static_cast<unsigned long long>(native.evaluates),static_cast<unsigned long long>(native.reused),
+            static_cast<unsigned long long>(native.submitted),static_cast<unsigned long long>(native.completed),
+            static_cast<unsigned long long>(native.skipped),native.avg_ms,native.gpu_samples,native.reason);
+        if(bytes>0)WriteFile(f,fg_inputs,static_cast<DWORD>((std::min)(bytes,static_cast<int>(sizeof(fg_inputs)-1))),&written,nullptr);
+    }
     // Worker-thread snapshots only: no GPU waits or readbacks in callbacks.
     const auto fsr = na::ffx::GetStats();
     const auto xess = na::xess::GetStats();

@@ -1,5 +1,8 @@
 #include "host_dx12/nr/nr_pass.hpp"
+#include "host_dx12/nr/nr_shaders.hpp"
 #include "host_dx12/nr/fg_composition.hpp"
+#include "host_dx12/nr/fg_color.hpp"
+#include "host_dx12/nr/native_fg.hpp"
 #include "host_dx12/depth_format.hpp"
 
 #include <d3dcompiler.h>
@@ -36,81 +39,7 @@ namespace {
 // sdr_to_hdr: applies NR's change as a ratio on the ORIGINAL HDR light
 // values, so highlights above paper white are preserved, then re-encodes in
 // the back buffer's own encoding (A60: any HDR format, not only HDR10).
-const char kShaderSource[] = R"(
-Texture2D<float4> t_a : register(t0);
-Texture2D<float4> t_b : register(t1);
-Texture2D<float4> t_c : register(t2);
-RWTexture2D<float4> u_out : register(u0);
-cbuffer C : register(b0) { float paper_white; uint width; uint height; uint mode; uint src_w; uint src_h; };
-
-static const float m1 = 0.1593017578125, m2 = 78.84375, c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;
-float3 pq_to_nits(float3 e) {
-    float3 ep = pow(saturate(e), 1.0 / m2);
-    float3 num = max(ep - c1, 0.0), den = c2 - c3 * ep;
-    return pow(num / den, 1.0 / m1) * 10000.0;
-}
-float3 nits_to_pq(float3 n) {
-    float3 y = pow(saturate(n / 10000.0), m1);
-    return pow((c1 + c2 * y) / (1.0 + c3 * y), m2);
-}
-// mode 2 (scRGB): linear, 1.0 = 80 nits (sRGB reference white), may exceed 1 or be negative.
-float3 hdr_to_nits(float3 v) { return mode == 2 ? v * 80.0 : pq_to_nits(v); }
-float3 nits_to_hdr(float3 n) { return mode == 2 ? n / 80.0 : nits_to_pq(n); }
-float3 srgb_encode(float3 v) {
-    v = saturate(v);
-    return v <= 0.0031308 ? 12.92 * v : 1.055 * pow(v, 1.0 / 2.4) - 0.055;
-}
-float3 srgb_decode(float3 s) {
-    s = saturate(s);
-    return s <= 0.04045 ? s / 12.92 : pow((s + 0.055) / 1.055, 2.4);
-}
-// Phase-4 scaled modes: bring render-size depth/motion to display size.
-// Depth and motion choose the same nearest source pixel, preserving their
-// surface correspondence. MVecScale carries the pixel-unit conversion.
-SamplerState s_linear : register(s0);
-[numthreads(8, 8, 1)]
-void upsample_depth(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= width || id.y >= height) return;
-    uint sw = src_w, sh = src_h; // the rendered region, not the (padded) allocation
-    uint2 src = uint2(min((id.x * sw) / width, sw - 1), min((id.y * sh) / height, sh - 1));
-    u_out[id.xy] = t_a[src];
-}
-[numthreads(8, 8, 1)]
-void upsample_motion(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= width || id.y >= height) return;
-    uint sw = src_w, sh = src_h;
-    uint2 src = uint2(min((id.x * sw) / width, sw - 1), min((id.y * sh) / height, sh - 1));
-    u_out[id.xy] = t_a[src];
-}
-// Argon audit #2 / C12: 24-bit (R24_UNORM_X8 view) or 16-bit (R16_UNORM view)
-// depth -> R32F, for the rendered region starting at (src_w, src_h).
-[numthreads(8, 8, 1)]
-void depth_to_r32(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= width || id.y >= height) return;
-    u_out[id.xy] = t_a[id.xy + uint2(src_w, src_h)].rrrr;
-}
-[numthreads(8, 8, 1)]
-void hdr_to_sdr(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= width || id.y >= height) return;
-    float3 n = hdr_to_nits(t_a[id.xy].rgb) / paper_white;
-    u_out[id.xy] = float4(srgb_encode(n), 1.0);
-}
-[numthreads(8, 8, 1)]
-void sdr_to_hdr(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= width || id.y >= height) return;
-    float4 orig = t_a[id.xy];                            // original HDR pixel
-    float3 nr = srgb_decode(t_b[id.xy].rgb);             // NR result, linear 0..1
-    float3 sdr = srgb_decode(t_c[id.xy].rgb);            // NR input, linear 0..1
-    // `precise`: the fast reciprocal would make x/x a hair under 1, and an
-    // fp16 store truncates, so an unchanged pixel would lose a step per frame.
-    precise float3 ratio = clamp((nr + 0.002) / (sdr + 0.002), 0.25, 4.0);
-    ratio = all(nr == sdr) ? 1.0 : ratio;
-    // scRGB is linear already: scale the stored value directly (a ratio of 1
-    // reproduces the input bit for bit; a nits round trip would not).
-    float3 out_rgb = mode == 2 ? orig.rgb * ratio : nits_to_pq(pq_to_nits(orig.rgb) * ratio);
-    u_out[id.xy] = float4(out_rgb, orig.a);
-}
-)";
+using shaders::kSource;
 
 struct Constants { float paper_white; uint32_t width, height, mode, src_w, src_h; };
 constexpr UINT kConstants = sizeof(Constants) / 4;
@@ -329,7 +258,7 @@ bool uav_store_supported(DXGI_FORMAT fmt)
 bool compile(const char* entry, ComPtr<ID3D12PipelineState>& pso)
 {
     ComPtr<ID3DBlob> code, err;
-    if (FAILED(D3DCompile(kShaderSource, sizeof(kShaderSource) - 1, "nr_pass.hlsl", nullptr, nullptr, entry, "cs_5_0",
+    if (FAILED(D3DCompile(kSource, sizeof(kSource) - 1, "nr_pass.hlsl", nullptr, nullptr, entry, "cs_5_0",
                           D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err)))
         return false;
     D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
@@ -339,8 +268,19 @@ bool compile(const char* entry, ComPtr<ID3D12PipelineState>& pso)
     return SUCCEEDED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso)));
 }
 
+void clear_device_locked();
+
 bool ensure_device_locked(ID3D12Device* dev)
 {
+    if(g.device && g.device_ready && g.device.Get()!=dev) {
+        discard_invalid_recordings_locked();
+        const bool removed=FAILED(g.device->GetDeviceRemovedReason());
+        if(!removed) {
+            if(g.signal_failed || (g.fence && g.fence->GetCompletedValue()<g.fence_next-1))return false;
+            for(const auto& p:g.pending)if(p.list || (p.fence && p.fence->GetCompletedValue()<p.submitted))return false;
+        }
+        clear_device_locked(); // only retired work, or a device which cannot execute again
+    }
     if (g.device && !g.device_ready) {
         // No NR work can have been recorded before initialization completed.
         // Drop only the partial bootstrap objects, then let the existing
@@ -426,6 +366,7 @@ bool ensure_device_locked(ID3D12Device* dev)
     // Prepare the separate FG composition route here, away from the native
     // FG callback. Failure must not disable the existing non-FG NR route.
     if (g.device_ready) PrepareFgComposition(dev);
+    if (g.device_ready) PrepareFgColor(dev);
     return g.device_ready;
 }
 
@@ -640,7 +581,7 @@ void FailNextDeviceInitializationForTests() { fail_device_init_for_tests.store(t
 
 bool WantsInputs()
 {
-    return HasRuntime() && na::settings::Get().nr_enabled.load(std::memory_order_relaxed) != 0 &&
+    return !native::OwnsRoute() && HasRuntime() && na::settings::Get().nr_enabled.load(std::memory_order_relaxed) != 0 &&
            !g.latched.load(std::memory_order_acquire);
 }
 
@@ -680,6 +621,9 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
     ComPtr<ID3D12Device> dev;
     if (FAILED(list->GetDevice(IID_PPV_ARGS(&dev)))) return;
     if (!ensure_device_locked(dev.Get())) {
+        if(g.device && g.device.Get()!=dev.Get()) {
+            set_reason("Waiting for the previous graphics device's NR work to retire.");return;
+        }
         latch("Neural Rendering could not set up on the graphics card.");
         return;
     }
@@ -824,6 +768,7 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
 
 void OnCommandListReset(ID3D12GraphicsCommandList* list)
 {
+    native::Reset(list);
     IUnknown* raw = nullptr;
     UINT bytes = sizeof(raw);
     if (list && SUCCEEDED(list->GetPrivateData(kRecordingToken, &bytes, &raw)) && raw) {
@@ -834,7 +779,9 @@ void OnCommandListReset(ID3D12GraphicsCommandList* list)
 
 void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists, ExecuteFn forward)
 {
-    if (internal_submit || !g.pending_count.load(std::memory_order_acquire)) {
+    if (internal_submit) { forward(queue,count,lists); return; }
+    native::Submission native_submission(queue,count,lists);
+    if (!g.pending_count.load(std::memory_order_acquire)) {
         forward(queue, count, lists);
         return;
     }
@@ -883,6 +830,8 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
 
 void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer, DXGI_COLOR_SPACE_TYPE color_space)
 {
+    native::Maintain();
+    if (native::OwnsRoute()) return; // already enhanced both FG inputs, never process generated frames
     if (!queue || !backbuffer) return;
     const na::settings::Settings& st = na::settings::Get();
     if (!st.nr_enabled.load(std::memory_order_relaxed)) {
@@ -1201,6 +1150,13 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer, DXGI_COLOR
 Stats GetStats()
 {
     Stats s{};
+    if (native::OwnsRoute()) {
+        const auto n=native::GetStatus();
+        s.runtime_present=1;s.active=n.active;s.evaluates=n.evaluates;s.skipped=n.skipped;
+        s.gpu_submitted=n.submitted;s.gpu_completed=n.completed;s.width=n.width;s.height=n.height;
+        s.last_ms=n.last_ms;s.avg_ms=n.avg_ms;s.gpu_samples=n.gpu_samples;
+        strncpy_s(s.reason,n.reason,_TRUNCATE);return s;
+    }
     s.runtime_present = g.has_rt.load(std::memory_order_acquire);
     s.active = g.active.load(std::memory_order_acquire);
     s.latched_off = g.latched.load(std::memory_order_acquire);
@@ -1240,6 +1196,18 @@ void ResetLatch()
     set_reason("Neural Rendering is off.");
 }
 
+void OnRuntimeShutdown(const Runtime& runtime)
+{
+    std::lock_guard<std::mutex> lock(g.m);
+    if(g.feature_runtime.create_feature==runtime.create_feature) {
+        g.feature=nullptr;g.feature_runtime={};g.feature_pending=0;g.active.store(0);g.reset_pending=true;
+    }
+    if(g.params_runtime.create_feature==runtime.create_feature){g.params=nullptr;g.params_runtime={};}
+    if(g.rt.create_feature==runtime.create_feature){g.rt={};g.has_rt.store(0);}
+    // Keep images/allocators until their fences retire. Shutdown of an NGX core
+    // does not mean the application's already-submitted GPU work has completed.
+}
+
 bool RecordDepthToR32ForTests(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, DXGI_FORMAT view, ID3D12Resource* out,
                               uint32_t bx, uint32_t by, uint32_t w, uint32_t h)
 {
@@ -1252,6 +1220,52 @@ bool RecordDepthToR32ForTests(ID3D12GraphicsCommandList* list, ID3D12Resource* d
     record_depth_to_r32_locked(list, depth, view, out, bx, by, w, h,
                               kPendingSlots + (g.eval_slot++ % (kEvalSlots - kPendingSlots)));
     return true;
+}
+
+namespace {
+void clear_device_locked()
+{
+    release_feature_locked();
+    destroy_params_locked();
+    g.depth_copy.Reset();
+    g.motion_copy.Reset();
+    for (auto& p : g.pending) p = {};
+    g.pending_count.store(0);
+    g.ready = nullptr;
+    g.output_queue.Reset();
+    g.input_value = 0;
+    g.last_consumed_input = 0;
+    g.cross_queue_waits = 0;
+    g.depth_up.Reset();
+    g.motion_up.Reset();
+    g.color_in.Reset();
+    g.nr_out.Reset();
+    g.hdr_out.Reset();
+    g.hdr_mode_used = 0;
+    g.pso_hdr_to_sdr.Reset();
+    g.pso_sdr_to_hdr.Reset();
+    g.pso_up_depth.Reset();
+    g.pso_up_motion.Reset();
+    g.pso_depth_r32.Reset();
+    g.root.Reset();
+    g.heap.Reset();
+    g.queries.Reset();
+    g.query_readback.Reset();
+    g.list.Reset();
+    for (Frame& f : g.frames) { f.alloc.Reset(); f.depth.Reset(); f.motion.Reset(); f.fence_value = 0; }
+    g.fence.Reset();
+    g.device.Reset();
+    g.device_ready = false;
+    g.have_inputs = 0;
+    g.inputs_fresh = 0;
+    g.in_w = g.in_h = g.width = g.height = 0;
+    g.active.store(0);
+    g.latched.store(0);
+    g.frame_index = 0;
+    g.fence_next = 1; g.reset_pending = true; g.last_evaluate_tick = 0; g.setting_signature = 0;
+    set_reason("Neural Rendering is off.");
+    g.signal_failed=false;
+}
 }
 
 void Shutdown()
@@ -1279,44 +1293,7 @@ void Shutdown()
             latch("Neural Rendering shutdown is waiting for GPU completion; resources retained."); return;
         }
     }
-    release_feature_locked();
-    destroy_params_locked();
-    g.depth_copy.Reset();
-    g.motion_copy.Reset();
-    for (auto& p : g.pending) p = {};
-    g.pending_count.store(0);
-    g.ready = nullptr;
-    g.output_queue.Reset();
-    g.input_value = 0;
-    g.last_consumed_input = 0;
-    g.cross_queue_waits = 0;
-    g.depth_up.Reset();
-    g.motion_up.Reset();
-    g.color_in.Reset();
-    g.nr_out.Reset();
-    g.hdr_out.Reset();
-    g.hdr_mode_used = 0;
-    g.pso_hdr_to_sdr.Reset();
-    g.pso_sdr_to_hdr.Reset();
-    g.pso_up_depth.Reset();
-    g.pso_up_motion.Reset();
-    g.root.Reset();
-    g.heap.Reset();
-    g.queries.Reset();
-    g.query_readback.Reset();
-    g.list.Reset();
-    for (Frame& f : g.frames) { f.alloc.Reset(); f.depth.Reset(); f.motion.Reset(); f.fence_value = 0; }
-    g.fence.Reset();
-    g.device.Reset();
-    g.device_ready = false;
-    g.have_inputs = 0;
-    g.inputs_fresh = 0;
-    g.in_w = g.in_h = g.width = g.height = 0;
-    g.active.store(0);
-    g.latched.store(0);
-    g.frame_index = 0;
-    g.fence_next = 1; g.reset_pending = true; g.last_evaluate_tick = 0; g.setting_signature = 0;
-    set_reason("Neural Rendering is off.");
+    clear_device_locked();
 }
 
 } // namespace na::nr
