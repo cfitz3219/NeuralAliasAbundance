@@ -491,24 +491,23 @@ void DrawFrameGenerationRow()
     }
 }
 
-void DrawRayReconstructionRow()
+// Which DLSS upscaler the game itself created (status only). Ray Reconstruction cannot
+// be switched on from outside: it replaces the game's ray-tracing denoiser and needs
+// the un-denoised lighting plus albedo / normal / roughness guides that only the game
+// produces. The former on/off switch saved a choice nothing read; removed (Cort).
+void DrawDlssInUseRow()
 {
     using namespace na::ui;
-    na::settings::Settings& st = na::settings::Get();
     na::ngx::Stats ngx = na::ngx::GetStats();
-    bool rr = st.ray_reconstruction.load() != 0;
-    bool available = ngx.rr_seen != 0;
-    BeginRow("Ray Reconstruction",
-             available ? "Refines ray-traced effects in games that support it."
-                       : "Refines ray-traced effects in games that support it.\nNot available in this game.",
-             SwitchWidth());
-    ImGui::BeginDisabled(!available);
-    if (Switch("rr", &rr)) {
-        st.ray_reconstruction.store(rr ? 1u : 0u);
-        note_request();
-        na::settings::Save();
-    }
-    ImGui::EndDisabled();
+    const bool rr = ngx.rr_seen != 0, sr = ngx.sr_creates != 0;
+    const char* badge = rr && sr ? "BOTH SEEN" : rr ? "RAY RECONSTRUCTION" : sr ? "SUPER RESOLUTION" : "NOT YET SEEN";
+    const char* help =
+        rr && sr ? "The game has used both: plain DLSS upscaling and Ray Reconstruction (its ray-traced DLSS). It switches when its ray-tracing settings change."
+        : rr     ? "The game upscales with Ray Reconstruction, the DLSS that also cleans up its ray-traced lighting. Turning ray reconstruction off in the game's settings switches it to plain DLSS."
+        : sr     ? "The game upscales with plain DLSS Super Resolution."
+                 : "The game has not started DLSS yet. Enable DLSS in its video settings.";
+    BeginRow("DLSS in use", help, BadgeWidth(badge));
+    Badge(badge);
     EndRow();
 }
 
@@ -754,8 +753,7 @@ void RegisterRouteAMenu()
                         Page::Enhancements});
     na::menu::Register({"Responsiveness", Availability::Available, nullptr, &DrawLatencyRow, Page::Enhancements});
     na::menu::Register({"Latency and display", Availability::Available, nullptr, &DrawLatencyDetails, Page::Details});
-    na::menu::Register({"Ray Reconstruction", Availability::Available, nullptr, &DrawRayReconstructionRow,
-                        Page::Enhancements});
+    na::menu::Register({"DLSS in use", Availability::Available, nullptr, &DrawDlssInUseRow, Page::Enhancements});
     na::menu::Register({"Motion analysis", Availability::Available, nullptr, &DrawMotionRow, Page::Enhancements});
     na::menu::Register({"Connection", Availability::Available, nullptr, &DrawConnectionRow, Page::Details});
     na::menu::Register({"Save pictures for analysis", Availability::Available, nullptr, &DrawCaptureRow,
