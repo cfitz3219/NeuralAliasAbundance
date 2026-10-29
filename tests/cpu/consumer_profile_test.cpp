@@ -160,7 +160,7 @@ int main()
               "same pipeline at the mid barrier (no prior consumer) is not accepted");
         const uint64_t water_ctx = ClassHash(cls_of(water()));
         check(p.Judge(bk, kGeo, water_ctx) == ConsumerProfile::Verdict::AcceptedQualified, "completion separated by context (after the water read)");
-        // ...and when the water pass is culled the context no longer separates: ambiguous, never the boundary matcher.
+        // ...and when the water pass is culled the context no longer separates: ambiguous (live: only the boundary matcher may still fire there).
         ConsumerProfile p2;
         for (uint64_t f = 1; f <= 4; ++f) learn(p2, {write(true, kGeo), B(kGeo), write(true, kGeo), B(kGeo), tonemap(400, kGeo)}, f);
         check(p2.Judge(bk, kGeo, 0) == ConsumerProfile::Verdict::Ambiguous, "indistinguishable barriers stay ambiguous");
@@ -172,7 +172,7 @@ int main()
         p3.Contradict(bk, kGeo2, 4, 0);
         const auto v = p3.Judge(bk, kGeo2, 0);
         check(v != ConsumerProfile::Verdict::AcceptedWithProducer && v != ConsumerProfile::Verdict::AcceptedQualified,
-              "contradicted pattern is no longer accepted (ambiguous -> boundary matcher not allowed)");
+              "contradicted pattern is no longer accepted (ambiguous -> only the boundary matcher may fire)");
         // (5) Post-processing consumer in a later command list: the scene list's final barrier
         //     and the later list's consumer are both learned as the frame's completion.
         ConsumerProfile p4;

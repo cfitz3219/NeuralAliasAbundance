@@ -247,3 +247,25 @@ Integrated Opus916548a, inspected consumer learning/live matching and render-pas
 ## 2026-10-27 — user testing handoff
 
 At Cort's instruction built but did not test. Installed combined consumer-anchor DLL260DFADB... into closed SER with automatic route/inline override disabled. Exact prior DLL/INI backup, rollback script and manifest local/ser-user-postentry-20261027. No game launch or test execution. COMMS-Continuation records user live ownership and unperformed validation; preparation complete, flicker outcome unverified.
+
+### 2026-10-28 — Astra: Sniper frame-coverage repair (source/build, user owns live testing)
+
+Request: fix repeated DLAA/native flicker in Sniper Elite Resistance and Sniper Elite 5 first. Based production branch on Opus 65398ba, retaining his exit-hang, original-object observation and camera-jitter rebasing fixes. No game launch, deployment or test execution in this work.
+
+Evidence read: local/j2-ser-dlaa/status.log (17847 scene frames, 15828 executed, 1047 depth-state failed attempts); local/j2-se5-dlaa-20261027-235611/status.log (4820 scene frames, 1967 executed, 2102 depth-state failed attempts). Attempts are not unique missed frames. SE5 did observe real consumers (1478 class + 230 pair matches); the previous claim that it never sees consumers is unsupported.
+
+Source fixes:
+- Frame learning silently stopped appending later lists once the sequence had 512 events, without marking truncation. Sniper traces exceed that. Use a bounded 16384-event whole-frame sequence, explicitly excluding incomplete frames from training.
+- Inline route previously forwarded every missed frame without trying between-list placement. It now uses an accepted actual post-entry consumer in a later list, within one Execute batch or a later batch of this frame. Retains only copied camera/jitter/subresource metadata from submitted scene work, never a pooled game-list pointer. Uses queue submission state at the actual insertion point. Once either path submits, the other cannot evaluate again that frame. The explicit force-inline diagnostic mode remains inline-only.
+- Consumer training preserves the preceding scene producer across a list split, so class/producer qualification agrees with the fallback.
+- At an inline colour barrier callback, use the first selected-subresource transition's StateBefore in that batch as entry-state evidence. Depth read-only use no longer loses an available explicit state just because prior GPU work is in flight. END_ONLY and aliasing do not provide such entry evidence.
+
+Build: Release NeuralAliasDXGI target completed with installed NVIDIA SDKs. Initial target name na_host_dx12 was wrong (MSB1009); corrected to host_dx12, then built the actual NeuralAliasDXGI DLL. git diff --check clean. No tests executed per Cort's instruction. Live coverage and visual flicker remain unverified until his run; these are concrete implementation fixes, not a claim of 100% coverage. Existing unknown input/consumer cases still report a miss rather than inventing resource states or placing after a consumed image.
+
+### 2026-10-28 — Astra: focused depth/drift repair after failed SE5 run
+
+Cort confirmed 8cbc62d regression: drift persists, DLAA engagement much worse. Installer receipt/hash prove current build; scene9786/executed1916/missed7870; depth refusal attempts12816, NGX failures0. Stopped broader work, retained it in stash named astra: unfinished broader placement-camera changes; set aside for measured depth/drift repair. Cort now explicitly authorizes automated CPU/DX12 regression runs, leaving games to him.
+
+Reproduced old single-sample jitter rebasing drift with rotating upload ranges; replaced by exact per-resource/offset write ledger. Reproduced placed-depth carried-state exclusion on RTX5070Ti by restoring old eligibility predicate (expected failure), then restored fixed predicate; named/wildcard alias cases and three-way state lookup checked. Added explicit live refusal facts because prior log cannot identify the game's allocation kind/precise state-store failure. Source corrections and controlled repros are proven, live causal completeness is not. Full details, old-path drift numbers, initial fixture failures/corrections and vendor guidance links: docs/SNIPER-DEPTH-DRIFT-REPAIR.md.
+
+Release NeuralAliasDXGI build and focused12/12 tests passed (34.90s). No game run/deployment. Preparing a pinned installer candidate; do not claim both live problems or all known gaps closed until user evidence confirms them.

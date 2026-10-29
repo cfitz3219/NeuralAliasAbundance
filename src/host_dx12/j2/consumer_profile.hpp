@@ -99,10 +99,11 @@ inline void LabelFrame(const std::vector<ColorEvent>& seq, uint32_t scene_w, uin
         return false;
     };
     uint64_t list_context = 0; // class of the latest consumer earlier in the current recording
+    uint64_t last_producer = 0; // submission order also spans a writer/consumer list split
     for (size_t i = 0; i < seq.size(); ++i) {
         const ColorEvent& c = seq[i];
         if (c.list_start) list_context = 0;
-        if (c.write) continue;
+        if (c.write) { last_producer = c.producer; continue; }
         if (c.op == Op::Barrier) {
             const bool temporary = continued(i + 1);
             Labelled l;
@@ -133,7 +134,7 @@ inline void LabelFrame(const std::vector<ColorEvent>& seq, uint32_t scene_w, uin
         }
         Labelled l;
         l.cls = MakeClass(c.raw, scene_w, scene_h);
-        l.producer = c.producer;
+        l.producer = c.producer ? c.producer : last_producer;
         l.role = temporary ? Role::Temporary : (post_found ? Role::Later : Role::PostEntry);
         if (!temporary) post_found = true;
         list_context = ClassHash(l.cls);

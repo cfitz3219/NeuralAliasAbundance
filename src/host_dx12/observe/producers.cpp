@@ -128,6 +128,9 @@ struct Obj {
     uint64_t root_hash = 0;                 // structural layout hash (role classes; stable across sessions)
     // Live mip bias: per-level twins of a root signature / pipeline state (index = level).
     // same[i]: the game's own object is already correct for level i (nothing to swap).
+    // Immutable once published; owns a reference on every twin. A twin is never one of
+    // the game's own objects (see D_CreateRootSignature), so twins cannot form cycles.
+    // Never destroyed inside another D3D12 object's destruction: see ReleaseTwinsLater.
     struct Twins { IUnknown* obj[3] = {}; bool same[3] = {}; ~Twins() { for (auto* o : obj) if (o) o->Release(); } };
     std::shared_ptr<Twins> twins;
     bool retirement_unobservable = false;   // the sentinel could not be attached
@@ -161,6 +164,36 @@ std::shared_mutex g_m; // registry, heaps, VA table. Never held across a D3D12 c
 // Never destroyed: at process exit an entry's twins must not be Released (a twin's last
 // Release can retire an object through its sentinel, which takes g_m and walks this map).
 std::unordered_map<const void*, Obj>& g_objs = *new std::unordered_map<const void*, Obj>();
+void ReleaseTwinsLater(std::shared_ptr<Obj::Twins>&& t); // live mip bias: see the definition
+void ReleaseParkedTwins();
+std::atomic<uint64_t> g_mip_shared_skips{0}; // twin levels dropped: D3D12 returned one of the game's own root signatures
+// Twins whose owner retired. The retirement sentinel runs INSIDE the D3D12 runtime's
+// destruction of the owner (private data is released as the object dies, under the
+// runtime's own locks: root signatures live in a per-device dedup cache, pipelines in
+// the device's object list). Releasing another root signature or pipeline from there
+// re-enters that destruction path and can wait on the lock the runtime already holds:
+// the host J2 tests exited "ok" and then never returned (028a182..783fb26). So the
+// sentinel only parks the twins here; they are released at the next safe point (a
+// creation hook or ExecuteCommandLists, which run in the game's call, not inside the
+// runtime's teardown of an object). Twins still parked at process exit are leaked.
+std::mutex g_twin_grave_m;
+std::vector<std::shared_ptr<Obj::Twins>>& g_twin_grave = *new std::vector<std::shared_ptr<Obj::Twins>>();
+void ReleaseTwinsLater(std::shared_ptr<Obj::Twins>&& t)
+{
+    if (!t) return;
+    std::lock_guard<std::mutex> lk(g_twin_grave_m);
+    g_twin_grave.push_back(std::move(t));
+}
+void ReleaseParkedTwins()
+{
+    std::vector<std::shared_ptr<Obj::Twins>> dead;
+    {
+        std::lock_guard<std::mutex> lk(g_twin_grave_m);
+        if (g_twin_grave.empty()) return;
+        dead.swap(g_twin_grave);
+    }
+    dead.clear(); // plain Release calls from the game's own call stack
+}
 std::vector<std::unique_ptr<DescHeap>> g_heaps;
 std::vector<VaRange> g_va; // sorted by begin
 struct BufferInfo {
@@ -399,7 +432,7 @@ private:
 void RetireSentinel::retire(const void* key, na_object_id id, uint32_t kind)
 {
     g_retire_gen.fetch_add(1, std::memory_order_acq_rel);
-    std::shared_ptr<Obj::Twins> drop; // released after g_m: a twin's Release is a D3D12 call
+    std::shared_ptr<Obj::Twins> drop; // parked, never released here (we are inside the owner's destruction)
     {
         std::unique_lock<std::shared_mutex> lock(g_m);
         auto it = g_objs.find(key);
@@ -410,6 +443,7 @@ void RetireSentinel::retire(const void* key, na_object_id id, uint32_t kind)
         g_buffers.erase(id);
         g_res_keys.erase(id);
     }
+    ReleaseTwinsLater(std::move(drop));
     if (kind == NA_OBJ_RESOURCE) known_forget(id);
     g_c.live.fetch_sub(1);
     g_c.retired.fetch_add(1);
@@ -473,6 +507,7 @@ na_object_id register_object(IUnknown* object, uint32_t kind)
         drop = std::move(o.twins);
         o = fresh_obj(id, kind);
     }
+    ReleaseTwinsLater(std::move(drop));
     g_c.live.fetch_add(1);
     g_c.created.fetch_add(1);
     attach_sentinel(object, key, id, kind);
@@ -497,6 +532,7 @@ na_object_id ensure_registered(IUnknown* object, uint32_t kind, bool* created)
         if (it != g_objs.end()) { g_c.live.fetch_sub(1); drop = std::move(it->second.twins); }
         g_objs[key] = fresh_obj(id, kind);
     }
+    ReleaseTwinsLater(std::move(drop));
     *created = true;
     g_c.live.fetch_add(1);
     g_c.created.fetch_add(1);
@@ -606,11 +642,11 @@ void note_resource(ID3D12Device* dev, IUnknown* obj, uint32_t creation_kind, ID3
         bi.width = d.Width;
         bi.cpu_visible = cpu_visible;
     }
-    // G3-06: committed, non-simultaneous textures are eligible for carried
-    // state from creation (a COMMON creation state is recorded but never
-    // usable until an explicit transition). Placed/reserved resources alias
-    // and are never eligible; simultaneous-access textures decay.
-    if (creation_kind == NA_CREATE_COMMITTED && d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+    // Placed textures also have persistent states. Named aliasing barriers
+    // invalidate their entries; wildcard barriers invalidate the whole store.
+    // Reserved/tiled and simultaneous-access resources remain outside this store.
+    if ((creation_kind == NA_CREATE_COMMITTED ||
+         (creation_kind == NA_CREATE_PLACED && (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))) && d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
         !(d.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS))
         known_created(id, static_cast<uint32_t>(initial));
     if (va) {
@@ -1394,6 +1430,7 @@ HRESULT STDMETHODCALLTYPE D_Wait(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v
 
 void STDMETHODCALLTYPE D_ExecuteCommandLists(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists)
 {
+    ReleaseParkedTwins();
     const ExecuteToken t = ExecuteBegin(q, n, lists);
     o_ExecuteCommandLists(q, n, lists);
     ExecuteEnd(t, q, n, lists);
@@ -1589,6 +1626,21 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
             const SIZE_T n = level_blob[level] ? level_blob[level]->GetBufferSize() : size;
             ID3D12RootSignature* twin = nullptr;
             if (SUCCEEDED(o_CreateRootSignature(dev, mask, bytes, n, IID_PPV_ARGS(&twin))) && twin) {
+                // D3D12 returns the same object for identical bytes: a twin that is one of
+                // the game's own root signatures is not kept (holding it could make two game
+                // root signatures own each other). That level has no twin: recordings at it
+                // fall back to the game's objects.
+                const void* tkey = canon(twin);
+                bool game_obj = false;
+                {
+                    std::shared_lock<std::shared_mutex> lock(g_m);
+                    game_obj = g_objs.find(tkey) != g_objs.end();
+                }
+                if (game_obj) {
+                    twin->Release();
+                    g_mip_shared_skips.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
                 rs_twins->obj[level] = twin;
                 g_mip_twin_rs.fetch_add(1, std::memory_order_relaxed);
             } else g_mip_twin_fail.fetch_add(1, std::memory_order_relaxed);
@@ -1728,6 +1780,7 @@ template <typename Make>
 void make_pso_twins(IUnknown* pso, const void* rs, Make make)
 {
     if (!pso || !g_mip_live_enabled.load(std::memory_order_relaxed)) return;
+    ReleaseParkedTwins();
     const auto rt = rs_twins_of(rs);
     std::shared_ptr<Obj::Twins> pt;
     if (!rs) {
@@ -2414,9 +2467,9 @@ struct On<sl::list::ResourceBarrier> {
         // overflow of the recording's evidence store still invalidates it
         // (C9B-R4). BEGIN_ONLY leaves the state pending until its END_ONLY half.
         // Aliasing barriers make the named resources' states unknown (both
-        // sides). Only placed/reserved resources alias, and those never enter
-        // the carried-state store, so a null (wildcard) aliasing barrier needs
-        // no store-wide action. Allocation is bounded by the 8192-entry
+        // sides). A wildcard alias can name ANY placed resource, so it marks
+        // this recording incomplete and invalidates carried states at submission.
+        // Allocation is bounded by the 8192-entry
         // recording store before anything proportional to n is reserved.
         constexpr size_t kMaxStates = 8192;
         std::vector<ListState::StateNote> add;
@@ -2437,6 +2490,7 @@ struct On<sl::list::ResourceBarrier> {
                 push(id, b[i].Transition.Subresource, begin_only ? kStatePending : static_cast<uint32_t>(b[i].Transition.StateAfter));
                 if (used.size() < 2 * kMaxListUses) used.push_back(id);
             } else if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) {
+                if (!b[i].Aliasing.pResourceBefore || !b[i].Aliasing.pResourceAfter) overflow = true;
                 const na_object_id before = i < m ? out[i].resource : resource_id(b[i].Aliasing.pResourceBefore);
                 const na_object_id after = i < m ? out[i].resource_after : resource_id(b[i].Aliasing.pResourceAfter);
                 for (na_object_id id : {before, after})
@@ -2876,12 +2930,33 @@ void before_read_transition(GL* l, UINT count, const D3D12_RESOURCE_BARRIER* bar
         uint32_t cs = 0, ds = 0;
         if (!ListSceneSubresource(l, color, depth, &cs, &ds) ||
             (b.Transition.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && b.Transition.Subresource != cs)) continue;
+        std::vector<ListState::StateNote> entry_states;
+        // The callback runs BEFORE this entire barrier batch. Its first
+        // transition for each selected subresource supplies the exact entry
+        // state, even when depth was only read and prior GPU work is in flight.
+        // Never use StateAfter here, nor the before-state of an END_ONLY half.
+        for (const auto selected : {std::pair<na_object_id, uint32_t>{color, cs}, {depth, ds}}) {
+            for (UINT j = 0; j < count; ++j) {
+                const auto& entry = barriers[j];
+                if (entry.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) break;
+                if (entry.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION ||
+                    resource_id(entry.Transition.pResource) != selected.first ||
+                    (entry.Transition.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES &&
+                     entry.Transition.Subresource != selected.second)) continue;
+                if (!(entry.Flags & D3D12_RESOURCE_BARRIER_FLAG_END_ONLY))
+                    entry_states.push_back({selected.first, selected.second, static_cast<uint32_t>(entry.Transition.StateBefore)});
+                break;
+            }
+        }
         {
             std::shared_lock<std::shared_mutex> lock(g_m);
             na_object_id lid = 0;
             auto* ls = list_state_locked(l, &lid);
             if (!ls) return;
             std::lock_guard<std::mutex> bl(ls->bind_m);
+            if (ls->states.size() + entry_states.size() <= 8192)
+                ls->states.insert(ls->states.end(), entry_states.begin(), entry_states.end());
+            else ls->evidence_complete = false;
             ls->insertion.Add({color, 0, UINT64_MAX, false, na::j2::Op::Barrier});
         }
         if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, true);
@@ -3047,13 +3122,26 @@ void mip_on_pso(GL* l, ID3D12PipelineState*& p)
 void mip_on_rs(GL* l, ID3D12RootSignature*& r)
 {
     if (!g_mip_switched.load(std::memory_order_relaxed) || !r) return;
-    std::shared_lock<std::shared_mutex> lock(g_m);
-    na_object_id lid = 0;
-    ListState* ls = list_state_locked(l, &lid);
-    if (!ls) return;
-    std::lock_guard<std::mutex> bl(ls->bind_m);
-    bool untwinned = false;
-    r = mip_swap_locked(ls->mip_level, r, false, &untwinned);
+    bool fallback = false;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_m);
+        na_object_id lid = 0;
+        ListState* ls = list_state_locked(l, &lid);
+        if (!ls) return;
+        std::lock_guard<std::mutex> bl(ls->bind_m);
+        if (ls->mip_level < 0) return;
+        bool untwinned = false;
+        ID3D12RootSignature* t = mip_swap_locked(ls->mip_level, r, false, &untwinned);
+        if (untwinned) { ls->mip_level = -1; fallback = true; } // r (the game's) is bound as is
+        else r = t;
+    }
+    if (fallback) {
+        // A pipeline twin may be bound: switch the whole recording to the game's objects
+        // (as mip_on_pso does) before the game's root signature goes in.
+        g_mip_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        const HostWorkScope host;
+        RestoreListState(l);
+    }
 }
 void mip_on_reset(GL* l, ID3D12PipelineState*& p)
 {
@@ -3086,13 +3174,30 @@ struct ListHook<Slot, R(A...)> {
     {
         na::hooking::variants::CallScope scope(l, Slot);
         auto fn = reinterpret_cast<Pfn>(orig[I]);
-        // Live mip bias: substitute twins before forwarding (also for host re-binds).
-        if constexpr (Slot == sl::list::SetPipelineState) { auto&& t = std::forward_as_tuple(a...); mip_on_pso(l, std::get<0>(t)); }
-        if constexpr (Slot == sl::list::SetGraphicsRootSignature || Slot == sl::list::SetComputeRootSignature) {
-            auto&& t = std::forward_as_tuple(a...);
-            mip_on_rs(l, std::get<0>(t));
-        }
-        if constexpr (Slot == sl::list::Reset) { auto&& t = std::forward_as_tuple(a...); mip_on_reset(l, std::get<1>(t)); }
+        // Live mip bias: the DRIVER gets the twin of the latched level; the OBSERVER always
+        // gets the game's own object. Twins are not in the registry (no root layout, no
+        // pipeline identity), so observing them blinded colour-read detection, producer
+        // pipelines and the learned profile at every level except the game's own.
+        constexpr bool kMipSlot = Slot == sl::list::SetPipelineState || Slot == sl::list::SetGraphicsRootSignature ||
+                                  Slot == sl::list::SetComputeRootSignature || Slot == sl::list::Reset;
+        if constexpr (kMipSlot) {
+            const std::tuple<std::decay_t<A>...> game{a...}; // what the game passed
+            {
+                auto&& t = std::forward_as_tuple(a...);
+                if constexpr (Slot == sl::list::SetPipelineState) mip_on_pso(l, std::get<0>(t));
+                else if constexpr (Slot == sl::list::Reset) mip_on_reset(l, std::get<1>(t));
+                else mip_on_rs(l, std::get<0>(t));
+            }
+            if constexpr (std::is_void_v<R>) {
+                fn(l, a...);
+                if (scope.outermost && !scope.ambiguous) std::apply([&](auto... g) { On<Slot>::run(l, g...); }, game);
+                return;
+            } else {
+                const R r = fn(l, a...);
+                if (scope.outermost && !scope.ambiguous) std::apply([&](auto... g) { On<Slot>::run(l, r, g...); }, game);
+                return r;
+            }
+        } else
         if constexpr (std::is_void_v<R>) {
             if constexpr (Slot == sl::list::ResourceBarrier)
                 if (scope.outermost && !scope.ambiguous) before_read_transition(l, a...);
@@ -4679,22 +4784,26 @@ uint32_t ListTargetsAfter(ID3D12CommandList* list, na_object_id color, na_object
 // State of ONE subresource after `list`: the last barrier naming that subresource
 // or all of them. Games commonly transition depth and stencil planes (or mips,
 // array slices) separately; the whole-resource query refuses those.
-bool ListLastStateSub(ID3D12CommandList* list, na_object_id id, uint32_t sub, uint32_t* state)
+StateLookup ListStateSub(ID3D12CommandList* list, na_object_id id, uint32_t sub, uint32_t* state)
 {
     std::shared_lock<std::shared_mutex> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
-    if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
+    if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return StateLookup::Unavailable;
     std::lock_guard<std::mutex> bl(ls->bind_m);
-    if (!ls->evidence_complete) return false;
+    if (!ls->evidence_complete) return StateLookup::Unavailable;
     for (auto it = ls->states.rbegin(); it != ls->states.rend(); ++it) {
         if (it->resource != id) continue;
         if (it->subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && it->subresource != sub) continue; // another plane/mip/slice
-        if (it->state_after == kStatePending) return false;
+        if (it->state_after == kStatePending) return StateLookup::Unavailable;
         *state = it->state_after;
-        return true;
+        return StateLookup::Known;
     }
-    return false;
+    return StateLookup::Absent;
+}
+bool ListLastStateSub(ID3D12CommandList* list, na_object_id id, uint32_t sub, uint32_t* state)
+{
+    return ListStateSub(list, id, sub, state) == StateLookup::Known;
 }
 bool ListLastState(ID3D12CommandList* list, na_object_id id, uint32_t* state)
 {
@@ -4782,6 +4891,38 @@ bool KnownSubStateNow(na_object_id id, uint32_t sub, uint32_t* state)
     if (v == kStatePending || v == D3D12_RESOURCE_STATE_COMMON) return false;
     *state = v;
     return true;
+}
+void DescribeStateEvidence(ID3D12CommandList* list, na_object_id id, uint32_t sub, char* text, size_t capacity)
+{
+    uint32_t kind = NA_UNKNOWN_U32;
+    bool covered = false, complete = false;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_m);
+        const auto key = g_res_keys.find(id);
+        if (key != g_res_keys.end()) {
+            const auto obj = g_objs.find(key->second);
+            if (obj != g_objs.end() && obj->second.created.size() >= sizeof(na_ev_resource_created))
+                kind = reinterpret_cast<const na_ev_resource_created*>(obj->second.created.data())->creation_kind;
+        }
+        na_object_id lid = 0;
+        auto* ls = list ? list_state_locked(list, &lid) : nullptr;
+        if (ls) {
+            std::lock_guard<std::mutex> bl(ls->bind_m);
+            covered = ls->recording_observed.load() && ls->coverage_complete.load();
+            complete = ls->evidence_complete;
+        }
+    }
+    std::lock_guard<std::mutex> lock(g_known_m);
+    const auto k = g_known.find(id);
+    uint32_t value = kStatePending;
+    if (k != g_known.end()) {
+        const auto s = k->second.subs.find(sub);
+        value = s != k->second.subs.end() ? s->second : k->second.has_all ? k->second.all : kStatePending;
+    }
+    std::snprintf(text, capacity, "kind=%u list_covered=%u list_complete=%u registered=%u state=0x%x marks=%u unknown_submissions=%u disabled=%u unhooked_queues=%llu",
+                  kind, covered ? 1u : 0u, complete ? 1u : 0u, k != g_known.end() ? 1u : 0u, value,
+                  k != g_known.end() ? k->second.in_flight : 0u, g_unknown_inflight,
+                  g_known_disabled.load() ? 1u : 0u, static_cast<unsigned long long>(g_unhooked_queues.load()));
 }
 bool KnownSubStateInCurrentSubmission(na_object_id id, uint32_t sub, uint32_t* state)
 {

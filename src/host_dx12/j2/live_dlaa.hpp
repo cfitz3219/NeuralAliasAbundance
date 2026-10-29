@@ -95,6 +95,8 @@ struct Stats {
     int64_t camera_inv_delta = 0; // bytes from the ViewProjection to its inverse in the camera block
     int64_t camera_proj_delta = 0; // bytes to the camera's separate projection matrix (0 = none found)
     uint64_t jitter_proj_writes = 0; // J1: projection matrices replaced by jittered copies
+    uint64_t jitter_rebased = 0;     // frames whose camera block still held the previous sample (game did not re-upload)
+    char depth_state_evidence[256] = {}; // last refusal's recording/store facts, not an inferred cause
     // J1 coverage: lists drawn after this frame's DLAA that still use the jittered
     // camera / the scene depth (unresolved shake), and camera-slot blocks holding a
     // different camera (not jittered).
@@ -122,7 +124,7 @@ struct Stats {
     uint64_t class_rejected_skips = 0;   // consumers skipped because their class is a known temporary reader
     uint64_t barrier_matched = 0;        // inline recordings at a learned scene-completion barrier (final producer)
     uint64_t barrier_vetoes = 0;         // boundary-matcher candidates blocked at a barrier known to be mid-scene
-    uint64_t barrier_ambiguous_skips = 0; // barriers whose pattern is seen both mid-scene and at completion (boundary matcher not allowed)
+    uint64_t barrier_ambiguous_skips = 0; // barriers whose pattern is seen both mid-scene and at completion (only the boundary matcher may fire there)
     uint64_t barrier_contradictions = 0;  // barrier placements followed by more scene work (that pattern demoted)
     uint64_t history_resets = 0;          // DLAA history restarted because the route changed
     uint64_t class_contradictions = 0;   // class-triggered frames followed by more scene content (class demoted)
