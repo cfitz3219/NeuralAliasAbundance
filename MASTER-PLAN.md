@@ -501,3 +501,7 @@ Checked Argon's drop-in against ABI 0.2: the `PIPELINE_CREATED` depth/blend fiel
 ### 2026-10-29 - PBZ pre-FG NR integration handoff
 
 Cort's explicit pre-FG integration and reversible installer request is implemented at c38f7a1 (PR59), tested with real DX12/fake-model integration and Home regressions, and packaged in Documents/NA-PBZ-package-c38f7a1. Launch with Documents/NA-pbz-update.cmd only when PBZ is closed. Astra completed integration, latest Opus shutdown finding, automated evidence and packaging; user retains deployment/game testing. Live quality/flicker/lockup confirmation remains unmeasured, not a passing gate. COMMS/HANDOFF and production docs/PBZ-PRE-FG-NR.md contain receipts. No further broad review cycle or autonomous game action.
+
+### 2026-10-29 - Future ideas (Cort: noted, not now)
+
+- **RTX Video SDK (NVIDIA): RTX Video HDR (SDR to HDR10) and RTX Video Super Resolution.** NGX-based, works on D3D11/D3D12 images, no game source needed. HDR would give SDR games an AI HDR picture in our pipeline (alongside NR). VSR is a picture-only upscaler, a possible fallback where depth/motion can't be acquired. Needs the SDK download (developer sign-in) to confirm API and redistribution terms. Cort: "we won't do it now". https://developer.nvidia.com/rtx-video-sdk
