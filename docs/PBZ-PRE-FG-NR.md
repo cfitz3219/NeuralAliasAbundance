@@ -141,3 +141,38 @@ paired output/subrect/HDR/cache tests and Home backlog. Final no-manual-observat
 native hook regression also passed (0.47 seconds). Additive installer/rollback
 fixture passed. These use a fake NR model and do not prove NVIDIA model quality
 or PBZ visual continuity. No game launch, deployment or native DLL change.
+
+## Live-result correction: optional identity and compute FG (2026-10-29)
+
+This supersedes the earlier mandatory BackbufferFrameID / DIRECT-list contract.
+Cort reported MissingIdentity in focus, apparent engagement after losing focus,
+and worse rapid flicker. Copied live status/observe/startup logs to
+local/pbz-native-identity-20261029. Installed283e1a0 hash was verified. Across43399
+FG evaluations frame_id_calls remained0; preFG NR evaluated0. Direct and compute
+FG lists appeared, with route switching to Present and old NR evals8764. Thus
+this was not the intended preFG path visually failing: it never evaluated NR.
+
+Two implementation defects corrected: optional native identity incorrectly made
+mandatory, and COMPUTE lists excluded from route ownership/evaluation. The native
+route now registers on feature creation and handles both DIRECT and COMPUTE.
+NVIDIA's nvsdk_ngx_defs_dlssg.h marks BackbufferFrameID optional; its
+nvsdk_ngx_params_dlssg.h defaults multiFrameCount and multiFrameIndex to1/1.
+Without an explicit ID, legacy calls each describe a real-frame pair; explicit
+MFG index1 starts a pair, subsequent inner indices reuse that pair's result.
+Malformed or incomplete inner sequences are not treated as a new frame. No SR
+call count, window focus or global generated-frame Present count is used. An ID
+source change resets the cache/history while outstanding recordings retain old
+resources. NR is not started halfway through an unenhanced MFG group.
+
+Primary source: https://github.com/NVIDIA/DLSS/blob/main/include/nvsdk_ngx_params_dlssg.h
+and corresponding defs header. The legacy fallback cannot distinguish an
+application retry that supplies no ID and resubmits the same picture as a new
+FG invocation; explicit native IDs remain preferred. This is not a global
+render-frame identity or permission to overlap calls on one FG feature.
+
+Release and22focused tests pass9.30s. New RTX/debug-layer coverage: missing ID
+with3inner frames on direct and compute queues, legacy missing count/index on
+compute, route ownership before first evaluate, native ID0, malformed sequences.
+NVIDIA model/actual PBZ display continuity still require Cort's test. No game
+launch/control/deployment. Opus owns resolution/model selection; Astra changed
+only the native route registration line in ngx_observe's FG creation branch.

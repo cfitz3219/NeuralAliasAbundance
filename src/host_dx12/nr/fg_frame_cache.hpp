@@ -5,8 +5,9 @@
 
 namespace na::nr {
 // One cache per native FG feature incarnation (core + handle + creation).
-// The native BackbufferFrameID identifies a real image, not MultiFrameIndex,
-// a texture pointer, a Present, or the CPU call count. No inferred identity.
+// The caller supplies either BackbufferFrameID or a feature-local real-pair
+// identity resolved from the NGX legacy/MFG protocol (FgIdentity). Global
+// Presents, SR calls and texture pointer reuse do not identify a pair.
 // Externally serialized by the feature owner. Payloads/GPU fences live in the
 // owner's matching slots; this class does not claim GPU completion itself.
 class FgFrameCache {

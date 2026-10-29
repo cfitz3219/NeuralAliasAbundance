@@ -572,9 +572,9 @@ void write_status_line()
             static_cast<unsigned long long>(native.skipped),native.avg_ms,native.gpu_samples,native.reason);
         if(bytes>0)WriteFile(f,fg_inputs,static_cast<DWORD>((std::min)(bytes,static_cast<int>(sizeof(fg_inputs)-1))),&written,nullptr);
         const int state_bytes=snprintf(fg_inputs,sizeof(fg_inputs),
-            "nr_pre_fg_delivery frame_id=%llu states_known=%u color_state=0x%x hudless_state=0x%x backbuffer_is_swapchain=%u output_real=%u output_real_is_swapchain=%u\r\n",
+            "nr_pre_fg_delivery frame_id=%llu states_known=%u color_state=0x%x hudless_state=0x%x backbuffer_is_swapchain=%u output_real=%u output_real_is_swapchain=%u identity=%u inner=%u/%u list_type=%u\r\n",
             static_cast<unsigned long long>(native.frame_id),native.input_states_known,native.color_state,native.hudless_state,
-            native.backbuffer_is_swapchain,native.output_real_present,native.output_real_is_swapchain);
+            native.backbuffer_is_swapchain,native.output_real_present,native.output_real_is_swapchain,native.identity_mode,native.multi_index,native.multi_count,native.list_type);
         if(state_bytes>0)WriteFile(f,fg_inputs,static_cast<DWORD>((std::min)(state_bytes,static_cast<int>(sizeof(fg_inputs)-1))),&written,nullptr);
     }
     // Worker-thread snapshots only: no GPU waits or readbacks in callbacks.

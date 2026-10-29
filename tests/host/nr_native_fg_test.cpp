@@ -32,7 +32,9 @@ float delta=.125f;
 bool fail=false;
 int core,fg;
 constexpr uint32_t W=8,H=4;
-constexpr auto ReadState=D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+auto ReadState=D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+D3D12_COMMAND_LIST_TYPE list_type=D3D12_COMMAND_LIST_TYPE_DIRECT;
+bool native_identity=true,legacy_pair=false;
 int32_t __cdecl Alloc(void** p){auto* v=new test::FakeParams;*p=v;allocations.insert(v);return 1;}
 int32_t __cdecl Destroy(void* p){allocations.erase(static_cast<test::FakeParams*>(p));delete static_cast<test::FakeParams*>(p);return 1;}
 int32_t __cdecl Create(void*,uint32_t feature,void*,void** p){CHECK(feature==18);auto* h=new int(++creates);*p=h;alive.insert(creates);handles.insert(h);
@@ -121,14 +123,14 @@ void CheckImage(Image& im,uint32_t w,bool hud,bool enhanced){void* data=nullptr;
 }
 void Params(test::FakeParams& p,Image& b,Image& h,ID3D12Resource* depth,ID3D12Resource* mv,uint64_t id,uint32_t w){
     p.Set("DLSSG.Backbuffer",b.texture.Get());p.Set("DLSSG.HUDLess",h.texture.Get());p.Set("DLSSG.Depth",depth);p.Set("DLSSG.MVecs",mv);
-    p.Set("DLSSG.BackbufferFrameID",static_cast<unsigned long long>(id));p.Set("DLSSG.ColorBuffersHDR",b.format==DXGI_FORMAT_R32G32B32A32_FLOAT?0u:1u);
+    if(native_identity)p.Set("DLSSG.BackbufferFrameID",static_cast<unsigned long long>(id));p.Set("DLSSG.ColorBuffersHDR",b.format==DXGI_FORMAT_R32G32B32A32_FLOAT?0u:1u);
     p.Set("DLSSG.MvecScaleX",1.f/3);p.Set("DLSSG.MvecScaleY",1.f/2);
     const char* names[]={"InputBackbuffer","HUDLess","Depth","MVecs"};const uint32_t xs[]={b.x,h.x,0,0},ys[]={b.y,h.y,0,0};
     for(int i=0;i<4;++i){char key[100];const char* suffix[]={"BaseX","BaseY","Width","Height"};const uint32_t v[]={xs[i],ys[i],i<2?w:3,i<2?H:2};
         for(int j=0;j<4;++j){snprintf(key,sizeof(key),"DLSSG.%sSubrect%s",names[i],suffix[j]);p.Set(key,v[j]);}}
 }
 int Frame(uint64_t id,uint32_t w= W,DXGI_FORMAT fmt=DXGI_FORMAT_R32G32B32A32_FLOAT,bool discard=false,bool backlog=false,bool enabled=true){
-    test::List list;REQUIRE(list.Create(d.device.Get()));Image b,h;REQUIRE(Make(list,b,1,2,w,true,fmt)==0);REQUIRE(Make(list,h,2,1,w,false,fmt)==0);
+    test::List list;REQUIRE(list.Create(d.device.Get(),list_type));Image b,h;REQUIRE(Make(list,b,1,2,w,true,fmt)==0);REQUIRE(Make(list,h,2,1,w,false,fmt)==0);
     auto depth=test::CreateTexture(d.device.Get(),3,2,DXGI_FORMAT_R32_FLOAT,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_FLAG_NONE);
     auto mv=test::CreateTexture(d.device.Get(),3,2,DXGI_FORMAT_R16G16_FLOAT,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_FLAG_NONE);
     D3D12_RESOURCE_BARRIER guides[]={test::Transition(depth.Get(),D3D12_RESOURCE_STATE_COMMON,ReadState),test::Transition(mv.Get(),D3D12_RESOURCE_STATE_COMMON,ReadState)};
@@ -136,11 +138,13 @@ int Frame(uint64_t id,uint32_t w= W,DXGI_FORMAT fmt=DXGI_FORMAT_R32G32B32A32_FLO
     test::FakeParams p;Params(p,b,h,depth.Get(),mv.Get(),id,w);na::nr::native::Prepare(list.list.Get());
     na::nr::native::MarkSwapchainBuffer(b.texture.Get());
     na::settings::Get().nr_enabled=enabled;const auto before=evaluates;
-    for(uint32_t m=1;m<=3;++m){p.Set("DLSSG.MultiFrameIndex",m);na::nr::native::Before(list.list.Get(),&core,&fg,&p,Runtime());}
+    for(uint32_t m=1;m<=(legacy_pair?1u:3u);++m){
+        if(!legacy_pair){p.Set("DLSSG.MultiFrameCount",3u);p.Set("DLSSG.MultiFrameIndex",m);}
+        na::nr::native::Before(list.list.Get(),&core,&fg,&p,Runtime());}
     CHECK(evaluates==before+(enabled?1:0));
     if(enabled&&!fail)CHECK(na::nr::native::GetStatus().active);
     if(enabled){const auto status=na::nr::native::GetStatus();CHECK(status.backbuffer_is_swapchain && !status.output_real_present);
-        CHECK(status.input_states_known && status.color_state==ReadState && status.hudless_state==ReadState);}
+        CHECK(status.input_states_known && status.color_state==static_cast<uint32_t>(ReadState) && status.hudless_state==static_cast<uint32_t>(ReadState));}
     // Original FG sees the already-modified pair, on its own command list.
     Read(list,b);Read(list,h);REQUIRE(SUCCEEDED(list.list->Close()));
     if(discard){na::nr::OnCommandListReset(list.list.Get());na::nr::native::Maintain();return 0;}
@@ -176,6 +180,17 @@ int main(){
     REQUIRE(Frame(0)==0); // fresh core/feature incarnation may restart frame IDs
     na::nr::native::Release(&core,nullptr);na::nr::native::Maintain();CHECK(creates==releases+orphaned);
     CHECK(allocations.empty() && handles.empty() && reentrant_forwards==creates);
+    native_identity=false;na::nr::native::Register(&core,&fg);CHECK(na::nr::native::OwnsRoute());
+    REQUIRE(Frame(0)==0);REQUIRE(Frame(1)==0); // missing optional ID, explicit MFG group
+    na::nr::native::Release(&core,nullptr);
+    list_type=D3D12_COMMAND_LIST_TYPE_COMPUTE;ReadState=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    d.WaitIdle();D3D12_COMMAND_QUEUE_DESC q{};q.Type=list_type;d.queue.Reset();
+    REQUIRE(SUCCEEDED(d.device->CreateCommandQueue(&q,IID_PPV_ARGS(&d.queue))));
+    na::nr::native::Register(&core,&fg);CHECK(na::nr::native::OwnsRoute());
+    REQUIRE(Frame(0)==0);REQUIRE(Frame(1)==0); // PBZ compute list, no optional ID
+    legacy_pair=true;na::nr::native::Release(&core,nullptr);
+    REQUIRE(Frame(2)==0);REQUIRE(Frame(3)==0); // pre-MFG API defaults, one pair/evaluate
+    na::nr::native::Release(&core,nullptr);na::nr::native::Maintain();
     if(info)for(UINT64 i=0;i<info->GetNumStoredMessages();++i){SIZE_T n=0;info->GetMessage(i,nullptr,&n);std::vector<char> buf(n);auto* m=reinterpret_cast<D3D12_MESSAGE*>(buf.data());info->GetMessage(i,m,&n);
         if(m->Severity<=D3D12_MESSAGE_SEVERITY_ERROR){std::printf("D3D12: %s\n",m->pDescription);CHECK(false);}}
     return test::finish("nr_native_fg_test");

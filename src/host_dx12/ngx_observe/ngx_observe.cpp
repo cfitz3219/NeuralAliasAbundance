@@ -360,6 +360,7 @@ NgxResult CreateFeatureImpl(CoreSlot& s, void* cmd_list, uint32_t feature_id, vo
     if (r != 1) g_create_failures.fetch_add(1, std::memory_order_relaxed);
     if (r == 1 && feature_id == 11 && out_handle && *out_handle) {
         na::nr::native::Release(&s,*out_handle); // new feature incarnation, even if the core reuses a handle address
+        na::nr::native::Register(&s,*out_handle); // compute FG owns the route too, before its first evaluate
         na::nr::native::Prepare(static_cast<ID3D12GraphicsCommandList*>(cmd_list));
         g_fg_last_create_uir.store(inspect_fg_create_uir(params));
         std::lock_guard<std::mutex> lock(g_confirm_m);

@@ -1,6 +1,7 @@
 #include "test_support.hpp"
 #include "fake_ngx_params.hpp"
 #include "host_dx12/nr/fg_contract.hpp"
+#include "host_dx12/nr/fg_identity.hpp"
 int main() {
     test::FakeParams p;
     p.Set("Width",999u); p.Set("MV.Scale.X",42.f);
@@ -23,5 +24,15 @@ int main() {
     CHECK(f.has_multi_index && f.multi_index==2 && f.multi_count==3);
     CHECK(p.non_fg_reads==0);
     CHECK(!na::nr::ReadFgContract(nullptr).has_frame_id);
+    na::nr::FgIdentity identity;na::nr::FgContract legacy;
+    CHECK(identity.Resolve(legacy)==1 && identity.mode==na::nr::FgIdentity::LegacyPair);
+    CHECK(identity.Resolve(legacy)==2); // repeated resource addresses do not mean the same legacy pair
+    legacy.has_multi_count=legacy.has_multi_index=true;legacy.multi_count=3;legacy.multi_index=1;
+    CHECK(identity.Resolve(legacy)==3);legacy.multi_index=2;CHECK(identity.Resolve(legacy)==3);
+    CHECK(identity.Resolve(legacy)==3);legacy.multi_index=3;CHECK(identity.Resolve(legacy)==3);
+    legacy.multi_index=1;CHECK(identity.Resolve(legacy)==4);
+    legacy.multi_index=3;CHECK(!identity.Resolve(legacy)); // missing inner frame is not guessed
+    legacy.multi_count=0;CHECK(!identity.Resolve(legacy));
+    legacy.has_frame_id=true;legacy.frame_id=0;CHECK(identity.Resolve(legacy)==0);
     return test::finish("nr_fg_contract_test");
 }

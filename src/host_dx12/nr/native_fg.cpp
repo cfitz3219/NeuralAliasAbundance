@@ -4,6 +4,7 @@
 #include "host_dx12/nr/fg_frame_cache.hpp"
 #include "host_dx12/nr/fg_color.hpp"
 #include "host_dx12/nr/fg_states.hpp"
+#include "host_dx12/nr/fg_identity.hpp"
 #include "host_dx12/hooking/variant_registry.hpp"
 #include "host_dx12/settings.hpp"
 #include "host_dx12/dlss/call_origin.hpp"
@@ -106,6 +107,8 @@ struct Packet {
 struct Context {
     const void* core=nullptr; const void* handle=nullptr;
     FgFrameCache cache;
+    FgIdentity identity;
+    uint32_t identity_mode=0;
     std::shared_ptr<Feature> feature;
     std::shared_ptr<Packet> packets[FgFrameCache::Capacity];
     bool live[FgFrameCache::Capacity]{};
@@ -237,6 +240,13 @@ void CopyRegion(ID3D12GraphicsCommandList* list,ID3D12Resource* source,FgSurface
 }
 }
 bool OwnsRoute(){return contexts_count.load()!=0;}
+void Register(const void* core,const void* handle){
+    std::lock_guard<std::mutex> lock(mutex);
+    for(auto& c:contexts)if(c->core==core && c->handle==handle)return;
+    if(contexts.size()>=8)return;
+    auto c=std::make_unique<Context>();c->core=core;c->handle=handle;contexts.push_back(std::move(c));
+    contexts_count.store(static_cast<uint32_t>(contexts.size()));
+}
 void PrepareDevice(ID3D12Device* device) {
     if(device){PrepareFgComposition(device);PrepareFgColor(device);}
 }
@@ -274,7 +284,7 @@ void CoreShutdown(const void* core) {
 Status GetStatus(){std::unique_lock<std::mutex> lock(mutex,std::try_to_lock);if(lock.owns_lock()){auto s=status;s.submitted=submissions.load();return s;} Status s;strcpy_s(s.reason,"Updating Neural Rendering.");return s;}
 void MarkSwapchainBuffer(ID3D12Resource* r){if(r){const UINT value=1;r->SetPrivateData(swapchain_key,sizeof(value),&value);}}
 void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,const void* parameters,const Runtime& runtime) {
-    if(!list || !parameters || list->GetType()!=D3D12_COMMAND_LIST_TYPE_DIRECT)return;
+    if(!list || !parameters || (list->GetType()!=D3D12_COMMAND_LIST_TYPE_DIRECT && list->GetType()!=D3D12_COMMAND_LIST_TYPE_COMPUTE))return;
     if(internal)return;Internal guard;na::dlss::InjectorCallScope origin;
     std::lock_guard<std::mutex> lock(mutex);Collect();
     Context* ctx=nullptr; for(auto& c:contexts)if(c->core==core && c->handle==handle)ctx=c.get();
@@ -286,7 +296,17 @@ void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,
     status.backbuffer_is_swapchain=IsSwapchain(f.color.resource);
     status.output_real_present=f.real_output.resource!=nullptr;
     status.output_real_is_swapchain=IsSwapchain(f.real_output.resource);
-    if(!f.has_frame_id){++status.skipped;Reason("Neural Rendering needs the native FG real-frame identity.");return;}
+    const auto identity=ctx->identity.Resolve(f);
+    status.identity_mode=ctx->identity.mode;status.multi_count=f.has_multi_count?f.multi_count:1;
+    status.multi_index=f.has_multi_index?f.multi_index:1;status.list_type=list->GetType();
+    if(!identity){++status.skipped;Reason("Neural Rendering needs a valid native FG inner-frame sequence.");return;}
+    if(ctx->identity_mode!=ctx->identity.mode){
+        // IDs from different protocols must not collide. Recordings retain
+        // old payloads independently until their submitted GPU work retires.
+        ctx->cache={};for(auto& p:ctx->packets)p.reset();for(auto& live:ctx->live)live=false;
+        ctx->feature.reset();ctx->identity_mode=ctx->identity.mode;
+    }
+    f.frame_id=*identity;status.frame_id=f.frame_id;
     if(!f.camera_motion || f.motion_jittered){++status.skipped;Reason("Neural Rendering needs unjittered camera-inclusive motion vectors.");return;}
     if(!Region(f.color) || !Region(f.hudless) || !Region(f.depth) || !Region(f.motion) ||
         f.color.region.width!=f.hudless.region.width || f.color.region.height!=f.hudless.region.height ||
@@ -310,6 +330,10 @@ void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,
         if(ctx->cache.RetireCompleted(ctx->tickets[i]))ctx->live[i]=false;
     }
     auto decision=ctx->cache.Acquire(f.frame_id);
+    if(decision.action==FgFrameCache::Action::Record && !f.has_frame_id && status.multi_index>1){
+        ctx->cache.AbandonUnsubmitted(decision.ticket);++status.skipped;
+        Reason("Neural Rendering did not enhance the first FG inner frame.");return;
+    }
     if(decision.action==FgFrameCache::Action::Full || decision.action==FgFrameCache::Action::Expired || decision.action==FgFrameCache::Action::Pending){++status.skipped;Reason("Neural Rendering is waiting for its real-frame cache.");return;}
     const auto index=decision.ticket.slot;
     auto& packet=ctx->packets[index];
@@ -422,6 +446,7 @@ void Before(ID3D12GraphicsCommandList*,const void*,const void*,const void*,const
 void Release(const void*,const void*){} void Prepare(ID3D12GraphicsCommandList*){} void Maintain(){}
 void PrepareDevice(ID3D12Device*){}
 void MarkSwapchainBuffer(ID3D12Resource*){}
+void Register(const void*,const void*){}
 void CoreShutdown(const void*){}
 void Reset(ID3D12GraphicsCommandList*){} bool OwnsRoute(){return false;} Status GetStatus(){return {};}
 Submission::Submission(ID3D12CommandQueue*,UINT,ID3D12CommandList* const*){} Submission::~Submission(){}
