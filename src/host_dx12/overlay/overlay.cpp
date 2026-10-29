@@ -1,6 +1,7 @@
 #include "host_dx12/adapters/tlou1/timing.hpp"
 #include "host_dx12/adapters/tlou1/apply.hpp"
 #include "host_dx12/overlay/overlay.hpp"
+#include "host_dx12/overlay/input_handover.hpp"
 
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -117,6 +118,8 @@ UINT real_index(IDXGISwapChain* sc)
 }
 std::atomic<int> g_color_space{DXGI_COLOR_SPACE_CUSTOM}; // last SetColorSpace1 on the game's chain
 XInputGetStateFn g_orig_xinput[3] = {};
+std::atomic<XInputGetStateFn> g_menu_xinput{nullptr};
+uint64_t g_pad_retry_after=0; // render thread, under g_state.mutex
 
 std::atomic<ID3D12CommandQueue*> g_direct_queue{nullptr};
 
@@ -900,8 +903,7 @@ struct InputState {
     float wheel = 0;
     struct Key { int vk; bool down; };
     std::vector<Key> keys;
-    XINPUT_STATE pad{};
-    bool pad_valid = false;
+    input::ReleaseBeforeUse mouse_handover[3], pad_handover;
     RECT client{};
 };
 InputState g_in;
@@ -1223,16 +1225,11 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 }
 
 // ---- XInput detour: the game sees a neutral pad while the menu is open;
-// the menu reads the real state from the snapshot. ----
+// the menu polls the original independently (the game may stop polling). ----
 DWORD WINAPI xinput_common(int slot, DWORD idx, XINPUT_STATE* st)
 {
     DWORD r = g_orig_xinput[slot](idx, st);
     if (r == ERROR_SUCCESS && st && idx == 0) {
-        {
-            std::lock_guard<std::mutex> lock(g_in.m);
-            g_in.pad = *st;
-            g_in.pad_valid = true;
-        }
         if (g_open.load(std::memory_order_acquire)) {
             XINPUT_GAMEPAD neutral{};
             st->Gamepad = neutral;
@@ -1267,6 +1264,15 @@ ImGuiKey vk_to_key(int vk)
 void apply_input(bool just_opened)
 {
     ImGuiIO& io = ImGui::GetIO();
+    XINPUT_GAMEPAD fresh_pad{};
+    const auto now=GetTickCount64();
+    if (now>=g_pad_retry_after) {
+        bool connected=false;
+        fresh_pad=input::FreshPad(g_menu_xinput.load(std::memory_order_acquire),&connected);
+        // Disconnected XInput polling can be expensive. Keep sending releases
+        // between probes; a connected controller is sampled every menu frame.
+        g_pad_retry_after=connected ? 0 : now+1000;
+    }
     std::lock_guard<std::mutex> lock(g_in.m);
     GetClientRect(g_state.hwnd, &g_in.client);
     if (just_opened) {
@@ -1294,7 +1300,7 @@ void apply_input(bool just_opened)
     const int vks[3] = {VK_LBUTTON, VK_RBUTTON, VK_MBUTTON};
     for (int b = 0; b < 3; ++b) {
         bool down = (real_get_async_key_state(vks[b]) & 0x8000) != 0;
-        if (just_opened) down = false; // the click that opened nothing must not select
+        down = g_in.mouse_handover[b].Update(down, just_opened);
         io.AddMouseButtonEvent(b, down);
     }
     if (g_in.wheel != 0.0f) {
@@ -1306,8 +1312,11 @@ void apply_input(bool just_opened)
         if (key != ImGuiKey_None) io.AddKeyEvent(key, k.down);
     }
     g_in.keys.clear();
-    if (g_in.pad_valid) {
-        const XINPUT_GAMEPAD& g = g_in.pad.Gamepad;
+    {
+        if (!g_in.pad_handover.Update(input::Navigating(fresh_pad), just_opened)) fresh_pad = {};
+        const XINPUT_GAMEPAD& g = fresh_pad;
+        // Always send up/zero events on disconnect or failed polling. Skipping
+        // these events leaves ImGui's previous buttons/axes held indefinitely.
         auto btn = [&](ImGuiKey key, WORD mask) { io.AddKeyEvent(key, (g.wButtons & mask) != 0); };
         btn(ImGuiKey_GamepadDpadUp, XINPUT_GAMEPAD_DPAD_UP);
         btn(ImGuiKey_GamepadDpadDown, XINPUT_GAMEPAD_DPAD_DOWN);
@@ -2454,8 +2463,10 @@ bool Start(const char* route_tag, PanelFn controls)
         if (!m) continue;
         void* target = reinterpret_cast<void*>(GetProcAddress(m, "XInputGetState"));
         if (target && na::hooking::HookFunction(target, detours[i],
-                                                reinterpret_cast<void**>(&g_orig_xinput[i])))
+                                                reinterpret_cast<void**>(&g_orig_xinput[i]))) {
             ++hooked;
+            if (!g_menu_xinput.load(std::memory_order_relaxed)) g_menu_xinput.store(g_orig_xinput[i],std::memory_order_release);
+        }
     }
     g_gamepad_hooked.store(hooked);
     install_input_hooks(); // A44: the game sees no mouse/keyboard while the menu is open
@@ -2568,6 +2579,8 @@ bool Stop()
     g_state.swapchain = nullptr;
     g_state.buffers_ready = false;
     g_state.was_open = false;
+    g_menu_xinput.store(nullptr,std::memory_order_release);
+    g_pad_retry_after=0;
     g_initialized.store(0, std::memory_order_release);
     g_stopping.store(false, std::memory_order_release); // a later Start may run again
     return true;

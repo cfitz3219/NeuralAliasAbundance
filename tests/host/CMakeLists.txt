@@ -67,6 +67,7 @@ na_host_test(capture_test SOURCES capture_test.cpp LIBS host_capture
              ARGS "${CMAKE_CURRENT_BINARY_DIR}/capture-test-out")
 
 na_host_test(overlay_test SOURCES overlay_test.cpp LIBS host_dx12 user32)
+na_host_test(overlay_input_handover_test SOURCES overlay_input_handover_test.cpp LIBS host_dx12)
 add_test(NAME host_overlay_hardware_test COMMAND overlay_test --hardware)
 set_tests_properties(host_overlay_hardware_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "host;gpu")
 

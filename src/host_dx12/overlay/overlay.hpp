@@ -16,7 +16,8 @@
 // user32 entry points a game may read input through directly
 // (GetRawInputData/Buffer, GetCursorPos/SetCursorPos, GetAsyncKeyState,
 // GetKeyboardState) are hooked so every thread but the overlay's own sees a
-// frozen cursor, no buttons and no keys. Controller input is read through an XInputGetState hook:
+// frozen cursor, no buttons and no keys. Controller input uses an XInputGetState hook
+// with independent live menu polling (never a stale game-poll snapshot):
 // the game sees a neutral pad while the menu is open; the menu navigates
 // with d-pad/left stick, A = select, B = back. Closing with Home restores
 // everything. The game itself keeps running (we cannot pause its
