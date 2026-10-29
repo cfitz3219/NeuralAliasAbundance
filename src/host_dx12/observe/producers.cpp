@@ -3165,6 +3165,8 @@ void mip_on_reset(GL* l, ID3D12PipelineState*& p)
 constexpr uint32_t kThunks = 4;
 std::atomic<void (*)(ID3D12GraphicsCommandList*)> g_reset_listener{nullptr};
 bool g_reset_registered = false; // installation thread only
+bool g_barriers_registered=false;
+std::atomic<void (*)(ID3D12GraphicsCommandList*,UINT,const D3D12_RESOURCE_BARRIER*)> g_barrier_listener{nullptr};
 std::atomic<bool> g_full_list_tracking{false};
 template <uint32_t Slot, typename Sig>
 struct ListHook;
@@ -3177,6 +3179,10 @@ struct ListHook<Slot, R(A...)> {
     {
         na::hooking::variants::CallScope scope(l, Slot);
         auto fn = reinterpret_cast<Pfn>(orig[I]);
+        if constexpr (Slot == sl::list::ResourceBarrier) {
+            if(scope.outermost && !scope.ambiguous)if(auto listener=g_barrier_listener.load())listener(l,a...);
+            if(!g_full_list_tracking.load()){fn(l,a...);return;}
+        }
         if constexpr (Slot == sl::list::Reset) {
             if (!g_full_list_tracking.load(std::memory_order_acquire)) {
                 const R r = fn(l, a...);
@@ -3284,10 +3290,11 @@ bool register_list_slots()
         ListHook<L::ExecuteIndirect, void(ID3D12CommandSignature*, UINT, ID3D12Resource*, UINT64, ID3D12Resource*, UINT64)>::spec(),
     };
     std::vector<na::hooking::variants::SlotSpec> remaining;
-    for (const auto& spec : specs) if (spec.slot != L::Reset || !g_reset_registered) remaining.push_back(spec);
+    for (const auto& spec : specs) if ((spec.slot != L::Reset || !g_reset_registered) &&
+        (spec.slot!=L::ResourceBarrier || !g_barriers_registered)) remaining.push_back(spec);
     const bool ok = na::hooking::variants::Register(na::hooking::variants::Kind::CommandList, remaining.data(),
                                                     static_cast<uint32_t>(remaining.size()));
-    if (ok) { g_reset_registered = true; g_full_list_tracking.store(true, std::memory_order_release); }
+    if (ok) { g_reset_registered = true; g_barriers_registered=true;g_full_list_tracking.store(true, std::memory_order_release); }
     return ok;
 }
 // Render passes: optional, own kind (snapshotted only through a List4 pointer).
@@ -4373,10 +4380,19 @@ std::atomic<bool> g_requested{false};
 std::atomic<bool> g_active{false};
 } // namespace
 
-bool InstallListResetTracking(ID3D12Device* device, void (*listener)(ID3D12GraphicsCommandList*))
+bool InstallListResetTracking(ID3D12Device* device, void (*listener)(ID3D12GraphicsCommandList*),
+    void (*barriers)(ID3D12GraphicsCommandList*,UINT,const D3D12_RESOURCE_BARRIER*))
 {
     if (!device || !listener) return false;
     g_reset_listener.store(listener, std::memory_order_release);
+    if(barriers) {
+        g_barrier_listener.store(barriers);
+        if(!g_barriers_registered){
+            const auto spec=ListHook<sl::list::ResourceBarrier,void(UINT,const D3D12_RESOURCE_BARRIER*)>::spec();
+            if(!na::hooking::Initialize() || !na::hooking::variants::Register(na::hooking::variants::Kind::CommandList,&spec,1))return false;
+            g_barriers_registered=true;
+        }
+    }
     if (!g_reset_registered) {
         const auto spec = ListHook<sl::list::Reset, HRESULT(ID3D12CommandAllocator*, ID3D12PipelineState*)>::spec();
         if (!na::hooking::Initialize() ||

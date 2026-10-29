@@ -96,3 +96,48 @@ must not be presented as that live confirmation.
 
 The old comments' NR-INSERTION-DESIGN.md and NR-TLOU-I-REPLAY.md were not found
 in fetched repository history; they are not evidence for this implementation.
+
+## Final peer-review corrections (2026-10-29)
+
+Opus reviewed 2ec66f0/c38f7a1 and accepted the connected placement, PQ ordering,
+real-frame deduplication, Present suppression, timing, shutdown ownership and
+additive installer. His remaining items have these dispositions:
+
+1. Unclean-session startup is implemented. A per-profile session marker survives
+   force termination, nonzero exit and watchdog freezes. Clean ExitProcess(0)
+   removes it unless the watchdog already recorded failure. Next launch starts
+   rendering overrides off, leaves Home available and preserves saved choices.
+   Explicit re-enablement saves normally. Driver FG overrides are restored using
+   the existing per-game backup; restoration failures are visible in Home.
+   This only detects sessions that ran marker-aware builds; it cannot reconstruct
+   a crash before the marker existed. The controlled child-process test verifies
+   actual hooked clean exit, forced termination and watchdog-marked exit.
+2. Submission no longer acquires the native context mutex. Only lists carrying
+   an NR recording token acquire their own recording lock. Shared recording
+   leases retain resources across forwarding. Ordinary game/NGX helper submits
+   do not wait on model creation. A helper-thread submit during fake model
+   creation is the regression, not a same-thread TLS-only test. Timestamp reads
+   wait for recording retirement as well as GPU completion, preventing reuse
+   races while a list can still be resubmitted.
+3. Input states come from observed legacy barriers on the actual command list.
+   Color, HUDless, depth and motion are normalized for NR and restored to their
+   exact observed states. Split begins, alias changes, Reset and enhanced
+   barriers invalidate old evidence. Unobserved/carried states and enhanced-only
+   inputs wait with a visible reason; no arbitrary state is substituted. The RTX
+   fixture now uses combined shader-read states and actual barrier detours,
+   without manually feeding observations. The debug layer reports no errors.
+4. Status now records real-frame identity, state evidence, and whether native FG
+   Backbuffer/OutputReal are tagged DXGI swapchain resources. These markers retain
+   no swapchain references. This is diagnostic evidence, not a claim that pointer
+   inequality proves missing real frames: Streamline can copy internal resources.
+   The pinned NGX header explicitly describes OutputReal as optional. No guessed
+   Present copy of the latest NR frame was added. Actual PBZ real/generated-frame
+   continuity remains part of Cort's live test; if neither resource is a swapchain
+   image, copy lineage or a capture must establish how the real frame is delivered.
+
+Validation: Release build; 22 focused CPU/DX12/RTX/WARP tests passed (8.65 seconds),
+including settings preservation, real process-exit hook, helper-thread submission,
+paired output/subrect/HDR/cache tests and Home backlog. Final no-manual-observation
+native hook regression also passed (0.47 seconds). Additive installer/rollback
+fixture passed. These use a fake NR model and do not prove NVIDIA model quality
+or PBZ visual continuity. No game launch, deployment or native DLL change.

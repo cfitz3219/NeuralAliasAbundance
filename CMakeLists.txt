@@ -168,6 +168,7 @@ add_library(host_dx12 STATIC
   src/host_dx12/nr/fg_composition.cpp
   src/host_dx12/nr/fg_color.cpp
   src/host_dx12/nr/native_fg.cpp
+  src/host_dx12/nr/fg_states.cpp
   src/host_dx12/j2/live_dlaa.cpp
   src/host_dx12/j2/nis_sharpen.cpp
   src/host_dx12/motion/live_flow.cpp
@@ -175,7 +176,8 @@ add_library(host_dx12 STATIC
   src/host_dx12/latency/pcl_stats.cpp
   src/host_dx12/adapters/tlou1/apply.cpp
   src/host_dx12/adapters/tlou1/timing.cpp
-  src/host_dx12/host_boot/host_boot.cpp)
+  src/host_dx12/host_boot/host_boot.cpp
+  src/host_dx12/host_boot/session.cpp)
 if(NA_GAME_ADAPTER_LIB)
   target_link_libraries(host_dx12 PUBLIC "${NA_GAME_ADAPTER_LIB}")
   message(STATUS "Game adapter: ${NA_GAME_ADAPTER_LIB}")

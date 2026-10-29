@@ -3,6 +3,8 @@
 #include "test_support.hpp"
 #include "fake_ngx_params.hpp"
 #include "host_dx12/nr/native_fg.hpp"
+#include "host_dx12/nr/fg_states.hpp"
+#include "host_dx12/observe/producers.hpp"
 #include "host_dx12/settings.hpp"
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
@@ -11,6 +13,7 @@
 #include <vector>
 #include <cmath>
 #include <set>
+#include <thread>
 
 namespace {
 using test::ComPtr;
@@ -29,11 +32,12 @@ float delta=.125f;
 bool fail=false;
 int core,fg;
 constexpr uint32_t W=8,H=4;
+constexpr auto ReadState=D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
 int32_t __cdecl Alloc(void** p){auto* v=new test::FakeParams;*p=v;allocations.insert(v);return 1;}
 int32_t __cdecl Destroy(void* p){allocations.erase(static_cast<test::FakeParams*>(p));delete static_cast<test::FakeParams*>(p);return 1;}
 int32_t __cdecl Create(void*,uint32_t feature,void*,void** p){CHECK(feature==18);auto* h=new int(++creates);*p=h;alive.insert(creates);handles.insert(h);
     // A runtime's internal submission must not recursively lock the NR mutex.
-    na::nr::Execute(d.queue.Get(),0,nullptr,ReentrantForward);return 1;}
+    std::thread helper([]{na::nr::Execute(d.queue.Get(),0,nullptr,ReentrantForward);});helper.join();return 1;}
 int32_t __cdecl Release(void* p){++releases;handles.erase(static_cast<int*>(p));alive.erase(*static_cast<int*>(p));delete static_cast<int*>(p);return 1;}
 int32_t __cdecl Eval(void* list,const void*,const void* params,void*) {
     ++evaluates;
@@ -102,9 +106,9 @@ int Make(test::List& list,Image& im,uint32_t bx,uint32_t by,uint32_t w,bool hud,
     }im.upload->Unmap(0,nullptr);
     D3D12_TEXTURE_COPY_LOCATION src{},dst{};src.pResource=im.upload.Get();src.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;src.PlacedFootprint=im.fp;
     dst.pResource=im.texture.Get();dst.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;list.list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
-    auto b=test::Transition(im.texture.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);list.list->ResourceBarrier(1,&b);return 0;
+    auto b=test::Transition(im.texture.Get(),D3D12_RESOURCE_STATE_COPY_DEST,ReadState);list.list->ResourceBarrier(1,&b);return 0;
 }
-void Read(test::List& list,Image& im){auto b=test::Transition(im.texture.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_SOURCE);list.list->ResourceBarrier(1,&b);
+void Read(test::List& list,Image& im){auto b=test::Transition(im.texture.Get(),ReadState,D3D12_RESOURCE_STATE_COPY_SOURCE);list.list->ResourceBarrier(1,&b);
     D3D12_TEXTURE_COPY_LOCATION src{},dst{};src.pResource=im.texture.Get();src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;dst.pResource=im.readback.Get();dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;dst.PlacedFootprint=im.fp;
     list.list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);std::swap(b.Transition.StateBefore,b.Transition.StateAfter);list.list->ResourceBarrier(1,&b);}
 void CheckImage(Image& im,uint32_t w,bool hud,bool enhanced){void* data=nullptr;CHECK(SUCCEEDED(im.readback->Map(0,nullptr,&data)));if(!data)return;
@@ -125,13 +129,18 @@ void Params(test::FakeParams& p,Image& b,Image& h,ID3D12Resource* depth,ID3D12Re
 }
 int Frame(uint64_t id,uint32_t w= W,DXGI_FORMAT fmt=DXGI_FORMAT_R32G32B32A32_FLOAT,bool discard=false,bool backlog=false,bool enabled=true){
     test::List list;REQUIRE(list.Create(d.device.Get()));Image b,h;REQUIRE(Make(list,b,1,2,w,true,fmt)==0);REQUIRE(Make(list,h,2,1,w,false,fmt)==0);
-    auto depth=test::CreateTexture(d.device.Get(),3,2,DXGI_FORMAT_R32_FLOAT,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_FLAG_NONE);
-    auto mv=test::CreateTexture(d.device.Get(),3,2,DXGI_FORMAT_R16G16_FLOAT,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_FLAG_NONE);
+    auto depth=test::CreateTexture(d.device.Get(),3,2,DXGI_FORMAT_R32_FLOAT,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_FLAG_NONE);
+    auto mv=test::CreateTexture(d.device.Get(),3,2,DXGI_FORMAT_R16G16_FLOAT,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_FLAG_NONE);
+    D3D12_RESOURCE_BARRIER guides[]={test::Transition(depth.Get(),D3D12_RESOURCE_STATE_COMMON,ReadState),test::Transition(mv.Get(),D3D12_RESOURCE_STATE_COMMON,ReadState)};
+    list.list->ResourceBarrier(2,guides);
     test::FakeParams p;Params(p,b,h,depth.Get(),mv.Get(),id,w);na::nr::native::Prepare(list.list.Get());
+    na::nr::native::MarkSwapchainBuffer(b.texture.Get());
     na::settings::Get().nr_enabled=enabled;const auto before=evaluates;
     for(uint32_t m=1;m<=3;++m){p.Set("DLSSG.MultiFrameIndex",m);na::nr::native::Before(list.list.Get(),&core,&fg,&p,Runtime());}
     CHECK(evaluates==before+(enabled?1:0));
     if(enabled&&!fail)CHECK(na::nr::native::GetStatus().active);
+    if(enabled){const auto status=na::nr::native::GetStatus();CHECK(status.backbuffer_is_swapchain && !status.output_real_present);
+        CHECK(status.input_states_known && status.color_state==ReadState && status.hudless_state==ReadState);}
     // Original FG sees the already-modified pair, on its own command list.
     Read(list,b);Read(list,h);REQUIRE(SUCCEEDED(list.list->Close()));
     if(discard){na::nr::OnCommandListReset(list.list.Get());na::nr::native::Maintain();return 0;}
@@ -146,6 +155,8 @@ int Frame(uint64_t id,uint32_t w= W,DXGI_FORMAT fmt=DXGI_FORMAT_R32G32B32A32_FLO
 int main(){
     ComPtr<ID3D12Debug> debug;if(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))debug->EnableDebugLayer();
     if(!test::CreateDevice(d))return test::SkipNoDevice("nr_native_fg_test");ComPtr<ID3D12InfoQueue> info;d.device.As(&info);
+    REQUIRE(na::nr::states::InstallEnhancedInvalidation());
+    REQUIRE(na::observe::InstallListResetTracking(d.device.Get(),na::nr::OnCommandListReset,na::nr::states::Observe));
     REQUIRE(Prepare()==0);
     REQUIRE(Frame(0)==0); // zero identity, MFG evaluates NR once
     CHECK(na::nr::native::GetStatus().gpu_samples>0);

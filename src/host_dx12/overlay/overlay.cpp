@@ -1,4 +1,5 @@
 #include "host_dx12/nr/native_fg.hpp"
+#include "host_dx12/nr/fg_states.hpp"
 #include "host_dx12/adapters/tlou1/timing.hpp"
 #include "host_dx12/adapters/tlou1/apply.hpp"
 #include "host_dx12/overlay/overlay.hpp"
@@ -500,6 +501,7 @@ void menu_note(const char* text) {
     CloseHandle(f);
 }
 int menu_fault(EXCEPTION_POINTERS* exception) {
+    na::settings::MarkSessionFailed("crash");
     if (g_menu_diagnostics) {
         char row[180];
         snprintf(row, sizeof(row), "menu_fault code=0x%08lX address=%p thread=%lu\r\n",
@@ -547,6 +549,8 @@ void write_status_line()
     if (f == INVALID_HANDLE_VALUE) return;
     DWORD written = 0;
     WriteFile(f, line, static_cast<DWORD>(n), &written, nullptr);
+    char safe_line[80];const int safe_bytes=snprintf(safe_line,sizeof(safe_line),"safe_start=%u reason=%s\r\n",na::settings::SafeStart()?1u:0u,na::settings::SafeStartReason());
+    if(safe_bytes>0)WriteFile(f,safe_line,static_cast<DWORD>(safe_bytes),&written,nullptr);
     char fg_inputs[320];
     const int fg_input_bytes = snprintf(fg_inputs, sizeof(fg_inputs),
         "native_fg_inputs evaluates=%llu available_resources=%llu hudless=%llu distortion=%llu list_type=%u color_format=%u allocation=%ux%u nr_route=%s\r\n",
@@ -567,6 +571,11 @@ void write_status_line()
             static_cast<unsigned long long>(native.submitted),static_cast<unsigned long long>(native.completed),
             static_cast<unsigned long long>(native.skipped),native.avg_ms,native.gpu_samples,native.reason);
         if(bytes>0)WriteFile(f,fg_inputs,static_cast<DWORD>((std::min)(bytes,static_cast<int>(sizeof(fg_inputs)-1))),&written,nullptr);
+        const int state_bytes=snprintf(fg_inputs,sizeof(fg_inputs),
+            "nr_pre_fg_delivery frame_id=%llu states_known=%u color_state=0x%x hudless_state=0x%x backbuffer_is_swapchain=%u output_real=%u output_real_is_swapchain=%u\r\n",
+            static_cast<unsigned long long>(native.frame_id),native.input_states_known,native.color_state,native.hudless_state,
+            native.backbuffer_is_swapchain,native.output_real_present,native.output_real_is_swapchain);
+        if(state_bytes>0)WriteFile(f,fg_inputs,static_cast<DWORD>((std::min)(state_bytes,static_cast<int>(sizeof(fg_inputs)-1))),&written,nullptr);
     }
     // Worker-thread snapshots only: no GPU waits or readbacks in callbacks.
     const auto fsr = na::ffx::GetStats();
@@ -734,7 +743,8 @@ void write_status_line()
         const auto& change=nr_writes.entries[i];
         if(change.sequence<=nr_write_logged) continue;
         const char* source=change.source==na::settings::NrWriteSource::Overlay ? "overlay" :
-            (change.source==na::settings::NrWriteSource::UserIni ? "user_ini" : "default_ini");
+            (change.source==na::settings::NrWriteSource::SafeStartup ? "safe_start" :
+            (change.source==na::settings::NrWriteSource::UserIni ? "user_ini" : "default_ini"));
         const int bytes=snprintf(nr_line,sizeof(nr_line),
             "nr_setting_write seq=%llu tick=%llu thread=%u before=%u after=%u source=%s input_flags=%u\r\n",
             change.sequence,change.tick_ms,change.thread,change.before,change.after,source,change.input_flags);
@@ -791,6 +801,7 @@ void write_status_line()
     // remains zero. The host counter advances on both presentation routes.
     const uint64_t host_presents = g_presents.load(std::memory_order_relaxed);
     if (watchdog.Check(host_presents, now)) {
+        na::settings::MarkSessionFailed("freeze");
         char hl[400];
         int m = snprintf(hl, sizeof(hl), "%02u:%02u:%02u FREEZE detected: the game's presents have not advanced for %llu ms (game_presents=%llu real_presents=%llu fg_active=%u count=%u backlog=%u). Thread stacks follow (innermost first).\r\n",
                          t.wHour, t.wMinute, t.wSecond, static_cast<unsigned long long>(watchdog.StalledMs(now)),
@@ -1378,6 +1389,9 @@ bool ensure_buffers_locked(IDXGISwapChain* sc)
     DXGI_SWAP_CHAIN_DESC desc{};
     if (FAILED(sc->GetDesc(&desc))) return false;
     g_state.backbuffer_count = desc.BufferCount;
+    // Mark identities without retaining swapchain buffers across resize.
+    for(UINT i=0;i<desc.BufferCount;++i){ComPtr<ID3D12Resource> buffer;
+        if(SUCCEEDED(real_get_buffer(sc,i,IID_PPV_ARGS(&buffer))))na::nr::native::MarkSwapchainBuffer(buffer.Get());}
     // Draw-resource lifetime follows submitted overlay draws, not the native
     // FG swapchain's image index. Allow a short GPU backlog without dropping
     // the menu, while keeping every allocator/RTV/ImGui slot fenced together.
@@ -1790,6 +1804,11 @@ void draw_panel(bool just_opened)
     // Content (scrolls; title, navigation and footer stay put).
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(S(36), S(20)));
     ImGui::BeginChild("##content", ImVec2(w - content_x, body_h), ImGuiChildFlags_AlwaysUseWindowPadding);
+    if(na::settings::SafeStart()) {
+        na::ui::StatusLine(2,"The last session didn't end normally, so NeuralAlias started off. Your settings are saved; turn features back on when ready.");
+        const auto profile=na::fg::preset::GetStatus();
+        if(profile.available && profile.result!=0)na::ui::StatusLine(2,"The driver preset could not be restored. Check Frame Generation details.");
+    }
     if (narrow) {
         nav(0, true);
         ImGui::Dummy(ImVec2(0, S(8)));
@@ -2462,7 +2481,7 @@ bool Start(const char* route_tag, PanelFn controls)
                 na::observe::InstallProducers(dev.Get(), queue.Get(), /*hook_queue_execute=*/false);
                 na::observe::SetExecuteForwarder(g_orig_execute); // C9b: host sample copies bypass this detour
             }
-            if (ok) na::observe::InstallListResetTracking(dev.Get(), na::nr::OnCommandListReset);
+            if (ok && na::nr::states::InstallEnhancedInvalidation()) na::observe::InstallListResetTracking(dev.Get(), na::nr::OnCommandListReset,na::nr::states::Observe);
             if (ok) {
                 na::present::Originals o;
                 o.present = g_orig_present;

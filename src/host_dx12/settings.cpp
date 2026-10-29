@@ -22,6 +22,18 @@ std::atomic<uint32_t> g_last_save{0};
 std::mutex g_nr_write_mutex;
 NrWrite g_nr_writes[16]{};
 uint64_t g_nr_write_sequence=0;
+std::atomic<bool> g_session_started{false},g_session_failed{false},g_safe_start{false};
+std::atomic<uint32_t> g_safe_overrides{0};
+uint32_t g_saved_switches[6]{};
+bool g_safe_profile=false;
+wchar_t g_session_marker[MAX_PATH]{};
+char g_safe_reason[16]="none";
+uint32_t PersistedSwitch(uint32_t slot,uint32_t current) {
+    const uint32_t mask=1u<<slot;
+    if(!(g_safe_overrides.load()&mask))return current;
+    if(current){g_safe_overrides.fetch_and(~mask);return current;}
+    return g_saved_switches[slot]; // saving another control must not save our forced OFF
+}
 
 void resolve_user_ini()
 {
@@ -179,7 +191,7 @@ bool Save()
     }
     wchar_t v[32];
     bool ok = true;
-    swprintf_s(v, L"%u", g_settings.enabled.load());
+    swprintf_s(v, L"%u", PersistedSwitch(0,g_settings.enabled.load()));
     ok &= WritePrivateProfileStringW(L"dlss", L"enabled", v, ini) != 0;
     swprintf_s(v, L"%u", g_settings.dlss_mode.load());
     ok &= WritePrivateProfileStringW(L"dlss", L"mode", v, ini) != 0;
@@ -199,7 +211,7 @@ bool Save()
         ok &= WritePrivateProfileStringW(L"overlay", kv.key, v, ini) != 0;
     }
     struct { const wchar_t* key; uint32_t value; } nr[] = {
-        {L"enabled", g_settings.nr_enabled.load()},   {L"intensity", g_settings.nr_intensity.load()},
+        {L"enabled", PersistedSwitch(1,g_settings.nr_enabled.load())},   {L"intensity", g_settings.nr_intensity.load()},
         {L"structure", g_settings.nr_structure.load()}, {L"tone", g_settings.nr_tone.load()},
         {L"skin", g_settings.nr_skin.load()},         {L"paper_white", g_settings.nr_paper_white.load()},
         {L"hdr_mode", g_settings.nr_hdr_mode.load()}, {L"model", g_settings.nr_model.load()}};
@@ -208,7 +220,7 @@ bool Save()
         ok &= WritePrivateProfileStringW(L"nr", kv.key, v, ini) != 0;
     }
     struct { const wchar_t* key; uint32_t value; } motion[] = {
-        {L"enabled", g_settings.motion_enabled.load()}, {L"grid", g_settings.motion_grid.load()}, {L"perf", g_settings.motion_perf.load()},
+        {L"enabled", PersistedSwitch(2,g_settings.motion_enabled.load())}, {L"grid", g_settings.motion_grid.load()}, {L"perf", g_settings.motion_perf.load()},
         {L"downscale", g_settings.motion_downscale.load()}};
     for (const auto& kv : motion) {
         swprintf_s(v, L"%u", kv.value);
@@ -221,13 +233,13 @@ bool Save()
         if (pv >= 1 && pv <= 26) swprintf_s(v, L"%c", static_cast<wchar_t>(L'A' + pv - 1));
         else swprintf_s(v, L"default");
         ok &= WritePrivateProfileStringW(L"j2", L"preset", v, ini) != 0;
-        swprintf_s(v, L"%.2f", g_settings.j2_mip_bias_x100.load() / 100.0);
+        swprintf_s(v, L"%.2f", static_cast<int32_t>(PersistedSwitch(5,static_cast<uint32_t>(g_settings.j2_mip_bias_x100.load()))) / 100.0);
         ok &= WritePrivateProfileStringW(L"j2", L"mip_bias", v, ini) != 0;
     }
-    swprintf_s(v, L"%d", g_settings.reflex_mode.load());
+    swprintf_s(v, L"%d", static_cast<int32_t>(PersistedSwitch(4,static_cast<uint32_t>(g_settings.reflex_mode.load()))));
     ok &= WritePrivateProfileStringW(L"latency", L"reflex", v, ini) != 0;
     struct { const wchar_t* key; uint32_t value; } fg[] = {
-        {L"enabled", g_settings.fg_enabled.load()}, {L"mode", g_settings.fg_mode.load()}, {L"preset", g_settings.fg_preset.load()},
+        {L"enabled", PersistedSwitch(3,g_settings.fg_enabled.load())}, {L"mode", g_settings.fg_mode.load()}, {L"preset", g_settings.fg_preset.load()},
         {L"multiplier", g_settings.fg_multiplier.load()}, {L"target_fps", g_settings.fg_target_fps.load()},
         {L"frozen_at", g_settings.fg_frozen_at.load()}};
     for (const auto& kv : fg) {
@@ -239,5 +251,39 @@ bool Save()
 }
 
 uint32_t LastSaveResult() { return g_last_save.load(); }
+
+bool SafeStart(){return g_safe_start.load();}
+bool SafeProfileRestoreRequired(){return SafeStart() && g_safe_profile;}
+const char* SafeStartReason(){return g_safe_reason;}
+void MarkSessionFailed(const char* reason) {
+    if(!g_session_started.load() || !g_session_marker[0])return;
+    g_session_failed.store(true);
+    HANDLE file=CreateFileW(g_session_marker,GENERIC_WRITE,FILE_SHARE_READ,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
+    if(file!=INVALID_HANDLE_VALUE){DWORD written=0;WriteFile(file,reason,static_cast<DWORD>(strlen(reason)),&written,nullptr);FlushFileBuffers(file);CloseHandle(file);}
+}
+void BeginSession(const wchar_t* marker_path) {
+    if(g_session_started.exchange(true))return;
+    if(marker_path)wcsncpy_s(g_session_marker,marker_path,_TRUNCATE);
+    else {resolve_user_ini();swprintf_s(g_session_marker,L"%s.session",g_ini_user);}
+    HANDLE previous=CreateFileW(g_session_marker,GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+    const bool unclean=previous!=INVALID_HANDLE_VALUE;
+    strcpy_s(g_safe_reason,unclean?"unclean":"none");
+    if(unclean){char reason[16]{};DWORD bytes=0;ReadFile(previous,reason,15,&bytes,nullptr);CloseHandle(previous);
+        if(!strcmp(reason,"freeze") || !strcmp(reason,"crash"))strcpy_s(g_safe_reason,reason);}
+    g_safe_start.store(unclean);g_safe_overrides.store(unclean?63u:0u);g_safe_profile=false;
+    if(unclean) {
+        g_saved_switches[0]=g_settings.enabled.exchange(0);g_saved_switches[1]=g_settings.nr_enabled.load();
+        SetNrEnabled(false,NrWriteSource::SafeStartup);
+        g_saved_switches[2]=g_settings.motion_enabled.exchange(0);g_saved_switches[3]=g_settings.fg_enabled.exchange(0);
+        g_saved_switches[4]=static_cast<uint32_t>(g_settings.reflex_mode.exchange(0));
+        g_safe_profile=g_settings.fg_profile_override.exchange(0)!=0;
+        g_saved_switches[5]=static_cast<uint32_t>(g_settings.j2_mip_bias_x100.exchange(0));
+    }
+    MarkSessionFailed("unclean");g_session_failed.store(false); // current session starts, no failure inferred yet
+}
+void EndSession(uint32_t exit_code) {
+    if(!g_session_started.exchange(false))return;
+    if(exit_code==0 && !g_session_failed.load() && g_session_marker[0])DeleteFileW(g_session_marker);
+}
 
 } // namespace na::settings

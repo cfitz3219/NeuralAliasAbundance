@@ -105,7 +105,7 @@ struct Settings {
 };
 
 Settings& Get();
-enum class NrWriteSource : uint32_t { DefaultIni=1, UserIni=2, Overlay=3 };
+enum class NrWriteSource : uint32_t { DefaultIni=1, UserIni=2, Overlay=3, SafeStartup=4 };
 struct NrWrite {
     uint64_t sequence=0, tick_ms=0;
     uint32_t thread=0, before=0, after=0;
@@ -128,5 +128,12 @@ void Load();  // defaults ini, then user ini overrides when present
 bool Save();
 // Result of the most recent Save(): 0 never saved, 1 ok, 2 failed.
 uint32_t LastSaveResult();
+// Startup/exit worker calls only. No settings file is rewritten by safe start.
+void BeginSession(const wchar_t* marker_path=nullptr);
+void EndSession(uint32_t exit_code);
+void MarkSessionFailed(const char* reason);
+bool SafeStart();
+const char* SafeStartReason();
+bool SafeProfileRestoreRequired();
 
 } // namespace na::settings

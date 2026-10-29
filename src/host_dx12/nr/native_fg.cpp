@@ -3,6 +3,7 @@
 #include "host_dx12/nr/fg_contract.hpp"
 #include "host_dx12/nr/fg_frame_cache.hpp"
 #include "host_dx12/nr/fg_color.hpp"
+#include "host_dx12/nr/fg_states.hpp"
 #include "host_dx12/hooking/variant_registry.hpp"
 #include "host_dx12/settings.hpp"
 #include "host_dx12/dlss/call_origin.hpp"
@@ -27,7 +28,9 @@ thread_local uint32_t internal=0;
 struct Internal { Internal(){++internal;} ~Internal(){--internal;} };
 std::atomic<uint32_t> contexts_count{0},records_count{0};
 Status status;
-uint64_t receipt=0;
+std::atomic<uint64_t> submissions{0};
+const GUID swapchain_key={0xc3f25562,0xe301,0x46c8,{0xb8,0x2d,0xa7,0x9e,0x0d,0x83,0xfe,0xf1}};
+bool IsSwapchain(ID3D12Resource* r){UINT value=0,size=sizeof(value);return r && SUCCEEDED(r->GetPrivateData(swapchain_key,&size,&value)) && value==1;}
 void Reason(const char* text) { strncpy_s(status.reason,text,_TRUNCATE); }
 bool Texture(ID3D12Device* d,uint32_t w,uint32_t h,DXGI_FORMAT f,D3D12_RESOURCE_STATES state,ComPtr<ID3D12Resource>& out) {
     D3D12_RESOURCE_DESC desc{}; desc.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D; desc.Width=w; desc.Height=h;
@@ -39,15 +42,38 @@ bool Region(FgSurface& s) {
     if (!s.resource) return false;
     const auto d=s.resource->GetDesc();
     if (d.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.DepthOrArraySize!=1 || d.SampleDesc.Count!=1 ||
-        d.Width>UINT32_MAX || s.region.x>=d.Width || s.region.y>=d.Height) return false;
+        d.Width>UINT32_MAX || d.MipLevels!=1 || s.region.x>=d.Width || s.region.y>=d.Height) return false;
     if (!s.region.width) s.region.width=static_cast<uint32_t>(d.Width)-s.region.x;
     if (!s.region.height) s.region.height=d.Height-s.region.y;
     return s.region.width<=d.Width-s.region.x && s.region.height<=d.Height-s.region.y;
 }
 void Barrier(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b) {
     D3D12_RESOURCE_BARRIER v{}; v.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    v.Transition={r,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,a,b}; l->ResourceBarrier(1,&v);
+    v.Transition={r,0,a,b}; l->ResourceBarrier(1,&v);
 }
+struct InputStates {
+    ID3D12GraphicsCommandList* list;
+    ID3D12Resource* resources[4]{};
+    D3D12_RESOURCE_STATES original[4]{};
+    uint32_t count=0;
+    bool ready=false;
+    InputStates(ID3D12GraphicsCommandList* l,const FgContract& f):list(l) {
+        ID3D12Resource* inputs[]={f.color.resource,f.hudless.resource,f.depth.resource,f.motion.resource};
+        for(auto* r:inputs) {
+            bool duplicate=false;for(uint32_t i=0;i<count;++i)duplicate|=resources[i]==r;
+            if(duplicate)continue;
+            resources[count]=r;if(!states::Read(l,r,original[count]))return;++count;
+        }
+        D3D12_RESOURCE_STATES observed{};
+        states::Read(l,f.color.resource,observed);status.color_state=static_cast<uint32_t>(observed);
+        states::Read(l,f.hudless.resource,observed);status.hudless_state=static_cast<uint32_t>(observed);
+        for(uint32_t i=0;i<count;++i)if(original[i]!=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+            Barrier(list,resources[i],original[i],D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        ready=true;
+    }
+    ~InputStates(){if(ready)for(uint32_t i=0;i<count;++i)if(original[i]!=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+        Barrier(list,resources[i],D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,original[i]);}
+};
 struct Feature {
     Runtime rt{}; void* handle=nullptr; NVSDK_NGX_Parameter* params=nullptr;
     ComPtr<ID3D12Resource> color,nr,enhanced;
@@ -90,16 +116,19 @@ struct Recording {
     ID3D12CommandList* list=nullptr;
     std::shared_ptr<std::atomic<bool>> valid;
     ComPtr<ID3D12Fence> fence;
-    uint64_t value=0,sequence=0;
-    bool failed=false;
+    std::atomic<uint64_t> value{0},frequency{0};
+    std::atomic<uint32_t> forwarding{0};
+    std::atomic<bool> failed{false};
+    std::mutex submission_mutex;
     std::vector<std::shared_ptr<Packet>> packets;
     std::vector<ComPtr<ID3D12Resource>> destinations;
 };
-std::unique_ptr<Recording> recordings[64];
+std::shared_ptr<Recording> recordings[64];
 const GUID token_id={0x354fc040,0xe9a9,0x48cd,{0x8d,0xb1,0xe1,0x6a,0x4d,0x21,0x6c,0xb3}};
 class Token final:public IUnknown {
 public:
-    explicit Token(std::shared_ptr<std::atomic<bool>> v):valid(std::move(v)){}
+    explicit Token(const std::shared_ptr<Recording>& r):recording(r),valid(r->valid){}
+    std::weak_ptr<Recording> recording;
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id,void** out) override {
         if(!out)return E_POINTER; *out=nullptr; if(id!=__uuidof(IUnknown))return E_NOINTERFACE;
         *out=this; AddRef(); return S_OK;
@@ -110,8 +139,21 @@ public:
 private: std::atomic<ULONG> refs{1}; std::shared_ptr<std::atomic<bool>> valid;
 };
 void Collect() {
+    // Submission threads only publish atomic receipts. They never take this
+    // context mutex, including while NGX is creating a model on another thread.
+    for(auto& r:recordings)if(r && !r->forwarding.load() && !r->failed.load() && r->value.load()) {
+        for(auto& p:r->packets)if(p->successful && p->producer.lock()==r->valid) {
+            if(!p->receipt_set)p->receipt_set=p->composition.SetCompletion(r->fence.Get(),r->value.load());
+            p->timing_fence=r->fence;p->timing_value=r->value.load();p->frequency=r->frequency.load();
+            for(auto& c:contexts)for(uint32_t i=0;i<FgFrameCache::Capacity;++i)
+                if(c->live[i] && c->packets[i]==p)c->cache.Submitted(c->tickets[i]);
+        }
+    }
     // Timestamp readback is nonblocking: only map an already-completed pair.
     for(auto& c:contexts)for(auto& p:c->packets)if(p && !p->timed && p->successful && p->timestamps && p->timing_fence && p->frequency) {
+        // A still-executable recording can be resubmitted and overwrite its
+        // timestamp pair. Read only after Reset/destruction ends that lifetime.
+        if(auto producer=p->producer.lock();producer && producer->load())continue;
         const auto done=p->timing_fence->GetCompletedValue();
         if(done!=UINT64_MAX && done>=p->timing_value) {
             void* data=nullptr;D3D12_RANGE read{0,16};
@@ -125,7 +167,7 @@ void Collect() {
             }
         }
     }
-    for(auto& r:recordings) if(r && !r->valid->load() && !r->failed &&
+    for(auto& r:recordings) if(r && !r->valid->load() && !r->forwarding.load() && !r->failed &&
         (!r->value || (r->fence->GetCompletedValue()!=UINT64_MAX && r->fence->GetCompletedValue()>=r->value))) {
         if(r->value) ++status.completed;
         for(auto& p:r->packets) if(!r->value || !p->successful) {
@@ -148,10 +190,10 @@ void Collect() {
 Recording* Track(ID3D12GraphicsCommandList* list,ID3D12Device* device) {
     for(auto& r:recordings) if(r && r->list==list && r->valid->load()) return r.get();
     for(auto& r:recordings) if(!r) {
-        auto fresh=std::make_unique<Recording>();
+        auto fresh=std::make_shared<Recording>();
         fresh->list=list; fresh->valid=std::make_shared<std::atomic<bool>>(true);
         if(FAILED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fresh->fence))))return nullptr;
-        auto* token=new Token(fresh->valid); const auto hr=list->SetPrivateDataInterface(token_id,token); token->Release();
+        auto* token=new Token(fresh); const auto hr=list->SetPrivateDataInterface(token_id,token); token->Release();
         if(FAILED(hr))return nullptr;
         r=std::move(fresh); records_count.fetch_add(1); return r.get();
     }
@@ -229,7 +271,8 @@ void CoreShutdown(const void* core) {
     contexts.erase(std::remove_if(contexts.begin(),contexts.end(),[&](const auto& c){return c->core==core;}),contexts.end());
     contexts_count.store(static_cast<uint32_t>(contexts.size()));
 }
-Status GetStatus(){std::unique_lock<std::mutex> lock(mutex,std::try_to_lock);if(lock.owns_lock())return status; Status s;strcpy_s(s.reason,"Updating Neural Rendering.");return s;}
+Status GetStatus(){std::unique_lock<std::mutex> lock(mutex,std::try_to_lock);if(lock.owns_lock()){auto s=status;s.submitted=submissions.load();return s;} Status s;strcpy_s(s.reason,"Updating Neural Rendering.");return s;}
+void MarkSwapchainBuffer(ID3D12Resource* r){if(r){const UINT value=1;r->SetPrivateData(swapchain_key,sizeof(value),&value);}}
 void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,const void* parameters,const Runtime& runtime) {
     if(!list || !parameters || list->GetType()!=D3D12_COMMAND_LIST_TYPE_DIRECT)return;
     if(internal)return;Internal guard;na::dlss::InjectorCallScope origin;
@@ -239,6 +282,10 @@ void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,
     status.active=0;
     if(!settings::Get().nr_enabled.load()){ctx->feature.reset();Reason("Neural Rendering is off.");return;}
     auto f=ReadFgContract(static_cast<const NVSDK_NGX_Parameter*>(parameters));
+    status.input_states_known=0;status.frame_id=f.frame_id;
+    status.backbuffer_is_swapchain=IsSwapchain(f.color.resource);
+    status.output_real_present=f.real_output.resource!=nullptr;
+    status.output_real_is_swapchain=IsSwapchain(f.real_output.resource);
     if(!f.has_frame_id){++status.skipped;Reason("Neural Rendering needs the native FG real-frame identity.");return;}
     if(!f.camera_motion || f.motion_jittered){++status.skipped;Reason("Neural Rendering needs unjittered camera-inclusive motion vectors.");return;}
     if(!Region(f.color) || !Region(f.hudless) || !Region(f.depth) || !Region(f.motion) ||
@@ -250,6 +297,8 @@ void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,
     if(f.color.resource==f.hudless.resource && (f.color.region.x!=f.hudless.region.x || f.color.region.y!=f.hudless.region.y)) {
         ++status.skipped;Reason("Neural Rendering needs separate nonoverlapping FG image regions.");return;
     }
+    InputStates input_states(list,f);status.input_states_known=input_states.ready;
+    if(!input_states.ready){++status.skipped;Reason("Neural Rendering is waiting for observed native FG input states.");return;}
     using namespace na::hooking::variants;
     if(Active(Kind::CommandList) && CoverageOf(Kind::CommandList,list)!=Coverage::Complete){++status.skipped;Reason("Neural Rendering needs tracked native FG command lists.");return;}
     ComPtr<ID3D12Device> device; if(FAILED(list->GetDevice(IID_PPV_ARGS(&device))))return;
@@ -342,18 +391,27 @@ void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,
 }
 Submission::Submission(ID3D12CommandQueue* q,UINT n,ID3D12CommandList* const* lists) {
     if(internal || !records_count.load())return;
-    ++internal;entered_=true;
-    lock_=std::unique_lock<std::mutex>(mutex);queue_=q;Collect();
-    for(auto& r:recordings) if(r && r->valid->load()) for(UINT i=0;i<n;++i)if(r->list==lists[i]){records_[count_++]=r.get();break;}
+    for(UINT i=0;i<n && count_<64;++i) {
+        IUnknown* raw=nullptr;UINT bytes=sizeof(raw);
+        if(lists[i] && SUCCEEDED(lists[i]->GetPrivateData(token_id,&bytes,&raw)) && raw) {
+            auto r=static_cast<Token*>(raw)->recording.lock();raw->Release();
+            if(r && r->valid->load() && std::find(records_,records_+count_,r)==records_+count_)records_[count_++]=r;
+        }
+    }
+    if(!count_)return; // ordinary game/helper submissions never enter an NR lock
+    std::sort(records_,records_+count_,[](const auto& a,const auto& b){return std::less<const void*>{}(a.get(),b.get());});
+    ++internal;entered_=true;queue_=q;
+    for(uint32_t i=0;i<count_;++i){auto& r=*static_cast<Recording*>(records_[i].get());
+        r.forwarding.fetch_add(1);locks_[i]=std::unique_lock<std::mutex>(r.submission_mutex);}
 }
 Submission::~Submission() {
     if(!queue_)return;
-    for(uint32_t i=0;i<count_;++i){auto& r=*static_cast<Recording*>(records_[i]);
-        if(FAILED(queue_->Signal(r.fence.Get(),++r.value))){r.failed=true;Reason("Neural Rendering retained a frame after a failed GPU signal.");continue;}
-        r.sequence=++receipt;++status.submitted;
-        for(auto& p:r.packets){if(!p->receipt_set && p->composition.Full()){p->receipt_set=p->composition.SetCompletion(r.fence.Get(),r.value);}
-            if(p->successful && p->producer.lock()==r.valid){p->timing_fence=r.fence;p->timing_value=r.value;queue_->GetTimestampFrequency(&p->frequency);}
-            if(p->successful)for(auto& c:contexts)for(uint32_t j=0;j<FgFrameCache::Capacity;++j)if(c->live[j] && c->packets[j]==p)c->cache.Submitted(c->tickets[j]);}
+    for(uint32_t i=0;i<count_;++i){auto& r=*static_cast<Recording*>(records_[i].get());
+        uint64_t frequency=0;queue_->GetTimestampFrequency(&frequency);r.frequency.store(frequency);
+        if(FAILED(queue_->Signal(r.fence.Get(),++r.value)))r.failed.store(true);
+        else submissions.fetch_add(1);
+        r.forwarding.fetch_sub(1);
+        locks_[i].unlock(); // before the shared Recording owner can be destroyed
     }
     if(entered_)--internal;
 }
@@ -363,6 +421,7 @@ namespace na::nr::native {
 void Before(ID3D12GraphicsCommandList*,const void*,const void*,const void*,const Runtime&){}
 void Release(const void*,const void*){} void Prepare(ID3D12GraphicsCommandList*){} void Maintain(){}
 void PrepareDevice(ID3D12Device*){}
+void MarkSwapchainBuffer(ID3D12Resource*){}
 void CoreShutdown(const void*){}
 void Reset(ID3D12GraphicsCommandList*){} bool OwnsRoute(){return false;} Status GetStatus(){return {};}
 Submission::Submission(ID3D12CommandQueue*,UINT,ID3D12CommandList* const*){} Submission::~Submission(){}

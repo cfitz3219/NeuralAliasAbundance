@@ -1,4 +1,5 @@
 #include "host_dx12/fg/camera.hpp"
+#include "host_dx12/host_boot/session.hpp"
 #include "host_dx12/adapters/tlou1/apply.hpp"
 #include "host_dx12/adapters/tlou1/timing.hpp"
 #include "host_dx12/sl_proxy/sl_abi.hpp"
@@ -91,15 +92,16 @@ DWORD WINAPI InitThread(LPVOID)
     // read by the NGX layer live; the overlay edits and saves them.
     na::settings::SetIniPath(ini);
     na::settings::Load();
+    na::host::StartSession();
     // Gate 2: the Streamline entry point also hosts non-native upscalers.
     // Observe by default; replacement remains an explicit per-provider opt-in.
     if (GetPrivateProfileIntW(L"fsr", L"enabled", 1, ini) == 1) {
-        na::ffx::SetMode(GetPrivateProfileIntW(L"fsr", L"replace", 0, ini) == 1
+        na::ffx::SetMode(!na::settings::SafeStart() && GetPrivateProfileIntW(L"fsr", L"replace", 0, ini) == 1
             ? na::ffx::Mode::ReplaceWithDlss : na::ffx::Mode::Observe);
         na::ffx::StartModuleWatch();
     }
     if (GetPrivateProfileIntW(L"xess", L"enabled", 1, ini) == 1) {
-        na::xess::SetMode(GetPrivateProfileIntW(L"xess", L"replace", 0, ini) == 1
+        na::xess::SetMode(!na::settings::SafeStart() && GetPrivateProfileIntW(L"xess", L"replace", 0, ini) == 1
             ? na::xess::Mode::ReplaceWithDlss : na::xess::Mode::Observe);
         na::xess::StartModuleWatch();
     }

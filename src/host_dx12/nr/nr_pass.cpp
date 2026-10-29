@@ -3,6 +3,7 @@
 #include "host_dx12/nr/fg_composition.hpp"
 #include "host_dx12/nr/fg_color.hpp"
 #include "host_dx12/nr/native_fg.hpp"
+#include "host_dx12/nr/fg_states.hpp"
 #include "host_dx12/depth_format.hpp"
 
 #include <d3dcompiler.h>
@@ -768,6 +769,7 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
 
 void OnCommandListReset(ID3D12GraphicsCommandList* list)
 {
+    states::Reset(list);
     native::Reset(list);
     IUnknown* raw = nullptr;
     UINT bytes = sizeof(raw);

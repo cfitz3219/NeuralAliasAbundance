@@ -144,7 +144,7 @@ DWORD WINAPI worker(void*) {
 void Initialize() {
     wchar_t path[MAX_PATH]{}; GetModuleFileNameW(nullptr, path, MAX_PATH);
     auto name = wcsrchr(path, L'\\'); name = name ? name + 1 : path;
-    if (_wcsicmp(name, L"tlou-i.exe") && !settings::Get().fg_profile_override.load()) return;
+    if (_wcsicmp(name, L"tlou-i.exe") && !settings::Get().fg_profile_override.load() && !settings::SafeProfileRestoreRequired()) return;
     wcscpy_s(target_exe, name);
     wcsncpy_s(backup_path, settings::UserIniPath(), _TRUNCATE);
     auto slash = wcsrchr(backup_path, L'\\');
@@ -156,7 +156,11 @@ void Initialize() {
     const auto preset = settings::Get().fg_preset.load();
     desired.store(preset >= 1 && preset <= 3 ? preset : 1u);
     { std::lock_guard<std::mutex> lock(mutex); status.available = true; }
-    apply_requested();
+    if(settings::SafeStart()) {
+        uint32_t stored=0;bool changed=false;
+        const auto result=apply(desired.load(),stored,changed,false,true);
+        std::lock_guard<std::mutex> lock(mutex);status.result=result;status.stored=stored;status.requested=desired.load();
+    } else apply_requested();
     HANDLE thread = CreateThread(nullptr, 0, worker, nullptr, 0, nullptr);
     if (thread) CloseHandle(thread);
     else { std::lock_guard<std::mutex> lock(mutex); status.available = false; }
