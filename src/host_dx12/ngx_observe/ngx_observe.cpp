@@ -313,6 +313,12 @@ NgxResult CreateFeatureImpl(CoreSlot& s, void* cmd_list, uint32_t feature_id, vo
         g_last_sr_in_h.store(ep.in_height, std::memory_order_relaxed);
         g_last_sr_out_w.store(ep.out_width, std::memory_order_relaxed);
         g_last_sr_out_h.store(ep.out_height, std::memory_order_relaxed);
+        // ...and it is the feature an armed render-size confirmation (Apply) waits for.
+        std::lock_guard<std::mutex> lock(g_confirm_m);
+        const uint64_t hnd = out_handle ? reinterpret_cast<uint64_t>(*out_handle) : 0;
+        g_feature_flags.Set(hnd, ep.valid ? ep.create_flags : 0xFFFFFFFFu);
+        if (g_confirm_active.load(std::memory_order_acquire))
+            g_confirm.OnCreate(ep.valid ? ep.in_width : 0, ep.valid ? ep.in_height : 0, hnd, GetTickCount64());
     }
     if (r == 1 && feature_id == 1) { // NVSDK_NGX_Result_Success, DLSS super resolution
         // A30: evidence for the menu's "active" state â€” the size the game

@@ -252,23 +252,63 @@ void DrawPicture()
         bool size_matches = rw && ngx.last_sr_in_w == rw && ngx.last_sr_in_h == rh;
         static bool engine_clicked = false;
         static bool admission_failed = false;
-        ImGui::BeginDisabled(!enabled || blocked || ngx.sr_creates == 0 || engine_busy);
+        static bool rebuild_clicked = false;   // generic: window nudge so the game rebuilds its DLSS
+        static bool rebuild_refused = false;
+        static uint32_t rebuild_attempts_at = 0;
+        // Any game upscaler counts: plain DLSS (feature 1) or Ray Reconstruction (13).
+        const bool have_upscaler = ngx.sr_creates != 0 || ngx.rr_seen != 0;
+        // A game with a hand-written engine adapter (TLOU) changes its own picture
+        // mode; every other game gets the generic rebuild (A63/A64): the window is
+        // nudged by one pixel and back, the engine re-creates its render targets and
+        // asks DLSS for the size again, and the armed confirmation reports whether
+        // the new size was actually rendered.
+        const bool engine_adapter = na::tlou1::GetApplyStatus().available;
+        ImGui::BeginDisabled(!enabled || blocked || !have_upscaler || engine_busy);
         BeginRow("Apply changes", "Update the picture mode and preset together.", ButtonWidth("Apply"));
         if (Button("Apply")) {
             admission_failed = false;
-            engine_clicked = !size_matches;
-            if (engine_clicked) {
-                admission_failed = !na::tlou1::RequestApply({static_cast<uint32_t>(mode), rw, rh, st.preset.load()});
-                g_apply_clicked = false;
-            } else {
+            engine_clicked = rebuild_clicked = rebuild_refused = false;
+            g_apply_clicked = false;
+            // Plain DLSS can take a new PRESET in place (A46). A size change, or any
+            // change while the game uses Ray Reconstruction, needs the game to
+            // re-create its DLSS feature.
+            const bool in_place = size_matches && ngx.sr_creates != 0 && !rr_upscaler;
+            if (in_place) {
                 na::ngx::RequestReapply();
                 g_apply_ok_at = ngx.reapplies;
                 g_apply_fail_at = ngx.reapply_failures;
                 g_apply_clicked = true;
+            } else if (engine_adapter) {
+                engine_clicked = true;
+                admission_failed = !na::tlou1::RequestApply({static_cast<uint32_t>(mode), rw, rh, st.preset.load()});
+            } else {
+                rebuild_clicked = true;
+                rebuild_attempts_at = na::overlay::GetPictureRebuild().attempts;
+                rebuild_refused = !na::overlay::RequestPictureRebuild(rw, rh);
             }
         }
         EndRow();
         ImGui::EndDisabled();
+        if (!have_upscaler && enabled)
+            Hint("Apply becomes available once the game has started DLSS.");
+        if (rebuild_clicked) {
+            const auto pr = na::overlay::GetPictureRebuild();
+            const auto check = na::ngx::GetSizeConfirmation();
+            if (rebuild_refused)
+                StatusLine(2, "A previous Apply is still in progress. Try again in a moment.");
+            else if (pr.state == 4)
+                StatusLine(2, pr.reason[0] ? pr.reason : "The picture could not be rebuilt.");
+            else if (pr.attempts == rebuild_attempts_at || pr.state == 1 || pr.state == 2)
+                StatusLine(0, "Asking the game to rebuild its picture...");
+            else if (check.id && check.id == pr.confirm_id && check.state == 3)
+                StatusLine(1, "Applied: the game is now rendering at the selected mode.");
+            else if (check.id && check.id == pr.confirm_id && check.state == 4) {
+                snprintf(buf, sizeof(buf), "This game did not rebuild its DLSS when asked (it rendered %ux%u). Change the DLSS or ray-tracing setting once in the game's own menu to apply.",
+                         check.last_w, check.last_h);
+                StatusLine(2, buf);
+            } else
+                StatusLine(0, "Picture rebuilt; checking the new size...");
+        }
         if (engine_clicked) {
             auto progress = na::tlou1::GetApplyStatus();
             if (admission_failed)
@@ -632,6 +672,10 @@ void DrawCaptureRow()
 void DrawLiveDlaa()
 {
     using namespace na::ui;
+    // Our DLAA injector for games WITHOUT DLSS ([j2] enabled=1 per game). In a game
+    // that runs its own DLSS it never starts, and "Not running yet ... 0 frames
+    // improved" only confused (Cort, Phantom Blade Zero): draw nothing there.
+    if (!na::j2::Configured()) return;
     const na::j2::Stats st = na::j2::GetStats();
     BeginGroupBox("Live DLAA");
     bool on = !na::j2::Paused();
