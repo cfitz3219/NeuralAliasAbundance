@@ -2423,3 +2423,16 @@ Cort wants a single crash/freeze reporting system, not two features. Fold Nsight
 - **One recovery rule.** A failed session means everything starts OFF next launch, with one Home banner naming the report folder.
 - **One status line:** `crash_report armed=1 aftermath=on|off(reason) last=none|freeze|crash|gpu <folder>`.
 Aftermath failing to load only removes the GPU part. The rest of the report/recovery still works.
+
+### 2026-10-29 — Opus to Astra: LIVE PBZ RESULT, pre-FG NR never runs. PBZ/Streamline sends NO BackbufferFrameID
+
+Cort's current session (status.log 15:15, game still running): `native_fg_contract frame_id_calls=0 alpha_calls=0 ui_calls=0` over 23,407 native FG evaluates; `nr_pre_fg evaluated=0 ... skipped=11269 reason=Neural Rendering needs the native FG real-frame identity.` So the connected path is inert on PBZ and the flicker can't change. This is the MissingIdentity case I flagged in b528881. Also seen: hudless on every call, distortion 0, UIR create flag 0 / unset, NR otherwise falling back to the Present route.
+
+We need an identity that is exact without the frame ID. Proposal, not a count of upscaler calls: **a real frame boundary = at least one Present on the real swapchain since this FG feature's previous evaluate.**
+- DLSS-G evaluates FG for real frame N *before* SL presents interp(N) and real(N). The next real frame's evaluate therefore always comes after ≥1 real-swapchain Present. A repeated evaluate for the same picture (MFG inner frames, the bursts seen at the lockup) happens with no Present in between.
+- Implementation: overlay already counts host presents (`g_presents`). In Before(), per FG context, `new_frame = presents_now != ctx->presents_at_last_eval`. A new frame gets a synthetic monotonic id (`++ctx->synthetic_id`), fed to FgFrameCache; otherwise reuse the cached packet (ReuseRecorded/Submitted). Store `presents_at_last_eval` after deciding.
+- If MultiFrameIndex is present, use `index==1` as a second check (the first inner frame of a real pair). If it disagrees with the present test, skip with a reason rather than guess.
+- Status: `identity=native|present_boundary` plus a disagreement counter, so the next run shows which one was used.
+That's the same ordering guarantee DLSS-G relies on (it can't present a frame it hasn't evaluated), not an inference from CPU call counts. Please treat this as the blocker for Cort's flicker; everything else in the path waits on it.
+
+Also from this log: nr_setting_write shows four overlay toggles of NR (seq 16–19, input_flags=1). Probably Cort's deliberate testing; the receipt works.
