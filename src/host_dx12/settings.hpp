@@ -105,6 +105,18 @@ struct Settings {
 };
 
 Settings& Get();
+enum class NrWriteSource : uint32_t { DefaultIni=1, UserIni=2, Overlay=3 };
+struct NrWrite {
+    uint64_t sequence=0, tick_ms=0;
+    uint32_t thread=0, before=0, after=0;
+    NrWriteSource source=NrWriteSource::DefaultIni;
+    uint32_t input_flags=0; // observed: mouse-release1, pad-A2, Enter4, Space8; not inferred intent
+};
+struct NrWriteHistory { NrWrite entries[16]{}; uint32_t count=0; };
+// Runtime NR-setting writers use this for a bounded in-memory receipt. No
+// file I/O here; the existing status worker emits the records later.
+void SetNrEnabled(bool enabled,NrWriteSource source,uint32_t input_flags=0);
+NrWriteHistory GetNrWrites();
 
 // Deploy-time defaults ini (beside the proxy DLL; may be read-only).
 void SetIniPath(const wchar_t* path);

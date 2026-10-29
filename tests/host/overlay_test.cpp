@@ -111,6 +111,24 @@ int main(int argc, char** argv)
     CHECK(s.open == 1);
     CHECK(s.frames_rendered > closed_rendered);
 
+    // A two-image swapchain must not restrict ImGui to two in-flight draws.
+    // Exercise the normal draw routine without DXGI Present's own throttling.
+    auto menu_target=test::CreateTexture(d.device.Get(),640,360,DXGI_FORMAT_R8G8B8A8_UNORM,
+        D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    test::ComPtr<ID3D12Fence> menu_gate;
+    REQUIRE(menu_target && SUCCEEDED(d.device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&menu_gate))));
+    d.WaitIdle();
+    REQUIRE(SUCCEEDED(d.queue->Wait(menu_gate.Get(),1)));
+    const auto before_backlog=na::overlay::GetStats().frames_rendered;
+    for(int i=0;i<8;++i) na::overlay::DrawMenuForTests(d.queue.Get(),menu_target.Get());
+    CHECK(na::overlay::GetStats().frames_rendered==before_backlog+8);
+    na::overlay::DrawMenuForTests(d.queue.Get(),menu_target.Get());
+    CHECK(na::overlay::GetStats().frames_rendered==before_backlog+8); // never overwrite a busy slot
+    REQUIRE(SUCCEEDED(menu_gate->Signal(1))); d.WaitIdle();
+    na::overlay::DrawMenuForTests(d.queue.Get(),menu_target.Get()); d.WaitIdle();
+    CHECK(na::overlay::GetStats().frames_rendered==before_backlog+9);
+    REQUIRE(d.device->GetDeviceRemovedReason()==S_OK);
+
     // While open the game receives no mouse/keyboard input.
     const uint32_t mouse_before = g_game_mouse.load(), keys_before = g_game_keys.load();
     SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(50, 60));

@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cwchar>
 #include <cwctype>
+#include <mutex>
+#include <algorithm>
 
 // Persistence: games under Program Files run unelevated, so writes next to
 // the game DLL fail silently (A17 finding). Defaults are read from the
@@ -17,6 +19,9 @@ Settings g_settings;
 wchar_t g_ini_defaults[MAX_PATH] = {};
 wchar_t g_ini_user[MAX_PATH] = {};
 std::atomic<uint32_t> g_last_save{0};
+std::mutex g_nr_write_mutex;
+NrWrite g_nr_writes[16]{};
+uint64_t g_nr_write_sequence=0;
 
 void resolve_user_ini()
 {
@@ -65,7 +70,8 @@ void load_from(const wchar_t* ini, bool only_if_present)
         int v = static_cast<int>(GetPrivateProfileIntW(L"nr", key, def, ini));
         return static_cast<uint32_t>(v < 0 ? 0 : (v > 100 ? 100 : v));
     };
-    g_settings.nr_enabled.store(GetPrivateProfileIntW(L"nr", L"enabled", 0, ini) ? 1u : 0u);
+    SetNrEnabled(GetPrivateProfileIntW(L"nr", L"enabled", 0, ini)!=0,
+                 only_if_present ? NrWriteSource::UserIni : NrWriteSource::DefaultIni);
     g_settings.nr_intensity.store(pct(L"intensity", 100));
     {
         const int v = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpness", 100, ini));
@@ -114,6 +120,20 @@ void load_from(const wchar_t* ini, bool only_if_present)
 } // namespace
 
 Settings& Get() { return g_settings; }
+void SetNrEnabled(bool enabled,NrWriteSource source,uint32_t input_flags) {
+    std::lock_guard<std::mutex> lock(g_nr_write_mutex);
+    const auto before=g_settings.nr_enabled.exchange(enabled?1u:0u);
+    const auto sequence=++g_nr_write_sequence;
+    g_nr_writes[(sequence-1)%16]={sequence,GetTickCount64(),GetCurrentThreadId(),before,enabled?1u:0u,source,input_flags};
+}
+NrWriteHistory GetNrWrites() {
+    std::lock_guard<std::mutex> lock(g_nr_write_mutex);
+    NrWriteHistory out;
+    out.count=static_cast<uint32_t>((std::min)(g_nr_write_sequence,uint64_t{16}));
+    const auto first=g_nr_write_sequence-out.count;
+    for(uint32_t i=0;i<out.count;++i) out.entries[i]=g_nr_writes[(first+i)%16];
+    return out;
+}
 
 void SetIniPath(const wchar_t* path)
 {

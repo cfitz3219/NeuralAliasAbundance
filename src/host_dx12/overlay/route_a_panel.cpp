@@ -413,7 +413,11 @@ void DrawNeuralRenderingRows()
     BeginRow("Neural Rendering", help, SwitchWidth());
     ImGui::BeginDisabled(!can);
     if (Switch("nr", &on)) {
-        st.nr_enabled.store(on ? 1u : 0u);
+        const uint32_t input_flags=(ImGui::IsMouseReleased(ImGuiMouseButton_Left)?1u:0u) |
+            (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceDown,false)?2u:0u) |
+            (ImGui::IsKeyPressed(ImGuiKey_Enter,false)?4u:0u) |
+            (ImGui::IsKeyPressed(ImGuiKey_Space,false)?8u:0u);
+        na::settings::SetNrEnabled(on,na::settings::NrWriteSource::Overlay,input_flags);
         if (on) na::nr::ResetLatch();
         nr = na::nr::GetStats();
         na::settings::Save();

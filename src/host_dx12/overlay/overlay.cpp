@@ -716,6 +716,20 @@ void write_status_line()
     if (ln > 0) WriteFile(f, lm, static_cast<DWORD>(ln), &written, nullptr);
     write_menu_progress(f);
     char nr_line[256];
+    // Read a bounded receipt ring on the logging worker, never write a file
+    // from the menu/input callback. Sequence gaps expose overwritten receipts.
+    static uint64_t nr_write_logged=0;
+    const auto nr_writes=na::settings::GetNrWrites();
+    for(uint32_t i=0;i<nr_writes.count;++i) {
+        const auto& change=nr_writes.entries[i];
+        if(change.sequence<=nr_write_logged) continue;
+        const char* source=change.source==na::settings::NrWriteSource::Overlay ? "overlay" :
+            (change.source==na::settings::NrWriteSource::UserIni ? "user_ini" : "default_ini");
+        const int bytes=snprintf(nr_line,sizeof(nr_line),
+            "nr_setting_write seq=%llu tick=%llu thread=%u before=%u after=%u source=%s input_flags=%u\r\n",
+            change.sequence,change.tick_ms,change.thread,change.before,change.after,source,change.input_flags);
+        if(bytes>0 && WriteFile(f,nr_line,static_cast<DWORD>(bytes),&written,nullptr)) nr_write_logged=change.sequence;
+    }
     int nn = snprintf(nr_line, sizeof(nr_line), "nr_inputs seen=%llu overwritten=%llu missing=%llu allocator_busy=%llu untracked_list=%llu\r\n",
                       static_cast<unsigned long long>(nr.inputs_seen), static_cast<unsigned long long>(nr.input_overwrites),
                       static_cast<unsigned long long>(nr.missing_inputs), static_cast<unsigned long long>(nr.busy_slots),
@@ -2650,6 +2664,11 @@ void SetStatusLogPath(const wchar_t* path)
 }
 
 void SetMenuDiagnostics(bool enabled) { g_menu_diagnostics = enabled; }
+void DrawMenuForTests(ID3D12CommandQueue* queue,ID3D12Resource* frame) {
+    std::lock_guard<std::mutex> lock(g_state.mutex);
+    if (!queue || !frame || !g_state.imgui_ready || !g_open.load()) return;
+    render_locked(g_state.swapchain,queue,false,frame);
+}
 
 int SwapChainColorSpace() { return g_color_space.load(std::memory_order_acquire); }
 

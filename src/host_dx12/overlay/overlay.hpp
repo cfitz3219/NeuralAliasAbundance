@@ -29,6 +29,7 @@
 struct ID3D12Device;
 struct ID3D12CommandQueue;
 struct ID3D12CommandList;
+struct ID3D12Resource;
 
 namespace na::overlay {
 
@@ -160,5 +161,9 @@ void SetStatusLogPath(const wchar_t* path);
 int CurrentPageIndex();
 // Last DXGI_COLOR_SPACE_TYPE the game set on its swap chain (DXGI_COLOR_SPACE_CUSTOM = never).
 int SwapChainColorSpace();
+// Test seam: render the existing menu into a caller-owned PRESENT-state
+// texture using the normal draw path, without DXGI Present pacing. Requires
+// an initialized/open overlay; caller owns queue synchronization and texture.
+void DrawMenuForTests(ID3D12CommandQueue* queue,ID3D12Resource* frame);
 
 } // namespace na::overlay
