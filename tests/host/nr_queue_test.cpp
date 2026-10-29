@@ -66,6 +66,11 @@ void Upload(ID3D12GraphicsCommandList* list, ID3D12Resource* texture, float valu
     if (desc.Format == DXGI_FORMAT_R32_FLOAT)
         for (UINT y = 0; y < desc.Height; ++y) for (UINT x = 0; x < desc.Width; ++x)
             std::memcpy(static_cast<char*>(data) + y * fp.Footprint.RowPitch + x * sizeof(float), &value, sizeof(float));
+    if (desc.Format == DXGI_FORMAT_R16_UNORM) {
+        const auto encoded = static_cast<uint16_t>(std::lround(value * 65535.f));
+        for (UINT y = 0; y < desc.Height; ++y) for (UINT x = 0; x < desc.Width; ++x)
+            std::memcpy(static_cast<char*>(data) + y * fp.Footprint.RowPitch + x * sizeof(encoded), &encoded, sizeof(encoded));
+    }
     upload->Unmap(0, nullptr);
     auto b = test::Transition(texture, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     list->ResourceBarrier(1, &b);
@@ -120,6 +125,49 @@ int main(int argc, char** argv) {
         reinterpret_cast<void*>(Alloc), reinterpret_cast<void*>(Destroy), reinterpret_cast<void*>(Caps)};
     na::settings::Get().nr_enabled = 1; na::nr::SetRuntime(rt);
     auto present = [&](ID3D12CommandQueue* queue) { na::nr::OnPresent(queue, back.Get(), DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709); };
+    if (argc > 1 && std::strcmp(argv[1], "--repeated-recording") == 0) {
+        REQUIRE(Input(d.queue.Get(), depth.Get(), motion.Get(), .1f) == 0);
+        Drain(d.queue.Get()); present(output.Get()); Drain(output.Get()); // create the fake feature
+        auto small_depth16 = test::CreateTexture(d.device.Get(), W / 2, H / 2, DXGI_FORMAT_R16_UNORM,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_FLAG_NONE);
+        auto large = test::CreateTexture(d.device.Get(), W, H, DXGI_FORMAT_R16_UNORM,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_FLAG_NONE);
+        auto other = test::CreateTexture(d.device.Get(), W, H, DXGI_FORMAT_R16_UNORM,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_FLAG_NONE);
+        REQUIRE(small_depth16 && large && other);
+        test::List recording; REQUIRE(recording.Create(d.device.Get()));
+        na::nr::EvalInputs in{}; in.motion = motion.Get(); in.out_w = W; in.out_h = H;
+        in.mv_scale_x = in.mv_scale_y = 1.f;
+        Upload(recording.list.Get(), motion.Get(), 0.f);
+        Upload(recording.list.Get(), small_depth16.Get(), .25f);
+        in.depth = small_depth16.Get(); in.render_w = W / 2; in.render_h = H / 2;
+        na::nr::OnEvaluate(recording.list.Get(), in);
+        Upload(recording.list.Get(), large.Get(), .75f);
+        in.depth = large.Get(); in.render_w = W; in.render_h = H;
+        na::nr::OnEvaluate(recording.list.Get(), in);
+        REQUIRE(SUCCEEDED(recording.list->Close()));
+        // Leave both copies unsubmitted while other lists recycle more than
+        // the old 64-table conversion ring. Their descriptors must stay intact.
+        for (int i = 0; i < 80; ++i) {
+            REQUIRE(Input(d.queue.Get(), other.Get(), motion.Get(), .4f) == 0);
+            Drain(d.queue.Get());
+        }
+        ID3D12CommandList* submitted[] = {recording.list.Get()};
+        na::nr::Execute(d.queue.Get(), 1, submitted, Forward);
+        Drain(d.queue.Get()); present(output.Get()); Drain(output.Get());
+        CHECK(na::nr::GetStats().inputs_seen == 83);
+        CHECK(na::nr::GetStats().input_submitted == 83);
+        CHECK(na::nr::GetStats().skipped == 0);
+        CheckWitness(0, .75f); // newest evaluate in actual list order
+        na::nr::Shutdown();
+        REQUIRE(d.device->GetDeviceRemovedReason() == S_OK);
+        if (info) for (UINT64 i = 0; i < info->GetNumStoredMessages(); ++i) {
+            SIZE_T size = 0; info->GetMessage(i, nullptr, &size); std::vector<char> bytes(size);
+            auto* message = reinterpret_cast<D3D12_MESSAGE*>(bytes.data()); info->GetMessage(i, message, &size);
+            if (message->Severity <= D3D12_MESSAGE_SEVERITY_ERROR) { std::printf("D3D12: %s\n", message->pDescription); CHECK(false); }
+        }
+        return test::finish("nr_repeated_recording_test");
+    }
     if (argc > 1 && std::strcmp(argv[1], "--discard-recording") == 0) {
         REQUIRE(na::observe::InstallListResetTracking(d.device.Get(), na::nr::OnCommandListReset));
         // More than the entire slot pool: neither discarded lists nor reset

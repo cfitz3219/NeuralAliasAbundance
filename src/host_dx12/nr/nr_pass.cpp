@@ -113,7 +113,8 @@ void sdr_to_hdr(uint3 id : SV_DispatchThreadID) {
 
 struct Constants { float paper_white; uint32_t width, height, mode, src_w, src_h; };
 constexpr UINT kConstants = sizeof(Constants) / 4;
-constexpr uint32_t kEvalSlots = 64; // descriptor groups for evaluate-time depth conversion (ring)
+constexpr uint32_t kEvalSlots = 64; // 16 GPU-retired production tables + isolated test tables
+constexpr uint32_t kPendingSlots = 16;
 
 constexpr uint32_t kRing = 8; // A63: was 4; a game running 3+ frames ahead made the pass skip alternate frames (flicker)
 
@@ -135,6 +136,7 @@ struct PendingInputs {
     UINT64 submitted = 0; // retain copies until their producer has finished
     UINT64 consumed = 0; // last NR submission reading these copies
     uint64_t serial = 0;
+    uint64_t recording_order = 0;
     ComPtr<ID3D12Fence> fence;
     ComPtr<ID3D12CommandQueue> queue;
     EvalInputs in{};
@@ -164,7 +166,8 @@ struct State {
     ComPtr<ID3D12Resource> query_readback;
     // NA-owned textures.
     ComPtr<ID3D12Resource> depth_copy, motion_copy;   // NPSR at rest (render size)
-    PendingInputs pending[16]; // bounded command-list recordings, no per-frame heap growth
+    PendingInputs pending[kPendingSlots]; // one snapshot per evaluation, including repeated calls on one list
+    uint64_t recording_order = 0;
     PendingInputs* ready = nullptr;
     std::atomic<uint32_t> pending_count{0};
     ComPtr<ID3D12CommandQueue> output_queue;
@@ -608,9 +611,9 @@ bool WantsInputs()
 // `out` (R32F UAV-capable, NON_PIXEL_SHADER_RESOURCE -> left in COPY_DEST).
 // Changes the list's descriptor heaps, root signature and pipeline. Caller holds g.m.
 void record_depth_to_r32_locked(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, DXGI_FORMAT view, ID3D12Resource* out,
-                                uint32_t bx, uint32_t by, uint32_t w, uint32_t h)
+                                uint32_t bx, uint32_t by, uint32_t w, uint32_t h, uint32_t descriptor_index)
 {
-    const uint32_t slot = 16 * kRing + 4 * (g.eval_slot++ % kEvalSlots);
+    const uint32_t slot = 16 * kRing + 4 * descriptor_index;
     write_srv(slot + 0, depth, view);
     write_srv(slot + 1, depth, view);
     write_srv(slot + 2, depth, view);
@@ -685,7 +688,11 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
         return;
     }
     discard_invalid_recordings_locked();
-    for (auto& p : g.pending) if (p.list == list) { pending = &p; break; }
+    // A second evaluate on this recording must not overwrite/reallocate the
+    // first evaluate's textures or shader-visible descriptors. Share only the
+    // Reset token; each recorded copy has its own GPU-retired slot.
+    std::shared_ptr<std::atomic<bool>> recording;
+    for (auto& p : g.pending) if (p.list == list) { recording = p.recording; break; }
     const auto output_done = g.fence->GetCompletedValue();
     if (!pending) for (auto& p : g.pending) {
         // Never reuse a recorded, GPU-busy, or still-unconsumed published
@@ -704,14 +711,15 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
         return;
     }
     const bool need_uav = !copy_depth;
-    if (!pending->list) {
+    if (!recording) {
         auto valid = std::make_shared<std::atomic<bool>>(true);
         auto* token = new RecordingToken(valid);
         const HRESULT hr = list->SetPrivateDataInterface(kRecordingToken, token);
         token->Release();
         if (FAILED(hr)) { g.skipped.fetch_add(1); set_reason("Neural Rendering could not track this input recording."); return; }
-        pending->recording = std::move(valid);
+        recording = std::move(valid);
     }
+    pending->recording = std::move(recording);
     if (!pending->fence && FAILED(g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&pending->fence)))) {
         latch("Neural Rendering could not prepare input synchronization."); return;
     }
@@ -747,7 +755,8 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
         // just ran already changed this list's descriptor heaps/root state, and
         // the caller must restore them after it (NGX/FFX contract), so this
         // pass records in that same window.
-        record_depth_to_r32_locked(list, in.depth, depth_view, recording_depth.Get(), dbx, dby, rw, rh);
+        record_depth_to_r32_locked(list, in.depth, depth_view, recording_depth.Get(), dbx, dby, rw, rh,
+                                  static_cast<uint32_t>(pending - g.pending));
         D3D12_RESOURCE_BARRIER pre[2] = {
             transition(in.motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
             transition(recording_motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)};
@@ -768,6 +777,7 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
     pending->valid_h = rh;
     if (!pending->list) g.pending_count.fetch_add(1, std::memory_order_release);
     pending->list = list;
+    pending->recording_order = ++g.recording_order;
     pending->in = in;
     pending->in.depth = pending->in.motion = nullptr; // no borrowed resource pointers outlive the call
     g.inputs_seen.fetch_add(1, std::memory_order_relaxed);
@@ -805,8 +815,15 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     // a game submission wait for NR: an FG queue may already be waiting for
     // that game submission, which would form a dependency cycle.
     forward(queue, count, lists); // never suppress the game's submission
-    for (UINT i = 0; i < count; ++i) for (auto& p : g.pending) {
-        if (!p.list || p.list != lists[i]) continue;
+    for (UINT i = 0; i < count; ++i) {
+      PendingInputs* ordered_inputs[kPendingSlots];
+      uint32_t n = 0;
+      for (auto& p : g.pending) if (p.list && p.list == lists[i]) ordered_inputs[n++] = &p;
+      std::sort(ordered_inputs, ordered_inputs + n, [](const auto* a, const auto* b) {
+          return a->recording_order < b->recording_order;
+      });
+      for (uint32_t j = 0; j < n; ++j) {
+        auto& p = *ordered_inputs[j];
         const bool ordered = !g.signal_failed && SUCCEEDED(queue->Signal(p.fence.Get(), ++p.submitted));
         if (ordered) {
             p.serial = ++g.input_value;
@@ -821,6 +838,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         // Keep the snapshot through BOTH its producer and consumer completion.
         p.list = nullptr;
         g.pending_count.fetch_sub(1, std::memory_order_release);
+      }
     }
 }
 
@@ -1191,7 +1209,10 @@ bool RecordDepthToR32ForTests(ID3D12GraphicsCommandList* list, ID3D12Resource* d
     std::lock_guard<std::mutex> lock(g.m);
     ComPtr<ID3D12Device> dev;
     if (FAILED(list->GetDevice(IID_PPV_ARGS(&dev))) || !ensure_device_locked(dev.Get())) return false;
-    record_depth_to_r32_locked(list, depth, view, out, bx, by, w, h);
+    // Isolated test-only descriptors; production descriptors are owned by
+    // pending snapshots and cannot wrap while a recording is in flight.
+    record_depth_to_r32_locked(list, depth, view, out, bx, by, w, h,
+                              kPendingSlots + (g.eval_slot++ % (kEvalSlots - kPendingSlots)));
     return true;
 }
 
