@@ -272,3 +272,8 @@ endif()
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/CMakeLists.txt")
   add_subdirectory(tools)       # Claude (C5): nr_replay (local-only, needs SDK lib)
 endif()
+
+# Reversible per-application FG preset helper; no profile changes at build/test time.
+add_executable(NAProfile src/host_dx12/fg/preset_profile.cpp)
+target_compile_definitions(NAProfile PRIVATE NA_PROFILE_CLI)
+target_link_libraries(NAProfile PRIVATE host_settings nvapi_headers)

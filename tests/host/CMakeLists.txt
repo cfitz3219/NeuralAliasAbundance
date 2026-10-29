@@ -13,6 +13,9 @@ function(na_host_test name)
   set_tests_properties(host_${name} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;${T_LABELS}")
 endfunction()
 
+na_host_test(fg_profile_test SOURCES fg_profile_test.cpp LIBS host_settings nvapi_headers)
+na_host_test(pbz_settings_test SOURCES pbz_settings_test.cpp LIBS host_settings)
+
 # Fake NGX runtime (the one non-driver name ngx_observe accepts).
 add_library(nvngx_stub SHARED ngx_stub.cpp)
 set_target_properties(nvngx_stub PROPERTIES PREFIX "")

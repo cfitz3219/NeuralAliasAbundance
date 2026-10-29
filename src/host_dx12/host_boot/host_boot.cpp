@@ -9,6 +9,7 @@
 #include <mutex>
 
 #include "host_dx12/fg/frame_gen.hpp"
+#include "host_dx12/fg/preset_profile.hpp"
 #include "host_dx12/hooking/vtable_hook.hpp"
 #include "host_dx12/host_boot/game_adapter.h"
 #include "host_dx12/ngx_observe/gpu_timing.hpp"
@@ -91,6 +92,7 @@ DWORD WINAPI InitThread(LPVOID)
     bool route_a = GetPrivateProfileIntW(L"route_a", L"enabled", 0, g_ini) == 1;
     bool route_a_started = false;
     if (route_a) {
+        na::fg::preset::Initialize();
         na::ngx::PreloadAndHookNgxCore();
         na::tlou1::InitializeApply();
         bool sync_hook = GetPrivateProfileIntW(L"observe", L"sync_loader_hook", 0, g_ini) == 1;

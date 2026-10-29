@@ -26,6 +26,16 @@ void resolve_user_ini()
         wchar_t dir[MAX_PATH];
         swprintf_s(dir, L"%s\\NeuralAlias", local);
         CreateDirectoryW(dir, nullptr);
+        wchar_t scope[64]{};
+        if (g_ini_defaults[0]) GetPrivateProfileStringW(L"settings", L"scope", L"", scope, 64, g_ini_defaults);
+        bool valid = scope[0] != 0;
+        for (const wchar_t* c = scope; *c; ++c)
+            valid &= (*c >= L'a' && *c <= L'z') || (*c >= L'A' && *c <= L'Z') ||
+                     (*c >= L'0' && *c <= L'9') || *c == L'-' || *c == L'_';
+        if (valid) {
+            swprintf_s(dir, L"%s\\NeuralAlias\\%s", local, scope);
+            CreateDirectoryW(dir, nullptr);
+        }
         swprintf_s(g_ini_user, L"%s\\NeuralAliasSL.ini", dir);
         CoTaskMemFree(local);
     }
@@ -91,7 +101,8 @@ void load_from(const wchar_t* ini, bool only_if_present)
     int reflex = static_cast<int>(GetPrivateProfileIntW(L"latency", L"reflex", 1, ini));
     g_settings.reflex_mode.store(reflex >= 0 && reflex <= 2 ? reflex : 1);
     g_settings.fg_enabled.store(GetPrivateProfileIntW(L"fg", L"enabled", 0, ini) ? 1u : 0u);
-    g_settings.fg_preset.store(GetPrivateProfileIntW(L"fg", L"preset", 1, ini) == 2 ? 2u : 1u);
+    const UINT fg_preset = GetPrivateProfileIntW(L"fg", L"preset", 1, ini);
+    g_settings.fg_preset.store(fg_preset >= 1 && fg_preset <= 3 ? fg_preset : 1u);
     g_settings.fg_mode.store(GetPrivateProfileIntW(L"fg", L"mode", 1, ini) ? 1u : 0u);
     uint32_t fm = GetPrivateProfileIntW(L"fg", L"multiplier", 2, ini);
     g_settings.fg_multiplier.store(fm < 2 ? 2 : (fm > 6 ? 6 : fm));
@@ -117,6 +128,7 @@ const wchar_t* UserIniPath()
 void Load()
 {
     load_from(g_ini_defaults, false);
+    g_settings.fg_profile_override.store(g_ini_defaults[0] && GetPrivateProfileIntW(L"fg", L"profile_override", 0, g_ini_defaults) == 1);
     resolve_user_ini();
     load_from(g_ini_user, true); // user choices win when present
     // Insertion mode is an explicit per-game deployment choice, never inherited

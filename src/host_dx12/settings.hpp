@@ -94,7 +94,8 @@ struct Settings {
     std::atomic<int32_t> reflex_mode{1}; // 0 Off, 1 On (default), 2 On + Boost; engine adapter supplies timings
     std::atomic<uint32_t> fg_enabled{0};
     std::atomic<uint32_t> fg_mode{1};
-    std::atomic<uint32_t> fg_preset{1}; // NVIDIA driver-profile request: A=1 (default), B=2; restart after change
+    std::atomic<uint32_t> fg_profile_override{0}; // per-deployment opt-in
+    std::atomic<uint32_t> fg_preset{1}; // NVIDIA driver-profile request: A=1 (default), B=2, C=3; restart after change
     std::atomic<uint32_t> fg_multiplier{2};
     std::atomic<uint32_t> fg_target_fps{0};
     // A69: the freeze watchdog switched Frame Generation off at this time
