@@ -145,12 +145,14 @@ void DrawPicture()
     // optimal-callback size only before any creation has been seen.
     unsigned out_w = valid_size(ngx.last_sr_out_w, ngx.last_sr_out_h) ? ngx.last_sr_out_w : opt.last_user_w;
     unsigned out_h = valid_size(ngx.last_sr_out_w, ngx.last_sr_out_h) ? ngx.last_sr_out_h : opt.last_user_h;
-    // A game that never asks DLSS which render size to use picks it itself
-    // (PBZ renders 1146x480 for 3440x1440 whatever we answer). Then only the
-    // game's own video settings change the resolution; NeuralAlias controls presets.
+    // True when no optimal-settings query for the game's display size has been
+    // seen. That is NOT proof the game ignores DLSS's answer: an engine may ask
+    // with a reference size (PBZ: 1000x1000) at startup. Used for guidance only.
     const bool game_sets_size = !na::tlou1::GetApplyStatus().available && valid_size(ngx.last_sr_out_w, ngx.last_sr_out_h) &&
                                 !na::ngx::OptimalQueriedFor(ngx.last_sr_out_w, ngx.last_sr_out_h);
-    if (game_sets_size) follow_game = true;
+    // No longer locks the picture mode (Cort's 16:41 run: the game's only
+    // queries were 1000x1000, possibly an engine reference size read at
+    // startup, so "no display-size query" is not proof the size can't change).
     unsigned rw = 0, rh = 0;
     if (valid_size(out_w, out_h)) requested_size(out_w, out_h, mode, &rw, &rh);
     if (follow_game && valid_size(ngx.last_sr_in_w, ngx.last_sr_in_h)) {
@@ -175,7 +177,7 @@ void DrawPicture()
         }
     } else if (engine_busy) {
         text = engine_apply.reason;
-    } else if (game_sets_size) {
+    } else if (game_sets_size && follow_game) {
         state = 1;
         snprintf(buf, sizeof(buf), "This game has not asked DLSS for its render size in a way NeuralAlias can change (%ux%u now). Pick Performance, Balanced or Quality in the game's video settings; NeuralAlias sets the DLSS preset.", rw, rh);
         text = buf;
@@ -217,7 +219,7 @@ void DrawPicture()
     EndRow();
     ImGui::EndDisabled();
 
-    ImGui::BeginDisabled(!enabled || engine_busy || game_sets_size);
+    ImGui::BeginDisabled(!enabled || engine_busy);
     BeginRow("Use game's resolution", "Choose DLAA, Quality or Ultra Performance in the game's video settings. NeuralAlias can still change presets.", SwitchWidth());
     if (Switch("follow_game_resolution", &follow_game)) {
         st.follow_game_resolution.store(follow_game ? 1u : 0u);
@@ -244,7 +246,7 @@ void DrawPicture()
         }
     }
     ImGui::EndDisabled();
-    Hint(game_sets_size ? "NeuralAlias has not seen this game ask DLSS for a render size, so the picture mode is chosen in the game's video settings." :
+    Hint(game_sets_size && !follow_game ? "This game has not asked DLSS for its render size while running. It may only read it at startup: if Apply does not change the size, keep this mode selected and restart the game." :
          follow_game ? "Picture mode follows the game's video settings, including Ultra Performance." : kModeHelp[mode]);
 
     // Preset + Apply. (A46: the disabled Sharpness row is gone until a
@@ -358,7 +360,7 @@ void DrawPicture()
                 StatusLine(1, follow_game ? "DLSS rebuilt with the preset request; the game's resolution is retained." : "Applied: the game is now rendering at the selected mode.");
             else if (check.id && check.id == pr.confirm_id && check.state == 4) {
                 snprintf(buf, sizeof(buf), check.creations
-                    ? "DLSS rebuilt, but the requested inputs were not confirmed (observed %ux%u). Use game's resolution and select picture mode in the game's menu."
+                    ? "DLSS rebuilt, but the game kept %ux%u. It may only read the render size at startup: keep this mode selected and restart the game, or choose the mode in the game's menu."
                     : "No DLSS rebuild was observed (last %ux%u). Change DLSS or ray tracing once in the game's menu.", check.last_w, check.last_h);
                 StatusLine(2, buf);
             } else
