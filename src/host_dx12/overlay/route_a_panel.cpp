@@ -112,6 +112,15 @@ static int preset_index(int value)
         if (kPresetValues[i] == value) return i;
     return 0;
 }
+// Ray Reconstruction's own presets: the SDK marks only D, E and F usable.
+static const char* kRrPresets[] = {"Automatic", "D (transformer)", "E (latest transformer)", "F (Ray Reconstruction 2)"};
+static const int kRrPresetValues[] = {0, 4, 5, 6};
+static int rr_preset_index(int value)
+{
+    for (int i = 1; i < 4; ++i)
+        if (kRrPresetValues[i] == value) return i;
+    return 0;
+}
 
 void DrawPicture()
 {
@@ -197,15 +206,30 @@ void DrawPicture()
     BeginGroupBox("picture-group");
     {
         ImGui::BeginDisabled(!enabled || blocked || engine_busy);
-        int preset = st.preset.load();
-        int sel = preset_index(preset);
-        BeginRow("DLSS preset",
-                 "Leave on Automatic unless a particular preset looks better.\nJ and K suit DLAA, Quality and Balanced; L and M are meant for Performance modes.",
-                 DropdownWidth());
-        if (Combo("preset", &sel, kPresets, 5, DropdownWidth())) {
-            st.preset.store(kPresetValues[sel]);
-            note_request();
-            na::settings::Save();
+        // The game's upscaler decides which preset list applies: Ray Reconstruction
+        // (feature 13) has its own keys and only presets D/E/F.
+        const bool rr_upscaler = ngx.active_upscaler == 13; // what the game uses NOW (follows its RR toggle)
+        int sel = 0;
+        if (rr_upscaler) {
+            sel = rr_preset_index(st.rr_preset.load());
+            BeginRow("Ray Reconstruction preset",
+                     "This game upscales with Ray Reconstruction, which has its own models.\nLeave on Automatic unless one looks better. E is required by games that use its depth-of-field guide.",
+                     DropdownWidth());
+            if (Combo("rr_preset", &sel, kRrPresets, 4, DropdownWidth())) {
+                st.rr_preset.store(kRrPresetValues[sel]);
+                note_request();
+                na::settings::Save();
+            }
+        } else {
+            sel = preset_index(st.preset.load());
+            BeginRow("DLSS preset",
+                     "Leave on Automatic unless a particular preset looks better.\nJ and K suit DLAA, Quality and Balanced; L and M are meant for Performance modes.",
+                     DropdownWidth());
+            if (Combo("preset", &sel, kPresets, 5, DropdownWidth())) {
+                st.preset.store(kPresetValues[sel]);
+                note_request();
+                na::settings::Save();
+            }
         }
         EndRow();
         ImGui::EndDisabled();
@@ -219,7 +243,7 @@ void DrawPicture()
             Hint("Automatic lets NVIDIA's software choose.");
         } else {
             snprintf(buf, sizeof(buf), "Preset %s requested. Whether NVIDIA's software uses it is not confirmed.",
-                     kPresets[sel]);
+                     rr_upscaler ? kRrPresets[sel] : kPresets[sel]);
             Hint(buf);
         }
         if (ngx.quality_rejected)
@@ -228,23 +252,63 @@ void DrawPicture()
         bool size_matches = rw && ngx.last_sr_in_w == rw && ngx.last_sr_in_h == rh;
         static bool engine_clicked = false;
         static bool admission_failed = false;
-        ImGui::BeginDisabled(!enabled || blocked || ngx.sr_creates == 0 || engine_busy);
+        static bool rebuild_clicked = false;   // generic: window nudge so the game rebuilds its DLSS
+        static bool rebuild_refused = false;
+        static uint32_t rebuild_attempts_at = 0;
+        // Any game upscaler counts: plain DLSS (feature 1) or Ray Reconstruction (13).
+        const bool have_upscaler = ngx.active_upscaler != 0;
+        // A game with a hand-written engine adapter (TLOU) changes its own picture
+        // mode; every other game gets the generic rebuild (A63/A64): the window is
+        // nudged by one pixel and back, the engine re-creates its render targets and
+        // asks DLSS for the size again, and the armed confirmation reports whether
+        // the new size was actually rendered.
+        const bool engine_adapter = na::tlou1::GetApplyStatus().available;
+        ImGui::BeginDisabled(!enabled || blocked || !have_upscaler || engine_busy);
         BeginRow("Apply changes", "Update the picture mode and preset together.", ButtonWidth("Apply"));
         if (Button("Apply")) {
             admission_failed = false;
-            engine_clicked = !size_matches;
-            if (engine_clicked) {
-                admission_failed = !na::tlou1::RequestApply({static_cast<uint32_t>(mode), rw, rh, st.preset.load()});
-                g_apply_clicked = false;
-            } else {
+            engine_clicked = rebuild_clicked = rebuild_refused = false;
+            g_apply_clicked = false;
+            // Plain DLSS can take a new PRESET in place (A46). A size change, or any
+            // change while the game uses Ray Reconstruction, needs the game to
+            // re-create its DLSS feature.
+            const bool in_place = size_matches && ngx.active_upscaler == 1;
+            if (in_place) {
                 na::ngx::RequestReapply();
                 g_apply_ok_at = ngx.reapplies;
                 g_apply_fail_at = ngx.reapply_failures;
                 g_apply_clicked = true;
+            } else if (engine_adapter) {
+                engine_clicked = true;
+                admission_failed = !na::tlou1::RequestApply({static_cast<uint32_t>(mode), rw, rh, st.preset.load()});
+            } else {
+                rebuild_clicked = true;
+                rebuild_attempts_at = na::overlay::GetPictureRebuild().attempts;
+                rebuild_refused = !na::overlay::RequestPictureRebuild(rw, rh);
             }
         }
         EndRow();
         ImGui::EndDisabled();
+        if (!have_upscaler && enabled)
+            Hint("Apply becomes available once the game has started DLSS.");
+        if (rebuild_clicked) {
+            const auto pr = na::overlay::GetPictureRebuild();
+            const auto check = na::ngx::GetSizeConfirmation();
+            if (rebuild_refused)
+                StatusLine(2, "A previous Apply is still in progress. Try again in a moment.");
+            else if (pr.state == 4)
+                StatusLine(2, pr.reason[0] ? pr.reason : "The picture could not be rebuilt.");
+            else if (pr.attempts == rebuild_attempts_at || pr.state == 1 || pr.state == 2)
+                StatusLine(0, "Asking the game to rebuild its picture...");
+            else if (check.id && check.id == pr.confirm_id && check.state == 3)
+                StatusLine(1, "Applied: the game is now rendering at the selected mode.");
+            else if (check.id && check.id == pr.confirm_id && check.state == 4) {
+                snprintf(buf, sizeof(buf), "This game did not rebuild its DLSS when asked (it rendered %ux%u). Change the DLSS or ray-tracing setting once in the game's own menu to apply.",
+                         check.last_w, check.last_h);
+                StatusLine(2, buf);
+            } else
+                StatusLine(0, "Picture rebuilt; checking the new size...");
+        }
         if (engine_clicked) {
             auto progress = na::tlou1::GetApplyStatus();
             if (admission_failed)
@@ -263,17 +327,32 @@ void DrawPicture()
         if (BeginDetails("Apply details")) {
             auto progress = na::tlou1::GetApplyStatus();
             auto check = na::ngx::GetSizeConfirmation();
-            Hint(progress.available ? (progress.stage == na::tlou1::Stage::Confirmed ? "The requested resolution was observed with coherent inputs. Visual quality is checked separately." : "Uses this game's graphics-settings update and waits for matching rendered frames.") : progress.reason);
-            snprintf(buf, sizeof(buf), "Request %llu; engine updates %llu; rebuilds requested %llu; thread %u.",
-                     static_cast<unsigned long long>(progress.request_id), static_cast<unsigned long long>(progress.frame_calls),
-                     static_cast<unsigned long long>(progress.triggers), progress.trigger_thread);
-            Hint(buf);
-            if (progress.request_id && progress.request_id == check.id) {
-                snprintf(buf, sizeof(buf), "Requested %ux%u; observed %ux%u; %u of %u consecutive frames; result %u/%u.",
-                         check.req_w, check.req_h, check.last_w, check.last_h, check.streak, check.need, check.state, check.reason);
+            if (progress.available) {
+                // A game with a hand-written engine adapter (TLOU).
+                Hint(progress.stage == na::tlou1::Stage::Confirmed ? "The requested resolution was observed with coherent inputs. Visual quality is checked separately." : "Uses this game's graphics-settings update and waits for matching rendered frames.");
+                snprintf(buf, sizeof(buf), "Request %llu; engine updates %llu; rebuilds requested %llu; thread %u.",
+                         static_cast<unsigned long long>(progress.request_id), static_cast<unsigned long long>(progress.frame_calls),
+                         static_cast<unsigned long long>(progress.triggers), progress.trigger_thread);
                 Hint(buf);
+                if (progress.request_id && progress.request_id == check.id) {
+                    snprintf(buf, sizeof(buf), "Requested %ux%u; observed %ux%u; %u of %u consecutive frames; result %u/%u.",
+                             check.req_w, check.req_h, check.last_w, check.last_h, check.streak, check.need, check.state, check.reason);
+                    Hint(buf);
+                }
+            } else {
+                // Every other game: the general rebuild (no game-specific code).
+                const auto pr = na::overlay::GetPictureRebuild();
+                Hint(ngx.active_upscaler == 1
+                         ? "A preset change is applied directly to the game's DLSS. A mode change asks the game to rebuild its picture (its window is resized by one pixel and back), then checks the size it renders."
+                         : "Apply asks the game to rebuild its picture (its window is resized by one pixel and back) so it re-creates its DLSS with your mode and preset, then checks the size it renders.");
+                snprintf(buf, sizeof(buf), "Rebuilds tried %u, failed %u.", pr.attempts, pr.failures);
+                Hint(buf);
+                if (pr.confirm_id && pr.confirm_id == check.id) {
+                    snprintf(buf, sizeof(buf), "Requested %ux%u; observed %ux%u; %u of %u consecutive frames; result %u/%u.",
+                             check.req_w, check.req_h, check.last_w, check.last_h, check.streak, check.need, check.state, check.reason);
+                    Hint(buf);
+                }
             }
-
         }
 
     }
@@ -491,24 +570,24 @@ void DrawFrameGenerationRow()
     }
 }
 
-void DrawRayReconstructionRow()
+// Which DLSS upscaler the game itself created (status only). Ray Reconstruction cannot
+// be switched on from outside: it replaces the game's ray-tracing denoiser and needs
+// the un-denoised lighting plus albedo / normal / roughness guides that only the game
+// produces. The former on/off switch saved a choice nothing read; removed (Cort).
+void DrawDlssInUseRow()
 {
     using namespace na::ui;
-    na::settings::Settings& st = na::settings::Get();
     na::ngx::Stats ngx = na::ngx::GetStats();
-    bool rr = st.ray_reconstruction.load() != 0;
-    bool available = ngx.rr_seen != 0;
-    BeginRow("Ray Reconstruction",
-             available ? "Refines ray-traced effects in games that support it."
-                       : "Refines ray-traced effects in games that support it.\nNot available in this game.",
-             SwitchWidth());
-    ImGui::BeginDisabled(!available);
-    if (Switch("rr", &rr)) {
-        st.ray_reconstruction.store(rr ? 1u : 0u);
-        note_request();
-        na::settings::Save();
-    }
-    ImGui::EndDisabled();
+    // The upscaler the game is using NOW (its most recent DLSS creation): many games
+    // offer ray reconstruction as a toggle, and switching it re-creates DLSS.
+    const bool rr = ngx.active_upscaler == 13, sr = ngx.active_upscaler == 1;
+    const char* badge = rr ? "RAY RECONSTRUCTION" : sr ? "SUPER RESOLUTION" : "NOT YET SEEN";
+    const char* help =
+        rr   ? "The game is using Ray Reconstruction now (its ray-traced DLSS, switched on in its settings). Turn it off there and the game switches to plain DLSS; NeuralAlias follows either way."
+        : sr ? "The game is using plain DLSS Super Resolution now. If it offers Ray Reconstruction, turning that on switches DLSS over; NeuralAlias follows either way."
+             : "The game has not started DLSS yet. Enable DLSS in its video settings.";
+    BeginRow("DLSS in use", help, BadgeWidth(badge));
+    Badge(badge);
     EndRow();
 }
 
@@ -609,6 +688,10 @@ void DrawCaptureRow()
 void DrawLiveDlaa()
 {
     using namespace na::ui;
+    // Our DLAA injector for games WITHOUT DLSS ([j2] enabled=1 per game). In a game
+    // that runs its own DLSS it never starts, and "Not running yet ... 0 frames
+    // improved" only confused (Cort, Phantom Blade Zero): draw nothing there.
+    if (!na::j2::Configured()) return;
     const na::j2::Stats st = na::j2::GetStats();
     BeginGroupBox("Live DLAA");
     bool on = !na::j2::Paused();
@@ -754,8 +837,7 @@ void RegisterRouteAMenu()
                         Page::Enhancements});
     na::menu::Register({"Responsiveness", Availability::Available, nullptr, &DrawLatencyRow, Page::Enhancements});
     na::menu::Register({"Latency and display", Availability::Available, nullptr, &DrawLatencyDetails, Page::Details});
-    na::menu::Register({"Ray Reconstruction", Availability::Available, nullptr, &DrawRayReconstructionRow,
-                        Page::Enhancements});
+    na::menu::Register({"DLSS in use", Availability::Available, nullptr, &DrawDlssInUseRow, Page::Enhancements});
     na::menu::Register({"Motion analysis", Availability::Available, nullptr, &DrawMotionRow, Page::Enhancements});
     na::menu::Register({"Connection", Availability::Available, nullptr, &DrawConnectionRow, Page::Details});
     na::menu::Register({"Save pictures for analysis", Availability::Available, nullptr, &DrawCaptureRow,

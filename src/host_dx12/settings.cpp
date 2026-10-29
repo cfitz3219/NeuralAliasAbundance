@@ -52,8 +52,8 @@ void load_from(const wchar_t* ini, bool only_if_present)
     int preset = static_cast<int>(
         GetPrivateProfileIntW(L"dlss", L"preset", static_cast<UINT>(-1), ini));
     g_settings.preset.store((preset >= 1 && preset <= 13) ? preset : -1);
-    g_settings.ray_reconstruction.store(
-        GetPrivateProfileIntW(L"dlss", L"ray_reconstruction", 0, ini) ? 1u : 0u);
+    const int rr_preset = static_cast<int>(GetPrivateProfileIntW(L"dlss", L"rr_preset", 0, ini));
+    g_settings.rr_preset.store(rr_preset >= 4 && rr_preset <= 6 ? rr_preset : 0);
     g_settings.text_bold.store(
         GetPrivateProfileIntW(L"overlay", L"text_bold", 0, ini) ? 1u : 0u);
     g_settings.win_x.store(static_cast<int32_t>(GetPrivateProfileIntW(L"overlay", L"win_x", 0, ini)));
@@ -164,8 +164,8 @@ bool Save()
     ok &= WritePrivateProfileStringW(L"dlss", L"mode", v, ini) != 0;
     swprintf_s(v, L"%d", g_settings.preset.load());
     ok &= WritePrivateProfileStringW(L"dlss", L"preset", v, ini) != 0;
-    swprintf_s(v, L"%u", g_settings.ray_reconstruction.load());
-    ok &= WritePrivateProfileStringW(L"dlss", L"ray_reconstruction", v, ini) != 0;
+    swprintf_s(v, L"%d", g_settings.rr_preset.load());
+    ok &= WritePrivateProfileStringW(L"dlss", L"rr_preset", v, ini) != 0;
     swprintf_s(v, L"%u", g_settings.text_bold.load());
     ok &= WritePrivateProfileStringW(L"overlay", L"text_bold", v, ini) != 0;
     struct { const wchar_t* key; int32_t value; } win[] = {

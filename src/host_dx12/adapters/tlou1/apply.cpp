@@ -32,7 +32,7 @@ std::once_flag g_init;
 ApplyRequest g_request;
 bool g_available = false;
 bool g_dispatch_active = false; // mutex protected; even cancelled invocations must return
-char g_reason[160] = "This game has no automatic picture-mode adapter.";
+char g_reason[160] = "No engine adapter for this game; Apply uses the general picture rebuild.";
 std::atomic<bool> g_queued{false};
 std::atomic<uint64_t> g_frame_calls{0}, g_predicate_calls{0}, g_triggers{0};
 std::atomic<uint64_t> g_resource_releases{0}, g_resource_release_failures{0};

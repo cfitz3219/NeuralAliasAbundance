@@ -9,6 +9,7 @@
 //   - StripPresetHints resets all six keys; RestoreQualityValue writes back.
 #include "test_support.hpp"
 #include "fake_ngx_params.hpp"
+#include <nvsdk_ngx_defs_dlssd.h> // Ray Reconstruction preset keys
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 #include "host_dx12/settings.hpp"
 
@@ -88,6 +89,42 @@ int main()
         CHECK(p.I(NVSDK_NGX_Parameter_PerfQualityValue) == NVSDK_NGX_PerfQuality_Value_MaxQuality);
     }
     CHECK(!na::ngx::ApplyCreateOverrides(nullptr));
-    st.preset.store(-1); st.dlss_mode.store(0);
+
+    // ---- Ray Reconstruction (feature 13) is the game's upscaler in RT games
+    // (Phantom Blade Zero): same quality value, its OWN preset keys (D/E/F only),
+    // never the Super Resolution keys. Frame Generation (11) is left untouched.
+    const char* kRrKeys[] = {NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA,
+                             NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality,
+                             NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced,
+                             NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Performance,
+                             NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraPerformance,
+                             NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraQuality};
+    {
+        test::FakeParams p;
+        st.enabled.store(1); st.dlss_mode.store(static_cast<uint32_t>(na::settings::DlssMode::UltraPerformance));
+        st.preset.store(13); st.rr_preset.store(5); // SR M chosen, RR E chosen
+        CHECK(na::ngx::ApplyCreateOverridesForFeature(13, &p));
+        CHECK(p.I(NVSDK_NGX_Parameter_PerfQualityValue) == NVSDK_NGX_PerfQuality_Value_UltraPerformance);
+        for (const char* k : kRrKeys) CHECK(p.U(k) == 5u);
+        for (const char* k : kPresetKeys) CHECK(!p.Has(k)); // RR never gets SR's preset (M is "do not use" for RR)
+        CHECK(na::ngx::StripRrPresetHints(&p));
+        for (const char* k : kRrKeys) CHECK(p.U(k) == 0u);
+    }
+    {
+        test::FakeParams p;
+        st.rr_preset.store(0); // Automatic: quality value only
+        CHECK(na::ngx::ApplyCreateOverridesForFeature(13, &p));
+        CHECK(p.Has(NVSDK_NGX_Parameter_PerfQualityValue));
+        for (const char* k : kRrKeys) CHECK(!p.Has(k));
+    }
+    {
+        test::FakeParams p;
+        CHECK(!na::ngx::ApplyCreateOverridesForFeature(11, &p)); // Frame Generation: not ours to change
+        CHECK(p.values.empty());
+        CHECK(na::ngx::ApplyCreateOverridesForFeature(1, &p));   // Super Resolution path unchanged
+        for (const char* k : kPresetKeys) CHECK(p.U(k) == 13u);
+        for (const char* k : kRrKeys) CHECK(!p.Has(k));
+    }
+    st.preset.store(-1); st.rr_preset.store(0); st.dlss_mode.store(0);
     return test::finish("ngx_params_test");
 }

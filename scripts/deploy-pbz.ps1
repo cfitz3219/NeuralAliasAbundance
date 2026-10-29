@@ -37,7 +37,6 @@ function Restore($m) {
             throw "File changed after installation; retained for inspection: $($e.destination)"
         }
     }
-    if ($m.profile_attempted -and (Test-Path -LiteralPath $profileBackup)) { Profile 'restore' }
     foreach ($e in $m.files) {
         if (-not $e.touched) { continue }
         if ($e.mutable -and (Test-Path -LiteralPath $e.destination)) {
@@ -51,7 +50,13 @@ function Restore($m) {
         }
     }
     $m.state = 'restored'; Save-Manifest $m
-    Write-Host 'Original game files, menu preferences and FG driver settings restored.'
+    # The driver profile comes back AFTER the files, and its failure never strands
+    # our files in the game folder (a driver update can move or rebuild the profile).
+    $profileRestored = $true
+    if ($m.profile_attempted -and (Test-Path -LiteralPath $profileBackup)) {
+        try { Profile 'restore' } catch { $profileRestored = $false; Write-Warning "Game folder restored, but the NVIDIA FG preset could not be put back: $_. Run Rollback again later, or reset the Frame Generation override for PBZ.exe in the NVIDIA App." }
+    }
+    if ($profileRestored) { Write-Host 'Game folder restored (NeuralAlias files removed; no game file was ever changed). Menu preferences and FG driver settings restored.' }
 }
 if ($Action -eq 'Status') {
     if (-not (Test-Path -LiteralPath $manifestPath)) { Write-Host 'Not installed by this package.'; return }
@@ -77,7 +82,7 @@ $package = Get-Content -Raw -LiteralPath (Join-Path $PackageRoot 'package.json')
 foreach ($f in $package.payload) {
     if ((Hash (Join-Path $PackageRoot $f.name)) -ne $f.sha256) { throw "Package file mismatch: $($f.name)" }
 }
-foreach ($f in @('nvngx_dlss.dll','nvngx_dlssd.dll','nvngx_dlssg.dll','nvngx_dlssnr.dll')) {
+foreach ($f in @('nvngx_dlssnr.dll')) {
     $sig = Get-AuthenticodeSignature -LiteralPath (Join-Path $PackageRoot $f)
     if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'NVIDIA Corporation') { throw "NVIDIA signature invalid: $f" }
 }
@@ -133,18 +138,19 @@ foreach ($dir in @('platform\steam')) {
     }
     $plans += @{source=$iniSource; destination=(Join-Path $GameRoot "$dir\NeuralAliasHost.ini"); mutable=$false}
 }
+# The game's own nvngx_dlss / nvngx_dlssd / nvngx_dlssg (310.9.1, already able to run
+# presets L/M; FG preset C is a driver-profile request) are NEVER replaced. Established
+# rule (Anno, Sniper Elite, TLOU): the installer only ADDS files to the game folder.
 $dlssDir = 'Engine\Plugins\Runtime\Nvidia\DLSS\Binaries\ThirdParty\Win64'
-$slDir = 'Engine\Plugins\Runtime\Nvidia\StreamlineCore\Binaries\ThirdParty\Win64'
-foreach ($name in @('nvngx_dlss.dll','nvngx_dlssd.dll')) {
-    $dest = Join-Path $GameRoot "$dlssDir\$name"
-    if (-not (Test-Path -LiteralPath $dest)) { throw "Expected game runtime missing: $dest" }
-    $plans += @{source=(Join-Path $PackageRoot $name); destination=$dest; mutable=$false}
-}
-$plans += @{source=(Join-Path $PackageRoot 'nvngx_dlssg.dll'); destination=(Join-Path $GameRoot "$slDir\nvngx_dlssg.dll"); mutable=$false}
 # NGX can use the plugin search directory rather than the executable directory.
 $plans += @{source=(Join-Path $PackageRoot 'nvngx_dlssnr.dll'); destination=(Join-Path $GameRoot "$dlssDir\nvngx_dlssnr.dll"); mutable=$false}
 $plans += @{source=$iniSource; destination=(Join-Path $UserRoot 'NeuralAliasSL.ini'); mutable=$true}
 $plans += @{source=$profileBackup; destination=(Join-Path $UserRoot 'FG-profile-before.ini'); mutable=$false}
+foreach ($p in $plans) {
+    if ($p.destination.StartsWith($GameRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $p.destination)) {
+        throw "Refusing: $($p.destination) already exists. This installer only adds files to the game folder and never replaces one. Nothing changed."
+    }
+}
 $m = [PSCustomObject]@{state='preparing'; source_commit=$package.source_commit; game_root=$GameRoot; user_root=$UserRoot; profile_attempted=$false; files=@()}
 foreach ($p in $plans) {
     $original = Hash $p.destination

@@ -57,7 +57,7 @@ struct Settings {
     std::atomic<uint32_t> enabled{1};   // master switch (NeuralAlias controls DLSS)
     std::atomic<uint32_t> dlss_mode{0}; // DlssMode
     std::atomic<int32_t> preset{-1};    // -1 = let NVIDIA choose; 1..13 = A..M
-    std::atomic<uint32_t> ray_reconstruction{0}; // honored only where the game uses RR
+    std::atomic<int32_t> rr_preset{0};  // Ray Reconstruction: 0 = let NVIDIA choose; 4 D, 5 E, 6 F (its only usable presets)
     std::atomic<uint32_t> overlay_open{0};
     std::atomic<uint32_t> text_bold{0}; // A44: 0 standard weight, 1 bold (replaces text_size)
     // A44: remembered menu window placement in client pixels (0 = default).

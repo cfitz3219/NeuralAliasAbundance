@@ -59,6 +59,12 @@ constexpr uint32_t kSwap3GetIndexSlot = 36;       // IDXGISwapChain3::GetCurrent
 constexpr uint32_t kSwap3SetColorSpace1Slot = 38; // IDXGISwapChain3::SetColorSpace1
 constexpr uint32_t kSwap3ResizeBuffers1Slot = 39; // IDXGISwapChain3::ResizeBuffers1 (A59)
 constexpr uint32_t kQueueExecuteSlot = 10;
+// IDXGIFactory / IDXGIFactory2 swap-chain creation (shared factory vtable): for D3D12
+// the "device" argument is the command queue the swap chain presents from.
+constexpr uint32_t kFactoryCreateSwapChainSlot = 10;
+constexpr uint32_t kFactory2CreateForHwndSlot = 15;
+constexpr uint32_t kFactory2CreateForCoreWindowSlot = 16;
+constexpr uint32_t kFactory2CreateForCompositionSlot = 24;
 constexpr uint32_t kSrvHeapSize = 64;
 
 using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
@@ -113,6 +119,82 @@ std::atomic<int> g_color_space{DXGI_COLOR_SPACE_CUSTOM}; // last SetColorSpace1 
 XInputGetStateFn g_orig_xinput[3] = {};
 
 std::atomic<ID3D12CommandQueue*> g_direct_queue{nullptr};
+
+// The queue each swap chain was created with. The menu (and anything else that
+// writes the back buffer at Present) must use THIS queue: Present executes on it,
+// so commands submitted there right before Present are ordered after everything
+// the presenter queued (Streamline DLSS Frame Generation writes the generated frame
+// and waits on this queue before presenting). g_direct_queue is only "the last
+// direct queue that submitted", which in a two-queue game with native Frame
+// Generation (Phantom Blade Zero) is often not the presenting queue: the menu then
+// wrote the back buffer unsynchronised with FG and the GPU faulted (Cort, 2026-10-29).
+struct SwapQueue { void* sc = nullptr; ID3D12CommandQueue* queue = nullptr; };
+std::mutex g_swap_queue_m;
+SwapQueue g_swap_queues[8];
+uint32_t g_swap_queue_next = 0;
+std::atomic<uint32_t> g_swap_queue_hits{0}, g_swap_queue_misses{0}, g_swap_queues_recorded{0};
+std::atomic<uintptr_t> g_last_present_queue{0};
+
+void note_swapchain_queue(IUnknown* device_or_queue, void* swapchain)
+{
+    if (!device_or_queue || !swapchain) return;
+    ID3D12CommandQueue* q = nullptr;
+    if (FAILED(device_or_queue->QueryInterface(IID_PPV_ARGS(&q))) || !q) return; // D3D11 / other device: not ours
+    std::lock_guard<std::mutex> lk(g_swap_queue_m);
+    for (auto& e : g_swap_queues)
+        if (e.sc == swapchain) { if (e.queue) e.queue->Release(); e.queue = q; g_swap_queues_recorded.fetch_add(1); return; } // address reused
+    SwapQueue& slot = g_swap_queues[g_swap_queue_next++ % 8];
+    if (slot.queue) slot.queue->Release();
+    slot.sc = swapchain;
+    slot.queue = q; // holds a reference: the queue outlives every Present we see
+    g_swap_queues_recorded.fetch_add(1);
+}
+ID3D12CommandQueue* swapchain_queue(void* swapchain)
+{
+    std::lock_guard<std::mutex> lk(g_swap_queue_m);
+    for (const auto& e : g_swap_queues) if (e.sc == swapchain) return e.queue;
+    return nullptr;
+}
+
+using CreateSwapChainFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory*, IUnknown*, DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**);
+using CreateForHwndFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*,
+                                                    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
+using CreateForCoreWindowFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, IUnknown*, const DXGI_SWAP_CHAIN_DESC1*,
+                                                          IDXGIOutput*, IDXGISwapChain1**);
+using CreateForCompositionFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, const DXGI_SWAP_CHAIN_DESC1*,
+                                                           IDXGIOutput*, IDXGISwapChain1**);
+CreateSwapChainFn g_orig_create_swapchain = nullptr;
+CreateForHwndFn g_orig_create_for_hwnd = nullptr;
+CreateForCoreWindowFn g_orig_create_for_core_window = nullptr;
+CreateForCompositionFn g_orig_create_for_composition = nullptr;
+
+HRESULT STDMETHODCALLTYPE DetourCreateSwapChain(IDXGIFactory* f, IUnknown* dev, DXGI_SWAP_CHAIN_DESC* d, IDXGISwapChain** out)
+{
+    const HRESULT hr = g_orig_create_swapchain(f, dev, d, out);
+    if (SUCCEEDED(hr) && out && *out) note_swapchain_queue(dev, *out);
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE DetourCreateForHwnd(IDXGIFactory2* f, IUnknown* dev, HWND w, const DXGI_SWAP_CHAIN_DESC1* d,
+                                              const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs, IDXGIOutput* o, IDXGISwapChain1** out)
+{
+    const HRESULT hr = g_orig_create_for_hwnd(f, dev, w, d, fs, o, out);
+    if (SUCCEEDED(hr) && out && *out) note_swapchain_queue(dev, *out);
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE DetourCreateForCoreWindow(IDXGIFactory2* f, IUnknown* dev, IUnknown* w, const DXGI_SWAP_CHAIN_DESC1* d,
+                                                    IDXGIOutput* o, IDXGISwapChain1** out)
+{
+    const HRESULT hr = g_orig_create_for_core_window(f, dev, w, d, o, out);
+    if (SUCCEEDED(hr) && out && *out) note_swapchain_queue(dev, *out);
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE DetourCreateForComposition(IDXGIFactory2* f, IUnknown* dev, const DXGI_SWAP_CHAIN_DESC1* d,
+                                                     IDXGIOutput* o, IDXGISwapChain1** out)
+{
+    const HRESULT hr = g_orig_create_for_composition(f, dev, d, o, out);
+    if (SUCCEEDED(hr) && out && *out) note_swapchain_queue(dev, *out);
+    return hr;
+}
 // ImGui synchronously waits for font/texture uploads during RenderDrawData.
 // They must not sit behind game work that needs this Present to return.
 // Published separately so the upload cannot become the observed game queue.
@@ -848,13 +930,16 @@ void write_menu_progress(HANDLE log)
     if (pn > 0) WriteFile(log, p_line, static_cast<DWORD>(pn), &pw, nullptr);
     std::unique_lock<std::mutex> lock(g_state.mutex, std::try_to_lock);
     if (!lock.owns_lock() || !g_state.fence || !g_state.device) return;
-    char line[256];
-    int n = snprintf(line, sizeof(line), "menu_gpu draws=%llu submitted=%llu completed=%llu device_hr=0x%08lX observed_queue=0x%llX\r\n",
+    char line[400];
+    int n = snprintf(line, sizeof(line), "menu_gpu draws=%llu submitted=%llu completed=%llu device_hr=0x%08lX observed_queue=0x%llX present_queue=0x%llX swapchain_queues=%u hits=%u misses=%u\r\n",
                      static_cast<unsigned long long>(g_frames.load()),
                      static_cast<unsigned long long>(g_menu_draw_marker.load()),
                      static_cast<unsigned long long>(g_state.fence->GetCompletedValue()),
                      static_cast<unsigned long>(g_state.device->GetDeviceRemovedReason()),
-                     static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(g_direct_queue.load())));
+                     static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(g_direct_queue.load())),
+                     static_cast<unsigned long long>(g_last_present_queue.load()), g_swap_queues_recorded.load(),
+                     g_swap_queue_hits.load(), g_swap_queue_misses.load());
+    if (n >= static_cast<int>(sizeof(line))) n = static_cast<int>(sizeof(line)) - 1; // never write past a truncated line
     DWORD written = 0;
     if (n > 0) WriteFile(log, line, static_cast<DWORD>(n), &written, nullptr);
     auto nr_progress = na::nr::GetStats();
@@ -1817,8 +1902,16 @@ bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue)
     if (g_stopping.load(std::memory_order_acquire)) return false;
     if (sc == g_state.dummy_swapchain_identity) return false;
     g_presents.fetch_add(1, std::memory_order_relaxed);
-    queue = g_direct_queue.load(std::memory_order_acquire);
+    // The presenting queue when we saw the swap chain created; otherwise (created
+    // before our hooks) the last direct queue, as before.
+    queue = swapchain_queue(sc);
+    if (queue) g_swap_queue_hits.fetch_add(1, std::memory_order_relaxed);
+    else {
+        g_swap_queue_misses.fetch_add(1, std::memory_order_relaxed);
+        queue = g_direct_queue.load(std::memory_order_acquire);
+    }
     if (!queue) return false;
+    g_last_present_queue.store(reinterpret_cast<uintptr_t>(queue), std::memory_order_relaxed);
     if (g_state.swapchain && g_state.swapchain != sc) {
         // A31 robustness: a game that recreates its swap chain (HDR toggle,
         // display-mode change) presents from a NEW object. If the one we
@@ -2266,6 +2359,23 @@ bool Start(const char* route_tag, PanelFn controls)
                 na::hooking::HookVTableSlot(sc3.Get(), kSwap3SetColorSpace1Slot,
                                             reinterpret_cast<void*>(&DetourSetColorSpace1),
                                             reinterpret_cast<void**>(&g_orig_set_color_space));
+            }
+            if (ok) {
+                // Swap-chain creation on the shared factory vtable (after our own dummy
+                // chain exists, so it is never recorded). Optional: without it the menu
+                // falls back to the last direct queue.
+                na::hooking::HookVTableSlot(factory.Get(), kFactoryCreateSwapChainSlot,
+                                            reinterpret_cast<void*>(&DetourCreateSwapChain),
+                                            reinterpret_cast<void**>(&g_orig_create_swapchain));
+                na::hooking::HookVTableSlot(factory.Get(), kFactory2CreateForHwndSlot,
+                                            reinterpret_cast<void*>(&DetourCreateForHwnd),
+                                            reinterpret_cast<void**>(&g_orig_create_for_hwnd));
+                na::hooking::HookVTableSlot(factory.Get(), kFactory2CreateForCoreWindowSlot,
+                                            reinterpret_cast<void*>(&DetourCreateForCoreWindow),
+                                            reinterpret_cast<void**>(&g_orig_create_for_core_window));
+                na::hooking::HookVTableSlot(factory.Get(), kFactory2CreateForCompositionSlot,
+                                            reinterpret_cast<void*>(&DetourCreateForComposition),
+                                            reinterpret_cast<void**>(&g_orig_create_for_composition));
             }
             if (ok && na::observe::InstallRequested()) // C8: observation producers on the same throwaway objects
             {

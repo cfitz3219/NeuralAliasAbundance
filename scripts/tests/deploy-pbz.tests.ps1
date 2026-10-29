@@ -7,7 +7,7 @@ function Check($condition,$why) { if (-not $condition) { throw $why } }
 # Fixture binaries are text; no NVIDIA DLL, driver setting or game is touched.
 function Get-AuthenticodeSignature { param($LiteralPath) [PSCustomObject]@{Status='Valid';SignerCertificate=[PSCustomObject]@{Subject='NVIDIA Corporation'}} }
 $payload=@()
-foreach($n in @('NAProfile.exe','NeuralAliasDXGI.dll','nvngx_dlss.dll','nvngx_dlssd.dll','nvngx_dlssg.dll','nvngx_dlssnr.dll')) {
+foreach($n in @('NAProfile.exe','NeuralAliasDXGI.dll','nvngx_dlssnr.dll')) {
     Set-Content -LiteralPath (Join-Path $pkg $n) -Value "fixture $n"
     $payload+=@{name=$n;sha256=(Get-FileHash (Join-Path $pkg $n)).Hash}
 }
@@ -28,21 +28,34 @@ $args=@{GameRoot=$game;PackageRoot=$pkg;StateRoot=$state;UserRoot=$user;ProfileT
 $m=Get-Content -Raw (Join-Path $state 'deployment.json') | ConvertFrom-Json
 Check ($m.state -eq 'installed') 'install did not complete'
 foreach($e in $m.files) { Check ((Get-FileHash $e.destination).Hash -eq $e.after_hash) 'installed hash mismatch' }
+# Additive only: every file the game shipped is byte-identical while installed.
+foreach($p in $before.Keys) { Check ((Get-FileHash $p).Hash -eq $before[$p]) 'install changed a game file' }
+foreach($e in $m.files) { if($e.destination.StartsWith($game)) { Check (-not $e.before_hash) 'install replaced an existing game file' } }
 'user changed NR' | Set-Content (Join-Path $user 'NeuralAliasSL.ini')
 & $script @args -Action Rollback
 foreach($p in $before.Keys) { Check ((Get-FileHash $p).Hash -eq $before[$p]) 'original not restored' }
 foreach($e in $m.files) { if(-not $e.before_hash) { Check (-not(Test-Path $e.destination)) 'added file remains' } }
 Check (Test-Path (Join-Path $state 'last-user-settings.ini')) 'user changes not archived'
-# Reinstall then simulate game update: rollback must preserve foreign bytes.
+# Reinstall, then another tool overwrites our dxgi.dll: rollback must preserve foreign bytes.
 & $script @args -Action Install
-$changed=Join-Path $game 'Engine\Plugins\Runtime\Nvidia\DLSS\Binaries\ThirdParty\Win64\nvngx_dlss.dll'
-'game update' | Set-Content $changed
+$changed=Join-Path $game 'platform\steam\dxgi.dll'
+'another mod' | Set-Content $changed
 $refused=$false
 try { & $script @args -Action Rollback } catch { $refused=$true }
-Check $refused 'rollback overwrote game update'
-Check ((Get-Content $changed) -eq 'game update') 'foreign content lost'
-Copy-Item (Join-Path $pkg 'nvngx_dlss.dll') $changed -Force
+Check $refused 'rollback deleted a file another tool wrote'
+Check ((Get-Content $changed) -eq 'another mod') 'foreign content lost'
+Copy-Item (Join-Path $pkg 'NeuralAliasDXGI.dll') $changed -Force
 & $script @args -Action Rollback
+# A file the installer would add already exists in the game folder: refuse, change nothing.
+$existing=Join-Path $game 'platform\steam\dxgi.dll'
+'game or other mod dxgi' | Set-Content $existing
+$snapshot=Get-ChildItem -Recurse -File $game | ForEach-Object { "$($_.FullName)=$((Get-FileHash $_.FullName).Hash)" }
+$refusedExisting=$false
+try { & $script @args -Action Install } catch { $refusedExisting=$true; Check ($_.Exception.Message -like '*never replaces*') 'wrong refusal' }
+Check $refusedExisting 'install replaced an existing dxgi.dll'
+$after=Get-ChildItem -Recurse -File $game | ForEach-Object { "$($_.FullName)=$((Get-FileHash $_.FullName).Hash)" }
+Check ((Compare-Object $snapshot $after) -eq $null) 'refused install changed the game folder'
+Remove-Item -LiteralPath $existing -Force
 # A staging collision after profile apply must roll back all earlier writes.
 $collision=Join-Path $game 'platform\steam\nvngx_dlssnr.dll.na-stage'
 'unrelated stage' | Set-Content $collision
@@ -52,4 +65,4 @@ Check $failed 'injected install failure did not fail'
 foreach($p in $before.Keys) { Check ((Get-FileHash $p).Hash -eq $before[$p]) 'failed install did not restore original' }
 Check (-not(Test-Path (Join-Path $game 'platform\steam\dxgi.dll'))) 'failed install left proxy'
 Check ((Get-Content $collision) -eq 'unrelated stage') 'foreign stage overwritten'
-Write-Host "PASS: install, exact rollback, mutable preferences, reinstall, changed-game refusal and partial-failure rollback. Fixture retained: $root"
+Write-Host "PASS: additive-only install, exact rollback, mutable preferences, reinstall, foreign-file refusal, existing-file refusal and partial-failure rollback. Fixture retained: $root"
