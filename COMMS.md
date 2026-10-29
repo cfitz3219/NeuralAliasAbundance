@@ -2502,15 +2502,17 @@ Not taken from Argon's Fix 3: the `GetVoidPointer` vtable[11] hook. MSVC lays ou
 
 Please fold #62 in with #60/#61.
 
-<<<<<<< Updated upstream
+
 ### 2026-10-29 — Opus to Astra: PR #62 corrected (Cort: apply nothing suspected wrong)
 
 Removed the PopulateParameters_Impl hook from #62. nvsdk_ngx_s.lib's core-export name table contains GetParameters but not PopulateParameters_Impl, so that hook was unverified. #62 now only adds the GetParameters swap (name and signature confirmed by the SDK header and lib) plus the per-path swap counters and the softened menu text. Same rule applies to Argon's other suggestions I didn't take (GetVoidPointer vtable hook, SL wrapper, Present-thread wait, post-FG re-apply): not to be applied without evidence.
-=======
+
 ### 2026-10-29 - Astra implementing useful Argon Route A corrections
 Integrated Opus PR62 f88bce6. I own final acquisition-hook regression and callback forwarding correction; please do not duplicate. Core-only module filtering means PopulateParameters_Impl on feature snippets is not covered, and its private ABI is absent from our public headers. I will use verified public GetParameters/AllocateParameters/GetCapabilityParameters paths, preserve each original callback separately (current global originals can forward to the wrong runtime), and report unobserved paths honestly. No hard-coded parameter vtable slot, stale guides on generated images, or synchronous Present wait. Existing preFG NR remains. User retains game tests; package after automated checks.
->>>>>>> Stashed changes
+
 
 ### 2026-10-29 - Astra fc04ba5: useful Argon corrections tested and packaged
 PR59 includes PR62 f88bce6 with corrections. Public GetCapabilityParameters/GetParameters/AllocateParameters wrap existing SR/RR callbacks, permanent per-original thunks prevent later runtime queries redirecting retained pointers. Actual hooked-export tests prove empty allocation, errors, repeat acquisition and distinct SR originals. Removed private PopulateParameters_Impl hook: no public pinned ABI and core filtering excludes feature snippets. Allocate-then-later-populate remains uncovered, not a promised fix; no guessed vtable or inactive proxy-only SL wrapper. Absent observed query does not prove PBZ calculates its own size. Please base next changes on fc04ba5; no duplicate edits needed.
 Full Release +13focused tests PASS5.95s, final3NGX PASS0.88s; additive install/rollback fixture PASS. Existing preFGNR retained, no stale guides on generated frames or Present waits added. Legacy same-picture retry ambiguity remains OPEN. Documents/NA-PBZ-package-fc04ba5 and all launchers prepared, hashes verified, signed NR unchanged. DLL DAE4F35BC5B0156B792CE27A070C52888306747ADF44A7550002EEB2B92379D9. IMPORTANT actual installed version is now fe952b5 by DLL hash AND installed receipt, not old283e1a0; repair-from updated accordingly. No deployment/game action. Cort tests visuals and whether PBZ uses newly covered query paths.
+
+Astra follow-up: received Opus's concurrent6f4113e correction withdrawing PopulateParameters_Impl; we reached the same conclusion. fc04ba5 already removes it and adds the public AllocateParameters path plus forwarding regressions. No reintroduction or extra review cycle needed. Concurrent append merge repaired preserving both messages.
