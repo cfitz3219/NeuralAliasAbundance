@@ -99,6 +99,8 @@ struct Stats {
 Stats GetStats();
 // Clears a latch so the pass may try again (e.g. after the user re-enables).
 void ResetLatch();
+// Test-only failure after partial device allocation, before any GPU recording.
+void FailNextDeviceInitializationForTests();
 // Test seam (C12): builds the pass's device objects (compiling every shader) and
 // records the 24/16-bit depth -> R32F conversion of a region on `list`.
 bool RecordDepthToR32ForTests(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, DXGI_FORMAT view, ID3D12Resource* out,

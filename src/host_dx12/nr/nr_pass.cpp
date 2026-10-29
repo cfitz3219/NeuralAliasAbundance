@@ -207,6 +207,7 @@ struct State {
     uint32_t width = 0, height = 0;
 };
 State g;
+std::atomic<bool> fail_device_init_for_tests{false};
 thread_local bool internal_submit = false;
 
 // Private data follows the COM object's lifetime without retaining the list.
@@ -339,6 +340,19 @@ bool compile(const char* entry, ComPtr<ID3D12PipelineState>& pso)
 
 bool ensure_device_locked(ID3D12Device* dev)
 {
+    if (g.device && !g.device_ready) {
+        // No NR work can have been recorded before initialization completed.
+        // Drop only the partial bootstrap objects, then let the existing
+        // ResetLatch/re-enable path retry on this device instead of remaining
+        // permanently stuck with g.device != nullptr and ready == false.
+        g.list.Reset();
+        for (auto& frame:g.frames) frame.alloc.Reset();
+        g.fence.Reset(); g.root.Reset(); g.heap.Reset();
+        g.queries.Reset(); g.query_readback.Reset();
+        g.pso_hdr_to_sdr.Reset(); g.pso_sdr_to_hdr.Reset();
+        g.pso_up_depth.Reset(); g.pso_up_motion.Reset(); g.pso_depth_r32.Reset();
+        g.device.Reset();
+    }
     if (g.device) return g.device_ready && g.device.Get() == dev;
     g.device_ready = false;
     g.device = dev;
@@ -348,6 +362,7 @@ bool ensure_device_locked(ID3D12Device* dev)
         return false;
     g.list->Close();
     if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g.fence)))) return false;
+    if (fail_device_init_for_tests.exchange(false)) return false;
 
     // Root signature: table(t0..t2, u0) + 4 root constants.
     D3D12_DESCRIPTOR_RANGE ranges[2]{};
@@ -607,6 +622,7 @@ void SetRuntime(const Runtime& rt)
     g.has_rt.store(ok ? 1u : 0u, std::memory_order_release);
 }
 bool HasRuntime() { return g.has_rt.load(std::memory_order_acquire) != 0; }
+void FailNextDeviceInitializationForTests() { fail_device_init_for_tests.store(true); }
 
 bool WantsInputs()
 {

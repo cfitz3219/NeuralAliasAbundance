@@ -125,6 +125,22 @@ int main(int argc, char** argv) {
         reinterpret_cast<void*>(Alloc), reinterpret_cast<void*>(Destroy), reinterpret_cast<void*>(Caps)};
     na::settings::Get().nr_enabled = 1; na::nr::SetRuntime(rt);
     auto present = [&](ID3D12CommandQueue* queue) { na::nr::OnPresent(queue, back.Get(), DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709); };
+    if (argc > 1 && std::strcmp(argv[1], "--retry-init") == 0) {
+        na::nr::FailNextDeviceInitializationForTests();
+        REQUIRE(Input(d.queue.Get(),depth.Get(),motion.Get(),.1f)==0); Drain(d.queue.Get());
+        CHECK(na::nr::GetStats().latched_off==1);
+        CHECK(na::nr::GetStats().inputs_seen==0);
+        na::nr::ResetLatch();
+        REQUIRE(Input(d.queue.Get(),depth.Get(),motion.Get(),.25f)==0);
+        Drain(d.queue.Get()); present(output.Get()); Drain(output.Get());
+        REQUIRE(Input(d.queue.Get(),depth.Get(),motion.Get(),.75f)==0);
+        Drain(d.queue.Get()); present(output.Get()); Drain(output.Get());
+        CHECK(na::nr::GetStats().active==1 && na::nr::GetStats().latched_off==0);
+        CheckWitness(0,.75f);
+        na::nr::Shutdown();
+        REQUIRE(d.device->GetDeviceRemovedReason()==S_OK);
+        return test::finish("nr_retry_init_test");
+    }
     if (argc > 1 && std::strcmp(argv[1], "--repeated-recording") == 0) {
         REQUIRE(Input(d.queue.Get(), depth.Get(), motion.Get(), .1f) == 0);
         Drain(d.queue.Get()); present(output.Get()); Drain(output.Get()); // create the fake feature
