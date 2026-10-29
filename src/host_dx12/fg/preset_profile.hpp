@@ -8,7 +8,7 @@ struct Status {
 };
 // Published NVIDIA DRS per-application setting. This is a driver request,
 // not evidence of which model the NGX runtime selected. Never edits global DRS.
-void Initialize(); // init thread, TLOU I only; read/persist before our NGX preload
+void Initialize(); // init thread, TLOU I or explicit per-game profile_override; read/persist before our NGX preload
 void Request(uint32_t preset); // menu thread: queue only, no DRS I/O
 Status GetStatus();
 }

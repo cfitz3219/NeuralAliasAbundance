@@ -91,14 +91,15 @@ bool confirmed(const na::ngx::Stats& ngx, unsigned rw, unsigned rh)
     return ngx.last_sr_in_w == rw && ngx.last_sr_in_h == rh;
 }
 
-static const char* kModes[] = {"DLAA", "Quality", "Balanced", "Performance"};
-static const char* kModeLine1[] = {"Full resolution", "More detail", "Middle ground", "More speed"};
-static const char* kModeLine2[] = {"Highest GPU cost", "Less GPU work", "Detail & speed", "Less fine detail"};
+static const char* kModes[] = {"DLAA", "Quality", "Balanced", "Performance", "Ultra Performance"};
+static const char* kModeLine1[] = {"Full resolution", "More detail", "Middle ground", "More speed", "Maximum speed"};
+static const char* kModeLine2[] = {"Highest GPU cost", "Less GPU work", "Detail & speed", "Less fine detail", "Lowest input resolution"};
 static const char* kModeHelp[] = {
     "DLAA smooths edges while keeping the game's full drawing resolution.",
     "Quality draws fewer pixels and reconstructs the full-size picture.",
     "Balanced reduces drawing resolution further to favor performance.",
-    "Performance prioritizes speed with a larger reduction in drawing resolution."};
+    "Performance prioritizes speed with a larger reduction in drawing resolution.",
+    "Ultra Performance draws at one third of each output dimension. Preset L is the recommended starting point."};
 // Presets offered: only the ones NVIDIA's SDK marks as usable (A42). Aâ€“D are
 // removed, E/F deprecated, G/H/I/N/O revert to default; J and K are the
 // current models for DLAA/Quality/Balanced, L and M are the defaults for
@@ -124,7 +125,7 @@ void DrawPicture()
     bool engine_busy = engine_apply.stage == na::tlou1::Stage::Queued || engine_apply.stage == na::tlou1::Stage::Entered || engine_apply.stage == na::tlou1::Stage::Rebuilding;
     bool enabled = st.enabled.load() != 0;
     int mode = static_cast<int>(st.dlss_mode.load());
-    if (mode > 3) mode = 3;
+    if (mode < 0 || mode >= static_cast<int>(DlssMode::Count)) mode = 0;
     unsigned rw = 0, rh = 0;
     if (opt.last_user_w && opt.last_user_h) requested_size(opt, mode, &rw, &rh);
     Conn conn = connection(ngx);
@@ -178,7 +179,7 @@ void DrawPicture()
     int cols = avail < S(640) ? 2 : 4; // A44: reflow by available width only
     float gap = S(9);
     float card_w = (avail - gap * (cols - 1)) / cols;
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < static_cast<int>(DlssMode::Count); ++i) {
         if (i % cols != 0) ImGui::SameLine(0.0f, gap);
         if (ModeCard(kModes[i], kModeLine1[i], kModeLine2[i], i == mode, card_w) && i != mode) {
             mode = i;
@@ -433,10 +434,11 @@ void DrawFrameGenerationRow()
     ImGui::EndDisabled();
     EndRow();
     RowDivider();
-    int preset_choice = st.fg_preset.load() == 2 ? 1 : 0;
-    const char* presets[] = {"Preset A", "Preset B"};
+    int preset_choice = static_cast<int>(st.fg_preset.load()) - 1;
+    if (preset_choice < 0 || preset_choice > 2) preset_choice = 0;
+    const char* presets[] = {"Preset A", "Preset B", "Preset C (Performance)"};
     BeginRow("Frame Generation preset", "Chooses NVIDIA's driver model request for this game. Restart the game after changing it.", DropdownWidth());
-    if (Combo("fg_preset", &preset_choice, presets, 2, DropdownWidth())) {
+    if (Combo("fg_preset", &preset_choice, presets, 3, DropdownWidth())) {
         st.fg_preset.store(static_cast<uint32_t>(preset_choice + 1));
         na::settings::Save(); na::fg::preset::Request(static_cast<uint32_t>(preset_choice + 1));
     }

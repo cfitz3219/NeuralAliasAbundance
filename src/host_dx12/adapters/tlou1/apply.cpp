@@ -44,7 +44,7 @@ Choice current_choice() {
     auto& st = na::settings::Get();
     auto opt = na::ngx::GetOptimalStats();
     Choice c{st.dlss_mode.load(), opt.last_user_w, opt.last_user_h, st.preset.load()};
-    if (c.mode && c.mode <= 3) {
+    if (c.mode && c.mode < static_cast<uint32_t>(settings::DlssMode::Count)) {
         float scale = na::settings::ScaleForMode(static_cast<na::settings::DlssMode>(c.mode));
         c.width = (static_cast<uint32_t>(c.width * scale + .5f) + 7u) & ~7u;
         c.height = (static_cast<uint32_t>(c.height * scale + .5f) + 7u) & ~7u;
@@ -230,7 +230,7 @@ bool RequestApply(Choice choice) {
     std::lock_guard<std::mutex> lock(g_mutex);
     refresh_locked();
     if (!g_available || g_dispatch_active || g_request.Busy() || !na::settings::Get().enabled.load() || !Same(choice, current_choice()) ||
-        choice.mode > 3 || !choice.width || !choice.height) return false;
+        choice.mode >= static_cast<uint32_t>(settings::DlssMode::Count) || !choice.width || !choice.height) return false;
     if (!g_free_resources) {
         // The original SL module is already loaded by the game by this point.
         // Never load a library or resolve an export inside a rendering detour.
