@@ -490,3 +490,6 @@ Integrated Opus012beda/aa88e76 preserving NRcc0e495, corrected query-vs-input re
 
 ### 2026-10-29 - Latest Opus override notice integratedfe952b5
 PR61/4179c84 integrated with thread-safeNVAPIinitialization andnonmaskingwarning. Homeopen requestsbackgrounddriverprofilerefresh; exactUse3Dappsetting/restartinstructionsincluded. Release+5testsPASS4.59s. NA-pbz-update.cmd targetsfe952b5; actualgameunchanged. LegacyduplicateNRconcernremainsopen andisnotaddressedbythisnotice.
+
+### 2026-10-29 - Argon useful Route A changes fc04ba5
+Reviewed/integrated Opus PR62; public parameter paths and stable per-original callbacks tested. Full Release,13focused tests, final3NGX and additive deployment fixture pass. Documents/NA-pbz-update.cmd targets packagefc04ba5 (DLL DAE4F35B...), repair from actual installedfe952b5 verified by hash and receipt. Native game DLLs unchanged. No game launch/deployment. Private late-population/SL query coverage not claimed; legacy duplicateNR retry ambiguity remains. COMMS and production docs/PBZ-PRE-FG-NR.md contain dispositions. User owns live results.
