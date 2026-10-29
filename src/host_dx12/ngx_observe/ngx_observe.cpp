@@ -55,7 +55,6 @@ using PfnEvaluateFeature = NgxResult(__cdecl*)(void* cmd_list, const void* handl
 using PfnReleaseFeature = NgxResult(__cdecl*)(void* handle);
 using PfnShutdown1 = NgxResult(__cdecl*)(void* device);
 using PfnGetCapParams = NgxResult(__cdecl*)(void** out_params);
-using PfnPopulateParams = NgxResult(__cdecl*)(void* params); // NVSDK_NGX_D3D12_PopulateParameters_Impl
 
 // A43: one set of ORIGINAL entry points PER HOOKED MODULE. Session 6 root
 // cause: a single shared set was overwritten each time another module with
@@ -75,7 +74,6 @@ struct CoreSlot {
     PfnShutdown1 shutdown1 = nullptr;
     PfnGetCapParams getcap = nullptr;
     PfnGetCapParams getparams = nullptr;   // NVSDK_NGX_D3D12_GetParameters (deprecated path)
-    PfnPopulateParams populate = nullptr;  // AllocateParameters + PopulateParameters_Impl path
     std::atomic<uint32_t> hooked{0};       // exports hooked in this module
     std::atomic<uint32_t> init_succeeded{0}; // the game initialised THIS core
 };
@@ -1291,7 +1289,7 @@ using PfnOptimalCallback = int32_t(__cdecl*)(void* params);
 std::atomic<void*> g_orig_optimal{nullptr};
 std::atomic<void*> g_orig_optimal_rr{nullptr}; // Ray Reconstruction's DLSSDOptimalSettingsCallback
 std::atomic<uint64_t> g_opt_calls{0};
-std::atomic<uint64_t> g_cap_swaps[3]{}; // optimal-callback swaps per path: capability, populate, get-parameters
+std::atomic<uint64_t> g_cap_swaps[3]{}; // optimal-callback swaps per path: [0] capability, [2] get-parameters ([1] unused)
 // Every display size anyone asked DLSS's optimal-settings callback about (a
 // few distinct sizes: the game's real output, probes such as 1000x1000).
 // A game that never asks about its own output size picks its render size
@@ -1406,7 +1404,7 @@ OptimalStats GetOptimalStats()
     s.last_user_w = g_opt_user_w.load(); s.last_user_h = g_opt_user_h.load();
     s.last_out_w = g_opt_out_w.load(); s.last_out_h = g_opt_out_h.load();
     s.last_overridden = g_opt_overridden.load();
-    s.swaps_capability = g_cap_swaps[0].load(); s.swaps_populate = g_cap_swaps[1].load(); s.swaps_getparams = g_cap_swaps[2].load();
+    s.swaps_capability = g_cap_swaps[0].load(); s.swaps_getparams = g_cap_swaps[2].load();
     return s;
 }
 
@@ -1421,17 +1419,13 @@ int32_t GetCapabilityParametersImpl(CoreSlot& s, void** out_params)
     if (r >= 0 && out_params && *out_params) swap_optimal_callbacks(*out_params, 0);
     return r;
 }
-// The callback pointers are also placed into game-owned parameter objects by
-// AllocateParameters + PopulateParameters_Impl (the SDK's current path) and by
-// the deprecated GetParameters. A game or Streamline using either never saw our
-// GetCapabilityParameters swap, so its render size came straight from NVIDIA's
-// callback (Argon review: PBZ kept 1146x480 through every rebuild).
-int32_t PopulateParametersImpl(CoreSlot& s, void* params)
-{
-    int32_t r = s.populate(params);
-    if (r >= 0 && params) swap_optimal_callbacks(params, 1);
-    return r;
-}
+// The NGX static library (linked into games and Streamline) looks the core's
+// GetParameters export up by name and uses it as the fallback when
+// GetCapabilityParameters is unavailable or out of date. A caller on that path
+// never saw our GetCapabilityParameters swap, so its render size came straight
+// from NVIDIA's callback (Argon review: PBZ kept 1146x480 through every rebuild).
+// (PopulateParameters_Impl is not among the names the static library resolves,
+// so it is deliberately not hooked.)
 int32_t GetParametersImpl(CoreSlot& s, void** out_params)
 {
     int32_t r = s.getparams(out_params);
@@ -1471,7 +1465,6 @@ void swap_optimal_callbacks(void* params, int path)
 #endif
 }
 template <int S> int32_t __cdecl DetourGetCapabilityParameters(void** out) { return GetCapabilityParametersImpl(g_slots[S], out); }
-template <int S> int32_t __cdecl DetourPopulateParameters(void* p) { return PopulateParametersImpl(g_slots[S], p); }
 template <int S> int32_t __cdecl DetourGetParameters(void** out) { return GetParametersImpl(g_slots[S], out); }
 
 // Base file name of a module name or full path.
@@ -1595,7 +1588,6 @@ template <int S> uint32_t install_slot(HMODULE ngx_module)
         {"NVSDK_NGX_D3D12_ReleaseFeature", reinterpret_cast<void*>(&DetourReleaseFeature<S>), reinterpret_cast<void**>(&slot.release)},
         {"NVSDK_NGX_D3D12_Shutdown1", reinterpret_cast<void*>(&DetourShutdown1<S>), reinterpret_cast<void**>(&slot.shutdown1)},
         {"NVSDK_NGX_D3D12_GetCapabilityParameters", reinterpret_cast<void*>(&DetourGetCapabilityParameters<S>), reinterpret_cast<void**>(&slot.getcap)},
-        {"NVSDK_NGX_D3D12_PopulateParameters_Impl", reinterpret_cast<void*>(&DetourPopulateParameters<S>), reinterpret_cast<void**>(&slot.populate)},
         {"NVSDK_NGX_D3D12_GetParameters", reinterpret_cast<void*>(&DetourGetParameters<S>), reinterpret_cast<void**>(&slot.getparams)},
     };
     // A45 installation transaction (answers A43-NGX-ACK finding 2): every
