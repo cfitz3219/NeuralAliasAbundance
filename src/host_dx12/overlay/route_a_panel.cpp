@@ -327,17 +327,32 @@ void DrawPicture()
         if (BeginDetails("Apply details")) {
             auto progress = na::tlou1::GetApplyStatus();
             auto check = na::ngx::GetSizeConfirmation();
-            Hint(progress.available ? (progress.stage == na::tlou1::Stage::Confirmed ? "The requested resolution was observed with coherent inputs. Visual quality is checked separately." : "Uses this game's graphics-settings update and waits for matching rendered frames.") : progress.reason);
-            snprintf(buf, sizeof(buf), "Request %llu; engine updates %llu; rebuilds requested %llu; thread %u.",
-                     static_cast<unsigned long long>(progress.request_id), static_cast<unsigned long long>(progress.frame_calls),
-                     static_cast<unsigned long long>(progress.triggers), progress.trigger_thread);
-            Hint(buf);
-            if (progress.request_id && progress.request_id == check.id) {
-                snprintf(buf, sizeof(buf), "Requested %ux%u; observed %ux%u; %u of %u consecutive frames; result %u/%u.",
-                         check.req_w, check.req_h, check.last_w, check.last_h, check.streak, check.need, check.state, check.reason);
+            if (progress.available) {
+                // A game with a hand-written engine adapter (TLOU).
+                Hint(progress.stage == na::tlou1::Stage::Confirmed ? "The requested resolution was observed with coherent inputs. Visual quality is checked separately." : "Uses this game's graphics-settings update and waits for matching rendered frames.");
+                snprintf(buf, sizeof(buf), "Request %llu; engine updates %llu; rebuilds requested %llu; thread %u.",
+                         static_cast<unsigned long long>(progress.request_id), static_cast<unsigned long long>(progress.frame_calls),
+                         static_cast<unsigned long long>(progress.triggers), progress.trigger_thread);
                 Hint(buf);
+                if (progress.request_id && progress.request_id == check.id) {
+                    snprintf(buf, sizeof(buf), "Requested %ux%u; observed %ux%u; %u of %u consecutive frames; result %u/%u.",
+                             check.req_w, check.req_h, check.last_w, check.last_h, check.streak, check.need, check.state, check.reason);
+                    Hint(buf);
+                }
+            } else {
+                // Every other game: the general rebuild (no game-specific code).
+                const auto pr = na::overlay::GetPictureRebuild();
+                Hint(ngx.active_upscaler == 1
+                         ? "A preset change is applied directly to the game's DLSS. A mode change asks the game to rebuild its picture (its window is resized by one pixel and back), then checks the size it renders."
+                         : "Apply asks the game to rebuild its picture (its window is resized by one pixel and back) so it re-creates its DLSS with your mode and preset, then checks the size it renders.");
+                snprintf(buf, sizeof(buf), "Rebuilds tried %u, failed %u.", pr.attempts, pr.failures);
+                Hint(buf);
+                if (pr.confirm_id && pr.confirm_id == check.id) {
+                    snprintf(buf, sizeof(buf), "Requested %ux%u; observed %ux%u; %u of %u consecutive frames; result %u/%u.",
+                             check.req_w, check.req_h, check.last_w, check.last_h, check.streak, check.need, check.state, check.reason);
+                    Hint(buf);
+                }
             }
-
         }
 
     }
