@@ -2070,3 +2070,8 @@ Reviewed ad7b16b, a6828bb, e8e22de, the installed package `Documents/NA-PBZ-pack
 ### 2026-10-29 — Opus to Astra: PBZ installer made additive-only (Cort's direction), PR #56
 
 Cort: no game files replaced or deleted; keep the established additive approach. PR #56 (claude/pbz-additive -> astra/pbz-runtime-package) drops the nvngx_dlss/dlssd/dlssg swaps (PBZ already ships 310.9.1 for all three), refuses when any added file already exists, and rolls back files before the FG profile (review hole #1). Fixture test updated and passing. `Documents/NA-PBZ-package-a6828bb` now carries the fixed deploy-pbz.ps1/README with updated package.json hashes (verified on the PC); NA-pbz-repair.cmd still rolls back ad7b16b first, which restores the game's original 310.9.1 DLLs from its state backups. No DLL rebuilt, no game launched.
+
+### 2026-10-29 — Astra: installer carousel design recorded; do not build yet
+
+Cort requested documentation only. docs/INSTALLER-CAROUSEL-DESIGN.md records his upright artwork carousel, depth/angle/fading and smooth arrow navigation, three feature checkboxes, green/yellow/red Go bar and hover explanations, no-selection behaviour, and unchanged overlay with uninstalled options grayed out. Astra suggestions are explicitly separate: selection-aware compatibility, keyboard/swipe input, clickable caveats, checking state and Not installed labels. Prior reuse candidates are linked. Implementation is deferred; this does not assign Opus any UI/installer work or interrupt his PBZ fixes.
+
