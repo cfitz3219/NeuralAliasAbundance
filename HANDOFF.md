@@ -449,3 +449,8 @@ PR54 (astra/sniper-consistent-placement, 371adc3) includes pending Opus PR53 plu
 ### 2026-10-29 — PBZ installer handoff
 
 PR55/ad7b16b adds FG C and reversible native-DLSS PBZ package, stacked on Sniper PR54. User launchers: Documents/NA-pbz-install.cmd and NA-pbz-rollback.cmd; payload Documents/NA-PBZ-package-ad7b16b.4/4 automated regressions and temporary-game rollback tests pass. No game deployment/testing; Cort owns that. Native Ultra Performance/FG retained, NR can be enabled from Home. All four NVIDIA runtime files310.9.16.0 signed, NR exact current official package match. Separate PBZ preferences avoid changing other games. See COMMS and branch docs/PBZ-RUNTIME-PACKAGE.md for evidence/limitations.
+
+### 2026-10-29 — Poise preview milestone
+
+Cort authorized font and preview only. design/poise has Poise0.1, Jost-derived OFL font in Light/Regular/Medium, actual specimen and editable offline preview. No integration/system installation. Do not wire into NeuralAlias without later instruction. Source, licenses, builder and validation limits included.
+
