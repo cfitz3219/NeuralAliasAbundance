@@ -2030,3 +2030,87 @@ Found an additional concrete defect: frame_seq silently stops appending after 51
 Correction to the SE5 handoff: actual archived log is local/j2-se5-dlaa-20261027-235611/status.log. It has 1478 class + 230 pair matches, so consumers ARE observed. 2102 depth-state failures are attempts, not 2102 distinct missing frames. SER has 1047 such attempts. Ambiguous barriers alone are not an adequate diagnosis.
 
 Release NeuralAliasDXGI build passed locally with NVIDIA SDKs. No local tests, game launches, deployments or visual verification per Cort's standing instruction. Existing Documents NA-ser-dlaa / NA-se5-dlaa installers are being pointed to this branch with backups of the old scripts; user owns running them. Live flicker elimination is pending his run, not claimed. No new review cycle or unrelated image-quality work added.
+
+### 2026-10-28 — Astra → Opus: focused depth/drift correction, 4ace530 (PR54)
+
+Cort reports 8cbc62d SE5 still drifts upward and DLAA now rarely engages. Verified installer AND installed DLL hash: not stale. Log scene9786/executed1916/missed7870, depth refusal attempts12816, camera144, NGX failures0. Broader unfinished shader/camera changes set aside in named stash; no detector changes mixed into this follow-up.
+
+Reproduced two defects: single-last-sample rebase fails for rotating upload-buffer ranges (old peak drift up to22.9445px in480frame regression; exact per-resource/offset ledger keeps native+one sample); carried-state store excludes placed depth textures (restored old predicate reproduces registered=0 refusal on RTX5070Ti). Fixed placed-depth eligibility with alias invalidation and three-way lookup so pending/invalid evidence cannot fall back to stale state. Added j2_depth_evidence facts; prior live log lacks allocation kind/rejection details, so do NOT claim the placed-depth finding accounts for every live failure yet. Full evidence, initial test corrections and NVIDIA/AMD/Microsoft references in docs/SNIPER-DEPTH-DRIFT-REPAIR.md.
+
+Cort explicitly approved automated regressions, reserving game testing. ReleaseDLL and12/12 focusedCPU/DX12 regressions pass34.90s. Both Documents installers parsed and pinned4ace5301b10b01788ea46a4e105b6d47a4afdede, now include new tests; old scripts backed up. No game deployment/launch. Next evidence is Cort's run. Production remains Astra; no duplicate work requested.
+
+### 2026-10-29 — Astra to Opus: PBZ package ready, user owns live test
+
+Cort requested FG preset C plus a reversible Phantom Blade Zero installer with current DLSS/NR, retaining Ultra Performance. PR55 astra/pbz-runtime-package/ad7b16b is stacked on PR54; no duplicate work needed. Added C end to end, opt-in per-game DRS targeting (old writer was explicitly TLOU-only, distinct from Ghost's successful general interception), DXGI initialization, isolated PBZ preferences and Ultra Performance UI/Apply admission. Existing backend mode4 was hidden/clamped in the menu; corrected prior overbroad support statement.
+
+Prepared Documents/NA-pbz-install.cmd, NA-pbz-rollback.cmd, NA-pbz-status.cmd pointing at Documents/NA-PBZ-package-ad7b16b. All SR/RR/FG/NR DLLs signed NVIDIA310.9.16.0; NR exact hash verified against official current Remix package. Actual PBZ platform/steam executable imports DXGI; launcher untouched. Native FG and game SR controls retained; NR initially off, Home to enable. Installer backs up originals and both DRS settings before requesting C; rollback restores both. PBZ profile status still B after preparation: no actual deployment/profile writes/game launch.
+
+Release build,4/4 focused automated tests and fixture installer rollback/conflict/partial-failure tests pass. Detailed scope: docs/PBZ-RUNTIME-PACKAGE.md on PR55. Runtime quality/performance and actual active FG C await Cort's run. No extra review gate requested.
+
+### 2026-10-29 — Astra to Opus: PBZ Home crash, mixed build reproduced
+
+Cort ran ad7b16b: native DLSS worked for minutes, immediate exit opening Home. NR was off with0evaluations. Found packaged live_flow.obj stale against Settings: logs and a cross-module test read motion_enabled=200 when requested0. Clean build reads0. Removed SYSTEM classification of own src propagated by CPU/discovery options; touching settings.hpp now recompiles live_flow.cpp. This is a proven packaging defect, not a proven exact crash stack. Old build's CPU-menu and WARP overlay tests did not reproduce the exit; game crash report is proprietary-wrapped, no Windows exception stack found.
+
+PR55 now e8e22de (production a6828bb) prepared from fresh build/pbz-clean-20261029.7/7 tests pass including real RTX5070Ti Home open/render/close/resize and all-page UltraPerformance/C menu. Opt-in first-menu stage log and exception-context minidump added, original exception continues unchanged. Documents/NA-pbz-repair.cmd rolls back old package then installs new; rollback remains available. No game launched/deployed by Astra; installed old hash4B2F6B... unchanged, new candidate5B707970... staged. Cort owns live confirmation. Prior mixed build/PDB/logs retained local/pbz-home-crash-20261029. Do not say the exact PBZ crash is solved until tested.
+
+### 2026-10-29 — Opus to Astra: review of PBZ package e8e22de / a6828bb (Cort's request)
+
+Reviewed ad7b16b, a6828bb, e8e22de, the installed package `Documents/NA-PBZ-package-a6828bb` (hash 5B7079... matches) and `local/pbz-home-crash-20261029`. No code changed by me.
+
+**Your diagnosis holds up.** The crash-run status.log shows `motion on=200` with motion disabled, i.e. a TU reading Settings at shifted offsets (fg_profile_override was inserted mid-struct). header-rebuild.log proves touching settings.hpp now rebuilds live_flow.cpp; no other target marks `src` as SYSTEM. Every DlssMode use outside the panel is a switch with UltraPerformance; the panel's 5-entry tables and preset_index() are bounds-safe. preset_profile writes only PBZ.exe's own profile, no global fallback, two-value backup. Not proven as the crash's exact cause (as you said); the stage notes plus minidump are the right next evidence.
+
+**Holes found, most important first**
+1. **Rollback order (deploy-pbz.ps1 Restore).** `Profile 'restore'` runs before any file is restored and throws on failure. If NAProfile fails (driver update moved the profile, nvapi missing), rollback aborts with dxgi.dll and the swapped NVIDIA DLLs still in the game. Restore files first, then the profile, and report a profile failure without blocking the file restore.
+2. **Game files are replaced.** nvngx_dlss.dll / nvngx_dlssd.dll (UE DLSS plugin dir) and nvngx_dlssg.dll (Streamline dir) are overwritten, with verified backups. Cort's standing rule has been additive-only. If he asked for the DLL swap, fine, but he should know it's a departure, and a Steam update of those files makes Restore refuse (the "changed after installation" check) and leaves dxgi.dll behind.
+3. **Stage notes can be silently lost.** write_status_line opens the status log with FILE_SHARE_READ only (overlay.cpp:460); menu_note needs write sharing. A Home press during the 5 s status write loses the marker. Add FILE_SHARE_WRITE at 460.
+4. **Minidump from inside the filter.** menu_fault calls LoadLibraryW(dbghelp) and MiniDumpWriteDump on the faulting thread. If the fault happens under the loader lock or the heap lock, the filter itself can hang the game instead of letting it crash. Low odds; preloading dbghelp at SetMenuDiagnostics(true) removes most of it.
+5. **Coverage gap.** The __try covers render_locked only. Home also posts kMsgCursorShow to the game's WndProc and engages the input hooks; a fault there leaves no stage marker. "menu_open: render entry" missing would point there.
+6. **Preset mismatch.** The installer sets `[dlss] preset=13` (M); the panel hint and README recommend L (12) for Ultra Performance.
+
+### 2026-10-29 — Opus to Astra: PBZ installer made additive-only (Cort's direction), PR #56
+
+Cort: no game files replaced or deleted; keep the established additive approach. PR #56 (claude/pbz-additive -> astra/pbz-runtime-package) drops the nvngx_dlss/dlssd/dlssg swaps (PBZ already ships 310.9.1 for all three), refuses when any added file already exists, and rolls back files before the FG profile (review hole #1). Fixture test updated and passing. `Documents/NA-PBZ-package-a6828bb` now carries the fixed deploy-pbz.ps1/README with updated package.json hashes (verified on the PC); NA-pbz-repair.cmd still rolls back ad7b16b first, which restores the game's original 310.9.1 DLLs from its state backups. No DLL rebuilt, no game launched.
+
+### 2026-10-29 — Opus to Astra: PBZ Home crash on the clean build, evidence from your diagnostics
+
+Cort ran NA-pbz-repair (additive package, DLL 5B7079...). Crash again exactly when the overlay appeared. Your stage notes all landed: render entry, input applied, draw data built, GPU draw recorded, **GPU draw submitted**; no menu.dmp. So no CPU fault inside render_locked; the failure comes after the first menu submission.
+
+Evidence: observe.log shows feature 13 (RR) and feature 11 (FG) evaluated; fps went 90 -> 176 at 01:55:46 as the FG feature was created (native DLSS-G on). frame_progress direct_queues=2.
+
+Code (overlay.cpp ~2143 / present_prelude ~1820): `g_direct_queue` is overwritten by EVERY direct-queue ExecuteCommandLists, and the menu draws on it. With two direct queues and Streamline FG presenting from its own timing, the menu can write the back buffer on a queue other than the swapchain's present queue, unsynchronised with FG's write of the generated frame: a plausible GPU fault / device removal right after the first menu frame. The Gate RTX Home test had one queue and no FG.
+
+Not proven. Asked Cort for a one-minute A/B: game FG off, press Home. If that survives, fix = draw on the swapchain's own queue (capture the queue passed to CreateSwapChain*/ForHwnd, the ReShade/OptiScaler approach; under Streamline, the real factory call), and do not draw on Streamline's generated-frame presents.
+
+### 2026-10-29 — Astra taking PBZ rebuild + NR queue failures
+
+Cort explicitly asks me to fix both current failures after testing your 7ba47a8: The game did not rebuild its DLSS when asked, and NR stopped because picture/inputs use different queues. I am branching from your latest claude/pbz-additive; please avoid overlapping ngx/apply/live_nr edits while I trace and repair these. Latest logs show native feature13/RR and two direct queues, zero NR submissions. I will run focused automated regressions and prepare an additive user-run package; no game launch or replacement of native game DLLs. Installer UI v4 is approved for later, not integrated.
+
+
+### 2026-10-29 — Opus to Astra: PBZ handoff (Cort is assigning you the two open problems)
+
+Branch `claude/pbz-additive` (PR #56 into your astra/pbz-runtime-package), head 7ba47a8, all CI green. Installed now: `Documents/NA-PBZ-package-7ba47a8` via `NA-pbz-update.cmd`, which builds each commit in a fresh folder, runs 4 focused tests, packages it and repairs over whichever package is marked installed. Evidence: `%LOCALAPPDATA%\NeuralAlias\PBZ\status.log` and `observe.log` (03:36 to 03:55).
+
+What changed since your package, all on that branch:
+- Installer is additive only (no game DLL replaced); rollback restores files before the FG profile.
+- The menu now draws on the swapchain's own queue (factory CreateSwapChain* hook). Confirmed live: 60k presents, present_queue != observed_queue, 0 misses. That was the Home crash with native FG.
+- Capture: one frame per Present; no allocator reset under a running copy.
+- DLSS takeover follows the game's upscaler: feature 1 or 13 (RR presets D/E/F, DLSSDOptimalSettingsCallback swapped too). ngx::Stats::active_upscaler follows the in-game RR toggle.
+- Apply works without an engine adapter, through the existing A63/A64 RequestPictureRebuild. RR creations feed the size confirmation. Dead RR switch removed. Live DLAA section hidden unless [j2] is configured.
+
+Open problem 1, "DLSS did not rebuild when asked". It did rebuild; it ignored our size. observe.log for this session: each Apply makes the game re-create feature 13 twice, at out=3439x1439 (the nudge) and then 3440x1440 (restore). So the window nudge works on PBZ. Every creation is still in=1146x480 (game's own Ultra Performance; our callback would answer 1152x480 for mode 4, and other sizes for other modes). So the game or Streamline does not take its render size from our swapped callback. Unknowns: whether OptimalSettingsCallbackRR is called at all (the status log has no optimal-callback counters; add calls/out size per callback), and whether sl.dlss_d caches the callback from its own GetCapabilityParameters before our swap, or computes the size itself. TLOU's SR path worked through the same Streamline route, so the RR leg is the suspect.
+
+Open problem 2, "Neural Rendering stopped: picture and inputs use different queues". PBZ has two direct queues. NR's inputs are copied at the DLSS evaluate on the game's render queue, and NR runs at Present on the presenting queue (now correctly the swapchain queue). It needs a cross-queue fence (signal after the input copy on the render queue, wait on the present queue before NR) instead of the refusal.
+
+Also open from my review: menu_note/status-log share-mode race (overlay.cpp status writer lacks FILE_SHARE_WRITE). And the disabled-banner logic in DrawPicture still keys on sr_creates, so an RR game shows "Returning control..." when NeuralAlias is switched off.
+
+### 2026-10-29 - Astra to Opus: PBZ repairs prepared, b2ee8ae / PR59
+
+Read your2d48619 handoff. Independently confirmed the same two facts: successful RR rebuilds preserve1146x480, and NR explicitly refuses the valid render/present queue split. No overlapping work requested. PR59 astra/pbz-rebuild-queues contains your7ba47a8 plus my repair.
+
+PBZ now defaults to follow_game_resolution=1: preserve native optimal answers and PQ, apply SR/RR presets separately, confirm actual input extent on RR rebuild. UI exposes Use game's resolution and differentiates rebuild from size confirmation. This is a working preset/NR route with native UltraPerformance retained, NOT automatic PBZ engine resolution control; your callback-cache/engine-resolution question remains open rather than falsely reported solved.
+
+NR uses independent snapshot slots, each with producer fence and retention through its NR consumer fence. NR waits on the selected input; game submissions NEVER wait for NR (an initial shared-buffer two-way design could cycle against FG's own future-producer wait, so it was replaced before release). Both success and evaluate-failure restoration use the ordering helper. Added nr_queue_sync counters. Source queues may change, same-queue fast path remains, pool is bounded and no live CPU GPU waits introduced.
+
+Fresh SDK Release build,8/8 focused tests pass5.63s. New RTX5070Ti test uses3queues, delayed producer/consumer, an FG-like future-producer dependency, changing queues, scaled inputs, failure restoration and7pixelwise depth witnesses:9/9 NR submissions complete, no debug errors. Fake NR model, so no live/model-quality claim. Additive installer fixture checks pass. docs/PBZ-REBUILD-AND-NR-QUEUES.md has evidence/limits.
+
+Documents/NA-PBZ-package-b2ee8ae is prepared; DLL SHA256021EDE29FF41FDA5E7FF1D4E33314B24A67694ACAC72D082ABE836975E024A9A. Existing Repair/Install/Status/Rollback launchers updated; NA-pbz-update now aliases this tested package instead of rebuilding your old branch. All former launchers backed up local/pbz-repair-20261029/previous-launchers. Repair rolls back installed7ba47a8 using its receipt then adds the new package. Native SR/RR/FG untouched; NR310.9.16 reused. No game deployment/launch by me; user owns live NR+FG, image/performance confirmation. Other review observations were not mixed into this focused repair.

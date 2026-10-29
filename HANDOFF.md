@@ -445,3 +445,16 @@ Not complete: independent all-pass raster jitter displacement, moving-image qual
 ### 2026-10-28 — Astra milestone: Sniper combined placement candidate
 
 PR54 (astra/sniper-consistent-placement, 371adc3) includes pending Opus PR53 plus complete-frame profile collection, same-frame separate-list consumer fallback, cross-list producer qualification and barrier entry-state evidence. Release NeuralAliasDXGI builds. No local tests/game execution/deployment; Cort tests. Both Documents installers will fetch this branch. Next evidence: user runs each game, compare j2_summary scene/missed/placed_before_scene_work and j2_profile between_observed; assess visible flicker. Do not call live coverage fixed before that evidence. Detailed journal is on the production branch WORKLOG; COMMS records ownership and log corrections.
+
+### 2026-10-29 — PBZ installer handoff
+
+PR55/ad7b16b adds FG C and reversible native-DLSS PBZ package, stacked on Sniper PR54. User launchers: Documents/NA-pbz-install.cmd and NA-pbz-rollback.cmd; payload Documents/NA-PBZ-package-ad7b16b.4/4 automated regressions and temporary-game rollback tests pass. No game deployment/testing; Cort owns that. Native Ultra Performance/FG retained, NR can be enabled from Home. All four NVIDIA runtime files310.9.16.0 signed, NR exact current official package match. Separate PBZ preferences avoid changing other games. See COMMS and branch docs/PBZ-RUNTIME-PACKAGE.md for evidence/limitations.
+
+### 2026-10-29 — approved installer UI remembered
+
+Cort approves Documents/NeuralAlias-Installer-Proposal-v4/preview.html. Actual Poise font; headline Your games. Sharper and smoother.; DLSS explanation beneath; centered 300px Go ABOVE one compact Installation Options box with three unboxed checkboxes. Nine cover positions: selected plus four per side, breathing room beside selected, tighter fading/blurred side stacks. Only nearest side covers act as arrows; repeated same-position clicks advance one game. Sync circle-arrows spins, reports only positive additions, caches DX/native-feature metadata; native features disabled/gray. DX corner ribbons. All remains design-only, metadata simulated. Preserve this approved design when implementation is authorized.
+
+
+### 2026-10-29 - PBZ queue and preset repair candidate
+
+Astra PR59 / astra/pbz-rebuild-queues b2ee8ae extends Opus7ba47a8. Fresh Release and8/8 automated regressions pass. NR now consumes fenced independent snapshots across render/present queues without stalling the game queue. PBZ preserves engine resolution/PQ while applying presets; user selects UltraPerformance or other resolutions in the game's settings. Automatic PBZ engine-mode changes are not implemented. Prepared Documents/NA-PBZ-package-b2ee8ae, Repair/Update launchers and exact rollback from7ba47a8. New DLL021EDE29...; installed game remains old48B331E7... because Cort tests/deploys. Details docs/PBZ-REBUILD-AND-NR-QUEUES.md on production branch and local/pbz-repair-20261029 evidence. Next: Cort runs repair then enables NR; confirm actual game NR evaluation/completion and visual result. Approved installer UI remains deferred.

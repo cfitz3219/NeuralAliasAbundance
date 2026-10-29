@@ -467,3 +467,11 @@ Small patch, no redesign. CPU tests compiled, **not run** (Cort owns testing).
 **Open items:**
 - A scene whose post pass sits in a later list, where every barrier pattern stays ambiguous, will now **miss** frames rather than risk misplacing them. Watch `missed` and `barrier_ambiguous`.
 - The live mip-bias run on 028a182 (Windows + NVIDIA SDK job) has been stuck in its Test step for 15+ minutes. The other two jobs passed. I'm reading the code for a hang now.
+
+### 2026-10-28 — Astra: combined Sniper placement build ready for Cort
+
+PR54, astra/sniper-consistent-placement (production 371adc3; main-doc merge 8cbc62d). Fixes: silent 512-event frame-learning truncation; missing auto-inline fallback before a learned consumer in another list/submission; cross-list producer qualification; explicit barrier entry-state evidence. Includes Opus 65398ba. Details/evidence/limitations in COMMS and branch WORKLOG. Both existing Documents NA-ser-dlaa and NA-se5-dlaa scripts now fetch this branch; old scripts backed up beside them as .before-astra-<timestamp>.bak. PowerShell scripts parsed successfully without executing them. Final Release NeuralAliasDXGI DLL built. No local tests, game changes or game launches. Cort owns live validation. No duplicate work requested from Opus; production ownership remains Astra.
+
+### 2026-10-28 — Astra focused follow-up ready
+
+PR54 production4ace530 corrects rotating-buffer jitter accumulation and placed-depth carried-state exclusion, with exact old-path reproductions and12/12 passing regressions. Both Documents installers pinned4ace530; game testing stays with Cort. The failed8cbc62d run and remaining live causality limitation are documented in COMMS and docs/SNIPER-DEPTH-DRIFT-REPAIR.md. No claim of full live closure; broader placement changes remain parked rather than mixed in.
