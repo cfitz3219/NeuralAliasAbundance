@@ -56,6 +56,7 @@ inline const char* NameForMode(DlssMode m)
 struct Settings {
     std::atomic<uint32_t> enabled{1};   // master switch (NeuralAlias controls DLSS)
     std::atomic<uint32_t> dlss_mode{0}; // DlssMode
+    std::atomic<uint32_t> follow_game_resolution{0}; // preserve engine render size/PQ; override presets only
     std::atomic<int32_t> preset{-1};    // -1 = let NVIDIA choose; 1..13 = A..M
     std::atomic<int32_t> rr_preset{0};  // Ray Reconstruction: 0 = let NVIDIA choose; 4 D, 5 E, 6 F (its only usable presets)
     std::atomic<uint32_t> overlay_open{0};

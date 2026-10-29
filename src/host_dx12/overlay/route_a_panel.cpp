@@ -133,10 +133,15 @@ void DrawPicture()
     auto engine_apply = na::tlou1::GetApplyStatus();
     bool engine_busy = engine_apply.stage == na::tlou1::Stage::Queued || engine_apply.stage == na::tlou1::Stage::Entered || engine_apply.stage == na::tlou1::Stage::Rebuilding;
     bool enabled = st.enabled.load() != 0;
+    bool follow_game = st.follow_game_resolution.load() != 0;
     int mode = static_cast<int>(st.dlss_mode.load());
     if (mode < 0 || mode >= static_cast<int>(DlssMode::Count)) mode = 0;
     unsigned rw = 0, rh = 0;
     if (opt.last_user_w && opt.last_user_h) requested_size(opt, mode, &rw, &rh);
+    if (follow_game && ngx.last_sr_in_w && ngx.last_sr_in_w != 0xFFFFFFFFu &&
+        ngx.last_sr_in_h && ngx.last_sr_in_h != 0xFFFFFFFFu) {
+        rw = ngx.last_sr_in_w; rh = ngx.last_sr_in_h;
+    }
     Conn conn = connection(ngx);
     bool blocked = conn != Conn::Connected;
 
@@ -156,6 +161,10 @@ void DrawPicture()
         }
     } else if (engine_busy) {
         text = engine_apply.reason;
+    } else if (follow_game) {
+        state = 1;
+        snprintf(buf, sizeof(buf), "Using the game's resolution: %ux%u. Presets can be changed below.", rw, rh);
+        text = buf;
     } else if (engine_apply.stage == na::tlou1::Stage::Failed && engine_apply.choice.mode == static_cast<uint32_t>(mode) && engine_apply.choice.width == rw && engine_apply.choice.height == rh) {
         text = engine_apply.reason;
     } else if (rw && confirmed(ngx, rw, rh)) {
@@ -172,7 +181,7 @@ void DrawPicture()
     // Master switch.
     ImGui::Dummy(ImVec2(0, S(6)));
     ImGui::BeginDisabled(engine_busy || (blocked && conn == Conn::NoDlss));
-    BeginRow("Use NeuralAlias", "Choose your picture settings here instead of in the game.", SwitchWidth());
+    BeginRow("Use NeuralAlias", "Control DLSS presets and supported picture settings.", SwitchWidth());
     if (Switch("master", &enabled)) {
         st.enabled.store(enabled ? 1u : 0u);
         note_request();
@@ -181,16 +190,26 @@ void DrawPicture()
     EndRow();
     ImGui::EndDisabled();
 
+    ImGui::BeginDisabled(!enabled || engine_busy);
+    BeginRow("Use game's resolution", "Choose DLAA, Quality or Ultra Performance in the game's video settings. NeuralAlias can still change presets.", SwitchWidth());
+    if (Switch("follow_game_resolution", &follow_game)) {
+        st.follow_game_resolution.store(follow_game ? 1u : 0u);
+        note_request();
+        na::settings::Save();
+    }
+    EndRow();
+    ImGui::EndDisabled();
+
     // Mode cards.
     SectionTitle("Picture mode");
-    ImGui::BeginDisabled(!enabled || blocked || engine_busy);
+    ImGui::BeginDisabled(!enabled || blocked || engine_busy || follow_game);
     float avail = ImGui::GetContentRegionAvail().x;
     int cols = avail < S(640) ? 2 : 4; // A44: reflow by available width only
     float gap = S(9);
     float card_w = (avail - gap * (cols - 1)) / cols;
     for (int i = 0; i < static_cast<int>(DlssMode::Count); ++i) {
         if (i % cols != 0) ImGui::SameLine(0.0f, gap);
-        if (ModeCard(kModes[i], kModeLine1[i], kModeLine2[i], i == mode, card_w) && i != mode) {
+        if (ModeCard(kModes[i], kModeLine1[i], kModeLine2[i], !follow_game && i == mode, card_w) && i != mode) {
             mode = i;
             st.dlss_mode.store(static_cast<uint32_t>(mode));
             note_request();
@@ -198,7 +217,7 @@ void DrawPicture()
         }
     }
     ImGui::EndDisabled();
-    Hint(kModeHelp[mode]);
+    Hint(follow_game ? "Picture mode follows the game's video settings, including Ultra Performance." : kModeHelp[mode]);
 
     // Preset + Apply. (A46: the disabled Sharpness row is gone until a
     // sharpening backend exists; a dead control only invites clicks.)
@@ -264,7 +283,7 @@ void DrawPicture()
         // the new size was actually rendered.
         const bool engine_adapter = na::tlou1::GetApplyStatus().available;
         ImGui::BeginDisabled(!enabled || blocked || !have_upscaler || engine_busy);
-        BeginRow("Apply changes", "Update the picture mode and preset together.", ButtonWidth("Apply"));
+        BeginRow("Apply changes", follow_game ? "Update the preset while keeping the game's resolution." : "Update the picture mode and preset together.", ButtonWidth("Apply"));
         if (Button("Apply")) {
             admission_failed = false;
             engine_clicked = rebuild_clicked = rebuild_refused = false;
@@ -278,7 +297,7 @@ void DrawPicture()
                 g_apply_ok_at = ngx.reapplies;
                 g_apply_fail_at = ngx.reapply_failures;
                 g_apply_clicked = true;
-            } else if (engine_adapter) {
+            } else if (engine_adapter && !follow_game) {
                 engine_clicked = true;
                 admission_failed = !na::tlou1::RequestApply({static_cast<uint32_t>(mode), rw, rh, st.preset.load()});
             } else {
@@ -301,10 +320,11 @@ void DrawPicture()
             else if (pr.attempts == rebuild_attempts_at || pr.state == 1 || pr.state == 2)
                 StatusLine(0, "Asking the game to rebuild its picture...");
             else if (check.id && check.id == pr.confirm_id && check.state == 3)
-                StatusLine(1, "Applied: the game is now rendering at the selected mode.");
+                StatusLine(1, follow_game ? "DLSS rebuilt with the preset request; the game's resolution is retained." : "Applied: the game is now rendering at the selected mode.");
             else if (check.id && check.id == pr.confirm_id && check.state == 4) {
-                snprintf(buf, sizeof(buf), "This game did not rebuild its DLSS when asked (it rendered %ux%u). Change the DLSS or ray-tracing setting once in the game's own menu to apply.",
-                         check.last_w, check.last_h);
+                snprintf(buf, sizeof(buf), check.creations
+                    ? "DLSS rebuilt, but the requested inputs were not confirmed (observed %ux%u). Use game's resolution and select picture mode in the game's menu."
+                    : "No DLSS rebuild was observed (last %ux%u). Change DLSS or ray tracing once in the game's menu.", check.last_w, check.last_h);
                 StatusLine(2, buf);
             } else
                 StatusLine(0, "Picture rebuilt; checking the new size...");
@@ -321,7 +341,7 @@ void DrawPicture()
         } else if (ngx.reapply_pending)
             StatusLine(0, "Applying the preset at the next frame.");
         else if (g_apply_clicked && ngx.reapplies > g_apply_ok_at)
-            StatusLine(1, "Preset applied. The picture mode already matches your selection.");
+            StatusLine(1, follow_game ? "Preset request applied; the game's resolution is retained." : "Preset applied. The picture mode already matches your selection.");
         else if (g_apply_clicked && ngx.reapply_failures > g_apply_fail_at)
             StatusLine(2, "The preset could not be applied. The previous setup is still in use.");
         if (BeginDetails("Apply details")) {
@@ -342,7 +362,8 @@ void DrawPicture()
             } else {
                 // Every other game: the general rebuild (no game-specific code).
                 const auto pr = na::overlay::GetPictureRebuild();
-                Hint(ngx.active_upscaler == 1
+                Hint(follow_game ? "Apply retains the engine's render size and quality value. Ray Reconstruction asks the game to rebuild its feature; the preset is a request to NVIDIA's runtime."
+                     : ngx.active_upscaler == 1
                          ? "A preset change is applied directly to the game's DLSS. A mode change asks the game to rebuild its picture (its window is resized by one pixel and back), then checks the size it renders."
                          : "Apply asks the game to rebuild its picture (its window is resized by one pixel and back) so it re-creates its DLSS with your mode and preset, then checks the size it renders.");
                 snprintf(buf, sizeof(buf), "Rebuilds tried %u, failed %u.", pr.attempts, pr.failures);

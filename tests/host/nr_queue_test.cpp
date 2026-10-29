@@ -1,0 +1,193 @@
+// Real D3D12 queues/resources, fake NR model. Proves queue ordering and copied
+// input contents, not NVIDIA model quality. CPU waits/readbacks are test-only.
+#include "test_support.hpp"
+#include "fake_ngx_params.hpp"
+#include "host_dx12/nr/nr_pass.hpp"
+#include "host_dx12/settings.hpp"
+#include <d3d12sdklayers.h>
+#include <cmath>
+#include <memory>
+#include <vector>
+
+namespace {
+constexpr UINT W = 16, H = 12;
+test::Device d;
+bool fail_evaluate = false;
+struct Witness { test::ComPtr<ID3D12Resource> buffer; D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{}; };
+std::vector<Witness> witnesses;
+std::vector<std::unique_ptr<test::List>> lists;
+std::vector<test::ComPtr<ID3D12Resource>> uploads;
+test::FakeParams caps;
+int32_t __cdecl Alloc(void** out) { *out = new test::FakeParams; return NVSDK_NGX_Result_Success; }
+int32_t __cdecl Destroy(void* p) { delete static_cast<test::FakeParams*>(p); return NVSDK_NGX_Result_Success; }
+int32_t __cdecl Caps(void** out) { caps.Set("DLSSNR.Available", 1); *out = &caps; return NVSDK_NGX_Result_Success; }
+int32_t __cdecl Create(void*, uint32_t feature, void*, void** out) {
+    CHECK(feature == 18); *out = reinterpret_cast<void*>(1); return NVSDK_NGX_Result_Success;
+}
+int32_t __cdecl Release(void*) { return NVSDK_NGX_Result_Success; }
+int32_t __cdecl Evaluate(void* list, const void*, const void* params, void*) {
+    if (fail_evaluate) return static_cast<int32_t>(NVSDK_NGX_Result_Fail);
+    auto* p = static_cast<const test::FakeParams*>(params);
+    auto* l = static_cast<ID3D12GraphicsCommandList*>(list);
+    ID3D12Resource *depth = nullptr, *color = nullptr, *out = nullptr;
+    p->Get("DLSSNR.Depth", &depth); p->Get("DLSSNR.Color", &color); p->Get("DLSSNR.Output", &out);
+    CHECK(depth && color && out);
+    Witness witness;
+    UINT64 total = 0;
+    const auto desc = depth->GetDesc();
+    d.device->GetCopyableFootprints(&desc, 0, 1, 0, &witness.fp, nullptr, nullptr, &total);
+    witness.buffer = test::CreateBuffer(d.device.Get(), total, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_RESOURCE_BARRIER b[] = {
+        test::Transition(depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        test::Transition(color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        test::Transition(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST)};
+    l->ResourceBarrier(3, b);
+    D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+    src.pResource = depth; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.pResource = witness.buffer.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = witness.fp;
+    l->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    l->CopyResource(out, color); // a deterministic stand-in for the NR model
+    for (auto& barrier : b) std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+    l->ResourceBarrier(3, b);
+    witnesses.push_back(std::move(witness));
+    return NVSDK_NGX_Result_Success;
+}
+void STDMETHODCALLTYPE Forward(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* l) { q->ExecuteCommandLists(n, l); }
+void Drain(ID3D12CommandQueue* q) { test::SignalAndWait(q, d.fence.Get(), d.fence_value, d.event, d.device.Get(), "NR queues"); }
+
+void Upload(ID3D12GraphicsCommandList* list, ID3D12Resource* texture, float value) {
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{}; UINT64 total = 0;
+    const auto desc = texture->GetDesc();
+    d.device->GetCopyableFootprints(&desc, 0, 1, 0, &fp, nullptr, nullptr, &total);
+    auto upload = test::CreateBuffer(d.device.Get(), total, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    void* data = nullptr; CHECK(SUCCEEDED(upload->Map(0, nullptr, &data)));
+    std::memset(data, 0, static_cast<size_t>(total));
+    if (desc.Format == DXGI_FORMAT_R32_FLOAT)
+        for (UINT y = 0; y < desc.Height; ++y) for (UINT x = 0; x < desc.Width; ++x)
+            std::memcpy(static_cast<char*>(data) + y * fp.Footprint.RowPitch + x * sizeof(float), &value, sizeof(float));
+    upload->Unmap(0, nullptr);
+    auto b = test::Transition(texture, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    list->ResourceBarrier(1, &b);
+    D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+    src.pResource = upload.Get(); src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; src.PlacedFootprint = fp;
+    dst.pResource = texture; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    std::swap(b.Transition.StateBefore, b.Transition.StateAfter); list->ResourceBarrier(1, &b);
+    uploads.push_back(upload);
+}
+int Input(ID3D12CommandQueue* queue, ID3D12Resource* depth, ID3D12Resource* motion, float value) {
+    auto list = std::make_unique<test::List>(); REQUIRE(list->Create(d.device.Get()));
+    Upload(list->list.Get(), depth, value); Upload(list->list.Get(), motion, 0.f);
+    na::nr::EvalInputs in{}; in.depth = depth; in.motion = motion;
+    in.render_w = static_cast<uint32_t>(depth->GetDesc().Width); in.render_h = depth->GetDesc().Height;
+    in.out_w = W; in.out_h = H; in.mv_scale_x = in.mv_scale_y = 1.f;
+    na::nr::OnEvaluate(list->list.Get(), in);
+    REQUIRE(SUCCEEDED(list->list->Close()));
+    ID3D12CommandList* submitted[] = {list->list.Get()};
+    na::nr::Execute(queue, 1, submitted, Forward);
+    lists.push_back(std::move(list));
+    return 0;
+}
+void CheckWitness(size_t index, float value) {
+    CHECK(index < witnesses.size()); if (index >= witnesses.size()) return;
+    auto& w = witnesses[index]; void* data = nullptr;
+    CHECK(SUCCEEDED(w.buffer->Map(0, nullptr, &data)));
+    bool good = true;
+    for (UINT y = 0; y < w.fp.Footprint.Height; ++y) for (UINT x = 0; x < w.fp.Footprint.Width; ++x) {
+        float actual; std::memcpy(&actual, static_cast<char*>(data) + y * w.fp.Footprint.RowPitch + x * sizeof(float), sizeof(float));
+        good &= std::fabs(actual - value) < 0.0001f;
+    }
+    w.buffer->Unmap(0, nullptr);
+    CHECK(good); std::printf("depth witness %zu: expected %.2f, %s\n", index, value, good ? "all pixels match" : "MISMATCH");
+}
+}
+
+int main() {
+    test::ComPtr<ID3D12Debug> debug;
+    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) debug->EnableDebugLayer();
+    if (!test::CreateDevice(d)) return test::SkipNoDevice("nr_queue_test");
+    test::ComPtr<ID3D12InfoQueue> info; d.device.As(&info);
+    test::ComPtr<ID3D12CommandQueue> output, alternate;
+    D3D12_COMMAND_QUEUE_DESC q{};
+    REQUIRE(SUCCEEDED(d.device->CreateCommandQueue(&q, IID_PPV_ARGS(&output))));
+    REQUIRE(SUCCEEDED(d.device->CreateCommandQueue(&q, IID_PPV_ARGS(&alternate))));
+    auto depth = test::CreateTexture(d.device.Get(), W, H, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_FLAG_NONE);
+    auto motion = test::CreateTexture(d.device.Get(), W, H, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_FLAG_NONE);
+    auto back = test::CreateTexture(d.device.Get(), W, H, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_FLAG_NONE);
+    REQUIRE(depth && motion && back);
+    na::nr::Runtime rt{reinterpret_cast<void*>(Create), reinterpret_cast<void*>(Evaluate), reinterpret_cast<void*>(Release),
+        reinterpret_cast<void*>(Alloc), reinterpret_cast<void*>(Destroy), reinterpret_cast<void*>(Caps)};
+    na::settings::Get().nr_enabled = 1; na::nr::SetRuntime(rt);
+    auto present = [&](ID3D12CommandQueue* queue) { na::nr::OnPresent(queue, back.Get(), DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709); };
+    REQUIRE(Input(d.queue.Get(), depth.Get(), motion.Get(), .1f) == 0);
+    present(output.Get()); // feature creation
+    Drain(d.queue.Get()); Drain(output.Get());
+    REQUIRE(!na::nr::GetStats().latched_off);
+
+    test::ComPtr<ID3D12Fence> gate, probe;
+    HANDLE probe_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    REQUIRE(probe_event);
+    REQUIRE(SUCCEEDED(d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate))));
+    REQUIRE(SUCCEEDED(d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&probe))));
+    // A deliberately late producer: NR must return on the CPU, but its GPU
+    // submission cannot complete until the copied inputs actually exist.
+    REQUIRE(SUCCEEDED(d.queue->Wait(gate.Get(), 1)));
+    REQUIRE(Input(d.queue.Get(), depth.Get(), motion.Get(), .25f) == 0); present(output.Get());
+    REQUIRE(SUCCEEDED(output->Signal(probe.Get(), 1)));
+    auto wait = test::WaitFence(probe.Get(), 1, probe_event, 60);
+    CHECK(wait == test::WaitResult::Timeout);
+    REQUIRE(SUCCEEDED(gate->Signal(1))); Drain(d.queue.Get()); Drain(output.Get()); CheckWitness(0, .25f);
+
+    // A deliberately late consumer: the next producer must finish without
+    // overwriting the snapshot NR will read. This also avoids an FG dependency
+    // cycle when the presentation queue itself waits for that next producer.
+    REQUIRE(SUCCEEDED(output->Wait(probe.Get(), 2))); // game/FG dependency on a future producer submission
+    REQUIRE(SUCCEEDED(output->Wait(gate.Get(), 2)));
+    REQUIRE(Input(d.queue.Get(), depth.Get(), motion.Get(), .5f) == 0); present(output.Get());
+    REQUIRE(Input(d.queue.Get(), depth.Get(), motion.Get(), .75f) == 0);
+    REQUIRE(SUCCEEDED(d.queue->Signal(probe.Get(), 2)));
+    ResetEvent(probe_event);
+    wait = test::WaitFence(probe.Get(), 2, probe_event, 1000); CHECK(wait == test::WaitResult::Ok);
+    REQUIRE(SUCCEEDED(gate->Signal(2))); Drain(output.Get()); Drain(d.queue.Get()); CheckWitness(1, .5f);
+    present(output.Get()); Drain(output.Get()); CheckWitness(2, .75f);
+
+    // Both queues may change. Their previously submitted work remains ordered.
+    REQUIRE(Input(alternate.Get(), depth.Get(), motion.Get(), .9f) == 0); present(d.queue.Get());
+    Drain(alternate.Get()); Drain(d.queue.Get()); CheckWitness(3, .9f);
+    REQUIRE(Input(d.queue.Get(), depth.Get(), motion.Get(), .6f) == 0); present(d.queue.Get()); Drain(d.queue.Get()); CheckWitness(4, .6f);
+    const auto waits_before = na::nr::GetStats().cross_queue_waits;
+    REQUIRE(Input(d.queue.Get(), depth.Get(), motion.Get(), .4f) == 0); present(d.queue.Get()); Drain(d.queue.Get()); CheckWitness(5, .4f);
+    CHECK(na::nr::GetStats().cross_queue_waits == waits_before); // steady same-queue fast path
+    const auto before_idle = na::nr::GetStats(); present(d.queue.Get());
+    CHECK(na::nr::GetStats().evaluates == before_idle.evaluates);
+    CHECK(na::nr::GetStats().missing_inputs == before_idle.missing_inputs + 1);
+
+    // Scaled modes (including Ultra Performance) use the same synchronized inputs.
+    auto small_depth = test::CreateTexture(d.device.Get(), W / 2, H / 2, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_FLAG_NONE);
+    auto small_motion = test::CreateTexture(d.device.Get(), W / 2, H / 2, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_FLAG_NONE);
+    REQUIRE(Input(alternate.Get(), small_depth.Get(), small_motion.Get(), .3f) == 0); present(output.Get());
+    Drain(alternate.Get()); Drain(output.Get()); CheckWitness(6, .3f);
+
+    // Failure recovery records restoration barriers too: it must wait for the
+    // producer, even though it does not count as a successful NR evaluation.
+    fail_evaluate = true;
+    REQUIRE(SUCCEEDED(alternate->Wait(gate.Get(), 3)));
+    REQUIRE(Input(alternate.Get(), small_depth.Get(), small_motion.Get(), .8f) == 0); present(output.Get());
+    REQUIRE(SUCCEEDED(output->Signal(probe.Get(), 3))); ResetEvent(probe_event);
+    wait = test::WaitFence(probe.Get(), 3, probe_event, 60); CHECK(wait == test::WaitResult::Timeout);
+    REQUIRE(SUCCEEDED(gate->Signal(3))); Drain(alternate.Get()); Drain(output.Get());
+    auto s = na::nr::GetStats();
+    CHECK(s.latched_off && s.evaluates == 7 && s.gpu_submitted == 9 && s.gpu_completed == 9);
+    CHECK(s.input_submitted == s.input_completed && s.cross_queue_waits > 0);
+    std::printf("NR evals=%llu submitted/completed=%llu/%llu input=%llu/%llu cross_queue_waits=%llu\n",
+        s.evaluates, s.gpu_submitted, s.gpu_completed, s.input_submitted, s.input_completed, s.cross_queue_waits);
+    na::nr::Shutdown(); lists.clear(); uploads.clear(); witnesses.clear();
+    CloseHandle(probe_event);
+    REQUIRE(d.device->GetDeviceRemovedReason() == S_OK);
+    if (info) for (UINT64 i = 0; i < info->GetNumStoredMessages(); ++i) {
+        SIZE_T size = 0; info->GetMessage(i, nullptr, &size); std::vector<char> bytes(size);
+        auto* message = reinterpret_cast<D3D12_MESSAGE*>(bytes.data()); info->GetMessage(i, message, &size);
+        if (message->Severity <= D3D12_MESSAGE_SEVERITY_ERROR) { std::printf("D3D12: %s\n", message->pDescription); CHECK(false); }
+    }
+    return test::finish("nr_queue_test");
+}

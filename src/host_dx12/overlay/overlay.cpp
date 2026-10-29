@@ -705,6 +705,10 @@ void write_status_line()
                       static_cast<unsigned long long>(nr.inputs_seen), static_cast<unsigned long long>(nr.input_overwrites),
                       static_cast<unsigned long long>(nr.missing_inputs), static_cast<unsigned long long>(nr.busy_slots));
     if (nn > 0) WriteFile(f, nr_line, static_cast<DWORD>(nn), &written, nullptr);
+    nn = snprintf(nr_line, sizeof(nr_line), "nr_queue_sync input_submitted=%llu input_completed=%llu gpu_waits=%llu\r\n",
+                  static_cast<unsigned long long>(nr.input_submitted), static_cast<unsigned long long>(nr.input_completed),
+                  static_cast<unsigned long long>(nr.cross_queue_waits));
+    if (nn > 0) WriteFile(f, nr_line, static_cast<DWORD>(nn), &written, nullptr);
     char fg_line[256];
     int fn = snprintf(fg_line, sizeof(fg_line), "fg_inputs recorded=%llu submitted=%llu overwritten=%llu missing=%llu\r\n",
                       static_cast<unsigned long long>(fg.inputs_recorded), static_cast<unsigned long long>(fg.inputs_submitted),

@@ -6,6 +6,7 @@
 #include <wrl/client.h>
 
 #include <atomic>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -128,6 +129,10 @@ struct Frame {
 
 struct PendingInputs {
     ID3D12CommandList* list = nullptr; // identity only; never dereferenced/retained
+    UINT64 submitted = 0; // retain copies until their producer has finished
+    UINT64 consumed = 0; // last NR submission reading these copies
+    ComPtr<ID3D12Fence> fence;
+    ComPtr<ID3D12CommandQueue> queue;
     EvalInputs in{};
     uint32_t valid_w = 0, valid_h = 0; // rendered region copied to (0,0) of the copies
     ComPtr<ID3D12Resource> depth, motion;
@@ -155,10 +160,12 @@ struct State {
     ComPtr<ID3D12Resource> query_readback;
     // NA-owned textures.
     ComPtr<ID3D12Resource> depth_copy, motion_copy;   // NPSR at rest (render size)
-    ComPtr<ID3D12Resource> recording_depth, recording_motion;
     PendingInputs pending[16]; // bounded command-list recordings, no per-frame heap growth
+    PendingInputs* ready = nullptr;
     std::atomic<uint32_t> pending_count{0};
-    ComPtr<ID3D12CommandQueue> input_queue;
+    ComPtr<ID3D12CommandQueue> output_queue;
+    UINT64 input_value = 0;
+    uint64_t cross_queue_waits = 0;
     ComPtr<ID3D12Resource> depth_up, motion_up;       // UAV at rest (display size, scaled modes only)
     ComPtr<ID3D12Resource> color_in;                  // NPSR at rest
     ComPtr<ID3D12Resource> nr_out;                    // UAV at rest
@@ -209,6 +216,34 @@ void latch(const char* text)
     set_reason(text);
     g.latched.store(1, std::memory_order_release);
     g.active.store(0, std::memory_order_release);
+}
+
+// Shared by successful evaluation AND the restore-only failure submission.
+// Wait only for values already signalled; these are GPU waits, never CPU waits.
+bool submit_frame_locked(ID3D12CommandQueue* queue, Frame& f)
+{
+    if (g.ready && g.ready->queue.Get() != queue) {
+        if (FAILED(queue->Wait(g.ready->fence.Get(), g.ready->submitted))) {
+            g.signal_failed = true; latch("Neural Rendering stopped: input queue wait failed."); return false;
+        }
+        ++g.cross_queue_waits;
+    }
+    if (g.output_queue && g.output_queue.Get() != queue && g.fence_next > 1) {
+        if (FAILED(queue->Wait(g.fence.Get(), g.fence_next - 1))) {
+            g.signal_failed = true; latch("Neural Rendering stopped: output queue wait failed."); return false;
+        }
+        ++g.cross_queue_waits;
+    }
+    ID3D12CommandList* lists[] = {g.list.Get()};
+    submit_locked(queue, 1, lists);
+    g.output_queue = queue;
+    f.fence_value = g.fence_next++;
+    if (g.ready) g.ready->consumed = f.fence_value;
+    if (FAILED(queue->Signal(g.fence.Get(), f.fence_value))) {
+        g.signal_failed = true; latch("Neural Rendering stopped: GPU completion signal failed."); return false;
+    }
+    g.frame_index = (g.frame_index + 1) % kRing;
+    return true;
 }
 
 D3D12_RESOURCE_BARRIER transition(ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b)
@@ -615,19 +650,32 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
     const uint32_t w = static_cast<uint32_t>(dd.Width), h = dd.Height;
     PendingInputs* pending = nullptr;
     for (auto& p : g.pending) if (p.list == list) { pending = &p; break; }
-    if (!pending) for (auto& p : g.pending) if (!p.list) { pending = &p; break; }
+    const auto output_done = g.fence->GetCompletedValue();
+    if (!pending) for (auto& p : g.pending) {
+        // Never reuse a recorded, GPU-busy, or still-unconsumed published
+        // snapshot. In particular, recording the next list must not change
+        // the inputs a concurrent Present is about to read.
+        if (!p.list && !(g.inputs_fresh && g.ready == &p) && p.consumed <= output_done &&
+            (!p.fence || p.submitted <= p.fence->GetCompletedValue())) { pending = &p; break; }
+    }
     if (!pending) {
-        latch("Neural Rendering stopped: too many unsubmitted input lists.");
+        g.skipped.fetch_add(1, std::memory_order_relaxed);
+        set_reason("Neural Rendering skipped: its input copies are still in use.");
         return;
     }
     const bool need_uav = !copy_depth;
-    if (!g.recording_depth || !g.recording_motion || g.recording_depth->GetDesc().Width != w ||
-        g.recording_depth->GetDesc().Height != h || g.recording_motion->GetDesc().Format != md.Format ||
-        g.recording_motion->GetDesc().Width != md.Width || g.recording_motion->GetDesc().Height != md.Height ||
-        (need_uav && !(g.recording_depth->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) {
+    if (!pending->fence && FAILED(g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&pending->fence)))) {
+        latch("Neural Rendering could not prepare input synchronization."); return;
+    }
+    auto& recording_depth = pending->depth;
+    auto& recording_motion = pending->motion;
+    if (!recording_depth || !recording_motion || recording_depth->GetDesc().Width != w ||
+        recording_depth->GetDesc().Height != h || recording_motion->GetDesc().Format != md.Format ||
+        recording_motion->GetDesc().Width != md.Width || recording_motion->GetDesc().Height != md.Height ||
+        (need_uav && !(recording_depth->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) {
         // Depth: the game's depth plane as a plain float texture (UAV-capable when converted).
-        if (!create_texture(w, h, DXGI_FORMAT_R32_FLOAT, need_uav, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g.recording_depth) ||
-            !create_texture(static_cast<UINT>(md.Width), md.Height, md.Format, false, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g.recording_motion)) {
+        if (!create_texture(w, h, DXGI_FORMAT_R32_FLOAT, need_uav, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, recording_depth) ||
+            !create_texture(static_cast<UINT>(md.Width), md.Height, md.Format, false, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, recording_motion)) {
             latch("Neural Rendering could not allocate its motion buffers.");
             return;
         }
@@ -638,12 +686,12 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
         D3D12_RESOURCE_BARRIER pre[4] = {
             transition(in.depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
             transition(in.motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
-            transition(g.recording_depth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
-            transition(g.recording_motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)};
+            transition(recording_depth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
+            transition(recording_motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)};
         pre[0].Transition.Subresource = 0; // depth plane only
         list->ResourceBarrier(4, pre);
         src.pResource = in.depth;
-        dst.pResource = g.recording_depth.Get();
+        dst.pResource = recording_depth.Get();
         const D3D12_BOX dbox{dbx, dby, 0, dbx + rw, dby + rh, 1};
         list->CopyTextureRegion(&dst, 0, 0, 0, &src, &dbox);
     } else {
@@ -651,20 +699,20 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
         // just ran already changed this list's descriptor heaps/root state, and
         // the caller must restore them after it (NGX/FFX contract), so this
         // pass records in that same window.
-        record_depth_to_r32_locked(list, in.depth, depth_view, g.recording_depth.Get(), dbx, dby, rw, rh);
+        record_depth_to_r32_locked(list, in.depth, depth_view, recording_depth.Get(), dbx, dby, rw, rh);
         D3D12_RESOURCE_BARRIER pre[2] = {
             transition(in.motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
-            transition(g.recording_motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)};
+            transition(recording_motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)};
         list->ResourceBarrier(2, pre);
     }
     src.pResource = in.motion;
-    dst.pResource = g.recording_motion.Get();
+    dst.pResource = recording_motion.Get();
     const D3D12_BOX mbox{mbx, mby, 0, mbx + rw, mby + rh, 1};
     list->CopyTextureRegion(&dst, 0, 0, 0, &src, &mbox);
     D3D12_RESOURCE_BARRIER post[4] = {
         transition(in.motion, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-        transition(g.recording_depth.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-        transition(g.recording_motion.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        transition(recording_depth.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        transition(recording_motion.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
         transition(in.depth, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
     post[3].Transition.Subresource = 0;
     list->ResourceBarrier(copy_depth ? 4 : 3, post);
@@ -674,8 +722,6 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
     pending->list = list;
     pending->in = in;
     pending->in.depth = pending->in.motion = nullptr; // no borrowed resource pointers outlive the call
-    pending->depth = g.recording_depth;
-    pending->motion = g.recording_motion;
     g.inputs_seen.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -696,13 +742,17 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     }
     // Hold the short CPU lock through the actual forward/publication, so a
     // concurrent Present cannot consume a receipt before its copies are queued.
-    forward(queue, count, lists);
+    // Each snapshot owns independent copies and a producer fence. Never make
+    // a game submission wait for NR: an FG queue may already be waiting for
+    // that game submission, which would form a dependency cycle.
+    forward(queue, count, lists); // never suppress the game's submission
     for (UINT i = 0; i < count; ++i) for (auto& p : g.pending) {
         if (!p.list || p.list != lists[i]) continue;
-        if (g.input_queue && g.input_queue.Get() != queue) {
-            latch("Neural Rendering stopped: input queues changed.");
-        } else {
-            g.input_queue = queue;
+        const bool ordered = !g.signal_failed && SUCCEEDED(queue->Signal(p.fence.Get(), ++p.submitted));
+        if (ordered) {
+            ++g.input_value;
+            p.queue = queue;
+            g.ready = &p;
             g.last_in = p.in;
             g.depth_copy = p.depth;
             g.motion_copy = p.motion;
@@ -712,8 +762,12 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
             g.have_inputs = 1;
             if (g.inputs_fresh) g.input_overwrites.fetch_add(1, std::memory_order_relaxed);
             g.inputs_fresh = 1;
+        } else {
+            g.signal_failed = true;
+            latch("Neural Rendering stopped: input queue synchronization failed.");
         }
-        p = {};
+        // Keep the snapshot through BOTH its producer and consumer completion.
+        p.list = nullptr;
         g.pending_count.fetch_sub(1, std::memory_order_release);
     }
 }
@@ -749,10 +803,6 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer, DXGI_COLOR
         return;
     }
     if (g.latched.load(std::memory_order_acquire)) return;
-    if (g.input_queue && g.input_queue.Get() != queue) {
-        latch("Neural Rendering stopped: picture and inputs use different queues.");
-        return;
-    }
     if (!g.have_inputs) {
         set_reason("Waiting for the game's first DLSS frame.");
         g.skipped.fetch_add(1, std::memory_order_relaxed);
@@ -942,14 +992,8 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer, DXGI_COLOR
             }
             D3D12_RESOURCE_BARRIER back = transition(backbuffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT);
             g.list->ResourceBarrier(1, &back);
-            g.list->Close();
-            ID3D12CommandList* lists[] = {g.list.Get()};
-            submit_locked(queue, 1, lists);
-            f.fence_value = g.fence_next++;
-            if (FAILED(queue->Signal(g.fence.Get(), f.fence_value))) {
-                g.signal_failed = true; latch("Neural Rendering stopped: GPU completion signal failed.");
-            }
-            g.frame_index = (g.frame_index + 1) % kRing;
+            if (FAILED(g.list->Close())) { latch("Neural Rendering could not restore its command buffer."); return; }
+            submit_frame_locked(queue, f);
             return;
         }
         D3D12_RESOURCE_BARRIER nr_done = uav_barrier(g.nr_out.Get());
@@ -1005,13 +1049,7 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer, DXGI_COLOR
         latch("Neural Rendering could not finish its command buffer.");
         return;
     }
-    ID3D12CommandList* lists[] = {g.list.Get()};
-    submit_locked(queue, 1, lists);
-    f.fence_value = g.fence_next++;
-    if (FAILED(queue->Signal(g.fence.Get(), f.fence_value))) {
-        g.signal_failed = true; latch("Neural Rendering stopped: GPU completion signal failed."); return;
-    }
-    g.frame_index = (g.frame_index + 1) % kRing;
+    if (!submit_frame_locked(queue, f)) return;
     if (g.feature_pending) {
         g.feature_pending = 0; // executes before the next frame's evaluate on the same queue
         set_reason("Neural Rendering is starting.");
@@ -1044,6 +1082,9 @@ Stats GetStats()
     if (lock.owns_lock()) {
         s.gpu_submitted = g.fence_next - 1;
         s.gpu_completed = g.fence ? g.fence->GetCompletedValue() : 0;
+        s.input_submitted = g.input_value;
+        for (const auto& p : g.pending) if (p.fence) s.input_completed += (std::min)(p.submitted, p.fence->GetCompletedValue());
+        s.cross_queue_waits = g.cross_queue_waits;
         s.width = g.width;
         s.height = g.height;
         strncpy_s(s.reason, g.reason, _TRUNCATE);
@@ -1077,6 +1118,17 @@ void Shutdown()
 {
     std::lock_guard<std::mutex> lock(g.m);
     if (g.signal_failed) { latch("Neural Rendering shutdown retained resources after a failed GPU signal."); return; }
+    for (const auto& p : g.pending) if (p.fence && p.fence->GetCompletedValue() < p.submitted) {
+        // Exit/test scope only, never a live callback wait.
+        HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (ev) {
+            if (SUCCEEDED(p.fence->SetEventOnCompletion(p.submitted, ev))) WaitForSingleObject(ev, 2000);
+            CloseHandle(ev);
+        }
+        if (p.fence->GetCompletedValue() < p.submitted) {
+            latch("Neural Rendering shutdown retained pending input copies."); return;
+        }
+    }
     if (g.fence && g.fence_next > 1 && g.fence->GetCompletedValue() < g.fence_next - 1) {
         HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (ev) {
@@ -1092,11 +1144,12 @@ void Shutdown()
     g.params = nullptr;
     g.depth_copy.Reset();
     g.motion_copy.Reset();
-    g.recording_depth.Reset();
-    g.recording_motion.Reset();
     for (auto& p : g.pending) p = {};
     g.pending_count.store(0);
-    g.input_queue.Reset();
+    g.ready = nullptr;
+    g.output_queue.Reset();
+    g.input_value = 0;
+    g.cross_queue_waits = 0;
     g.depth_up.Reset();
     g.motion_up.Reset();
     g.color_in.Reset();

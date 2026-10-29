@@ -1057,13 +1057,19 @@ bool ApplyCreateOverridesForFeature(uint32_t feature_id, void* ngx_parameter)
     case na::settings::DlssMode::UltraPerformance: pq = NVSDK_NGX_PerfQuality_Value_UltraPerformance; break;
     default: break;
     }
-    p->Set(NVSDK_NGX_Parameter_PerfQualityValue, pq);
-    wrote = true;
+    // Some engines cache their render scale and never query optimal settings
+    // on a resize (PBZ). A preset-only request must preserve both that scale
+    // and the game's matching quality value, rather than label low-res DLAA.
+    if (!na::settings::Get().follow_game_resolution.load(std::memory_order_acquire)) {
+        p->Set(NVSDK_NGX_Parameter_PerfQualityValue, pq);
+        wrote = true;
+    }
     if (feature_id == kFeatureRayReconstruction) {
         // Ray Reconstruction reads its own preset keys; only D, E and F are usable
         // (the SDK marks the rest "do not use, reverts to default").
         const int32_t rp = na::settings::Get().rr_preset.load(std::memory_order_acquire);
         if (rp >= 4 && rp <= 6) {
+            wrote = true;
             const unsigned int v = static_cast<unsigned int>(rp);
             p->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA, v);
             p->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality, v);
@@ -1076,6 +1082,7 @@ bool ApplyCreateOverridesForFeature(uint32_t feature_id, void* ngx_parameter)
     }
     int32_t preset = na::settings::Get().preset.load(std::memory_order_acquire);
     if (preset >= 1 && preset <= 13) {
+        wrote = true;
         const unsigned int v = static_cast<unsigned int>(preset);
         p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, v);
         p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality, v);
@@ -1195,7 +1202,7 @@ int32_t optimal_settings_common(void* ngx_parameter, void* orig)
     auto mode = static_cast<na::settings::DlssMode>(
         na::settings::Get().dlss_mode.load(std::memory_order_acquire));
     bool overridden = false;
-    if (enabled && user_w && user_h) {
+    if (enabled && !na::settings::Get().follow_game_resolution.load(std::memory_order_acquire) && user_w && user_h) {
         unsigned int tw = user_w, th = user_h;
         if (mode != na::settings::DlssMode::DLAA) {
             float ratio = na::settings::ScaleForMode(mode);

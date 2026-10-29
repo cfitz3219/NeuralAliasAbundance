@@ -49,6 +49,7 @@ void load_from(const wchar_t* ini, bool only_if_present)
     uint32_t mode = GetPrivateProfileIntW(L"dlss", L"mode", 0, ini);
     if (mode >= static_cast<uint32_t>(DlssMode::Count)) mode = 0;
     g_settings.dlss_mode.store(mode);
+    g_settings.follow_game_resolution.store(GetPrivateProfileIntW(L"dlss", L"follow_game_resolution", 0, ini) ? 1u : 0u);
     int preset = static_cast<int>(
         GetPrivateProfileIntW(L"dlss", L"preset", static_cast<UINT>(-1), ini));
     g_settings.preset.store((preset >= 1 && preset <= 13) ? preset : -1);
@@ -162,6 +163,8 @@ bool Save()
     ok &= WritePrivateProfileStringW(L"dlss", L"enabled", v, ini) != 0;
     swprintf_s(v, L"%u", g_settings.dlss_mode.load());
     ok &= WritePrivateProfileStringW(L"dlss", L"mode", v, ini) != 0;
+    swprintf_s(v, L"%u", g_settings.follow_game_resolution.load());
+    ok &= WritePrivateProfileStringW(L"dlss", L"follow_game_resolution", v, ini) != 0;
     swprintf_s(v, L"%d", g_settings.preset.load());
     ok &= WritePrivateProfileStringW(L"dlss", L"preset", v, ini) != 0;
     swprintf_s(v, L"%d", g_settings.rr_preset.load());

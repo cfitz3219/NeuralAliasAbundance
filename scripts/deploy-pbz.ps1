@@ -113,6 +113,7 @@ proxy=0
 [dlss]
 enabled=0
 mode=4
+follow_game_resolution=1
 preset=13
 [nr]
 enabled=0

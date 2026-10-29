@@ -13,7 +13,7 @@
 // re-encoded after. SDR chains are processed in their own format.
 //
 // Safety: any NGX or D3D failure latches the pass OFF with a reason; the
-// frame is then presented untouched. Never waits on the GPU in hooks. All
+// frame is then presented untouched. Never waits on the CPU in hooks. All
 // settings come from na::settings (menu + ini); nothing runs unless
 // `nr_enabled` is set and the runtime entry points are present.
 #pragma once
@@ -61,8 +61,11 @@ bool WantsInputs();
 void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in);
 
 // Wrap the actual queue forward. Recording a future list is NOT a ready frame.
-// Publish its inputs only after submission, serialized with OnPresent. No GPU
-// wait is added. The host calls this for every ExecuteCommandLists; test hosts
+// Publish its inputs only after submission, serialized with OnPresent. Different
+// producer/presentation queues use a GPU wait before NR reads each snapshot.
+// Snapshots are not reused until both copies and NR have completed; game queues
+// never wait for NR. The host
+// calls this for every ExecuteCommandLists; test hosts
 // must do likewise. This does not consume the adapter's Execute subscription.
 using ExecuteFn = void (STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists, ExecuteFn forward);
@@ -83,6 +86,7 @@ struct Stats {
     uint64_t skipped;           // frames skipped (no inputs / extent mismatch)
     uint64_t inputs_seen, input_overwrites, missing_inputs, busy_slots;
     uint64_t gpu_submitted, gpu_completed;
+    uint64_t input_submitted, input_completed, cross_queue_waits;
     float last_ms, avg_ms;      // GPU time of the whole pass (transform + NR)
     uint32_t gpu_samples;
     char reason[96];            // plain-language reason when not active

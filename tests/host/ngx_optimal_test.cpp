@@ -81,6 +81,16 @@ int main()
     CHECK(na::ngx::OptimalSettingsCallbackRR(&p) == NVSDK_NGX_Result_Success);
     CHECK(p.U(NVSDK_NGX_Parameter_OutWidth) == 1152u && p.U(NVSDK_NGX_Parameter_OutHeight) == 480u); // 3440/3 -> 1147 -> 8-aligned
     std::printf("RR Ultra Performance -> %ux%u\n", p.U(NVSDK_NGX_Parameter_OutWidth), p.U(NVSDK_NGX_Parameter_OutHeight));
+    st.follow_game_resolution = 1;
+    st.dlss_mode = 0; // stale DLAA selection must not override the engine
+    for (auto callback : {&na::ngx::OptimalSettingsCallback, &na::ngx::OptimalSettingsCallbackRR}) {
+        Ask(p);
+        CHECK(callback(&p) == NVSDK_NGX_Result_Success);
+        CHECK(p.U(NVSDK_NGX_Parameter_OutWidth) == 2293u && p.U(NVSDK_NGX_Parameter_OutHeight) == 960u);
+        CHECK(!p.Has(NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Max_Render_Width));
+        CHECK(na::ngx::GetOptimalStats().last_overridden == 0);
+    }
+    st.follow_game_resolution = 0;
     na::ngx::SetOriginalOptimalCallbackRRForTest(nullptr);
 
     na::ngx::SetOriginalOptimalCallbackForTest(nullptr);

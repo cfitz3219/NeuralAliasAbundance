@@ -125,6 +125,24 @@ int main()
         for (const char* k : kPresetKeys) CHECK(p.U(k) == 13u);
         for (const char* k : kRrKeys) CHECK(!p.Has(k));
     }
+    // PBZ caches its resolution: presets must not relabel an Ultra Performance
+    // 1146x480 input as DLAA, even if a stale overlay selection says DLAA.
+    st.follow_game_resolution = 1; st.dlss_mode = 0; st.preset = 13; st.rr_preset = 6;
+    for (uint32_t feature : {1u, 13u}) {
+        test::FakeParams p;
+        p.Set(NVSDK_NGX_Parameter_PerfQualityValue, int(NVSDK_NGX_PerfQuality_Value_UltraPerformance));
+        p.Set(NVSDK_NGX_Parameter_Width, 1146u); p.Set(NVSDK_NGX_Parameter_Height, 480u);
+        CHECK(na::ngx::ApplyCreateOverridesForFeature(feature, &p));
+        CHECK(p.I(NVSDK_NGX_Parameter_PerfQualityValue) == NVSDK_NGX_PerfQuality_Value_UltraPerformance);
+        CHECK(p.U(NVSDK_NGX_Parameter_Width) == 1146 && p.U(NVSDK_NGX_Parameter_Height) == 480);
+        if (feature == 1) { for (const char* k : kPresetKeys) CHECK(p.U(k) == 13u); }
+        else { for (const char* k : kRrKeys) CHECK(p.U(k) == 6u); }
+    }
+    st.preset = -1; st.rr_preset = 0;
+    test::FakeParams automatic;
+    CHECK(!na::ngx::ApplyCreateOverridesForFeature(13, &automatic));
+    CHECK(automatic.values.empty());
+    st.follow_game_resolution = 0;
     st.preset.store(-1); st.rr_preset.store(0); st.dlss_mode.store(0);
     return test::finish("ngx_params_test");
 }
