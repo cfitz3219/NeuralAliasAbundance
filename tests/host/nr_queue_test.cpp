@@ -14,18 +14,21 @@ namespace {
 constexpr UINT W = 16, H = 12;
 test::Device d;
 bool fail_evaluate = false;
+uint32_t releases_a=0,releases_b=0,destroys_a=0,destroys_b=0,evals_b=0;
 struct Witness { test::ComPtr<ID3D12Resource> buffer; D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{}; };
 std::vector<Witness> witnesses;
 std::vector<std::unique_ptr<test::List>> lists;
 std::vector<test::ComPtr<ID3D12Resource>> uploads;
 test::FakeParams caps;
 int32_t __cdecl Alloc(void** out) { *out = new test::FakeParams; return NVSDK_NGX_Result_Success; }
-int32_t __cdecl Destroy(void* p) { delete static_cast<test::FakeParams*>(p); return NVSDK_NGX_Result_Success; }
+int32_t __cdecl Destroy(void* p) { ++destroys_a; delete static_cast<test::FakeParams*>(p); return NVSDK_NGX_Result_Success; }
+int32_t __cdecl DestroyB(void* p) { ++destroys_b; delete static_cast<test::FakeParams*>(p); return NVSDK_NGX_Result_Success; }
 int32_t __cdecl Caps(void** out) { caps.Set("DLSSNR.Available", 1); *out = &caps; return NVSDK_NGX_Result_Success; }
 int32_t __cdecl Create(void*, uint32_t feature, void*, void** out) {
     CHECK(feature == 18); *out = reinterpret_cast<void*>(1); return NVSDK_NGX_Result_Success;
 }
-int32_t __cdecl Release(void*) { return NVSDK_NGX_Result_Success; }
+int32_t __cdecl Release(void*) { ++releases_a; return NVSDK_NGX_Result_Success; }
+int32_t __cdecl ReleaseB(void*) { ++releases_b; return NVSDK_NGX_Result_Success; }
 int32_t __cdecl Evaluate(void* list, const void*, const void* params, void*) {
     if (fail_evaluate) return static_cast<int32_t>(NVSDK_NGX_Result_Fail);
     auto* p = static_cast<const test::FakeParams*>(params);
@@ -54,6 +57,9 @@ int32_t __cdecl Evaluate(void* list, const void*, const void* params, void*) {
     return NVSDK_NGX_Result_Success;
 }
 void STDMETHODCALLTYPE Forward(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* l) { q->ExecuteCommandLists(n, l); }
+int32_t __cdecl EvaluateB(void* list,const void* feature,const void* params,void* callback) {
+    ++evals_b; return Evaluate(list,feature,params,callback);
+}
 void Drain(ID3D12CommandQueue* q) { test::SignalAndWait(q, d.fence.Get(), d.fence_value, d.event, d.device.Get(), "NR queues"); }
 
 void Upload(ID3D12GraphicsCommandList* list, ID3D12Resource* texture, float value) {
@@ -125,6 +131,30 @@ int main(int argc, char** argv) {
         reinterpret_cast<void*>(Alloc), reinterpret_cast<void*>(Destroy), reinterpret_cast<void*>(Caps)};
     na::settings::Get().nr_enabled = 1; na::nr::SetRuntime(rt);
     auto present = [&](ID3D12CommandQueue* queue) { na::nr::OnPresent(queue, back.Get(), DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709); };
+    if (argc > 1 && std::strcmp(argv[1], "--runtime-owner") == 0) {
+        REQUIRE(Input(d.queue.Get(),depth.Get(),motion.Get(),.1f)==0);
+        Drain(d.queue.Get()); present(output.Get()); Drain(output.Get()); // runtime A created feature/params
+        auto rt_b=rt;
+        rt_b.evaluate_feature=reinterpret_cast<void*>(EvaluateB);
+        rt_b.release_feature=reinterpret_cast<void*>(ReleaseB);
+        rt_b.destroy_parameters=reinterpret_cast<void*>(DestroyB);
+        na::nr::SetRuntime(rt_b); // attaching another core cannot transfer old objects
+        REQUIRE(Input(d.queue.Get(),depth.Get(),motion.Get(),.25f)==0);
+        Drain(d.queue.Get()); present(output.Get()); Drain(output.Get());
+        CHECK(evals_b==0); CheckWitness(0,.25f);
+        na::settings::Get().nr_enabled=0; present(output.Get());
+        CHECK(releases_a==1 && releases_b==0 && destroys_a==1 && destroys_b==0);
+        na::settings::Get().nr_enabled=1; na::nr::ResetLatch();
+        REQUIRE(Input(d.queue.Get(),depth.Get(),motion.Get(),.5f)==0);
+        Drain(d.queue.Get()); present(output.Get()); Drain(output.Get());
+        REQUIRE(Input(d.queue.Get(),depth.Get(),motion.Get(),.75f)==0);
+        Drain(d.queue.Get()); present(output.Get()); Drain(output.Get());
+        CHECK(evals_b==1); CheckWitness(1,.75f);
+        na::nr::Shutdown();
+        CHECK(releases_a==1 && releases_b==1 && destroys_a==1 && destroys_b==1);
+        REQUIRE(d.device->GetDeviceRemovedReason()==S_OK);
+        return test::finish("nr_runtime_owner_test");
+    }
     if (argc > 1 && std::strcmp(argv[1], "--retry-init") == 0) {
         na::nr::FailNextDeviceInitializationForTests();
         REQUIRE(Input(d.queue.Get(),depth.Get(),motion.Get(),.1f)==0); Drain(d.queue.Get());

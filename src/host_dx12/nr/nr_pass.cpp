@@ -148,6 +148,7 @@ struct PendingInputs {
 struct State {
     std::mutex m;
     Runtime rt;
+    Runtime params_runtime, feature_runtime; // object ownership does not follow later attachments
     std::atomic<uint32_t> has_rt{0};
     std::atomic<uint32_t> wants_inputs{0};
     // Device objects (game device).
@@ -457,9 +458,18 @@ D3D12_GPU_DESCRIPTOR_HANDLE table_gpu(uint32_t slot)
 
 void release_feature_locked()
 {
-    if (g.feature && g.rt.release_feature) reinterpret_cast<PfnRelease>(g.rt.release_feature)(g.feature);
+    if (g.feature && g.feature_runtime.release_feature)
+        reinterpret_cast<PfnRelease>(g.feature_runtime.release_feature)(g.feature);
     g.feature = nullptr;
+    g.feature_runtime = {};
     g.feature_pending = 0;
+}
+void destroy_params_locked()
+{
+    if (g.params && g.params_runtime.destroy_parameters)
+        reinterpret_cast<PfnDestroyParams>(g.params_runtime.destroy_parameters)(g.params);
+    g.params = nullptr;
+    g.params_runtime = {};
 }
 
 #if defined(NA_HAVE_NGX_SDK)
@@ -475,6 +485,8 @@ bool ensure_feature_locked(uint32_t w, uint32_t h, bool hdr, DXGI_FORMAT bb_form
     if (g.feature && g.feat_w == w && g.feat_h == h && g.feat_hdr == (hdr ? 1u : 0u) && g.feat_format == bb_format && g.feat_model == model)
         return true;
     release_feature_locked();
+    if (g.params && (g.params_runtime.create_feature != g.rt.create_feature ||
+        g.params_runtime.allocate_parameters != g.rt.allocate_parameters)) destroy_params_locked();
     if (!g.params) {
         void* p = nullptr;
         int32_t r = reinterpret_cast<PfnAllocParams>(g.rt.allocate_parameters)(&p);
@@ -483,6 +495,7 @@ bool ensure_feature_locked(uint32_t w, uint32_t h, bool hdr, DXGI_FORMAT bb_form
             return false;
         }
         g.params = p;
+        g.params_runtime = g.rt;
     }
     // Capability check once per size: DLSSNR.Available on the capability params.
     if (g.rt.get_capability_parameters) {
@@ -525,6 +538,7 @@ bool ensure_feature_locked(uint32_t w, uint32_t h, bool hdr, DXGI_FORMAT bb_form
         return false;
     }
     g.feature = handle;
+    g.feature_runtime = g.rt;
     g.feat_w = w;
     g.feat_h = h;
     g.feat_hdr = hdr ? 1u : 0u;
@@ -570,7 +584,7 @@ bool evaluate_locked(bool hdr)
         snprintf(key, sizeof(key), "DLSSNR.%sSubrectHeight", k); p->Set(key, g.height);
     }
     (void)hdr;
-    int32_t r = reinterpret_cast<PfnEvaluate>(g.rt.evaluate_feature)(g.list.Get(), g.feature, g.params, nullptr);
+    int32_t r = reinterpret_cast<PfnEvaluate>(g.feature_runtime.evaluate_feature)(g.list.Get(), g.feature, g.params, nullptr);
     if (!NVSDK_NGX_SUCCEED(static_cast<NVSDK_NGX_Result>(r))) {
         char buf[96];
         snprintf(buf, sizeof(buf), "Neural Rendering stopped (NVIDIA code 0x%08X).", static_cast<unsigned>(r));
@@ -882,9 +896,7 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer, DXGI_COLOR
         if (!g.signal_failed && g.feature && g.fence && g.fence->GetCompletedValue() != UINT64_MAX &&
             g.fence->GetCompletedValue() >= g.fence_next - 1) {
             release_feature_locked();
-            if (g.params && g.rt.destroy_parameters)
-                reinterpret_cast<PfnDestroyParams>(g.rt.destroy_parameters)(g.params);
-            g.params = nullptr;
+            destroy_params_locked();
             g.color_in.Reset(); g.nr_out.Reset(); g.hdr_out.Reset();
             g.depth_up.Reset(); g.motion_up.Reset();
             for (auto& frame : g.frames) { frame.depth.Reset(); frame.motion.Reset(); }
@@ -1268,8 +1280,7 @@ void Shutdown()
         }
     }
     release_feature_locked();
-    if (g.params && g.rt.destroy_parameters) reinterpret_cast<PfnDestroyParams>(g.rt.destroy_parameters)(g.params);
-    g.params = nullptr;
+    destroy_params_locked();
     g.depth_copy.Reset();
     g.motion_copy.Reset();
     for (auto& p : g.pending) p = {};
