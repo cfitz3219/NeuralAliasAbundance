@@ -47,6 +47,7 @@ struct EvalParams {
     uint32_t perf_quality;   // PerfQualityValue at create; 0xFFFFFFFF unknown
     uint32_t create_flags;   // DLSS.Feature.Create.Flags; 0xFFFFFFFF unknown
     uint32_t overridden;     // 1 = host overrides were applied to this call
+    uint32_t preset_hint;    // create only: preset hint the runtime receives for this call's quality slot (0 = default)
     // A67 (Astra R4): subrect origins per input; 0xFFFFFFFF unknown. Coverage
     // of a resource is base + size, not size alone.
     uint32_t color_base_x, color_base_y, depth_base_x, depth_base_y;
@@ -83,6 +84,13 @@ struct OptimalStats {
     uint32_t last_overridden;   // 1 if we rewrote the answer
 };
 OptimalStats GetOptimalStats();
+// True if the optimal-settings callback was ever asked about this display size
+// (+-1 px). False for a game that computes its own render size: then a picture
+// mode chosen in NeuralAlias cannot change its resolution, only presets apply.
+bool OptimalQueriedFor(uint32_t out_w, uint32_t out_h);
+// The preset hint a creation hands the runtime for its own quality slot (after
+// our overrides). 0 = default/none. Logged per creation as preset=.
+uint32_t CreatePresetHint(uint32_t feature_id, void* ngx_parameter);
 
 struct CallRecord {
     uint64_t qpc_ticks;     // QueryPerformanceCounter at detour entry

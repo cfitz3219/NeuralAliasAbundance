@@ -11,4 +11,22 @@ struct Status {
 void Initialize(); // init thread, TLOU I or explicit per-game profile_override; read/persist before our NGX preload
 void Request(uint32_t preset); // menu thread: queue only, no DRS I/O
 Status GetStatus();
+
+// Read-only: NVIDIA driver (NVIDIA app "DLSS Override") preset overrides for
+// Super Resolution and Ray Reconstruction, game profile over global profile.
+// When an override is active the driver replaces the preset hint the game (or
+// NeuralAlias) passes, so every preset choice in our menu looks identical.
+struct UpscalerOverrides {
+    bool available = false;
+    uint32_t sr_enabled = 0, sr_preset = 0, rr_enabled = 0, rr_preset = 0;
+    bool sr_global = false, rr_global = false;
+    // A preset selection in the driver profile (0 = off / the application
+    // decides; 0x00FFFFFF = NVIDIA's "Latest"). Treated as forcing even when the
+    // separate enable value is absent, since driver versions differ; both raw
+    // values are logged in the status line.
+    bool SrForced() const { return sr_preset != 0; }
+    bool RrForced() const { return rr_preset != 0; }
+};
+void ReadUpscalerOverrides(); // init thread only (DRS session); never writes
+UpscalerOverrides GetUpscalerOverrides();
 }

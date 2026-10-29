@@ -61,16 +61,20 @@ void note_request()
     g_req.evaluates_at = s.evaluates;
 }
 
-void requested_size(const na::ngx::OptimalStats& opt, int mode, unsigned* rw, unsigned* rh)
+// The render size a mode asks for, from the display size the game's DLSS
+// actually outputs. NOT from the last optimal-settings call: other callers
+// probe it with unrelated sizes (PBZ: 1000x1000, which produced "584x584").
+void requested_size(unsigned out_w, unsigned out_h, int mode, unsigned* rw, unsigned* rh)
 {
     float scale = na::settings::ScaleForMode(static_cast<DlssMode>(mode));
-    *rw = opt.last_user_w;
-    *rh = opt.last_user_h;
+    *rw = out_w;
+    *rh = out_h;
     if (mode != 0) {
-        *rw = ((static_cast<unsigned>(opt.last_user_w * scale + 0.5f)) + 7u) & ~7u;
-        *rh = ((static_cast<unsigned>(opt.last_user_h * scale + 0.5f)) + 7u) & ~7u;
+        *rw = ((static_cast<unsigned>(out_w * scale + 0.5f)) + 7u) & ~7u;
+        *rh = ((static_cast<unsigned>(out_h * scale + 0.5f)) + 7u) & ~7u;
     }
 }
+bool valid_size(unsigned w, unsigned h) { return w && h && w != 0xFFFFFFFFu && h != 0xFFFFFFFFu; }
 
 enum class Conn { NoDlss, Interrupted, Connected };
 
@@ -136,10 +140,20 @@ void DrawPicture()
     bool follow_game = st.follow_game_resolution.load() != 0;
     int mode = static_cast<int>(st.dlss_mode.load());
     if (mode < 0 || mode >= static_cast<int>(DlssMode::Count)) mode = 0;
+    // Display size: the game's last DLSS creation output (the one-pixel rebuild
+    // nudge is ignored by rounding through the mode's scale). Fall back to the
+    // optimal-callback size only before any creation has been seen.
+    unsigned out_w = valid_size(ngx.last_sr_out_w, ngx.last_sr_out_h) ? ngx.last_sr_out_w : opt.last_user_w;
+    unsigned out_h = valid_size(ngx.last_sr_out_w, ngx.last_sr_out_h) ? ngx.last_sr_out_h : opt.last_user_h;
+    // A game that never asks DLSS which render size to use picks it itself
+    // (PBZ renders 1146x480 for 3440x1440 whatever we answer). Then only the
+    // game's own video settings change the resolution; NeuralAlias controls presets.
+    const bool game_sets_size = valid_size(ngx.last_sr_out_w, ngx.last_sr_out_h) &&
+                                !na::ngx::OptimalQueriedFor(ngx.last_sr_out_w, ngx.last_sr_out_h);
+    if (game_sets_size) follow_game = true;
     unsigned rw = 0, rh = 0;
-    if (opt.last_user_w && opt.last_user_h) requested_size(opt, mode, &rw, &rh);
-    if (follow_game && ngx.last_sr_in_w && ngx.last_sr_in_w != 0xFFFFFFFFu &&
-        ngx.last_sr_in_h && ngx.last_sr_in_h != 0xFFFFFFFFu) {
+    if (valid_size(out_w, out_h)) requested_size(out_w, out_h, mode, &rw, &rh);
+    if (follow_game && valid_size(ngx.last_sr_in_w, ngx.last_sr_in_h)) {
         rw = ngx.last_sr_in_w; rh = ngx.last_sr_in_h;
     }
     Conn conn = connection(ngx);
@@ -161,6 +175,10 @@ void DrawPicture()
         }
     } else if (engine_busy) {
         text = engine_apply.reason;
+    } else if (game_sets_size) {
+        state = 1;
+        snprintf(buf, sizeof(buf), "This game chooses its own render resolution (%ux%u now). Pick Performance, Balanced or Quality in the game's video settings; NeuralAlias sets the DLSS preset.", rw, rh);
+        text = buf;
     } else if (follow_game) {
         state = 1;
         snprintf(buf, sizeof(buf), "Using the game's resolution: %ux%u. Presets can be changed below.", rw, rh);
@@ -190,7 +208,7 @@ void DrawPicture()
     EndRow();
     ImGui::EndDisabled();
 
-    ImGui::BeginDisabled(!enabled || engine_busy);
+    ImGui::BeginDisabled(!enabled || engine_busy || game_sets_size);
     BeginRow("Use game's resolution", "Choose DLAA, Quality or Ultra Performance in the game's video settings. NeuralAlias can still change presets.", SwitchWidth());
     if (Switch("follow_game_resolution", &follow_game)) {
         st.follow_game_resolution.store(follow_game ? 1u : 0u);
@@ -217,7 +235,8 @@ void DrawPicture()
         }
     }
     ImGui::EndDisabled();
-    Hint(follow_game ? "Picture mode follows the game's video settings, including Ultra Performance." : kModeHelp[mode]);
+    Hint(game_sets_size ? "This game sets its render resolution itself, so the picture mode is chosen in the game's video settings." :
+         follow_game ? "Picture mode follows the game's video settings, including Ultra Performance." : kModeHelp[mode]);
 
     // Preset + Apply. (A46: the disabled Sharpness row is gone until a
     // sharpening backend exists; a dead control only invites clicks.)
@@ -252,7 +271,14 @@ void DrawPicture()
         }
         EndRow();
         ImGui::EndDisabled();
-        if (ngx.preset_rejected) {
+        // The NVIDIA app's "DLSS Override - Model presets" replaces whatever preset
+        // the game or NeuralAlias asks for: every choice here would look the same.
+        const auto drv = na::fg::preset::GetUpscalerOverrides();
+        if (rr_upscaler ? drv.RrForced() : drv.SrForced()) {
+            StatusLine(2, rr_upscaler
+                ? "The NVIDIA app is overriding the Ray Reconstruction model for this game, so changing it here has no effect. Turn off DLSS Override (Ray Reconstruction) in the NVIDIA app to use this setting."
+                : "The NVIDIA app is overriding the DLSS model for this game, so J, K, L and M all look the same. Turn off DLSS Override (Super Resolution model presets) in the NVIDIA app to use this setting.");
+        } else if (ngx.preset_rejected) {
             // The runtime refused a preset hint; the detour already reset the
             // setting in memory (A42). Persist it and say so.
             static bool saved = false;
