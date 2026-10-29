@@ -497,3 +497,7 @@ Checked Argon's drop-in against ABI 0.2: the `PIPELINE_CREATED` depth/blend fiel
 ## 2026-10-25 — Astra non-algorithm audit corrections complete
 
 4b65daa on astra/phase3-integration finishes G3-09 lease retirement and unsupported-result handling, with G3-01/G3-08 fixes reverified. Full Release build, CPU/fixture28/28 and targeted5/5 pass locally. Exact handoff in COMMS and docs/ARGON-ASTRA-AUDIT-FIXES.md. Opus retains G3-04/G3-05 extraction ownership. Peer review and Opus's work remain separate; no Gate3 closure or Anno success claimed.
+
+### 2026-10-29 - PBZ pre-FG NR integration handoff
+
+Cort's explicit pre-FG integration and reversible installer request is implemented at c38f7a1 (PR59), tested with real DX12/fake-model integration and Home regressions, and packaged in Documents/NA-PBZ-package-c38f7a1. Launch with Documents/NA-pbz-update.cmd only when PBZ is closed. Astra completed integration, latest Opus shutdown finding, automated evidence and packaging; user retains deployment/game testing. Live quality/flicker/lockup confirmation remains unmeasured, not a passing gate. COMMS/HANDOFF and production docs/PBZ-PRE-FG-NR.md contain receipts. No further broad review cycle or autonomous game action.
