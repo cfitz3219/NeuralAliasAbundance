@@ -504,3 +504,7 @@ Final same-session packageccff874 supersedes3bc305e: includes lateOpus72bf429 se
 
 ### 2026-10-29 - Latest Opus merged55f9a98
 NA-pbz-update.cmd and all companions now package55f9a98, with read-only Unreal probe and warningfixes. Release+4testsPASS1.58s; preflightPASS. Actualgamefc04ba5 unchanged. Repair resetssettings; reselect intended mode afterinstall forstartup experiment. User controlsgame.
+
+### 2026-10-29 - NR read-contract correction 6700116 ready for user test
+Full Release and 21 focused CPU/RTX regressions pass. Corrected mixed-state bug without borrowing another resource's exact state; owned HUD input restored after FG call and retained through GPU completion. Documents/NA-pbz-update.cmd targets package6700116, PS5.1 validation passed, repair-from installed55f9a98. Installation untouched. Repair resets preferences: enable NR after update. Live PBZ quality/flicker not verified; legacy duplicate-FG retry ambiguity remains separate. Details in COMMS and production WORKLOG/docs.
+
