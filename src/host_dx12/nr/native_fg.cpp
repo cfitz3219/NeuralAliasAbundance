@@ -371,6 +371,18 @@ void CoreShutdown(const void* core) {
     contexts.erase(std::remove_if(contexts.begin(),contexts.end(),[&](const auto& c){return c->core==core;}),contexts.end());
     contexts_count.store(static_cast<uint32_t>(contexts.size()));
 }
+void After(const void* core,const void* handle,int32_t result) {
+    if(result==1 || internal)return;
+    Internal guard;
+    std::lock_guard<std::mutex> lock(mutex);
+    for(auto& c:contexts)if(c->core==core && c->handle==handle) {
+        // Keep this image's cached enhancement for a retry/remaining MFG
+        // consumers. Only the next fresh NR evaluation resets history.
+        if(c->feature)c->feature->reset=true;
+        status.active=0;
+        Reason("Native Frame Generation failed; Neural Rendering will reset its history.");
+    }
+}
 Status GetStatus(){
     std::unique_lock<std::mutex> lock(mutex,std::try_to_lock);
     // Contention is not a disabled effect. Return the last complete snapshot
@@ -585,6 +597,7 @@ void PrepareDevice(ID3D12Device*){}
 void MarkSwapchainBuffer(ID3D12Resource*){}
 void Register(const void*,const void*){}
 void CoreShutdown(const void*){}
+void After(const void*,const void*,int32_t){}
 void Reset(ID3D12GraphicsCommandList*){} bool OwnsRoute(){return false;} Status GetStatus(){return {};}
 Submission::Submission(ID3D12CommandQueue*,UINT,ID3D12CommandList* const*){} Submission::~Submission(){}
 }

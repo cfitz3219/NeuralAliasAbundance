@@ -18,6 +18,7 @@ private:
 };
 // Called on the native FG recording thread before its original NGX evaluate.
 void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,const void* parameters,const Runtime& runtime,InputOverride* replacement=nullptr);
+void After(const void* core,const void* handle,int32_t result);
 void Register(const void* core,const void* handle);
 void Release(const void* core,const void* handle);
 void CoreShutdown(const void* core);

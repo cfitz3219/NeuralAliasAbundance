@@ -593,6 +593,7 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
         na::nr::native::Before(list,&s,handle,params,core_runtime(s),&fg_inputs);
         na::nr::trace::Record("fg_begin",nullptr,list);
         const NgxResult result = s.evaluate(cmd_list, handle, params, callback);
+        na::nr::native::After(&s,handle,result);
         na::nr::trace::Record("fg_end",nullptr,list,0,0,result);
         g_evaluates.fetch_add(1, std::memory_order_relaxed);
         g_evaluates_external.fetch_add(1, std::memory_order_release);

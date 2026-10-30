@@ -31,6 +31,7 @@ void STDMETHODCALLTYPE ReentrantForward(ID3D12CommandQueue*,UINT,ID3D12CommandLi
 float delta=.125f;
 bool fail=false;
 bool check_busy_status=false;
+uint32_t last_nr_reset=~0u;
 int core,fg;
 constexpr uint32_t W=8,H=4;
 auto ReadState=D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
@@ -51,6 +52,7 @@ int32_t __cdecl Eval(void* list,const void*,const void* params,void*) {
     }
     if(fail)return static_cast<int32_t>(NVSDK_NGX_Result_Fail);
     auto* p=static_cast<const test::FakeParams*>(params);
+    p->Get("DLSSNR.Reset",&last_nr_reset);
     auto* l=static_cast<ID3D12GraphicsCommandList*>(list);
     ID3D12Resource *in=nullptr,*out=nullptr,*depth=nullptr;
     p->Get("DLSSNR.Color",&in);p->Get("DLSSNR.Output",&out);p->Get("DLSSNR.Depth",&depth);
@@ -276,6 +278,11 @@ int main(){
     REQUIRE(Frame(40,W,DXGI_FORMAT_R32G32B32A32_FLOAT,false,false,true,true)==0);
     REQUIRE(Frame(41,W,DXGI_FORMAT_R32G32B32A32_FLOAT,false,false,false,true)==0);
     REQUIRE(Frame(42)==0); // re-enable at the next real-frame boundary
+    REQUIRE(Frame(43)==0);CHECK(last_nr_reset==0);
+    na::nr::native::After(&core,&fg,static_cast<int32_t>(NVSDK_NGX_Result_Fail));
+    CHECK(!na::nr::native::GetStatus().active);
+    REQUIRE(Frame(44)==0);CHECK(last_nr_reset==1);
+    REQUIRE(Frame(45)==0);CHECK(last_nr_reset==0);
     na::nr::native::Release(&core,nullptr);na::nr::native::Maintain();
     REQUIRE(Frame(0)==0); // zero identity, MFG evaluates NR once
     check_busy_status=true;
