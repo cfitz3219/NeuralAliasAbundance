@@ -137,6 +137,37 @@ Stats GetStats();
 // One status-log line ("sl_boundary ..."), NUL-terminated. Returns length.
 int FormatStatus(char* out, size_t cap);
 
+// ---- native frame generation (DLSS-G) control ----
+// Wraps the game's own slDLSSGSetOptions / slDLSSGGetState (resolved through
+// sl.interposer's slGetFeatureFunction): the game keeps ownership of DLSS-G
+// and presentation; a request only rewrites `mode` / `numFramesToGenerate` in
+// a copy of the game's options (every other field, the struct version and
+// its `next` chain are preserved) on the game's next call. Requests outside
+// what the runtime reports (DLSSGState::numFramesToGenerateMax, dynamic MFG
+// support) are refused, not clamped silently. Our own FG presenter is never
+// involved.
+enum class FgMode : uint32_t { Game = 0, Off = 1, On = 2, Dynamic = 3 };
+struct FgRequest {
+    FgMode mode = FgMode::Game;
+    uint32_t frames = 0; // generated frames per real frame (1 = 2x, 3 = 4x); 0 = keep the game's
+};
+void SetFgRequest(const FgRequest& request);
+
+struct FgState {
+    uint32_t set_hooked = 0, get_hooked = 0;
+    uint64_t set_calls = 0, get_calls = 0;
+    uint32_t game_mode = 0xFFFFFFFFu, game_frames = 0;       // last values the game passed (sl::DLSSGMode)
+    uint32_t sent_mode = 0xFFFFFFFFu, sent_frames = 0;       // what reached Streamline
+    uint32_t max_frames = 0xFFFFFFFFu;                       // DLSSGState::numFramesToGenerateMax (UINT_MAX unknown)
+    int32_t dynamic_supported = -1;                          // DLSSGState::bIsDynamicMFGSupported (-1 unknown)
+    uint32_t status = 0xFFFFFFFFu;                           // DLSSGState::status flags
+    uint32_t presented = 0;                                  // numFramesActuallyPresented at the last state read
+    int32_t last_result = 0;                                 // sl::Result of the last forwarded SetOptions
+    FgRequest request;
+    char reason[160] = "";
+};
+FgState GetFgState();
+
 // ---- test seams (no game, no sl.interposer) ----
 // Runs the same installation against `module` as if it were sl.interposer.dll
 // (RTTI search, tag export hooks). Returns true if anything was hooked.

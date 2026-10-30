@@ -63,6 +63,41 @@ using PfnFactoryCreateCore = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknow
 using PfnFactoryCreateComp = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, const DXGI_SWAP_CHAIN_DESC1*, IDXGIOutput*,
                                                          IDXGISwapChain1**);
 
+using PfnGetFeatureFunction = SlResult(__cdecl*)(uint32_t feature, const char* name, void** function);
+using PfnDlssgSetOptions = SlResult(__cdecl*)(const void* viewport, const void* options);
+using PfnDlssgGetState = SlResult(__cdecl*)(const void* viewport, void* state, const void* options);
+constexpr uint32_t kFeatureDlssG = 1000; // sl::kFeatureDLSS_G
+// sl::DLSSGOptions {FAC5F1CB-2DFD-4F36-A1E6-3A9E865256C5}, sl::DLSSGState {CC8AC8E1-A179-44F5-97FA-E74112F9BC61}
+constexpr uint8_t kDlssgOptionsGuid[16] = {0xcb, 0xf1, 0xc5, 0xfa, 0xfd, 0x2d, 0x36, 0x4f, 0xa1, 0xe6, 0x3a, 0x9e, 0x86, 0x52, 0x56, 0xc5};
+constexpr uint8_t kDlssgStateGuid[16] = {0xe1, 0xc8, 0x8a, 0xcc, 0x79, 0xa1, 0xf5, 0x44, 0x97, 0xfa, 0xe7, 0x41, 0x12, 0xf9, 0xbc, 0x61};
+constexpr size_t kDlssgOptionsCopy = 128; // >= sizeof(sl::DLSSGOptions) v5 (120)
+constexpr uint32_t kSlModeOff = 0, kSlModeOn = 1, kSlModeDynamic = 3;
+
+PfnGetFeatureFunction g_orig_gff = nullptr;
+void* g_gff_export = nullptr;
+PfnDlssgSetOptions g_orig_fg_set = nullptr;
+PfnDlssgGetState g_orig_fg_get = nullptr;
+std::atomic<bool> g_fg_set_requested{false}, g_fg_get_requested{false}, g_fg_lookup_done{false};
+std::atomic<uint32_t> g_fg_set_hooked{0}, g_fg_get_hooked{0};
+std::atomic<uint64_t> g_fg_set_calls{0}, g_fg_get_calls{0};
+std::atomic<uint64_t> g_fg_request{0}; // (mode << 32) | frames
+std::mutex g_fg_m;
+FgState g_fg; // guarded by g_fg_m (counters/hook flags are filled in GetFgState)
+
+void lookup_fg_functions_once(); // defined with the DLSS-G control below
+
+// The hooking core allows one install transaction per process at a time, and
+// other modules (NGX, upscalers) install from their own threads: wait briefly.
+std::mutex g_install_m;
+bool begin_install_retry()
+{
+    for (int i = 0; i < 100; ++i) {
+        if (na::hooking::BeginInstall()) return true;
+        Sleep(10);
+    }
+    return false;
+}
+
 PfnSetTagForFrame g_orig_tag_frame = nullptr;
 PfnSetTag g_orig_tag = nullptr;
 PfnUpgradeInterface g_orig_upgrade = nullptr;
@@ -288,6 +323,7 @@ PresentEvent begin_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI
         e.kind = PresentKind::Real;
         e.real_serial = g_real.fetch_add(1, std::memory_order_acq_rel) + 1;
     }
+    if (e.kind == PresentKind::Real && e.real_serial == 120) lookup_fg_functions_once();
     e.last_tag_sequence = g_tag_seq.load(std::memory_order_acquire);
     e.has_last_frame_token = g_have_frame_token.load(std::memory_order_acquire);
     e.last_frame_token = g_last_frame_token.load(std::memory_order_acquire);
@@ -339,7 +375,8 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT n, UINT
 bool install_proxy_vtable(void* const* vtable, Discovery how)
 {
     if (!vtable || g_present_hooks.load(std::memory_order_acquire)) return false;
-    if (!na::hooking::BeginInstall()) return false;
+    std::lock_guard<std::mutex> install_lock(g_install_m);
+    if (!begin_install_retry()) return false;
     bool ok = na::hooking::PrepareHook(vtable[kSlotPresent], reinterpret_cast<void*>(&DetourPresent),
                                        reinterpret_cast<void**>(&g_orig_present)) &&
               na::hooking::PrepareHook(vtable[kSlotPresent1], reinterpret_cast<void*>(&DetourPresent1),
@@ -440,6 +477,164 @@ void* const* find_proxy_vtable(HMODULE m)
     return nullptr;
 }
 
+// ------------------------------------------------- native DLSS-G control
+void fg_reason(const char* text)
+{
+    std::lock_guard<std::mutex> lock(g_fg_m);
+    strncpy_s(g_fg.reason, text, _TRUNCATE);
+}
+
+void read_fg_state(const void* state)
+{
+    uint8_t b[96] = {};
+    const size_t got = state ? guarded_copy(b, state, sizeof(b)) : 0;
+    if (got < 56 || !abi::HasGuid(b, got, kDlssgStateGuid)) return;
+    const uint64_t version = abi::Read<uint64_t>(b, 24);
+    std::lock_guard<std::mutex> lock(g_fg_m);
+    g_fg.status = abi::Read<uint32_t>(b, 40);
+    g_fg.presented = abi::Read<uint32_t>(b, 48);
+    if (version >= 2) g_fg.max_frames = abi::Read<uint32_t>(b, 52);
+    if (version >= 4 && got >= 81) g_fg.dynamic_supported = b[80] == 1 ? 1 : 0; // sl::Boolean eTrue
+}
+
+SlResult __cdecl DetourDlssgGetState(const void* viewport, void* state, const void* options)
+{
+    g_fg_get_calls.fetch_add(1, std::memory_order_relaxed);
+    const SlResult r = g_orig_fg_get(viewport, state, options);
+    if (r == 0) read_fg_state(state);
+    return r;
+}
+
+// Our own state query (when the game never asks): a zeroed DLSSGState of
+// version 2, the first version that carries numFramesToGenerateMax.
+void query_fg_state(const void* viewport)
+{
+    if (!g_orig_fg_get) return;
+    alignas(8) uint8_t st[96] = {};
+    memcpy(st + 8, kDlssgStateGuid, 16);
+    const uint64_t version = 2;
+    memcpy(st + 24, &version, 8);
+    if (g_orig_fg_get(viewport, st, nullptr) == 0) read_fg_state(st);
+}
+
+SlResult __cdecl DetourDlssgSetOptions(const void* viewport, const void* options)
+{
+    g_fg_set_calls.fetch_add(1, std::memory_order_relaxed);
+    alignas(8) uint8_t copy[kDlssgOptionsCopy] = {};
+    const size_t got = options ? guarded_copy(copy, options, sizeof(copy)) : 0;
+    if (got < 40 || !abi::HasGuid(copy, got, kDlssgOptionsGuid)) {
+        fg_reason("The game's frame generation options were not recognised; passed through unchanged.");
+        return g_orig_fg_set(viewport, options);
+    }
+    const uint32_t game_mode = abi::Read<uint32_t>(copy, 32);
+    const uint32_t game_frames = abi::Read<uint32_t>(copy, 36);
+    const uint64_t packed = g_fg_request.load(std::memory_order_acquire);
+    const auto req_mode = static_cast<FgMode>(packed >> 32);
+    const uint32_t req_frames = static_cast<uint32_t>(packed);
+    {
+        std::lock_guard<std::mutex> lock(g_fg_m);
+        g_fg.game_mode = game_mode;
+        g_fg.game_frames = game_frames;
+    }
+    auto pass = [&](const char* why) {
+        const SlResult r = g_orig_fg_set(viewport, options);
+        std::lock_guard<std::mutex> lock(g_fg_m);
+        g_fg.sent_mode = game_mode;
+        g_fg.sent_frames = game_frames;
+        g_fg.last_result = r;
+        if (why) strncpy_s(g_fg.reason, why, _TRUNCATE);
+        return r;
+    };
+    if (req_mode == FgMode::Game && req_frames == 0) return pass("The game's frame generation settings are in use.");
+    uint32_t max_frames, dynamic;
+    {
+        std::lock_guard<std::mutex> lock(g_fg_m);
+        max_frames = g_fg.max_frames;
+        dynamic = static_cast<uint32_t>(g_fg.dynamic_supported);
+    }
+    if (max_frames == 0xFFFFFFFFu) {
+        query_fg_state(viewport);
+        std::lock_guard<std::mutex> lock(g_fg_m);
+        max_frames = g_fg.max_frames;
+        dynamic = static_cast<uint32_t>(g_fg.dynamic_supported);
+    }
+    uint32_t mode = game_mode;
+    switch (req_mode) {
+    case FgMode::Off: mode = kSlModeOff; break;
+    case FgMode::On: mode = kSlModeOn; break;
+    case FgMode::Dynamic: mode = kSlModeDynamic; break;
+    default: break;
+    }
+    const uint32_t frames = req_frames ? req_frames : game_frames;
+    if (mode == kSlModeDynamic && dynamic != 1u)
+        return pass("Dynamic frame generation is not reported as supported here; the game's setting is kept.");
+    if (mode != kSlModeOff && frames != game_frames) {
+        if (max_frames == 0xFFFFFFFFu) return pass("The runtime has not reported its frame limit yet; the game's setting is kept.");
+        if (frames < 1 || frames > max_frames) return pass("That frame count is above what this system supports; the game's setting is kept.");
+    }
+    memcpy(copy + 32, &mode, 4);
+    memcpy(copy + 36, &frames, 4);
+    const SlResult r = g_orig_fg_set(viewport, copy);
+    std::lock_guard<std::mutex> lock(g_fg_m);
+    g_fg.sent_mode = mode;
+    g_fg.sent_frames = frames;
+    g_fg.last_result = r;
+    strncpy_s(g_fg.reason, r == 0 ? "Frame generation request applied to the game's DLSS-G options." :
+                                    "Streamline refused the frame generation request.", _TRUNCATE);
+    return r;
+}
+
+struct FgInstall { void* target; bool set; };
+
+DWORD WINAPI deferred_fg_install(LPVOID p)
+{
+    auto* job = static_cast<FgInstall*>(p);
+    std::lock_guard<std::mutex> install_lock(g_install_m);
+    if (begin_install_retry()) {
+        bool ok = job->set ? na::hooking::PrepareHook(job->target, reinterpret_cast<void*>(&DetourDlssgSetOptions),
+                                                      reinterpret_cast<void**>(&g_orig_fg_set))
+                           : na::hooking::PrepareHook(job->target, reinterpret_cast<void*>(&DetourDlssgGetState),
+                                                      reinterpret_cast<void**>(&g_orig_fg_get));
+        if (!ok) na::hooking::AbandonInstall();
+        else if (na::hooking::CommitInstall()) (job->set ? g_fg_set_hooked : g_fg_get_hooked).store(1, std::memory_order_release);
+        // A failed commit is rolled back by the hooking core.
+    }
+    delete job;
+    return 0;
+}
+
+void request_fg_install(void* target, bool set)
+{
+    if (!target) return;
+    std::atomic<bool>& flag = set ? g_fg_set_requested : g_fg_get_requested;
+    if (flag.exchange(true, std::memory_order_acq_rel)) return;
+    if (HANDLE t = CreateThread(nullptr, 0, &deferred_fg_install, new FgInstall{target, set}, 0, nullptr)) CloseHandle(t);
+}
+
+SlResult __cdecl DetourGetFeatureFunction(uint32_t feature, const char* name, void** function)
+{
+    const SlResult r = g_orig_gff(feature, name, function);
+    if (r == 0 && feature == kFeatureDlssG && name && function && *function) {
+        if (strcmp(name, "slDLSSGSetOptions") == 0) request_fg_install(*function, true);
+        else if (strcmp(name, "slDLSSGGetState") == 0) request_fg_install(*function, false);
+    }
+    return r;
+}
+
+// The game may have resolved the DLSS-G functions before our hooks went in:
+// look them up once ourselves (a lookup only; the device is set by then).
+void lookup_fg_functions_once()
+{
+    if (!g_gff_export || g_fg_lookup_done.exchange(true, std::memory_order_acq_rel)) return;
+    auto gff = reinterpret_cast<PfnGetFeatureFunction>(g_gff_export);
+    void* fn = nullptr;
+    if (!g_fg_set_requested.load(std::memory_order_acquire) && gff(kFeatureDlssG, "slDLSSGSetOptions", &fn) == 0 && fn)
+        request_fg_install(fn, true);
+    fn = nullptr;
+    if (!g_fg_get_requested.load(std::memory_order_acquire) && gff(kFeatureDlssG, "slDLSSGGetState", &fn) == 0 && fn)
+        request_fg_install(fn, false);
+}
+
 // --------------------------------------------- fallback discovery (no RTTI)
 struct DeferredVtable { void* const* vtable; Discovery how; };
 
@@ -501,7 +696,8 @@ HRESULT STDMETHODCALLTYPE DetourFactoryCreateComp(IDXGIFactory2* f, IUnknown* de
 DWORD WINAPI deferred_factory_install(LPVOID p)
 {
     void* const* vt = static_cast<void* const*>(p);
-    if (!na::hooking::BeginInstall()) return 0;
+    std::lock_guard<std::mutex> install_lock(g_install_m);
+    if (!begin_install_retry()) return 0;
     na::hooking::PrepareHook(vt[kSlotCreateSwapChain], reinterpret_cast<void*>(&DetourFactoryCreate), reinterpret_cast<void**>(&g_orig_fc));
     na::hooking::PrepareHook(vt[kSlotCreateSwapChainForHwnd], reinterpret_cast<void*>(&DetourFactoryCreateHwnd), reinterpret_cast<void**>(&g_orig_fc_hwnd));
     na::hooking::PrepareHook(vt[kSlotCreateSwapChainForCoreWindow], reinterpret_cast<void*>(&DetourFactoryCreateCore), reinterpret_cast<void**>(&g_orig_fc_core));
@@ -567,20 +763,33 @@ bool install_for_module(HMODULE m)
     // Tag exports.
     auto* tag_frame = reinterpret_cast<void*>(GetProcAddress(m, "slSetTagForFrame"));
     auto* tag = reinterpret_cast<void*>(GetProcAddress(m, "slSetTag"));
-    if (na::hooking::BeginInstall()) {
+    auto* gff = reinterpret_cast<void*>(GetProcAddress(m, "slGetFeatureFunction"));
+    std::unique_lock<std::mutex> install_lock(g_install_m);
+    if (begin_install_retry()) {
         uint32_t n = 0;
+        if (gff && na::hooking::PrepareHook(gff, reinterpret_cast<void*>(&DetourGetFeatureFunction),
+                                            reinterpret_cast<void**>(&g_orig_gff)))
+            g_gff_export = gff;
         if (tag_frame && na::hooking::PrepareHook(tag_frame, reinterpret_cast<void*>(&DetourSetTagForFrame),
                                                   reinterpret_cast<void**>(&g_orig_tag_frame))) ++n;
         if (tag && na::hooking::PrepareHook(tag, reinterpret_cast<void*>(&DetourSetTag), reinterpret_cast<void**>(&g_orig_tag))) ++n;
         if (na::hooking::CommitInstall()) {
             g_tag_hooks.store(n, std::memory_order_release);
-            any = n != 0;
+            any = n != 0 || g_gff_export != nullptr;
+        } else {
+            g_gff_export = nullptr;
         }
     }
+    install_lock.unlock(); // install_proxy_vtable takes it again
     // Proxy swap chain: RTTI first (every creation path shares this vtable).
     if (void* const* vt = find_proxy_vtable(m)) {
         any = install_proxy_vtable(vt, Discovery::Rtti) || any;
-    } else if (na::hooking::BeginInstall()) {
+    } else {
+        install_lock.lock();
+        if (!begin_install_retry()) {
+            set_reason("Could not install the Streamline fallback hooks.");
+            return any;
+        }
         // Fallback: inspect what Streamline hands out.
         auto* up = reinterpret_cast<void*>(GetProcAddress(m, "slUpgradeInterface"));
         auto* cf = reinterpret_cast<void*>(GetProcAddress(m, "CreateDXGIFactory"));
@@ -609,7 +818,7 @@ void write_log()
     if (!g_log_path[0]) return;
     FILE* f = nullptr;
     if (_wfopen_s(&f, g_log_path, L"w") != 0 || !f) return;
-    char line[640];
+    char line[1024];
     FormatStatus(line, sizeof(line));
     std::fprintf(f, "%s\n", line);
     std::lock_guard<std::mutex> lock(g_m);
@@ -693,7 +902,37 @@ int FormatStatus(char* out, size_t cap)
         static_cast<unsigned long long>(s.stream_epoch), s.proxies_seen,
         abi::LifecycleName(s.hudless_lifecycle), s.hudless_state, abi::LifecycleName(s.depth_lifecycle),
         abi::LifecycleName(s.motion_lifecycle), s.backbuffer_tagged, s.ui_tagged, s.reason);
-    return n < 0 ? static_cast<int>(strlen(out)) : n;
+    const int used = n < 0 ? static_cast<int>(strlen(out)) : n;
+    const FgState fg = GetFgState();
+    const int m = _snprintf_s(out + used, cap - static_cast<size_t>(used), _TRUNCATE,
+        " | dlssg set_hook=%u get_hook=%u set_calls=%llu get_calls=%llu game=%u/%u sent=%u/%u max=%d dynamic=%d status=0x%x request=%u/%u result=%d \"%s\"",
+        fg.set_hooked, fg.get_hooked, static_cast<unsigned long long>(fg.set_calls), static_cast<unsigned long long>(fg.get_calls),
+        fg.game_mode, fg.game_frames, fg.sent_mode, fg.sent_frames,
+        fg.max_frames == 0xFFFFFFFFu ? -1 : static_cast<int>(fg.max_frames), fg.dynamic_supported, fg.status,
+        static_cast<uint32_t>(fg.request.mode), fg.request.frames, fg.last_result, fg.reason);
+    return m < 0 ? static_cast<int>(strlen(out)) : used + m;
+}
+
+void SetFgRequest(const FgRequest& request)
+{
+    const uint64_t packed = (uint64_t(static_cast<uint32_t>(request.mode)) << 32) | request.frames;
+    g_fg_request.store(packed, std::memory_order_release);
+    std::lock_guard<std::mutex> lock(g_fg_m);
+    g_fg.request = request;
+}
+
+FgState GetFgState()
+{
+    FgState out;
+    {
+        std::lock_guard<std::mutex> lock(g_fg_m);
+        out = g_fg;
+    }
+    out.set_hooked = g_fg_set_hooked.load(std::memory_order_acquire);
+    out.get_hooked = g_fg_get_hooked.load(std::memory_order_acquire);
+    out.set_calls = g_fg_set_calls.load(std::memory_order_relaxed);
+    out.get_calls = g_fg_get_calls.load(std::memory_order_relaxed);
+    return out;
 }
 
 bool InstallForModuleForTests(void* module) { return install_for_module(static_cast<HMODULE>(module)); }

@@ -9,6 +9,10 @@
 //      frame token, viewport, command buffer) and reported BEFORE the original,
 //      which still runs once with the game's own arguments;
 //   3. an unrecognised tag layout is reported undecoded and still forwarded;
+//   5. native DLSS-G control: slGetFeatureFunction lookups get the game's
+//      slDLSSGSetOptions/GetState hooked; a request rewrites only mode/count in
+//      a copy (all other fields kept); out-of-range or unsupported requests
+//      pass the game's own options through untouched.
 //   4. Present: Real advances the serial, TEST makes no callback, a
 //      WAS_STILL_DRAWING result makes the next Present a Retry of the same
 //      serial, a new proxy and a successful ResizeBuffers advance the epoch,
@@ -56,6 +60,45 @@ extern "C" __declspec(dllexport) __declspec(noinline) int32_t slSetTag(const voi
     g_orig_seen_n = n;
     g_sink = g_sink + 5;
     return 0;
+}
+
+// ---- the "Streamline" DLSS-G plugin functions ----
+namespace {
+const void* g_fg_seen_options = nullptr;
+uint8_t g_fg_seen_bytes[128] = {};
+int g_fg_set_calls = 0, g_fg_get_calls = 0;
+uint32_t g_fg_max = 5;
+uint8_t g_fg_dynamic = 0;
+}
+extern "C" __declspec(noinline) int32_t fake_dlssg_set_options(const void*, const void* options)
+{
+    ++g_fg_set_calls;
+    g_fg_seen_options = options;
+    std::memcpy(g_fg_seen_bytes, options, sizeof(g_fg_seen_bytes));
+    g_sink = g_sink + 17;
+    return 0;
+}
+extern "C" __declspec(noinline) int32_t fake_dlssg_get_state(const void*, void* state, const void*)
+{
+    ++g_fg_get_calls;
+    auto* b = static_cast<uint8_t*>(state);
+    uint64_t version = 0;
+    std::memcpy(&version, b + 24, 8);
+    const uint32_t status = 0, presented = 2;
+    std::memcpy(b + 40, &status, 4);
+    std::memcpy(b + 48, &presented, 4);
+    if (version >= 2) std::memcpy(b + 52, &g_fg_max, 4);
+    if (version >= 4) b[80] = g_fg_dynamic;
+    g_sink = g_sink + 19;
+    return 0;
+}
+extern "C" __declspec(dllexport) __declspec(noinline) int32_t slGetFeatureFunction(uint32_t feature, const char* name, void** fn)
+{
+    g_sink = g_sink + 23;
+    if (feature != 1000 || !name || !fn) return 1;
+    if (std::strcmp(name, "slDLSSGSetOptions") == 0) { *fn = reinterpret_cast<void*>(&fake_dlssg_set_options); return 0; }
+    if (std::strcmp(name, "slDLSSGGetState") == 0) { *fn = reinterpret_cast<void*>(&fake_dlssg_get_state); return 0; }
+    return 1;
 }
 
 // ---- the "Streamline" swap-chain proxy: same RTTI name and slot order ----
@@ -309,7 +352,69 @@ int main()
     s = na::slb::GetStats();
     CHECK(s.presents_real == 5 && s.presents_retry == 1 && s.proxies_seen == 2);
 
-    char line[512];
+    // ---- 5. native DLSS-G control ----
+    {
+        using GffFn = int32_t(__cdecl*)(uint32_t, const char*, void**);
+        using SetFn = int32_t(__cdecl*)(const void*, const void*);
+        auto gff = reinterpret_cast<GffFn>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(nullptr), "slGetFeatureFunction")));
+        REQUIRE(gff);
+        void* set_fn = nullptr;
+        void* get_fn = nullptr;
+        CHECK(gff(1000, "slDLSSGSetOptions", &set_fn) == 0 && set_fn == reinterpret_cast<void*>(&fake_dlssg_set_options));
+        CHECK(gff(1000, "slDLSSGGetState", &get_fn) == 0 && get_fn);
+        for (int i = 0; i < 200 && !(na::slb::GetFgState().set_hooked && na::slb::GetFgState().get_hooked); ++i) Sleep(10);
+        REQUIRE(na::slb::GetFgState().set_hooked == 1 && na::slb::GetFgState().get_hooked == 1);
+        auto set = reinterpret_cast<SetFn>(set_fn);
+        // The game's options: v5 struct, mode eOn, 1 frame, colour size 3440x1440, a chained `next`.
+        alignas(8) uint8_t opts[120] = {};
+        const uint8_t guid[16] = {0xcb, 0xf1, 0xc5, 0xfa, 0xfd, 0x2d, 0x36, 0x4f, 0xa1, 0xe6, 0x3a, 0x9e, 0x86, 0x52, 0x56, 0xc5};
+        const uint64_t next = 0xABCDEF00, version = 5;
+        const uint32_t on = 1, one = 1, cw = 3440, ch = 1440;
+        std::memcpy(opts, &next, 8);
+        std::memcpy(opts + 8, guid, 16);
+        std::memcpy(opts + 24, &version, 8);
+        std::memcpy(opts + 32, &on, 4);
+        std::memcpy(opts + 36, &one, 4);
+        std::memcpy(opts + 64, &cw, 4);
+        std::memcpy(opts + 68, &ch, 4);
+        FakeViewport vp(7);
+        // Game request: the game's own pointer goes through.
+        CHECK(set(&vp, opts) == 0);
+        CHECK(g_fg_seen_options == opts);
+        // 4x (3 generated): a copy with only the count changed.
+        na::slb::SetFgRequest({na::slb::FgMode::On, 3});
+        CHECK(set(&vp, opts) == 0);
+        CHECK(g_fg_seen_options != opts);
+        uint32_t mode = 0, frames = 0, w = 0;
+        uint64_t seen_next = 0;
+        std::memcpy(&mode, g_fg_seen_bytes + 32, 4);
+        std::memcpy(&frames, g_fg_seen_bytes + 36, 4);
+        std::memcpy(&w, g_fg_seen_bytes + 64, 4);
+        std::memcpy(&seen_next, g_fg_seen_bytes, 8);
+        CHECK(mode == 1 && frames == 3 && w == 3440 && seen_next == next);
+        CHECK(std::memcmp(g_fg_seen_bytes + 8, guid, 16) == 0);
+        uint32_t game_frames = 0;
+        std::memcpy(&game_frames, opts + 36, 4);
+        CHECK(game_frames == 1); // the game's own struct is untouched
+        na::slb::FgState fg = na::slb::GetFgState();
+        CHECK(fg.max_frames == 5 && fg.sent_frames == 3 && fg.game_frames == 1);
+        // Above the runtime's maximum: refused, game's options pass through.
+        na::slb::SetFgRequest({na::slb::FgMode::On, 9});
+        CHECK(set(&vp, opts) == 0);
+        CHECK(g_fg_seen_options == opts);
+        // Dynamic when the runtime did not report support: refused.
+        na::slb::SetFgRequest({na::slb::FgMode::Dynamic, 0});
+        CHECK(set(&vp, opts) == 0);
+        CHECK(g_fg_seen_options == opts);
+        // Off: mode rewritten, count kept.
+        na::slb::SetFgRequest({na::slb::FgMode::Off, 0});
+        CHECK(set(&vp, opts) == 0);
+        std::memcpy(&mode, g_fg_seen_bytes + 32, 4);
+        CHECK(g_fg_seen_options != opts && mode == 0);
+        na::slb::SetFgRequest({});
+    }
+
+    char line[1024];
     CHECK(na::slb::FormatStatus(line, sizeof(line)) > 0);
     std::printf("%s\n", line);
     CHECK(std::strstr(line, "discovery=rtti") != nullptr);
