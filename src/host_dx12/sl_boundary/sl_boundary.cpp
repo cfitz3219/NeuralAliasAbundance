@@ -25,6 +25,7 @@ namespace na::slb {
 namespace {
 
 // IDXGISwapChain vtable slots (single inheritance chain up to IDXGISwapChain4).
+constexpr uint32_t kSlotRelease = 2;
 constexpr uint32_t kSlotPresent = 8;
 constexpr uint32_t kSlotResizeBuffers = 13;
 constexpr uint32_t kSlotPresent1 = 22;
@@ -49,6 +50,8 @@ using SlResult = int32_t;
 using PfnSetTagForFrame = SlResult(__cdecl*)(const void* frame, const void* viewport, const void* tags, uint32_t n, void* cmd);
 using PfnSetTag = SlResult(__cdecl*)(const void* viewport, const void* tags, uint32_t n, void* cmd);
 using PfnUpgradeInterface = SlResult(__cdecl*)(void** base);
+using PfnSetConstants = SlResult(__cdecl*)(const void* constants, const void* frame, const void* viewport);
+using PfnRelease = ULONG(STDMETHODCALLTYPE*)(IUnknown*);
 using PfnCreateFactory = HRESULT(WINAPI*)(REFIID, void**);
 using PfnCreateFactory2 = HRESULT(WINAPI*)(UINT, REFIID, void**);
 using PfnPresent = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
@@ -101,6 +104,8 @@ bool begin_install_retry()
 PfnSetTagForFrame g_orig_tag_frame = nullptr;
 PfnSetTag g_orig_tag = nullptr;
 PfnUpgradeInterface g_orig_upgrade = nullptr;
+PfnSetConstants g_orig_constants = nullptr;
+PfnRelease g_orig_release = nullptr;
 PfnCreateFactory g_orig_cf = nullptr, g_orig_cf1 = nullptr;
 PfnCreateFactory2 g_orig_cf2 = nullptr;
 PfnPresent g_orig_present = nullptr;
@@ -112,22 +117,81 @@ PfnFactoryCreateHwnd g_orig_fc_hwnd = nullptr;
 PfnFactoryCreateCore g_orig_fc_core = nullptr;
 PfnFactoryCreateComp g_orig_fc_comp = nullptr;
 
-std::atomic<const Callbacks*> g_callbacks{nullptr};
+// ------------------------------------------------------- callback subscription
+// One retained subscription per call. Subscriptions are never freed (a few
+// bytes per SetCallbacks); what SetCallbacks guarantees is that no callback
+// into an old set starts after it returns and none is still running.
+struct Subscription {
+    Callbacks cb;
+    std::atomic<int32_t> inflight{0};
+};
+std::atomic<Subscription*> g_sub{nullptr};
+std::mutex g_sub_m;                 // serializes SetCallbacks
+thread_local int t_callback_depth = 0;
+
+Subscription* acquire_sub()
+{
+    for (;;) {
+        Subscription* s = g_sub.load(std::memory_order_seq_cst);
+        if (!s) return nullptr;
+        s->inflight.fetch_add(1, std::memory_order_seq_cst);
+        if (g_sub.load(std::memory_order_seq_cst) == s) return s;
+        s->inflight.fetch_sub(1, std::memory_order_seq_cst); // replaced meanwhile: never call into it
+    }
+}
+void release_sub(Subscription* s)
+{
+    if (s) s->inflight.fetch_sub(1, std::memory_order_seq_cst);
+}
+struct CallbackScope { CallbackScope() { ++t_callback_depth; } ~CallbackScope() { --t_callback_depth; } };
+
 std::atomic<uintptr_t> g_module_lo{0}, g_module_hi{0};
 
 std::atomic<uint32_t> g_module_seen{0}, g_tag_hooks{0}, g_present_hooks{0}, g_discovery{0}, g_proxies{0};
 std::atomic<uint64_t> g_tag_calls{0}, g_tag_undecoded{0}, g_tags_seen{0}, g_tag_seq{0};
-std::atomic<uint64_t> g_real{0}, g_retry{0}, g_test{0}, g_epoch{0};
-std::atomic<bool> g_retry_pending{false};
+std::atomic<uint64_t> g_real{0}, g_retry{0}, g_test{0};
+std::atomic<uint64_t> g_const_calls{0}, g_const_decoded{0}, g_const_valid{0}, g_const_seq{0};
+std::atomic<uint64_t> g_assoc_unique{0}, g_assoc_ambiguous{0}, g_assoc_none{0};
+std::atomic<uint64_t> g_present_events{0}; // real presents across all proxies (association provenance)
+uint64_t g_last_present_tag_seq = 0;        // tag sequence at the newest real Present of any proxy (g_m)
 std::atomic<bool> g_proxy_install_requested{false}, g_factory_install_requested{false};
-std::atomic<uint32_t> g_last_frame_token{0};
-std::atomic<bool> g_have_frame_token{false};
 
-std::mutex g_m; // proxy identity cache + last-tag summary + reason
-IDXGISwapChain* g_last_proxy = nullptr;
-IDXGISwapChain* g_last_base = nullptr;
+std::mutex g_m; // proxies, tag window, constants ring, last-tag summary, reason
+
+// Per-proxy stream state (keyed by the proxy object; removed when SL releases it).
+struct ProxyState {
+    IDXGISwapChain* proxy = nullptr;
+    IDXGISwapChain* base = nullptr;
+    uint32_t id = 0;
+    uint64_t epoch = 0, serial = 0;
+    bool retry_pending = false;
+    uint64_t last_tag_seq = 0;       // tag sequence at this proxy's previous real Present
+    uint64_t last_present_event = 0; // g_present_events value after its previous real Present
+};
+constexpr uint32_t kMaxProxies = 8;
+ProxyState g_proxy_state[kMaxProxies];
+uint32_t g_next_proxy_id = 0;
+
+ProxyState* find_proxy_locked(IDXGISwapChain* p)
+{
+    for (ProxyState& st : g_proxy_state)
+        if (st.proxy == p) return &st;
+    return nullptr;
+}
+
+// Accepted tag calls (original returned 0), newest last, for association.
+struct TagWindowEntry { uint64_t sequence; bool has_viewport, has_frame; uint32_t viewport, frame_token; };
+constexpr uint32_t kTagWindow = 64;
+TagWindowEntry g_tag_window[kTagWindow] = {};
+uint32_t g_tag_window_count = 0; // total pushed (ring index = count % kTagWindow)
+
+// Accepted constants per (frame token, viewport), newest overwrite oldest.
+constexpr uint32_t kConstRing = 16;
+ConstantsRecord g_const_ring[kConstRing];
+uint32_t g_const_count = 0;
+
 uint32_t g_hud_life = 0xFFFFFFFFu, g_hud_state = 0xFFFFFFFFu, g_depth_life = 0xFFFFFFFFu, g_motion_life = 0xFFFFFFFFu;
-uint32_t g_bb_tagged = 0, g_ui_tagged = 0;
+uint32_t g_bb_tagged = 0, g_ui_tagged = 0, g_ui_alpha_tagged = 0;
 char g_reason[96] = "Streamline not loaded.";
 // Distinct tag shapes seen (evidence for sl_boundary.log): which buffers the
 // game tags, with which lifecycle/state/format/size, on which call.
@@ -193,13 +257,11 @@ bool in_module(const void* p)
 }
 
 // ------------------------------------------------------------------- tag calls
-void decode_and_report(bool for_frame, const void* frame, const void* viewport, const void* tags, uint32_t n, void* cmd)
+void decode_tags(bool for_frame, const void* frame, const void* viewport, const void* tags, uint32_t n, void* cmd,
+                 TagEvent& e, Tag* decoded)
 {
     g_tag_calls.fetch_add(1, std::memory_order_relaxed);
-    Tag decoded[kMaxTagsPerCall];
-    TagEvent e;
     e.sequence = g_tag_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
-    e.stream_epoch = g_epoch.load(std::memory_order_acquire);
     e.for_frame = for_frame;
     e.has_frame = for_frame && frame_token_value(frame, &e.frame_token);
     e.has_viewport = viewport_value(viewport, &e.viewport);
@@ -237,68 +299,186 @@ void decode_and_report(bool for_frame, const void* frame, const void* viewport, 
     e.decoded = ok;
     e.count = ok ? count : 0;
     if (!ok) g_tag_undecoded.fetch_add(1, std::memory_order_relaxed);
-    else {
-        g_tags_seen.fetch_add(e.count, std::memory_order_relaxed);
-        if (e.has_frame) {
-            g_last_frame_token.store(e.frame_token, std::memory_order_release);
-            g_have_frame_token.store(true, std::memory_order_release);
-        }
-        std::lock_guard<std::mutex> lock(g_m);
-        for (uint32_t i = 0; i < e.count; ++i) {
-            const Tag& d = decoded[i];
-            const bool present = d.resource != nullptr;
-            if (present) note_shape_locked(d, cmd != nullptr, for_frame);
-            switch (d.buffer_type) {
-            case abi::kBufferHudlessColor:
-                if (present) { g_hud_life = d.lifecycle; g_hud_state = d.state; }
-                break;
-            case abi::kBufferDepth: if (present) g_depth_life = d.lifecycle; break;
-            case abi::kBufferMotionVectors: if (present) g_motion_life = d.lifecycle; break;
-            case abi::kBufferBackbuffer: g_bb_tagged = present ? 1u : 0u; break;
-            case abi::kBufferUiColorAndAlpha: g_ui_tagged = present ? 1u : 0u; break;
-            default: break;
-            }
+}
+
+// After the original: an accepted call joins the association window and the summary.
+void note_accepted_tags(const TagEvent& e, int32_t result)
+{
+    if (result != 0) return; // rejected by Streamline: never associated
+    std::lock_guard<std::mutex> lock(g_m);
+    // An accepted call we could not decode still joins the window, as unknown
+    // (it makes the association ambiguous instead of silently missing).
+    g_tag_window[g_tag_window_count % kTagWindow] = {e.sequence, e.decoded && e.has_viewport, e.decoded && e.has_frame, e.viewport, e.frame_token};
+    ++g_tag_window_count;
+    if (!e.decoded) return;
+    g_tags_seen.fetch_add(e.count, std::memory_order_relaxed);
+    for (uint32_t i = 0; i < e.count; ++i) {
+        const Tag& d = e.tags[i];
+        const bool present = d.resource != nullptr;
+        if (present) note_shape_locked(d, e.command_list != nullptr, e.for_frame);
+        switch (d.buffer_type) {
+        case abi::kBufferHudlessColor:
+            if (present) { g_hud_life = d.lifecycle; g_hud_state = d.state; }
+            break;
+        case abi::kBufferDepth: if (present) g_depth_life = d.lifecycle; break;
+        case abi::kBufferMotionVectors: if (present) g_motion_life = d.lifecycle; break;
+        case abi::kBufferBackbuffer: g_bb_tagged = present ? 1u : 0u; break;
+        case abi::kBufferUiColorAndAlpha: g_ui_tagged = present ? 1u : 0u; break;
+        case abi::kBufferUiAlpha: g_ui_alpha_tagged = present ? 1u : 0u; break;
+        default: break;
         }
     }
-    if (const Callbacks* cb = g_callbacks.load(std::memory_order_acquire); cb && cb->on_tag) cb->on_tag(e, cb->user);
+}
+
+template <class Forward>
+SlResult tag_call(bool for_frame, const void* frame, const void* viewport, const void* tags, uint32_t n, void* cmd, Forward forward)
+{
+    Tag decoded[kMaxTagsPerCall];
+    TagEvent e;
+    decode_tags(for_frame, frame, viewport, tags, n, cmd, e, decoded);
+    Subscription* sub = acquire_sub();
+    if (sub && sub->cb.on_tag) { CallbackScope scope; sub->cb.on_tag(e, sub->cb.user); }
+    const SlResult r = forward();
+    note_accepted_tags(e, r);
+    if (sub && sub->cb.after_tag) { CallbackScope scope; sub->cb.after_tag(e, r, sub->cb.user); }
+    release_sub(sub);
+    return r;
 }
 
 SlResult __cdecl DetourSetTagForFrame(const void* frame, const void* viewport, const void* tags, uint32_t n, void* cmd)
 {
-    decode_and_report(true, frame, viewport, tags, n, cmd);
-    return g_orig_tag_frame(frame, viewport, tags, n, cmd);
+    return tag_call(true, frame, viewport, tags, n, cmd, [&] { return g_orig_tag_frame(frame, viewport, tags, n, cmd); });
 }
 
 SlResult __cdecl DetourSetTag(const void* viewport, const void* tags, uint32_t n, void* cmd)
 {
-    decode_and_report(false, nullptr, viewport, tags, n, cmd);
-    return g_orig_tag(viewport, tags, n, cmd);
+    return tag_call(false, nullptr, viewport, tags, n, cmd, [&] { return g_orig_tag(viewport, tags, n, cmd); });
+}
+
+// --------------------------------------------------------------- constants
+SlResult __cdecl DetourSetConstants(const void* constants, const void* frame, const void* viewport)
+{
+    g_const_calls.fetch_add(1, std::memory_order_relaxed);
+    Subscription* sub = acquire_sub();
+    const SlResult r = g_orig_constants(constants, frame, viewport);
+    ConstantsRecord rec;
+    rec.result = r;
+    rec.thread_id = GetCurrentThreadId();
+    uint8_t buf[na::sl::kV2ConstantsSize] = {};
+    const size_t got = constants ? guarded_copy(buf, constants, sizeof(buf)) : 0;
+    const bool decoded = got == sizeof(buf) && na::sl::HasType(buf, got, na::sl::kConstantsGuid) &&
+                         na::sl::DecodeConstants(buf, got, rec.camera) == na::sl::Layout::V2 &&
+                         frame_token_value(frame, &rec.frame_token) && viewport_value(viewport, &rec.viewport);
+    if (decoded) {
+        g_const_decoded.fetch_add(1, std::memory_order_relaxed);
+        rec.sequence = g_const_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
+        rec.camera_valid = na::fg::ValidCamera(rec.camera);
+        if (rec.camera_valid) g_const_valid.fetch_add(1, std::memory_order_relaxed);
+        if (r == 0) {
+            std::lock_guard<std::mutex> lock(g_m);
+            g_const_ring[g_const_count % kConstRing] = rec;
+            ++g_const_count;
+        }
+        if (sub && sub->cb.on_constants) { CallbackScope scope; sub->cb.on_constants(rec, sub->cb.user); }
+    }
+    release_sub(sub);
+    return r;
 }
 
 // ------------------------------------------------------------- proxy presents
-IDXGISwapChain* base_for(IDXGISwapChain* proxy)
+// Per-proxy state for a Present (registers a newly seen proxy: epoch 1).
+void present_state(IDXGISwapChain* sc, PresentEvent& e)
 {
+    IDXGISwapChain* base = nullptr;
+    bool fresh = false;
     {
         std::lock_guard<std::mutex> lock(g_m);
-        if (proxy == g_last_proxy) return g_last_base;
+        fresh = find_proxy_locked(sc) == nullptr;
     }
-    // A proxy never seen before: a new stream incarnation.
-    IDXGISwapChain* base = nullptr;
-    void* raw = nullptr;
-    if (SUCCEEDED(proxy->QueryInterface(kSlRetrieveBaseIid, &raw)) && raw) {
-        base = static_cast<IDXGISwapChain*>(raw);
-        base->Release(); // borrowed: the proxy keeps its base alive
+    if (fresh) {
+        void* raw = nullptr;
+        if (SUCCEEDED(sc->QueryInterface(kSlRetrieveBaseIid, &raw)) && raw) {
+            base = static_cast<IDXGISwapChain*>(raw);
+            base->Release(); // borrowed: the proxy keeps its base alive
+        }
     }
-    g_proxies.fetch_add(1, std::memory_order_relaxed);
-    g_epoch.fetch_add(1, std::memory_order_acq_rel);
     std::lock_guard<std::mutex> lock(g_m);
-    g_last_proxy = proxy;
-    g_last_base = base;
-    return base;
+    ProxyState* st = find_proxy_locked(sc);
+    if (!st) {
+        st = find_proxy_locked(nullptr);
+        if (!st) st = &g_proxy_state[0]; // more than kMaxProxies live chains: reuse (reported as a new stream)
+        *st = ProxyState{};
+        st->proxy = sc;
+        st->base = base;
+        st->id = ++g_next_proxy_id;
+        st->epoch = 1;
+        // A new chain's first window starts after the newest real Present of any
+        // chain (from the start if none), so its first frame's tags count.
+        st->last_tag_seq = g_last_present_tag_seq;
+        st->last_present_event = g_present_events.load(std::memory_order_acquire);
+        g_proxies.fetch_add(1, std::memory_order_relaxed);
+    }
+    e.proxy_id = st->id;
+    e.base = st->base;
+    e.stream_epoch = st->epoch;
+    if (st->retry_pending) {
+        e.kind = PresentKind::Retry;
+        e.real_serial = st->serial;
+        g_retry.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    e.kind = PresentKind::Real;
+    e.real_serial = ++st->serial;
+    g_real.fetch_add(1, std::memory_order_relaxed);
+    // Association: accepted tag calls since this proxy's previous real Present.
+    const uint64_t newest = g_tag_seq.load(std::memory_order_acquire);
+    e.tags_after_sequence = st->last_tag_seq;
+    e.last_tag_sequence = newest;
+    const uint64_t events_now = g_present_events.fetch_add(1, std::memory_order_acq_rel);
+    const bool other_presented = events_now != st->last_present_event;
+    st->last_present_event = events_now + 1;
+    st->last_tag_seq = newest;
+    g_last_present_tag_seq = newest;
+    uint32_t matched = 0;
+    bool consistent = true;
+    const uint32_t available = g_tag_window_count < kTagWindow ? g_tag_window_count : kTagWindow;
+    for (uint32_t i = 0; i < available; ++i) {
+        const TagWindowEntry& t = g_tag_window[(g_tag_window_count - 1 - i) % kTagWindow];
+        if (t.sequence <= e.tags_after_sequence) break;
+        if (!t.has_viewport || !t.has_frame) { consistent = false; ++matched; continue; }
+        if (matched == 0) { e.viewport = t.viewport; e.frame_token = t.frame_token; }
+        else if (t.viewport != e.viewport || t.frame_token != e.frame_token) consistent = false;
+        ++matched;
+    }
+    if (newest - e.tags_after_sequence > kTagWindow) consistent = false; // more calls than the window retains
+    if (matched == 0) {
+        e.association = Association::None;
+        g_assoc_none.fetch_add(1, std::memory_order_relaxed);
+    } else if (consistent && !other_presented) {
+        e.association = Association::Unique;
+        g_assoc_unique.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        e.association = Association::Ambiguous;
+        e.viewport = e.frame_token = 0;
+        g_assoc_ambiguous.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
-PresentEvent begin_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* pp, bool present1)
+void note_present_result(IDXGISwapChain* sc, HRESULT hr)
 {
+    // DXGI_PRESENT_DO_NOT_WAIT + WAS_STILL_DRAWING: nothing was queued; this
+    // chain presents the same frame again, which must not advance its serial.
+    std::lock_guard<std::mutex> lock(g_m);
+    if (ProxyState* st = find_proxy_locked(sc)) st->retry_pending = hr == DXGI_ERROR_WAS_STILL_DRAWING;
+}
+
+template <class Forward>
+HRESULT present_call(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* pp, bool present1, Forward forward)
+{
+    if (flags & DXGI_PRESENT_TEST) {
+        g_test.fetch_add(1, std::memory_order_relaxed);
+        return forward();
+    }
     PresentEvent e;
     e.present1 = present1;
     e.game_facing = sc;
@@ -306,60 +486,40 @@ PresentEvent begin_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI
     e.flags = flags;
     e.params = pp;
     e.thread_id = GetCurrentThreadId();
-    if (flags & DXGI_PRESENT_TEST) {
-        e.kind = PresentKind::Test;
-        g_test.fetch_add(1, std::memory_order_relaxed);
-        e.real_serial = g_real.load(std::memory_order_acquire);
-        e.stream_epoch = g_epoch.load(std::memory_order_acquire);
-        return e;
-    }
-    e.base = base_for(sc);
-    e.stream_epoch = g_epoch.load(std::memory_order_acquire);
-    if (g_retry_pending.load(std::memory_order_acquire)) {
-        e.kind = PresentKind::Retry;
-        g_retry.fetch_add(1, std::memory_order_relaxed);
-        e.real_serial = g_real.load(std::memory_order_acquire);
-    } else {
-        e.kind = PresentKind::Real;
-        e.real_serial = g_real.fetch_add(1, std::memory_order_acq_rel) + 1;
-    }
-    if (e.kind == PresentKind::Real && e.real_serial == 120) lookup_fg_functions_once();
-    e.last_tag_sequence = g_tag_seq.load(std::memory_order_acquire);
-    e.has_last_frame_token = g_have_frame_token.load(std::memory_order_acquire);
-    e.last_frame_token = g_last_frame_token.load(std::memory_order_acquire);
-    if (const Callbacks* cb = g_callbacks.load(std::memory_order_acquire); cb && cb->before_present) cb->before_present(e, cb->user);
-    return e;
-}
-
-void end_present(const PresentEvent& e, HRESULT hr)
-{
-    if (e.kind == PresentKind::Test) return;
-    // DXGI_PRESENT_DO_NOT_WAIT + WAS_STILL_DRAWING: nothing was queued; the
-    // game presents the same frame again, which must not advance the serial.
-    g_retry_pending.store(hr == DXGI_ERROR_WAS_STILL_DRAWING, std::memory_order_release);
-    if (const Callbacks* cb = g_callbacks.load(std::memory_order_acquire); cb && cb->after_present) cb->after_present(e, hr, cb->user);
+    present_state(sc, e);
+    if (e.kind == PresentKind::Real && g_real.load(std::memory_order_relaxed) == 120) lookup_fg_functions_once();
+    Subscription* sub = acquire_sub(); // one subscription for before AND after
+    if (sub && sub->cb.before_present) { CallbackScope scope; sub->cb.before_present(e, sub->cb.user); }
+    const HRESULT hr = forward();
+    note_present_result(sc, hr);
+    if (sub && sub->cb.after_present) { CallbackScope scope; sub->cb.after_present(e, hr, sub->cb.user); }
+    release_sub(sub);
+    return hr;
 }
 
 HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flags)
 {
-    const PresentEvent e = begin_present(sc, sync, flags, nullptr, false);
-    const HRESULT hr = g_orig_present(sc, sync, flags);
-    end_present(e, hr);
-    return hr;
+    return present_call(sc, sync, flags, nullptr, false, [&] { return g_orig_present(sc, sync, flags); });
 }
 
 HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* pp)
 {
-    const PresentEvent e = begin_present(sc, sync, flags, pp, true);
-    const HRESULT hr = g_orig_present1(sc, sync, flags, pp);
-    end_present(e, hr);
-    return hr;
+    return present_call(sc, sync, flags, pp, true, [&] { return g_orig_present1(sc, sync, flags, pp); });
+}
+
+void bump_epoch(IDXGISwapChain* sc)
+{
+    std::lock_guard<std::mutex> lock(g_m);
+    if (ProxyState* st = find_proxy_locked(sc)) {
+        ++st->epoch;
+        st->retry_pending = false;
+    }
 }
 
 HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT flags)
 {
     const HRESULT hr = g_orig_resize(sc, n, w, h, f, flags);
-    if (SUCCEEDED(hr)) g_epoch.fetch_add(1, std::memory_order_acq_rel);
+    if (SUCCEEDED(hr)) bump_epoch(sc);
     return hr;
 }
 
@@ -367,8 +527,19 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT n, UINT
                                                const UINT* masks, IUnknown* const* queues)
 {
     const HRESULT hr = g_orig_resize1(sc, n, w, h, f, flags, masks, queues);
-    if (SUCCEEDED(hr)) g_epoch.fetch_add(1, std::memory_order_acq_rel);
+    if (SUCCEEDED(hr)) bump_epoch(sc);
     return hr;
+}
+
+// A released proxy ends its stream: a later object at the same address is new.
+ULONG STDMETHODCALLTYPE DetourRelease(IUnknown* obj)
+{
+    const ULONG r = g_orig_release(obj);
+    if (r == 0) {
+        std::lock_guard<std::mutex> lock(g_m);
+        if (ProxyState* st = find_proxy_locked(reinterpret_cast<IDXGISwapChain*>(obj))) *st = ProxyState{};
+    }
+    return r;
 }
 
 // Installs the four proxy hooks from the proxy class's vtable. Worker threads only.
@@ -384,7 +555,9 @@ bool install_proxy_vtable(void* const* vtable, Discovery how)
               na::hooking::PrepareHook(vtable[kSlotResizeBuffers], reinterpret_cast<void*>(&DetourResizeBuffers),
                                        reinterpret_cast<void**>(&g_orig_resize)) &&
               na::hooking::PrepareHook(vtable[kSlotResizeBuffers1], reinterpret_cast<void*>(&DetourResizeBuffers1),
-                                       reinterpret_cast<void**>(&g_orig_resize1));
+                                       reinterpret_cast<void**>(&g_orig_resize1)) &&
+              na::hooking::PrepareHook(vtable[kSlotRelease], reinterpret_cast<void*>(&DetourRelease),
+                                       reinterpret_cast<void**>(&g_orig_release));
     if (!ok) {
         na::hooking::AbandonInstall();
         set_reason("Could not prepare the Streamline swap-chain hooks.");
@@ -764,6 +937,7 @@ bool install_for_module(HMODULE m)
     auto* tag_frame = reinterpret_cast<void*>(GetProcAddress(m, "slSetTagForFrame"));
     auto* tag = reinterpret_cast<void*>(GetProcAddress(m, "slSetTag"));
     auto* gff = reinterpret_cast<void*>(GetProcAddress(m, "slGetFeatureFunction"));
+    auto* constants = reinterpret_cast<void*>(GetProcAddress(m, "slSetConstants"));
     std::unique_lock<std::mutex> install_lock(g_install_m);
     if (begin_install_retry()) {
         uint32_t n = 0;
@@ -773,6 +947,8 @@ bool install_for_module(HMODULE m)
         if (tag_frame && na::hooking::PrepareHook(tag_frame, reinterpret_cast<void*>(&DetourSetTagForFrame),
                                                   reinterpret_cast<void**>(&g_orig_tag_frame))) ++n;
         if (tag && na::hooking::PrepareHook(tag, reinterpret_cast<void*>(&DetourSetTag), reinterpret_cast<void**>(&g_orig_tag))) ++n;
+        if (constants)
+            na::hooking::PrepareHook(constants, reinterpret_cast<void*>(&DetourSetConstants), reinterpret_cast<void**>(&g_orig_constants));
         if (na::hooking::CommitInstall()) {
             g_tag_hooks.store(n, std::memory_order_release);
             any = n != 0 || g_gff_export != nullptr;
@@ -844,11 +1020,34 @@ const wchar_t* const kModuleNames[] = {L"sl.interposer.dll", nullptr};
 
 } // namespace
 
-void SetCallbacks(const Callbacks& callbacks)
+bool SetCallbacks(const Callbacks& callbacks)
 {
-    // Old sets are never freed: a detour may still hold the previous pointer.
-    const bool any = callbacks.on_tag || callbacks.before_present || callbacks.after_present;
-    g_callbacks.store(any ? new Callbacks(callbacks) : nullptr, std::memory_order_release);
+    if (t_callback_depth > 0) return false; // would wait for itself
+    std::lock_guard<std::mutex> lock(g_sub_m);
+    const bool any = callbacks.on_tag || callbacks.after_tag || callbacks.on_constants || callbacks.before_present || callbacks.after_present;
+    Subscription* next = any ? new Subscription : nullptr;
+    if (next) next->cb = callbacks;
+    Subscription* old = g_sub.exchange(next, std::memory_order_seq_cst);
+    // Quiescence: a caller that acquired `old` before the exchange finishes
+    // first; one acquiring after it sees `next` and backs out of `old`.
+    if (old)
+        while (old->inflight.load(std::memory_order_seq_cst) != 0) Sleep(0);
+    return true; // `old` is intentionally not freed: a late acquirer may still touch its counter
+}
+
+bool FindConstants(uint32_t frame_token, uint32_t viewport, ConstantsRecord* out)
+{
+    if (!out) return false;
+    std::lock_guard<std::mutex> lock(g_m);
+    const uint32_t available = g_const_count < kConstRing ? g_const_count : kConstRing;
+    for (uint32_t i = 0; i < available; ++i) {
+        const ConstantsRecord& r = g_const_ring[(g_const_count - 1 - i) % kConstRing];
+        if (r.frame_token == frame_token && r.viewport == viewport) {
+            *out = r;
+            return true;
+        }
+    }
+    return false;
 }
 
 bool Start(const wchar_t* log_path)
@@ -873,15 +1072,23 @@ Stats GetStats()
     s.presents_real = g_real.load(std::memory_order_relaxed);
     s.presents_retry = g_retry.load(std::memory_order_relaxed);
     s.presents_test = g_test.load(std::memory_order_relaxed);
-    s.stream_epoch = g_epoch.load(std::memory_order_relaxed);
     s.proxies_seen = g_proxies.load(std::memory_order_relaxed);
+    s.constants_calls = g_const_calls.load(std::memory_order_relaxed);
+    s.constants_decoded = g_const_decoded.load(std::memory_order_relaxed);
+    s.constants_valid_camera = g_const_valid.load(std::memory_order_relaxed);
+    s.presents_unique = g_assoc_unique.load(std::memory_order_relaxed);
+    s.presents_ambiguous = g_assoc_ambiguous.load(std::memory_order_relaxed);
+    s.presents_untagged = g_assoc_none.load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(g_m);
+    for (const ProxyState& st : g_proxy_state)
+        if (st.proxy) ++s.proxies_live;
     s.hudless_lifecycle = g_hud_life;
     s.hudless_state = g_hud_state;
     s.depth_lifecycle = g_depth_life;
     s.motion_lifecycle = g_motion_life;
     s.backbuffer_tagged = g_bb_tagged;
     s.ui_tagged = g_ui_tagged;
+    s.ui_alpha_tagged = g_ui_alpha_tagged;
     strncpy_s(s.reason, g_reason, _TRUNCATE);
     return s;
 }
@@ -894,14 +1101,18 @@ int FormatStatus(char* out, size_t cap)
     const uint32_t how = static_cast<uint32_t>(s.discovery);
     const int n = _snprintf_s(out, cap, _TRUNCATE,
         "sl_boundary module=%u tag_hooks=%u present_hooks=%u discovery=%s tag_calls=%llu undecoded=%llu tags=%llu "
-        "presents=%llu retry=%llu test=%llu epoch=%llu proxies=%u hudless=%s/0x%x depth=%s motion=%s backbuffer_tag=%u ui_tag=%u reason=\"%s\"",
+        "presents=%llu retry=%llu test=%llu assoc=%llu/%llu/%llu proxies=%u/%u constants=%llu/%llu/%llu "
+        "hudless=%s/0x%x depth=%s motion=%s backbuffer_tag=%u ui_tag=%u ui_alpha_tag=%u reason=\"%s\"",
         s.module_seen, s.tag_hooks, s.present_hooks, how < 4 ? kHow[how] : "?",
         static_cast<unsigned long long>(s.tag_calls), static_cast<unsigned long long>(s.tag_undecoded),
         static_cast<unsigned long long>(s.tags_seen), static_cast<unsigned long long>(s.presents_real),
         static_cast<unsigned long long>(s.presents_retry), static_cast<unsigned long long>(s.presents_test),
-        static_cast<unsigned long long>(s.stream_epoch), s.proxies_seen,
+        static_cast<unsigned long long>(s.presents_unique), static_cast<unsigned long long>(s.presents_ambiguous),
+        static_cast<unsigned long long>(s.presents_untagged), s.proxies_live, s.proxies_seen,
+        static_cast<unsigned long long>(s.constants_calls), static_cast<unsigned long long>(s.constants_decoded),
+        static_cast<unsigned long long>(s.constants_valid_camera),
         abi::LifecycleName(s.hudless_lifecycle), s.hudless_state, abi::LifecycleName(s.depth_lifecycle),
-        abi::LifecycleName(s.motion_lifecycle), s.backbuffer_tagged, s.ui_tagged, s.reason);
+        abi::LifecycleName(s.motion_lifecycle), s.backbuffer_tagged, s.ui_tagged, s.ui_alpha_tagged, s.reason);
     const int used = n < 0 ? static_cast<int>(strlen(out)) : n;
     const FgState fg = GetFgState();
     const int m = _snprintf_s(out + used, cap - static_cast<size_t>(used), _TRUNCATE,
@@ -946,13 +1157,13 @@ void ResetCountersForTests()
     g_real = 0;
     g_retry = 0;
     g_test = 0;
-    g_epoch = 0;
     g_proxies = 0;
-    g_retry_pending = false;
-    g_have_frame_token = false;
+    g_present_events = 0;
     std::lock_guard<std::mutex> lock(g_m);
-    g_last_proxy = nullptr;
-    g_last_base = nullptr;
+    for (ProxyState& st : g_proxy_state) st = ProxyState{};
+    g_last_present_tag_seq = 0;
+    g_tag_window_count = 0;
+    g_const_count = 0;
 }
 
 } // namespace na::slb

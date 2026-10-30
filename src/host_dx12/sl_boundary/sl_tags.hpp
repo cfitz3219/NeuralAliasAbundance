@@ -46,6 +46,7 @@ constexpr uint32_t kBufferScalingOutputColor = 4;
 constexpr uint32_t kBufferUiColorAndAlpha = 23;
 constexpr uint32_t kBufferBidirectionalDistortion = 50;
 constexpr uint32_t kBufferBackbuffer = 53;
+constexpr uint32_t kBufferUiAlpha = 69;
 
 // One decoded tag. `resource` is the raw sl::Resource::native pointer value
 // (an ID3D12Resource* for D3D12); 0 means the game untagged this buffer type.
@@ -114,6 +115,7 @@ inline const char* BufferName(uint32_t t)
     case kBufferUiColorAndAlpha: return "ui_color_alpha";
     case kBufferBidirectionalDistortion: return "distortion";
     case kBufferBackbuffer: return "backbuffer";
+    case kBufferUiAlpha: return "ui_alpha";
     default: return "other";
     }
 }
