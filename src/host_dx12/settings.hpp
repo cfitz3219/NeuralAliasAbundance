@@ -102,6 +102,12 @@ struct Settings {
     // A69: the freeze watchdog switched Frame Generation off at this time
     // (seconds since 1970, 0 = never). Shown in the menu until FG is re-enabled.
     std::atomic<uint32_t> fg_frozen_at{0};
+    // The GAME's own frame generation (Streamline DLSS-G), [native_fg] section:
+    // requests applied to the game's slDLSSGSetOptions by the SL boundary.
+    //  mode: 0 the game's setting (default, no change), 1 Off, 2 On, 3 Dynamic
+    //  frames: generated frames per real frame (1 = 2x ... 5 = 6x); 0 = the game's
+    std::atomic<uint32_t> native_fg_mode{0};
+    std::atomic<uint32_t> native_fg_frames{0};
 };
 
 Settings& Get();
