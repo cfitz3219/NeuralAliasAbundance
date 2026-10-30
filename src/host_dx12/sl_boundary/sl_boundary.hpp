@@ -32,11 +32,23 @@
 //     metadata stream).
 //
 // Callback rules: invoked on the game's thread inside SL entry points. Do not
-// block, do not call slSetTag*/Present re-entrantly, do not install hooks.
+// block, do not call slSetTag*/Present re-entrantly, do not install hooks, do
+// not call SetCallbacks. Lifetime: one subscription is retained for a whole
+// call (a Present's before and after callbacks, a tag's on/after callbacks
+// always come from the same set), and SetCallbacks returns only once no call
+// into the previous set is in flight: after it returns the previous `user`
+// object may be destroyed.
+//
+// Association: Streamline tag and constants calls are not bound to a swap
+// chain. A PresentEvent reports which tag calls were issued since that
+// proxy's previous real Present, and whether they name exactly one
+// (viewport, frame token) — with "unknown"/"ambiguous" stated, never guessed.
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
+
+#include "host_dx12/fg/camera.hpp"
 
 struct IDXGISwapChain;
 struct ID3D12Resource;
@@ -59,8 +71,7 @@ struct Tag {
 constexpr uint32_t kMaxTagsPerCall = 32;
 
 struct TagEvent {
-    uint64_t sequence = 0;           // per process, every tag call
-    uint64_t stream_epoch = 0;       // swap-chain incarnation current at the call (see PresentEvent)
+    uint64_t sequence = 0;           // per process, every tag call (tags are not bound to a swap chain)
     bool for_frame = false;          // slSetTagForFrame (true) or legacy slSetTag
     bool has_frame = false;
     uint32_t frame_token = 0;        // sl::FrameToken value
@@ -75,39 +86,70 @@ struct TagEvent {
 };
 
 enum class PresentKind : uint32_t {
-    Real = 0,  // a game frame: real_serial advanced for it
-    Retry = 1, // the game re-presenting after DXGI_ERROR_WAS_STILL_DRAWING: same real_serial
-    Test = 2,  // DXGI_PRESENT_TEST: no frame
+    Real = 0,  // a game frame: this proxy's real_serial advanced for it
+    Retry = 1, // this proxy re-presenting after DXGI_ERROR_WAS_STILL_DRAWING: same real_serial
+    Test = 2,  // DXGI_PRESENT_TEST: no frame, no callbacks
+};
+
+// Which tag calls a Present can be associated with (see header comment).
+enum class Association : uint32_t {
+    None = 0,      // no decoded tag call since this proxy's previous real Present
+    Unique = 1,    // they name exactly one (viewport, frame token), and no other proxy presented in between
+    Ambiguous = 2, // several viewports/tokens, a call without them, or another proxy presented in between
 };
 
 struct PresentEvent {
-    uint64_t real_serial = 0;        // advances once per accepted real game Present
-    uint64_t stream_epoch = 0;       // +1 for a newly seen proxy and after each successful ResizeBuffers*
+    uint32_t proxy_id = 0;           // small stable id per SL proxy object (1, 2, ...), until it is released
+    uint64_t real_serial = 0;        // per proxy: advances once per accepted real game Present
+    uint64_t stream_epoch = 0;       // per proxy: 1 when first seen, +1 after each successful ResizeBuffers*
     PresentKind kind = PresentKind::Real;
     bool present1 = false;
     IDXGISwapChain* game_facing = nullptr; // SL's proxy; GetBuffer/GetCurrentBackBufferIndex on it return what the game drew
     IDXGISwapChain* base = nullptr;  // the chain beneath SL (via SL's StreamlineRetrieveBaseInterface), may be null
+    void* present_queue = nullptr;   // always null: not discovered here; use the existing exact queue binding for `base`
     uint32_t sync = 0, flags = 0;
     const DXGI_PRESENT_PARAMETERS* params = nullptr;
     uint32_t thread_id = 0;
-    uint64_t last_tag_sequence = 0;  // newest TagEvent::sequence issued before this Present
-    bool has_last_frame_token = false;
-    uint32_t last_frame_token = 0;   // frame token of the newest decoded tag call
+    // Tag calls since this proxy's previous real Present: sequences (first, last], 0/0 = none.
+    uint64_t tags_after_sequence = 0, last_tag_sequence = 0;
+    Association association = Association::None;
+    uint32_t viewport = 0, frame_token = 0; // meaningful only when association == Unique
 };
 
+// The game's slSetConstants for one (frame token, viewport), decoded with the
+// validated Streamline 2.x layout (na::sl::DecodeConstants). Booleans keep
+// sl::Boolean values: 0 false, 1 true, 2 invalid/not provided.
+struct ConstantsRecord {
+    uint64_t sequence = 0;
+    uint32_t frame_token = 0, viewport = 0;
+    uint32_t thread_id = 0;
+    int32_t result = 0;              // sl::Result of the original call (0 = accepted)
+    bool camera_valid = false;       // na::fg::ValidCamera accepted the block
+    na::fg::Camera camera{};         // matrices (row-major, without jitter), jitter, mvec scale, flags
+};
+// Newest accepted record for exactly this (frame token, viewport); false if none retained.
+bool FindConstants(uint32_t frame_token, uint32_t viewport, ConstantsRecord* out);
+
 using TagCallback = void (*)(const TagEvent& event, void* user);
+using AfterTagCallback = void (*)(const TagEvent& event, int32_t result, void* user); // result: sl::Result, 0 = accepted
+using ConstantsCallback = void (*)(const ConstantsRecord& record, void* user);       // after the original
 using BeforePresentCallback = void (*)(const PresentEvent& event, void* user);
 using AfterPresentCallback = void (*)(const PresentEvent& event, long hr, void* user);
 
 struct Callbacks {
-    TagCallback on_tag = nullptr;
+    TagCallback on_tag = nullptr;          // before the original tag call (eOnlyValidNow contents still valid)
+    AfterTagCallback after_tag = nullptr;  // after it, with its result: staged metadata is accepted only on 0
+    ConstantsCallback on_constants = nullptr;
     BeforePresentCallback before_present = nullptr;
     AfterPresentCallback after_present = nullptr;
     void* user = nullptr;
 };
 
-// One consumer (NR). Replaces any previous set; pass {} to detach.
-void SetCallbacks(const Callbacks& callbacks);
+// One consumer (NR). Replaces any previous set; pass {} to detach. Returns
+// after every in-flight call into the previous set has finished (bounded by
+// the longest Present). Returns false, changing nothing, if called from
+// inside a callback.
+bool SetCallbacks(const Callbacks& callbacks);
 
 // Watches for sl.interposer.dll and installs once it is loaded. Called from
 // host_boot on Route A. `log_path` (optional): evidence file written 30 s and
@@ -123,13 +165,14 @@ struct Stats {
     uint32_t present_hooks = 0;      // 0..2 (Present, Present1 on the proxy)
     Discovery discovery = Discovery::None;
     uint64_t tag_calls = 0, tag_undecoded = 0, tags_seen = 0;
-    uint64_t presents_real = 0, presents_retry = 0, presents_test = 0;
-    uint64_t stream_epoch = 0;
-    uint32_t proxies_seen = 0;
+    uint64_t presents_real = 0, presents_retry = 0, presents_test = 0; // all proxies
+    uint32_t proxies_seen = 0, proxies_live = 0;
+    uint64_t constants_calls = 0, constants_decoded = 0, constants_valid_camera = 0;
+    uint64_t presents_unique = 0, presents_ambiguous = 0, presents_untagged = 0;
     // Newest decoded tag of the three FG/NR inputs, for the status line.
     uint32_t hudless_lifecycle = 0xFFFFFFFFu, hudless_state = 0xFFFFFFFFu;
     uint32_t depth_lifecycle = 0xFFFFFFFFu, motion_lifecycle = 0xFFFFFFFFu;
-    uint32_t backbuffer_tagged = 0, ui_tagged = 0;
+    uint32_t backbuffer_tagged = 0, ui_tagged = 0, ui_alpha_tagged = 0;
     char reason[96] = "";
 };
 Stats GetStats();
