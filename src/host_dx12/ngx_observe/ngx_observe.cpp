@@ -3,6 +3,7 @@
 
 #include "host_dx12/nr/nr_pass.hpp"
 #include "host_dx12/nr/native_fg.hpp"
+#include "host_dx12/nr/queue_trace.hpp"
 #include "host_dx12/motion/live_flow.hpp"
 
 #include "host_dx12/capture/frame_capture.hpp"
@@ -558,7 +559,9 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
         inspect_fg_inputs(cmd_list, params);
         na::nr::native::InputOverride fg_inputs;
         na::nr::native::Before(list,&s,handle,params,core_runtime(s),&fg_inputs);
+        na::nr::trace::Record("fg_begin",nullptr,list);
         const NgxResult result = s.evaluate(cmd_list, handle, params, callback);
+        na::nr::trace::Record("fg_end",nullptr,list,0,0,result);
         g_evaluates.fetch_add(1, std::memory_order_relaxed);
         g_evaluates_external.fetch_add(1, std::memory_order_release);
         push_record(CallKind::EvaluateFeature, result, 11u, 0, reinterpret_cast<uint64_t>(handle),

@@ -40,6 +40,7 @@
 #include "host_dx12/overlay/na_style.hpp"
 #include "host_dx12/overlay/presenter.hpp"
 #include "host_dx12/overlay/freeze_watchdog.hpp"
+#include "host_dx12/nr/queue_trace.hpp"
 #include <ctime>
 #include "host_dx12/settings.hpp"
 #include "host_dx12/latency/nvidia_latency.hpp"
@@ -105,6 +106,8 @@ std::atomic<DWORD> g_present_caller{0};
 std::atomic<HRESULT> g_present_result{S_OK};
 std::atomic<UINT> g_game_max_latency{0}; // what the game asked for (A62), reported back to it unchanged
 ExecuteFn g_orig_execute = nullptr;
+using QueueSyncFn=HRESULT(STDMETHODCALLTYPE*)(ID3D12CommandQueue*,ID3D12Fence*,UINT64);
+QueueSyncFn g_trace_signal=nullptr,g_trace_wait=nullptr;
 SetColorSpaceFn g_orig_set_color_space = nullptr;
 
 // Our own reads of the game's chain must bypass the presenter's proxies.
@@ -831,6 +834,8 @@ void write_status_line()
     const uint64_t host_presents = g_presents.load(std::memory_order_relaxed);
     if (watchdog.Check(host_presents, now)) {
         na::settings::MarkSessionFailed("freeze");
+        na::nr::native::TraceGpuProgress();
+        na::nr::trace::Dump(f);
         char hl[400];
         int m = snprintf(hl, sizeof(hl), "%02u:%02u:%02u FREEZE detected: the game's presents have not advanced for %llu ms (game_presents=%llu real_presents=%llu fg_active=%u count=%u backlog=%u). Thread stacks follow (innermost first).\r\n",
                          t.wHour, t.wMinute, t.wSecond, static_cast<unsigned long long>(watchdog.StalledMs(now)),
@@ -2191,8 +2196,10 @@ HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flag
     na::dlss::ReleaseIfDeviceRemoved(); // G2-004: never pin a removed device across the game's recovery
     if (!(flags & DXGI_PRESENT_TEST) && na::present::Proxied(sc)) return presenter_present(sc, sync, flags, nullptr);
     const auto observed = na::observe::PresentBegin(sc);
+    na::nr::trace::Record("present_begin",sc);
     if (!(flags & DXGI_PRESENT_TEST)) on_present(sc);
     const HRESULT result = g_orig_present(sc, sync, flags);
+    na::nr::trace::Record("present_end",sc,nullptr,0,0,result);
     na::observe::PresentEnd(observed,sync,flags,result);
     return result;
 }
@@ -2203,8 +2210,10 @@ HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT fl
     na::dlss::ReleaseIfDeviceRemoved(); // G2-004: never pin a removed device across the game's recovery
     if (!(flags & DXGI_PRESENT_TEST) && na::present::Proxied(sc)) return presenter_present(sc, sync, flags, pp);
     const auto observed = na::observe::PresentBegin(sc);
+    na::nr::trace::Record("present1_begin",sc);
     if (!(flags & DXGI_PRESENT_TEST)) on_present(sc);
     const HRESULT result = g_orig_present1(sc, sync, flags, pp);
+    na::nr::trace::Record("present1_end",sc,nullptr,0,0,result);
     na::observe::PresentEnd(observed,sync,flags,result);
     return result;
 }
@@ -2325,6 +2334,17 @@ void STDMETHODCALLTYPE ForwardWithFgInputs(ID3D12CommandQueue* q, UINT n, ID3D12
 {
     na::fg::Execute(q, n, lists, g_orig_execute);
 }
+HRESULT STDMETHODCALLTYPE TraceSignal(ID3D12CommandQueue* q,ID3D12Fence* fence,UINT64 value) {
+    na::nr::trace::Record("signal_begin",q,fence,value);
+    const auto hr=g_trace_signal(q,fence,value);
+    na::nr::trace::Record("signal_end",q,fence,value,0,hr);return hr;
+}
+HRESULT STDMETHODCALLTYPE TraceWait(ID3D12CommandQueue* q,ID3D12Fence* fence,UINT64 value) {
+    const auto completed=fence?fence->GetCompletedValue():0;
+    na::nr::trace::Record("wait_begin",q,fence,value,completed);
+    const auto hr=g_trace_wait(q,fence,value);
+    na::nr::trace::Record("wait_end",q,fence,value,completed,hr);return hr;
+}
 // J2: live DLAA may insert its list after the game's scene list, then the
 // batch continues through Neural Rendering / Frame Generation as before.
 void STDMETHODCALLTYPE ForwardThroughNr(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists)
@@ -2334,6 +2354,8 @@ void STDMETHODCALLTYPE ForwardThroughNr(ID3D12CommandQueue* q, UINT n, ID3D12Com
 void STDMETHODCALLTYPE DetourExecute(ID3D12CommandQueue* q, UINT n,
                                      ID3D12CommandList* const* lists)
 {
+    struct TraceExecute { ID3D12CommandQueue* q; ~TraceExecute(){na::nr::trace::Record("execute_end",q);} } trace_execute{q};
+    na::nr::trace::Record("execute_begin",q,n && lists?lists[0]:nullptr,n);
     if(na::present::OwnsQueue(q)) { g_orig_execute(q,n,lists); return; }
     if (q == g_texture_queue.load(std::memory_order_acquire)) {
         na::nr::Execute(q, n, lists, ForwardWithFgInputs);
@@ -2464,6 +2486,13 @@ bool Start(const char* route_tag, PanelFn controls)
                                              reinterpret_cast<void*>(&DetourExecute),
                                              reinterpret_cast<void**>(&g_orig_execute));
             // A59 presenter: GetBuffer / GetCurrentBackBufferIndex / ResizeBuffers1.
+            // The full observer owns these slots when requested. This narrow
+            // trace is for Route A freezes with that observer disabled.
+            if(ok && !na::observe::InstallRequested()) {
+                const bool signal=na::hooking::HookVTableSlot(queue.Get(),14,reinterpret_cast<void*>(&TraceSignal),reinterpret_cast<void**>(&g_trace_signal));
+                const bool wait=na::hooking::HookVTableSlot(queue.Get(),15,reinterpret_cast<void*>(&TraceWait),reinterpret_cast<void**>(&g_trace_wait));
+                na::nr::trace::sync_hooks.store((signal?1u:0u)|(wait?2u:0u));
+            }
             ComPtr<IDXGISwapChain3> sc3;
             if (ok && SUCCEEDED(sc.As(&sc3))) {
                 ok = na::hooking::HookVTableSlot(sc.Get(), kSwapGetBufferSlot,

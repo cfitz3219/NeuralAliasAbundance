@@ -1,4 +1,5 @@
 #include "host_dx12/nr/native_fg.hpp"
+#include "host_dx12/nr/queue_trace.hpp"
 #ifdef NA_HAVE_NGX_SDK
 #include "host_dx12/nr/fg_contract.hpp"
 #include "host_dx12/nr/fg_frame_cache.hpp"
@@ -138,6 +139,7 @@ struct Recording {
     std::atomic<uint64_t> value{0},frequency{0};
     std::atomic<uint32_t> forwarding{0};
     std::atomic<bool> failed{false};
+    std::atomic<uintptr_t> last_queue{0};
     std::mutex submission_mutex;
     std::vector<std::shared_ptr<Packet>> packets;
     std::vector<ComPtr<ID3D12Resource>> destinations;
@@ -322,10 +324,20 @@ void CoreShutdown(const void* core) {
     contexts_count.store(static_cast<uint32_t>(contexts.size()));
 }
 Status GetStatus(){std::unique_lock<std::mutex> lock(mutex,std::try_to_lock);if(lock.owns_lock()){auto s=status;s.submitted=submissions.load();return s;} Status s;strcpy_s(s.reason,"Updating Neural Rendering.");return s;}
+void TraceGpuProgress(){
+    std::unique_lock<std::mutex> lock(mutex,std::try_to_lock);
+    if(!lock.owns_lock()){trace::Record("nr_progress_busy",nullptr);return;}
+    for(const auto& r:recordings)if(r){
+        trace::Record("nr_gpu_progress",reinterpret_cast<void*>(r->last_queue.load()),r->fence.Get(),r->value.load(),r->fence->GetCompletedValue());
+        trace::Record("nr_recording",reinterpret_cast<void*>(r->last_queue.load()),r->list,r->valid->load(),r->forwarding.load());
+    }
+}
 void MarkSwapchainBuffer(ID3D12Resource* r){if(r){const UINT value=1;r->SetPrivateData(swapchain_key,sizeof(value),&value);}}
 void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,const void* parameters,const Runtime& runtime,InputOverride* replacement) {
     if(!list || !parameters || (list->GetType()!=D3D12_COMMAND_LIST_TYPE_DIRECT && list->GetType()!=D3D12_COMMAND_LIST_TYPE_COMPUTE))return;
     if(internal)return;Internal guard;na::dlss::InjectorCallScope origin;
+    trace::Record("nr_begin",nullptr,list);
+    struct End {ID3D12GraphicsCommandList* list;~End(){trace::Record("nr_end",nullptr,list);}} end{list};
     std::lock_guard<std::mutex> lock(mutex);Collect();
     Context* ctx=nullptr; for(auto& c:contexts)if(c->core==core && c->handle==handle)ctx=c.get();
     if(!ctx){if(contexts.size()>=8)return;auto c=std::make_unique<Context>();c->core=core;c->handle=handle;ctx=c.get();contexts.push_back(std::move(c));contexts_count.store(static_cast<uint32_t>(contexts.size()));}
@@ -481,9 +493,11 @@ Submission::Submission(ID3D12CommandQueue* q,UINT n,ID3D12CommandList* const* li
 Submission::~Submission() {
     if(!queue_)return;
     for(uint32_t i=0;i<count_;++i){auto& r=*static_cast<Recording*>(records_[i].get());
+        r.last_queue.store(reinterpret_cast<uintptr_t>(queue_));
         uint64_t frequency=0;queue_->GetTimestampFrequency(&frequency);r.frequency.store(frequency);
         if(FAILED(queue_->Signal(r.fence.Get(),++r.value)))r.failed.store(true);
         else submissions.fetch_add(1);
+        trace::Record("nr_receipt",queue_,r.fence.Get(),r.value.load(),r.fence->GetCompletedValue());
         r.forwarding.fetch_sub(1);
         locks_[i].unlock(); // before the shared Recording owner can be destroyed
     }
@@ -496,6 +510,7 @@ InputOverride::~InputOverride(){}
 void InputOverride::Bind(const void*,ID3D12Resource*){}
 void Before(ID3D12GraphicsCommandList*,const void*,const void*,const void*,const Runtime&,InputOverride*){}
 void Release(const void*,const void*){} void Prepare(ID3D12GraphicsCommandList*){} void Maintain(){}
+void TraceGpuProgress(){}
 void PrepareDevice(ID3D12Device*){}
 void MarkSwapchainBuffer(ID3D12Resource*){}
 void Register(const void*,const void*){}

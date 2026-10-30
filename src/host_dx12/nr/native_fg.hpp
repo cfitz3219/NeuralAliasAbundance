@@ -24,6 +24,7 @@ void CoreShutdown(const void* core);
 void Prepare(ID3D12GraphicsCommandList* list);
 void PrepareDevice(ID3D12Device* device);
 void Maintain();
+void TraceGpuProgress(); // background freeze logger; no waits/readbacks
 void MarkSwapchainBuffer(ID3D12Resource* resource);
 void Reset(ID3D12GraphicsCommandList* list);
 bool OwnsRoute();
