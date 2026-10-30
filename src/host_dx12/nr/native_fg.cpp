@@ -60,20 +60,38 @@ struct InputStates {
     bool ready=false;
     InputStates(ID3D12GraphicsCommandList* l,const FgContract& f):list(l) {
         ID3D12Resource* inputs[]={f.color.resource,f.hudless.resource,f.depth.resource,f.motion.resource};
-        bool all_known=true;status.illegal_state_mask=0;
+        D3D12_RESOURCE_STATES state_of[4]{};states::Evidence evidence_of[4]{};
+        status.illegal_state_mask=0;
+        for(uint32_t i=0;i<4;++i) evidence_of[i]=states::Inspect(l,inputs[i],state_of[i]);
+        // Streamline transitions every FG input to the state NGX reads before it
+        // calls the FG evaluate, and records a barrier ONLY for inputs that are not
+        // already there (Cort's 18:26 PBZ run: Backbuffer observed -> 0x40, HUDLess/
+        // Depth/MVecs no barrier on the FG list). So an input with no transition on
+        // this list is in the same read state SL just put the observed input in.
+        // Inferred only from an observed shader-read reference on the same list;
+        // any invalidated, split or uncovered evidence still refuses.
+        D3D12_RESOURCE_STATES reference{};bool have_reference=false;
+        for(uint32_t i=0;i<4 && !have_reference;++i)
+            if(evidence_of[i]==states::Evidence::Known &&
+               (state_of[i]==D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE ||
+                state_of[i]==(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE|D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE))){
+                reference=state_of[i];have_reference=true;}
+        bool all_known=true;
         for(uint32_t i=0;i<4;++i){
-            D3D12_RESOURCE_STATES state{};auto evidence=states::Inspect(l,inputs[i],state);
-            status.input_states[i]=static_cast<uint32_t>(state);
-            status.input_evidence[i]=static_cast<uint32_t>(evidence);
-            if(evidence!=states::Evidence::Known)all_known=false;
-            else if(!states::CanTransitionOn(l->GetType(),state)){status.illegal_state_mask|=1u<<i;all_known=false;}
+            if(evidence_of[i]==states::Evidence::NoTransition && have_reference){
+                state_of[i]=reference;evidence_of[i]=states::Evidence::InferredStreamline;}
+            if(evidence_of[i]!=states::Evidence::Known && evidence_of[i]!=states::Evidence::InferredStreamline)all_known=false;
+            else if(!states::CanTransitionOn(l->GetType(),state_of[i])){status.illegal_state_mask|=1u<<i;all_known=false;}
+            status.input_states[i]=static_cast<uint32_t>(state_of[i]);
+            status.input_evidence[i]=static_cast<uint32_t>(evidence_of[i]);
         }
         status.color_state=status.input_states[0];status.hudless_state=status.input_states[1];
         if(!all_known)return; // publish ALL input evidence before any early exit
-        for(auto* r:inputs) {
+        for(uint32_t k=0;k<4;++k) {
+            auto* r=inputs[k];
             bool duplicate=false;for(uint32_t i=0;i<count;++i)duplicate|=resources[i]==r;
             if(duplicate)continue;
-            resources[count]=r;if(!states::Read(l,r,original[count]) || !states::CanTransitionOn(l->GetType(),original[count]))return;++count;
+            resources[count]=r;original[count]=state_of[k];++count;
         }
         for(uint32_t i=0;i<count;++i)if(original[i]!=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
             Barrier(list,resources[i],original[i],D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);

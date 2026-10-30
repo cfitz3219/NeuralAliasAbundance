@@ -12,7 +12,7 @@ bool InstallEnhancedInvalidation();
 void Observe(ID3D12GraphicsCommandList*,UINT,const D3D12_RESOURCE_BARRIER*);
 void Reset(ID3D12GraphicsCommandList*);
 bool Read(ID3D12GraphicsCommandList*,ID3D12Resource*,D3D12_RESOURCE_STATES&);
-enum class Evidence : unsigned { Known, NoTransition, SplitPending, EnhancedInvalidated, AliasingInvalidated, UncoveredList };
+enum class Evidence : unsigned { Known, NoTransition, SplitPending, EnhancedInvalidated, AliasingInvalidated, UncoveredList, InferredStreamline };
 Evidence Inspect(ID3D12GraphicsCommandList*,ID3D12Resource*,D3D12_RESOURCE_STATES&);
 const char* Name(Evidence);
 void InvalidateEnhanced(ID3D12GraphicsCommandList*);
