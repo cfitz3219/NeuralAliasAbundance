@@ -406,7 +406,7 @@ NgxResult CreateFeatureImpl(CoreSlot& s, void* cmd_list, uint32_t feature_id, vo
         // ...and it is the feature an armed render-size confirmation (Apply) waits for.
         std::lock_guard<std::mutex> lock(g_confirm_m);
         const uint64_t hnd = out_handle ? reinterpret_cast<uint64_t>(*out_handle) : 0;
-        g_feature_flags.Set(hnd, ep.valid ? ep.create_flags : 0xFFFFFFFFu);
+        g_feature_flags.Set(hnd, ep.valid ? ep.create_flags : 0xFFFFFFFFu,reinterpret_cast<uint64_t>(&s));
         if (g_confirm_active.load(std::memory_order_acquire))
             g_confirm.OnCreate(ep.valid ? ep.in_width : 0, ep.valid ? ep.in_height : 0, hnd, GetTickCount64());
     }
@@ -431,7 +431,7 @@ NgxResult CreateFeatureImpl(CoreSlot& s, void* cmd_list, uint32_t feature_id, vo
         {
             std::lock_guard<std::mutex> lock(g_confirm_m);
             uint64_t hnd = out_handle ? reinterpret_cast<uint64_t>(*out_handle) : 0;
-            g_feature_flags.Set(hnd, ep.valid ? ep.create_flags : 0xFFFFFFFFu); // A68: flags bound to this feature
+            g_feature_flags.Set(hnd, ep.valid ? ep.create_flags : 0xFFFFFFFFu,reinterpret_cast<uint64_t>(&s)); // A68: flags bound to this feature
             if (g_confirm_active.load(std::memory_order_acquire)) { // A66 (R1): the feature the request waits for
                 uint32_t w = ep.valid ? ep.in_width : 0, h = ep.valid ? ep.in_height : 0;
                 g_confirm.OnCreate(w, h, hnd, GetTickCount64());
@@ -690,7 +690,7 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
                     uint32_t flags = ep.create_flags;
                     if (flags == 0xFFFFFFFFu) { // evaluate objects often lack creation keys: use THIS feature's creation flags (A68)
                         std::lock_guard<std::mutex> lock(g_confirm_m);
-                        flags = g_feature_flags.Get(reinterpret_cast<uint64_t>(game_handle));
+                        flags = g_feature_flags.Get(reinterpret_cast<uint64_t>(game_handle),reinterpret_cast<uint64_t>(&s));
                     }
                     bool mv_low_res = flags != 0xFFFFFFFFu && (flags & 0x2u) != 0; // NVSDK_NGX_DLSS_Feature_Flags_MVLowRes
                     uint32_t mv_w = mv_low_res ? rw : ep.out_width, mv_h = mv_low_res ? rh : ep.out_height;
@@ -733,7 +733,7 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
             uint32_t flags = ep.create_flags;
             if (flags == 0xFFFFFFFFu) {
                 std::lock_guard<std::mutex> lock(g_confirm_m);
-                flags = g_feature_flags.Get(reinterpret_cast<uint64_t>(game_handle));
+                flags = g_feature_flags.Get(reinterpret_cast<uint64_t>(game_handle),reinterpret_cast<uint64_t>(&s));
             }
             in.mv_low_res = flags != 0xFFFFFFFFu && (flags & 0x2u);
             in.depth_inverted = flags != 0xFFFFFFFFu && (flags & 0x8u) ? 1u : 0u;
@@ -757,7 +757,7 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
             uint32_t nflags = ep.create_flags;
             if (nflags == 0xFFFFFFFFu) {
                 std::lock_guard<std::mutex> lock(g_confirm_m);
-                nflags = g_feature_flags.Get(reinterpret_cast<uint64_t>(game_handle));
+                nflags = g_feature_flags.Get(reinterpret_cast<uint64_t>(game_handle),reinterpret_cast<uint64_t>(&s));
             }
             in.depth_inverted = nflags != 0xFFFFFFFFu && (nflags & 0x8u) ? 1u : 0u;
             in.mv_low_res = nflags != 0xFFFFFFFFu && (nflags & 0x2u) ? 1u : 0u;
@@ -812,19 +812,17 @@ NgxResult ReleaseFeatureImpl(CoreSlot& s, void* handle)
         if(result==1){
             na::nr::native::Release(&s,handle);
             std::lock_guard<std::mutex> lock(g_confirm_m);
-            g_feature_flags.Erase(reinterpret_cast<uint64_t>(handle));
+            g_feature_flags.Erase(reinterpret_cast<uint64_t>(handle),reinterpret_cast<uint64_t>(&s));
             for(auto& entry:g_fg_handles)if(entry.core==&s && entry.handle==handle)entry={};
         }
         g_releases.fetch_add(1,std::memory_order_relaxed);
         push_record(CallKind::ReleaseFeature,result,11u,0,reinterpret_cast<uint64_t>(handle),0);
         return result;
     }
-    na::nr::native::Release(&s,handle);
-    {
+    auto erase_flags=[&]{
         std::lock_guard<std::mutex> lock(g_confirm_m);
-        g_feature_flags.Erase(reinterpret_cast<uint64_t>(handle)); // A68: a released handle value may be reused
-        for (auto& entry : g_fg_handles) if (entry.core == &s && entry.handle == handle) entry = {};
-    }
+        g_feature_flags.Erase(reinterpret_cast<uint64_t>(handle),reinterpret_cast<uint64_t>(&s));
+    };
     // A mapped handle belongs to us. Retirement follows its actual recordings;
     // the game's original handle is only an external key and may already be retired.
     {
@@ -838,6 +836,7 @@ NgxResult ReleaseFeatureImpl(CoreSlot& s, void* handle)
             if(g_last_sr_core==&s && g_last_sr_handle.load()==m.ours.load())g_last_sr_handle.store(nullptr);
             m.game.store(nullptr);m.ours.store(nullptr);m.core=nullptr;
             CollectSrLocked();
+            erase_flags();
             g_releases.fetch_add(1);
             push_record(CallKind::ReleaseFeature,1,1u,0,reinterpret_cast<uint64_t>(handle),0);
             return 1; // virtual handle retired; backend errors remain queued for retry
@@ -845,6 +844,7 @@ NgxResult ReleaseFeatureImpl(CoreSlot& s, void* handle)
     }
     NgxResult r = s.release(handle);
     if(r==1){
+        erase_flags();
         std::lock_guard<std::mutex> lock(g_reapply_mutex);
         g_sr_uses.erase(std::remove_if(g_sr_uses.begin(),g_sr_uses.end(),[&](const auto& u){return u.core==&s && u.handle==handle;}),g_sr_uses.end());
         if(g_last_sr_core==&s && g_last_sr_handle.load()==handle)g_last_sr_handle.store(nullptr);
@@ -864,11 +864,18 @@ NgxResult Shutdown1Impl(CoreSlot& s, void* device)
     NgxResult r = s.shutdown1(device);
     if(r==1){
         std::lock_guard<std::mutex> lock(g_reapply_mutex);
-        for(auto& m:g_handle_maps)if(m.core==&s){m.game.store(nullptr);m.ours.store(nullptr);m.params.store(nullptr);m.core=nullptr;}
-        g_sr_uses.erase(std::remove_if(g_sr_uses.begin(),g_sr_uses.end(),[&](const auto& u){return u.core==&s;}),g_sr_uses.end());
-        g_retired.erase(std::remove_if(g_retired.begin(),g_retired.end(),[&](const auto& u){return u.uses.core==&s;}),g_retired.end());
-        if(g_last_sr_core==&s){g_last_sr_core=nullptr;g_last_sr_handle.store(nullptr);}
-        s.has_device.store(false);
+        const auto belongs=[&](const SrUses& u){return u.core==&s && (!device || u.device.Get()==device);};
+        for(auto& m:g_handle_maps)if(m.core==&s && std::any_of(g_sr_uses.begin(),g_sr_uses.end(),[&](const auto& u){return belongs(u) && u.handle==m.ours.load();})){
+            m.game.store(nullptr);m.ours.store(nullptr);m.params.store(nullptr);m.core=nullptr;
+        }
+        if(g_last_sr_core==&s && std::any_of(g_sr_uses.begin(),g_sr_uses.end(),[&](const auto& u){return belongs(u) && u.handle==g_last_sr_handle.load();})){
+            g_last_sr_core=nullptr;g_last_sr_handle.store(nullptr);
+        }
+        g_sr_uses.erase(std::remove_if(g_sr_uses.begin(),g_sr_uses.end(),belongs),g_sr_uses.end());
+        g_retired.erase(std::remove_if(g_retired.begin(),g_retired.end(),[&](const auto& u){return belongs(u.uses);}),g_retired.end());
+        // Another device can still be using this core. Do not retarget its maps
+        // or disable command-list observation merely because one device shut down.
+        if(!device)s.has_device.store(false);
     }
     if (r == 1) {
         std::lock_guard<std::mutex> lock(g_confirm_m);

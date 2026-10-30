@@ -293,7 +293,33 @@ int wmain(int argc, wchar_t** argv)
         REQUIRE(eval(next.Get(),nullptr,nullptr,nullptr)==1);
         CHECK(state()->releases==releases_before+3);
         REQUIRE(SUCCEEDED(next->Close()));na::nr::native::Reset(next.Get());na::nr::native::Maintain();
+        if(!gpu.warp) {
+        test::Device other_gpu;
+        Microsoft::WRL::ComPtr<IDXGIAdapter> warp_adapter;
+        REQUIRE(SUCCEEDED(gpu.factory->EnumWarpAdapter(IID_PPV_ARGS(&warp_adapter))));
+        REQUIRE(SUCCEEDED(D3D12CreateDevice(warp_adapter.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&other_gpu.device))));
+        REQUIRE(other_gpu.device!=gpu.device); // same-adapter D3D12CreateDevice returns the same device
+        REQUIRE(init(8,L"",other_gpu.device.Get(),0x15,nullptr)==1);
+        Microsoft::WRL::ComPtr<ID3D12CommandAllocator> other_allocator;
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> other_list;
+        REQUIRE(SUCCEEDED(other_gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&other_allocator))));
+        REQUIRE(SUCCEEDED(other_gpu.device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,other_allocator.Get(),nullptr,IID_PPV_ARGS(&other_list))));
+        void* other_original=nullptr;
+        REQUIRE(create(other_list.Get(),1,&p,&other_original)==1);
+        na::ngx::RequestReapply();REQUIRE(eval(other_list.Get(),other_original,&p,nullptr)==1);
+        const auto other_mapped=state()->last_handle_in;
+        CHECK(other_mapped!=reinterpret_cast<uintptr_t>(other_original));
         REQUIRE(shutdown(gpu.device.Get())==1);
+        REQUIRE(eval(other_list.Get(),other_original,&p,nullptr)==1);
+        CHECK(state()->last_handle_in==other_mapped); // one device's shutdown must not destroy the other's map
+        REQUIRE(SUCCEEDED(other_list->Close()));
+        na::nr::native::Reset(other_list.Get());na::nr::native::Maintain();
+        REQUIRE(release(other_original)==1);
+        REQUIRE(shutdown(other_gpu.device.Get())==1);
+        } else {
+            std::printf("two-device SR case unavailable on WARP-only host\n");
+            REQUIRE(shutdown(gpu.device.Get())==1);
+        }
     }
 #endif
     na::hooking::Shutdown();

@@ -54,27 +54,28 @@ inline bool CoversSubrect(uint64_t res_w, uint64_t res_h, uint32_t bx, uint32_t 
 class FeatureFlags {
 public:
     static constexpr uint32_t kUnknown = 0xFFFFFFFFu;
-    void Set(uint64_t handle, uint32_t flags)
+    void Set(uint64_t handle, uint32_t flags, uint64_t core = 0)
     {
         if (!handle) return;
-        for (Entry& e : e_) if (e.handle == handle) { e.flags = flags; return; }
-        for (Entry& e : e_) if (e.handle == 0) { e = {handle, flags}; return; }
-        e_[next_++ % kEntries] = {handle, flags}; // full: overwrite round-robin
+        for (Entry& e : e_) if (e.handle == handle && e.core == core) { e.flags = flags; return; }
+        for (Entry& e : e_) if (e.handle == 0) { e = {handle, flags, core}; return; }
+        e_[next_++ % kEntries] = {handle, flags, core}; // full: overwrite round-robin
     }
-    uint32_t Get(uint64_t handle) const
+    uint32_t Get(uint64_t handle, uint64_t core = 0) const
     {
         if (!handle) return kUnknown;
-        for (const Entry& e : e_) if (e.handle == handle) return e.flags;
+        for (const Entry& e : e_) if (e.handle == handle && e.core == core) return e.flags;
         return kUnknown;
     }
-    void Erase(uint64_t handle)
+    void Erase(uint64_t handle, uint64_t core = 0)
     {
-        for (Entry& e : e_) if (e.handle == handle) e = {};
+        for (Entry& e : e_) if (e.handle == handle && e.core == core) e = {};
     }
+    void EraseCore(uint64_t core) { for (Entry& e : e_) if (e.core == core) e = {}; }
 
 private:
     static constexpr uint32_t kEntries = 8;
-    struct Entry { uint64_t handle = 0; uint32_t flags = kUnknown; };
+    struct Entry { uint64_t handle = 0; uint32_t flags = kUnknown; uint64_t core = 0; };
     Entry e_[kEntries]{};
     uint32_t next_ = 0;
 };

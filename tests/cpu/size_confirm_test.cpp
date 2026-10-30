@@ -29,6 +29,10 @@ int main() { return test::run({
         FeatureFlags f; f.Set(7, 1); f.Set(8, 2); CHECK(f.Get(7) == 1 && f.Get(8) == 2);
         f.Set(7, 3); CHECK(f.Get(7) == 3); f.Erase(7); CHECK(f.Get(7) == FeatureFlags::kUnknown);
         f.Set(0, 0); CHECK(f.Get(0) == FeatureFlags::kUnknown);
+        f.Set(7, 11, 100); f.Set(7, 22, 200);
+        CHECK(f.Get(7, 100) == 11 && f.Get(7, 200) == 22);
+        f.Erase(7, 100); CHECK(f.Get(7, 200) == 22);
+        f.EraseCore(200); CHECK(f.Get(7, 200) == FeatureFlags::kUnknown);
         for (uint64_t id = 10; id < 30; ++id) f.Set(id, static_cast<uint32_t>(id));
         CHECK(f.Get(29) == 29); CHECK(f.Get(10) == FeatureFlags::kUnknown);
     }},
