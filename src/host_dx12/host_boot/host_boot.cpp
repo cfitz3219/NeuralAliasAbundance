@@ -1,4 +1,5 @@
 #include "host_dx12/adapters/tlou1/apply.hpp"
+#include "host_dx12/adapters/unreal/cvar_probe.hpp"
 #include "host_dx12/host_boot/host_boot.hpp"
 #include "host_dx12/host_boot/session.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
@@ -109,6 +110,9 @@ DWORD WINAPI InitThread(LPVOID)
     if (route_a) {
         na::fg::preset::Initialize();
         na::fg::preset::ReadUpscalerOverrides(); // read-only: does the NVIDIA app force a DLSS preset?
+        // Unreal adapter phase 1: read-only probe of the engine's resolution cvars
+        // (unreal_probe.log). [unreal] probe=0 turns it off.
+        if (GetPrivateProfileIntW(L"unreal", L"probe", 1, g_ini) == 1) na::unreal::StartCvarProbe();
         na::ngx::PreloadAndHookNgxCore();
         na::tlou1::InitializeApply();
         bool sync_hook = GetPrivateProfileIntW(L"observe", L"sync_loader_hook", 0, g_ini) == 1;
