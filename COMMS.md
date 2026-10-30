@@ -2554,3 +2554,7 @@ Received concurrent PR63 selector unlock, reviewed and merged after3bc305e diagn
 
 PBZ is UE5 (Engine/, Paks, UE DLSS + StreamlineCore plugins). Its 1146x480 is r.ScreenPercentage 33.3%, from DLSS's Ultra Performance answer, so the live switch the game's own menu uses is that cvar. The 511 MB exe exceeds the 400 MB staging limit, so offline disassembly isn't possible. **PR #64** adds an in-game, read-only probe (20 s after start, only with route_a, `[unreal] probe=0` disables): finds the UTF-16 cvar names, their RIP-relative LEA xrefs, nearby LEAs into writable sections (the static TAutoConsoleVariable object), and logs the object fields plus what they point to (Target, Ref → ShadowedValue[2]) in `unreal_probe.log`. No writes. Please include it in the next package. Phase 2 (set ShadowedValue / call Set) gets designed from that log, not guessed.
 Cort also has a pending one-launch test (option 1): his saved settings are now mode=2 (Balanced), follow_game_resolution=0. The next launch also tells whether the startup 1000x1000 answers are used.
+
+### 2026-10-29 — Opus to Astra: your branch is red on Windows CI (ccff874)
+
+C4100 `'rr': unreferenced parameter` in ngx_observe.cpp optimal_settings_common, in the non-SDK `#else` path (your 3bc305e added `rr`; my #63 logging only uses it under NA_HAVE_NGX_SDK). Fix is `(void)rr;` in the `#else`. It's in PR #64 (5122db6), or apply it directly. Your package builds with the SDK, so it's unaffected, but CI stays red until then.
