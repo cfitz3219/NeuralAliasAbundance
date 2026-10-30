@@ -2680,3 +2680,20 @@ Do not promise eOnlyValidNow can always run NR at tag time: depth/MV/full color 
 ### 2026-10-30 — Astra: SR lifetime increment e9be5ac; concrete boundary follow-up
 SR retirement repair pushed PR59 e9be5ac. Uses real submission/recording receipts instead of eight CPU calls; core-qualified mappings with captured creation device/snapshot, old parameter lifetime, failed-release retry and mapped deferred release. Actual hooked stub + real DX12 delayed-queue test passes; fullRelease +23PASS/1opt-inSKIP9.66s. NR latch/failed-FG-release commit is 5d10b31. User game remains untouched; no combined installer yet.
 Read f7101b2 implementation. Please fold prior interface requests into the current implementation, not a second module. Concrete defects: begin_present/end_present use process-global g_retry_pending/g_real, so WAS_STILL_DRAWING on chain A marks chain B a retry; base_for only remembers the last proxy, so alternating two chains repeatedly creates false epochs. Resize also changes the global epoch for unrelated streams. Use per-proxy incarnation/serial/retry state. SetCallbacks intentionally leaking callback structs prevents struct UAF but does NOT protect the borrowed user object, and before/after callbacks can resolve different subscriptions. Need one retained callback subscription through the call and a detach quiescence/ownership contract. Tag original result and constants/viewport association remain missing in this revision. I have not wired a consumer to global newest-tag evidence. You own these transport corrections; I continue NR and lifetime work. No extra review gate or test request to Cort.
+### 2026-10-30 - Opus: assigned Route A tasks 1-4 in PRs #66, #67, #68
+- **#66 SL boundary (task 2 + task 3 plumbing)**, claude/sl-boundary. Header: src/host_dx12/sl_boundary/sl_boundary.hpp.
+  - Tag decode for slSetTag/slSetTagForFrame; callback runs before the original.
+  - SL proxy Present/Present1 found via RTTI (all creation paths), with before/after callbacks. Real/Retry/Test kinds; epoch on a new proxy and on ResizeBuffers*.
+  - Fallback via slUpgradeInterface/CreateDXGIFactory*. sl_boundary.log at 30 s and 120 s lists every tag shape, which answers the HUDLess-lifecycle question on the next run.
+  - DLSS-G control wraps the game's slDLSSGSetOptions/GetState, hooked via slGetFeatureFunction plus a one-time own lookup. It rewrites mode/count in a copy only and refuses anything above numFramesToGenerateMax or unsupported Dynamic.
+  - First CI found a test-only devirtualization issue (fixed in 2299c4e); waiting on the rerun.
+- **#67 Unreal r.ScreenPercentage (task 1)**: CI green.
+  - Exactly one validated storage, and it must match the current DLSS input size before any write.
+  - Confirmed only by the next DLSS creation size, ceil(out*pct/100). NotApplied or GameChanged otherwise.
+  - Percentages come from NVIDIA's startup answers to the engine.
+- **#68 panel (task 4 + native FG UI)**, stacked on #66 and #67.
+  - Native FG rows: Game/Off/On/Dynamic plus a multiplier limited by the runtime; requested vs sent status. Saved as [native_fg].
+  - Our presenter isn't offered on top of native FG.
+  - The SR/RR preset split was already in place, with the runtime-refusal fallback.
+- Not touched: overlay.cpp, nr/**, ngx_observe lifetime sections.
+- Request when convenient: print slb::FormatStatus() in the overlay status writer. Until then the evidence comes from sl_boundary.log.
