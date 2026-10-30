@@ -1,5 +1,6 @@
 #include "host_dx12/adapters/tlou1/apply.hpp"
 #include "host_dx12/adapters/unreal/screen_percentage.hpp"
+#include "host_dx12/sl_boundary/sl_boundary.hpp"
 // Route A menu content (A30 redesign): the Picture page (status, master
 // switch, mode cards, preset), the Enhancements rows (Ray Reconstruction;
 // Neural Rendering and Frame Generation placeholders) and the Details rows
@@ -604,29 +605,13 @@ void DrawMotionRow()
 
 // A59 Frame Generation: NVIDIA's DLSS Frame Generation driven by NeuralAlias
 // (the game never asked for it). Off / Fixed / Dynamic with a multiplier.
-void DrawFrameGenerationRow()
+// Driver-profile FG model request and the freeze note: these apply to the
+// game's own frame generation and to ours alike.
+void DrawFgDriverPresetRows()
 {
     using namespace na::ui;
     na::settings::Settings& st = na::settings::Get();
-    na::ngx::Stats ngx = na::ngx::GetStats();
-    na::fg::Stats fs = na::fg::GetStats();
-    na::present::Stats pr = na::present::GetStats();
     char buf[240];
-    bool on = st.fg_enabled.load() != 0;
-    bool possible = na::present::Enabled();
-    const char* help = ngx.fg_seen
-        ? "Creates extra pictures between rendered frames.\nThis game runs NVIDIA's own Frame Generation; switching this on as well is not recommended."
-        : "Creates extra pictures between rendered frames using NVIDIA's Frame Generation. Smoother motion; the delay between your input and the picture grows a little.";
-    BeginRow("Frame Generation", possible ? help : "Creates extra pictures between rendered frames.\nNot available on this route.", SwitchWidth());
-    ImGui::BeginDisabled(!possible);
-    if (Switch("fg", &on)) {
-        st.fg_enabled.store(on ? 1u : 0u);
-        if (on) { na::fg::ResetLatch(); st.fg_frozen_at.store(0); } // A69: re-enabling clears the safe-mode note
-        na::settings::Save();
-    }
-    ImGui::EndDisabled();
-    EndRow();
-    RowDivider();
     int preset_choice = static_cast<int>(st.fg_preset.load()) - 1;
     if (preset_choice < 0 || preset_choice > 2) preset_choice = 0;
     const char* presets[] = {"Preset A", "Preset B", "Preset C (Performance)"};
@@ -650,6 +635,109 @@ void DrawFrameGenerationRow()
                  lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min);
         StatusLine(2, buf);
     }
+}
+
+// The GAME's own frame generation (Streamline DLSS-G): controls go to the
+// game's slDLSSGSetOptions through the SL boundary. The game keeps presenting;
+// our own generator is never stacked on top.
+void DrawNativeFrameGenerationRows(const na::ngx::Stats& ngx)
+{
+    using namespace na::ui;
+    na::settings::Settings& st = na::settings::Get();
+    const na::slb::FgState fg = na::slb::GetFgState();
+    char buf[260];
+    const bool hooked = fg.set_hooked != 0;
+    static const char* kNativeFgModes[] = {"Game's setting", "Off", "On", "Dynamic"};
+    int mode = static_cast<int>(st.native_fg_mode.load());
+    if (mode < 0 || mode > 3) mode = 0;
+    const int modes_shown = fg.dynamic_supported == 1 ? 4 : 3; // Dynamic only where the runtime reports it
+    if (mode >= modes_shown) mode = 0;
+    BeginRow("Game's Frame Generation",
+             "This game runs NVIDIA's own Frame Generation. NeuralAlias can switch it or change how many pictures it makes, through the game's own settings call. \"Game's setting\" leaves it exactly as the game asks.",
+             DropdownWidth());
+    ImGui::BeginDisabled(!hooked);
+    if (Combo("native_fg_mode", &mode, kNativeFgModes, modes_shown, DropdownWidth())) {
+        st.native_fg_mode.store(static_cast<uint32_t>(mode));
+        na::slb::SetFgRequest({static_cast<na::slb::FgMode>(mode), st.native_fg_frames.load()});
+        na::settings::Save();
+    }
+    ImGui::EndDisabled();
+    EndRow();
+    static const char* kMults[] = {"Game's", "2x", "3x", "4x", "5x", "6x"};
+    int frames = static_cast<int>(st.native_fg_frames.load());
+    if (frames < 0 || frames > 5) frames = 0;
+    int shown = fg.max_frames == 0xFFFFFFFFu ? 1 : static_cast<int>(fg.max_frames) + 1; // "Game's" + supported multipliers
+    if (shown > 6) shown = 6;
+    if (frames >= shown) frames = 0;
+    BeginRow(mode == 3 ? "Maximum" : "Multiplier",
+             "Pictures shown per rendered frame. Only multipliers this system reports are listed.", DropdownWidth());
+    ImGui::BeginDisabled(!hooked || mode == 1 || shown <= 1);
+    if (Combo("native_fg_frames", &frames, kMults, shown, DropdownWidth())) {
+        st.native_fg_frames.store(static_cast<uint32_t>(frames));
+        na::slb::SetFgRequest({static_cast<na::slb::FgMode>(mode), static_cast<uint32_t>(frames)});
+        na::settings::Save();
+    }
+    ImGui::EndDisabled();
+    EndRow();
+    // Requested versus what actually reached Streamline (and what it reports).
+    static const char* kSlModes[] = {"off", "on", "auto", "dynamic"};
+    auto mode_name = [](uint32_t m) { return m < 4 ? kSlModes[m] : "unknown"; };
+    if (!hooked) {
+        StatusLine(0, ngx.fg_seen ? "Waiting for the game's frame generation settings call..." : "The game has not started its frame generation.");
+    } else if (fg.set_calls == 0) {
+        StatusLine(0, "Waiting for the game to update its frame generation settings.");
+    } else {
+        // Applied = what reached NVIDIA is what was asked for (the game's value where "Game's").
+        static const uint32_t kToSl[] = {0xFFFFFFFFu, 0u, 1u, 3u};
+        const uint32_t want_mode = mode == 0 ? fg.game_mode : kToSl[mode];
+        const uint32_t want_frames = frames == 0 ? fg.game_frames : static_cast<uint32_t>(frames);
+        const bool applied = fg.sent_mode == want_mode && (want_mode == 0 || fg.sent_frames == want_frames);
+        snprintf(buf, sizeof(buf), "Game asks %s %ux; sent to NVIDIA %s %ux. %s",
+                 mode_name(fg.game_mode), fg.game_frames + 1, mode_name(fg.sent_mode), fg.sent_frames + 1, fg.reason);
+        StatusLine(fg.last_result == 0 && applied ? 1 : 2, buf);
+    }
+    if (BeginDetails("Game frame generation details")) {
+        char max_text[24] = "not reported yet";
+        if (fg.max_frames != 0xFFFFFFFFu) snprintf(max_text, sizeof(max_text), "%ux", fg.max_frames + 1);
+        snprintf(buf, sizeof(buf), "Settings calls %llu; state reads %llu; system maximum %s; dynamic %s; status 0x%x; pictures presented at last read %u.",
+                 static_cast<unsigned long long>(fg.set_calls), static_cast<unsigned long long>(fg.get_calls), max_text,
+                 fg.dynamic_supported < 0 ? "unknown" : (fg.dynamic_supported ? "supported" : "not supported"), fg.status, fg.presented);
+        Hint(buf);
+    }
+}
+
+void DrawFrameGenerationRow()
+{
+    using namespace na::ui;
+    na::settings::Settings& st = na::settings::Get();
+    na::ngx::Stats ngx = na::ngx::GetStats();
+    na::fg::Stats fs = na::fg::GetStats();
+    na::present::Stats pr = na::present::GetStats();
+    char buf[240];
+    bool on = st.fg_enabled.load() != 0;
+    // A game with its own frame generation keeps it: controls go to the game's
+    // generator, and ours is not offered on top (never two schedulers).
+    if (ngx.fg_seen || na::slb::GetFgState().set_hooked) {
+        DrawNativeFrameGenerationRows(ngx);
+        RowDivider();
+        DrawFgDriverPresetRows();
+        return;
+    }
+    bool possible = na::present::Enabled();
+    const char* help = ngx.fg_seen
+        ? "Creates extra pictures between rendered frames.\nThis game runs NVIDIA's own Frame Generation; switching this on as well is not recommended."
+        : "Creates extra pictures between rendered frames using NVIDIA's Frame Generation. Smoother motion; the delay between your input and the picture grows a little.";
+    BeginRow("Frame Generation", possible ? help : "Creates extra pictures between rendered frames.\nNot available on this route.", SwitchWidth());
+    ImGui::BeginDisabled(!possible);
+    if (Switch("fg", &on)) {
+        st.fg_enabled.store(on ? 1u : 0u);
+        if (on) { na::fg::ResetLatch(); st.fg_frozen_at.store(0); } // A69: re-enabling clears the safe-mode note
+        na::settings::Save();
+    }
+    ImGui::EndDisabled();
+    EndRow();
+    RowDivider();
+    DrawFgDriverPresetRows();
     if (!on || !possible) return;
     static const char* kFgModes[] = {"Fixed", "Dynamic"};
     int mode = st.fg_mode.load() ? 1 : 0;

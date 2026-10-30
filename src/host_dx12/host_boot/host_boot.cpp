@@ -124,6 +124,9 @@ DWORD WINAPI InitThread(LPVOID)
             if (wchar_t* slash = wcsrchr(slb_log, L'\\')) wcscpy_s(slash + 1, MAX_PATH - static_cast<size_t>(slash + 1 - slb_log), L"sl_boundary.log");
             else slb_log[0] = 0;
             na::slb::Start(slb_log);
+            // Saved request for the game's own frame generation (default: the game's setting).
+            na::slb::SetFgRequest({static_cast<na::slb::FgMode>(na::settings::Get().native_fg_mode.load()),
+                                   na::settings::Get().native_fg_frames.load()});
         }
         // Unreal adapter phase 2: live render resolution via r.ScreenPercentage.
         // Locating is read-only; the value changes only on the user's Apply.

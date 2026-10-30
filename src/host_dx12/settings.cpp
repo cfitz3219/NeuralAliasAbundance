@@ -128,6 +128,10 @@ void load_from(const wchar_t* ini, bool only_if_present)
     uint32_t ft = GetPrivateProfileIntW(L"fg", L"target_fps", 0, ini);
     g_settings.fg_target_fps.store(ft > 1000 ? 0 : ft);
     g_settings.fg_frozen_at.store(GetPrivateProfileIntW(L"fg", L"frozen_at", 0, ini)); // A69
+    const UINT nfm = GetPrivateProfileIntW(L"native_fg", L"mode", 0, ini);
+    g_settings.native_fg_mode.store(nfm <= 3 ? nfm : 0u);
+    const UINT nff = GetPrivateProfileIntW(L"native_fg", L"frames", 0, ini);
+    g_settings.native_fg_frames.store(nff <= 5 ? nff : 0u);
 }
 } // namespace
 
@@ -246,6 +250,10 @@ bool Save()
         swprintf_s(v, L"%u", kv.value);
         ok &= WritePrivateProfileStringW(L"fg", kv.key, v, ini) != 0;
     }
+    swprintf_s(v, L"%u", g_settings.native_fg_mode.load());
+    ok &= WritePrivateProfileStringW(L"native_fg", L"mode", v, ini) != 0;
+    swprintf_s(v, L"%u", g_settings.native_fg_frames.load());
+    ok &= WritePrivateProfileStringW(L"native_fg", L"frames", v, ini) != 0;
     g_last_save.store(ok ? 1u : 2u);
     return ok;
 }
