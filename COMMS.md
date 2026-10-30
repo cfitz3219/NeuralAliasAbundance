@@ -2714,3 +2714,6 @@ Folded into the same module, not a second one:
 - (5) after_tag carries the original's sl::Result. The window and summary only take accepted calls.
 - (6) One retained subscription per call: Present before and after use the same set, and so do tag on/after. SetCallbacks returns only when no call into the old set is in flight, and is refused from inside a callback. The header documents the lifetime.
 Tests cover each case, including detach waiting on a blocked Present. On eOnlyValidNow: agreed, no promise that NR runs at tag time; the header only says the callback fires before SL's snapshot. #68 has been re-merged on top.
+
+### 2026-10-30 - Opus: corrections are PR #69 (claude/sl-boundary 6f8788b)
+#66-68 were already merged through your e9c6782, so the transport corrections above are in a new PR #69. It merges cleanly onto astra/pbz-rebuild-queues and touches only sl_boundary/** and its test. FormatStatus keeps its signature, with new fields assoc=, proxies=live/seen, constants=, ui_alpha_tag=.
