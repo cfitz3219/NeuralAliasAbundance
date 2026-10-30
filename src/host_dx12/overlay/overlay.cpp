@@ -1,4 +1,5 @@
 #include "host_dx12/nr/native_fg.hpp"
+#include "host_dx12/sl_boundary/sl_boundary.hpp"
 #include "host_dx12/nr/fg_states.hpp"
 #include "host_dx12/adapters/tlou1/timing.hpp"
 #include "host_dx12/adapters/tlou1/apply.hpp"
@@ -552,21 +553,27 @@ void write_status_line()
     HANDLE f = CreateFileW(g_status_log, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return;
     DWORD written = 0;
-    WriteFile(f, line, static_cast<DWORD>(n), &written, nullptr);
+    WriteFile(f, line, static_cast<DWORD>((std::min)(n, static_cast<int>(sizeof(line)-1))), &written, nullptr);
+    char sl_boundary_line[1024];
+    const int sl_boundary_bytes=na::slb::FormatStatus(sl_boundary_line,sizeof(sl_boundary_line));
+    if(sl_boundary_bytes>0){
+        WriteFile(f,sl_boundary_line,static_cast<DWORD>((std::min)(sl_boundary_bytes,static_cast<int>(sizeof(sl_boundary_line)-1))),&written,nullptr);
+        WriteFile(f,"\r\n",2,&written,nullptr);
+    }
     char safe_line[80];const int safe_bytes=snprintf(safe_line,sizeof(safe_line),"safe_start=%u reason=%s\r\n",na::settings::SafeStart()?1u:0u,na::settings::SafeStartReason());
-    if(safe_bytes>0)WriteFile(f,safe_line,static_cast<DWORD>(safe_bytes),&written,nullptr);
+    if(safe_bytes>0)WriteFile(f, safe_line, static_cast<DWORD>((std::min)(safe_bytes, static_cast<int>(sizeof(safe_line)-1))), &written, nullptr);
     char fg_inputs[512];
     const int fg_input_bytes = snprintf(fg_inputs, sizeof(fg_inputs),
         "native_fg_inputs evaluates=%llu available_resources=%llu hudless=%llu distortion=%llu list_type=%u color_format=%u allocation=%ux%u nr_route=%s\r\n",
         static_cast<unsigned long long>(ngx.fg_evaluates), static_cast<unsigned long long>(ngx.fg_with_inputs),
         static_cast<unsigned long long>(ngx.fg_with_hudless), static_cast<unsigned long long>(ngx.fg_with_distortion),
         ngx.fg_list_type, ngx.fg_color_format, ngx.fg_color_w, ngx.fg_color_h,na::nr::native::OwnsRoute()?"pre_native_fg":"present");
-    if (fg_input_bytes > 0) WriteFile(f, fg_inputs, static_cast<DWORD>(fg_input_bytes), &written, nullptr);
+    if (fg_input_bytes > 0) WriteFile(f, fg_inputs, static_cast<DWORD>((std::min)(fg_input_bytes, static_cast<int>(sizeof(fg_inputs)-1))), &written, nullptr);
     const int fg_contract_bytes = snprintf(fg_inputs, sizeof(fg_inputs),
         "native_fg_contract frame_id_calls=%llu alpha_calls=%llu ui_calls=%llu last_create_uir=%u\r\n",
         static_cast<unsigned long long>(ngx.fg_with_frame_id), static_cast<unsigned long long>(ngx.fg_with_alpha),
         static_cast<unsigned long long>(ngx.fg_with_ui), ngx.fg_last_create_uir);
-    if (fg_contract_bytes > 0) WriteFile(f, fg_inputs, static_cast<DWORD>(fg_contract_bytes), &written, nullptr);
+    if (fg_contract_bytes > 0) WriteFile(f, fg_inputs, static_cast<DWORD>((std::min)(fg_contract_bytes, static_cast<int>(sizeof(fg_inputs)-1))), &written, nullptr);
     if (na::nr::native::OwnsRoute()) {
         const auto native=na::nr::native::GetStatus();
         const int bytes=snprintf(fg_inputs,sizeof(fg_inputs),
@@ -604,7 +611,7 @@ void write_status_line()
                       static_cast<unsigned long>(g_present_result.load()),
                       static_cast<unsigned long long>(g_game_latency_handle.load()),
                       static_cast<unsigned long long>(g_present_queue_identity.load()));
-    if (pn > 0) WriteFile(f, pacing, static_cast<DWORD>(pn), &written, nullptr);
+    if (pn > 0) WriteFile(f, pacing, static_cast<DWORD>((std::min)(pn, static_cast<int>(sizeof(pacing)-1))), &written, nullptr);
     {
         const auto j2 = na::j2::GetStats();
         uint64_t mb_s = 0, mb_st = 0;
@@ -634,7 +641,7 @@ void write_status_line()
             (unsigned long long)j2.inline_presents, (unsigned long long)j2.inline_covered,
             (unsigned long long)j2.inline_late_writes, (unsigned long long)j2.inline_jittered,
             j2.inline_jitter_x, j2.inline_jitter_y);
-        if (nc > 0) WriteFile(f, coverage, static_cast<DWORD>(nc), &written, nullptr);
+        if (nc > 0) WriteFile(f, coverage, static_cast<DWORD>((std::min)(nc, static_cast<int>(sizeof(coverage)-1))), &written, nullptr);
         {
             static const char* kRoutes[] = {"none", "between", "inline", "interceptor"};
             static const char* kModes[] = {"auto", "forced-between", "forced-inline"};
@@ -706,7 +713,7 @@ void write_status_line()
         char nl[200];
         const int nn = snprintf(nl, sizeof nl, "mip_native below0=%llu at0=%llu above0=%llu min=%.2f max=%.2f (game's own bias on surface samplers)\r\n",
                                 static_cast<unsigned long long>(nbs.negative), static_cast<unsigned long long>(nbs.zero), static_cast<unsigned long long>(nbs.positive), nbs.min, nbs.max);
-        if (nn > 0) WriteFile(f, nl, static_cast<DWORD>(nn), &written, nullptr);
+        if (nn > 0) WriteFile(f, nl, static_cast<DWORD>((std::min)(nn, static_cast<int>(sizeof(nl)-1))), &written, nullptr);
         // Live texture detail: were twins built, and do recordings use them or fall back?
         const auto ml = na::observe::GetMipLiveStats();
         char ml_line[300];
@@ -714,35 +721,35 @@ void write_status_line()
                                 ml.enabled ? 1u : 0u, na::observe::SamplerMipBias(), ml.game_bias, (unsigned long long)ml.twin_root_signatures,
                                 (unsigned long long)ml.twin_pipelines, (unsigned long long)ml.untwinned_pipelines, (unsigned long long)ml.fallbacks,
                                 (unsigned long long)ml.twin_failures);
-        if (mn > 0) WriteFile(f, ml_line, static_cast<DWORD>(mn), &written, nullptr);
+        if (mn > 0) WriteFile(f, ml_line, static_cast<DWORD>((std::min)(mn, static_cast<int>(sizeof(ml_line)-1))), &written, nullptr);
     }
     const auto latency = na::latency::GetStats();
     char lm[900];
     int ln = snprintf(lm, sizeof(lm), "latency request=%d available=%u confirmed=%u game_sleep=%u native_n=%llu native_ms=%.2f set=%d query=%d foreground=%u vrr=%u cpl_vsync=%u iflip=%u sync=%u flags=0x%X ready_ms=%.2f ready_p95=%.2f real_age_ms=%.2f real_age_p95=%.2f interval_ms=%.2f interval_p95=%.2f present_ms=%.2f backlog=%u\r\n", na::settings::Get().reflex_mode.load(), latency.available, latency.low_latency, latency.game_sleep, static_cast<unsigned long long>(latency.native_samples), latency.native_render_ms, latency.set_result, latency.query_result, latency.foreground, latency.fullscreen_vrr, latency.vsync_override, latency.independent_flip, pr.requested_sync, pr.requested_flags, pr.ready_age.mean, pr.ready_age.p95, pr.real_age.mean, pr.real_age.p95, pr.submit_interval.mean, pr.submit_interval.p95, pr.present_call.mean, pr.backlog);
-    if (ln > 0) WriteFile(f, lm, static_cast<DWORD>(ln), &written, nullptr);
+    if (ln > 0) WriteFile(f, lm, static_cast<DWORD>((std::min)(ln, static_cast<int>(sizeof(lm)-1))), &written, nullptr);
     ln = snprintf(lm, sizeof(lm), "reflex_observers sleep=%u marker=%u dropped=%llu (incoming calls, not engine-placement qualification)\r\n", latency.sleep_observer, latency.marker_observer, static_cast<unsigned long long>(latency.audit_dropped));
-    if (ln > 0) WriteFile(f, lm, static_cast<DWORD>(ln), &written, nullptr);
+    if (ln > 0) WriteFile(f, lm, static_cast<DWORD>((std::min)(ln, static_cast<int>(sizeof(lm)-1))), &written, nullptr);
     for (uint32_t kind = 0; kind < na::latency::NativeAudit::Slots; ++kind) {
         const auto& c = latency.audit.calls[kind];
         if (!c.count) continue;
         ln = snprintf(lm, sizeof(lm), "reflex_incoming kind=%u count=%llu ok=%llu device=0x%llX frame=%llu thread=%u caller=0x%llX begin_qpc=%llu end_qpc=%llu result=%d\r\n", kind, static_cast<unsigned long long>(c.count), static_cast<unsigned long long>(c.successes), static_cast<unsigned long long>(c.device), static_cast<unsigned long long>(c.frame), c.thread, static_cast<unsigned long long>(c.caller), static_cast<unsigned long long>(c.begin_qpc), static_cast<unsigned long long>(c.end_qpc), c.result);
-        if (ln > 0) WriteFile(f, lm, static_cast<DWORD>(ln), &written, nullptr);
+        if (ln > 0) WriteFile(f, lm, static_cast<DWORD>((std::min)(ln, static_cast<int>(sizeof(lm)-1))), &written, nullptr);
     }
     ln = snprintf(lm, sizeof(lm), "reflex_engine attached=%u available=%u external=%u pcl=%u sleeps=%llu markers=%llu complete=%llu rejected=%llu errors=%llu result=%d\r\n", latency.engine_attached, latency.engine_available, latency.external_owner, latency.pcl_available, static_cast<unsigned long long>(latency.engine_sleep), static_cast<unsigned long long>(latency.engine_markers), static_cast<unsigned long long>(latency.engine_complete), static_cast<unsigned long long>(latency.engine_rejected), static_cast<unsigned long long>(latency.engine_errors), latency.engine_last_result);
-    if (ln > 0) WriteFile(f, lm, static_cast<DWORD>(ln), &written, nullptr);
+    if (ln > 0) WriteFile(f, lm, static_cast<DWORD>((std::min)(ln, static_cast<int>(sizeof(lm)-1))), &written, nullptr);
     const auto timing_trace = na::tlou1::GetTimingTrace();
     ln=snprintf(lm,sizeof(lm),"gpu_present_copy first_ms=%.3f first_p95=%.3f interval_ms=%.3f interval_p95=%.3f samples=%u independent_queue=%u (GPU completion, not scanout)\r\n",pr.gpu_first_copy.mean,pr.gpu_first_copy.p95,pr.gpu_copy_interval.mean,pr.gpu_copy_interval.p95,pr.gpu_first_copy.count,pr.independent_queue);
-    if(ln>0) WriteFile(f,lm,static_cast<DWORD>(ln),&written,nullptr);
+    if(ln>0) WriteFile(f, lm, static_cast<DWORD>((std::min)(ln, static_cast<int>(sizeof(lm)-1))), &written, nullptr);
     ln = snprintf(lm,sizeof(lm),"engine_present seen=%llu with_frame=%llu game_callers=",timing_trace.seen,timing_trace.with_frame);
     for(unsigned i=0;i<timing_trace.count && ln<700;++i) ln+=snprintf(lm+ln,sizeof(lm)-ln,"%llX,",static_cast<unsigned long long>(timing_trace.callers[i]));
     ln+=snprintf(lm+ln,sizeof(lm)-ln,"\r\n");
-    if(ln>0) WriteFile(f,lm,static_cast<DWORD>(ln),&written,nullptr);
+    if(ln>0) WriteFile(f, lm, static_cast<DWORD>((std::min)(ln, static_cast<int>(sizeof(lm)-1))), &written, nullptr);
     const auto camera = na::fg::GetCameraStats();
     ln = snprintf(lm, sizeof(lm), "fg_camera recorded=%llu rejected=%llu matched=%llu missed=%llu\r\n", camera.recorded,camera.rejected,camera.matched,camera.missed);
-    if (ln > 0) WriteFile(f,lm,static_cast<DWORD>(ln),&written,nullptr);
+    if (ln > 0) WriteFile(f, lm, static_cast<DWORD>((std::min)(ln, static_cast<int>(sizeof(lm)-1))), &written, nullptr);
     const auto fpreset = na::fg::preset::GetStatus();
     ln = snprintf(lm, sizeof(lm), "fg_driver_preset requested=%u stored=%u result=%d pending=%u restart=%u (profile request; active model unverified)\r\n", fpreset.requested, fpreset.stored, fpreset.result, fpreset.pending ? 1u : 0u, fpreset.restart ? 1u : 0u);
-    if (ln > 0) WriteFile(f, lm, static_cast<DWORD>(ln), &written, nullptr);
+    if (ln > 0) WriteFile(f, lm, static_cast<DWORD>((std::min)(ln, static_cast<int>(sizeof(lm)-1))), &written, nullptr);
     const auto drv = na::fg::preset::GetUpscalerOverrides();
     const auto optc = na::ngx::GetOptimalStats();
     const auto ngxs = na::ngx::GetStats();
@@ -752,7 +759,7 @@ void write_status_line()
                   na::ngx::OptimalQueriedFor(ngxs.last_sr_out_w, ngxs.last_sr_out_h) ? 1u : 0u,
                   static_cast<unsigned long long>(optc.swaps_capability), static_cast<unsigned long long>(optc.swaps_allocate),
                   static_cast<unsigned long long>(optc.swaps_getparams));
-    if (ln > 0) WriteFile(f, lm, static_cast<DWORD>(ln), &written, nullptr);
+    if (ln > 0) WriteFile(f, lm, static_cast<DWORD>((std::min)(ln, static_cast<int>(sizeof(lm)-1))), &written, nullptr);
     {
         static uint64_t opt_logged = 0;
         na::ngx::OptimalCall calls[16];
@@ -762,7 +769,7 @@ void write_status_line()
             ln = snprintf(lm, sizeof(lm), "dlss_optimal_call seq=%llu rr=%u asked=%ux%u pq=%d nvidia=%ux%u returned=%ux%u overridden=%u\r\n",
                           static_cast<unsigned long long>(c.sequence), c.rr, c.user_w, c.user_h, c.perf_quality,
                           c.native_w, c.native_h, c.out_w, c.out_h, c.overridden);
-            if (ln > 0) WriteFile(f, lm, static_cast<DWORD>(ln), &written, nullptr);
+            if (ln > 0) WriteFile(f, lm, static_cast<DWORD>((std::min)(ln, static_cast<int>(sizeof(lm)-1))), &written, nullptr);
             opt_logged = c.sequence;
         }
     }
@@ -787,16 +794,16 @@ void write_status_line()
                       static_cast<unsigned long long>(nr.inputs_seen), static_cast<unsigned long long>(nr.input_overwrites),
                       static_cast<unsigned long long>(nr.missing_inputs), static_cast<unsigned long long>(nr.busy_slots),
                       static_cast<unsigned long long>(nr.untracked_lists));
-    if (nn > 0) WriteFile(f, nr_line, static_cast<DWORD>(nn), &written, nullptr);
+    if (nn > 0) WriteFile(f, nr_line, static_cast<DWORD>((std::min)(nn, static_cast<int>(sizeof(nr_line)-1))), &written, nullptr);
     nn = snprintf(nr_line, sizeof(nr_line), "nr_queue_sync input_submitted=%llu input_completed=%llu gpu_waits=%llu\r\n",
                   static_cast<unsigned long long>(nr.input_submitted), static_cast<unsigned long long>(nr.input_completed),
                   static_cast<unsigned long long>(nr.cross_queue_waits));
-    if (nn > 0) WriteFile(f, nr_line, static_cast<DWORD>(nn), &written, nullptr);
+    if (nn > 0) WriteFile(f, nr_line, static_cast<DWORD>((std::min)(nn, static_cast<int>(sizeof(nr_line)-1))), &written, nullptr);
     char fg_line[256];
     int fn = snprintf(fg_line, sizeof(fg_line), "fg_inputs recorded=%llu submitted=%llu overwritten=%llu missing=%llu\r\n",
                       static_cast<unsigned long long>(fg.inputs_recorded), static_cast<unsigned long long>(fg.inputs_submitted),
                       static_cast<unsigned long long>(fg.inputs_overwritten), static_cast<unsigned long long>(fg.missing_inputs));
-    if (fn > 0) WriteFile(f, fg_line, static_cast<DWORD>(fn), &written, nullptr);
+    if (fn > 0) WriteFile(f, fg_line, static_cast<DWORD>((std::min)(fn, static_cast<int>(sizeof(fg_line)-1))), &written, nullptr);
     // A66 (R3): one line per game-driven DLSS creation since the last write:
     // sequence, thread, result, sizes, the Apply request it happened under
     // (ctx=apply#N, or ctx=game for a baseline / game-menu creation), and the
@@ -841,12 +848,12 @@ void write_status_line()
         int m = snprintf(hl, sizeof(hl), "%02u:%02u:%02u FREEZE detected: the game's presents have not advanced for %llu ms (game_presents=%llu real_presents=%llu fg_active=%u count=%u backlog=%u). Thread stacks follow (innermost first).\r\n",
                          t.wHour, t.wMinute, t.wSecond, static_cast<unsigned long long>(watchdog.StalledMs(now)),
                          static_cast<unsigned long long>(host_presents), static_cast<unsigned long long>(pr.presents_real), fg.active, fg.last_count, pr.backlog);
-        if (m > 0) WriteFile(f, hl, static_cast<DWORD>(m), &written, nullptr);
+        if (m > 0) WriteFile(f, hl, static_cast<DWORD>((std::min)(m, static_cast<int>(sizeof(hl)-1))), &written, nullptr);
         static na::freeze::Capture cap; // static: not on this thread's stack
         na::freeze::CaptureAllThreads(&cap);
         m = snprintf(hl, sizeof(hl), "FREEZE thread coverage: captured=%u found=%u capacity=%u\r\n",
                      cap.thread_count, cap.threads_total, na::freeze::kMaxThreads);
-        if (m > 0) WriteFile(f, hl, static_cast<DWORD>(m), &written, nullptr);
+        if (m > 0) WriteFile(f, hl, static_cast<DWORD>((std::min)(m, static_cast<int>(sizeof(hl)-1))), &written, nullptr);
         for (uint32_t i = 0; i < cap.thread_count; ++i) {
             char sl[2400];
             uint32_t len = na::freeze::FormatStack(cap.threads[i], sl, sizeof(sl) - 4);
@@ -867,7 +874,7 @@ void write_status_line()
                 char dump_a[MAX_PATH];
                 WideCharToMultiByte(CP_ACP, 0, dump, -1, dump_a, sizeof(dump_a), nullptr, nullptr);
                 m = snprintf(dl, sizeof(dl), "%02u:%02u:%02u FREEZE minidump %s: %s\r\n", t.wHour, t.wMinute, t.wSecond, ok ? "written" : "FAILED", dump_a);
-                if (m > 0) WriteFile(f, dl, static_cast<DWORD>(m), &written, nullptr);
+                if (m > 0) WriteFile(f, dl, static_cast<DWORD>((std::min)(m, static_cast<int>(sizeof(dl)-1))), &written, nullptr);
             }
         }
         // Safe mode for the next launch: Frame Generation off, with the time recorded.
@@ -876,7 +883,7 @@ void write_status_line()
             na::settings::Get().fg_frozen_at.store(static_cast<uint32_t>(time(nullptr)), std::memory_order_release);
             bool saved = na::settings::Save();
             m = snprintf(hl, sizeof(hl), "%02u:%02u:%02u FREEZE safe mode: Frame Generation switched off for the next launch (%s).\r\n", t.wHour, t.wMinute, t.wSecond, saved ? "saved" : "save FAILED");
-            if (m > 0) WriteFile(f, hl, static_cast<DWORD>(m), &written, nullptr);
+            if (m > 0) WriteFile(f, hl, static_cast<DWORD>((std::min)(m, static_cast<int>(sizeof(hl)-1))), &written, nullptr);
         }
     }
     // A71: the game's Streamline settings calls (slSetFeatureConstants = set_constants,
@@ -914,7 +921,7 @@ void write_status_line()
                            static_cast<unsigned long long>(a.frame_calls), static_cast<unsigned long long>(a.predicate_calls),
                            static_cast<unsigned long long>(a.triggers), static_cast<unsigned long long>(a.resource_releases),
                            static_cast<unsigned long long>(a.resource_release_failures), a.trigger_thread, a.reason);
-        if (len > 0 && len < static_cast<int>(sizeof(row))) WriteFile(f, row, static_cast<DWORD>(len), &written, nullptr);
+        if (len > 0 && len < static_cast<int>(sizeof(row))) WriteFile(f, row, static_cast<DWORD>((std::min)(len, static_cast<int>(sizeof(row)-1))), &written, nullptr);
     }
     // A66 (R1): the size-confirmation monitor, one line whenever its state changes.
     static uint64_t last_confirm_id = 0;
@@ -930,7 +937,7 @@ void write_status_line()
                          static_cast<unsigned long long>(sc.mismatched), static_cast<unsigned long long>(sc.incoherent), static_cast<unsigned long long>(sc.failed),
                          static_cast<unsigned long long>(sc.resets), static_cast<unsigned long long>(sc.unknown_handle), static_cast<unsigned long long>(sc.other_feature),
                          static_cast<unsigned long long>(sc.before_restore), static_cast<unsigned long long>(sc.creations));
-        if (m > 0) WriteFile(f, cl, static_cast<DWORD>(m), &written, nullptr);
+        if (m > 0) WriteFile(f, cl, static_cast<DWORD>((std::min)(m, static_cast<int>(sizeof(cl)-1))), &written, nullptr);
     }
     CloseHandle(f);
 }

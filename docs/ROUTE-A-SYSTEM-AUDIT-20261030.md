@@ -210,3 +210,13 @@ Additional primary sources checked:
 - NVIDIA Streamline general guide (tag state/lifetime and copies): https://github.com/NVIDIA-RTX/Streamline/blob/main/docs/ProgrammingGuide.md
 
 The public proxy is not the closed FG scheduler; its source establishes interface ordering, not PBZ's internal copy topology. Initial URLs omitting the `dxgi/` subdirectory returned 404; the corrected sources above were read.
+
+## Implementation progress — 2026-10-30 (append-only)
+
+Production now includes repairs 1eecaaf, 5d10b31, e9be5ac, c5bcd5e and 54f02b1: independent Home draw receipts; completed backbuffer reference retirement at resize; NR enable decision latched per real/MFG group; failed FG release retains classification; SR replacement ownership follows submitted recordings rather than CPU call counts; core/device-scoped SR metadata and shutdown cleanup; failed native FG evaluation resets the next new NR history without discarding the current cached image. Permanent tests cover these defects. Original audit evidence and its qualifications above remain historical.
+
+Opus's transport/control/panel branches through c1fa5ea are merged for combined build validation (merge e9c6782). Added requested Streamline status line. Bounded the status writer's snprintf-derived WriteFile lengths: snprintf returns the desired length on truncation, so the former path could read beyond a stack buffer. This is a confirmed logging defect, not evidence explaining visible NR/overlay flicker.
+
+Combined full Release PASS. 52 CPU/host/DX12 tests PASS; one opt-in actual-model probe SKIP; total11.54s. Tests include the new SL hook test plus all portable CPU tests and affected NR/overlay/NGX tests. No game launch, deployment, native DLL replacement or updated installer. No end-to-end PBZ quality claim.
+
+Still open: connecting game-facing tags/presentation to one enhanced real/generated source, stable HUD/HDR composition and exact frame/stream history handoff. Opus's currently merged transport still has process-global newest-tag/retry/epoch state and incomplete callback ownership/accepted-tag/constants metadata; COMMS assigns those specific corrections to him. No NR consumer is connected to those incomplete identities. The actual captured native fence owner is still unproven. Engineering completion and a new installer must not be inferred from this combined build.
