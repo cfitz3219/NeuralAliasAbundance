@@ -551,7 +551,7 @@ void write_status_line()
     WriteFile(f, line, static_cast<DWORD>(n), &written, nullptr);
     char safe_line[80];const int safe_bytes=snprintf(safe_line,sizeof(safe_line),"safe_start=%u reason=%s\r\n",na::settings::SafeStart()?1u:0u,na::settings::SafeStartReason());
     if(safe_bytes>0)WriteFile(f,safe_line,static_cast<DWORD>(safe_bytes),&written,nullptr);
-    char fg_inputs[320];
+    char fg_inputs[512];
     const int fg_input_bytes = snprintf(fg_inputs, sizeof(fg_inputs),
         "native_fg_inputs evaluates=%llu available_resources=%llu hudless=%llu distortion=%llu list_type=%u color_format=%u allocation=%ux%u nr_route=%s\r\n",
         static_cast<unsigned long long>(ngx.fg_evaluates), static_cast<unsigned long long>(ngx.fg_with_inputs),
@@ -572,9 +572,9 @@ void write_status_line()
             static_cast<unsigned long long>(native.skipped),native.avg_ms,native.gpu_samples,native.reason);
         if(bytes>0)WriteFile(f,fg_inputs,static_cast<DWORD>((std::min)(bytes,static_cast<int>(sizeof(fg_inputs)-1))),&written,nullptr);
         const int state_bytes=snprintf(fg_inputs,sizeof(fg_inputs),
-            "nr_pre_fg_delivery frame_id=%llu states_known=%u color_state=0x%x hudless_state=0x%x backbuffer_is_swapchain=%u output_real=%u output_real_is_swapchain=%u identity=%u inner=%u/%u list_type=%u\r\n",
+            "nr_pre_fg_delivery frame_id=%llu states_known=%u color_state=0x%x hudless_state=0x%x backbuffer_is_swapchain=%u output_real=%u output_real_is_swapchain=%u identity=%u inner=%u/%u list_type=%u states_ready=%u read_contract_mask=0x%x hudless_replaced=%u\r\n",
             static_cast<unsigned long long>(native.frame_id),native.input_states_known,native.color_state,native.hudless_state,
-            native.backbuffer_is_swapchain,native.output_real_present,native.output_real_is_swapchain,native.identity_mode,native.multi_index,native.multi_count,native.list_type);
+            native.backbuffer_is_swapchain,native.output_real_present,native.output_real_is_swapchain,native.identity_mode,native.multi_index,native.multi_count,native.list_type,native.input_states_ready,native.state_contract_mask,native.hudless_replaced);
         if(state_bytes>0)WriteFile(f,fg_inputs,static_cast<DWORD>((std::min)(state_bytes,static_cast<int>(sizeof(fg_inputs)-1))),&written,nullptr);
         const char* names[]={"color","hudless","depth","motion"};
         for(unsigned i=0;i<4;++i){

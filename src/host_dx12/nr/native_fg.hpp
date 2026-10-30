@@ -3,8 +3,21 @@
 #include <mutex>
 #include <memory>
 namespace na::nr::native {
+// Scoped only around the original native FG evaluate. GPU ownership remains
+// with its recorded Packet; the caller's parameter object is restored on return.
+class InputOverride {
+public:
+    InputOverride()=default;
+    InputOverride(const InputOverride&)=delete;
+    InputOverride& operator=(const InputOverride&)=delete;
+    ~InputOverride();
+    void Bind(const void* parameters,ID3D12Resource* replacement);
+private:
+    void* parameters_=nullptr;
+    ID3D12Resource* original_=nullptr;
+};
 // Called on the native FG recording thread before its original NGX evaluate.
-void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,const void* parameters,const Runtime& runtime);
+void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,const void* parameters,const Runtime& runtime,InputOverride* replacement=nullptr);
 void Register(const void* core,const void* handle);
 void Release(const void* core,const void* handle);
 void CoreShutdown(const void* core);
@@ -21,6 +34,7 @@ struct Status {
     uint32_t gpu_samples=0;
     uint32_t input_states_known=0,color_state=0,hudless_state=0;
     uint32_t input_states[4]{},input_evidence[4]{},illegal_state_mask=0;
+    uint32_t input_states_ready=0,state_contract_mask=0,hudless_replaced=0;
     uint32_t backbuffer_is_swapchain=0,output_real_is_swapchain=0,output_real_present=0;
     uint64_t frame_id=0;
     uint32_t identity_mode=0,multi_count=0,multi_index=0,list_type=0;

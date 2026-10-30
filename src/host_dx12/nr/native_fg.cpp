@@ -33,9 +33,9 @@ std::atomic<uint64_t> submissions{0};
 const GUID swapchain_key={0xc3f25562,0xe301,0x46c8,{0xb8,0x2d,0xa7,0x9e,0x0d,0x83,0xfe,0xf1}};
 bool IsSwapchain(ID3D12Resource* r){UINT value=0,size=sizeof(value);return r && SUCCEEDED(r->GetPrivateData(swapchain_key,&size,&value)) && value==1;}
 void Reason(const char* text) { strncpy_s(status.reason,text,_TRUNCATE); }
-bool Texture(ID3D12Device* d,uint32_t w,uint32_t h,DXGI_FORMAT f,D3D12_RESOURCE_STATES state,ComPtr<ID3D12Resource>& out) {
+bool Texture(ID3D12Device* d,uint32_t w,uint32_t h,DXGI_FORMAT f,D3D12_RESOURCE_STATES state,ComPtr<ID3D12Resource>& out,D3D12_RESOURCE_FLAGS flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
     D3D12_RESOURCE_DESC desc{}; desc.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D; desc.Width=w; desc.Height=h;
-    desc.DepthOrArraySize=desc.MipLevels=1; desc.Format=f; desc.SampleDesc.Count=1; desc.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    desc.DepthOrArraySize=desc.MipLevels=1; desc.Format=f; desc.SampleDesc.Count=1; desc.Flags=flags;
     D3D12_HEAP_PROPERTIES hp{}; hp.Type=D3D12_HEAP_TYPE_DEFAULT;
     return SUCCEEDED(d->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&desc,state,nullptr,IID_PPV_ARGS(&out)));
 }
@@ -58,23 +58,31 @@ struct InputStates {
     D3D12_RESOURCE_STATES original[4]{};
     uint32_t count=0;
     bool ready=false;
-    InputStates(ID3D12GraphicsCommandList* l,const FgContract& f):list(l) {
+    bool replace_hudless=false;
+    InputStates(ID3D12GraphicsCommandList* l,const FgContract& f,bool can_replace):list(l) {
         ID3D12Resource* inputs[]={f.color.resource,f.hudless.resource,f.depth.resource,f.motion.resource};
-        bool all_known=true;status.illegal_state_mask=0;
+        bool all_known=true;status.illegal_state_mask=0;status.state_contract_mask=0;
+        // NVIDIA DLSS-FG guide section 6 requires compute-readable INPUTS at
+        // EvaluateFeature. This is permission to read, NOT exact state evidence.
+        // Missing color state still refuses: real-picture copy-back needs it.
         for(uint32_t i=0;i<4;++i){
             D3D12_RESOURCE_STATES state{};auto evidence=states::Inspect(l,inputs[i],state);
+            if(i>0 && evidence==states::Evidence::NoTransition && !IsSwapchain(inputs[i]) &&
+               (i!=1 || can_replace)) {
+                evidence=states::Evidence::NgxReadContract;
+                status.state_contract_mask|=1u<<i;
+                if(i==1)replace_hudless=true;
+            }
             status.input_states[i]=static_cast<uint32_t>(state);
             status.input_evidence[i]=static_cast<uint32_t>(evidence);
-            if(evidence!=states::Evidence::Known)all_known=false;
-            else if(!states::CanTransitionOn(l->GetType(),state)){status.illegal_state_mask|=1u<<i;all_known=false;}
+            if(evidence==states::Evidence::NgxReadContract)continue; // no barrier or restore for unknown state
+            if(evidence!=states::Evidence::Known){all_known=false;continue;}
+            if(!states::CanTransitionOn(l->GetType(),state)){status.illegal_state_mask|=1u<<i;all_known=false;}
+            bool duplicate=false;for(uint32_t k=0;k<count;++k)duplicate|=resources[k]==inputs[i];
+            if(!duplicate){resources[count]=inputs[i];original[count++]=state;}
         }
         status.color_state=status.input_states[0];status.hudless_state=status.input_states[1];
-        if(!all_known)return; // publish ALL input evidence before any early exit
-        for(auto* r:inputs) {
-            bool duplicate=false;for(uint32_t i=0;i<count;++i)duplicate|=resources[i]==r;
-            if(duplicate)continue;
-            resources[count]=r;if(!states::Read(l,r,original[count]) || !states::CanTransitionOn(l->GetType(),original[count]))return;++count;
-        }
+        if(!all_known)return;
         for(uint32_t i=0;i<count;++i)if(original[i]!=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
             Barrier(list,resources[i],original[i],D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         ready=true;
@@ -99,6 +107,7 @@ struct Feature {
 struct Packet {
     std::shared_ptr<Feature> feature;
     FgComposition composition;
+    ComPtr<ID3D12Resource> hudless_override;
     FgColorPass input,output;
     ComPtr<ID3D12Resource> refs[6];
     bool receipt_set=false;
@@ -245,6 +254,30 @@ void CopyRegion(ID3D12GraphicsCommandList* list,ID3D12Resource* source,FgSurface
     Barrier(list,dest.resource,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     Barrier(list,source,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 }
+bool ReplaceHudless(ID3D12GraphicsCommandList* list,ID3D12Device* device,Packet& packet,const FgContract& f,const void* parameters,InputOverride& replacement) {
+    const auto target=f.hudless.resource->GetDesc();
+    if(!packet.hudless_override){
+        if(!Texture(device,static_cast<uint32_t>(target.Width),target.Height,target.Format,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,packet.hudless_override,D3D12_RESOURCE_FLAG_NONE))return false;
+    }
+    const auto owned=packet.hudless_override->GetDesc();
+    if(owned.Width!=target.Width || owned.Height!=target.Height || owned.Format!=target.Format)return false;
+    // The packet cannot be recycled while any submitted FG call consumes it.
+    auto destination=f.hudless;destination.resource=packet.hudless_override.Get();
+    CopyRegion(list,packet.composition.Hudless(),destination);
+    replacement.Bind(parameters,packet.hudless_override.Get());
+    status.hudless_replaced=1;
+    return true;
+}
+
+}
+InputOverride::~InputOverride(){
+    if(parameters_)static_cast<NVSDK_NGX_Parameter*>(parameters_)->Set("DLSSG.HUDLess",original_);
+}
+void InputOverride::Bind(const void* parameters,ID3D12Resource* replacement){
+    auto* p=const_cast<NVSDK_NGX_Parameter*>(static_cast<const NVSDK_NGX_Parameter*>(parameters));
+    if(!parameters_){p->Get("DLSSG.HUDLess",&original_);parameters_=p;}
+    p->Set("DLSSG.HUDLess",replacement);
 }
 bool OwnsRoute(){return contexts_count.load()!=0;}
 void Register(const void* core,const void* handle){
@@ -290,7 +323,7 @@ void CoreShutdown(const void* core) {
 }
 Status GetStatus(){std::unique_lock<std::mutex> lock(mutex,std::try_to_lock);if(lock.owns_lock()){auto s=status;s.submitted=submissions.load();return s;} Status s;strcpy_s(s.reason,"Updating Neural Rendering.");return s;}
 void MarkSwapchainBuffer(ID3D12Resource* r){if(r){const UINT value=1;r->SetPrivateData(swapchain_key,sizeof(value),&value);}}
-void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,const void* parameters,const Runtime& runtime) {
+void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,const void* parameters,const Runtime& runtime,InputOverride* replacement) {
     if(!list || !parameters || (list->GetType()!=D3D12_COMMAND_LIST_TYPE_DIRECT && list->GetType()!=D3D12_COMMAND_LIST_TYPE_COMPUTE))return;
     if(internal)return;Internal guard;na::dlss::InjectorCallScope origin;
     std::lock_guard<std::mutex> lock(mutex);Collect();
@@ -299,7 +332,7 @@ void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,
     status.active=0;
     if(!settings::Get().nr_enabled.load()){ctx->feature.reset();Reason("Neural Rendering is off.");return;}
     auto f=ReadFgContract(static_cast<const NVSDK_NGX_Parameter*>(parameters));
-    status.input_states_known=0;status.frame_id=f.frame_id;
+    status.input_states_known=0;status.input_states_ready=0;status.hudless_replaced=0;status.state_contract_mask=0;status.frame_id=f.frame_id;
     status.backbuffer_is_swapchain=IsSwapchain(f.color.resource);
     status.output_real_present=f.real_output.resource!=nullptr;
     status.output_real_is_swapchain=IsSwapchain(f.real_output.resource);
@@ -324,7 +357,9 @@ void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,
     if(f.color.resource==f.hudless.resource && (f.color.region.x!=f.hudless.region.x || f.color.region.y!=f.hudless.region.y)) {
         ++status.skipped;Reason("Neural Rendering needs separate nonoverlapping FG image regions.");return;
     }
-    InputStates input_states(list,f);status.input_states_known=input_states.ready;
+    InputStates input_states(list,f,replacement!=nullptr);
+    status.input_states_ready=input_states.ready;
+    status.input_states_known=input_states.ready && !status.state_contract_mask;
     if(!input_states.ready){++status.skipped;Reason("Neural Rendering is waiting for observed native FG input states.");return;}
     using namespace na::hooking::variants;
     if(Active(Kind::CommandList) && CoverageOf(Kind::CommandList,list)!=Coverage::Complete){++status.skipped;Reason("Neural Rendering needs tracked native FG command lists.");return;}
@@ -355,13 +390,19 @@ void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,
         // caller-established order, without an injected cross-queue wait.
         Keep(*recording,packet);
         recording->destinations.emplace_back(f.color.resource);recording->destinations.emplace_back(f.hudless.resource);
+        if(input_states.replace_hudless && !ReplaceHudless(list,device.Get(),*packet,f,parameters,*replacement)){
+            Reason("Neural Rendering could not prepare its FG HUD-free input.");return;}
         CopyRegion(list,packet->composition.Full(),f.color);
-        if(f.hudless.resource!=f.color.resource)CopyRegion(list,packet->composition.Hudless(),f.hudless);
+        if(!input_states.replace_hudless && f.hudless.resource!=f.color.resource)CopyRegion(list,packet->composition.Hudless(),f.hudless);
         ++status.reused;status.active=1;Reason("Neural Rendering is active before native Frame Generation.");return;
     }
     if(!packet)packet=std::make_shared<Packet>();
     else if(packet->receipt_set && !packet->composition.TryRecycle()){ctx->cache.AbandonUnsubmitted(decision.ticket);++status.skipped;return;}
     if(packet->feature && packet->feature->device.Get()!=device.Get())packet=std::make_shared<Packet>();
+    if(packet->hudless_override){
+        const auto owned=packet->hudless_override->GetDesc(),target=f.hudless.resource->GetDesc();
+        if(owned.Width!=target.Width || owned.Height!=target.Height || owned.Format!=target.Format)packet->hudless_override.Reset();
+    }
     packet->id=f.frame_id;packet->receipt_set=false;packet->successful=false;packet->timed=false;
     packet->timing_fence.Reset();packet->timing_value=packet->frequency=0;ctx->live[index]=true;ctx->tickets[index]=decision.ticket;
     packet->producer=recording->valid;
@@ -411,8 +452,10 @@ void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,
         original,{mode?n.enhanced.Get():n.nr.Get(),0,0},{},UiComposition::EqualPixels);
     Barrier(list,n.nr.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     if(!composed){Reason("Neural Rendering could not compose the pre-FG picture.");return;}
+    if(input_states.replace_hudless && !ReplaceHudless(list,device.Get(),*packet,f,parameters,*replacement)){
+        Reason("Neural Rendering could not prepare its FG HUD-free input.");return;}
     CopyRegion(list,packet->composition.Full(),f.color);
-    if(f.hudless.resource!=f.color.resource)CopyRegion(list,packet->composition.Hudless(),f.hudless);
+    if(!input_states.replace_hudless && f.hudless.resource!=f.color.resource)CopyRegion(list,packet->composition.Hudless(),f.hudless);
     if(packet->queries && packet->timestamps) {
         list->EndQuery(packet->queries.Get(),D3D12_QUERY_TYPE_TIMESTAMP,1);
         list->ResolveQueryData(packet->queries.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0,2,packet->timestamps.Get(),0);
@@ -449,7 +492,9 @@ Submission::~Submission() {
 } // namespace na::nr::native
 #else
 namespace na::nr::native {
-void Before(ID3D12GraphicsCommandList*,const void*,const void*,const void*,const Runtime&){}
+InputOverride::~InputOverride(){}
+void InputOverride::Bind(const void*,ID3D12Resource*){}
+void Before(ID3D12GraphicsCommandList*,const void*,const void*,const void*,const Runtime&,InputOverride*){}
 void Release(const void*,const void*){} void Prepare(ID3D12GraphicsCommandList*){} void Maintain(){}
 void PrepareDevice(ID3D12Device*){}
 void MarkSwapchainBuffer(ID3D12Resource*){}

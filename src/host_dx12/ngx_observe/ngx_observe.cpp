@@ -556,7 +556,8 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
     }
     if (native_fg) {
         inspect_fg_inputs(cmd_list, params);
-        na::nr::native::Before(list,&s,handle,params,core_runtime(s));
+        na::nr::native::InputOverride fg_inputs;
+        na::nr::native::Before(list,&s,handle,params,core_runtime(s),&fg_inputs);
         const NgxResult result = s.evaluate(cmd_list, handle, params, callback);
         g_evaluates.fetch_add(1, std::memory_order_relaxed);
         g_evaluates_external.fetch_add(1, std::memory_order_release);

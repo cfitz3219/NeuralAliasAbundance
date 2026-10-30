@@ -72,5 +72,6 @@ const char* Name(Evidence e){switch(e){
 case Evidence::Known:return "observed";case Evidence::NoTransition:return "no_transition";
 case Evidence::SplitPending:return "split_pending";case Evidence::EnhancedInvalidated:return "enhanced_invalidated";
 case Evidence::AliasingInvalidated:return "aliasing_invalidated";case Evidence::UncoveredList:return "uncovered_list";
+case Evidence::NgxReadContract:return "ngx_read_contract";
 }return "unknown";}
 }
