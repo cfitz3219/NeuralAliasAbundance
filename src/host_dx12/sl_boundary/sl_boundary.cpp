@@ -150,6 +150,7 @@ std::atomic<uintptr_t> g_module_lo{0}, g_module_hi{0};
 std::atomic<uint32_t> g_module_seen{0}, g_tag_hooks{0}, g_present_hooks{0}, g_discovery{0}, g_proxies{0};
 std::atomic<uint64_t> g_tag_calls{0}, g_tag_undecoded{0}, g_tags_seen{0}, g_tag_seq{0};
 std::atomic<uint64_t> g_real{0}, g_retry{0}, g_test{0};
+std::atomic<uint32_t> g_tags_inflight{0};
 std::atomic<uint64_t> g_const_calls{0}, g_const_decoded{0}, g_const_valid{0}, g_const_seq{0};
 std::atomic<uint64_t> g_assoc_unique{0}, g_assoc_ambiguous{0}, g_assoc_none{0};
 std::atomic<uint64_t> g_present_events{0}; // real presents across all proxies (association provenance)
@@ -165,6 +166,7 @@ struct ProxyState {
     uint32_t id = 0;
     uint64_t epoch = 0, serial = 0;
     bool retry_pending = false;
+    PresentEvent retry_frame{}; // identity only; borrowed call arguments are never replayed
     uint64_t last_tag_seq = 0;       // tag sequence at this proxy's previous real Present
     uint64_t last_present_event = 0; // g_present_events value after its previous real Present
 };
@@ -304,8 +306,9 @@ void decode_tags(bool for_frame, const void* frame, const void* viewport, const 
 // After the original: an accepted call joins the association window and the summary.
 void note_accepted_tags(const TagEvent& e, int32_t result)
 {
-    if (result != 0) return; // rejected by Streamline: never associated
     std::lock_guard<std::mutex> lock(g_m);
+    g_tags_inflight.fetch_sub(1);
+    if (result != 0) return; // rejected by Streamline: never associated
     // An accepted call we could not decode still joins the window, as unknown
     // (it makes the association ambiguous instead of silently missing).
     g_tag_window[g_tag_window_count % kTagWindow] = {e.sequence, e.decoded && e.has_viewport, e.decoded && e.has_frame, e.viewport, e.frame_token};
@@ -333,6 +336,7 @@ void note_accepted_tags(const TagEvent& e, int32_t result)
 template <class Forward>
 SlResult tag_call(bool for_frame, const void* frame, const void* viewport, const void* tags, uint32_t n, void* cmd, Forward forward)
 {
+    g_tags_inflight.fetch_add(1);
     Tag decoded[kMaxTagsPerCall];
     TagEvent e;
     decode_tags(for_frame, frame, viewport, tags, n, cmd, e, decoded);
@@ -424,6 +428,11 @@ void present_state(IDXGISwapChain* sc, PresentEvent& e)
     if (st->retry_pending) {
         e.kind = PresentKind::Retry;
         e.real_serial = st->serial;
+        e.tags_after_sequence=st->retry_frame.tags_after_sequence;
+        e.last_tag_sequence=st->retry_frame.last_tag_sequence;
+        e.association=st->retry_frame.association;
+        e.viewport=st->retry_frame.viewport;
+        e.frame_token=st->retry_frame.frame_token;
         g_retry.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -440,18 +449,21 @@ void present_state(IDXGISwapChain* sc, PresentEvent& e)
     st->last_tag_seq = newest;
     g_last_present_tag_seq = newest;
     uint32_t matched = 0;
-    bool consistent = true;
+    const bool pending_tags=g_tags_inflight.load()!=0;
+    bool consistent = !pending_tags;
     const uint32_t available = g_tag_window_count < kTagWindow ? g_tag_window_count : kTagWindow;
     for (uint32_t i = 0; i < available; ++i) {
         const TagWindowEntry& t = g_tag_window[(g_tag_window_count - 1 - i) % kTagWindow];
-        if (t.sequence <= e.tags_after_sequence) break;
+        // Calls can finish out of issue order. An older completion must not
+        // hide a newer accepted call in the rest of the ring.
+        if (t.sequence <= e.tags_after_sequence || t.sequence > newest) continue;
         if (!t.has_viewport || !t.has_frame) { consistent = false; ++matched; continue; }
         if (matched == 0) { e.viewport = t.viewport; e.frame_token = t.frame_token; }
         else if (t.viewport != e.viewport || t.frame_token != e.frame_token) consistent = false;
         ++matched;
     }
     if (newest - e.tags_after_sequence > kTagWindow) consistent = false; // more calls than the window retains
-    if (matched == 0) {
+    if (matched == 0 && !pending_tags) {
         e.association = Association::None;
         g_assoc_none.fetch_add(1, std::memory_order_relaxed);
     } else if (consistent && !other_presented) {
@@ -462,6 +474,8 @@ void present_state(IDXGISwapChain* sc, PresentEvent& e)
         e.viewport = e.frame_token = 0;
         g_assoc_ambiguous.fetch_add(1, std::memory_order_relaxed);
     }
+    st->retry_frame=e;
+    st->retry_frame.params=nullptr;
 }
 
 void note_present_result(IDXGISwapChain* sc, HRESULT hr)
@@ -513,6 +527,9 @@ void bump_epoch(IDXGISwapChain* sc)
     if (ProxyState* st = find_proxy_locked(sc)) {
         ++st->epoch;
         st->retry_pending = false;
+        st->retry_frame={};
+        st->last_tag_seq=g_tag_seq.load();
+        st->last_present_event=g_present_events.load();
     }
 }
 

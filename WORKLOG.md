@@ -505,3 +505,6 @@ Creation flags used to decode guide conventions were still indexed only by raw h
 
 ### 2026-10-30 — Combined Opus controls integration
 Merged origin/claude/route-a-controls through c1fa5ea (e9c6782); added slb::FormatStatus to overlay status writer and bounded all its simple snprintf write lengths. FullReleasePASS,52CPU/host/DX12PASS1opt-inSKIP11.54s. No NR consumer wired to incomplete transport identity. Details and remaining work in docs/ROUTE-A-SYSTEM-AUDIT-20261030.md append-only implementation section. No package/deployment/game changes.
+
+### 2026-10-30 — Astra deployment review of Opus 6f8788b
+Integrated PR69 into production. Reviewed per-proxy state, constants/tag result transport and subscription quiescence. Fixed remaining retry identity loss, resize carrying stale tag windows, and out-of-order/pending tag completion being mistaken for a unique frame. Regression uses overlapping original tag calls on two threads, exact retry token preservation and stale pre-resize tags. Full Release and focused boundary test PASS0.62s; combined regression and package validation follow. This transport work does NOT implement the still-open NR consumer/common real-generated image delivery path. Prepared updater must describe controls/lifetime fixes and evidence acquisition honestly, not promise NR flicker cured. No game deployment or launch.

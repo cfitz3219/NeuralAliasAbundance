@@ -30,6 +30,7 @@
 #include <atomic>
 #include <cmath>
 #include <vector>
+#include <thread>
 
 namespace {
 
@@ -46,6 +47,7 @@ void* g_orig_seen_cmd = nullptr;
 HRESULT g_next_present_hr = S_OK;
 int g_present_calls = 0, g_present1_calls = 0, g_resize_calls = 0, g_constants_calls = 0;
 HANDLE g_block = nullptr, g_entered = nullptr; // test 7: hold a Present inside the original
+HANDLE g_tag_block=nullptr,g_tag_entered=nullptr;
 
 } // namespace
 
@@ -58,6 +60,9 @@ extern "C" __declspec(dllexport) __declspec(noinline) int32_t slSetTagForFrame(c
     g_orig_seen_n = n;
     g_orig_seen_cmd = cmd;
     g_sink = g_sink + 3;
+    if(g_tag_block && cmd==reinterpret_cast<void*>(0xdead)){
+        SetEvent(g_tag_entered);WaitForSingleObject(g_tag_block,5000);
+    }
     return 0;
 }
 extern "C" __declspec(dllexport) __declspec(noinline) int32_t slSetTag(const void*, const void* tags, uint32_t n, void*)
@@ -436,6 +441,7 @@ int main()
     CHECK(na::slb::GetStats().presents_test == 1);
 
     // Retry is per chain: WAS_STILL_DRAWING on A does not make B a retry.
+    CHECK(tag_frame(&frame2, &viewport, tags, 2, cmd) == 0);
     g_next_present_hr = DXGI_ERROR_WAS_STILL_DRAWING;
     CHECK(chain->Present(0, DXGI_PRESENT_DO_NOT_WAIT) == DXGI_ERROR_WAS_STILL_DRAWING); // A serial 4
     g_next_present_hr = S_OK;
@@ -450,16 +456,20 @@ int main()
     REQUIRE(g_rec.before.size() == 6);
     CHECK(g_rec.before[5].proxy_id == 1 && g_rec.before[5].kind == na::slb::PresentKind::Retry && g_rec.before[5].real_serial == 4);
     CHECK(g_rec.before[5].present1 && g_rec.before[5].params == &pp);
+    CHECK(g_rec.before[5].association==na::slb::Association::Unique);
+    CHECK(g_rec.before[5].frame_token==g_rec.before[3].frame_token && g_rec.before[5].viewport==g_rec.before[3].viewport);
     CHECK(chain->Present(1, 0) == S_OK);                                                 // A real again
     CHECK(g_rec.before[6].kind == na::slb::PresentKind::Real && g_rec.before[6].real_serial == 5);
     // Chain B presented since A's last real Present: A's window is ambiguous even though its tags were clean.
     CHECK(g_rec.before[6].association == na::slb::Association::Ambiguous);
 
     // Resize bumps only that chain's epoch.
+    CHECK(tag_frame(&frame3, &viewport, tags, 2, cmd) == 0);
     CHECK(chain->ResizeBuffers(3, 1920, 1080, DXGI_FORMAT_R8G8B8A8_UNORM, 0) == S_OK);
     CHECK(g_resize_calls == 1);
     CHECK(chain->Present(1, 0) == S_OK);
     CHECK(g_rec.before.back().proxy_id == 1 && g_rec.before.back().stream_epoch == 2);
+    CHECK(g_rec.before.back().association==na::slb::Association::None);
     CHECK(other->Present(1, 0) == S_OK);
     CHECK(g_rec.before.back().proxy_id == 2 && g_rec.before.back().stream_epoch == 1 && g_rec.before.back().real_serial == 2);
 
@@ -498,6 +508,26 @@ int main()
     g_block = nullptr;
     CHECK(chain->Present(1, 0) == S_OK);   // detached: still forwards, no callbacks
     CHECK(g_rec.before.size() == before_count + 1);
+
+    // Original tag calls can overlap and finish out of issue order. Pending
+    // calls cannot establish a unique frame; a late older completion cannot
+    // hide a newer accepted tag behind it in the association ring.
+    CHECK(na::slb::SetCallbacks(cb));
+    CHECK(chain->Present(1,0)==S_OK);
+    g_tag_block=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+    g_tag_entered=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+    std::thread pending([&]{CHECK(tag_frame(&frame2,&viewport,tags,2,reinterpret_cast<void*>(0xdead))==0);});
+    REQUIRE(WaitForSingleObject(g_tag_entered,5000)==WAIT_OBJECT_0);
+    CHECK(tag_frame(&frame2,&viewport,tags,2,cmd)==0);
+    CHECK(chain->Present(1,0)==S_OK);
+    CHECK(g_rec.before.back().association==na::slb::Association::Ambiguous);
+    CHECK(tag_frame(&frame3,&viewport,tags,2,cmd)==0);
+    SetEvent(g_tag_block);pending.join();
+    CloseHandle(g_tag_block);CloseHandle(g_tag_entered);g_tag_block=nullptr;
+    CHECK(chain->Present(1,0)==S_OK);
+    CHECK(g_rec.before.back().association==na::slb::Association::Unique);
+    CHECK(g_rec.before.back().frame_token==4244);
+    CHECK(na::slb::SetCallbacks({}));
 
     // ---- 8. native DLSS-G control ----
     {
