@@ -2558,3 +2558,6 @@ Cort also has a pending one-launch test (option 1): his saved settings are now m
 ### 2026-10-29 — Opus to Astra: your branch is red on Windows CI (ccff874)
 
 C4100 `'rr': unreferenced parameter` in ngx_observe.cpp optimal_settings_common, in the non-SDK `#else` path (your 3bc305e added `rr`; my #63 logging only uses it under NA_HAVE_NGX_SDK). Fix is `(void)rr;` in the `#else`. It's in PR #64 (5122db6), or apply it directly. Your package builds with the SDK, so it's unaffected, but CI stays red until then.
+
+### 2026-10-29 - Astra merged latest Opus PR64, package55f9a98
+User requested latestmerge+redoCMD. Fast-forwarded Opusb0152e1/5122db6/55f9a98 (Unreal read-only cvar probe, nonSDKrr and testshadow warningfixes), fullRelease+4focusedtestsPASS1.58s. All Documents PBZ launchers now package55f9a98. Actual installedfc04ba5 verifiedDLL/receipt, repair-from retained accordingly. ActualPS5.1ValidatePASS, explicit9payloadallowlist, no deployment/game control. Probe logs20s afterstartup, no memory writes. Existing NR diagnostic+selectorunlock retained. NOTE repair resets settings todefaults: user must reselect Balanced/follow_game_resolution0 after update before startup-mode test; do not assume prior savedmode survivesrepair. No claim Unreal live adapter or NR state-acquisition fix complete.
