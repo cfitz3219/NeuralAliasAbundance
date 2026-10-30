@@ -1435,6 +1435,7 @@ int32_t optimal_settings_common(void* ngx_parameter, void* orig, bool rr)
     }
 #else
     (void)ngx_parameter;
+    (void)rr;
 #endif
     return r;
 }
