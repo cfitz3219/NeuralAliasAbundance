@@ -1,6 +1,7 @@
 #include "host_dx12/adapters/tlou1/apply.hpp"
 #include "host_dx12/adapters/unreal/cvar_probe.hpp"
 #include "host_dx12/sl_boundary/sl_boundary.hpp"
+#include "host_dx12/adapters/unreal/screen_percentage.hpp"
 #include "host_dx12/host_boot/host_boot.hpp"
 #include "host_dx12/host_boot/session.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
@@ -124,6 +125,10 @@ DWORD WINAPI InitThread(LPVOID)
             else slb_log[0] = 0;
             na::slb::Start(slb_log);
         }
+        // Unreal adapter phase 2: live render resolution via r.ScreenPercentage.
+        // Locating is read-only; the value changes only on the user's Apply.
+        if (!na::settings::SafeStart() && GetPrivateProfileIntW(L"unreal", L"screen_percentage", 1, g_ini) == 1)
+            na::unreal::StartScreenPercentage();
         na::ngx::PreloadAndHookNgxCore();
         na::tlou1::InitializeApply();
         bool sync_hook = GetPrivateProfileIntW(L"observe", L"sync_loader_hook", 0, g_ini) == 1;

@@ -1,4 +1,5 @@
 #include "host_dx12/adapters/tlou1/apply.hpp"
+#include "host_dx12/adapters/unreal/screen_percentage.hpp"
 // Route A menu content (A30 redesign): the Picture page (status, master
 // switch, mode cards, preset), the Enhancements rows (Ray Reconstruction;
 // Neural Rendering and Frame Generation placeholders) and the Details rows
@@ -75,6 +76,24 @@ void requested_size(unsigned out_w, unsigned out_h, int mode, unsigned* rw, unsi
     }
 }
 bool valid_size(unsigned w, unsigned h) { return w && h && w != 0xFFFFFFFFu && h != 0xFFFFFFFFu; }
+
+// Unreal: the screen percentage for a mode, from the ratios NVIDIA gave the
+// engine at startup (PBZ asked with 1000x1000: 333/500/580/667/1000), so our
+// request lands exactly on the engine's own table. Defaults if not seen.
+float unreal_percent_for_mode(int mode)
+{
+    static const int kPq[] = {5, 2, 1, 0, 3}; // DLAA, Quality, Balanced, Performance, Ultra Performance -> NVSDK_NGX_PerfQuality_Value
+    static const float kDefault[] = {100.f, 66.7f, 58.f, 50.f, 33.3f};
+    if (mode < 0 || mode > 4) return 100.f;
+    na::ngx::OptimalCall calls[32];
+    const uint32_t n = na::ngx::GetOptimalCalls(0, calls, 32);
+    for (uint32_t i = n; i-- > 0;) {
+        const auto& c = calls[i];
+        if (c.perf_quality == kPq[mode] && c.user_w && c.native_w && c.native_w <= c.user_w)
+            return 100.f * static_cast<float>(c.native_w) / static_cast<float>(c.user_w);
+    }
+    return kDefault[mode];
+}
 
 enum class Conn { NoDlss, Interrupted, Connected };
 
@@ -153,8 +172,20 @@ void DrawPicture()
     // No longer locks the picture mode (Cort's 16:41 run: the game's only
     // queries were 1000x1000, possibly an engine reference size read at
     // startup, so "no display-size query" is not proof the size can't change).
+    // Unreal games: live render-resolution control through the engine's own
+    // r.ScreenPercentage (the setting its DLSS menu changes).
+    const na::unreal::SpStatus sp = na::unreal::GetScreenPercentageStatus();
+    const bool unreal_size = sp.available && !na::tlou1::GetApplyStatus().available;
     unsigned rw = 0, rh = 0;
-    if (valid_size(out_w, out_h)) requested_size(out_w, out_h, mode, &rw, &rh);
+    if (valid_size(out_w, out_h)) {
+        if (unreal_size) {
+            const float pct = unreal_percent_for_mode(mode);
+            rw = na::unreal::ExpectedExtent(out_w, pct);
+            rh = na::unreal::ExpectedExtent(out_h, pct);
+        } else {
+            requested_size(out_w, out_h, mode, &rw, &rh);
+        }
+    }
     if (follow_game && valid_size(ngx.last_sr_in_w, ngx.last_sr_in_h)) {
         rw = ngx.last_sr_in_w; rh = ngx.last_sr_in_h;
     }
@@ -177,7 +208,7 @@ void DrawPicture()
         }
     } else if (engine_busy) {
         text = engine_apply.reason;
-    } else if (game_sets_size && follow_game) {
+    } else if (game_sets_size && follow_game && !unreal_size) {
         state = 1;
         snprintf(buf, sizeof(buf), "This game has not asked DLSS for its render size in a way NeuralAlias can change (%ux%u now). Pick Performance, Balanced or Quality in the game's video settings; NeuralAlias sets the DLSS preset.", rw, rh);
         text = buf;
@@ -246,7 +277,8 @@ void DrawPicture()
         }
     }
     ImGui::EndDisabled();
-    Hint(game_sets_size && !follow_game ? "This game has not asked DLSS for its render size while running. It may only read it at startup: if Apply does not change the size, keep this mode selected and restart the game." :
+    Hint(unreal_size && !follow_game ? "Apply changes the game's own resolution setting, the same one its DLSS menu uses. No restart needed." :
+         game_sets_size && !follow_game ? "This game has not asked DLSS for its render size while running. It may only read it at startup: if Apply does not change the size, keep this mode selected and restart the game." :
          follow_game ? "Picture mode follows the game's video settings, including Ultra Performance." : kModeHelp[mode]);
 
     // Preset + Apply. (A46: the disabled Sharpness row is gone until a
@@ -311,6 +343,8 @@ void DrawPicture()
         static bool rebuild_clicked = false;   // generic: window nudge so the game rebuilds its DLSS
         static bool rebuild_refused = false;
         static uint32_t rebuild_attempts_at = 0;
+        static bool unreal_clicked = false;
+        static bool unreal_refused = false;
         // Any game upscaler counts: plain DLSS (feature 1) or Ray Reconstruction (13).
         const bool have_upscaler = ngx.active_upscaler != 0;
         // A game with a hand-written engine adapter (TLOU) changes its own picture
@@ -323,7 +357,7 @@ void DrawPicture()
         BeginRow("Apply changes", follow_game ? "Update the preset while keeping the game's resolution." : "Update the picture mode and preset together.", ButtonWidth("Apply"));
         if (Button("Apply")) {
             admission_failed = false;
-            engine_clicked = rebuild_clicked = rebuild_refused = false;
+            engine_clicked = rebuild_clicked = rebuild_refused = unreal_clicked = unreal_refused = false;
             g_apply_clicked = false;
             // Plain DLSS can take a new PRESET in place (A46). A size change, or any
             // change while the game uses Ray Reconstruction, needs the game to
@@ -337,6 +371,11 @@ void DrawPicture()
             } else if (engine_adapter && !follow_game) {
                 engine_clicked = true;
                 admission_failed = !na::tlou1::RequestApply({static_cast<uint32_t>(mode), rw, rh, st.preset.load()});
+            } else if (unreal_size && !follow_game && !size_matches) {
+                // The engine re-creates DLSS at the new size itself; our creation
+                // override adds the preset to that re-creation.
+                unreal_clicked = true;
+                unreal_refused = !na::unreal::RequestScreenPercentage(unreal_percent_for_mode(mode), out_w, out_h);
             } else {
                 rebuild_clicked = true;
                 rebuild_attempts_at = na::overlay::GetPictureRebuild().attempts;
@@ -365,6 +404,12 @@ void DrawPicture()
                 StatusLine(2, buf);
             } else
                 StatusLine(0, "Picture rebuilt; checking the new size...");
+        }
+        if (unreal_clicked) {
+            const na::unreal::SpStatus now = na::unreal::GetScreenPercentageStatus();
+            const int level = now.state == na::unreal::SpState::Confirmed ? 1 :
+                              now.state == na::unreal::SpState::Applying ? 0 : 2;
+            StatusLine(unreal_refused && now.state != na::unreal::SpState::Applying ? 2 : level, now.reason);
         }
         if (engine_clicked) {
             auto progress = na::tlou1::GetApplyStatus();
@@ -396,6 +441,12 @@ void DrawPicture()
                              check.req_w, check.req_h, check.last_w, check.last_h, check.streak, check.need, check.state, check.reason);
                     Hint(buf);
                 }
+            } else if (unreal_size) {
+                Hint("Unreal game: Apply sets the engine's r.ScreenPercentage, then checks that the game's next DLSS creation uses the expected size.");
+                snprintf(buf, sizeof(buf), "Engine setting now %.1f%%; requested %.1f%% (expect %ux%u); game's DLSS input %ux%u; request %llu.",
+                         sp.current, sp.requested, sp.expect_w, sp.expect_h, sp.seen_w, sp.seen_h,
+                         static_cast<unsigned long long>(sp.request_id));
+                Hint(buf);
             } else {
                 // Every other game: the general rebuild (no game-specific code).
                 const auto pr = na::overlay::GetPictureRebuild();
