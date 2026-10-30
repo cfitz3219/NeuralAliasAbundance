@@ -103,7 +103,7 @@ extern "C" __declspec(dllexport) __declspec(noinline) int32_t slGetFeatureFuncti
 
 // ---- the "Streamline" swap-chain proxy: same RTTI name and slot order ----
 namespace sl::interposer {
-#define NA_DUMMY(n) virtual int __stdcall Dummy##n() { g_sink = g_sink + n * 11; return n; }
+#define NA_DUMMY(n) __declspec(noinline) virtual int __stdcall Dummy##n() { g_sink = g_sink + n * 11; return n; }
 struct DXGISwapChain {
     IUnknown* base = nullptr;
     LONG refs = 1;
@@ -124,7 +124,7 @@ struct DXGISwapChain {
     virtual ULONG __stdcall Release() { return static_cast<ULONG>(InterlockedDecrement(&refs)); }
     NA_DUMMY(3) NA_DUMMY(4) NA_DUMMY(5) NA_DUMMY(6) NA_DUMMY(7)
     // 8 Present
-    virtual HRESULT __stdcall Present(UINT sync, UINT flags)
+    __declspec(noinline) virtual HRESULT __stdcall Present(UINT sync, UINT flags)
     {
         ++g_present_calls;
         g_sink = g_sink + static_cast<int>(sync + flags) + 101;
@@ -132,7 +132,7 @@ struct DXGISwapChain {
     }
     NA_DUMMY(9) NA_DUMMY(10) NA_DUMMY(11) NA_DUMMY(12)
     // 13 ResizeBuffers
-    virtual HRESULT __stdcall ResizeBuffers(UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT flags)
+    __declspec(noinline) virtual HRESULT __stdcall ResizeBuffers(UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT flags)
     {
         ++g_resize_calls;
         g_sink = g_sink + static_cast<int>(n + w + h + flags + static_cast<UINT>(f)) + 131;
@@ -140,7 +140,7 @@ struct DXGISwapChain {
     }
     NA_DUMMY(14) NA_DUMMY(15) NA_DUMMY(16) NA_DUMMY(17) NA_DUMMY(18) NA_DUMMY(19) NA_DUMMY(20) NA_DUMMY(21)
     // 22 Present1
-    virtual HRESULT __stdcall Present1(UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS*)
+    __declspec(noinline) virtual HRESULT __stdcall Present1(UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS*)
     {
         ++g_present1_calls;
         g_sink = g_sink + static_cast<int>(sync + flags) + 221;
@@ -149,7 +149,7 @@ struct DXGISwapChain {
     NA_DUMMY(23) NA_DUMMY(24) NA_DUMMY(25) NA_DUMMY(26) NA_DUMMY(27) NA_DUMMY(28) NA_DUMMY(29) NA_DUMMY(30)
     NA_DUMMY(31) NA_DUMMY(32) NA_DUMMY(33) NA_DUMMY(34) NA_DUMMY(35) NA_DUMMY(36) NA_DUMMY(37) NA_DUMMY(38)
     // 39 ResizeBuffers1
-    virtual HRESULT __stdcall ResizeBuffers1(UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT flags, const UINT*, IUnknown* const*)
+    __declspec(noinline) virtual HRESULT __stdcall ResizeBuffers1(UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT flags, const UINT*, IUnknown* const*)
     {
         ++g_resize_calls;
         g_sink = g_sink + static_cast<int>(n + w + h + flags + static_cast<UINT>(f)) + 391;
@@ -310,9 +310,17 @@ int main()
     CHECK(na::slb::GetStats().tag_undecoded == 1);
 
     // ---- 4. presents ----
-    auto* chain = reinterpret_cast<IDXGISwapChain*>(&proxy);
+    // Opaque pointers: the optimizer must not see the fake's dynamic type and
+    // devirtualize/inline the call past the hooked function (as a game's call
+    // through SL's proxy never could be).
+    IDXGISwapChain* volatile chain_v = reinterpret_cast<IDXGISwapChain*>(&proxy);
+    IDXGISwapChain1* volatile chain1_v = reinterpret_cast<IDXGISwapChain1*>(&proxy);
+    IDXGISwapChain* volatile other_v = reinterpret_cast<IDXGISwapChain*>(&proxy2);
+    IDXGISwapChain* chain = chain_v;
     CHECK(chain->Present(1, 0) == S_OK);
     CHECK(g_present_calls == 1);
+    std::printf("presents: before=%zu after=%zu fake_calls=%d real=%llu\n", g_rec.before.size(), g_rec.after.size(), g_present_calls,
+                static_cast<unsigned long long>(na::slb::GetStats().presents_real));
     REQUIRE(g_rec.before.size() == 1 && g_rec.after.size() == 1);
     CHECK(g_rec.before[0].kind == na::slb::PresentKind::Real && g_rec.before[0].real_serial == 1);
     CHECK(g_rec.before[0].stream_epoch == 1);   // first proxy seen
@@ -330,7 +338,7 @@ int main()
     g_next_present_hr = DXGI_ERROR_WAS_STILL_DRAWING;
     CHECK(chain->Present(0, DXGI_PRESENT_DO_NOT_WAIT) == DXGI_ERROR_WAS_STILL_DRAWING);
     g_next_present_hr = S_OK;
-    auto* chain1 = reinterpret_cast<IDXGISwapChain1*>(&proxy);
+    IDXGISwapChain1* chain1 = chain1_v;
     DXGI_PRESENT_PARAMETERS pp{};
     CHECK(chain1->Present1(0, DXGI_PRESENT_DO_NOT_WAIT, &pp) == S_OK);
     CHECK(g_present1_calls == 1);
@@ -346,7 +354,7 @@ int main()
     CHECK(chain->Present(1, 0) == S_OK);
     CHECK(g_rec.before.back().stream_epoch == 2); // resize = new incarnation
 
-    auto* other = reinterpret_cast<IDXGISwapChain*>(&proxy2);
+    IDXGISwapChain* other = other_v;
     CHECK(other->Present(1, 0) == S_OK);
     CHECK(g_rec.before.back().stream_epoch == 3 && g_rec.before.back().game_facing == other); // new proxy
     s = na::slb::GetStats();
