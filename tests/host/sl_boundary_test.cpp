@@ -94,7 +94,9 @@ extern "C" __declspec(noinline) int32_t fake_dlssg_set_options(const void*, cons
 {
     ++g_fg_set_calls;
     g_fg_seen_options = options;
-    std::memcpy(g_fg_seen_bytes, options, sizeof(g_fg_seen_bytes));
+    uint64_t version=0;std::memcpy(&version,static_cast<const uint8_t*>(options)+24,8);
+    const size_t bytes=version==1?104:version<4?112:120;
+    std::memcpy(g_fg_seen_bytes, options, bytes);
     g_sink = g_sink + 17;
     return 0;
 }
@@ -583,6 +585,15 @@ int main()
         CHECK(set(&vp, opts) == 0);
         std::memcpy(&mode, g_fg_seen_bytes + 32, 4);
         CHECK(g_fg_seen_options != opts && mode == 0);
+        // Put the exact v5 object against an inaccessible page: reading 128
+        // bytes instead of its 120 bytes used to silently reject overrides.
+        SYSTEM_INFO si{};GetSystemInfo(&si);
+        auto* pages=static_cast<uint8_t*>(VirtualAlloc(nullptr,si.dwPageSize*2,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));
+        REQUIRE(pages);DWORD old=0;
+        REQUIRE(VirtualProtect(pages+si.dwPageSize,si.dwPageSize,PAGE_NOACCESS,&old));
+        auto* exact=pages+si.dwPageSize-sizeof(opts);std::memcpy(exact,opts,sizeof(opts));
+        CHECK(set(&vp,exact)==0);CHECK(g_fg_seen_options!=exact);
+        VirtualFree(pages,0,MEM_RELEASE);
         na::slb::SetFgRequest({});
     }
 

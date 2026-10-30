@@ -74,6 +74,7 @@ constexpr uint32_t kFeatureDlssG = 1000; // sl::kFeatureDLSS_G
 constexpr uint8_t kDlssgOptionsGuid[16] = {0xcb, 0xf1, 0xc5, 0xfa, 0xfd, 0x2d, 0x36, 0x4f, 0xa1, 0xe6, 0x3a, 0x9e, 0x86, 0x52, 0x56, 0xc5};
 constexpr uint8_t kDlssgStateGuid[16] = {0xe1, 0xc8, 0x8a, 0xcc, 0x79, 0xa1, 0xf5, 0x44, 0x97, 0xfa, 0xe7, 0x41, 0x12, 0xf9, 0xbc, 0x61};
 constexpr size_t kDlssgOptionsCopy = 128; // >= sizeof(sl::DLSSGOptions) v5 (120)
+std::recursive_mutex g_fg_api_m; // NVIDIA documents GetState/SetOptions as not thread safe
 constexpr uint32_t kSlModeOff = 0, kSlModeOn = 1, kSlModeDynamic = 3;
 
 PfnGetFeatureFunction g_orig_gff = nullptr;
@@ -677,18 +678,20 @@ void fg_reason(const char* text)
 void read_fg_state(const void* state)
 {
     uint8_t b[96] = {};
-    const size_t got = state ? guarded_copy(b, state, sizeof(b)) : 0;
-    if (got < 56 || !abi::HasGuid(b, got, kDlssgStateGuid)) return;
+    if(!state || guarded_copy(b,state,32)!=32 || !abi::HasGuid(b,32,kDlssgStateGuid))return;
     const uint64_t version = abi::Read<uint64_t>(b, 24);
+    const size_t bytes=version==1?52:version<4?56:81;
+    if(!version || guarded_copy(b,state,bytes)!=bytes)return;
     std::lock_guard<std::mutex> lock(g_fg_m);
     g_fg.status = abi::Read<uint32_t>(b, 40);
     g_fg.presented = abi::Read<uint32_t>(b, 48);
     if (version >= 2) g_fg.max_frames = abi::Read<uint32_t>(b, 52);
-    if (version >= 4 && got >= 81) g_fg.dynamic_supported = b[80] == 1 ? 1 : 0; // sl::Boolean eTrue
+    if (version >= 4) g_fg.dynamic_supported = b[80] == 1 ? 1 : b[80] == 0 ? 0 : -1;
 }
 
 SlResult __cdecl DetourDlssgGetState(const void* viewport, void* state, const void* options)
 {
+    std::lock_guard<std::recursive_mutex> api_lock(g_fg_api_m);
     g_fg_get_calls.fetch_add(1, std::memory_order_relaxed);
     const SlResult r = g_orig_fg_get(viewport, state, options);
     if (r == 0) read_fg_state(state);
@@ -696,22 +699,28 @@ SlResult __cdecl DetourDlssgGetState(const void* viewport, void* state, const vo
 }
 
 // Our own state query (when the game never asks): a zeroed DLSSGState of
-// version 2, the first version that carries numFramesToGenerateMax.
+// version 4 includes dynamic support. Retry v2 for older runtimes.
 void query_fg_state(const void* viewport)
 {
     if (!g_orig_fg_get) return;
     alignas(8) uint8_t st[96] = {};
     memcpy(st + 8, kDlssgStateGuid, 16);
-    const uint64_t version = 2;
+    uint64_t version = 4;
     memcpy(st + 24, &version, 8);
+    st[80]=2; // unknown until explicitly reported
     if (g_orig_fg_get(viewport, st, nullptr) == 0) read_fg_state(st);
+    else {version=2;memcpy(st+24,&version,8);if(g_orig_fg_get(viewport,st,nullptr)==0)read_fg_state(st);}
 }
 
 SlResult __cdecl DetourDlssgSetOptions(const void* viewport, const void* options)
 {
+    std::lock_guard<std::recursive_mutex> api_lock(g_fg_api_m);
     g_fg_set_calls.fetch_add(1, std::memory_order_relaxed);
     alignas(8) uint8_t copy[kDlssgOptionsCopy] = {};
-    const size_t got = options ? guarded_copy(copy, options, sizeof(copy)) : 0;
+    const size_t header = options ? guarded_copy(copy, options, 32) : 0;
+    const auto version=header==32?abi::Read<uint64_t>(copy,24):0;
+    const size_t size=version==1?104:version==2 || version==3?112:version==4 || version==5?120:0;
+    const size_t got = size ? guarded_copy(copy,options,size) : 0;
     if (got < 40 || !abi::HasGuid(copy, got, kDlssgOptionsGuid)) {
         fg_reason("The game's frame generation options were not recognised; passed through unchanged.");
         return g_orig_fg_set(viewport, options);
@@ -742,7 +751,7 @@ SlResult __cdecl DetourDlssgSetOptions(const void* viewport, const void* options
         max_frames = g_fg.max_frames;
         dynamic = static_cast<uint32_t>(g_fg.dynamic_supported);
     }
-    if (max_frames == 0xFFFFFFFFu) {
+    if (max_frames == 0xFFFFFFFFu || (req_mode==FgMode::Dynamic && dynamic==0xFFFFFFFFu)) {
         query_fg_state(viewport);
         std::lock_guard<std::mutex> lock(g_fg_m);
         max_frames = g_fg.max_frames;
