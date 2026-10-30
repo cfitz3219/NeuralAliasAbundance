@@ -7,6 +7,9 @@ bool PrepareFgColor(ID3D12Device* device);
 class FgColorPass {
 public:
     void ReleaseInputs() { for (auto& input : refs_) input.Reset(); }
+    void ReleaseReference(ID3D12Resource* resource) {
+        for (auto& input : refs_) if (input.Get()==resource) input.Reset();
+    }
     bool Record(ID3D12GraphicsCommandList* list, bool output_pass,
         CompositionSurface original, ID3D12Resource* nr, ID3D12Resource* sdr,
         ID3D12Resource* output, uint32_t mode, float paper_white);

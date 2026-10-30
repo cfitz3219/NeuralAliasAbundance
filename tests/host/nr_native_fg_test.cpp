@@ -211,6 +211,56 @@ int Frame(uint64_t id,uint32_t w= W,DXGI_FORMAT fmt=DXGI_FORMAT_R32G32B32A32_FLO
     na::nr::OnCommandListReset(list.list.Get());na::nr::native::Maintain();heaps.clear();return 0;
 }
 }
+int ResizeRetentionAudit(bool enabled){
+    na::nr::native::Release(&core,nullptr);na::nr::native::Maintain();
+    HWND window=test::CreateTestWindow(L"NR audit",32,32);REQUIRE(window);
+    DXGI_SWAP_CHAIN_DESC1 desc{};desc.Width=W+4;desc.Height=H+4;
+    desc.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;desc.SampleDesc.Count=1;
+    desc.BufferCount=2;desc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;desc.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    ComPtr<IDXGISwapChain1> chain;REQUIRE(SUCCEEDED(d.factory->CreateSwapChainForHwnd(d.queue.Get(),window,&desc,nullptr,nullptr,&chain)));
+    test::List list;REQUIRE(list.Create(d.device.Get()));Image b,h;
+    REQUIRE(Make(list,b,1,2,W,true,desc.Format)==0);REQUIRE(Make(list,h,2,1,W,false,desc.Format)==0);
+    auto upload_color=b.texture;b.texture.Reset();REQUIRE(SUCCEEDED(chain->GetBuffer(0,IID_PPV_ARGS(&b.texture))));
+    D3D12_RESOURCE_BARRIER init[]={test::Transition(upload_color.Get(),ReadState,D3D12_RESOURCE_STATE_COPY_SOURCE),
+        test::Transition(b.texture.Get(),D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_STATE_COPY_DEST)};
+    list.list->ResourceBarrier(2,init);list.list->CopyResource(b.texture.Get(),upload_color.Get());
+    auto color_ready=test::Transition(b.texture.Get(),D3D12_RESOURCE_STATE_COPY_DEST,ReadState);list.list->ResourceBarrier(1,&color_ready);
+    auto depth=test::CreateTexture(d.device.Get(),3,2,DXGI_FORMAT_R32_FLOAT,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_FLAG_NONE);
+    auto mv=test::CreateTexture(d.device.Get(),3,2,DXGI_FORMAT_R16G16_FLOAT,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_FLAG_NONE);
+    D3D12_RESOURCE_BARRIER guides[]={test::Transition(depth.Get(),D3D12_RESOURCE_STATE_COMMON,ReadState),test::Transition(mv.Get(),D3D12_RESOURCE_STATE_COMMON,ReadState)};
+    list.list->ResourceBarrier(2,guides);test::FakeParams p;Params(p,b,h,depth.Get(),mv.Get(),100,W);
+    p.Set("DLSSG.MultiFrameCount",1u);p.Set("DLSSG.MultiFrameIndex",1u);
+    na::settings::Get().nr_enabled=enabled;na::nr::native::Prepare(list.list.Get());
+    na::nr::native::Before(list.list.Get(),&core,&fg,&p,Runtime());
+    auto present=test::Transition(b.texture.Get(),ReadState,D3D12_RESOURCE_STATE_PRESENT);list.list->ResourceBarrier(1,&present);
+    REQUIRE(SUCCEEDED(list.list->Close()));ID3D12CommandList* lists[]={list.list.Get()};
+    ComPtr<ID3D12Fence> resize_gate;REQUIRE(SUCCEEDED(d.device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&resize_gate))));
+    REQUIRE(SUCCEEDED(d.queue->Wait(resize_gate.Get(),1)));
+    na::nr::Execute(d.queue.Get(),1,lists,Forward);
+    b.texture->AddRef();const auto refs_before=b.texture->Release();
+    na::nr::native::RetireBackbuffer(b.texture.Get());
+    b.texture->AddRef();const auto refs_after=b.texture->Release();
+    CHECK(refs_after==refs_before); // blocked submission must keep game refs too
+    REQUIRE(SUCCEEDED(resize_gate->Signal(1)));d.WaitIdle();
+    na::nr::native::Release(&core,&fg);na::nr::native::Maintain();
+    na::nr::native::RetireBackbuffer(b.texture.Get());
+    // A failed resize leaves the old swapchain usable. Keep the injected
+    // feature alive until its recording is reset, despite dropping game refs.
+    const auto releases_before_resize=releases;
+    CHECK(FAILED(chain->ResizeBuffers(2,W+6,H+6,desc.Format,0))); // our test still holds b
+    CHECK(releases==releases_before_resize);
+    CHECK(d.device->GetDeviceRemovedReason()==S_OK);
+    na::nr::native::RetireBackbuffer(b.texture.Get());
+    b.texture.Reset();h.texture.Reset();upload_color.Reset();depth.Reset();mv.Reset();heaps.clear();
+    const auto before=chain->ResizeBuffers(2,W+6,H+6,desc.Format,0);
+    // The exact same completed-but-not-reset command-list lifetime is tested
+    // with NR off and on. Reset happens only after the first ResizeBuffers.
+    list.Reset();REQUIRE(SUCCEEDED(list.list->Close()));na::nr::native::Maintain();
+    const auto after=chain->ResizeBuffers(2,W+8,H+8,desc.Format,0);
+    std::printf("resize nr=%u before_reset=0x%08lX after_reset=0x%08lX\n",enabled,static_cast<unsigned long>(before),static_cast<unsigned long>(after));
+    CHECK(SUCCEEDED(before));CHECK(SUCCEEDED(after));
+    chain.Reset();DestroyWindow(window);return 0;
+}
 int main(){
     CHECK(na::nr::states::CanTransitionOn(D3D12_COMMAND_LIST_TYPE_COMPUTE,D3D12_RESOURCE_STATE_COMMON));
     CHECK(na::nr::states::CanTransitionOn(D3D12_COMMAND_LIST_TYPE_COMPUTE,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
@@ -221,6 +271,7 @@ int main(){
     REQUIRE(na::nr::states::InstallEnhancedInvalidation());
     REQUIRE(na::observe::InstallListResetTracking(d.device.Get(),na::nr::OnCommandListReset,na::nr::states::Observe));
     REQUIRE(Prepare()==0);
+    REQUIRE(ResizeRetentionAudit(false)==0);REQUIRE(ResizeRetentionAudit(true)==0);
     REQUIRE(Frame(0)==0); // zero identity, MFG evaluates NR once
     check_busy_status=true;
     CHECK(na::nr::native::GetStatus().gpu_samples>0);

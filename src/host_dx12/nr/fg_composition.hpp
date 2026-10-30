@@ -39,6 +39,9 @@ public:
     // Owner has established that no recorded or submitted use remains. Keep
     // cached outputs, but do not pin old game buffers across ResizeBuffers.
     void ReleaseInputs() { for (auto& input : inputs_) input.Reset(); }
+    void ReleaseReference(ID3D12Resource* resource) {
+        for (auto& input : inputs_) if (input.Get()==resource) input.Reset();
+    }
     ID3D12Resource* Full() const { return full_.Get(); }
     ID3D12Resource* Hudless() const { return hudless_.Get(); }
 private:

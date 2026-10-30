@@ -983,6 +983,14 @@ struct FrameCtx {
     ComPtr<ID3D12Resource> back_buffer;
     D3D12_CPU_DESCRIPTOR_HANDLE rtv{};
     UINT64 fence_value = 0;
+    ComPtr<ID3D12Fence> completion;
+    bool signal_failed = false;
+    bool Complete() const {
+        if (signal_failed) return false;
+        if (!fence_value) return true;
+        const auto done = completion ? completion->GetCompletedValue() : UINT64_MAX;
+        return done != UINT64_MAX && done >= fence_value;
+    }
 };
 
 struct State {
@@ -992,7 +1000,6 @@ struct State {
     ComPtr<ID3D12CommandQueue> texture_queue;
     ComPtr<ID3D12DescriptorHeap> rtv_heap, srv_heap;
     ComPtr<ID3D12GraphicsCommandList> list;
-    ComPtr<ID3D12Fence> fence;
     HANDLE fence_event = nullptr;
     UINT64 fence_next = 1;
     std::vector<FrameCtx> frames;
@@ -1013,6 +1020,19 @@ struct State {
 };
 State g_state;
 
+// A slot is not signaled again until its previous use completes. Independent
+// queues therefore cannot advance one another's completion receipts.
+bool menu_draws_complete() {
+    for (const auto& f : g_state.frames) if (!f.Complete()) return false;
+    return true;
+}
+UINT64 menu_completed_prefix() {
+    UINT64 result = g_state.fence_next - 1;
+    for (const auto& f : g_state.frames)
+        if (!f.Complete() && f.fence_value) result = (std::min)(result, f.fence_value - 1);
+    return result;
+}
+
 // Diagnostic polling must never wait on the render thread or on the GPU.
 void write_menu_progress(HANDLE log)
 {
@@ -1024,12 +1044,12 @@ void write_menu_progress(HANDLE log)
     DWORD pw = 0;
     if (pn > 0) WriteFile(log, p_line, static_cast<DWORD>(pn), &pw, nullptr);
     std::unique_lock<std::mutex> lock(g_state.mutex, std::try_to_lock);
-    if (!lock.owns_lock() || !g_state.fence || !g_state.device) return;
+    if (!lock.owns_lock() || !g_state.device) return;
     char line[400];
     int n = snprintf(line, sizeof(line), "menu_gpu draws=%llu submitted=%llu completed=%llu device_hr=0x%08lX observed_queue=0x%llX present_queue=0x%llX swapchain_queues=%u hits=%u misses=%u\r\n",
                      static_cast<unsigned long long>(g_frames.load()),
                      static_cast<unsigned long long>(g_menu_draw_marker.load()),
-                     static_cast<unsigned long long>(g_state.fence->GetCompletedValue()),
+                     static_cast<unsigned long long>(menu_completed_prefix()),
                      static_cast<unsigned long>(g_state.device->GetDeviceRemovedReason()),
                      static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(g_direct_queue.load())),
                      static_cast<unsigned long long>(g_last_present_queue.load()), g_swap_queues_recorded.load(),
@@ -1431,22 +1451,28 @@ bool ensure_buffers_locked(IDXGISwapChain* sc)
     // FG swapchain's image index. Allow a short GPU backlog without dropping
     // the menu, while keeping every allocator/RTV/ImGui slot fenced together.
     UINT count = (std::max)(8u, desc.BufferCount);
+    if ((g_state.frames.size() != count || g_state.format != desc.BufferDesc.Format) &&
+        !menu_draws_complete()) return false;
     if (g_state.frames.size() != count) {
-        g_state.frames.clear();
-        g_state.frames.resize(count);
+        std::vector<FrameCtx> frames(count);
+        ComPtr<ID3D12DescriptorHeap> rtv_heap;
         D3D12_DESCRIPTOR_HEAP_DESC rh{};
         rh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
         rh.NumDescriptors = count;
-        if (FAILED(g_state.device->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&g_state.rtv_heap))))
+        if (FAILED(g_state.device->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&rtv_heap))))
             return false;
         for (UINT i = 0; i < count; ++i) {
+            if (FAILED(g_state.device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                    IID_PPV_ARGS(&frames[i].completion)))) return false;
             if (FAILED(g_state.device->CreateCommandAllocator(
-                    D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_state.frames[i].allocator))))
+                    D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&frames[i].allocator))))
                 return false;
-            g_state.frames[i].rtv.ptr =
-                g_state.rtv_heap->GetCPUDescriptorHandleForHeapStart().ptr +
+            frames[i].rtv.ptr =
+                rtv_heap->GetCPUDescriptorHandleForHeapStart().ptr +
                 static_cast<SIZE_T>(i) * g_state.rtv_stride;
         }
+        g_state.frames=std::move(frames);
+        g_state.rtv_heap=std::move(rtv_heap);
     }
     g_state.format = desc.BufferDesc.Format;
     // A71 (Astra B-007): back buffers are NOT retained here. A cached buffer
@@ -1513,7 +1539,6 @@ bool ensure_init_locked(IDXGISwapChain* sc)
     sh.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(g_state.device->CreateDescriptorHeap(&sh, IID_PPV_ARGS(&g_state.srv_heap)))) return false;
     g_state.srv_used.assign(kSrvHeapSize, false);
-    if (FAILED(g_state.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_state.fence)))) return false;
     g_state.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!ensure_buffers_locked(sc)) return false;
     if (FAILED(g_state.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -1916,12 +1941,10 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     if (g_state.imgui_slot_fences.empty()) return;
     const size_t imgui_slot = g_state.imgui_draws % g_state.imgui_slot_fences.size();
     FrameCtx& f = g_state.frames[imgui_slot];
-    if (g_state.fence->GetCompletedValue() < g_state.imgui_slot_fences[imgui_slot]) return;
     // Never wait for game-queue work from inside its Present callback. A
     // driver/engine may release that work only after the callback returns.
     // If this allocator is still in use, skip this overlay draw and retry.
-    if (g_state.fence->GetCompletedValue() == UINT64_MAX ||
-        g_state.fence->GetCompletedValue() < f.fence_value) return;
+    if (!f.Complete()) return;
     ComPtr<ID3D12Resource> back_buffer; // A71: this frame only
     if (frame) {
         back_buffer = frame;
@@ -1962,7 +1985,7 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     if (draw->Textures) {
         for (ImTextureData* texture : *draw->Textures) {
             if (texture->Status != ImTextureStatus_OK &&
-                g_state.fence->GetCompletedValue() < g_state.fence_next - 1) return;
+                !menu_draws_complete()) return;
         }
     }
     if (FAILED(f.allocator->Reset()) || FAILED(g_state.list->Reset(f.allocator.Get(), nullptr))) return;
@@ -1988,7 +2011,7 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     g_orig_execute(queue, 1, lists);
     f.fence_value = g_state.fence_next++;
     g_state.imgui_slot_fences[imgui_slot] = f.fence_value;
-    queue->Signal(g_state.fence.Get(), f.fence_value);
+    f.signal_failed = FAILED(queue->Signal(f.completion.Get(), f.fence_value));
     g_menu_draw_marker.store(f.fence_value);
     g_frames.fetch_add(1, std::memory_order_relaxed);
     if (just_opened) menu_note("menu_open: GPU draw submitted\r\n");
@@ -2051,7 +2074,7 @@ bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue,ComPtr<ID3D1
         if (!g_state.last_present.QuadPart || !g_state.qpc_freq.QuadPart ||
             (now.QuadPart - g_state.last_present.QuadPart) < 2 * g_state.qpc_freq.QuadPart)
             return false;
-        if (g_state.fence && g_state.fence_next > 1 && g_state.fence->GetCompletedValue() < g_state.fence_next - 1)
+        if (!menu_draws_complete())
             return false; // our last draw on the old chain is still in flight; try next present
         release_buffers_locked();
         g_state.frames.clear();
@@ -2278,9 +2301,9 @@ void on_chain_gone(IDXGISwapChain* sc)
     std::lock_guard<std::mutex> lock(g_state.mutex);
     if (g_state.swapchain != sc) return;
     release_buffers_locked();
-    g_state.frames.clear();
-    g_state.rtv_heap.Reset();
-    if (g_state.imgui_ready) ImGui_ImplDX12_InvalidateDeviceObjects();
+    // A chain's destruction is not completion of injected draw submissions.
+    // Keep their slot receipts and renderer objects until completion; the next
+    // chain can reuse them or rebuild them through ensure_buffers_locked.
     g_state.swapchain = nullptr;
     g_state.last_present.QuadPart = 0;
 }
@@ -2310,12 +2333,19 @@ ULONG STDMETHODCALLTYPE DetourRelease(IUnknown* obj)
     }
     return n;
 }
+void retire_nr_backbuffers(IDXGISwapChain* sc) {
+    DXGI_SWAP_CHAIN_DESC desc{};
+    if(FAILED(sc->GetDesc(&desc)))return;
+    for(UINT i=0;i<desc.BufferCount;++i){ComPtr<ID3D12Resource> buffer;
+        if(SUCCEEDED(real_get_buffer(sc,i,IID_PPV_ARGS(&buffer))))na::nr::native::RetireBackbuffer(buffer.Get());}
+}
 HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT count, UINT w,
                                               UINT h, DXGI_FORMAT fmt, UINT flags)
 {
     // Reset may have retired the native FG recording without another Present.
     // Drop its completed image references before DXGI checks ResizeBuffers.
     na::nr::native::Maintain();
+    retire_nr_backbuffers(sc);
     {
         std::lock_guard<std::mutex> lock(g_state.mutex);
         if (g_state.swapchain == sc) release_buffers_locked();
@@ -2327,6 +2357,7 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT count, 
                                                const UINT* node_masks, IUnknown* const* queues)
 {
     na::nr::native::Maintain();
+    retire_nr_backbuffers(sc);
     {
         std::lock_guard<std::mutex> lock(g_state.mutex);
         if (g_state.swapchain == sc) release_buffers_locked();
@@ -2674,11 +2705,12 @@ bool Stop()
     remove_input_hooks();
     std::lock_guard<std::mutex> lock(g_state.mutex);
     if (g_state.imgui_ready) {
-        if (g_state.fence && g_state.fence_next > 1) {
-            UINT64 last = g_state.fence_next - 1;
-            if (g_state.fence->GetCompletedValue() < last) {
-                g_state.fence->SetEventOnCompletion(last, g_state.fence_event);
-                WaitForSingleObject(g_state.fence_event, 2000);
+        for (const auto& f : g_state.frames) if (!f.Complete()) {
+            if (f.signal_failed || !f.completion || !g_state.fence_event ||
+                FAILED(f.completion->SetEventOnCompletion(f.fence_value, g_state.fence_event)) ||
+                WaitForSingleObject(g_state.fence_event, 2000) != WAIT_OBJECT_0 || !f.Complete()) {
+                g_stop_incomplete.store(1, std::memory_order_release);
+                return false; // keep GPU-owned resources alive; shutdown may retry
             }
         }
         ImGui_ImplDX12_Shutdown();
@@ -2693,7 +2725,6 @@ bool Stop()
     g_state.list.Reset();
     g_state.rtv_heap.Reset();
     g_state.srv_heap.Reset();
-    g_state.fence.Reset();
     if (g_state.fence_event) CloseHandle(g_state.fence_event);
     g_state.fence_event = nullptr;
     g_texture_queue.store(nullptr, std::memory_order_release);

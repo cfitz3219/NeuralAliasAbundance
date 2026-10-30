@@ -309,6 +309,38 @@ void Reset(ID3D12GraphicsCommandList* list) {
     IUnknown* raw=nullptr;UINT bytes=sizeof(raw);
     if(list && SUCCEEDED(list->GetPrivateData(token_id,&bytes,&raw)) && raw){static_cast<Token*>(raw)->Invalidate();raw->Release();}
 }
+void RetireBackbuffer(ID3D12Resource* resource) {
+    if(!resource || internal)return;Internal guard;
+    std::unique_lock<std::mutex> lock(mutex,std::try_to_lock);
+    if(!lock.owns_lock())return;
+    Collect();
+    std::unique_lock<std::mutex> leases[64];
+    uint32_t count=0;
+    auto references=[&](const Recording& r){
+        for(const auto& dest:r.destinations)if(dest.Get()==resource)return true;
+        for(const auto& p:r.packets)for(const auto& ref:p->refs)if(ref.Get()==resource)return true;
+        return false;
+    };
+    for(const auto& r:recordings)if(r && references(*r)) {
+        leases[count]=std::unique_lock<std::mutex>(r->submission_mutex,std::try_to_lock);
+        if(!leases[count++].owns_lock() || r->forwarding.load() || r->failed.load())return;
+        const auto value=r->value.load(),done=r->fence->GetCompletedValue();
+        // Unsubmitted commands have no completion proof. Keep them intact.
+        if(!value || done==UINT64_MAX || done<value)return;
+    }
+    auto drop=[&](Packet& p){
+        p.composition.ReleaseReference(resource);p.input.ReleaseReference(resource);p.output.ReleaseReference(resource);
+        for(auto& ref:p.refs)if(ref.Get()==resource)ref.Reset();
+    };
+    for(auto& r:recordings)if(r) {
+        for(auto& p:r->packets)drop(*p);
+        for(auto& dest:r->destinations)if(dest.Get()==resource)dest.Reset();
+    }
+    for(auto& c:contexts)for(auto& p:c->packets)if(p)drop(*p);
+    // DXGI still owns the old buffer if resize fails. Keep NR-owned textures,
+    // descriptors, features and recording tokens for a legal list resubmit.
+    // After successful resize the game must not resubmit lists using old buffers.
+}
 void Release(const void* core,const void* handle) {
     if(internal)return;Internal guard;
     std::lock_guard<std::mutex> lock(mutex);
@@ -519,6 +551,7 @@ InputOverride::~InputOverride(){}
 void InputOverride::Bind(const void*,ID3D12Resource*){}
 void Before(ID3D12GraphicsCommandList*,const void*,const void*,const void*,const Runtime&,InputOverride*){}
 void Release(const void*,const void*){} void Prepare(ID3D12GraphicsCommandList*){} void Maintain(){}
+void RetireBackbuffer(ID3D12Resource*){}
 void TraceGpuProgress(){}
 void PrepareDevice(ID3D12Device*){}
 void MarkSwapchainBuffer(ID3D12Resource*){}

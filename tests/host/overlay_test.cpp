@@ -130,6 +130,36 @@ int main(int argc, char** argv)
     CHECK(na::overlay::GetStats().frames_rendered==before_backlog+9);
     REQUIRE(d.device->GetDeviceRemovedReason()==S_OK);
 
+    // A later independent queue must not retire an older blocked draw.
+    {
+        test::ComPtr<ID3D12CommandQueue> fast;
+        D3D12_COMMAND_QUEUE_DESC fastDesc{};fastDesc.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
+        REQUIRE(SUCCEEDED(d.device->CreateCommandQueue(&fastDesc,IID_PPV_ARGS(&fast))));
+        auto other=test::CreateTexture(d.device.Get(),640,360,DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        test::ComPtr<ID3D12Fence> completed;
+        REQUIRE(other && SUCCEEDED(d.device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&completed))));
+        REQUIRE(SUCCEEDED(d.queue->Wait(menu_gate.Get(),2)));
+        const auto count0=na::overlay::GetStats().frames_rendered;
+        na::overlay::DrawMenuForTests(d.queue.Get(),menu_target.Get());
+        for(int j=0;j<7;++j)na::overlay::DrawMenuForTests(fast.Get(),other.Get());
+        REQUIRE(SUCCEEDED(fast->Signal(completed.Get(),1)));
+        auto wait=test::WaitFence(completed.Get(),1,d.event,5000);
+        if(wait!=test::WaitResult::Ok){menu_gate->Signal(2);return 2;}
+        const auto beforeReuse=na::overlay::GetStats().frames_rendered;
+        CHECK(beforeReuse==count0+8);
+        na::overlay::DrawMenuForTests(fast.Get(),other.Get());
+        const auto afterReuse=na::overlay::GetStats().frames_rendered;
+        CHECK(afterReuse==beforeReuse); // blocked draw's allocator must not be reused
+        REQUIRE(SUCCEEDED(menu_gate->Signal(2)));d.WaitIdle();
+        REQUIRE(SUCCEEDED(fast->Signal(completed.Get(),2)));
+        REQUIRE(test::WaitFence(completed.Get(),2,d.event,5000)==test::WaitResult::Ok);
+        na::overlay::DrawMenuForTests(fast.Get(),other.Get());
+        CHECK(na::overlay::GetStats().frames_rendered==beforeReuse+1);
+        REQUIRE(SUCCEEDED(fast->Signal(completed.Get(),3)));
+        REQUIRE(test::WaitFence(completed.Get(),3,d.event,5000)==test::WaitResult::Ok);
+    }
+
     // While open the game receives no mouse/keyboard input.
     const uint32_t mouse_before = g_game_mouse.load(), keys_before = g_game_keys.load();
     SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(50, 60));
