@@ -209,8 +209,8 @@ int wmain(int argc, wchar_t** argv)
         CHECK(reinterpret_cast<Callback>(a)(&request) == 1 && request.U("witness") == 11);
         CHECK(reinterpret_cast<Callback>(b)(&request) == 1 && request.U("witness") == 22);
         na::ngx::OptimalCall calls[64]{};
-        const auto n=na::ngx::GetOptimalCalls(0,calls,64);
-        CHECK(n>=2 && calls[n-2].rr==0 && calls[n-1].rr==1);
+        const auto opt_n=na::ngx::GetOptimalCalls(0,calls,64);
+        CHECK(opt_n>=2 && calls[opt_n-2].rr==0 && calls[opt_n-1].rr==1);
         retained = a;
     }
     test::FakeParams after;
