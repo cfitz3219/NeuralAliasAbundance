@@ -11,6 +11,7 @@
 #include "test_support.hpp"
 #include "host_dx12/hooking/vtable_hook.hpp"
 #include "host_dx12/overlay/overlay.hpp"
+#include "host_dx12/overlay/present_queues.hpp"
 #include "host_dx12/overlay/route_a_panel.hpp"
 #include "host_dx12/settings.hpp"
 #include <filesystem>
@@ -150,6 +151,22 @@ int main(int argc, char** argv)
     CHECK(SUCCEEDED(sc->ResizeBuffers(0, 800, 450, DXGI_FORMAT_UNKNOWN, 0)));
     for (int i = 0; i < 3; ++i) CHECK(SUCCEEDED(frame()));
     CHECK(na::overlay::GetStats().presents_seen >= s.presents_seen + 4);
+
+    // A native FG transition may reassign the same chain to another queue.
+    // Exercise the real ResizeBuffers1 hook, not just creation or last-submit.
+    test::ComPtr<ID3D12CommandQueue> replacement;
+    D3D12_COMMAND_QUEUE_DESC qd{};qd.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
+    REQUIRE(SUCCEEDED(d.device->CreateCommandQueue(&qd,IID_PPV_ARGS(&replacement))));
+    IUnknown* queues[]={replacement.Get(),replacement.Get()};UINT masks[]={1,1};
+    na::overlay::PresentQueues binding;binding.Created(d.queue.Get());
+    CHECK(!binding.Resized(E_FAIL,2,queues));CHECK(binding.At(1).Get()==d.queue.Get());
+    IUnknown* alternating[]={d.queue.Get(),replacement.Get()};
+    CHECK(binding.Resized(S_OK,2,alternating));CHECK(binding.At(0).Get()==d.queue.Get());CHECK(binding.At(1).Get()==replacement.Get());
+    d.WaitIdle();
+    REQUIRE(SUCCEEDED(sc->ResizeBuffers1(2,800,450,DXGI_FORMAT_UNKNOWN,0,masks,queues)));
+    d.queue=replacement; // test render work uses the queue we just assigned
+    na::overlay::SetOpen(true);
+    for(int i=0;i<3;++i){CHECK(SUCCEEDED(frame()));CHECK(na::overlay::GetStats().present_queue==reinterpret_cast<uintptr_t>(replacement.Get()));}
 
     d.WaitIdle();
     bool stopped = false;

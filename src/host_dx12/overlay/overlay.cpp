@@ -4,6 +4,7 @@
 #include "host_dx12/adapters/tlou1/apply.hpp"
 #include "host_dx12/overlay/overlay.hpp"
 #include "host_dx12/overlay/input_handover.hpp"
+#include "host_dx12/overlay/present_queues.hpp"
 
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -136,7 +137,7 @@ std::atomic<ID3D12CommandQueue*> g_direct_queue{nullptr};
 // direct queue that submitted", which in a two-queue game with native Frame
 // Generation (Phantom Blade Zero) is often not the presenting queue: the menu then
 // wrote the back buffer unsynchronised with FG and the GPU faulted (Cort, 2026-10-29).
-struct SwapQueue { void* sc = nullptr; ID3D12CommandQueue* queue = nullptr; };
+struct SwapQueue { void* sc = nullptr; PresentQueues queues; };
 std::mutex g_swap_queue_m;
 SwapQueue g_swap_queues[8];
 uint32_t g_swap_queue_next = 0;
@@ -146,21 +147,21 @@ std::atomic<uintptr_t> g_last_present_queue{0};
 void note_swapchain_queue(IUnknown* device_or_queue, void* swapchain)
 {
     if (!device_or_queue || !swapchain) return;
-    ID3D12CommandQueue* q = nullptr;
+    ComPtr<ID3D12CommandQueue> q;
     if (FAILED(device_or_queue->QueryInterface(IID_PPV_ARGS(&q))) || !q) return; // D3D11 / other device: not ours
     std::lock_guard<std::mutex> lk(g_swap_queue_m);
     for (auto& e : g_swap_queues)
-        if (e.sc == swapchain) { if (e.queue) e.queue->Release(); e.queue = q; g_swap_queues_recorded.fetch_add(1); return; } // address reused
+        if (e.sc == swapchain) { e.queues.Created(q.Get()); g_swap_queues_recorded.fetch_add(1); return; } // address reused
     SwapQueue& slot = g_swap_queues[g_swap_queue_next++ % 8];
-    if (slot.queue) slot.queue->Release();
     slot.sc = swapchain;
-    slot.queue = q; // holds a reference: the queue outlives every Present we see
+    slot.queues.Created(q.Get());
     g_swap_queues_recorded.fetch_add(1);
 }
-ID3D12CommandQueue* swapchain_queue(void* swapchain)
+ComPtr<ID3D12CommandQueue> swapchain_queue(IDXGISwapChain* swapchain)
 {
+    const UINT index=real_index(swapchain);
     std::lock_guard<std::mutex> lk(g_swap_queue_m);
-    for (const auto& e : g_swap_queues) if (e.sc == swapchain) return e.queue;
+    for (const auto& e : g_swap_queues) if (e.sc == swapchain) return e.queues.At(index);
     return nullptr;
 }
 
@@ -2024,14 +2025,15 @@ void process_frame(ID3D12CommandQueue* queue, ID3D12Resource* frame)
 // false when nothing further should happen (stopping, no queue yet, init
 // failed). Takes g_state.mutex on success (caller releases via the guard it
 // passes in).
-bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue)
+bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue,ComPtr<ID3D12CommandQueue>& retained_queue)
 {
     if (g_stopping.load(std::memory_order_acquire)) return false;
     if (sc == g_state.dummy_swapchain_identity) return false;
     g_presents.fetch_add(1, std::memory_order_relaxed);
     // The presenting queue when we saw the swap chain created; otherwise (created
     // before our hooks) the last direct queue, as before.
-    queue = swapchain_queue(sc);
+    retained_queue = swapchain_queue(sc);
+    queue = retained_queue.Get();
     if (queue) g_swap_queue_hits.fetch_add(1, std::memory_order_relaxed);
     else {
         g_swap_queue_misses.fetch_add(1, std::memory_order_relaxed);
@@ -2132,7 +2134,8 @@ void on_present(IDXGISwapChain* sc)
 {
     std::lock_guard<std::mutex> lock(g_state.mutex);
     ID3D12CommandQueue* queue = nullptr;
-    if (!present_prelude(sc, queue)) return;
+    ComPtr<ID3D12CommandQueue> retained_queue;
+    if (!present_prelude(sc, queue,retained_queue)) return;
     na::j2::OnPresent(queue); // one game-frame boundary, never a TEST Present
     UINT idx = real_index(sc);
     if (idx < g_state.backbuffer_count) {
@@ -2155,7 +2158,8 @@ HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_
 {
     std::lock_guard<std::mutex> lock(g_state.mutex);
     ID3D12CommandQueue* queue = nullptr;
-    if (!present_prelude(sc, queue)) {
+    ComPtr<ID3D12CommandQueue> retained_queue;
+    if (!present_prelude(sc, queue,retained_queue)) {
         // No queue or not initialised yet: the frame sits in a proxy; forward so
         // the chain keeps turning (a black frame at most, at start-up).
         return g_orig_present(sc, sync, flags);
@@ -2328,7 +2332,16 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT count, 
         if (g_state.swapchain == sc) release_buffers_locked();
     }
     na::present::BeforeResize(sc);
-    return g_orig_resize1(sc, count, w, h, fmt, flags, node_masks, queues);
+    const auto result=g_orig_resize1(sc, count, w, h, fmt, flags, node_masks, queues);
+    if(SUCCEEDED(result) && queues){
+        UINT actual=count;
+        if(!actual){DXGI_SWAP_CHAIN_DESC1 desc{};if(SUCCEEDED(sc->GetDesc1(&desc)))actual=desc.BufferCount;}
+        std::lock_guard<std::mutex> lock(g_swap_queue_m);
+        for(auto& binding:g_swap_queues)if(binding.sc==sc && binding.queues.Resized(result,actual,queues)){
+            g_swap_queues_recorded.fetch_add(1);break;
+        }
+    }
+    return result;
 }
 void STDMETHODCALLTYPE ForwardWithFgInputs(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists)
 {
@@ -2712,6 +2725,7 @@ Stats GetStats()
     s.input_hooks = g_input_hooks.load(std::memory_order_acquire);
     s.retargets = g_retargets.load(std::memory_order_relaxed);
     s.chain_gone = g_chain_gone.load(std::memory_order_relaxed);
+    s.present_queue = g_last_present_queue.load(std::memory_order_relaxed);
     return s;
 }
 

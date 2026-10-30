@@ -30,6 +30,7 @@ uint32_t reentrant_forwards=0;
 void STDMETHODCALLTYPE ReentrantForward(ID3D12CommandQueue*,UINT,ID3D12CommandList* const*){++reentrant_forwards;}
 float delta=.125f;
 bool fail=false;
+bool check_busy_status=false;
 int core,fg;
 constexpr uint32_t W=8,H=4;
 auto ReadState=D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
@@ -43,6 +44,11 @@ int32_t __cdecl Create(void*,uint32_t feature,void*,void** p){CHECK(feature==18)
 int32_t __cdecl Release(void* p){++releases;handles.erase(static_cast<int*>(p));alive.erase(*static_cast<int*>(p));delete static_cast<int*>(p);return 1;}
 int32_t __cdecl Eval(void* list,const void*,const void* params,void*) {
     ++evaluates;
+    if(check_busy_status){
+        // Before holds the native context mutex while calling the model.
+        // A simultaneous overlay poll must retain the last active snapshot.
+        std::thread poll([]{const auto s=na::nr::native::GetStatus();CHECK(s.active==1);CHECK(s.evaluates>0);});poll.join();
+    }
     if(fail)return static_cast<int32_t>(NVSDK_NGX_Result_Fail);
     auto* p=static_cast<const test::FakeParams*>(params);
     auto* l=static_cast<ID3D12GraphicsCommandList*>(list);
@@ -216,8 +222,10 @@ int main(){
     REQUIRE(na::observe::InstallListResetTracking(d.device.Get(),na::nr::OnCommandListReset,na::nr::states::Observe));
     REQUIRE(Prepare()==0);
     REQUIRE(Frame(0)==0); // zero identity, MFG evaluates NR once
+    check_busy_status=true;
     CHECK(na::nr::native::GetStatus().gpu_samples>0);
     REQUIRE(Frame(1,W,DXGI_FORMAT_R32G32B32A32_FLOAT,true)==0); // discard and retry same identity
+    check_busy_status=false;
     REQUIRE(Frame(1)==0);
     for(uint64_t i=2;i<24;++i)REQUIRE(Frame(i,i<18 || i%2?W:W+2)==0); // stable feature pool recycling, then quality/extent changes
     REQUIRE(Frame(24,W,DXGI_FORMAT_R32G32B32A32_FLOAT,false,false,false)==0);

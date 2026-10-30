@@ -30,6 +30,8 @@ thread_local uint32_t internal=0;
 struct Internal { Internal(){++internal;} ~Internal(){--internal;} };
 std::atomic<uint32_t> contexts_count{0},records_count{0};
 Status status;
+std::mutex published_status_mutex;
+Status published_status;
 std::atomic<uint64_t> submissions{0};
 const GUID swapchain_key={0xc3f25562,0xe301,0x46c8,{0xb8,0x2d,0xa7,0x9e,0x0d,0x83,0xfe,0xf1}};
 bool IsSwapchain(ID3D12Resource* r){UINT value=0,size=sizeof(value);return r && SUCCEEDED(r->GetPrivateData(swapchain_key,&size,&value)) && value==1;}
@@ -323,7 +325,14 @@ void CoreShutdown(const void* core) {
     contexts.erase(std::remove_if(contexts.begin(),contexts.end(),[&](const auto& c){return c->core==core;}),contexts.end());
     contexts_count.store(static_cast<uint32_t>(contexts.size()));
 }
-Status GetStatus(){std::unique_lock<std::mutex> lock(mutex,std::try_to_lock);if(lock.owns_lock()){auto s=status;s.submitted=submissions.load();return s;} Status s;strcpy_s(s.reason,"Updating Neural Rendering.");return s;}
+Status GetStatus(){
+    std::unique_lock<std::mutex> lock(mutex,std::try_to_lock);
+    // Contention is not a disabled effect. Return the last complete snapshot
+    // while an evaluation owns the context, rather than fabricated zeros.
+    std::lock_guard<std::mutex> published_lock(published_status_mutex);
+    if(lock.owns_lock()){published_status=status;published_status.submitted=submissions.load();}
+    return published_status;
+}
 void TraceGpuProgress(){
     std::unique_lock<std::mutex> lock(mutex,std::try_to_lock);
     if(!lock.owns_lock()){trace::Record("nr_progress_busy",nullptr);return;}

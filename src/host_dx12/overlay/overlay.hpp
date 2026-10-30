@@ -64,6 +64,7 @@ struct Stats {
     uint32_t input_hooks;       // A44: user32 input entry points hooked (6 when complete)
     uint32_t retargets;         // A31: swap chain re-targets after 2 s of silence
     uint32_t chain_gone;        // A71: chains observed destroyed at the game's final Release (immediate re-target)
+    uintptr_t present_queue;   // queue selected for the current DXGI buffer
 };
 Stats GetStats();
 
