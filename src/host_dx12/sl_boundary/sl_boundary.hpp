@@ -110,8 +110,10 @@ struct Callbacks {
 void SetCallbacks(const Callbacks& callbacks);
 
 // Watches for sl.interposer.dll and installs once it is loaded. Called from
-// host_boot on Route A. Returns false if the module watch could not start.
-bool Start();
+// host_boot on Route A. `log_path` (optional): evidence file written 30 s and
+// 120 s after start (status line + every distinct tag shape seen).
+// Returns false if the module watch could not start.
+bool Start(const wchar_t* log_path = nullptr);
 
 enum class Discovery : uint32_t { None = 0, Rtti = 1, UpgradeInterface = 2, FactoryExport = 3 };
 

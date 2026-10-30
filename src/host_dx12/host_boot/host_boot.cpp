@@ -1,5 +1,6 @@
 #include "host_dx12/adapters/tlou1/apply.hpp"
 #include "host_dx12/adapters/unreal/cvar_probe.hpp"
+#include "host_dx12/sl_boundary/sl_boundary.hpp"
 #include "host_dx12/host_boot/host_boot.hpp"
 #include "host_dx12/host_boot/session.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
@@ -113,6 +114,16 @@ DWORD WINAPI InitThread(LPVOID)
         // Unreal adapter phase 1: read-only probe of the engine's resolution cvars
         // (unreal_probe.log). [unreal] probe=0 turns it off.
         if (GetPrivateProfileIntW(L"unreal", L"probe", 1, g_ini) == 1) na::unreal::StartCvarProbe();
+        // Game-facing Streamline boundary: observes the game's tags and its Present
+        // into SL's swap-chain proxy (pass-through; consumers decide effects).
+        // [sl_boundary] enabled=0 turns it off.
+        if (!na::settings::SafeStart() && GetPrivateProfileIntW(L"sl_boundary", L"enabled", 1, g_ini) == 1) {
+            wchar_t slb_log[MAX_PATH] = {};
+            wcsncpy_s(slb_log, na::settings::UserIniPath(), _TRUNCATE);
+            if (wchar_t* slash = wcsrchr(slb_log, L'\\')) wcscpy_s(slash + 1, MAX_PATH - static_cast<size_t>(slash + 1 - slb_log), L"sl_boundary.log");
+            else slb_log[0] = 0;
+            na::slb::Start(slb_log);
+        }
         na::ngx::PreloadAndHookNgxCore();
         na::tlou1::InitializeApply();
         bool sync_hook = GetPrivateProfileIntW(L"observe", L"sync_loader_hook", 0, g_ini) == 1;
