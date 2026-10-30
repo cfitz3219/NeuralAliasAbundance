@@ -137,6 +137,7 @@ struct Context {
 };
 std::vector<std::unique_ptr<Context>> contexts;
 struct Recording {
+    std::shared_ptr<std::atomic<bool>> retired=std::make_shared<std::atomic<bool>>(false);
     ID3D12CommandList* list=nullptr;
     std::shared_ptr<std::atomic<bool>> valid;
     ComPtr<ID3D12Fence> fence;
@@ -194,7 +195,7 @@ void Collect() {
     }
     for(auto& r:recordings) if(r && !r->valid->load() && !r->forwarding.load() && !r->failed &&
         (!r->value || (r->fence->GetCompletedValue()!=UINT64_MAX && r->fence->GetCompletedValue()>=r->value))) {
-        if(r->value) ++status.completed;
+        if(r->value && !r->packets.empty()) ++status.completed;
         for(auto& p:r->packets) if(!r->value || !p->successful) {
             // Reset before submission discards commands; failed evaluations
             // may have recorded work, so wait for its receipt before retry.
@@ -205,6 +206,7 @@ void Collect() {
                     c->packets[i].reset();
                 }
         }
+        r->retired->store(true,std::memory_order_release);
         r.reset(); records_count.fetch_sub(1);
     }
     for(auto& c:contexts)for(auto& p:c->packets)if(p && p.use_count()==1) {
@@ -306,6 +308,16 @@ void Maintain() {
     if(internal)return;Internal guard;
     std::unique_lock<std::mutex> lock(mutex,std::try_to_lock);
     if(lock.owns_lock())Collect();
+}
+std::shared_ptr<const std::atomic<bool>> TrackUse(ID3D12GraphicsCommandList* list) {
+    if(!list || internal)return {};
+    Internal guard;
+    ComPtr<ID3D12Device> device;
+    if(FAILED(list->GetDevice(IID_PPV_ARGS(&device))))return {};
+    std::lock_guard<std::mutex> lock(mutex);
+    Collect();
+    auto* r=Track(list,device.Get());
+    return r?r->retired:nullptr;
 }
 void Reset(ID3D12GraphicsCommandList* list) {
     IUnknown* raw=nullptr;UINT bytes=sizeof(raw);
@@ -552,7 +564,7 @@ Submission::~Submission() {
         r.last_queue.store(reinterpret_cast<uintptr_t>(queue_));
         uint64_t frequency=0;queue_->GetTimestampFrequency(&frequency);r.frequency.store(frequency);
         if(FAILED(queue_->Signal(r.fence.Get(),++r.value)))r.failed.store(true);
-        else submissions.fetch_add(1);
+        else if(!r.packets.empty())submissions.fetch_add(1);
         trace::Record("nr_receipt",queue_,r.fence.Get(),r.value.load(),r.fence->GetCompletedValue());
         r.forwarding.fetch_sub(1);
         locks_[i].unlock(); // before the shared Recording owner can be destroyed
@@ -567,6 +579,7 @@ void InputOverride::Bind(const void*,ID3D12Resource*){}
 void Before(ID3D12GraphicsCommandList*,const void*,const void*,const void*,const Runtime&,InputOverride*){}
 void Release(const void*,const void*){} void Prepare(ID3D12GraphicsCommandList*){} void Maintain(){}
 void RetireBackbuffer(ID3D12Resource*){}
+std::shared_ptr<const std::atomic<bool>> TrackUse(ID3D12GraphicsCommandList*){return {};}
 void TraceGpuProgress(){}
 void PrepareDevice(ID3D12Device*){}
 void MarkSwapchainBuffer(ID3D12Resource*){}

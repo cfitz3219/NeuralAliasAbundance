@@ -24,6 +24,9 @@ void CoreShutdown(const void* core);
 void Prepare(ID3D12GraphicsCommandList* list);
 void PrepareDevice(ID3D12Device* device);
 void Maintain();
+// Receipt becomes true only after Reset/destruction AND completion of every
+// submission of this recording. Null means tracking failed, never completion.
+std::shared_ptr<const std::atomic<bool>> TrackUse(ID3D12GraphicsCommandList* list);
 // Called only at the game's ResizeBuffers boundary for an actual old buffer.
 // Release completed game-buffer references, retaining executable NR payloads.
 void RetireBackbuffer(ID3D12Resource* resource);

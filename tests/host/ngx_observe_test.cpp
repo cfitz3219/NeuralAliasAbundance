@@ -236,6 +236,66 @@ int wmain(int argc, wchar_t** argv)
     const auto opt = na::ngx::GetOptimalStats();
     CHECK(opt.swaps_capability && opt.swaps_getparams && opt.swaps_allocate);
 #endif
+#if defined(NA_HAVE_NGX_SDK)
+    // The old eight-Evaluate retirement could release a feature while a
+    // deliberately blocked queue still owned its commands. Exercise the real
+    // hooks, real queue receipts and fake backend release counters together.
+    {
+        test::Device gpu;
+        REQUIRE(test::CreateDevice(gpu));
+        REQUIRE(init(7,L"",gpu.device.Get(),0x15,nullptr)==1);
+        Microsoft::WRL::ComPtr<ID3D12CommandAllocator> a,b;
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> first,next;
+        REQUIRE(SUCCEEDED(gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&a))));
+        REQUIRE(SUCCEEDED(gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&b))));
+        REQUIRE(SUCCEEDED(gpu.device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,a.Get(),nullptr,IID_PPV_ARGS(&first))));
+        REQUIRE(SUCCEEDED(gpu.device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,b.Get(),nullptr,IID_PPV_ARGS(&next))));
+        test::FakeParams p;p.Set("Width",64u);p.Set("Height",64u);p.Set("OutWidth",64u);p.Set("OutHeight",64u);p.Set("PerfQualityValue",0);
+        void* original=nullptr;
+        set_results(1,1);
+        REQUIRE(create(first.Get(),1,&p,&original)==1);
+        REQUIRE(eval(first.Get(),original,&p,nullptr)==1);
+        REQUIRE(SUCCEEDED(first->Close()));
+        Microsoft::WRL::ComPtr<ID3D12Fence> gate;
+        REQUIRE(SUCCEEDED(gpu.device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&gate))));
+        REQUIRE(SUCCEEDED(gpu.queue->Wait(gate.Get(),1)));
+        ID3D12CommandList* lists[]={first.Get()};
+        {na::nr::native::Submission submitted(gpu.queue.Get(),1,lists);gpu.queue->ExecuteCommandLists(1,lists);}
+        const auto releases_before=state()->releases;
+        na::settings::Get().preset=5;
+        na::ngx::RequestReapply();
+        REQUIRE(eval(next.Get(),original,&p,nullptr)==1);
+        CHECK(state()->last_handle_in!=reinterpret_cast<uintptr_t>(original));
+        for(int i=0;i<20;++i)REQUIRE(eval(next.Get(),original,&p,nullptr)==1);
+        CHECK(state()->releases==releases_before);
+        REQUIRE(SUCCEEDED(next->Close()));
+        na::nr::native::Reset(next.Get());na::nr::native::Maintain();
+        // Reset is not completion: the first submission is still blocked.
+        CHECK(state()->releases==releases_before);
+        REQUIRE(SUCCEEDED(gate->Signal(1)));gpu.WaitIdle();
+        na::nr::native::Maintain();
+        REQUIRE(SUCCEEDED(next->Reset(b.Get(),nullptr)));
+        REQUIRE(eval(next.Get(),original,&p,nullptr)==1);
+        CHECK(state()->releases==releases_before); // completed, but executable first list may replay
+        na::nr::native::Reset(first.Get());na::nr::native::Maintain();
+        release_result(static_cast<int32_t>(NVSDK_NGX_Result_Fail));
+        REQUIRE(eval(next.Get(),original,&p,nullptr)==1);
+        CHECK(state()->releases==releases_before+1);
+        release_result(1);
+        REQUIRE(eval(next.Get(),original,&p,nullptr)==1);
+        CHECK(state()->releases==releases_before+2); // failed backend release was retained and retried
+        REQUIRE(SUCCEEDED(next->Close()));
+        REQUIRE(release(original)==1);
+        CHECK(state()->releases==releases_before+2); // mapped recording still executable
+        na::nr::native::Reset(next.Get());na::nr::native::Maintain();
+        // Another ordinary evaluation drives nonblocking retirement collection.
+        REQUIRE(SUCCEEDED(next->Reset(b.Get(),nullptr)));
+        REQUIRE(eval(next.Get(),nullptr,nullptr,nullptr)==1);
+        CHECK(state()->releases==releases_before+3);
+        REQUIRE(SUCCEEDED(next->Close()));na::nr::native::Reset(next.Get());na::nr::native::Maintain();
+        REQUIRE(shutdown(gpu.device.Get())==1);
+    }
+#endif
     na::hooking::Shutdown();
     return test::finish("ngx_observe_test");
 }

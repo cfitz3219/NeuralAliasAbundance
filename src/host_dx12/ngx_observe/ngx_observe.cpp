@@ -14,6 +14,7 @@
 #include "host_dx12/settings.hpp"
 
 #include <d3d12.h>
+#include <wrl/client.h>
 
 #include <atomic>
 #include <cmath>
@@ -24,6 +25,7 @@
 #include <vector>
 #include <array>
 #include <utility>
+#include <algorithm>
 
 #if defined(NA_HAVE_NGX_SDK)
 // Locally pinned NVIDIA SDK headers (never committed; see third_party/README).
@@ -68,6 +70,7 @@ using PfnGetCapParams = NgxResult(__cdecl*)(void** out_params);
 // DLL, which answered 0xBAD00002 for every DLSS creation. Now each module
 // gets its own slot and detours, and feature DLLs are never hooked.
 struct CoreSlot {
+    std::atomic<bool> has_device{false};
     std::atomic<HMODULE> module{nullptr};
     PfnInitExt init_ext = nullptr;
     PfnInitProjectId init_pid = nullptr;
@@ -164,7 +167,7 @@ NgxResult InitExtImpl(CoreSlot& s, unsigned long long app_id, const wchar_t* dat
                       uint32_t sdk_version, const void* params)
 {
     NgxResult r = s.init_ext(app_id, data_path, device, sdk_version, params);
-    if (r == 1) { on_core_initialised(s); na::nr::native::PrepareDevice(static_cast<ID3D12Device*>(device)); }
+    if (r == 1) { s.has_device.store(device!=nullptr); on_core_initialised(s); na::nr::native::PrepareDevice(static_cast<ID3D12Device*>(device)); }
     g_inits.fetch_add(1, std::memory_order_relaxed);
     push_record(CallKind::Init, r, 0, app_id, 0, 0);
     return r;
@@ -174,7 +177,7 @@ NgxResult InitProjectIdImpl(CoreSlot& s, const char* project_id, uint32_t engine
                             const wchar_t* data_path, void* device, uint32_t sdk_version, const void* params)
 {
     NgxResult r = s.init_pid(project_id, engine_type, engine_version, data_path, device, sdk_version, params);
-    if (r == 1) { on_core_initialised(s); na::nr::native::PrepareDevice(static_cast<ID3D12Device*>(device)); }
+    if (r == 1) { s.has_device.store(device!=nullptr); on_core_initialised(s); na::nr::native::PrepareDevice(static_cast<ID3D12Device*>(device)); }
     g_inits.fetch_add(1, std::memory_order_relaxed);
     push_record(CallKind::Init, r, 0, 0, 0, 0);
     return r;
@@ -245,7 +248,24 @@ std::atomic<uint64_t> g_create_failures{0}, g_create_recovered{0};
 std::atomic<uint32_t> g_preset_rejected{0}, g_quality_rejected{0};
 std::atomic<const void*> g_last_sr_handle{nullptr}; // A46: the feature "Apply now" re-creates
 std::mutex g_reapply_mutex;               // rare path only (apply / release)
-EvalParams g_last_sr_create{};            // A63: the game's last successful DLSS creation (sizes, quality, flags), guarded by g_reapply_mutex
+CoreSlot* g_last_sr_core=nullptr; // guarded with the handle and snapshot by g_reapply_mutex
+using SrReceipt=std::shared_ptr<const std::atomic<bool>>;
+struct SrUses {
+    std::shared_ptr<std::atomic<uint32_t>> calls=std::make_shared<std::atomic<uint32_t>>(0);
+    CoreSlot* core=nullptr;
+    const void* handle=nullptr;
+    EvalParams create{};
+    Microsoft::WRL::ComPtr<ID3D12Device> device;
+    std::vector<SrReceipt> receipts;
+    bool untracked=false;
+};
+std::vector<SrUses> g_sr_uses; // g_reapply_mutex
+void AddSrUse(SrUses& use,const SrReceipt& receipt) {
+    use.receipts.erase(std::remove_if(use.receipts.begin(),use.receipts.end(),
+        [](const auto& r){return r->load(std::memory_order_acquire);}),use.receipts.end());
+    if(!receipt)use.untracked=true;
+    else if(std::find(use.receipts.begin(),use.receipts.end(),receipt)==use.receipts.end())use.receipts.push_back(receipt);
+}
 constexpr uint32_t kFeatureRayReconstruction = 13; // NVSDK_NGX_Feature_RayReconstruction
 
 // A66 (R3): bounded per-creation records. The detour captures only raw
@@ -399,10 +419,14 @@ NgxResult CreateFeatureImpl(CoreSlot& s, void* cmd_list, uint32_t feature_id, vo
         g_last_sr_out_h.store(ep.out_height, std::memory_order_relaxed);
         g_sr_creates.fetch_add(1, std::memory_order_release);
         g_sr_creates_unknown.fetch_add(1, std::memory_order_release);
-        if (out_handle) g_last_sr_handle.store(*out_handle, std::memory_order_release); // A46 apply target
-        if (ep.valid) { // A63: what a re-creation from scratch needs
+        if (out_handle && *out_handle) {
+            const auto receipt=s.has_device.load()?na::nr::native::TrackUse(static_cast<ID3D12GraphicsCommandList*>(cmd_list)):SrReceipt{};
             std::lock_guard<std::mutex> lock(g_reapply_mutex);
-            g_last_sr_create = ep;
+            g_last_sr_handle.store(*out_handle,std::memory_order_release);
+            g_last_sr_core=&s;
+            SrUses uses;uses.core=&s;uses.handle=*out_handle;uses.create=ep;AddSrUse(uses,receipt);
+            if(receipt)static_cast<ID3D12GraphicsCommandList*>(cmd_list)->GetDevice(IID_PPV_ARGS(&uses.device));
+            g_sr_uses.push_back(std::move(uses));
         }
         {
             std::lock_guard<std::mutex> lock(g_confirm_m);
@@ -454,28 +478,37 @@ NgxResult CreateFeatureImpl(CoreSlot& s, void* cmd_list, uint32_t feature_id, vo
 // game evaluates with (Streamline keeps one object per feature with the
 // creation keys still set), then map the game's handle to ours: evaluates
 // and the eventual release are forwarded to the new feature; the old one is
-// released a few evaluates later so in-flight GPU work is never cut off.
+// retained until its recorded commands are discarded or finish on the GPU.
 // Size changes (DLAA/Quality/...) still need the game to rebuild its render
 // targets; that is stated in the menu and cannot be done from here.
 constexpr int kMaxHandleMaps = 4;
 struct HandleMap {
+    CoreSlot* core=nullptr; // all map access is guarded by g_reapply_mutex
     std::atomic<const void*> game{nullptr};
     std::atomic<const void*> ours{nullptr};
     std::atomic<void*> params{nullptr}; // A63: our own parameter object when the feature was built from scratch
 };
 HandleMap g_handle_maps[kMaxHandleMaps];
-struct Retired { const void* handle; uint64_t due; };
+struct Retired { SrUses uses; void* params=nullptr; };
 std::vector<Retired> g_retired;           // guarded by g_reapply_mutex
-std::atomic<uint32_t> g_retired_count{0}; // fast check without the mutex
 std::atomic<uint32_t> g_reapply_pending{0};
 std::atomic<uint64_t> g_reapplies{0}, g_reapply_failures{0};
-constexpr uint64_t kRetireAfterEvaluates = 8;
-
-const void* mapped_handle(const void* game)
+void DestroySrParams(CoreSlot& core,void* params)
 {
-    for (HandleMap& m : g_handle_maps)
-        if (m.game.load(std::memory_order_acquire) == game) return m.ours.load(std::memory_order_acquire);
-    return nullptr;
+    if(!params)return;
+    using Fn=int32_t(__cdecl*)(void*);
+    if(auto module=core.module.load())if(auto fn=reinterpret_cast<Fn>(GetProcAddress(module,"NVSDK_NGX_D3D12_DestroyParameters")))fn(params);
+}
+void CollectSrLocked() {
+    for(size_t i=0;i<g_retired.size();) {
+        auto& r=g_retired[i];
+        if(!r.uses.untracked && !r.uses.calls->load() && std::all_of(r.uses.receipts.begin(),r.uses.receipts.end(),
+            [](const auto& receipt){return receipt->load(std::memory_order_acquire);}) &&
+            r.uses.core->release(const_cast<void*>(r.uses.handle))==1) {
+            DestroySrParams(*r.uses.core,r.params);
+            g_retired.erase(g_retired.begin()+i);
+        } else ++i;
+    }
 }
 
 // Writes the current preset choice into the feature's parameter object
@@ -510,10 +543,9 @@ bool write_preset_only(void* params)
 // successful creation (sizes, quality value, create flags) plus the preset.
 // Returns the NGX result; on success *params_out is our object (destroyed
 // when the feature is released).
-NgxResult create_from_snapshot_locked(CoreSlot& s, void* cmd_list, void** out_handle, void** params_out)
+NgxResult create_from_snapshot_locked(CoreSlot& s, const EvalParams& c, void* cmd_list, void** out_handle, void** params_out)
 {
 #if defined(NA_HAVE_NGX_SDK)
-    const EvalParams& c = g_last_sr_create;
     HMODULE m = s.module.load(std::memory_order_acquire);
     if (!c.valid || !m || c.in_width == 0xFFFFFFFFu || c.out_width == 0xFFFFFFFFu || c.perf_quality == 0xFFFFFFFFu) return -1;
     using PfnAlloc = int32_t(__cdecl*)(void**);
@@ -538,7 +570,7 @@ NgxResult create_from_snapshot_locked(CoreSlot& s, void* cmd_list, void** out_ha
     else destroy(raw);
     return r;
 #else
-    (void)s; (void)cmd_list; (void)out_handle; (void)params_out;
+    (void)s; (void)c; (void)cmd_list; (void)out_handle; (void)params_out;
     return -1;
 #endif
 }
@@ -572,74 +604,51 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
         return result;
     }
     const void* game_handle = handle; // A66: identity as the game sees it (creation records use the same)
-    // A46: forward to our re-created feature when the game's handle is mapped.
-    if (const void* ours = mapped_handle(handle)) handle = ours;
-    if (g_reapply_pending.load(std::memory_order_acquire) && handle == g_last_sr_handle.load(std::memory_order_acquire) &&
-        g_reapply_pending.exchange(0, std::memory_order_acq_rel)) {
+    // Acquire the recording receipt before any feature can record GPU work.
+    // A null-device observation stub has no real command list; never dereference it.
+    const auto receipt=s.has_device.load()?na::nr::native::TrackUse(list):SrReceipt{};
+    Microsoft::WRL::ComPtr<ID3D12Device> eval_device;
+    if(receipt)list->GetDevice(IID_PPV_ARGS(&eval_device));
+    std::shared_ptr<std::atomic<uint32_t>> active_call;
+    {
         std::lock_guard<std::mutex> lock(g_reapply_mutex);
-        void* new_handle = nullptr;
-        void* own_params = nullptr;
-        bool wrote = write_preset_only(const_cast<void*>(params));
-        NgxResult cr = wrote ? s.create(cmd_list, 1u, const_cast<void*>(params), &new_handle) : -1;
-        if (cr != 1) cr = create_from_snapshot_locked(s, cmd_list, &new_handle, &own_params); // A63 fallback
-        EvalParams reapply_params{};
-        auto* used_params=own_params?own_params:const_cast<void*>(params);
-        ReadEvalParams(used_params,&reapply_params);
-        reapply_params.preset_hint=CreatePresetHint(1u,used_params);
-        if (cr == 1 && new_handle) {
-            // Find the game's key for this handle (the original game handle, or the one already mapped).
-            const void* game_key = handle;
-            for (HandleMap& m : g_handle_maps)
-                if (m.ours.load(std::memory_order_acquire) == handle) { game_key = m.game.load(std::memory_order_acquire); break; }
-            HandleMap* slot = nullptr;
-            for (HandleMap& m : g_handle_maps)
-                if (m.game.load(std::memory_order_acquire) == game_key) { slot = &m; break; }
-            if (!slot)
-                for (HandleMap& m : g_handle_maps)
-                    if (!m.game.load(std::memory_order_acquire)) { slot = &m; break; }
-            if (slot) {
-                if (void* old = slot->params.exchange(own_params, std::memory_order_acq_rel)) { // previous from-scratch object
-                    using PfnDestroy = int32_t(__cdecl*)(void*);
-                    if (HMODULE m = s.module.load(std::memory_order_acquire))
-                        if (auto destroy = reinterpret_cast<PfnDestroy>(GetProcAddress(m, "NVSDK_NGX_D3D12_DestroyParameters"))) destroy(old);
-                }
-                slot->ours.store(new_handle, std::memory_order_release);
-                slot->game.store(game_key, std::memory_order_release);
-                g_retired.push_back({handle, g_evaluates.load(std::memory_order_relaxed) + kRetireAfterEvaluates});
-                g_retired_count.store(static_cast<uint32_t>(g_retired.size()), std::memory_order_release);
-                g_last_sr_handle.store(new_handle, std::memory_order_release);
-                g_reapplies.fetch_add(1, std::memory_order_relaxed);
-                handle = new_handle;
-            } else {
-                s.release(new_handle); // no map slot: keep the old feature
-                if (own_params) {
-                    using PfnDestroy = int32_t(__cdecl*)(void*);
-                    if (HMODULE m = s.module.load(std::memory_order_acquire))
-                        if (auto destroy = reinterpret_cast<PfnDestroy>(GetProcAddress(m, "NVSDK_NGX_D3D12_DestroyParameters"))) destroy(own_params);
-                }
-                g_reapply_failures.fetch_add(1, std::memory_order_relaxed);
+        CollectSrLocked();
+        HandleMap* slot=nullptr;
+        for(auto& m:g_handle_maps)if(m.core==&s && m.game.load()==game_handle){slot=&m;handle=m.ours.load();break;}
+        auto use=std::find_if(g_sr_uses.begin(),g_sr_uses.end(),[&](const auto& u){return u.core==&s && u.handle==handle;});
+        if(use!=g_sr_uses.end()) {
+            AddSrUse(*use,receipt);
+            if(g_last_sr_core==&s && handle==g_last_sr_handle.load() && g_reapply_pending.exchange(0)) {
+                if(!slot)for(auto& m:g_handle_maps)if(!m.game.load()){slot=&m;break;}
+                // Reserve capacity BEFORE Create: even a rejected replacement may
+                // record commands. Never create then immediately release for lack of a map.
+                if(slot && !use->untracked && use->device && use->device==eval_device) {
+                    void* replacement=nullptr;void* own_params=nullptr;
+                    const auto snapshot=use->create;
+                    bool wrote=write_preset_only(const_cast<void*>(params));
+                    NgxResult cr=wrote?s.create(cmd_list,1u,const_cast<void*>(params),&replacement):-1;
+                    if(cr!=1)cr=create_from_snapshot_locked(s,snapshot,cmd_list,&replacement,&own_params);
+                    EvalParams reapply_params{};
+                    auto* used=own_params?own_params:const_cast<void*>(params);
+                    ReadEvalParams(used,&reapply_params);reapply_params.preset_hint=CreatePresetHint(1u,used);
+                    if(cr==1 && replacement) {
+                        g_retired.push_back({std::move(*use),slot->params.exchange(own_params)});
+                        SrUses fresh;fresh.core=&s;fresh.handle=replacement;fresh.create=snapshot;fresh.device=eval_device;AddSrUse(fresh,receipt);
+                        *use=std::move(fresh);
+                        slot->core=&s;slot->ours.store(replacement);slot->game.store(game_handle);
+                        handle=replacement;g_last_sr_handle.store(handle);
+                        g_reapplies.fetch_add(1);
+                    } else g_reapply_failures.fetch_add(1);
+                    push_record(CallKind::CreateFeature,cr,1u,0,reinterpret_cast<uint64_t>(replacement),reinterpret_cast<uint64_t>(cmd_list),&reapply_params);
+                } else g_reapply_failures.fetch_add(1);
             }
-        } else {
-            g_reapply_failures.fetch_add(1, std::memory_order_relaxed);
+            active_call=use->calls;active_call->fetch_add(1);
         }
-        push_record(CallKind::CreateFeature, cr, 1u, 0, reinterpret_cast<uint64_t>(new_handle), reinterpret_cast<uint64_t>(cmd_list),&reapply_params);
-    }
-    if (g_retired_count.load(std::memory_order_acquire)) {
-        std::lock_guard<std::mutex> lock(g_reapply_mutex);
-        uint64_t now = g_evaluates.load(std::memory_order_relaxed);
-        for (size_t i = 0; i < g_retired.size();) {
-            if (g_retired[i].due <= now) {
-                s.release(const_cast<void*>(g_retired[i].handle));
-                g_retired.erase(g_retired.begin() + static_cast<std::ptrdiff_t>(i));
-            } else {
-                ++i;
-            }
-        }
-        g_retired_count.store(static_cast<uint32_t>(g_retired.size()), std::memory_order_release);
     }
     na::gputime::Begin(list);
     NgxResult r = s.evaluate(cmd_list, handle, params, callback);
     na::gputime::End(list);
+    if(active_call)active_call->fetch_sub(1);
     g_evaluates.fetch_add(1, std::memory_order_relaxed);
     g_evaluates_external.fetch_add(1, std::memory_order_release);
     bool detail = g_detail.load(std::memory_order_relaxed);
@@ -815,31 +824,31 @@ NgxResult ReleaseFeatureImpl(CoreSlot& s, void* handle)
         g_feature_flags.Erase(reinterpret_cast<uint64_t>(handle)); // A68: a released handle value may be reused
         for (auto& entry : g_fg_handles) if (entry.core == &s && entry.handle == handle) entry = {};
     }
-    // A46: the game releases ITS handle; if we replaced that feature, release
-    // ours instead (the game's original was retired already) and drop the map.
-    for (HandleMap& m : g_handle_maps) {
-        if (m.game.load(std::memory_order_acquire) == handle) {
-            const void* ours = m.ours.load(std::memory_order_acquire);
-            m.game.store(nullptr, std::memory_order_release);
-            m.ours.store(nullptr, std::memory_order_release);
-            std::lock_guard<std::mutex> lock(g_reapply_mutex);
-            if (void* own = m.params.exchange(nullptr, std::memory_order_acq_rel)) { // A63: our from-scratch parameter object
-                using PfnDestroy = int32_t(__cdecl*)(void*);
-                if (HMODULE mod = s.module.load(std::memory_order_acquire))
-                    if (auto destroy = reinterpret_cast<PfnDestroy>(GetProcAddress(mod, "NVSDK_NGX_D3D12_DestroyParameters"))) destroy(own);
+    // A mapped handle belongs to us. Retirement follows its actual recordings;
+    // the game's original handle is only an external key and may already be retired.
+    {
+        std::lock_guard<std::mutex> lock(g_reapply_mutex);
+        for(auto& m:g_handle_maps)if(m.core==&s && m.game.load()==handle) {
+            auto use=std::find_if(g_sr_uses.begin(),g_sr_uses.end(),[&](const auto& u){return u.core==&s && u.handle==m.ours.load();});
+            if(use!=g_sr_uses.end()) {
+                g_retired.push_back({std::move(*use),m.params.exchange(nullptr)});
+                g_sr_uses.erase(use);
             }
-            bool still_retiring = false; // the game's own handle may still be in the retire queue: release it now
-            for (size_t i = 0; i < g_retired.size();) {
-                if (g_retired[i].handle == handle) { still_retiring = true; g_retired.erase(g_retired.begin() + static_cast<std::ptrdiff_t>(i)); }
-                else ++i;
-            }
-            g_retired_count.store(static_cast<uint32_t>(g_retired.size()), std::memory_order_release);
-            if (still_retiring) s.release(handle);
-            handle = const_cast<void*>(ours);
-            break;
+            if(g_last_sr_core==&s && g_last_sr_handle.load()==m.ours.load())g_last_sr_handle.store(nullptr);
+            m.game.store(nullptr);m.ours.store(nullptr);m.core=nullptr;
+            CollectSrLocked();
+            g_releases.fetch_add(1);
+            push_record(CallKind::ReleaseFeature,1,1u,0,reinterpret_cast<uint64_t>(handle),0);
+            return 1; // virtual handle retired; backend errors remain queued for retry
         }
     }
     NgxResult r = s.release(handle);
+    if(r==1){
+        std::lock_guard<std::mutex> lock(g_reapply_mutex);
+        g_sr_uses.erase(std::remove_if(g_sr_uses.begin(),g_sr_uses.end(),[&](const auto& u){return u.core==&s && u.handle==handle;}),g_sr_uses.end());
+        if(g_last_sr_core==&s && g_last_sr_handle.load()==handle)g_last_sr_handle.store(nullptr);
+        CollectSrLocked();
+    }
     g_releases.fetch_add(1, std::memory_order_relaxed);
     push_record(CallKind::ReleaseFeature, r, 0, 0,
                 reinterpret_cast<uint64_t>(handle), 0);
@@ -852,6 +861,14 @@ NgxResult Shutdown1Impl(CoreSlot& s, void* device)
     na::nr::OnRuntimeShutdown(core_runtime(s));
     s.init_succeeded.store(0);
     NgxResult r = s.shutdown1(device);
+    if(r==1){
+        std::lock_guard<std::mutex> lock(g_reapply_mutex);
+        for(auto& m:g_handle_maps)if(m.core==&s){m.game.store(nullptr);m.ours.store(nullptr);m.params.store(nullptr);m.core=nullptr;}
+        g_sr_uses.erase(std::remove_if(g_sr_uses.begin(),g_sr_uses.end(),[&](const auto& u){return u.core==&s;}),g_sr_uses.end());
+        g_retired.erase(std::remove_if(g_retired.begin(),g_retired.end(),[&](const auto& u){return u.uses.core==&s;}),g_retired.end());
+        if(g_last_sr_core==&s){g_last_sr_core=nullptr;g_last_sr_handle.store(nullptr);}
+        s.has_device.store(false);
+    }
     if (r == 1) {
         std::lock_guard<std::mutex> lock(g_confirm_m);
         for (auto& entry : g_fg_handles) if (entry.core == &s) entry = {};
