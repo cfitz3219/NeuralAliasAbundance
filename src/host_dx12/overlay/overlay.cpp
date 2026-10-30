@@ -2335,13 +2335,17 @@ void STDMETHODCALLTYPE ForwardWithFgInputs(ID3D12CommandQueue* q, UINT n, ID3D12
     na::fg::Execute(q, n, lists, g_orig_execute);
 }
 HRESULT STDMETHODCALLTYPE TraceSignal(ID3D12CommandQueue* q,ID3D12Fence* fence,UINT64 value) {
-    na::nr::trace::Record("signal_begin",q,fence,value);
+    void* callers[4]{};
+    if(na::settings::Get().nr_enabled.load(std::memory_order_relaxed))CaptureStackBackTrace(1,4,callers,nullptr);
+    na::nr::trace::Record("signal_begin",q,fence,value,0,0,callers);
     const auto hr=g_trace_signal(q,fence,value);
     na::nr::trace::Record("signal_end",q,fence,value,0,hr);return hr;
 }
 HRESULT STDMETHODCALLTYPE TraceWait(ID3D12CommandQueue* q,ID3D12Fence* fence,UINT64 value) {
     const auto completed=fence?fence->GetCompletedValue():0;
-    na::nr::trace::Record("wait_begin",q,fence,value,completed);
+    void* callers[4]{};
+    if(na::settings::Get().nr_enabled.load(std::memory_order_relaxed))CaptureStackBackTrace(1,4,callers,nullptr);
+    na::nr::trace::Record("wait_begin",q,fence,value,completed,0,callers);
     const auto hr=g_trace_wait(q,fence,value);
     na::nr::trace::Record("wait_end",q,fence,value,completed,hr);return hr;
 }

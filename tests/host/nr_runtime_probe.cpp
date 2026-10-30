@@ -6,6 +6,40 @@
 #include "host_dx12/settings.hpp"
 #include <nvsdk_ngx.h>
 
+// Exercise DXGI buffer acquisition/presentation, not only offscreen evaluation.
+// This is a separate test window and never attaches to a game.
+struct Presentation {
+    HWND window=nullptr;
+    test::ComPtr<IDXGISwapChain3> chain;
+    test::List copies[8];
+    uint64_t receipts[8]{};
+    unsigned count=0;
+    int Init(test::Device& d,UINT w,UINT h,DXGI_FORMAT format) {
+        WNDCLASSW wc{};wc.lpfnWndProc=DefWindowProcW;wc.hInstance=GetModuleHandleW(nullptr);wc.lpszClassName=L"NA_NR_Probe";
+        RegisterClassW(&wc);window=CreateWindowW(wc.lpszClassName,L"NeuralAlias standalone NR regression",WS_OVERLAPPEDWINDOW,
+            0,0,320,180,nullptr,nullptr,wc.hInstance,nullptr);REQUIRE(window);
+        test::ComPtr<IDXGIFactory2> factory;REQUIRE(SUCCEEDED(CreateDXGIFactory2(0,IID_PPV_ARGS(&factory))));
+        DXGI_SWAP_CHAIN_DESC1 desc{};desc.Width=w;desc.Height=h;desc.Format=format;desc.SampleDesc.Count=1;
+        desc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;desc.BufferCount=3;desc.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        test::ComPtr<IDXGISwapChain1> base;REQUIRE(SUCCEEDED(factory->CreateSwapChainForHwnd(d.queue.Get(),window,&desc,nullptr,nullptr,&base)));
+        REQUIRE(SUCCEEDED(base.As(&chain)));ShowWindow(window,SW_SHOWNOACTIVATE);
+        for(auto& c:copies){REQUIRE(c.Create(d.device.Get()));REQUIRE(SUCCEEDED(c.list->Close()));}return 0;
+    }
+    int Show(test::Device& d,ID3D12Resource* image,D3D12_RESOURCE_STATES state) {
+        MSG message;while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){TranslateMessage(&message);DispatchMessageW(&message);}
+        const auto index=count++%8;
+        if(receipts[index]){auto waited=test::WaitFence(d.fence.Get(),receipts[index],d.event,10000);if(waited!=test::WaitResult::Ok)test::FatalWait("present ring",waited,d.device.Get());}
+        auto& c=copies[index];c.Reset();test::ComPtr<ID3D12Resource> buffer;REQUIRE(SUCCEEDED(chain->GetBuffer(chain->GetCurrentBackBufferIndex(),IID_PPV_ARGS(&buffer))));
+        D3D12_RESOURCE_BARRIER barriers[]={test::Transition(image,state,D3D12_RESOURCE_STATE_COPY_SOURCE),test::Transition(buffer.Get(),D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_STATE_COPY_DEST)};
+        c.list->ResourceBarrier(2,barriers);c.list->CopyResource(buffer.Get(),image);
+        for(auto& b:barriers)std::swap(b.Transition.StateBefore,b.Transition.StateAfter);
+        c.list->ResourceBarrier(2,barriers);REQUIRE(SUCCEEDED(c.list->Close()));ID3D12CommandList* lists[]={c.list.Get()};d.queue->ExecuteCommandLists(1,lists);
+        receipts[index]=++d.fence_value;REQUIRE(SUCCEEDED(d.queue->Signal(d.fence.Get(),d.fence_value)));
+        REQUIRE(SUCCEEDED(chain->Present(0,0)));return 0;
+    }
+    ~Presentation(){chain.Reset();if(window)DestroyWindow(window);}
+};
+
 void STDMETHODCALLTYPE Forward(ID3D12CommandQueue* q,UINT n,ID3D12CommandList* const* l){q->ExecuteCommandLists(n,l);}
 int wmain(int argc,wchar_t** argv) {
     if(argc!=4){puts("SKIP: supply NGX core path, NR model directory and FG model directory");return test::kSkip;}
@@ -24,6 +58,7 @@ int wmain(int argc,wchar_t** argv) {
         reinterpret_cast<void*>(GetProcAddress(core,"NVSDK_NGX_D3D12_DestroyParameters")),nullptr};
     REQUIRE(rt.create_feature && rt.evaluate_feature && rt.allocate_parameters);
     constexpr UINT w=3440,h=1440;
+    Presentation presentation;REQUIRE(presentation.Init(d,w,h,DXGI_FORMAT_R10G10B10A2_UNORM)==0);
     test::ComPtr<ID3D12Resource> inputs[4];
     DXGI_FORMAT formats[]={DXGI_FORMAT_R10G10B10A2_UNORM,DXGI_FORMAT_R10G10B10A2_UNORM,DXGI_FORMAT_R32_FLOAT,DXGI_FORMAT_R16G16_FLOAT};
     test::ComPtr<ID3D12DescriptorHeap> heap;D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,4,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
@@ -48,7 +83,7 @@ int wmain(int argc,wchar_t** argv) {
     float identity[16]{1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
     for(const char* key:{"DLSSG.CameraViewToClip","DLSSG.ClipToCameraView","DLSSG.ClipToLensClip","DLSSG.ClipToPrevClip","DLSSG.PrevClipToClip"})p.Set(key,static_cast<void*>(identity));
     p.Set("DLSSG.CameraNear",.1f);p.Set("DLSSG.CameraFar",1000.f);p.Set("DLSSG.CameraFOV",1.f);p.Set("DLSSG.CameraAspectRatio",float(w)/h);
-    p.Set("DLSSG.ColorBuffersHDR",0u);p.Set("DLSSG.MvecScaleX",1.f);p.Set("DLSSG.MvecScaleY",1.f);
+    p.Set("DLSSG.ColorBuffersHDR",1u);p.Set("DLSSG.MvecScaleX",1.f);p.Set("DLSSG.MvecScaleY",1.f);
     na::settings::Get().nr_enabled.store(1);int handle;
     test::List ring[8];uint64_t receipts[8]{};
     for(auto& slot:ring){REQUIRE(slot.Create(d.device.Get()));REQUIRE(SUCCEEDED(slot.list->Close()));}
@@ -67,6 +102,8 @@ int wmain(int argc,wchar_t** argv) {
         REQUIRE(s.evaluates==frame && s.active);REQUIRE(SUCCEEDED(cmd->Close()));
         ID3D12CommandList* submitted[]={cmd};na::nr::Execute(d.queue.Get(),1,submitted,Forward);
         receipts[index]=++d.fence_value;REQUIRE(SUCCEEDED(d.queue->Signal(d.fence.Get(),d.fence_value)));
+        REQUIRE(presentation.Show(d,generated.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS)==0);
+        if(inner==2)REQUIRE(presentation.Show(d,inputs[0].Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)==0);
     }
     d.WaitIdle();for(auto& slot:ring){slot.Reset();na::nr::OnCommandListReset(slot.list.Get());slot.list->Close();}
     list.Reset();na::nr::OnCommandListReset(list.list.Get());list.list->Close();na::nr::native::Maintain();
