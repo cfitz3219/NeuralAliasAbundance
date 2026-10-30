@@ -17,6 +17,7 @@
 #include <cwchar>
 #include "host_dx12/dlss/call_origin.hpp"
 #include "host_dx12/settings.hpp"
+#include "host_dx12/nr/native_fg.hpp"
 #if defined(NA_HAVE_NGX_SDK)
 #include "fake_ngx_params.hpp"
 #endif
@@ -168,10 +169,18 @@ int wmain(int argc, wchar_t** argv)
     CHECK(fg_params.non_fg_reads == reads);
     CHECK(na::ngx::GetStats().fg_evaluates == fg0.fg_evaluates + 1);
     CHECK(na::ngx::GetStats().fg_with_frame_id == fg0.fg_with_frame_id + 1);
+    auto release_result=reinterpret_cast<void(__cdecl*)(int32_t)>(GetProcAddress(stub,"NgxStubSetReleaseResult"));
+    REQUIRE(release_result);
+    release_result(static_cast<int32_t>(NVSDK_NGX_Result_Fail));
+    CHECK(release(fg_handle)==static_cast<int32_t>(NVSDK_NGX_Result_Fail));
+    CHECK(na::nr::native::OwnsRoute());
+    CHECK(eval(nullptr,fg_handle,&fg_params,nullptr)==1);
+    CHECK(na::ngx::GetStats().fg_evaluates==fg0.fg_evaluates+2);
+    release_result(1);
     CHECK(release(fg_handle) == 1);
     // Released identities must not remain classified as FG.
     CHECK(eval(nullptr, fg_handle, nullptr, nullptr) == 1);
-    CHECK(na::ngx::GetStats().fg_evaluates == fg0.fg_evaluates + 1);
+    CHECK(na::ngx::GetStats().fg_evaluates == fg0.fg_evaluates + 2);
 #endif
 #if defined(NA_HAVE_NGX_SDK)
     // Exercise actual patched exports, including empty allocation, failures,

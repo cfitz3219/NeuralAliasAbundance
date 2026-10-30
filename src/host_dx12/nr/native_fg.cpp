@@ -128,6 +128,8 @@ struct Context {
     FgFrameCache cache;
     FgIdentity identity;
     uint32_t identity_mode=0;
+    std::optional<uint64_t> setting_frame;
+    bool frame_enabled=false;
     std::shared_ptr<Feature> feature;
     std::shared_ptr<Packet> packets[FgFrameCache::Capacity];
     bool live[FgFrameCache::Capacity]{};
@@ -383,7 +385,6 @@ void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,
     Context* ctx=nullptr; for(auto& c:contexts)if(c->core==core && c->handle==handle)ctx=c.get();
     if(!ctx){if(contexts.size()>=8)return;auto c=std::make_unique<Context>();c->core=core;c->handle=handle;ctx=c.get();contexts.push_back(std::move(c));contexts_count.store(static_cast<uint32_t>(contexts.size()));}
     status.active=0;
-    if(!settings::Get().nr_enabled.load()){ctx->feature.reset();Reason("Neural Rendering is off.");return;}
     auto f=ReadFgContract(static_cast<const NVSDK_NGX_Parameter*>(parameters));
     status.input_states_known=0;status.input_states_ready=0;status.hudless_replaced=0;status.state_contract_mask=0;status.frame_id=f.frame_id;
     status.backbuffer_is_swapchain=IsSwapchain(f.color.resource);
@@ -398,8 +399,22 @@ void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,
         // old payloads independently until their submitted GPU work retires.
         ctx->cache={};for(auto& p:ctx->packets)p.reset();for(auto& live:ctx->live)live=false;
         ctx->feature.reset();ctx->identity_mode=ctx->identity.mode;
+        ctx->setting_frame.reset();
     }
     f.frame_id=*identity;status.frame_id=f.frame_id;
+    // A preference change takes effect on the next real image, not between
+    // the generated images of one pair. Resolve identity even while off.
+    if(!ctx->setting_frame || f.frame_id>*ctx->setting_frame){
+        ctx->setting_frame=f.frame_id;ctx->frame_enabled=settings::Get().nr_enabled.load()!=0;
+        if(!ctx->frame_enabled)ctx->feature.reset();
+    }
+    bool frame_enabled=f.frame_id==*ctx->setting_frame && ctx->frame_enabled;
+    // A delayed inner call for an older enhanced frame retains its decision
+    // while that frame's payload is live. Older disabled/retired images never
+    // acquire a new enhancement merely because the preference changed.
+    for(uint32_t i=0;i<FgFrameCache::Capacity;++i)
+        if(ctx->live[i] && ctx->packets[i] && ctx->packets[i]->id==f.frame_id)frame_enabled=true;
+    if(!frame_enabled){Reason("Neural Rendering is off for this real frame.");return;}
     if(!f.camera_motion || f.motion_jittered){++status.skipped;Reason("Neural Rendering needs unjittered camera-inclusive motion vectors.");return;}
     if(!Region(f.color) || !Region(f.hudless) || !Region(f.depth) || !Region(f.motion) ||
         f.color.region.width!=f.hudless.region.width || f.color.region.height!=f.hudless.region.height ||

@@ -792,6 +792,23 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
 
 NgxResult ReleaseFeatureImpl(CoreSlot& s, void* handle)
 {
+    bool native_fg=false;
+    {
+        std::lock_guard<std::mutex> lock(g_confirm_m);
+        for(const auto& entry:g_fg_handles)if(entry.core==&s && entry.handle==handle){native_fg=true;break;}
+    }
+    if(native_fg){
+        const auto result=s.release(handle);
+        if(result==1){
+            na::nr::native::Release(&s,handle);
+            std::lock_guard<std::mutex> lock(g_confirm_m);
+            g_feature_flags.Erase(reinterpret_cast<uint64_t>(handle));
+            for(auto& entry:g_fg_handles)if(entry.core==&s && entry.handle==handle)entry={};
+        }
+        g_releases.fetch_add(1,std::memory_order_relaxed);
+        push_record(CallKind::ReleaseFeature,result,11u,0,reinterpret_cast<uint64_t>(handle),0);
+        return result;
+    }
     na::nr::native::Release(&s,handle);
     {
         std::lock_guard<std::mutex> lock(g_confirm_m);

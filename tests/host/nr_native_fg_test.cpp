@@ -135,7 +135,7 @@ void Params(test::FakeParams& p,Image& b,Image& h,ID3D12Resource* depth,ID3D12Re
     for(int i=0;i<4;++i){char key[100];const char* suffix[]={"BaseX","BaseY","Width","Height"};const uint32_t v[]={xs[i],ys[i],i<2?w:3,i<2?H:2};
         for(int j=0;j<4;++j){snprintf(key,sizeof(key),"DLSSG.%sSubrect%s",names[i],suffix[j]);p.Set(key,v[j]);}}
 }
-int Frame(uint64_t id,uint32_t w= W,DXGI_FORMAT fmt=DXGI_FORMAT_R32G32B32A32_FLOAT,bool discard=false,bool backlog=false,bool enabled=true){
+int Frame(uint64_t id,uint32_t w= W,DXGI_FORMAT fmt=DXGI_FORMAT_R32G32B32A32_FLOAT,bool discard=false,bool backlog=false,bool enabled=true,bool toggle_inner=false){
     test::List list;REQUIRE(list.Create(d.device.Get(),list_type));Image b,h;REQUIRE(Make(list,b,1,2,w,true,fmt)==0);REQUIRE(Make(list,h,2,1,w,false,fmt)==0);
     auto depth=test::CreateTexture(d.device.Get(),3,2,DXGI_FORMAT_R32_FLOAT,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_FLAG_NONE);
     auto mv=test::CreateTexture(d.device.Get(),3,2,DXGI_FORMAT_R16G16_FLOAT,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_FLAG_NONE);
@@ -177,11 +177,12 @@ int Frame(uint64_t id,uint32_t w= W,DXGI_FORMAT fmt=DXGI_FORMAT_R32G32B32A32_FLO
         na::nr::states::Observe(list.list.Get(),1,&color);
     }
     for(uint32_t m=1;m<=(legacy_pair?1u:3u);++m){
+        if(toggle_inner && m==2)na::settings::Get().nr_enabled=!enabled;
         if(!legacy_pair){p.Set("DLSSG.MultiFrameCount",3u);p.Set("DLSSG.MultiFrameIndex",m);}
         {
             na::nr::native::InputOverride override;
             na::nr::native::Before(list.list.Get(),&core,&fg,&p,Runtime(),&override);
-            if(missing){
+            if(missing && enabled){
                 ID3D12Resource* replacement=nullptr;p.Get("DLSSG.HUDLess",&replacement);
                 CHECK(replacement && replacement!=h.texture.Get());
                 const auto status=na::nr::native::GetStatus();
@@ -207,7 +208,7 @@ int Frame(uint64_t id,uint32_t w= W,DXGI_FORMAT fmt=DXGI_FORMAT_R32G32B32A32_FLO
     ID3D12CommandList* ls[]={list.list.Get()};na::nr::Execute(d.queue.Get(),1,ls,Forward);
     if(backlog){const auto current=creates;na::nr::native::Release(&core,&fg);na::nr::OnCommandListReset(list.list.Get());na::nr::native::Maintain();CHECK(alive.count(current)==1);REQUIRE(SUCCEEDED(gate->Signal(1)));}
     d.WaitIdle();CHECK(d.device->GetDeviceRemovedReason()==S_OK);
-    if(!fail){CheckImage(b,w,true,enabled&&delta!=0);CheckImage(h,w,false,enabled&&delta!=0&&!missing);if(missing)CheckImage(fg_hud,w,false,enabled&&delta!=0,false);}
+    if(!fail){CheckImage(b,w,true,enabled&&delta!=0);CheckImage(h,w,false,enabled&&delta!=0&&!missing);if(missing && enabled)CheckImage(fg_hud,w,false,delta!=0,false);}
     na::nr::OnCommandListReset(list.list.Get());na::nr::native::Maintain();heaps.clear();return 0;
 }
 }
@@ -272,6 +273,10 @@ int main(){
     REQUIRE(na::observe::InstallListResetTracking(d.device.Get(),na::nr::OnCommandListReset,na::nr::states::Observe));
     REQUIRE(Prepare()==0);
     REQUIRE(ResizeRetentionAudit(false)==0);REQUIRE(ResizeRetentionAudit(true)==0);
+    REQUIRE(Frame(40,W,DXGI_FORMAT_R32G32B32A32_FLOAT,false,false,true,true)==0);
+    REQUIRE(Frame(41,W,DXGI_FORMAT_R32G32B32A32_FLOAT,false,false,false,true)==0);
+    REQUIRE(Frame(42)==0); // re-enable at the next real-frame boundary
+    na::nr::native::Release(&core,nullptr);na::nr::native::Maintain();
     REQUIRE(Frame(0)==0); // zero identity, MFG evaluates NR once
     check_busy_status=true;
     CHECK(na::nr::native::GetStatus().gpu_samples>0);
