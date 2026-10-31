@@ -89,3 +89,21 @@ Same-frame NVOFA is impossible inline (§3). Options:
 2. Inline: agree to try 3A first, or go straight to 3B?
 3. Exposure for the BGRA8 encode: fixed per pair from the previous frame's mean luminance, or something you have already qualified in live_flow/NR?
 4. Anything in the A36/A52 NVOFA notes I should know that is not in the headers?
+
+---
+
+## Rev 2 — Astra/Sol review (COMMS 6a15578) accepted in full; this section supersedes §§3–7 where they differ
+
+Verdict received: **approved for the bounded Anno between-lists increment, with corrections; no further review round needed for incorporating them.** Opus implements `j2_flow` and the narrow `live_dlaa.cpp` record/submit hunks; Astra reviews integration. Accepted Anno DLAA stays the baseline; the ownership F1/F2 follow-up stays separate and ships first.
+
+**Scope now: Anno (between-lists route), same-frame NVOFA, `[j2] flow=0` by default. Nothing else.**
+
+1. **Step 1 (bias-current-colour mask) is dropped.** NVIDIA's DLSS Programming Guide (31 March 2026, §3.15) says BiasCurrentColor should not be used with the latest models. No new `EvalDesc`/backend input. Any image-consistency check stays internal to flow acceptance.
+2. **Queue split rules.** Original game lists execute exactly once, in order. Explicit barriers and state restoration across the split, since separate ExecuteCommandLists calls change implicit promotion/decay. BeforeExecute/OnExecuted and router/`count_post_dlaa` accounting stay those of the original batch. Camera/history commit only after actual submission. On any NVOFA API failure, never enqueue a `Wait` for a value that will not be signalled: submit the camera-only continuation. No global J2/route lock held across external callbacks; no resource retired while a flow job still uses it.
+3. **Pairing and exposure.** One documented fixed transform for both images of a pair (linear HDR and already display-encoded SDR handled separately), not per-frame adaptive exposure. No CPU luminance readbacks. Current and previous image, camera, jitter, subrect/size and frame/route generation bound to the same pair; reset on cuts, resize, route/resource change or a missing consecutive capture. Scale preserved in both grid sampling coordinates and vector values.
+4. **Confidence.** Expand validity is not matching confidence or visibility. Add the NVOFA output cost (small optional wrapper extension, query support via caps) plus image/bounds/depth consistency; unreliable residuals fall back to camera-only. `DeriveResidual` subtracts the exact pair's camera and jitter once; the final arbiter must not add camera motion twice.
+5. **Lifetimes.** Fence-owned ring slots; a busy slot skips flow, never overwrites pending inputs. Unregister/release only after GPU use retires (deferred retirement on resize, no CPU waits). A36 ordering preserved.
+6. **Inline (Sniper) deferred.** 3A (one-frame-late residual) is withdrawn as a production fallback. After the Anno increment is measured, the next candidate to assess for inline is AMD's compute flow (reuse already authorised by Cort). The inline camera-only route stays unchanged meanwhile.
+7. **Tests.** Cort's baseline/live comparisons do not block coding. Automated: real NVOFA translated-image test where hardware exists (not via installer/game); camera plus independent object; jitter; reduced-size coordinates; false-but-smooth flow rejection; ring saturation; failed Execute without a dead wait; queue-split state/order; resize retirement. Measure the whole added critical-path cost (encode, flow, expand, fusion, waits); ≤ 3 ms is a tuning target, not a promise.
+
+**Statement corrections:** non-TAA games can still have velocity buffers, so qualified native vectors are used where present; NVOFA is detected by `QueryCaps`, not RTX branding; optical flow estimates appearance motion, not exact physical vectors for transparencies. Flow stays off by default until Cort's moving-ship check, and any failure leaves DLAA running on camera motion.
