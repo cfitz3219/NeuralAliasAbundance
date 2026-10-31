@@ -7,6 +7,7 @@
 #include <mutex>
 
 #include "host_dx12/hooking/vtable_hook.hpp"
+#include "host_dx12/ngx_observe/ngx_observe.hpp"
 #include "host_dx12/sl_boundary/sl_tags.hpp"
 
 // See sl_dlss_mode.hpp. Layouts from the public Streamline header
@@ -134,7 +135,11 @@ SlResult __cdecl DetourGetOptimalSettings(const void* options, void* settings)
     }
     if (rewrite && r == 0) {
         ++g_state.rewritten_this_generation;
-        g_state.size_followed = true;
+        // Only a query for the game's real output size counts as the game taking
+        // our size (engines also probe reference sizes, e.g. 1000x1000 tables).
+        const na::ngx::Stats ngx = na::ngx::GetStats();
+        const bool output_known = ngx.last_sr_out_w && ngx.last_sr_out_w != 0xFFFFFFFFu;
+        if (!output_known || (g_state.out_w == ngx.last_sr_out_w && g_state.out_h == ngx.last_sr_out_h)) g_state.size_followed = true;
         set_reason_locked("The game asked Streamline for its render size; it received the selected mode's size.");
     } else if (!rewrite) {
         set_reason_locked(game_mode == kSlOff ? "The game has DLSS off in this call; left unchanged." : "The game's own DLSS mode is in use.");

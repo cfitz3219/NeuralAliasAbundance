@@ -49,7 +49,7 @@ struct ModeState {
     uint32_t optimal_w = 0, optimal_h = 0;                       // answer delivered to the game
     uint32_t min_w = 0, min_h = 0, max_w = 0, max_h = 0;         // bounds delivered to the game
     uint32_t set_game_mode = 0xFFFFFFFFu, set_sent_mode = 0xFFFFFFFFu; // last SetOptions
-    bool size_followed = false;              // the game took a rewritten size this generation
+    bool size_followed = false;              // the game took a rewritten size for its real output size this generation
     int32_t last_result = 0;
     char reason[160] = "";
 };

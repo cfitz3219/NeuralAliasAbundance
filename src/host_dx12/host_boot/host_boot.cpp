@@ -4,6 +4,7 @@
 #include "host_dx12/adapters/unreal/cvar_probe.hpp"
 #include "host_dx12/sl_boundary/sl_boundary.hpp"
 #include "host_dx12/adapters/unreal/screen_percentage.hpp"
+#include "host_dx12/adapters/mode_control.hpp"
 #include "host_dx12/host_boot/host_boot.hpp"
 #include "host_dx12/host_boot/session.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
@@ -135,6 +136,8 @@ DWORD WINAPI InitThread(LPVOID)
         // Locating is read-only; the value changes only on the user's Apply.
         if (!na::settings::SafeStart() && GetPrivateProfileIntW(L"unreal", L"screen_percentage", 1, g_ini) == 1)
             na::unreal::StartScreenPercentage();
+        // One Apply across all resolution-control methods (learned per game).
+        na::mode::Start();
         na::ngx::PreloadAndHookNgxCore();
         na::tlou1::InitializeApply();
     na::tsushima::InitializeApply();

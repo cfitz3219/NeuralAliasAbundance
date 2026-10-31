@@ -1,6 +1,7 @@
 #include "host_dx12/adapters/tlou1/apply.hpp"
 #include "host_dx12/adapters/tsushima/apply.hpp"
 #include "host_dx12/adapters/unreal/screen_percentage.hpp"
+#include "host_dx12/adapters/mode_control.hpp"
 #include "host_dx12/sl_boundary/sl_boundary.hpp"
 // Route A menu content (A30 redesign): the Picture page (status, master
 // switch, mode cards, preset), the Enhancements rows (Ray Reconstruction;
@@ -251,6 +252,7 @@ void DrawPicture()
     BeginRow("Use NeuralAlias", "Control DLSS presets and supported picture settings.", SwitchWidth());
     if (Switch("master", &enabled)) {
         st.enabled.store(enabled ? 1u : 0u);
+        if (!enabled) na::mode::Cancel(true); // hand resolution control back to the game
         note_request();
         na::settings::Save();
     }
@@ -261,6 +263,7 @@ void DrawPicture()
     BeginRow("Use game's resolution", "Choose DLAA, Quality or Ultra Performance in the game's video settings. NeuralAlias can still change presets.", SwitchWidth());
     if (Switch("follow_game_resolution", &follow_game)) {
         st.follow_game_resolution.store(follow_game ? 1u : 0u);
+        if (follow_game) na::mode::Cancel(true); // the game's resolution again
         note_request();
         na::settings::Save();
     }
@@ -281,6 +284,7 @@ void DrawPicture()
         if (ModeCard(kModes[i], kModeLine1[i], kModeLine2[i], !follow_game && i == mode, card_w) && i != mode) {
             mode = i;
             st.dlss_mode.store(static_cast<uint32_t>(mode));
+            na::mode::Cancel(false); // a running Apply was for the previous choice
             note_request();
             na::settings::Save();
         }
@@ -354,19 +358,19 @@ void DrawPicture()
         static uint32_t rebuild_attempts_at = 0;
         static bool unreal_clicked = false;
         static bool unreal_refused = false;
+        static bool mode_clicked = false;     // one Apply across all resolution methods (mode_control)
+        static bool mode_refused = false;
         // Any game upscaler counts: plain DLSS (feature 1) or Ray Reconstruction (13).
         const bool have_upscaler = ngx.active_upscaler != 0;
-        // A game with a hand-written engine adapter (TLOU) changes its own picture
-        // mode; every other game gets the generic rebuild (A63/A64): the window is
-        // nudged by one pixel and back, the engine re-creates its render targets and
-        // asks DLSS for the size again, and the armed confirmation reports whether
-        // the new size was actually rendered.
-        const bool engine_adapter = engine_apply_status().available;
+        // Picture-mode changes go through na::mode (mode_control.hpp): it picks the
+        // method this game responds to and confirms the rendered size. Preset-only
+        // changes keep the in-place path; with "Use game's resolution" a rebuild
+        // carries the preset into the game's own re-creation.
         ImGui::BeginDisabled(!enabled || blocked || !have_upscaler || engine_busy);
         BeginRow("Apply changes", follow_game ? "Update the preset while keeping the game's resolution." : "Update the picture mode and preset together.", ButtonWidth("Apply"));
         if (Button("Apply")) {
             admission_failed = false;
-            engine_clicked = rebuild_clicked = rebuild_refused = unreal_clicked = unreal_refused = false;
+            engine_clicked = rebuild_clicked = rebuild_refused = unreal_clicked = unreal_refused = mode_clicked = mode_refused = false;
             g_apply_clicked = false;
             // Plain DLSS can take a new PRESET in place (A46). A size change, or any
             // change while the game uses Ray Reconstruction, needs the game to
@@ -377,16 +381,20 @@ void DrawPicture()
                 g_apply_ok_at = ngx.reapplies;
                 g_apply_fail_at = ngx.reapply_failures;
                 g_apply_clicked = true;
-            } else if (engine_adapter && !follow_game) {
-                engine_clicked = true;
-                admission_failed = !(na::tsushima::GetApplyStatus().available
-                    ? na::tsushima::RequestApply({static_cast<uint32_t>(mode), rw, rh, st.preset.load()})
-                    : na::tlou1::RequestApply({static_cast<uint32_t>(mode), rw, rh, st.preset.load()}));
-            } else if (unreal_size && !follow_game && !size_matches) {
-                // The engine re-creates DLSS at the new size itself; our creation
-                // override adds the preset to that re-creation.
-                unreal_clicked = true;
-                unreal_refused = !na::unreal::RequestScreenPercentage(unreal_percent_for_mode(mode), out_w, out_h);
+            } else if (!follow_game) {
+                // Picture mode: one Apply that picks the method this game responds to
+                // (Streamline query, Unreal setting, this game's settings path, rebuild),
+                // confirmed by the size the game's DLSS actually renders.
+                na::mode::Request mr;
+                mr.mode = static_cast<uint32_t>(mode);
+                mr.preset = st.preset.load();
+                mr.out_w = out_w;
+                mr.out_h = out_h;
+                mr.render_w = rw;
+                mr.render_h = rh;
+                mr.unreal_percent = unreal_percent_for_mode(mode);
+                mode_clicked = true;
+                mode_refused = !na::mode::RequestApply(mr);
             } else {
                 rebuild_clicked = true;
                 rebuild_attempts_at = na::overlay::GetPictureRebuild().attempts;
@@ -415,6 +423,11 @@ void DrawPicture()
                 StatusLine(2, buf);
             } else
                 StatusLine(0, "Picture rebuilt; checking the new size...");
+        }
+        if (mode_clicked) {
+            const na::mode::Status ms = na::mode::GetStatus();
+            StatusLine(ms.state == na::mode::State::Confirmed ? 1 : ms.state == na::mode::State::Trying ? 0 : 2,
+                       mode_refused && ms.state != na::mode::State::Trying ? "A previous Apply is still running. Try again in a moment." : ms.reason);
         }
         if (unreal_clicked) {
             const na::unreal::SpStatus now = na::unreal::GetScreenPercentageStatus();

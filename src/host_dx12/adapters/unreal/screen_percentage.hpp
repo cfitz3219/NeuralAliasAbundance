@@ -16,8 +16,13 @@
 // current value matches the render size the game is actually feeding DLSS.
 // A request writes both shadowed values (aligned 32-bit stores, as the cvar
 // system's own set does) and is reported Confirmed only when the game's next
-// DLSS creation uses the expected render size. A successful write is not the
-// success witness. If the game itself changes the value afterwards (its menu),
+// DLSS feature, created after the write, is evaluated at the expected render
+// size for consecutive frames with coherent inputs (the shared NGX size
+// confirmation monitor). A successful write is not the success witness.
+// Limits, stated: the shadowed values are written directly rather than
+// through IConsoleVariable::Set (whose vtable slot is not stable across
+// engine versions); the cvar's set-by priority is left as the game had it, so
+// the game's own setter can still override us, and is detected as GameChanged. If the game itself changes the value afterwards (its menu),
 // the adapter reports that and does not fight it.
 #include <cstdint>
 
@@ -32,6 +37,7 @@ enum class SpState : uint32_t {
     NotApplied = 5, // written, but the expected size was not observed in time
     GameChanged = 6,// the game changed the value itself after our request
     Refused = 7,    // request rejected (located value does not match the render size, or busy)
+    Cancelled = 8,  // withdrawn (selection changed, NeuralAlias or our resolution control switched off)
 };
 
 struct SpStatus {
@@ -52,6 +58,12 @@ void StartScreenPercentage();
 // ceil(out * percent / 100). Returns false (state Refused) when unavailable or busy.
 bool RequestScreenPercentage(float percent, uint32_t out_w, uint32_t out_h);
 SpStatus GetScreenPercentageStatus();
+// Withdraws a running request (its confirmation too). The value stays as it is.
+void CancelScreenPercentage();
+// Gives the setting back to the game: restores the value it had before our
+// first write, but only if our value is still in place (a change the game made
+// itself is kept). Returns true if something was restored.
+bool HandBackScreenPercentage();
 
 // Expected Unreal render extent for an output extent and percentage (the
 // engine rounds up: 3440 * 58% = 1995.2 -> 1996, matching Cort's log).

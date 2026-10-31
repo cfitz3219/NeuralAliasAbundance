@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "host_dx12/hooking/vtable_hook.hpp"
+#include "host_dx12/adapters/mode_control.hpp"
 #include "host_dx12/sl_boundary/sl_dlss_mode.hpp"
 #include "host_dx12/sl_boundary/sl_tags.hpp"
 #include "host_dx12/sl_proxy/sl_abi.hpp"
@@ -1075,6 +1076,7 @@ void write_log()
     char line[1024];
     FormatStatus(line, sizeof(line));
     std::fprintf(f, "%s\n", line);
+    if (na::mode::FormatStatus(line, sizeof(line)) > 0) std::fprintf(f, "%s\n", line);
     std::lock_guard<std::mutex> lock(g_m);
     for (uint32_t i = 0; i < g_shape_count; ++i) {
         const TagShape& t = g_shapes[i];

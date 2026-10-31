@@ -10,9 +10,12 @@
 //   - SetOptions: presets are written whenever requested; the mode label is
 //     rewritten only after the game took a rewritten size this generation;
 //   - an unknown struct version passes through untouched.
+// Also the Apply selector's ordering rule and Unreal's extent rounding.
 #include "test_support.hpp"
 #include "host_dx12/sl_boundary/sl_boundary.hpp"
 #include "host_dx12/sl_boundary/sl_dlss_mode.hpp"
+#include "host_dx12/adapters/mode_control.hpp"
+#include "host_dx12/adapters/unreal/screen_percentage.hpp"
 
 namespace {
 
@@ -108,6 +111,27 @@ Optimal make_optimal()
 
 int main()
 {
+    {
+        using na::mode::Layer;
+        auto bit = [](Layer l) { return 1u << static_cast<uint32_t>(l); };
+        Layer order[5];
+        // Default order: Streamline, Unreal, exact build, rebuild (only those available).
+        uint32_t n = na::mode::PlanOrder(bit(Layer::Streamline) | bit(Layer::Rebuild), Layer::None, order, 5);
+        CHECK(n == 2 && order[0] == Layer::Streamline && order[1] == Layer::Rebuild);
+        n = na::mode::PlanOrder(bit(Layer::Unreal) | bit(Layer::ExactBuild) | bit(Layer::Rebuild), Layer::None, order, 5);
+        CHECK(n == 3 && order[0] == Layer::Unreal && order[1] == Layer::ExactBuild && order[2] == Layer::Rebuild);
+        // The learned layer goes first, once; an unavailable learned layer is skipped.
+        n = na::mode::PlanOrder(bit(Layer::Streamline) | bit(Layer::ExactBuild) | bit(Layer::Rebuild), Layer::ExactBuild, order, 5);
+        CHECK(n == 3 && order[0] == Layer::ExactBuild && order[1] == Layer::Streamline && order[2] == Layer::Rebuild);
+        n = na::mode::PlanOrder(bit(Layer::Rebuild), Layer::Unreal, order, 5);
+        CHECK(n == 1 && order[0] == Layer::Rebuild);
+        CHECK(na::mode::PlanOrder(0, Layer::None, order, 5) == 0);
+        // Unreal rounds up (Cort's PBZ log: 3440 x 58% -> 1996, 1440 x 66.7% -> 961, 33.3% -> 1146x480).
+        CHECK(na::unreal::ExpectedExtent(3440, 58.f) == 1996 && na::unreal::ExpectedExtent(1440, 58.f) == 836);
+        CHECK(na::unreal::ExpectedExtent(3440, 66.7f) == 2295 && na::unreal::ExpectedExtent(1440, 66.7f) == 961);
+        CHECK(na::unreal::ExpectedExtent(3440, 33.3f) == 1146 && na::unreal::ExpectedExtent(1440, 33.3f) == 480);
+        CHECK(na::unreal::ExpectedExtent(3440, 50.f) == 1720 && na::unreal::ExpectedExtent(3440, 100.f) == 3440);
+    }
     using namespace na::slb::dlss;
     CHECK(SlModeForDlssMode(0) == kSlDlaa && SlModeForDlssMode(1) == kSlMaxQuality && SlModeForDlssMode(2) == kSlBalanced);
     CHECK(SlModeForDlssMode(3) == kSlMaxPerformance && SlModeForDlssMode(4) == kSlUltraPerformance && SlModeForDlssMode(9) == kSlOff);
