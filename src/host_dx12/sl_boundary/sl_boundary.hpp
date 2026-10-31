@@ -235,6 +235,11 @@ struct FgState {
     uint32_t status = 0xFFFFFFFFu;                           // DLSSGState::status flags
     uint32_t presented = 0;                                  // numFramesActuallyPresented at the last state read
     int32_t last_result = 0;                                 // sl::Result of the last forwarded SetOptions
+    // File version of the game's sl.interposer.dll (VS_FIXEDFILEINFO), read at
+    // installation; all zero when unknown. Streamline before 2.7 can only
+    // request one generated frame, so the menu names the version instead of
+    // inferring it from a zero frame limit.
+    uint16_t sl_version[4] = {0, 0, 0, 0};
     FgRequest request;
     char reason[160] = "";
 };
