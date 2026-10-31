@@ -44,6 +44,13 @@ na_host_test(gpu_timing_test SOURCES gpu_timing_test.cpp LIBS host_dx12)
 na_host_test(ngx_observe_test SOURCES ngx_observe_test.cpp LIBS host_dx12
              ARGS "$<TARGET_FILE:nvngx_stub>")
 add_dependencies(ngx_observe_test nvngx_stub)
+na_host_test(session_init_test SOURCES session_init_test.cpp LIBS host_dx12
+             ARGS "$<TARGET_FILE:nvngx_stub>" ext)
+add_dependencies(session_init_test nvngx_stub)
+foreach(kind project recovery)
+  add_test(NAME host_session_init_${kind} COMMAND session_init_test "$<TARGET_FILE:nvngx_stub>" ${kind})
+  set_tests_properties(host_session_init_${kind} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS host)
+endforeach()
 
 # Stand-in for the game's renamed original interposer.
 add_library(sl_interposer_real SHARED sl_stub.cpp)

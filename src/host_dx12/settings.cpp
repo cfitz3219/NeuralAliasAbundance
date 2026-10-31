@@ -328,7 +328,8 @@ void write_journal(uint32_t reason){
 } // namespace
 
 bool BeginRendererSession(bool journal_allowed){
-    // Only the init/control worker calls this after real renderer evidence.
+    // Serialized session startup, either on the init/control worker after
+    // Present/evaluate evidence or at a successful game NGX Init boundary.
     resolve_user_ini();
     if(!g_ini_user[0])return false; // never create relative journals in a game/work directory
     uint64_t hash=1469598103934665603ull;
