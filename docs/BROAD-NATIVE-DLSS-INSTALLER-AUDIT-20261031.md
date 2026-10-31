@@ -144,3 +144,11 @@ The busy-cursor report remains unresolved. Current code sets IDC_ARROW on menu o
 - Microsoft DX12 swapchains: https://learn.microsoft.com/en-us/windows/win32/direct3d12/swap-chains — creation queue/presentation ownership.
 - Microsoft enhanced barriers: https://github.com/microsoft/DirectX-Specs/blob/master/d3d/D3D12EnhancedBarriers.md — layouts/access/queue compatibility; not arbitrary legacy-state substitution.
 - OptiScaler official README/config: https://github.com/optiscaler/OptiScaler and https://github.com/optiscaler/OptiScaler/blob/master/OptiScaler.ini — established API-family interception, independent FG inputs/outputs, process filters, compatibility knowledge and quality/DRS overrides. These are useful architecture precedents, not evidence that OptiScaler guarantees every game or universally controls engine resolution. No upstream implementation was copied.
+
+## 2026-10-31 — Cort's direction: preserve NeuralAlias, reuse narrowly
+
+Cort clarifies that the visible product must remain fundamentally NeuralAlias and that its core machinery must not be gutted or replaced wholesale. This supersedes Astra's chat suggestion of making an external graphics stack the foundation. Existing interception, NR processing, frame/resource tracking, controls, overlay and installer transactions remain the implementation base.
+
+Use established algorithms, documented integration patterns or small compatible components to close specific demonstrated gaps: interface/version and game-layout detection; motion/jitter and resource-layout normalization; presenter/stream ownership; pending FG request application; upgrade preference preservation. Adapt these into the existing contracts. External hosts/backends are references or narrowly scoped optional integrations, not an authorized replacement of the core. Preserve upstream attribution and applicable licenses.
+
+Keep the focused completion sequence above, but execute it as incremental repairs/extensions. Each change must name its concrete compatibility gap, existing component being extended, reusable upstream technique (if any), and regression evidence. Preserve the user-confirmed Ghost behavior and the approved interface. No wholesale rewrite, replacement overlay, new general graphics analyzer or additional review cycle is authorized by this direction. Game testing remains Cort's.
