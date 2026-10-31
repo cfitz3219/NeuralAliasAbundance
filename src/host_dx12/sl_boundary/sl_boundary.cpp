@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "host_dx12/hooking/vtable_hook.hpp"
+#include "host_dx12/sl_boundary/sl_dlss_mode.hpp"
 #include "host_dx12/sl_boundary/sl_tags.hpp"
 #include "host_dx12/sl_proxy/sl_abi.hpp"
 #include "host_dx12/upscalers/module_watch.hpp"
@@ -852,6 +853,7 @@ void request_fg_install(void* target, bool set)
 SlResult __cdecl DetourGetFeatureFunction(uint32_t feature, const char* name, void** function)
 {
     const SlResult r = g_orig_gff(feature, name, function);
+    if (r == 0 && feature == 0 && name && function && *function) dlss::OnFeatureFunction(name, *function); // sl::kFeatureDLSS
     if (r == 0 && feature == kFeatureDlssG && name && function && *function) {
         if (strcmp(name, "slDLSSGSetOptions") == 0) request_fg_install(*function, true);
         else if (strcmp(name, "slDLSSGGetState") == 0) request_fg_install(*function, false);
@@ -863,6 +865,7 @@ SlResult __cdecl DetourGetFeatureFunction(uint32_t feature, const char* name, vo
 // look them up once ourselves (a lookup only; the device is set by then).
 void lookup_fg_functions_once()
 {
+    if (g_gff_export) dlss::LookupOnce(reinterpret_cast<dlss::LookupFn>(g_gff_export));
     if (!g_gff_export || g_fg_lookup_done.exchange(true, std::memory_order_acq_rel)) return;
     auto gff = reinterpret_cast<PfnGetFeatureFunction>(g_gff_export);
     void* fn = nullptr;
