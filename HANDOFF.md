@@ -560,3 +560,6 @@ PR59 includes Opus628520b plus Ghost locator a5f6a9f and Astra corrective integr
 
 ### 2026-10-31 - Opus now owns remaining Unreal breadth work
 User transferred PBZ exact-build restriction removal to Opus. See detailed COMMS handoff for code baseline63395c7, resolved ABI witnesses, locator contract, tests and installer delivery. Astra will not duplicate implementation. Existing prepared63395c7 packages remain unchanged by this handoff; next delivery must remove mandatory PBZ SHA/fixed-RVA admission for the validated ABI and retain native setter/DRS/live-frame confirmation behavior. User owns game testing.
+
+### 2026-10-31 - Ghost crash package supersedes63395c7
+Cort's immediate startup crash reproduced in automated COM-wrapper fixture and corrected by742ff30/f46adb7. Existing Documents/NA-tsushima-update.cmd now targets validated packagef46adb7 with automatic prior-package rollback; no installation performed.59automatedPASS1optionalmodelSKIP, installer fixturesPASS. Root cause: native DXGI trampoline called with Streamline wrapper object during internal index lookup; virtual dispatch with scoped presenter bypass fixes index and buffer reads. Opus must retain these commits while finishing UE locator. PBZ installer unchanged. User owns live testing.
