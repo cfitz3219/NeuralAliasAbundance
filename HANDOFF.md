@@ -578,3 +578,6 @@ Existing Documents/NA-tsushima-update.cmd now targets validated additive package
 
 ### 2026-10-31 - Ghost overlay live acceptance
 Cort confirms the updated Ghost overlay now works. The b71ba0b repair uses shared Streamline/queue observation, without a Ghost executable restriction, and preserves the native path for other chains. This user confirmation covers the overlay; NR quality and other games on this build are not newly confirmed. See COMMS for Opus's final review and retained limitations.
+
+### 2026-10-31 - Broad native-DLSS readiness audit
+Cort requested assessment of fragility against broad drop-in goals. Production docs/BROAD-NATIVE-DLSS-INSTALLER-AUDIT-20261031.md records source-backed findings, actual Ghost source1 NR and FG Off/On evidence, primary NVIDIA/Microsoft requirements, reusable implementation plan and qualification limits. COMMS has focused handoff. No runtime or installer changed in this audit. Shared ownership/convention/engine-control gaps remain; this is not another claim that universal readiness is complete.
