@@ -563,3 +563,6 @@ User transferred PBZ exact-build restriction removal to Opus. See detailed COMMS
 
 ### 2026-10-31 - Ghost crash package supersedes63395c7
 Cort's immediate startup crash reproduced in automated COM-wrapper fixture and corrected by742ff30/f46adb7. Existing Documents/NA-tsushima-update.cmd now targets validated packagef46adb7 with automatic prior-package rollback; no installation performed.59automatedPASS1optionalmodelSKIP, installer fixturesPASS. Root cause: native DXGI trampoline called with Streamline wrapper object during internal index lookup; virtual dispatch with scoped presenter bypass fixes index and buffer reads. Opus must retain these commits while finishing UE locator. PBZ installer unchanged. User owns live testing.
+
+### 2026-10-31 - Live quality supported-ABI discovery completed
+Production PR59 now3666c9d: Unreal exact-PBZ hash/RVAs replaced with supported console ABI locator.60automated testsPASS1optionalSKIP; installedPBZ read-only locatorPASS; PS5.1installerfixturesPASS. Documents PBZ/Ghost updaters prepared3666c9d (not deployed), native DLLs untouched. See COMMS and code docs/PBZ-LIVE-QUALITY-ASSESSMENT.md. New Opus Ghost overlay-not-drawing report remains open; do not call Ghost gameplay-ready. User retains live testing.
