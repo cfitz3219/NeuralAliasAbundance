@@ -138,7 +138,7 @@ std::atomic<ID3D12CommandQueue*> g_direct_queue{nullptr};
 // direct queue that submitted", which in a two-queue game with native Frame
 // Generation (Phantom Blade Zero) is often not the presenting queue: the menu then
 // wrote the back buffer unsynchronised with FG and the GPU faulted (Cort, 2026-10-29).
-struct SwapQueue { void* sc = nullptr; PresentQueues queues; };
+struct SwapQueue { void* sc = nullptr; PresentQueues queues; int color_space=DXGI_COLOR_SPACE_CUSTOM; };
 std::mutex g_swap_queue_m;
 SwapQueue g_swap_queues[8];
 uint32_t g_swap_queue_next = 0;
@@ -152,9 +152,9 @@ void note_swapchain_queue(IUnknown* device_or_queue, void* swapchain)
     if (FAILED(device_or_queue->QueryInterface(IID_PPV_ARGS(&q))) || !q) return; // D3D11 / other device: not ours
     std::lock_guard<std::mutex> lk(g_swap_queue_m);
     for (auto& e : g_swap_queues)
-        if (e.sc == swapchain) { e.queues.Created(q.Get()); g_swap_queues_recorded.fetch_add(1); return; } // address reused
+        if (e.sc == swapchain) { e.queues.Created(q.Get()); e.color_space=DXGI_COLOR_SPACE_CUSTOM; g_swap_queues_recorded.fetch_add(1); return; } // address reused
     SwapQueue& slot = g_swap_queues[g_swap_queue_next++ % 8];
-    slot.sc = swapchain;
+    slot.sc = swapchain;slot.color_space=DXGI_COLOR_SPACE_CUSTOM;
     slot.queues.Created(q.Get());
     g_swap_queues_recorded.fetch_add(1);
 }
@@ -567,7 +567,7 @@ void write_status_line()
         "native_fg_inputs evaluates=%llu available_resources=%llu hudless=%llu distortion=%llu list_type=%u color_format=%u allocation=%ux%u nr_route=%s\r\n",
         static_cast<unsigned long long>(ngx.fg_evaluates), static_cast<unsigned long long>(ngx.fg_with_inputs),
         static_cast<unsigned long long>(ngx.fg_with_hudless), static_cast<unsigned long long>(ngx.fg_with_distortion),
-        ngx.fg_list_type, ngx.fg_color_format, ngx.fg_color_w, ngx.fg_color_h,na::nr::native::OwnsRoute()?"pre_native_fg":"present");
+        ngx.fg_list_type, ngx.fg_color_format, ngx.fg_color_w, ngx.fg_color_h,na::nr::native::GetStatus().source==2?"pre_streamline_present":na::nr::native::OwnsRoute()?"pre_native_fg":"present");
     if (fg_input_bytes > 0) WriteFile(f, fg_inputs, static_cast<DWORD>((std::min)(fg_input_bytes, static_cast<int>(sizeof(fg_inputs)-1))), &written, nullptr);
     const int fg_contract_bytes = snprintf(fg_inputs, sizeof(fg_inputs),
         "native_fg_contract frame_id_calls=%llu alpha_calls=%llu ui_calls=%llu last_create_uir=%u\r\n",
@@ -577,10 +577,10 @@ void write_status_line()
     if (na::nr::native::OwnsRoute()) {
         const auto native=na::nr::native::GetStatus();
         const int bytes=snprintf(fg_inputs,sizeof(fg_inputs),
-            "nr_pre_fg evaluated=%llu reused=%llu submissions=%llu retired=%llu skipped=%llu gpu_ms=%.3f samples=%u reason=%s\r\n",
+            "nr_pre_fg evaluated=%llu reused=%llu submissions=%llu retired=%llu skipped=%llu gpu_ms=%.3f samples=%u source=%u reason=%s\r\n",
             static_cast<unsigned long long>(native.evaluates),static_cast<unsigned long long>(native.reused),
             static_cast<unsigned long long>(native.submitted),static_cast<unsigned long long>(native.completed),
-            static_cast<unsigned long long>(native.skipped),native.avg_ms,native.gpu_samples,native.reason);
+            static_cast<unsigned long long>(native.skipped),native.avg_ms,native.gpu_samples,native.source,native.reason);
         if(bytes>0)WriteFile(f,fg_inputs,static_cast<DWORD>((std::min)(bytes,static_cast<int>(sizeof(fg_inputs)-1))),&written,nullptr);
         const int state_bytes=snprintf(fg_inputs,sizeof(fg_inputs),
             "nr_pre_fg_delivery frame_id=%llu states_known=%u color_state=0x%x hudless_state=0x%x backbuffer_is_swapchain=%u output_real=%u output_real_is_swapchain=%u identity=%u inner=%u/%u list_type=%u states_ready=%u read_contract_mask=0x%x hudless_replaced=%u\r\n",
@@ -2296,6 +2296,9 @@ HRESULT STDMETHODCALLTYPE DetourSetColorSpace1(IDXGISwapChain3* sc, DXGI_COLOR_S
 {
     HRESULT hr = g_orig_set_color_space(sc, cs);
     if (SUCCEEDED(hr) && sc != g_state.dummy_swapchain_identity) g_color_space.store(static_cast<int>(cs), std::memory_order_release);
+    if(SUCCEEDED(hr)) {std::lock_guard<std::mutex> lock(g_swap_queue_m);
+        for(auto& binding:g_swap_queues)if(binding.sc==sc)binding.color_space=cs;
+    }
     return hr;
 }
 // A71 (Astra B-007): a chain the game let go of. Forget it at once so the
@@ -2819,5 +2822,11 @@ void DrawMenuForTests(ID3D12CommandQueue* queue,ID3D12Resource* frame) {
 }
 
 int SwapChainColorSpace() { return g_color_space.load(std::memory_order_acquire); }
+ID3D12CommandQueue* AcquirePresentQueue(IDXGISwapChain* chain){return swapchain_queue(chain).Detach();}
+int SwapChainColorSpace(IDXGISwapChain* chain){
+    std::lock_guard<std::mutex> lock(g_swap_queue_m);
+    for(const auto& binding:g_swap_queues)if(binding.sc==chain)return binding.color_space;
+    return DXGI_COLOR_SPACE_CUSTOM;
+}
 
 } // namespace na::overlay

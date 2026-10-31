@@ -32,7 +32,8 @@
 //     metadata stream).
 //
 // Callback rules: invoked on the game's thread inside SL entry points. Do not
-// block, do not call slSetTag*/Present re-entrantly, do not install hooks, do
+// block, do not call the hooked slSetTag*/Present re-entrantly (use the
+// explicit original-only RetagForFrame helper), do not install hooks, do
 // not call SetCallbacks. Lifetime: one subscription is retained for a whole
 // call (a Present's before and after callbacks, a tag's on/after callbacks
 // always come from the same set), and SetCallbacks returns only once no call
@@ -106,7 +107,7 @@ struct PresentEvent {
     bool present1 = false;
     IDXGISwapChain* game_facing = nullptr; // SL's proxy; GetBuffer/GetCurrentBackBufferIndex on it return what the game drew
     IDXGISwapChain* base = nullptr;  // the chain beneath SL (via SL's StreamlineRetrieveBaseInterface), may be null
-    void* present_queue = nullptr;   // always null: not discovered here; use the existing exact queue binding for `base`
+    void* present_queue = nullptr;   // exact game-facing creation/ResizeBuffers1 queue, borrowed through the callbacks; null if unknown
     uint32_t sync = 0, flags = 0;
     const DXGI_PRESENT_PARAMETERS* params = nullptr;
     uint32_t thread_id = 0;
@@ -129,12 +130,20 @@ struct ConstantsRecord {
 };
 // Newest accepted record for exactly this (frame token, viewport); false if none retained.
 bool FindConstants(uint32_t frame_token, uint32_t viewport, ConstantsRecord* out);
+// Before original Present only: replace an input for this exact accepted frame.
+// Calls the original SL entry points, never the observation detours. SL owns
+// the token obtained with its explicit-frame API; no fabricated token/vtable.
+// OnlyValidNow makes SL record its preservation copy on command_list; caller
+// submits that list before Present and retains inputs through its completion.
+int32_t RetagForFrame(uint32_t frame_token,uint32_t viewport,const Tag* tags,
+                     uint32_t count,ID3D12GraphicsCommandList* command_list);
 
 using TagCallback = void (*)(const TagEvent& event, void* user);
 using AfterTagCallback = void (*)(const TagEvent& event, int32_t result, void* user); // result: sl::Result, 0 = accepted
 using ConstantsCallback = void (*)(const ConstantsRecord& record, void* user);       // after the original
 using BeforePresentCallback = void (*)(const PresentEvent& event, void* user);
 using AfterPresentCallback = void (*)(const PresentEvent& event, long hr, void* user);
+using StreamReleasedCallback = void (*)(uint32_t proxy_id,void* user);
 
 struct Callbacks {
     TagCallback on_tag = nullptr;          // before the original tag call (eOnlyValidNow contents still valid)
@@ -143,6 +152,7 @@ struct Callbacks {
     BeforePresentCallback before_present = nullptr;
     AfterPresentCallback after_present = nullptr;
     void* user = nullptr;
+    StreamReleasedCallback stream_released = nullptr;
 };
 
 // One consumer (NR). Replaces any previous set; pass {} to detach. Returns

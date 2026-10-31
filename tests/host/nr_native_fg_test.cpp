@@ -3,6 +3,11 @@
 #include "test_support.hpp"
 #include "fake_ngx_params.hpp"
 #include "host_dx12/nr/native_fg.hpp"
+#include "host_dx12/nr/fg_contract.hpp"
+#include "host_dx12/nr/sl_consumer.hpp"
+#include "host_dx12/sl_boundary/sl_boundary.hpp"
+#include "host_dx12/sl_boundary/sl_tags.hpp"
+#include "host_dx12/sl_proxy/sl_abi.hpp"
 #include "host_dx12/nr/fg_states.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/settings.hpp"
@@ -36,7 +41,7 @@ int core,fg;
 constexpr uint32_t W=8,H=4;
 auto ReadState=D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
 D3D12_COMMAND_LIST_TYPE list_type=D3D12_COMMAND_LIST_TYPE_DIRECT;
-bool native_identity=true,legacy_pair=false;
+bool native_identity=true,legacy_pair=false,explicit_frame=false;
 int32_t __cdecl Alloc(void** p){auto* v=new test::FakeParams;*p=v;allocations.insert(v);return 1;}
 int32_t __cdecl Destroy(void* p){allocations.erase(static_cast<test::FakeParams*>(p));delete static_cast<test::FakeParams*>(p);return 1;}
 int32_t __cdecl Create(void*,uint32_t feature,void*,void** p){CHECK(feature==18);auto* h=new int(++creates);*p=h;alive.insert(creates);handles.insert(h);
@@ -183,7 +188,13 @@ int Frame(uint64_t id,uint32_t w= W,DXGI_FORMAT fmt=DXGI_FORMAT_R32G32B32A32_FLO
         if(!legacy_pair){p.Set("DLSSG.MultiFrameCount",3u);p.Set("DLSSG.MultiFrameIndex",m);}
         {
             na::nr::native::InputOverride override;
-            na::nr::native::Before(list.list.Get(),&core,&fg,&p,Runtime(),&override);
+            if(explicit_frame){
+                auto f=na::nr::ReadFgContract(&p);
+                na::nr::native::FrameStates states{};
+                for(auto& state:states.values)state=ReadState;
+                const bool recorded=na::nr::native::RecordFrame(list.list.Get(),&core,&fg,f,Runtime(),states);
+                CHECK(recorded==(enabled&&!fail));
+            } else na::nr::native::Before(list.list.Get(),&core,&fg,&p,Runtime(),&override);
             if(missing && enabled){
                 ID3D12Resource* replacement=nullptr;p.Get("DLSSG.HUDLess",&replacement);
                 CHECK(replacement && replacement!=h.texture.Get());
@@ -213,6 +224,147 @@ int Frame(uint64_t id,uint32_t w= W,DXGI_FORMAT fmt=DXGI_FORMAT_R32G32B32A32_FLO
     if(!fail){CheckImage(b,w,true,enabled&&delta!=0);CheckImage(h,w,false,enabled&&delta!=0&&!missing);if(missing && enabled)CheckImage(fg_hud,w,false,delta!=0,false);}
     na::nr::OnCommandListReset(list.list.Get());na::nr::native::Maintain();heaps.clear();return 0;
 }
+}
+// This executable also supplies the tiny public SL API surface needed to
+// exercise the real consumer and original-retag trampoline on a real GPU.
+struct SlToken {
+    virtual uint32_t Value()const{return value;}
+    uint8_t header[32]{};uint32_t value=0;
+    SlToken(){memcpy(header+8,na::sl::kFrameTokenGuid,16);uint64_t version=1;memcpy(header+24,&version,8);}
+};
+ComPtr<ID3D12Resource> sl_generated_source;
+std::vector<ComPtr<ID3D12Resource>> sl_kept_copies;
+extern "C" __declspec(dllexport) __declspec(noinline) int32_t slGetNewFrameToken(void** out,const uint32_t* index){
+    static SlToken token;token.value=*index;*out=&token;return 0;
+}
+extern "C" __declspec(dllexport) __declspec(noinline) int32_t slSetConstants(const void*,const void*,const void*){return 0;}
+extern "C" __declspec(dllexport) __declspec(noinline) int32_t slSetTagForFrame(const void*,const void*,const void* tags,uint32_t count,void* command){
+    auto* list=static_cast<ID3D12GraphicsCommandList*>(command);
+    for(uint32_t i=0;i<count;++i){
+        const auto* bytes=static_cast<const uint8_t*>(tags)+64*i;
+        na::slb::abi::RawTag tag;
+        CHECK(na::slb::abi::DecodeTag(bytes,64,reinterpret_cast<const uint8_t*>(na::slb::abi::TagResourcePointer(bytes)),112,tag));
+        if(tag.buffer_type!=na::slb::abi::kBufferHudlessColor || !tag.resource || tag.lifecycle==na::slb::abi::kValidUntilPresent)continue;
+        auto* source=reinterpret_cast<ID3D12Resource*>(tag.resource);const auto desc=source->GetDesc();
+        sl_generated_source=test::CreateTexture(d.device.Get(),static_cast<uint32_t>(desc.Width),desc.Height,desc.Format,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_NONE);
+        CHECK(!!sl_generated_source);sl_kept_copies.push_back(sl_generated_source);
+        auto b=test::Transition(source,static_cast<D3D12_RESOURCE_STATES>(tag.state),D3D12_RESOURCE_STATE_COPY_SOURCE);list->ResourceBarrier(1,&b);
+        list->CopyResource(sl_generated_source.Get(),source);std::swap(b.Transition.StateBefore,b.Transition.StateAfter);list->ResourceBarrier(1,&b);
+        b=test::Transition(sl_generated_source.Get(),D3D12_RESOURCE_STATE_COPY_DEST,ReadState);list->ResourceBarrier(1,&b);
+    }
+    return 0;
+}
+int StreamlineConsumerAudit(){
+    d.WaitIdle();D3D12_COMMAND_QUEUE_DESC qd{};d.queue.Reset();
+    REQUIRE(SUCCEEDED(d.device->CreateCommandQueue(&qd,IID_PPV_ARGS(&d.queue))));
+    list_type=D3D12_COMMAND_LIST_TYPE_DIRECT;ReadState=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    REQUIRE(na::slb::InstallForModuleForTests(GetModuleHandleW(nullptr)));
+    REQUIRE(na::nr::slconsumer::Start());na::nr::SetRuntime(Runtime());na::settings::Get().nr_enabled=1;
+    using TagFn=int32_t(__cdecl*)(const void*,const void*,const void*,uint32_t,void*);
+    using ConstFn=int32_t(__cdecl*)(const void*,const void*,const void*);
+    auto tag_fn=reinterpret_cast<TagFn>(GetProcAddress(GetModuleHandleW(nullptr),"slSetTagForFrame"));
+    auto const_fn=reinterpret_cast<ConstFn>(GetProcAddress(GetModuleHandleW(nullptr),"slSetConstants"));
+    HWND window=test::CreateTestWindow(L"SL NR consumer",32,32);REQUIRE(window);
+    DXGI_SWAP_CHAIN_DESC1 desc{};desc.Width=W+4;desc.Height=H+4;desc.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;
+    desc.SampleDesc.Count=1;desc.BufferCount=2;desc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;desc.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    ComPtr<IDXGISwapChain1> chain;REQUIRE(SUCCEEDED(d.factory->CreateSwapChainForHwnd(d.queue.Get(),window,&desc,nullptr,nullptr,&chain)));
+    for(uint32_t frame=1;frame<=24;++frame){
+        if(frame==9){desc.Width=W+6;REQUIRE(SUCCEEDED(chain->ResizeBuffers(2,desc.Width,desc.Height,desc.Format,0)));}
+        const uint32_t width=desc.Width-4;const bool enabled=frame!=5;
+        na::settings::Get().nr_enabled=enabled;
+        test::List producer;REQUIRE(producer.Create(d.device.Get()));Image full,hud;
+        REQUIRE(Make(producer,full,0,0,width,true,desc.Format)==0);REQUIRE(Make(producer,hud,0,0,width,false,desc.Format)==0);
+        auto original=full.texture;full.texture.Reset();REQUIRE(SUCCEEDED(chain->GetBuffer(0,IID_PPV_ARGS(&full.texture))));
+        auto b=test::Transition(original.Get(),ReadState,D3D12_RESOURCE_STATE_COPY_SOURCE);producer.list->ResourceBarrier(1,&b);
+        b=test::Transition(full.texture.Get(),D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_STATE_COPY_DEST);producer.list->ResourceBarrier(1,&b);
+        producer.list->CopyResource(full.texture.Get(),original.Get());
+        b=test::Transition(full.texture.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_PRESENT);producer.list->ResourceBarrier(1,&b);
+        auto depth=test::CreateTexture(d.device.Get(),3,2,DXGI_FORMAT_R32_FLOAT,ReadState,D3D12_RESOURCE_FLAG_NONE);
+        auto motion=test::CreateTexture(d.device.Get(),3,2,DXGI_FORMAT_R16G16_FLOAT,ReadState,D3D12_RESOURCE_FLAG_NONE);
+        alignas(8) uint8_t resources[4][112]{},tags[5][64]{},viewport[40]{},constants[464]{};
+        auto put=[](uint8_t* data,size_t at,const auto& value){memcpy(data+at,&value,sizeof(value));};
+        uint64_t version=1;memcpy(viewport+8,na::sl::kViewportGuid,16);put(viewport,24,version);
+        memcpy(constants+8,na::sl::kConstantsGuid,16);put(constants,24,version);
+        na::fg::Camera camera{};for(auto* matrix:{camera.view_to_clip,camera.clip_to_view,camera.clip_to_previous,camera.previous_to_clip})for(int i=0;i<4;++i)matrix[i*4+i]=1;
+        camera.motion_scale[0]=1.f/3;camera.motion_scale[1]=1.f/2;
+        memcpy(constants+32,&camera,412);constants[32+412+1]=1; // camera motion included
+        SlToken token;token.value=frame;CHECK(const_fn(constants,&token,viewport)==0);
+        ID3D12Resource* sources[]={hud.texture.Get(),depth.Get(),motion.Get()};uint32_t types[]={2,0,1};
+        for(int i=0;i<3;++i){auto* r=resources[i];auto* t=tags[i];memcpy(r+8,na::slb::abi::kResourceGuid,16);put(r,24,version);
+            put(r,40,sources[i]);uint32_t state=ReadState;put(r,64,state);auto rd=sources[i]->GetDesc();uint32_t resource_width=static_cast<uint32_t>(rd.Width);
+            put(r,68,resource_width);put(r,72,rd.Height);put(r,76,rd.Format);memcpy(t+8,na::slb::abi::kResourceTagGuid,16);put(t,24,version);put(t,32,r);put(t,40,types[i]);}
+        const bool subrect=frame>=17,immutable=frame>=10 && frame<17,ui_alpha=frame>=21;
+        if(immutable){
+            uint32_t lifecycle=1;put(tags[0],44,lifecycle);
+            b=test::Transition(hud.texture.Get(),ReadState,D3D12_RESOURCE_STATE_COPY_SOURCE);producer.list->ResourceBarrier(1,&b);
+        }
+        if(subrect){
+            uint32_t extent_width=width,extent_height=H,type=53;
+            put(tags[0],56,extent_width);put(tags[0],60,extent_height);
+            memcpy(tags[3]+8,na::slb::abi::kResourceTagGuid,16);put(tags[3],24,version);put(tags[3],40,type);
+            put(tags[3],56,extent_width);put(tags[3],60,extent_height);
+        }
+        if(ui_alpha){
+            auto* r=resources[3];auto* t=tags[4];memcpy(r+8,na::slb::abi::kResourceGuid,16);put(r,24,version);
+            auto* source=original.Get();put(r,40,source);uint32_t state=D3D12_RESOURCE_STATE_COPY_SOURCE;put(r,64,state);
+            memcpy(t+8,na::slb::abi::kResourceTagGuid,16);put(t,24,version);put(t,32,r);uint32_t type=23;put(t,40,type);
+            put(t,56,width);put(t,60,H);
+        }
+        REQUIRE(tag_fn(&token,viewport,tags,ui_alpha?5u:subrect?4u:3u,producer.list.Get())==0);
+        // The game overwrites its short-lived HUD-free texture immediately.
+        if(immutable){b=test::Transition(hud.texture.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,ReadState);producer.list->ResourceBarrier(1,&b);}
+        else {b=test::Transition(hud.texture.Get(),ReadState,D3D12_RESOURCE_STATE_COPY_DEST);producer.list->ResourceBarrier(1,&b);
+        producer.list->CopyResource(hud.texture.Get(),original.Get());std::swap(b.Transition.StateBefore,b.Transition.StateAfter);producer.list->ResourceBarrier(1,&b);}
+        REQUIRE(SUCCEEDED(producer.list->Close()));ID3D12CommandList* lists[]={producer.list.Get()};na::nr::Execute(d.queue.Get(),1,lists,Forward);
+        na::slb::PresentEvent event;event.proxy_id=100;event.real_serial=frame;event.stream_epoch=frame<9?1:2;event.game_facing=chain.Get();event.base=chain.Get();
+        event.association=na::slb::Association::Unique;event.frame_token=frame;event.viewport=0;
+        const auto before=evaluates;
+        na::nr::slconsumer::ConsumeForTests(event,d.queue.Get(),DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+        CHECK(evaluates==before+(enabled?1:0));CHECK(na::nr::slconsumer::OwnsDevice(d.device.Get()));
+        event.kind=na::slb::PresentKind::Retry;na::nr::slconsumer::ConsumeForTests(event,d.queue.Get(),DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);CHECK(evaluates==before+(enabled?1:0));
+        test::List read;REQUIRE(read.Create(d.device.Get()));Image generated=full;generated.texture=sl_generated_source;
+        generated.readback=test::CreateBuffer(d.device.Get(),full.readback->GetDesc().Width,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
+        Read(read,full,D3D12_RESOURCE_STATE_PRESENT);Read(read,generated,ReadState);
+        test::FakeParams p;Params(p,full,hud,depth.Get(),motion.Get(),frame,W);
+        na::nr::native::Before(read.list.Get(),&core,&fg,&p,Runtime());CHECK(evaluates==before+(enabled?1:0)); // no second NR inside FG
+        REQUIRE(SUCCEEDED(read.list->Close()));ID3D12CommandList* reads[]={read.list.Get()};d.queue->ExecuteCommandLists(1,reads);d.WaitIdle();
+        for(auto* image:{&full,&generated}){void* data=nullptr;REQUIRE(SUCCEEDED(image->readback->Map(0,nullptr,&data)));
+            for(uint32_t y=0;y<desc.Height;++y)for(uint32_t x=0;x<desc.Width;++x){
+                const bool scene=x<width && y<H;float expected=scene?.25f:.875f;
+                if(image==&full && x==0 && y<H)expected=.5f;
+                if(enabled && (!subrect || scene) && !(ui_alpha && image==&full))expected+=delta;
+                const auto actual=Decode(static_cast<char*>(data)+y*image->fp.Footprint.RowPitch+x*8,desc.Format);
+                for(int c=0;c<3;++c)CHECK(std::fabs(actual[c]-expected)<.002f);
+            }image->readback->Unmap(0,nullptr);}
+        na::nr::OnCommandListReset(producer.list.Get());na::nr::native::Maintain();heaps.clear();sl_kept_copies.clear();
+    }
+    na::nr::slconsumer::ForgetStream(100);CHECK(!na::nr::slconsumer::OwnsDevice(d.device.Get()));
+    na::nr::native::Maintain();
+    na::nr::slconsumer::Shutdown(Runtime());na::slb::SetCallbacks({});sl_generated_source.Reset();chain.Reset();DestroyWindow(window);
+    return 0;
+}
+int SnapshotLeaseAudit(){
+    test::List list;REQUIRE(list.Create(d.device.Get()));
+    auto payload=std::make_shared<int>(7);std::weak_ptr<int> lifetime=payload;
+    auto lease=na::nr::native::RetainRecording(list.list.Get(),payload);REQUIRE(!!lease);
+    payload.reset();CHECK(!lifetime.expired());CHECK(!lease.Ready(d.queue.Get()));
+    ComPtr<ID3D12CommandQueue> other;D3D12_COMMAND_QUEUE_DESC qd{};
+    REQUIRE(SUCCEEDED(d.device->CreateCommandQueue(&qd,IID_PPV_ARGS(&other))));
+    ComPtr<ID3D12Fence> gate;REQUIRE(SUCCEEDED(d.device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&gate))));
+    REQUIRE(SUCCEEDED(d.queue->Wait(gate.Get(),1))); // test-only delayed producer
+    REQUIRE(SUCCEEDED(list.list->Close()));ID3D12CommandList* lists[]={list.list.Get()};
+    na::nr::Execute(d.queue.Get(),1,lists,Forward);
+    CHECK(lease.Ready(d.queue.Get()));CHECK(!lease.Ready(other.Get()));CHECK(!lease.Retired());
+    na::nr::OnCommandListReset(list.list.Get());na::nr::native::Maintain();
+    CHECK(!lease.Retired());CHECK(!lifetime.expired());
+    REQUIRE(SUCCEEDED(gate->Signal(1)));d.WaitIdle();na::nr::native::Maintain();
+    CHECK(lease.Ready(other.Get()));CHECK(lease.Retired());
+    CHECK(lifetime.expired());lease={};
+    list.Reset();auto discarded_payload=std::make_shared<int>(8);std::weak_ptr<int> discarded=discarded_payload;
+    auto unused=na::nr::native::RetainRecording(list.list.Get(),discarded_payload);discarded_payload.reset();
+    REQUIRE(SUCCEEDED(list.list->Close()));na::nr::OnCommandListReset(list.list.Get());na::nr::native::Maintain();
+    CHECK(unused.Retired());CHECK(!unused.Ready(d.queue.Get()));unused={};CHECK(discarded.expired());
+    return 0;
 }
 int ResizeRetentionAudit(bool enabled){
     na::nr::native::Release(&core,nullptr);na::nr::native::Maintain();
@@ -284,6 +436,10 @@ int main(){
     REQUIRE(Frame(44)==0);CHECK(last_nr_reset==1);
     REQUIRE(Frame(45)==0);CHECK(last_nr_reset==0);
     na::nr::native::Release(&core,nullptr);na::nr::native::Maintain();
+    na::nr::native::Release(&core,nullptr);
+    REQUIRE(SnapshotLeaseAudit()==0);
+    explicit_frame=true;REQUIRE(Frame(101)==0);REQUIRE(Frame(102)==0);
+    explicit_frame=false;na::nr::native::Release(&core,nullptr);
     REQUIRE(Frame(0)==0); // zero identity, MFG evaluates NR once
     check_busy_status=true;
     CHECK(na::nr::native::GetStatus().gpu_samples>0);
@@ -320,6 +476,7 @@ int main(){
     legacy_pair=true;na::nr::native::Release(&core,nullptr);
     REQUIRE(Frame(2)==0);REQUIRE(Frame(3)==0); // pre-MFG API defaults, one pair/evaluate
     na::nr::native::Release(&core,nullptr);na::nr::native::Maintain();
+    REQUIRE(StreamlineConsumerAudit()==0);
     if(info)for(UINT64 i=0;i<info->GetNumStoredMessages();++i){SIZE_T n=0;info->GetMessage(i,nullptr,&n);std::vector<char> buf(n);auto* m=reinterpret_cast<D3D12_MESSAGE*>(buf.data());info->GetMessage(i,m,&n);
         if(m->Severity<=D3D12_MESSAGE_SEVERITY_ERROR){std::printf("D3D12: %s\n",m->pDescription);CHECK(false);}}
     return test::finish("nr_native_fg_test");

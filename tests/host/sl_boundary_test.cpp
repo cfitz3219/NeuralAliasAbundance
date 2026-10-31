@@ -40,6 +40,8 @@ constexpr uint32_t kHdr10 = static_cast<uint32_t>(DXGI_FORMAT_R10G10B10A2_UNORM)
 
 volatile int g_sink = 0;
 int g_tag_frame_calls = 0, g_tag_calls = 0;
+bool capture_retag=false;
+na::slb::abi::RawTag retag_seen{};
 uint64_t g_order = 0, g_original_order = 0, g_callback_order = 0;
 const void* g_orig_seen_tags = nullptr;
 uint32_t g_orig_seen_n = 0;
@@ -55,6 +57,11 @@ HANDLE g_tag_block=nullptr,g_tag_entered=nullptr;
 extern "C" __declspec(dllexport) __declspec(noinline) int32_t slSetTagForFrame(const void*, const void*, const void* tags, uint32_t n, void* cmd)
 {
     ++g_tag_frame_calls;
+    if(capture_retag && n==1){
+        auto* raw=static_cast<const uint8_t*>(tags);
+        auto* resource=reinterpret_cast<const uint8_t*>(na::slb::abi::TagResourcePointer(raw));
+        CHECK(na::slb::abi::DecodeTag(raw,64,resource,112,retag_seen));
+    }
     g_original_order = ++g_order;
     g_orig_seen_tags = tags;
     g_orig_seen_n = n;
@@ -128,7 +135,7 @@ namespace sl::interposer {
 #define NA_DUMMY(n) __declspec(noinline) virtual int __stdcall Dummy##n() { g_sink = g_sink + n * 11; return n; }
 struct DXGISwapChain {
     IUnknown* base = nullptr;
-    LONG refs = 1;
+    LONG refs = 1;UINT index=0;
     // 0..2 IUnknown
     virtual HRESULT __stdcall QueryInterface(REFIID riid, void** out)
     {
@@ -139,6 +146,7 @@ struct DXGISwapChain {
             *out = base;
             return S_OK;
         }
+        if(riid==__uuidof(IDXGISwapChain3)){*out=this;AddRef();return S_OK;}
         *out = nullptr;
         return E_NOINTERFACE;
     }
@@ -173,7 +181,7 @@ struct DXGISwapChain {
         return g_next_present_hr;
     }
     NA_DUMMY(23) NA_DUMMY(24) NA_DUMMY(25) NA_DUMMY(26) NA_DUMMY(27) NA_DUMMY(28) NA_DUMMY(29) NA_DUMMY(30)
-    NA_DUMMY(31) NA_DUMMY(32) NA_DUMMY(33) NA_DUMMY(34) NA_DUMMY(35) NA_DUMMY(36) NA_DUMMY(37) NA_DUMMY(38)
+    NA_DUMMY(31) NA_DUMMY(32) NA_DUMMY(33) NA_DUMMY(34) NA_DUMMY(35) virtual UINT __stdcall GetCurrentBackBufferIndex(){return index;} NA_DUMMY(37) NA_DUMMY(38)
     // 39 ResizeBuffers1
     __declspec(noinline) virtual HRESULT __stdcall ResizeBuffers1(UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT flags, const UINT*, IUnknown* const*)
     {
@@ -181,6 +189,13 @@ struct DXGISwapChain {
         g_sink = g_sink + static_cast<int>(n + w + h + flags + static_cast<UINT>(f)) + 391;
         return S_OK;
     }
+};
+IDXGISwapChain1* factory_result=nullptr;
+struct DXGIFactory {
+    NA_DUMMY(0) NA_DUMMY(1) NA_DUMMY(2) NA_DUMMY(3) NA_DUMMY(4) NA_DUMMY(5) NA_DUMMY(6)
+    NA_DUMMY(7) NA_DUMMY(8) NA_DUMMY(9) NA_DUMMY(10) NA_DUMMY(11) NA_DUMMY(12) NA_DUMMY(13) NA_DUMMY(14)
+    virtual HRESULT __stdcall CreateSwapChainForHwnd(IUnknown*,HWND,const DXGI_SWAP_CHAIN_DESC1*,const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*,IDXGIOutput*,IDXGISwapChain1** out){*out=factory_result;return S_OK;}
+    NA_DUMMY(16) NA_DUMMY(17) NA_DUMMY(18) NA_DUMMY(19) NA_DUMMY(20) NA_DUMMY(21) NA_DUMMY(22) NA_DUMMY(23) NA_DUMMY(24)
 };
 #undef NA_DUMMY
 } // namespace sl::interposer
@@ -307,6 +322,9 @@ DWORD WINAPI detach_thread(LPVOID)
 
 } // namespace
 
+extern "C" __declspec(dllexport) int32_t slGetNewFrameToken(void** out,const uint32_t* index){
+    static FakeFrameToken token(0);token.v=*index;*out=&token;return 0;
+}
 int main()
 {
     // Instantiating the proxies emits their vtable/RTTI into this image.
@@ -597,6 +615,47 @@ int main()
         na::slb::SetFgRequest({});
     }
 
+    {
+        na::slb::Tag replacement{};replacement.resource_decoded=true;
+        replacement.resource=reinterpret_cast<ID3D12Resource*>(0x1234000);
+        replacement.buffer_type=na::slb::abi::kBufferHudlessColor;
+        replacement.state=kNonPixel;replacement.width=128;replacement.height=64;
+        replacement.native_format=DXGI_FORMAT_R16G16B16A16_FLOAT;
+        replacement.extent_left=2;replacement.extent_width=120;replacement.extent_height=60;
+        const auto calls=na::slb::GetStats().tag_calls;const auto original=g_tag_frame_calls;
+        capture_retag=true;
+        CHECK(na::slb::RetagForFrame(4567,7,&replacement,1,reinterpret_cast<ID3D12GraphicsCommandList*>(0x9876))==0);
+        capture_retag=false;
+        CHECK(g_tag_frame_calls==original+1 && na::slb::GetStats().tag_calls==calls);
+        CHECK(retag_seen.resource==0x1234000 && retag_seen.state==kNonPixel);
+        CHECK(retag_seen.extent_left==2 && retag_seen.extent_width==120 && retag_seen.lifecycle==0);
+        replacement.lifecycle=na::slb::abi::kValidUntilPresent;
+        CHECK(na::slb::RetagForFrame(4567,7,&replacement,1,reinterpret_cast<ID3D12GraphicsCommandList*>(0x9876))!=0);
+        CHECK(g_tag_frame_calls==original+1);
+    }
+    // RTTI factory discovery captures the GAME queue even when swap-chain
+    // RTTI already succeeded; downstream native presentation may use another.
+    {
+        test::Device gpu;
+        if(test::CreateDevice(gpu)){
+            sl::interposer::DXGIFactory factory;sl::interposer::DXGISwapChain queue_proxy;
+            FakeBase queue_base;queue_proxy.base=&queue_base;sl::interposer::factory_result=reinterpret_cast<IDXGISwapChain1*>(&queue_proxy);
+            using Create=HRESULT(STDMETHODCALLTYPE*)(void*,IUnknown*,HWND,const DXGI_SWAP_CHAIN_DESC1*,const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*,IDXGIOutput*,IDXGISwapChain1**);
+            auto create=reinterpret_cast<Create>((*reinterpret_cast<void***>(&factory))[15]);
+            IDXGISwapChain1* out=nullptr;DXGI_SWAP_CHAIN_DESC1 desc{};desc.BufferCount=2;
+            CHECK(create(&factory,gpu.queue.Get(),nullptr,&desc,nullptr,nullptr,&out)==S_OK);
+            CHECK(na::slb::SetCallbacks(cb));CHECK(out->Present(1,0)==S_OK);
+            CHECK(g_rec.before.back().present_queue==gpu.queue.Get());
+            test::ComPtr<ID3D12CommandQueue> second;D3D12_COMMAND_QUEUE_DESC qd{};
+            REQUIRE(SUCCEEDED(gpu.device->CreateCommandQueue(&qd,IID_PPV_ARGS(&second))));
+            IUnknown* queues[]={gpu.queue.Get(),second.Get()};UINT masks[]={1,1};
+            auto* v3=reinterpret_cast<IDXGISwapChain3*>(out);
+            CHECK(v3->ResizeBuffers1(2,32,32,DXGI_FORMAT_R8G8B8A8_UNORM,0,masks,queues)==S_OK);
+            queue_proxy.index=1;CHECK(out->Present(1,0)==S_OK);CHECK(g_rec.before.back().present_queue==second.Get());
+            queue_proxy.index=0;CHECK(out->Present(1,0)==S_OK);CHECK(g_rec.before.back().present_queue==gpu.queue.Get());
+            CHECK(out->Release()==0);CHECK(na::slb::SetCallbacks({}));
+        }
+    }
     char line[1024];
     CHECK(na::slb::FormatStatus(line, sizeof(line)) > 0);
     std::printf("%s\n", line);

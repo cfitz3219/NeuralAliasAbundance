@@ -167,6 +167,7 @@ add_library(host_dx12 STATIC
   src/host_dx12/nr/nr_pass.cpp
   src/host_dx12/nr/fg_composition.cpp
   src/host_dx12/nr/fg_color.cpp
+  src/host_dx12/nr/sl_consumer.cpp
   src/host_dx12/nr/native_fg.cpp
   src/host_dx12/nr/fg_states.cpp
   src/host_dx12/j2/live_dlaa.cpp

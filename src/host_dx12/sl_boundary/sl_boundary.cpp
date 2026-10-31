@@ -2,11 +2,15 @@
 
 #include <windows.h>
 #include <dxgi1_6.h>
+#include <d3d12.h>
+#include <wrl/client.h>
+#include "host_dx12/overlay/present_queues.hpp"
 
 #include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <vector>
 
 #include "host_dx12/hooking/vtable_hook.hpp"
 #include "host_dx12/sl_boundary/sl_tags.hpp"
@@ -102,6 +106,8 @@ bool begin_install_retry()
     return false;
 }
 
+using PfnNewFrame=SlResult(__cdecl*)(void**,const uint32_t*);
+PfnNewFrame g_new_frame=nullptr;
 PfnSetTagForFrame g_orig_tag_frame = nullptr;
 PfnSetTag g_orig_tag = nullptr;
 PfnUpgradeInterface g_orig_upgrade = nullptr;
@@ -174,6 +180,21 @@ struct ProxyState {
 constexpr uint32_t kMaxProxies = 8;
 ProxyState g_proxy_state[kMaxProxies];
 uint32_t g_next_proxy_id = 0;
+struct GameQueueBinding { IDXGISwapChain* proxy=nullptr;na::overlay::PresentQueues queues; };
+GameQueueBinding g_game_queues[kMaxProxies];
+Microsoft::WRL::ComPtr<ID3D12CommandQueue> canonical_queue(IUnknown* object){
+    Microsoft::WRL::ComPtr<IUnknown> base;
+    if(object && SUCCEEDED(object->QueryInterface(kSlRetrieveBaseIid,&base)))object=base.Get();
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
+    if(object)object->QueryInterface(IID_PPV_ARGS(&queue));return queue;
+}
+void bind_game_queue(IDXGISwapChain* chain,IUnknown* object){
+    auto queue=canonical_queue(object);if(!chain || !queue)return;
+    std::lock_guard<std::mutex> lock(g_m);
+    for(auto& b:g_game_queues)if(b.proxy==chain){b.queues.Created(queue.Get());return;}
+    for(auto& b:g_game_queues)if(!b.proxy){b.proxy=chain;b.queues.Created(queue.Get());return;}
+}
+
 
 ProxyState* find_proxy_locked(IDXGISwapChain* p)
 {
@@ -502,6 +523,11 @@ HRESULT present_call(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_PRESE
     e.params = pp;
     e.thread_id = GetCurrentThreadId();
     present_state(sc, e);
+    Microsoft::WRL::ComPtr<IDXGISwapChain3> indexed;
+    const UINT buffer=SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&indexed)))?indexed->GetCurrentBackBufferIndex():0;
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
+    {std::lock_guard<std::mutex> lock(g_m);for(const auto& binding:g_game_queues)if(binding.proxy==sc)queue=binding.queues.At(buffer);}
+    e.present_queue=queue.Get(); // kept alive across BOTH callbacks/original Present
     if (e.kind == PresentKind::Real && g_real.load(std::memory_order_relaxed) == 120) lookup_fg_functions_once();
     Subscription* sub = acquire_sub(); // one subscription for before AND after
     if (sub && sub->cb.before_present) { CallbackScope scope; sub->cb.before_present(e, sub->cb.user); }
@@ -544,7 +570,15 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT n, UINT w
 HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT flags,
                                                const UINT* masks, IUnknown* const* queues)
 {
+    std::vector<Microsoft::WRL::ComPtr<ID3D12CommandQueue>> owned;
+    std::vector<IUnknown*> canonical;
+    UINT queue_count=n;if(!queue_count){DXGI_SWAP_CHAIN_DESC1 desc{};if(SUCCEEDED(sc->GetDesc1(&desc)))queue_count=desc.BufferCount;}
+    if(queues && queue_count){for(UINT i=0;i<queue_count;++i){owned.push_back(canonical_queue(queues[i]));canonical.push_back(owned.back().Get());}}
     const HRESULT hr = g_orig_resize1(sc, n, w, h, f, flags, masks, queues);
+    if(SUCCEEDED(hr) && !canonical.empty()){
+        std::lock_guard<std::mutex> lock(g_m);
+        for(auto& binding:g_game_queues)if(binding.proxy==sc)binding.queues.Resized(hr,queue_count,canonical.data());
+    }
     if (SUCCEEDED(hr)) bump_epoch(sc);
     return hr;
 }
@@ -554,8 +588,13 @@ ULONG STDMETHODCALLTYPE DetourRelease(IUnknown* obj)
 {
     const ULONG r = g_orig_release(obj);
     if (r == 0) {
-        std::lock_guard<std::mutex> lock(g_m);
-        if (ProxyState* st = find_proxy_locked(reinterpret_cast<IDXGISwapChain*>(obj))) *st = ProxyState{};
+        uint32_t id=0;
+        {std::lock_guard<std::mutex> lock(g_m);
+        if (ProxyState* st = find_proxy_locked(reinterpret_cast<IDXGISwapChain*>(obj))) {id=st->id;*st = ProxyState{};}
+        for(auto& b:g_game_queues)if(b.proxy==obj)b={};}
+        Subscription* sub=acquire_sub();
+        if(id && sub && sub->cb.stream_released){CallbackScope scope;sub->cb.stream_released(id,sub->cb.user);}
+        release_sub(sub);
     }
     return r;
 }
@@ -620,7 +659,7 @@ bool in_exec(const Section* s, uint32_t n, uintptr_t a)
 // MSVC x64 RTTI: TypeDescriptor{vftable*, spare*, char name[]}; CompleteObjectLocator
 // {sig=1, offset, cdOffset, typeDescriptor RVA, classDescriptor RVA, self RVA};
 // the vtable is preceded by a pointer to its COL. Returns the offset-0 vtable.
-void* const* find_vtable_by_rtti_impl(HMODULE m, const char* name)
+void* const* find_vtable_by_rtti_impl(HMODULE m, const char* name,uint32_t min_slots=kProxyVtableMinSlots)
 {
     Section sec[32];
     const uint32_t ns = sections_of(m, sec, 32);
@@ -638,11 +677,11 @@ void* const* find_vtable_by_rtti_impl(HMODULE m, const char* name)
                     if (col[0] != 1 || col[1] != 0 || col[3] != td_rva || col[5] != static_cast<uint32_t>(c - base)) continue;
                     for (uint32_t k = 0; k < ns; ++k) {
                         if (sec[k].exec) continue;
-                        for (uintptr_t v = (sec[k].lo + 7) & ~uintptr_t(7); v + 8 * (1 + kProxyVtableMinSlots) <= sec[k].hi; v += 8) {
+                        for (uintptr_t v = (sec[k].lo + 7) & ~uintptr_t(7); v + 8 * (1 + min_slots) <= sec[k].hi; v += 8) {
                             if (*reinterpret_cast<const uintptr_t*>(v) != c) continue;
                             void* const* vt = reinterpret_cast<void* const*>(v + 8);
                             bool all = true;
-                            for (uint32_t s = 0; s < kProxyVtableMinSlots && all; ++s)
+                            for (uint32_t s = 0; s < min_slots && all; ++s)
                                 all = in_exec(sec, ns, reinterpret_cast<uintptr_t>(vt[s]));
                             if (all) return vt;
                         }
@@ -867,28 +906,28 @@ void inspect_swapchain(IUnknown* obj, Discovery how)
 HRESULT STDMETHODCALLTYPE DetourFactoryCreate(IDXGIFactory* f, IUnknown* dev, DXGI_SWAP_CHAIN_DESC* d, IDXGISwapChain** out)
 {
     const HRESULT hr = g_orig_fc(f, dev, d, out);
-    if (SUCCEEDED(hr) && out) inspect_swapchain(*out, Discovery::FactoryExport);
+    if (SUCCEEDED(hr) && out){bind_game_queue(*out,dev);inspect_swapchain(*out, Discovery::FactoryExport);}
     return hr;
 }
 HRESULT STDMETHODCALLTYPE DetourFactoryCreateHwnd(IDXGIFactory2* f, IUnknown* dev, HWND w, const DXGI_SWAP_CHAIN_DESC1* d,
                                                   const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs, IDXGIOutput* o, IDXGISwapChain1** out)
 {
     const HRESULT hr = g_orig_fc_hwnd(f, dev, w, d, fs, o, out);
-    if (SUCCEEDED(hr) && out) inspect_swapchain(*out, Discovery::FactoryExport);
+    if (SUCCEEDED(hr) && out){bind_game_queue(*out,dev);inspect_swapchain(*out, Discovery::FactoryExport);}
     return hr;
 }
 HRESULT STDMETHODCALLTYPE DetourFactoryCreateCore(IDXGIFactory2* f, IUnknown* dev, IUnknown* w, const DXGI_SWAP_CHAIN_DESC1* d,
                                                   IDXGIOutput* o, IDXGISwapChain1** out)
 {
     const HRESULT hr = g_orig_fc_core(f, dev, w, d, o, out);
-    if (SUCCEEDED(hr) && out) inspect_swapchain(*out, Discovery::FactoryExport);
+    if (SUCCEEDED(hr) && out){bind_game_queue(*out,dev);inspect_swapchain(*out, Discovery::FactoryExport);}
     return hr;
 }
 HRESULT STDMETHODCALLTYPE DetourFactoryCreateComp(IDXGIFactory2* f, IUnknown* dev, const DXGI_SWAP_CHAIN_DESC1* d, IDXGIOutput* o,
                                                   IDXGISwapChain1** out)
 {
     const HRESULT hr = g_orig_fc_comp(f, dev, d, o, out);
-    if (SUCCEEDED(hr) && out) inspect_swapchain(*out, Discovery::FactoryExport);
+    if (SUCCEEDED(hr) && out){bind_game_queue(*out,dev);inspect_swapchain(*out, Discovery::FactoryExport);}
     return hr;
 }
 
@@ -907,7 +946,7 @@ DWORD WINAPI deferred_factory_install(LPVOID p)
 
 void inspect_object(void* obj, Discovery how)
 {
-    if (!obj || g_present_hooks.load(std::memory_order_acquire)) return;
+    if (!obj) return;
     auto* unk = static_cast<IUnknown*>(obj);
     inspect_swapchain(unk, how);
     void* raw = nullptr;
@@ -960,6 +999,7 @@ bool install_for_module(HMODULE m)
     }
     bool any = false;
     // Tag exports.
+    g_new_frame=reinterpret_cast<PfnNewFrame>(GetProcAddress(m,"slGetNewFrameToken"));
     auto* tag_frame = reinterpret_cast<void*>(GetProcAddress(m, "slSetTagForFrame"));
     auto* tag = reinterpret_cast<void*>(GetProcAddress(m, "slSetTag"));
     auto* gff = reinterpret_cast<void*>(GetProcAddress(m, "slGetFeatureFunction"));
@@ -983,10 +1023,19 @@ bool install_for_module(HMODULE m)
         }
     }
     install_lock.unlock(); // install_proxy_vtable takes it again
+    // Capture the game's queue BEFORE DLSS-G can substitute a private
+    // presentation queue. Factory discovery is needed even with proxy RTTI.
+    for(const char* name:{".?AUDXGIFactory@interposer@sl@@",".?AVDXGIFactory@interposer@sl@@"}){
+        if(auto* factory=find_vtable_by_rtti_impl(m,name,kSlotCreateSwapChainForComposition+1)){
+            if(!g_factory_install_requested.exchange(true))deferred_factory_install(const_cast<void**>(factory));
+            break;
+        }
+    }
     // Proxy swap chain: RTTI first (every creation path shares this vtable).
     if (void* const* vt = find_proxy_vtable(m)) {
         any = install_proxy_vtable(vt, Discovery::Rtti) || any;
-    } else {
+    }
+    {
         install_lock.lock();
         if (!begin_install_retry()) {
             set_reason("Could not install the Streamline fallback hooks.");
@@ -1002,7 +1051,7 @@ bool install_for_module(HMODULE m)
         if (cf1) na::hooking::PrepareHook(cf1, reinterpret_cast<void*>(&DetourCreateFactory1), reinterpret_cast<void**>(&g_orig_cf1));
         if (cf2) na::hooking::PrepareHook(cf2, reinterpret_cast<void*>(&DetourCreateFactory2), reinterpret_cast<void**>(&g_orig_cf2));
         na::hooking::CommitInstall();
-        set_reason("No RTTI for Streamline's swap chain; waiting for slUpgradeInterface or a factory.");
+        if(!g_present_hooks.load())set_reason("No RTTI for Streamline's swap chain; waiting for slUpgradeInterface or a factory.");
     }
     if (!g_present_hooks.load(std::memory_order_acquire) && g_tag_hooks.load(std::memory_order_acquire) == 0)
         set_reason("Streamline loaded, but none of its entry points could be hooked.");
@@ -1046,11 +1095,38 @@ const wchar_t* const kModuleNames[] = {L"sl.interposer.dll", nullptr};
 
 } // namespace
 
+int32_t RetagForFrame(uint32_t token,uint32_t viewport,const Tag* tags,uint32_t count,ID3D12GraphicsCommandList* list) {
+    if(!g_new_frame || !g_orig_tag_frame || !tags || !count || count>kMaxTagsPerCall || !list)return -1;
+    // Public Streamline 2.x ABI, include/sl_core_types.h. Full Resource v1
+    // storage (112 bytes), not the shorter prefix sufficient for decoding.
+    struct alignas(8) ResourceBytes { uint8_t data[112]{}; } resources[kMaxTagsPerCall];
+    struct alignas(8) TagBytes { uint8_t data[64]{}; } raw[kMaxTagsPerCall];
+    alignas(8) uint8_t view[40]{};
+    auto put=[](uint8_t* data,size_t offset,const auto& value){std::memcpy(data+offset,&value,sizeof(value));};
+    const uint64_t version=1;
+    std::memcpy(view+8,na::sl::kViewportGuid,16);put(view,24,version);put(view,32,viewport);
+    for(uint32_t i=0;i<count;++i){
+        const auto& t=tags[i];
+        if(!t.resource || !t.resource_decoded || t.resource_type!=0 || t.state==UINT32_MAX || t.lifecycle!=abi::kOnlyValidNow)return -1;
+        auto* r=resources[i].data;auto* b=raw[i].data;
+        std::memcpy(r+8,abi::kResourceGuid,16);put(r,24,version);put(r,40,t.resource);put(r,64,t.state);
+        put(r,68,t.width);put(r,72,t.height);put(r,76,t.native_format);
+        const uint32_t one=1;put(r,80,one);put(r,84,one);
+        std::memcpy(b+8,abi::kResourceTagGuid,16);put(b,24,version);put(b,32,r);
+        put(b,40,t.buffer_type);put(b,44,t.lifecycle);put(b,48,t.extent_top);put(b,52,t.extent_left);
+        put(b,56,t.extent_width);put(b,60,t.extent_height);
+    }
+    void* frame=nullptr;
+    const auto result=g_new_frame(&frame,&token);if(result!=0)return result;
+    uint32_t actual=0;if(!frame_token_value(frame,&actual) || actual!=token)return -1;
+    return g_orig_tag_frame(frame,view,raw,count,list);
+}
+
 bool SetCallbacks(const Callbacks& callbacks)
 {
     if (t_callback_depth > 0) return false; // would wait for itself
     std::lock_guard<std::mutex> lock(g_sub_m);
-    const bool any = callbacks.on_tag || callbacks.after_tag || callbacks.on_constants || callbacks.before_present || callbacks.after_present;
+    const bool any = callbacks.on_tag || callbacks.after_tag || callbacks.on_constants || callbacks.before_present || callbacks.after_present || callbacks.stream_released;
     Subscription* next = any ? new Subscription : nullptr;
     if (next) next->cb = callbacks;
     Subscription* old = g_sub.exchange(next, std::memory_order_seq_cst);

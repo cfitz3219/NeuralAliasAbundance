@@ -8,7 +8,7 @@ struct CompositionSurface {
     ID3D12Resource* texture = nullptr;
     uint32_t x = 0, y = 0;
 };
-enum class UiComposition : uint32_t { EqualPixels, AlphaRed, UiAlpha };
+enum class UiComposition : uint32_t { EqualPixels, AlphaRed, UiAlpha, AdditiveResidual };
 // Call during device/NR preparation, never from native FG evaluation.
 bool PrepareFgComposition(ID3D12Device* device);
 

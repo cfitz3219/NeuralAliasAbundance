@@ -1,3 +1,4 @@
+#include "host_dx12/nr/sl_consumer.hpp"
 #include "host_dx12/nr/native_fg.hpp"
 #include "host_dx12/nr/queue_trace.hpp"
 #ifdef NA_HAVE_NGX_SDK
@@ -57,27 +58,29 @@ void Barrier(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATE
 }
 struct InputStates {
     ID3D12GraphicsCommandList* list;
-    ID3D12Resource* resources[4]{};
-    D3D12_RESOURCE_STATES original[4]{};
+    ID3D12Resource* resources[5]{};
+    D3D12_RESOURCE_STATES original[5]{};
     uint32_t count=0;
     bool ready=false;
     bool replace_hudless=false;
-    InputStates(ID3D12GraphicsCommandList* l,const FgContract& f,bool can_replace):list(l) {
-        ID3D12Resource* inputs[]={f.color.resource,f.hudless.resource,f.depth.resource,f.motion.resource};
+    InputStates(ID3D12GraphicsCommandList* l,const FgContract& f,bool can_replace,const FrameStates* declared=nullptr):list(l) {
+        ID3D12Resource* inputs[]={f.color.resource,f.hudless.resource,f.depth.resource,f.motion.resource,declared?(f.alpha.resource?f.alpha.resource:f.ui.resource):nullptr};
         bool all_known=true;status.illegal_state_mask=0;status.state_contract_mask=0;
         // NVIDIA DLSS-FG guide section 6 requires compute-readable INPUTS at
         // EvaluateFeature. This is permission to read, NOT exact state evidence.
         // Missing color state still refuses: real-picture copy-back needs it.
-        for(uint32_t i=0;i<4;++i){
-            D3D12_RESOURCE_STATES state{};auto evidence=states::Inspect(l,inputs[i],state);
+        for(uint32_t i=0;i<(inputs[4]?5u:4u);++i){
+            D3D12_RESOURCE_STATES state{};auto evidence=states::Evidence::Known;
+            if(declared)state=static_cast<D3D12_RESOURCE_STATES>(declared->values[i]);
+            else evidence=states::Inspect(l,inputs[i],state);
             if(i>0 && evidence==states::Evidence::NoTransition && !IsSwapchain(inputs[i]) &&
                (i!=1 || can_replace)) {
                 evidence=states::Evidence::NgxReadContract;
                 status.state_contract_mask|=1u<<i;
                 if(i==1)replace_hudless=true;
             }
-            status.input_states[i]=static_cast<uint32_t>(state);
-            status.input_evidence[i]=static_cast<uint32_t>(evidence);
+            if(i<4){status.input_states[i]=static_cast<uint32_t>(state);
+            status.input_evidence[i]=static_cast<uint32_t>(evidence);}
             if(evidence==states::Evidence::NgxReadContract)continue; // no barrier or restore for unknown state
             if(evidence!=states::Evidence::Known){all_known=false;continue;}
             if(!states::CanTransitionOn(l->GetType(),state)){status.illegal_state_mask|=1u<<i;all_known=false;}
@@ -138,6 +141,7 @@ struct Context {
 std::vector<std::unique_ptr<Context>> contexts;
 struct Recording {
     std::shared_ptr<std::atomic<bool>> retired=std::make_shared<std::atomic<bool>>(false);
+    std::shared_ptr<std::atomic<bool>> completed=std::make_shared<std::atomic<bool>>(false);
     ID3D12CommandList* list=nullptr;
     std::shared_ptr<std::atomic<bool>> valid;
     ComPtr<ID3D12Fence> fence;
@@ -146,6 +150,7 @@ struct Recording {
     std::atomic<bool> failed{false};
     std::atomic<uintptr_t> last_queue{0};
     std::mutex submission_mutex;
+    std::vector<std::shared_ptr<void>> retained;
     std::vector<std::shared_ptr<Packet>> packets;
     std::vector<ComPtr<ID3D12Resource>> destinations;
 };
@@ -206,6 +211,7 @@ void Collect() {
                     c->packets[i].reset();
                 }
         }
+        r->completed->store(r->value.load()!=0,std::memory_order_release);
         r->retired->store(true,std::memory_order_release);
         r.reset(); records_count.fetch_sub(1);
     }
@@ -287,7 +293,7 @@ void InputOverride::Bind(const void* parameters,ID3D12Resource* replacement){
     if(!parameters_){p->Get("DLSSG.HUDLess",&original_);parameters_=p;}
     p->Set("DLSSG.HUDLess",replacement);
 }
-bool OwnsRoute(){return contexts_count.load()!=0;}
+bool OwnsRoute(){return contexts_count.load()!=0 || slconsumer::OwnsAny();}
 void Register(const void* core,const void* handle){
     std::lock_guard<std::mutex> lock(mutex);
     for(auto& c:contexts)if(c->core==core && c->handle==handle)return;
@@ -371,6 +377,7 @@ void CoreShutdown(const void* core) {
     contexts.erase(std::remove_if(contexts.begin(),contexts.end(),[&](const auto& c){return c->core==core;}),contexts.end());
     contexts_count.store(static_cast<uint32_t>(contexts.size()));
 }
+void ReportUnavailable(const char* reason){std::lock_guard<std::mutex> lock(mutex);status.active=0;status.source=2;++status.skipped;Reason(reason);}
 void After(const void* core,const void* handle,int32_t result) {
     if(result==1 || internal)return;
     Internal guard;
@@ -391,6 +398,32 @@ Status GetStatus(){
     if(lock.owns_lock()){published_status=status;published_status.submitted=submissions.load();}
     return published_status;
 }
+RecordingLease RetainRecording(ID3D12GraphicsCommandList* list,std::shared_ptr<void> payload) {
+    RecordingLease lease;
+    if(!list || !payload)return lease;
+    ComPtr<ID3D12Device> device;
+    if(FAILED(list->GetDevice(IID_PPV_ARGS(&device))))return lease;
+    std::lock_guard<std::mutex> lock(mutex);Collect();
+    auto* r=Track(list,device.Get());if(!r)return lease;
+    r->retained.push_back(std::move(payload));
+    for(const auto& entry:recordings)if(entry.get()==r){lease.record_=entry;lease.retired_=r->retired;lease.completed_=r->completed;break;}
+    return lease;
+}
+bool RecordingLease::Ready(ID3D12CommandQueue* consumer) const {
+    if(!consumer)return false;
+    auto record=record_.lock();
+    if(!record)return completed_ && completed_->load(std::memory_order_acquire);
+    const auto& r=*static_cast<const Recording*>(record.get());
+    // Do not race a second submission or treat recording as submission.
+    if(r.forwarding.load() || r.failed.load())return false;
+    const auto value=r.value.load();if(!value)return false;
+    if(r.last_queue.load()==reinterpret_cast<uintptr_t>(consumer))return true;
+    const auto done=r.fence->GetCompletedValue();
+    return done!=UINT64_MAX && done>=value && !r.forwarding.load();
+}
+bool RecordingLease::Retired() const {
+    return retired_ && retired_->load(std::memory_order_acquire);
+}
 void TraceGpuProgress(){
     std::unique_lock<std::mutex> lock(mutex,std::try_to_lock);
     if(!lock.owns_lock()){trace::Record("nr_progress_busy",nullptr);return;}
@@ -400,16 +433,15 @@ void TraceGpuProgress(){
     }
 }
 void MarkSwapchainBuffer(ID3D12Resource* r){if(r){const UINT value=1;r->SetPrivateData(swapchain_key,sizeof(value),&value);}}
-void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,const void* parameters,const Runtime& runtime,InputOverride* replacement) {
-    if(!list || !parameters || (list->GetType()!=D3D12_COMMAND_LIST_TYPE_DIRECT && list->GetType()!=D3D12_COMMAND_LIST_TYPE_COMPUTE))return;
-    if(internal)return;Internal guard;na::dlss::InjectorCallScope origin;
+static bool Record(ID3D12GraphicsCommandList* list,const void* core,const void* handle,FgContract f,const Runtime& runtime,InputOverride* replacement,const void* parameters,const FrameStates* declared) {
+    if(!list || (list->GetType()!=D3D12_COMMAND_LIST_TYPE_DIRECT && list->GetType()!=D3D12_COMMAND_LIST_TYPE_COMPUTE))return false;
+    if(internal)return false;Internal guard;na::dlss::InjectorCallScope origin;
     trace::Record("nr_begin",nullptr,list);
     struct End {ID3D12GraphicsCommandList* list;~End(){trace::Record("nr_end",nullptr,list);}} end{list};
     std::lock_guard<std::mutex> lock(mutex);Collect();
     Context* ctx=nullptr; for(auto& c:contexts)if(c->core==core && c->handle==handle)ctx=c.get();
-    if(!ctx){if(contexts.size()>=8)return;auto c=std::make_unique<Context>();c->core=core;c->handle=handle;ctx=c.get();contexts.push_back(std::move(c));contexts_count.store(static_cast<uint32_t>(contexts.size()));}
-    status.active=0;
-    auto f=ReadFgContract(static_cast<const NVSDK_NGX_Parameter*>(parameters));
+    if(!ctx){if(contexts.size()>=8)return false;auto c=std::make_unique<Context>();c->core=core;c->handle=handle;ctx=c.get();contexts.push_back(std::move(c));contexts_count.store(static_cast<uint32_t>(contexts.size()));}
+    status.active=0;status.source=declared?2u:1u;
     status.input_states_known=0;status.input_states_ready=0;status.hudless_replaced=0;status.state_contract_mask=0;status.frame_id=f.frame_id;
     status.backbuffer_is_swapchain=IsSwapchain(f.color.resource);
     status.output_real_present=f.real_output.resource!=nullptr;
@@ -417,7 +449,7 @@ void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,
     const auto identity=ctx->identity.Resolve(f);
     status.identity_mode=ctx->identity.mode;status.multi_count=f.has_multi_count?f.multi_count:1;
     status.multi_index=f.has_multi_index?f.multi_index:1;status.list_type=list->GetType();
-    if(!identity){++status.skipped;Reason("Neural Rendering needs a valid native FG inner-frame sequence.");return;}
+    if(!identity){++status.skipped;Reason("Neural Rendering needs a valid native FG inner-frame sequence.");return false;}
     if(ctx->identity_mode!=ctx->identity.mode){
         // IDs from different protocols must not collide. Recordings retain
         // old payloads independently until their submitted GPU work retires.
@@ -438,25 +470,25 @@ void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,
     // acquire a new enhancement merely because the preference changed.
     for(uint32_t i=0;i<FgFrameCache::Capacity;++i)
         if(ctx->live[i] && ctx->packets[i] && ctx->packets[i]->id==f.frame_id)frame_enabled=true;
-    if(!frame_enabled){Reason("Neural Rendering is off for this real frame.");return;}
-    if(!f.camera_motion || f.motion_jittered){++status.skipped;Reason("Neural Rendering needs unjittered camera-inclusive motion vectors.");return;}
+    if(!frame_enabled){Reason("Neural Rendering is off for this real frame.");return false;}
+    if(!f.camera_motion || f.motion_jittered){++status.skipped;Reason("Neural Rendering needs unjittered camera-inclusive motion vectors.");return false;}
     if(!Region(f.color) || !Region(f.hudless) || !Region(f.depth) || !Region(f.motion) ||
         f.color.region.width!=f.hudless.region.width || f.color.region.height!=f.hudless.region.height ||
         f.color.resource->GetDesc().Format!=f.hudless.resource->GetDesc().Format || f.distortion.resource ||
         !f.has_hdr || !f.has_motion_x || !f.has_motion_y || !std::isfinite(f.motion_x) || !std::isfinite(f.motion_y)) {
-        ++status.skipped;Reason("Neural Rendering is waiting for matching FG picture and guide regions.");return;
+        ++status.skipped;Reason("Neural Rendering is waiting for matching FG picture and guide regions.");return false;
     }
     if(f.color.resource==f.hudless.resource && (f.color.region.x!=f.hudless.region.x || f.color.region.y!=f.hudless.region.y)) {
-        ++status.skipped;Reason("Neural Rendering needs separate nonoverlapping FG image regions.");return;
+        ++status.skipped;Reason("Neural Rendering needs separate nonoverlapping FG image regions.");return false;
     }
-    InputStates input_states(list,f,replacement!=nullptr);
+    InputStates input_states(list,f,replacement!=nullptr,declared);
     status.input_states_ready=input_states.ready;
     status.input_states_known=input_states.ready && !status.state_contract_mask;
-    if(!input_states.ready){++status.skipped;Reason("Neural Rendering is waiting for observed native FG input states.");return;}
+    if(!input_states.ready){++status.skipped;Reason("Neural Rendering is waiting for observed native FG input states.");return false;}
     using namespace na::hooking::variants;
-    if(Active(Kind::CommandList) && CoverageOf(Kind::CommandList,list)!=Coverage::Complete){++status.skipped;Reason("Neural Rendering needs tracked native FG command lists.");return;}
-    ComPtr<ID3D12Device> device; if(FAILED(list->GetDevice(IID_PPV_ARGS(&device))))return;
-    auto* recording=Track(list,device.Get());if(!recording){++status.skipped;Reason("Neural Rendering is waiting for its recorded frames to finish.");return;}
+    if(Active(Kind::CommandList) && CoverageOf(Kind::CommandList,list)!=Coverage::Complete){++status.skipped;Reason("Neural Rendering needs tracked native FG command lists.");return false;}
+    ComPtr<ID3D12Device> device; if(FAILED(list->GetDevice(IID_PPV_ARGS(&device))))return false;
+    auto* recording=Track(list,device.Get());if(!recording){++status.skipped;Reason("Neural Rendering is waiting for its recorded frames to finish.");return false;}
     // Retain a small history for delayed MFG calls, recycle only payloads with
     // no recorded/submitted consumers left. Slots retain their allocations.
     for(uint32_t i=0;i<FgFrameCache::Capacity;++i) if(ctx->live[i] && ctx->packets[i].use_count()==1 &&
@@ -466,16 +498,16 @@ void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,
     auto decision=ctx->cache.Acquire(f.frame_id);
     if(decision.action==FgFrameCache::Action::Record && !f.has_frame_id && status.multi_index>1){
         ctx->cache.AbandonUnsubmitted(decision.ticket);++status.skipped;
-        Reason("Neural Rendering did not enhance the first FG inner frame.");return;
+        Reason("Neural Rendering did not enhance the first FG inner frame.");return false;
     }
-    if(decision.action==FgFrameCache::Action::Full || decision.action==FgFrameCache::Action::Expired || decision.action==FgFrameCache::Action::Pending){++status.skipped;Reason("Neural Rendering is waiting for its real-frame cache.");return;}
+    if(decision.action==FgFrameCache::Action::Full || decision.action==FgFrameCache::Action::Expired || decision.action==FgFrameCache::Action::Pending){++status.skipped;Reason("Neural Rendering is waiting for its real-frame cache.");return false;}
     const auto index=decision.ticket.slot;
     auto& packet=ctx->packets[index];
     if(decision.action!=FgFrameCache::Action::Record) {
-        if(!packet || !packet->successful || !packet->composition.Full())return;
+        if(!packet || !packet->successful || !packet->composition.Full())return false;
         const auto cached=packet->composition.Full()->GetDesc();
         if(cached.Width!=f.color.region.width || cached.Height!=f.color.region.height || cached.Format!=f.color.resource->GetDesc().Format) {
-            ++status.skipped;Reason("Native FG reused a frame identity with a different picture shape.");return;
+            ++status.skipped;Reason("Native FG reused a frame identity with a different picture shape.");return false;
         }
         // Native FG evaluations of one feature already require GPU ordering:
         // its own temporal history and these cached images follow that same
@@ -483,13 +515,13 @@ void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,
         Keep(*recording,packet);
         recording->destinations.emplace_back(f.color.resource);recording->destinations.emplace_back(f.hudless.resource);
         if(input_states.replace_hudless && !ReplaceHudless(list,device.Get(),*packet,f,parameters,*replacement)){
-            Reason("Neural Rendering could not prepare its FG HUD-free input.");return;}
+            Reason("Neural Rendering could not prepare its FG HUD-free input.");return false;}
         CopyRegion(list,packet->composition.Full(),f.color);
         if(!input_states.replace_hudless && f.hudless.resource!=f.color.resource)CopyRegion(list,packet->composition.Hudless(),f.hudless);
-        ++status.reused;status.active=1;Reason("Neural Rendering is active before native Frame Generation.");return;
+        ++status.reused;status.active=1;Reason("Neural Rendering is active before native Frame Generation.");return true;
     }
     if(!packet)packet=std::make_shared<Packet>();
-    else if(packet->receipt_set && !packet->composition.TryRecycle()){ctx->cache.AbandonUnsubmitted(decision.ticket);++status.skipped;return;}
+    else if(packet->receipt_set && !packet->composition.TryRecycle()){ctx->cache.AbandonUnsubmitted(decision.ticket);++status.skipped;return false;}
     if(packet->feature && packet->feature->device.Get()!=device.Get())packet=std::make_shared<Packet>();
     if(packet->hudless_override){
         const auto owned=packet->hudless_override->GetDesc(),target=f.hudless.resource->GetDesc();
@@ -501,13 +533,13 @@ void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,
     Keep(*recording,packet); // lifetime starts BEFORE any NR GPU commands
     const auto fmt=f.hudless.resource->GetDesc().Format;
     const uint32_t mode=f.hdr ? (fmt==DXGI_FORMAT_R16G16B16A16_FLOAT?2u:1u):0u;
-    if(mode==1 && fmt!=DXGI_FORMAT_R10G10B10A2_UNORM){Reason("Neural Rendering needs a supported HDR encoding.");return;}
+    if(mode==1 && fmt!=DXGI_FORMAT_R10G10B10A2_UNORM){Reason("Neural Rendering needs a supported HDR encoding.");return false;}
     if(!ctx->feature || ctx->feature->w!=f.color.region.width || ctx->feature->h!=f.color.region.height ||
         ctx->feature->mode!=mode || ctx->feature->format!=fmt || ctx->feature->device.Get()!=device.Get() ||
         ctx->feature->model!=settings::Get().nr_model.load()) {
         packet->feature=std::make_shared<Feature>();
         packet->feature->core=core;
-        if(!MakeFeature(list,device.Get(),runtime,f,mode,packet->feature)){ctx->feature.reset();Reason("Neural Rendering could not create its pre-FG feature.");return;}
+        if(!MakeFeature(list,device.Get(),runtime,f,mode,packet->feature)){ctx->feature.reset();Reason("Neural Rendering could not create its pre-FG feature.");return false;}
         ctx->feature=packet->feature;
     } else packet->feature=ctx->feature;
     auto& n=*packet->feature; auto* p=n.params;const auto& st=settings::Get();
@@ -528,7 +560,7 @@ void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,
     }
     if(packet->queries && packet->timestamps)list->EndQuery(packet->queries.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0);
     CompositionSurface original{f.hudless.resource,f.hudless.region.x,f.hudless.region.y};
-    if(mode && !packet->input.Record(list,false,original,nullptr,nullptr,n.color.Get(),mode,static_cast<float>(st.nr_paper_white.load())))return;
+    if(mode && !packet->input.Record(list,false,original,nullptr,nullptr,n.color.Get(),mode,static_cast<float>(st.nr_paper_white.load())))return false;
     p->Set("DLSSNR.Color",mode?n.color.Get():f.hudless.resource);p->Set("DLSSNR.Depth",f.depth.resource);
     p->Set("DLSSNR.MVec",f.motion.resource);p->Set("DLSSNR.Output",n.nr.Get());p->Set("DLSSNR.Reset",n.reset||f.reset?1u:0u);
     p->Set("DLSSNR.DepthInverted",f.depth_inverted);p->Set("DLSSNR.MVecScaleX",f.motion_x*n.w);p->Set("DLSSNR.MVecScaleY",f.motion_y*n.h);
@@ -536,16 +568,20 @@ void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,
     p->Set("DLSSNR.LocalToneStrength",st.nr_tone.load()/100.f);p->Set("DLSSNR.SkinStructureStrength",st.nr_skin.load()/100.f);
     const FgRegion compact{0,0,n.w,n.h,15};SetRegion(p,"Color",mode?compact:f.hudless.region);
     SetRegion(p,"Depth",f.depth.region);SetRegion(p,"MVec",f.motion.region);SetRegion(p,"Output",compact);
-    if(!Good(reinterpret_cast<EvaluateFn>(n.rt.evaluate_feature)(list,n.handle,p,nullptr))){n.reset=true;ctx->feature.reset();Reason("Neural Rendering pre-FG evaluation failed.");return;}
+    if(!Good(reinterpret_cast<EvaluateFn>(n.rt.evaluate_feature)(list,n.handle,p,nullptr))){n.reset=true;ctx->feature.reset();Reason("Neural Rendering pre-FG evaluation failed.");return false;}
     n.reset=false;n.last_frame=f.frame_id;++status.evaluates;
     Barrier(list,n.nr.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     const bool converted=!mode || packet->output.Record(list,true,original,n.nr.Get(),n.color.Get(),n.enhanced.Get(),mode,static_cast<float>(st.nr_paper_white.load()));
+    const auto alpha=declared?(f.alpha.resource?f.alpha:f.ui):FgSurface{};
+    const auto composition_mode=alpha.resource?(f.alpha.resource?UiComposition::AlphaRed:UiComposition::UiAlpha):
+        (declared && declared->preserve_additive_ui?UiComposition::AdditiveResidual:UiComposition::EqualPixels);
+    packet->refs[4]=alpha.resource;
     const bool composed=converted && packet->composition.Record(list,n.w,n.h,{f.color.resource,f.color.region.x,f.color.region.y},
-        original,{mode?n.enhanced.Get():n.nr.Get(),0,0},{},UiComposition::EqualPixels);
+        original,{mode?n.enhanced.Get():n.nr.Get(),0,0},{alpha.resource,alpha.region.x,alpha.region.y},composition_mode);
     Barrier(list,n.nr.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    if(!composed){Reason("Neural Rendering could not compose the pre-FG picture.");return;}
+    if(!composed){Reason("Neural Rendering could not compose the pre-FG picture.");return false;}
     if(input_states.replace_hudless && !ReplaceHudless(list,device.Get(),*packet,f,parameters,*replacement)){
-        Reason("Neural Rendering could not prepare its FG HUD-free input.");return;}
+        Reason("Neural Rendering could not prepare its FG HUD-free input.");return false;}
     CopyRegion(list,packet->composition.Full(),f.color);
     if(!input_states.replace_hudless && f.hudless.resource!=f.color.resource)CopyRegion(list,packet->composition.Hudless(),f.hudless);
     if(packet->queries && packet->timestamps) {
@@ -554,6 +590,15 @@ void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,
     }
     packet->successful=true;ctx->cache.Recorded(decision.ticket);status.width=n.w;status.height=n.h;status.active=1;
     Reason("Neural Rendering is active before native Frame Generation.");
+    return true;
+}
+void Before(ID3D12GraphicsCommandList* list,const void* core,const void* handle,const void* parameters,const Runtime& runtime,InputOverride* replacement) {
+    ComPtr<ID3D12Device> device;
+    if(list && SUCCEEDED(list->GetDevice(IID_PPV_ARGS(&device))) && slconsumer::OwnsDevice(device.Get()))return;
+    if(parameters)Record(list,core,handle,ReadFgContract(static_cast<const NVSDK_NGX_Parameter*>(parameters)),runtime,replacement,parameters,nullptr);
+}
+bool RecordFrame(ID3D12GraphicsCommandList* list,const void* core,const void* stream,const FgContract& frame,const Runtime& runtime,const FrameStates& states) {
+    return Record(list,core,stream,frame,runtime,nullptr,nullptr,&states);
 }
 Submission::Submission(ID3D12CommandQueue* q,UINT n,ID3D12CommandList* const* lists) {
     if(internal || !records_count.load())return;
@@ -589,15 +634,20 @@ namespace na::nr::native {
 InputOverride::~InputOverride(){}
 void InputOverride::Bind(const void*,ID3D12Resource*){}
 void Before(ID3D12GraphicsCommandList*,const void*,const void*,const void*,const Runtime&,InputOverride*){}
+bool RecordFrame(ID3D12GraphicsCommandList*,const void*,const void*,const FgContract&,const Runtime&,const FrameStates&){return false;}
 void Release(const void*,const void*){} void Prepare(ID3D12GraphicsCommandList*){} void Maintain(){}
 void RetireBackbuffer(ID3D12Resource*){}
 std::shared_ptr<const std::atomic<bool>> TrackUse(ID3D12GraphicsCommandList*){return {};}
+RecordingLease RetainRecording(ID3D12GraphicsCommandList*,std::shared_ptr<void>){return {};}
+bool RecordingLease::Ready(ID3D12CommandQueue*)const{return false;}
+bool RecordingLease::Retired()const{return false;}
 void TraceGpuProgress(){}
 void PrepareDevice(ID3D12Device*){}
 void MarkSwapchainBuffer(ID3D12Resource*){}
 void Register(const void*,const void*){}
 void CoreShutdown(const void*){}
 void After(const void*,const void*,int32_t){}
+void ReportUnavailable(const char*){}
 void Reset(ID3D12GraphicsCommandList*){} bool OwnsRoute(){return false;} Status GetStatus(){return {};}
 Submission::Submission(ID3D12CommandQueue*,UINT,ID3D12CommandList* const*){} Submission::~Submission(){}
 }

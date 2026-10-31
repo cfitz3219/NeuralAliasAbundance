@@ -31,6 +31,12 @@ void compose(uint3 id : SV_DispatchThreadID) {
     float3 bo = b.rgb, ho = h.rgb;
     if (mode == 0) {
         if (all(b.rgb == h.rgb)) { bo = e; ho = e; }
+    } else if (mode == 3) {
+        // With no opacity tag the original UI cannot be uniquely separated.
+        // Preserve its measured additive residual, without a binary equality
+        // mask switching enhancement off as quantization/dither changes.
+        bo = e + (b.rgb - h.rgb);
+        ho = e;
     } else {
         float4 av = alpha[id.xy + alpha_base];
         float a = saturate(mode == 1 ? av.r : av.a);
@@ -122,7 +128,7 @@ bool FgComposition::Record(ID3D12GraphicsCommandList* list,uint32_t w,uint32_t h
     if (recorded_ || !list || !w || !h || !Fits(b,w,h) || !Fits(h0,w,h) || !Fits(e,w,h)) return false;
     const auto bf=b.texture->GetDesc().Format, hf=h0.texture->GetDesc().Format;
     if (!ColorFormat(bf) || !ColorFormat(hf) || !ColorFormat(e.texture->GetDesc().Format)) return false;
-    if (mode == UiComposition::EqualPixels) {
+    if (mode == UiComposition::EqualPixels || mode == UiComposition::AdditiveResidual) {
         if (bf != hf) return false;
         a = b; // valid unused SRV, without reading a missing alpha texture
     } else {

@@ -1,3 +1,4 @@
+#include "host_dx12/nr/sl_consumer.hpp"
 #include "host_dx12/nr/nr_pass.hpp"
 #include "host_dx12/nr/nr_shaders.hpp"
 #include "host_dx12/nr/fg_composition.hpp"
@@ -572,6 +573,7 @@ void read_timings_locked(ID3D12CommandQueue* queue)
 
 void SetRuntime(const Runtime& rt)
 {
+    slconsumer::SetRuntime(rt);
     std::lock_guard<std::mutex> lock(g.m);
     g.rt = rt;
     bool ok = rt.create_feature && rt.evaluate_feature && rt.release_feature && rt.allocate_parameters;
@@ -833,6 +835,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
 void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer, DXGI_COLOR_SPACE_TYPE color_space)
 {
     native::Maintain();
+    if(queue){ComPtr<ID3D12Device> device;if(SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&device))) && slconsumer::OwnsDevice(device.Get()))return;}
     if (native::OwnsRoute()) return; // already enhanced both FG inputs, never process generated frames
     if (!queue || !backbuffer) return;
     const na::settings::Settings& st = na::settings::Get();
@@ -1200,6 +1203,7 @@ void ResetLatch()
 
 void OnRuntimeShutdown(const Runtime& runtime)
 {
+    slconsumer::Shutdown(runtime);
     std::lock_guard<std::mutex> lock(g.m);
     if(g.feature_runtime.create_feature==runtime.create_feature) {
         g.feature=nullptr;g.feature_runtime={};g.feature_pending=0;g.active.store(0);g.reset_pending=true;

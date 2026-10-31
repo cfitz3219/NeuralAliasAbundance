@@ -1,3 +1,4 @@
+#include "host_dx12/nr/sl_consumer.hpp"
 #include "host_dx12/adapters/tlou1/apply.hpp"
 #include "host_dx12/adapters/unreal/cvar_probe.hpp"
 #include "host_dx12/sl_boundary/sl_boundary.hpp"
@@ -123,6 +124,7 @@ DWORD WINAPI InitThread(LPVOID)
             wcsncpy_s(slb_log, na::settings::UserIniPath(), _TRUNCATE);
             if (wchar_t* slash = wcsrchr(slb_log, L'\\')) wcscpy_s(slash + 1, MAX_PATH - static_cast<size_t>(slash + 1 - slb_log), L"sl_boundary.log");
             else slb_log[0] = 0;
+            na::nr::slconsumer::Start();
             na::slb::Start(slb_log);
             // Saved request for the game's own frame generation (default: the game's setting).
             na::slb::SetFgRequest({static_cast<na::slb::FgMode>(na::settings::Get().native_fg_mode.load()),

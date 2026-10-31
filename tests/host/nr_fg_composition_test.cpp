@@ -44,6 +44,7 @@ int Check(test::Device& d,UiComposition mode) {
         full[x]={.4f*a+(1-a)*2,.6f*a+(1-a)*3,.8f*a+(1-a)*4,.625f};
         expected_full[x]={.4f*a+(1-a)*6,.6f*a+(1-a)*7,.8f*a+(1-a)*8,.625f};
         expected_hud[x]={6,7,8,.375f};
+        if(mode==UiComposition::AdditiveResidual)for(uint32_t c=0;c<3;++c)expected_full[x][c]=enhanced[x][c]+full[x][c]-hud[x][c];
         if(mode==UiComposition::EqualPixels && x>0) {
             expected_full[x]=full[x]; expected_hud[x]=hud[x];
         }
@@ -119,7 +120,7 @@ int main() {
     test::Device d; if(!test::CreateDevice(d)) return test::SkipNoDevice("nr_fg_composition_test");
     REQUIRE(na::nr::PrepareFgComposition(d.device.Get()));
     test::ComPtr<ID3D12InfoQueue> info; d.device.As(&info);
-    for(auto mode:{UiComposition::EqualPixels,UiComposition::AlphaRed,UiComposition::UiAlpha}) if(int r=Check(d,mode)) return r;
+    for(auto mode:{UiComposition::EqualPixels,UiComposition::AlphaRed,UiComposition::UiAlpha,UiComposition::AdditiveResidual}) if(int r=Check(d,mode)) return r;
     if(info) for(UINT64 i=0;i<info->GetNumStoredMessages();++i) {
         SIZE_T size=0; info->GetMessage(i,nullptr,&size); std::vector<char> bytes(size);
         auto* m=reinterpret_cast<D3D12_MESSAGE*>(bytes.data()); info->GetMessage(i,m,&size);
