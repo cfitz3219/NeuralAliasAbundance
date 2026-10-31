@@ -229,6 +229,9 @@ std::atomic<uint64_t> g_menu_draw_marker{0};
 void write_menu_progress(HANDLE log);
 std::atomic<uint32_t> g_retargets{0}; // swap chain re-targets (A31)
 std::atomic<uint32_t> g_initialized{0};
+std::atomic<bool> g_core_started{false}, g_menu_enabled{false}, g_fail_menu_start{false},g_fail_menu_create{false};
+std::mutex g_start_m;
+bool g_menu_frame_ready=false; // g_state.mutex
 std::atomic<uint32_t> g_gamepad_hooked{0};
 std::atomic<bool> g_stopping{false};
 // Diagnostic counters plus per-chain ownership; no global routing switch.
@@ -266,6 +269,9 @@ using PfnGetRawInputData = UINT(WINAPI*)(HRAWINPUT, UINT, LPVOID, PUINT, UINT);
 using PfnGetRawInputBuffer = UINT(WINAPI*)(PRAWINPUT, PUINT, UINT);
 using PfnGetCursorPos = BOOL(WINAPI*)(LPPOINT);
 using PfnSetCursorPos = BOOL(WINAPI*)(int, int);
+using PfnSetCursor = HCURSOR(WINAPI*)(HCURSOR);
+PfnSetCursor g_orig_set_cursor=nullptr;
+HCURSOR g_menu_cursor=nullptr;
 using PfnGetAsyncKeyState = SHORT(WINAPI*)(int);
 using PfnGetKeyboardState = BOOL(WINAPI*)(PBYTE);
 using PfnGetKeyState = SHORT(WINAPI*)(int);
@@ -276,7 +282,7 @@ PfnSetCursorPos g_orig_set_cursor_pos = nullptr;
 PfnGetAsyncKeyState g_orig_get_async_key_state = nullptr;
 PfnGetKeyboardState g_orig_get_keyboard_state = nullptr;
 PfnGetKeyState g_orig_get_key_state = nullptr;
-void* g_input_hook_targets[7] = {};
+void* g_input_hook_targets[8] = {};
 thread_local bool t_overlay_input = false; // the overlay itself is reading input (menu drawing)
 std::atomic<uint32_t> g_input_hooks{0};
 std::atomic<DWORD> g_render_thread{0};
@@ -329,6 +335,10 @@ BOOL WINAPI DetourGetCursorPos(LPPOINT p)
         return TRUE;
     }
     return g_orig_get_cursor_pos(p);
+}
+HCURSOR WINAPI DetourSetCursor(HCURSOR cursor)
+{
+    return g_orig_set_cursor(lock_input_for_this_thread() && g_menu_cursor ? g_menu_cursor : cursor);
 }
 BOOL WINAPI DetourSetCursorPos(int x, int y)
 {
@@ -422,7 +432,7 @@ void install_input_hooks()
     install_dinput_hooks();
     HMODULE u = GetModuleHandleW(L"user32.dll");
     if (!u) return;
-    struct { const char* name; void* detour; void** original; } specs[7] = {
+    struct { const char* name; void* detour; void** original; } specs[8] = {
         {"GetRawInputData", reinterpret_cast<void*>(&DetourGetRawInputData), reinterpret_cast<void**>(&g_orig_get_raw_input_data)},
         {"GetRawInputBuffer", reinterpret_cast<void*>(&DetourGetRawInputBuffer), reinterpret_cast<void**>(&g_orig_get_raw_input_buffer)},
         {"GetCursorPos", reinterpret_cast<void*>(&DetourGetCursorPos), reinterpret_cast<void**>(&g_orig_get_cursor_pos)},
@@ -430,9 +440,11 @@ void install_input_hooks()
         {"GetAsyncKeyState", reinterpret_cast<void*>(&DetourGetAsyncKeyState), reinterpret_cast<void**>(&g_orig_get_async_key_state)},
         {"GetKeyboardState", reinterpret_cast<void*>(&DetourGetKeyboardState), reinterpret_cast<void**>(&g_orig_get_keyboard_state)},
         {"GetKeyState", reinterpret_cast<void*>(&DetourGetKeyState), reinterpret_cast<void**>(&g_orig_get_key_state)},
+        {"SetCursor", reinterpret_cast<void*>(&DetourSetCursor), reinterpret_cast<void**>(&g_orig_set_cursor)},
     };
     uint32_t n = 0;
-    for (int i = 0; i < 7; ++i) {
+    for (int i = 0; i < 8; ++i) {
+        if(g_input_hook_targets[i]){++n;continue;}
         void* target = reinterpret_cast<void*>(GetProcAddress(u, specs[i].name));
         if (target && install_input_function(target, specs[i].detour, specs[i].original)) {
             g_input_hook_targets[i] = target;
@@ -1078,6 +1090,7 @@ struct State {
     WNDPROC orig_wndproc = nullptr;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
     bool imgui_ready = false;
+    bool imgui_context_created=false;
     bool buffers_ready = false;
     bool was_open = false;
     LARGE_INTEGER last_present{};
@@ -1294,7 +1307,10 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g_frozen_x.store(frozen.x, std::memory_order_relaxed);
             g_frozen_y.store(frozen.y, std::memory_order_relaxed);
         }
-        while (ShowCursor(TRUE) < 0 && g_cursor_shows < 64) ++g_cursor_shows;
+        // Count every increment, including the one that makes it visible.
+        // The previous loop omitted that last increment and left Windows'
+        // cursor count one higher after each Home open/close cycle.
+        while(g_cursor_shows<64){++g_cursor_shows;if(ShowCursor(TRUE)>=0)break;}
         SetCursor(LoadCursorW(nullptr, IDC_ARROW));
         return 0;
     }
@@ -1562,6 +1578,26 @@ bool acquire_back_buffer_locked(IDXGISwapChain* sc, UINT idx, D3D12_CPU_DESCRIPT
     return true;
 }
 
+// Only called before any menu draw, or after all old draws retired. Core
+// device/queue ownership survives a failed menu allocation/backend startup.
+void discard_menu_init_locked()
+{
+    if(g_state.imgui_context_created){
+        auto& io=ImGui::GetIO();
+        if(io.BackendRendererUserData)ImGui_ImplDX12_Shutdown();
+        if(io.BackendPlatformUserData)ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();g_state.imgui_context_created=false;
+    }
+    if(g_state.hwnd && g_state.orig_wndproc)
+        SetWindowLongPtrW(g_state.hwnd,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(g_state.orig_wndproc));
+    g_state.orig_wndproc=nullptr;g_state.hwnd=nullptr;g_state.swapchain=nullptr;
+    g_state.imgui_ready=false;g_state.buffers_ready=false;
+    g_state.frames.clear();g_state.imgui_slot_fences.clear();g_state.list.Reset();
+    g_state.rtv_heap.Reset();g_state.srv_heap.Reset();
+    if(g_state.fence_event)CloseHandle(g_state.fence_event);
+    g_state.fence_event=nullptr;g_texture_queue.store(nullptr,std::memory_order_release);g_state.texture_queue.Reset();
+    g_initialized.store(0,std::memory_order_release);
+}
 bool ensure_init_locked(IDXGISwapChain* sc)
 {
     if (g_state.imgui_ready) {
@@ -1589,12 +1625,16 @@ bool ensure_init_locked(IDXGISwapChain* sc)
             info.SrvDescriptorHeap = g_state.srv_heap.Get();
             info.SrvDescriptorAllocFn = &SrvAlloc;
             info.SrvDescriptorFreeFn = &SrvFree;
-            if (!ImGui_ImplDX12_Init(&info) || !ImGui_ImplDX12_CreateDeviceObjects()) { g_state.imgui_ready = false; return false; }
+            if (!ImGui_ImplDX12_Init(&info) || !ImGui_ImplDX12_CreateDeviceObjects()) { discard_menu_init_locked(); return false; }
             g_state.imgui_draws = 0;
             g_state.imgui_slot_fences.assign(g_state.frames.size(), 0);
         }
         return true;
     }
+    struct MenuAttempt {
+        bool committed=false;
+        ~MenuAttempt(){if(!committed)discard_menu_init_locked();}
+    } attempt;
     if (FAILED(sc->GetDevice(IID_PPV_ARGS(&g_state.device)))) return false;
     na::gputime::SetDevice(g_state.device.Get());
     g_state.rtv_stride = g_state.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
@@ -1638,7 +1678,8 @@ bool ensure_init_locked(IDXGISwapChain* sc)
     QueryPerformanceFrequency(&g_state.qpc_freq);
 
     IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
+    ImGui::CreateContext();g_state.imgui_context_created=true;
+    if(g_fail_menu_create.exchange(false))return false;
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
     // Gameplay Space/Enter must not activate the last mouse-focused switch.
@@ -1649,7 +1690,7 @@ bool ensure_init_locked(IDXGISwapChain* sc)
     na::ui::SetBoldText(na::settings::Get().text_bold.load() != 0);
     na::ui::ApplyStyle();
     na::ui::LoadFonts();
-    ImGui_ImplWin32_Init(g_state.hwnd);
+    if(!ImGui_ImplWin32_Init(g_state.hwnd))return false;
     ImGui_ImplDX12_InitInfo info;
     info.Device = g_state.device.Get();
     // Texture uploads only. The actual menu draw stays on the game's queue,
@@ -1669,6 +1710,7 @@ bool ensure_init_locked(IDXGISwapChain* sc)
     // frames. Do not first initialize the renderer during the transition from
     // the presentation worker to an inline Home frame.
     if (!ImGui_ImplDX12_CreateDeviceObjects()) return false;
+    attempt.committed=true;
     g_state.imgui_ready = true;
     g_state.swapchain = sc;
     g_initialized.store(1, std::memory_order_release);
@@ -2165,7 +2207,16 @@ bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue,ComPtr<ID3D1
         g_state.last_present.QuadPart = 0;
         g_retargets.fetch_add(1, std::memory_order_relaxed);
     }
-    if (!ensure_init_locked(sc)) return false;
+    if(!g_state.device){
+        if(SUCCEEDED(sc->GetDevice(IID_PPV_ARGS(&g_state.device)))){
+            na::gputime::SetDevice(g_state.device.Get());
+            g_seen_device.store(g_state.device.Get(),std::memory_order_release);
+            if(seen_push(SeenKind::Device,g_state.device.Get()))g_device_announced.store(true,std::memory_order_release);
+        }
+    }
+    // ImGui allocation may fail or its buffers may still be retiring. Core
+    // frame work continues, but no draw may use a partially prepared menu.
+    g_menu_frame_ready=g_menu_enabled.load(std::memory_order_acquire) && ensure_init_locked(sc);
     // Frame timing (smoothed) for the footer readout.
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
@@ -2223,6 +2274,7 @@ bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue,ComPtr<ID3D1
 // Menu step (both paths): cursor show/restore messages, then the draw.
 void menu_step(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool open, ID3D12Resource* frame = nullptr)
 {
+    if (!g_menu_enabled.load(std::memory_order_acquire) || !g_state.imgui_ready || !g_menu_frame_ready) return;
     bool just_opened = open && !g_state.was_open;
     bool just_closed = !open && g_state.was_open;
     g_state.was_open = open;
@@ -2242,7 +2294,7 @@ void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue_hint = nullptr)
     if (!present_prelude(sc, queue,retained_queue,queue_hint)) return;
     na::j2::OnPresent(queue); // one game-frame boundary, never a TEST Present
     UINT idx = real_index(sc);
-    if (idx < g_state.backbuffer_count) {
+    { // frame processing uses the actual buffer, independently of menu allocation
         ComPtr<ID3D12Resource> bb; // A71: this frame only
         if (SUCCEEDED(real_get_buffer(sc, idx, IID_PPV_ARGS(&bb)))) process_frame(queue, bb.Get());
     }
@@ -2277,7 +2329,8 @@ HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_
     a.flags = flags;
     a.pp = pp;
     a.queue = queue;
-    a.hdr = na::color::IsHdr(na::color::Classify(g_state.format, static_cast<DXGI_COLOR_SPACE_TYPE>(g_color_space.load(std::memory_order_acquire)))); // A60
+    DXGI_SWAP_CHAIN_DESC picture_desc{}; sc->GetDesc(&picture_desc);
+    a.hdr = na::color::IsHdr(na::color::Classify(picture_desc.BufferDesc.Format, static_cast<DXGI_COLOR_SPACE_TYPE>(g_color_space.load(std::memory_order_acquire)))); // A60
     bool open = g_open.load(std::memory_order_acquire);
     a.menu_open = open || g_state.was_open; // closing frame still processes cursor restoration
     a.frame = &presenter_frame_cb;
@@ -2442,8 +2495,9 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT count, UI
         std::lock_guard<std::mutex> lock(g_state.mutex);
         if (g_state.swapchain == sc) release_buffers_locked();
     }
-    na::present::BeforeResize(sc); // A59: drains generated presents, drops proxies and cached real buffers
-    return g_orig_resize(sc, count, w, h, fmt, flags);
+    if(!na::present::BeforeResize(sc))return DXGI_ERROR_WAS_STILL_DRAWING;
+    const auto result=g_orig_resize(sc,count,w,h,fmt,flags);
+    na::present::AfterResize(sc,result);return result;
 }
 HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags,
                                                const UINT* node_masks, IUnknown* const* queues)
@@ -2454,8 +2508,9 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT count, 
         std::lock_guard<std::mutex> lock(g_state.mutex);
         if (g_state.swapchain == sc) release_buffers_locked();
     }
-    na::present::BeforeResize(sc);
+    if(!na::present::BeforeResize(sc))return DXGI_ERROR_WAS_STILL_DRAWING;
     const auto result=g_orig_resize1(sc, count, w, h, fmt, flags, node_masks, queues);
+    na::present::AfterResize(sc,result);
     if(SUCCEEDED(result) && queues){
         UINT actual=count;
         if(!actual){DXGI_SWAP_CHAIN_DESC1 desc{};if(SUCCEEDED(sc->GetDesc1(&desc)))actual=desc.BufferCount;}
@@ -2635,6 +2690,11 @@ void boundary_present(IDXGISwapChain* game_facing, IDXGISwapChain* base, ID3D12C
         if(g_boundary_policy.OwnsProxy(reinterpret_cast<uintptr_t>(game_facing)))
             g_boundary_policy.Select(reinterpret_cast<uintptr_t>(game_facing),reinterpret_cast<uintptr_t>(base));
     }
+    // No route-table lock is held while entering the presenter or COM.
+    // An acquired NeuralAlias buffer keeps its delivery until resize.
+    const bool proxy_external=na::present::NoteExternalOwner(game_facing);
+    const bool base_external=na::present::NoteExternalOwner(base);
+    if(!proxy_external || !base_external)return;
     // Only the game's creation/ResizeBuffers1 queue, never the base chain's
     // private DLSS-G queue. Keep the owned reference through submission.
     ComPtr<ID3D12CommandQueue> hint(queue);
@@ -2675,9 +2735,13 @@ void boundary_released(IDXGISwapChain* game_facing)
 {
     if(game_facing)on_chain_gone(game_facing);
 }
+void boundary_seen(IDXGISwapChain* proxy,IDXGISwapChain* base) {
+    na::present::NoteExternalOwner(proxy);na::present::NoteExternalOwner(base);
+}
 na::slb::OverlayHooks make_boundary_hooks()
 {
     na::slb::OverlayHooks h;
+    h.chain_seen=&boundary_seen;
     h.present = &boundary_present;
     h.before_resize = &boundary_before_resize;
     h.released = &boundary_released;
@@ -2686,8 +2750,11 @@ na::slb::OverlayHooks make_boundary_hooks()
 const na::slb::OverlayHooks g_boundary_hooks = make_boundary_hooks();
 } // namespace
 
-bool Start(const char* route_tag, PanelFn controls)
+bool StartCore(const char* route_tag, PanelFn controls)
 {
+    std::lock_guard<std::mutex> start_lock(g_start_m);
+    if(g_core_started.load(std::memory_order_acquire))return true;
+    QueryPerformanceFrequency(&g_state.qpc_freq);
     // Start is called with a bootstrap-local buffer; own the overlay label.
     snprintf(g_route_tag, sizeof(g_route_tag), "%s", route_tag ? route_tag : "");
     g_controls = controls;
@@ -2854,6 +2921,21 @@ bool Start(const char* route_tag, PanelFn controls)
     DestroyWindow(hwnd);
     g_state.dummy_swapchain_identity = nullptr;
 
+    if (ok) {
+        ok=na::hooking::variants::StartDiscoveryThread(&seen_drain, nullptr);
+        if(ok)na::slb::SetOverlayHooks(&g_boundary_hooks);
+    }
+    g_core_started.store(ok,std::memory_order_release);
+    return ok;
+}
+
+bool StartMenu()
+{
+    std::lock_guard<std::mutex> start_lock(g_start_m);
+    if(!g_core_started.load(std::memory_order_acquire))return false;
+    if(g_menu_enabled.load(std::memory_order_acquire))return true;
+    if(g_fail_menu_start.exchange(false))return false;
+    g_menu_cursor=LoadCursorW(nullptr,IDC_ARROW);
     // Controller: hook whichever XInput modules the game already loaded.
     const wchar_t* mods[3] = {L"xinput1_4.dll", L"xinput1_3.dll", L"xinput9_1_0.dll"};
     void* detours[3] = {reinterpret_cast<void*>(&XInputDetour0),
@@ -2872,10 +2954,16 @@ bool Start(const char* route_tag, PanelFn controls)
     }
     g_gamepad_hooked.store(hooked);
     install_input_hooks(); // A44: the game sees no mouse/keyboard while the menu is open
-    if (!na::hooking::variants::StartDiscoveryThread(&seen_drain, nullptr)) return false; // A49: propagated
-    if (ok) na::slb::SetOverlayHooks(&g_boundary_hooks); // prefer the qualified game-facing frame before native FG
-    return ok;
+    const bool ready=g_input_hooks.load(std::memory_order_acquire)==8;
+    g_menu_enabled.store(ready,std::memory_order_release);
+    return ready;
 }
+bool Start(const char* route_tag, PanelFn controls)
+{
+    return StartCore(route_tag,controls) && StartMenu();
+}
+void FailNextMenuStartForTests(){g_fail_menu_start.store(true);}
+void FailNextMenuCreateForTests(){g_fail_menu_create.store(true);}
 
 bool SubscribeExecute(ExecuteBeginFn begin, ExecuteEndFn end, void* user)
 {
@@ -2969,7 +3057,8 @@ bool Stop()
         if (g_state.hwnd && g_state.orig_wndproc)
             SetWindowLongPtrW(g_state.hwnd, GWLP_WNDPROC,
                               reinterpret_cast<LONG_PTR>(g_state.orig_wndproc));
-        g_state.imgui_ready = false;
+        g_state.imgui_ready = false;g_state.imgui_context_created=false;
+        g_state.orig_wndproc=nullptr;
     }
     g_state.frames.clear();
     g_state.list.Reset();
@@ -2979,6 +3068,7 @@ bool Stop()
     g_state.fence_event = nullptr;
     g_texture_queue.store(nullptr, std::memory_order_release);
     g_state.texture_queue.Reset();
+    g_seen_device.store(nullptr,std::memory_order_release);
     g_state.device.Reset();
     g_state.swapchain = nullptr;
     g_state.buffers_ready = false;
@@ -2986,6 +3076,8 @@ bool Stop()
     g_menu_xinput.store(nullptr,std::memory_order_release);
     g_pad_retry_after=0;
     g_initialized.store(0, std::memory_order_release);
+    g_menu_enabled.store(false,std::memory_order_release);
+    g_core_started.store(false,std::memory_order_release);
     g_stopping.store(false, std::memory_order_release); // a later Start may run again
     return true;
 }
@@ -2996,6 +3088,7 @@ Stats GetStats()
     s.frames_rendered = g_frames.load();
     s.presents_seen = g_presents.load();
     s.initialized = g_initialized.load();
+    s.core_ready=g_core_started.load();s.menu_enabled=g_menu_enabled.load();
     s.open = g_open.load() ? 1u : 0u;
     s.have_queue = g_direct_queue.load() ? 1u : 0u;
     s.gamepad_hooked = g_gamepad_hooked.load();
@@ -3062,6 +3155,7 @@ void DrawMenuForTests(ID3D12CommandQueue* queue,ID3D12Resource* frame) {
 
 int SwapChainColorSpace() { return g_color_space.load(std::memory_order_acquire); }
 void BoundaryPresentForTests(IDXGISwapChain* proxy,IDXGISwapChain* base,ID3D12CommandQueue* queue){boundary_present(proxy,base,queue);}
+void BoundarySeenForTests(IDXGISwapChain* proxy,IDXGISwapChain* base){boundary_seen(proxy,base);}
 void BoundaryResizeForTests(IDXGISwapChain* proxy){boundary_before_resize(proxy);}
 void BoundaryReleaseForTests(IDXGISwapChain* proxy){boundary_released(proxy);}
 long ReadNativeBufferForTests(IDXGISwapChain* chain, unsigned index, REFIID iid, void** out){return real_get_buffer(chain,index,iid,out);}

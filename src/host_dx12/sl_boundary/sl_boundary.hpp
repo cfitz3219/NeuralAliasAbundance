@@ -174,6 +174,8 @@ bool SetCallbacks(const Callbacks& callbacks);
 //    proxy, so retained back-buffer references can be dropped first.
 //  - released: after the proxy's final Release (pointer identity only).
 struct OverlayHooks {
+    // Creation observation before the game can call GetBuffer. No SL locks.
+    void (*chain_seen)(IDXGISwapChain*,IDXGISwapChain*) = nullptr;
     void (*present)(IDXGISwapChain* game_facing, IDXGISwapChain* base, ID3D12CommandQueue* queue) = nullptr;
     void (*before_resize)(IDXGISwapChain* game_facing) = nullptr;
     void (*released)(IDXGISwapChain* game_facing) = nullptr;
@@ -248,6 +250,7 @@ FgState GetFgState();
 // ---- test seams (no game, no sl.interposer) ----
 // Runs the same installation against `module` as if it were sl.interposer.dll
 // (RTTI search, tag export hooks). Returns true if anything was hooked.
+void FailNextAttachAcquireForTests();
 bool InstallForModuleForTests(void* module);
 void ResetCountersForTests();
 

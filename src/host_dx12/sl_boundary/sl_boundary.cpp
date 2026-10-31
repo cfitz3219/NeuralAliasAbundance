@@ -99,10 +99,16 @@ void lookup_fg_functions_once(); // defined with the DLSS-G control below
 
 // The hooking core allows one install transaction per process at a time, and
 // other modules (NGX, upscalers) install from their own threads: wait briefly.
-std::mutex g_install_m;
+std::mutex g_install_m, g_attach_m;
+std::atomic<bool> g_retry_needed{false},g_fail_acquire{false};
+bool g_exports_done=false,g_fallback_done=false,g_hooking_initialized=false;
+std::atomic<bool> g_attach_terminal{false};
+HMODULE g_attach_module=nullptr;
 bool begin_install_retry()
 {
-    return na::hooking::BeginInstallWait("Streamline boundary");
+    const bool ok=!g_fail_acquire.exchange(false) && na::hooking::BeginInstallWait("Streamline boundary");
+    if(!ok)g_retry_needed.store(true,std::memory_order_release);
+    return ok;
 }
 
 using PfnNewFrame=SlResult(__cdecl*)(void**,const uint32_t*);
@@ -187,11 +193,15 @@ Microsoft::WRL::ComPtr<ID3D12CommandQueue> canonical_queue(IUnknown* object){
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
     if(object)object->QueryInterface(IID_PPV_ARGS(&queue));return queue;
 }
+void notify_chain_seen(IDXGISwapChain* chain);
 void bind_game_queue(IDXGISwapChain* chain,IUnknown* object){
     auto queue=canonical_queue(object);if(!chain || !queue)return;
-    std::lock_guard<std::mutex> lock(g_m);
-    for(auto& b:g_game_queues)if(b.proxy==chain){b.queues.Created(queue.Get());return;}
-    for(auto& b:g_game_queues)if(!b.proxy){b.proxy=chain;b.queues.Created(queue.Get());return;}
+    {std::lock_guard<std::mutex> lock(g_m);
+        GameQueueBinding* entry=nullptr;
+        for(auto& binding:g_game_queues)if(binding.proxy==chain){entry=&binding;break;}
+        if(!entry)for(auto& binding:g_game_queues)if(!binding.proxy){entry=&binding;break;}
+        if(entry){entry->proxy=chain;entry->queues.Created(queue.Get());}}
+    notify_chain_seen(chain);
 }
 
 
@@ -508,6 +518,13 @@ void note_present_result(IDXGISwapChain* sc, HRESULT hr)
 
 std::atomic<const OverlayHooks*> g_overlay_hooks{nullptr};
 
+void notify_chain_seen(IDXGISwapChain* chain){
+    Microsoft::WRL::ComPtr<IUnknown> base;
+    if(chain && SUCCEEDED(chain->QueryInterface(kSlRetrieveBaseIid,&base)))
+        if(const auto* hook=g_overlay_hooks.load(std::memory_order_acquire);hook && hook->chain_seen)
+            hook->chain_seen(chain,reinterpret_cast<IDXGISwapChain*>(base.Get()));
+}
+
 template <class Forward>
 HRESULT present_call(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* pp, bool present1, Forward forward)
 {
@@ -618,8 +635,10 @@ ULONG STDMETHODCALLTYPE DetourRelease(IUnknown* obj)
 // Installs the four proxy hooks from the proxy class's vtable. Worker threads only.
 bool install_proxy_vtable(void* const* vtable, Discovery how)
 {
-    if (!vtable || g_present_hooks.load(std::memory_order_acquire)) return false;
+    if (!vtable) return false;
     std::lock_guard<std::mutex> install_lock(g_install_m);
+    if(g_present_hooks.load(std::memory_order_acquire))return true;
+    if(g_attach_terminal.load())return false;
     if (!begin_install_retry()) return false;
     bool ok = na::hooking::PrepareHook(vtable[kSlotPresent], reinterpret_cast<void*>(&DetourPresent),
                                        reinterpret_cast<void**>(&g_orig_present)) &&
@@ -633,10 +652,12 @@ bool install_proxy_vtable(void* const* vtable, Discovery how)
                                        reinterpret_cast<void**>(&g_orig_release));
     if (!ok) {
         na::hooking::AbandonInstall();
+        g_attach_terminal=true;
         set_reason("Could not prepare the Streamline swap-chain hooks.");
         return false;
     }
     if (!na::hooking::CommitInstall()) {
+        g_attach_terminal=true;
         set_reason("Could not enable the Streamline swap-chain hooks.");
         return false;
     }
@@ -897,7 +918,11 @@ struct DeferredVtable { void* const* vtable; Discovery how; };
 DWORD WINAPI deferred_proxy_install(LPVOID p)
 {
     auto* d = static_cast<DeferredVtable*>(p);
-    install_proxy_vtable(d->vtable, d->how);
+    for(unsigned attempt=0;attempt<3;++attempt){
+        if(install_proxy_vtable(d->vtable,d->how) || g_attach_terminal.load() || g_present_hooks.load())break;
+        if(attempt<2)Sleep(50);
+    }
+    if(!g_present_hooks.load() && !g_attach_terminal.load())g_proxy_install_requested.store(false);
     delete d;
     return 0;
 }
@@ -909,7 +934,9 @@ void request_proxy_install(void* object, Discovery how)
     if (!in_module(vt[kSlotPresent])) return;
     if (g_proxy_install_requested.exchange(true, std::memory_order_acq_rel)) return;
     // Never install inside a detour: hand the vtable to a short-lived thread.
-    if (HANDLE t = CreateThread(nullptr, 0, &deferred_proxy_install, new DeferredVtable{vt, how}, 0, nullptr)) CloseHandle(t);
+    auto* job=new DeferredVtable{vt,how};
+    if(HANDLE t=CreateThread(nullptr,0,&deferred_proxy_install,job,0,nullptr))CloseHandle(t);
+    else{delete job;g_proxy_install_requested.store(false);}
 }
 
 void inspect_swapchain(IUnknown* obj, Discovery how)
@@ -953,12 +980,17 @@ DWORD WINAPI deferred_factory_install(LPVOID p)
 {
     void* const* vt = static_cast<void* const*>(p);
     std::lock_guard<std::mutex> install_lock(g_install_m);
-    if (!begin_install_retry()) return 0;
-    na::hooking::PrepareHook(vt[kSlotCreateSwapChain], reinterpret_cast<void*>(&DetourFactoryCreate), reinterpret_cast<void**>(&g_orig_fc));
-    na::hooking::PrepareHook(vt[kSlotCreateSwapChainForHwnd], reinterpret_cast<void*>(&DetourFactoryCreateHwnd), reinterpret_cast<void**>(&g_orig_fc_hwnd));
-    na::hooking::PrepareHook(vt[kSlotCreateSwapChainForCoreWindow], reinterpret_cast<void*>(&DetourFactoryCreateCore), reinterpret_cast<void**>(&g_orig_fc_core));
-    na::hooking::PrepareHook(vt[kSlotCreateSwapChainForComposition], reinterpret_cast<void*>(&DetourFactoryCreateComp), reinterpret_cast<void**>(&g_orig_fc_comp));
-    na::hooking::CommitInstall();
+    bool acquired=false;
+    for(unsigned attempt=0;attempt<3 && !acquired;++attempt){
+        acquired=begin_install_retry();if(!acquired && attempt<2)Sleep(50);
+    }
+    if(!acquired){g_factory_install_requested.store(false);return 0;}
+    bool prepared=na::hooking::PrepareHook(vt[kSlotCreateSwapChain], reinterpret_cast<void*>(&DetourFactoryCreate), reinterpret_cast<void**>(&g_orig_fc));
+    prepared=na::hooking::PrepareHook(vt[kSlotCreateSwapChainForHwnd], reinterpret_cast<void*>(&DetourFactoryCreateHwnd), reinterpret_cast<void**>(&g_orig_fc_hwnd)) && prepared;
+    prepared=na::hooking::PrepareHook(vt[kSlotCreateSwapChainForCoreWindow], reinterpret_cast<void*>(&DetourFactoryCreateCore), reinterpret_cast<void**>(&g_orig_fc_core)) && prepared;
+    prepared=na::hooking::PrepareHook(vt[kSlotCreateSwapChainForComposition], reinterpret_cast<void*>(&DetourFactoryCreateComp), reinterpret_cast<void**>(&g_orig_fc_comp)) && prepared;
+    if(!prepared){na::hooking::AbandonInstall();g_attach_terminal=true;return 0;}
+    if(!na::hooking::CommitInstall())g_attach_terminal=true;
     return 0;
 }
 
@@ -973,6 +1005,7 @@ void inspect_object(void* obj, Discovery how)
         void* const* vt = *static_cast<void* const* const*>(raw);
         if (in_module(vt[kSlotCreateSwapChain]) && !g_factory_install_requested.exchange(true, std::memory_order_acq_rel))
             if (HANDLE t = CreateThread(nullptr, 0, &deferred_factory_install, const_cast<void**>(vt), 0, nullptr)) CloseHandle(t);
+            else g_factory_install_requested.store(false);
     }
 }
 
@@ -1029,7 +1062,10 @@ bool read_module_file_version(HMODULE m, uint16_t out[4])
 
 bool install_for_module(HMODULE m)
 {
-    if (!m || g_module_seen.exchange(1, std::memory_order_acq_rel)) return false;
+    std::lock_guard<std::mutex> attach_lock(g_attach_m);
+    if (!m || g_attach_terminal || (g_attach_module && g_attach_module!=m)) return false;
+    g_attach_module=m;g_module_seen.store(1,std::memory_order_release);
+    g_retry_needed.store(false,std::memory_order_release);
     {
         const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(m);
         const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(reinterpret_cast<const uint8_t*>(m) + dos->e_lfanew);
@@ -1043,11 +1079,12 @@ bool install_for_module(HMODULE m)
             memcpy(g_fg.sl_version, version, sizeof(version));
         }
     }
-    if (!na::hooking::Initialize()) {
+    if (!g_hooking_initialized && !na::hooking::Initialize()) {
         set_reason("Hooking core failed to initialise.");
         return false;
     }
-    bool any = false;
+    g_hooking_initialized=true;
+    bool any = g_tag_hooks.load()!=0 || g_present_hooks.load()!=0;
     // Tag exports.
     g_new_frame=reinterpret_cast<PfnNewFrame>(GetProcAddress(m,"slGetNewFrameToken"));
     auto* tag_frame = reinterpret_cast<void*>(GetProcAddress(m, "slSetTagForFrame"));
@@ -1055,21 +1092,22 @@ bool install_for_module(HMODULE m)
     auto* gff = reinterpret_cast<void*>(GetProcAddress(m, "slGetFeatureFunction"));
     auto* constants = reinterpret_cast<void*>(GetProcAddress(m, "slSetConstants"));
     std::unique_lock<std::mutex> install_lock(g_install_m);
-    if (begin_install_retry()) {
-        uint32_t n = 0;
-        if (gff && na::hooking::PrepareHook(gff, reinterpret_cast<void*>(&DetourGetFeatureFunction),
-                                            reinterpret_cast<void**>(&g_orig_gff)))
-            g_gff_export = gff;
+    if (!g_exports_done && begin_install_retry()) {
+        uint32_t n = 0;bool prepared=true;
+        if(gff)prepared=na::hooking::PrepareHook(gff,reinterpret_cast<void*>(&DetourGetFeatureFunction),reinterpret_cast<void**>(&g_orig_gff)) && prepared;
         if (tag_frame && na::hooking::PrepareHook(tag_frame, reinterpret_cast<void*>(&DetourSetTagForFrame),
                                                   reinterpret_cast<void**>(&g_orig_tag_frame))) ++n;
+        else if(tag_frame)prepared=false;
         if (tag && na::hooking::PrepareHook(tag, reinterpret_cast<void*>(&DetourSetTag), reinterpret_cast<void**>(&g_orig_tag))) ++n;
-        if (constants)
-            na::hooking::PrepareHook(constants, reinterpret_cast<void*>(&DetourSetConstants), reinterpret_cast<void**>(&g_orig_constants));
+        else if(tag)prepared=false;
+        if (constants) prepared=na::hooking::PrepareHook(constants,reinterpret_cast<void*>(&DetourSetConstants),reinterpret_cast<void**>(&g_orig_constants)) && prepared;
+        if(!prepared){na::hooking::AbandonInstall();g_attach_terminal=true;return any;}
         if (na::hooking::CommitInstall()) {
+            g_exports_done=true;g_gff_export=gff;
             g_tag_hooks.store(n, std::memory_order_release);
             any = n != 0 || g_gff_export != nullptr;
         } else {
-            g_gff_export = nullptr;
+            g_attach_terminal=true;return any; // originals/dead targets remain owned by the hook core
         }
     }
     install_lock.unlock(); // install_proxy_vtable takes it again
@@ -1087,20 +1125,24 @@ bool install_for_module(HMODULE m)
     }
     {
         install_lock.lock();
+        if(g_fallback_done)return any;
         if (!begin_install_retry()) {
-            set_reason("Could not install the Streamline fallback hooks.");
+            set_reason("Streamline fallback attachment will retry after install contention.");
             return any;
         }
+        bool prepared=true;
         // Fallback: inspect what Streamline hands out.
         auto* up = reinterpret_cast<void*>(GetProcAddress(m, "slUpgradeInterface"));
         auto* cf = reinterpret_cast<void*>(GetProcAddress(m, "CreateDXGIFactory"));
         auto* cf1 = reinterpret_cast<void*>(GetProcAddress(m, "CreateDXGIFactory1"));
         auto* cf2 = reinterpret_cast<void*>(GetProcAddress(m, "CreateDXGIFactory2"));
-        if (up) na::hooking::PrepareHook(up, reinterpret_cast<void*>(&DetourUpgradeInterface), reinterpret_cast<void**>(&g_orig_upgrade));
-        if (cf) na::hooking::PrepareHook(cf, reinterpret_cast<void*>(&DetourCreateFactory), reinterpret_cast<void**>(&g_orig_cf));
-        if (cf1) na::hooking::PrepareHook(cf1, reinterpret_cast<void*>(&DetourCreateFactory1), reinterpret_cast<void**>(&g_orig_cf1));
-        if (cf2) na::hooking::PrepareHook(cf2, reinterpret_cast<void*>(&DetourCreateFactory2), reinterpret_cast<void**>(&g_orig_cf2));
-        na::hooking::CommitInstall();
+        if (up) prepared=na::hooking::PrepareHook(up, reinterpret_cast<void*>(&DetourUpgradeInterface), reinterpret_cast<void**>(&g_orig_upgrade)) && prepared;
+        if (cf) prepared=na::hooking::PrepareHook(cf, reinterpret_cast<void*>(&DetourCreateFactory), reinterpret_cast<void**>(&g_orig_cf)) && prepared;
+        if (cf1) prepared=na::hooking::PrepareHook(cf1, reinterpret_cast<void*>(&DetourCreateFactory1), reinterpret_cast<void**>(&g_orig_cf1)) && prepared;
+        if (cf2) prepared=na::hooking::PrepareHook(cf2, reinterpret_cast<void*>(&DetourCreateFactory2), reinterpret_cast<void**>(&g_orig_cf2)) && prepared;
+        if(!prepared){na::hooking::AbandonInstall();g_attach_terminal=true;return any;}
+        if(!na::hooking::CommitInstall()){g_attach_terminal=true;return any;}
+        g_fallback_done=true;
         if(!g_present_hooks.load())set_reason("No RTTI for Streamline's swap chain; waiting for slUpgradeInterface or a factory.");
     }
     if (!g_present_hooks.load(std::memory_order_acquire) && g_tag_hooks.load(std::memory_order_acquire) == 0)
@@ -1108,7 +1150,16 @@ bool install_for_module(HMODULE m)
     return any;
 }
 
-void install_cb(HMODULE m) { install_for_module(m); }
+void install_cb(HMODULE m) {
+    // Module-watch/init workers only. Completed batches are never republished;
+    // preparation/commit failures are terminal, unlike transaction contention.
+    for(unsigned attempt=0;attempt<3;++attempt){
+        install_for_module(m);
+        if(g_attach_terminal.load() || !g_retry_needed.load(std::memory_order_acquire))return;
+        if(attempt<2)Sleep(50);
+    }
+    set_reason("Streamline attachment exhausted its bounded install retries; completed hooks remain active.");
+}
 
 // One evidence file next to the user ini, written 30 s and 120 s after start:
 // the status line plus every distinct tag shape. No file I/O in game callbacks.
@@ -1216,7 +1267,7 @@ bool Start(const wchar_t* log_path)
     // queuing it to another worker loses the pre-DLSS-G creation queue.
     for(const wchar_t* const* name=kModuleNames;*name;++name){
         HMODULE module=nullptr;
-        if(GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN,*name,&module))install_for_module(module);
+        if(GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN,*name,&module))install_cb(module);
     }
     return na::upscalers::AddModuleWatch(kModuleNames, &install_cb);
 }
@@ -1309,6 +1360,7 @@ FgState GetFgState()
     return out;
 }
 
+void FailNextAttachAcquireForTests(){g_fail_acquire.store(true);}
 bool InstallForModuleForTests(void* module) { return install_for_module(static_cast<HMODULE>(module)); }
 
 void ResetCountersForTests()

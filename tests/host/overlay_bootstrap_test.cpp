@@ -7,7 +7,13 @@
 #include "host_dx12/settings.hpp"
 #include <filesystem>
 
-int main(int argc,char**) {
+namespace {std::atomic<unsigned> submits{0},devices{0};
+void submitted(na::overlay::ExecuteContext*){submits.fetch_add(1);}
+void device_seen(ID3D12Device*,void*){devices.fetch_add(1);}}
+int main(int argc,char** argv) {
+    const bool menu_failure=argc>1 && !strcmp(argv[1],"--menu-failure");
+    const bool create_failure=argc>1 && !strcmp(argv[1],"--menu-create-failure");
+    const bool recovery=argc>1 && !strcmp(argv[1],"--recovery");
     SetEnvironmentVariableW(L"NEURALALIAS_TEST_WARP",L"1");
     wchar_t exe[MAX_PATH]{};GetModuleFileNameW(nullptr,exe,MAX_PATH);
     const auto dir=std::filesystem::path(exe).parent_path();
@@ -26,12 +32,13 @@ int main(int argc,char**) {
     set(L"unreal",L"probe",L"0");set(L"unreal",L"screen_percentage",L"0");
     set(L"settings",L"scope",scope.c_str());set(L"present",L"proxy",L"0");
     set(L"dlss",L"enabled",L"0");
-    if(argc>1){
+    if(recovery){
         na::settings::SetIniPath(ini.c_str());na::settings::Load();
         const auto marker=std::wstring(na::settings::UserIniPath())+L".session";
         HANDLE f=CreateFileW(marker.c_str(),GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
         REQUIRE(f!=INVALID_HANDLE_VALUE);CloseHandle(f);
     }
+    if(menu_failure)na::overlay::FailNextMenuStartForTests();
     REQUIRE(na::host::StartFromIni(GetModuleHandleW(nullptr),name.c_str(),"BOOT TEST"));
     // Same ordering as our DXGI proxy's exported CreateDXGIFactory entry.
     na::host::WaitForObserveInstall();
@@ -54,13 +61,31 @@ int main(int argc,char**) {
     test::ComPtr<ID3D12CommandQueue> observed;
     observed.Attach(na::overlay::AcquirePresentQueue(chain.Get()));
     CHECK(observed.Get()==d.queue.Get());
+    for(unsigned i=0;i<400 && !na::host::GetStatus().init_complete;++i)Sleep(5);
+    REQUIRE(na::host::GetStatus().init_complete==1);
+    if(create_failure)na::overlay::FailNextMenuCreateForTests();
     REQUIRE(SUCCEEDED(chain->Present(0,0)));d.WaitIdle();
+    if(menu_failure || create_failure){
+        CHECK(na::overlay::GetStats().core_ready==1);
+        CHECK(na::overlay::GetStats().menu_enabled==(create_failure?1u:0u) && na::overlay::GetStats().initialized==0);
+        REQUIRE(na::overlay::SubscribeExecute(nullptr,&submitted,nullptr));
+        REQUIRE(na::overlay::SubscribeDiscovery(&device_seen,nullptr,nullptr,nullptr));
+        test::List work;REQUIRE(work.Create(d.device.Get()));REQUIRE(SUCCEEDED(work.list->Close()));
+        ID3D12CommandList* lists[]={work.list.Get()};d.queue->ExecuteCommandLists(1,lists);d.WaitIdle();
+        CHECK(submits.load()==1);
+        for(unsigned i=0;i<100 && !devices.load();++i)Sleep(5);
+        CHECK(devices.load()>0);
+        CHECK(na::host::GetStatus().route_a_started==1);
+        REQUIRE(na::overlay::UnsubscribeExecute());na::overlay::UnsubscribeDiscovery();
+        REQUIRE(na::overlay::StartMenu()); // retry input setup, leaving core hooks untouched
+        REQUIRE(SUCCEEDED(chain->Present(0,0)));d.WaitIdle();
+    }
     CHECK(na::overlay::GetStats().initialized==1);
     SendMessageW(window,WM_KEYDOWN,VK_HOME,1);
     REQUIRE(SUCCEEDED(chain->Present(0,0)));d.WaitIdle();
     CHECK(na::overlay::GetStats().open && na::overlay::GetStats().frames_rendered>0);
     CHECK(na::host::GetStatus().host_started==1);
-    CHECK(na::settings::SafeStart()==(argc>1));
+    CHECK(na::settings::SafeStart()==recovery);
     CHECK(d.device->GetDeviceRemovedReason()==S_OK);
     REQUIRE(na::overlay::Stop());chain.Reset();DestroyWindow(window);
     DeleteFileW(ini.c_str());

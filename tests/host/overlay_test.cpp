@@ -221,6 +221,7 @@ int main(int argc, char** argv)
     for (int i = 0; i < 3; ++i) frame();
     CHECK(na::overlay::GetStats().frames_rendered == closed_rendered); // draws nothing while closed
 
+    const int cursor_count_before=ShowCursor(TRUE);ShowCursor(FALSE);
     // Home opens the menu (first press, not auto-repeat).
     SendMessageW(hwnd, WM_KEYDOWN, VK_HOME, 1);
     for (int i = 0; i < 4; ++i) frame();
@@ -228,6 +229,9 @@ int main(int argc, char** argv)
     CHECK(s.open == 1);
     CHECK(s.frames_rendered > closed_rendered);
 
+    HCURSOR waiting=LoadCursorW(nullptr,IDC_WAIT),arrow=LoadCursorW(nullptr,IDC_ARROW);
+    REQUIRE(waiting && arrow);SetCursor(waiting);CHECK(GetCursor()==arrow);
+    CHECK(na::overlay::GetStats().input_hooks==8);
     if(late_queue){
         CHECK(d.device->GetDeviceRemovedReason()==S_OK);
         CHECK(na::overlay::GetStats().present_queue==reinterpret_cast<uintptr_t>(d.queue.Get()));
@@ -295,6 +299,9 @@ int main(int argc, char** argv)
     SendMessageW(hwnd, WM_KEYDOWN, VK_HOME, 1);
     frame();
     CHECK(na::overlay::GetStats().open == 0);
+    SetCursor(waiting);CHECK(GetCursor()==waiting);SetCursor(arrow);
+    const int cursor_count_after=ShowCursor(TRUE);ShowCursor(FALSE);
+    CHECK(cursor_count_after==cursor_count_before);
     SendMessageW(hwnd, WM_KEYDOWN, 'W', 1);
     CHECK(g_game_keys.load() == keys_before + 1);
 

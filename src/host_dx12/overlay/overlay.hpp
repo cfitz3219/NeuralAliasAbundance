@@ -43,7 +43,11 @@ using PanelFn = void (*)();
 // "Â· ROUTE B") is shown only on the Details page. `controls`, when not null,
 // is a legacy full-body PanelFn drawn instead of the pages (kept for
 // compatibility; both routes now pass nullptr).
-bool Start(const char* route_tag, PanelFn controls);
+bool StartCore(const char* route_tag, PanelFn controls);
+bool StartMenu(); // input/menu readiness; core remains attached on failure
+bool Start(const char* route_tag, PanelFn controls); // compatibility: both
+void FailNextMenuStartForTests();
+void FailNextMenuCreateForTests();
 // A51: returns false, with SeamStats.stop_incomplete set and NOTHING torn
 // down, when an Execute callback or the discovery worker/producers could not
 // be proven quiescent within the timeout; call again later. true = fully stopped.
@@ -58,13 +62,14 @@ struct Stats {
     uint64_t frames_rendered;
     uint64_t presents_seen;
     uint32_t initialized;
+    uint32_t core_ready, menu_enabled;
     uint32_t open;
     uint32_t have_queue;
     uint32_t gamepad_hooked;    // number of XInput modules hooked
     float fps;                  // smoothed, from Present cadence
     float frame_ms;             // smoothed CPU frame interval
     float mouse_x, mouse_y;     // menu cursor (client px) last applied
-    uint32_t input_hooks;       // A44: user32 input entry points hooked (6 when complete)
+    uint32_t input_hooks;       // A44: user32 input entry points hooked (8 when complete)
     uint32_t retargets;         // A31: swap chain re-targets after 2 s of silence
     uint32_t chain_gone;        // A71: chains observed destroyed at the game's final Release (immediate re-target)
     uintptr_t present_queue;   // queue selected for the current DXGI buffer

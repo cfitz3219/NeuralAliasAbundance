@@ -140,6 +140,11 @@ DWORD WINAPI InitThread(LPVOID)
     na::ngx::SetDetailLogging(GetPrivateProfileIntW(L"observe", L"detail", 0, ini) == 1);
     // GPU timestamps around the DLSS evaluate ([observe] gpu_timing=0 to disable).
     na::gputime::SetEnabled(GetPrivateProfileIntW(L"observe", L"gpu_timing", 1, ini) == 1);
+    na::overlay::RegisterRouteAMenu();
+    wchar_t status_path[MAX_PATH];
+    wsprintfW(status_path,L"%s\\NeuralAliasSL-status.log",dir);
+    na::overlay::SetStatusLogPath(status_path);
+    na::overlay::StartCore("ROUTE A",nullptr);
     // In-game menu (Home). [overlay] enabled=0 disables it; scale= and
     // font_body=/font_title= tune size and typeface without a rebuild.
     if (GetPrivateProfileIntW(L"overlay", L"enabled", 1, ini) == 1) {
@@ -152,11 +157,7 @@ DWORD WINAPI InitThread(LPVOID)
         GetPrivateProfileStringA("overlay", "font_body", "", body, sizeof(body), ini_a);
         GetPrivateProfileStringA("overlay", "font_title", "", title, sizeof(title), ini_a);
         na::ui::SetFontPaths(body, title);
-        na::overlay::RegisterRouteAMenu();
-        wchar_t status_path[MAX_PATH];
-        wsprintfW(status_path, L"%s\\NeuralAliasSL-status.log", dir);
-        na::overlay::SetStatusLogPath(status_path); // A55: measurements recorded every 5 s
-        na::overlay::Start("ROUTE A", nullptr); // A30: the host draws the pages
+        na::overlay::StartMenu();
     }
     wchar_t log_path[MAX_PATH];
     wchar_t configured[MAX_PATH] = {};

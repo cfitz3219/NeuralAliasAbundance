@@ -24,6 +24,7 @@
 //      out-of-range or unsupported requests.
 #include "test_support.hpp"
 #include "host_dx12/sl_boundary/sl_boundary.hpp"
+#include "host_dx12/hooking/vtable_hook.hpp"
 #include "host_dx12/sl_boundary/sl_tags.hpp"
 #include "host_dx12/sl_proxy/sl_abi.hpp"
 
@@ -330,7 +331,7 @@ DWORD WINAPI detach_thread(LPVOID)
 extern "C" __declspec(dllexport) int32_t slGetNewFrameToken(void** out,const uint32_t* index){
     static FakeFrameToken token(0);token.v=*index;*out=&token;return 0;
 }
-int main()
+int main(int argc,char**)
 {
     // Instantiating the proxies emits their vtable/RTTI into this image.
     FakeBase base;
@@ -339,6 +340,17 @@ int main()
     sl::interposer::DXGISwapChain proxy2;
     proxy2.base = &base;
 
+    if(argc>1){
+        na::hooking::FailNextCommitEnableForTest(1);
+        CHECK(!na::slb::InstallForModuleForTests(GetModuleHandleW(nullptr)));
+        const auto dead=na::hooking::DeadHookCount();CHECK(dead>0);
+        CHECK(!na::slb::InstallForModuleForTests(GetModuleHandleW(nullptr)));
+        CHECK(na::hooking::DeadHookCount()==dead);
+        return test::finish("sl_boundary_terminal_attach_test");
+    }
+    na::slb::FailNextAttachAcquireForTests();
+    na::slb::InstallForModuleForTests(GetModuleHandleW(nullptr));
+    CHECK(na::slb::GetStats().tag_hooks==0); // first group deferred, not a permanent module_seen latch
     REQUIRE(na::slb::InstallForModuleForTests(GetModuleHandleW(nullptr)));
     na::slb::Stats s = na::slb::GetStats();
     CHECK(s.tag_hooks == 2);

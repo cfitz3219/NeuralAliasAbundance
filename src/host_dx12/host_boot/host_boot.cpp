@@ -44,6 +44,7 @@ wchar_t g_ini[MAX_PATH] = {};
 // the game's device, heaps and resources are created under observation.
 HANDLE g_install_event = nullptr;              // manual reset; set once install was attempted
 std::atomic<DWORD> g_init_thread{0};
+std::atomic<uint32_t> g_gate_expired{0};
 void signal_install_attempted()
 {
     if (g_install_event) SetEvent(g_install_event);
@@ -212,14 +213,17 @@ DWORD WINAPI InitThread(LPVOID)
                        GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1);
     if (na::j2::Configured()) na::overlay::RegisterLiveDlaaMenu();
     if(na::settings::SafeStart())na::j2::SetPaused(true);
-    bool started = na::overlay::Start(tag, nullptr);
+    bool started = na::overlay::StartCore(tag, nullptr);
     signal_install_attempted(); // producers were installed (or could not be) inside Start
-    boot_log(started ? "overlay started" : "overlay start failed");
+    boot_log(started ? "core attached" : "core attachment failed");
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_status.host_started = started ? 1u : 0u;
     }
-    if (!started) { set_error("overlay/host start failed"); return 0; }
+    if (!started) set_error("core attachment failed; independent observation continues");
+    const bool want_menu=GetPrivateProfileIntW(L"overlay",L"enabled",1,g_ini)==1;
+    const bool menu_started=started && want_menu && na::overlay::StartMenu();
+    boot_log(menu_started ? "menu enabled" : "menu unavailable/disabled; core readiness is independent");
     // Engine scans must not delay the first factory/queue capture. Applying a
     // quality setting still requires an explicit user request.
     if(route_a){
@@ -244,13 +248,15 @@ DWORD WINAPI InitThread(LPVOID)
         if(ProcessLogPath(process_path,MAX_PATH,log_path))na::ngx::StartLogger(process_path);
     }
     // Adapter phase 2: subscriptions and registry after the host owns Execute/discovery.
-    if (prepared) {
+    if (prepared && started) {
         bool ok = na_adapter_start() != 0;
         boot_log(ok ? "adapter started" : "adapter start failed");
         std::lock_guard<std::mutex> lock(g_mutex);
         g_status.adapter_started = ok ? 1u : 0u;
         if (!ok) strncpy_s(g_status.error, "adapter start failed; host runs without it", _TRUNCATE);
     }
+    if(g_gate_expired.load())boot_log("early factory gate expired; objects created before attachment require late queue evidence");
+    {std::lock_guard<std::mutex> lock(g_mutex);g_status.init_complete=1;}
     return 0;
 }
 
@@ -276,8 +282,7 @@ bool StartFromIni(HMODULE self, const wchar_t* ini_name, const char* default_tag
         strncpy_s(g_status.tag, tag_a[0] ? tag_a : (default_tag ? default_tag : "HOST"), _TRUNCATE);
     }
     if ((GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1 ||
-         (GetPrivateProfileIntW(L"route_a", L"enabled", 0, g_ini) == 1 &&
-          GetPrivateProfileIntW(L"overlay", L"enabled", 1, g_ini) == 1)) &&
+         (GetPrivateProfileIntW(L"route_a", L"enabled", 0, g_ini) == 1)) &&
         GetPrivateProfileIntW(L"observe", L"early_install", 1, g_ini) == 1)
         g_install_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     HANDLE t = CreateThread(nullptr, 0, &InitThread, nullptr, 0, nullptr);
@@ -297,13 +302,13 @@ void WaitForObserveInstall()
     if (init && init == GetCurrentThreadId()) return;
     // Bounded: if the init thread cannot progress (e.g. the caller holds the
     // loader lock), the game continues and early objects stay PREEXISTING.
-    WaitForSingleObject(g_install_event, 3000);
+    if(WaitForSingleObject(g_install_event,3000)==WAIT_TIMEOUT)g_gate_expired.fetch_add(1);
 }
 
 Status GetStatus()
 {
     std::lock_guard<std::mutex> lock(g_mutex);
-    return g_status;
+    auto status=g_status;status.early_gate_expired=g_gate_expired.load();return status;
 }
 
 } // namespace na::host

@@ -22,7 +22,9 @@ bool StartFromIni(HMODULE self, const wchar_t* ini_name, const char* default_tag
 
 struct Status {
     uint32_t host_enabled;    // ini said enabled=1
-    uint32_t host_started;    // overlay Start succeeded
+    uint32_t host_started;    // core attachment succeeded
+    uint32_t early_gate_expired; // early queue capture not guaranteed; late attachment remains active
+    uint32_t init_complete;   // worker completed menu/adapters/logger startup
     uint32_t adapter_prepared;
     uint32_t adapter_started;
     // A61: Route A services in a NON-Streamline DLSS game ([route_a] enabled=1):

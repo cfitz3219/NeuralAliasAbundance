@@ -2,7 +2,7 @@
 
 Revision 1 — 2026-10-31. Author: Astra (Codex).
 
-**Status: PROPOSED. Peer review requested from Opus through COMMS; review not yet received. Implementation paused for Cort's audit.** The interrupted implementation turn performed source reads only. No runtime source, build, installer, game file or running game was changed by that turn.
+**Current status: review received; Cort authorized only approved/corrected implementation. See revision 2 below for the controlling staged scope.** Original revision-1 proposal follows for provenance. The interrupted implementation turn performed source reads only. No runtime source, build, installer, game file or running game was changed by that turn.
 
 Baseline: source78df593 (documentation after e6b3ac4); rendering behavior b71ba0b. Companion findings: docs/BROAD-NATIVE-DLSS-INSTALLER-AUDIT-20261031.md. Preserve the current user-confirmed Ghost package as the comparison baseline.
 
@@ -224,3 +224,21 @@ No runtime changes are requested from the reviewer during this review. Do not in
 
 - Revision1 authored by Astra; Opus review requested through COMMS. No peer review received at publication.
 - Cort's audit pending. No implementation approval inferred from elapsed time or lack of a reply.
+
+
+## Revision 2 — disposition of PLAN-REVIEW 72d3aaf
+
+Cort authorized implementation after the review recorded in COMMS at f3d58d1. That entry is by Claude/Opus, with Fable attribution in its commits. The separately named project-file writeup was not accessible in this checkout/Downloads; no additional approval is inferred from it. The explicit COMMS review controls this revision.
+
+1. **First candidate: O4 + O1 + cursor + FG wording.** Core queue/submission/discovery readiness is separate from optional input/ImGui readiness; independent engine/logger startup continues after a menu failure. Streamline retries unfinished installation groups after acquisition contention, with completed originals preserved and preparation/commit failures terminal. External presentation ownership is observed before new buffer substitution; existing proxy images retain their delivery until successful resize. Failed resize restores exact images/index, and unretired presenter work prevents native resize. Streamline observation never changes its private queue while handing over retained images. No route-table lock spans presenter/COM/consumer calls. Cached GetBuffer access uses a separate short buffer publication lock, avoiding the consumer/presenter lock inversion.
+2. **Cursor is included now.** Balance every ShowCursor increment, including the final visible one; force the menu arrow against competing SetCursor calls while Home is open; forward application cursor requests while closed. This fixes reproducible cursor ownership/count defects. Cort's actual frozen-cursor appearance still requires his live confirmation.
+3. **FG wording is included now.** Integrate reviewed cd012b1, read the loaded interposer's real version and distinguish forwarding from observed generation. Ghost's 2.4.0 interface requires one generated frame (2x); a zero/absent limit alone does not establish its version. This stage adds no FG scheduler or live multiplier redesign.
+4. **O3 is a separate subsequent candidate.** Replace the proposed OS lease/instance-ID/migration design with the review's simpler rendering-qualified per-process marker first. Loading our DLL/dummy/menu does not qualify. No session/settings changes are included in the first candidate.
+5. **O2 remains conditional.** Written R1 evidence/answer is still absent in COMMS. Before any NR scoping change, time-box the source=1/2 and unique/ambiguous/none association evidence. Preserve current NR behavior if no exact bridge can be established. No second peer-review cycle and no approval by silence.
+6. **Delivery/testing order supersedes section 10.** Deliver this first candidate separately, retaining b71ba0b and existing launcher/package files as the known-working comparison; then O3, then O2 only after R1. The review's proposal to launch PBZ now is superseded by Cort retaining game installation/testing. Automated CPU/DX12 and installer fixture tests are authorized. No game launch/control/deployment/native DLL replacement.
+
+No whole host/backend replacement, new analyzer, extraction algorithms or new UI design is authorized by this revision. NeuralAlias's existing core, NR algorithms, frame/resource lifetime machinery, overlay controls, Poise assets and additive installer remain in place.
+
+### First-stage evidence and limitations
+
+Evidence is recorded in `docs/OWNERSHIP-STAGE1-20261031.md` and local/ownership-stage1-20261031 (untracked test logs). Test-only GPU readbacks/waits qualify orchestration/image delivery, not native game FG scheduling or model quality. Initial engineering failures and corrections remain recorded in WORKLOG; they were never deployed.
