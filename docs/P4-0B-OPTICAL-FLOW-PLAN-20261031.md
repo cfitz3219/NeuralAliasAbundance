@@ -1,7 +1,8 @@
 # P4-0b: moving-object motion for live DLAA (J2) with NVIDIA optical flow
 
 **Status:** PROPOSAL for approval by Astra (and Sol, at Cort's request). No code written. Author: Claude/Opus, 2026-10-31, at Cort's direction ("Create a plan of action. Then submit it for Astra/Sol's approval").
-**Base:** `astra/pbz-rebuild-queues` at b2806ff (PR #59). MASTER-PLAN Phase 4, task P4-0(b): "Motion for moving objects ... Reuse NVOF / `motion/live_flow` on the pre-HUD scene image with per-pixel provenance."
+**Base:** `astra/pbz-rebuild-queues` at b2806ff (PR #59).
+**Supersedes:** `docs/J2-OPTICAL-FLOW-PLAN-20261031.md` rev 1 on `claude/j2-optical-flow-plan` (8de124f), a parallel draft written the same evening; its F0 accuracy step, mask-first ordering and risk list are merged here, so there is one plan to review. MASTER-PLAN Phase 4, task P4-0(b): "Motion for moving objects ... Reuse NVOF / `motion/live_flow` on the pre-HUD scene image with per-pixel provenance."
 
 ## 1. Problem
 
@@ -24,7 +25,7 @@ NVOFA is not recorded into a command list. `Flow::Execute` is a queue-level oper
 
 | J2 route | Games | Same-frame NVOFA possible? |
 |---|---|---|
-| **Between lists** (J2 records its own list after the game's last scene list) | Anno 1800 | **Yes.** Split the ExecuteCommandLists batch at our list: game lists + our copy/encode list, `Signal`, NVOFA `Execute` (waits, signals), `queue->Wait(flow fence)`, then our DLSS list + the rest of the batch. GPU-side waits only; same queue order preserved. |
+| **Between lists** (J2 records its own list after the game's last scene list) | Anno 1800 on the 10/26 run (inline did not exist yet); the current auto-router may choose either, and Step 0's `route=` status field settles it | **Yes.** Split the ExecuteCommandLists batch at our list: game lists + our copy/encode list, `Signal`, NVOFA `Execute` (waits, signals), `queue->Wait(flow fence)`, then our DLSS list + the rest of the batch. GPU-side waits only; same queue order preserved. |
 | **Inline** (J2 records inside the game's list, at the scene-colour consumer) | Sniper Elite Resistance, Sniper Elite 5 | **No.** The game's own post-processing follows in the same list, so no fence can be placed between our copy and our evaluate. |
 
 Cost note for the between-lists split: the direct queue idles while NVOFA runs unless other work overlaps, so the 2–4 ms is on the frame's critical path. Grid 4 with perf 20 (fast) and half-resolution input are the first things to measure.
@@ -35,6 +36,7 @@ Cost note for the between-lists split: the direct queue idles while NVOFA runs u
 - Sniper Elite Resistance: strafe the camera around the player character with the motion debug view on, current J2 build. Confirms how bad the trailing is and gives a before image.
 - Anno: same with a moving ship. Doubles as the owed Anno re-test on the current build.
 These are the baseline screenshots the acceptance criteria compare against.
+- **Flow accuracy in a DLSS game (optional, same session as a Ghost or PBZ run):** `[motion] enabled=1` with J2 off. live_flow's existing EvalRef mode compares NVOFA against the game's own motion vectors and logs mean endpoint error and % within 1 px, plus GPU ms. Gives a measured accuracy/cost table at grid 4 perf 5, grid 4 perf 20 and grid 2 before J2 depends on it. No new code.
 
 ### Step 1 — bias-current-colour mask (½ day, both routes, cheapest visible win)
 - Add `bias_current_color` (R8_UNORM, optional) to `na::dlss::EvalDesc` and pass it as `NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask`.
@@ -66,14 +68,22 @@ Same-frame NVOFA is impossible inline (§3). Options:
   - Measured cost in the status line; target ≤ 3 ms at 3440x1440, else grid/perf/half-res is tuned before shipping.
   - Toggle flow off/on, resize, alt-tab, exit: clean, no device removal.
 
-## 5. Ownership, order, estimate
+## 5. Risks
+
+- Flow is unreliable on water, smoke, particles, glass and flat colour: handled by validity plus the bias mask, never by trusting flow; thresholds may need per-game tuning.
+- 3A latency on sudden starts/stops and fast animation: bias mask, then 3B.
+- NVOFA needs RTX 20 or newer: elsewhere flow reports "unavailable" and J2 behaves exactly as today.
+- GPU cost lowers fps: measured first (Step 0) and shown in the status line.
+- J2 engagement drop-outs (Anno `no_scene_list`/`no_selection`, SE5 low coverage) are a separate reliability problem; fix them first or alongside so flow is judged on frames J2 actually processes.
+
+## 6. Ownership, order, estimate
 
 - MASTER-PLAN P4-0b: **Opus implements, Astra reviews.** J2 production placement is Astra's lane (COMMS 2026-10-28); this plan touches `live_dlaa.cpp` only at the record path (after the colour/depth copy, before `na::dlss::Evaluate`) and the between-lists submit. Astra, please say whether you want those hunks or prefer to own them.
 - New files (Opus): `src/host_dx12/j2/j2_flow.{hpp,cpp}` (encode, NVOFA ring, expand, derive, bias mask). `dlss_backend` gets one optional input.
 - Order: after the ownership follow-up (stage-2 F1 + Cort's Apply-only decision) and Step 0. Then Step 1 → Step 2 → Step 3A → tests → live.
 - Estimate: Step 1 ½ day, Step 2 2–3 days, Step 3A 1 day, tests 1 day, plus Cort's two live sessions.
 
-## 6. Questions for Astra / Sol
+## 7. Questions for Astra / Sol
 
 1. Batch split for the between-lists route: any objection to splitting the game's ExecuteCommandLists call at our list (same queue, order preserved), given the router and `count_post_dlaa` logic that run on that batch?
 2. Inline: agree to try 3A first, or go straight to 3B?
