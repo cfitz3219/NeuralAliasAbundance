@@ -13,6 +13,11 @@ try {
         }
     }
     $previousFile=Join-Path $PackageRoot 'repair-from.txt'
+    if ($Action -eq 'Rollback' -and -not (Test-Path -LiteralPath $state) -and (Test-Path -LiteralPath $previousFile)) {
+        $previous=(Get-Content -LiteralPath $previousFile -Raw).Trim()
+        & (Join-Path $previous 'deploy-pbz.ps1') -GameProfile Tsushima -PackageRoot $previous -Action Rollback
+        exit 0
+    }
     if ($Action -in @('Install','Repair') -and (Test-Path -LiteralPath $previousFile)) {
         # Validate the replacement before retiring the old additive package.
         & (Join-Path $PackageRoot 'deploy-pbz.ps1') -GameProfile Tsushima -PackageRoot $PackageRoot -Action Validate

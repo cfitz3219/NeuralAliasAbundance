@@ -44,4 +44,8 @@ Reset-Fixture
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$new/tsushima-package-run.ps1" -Action Repair
 Check ($LASTEXITCODE -eq 0) 'repair after prior rollback failed'
 Check ((Actions) -eq 'new:Validate,new:Install') 'restored old package rolled back again'
+Reset-Fixture
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$new/tsushima-package-run.ps1" -Action Rollback
+Check ($LASTEXITCODE -eq 0) 'pre-update rollback failed'
+Check ((Actions) -eq 'old:Rollback') 'pre-update rollback did not target installed receipt'
 Write-Host "PASS: Ghost wrapper validation, rollback/install order, repeat-install status and restored baseline. Fixture: $root"
