@@ -155,7 +155,7 @@ struct SwapQueue { void* sc = nullptr; PresentQueues queues; int color_space=DXG
 std::mutex g_swap_queue_m;
 SwapQueue g_swap_queues[8];
 uint32_t g_swap_queue_next = 0;
-std::atomic<uint32_t> g_swap_queue_hits{0}, g_swap_queue_misses{0}, g_swap_queues_recorded{0};
+std::atomic<uint32_t> g_swap_queue_hits{0}, g_swap_queue_misses{0}, g_swap_queues_recorded{0}, g_swap_queue_device{0};
 std::atomic<uintptr_t> g_last_present_queue{0};
 
 void note_swapchain_queue(IUnknown* device_or_queue, void* swapchain)
@@ -1099,14 +1099,14 @@ void write_menu_progress(HANDLE log)
     std::unique_lock<std::mutex> lock(g_state.mutex, std::try_to_lock);
     if (!lock.owns_lock() || !g_state.device) return;
     char line[400];
-    int n = snprintf(line, sizeof(line), "menu_gpu draws=%llu submitted=%llu completed=%llu device_hr=0x%08lX observed_queue=0x%llX present_queue=0x%llX swapchain_queues=%u hits=%u misses=%u\r\n",
+    int n = snprintf(line, sizeof(line), "menu_gpu draws=%llu submitted=%llu completed=%llu device_hr=0x%08lX observed_queue=0x%llX present_queue=0x%llX swapchain_queues=%u hits=%u device_queue=%u misses=%u\r\n",
                      static_cast<unsigned long long>(g_frames.load()),
                      static_cast<unsigned long long>(g_menu_draw_marker.load()),
                      static_cast<unsigned long long>(menu_completed_prefix()),
                      static_cast<unsigned long>(g_state.device->GetDeviceRemovedReason()),
                      static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(g_direct_queue.load())),
                      static_cast<unsigned long long>(g_last_present_queue.load()), g_swap_queues_recorded.load(),
-                     g_swap_queue_hits.load(), g_swap_queue_misses.load());
+                     g_swap_queue_hits.load(), g_swap_queue_device.load(), g_swap_queue_misses.load());
     if (n >= static_cast<int>(sizeof(line))) n = static_cast<int>(sizeof(line)) - 1; // never write past a truncated line
     DWORD written = 0;
     if (n > 0) WriteFile(log, line, static_cast<DWORD>(n), &written, nullptr);
@@ -2113,9 +2113,18 @@ bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue,ComPtr<ID3D1
     // Boundary frames: the game-facing proxy is not a key in g_swap_queues;
     // sl_boundary supplies the proxy's exact creation/ResizeBuffers1 queue.
     if (!retained_queue && queue_hint) retained_queue = queue_hint;
+    if (retained_queue) g_swap_queue_hits.fetch_add(1, std::memory_order_relaxed);
+    else if (SUCCEEDED(sc->GetDevice(IID_PPV_ARGS(&retained_queue))) && retained_queue) {
+        // Creation was not observed (Ghost of Tsushima, 80dfbcb: hits=0
+        // misses=2951, then the device was removed with ACCESS_DENIED within
+        // seconds of the first menu draw). A D3D12 chain reports the queue it
+        // was created on through GetDevice: draw on THAT queue, never on "the
+        // last direct queue that submitted", which in a multi-queue game is
+        // unsynchronised with the presenting queue.
+        g_swap_queue_device.fetch_add(1, std::memory_order_relaxed);
+    }
     queue = retained_queue.Get();
-    if (queue) g_swap_queue_hits.fetch_add(1, std::memory_order_relaxed);
-    else {
+    if (!queue) {
         g_swap_queue_misses.fetch_add(1, std::memory_order_relaxed);
         queue = g_direct_queue.load(std::memory_order_acquire);
     }
