@@ -233,14 +233,16 @@ void upload_r32f(test::Device& d, ID3D12Resource* tex, float v, D3D12_RESOURCE_S
     d.queue->ExecuteCommandLists(1, ls);
     d.WaitIdle();
 }
-// Background value, or a 4-pixel checkerboard; a bright square at [x0, x0+16) x [24, 40) (x0 < 0: none).
+// Background value, or a 4-pixel checkerboard; a bright rectangle at [x0, x0+48) x [16, 48) (x0 < 0: none).
+// Large enough (6x4 flow blocks) to have an interior: pixels next to the background are
+// correctly marked unreliable by the depth-aware expansion (neighbour-flow spread).
 std::vector<float> picture(int x0, bool checker)
 {
     std::vector<float> px(W * H * 4);
     for (uint32_t y = 0; y < H; ++y)
         for (uint32_t x = 0; x < W; ++x) {
             float v = checker ? (((x / 4) + (y / 4)) % 2 ? 1.0f : 0.05f) : 0.05f;
-            if (x0 >= 0 && static_cast<int>(x) >= x0 && static_cast<int>(x) < x0 + 16 && y >= 24 && y < 40) v = 4.0f;
+            if (x0 >= 0 && static_cast<int>(x) >= x0 && static_cast<int>(x) < x0 + 48 && y >= 16 && y < 48) v = 4.0f;
             float* q = &px[(y * W + x) * 4];
             q[0] = q[1] = q[2] = v;
             q[3] = 1.f;
@@ -385,17 +387,17 @@ int case_pair(test::Device& d, FakeEngine* fake)
         // Engine pixels (downscale 2), S10.5. Background: the jitter's image shift jp - jc.
         const int16_t bx = static_cast<int16_t>((jp[0] - jc[0]) / 2 * 32), by = static_cast<int16_t>((jp[1] - jc[1]) / 2 * 32);
         const int16_t ox = static_cast<int16_t>((-4.f + jp[0] - jc[0]) / 2 * 32), oy = by;
-        fake->SetGrid(bx, by, 5, 6, 3, 4, ox, oy);
+        fake->SetGrid(bx, by, 5, 10, 2, 5, ox, oy); // blocks of 8 px: the rectangle at x 40..88, y 16..48
         fake->gated = true;
     }
-    h.SetPicture(picture(40, false));
+    h.SetPicture(picture(36, false));
     fl::Ticket t1 = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(1, 0, jp[0], jp[1]));
     CHECK(t1.valid && !t1.pair);
     size_t calls = 0;
     h.Frame(t1, jp[0], jp[1], &calls);
     CHECK(calls == 1);
     REQUIRE(h.WaitJ2(5000));
-    h.SetPicture(picture(44, false));
+    h.SetPicture(picture(40, false));
     fl::Ticket t2 = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(2, 1, jc[0], jc[1]));
     CHECK(t2.valid && t2.pair);
     const bool fused = h.Frame(t2, jc[0], jc[1], &calls);
@@ -408,13 +410,13 @@ int case_pair(test::Device& d, FakeEngine* fake)
     }
     REQUIRE(h.WaitJ2(10000));
     float v[2];
-    h.Motion(52, 32, v);
+    h.Motion(64, 32, v);
     recap("pair: object motion (%.3f, %.3f)", v[0], v[1]);
     CHECK(std::fabs(v[0] + 4.f) < (fake ? 0.1f : 1.0f) && std::fabs(v[1]) < (fake ? 0.1f : 1.0f));
     h.Motion(10, 10, v);
     recap("pair: background motion (%.3f, %.3f)", v[0], v[1]);
     CHECK(std::fabs(v[0]) < 0.1f && std::fabs(v[1]) < 0.1f);
-    h.Motion(100, 50, v);
+    h.Motion(120, 58, v);
     CHECK(std::fabs(v[0]) < 0.1f && std::fabs(v[1]) < 0.1f);
     // Read-back of the counters happens at the next Prepare.
     fl::Ticket t3 = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(3, 2, jp[0], jp[1]));
@@ -424,7 +426,7 @@ int case_pair(test::Device& d, FakeEngine* fake)
                 (unsigned long long)st.px_small, (unsigned long long)st.px_cost, (unsigned long long)st.px_offscreen, (unsigned long long)st.px_image,
                 st.mean_cost);
     recap("pair reason: %s", st.reason);
-    CHECK(st.pairs >= 1 && st.consumed == 1 && st.px_accepted > 100 && st.px_accepted < 400);
+    CHECK(st.pairs >= 1 && st.consumed == 1 && st.px_accepted > 200 && st.px_accepted <= 1536);
     if (fake) CHECK(st.cost == 1 && std::fabs(st.mean_cost - 10.f) < 0.5f);
     fl::Abandon(d.queue.Get(), t3);
     if (fake) fake->OpenGate();
