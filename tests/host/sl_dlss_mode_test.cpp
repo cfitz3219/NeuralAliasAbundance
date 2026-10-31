@@ -83,7 +83,7 @@ extern "C" __declspec(dllexport) __declspec(noinline) int32_t slGetFeatureFuncti
 namespace {
 
 struct alignas(8) Options { uint8_t b[88] = {}; };
-struct alignas(8) Optimal { uint8_t b[60] = {}; };
+struct alignas(8) Optimal { uint8_t b[64] = {}; }; // sl::DLSSOptimalSettings v1 is 60 bytes; 64 avoids C4324 padding
 
 Options make_options(uint32_t mode, uint32_t ow, uint32_t oh, uint64_t version = 3, uint32_t preset = 0)
 {
