@@ -230,6 +230,7 @@ void write_menu_progress(HANDLE log);
 std::atomic<uint32_t> g_retargets{0}; // swap chain re-targets (A31)
 std::atomic<uint32_t> g_initialized{0};
 std::atomic<bool> g_core_started{false}, g_menu_enabled{false}, g_fail_menu_start{false},g_fail_menu_create{false};
+std::atomic<unsigned> g_fail_optional_input{0};
 std::mutex g_start_m;
 bool g_menu_frame_ready=false; // g_state.mutex
 std::atomic<uint32_t> g_gamepad_hooked{0};
@@ -446,7 +447,8 @@ void install_input_hooks()
     for (int i = 0; i < 8; ++i) {
         if(g_input_hook_targets[i]){++n;continue;}
         void* target = reinterpret_cast<void*>(GetProcAddress(u, specs[i].name));
-        if (target && install_input_function(target, specs[i].detour, specs[i].original)) {
+        const bool optional_unavailable=i==7 && g_fail_optional_input.load() && g_fail_optional_input.fetch_sub(1)>0;
+        if (target && !optional_unavailable && install_input_function(target, specs[i].detour, specs[i].original)) {
             g_input_hook_targets[i] = target;
             ++n;
         } else {
@@ -614,6 +616,10 @@ void write_status_line()
         if(count){const auto bytes=snprintf(failure_line,sizeof(failure_line),"hook_install_wait_failures=%u last=%s\r\n",count,reason);
             WriteFile(f,failure_line,DWORD((std::min)(bytes,int(sizeof(failure_line)-1))),&written,nullptr);}
     }
+    char readiness[128]{};
+    const auto readiness_bytes=snprintf(readiness,sizeof(readiness),"overlay_ready core=%u menu=%u initialized=%u input_hooks=%u/8\r\n",
+        g_core_started.load()?1u:0u,g_menu_enabled.load()?1u:0u,g_initialized.load(),g_input_hooks.load());
+    if(readiness_bytes>0)WriteFile(f,readiness,DWORD((std::min)(readiness_bytes,int(sizeof(readiness)-1))),&written,nullptr);
     char sl_boundary_line[1024];
     const int sl_boundary_bytes=na::slb::FormatStatus(sl_boundary_line,sizeof(sl_boundary_line));
     if(sl_boundary_bytes>0){
@@ -1615,6 +1621,7 @@ bool ensure_init_locked(IDXGISwapChain* sc)
             // format and frame count: re-create it for the new chain. The
             // ImGui context, fonts and the Win32 backend stay; device objects
             // are rebuilt right away (eager, as at first init).
+            if(!menu_draws_complete())return false; // retry next frame; never wait in Present
             ImGui_ImplDX12_Shutdown();
             ImGui_ImplDX12_InitInfo info{};
             info.Device = g_state.device.Get();
@@ -2495,7 +2502,7 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT count, UI
         std::lock_guard<std::mutex> lock(g_state.mutex);
         if (g_state.swapchain == sc) release_buffers_locked();
     }
-    if(!na::present::BeforeResize(sc))return DXGI_ERROR_WAS_STILL_DRAWING;
+    if(!na::present::BeforeResize(sc))return DXGI_ERROR_INVALID_CALL; // outstanding buffer use; size unchanged
     const auto result=g_orig_resize(sc,count,w,h,fmt,flags);
     na::present::AfterResize(sc,result);return result;
 }
@@ -2508,7 +2515,7 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT count, 
         std::lock_guard<std::mutex> lock(g_state.mutex);
         if (g_state.swapchain == sc) release_buffers_locked();
     }
-    if(!na::present::BeforeResize(sc))return DXGI_ERROR_WAS_STILL_DRAWING;
+    if(!na::present::BeforeResize(sc))return DXGI_ERROR_INVALID_CALL; // outstanding buffer use; size unchanged
     const auto result=g_orig_resize1(sc, count, w, h, fmt, flags, node_masks, queues);
     na::present::AfterResize(sc,result);
     if(SUCCEEDED(result) && queues){
@@ -2933,7 +2940,7 @@ bool StartMenu()
 {
     std::lock_guard<std::mutex> start_lock(g_start_m);
     if(!g_core_started.load(std::memory_order_acquire))return false;
-    if(g_menu_enabled.load(std::memory_order_acquire))return true;
+    if(g_menu_enabled.load(std::memory_order_acquire) && g_input_hooks.load()==8)return true;
     if(g_fail_menu_start.exchange(false))return false;
     g_menu_cursor=LoadCursorW(nullptr,IDC_ARROW);
     // Controller: hook whichever XInput modules the game already loaded.
@@ -2954,7 +2961,7 @@ bool StartMenu()
     }
     g_gamepad_hooked.store(hooked);
     install_input_hooks(); // A44: the game sees no mouse/keyboard while the menu is open
-    const bool ready=g_input_hooks.load(std::memory_order_acquire)==8;
+    const bool ready=g_input_hook_targets[0] && g_input_hook_targets[2]; // essentials; cursor/controller hooks may degrade
     g_menu_enabled.store(ready,std::memory_order_release);
     return ready;
 }
@@ -2964,6 +2971,7 @@ bool Start(const char* route_tag, PanelFn controls)
 }
 void FailNextMenuStartForTests(){g_fail_menu_start.store(true);}
 void FailNextMenuCreateForTests(){g_fail_menu_create.store(true);}
+void FailOptionalInputForTests(unsigned attempts){g_fail_optional_input.store(attempts);}
 
 bool SubscribeExecute(ExecuteBeginFn begin, ExecuteEndFn end, void* user)
 {

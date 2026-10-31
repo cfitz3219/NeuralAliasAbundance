@@ -264,3 +264,8 @@ add_test(NAME host_sl_boundary_terminal_attach_test COMMAND sl_boundary_test --t
 set_tests_properties(host_sl_boundary_terminal_attach_test PROPERTIES TIMEOUT 20 LABELS host)
 add_test(NAME host_overlay_menu_create_failure_test COMMAND overlay_bootstrap_test --menu-create-failure)
 set_tests_properties(host_overlay_menu_create_failure_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+
+add_test(NAME host_overlay_optional_input_test COMMAND overlay_bootstrap_test --optional-input)
+set_tests_properties(host_overlay_optional_input_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+add_test(NAME host_sl_boundary_optional_conflict_test COMMAND sl_boundary_test --optional-conflict)
+set_tests_properties(host_sl_boundary_optional_conflict_test PROPERTIES TIMEOUT 20 LABELS host)

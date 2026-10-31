@@ -8,6 +8,7 @@
 #include "host_dx12/overlay/present_queues.hpp"
 
 #include <atomic>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -104,6 +105,17 @@ std::atomic<bool> g_retry_needed{false},g_fail_acquire{false};
 bool g_exports_done=false,g_fallback_done=false,g_hooking_initialized=false;
 std::atomic<bool> g_attach_terminal{false};
 HMODULE g_attach_module=nullptr;
+uint8_t g_export_state[4]{},g_fallback_state[4]{}; // 0 unfinished,1 attached,2 unavailable/terminal target
+std::atomic<bool> g_fail_proxy_commit{false};
+void prepare_optional(void* target,void* detour,void** original,uint8_t& state,std::vector<uint8_t*>& batch){
+    if(state)return;
+    if(!target || !na::hooking::PrepareHook(target,detour,original)){state=2;return;}
+    batch.push_back(&state);
+}
+void commit_optional(std::vector<uint8_t*>& batch){
+    const uint8_t outcome=na::hooking::CommitInstall()?1u:2u;
+    for(auto* state:batch)*state=outcome; // failed/dead optional targets never retried
+}
 bool begin_install_retry()
 {
     const bool ok=!g_fail_acquire.exchange(false) && na::hooking::BeginInstallWait("Streamline boundary");
@@ -656,6 +668,7 @@ bool install_proxy_vtable(void* const* vtable, Discovery how)
         set_reason("Could not prepare the Streamline swap-chain hooks.");
         return false;
     }
+    if(g_fail_proxy_commit.exchange(false))na::hooking::FailNextCommitEnableForTest(1);
     if (!na::hooking::CommitInstall()) {
         g_attach_terminal=true;
         set_reason("Could not enable the Streamline swap-chain hooks.");
@@ -1093,22 +1106,17 @@ bool install_for_module(HMODULE m)
     auto* constants = reinterpret_cast<void*>(GetProcAddress(m, "slSetConstants"));
     std::unique_lock<std::mutex> install_lock(g_install_m);
     if (!g_exports_done && begin_install_retry()) {
-        uint32_t n = 0;bool prepared=true;
-        if(gff)prepared=na::hooking::PrepareHook(gff,reinterpret_cast<void*>(&DetourGetFeatureFunction),reinterpret_cast<void**>(&g_orig_gff)) && prepared;
-        if (tag_frame && na::hooking::PrepareHook(tag_frame, reinterpret_cast<void*>(&DetourSetTagForFrame),
-                                                  reinterpret_cast<void**>(&g_orig_tag_frame))) ++n;
-        else if(tag_frame)prepared=false;
-        if (tag && na::hooking::PrepareHook(tag, reinterpret_cast<void*>(&DetourSetTag), reinterpret_cast<void**>(&g_orig_tag))) ++n;
-        else if(tag)prepared=false;
-        if (constants) prepared=na::hooking::PrepareHook(constants,reinterpret_cast<void*>(&DetourSetConstants),reinterpret_cast<void**>(&g_orig_constants)) && prepared;
-        if(!prepared){na::hooking::AbandonInstall();g_attach_terminal=true;return any;}
-        if (na::hooking::CommitInstall()) {
-            g_exports_done=true;g_gff_export=gff;
-            g_tag_hooks.store(n, std::memory_order_release);
-            any = n != 0 || g_gff_export != nullptr;
-        } else {
-            g_attach_terminal=true;return any; // originals/dead targets remain owned by the hook core
-        }
+        std::vector<uint8_t*> batch;
+        prepare_optional(gff,reinterpret_cast<void*>(&DetourGetFeatureFunction),reinterpret_cast<void**>(&g_orig_gff),g_export_state[0],batch);
+        prepare_optional(tag_frame,reinterpret_cast<void*>(&DetourSetTagForFrame),reinterpret_cast<void**>(&g_orig_tag_frame),g_export_state[1],batch);
+        prepare_optional(tag,reinterpret_cast<void*>(&DetourSetTag),reinterpret_cast<void**>(&g_orig_tag),g_export_state[2],batch);
+        prepare_optional(constants,reinterpret_cast<void*>(&DetourSetConstants),reinterpret_cast<void**>(&g_orig_constants),g_export_state[3],batch);
+        commit_optional(batch);
+        g_exports_done=std::all_of(std::begin(g_export_state),std::end(g_export_state),[](uint8_t state){return state!=0;});
+        g_gff_export=g_export_state[0]==1?gff:nullptr;
+        const uint32_t n=(g_export_state[1]==1?1u:0u)+(g_export_state[2]==1?1u:0u);
+        g_tag_hooks.store(n,std::memory_order_release);
+        any=any || n!=0 || g_gff_export;
     }
     install_lock.unlock(); // install_proxy_vtable takes it again
     // Capture the game's queue BEFORE DLSS-G can substitute a private
@@ -1130,19 +1138,15 @@ bool install_for_module(HMODULE m)
             set_reason("Streamline fallback attachment will retry after install contention.");
             return any;
         }
-        bool prepared=true;
-        // Fallback: inspect what Streamline hands out.
-        auto* up = reinterpret_cast<void*>(GetProcAddress(m, "slUpgradeInterface"));
-        auto* cf = reinterpret_cast<void*>(GetProcAddress(m, "CreateDXGIFactory"));
-        auto* cf1 = reinterpret_cast<void*>(GetProcAddress(m, "CreateDXGIFactory1"));
-        auto* cf2 = reinterpret_cast<void*>(GetProcAddress(m, "CreateDXGIFactory2"));
-        if (up) prepared=na::hooking::PrepareHook(up, reinterpret_cast<void*>(&DetourUpgradeInterface), reinterpret_cast<void**>(&g_orig_upgrade)) && prepared;
-        if (cf) prepared=na::hooking::PrepareHook(cf, reinterpret_cast<void*>(&DetourCreateFactory), reinterpret_cast<void**>(&g_orig_cf)) && prepared;
-        if (cf1) prepared=na::hooking::PrepareHook(cf1, reinterpret_cast<void*>(&DetourCreateFactory1), reinterpret_cast<void**>(&g_orig_cf1)) && prepared;
-        if (cf2) prepared=na::hooking::PrepareHook(cf2, reinterpret_cast<void*>(&DetourCreateFactory2), reinterpret_cast<void**>(&g_orig_cf2)) && prepared;
-        if(!prepared){na::hooking::AbandonInstall();g_attach_terminal=true;return any;}
-        if(!na::hooking::CommitInstall()){g_attach_terminal=true;return any;}
-        g_fallback_done=true;
+        // Optional discovery exports cannot disable an already working proxy.
+        std::vector<uint8_t*> batch;
+        const char* names[]={"slUpgradeInterface","CreateDXGIFactory","CreateDXGIFactory1","CreateDXGIFactory2"};
+        void* detours[]={reinterpret_cast<void*>(&DetourUpgradeInterface),reinterpret_cast<void*>(&DetourCreateFactory),
+            reinterpret_cast<void*>(&DetourCreateFactory1),reinterpret_cast<void*>(&DetourCreateFactory2)};
+        void** originals[]={reinterpret_cast<void**>(&g_orig_upgrade),reinterpret_cast<void**>(&g_orig_cf),
+            reinterpret_cast<void**>(&g_orig_cf1),reinterpret_cast<void**>(&g_orig_cf2)};
+        for(unsigned i=0;i<4;++i)prepare_optional(reinterpret_cast<void*>(GetProcAddress(m,names[i])),detours[i],originals[i],g_fallback_state[i],batch);
+        commit_optional(batch);g_fallback_done=true;
         if(!g_present_hooks.load())set_reason("No RTTI for Streamline's swap chain; waiting for slUpgradeInterface or a factory.");
     }
     if (!g_present_hooks.load(std::memory_order_acquire) && g_tag_hooks.load(std::memory_order_acquire) == 0)
@@ -1361,6 +1365,7 @@ FgState GetFgState()
 }
 
 void FailNextAttachAcquireForTests(){g_fail_acquire.store(true);}
+void FailNextProxyCommitForTests(){g_fail_proxy_commit.store(true);}
 bool InstallForModuleForTests(void* module) { return install_for_module(static_cast<HMODULE>(module)); }
 
 void ResetCountersForTests()

@@ -222,7 +222,12 @@ DWORD WINAPI InitThread(LPVOID)
     }
     if (!started) set_error("core attachment failed; independent observation continues");
     const bool want_menu=GetPrivateProfileIntW(L"overlay",L"enabled",1,g_ini)==1;
-    const bool menu_started=started && want_menu && na::overlay::StartMenu();
+    bool menu_started=false;
+    if(started && want_menu)for(unsigned attempt=0;attempt<3;++attempt){
+        menu_started=na::overlay::StartMenu() || menu_started;
+        if(na::overlay::GetStats().input_hooks==8)break;
+        if(attempt<2)Sleep(50); // init worker only, not Present
+    }
     boot_log(menu_started ? "menu enabled" : "menu unavailable/disabled; core readiness is independent");
     // Engine scans must not delay the first factory/queue capture. Applying a
     // quality setting still requires an explicit user request.

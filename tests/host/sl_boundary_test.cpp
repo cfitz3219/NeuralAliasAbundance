@@ -331,7 +331,12 @@ DWORD WINAPI detach_thread(LPVOID)
 extern "C" __declspec(dllexport) int32_t slGetNewFrameToken(void** out,const uint32_t* index){
     static FakeFrameToken token(0);token.v=*index;*out=&token;return 0;
 }
-int main(int argc,char**)
+namespace {
+using ConstantsFn=int32_t(__cdecl*)(const void*,const void*,const void*);
+ConstantsFn conflict_constants=nullptr;
+int32_t __cdecl OtherConstantsHook(const void* a,const void* b,const void* c){return conflict_constants(a,b,c);}
+}
+int main(int argc,char** argv)
 {
     // Instantiating the proxies emits their vtable/RTTI into this image.
     FakeBase base;
@@ -340,9 +345,21 @@ int main(int argc,char**)
     sl::interposer::DXGISwapChain proxy2;
     proxy2.base = &base;
 
+    if(argc>1 && !strcmp(argv[1],"--optional-conflict")){
+        REQUIRE(na::hooking::Initialize());
+        void* target=reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(nullptr),"slSetConstants"));
+        REQUIRE(na::hooking::HookFunction(target,reinterpret_cast<void*>(&OtherConstantsHook),reinterpret_cast<void**>(&conflict_constants)));
+        REQUIRE(na::slb::InstallForModuleForTests(GetModuleHandleW(nullptr)));
+        CHECK(na::slb::GetStats().present_hooks==2 && na::slb::GetStats().tag_hooks==2);
+        auto* iface=reinterpret_cast<IDXGISwapChain3*>(&proxy);
+        CHECK(iface->Present(0,0)==S_OK && g_present_calls==1);
+        CHECK(na::slb::GetStats().presents_real==1);
+        return test::finish("sl_boundary_optional_conflict_test");
+    }
     if(argc>1){
-        na::hooking::FailNextCommitEnableForTest(1);
-        CHECK(!na::slb::InstallForModuleForTests(GetModuleHandleW(nullptr)));
+        na::slb::FailNextProxyCommitForTests();
+        na::slb::InstallForModuleForTests(GetModuleHandleW(nullptr));
+        CHECK(na::slb::GetStats().present_hooks==0 && na::slb::GetStats().tag_hooks==2);
         const auto dead=na::hooking::DeadHookCount();CHECK(dead>0);
         CHECK(!na::slb::InstallForModuleForTests(GetModuleHandleW(nullptr)));
         CHECK(na::hooking::DeadHookCount()==dead);
@@ -723,3 +740,4 @@ int main(int argc,char**)
     CHECK(std::strstr(line, "hudless=only_valid_now/0x") != nullptr);
     return test::finish("sl_boundary_test");
 }
+

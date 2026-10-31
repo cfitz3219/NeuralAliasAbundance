@@ -157,7 +157,10 @@ DWORD WINAPI InitThread(LPVOID)
         GetPrivateProfileStringA("overlay", "font_body", "", body, sizeof(body), ini_a);
         GetPrivateProfileStringA("overlay", "font_title", "", title, sizeof(title), ini_a);
         na::ui::SetFontPaths(body, title);
-        na::overlay::StartMenu();
+        for(unsigned attempt=0;attempt<3;++attempt){
+            na::overlay::StartMenu();if(na::overlay::GetStats().input_hooks==8)break;
+            if(attempt<2)Sleep(50);
+        }
     }
     wchar_t log_path[MAX_PATH];
     wchar_t configured[MAX_PATH] = {};

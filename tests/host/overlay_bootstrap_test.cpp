@@ -12,6 +12,7 @@ void submitted(na::overlay::ExecuteContext*){submits.fetch_add(1);}
 void device_seen(ID3D12Device*,void*){devices.fetch_add(1);}}
 int main(int argc,char** argv) {
     const bool menu_failure=argc>1 && !strcmp(argv[1],"--menu-failure");
+    const bool optional_input=argc>1 && !strcmp(argv[1],"--optional-input");
     const bool create_failure=argc>1 && !strcmp(argv[1],"--menu-create-failure");
     const bool recovery=argc>1 && !strcmp(argv[1],"--recovery");
     SetEnvironmentVariableW(L"NEURALALIAS_TEST_WARP",L"1");
@@ -39,6 +40,7 @@ int main(int argc,char** argv) {
         REQUIRE(f!=INVALID_HANDLE_VALUE);CloseHandle(f);
     }
     if(menu_failure)na::overlay::FailNextMenuStartForTests();
+    if(optional_input)na::overlay::FailOptionalInputForTests(3);
     REQUIRE(na::host::StartFromIni(GetModuleHandleW(nullptr),name.c_str(),"BOOT TEST"));
     // Same ordering as our DXGI proxy's exported CreateDXGIFactory entry.
     na::host::WaitForObserveInstall();
@@ -65,9 +67,10 @@ int main(int argc,char** argv) {
     REQUIRE(na::host::GetStatus().init_complete==1);
     if(create_failure)na::overlay::FailNextMenuCreateForTests();
     REQUIRE(SUCCEEDED(chain->Present(0,0)));d.WaitIdle();
-    if(menu_failure || create_failure){
+    if(optional_input)CHECK(na::overlay::GetStats().menu_enabled==1 && na::overlay::GetStats().input_hooks==7);
+    if(create_failure){
         CHECK(na::overlay::GetStats().core_ready==1);
-        CHECK(na::overlay::GetStats().menu_enabled==(create_failure?1u:0u) && na::overlay::GetStats().initialized==0);
+        CHECK(na::overlay::GetStats().menu_enabled==1 && na::overlay::GetStats().initialized==0);
         REQUIRE(na::overlay::SubscribeExecute(nullptr,&submitted,nullptr));
         REQUIRE(na::overlay::SubscribeDiscovery(&device_seen,nullptr,nullptr,nullptr));
         test::List work;REQUIRE(work.Create(d.device.Get()));REQUIRE(SUCCEEDED(work.list->Close()));

@@ -251,6 +251,7 @@ FgState GetFgState();
 // Runs the same installation against `module` as if it were sl.interposer.dll
 // (RTTI search, tag export hooks). Returns true if anything was hooked.
 void FailNextAttachAcquireForTests();
+void FailNextProxyCommitForTests();
 bool InstallForModuleForTests(void* module);
 void ResetCountersForTests();
 
