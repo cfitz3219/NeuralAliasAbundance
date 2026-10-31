@@ -170,6 +170,10 @@ std::atomic<bool> g_started{false};
 HANDLE g_wake = nullptr;
 struct Pending { bool set = false; float percent = 0.f; uint32_t out_w = 0, out_h = 0; uint64_t id = 0; } g_pending;
 uint64_t g_next_id = 0;
+std::atomic<uint64_t> g_generation{0};  // bumped by Cancel: a running request stops at its next check
+uint64_t g_confirm_id = 0;              // size-confirmation request owned by the running Apply (g_m)
+bool g_have_game_value = false;         // the game's value before our first write (hand-back), g_m
+float g_game_value = 0.f, g_our_value = 0.f;
 
 void set_state(SpState s, const char* reason)
 {
@@ -224,6 +228,7 @@ bool locate()
 
 void run_request(const Pending& req)
 {
+    const uint64_t generation = g_generation.load(std::memory_order_acquire);
     float* ref = g_ref.load(std::memory_order_acquire);
     const na::ngx::Stats before = na::ngx::GetStats();
     const float now = read_value(ref);
@@ -238,58 +243,79 @@ void run_request(const Pending& req)
             return;
         }
     }
+    const uint32_t ew = ExpectedExtent(req.out_w, req.percent), eh = ExpectedExtent(req.out_h, req.percent);
     {
         std::lock_guard<std::mutex> lock(g_m);
         g_status.requested = req.percent;
         g_status.request_id = req.id;
-        g_status.expect_w = ExpectedExtent(req.out_w, req.percent);
-        g_status.expect_h = ExpectedExtent(req.out_h, req.percent);
+        g_status.expect_w = ew;
+        g_status.expect_h = eh;
+    }
+    // Already rendering at that size (the value already matches): nothing to change.
+    if (std::fabs(now - req.percent) < 0.01f && before.last_sr_in_w + 1 >= ew && before.last_sr_in_w <= ew + 1 &&
+        before.last_sr_in_h + 1 >= eh && before.last_sr_in_h <= eh + 1) {
+        set_state(SpState::Confirmed, "This mode is already the game's render size.");
+        return;
+    }
+    // Confirmation is armed BEFORE the write, so the re-creation it causes is observed.
+    const uint64_t confirm = na::ngx::ArmSizeConfirmation(ew, eh, 30, 4000, 4000, 9000);
+    {
+        std::lock_guard<std::mutex> lock(g_m);
+        g_confirm_id = confirm;
+        if (!g_have_game_value || std::fabs(now - g_our_value) > 0.01f) { // remember the game's own value for hand-back
+            g_game_value = now;
+            g_have_game_value = true;
+        }
+        g_our_value = req.percent;
     }
     if (!write_value(ref, req.percent)) {
+        na::ngx::CancelSizeConfirmation();
         set_state(SpState::Refused, "Writing the engine's screen percentage failed; nothing was changed.");
         return;
     }
-    set_state(SpState::Applying, "Waiting for the game to rebuild DLSS at the new size...");
-    uint32_t ew = 0, eh = 0;
-    {
-        std::lock_guard<std::mutex> lock(g_m);
-        ew = g_status.expect_w;
-        eh = g_status.expect_h;
-    }
-    const ULONGLONG start = GetTickCount64();
-    while (GetTickCount64() - start < 8000) {
+    na::ngx::MarkSizeConfirmationRestored(confirm); // no window change: evaluations count from now
+    set_state(SpState::Applying, "Waiting for the game's DLSS to render at the new size...");
+    for (;;) {
         Sleep(100);
+        if (g_generation.load(std::memory_order_acquire) != generation) {
+            if (na::ngx::GetSizeConfirmation().id == confirm) na::ngx::CancelSizeConfirmation();
+            set_state(SpState::Cancelled, "Selection changed; the request was withdrawn.");
+            return;
+        }
         const float cur = read_value(ref);
         const na::ngx::Stats s = na::ngx::GetStats();
+        const na::ngx::SizeConfirmation c = na::ngx::GetSizeConfirmation();
         {
             std::lock_guard<std::mutex> lock(g_m);
             g_status.current = cur;
-            g_status.seen_w = s.last_sr_in_w;
-            g_status.seen_h = s.last_sr_in_h;
+            g_status.seen_w = c.id == confirm && c.last_w ? c.last_w : s.last_sr_in_w;
+            g_status.seen_h = c.id == confirm && c.last_h ? c.last_h : s.last_sr_in_h;
         }
         if (std::fabs(cur - req.percent) > 0.01f) {
+            if (c.id == confirm) na::ngx::CancelSizeConfirmation();
             set_state(SpState::GameChanged, "The game changed its resolution setting itself; its choice is kept.");
             return;
         }
-        const bool w_ok = s.last_sr_in_w + 1 >= ew && s.last_sr_in_w <= ew + 1;
-        const bool h_ok = s.last_sr_in_h + 1 >= eh && s.last_sr_in_h <= eh + 1;
-        if (s.sr_creates > before.sr_creates || s.creates > before.creates) {
-            if (w_ok && h_ok) {
-                char why[160];
-                snprintf(why, sizeof(why), "Applied: the game now renders %ux%u (%.1f%%).", s.last_sr_in_w, s.last_sr_in_h, req.percent);
-                set_state(SpState::Confirmed, why);
-                return;
-            }
-        } else if (w_ok && h_ok && before.last_sr_in_w == s.last_sr_in_w && before.last_sr_in_h == s.last_sr_in_h) {
-            set_state(SpState::Confirmed, "This mode is already the game's render size.");
+        if (c.id != confirm) {
+            set_state(SpState::NotApplied, "Another picture change replaced this request.");
+            return;
+        }
+        if (c.state == 3) { // confirm::State::Confirmed
+            char why[160];
+            snprintf(why, sizeof(why), "Applied: the game now renders %ux%u (%.1f%%), confirmed on %u frames.", c.last_w, c.last_h, req.percent, c.streak);
+            set_state(SpState::Confirmed, why);
+            return;
+        }
+        if (c.state == 4) { // confirm::State::Failed
+            char why[240];
+            snprintf(why, sizeof(why), c.creations
+                ? "Set %.1f%%; the game rebuilt DLSS but rendered %ux%u, not %ux%u. Dynamic resolution or the game's own setting may be in control."
+                : "Set %.1f%%; the game did not rebuild DLSS (still %ux%u, expected %ux%u). It may only apply this from its own menu.",
+                req.percent, c.last_w ? c.last_w : s.last_sr_in_w, c.last_h ? c.last_h : s.last_sr_in_h, ew, eh);
+            set_state(SpState::NotApplied, why);
             return;
         }
     }
-    char why[200];
-    const na::ngx::Stats s = na::ngx::GetStats();
-    snprintf(why, sizeof(why), "Set %.1f%%, but the game's DLSS still renders %ux%u (expected %ux%u). The game may be using dynamic resolution or re-applying its own setting.",
-             req.percent, s.last_sr_in_w, s.last_sr_in_h, ew, eh);
-    set_state(SpState::NotApplied, why);
 }
 
 DWORD WINAPI worker(LPVOID)
@@ -346,6 +372,34 @@ SpStatus GetScreenPercentageStatus()
 {
     std::lock_guard<std::mutex> lock(g_m);
     return g_status;
+}
+
+void CancelScreenPercentage()
+{
+    g_generation.fetch_add(1, std::memory_order_acq_rel);
+    std::lock_guard<std::mutex> lock(g_m);
+    g_pending.set = false;
+    if (g_status.state == SpState::Applying) {
+        g_status.state = SpState::Cancelled;
+        strncpy_s(g_status.reason, "Selection changed; the request was withdrawn.", _TRUNCATE);
+    }
+}
+
+bool HandBackScreenPercentage()
+{
+    CancelScreenPercentage();
+    float* ref = g_ref.load(std::memory_order_acquire);
+    std::lock_guard<std::mutex> lock(g_m);
+    if (!ref || !g_have_game_value) return false;
+    const float cur = read_value(ref);
+    if (std::fabs(cur - g_our_value) > 0.01f) { // the game has set its own value since: keep it
+        g_have_game_value = false;
+        return false;
+    }
+    const bool ok = write_value(ref, g_game_value);
+    g_have_game_value = false;
+    strncpy_s(g_status.reason, ok ? "Resolution control handed back to the game." : "Could not restore the game's resolution setting.", _TRUNCATE);
+    return ok;
 }
 
 } // namespace na::unreal

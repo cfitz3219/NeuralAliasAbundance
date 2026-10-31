@@ -179,7 +179,9 @@ add_library(host_dx12 STATIC
   src/host_dx12/adapters/tsushima/apply.cpp
   src/host_dx12/adapters/unreal/cvar_probe.cpp
   src/host_dx12/sl_boundary/sl_boundary.cpp
+  src/host_dx12/sl_boundary/sl_dlss_mode.cpp
   src/host_dx12/adapters/unreal/screen_percentage.cpp
+  src/host_dx12/adapters/mode_control.cpp
   src/host_dx12/adapters/tlou1/timing.cpp
   src/host_dx12/host_boot/host_boot.cpp
   src/host_dx12/host_boot/session.cpp)
