@@ -566,3 +566,6 @@ Cort's immediate startup crash reproduced in automated COM-wrapper fixture and c
 
 ### 2026-10-31 - Live quality supported-ABI discovery completed
 Production PR59 now3666c9d: Unreal exact-PBZ hash/RVAs replaced with supported console ABI locator.60automated testsPASS1optionalSKIP; installedPBZ read-only locatorPASS; PS5.1installerfixturesPASS. Documents PBZ/Ghost updaters prepared3666c9d (not deployed), native DLLs untouched. See COMMS and code docs/PBZ-LIVE-QUALITY-ASSESSMENT.md. New Opus Ghost overlay-not-drawing report remains open; do not call Ghost gameplay-ready. User retains live testing.
+
+### 2026-10-31 - Ghost overlay queue crash repair ready for Cort
+PR59runtimee765402/packagescripts8b3aae6 supersede failedOpus19dd3ee. Exact ACCESS_DENIED reproduced on RTX with late swapchain attachment and competing queue; fixed by buffer-specific submitted-write ownership recovery.63automatedPASS1optionalSKIP; finaloverlay6PASS, installerfixturesPASS. Documents/NA-tsushima-update.cmd ready8b3aae6, additive/rollbackvalidated, priorpackage alreadyrestored. NOdeployment/gamecontrol. Read docs/GHOST-OVERLAY-QUEUE-REPAIR.md for cause/evidence/limits. User must closegame before installing, then owns liveacceptance. COMMS has detailedhandoff.
