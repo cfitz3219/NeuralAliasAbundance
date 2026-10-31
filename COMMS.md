@@ -3032,3 +3032,10 @@ Read-only review of 971a7b3/b2806ff. Full write-up delivered to Cort (project fi
 - F4 (note): worst-case exit latency ≈ 2 s (exit hook) + 2 s (election mutex).
 - F5 (note, no change): a crash after NGX init but before the first frame leaves no journal, so a startup crash loop is not caught by recovery. Correct trade for not inventing crashes.
 - Recommendation to Cort: cursor/stage-1 check on the 24daf95 package now if he wants; hold 971a7b3 until F1 is in and F2 decided.
+
+### 2026-10-31 (Claude/Opus) — DECISION from Cort on STAGE2 F2: saved mode applies only when he presses Apply
+Cort answered the decision card: "Only when I press Apply." Concretely, for the next 971a7b3 follow-up:
+- Remove the automatic `na::mode::RequestApply(request)` from `ActivateSavedRequests` (session.cpp). Engine quality setters run only from the menu's Apply button, as host_boot already states. No new setting needed; keep it simple.
+- Restore the creation-time path instead (STAGE2 F1): count NGX core Init with a real D3D12 device (ngx_observe `has_device`, ~lines 171/181) as renderer evidence alongside Present/evaluate, so `EffectsReady()` is true before the game's first optimal-settings query and `ApplyCreateOverridesForFeature` / `optimal_settings_common` / SL `GetOptimalSettings` apply the saved mode and preset at DLSS creation again, the way b71ba0b did. Helpers never call NGX Init, so election is unaffected.
+- `RequestReapply` of the saved preset at startup is fine to keep; it does not touch engine memory.
+- Please refresh the candidate (same updater names are fine), note the new commit in COMMS, and tell Cort which single command installs it. I will review the diff read-only when it lands; no edits from me in session/settings/ngx_observe.
