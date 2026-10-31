@@ -76,6 +76,11 @@ bool HookFunction(void* target, void* detour, void** out_original);
 // gets false and LastError(). Dead targets cannot be re-hooked in this
 // session.
 bool BeginInstall();
+// Install workers only (never loader notification/render callbacks). Waits for
+// another worker's transaction, bounded; same-thread nesting fails immediately.
+// A timeout records the caller and owner thread in LastError/OutputDebugString.
+bool BeginInstallWait(const char* caller, uint32_t timeout_ms = 5000);
+uint32_t InstallWaitFailures(char* last, uint32_t capacity);
 bool PrepareHook(void* target, void* detour, void** out_original);
 bool PrepareVTableSlot(void* object, uint32_t slot_index, void* detour, void** out_original);
 bool CommitInstall();

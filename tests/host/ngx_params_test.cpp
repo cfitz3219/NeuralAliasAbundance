@@ -9,6 +9,7 @@
 //   - StripPresetHints resets all six keys; RestoreQualityValue writes back.
 #include "test_support.hpp"
 #include "fake_ngx_params.hpp"
+#include <nvsdk_ngx_defs_dlssd.h> // Ray Reconstruction preset keys
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 #include "host_dx12/settings.hpp"
 
@@ -61,6 +62,52 @@ int main()
         CHECK(ep.color == 0 && ep.depth == 0 && ep.motion == 0 && ep.output == 0);
     }
 
+    // ---- A game that computes its own render size (PBZ) never asks the
+    // optimal-settings callback about its display size. Then the quality value
+    // must not be relabelled to our mode: the input stays at the game's size.
+    // Only the preset is written. (The callback has not been called yet here.)
+    {
+        test::FakeParams p;
+        st.enabled.store(1); st.follow_game_resolution.store(0);
+        st.dlss_mode.store(static_cast<uint32_t>(na::settings::DlssMode::Balanced)); st.preset.store(13);
+        p.Set(NVSDK_NGX_Parameter_OutWidth, 3440u); p.Set(NVSDK_NGX_Parameter_OutHeight, 1440u);
+        p.Set(NVSDK_NGX_Parameter_PerfQualityValue, int(NVSDK_NGX_PerfQuality_Value_UltraPerformance));
+        CHECK(!na::ngx::OptimalQueriedFor(3440, 1440));
+        CHECK(na::ngx::ApplyCreateOverrides(&p));
+        CHECK(p.I(NVSDK_NGX_Parameter_PerfQualityValue) == NVSDK_NGX_PerfQuality_Value_UltraPerformance);
+        for (const char* k : kPresetKeys) CHECK(p.U(k) == 13u);
+    }
+    // An unrelated probe (PBZ: 1000x1000) does not count as the game asking.
+    {
+        test::FakeParams probe;
+        probe.Set(NVSDK_NGX_Parameter_Width, 1000u); probe.Set(NVSDK_NGX_Parameter_Height, 1000u);
+        na::ngx::OptimalSettingsCallback(&probe);
+        CHECK(!na::ngx::OptimalQueriedFor(3440, 1440));
+    }
+    // From here on the game asks about its 3440x1440 display (TLOU-style):
+    // our mode's quality value is written. The one-pixel rebuild nudge counts too.
+    {
+        test::FakeParams q;
+        q.Set(NVSDK_NGX_Parameter_Width, 3440u); q.Set(NVSDK_NGX_Parameter_Height, 1440u);
+        na::ngx::OptimalSettingsCallback(&q);
+        CHECK(na::ngx::OptimalQueriedFor(3440, 1440));
+        CHECK(na::ngx::OptimalQueriedFor(3439, 1439));
+        CHECK(!na::ngx::OptimalQueriedFor(1920, 1080));
+    }
+    { // Even a matching display probe does not prove the game used our answer.
+        test::FakeParams p;p.Set(NVSDK_NGX_Parameter_OutWidth,3440u);p.Set(NVSDK_NGX_Parameter_OutHeight,1440u);
+        p.Set(NVSDK_NGX_Parameter_Width,1146u);p.Set(NVSDK_NGX_Parameter_Height,480u);
+        p.Set(NVSDK_NGX_Parameter_PerfQualityValue,int(NVSDK_NGX_PerfQuality_Value_UltraPerformance));
+        CHECK(na::ngx::ApplyCreateOverrides(&p));
+        CHECK(p.I(NVSDK_NGX_Parameter_PerfQualityValue)==NVSDK_NGX_PerfQuality_Value_UltraPerformance);
+    }
+    auto with_out = [&](test::FakeParams& p) {
+        p.Set(NVSDK_NGX_Parameter_OutWidth, 3440u); p.Set(NVSDK_NGX_Parameter_OutHeight, 1440u);
+        auto q=static_cast<na::settings::DlssMode>(st.dlss_mode.load());
+        auto size=[&](unsigned v){return q==na::settings::DlssMode::DLAA?v:(static_cast<unsigned>(v*na::settings::ScaleForMode(q)+.5f)+7u)&~7u;};
+        p.Set(NVSDK_NGX_Parameter_Width,size(3440));p.Set(NVSDK_NGX_Parameter_Height,size(1440));
+    };
+
     // ---- ApplyCreateOverrides.
     {
         test::FakeParams p;
@@ -71,6 +118,7 @@ int main()
     {
         test::FakeParams p;
         st.enabled.store(1); st.dlss_mode.store(static_cast<uint32_t>(na::settings::DlssMode::DLAA)); st.preset.store(-1);
+        with_out(p);
         CHECK(na::ngx::ApplyCreateOverrides(&p));
         CHECK(p.I(NVSDK_NGX_Parameter_PerfQualityValue) == NVSDK_NGX_PerfQuality_Value_DLAA);
         for (const char* k : kPresetKeys) CHECK(!p.Has(k)); // Automatic: no preset hints written
@@ -78,6 +126,7 @@ int main()
     {
         test::FakeParams p;
         st.dlss_mode.store(static_cast<uint32_t>(na::settings::DlssMode::Performance)); st.preset.store(11); // K
+        with_out(p);
         CHECK(na::ngx::ApplyCreateOverrides(&p));
         CHECK(p.I(NVSDK_NGX_Parameter_PerfQualityValue) == NVSDK_NGX_PerfQuality_Value_MaxPerf);
         for (const char* k : kPresetKeys) CHECK(p.U(k) == 11u);
@@ -88,6 +137,62 @@ int main()
         CHECK(p.I(NVSDK_NGX_Parameter_PerfQualityValue) == NVSDK_NGX_PerfQuality_Value_MaxQuality);
     }
     CHECK(!na::ngx::ApplyCreateOverrides(nullptr));
-    st.preset.store(-1); st.dlss_mode.store(0);
+
+    // ---- Ray Reconstruction (feature 13) is the game's upscaler in RT games
+    // (Phantom Blade Zero): same quality value, its OWN preset keys (D/E/F only),
+    // never the Super Resolution keys. Frame Generation (11) is left untouched.
+    const char* kRrKeys[] = {NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA,
+                             NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality,
+                             NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced,
+                             NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Performance,
+                             NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraPerformance,
+                             NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraQuality};
+    {
+        test::FakeParams p;
+        st.enabled.store(1); st.dlss_mode.store(static_cast<uint32_t>(na::settings::DlssMode::UltraPerformance));
+        st.preset.store(13); st.rr_preset.store(5); // SR M chosen, RR E chosen
+        with_out(p);
+        CHECK(na::ngx::ApplyCreateOverridesForFeature(13, &p));
+        CHECK(p.I(NVSDK_NGX_Parameter_PerfQualityValue) == NVSDK_NGX_PerfQuality_Value_UltraPerformance);
+        for (const char* k : kRrKeys) CHECK(p.U(k) == 5u);
+        for (const char* k : kPresetKeys) CHECK(!p.Has(k)); // RR never gets SR's preset (M is "do not use" for RR)
+        CHECK(na::ngx::StripRrPresetHints(&p));
+        for (const char* k : kRrKeys) CHECK(p.U(k) == 0u);
+    }
+    {
+        test::FakeParams p;
+        st.rr_preset.store(0); // Automatic: quality value only
+        with_out(p);
+        CHECK(na::ngx::ApplyCreateOverridesForFeature(13, &p));
+        CHECK(p.Has(NVSDK_NGX_Parameter_PerfQualityValue));
+        for (const char* k : kRrKeys) CHECK(!p.Has(k));
+    }
+    {
+        test::FakeParams p;
+        CHECK(!na::ngx::ApplyCreateOverridesForFeature(11, &p)); // Frame Generation: not ours to change
+        CHECK(p.values.empty());
+        CHECK(na::ngx::ApplyCreateOverridesForFeature(1, &p));   // Super Resolution path unchanged
+        for (const char* k : kPresetKeys) CHECK(p.U(k) == 13u);
+        for (const char* k : kRrKeys) CHECK(!p.Has(k));
+    }
+    // PBZ caches its resolution: presets must not relabel an Ultra Performance
+    // 1146x480 input as DLAA, even if a stale overlay selection says DLAA.
+    st.follow_game_resolution = 1; st.dlss_mode = 0; st.preset = 13; st.rr_preset = 6;
+    for (uint32_t feature : {1u, 13u}) {
+        test::FakeParams p;
+        p.Set(NVSDK_NGX_Parameter_PerfQualityValue, int(NVSDK_NGX_PerfQuality_Value_UltraPerformance));
+        p.Set(NVSDK_NGX_Parameter_Width, 1146u); p.Set(NVSDK_NGX_Parameter_Height, 480u);
+        CHECK(na::ngx::ApplyCreateOverridesForFeature(feature, &p));
+        CHECK(p.I(NVSDK_NGX_Parameter_PerfQualityValue) == NVSDK_NGX_PerfQuality_Value_UltraPerformance);
+        CHECK(p.U(NVSDK_NGX_Parameter_Width) == 1146 && p.U(NVSDK_NGX_Parameter_Height) == 480);
+        if (feature == 1) { for (const char* k : kPresetKeys) CHECK(p.U(k) == 13u); }
+        else { for (const char* k : kRrKeys) CHECK(p.U(k) == 6u); }
+    }
+    st.preset = -1; st.rr_preset = 0;
+    test::FakeParams automatic;
+    CHECK(!na::ngx::ApplyCreateOverridesForFeature(13, &automatic));
+    CHECK(automatic.values.empty());
+    st.follow_game_resolution = 0;
+    st.preset.store(-1); st.rr_preset.store(0); st.dlss_mode.store(0);
     return test::finish("ngx_params_test");
 }

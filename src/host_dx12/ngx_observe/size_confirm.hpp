@@ -54,27 +54,28 @@ inline bool CoversSubrect(uint64_t res_w, uint64_t res_h, uint32_t bx, uint32_t 
 class FeatureFlags {
 public:
     static constexpr uint32_t kUnknown = 0xFFFFFFFFu;
-    void Set(uint64_t handle, uint32_t flags)
+    void Set(uint64_t handle, uint32_t flags, uint64_t core = 0)
     {
         if (!handle) return;
-        for (Entry& e : e_) if (e.handle == handle) { e.flags = flags; return; }
-        for (Entry& e : e_) if (e.handle == 0) { e = {handle, flags}; return; }
-        e_[next_++ % kEntries] = {handle, flags}; // full: overwrite round-robin
+        for (Entry& e : e_) if (e.handle == handle && e.core == core) { e.flags = flags; return; }
+        for (Entry& e : e_) if (e.handle == 0) { e = {handle, flags, core}; return; }
+        e_[next_++ % kEntries] = {handle, flags, core}; // full: overwrite round-robin
     }
-    uint32_t Get(uint64_t handle) const
+    uint32_t Get(uint64_t handle, uint64_t core = 0) const
     {
         if (!handle) return kUnknown;
-        for (const Entry& e : e_) if (e.handle == handle) return e.flags;
+        for (const Entry& e : e_) if (e.handle == handle && e.core == core) return e.flags;
         return kUnknown;
     }
-    void Erase(uint64_t handle)
+    void Erase(uint64_t handle, uint64_t core = 0)
     {
-        for (Entry& e : e_) if (e.handle == handle) e = {};
+        for (Entry& e : e_) if (e.handle == handle && e.core == core) e = {};
     }
+    void EraseCore(uint64_t core) { for (Entry& e : e_) if (e.core == core) e = {}; }
 
 private:
     static constexpr uint32_t kEntries = 8;
-    struct Entry { uint64_t handle = 0; uint32_t flags = kUnknown; };
+    struct Entry { uint64_t handle = 0; uint32_t flags = kUnknown; uint64_t core = 0; };
     Entry e_[kEntries]{};
     uint32_t next_ = 0;
 };
@@ -124,6 +125,9 @@ struct EvalObs {
     bool reset;       // history-reset flag raised
     bool ok;          // the evaluate call succeeded and its parameters were readable
     uint64_t handle;  // the feature handle the game evaluated (0 = unknown)
+    uint64_t core = 0;
+    uint32_t out_w = 0, out_h = 0;
+    bool upscaler = false;
 };
 
 class Monitor {
@@ -144,12 +148,17 @@ public:
         n.need = need ? need : 1;
         n.armed_tick = now;
         s_ = n;
+        live_ = false; out_w_ = out_h_ = 0; core_ = 0;
         handle_ = 0;
         eligible_ = false;
         create_timeout_ = create_timeout_ms;
         confirm_timeout_ = confirm_timeout_ms;
         overall_deadline_ = now + overall_timeout_ms;
         return n.id;
+    }
+    uint64_t ArmLive(uint32_t w,uint32_t h,uint32_t ow,uint32_t oh,uint32_t need,uint64_t now,uint64_t timeout) {
+        const auto id=Arm(w,h,need,now,timeout,timeout,timeout);
+        live_=true;out_w_=ow;out_h_=oh;return id;
     }
     // Withdraws the running request (no effect on a finished one).
     void Cancel(uint64_t now)
@@ -175,9 +184,17 @@ public:
         s_.created_w = w;
         s_.created_h = h;
         s_.created_tick = now;
+        if(live_)return; // existing/new SR/RR handles bind on actual evaluation
         handle_ = handle;
         eligible_ = handle != 0;
         s_.streak = 0; // a replaced feature starts its own streak; deadlines are unchanged
+    }
+    // A released live handle may be replaced without confusing it with a second viewport.
+    void OnRelease(uint64_t handle, uint64_t core, uint64_t now) {
+        Tick(now);
+        if(Active() && live_ && eligible_ && handle_==handle && core_==core) {
+            eligible_=false;handle_=core_=0;s_.streak=0;
+        }
     }
     // One DLSS evaluation, successful or not.
     void OnEvaluate(const EvalObs& e, uint64_t now)
@@ -192,6 +209,15 @@ public:
             ++s_.unknown_handle;
             s_.streak = 0;
             return;
+        }
+        if(live_) {
+            if(!e.upscaler || e.out_w!=out_w_ || e.out_h!=out_h_) {++s_.other_feature;return;}
+            if(!eligible_ && e.ok && e.coherent && e.w==s_.req_w && e.h==s_.req_h) {handle_=e.handle;core_=e.core;eligible_=true;s_.created_tick=now;}
+            if(eligible_ && (e.handle!=handle_ || e.core!=core_)) {
+                // Two simultaneous streams at this output cannot be called the
+                // main viewport without additional provenance.
+                finish(State::Failed,Reason::UnknownFeature,now);return;
+            }
         }
         if (!eligible_ || e.handle != handle_) {
             ++s_.other_feature;
@@ -260,6 +286,9 @@ private:
     uint64_t last_id_ = 0;
     uint64_t handle_ = 0;
     bool eligible_ = false;
+    bool live_ = false;
+    uint64_t core_ = 0;
+    uint32_t out_w_ = 0, out_h_ = 0;
     uint64_t create_timeout_ = 0, confirm_timeout_ = 0, overall_deadline_ = 0;
 };
 

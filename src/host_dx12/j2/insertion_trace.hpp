@@ -242,6 +242,7 @@ public:
                 producer = e.pipeline;
                 ColorEvent c;
                 c.write = true; c.op = op; c.with_depth = e.with_depth;
+                c.producer = producer;
                 c.list_start = first; first = false;
                 out.push_back(c);
             } else if ((IsConsumer(op) && e.destination != color) || op == Op::Barrier) {

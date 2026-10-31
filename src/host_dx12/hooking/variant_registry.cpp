@@ -200,7 +200,7 @@ Coverage ensure_locked(Registry& r, const void* const* targets_in, uint32_t coun
         plans[plan_count++] = {si, free_thunk, target};
     }
     if (plan_count) {
-        bool ok = na::hooking::BeginInstall();
+        bool ok = na::hooking::BeginInstallWait("hooking/variant_registry.cpp");
         for (uint32_t i = 0; ok && i < plan_count; ++i) {
             Slot& s = r.slots[plans[i].slot];
             ok = na::hooking::PrepareHook(plans[i].target, s.thunks[plans[i].thunk], &s.originals[plans[i].thunk]);
@@ -358,6 +358,10 @@ uint32_t WarmUpCommandLists(ID3D12Device* device, uint32_t type_mask)
         const auto ensure = [&]() {
             EnsureObject(Kind::CommandList, list.Get());
             ++ensured;
+            if(R(Kind::CommandList7).pub_slot_count.load(std::memory_order_acquire)) {
+                ComPtr<ID3D12GraphicsCommandList7> l7;
+                if(SUCCEEDED(list.As(&l7)) && l7)EnsureObject(Kind::CommandList7,l7.Get());
+            }
             if (!R(Kind::CommandList4).pub_slot_count.load(std::memory_order_acquire)) return;
             ComPtr<ID3D12GraphicsCommandList4> l4;
             if (SUCCEEDED(list.As(&l4)) && l4) EnsureObject(Kind::CommandList4, l4.Get());

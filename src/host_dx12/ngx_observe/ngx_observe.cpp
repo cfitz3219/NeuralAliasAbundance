@@ -2,6 +2,8 @@
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 
 #include "host_dx12/nr/nr_pass.hpp"
+#include "host_dx12/nr/native_fg.hpp"
+#include "host_dx12/nr/queue_trace.hpp"
 #include "host_dx12/motion/live_flow.hpp"
 
 #include "host_dx12/capture/frame_capture.hpp"
@@ -10,8 +12,10 @@
 #include "host_dx12/ngx_observe/gpu_timing.hpp"
 #include "host_dx12/ngx_observe/size_confirm.hpp"
 #include "host_dx12/settings.hpp"
+#include "host_dx12/host_boot/session.hpp"
 
 #include <d3d12.h>
+#include <wrl/client.h>
 
 #include <atomic>
 #include <cmath>
@@ -20,6 +24,9 @@
 #include <cwctype>
 #include <mutex>
 #include <vector>
+#include <array>
+#include <utility>
+#include <algorithm>
 
 #if defined(NA_HAVE_NGX_SDK)
 // Locally pinned NVIDIA SDK headers (never committed; see third_party/README).
@@ -27,7 +34,9 @@
 #include <d3d12.h>
 #pragma warning(push, 3)
 #include <nvsdk_ngx_defs.h>
+#include <nvsdk_ngx_defs_dlssd.h> // Ray Reconstruction: preset keys and DLSSDOptimalSettingsCallback
 #include <nvsdk_ngx_params.h>
+#include "host_dx12/nr/fg_contract.hpp"
 #pragma warning(pop)
 #endif
 
@@ -62,6 +71,7 @@ using PfnGetCapParams = NgxResult(__cdecl*)(void** out_params);
 // DLL, which answered 0xBAD00002 for every DLSS creation. Now each module
 // gets its own slot and detours, and feature DLLs are never hooked.
 struct CoreSlot {
+    std::atomic<bool> has_device{false};
     std::atomic<HMODULE> module{nullptr};
     PfnInitExt init_ext = nullptr;
     PfnInitProjectId init_pid = nullptr;
@@ -70,6 +80,8 @@ struct CoreSlot {
     PfnReleaseFeature release = nullptr;
     PfnShutdown1 shutdown1 = nullptr;
     PfnGetCapParams getcap = nullptr;
+    PfnGetCapParams getparams = nullptr;   // NVSDK_NGX_D3D12_GetParameters (deprecated path)
+    PfnGetCapParams allocate = nullptr; // public AllocateParameters path
     std::atomic<uint32_t> hooked{0};       // exports hooked in this module
     std::atomic<uint32_t> init_succeeded{0}; // the game initialised THIS core
 };
@@ -133,26 +145,30 @@ void push_record(CallKind kind, int32_t result, uint32_t feature_id,
 // A43: once the game has initialised a core, the live NR pass must create
 // its feature through THAT core's entry points (one-time work at Init, not
 // per frame; SetRuntime only stores pointers under the pass's mutex).
-void on_core_initialised(CoreSlot& s)
+na::nr::Runtime core_runtime(CoreSlot& s)
 {
     HMODULE m = s.module.load(std::memory_order_acquire);
-    if (!m) return; // cannot happen after A45 (module published before enable); never consume the notification without it
-    if (s.init_succeeded.exchange(1, std::memory_order_acq_rel)) return; // first success only
     na::nr::Runtime rt;
+    if (!m) return rt;
     rt.create_feature = reinterpret_cast<void*>(s.create);
     rt.evaluate_feature = reinterpret_cast<void*>(s.evaluate);
     rt.release_feature = reinterpret_cast<void*>(s.release);
     rt.allocate_parameters = reinterpret_cast<void*>(GetProcAddress(m, "NVSDK_NGX_D3D12_AllocateParameters"));
     rt.destroy_parameters = reinterpret_cast<void*>(GetProcAddress(m, "NVSDK_NGX_D3D12_DestroyParameters"));
     rt.get_capability_parameters = reinterpret_cast<void*>(s.getcap);
-    na::nr::SetRuntime(rt);
+    return rt;
+}
+void on_core_initialised(CoreSlot& s)
+{
+    if (!s.module.load() || s.init_succeeded.exchange(1)) return;
+    na::nr::SetRuntime(core_runtime(s));
 }
 
 NgxResult InitExtImpl(CoreSlot& s, unsigned long long app_id, const wchar_t* data_path, void* device,
                       uint32_t sdk_version, const void* params)
 {
     NgxResult r = s.init_ext(app_id, data_path, device, sdk_version, params);
-    if (r == 1) on_core_initialised(s);
+    if (r == 1) { s.has_device.store(device!=nullptr); on_core_initialised(s); na::nr::native::PrepareDevice(static_cast<ID3D12Device*>(device)); }
     g_inits.fetch_add(1, std::memory_order_relaxed);
     push_record(CallKind::Init, r, 0, app_id, 0, 0);
     return r;
@@ -162,7 +178,7 @@ NgxResult InitProjectIdImpl(CoreSlot& s, const char* project_id, uint32_t engine
                             const wchar_t* data_path, void* device, uint32_t sdk_version, const void* params)
 {
     NgxResult r = s.init_pid(project_id, engine_type, engine_version, data_path, device, sdk_version, params);
-    if (r == 1) on_core_initialised(s);
+    if (r == 1) { s.has_device.store(device!=nullptr); on_core_initialised(s); na::nr::native::PrepareDevice(static_cast<ID3D12Device*>(device)); }
     g_inits.fetch_add(1, std::memory_order_relaxed);
     push_record(CallKind::Init, r, 0, 0, 0, 0);
     return r;
@@ -176,7 +192,54 @@ std::mutex g_confirm_m;
 confirm::Monitor g_confirm;
 confirm::FeatureFlags g_feature_flags; // A68: creation flags per game handle (guarded by g_confirm_m)
 std::atomic<uint32_t> g_rr_seen{0};
+std::atomic<uint32_t> g_active_upscaler{0}; // 1 or 13: the game's most recent successful upscaler creation
 std::atomic<uint32_t> g_fg_seen{0};
+struct FgHandle { const CoreSlot* core = nullptr; const void* handle = nullptr; };
+FgHandle g_fg_handles[32]; // guarded by g_confirm_m; do not infer an evaluate from a creation
+std::atomic<uint64_t> g_fg_evaluates{0}, g_fg_with_inputs{0}, g_fg_with_hudless{0}, g_fg_with_distortion{0};
+std::atomic<uint32_t> g_fg_list_type{0xFFFFFFFFu}, g_fg_color_format{0}, g_fg_color_w{0}, g_fg_color_h{0};
+std::atomic<uint64_t> g_fg_with_frame_id{0}, g_fg_with_alpha{0}, g_fg_with_ui{0};
+std::atomic<uint32_t> g_fg_last_create_uir{UINT32_MAX};
+
+uint32_t inspect_fg_create_uir(const void* raw)
+{
+    uint32_t value = UINT32_MAX;
+#if defined(NA_HAVE_NGX_SDK)
+    __try {
+        if (raw) na::nr::FgRead(static_cast<const NVSDK_NGX_Parameter*>(raw),
+                               "DLSSG.UserInterfaceRecompositionEnabled", &value);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { value = UINT32_MAX; }
+#else
+    (void)raw;
+#endif
+    return value;
+}
+
+void inspect_fg_inputs(void* command_list, const void* raw)
+{
+    g_fg_evaluates.fetch_add(1, std::memory_order_relaxed);
+#if defined(NA_HAVE_NGX_SDK)
+    if (!raw) return;
+    __try {
+        const auto* p = static_cast<const NVSDK_NGX_Parameter*>(raw);
+        const auto frame = na::nr::ReadFgContract(p);
+        auto* color = frame.color.resource;
+        if (command_list) g_fg_list_type.store(static_cast<ID3D12GraphicsCommandList*>(command_list)->GetType());
+        if (color) {
+            const auto desc = color->GetDesc();
+            g_fg_color_format.store(desc.Format); g_fg_color_w.store(static_cast<uint32_t>(desc.Width)); g_fg_color_h.store(desc.Height);
+        }
+        if (command_list && color && frame.depth.resource && frame.motion.resource) g_fg_with_inputs.fetch_add(1);
+        if (frame.hudless.resource) g_fg_with_hudless.fetch_add(1);
+        if (frame.distortion.resource) g_fg_with_distortion.fetch_add(1);
+        if (frame.has_frame_id) g_fg_with_frame_id.fetch_add(1);
+        if (frame.alpha.resource) g_fg_with_alpha.fetch_add(1);
+        if (frame.ui.resource) g_fg_with_ui.fetch_add(1);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { /* diagnostics must not interrupt native FG */ }
+#else
+    (void)command_list; (void)raw;
+#endif
+}
 std::atomic<HMODULE> g_hooked_module{nullptr};
 std::atomic<uint64_t> g_sr_creates{0};
 std::atomic<uint64_t> g_sr_creates_unknown{0}, g_sr_creates_injector{0};
@@ -186,7 +249,24 @@ std::atomic<uint64_t> g_create_failures{0}, g_create_recovered{0};
 std::atomic<uint32_t> g_preset_rejected{0}, g_quality_rejected{0};
 std::atomic<const void*> g_last_sr_handle{nullptr}; // A46: the feature "Apply now" re-creates
 std::mutex g_reapply_mutex;               // rare path only (apply / release)
-EvalParams g_last_sr_create{};            // A63: the game's last successful DLSS creation (sizes, quality, flags), guarded by g_reapply_mutex
+CoreSlot* g_last_sr_core=nullptr; // guarded with the handle and snapshot by g_reapply_mutex
+using SrReceipt=std::shared_ptr<const std::atomic<bool>>;
+struct SrUses {
+    std::shared_ptr<std::atomic<uint32_t>> calls=std::make_shared<std::atomic<uint32_t>>(0);
+    CoreSlot* core=nullptr;
+    const void* handle=nullptr;
+    EvalParams create{};
+    Microsoft::WRL::ComPtr<ID3D12Device> device;
+    std::vector<SrReceipt> receipts;
+    bool untracked=false;
+};
+std::vector<SrUses> g_sr_uses; // g_reapply_mutex
+void AddSrUse(SrUses& use,const SrReceipt& receipt) {
+    use.receipts.erase(std::remove_if(use.receipts.begin(),use.receipts.end(),
+        [](const auto& r){return r->load(std::memory_order_acquire);}),use.receipts.end());
+    if(!receipt)use.untracked=true;
+    else if(std::find(use.receipts.begin(),use.receipts.end(),receipt)==use.receipts.end())use.receipts.push_back(receipt);
+}
 constexpr uint32_t kFeatureRayReconstruction = 13; // NVSDK_NGX_Feature_RayReconstruction
 
 // A66 (R3): bounded per-creation records. The detour captures only raw
@@ -277,7 +357,9 @@ NgxResult CreateFeatureImpl(CoreSlot& s, void* cmd_list, uint32_t feature_id, vo
     if (feature_id == 11) g_fg_seen.store(1, std::memory_order_release); // NVSDK_NGX_Feature_FrameGeneration
     EvalParams before{};
     ReadEvalParams(params, &before); // the game's own quality value, for the fallback
-    bool overrode = ApplyCreateOverrides(params); // takeover step: write hints
+    // Takeover step: write hints into the game's UPSCALER, whichever it creates
+    // (Super Resolution or Ray Reconstruction); other features are left alone.
+    bool overrode = ApplyCreateOverridesForFeature(feature_id, params);
     EvalParams ep{};
     ReadEvalParams(params, &ep); // read before: capture inputs even on failure
     ep.overridden = overrode ? 1u : 0u;
@@ -287,10 +369,12 @@ NgxResult CreateFeatureImpl(CoreSlot& s, void* cmd_list, uint32_t feature_id, vo
     // made the creation fail, retry without the preset hints; if that still
     // fails, retry with the game's own quality value. Never leave the game
     // without DLSS because of a hint.
-    if (r != 1 && feature_id == 1 && overrode) {
-        if (StripPresetHints(params)) {
+    if (r != 1 && (feature_id == 1 || feature_id == kFeatureRayReconstruction) && overrode) {
+        const bool rr = feature_id == kFeatureRayReconstruction;
+        if (rr ? StripRrPresetHints(params) : StripPresetHints(params)) {
             g_preset_rejected.store(1, std::memory_order_release);
-            na::settings::Get().preset.store(-1, std::memory_order_release); // menu saves this
+            if (rr) na::settings::Get().rr_preset.store(0, std::memory_order_release); // menu saves this
+            else na::settings::Get().preset.store(-1, std::memory_order_release);
             r = g_orig_create(cmd_list, feature_id, params, out_handle);
         }
         if (r != 1 && before.perf_quality != 0xFFFFFFFFu && RestoreQualityValue(params, before.perf_quality)) {
@@ -300,6 +384,33 @@ NgxResult CreateFeatureImpl(CoreSlot& s, void* cmd_list, uint32_t feature_id, vo
         if (r == 1) g_create_recovered.fetch_add(1, std::memory_order_relaxed);
     }
     if (r != 1) g_create_failures.fetch_add(1, std::memory_order_relaxed);
+    if (r == 1 && feature_id == 11 && out_handle && *out_handle) {
+        na::nr::native::Release(&s,*out_handle); // new feature incarnation, even if the core reuses a handle address
+        na::nr::native::Register(&s,*out_handle); // compute FG owns the route too, before its first evaluate
+        na::nr::native::Prepare(static_cast<ID3D12GraphicsCommandList*>(cmd_list));
+        g_fg_last_create_uir.store(inspect_fg_create_uir(params));
+        std::lock_guard<std::mutex> lock(g_confirm_m);
+        for (auto& entry : g_fg_handles) if (!entry.handle || (entry.core == &s && entry.handle == *out_handle)) {
+            entry = {&s, *out_handle}; break;
+        }
+    }
+    if (r == 1 && (feature_id == 1 || feature_id == kFeatureRayReconstruction))
+        g_active_upscaler.store(feature_id, std::memory_order_release); // the game's upscaler NOW
+    if (r == 1 && feature_id == kFeatureRayReconstruction) {
+        // Ray Reconstruction upscales too: the size it was created with is the menu's
+        // "active" evidence, as for Super Resolution. (Not the A46/A63 re-creation
+        // snapshot, which rebuilds a Super Resolution feature.)
+        g_last_sr_in_w.store(ep.in_width, std::memory_order_relaxed);
+        g_last_sr_in_h.store(ep.in_height, std::memory_order_relaxed);
+        g_last_sr_out_w.store(ep.out_width, std::memory_order_relaxed);
+        g_last_sr_out_h.store(ep.out_height, std::memory_order_relaxed);
+        // ...and it is the feature an armed render-size confirmation (Apply) waits for.
+        std::lock_guard<std::mutex> lock(g_confirm_m);
+        const uint64_t hnd = out_handle ? reinterpret_cast<uint64_t>(*out_handle) : 0;
+        g_feature_flags.Set(hnd, ep.valid ? ep.create_flags : 0xFFFFFFFFu,reinterpret_cast<uint64_t>(&s));
+        if (g_confirm_active.load(std::memory_order_acquire))
+            g_confirm.OnCreate(ep.valid ? ep.in_width : 0, ep.valid ? ep.in_height : 0, hnd, GetTickCount64());
+    }
     if (r == 1 && feature_id == 1) { // NVSDK_NGX_Result_Success, DLSS super resolution
         // A30: evidence for the menu's "active" state â€” the size the game
         // actually created its DLSS feature with (poison 0xFFFFFFFF = unread).
@@ -309,15 +420,19 @@ NgxResult CreateFeatureImpl(CoreSlot& s, void* cmd_list, uint32_t feature_id, vo
         g_last_sr_out_h.store(ep.out_height, std::memory_order_relaxed);
         g_sr_creates.fetch_add(1, std::memory_order_release);
         g_sr_creates_unknown.fetch_add(1, std::memory_order_release);
-        if (out_handle) g_last_sr_handle.store(*out_handle, std::memory_order_release); // A46 apply target
-        if (ep.valid) { // A63: what a re-creation from scratch needs
+        if (out_handle && *out_handle) {
+            const auto receipt=s.has_device.load()?na::nr::native::TrackUse(static_cast<ID3D12GraphicsCommandList*>(cmd_list)):SrReceipt{};
             std::lock_guard<std::mutex> lock(g_reapply_mutex);
-            g_last_sr_create = ep;
+            g_last_sr_handle.store(*out_handle,std::memory_order_release);
+            g_last_sr_core=&s;
+            SrUses uses;uses.core=&s;uses.handle=*out_handle;uses.create=ep;AddSrUse(uses,receipt);
+            if(receipt)static_cast<ID3D12GraphicsCommandList*>(cmd_list)->GetDevice(IID_PPV_ARGS(&uses.device));
+            g_sr_uses.push_back(std::move(uses));
         }
         {
             std::lock_guard<std::mutex> lock(g_confirm_m);
             uint64_t hnd = out_handle ? reinterpret_cast<uint64_t>(*out_handle) : 0;
-            g_feature_flags.Set(hnd, ep.valid ? ep.create_flags : 0xFFFFFFFFu); // A68: flags bound to this feature
+            g_feature_flags.Set(hnd, ep.valid ? ep.create_flags : 0xFFFFFFFFu,reinterpret_cast<uint64_t>(&s)); // A68: flags bound to this feature
             if (g_confirm_active.load(std::memory_order_acquire)) { // A66 (R1): the feature the request waits for
                 uint32_t w = ep.valid ? ep.in_width : 0, h = ep.valid ? ep.in_height : 0;
                 g_confirm.OnCreate(w, h, hnd, GetTickCount64());
@@ -350,6 +465,7 @@ NgxResult CreateFeatureImpl(CoreSlot& s, void* cmd_list, uint32_t feature_id, vo
     g_creates.fetch_add(1, std::memory_order_relaxed);
     uint64_t handle =
         (out_handle && *out_handle) ? reinterpret_cast<uint64_t>(*out_handle) : 0;
+    ep.preset_hint = CreatePresetHint(feature_id, params); // what the runtime was finally handed (after any A42 retry)
     push_record(CallKind::CreateFeature, r, feature_id, 0, handle,
                 reinterpret_cast<uint64_t>(cmd_list), &ep);
     return r;
@@ -363,28 +479,37 @@ NgxResult CreateFeatureImpl(CoreSlot& s, void* cmd_list, uint32_t feature_id, vo
 // game evaluates with (Streamline keeps one object per feature with the
 // creation keys still set), then map the game's handle to ours: evaluates
 // and the eventual release are forwarded to the new feature; the old one is
-// released a few evaluates later so in-flight GPU work is never cut off.
+// retained until its recorded commands are discarded or finish on the GPU.
 // Size changes (DLAA/Quality/...) still need the game to rebuild its render
 // targets; that is stated in the menu and cannot be done from here.
 constexpr int kMaxHandleMaps = 4;
 struct HandleMap {
+    CoreSlot* core=nullptr; // all map access is guarded by g_reapply_mutex
     std::atomic<const void*> game{nullptr};
     std::atomic<const void*> ours{nullptr};
     std::atomic<void*> params{nullptr}; // A63: our own parameter object when the feature was built from scratch
 };
 HandleMap g_handle_maps[kMaxHandleMaps];
-struct Retired { const void* handle; uint64_t due; };
+struct Retired { SrUses uses; void* params=nullptr; };
 std::vector<Retired> g_retired;           // guarded by g_reapply_mutex
-std::atomic<uint32_t> g_retired_count{0}; // fast check without the mutex
 std::atomic<uint32_t> g_reapply_pending{0};
 std::atomic<uint64_t> g_reapplies{0}, g_reapply_failures{0};
-constexpr uint64_t kRetireAfterEvaluates = 8;
-
-const void* mapped_handle(const void* game)
+void DestroySrParams(CoreSlot& core,void* params)
 {
-    for (HandleMap& m : g_handle_maps)
-        if (m.game.load(std::memory_order_acquire) == game) return m.ours.load(std::memory_order_acquire);
-    return nullptr;
+    if(!params)return;
+    using Fn=int32_t(__cdecl*)(void*);
+    if(auto module=core.module.load())if(auto fn=reinterpret_cast<Fn>(GetProcAddress(module,"NVSDK_NGX_D3D12_DestroyParameters")))fn(params);
+}
+void CollectSrLocked() {
+    for(size_t i=0;i<g_retired.size();) {
+        auto& r=g_retired[i];
+        if(!r.uses.untracked && !r.uses.calls->load() && std::all_of(r.uses.receipts.begin(),r.uses.receipts.end(),
+            [](const auto& receipt){return receipt->load(std::memory_order_acquire);}) &&
+            r.uses.core->release(const_cast<void*>(r.uses.handle))==1) {
+            DestroySrParams(*r.uses.core,r.params);
+            g_retired.erase(g_retired.begin()+i);
+        } else ++i;
+    }
 }
 
 // Writes the current preset choice into the feature's parameter object
@@ -392,6 +517,7 @@ const void* mapped_handle(const void* game)
 // game's and are left untouched.
 bool write_preset_only(void* params)
 {
+    if (!na::settings::EffectsReady())return true;
     if (!params) return true; // nothing to write (test stubs pass no parameter object)
 #if defined(NA_HAVE_NGX_SDK)
     int32_t preset = na::settings::Get().preset.load(std::memory_order_acquire);
@@ -419,10 +545,9 @@ bool write_preset_only(void* params)
 // successful creation (sizes, quality value, create flags) plus the preset.
 // Returns the NGX result; on success *params_out is our object (destroyed
 // when the feature is released).
-NgxResult create_from_snapshot_locked(CoreSlot& s, void* cmd_list, void** out_handle, void** params_out)
+NgxResult create_from_snapshot_locked(CoreSlot& s, const EvalParams& c, void* cmd_list, void** out_handle, void** params_out)
 {
 #if defined(NA_HAVE_NGX_SDK)
-    const EvalParams& c = g_last_sr_create;
     HMODULE m = s.module.load(std::memory_order_acquire);
     if (!c.valid || !m || c.in_width == 0xFFFFFFFFu || c.out_width == 0xFFFFFFFFu || c.perf_quality == 0xFFFFFFFFu) return -1;
     using PfnAlloc = int32_t(__cdecl*)(void**);
@@ -447,7 +572,7 @@ NgxResult create_from_snapshot_locked(CoreSlot& s, void* cmd_list, void** out_ha
     else destroy(raw);
     return r;
 #else
-    (void)s; (void)cmd_list; (void)out_handle; (void)params_out;
+    (void)s; (void)c; (void)cmd_list; (void)out_handle; (void)params_out;
     return -1;
 #endif
 }
@@ -459,71 +584,75 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
         return s.evaluate(cmd_list, handle, params, callback);
     }
     auto* list = static_cast<ID3D12GraphicsCommandList*>(cmd_list);
-    const void* game_handle = handle; // A66: identity as the game sees it (creation records use the same)
-    // A46: forward to our re-created feature when the game's handle is mapped.
-    if (const void* ours = mapped_handle(handle)) handle = ours;
-    if (g_reapply_pending.load(std::memory_order_acquire) && handle == g_last_sr_handle.load(std::memory_order_acquire) &&
-        g_reapply_pending.exchange(0, std::memory_order_acq_rel)) {
-        std::lock_guard<std::mutex> lock(g_reapply_mutex);
-        void* new_handle = nullptr;
-        void* own_params = nullptr;
-        bool wrote = write_preset_only(const_cast<void*>(params));
-        NgxResult cr = wrote ? s.create(cmd_list, 1u, const_cast<void*>(params), &new_handle) : -1;
-        if (cr != 1) cr = create_from_snapshot_locked(s, cmd_list, &new_handle, &own_params); // A63 fallback
-        if (cr == 1 && new_handle) {
-            // Find the game's key for this handle (the original game handle, or the one already mapped).
-            const void* game_key = handle;
-            for (HandleMap& m : g_handle_maps)
-                if (m.ours.load(std::memory_order_acquire) == handle) { game_key = m.game.load(std::memory_order_acquire); break; }
-            HandleMap* slot = nullptr;
-            for (HandleMap& m : g_handle_maps)
-                if (m.game.load(std::memory_order_acquire) == game_key) { slot = &m; break; }
-            if (!slot)
-                for (HandleMap& m : g_handle_maps)
-                    if (!m.game.load(std::memory_order_acquire)) { slot = &m; break; }
-            if (slot) {
-                if (void* old = slot->params.exchange(own_params, std::memory_order_acq_rel)) { // previous from-scratch object
-                    using PfnDestroy = int32_t(__cdecl*)(void*);
-                    if (HMODULE m = s.module.load(std::memory_order_acquire))
-                        if (auto destroy = reinterpret_cast<PfnDestroy>(GetProcAddress(m, "NVSDK_NGX_D3D12_DestroyParameters"))) destroy(old);
-                }
-                slot->ours.store(new_handle, std::memory_order_release);
-                slot->game.store(game_key, std::memory_order_release);
-                g_retired.push_back({handle, g_evaluates.load(std::memory_order_relaxed) + kRetireAfterEvaluates});
-                g_retired_count.store(static_cast<uint32_t>(g_retired.size()), std::memory_order_release);
-                g_last_sr_handle.store(new_handle, std::memory_order_release);
-                g_reapplies.fetch_add(1, std::memory_order_relaxed);
-                handle = new_handle;
-            } else {
-                s.release(new_handle); // no map slot: keep the old feature
-                if (own_params) {
-                    using PfnDestroy = int32_t(__cdecl*)(void*);
-                    if (HMODULE m = s.module.load(std::memory_order_acquire))
-                        if (auto destroy = reinterpret_cast<PfnDestroy>(GetProcAddress(m, "NVSDK_NGX_D3D12_DestroyParameters"))) destroy(own_params);
-                }
-                g_reapply_failures.fetch_add(1, std::memory_order_relaxed);
-            }
-        } else {
-            g_reapply_failures.fetch_add(1, std::memory_order_relaxed);
-        }
-        push_record(CallKind::CreateFeature, cr, 1u, 0, reinterpret_cast<uint64_t>(new_handle), reinterpret_cast<uint64_t>(cmd_list));
+    if(list && s.has_device.load(std::memory_order_acquire))na::host::RendererObserved();
+    bool native_fg = false;
+    {
+        std::lock_guard<std::mutex> lock(g_confirm_m);
+        for (const auto& entry : g_fg_handles) if (entry.core == &s && entry.handle == handle) { native_fg = true; break; }
     }
-    if (g_retired_count.load(std::memory_order_acquire)) {
+    if (native_fg) {
+        inspect_fg_inputs(cmd_list, params);
+        na::nr::native::InputOverride fg_inputs;
+        na::nr::native::Before(list,&s,handle,params,core_runtime(s),&fg_inputs);
+        na::nr::trace::Record("fg_begin",nullptr,list);
+        const NgxResult result = s.evaluate(cmd_list, handle, params, callback);
+        na::nr::native::After(&s,handle,result);
+        na::nr::trace::Record("fg_end",nullptr,list,0,0,result);
+        g_evaluates.fetch_add(1, std::memory_order_relaxed);
+        g_evaluates_external.fetch_add(1, std::memory_order_release);
+        push_record(CallKind::EvaluateFeature, result, 11u, 0, reinterpret_cast<uint64_t>(handle),
+                    reinterpret_cast<uint64_t>(cmd_list));
+        // A reused parameter object may still contain SR/RR keys. FG must
+        // never publish those stale keys as a new upscaler input snapshot or
+        // advance the SR/RR size-confirmation monitor.
+        return result;
+    }
+    const void* game_handle = handle; // A66: identity as the game sees it (creation records use the same)
+    // Acquire the recording receipt before any feature can record GPU work.
+    // A null-device observation stub has no real command list; never dereference it.
+    const auto receipt=s.has_device.load()?na::nr::native::TrackUse(list):SrReceipt{};
+    Microsoft::WRL::ComPtr<ID3D12Device> eval_device;
+    if(receipt)list->GetDevice(IID_PPV_ARGS(&eval_device));
+    std::shared_ptr<std::atomic<uint32_t>> active_call;
+    {
         std::lock_guard<std::mutex> lock(g_reapply_mutex);
-        uint64_t now = g_evaluates.load(std::memory_order_relaxed);
-        for (size_t i = 0; i < g_retired.size();) {
-            if (g_retired[i].due <= now) {
-                s.release(const_cast<void*>(g_retired[i].handle));
-                g_retired.erase(g_retired.begin() + static_cast<std::ptrdiff_t>(i));
-            } else {
-                ++i;
+        CollectSrLocked();
+        HandleMap* slot=nullptr;
+        for(auto& m:g_handle_maps)if(m.core==&s && m.game.load()==game_handle){slot=&m;handle=m.ours.load();break;}
+        auto use=std::find_if(g_sr_uses.begin(),g_sr_uses.end(),[&](const auto& u){return u.core==&s && u.handle==handle;});
+        if(use!=g_sr_uses.end()) {
+            AddSrUse(*use,receipt);
+            if(g_last_sr_core==&s && handle==g_last_sr_handle.load() && na::settings::EffectsReady() && g_reapply_pending.exchange(0)) {
+                if(!slot)for(auto& m:g_handle_maps)if(!m.game.load()){slot=&m;break;}
+                // Reserve capacity BEFORE Create: even a rejected replacement may
+                // record commands. Never create then immediately release for lack of a map.
+                if(slot && !use->untracked && use->device && use->device==eval_device) {
+                    void* replacement=nullptr;void* own_params=nullptr;
+                    const auto snapshot=use->create;
+                    bool wrote=write_preset_only(const_cast<void*>(params));
+                    NgxResult cr=wrote?s.create(cmd_list,1u,const_cast<void*>(params),&replacement):-1;
+                    if(cr!=1)cr=create_from_snapshot_locked(s,snapshot,cmd_list,&replacement,&own_params);
+                    EvalParams reapply_params{};
+                    auto* used=own_params?own_params:const_cast<void*>(params);
+                    ReadEvalParams(used,&reapply_params);reapply_params.preset_hint=CreatePresetHint(1u,used);
+                    if(cr==1 && replacement) {
+                        g_retired.push_back({std::move(*use),slot->params.exchange(own_params)});
+                        SrUses fresh;fresh.core=&s;fresh.handle=replacement;fresh.create=snapshot;fresh.device=eval_device;AddSrUse(fresh,receipt);
+                        *use=std::move(fresh);
+                        slot->core=&s;slot->ours.store(replacement);slot->game.store(game_handle);
+                        handle=replacement;g_last_sr_handle.store(handle);
+                        g_reapplies.fetch_add(1);
+                    } else g_reapply_failures.fetch_add(1);
+                    push_record(CallKind::CreateFeature,cr,1u,0,reinterpret_cast<uint64_t>(replacement),reinterpret_cast<uint64_t>(cmd_list),&reapply_params);
+                } else g_reapply_failures.fetch_add(1);
             }
+            active_call=use->calls;active_call->fetch_add(1);
         }
-        g_retired_count.store(static_cast<uint32_t>(g_retired.size()), std::memory_order_release);
     }
     na::gputime::Begin(list);
     NgxResult r = s.evaluate(cmd_list, handle, params, callback);
     na::gputime::End(list);
+    if(active_call)active_call->fetch_sub(1);
     g_evaluates.fetch_add(1, std::memory_order_relaxed);
     g_evaluates_external.fetch_add(1, std::memory_order_release);
     bool detail = g_detail.load(std::memory_order_relaxed);
@@ -541,7 +670,11 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
             // feature that breaks the streak; it is never skipped.
             confirm::EvalObs obs{};
             obs.handle = reinterpret_cast<uint64_t>(game_handle);
-            obs.ok = ep.valid && r >= 0;
+            obs.ok = ep.valid && r == 1;
+            obs.core=reinterpret_cast<uint64_t>(&s);
+            obs.out_w=ep.out_width;obs.out_h=ep.out_height;
+            {std::lock_guard<std::mutex> lock(g_confirm_m);
+             obs.upscaler=g_feature_flags.Get(obs.handle,obs.core)!=0xFFFFFFFFu;}
             if (obs.ok) {
                 uint32_t rw = ep.subrect_width != 0xFFFFFFFFu ? ep.subrect_width : ep.in_width;
                 uint32_t rh = ep.subrect_height != 0xFFFFFFFFu ? ep.subrect_height : ep.in_height;
@@ -564,7 +697,7 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
                     uint32_t flags = ep.create_flags;
                     if (flags == 0xFFFFFFFFu) { // evaluate objects often lack creation keys: use THIS feature's creation flags (A68)
                         std::lock_guard<std::mutex> lock(g_confirm_m);
-                        flags = g_feature_flags.Get(reinterpret_cast<uint64_t>(game_handle));
+                        flags = g_feature_flags.Get(reinterpret_cast<uint64_t>(game_handle),reinterpret_cast<uint64_t>(&s));
                     }
                     bool mv_low_res = flags != 0xFFFFFFFFu && (flags & 0x2u) != 0; // NVSDK_NGX_DLSS_Feature_Flags_MVLowRes
                     uint32_t mv_w = mv_low_res ? rw : ep.out_width, mv_h = mv_low_res ? rh : ep.out_height;
@@ -607,7 +740,7 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
             uint32_t flags = ep.create_flags;
             if (flags == 0xFFFFFFFFu) {
                 std::lock_guard<std::mutex> lock(g_confirm_m);
-                flags = g_feature_flags.Get(reinterpret_cast<uint64_t>(game_handle));
+                flags = g_feature_flags.Get(reinterpret_cast<uint64_t>(game_handle),reinterpret_cast<uint64_t>(&s));
             }
             in.mv_low_res = flags != 0xFFFFFFFFu && (flags & 0x2u);
             in.depth_inverted = flags != 0xFFFFFFFFu && (flags & 0x8u) ? 1u : 0u;
@@ -631,7 +764,7 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
             uint32_t nflags = ep.create_flags;
             if (nflags == 0xFFFFFFFFu) {
                 std::lock_guard<std::mutex> lock(g_confirm_m);
-                nflags = g_feature_flags.Get(reinterpret_cast<uint64_t>(game_handle));
+                nflags = g_feature_flags.Get(reinterpret_cast<uint64_t>(game_handle),reinterpret_cast<uint64_t>(&s));
             }
             in.depth_inverted = nflags != 0xFFFFFFFFu && (nflags & 0x8u) ? 1u : 0u;
             in.mv_low_res = nflags != 0xFFFFFFFFu && (nflags & 0x2u) ? 1u : 0u;
@@ -676,35 +809,55 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
 
 NgxResult ReleaseFeatureImpl(CoreSlot& s, void* handle)
 {
+    bool native_fg=false;
     {
         std::lock_guard<std::mutex> lock(g_confirm_m);
-        g_feature_flags.Erase(reinterpret_cast<uint64_t>(handle)); // A68: a released handle value may be reused
+        for(const auto& entry:g_fg_handles)if(entry.core==&s && entry.handle==handle){native_fg=true;break;}
     }
-    // A46: the game releases ITS handle; if we replaced that feature, release
-    // ours instead (the game's original was retired already) and drop the map.
-    for (HandleMap& m : g_handle_maps) {
-        if (m.game.load(std::memory_order_acquire) == handle) {
-            const void* ours = m.ours.load(std::memory_order_acquire);
-            m.game.store(nullptr, std::memory_order_release);
-            m.ours.store(nullptr, std::memory_order_release);
-            std::lock_guard<std::mutex> lock(g_reapply_mutex);
-            if (void* own = m.params.exchange(nullptr, std::memory_order_acq_rel)) { // A63: our from-scratch parameter object
-                using PfnDestroy = int32_t(__cdecl*)(void*);
-                if (HMODULE mod = s.module.load(std::memory_order_acquire))
-                    if (auto destroy = reinterpret_cast<PfnDestroy>(GetProcAddress(mod, "NVSDK_NGX_D3D12_DestroyParameters"))) destroy(own);
+    if(native_fg){
+        const auto result=s.release(handle);
+        if(result==1){
+            na::nr::native::Release(&s,handle);
+            std::lock_guard<std::mutex> lock(g_confirm_m);
+            g_feature_flags.Erase(reinterpret_cast<uint64_t>(handle),reinterpret_cast<uint64_t>(&s));
+            for(auto& entry:g_fg_handles)if(entry.core==&s && entry.handle==handle)entry={};
+        }
+        g_releases.fetch_add(1,std::memory_order_relaxed);
+        push_record(CallKind::ReleaseFeature,result,11u,0,reinterpret_cast<uint64_t>(handle),0);
+        return result;
+    }
+    auto erase_flags=[&]{
+        std::lock_guard<std::mutex> lock(g_confirm_m);
+        g_confirm.OnRelease(reinterpret_cast<uint64_t>(handle),reinterpret_cast<uint64_t>(&s),GetTickCount64());
+        g_feature_flags.Erase(reinterpret_cast<uint64_t>(handle),reinterpret_cast<uint64_t>(&s));
+    };
+    // A mapped handle belongs to us. Retirement follows its actual recordings;
+    // the game's original handle is only an external key and may already be retired.
+    {
+        std::lock_guard<std::mutex> lock(g_reapply_mutex);
+        for(auto& m:g_handle_maps)if(m.core==&s && m.game.load()==handle) {
+            auto use=std::find_if(g_sr_uses.begin(),g_sr_uses.end(),[&](const auto& u){return u.core==&s && u.handle==m.ours.load();});
+            if(use!=g_sr_uses.end()) {
+                g_retired.push_back({std::move(*use),m.params.exchange(nullptr)});
+                g_sr_uses.erase(use);
             }
-            bool still_retiring = false; // the game's own handle may still be in the retire queue: release it now
-            for (size_t i = 0; i < g_retired.size();) {
-                if (g_retired[i].handle == handle) { still_retiring = true; g_retired.erase(g_retired.begin() + static_cast<std::ptrdiff_t>(i)); }
-                else ++i;
-            }
-            g_retired_count.store(static_cast<uint32_t>(g_retired.size()), std::memory_order_release);
-            if (still_retiring) s.release(handle);
-            handle = const_cast<void*>(ours);
-            break;
+            if(g_last_sr_core==&s && g_last_sr_handle.load()==m.ours.load())g_last_sr_handle.store(nullptr);
+            m.game.store(nullptr);m.ours.store(nullptr);m.core=nullptr;
+            CollectSrLocked();
+            erase_flags();
+            g_releases.fetch_add(1);
+            push_record(CallKind::ReleaseFeature,1,1u,0,reinterpret_cast<uint64_t>(handle),0);
+            return 1; // virtual handle retired; backend errors remain queued for retry
         }
     }
     NgxResult r = s.release(handle);
+    if(r==1){
+        erase_flags();
+        std::lock_guard<std::mutex> lock(g_reapply_mutex);
+        g_sr_uses.erase(std::remove_if(g_sr_uses.begin(),g_sr_uses.end(),[&](const auto& u){return u.core==&s && u.handle==handle;}),g_sr_uses.end());
+        if(g_last_sr_core==&s && g_last_sr_handle.load()==handle)g_last_sr_handle.store(nullptr);
+        CollectSrLocked();
+    }
     g_releases.fetch_add(1, std::memory_order_relaxed);
     push_record(CallKind::ReleaseFeature, r, 0, 0,
                 reinterpret_cast<uint64_t>(handle), 0);
@@ -713,7 +866,29 @@ NgxResult ReleaseFeatureImpl(CoreSlot& s, void* handle)
 
 NgxResult Shutdown1Impl(CoreSlot& s, void* device)
 {
+    na::nr::native::CoreShutdown(&s);
+    na::nr::OnRuntimeShutdown(core_runtime(s));
+    s.init_succeeded.store(0);
     NgxResult r = s.shutdown1(device);
+    if(r==1){
+        std::lock_guard<std::mutex> lock(g_reapply_mutex);
+        const auto belongs=[&](const SrUses& u){return u.core==&s && (!device || u.device.Get()==device);};
+        for(auto& m:g_handle_maps)if(m.core==&s && std::any_of(g_sr_uses.begin(),g_sr_uses.end(),[&](const auto& u){return belongs(u) && u.handle==m.ours.load();})){
+            m.game.store(nullptr);m.ours.store(nullptr);m.params.store(nullptr);m.core=nullptr;
+        }
+        if(g_last_sr_core==&s && std::any_of(g_sr_uses.begin(),g_sr_uses.end(),[&](const auto& u){return belongs(u) && u.handle==g_last_sr_handle.load();})){
+            g_last_sr_core=nullptr;g_last_sr_handle.store(nullptr);
+        }
+        g_sr_uses.erase(std::remove_if(g_sr_uses.begin(),g_sr_uses.end(),belongs),g_sr_uses.end());
+        g_retired.erase(std::remove_if(g_retired.begin(),g_retired.end(),[&](const auto& u){return belongs(u.uses);}),g_retired.end());
+        // Another device can still be using this core. Do not retarget its maps
+        // or disable command-list observation merely because one device shut down.
+        if(!device)s.has_device.store(false);
+    }
+    if (r == 1) {
+        std::lock_guard<std::mutex> lock(g_confirm_m);
+        for (auto& entry : g_fg_handles) if (entry.core == &s) entry = {};
+    }
     g_shutdowns.fetch_add(1, std::memory_order_relaxed);
     push_record(CallKind::Shutdown, r, 0, 0, 0, 0);
     return r;
@@ -861,10 +1036,10 @@ DWORD WINAPI LoggerThread(LPVOID)
                     static_cast<unsigned long long>(r.params.output),
                     static_cast<unsigned long long>(r.params.exposure));
                 std::fprintf(g_log_file,
-                             " subrect=%ux%u pq=%u cflags=0x%X ovr=%u",
+                             " subrect=%ux%u pq=%u cflags=0x%X ovr=%u preset=%u",
                              r.params.subrect_width, r.params.subrect_height,
                              r.params.perf_quality, r.params.create_flags,
-                             r.params.overridden);
+                             r.params.overridden, r.params.preset_hint);
             }
             std::fputc('\n', g_log_file);
         }
@@ -884,6 +1059,11 @@ uint64_t ArmSizeConfirmation(uint32_t w, uint32_t h, uint32_t need, uint32_t cre
     uint64_t id = g_confirm.Arm(w, h, need, GetTickCount64(), create_timeout_ms, confirm_timeout_ms, overall_timeout_ms);
     g_confirm_active.store(true, std::memory_order_release);
     return id;
+}
+uint64_t ArmLiveSizeConfirmation(uint32_t w,uint32_t h,uint32_t ow,uint32_t oh,uint32_t need,uint32_t timeout) {
+    std::lock_guard<std::mutex> lock(g_confirm_m);
+    const auto id=g_confirm.ArmLive(w,h,ow,oh,need,GetTickCount64(),timeout);
+    g_confirm_active.store(true,std::memory_order_release);return id;
 }
 void MarkSizeConfirmationRestored(uint64_t id)
 {
@@ -1011,11 +1191,40 @@ void RequestReapply()
     if (g_last_sr_handle.load(std::memory_order_acquire)) g_reapply_pending.store(1, std::memory_order_release);
 }
 
-bool ApplyCreateOverrides(void* ngx_parameter)
+uint32_t CreatePresetHint(uint32_t feature_id, void* ngx_parameter)
+{
+#if defined(NA_HAVE_NGX_SDK)
+    if (!ngx_parameter || (feature_id != 1u && feature_id != kFeatureRayReconstruction)) return 0;
+    auto* p = static_cast<NVSDK_NGX_Parameter*>(ngx_parameter);
+    int pq = -1;
+    p->Get(NVSDK_NGX_Parameter_PerfQualityValue, &pq);
+    const bool rr = feature_id == kFeatureRayReconstruction;
+    const char* key = nullptr;
+    switch (pq) {
+    case NVSDK_NGX_PerfQuality_Value_MaxPerf: key = rr ? NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Performance : NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance; break;
+    case NVSDK_NGX_PerfQuality_Value_Balanced: key = rr ? NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced : NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced; break;
+    case NVSDK_NGX_PerfQuality_Value_MaxQuality: key = rr ? NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality : NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality; break;
+    case NVSDK_NGX_PerfQuality_Value_UltraPerformance: key = rr ? NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraPerformance : NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance; break;
+    case NVSDK_NGX_PerfQuality_Value_UltraQuality: key = rr ? NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraQuality : NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality; break;
+    case NVSDK_NGX_PerfQuality_Value_DLAA: key = rr ? NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA : NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA; break;
+    default: return 0;
+    }
+    unsigned int v = 0;
+    return p->Get(key, &v) == NVSDK_NGX_Result_Success ? v : 0u;
+#else
+    (void)feature_id; (void)ngx_parameter;
+    return 0;
+#endif
+}
+
+bool ApplyCreateOverrides(void* ngx_parameter) { return ApplyCreateOverridesForFeature(1u, ngx_parameter); }
+
+bool ApplyCreateOverridesForFeature(uint32_t feature_id, void* ngx_parameter)
 {
 #if defined(NA_HAVE_NGX_SDK)
     if (!ngx_parameter) return false;
-    if (!na::settings::Get().enabled.load(std::memory_order_acquire)) return false;
+    if (feature_id != 1u && feature_id != kFeatureRayReconstruction) return false; // FG and others: not ours
+    if (!na::settings::EffectsReady() || !na::settings::Get().enabled.load(std::memory_order_acquire)) return false;
     auto* p = static_cast<NVSDK_NGX_Parameter*>(ngx_parameter);
     bool wrote = false;
     // A20 perf/correctness: tell DLSS which quality mode WE chose, so the
@@ -1031,10 +1240,45 @@ bool ApplyCreateOverrides(void* ngx_parameter)
     case na::settings::DlssMode::UltraPerformance: pq = NVSDK_NGX_PerfQuality_Value_UltraPerformance; break;
     default: break;
     }
-    p->Set(NVSDK_NGX_Parameter_PerfQualityValue, pq);
-    wrote = true;
+    // Some engines cache their render scale and never query optimal settings
+    // on a resize (PBZ). A preset-only request must preserve both that scale
+    // and the game's matching quality value, rather than label low-res DLAA.
+    // Only when the game takes its render size from DLSS's optimal settings:
+    // otherwise its input stays at the size IT chose, and labelling that input
+    // with our mode (e.g. Balanced on an Ultra Performance input) is just wrong.
+    unsigned int create_out_w = 0, create_out_h = 0;
+    p->Get(NVSDK_NGX_Parameter_OutWidth, &create_out_w);
+    p->Get(NVSDK_NGX_Parameter_OutHeight, &create_out_h);
+    unsigned int input_w=0,input_h=0;
+    p->Get(NVSDK_NGX_Parameter_Width,&input_w);p->Get(NVSDK_NGX_Parameter_Height,&input_h);
+    auto expected=[&](unsigned int extent){return mode==na::settings::DlssMode::DLAA?extent:
+        (static_cast<unsigned int>(extent*na::settings::ScaleForMode(mode)+0.5f)+7u)&~7u;};
+    const bool size_matches=input_w && input_h && create_out_w<=16384 && create_out_h<=16384 &&
+        input_w==expected(create_out_w) && input_h==expected(create_out_h);
+    if (!na::settings::Get().follow_game_resolution.load(std::memory_order_acquire) &&
+        OptimalQueriedFor(create_out_w, create_out_h) && size_matches) {
+        p->Set(NVSDK_NGX_Parameter_PerfQualityValue, pq);
+        wrote = true;
+    }
+    if (feature_id == kFeatureRayReconstruction) {
+        // Ray Reconstruction reads its own preset keys; only D, E and F are usable
+        // (the SDK marks the rest "do not use, reverts to default").
+        const int32_t rp = na::settings::Get().rr_preset.load(std::memory_order_acquire);
+        if (rp >= 4 && rp <= 6) {
+            wrote = true;
+            const unsigned int v = static_cast<unsigned int>(rp);
+            p->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA, v);
+            p->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality, v);
+            p->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced, v);
+            p->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Performance, v);
+            p->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraPerformance, v);
+            p->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraQuality, v);
+        }
+        return wrote;
+    }
     int32_t preset = na::settings::Get().preset.load(std::memory_order_acquire);
     if (preset >= 1 && preset <= 13) {
+        wrote = true;
         const unsigned int v = static_cast<unsigned int>(preset);
         p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, v);
         p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality, v);
@@ -1044,6 +1288,26 @@ bool ApplyCreateOverrides(void* ngx_parameter)
         p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality, v);
     }
     return wrote;
+#else
+    (void)feature_id;
+    (void)ngx_parameter;
+    return false;
+#endif
+}
+
+bool StripRrPresetHints(void* ngx_parameter)
+{
+#if defined(NA_HAVE_NGX_SDK)
+    if (!ngx_parameter) return false;
+    auto* p = static_cast<NVSDK_NGX_Parameter*>(ngx_parameter);
+    const unsigned int def = NVSDK_NGX_RayReconstruction_Hint_Render_Preset_Default;
+    p->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA, def);
+    p->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality, def);
+    p->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced, def);
+    p->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Performance, def);
+    p->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraPerformance, def);
+    p->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraQuality, def);
+    return true;
 #else
     (void)ngx_parameter;
     return false;
@@ -1085,7 +1349,34 @@ bool RestoreQualityValue(void* ngx_parameter, uint32_t perf_quality)
 namespace {
 using PfnOptimalCallback = int32_t(__cdecl*)(void* params);
 std::atomic<void*> g_orig_optimal{nullptr};
+std::atomic<void*> g_orig_optimal_rr{nullptr}; // Ray Reconstruction's DLSSDOptimalSettingsCallback
 std::atomic<uint64_t> g_opt_calls{0};
+// Every optimal-settings answer, so a log shows what each caller asked
+// (display or reference size, quality value), what NVIDIA answered and what we
+// returned. UE-style engines may query a reference size (e.g. 1000x1000) per
+// quality mode and derive their screen percentage from the answer.
+constexpr uint32_t kOptLog = 16;
+OptimalCall g_opt_log[kOptLog];
+std::atomic<uint64_t> g_opt_log_seq{0};
+std::mutex g_opt_log_m;
+std::atomic<uint64_t> g_cap_swaps[3]{}; // optimal-callback swaps per path: capability, allocate, get-parameters
+// Every display size anyone asked DLSS's optimal-settings callback about (a
+// few distinct sizes: the game's real output, probes such as 1000x1000).
+// No query observed here does not prove the engine computes its own size;
+// another NGX/Streamline acquisition interface may be in use.
+constexpr uint32_t kOptSizes = 16;
+std::atomic<uint64_t> g_opt_sizes[kOptSizes]{};
+void note_opt_size(uint32_t w, uint32_t h)
+{
+    if (!w || !h) return;
+    const uint64_t v = (uint64_t(w) << 32) | h;
+    for (auto& e : g_opt_sizes) {
+        uint64_t cur = e.load(std::memory_order_acquire);
+        if (cur == v) return;
+        if (!cur && e.compare_exchange_strong(cur, v, std::memory_order_acq_rel)) return;
+        if (cur == v) return;
+    }
+}
 std::atomic<uint32_t> g_opt_user_w{0}, g_opt_user_h{0}, g_opt_out_w{0},
     g_opt_out_h{0}, g_opt_overridden{0};
 
@@ -1096,12 +1387,60 @@ void SetOriginalOptimalCallbackForTest(void* original_callback)
 {
     g_orig_optimal.store(original_callback, std::memory_order_release);
 }
+void SetOriginalOptimalCallbackRRForTest(void* original_callback)
+{
+    g_orig_optimal_rr.store(original_callback, std::memory_order_release);
+}
 
+namespace {
+int32_t optimal_settings_common(void* ngx_parameter, void* orig, bool rr);
+}
 int32_t OptimalSettingsCallback(void* ngx_parameter)
 {
+    return optimal_settings_common(ngx_parameter, g_orig_optimal.load(std::memory_order_acquire), false);
+}
+int32_t OptimalSettingsCallbackRR(void* ngx_parameter)
+{
+    return optimal_settings_common(ngx_parameter, g_orig_optimal_rr.load(std::memory_order_acquire), true);
+}
+
+namespace {
+// Bind each thunk permanently to its original. A second runtime query must
+// not retarget callbacks already handed out. Never recycle retained pointers.
+constexpr size_t kOptimalBindings = 32;
+std::array<std::atomic<void*>, kOptimalBindings> g_opt_originals{};
+std::array<bool, kOptimalBindings> g_opt_rr{};
+std::mutex g_opt_bind_mutex;
+template<size_t I> int32_t __cdecl BoundOptimal(void* p)
+{
+    void* original=g_opt_originals[I].load(std::memory_order_acquire);
+    return optimal_settings_common(p, original, g_opt_rr[I]);
+}
+template<size_t... I> auto optimal_thunks(std::index_sequence<I...>)
+{
+    return std::array<PfnOptimalCallback, sizeof...(I)>{&BoundOptimal<I>...};
+}
+const auto g_opt_thunks = optimal_thunks(std::make_index_sequence<kOptimalBindings>{});
+void* bind_optimal(void* original, bool rr)
+{
+    for (auto thunk : g_opt_thunks)
+        if (original == reinterpret_cast<void*>(thunk)) return original;
+    std::lock_guard<std::mutex> lock(g_opt_bind_mutex);
+    for (size_t i = 0; i < kOptimalBindings; ++i) {
+        void* stored = g_opt_originals[i].load(std::memory_order_acquire);
+        if (stored == original && g_opt_rr[i] == rr) return reinterpret_cast<void*>(g_opt_thunks[i]);
+        if (!stored) {
+            g_opt_rr[i]=rr;
+            g_opt_originals[i].store(original, std::memory_order_release);
+            return reinterpret_cast<void*>(g_opt_thunks[i]);
+        }
+    }
+    return original; // full: retain the runtime answer, never misroute it
+}
+int32_t optimal_settings_common(void* ngx_parameter, void* orig, bool rr)
+{
     int32_t r = 1; // NVSDK_NGX_Result_Success when no original (tests)
-    if (void* orig = g_orig_optimal.load(std::memory_order_acquire))
-        r = reinterpret_cast<PfnOptimalCallback>(orig)(ngx_parameter);
+    if (orig) r = reinterpret_cast<PfnOptimalCallback>(orig)(ngx_parameter);
     g_opt_calls.fetch_add(1, std::memory_order_relaxed);
 #if defined(NA_HAVE_NGX_SDK)
     if (!ngx_parameter || r < 0) return r;
@@ -1112,12 +1451,16 @@ int32_t OptimalSettingsCallback(void* ngx_parameter)
     p->Get(NVSDK_NGX_Parameter_OutWidth, &out_w);
     p->Get(NVSDK_NGX_Parameter_OutHeight, &out_h);
     g_opt_user_w.store(user_w); g_opt_user_h.store(user_h);
+    note_opt_size(user_w, user_h);
+    int pq = -1;
+    p->Get(NVSDK_NGX_Parameter_PerfQualityValue, &pq);
+    const unsigned int native_w = out_w, native_h = out_h; // NVIDIA's own answer, before ours
 
-    bool enabled = na::settings::Get().enabled.load(std::memory_order_acquire) != 0;
+    bool enabled = na::settings::EffectsReady() && na::settings::Get().enabled.load(std::memory_order_acquire) != 0;
     auto mode = static_cast<na::settings::DlssMode>(
         na::settings::Get().dlss_mode.load(std::memory_order_acquire));
     bool overridden = false;
-    if (enabled && user_w && user_h) {
+    if (enabled && !na::settings::Get().follow_game_resolution.load(std::memory_order_acquire) && user_w && user_h) {
         unsigned int tw = user_w, th = user_h;
         if (mode != na::settings::DlssMode::DLAA) {
             float ratio = na::settings::ScaleForMode(mode);
@@ -1126,7 +1469,11 @@ int32_t OptimalSettingsCallback(void* ngx_parameter)
             if (tw > user_w) tw = user_w;
             if (th > user_h) th = user_h;
         }
-        if (tw != out_w || th != out_h) {
+        // NGX callers can read either extents or scaling aliases. Publish one
+        // consistent answer, including when native extents already match.
+        p->Set(NVSDK_NGX_Parameter_Scale, static_cast<float>(tw) / user_w);
+        p->Set(NVSDK_NGX_Parameter_SuperSampling_ScaleFactor, static_cast<float>(tw) / user_w);
+        {
             p->Set(NVSDK_NGX_Parameter_OutWidth, tw);
             p->Set(NVSDK_NGX_Parameter_OutHeight, th);
             p->Set(NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Max_Render_Width, tw);
@@ -1139,10 +1486,49 @@ int32_t OptimalSettingsCallback(void* ngx_parameter)
     }
     g_opt_out_w.store(out_w); g_opt_out_h.store(out_h);
     g_opt_overridden.store(overridden ? 1u : 0u);
+    {
+        std::lock_guard<std::mutex> lock(g_opt_log_m);
+        const uint64_t seq = g_opt_log_seq.load(std::memory_order_relaxed) + 1;
+        OptimalCall& c = g_opt_log[seq % kOptLog];
+        c = {};
+        c.sequence = seq; c.user_w = user_w; c.user_h = user_h; c.perf_quality = static_cast<int32_t>(pq);
+        c.native_w = native_w; c.native_h = native_h; c.out_w = out_w; c.out_h = out_h;
+        c.overridden = overridden ? 1u : 0u; c.rr = rr ? 1u : 0u;
+        g_opt_log_seq.store(seq, std::memory_order_release);
+    }
 #else
     (void)ngx_parameter;
+    (void)rr;
 #endif
     return r;
+}
+} // namespace
+
+uint32_t GetOptimalCalls(uint64_t after, OptimalCall* out, uint32_t max)
+{
+    std::lock_guard<std::mutex> lock(g_opt_log_m);
+    const uint64_t last = g_opt_log_seq.load(std::memory_order_acquire);
+    uint64_t first = after + 1;
+    if (last >= kOptLog && first < last - kOptLog + 1) first = last - kOptLog + 1;
+    uint32_t n = 0;
+    for (uint64_t q = first; q <= last && n < max; ++q) {
+        const OptimalCall& c = g_opt_log[q % kOptLog];
+        if (c.sequence == q) out[n++] = c;
+    }
+    return n;
+}
+
+bool OptimalQueriedFor(uint32_t out_w, uint32_t out_h)
+{
+    if (!out_w || !out_h || out_w == 0xFFFFFFFFu || out_h == 0xFFFFFFFFu) return false;
+    for (const auto& e : g_opt_sizes) {
+        const uint64_t v = e.load(std::memory_order_acquire);
+        if (!v) break;
+        const uint32_t w = uint32_t(v >> 32), h = uint32_t(v);
+        // The generic rebuild nudges the window by one pixel; count that as the same display.
+        if (w + 1 >= out_w && w <= out_w + 1 && h + 1 >= out_h && h <= out_h + 1) return true;
+    }
+    return false;
 }
 
 OptimalStats GetOptimalStats()
@@ -1152,6 +1538,7 @@ OptimalStats GetOptimalStats()
     s.last_user_w = g_opt_user_w.load(); s.last_user_h = g_opt_user_h.load();
     s.last_out_w = g_opt_out_w.load(); s.last_out_h = g_opt_out_h.load();
     s.last_overridden = g_opt_overridden.load();
+    s.swaps_capability = g_cap_swaps[0].load(); s.swaps_allocate = g_cap_swaps[1].load(); s.swaps_getparams = g_cap_swaps[2].load();
     return s;
 }
 
@@ -1159,25 +1546,50 @@ namespace {
 // After the runtime hands out capability parameters, swap the optimal-
 // settings callback pointer inside them for ours (idempotent: never
 // re-capture our own pointer as the "original").
+void swap_optimal_callbacks(void* params, int path);
 int32_t GetCapabilityParametersImpl(CoreSlot& s, void** out_params)
 {
     int32_t r = s.getcap(out_params);
-#if defined(NA_HAVE_NGX_SDK)
-    if (r >= 0 && out_params && *out_params) {
-        auto* p = static_cast<NVSDK_NGX_Parameter*>(*out_params);
-        void* cb = nullptr;
-        if (p->Get(NVSDK_NGX_Parameter_DLSSOptimalSettingsCallback, &cb) ==
-                NVSDK_NGX_Result_Success && cb &&
-            cb != reinterpret_cast<void*>(&OptimalSettingsCallback)) {
-            g_orig_optimal.store(cb, std::memory_order_release);
-            p->Set(NVSDK_NGX_Parameter_DLSSOptimalSettingsCallback,
-                   reinterpret_cast<void*>(&OptimalSettingsCallback));
-        }
-    }
-#endif
+    if (r == 1 && out_params && *out_params) swap_optimal_callbacks(*out_params, 0);
     return r;
 }
+// Allocations may be empty; only wrap callbacks already supplied by the runtime.
+int32_t AllocateParametersImpl(CoreSlot& s, void** out_params)
+{
+    int32_t r = s.allocate(out_params);
+    if (r == 1 && out_params && *out_params) swap_optimal_callbacks(*out_params, 1);
+    return r;
+}
+int32_t GetParametersImpl(CoreSlot& s, void** out_params)
+{
+    int32_t r = s.getparams(out_params);
+    if (r == 1 && out_params && *out_params) swap_optimal_callbacks(*out_params, 2);
+    return r;
+}
+void swap_optimal_callbacks(void* params, int path)
+{
+#if defined(NA_HAVE_NGX_SDK)
+    {
+        auto* p = static_cast<NVSDK_NGX_Parameter*>(params);
+        bool swapped = false;
+        for (const char* key : {NVSDK_NGX_Parameter_DLSSOptimalSettingsCallback,
+                                NVSDK_NGX_Parameter_DLSSDOptimalSettingsCallback}) {
+            void* cb = nullptr;
+            if (p->Get(key, &cb) != NVSDK_NGX_Result_Success || !cb) continue;
+            void* replacement = bind_optimal(cb, std::strcmp(key,NVSDK_NGX_Parameter_DLSSDOptimalSettingsCallback)==0);
+            if (replacement == cb) continue;
+            p->Set(key, replacement);
+            swapped = true;
+        }
+        if (swapped && path >= 0 && path < 3) g_cap_swaps[path].fetch_add(1, std::memory_order_relaxed);
+    }
+#else
+    (void)params; (void)path;
+#endif
+}
 template <int S> int32_t __cdecl DetourGetCapabilityParameters(void** out) { return GetCapabilityParametersImpl(g_slots[S], out); }
+template <int S> int32_t __cdecl DetourAllocateParameters(void** p) { return AllocateParametersImpl(g_slots[S], p); }
+template <int S> int32_t __cdecl DetourGetParameters(void** out) { return GetParametersImpl(g_slots[S], out); }
 
 // Base file name of a module name or full path.
 const wchar_t* base_name(const wchar_t* name, size_t len, size_t* out_len)
@@ -1300,13 +1712,15 @@ template <int S> uint32_t install_slot(HMODULE ngx_module)
         {"NVSDK_NGX_D3D12_ReleaseFeature", reinterpret_cast<void*>(&DetourReleaseFeature<S>), reinterpret_cast<void**>(&slot.release)},
         {"NVSDK_NGX_D3D12_Shutdown1", reinterpret_cast<void*>(&DetourShutdown1<S>), reinterpret_cast<void**>(&slot.shutdown1)},
         {"NVSDK_NGX_D3D12_GetCapabilityParameters", reinterpret_cast<void*>(&DetourGetCapabilityParameters<S>), reinterpret_cast<void**>(&slot.getcap)},
+        {"NVSDK_NGX_D3D12_AllocateParameters", reinterpret_cast<void*>(&DetourAllocateParameters<S>), reinterpret_cast<void**>(&slot.allocate)},
+        {"NVSDK_NGX_D3D12_GetParameters", reinterpret_cast<void*>(&DetourGetParameters<S>), reinterpret_cast<void**>(&slot.getparams)},
     };
     // A45 installation transaction (answers A43-NGX-ACK finding 2): every
     // original is prepared and published, then the slot's module record is
     // published, and only then are the detours enabled together. A detour
     // therefore never runs against a half-filled slot, and a failed commit
     // leaves nothing patched.
-    if (!na::hooking::BeginInstall()) return 0;
+    if (!na::hooking::BeginInstallWait("ngx_observe/ngx_observe.cpp")) return 0;
     uint32_t hooked = 0;
     for (const HookSpec& s : specs) {
         void* target = reinterpret_cast<void*>(GetProcAddress(ngx_module, s.name));
@@ -1411,7 +1825,14 @@ Stats GetStats()
     Stats s{};
     s.core_preloaded = g_core_preloaded.load(std::memory_order_acquire);
     s.rr_seen = g_rr_seen.load(std::memory_order_acquire);
+    s.active_upscaler = g_active_upscaler.load(std::memory_order_acquire);
     s.fg_seen = g_fg_seen.load(std::memory_order_acquire);
+    s.fg_evaluates = g_fg_evaluates.load(); s.fg_with_inputs = g_fg_with_inputs.load();
+    s.fg_with_hudless = g_fg_with_hudless.load(); s.fg_with_distortion = g_fg_with_distortion.load();
+    s.fg_list_type = g_fg_list_type.load(); s.fg_color_format = g_fg_color_format.load();
+    s.fg_color_w = g_fg_color_w.load(); s.fg_color_h = g_fg_color_h.load();
+    s.fg_with_frame_id = g_fg_with_frame_id.load(); s.fg_with_alpha = g_fg_with_alpha.load();
+    s.fg_with_ui = g_fg_with_ui.load(); s.fg_last_create_uir = g_fg_last_create_uir.load();
     s.inits = g_inits.load(std::memory_order_relaxed);
     s.creates = g_creates.load(std::memory_order_relaxed);
     s.evaluates = g_evaluates.load(std::memory_order_relaxed);

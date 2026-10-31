@@ -1,6 +1,15 @@
+#include "host_dx12/host_boot/process_log.hpp"
+#include "host_dx12/adapters/mode_control.hpp"
+#include "host_dx12/nr/native_fg.hpp"
+#include "host_dx12/sl_boundary/sl_boundary.hpp"
+#include "host_dx12/nr/fg_states.hpp"
 #include "host_dx12/adapters/tlou1/timing.hpp"
 #include "host_dx12/adapters/tlou1/apply.hpp"
+#include "host_dx12/adapters/tsushima/apply.hpp"
 #include "host_dx12/overlay/overlay.hpp"
+#include "host_dx12/overlay/input_handover.hpp"
+#include "host_dx12/overlay/present_queues.hpp"
+#include "host_dx12/overlay/boundary_fallback.hpp"
 
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -37,8 +46,10 @@
 #include "host_dx12/overlay/na_style.hpp"
 #include "host_dx12/overlay/presenter.hpp"
 #include "host_dx12/overlay/freeze_watchdog.hpp"
+#include "host_dx12/nr/queue_trace.hpp"
 #include <ctime>
 #include "host_dx12/settings.hpp"
+#include "host_dx12/host_boot/session.hpp"
 #include "host_dx12/latency/nvidia_latency.hpp"
 #include "host_dx12/latency/pcl_stats.hpp"
 
@@ -59,6 +70,12 @@ constexpr uint32_t kSwap3GetIndexSlot = 36;       // IDXGISwapChain3::GetCurrent
 constexpr uint32_t kSwap3SetColorSpace1Slot = 38; // IDXGISwapChain3::SetColorSpace1
 constexpr uint32_t kSwap3ResizeBuffers1Slot = 39; // IDXGISwapChain3::ResizeBuffers1 (A59)
 constexpr uint32_t kQueueExecuteSlot = 10;
+// IDXGIFactory / IDXGIFactory2 swap-chain creation (shared factory vtable): for D3D12
+// the "device" argument is the command queue the swap chain presents from.
+constexpr uint32_t kFactoryCreateSwapChainSlot = 10;
+constexpr uint32_t kFactory2CreateForHwndSlot = 15;
+constexpr uint32_t kFactory2CreateForCoreWindowSlot = 16;
+constexpr uint32_t kFactory2CreateForCompositionSlot = 24;
 constexpr uint32_t kSrvHeapSize = 64;
 
 using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
@@ -96,23 +113,113 @@ std::atomic<DWORD> g_present_caller{0};
 std::atomic<HRESULT> g_present_result{S_OK};
 std::atomic<UINT> g_game_max_latency{0}; // what the game asked for (A62), reported back to it unchanged
 ExecuteFn g_orig_execute = nullptr;
+using QueueSyncFn=HRESULT(STDMETHODCALLTYPE*)(ID3D12CommandQueue*,ID3D12Fence*,UINT64);
+QueueSyncFn g_trace_signal=nullptr,g_trace_wait=nullptr;
 SetColorSpaceFn g_orig_set_color_space = nullptr;
 
-// Our own reads of the game's chain must bypass the presenter's proxies.
+// Internal reads bypass only OUR virtual backbuffer substitution. They must
+// still dispatch through the actual COM object's vtable: a Streamline wrapper
+// is not a native DXGI object and cannot be passed to the dummy-chain trampoline.
+thread_local unsigned t_native_buffer_read=0;
+struct NativeBufferRead {
+    NativeBufferRead(){++t_native_buffer_read;}
+    ~NativeBufferRead(){--t_native_buffer_read;}
+};
 HRESULT real_get_buffer(IDXGISwapChain* sc, UINT i, REFIID riid, void** out)
 {
-    return g_orig_get_buffer ? g_orig_get_buffer(sc, i, riid, out) : sc->GetBuffer(i, riid, out);
+    NativeBufferRead scope;
+    return sc->GetBuffer(i, riid, out);
 }
 UINT real_index(IDXGISwapChain* sc)
 {
+    if(!sc)return 0xFFFFFFFFu;
     ComPtr<IDXGISwapChain3> sc3;
-    if (FAILED(sc->QueryInterface(IID_PPV_ARGS(&sc3)))) return 0xFFFFFFFFu;
-    return g_orig_get_index ? g_orig_get_index(sc3.Get()) : sc3->GetCurrentBackBufferIndex();
+    if (FAILED(sc->QueryInterface(IID_PPV_ARGS(&sc3))) || !sc3) return 0xFFFFFFFFu;
+    NativeBufferRead scope;
+    return sc3->GetCurrentBackBufferIndex();
 }
 std::atomic<int> g_color_space{DXGI_COLOR_SPACE_CUSTOM}; // last SetColorSpace1 on the game's chain
 XInputGetStateFn g_orig_xinput[3] = {};
+std::atomic<XInputGetStateFn> g_menu_xinput{nullptr};
+uint64_t g_pad_retry_after=0; // render thread, under g_state.mutex
 
 std::atomic<ID3D12CommandQueue*> g_direct_queue{nullptr};
+
+// The queue each swap chain was created with. The menu (and anything else that
+// writes the back buffer at Present) must use THIS queue: Present executes on it,
+// so commands submitted there right before Present are ordered after everything
+// the presenter queued (Streamline DLSS Frame Generation writes the generated frame
+// and waits on this queue before presenting). g_direct_queue is only "the last
+// direct queue that submitted", which in a two-queue game with native Frame
+// Generation (Phantom Blade Zero) is often not the presenting queue: the menu then
+// wrote the back buffer unsynchronised with FG and the GPU faulted (Cort, 2026-10-29).
+struct SwapQueue { void* sc = nullptr; PresentQueues queues; int color_space=DXGI_COLOR_SPACE_CUSTOM; };
+std::mutex g_swap_queue_m;
+SwapQueue g_swap_queues[8];
+uint32_t g_swap_queue_next = 0;
+std::atomic<uint32_t> g_swap_queue_hits{0}, g_swap_queue_misses{0}, g_swap_queues_recorded{0}, g_swap_queue_observed{0};
+std::atomic<uintptr_t> g_last_present_queue{0};
+
+void note_swapchain_queue(IUnknown* device_or_queue, void* swapchain)
+{
+    if (!device_or_queue || !swapchain) return;
+    ComPtr<ID3D12CommandQueue> q;
+    if (FAILED(device_or_queue->QueryInterface(IID_PPV_ARGS(&q))) || !q) return; // D3D11 / other device: not ours
+    std::lock_guard<std::mutex> lk(g_swap_queue_m);
+    for (auto& e : g_swap_queues)
+        if (e.sc == swapchain) { e.queues.Created(q.Get()); e.color_space=DXGI_COLOR_SPACE_CUSTOM; g_swap_queues_recorded.fetch_add(1); return; } // address reused
+    SwapQueue& slot = g_swap_queues[g_swap_queue_next++ % 8];
+    slot.sc = swapchain;slot.color_space=DXGI_COLOR_SPACE_CUSTOM;
+    slot.queues.Created(q.Get());
+    g_swap_queues_recorded.fetch_add(1);
+}
+ComPtr<ID3D12CommandQueue> swapchain_queue(IDXGISwapChain* swapchain)
+{
+    const UINT index=real_index(swapchain);
+    std::lock_guard<std::mutex> lk(g_swap_queue_m);
+    for (const auto& e : g_swap_queues) if (e.sc == swapchain) return e.queues.At(index);
+    return nullptr;
+}
+
+using CreateSwapChainFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory*, IUnknown*, DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**);
+using CreateForHwndFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*,
+                                                    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
+using CreateForCoreWindowFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, IUnknown*, const DXGI_SWAP_CHAIN_DESC1*,
+                                                          IDXGIOutput*, IDXGISwapChain1**);
+using CreateForCompositionFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, const DXGI_SWAP_CHAIN_DESC1*,
+                                                           IDXGIOutput*, IDXGISwapChain1**);
+CreateSwapChainFn g_orig_create_swapchain = nullptr;
+CreateForHwndFn g_orig_create_for_hwnd = nullptr;
+CreateForCoreWindowFn g_orig_create_for_core_window = nullptr;
+CreateForCompositionFn g_orig_create_for_composition = nullptr;
+
+HRESULT STDMETHODCALLTYPE DetourCreateSwapChain(IDXGIFactory* f, IUnknown* dev, DXGI_SWAP_CHAIN_DESC* d, IDXGISwapChain** out)
+{
+    const HRESULT hr = g_orig_create_swapchain(f, dev, d, out);
+    if (SUCCEEDED(hr) && out && *out) note_swapchain_queue(dev, *out);
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE DetourCreateForHwnd(IDXGIFactory2* f, IUnknown* dev, HWND w, const DXGI_SWAP_CHAIN_DESC1* d,
+                                              const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs, IDXGIOutput* o, IDXGISwapChain1** out)
+{
+    const HRESULT hr = g_orig_create_for_hwnd(f, dev, w, d, fs, o, out);
+    if (SUCCEEDED(hr) && out && *out) note_swapchain_queue(dev, *out);
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE DetourCreateForCoreWindow(IDXGIFactory2* f, IUnknown* dev, IUnknown* w, const DXGI_SWAP_CHAIN_DESC1* d,
+                                                    IDXGIOutput* o, IDXGISwapChain1** out)
+{
+    const HRESULT hr = g_orig_create_for_core_window(f, dev, w, d, o, out);
+    if (SUCCEEDED(hr) && out && *out) note_swapchain_queue(dev, *out);
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE DetourCreateForComposition(IDXGIFactory2* f, IUnknown* dev, const DXGI_SWAP_CHAIN_DESC1* d,
+                                                     IDXGIOutput* o, IDXGISwapChain1** out)
+{
+    const HRESULT hr = g_orig_create_for_composition(f, dev, d, o, out);
+    if (SUCCEEDED(hr) && out && *out) note_swapchain_queue(dev, *out);
+    return hr;
+}
 // ImGui synchronously waits for font/texture uploads during RenderDrawData.
 // They must not sit behind game work that needs this Present to return.
 // Published separately so the upload cannot become the observed game queue.
@@ -123,8 +230,21 @@ std::atomic<uint64_t> g_menu_draw_marker{0};
 void write_menu_progress(HANDLE log);
 std::atomic<uint32_t> g_retargets{0}; // swap chain re-targets (A31)
 std::atomic<uint32_t> g_initialized{0};
+std::atomic<bool> g_core_started{false}, g_menu_enabled{false}, g_fail_menu_start{false},g_fail_menu_create{false};
+std::atomic<unsigned> g_fail_optional_input{0};
+std::atomic<bool> g_fail_cursor_cleanup{false};
+std::mutex g_start_m;
+bool g_menu_frame_ready=false; // g_state.mutex
 std::atomic<uint32_t> g_gamepad_hooked{0};
 std::atomic<bool> g_stopping{false};
+// Diagnostic counters plus per-chain ownership; no global routing switch.
+// Native Presents include DLSS-G's asynchronous generated frames.
+std::atomic<uint64_t> g_native_game_presents{0};
+std::atomic<bool> g_boundary_frames{false};
+std::mutex g_boundary_m;
+BoundaryRoutes g_boundary_policy; // g_boundary_m
+void* g_native_present_target = nullptr;  // native Present body hooked at Start (diagnostics only)
+void* g_native_present1_target = nullptr;
 std::atomic<float> g_fps{0.0f}, g_frame_ms{0.0f}, g_mouse_x{0.0f}, g_mouse_y{0.0f};
 char g_route_tag[64]{};
 PanelFn g_controls = nullptr;
@@ -152,6 +272,9 @@ using PfnGetRawInputData = UINT(WINAPI*)(HRAWINPUT, UINT, LPVOID, PUINT, UINT);
 using PfnGetRawInputBuffer = UINT(WINAPI*)(PRAWINPUT, PUINT, UINT);
 using PfnGetCursorPos = BOOL(WINAPI*)(LPPOINT);
 using PfnSetCursorPos = BOOL(WINAPI*)(int, int);
+using PfnSetCursor = HCURSOR(WINAPI*)(HCURSOR);
+PfnSetCursor g_orig_set_cursor=nullptr;
+HCURSOR g_menu_cursor=nullptr;
 using PfnGetAsyncKeyState = SHORT(WINAPI*)(int);
 using PfnGetKeyboardState = BOOL(WINAPI*)(PBYTE);
 using PfnGetKeyState = SHORT(WINAPI*)(int);
@@ -162,7 +285,7 @@ PfnSetCursorPos g_orig_set_cursor_pos = nullptr;
 PfnGetAsyncKeyState g_orig_get_async_key_state = nullptr;
 PfnGetKeyboardState g_orig_get_keyboard_state = nullptr;
 PfnGetKeyState g_orig_get_key_state = nullptr;
-void* g_input_hook_targets[7] = {};
+void* g_input_hook_targets[8] = {};
 thread_local bool t_overlay_input = false; // the overlay itself is reading input (menu drawing)
 std::atomic<uint32_t> g_input_hooks{0};
 std::atomic<DWORD> g_render_thread{0};
@@ -216,6 +339,10 @@ BOOL WINAPI DetourGetCursorPos(LPPOINT p)
     }
     return g_orig_get_cursor_pos(p);
 }
+HCURSOR WINAPI DetourSetCursor(HCURSOR cursor)
+{
+    return g_orig_set_cursor(lock_input_for_this_thread() && g_menu_cursor ? g_menu_cursor : cursor);
+}
 BOOL WINAPI DetourSetCursorPos(int x, int y)
 {
     if (lock_input_for_this_thread()) return TRUE; // the game may not re-centre the menu cursor
@@ -264,6 +391,14 @@ HRESULT STDMETHODCALLTYPE DetourDIGetDeviceData(void* self, DWORD cb, void* even
     if (SUCCEEDED(r) && inout && lock_input_for_this_thread()) *inout = 0; // drained, not delivered
     return r;
 }
+// Startup worker only: optional input hooks must not lose to another installer.
+bool install_input_function(void* target,void* detour,void** original) {
+    if(!na::hooking::BeginInstallWait("overlay input"))return false;
+    if(!na::hooking::PrepareHook(target,detour,original)){
+        na::hooking::AbandonInstall();return false;
+    }
+    return na::hooking::CommitInstall();
+}
 void install_dinput_hooks()
 {
     HMODULE m = LoadLibraryW(L"dinput8.dll"); // pinned: the hooked code must stay loaded
@@ -288,8 +423,8 @@ void install_dinput_hooks()
             // The A and W interfaces may share one implementation: hook each function once.
             bool st_done = false, dt_done = false;
             for (void* t : g_di_targets) { st_done |= t == st; dt_done |= t == dt; }
-            if (!st_done && na::hooking::HookFunction(st, states[i], reinterpret_cast<void**>(&g_orig_di_state[i]))) g_di_targets[i * 2] = st;
-            if (!dt_done && na::hooking::HookFunction(dt, datas[i], reinterpret_cast<void**>(&g_orig_di_data[i]))) g_di_targets[i * 2 + 1] = dt;
+            if (!st_done && install_input_function(st, states[i], reinterpret_cast<void**>(&g_orig_di_state[i]))) g_di_targets[i * 2] = st;
+            if (!dt_done && install_input_function(dt, datas[i], reinterpret_cast<void**>(&g_orig_di_data[i]))) g_di_targets[i * 2 + 1] = dt;
             static_cast<IUnknown*>(dev)->Release();
         }
         static_cast<IUnknown*>(di)->Release();
@@ -300,7 +435,7 @@ void install_input_hooks()
     install_dinput_hooks();
     HMODULE u = GetModuleHandleW(L"user32.dll");
     if (!u) return;
-    struct { const char* name; void* detour; void** original; } specs[7] = {
+    struct { const char* name; void* detour; void** original; } specs[8] = {
         {"GetRawInputData", reinterpret_cast<void*>(&DetourGetRawInputData), reinterpret_cast<void**>(&g_orig_get_raw_input_data)},
         {"GetRawInputBuffer", reinterpret_cast<void*>(&DetourGetRawInputBuffer), reinterpret_cast<void**>(&g_orig_get_raw_input_buffer)},
         {"GetCursorPos", reinterpret_cast<void*>(&DetourGetCursorPos), reinterpret_cast<void**>(&g_orig_get_cursor_pos)},
@@ -308,16 +443,23 @@ void install_input_hooks()
         {"GetAsyncKeyState", reinterpret_cast<void*>(&DetourGetAsyncKeyState), reinterpret_cast<void**>(&g_orig_get_async_key_state)},
         {"GetKeyboardState", reinterpret_cast<void*>(&DetourGetKeyboardState), reinterpret_cast<void**>(&g_orig_get_keyboard_state)},
         {"GetKeyState", reinterpret_cast<void*>(&DetourGetKeyState), reinterpret_cast<void**>(&g_orig_get_key_state)},
+        {"SetCursor", reinterpret_cast<void*>(&DetourSetCursor), reinterpret_cast<void**>(&g_orig_set_cursor)},
     };
     uint32_t n = 0;
-    for (int i = 0; i < 7; ++i) {
+    for (int i = 0; i < 8; ++i) {
+        if(g_input_hook_targets[i]){++n;continue;}
         void* target = reinterpret_cast<void*>(GetProcAddress(u, specs[i].name));
-        if (target && na::hooking::HookFunction(target, specs[i].detour, specs[i].original)) {
+        if(i==7 && g_fail_cursor_cleanup.exchange(false)){
+            na::hooking::FailNextCommitEnableForTest(0);na::hooking::FailNextRemoveForTest();
+        }
+        const bool optional_unavailable=i==7 && g_fail_optional_input.load() && g_fail_optional_input.fetch_sub(1)>0;
+        if (target && !optional_unavailable && install_input_function(target, specs[i].detour, specs[i].original)) {
             g_input_hook_targets[i] = target;
             ++n;
         } else {
-            // Fall back to the plain export so our own calls still work.
-            *specs[i].original = target;
+            // Failed cleanup may retain a callable trampoline. Overwriting it
+            // with the patched export can recurse into our own detour.
+            if(!*specs[i].original)*specs[i].original=target;
         }
     }
     g_input_hooks.store(n, std::memory_order_release);
@@ -404,6 +546,28 @@ void announce_pending()
 }
 // A55 status log (discovery thread only).
 wchar_t g_status_log[MAX_PATH] = {};
+bool g_menu_diagnostics = false;
+void menu_note(const char* text) {
+    if (!g_menu_diagnostics || !g_status_log[0]) return;
+    HANDLE f = CreateFileW(g_status_log, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(f, text, static_cast<DWORD>(strlen(text)), &written, nullptr);
+    CloseHandle(f);
+}
+int menu_fault(EXCEPTION_POINTERS* exception) {
+    na::settings::MarkSessionFailed("crash");
+    if (g_menu_diagnostics) {
+        char row[180];
+        snprintf(row, sizeof(row), "menu_fault code=0x%08lX address=%p thread=%lu\r\n",
+                 exception->ExceptionRecord->ExceptionCode, exception->ExceptionRecord->ExceptionAddress, GetCurrentThreadId());
+        menu_note(row);
+        wchar_t path[MAX_PATH]{};
+        if (swprintf_s(path, L"%s.menu.dmp", g_status_log) > 0)
+            na::freeze::WriteMiniDump(path, exception);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 ULONGLONG g_status_last_tick = 0;
 void write_status_line()
 {
@@ -436,10 +600,72 @@ void write_status_line()
                      static_cast<unsigned long long>(pr.late), static_cast<unsigned long long>(pr.dropped),
                      static_cast<unsigned long long>(pr.vetoed), static_cast<unsigned long long>(pr.generated_dropped), pr.chain_releases, pr.chain_flags, pr.orphaned);
     if (n <= 0) return;
-    HANDLE f = CreateFileW(g_status_log, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE f = CreateFileW(g_status_log, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return;
     DWORD written = 0;
-    WriteFile(f, line, static_cast<DWORD>(n), &written, nullptr);
+    WriteFile(f, line, static_cast<DWORD>((std::min)(n, static_cast<int>(sizeof(line)-1))), &written, nullptr);
+    char mode_line[1536]{};
+    const int mode_bytes=na::mode::FormatStatus(mode_line,sizeof(mode_line));
+    if(mode_bytes>0){WriteFile(f,mode_line,DWORD((std::min)(mode_bytes,int(sizeof(mode_line)-1))),&written,nullptr);WriteFile(f,"\r\n",2,&written,nullptr);}
+    {
+        char source_line[256];
+        const int source_bytes=snprintf(source_line,sizeof(source_line),"overlay_source=%s native_presents=%llu presents=%llu pid=%lu queue_hits=%u buffer_queue=%u queue_misses=%u\r\n",
+            g_boundary_frames.load(std::memory_order_acquire)?"streamline":"native",
+            static_cast<unsigned long long>(g_native_game_presents.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_presents.load(std::memory_order_relaxed)),GetCurrentProcessId(),
+            g_swap_queue_hits.load(),g_swap_queue_observed.load(),g_swap_queue_misses.load());
+        if(source_bytes>0)WriteFile(f,source_line,DWORD((std::min)(source_bytes,int(sizeof(source_line)-1))),&written,nullptr);
+    }
+    {
+        char reason[160]{},failure_line[240]{};
+        const auto count=na::hooking::InstallWaitFailures(reason,sizeof(reason));
+        if(count){const auto bytes=snprintf(failure_line,sizeof(failure_line),"hook_install_wait_failures=%u last=%s\r\n",count,reason);
+            WriteFile(f,failure_line,DWORD((std::min)(bytes,int(sizeof(failure_line)-1))),&written,nullptr);}
+    }
+    char readiness[128]{};
+    const auto readiness_bytes=snprintf(readiness,sizeof(readiness),"overlay_ready core=%u menu=%u initialized=%u input_hooks=%u/8\r\n",
+        g_core_started.load()?1u:0u,g_menu_enabled.load()?1u:0u,g_initialized.load(),g_input_hooks.load());
+    if(readiness_bytes>0)WriteFile(f,readiness,DWORD((std::min)(readiness_bytes,int(sizeof(readiness)-1))),&written,nullptr);
+    char sl_boundary_line[1024];
+    const int sl_boundary_bytes=na::slb::FormatStatus(sl_boundary_line,sizeof(sl_boundary_line));
+    if(sl_boundary_bytes>0){
+        WriteFile(f,sl_boundary_line,static_cast<DWORD>((std::min)(sl_boundary_bytes,static_cast<int>(sizeof(sl_boundary_line)-1))),&written,nullptr);
+        WriteFile(f,"\r\n",2,&written,nullptr);
+    }
+    char safe_line[144];const int safe_bytes=snprintf(safe_line,sizeof(safe_line),"safe_start=%u reason=%s renderer_ready=%u shared_writer=%u clean_exit_hook=%u\r\n",na::settings::SafeStart()?1u:0u,na::settings::SafeStartReason(),na::host::SessionReady()?1u:0u,na::settings::CanPersist()?1u:0u,na::host::CleanExitObserved()?1u:0u);
+    if(safe_bytes>0)WriteFile(f, safe_line, static_cast<DWORD>((std::min)(safe_bytes, static_cast<int>(sizeof(safe_line)-1))), &written, nullptr);
+    char fg_inputs[512];
+    const int fg_input_bytes = snprintf(fg_inputs, sizeof(fg_inputs),
+        "native_fg_inputs evaluates=%llu available_resources=%llu hudless=%llu distortion=%llu list_type=%u color_format=%u allocation=%ux%u nr_route=%s\r\n",
+        static_cast<unsigned long long>(ngx.fg_evaluates), static_cast<unsigned long long>(ngx.fg_with_inputs),
+        static_cast<unsigned long long>(ngx.fg_with_hudless), static_cast<unsigned long long>(ngx.fg_with_distortion),
+        ngx.fg_list_type, ngx.fg_color_format, ngx.fg_color_w, ngx.fg_color_h,na::nr::native::GetStatus().source==2?"pre_streamline_present":na::nr::native::OwnsRoute()?"pre_native_fg":"present");
+    if (fg_input_bytes > 0) WriteFile(f, fg_inputs, static_cast<DWORD>((std::min)(fg_input_bytes, static_cast<int>(sizeof(fg_inputs)-1))), &written, nullptr);
+    const int fg_contract_bytes = snprintf(fg_inputs, sizeof(fg_inputs),
+        "native_fg_contract frame_id_calls=%llu alpha_calls=%llu ui_calls=%llu last_create_uir=%u\r\n",
+        static_cast<unsigned long long>(ngx.fg_with_frame_id), static_cast<unsigned long long>(ngx.fg_with_alpha),
+        static_cast<unsigned long long>(ngx.fg_with_ui), ngx.fg_last_create_uir);
+    if (fg_contract_bytes > 0) WriteFile(f, fg_inputs, static_cast<DWORD>((std::min)(fg_contract_bytes, static_cast<int>(sizeof(fg_inputs)-1))), &written, nullptr);
+    if (na::nr::native::OwnsRoute()) {
+        const auto native=na::nr::native::GetStatus();
+        const int bytes=snprintf(fg_inputs,sizeof(fg_inputs),
+            "nr_pre_fg evaluated=%llu reused=%llu submissions=%llu retired=%llu skipped=%llu gpu_ms=%.3f samples=%u source=%u reason=%s\r\n",
+            static_cast<unsigned long long>(native.evaluates),static_cast<unsigned long long>(native.reused),
+            static_cast<unsigned long long>(native.submitted),static_cast<unsigned long long>(native.completed),
+            static_cast<unsigned long long>(native.skipped),native.avg_ms,native.gpu_samples,native.source,native.reason);
+        if(bytes>0)WriteFile(f,fg_inputs,static_cast<DWORD>((std::min)(bytes,static_cast<int>(sizeof(fg_inputs)-1))),&written,nullptr);
+        const int state_bytes=snprintf(fg_inputs,sizeof(fg_inputs),
+            "nr_pre_fg_delivery frame_id=%llu states_known=%u color_state=0x%x hudless_state=0x%x backbuffer_is_swapchain=%u output_real=%u output_real_is_swapchain=%u identity=%u inner=%u/%u list_type=%u states_ready=%u read_contract_mask=0x%x hudless_replaced=%u\r\n",
+            static_cast<unsigned long long>(native.frame_id),native.input_states_known,native.color_state,native.hudless_state,
+            native.backbuffer_is_swapchain,native.output_real_present,native.output_real_is_swapchain,native.identity_mode,native.multi_index,native.multi_count,native.list_type,native.input_states_ready,native.state_contract_mask,native.hudless_replaced);
+        if(state_bytes>0)WriteFile(f,fg_inputs,static_cast<DWORD>((std::min)(state_bytes,static_cast<int>(sizeof(fg_inputs)-1))),&written,nullptr);
+        const char* names[]={"color","hudless","depth","motion"};
+        for(unsigned i=0;i<4;++i){
+            const int bytes_input=snprintf(fg_inputs,sizeof(fg_inputs),"nr_pre_fg_state input=%s state=0x%x evidence=%s illegal_on_queue=%u\r\n",
+                names[i],native.input_states[i],na::nr::states::Name(static_cast<na::nr::states::Evidence>(native.input_evidence[i])),(native.illegal_state_mask>>i)&1u);
+            if(bytes_input>0)WriteFile(f,fg_inputs,static_cast<DWORD>((std::min)(bytes_input,static_cast<int>(sizeof(fg_inputs)-1))),&written,nullptr);
+        }
+    }
     // Worker-thread snapshots only: no GPU waits or readbacks in callbacks.
     const auto fsr = na::ffx::GetStats();
     const auto xess = na::xess::GetStats();
@@ -457,7 +683,7 @@ void write_status_line()
                       static_cast<unsigned long>(g_present_result.load()),
                       static_cast<unsigned long long>(g_game_latency_handle.load()),
                       static_cast<unsigned long long>(g_present_queue_identity.load()));
-    if (pn > 0) WriteFile(f, pacing, static_cast<DWORD>(pn), &written, nullptr);
+    if (pn > 0) WriteFile(f, pacing, static_cast<DWORD>((std::min)(pn, static_cast<int>(sizeof(pacing)-1))), &written, nullptr);
     {
         const auto j2 = na::j2::GetStats();
         uint64_t mb_s = 0, mb_st = 0;
@@ -466,14 +692,19 @@ void write_status_line()
         na::observe::GetLiveSelection(&sel_depth, &sel_color);
         char jl[1536];
         int jn = snprintf(jl, sizeof(jl),
-            "j2 on=%u active=%u depth=%llu color=%llu submissions=%llu frames=%llu no_selection=%llu no_scene_list=%llu no_state=%llu (colour %llu depth %llu) no_camera=%llu busy=%llu dlss_failed=%llu cuts=%llu camera_offset=%llu later_passes=%u duplicates=%llu jitter_writes=%llu cam_learned=%llu cam_scans=%llu inv_delta=%lld proj_delta=%lld proj_writes=%llu mip_bias=%.2f biased_samplers=%llu biased_static=%llu post_cam=%llu post_depth=%llu other_cam=%llu reversed=%u preset=%u sharpness=%u nis_frames=%llu scene_batches=%u/%u target=%u waited=%llu post_scene=%llu inline=%u/%u cands=%llu inl_wait=%llu inl_rec=%llu inl_frames=%llu inl_refused=%llu shape=sub%u/mips%u/slices%u/msaa%u depth_slices%u/msaa%u size=%ux%u format=%u \"%s\"\r\n",
+            "j2 on=%u active=%u depth=%llu color=%llu submissions=%llu frames=%llu no_selection=%llu no_scene_list=%llu no_state=%llu (colour %llu depth %llu) no_camera=%llu busy=%llu dlss_failed=%llu cuts=%llu camera_offset=%llu later_passes=%u duplicates=%llu jitter_writes=%llu cam_learned=%llu cam_scans=%llu inv_delta=%lld proj_delta=%lld proj_writes=%llu rebased=%llu mip_bias=%.2f biased_samplers=%llu biased_static=%llu post_cam=%llu post_depth=%llu other_cam=%llu reversed=%u preset=%u sharpness=%u nis_frames=%llu scene_batches=%u/%u target=%u waited=%llu post_scene=%llu inline=%u/%u cands=%llu inl_wait=%llu inl_rec=%llu inl_frames=%llu inl_refused=%llu shape=sub%u/mips%u/slices%u/msaa%u depth_slices%u/msaa%u size=%ux%u format=%u \"%s\"\r\n",
             na::j2::Enabled() ? 1u : 0u, j2.active ? 1u : 0u, static_cast<unsigned long long>(sel_depth), static_cast<unsigned long long>(sel_color),
             static_cast<unsigned long long>(j2.submissions), static_cast<unsigned long long>(j2.frames), static_cast<unsigned long long>(j2.no_selection),
             static_cast<unsigned long long>(j2.no_scene_list), static_cast<unsigned long long>(j2.no_state), static_cast<unsigned long long>(j2.no_state_color), static_cast<unsigned long long>(j2.no_state_depth), static_cast<unsigned long long>(j2.no_camera),
             static_cast<unsigned long long>(j2.busy), static_cast<unsigned long long>(j2.dlss_failed), static_cast<unsigned long long>(j2.cuts),
-            static_cast<unsigned long long>(j2.camera_offset), j2.later_passes, static_cast<unsigned long long>(j2.duplicate_submissions), static_cast<unsigned long long>(j2.jitter_writes), static_cast<unsigned long long>(j2.camera_learned_hits), static_cast<unsigned long long>(j2.camera_scans), static_cast<long long>(j2.camera_inv_delta), static_cast<long long>(j2.camera_proj_delta), static_cast<unsigned long long>(j2.jitter_proj_writes), na::observe::SamplerMipBias(), static_cast<unsigned long long>(mb_s), static_cast<unsigned long long>(mb_st), static_cast<unsigned long long>(j2.post_camera_lists), static_cast<unsigned long long>(j2.post_depth_lists), static_cast<unsigned long long>(j2.other_camera_blocks), j2.depth_reversed ? 1u : 0u, dlss.feature_preset, na::settings::Get().j2_sharpness.load(), static_cast<unsigned long long>(j2.nis_frames), j2.scene_batches, j2.scene_batches_max, j2.scene_batches_target, static_cast<unsigned long long>(j2.waited_batches), static_cast<unsigned long long>(j2.post_scene_batches), j2.inline_mode, j2.inline_target, static_cast<unsigned long long>(j2.inline_candidates), static_cast<unsigned long long>(j2.inline_waited), static_cast<unsigned long long>(j2.inline_recorded), static_cast<unsigned long long>(j2.inline_frames), static_cast<unsigned long long>(j2.inline_refused), j2.color_sub, j2.color_mips, j2.color_slices, j2.color_samples, j2.depth_slices, j2.depth_samples, j2.width, j2.height, j2.color_format, j2.reason);
+            static_cast<unsigned long long>(j2.camera_offset), j2.later_passes, static_cast<unsigned long long>(j2.duplicate_submissions), static_cast<unsigned long long>(j2.jitter_writes), static_cast<unsigned long long>(j2.camera_learned_hits), static_cast<unsigned long long>(j2.camera_scans), static_cast<long long>(j2.camera_inv_delta), static_cast<long long>(j2.camera_proj_delta), static_cast<unsigned long long>(j2.jitter_proj_writes), static_cast<unsigned long long>(j2.jitter_rebased), na::observe::SamplerMipBias(), static_cast<unsigned long long>(mb_s), static_cast<unsigned long long>(mb_st), static_cast<unsigned long long>(j2.post_camera_lists), static_cast<unsigned long long>(j2.post_depth_lists), static_cast<unsigned long long>(j2.other_camera_blocks), j2.depth_reversed ? 1u : 0u, dlss.feature_preset, na::settings::Get().j2_sharpness.load(), static_cast<unsigned long long>(j2.nis_frames), j2.scene_batches, j2.scene_batches_max, j2.scene_batches_target, static_cast<unsigned long long>(j2.waited_batches), static_cast<unsigned long long>(j2.post_scene_batches), j2.inline_mode, j2.inline_target, static_cast<unsigned long long>(j2.inline_candidates), static_cast<unsigned long long>(j2.inline_waited), static_cast<unsigned long long>(j2.inline_recorded), static_cast<unsigned long long>(j2.inline_frames), static_cast<unsigned long long>(j2.inline_refused), j2.color_sub, j2.color_mips, j2.color_slices, j2.color_samples, j2.depth_slices, j2.depth_samples, j2.width, j2.height, j2.color_format, j2.reason);
         if (jn > 0) WriteFile(f, jl, static_cast<DWORD>((std::min)(jn, static_cast<int>(sizeof(jl) - 1))), &written, nullptr);
         char coverage[256];
+        if (j2.depth_state_evidence[0]) {
+            WriteFile(f, "j2_depth_evidence ", 18, &written, nullptr);
+            WriteFile(f, j2.depth_state_evidence, static_cast<DWORD>(std::strlen(j2.depth_state_evidence)), &written, nullptr);
+            WriteFile(f, "\r\n", 2, &written, nullptr);
+        }
         const DWORD trace_len = static_cast<DWORD>(std::strlen(j2.insertion_frame_trace));
         WriteFile(f, "j2_frame", 8, &written, nullptr);
         WriteFile(f, j2.insertion_frame_trace, trace_len, &written, nullptr);
@@ -482,7 +713,7 @@ void write_status_line()
             (unsigned long long)j2.inline_presents, (unsigned long long)j2.inline_covered,
             (unsigned long long)j2.inline_late_writes, (unsigned long long)j2.inline_jittered,
             j2.inline_jitter_x, j2.inline_jitter_y);
-        if (nc > 0) WriteFile(f, coverage, static_cast<DWORD>(nc), &written, nullptr);
+        if (nc > 0) WriteFile(f, coverage, static_cast<DWORD>((std::min)(nc, static_cast<int>(sizeof(coverage)-1))), &written, nullptr);
         {
             static const char* kRoutes[] = {"none", "between", "inline", "interceptor"};
             static const char* kModes[] = {"auto", "forced-between", "forced-inline"};
@@ -554,46 +785,97 @@ void write_status_line()
         char nl[200];
         const int nn = snprintf(nl, sizeof nl, "mip_native below0=%llu at0=%llu above0=%llu min=%.2f max=%.2f (game's own bias on surface samplers)\r\n",
                                 static_cast<unsigned long long>(nbs.negative), static_cast<unsigned long long>(nbs.zero), static_cast<unsigned long long>(nbs.positive), nbs.min, nbs.max);
-        if (nn > 0) WriteFile(f, nl, static_cast<DWORD>(nn), &written, nullptr);
+        if (nn > 0) WriteFile(f, nl, static_cast<DWORD>((std::min)(nn, static_cast<int>(sizeof(nl)-1))), &written, nullptr);
+        // Live texture detail: were twins built, and do recordings use them or fall back?
+        const auto ml = na::observe::GetMipLiveStats();
+        char ml_line[300];
+        const int mn = snprintf(ml_line, sizeof ml_line, "mip_live enabled=%u now=%.2f game=%.2f twin_rs=%llu twin_pso=%llu untwinned_pso=%llu fallbacks=%llu twin_failures=%llu\r\n",
+                                ml.enabled ? 1u : 0u, na::observe::SamplerMipBias(), ml.game_bias, (unsigned long long)ml.twin_root_signatures,
+                                (unsigned long long)ml.twin_pipelines, (unsigned long long)ml.untwinned_pipelines, (unsigned long long)ml.fallbacks,
+                                (unsigned long long)ml.twin_failures);
+        if (mn > 0) WriteFile(f, ml_line, static_cast<DWORD>((std::min)(mn, static_cast<int>(sizeof(ml_line)-1))), &written, nullptr);
     }
     const auto latency = na::latency::GetStats();
     char lm[900];
     int ln = snprintf(lm, sizeof(lm), "latency request=%d available=%u confirmed=%u game_sleep=%u native_n=%llu native_ms=%.2f set=%d query=%d foreground=%u vrr=%u cpl_vsync=%u iflip=%u sync=%u flags=0x%X ready_ms=%.2f ready_p95=%.2f real_age_ms=%.2f real_age_p95=%.2f interval_ms=%.2f interval_p95=%.2f present_ms=%.2f backlog=%u\r\n", na::settings::Get().reflex_mode.load(), latency.available, latency.low_latency, latency.game_sleep, static_cast<unsigned long long>(latency.native_samples), latency.native_render_ms, latency.set_result, latency.query_result, latency.foreground, latency.fullscreen_vrr, latency.vsync_override, latency.independent_flip, pr.requested_sync, pr.requested_flags, pr.ready_age.mean, pr.ready_age.p95, pr.real_age.mean, pr.real_age.p95, pr.submit_interval.mean, pr.submit_interval.p95, pr.present_call.mean, pr.backlog);
-    if (ln > 0) WriteFile(f, lm, static_cast<DWORD>(ln), &written, nullptr);
+    if (ln > 0) WriteFile(f, lm, static_cast<DWORD>((std::min)(ln, static_cast<int>(sizeof(lm)-1))), &written, nullptr);
     ln = snprintf(lm, sizeof(lm), "reflex_observers sleep=%u marker=%u dropped=%llu (incoming calls, not engine-placement qualification)\r\n", latency.sleep_observer, latency.marker_observer, static_cast<unsigned long long>(latency.audit_dropped));
-    if (ln > 0) WriteFile(f, lm, static_cast<DWORD>(ln), &written, nullptr);
+    if (ln > 0) WriteFile(f, lm, static_cast<DWORD>((std::min)(ln, static_cast<int>(sizeof(lm)-1))), &written, nullptr);
     for (uint32_t kind = 0; kind < na::latency::NativeAudit::Slots; ++kind) {
         const auto& c = latency.audit.calls[kind];
         if (!c.count) continue;
         ln = snprintf(lm, sizeof(lm), "reflex_incoming kind=%u count=%llu ok=%llu device=0x%llX frame=%llu thread=%u caller=0x%llX begin_qpc=%llu end_qpc=%llu result=%d\r\n", kind, static_cast<unsigned long long>(c.count), static_cast<unsigned long long>(c.successes), static_cast<unsigned long long>(c.device), static_cast<unsigned long long>(c.frame), c.thread, static_cast<unsigned long long>(c.caller), static_cast<unsigned long long>(c.begin_qpc), static_cast<unsigned long long>(c.end_qpc), c.result);
-        if (ln > 0) WriteFile(f, lm, static_cast<DWORD>(ln), &written, nullptr);
+        if (ln > 0) WriteFile(f, lm, static_cast<DWORD>((std::min)(ln, static_cast<int>(sizeof(lm)-1))), &written, nullptr);
     }
     ln = snprintf(lm, sizeof(lm), "reflex_engine attached=%u available=%u external=%u pcl=%u sleeps=%llu markers=%llu complete=%llu rejected=%llu errors=%llu result=%d\r\n", latency.engine_attached, latency.engine_available, latency.external_owner, latency.pcl_available, static_cast<unsigned long long>(latency.engine_sleep), static_cast<unsigned long long>(latency.engine_markers), static_cast<unsigned long long>(latency.engine_complete), static_cast<unsigned long long>(latency.engine_rejected), static_cast<unsigned long long>(latency.engine_errors), latency.engine_last_result);
-    if (ln > 0) WriteFile(f, lm, static_cast<DWORD>(ln), &written, nullptr);
+    if (ln > 0) WriteFile(f, lm, static_cast<DWORD>((std::min)(ln, static_cast<int>(sizeof(lm)-1))), &written, nullptr);
     const auto timing_trace = na::tlou1::GetTimingTrace();
     ln=snprintf(lm,sizeof(lm),"gpu_present_copy first_ms=%.3f first_p95=%.3f interval_ms=%.3f interval_p95=%.3f samples=%u independent_queue=%u (GPU completion, not scanout)\r\n",pr.gpu_first_copy.mean,pr.gpu_first_copy.p95,pr.gpu_copy_interval.mean,pr.gpu_copy_interval.p95,pr.gpu_first_copy.count,pr.independent_queue);
-    if(ln>0) WriteFile(f,lm,static_cast<DWORD>(ln),&written,nullptr);
+    if(ln>0) WriteFile(f, lm, static_cast<DWORD>((std::min)(ln, static_cast<int>(sizeof(lm)-1))), &written, nullptr);
     ln = snprintf(lm,sizeof(lm),"engine_present seen=%llu with_frame=%llu game_callers=",timing_trace.seen,timing_trace.with_frame);
     for(unsigned i=0;i<timing_trace.count && ln<700;++i) ln+=snprintf(lm+ln,sizeof(lm)-ln,"%llX,",static_cast<unsigned long long>(timing_trace.callers[i]));
     ln+=snprintf(lm+ln,sizeof(lm)-ln,"\r\n");
-    if(ln>0) WriteFile(f,lm,static_cast<DWORD>(ln),&written,nullptr);
+    if(ln>0) WriteFile(f, lm, static_cast<DWORD>((std::min)(ln, static_cast<int>(sizeof(lm)-1))), &written, nullptr);
     const auto camera = na::fg::GetCameraStats();
     ln = snprintf(lm, sizeof(lm), "fg_camera recorded=%llu rejected=%llu matched=%llu missed=%llu\r\n", camera.recorded,camera.rejected,camera.matched,camera.missed);
-    if (ln > 0) WriteFile(f,lm,static_cast<DWORD>(ln),&written,nullptr);
+    if (ln > 0) WriteFile(f, lm, static_cast<DWORD>((std::min)(ln, static_cast<int>(sizeof(lm)-1))), &written, nullptr);
     const auto fpreset = na::fg::preset::GetStatus();
     ln = snprintf(lm, sizeof(lm), "fg_driver_preset requested=%u stored=%u result=%d pending=%u restart=%u (profile request; active model unverified)\r\n", fpreset.requested, fpreset.stored, fpreset.result, fpreset.pending ? 1u : 0u, fpreset.restart ? 1u : 0u);
-    if (ln > 0) WriteFile(f, lm, static_cast<DWORD>(ln), &written, nullptr);
+    if (ln > 0) WriteFile(f, lm, static_cast<DWORD>((std::min)(ln, static_cast<int>(sizeof(lm)-1))), &written, nullptr);
+    const auto drv = na::fg::preset::GetUpscalerOverrides();
+    const auto optc = na::ngx::GetOptimalStats();
+    const auto ngxs = na::ngx::GetStats();
+    ln = snprintf(lm, sizeof(lm), "dlss_control driver_read=%u sr_override=%u sr_preset=0x%X sr_global=%u rr_override=%u rr_preset=0x%X rr_global=%u preset_setting=%d rr_preset_setting=%d optimal_calls=%llu last_query=%ux%u game_asks_size=%u swaps=cap%llu/allocate%llu/getparams%llu\r\n",
+                  drv.available ? 1u : 0u, drv.sr_enabled, drv.sr_preset, drv.sr_global ? 1u : 0u, drv.rr_enabled, drv.rr_preset, drv.rr_global ? 1u : 0u,
+                  na::settings::Get().preset.load(), na::settings::Get().rr_preset.load(), static_cast<unsigned long long>(optc.calls), optc.last_user_w, optc.last_user_h,
+                  na::ngx::OptimalQueriedFor(ngxs.last_sr_out_w, ngxs.last_sr_out_h) ? 1u : 0u,
+                  static_cast<unsigned long long>(optc.swaps_capability), static_cast<unsigned long long>(optc.swaps_allocate),
+                  static_cast<unsigned long long>(optc.swaps_getparams));
+    if (ln > 0) WriteFile(f, lm, static_cast<DWORD>((std::min)(ln, static_cast<int>(sizeof(lm)-1))), &written, nullptr);
+    {
+        static uint64_t opt_logged = 0;
+        na::ngx::OptimalCall calls[16];
+        const uint32_t opt_n = na::ngx::GetOptimalCalls(opt_logged, calls, 16);
+        for (uint32_t i = 0; i < opt_n; ++i) {
+            const auto& c = calls[i];
+            ln = snprintf(lm, sizeof(lm), "dlss_optimal_call seq=%llu rr=%u asked=%ux%u pq=%d nvidia=%ux%u returned=%ux%u overridden=%u\r\n",
+                          static_cast<unsigned long long>(c.sequence), c.rr, c.user_w, c.user_h, c.perf_quality,
+                          c.native_w, c.native_h, c.out_w, c.out_h, c.overridden);
+            if (ln > 0) WriteFile(f, lm, static_cast<DWORD>((std::min)(ln, static_cast<int>(sizeof(lm)-1))), &written, nullptr);
+            opt_logged = c.sequence;
+        }
+    }
     write_menu_progress(f);
     char nr_line[256];
-    int nn = snprintf(nr_line, sizeof(nr_line), "nr_inputs seen=%llu overwritten=%llu missing=%llu allocator_busy=%llu\r\n",
+    // Read a bounded receipt ring on the logging worker, never write a file
+    // from the menu/input callback. Sequence gaps expose overwritten receipts.
+    static uint64_t nr_write_logged=0;
+    const auto nr_writes=na::settings::GetNrWrites();
+    for(uint32_t i=0;i<nr_writes.count;++i) {
+        const auto& change=nr_writes.entries[i];
+        if(change.sequence<=nr_write_logged) continue;
+        const char* source=change.source==na::settings::NrWriteSource::Overlay ? "overlay" :
+            (change.source==na::settings::NrWriteSource::SafeStartup ? "safe_start" :
+            (change.source==na::settings::NrWriteSource::UserIni ? "user_ini" : "default_ini"));
+        const int bytes=snprintf(nr_line,sizeof(nr_line),
+            "nr_setting_write seq=%llu tick=%llu thread=%u before=%u after=%u source=%s input_flags=%u\r\n",
+            change.sequence,change.tick_ms,change.thread,change.before,change.after,source,change.input_flags);
+        if(bytes>0 && WriteFile(f,nr_line,static_cast<DWORD>(bytes),&written,nullptr)) nr_write_logged=change.sequence;
+    }
+    int nn = snprintf(nr_line, sizeof(nr_line), "nr_inputs seen=%llu overwritten=%llu missing=%llu allocator_busy=%llu untracked_list=%llu\r\n",
                       static_cast<unsigned long long>(nr.inputs_seen), static_cast<unsigned long long>(nr.input_overwrites),
-                      static_cast<unsigned long long>(nr.missing_inputs), static_cast<unsigned long long>(nr.busy_slots));
-    if (nn > 0) WriteFile(f, nr_line, static_cast<DWORD>(nn), &written, nullptr);
+                      static_cast<unsigned long long>(nr.missing_inputs), static_cast<unsigned long long>(nr.busy_slots),
+                      static_cast<unsigned long long>(nr.untracked_lists));
+    if (nn > 0) WriteFile(f, nr_line, static_cast<DWORD>((std::min)(nn, static_cast<int>(sizeof(nr_line)-1))), &written, nullptr);
+    nn = snprintf(nr_line, sizeof(nr_line), "nr_queue_sync input_submitted=%llu input_completed=%llu gpu_waits=%llu\r\n",
+                  static_cast<unsigned long long>(nr.input_submitted), static_cast<unsigned long long>(nr.input_completed),
+                  static_cast<unsigned long long>(nr.cross_queue_waits));
+    if (nn > 0) WriteFile(f, nr_line, static_cast<DWORD>((std::min)(nn, static_cast<int>(sizeof(nr_line)-1))), &written, nullptr);
     char fg_line[256];
     int fn = snprintf(fg_line, sizeof(fg_line), "fg_inputs recorded=%llu submitted=%llu overwritten=%llu missing=%llu\r\n",
                       static_cast<unsigned long long>(fg.inputs_recorded), static_cast<unsigned long long>(fg.inputs_submitted),
                       static_cast<unsigned long long>(fg.inputs_overwritten), static_cast<unsigned long long>(fg.missing_inputs));
-    if (fn > 0) WriteFile(f, fg_line, static_cast<DWORD>(fn), &written, nullptr);
+    if (fn > 0) WriteFile(f, fg_line, static_cast<DWORD>((std::min)(fn, static_cast<int>(sizeof(fg_line)-1))), &written, nullptr);
     // A66 (R3): one line per game-driven DLSS creation since the last write:
     // sequence, thread, result, sizes, the Apply request it happened under
     // (ctx=apply#N, or ctx=game for a baseline / game-menu creation), and the
@@ -627,17 +909,23 @@ void write_status_line()
     // itself: every thread's stack, a minidump, and Frame Generation off for
     // the next launch.
     static na::freeze::Watchdog watchdog(10000);
-    if (watchdog.Check(pr.presents_game, now)) {
+    // Native-FG games bypass our optional presenter, whose presents_game
+    // remains zero. The host counter advances on both presentation routes.
+    const uint64_t host_presents = g_presents.load(std::memory_order_relaxed);
+    if (watchdog.Check(host_presents, now)) {
+        na::settings::MarkSessionFailed("freeze");
+        na::nr::native::TraceGpuProgress();
+        na::nr::trace::Dump(f);
         char hl[400];
         int m = snprintf(hl, sizeof(hl), "%02u:%02u:%02u FREEZE detected: the game's presents have not advanced for %llu ms (game_presents=%llu real_presents=%llu fg_active=%u count=%u backlog=%u). Thread stacks follow (innermost first).\r\n",
                          t.wHour, t.wMinute, t.wSecond, static_cast<unsigned long long>(watchdog.StalledMs(now)),
-                         static_cast<unsigned long long>(pr.presents_game), static_cast<unsigned long long>(pr.presents_real), fg.active, fg.last_count, pr.backlog);
-        if (m > 0) WriteFile(f, hl, static_cast<DWORD>(m), &written, nullptr);
+                         static_cast<unsigned long long>(host_presents), static_cast<unsigned long long>(pr.presents_real), fg.active, fg.last_count, pr.backlog);
+        if (m > 0) WriteFile(f, hl, static_cast<DWORD>((std::min)(m, static_cast<int>(sizeof(hl)-1))), &written, nullptr);
         static na::freeze::Capture cap; // static: not on this thread's stack
         na::freeze::CaptureAllThreads(&cap);
         m = snprintf(hl, sizeof(hl), "FREEZE thread coverage: captured=%u found=%u capacity=%u\r\n",
                      cap.thread_count, cap.threads_total, na::freeze::kMaxThreads);
-        if (m > 0) WriteFile(f, hl, static_cast<DWORD>(m), &written, nullptr);
+        if (m > 0) WriteFile(f, hl, static_cast<DWORD>((std::min)(m, static_cast<int>(sizeof(hl)-1))), &written, nullptr);
         for (uint32_t i = 0; i < cap.thread_count; ++i) {
             char sl[2400];
             uint32_t len = na::freeze::FormatStack(cap.threads[i], sl, sizeof(sl) - 4);
@@ -658,7 +946,7 @@ void write_status_line()
                 char dump_a[MAX_PATH];
                 WideCharToMultiByte(CP_ACP, 0, dump, -1, dump_a, sizeof(dump_a), nullptr, nullptr);
                 m = snprintf(dl, sizeof(dl), "%02u:%02u:%02u FREEZE minidump %s: %s\r\n", t.wHour, t.wMinute, t.wSecond, ok ? "written" : "FAILED", dump_a);
-                if (m > 0) WriteFile(f, dl, static_cast<DWORD>(m), &written, nullptr);
+                if (m > 0) WriteFile(f, dl, static_cast<DWORD>((std::min)(m, static_cast<int>(sizeof(dl)-1))), &written, nullptr);
             }
         }
         // Safe mode for the next launch: Frame Generation off, with the time recorded.
@@ -667,7 +955,7 @@ void write_status_line()
             na::settings::Get().fg_frozen_at.store(static_cast<uint32_t>(time(nullptr)), std::memory_order_release);
             bool saved = na::settings::Save();
             m = snprintf(hl, sizeof(hl), "%02u:%02u:%02u FREEZE safe mode: Frame Generation switched off for the next launch (%s).\r\n", t.wHour, t.wMinute, t.wSecond, saved ? "saved" : "save FAILED");
-            if (m > 0) WriteFile(f, hl, static_cast<DWORD>(m), &written, nullptr);
+            if (m > 0) WriteFile(f, hl, static_cast<DWORD>((std::min)(m, static_cast<int>(sizeof(hl)-1))), &written, nullptr);
         }
     }
     // A71: the game's Streamline settings calls (slSetFeatureConstants = set_constants,
@@ -705,7 +993,18 @@ void write_status_line()
                            static_cast<unsigned long long>(a.frame_calls), static_cast<unsigned long long>(a.predicate_calls),
                            static_cast<unsigned long long>(a.triggers), static_cast<unsigned long long>(a.resource_releases),
                            static_cast<unsigned long long>(a.resource_release_failures), a.trigger_thread, a.reason);
-        if (len > 0 && len < static_cast<int>(sizeof(row))) WriteFile(f, row, static_cast<DWORD>(len), &written, nullptr);
+        if (len > 0 && len < static_cast<int>(sizeof(row))) WriteFile(f, row, static_cast<DWORD>((std::min)(len, static_cast<int>(sizeof(row)-1))), &written, nullptr);
+    }
+    {
+        auto a=na::tsushima::GetApplyStatus();
+        if(a.available) {
+            char row[512];
+            int len=snprintf(row,sizeof(row),"ghost_apply request=%llu state=%u mode=%u size=%ux%u frames=%llu triggers=%llu thread=%u reason=\"%s\"\r\n",
+                static_cast<unsigned long long>(a.request_id),static_cast<unsigned>(a.stage),a.choice.mode,
+                a.choice.width,a.choice.height,static_cast<unsigned long long>(a.frame_calls),
+                static_cast<unsigned long long>(a.triggers),a.trigger_thread,a.reason);
+            if(len>0 && len<static_cast<int>(sizeof(row)))WriteFile(f,row,static_cast<DWORD>(len),&written,nullptr);
+        }
     }
     // A66 (R1): the size-confirmation monitor, one line whenever its state changes.
     static uint64_t last_confirm_id = 0;
@@ -721,7 +1020,7 @@ void write_status_line()
                          static_cast<unsigned long long>(sc.mismatched), static_cast<unsigned long long>(sc.incoherent), static_cast<unsigned long long>(sc.failed),
                          static_cast<unsigned long long>(sc.resets), static_cast<unsigned long long>(sc.unknown_handle), static_cast<unsigned long long>(sc.other_feature),
                          static_cast<unsigned long long>(sc.before_restore), static_cast<unsigned long long>(sc.creations));
-        if (m > 0) WriteFile(f, cl, static_cast<DWORD>(m), &written, nullptr);
+        if (m > 0) WriteFile(f, cl, static_cast<DWORD>((std::min)(m, static_cast<int>(sizeof(cl)-1))), &written, nullptr);
     }
     CloseHandle(f);
 }
@@ -764,8 +1063,7 @@ struct InputState {
     float wheel = 0;
     struct Key { int vk; bool down; };
     std::vector<Key> keys;
-    XINPUT_STATE pad{};
-    bool pad_valid = false;
+    input::ReleaseBeforeUse mouse_handover[3], pad_handover;
     RECT client{};
 };
 InputState g_in;
@@ -775,6 +1073,14 @@ struct FrameCtx {
     ComPtr<ID3D12Resource> back_buffer;
     D3D12_CPU_DESCRIPTOR_HANDLE rtv{};
     UINT64 fence_value = 0;
+    ComPtr<ID3D12Fence> completion;
+    bool signal_failed = false;
+    bool Complete() const {
+        if (signal_failed) return false;
+        if (!fence_value) return true;
+        const auto done = completion ? completion->GetCompletedValue() : UINT64_MAX;
+        return done != UINT64_MAX && done >= fence_value;
+    }
 };
 
 struct State {
@@ -784,16 +1090,19 @@ struct State {
     ComPtr<ID3D12CommandQueue> texture_queue;
     ComPtr<ID3D12DescriptorHeap> rtv_heap, srv_heap;
     ComPtr<ID3D12GraphicsCommandList> list;
-    ComPtr<ID3D12Fence> fence;
     HANDLE fence_event = nullptr;
     UINT64 fence_next = 1;
     std::vector<FrameCtx> frames;
+    UINT backbuffer_count = 0;
+    uint64_t imgui_draws = 0;
+    std::vector<UINT64> imgui_slot_fences;
     UINT rtv_stride = 0, srv_stride = 0;
     std::vector<bool> srv_used;
     HWND hwnd = nullptr;
     WNDPROC orig_wndproc = nullptr;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
     bool imgui_ready = false;
+    bool imgui_context_created=false;
     bool buffers_ready = false;
     bool was_open = false;
     LARGE_INTEGER last_present{};
@@ -801,6 +1110,19 @@ struct State {
     void* dummy_swapchain_identity = nullptr;
 };
 State g_state;
+
+// A slot is not signaled again until its previous use completes. Independent
+// queues therefore cannot advance one another's completion receipts.
+bool menu_draws_complete() {
+    for (const auto& f : g_state.frames) if (!f.Complete()) return false;
+    return true;
+}
+UINT64 menu_completed_prefix() {
+    UINT64 result = g_state.fence_next - 1;
+    for (const auto& f : g_state.frames)
+        if (!f.Complete() && f.fence_value) result = (std::min)(result, f.fence_value - 1);
+    return result;
+}
 
 // Diagnostic polling must never wait on the render thread or on the GPU.
 void write_menu_progress(HANDLE log)
@@ -813,14 +1135,17 @@ void write_menu_progress(HANDLE log)
     DWORD pw = 0;
     if (pn > 0) WriteFile(log, p_line, static_cast<DWORD>(pn), &pw, nullptr);
     std::unique_lock<std::mutex> lock(g_state.mutex, std::try_to_lock);
-    if (!lock.owns_lock() || !g_state.fence || !g_state.device) return;
-    char line[256];
-    int n = snprintf(line, sizeof(line), "menu_gpu draws=%llu submitted=%llu completed=%llu device_hr=0x%08lX observed_queue=0x%llX\r\n",
+    if (!lock.owns_lock() || !g_state.device) return;
+    char line[400];
+    int n = snprintf(line, sizeof(line), "menu_gpu draws=%llu submitted=%llu completed=%llu device_hr=0x%08lX observed_queue=0x%llX present_queue=0x%llX swapchain_queues=%u hits=%u buffer_queue=%u misses=%u\r\n",
                      static_cast<unsigned long long>(g_frames.load()),
                      static_cast<unsigned long long>(g_menu_draw_marker.load()),
-                     static_cast<unsigned long long>(g_state.fence->GetCompletedValue()),
+                     static_cast<unsigned long long>(menu_completed_prefix()),
                      static_cast<unsigned long>(g_state.device->GetDeviceRemovedReason()),
-                     static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(g_direct_queue.load())));
+                     static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(g_direct_queue.load())),
+                     static_cast<unsigned long long>(g_last_present_queue.load()), g_swap_queues_recorded.load(),
+                     g_swap_queue_hits.load(), g_swap_queue_observed.load(), g_swap_queue_misses.load());
+    if (n >= static_cast<int>(sizeof(line))) n = static_cast<int>(sizeof(line)) - 1; // never write past a truncated line
     DWORD written = 0;
     if (n > 0) WriteFile(log, line, static_cast<DWORD>(n), &written, nullptr);
     auto nr_progress = na::nr::GetStats();
@@ -994,7 +1319,10 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g_frozen_x.store(frozen.x, std::memory_order_relaxed);
             g_frozen_y.store(frozen.y, std::memory_order_relaxed);
         }
-        while (ShowCursor(TRUE) < 0 && g_cursor_shows < 64) ++g_cursor_shows;
+        // Count every increment, including the one that makes it visible.
+        // The previous loop omitted that last increment and left Windows'
+        // cursor count one higher after each Home open/close cycle.
+        while(g_cursor_shows<64){++g_cursor_shows;if(ShowCursor(TRUE)>=0)break;}
         SetCursor(LoadCursorW(nullptr, IDC_ARROW));
         return 0;
     }
@@ -1081,16 +1409,11 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 }
 
 // ---- XInput detour: the game sees a neutral pad while the menu is open;
-// the menu reads the real state from the snapshot. ----
+// the menu polls the original independently (the game may stop polling). ----
 DWORD WINAPI xinput_common(int slot, DWORD idx, XINPUT_STATE* st)
 {
     DWORD r = g_orig_xinput[slot](idx, st);
     if (r == ERROR_SUCCESS && st && idx == 0) {
-        {
-            std::lock_guard<std::mutex> lock(g_in.m);
-            g_in.pad = *st;
-            g_in.pad_valid = true;
-        }
         if (g_open.load(std::memory_order_acquire)) {
             XINPUT_GAMEPAD neutral{};
             st->Gamepad = neutral;
@@ -1125,6 +1448,15 @@ ImGuiKey vk_to_key(int vk)
 void apply_input(bool just_opened)
 {
     ImGuiIO& io = ImGui::GetIO();
+    XINPUT_GAMEPAD fresh_pad{};
+    const auto now=GetTickCount64();
+    if (now>=g_pad_retry_after) {
+        bool connected=false;
+        fresh_pad=input::FreshPad(g_menu_xinput.load(std::memory_order_acquire),&connected);
+        // Disconnected XInput polling can be expensive. Keep sending releases
+        // between probes; a connected controller is sampled every menu frame.
+        g_pad_retry_after=connected ? 0 : now+1000;
+    }
     std::lock_guard<std::mutex> lock(g_in.m);
     GetClientRect(g_state.hwnd, &g_in.client);
     if (just_opened) {
@@ -1152,7 +1484,7 @@ void apply_input(bool just_opened)
     const int vks[3] = {VK_LBUTTON, VK_RBUTTON, VK_MBUTTON};
     for (int b = 0; b < 3; ++b) {
         bool down = (real_get_async_key_state(vks[b]) & 0x8000) != 0;
-        if (just_opened) down = false; // the click that opened nothing must not select
+        down = g_in.mouse_handover[b].Update(down, just_opened);
         io.AddMouseButtonEvent(b, down);
     }
     if (g_in.wheel != 0.0f) {
@@ -1164,8 +1496,11 @@ void apply_input(bool just_opened)
         if (key != ImGuiKey_None) io.AddKeyEvent(key, k.down);
     }
     g_in.keys.clear();
-    if (g_in.pad_valid) {
-        const XINPUT_GAMEPAD& g = g_in.pad.Gamepad;
+    {
+        if (!g_in.pad_handover.Update(input::Navigating(fresh_pad), just_opened)) fresh_pad = {};
+        const XINPUT_GAMEPAD& g = fresh_pad;
+        // Always send up/zero events on disconnect or failed polling. Skipping
+        // these events leaves ImGui's previous buttons/axes held indefinitely.
         auto btn = [&](ImGuiKey key, WORD mask) { io.AddKeyEvent(key, (g.wButtons & mask) != 0); };
         btn(ImGuiKey_GamepadDpadUp, XINPUT_GAMEPAD_DPAD_UP);
         btn(ImGuiKey_GamepadDpadDown, XINPUT_GAMEPAD_DPAD_DOWN);
@@ -1202,23 +1537,36 @@ bool ensure_buffers_locked(IDXGISwapChain* sc)
     if (g_state.buffers_ready) return true;
     DXGI_SWAP_CHAIN_DESC desc{};
     if (FAILED(sc->GetDesc(&desc))) return false;
-    UINT count = desc.BufferCount;
+    g_state.backbuffer_count = desc.BufferCount;
+    // Mark identities without retaining swapchain buffers across resize.
+    for(UINT i=0;i<desc.BufferCount;++i){ComPtr<ID3D12Resource> buffer;
+        if(SUCCEEDED(real_get_buffer(sc,i,IID_PPV_ARGS(&buffer))))na::nr::native::MarkSwapchainBuffer(buffer.Get());}
+    // Draw-resource lifetime follows submitted overlay draws, not the native
+    // FG swapchain's image index. Allow a short GPU backlog without dropping
+    // the menu, while keeping every allocator/RTV/ImGui slot fenced together.
+    UINT count = (std::max)(8u, desc.BufferCount);
+    if ((g_state.frames.size() != count || g_state.format != desc.BufferDesc.Format) &&
+        !menu_draws_complete()) return false;
     if (g_state.frames.size() != count) {
-        g_state.frames.clear();
-        g_state.frames.resize(count);
+        std::vector<FrameCtx> frames(count);
+        ComPtr<ID3D12DescriptorHeap> rtv_heap;
         D3D12_DESCRIPTOR_HEAP_DESC rh{};
         rh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
         rh.NumDescriptors = count;
-        if (FAILED(g_state.device->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&g_state.rtv_heap))))
+        if (FAILED(g_state.device->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&rtv_heap))))
             return false;
         for (UINT i = 0; i < count; ++i) {
+            if (FAILED(g_state.device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                    IID_PPV_ARGS(&frames[i].completion)))) return false;
             if (FAILED(g_state.device->CreateCommandAllocator(
-                    D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_state.frames[i].allocator))))
+                    D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&frames[i].allocator))))
                 return false;
-            g_state.frames[i].rtv.ptr =
-                g_state.rtv_heap->GetCPUDescriptorHandleForHeapStart().ptr +
+            frames[i].rtv.ptr =
+                rtv_heap->GetCPUDescriptorHandleForHeapStart().ptr +
                 static_cast<SIZE_T>(i) * g_state.rtv_stride;
         }
+        g_state.frames=std::move(frames);
+        g_state.rtv_heap=std::move(rtv_heap);
     }
     g_state.format = desc.BufferDesc.Format;
     // A71 (Astra B-007): back buffers are NOT retained here. A cached buffer
@@ -1231,17 +1579,37 @@ bool ensure_buffers_locked(IDXGISwapChain* sc)
 
 // The current real back buffer for THIS frame only: fetched, its RTV
 // (re)written, used, and released by the caller before the Present returns.
-bool acquire_back_buffer_locked(IDXGISwapChain* sc, UINT idx, ComPtr<ID3D12Resource>& out)
+bool acquire_back_buffer_locked(IDXGISwapChain* sc, UINT idx, D3D12_CPU_DESCRIPTOR_HANDLE target_rtv, ComPtr<ID3D12Resource>& out)
 {
-    if (idx >= g_state.frames.size()) return false;
+    if (idx >= g_state.backbuffer_count) return false;
     if (FAILED(real_get_buffer(sc, idx, IID_PPV_ARGS(&out)))) return false;
     D3D12_RENDER_TARGET_VIEW_DESC rtv{};
     rtv.Format = g_state.format;
     rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-    g_state.device->CreateRenderTargetView(out.Get(), &rtv, g_state.frames[idx].rtv);
+    g_state.device->CreateRenderTargetView(out.Get(), &rtv, target_rtv);
     return true;
 }
 
+// Only called before any menu draw, or after all old draws retired. Core
+// device/queue ownership survives a failed menu allocation/backend startup.
+void discard_menu_init_locked()
+{
+    if(g_state.imgui_context_created){
+        auto& io=ImGui::GetIO();
+        if(io.BackendRendererUserData)ImGui_ImplDX12_Shutdown();
+        if(io.BackendPlatformUserData)ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();g_state.imgui_context_created=false;
+    }
+    if(g_state.hwnd && g_state.orig_wndproc)
+        SetWindowLongPtrW(g_state.hwnd,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(g_state.orig_wndproc));
+    g_state.orig_wndproc=nullptr;g_state.hwnd=nullptr;g_state.swapchain=nullptr;
+    g_state.imgui_ready=false;g_state.buffers_ready=false;
+    g_state.frames.clear();g_state.imgui_slot_fences.clear();g_state.list.Reset();
+    g_state.rtv_heap.Reset();g_state.srv_heap.Reset();
+    if(g_state.fence_event)CloseHandle(g_state.fence_event);
+    g_state.fence_event=nullptr;g_texture_queue.store(nullptr,std::memory_order_release);g_state.texture_queue.Reset();
+    g_initialized.store(0,std::memory_order_release);
+}
 bool ensure_init_locked(IDXGISwapChain* sc)
 {
     if (g_state.imgui_ready) {
@@ -1259,6 +1627,7 @@ bool ensure_init_locked(IDXGISwapChain* sc)
             // format and frame count: re-create it for the new chain. The
             // ImGui context, fonts and the Win32 backend stay; device objects
             // are rebuilt right away (eager, as at first init).
+            if(!menu_draws_complete())return false; // retry next frame; never wait in Present
             ImGui_ImplDX12_Shutdown();
             ImGui_ImplDX12_InitInfo info{};
             info.Device = g_state.device.Get();
@@ -1269,10 +1638,16 @@ bool ensure_init_locked(IDXGISwapChain* sc)
             info.SrvDescriptorHeap = g_state.srv_heap.Get();
             info.SrvDescriptorAllocFn = &SrvAlloc;
             info.SrvDescriptorFreeFn = &SrvFree;
-            if (!ImGui_ImplDX12_Init(&info) || !ImGui_ImplDX12_CreateDeviceObjects()) { g_state.imgui_ready = false; return false; }
+            if (!ImGui_ImplDX12_Init(&info) || !ImGui_ImplDX12_CreateDeviceObjects()) { discard_menu_init_locked(); return false; }
+            g_state.imgui_draws = 0;
+            g_state.imgui_slot_fences.assign(g_state.frames.size(), 0);
         }
         return true;
     }
+    struct MenuAttempt {
+        bool committed=false;
+        ~MenuAttempt(){if(!committed)discard_menu_init_locked();}
+    } attempt;
     if (FAILED(sc->GetDevice(IID_PPV_ARGS(&g_state.device)))) return false;
     na::gputime::SetDevice(g_state.device.Get());
     g_state.rtv_stride = g_state.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
@@ -1283,7 +1658,6 @@ bool ensure_init_locked(IDXGISwapChain* sc)
     sh.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(g_state.device->CreateDescriptorHeap(&sh, IID_PPV_ARGS(&g_state.srv_heap)))) return false;
     g_state.srv_used.assign(kSrvHeapSize, false);
-    if (FAILED(g_state.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_state.fence)))) return false;
     g_state.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!ensure_buffers_locked(sc)) return false;
     if (FAILED(g_state.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -1317,15 +1691,19 @@ bool ensure_init_locked(IDXGISwapChain* sc)
     QueryPerformanceFrequency(&g_state.qpc_freq);
 
     IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
+    ImGui::CreateContext();g_state.imgui_context_created=true;
+    if(g_fail_menu_create.exchange(false))return false;
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
+    // Gameplay Space/Enter must not activate the last mouse-focused switch.
+    // Keep controller navigation; text fields still receive keyboard input.
+    io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
     io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
     na::ui::SetBoldText(na::settings::Get().text_bold.load() != 0);
     na::ui::ApplyStyle();
     na::ui::LoadFonts();
-    ImGui_ImplWin32_Init(g_state.hwnd);
+    if(!ImGui_ImplWin32_Init(g_state.hwnd))return false;
     ImGui_ImplDX12_InitInfo info;
     info.Device = g_state.device.Get();
     // Texture uploads only. The actual menu draw stays on the game's queue,
@@ -1339,10 +1717,13 @@ bool ensure_init_locked(IDXGISwapChain* sc)
     info.SrvDescriptorAllocFn = &SrvAlloc;
     info.SrvDescriptorFreeFn = &SrvFree;
     if (!ImGui_ImplDX12_Init(&info)) return false;
+    g_state.imgui_draws = 0;
+    g_state.imgui_slot_fences.assign(g_state.frames.size(), 0);
     // Compile/create the menu pipelines before this chain can start generating
     // frames. Do not first initialize the renderer during the transition from
     // the presentation worker to an inline Home frame.
     if (!ImGui_ImplDX12_CreateDeviceObjects()) return false;
+    attempt.committed=true;
     g_state.imgui_ready = true;
     g_state.swapchain = sc;
     g_initialized.store(1, std::memory_order_release);
@@ -1467,6 +1848,7 @@ void draw_details_technical()
 
 void draw_panel(bool just_opened)
 {
+    if (just_opened) na::fg::preset::RequestUpscalerOverridesRefresh(); // NVIDIA app changes made while playing
     using namespace na::ui;
     using na::menu::Page;
     ImGuiIO& io = ImGui::GetIO();
@@ -1604,6 +1986,11 @@ void draw_panel(bool just_opened)
     // Content (scrolls; title, navigation and footer stay put).
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(S(36), S(20)));
     ImGui::BeginChild("##content", ImVec2(w - content_x, body_h), ImGuiChildFlags_AlwaysUseWindowPadding);
+    if(na::settings::SafeStart()) {
+        na::ui::StatusLine(2,"The last session didn't end normally, so NeuralAlias started off. Your settings are saved; turn features back on when ready.");
+        const auto profile=na::fg::preset::GetStatus();
+        if(profile.available && profile.result!=0)na::ui::StatusLine(2,"The driver preset could not be restored. Check Frame Generation details.");
+    }
     if (narrow) {
         nav(0, true);
         ImGui::Dummy(ImVec2(0, S(8)));
@@ -1651,6 +2038,7 @@ void draw_panel(bool just_opened)
     uint32_t save = na::settings::LastSaveResult();
     if (save == 2) right = "Your choice is active for this session but could not be saved.";
     else if (save == 1) right = "Settings saved";
+    else if (save == 3) right = "Saving settings...";
     float rw = ImGui::CalcTextSize(right).x;
     ImGui::SameLine(w - pad_x - rw);
     ImGui::TextColored(save == 2 ? kWarn : kTextDim, "%s", right);
@@ -1661,6 +2049,7 @@ void draw_panel(bool just_opened)
 
 void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_opened, ID3D12Resource* frame = nullptr)
 {
+    if (just_opened) menu_note("menu_open: render entry\r\n");
     g_render_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
     // Only the overlay's own input reads (apply_input, the ImGui Win32 backend)
     // pass the input lock; the game's reads on this same thread do not.
@@ -1669,14 +2058,15 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
         OverlayInputScope() { t_overlay_input = true; }
         ~OverlayInputScope() { t_overlay_input = prev; }
     } overlay_input_scope;
-    UINT idx = frame ? static_cast<UINT>(g_frames.load() % g_state.frames.size()) : real_index(sc);
-    if (idx >= g_state.frames.size()) return;
-    FrameCtx& f = g_state.frames[idx];
+    UINT idx = frame ? 0 : real_index(sc);
+    if (!frame && idx >= g_state.backbuffer_count) return;
+    if (g_state.imgui_slot_fences.empty()) return;
+    const size_t imgui_slot = g_state.imgui_draws % g_state.imgui_slot_fences.size();
+    FrameCtx& f = g_state.frames[imgui_slot];
     // Never wait for game-queue work from inside its Present callback. A
     // driver/engine may release that work only after the callback returns.
     // If this allocator is still in use, skip this overlay draw and retry.
-    if (g_state.fence->GetCompletedValue() == UINT64_MAX ||
-        g_state.fence->GetCompletedValue() < f.fence_value) return;
+    if (!f.Complete()) return;
     ComPtr<ID3D12Resource> back_buffer; // A71: this frame only
     if (frame) {
         back_buffer = frame;
@@ -1684,9 +2074,10 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
         rtv.Format = g_state.format;
         rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
         g_state.device->CreateRenderTargetView(frame, &rtv, f.rtv);
-    } else if (!acquire_back_buffer_locked(sc, idx, back_buffer)) return;
+    } else if (!acquire_back_buffer_locked(sc, idx, f.rtv, back_buffer)) return;
 
     apply_input(just_opened);
+    if (just_opened) menu_note("menu_open: input applied\r\n");
     // A42: the hardware cursor is the menu cursor. A43 safety nets, checked
     // every frame: if the game re-hid it, draw ImGui's software cursor at the
     // same position instead; if the game re-clipped it to a point (mouse-look
@@ -1705,8 +2096,10 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     ImGui::NewFrame();
     draw_panel(just_opened);
     ImGui::Render();
+    if (just_opened) menu_note("menu_open: draw data built\r\n");
 
     ImDrawData* draw = ImGui::GetDrawData();
+    if (draw->DisplaySize.x <= 0 || draw->DisplaySize.y <= 0) return;
     // New glyphs can update an EXISTING font atlas. The private upload queue
     // must not write it while an older game-queue menu draw is sampling it.
     // A completion check (not a wait) protects all atlas updates/destruction.
@@ -1714,7 +2107,7 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     if (draw->Textures) {
         for (ImTextureData* texture : *draw->Textures) {
             if (texture->Status != ImTextureStatus_OK &&
-                g_state.fence->GetCompletedValue() < g_state.fence_next - 1) return;
+                !menu_draws_complete()) return;
         }
     }
     if (FAILED(f.allocator->Reset()) || FAILED(g_state.list->Reset(f.allocator.Get(), nullptr))) return;
@@ -1730,6 +2123,8 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     ID3D12DescriptorHeap* heaps[] = {g_state.srv_heap.Get()};
     g_state.list->SetDescriptorHeaps(1, heaps);
     ImGui_ImplDX12_RenderDrawData(draw, g_state.list.Get());
+    ++g_state.imgui_draws; // backend advances once per RenderDrawData, even if submission fails
+    if (just_opened) menu_note("menu_open: GPU draw recorded\r\n");
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     g_state.list->ResourceBarrier(1, &b);
@@ -1737,9 +2132,16 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     ID3D12CommandList* lists[] = {g_state.list.Get()};
     g_orig_execute(queue, 1, lists);
     f.fence_value = g_state.fence_next++;
-    queue->Signal(g_state.fence.Get(), f.fence_value);
+    g_state.imgui_slot_fences[imgui_slot] = f.fence_value;
+    f.signal_failed = FAILED(queue->Signal(f.completion.Get(), f.fence_value));
     g_menu_draw_marker.store(f.fence_value);
     g_frames.fetch_add(1, std::memory_order_relaxed);
+    if (just_opened) menu_note("menu_open: GPU draw submitted\r\n");
+}
+
+void render_with_fault_receipt(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_opened, ID3D12Resource* frame) {
+    __try { render_locked(sc, queue, just_opened, frame); }
+    __except (menu_fault(GetExceptionInformation())) {} // filter always continues the original exception
 }
 
 // The finished frame (real back buffer on the old path, the game's proxy on
@@ -1768,13 +2170,38 @@ void process_frame(ID3D12CommandQueue* queue, ID3D12Resource* frame)
 // false when nothing further should happen (stopping, no queue yet, init
 // failed). Takes g_state.mutex on success (caller releases via the guard it
 // passes in).
-bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue)
+bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue,ComPtr<ID3D12CommandQueue>& retained_queue,
+                     ID3D12CommandQueue* queue_hint = nullptr)
 {
     if (g_stopping.load(std::memory_order_acquire)) return false;
     if (sc == g_state.dummy_swapchain_identity) return false;
+    na::host::RendererObserved();
     g_presents.fetch_add(1, std::memory_order_relaxed);
-    queue = g_direct_queue.load(std::memory_order_acquire);
-    if (!queue) return false;
+    // Use the recorded per-buffer queue or recover it from submitted writes.
+    retained_queue = queue_hint ? ComPtr<ID3D12CommandQueue>(queue_hint) : swapchain_queue(sc);
+    // Boundary frames: the game-facing proxy is not a key in g_swap_queues;
+    // sl_boundary supplies the proxy's exact creation/ResizeBuffers1 queue.
+    if (retained_queue) g_swap_queue_hits.fetch_add(1, std::memory_order_relaxed);
+    else {
+        // GetDevice returns the device, not a supported queue-recovery API.
+        // Native FG can present on a different queue than the game's last
+        // Execute. Writing its real backbuffer on that last queue removes the
+        // device with ACCESS_DENIED. Recover per BUFFER from actual submissions.
+        DXGI_SWAP_CHAIN_DESC desc{};
+        const UINT current=real_index(sc);
+        if(SUCCEEDED(sc->GetDesc(&desc)))for(UINT i=0;i<desc.BufferCount;++i){
+            ComPtr<ID3D12Resource> buffer;
+            if(FAILED(real_get_buffer(sc,i,IID_PPV_ARGS(&buffer))))continue;
+            ComPtr<ID3D12CommandQueue> observed;
+            observed.Attach(na::nr::states::WatchPresentBuffer(buffer.Get()));
+            if(i==current)retained_queue=observed;
+        }
+        if(retained_queue)g_swap_queue_observed.fetch_add(1,std::memory_order_relaxed);
+        else g_swap_queue_misses.fetch_add(1,std::memory_order_relaxed);
+    }
+    queue=retained_queue.Get();
+    if (!queue) return false; // next submitted frame supplies evidence; never guess
+    g_last_present_queue.store(reinterpret_cast<uintptr_t>(queue), std::memory_order_relaxed);
     if (g_state.swapchain && g_state.swapchain != sc) {
         // A31 robustness: a game that recreates its swap chain (HDR toggle,
         // display-mode change) presents from a NEW object. If the one we
@@ -1785,7 +2212,7 @@ bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue)
         if (!g_state.last_present.QuadPart || !g_state.qpc_freq.QuadPart ||
             (now.QuadPart - g_state.last_present.QuadPart) < 2 * g_state.qpc_freq.QuadPart)
             return false;
-        if (g_state.fence && g_state.fence_next > 1 && g_state.fence->GetCompletedValue() < g_state.fence_next - 1)
+        if (!menu_draws_complete())
             return false; // our last draw on the old chain is still in flight; try next present
         release_buffers_locked();
         g_state.frames.clear();
@@ -1795,7 +2222,16 @@ bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue)
         g_state.last_present.QuadPart = 0;
         g_retargets.fetch_add(1, std::memory_order_relaxed);
     }
-    if (!ensure_init_locked(sc)) return false;
+    if(!g_state.device){
+        if(SUCCEEDED(sc->GetDevice(IID_PPV_ARGS(&g_state.device)))){
+            na::gputime::SetDevice(g_state.device.Get());
+            g_seen_device.store(g_state.device.Get(),std::memory_order_release);
+            if(seen_push(SeenKind::Device,g_state.device.Get()))g_device_announced.store(true,std::memory_order_release);
+        }
+    }
+    // ImGui allocation may fail or its buffers may still be retiring. Core
+    // frame work continues, but no draw may use a partially prepared menu.
+    g_menu_frame_ready=g_menu_enabled.load(std::memory_order_acquire) && ensure_init_locked(sc);
     // Frame timing (smoothed) for the footer readout.
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
@@ -1853,25 +2289,27 @@ bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue)
 // Menu step (both paths): cursor show/restore messages, then the draw.
 void menu_step(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool open, ID3D12Resource* frame = nullptr)
 {
+    if (!g_menu_enabled.load(std::memory_order_acquire) || !g_state.imgui_ready || !g_menu_frame_ready) return;
     bool just_opened = open && !g_state.was_open;
     bool just_closed = !open && g_state.was_open;
     g_state.was_open = open;
     if (just_opened && g_state.hwnd) PostMessageW(g_state.hwnd, kMsgCursorShow, 0, 0);
     if (just_closed && g_state.hwnd) PostMessageW(g_state.hwnd, kMsgCursorRestore, 0, 0);
     if (!open) return;
-    render_locked(sc, queue, just_opened, frame);
+    render_with_fault_receipt(sc, queue, just_opened, frame);
 }
 
 // Old path (no presenter): everything on the real back buffer, then the
 // original Present by the caller.
-void on_present(IDXGISwapChain* sc)
+void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue_hint = nullptr)
 {
     std::lock_guard<std::mutex> lock(g_state.mutex);
     ID3D12CommandQueue* queue = nullptr;
-    if (!present_prelude(sc, queue)) return;
+    ComPtr<ID3D12CommandQueue> retained_queue;
+    if (!present_prelude(sc, queue,retained_queue,queue_hint)) return;
     na::j2::OnPresent(queue); // one game-frame boundary, never a TEST Present
     UINT idx = real_index(sc);
-    if (idx < g_state.frames.size()) {
+    { // frame processing uses the actual buffer, independently of menu allocation
         ComPtr<ID3D12Resource> bb; // A71: this frame only
         if (SUCCEEDED(real_get_buffer(sc, idx, IID_PPV_ARGS(&bb)))) process_frame(queue, bb.Get());
     }
@@ -1891,7 +2329,8 @@ HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_
 {
     std::lock_guard<std::mutex> lock(g_state.mutex);
     ID3D12CommandQueue* queue = nullptr;
-    if (!present_prelude(sc, queue)) {
+    ComPtr<ID3D12CommandQueue> retained_queue;
+    if (!present_prelude(sc, queue,retained_queue)) {
         // No queue or not initialised yet: the frame sits in a proxy; forward so
         // the chain keeps turning (a black frame at most, at start-up).
         return g_orig_present(sc, sync, flags);
@@ -1905,7 +2344,8 @@ HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_
     a.flags = flags;
     a.pp = pp;
     a.queue = queue;
-    a.hdr = na::color::IsHdr(na::color::Classify(g_state.format, static_cast<DXGI_COLOR_SPACE_TYPE>(g_color_space.load(std::memory_order_acquire)))); // A60
+    DXGI_SWAP_CHAIN_DESC picture_desc{}; sc->GetDesc(&picture_desc);
+    a.hdr = na::color::IsHdr(na::color::Classify(picture_desc.BufferDesc.Format, static_cast<DXGI_COLOR_SPACE_TYPE>(g_color_space.load(std::memory_order_acquire)))); // A60
     bool open = g_open.load(std::memory_order_acquire);
     a.menu_open = open || g_state.was_open; // closing frame still processes cursor restoration
     a.frame = &presenter_frame_cb;
@@ -1926,14 +2366,21 @@ HANDLE STDMETHODCALLTYPE DetourGetFrameLatencyWaitableObject(IDXGISwapChain2* sc
     return handle; // observe exactly what the game receives; never signal/replace/close it
 }
 
+bool boundary_owns_native(IDXGISwapChain* chain) {
+    std::lock_guard<std::mutex> lock(g_boundary_m);
+    return g_boundary_policy.Suppresses(reinterpret_cast<uintptr_t>(chain));
+}
 HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flags)
 {
     if (na::present::IsPresentThread()) return g_orig_present(sc, sync, flags); // never re-entered by design; safety
+    if (!(flags & DXGI_PRESENT_TEST)) g_native_game_presents.fetch_add(1, std::memory_order_acq_rel);
     na::dlss::ReleaseIfDeviceRemoved(); // G2-004: never pin a removed device across the game's recovery
-    if (!(flags & DXGI_PRESENT_TEST) && na::present::Proxied(sc)) return presenter_present(sc, sync, flags, nullptr);
+    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc) && na::present::Proxied(sc)) return presenter_present(sc, sync, flags, nullptr);
     const auto observed = na::observe::PresentBegin(sc);
-    if (!(flags & DXGI_PRESENT_TEST)) on_present(sc);
+    na::nr::trace::Record("present_begin",sc);
+    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc)) on_present(sc);
     const HRESULT result = g_orig_present(sc, sync, flags);
+    na::nr::trace::Record("present_end",sc,nullptr,0,0,result);
     na::observe::PresentEnd(observed,sync,flags,result);
     return result;
 }
@@ -1941,24 +2388,27 @@ HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT fl
                                          const DXGI_PRESENT_PARAMETERS* pp)
 {
     if (na::present::IsPresentThread()) return g_orig_present1(sc, sync, flags, pp);
+    if (!(flags & DXGI_PRESENT_TEST)) g_native_game_presents.fetch_add(1, std::memory_order_acq_rel);
     na::dlss::ReleaseIfDeviceRemoved(); // G2-004: never pin a removed device across the game's recovery
-    if (!(flags & DXGI_PRESENT_TEST) && na::present::Proxied(sc)) return presenter_present(sc, sync, flags, pp);
+    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc) && na::present::Proxied(sc)) return presenter_present(sc, sync, flags, pp);
     const auto observed = na::observe::PresentBegin(sc);
-    if (!(flags & DXGI_PRESENT_TEST)) on_present(sc);
+    na::nr::trace::Record("present1_begin",sc);
+    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc)) on_present(sc);
     const HRESULT result = g_orig_present1(sc, sync, flags, pp);
+    na::nr::trace::Record("present1_end",sc,nullptr,0,0,result);
     na::observe::PresentEnd(observed,sync,flags,result);
     return result;
 }
 HRESULT STDMETHODCALLTYPE DetourGetBuffer(IDXGISwapChain* sc, UINT index, REFIID riid, void** out)
 {
     HRESULT hr = S_OK;
-    if (sc != g_state.dummy_swapchain_identity && na::present::HandleGetBuffer(sc, index, riid, out, &hr)) return hr;
+    if (!t_native_buffer_read && sc != g_state.dummy_swapchain_identity && na::present::HandleGetBuffer(sc, index, riid, out, &hr)) return hr;
     return g_orig_get_buffer(sc, index, riid, out);
 }
 UINT STDMETHODCALLTYPE DetourGetCurrentBackBufferIndex(IDXGISwapChain3* sc)
 {
     UINT idx = 0;
-    if (na::present::HandleGetIndex(sc, &idx)) return idx;
+    if (!t_native_buffer_read && na::present::HandleGetIndex(sc, &idx)) return idx;
     return g_orig_get_index(sc);
 }
 // A62: a game that paces itself with the frame-latency waitable object would
@@ -1994,6 +2444,9 @@ HRESULT STDMETHODCALLTYPE DetourSetColorSpace1(IDXGISwapChain3* sc, DXGI_COLOR_S
 {
     HRESULT hr = g_orig_set_color_space(sc, cs);
     if (SUCCEEDED(hr) && sc != g_state.dummy_swapchain_identity) g_color_space.store(static_cast<int>(cs), std::memory_order_release);
+    if(SUCCEEDED(hr)) {std::lock_guard<std::mutex> lock(g_swap_queue_m);
+        for(auto& binding:g_swap_queues)if(binding.sc==sc)binding.color_space=cs;
+    }
     return hr;
 }
 // A71 (Astra B-007): a chain the game let go of. Forget it at once so the
@@ -2002,13 +2455,15 @@ HRESULT STDMETHODCALLTYPE DetourSetColorSpace1(IDXGISwapChain3* sc, DXGI_COLOR_S
 void on_chain_gone(IDXGISwapChain* sc)
 {
     g_chain_gone.fetch_add(1, std::memory_order_relaxed);
+    {std::lock_guard<std::mutex> lock(g_boundary_m);g_boundary_policy.Forget(reinterpret_cast<uintptr_t>(sc));}
     na::present::ForgetChain(sc);
+    {std::lock_guard<std::mutex> lock(g_swap_queue_m);for(auto& binding:g_swap_queues)if(binding.sc==sc)binding={};}
     std::lock_guard<std::mutex> lock(g_state.mutex);
     if (g_state.swapchain != sc) return;
     release_buffers_locked();
-    g_state.frames.clear();
-    g_state.rtv_heap.Reset();
-    if (g_state.imgui_ready) ImGui_ImplDX12_InvalidateDeviceObjects();
+    // A chain's destruction is not completion of injected draw submissions.
+    // Keep their slot receipts and renderer objects until completion; the next
+    // chain can reuse them or rebuild them through ensure_buffers_locked.
     g_state.swapchain = nullptr;
     g_state.last_present.QuadPart = 0;
 }
@@ -2038,29 +2493,70 @@ ULONG STDMETHODCALLTYPE DetourRelease(IUnknown* obj)
     }
     return n;
 }
+void retire_nr_backbuffers(IDXGISwapChain* sc) {
+    DXGI_SWAP_CHAIN_DESC desc{};
+    if(FAILED(sc->GetDesc(&desc)))return;
+    for(UINT i=0;i<desc.BufferCount;++i){ComPtr<ID3D12Resource> buffer;
+        if(SUCCEEDED(real_get_buffer(sc,i,IID_PPV_ARGS(&buffer))))na::nr::native::RetireBackbuffer(buffer.Get());}
+}
 HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT count, UINT w,
                                               UINT h, DXGI_FORMAT fmt, UINT flags)
 {
+    // Reset may have retired the native FG recording without another Present.
+    // Drop its completed image references before DXGI checks ResizeBuffers.
+    na::nr::native::Maintain();
+    retire_nr_backbuffers(sc);
     {
         std::lock_guard<std::mutex> lock(g_state.mutex);
         if (g_state.swapchain == sc) release_buffers_locked();
     }
-    na::present::BeforeResize(sc); // A59: drains generated presents, drops proxies and cached real buffers
-    return g_orig_resize(sc, count, w, h, fmt, flags);
+    if(!na::present::BeforeResize(sc))return DXGI_ERROR_INVALID_CALL; // outstanding buffer use; size unchanged
+    const auto result=g_orig_resize(sc,count,w,h,fmt,flags);
+    na::present::AfterResize(sc,result);return result;
 }
 HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags,
                                                const UINT* node_masks, IUnknown* const* queues)
 {
+    na::nr::native::Maintain();
+    retire_nr_backbuffers(sc);
     {
         std::lock_guard<std::mutex> lock(g_state.mutex);
         if (g_state.swapchain == sc) release_buffers_locked();
     }
-    na::present::BeforeResize(sc);
-    return g_orig_resize1(sc, count, w, h, fmt, flags, node_masks, queues);
+    if(!na::present::BeforeResize(sc))return DXGI_ERROR_INVALID_CALL; // outstanding buffer use; size unchanged
+    const auto result=g_orig_resize1(sc, count, w, h, fmt, flags, node_masks, queues);
+    na::present::AfterResize(sc,result);
+    if(SUCCEEDED(result) && queues){
+        UINT actual=count;
+        if(!actual){DXGI_SWAP_CHAIN_DESC1 desc{};if(SUCCEEDED(sc->GetDesc1(&desc)))actual=desc.BufferCount;}
+        std::lock_guard<std::mutex> lock(g_swap_queue_m);
+        SwapQueue* slot=nullptr;
+        for(auto& binding:g_swap_queues)if(binding.sc==sc){slot=&binding;break;}
+        // A late attachment may first learn the queue from ResizeBuffers1.
+        if(!slot){slot=&g_swap_queues[g_swap_queue_next++%8];*slot={};slot->sc=sc;}
+        if(slot->queues.Resized(result,actual,queues))g_swap_queues_recorded.fetch_add(1);
+        else slot->queues={}; // never retain stale per-buffer ownership
+    }
+    return result;
 }
 void STDMETHODCALLTYPE ForwardWithFgInputs(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists)
 {
     na::fg::Execute(q, n, lists, g_orig_execute);
+}
+HRESULT STDMETHODCALLTYPE TraceSignal(ID3D12CommandQueue* q,ID3D12Fence* fence,UINT64 value) {
+    void* callers[4]{};
+    if(na::settings::Get().nr_enabled.load(std::memory_order_relaxed))CaptureStackBackTrace(1,4,callers,nullptr);
+    na::nr::trace::Record("signal_begin",q,fence,value,0,0,callers);
+    const auto hr=g_trace_signal(q,fence,value);
+    na::nr::trace::Record("signal_end",q,fence,value,0,hr);return hr;
+}
+HRESULT STDMETHODCALLTYPE TraceWait(ID3D12CommandQueue* q,ID3D12Fence* fence,UINT64 value) {
+    const auto completed=fence?fence->GetCompletedValue():0;
+    void* callers[4]{};
+    if(na::settings::Get().nr_enabled.load(std::memory_order_relaxed))CaptureStackBackTrace(1,4,callers,nullptr);
+    na::nr::trace::Record("wait_begin",q,fence,value,completed,0,callers);
+    const auto hr=g_trace_wait(q,fence,value);
+    na::nr::trace::Record("wait_end",q,fence,value,completed,hr);return hr;
 }
 // J2: live DLAA may insert its list after the game's scene list, then the
 // batch continues through Neural Rendering / Frame Generation as before.
@@ -2071,6 +2567,8 @@ void STDMETHODCALLTYPE ForwardThroughNr(ID3D12CommandQueue* q, UINT n, ID3D12Com
 void STDMETHODCALLTYPE DetourExecute(ID3D12CommandQueue* q, UINT n,
                                      ID3D12CommandList* const* lists)
 {
+    struct TraceExecute { ID3D12CommandQueue* q; ~TraceExecute(){na::nr::trace::Record("execute_end",q);} } trace_execute{q};
+    na::nr::trace::Record("execute_begin",q,n && lists?lists[0]:nullptr,n);
     if(na::present::OwnsQueue(q)) { g_orig_execute(q,n,lists); return; }
     if (q == g_texture_queue.load(std::memory_order_acquire)) {
         na::nr::Execute(q, n, lists, ForwardWithFgInputs);
@@ -2105,9 +2603,12 @@ void STDMETHODCALLTYPE DetourExecute(ID3D12CommandQueue* q, UINT n,
     if (na::hooking::variants::Active(Kind::CommandList)) { // inert until an adapter registers slots
         for (UINT i = 0; i < n; ++i) {
             if (!lists[i]) continue;
-            if (na::hooking::variants::NoteObject(Kind::CommandList, lists[i]) != na::hooking::variants::Coverage::Complete) {
+            const auto coverage = na::observe::ProducersActive()
+                ? na::hooking::variants::NoteObject(Kind::CommandList, lists[i])
+                : na::hooking::variants::CoverageOf(Kind::CommandList, lists[i]);
+            if (coverage != na::hooking::variants::Coverage::Complete) {
                 ++uncovered;
-                seen_push(SeenKind::List, lists[i]);
+                if (na::observe::ProducersActive()) seen_push(SeenKind::List, lists[i]);
             }
         }
     }
@@ -2131,18 +2632,153 @@ void STDMETHODCALLTYPE DetourExecute(ID3D12CommandQueue* q, UINT n,
         na::gputime::OnExecuted(q, n, lists); // R-202: completion fence on the queue that ran the lists
         na::dlss::OnExecuted(q, n, lists);    // C6: completion evidence before retired DLSS features are released
     }
+    na::nr::states::Submitted(q,n,lists);
     if (obs_token.queue_state) na::observe::ExecuteEnd(obs_token, q, n, lists);
     g_exec_active.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 } // namespace
 
-bool Start(const char* route_tag, PanelFn controls)
+namespace {
+// ------------------------------------------------ Streamline boundary frames
+// Game-facing Streamline presentation is preferred when creation/resize gives
+// us its exact queue. Native generated Presents never draw the same menu again.
+void append_status_text(const char* text, int n)
 {
+    if (!g_status_log[0] || n <= 0) return;
+    HANDLE f = CreateFileW(g_status_log, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(f, text, static_cast<DWORD>(n), &written, nullptr);
+    CloseHandle(f);
+}
+const char* module_of(const void* address, char* out, size_t cap)
+{
+    if (!out || !cap) return "";
+    out[0] = 0;
+    HMODULE m = nullptr;
+    if (!address || !GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                        static_cast<LPCSTR>(address), &m) || !m) {
+        snprintf(out, cap, "?");
+        return out;
+    }
+    char path[MAX_PATH] = {};
+    if (!GetModuleFileNameA(m, path, MAX_PATH)) { snprintf(out, cap, "?"); return out; }
+    const char* base = strrchr(path, '\\');
+    snprintf(out, cap, "%s+0x%llX", base ? base + 1 : path,
+             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(m)));
+    return out;
+}
+const void* present_slot_of(IDXGISwapChain* sc)
+{
+    if (!sc) return nullptr;
+    void* const* vt = *reinterpret_cast<void* const* const*>(sc);
+    return vt ? vt[kSwapPresentSlot] : nullptr;
+}
+// Once, when the boundary takes over: where each chain's Present slot points,
+// so the next log shows why the native detour was bypassed.
+void note_boundary_engaged(IDXGISwapChain* game_facing, IDXGISwapChain* base)
+{
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    char proxy_mod[160], base_mod[160], hooked_mod[160], hooked1_mod[160];
+    const void* proxy_present = present_slot_of(game_facing);
+    const void* base_present = present_slot_of(base);
+    char line[1024];
+    const int n = snprintf(line, sizeof(line),
+        "%02u:%02u:%02u overlay_source=streamline: qualified game-facing queue; associated native draws suppressed "
+        "(native_presents=%llu). proxy=%p present=%s base=%p present=%s hooked_present=%s hooked_present1=%s base_slot_is_hooked=%u\r\n",
+        t.wHour, t.wMinute, t.wSecond,
+        static_cast<unsigned long long>(g_native_game_presents.load(std::memory_order_acquire)),
+        static_cast<void*>(game_facing), module_of(proxy_present, proxy_mod, sizeof(proxy_mod)),
+        static_cast<void*>(base), base ? module_of(base_present, base_mod, sizeof(base_mod)) : "none",
+        module_of(g_native_present_target, hooked_mod, sizeof(hooked_mod)),
+        module_of(g_native_present1_target, hooked1_mod, sizeof(hooked1_mod)),
+        base_present && base_present == g_native_present_target ? 1u : 0u);
+    append_status_text(line, (std::min)(n, static_cast<int>(sizeof(line)) - 1));
+}
+void boundary_present(IDXGISwapChain* game_facing, IDXGISwapChain* base, ID3D12CommandQueue* queue)
+{
+    if(!game_facing || !base || game_facing==base || g_stopping.load(std::memory_order_acquire))return;
+    {
+        std::lock_guard<std::mutex> lock(g_boundary_m);
+        if(g_boundary_policy.OwnsProxy(reinterpret_cast<uintptr_t>(game_facing)))
+            g_boundary_policy.Select(reinterpret_cast<uintptr_t>(game_facing),reinterpret_cast<uintptr_t>(base));
+    }
+    // No route-table lock is held while entering the presenter or COM.
+    // An acquired NeuralAlias buffer keeps its delivery until resize.
+    const bool proxy_external=na::present::NoteExternalOwner(game_facing);
+    const bool base_external=na::present::NoteExternalOwner(base);
+    if(!proxy_external || !base_external)return;
+    // Only the game's creation/ResizeBuffers1 queue, never the base chain's
+    // private DLSS-G queue. Keep the owned reference through submission.
+    ComPtr<ID3D12CommandQueue> hint(queue);
+    if(!hint)hint=swapchain_queue(game_facing);
+    if(!hint || hint->GetDesc().Type!=D3D12_COMMAND_LIST_TYPE_DIRECT)return;
+    ComPtr<ID3D12Resource> buffer;ComPtr<ID3D12Device> buffer_device,queue_device;
+    if(FAILED(real_get_buffer(game_facing,real_index(game_facing),IID_PPV_ARGS(&buffer))) ||
+       FAILED(buffer->GetDevice(IID_PPV_ARGS(&buffer_device))) ||
+       FAILED(hint->GetDevice(IID_PPV_ARGS(&queue_device))) ||
+       buffer_device.Get()!=queue_device.Get() || FAILED(queue_device->GetDeviceRemovedReason()))return;
+    bool first=false;
+    {
+        std::lock_guard<std::mutex> lock(g_boundary_m);
+        first=!g_boundary_policy.OwnsProxy(reinterpret_cast<uintptr_t>(game_facing));
+        if(!g_boundary_policy.Select(reinterpret_cast<uintptr_t>(game_facing),reinterpret_cast<uintptr_t>(base)))return;
+    }
+    g_boundary_frames.store(true,std::memory_order_release);
+    if(first)note_boundary_engaged(game_facing,base);
+    // If the native path attached before SL was discovered, transfer this
+    // chain immediately once its submitted draws retire, without a 2s blackout.
+    {
+        std::lock_guard<std::mutex> lock(g_state.mutex);
+        if(g_state.swapchain==base && menu_draws_complete()){
+            release_buffers_locked();g_state.swapchain=nullptr;g_state.last_present.QuadPart=0;
+        }
+    }
+    on_present(game_facing,hint.Get());
+}
+void boundary_before_resize(IDXGISwapChain* game_facing)
+{
+    if(!game_facing)return;
+    na::nr::native::Maintain();
+    retire_nr_backbuffers(game_facing);
+    std::lock_guard<std::mutex> lock(g_state.mutex);
+    if(g_state.swapchain==game_facing)release_buffers_locked();
+}
+void boundary_released(IDXGISwapChain* game_facing)
+{
+    if(game_facing)on_chain_gone(game_facing);
+}
+void boundary_seen(IDXGISwapChain* proxy,IDXGISwapChain* base) {
+    na::present::NoteExternalOwner(proxy);na::present::NoteExternalOwner(base);
+}
+na::slb::OverlayHooks make_boundary_hooks()
+{
+    na::slb::OverlayHooks h;
+    h.chain_seen=&boundary_seen;
+    h.present = &boundary_present;
+    h.before_resize = &boundary_before_resize;
+    h.released = &boundary_released;
+    return h;
+}
+const na::slb::OverlayHooks g_boundary_hooks = make_boundary_hooks();
+} // namespace
+
+bool StartCore(const char* route_tag, PanelFn controls)
+{
+    std::lock_guard<std::mutex> start_lock(g_start_m);
+    if(g_core_started.load(std::memory_order_acquire))return true;
+    QueryPerformanceFrequency(&g_state.qpc_freq);
     // Start is called with a bootstrap-local buffer; own the overlay label.
     snprintf(g_route_tag, sizeof(g_route_tag), "%s", route_tag ? route_tag : "");
     g_controls = controls;
     g_stopping.store(false);
+    g_boundary_frames.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(g_boundary_m);
+        g_boundary_policy.Reset();
+    }
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = DefWindowProcW;
@@ -2182,52 +2818,107 @@ bool Start(const char* route_tag, PanelFn controls)
             SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) &&
             SUCCEEDED(factory->CreateSwapChainForHwnd(queue.Get(), hwnd, &sd, nullptr, nullptr, &sc))) {
             g_state.dummy_swapchain_identity = sc.Get();
-            ok = na::hooking::HookVTableSlot(sc.Get(), kSwapReleaseSlot,
+            {
+                void* const* vt = *reinterpret_cast<void* const* const*>(sc.Get());
+                g_native_present_target = vt[kSwapPresentSlot];
+                g_native_present1_target = vt[kSwap1Present1Slot];
+            }
+            // Other startup workers (Streamline/NGX/engine adapters) also
+            // install hooks. Immediate HookVTableSlot fails while ANY install
+            // transaction is open. Previously that left just the first hooks
+            // enabled and skipped the queue tracker. Own one coherent batch.
+            bool transaction=na::hooking::BeginInstallWait("overlay core");
+            auto prepare_start_hook=[](void* object,uint32_t slot,void* detour,void** original){
+                const bool prepared=na::hooking::PrepareVTableSlot(object,slot,detour,original);
+                if(!prepared){
+                    char reason[160]{},target[160]{},line[480]{};
+                    na::hooking::LastError(reason,sizeof(reason));
+                    const void* address=object?(*static_cast<void***>(object))[slot]:nullptr;
+                    const int n=snprintf(line,sizeof(line),"overlay_start pid=%lu slot=%u target=%s failed: %s\r\n",
+                        GetCurrentProcessId(),slot,module_of(address,target,sizeof(target)),reason);
+                    append_status_text(line,(std::min)(n,int(sizeof(line)-1)));
+                }
+                return prepared;
+            };
+            ok = transaction && prepare_start_hook(sc.Get(), kSwapReleaseSlot,
                                              reinterpret_cast<void*>(&DetourRelease),
                                              reinterpret_cast<void**>(&g_orig_release)) &&
-                 na::hooking::HookVTableSlot(sc.Get(), kSwapPresentSlot,
+                 prepare_start_hook(sc.Get(), kSwapPresentSlot,
                                              reinterpret_cast<void*>(&DetourPresent),
                                              reinterpret_cast<void**>(&g_orig_present)) &&
-                 na::hooking::HookVTableSlot(sc.Get(), kSwap1Present1Slot,
+                 prepare_start_hook(sc.Get(), kSwap1Present1Slot,
                                              reinterpret_cast<void*>(&DetourPresent1),
                                              reinterpret_cast<void**>(&g_orig_present1)) &&
-                 na::hooking::HookVTableSlot(sc.Get(), kSwapResizeBuffersSlot,
+                 prepare_start_hook(sc.Get(), kSwapResizeBuffersSlot,
                                              reinterpret_cast<void*>(&DetourResizeBuffers),
                                              reinterpret_cast<void**>(&g_orig_resize)) &&
-                 na::hooking::HookVTableSlot(queue.Get(), kQueueExecuteSlot,
+                 prepare_start_hook(queue.Get(), kQueueExecuteSlot,
                                              reinterpret_cast<void*>(&DetourExecute),
                                              reinterpret_cast<void**>(&g_orig_execute));
             // A59 presenter: GetBuffer / GetCurrentBackBufferIndex / ResizeBuffers1.
+            // The full observer owns these slots when requested. This narrow
+            // trace is for Route A freezes with that observer disabled.
+            if(ok && !na::observe::InstallRequested()) {
+                const bool signal=prepare_start_hook(queue.Get(),14,reinterpret_cast<void*>(&TraceSignal),reinterpret_cast<void**>(&g_trace_signal));
+                const bool wait=prepare_start_hook(queue.Get(),15,reinterpret_cast<void*>(&TraceWait),reinterpret_cast<void**>(&g_trace_wait));
+                na::nr::trace::sync_hooks.store((signal?1u:0u)|(wait?2u:0u));
+            }
             ComPtr<IDXGISwapChain3> sc3;
             if (ok && SUCCEEDED(sc.As(&sc3))) {
-                ok = na::hooking::HookVTableSlot(sc.Get(), kSwapGetBufferSlot,
+                ok = prepare_start_hook(sc.Get(), kSwapGetBufferSlot,
                                                  reinterpret_cast<void*>(&DetourGetBuffer),
                                                  reinterpret_cast<void**>(&g_orig_get_buffer)) &&
-                     na::hooking::HookVTableSlot(sc3.Get(), kSwap3GetIndexSlot,
+                     prepare_start_hook(sc3.Get(), kSwap3GetIndexSlot,
                                                  reinterpret_cast<void*>(&DetourGetCurrentBackBufferIndex),
                                                  reinterpret_cast<void**>(&g_orig_get_index)) &&
-                     na::hooking::HookVTableSlot(sc3.Get(), kSwap3ResizeBuffers1Slot,
+                     prepare_start_hook(sc3.Get(), kSwap3ResizeBuffers1Slot,
                                                  reinterpret_cast<void*>(&DetourResizeBuffers1),
                                                  reinterpret_cast<void**>(&g_orig_resize1)) &&
-                     na::hooking::HookVTableSlot(sc3.Get(), kSwap2SetMaxLatencySlot,
+                     prepare_start_hook(sc3.Get(), kSwap2SetMaxLatencySlot,
                                                  reinterpret_cast<void*>(&DetourSetMaximumFrameLatency),
                                                  reinterpret_cast<void**>(&g_orig_set_max_latency)) &&
-                     na::hooking::HookVTableSlot(sc3.Get(), kSwap2GetMaxLatencySlot,
+                     prepare_start_hook(sc3.Get(), kSwap2GetMaxLatencySlot,
                                                  reinterpret_cast<void*>(&DetourGetMaximumFrameLatency),
                                                  reinterpret_cast<void**>(&g_orig_get_max_latency)) &&
-                     na::hooking::HookVTableSlot(sc3.Get(), kSwap2GetLatencyObjectSlot,
+                     prepare_start_hook(sc3.Get(), kSwap2GetLatencyObjectSlot,
                                                  reinterpret_cast<void*>(&DetourGetFrameLatencyWaitableObject),
                                                  reinterpret_cast<void**>(&g_orig_get_latency_object));
                 // Colour space (HDR10 detection for Neural Rendering); optional.
-                na::hooking::HookVTableSlot(sc3.Get(), kSwap3SetColorSpace1Slot,
+                prepare_start_hook(sc3.Get(), kSwap3SetColorSpace1Slot,
                                             reinterpret_cast<void*>(&DetourSetColorSpace1),
                                             reinterpret_cast<void**>(&g_orig_set_color_space));
+            }
+            if (ok) {
+                // Swap-chain creation on the shared factory vtable (after our own dummy
+                // chain exists, so it is never recorded). Late attachments recover
+                // per-buffer queues from submitted writes instead.
+                prepare_start_hook(factory.Get(), kFactoryCreateSwapChainSlot,
+                                            reinterpret_cast<void*>(&DetourCreateSwapChain),
+                                            reinterpret_cast<void**>(&g_orig_create_swapchain));
+                prepare_start_hook(factory.Get(), kFactory2CreateForHwndSlot,
+                                            reinterpret_cast<void*>(&DetourCreateForHwnd),
+                                            reinterpret_cast<void**>(&g_orig_create_for_hwnd));
+                prepare_start_hook(factory.Get(), kFactory2CreateForCoreWindowSlot,
+                                            reinterpret_cast<void*>(&DetourCreateForCoreWindow),
+                                            reinterpret_cast<void**>(&g_orig_create_for_core_window));
+                prepare_start_hook(factory.Get(), kFactory2CreateForCompositionSlot,
+                                            reinterpret_cast<void*>(&DetourCreateForComposition),
+                                            reinterpret_cast<void**>(&g_orig_create_for_composition));
+            }
+            if(transaction){
+                if(ok)ok=na::hooking::CommitInstall();else na::hooking::AbandonInstall();
+            }
+            if(!ok){
+                char reason[160]{},line[240]{};na::hooking::LastError(reason,sizeof(reason));
+                const int n=snprintf(line,sizeof(line),"overlay_start pid=%lu core_failed: %s\r\n",GetCurrentProcessId(),reason);
+                append_status_text(line,(std::min)(n,int(sizeof(line)-1)));
             }
             if (ok && na::observe::InstallRequested()) // C8: observation producers on the same throwaway objects
             {
                 na::observe::InstallProducers(dev.Get(), queue.Get(), /*hook_queue_execute=*/false);
                 na::observe::SetExecuteForwarder(g_orig_execute); // C9b: host sample copies bypass this detour
             }
+            if (ok && na::nr::states::InstallEnhancedInvalidation()) na::observe::InstallListResetTracking(dev.Get(), na::nr::OnCommandListReset,na::nr::states::Observe);
             if (ok) {
                 na::present::Originals o;
                 o.present = g_orig_present;
@@ -2245,6 +2936,21 @@ bool Start(const char* route_tag, PanelFn controls)
     DestroyWindow(hwnd);
     g_state.dummy_swapchain_identity = nullptr;
 
+    if (ok) {
+        ok=na::hooking::variants::StartDiscoveryThread(&seen_drain, nullptr);
+        if(ok)na::slb::SetOverlayHooks(&g_boundary_hooks);
+    }
+    g_core_started.store(ok,std::memory_order_release);
+    return ok;
+}
+
+bool StartMenu()
+{
+    std::lock_guard<std::mutex> start_lock(g_start_m);
+    if(!g_core_started.load(std::memory_order_acquire))return false;
+    if(g_menu_enabled.load(std::memory_order_acquire) && g_input_hooks.load()==8)return true;
+    if(g_fail_menu_start.exchange(false))return false;
+    g_menu_cursor=LoadCursorW(nullptr,IDC_ARROW);
     // Controller: hook whichever XInput modules the game already loaded.
     const wchar_t* mods[3] = {L"xinput1_4.dll", L"xinput1_3.dll", L"xinput9_1_0.dll"};
     void* detours[3] = {reinterpret_cast<void*>(&XInputDetour0),
@@ -2255,15 +2961,27 @@ bool Start(const char* route_tag, PanelFn controls)
         HMODULE m = GetModuleHandleW(mods[i]);
         if (!m) continue;
         void* target = reinterpret_cast<void*>(GetProcAddress(m, "XInputGetState"));
-        if (target && na::hooking::HookFunction(target, detours[i],
-                                                reinterpret_cast<void**>(&g_orig_xinput[i])))
+        if (target && install_input_function(target, detours[i],
+                                                reinterpret_cast<void**>(&g_orig_xinput[i]))) {
             ++hooked;
+            if (!g_menu_xinput.load(std::memory_order_relaxed)) g_menu_xinput.store(g_orig_xinput[i],std::memory_order_release);
+        }
     }
     g_gamepad_hooked.store(hooked);
     install_input_hooks(); // A44: the game sees no mouse/keyboard while the menu is open
-    if (!na::hooking::variants::StartDiscoveryThread(&seen_drain, nullptr)) return false; // A49: propagated
-    return ok;
+    const bool ready=g_input_hook_targets[0] && g_input_hook_targets[2]; // essentials; cursor/controller hooks may degrade
+    g_menu_enabled.store(ready,std::memory_order_release);
+    return ready;
 }
+bool Start(const char* route_tag, PanelFn controls)
+{
+    return StartCore(route_tag,controls) && StartMenu();
+}
+void FailNextMenuStartForTests(){g_fail_menu_start.store(true);}
+void FailNextMenuCreateForTests(){g_fail_menu_create.store(true);}
+void FailOptionalInputForTests(unsigned attempts){g_fail_optional_input.store(attempts);}
+void FailCursorCleanupForTests(){g_fail_cursor_cleanup.store(true);}
+void* CursorOriginalForTests(){return reinterpret_cast<void*>(g_orig_set_cursor);}
 
 bool SubscribeExecute(ExecuteBeginFn begin, ExecuteEndFn end, void* user)
 {
@@ -2319,6 +3037,7 @@ SeamStats GetSeamStats()
 bool Stop()
 {
     g_stopping.store(true, std::memory_order_release);
+    na::slb::SetOverlayHooks(nullptr);
     g_open.store(false, std::memory_order_release);
     // A50/A51: quiescence first. A failed callback drain or discovery stop
     // is recorded (SeamStats.stop_incomplete) and Stop RETURNS false before
@@ -2342,11 +3061,12 @@ bool Stop()
     remove_input_hooks();
     std::lock_guard<std::mutex> lock(g_state.mutex);
     if (g_state.imgui_ready) {
-        if (g_state.fence && g_state.fence_next > 1) {
-            UINT64 last = g_state.fence_next - 1;
-            if (g_state.fence->GetCompletedValue() < last) {
-                g_state.fence->SetEventOnCompletion(last, g_state.fence_event);
-                WaitForSingleObject(g_state.fence_event, 2000);
+        for (const auto& f : g_state.frames) if (!f.Complete()) {
+            if (f.signal_failed || !f.completion || !g_state.fence_event ||
+                FAILED(f.completion->SetEventOnCompletion(f.fence_value, g_state.fence_event)) ||
+                WaitForSingleObject(g_state.fence_event, 2000) != WAIT_OBJECT_0 || !f.Complete()) {
+                g_stop_incomplete.store(1, std::memory_order_release);
+                return false; // keep GPU-owned resources alive; shutdown may retry
             }
         }
         ImGui_ImplDX12_Shutdown();
@@ -2355,22 +3075,27 @@ bool Stop()
         if (g_state.hwnd && g_state.orig_wndproc)
             SetWindowLongPtrW(g_state.hwnd, GWLP_WNDPROC,
                               reinterpret_cast<LONG_PTR>(g_state.orig_wndproc));
-        g_state.imgui_ready = false;
+        g_state.imgui_ready = false;g_state.imgui_context_created=false;
+        g_state.orig_wndproc=nullptr;
     }
     g_state.frames.clear();
     g_state.list.Reset();
     g_state.rtv_heap.Reset();
     g_state.srv_heap.Reset();
-    g_state.fence.Reset();
     if (g_state.fence_event) CloseHandle(g_state.fence_event);
     g_state.fence_event = nullptr;
     g_texture_queue.store(nullptr, std::memory_order_release);
     g_state.texture_queue.Reset();
+    g_seen_device.store(nullptr,std::memory_order_release);
     g_state.device.Reset();
     g_state.swapchain = nullptr;
     g_state.buffers_ready = false;
     g_state.was_open = false;
+    g_menu_xinput.store(nullptr,std::memory_order_release);
+    g_pad_retry_after=0;
     g_initialized.store(0, std::memory_order_release);
+    g_menu_enabled.store(false,std::memory_order_release);
+    g_core_started.store(false,std::memory_order_release);
     g_stopping.store(false, std::memory_order_release); // a later Start may run again
     return true;
 }
@@ -2381,6 +3106,7 @@ Stats GetStats()
     s.frames_rendered = g_frames.load();
     s.presents_seen = g_presents.load();
     s.initialized = g_initialized.load();
+    s.core_ready=g_core_started.load();s.menu_enabled=g_menu_enabled.load();
     s.open = g_open.load() ? 1u : 0u;
     s.have_queue = g_direct_queue.load() ? 1u : 0u;
     s.gamepad_hooked = g_gamepad_hooked.load();
@@ -2391,6 +3117,7 @@ Stats GetStats()
     s.input_hooks = g_input_hooks.load(std::memory_order_acquire);
     s.retargets = g_retargets.load(std::memory_order_relaxed);
     s.chain_gone = g_chain_gone.load(std::memory_order_relaxed);
+    s.present_queue = g_last_present_queue.load(std::memory_order_relaxed);
     return s;
 }
 
@@ -2433,11 +3160,28 @@ int CurrentPageIndex() { return static_cast<int>(na::menu::CurrentPage()) - 1; }
 
 void SetStatusLogPath(const wchar_t* path)
 {
-    if (path) lstrcpynW(g_status_log, path, MAX_PATH);
-    else g_status_log[0] = 0;
+    na::host::ProcessLogPath(g_status_log, MAX_PATH, path);
     g_status_last_tick = 0;
 }
 
+void SetMenuDiagnostics(bool enabled) { g_menu_diagnostics = enabled; }
+void DrawMenuForTests(ID3D12CommandQueue* queue,ID3D12Resource* frame) {
+    std::lock_guard<std::mutex> lock(g_state.mutex);
+    if (!queue || !frame || !g_state.imgui_ready || !g_open.load()) return;
+    render_locked(g_state.swapchain,queue,false,frame);
+}
+
 int SwapChainColorSpace() { return g_color_space.load(std::memory_order_acquire); }
+void BoundaryPresentForTests(IDXGISwapChain* proxy,IDXGISwapChain* base,ID3D12CommandQueue* queue){boundary_present(proxy,base,queue);}
+void BoundarySeenForTests(IDXGISwapChain* proxy,IDXGISwapChain* base){boundary_seen(proxy,base);}
+void BoundaryResizeForTests(IDXGISwapChain* proxy){boundary_before_resize(proxy);}
+void BoundaryReleaseForTests(IDXGISwapChain* proxy){boundary_released(proxy);}
+long ReadNativeBufferForTests(IDXGISwapChain* chain, unsigned index, REFIID iid, void** out){return real_get_buffer(chain,index,iid,out);}
+ID3D12CommandQueue* AcquirePresentQueue(IDXGISwapChain* chain){return swapchain_queue(chain).Detach();}
+int SwapChainColorSpace(IDXGISwapChain* chain){
+    std::lock_guard<std::mutex> lock(g_swap_queue_m);
+    for(const auto& binding:g_swap_queues)if(binding.sc==chain)return binding.color_space;
+    return DXGI_COLOR_SPACE_CUSTOM;
+}
 
 } // namespace na::overlay

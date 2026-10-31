@@ -109,7 +109,7 @@ uint32_t FormatStack(const ThreadStack& t, char* out, uint32_t capacity)
     return pos;
 }
 
-bool WriteMiniDump(const wchar_t* path)
+bool WriteMiniDump(const wchar_t* path, EXCEPTION_POINTERS* exception)
 {
     if (!path) return false;
     HMODULE dbg = LoadLibraryW(L"dbghelp.dll");
@@ -122,7 +122,8 @@ bool WriteMiniDump(const wchar_t* path)
     if (f == INVALID_HANDLE_VALUE) { FreeLibrary(dbg); return false; }
     auto type = static_cast<MINIDUMP_TYPE>(MiniDumpWithThreadInfo | MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithUnloadedModules |
                                            MiniDumpWithHandleData);
-    BOOL ok = write(GetCurrentProcess(), GetCurrentProcessId(), f, type, nullptr, nullptr, nullptr);
+    MINIDUMP_EXCEPTION_INFORMATION info{GetCurrentThreadId(), exception, FALSE};
+    BOOL ok = write(GetCurrentProcess(), GetCurrentProcessId(), f, type, exception ? &info : nullptr, nullptr, nullptr);
     CloseHandle(f);
     FreeLibrary(dbg);
     return ok != FALSE;

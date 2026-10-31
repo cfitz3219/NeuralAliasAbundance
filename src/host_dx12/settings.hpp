@@ -56,8 +56,9 @@ inline const char* NameForMode(DlssMode m)
 struct Settings {
     std::atomic<uint32_t> enabled{1};   // master switch (NeuralAlias controls DLSS)
     std::atomic<uint32_t> dlss_mode{0}; // DlssMode
+    std::atomic<uint32_t> follow_game_resolution{0}; // preserve engine render size/PQ; override presets only
     std::atomic<int32_t> preset{-1};    // -1 = let NVIDIA choose; 1..13 = A..M
-    std::atomic<uint32_t> ray_reconstruction{0}; // honored only where the game uses RR
+    std::atomic<int32_t> rr_preset{0};  // Ray Reconstruction: 0 = let NVIDIA choose; 4 D, 5 E, 6 F (its only usable presets)
     std::atomic<uint32_t> overlay_open{0};
     std::atomic<uint32_t> text_bold{0}; // A44: 0 standard weight, 1 bold (replaces text_size)
     // A44: remembered menu window placement in client pixels (0 = default).
@@ -94,15 +95,34 @@ struct Settings {
     std::atomic<int32_t> reflex_mode{1}; // 0 Off, 1 On (default), 2 On + Boost; engine adapter supplies timings
     std::atomic<uint32_t> fg_enabled{0};
     std::atomic<uint32_t> fg_mode{1};
-    std::atomic<uint32_t> fg_preset{1}; // NVIDIA driver-profile request: A=1 (default), B=2; restart after change
+    std::atomic<uint32_t> fg_profile_override{0}; // per-deployment opt-in
+    std::atomic<uint32_t> fg_preset{1}; // NVIDIA driver-profile request: A=1 (default), B=2, C=3; restart after change
     std::atomic<uint32_t> fg_multiplier{2};
     std::atomic<uint32_t> fg_target_fps{0};
     // A69: the freeze watchdog switched Frame Generation off at this time
     // (seconds since 1970, 0 = never). Shown in the menu until FG is re-enabled.
     std::atomic<uint32_t> fg_frozen_at{0};
+    // The GAME's own frame generation (Streamline DLSS-G), [native_fg] section:
+    // requests applied to the game's slDLSSGSetOptions by the SL boundary.
+    //  mode: 0 the game's setting (default, no change), 1 Off, 2 On, 3 Dynamic
+    //  frames: generated frames per real frame (1 = 2x ... 5 = 6x); 0 = the game's
+    std::atomic<uint32_t> native_fg_mode{0};
+    std::atomic<uint32_t> native_fg_frames{0};
 };
 
 Settings& Get();
+enum class NrWriteSource : uint32_t { DefaultIni=1, UserIni=2, Overlay=3, SafeStartup=4 };
+struct NrWrite {
+    uint64_t sequence=0, tick_ms=0;
+    uint32_t thread=0, before=0, after=0;
+    NrWriteSource source=NrWriteSource::DefaultIni;
+    uint32_t input_flags=0; // observed: mouse-release1, pad-A2, Enter4, Space8; not inferred intent
+};
+struct NrWriteHistory { NrWrite entries[16]{}; uint32_t count=0; };
+// Runtime NR-setting writers use this for a bounded in-memory receipt. No
+// file I/O here; the existing status worker emits the records later.
+void SetNrEnabled(bool enabled,NrWriteSource source,uint32_t input_flags=0);
+NrWriteHistory GetNrWrites();
 
 // Deploy-time defaults ini (beside the proxy DLL; may be read-only).
 void SetIniPath(const wchar_t* path);
@@ -112,7 +132,25 @@ void Load();  // defaults ini, then user ini overrides when present
 // Settings -> user ini (only our keys). Returns false when any write failed;
 // the menu then says the choice is active for this session but not saved.
 bool Save();
-// Result of the most recent Save(): 0 never saved, 1 ok, 2 failed.
+// Production dispatch is queued to the existing init/control worker after
+// renderer authority. Standalone hosts/tests retain synchronous Save().
+using SaveDispatcher=bool(*)();
+void DeferForRenderer(SaveDispatcher dispatcher);
+bool BeginRendererSession(bool journal_allowed=true); // worker only; returns shared-persistence ownership
+void PublishRendererReady();
+bool EffectsReady();
+bool CanPersist();
+bool SaveFromWorker();
+void SetSavePending();
+void FlushSessionFailure();
+// Result of most recent Save():0 never,1 saved,2 failed/read-only,3 queued.
 uint32_t LastSaveResult();
+// Startup/exit worker calls only. No settings file is rewritten by safe start.
+void BeginSession(const wchar_t* marker_path=nullptr);
+void EndSession(uint32_t exit_code);
+void MarkSessionFailed(const char* reason);
+bool SafeStart();
+const char* SafeStartReason();
+bool SafeProfileRestoreRequired();
 
 } // namespace na::settings

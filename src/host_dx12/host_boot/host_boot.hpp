@@ -22,7 +22,9 @@ bool StartFromIni(HMODULE self, const wchar_t* ini_name, const char* default_tag
 
 struct Status {
     uint32_t host_enabled;    // ini said enabled=1
-    uint32_t host_started;    // overlay Start succeeded
+    uint32_t host_started;    // core attachment succeeded
+    uint32_t early_gate_expired; // early queue capture not guaranteed; late attachment remains active
+    uint32_t init_complete;   // worker completed menu/adapters/logger startup
     uint32_t adapter_prepared;
     uint32_t adapter_started;
     // A61: Route A services in a NON-Streamline DLSS game ([route_a] enabled=1):
@@ -37,9 +39,10 @@ struct Status {
 Status GetStatus();
 
 // G3-03: called by the proxy's DXGI factory exports before forwarding. With
-// [observe] producers=1 (and early_install, default 1) a caller other than the
+// [observe] producers=1 OR Route A overlay enabled (early_install defaults to 1),
+// a caller other than the
 // init thread waits up to 3 s until producer installation was attempted, so
-// the game's device and early objects are created under observation.
+// early swap-chain queue bindings are captured as well as producer objects.
 void WaitForObserveInstall();
 
 } // namespace na::host

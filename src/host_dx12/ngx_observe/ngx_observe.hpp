@@ -47,6 +47,7 @@ struct EvalParams {
     uint32_t perf_quality;   // PerfQualityValue at create; 0xFFFFFFFF unknown
     uint32_t create_flags;   // DLSS.Feature.Create.Flags; 0xFFFFFFFF unknown
     uint32_t overridden;     // 1 = host overrides were applied to this call
+    uint32_t preset_hint;    // create only: preset hint the runtime receives for this call's quality slot (0 = default)
     // A67 (Astra R4): subrect origins per input; 0xFFFFFFFF unknown. Coverage
     // of a resource is base + size, not size alone.
     uint32_t color_base_x, color_base_y, depth_base_x, depth_base_y;
@@ -61,20 +62,46 @@ struct EvalParams {
 //    parameters is replaced with ours, which calls the original and then, per
 //    settings.resolution_mode, rewrites OutWidth/OutHeight and the dynamic
 //    min/max so the ENGINE renders at native (DLAA) or a chosen ratio.
-bool ApplyCreateOverrides(void* ngx_parameter);
-// The replacement callback itself (exposed for tests): `original` is the
-// runtime's callback (may be null in tests), `ngx_parameter` the params.
+bool ApplyCreateOverrides(void* ngx_parameter); // DLSS Super Resolution (feature 1)
+// The game's upscaler, whichever it creates: feature 1 (Super Resolution) or 13
+// (Ray Reconstruction, which upscales too and has its own preset keys D/E/F).
+// Any other feature (Frame Generation, ...) is left untouched: returns false.
+bool ApplyCreateOverridesForFeature(uint32_t feature_id, void* ngx_parameter);
+// The replacement callbacks (exposed for tests): Super Resolution's
+// DLSSOptimalSettingsCallback and Ray Reconstruction's DLSSDOptimalSettingsCallback.
+// Both use the same parameters (Width/Height in, OutWidth/OutHeight and the dynamic
+// min/max out), so the same mode-to-size rule applies.
 int32_t OptimalSettingsCallback(void* ngx_parameter);
-// Test hook: installs `original_callback` as the forwarded callback.
+int32_t OptimalSettingsCallbackRR(void* ngx_parameter);
+// Test hooks: install `original_callback` as the forwarded callback.
 void SetOriginalOptimalCallbackForTest(void* original_callback);
+void SetOriginalOptimalCallbackRRForTest(void* original_callback);
 
 struct OptimalStats {
     uint64_t calls;             // times our callback ran
     uint32_t last_user_w, last_user_h;   // what the game asked about
     uint32_t last_out_w, last_out_h;     // what we answered
     uint32_t last_overridden;   // 1 if we rewrote the answer
+    uint64_t swaps_capability, swaps_allocate, swaps_getparams; // where our callback was installed
 };
 OptimalStats GetOptimalStats();
+// True if the optimal-settings callback was ever asked about this display size
+// (+-1 px). False means no query observed here; another interface may be in use.
+bool OptimalQueriedFor(uint32_t out_w, uint32_t out_h);
+// One optimal-settings callback answer (bounded ring, newest kept).
+struct OptimalCall {
+    uint64_t sequence = 0;
+    uint32_t user_w = 0, user_h = 0;     // size asked about (display or a reference size)
+    int32_t perf_quality = -1;           // quality mode the caller asked for
+    uint32_t native_w = 0, native_h = 0; // NVIDIA's answer
+    uint32_t out_w = 0, out_h = 0;       // what the caller received
+    uint32_t overridden = 0, rr = 0;     // 1 = we changed the answer; 1 = Ray Reconstruction callback
+};
+// Copies answers with sequence > after (oldest first) into out; returns count.
+uint32_t GetOptimalCalls(uint64_t after, OptimalCall* out, uint32_t max);
+// The preset hint a creation hands the runtime for its own quality slot (after
+// our overrides). 0 = default/none. Logged per creation as preset=.
+uint32_t CreatePresetHint(uint32_t feature_id, void* ngx_parameter);
 
 struct CallRecord {
     uint64_t qpc_ticks;     // QueryPerformanceCounter at detour entry
@@ -103,8 +130,16 @@ struct Stats {
     uint32_t hooked_functions;  // how many exports were found and hooked
     uint32_t module_attached;   // 0/1
     uint32_t core_preloaded;    // 0/1 PreloadAndHookNgxCore succeeded
-    uint32_t rr_seen;           // 0/1 the game created a Ray Reconstruction feature
+    uint32_t rr_seen;           // 0/1 the game created a Ray Reconstruction feature (ever)
+    // The game's CURRENT upscaler: the feature id of its most recent successful
+    // upscaler creation, 1 (Super Resolution) or 13 (Ray Reconstruction); 0 = none
+    // yet. Follows in-game toggles (ray reconstruction on/off re-creates DLSS).
+    uint32_t active_upscaler;
     uint32_t fg_seen;           // 0/1 the game created a Frame Generation feature (id 11)
+    uint64_t fg_evaluates, fg_with_inputs, fg_with_hudless, fg_with_distortion;
+    uint32_t fg_list_type, fg_color_format, fg_color_w, fg_color_h;
+    uint64_t fg_with_frame_id, fg_with_alpha, fg_with_ui;
+    uint32_t fg_last_create_uir; // UINT32_MAX = absent; creation setting, not inferred from textures
     // A30 menu evidence: successful DLSS super-resolution feature creations
     // and the sizes the LAST one was created with (0xFFFFFFFF = not read).
     uint64_t sr_creates; // aggregate successful SR creations
@@ -142,6 +177,8 @@ struct Stats {
 // before every event and on every GetSizeConfirmation() read, so no menu
 // page needs to stay open. One request runs; a new one supersedes. Returns
 // the request id.
+// Confirms actual SR/RR evaluations without requiring feature recreation.
+uint64_t ArmLiveSizeConfirmation(uint32_t w,uint32_t h,uint32_t out_w,uint32_t out_h,uint32_t need=30,uint32_t timeout_ms=8000);
 uint64_t ArmSizeConfirmation(uint32_t w, uint32_t h, uint32_t need, uint32_t create_timeout_ms, uint32_t confirm_timeout_ms,
                              uint32_t overall_timeout_ms);
 // The window is back; evaluations from now on count (no-op for another id).
@@ -216,6 +253,7 @@ void RequestReapply();
 // A42 fallback helpers (exposed for tests): clear all six preset hint keys
 // to Default; write back a quality value.
 bool StripPresetHints(void* ngx_parameter);
+bool StripRrPresetHints(void* ngx_parameter); // Ray Reconstruction's six keys to Default
 bool RestoreQualityValue(void* ngx_parameter, uint32_t perf_quality);
 
 // Per-evaluate parameter reads + log records are diagnostics; off by default

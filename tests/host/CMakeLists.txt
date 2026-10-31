@@ -13,12 +13,21 @@ function(na_host_test name)
   set_tests_properties(host_${name} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;${T_LABELS}")
 endfunction()
 
+na_host_test(fg_profile_test SOURCES fg_profile_test.cpp LIBS host_settings nvapi_headers)
+na_host_test(pbz_settings_test SOURCES pbz_settings_test.cpp LIBS host_settings)
+na_host_test(session_exit_test SOURCES session_exit_test.cpp LIBS host_dx12)
+na_host_test(nr_settings_trace_test SOURCES nr_settings_trace_test.cpp LIBS host_settings)
+na_host_test(route_a_menu_test SOURCES route_a_menu_test.cpp LIBS host_dx12)
+
 # Fake NGX runtime (the one non-driver name ngx_observe accepts).
 add_library(nvngx_stub SHARED ngx_stub.cpp)
 set_target_properties(nvngx_stub PROPERTIES PREFIX "")
 target_link_libraries(nvngx_stub PRIVATE abundance_options)
 
 na_host_test(hooking_test SOURCES hooking_test.cpp LIBS host_hooking d3d12 dxgi)
+# Game-facing Streamline boundary: this exe plays sl.interposer (exports + RTTI proxy class).
+na_host_test(sl_boundary_test SOURCES sl_boundary_test.cpp LIBS host_dx12)
+na_host_test(sl_dlss_mode_test SOURCES sl_dlss_mode_test.cpp LIBS host_dx12)
 
 na_host_test(proxy_test SOURCES proxy_test.cpp LIBS d3d12 dxgi user32
              ARGS "$<TARGET_FILE:NeuralAliasDXGI>")
@@ -63,18 +72,44 @@ na_host_test(capture_test SOURCES capture_test.cpp LIBS host_capture
              ARGS "${CMAKE_CURRENT_BINARY_DIR}/capture-test-out")
 
 na_host_test(overlay_test SOURCES overlay_test.cpp LIBS host_dx12 user32)
+na_host_test(overlay_bootstrap_test SOURCES overlay_bootstrap_test.cpp LIBS host_dx12 user32)
+na_host_test(overlay_input_handover_test SOURCES overlay_input_handover_test.cpp LIBS host_dx12)
+na_host_test(overlay_boundary_fallback_test SOURCES overlay_boundary_fallback_test.cpp)
+add_test(NAME host_overlay_hardware_test COMMAND overlay_test --hardware)
+set_tests_properties(host_overlay_hardware_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "host;gpu")
 
 # Parameter-object tests need the NVIDIA NGX SDK headers (local SDK folder, or
 # the CI job that fetches the public DLSS repo's headers at build time).
 if(NA_HAVE_NGX_SDK)
+  target_compile_definitions(nvngx_stub PRIVATE NA_HAVE_NGX_SDK)
+  target_include_directories(nvngx_stub SYSTEM PRIVATE "${NA_NGX_SDK_INCLUDE}")
   na_host_test(ngx_params_test SOURCES ngx_params_test.cpp LIBS host_dx12)
   na_host_test(ngx_optimal_test SOURCES ngx_optimal_test.cpp LIBS host_dx12)
+  na_host_test(nr_queue_test SOURCES nr_queue_test.cpp LIBS host_dx12)
+  na_host_test(nr_native_fg_test SOURCES nr_native_fg_test.cpp LIBS host_dx12 d3dcompiler)
+  na_host_test(nr_runtime_probe SOURCES nr_runtime_probe.cpp LIBS host_dx12 LABELS nvidia)
+  add_test(NAME host_nr_retry_init_test COMMAND nr_queue_test --retry-init)
+  add_test(NAME host_nr_runtime_owner_test COMMAND nr_queue_test --runtime-owner)
+  add_test(NAME host_nr_runtime_shutdown_test COMMAND nr_queue_test --runtime-shutdown)
+  add_test(NAME host_nr_device_migrate_test COMMAND nr_queue_test --device-migrate)
+  set_tests_properties(host_nr_runtime_shutdown_test host_nr_device_migrate_test PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77 LABELS host)
+  set_tests_properties(host_nr_runtime_owner_test PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77 LABELS host)
+  set_tests_properties(host_nr_retry_init_test PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77 LABELS host)
+  na_host_test(nr_fg_contract_test SOURCES nr_fg_contract_test.cpp LIBS host_dx12)
+  add_test(NAME host_nr_present_dependency_test COMMAND nr_queue_test --present-dependency)
+  add_test(NAME host_nr_discard_recording_test COMMAND nr_queue_test --discard-recording)
+  add_test(NAME host_nr_repeated_recording_test COMMAND nr_queue_test --repeated-recording)
+  set_tests_properties(host_nr_repeated_recording_test PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77 LABELS host)
+  set_tests_properties(host_nr_discard_recording_test PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77 LABELS host)
+  set_tests_properties(host_nr_present_dependency_test PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77 LABELS host)
 endif()
 
 # Argon audit #2: depth formats safe to copy as R32F (no device).
 na_host_test(depth_format_test SOURCES depth_format_test.cpp)
 # Neural Rendering input preparation: shaders build; 24/16-bit depth -> R32F for a subrect.
 na_host_test(nr_depth_test SOURCES nr_depth_test.cpp LIBS host_dx12)
+na_host_test(nr_fg_composition_test SOURCES nr_fg_composition_test.cpp LIBS host_dx12)
+na_host_test(nr_fg_frame_cache_test SOURCES nr_fg_frame_cache_test.cpp LIBS host_dx12)
 
 # C6: generic DLSS backend. The fake-runtime test needs only the NGX headers
 # (runs in CI); the real test needs our own NGX instance (static library from
@@ -156,7 +191,8 @@ endif()
 set(NA_UPSCALER_RUNTIME_DIR "" CACHE PATH "Folder with the official FSR / XeSS runtime DLLs (hardware session)")
 na_host_test(upscaler_jitter_test SOURCES upscaler_jitter_test.cpp LIBS d3d12 dxgi
              ARGS "${NA_UPSCALER_RUNTIME_DIR}" LABELS "gpu")
-target_include_directories(upscaler_jitter_test SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/third_party/ffx-api" "${PROJECT_SOURCE_DIR}/src")
+target_include_directories(upscaler_jitter_test SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/third_party/ffx-api")
+target_include_directories(upscaler_jitter_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
 
 # C8a: H1 producers on a real device (WARP on CI).
 na_host_test(observe_producers_test SOURCES observe_producers_test.cpp LIBS host_observe_producers dxgi)
@@ -166,6 +202,7 @@ na_host_test(observe_passes_test SOURCES observe_passes_test.cpp LIBS host_obser
 na_host_test(observe_snapshot_test SOURCES observe_snapshot_test.cpp LIBS host_observe_producers d3d12 dxgi)
 # C9b: asynchronous resource content samples (A2-R03).
 na_host_test(observe_sample_test SOURCES observe_sample_test.cpp LIBS host_observe_producers d3d12 dxgi)
+na_host_test(depth_carried_state_test SOURCES depth_carried_state_test.cpp LIBS host_observe_producers d3d12 dxgi)
 
 # C7a: FSR 3.1+ interception against a stand-in FidelityFX runtime DLL.
 add_library(ffx_stub SHARED ffx_stub.cpp)
@@ -194,3 +231,46 @@ na_host_test(module_watch_test SOURCES module_watch_test.cpp LIBS host_upscalers
              ARGS "$<TARGET_FILE:sl_interposer_real>" "$<TARGET_FILE:ffx_stub>")
 add_dependencies(module_watch_test sl_interposer_real ffx_stub)
 set_tests_properties(host_module_watch_test PROPERTIES TIMEOUT 60)
+
+na_host_test(tsushima_apply_test SOURCES tsushima_apply_test.cpp
+  ${PROJECT_SOURCE_DIR}/src/host_dx12/adapters/tsushima/apply.cpp LIBS host_dx12)
+target_compile_definitions(tsushima_apply_test PRIVATE NA_TSUSHIMA_APPLY_TEST=1)
+na_host_test(tsushima_locator_test SOURCES tsushima_locator_test.cpp LIBS minhook)
+na_host_test(unreal_apply_test SOURCES unreal_apply_test.cpp
+  ${PROJECT_SOURCE_DIR}/src/host_dx12/adapters/unreal/screen_percentage.cpp LIBS host_dx12)
+target_compile_definitions(unreal_apply_test PRIVATE NA_UNREAL_APPLY_TEST=1)
+
+na_host_test(unreal_locator_test SOURCES unreal_locator_test.cpp LIBS host_dx12)
+
+add_test(NAME host_overlay_late_queue_test COMMAND overlay_test --warp --late-queue)
+add_test(NAME host_overlay_late_queue_hardware_test COMMAND overlay_test --hardware --late-queue)
+set_tests_properties(host_overlay_late_queue_test host_overlay_late_queue_hardware_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+
+add_test(NAME host_overlay_start_contention_test COMMAND overlay_test --warp --busy-install)
+set_tests_properties(host_overlay_start_contention_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+
+add_test(NAME host_overlay_boundary_test COMMAND overlay_test --warp --boundary)
+add_test(NAME host_overlay_boundary_hardware_test COMMAND overlay_test --hardware --boundary)
+set_tests_properties(host_overlay_boundary_test host_overlay_boundary_hardware_test PROPERTIES TIMEOUT 40 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+
+add_test(NAME host_overlay_bootstrap_recovery_test COMMAND overlay_bootstrap_test --recovery)
+set_tests_properties(host_overlay_bootstrap_recovery_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+
+# Reviewed ownership stage 1: failed menu cannot stop host queue/discovery work.
+add_test(NAME host_overlay_menu_failure_test COMMAND overlay_bootstrap_test --menu-failure)
+set_tests_properties(host_overlay_menu_failure_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+na_host_test(presenter_ownership_test SOURCES presenter_ownership_test.cpp LIBS host_dx12 user32)
+add_test(NAME host_sl_boundary_terminal_attach_test COMMAND sl_boundary_test --terminal-attach)
+set_tests_properties(host_sl_boundary_terminal_attach_test PROPERTIES TIMEOUT 20 LABELS host)
+add_test(NAME host_overlay_menu_create_failure_test COMMAND overlay_bootstrap_test --menu-create-failure)
+set_tests_properties(host_overlay_menu_create_failure_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+
+add_test(NAME host_overlay_optional_input_test COMMAND overlay_bootstrap_test --optional-input)
+set_tests_properties(host_overlay_optional_input_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+add_test(NAME host_sl_boundary_optional_conflict_test COMMAND sl_boundary_test --optional-conflict)
+set_tests_properties(host_sl_boundary_optional_conflict_test PROPERTIES TIMEOUT 20 LABELS host)
+
+na_host_test(session_ownership_test SOURCES session_ownership_test.cpp LIBS host_dx12 user32)
+
+add_test(NAME host_overlay_cursor_cleanup_test COMMAND overlay_bootstrap_test --cursor-cleanup)
+set_tests_properties(host_overlay_cursor_cleanup_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "host;gpu")

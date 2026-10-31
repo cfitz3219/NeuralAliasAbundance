@@ -165,14 +165,26 @@ add_library(host_dx12 STATIC
   src/host_dx12/fg/frame_gen.cpp
   src/host_dx12/fg/preset_profile.cpp
   src/host_dx12/nr/nr_pass.cpp
+  src/host_dx12/nr/fg_composition.cpp
+  src/host_dx12/nr/fg_color.cpp
+  src/host_dx12/nr/sl_consumer.cpp
+  src/host_dx12/nr/native_fg.cpp
+  src/host_dx12/nr/fg_states.cpp
   src/host_dx12/j2/live_dlaa.cpp
   src/host_dx12/j2/nis_sharpen.cpp
   src/host_dx12/motion/live_flow.cpp
   src/host_dx12/latency/nvidia_latency.cpp
   src/host_dx12/latency/pcl_stats.cpp
   src/host_dx12/adapters/tlou1/apply.cpp
+  src/host_dx12/adapters/tsushima/apply.cpp
+  src/host_dx12/adapters/unreal/cvar_probe.cpp
+  src/host_dx12/sl_boundary/sl_boundary.cpp
+  src/host_dx12/sl_boundary/sl_dlss_mode.cpp
+  src/host_dx12/adapters/unreal/screen_percentage.cpp
+  src/host_dx12/adapters/mode_control.cpp
   src/host_dx12/adapters/tlou1/timing.cpp
-  src/host_dx12/host_boot/host_boot.cpp)
+  src/host_dx12/host_boot/host_boot.cpp
+  src/host_dx12/host_boot/session.cpp)
 if(NA_GAME_ADAPTER_LIB)
   target_link_libraries(host_dx12 PUBLIC "${NA_GAME_ADAPTER_LIB}")
   message(STATUS "Game adapter: ${NA_GAME_ADAPTER_LIB}")
@@ -242,7 +254,7 @@ add_library(host_upscalers STATIC
   src/host_dx12/upscalers/ffx_intercept.cpp
   src/host_dx12/upscalers/xess_intercept.cpp)
 target_include_directories(host_upscalers SYSTEM PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ffx-api")
-target_link_libraries(host_upscalers PUBLIC abundance_options host_hooking host_dlss d3d12)
+target_link_libraries(host_upscalers PUBLIC abundance_options host_hooking host_dlss host_settings d3d12)
 
 # -------------------------------------------------------------- deliverables
 # Standalone manager / diagnostic exe.
@@ -272,3 +284,8 @@ endif()
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/CMakeLists.txt")
   add_subdirectory(tools)       # Claude (C5): nr_replay (local-only, needs SDK lib)
 endif()
+
+# Reversible per-application FG preset helper; no profile changes at build/test time.
+add_executable(NAProfile src/host_dx12/fg/preset_profile.cpp)
+target_compile_definitions(NAProfile PRIVATE NA_PROFILE_CLI)
+target_link_libraries(NAProfile PRIVATE host_settings nvapi_headers)

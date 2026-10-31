@@ -1,5 +1,7 @@
 #include "host_dx12/fg/camera.hpp"
+#include "host_dx12/host_boot/session.hpp"
 #include "host_dx12/adapters/tlou1/apply.hpp"
+#include "host_dx12/adapters/tsushima/apply.hpp"
 #include "host_dx12/adapters/tlou1/timing.hpp"
 #include "host_dx12/sl_proxy/sl_abi.hpp"
 // Route A: sl.interposer.dll stand-in for Streamline titles.
@@ -91,24 +93,26 @@ DWORD WINAPI InitThread(LPVOID)
     // read by the NGX layer live; the overlay edits and saves them.
     na::settings::SetIniPath(ini);
     na::settings::Load();
+    na::host::StartSession();
     // Gate 2: the Streamline entry point also hosts non-native upscalers.
     // Observe by default; replacement remains an explicit per-provider opt-in.
     if (GetPrivateProfileIntW(L"fsr", L"enabled", 1, ini) == 1) {
-        na::ffx::SetMode(GetPrivateProfileIntW(L"fsr", L"replace", 0, ini) == 1
+        na::ffx::SetMode(!na::settings::SafeStart() && GetPrivateProfileIntW(L"fsr", L"replace", 0, ini) == 1
             ? na::ffx::Mode::ReplaceWithDlss : na::ffx::Mode::Observe);
         na::ffx::StartModuleWatch();
     }
     if (GetPrivateProfileIntW(L"xess", L"enabled", 1, ini) == 1) {
-        na::xess::SetMode(GetPrivateProfileIntW(L"xess", L"replace", 0, ini) == 1
+        na::xess::SetMode(!na::settings::SafeStart() && GetPrivateProfileIntW(L"xess", L"replace", 0, ini) == 1
             ? na::xess::Mode::ReplaceWithDlss : na::xess::Mode::Observe);
         na::xess::StartModuleWatch();
     }
     na::latency::Initialize();
-    na::fg::preset::Initialize();
+    // Driver profile changes wait for a qualified renderer.
     // Deterministic attach: hook the driver's NGX core before Streamline
     // loads it (closes the Init/GetCapabilityParameters race, A17).
     na::ngx::PreloadAndHookNgxCore();
     na::tlou1::InitializeApply();
+    na::tsushima::InitializeApply();
     na::tlou1::InitializeTiming();
     if (!na::ngx::StartModuleWatch(sync_hook)) return 0;
     // Live Neural Rendering (A30) and Frame Generation (A59): hand the
@@ -136,6 +140,11 @@ DWORD WINAPI InitThread(LPVOID)
     na::ngx::SetDetailLogging(GetPrivateProfileIntW(L"observe", L"detail", 0, ini) == 1);
     // GPU timestamps around the DLSS evaluate ([observe] gpu_timing=0 to disable).
     na::gputime::SetEnabled(GetPrivateProfileIntW(L"observe", L"gpu_timing", 1, ini) == 1);
+    na::overlay::RegisterRouteAMenu();
+    wchar_t status_path[MAX_PATH];
+    wsprintfW(status_path,L"%s\\NeuralAliasSL-status.log",dir);
+    na::overlay::SetStatusLogPath(status_path);
+    na::overlay::StartCore("ROUTE A",nullptr);
     // In-game menu (Home). [overlay] enabled=0 disables it; scale= and
     // font_body=/font_title= tune size and typeface without a rebuild.
     if (GetPrivateProfileIntW(L"overlay", L"enabled", 1, ini) == 1) {
@@ -148,11 +157,10 @@ DWORD WINAPI InitThread(LPVOID)
         GetPrivateProfileStringA("overlay", "font_body", "", body, sizeof(body), ini_a);
         GetPrivateProfileStringA("overlay", "font_title", "", title, sizeof(title), ini_a);
         na::ui::SetFontPaths(body, title);
-        na::overlay::RegisterRouteAMenu();
-        wchar_t status_path[MAX_PATH];
-        wsprintfW(status_path, L"%s\\NeuralAliasSL-status.log", dir);
-        na::overlay::SetStatusLogPath(status_path); // A55: measurements recorded every 5 s
-        na::overlay::Start("ROUTE A", nullptr); // A30: the host draws the pages
+        for(unsigned attempt=0;attempt<3;++attempt){
+            na::overlay::StartMenu();if(na::overlay::GetStats().input_hooks==8)break;
+            if(attempt<2)Sleep(50);
+        }
     }
     wchar_t log_path[MAX_PATH];
     wchar_t configured[MAX_PATH] = {};
@@ -162,6 +170,8 @@ DWORD WINAPI InitThread(LPVOID)
     else
         wsprintfW(log_path, L"%s\\NeuralAliasSL-observe.log", dir);
     na::ngx::StartLogger(log_path);
+    static wchar_t session_ini[MAX_PATH]{};wcsncpy_s(session_ini,ini,_TRUNCATE);
+    na::host::RunSessionWorker([]{na::host::ActivateSavedRequests(session_ini);});
     return 0;
 }
 

@@ -7,6 +7,9 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#if defined(NA_HAVE_NGX_SDK)
+#include "fake_ngx_params.hpp"
+#endif
 
 namespace {
 struct State {
@@ -22,7 +25,14 @@ uint64_t g_next_handle = 0xA000;
 // A parameter object is a plain 4 KiB block here (opaque to the host unless
 // the NGX SDK is present, in which case the host reads through the real
 // vtable; this stub is only used for the SDK-less observation tests).
+#if defined(NA_HAVE_NGX_SDK)
+using Params = test::FakeParams;
+#else
 struct Params { uint32_t magic; uint8_t pad[4092]; };
+#endif
+void* g_query_params = nullptr;
+int32_t g_query_result = 1;
+int32_t g_release_result = 1;
 } // namespace
 
 #define NGX_EXPORT extern "C" __declspec(dllexport)
@@ -41,12 +51,14 @@ NGX_EXPORT int32_t __cdecl NVSDK_NGX_D3D12_CreateFeature(void* cmd_list, uint32_
 NGX_EXPORT int32_t __cdecl NVSDK_NGX_D3D12_EvaluateFeature(void* cmd_list, const void* handle, const void*, void*)
 { ++g_state.evaluates; g_state.last_cmd_list = cmd_list; g_state.last_handle_in = reinterpret_cast<uintptr_t>(handle); return g_state.next_eval_result; }
 NGX_EXPORT int32_t __cdecl NVSDK_NGX_D3D12_ReleaseFeature(void* handle)
-{ ++g_state.releases; g_state.last_handle_in = reinterpret_cast<uintptr_t>(handle); return 1; }
+{ ++g_state.releases; g_state.last_handle_in = reinterpret_cast<uintptr_t>(handle); return g_release_result; }
 NGX_EXPORT int32_t __cdecl NVSDK_NGX_D3D12_Shutdown1(void*) { ++g_state.shutdowns; return 1; }
 NGX_EXPORT int32_t __cdecl NVSDK_NGX_D3D12_GetCapabilityParameters(void** out)
-{ ++g_state.getcaps; static Params caps{0xCA95, {}}; if (out) *out = &caps; return 1; }
+{ ++g_state.getcaps; static Params caps{}; if (out) *out = g_query_params ? g_query_params : &caps; return g_query_result; }
+NGX_EXPORT int32_t __cdecl NVSDK_NGX_D3D12_GetParameters(void** out)
+{ static Params params{}; if (out) *out = g_query_params ? g_query_params : &params; return g_query_result; }
 NGX_EXPORT int32_t __cdecl NVSDK_NGX_D3D12_AllocateParameters(void** out)
-{ ++g_state.allocs; if (!out) return -1; auto* p = new Params{0x9A4A, {}}; *out = p; return 1; }
+{ ++g_state.allocs; if (!out) return -1; *out = g_query_params ? g_query_params : new Params{}; return g_query_result; }
 NGX_EXPORT int32_t __cdecl NVSDK_NGX_D3D12_DestroyParameters(void* p)
 { ++g_state.destroys; delete static_cast<Params*>(p); return 1; }
 
@@ -54,5 +66,8 @@ NGX_EXPORT int32_t __cdecl NVSDK_NGX_D3D12_DestroyParameters(void* p)
 NGX_EXPORT const State* __cdecl NgxStubState() { return &g_state; }
 NGX_EXPORT void __cdecl NgxStubSetResults(int32_t create_result, int32_t eval_result)
 { g_state.next_create_result = create_result; g_state.next_eval_result = eval_result; }
+NGX_EXPORT void __cdecl NgxStubSetQuery(void* params, int32_t result)
+{ g_query_params = params; g_query_result = result; }
+NGX_EXPORT void __cdecl NgxStubSetReleaseResult(int32_t result) { g_release_result=result; }
 
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID) { if (reason == DLL_PROCESS_ATTACH) DisableThreadLibraryCalls(h); return TRUE; }
