@@ -80,3 +80,35 @@ foreach($p in $before.Keys) { Check ((Get-FileHash $p).Hash -eq $before[$p]) 'fa
 Check (-not(Test-Path (Join-Path $game 'platform\steam\dxgi.dll'))) 'failed install left proxy'
 Check ((Get-Content $collision) -eq 'unrelated stage') 'foreign stage overwritten'
 Write-Host "PASS: additive-only install, exact rollback, mutable preferences, reinstall, foreign-file refusal, existing-file refusal and partial-failure rollback. Fixture retained: $root"
+
+# Ghost shares the tested transaction but has root-level binaries, separate
+# preferences and no Unreal plugin directory or driver-profile modification.
+$ghost=Join-Path $root 'ghost'; $ghostState=Join-Path $root 'ghost-state'; $ghostUser=Join-Path $root 'ghost-user'
+New-Item -ItemType Directory -Force -Path $ghost,$ghostUser | Out-Null
+$native=@{}
+foreach($name in @('GhostOfTsushima.exe','sl.interposer.dll','nvngx_dlss.dll','nvngx_dlssg.dll')) {
+    $path=Join-Path $ghost $name; "native $name" | Set-Content $path; $native[$path]=(Get-FileHash $path).Hash
+}
+$priorPrefs=Join-Path $ghostUser 'NeuralAliasSL.ini'
+'old scoped choices' | Set-Content $priorPrefs
+$priorHash=(Get-FileHash $priorPrefs).Hash
+$ghostArgs=@{GameProfile='Tsushima';GameRoot=$ghost;PackageRoot=$pkg;StateRoot=$ghostState;UserRoot=$ghostUser;ProfileTool=(Join-Path $root 'must-not-run.exe')}
+& $script @ghostArgs -Action Validate
+& $script @ghostArgs -Action Install
+$gm=Get-Content (Join-Path $ghostState 'deployment.json') -Raw | ConvertFrom-Json
+Check ($gm.files.Count -eq 4) 'Ghost installed an unexpected file set'
+Check (-not $gm.profile_attempted) 'Ghost altered a driver profile'
+Check (Test-Path (Join-Path $ghost 'dxgi.dll')) 'Ghost proxy absent'
+Check (-not (Test-Path (Join-Path $ghost 'Engine'))) 'Ghost got an Unreal directory'
+Check ((Get-Content $priorPrefs -Raw) -match 'scope=Tsushima') 'Ghost scope incorrect'
+Check ((Get-Content $priorPrefs -Raw) -match 'profile_override=0') 'Ghost profile override enabled'
+foreach($path in $native.Keys) { Check ((Get-FileHash $path).Hash -eq $native[$path]) 'Ghost native file changed' }
+& $script @ghostArgs -Action Rollback
+Check ((Get-FileHash $priorPrefs).Hash -eq $priorHash) 'Ghost prior preferences not restored'
+Check (-not (Test-Path (Join-Path $ghost 'dxgi.dll'))) 'Ghost rollback left proxy'
+foreach($path in $native.Keys) { Check ((Get-FileHash $path).Hash -eq $native[$path]) 'Ghost rollback changed native file' }
+'legacy proxy original' | Set-Content (Join-Path $ghost 'sl_interposer_real.dll')
+$legacyRefused=$false
+try { & $script @ghostArgs -Action Install } catch { $legacyRefused=$_.Exception.Message -like '*previous Streamline*' }
+Check $legacyRefused 'Ghost accepted a second injector over the legacy proxy'
+Write-Host 'PASS: Ghost additive install/rollback, original preferences restored, no native DLL or driver-profile changes, legacy proxy refusal.'

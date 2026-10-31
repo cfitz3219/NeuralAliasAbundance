@@ -5,8 +5,18 @@ param(
     [string]$PackageRoot,
     [string]$StateRoot,
     [string]$UserRoot = (Join-Path $env:LOCALAPPDATA 'NeuralAlias\PBZ'),
-    [string]$ProfileTool
+    [string]$ProfileTool,
+    [ValidateSet('PBZ','Tsushima')][string]$GameProfile = 'PBZ'
 )
+# Reuse the additive transaction/rollback for the root-layout Nixxes game.
+$gameExe = 'PBZ.exe'; $exeDir = 'platform\steam'; $scope = 'PBZ'
+$gameLabel = 'PHANTOM BLADE ZERO'; $useProfile = $true
+if ($GameProfile -eq 'Tsushima') {
+    if (-not $PSBoundParameters.ContainsKey('GameRoot')) { $GameRoot = "D:\SteamLibrary\steamapps\common\Ghost of Tsushima DIRECTOR'S CUT" }
+    if (-not $PSBoundParameters.ContainsKey('UserRoot')) { $UserRoot = Join-Path $env:LOCALAPPDATA 'NeuralAlias\Tsushima' }
+    $gameExe = 'GhostOfTsushima.exe'; $exeDir = '.'; $scope = 'Tsushima'
+    $gameLabel = 'GHOST OF TSUSHIMA'; $useProfile = $false
+}
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if (-not $PackageRoot) { $PackageRoot = $PSScriptRoot }
@@ -24,11 +34,11 @@ function Save-Manifest($m) {
     Move-Item -LiteralPath "$manifestPath.tmp" -Destination $manifestPath -Force
 }
 function Profile([string]$verb) {
-    & $helper $verb 'PBZ.exe' $profileBackup 3
+    & $helper $verb $gameExe $profileBackup 3
     if ($LASTEXITCODE -ne 0) { throw "NVIDIA profile $verb failed ($LASTEXITCODE)." }
 }
 function Assert-Closed {
-    if (Get-Process -Name PBZ -ErrorAction SilentlyContinue) { throw 'Close Phantom Blade Zero before installing or rolling back.' }
+    if (Get-Process -Name ([IO.Path]::GetFileNameWithoutExtension($gameExe)) -ErrorAction SilentlyContinue) { throw "Close $gameLabel before installing or rolling back." }
 }
 function Restore($m) {
     if ($m.game_root -ne $GameRoot -or $m.user_root -ne $UserRoot) { throw 'Rollback paths differ from the recorded installation.' }
@@ -76,7 +86,7 @@ if ($Action -eq 'Rollback') {
 }
 $package = Get-Content -Raw -LiteralPath (Join-Path $PackageRoot 'package.json') | ConvertFrom-Json
 foreach ($f in $package.payload) {
-    if ($f.name -notin @('NeuralAliasDXGI.dll','NAProfile.exe','nvngx_dlssnr.dll','NVIDIA-NR-LICENSE.txt','deploy-pbz.ps1','pbz-package-run.ps1','README.md','ENGINEERING-NOTES.md','repair-from.txt')) {
+    if ($f.name -notin @('NeuralAliasDXGI.dll','NAProfile.exe','nvngx_dlssnr.dll','NVIDIA-NR-LICENSE.txt','deploy-pbz.ps1','pbz-package-run.ps1','README.md','ENGINEERING-NOTES.md','repair-from.txt','tsushima-package-run.ps1')) {
         throw "Not a package payload file: $($f.name). Logs and deployment state must not enter the payload manifest."
     }
     if ((Hash (Join-Path $PackageRoot $f.name)) -ne $f.sha256) { throw "Package file mismatch: $($f.name)" }
@@ -85,7 +95,8 @@ foreach ($f in @('nvngx_dlssnr.dll')) {
     $sig = Get-AuthenticodeSignature -LiteralPath (Join-Path $PackageRoot $f)
     if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'NVIDIA Corporation') { throw "NVIDIA signature invalid: $f" }
 }
-if (-not (Test-Path -LiteralPath (Join-Path $GameRoot 'platform\steam\PBZ.exe'))) { throw 'Phantom Blade Zero executable not found.' }
+if (-not (Test-Path -LiteralPath (Join-Path $GameRoot "$exeDir\$gameExe"))) { throw "$gameLabel executable not found." }
+if ($GameProfile -eq 'Tsushima' -and (Test-Path -LiteralPath (Join-Path $GameRoot 'sl_interposer_real.dll'))) { throw 'Restore the previous Streamline proxy installation before using this additive package.' }
 if ($Action -eq 'Validate') { Write-Host 'Replacement package validated; installation unchanged.'; return }
 if (Test-Path -LiteralPath $manifestPath) {
     $prior = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
@@ -94,15 +105,17 @@ if (Test-Path -LiteralPath $manifestPath) {
     New-Item -ItemType Directory -Path $archive | Out-Null
     Get-ChildItem -LiteralPath $StateRoot -File | ForEach-Object { Move-Item -LiteralPath $_.FullName -Destination $archive }
 }
-& $helper status PBZ.exe
-if ($LASTEXITCODE -ne 0) { throw 'Phantom Blade Zero NVIDIA profile was not found.' }
+if ($useProfile) {
+    & $helper status $gameExe
+    if ($LASTEXITCODE -ne 0) { throw "$gameLabel NVIDIA profile was not found." }
+}
 New-Item -ItemType Directory -Force -Path $StateRoot,$UserRoot | Out-Null
 $ini = @"
 [settings]
-scope=PBZ
+scope=$scope
 [host]
 enabled=1
-tag=PHANTOM BLADE ZERO
+tag=$gameLabel
 status_log=$UserRoot\status.log
 startup_log=$UserRoot\startup.log
 menu_diagnostics=1
@@ -127,7 +140,7 @@ enabled=0
 model=0
 [fg]
 enabled=0
-profile_override=1
+profile_override=$([int]$useProfile)
 preset=3
 [j2]
 enabled=0
@@ -139,8 +152,8 @@ enabled=0
 $iniSource = Join-Path $StateRoot 'defaults.ini'
 $ini | Set-Content -LiteralPath $iniSource -Encoding Unicode
 $plans = @()
-foreach ($dir in @('platform\steam')) {
-    if (-not (Test-Path -LiteralPath (Join-Path $GameRoot "$dir\PBZ.exe"))) { continue }
+foreach ($dir in @($exeDir)) {
+    if (-not (Test-Path -LiteralPath (Join-Path $GameRoot "$dir\$gameExe"))) { continue }
     foreach ($pair in @(@('NeuralAliasDXGI.dll','dxgi.dll'),@('nvngx_dlssnr.dll','nvngx_dlssnr.dll'))) {
         $plans += @{source=(Join-Path $PackageRoot $pair[0]); destination=(Join-Path $GameRoot "$dir\$($pair[1])"); mutable=$false}
     }
@@ -151,9 +164,9 @@ foreach ($dir in @('platform\steam')) {
 # rule (Anno, Sniper Elite, TLOU): the installer only ADDS files to the game folder.
 $dlssDir = 'Engine\Plugins\Runtime\Nvidia\DLSS\Binaries\ThirdParty\Win64'
 # NGX can use the plugin search directory rather than the executable directory.
-$plans += @{source=(Join-Path $PackageRoot 'nvngx_dlssnr.dll'); destination=(Join-Path $GameRoot "$dlssDir\nvngx_dlssnr.dll"); mutable=$false}
+if ($GameProfile -eq 'PBZ') { $plans += @{source=(Join-Path $PackageRoot 'nvngx_dlssnr.dll'); destination=(Join-Path $GameRoot "$dlssDir\nvngx_dlssnr.dll"); mutable=$false} }
 $plans += @{source=$iniSource; destination=(Join-Path $UserRoot 'NeuralAliasSL.ini'); mutable=$true}
-$plans += @{source=$profileBackup; destination=(Join-Path $UserRoot 'FG-profile-before.ini'); mutable=$false}
+if ($useProfile) { $plans += @{source=$profileBackup; destination=(Join-Path $UserRoot 'FG-profile-before.ini'); mutable=$false} }
 foreach ($p in $plans) {
     if ($p.destination.StartsWith($GameRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $p.destination)) {
         throw "Refusing: $($p.destination) already exists. This installer only adds files to the game folder and never replaces one. Nothing changed."
@@ -171,8 +184,10 @@ foreach ($p in $plans) {
 }
 Save-Manifest $m
 try {
-    $m.profile_attempted=$true; Save-Manifest $m
-    Profile 'apply'
+    if ($useProfile) {
+        $m.profile_attempted=$true; Save-Manifest $m
+        Profile 'apply'
+    }
     foreach ($e in $m.files) {
         $e.after_hash=Hash $e.source
         if (-not $e.after_hash) { throw "Source missing: $($e.source)" }
@@ -189,8 +204,10 @@ try {
         if ((Hash $e.destination) -ne $e.after_hash) { throw "Installed file verification failed: $($e.destination)" }
     }
     $m.state='installed'; Save-Manifest $m
-    Write-Host 'Installed. Launch normally. Keep DLSS Ultra Performance in the game; Home opens NeuralAlias. Turn Neural Rendering on there when ready.'
-    Write-Host 'Native game Frame Generation remains in control; its driver preset request is C. No game was launched.'
+    Write-Host 'Installed. Select DLSS in the game. Home opens NeuralAlias; enable Neural Rendering there. Game testing remains yours.'
+    if ($useProfile) { Write-Host 'Native game Frame Generation remains in control; its driver preset request is C.' }
+    else { Write-Host 'Native game Frame Generation remains in control; driver settings are unchanged.' }
+    Write-Host 'No game was launched.'
 } catch {
     $failure=$_
     try { Restore $m } catch { Write-Warning "Automatic rollback needs attention: $_. Run Rollback again after resolving it." }
