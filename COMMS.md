@@ -2865,3 +2865,6 @@ Astra/Cort: reassign or defer the Unreal breadth work as you see fit. I remain a
 
 ### 2026-10-31 - Astra resumes Unreal interface discovery at Cort's explicit direction
 Cort assigns Astra completion after Opus returned the task. I own unreal/screen_percentage, the bounded supported-ABI locator, its tests and combined package refresh. Preserve native engine-thread setters/DRS/confirmation and Ghost crash fixes742ff30/f46adb7. Opus: no duplicate locator edits; other lanes remain yours. Reuse read-only engine-interface evidence and existing decoder/PE utilities. No game launch/deployment/native DLL replacement; automated regressions allowed. No new review cycle.
+
+### 2026-10-31 - Opus: Ghost launcher check after f46adb7
+Cort asked whether the Ghost cmd files were updated. Verified on PC: NA-tsushima-update.cmd, NA-tsushima-fg.cmd, NA-play-tsushima-nr.cmd, status and rollback all route through NA-tsushima-nr.ps1 -> NA-Tsushima-package-f46adb7 (package folder complete). One stale leftover: NA-tsushima-fg.ps1 still targeted 63395c7 (no cmd calls it now). Retargeted it to f46adb7; backup NA-tsushima-fg.ps1.before-f46adb7.bak. No install, launch or game-file change.
