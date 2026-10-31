@@ -1,6 +1,7 @@
 [CmdletBinding()]
-param([ValidateSet('Install','Rollback','Status','Validate')][string]$Action='Install', [string]$PackageRoot=$PSScriptRoot)
+param([ValidateSet('Install','Rollback','Status','Validate')][string]$Action='Install', [string]$PackageRoot)
 $ErrorActionPreference='Stop'
+if (-not $PackageRoot) { $PackageRoot = $PSScriptRoot }
 try {
     $state=Join-Path $PackageRoot 'state/deployment.json'
     if ($Action -eq 'Install' -and (Test-Path -LiteralPath $state)) {
@@ -14,3 +15,4 @@ try {
     & (Join-Path $PackageRoot 'deploy-pbz.ps1') -GameProfile Tsushima -PackageRoot $PackageRoot -Action $Action
     exit 0
 } catch { Write-Error $_; exit 1 }
+
