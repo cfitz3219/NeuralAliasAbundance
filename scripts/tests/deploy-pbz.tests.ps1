@@ -7,7 +7,8 @@ function Check($condition,$why) { if (-not $condition) { throw $why } }
 # Fixture binaries are text; no NVIDIA DLL, driver setting or game is touched.
 # Process discovery is also fixture-local; a real game running elsewhere must
 # not prevent install/rollback tests against these temporary text files.
-function Get-Process { [CmdletBinding()] param([string]$Name) return $null }
+$global:naFixtureRunning=$false
+function Get-Process { [CmdletBinding()] param([string]$Name) if($global:naFixtureRunning){[PSCustomObject]@{Name=$Name}} }
 function Get-AuthenticodeSignature { param($LiteralPath) [PSCustomObject]@{Status='Valid';SignerCertificate=[PSCustomObject]@{Subject='NVIDIA Corporation'}} }
 $payload=@()
 foreach($n in @('NAProfile.exe','NeuralAliasDXGI.dll','nvngx_dlssnr.dll')) {
@@ -43,7 +44,14 @@ try { & $script @args -Action Validate } catch { $refusedLog=$true; Check ($_.Ex
 Check $refusedLog 'transcript accepted as payload'
 Check ((Get-Content (Join-Path $state 'deployment.json') -Raw | ConvertFrom-Json).state -eq 'installed') 'preflight changed installation state'
 $validManifest | Set-Content $packagePath
+$global:naFixtureRunning=$true
 & $script @args -Action Validate
+foreach($action in @('Install','Rollback')){
+ $blocked=$false
+ try { & $script @args -Action $action } catch { $blocked=$_.Exception.Message -like 'Close *' }
+ Check $blocked 'mutating action accepted while fixture process running'
+}
+$global:naFixtureRunning=$false
 foreach($e in $m.files) { Check ((Get-FileHash $e.destination).Hash -eq $e.after_hash) 'installed hash mismatch' }
 # Additive only: every file the game shipped is byte-identical while installed.
 foreach($p in $before.Keys) { Check ((Get-FileHash $p).Hash -eq $before[$p]) 'install changed a game file' }

@@ -78,7 +78,7 @@ if ($Action -eq 'Status') {
     $m.files | ForEach-Object { [PSCustomObject]@{File=$_.destination; MatchesInstalled=((Hash $_.destination) -eq $_.after_hash)} }
     return
 }
-Assert-Closed
+if ($Action -ne 'Validate') { Assert-Closed } # package validation is read-only
 if ($Action -eq 'Rollback') {
     if (-not (Test-Path -LiteralPath $manifestPath)) { throw 'No deployment manifest exists.' }
     Restore (Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json)
