@@ -11,6 +11,11 @@ inline bool CanTransitionOn(D3D12_COMMAND_LIST_TYPE type,D3D12_RESOURCE_STATES s
 bool InstallEnhancedInvalidation();
 void Observe(ID3D12GraphicsCommandList*,UINT,const D3D12_RESOURCE_BARRIER*);
 void Reset(ID3D12GraphicsCommandList*);
+// Late overlay attachment: watch only actual GetBuffer resources; learn their
+// owning direct queue from submitted write -> PRESENT transitions. No waits,
+// resource retention, process-wide last-queue guess or raw address cache.
+ID3D12CommandQueue* WatchPresentBuffer(ID3D12Resource*); // caller owns returned reference
+void Submitted(ID3D12CommandQueue*,UINT,ID3D12CommandList* const*);
 bool Read(ID3D12GraphicsCommandList*,ID3D12Resource*,D3D12_RESOURCE_STATES&);
 enum class Evidence : unsigned { Known, NoTransition, SplitPending, EnhancedInvalidated, AliasingInvalidated, UncoveredList, NgxReadContract };
 Evidence Inspect(ID3D12GraphicsCommandList*,ID3D12Resource*,D3D12_RESOURCE_STATES&);

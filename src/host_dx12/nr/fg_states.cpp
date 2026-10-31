@@ -12,7 +12,9 @@ template<unsigned I> void STDMETHODCALLTYPE Enhanced(ID3D12GraphicsCommandList7*
     InvalidateEnhanced(list);
     reinterpret_cast<void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList7*,UINT,const D3D12_BARRIER_GROUP*)>(barrier_original[I])(list,count,groups);
 }
-struct Entry { ID3D12Resource* resource; D3D12_RESOURCE_STATES state; bool known; };
+const GUID watch_key={0x681d2521,0x2aaf,0x4457,{0x9a,0xd1,0x72,0x53,0x91,0x55,0x23,0x91}};
+const GUID queue_key={0x681d2522,0x2aaf,0x4457,{0x9a,0xd1,0x72,0x53,0x91,0x55,0x23,0x91}};
+struct Entry { ID3D12Resource* resource; D3D12_RESOURCE_STATES state; bool known; bool written=false; };
 // Command-list recording is externally single-threaded by the D3D12 contract.
 // Private data follows Reset/destruction; no resources or global locks retained.
 struct State final:IUnknown {
@@ -50,6 +52,8 @@ void Observe(ID3D12GraphicsCommandList* list,UINT count,const D3D12_RESOURCE_BAR
            (b.Transition.Subresource!=0 && b.Transition.Subresource!=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES))continue;
         Entry* e=nullptr;for(auto& v:s->entries)if(v.resource==b.Transition.pResource){e=&v;break;}
         if(!e){if(s->entries.size()==512)s->entries.erase(s->entries.begin());s->entries.push_back({b.Transition.pResource,{},{}});e=&s->entries.back();}
+        constexpr unsigned write=D3D12_RESOURCE_STATE_RENDER_TARGET|D3D12_RESOURCE_STATE_COPY_DEST;
+        e->written |= ((b.Transition.StateBefore|b.Transition.StateAfter)&write)!=0;
         e->state=b.Transition.StateAfter;e->known=b.Flags!=D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY;
     }s->Release();
 }
@@ -66,6 +70,28 @@ Evidence Inspect(ID3D12GraphicsCommandList* list,ID3D12Resource* r,D3D12_RESOURC
     auto* s=Get(list,false);if(!s)return Evidence::NoTransition;auto result=s->absent;
     for(const auto& v:s->entries)if(v.resource==r){result=v.known?Evidence::Known:Evidence::SplitPending;if(v.known)state=v.state;break;}
     s->Release();return result;
+}
+ID3D12CommandQueue* WatchPresentBuffer(ID3D12Resource* resource) {
+    if(!resource)return nullptr;
+    const UINT watched=1;resource->SetPrivateData(watch_key,sizeof(watched),&watched);
+    IUnknown* object=nullptr;UINT size=sizeof(object);
+    if(FAILED(resource->GetPrivateData(queue_key,&size,&object)) || !object)return nullptr;
+    ID3D12CommandQueue* queue=nullptr;object->QueryInterface(IID_PPV_ARGS(&queue));object->Release();return queue;
+}
+void Submitted(ID3D12CommandQueue* queue,UINT count,ID3D12CommandList* const* lists) {
+    if(!queue || !lists || queue->GetDesc().Type!=D3D12_COMMAND_LIST_TYPE_DIRECT)return;
+    for(UINT i=0;i<count;++i){
+        ID3D12GraphicsCommandList* list=nullptr;
+        if(!lists[i] || FAILED(lists[i]->QueryInterface(IID_PPV_ARGS(&list))))continue;
+        auto* s=Get(list,false);list->Release();if(!s)continue;
+        for(const auto& entry:s->entries){
+            if(!entry.resource || !entry.known || !entry.written || entry.state!=D3D12_RESOURCE_STATE_PRESENT)continue;
+            UINT watched=0,size=sizeof(watched);
+            if(SUCCEEDED(entry.resource->GetPrivateData(watch_key,&size,&watched)) && watched)
+                entry.resource->SetPrivateDataInterface(queue_key,queue);
+        }
+        s->Release();
+    }
 }
 bool Read(ID3D12GraphicsCommandList* list,ID3D12Resource* r,D3D12_RESOURCE_STATES& state){return Inspect(list,r,state)==Evidence::Known;}
 const char* Name(Evidence e){switch(e){

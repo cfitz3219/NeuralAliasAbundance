@@ -5,6 +5,9 @@ New-Item -ItemType Directory -Force -Path $pkg,$game,$user | Out-Null
 $script=Join-Path $PSScriptRoot '..\deploy-pbz.ps1'
 function Check($condition,$why) { if (-not $condition) { throw $why } }
 # Fixture binaries are text; no NVIDIA DLL, driver setting or game is touched.
+# Process discovery is also fixture-local; a real game running elsewhere must
+# not prevent install/rollback tests against these temporary text files.
+function Get-Process { [CmdletBinding()] param([string]$Name) return $null }
 function Get-AuthenticodeSignature { param($LiteralPath) [PSCustomObject]@{Status='Valid';SignerCertificate=[PSCustomObject]@{Subject='NVIDIA Corporation'}} }
 $payload=@()
 foreach($n in @('NAProfile.exe','NeuralAliasDXGI.dll','nvngx_dlssnr.dll')) {

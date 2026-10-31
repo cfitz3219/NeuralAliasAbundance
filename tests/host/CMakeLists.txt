@@ -240,3 +240,7 @@ na_host_test(unreal_apply_test SOURCES unreal_apply_test.cpp
 target_compile_definitions(unreal_apply_test PRIVATE NA_UNREAL_APPLY_TEST=1)
 
 na_host_test(unreal_locator_test SOURCES unreal_locator_test.cpp LIBS host_dx12)
+
+add_test(NAME host_overlay_late_queue_test COMMAND overlay_test --warp --late-queue)
+add_test(NAME host_overlay_late_queue_hardware_test COMMAND overlay_test --hardware --late-queue)
+set_tests_properties(host_overlay_late_queue_test host_overlay_late_queue_hardware_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "host;gpu")

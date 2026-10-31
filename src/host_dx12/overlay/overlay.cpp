@@ -155,7 +155,7 @@ struct SwapQueue { void* sc = nullptr; PresentQueues queues; int color_space=DXG
 std::mutex g_swap_queue_m;
 SwapQueue g_swap_queues[8];
 uint32_t g_swap_queue_next = 0;
-std::atomic<uint32_t> g_swap_queue_hits{0}, g_swap_queue_misses{0}, g_swap_queues_recorded{0}, g_swap_queue_device{0};
+std::atomic<uint32_t> g_swap_queue_hits{0}, g_swap_queue_misses{0}, g_swap_queues_recorded{0}, g_swap_queue_observed{0};
 std::atomic<uintptr_t> g_last_present_queue{0};
 
 void note_swapchain_queue(IUnknown* device_or_queue, void* swapchain)
@@ -1099,14 +1099,14 @@ void write_menu_progress(HANDLE log)
     std::unique_lock<std::mutex> lock(g_state.mutex, std::try_to_lock);
     if (!lock.owns_lock() || !g_state.device) return;
     char line[400];
-    int n = snprintf(line, sizeof(line), "menu_gpu draws=%llu submitted=%llu completed=%llu device_hr=0x%08lX observed_queue=0x%llX present_queue=0x%llX swapchain_queues=%u hits=%u device_queue=%u misses=%u\r\n",
+    int n = snprintf(line, sizeof(line), "menu_gpu draws=%llu submitted=%llu completed=%llu device_hr=0x%08lX observed_queue=0x%llX present_queue=0x%llX swapchain_queues=%u hits=%u buffer_queue=%u misses=%u\r\n",
                      static_cast<unsigned long long>(g_frames.load()),
                      static_cast<unsigned long long>(g_menu_draw_marker.load()),
                      static_cast<unsigned long long>(menu_completed_prefix()),
                      static_cast<unsigned long>(g_state.device->GetDeviceRemovedReason()),
                      static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(g_direct_queue.load())),
                      static_cast<unsigned long long>(g_last_present_queue.load()), g_swap_queues_recorded.load(),
-                     g_swap_queue_hits.load(), g_swap_queue_device.load(), g_swap_queue_misses.load());
+                     g_swap_queue_hits.load(), g_swap_queue_observed.load(), g_swap_queue_misses.load());
     if (n >= static_cast<int>(sizeof(line))) n = static_cast<int>(sizeof(line)) - 1; // never write past a truncated line
     DWORD written = 0;
     if (n > 0) WriteFile(log, line, static_cast<DWORD>(n), &written, nullptr);
@@ -2107,28 +2107,31 @@ bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue,ComPtr<ID3D1
     if (g_stopping.load(std::memory_order_acquire)) return false;
     if (sc == g_state.dummy_swapchain_identity) return false;
     g_presents.fetch_add(1, std::memory_order_relaxed);
-    // The presenting queue when we saw the swap chain created; otherwise (created
-    // before our hooks) the last direct queue, as before.
+    // Use the recorded per-buffer queue or recover it from submitted writes.
     retained_queue = swapchain_queue(sc);
     // Boundary frames: the game-facing proxy is not a key in g_swap_queues;
     // sl_boundary supplies the proxy's exact creation/ResizeBuffers1 queue.
     if (!retained_queue && queue_hint) retained_queue = queue_hint;
     if (retained_queue) g_swap_queue_hits.fetch_add(1, std::memory_order_relaxed);
-    else if (SUCCEEDED(sc->GetDevice(IID_PPV_ARGS(&retained_queue))) && retained_queue) {
-        // Creation was not observed (Ghost of Tsushima, 80dfbcb: hits=0
-        // misses=2951, then the device was removed with ACCESS_DENIED within
-        // seconds of the first menu draw). A D3D12 chain reports the queue it
-        // was created on through GetDevice: draw on THAT queue, never on "the
-        // last direct queue that submitted", which in a multi-queue game is
-        // unsynchronised with the presenting queue.
-        g_swap_queue_device.fetch_add(1, std::memory_order_relaxed);
+    else {
+        // GetDevice returns the device, not a supported queue-recovery API.
+        // Native FG can present on a different queue than the game's last
+        // Execute. Writing its real backbuffer on that last queue removes the
+        // device with ACCESS_DENIED. Recover per BUFFER from actual submissions.
+        DXGI_SWAP_CHAIN_DESC desc{};
+        const UINT current=real_index(sc);
+        if(SUCCEEDED(sc->GetDesc(&desc)))for(UINT i=0;i<desc.BufferCount;++i){
+            ComPtr<ID3D12Resource> buffer;
+            if(FAILED(real_get_buffer(sc,i,IID_PPV_ARGS(&buffer))))continue;
+            ComPtr<ID3D12CommandQueue> observed;
+            observed.Attach(na::nr::states::WatchPresentBuffer(buffer.Get()));
+            if(i==current)retained_queue=observed;
+        }
+        if(retained_queue)g_swap_queue_observed.fetch_add(1,std::memory_order_relaxed);
+        else g_swap_queue_misses.fetch_add(1,std::memory_order_relaxed);
     }
-    queue = retained_queue.Get();
-    if (!queue) {
-        g_swap_queue_misses.fetch_add(1, std::memory_order_relaxed);
-        queue = g_direct_queue.load(std::memory_order_acquire);
-    }
-    if (!queue) return false;
+    queue=retained_queue.Get();
+    if (!queue) return false; // next submitted frame supplies evidence; never guess
     g_last_present_queue.store(reinterpret_cast<uintptr_t>(queue), std::memory_order_relaxed);
     if (g_state.swapchain && g_state.swapchain != sc) {
         // A31 robustness: a game that recreates its swap chain (HDR toggle,
@@ -2369,6 +2372,7 @@ void on_chain_gone(IDXGISwapChain* sc)
 {
     g_chain_gone.fetch_add(1, std::memory_order_relaxed);
     na::present::ForgetChain(sc);
+    {std::lock_guard<std::mutex> lock(g_swap_queue_m);for(auto& binding:g_swap_queues)if(binding.sc==sc)binding={};}
     std::lock_guard<std::mutex> lock(g_state.mutex);
     if (g_state.swapchain != sc) return;
     release_buffers_locked();
@@ -2439,9 +2443,12 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT count, 
         UINT actual=count;
         if(!actual){DXGI_SWAP_CHAIN_DESC1 desc{};if(SUCCEEDED(sc->GetDesc1(&desc)))actual=desc.BufferCount;}
         std::lock_guard<std::mutex> lock(g_swap_queue_m);
-        for(auto& binding:g_swap_queues)if(binding.sc==sc && binding.queues.Resized(result,actual,queues)){
-            g_swap_queues_recorded.fetch_add(1);break;
-        }
+        SwapQueue* slot=nullptr;
+        for(auto& binding:g_swap_queues)if(binding.sc==sc){slot=&binding;break;}
+        // A late attachment may first learn the queue from ResizeBuffers1.
+        if(!slot){slot=&g_swap_queues[g_swap_queue_next++%8];*slot={};slot->sc=sc;}
+        if(slot->queues.Resized(result,actual,queues))g_swap_queues_recorded.fetch_add(1);
+        else slot->queues={}; // never retain stale per-buffer ownership
     }
     return result;
 }
@@ -2538,6 +2545,7 @@ void STDMETHODCALLTYPE DetourExecute(ID3D12CommandQueue* q, UINT n,
         na::gputime::OnExecuted(q, n, lists); // R-202: completion fence on the queue that ran the lists
         na::dlss::OnExecuted(q, n, lists);    // C6: completion evidence before retired DLSS features are released
     }
+    na::nr::states::Submitted(q,n,lists);
     if (obs_token.queue_state) na::observe::ExecuteEnd(obs_token, q, n, lists);
     g_exec_active.fetch_sub(1, std::memory_order_acq_rel);
 }
@@ -2619,8 +2627,6 @@ void boundary_present(IDXGISwapChain* game_facing, IDXGISwapChain* base, ID3D12C
     if (!draw) return;
     if (!g_boundary_frames.exchange(true, std::memory_order_acq_rel)) note_boundary_engaged(game_facing, base);
     ComPtr<ID3D12CommandQueue> hint(queue);
-    // A D3D12 chain reports the queue it presents on through GetDevice.
-    if (!hint) game_facing->GetDevice(IID_PPV_ARGS(&hint));
     on_present(game_facing, hint.Get());
 }
 void boundary_before_resize(IDXGISwapChain* game_facing)
@@ -2751,8 +2757,8 @@ bool Start(const char* route_tag, PanelFn controls)
             }
             if (ok) {
                 // Swap-chain creation on the shared factory vtable (after our own dummy
-                // chain exists, so it is never recorded). Optional: without it the menu
-                // falls back to the last direct queue.
+                // chain exists, so it is never recorded). Late attachments recover
+                // per-buffer queues from submitted writes instead.
                 na::hooking::HookVTableSlot(factory.Get(), kFactoryCreateSwapChainSlot,
                                             reinterpret_cast<void*>(&DetourCreateSwapChain),
                                             reinterpret_cast<void**>(&g_orig_create_swapchain));

@@ -14,6 +14,7 @@
 #include "host_dx12/overlay/present_queues.hpp"
 #include "host_dx12/overlay/route_a_panel.hpp"
 #include "host_dx12/settings.hpp"
+#include "host_dx12/nr/fg_states.hpp"
 #include <filesystem>
 
 #include <atomic>
@@ -57,6 +58,7 @@ void Pump() { MSG msg; while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { Tr
 int main(int argc, char** argv)
 {
     const bool hardware = argc > 1 && !strcmp(argv[1], "--hardware");
+    const bool late_queue = argc > 2 && !strcmp(argv[2], "--late-queue");
     SetEnvironmentVariableW(L"NEURALALIAS_TEST_WARP", hardware ? nullptr : L"1");
     wchar_t temp[MAX_PATH]{}, ini[MAX_PATH]{}, scope[64]{};
     GetTempPathW(MAX_PATH, temp);
@@ -85,7 +87,7 @@ int main(int argc, char** argv)
 
     REQUIRE(na::hooking::Initialize());
     na::overlay::RegisterRouteAMenu();
-    REQUIRE(na::overlay::Start("TEST", nullptr));
+    if(!late_queue) REQUIRE(na::overlay::Start("TEST", nullptr));
 
     WNDCLASSW wc{}; wc.lpfnWndProc = GameWndProc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"NeuralAliasOverlayTestGame";
     RegisterClassW(&wc);
@@ -101,6 +103,15 @@ int main(int argc, char** argv)
     test::ComPtr<IDXGISwapChain3> sc;
     REQUIRE(SUCCEEDED(sc1.As(&sc)));
 
+    if(late_queue) REQUIRE(na::overlay::Start("TEST", nullptr));
+    test::ComPtr<ID3D12CommandQueue> unrelated;
+    test::List unrelated_list;
+    if(late_queue){
+        D3D12_COMMAND_QUEUE_DESC q{};
+        REQUIRE(SUCCEEDED(d.device->CreateCommandQueue(&q,IID_PPV_ARGS(&unrelated))));
+        REQUIRE(unrelated_list.Create(d.device.Get())); REQUIRE(SUCCEEDED(unrelated_list.list->Close()));
+    }
+
     // This production queue-lookup call previously passed the wrapper directly
     // to the native GetCurrentBackBufferIndex trampoline and crashed at startup.
     ChainWrapper wrapped(sc.Get());
@@ -113,6 +124,27 @@ int main(int argc, char** argv)
         CHECK(SUCCEEDED(na::overlay::ReadNativeBufferForTests(wrapped.chain(),index,IID_PPV_ARGS(&wrappedBuffer))));
         CHECK(SUCCEEDED(sc->GetBuffer(index,IID_PPV_ARGS(&plainBuffer))));
         CHECK(wrappedBuffer.Get()==plainBuffer.Get() && wrapped.buffers==1 && wrapped.refs==1);
+    }
+
+    // Discarded, split, and read-only recordings cannot establish a writer.
+    {
+        auto watched=test::CreateTexture(d.device.Get(),16,16,DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        REQUIRE(watched);test::List pending;REQUIRE(pending.Create(d.device.Get()));
+        auto get=[&](){test::ComPtr<ID3D12CommandQueue> q;q.Attach(na::nr::states::WatchPresentBuffer(watched.Get()));return q;};
+        CHECK(!get());ID3D12CommandList* lists[]={pending.list.Get()};
+        auto barrier=test::Transition(watched.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_PRESENT);
+        na::nr::states::Observe(pending.list.Get(),1,&barrier);CHECK(!get());
+        na::nr::states::Reset(pending.list.Get());
+        na::nr::states::Submitted(d.queue.Get(),1,lists);CHECK(!get());
+        barrier.Flags=D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY;
+        na::nr::states::Observe(pending.list.Get(),1,&barrier);
+        na::nr::states::Submitted(d.queue.Get(),1,lists);CHECK(!get());
+        na::nr::states::Reset(pending.list.Get());barrier.Flags=D3D12_RESOURCE_BARRIER_FLAG_NONE;
+        barrier.Transition.StateBefore=D3D12_RESOURCE_STATE_COPY_SOURCE;
+        na::nr::states::Observe(pending.list.Get(),1,&barrier);
+        na::nr::states::Submitted(d.queue.Get(),1,lists);CHECK(!get());
+        // Only diagnostic observations above: never submit invalid artificial barriers.
     }
 
     // One "game frame": clear the back buffer on the game's DIRECT queue, present.
@@ -128,6 +160,7 @@ int main(int argc, char** argv)
         l.list->Close();
         ID3D12CommandList* lists[] = {l.list.Get()};
         d.queue->ExecuteCommandLists(1, lists);
+        if(late_queue){ID3D12CommandList* other[]={unrelated_list.list.Get()};unrelated->ExecuteCommandLists(1,other);}
         const HRESULT hr = sc->Present(0, 0);
         d.WaitIdle();
         Pump();
@@ -150,6 +183,12 @@ int main(int argc, char** argv)
     s = na::overlay::GetStats();
     CHECK(s.open == 1);
     CHECK(s.frames_rendered > closed_rendered);
+
+    if(late_queue){
+        CHECK(d.device->GetDeviceRemovedReason()==S_OK);
+        CHECK(na::overlay::GetStats().present_queue==reinterpret_cast<uintptr_t>(d.queue.Get()));
+        if(FAILED(d.device->GetDeviceRemovedReason()))return test::finish("overlay_late_queue_repro");
+    }
 
     // A two-image swapchain must not restrict ImGui to two in-flight draws.
     // Exercise the normal draw routine without DXGI Present's own throttling.
