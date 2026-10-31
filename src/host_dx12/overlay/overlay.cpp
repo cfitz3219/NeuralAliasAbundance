@@ -114,16 +114,26 @@ using QueueSyncFn=HRESULT(STDMETHODCALLTYPE*)(ID3D12CommandQueue*,ID3D12Fence*,U
 QueueSyncFn g_trace_signal=nullptr,g_trace_wait=nullptr;
 SetColorSpaceFn g_orig_set_color_space = nullptr;
 
-// Our own reads of the game's chain must bypass the presenter's proxies.
+// Internal reads bypass only OUR virtual backbuffer substitution. They must
+// still dispatch through the actual COM object's vtable: a Streamline wrapper
+// is not a native DXGI object and cannot be passed to the dummy-chain trampoline.
+thread_local unsigned t_native_buffer_read=0;
+struct NativeBufferRead {
+    NativeBufferRead(){++t_native_buffer_read;}
+    ~NativeBufferRead(){--t_native_buffer_read;}
+};
 HRESULT real_get_buffer(IDXGISwapChain* sc, UINT i, REFIID riid, void** out)
 {
-    return g_orig_get_buffer ? g_orig_get_buffer(sc, i, riid, out) : sc->GetBuffer(i, riid, out);
+    NativeBufferRead scope;
+    return sc->GetBuffer(i, riid, out);
 }
 UINT real_index(IDXGISwapChain* sc)
 {
+    if(!sc)return 0xFFFFFFFFu;
     ComPtr<IDXGISwapChain3> sc3;
-    if (FAILED(sc->QueryInterface(IID_PPV_ARGS(&sc3)))) return 0xFFFFFFFFu;
-    return g_orig_get_index ? g_orig_get_index(sc3.Get()) : sc3->GetCurrentBackBufferIndex();
+    if (FAILED(sc->QueryInterface(IID_PPV_ARGS(&sc3))) || !sc3) return 0xFFFFFFFFu;
+    NativeBufferRead scope;
+    return sc3->GetCurrentBackBufferIndex();
 }
 std::atomic<int> g_color_space{DXGI_COLOR_SPACE_CUSTOM}; // last SetColorSpace1 on the game's chain
 XInputGetStateFn g_orig_xinput[3] = {};
@@ -2270,13 +2280,13 @@ HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT fl
 HRESULT STDMETHODCALLTYPE DetourGetBuffer(IDXGISwapChain* sc, UINT index, REFIID riid, void** out)
 {
     HRESULT hr = S_OK;
-    if (sc != g_state.dummy_swapchain_identity && na::present::HandleGetBuffer(sc, index, riid, out, &hr)) return hr;
+    if (!t_native_buffer_read && sc != g_state.dummy_swapchain_identity && na::present::HandleGetBuffer(sc, index, riid, out, &hr)) return hr;
     return g_orig_get_buffer(sc, index, riid, out);
 }
 UINT STDMETHODCALLTYPE DetourGetCurrentBackBufferIndex(IDXGISwapChain3* sc)
 {
     UINT idx = 0;
-    if (na::present::HandleGetIndex(sc, &idx)) return idx;
+    if (!t_native_buffer_read && na::present::HandleGetIndex(sc, &idx)) return idx;
     return g_orig_get_index(sc);
 }
 // A62: a game that paces itself with the frame-latency waitable object would
@@ -2838,6 +2848,7 @@ void DrawMenuForTests(ID3D12CommandQueue* queue,ID3D12Resource* frame) {
 }
 
 int SwapChainColorSpace() { return g_color_space.load(std::memory_order_acquire); }
+long ReadNativeBufferForTests(IDXGISwapChain* chain, unsigned index, REFIID iid, void** out){return real_get_buffer(chain,index,iid,out);}
 ID3D12CommandQueue* AcquirePresentQueue(IDXGISwapChain* chain){return swapchain_queue(chain).Detach();}
 int SwapChainColorSpace(IDXGISwapChain* chain){
     std::lock_guard<std::mutex> lock(g_swap_queue_m);

@@ -18,7 +18,32 @@
 
 #include <atomic>
 
+namespace na::overlay { long ReadNativeBufferForTests(IDXGISwapChain*,unsigned,REFIID,void**); }
+
 namespace {
+// Different COM layout, like a Streamline game-facing wrapper. Calling a
+// native DXGI trampoline with this pointer is invalid even though QI succeeds.
+struct ChainWrapper {
+    void** vtable;
+    unsigned refs=1,indices=0,buffers=0;
+    IDXGISwapChain3* inner=nullptr;
+    unsigned char padding[512]{};
+    void* methods[40]{};
+    static HRESULT STDMETHODCALLTYPE Query(ChainWrapper* self,REFIID iid,void** out){
+        if(!out)return E_POINTER;*out=nullptr;
+        if(iid!=__uuidof(IUnknown)&&iid!=__uuidof(IDXGISwapChain)&&iid!=__uuidof(IDXGISwapChain3))return E_NOINTERFACE;
+        *out=self;++self->refs;return S_OK;
+    }
+    static ULONG STDMETHODCALLTYPE Add(ChainWrapper* self){return ++self->refs;}
+    static ULONG STDMETHODCALLTYPE Release(ChainWrapper* self){return --self->refs;}
+    static UINT STDMETHODCALLTYPE Index(ChainWrapper* self){++self->indices;return self->inner->GetCurrentBackBufferIndex();}
+    static HRESULT STDMETHODCALLTYPE Buffer(ChainWrapper* self,UINT index,REFIID iid,void** out){++self->buffers;return self->inner->GetBuffer(index,iid,out);}
+    explicit ChainWrapper(IDXGISwapChain3* chain):vtable(methods),inner(chain){
+        methods[0]=reinterpret_cast<void*>(&Query);methods[1]=reinterpret_cast<void*>(&Add);methods[2]=reinterpret_cast<void*>(&Release);
+        methods[9]=reinterpret_cast<void*>(&Buffer);methods[36]=reinterpret_cast<void*>(&Index);
+    }
+    IDXGISwapChain* chain(){return reinterpret_cast<IDXGISwapChain*>(this);}
+};
 std::atomic<uint32_t> g_game_mouse{0}, g_game_keys{0};
 LRESULT CALLBACK GameWndProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
@@ -75,6 +100,20 @@ int main(int argc, char** argv)
     REQUIRE(SUCCEEDED(d.factory->CreateSwapChainForHwnd(d.queue.Get(), hwnd, &sd, nullptr, nullptr, &sc1)));
     test::ComPtr<IDXGISwapChain3> sc;
     REQUIRE(SUCCEEDED(sc1.As(&sc)));
+
+    // This production queue-lookup call previously passed the wrapper directly
+    // to the native GetCurrentBackBufferIndex trampoline and crashed at startup.
+    ChainWrapper wrapped(sc.Get());
+    auto* absent=na::overlay::AcquirePresentQueue(wrapped.chain());
+    CHECK(absent==nullptr);if(absent)absent->Release();
+    CHECK(wrapped.indices==1 && wrapped.refs==1);
+    {
+        test::ComPtr<ID3D12Resource> wrappedBuffer,plainBuffer;
+        const auto index=sc->GetCurrentBackBufferIndex();
+        CHECK(SUCCEEDED(na::overlay::ReadNativeBufferForTests(wrapped.chain(),index,IID_PPV_ARGS(&wrappedBuffer))));
+        CHECK(SUCCEEDED(sc->GetBuffer(index,IID_PPV_ARGS(&plainBuffer))));
+        CHECK(wrappedBuffer.Get()==plainBuffer.Get() && wrapped.buffers==1 && wrapped.refs==1);
+    }
 
     // One "game frame": clear the back buffer on the game's DIRECT queue, present.
     test::List l; REQUIRE(l.Create(d.device.Get())); l.list->Close();
