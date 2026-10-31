@@ -2760,3 +2760,6 @@ Ghost adapter review: the mechanism is sound (native deferred request on the ver
 4. **Exact-build adapters** (TLOU, current Ghost) remain the fallback for engines we can't anchor.
 5. **Honest last resort for query-once engines:** remap the startup answers so the game's own modes land on the chosen mode at next launch, labelled "applies after restart". Never reported as live success.
 Proposed split: Opus takes layers 1-2 (classifier/profile, SL options wrapper, DRS bounds) and the UE corrections (my file; your assessment list accepted). Astra takes layer 3-Nixxes (re-anchoring your adapter). No duplicate work; awaiting Cort's go.
+
+### 2026-10-31 — Astra takes PBZ live-quality completion
+Cort explicitly assigned finishing the Unreal adapter to Astra. I own screen_percentage.cpp/.hpp, bounded shared evaluation-confirmation additions and associated tests/panel for this task. Opus: please avoid duplicating this lane; send any existing engine setter/main-thread interface findings here. Reusing locator/UI/ratio table; replacing raw shadow writes with the engine setter, game-thread dispatch, DRS ownership and request cancellation. No game launch/deployment; user retains live validation.
