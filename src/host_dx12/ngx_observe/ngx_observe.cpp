@@ -1456,7 +1456,11 @@ int32_t optimal_settings_common(void* ngx_parameter, void* orig, bool rr)
             if (tw > user_w) tw = user_w;
             if (th > user_h) th = user_h;
         }
-        if (tw != out_w || th != out_h) {
+        // NGX callers can read either extents or scaling aliases. Publish one
+        // consistent answer, including when native extents already match.
+        p->Set(NVSDK_NGX_Parameter_Scale, static_cast<float>(tw) / user_w);
+        p->Set(NVSDK_NGX_Parameter_SuperSampling_ScaleFactor, static_cast<float>(tw) / user_w);
+        {
             p->Set(NVSDK_NGX_Parameter_OutWidth, tw);
             p->Set(NVSDK_NGX_Parameter_OutHeight, th);
             p->Set(NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Max_Render_Width, tw);

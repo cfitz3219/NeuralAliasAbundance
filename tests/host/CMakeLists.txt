@@ -228,3 +228,7 @@ na_host_test(module_watch_test SOURCES module_watch_test.cpp LIBS host_upscalers
              ARGS "$<TARGET_FILE:sl_interposer_real>" "$<TARGET_FILE:ffx_stub>")
 add_dependencies(module_watch_test sl_interposer_real ffx_stub)
 set_tests_properties(host_module_watch_test PROPERTIES TIMEOUT 60)
+
+na_host_test(tsushima_apply_test SOURCES tsushima_apply_test.cpp
+  ${PROJECT_SOURCE_DIR}/src/host_dx12/adapters/tsushima/apply.cpp LIBS host_dx12)
+target_compile_definitions(tsushima_apply_test PRIVATE NA_TSUSHIMA_APPLY_TEST=1)

@@ -7,6 +7,7 @@
 //     -> 2000x840; dynamic min/max follow the answer;
 //   - a failing original callback's result passes through, nothing rewritten.
 #include "test_support.hpp"
+#include <cmath>
 #include "fake_ngx_params.hpp"
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 #include "host_dx12/settings.hpp"
@@ -48,6 +49,10 @@ int main()
         Ask(p);
         CHECK(na::ngx::OptimalSettingsCallback(&p) == NVSDK_NGX_Result_Success);
         CHECK(p.U(NVSDK_NGX_Parameter_OutWidth) == c.w && p.U(NVSDK_NGX_Parameter_OutHeight) == c.h);
+        float scale=0, alias=0;
+        CHECK(p.Get(NVSDK_NGX_Parameter_Scale,&scale)==NVSDK_NGX_Result_Success);
+        CHECK(p.Get(NVSDK_NGX_Parameter_SuperSampling_ScaleFactor,&alias)==NVSDK_NGX_Result_Success);
+        CHECK(std::abs(scale-static_cast<float>(c.w)/3440.f)<0.000001f && scale==alias);
         CHECK(p.U(NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Max_Render_Width) == c.w);
         CHECK(p.U(NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Min_Render_Height) == c.h);
         const auto s = na::ngx::GetOptimalStats();
@@ -88,6 +93,7 @@ int main()
         CHECK(callback(&p) == NVSDK_NGX_Result_Success);
         CHECK(p.U(NVSDK_NGX_Parameter_OutWidth) == 2293u && p.U(NVSDK_NGX_Parameter_OutHeight) == 960u);
         CHECK(!p.Has(NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Max_Render_Width));
+        CHECK(!p.Has(NVSDK_NGX_Parameter_Scale));
         CHECK(na::ngx::GetOptimalStats().last_overridden == 0);
     }
     st.follow_game_resolution = 0;

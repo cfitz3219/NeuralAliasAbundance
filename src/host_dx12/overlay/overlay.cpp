@@ -3,6 +3,7 @@
 #include "host_dx12/nr/fg_states.hpp"
 #include "host_dx12/adapters/tlou1/timing.hpp"
 #include "host_dx12/adapters/tlou1/apply.hpp"
+#include "host_dx12/adapters/tsushima/apply.hpp"
 #include "host_dx12/overlay/overlay.hpp"
 #include "host_dx12/overlay/input_handover.hpp"
 #include "host_dx12/overlay/present_queues.hpp"
@@ -922,6 +923,17 @@ void write_status_line()
                            static_cast<unsigned long long>(a.triggers), static_cast<unsigned long long>(a.resource_releases),
                            static_cast<unsigned long long>(a.resource_release_failures), a.trigger_thread, a.reason);
         if (len > 0 && len < static_cast<int>(sizeof(row))) WriteFile(f, row, static_cast<DWORD>((std::min)(len, static_cast<int>(sizeof(row)-1))), &written, nullptr);
+    }
+    {
+        auto a=na::tsushima::GetApplyStatus();
+        if(a.available) {
+            char row[512];
+            int len=snprintf(row,sizeof(row),"ghost_apply request=%llu state=%u mode=%u size=%ux%u frames=%llu triggers=%llu thread=%u reason=\"%s\"\r\n",
+                static_cast<unsigned long long>(a.request_id),static_cast<unsigned>(a.stage),a.choice.mode,
+                a.choice.width,a.choice.height,static_cast<unsigned long long>(a.frame_calls),
+                static_cast<unsigned long long>(a.triggers),a.trigger_thread,a.reason);
+            if(len>0 && len<static_cast<int>(sizeof(row)))WriteFile(f,row,static_cast<DWORD>(len),&written,nullptr);
+        }
     }
     // A66 (R1): the size-confirmation monitor, one line whenever its state changes.
     static uint64_t last_confirm_id = 0;

@@ -1,6 +1,7 @@
 #include "host_dx12/fg/camera.hpp"
 #include "host_dx12/host_boot/session.hpp"
 #include "host_dx12/adapters/tlou1/apply.hpp"
+#include "host_dx12/adapters/tsushima/apply.hpp"
 #include "host_dx12/adapters/tlou1/timing.hpp"
 #include "host_dx12/sl_proxy/sl_abi.hpp"
 // Route A: sl.interposer.dll stand-in for Streamline titles.
@@ -111,6 +112,7 @@ DWORD WINAPI InitThread(LPVOID)
     // loads it (closes the Init/GetCapabilityParameters race, A17).
     na::ngx::PreloadAndHookNgxCore();
     na::tlou1::InitializeApply();
+    na::tsushima::InitializeApply();
     na::tlou1::InitializeTiming();
     if (!na::ngx::StartModuleWatch(sync_hook)) return 0;
     // Live Neural Rendering (A30) and Frame Generation (A59): hand the

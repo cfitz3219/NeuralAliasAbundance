@@ -1,4 +1,5 @@
 #include "host_dx12/adapters/tlou1/apply.hpp"
+#include "host_dx12/adapters/tsushima/apply.hpp"
 #include "host_dx12/adapters/unreal/screen_percentage.hpp"
 #include "host_dx12/sl_boundary/sl_boundary.hpp"
 // Route A menu content (A30 redesign): the Picture page (status, master
@@ -37,6 +38,11 @@
 
 namespace na::overlay {
 namespace {
+na::tlou1::ApplyStatus engine_apply_status() {
+    auto ghost=na::tsushima::GetApplyStatus();
+    return ghost.available ? ghost : na::tlou1::GetApplyStatus();
+}
+
 
 using na::settings::DlssMode;
 
@@ -154,7 +160,7 @@ void DrawPicture()
     na::ngx::OptimalStats opt = na::ngx::GetOptimalStats();
     char buf[200];
 
-    auto engine_apply = na::tlou1::GetApplyStatus();
+    auto engine_apply = engine_apply_status();
     bool engine_busy = engine_apply.stage == na::tlou1::Stage::Queued || engine_apply.stage == na::tlou1::Stage::Entered || engine_apply.stage == na::tlou1::Stage::Rebuilding;
     bool enabled = st.enabled.load() != 0;
     bool follow_game = st.follow_game_resolution.load() != 0;
@@ -168,7 +174,7 @@ void DrawPicture()
     // True when no optimal-settings query for the game's display size has been
     // seen. That is NOT proof the game ignores DLSS's answer: an engine may ask
     // with a reference size (PBZ: 1000x1000) at startup. Used for guidance only.
-    const bool game_sets_size = !na::tlou1::GetApplyStatus().available && valid_size(ngx.last_sr_out_w, ngx.last_sr_out_h) &&
+    const bool game_sets_size = !engine_apply_status().available && valid_size(ngx.last_sr_out_w, ngx.last_sr_out_h) &&
                                 !na::ngx::OptimalQueriedFor(ngx.last_sr_out_w, ngx.last_sr_out_h);
     // No longer locks the picture mode (Cort's 16:41 run: the game's only
     // queries were 1000x1000, possibly an engine reference size read at
@@ -176,7 +182,7 @@ void DrawPicture()
     // Unreal games: live render-resolution control through the engine's own
     // r.ScreenPercentage (the setting its DLSS menu changes).
     const na::unreal::SpStatus sp = na::unreal::GetScreenPercentageStatus();
-    const bool unreal_size = sp.available && !na::tlou1::GetApplyStatus().available;
+    const bool unreal_size = sp.available && !engine_apply_status().available;
     unsigned rw = 0, rh = 0;
     if (valid_size(out_w, out_h)) {
         if (unreal_size) {
@@ -262,6 +268,8 @@ void DrawPicture()
     ImGui::EndDisabled();
 
     // Mode cards.
+    if (na::tsushima::GetApplyStatus().available && !follow_game)
+        Hint("Apply uses Ghost's live graphics-settings update. Fixed picture modes turn dynamic resolution off.");
     SectionTitle("Picture mode");
     ImGui::BeginDisabled(!enabled || blocked || engine_busy || follow_game);
     float avail = ImGui::GetContentRegionAvail().x;
@@ -353,7 +361,7 @@ void DrawPicture()
         // nudged by one pixel and back, the engine re-creates its render targets and
         // asks DLSS for the size again, and the armed confirmation reports whether
         // the new size was actually rendered.
-        const bool engine_adapter = na::tlou1::GetApplyStatus().available;
+        const bool engine_adapter = engine_apply_status().available;
         ImGui::BeginDisabled(!enabled || blocked || !have_upscaler || engine_busy);
         BeginRow("Apply changes", follow_game ? "Update the preset while keeping the game's resolution." : "Update the picture mode and preset together.", ButtonWidth("Apply"));
         if (Button("Apply")) {
@@ -371,7 +379,9 @@ void DrawPicture()
                 g_apply_clicked = true;
             } else if (engine_adapter && !follow_game) {
                 engine_clicked = true;
-                admission_failed = !na::tlou1::RequestApply({static_cast<uint32_t>(mode), rw, rh, st.preset.load()});
+                admission_failed = !(na::tsushima::GetApplyStatus().available
+                    ? na::tsushima::RequestApply({static_cast<uint32_t>(mode), rw, rh, st.preset.load()})
+                    : na::tlou1::RequestApply({static_cast<uint32_t>(mode), rw, rh, st.preset.load()}));
             } else if (unreal_size && !follow_game && !size_matches) {
                 // The engine re-creates DLSS at the new size itself; our creation
                 // override adds the preset to that re-creation.
@@ -413,7 +423,7 @@ void DrawPicture()
             StatusLine(unreal_refused && now.state != na::unreal::SpState::Applying ? 2 : level, now.reason);
         }
         if (engine_clicked) {
-            auto progress = na::tlou1::GetApplyStatus();
+            auto progress = engine_apply_status();
             if (admission_failed)
                 StatusLine(2, progress.available ? "Another change is in progress, or the selection changed. Try Apply again." : progress.reason);
             else if (progress.choice.mode != st.dlss_mode.load() || progress.choice.preset != st.preset.load())
@@ -428,7 +438,7 @@ void DrawPicture()
         else if (g_apply_clicked && ngx.reapply_failures > g_apply_fail_at)
             StatusLine(2, "The preset could not be applied. The previous setup is still in use.");
         if (BeginDetails("Apply details")) {
-            auto progress = na::tlou1::GetApplyStatus();
+            auto progress = engine_apply_status();
             auto check = na::ngx::GetSizeConfirmation();
             if (progress.available) {
                 // A game with a hand-written engine adapter (TLOU).

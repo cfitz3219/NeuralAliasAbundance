@@ -176,6 +176,7 @@ add_library(host_dx12 STATIC
   src/host_dx12/latency/nvidia_latency.cpp
   src/host_dx12/latency/pcl_stats.cpp
   src/host_dx12/adapters/tlou1/apply.cpp
+  src/host_dx12/adapters/tsushima/apply.cpp
   src/host_dx12/adapters/unreal/cvar_probe.cpp
   src/host_dx12/sl_boundary/sl_boundary.cpp
   src/host_dx12/adapters/unreal/screen_percentage.cpp

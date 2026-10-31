@@ -1,5 +1,6 @@
 #include "host_dx12/nr/sl_consumer.hpp"
 #include "host_dx12/adapters/tlou1/apply.hpp"
+#include "host_dx12/adapters/tsushima/apply.hpp"
 #include "host_dx12/adapters/unreal/cvar_probe.hpp"
 #include "host_dx12/sl_boundary/sl_boundary.hpp"
 #include "host_dx12/adapters/unreal/screen_percentage.hpp"
@@ -136,6 +137,7 @@ DWORD WINAPI InitThread(LPVOID)
             na::unreal::StartScreenPercentage();
         na::ngx::PreloadAndHookNgxCore();
         na::tlou1::InitializeApply();
+    na::tsushima::InitializeApply();
         bool sync_hook = GetPrivateProfileIntW(L"observe", L"sync_loader_hook", 0, g_ini) == 1;
         route_a_started = na::ngx::StartModuleWatch(sync_hook);
         na::nr::Runtime rt;
