@@ -234,3 +234,6 @@ na_host_test(tsushima_apply_test SOURCES tsushima_apply_test.cpp
   ${PROJECT_SOURCE_DIR}/src/host_dx12/adapters/tsushima/apply.cpp LIBS host_dx12)
 target_compile_definitions(tsushima_apply_test PRIVATE NA_TSUSHIMA_APPLY_TEST=1)
 na_host_test(tsushima_locator_test SOURCES tsushima_locator_test.cpp LIBS minhook)
+na_host_test(unreal_apply_test SOURCES unreal_apply_test.cpp
+  ${PROJECT_SOURCE_DIR}/src/host_dx12/adapters/unreal/screen_percentage.cpp LIBS host_dx12)
+target_compile_definitions(unreal_apply_test PRIVATE NA_UNREAL_APPLY_TEST=1)

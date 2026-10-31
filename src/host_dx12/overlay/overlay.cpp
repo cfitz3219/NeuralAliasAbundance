@@ -1,3 +1,4 @@
+#include "host_dx12/adapters/mode_control.hpp"
 #include "host_dx12/nr/native_fg.hpp"
 #include "host_dx12/sl_boundary/sl_boundary.hpp"
 #include "host_dx12/nr/fg_states.hpp"
@@ -555,6 +556,9 @@ void write_status_line()
     if (f == INVALID_HANDLE_VALUE) return;
     DWORD written = 0;
     WriteFile(f, line, static_cast<DWORD>((std::min)(n, static_cast<int>(sizeof(line)-1))), &written, nullptr);
+    char mode_line[1536]{};
+    const int mode_bytes=na::mode::FormatStatus(mode_line,sizeof(mode_line));
+    if(mode_bytes>0){WriteFile(f,mode_line,DWORD((std::min)(mode_bytes,int(sizeof(mode_line)-1))),&written,nullptr);WriteFile(f,"\r\n",2,&written,nullptr);}
     char sl_boundary_line[1024];
     const int sl_boundary_bytes=na::slb::FormatStatus(sl_boundary_line,sizeof(sl_boundary_line));
     if(sl_boundary_bytes>0){

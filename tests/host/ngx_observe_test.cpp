@@ -322,6 +322,34 @@ int wmain(int argc, wchar_t** argv)
         }
     }
 #endif
+
+#if defined(NA_HAVE_NGX_SDK)
+    { // Production hooks: existing handle, changed subrect, unchanged allocation.
+        test::Device gpu;REQUIRE(test::CreateDevice(gpu));na::settings::Get().enabled=0;
+        REQUIRE(init(9,L"",gpu.device.Get(),0x15,nullptr)==1);
+        auto texture=test::CreateTexture(gpu.device.Get(),64,64,DXGI_FORMAT_R32G32B32A32_FLOAT,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_FLAG_NONE);
+        REQUIRE(texture);test::FakeParams p;
+        p.Set(NVSDK_NGX_Parameter_Width,64u);p.Set(NVSDK_NGX_Parameter_Height,64u);
+        p.Set(NVSDK_NGX_Parameter_OutWidth,64u);p.Set(NVSDK_NGX_Parameter_OutHeight,64u);
+        p.Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags,2u);
+        p.Set(NVSDK_NGX_Parameter_Jitter_Offset_X,0.f);p.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y,0.f);
+        p.Set(NVSDK_NGX_Parameter_MV_Scale_X,1.f);p.Set(NVSDK_NGX_Parameter_MV_Scale_Y,1.f);
+        for(const char* k:{NVSDK_NGX_Parameter_Color,NVSDK_NGX_Parameter_Depth,NVSDK_NGX_Parameter_MotionVectors,NVSDK_NGX_Parameter_Output})p.Set(k,texture.Get());
+        for(const char* k:{NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_X,NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_Y,
+            NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X,NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_Y,
+            NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_X,NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_Y,
+            NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_X,NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_Y})p.Set(k,0u);
+        for(uint32_t feature:{1u,13u}) {
+            void* h=nullptr;set_results(1,1);REQUIRE(create(nullptr,feature,&p,&h)==1);
+            const auto id=na::ngx::ArmLiveSizeConfirmation(32,32,64,64,2);na::ngx::MarkSizeConfirmationRestored(id);
+            p.Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,32u);p.Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height,32u);
+            REQUIRE(eval(nullptr,h,&p,nullptr)==1);REQUIRE(eval(nullptr,h,&p,nullptr)==1);
+            const auto c=na::ngx::GetSizeConfirmation();CHECK(c.state==3);CHECK(c.creations==0);CHECK(c.last_w==32&&c.last_h==32);
+            REQUIRE(release(h)==1);
+        }
+        REQUIRE(shutdown(gpu.device.Get())==1);
+    }
+#endif
     na::hooking::Shutdown();
     return test::finish("ngx_observe_test");
 }

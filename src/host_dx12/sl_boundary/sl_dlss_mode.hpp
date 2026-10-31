@@ -13,8 +13,8 @@
 //     pinned to that size (min = max = optimal): a game whose dynamic
 //     resolution re-reads the bounds every step converges on our size.
 //   - SetOptions: per-mode preset fields get our preset (any time a preset is
-//     requested). The MODE is rewritten only after the game has taken a size
-//     from a rewritten GetOptimalSettings call since the request: a DLSS
+//     requested). The MODE requires a matching optimal answer AND confirmed
+//     rendered SR/RR evaluations from the same request: a DLSS
 //     feature labelled for a smaller mode than the game actually renders
 //     would be wrong, so the label follows the size, never leads it.
 // Whether this changes the picture live depends on WHEN the game asks: the
@@ -29,6 +29,9 @@ constexpr uint32_t kSlOff = 0, kSlMaxPerformance = 1, kSlBalanced = 2, kSlMaxQua
                    kSlUltraQuality = 5, kSlDlaa = 6;
 
 struct ModeRequest {
+    uint32_t out_w = 0, out_h = 0; // scope to the requested main output, never startup reference probes
+    uint32_t render_w = 0, render_h = 0;
+    uint64_t confirmation = 0;
     bool own_mode = false;   // replace the game's requested mode
     uint32_t sl_mode = 0;    // sl::DLSSMode to request
     bool pin_bounds = true;  // min = max = optimal in the returned settings
@@ -49,7 +52,7 @@ struct ModeState {
     uint32_t optimal_w = 0, optimal_h = 0;                       // answer delivered to the game
     uint32_t min_w = 0, min_h = 0, max_w = 0, max_h = 0;         // bounds delivered to the game
     uint32_t set_game_mode = 0xFFFFFFFFu, set_sent_mode = 0xFFFFFFFFu; // last SetOptions
-    bool size_followed = false;              // the game took a rewritten size for its real output size this generation
+    bool size_followed = false;              // a valid answer was offered for this output; NOT proof it was used
     int32_t last_result = 0;
     char reason[160] = "";
 };

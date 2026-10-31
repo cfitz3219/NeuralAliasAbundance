@@ -1,29 +1,7 @@
 #pragma once
-// Unreal adapter phase 2: change the render resolution LIVE through the
-// engine's own r.ScreenPercentage, the setting the game's DLSS menu changes.
-//
-// Evidence (Cort's PBZ logs, 2026-10-29): the engine asks DLSS for its sizes
-// once at startup (six 1000x1000 queries), then changed its render size live
-// from its own menu (1146x480 -> 2295x961 -> 1996x836 -> 1720x720) with no new
-// queries. So the size comes from the engine's screen-percentage cvar each
-// frame; NGX answers cannot move it after startup.
-//
-// How: the static TAutoConsoleVariable<float> for r.ScreenPercentage is found
-// in the game executable (its UTF-16 name, the static initializer's
-// RIP-relative LEAs; layout [0] vtable, [8] IConsoleVariable*, [16]
-// TConsoleVariableData<float>* -> ShadowedValue[0] game thread, [1] render
-// thread). A candidate is accepted only if exactly one validates AND its
-// current value matches the render size the game is actually feeding DLSS.
-// A request writes both shadowed values (aligned 32-bit stores, as the cvar
-// system's own set does) and is reported Confirmed only when the game's next
-// DLSS feature, created after the write, is evaluated at the expected render
-// size for consecutive frames with coherent inputs (the shared NGX size
-// confirmation monitor). A successful write is not the success witness.
-// Limits, stated: the shadowed values are written directly rather than
-// through IConsoleVariable::Set (whose vtable slot is not stable across
-// engine versions); the cvar's set-by priority is left as the game had it, so
-// the game's own setter can still override us, and is detected as GameChanged. If the game itself changes the value afterwards (its menu),
-// the adapter reports that and does not fight it.
+// PBZ qualified engine setters, queued at its normal game-thread console sink.
+// No direct shadow stores. Success requires coherent SR/RR evaluations, with or
+// without feature recreation. Other UE builds require interface qualification.
 #include <cstdint>
 
 namespace na::unreal {
@@ -54,15 +32,15 @@ struct SpStatus {
 
 // Starts the locator thread (no writes). Safe to call more than once.
 void StartScreenPercentage();
-// Asynchronous: writes `percent` and watches the game's next DLSS creation for
+// Asynchronous: queues engine Set(percent), disables DRS and checks frames for
 // ceil(out * percent / 100). Returns false (state Refused) when unavailable or busy.
 bool RequestScreenPercentage(float percent, uint32_t out_w, uint32_t out_h);
 SpStatus GetScreenPercentageStatus();
 // Withdraws a running request (its confirmation too). The value stays as it is.
 void CancelScreenPercentage();
-// Gives the setting back to the game: restores the value it had before our
+// Queues game-thread restoration of the setting it had before our
 // first write, but only if our value is still in place (a change the game made
-// itself is kept). Returns true if something was restored.
+// itself is kept). Returns true if restoration was queued.
 bool HandBackScreenPercentage();
 
 // Expected Unreal render extent for an output extent and percentage (the

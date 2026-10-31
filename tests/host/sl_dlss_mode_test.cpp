@@ -12,6 +12,8 @@
 //   - an unknown struct version passes through untouched.
 // Also the Apply selector's ordering rule and Unreal's extent rounding.
 #include "test_support.hpp"
+#include <thread>
+#include <atomic>
 #include "host_dx12/sl_boundary/sl_boundary.hpp"
 #include "host_dx12/sl_boundary/sl_dlss_mode.hpp"
 #include "host_dx12/adapters/mode_control.hpp"
@@ -20,6 +22,7 @@
 namespace {
 
 volatile int g_sink = 0;
+std::atomic<bool> g_block{false},g_entered{false},g_leave{false};
 const void* g_seen_options = nullptr;
 uint8_t g_seen[96] = {};
 int g_optimal_calls = 0, g_set_calls = 0;
@@ -47,6 +50,8 @@ float ratio(uint32_t mode)
 
 extern "C" __declspec(noinline) int32_t fake_optimal(const void* options, void* settings)
 {
+    (void)na::slb::dlss::GetModeState(); // plugin may reenter status, including unknown ABI
+    if(g_block.load()){g_entered.store(true);while(!g_leave.load())Sleep(1);}
     ++g_optimal_calls;
     g_seen_options = options;
     std::memcpy(g_seen, options, 88);
@@ -160,6 +165,8 @@ int main()
 
     // Request Balanced while the game asks for Quality.
     ModeRequest req;
+    req.out_w=3440;req.out_h=1440;
+    req.render_w=static_cast<uint32_t>(3440*0.58f+0.5f);req.render_h=static_cast<uint32_t>(1440*0.58f+0.5f);
     req.own_mode = true;
     req.sl_mode = kSlBalanced;
     SetModeRequest(req);
@@ -177,11 +184,16 @@ int main()
     ModeState st = GetModeState();
     CHECK(st.size_followed && st.game_mode == kSlMaxQuality && st.sent_mode == kSlBalanced && st.rewritten_this_generation == 1);
     CHECK(st.optimal_w == bw && st.min_w == bw && st.max_w == bw);
-    // Now the label follows the size.
+    // A returned recommendation is not proof of rendering: label stays native.
     CHECK(set(viewport, q.b) == 0);
-    CHECK(g_seen_options != q.b && get<uint32_t>(g_seen, 32) == kSlBalanced);
-    CHECK(GetModeState().set_sent_mode == kSlBalanced);
+    CHECK(g_seen_options == q.b && get<uint32_t>(g_seen, 32) == kSlMaxQuality);
+    CHECK(GetModeState().set_sent_mode == kSlMaxQuality);
 
+    Options reference=make_options(kSlMaxQuality,1000,1000);
+    a=make_optimal();CHECK(optimal(reference.b,a.b)==0);CHECK(g_seen_options==reference.b);
+    SetModeRequest(req);a=make_optimal();put<uint64_t>(a.b,24,99);
+    CHECK(optimal(q.b,a.b)==0);CHECK(!GetModeState().size_followed);
+    CHECK(get<uint32_t>(a.b,44)==3440/3); // unknown output ABI is not rewritten
     // DLSS off in the game's call stays off.
     Options off = make_options(kSlOff, 3440, 1440);
     a = make_optimal();
@@ -214,5 +226,15 @@ int main()
     a = make_optimal();
     CHECK(optimal(q.b, a.b) == 0);
     CHECK(g_seen_options == q.b);
+    // Retirement cannot leave an old query publishing evidence in a new generation.
+    SetModeRequest(req);g_block=true;g_entered=false;g_leave=false;
+    std::thread query([&]{Optimal answer=make_optimal();optimal(q.b,answer.b);});
+    const auto deadline=GetTickCount64()+2000;
+    while(!g_entered.load() && GetTickCount64()<deadline)Sleep(1);
+    CHECK(g_entered.load());
+    std::atomic<bool> retired{false};
+    std::thread retire([&]{SetModeRequest({});retired=true;});
+    Sleep(20);CHECK(!retired.load());g_leave=true;query.join();retire.join();g_block=false;
+    CHECK(retired.load() && !GetModeState().size_followed && GetModeState().optimal_calls_this_generation==0);
     return test::finish("sl_dlss_mode_test");
 }

@@ -10,6 +10,28 @@ Monitor counting(uint32_t need = 2) {
 }
 }
 int main() { return test::run({
+    {"live resolution confirms an existing SR/RR handle without recreation", [] {
+        Monitor m;m.ArmLive(640,360,1920,1080,2,100,1000);m.MarkRestored(101);
+        auto e=good();e.upscaler=true;e.core=1;e.out_w=1920;e.out_h=1080;
+        auto unrelated=e;unrelated.out_w=1000;m.OnEvaluate(unrelated,102);
+        CHECK(m.snapshot().matching==0);m.OnEvaluate(e,103);m.OnEvaluate(e,104);
+        CHECK(m.state()==State::Confirmed);CHECK(m.snapshot().creations==0);
+    }},
+    {"live confirmation rejects ambiguous cores and non-upscalers", [] {
+        Monitor m;m.ArmLive(640,360,1920,1080,2,100,1000);m.MarkRestored(101);
+        auto e=good();e.core=1;e.out_w=1920;e.out_h=1080;
+        m.OnEvaluate(e,102);CHECK(m.snapshot().matching==0);
+        e.upscaler=true;m.OnEvaluate(e,103);e.core=2;m.OnEvaluate(e,104);
+        CHECK(m.state()==State::Failed);
+    }},
+    {"live replacement after release resets streak and keeps deadline", [] {
+        Monitor m;m.ArmLive(640,360,1920,1080,2,100,1000);m.MarkRestored(101);
+        auto e=good();e.upscaler=true;e.core=1;e.out_w=1920;e.out_h=1080;
+        m.OnEvaluate(e,102);m.OnRelease(e.handle,2,103);CHECK(m.snapshot().streak==1);
+        m.OnRelease(e.handle,1,104);CHECK(m.snapshot().streak==0);
+        e.handle=9;m.OnEvaluate(e,105);CHECK(m.state()==State::Counting);
+        m.OnEvaluate(e,106);CHECK(m.state()==State::Confirmed);
+    }},
     {"scalar poison, finite values and signed motion scales", [] {
         CHECK(ScalarInputsCoherent(.5f, -.5f, -640, 360));
         for (float invalid : {1e38f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity()}) {

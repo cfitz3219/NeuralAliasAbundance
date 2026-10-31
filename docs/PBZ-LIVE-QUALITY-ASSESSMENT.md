@@ -37,3 +37,18 @@ Primary references:
 - Epic Console Variables C++: https://dev.epicgames.com/documentation/unreal-engine/console-variables-cplusplus-in-unreal-engine?lang=en-US (console manager, callbacks/sinks, thread context and set priority).
 - Epic Dynamic Resolution: https://dev.epicgames.com/documentation/en-us/unreal-engine/dynamic-resolution-in-unreal-engine (resolution owner/heuristic).
 - NVIDIA Streamline DLSS guide: https://github.com/NVIDIA-RTX/Streamline/blob/main/docs/ProgrammingGuideDLSS.md (query result versus application's viewport update).
+
+
+## 2026-10-31 — Integrated repair of PR70
+
+Astra merged Opus 628520b with Ghost locator a5f6a9f and repaired the remaining review items. PBZ resolution changes now run through its actual engine console-variable setters at the normal game-thread console-sink call, not through worker-thread stores into its two float shadows. The generic string locator is retained for verification, not treated as proof of a universal setter ABI.
+
+Inspected PBZ SHA256: `7b4fcd286a350780faf0824d73aa150b21cbf1bccde883e6a96386cbe09973b4`. Static trace: ScreenPercentage object df4a9f8, variable pointer +8, float vtable a685528 / Set 12c19d0; DynamicRes.OperationMode object df74238, int vtable a6852e8 / Set 12c1950. Both setters take a flags/FName record, not flags by value. Console manager sink 12aa200 is called at 47ad721 (return 47ad724) inside engine tick, witnessed by the Tick.Benchmarking string/call chain. Admission verifies file identity, storage/object relationship, vtables and call bytes. Updates require requalification of this PBZ ABI; this is not generic Unreal compatibility.
+
+The request is queued, accepted at that engine-thread call, uses existing set-by priority, disables DRS for fixed quality, and lets the engine perform callbacks/render-shadow propagation. Handback is queued at the same point and preserves later menu changes. Pending requests cancel; timeout/failed application stops fallback and restores owned values. No host mutex is held while invoking engine setters.
+
+Shared confirmation accepts existing SR/RR features using coherent successful evaluations, actual render subrect, matching output size and core/handle identity. Released handles can be replaced; simultaneous ambiguous streams cannot confirm. Creation counts or already-matching last creation are not success. Streamline rewrites matching output queries, preserves unknown ABI/reference probes, serializes retirement with in-flight calls, and requires rendered evidence before changing mode labels. Failed attempts retire constraints. Learned strategies are session hints, not permissions persisted across executable changes. Status has its own bounded log line.
+
+Validation: full Release; 59 CPU/host/DX12 PASS, one opt-in actual-model probe SKIP (60 selected,21.71s). New real-hook SR/RR no-recreation regressions use D3D12 with fake NGX. Engine setter fixture covers dispatch/cancellation, callback reentry, priorities, DRS and handback without writing render shadows. Streamline fixture covers reference queries, unknown versions, offered-versus-rendered evidence and in-flight retirement. PBZ/Ghost additive installer rollback fixtures PASS in temporary mock installations. These do not establish gameplay success; Cort retains installation/live testing. Existing NR implementation is carried forward unchanged by this controls increment.
+
+Scope: standard queries help engines consuming those answers; DRS controllers need not. Same-size independent viewports need further provenance before broad multi-viewport claims. Ghost locator tolerates supported ABI relocation, not arbitrary settings layout changes. No game launch, deployment or native DLL replacement.

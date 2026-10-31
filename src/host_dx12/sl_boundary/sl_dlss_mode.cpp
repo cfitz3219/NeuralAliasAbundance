@@ -45,6 +45,7 @@ std::atomic<bool> g_optimal_requested{false}, g_set_requested{false}, g_lookup_d
 std::atomic<uint32_t> g_optimal_hooked{0}, g_set_hooked{0};
 std::atomic<uint64_t> g_optimal_calls{0}, g_set_calls{0};
 
+std::recursive_mutex g_calls; // serialize the non-thread-safe plugin calls and request retirement
 std::mutex g_m;
 ModeRequest g_request;
 ModeState g_state; // counters and hook flags are filled in GetModeState
@@ -85,30 +86,33 @@ void set_reason_locked(const char* text) { strncpy_s(g_state.reason, text, _TRUN
 
 SlResult __cdecl DetourGetOptimalSettings(const void* options, void* settings)
 {
+    std::lock_guard<std::recursive_mutex> call(g_calls);
+    uint64_t generation=0;
     g_optimal_calls.fetch_add(1, std::memory_order_relaxed);
     uint8_t copy[96] = {};
     const size_t n = copy_options(options, copy);
     ModeRequest req;
     {
         std::lock_guard<std::mutex> lock(g_m);
-        req = g_request;
+        req = g_request;generation=g_state.generation;
         const uint64_t now = GetTickCount64();
         if (!g_state.first_optimal_tick) g_state.first_optimal_tick = now;
         g_state.last_optimal_tick = now;
         ++g_state.optimal_calls_this_generation;
     }
     if (!n) {
-        std::lock_guard<std::mutex> lock(g_m);
-        set_reason_locked("The game's DLSS options were not recognised; passed through unchanged.");
+        {std::lock_guard<std::mutex> lock(g_m);
+        set_reason_locked("The game's DLSS options were not recognised; passed through unchanged.");}
         return g_orig_optimal(options, settings);
     }
     const uint32_t game_mode = abi::Read<uint32_t>(copy, 32);
-    const bool rewrite = req.own_mode && game_mode != kSlOff && req.sl_mode != kSlOff;
+    const bool rewrite = req.own_mode && game_mode != kSlOff && req.sl_mode != kSlOff &&
+        req.out_w && req.out_h && abi::Read<uint32_t>(copy,36)==req.out_w && abi::Read<uint32_t>(copy,40)==req.out_h;
     if (rewrite) memcpy(copy + 32, &req.sl_mode, 4);
     const SlResult r = rewrite ? g_orig_optimal(copy, settings) : g_orig_optimal(options, settings);
     uint8_t s[kOptimalSize] = {};
     bool have = false;
-    if (r == 0 && settings && guarded_copy(s, settings, kOptimalSize) == kOptimalSize && abi::HasGuid(s, kOptimalSize, kOptimalGuid)) {
+    if (r == 0 && settings && guarded_copy(s, settings, kOptimalSize) == kOptimalSize && abi::HasGuid(s, kOptimalSize, kOptimalGuid) && abi::Read<uint64_t>(s,24)==1) {
         have = true;
         if (rewrite && req.pin_bounds) {
             // Dynamic resolution reads these bounds: pin them to the optimal size.
@@ -120,6 +124,7 @@ SlResult __cdecl DetourGetOptimalSettings(const void* options, void* settings)
         }
     }
     std::lock_guard<std::mutex> lock(g_m);
+    if(g_state.generation!=generation)return r;
     g_state.game_mode = game_mode;
     g_state.sent_mode = rewrite ? req.sl_mode : game_mode;
     g_state.out_w = abi::Read<uint32_t>(copy, 36);
@@ -135,11 +140,10 @@ SlResult __cdecl DetourGetOptimalSettings(const void* options, void* settings)
     }
     if (rewrite && r == 0) {
         ++g_state.rewritten_this_generation;
-        // Only a query for the game's real output size counts as the game taking
-        // our size (engines also probe reference sizes, e.g. 1000x1000 tables).
-        const na::ngx::Stats ngx = na::ngx::GetStats();
-        const bool output_known = ngx.last_sr_out_w && ngx.last_sr_out_w != 0xFFFFFFFFu;
-        if (!output_known || (g_state.out_w == ngx.last_sr_out_w && g_state.out_h == ngx.last_sr_out_h)) g_state.size_followed = true;
+        // This records a matching recommendation, not proof of consumption.
+        // Rendered evaluations provide the separate confirmation witness.
+        if(have && g_state.optimal_w && g_state.optimal_h &&
+           g_state.optimal_w==req.render_w && g_state.optimal_h==req.render_h)g_state.size_followed=true;
         set_reason_locked("The game asked Streamline for its render size; it received the selected mode's size.");
     } else if (!rewrite) {
         set_reason_locked(game_mode == kSlOff ? "The game has DLSS off in this call; left unchanged." : "The game's own DLSS mode is in use.");
@@ -151,6 +155,7 @@ SlResult __cdecl DetourGetOptimalSettings(const void* options, void* settings)
 
 SlResult __cdecl DetourSetOptions(const void* viewport, const void* options)
 {
+    std::lock_guard<std::recursive_mutex> call(g_calls);
     g_set_calls.fetch_add(1, std::memory_order_relaxed);
     uint8_t copy[96] = {};
     const size_t n = copy_options(options, copy);
@@ -169,8 +174,11 @@ SlResult __cdecl DetourSetOptions(const void* viewport, const void* options)
             memcpy(copy + kPresetFirst + 4 * i, &req.preset, 4);
             changed = true;
         }
-    // The label follows the size: only once the game took our size.
-    const bool mode = req.own_mode && followed && game_mode != kSlOff && req.sl_mode != kSlOff && game_mode != req.sl_mode;
+    // The label follows actual rendered-size confirmation, not a query.
+    const auto witness=na::ngx::GetSizeConfirmation();
+    const bool observed=req.confirmation && witness.id==req.confirmation && witness.state==3 && witness.req_w==req.render_w && witness.req_h==req.render_h;
+    const bool output=req.out_w && req.out_h && abi::Read<uint32_t>(copy,36)==req.out_w && abi::Read<uint32_t>(copy,40)==req.out_h;
+    const bool mode = req.own_mode && followed && observed && output && game_mode != kSlOff && req.sl_mode != kSlOff && game_mode != req.sl_mode;
     if (mode) {
         memcpy(copy + 32, &req.sl_mode, 4);
         changed = true;
@@ -207,7 +215,9 @@ void request_install(void* target, bool optimal)
     if (!target) return;
     std::atomic<bool>& flag = optimal ? g_optimal_requested : g_set_requested;
     if (flag.exchange(true, std::memory_order_acq_rel)) return;
-    if (HANDLE t = CreateThread(nullptr, 0, &install_thread, new Install{target, optimal}, 0, nullptr)) CloseHandle(t);
+    auto* job=new Install{target,optimal};
+    if (HANDLE t = CreateThread(nullptr, 0, &install_thread, job, 0, nullptr)) CloseHandle(t);
+    else {delete job;flag.store(false,std::memory_order_release);}
 }
 
 } // namespace
@@ -221,12 +231,14 @@ uint32_t SlModeForDlssMode(uint32_t dlss_mode)
 
 void SetModeRequest(const ModeRequest& request)
 {
+    std::lock_guard<std::recursive_mutex> call(g_calls);
     std::lock_guard<std::mutex> lock(g_m);
     g_request = request;
     ++g_state.generation;
     g_state.optimal_calls_this_generation = 0;
     g_state.rewritten_this_generation = 0;
     g_state.size_followed = false;
+    g_state.optimal_w=g_state.optimal_h=0;
 }
 
 ModeState GetModeState()

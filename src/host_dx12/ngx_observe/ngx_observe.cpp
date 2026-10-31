@@ -667,7 +667,11 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
             // feature that breaks the streak; it is never skipped.
             confirm::EvalObs obs{};
             obs.handle = reinterpret_cast<uint64_t>(game_handle);
-            obs.ok = ep.valid && r >= 0;
+            obs.ok = ep.valid && r == 1;
+            obs.core=reinterpret_cast<uint64_t>(&s);
+            obs.out_w=ep.out_width;obs.out_h=ep.out_height;
+            {std::lock_guard<std::mutex> lock(g_confirm_m);
+             obs.upscaler=g_feature_flags.Get(obs.handle,obs.core)!=0xFFFFFFFFu;}
             if (obs.ok) {
                 uint32_t rw = ep.subrect_width != 0xFFFFFFFFu ? ep.subrect_width : ep.in_width;
                 uint32_t rh = ep.subrect_height != 0xFFFFFFFFu ? ep.subrect_height : ep.in_height;
@@ -821,6 +825,7 @@ NgxResult ReleaseFeatureImpl(CoreSlot& s, void* handle)
     }
     auto erase_flags=[&]{
         std::lock_guard<std::mutex> lock(g_confirm_m);
+        g_confirm.OnRelease(reinterpret_cast<uint64_t>(handle),reinterpret_cast<uint64_t>(&s),GetTickCount64());
         g_feature_flags.Erase(reinterpret_cast<uint64_t>(handle),reinterpret_cast<uint64_t>(&s));
     };
     // A mapped handle belongs to us. Retirement follows its actual recordings;
@@ -1051,6 +1056,11 @@ uint64_t ArmSizeConfirmation(uint32_t w, uint32_t h, uint32_t need, uint32_t cre
     uint64_t id = g_confirm.Arm(w, h, need, GetTickCount64(), create_timeout_ms, confirm_timeout_ms, overall_timeout_ms);
     g_confirm_active.store(true, std::memory_order_release);
     return id;
+}
+uint64_t ArmLiveSizeConfirmation(uint32_t w,uint32_t h,uint32_t ow,uint32_t oh,uint32_t need,uint32_t timeout) {
+    std::lock_guard<std::mutex> lock(g_confirm_m);
+    const auto id=g_confirm.ArmLive(w,h,ow,oh,need,GetTickCount64(),timeout);
+    g_confirm_active.store(true,std::memory_order_release);return id;
 }
 void MarkSizeConfirmationRestored(uint64_t id)
 {

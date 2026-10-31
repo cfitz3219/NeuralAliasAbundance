@@ -19,9 +19,11 @@ namespace na::mode {
 namespace {
 
 std::mutex g_m;
+std::mutex g_actions; // serialize request admission with cancellation, never held while waiting
 Status g_status;
 Request g_pending;
 bool g_has_pending = false;
+bool g_running=false;
 std::atomic<uint64_t> g_generation{0};
 std::atomic<bool> g_started{false};
 HANDLE g_wake = nullptr;
@@ -41,11 +43,7 @@ void remember(Layer layer)
         std::lock_guard<std::mutex> lock(g_m);
         g_status.learned = layer;
     }
-    const wchar_t* ini = na::settings::UserIniPath();
-    if (!ini || !ini[0]) return;
-    wchar_t v[8];
-    swprintf_s(v, L"%u", static_cast<uint32_t>(layer));
-    WritePrivateProfileStringW(L"mode_control", L"layer", v, ini);
+
 }
 
 enum class Outcome { Confirmed, CannotAct, Failed, Cancelled };
@@ -66,16 +64,23 @@ Outcome wait_confirmation(uint64_t id, uint64_t generation, uint32_t timeout_ms)
 }
 
 // Streamline: request the mode; it can act only if the game asks Streamline
-// for its size while we wait. The request is left in place either way.
+// for its size while we wait. Failed attempts are retired before fallback.
 Outcome try_streamline(const Request& r, uint64_t generation)
 {
     na::slb::dlss::ModeRequest req;
+    req.out_w=r.out_w;req.out_h=r.out_h;req.render_w=r.render_w;req.render_h=r.render_h;
     req.own_mode = true;
     req.sl_mode = na::slb::dlss::SlModeForDlssMode(r.mode);
     req.pin_bounds = true;
     req.own_preset = r.preset >= 1 && r.preset <= 15;
     req.preset = req.own_preset ? static_cast<uint32_t>(r.preset) : 0;
+    std::unique_lock<std::mutex> action(g_actions);
+    if(cancelled(generation))return Outcome::Cancelled;
+    const uint64_t id=na::ngx::ArmLiveSizeConfirmation(r.render_w,r.render_h,r.out_w,r.out_h,30,8000);
+    req.confirmation=id;
+    na::ngx::MarkSizeConfirmationRestored(id);
     na::slb::dlss::SetModeRequest(req);
+    action.unlock();
     set_reason("Asking the game's Streamline DLSS for the selected mode...");
     const ULONGLONG end = GetTickCount64() + 1500;
     na::slb::dlss::ModeState st{};
@@ -86,14 +91,16 @@ Outcome try_streamline(const Request& r, uint64_t generation)
         Sleep(10);
     }
     if (!st.size_followed) return Outcome::CannotAct; // the game did not ask again on its own
-    const uint64_t id = na::ngx::ArmSizeConfirmation(st.optimal_w, st.optimal_h, 30, 3000, 4000, 7000);
-    na::ngx::MarkSizeConfirmationRestored(id);
     return wait_confirmation(id, generation, 7500);
 }
 
 Outcome try_unreal(const Request& r, uint64_t generation)
 {
-    if (!na::unreal::RequestScreenPercentage(r.unreal_percent, r.out_w, r.out_h)) return Outcome::CannotAct;
+    {
+        std::lock_guard<std::mutex> action(g_actions);
+        if(cancelled(generation))return Outcome::Cancelled;
+        if (!na::unreal::RequestScreenPercentage(r.unreal_percent, r.out_w, r.out_h)) return Outcome::CannotAct;
+    }
     set_reason("Changing the game's resolution setting (r.ScreenPercentage)...");
     const ULONGLONG end = GetTickCount64() + 10000;
     while (GetTickCount64() < end) {
@@ -104,7 +111,7 @@ Outcome try_unreal(const Request& r, uint64_t generation)
         const na::unreal::SpStatus s = na::unreal::GetScreenPercentageStatus();
         switch (s.state) {
         case na::unreal::SpState::Confirmed: return Outcome::Confirmed;
-        case na::unreal::SpState::NotApplied:
+        case na::unreal::SpState::NotApplied: return Outcome::Failed;
         case na::unreal::SpState::Refused: return Outcome::CannotAct;
         case na::unreal::SpState::GameChanged: return Outcome::Failed;
         case na::unreal::SpState::Cancelled: return Outcome::Cancelled;
@@ -112,8 +119,8 @@ Outcome try_unreal(const Request& r, uint64_t generation)
         }
         Sleep(50);
     }
-    na::unreal::CancelScreenPercentage();
-    return Outcome::CannotAct;
+    na::unreal::HandBackScreenPercentage();
+    return Outcome::Failed;
 }
 
 Outcome try_exact(const Request& r, uint64_t generation)
@@ -128,7 +135,7 @@ Outcome try_exact(const Request& r, uint64_t generation)
         if (cancelled(generation)) return Outcome::Cancelled;
         const na::tlou1::ApplyStatus s = ghost ? na::tsushima::GetApplyStatus() : na::tlou1::GetApplyStatus();
         if (s.stage == na::tlou1::Stage::Confirmed) return Outcome::Confirmed;
-        if (s.stage == na::tlou1::Stage::Failed) return Outcome::CannotAct;
+        if (s.stage == na::tlou1::Stage::Failed) return Outcome::Failed;
         if (s.stage == na::tlou1::Stage::Cancelled) return Outcome::Cancelled;
         Sleep(50);
     }
@@ -174,6 +181,7 @@ void run(const Request& r, uint64_t generation)
         g_status.tried_mask = 0;
     }
     for (uint32_t i = 0; i < n; ++i) {
+        if(cancelled(generation))break;
         const Layer layer = order[i];
         {
             std::lock_guard<std::mutex> lock(g_m);
@@ -188,7 +196,10 @@ void run(const Request& r, uint64_t generation)
         case Layer::Rebuild: o = try_rebuild(r, generation); break;
         default: break;
         }
+        if(cancelled(generation))o=Outcome::Cancelled;
         if (o == Outcome::Cancelled) {
+            na::slb::dlss::SetModeRequest({});
+            na::unreal::CancelScreenPercentage();
             std::lock_guard<std::mutex> lock(g_m);
             g_status.state = State::Cancelled;
             strncpy_s(g_status.reason, "Selection changed; choose Apply again.", _TRUNCATE);
@@ -203,16 +214,24 @@ void run(const Request& r, uint64_t generation)
             else
                 snprintf(why, sizeof(why), "Applied through %s: the game renders at the selected mode.", LayerName(layer));
             std::lock_guard<std::mutex> lock(g_m);
+            if(cancelled(generation))return;
             g_status.state = State::Confirmed;
             strncpy_s(g_status.reason, why, _TRUNCATE);
             return;
         }
-        // CannotAct / Failed: try the next layer (the Streamline request stays active).
+        // Retire this attempt before trying another engine path. A persistent
+        // API constraint is only retained for a confirmed owner.
+        na::slb::dlss::SetModeRequest({});
+        na::unreal::CancelScreenPercentage();
+        na::ngx::CancelSizeConfirmation();
+        if(o==Outcome::Failed)break;
     }
+    na::slb::dlss::SetModeRequest({});
     std::lock_guard<std::mutex> lock(g_m);
+    if(cancelled(generation))return;
     g_status.state = State::Failed;
     strncpy_s(g_status.reason,
-              n ? "None of the available methods changed this game's render size while it runs. Choose the mode in the game's own menu, or keep it selected here and restart the game."
+              n ? "None of the available methods changed this game's render size while it runs. The requested live change was not applied."
                 : "No method to change this game's render size is available yet (DLSS not started, or not supported here).",
               _TRUNCATE);
 }
@@ -226,11 +245,13 @@ DWORD WINAPI worker(LPVOID)
         {
             std::lock_guard<std::mutex> lock(g_m);
             if (!g_has_pending) continue;
+            g_running=true;
             r = g_pending;
             g_has_pending = false;
             generation = g_generation.load(std::memory_order_acquire);
         }
         run(r, generation);
+        {std::lock_guard<std::mutex> lock(g_m);g_running=false;}
     }
 }
 
@@ -263,6 +284,7 @@ uint32_t PlanOrder(uint32_t available_mask, Layer learned, Layer* out, uint32_t 
     static const Layer kDefault[] = {Layer::Streamline, Layer::Unreal, Layer::ExactBuild, Layer::Rebuild};
     uint32_t n = 0;
     auto add = [&](Layer l) {
+        if(!out || static_cast<uint32_t>(l)>=static_cast<uint32_t>(Layer::Count))return;
         const uint32_t bit = 1u << static_cast<uint32_t>(l);
         if (l == Layer::None || !(available_mask & bit) || n >= cap) return;
         for (uint32_t i = 0; i < n; ++i)
@@ -277,12 +299,6 @@ uint32_t PlanOrder(uint32_t available_mask, Layer learned, Layer* out, uint32_t 
 void Start()
 {
     if (g_started.exchange(true)) return;
-    const wchar_t* ini = na::settings::UserIniPath();
-    const UINT learned = ini && ini[0] ? GetPrivateProfileIntW(L"mode_control", L"layer", 0, ini) : 0;
-    {
-        std::lock_guard<std::mutex> lock(g_m);
-        g_status.learned = learned < static_cast<UINT>(Layer::Count) ? static_cast<Layer>(learned) : Layer::None;
-    }
     g_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (HANDLE t = CreateThread(nullptr, 0, &worker, nullptr, 0, nullptr)) CloseHandle(t);
 }
@@ -290,10 +306,13 @@ void Start()
 bool RequestApply(const Request& request)
 {
     std::lock_guard<std::mutex> lock(g_m);
-    if (!g_wake || g_status.state == State::Trying || g_has_pending) {
+    if(request.mode>4 || !request.out_w || !request.out_h || !request.render_w || !request.render_h ||
+       request.out_w==UINT32_MAX || request.out_h==UINT32_MAX || request.render_w>request.out_w || request.render_h>request.out_h)return false;
+    if (!g_wake || g_running || g_status.state == State::Trying || g_has_pending) {
         strncpy_s(g_status.reason, "A previous Apply is still running. Try again in a moment.", _TRUNCATE);
         return false;
     }
+    g_generation.fetch_add(1,std::memory_order_acq_rel);
     g_pending = request;
     g_has_pending = true;
     g_status.state = State::Trying;
@@ -306,6 +325,7 @@ bool RequestApply(const Request& request)
 
 void Cancel(bool hand_back)
 {
+    std::lock_guard<std::mutex> action(g_actions);
     g_generation.fetch_add(1, std::memory_order_acq_rel);
     {
         std::lock_guard<std::mutex> lock(g_m);
@@ -315,8 +335,9 @@ void Cancel(bool hand_back)
             strncpy_s(g_status.reason, "Selection changed; choose Apply again.", _TRUNCATE);
         }
     }
+    na::slb::dlss::SetModeRequest({});
+    na::unreal::CancelScreenPercentage();
     if (hand_back) {
-        na::slb::dlss::SetModeRequest({});
         na::unreal::HandBackScreenPercentage();
     }
 }

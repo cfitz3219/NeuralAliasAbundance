@@ -177,6 +177,8 @@ struct Stats {
 // before every event and on every GetSizeConfirmation() read, so no menu
 // page needs to stay open. One request runs; a new one supersedes. Returns
 // the request id.
+// Confirms actual SR/RR evaluations without requiring feature recreation.
+uint64_t ArmLiveSizeConfirmation(uint32_t w,uint32_t h,uint32_t out_w,uint32_t out_h,uint32_t need=30,uint32_t timeout_ms=8000);
 uint64_t ArmSizeConfirmation(uint32_t w, uint32_t h, uint32_t need, uint32_t create_timeout_ms, uint32_t confirm_timeout_ms,
                              uint32_t overall_timeout_ms);
 // The window is back; evaluations from now on count (no-op for another id).

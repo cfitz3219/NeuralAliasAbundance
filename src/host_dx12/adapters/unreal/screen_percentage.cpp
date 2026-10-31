@@ -3,6 +3,10 @@
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 
 #include <windows.h>
+#include <bcrypt.h>
+#include <intrin.h>
+#include <array>
+#include "host_dx12/hooking/vtable_hook.hpp"
 
 #include <atomic>
 #include <cmath>
@@ -163,243 +167,192 @@ float* locate_float_cvar(const wchar_t* name, uint32_t* count, char* why, size_t
     return found;
 }
 
+
+// PBZ shipping-console ABI, qualified from the installed executable. The
+// generic locator remains read-only: a string/storage match is not an ABI.
+constexpr char kPbzHash[]="7b4fcd286a350780faf0824d73aa150b21cbf1bccde883e6a96386cbe09973b4";
+using Sink=void(*)(void*);
+using Setter=void(*)(void*,const wchar_t*,const void*);
+Sink g_sink=nullptr;
+Setter g_float_set=nullptr,g_int_set=nullptr;
+void* g_float=nullptr;void* g_int=nullptr;
+uintptr_t g_caller=0;
 std::mutex g_m;
 SpStatus g_status;
-std::atomic<float*> g_ref{nullptr};
 std::atomic<bool> g_started{false};
-HANDLE g_wake = nullptr;
-struct Pending { bool set = false; float percent = 0.f; uint32_t out_w = 0, out_h = 0; uint64_t id = 0; } g_pending;
-uint64_t g_next_id = 0;
-std::atomic<uint64_t> g_generation{0};  // bumped by Cancel: a running request stops at its next check
-uint64_t g_confirm_id = 0;              // size-confirmation request owned by the running Apply (g_m)
-bool g_have_game_value = false;         // the game's value before our first write (hand-back), g_m
-float g_game_value = 0.f, g_our_value = 0.f;
-
-void set_state(SpState s, const char* reason)
-{
-    std::lock_guard<std::mutex> lock(g_m);
-    g_status.state = s;
-    if (reason) strncpy_s(g_status.reason, reason, _TRUNCATE);
-}
-
-float read_value(float* ref)
-{
-    float v = 0.f;
+struct Pending {bool set=false;float percent=0;uint32_t ow=0,oh=0;uint64_t generation=0;} g_pending;
+uint64_t g_generation=0,g_confirm=0;
+bool g_handback=false,g_executing=false;
+struct Ownership {bool held=false;float before=0,ours=0;int drs=0;uint32_t float_priority=0,int_priority=0;} g_owner;
+struct Values {float percent;int drs;uint32_t fp,ip;bool valid;};
+Values values() {
+    Values v{};
     __try {
-        v = *reinterpret_cast<volatile float*>(ref);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        v = 0.f;
-    }
+        v.percent=*reinterpret_cast<const float*>(static_cast<const uint8_t*>(g_float)+0x50);
+        v.drs=*reinterpret_cast<const int*>(static_cast<const uint8_t*>(g_int)+0x50);
+        v.fp=*reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(g_float)+0x18)&0xff000000u;
+        v.ip=*reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(g_int)+0x18)&0xff000000u;
+        v.valid=sane_percent(v.percent)&&v.drs>=0&&v.drs<=2;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {v.valid=false;}
     return v;
 }
-
-bool write_value(float* ref, float v)
-{
-    LONG bits;
-    memcpy(&bits, &v, 4);
-    __try {
-        InterlockedExchange(reinterpret_cast<volatile LONG*>(ref), bits);     // ShadowedValue[0], game thread
-        InterlockedExchange(reinterpret_cast<volatile LONG*>(ref + 1), bits); // ShadowedValue[1], render thread
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
+void set_value(Setter set,void* variable,const wchar_t* value,uint32_t priority) {
+    // This build takes a packed flags + FName parameter record, NOT uint32
+    // flags by value. Preserve set-by precedence; zero FName denotes None.
+    alignas(8) uint8_t args[24]{};std::memcpy(args,&priority,4);
+    set(variable,value,args); // engine owns callback/sink/render-shadow propagation
+}
+void restore(const Ownership& owned) {
+    if(!owned.held)return;
+    const auto v=values();if(!v.valid)return;
+    wchar_t text[32]{};
+    // Do not overwrite a subsequent menu/engine change, including priority.
+    if(std::fabs(v.percent-owned.ours)<0.01f && v.fp==owned.float_priority) {
+        swprintf_s(text,L"%.9g",double(owned.before));set_value(g_float_set,g_float,text,v.fp);
+    }
+    if(v.drs==0 && v.ip==owned.int_priority) {
+        swprintf_s(text,L"%d",owned.drs);set_value(g_int_set,g_int,text,v.ip);
     }
 }
-
-bool locate()
-{
-    char why[160] = "";
-    uint32_t n = 0;
-    float* ref = locate_float_cvar(L"r.ScreenPercentage", &n, why, sizeof(why));
-    std::lock_guard<std::mutex> lock(g_m);
-    g_status.candidates = n;
-    if (!ref) {
-        g_status.state = SpState::NotFound;
-        g_status.available = false;
-        strncpy_s(g_status.reason, why, _TRUNCATE);
-        return false;
-    }
-    g_ref.store(ref, std::memory_order_release);
-    g_status.state = SpState::Ready;
-    g_status.available = true;
-    strncpy_s(g_status.reason, "Unreal render resolution control is ready.", _TRUNCATE);
-    return true;
-}
-
-void run_request(const Pending& req)
-{
-    const uint64_t generation = g_generation.load(std::memory_order_acquire);
-    float* ref = g_ref.load(std::memory_order_acquire);
-    const na::ngx::Stats before = na::ngx::GetStats();
-    const float now = read_value(ref);
-    // Safety: the located value must describe the size the game feeds DLSS now.
-    if (before.last_sr_in_w != 0xFFFFFFFFu && before.last_sr_out_w && before.last_sr_out_w != 0xFFFFFFFFu) {
-        const uint32_t expect_now = ExpectedExtent(before.last_sr_out_w, now);
-        if (expect_now + 2 < before.last_sr_in_w || before.last_sr_in_w + 2 < expect_now) {
-            char why[200];
-            snprintf(why, sizeof(why), "The located setting (%.1f%%) does not match the game's render size (%ux%u); nothing was changed.",
-                     now, before.last_sr_in_w, before.last_sr_in_h);
-            set_state(SpState::Refused, why);
-            return;
-        }
-    }
-    const uint32_t ew = ExpectedExtent(req.out_w, req.percent), eh = ExpectedExtent(req.out_h, req.percent);
+void process(uintptr_t caller) {
+    Pending req;Ownership handback;
     {
         std::lock_guard<std::mutex> lock(g_m);
-        g_status.requested = req.percent;
-        g_status.request_id = req.id;
-        g_status.expect_w = ew;
-        g_status.expect_h = eh;
+        if(caller!=g_caller || g_executing)return;
+        g_executing=true;
+        if(g_handback){handback=g_owner;g_owner={};g_handback=false;}
+        req=g_pending;g_pending={};
     }
-    // Already rendering at that size (the value already matches): nothing to change.
-    if (std::fabs(now - req.percent) < 0.01f && before.last_sr_in_w + 1 >= ew && before.last_sr_in_w <= ew + 1 &&
-        before.last_sr_in_h + 1 >= eh && before.last_sr_in_h <= eh + 1) {
-        set_state(SpState::Confirmed, "This mode is already the game's render size.");
-        return;
+    restore(handback); // no host mutex held across engine callbacks
+    if(req.set) {
+        const auto v=values();
+        uint64_t confirm=0;bool admitted=false;
+        {
+            std::lock_guard<std::mutex> lock(g_m);
+            admitted=v.valid&&req.generation==g_generation&&!g_handback;
+            if(admitted) {
+                if(!g_owner.held || std::fabs(v.percent-g_owner.ours)>0.01f || v.fp!=g_owner.float_priority || v.drs!=0 || v.ip!=g_owner.int_priority)
+                    g_owner={true,v.percent,req.percent,v.drs,v.fp,v.ip};
+                g_owner.ours=req.percent;
+                g_status.requested=req.percent;g_status.request_id=req.generation;
+                g_status.expect_w=ExpectedExtent(req.ow,req.percent);g_status.expect_h=ExpectedExtent(req.oh,req.percent);
+                confirm=na::ngx::ArmLiveSizeConfirmation(g_status.expect_w,g_status.expect_h,req.ow,req.oh);
+                g_confirm=confirm;
+            }
+        }
+        if(admitted) {
+            wchar_t text[32]{};swprintf_s(text,L"%.9g",double(req.percent));
+            set_value(g_int_set,g_int,L"0",v.ip);
+            set_value(g_float_set,g_float,text,v.fp);
+            na::ngx::MarkSizeConfirmationRestored(confirm);
+            const auto after=values();
+            std::lock_guard<std::mutex> lock(g_m);
+            if(req.generation==g_generation) {
+                if(!after.valid || after.drs!=0 || std::fabs(after.percent-req.percent)>0.01f) {
+                    g_status.state=SpState::NotApplied;g_handback=true;
+                    strcpy_s(g_status.reason,"The engine did not accept the requested resolution settings.");
+                    if(na::ngx::GetSizeConfirmation().id==confirm)na::ngx::CancelSizeConfirmation();
+                } else strcpy_s(g_status.reason,"Engine setting applied; checking actual DLSS frames.");
+            }
+        }
     }
-    // Confirmation is armed BEFORE the write, so the re-creation it causes is observed.
-    const uint64_t confirm = na::ngx::ArmSizeConfirmation(ew, eh, 30, 4000, 4000, 9000);
+    const auto v=values();
     {
         std::lock_guard<std::mutex> lock(g_m);
-        g_confirm_id = confirm;
-        if (!g_have_game_value || std::fabs(now - g_our_value) > 0.01f) { // remember the game's own value for hand-back
-            g_game_value = now;
-            g_have_game_value = true;
+        if(v.valid)g_status.current=v.percent;
+        if(g_status.state==SpState::Applying && g_confirm) {
+            const auto c=na::ngx::GetSizeConfirmation();
+            g_status.seen_w=c.last_w;g_status.seen_h=c.last_h;
+            if(!v.valid || v.drs!=0 || std::fabs(v.percent-g_status.requested)>0.01f) {
+                g_status.state=SpState::GameChanged;
+                strcpy_s(g_status.reason,"The game's settings changed; its choice is kept.");
+                if(c.id==g_confirm)na::ngx::CancelSizeConfirmation();
+            } else if(c.id!=g_confirm || c.state==4) {
+                g_status.state=SpState::NotApplied;g_handback=true;
+                strcpy_s(g_status.reason,"The requested resolution was not confirmed on rendered DLSS frames.");
+            } else if(c.state==3) {
+                g_status.state=SpState::Confirmed;
+                snprintf(g_status.reason,sizeof(g_status.reason),"Applied: the game renders %ux%u (%u confirmed frames).",c.last_w,c.last_h,c.streak);
+            }
         }
-        g_our_value = req.percent;
-    }
-    if (!write_value(ref, req.percent)) {
-        na::ngx::CancelSizeConfirmation();
-        set_state(SpState::Refused, "Writing the engine's screen percentage failed; nothing was changed.");
-        return;
-    }
-    na::ngx::MarkSizeConfirmationRestored(confirm); // no window change: evaluations count from now
-    set_state(SpState::Applying, "Waiting for the game's DLSS to render at the new size...");
-    for (;;) {
-        Sleep(100);
-        if (g_generation.load(std::memory_order_acquire) != generation) {
-            if (na::ngx::GetSizeConfirmation().id == confirm) na::ngx::CancelSizeConfirmation();
-            set_state(SpState::Cancelled, "Selection changed; the request was withdrawn.");
-            return;
-        }
-        const float cur = read_value(ref);
-        const na::ngx::Stats s = na::ngx::GetStats();
-        const na::ngx::SizeConfirmation c = na::ngx::GetSizeConfirmation();
-        {
-            std::lock_guard<std::mutex> lock(g_m);
-            g_status.current = cur;
-            g_status.seen_w = c.id == confirm && c.last_w ? c.last_w : s.last_sr_in_w;
-            g_status.seen_h = c.id == confirm && c.last_h ? c.last_h : s.last_sr_in_h;
-        }
-        if (std::fabs(cur - req.percent) > 0.01f) {
-            if (c.id == confirm) na::ngx::CancelSizeConfirmation();
-            set_state(SpState::GameChanged, "The game changed its resolution setting itself; its choice is kept.");
-            return;
-        }
-        if (c.id != confirm) {
-            set_state(SpState::NotApplied, "Another picture change replaced this request.");
-            return;
-        }
-        if (c.state == 3) { // confirm::State::Confirmed
-            char why[160];
-            snprintf(why, sizeof(why), "Applied: the game now renders %ux%u (%.1f%%), confirmed on %u frames.", c.last_w, c.last_h, req.percent, c.streak);
-            set_state(SpState::Confirmed, why);
-            return;
-        }
-        if (c.state == 4) { // confirm::State::Failed
-            char why[240];
-            snprintf(why, sizeof(why), c.creations
-                ? "Set %.1f%%; the game rebuilt DLSS but rendered %ux%u, not %ux%u. Dynamic resolution or the game's own setting may be in control."
-                : "Set %.1f%%; the game did not rebuild DLSS (still %ux%u, expected %ux%u). It may only apply this from its own menu.",
-                req.percent, c.last_w ? c.last_w : s.last_sr_in_w, c.last_h ? c.last_h : s.last_sr_in_h, ew, eh);
-            set_state(SpState::NotApplied, why);
-            return;
-        }
+        g_executing=false;
     }
 }
-
-DWORD WINAPI worker(LPVOID)
-{
-    Sleep(5000); // after engine start: static cvars registered and the game's settings applied
-    if (!locate()) return 0;
-    for (;;) {
-        WaitForSingleObject(g_wake, 1000);
-        Pending req;
-        {
-            std::lock_guard<std::mutex> lock(g_m);
-            req = g_pending;
-            g_pending.set = false;
-            if (float* ref = g_ref.load(std::memory_order_acquire)) g_status.current = read_value(ref);
-        }
-        if (req.set) run_request(req);
-    }
+void sink_detour(void* manager) {
+    process(reinterpret_cast<uintptr_t>(_ReturnAddress()));
+    g_sink(manager); // newly changed cvars participate in this ordinary sink pass
 }
-
+bool hash_file(const wchar_t* path,char (&out)[65]) {
+    HANDLE f=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_SEQUENTIAL_SCAN,nullptr);
+    if(f==INVALID_HANDLE_VALUE)return false;
+    BCRYPT_ALG_HANDLE a=nullptr;BCRYPT_HASH_HANDLE h=nullptr;
+    bool ok=BCryptOpenAlgorithmProvider(&a,BCRYPT_SHA256_ALGORITHM,nullptr,0)>=0;
+    if(ok)ok=BCryptCreateHash(a,&h,nullptr,0,nullptr,0,0)>=0;
+    std::array<uint8_t,65536> b{};DWORD n=0;
+    while(ok) {if(!ReadFile(f,b.data(),DWORD(b.size()),&n,nullptr)){ok=false;break;}if(!n)break;ok=BCryptHashData(h,b.data(),n,0)>=0;}
+    uint8_t digest[32]{};if(ok)ok=BCryptFinishHash(h,digest,32,0)>=0;
+    if(h)BCryptDestroyHash(h);if(a)BCryptCloseAlgorithmProvider(a,0);CloseHandle(f);
+    if(ok)for(unsigned i=0;i<32;++i)sprintf_s(out+i*2,65-i*2,"%02x",digest[i]);return ok;
+}
+DWORD WINAPI worker(LPVOID) {
+    Sleep(5000);
+    wchar_t path[32768]{};char hash[65]{};
+    bool valid=GetModuleFileNameW(nullptr,path,32768)&&hash_file(path,hash)&&!std::strcmp(hash,kPbzHash);
+    char why[160]="This Unreal build's engine setting interface is not qualified yet.";
+    uint32_t count=0;
+    if(valid) {
+        auto base=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        auto ref=locate_float_cvar(L"r.ScreenPercentage",&count,why,sizeof(why));
+        if(ref && region_ok(reinterpret_cast<void*>(base+0xdf4a9f8),24,false)&&region_ok(reinterpret_cast<void*>(base+0xdf74238),24,false)) {
+            g_float=*reinterpret_cast<void**>(base+0xdf4a9f8+8);g_int=*reinterpret_cast<void**>(base+0xdf74238+8);
+            valid=region_ok(g_float,0x58,false)&&region_ok(g_int,0x58,false)&&
+                *reinterpret_cast<uintptr_t*>(g_float)==base+0xa685528&&*reinterpret_cast<uintptr_t*>(g_int)==base+0xa6852e8&&
+                reinterpret_cast<uintptr_t>(ref)==reinterpret_cast<uintptr_t>(g_float)+0x50;
+            if(valid) {
+                g_float_set=reinterpret_cast<Setter>(base+0x12c19d0);g_int_set=reinterpret_cast<Setter>(base+0x12c1950);
+                g_caller=base+0x47ad724;
+                constexpr uint8_t caller[]={0xff,0x50,0x58};
+                constexpr uint8_t entry[]={0x40,0x56,0x48,0x83,0xec,0x20};
+                valid=!std::memcmp(reinterpret_cast<void*>(g_caller-3),caller,3)&&!std::memcmp(reinterpret_cast<void*>(base+0x12aa200),entry,sizeof(entry));
+                if(valid && na::hooking::BeginInstall()) {
+                    valid=na::hooking::PrepareHook(reinterpret_cast<void*>(base+0x12aa200),reinterpret_cast<void*>(&sink_detour),reinterpret_cast<void**>(&g_sink));
+                    if(valid)valid=na::hooking::CommitInstall();else na::hooking::AbandonInstall();
+                } else valid=false;
+            }
+        } else valid=false;
+    }
+    std::lock_guard<std::mutex> lock(g_m);g_status.available=valid;g_status.candidates=count;
+    g_status.state=valid?SpState::Ready:SpState::NotFound;
+    strcpy_s(g_status.reason,valid?"PBZ engine resolution control is ready.":why);
+    return 0;
+}
 } // namespace
-
-uint32_t ExpectedExtent(uint32_t out, float percent)
-{
-    return static_cast<uint32_t>(std::ceil(static_cast<double>(out) * static_cast<double>(percent) / 100.0 - 1e-6));
+uint32_t ExpectedExtent(uint32_t out,float percent) {
+    if(!sane_percent(percent)||out==0xffffffffu)return 0;
+    const double value=std::ceil(double(out)*double(percent)/100.-1e-6);
+    return value<=UINT32_MAX?uint32_t(value):0;
 }
-
-void StartScreenPercentage()
-{
-    if (g_started.exchange(true)) return;
-    g_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (HANDLE t = CreateThread(nullptr, 0, &worker, nullptr, 0, nullptr)) CloseHandle(t);
-}
-
-bool RequestScreenPercentage(float percent, uint32_t out_w, uint32_t out_h)
-{
+void StartScreenPercentage() {if(g_started.exchange(true))return;if(HANDLE t=CreateThread(nullptr,0,worker,nullptr,0,nullptr))CloseHandle(t);}
+bool RequestScreenPercentage(float percent,uint32_t ow,uint32_t oh) {
     std::lock_guard<std::mutex> lock(g_m);
-    if (!g_status.available || !sane_percent(percent) || !out_w || !out_h || out_w == 0xFFFFFFFFu || out_h == 0xFFFFFFFFu) {
-        g_status.state = g_status.available ? SpState::Refused : g_status.state;
-        if (g_status.available) strncpy_s(g_status.reason, "The request was not valid for this game's output size.", _TRUNCATE);
-        return false;
-    }
-    if (g_status.state == SpState::Applying || g_pending.set) {
-        strncpy_s(g_status.reason, "A previous change is still being applied. Try again in a moment.", _TRUNCATE);
-        return false;
-    }
-    g_pending = {true, percent, out_w, out_h, ++g_next_id};
-    g_status.state = SpState::Applying;
-    strncpy_s(g_status.reason, "Applying...", _TRUNCATE);
-    if (g_wake) SetEvent(g_wake);
-    return true;
+    if(!g_status.available || !sane_percent(percent)||!ow||!oh||!ExpectedExtent(ow,percent)||!ExpectedExtent(oh,percent)||g_executing||g_pending.set||g_status.state==SpState::Applying||g_handback)return false;
+    g_pending={true,percent,ow,oh,++g_generation};g_confirm=0;g_status.state=SpState::Applying;
+    strcpy_s(g_status.reason,"Queued for the engine's game-thread settings update.");return true;
 }
-
-SpStatus GetScreenPercentageStatus()
-{
-    std::lock_guard<std::mutex> lock(g_m);
-    return g_status;
+SpStatus GetScreenPercentageStatus(){std::lock_guard<std::mutex> lock(g_m);return g_status;}
+void CancelScreenPercentage() {
+    std::lock_guard<std::mutex> lock(g_m);++g_generation;g_pending={};
+    if(g_confirm && na::ngx::GetSizeConfirmation().id==g_confirm)na::ngx::CancelSizeConfirmation();g_confirm=0;
+    if(g_status.state==SpState::Applying)g_status.state=SpState::Cancelled;
 }
-
-void CancelScreenPercentage()
-{
-    g_generation.fetch_add(1, std::memory_order_acq_rel);
-    std::lock_guard<std::mutex> lock(g_m);
-    g_pending.set = false;
-    if (g_status.state == SpState::Applying) {
-        g_status.state = SpState::Cancelled;
-        strncpy_s(g_status.reason, "Selection changed; the request was withdrawn.", _TRUNCATE);
-    }
+bool HandBackScreenPercentage() {
+    CancelScreenPercentage();std::lock_guard<std::mutex> lock(g_m);g_handback=g_owner.held;return g_handback;
 }
-
-bool HandBackScreenPercentage()
-{
-    CancelScreenPercentage();
-    float* ref = g_ref.load(std::memory_order_acquire);
-    std::lock_guard<std::mutex> lock(g_m);
-    if (!ref || !g_have_game_value) return false;
-    const float cur = read_value(ref);
-    if (std::fabs(cur - g_our_value) > 0.01f) { // the game has set its own value since: keep it
-        g_have_game_value = false;
-        return false;
-    }
-    const bool ok = write_value(ref, g_game_value);
-    g_have_game_value = false;
-    strncpy_s(g_status.reason, ok ? "Resolution control handed back to the game." : "Could not restore the game's resolution setting.", _TRUNCATE);
-    return ok;
+#ifdef NA_UNREAL_APPLY_TEST
+void ConfigureForTest(void* f,void* i,Setter fs,Setter is) {
+    std::lock_guard<std::mutex> lock(g_m);g_float=f;g_int=i;g_float_set=fs;g_int_set=is;g_caller=0xabc;
+    g_status={};g_status.available=true;g_pending={};g_owner={};g_confirm=0;g_executing=g_handback=false;
 }
-
+void ProcessForTest(uintptr_t caller){process(caller);}
+#endif
 } // namespace na::unreal
