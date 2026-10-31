@@ -582,11 +582,12 @@ void write_status_line()
     const int mode_bytes=na::mode::FormatStatus(mode_line,sizeof(mode_line));
     if(mode_bytes>0){WriteFile(f,mode_line,DWORD((std::min)(mode_bytes,int(sizeof(mode_line)-1))),&written,nullptr);WriteFile(f,"\r\n",2,&written,nullptr);}
     {
-        char source_line[160];
-        const int source_bytes=snprintf(source_line,sizeof(source_line),"overlay_source=%s native_presents=%llu presents=%llu\r\n",
+        char source_line[256];
+        const int source_bytes=snprintf(source_line,sizeof(source_line),"overlay_source=%s native_presents=%llu presents=%llu pid=%lu queue_hits=%u buffer_queue=%u queue_misses=%u\r\n",
             g_boundary_frames.load(std::memory_order_acquire)?"streamline":"native",
             static_cast<unsigned long long>(g_native_game_presents.load(std::memory_order_relaxed)),
-            static_cast<unsigned long long>(g_presents.load(std::memory_order_relaxed)));
+            static_cast<unsigned long long>(g_presents.load(std::memory_order_relaxed)),GetCurrentProcessId(),
+            g_swap_queue_hits.load(),g_swap_queue_observed.load(),g_swap_queue_misses.load());
         if(source_bytes>0)WriteFile(f,source_line,DWORD((std::min)(source_bytes,int(sizeof(source_line)-1))),&written,nullptr);
     }
     char sl_boundary_line[1024];
@@ -2707,51 +2708,71 @@ bool Start(const char* route_tag, PanelFn controls)
                 g_native_present_target = vt[kSwapPresentSlot];
                 g_native_present1_target = vt[kSwap1Present1Slot];
             }
-            ok = na::hooking::HookVTableSlot(sc.Get(), kSwapReleaseSlot,
+            // Other startup workers (Streamline/NGX/engine adapters) also
+            // install hooks. Immediate HookVTableSlot fails while ANY install
+            // transaction is open. Previously that left just the first hooks
+            // enabled and skipped the queue tracker. Own one coherent batch.
+            bool transaction=false;
+            for(unsigned attempt=0;attempt<5000 && !transaction;++attempt){
+                transaction=na::hooking::BeginInstall();if(!transaction)Sleep(1);
+            }
+            auto prepare_start_hook=[](void* object,uint32_t slot,void* detour,void** original){
+                const bool prepared=na::hooking::PrepareVTableSlot(object,slot,detour,original);
+                if(!prepared){
+                    char reason[160]{},target[160]{},line[480]{};
+                    na::hooking::LastError(reason,sizeof(reason));
+                    const void* address=object?(*static_cast<void***>(object))[slot]:nullptr;
+                    const int n=snprintf(line,sizeof(line),"overlay_start pid=%lu slot=%u target=%s failed: %s\r\n",
+                        GetCurrentProcessId(),slot,module_of(address,target,sizeof(target)),reason);
+                    append_status_text(line,(std::min)(n,int(sizeof(line)-1)));
+                }
+                return prepared;
+            };
+            ok = transaction && prepare_start_hook(sc.Get(), kSwapReleaseSlot,
                                              reinterpret_cast<void*>(&DetourRelease),
                                              reinterpret_cast<void**>(&g_orig_release)) &&
-                 na::hooking::HookVTableSlot(sc.Get(), kSwapPresentSlot,
+                 prepare_start_hook(sc.Get(), kSwapPresentSlot,
                                              reinterpret_cast<void*>(&DetourPresent),
                                              reinterpret_cast<void**>(&g_orig_present)) &&
-                 na::hooking::HookVTableSlot(sc.Get(), kSwap1Present1Slot,
+                 prepare_start_hook(sc.Get(), kSwap1Present1Slot,
                                              reinterpret_cast<void*>(&DetourPresent1),
                                              reinterpret_cast<void**>(&g_orig_present1)) &&
-                 na::hooking::HookVTableSlot(sc.Get(), kSwapResizeBuffersSlot,
+                 prepare_start_hook(sc.Get(), kSwapResizeBuffersSlot,
                                              reinterpret_cast<void*>(&DetourResizeBuffers),
                                              reinterpret_cast<void**>(&g_orig_resize)) &&
-                 na::hooking::HookVTableSlot(queue.Get(), kQueueExecuteSlot,
+                 prepare_start_hook(queue.Get(), kQueueExecuteSlot,
                                              reinterpret_cast<void*>(&DetourExecute),
                                              reinterpret_cast<void**>(&g_orig_execute));
             // A59 presenter: GetBuffer / GetCurrentBackBufferIndex / ResizeBuffers1.
             // The full observer owns these slots when requested. This narrow
             // trace is for Route A freezes with that observer disabled.
             if(ok && !na::observe::InstallRequested()) {
-                const bool signal=na::hooking::HookVTableSlot(queue.Get(),14,reinterpret_cast<void*>(&TraceSignal),reinterpret_cast<void**>(&g_trace_signal));
-                const bool wait=na::hooking::HookVTableSlot(queue.Get(),15,reinterpret_cast<void*>(&TraceWait),reinterpret_cast<void**>(&g_trace_wait));
+                const bool signal=prepare_start_hook(queue.Get(),14,reinterpret_cast<void*>(&TraceSignal),reinterpret_cast<void**>(&g_trace_signal));
+                const bool wait=prepare_start_hook(queue.Get(),15,reinterpret_cast<void*>(&TraceWait),reinterpret_cast<void**>(&g_trace_wait));
                 na::nr::trace::sync_hooks.store((signal?1u:0u)|(wait?2u:0u));
             }
             ComPtr<IDXGISwapChain3> sc3;
             if (ok && SUCCEEDED(sc.As(&sc3))) {
-                ok = na::hooking::HookVTableSlot(sc.Get(), kSwapGetBufferSlot,
+                ok = prepare_start_hook(sc.Get(), kSwapGetBufferSlot,
                                                  reinterpret_cast<void*>(&DetourGetBuffer),
                                                  reinterpret_cast<void**>(&g_orig_get_buffer)) &&
-                     na::hooking::HookVTableSlot(sc3.Get(), kSwap3GetIndexSlot,
+                     prepare_start_hook(sc3.Get(), kSwap3GetIndexSlot,
                                                  reinterpret_cast<void*>(&DetourGetCurrentBackBufferIndex),
                                                  reinterpret_cast<void**>(&g_orig_get_index)) &&
-                     na::hooking::HookVTableSlot(sc3.Get(), kSwap3ResizeBuffers1Slot,
+                     prepare_start_hook(sc3.Get(), kSwap3ResizeBuffers1Slot,
                                                  reinterpret_cast<void*>(&DetourResizeBuffers1),
                                                  reinterpret_cast<void**>(&g_orig_resize1)) &&
-                     na::hooking::HookVTableSlot(sc3.Get(), kSwap2SetMaxLatencySlot,
+                     prepare_start_hook(sc3.Get(), kSwap2SetMaxLatencySlot,
                                                  reinterpret_cast<void*>(&DetourSetMaximumFrameLatency),
                                                  reinterpret_cast<void**>(&g_orig_set_max_latency)) &&
-                     na::hooking::HookVTableSlot(sc3.Get(), kSwap2GetMaxLatencySlot,
+                     prepare_start_hook(sc3.Get(), kSwap2GetMaxLatencySlot,
                                                  reinterpret_cast<void*>(&DetourGetMaximumFrameLatency),
                                                  reinterpret_cast<void**>(&g_orig_get_max_latency)) &&
-                     na::hooking::HookVTableSlot(sc3.Get(), kSwap2GetLatencyObjectSlot,
+                     prepare_start_hook(sc3.Get(), kSwap2GetLatencyObjectSlot,
                                                  reinterpret_cast<void*>(&DetourGetFrameLatencyWaitableObject),
                                                  reinterpret_cast<void**>(&g_orig_get_latency_object));
                 // Colour space (HDR10 detection for Neural Rendering); optional.
-                na::hooking::HookVTableSlot(sc3.Get(), kSwap3SetColorSpace1Slot,
+                prepare_start_hook(sc3.Get(), kSwap3SetColorSpace1Slot,
                                             reinterpret_cast<void*>(&DetourSetColorSpace1),
                                             reinterpret_cast<void**>(&g_orig_set_color_space));
             }
@@ -2759,18 +2780,26 @@ bool Start(const char* route_tag, PanelFn controls)
                 // Swap-chain creation on the shared factory vtable (after our own dummy
                 // chain exists, so it is never recorded). Late attachments recover
                 // per-buffer queues from submitted writes instead.
-                na::hooking::HookVTableSlot(factory.Get(), kFactoryCreateSwapChainSlot,
+                prepare_start_hook(factory.Get(), kFactoryCreateSwapChainSlot,
                                             reinterpret_cast<void*>(&DetourCreateSwapChain),
                                             reinterpret_cast<void**>(&g_orig_create_swapchain));
-                na::hooking::HookVTableSlot(factory.Get(), kFactory2CreateForHwndSlot,
+                prepare_start_hook(factory.Get(), kFactory2CreateForHwndSlot,
                                             reinterpret_cast<void*>(&DetourCreateForHwnd),
                                             reinterpret_cast<void**>(&g_orig_create_for_hwnd));
-                na::hooking::HookVTableSlot(factory.Get(), kFactory2CreateForCoreWindowSlot,
+                prepare_start_hook(factory.Get(), kFactory2CreateForCoreWindowSlot,
                                             reinterpret_cast<void*>(&DetourCreateForCoreWindow),
                                             reinterpret_cast<void**>(&g_orig_create_for_core_window));
-                na::hooking::HookVTableSlot(factory.Get(), kFactory2CreateForCompositionSlot,
+                prepare_start_hook(factory.Get(), kFactory2CreateForCompositionSlot,
                                             reinterpret_cast<void*>(&DetourCreateForComposition),
                                             reinterpret_cast<void**>(&g_orig_create_for_composition));
+            }
+            if(transaction){
+                if(ok)ok=na::hooking::CommitInstall();else na::hooking::AbandonInstall();
+            }
+            if(!ok){
+                char reason[160]{},line[240]{};na::hooking::LastError(reason,sizeof(reason));
+                const int n=snprintf(line,sizeof(line),"overlay_start pid=%lu core_failed: %s\r\n",GetCurrentProcessId(),reason);
+                append_status_text(line,(std::min)(n,int(sizeof(line)-1)));
             }
             if (ok && na::observe::InstallRequested()) // C8: observation producers on the same throwaway objects
             {

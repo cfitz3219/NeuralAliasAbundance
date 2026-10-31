@@ -87,7 +87,7 @@ bool hook_target_locked(void* target, void* detour, void** out_original, bool en
         // Idempotent: same target may be reached through many objects sharing
         // one vtable. A second registration with a different detour is a
         // programming error we refuse rather than silently chain.
-        if (it->second.detour != detour || it->second.dead) return false;
+        if (it->second.detour != detour || it->second.dead) { set_error("target already owned by another detour or retired hook"); return false; }
         *out_original = it->second.trampoline;
         if (!enable) {
             // A46 (A45 review finding 1): a pending target published to a

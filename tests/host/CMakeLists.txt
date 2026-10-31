@@ -244,3 +244,6 @@ na_host_test(unreal_locator_test SOURCES unreal_locator_test.cpp LIBS host_dx12)
 add_test(NAME host_overlay_late_queue_test COMMAND overlay_test --warp --late-queue)
 add_test(NAME host_overlay_late_queue_hardware_test COMMAND overlay_test --hardware --late-queue)
 set_tests_properties(host_overlay_late_queue_test host_overlay_late_queue_hardware_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+
+add_test(NAME host_overlay_start_contention_test COMMAND overlay_test --warp --busy-install)
+set_tests_properties(host_overlay_start_contention_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "host;gpu")

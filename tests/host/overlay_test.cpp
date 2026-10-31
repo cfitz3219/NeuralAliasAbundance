@@ -18,6 +18,7 @@
 #include <filesystem>
 
 #include <atomic>
+#include <thread>
 
 namespace na::overlay { long ReadNativeBufferForTests(IDXGISwapChain*,unsigned,REFIID,void**); }
 
@@ -58,6 +59,7 @@ void Pump() { MSG msg; while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { Tr
 int main(int argc, char** argv)
 {
     const bool hardware = argc > 1 && !strcmp(argv[1], "--hardware");
+    const bool busy_install=argc>2 && !strcmp(argv[2],"--busy-install");
     const bool late_queue = argc > 2 && !strcmp(argv[2], "--late-queue");
     SetEnvironmentVariableW(L"NEURALALIAS_TEST_WARP", hardware ? nullptr : L"1");
     wchar_t temp[MAX_PATH]{}, ini[MAX_PATH]{}, scope[64]{};
@@ -87,7 +89,17 @@ int main(int argc, char** argv)
 
     REQUIRE(na::hooking::Initialize());
     na::overlay::RegisterRouteAMenu();
-    if(!late_queue) REQUIRE(na::overlay::Start("TEST", nullptr));
+    if(!late_queue) {
+        std::atomic<bool> held{false};std::thread competitor;
+        if(busy_install)competitor=std::thread([&]{
+            const bool acquired=na::hooking::BeginInstall();held.store(acquired);
+            if(acquired){Sleep(2000);na::hooking::AbandonInstall();}
+        });
+        if(busy_install)while(!held.load())Sleep(1);
+        const bool started=na::overlay::Start("TEST",nullptr);
+        if(competitor.joinable())competitor.join();
+        REQUIRE(started);
+    }
 
     WNDCLASSW wc{}; wc.lpfnWndProc = GameWndProc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"NeuralAliasOverlayTestGame";
     RegisterClassW(&wc);
