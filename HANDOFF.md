@@ -581,3 +581,11 @@ Cort confirms the updated Ghost overlay now works. The b71ba0b repair uses share
 
 ### 2026-10-31 - Broad native-DLSS readiness audit
 Cort requested assessment of fragility against broad drop-in goals. Production docs/BROAD-NATIVE-DLSS-INSTALLER-AUDIT-20261031.md records source-backed findings, actual Ghost source1 NR and FG Off/On evidence, primary NVIDIA/Microsoft requirements, reusable implementation plan and qualification limits. COMMS has focused handoff. No runtime or installer changed in this audit. Shared ownership/convention/engine-control gaps remain; this is not another claim that universal readiness is complete.
+
+## 2026-10-31 - Approved ownership stage1 ready for user audit/testing
+
+Production PR59 runtime698c298 / documentationee69256. Fable/Opus plan review implemented as staged approval: O4 independent core/menu and SL retry, O1 consistent buffer/delivery/resize ownership with lock order, cursor count/competition fix, and actual-version FG wording. Existing core, NR algorithms/route behavior and Poise retained. FullRelease131PASS5SKIP0FAIL across136tests, WARP/RTX included; WinPS5.1 installer/rollback/upgrade fixturesPASS. Source details and qualifications: production docs/OWNERSHIP-STAGE1-20261031.md and plan revision2.
+
+Separate validated Documents packages NA-Tsushima-package-698c298 and NA-PBZ-package-698c298; new ownership-update/rollback cmd files. Default updaters and actual installed Ghostb71ba0b/PBZ63395c7 unchanged and immutable hashes verified. No game/native DLL actions; Cort tests. Candidate additive repair retains existing preference-reset behavior. Ghostb71 remains known-working baseline; new game quality not claimed.
+
+R1/R2 follow-upd9d6bbb received after build. Current Ghost aggregate logs cannot replay-prove exact view/context binding; O2 stays unchanged. Next O3 must use review's light rendering-qualified process marker with explicit shared persistence permission; no complex lease redesign approved in first candidate. F/F-1 resource reuse, before-replacement identity, async timing and one-frame wake assumptions corrected in COMMS/plan. No added review cycle/subagents. This completes the first approved stage, not the entire universal-installer ownership roadmap.
