@@ -110,6 +110,14 @@ na_host_test(depth_format_test SOURCES depth_format_test.cpp)
 na_host_test(nr_depth_test SOURCES nr_depth_test.cpp LIBS host_dx12)
 na_host_test(nr_fg_composition_test SOURCES nr_fg_composition_test.cpp LIBS host_dx12)
 na_host_test(nr_fg_frame_cache_test SOURCES nr_fg_frame_cache_test.cpp LIBS host_dx12)
+# P4-0b: moving-object motion for J2 from optical flow. Fake engine in CI (pairing,
+# false-flow rejection, engine failure, busy rings + watchdog, resize retirement).
+na_host_test(j2_flow_test SOURCES j2_flow_test.cpp LIBS host_dx12 dxgi d3dcompiler)
+if(NA_HAVE_NVOF)
+  # Same pipeline on the real NVIDIA optical-flow engine (RTX 20+); SKIPs without it.
+  add_test(NAME host_j2_flow_real_test COMMAND j2_flow_test --real)
+  set_tests_properties(host_j2_flow_real_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
+endif()
 
 # C6: generic DLSS backend. The fake-runtime test needs only the NGX headers
 # (runs in CI); the real test needs our own NGX instance (static library from

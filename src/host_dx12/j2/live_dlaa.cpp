@@ -4,6 +4,7 @@
 #include "host_dx12/j2/route_selector.hpp"
 #include "host_dx12/j2/consumer_profile.hpp"
 #include "host_dx12/j2/jitter_writes.hpp"
+#include "host_dx12/j2/j2_flow.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 #include "host_dx12/upscalers/ffx_intercept.hpp"
@@ -948,7 +949,8 @@ na::motion::Mat4 to_mat4(const na::camera::Matrix& m)
 // recorded into it (the caller then restores the game's state).
 bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, na_object_id color_id,
             ID3D12GraphicsCommandList** out_list, PendingHistory& pending, ID3D12GraphicsCommandList* inl = nullptr,
-            bool* touched = nullptr, const SceneInput* saved = nullptr, UINT prefix = 0)
+            bool* touched = nullptr, const SceneInput* saved = nullptr, UINT prefix = 0,
+            na::j2::flow::Ticket* flow_ticket = nullptr, bool flow_pair_ok = false)
 {
     ComPtr<ID3D12Resource> color, depth;
     color.Attach(na::observe::AcquireResource(color_id));
@@ -1069,10 +1071,32 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // frames (a frame whose scene submissions differed): no reset, no visible
     // restart. A long gap (or resume/resize) starts over.
     constexpr uint64_t kMaxGapFrames = 4;
-    if (g.resume_reset || (g.submitted_frame && g.frame > g.submitted_frame + kMaxGapFrames)) pending.tracker.Reset();
+    const bool tracker_restart = g.resume_reset || (g.submitted_frame && g.frame > g.submitted_frame + kMaxGapFrames);
+    if (tracker_restart) pending.tracker.Reset();
     const na::camera::CameraFrame cam = pending.tracker.Update(vp, g.frame, w, h, injected);
     if (!cam.valid) { ++g.stats.no_camera; reason("The camera matrix could not be inverted."); return false; }
     pending.cut = cam.camera_cut;
+    // P4-0b: moving-object motion (between-lists route only). The pre list is
+    // submitted right before this list; the flow pairs with the frame the camera
+    // history pairs with. Any failure leaves this frame camera-only.
+    if (flow_ticket && !inl && !color_msaa && na::j2::flow::Enabled()) {
+        na::j2::flow::Source fs;
+        fs.color = color.Get();
+        fs.subresource = csub;
+        fs.state = sc;
+        fs.format = cf;
+        fs.width = w;
+        fs.height = h;
+        fs.frame = g.frame;
+        fs.previous_frame = g.submitted_frame;
+        fs.generation = g.route_gen_applied;
+        fs.reset = tracker_restart || cam.camera_cut || resize;
+        fs.allow_pair = flow_pair_ok;
+        fs.jitter_px[0] = static_cast<float>(cam.jitter_px_x);
+        fs.jitter_px[1] = static_cast<float>(cam.jitter_px_y);
+        fs.slot = g.slot;
+        *flow_ticket = na::j2::flow::Prepare(g.device.Get(), g.queue.Get(), fs);
+    }
     if (!inl && (FAILED(s.alloc->Reset()) || FAILED(s.list->Reset(s.alloc.Get(), nullptr)))) { reason("Could not reset the DLAA command list."); return false; }
     ID3D12GraphicsCommandList* l = inl ? inl : s.list.Get();
     if (touched) *touched = true;
@@ -1135,6 +1159,14 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         // projection; the arbiter removes it before reprojecting (Astra, 378663e finding).
         in.jitter_current_px[0] = static_cast<float>(cam.jitter_px_x);
         in.jitter_current_px[1] = static_cast<float>(cam.jitter_px_y);
+        // P4-0b: camera + accepted moving-object residual (tier 3) when this frame's pair ran.
+        na::j2::flow::Tier3 t3;
+        if (flow_ticket && flow_ticket->pair && na::j2::flow::RecordFusion(l, *flow_ticket, g.depth32.Get(), in, &t3)) {
+            in.tier3_residual = t3.residual;
+            in.tier3_mask = t3.mask;
+            in.tier3_valid = t3.valid;
+            in.tier3_valid_flag = true;
+        }
         na::motion::gpu::Outputs o{};
         o.xy = g.motion.Get();
         o.provenance = g.provenance.Get();
@@ -1972,6 +2004,11 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     const bool wait_later = scene >= 0 && g.scene_batches_cur < g.scene_batches_target;
     ID3D12GraphicsCommandList* ours = nullptr;
     PendingHistory pending;
+    // P4-0b: the flow pair needs a GPU wait between our pre list and our DLAA list.
+    // Without the diagnostic split switch that is only done when no game list follows
+    // the scene list in this submission (the game's lists keep their grouping).
+    na::j2::flow::Ticket flow_ticket;
+    const bool flow_pair_ok = scene >= 0 && (static_cast<UINT>(scene) + 1 == count || na::j2::flow::AllowSplit());
     if (scene < 0) {
         ++g.stats.no_scene_list;
     } else if (wait_later) {
@@ -1981,7 +2018,8 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     } else {
         if (!dlss_on()) {
             // reason set
-        } else if (record(lists, static_cast<UINT>(scene), depth_id, color_id, &ours, pending)) {
+        } else if (record(lists, static_cast<UINT>(scene), depth_id, color_id, &ours, pending, nullptr, nullptr, nullptr, 0,
+                          &flow_ticket, flow_pair_ok)) {
             g.stats.later_passes = na::observe::ListTargetsAfter(lists[scene], color_id, depth_id);
         }
     }
@@ -1989,6 +2027,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     if (scene >= 0 && !wait_later) g.jit.valid = false; // the scene closes this frame's jitter: the next camera block starts a new sample
     if (!ours) {
         na::capture::j2::Discard(pending.capture, false); // our list is reset before any GPU use
+        na::j2::flow::Abandon(queue, flow_ticket);        // never leaves the flow engine waiting
         lock.unlock();
         forward(queue, count, lists);
         return;
@@ -1996,12 +2035,14 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     if (before_reader) ++g.stats.between_observed; // an observed reader follows in this batch
     else ++g.stats.between_predicted;              // placed after a predicted last scene list
     std::vector<ID3D12CommandList*> batch(lists, lists + count);
-    batch.insert(batch.begin() + scene + 1, ours);
+    UINT ours_at = static_cast<UINT>(scene) + 1;
+    if (flow_ticket.valid) batch.insert(batch.begin() + ours_at++, flow_ticket.pre); // P4-0b pre list, right before ours
+    batch.insert(batch.begin() + ours_at, ours);
     const UINT n2 = static_cast<UINT>(batch.size());
     Slot& s = g.slots[g.slot];
     g.slot = (g.slot + 1) % kRing;
     na::dlss::BeforeExecute(queue, n2, batch.data());
-    forward(queue, n2, batch.data());
+    na::j2::flow::Submit(queue, flow_ticket, batch.data(), n2, ours_at, forward); // one forward unless a flow pair is consumed
     if (g.jitter_on) count_post_dlaa(lists, static_cast<UINT>(scene) + 1, count, depth_id); // same batch, after the DLAA list
     // The void D3D12 forward has now submitted our list. Failed recording/NGX
     // attempts above must never replace the previous submitted camera.
@@ -2022,6 +2063,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     na::dlss::OnExecuted(queue, n2, batch.data());
     s.fence_value = g.fence_next++;
     queue->Signal(g.fence.Get(), s.fence_value);
+    na::j2::flow::Committed(flow_ticket, g.fence.Get(), s.fence_value);
     na::capture::j2::Submitted(pending.capture, queue, g.stats.submissions);
 }
 
@@ -2037,6 +2079,7 @@ void Shutdown()
     g.depth32.Reset(); g.motion.Reset(); g.provenance.Reset(); g.output.Reset(); g.color_in.Reset(); g.sharp.Reset();
     g.msaa = MsaaResolve{};
     for (auto& s : g.slots) { s.list.Reset(); s.alloc.Reset(); s.fence_value = 0; }
+    na::j2::flow::Shutdown(); // before the device and J2's fence go
     g.fence.Reset(); g.queue.Reset(); g.device.Reset();
     g.arbiter = na::motion::gpu::Arbiter{};
     g_dbg = DebugPass{};

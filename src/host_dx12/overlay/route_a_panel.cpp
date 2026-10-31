@@ -25,6 +25,7 @@
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/fg/frame_gen.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/j2/j2_flow.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/fg/preset_profile.hpp"
 #include "host_dx12/motion/live_flow.hpp"
@@ -962,6 +963,23 @@ void DrawLiveDlaa()
         ImGui::SetNextItemWidth(S(220));
         if (ImGui::Combo("##j2dbg", &dv, kViews, 4)) na::j2::SetDebugView(dv);
         EndRow();
+    }
+    {
+        // P4-0b: moving-object motion from NVIDIA hardware optical flow (test; off by default).
+        bool fl = na::j2::flow::Enabled();
+        BeginRow("Moving-object motion (test)", "Measures how ships, people and other moving things move (NVIDIA optical flow) so DLAA does not smear them. Still scenery is unchanged. Costs a few milliseconds per frame. Turn it off to compare; the Motion vectors debug view shows the result.", SwitchWidth());
+        if (Switch("j2flow", &fl)) na::j2::flow::SetEnabled(fl);
+        EndRow();
+        if (fl) {
+            const na::j2::flow::Stats fs = na::j2::flow::GetStats();
+            const uint64_t px = fs.px_accepted + fs.px_invalid + fs.px_small + fs.px_cost + fs.px_offscreen + fs.px_image;
+            const double pct = px ? 100.0 * static_cast<double>(fs.px_accepted) / static_cast<double>(px) : 0.0;
+            char tb[360];
+            std::snprintf(tb, sizeof tb, "%s Moving pixels found: %.1f%% of the picture. Cost %.2f ms (average %.2f). Pairs %llu, camera-only frames %llu.",
+                          fs.reason, pct, fs.ms_last, fs.ms_avg, static_cast<unsigned long long>(fs.consumed),
+                          static_cast<unsigned long long>(fs.encode_only + fs.skipped_busy + fs.skipped_split));
+            StatusLine(fs.latched ? 2 : 0, tb);
+        }
     }
     {
         // Texture detail (negative mip bias, NVIDIA DLSS guide 3.5: -1 at native).

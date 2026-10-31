@@ -171,6 +171,7 @@ add_library(host_dx12 STATIC
   src/host_dx12/nr/native_fg.cpp
   src/host_dx12/nr/fg_states.cpp
   src/host_dx12/j2/live_dlaa.cpp
+  src/host_dx12/j2/j2_flow.cpp
   src/host_dx12/j2/nis_sharpen.cpp
   src/host_dx12/motion/live_flow.cpp
   src/host_dx12/latency/nvidia_latency.cpp
