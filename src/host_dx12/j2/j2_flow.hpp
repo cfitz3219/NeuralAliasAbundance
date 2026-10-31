@@ -36,7 +36,9 @@
 #include <d3d12.h>
 #include <cstdint>
 
-#include "core/motion_arbiter_gpu.hpp"
+// Forward declaration only: core/motion_arbiter.hpp and motion/live_flow.hpp both
+// define na::motion::Output/Stats, so this header (included by the menu) must not pull them in.
+namespace na::motion::gpu { struct Inputs; }
 
 namespace na::j2::flow {
 

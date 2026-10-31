@@ -1,5 +1,7 @@
 #include "host_dx12/j2/j2_flow.hpp"
 
+#include "core/motion_arbiter_gpu.hpp"
+
 #include "host_dx12/nvof/flow_expand.hpp"
 #include "host_dx12/nvof/nvof_flow.hpp"
 #include "host_dx12/settings.hpp"
