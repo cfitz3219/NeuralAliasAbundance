@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [ValidateSet('Install','Rollback','Status','Validate')][string]$Action = 'Install',
     [string]$GameRoot = 'C:\Program Files (x86)\Steam\steamapps\common\PBZ',
@@ -86,7 +86,7 @@ if ($Action -eq 'Rollback') {
 }
 $package = Get-Content -Raw -LiteralPath (Join-Path $PackageRoot 'package.json') | ConvertFrom-Json
 foreach ($f in $package.payload) {
-    if ($f.name -notin @('NeuralAliasDXGI.dll','NAProfile.exe','nvngx_dlssnr.dll','NVIDIA-NR-LICENSE.txt','deploy-pbz.ps1','pbz-package-run.ps1','README.md','ENGINEERING-NOTES.md','repair-from.txt','tsushima-package-run.ps1')) {
+    if ($f.name -notin @('NeuralAliasDXGI.dll','NAProfile.exe','nvngx_dlssnr.dll','NVIDIA-NR-LICENSE.txt','deploy-pbz.ps1','pbz-package-run.ps1','README.md','ENGINEERING-NOTES.md','repair-from.txt','tsushima-package-run.ps1','Poise-Regular.ttf','Poise-Medium.ttf','Poise-OFL.txt')) {
         throw "Not a package payload file: $($f.name). Logs and deployment state must not enter the payload manifest."
     }
     if ((Hash (Join-Path $PackageRoot $f.name)) -ne $f.sha256) { throw "Package file mismatch: $($f.name)" }
@@ -110,6 +110,7 @@ if ($useProfile) {
     if ($LASTEXITCODE -ne 0) { throw "$gameLabel NVIDIA profile was not found." }
 }
 New-Item -ItemType Directory -Force -Path $StateRoot,$UserRoot | Out-Null
+$poise = (Test-Path -LiteralPath (Join-Path $PackageRoot 'Poise-Regular.ttf')) -and (Test-Path -LiteralPath (Join-Path $PackageRoot 'Poise-Medium.ttf')) -and (Test-Path -LiteralPath (Join-Path $PackageRoot 'Poise-OFL.txt'))
 $ini = @"
 [settings]
 scope=$scope
@@ -119,6 +120,9 @@ tag=$gameLabel
 status_log=$UserRoot\status.log
 startup_log=$UserRoot\startup.log
 menu_diagnostics=1
+[overlay]
+font_body=$(if($poise){Join-Path $UserRoot 'Poise-Regular.ttf'})
+font_title=$(if($poise){Join-Path $UserRoot 'Poise-Medium.ttf'})
 [route_a]
 enabled=1
 [observe]
@@ -152,6 +156,9 @@ enabled=0
 $iniSource = Join-Path $StateRoot 'defaults.ini'
 $ini | Set-Content -LiteralPath $iniSource -Encoding Unicode
 $plans = @()
+if($poise){foreach($font in @('Poise-Regular.ttf','Poise-Medium.ttf','Poise-OFL.txt')){
+    $plans += @{source=(Join-Path $PackageRoot $font);destination=(Join-Path $UserRoot $font);mutable=$false}
+}}
 foreach ($dir in @($exeDir)) {
     if (-not (Test-Path -LiteralPath (Join-Path $GameRoot "$dir\$gameExe"))) { continue }
     foreach ($pair in @(@('NeuralAliasDXGI.dll','dxgi.dll'),@('nvngx_dlssnr.dll','nvngx_dlssnr.dll'))) {

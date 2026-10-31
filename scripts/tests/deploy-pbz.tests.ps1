@@ -11,7 +11,7 @@ $global:naFixtureRunning=$false
 function Get-Process { [CmdletBinding()] param([string]$Name) if($global:naFixtureRunning){[PSCustomObject]@{Name=$Name}} }
 function Get-AuthenticodeSignature { param($LiteralPath) [PSCustomObject]@{Status='Valid';SignerCertificate=[PSCustomObject]@{Subject='NVIDIA Corporation'}} }
 $payload=@()
-foreach($n in @('NAProfile.exe','NeuralAliasDXGI.dll','nvngx_dlssnr.dll')) {
+foreach($n in @('NAProfile.exe','NeuralAliasDXGI.dll','nvngx_dlssnr.dll','Poise-Regular.ttf','Poise-Medium.ttf','Poise-OFL.txt')) {
     Set-Content -LiteralPath (Join-Path $pkg $n) -Value "fixture $n"
     $payload+=@{name=$n;sha256=(Get-FileHash (Join-Path $pkg $n)).Hash}
 }
@@ -107,7 +107,7 @@ $ghostArgs=@{GameProfile='Tsushima';GameRoot=$ghost;PackageRoot=$pkg;StateRoot=$
 & $script @ghostArgs -Action Validate
 & $script @ghostArgs -Action Install
 $gm=Get-Content (Join-Path $ghostState 'deployment.json') -Raw | ConvertFrom-Json
-Check ($gm.files.Count -eq 4) 'Ghost installed an unexpected file set'
+Check ($gm.files.Count -eq 7) 'Ghost installed an unexpected file set'
 Check (-not $gm.profile_attempted) 'Ghost altered a driver profile'
 Check (Test-Path (Join-Path $ghost 'dxgi.dll')) 'Ghost proxy absent'
 Check (-not (Test-Path (Join-Path $ghost 'Engine'))) 'Ghost got an Unreal directory'
@@ -123,3 +123,5 @@ $legacyRefused=$false
 try { & $script @ghostArgs -Action Install } catch { $legacyRefused=$_.Exception.Message -like '*previous Streamline*' }
 Check $legacyRefused 'Ghost accepted a second injector over the legacy proxy'
 Write-Host 'PASS: Ghost additive install/rollback, original preferences restored, no native DLL or driver-profile changes, legacy proxy refusal.'
+
+
