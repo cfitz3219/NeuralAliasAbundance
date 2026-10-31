@@ -254,7 +254,7 @@ add_library(host_upscalers STATIC
   src/host_dx12/upscalers/ffx_intercept.cpp
   src/host_dx12/upscalers/xess_intercept.cpp)
 target_include_directories(host_upscalers SYSTEM PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ffx-api")
-target_link_libraries(host_upscalers PUBLIC abundance_options host_hooking host_dlss d3d12)
+target_link_libraries(host_upscalers PUBLIC abundance_options host_hooking host_dlss host_settings d3d12)
 
 # -------------------------------------------------------------- deliverables
 # Standalone manager / diagnostic exe.

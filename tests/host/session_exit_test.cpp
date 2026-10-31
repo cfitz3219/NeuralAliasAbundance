@@ -4,11 +4,16 @@
 #include "host_dx12/hooking/vtable_hook.hpp"
 #include <filesystem>
 #include <string>
+#include <thread>
 int wmain(int argc,wchar_t** argv){
     if(argc==3){
         na::settings::SetIniPath(argv[2]);na::settings::Load();
         if(!na::hooking::Initialize())return 9;
         na::host::StartSession();
+        std::thread worker([]{na::host::RunSessionWorker();});
+        na::host::RendererObserved();
+        for(unsigned i=0;i<1000 && !na::host::SessionReady();++i)Sleep(5);
+        if(!na::host::SessionReady())ExitProcess(8);
         if(!wcscmp(argv[1],L"freeze"))na::settings::MarkSessionFailed("freeze");
         if(!wcscmp(argv[1],L"kill"))TerminateProcess(GetCurrentProcess(),5);
         ExitProcess(0);
@@ -26,9 +31,10 @@ int wmain(int argc,wchar_t** argv){
         REQUIRE(CreateProcessW(nullptr,command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW,nullptr,nullptr,&si,&pi));
         const auto wait=WaitForSingleObject(pi.hProcess,10000);
         if(wait!=WAIT_OBJECT_0)TerminateProcess(pi.hProcess,9);
+        const auto renderer_marker=marker+L"."+std::to_wstring(pi.dwProcessId);
         DWORD code=0;GetExitCodeProcess(pi.hProcess,&code);CloseHandle(pi.hThread);CloseHandle(pi.hProcess);
         CHECK(wait==WAIT_OBJECT_0);CHECK(code==(!wcscmp(mode,L"kill")?5u:0u));
-        const bool exists=GetFileAttributesW(marker.c_str())!=INVALID_FILE_ATTRIBUTES;
+        const bool exists=GetFileAttributesW(renderer_marker.c_str())!=INVALID_FILE_ATTRIBUTES;
         CHECK(exists==(wcscmp(mode,L"clean")!=0));
     }
     DeleteFileW(marker.c_str());DeleteFileW(ini);DeleteFileW(na::settings::UserIniPath());

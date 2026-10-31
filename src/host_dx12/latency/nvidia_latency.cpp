@@ -84,9 +84,10 @@ NvAPI_Status __cdecl SetMode(IUnknown* dev, NV_SET_SLEEP_MODE_PARAMS* params) {
     if (device_identity != dev) { device_identity = dev; applied = -2; last_native_frame = 0; }
     game_params = *params; have_game_params = true;
     const int requested = settings::Get().reflex_mode.load();
-    auto selected = ModeRequest(*params, requested);
+    const bool effects_ready=settings::EffectsReady();
+    auto selected = effects_ready?ModeRequest(*params, requested):*params;
     const auto result = set_mode(dev, &selected);
-    applied = result == NVAPI_OK ? requested : -2;
+    applied = effects_ready && result == NVAPI_OK ? requested : -2;
     { std::lock_guard<std::mutex> out(stats_lock); stats.set_result = result; }
     return result;
 }
@@ -112,7 +113,7 @@ void Initialize() {
     ready.store(true, std::memory_order_release);
 }
 void Update(ID3D12Device* device, HWND window) {
-    if (!device || !ready.load(std::memory_order_acquire)) return;
+    if (!settings::EffectsReady() || !device || !ready.load(std::memory_order_acquire)) return;
     std::unique_lock<std::mutex> lock(control, std::try_to_lock);
     if (!lock.owns_lock()) return;
     const auto now = GetTickCount64();

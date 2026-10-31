@@ -107,7 +107,7 @@ DWORD WINAPI InitThread(LPVOID)
         na::xess::StartModuleWatch();
     }
     na::latency::Initialize();
-    na::fg::preset::Initialize();
+    // Driver profile changes wait for a qualified renderer.
     // Deterministic attach: hook the driver's NGX core before Streamline
     // loads it (closes the Init/GetCapabilityParameters race, A17).
     na::ngx::PreloadAndHookNgxCore();
@@ -170,6 +170,8 @@ DWORD WINAPI InitThread(LPVOID)
     else
         wsprintfW(log_path, L"%s\\NeuralAliasSL-observe.log", dir);
     na::ngx::StartLogger(log_path);
+    static wchar_t session_ini[MAX_PATH]{};wcsncpy_s(session_ini,ini,_TRUNCATE);
+    na::host::RunSessionWorker([]{na::host::ActivateSavedRequests(session_ini);});
     return 0;
 }
 

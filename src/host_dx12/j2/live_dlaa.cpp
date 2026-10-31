@@ -1317,7 +1317,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
 // scene write. The host restores game state before forwarding the real call.
 void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint32_t n, bool compute)
 {
-    if (!g.enabled.load(std::memory_order_relaxed) || g.paused.load(std::memory_order_relaxed)) return;
+    if (!na::settings::EffectsReady() || !g.enabled.load(std::memory_order_relaxed) || g.paused.load(std::memory_order_relaxed)) return;
     uint64_t depth_id = 0, color_id = 0;
     na::observe::GetLiveSelection(&depth_id, &color_id);
     if (!color_id || !depth_id) return;
@@ -1554,7 +1554,7 @@ void SetEnabled(bool on)
     g.configured.store(on);
     if (on) na::observe::SetTableBindCallback(&on_table_bind);
 }
-bool Enabled() { return g.enabled.load(); }
+bool Enabled() { return na::settings::EffectsReady() && g.enabled.load(); }
 bool Configured() { return g.configured.load(); }
 void SetPaused(bool paused)
 {
@@ -1726,7 +1726,7 @@ void OnPresent(ID3D12CommandQueue* queue)
 
 void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists, ExecuteFn forward)
 {
-    if (!g.enabled.load(std::memory_order_relaxed) || g.paused.load(std::memory_order_relaxed) || !queue || !lists || !count) {
+    if (!na::settings::EffectsReady() || !g.enabled.load(std::memory_order_relaxed) || g.paused.load(std::memory_order_relaxed) || !queue || !lists || !count) {
         forward(queue, count, lists);
         return;
     }

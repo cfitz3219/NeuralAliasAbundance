@@ -257,6 +257,35 @@ DWORD WINAPI worker(LPVOID)
 
 } // namespace
 
+uint32_t AlignedRenderExtent(uint32_t output,int mode){
+    const auto scale=settings::ScaleForMode(static_cast<settings::DlssMode>(mode));
+    return mode==0?output:(static_cast<uint32_t>(output*scale+0.5f)+7u)&~7u;
+}
+float UnrealPercentForMode(int mode)
+{
+    static const int kPq[] = {5, 2, 1, 0, 3}; // DLAA, Quality, Balanced, Performance, Ultra Performance -> NVSDK_NGX_PerfQuality_Value
+    static const float kDefault[] = {100.f, 66.7f, 58.f, 50.f, 33.3f};
+    if (mode < 0 || mode > 4) return 100.f;
+    na::ngx::OptimalCall calls[32];
+    const uint32_t n = na::ngx::GetOptimalCalls(0, calls, 32);
+    for (uint32_t i = n; i-- > 0;) {
+        const auto& c = calls[i];
+        if (c.perf_quality == kPq[mode] && c.user_w && c.native_w && c.native_w <= c.user_w)
+            return 100.f * static_cast<float>(c.native_w) / static_cast<float>(c.user_w);
+    }
+    return kDefault[mode];
+}
+
+bool BuildSavedRequest(uint32_t mode,int32_t preset,uint32_t out_w,uint32_t out_h,Request& request){
+    if(mode>=static_cast<uint32_t>(settings::DlssMode::Count) || !out_w || !out_h || out_w==0xffffffffu || out_h==0xffffffffu)return false;
+    request={};request.mode=mode;request.preset=preset;request.out_w=out_w;request.out_h=out_h;
+    request.unreal_percent=UnrealPercentForMode(static_cast<int>(mode));
+    const bool engine_unreal=na::unreal::GetScreenPercentageStatus().available && !na::tsushima::GetApplyStatus().available && !na::tlou1::GetApplyStatus().available;
+    request.render_w=engine_unreal?na::unreal::ExpectedExtent(out_w,request.unreal_percent):AlignedRenderExtent(out_w,static_cast<int>(mode));
+    request.render_h=engine_unreal?na::unreal::ExpectedExtent(out_h,request.unreal_percent):AlignedRenderExtent(out_h,static_cast<int>(mode));
+    return true;
+}
+
 const char* LayerName(Layer layer)
 {
     switch (layer) {

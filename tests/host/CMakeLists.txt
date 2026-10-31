@@ -269,3 +269,8 @@ add_test(NAME host_overlay_optional_input_test COMMAND overlay_bootstrap_test --
 set_tests_properties(host_overlay_optional_input_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "host;gpu")
 add_test(NAME host_sl_boundary_optional_conflict_test COMMAND sl_boundary_test --optional-conflict)
 set_tests_properties(host_sl_boundary_optional_conflict_test PROPERTIES TIMEOUT 20 LABELS host)
+
+na_host_test(session_ownership_test SOURCES session_ownership_test.cpp LIBS host_dx12 user32)
+
+add_test(NAME host_overlay_cursor_cleanup_test COMMAND overlay_bootstrap_test --cursor-cleanup)
+set_tests_properties(host_overlay_cursor_cleanup_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "host;gpu")

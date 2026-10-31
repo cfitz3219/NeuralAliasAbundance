@@ -132,7 +132,18 @@ void Load();  // defaults ini, then user ini overrides when present
 // Settings -> user ini (only our keys). Returns false when any write failed;
 // the menu then says the choice is active for this session but not saved.
 bool Save();
-// Result of the most recent Save(): 0 never saved, 1 ok, 2 failed.
+// Production dispatch is queued to the existing init/control worker after
+// renderer authority. Standalone hosts/tests retain synchronous Save().
+using SaveDispatcher=bool(*)();
+void DeferForRenderer(SaveDispatcher dispatcher);
+bool BeginRendererSession(bool journal_allowed=true); // worker only; returns shared-persistence ownership
+void PublishRendererReady();
+bool EffectsReady();
+bool CanPersist();
+bool SaveFromWorker();
+void SetSavePending();
+void FlushSessionFailure();
+// Result of most recent Save():0 never,1 saved,2 failed/read-only,3 queued.
 uint32_t LastSaveResult();
 // Startup/exit worker calls only. No settings file is rewritten by safe start.
 void BeginSession(const wchar_t* marker_path=nullptr);

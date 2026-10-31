@@ -434,6 +434,7 @@ void TraceGpuProgress(){
 }
 void MarkSwapchainBuffer(ID3D12Resource* r){if(r){const UINT value=1;r->SetPrivateData(swapchain_key,sizeof(value),&value);}}
 static bool Record(ID3D12GraphicsCommandList* list,const void* core,const void* handle,FgContract f,const Runtime& runtime,InputOverride* replacement,const void* parameters,const FrameStates* declared) {
+    if(!settings::EffectsReady())return false;
     if(!list || (list->GetType()!=D3D12_COMMAND_LIST_TYPE_DIRECT && list->GetType()!=D3D12_COMMAND_LIST_TYPE_COMPUTE))return false;
     if(internal)return false;Internal guard;na::dlss::InjectorCallScope origin;
     trace::Record("nr_begin",nullptr,list);

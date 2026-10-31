@@ -1,10 +1,16 @@
 #include "test_support.hpp"
 #include "host_dx12/settings.hpp"
+#include "host_dx12/adapters/mode_control.hpp"
 #include "host_dx12/motion/live_flow.hpp"
 #include "host_dx12/overlay/route_a_panel.hpp"
 #include "host_dx12/overlay/menu.hpp"
 #include "host_dx12/overlay/na_style.hpp"
 int main() {
+    na::mode::Request saved;
+    CHECK(na::mode::BuildSavedRequest(2,13,3440,1440,saved));
+    CHECK(saved.render_w==2000 && saved.render_h==840 && saved.unreal_percent==58.f);
+    CHECK(na::mode::BuildSavedRequest(0,13,3440,1440,saved) && saved.render_w==3440 && saved.render_h==1440);
+    CHECK(!na::mode::BuildSavedRequest(99,13,3440,1440,saved));
     auto& st=na::settings::Get();
     st.motion_enabled=0; st.nr_paper_white=200; st.dlss_mode=4; st.fg_preset=3;
     auto ms=na::motion::GetStats();

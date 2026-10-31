@@ -740,4 +740,3 @@ int main(int argc,char** argv)
     CHECK(std::strstr(line, "hudless=only_valid_now/0x") != nullptr);
     return test::finish("sl_boundary_test");
 }
-

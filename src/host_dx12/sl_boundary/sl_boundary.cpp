@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "host_dx12/hooking/vtable_hook.hpp"
+#include "host_dx12/settings.hpp"
 #include "host_dx12/adapters/mode_control.hpp"
 #include "host_dx12/sl_boundary/sl_dlss_mode.hpp"
 #include "host_dx12/sl_boundary/sl_tags.hpp"
@@ -817,8 +818,9 @@ SlResult __cdecl DetourDlssgSetOptions(const void* viewport, const void* options
     const uint32_t game_mode = abi::Read<uint32_t>(copy, 32);
     const uint32_t game_frames = abi::Read<uint32_t>(copy, 36);
     const uint64_t packed = g_fg_request.load(std::memory_order_acquire);
-    const auto req_mode = static_cast<FgMode>(packed >> 32);
-    const uint32_t req_frames = static_cast<uint32_t>(packed);
+    const bool effects_ready=na::settings::EffectsReady();
+    const auto req_mode = effects_ready?static_cast<FgMode>(packed >> 32):FgMode::Game;
+    const uint32_t req_frames = effects_ready?static_cast<uint32_t>(packed):0;
     {
         std::lock_guard<std::mutex> lock(g_fg_m);
         g_fg.game_mode = game_mode;
@@ -1002,8 +1004,8 @@ DWORD WINAPI deferred_factory_install(LPVOID p)
     prepared=na::hooking::PrepareHook(vt[kSlotCreateSwapChainForHwnd], reinterpret_cast<void*>(&DetourFactoryCreateHwnd), reinterpret_cast<void**>(&g_orig_fc_hwnd)) && prepared;
     prepared=na::hooking::PrepareHook(vt[kSlotCreateSwapChainForCoreWindow], reinterpret_cast<void*>(&DetourFactoryCreateCore), reinterpret_cast<void**>(&g_orig_fc_core)) && prepared;
     prepared=na::hooking::PrepareHook(vt[kSlotCreateSwapChainForComposition], reinterpret_cast<void*>(&DetourFactoryCreateComp), reinterpret_cast<void**>(&g_orig_fc_comp)) && prepared;
-    if(!prepared){na::hooking::AbandonInstall();g_attach_terminal=true;return 0;}
-    if(!na::hooking::CommitInstall())g_attach_terminal=true;
+    if(!prepared){na::hooking::AbandonInstall();return 0;}
+    if(!na::hooking::CommitInstall())set_reason("Optional Streamline factory hooks unavailable; independent proxy attachment continues.");
     return 0;
 }
 

@@ -584,7 +584,7 @@ void FailNextDeviceInitializationForTests() { fail_device_init_for_tests.store(t
 
 bool WantsInputs()
 {
-    return !native::OwnsRoute() && HasRuntime() && na::settings::Get().nr_enabled.load(std::memory_order_relaxed) != 0 &&
+    return na::settings::EffectsReady() && !native::OwnsRoute() && HasRuntime() && na::settings::Get().nr_enabled.load(std::memory_order_relaxed) != 0 &&
            !g.latched.load(std::memory_order_acquire);
 }
 
@@ -839,7 +839,7 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer, DXGI_COLOR
     if (native::OwnsRoute()) return; // already enhanced both FG inputs, never process generated frames
     if (!queue || !backbuffer) return;
     const na::settings::Settings& st = na::settings::Get();
-    if (!st.nr_enabled.load(std::memory_order_relaxed)) {
+    if (!na::settings::EffectsReady() || !st.nr_enabled.load(std::memory_order_relaxed)) {
         g.active.store(0, std::memory_order_release);
         std::unique_lock<std::mutex> lock(g.m, std::try_to_lock);
         if (!lock.owns_lock()) return;

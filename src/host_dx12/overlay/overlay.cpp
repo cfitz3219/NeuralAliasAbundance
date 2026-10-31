@@ -49,6 +49,7 @@
 #include "host_dx12/nr/queue_trace.hpp"
 #include <ctime>
 #include "host_dx12/settings.hpp"
+#include "host_dx12/host_boot/session.hpp"
 #include "host_dx12/latency/nvidia_latency.hpp"
 #include "host_dx12/latency/pcl_stats.hpp"
 
@@ -231,6 +232,7 @@ std::atomic<uint32_t> g_retargets{0}; // swap chain re-targets (A31)
 std::atomic<uint32_t> g_initialized{0};
 std::atomic<bool> g_core_started{false}, g_menu_enabled{false}, g_fail_menu_start{false},g_fail_menu_create{false};
 std::atomic<unsigned> g_fail_optional_input{0};
+std::atomic<bool> g_fail_cursor_cleanup{false};
 std::mutex g_start_m;
 bool g_menu_frame_ready=false; // g_state.mutex
 std::atomic<uint32_t> g_gamepad_hooked{0};
@@ -447,13 +449,17 @@ void install_input_hooks()
     for (int i = 0; i < 8; ++i) {
         if(g_input_hook_targets[i]){++n;continue;}
         void* target = reinterpret_cast<void*>(GetProcAddress(u, specs[i].name));
+        if(i==7 && g_fail_cursor_cleanup.exchange(false)){
+            na::hooking::FailNextCommitEnableForTest(0);na::hooking::FailNextRemoveForTest();
+        }
         const bool optional_unavailable=i==7 && g_fail_optional_input.load() && g_fail_optional_input.fetch_sub(1)>0;
         if (target && !optional_unavailable && install_input_function(target, specs[i].detour, specs[i].original)) {
             g_input_hook_targets[i] = target;
             ++n;
         } else {
-            // Fall back to the plain export so our own calls still work.
-            *specs[i].original = target;
+            // Failed cleanup may retain a callable trampoline. Overwriting it
+            // with the patched export can recurse into our own detour.
+            if(!*specs[i].original)*specs[i].original=target;
         }
     }
     g_input_hooks.store(n, std::memory_order_release);
@@ -626,7 +632,7 @@ void write_status_line()
         WriteFile(f,sl_boundary_line,static_cast<DWORD>((std::min)(sl_boundary_bytes,static_cast<int>(sizeof(sl_boundary_line)-1))),&written,nullptr);
         WriteFile(f,"\r\n",2,&written,nullptr);
     }
-    char safe_line[80];const int safe_bytes=snprintf(safe_line,sizeof(safe_line),"safe_start=%u reason=%s\r\n",na::settings::SafeStart()?1u:0u,na::settings::SafeStartReason());
+    char safe_line[144];const int safe_bytes=snprintf(safe_line,sizeof(safe_line),"safe_start=%u reason=%s renderer_ready=%u shared_writer=%u clean_exit_hook=%u\r\n",na::settings::SafeStart()?1u:0u,na::settings::SafeStartReason(),na::host::SessionReady()?1u:0u,na::settings::CanPersist()?1u:0u,na::host::CleanExitObserved()?1u:0u);
     if(safe_bytes>0)WriteFile(f, safe_line, static_cast<DWORD>((std::min)(safe_bytes, static_cast<int>(sizeof(safe_line)-1))), &written, nullptr);
     char fg_inputs[512];
     const int fg_input_bytes = snprintf(fg_inputs, sizeof(fg_inputs),
@@ -2032,6 +2038,7 @@ void draw_panel(bool just_opened)
     uint32_t save = na::settings::LastSaveResult();
     if (save == 2) right = "Your choice is active for this session but could not be saved.";
     else if (save == 1) right = "Settings saved";
+    else if (save == 3) right = "Saving settings...";
     float rw = ImGui::CalcTextSize(right).x;
     ImGui::SameLine(w - pad_x - rw);
     ImGui::TextColored(save == 2 ? kWarn : kTextDim, "%s", right);
@@ -2168,6 +2175,7 @@ bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue,ComPtr<ID3D1
 {
     if (g_stopping.load(std::memory_order_acquire)) return false;
     if (sc == g_state.dummy_swapchain_identity) return false;
+    na::host::RendererObserved();
     g_presents.fetch_add(1, std::memory_order_relaxed);
     // Use the recorded per-buffer queue or recover it from submitted writes.
     retained_queue = queue_hint ? ComPtr<ID3D12CommandQueue>(queue_hint) : swapchain_queue(sc);
@@ -2972,6 +2980,8 @@ bool Start(const char* route_tag, PanelFn controls)
 void FailNextMenuStartForTests(){g_fail_menu_start.store(true);}
 void FailNextMenuCreateForTests(){g_fail_menu_create.store(true);}
 void FailOptionalInputForTests(unsigned attempts){g_fail_optional_input.store(attempts);}
+void FailCursorCleanupForTests(){g_fail_cursor_cleanup.store(true);}
+void* CursorOriginalForTests(){return reinterpret_cast<void*>(g_orig_set_cursor);}
 
 bool SubscribeExecute(ExecuteBeginFn begin, ExecuteEndFn end, void* user)
 {

@@ -92,7 +92,7 @@ DWORD WINAPI InitThread(LPVOID)
     if (GetPrivateProfileIntW(L"j2", L"enabled", 0, g_ini) == 1 && GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1) {
         wchar_t mb[32] = {};
         GetPrivateProfileStringW(L"j2", L"mip_bias", L"-1.0", mb, 32, g_ini);
-        na::observe::SetSamplerMipBias(na::settings::SafeStart()?0.f:static_cast<float>(_wtof(mb)));
+        na::observe::SetSamplerMipBias(0.f); // defer the saved effect until renderer recovery is known
         // Live switching from the menu (no restart): twin root signatures/pipelines are
         // built at creation for the other levels. [j2] mip_bias_live=0 turns it off.
         na::observe::SetSamplerMipBiasLiveEnabled(GetPrivateProfileIntW(L"j2", L"mip_bias_live", 1, g_ini) != 0);
@@ -117,7 +117,7 @@ DWORD WINAPI InitThread(LPVOID)
     bool route_a = GetPrivateProfileIntW(L"route_a", L"enabled", 0, g_ini) == 1;
     bool route_a_started = false;
     if (route_a) {
-        na::fg::preset::Initialize();
+        // Driver profile writes are deferred until renderer persistence authority.
         na::fg::preset::ReadUpscalerOverrides(); // read-only: does the NVIDIA app force a DLSS preset?
         // Game-facing Streamline boundary: observes the game's tags and its Present
         // into SL's swap-chain proxy (pass-through; consumers decide effects).
@@ -132,8 +132,7 @@ DWORD WINAPI InitThread(LPVOID)
             if(!na::settings::SafeStart())na::nr::slconsumer::Start();
             na::slb::Start(slb_log);
             // Saved request for the game's own frame generation (default: the game's setting).
-            if(!na::settings::SafeStart())na::slb::SetFgRequest({static_cast<na::slb::FgMode>(na::settings::Get().native_fg_mode.load()),
-                                   na::settings::Get().native_fg_frames.load()});
+            // Saved native-FG request is published by the qualified worker.
         }
         // One Apply across all resolution-control methods (learned per game).
         na::mode::Start();
@@ -262,6 +261,7 @@ DWORD WINAPI InitThread(LPVOID)
     }
     if(g_gate_expired.load())boot_log("early factory gate expired; objects created before attachment require late queue evidence");
     {std::lock_guard<std::mutex> lock(g_mutex);g_status.init_complete=1;}
+    na::host::RunSessionWorker([]{na::host::ActivateSavedRequests(g_ini);});
     return 0;
 }
 

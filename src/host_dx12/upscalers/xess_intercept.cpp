@@ -1,3 +1,4 @@
+#include "host_dx12/settings.hpp"
 // C7b: XeSS (libxess.dll, D3D12) interception. See xess_intercept.hpp.
 #include "host_dx12/upscalers/xess_intercept.hpp"
 
@@ -289,7 +290,7 @@ Result DetourExecute(Context c, ID3D12GraphicsCommandList* list, const D3D12Exec
         uint64_t view_id = 0;
         Backend last = Backend::None;
         if (const ContextInfo* ci0 = find(c)) { view_id = ci0->view_id; last = ci0->last; }
-        const bool replace = static_cast<Mode>(g_mode.load(std::memory_order_relaxed)) == Mode::ReplaceWithDlss;
+        const bool replace = na::settings::EffectsReady() && static_cast<Mode>(g_mode.load(std::memory_order_relaxed)) == Mode::ReplaceWithDlss;
         lock.unlock(); // ARGON-G2-005: NGX start-up and evaluation run without g_m
         bool replaced = false;
         const char* why = nullptr;

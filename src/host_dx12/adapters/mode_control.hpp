@@ -41,6 +41,11 @@ struct Status {
     char reason[220] = "";
 };
 
+// Shared with the overlay and deferred saved-settings activation. Preserve the
+// existing 8-pixel native alignment and observed Unreal startup ratio table.
+uint32_t AlignedRenderExtent(uint32_t output,int mode);
+float UnrealPercentForMode(int mode);
+bool BuildSavedRequest(uint32_t mode,int32_t preset,uint32_t out_w,uint32_t out_h,Request& request);
 void Start();                        // loads the learned layer; starts the worker
 bool RequestApply(const Request& request); // false when busy or nothing can act
 // Withdraws a running Apply. `hand_back` also returns resolution control to

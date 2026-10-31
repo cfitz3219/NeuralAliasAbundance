@@ -80,7 +80,7 @@ std::shared_ptr<Image> Copy(ID3D12GraphicsCommandList* list,const slb::Tag& tag)
     return image;
 }
 void OnTag(const slb::TagEvent& e,void*){
-    if(!e.decoded || !e.has_frame || !e.has_viewport || !settings::Get().nr_enabled.load())return;
+    if(!e.decoded || !e.has_frame || !e.has_viewport || (!settings::EffectsReady() || !settings::Get().nr_enabled.load()))return;
     std::lock_guard<std::mutex> lock(mutex);
     if(!runtime.create_feature || staged.size()>=32)return;
     Staged next;next.sequence=e.sequence;next.tags.token=e.frame_token;next.tags.viewport=e.viewport;
@@ -120,13 +120,13 @@ void AfterTag(const slb::TagEvent& e,int32_t result,void*){
     staged.erase(pending);
 }
 void Consume(const slb::PresentEvent& e,ID3D12CommandQueue* bound_queue,DXGI_COLOR_SPACE_TYPE color_space){
-    if(e.kind==slb::PresentKind::Test || !e.game_facing || !e.base)return;
+    if(!settings::EffectsReady() || e.kind==slb::PresentKind::Test || !e.game_facing || !e.base)return;
     std::lock_guard<std::mutex> lock(mutex);
     native::Maintain();
     flights.erase(std::remove_if(flights.begin(),flights.end(),[](const auto& f){return f.lease.Retired();}),flights.end());
     Stream* existing=nullptr;for(auto& s:streams)if(s->proxy==e.proxy_id)existing=s.get();
     if(existing && existing->last_serial==e.real_serial && existing->epoch==e.stream_epoch)return;
-    if(existing && !settings::Get().nr_enabled.load()){
+    if(existing && (!settings::EffectsReady() || !settings::Get().nr_enabled.load())){
         native::Release(runtime.create_feature,existing);existing->last_serial=e.real_serial;
         native::ReportUnavailable("Neural Rendering is off for this real frame.");return;
     }
@@ -154,7 +154,7 @@ void Consume(const slb::PresentEvent& e,ID3D12CommandQueue* bound_queue,DXGI_COL
         for(size_t i=0;i<streams.size();++i)claimed[i].store(streams[i]->device.Get());
     }
     if(stream->last_serial==e.real_serial)return; // DXGI nonblocking retry, already submitted
-    if(!settings::Get().nr_enabled.load()){native::Release(runtime.create_feature,stream);return;}
+    if((!settings::EffectsReady() || !settings::Get().nr_enabled.load())){native::Release(runtime.create_feature,stream);return;}
     // Temporal history was recorded on this queue. Changing to another queue
     // cannot implicitly order its in-flight evaluations.
     if(stream->queue.Get()!=queue.Get()){

@@ -73,35 +73,16 @@ void note_request()
 // The render size a mode asks for, from the display size the game's DLSS
 // actually outputs. NOT from the last optimal-settings call: other callers
 // probe it with unrelated sizes (PBZ: 1000x1000, which produced "584x584").
-void requested_size(unsigned out_w, unsigned out_h, int mode, unsigned* rw, unsigned* rh)
-{
-    float scale = na::settings::ScaleForMode(static_cast<DlssMode>(mode));
-    *rw = out_w;
-    *rh = out_h;
-    if (mode != 0) {
-        *rw = ((static_cast<unsigned>(out_w * scale + 0.5f)) + 7u) & ~7u;
-        *rh = ((static_cast<unsigned>(out_h * scale + 0.5f)) + 7u) & ~7u;
-    }
+void requested_size(unsigned out_w,unsigned out_h,int mode,unsigned* rw,unsigned* rh){
+    *rw=na::mode::AlignedRenderExtent(out_w,mode);*rh=na::mode::AlignedRenderExtent(out_h,mode);
 }
+
 bool valid_size(unsigned w, unsigned h) { return w && h && w != 0xFFFFFFFFu && h != 0xFFFFFFFFu; }
 
 // Unreal: the screen percentage for a mode, from the ratios NVIDIA gave the
 // engine at startup (PBZ asked with 1000x1000: 333/500/580/667/1000), so our
 // request lands exactly on the engine's own table. Defaults if not seen.
-float unreal_percent_for_mode(int mode)
-{
-    static const int kPq[] = {5, 2, 1, 0, 3}; // DLAA, Quality, Balanced, Performance, Ultra Performance -> NVSDK_NGX_PerfQuality_Value
-    static const float kDefault[] = {100.f, 66.7f, 58.f, 50.f, 33.3f};
-    if (mode < 0 || mode > 4) return 100.f;
-    na::ngx::OptimalCall calls[32];
-    const uint32_t n = na::ngx::GetOptimalCalls(0, calls, 32);
-    for (uint32_t i = n; i-- > 0;) {
-        const auto& c = calls[i];
-        if (c.perf_quality == kPq[mode] && c.user_w && c.native_w && c.native_w <= c.user_w)
-            return 100.f * static_cast<float>(c.native_w) / static_cast<float>(c.user_w);
-    }
-    return kDefault[mode];
-}
+float unreal_percent_for_mode(int mode){return na::mode::UnrealPercentForMode(mode);}
 
 enum class Conn { NoDlss, Interrupted, Connected };
 

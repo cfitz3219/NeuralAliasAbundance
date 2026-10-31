@@ -5,6 +5,8 @@
 #include "host_dx12/host_boot/process_log.hpp"
 #include "host_dx12/overlay/overlay.hpp"
 #include "host_dx12/settings.hpp"
+#include "host_dx12/host_boot/session.hpp"
+#include "host_dx12/hooking/vtable_hook.hpp"
 #include <filesystem>
 
 namespace {std::atomic<unsigned> submits{0},devices{0};
@@ -12,6 +14,7 @@ void submitted(na::overlay::ExecuteContext*){submits.fetch_add(1);}
 void device_seen(ID3D12Device*,void*){devices.fetch_add(1);}}
 int main(int argc,char** argv) {
     const bool menu_failure=argc>1 && !strcmp(argv[1],"--menu-failure");
+    const bool cursor_cleanup=argc>1 && !strcmp(argv[1],"--cursor-cleanup");
     const bool optional_input=argc>1 && !strcmp(argv[1],"--optional-input");
     const bool create_failure=argc>1 && !strcmp(argv[1],"--menu-create-failure");
     const bool recovery=argc>1 && !strcmp(argv[1],"--recovery");
@@ -41,6 +44,7 @@ int main(int argc,char** argv) {
     }
     if(menu_failure)na::overlay::FailNextMenuStartForTests();
     if(optional_input)na::overlay::FailOptionalInputForTests(3);
+    if(cursor_cleanup)na::overlay::FailCursorCleanupForTests();
     REQUIRE(na::host::StartFromIni(GetModuleHandleW(nullptr),name.c_str(),"BOOT TEST"));
     // Same ordering as our DXGI proxy's exported CreateDXGIFactory entry.
     na::host::WaitForObserveInstall();
@@ -67,6 +71,12 @@ int main(int argc,char** argv) {
     REQUIRE(na::host::GetStatus().init_complete==1);
     if(create_failure)na::overlay::FailNextMenuCreateForTests();
     REQUIRE(SUCCEEDED(chain->Present(0,0)));d.WaitIdle();
+    if(cursor_cleanup){
+        auto* target=reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"user32.dll"),"SetCursor"));
+        CHECK(na::hooking::DeadHookCount()>0);
+        CHECK(na::overlay::CursorOriginalForTests()==na::hooking::OriginalFor(target));
+        CHECK(na::overlay::CursorOriginalForTests()!=target);
+    }
     if(optional_input)CHECK(na::overlay::GetStats().menu_enabled==1 && na::overlay::GetStats().input_hooks==7);
     if(create_failure){
         CHECK(na::overlay::GetStats().core_ready==1);
@@ -88,8 +98,11 @@ int main(int argc,char** argv) {
     REQUIRE(SUCCEEDED(chain->Present(0,0)));d.WaitIdle();
     CHECK(na::overlay::GetStats().open && na::overlay::GetStats().frames_rendered>0);
     CHECK(na::host::GetStatus().host_started==1);
+    for(unsigned i=0;i<400 && !na::host::SessionReady();++i)Sleep(5);
+    REQUIRE(na::host::SessionReady());
     CHECK(na::settings::SafeStart()==recovery);
     CHECK(d.device->GetDeviceRemovedReason()==S_OK);
+    na::host::StopSessionForTests();
     REQUIRE(na::overlay::Stop());chain.Reset();DestroyWindow(window);
     DeleteFileW(ini.c_str());
     wchar_t processLog[MAX_PATH]{};

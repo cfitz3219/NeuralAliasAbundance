@@ -49,6 +49,8 @@ bool Start(const char* route_tag, PanelFn controls); // compatibility: both
 void FailNextMenuStartForTests();
 void FailNextMenuCreateForTests();
 void FailOptionalInputForTests(unsigned attempts);
+void FailCursorCleanupForTests();
+void* CursorOriginalForTests();
 // A51: returns false, with SeamStats.stop_incomplete set and NOTHING torn
 // down, when an Execute callback or the discovery worker/producers could not
 // be proven quiescent within the timeout; call again later. true = fully stopped.

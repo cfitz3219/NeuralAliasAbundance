@@ -12,6 +12,7 @@
 #include "host_dx12/ngx_observe/gpu_timing.hpp"
 #include "host_dx12/ngx_observe/size_confirm.hpp"
 #include "host_dx12/settings.hpp"
+#include "host_dx12/host_boot/session.hpp"
 
 #include <d3d12.h>
 #include <wrl/client.h>
@@ -516,6 +517,7 @@ void CollectSrLocked() {
 // game's and are left untouched.
 bool write_preset_only(void* params)
 {
+    if (!na::settings::EffectsReady())return true;
     if (!params) return true; // nothing to write (test stubs pass no parameter object)
 #if defined(NA_HAVE_NGX_SDK)
     int32_t preset = na::settings::Get().preset.load(std::memory_order_acquire);
@@ -582,6 +584,7 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
         return s.evaluate(cmd_list, handle, params, callback);
     }
     auto* list = static_cast<ID3D12GraphicsCommandList*>(cmd_list);
+    if(list && s.has_device.load(std::memory_order_acquire))na::host::RendererObserved();
     bool native_fg = false;
     {
         std::lock_guard<std::mutex> lock(g_confirm_m);
@@ -619,7 +622,7 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
         auto use=std::find_if(g_sr_uses.begin(),g_sr_uses.end(),[&](const auto& u){return u.core==&s && u.handle==handle;});
         if(use!=g_sr_uses.end()) {
             AddSrUse(*use,receipt);
-            if(g_last_sr_core==&s && handle==g_last_sr_handle.load() && g_reapply_pending.exchange(0)) {
+            if(g_last_sr_core==&s && handle==g_last_sr_handle.load() && na::settings::EffectsReady() && g_reapply_pending.exchange(0)) {
                 if(!slot)for(auto& m:g_handle_maps)if(!m.game.load()){slot=&m;break;}
                 // Reserve capacity BEFORE Create: even a rejected replacement may
                 // record commands. Never create then immediately release for lack of a map.
@@ -1221,7 +1224,7 @@ bool ApplyCreateOverridesForFeature(uint32_t feature_id, void* ngx_parameter)
 #if defined(NA_HAVE_NGX_SDK)
     if (!ngx_parameter) return false;
     if (feature_id != 1u && feature_id != kFeatureRayReconstruction) return false; // FG and others: not ours
-    if (!na::settings::Get().enabled.load(std::memory_order_acquire)) return false;
+    if (!na::settings::EffectsReady() || !na::settings::Get().enabled.load(std::memory_order_acquire)) return false;
     auto* p = static_cast<NVSDK_NGX_Parameter*>(ngx_parameter);
     bool wrote = false;
     // A20 perf/correctness: tell DLSS which quality mode WE chose, so the
@@ -1453,7 +1456,7 @@ int32_t optimal_settings_common(void* ngx_parameter, void* orig, bool rr)
     p->Get(NVSDK_NGX_Parameter_PerfQualityValue, &pq);
     const unsigned int native_w = out_w, native_h = out_h; // NVIDIA's own answer, before ours
 
-    bool enabled = na::settings::Get().enabled.load(std::memory_order_acquire) != 0;
+    bool enabled = na::settings::EffectsReady() && na::settings::Get().enabled.load(std::memory_order_acquire) != 0;
     auto mode = static_cast<na::settings::DlssMode>(
         na::settings::Get().dlss_mode.load(std::memory_order_acquire));
     bool overridden = false;

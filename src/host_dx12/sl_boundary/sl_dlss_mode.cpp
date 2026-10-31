@@ -9,6 +9,7 @@
 #include "host_dx12/hooking/vtable_hook.hpp"
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 #include "host_dx12/sl_boundary/sl_tags.hpp"
+#include "host_dx12/settings.hpp"
 
 // See sl_dlss_mode.hpp. Layouts from the public Streamline header
 // include/sl_dlss.h (MIT, NVIDIA-RTX/Streamline main 625db07):
@@ -94,7 +95,7 @@ SlResult __cdecl DetourGetOptimalSettings(const void* options, void* settings)
     ModeRequest req;
     {
         std::lock_guard<std::mutex> lock(g_m);
-        req = g_request;generation=g_state.generation;
+        req = na::settings::EffectsReady()?g_request:ModeRequest{};generation=g_state.generation;
         const uint64_t now = GetTickCount64();
         if (!g_state.first_optimal_tick) g_state.first_optimal_tick = now;
         g_state.last_optimal_tick = now;
@@ -164,7 +165,7 @@ SlResult __cdecl DetourSetOptions(const void* viewport, const void* options)
     bool followed;
     {
         std::lock_guard<std::mutex> lock(g_m);
-        req = g_request;
+        req = na::settings::EffectsReady()?g_request:ModeRequest{};
         followed = g_state.size_followed;
     }
     const uint32_t game_mode = abi::Read<uint32_t>(copy, 32);
