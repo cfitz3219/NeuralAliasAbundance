@@ -47,6 +47,11 @@ const void* g_orig_seen_tags = nullptr;
 uint32_t g_orig_seen_n = 0;
 void* g_orig_seen_cmd = nullptr;
 HRESULT g_next_present_hr = S_OK;
+// Overlay boundary frame source (Ghost of Tsushima): what the overlay hooks saw.
+struct OverlaySeen { int presents = 0, resizes = 0, releases = 0; IDXGISwapChain* last = nullptr; } g_overlay_seen;
+void overlay_present(IDXGISwapChain* sc, IDXGISwapChain*, ID3D12CommandQueue*) { ++g_overlay_seen.presents; g_overlay_seen.last = sc; }
+void overlay_resize(IDXGISwapChain* sc) { ++g_overlay_seen.resizes; g_overlay_seen.last = sc; }
+void overlay_released(IDXGISwapChain* sc) { ++g_overlay_seen.releases; g_overlay_seen.last = sc; }
 int g_present_calls = 0, g_present1_calls = 0, g_resize_calls = 0, g_constants_calls = 0;
 HANDLE g_block = nullptr, g_entered = nullptr; // test 7: hold a Present inside the original
 HANDLE g_tag_block=nullptr,g_tag_entered=nullptr;
@@ -548,6 +553,36 @@ int main()
     CHECK(g_rec.before.back().association==na::slb::Association::Unique);
     CHECK(g_rec.before.back().frame_token==4244);
     CHECK(na::slb::SetCallbacks({}));
+
+    // Overlay hooks: one call per real game Present into the proxy (never a
+    // TEST or a retry of a WAS_STILL_DRAWING frame), one before each proxy
+    // resize; detached hooks are never called. Independent of SetCallbacks.
+    {
+        static na::slb::OverlayHooks hooks;
+        hooks.present = &overlay_present;
+        hooks.before_resize = &overlay_resize;
+        hooks.released = &overlay_released;
+        na::slb::SetOverlayHooks(&hooks);
+        const int presents_before = g_present_calls;
+        CHECK(chain->Present(1, 0) == S_OK);
+        CHECK(g_overlay_seen.presents == 1 && g_overlay_seen.last == chain);
+        CHECK(g_present_calls == presents_before + 1); // the original still runs, once
+        CHECK(chain->Present(0, DXGI_PRESENT_TEST) == S_OK);
+        CHECK(g_overlay_seen.presents == 1);
+        g_next_present_hr = DXGI_ERROR_WAS_STILL_DRAWING;
+        CHECK(chain->Present(0, DXGI_PRESENT_DO_NOT_WAIT) == DXGI_ERROR_WAS_STILL_DRAWING);
+        g_next_present_hr = S_OK;
+        CHECK(g_overlay_seen.presents == 2);
+        CHECK(chain->Present(0, DXGI_PRESENT_DO_NOT_WAIT) == S_OK); // retry of the same frame
+        CHECK(g_overlay_seen.presents == 2);
+        CHECK(chain->Present(1, 0) == S_OK);
+        CHECK(g_overlay_seen.presents == 3);
+        CHECK(chain->ResizeBuffers(3, 1920, 1080, DXGI_FORMAT_R8G8B8A8_UNORM, 0) == S_OK);
+        CHECK(g_overlay_seen.resizes == 1 && g_overlay_seen.last == chain);
+        na::slb::SetOverlayHooks(nullptr);
+        CHECK(chain->Present(1, 0) == S_OK);
+        CHECK(g_overlay_seen.presents == 3 && g_overlay_seen.releases == 0);
+    }
 
     // ---- 8. native DLSS-G control ----
     {

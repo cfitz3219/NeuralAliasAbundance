@@ -8,6 +8,7 @@
 #include "host_dx12/overlay/overlay.hpp"
 #include "host_dx12/overlay/input_handover.hpp"
 #include "host_dx12/overlay/present_queues.hpp"
+#include "host_dx12/overlay/boundary_fallback.hpp"
 
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -229,6 +230,17 @@ std::atomic<uint32_t> g_retargets{0}; // swap chain re-targets (A31)
 std::atomic<uint32_t> g_initialized{0};
 std::atomic<uint32_t> g_gamepad_hooked{0};
 std::atomic<bool> g_stopping{false};
+// Streamline boundary frame source (Ghost of Tsushima, 2026-10-31): see
+// boundary_fallback.hpp. g_native_game_presents counts game Presents that
+// reached the native DXGI detour; once the boundary sees three consecutive SL
+// proxy frames with no native one in between, g_boundary_frames latches and
+// the overlay draws from the boundary instead (never from both).
+std::atomic<uint64_t> g_native_game_presents{0};
+std::atomic<bool> g_boundary_frames{false};
+std::mutex g_boundary_m;
+BoundaryFallback g_boundary_policy; // g_boundary_m
+void* g_native_present_target = nullptr;  // native Present body hooked at Start (diagnostics only)
+void* g_native_present1_target = nullptr;
 std::atomic<float> g_fps{0.0f}, g_frame_ms{0.0f}, g_mouse_x{0.0f}, g_mouse_y{0.0f};
 char g_route_tag[64]{};
 PanelFn g_controls = nullptr;
@@ -569,6 +581,14 @@ void write_status_line()
     char mode_line[1536]{};
     const int mode_bytes=na::mode::FormatStatus(mode_line,sizeof(mode_line));
     if(mode_bytes>0){WriteFile(f,mode_line,DWORD((std::min)(mode_bytes,int(sizeof(mode_line)-1))),&written,nullptr);WriteFile(f,"\r\n",2,&written,nullptr);}
+    {
+        char source_line[160];
+        const int source_bytes=snprintf(source_line,sizeof(source_line),"overlay_source=%s native_presents=%llu presents=%llu\r\n",
+            g_boundary_frames.load(std::memory_order_acquire)?"streamline":"native",
+            static_cast<unsigned long long>(g_native_game_presents.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_presents.load(std::memory_order_relaxed)));
+        if(source_bytes>0)WriteFile(f,source_line,DWORD((std::min)(source_bytes,int(sizeof(source_line)-1))),&written,nullptr);
+    }
     char sl_boundary_line[1024];
     const int sl_boundary_bytes=na::slb::FormatStatus(sl_boundary_line,sizeof(sl_boundary_line));
     if(sl_boundary_bytes>0){
@@ -2081,7 +2101,8 @@ void process_frame(ID3D12CommandQueue* queue, ID3D12Resource* frame)
 // false when nothing further should happen (stopping, no queue yet, init
 // failed). Takes g_state.mutex on success (caller releases via the guard it
 // passes in).
-bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue,ComPtr<ID3D12CommandQueue>& retained_queue)
+bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue,ComPtr<ID3D12CommandQueue>& retained_queue,
+                     ID3D12CommandQueue* queue_hint = nullptr)
 {
     if (g_stopping.load(std::memory_order_acquire)) return false;
     if (sc == g_state.dummy_swapchain_identity) return false;
@@ -2089,6 +2110,9 @@ bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue,ComPtr<ID3D1
     // The presenting queue when we saw the swap chain created; otherwise (created
     // before our hooks) the last direct queue, as before.
     retained_queue = swapchain_queue(sc);
+    // Boundary frames: the game-facing proxy is not a key in g_swap_queues;
+    // sl_boundary supplies the proxy's exact creation/ResizeBuffers1 queue.
+    if (!retained_queue && queue_hint) retained_queue = queue_hint;
     queue = retained_queue.Get();
     if (queue) g_swap_queue_hits.fetch_add(1, std::memory_order_relaxed);
     else {
@@ -2186,12 +2210,12 @@ void menu_step(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool open, ID3D12R
 
 // Old path (no presenter): everything on the real back buffer, then the
 // original Present by the caller.
-void on_present(IDXGISwapChain* sc)
+void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue_hint = nullptr)
 {
     std::lock_guard<std::mutex> lock(g_state.mutex);
     ID3D12CommandQueue* queue = nullptr;
     ComPtr<ID3D12CommandQueue> retained_queue;
-    if (!present_prelude(sc, queue,retained_queue)) return;
+    if (!present_prelude(sc, queue,retained_queue,queue_hint)) return;
     na::j2::OnPresent(queue); // one game-frame boundary, never a TEST Present
     UINT idx = real_index(sc);
     if (idx < g_state.backbuffer_count) {
@@ -2253,11 +2277,12 @@ HANDLE STDMETHODCALLTYPE DetourGetFrameLatencyWaitableObject(IDXGISwapChain2* sc
 HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flags)
 {
     if (na::present::IsPresentThread()) return g_orig_present(sc, sync, flags); // never re-entered by design; safety
+    if (!(flags & DXGI_PRESENT_TEST)) g_native_game_presents.fetch_add(1, std::memory_order_acq_rel);
     na::dlss::ReleaseIfDeviceRemoved(); // G2-004: never pin a removed device across the game's recovery
     if (!(flags & DXGI_PRESENT_TEST) && na::present::Proxied(sc)) return presenter_present(sc, sync, flags, nullptr);
     const auto observed = na::observe::PresentBegin(sc);
     na::nr::trace::Record("present_begin",sc);
-    if (!(flags & DXGI_PRESENT_TEST)) on_present(sc);
+    if (!(flags & DXGI_PRESENT_TEST) && !g_boundary_frames.load(std::memory_order_acquire)) on_present(sc);
     const HRESULT result = g_orig_present(sc, sync, flags);
     na::nr::trace::Record("present_end",sc,nullptr,0,0,result);
     na::observe::PresentEnd(observed,sync,flags,result);
@@ -2267,11 +2292,12 @@ HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT fl
                                          const DXGI_PRESENT_PARAMETERS* pp)
 {
     if (na::present::IsPresentThread()) return g_orig_present1(sc, sync, flags, pp);
+    if (!(flags & DXGI_PRESENT_TEST)) g_native_game_presents.fetch_add(1, std::memory_order_acq_rel);
     na::dlss::ReleaseIfDeviceRemoved(); // G2-004: never pin a removed device across the game's recovery
     if (!(flags & DXGI_PRESENT_TEST) && na::present::Proxied(sc)) return presenter_present(sc, sync, flags, pp);
     const auto observed = na::observe::PresentBegin(sc);
     na::nr::trace::Record("present1_begin",sc);
-    if (!(flags & DXGI_PRESENT_TEST)) on_present(sc);
+    if (!(flags & DXGI_PRESENT_TEST) && !g_boundary_frames.load(std::memory_order_acquire)) on_present(sc);
     const HRESULT result = g_orig_present1(sc, sync, flags, pp);
     na::nr::trace::Record("present1_end",sc,nullptr,0,0,result);
     na::observe::PresentEnd(observed,sync,flags,result);
@@ -2509,12 +2535,119 @@ void STDMETHODCALLTYPE DetourExecute(ID3D12CommandQueue* q, UINT n,
 
 } // namespace
 
+namespace {
+// ------------------------------------------------ Streamline boundary frames
+// Ghost of Tsushima (f46adb7, 2026-10-31): sl_boundary counted thousands of
+// game Presents into SL's proxy while the native Present detour never ran, so
+// the menu was never drawn. When that is detected (boundary_fallback.hpp) the
+// overlay takes its frames from the proxy Present instead: the same on_present
+// work the native detour does, on the game-facing chain, before SL's original
+// Present. Back-buffer reads dispatch virtually through the proxy (742ff30),
+// so they return exactly what the game drew. Resize/release on the proxy drop
+// our references the way the native ResizeBuffers/Release detours do.
+void append_status_text(const char* text, int n)
+{
+    if (!g_status_log[0] || n <= 0) return;
+    HANDLE f = CreateFileW(g_status_log, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(f, text, static_cast<DWORD>(n), &written, nullptr);
+    CloseHandle(f);
+}
+const char* module_of(const void* address, char* out, size_t cap)
+{
+    if (!out || !cap) return "";
+    out[0] = 0;
+    HMODULE m = nullptr;
+    if (!address || !GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                        static_cast<LPCSTR>(address), &m) || !m) {
+        snprintf(out, cap, "?");
+        return out;
+    }
+    char path[MAX_PATH] = {};
+    if (!GetModuleFileNameA(m, path, MAX_PATH)) { snprintf(out, cap, "?"); return out; }
+    const char* base = strrchr(path, '\\');
+    snprintf(out, cap, "%s+0x%llX", base ? base + 1 : path,
+             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(m)));
+    return out;
+}
+const void* present_slot_of(IDXGISwapChain* sc)
+{
+    if (!sc) return nullptr;
+    void* const* vt = *reinterpret_cast<void* const* const*>(sc);
+    return vt ? vt[kSwapPresentSlot] : nullptr;
+}
+// Once, when the boundary takes over: where each chain's Present slot points,
+// so the next log shows why the native detour was bypassed.
+void note_boundary_engaged(IDXGISwapChain* game_facing, IDXGISwapChain* base)
+{
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    char proxy_mod[160], base_mod[160], hooked_mod[160], hooked1_mod[160];
+    const void* proxy_present = present_slot_of(game_facing);
+    const void* base_present = present_slot_of(base);
+    char line[1024];
+    const int n = snprintf(line, sizeof(line),
+        "%02u:%02u:%02u overlay_source=streamline: the native Present detour saw no game Present across %u Streamline proxy frames "
+        "(native_presents=%llu). proxy=%p present=%s base=%p present=%s hooked_present=%s hooked_present1=%s base_slot_is_hooked=%u\r\n",
+        t.wHour, t.wMinute, t.wSecond, BoundaryFallback::kMissesToEngage,
+        static_cast<unsigned long long>(g_native_game_presents.load(std::memory_order_acquire)),
+        static_cast<void*>(game_facing), module_of(proxy_present, proxy_mod, sizeof(proxy_mod)),
+        static_cast<void*>(base), base ? module_of(base_present, base_mod, sizeof(base_mod)) : "none",
+        module_of(g_native_present_target, hooked_mod, sizeof(hooked_mod)),
+        module_of(g_native_present1_target, hooked1_mod, sizeof(hooked1_mod)),
+        base_present && base_present == g_native_present_target ? 1u : 0u);
+    append_status_text(line, (std::min)(n, static_cast<int>(sizeof(line)) - 1));
+}
+void boundary_present(IDXGISwapChain* game_facing, IDXGISwapChain* base, ID3D12CommandQueue* queue)
+{
+    if (!game_facing || g_stopping.load(std::memory_order_acquire)) return;
+    bool draw = false;
+    {
+        std::lock_guard<std::mutex> lock(g_boundary_m);
+        draw = g_boundary_policy.OnBoundaryPresent(g_native_game_presents.load(std::memory_order_acquire));
+    }
+    if (!draw) return;
+    if (!g_boundary_frames.exchange(true, std::memory_order_acq_rel)) note_boundary_engaged(game_facing, base);
+    ComPtr<ID3D12CommandQueue> hint(queue);
+    // A D3D12 chain reports the queue it presents on through GetDevice.
+    if (!hint) game_facing->GetDevice(IID_PPV_ARGS(&hint));
+    on_present(game_facing, hint.Get());
+}
+void boundary_before_resize(IDXGISwapChain* game_facing)
+{
+    if (!game_facing || !g_boundary_frames.load(std::memory_order_acquire)) return;
+    na::nr::native::Maintain();
+    retire_nr_backbuffers(game_facing);
+    std::lock_guard<std::mutex> lock(g_state.mutex);
+    if (g_state.swapchain == game_facing) release_buffers_locked();
+}
+void boundary_released(IDXGISwapChain* game_facing)
+{
+    if (game_facing && g_boundary_frames.load(std::memory_order_acquire)) on_chain_gone(game_facing);
+}
+na::slb::OverlayHooks make_boundary_hooks()
+{
+    na::slb::OverlayHooks h;
+    h.present = &boundary_present;
+    h.before_resize = &boundary_before_resize;
+    h.released = &boundary_released;
+    return h;
+}
+const na::slb::OverlayHooks g_boundary_hooks = make_boundary_hooks();
+} // namespace
+
 bool Start(const char* route_tag, PanelFn controls)
 {
     // Start is called with a bootstrap-local buffer; own the overlay label.
     snprintf(g_route_tag, sizeof(g_route_tag), "%s", route_tag ? route_tag : "");
     g_controls = controls;
     g_stopping.store(false);
+    g_boundary_frames.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(g_boundary_m);
+        g_boundary_policy.Reset();
+    }
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = DefWindowProcW;
@@ -2554,6 +2687,11 @@ bool Start(const char* route_tag, PanelFn controls)
             SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) &&
             SUCCEEDED(factory->CreateSwapChainForHwnd(queue.Get(), hwnd, &sd, nullptr, nullptr, &sc))) {
             g_state.dummy_swapchain_identity = sc.Get();
+            {
+                void* const* vt = *reinterpret_cast<void* const* const*>(sc.Get());
+                g_native_present_target = vt[kSwapPresentSlot];
+                g_native_present1_target = vt[kSwap1Present1Slot];
+            }
             ok = na::hooking::HookVTableSlot(sc.Get(), kSwapReleaseSlot,
                                              reinterpret_cast<void*>(&DetourRelease),
                                              reinterpret_cast<void**>(&g_orig_release)) &&
@@ -2661,6 +2799,7 @@ bool Start(const char* route_tag, PanelFn controls)
     g_gamepad_hooked.store(hooked);
     install_input_hooks(); // A44: the game sees no mouse/keyboard while the menu is open
     if (!na::hooking::variants::StartDiscoveryThread(&seen_drain, nullptr)) return false; // A49: propagated
+    if (ok) na::slb::SetOverlayHooks(&g_boundary_hooks); // frames from SL's proxy if the native detour stays silent
     return ok;
 }
 
@@ -2718,6 +2857,7 @@ SeamStats GetSeamStats()
 bool Stop()
 {
     g_stopping.store(true, std::memory_order_release);
+    na::slb::SetOverlayHooks(nullptr);
     g_open.store(false, std::memory_order_release);
     // A50/A51: quiescence first. A failed callback drain or discovery stop
     // is recorded (SeamStats.stop_incomplete) and Stop RETURNS false before

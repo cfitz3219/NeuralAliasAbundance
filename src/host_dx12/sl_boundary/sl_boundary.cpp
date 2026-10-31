@@ -510,6 +510,8 @@ void note_present_result(IDXGISwapChain* sc, HRESULT hr)
     if (ProxyState* st = find_proxy_locked(sc)) st->retry_pending = hr == DXGI_ERROR_WAS_STILL_DRAWING;
 }
 
+std::atomic<const OverlayHooks*> g_overlay_hooks{nullptr};
+
 template <class Forward>
 HRESULT present_call(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* pp, bool present1, Forward forward)
 {
@@ -533,6 +535,9 @@ HRESULT present_call(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_PRESE
     if (e.kind == PresentKind::Real && g_real.load(std::memory_order_relaxed) == 120) lookup_fg_functions_once();
     Subscription* sub = acquire_sub(); // one subscription for before AND after
     if (sub && sub->cb.before_present) { CallbackScope scope; sub->cb.before_present(e, sub->cb.user); }
+    if (e.kind == PresentKind::Real)
+        if (const OverlayHooks* overlay = g_overlay_hooks.load(std::memory_order_acquire); overlay && overlay->present)
+            overlay->present(sc, e.base, queue.Get());
     const HRESULT hr = forward();
     note_present_result(sc, hr);
     if (sub && sub->cb.after_present) { CallbackScope scope; sub->cb.after_present(e, hr, sub->cb.user); }
@@ -562,8 +567,15 @@ void bump_epoch(IDXGISwapChain* sc)
     }
 }
 
+void overlay_before_resize(IDXGISwapChain* sc)
+{
+    if (const OverlayHooks* overlay = g_overlay_hooks.load(std::memory_order_acquire); overlay && overlay->before_resize)
+        overlay->before_resize(sc);
+}
+
 HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT flags)
 {
+    overlay_before_resize(sc);
     const HRESULT hr = g_orig_resize(sc, n, w, h, f, flags);
     if (SUCCEEDED(hr)) bump_epoch(sc);
     return hr;
@@ -576,6 +588,7 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT n, UINT
     std::vector<IUnknown*> canonical;
     UINT queue_count=n;if(!queue_count){DXGI_SWAP_CHAIN_DESC1 desc{};if(SUCCEEDED(sc->GetDesc1(&desc)))queue_count=desc.BufferCount;}
     if(queues && queue_count){for(UINT i=0;i<queue_count;++i){owned.push_back(canonical_queue(queues[i]));canonical.push_back(owned.back().Get());}}
+    overlay_before_resize(sc);
     const HRESULT hr = g_orig_resize1(sc, n, w, h, f, flags, masks, queues);
     if(SUCCEEDED(hr) && !canonical.empty()){
         std::lock_guard<std::mutex> lock(g_m);
@@ -597,6 +610,8 @@ ULONG STDMETHODCALLTYPE DetourRelease(IUnknown* obj)
         Subscription* sub=acquire_sub();
         if(id && sub && sub->cb.stream_released){CallbackScope scope;sub->cb.stream_released(id,sub->cb.user);}
         release_sub(sub);
+        if (const OverlayHooks* overlay = g_overlay_hooks.load(std::memory_order_acquire); overlay && overlay->released)
+            overlay->released(reinterpret_cast<IDXGISwapChain*>(obj));
     }
     return r;
 }
@@ -1126,6 +1141,8 @@ int32_t RetagForFrame(uint32_t token,uint32_t viewport,const Tag* tags,uint32_t 
     uint32_t actual=0;if(!frame_token_value(frame,&actual) || actual!=token)return -1;
     return g_orig_tag_frame(frame,view,raw,count,list);
 }
+
+void SetOverlayHooks(const OverlayHooks* hooks) { g_overlay_hooks.store(hooks, std::memory_order_release); }
 
 bool SetCallbacks(const Callbacks& callbacks)
 {
