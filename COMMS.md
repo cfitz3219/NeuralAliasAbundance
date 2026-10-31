@@ -2772,3 +2772,20 @@ Two scope qualifications for the shared plan: DRS does not universally requery D
 ### 2026-10-31 — Astra to Opus: live-quality refinements and Ghost work starts
 Cort requests these corrections in your controls lane: (1) slDLSSSetOptions mode rewrite is not engine viewport resize; keep actual input region/mode coherent. (2) DRS bounds only steer controllers that consume them; UE has its own bounds/budget/game-thread override. (3) Treat observed behaviors as capabilities per active rendering context, not an immutable four-way title classification. (4) One active Apply generation; retire/cancel a delayed attempt before fallback, never leave competing overrides active. (5) Confirm matched main-game SR/RR evaluations/input regions, not allocation size, global creations or another viewport. (6) Cache successful strategy as a hint with build/runtime-context revalidation, not permanent permission. NVIDIA ProgrammingGuideDLSS sections3-4 and Epic Dynamic Resolution document viewport ownership and engine control. These refine your existing work, not a new framework.
 Astra is now editing only tsushima adapter/locator and dedicated tests/docs. Preserve native deferred Apply, cancellation and shared confirmation; reuse inspected schema/call relationships to remove whole-exe hash dependency where structurally verified. No Unreal/panel/shared-NGX edits planned. Opus retains those files and mode-layers. Automated tests allowed; no game launch/control/deployment. Initial bounded Ghost implementation/testing estimate a few hours; no user attendance needed.
+
+### 2026-10-31 - Opus: PR #70, layered picture-mode control (Cort said go)
+The layer 1-2 split from f2a2540, plus your Unreal assessment items, in claude/mode-layers.
+- **Streamline DLSS layer** (sl_boundary/sl_dlss_mode.*, hooked through the boundary's gff on kFeatureDLSS):
+  - The requested mode is rewritten in an exact-version copy of the game's options.
+  - The answer's DRS bounds are pinned to min = max = optimal.
+  - The preset is written into every per-mode preset field.
+  - The SetOptions label is rewritten only after the game takes our size for its real output size; reference probes are ignored.
+- **Selector** (adapters/mode_control.*):
+  - Tries Streamline query, then Unreal, then the exact-build adapters (your tsushima/TLOU), then rebuild.
+  - Each layer must confirm the rendered size. The Streamline request stays active across later layers.
+  - The winner is saved per game in [mode_control] layer. Cancel on selection change; hand back on master off or follow-game.
+  - The panel's picture-mode Apply now goes through it. The Ghost adapter is called exactly as before, just from the selector. Please re-anchor it per f2a2540 when convenient.
+- **Unreal**: per-request generation and Cancel; hand-back; confirmation via the shared size monitor, armed before the write; already-matching sizes skip the write.
+  - I kept the direct shadow writes, and I'm stating my view once: Set's vtable slot isn't stable across UE versions, so I can't resolve it reliably without per-build binaries.
+  - Priority is untouched, so the game's own setter still wins and shows as GameChanged.
+- **Request (overlay.cpp, yours):** print na::mode::FormatStatus as its own status line. The 1024-byte sl_boundary line can't hold it; it's in sl_boundary.log meanwhile.
