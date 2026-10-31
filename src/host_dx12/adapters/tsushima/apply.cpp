@@ -3,15 +3,13 @@
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 #include "host_dx12/settings.hpp"
 #include <windows.h>
-#include <bcrypt.h>
+#include "host_dx12/adapters/tsushima/locator.hpp"
 #include <intrin.h>
 #include <mutex>
 #include <cstdio>
 
 namespace na::tsushima {
 namespace {
-constexpr uint32_t kDispatch=0x422760, kRequest=0x421c00, kCaller=0x42596f;
-constexpr char kHash[]="ed0931b6f6d3ca3874baf39ebc16d95ff0e93296891182f96c3a790da7109f63";
 using Dispatch=bool(*)(void*);
 using Request=void(*)(void*,const void*,bool);
 Dispatch g_dispatch=nullptr;
@@ -79,35 +77,21 @@ bool dispatch(void* context,uintptr_t caller) {
     return result;
 }
 bool detour(void* context){return dispatch(context,reinterpret_cast<uintptr_t>(_ReturnAddress()));}
-bool hash_file(const wchar_t* path, char (&hex)[65]) {
-    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return false;
-    BCRYPT_ALG_HANDLE alg = nullptr; BCRYPT_HASH_HANDLE hash = nullptr;
-    bool ok = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) >= 0;
-    if (ok) ok = BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0) >= 0;
-    std::array<unsigned char, 65536> bytes{};
-    DWORD n = 0;
-    while (ok) {
-        if (!ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &n, nullptr)) { ok = false; break; }
-        if (!n) break;
-        ok = BCryptHashData(hash, bytes.data(), n, 0) >= 0;
+bool readable_range(const uint8_t* base, const uint8_t* start, size_t size) {
+    // The loader may discard sections; never scan an inaccessible allocation.
+    size_t at=0;
+    while(at<size) {
+        MEMORY_BASIC_INFORMATION m{};
+        if(!VirtualQuery(start+at,&m,sizeof(m)) || m.AllocationBase!=base ||
+           m.State!=MEM_COMMIT || (m.Protect&(PAGE_NOACCESS|PAGE_GUARD)))return false;
+        const auto end=reinterpret_cast<uintptr_t>(m.BaseAddress)+m.RegionSize;
+        const auto current=reinterpret_cast<uintptr_t>(start)+at;
+        if(end<=current)return false;
+        const size_t step=end-current;
+        if(step>=size-at)return true;
+        at+=step;
     }
-    std::array<unsigned char, 32> digest{};
-    if (ok) ok = BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0) >= 0;
-    if (hash) BCryptDestroyHash(hash);
-    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
-    CloseHandle(file);
-    if (ok) for (size_t i = 0; i < digest.size(); ++i) sprintf_s(hex + i * 2, 65 - i * 2, "%02x", digest[i]);
-    return ok;
-}
-bool code_matches(uintptr_t base, uint32_t rva, const unsigned char* bytes, size_t n) {
-    MEMORY_BASIC_INFORMATION mi{};
-    auto* p = reinterpret_cast<const void*>(base + rva);
-    if (!VirtualQuery(p, &mi, sizeof(mi)) || mi.State != MEM_COMMIT ||
-        !(mi.Protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) ||
-        (mi.Protect & PAGE_GUARD) || reinterpret_cast<uintptr_t>(mi.AllocationBase) != base) return false;
-    if (base + rva + n > reinterpret_cast<uintptr_t>(mi.BaseAddress) + mi.RegionSize) return false;
-    return std::memcmp(p, bytes, n) == 0;
+    return true;
 }
 } // namespace
 void InitializeApply() {
@@ -117,17 +101,30 @@ void InitializeApply() {
         if(!n || n==32768)return;
         const wchar_t* name=wcsrchr(path,L'\\');name=name?name+1:path;
         if(_wcsicmp(name,L"GhostOfTsushima.exe"))return;
-        char hash[65]{};
-        if(!hash_file(path,hash) || std::strcmp(hash,kHash))return;
-        const auto base=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-        constexpr unsigned char entry[]={0x40,0x53,0x48,0x81,0xec,0xa0,0x01,0x00,0x00,0x48,0x8b,0x01};
-        constexpr unsigned char caller[]={0xff,0x90,0x30,0x01,0x00,0x00};
-        if(!code_matches(base,kDispatch,entry,sizeof(entry)) ||
-           !code_matches(base,kCaller-sizeof(caller),caller,sizeof(caller)))return;
+        const auto* bytes=reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
+        const auto* dos=reinterpret_cast<const IMAGE_DOS_HEADER*>(bytes);
+        if(!bytes || dos->e_magic!=IMAGE_DOS_SIGNATURE || dos->e_lfanew<0 || dos->e_lfanew>4096)return;
+        const auto* nt=reinterpret_cast<const IMAGE_NT_HEADERS64*>(bytes+dos->e_lfanew);
+        const size_t size=nt->OptionalHeader.SizeOfImage;
         std::lock_guard<std::mutex> lock(g_mutex);
+        bool readable=true;
+        const auto* sections=IMAGE_FIRST_SECTION(nt);
+        for(unsigned i=0;i<nt->FileHeader.NumberOfSections;++i) {
+            const auto& s=sections[i];
+            if(!(s.Characteristics&IMAGE_SCN_MEM_READ) || (s.Characteristics&IMAGE_SCN_MEM_DISCARDABLE))continue;
+            if(s.VirtualAddress>size || s.Misc.VirtualSize>size-s.VirtualAddress ||
+               !readable_range(bytes,bytes+s.VirtualAddress,s.Misc.VirtualSize)){readable=false;break;}
+        }
+        if(!readable) {
+            strcpy_s(g_status.reason,"Ghost executable contains unreadable sections; live controls could not attach.");return;
+        }
+        const auto base=reinterpret_cast<uintptr_t>(bytes);
+        const auto image=locator::mapped_image(bytes,size,base);
+        const auto located=locator::locate(image);
+        if(!located){strcpy_s(g_status.reason,located.reason);return;}
         if(!na::hooking::BeginInstall())return;
-        g_request=reinterpret_cast<Request>(base+kRequest);g_caller=base+kCaller;
-        if(!na::hooking::PrepareHook(reinterpret_cast<void*>(base+kDispatch),reinterpret_cast<void*>(&detour),reinterpret_cast<void**>(&g_dispatch))){
+        g_request=reinterpret_cast<Request>(base+located.request);g_caller=base+located.caller;
+        if(!na::hooking::PrepareHook(reinterpret_cast<void*>(base+located.dispatch),reinterpret_cast<void*>(&detour),reinterpret_cast<void**>(&g_dispatch))){
             na::hooking::AbandonInstall();return;
         }
         g_status.available=na::hooking::CommitInstall();
