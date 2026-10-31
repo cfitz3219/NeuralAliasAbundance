@@ -702,12 +702,22 @@ void DrawNativeFrameGenerationRows(const na::ngx::Stats& ngx)
     }
     ImGui::EndDisabled();
     EndRow();
-    // A Streamline older than 2.7 (Ghost of Tsushima ships 2.4) has no
-    // multi-frame field: the limit reads as 0 while the game runs 2x. Say so
-    // instead of leaving the multiplier greyed out without a word.
+    // A Streamline older than 2.7 (Ghost of Tsushima ships 2.4.0) can request
+    // one generated frame only, and its state has no usable frame limit, so
+    // the limit reads 0 while the game runs 2x. Name the version the boundary
+    // read from sl.interposer.dll instead of leaving the multiplier greyed out
+    // without a word; without a version, say only what was observed.
+    const bool sl_version_known = fg.sl_version[0] != 0 || fg.sl_version[1] != 0;
+    const bool sl_before_27 = sl_version_known && (fg.sl_version[0] < 2 || (fg.sl_version[0] == 2 && fg.sl_version[1] < 7));
     const bool no_multi_frame = hooked && fg.max_frames == 0 && shown <= 1;
-    if (no_multi_frame)
-        Hint("Only 2x here: this game's Streamline does not report multi-frame support (Streamline 2.7 or newer is needed for 3x and 4x). Off and On still work.");
+    char sl_text[48] = "";
+    if (sl_version_known) snprintf(sl_text, sizeof(sl_text), "Streamline %u.%u.%u", fg.sl_version[0], fg.sl_version[1], fg.sl_version[2]);
+    if (no_multi_frame && sl_before_27) {
+        snprintf(buf, sizeof(buf), "Only 2x here: this game ships %s, which can request one generated frame only (2.7 or newer is needed for 3x and 4x). Off and On still work.", sl_text);
+        Hint(buf);
+    } else if (no_multi_frame) {
+        Hint("Only 2x here: this game's Streamline reports no multi-frame limit. Off and On still work.");
+    }
     // Requested versus what actually reached Streamline (and what it reports).
     static const char* kSlModes[] = {"off", "on", "auto", "dynamic"};
     auto mode_name = [](uint32_t m) { return m < 4 ? kSlModes[m] : "unknown"; };
@@ -729,7 +739,7 @@ void DrawNativeFrameGenerationRows(const na::ngx::Stats& ngx)
     }
     if (BeginDetails("Game frame generation details")) {
         char max_text[64] = "not reported yet";
-        if (no_multi_frame) snprintf(max_text, sizeof(max_text), "%s", "not reported (Streamline before 2.7)");
+        if (no_multi_frame) snprintf(max_text, sizeof(max_text), "not reported (%s)", sl_version_known ? sl_text : "no frame limit in state");
         else if (fg.max_frames != 0xFFFFFFFFu) snprintf(max_text, sizeof(max_text), "%ux", fg.max_frames + 1);
         snprintf(buf, sizeof(buf), "Settings calls %llu; state reads %llu; system maximum %s; dynamic %s; status 0x%x; pictures presented at last read %u.",
                  static_cast<unsigned long long>(fg.set_calls), static_cast<unsigned long long>(fg.get_calls), max_text,

@@ -1002,6 +1002,31 @@ HRESULT WINAPI DetourCreateFactory2(UINT flags, REFIID riid, void** out)
 }
 
 // --------------------------------------------------------------- installation
+// File version of a loaded module from its VS_VERSIONINFO resource (no
+// version.lib): the VS_FIXEDFILEINFO block is found by its signature inside
+// the resource bytes. Returns false, leaving `out` untouched, when the module
+// carries no version resource (test stubs) or the block is malformed.
+bool read_module_file_version(HMODULE m, uint16_t out[4])
+{
+    HRSRC res = FindResourceW(m, MAKEINTRESOURCEW(1), reinterpret_cast<LPCWSTR>(RT_VERSION));
+    if (!res) return false;
+    const DWORD size = SizeofResource(m, res);
+    HGLOBAL global = LoadResource(m, res);
+    const auto* bytes = global ? static_cast<const uint8_t*>(LockResource(global)) : nullptr;
+    if (!bytes || size < sizeof(VS_FIXEDFILEINFO)) return false;
+    for (DWORD off = 0; off + sizeof(VS_FIXEDFILEINFO) <= size; off += 4) {
+        VS_FIXEDFILEINFO info{};
+        memcpy(&info, bytes + off, sizeof(info));
+        if (info.dwSignature != 0xFEEF04BDu) continue;
+        out[0] = static_cast<uint16_t>(info.dwFileVersionMS >> 16);
+        out[1] = static_cast<uint16_t>(info.dwFileVersionMS & 0xFFFFu);
+        out[2] = static_cast<uint16_t>(info.dwFileVersionLS >> 16);
+        out[3] = static_cast<uint16_t>(info.dwFileVersionLS & 0xFFFFu);
+        return true;
+    }
+    return false;
+}
+
 bool install_for_module(HMODULE m)
 {
     if (!m || g_module_seen.exchange(1, std::memory_order_acq_rel)) return false;
@@ -1010,6 +1035,13 @@ bool install_for_module(HMODULE m)
         const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(reinterpret_cast<const uint8_t*>(m) + dos->e_lfanew);
         g_module_lo.store(reinterpret_cast<uintptr_t>(m), std::memory_order_release);
         g_module_hi.store(reinterpret_cast<uintptr_t>(m) + nt->OptionalHeader.SizeOfImage, std::memory_order_release);
+    }
+    {
+        uint16_t version[4] = {0, 0, 0, 0};
+        if (read_module_file_version(m, version)) {
+            std::lock_guard<std::mutex> lock(g_fg_m);
+            memcpy(g_fg.sl_version, version, sizeof(version));
+        }
     }
     if (!na::hooking::Initialize()) {
         set_reason("Hooking core failed to initialise.");
@@ -1246,7 +1278,8 @@ int FormatStatus(char* out, size_t cap)
     const int used = n < 0 ? static_cast<int>(strlen(out)) : n;
     const FgState fg = GetFgState();
     const int m = _snprintf_s(out + used, cap - static_cast<size_t>(used), _TRUNCATE,
-        " | dlssg set_hook=%u get_hook=%u set_calls=%llu get_calls=%llu game=%u/%u sent=%u/%u max=%d dynamic=%d status=0x%x request=%u/%u result=%d \"%s\"",
+        " | dlssg sl=%u.%u.%u.%u set_hook=%u get_hook=%u set_calls=%llu get_calls=%llu game=%u/%u sent=%u/%u max=%d dynamic=%d status=0x%x request=%u/%u result=%d \"%s\"",
+        fg.sl_version[0], fg.sl_version[1], fg.sl_version[2], fg.sl_version[3],
         fg.set_hooked, fg.get_hooked, static_cast<unsigned long long>(fg.set_calls), static_cast<unsigned long long>(fg.get_calls),
         fg.game_mode, fg.game_frames, fg.sent_mode, fg.sent_frames,
         fg.max_frames == 0xFFFFFFFFu ? -1 : static_cast<int>(fg.max_frames), fg.dynamic_supported, fg.status,
