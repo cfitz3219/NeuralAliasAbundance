@@ -569,3 +569,6 @@ Production PR59 now3666c9d: Unreal exact-PBZ hash/RVAs replaced with supported c
 
 ### 2026-10-31 - Ghost overlay queue crash repair ready for Cort
 PR59runtimee765402/packagescripts8b3aae6 supersede failedOpus19dd3ee. Exact ACCESS_DENIED reproduced on RTX with late swapchain attachment and competing queue; fixed by buffer-specific submitted-write ownership recovery.63automatedPASS1optionalSKIP; finaloverlay6PASS, installerfixturesPASS. Documents/NA-tsushima-update.cmd ready8b3aae6, additive/rollbackvalidated, priorpackage alreadyrestored. NOdeployment/gamecontrol. Read docs/GHOST-OVERLAY-QUEUE-REPAIR.md for cause/evidence/limits. User must closegame before installing, then owns liveacceptance. COMMS has detailedhandoff.
+
+### 2026-10-31 - Ghost live test8b3aae6 failed; startup correction1da9afd ready
+Home stillabsent; startupfailedwithpartialhooks. Reproduced concurrentinstallation failure, corehookbatchserialized in1da9afd.65automatedPASS1optionalSKIP. Ghostupdater now1da9afd, validated/notdeployed. Exact livefailedslotnotknownfromoldlogs; newdiagnosticsreportit. Do not claimGhostfixeduntiluseracceptance. SeeCOMMS/docsGHOST-OVERLAY-QUEUE-REPAIR.
