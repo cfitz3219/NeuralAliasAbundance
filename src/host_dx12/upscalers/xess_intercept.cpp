@@ -357,7 +357,7 @@ uint32_t install_slot(HMODULE m)
     };
     for (const Spec& s : specs)
         if (s.required && !GetProcAddress(m, s.name)) return 0;
-    if (!na::hooking::BeginInstall()) return 0;
+    if (!na::hooking::BeginInstallWait("upscalers/xess_intercept.cpp")) return 0;
     uint32_t hooked = 0;
     for (const Spec& s : specs) {
         void* target = reinterpret_cast<void*>(GetProcAddress(m, s.name));

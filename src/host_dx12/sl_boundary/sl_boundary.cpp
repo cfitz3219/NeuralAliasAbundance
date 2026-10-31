@@ -1,3 +1,4 @@
+#include "host_dx12/host_boot/process_log.hpp"
 #include "host_dx12/sl_boundary/sl_boundary.hpp"
 
 #include <windows.h>
@@ -101,11 +102,7 @@ void lookup_fg_functions_once(); // defined with the DLSS-G control below
 std::mutex g_install_m;
 bool begin_install_retry()
 {
-    for (int i = 0; i < 100; ++i) {
-        if (na::hooking::BeginInstall()) return true;
-        Sleep(10);
-    }
-    return false;
+    return na::hooking::BeginInstallWait("Streamline boundary");
 }
 
 using PfnNewFrame=SlResult(__cdecl*)(void**,const uint32_t*);
@@ -418,17 +415,13 @@ SlResult __cdecl DetourSetConstants(const void* constants, const void* frame, co
 void present_state(IDXGISwapChain* sc, PresentEvent& e)
 {
     IDXGISwapChain* base = nullptr;
-    bool fresh = false;
-    {
-        std::lock_guard<std::mutex> lock(g_m);
-        fresh = find_proxy_locked(sc) == nullptr;
-    }
-    if (fresh) {
-        void* raw = nullptr;
-        if (SUCCEEDED(sc->QueryInterface(kSlRetrieveBaseIid, &raw)) && raw) {
-            base = static_cast<IDXGISwapChain*>(raw);
-            base->Release(); // borrowed: the proxy keeps its base alive
-        }
+    // SL can replace its underlying chain during an FG/display transition
+    // without changing the game-facing proxy address. Never suppress/draw
+    // against a cached old base identity. QI is outside our state mutex.
+    void* raw = nullptr;
+    if(SUCCEEDED(sc->QueryInterface(kSlRetrieveBaseIid,&raw)) && raw){
+        base=static_cast<IDXGISwapChain*>(raw);
+        base->Release(); // borrowed: the proxy retains it through its Present
     }
     std::lock_guard<std::mutex> lock(g_m);
     ProxyState* st = find_proxy_locked(sc);
@@ -445,6 +438,9 @@ void present_state(IDXGISwapChain* sc, PresentEvent& e)
         st->last_tag_seq = g_last_present_tag_seq;
         st->last_present_event = g_present_events.load(std::memory_order_acquire);
         g_proxies.fetch_add(1, std::memory_order_relaxed);
+    }
+    if(st->base!=base){
+        st->base=base;++st->epoch;st->retry_pending=false;st->retry_frame={};
     }
     e.proxy_id = st->id;
     e.base = st->base;
@@ -592,7 +588,10 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT n, UINT
     const HRESULT hr = g_orig_resize1(sc, n, w, h, f, flags, masks, queues);
     if(SUCCEEDED(hr) && !canonical.empty()){
         std::lock_guard<std::mutex> lock(g_m);
-        for(auto& binding:g_game_queues)if(binding.proxy==sc)binding.queues.Resized(hr,queue_count,canonical.data());
+        GameQueueBinding* entry=nullptr;
+        for(auto& binding:g_game_queues)if(binding.proxy==sc){entry=&binding;break;}
+        if(!entry)for(auto& binding:g_game_queues)if(!binding.proxy){entry=&binding;break;}
+        if(entry && entry->queues.Resized(hr,queue_count,canonical.data()))entry->proxy=sc;
     }
     if (SUCCEEDED(hr)) bump_epoch(sc);
     return hr;
@@ -1177,8 +1176,15 @@ bool FindConstants(uint32_t frame_token, uint32_t viewport, ConstantsRecord* out
 bool Start(const wchar_t* log_path)
 {
     if (log_path && log_path[0]) {
-        wcsncpy_s(g_log_path, log_path, _TRUNCATE);
+        na::host::ProcessLogPath(g_log_path, MAX_PATH, log_path);
         if (HANDLE t = CreateThread(nullptr, 0, &log_thread, nullptr, 0, nullptr)) CloseHandle(t);
+    }
+    // This runs on the host init worker, before the early-factory gate opens.
+    // Already-loaded SL must be covered before the game creates its chain;
+    // queuing it to another worker loses the pre-DLSS-G creation queue.
+    for(const wchar_t* const* name=kModuleNames;*name;++name){
+        HMODULE module=nullptr;
+        if(GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN,*name,&module))install_for_module(module);
     }
     return na::upscalers::AddModuleWatch(kModuleNames, &install_cb);
 }

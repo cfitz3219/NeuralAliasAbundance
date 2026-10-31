@@ -1,3 +1,4 @@
+#include "host_dx12/host_boot/process_log.hpp"
 #include "host_dx12/nr/sl_consumer.hpp"
 #include "host_dx12/adapters/tlou1/apply.hpp"
 #include "host_dx12/adapters/tsushima/apply.hpp"
@@ -52,7 +53,9 @@ void signal_install_attempted()
 void boot_log(const char* message)
 {
     wchar_t path[MAX_PATH]{};
-    GetPrivateProfileStringW(L"host", L"startup_log", L"", path, MAX_PATH, g_ini);
+    wchar_t configured[MAX_PATH]{};
+    GetPrivateProfileStringW(L"host", L"startup_log", L"", configured, MAX_PATH, g_ini);
+    ProcessLogPath(path, MAX_PATH, configured);
     if (!path[0]) return;
     FILE* file = nullptr;
     if (_wfopen_s(&file, path, L"a") == 0 && file) {
@@ -115,32 +118,26 @@ DWORD WINAPI InitThread(LPVOID)
     if (route_a) {
         na::fg::preset::Initialize();
         na::fg::preset::ReadUpscalerOverrides(); // read-only: does the NVIDIA app force a DLSS preset?
-        // Unreal adapter phase 1: read-only probe of the engine's resolution cvars
-        // (unreal_probe.log). [unreal] probe=0 turns it off.
-        if (GetPrivateProfileIntW(L"unreal", L"probe", 1, g_ini) == 1) na::unreal::StartCvarProbe();
         // Game-facing Streamline boundary: observes the game's tags and its Present
         // into SL's swap-chain proxy (pass-through; consumers decide effects).
         // [sl_boundary] enabled=0 turns it off.
-        if (!na::settings::SafeStart() && GetPrivateProfileIntW(L"sl_boundary", L"enabled", 1, g_ini) == 1) {
+        if (GetPrivateProfileIntW(L"sl_boundary", L"enabled", 1, g_ini) == 1) {
             wchar_t slb_log[MAX_PATH] = {};
             wcsncpy_s(slb_log, na::settings::UserIniPath(), _TRUNCATE);
             if (wchar_t* slash = wcsrchr(slb_log, L'\\')) wcscpy_s(slash + 1, MAX_PATH - static_cast<size_t>(slash + 1 - slb_log), L"sl_boundary.log");
             else slb_log[0] = 0;
-            na::nr::slconsumer::Start();
+            // Keep the menu's presentation/queue observation after a crash too.
+            // Safe-start still suppresses NR and saved FG-control requests.
+            if(!na::settings::SafeStart())na::nr::slconsumer::Start();
             na::slb::Start(slb_log);
             // Saved request for the game's own frame generation (default: the game's setting).
-            na::slb::SetFgRequest({static_cast<na::slb::FgMode>(na::settings::Get().native_fg_mode.load()),
+            if(!na::settings::SafeStart())na::slb::SetFgRequest({static_cast<na::slb::FgMode>(na::settings::Get().native_fg_mode.load()),
                                    na::settings::Get().native_fg_frames.load()});
         }
-        // Unreal adapter phase 2: live render resolution via r.ScreenPercentage.
-        // Locating is read-only; the value changes only on the user's Apply.
-        if (!na::settings::SafeStart() && GetPrivateProfileIntW(L"unreal", L"screen_percentage", 1, g_ini) == 1)
-            na::unreal::StartScreenPercentage();
         // One Apply across all resolution-control methods (learned per game).
         na::mode::Start();
         na::ngx::PreloadAndHookNgxCore();
-        na::tlou1::InitializeApply();
-    na::tsushima::InitializeApply();
+
         bool sync_hook = GetPrivateProfileIntW(L"observe", L"sync_loader_hook", 0, g_ini) == 1;
         route_a_started = na::ngx::StartModuleWatch(sync_hook);
         na::nr::Runtime rt;
@@ -223,6 +220,15 @@ DWORD WINAPI InitThread(LPVOID)
         g_status.host_started = started ? 1u : 0u;
     }
     if (!started) { set_error("overlay/host start failed"); return 0; }
+    // Engine scans must not delay the first factory/queue capture. Applying a
+    // quality setting still requires an explicit user request.
+    if(route_a){
+        if(GetPrivateProfileIntW(L"unreal",L"probe",1,g_ini)==1)na::unreal::StartCvarProbe();
+        if(!na::settings::SafeStart() && GetPrivateProfileIntW(L"unreal",L"screen_percentage",1,g_ini)==1)
+            na::unreal::StartScreenPercentage();
+        na::tlou1::InitializeApply();
+        na::tsushima::InitializeApply();
+    }
     if (route_a) { // A61: the DLSS call log beside the ini, as the sl proxy writes it
         wchar_t log_path[MAX_PATH], configured[MAX_PATH] = {};
         GetPrivateProfileStringW(L"observe", L"log", L"", configured, MAX_PATH, g_ini);
@@ -234,7 +240,8 @@ DWORD WINAPI InitThread(LPVOID)
                 if (log_path[i] == L'\\' || log_path[i] == L'/') { log_path[i] = 0; break; }
             lstrcatW(log_path, L"\\NeuralAliasHost-observe.log");
         }
-        na::ngx::StartLogger(log_path);
+        wchar_t process_path[MAX_PATH]{};
+        if(ProcessLogPath(process_path,MAX_PATH,log_path))na::ngx::StartLogger(process_path);
     }
     // Adapter phase 2: subscriptions and registry after the host owns Execute/discovery.
     if (prepared) {
@@ -268,7 +275,9 @@ bool StartFromIni(HMODULE self, const wchar_t* ini_name, const char* default_tag
         if (tag_w[0]) WideCharToMultiByte(CP_ACP, 0, tag_w, -1, tag_a, 32, nullptr, nullptr);
         strncpy_s(g_status.tag, tag_a[0] ? tag_a : (default_tag ? default_tag : "HOST"), _TRUNCATE);
     }
-    if (GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1 &&
+    if ((GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1 ||
+         (GetPrivateProfileIntW(L"route_a", L"enabled", 0, g_ini) == 1 &&
+          GetPrivateProfileIntW(L"overlay", L"enabled", 1, g_ini) == 1)) &&
         GetPrivateProfileIntW(L"observe", L"early_install", 1, g_ini) == 1)
         g_install_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     HANDLE t = CreateThread(nullptr, 0, &InitThread, nullptr, 0, nullptr);

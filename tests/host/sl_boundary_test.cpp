@@ -688,7 +688,20 @@ int main()
             CHECK(v3->ResizeBuffers1(2,32,32,DXGI_FORMAT_R8G8B8A8_UNORM,0,masks,queues)==S_OK);
             queue_proxy.index=1;CHECK(out->Present(1,0)==S_OK);CHECK(g_rec.before.back().present_queue==second.Get());
             queue_proxy.index=0;CHECK(out->Present(1,0)==S_OK);CHECK(g_rec.before.back().present_queue==gpu.queue.Get());
-            CHECK(out->Release()==0);CHECK(na::slb::SetCallbacks({}));
+            CHECK(out->Release()==0);
+            // Late attachment: ResizeBuffers1 itself can establish a binding
+            // even if this proxy's factory creation was not observed.
+            sl::interposer::DXGISwapChain late;late.base=&queue_base;
+            auto* late3=reinterpret_cast<IDXGISwapChain3*>(&late);
+            CHECK(late3->ResizeBuffers1(2,32,32,DXGI_FORMAT_R8G8B8A8_UNORM,0,masks,queues)==S_OK);
+            late.index=1;CHECK(late3->Present(1,0)==S_OK);CHECK(g_rec.before.back().present_queue==second.Get());
+            FakeBase new_base;
+            const auto previous_epoch=g_rec.before.back().stream_epoch;
+            late.base=&new_base;CHECK(late3->Present(1,0)==S_OK);
+            CHECK(g_rec.before.back().base==reinterpret_cast<IDXGISwapChain*>(&new_base));
+            CHECK(g_rec.before.back().stream_epoch==previous_epoch+1);
+            CHECK(new_base.refs==1 && queue_base.refs==1);
+            CHECK(late3->Release()==0);CHECK(na::slb::SetCallbacks({}));
         }
     }
     char line[1024];

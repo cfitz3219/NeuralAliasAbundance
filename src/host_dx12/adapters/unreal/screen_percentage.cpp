@@ -223,7 +223,7 @@ DWORD WINAPI worker(LPVOID) {
         g_float_set=reinterpret_cast<Setter>(const_cast<uint8_t*>(image.base)+found.setters[0]);
         g_int_set=reinterpret_cast<Setter>(const_cast<uint8_t*>(image.base)+found.setters[1]);
         g_caller=reinterpret_cast<uintptr_t>(image.base)+found.caller;
-        if(na::hooking::BeginInstall()) {
+        if(na::hooking::BeginInstallWait("adapters/unreal/screen_percentage.cpp")) {
             valid=na::hooking::PrepareHook(const_cast<uint8_t*>(image.base)+found.sink,reinterpret_cast<void*>(&sink_detour),reinterpret_cast<void**>(&g_sink));
             if(valid)valid=na::hooking::CommitInstall();else na::hooking::AbandonInstall();
         } else valid=false;

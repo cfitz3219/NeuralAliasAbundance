@@ -7,6 +7,7 @@
 #include <map>
 #include <mutex>
 #include <vector>
+#include <cstdio>
 
 namespace na::hooking {
 namespace {
@@ -37,6 +38,8 @@ int g_fail_enable_at_for_test = -1; // A46 test injection: the Nth enable in a c
 bool g_fail_next_remove_for_test = false;  // A47: the next MinHook removal is treated as failed (not performed)
 bool g_fail_next_disable_for_test = false; // A47: the next MinHook disable is treated as failed (not performed)
 char g_last_error[160] = "";
+char g_wait_error[160] = "";
+uint32_t g_wait_failures = 0;
 uint32_t g_dead_count = 0;
 
 thread_local int t_detour_depth = 0;
@@ -232,6 +235,40 @@ bool BeginInstall()
     g_pending.clear();
     g_last_error[0] = 0;
     return true;
+}
+
+bool BeginInstallWait(const char* caller, uint32_t timeout_ms)
+{
+    const auto started = GetTickCount64();
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            if (g_init_refs && !g_in_transaction) {
+                g_in_transaction = true;
+                g_transaction_owner = GetCurrentThreadId();
+                g_pending.clear();
+                g_last_error[0] = 0;
+                return true;
+            }
+            if (!g_init_refs || g_transaction_owner == GetCurrentThreadId() ||
+                GetTickCount64() - started >= timeout_ms) {
+                snprintf(g_last_error, sizeof(g_last_error), "%s: install %s (owner=%lu caller=%lu)",
+                         caller ? caller : "worker", !g_init_refs ? "uninitialized" :
+                         g_transaction_owner == GetCurrentThreadId() ? "nested" : "timed out",
+                         g_transaction_owner, GetCurrentThreadId());
+                ++g_wait_failures;lstrcpynA(g_wait_error,g_last_error,sizeof(g_wait_error));
+                OutputDebugStringA(g_last_error);
+                return false;
+            }
+        }
+        Sleep(1);
+    }
+}
+
+uint32_t InstallWaitFailures(char* last,uint32_t capacity) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if(last && capacity)lstrcpynA(last,g_wait_error,capacity);
+    return g_wait_failures;
 }
 
 bool PrepareHook(void* target, void* detour, void** out_original)

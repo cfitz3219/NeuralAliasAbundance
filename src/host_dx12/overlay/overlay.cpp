@@ -1,3 +1,4 @@
+#include "host_dx12/host_boot/process_log.hpp"
 #include "host_dx12/adapters/mode_control.hpp"
 #include "host_dx12/nr/native_fg.hpp"
 #include "host_dx12/sl_boundary/sl_boundary.hpp"
@@ -230,15 +231,12 @@ std::atomic<uint32_t> g_retargets{0}; // swap chain re-targets (A31)
 std::atomic<uint32_t> g_initialized{0};
 std::atomic<uint32_t> g_gamepad_hooked{0};
 std::atomic<bool> g_stopping{false};
-// Streamline boundary frame source (Ghost of Tsushima, 2026-10-31): see
-// boundary_fallback.hpp. g_native_game_presents counts game Presents that
-// reached the native DXGI detour; once the boundary sees three consecutive SL
-// proxy frames with no native one in between, g_boundary_frames latches and
-// the overlay draws from the boundary instead (never from both).
+// Diagnostic counters plus per-chain ownership; no global routing switch.
+// Native Presents include DLSS-G's asynchronous generated frames.
 std::atomic<uint64_t> g_native_game_presents{0};
 std::atomic<bool> g_boundary_frames{false};
 std::mutex g_boundary_m;
-BoundaryFallback g_boundary_policy; // g_boundary_m
+BoundaryRoutes g_boundary_policy; // g_boundary_m
 void* g_native_present_target = nullptr;  // native Present body hooked at Start (diagnostics only)
 void* g_native_present1_target = nullptr;
 std::atomic<float> g_fps{0.0f}, g_frame_ms{0.0f}, g_mouse_x{0.0f}, g_mouse_y{0.0f};
@@ -380,6 +378,14 @@ HRESULT STDMETHODCALLTYPE DetourDIGetDeviceData(void* self, DWORD cb, void* even
     if (SUCCEEDED(r) && inout && lock_input_for_this_thread()) *inout = 0; // drained, not delivered
     return r;
 }
+// Startup worker only: optional input hooks must not lose to another installer.
+bool install_input_function(void* target,void* detour,void** original) {
+    if(!na::hooking::BeginInstallWait("overlay input"))return false;
+    if(!na::hooking::PrepareHook(target,detour,original)){
+        na::hooking::AbandonInstall();return false;
+    }
+    return na::hooking::CommitInstall();
+}
 void install_dinput_hooks()
 {
     HMODULE m = LoadLibraryW(L"dinput8.dll"); // pinned: the hooked code must stay loaded
@@ -404,8 +410,8 @@ void install_dinput_hooks()
             // The A and W interfaces may share one implementation: hook each function once.
             bool st_done = false, dt_done = false;
             for (void* t : g_di_targets) { st_done |= t == st; dt_done |= t == dt; }
-            if (!st_done && na::hooking::HookFunction(st, states[i], reinterpret_cast<void**>(&g_orig_di_state[i]))) g_di_targets[i * 2] = st;
-            if (!dt_done && na::hooking::HookFunction(dt, datas[i], reinterpret_cast<void**>(&g_orig_di_data[i]))) g_di_targets[i * 2 + 1] = dt;
+            if (!st_done && install_input_function(st, states[i], reinterpret_cast<void**>(&g_orig_di_state[i]))) g_di_targets[i * 2] = st;
+            if (!dt_done && install_input_function(dt, datas[i], reinterpret_cast<void**>(&g_orig_di_data[i]))) g_di_targets[i * 2 + 1] = dt;
             static_cast<IUnknown*>(dev)->Release();
         }
         static_cast<IUnknown*>(di)->Release();
@@ -428,7 +434,7 @@ void install_input_hooks()
     uint32_t n = 0;
     for (int i = 0; i < 7; ++i) {
         void* target = reinterpret_cast<void*>(GetProcAddress(u, specs[i].name));
-        if (target && na::hooking::HookFunction(target, specs[i].detour, specs[i].original)) {
+        if (target && install_input_function(target, specs[i].detour, specs[i].original)) {
             g_input_hook_targets[i] = target;
             ++n;
         } else {
@@ -589,6 +595,12 @@ void write_status_line()
             static_cast<unsigned long long>(g_presents.load(std::memory_order_relaxed)),GetCurrentProcessId(),
             g_swap_queue_hits.load(),g_swap_queue_observed.load(),g_swap_queue_misses.load());
         if(source_bytes>0)WriteFile(f,source_line,DWORD((std::min)(source_bytes,int(sizeof(source_line)-1))),&written,nullptr);
+    }
+    {
+        char reason[160]{},failure_line[240]{};
+        const auto count=na::hooking::InstallWaitFailures(reason,sizeof(reason));
+        if(count){const auto bytes=snprintf(failure_line,sizeof(failure_line),"hook_install_wait_failures=%u last=%s\r\n",count,reason);
+            WriteFile(f,failure_line,DWORD((std::min)(bytes,int(sizeof(failure_line)-1))),&written,nullptr);}
     }
     char sl_boundary_line[1024];
     const int sl_boundary_bytes=na::slb::FormatStatus(sl_boundary_line,sizeof(sl_boundary_line));
@@ -2109,10 +2121,9 @@ bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue,ComPtr<ID3D1
     if (sc == g_state.dummy_swapchain_identity) return false;
     g_presents.fetch_add(1, std::memory_order_relaxed);
     // Use the recorded per-buffer queue or recover it from submitted writes.
-    retained_queue = swapchain_queue(sc);
+    retained_queue = queue_hint ? ComPtr<ID3D12CommandQueue>(queue_hint) : swapchain_queue(sc);
     // Boundary frames: the game-facing proxy is not a key in g_swap_queues;
     // sl_boundary supplies the proxy's exact creation/ResizeBuffers1 queue.
-    if (!retained_queue && queue_hint) retained_queue = queue_hint;
     if (retained_queue) g_swap_queue_hits.fetch_add(1, std::memory_order_relaxed);
     else {
         // GetDevice returns the device, not a supported queue-recovery API.
@@ -2287,15 +2298,19 @@ HANDLE STDMETHODCALLTYPE DetourGetFrameLatencyWaitableObject(IDXGISwapChain2* sc
     return handle; // observe exactly what the game receives; never signal/replace/close it
 }
 
+bool boundary_owns_native(IDXGISwapChain* chain) {
+    std::lock_guard<std::mutex> lock(g_boundary_m);
+    return g_boundary_policy.Suppresses(reinterpret_cast<uintptr_t>(chain));
+}
 HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flags)
 {
     if (na::present::IsPresentThread()) return g_orig_present(sc, sync, flags); // never re-entered by design; safety
     if (!(flags & DXGI_PRESENT_TEST)) g_native_game_presents.fetch_add(1, std::memory_order_acq_rel);
     na::dlss::ReleaseIfDeviceRemoved(); // G2-004: never pin a removed device across the game's recovery
-    if (!(flags & DXGI_PRESENT_TEST) && na::present::Proxied(sc)) return presenter_present(sc, sync, flags, nullptr);
+    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc) && na::present::Proxied(sc)) return presenter_present(sc, sync, flags, nullptr);
     const auto observed = na::observe::PresentBegin(sc);
     na::nr::trace::Record("present_begin",sc);
-    if (!(flags & DXGI_PRESENT_TEST) && !g_boundary_frames.load(std::memory_order_acquire)) on_present(sc);
+    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc)) on_present(sc);
     const HRESULT result = g_orig_present(sc, sync, flags);
     na::nr::trace::Record("present_end",sc,nullptr,0,0,result);
     na::observe::PresentEnd(observed,sync,flags,result);
@@ -2307,10 +2322,10 @@ HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT fl
     if (na::present::IsPresentThread()) return g_orig_present1(sc, sync, flags, pp);
     if (!(flags & DXGI_PRESENT_TEST)) g_native_game_presents.fetch_add(1, std::memory_order_acq_rel);
     na::dlss::ReleaseIfDeviceRemoved(); // G2-004: never pin a removed device across the game's recovery
-    if (!(flags & DXGI_PRESENT_TEST) && na::present::Proxied(sc)) return presenter_present(sc, sync, flags, pp);
+    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc) && na::present::Proxied(sc)) return presenter_present(sc, sync, flags, pp);
     const auto observed = na::observe::PresentBegin(sc);
     na::nr::trace::Record("present1_begin",sc);
-    if (!(flags & DXGI_PRESENT_TEST) && !g_boundary_frames.load(std::memory_order_acquire)) on_present(sc);
+    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc)) on_present(sc);
     const HRESULT result = g_orig_present1(sc, sync, flags, pp);
     na::nr::trace::Record("present1_end",sc,nullptr,0,0,result);
     na::observe::PresentEnd(observed,sync,flags,result);
@@ -2372,6 +2387,7 @@ HRESULT STDMETHODCALLTYPE DetourSetColorSpace1(IDXGISwapChain3* sc, DXGI_COLOR_S
 void on_chain_gone(IDXGISwapChain* sc)
 {
     g_chain_gone.fetch_add(1, std::memory_order_relaxed);
+    {std::lock_guard<std::mutex> lock(g_boundary_m);g_boundary_policy.Forget(reinterpret_cast<uintptr_t>(sc));}
     na::present::ForgetChain(sc);
     {std::lock_guard<std::mutex> lock(g_swap_queue_m);for(auto& binding:g_swap_queues)if(binding.sc==sc)binding={};}
     std::lock_guard<std::mutex> lock(g_state.mutex);
@@ -2555,14 +2571,8 @@ void STDMETHODCALLTYPE DetourExecute(ID3D12CommandQueue* q, UINT n,
 
 namespace {
 // ------------------------------------------------ Streamline boundary frames
-// Ghost of Tsushima (f46adb7, 2026-10-31): sl_boundary counted thousands of
-// game Presents into SL's proxy while the native Present detour never ran, so
-// the menu was never drawn. When that is detected (boundary_fallback.hpp) the
-// overlay takes its frames from the proxy Present instead: the same on_present
-// work the native detour does, on the game-facing chain, before SL's original
-// Present. Back-buffer reads dispatch virtually through the proxy (742ff30),
-// so they return exactly what the game drew. Resize/release on the proxy drop
-// our references the way the native ResizeBuffers/Release detours do.
+// Game-facing Streamline presentation is preferred when creation/resize gives
+// us its exact queue. Native generated Presents never draw the same menu again.
 void append_status_text(const char* text, int n)
 {
     if (!g_status_log[0] || n <= 0) return;
@@ -2606,9 +2616,9 @@ void note_boundary_engaged(IDXGISwapChain* game_facing, IDXGISwapChain* base)
     const void* base_present = present_slot_of(base);
     char line[1024];
     const int n = snprintf(line, sizeof(line),
-        "%02u:%02u:%02u overlay_source=streamline: the native Present detour saw no game Present across %u Streamline proxy frames "
+        "%02u:%02u:%02u overlay_source=streamline: qualified game-facing queue; associated native draws suppressed "
         "(native_presents=%llu). proxy=%p present=%s base=%p present=%s hooked_present=%s hooked_present1=%s base_slot_is_hooked=%u\r\n",
-        t.wHour, t.wMinute, t.wSecond, BoundaryFallback::kMissesToEngage,
+        t.wHour, t.wMinute, t.wSecond,
         static_cast<unsigned long long>(g_native_game_presents.load(std::memory_order_acquire)),
         static_cast<void*>(game_facing), module_of(proxy_present, proxy_mod, sizeof(proxy_mod)),
         static_cast<void*>(base), base ? module_of(base_present, base_mod, sizeof(base_mod)) : "none",
@@ -2619,28 +2629,51 @@ void note_boundary_engaged(IDXGISwapChain* game_facing, IDXGISwapChain* base)
 }
 void boundary_present(IDXGISwapChain* game_facing, IDXGISwapChain* base, ID3D12CommandQueue* queue)
 {
-    if (!game_facing || g_stopping.load(std::memory_order_acquire)) return;
-    bool draw = false;
+    if(!game_facing || !base || game_facing==base || g_stopping.load(std::memory_order_acquire))return;
     {
         std::lock_guard<std::mutex> lock(g_boundary_m);
-        draw = g_boundary_policy.OnBoundaryPresent(g_native_game_presents.load(std::memory_order_acquire));
+        if(g_boundary_policy.OwnsProxy(reinterpret_cast<uintptr_t>(game_facing)))
+            g_boundary_policy.Select(reinterpret_cast<uintptr_t>(game_facing),reinterpret_cast<uintptr_t>(base));
     }
-    if (!draw) return;
-    if (!g_boundary_frames.exchange(true, std::memory_order_acq_rel)) note_boundary_engaged(game_facing, base);
+    // Only the game's creation/ResizeBuffers1 queue, never the base chain's
+    // private DLSS-G queue. Keep the owned reference through submission.
     ComPtr<ID3D12CommandQueue> hint(queue);
-    on_present(game_facing, hint.Get());
+    if(!hint)hint=swapchain_queue(game_facing);
+    if(!hint || hint->GetDesc().Type!=D3D12_COMMAND_LIST_TYPE_DIRECT)return;
+    ComPtr<ID3D12Resource> buffer;ComPtr<ID3D12Device> buffer_device,queue_device;
+    if(FAILED(real_get_buffer(game_facing,real_index(game_facing),IID_PPV_ARGS(&buffer))) ||
+       FAILED(buffer->GetDevice(IID_PPV_ARGS(&buffer_device))) ||
+       FAILED(hint->GetDevice(IID_PPV_ARGS(&queue_device))) ||
+       buffer_device.Get()!=queue_device.Get() || FAILED(queue_device->GetDeviceRemovedReason()))return;
+    bool first=false;
+    {
+        std::lock_guard<std::mutex> lock(g_boundary_m);
+        first=!g_boundary_policy.OwnsProxy(reinterpret_cast<uintptr_t>(game_facing));
+        if(!g_boundary_policy.Select(reinterpret_cast<uintptr_t>(game_facing),reinterpret_cast<uintptr_t>(base)))return;
+    }
+    g_boundary_frames.store(true,std::memory_order_release);
+    if(first)note_boundary_engaged(game_facing,base);
+    // If the native path attached before SL was discovered, transfer this
+    // chain immediately once its submitted draws retire, without a 2s blackout.
+    {
+        std::lock_guard<std::mutex> lock(g_state.mutex);
+        if(g_state.swapchain==base && menu_draws_complete()){
+            release_buffers_locked();g_state.swapchain=nullptr;g_state.last_present.QuadPart=0;
+        }
+    }
+    on_present(game_facing,hint.Get());
 }
 void boundary_before_resize(IDXGISwapChain* game_facing)
 {
-    if (!game_facing || !g_boundary_frames.load(std::memory_order_acquire)) return;
+    if(!game_facing)return;
     na::nr::native::Maintain();
     retire_nr_backbuffers(game_facing);
     std::lock_guard<std::mutex> lock(g_state.mutex);
-    if (g_state.swapchain == game_facing) release_buffers_locked();
+    if(g_state.swapchain==game_facing)release_buffers_locked();
 }
 void boundary_released(IDXGISwapChain* game_facing)
 {
-    if (game_facing && g_boundary_frames.load(std::memory_order_acquire)) on_chain_gone(game_facing);
+    if(game_facing)on_chain_gone(game_facing);
 }
 na::slb::OverlayHooks make_boundary_hooks()
 {
@@ -2712,10 +2745,7 @@ bool Start(const char* route_tag, PanelFn controls)
             // install hooks. Immediate HookVTableSlot fails while ANY install
             // transaction is open. Previously that left just the first hooks
             // enabled and skipped the queue tracker. Own one coherent batch.
-            bool transaction=false;
-            for(unsigned attempt=0;attempt<5000 && !transaction;++attempt){
-                transaction=na::hooking::BeginInstall();if(!transaction)Sleep(1);
-            }
+            bool transaction=na::hooking::BeginInstallWait("overlay core");
             auto prepare_start_hook=[](void* object,uint32_t slot,void* detour,void** original){
                 const bool prepared=na::hooking::PrepareVTableSlot(object,slot,detour,original);
                 if(!prepared){
@@ -2834,7 +2864,7 @@ bool Start(const char* route_tag, PanelFn controls)
         HMODULE m = GetModuleHandleW(mods[i]);
         if (!m) continue;
         void* target = reinterpret_cast<void*>(GetProcAddress(m, "XInputGetState"));
-        if (target && na::hooking::HookFunction(target, detours[i],
+        if (target && install_input_function(target, detours[i],
                                                 reinterpret_cast<void**>(&g_orig_xinput[i]))) {
             ++hooked;
             if (!g_menu_xinput.load(std::memory_order_relaxed)) g_menu_xinput.store(g_orig_xinput[i],std::memory_order_release);
@@ -2843,7 +2873,7 @@ bool Start(const char* route_tag, PanelFn controls)
     g_gamepad_hooked.store(hooked);
     install_input_hooks(); // A44: the game sees no mouse/keyboard while the menu is open
     if (!na::hooking::variants::StartDiscoveryThread(&seen_drain, nullptr)) return false; // A49: propagated
-    if (ok) na::slb::SetOverlayHooks(&g_boundary_hooks); // frames from SL's proxy if the native detour stays silent
+    if (ok) na::slb::SetOverlayHooks(&g_boundary_hooks); // prefer the qualified game-facing frame before native FG
     return ok;
 }
 
@@ -3019,8 +3049,7 @@ int CurrentPageIndex() { return static_cast<int>(na::menu::CurrentPage()) - 1; }
 
 void SetStatusLogPath(const wchar_t* path)
 {
-    if (path) lstrcpynW(g_status_log, path, MAX_PATH);
-    else g_status_log[0] = 0;
+    na::host::ProcessLogPath(g_status_log, MAX_PATH, path);
     g_status_last_tick = 0;
 }
 
@@ -3032,6 +3061,9 @@ void DrawMenuForTests(ID3D12CommandQueue* queue,ID3D12Resource* frame) {
 }
 
 int SwapChainColorSpace() { return g_color_space.load(std::memory_order_acquire); }
+void BoundaryPresentForTests(IDXGISwapChain* proxy,IDXGISwapChain* base,ID3D12CommandQueue* queue){boundary_present(proxy,base,queue);}
+void BoundaryResizeForTests(IDXGISwapChain* proxy){boundary_before_resize(proxy);}
+void BoundaryReleaseForTests(IDXGISwapChain* proxy){boundary_released(proxy);}
 long ReadNativeBufferForTests(IDXGISwapChain* chain, unsigned index, REFIID iid, void** out){return real_get_buffer(chain,index,iid,out);}
 ID3D12CommandQueue* AcquirePresentQueue(IDXGISwapChain* chain){return swapchain_queue(chain).Detach();}
 int SwapChainColorSpace(IDXGISwapChain* chain){

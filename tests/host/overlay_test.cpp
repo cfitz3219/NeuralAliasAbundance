@@ -20,7 +20,12 @@
 #include <atomic>
 #include <thread>
 
-namespace na::overlay { long ReadNativeBufferForTests(IDXGISwapChain*,unsigned,REFIID,void**); }
+namespace na::overlay {
+long ReadNativeBufferForTests(IDXGISwapChain*,unsigned,REFIID,void**);
+void BoundaryPresentForTests(IDXGISwapChain*,IDXGISwapChain*,ID3D12CommandQueue*);
+void BoundaryResizeForTests(IDXGISwapChain*);
+void BoundaryReleaseForTests(IDXGISwapChain*);
+}
 
 namespace {
 // Different COM layout, like a Streamline game-facing wrapper. Calling a
@@ -40,8 +45,11 @@ struct ChainWrapper {
     static ULONG STDMETHODCALLTYPE Release(ChainWrapper* self){return --self->refs;}
     static UINT STDMETHODCALLTYPE Index(ChainWrapper* self){++self->indices;return self->inner->GetCurrentBackBufferIndex();}
     static HRESULT STDMETHODCALLTYPE Buffer(ChainWrapper* self,UINT index,REFIID iid,void** out){++self->buffers;return self->inner->GetBuffer(index,iid,out);}
+    static HRESULT STDMETHODCALLTYPE Device(ChainWrapper* self,REFIID iid,void** out){return self->inner->GetDevice(iid,out);}
+    static HRESULT STDMETHODCALLTYPE Desc(ChainWrapper* self,DXGI_SWAP_CHAIN_DESC* out){return self->inner->GetDesc(out);}
     explicit ChainWrapper(IDXGISwapChain3* chain):vtable(methods),inner(chain){
         methods[0]=reinterpret_cast<void*>(&Query);methods[1]=reinterpret_cast<void*>(&Add);methods[2]=reinterpret_cast<void*>(&Release);
+        methods[7]=reinterpret_cast<void*>(&Device);methods[12]=reinterpret_cast<void*>(&Desc);
         methods[9]=reinterpret_cast<void*>(&Buffer);methods[36]=reinterpret_cast<void*>(&Index);
     }
     IDXGISwapChain* chain(){return reinterpret_cast<IDXGISwapChain*>(this);}
@@ -59,6 +67,7 @@ void Pump() { MSG msg; while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { Tr
 int main(int argc, char** argv)
 {
     const bool hardware = argc > 1 && !strcmp(argv[1], "--hardware");
+    const bool boundary=argc>2 && !strcmp(argv[2],"--boundary");
     const bool busy_install=argc>2 && !strcmp(argv[2],"--busy-install");
     const bool late_queue = argc > 2 && !strcmp(argv[2], "--late-queue");
     SetEnvironmentVariableW(L"NEURALALIAS_TEST_WARP", hardware ? nullptr : L"1");
@@ -118,7 +127,7 @@ int main(int argc, char** argv)
     if(late_queue) REQUIRE(na::overlay::Start("TEST", nullptr));
     test::ComPtr<ID3D12CommandQueue> unrelated;
     test::List unrelated_list;
-    if(late_queue){
+    if(late_queue || boundary){
         D3D12_COMMAND_QUEUE_DESC q{};
         REQUIRE(SUCCEEDED(d.device->CreateCommandQueue(&q,IID_PPV_ARGS(&unrelated))));
         REQUIRE(unrelated_list.Create(d.device.Get())); REQUIRE(SUCCEEDED(unrelated_list.list->Close()));
@@ -136,6 +145,21 @@ int main(int argc, char** argv)
         CHECK(SUCCEEDED(na::overlay::ReadNativeBufferForTests(wrapped.chain(),index,IID_PPV_ARGS(&wrappedBuffer))));
         CHECK(SUCCEEDED(sc->GetBuffer(index,IID_PPV_ARGS(&plainBuffer))));
         CHECK(wrappedBuffer.Get()==plainBuffer.Get() && wrapped.buffers==1 && wrapped.refs==1);
+    }
+
+    // Native-FG-like topology: a game-facing wrapper exposes the game's
+    // buffer on queue A, while Present forwards to a DIFFERENT chain/queue B.
+    // Invoke the production boundary callback, then real hooked native Presents
+    // (including extra generated ones). No ResourceBarrier inference is needed.
+    HWND nativeWindow=nullptr;test::ComPtr<IDXGISwapChain1> nativeChain;
+    if(boundary){
+        nativeWindow=CreateWindowExW(0,wc.lpszClassName,L"native presentation test",WS_OVERLAPPEDWINDOW,
+            120,120,640,360,nullptr,nullptr,wc.hInstance,nullptr);
+        REQUIRE(nativeWindow);
+        REQUIRE(SUCCEEDED(d.factory->CreateSwapChainForHwnd(unrelated.Get(),nativeWindow,&sd,nullptr,nullptr,&nativeChain)));
+        const auto before=na::overlay::GetStats().presents_seen;
+        na::overlay::BoundaryPresentForTests(wrapped.chain(),nativeChain.Get(),nullptr);
+        CHECK(na::overlay::GetStats().presents_seen==before); // unknown queue isn't guessed
     }
 
     // Discarded, split, and read-only recordings cannot establish a writer.
@@ -167,13 +191,21 @@ int main(int argc, char** argv)
         l.Reset();
         auto b0 = test::Transition(bb.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
         auto b1 = test::Transition(bb.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
-        l.list->ResourceBarrier(1, &b0);
-        l.list->ResourceBarrier(1, &b1);
+        if(!boundary){l.list->ResourceBarrier(1, &b0);l.list->ResourceBarrier(1, &b1);}
         l.list->Close();
         ID3D12CommandList* lists[] = {l.list.Get()};
         d.queue->ExecuteCommandLists(1, lists);
         if(late_queue){ID3D12CommandList* other[]={unrelated_list.list.Get()};unrelated->ExecuteCommandLists(1,other);}
-        const HRESULT hr = sc->Present(0, 0);
+        HRESULT hr=S_OK;
+        if(boundary){
+            const auto count=na::overlay::GetStats().presents_seen;
+            na::overlay::BoundaryPresentForTests(wrapped.chain(),nativeChain.Get(),d.queue.Get());
+            CHECK(na::overlay::GetStats().presents_seen==count+1);
+            hr=nativeChain->Present(0,0);
+            CHECK(SUCCEEDED(nativeChain->Present(0,0))); // generated Present
+            CHECK(SUCCEEDED(nativeChain->Present(0,DXGI_PRESENT_TEST)));
+            CHECK(na::overlay::GetStats().presents_seen==count+1); // no native double-draw
+        }else hr = sc->Present(0, 0);
         d.WaitIdle();
         Pump();
         return hr;
@@ -268,6 +300,7 @@ int main(int argc, char** argv)
 
     // Resize survives.
     d.WaitIdle();
+    if(boundary)na::overlay::BoundaryResizeForTests(wrapped.chain());
     CHECK(SUCCEEDED(sc->ResizeBuffers(0, 800, 450, DXGI_FORMAT_UNKNOWN, 0)));
     for (int i = 0; i < 3; ++i) CHECK(SUCCEEDED(frame()));
     CHECK(na::overlay::GetStats().presents_seen >= s.presents_seen + 4);
@@ -283,15 +316,28 @@ int main(int argc, char** argv)
     IUnknown* alternating[]={d.queue.Get(),replacement.Get()};
     CHECK(binding.Resized(S_OK,2,alternating));CHECK(binding.At(0).Get()==d.queue.Get());CHECK(binding.At(1).Get()==replacement.Get());
     d.WaitIdle();
+    if(boundary)na::overlay::BoundaryResizeForTests(wrapped.chain());
     REQUIRE(SUCCEEDED(sc->ResizeBuffers1(2,800,450,DXGI_FORMAT_UNKNOWN,0,masks,queues)));
     d.queue=replacement; // test render work uses the queue we just assigned
     na::overlay::SetOpen(true);
     for(int i=0;i<3;++i){CHECK(SUCCEEDED(frame()));CHECK(na::overlay::GetStats().present_queue==reinterpret_cast<uintptr_t>(replacement.Get()));}
 
     d.WaitIdle();
+    if(boundary){
+        // Temporary loss of metadata must not put us back on DLSS-G's chain.
+        const auto before=na::overlay::GetStats().presents_seen;
+        na::overlay::BoundaryPresentForTests(wrapped.chain(),nativeChain.Get(),nullptr);
+        nativeChain->Present(0,0);
+        CHECK(na::overlay::GetStats().presents_seen==before);
+        na::overlay::BoundaryReleaseForTests(wrapped.chain());
+        nativeChain->Present(0,0);
+        CHECK(na::overlay::GetStats().presents_seen==before+1);
+        d.WaitIdle();
+    }
     bool stopped = false;
     for (int i = 0; i < 20 && !stopped; ++i) { stopped = na::overlay::Stop(); if (!stopped) Sleep(100); }
     CHECK(stopped);
+    nativeChain.Reset();if(nativeWindow)DestroyWindow(nativeWindow);
     sc.Reset(); sc1.Reset();
     DestroyWindow(hwnd);
     na::hooking::Shutdown();

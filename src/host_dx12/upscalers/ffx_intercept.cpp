@@ -427,7 +427,7 @@ uint32_t install_slot(HMODULE m)
     // table honest); Configure and Query are pass-through and hooked when possible.
     if (!GetProcAddress(m, "ffxDispatch") || !GetProcAddress(m, "ffxCreateContext") || !GetProcAddress(m, "ffxDestroyContext"))
         return 0;
-    if (!na::hooking::BeginInstall()) return 0;
+    if (!na::hooking::BeginInstallWait("upscalers/ffx_intercept.cpp")) return 0;
     uint32_t hooked = 0;
     for (size_t i = 0; i < sizeof(specs) / sizeof(specs[0]); ++i) {
         const Spec& s = specs[i];

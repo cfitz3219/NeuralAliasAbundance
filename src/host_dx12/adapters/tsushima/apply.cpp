@@ -122,10 +122,12 @@ void InitializeApply() {
         const auto image=locator::mapped_image(bytes,size,base);
         const auto located=locator::locate(image);
         if(!located){strcpy_s(g_status.reason,located.reason);return;}
-        if(!na::hooking::BeginInstall())return;
+        if(!na::hooking::BeginInstallWait("adapters/tsushima/apply.cpp")){
+            na::hooking::LastError(g_status.reason,sizeof(g_status.reason));return;
+        }
         g_request=reinterpret_cast<Request>(base+located.request);g_caller=base+located.caller;
         if(!na::hooking::PrepareHook(reinterpret_cast<void*>(base+located.dispatch),reinterpret_cast<void*>(&detour),reinterpret_cast<void**>(&g_dispatch))){
-            na::hooking::AbandonInstall();return;
+            na::hooking::AbandonInstall();na::hooking::LastError(g_status.reason,sizeof(g_status.reason));return;
         }
         g_status.available=na::hooking::CommitInstall();
         strcpy_s(g_status.reason,g_status.available?"Ghost live picture-mode control is ready.":"Ghost live picture-mode control could not attach.");

@@ -188,7 +188,7 @@ bool code_matches(uintptr_t base, uint32_t rva, const unsigned char* bytes, size
 bool install(uintptr_t frame, uintptr_t predicate, uintptr_t caller, uintptr_t rebuild, uintptr_t rebuild_caller) {
     g_caller = caller;
     g_rebuild_caller = rebuild_caller;
-    if (!na::hooking::BeginInstall()) return false;
+    if (!na::hooking::BeginInstallWait("adapters/tlou1/apply.cpp")) return false;
     bool ok = na::hooking::PrepareHook(reinterpret_cast<void*>(frame), reinterpret_cast<void*>(&frame_detour), reinterpret_cast<void**>(&g_frame)) &&
               na::hooking::PrepareHook(reinterpret_cast<void*>(predicate), reinterpret_cast<void*>(&predicate_detour), reinterpret_cast<void**>(&g_predicate)) &&
               na::hooking::PrepareHook(reinterpret_cast<void*>(rebuild), reinterpret_cast<void*>(&rebuild_detour), reinterpret_cast<void**>(&g_rebuild));

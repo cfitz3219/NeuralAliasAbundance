@@ -200,7 +200,7 @@ Coverage ensure_locked(Registry& r, const void* const* targets_in, uint32_t coun
         plans[plan_count++] = {si, free_thunk, target};
     }
     if (plan_count) {
-        bool ok = na::hooking::BeginInstall();
+        bool ok = na::hooking::BeginInstallWait("hooking/variant_registry.cpp");
         for (uint32_t i = 0; ok && i < plan_count; ++i) {
             Slot& s = r.slots[plans[i].slot];
             ok = na::hooking::PrepareHook(plans[i].target, s.thunks[plans[i].thunk], &s.originals[plans[i].thunk]);

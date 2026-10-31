@@ -5,7 +5,9 @@
 // Present/Present1/ResizeBuffers/ExecuteCommandLists on those vtables makes
 // the GAME's swapchain and queues route through us. On the game's first
 // Present we lazily create the D3D objects and ImGui backends against the
-// game's device and its most recently executing DIRECT queue.
+// game's device and its verified creation/resize DIRECT queue (or submitted
+// per-buffer evidence on late native attachment). Streamline chains prefer
+// their game-facing Present; associated generated Presents do not draw again.
 //
 // Input model (A20/A42/A44, ReShade-like): while the menu is open the game
 // receives NO input. The subclassed WndProc consumes raw input (WM_INPUT),

@@ -2,48 +2,32 @@
 #include <cstdint>
 
 namespace na::overlay {
-
-// Decides when the overlay must draw from Streamline's game-facing Present
-// (the SL proxy hook in sl_boundary) instead of the native DXGI Present detour.
-//
-// Normally a game Present into SL's proxy reaches the native swap chain's
-// Present, where the overlay draws. Ghost of Tsushima (f46adb7, 2026-10-31)
-// presents thousands of frames through the proxy while the native detour never
-// runs, so the menu had no frame to draw on. The policy watches the native
-// detour's game-present counter at each real boundary Present: when it has not
-// advanced across kMissesToEngage consecutive boundary frames, the boundary
-// becomes the overlay's frame source for the rest of the session (sticky, so
-// the menu never alternates between the two paths or draws twice).
-//
-// Caller serializes calls.
-class BoundaryFallback {
+// Caller serializes. A qualified game-facing route owns only its associated
+// base chain, including asynchronous generated Presents. No global latch and
+// no frame-count heuristic. Resize preserves ownership; final Release removes
+// it, so another chain or a reused address is never suppressed accidentally.
+class BoundaryRoutes {
 public:
-    static constexpr uint32_t kMissesToEngage = 3;
-
-    // One real (non-TEST, non-retry) game Present seen at the boundary, before
-    // its original runs. native_presents: the native detour's game-present
-    // count right now. Returns true when the overlay draws this frame here.
-    bool OnBoundaryPresent(uint64_t native_presents)
-    {
-        if (engaged_) return true;
-        if (have_last_ && native_presents == last_native_) {
-            if (++misses_ >= kMissesToEngage) engaged_ = true;
-        } else {
-            misses_ = 0;
-        }
-        last_native_ = native_presents;
-        have_last_ = true;
-        return engaged_;
+    bool Select(uintptr_t proxy,uintptr_t base) {
+        if(!proxy || !base || proxy==base)return false;
+        for(auto& r:routes_)if(r.proxy==proxy){r.base=base;return true;}
+        for(auto& r:routes_)if(!r.proxy){r={proxy,base};return true;}
+        return false;
     }
-    bool Engaged() const { return engaged_; }
-    uint32_t Misses() const { return misses_; }
-    void Reset() { *this = BoundaryFallback{}; }
-
+    bool OwnsProxy(uintptr_t proxy) const {
+        for(const auto& r:routes_)if(r.proxy && r.proxy==proxy)return true;
+        return false;
+    }
+    bool Suppresses(uintptr_t chain) const {
+        for(const auto& r:routes_)if(r.proxy && (r.base==chain || r.proxy==chain))return true;
+        return false;
+    }
+    void Forget(uintptr_t chain) {
+        for(auto& r:routes_)if(r.proxy==chain || r.base==chain)r={};
+    }
+    void Reset(){*this=BoundaryRoutes{};}
 private:
-    uint64_t last_native_ = 0;
-    uint32_t misses_ = 0;
-    bool have_last_ = false;
-    bool engaged_ = false;
+    struct Route {uintptr_t proxy=0,base=0;};
+    Route routes_[8]{};
 };
-
-} // namespace na::overlay
+}

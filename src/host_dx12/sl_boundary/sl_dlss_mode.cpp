@@ -195,16 +195,14 @@ struct Install { void* target; bool optimal; };
 DWORD WINAPI install_thread(LPVOID p)
 {
     auto* job = static_cast<Install*>(p);
-    for (int i = 0; i < 100; ++i) {
-        if (na::hooking::BeginInstall()) {
+    {
+        if (na::hooking::BeginInstallWait("Streamline quality")) {
             const bool ok = job->optimal
                 ? na::hooking::PrepareHook(job->target, reinterpret_cast<void*>(&DetourGetOptimalSettings), reinterpret_cast<void**>(&g_orig_optimal))
                 : na::hooking::PrepareHook(job->target, reinterpret_cast<void*>(&DetourSetOptions), reinterpret_cast<void**>(&g_orig_set));
             if (!ok) na::hooking::AbandonInstall();
             else if (na::hooking::CommitInstall()) (job->optimal ? g_optimal_hooked : g_set_hooked).store(1, std::memory_order_release);
-            break;
         }
-        Sleep(10); // another module's install transaction is open
     }
     delete job;
     return 0;

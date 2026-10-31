@@ -1717,7 +1717,7 @@ template <int S> uint32_t install_slot(HMODULE ngx_module)
     // published, and only then are the detours enabled together. A detour
     // therefore never runs against a half-filled slot, and a failed commit
     // leaves nothing patched.
-    if (!na::hooking::BeginInstall()) return 0;
+    if (!na::hooking::BeginInstallWait("ngx_observe/ngx_observe.cpp")) return 0;
     uint32_t hooked = 0;
     for (const HookSpec& s : specs) {
         void* target = reinterpret_cast<void*>(GetProcAddress(ngx_module, s.name));

@@ -37,9 +37,10 @@ struct Status {
 Status GetStatus();
 
 // G3-03: called by the proxy's DXGI factory exports before forwarding. With
-// [observe] producers=1 (and early_install, default 1) a caller other than the
+// [observe] producers=1 OR Route A overlay enabled (early_install defaults to 1),
+// a caller other than the
 // init thread waits up to 3 s until producer installation was attempted, so
-// the game's device and early objects are created under observation.
+// early swap-chain queue bindings are captured as well as producer objects.
 void WaitForObserveInstall();
 
 } // namespace na::host

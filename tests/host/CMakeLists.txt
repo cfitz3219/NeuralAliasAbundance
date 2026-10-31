@@ -72,6 +72,7 @@ na_host_test(capture_test SOURCES capture_test.cpp LIBS host_capture
              ARGS "${CMAKE_CURRENT_BINARY_DIR}/capture-test-out")
 
 na_host_test(overlay_test SOURCES overlay_test.cpp LIBS host_dx12 user32)
+na_host_test(overlay_bootstrap_test SOURCES overlay_bootstrap_test.cpp LIBS host_dx12 user32)
 na_host_test(overlay_input_handover_test SOURCES overlay_input_handover_test.cpp LIBS host_dx12)
 na_host_test(overlay_boundary_fallback_test SOURCES overlay_boundary_fallback_test.cpp)
 add_test(NAME host_overlay_hardware_test COMMAND overlay_test --hardware)
@@ -247,3 +248,10 @@ set_tests_properties(host_overlay_late_queue_test host_overlay_late_queue_hardwa
 
 add_test(NAME host_overlay_start_contention_test COMMAND overlay_test --warp --busy-install)
 set_tests_properties(host_overlay_start_contention_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+
+add_test(NAME host_overlay_boundary_test COMMAND overlay_test --warp --boundary)
+add_test(NAME host_overlay_boundary_hardware_test COMMAND overlay_test --hardware --boundary)
+set_tests_properties(host_overlay_boundary_test host_overlay_boundary_hardware_test PROPERTIES TIMEOUT 40 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+
+add_test(NAME host_overlay_bootstrap_recovery_test COMMAND overlay_bootstrap_test --recovery)
+set_tests_properties(host_overlay_bootstrap_recovery_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "host;gpu")
