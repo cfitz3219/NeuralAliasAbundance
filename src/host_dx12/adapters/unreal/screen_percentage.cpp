@@ -3,7 +3,7 @@
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 
 #include <windows.h>
-#include <bcrypt.h>
+#include "host_dx12/adapters/unreal/locator.hpp"
 #include <intrin.h>
 #include <array>
 #include "host_dx12/hooking/vtable_hook.hpp"
@@ -35,6 +35,8 @@ bool load_image(Image& img)
     img.size = nt->OptionalHeader.SizeOfImage;
     const IMAGE_SECTION_HEADER* sh = IMAGE_FIRST_SECTION(nt);
     for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        if(!(sh[i].Characteristics & IMAGE_SCN_MEM_READ) || (sh[i].Characteristics & IMAGE_SCN_MEM_DISCARDABLE))continue;
+        if(sh[i].VirtualAddress>img.size || sh[i].Misc.VirtualSize>img.size-sh[i].VirtualAddress)return false;
         Section s;
         s.base = base + sh[i].VirtualAddress;
         s.size = sh[i].Misc.VirtualSize;
@@ -43,14 +45,6 @@ bool load_image(Image& img)
         img.sections.push_back(s);
     }
     return true;
-}
-
-const Section* section_of(const Image& img, const void* p)
-{
-    auto* b = static_cast<const uint8_t*>(p);
-    for (const auto& s : img.sections)
-        if (b >= s.base && b < s.base + s.size) return &s;
-    return nullptr;
 }
 
 bool region_ok(const void* p, size_t n, bool need_write)
@@ -64,113 +58,9 @@ bool region_ok(const void* p, size_t n, bool need_write)
     return static_cast<const uint8_t*>(p) + n <= static_cast<const uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
 }
 
-std::vector<const uint8_t*> find_wide(const Image& img, const wchar_t* text)
-{
-    std::vector<const uint8_t*> hits;
-    const size_t n = (wcslen(text) + 1) * sizeof(wchar_t);
-    for (const auto& s : img.sections) {
-        if (s.exec || s.size < n) continue;
-        for (size_t i = 0; i + n <= s.size; i += 2)
-            if (s.base[i] == static_cast<uint8_t>(text[0]) && memcmp(s.base + i, text, n) == 0) {
-                if (i >= 2 && (s.base[i - 2] || s.base[i - 1])) continue; // must start a string
-                hits.push_back(s.base + i);
-                if (hits.size() >= 4) return hits;
-            }
-    }
-    return hits;
-}
-
-struct Lea { const uint8_t* at; const uint8_t* target; unsigned reg; };
-bool decode_lea(const uint8_t* p, Lea& out)
-{
-    if ((p[0] != 0x48 && p[0] != 0x4C) || p[1] != 0x8D || (p[2] & 0xC7) != 0x05) return false;
-    int32_t disp;
-    memcpy(&disp, p + 3, 4);
-    out.at = p;
-    out.target = p + 7 + disp;
-    out.reg = ((p[0] & 4u) << 1) | ((p[2] >> 3) & 7u);
-    return true;
-}
-
 bool sane_percent(float v) { return std::isfinite(v) && v >= 1.f && v <= 400.f; }
-
-// Returns the validated TConsoleVariableData<float>* (ShadowedValue[0..1]) for
-// the cvar whose static initializer references `name`, or null. `count` gets
-// the number of distinct validated candidates (only 1 is accepted).
-float* locate_float_cvar(const wchar_t* name, uint32_t* count, char* why, size_t why_cap)
-{
-    *count = 0;
-    Image img;
-    if (!load_image(img)) { strncpy_s(why, why_cap, "No 64-bit executable image.", _TRUNCATE); return nullptr; }
-    const std::vector<const uint8_t*> strings = find_wide(img, name);
-    if (strings.empty()) { strncpy_s(why, why_cap, "r.ScreenPercentage is not in this executable (not an Unreal game).", _TRUNCATE); return nullptr; }
-    std::vector<Lea> xrefs;
-    for (const auto& s : img.sections) {
-        if (!s.exec || s.size < 8) continue;
-        for (size_t i = 0; i + 7 <= s.size; ++i) {
-            Lea l;
-            if (!decode_lea(s.base + i, l)) continue;
-            for (const uint8_t* str : strings)
-                if (l.target == str && xrefs.size() < 16) xrefs.push_back(l);
-        }
-    }
-    float* found = nullptr;
-    for (const Lea& x : xrefs) {
-        // The static initializer loads the object's own address into RCX right
-        // beside the name (Cort's PBZ probe: +7). Earlier/later objects belong to
-        // neighbouring cvars (-63, +87 there), so the window stays narrow.
-        const Lea* best = nullptr;
-        Lea cand[8];
-        uint32_t nc = 0;
-        for (const uint8_t* p = x.at - 32; p <= x.at + 48 && nc < 8; ++p) {
-            if (p < img.base || p + 7 > img.base + img.size || p == x.at) continue;
-            Lea c;
-            if (!decode_lea(p, c) || c.reg != 1) continue; // RCX = this
-            const Section* cs = section_of(img, c.target);
-            if (!cs || !cs->write) continue;
-            cand[nc++] = c;
-        }
-        for (uint32_t i = 0; i < nc; ++i) {
-            const uint8_t* obj = cand[i].target;
-            if (!region_ok(obj, 24, false)) continue;
-            uint64_t q[3];
-            memcpy(q, obj, sizeof(q));
-            if (!section_of(img, reinterpret_cast<const void*>(q[0]))) continue; // vtable in the image
-            auto* target = reinterpret_cast<const uint8_t*>(q[1]);
-            if (!region_ok(target, 8, false)) continue;
-            uint64_t tv = 0;
-            memcpy(&tv, target, 8);
-            if (!section_of(img, reinterpret_cast<const void*>(tv))) continue;   // IConsoleVariable has an image vtable
-            auto* ref = reinterpret_cast<float*>(q[2]);
-            if ((q[2] & 3u) != 0 || !region_ok(ref, 8, true)) continue;
-            float v[2];
-            memcpy(v, ref, sizeof(v));
-            if (!sane_percent(v[0]) || !sane_percent(v[1])) continue;
-            if (!best || std::abs(cand[i].at - x.at) < std::abs(best->at - x.at)) best = &cand[i];
-        }
-        if (!best) continue;
-        float* ref = nullptr;
-        {
-            uint64_t q2 = 0;
-            memcpy(&q2, best->target + 16, 8);
-            ref = reinterpret_cast<float*>(q2);
-        }
-        if (found && found != ref) {
-            *count = 2;
-            strncpy_s(why, why_cap, "r.ScreenPercentage matched more than one storage location; not changing anything.", _TRUNCATE);
-            return nullptr;
-        }
-        found = ref;
-        *count = 1;
-    }
-    if (!found) strncpy_s(why, why_cap, "r.ScreenPercentage's storage could not be validated.", _TRUNCATE);
-    return found;
-}
-
-
-// PBZ shipping-console ABI, qualified from the installed executable. The
-// generic locator remains read-only: a string/storage match is not an ABI.
-constexpr char kPbzHash[]="7b4fcd286a350780faf0824d73aa150b21cbf1bccde883e6a96386cbe09973b4";
+// Supported engine ABI is discovered from code/data relationships, not a
+// title, executable hash, or fixed address. See locator.hpp.
 using Sink=void(*)(void*);
 using Setter=void(*)(void*,const wchar_t*,const void*);
 Sink g_sink=nullptr;
@@ -282,48 +172,66 @@ void sink_detour(void* manager) {
     process(reinterpret_cast<uintptr_t>(_ReturnAddress()));
     g_sink(manager); // newly changed cvars participate in this ordinary sink pass
 }
-bool hash_file(const wchar_t* path,char (&out)[65]) {
-    HANDLE f=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_SEQUENTIAL_SCAN,nullptr);
-    if(f==INVALID_HANDLE_VALUE)return false;
-    BCRYPT_ALG_HANDLE a=nullptr;BCRYPT_HASH_HANDLE h=nullptr;
-    bool ok=BCryptOpenAlgorithmProvider(&a,BCRYPT_SHA256_ALGORITHM,nullptr,0)>=0;
-    if(ok)ok=BCryptCreateHash(a,&h,nullptr,0,nullptr,0,0)>=0;
-    std::array<uint8_t,65536> b{};DWORD n=0;
-    while(ok) {if(!ReadFile(f,b.data(),DWORD(b.size()),&n,nullptr)){ok=false;break;}if(!n)break;ok=BCryptHashData(h,b.data(),n,0)>=0;}
-    uint8_t digest[32]{};if(ok)ok=BCryptFinishHash(h,digest,32,0)>=0;
-    if(h)BCryptDestroyHash(h);if(a)BCryptCloseAlgorithmProvider(a,0);CloseHandle(f);
-    if(ok)for(unsigned i=0;i<32;++i)sprintf_s(out+i*2,65-i*2,"%02x",digest[i]);return ok;
+bool image_readable(const Image& image) {
+    for(const auto& s:image.sections) {
+        size_t at=0;
+        while(at<s.size) {
+            MEMORY_BASIC_INFORMATION m{};
+            if(!VirtualQuery(s.base+at,&m,sizeof(m)) || m.AllocationBase!=image.base ||
+               m.State!=MEM_COMMIT || (m.Protect&(PAGE_NOACCESS|PAGE_GUARD)))return false;
+            const auto end=reinterpret_cast<uintptr_t>(m.BaseAddress)+m.RegionSize;
+            const auto current=reinterpret_cast<uintptr_t>(s.base)+at;
+            if(end<=current)return false;
+            at+=std::min(size_t(end-current),s.size-at);
+        }
+    }
+    return true;
+}
+bool bind_variables(const Image& image,const locator::Result& found) {
+    void* objects[2]{};
+    for(unsigned k=0;k<2;++k) {
+        const auto* reg=image.base+found.variables[k];
+        if(!region_ok(reg,24,false))return false;
+        const auto* words=reinterpret_cast<const uintptr_t*>(reg);
+        if(words[0]!=reinterpret_cast<uintptr_t>(image.base)+found.registration_tables[k])return false;
+        auto* object=reinterpret_cast<void*>(words[1]);
+        if(!region_ok(object,0x58,false) ||
+           *static_cast<const uintptr_t*>(object)!=reinterpret_cast<uintptr_t>(image.base)+found.tables[k] ||
+           words[2]!=reinterpret_cast<uintptr_t>(object)+0x50)return false;
+        objects[k]=object;
+    }
+    g_float=objects[0];g_int=objects[1];return values().valid;
 }
 DWORD WINAPI worker(LPVOID) {
     Sleep(5000);
-    wchar_t path[32768]{};char hash[65]{};
-    bool valid=GetModuleFileNameW(nullptr,path,32768)&&hash_file(path,hash)&&!std::strcmp(hash,kPbzHash);
-    char why[160]="This Unreal build's engine setting interface is not qualified yet.";
-    uint32_t count=0;
+    Image image;
+    locator::Result found;
+    bool valid=load_image(image) && image_readable(image);
+    if(valid)found=locator::locate(locator::pe::mapped_image(image.base,image.size,reinterpret_cast<uintptr_t>(image.base)));
+    valid=valid && bool(found);
+    const char* why=found.reason;
     if(valid) {
-        auto base=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-        auto ref=locate_float_cvar(L"r.ScreenPercentage",&count,why,sizeof(why));
-        if(ref && region_ok(reinterpret_cast<void*>(base+0xdf4a9f8),24,false)&&region_ok(reinterpret_cast<void*>(base+0xdf74238),24,false)) {
-            g_float=*reinterpret_cast<void**>(base+0xdf4a9f8+8);g_int=*reinterpret_cast<void**>(base+0xdf74238+8);
-            valid=region_ok(g_float,0x58,false)&&region_ok(g_int,0x58,false)&&
-                *reinterpret_cast<uintptr_t*>(g_float)==base+0xa685528&&*reinterpret_cast<uintptr_t*>(g_int)==base+0xa6852e8&&
-                reinterpret_cast<uintptr_t>(ref)==reinterpret_cast<uintptr_t>(g_float)+0x50;
-            if(valid) {
-                g_float_set=reinterpret_cast<Setter>(base+0x12c19d0);g_int_set=reinterpret_cast<Setter>(base+0x12c1950);
-                g_caller=base+0x47ad724;
-                constexpr uint8_t caller[]={0xff,0x50,0x58};
-                constexpr uint8_t entry[]={0x40,0x56,0x48,0x83,0xec,0x20};
-                valid=!std::memcmp(reinterpret_cast<void*>(g_caller-3),caller,3)&&!std::memcmp(reinterpret_cast<void*>(base+0x12aa200),entry,sizeof(entry));
-                if(valid && na::hooking::BeginInstall()) {
-                    valid=na::hooking::PrepareHook(reinterpret_cast<void*>(base+0x12aa200),reinterpret_cast<void*>(&sink_detour),reinterpret_cast<void**>(&g_sink));
-                    if(valid)valid=na::hooking::CommitInstall();else na::hooking::AbandonInstall();
-                } else valid=false;
-            }
-        } else valid=false;
+        // Registration can finish later than module load. Resolve once, then
+        // retry the cheap object binding without calling any engine code.
+        valid=false;
+        for(unsigned attempt=0;attempt<30;++attempt) {
+            if(bind_variables(image,found)){valid=true;break;}Sleep(100);
+        }
+        if(!valid)why="Unreal console objects are not initialized with the supported layout.";
     }
-    std::lock_guard<std::mutex> lock(g_m);g_status.available=valid;g_status.candidates=count;
+    if(valid) {
+        g_float_set=reinterpret_cast<Setter>(const_cast<uint8_t*>(image.base)+found.setters[0]);
+        g_int_set=reinterpret_cast<Setter>(const_cast<uint8_t*>(image.base)+found.setters[1]);
+        g_caller=reinterpret_cast<uintptr_t>(image.base)+found.caller;
+        if(na::hooking::BeginInstall()) {
+            valid=na::hooking::PrepareHook(const_cast<uint8_t*>(image.base)+found.sink,reinterpret_cast<void*>(&sink_detour),reinterpret_cast<void**>(&g_sink));
+            if(valid)valid=na::hooking::CommitInstall();else na::hooking::AbandonInstall();
+        } else valid=false;
+        if(!valid)why="Unreal console interface found, but its game-thread hook could not attach.";
+    }
+    std::lock_guard<std::mutex> lock(g_m);g_status.available=valid;g_status.candidates=found?1:0;
     g_status.state=valid?SpState::Ready:SpState::NotFound;
-    strcpy_s(g_status.reason,valid?"PBZ engine resolution control is ready.":why);
+    strcpy_s(g_status.reason,valid?"Unreal engine resolution control is ready.":why);
     return 0;
 }
 } // namespace
@@ -349,6 +257,7 @@ bool HandBackScreenPercentage() {
     CancelScreenPercentage();std::lock_guard<std::mutex> lock(g_m);g_handback=g_owner.held;return g_handback;
 }
 #ifdef NA_UNREAL_APPLY_TEST
+bool BindForTest(const uint8_t* base,const locator::Result& result){Image image;image.base=base;return bind_variables(image,result);}
 void ConfigureForTest(void* f,void* i,Setter fs,Setter is) {
     std::lock_guard<std::mutex> lock(g_m);g_float=f;g_int=i;g_float_set=fs;g_int_set=is;g_caller=0xabc;
     g_status={};g_status.available=true;g_pending={};g_owner={};g_confirm=0;g_executing=g_handback=false;

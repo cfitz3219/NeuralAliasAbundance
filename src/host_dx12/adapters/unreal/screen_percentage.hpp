@@ -1,7 +1,7 @@
 #pragma once
-// PBZ qualified engine setters, queued at its normal game-thread console sink.
+// Located compatible Unreal engine setters, queued at the normal game-thread console sink.
 // No direct shadow stores. Success requires coherent SR/RR evaluations, with or
-// without feature recreation. Other UE builds require interface qualification.
+// without feature recreation. Admission uses supported ABI relationships, not a game hash.
 #include <cstdint>
 
 namespace na::unreal {
@@ -10,7 +10,7 @@ enum class SpState : uint32_t {
     Unknown = 0,    // not searched yet
     NotFound = 1,   // not an Unreal executable, or the cvar could not be located unambiguously
     Ready = 2,      // located; no request yet
-    Applying = 3,   // written; waiting for the game's DLSS to be re-created at the new size
+    Applying = 3,   // queued/applied; waiting for actual DLSS evaluations at the new size
     Confirmed = 4,  // the game's DLSS input now has the expected size
     NotApplied = 5, // written, but the expected size was not observed in time
     GameChanged = 6,// the game changed the value itself after our request
@@ -24,7 +24,7 @@ struct SpStatus {
     float current = 0.f;         // ShadowedValue[0] now
     float requested = 0.f;
     uint32_t expect_w = 0, expect_h = 0; // render size the request should produce
-    uint32_t seen_w = 0, seen_h = 0;     // game's latest DLSS creation size
+    uint32_t seen_w = 0, seen_h = 0;     // game's latest observed DLSS evaluation size
     uint64_t request_id = 0;
     uint32_t candidates = 0;     // validated candidate objects (1 = unambiguous)
     char reason[200] = "";
