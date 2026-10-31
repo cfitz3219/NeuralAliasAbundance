@@ -242,3 +242,12 @@ No whole host/backend replacement, new analyzer, extraction algorithms or new UI
 ### First-stage evidence and limitations
 
 Evidence is recorded in `docs/OWNERSHIP-STAGE1-20261031.md` and local/ownership-stage1-20261031 (untracked test logs). Test-only GPU readbacks/waits qualify orchestration/image delivery, not native game FG scheduling or model quality. Initial engineering failures and corrections remain recorded in WORKLOG; they were never deployed.
+
+
+### Part 2 received after the first-stage build — d9d6bbb
+
+The reviewer has now posted R1/R2 answers. They refine the staged approval; they do not qualify O2 automatically. A bounded read of existing Ghost sl_boundary/status evidence confirms source1 and `assoc=0/5171/0` (ambiguous), but the SL evidence file stores aggregate shapes/counters, not per-evaluate resource/frame/generation records. The proposed context/view binding therefore cannot be replay-proven from that receipt. Preserve current NR behavior and do not start O2 routing changes from these counters.
+
+R1's proposed narrow evaluate publication is a useful next observation seam. Resource equality must also match the accepted recording/submission generation: allowing either F or F-1, or the latest legacy tag set, cannot by itself disambiguate pooled textures reused between frames. Original tag identities must be captured before our InputOverride/retag replaces them. Async evaluate timing must be observed rather than assumed to run on the game's Present thread. Without exact evidence, keep the context unbound; no device/dimensions/latest-callback fallback.
+
+R2's rendering-evidence ordering is useful, with two corrections for the later O3 stage: a worker wake does not guarantee readiness within one frame, and per-process journal filenames alone do not protect shared settings Save/recovery writes. Preserve the review's light first implementation while making renderer permission to persist explicit. No OS lease/instance-ID framework is being smuggled into the first stage. No second review cycle is requested.

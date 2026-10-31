@@ -31,3 +31,8 @@ Candidate rollback uses the existing additive deployment receipt. To return to t
 O3 is next and separate: try the review's rendering-qualified per-process marker before more elaborate ownership machinery. O2 remains conditional on written R1 frame/view-association evidence. R1/R2 follow-up is still absent in COMMS. Today's native source1/Streamline source2 NR behavior is retained; no universal NR ownership or game visual-quality pass is claimed.
 
 Cort's short live check, when desired: Ghost Home open/close and cursor; existing model/mode/NR controls; native FG, resize and quality changes; then a separate PBZ session. Game testing remains his.
+
+
+Follow-up after candidate preparation: COMMS d9d6bbb contains the promised R1/R2 answers. The first-stage package's notes are its build-time receipt. Current plan revision2 now records the follow-up: existing aggregate Ghost logs do not contain the per-evaluate tag resource/frame/generation data needed to replay-prove a binder. O2 remains unqualified and unchanged. Useful R1/R2 suggestions and corrections are recorded in COMMS/plan; no additional runtime edits or review cycle resulted from this follow-up.
+
+Prepared separate packages NA-Tsushima-package-698c298 and NA-PBZ-package-698c298; both Windows PowerShell5.1 Validate PASS. Payload SHA256 for NeuralAliasDXGI.dll:3CC533543AC88CCF54FDB68C346BC44A9A7BD0D7907699C42E3F79588DC31339. NVIDIA NR signature valid; existing ordinary updater commands unchanged. Candidate ownership-update/rollback commands are in Documents. PR72 is confirmed merged into PR59 via0ba114c.
