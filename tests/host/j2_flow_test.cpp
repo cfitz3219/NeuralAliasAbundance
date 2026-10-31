@@ -22,12 +22,30 @@
 #include "host_dx12/nvof/nvof_flow.hpp"
 
 #include <cmath>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <utility>
 #include <vector>
 
 using test::ComPtr;
+
+// CI shows only the last lines of a failed test: every failure and key value is
+// also collected and repeated at the end.
+std::vector<std::string> g_recap;
+void recap(const char* fmt, ...)
+{
+    char b[256];
+    va_list a;
+    va_start(a, fmt);
+    std::vsnprintf(b, sizeof b, fmt, a);
+    va_end(a);
+    g_recap.emplace_back(b);
+    std::printf("%s\n", b);
+}
+#undef CHECK
+#define CHECK(cond) do { if (!(cond)) { recap("FAIL line %d: %s", __LINE__, #cond); ++test::g_failures; } } while (0)
 namespace fl = na::j2::flow;
 
 namespace {
@@ -391,20 +409,21 @@ int case_pair(test::Device& d, FakeEngine* fake)
     REQUIRE(h.WaitJ2(10000));
     float v[2];
     h.Motion(52, 32, v);
-    std::printf("object motion (%.3f, %.3f)\n", v[0], v[1]);
+    recap("pair: object motion (%.3f, %.3f)", v[0], v[1]);
     CHECK(std::fabs(v[0] + 4.f) < (fake ? 0.1f : 1.0f) && std::fabs(v[1]) < (fake ? 0.1f : 1.0f));
     h.Motion(10, 10, v);
-    std::printf("background motion (%.3f, %.3f)\n", v[0], v[1]);
+    recap("pair: background motion (%.3f, %.3f)", v[0], v[1]);
     CHECK(std::fabs(v[0]) < 0.1f && std::fabs(v[1]) < 0.1f);
     h.Motion(100, 50, v);
     CHECK(std::fabs(v[0]) < 0.1f && std::fabs(v[1]) < 0.1f);
     // Read-back of the counters happens at the next Prepare.
     fl::Ticket t3 = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(3, 2, jp[0], jp[1]));
     const fl::Stats st = fl::GetStats();
-    std::printf("stats: pairs %llu consumed %llu accepted %llu invalid %llu small %llu cost %llu offscreen %llu image %llu, mean cost %.1f, %s\n",
+    recap("pair stats: pairs %llu consumed %llu acc %llu inv %llu small %llu cost %llu off %llu img %llu mean %.1f",
                 (unsigned long long)st.pairs, (unsigned long long)st.consumed, (unsigned long long)st.px_accepted, (unsigned long long)st.px_invalid,
                 (unsigned long long)st.px_small, (unsigned long long)st.px_cost, (unsigned long long)st.px_offscreen, (unsigned long long)st.px_image,
-                st.mean_cost, st.reason);
+                st.mean_cost);
+    recap("pair reason: %s", st.reason);
     CHECK(st.pairs >= 1 && st.consumed == 1 && st.px_accepted > 100 && st.px_accepted < 400);
     if (fake) CHECK(st.cost == 1 && std::fabs(st.mean_cost - 10.f) < 0.5f);
     fl::Abandon(d.queue.Get(), t3);
@@ -528,7 +547,12 @@ int case_resize(test::Device& d, FakeEngine& fake)
     d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f));
     fake.q->Signal(f.Get(), 1);
     CHECK(test::WaitFence(f.Get(), 1, d.event, 5000) == test::WaitResult::Ok);
+    // The game's colour now has the new size (a copy between sizes would be invalid).
+    h.color = test::CreateTexture(d.device.Get(), W / 2, H / 2, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                  D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    REQUIRE(h.color);
     fl::Ticket t4 = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(4, 0, 0, 0, true, false, W / 2, H / 2));
+    if (!t4.valid) recap("resize: %s", fl::GetStats().reason);
     CHECK(t4.valid && !t4.pair);
     CHECK(fake.unregisters == unreg + reg && fake.inits == inits + 1 && fake.last_w == W / 4 && fake.last_h == H / 4);
     fl::Abandon(d.queue.Get(), t4);
@@ -581,6 +605,7 @@ int main(int argc, char** argv)
         }
         case_pair(d, nullptr);
         fl::Shutdown();
+        for (const std::string& r : g_recap) std::printf("recap: %s\n", r.c_str());
         return test::finish("j2_flow_test --real");
     }
     FakeEngine fake;
@@ -593,5 +618,6 @@ int main(int argc, char** argv)
     case_split_reset(d, fake);
     fl::Shutdown();
     fl::SetEngineForTests(nullptr);
+    for (const std::string& r : g_recap) std::printf("recap: %s\n", r.c_str());
     return test::finish("j2_flow_test");
 }
