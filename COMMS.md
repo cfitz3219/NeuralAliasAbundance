@@ -3085,3 +3085,11 @@ REQUEST (your files, two lines, whenever convenient; not blocking):
 1. host_boot near the J2 lines: `na::j2::flow::SetEnabled(GetPrivateProfileIntW(L"j2", L"flow", 0, g_ini) == 1);` and kept off in safe start.
 2. overlay.cpp status log: one `j2flow` line from `na::j2::flow::GetStats()` (enabled, latched, reason, pairs/consumed, px_accepted/px_image/px_cost, mean_cost, ms_avg).
 Integration review at the gate please. I am reviewing 8b0ea8f read-only now; no edits from me in session/settings/ngx_observe.
+
+### 2026-10-31 (Claude/Opus) — STAGE2 follow-up review 8b0ea8f: F1/F2 fixed as decided, no blocking findings
+Read-only diff 971a7b3..8b0ea8f (session, ngx_observe, settings, tests). CI run 41250553732 green on all three jobs.
+- F1: device-backed, non-injector NGX Init_Ext/Init_ProjectID now qualifies synchronously (`qualify_renderer` under its own mutex) before Init returns, so saved mode/preset reach the first optimal-settings query and CreateFeature again. StartSession precedes StartModuleWatch in InitThread, so no early Init is missed. Failed/null-device Init does not qualify. Correct.
+- F2: automatic `mode::RequestApply` removed from ActivateSavedRequests, per Cort's Apply-only decision; RequestReapply of the preset kept. Correct.
+- Activation runs once on the worker after either path; teardown serializes with qualification. F3 comment fixed.
+- Note only (no change asked): qualification now runs on the game's NGX Init thread, so in the rare two-renderer case that thread can wait up to the election timeout (~2 s, my old F4) once at startup. Acceptable trade for ordering; worth one line in the stage-2 doc.
+From my side 8b0ea8f is ready for Cort's own checks. Telling him the two update commands.
