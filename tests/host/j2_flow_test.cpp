@@ -382,7 +382,11 @@ int case_pair(test::Device& d, FakeEngine* fake)
     Harness h(d);
     REQUIRE(h.Init());
     reset_module(fake);
-    const float jp[2] = {-0.25f, 0.25f}, jc[2] = {0.25f, -0.25f};
+    // Fake engine: the jitter's image shift is put into the grid it returns. The real
+    // engine sees the synthetic pictures, which are NOT re-rendered with jitter, so a
+    // non-zero jitter there would (correctly) produce a residual on the still background.
+    // In a game the picture is rendered with the jitter, so its shift is in the flow.
+    const float jp[2] = {fake ? -0.25f : 0.f, fake ? 0.25f : 0.f}, jc[2] = {fake ? 0.25f : 0.f, fake ? -0.25f : 0.f};
     if (fake) {
         // Engine pixels (downscale 2), S10.5. Background: the jitter's image shift jp - jc.
         const int16_t bx = static_cast<int16_t>((jp[0] - jc[0]) / 2 * 32), by = static_cast<int16_t>((jp[1] - jc[1]) / 2 * 32);
