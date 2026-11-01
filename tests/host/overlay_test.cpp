@@ -70,6 +70,7 @@ int main(int argc, char** argv)
     const bool boundary=argc>2 && !strcmp(argv[2],"--boundary");
     const bool busy_install=argc>2 && !strcmp(argv[2],"--busy-install");
     const bool late_queue = argc > 2 && !strcmp(argv[2], "--late-queue");
+    const bool cursor_state=argc>2 && !strcmp(argv[2],"--cursor-state");
     SetEnvironmentVariableW(L"NEURALALIAS_TEST_WARP", hardware ? nullptr : L"1");
     wchar_t temp[MAX_PATH]{}, ini[MAX_PATH]{}, scope[64]{};
     GetTempPathW(MAX_PATH, temp);
@@ -232,6 +233,32 @@ int main(int argc, char** argv)
     HCURSOR waiting=LoadCursorW(nullptr,IDC_WAIT),arrow=LoadCursorW(nullptr,IDC_ARROW);
     REQUIRE(waiting && arrow);SetCursor(waiting);CHECK(GetCursor()==arrow);
     CHECK(na::overlay::GetStats().input_hooks==8);
+    if(cursor_state){
+        const auto game_cursor=LoadCursorW(nullptr,IDC_IBEAM);REQUIRE(game_cursor);
+        SetCursor(game_cursor); // game request must survive the overlay's arrow
+        int hides=0;do{++hides;}while(ShowCursor(FALSE)>=0 && hides<64);
+        std::thread render([&]{frame();});render.join();Pump(); // a distinct Present thread
+        CHECK(GetCursor()!=nullptr); // backend must not leave the OS shape null
+        SendMessageW(hwnd,WM_KEYDOWN,VK_HOME,1);
+        CHECK(GetCursor()==game_cursor); // no mouse move/WM_SETCURSOR is required
+        frame();
+        while(hides-->0)ShowCursor(TRUE);
+        SendMessageW(hwnd,WM_KEYDOWN,VK_HOME,1);frame();
+        using CursorFn=HCURSOR(WINAPI*)(HCURSOR);
+        auto original=reinterpret_cast<CursorFn>(na::hooking::OriginalFor(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"user32.dll"),"SetCursor"))));
+        REQUIRE(original);original(LoadCursorW(nullptr,IDC_APPSTARTING));
+        std::thread next_render([&]{frame();});next_render.join();Pump();
+        CHECK(GetCursor()==arrow); // a cached backend shape is not enough
+        for(int cycle=0;cycle<3;++cycle){
+            SetCursor(game_cursor);SendMessageW(hwnd,WM_KEYDOWN,VK_HOME,1);
+            CHECK(GetCursor()==game_cursor); // restore without waiting for Present
+            // Rapid reopen with an older refresh still queued: no extra ShowCursor increment.
+            SendMessageW(hwnd,WM_KEYDOWN,VK_HOME,1);frame();
+        }
+        SetCursor(nullptr);SendMessageW(hwnd,WM_KEYDOWN,VK_HOME,1);
+        CHECK(GetCursor()==nullptr); // preserve an intentionally game-drawn cursor too
+        SetCursor(game_cursor);SendMessageW(hwnd,WM_KEYDOWN,VK_HOME,1);frame();
+    }
     if(late_queue){
         CHECK(d.device->GetDeviceRemovedReason()==S_OK);
         CHECK(na::overlay::GetStats().present_queue==reinterpret_cast<uintptr_t>(d.queue.Get()));
@@ -344,6 +371,7 @@ int main(int argc, char** argv)
     bool stopped = false;
     for (int i = 0; i < 20 && !stopped; ++i) { stopped = na::overlay::Stop(); if (!stopped) Sleep(100); }
     CHECK(stopped);
+    if(cursor_state)CHECK(GetCursor()==arrow); // Stop while open restores before detaching WndProc
     nativeChain.Reset();if(nativeWindow)DestroyWindow(nativeWindow);
     sc.Reset(); sc1.Reset();
     DestroyWindow(hwnd);
