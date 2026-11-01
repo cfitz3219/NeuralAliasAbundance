@@ -32,3 +32,18 @@ Automated evidence includes:
 Cort retains both Sniper live checks: enable Moving-object motion, inspect stationary scenery and moving characters while standing still and panning; compare trails/shimmer, check GPU time and j2compute log, then toggle off/on. No game launch, control or deployment by Astra. Prebuilt reversible test installers are prepared separately using the existing Sniper add-only transaction/manifest and retaining the MIT notice. Native game DLLs are never replaced.
 
 References: AMD pinned host schedule sdk/src/components/opticalflow/ffx_opticalflow.cpp and vendored pass entry points; [AMD optical-flow documentation](https://gpuopen.com/manuals/fidelityfx_sdk/techniques/optical-flow/). Fine geometry, transparency, occlusion and block-boundary quality remain estimation limits, not proof that motion is exact for every pixel.
+
+## Delivery receipt
+
+Runtime source: `dab9462eab6055b031113790aa3d5c08d0f61b33`, PR74 stacked on PR73. The integration includes Fable's newer Anno changes through c4a6e44. Anno's NVOFA implementation was preserved from that branch; AMD's encode/accept shader helper is an independently retained snapshot of the existing NeuralAlias helper, not a replacement for Fable's temporal filter. The earlier description of shared helpers does not mean the Anno filter was ported into AMD. Live jitter/edge quality remains part of Cort's game check.
+
+Final Release build passed with real local NGX/NVOF and embedded AMD DXIL. The clean, subsequent full CTest run completed in 221.42 seconds: 152 passed, 0 failed, 5 skipped out of 157. Skips: opt-in NR model probe, three unsupported 16x-MSAA cases, optional upscaler jitter fixture. All four AMD/inline tests ran and passed. Earlier runs during integration are not substituted for this final run. Evidence: `local/amd-flow-reference/release-build.log`, `release-tests.log`, `hd-compute-test.log`, and the focused logs in that folder.
+
+Prebuilt, reversible candidates (prepared, not deployed):
+
+- SER: `C:/Users/Cort/Documents/NA-SER-AMD-flow-dab9462`, updater `C:/Users/Cort/Documents/NA-ser-flow-update.cmd`, rollback `C:/Users/Cort/Documents/NA-ser-flow-rollback.cmd`.
+- SE5: `C:/Users/Cort/Documents/NA-SE5-AMD-flow-dab9462`, updater `C:/Users/Cort/Documents/NA-se5-flow-update.cmd`, rollback `C:/Users/Cort/Documents/NA-se5-flow-rollback.cmd`.
+
+Both contain DLL SHA256 `8E911E0E81EE08B693E3C8F447893FC0D660A1185678B15DFC1F638F8C23F016`. Existing ordinary DLAA commands remain unchanged. Close the respective game before updating. Flow starts off; enable Home > Moving-object motion (test). The package reuses the existing Sniper installation receipt, original-file snapshot and settings carry-over; payload validation happens before retiring an existing candidate. No Git checkout/build occurs in the updater. The MIT notice accompanies the installed shader code. Native game DLLs are never replaced.
+
+Windows PowerShell 5.1 installer fixtures passed separately for SER and SE5: additive install, notice, default-off, corrupt replacement leaving the previous install intact, valid receipt upgrade, rollback restoring the original directory, and refusal to replace pre-existing native DLSS. These tests use fake game directories. Neither Sniper has been launched, controlled, installed into or visually qualified by this task. AMD shader correctness on the synthetic cases and successful inline orchestration are measured; actual Sniper picture quality and GPU cost are still the user's live tests.

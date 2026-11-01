@@ -6,6 +6,7 @@
 int main(){
     if(!na::ffx_flow::Built())return test::kSkip;
     test::Device d;if(!test::CreateDevice(d))return test::kSkip;
+    if(!na::ffx_flow::DeviceSupported(d.device.Get())){std::puts("SKIP: AMD search needs 32/64-lane hardware waves");return test::kSkip;}
     constexpr unsigned w=512,h=256;na::ffx_flow::PairFlow flow;
     if(!flow.Init(d.device.Get(),w,h)){std::printf("%s\n",flow.Error());return 1;}
     test::List l;REQUIRE(l.Create(d.device.Get()));

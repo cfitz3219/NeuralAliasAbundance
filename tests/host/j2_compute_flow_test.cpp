@@ -1,6 +1,7 @@
 #include "test_support.hpp"
 #include "host_dx12/j2/compute_flow.hpp"
 #include "host_dx12/ffx_flow/ffx_flow_shaders.hpp"
+#include "host_dx12/ffx_flow/ffx_flow.hpp"
 #include "host_dx12/nr/native_fg.hpp"
 #include "core/motion_arbiter_gpu.hpp"
 #include <vector>
@@ -8,6 +9,7 @@
 int main(int argc,char**){
     if(!na::ffx_flow::Built())return test::kSkip;
     test::Device d;if(!test::CreateDevice(d))return test::kSkip;
+    if(!na::ffx_flow::DeviceSupported(d.device.Get())){std::puts("SKIP: AMD search needs 32/64-lane hardware waves");return test::kSkip;}
     const unsigned w=argc>1?1920:512,h=argc>1?1080:256;constexpr auto S=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,U=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     test::List l;REQUIRE(l.Create(d.device.Get()));std::vector<test::ComPtr<ID3D12Resource>> uploads;
     auto image=[&](int dx,bool depth){

@@ -6,6 +6,7 @@
 #include "test_support.hpp"
 
 #include "host_dx12/ffx_flow/ffx_flow_shaders.hpp"
+#include "host_dx12/ffx_flow/ffx_flow.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -57,6 +58,23 @@ int main() {
             std::printf("%s %-18s hdr=%d size=%6zu hr=0x%08lX\n", SUCCEEDED(hr) ? "ok  " : "FAIL",
                         ff::PassName(pass), hdr, b.size, static_cast<unsigned long>(hr));
             if (FAILED(hr)) ++failures;
+        }
+    }
+    // CI's software adapter accepts the PSOs but its small waves cannot execute
+    // AMD's 64-thread block reductions correctly. Verify the runtime refuses it,
+    // rather than silently reporting successful all-zero optical flow.
+    ComPtr<IDXGIAdapter> warp;
+    ComPtr<ID3D12Device> software;
+    if (SUCCEEDED(d.factory->EnumWarpAdapter(IID_PPV_ARGS(&warp))) &&
+        SUCCEEDED(D3D12CreateDevice(warp.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&software)))) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS1 opt{};
+        if (SUCCEEDED(software->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &opt, sizeof opt)) &&
+            (opt.WaveLaneCountMin < 32 || opt.WaveLaneCountMax > 64)) {
+            ff::PairFlow unsupported;
+            const bool rejected = !unsupported.Init(software.Get(), 512, 256);
+            std::printf("%s unsupported software wave range %u..%u: %s\n", rejected ? "ok" : "FAIL",
+                opt.WaveLaneCountMin, opt.WaveLaneCountMax, unsupported.Error());
+            if (!rejected) ++failures;
         }
     }
     std::printf("ffx_flow_shaders_test: %s (%d failure%s, device %s)\n", failures ? "FAIL" : "PASS", failures,

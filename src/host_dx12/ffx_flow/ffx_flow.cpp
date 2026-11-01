@@ -59,12 +59,17 @@ struct PairFlow::Impl {
     }
 };
 PairFlow::PairFlow():p(new Impl){} PairFlow::~PairFlow()=default;
+bool DeviceSupported(ID3D12Device* dev){
+    if(!dev)return false;
+    D3D12_FEATURE_DATA_SHADER_MODEL sm{D3D_SHADER_MODEL_6_2};D3D12_FEATURE_DATA_D3D12_OPTIONS1 opt{};
+    return SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL,&sm,sizeof sm)) && sm.HighestShaderModel>=D3D_SHADER_MODEL_6_2 &&
+        SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1,&opt,sizeof opt)) && opt.WaveOps &&
+        opt.WaveLaneCountMin>=32 && opt.WaveLaneCountMax<=64;
+}
 bool PairFlow::Init(ID3D12Device* dev,unsigned w,unsigned h,unsigned slots){
     if(!dev || !Built() || w<256 || h<64 || w>16384 || h>16384 || !slots || slots>8){p->error="AMD compute flow needs DXC shaders and an image at least 256x64";return false;}
     if(p->device){p->error="Reinitialize only after retirement";return false;}
-    D3D12_FEATURE_DATA_SHADER_MODEL sm{D3D_SHADER_MODEL_6_2};D3D12_FEATURE_DATA_D3D12_OPTIONS1 opt{};
-    if(FAILED(dev->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL,&sm,sizeof sm)) || sm.HighestShaderModel<D3D_SHADER_MODEL_6_2 ||
-       FAILED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1,&opt,sizeof opt)) || !opt.WaveOps){p->error="AMD flow requires Shader Model6.2 and wave operations";return false;}
+    if(!DeviceSupported(dev)){p->error="AMD flow requires Shader Model6.2 and 32/64-lane waves";return false;}
     p->device=dev;p->w=w;p->h=h;p->slots=slots;p->stride=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     D3D12_DESCRIPTOR_HEAP_DESC hd{};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;hd.NumDescriptors=permanent+slots*per_slot;
     if(FAILED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&p->heap))))return false;

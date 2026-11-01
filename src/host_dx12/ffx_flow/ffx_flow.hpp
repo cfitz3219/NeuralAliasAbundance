@@ -4,6 +4,9 @@
 #include <memory>
 
 namespace na::ffx_flow {
+// The pinned search shader reduces a 64-thread block with one wave64 or two
+// wave32 groups. WaveOps alone is insufficient (WARP also exposes smaller waves).
+bool DeviceSupported(ID3D12Device*);
 // AMD FSR3-3.0.3 optical-flow shaders, unmodified. Explicit image pair:
 // no CPU-side temporal state advances when a recorded list is discarded.
 // Caller serializes recordings/submission on ONE direct queue, keeps this
