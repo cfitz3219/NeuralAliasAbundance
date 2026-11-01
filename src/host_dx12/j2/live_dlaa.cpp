@@ -258,7 +258,8 @@ bool is_float_color(DXGI_FORMAT f)
 // Replaces the DLAA result with a picture of what DLAA was given, so it can be
 // judged in the game: 1 motion (hue = direction, brightness = speed, 4 px = full;
 // black = no motion), 2 fine motion (0.2 px = full: reveals sub-pixel false
-// motion on a still camera), 3 depth (banded). Magenta = non-finite motion.
+// motion on a still camera), 3 depth (banded). White = non-finite motion (no direction
+// hue is ever white; magenta is the right-and-up hue, which misled the first Anno read).
 std::atomic<int> g_debug_view{0};
 struct DebugPass {
     ComPtr<ID3D12RootSignature> root;
@@ -281,7 +282,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         c = frac(d * float3(1.0, 16.0, 256.0));
     } else {
         float2 v = t_mv[id.xy];
-        if (any(isnan(v)) || any(isinf(v))) { c = float3(1, 0, 1); }
+        if (any(isnan(v)) || any(isinf(v))) { c = float3(1, 1, 1); }
         else {
             float a = atan2(v.y, v.x) / 6.2831853;
             float3 hue = saturate(abs(frac(a + float3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0);
