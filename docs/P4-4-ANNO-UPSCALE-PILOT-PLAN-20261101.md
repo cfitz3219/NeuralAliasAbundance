@@ -22,6 +22,9 @@ in COMMS before edits, as P4-4 says.
   Pilot mechanism: write the DLSS ratio (e.g. 0.666667) there at process start, before the game
   reads the file, so it applies on the first launch; a mid-game change applies on the next launch
   until a live engine setter is found. To verify in the first run: the game keeps the value.
+  Menu modes are the five DLSS modes (DLAA, Quality, Balanced, Performance, Ultra Performance,
+  target scale from NGX's optimal-settings query). Sniper's range starts at 0.5, so Ultra
+  Performance is greyed out there with a plain reason.
 - **Coverage:** the DLSS path never depends on where the setting lives (J2 detects the real
   reduced extent; any slider step works). One-click needs a per-engine profile (file, key,
   format): Unreal screen percentage (existing), Rebellion's GraphicsOptions.ini RenderScale
