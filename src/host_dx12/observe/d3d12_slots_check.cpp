@@ -12,6 +12,7 @@
     static_assert(offsetof(vtbl, method) / sizeof(void*) == (value), #vtbl "::" #method " slot")
 
 namespace s = na::observe::slots;
+NA_SLOT(ID3D12GraphicsCommandListVtbl, IASetPrimitiveTopology, s::list::IASetPrimitiveTopology);
 NA_SLOT(ID3D12DeviceVtbl, CreateCommandQueue, s::device::CreateCommandQueue);
 NA_SLOT(ID3D12DeviceVtbl, CreateCommandAllocator, s::device::CreateCommandAllocator);
 NA_SLOT(ID3D12DeviceVtbl, CreateGraphicsPipelineState, s::device::CreateGraphicsPipelineState);

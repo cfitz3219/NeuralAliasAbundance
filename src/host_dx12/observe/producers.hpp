@@ -135,6 +135,13 @@ void ResetDerived();
 // pipeline state of this recording. False (nothing issued) if the state is not fully
 // known (unobserved recording, a bundle was executed).
 bool RestoreListState(ID3D12GraphicsCommandList* list);
+// Layer2 raster work also changes RTV/DSV, viewport/scissor and IA topology.
+// Opt-in: private CPU descriptor snapshots are taken before OMSetRenderTargets
+// (the game's source descriptors may legally be reused immediately afterwards).
+// Enable is latched at each observed Reset so Disable cannot interrupt a scope's
+// restoration. Existing executable recordings keep their captured state.
+void SetRasterStateTracking(bool enabled);
+bool ListRasterStateRestorable(ID3D12CommandList* list);
 bool ListStateRestorable(ID3D12CommandList* list); // RestoreListState would succeed
 // First render target and depth currently bound in the recording.
 bool ListCurrentTargets(ID3D12CommandList* list, na_object_id* rt, na_object_id* ds);

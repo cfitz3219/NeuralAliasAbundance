@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
+#include <wrl/client.h>
 
 #include "queue_occurrences.hpp"
 #include "host_dx12/j2/insertion_trace.hpp"
@@ -114,6 +115,13 @@ struct ListState {
     uint32_t cur_ds_sub = NA_UNKNOWN_U32;
     bool restorable = true;              // false after work whose state effects we cannot replay
     bool in_render_pass = false;         // between BeginRenderPass and EndRenderPass (no host copy/dispatch allowed)
+    D3D12_VIEWPORT raster_viewports[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+    D3D12_RECT raster_scissors[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+    UINT raster_viewport_count = 0, raster_scissor_count = 0, raster_rt_count = 0;
+    D3D12_PRIMITIVE_TOPOLOGY raster_topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    bool raster_viewports_known = false, raster_scissors_known = false, raster_topology_known = false;
+    bool raster_targets_known = false, raster_has_depth = false;
+    bool raster_tracking = false; // latched at Reset; an Off request cannot undo restoration mid-recording
     int8_t mip_level = -1;               // live mip bias: twin level latched at Reset (-1 = the game's own objects)
 };
 
@@ -164,6 +172,7 @@ std::shared_mutex g_m; // registry, heaps, VA table. Never held across a D3D12 c
 // Never destroyed: at process exit an entry's twins must not be Released (a twin's last
 // Release can retire an object through its sentinel, which takes g_m and walks this map).
 std::unordered_map<const void*, Obj>& g_objs = *new std::unordered_map<const void*, Obj>();
+std::atomic<bool> g_raster_tracking{false};
 void ReleaseTwinsLater(std::shared_ptr<Obj::Twins>&& t); // live mip bias: see the definition
 void ReleaseParkedTwins();
 std::atomic<uint64_t> g_mip_shared_skips{0}; // twin levels dropped: D3D12 returned one of the game's own root signatures
@@ -2225,6 +2234,9 @@ struct On<sl::list::Reset> {
                     ls->cur_nrt = 0;
                     ls->restorable = true;
                     ls->in_render_pass = false;
+                    ls->raster_viewports_known = ls->raster_scissors_known = ls->raster_topology_known = false;
+                    ls->raster_targets_known = false;
+                    ls->raster_tracking = g_raster_tracking.load(std::memory_order_acquire);
                 }
                 ls->root_sig[0] = ls->root_sig[1] = nullptr;
                 ls->coverage_complete.store(cov == na::hooking::variants::Coverage::Complete);
@@ -2386,7 +2398,16 @@ struct On<sl::list::RSSetViewports> {
     static void run(GL* l, UINT n, const D3D12_VIEWPORT* v)
     {
         Rec r;
-        if (!begin_op(l, &r) || !n || !v) return;
+        if (!begin_op(l, &r)) return;
+        with_list_state(l, [&](ListState& ls) {
+            std::lock_guard<std::mutex> bl(ls.bind_m);
+            ls.raster_viewports_known = n <= D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE && (!n || v);
+            if (ls.raster_viewports_known) {
+                ls.raster_viewport_count = n;
+                if (n) std::copy_n(v, n, ls.raster_viewports);
+            }
+        });
+        if (!n || !v) return;
         // Every viewport (review): 6 floats each, first one also in a[].
         constexpr UINT kMax = D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
         float all[kMax * 6];
@@ -2404,7 +2425,16 @@ struct On<sl::list::RSSetScissorRects> {
     static void run(GL* l, UINT n, const D3D12_RECT* rc)
     {
         Rec r;
-        if (!begin_op(l, &r) || !n || !rc) return;
+        if (!begin_op(l, &r)) return;
+        with_list_state(l, [&](ListState& ls) {
+            std::lock_guard<std::mutex> bl(ls.bind_m);
+            ls.raster_scissors_known = n <= D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE && (!n || rc);
+            if (ls.raster_scissors_known) {
+                ls.raster_scissor_count = n;
+                if (n) std::copy_n(rc, n, ls.raster_scissors);
+            }
+        });
+        if (!n || !rc) return;
         const auto pack = [](LONG a, LONG b) { return static_cast<uint64_t>(static_cast<uint32_t>(a)) | (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32); };
         constexpr UINT kMax = D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
         int32_t all[kMax * 4];
@@ -2416,6 +2446,16 @@ struct On<sl::list::RSSetScissorRects> {
             all[i * 4 + 3] = rc[i].bottom;
         }
         emit_op(r, NA_OP_RS_SCISSOR, {n, pack(rc->left, rc->top), pack(rc->right, rc->bottom)}, all, m * 16, 16, m < n ? NA_EVF_TRUNCATED : 0u);
+    }
+};
+template <>
+struct On<sl::list::IASetPrimitiveTopology> {
+    static void run(GL* l, D3D12_PRIMITIVE_TOPOLOGY topology) {
+        if (t_host_work) return;
+        with_list_state(l, [&](ListState& ls) {
+            std::lock_guard<std::mutex> bl(ls.bind_m);
+            ls.raster_topology = topology; ls.raster_topology_known = true;
+        });
     }
 };
 template <>
@@ -2846,6 +2886,7 @@ struct On<sl::list::BeginRenderPass> {
             std::lock_guard<std::mutex> bl(ls.bind_m);
             set_targets_locked(ls, refs, m, ds != nullptr);
             ls.in_render_pass = true;
+            ls.raster_targets_known = false; // render-pass targets need their own snapshot before Layer2 work
             for (uint32_t i = 0; i < nrt; ++i) {
                 if (rts[i].BeginningAccess.Type != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR || !refs[i].resource) continue;
                 ls.insertion.Add({refs[i].resource, 0, 0, true, na::j2::Op::ClearWrite});
@@ -3168,6 +3209,62 @@ bool g_reset_registered = false; // installation thread only
 bool g_barriers_registered=false;
 std::atomic<void (*)(ID3D12GraphicsCommandList*,UINT,const D3D12_RESOURCE_BARRIER*)> g_barrier_listener{nullptr};
 std::atomic<bool> g_full_list_tracking{false};
+
+void capture_raster_targets(GL* list, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets,
+    BOOL contiguous, const D3D12_CPU_DESCRIPTOR_HANDLE* depth)
+{
+    if (t_host_work) return;
+    bool enabled = false;
+    with_list_state(list, [&](ListState& ls) {
+        std::lock_guard<std::mutex> bl(ls.bind_m); enabled = ls.raster_tracking; ls.raster_targets_known = false;
+    });
+    if (!enabled) return;
+    if (count > 8 || (count && !targets)) return;
+    std::shared_ptr<Obj::Twins> storage;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_m);
+        const auto found = g_objs.find(canon(list));
+        if (found == g_objs.end() || !found->second.list) return;
+        storage = found->second.twins;
+    }
+    // CPU-only descriptor storage, once per observed list. Use the existing
+    // deferred child-object release path: releasing these from a list's private
+    // retirement sentinel would re-enter D3D12 under its destruction lock.
+    HostWorkScope own;
+    Microsoft::WRL::ComPtr<ID3D12Device> device;
+    if (FAILED(list->GetDevice(IID_PPV_ARGS(&device)))) return;
+    if (!storage) {
+        auto candidate = std::make_shared<Obj::Twins>();
+        Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> rt, ds;
+        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 8, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rt)))) return;
+        hd = {D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&ds)))) return;
+        candidate->obj[0] = rt.Detach(); candidate->obj[1] = ds.Detach();
+        {
+            std::unique_lock<std::shared_mutex> lock(g_m);
+            const auto found = g_objs.find(canon(list));
+            if (found == g_objs.end() || !found->second.list) return;
+            if (!found->second.twins) found->second.twins = candidate;
+            storage = found->second.twins;
+        }
+    }
+    auto* rt = static_cast<ID3D12DescriptorHeap*>(storage->obj[0]);
+    auto* ds = static_cast<ID3D12DescriptorHeap*>(storage->obj[1]);
+    if (!rt || !ds) return;
+    const UINT stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    auto dst = rt->GetCPUDescriptorHandleForHeapStart();
+    for (UINT i = 0; i < count; ++i) {
+        const auto src = contiguous ? D3D12_CPU_DESCRIPTOR_HANDLE{targets[0].ptr + SIZE_T(i) * stride} : targets[i];
+        device->CopyDescriptorsSimple(1, dst, src, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        dst.ptr += stride;
+    }
+    if (depth) device->CopyDescriptorsSimple(1, ds->GetCPUDescriptorHandleForHeapStart(), *depth, D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+    with_list_state(list, [&](ListState& ls) {
+        std::lock_guard<std::mutex> bl(ls.bind_m);
+        ls.raster_rt_count = count; ls.raster_has_depth = depth != nullptr; ls.raster_targets_known = true;
+    });
+}
 template <uint32_t Slot, typename Sig>
 struct ListHook;
 template <uint32_t Slot, typename R, typename... A>
@@ -3219,6 +3316,8 @@ struct ListHook<Slot, R(A...)> {
             }
         } else
         if constexpr (std::is_void_v<R>) {
+            if constexpr (Slot == sl::list::OMSetRenderTargets)
+                if (scope.outermost && !scope.ambiguous) capture_raster_targets(l, a...);
             if constexpr (Slot == sl::list::ResourceBarrier)
                 if (scope.outermost && !scope.ambiguous) before_read_transition(l, a...);
             if constexpr (Slot == sl::list::CopyResource || Slot == sl::list::ResolveSubresource || Slot == sl::list::CopyTextureRegion) {
@@ -3264,6 +3363,7 @@ bool register_list_slots()
         ListHook<L::CopyTextureRegion, void(const D3D12_TEXTURE_COPY_LOCATION*, UINT, UINT, UINT, const D3D12_TEXTURE_COPY_LOCATION*, const D3D12_BOX*)>::spec(),
         ListHook<L::CopyResource, void(ID3D12Resource*, ID3D12Resource*)>::spec(),
         ListHook<L::ResolveSubresource, void(ID3D12Resource*, UINT, ID3D12Resource*, UINT, DXGI_FORMAT)>::spec(),
+        ListHook<L::IASetPrimitiveTopology, void(D3D12_PRIMITIVE_TOPOLOGY)>::spec(),
         ListHook<L::RSSetViewports, void(UINT, const D3D12_VIEWPORT*)>::spec(),
         ListHook<L::RSSetScissorRects, void(UINT, const D3D12_RECT*)>::spec(),
         ListHook<L::SetPipelineState, void(ID3D12PipelineState*)>::spec(),
@@ -4739,6 +4839,17 @@ bool ListStateRestorable(ID3D12CommandList* l)
     std::lock_guard<std::mutex> bl(ls->bind_m);
     return ls->restorable && !ls->in_render_pass;
 }
+void SetRasterStateTracking(bool enabled) { g_raster_tracking.store(enabled, std::memory_order_release); }
+bool ListRasterStateRestorable(ID3D12CommandList* list)
+{
+    std::shared_lock<std::shared_mutex> lock(g_m);
+    na_object_id id = 0;
+    ListState* ls = list ? list_state_locked(list, &id) : nullptr;
+    if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return ls->raster_tracking && ls->restorable && !ls->in_render_pass && ls->raster_targets_known &&
+        ls->raster_viewports_known && ls->raster_scissors_known && ls->raster_topology_known;
+}
 bool RestoreListState(ID3D12GraphicsCommandList* l)
 {
     // Snapshot under the locks, issue the calls without them (these calls run
@@ -4748,6 +4859,12 @@ bool RestoreListState(ID3D12GraphicsCommandList* l)
     uint32_t nheaps = 0;
     const void* rs[2] = {};
     std::vector<ListState::RootArg> args[2];
+    std::shared_ptr<Obj::Twins> raster_storage;
+    D3D12_VIEWPORT viewports[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+    D3D12_RECT scissors[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+    UINT viewport_count = 0, scissor_count = 0, rt_count = 0;
+    D3D12_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    bool vp_known = false, sc_known = false, topology_known = false, has_depth = false;
     {
         std::shared_lock<std::shared_mutex> rl(g_m);
         na_object_id lid = 0;
@@ -4763,6 +4880,18 @@ bool RestoreListState(ID3D12GraphicsCommandList* l)
         rs[1] = ls->root_sig[1];
         args[0] = ls->args[0];
         args[1] = ls->args[1];
+        if (ls->raster_tracking) {
+            vp_known = ls->raster_viewports_known; viewport_count = ls->raster_viewport_count;
+            sc_known = ls->raster_scissors_known; scissor_count = ls->raster_scissor_count;
+            topology_known = ls->raster_topology_known; topology = ls->raster_topology;
+            if (vp_known) std::copy_n(ls->raster_viewports, viewport_count, viewports);
+            if (sc_known) std::copy_n(ls->raster_scissors, scissor_count, scissors);
+            if (ls->raster_targets_known) {
+                const auto owner = g_objs.find(canon(l));
+                if (owner != g_objs.end()) raster_storage = owner->second.twins;
+                rt_count = ls->raster_rt_count; has_depth = ls->raster_has_depth;
+            }
+        }
     }
     if (nheaps) l->SetDescriptorHeaps(nheaps, heaps);
     for (uint32_t c = 0; c < 2; ++c) {
@@ -4782,6 +4911,14 @@ bool RestoreListState(ID3D12GraphicsCommandList* l)
         }
     }
     if (pso) l->SetPipelineState(pso);
+    if (raster_storage && raster_storage->obj[0] && raster_storage->obj[1]) {
+        const auto rt = static_cast<ID3D12DescriptorHeap*>(raster_storage->obj[0])->GetCPUDescriptorHandleForHeapStart();
+        const auto ds = static_cast<ID3D12DescriptorHeap*>(raster_storage->obj[1])->GetCPUDescriptorHandleForHeapStart();
+        l->OMSetRenderTargets(rt_count, rt_count ? &rt : nullptr, TRUE, has_depth ? &ds : nullptr);
+    }
+    if (vp_known) l->RSSetViewports(viewport_count, viewport_count ? viewports : nullptr);
+    if (sc_known) l->RSSetScissorRects(scissor_count, scissor_count ? scissors : nullptr);
+    if (topology_known) l->IASetPrimitiveTopology(topology);
     return true;
 }
 bool ListClearsTarget(ID3D12CommandList* list, na_object_id target)
