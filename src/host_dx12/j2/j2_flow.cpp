@@ -725,14 +725,22 @@ Ticket Prepare(ID3D12Device* device, ID3D12CommandQueue* queue, const Source& sr
     // Pair only with the frame J2's camera history pairs with.
     bool pair = prev >= 0 && !src.reset && src.previous_frame && g.img[prev].committed &&
                 g.img[prev].frame == src.previous_frame && g.img[prev].generation == src.generation;
-    if (!pair && prev >= 0) ++g.stats.skipped_reset;
-    if (pair && !src.allow_pair) { pair = false; ++g.stats.skipped_split; }
+    const char* why_not = prev < 0 ? "Collecting the first image of a pair." : nullptr;
+    if (!pair && prev >= 0) { ++g.stats.skipped_reset; why_not = "Camera-only this frame: a cut, resize, restart or skipped frame."; }
+    if (pair && !src.allow_pair) {
+        pair = false;
+        ++g.stats.skipped_split;
+        why_not = "Camera-only: the game sends more of its own work right after the scene in the same batch (batch split is off).";
+    }
     Grid* gr = nullptr;
     uint32_t gi = 0;
     if (pair) {
         gi = g.next_grid;
         gr = &g.grids[gi];
-        if (of_done < gr->last_of || j2_done < gr->last_j2) { pair = false; gr = nullptr; ++g.stats.skipped_busy; }
+        if (of_done < gr->last_of || j2_done < gr->last_j2) {
+            pair = false; gr = nullptr; ++g.stats.skipped_busy;
+            why_not = "Camera-only this frame: the previous motion result is still in use.";
+        }
     }
     // Pre list: copy the scene subresource, encode it into img[cur].
     if (FAILED(pre.alloc->Reset()) || FAILED(pre.list->Reset(pre.alloc.Get(), nullptr))) {
@@ -824,7 +832,7 @@ Ticket Prepare(ID3D12Device* device, ID3D12CommandQueue* queue, const Source& sr
     }
     if (!t.pair) ++g.stats.encode_only;
     g.stats.active = 1;
-    set_reason(t.pair ? "Running." : "Collecting the first image of a pair.");
+    if (!g.latched) set_reason(t.pair ? "Running." : (why_not ? why_not : "Camera-only this frame.")); // a latch keeps its own reason
     return t;
 }
 
