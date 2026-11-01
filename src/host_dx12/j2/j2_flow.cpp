@@ -29,7 +29,12 @@ constexpr uint32_t kSlots = 8;   // >= J2's ring (6): descriptor blocks and read
 constexpr uint32_t kPre = 8;     // pre-list allocators
 constexpr uint32_t kCounters = 8; // per slot: accepted, invalid, small, cost, offscreen, image, cost_sum, cost_n
 constexpr uint32_t kCostMax = 160;     // engine cost above this rejects the block (tuning target, reported as mean_cost)
-constexpr float kSnapPx = 0.25f;       // same as the arbiter's snap: smaller residuals are noise
+// Residuals below 1 px are not trusted. Anno run (d927268, 3440x1440, engine at half
+// size): ~70% of the picture carried an accepted residual, i.e. sub-pixel disagreement
+// between the engine and camera+jitter on still scenery, not objects. The half-size
+// engine cannot resolve the DLAA jitter shift (<= 1 px between frames); moving ships
+// and people move several pixels per frame.
+constexpr float kSnapPx = 1.0f;
 constexpr float kImageAbs = 0.08f;     // the flow must explain the image (mean luma error, 3x3 encoded texels)
 constexpr float kImageMargin = 0.02f;  // and never clearly worse than the camera alone (flat areas: both explain it)
 // Minimum local contrast (3x3 encoded luma, max - min) for a residual to count. On flat
