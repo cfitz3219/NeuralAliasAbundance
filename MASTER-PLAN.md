@@ -13,6 +13,8 @@
 
 ## 1. How we work (read this first)
 
+**Cort's project-wide direction (2026-11-01):** avoid relentless skepticism or looking for something to object to. Give a sound idea plain credit and pursue it. Raise concrete defects and material limitations when supported by evidence; do not turn hypothetical concerns into extra gates, scope or review cycles. This applies for the duration of the project.
+
 | Rule | Detail |
 |---|---|
 | **Build mode now** | Cort's direction: **both agents build, nobody reviews yet.** Don't block on the other agent. Don't edit the other agent's files. |
