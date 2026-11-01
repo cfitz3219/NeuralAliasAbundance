@@ -38,7 +38,9 @@ std::shared_ptr<const GpuConstants> GpuConstants::Create(ID3D12Device* device, I
     if (!PatchConstants(observed, bytes, patches, replaced, error)) return {};
     auto copy = std::shared_ptr<GpuConstants>(new GpuConstants);
     copy->source_ = source; copy->source_offset_ = offset; copy->bytes_ = bytes;
-    copy->fixed_source_state_ = hp.Type == D3D12_HEAP_TYPE_UPLOAD || hp.Type == D3D12_HEAP_TYPE_GPU_UPLOAD;
+    // GPU_UPLOAD is value5; older supported Windows SDK headers predate its
+    // symbolic name, while the runtime can still return that public heap type.
+    copy->fixed_source_state_ = hp.Type == D3D12_HEAP_TYPE_UPLOAD || hp.Type == static_cast<D3D12_HEAP_TYPE>(5);
     for (const auto& p : patches) if (std::find(copy->offsets_.begin(), copy->offsets_.end(), p.offset) == copy->offsets_.end())
         copy->offsets_.push_back(p.offset);
     if (!buffer(device, (bytes + 255) & ~uint64_t(255), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, copy->owned_) ||

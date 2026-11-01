@@ -3,7 +3,8 @@
 namespace na::scale {
 // GPU-time CB copy + explicit extent edits. A record-time CPU clone would miss
 // later game/J2 uploads (including submission-time camera jitter). The source
-// buffer is never written. Prepare on the setup worker; retain this object in
+// buffer is never written. Prepare on the setup worker under HostWorkScope;
+// retain this object in
 // each executable recording and every submitted occurrence.
 class GpuConstants {
 public:

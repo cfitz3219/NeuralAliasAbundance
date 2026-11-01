@@ -31,7 +31,9 @@ struct Member {
 };
 class SceneGroup {
 public:
-    // Worker/setup operation, not a per-draw allocation. On ANY failure, all
+    // Worker/setup operation, not a per-draw allocation. The host caller must
+    // use HostWorkScope so private allocations aren't discovery candidates.
+    // On ANY failure, all
     // temporary allocations are released and no candidate is returned. The
     // original game's resources/heaps/descriptors remain completely untouched.
     // This allocates storage only. Initialization/history contents and a coherent

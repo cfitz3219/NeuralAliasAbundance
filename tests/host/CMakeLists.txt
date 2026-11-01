@@ -17,6 +17,7 @@ na_host_test(fg_profile_test SOURCES fg_profile_test.cpp LIBS host_settings nvap
 na_host_test(pbz_settings_test SOURCES pbz_settings_test.cpp LIBS host_settings)
 na_host_test(scene_group_test SOURCES scene_group_test.cpp LIBS host_scene_scale d3d12 dxgi d3dcompiler)
 na_host_test(depth_restore_test SOURCES depth_restore_test.cpp LIBS host_scene_scale d3d12 dxgi d3dcompiler)
+na_host_test(color_restore_test SOURCES color_restore_test.cpp LIBS host_scene_scale d3d12 dxgi d3dcompiler)
 na_host_test(raster_restore_test SOURCES raster_restore_test.cpp LIBS host_scene_scale host_observe_producers d3d12 dxgi d3dcompiler)
 na_host_test(gpu_constants_test SOURCES gpu_constants_test.cpp LIBS host_scene_scale d3d12 dxgi d3dcompiler)
 na_host_test(shader_operation_test SOURCES shader_operation_test.cpp LIBS host_observe_producers d3d12 dxgi d3dcompiler)
