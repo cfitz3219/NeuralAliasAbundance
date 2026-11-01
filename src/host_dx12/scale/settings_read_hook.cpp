@@ -73,6 +73,7 @@ bool candidate(const std::wstring& p)
     if (dot == std::wstring::npos || p.find_last_of(L"\\/") > dot) return false;
     static const wchar_t* const exts[] = {L".ini", L".cfg", L".json", L".xml", L".txt", L".yaml", L".yml", L".conf", L".config"};
     const std::wstring e = lower(p.substr(dot));
+    if (lower(p).find(L"neuralalias") != std::wstring::npos) return false; // never our own settings or logs
     for (const wchar_t* x : exts) if (e == x) return true;
     return false;
 }

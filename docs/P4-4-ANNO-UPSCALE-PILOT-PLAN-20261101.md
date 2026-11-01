@@ -129,3 +129,33 @@ at the reduced size), GPU time and fps, ghosting on movers. Cort judges the pict
 ## Estimates
 
 Stage 1 about 2-3 days; Stage M recorder about 1-2 days; Stage P after the map.
+
+## Astra's review folded in (COMMS 4170a93, 5b8dd1f, d8ca9b8, 2d16897, 017b498)
+
+Permissions granted: Stage M recorder hunks in producers.cpp (bounded, read-only, off by default,
+event ABI kept; consume her tracked raster state, no parallel caches); host_scale read hook plus
+one host_boot install call; the guidance badge/menu hunks in overlay.cpp (keep Home/cursor
+behaviour); the mip-service extension (producers.cpp kMipLevels/twins + session.cpp wiring,
+hunks posted before edits).
+
+Corrections adopted:
+- Read hook: install as early as possible outside the loader lock, separate from delayed GPU
+  start-up; log whether the settings read was actually intercepted. Startup substitution sets the
+  launch mode only; live mode changes need an engine path, else "applies on next launch".
+  Synchronous complete reads only (Sniper's case); unsupported shapes fall back honestly.
+- Success = actual reduced render extent AND an actual DLSS upscale submitted (Stats
+  upscaled_frames), never the ratio alone.
+- Colour domain from content/transfer, not float-vs-UNORM format (live_dlaa uses is_float_color
+  today). A post-tonemap placement is a measured deviation from NVIDIA's guide (pre-tonemap).
+- Mip bias: current levels {0,-0.5,-1} quantize Quality's ~-1.58 to -1; extend the service,
+  account for the game's own bias, no double application.
+- Stage M: per-queue order plus Signal/Wait edges; main-picture producer->consumer closure
+  including half/quarter targets, mip/slice views, compute UAVs, history; unknown/bindless
+  recorded as unresolved; worker-side export, no readbacks or per-draw disk writes.
+- Stage P: skip-vs-overwrite through Astra's shader_operation seam (PR75 d05faf5:
+  Reconstruction/Bindings lanes, Before/After/Replaced); no second draw/dispatch hook. Skip only
+  after a complete valid replacement; native op runs exactly once otherwise.
+- For R3 (Astra): an optional immutable PHYSICAL input override alongside UpscaleTarget
+  (reduced resource pointers/subresources, actual states, active extent, one group generation);
+  logical native ids stay for discovery/camera. Fable builds it.
+- Flow off while upscaling stays a documented pilot limit.
