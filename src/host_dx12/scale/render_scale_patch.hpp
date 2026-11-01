@@ -144,21 +144,54 @@ inline bool FormatSameWidth(double fraction, const Match& m, char* out /* value_
     return true;
 }
 
-// Rewrites every non-comment render-scale value in place (same length). Returns how many were
-// rewritten; `first` gets the first match (also when nothing could be written).
-inline int PatchRenderScale(char* d, size_t n, double fraction, Match* first = nullptr, bool tag = false)
+// What PatchRenderScale did to the FIRST entry it actually rewrote (an entry it could not
+// rewrite is never reported as the source of a later one).
+struct PatchInfo {
+    int patched = 0;          // entries rewritten
+    bool have = false;        // `m`, `original`, `written` describe a rewritten entry
+    Match m;                  // that entry (its unit, key, position, the game's own value)
+    char original[16] = {};   // its text before
+    char written[16] = {};    // its text after
+    bool tagged = false;      // `written` carries the live-switch marker, and the marker survives
+                              // conversion to float and to double (distinct from the untagged value)
+};
+
+namespace detail {
+// The tagged text must still differ from the untagged text after the game converts it.
+inline bool tag_survives(const char* tagged, const char* plain)
 {
-    int patched = 0;
-    bool have_first = false;
+    const double a = std::atof(tagged), b = std::atof(plain);
+    return a != b && static_cast<float>(a) != static_cast<float>(b);
+}
+} // namespace detail
+
+// Rewrites every non-comment render-scale value in place (same length). Returns how many were
+// rewritten. With `tag`, each value is marked when its width allows (see FormatSameWidth);
+// an entry too short to mark is still rewritten, unmarked, and `info->tagged` says so.
+inline int PatchRenderScale(char* d, size_t n, double fraction, PatchInfo* info = nullptr, bool tag = false)
+{
+    PatchInfo local;
+    PatchInfo& r = info ? *info : local;
+    r = PatchInfo{};
     Match m;
     for (size_t from = 0; FindRenderScale(d, n, &m, from); from = m.value_pos + m.value_len) {
-        if (!have_first && first) { *first = m; have_first = true; }
-        char v[16] = {};
-        if (!FormatSameWidth(fraction, m, v, tag) && !(tag && FormatSameWidth(fraction, m, v))) continue;
+        if (!r.have && r.patched == 0) r.m = m; // the first entry found, until one is rewritten
+        char plain[16] = {}, v[16] = {};
+        if (!FormatSameWidth(fraction, m, plain)) continue;
+        bool tagged = tag && FormatSameWidth(fraction, m, v, true) && detail::tag_survives(v, plain);
+        if (!tagged) std::memcpy(v, plain, sizeof v);
+        if (!r.have) {
+            r.have = true;
+            r.m = m;
+            std::memcpy(r.original, d + m.value_pos, m.value_len);
+            r.original[m.value_len] = 0;
+            std::memcpy(r.written, v, m.value_len + 1);
+            r.tagged = tagged;
+        }
         std::memcpy(d + m.value_pos, v, m.value_len);
-        ++patched;
+        ++r.patched;
     }
-    return patched;
+    return r.patched;
 }
 
 } // namespace na::scale

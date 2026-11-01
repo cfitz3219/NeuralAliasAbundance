@@ -3,10 +3,15 @@
 //
 // Hooks CreateFileW / CreateFileA / ReadFile / WriteFile in KernelBase. For a small text
 // settings file (.ini .cfg .json .xml .txt .yaml .yml .conf .config, at most 1 MB) opened for
-// reading, the bytes ReadFile returns are passed to render_scale_patch.hpp, which rewrites a
-// known render-scale value in place (same length). The file on disk is never written by us.
-// If the game later saves its settings to the same file, our value is put back to the game's
-// original in the bytes it writes, so the user's file keeps what they had.
+// reading, the bytes a SYNCHRONOUS ReadFile returns are passed to render_scale_patch.hpp, which
+// rewrites a known render-scale value in place (same length). We never open the file for writing.
+// When the game later saves synchronously to the same file (same final path), a value we put
+// there (the substituted one, or a live value we wrote, in any number formatting) is put back to
+// the game's original, in the same width, in the bytes it writes. Not covered, and logged where
+// seen: asynchronous (OVERLAPPED) saves are forwarded untouched; saves through a temporary file
+// renamed over the original; a width the original cannot be written in. So the user's file keeps
+// its value in the cases we intercept, not unconditionally.
+// A tracked handle is re-identified by volume + file index (handle values are reused).
 // J2 confirms in the same launch (its detected render extent); nothing here assumes success.
 //
 // Off until Configure(fraction > 0). Install from a worker thread (never under the loader lock),
@@ -38,20 +43,49 @@ struct ReadHookStats {
 ReadHookStats GetReadHookStats();
 
 // Live mode change (Sniper applies Render Scale instantly in its own menu). The value substituted
-// at read time is tagged (last decimal nudged by one), so after the game parsed it the exact
-// float/double holding it can be found in the game's writable memory. SetLiveFraction finds those
-// copies once (worker thread only: it scans memory; never from a render callback), then writes
-// the new value into each copy that still holds the last value we put there. Returns how many
-// copies were written; 0 = live change not available (the menu says "applies on next launch").
-// More than 8 copies is treated as ambiguous and nothing is written. The caller confirms the
-// change from J2's detected render extent.
-int SetLiveFraction(double fraction);
+// at read time is tagged (last decimal nudged by one) when its width allows, so after the game
+// parsed it the float/double holding it can be found in the game's writable memory.
+//
+// A rare value identifies DATA RELATED to the setting, not its live owner (Astra 2026-11-01):
+// the parsed, menu, last-applied, save and scratch copies can all hold it. So copies are never
+// written all at once. Each candidate is tried ALONE; the caller watches J2 and reports whether
+// the scene extent actually changed (and DLSS upscaled). A candidate that did not move the
+// picture is put back exactly as it was and the next is tried; the one that did is the control
+// and the only one written from then on. Writing memory is never itself evidence of success.
+//
+// Threading: SetLiveFraction never scans on the caller's thread and never holds the file-hook
+// lock while scanning. The first request after a tagged read starts ONE background scan for that
+// read (no repeated whole-process scan per Apply); the latest request is applied when it ends.
+enum class LiveResult : int {
+    Off,            // no request, or the fraction is out of range
+    NoTag,          // no MARKED value was read at start-up (startup substitution may still have worked)
+    Scanning,       // the background scan is running; the request is applied when it ends
+    NotFound,       // the marker is not in memory (the game did not keep the parsed value)
+    Ambiguous,      // more candidates than are worth trying one at a time; nothing written
+    Trying,         // candidate written; caller must report the observed extent (ReportLiveOutcome)
+    Applied,        // written to the confirmed control
+    NoLongerOurs,   // the control no longer holds our last value (the user moved the game's slider)
+    Exhausted,      // every candidate was tried and none changed the picture: not live-controllable
+};
+const char* LiveResultName(LiveResult r);
+LiveResult SetLiveFraction(double fraction);
+// After Trying: `extent_changed` = J2 saw the requested render extent AND submitted a DLSS
+// upscale. false puts the candidate back and moves on to the next (the caller then calls
+// SetLiveFraction again, which writes the next candidate). Ignored in other states.
+void ReportLiveOutcome(bool extent_changed);
+bool WaitLiveScan(uint32_t timeout_ms); // diagnostics / tests: true when no scan is running
+
 struct LiveStats {
-    uint32_t float_hits = 0, double_hits = 0, writes = 0;
-    uint64_t scanned_mb = 0, scanned_kb = 0;
-    uint32_t regions = 0, writable_regions = 0; // memory regions seen / writable ones (diagnostics)
-    double tag = 0;          // the tagged value the game parsed (its unit)
-    char note[160] = {};
+    LiveResult result = LiveResult::Off;
+    uint32_t float_hits = 0, double_hits = 0, candidates = 0;
+    int32_t trying = -1, control = -1;   // candidate index being tried / confirmed
+    uint32_t writes = 0, restores = 0, generation = 0;
+    uint64_t scanned_kb = 0, scan_ms = 0;
+    uint32_t regions = 0, writable_regions = 0, stack_allocations_skipped = 0;
+    bool tagged = false;                 // the read carried a marker that survives float conversion
+    double tag = 0;                      // the marked value the game parsed (its unit)
+    double requested = 0;                // last requested value (its unit)
+    char note[200] = {};
 };
 LiveStats GetLiveStats();
 

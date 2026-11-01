@@ -5,9 +5,13 @@
 #include <string>
 
 namespace {
-std::string patch(std::string s, double f, int* n = nullptr, na::scale::Match* m = nullptr, bool tag = false)
+std::string patch(std::string s, double f, int* n = nullptr, na::scale::Match* m = nullptr, bool tag = false,
+                  na::scale::PatchInfo* out = nullptr)
 {
-    const int k = na::scale::PatchRenderScale(s.data(), s.size(), f, m, tag);
+    na::scale::PatchInfo info;
+    const int k = na::scale::PatchRenderScale(s.data(), s.size(), f, &info, tag);
+    if (m) *m = info.m;
+    if (out) *out = info;
     if (n) *n = k;
     return s;
 }
@@ -66,6 +70,25 @@ int main()
         int n = 0;
         CHECK(patch("RenderScale = 1.000000\n", 0.666667, &n, nullptr, true) == "RenderScale = 0.666668\n" && n == 1);
         CHECK(patch("ScreenPercentage=100\n", 0.5, &n, nullptr, true) == "ScreenPercentage= 50\n" && n == 1);
+    }
+    // Tag status is reported per rewritten entry (Astra 2026-11-01): a short field is rewritten
+    // but NOT marked, so live discovery must not start from it.
+    {
+        PatchInfo info;
+        CHECK(patch("RenderScale = 1.000000\n", 0.666667, nullptr, nullptr, true, &info) == "RenderScale = 0.666668\n");
+        CHECK(info.have && info.tagged && std::string(info.original) == "1.000000" && std::string(info.written) == "0.666668");
+        CHECK(patch("RenderScale=1.0\n", 0.5, nullptr, nullptr, true, &info) == "RenderScale=0.5\n");
+        CHECK(info.have && !info.tagged && std::string(info.written) == "0.5");
+        // The first entry cannot be rewritten (too short for 0.667); the second can: it is the one reported.
+        CHECK(patch("RenderScale=1.0\nResolutionScale = 1.000000\n", 0.666667, nullptr, nullptr, true, &info) ==
+              "RenderScale=1.0\nResolutionScale = 0.666668\n");
+        CHECK(info.patched == 1 && info.have && std::string(info.m.key) == "ResolutionScale" && std::string(info.original) == "1.000000");
+        // Nothing rewritten: `have` is false, the first entry found is still described.
+        CHECK(patch("RenderScale=1.0\n", 0.666667, nullptr, nullptr, true, &info) == "RenderScale=1.0\n");
+        CHECK(!info.have && info.patched == 0 && info.m.current == 1.0);
+        // A marker too fine for float precision is not claimed as a marker.
+        CHECK(!detail::tag_survives("0.66666670000001", "0.66666670000000"));
+        CHECK(detail::tag_survives("0.666668", "0.666667"));
     }
     return test::finish("render_scale_patch_test");
 }

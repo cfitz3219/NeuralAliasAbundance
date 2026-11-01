@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
@@ -30,12 +32,18 @@ WriteFileFn o_write = nullptr;
 constexpr uint64_t kMaxFileBytes = 1u << 20;
 
 struct Tracked {
-    std::wstring path;
+    std::wstring path;          // lower-cased final path (GetFinalPathNameByHandleW)
+    DWORD volume = 0;
+    uint64_t index = 0;         // volume serial + file index: the file's identity
     bool read = false, write = false;
 };
 struct Patched { // per file: what we changed, to put back in the game's own writes
     std::string original, ours; // value text, same length
     std::string key;
+    Unit unit = Unit::Fraction;
+    double original_value = 0;  // the game's value, its unit
+    double ours_value = 0;
+    bool async_logged = false;
 };
 
 std::mutex g_m;
@@ -44,17 +52,27 @@ std::wstring g_log;
 std::map<HANDLE, Tracked> g_handles;
 std::map<std::wstring, Patched> g_patched; // lower-cased path
 ReadHookStats g_stats;
-// Live switching: the tagged value the game parsed, in its unit, and where copies were found.
+// Live switching: the marked value the game parsed, in its unit, and the candidates found.
+struct Candidate {
+    uintptr_t addr = 0;
+    bool is_double = false;
+    unsigned char last[8] = {};   // the bytes we expect there (marker, then what we wrote)
+    unsigned char before[8] = {}; // what was there before we tried it (put back on failure)
+    bool written = false;
+};
 struct Live {
     bool have_tag = false;
     Unit unit = Unit::Fraction;
     double tag = 0;
-    bool scanned = false;
-    std::vector<uintptr_t> floats, doubles;
-    float last_f = 0;
-    double last_d = 0;
+    uint32_t generation = 0;     // bumped on each marked read; a scan publishes only if current
+    bool scanned = false, scanning = false;
+    std::vector<Candidate> cand;
+    int trying = -1, control = -1;
+    std::vector<double> values_written; // every value we wrote (its unit): restored in saves
+    double pending = 0;           // latest requested fraction (0 = none)
     LiveStats stats;
 } g_live;
+HANDLE g_scan_done = nullptr;     // manual-reset event: set while no scan runs
 bool g_installed = false;
 thread_local int t_inside = 0; // our own file work (the log) is not observed
 // Lock-free fast path: ReadFile/WriteFile run for every file the game touches, so untracked
@@ -115,6 +133,32 @@ void log_line(const char* text)
     --t_inside;
 }
 
+bool identity(HANDLE h, DWORD* vol, uint64_t* idx)
+{
+    BY_HANDLE_FILE_INFORMATION fi{};
+    if (!GetFileInformationByHandle(h, &fi)) return false;
+    *vol = fi.dwVolumeSerialNumber;
+    *idx = (static_cast<uint64_t>(fi.nFileIndexHigh) << 32) | fi.nFileIndexLow;
+    return true;
+}
+std::wstring final_path(HANDLE h, const std::wstring& fallback)
+{
+    wchar_t buf[MAX_PATH * 2] = {};
+    const DWORD n = GetFinalPathNameByHandleW(h, buf, MAX_PATH * 2, FILE_NAME_NORMALIZED);
+    if (!n || n >= MAX_PATH * 2) return lower(fallback);
+    std::wstring fin = lower(buf);
+    if (fin.rfind(L"\\\\?\\", 0) == 0) fin = fin.substr(4);
+    return fin;
+}
+// The tracked entry still names the same file: handle values are reused after CloseHandle, and
+// a same-named file in another folder is a different file (Astra 2026-11-01).
+bool still_same(HANDLE h, const Tracked& t)
+{
+    DWORD v = 0;
+    uint64_t i = 0;
+    return identity(h, &v, &i) && v == t.volume && i == t.index;
+}
+
 void on_open(HANDLE h, std::wstring path, DWORD access)
 {
     if (h == INVALID_HANDLE_VALUE || t_inside || !candidate(path)) return;
@@ -127,8 +171,13 @@ void on_open(HANDLE h, std::wstring path, DWORD access)
         if (!GetFileSizeEx(h, &sz) || static_cast<uint64_t>(sz.QuadPart) > kMaxFileBytes) return;
         ++g_stats.files_opened;
     }
+    Tracked t;
+    if (!identity(h, &t.volume, &t.index)) return;
+    t.path = final_path(h, path);
+    t.read = rd;
+    t.write = wr;
     if (g_handles.size() > 256) g_handles.clear(); // bounded: stale entries only
-    g_handles[h] = Tracked{lower(std::move(path)), rd, wr};
+    g_handles[h] = std::move(t);
     track_slot(h);
 }
 
@@ -150,18 +199,6 @@ HANDLE WINAPI create_a(LPCSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIB
     return h;
 }
 
-// The tracked entry still names the same file (handle values are reused after CloseHandle).
-bool still_same(HANDLE h, const std::wstring& path)
-{
-    wchar_t buf[MAX_PATH * 2] = {};
-    const DWORD n = GetFinalPathNameByHandleW(h, buf, MAX_PATH * 2, FILE_NAME_NORMALIZED);
-    if (!n || n >= MAX_PATH * 2) return false;
-    std::wstring fin = lower(buf);
-    if (fin.rfind(L"\\\\?\\", 0) == 0) fin = fin.substr(4);
-    const size_t a = fin.find_last_of(L"\\/"), b = path.find_last_of(L"\\/");
-    return fin.substr(a == std::wstring::npos ? 0 : a + 1) == path.substr(b == std::wstring::npos ? 0 : b + 1);
-}
-
 BOOL WINAPI read_file(HANDLE h, LPVOID buf, DWORD n, LPDWORD got, LPOVERLAPPED ov)
 {
     const BOOL ok = o_read(h, buf, n, got, ov);
@@ -170,37 +207,59 @@ BOOL WINAPI read_file(HANDLE h, LPVOID buf, DWORD n, LPDWORD got, LPOVERLAPPED o
     if (!(g_fraction > 0) || g_handles.empty()) return ok;
     const auto it = g_handles.find(h);
     if (it == g_handles.end() || !it->second.read) return ok;
-    if (!still_same(h, it->second.path)) { g_handles.erase(it); return ok; }
+    if (!still_same(h, it->second)) { g_handles.erase(it); return ok; }
     char* d = static_cast<char*>(buf);
-    Match m;
-    if (!FindRenderScale(d, *got, &m)) return ok;
-    const std::string original(d + m.value_pos, m.value_len);
-    const int k = PatchRenderScale(d, *got, g_fraction, &m, /*tag=*/true);
+    PatchInfo info;
+    const int k = PatchRenderScale(d, *got, g_fraction, &info, /*tag=*/true);
+    if (k == 0 && !info.m.key[0]) return ok; // no render-scale key in these bytes
     char line[600];
+    const std::string file = utf8(it->second.path);
     if (k > 0) {
+        const Match& m = info.m; // the first entry actually rewritten
         ++g_stats.reads_patched;
         g_stats.original = m.current;
         std::snprintf(g_stats.key, sizeof g_stats.key, "%s", m.key);
-        const std::string file = utf8(it->second.path);
         std::snprintf(g_stats.file, sizeof g_stats.file, "%s", file.c_str());
         Patched& p = g_patched[it->second.path];
-        p.original = original;
-        p.ours.assign(d + m.value_pos, m.value_len);
+        p.original = info.original;
+        p.ours = info.written;
         p.key = m.key;
-        g_live.have_tag = true;
+        p.unit = m.unit;
+        p.original_value = m.current;
+        p.ours_value = std::atof(info.written);
+        // Live discovery only from a marker that really is in the bytes and survives float
+        // conversion; startup substitution works either way.
+        g_live.have_tag = info.tagged;
         g_live.unit = m.unit;
-        g_live.tag = std::atof(p.ours.c_str());
-        g_live.stats.tag = g_live.tag;
+        g_live.tag = info.tagged ? p.ours_value : 0;
+        ++g_live.generation;
         g_live.scanned = false;
-        std::snprintf(g_stats.note, sizeof g_stats.note, "%s %s -> %s (%d value%s)", m.key, original.c_str(), p.ours.c_str(), k, k == 1 ? "" : "s");
+        g_live.cand.clear();
+        g_live.trying = g_live.control = -1;
+        g_live.stats.tagged = info.tagged;
+        g_live.stats.tag = g_live.tag;
+        g_live.stats.generation = g_live.generation;
+        std::snprintf(g_stats.note, sizeof g_stats.note, "%s %s -> %s (%d value%s, %s)", m.key, info.original, info.written, k,
+                      k == 1 ? "" : "s", info.tagged ? "marked for live switching" : "too short to mark: no live switching");
         std::snprintf(line, sizeof line, "patched read of %s: %s", file.c_str(), g_stats.note);
     } else {
         ++g_stats.reads_unpatched;
-        std::snprintf(g_stats.note, sizeof g_stats.note, "%s = %s found, but %.4f does not fit its width", m.key, original.c_str(), g_fraction);
-        std::snprintf(line, sizeof line, "not patched (%s): %s", utf8(it->second.path).c_str(), g_stats.note);
+        std::snprintf(g_stats.note, sizeof g_stats.note, "%s = %.6g found, but %.4f does not fit its width", info.m.key, info.m.current, g_fraction);
+        std::snprintf(line, sizeof line, "not patched (%s): %s", file.c_str(), g_stats.note);
     }
     log_line(line);
     return ok;
+}
+
+// A value in the game's save is one we put there: the substituted text, or (any formatting)
+// the substituted value or a live value we wrote.
+bool ours_value(const Patched& p, const std::string& text, double v)
+{
+    if (text == p.ours) return true;
+    const auto near = [&](double a) { return std::fabs(v - a) <= 1e-5 * (std::max)(1.0, std::fabs(a)); };
+    if (near(p.ours_value)) return true;
+    for (double w : g_live.values_written) if (near(w)) return true;
+    return false;
 }
 
 BOOL WINAPI write_file(HANDLE h, LPCVOID buf, DWORD n, LPDWORD done, LPOVERLAPPED ov)
@@ -210,28 +269,55 @@ BOOL WINAPI write_file(HANDLE h, LPCVOID buf, DWORD n, LPDWORD done, LPOVERLAPPE
     {
         std::lock_guard<std::mutex> lk(g_m);
         const auto it = g_handles.find(h);
-        if (it != g_handles.end() && it->second.write) {
+        if (it != g_handles.end() && it->second.write && still_same(h, it->second)) {
             const auto p = g_patched.find(it->second.path);
-            if (p != g_patched.end()) {
-                // Put the game's original value back where it writes exactly our value.
+            if (p != g_patched.end() && ov) {
+                // Asynchronous save: the bytes must stay valid until completion, which a temporary
+                // here would not. Forwarded untouched (Astra 2026-11-01); logged once.
+                if (!p->second.async_logged) {
+                    p->second.async_logged = true;
+                    char line[400];
+                    std::snprintf(line, sizeof line, "game saved %s asynchronously: not restored (the saved value may be ours)",
+                                  utf8(it->second.path).c_str());
+                    log_line(line);
+                }
+            } else if (p != g_patched.end()) {
                 fixed.assign(static_cast<const char*>(buf), n);
+                const Patched& pp = p->second;
                 Match m;
-                bool changed = false;
+                int restored = 0, failed = 0;
                 for (size_t from = 0; FindRenderScale(fixed.data(), fixed.size(), &m, from); from = m.value_pos + m.value_len) {
-                    if (m.value_len == p->second.ours.size() && fixed.compare(m.value_pos, m.value_len, p->second.ours) == 0) {
-                        fixed.replace(m.value_pos, m.value_len, p->second.original);
-                        changed = true;
+                    const std::string text = fixed.substr(m.value_pos, m.value_len);
+                    if (!ours_value(pp, text, m.current)) continue; // the user's own value: saved as it is
+                    if (m.value_len == pp.original.size()) {
+                        fixed.replace(m.value_pos, m.value_len, pp.original);
+                        ++restored;
+                        continue;
+                    }
+                    char v[16] = {};
+                    const double frac = pp.unit == Unit::Percent ? pp.original_value / 100.0 : pp.original_value;
+                    Match mm = m;
+                    mm.unit = pp.unit;
+                    if (FormatSameWidth(frac, mm, v) && std::fabs(std::atof(v) - pp.original_value) <= 1e-6 * (std::max)(1.0, pp.original_value)) {
+                        fixed.replace(m.value_pos, m.value_len, v);
+                        ++restored;
+                    } else {
+                        ++failed;
                     }
                 }
-                if (changed) {
+                char line[400];
+                if (restored) {
                     ++g_stats.writes_restored;
-                    char line[400];
-                    std::snprintf(line, sizeof line, "game saved %s: kept the original %s = %s", utf8(it->second.path).c_str(),
-                                  p->second.key.c_str(), p->second.original.c_str());
+                    std::snprintf(line, sizeof line, "game saved %s: kept the original %s = %s", utf8(it->second.path).c_str(), pp.key.c_str(),
+                                  pp.original.c_str());
                     log_line(line);
-                } else {
-                    fixed.clear();
                 }
+                if (failed) {
+                    std::snprintf(line, sizeof line, "game saved %s: our %s value could not be put back in its width (%d)",
+                                  utf8(it->second.path).c_str(), pp.key.c_str(), failed);
+                    log_line(line);
+                }
+                if (!restored) fixed.clear();
             }
         }
     }
@@ -294,115 +380,289 @@ bool InstallSettingsReadHook()
 }
 
 namespace {
-// Committed, writable, readable regions of this process outside our own module and buffers.
-template <class F> uint64_t for_each_region(const void* skip_a, size_t skip_n, F&& f)
+constexpr size_t kMaxCandidates = 8; // more than this: ambiguous, nothing is tried
+
+struct ScanOut {
+    std::vector<Candidate> cand;
+    uint32_t floats = 0, doubles = 0, regions = 0, writable = 0, stacks = 0;
+    uint64_t bytes = 0;
+};
+
+// Committed, writable regions of this process, outside our own module, our scan buffer and
+// every thread's stack (an allocation holding a guard page is a stack: other threads' locals
+// and spills hold the marker transiently and are never a setting's home).
+void scan_memory(double v, ScanOut& o)
 {
     HMODULE self = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        reinterpret_cast<LPCWSTR>(&g_live), &self);
-    uint64_t scanned = 0;
-    uint32_t regions = 0, writable = 0;
+    struct Region { uintptr_t base; size_t size; void* alloc; };
+    std::vector<Region> list;
+    std::vector<void*> stacks;
     MEMORY_BASIC_INFORMATION mi{};
     for (uintptr_t a = 0x10000; VirtualQuery(reinterpret_cast<void*>(a), &mi, sizeof mi) == sizeof mi;) {
         const uintptr_t base = reinterpret_cast<uintptr_t>(mi.BaseAddress), next = base + mi.RegionSize;
         if (next <= a) break;
         a = next;
-        ++regions;
-        if (mi.State != MEM_COMMIT || (mi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) continue;
+        ++o.regions;
+        if (mi.State != MEM_COMMIT) continue;
+        if (mi.Protect & PAGE_GUARD) { stacks.push_back(mi.AllocationBase); continue; }
+        if (mi.Protect & PAGE_NOACCESS) continue;
         if (!(mi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE))) continue;
-        ++writable;
+        ++o.writable;
         if (self && mi.AllocationBase == self) continue;
-        const uintptr_t sa = reinterpret_cast<uintptr_t>(skip_a);
-        if (sa >= base && sa < next && skip_n) continue;
-        if (mi.RegionSize > (2ull << 30)) continue;          // one huge region: not a settings value's home
-        if (scanned + mi.RegionSize > (16ull << 30)) break;  // bounded in total
-        scanned += mi.RegionSize;
-        f(base, static_cast<size_t>(mi.RegionSize));
+        if (mi.RegionSize > (2ull << 30)) continue; // one huge region: not a settings value's home
+        list.push_back({base, static_cast<size_t>(mi.RegionSize), mi.AllocationBase});
     }
-    g_live.stats.regions = regions;
-    g_live.stats.writable_regions = writable;
-    return scanned;
-}
-void scan_locked()
-{
-    g_live.floats.clear();
-    g_live.doubles.clear();
-    const double v = g_live.tag;
+    o.stacks = static_cast<uint32_t>(stacks.size());
     const float fv = static_cast<float>(v);
-    ULONG_PTR stack_lo = 0, stack_hi = 0; // this thread's own locals hold the tag too
-    GetCurrentThreadStackLimits(&stack_lo, &stack_hi);
-    const auto ours = [&](uintptr_t addr) { return addr >= stack_lo && addr < stack_hi; };
     constexpr size_t kChunk = 1u << 20;
     auto* buf = static_cast<unsigned char*>(VirtualAlloc(nullptr, kChunk, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
     if (!buf) return;
-    const uint64_t bytes = for_each_region(buf, kChunk, [&](uintptr_t base, size_t size) {
-        for (size_t off = 0; off < size; off += kChunk) {
-            const size_t n = (std::min)(kChunk, size - off);
+    bool full = false;
+    for (const Region& r : list) {
+        if (full) break;
+        if (std::find(stacks.begin(), stacks.end(), r.alloc) != stacks.end()) continue;
+        if (o.bytes + r.size > (16ull << 30)) break; // bounded in total
+        o.bytes += r.size;
+        for (size_t off = 0; off < r.size && !full; off += kChunk) {
+            const size_t n = (std::min)(kChunk, r.size - off);
             SIZE_T got = 0;
-            if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(base + off), buf, n, &got) || got < 8) continue;
-            for (size_t i = 0; i + 8 <= got; i += 4) {
+            if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(r.base + off), buf, n, &got) || got < 4) continue;
+            for (size_t i = 0; i + 4 <= got; i += 4) {
+                Candidate c;
+                c.addr = r.base + off + i;
                 float f;
                 std::memcpy(&f, buf + i, 4);
-                if (f == fv && !ours(base + off + i) && g_live.floats.size() < 16) g_live.floats.push_back(base + off + i);
-                double dv;
-                std::memcpy(&dv, buf + i, 8);
-                if (dv == v && !ours(base + off + i) && g_live.doubles.size() < 16) g_live.doubles.push_back(base + off + i);
+                if (f == fv) {
+                    ++o.floats;
+                    std::memcpy(c.last, &f, 4);
+                    o.cand.push_back(c);
+                }
+                if (i + 8 <= got) {
+                    double dv;
+                    std::memcpy(&dv, buf + i, 8);
+                    if (dv == v) {
+                        ++o.doubles;
+                        c.is_double = true;
+                        std::memcpy(c.last, &dv, 8);
+                        o.cand.push_back(c);
+                    }
+                }
+                if (o.cand.size() > kMaxCandidates) { full = true; break; }
             }
         }
-    });
+    }
     VirtualFree(buf, 0, MEM_RELEASE);
-    g_live.scanned = true;
-    g_live.last_f = fv;
-    g_live.last_d = v;
-    g_live.stats.float_hits = static_cast<uint32_t>(g_live.floats.size());
-    g_live.stats.double_hits = static_cast<uint32_t>(g_live.doubles.size());
-    g_live.stats.scanned_mb = bytes >> 20;
-    g_live.stats.scanned_kb = bytes >> 10;
+}
+
+size_t width(const Candidate& c) { return c.is_double ? 8 : 4; }
+bool holds(const Candidate& c, const unsigned char* expect)
+{
+    unsigned char cur[8] = {};
+    SIZE_T got = 0;
+    return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(c.addr), cur, width(c), &got) && got == width(c) &&
+           std::memcmp(cur, expect, width(c)) == 0;
+}
+bool store(Candidate& c, const unsigned char* bytes)
+{
+    SIZE_T put = 0;
+    if (!WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(c.addr), bytes, width(c), &put) || put != width(c)) return false;
+    std::memcpy(c.last, bytes, width(c));
+    return true;
+}
+void encode(const Candidate& c, double v, unsigned char* out)
+{
+    if (c.is_double) std::memcpy(out, &v, 8);
+    else { const float f = static_cast<float>(v); std::memcpy(out, &f, 4); }
+}
+
+LiveResult set_result(LiveResult r, const char* fmt, ...)
+{
+    g_live.stats.result = r;
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(g_live.stats.note, sizeof g_live.stats.note, fmt, ap);
+    va_end(ap);
+    char line[300];
+    std::snprintf(line, sizeof line, "live switch %s: %s", LiveResultName(r), g_live.stats.note);
+    log_line(line);
+    return r;
+}
+
+void remember(double v) // values we wrote, restored in the game's saves (bounded)
+{
+    auto& w = g_live.values_written;
+    if (std::find(w.begin(), w.end(), v) != w.end()) return;
+    if (w.size() >= 32) w.erase(w.begin());
+    w.push_back(v);
+}
+
+// g_m held. Writes the pending request to the confirmed control, or to the next untried candidate.
+LiveResult apply_locked()
+{
+    auto& L = g_live;
+    const double fraction = L.pending;
+    if (!(fraction > 0)) return L.stats.result;
+    const double nv = L.unit == Unit::Percent ? fraction * 100.0 : fraction;
+    L.stats.requested = nv;
+    if (L.cand.empty()) return set_result(LiveResult::NotFound, "the marked value %.6f was not found in memory", L.tag);
+    if (L.cand.size() > kMaxCandidates)
+        return set_result(LiveResult::Ambiguous, "more than %zu copies of the marked value: nothing written", kMaxCandidates);
+    unsigned char bytes[8] = {};
+    if (L.control >= 0) {
+        Candidate& c = L.cand[static_cast<size_t>(L.control)];
+        if (!holds(c, c.last)) return set_result(LiveResult::NoLongerOurs, "the control no longer holds our last value: left alone");
+        encode(c, nv, bytes);
+        if (!store(c, bytes)) return set_result(LiveResult::NoLongerOurs, "the control could not be written");
+        ++L.stats.writes;
+        remember(nv);
+        L.pending = 0;
+        return set_result(LiveResult::Applied, "wrote %.6f to the control (%s at %p); J2 confirms the extent", nv,
+                          c.is_double ? "double" : "float", reinterpret_cast<void*>(c.addr));
+    }
+    // Untried candidate, one at a time. A candidate already written and still being tried is rewritten.
+    for (int i = L.trying < 0 ? 0 : L.trying; i < static_cast<int>(L.cand.size()); ++i) {
+        Candidate& c = L.cand[static_cast<size_t>(i)];
+        if (!c.written && !holds(c, c.last)) continue; // reused for something else since the scan: skip
+        if (c.written && !holds(c, c.last)) continue;
+        if (!c.written) std::memcpy(c.before, c.last, sizeof c.before);
+        encode(c, nv, bytes);
+        if (!store(c, bytes)) continue;
+        c.written = true;
+        L.trying = i;
+        ++L.stats.writes;
+        remember(nv);
+        L.stats.trying = i;
+        L.pending = 0;
+        return set_result(LiveResult::Trying, "trying candidate %d of %zu (%s at %p) = %.6f; waiting for J2's extent", i + 1, L.cand.size(),
+                          c.is_double ? "double" : "float", reinterpret_cast<void*>(c.addr), nv);
+    }
+    L.trying = static_cast<int>(L.cand.size()); // stays exhausted until the next marked read
+    L.stats.trying = -1;
+    return set_result(LiveResult::Exhausted, "none of the %zu candidates changed the picture: applies on next launch", L.cand.size());
+}
+
+DWORD WINAPI scan_thread(void*)
+{
+    for (;;) {
+        double tag = 0;
+        uint32_t gen = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_m);
+            tag = g_live.tag;
+            gen = g_live.generation;
+        }
+        const ULONGLONG t0 = GetTickCount64();
+        ScanOut o;
+        scan_memory(tag, o); // outside g_m: the file hooks keep running meanwhile
+        const ULONGLONG ms = GetTickCount64() - t0;
+        std::lock_guard<std::mutex> lk(g_m);
+        auto& L = g_live;
+        if (gen != L.generation && L.have_tag) continue; // a newer marked read: scan again for it
+        if (gen != L.generation) { // a newer read carried no marker: nothing to publish
+            L.scanning = false;
+            L.cand.clear();
+            SetEvent(g_scan_done);
+            return 0;
+        }
+        L.cand = std::move(o.cand);
+        L.scanned = true;
+        L.scanning = false;
+        L.trying = L.control = -1;
+        L.stats.float_hits = o.floats;
+        L.stats.double_hits = o.doubles;
+        L.stats.candidates = static_cast<uint32_t>(L.cand.size());
+        L.stats.scanned_kb = o.bytes >> 10;
+        L.stats.scan_ms = ms;
+        L.stats.regions = o.regions;
+        L.stats.writable_regions = o.writable;
+        L.stats.stack_allocations_skipped = o.stacks;
+        char line[300];
+        std::snprintf(line, sizeof line, "scan for %.6f: %llu KB in %llu ms, %u float + %u double candidate%s, %u stacks skipped", tag,
+                      (unsigned long long)L.stats.scanned_kb, (unsigned long long)ms, o.floats, o.doubles,
+                      L.cand.size() == 1 ? "" : "s", o.stacks);
+        log_line(line);
+        apply_locked();
+        SetEvent(g_scan_done);
+        return 0;
+    }
 }
 } // namespace
 
-int SetLiveFraction(double fraction)
+const char* LiveResultName(LiveResult r)
+{
+    switch (r) {
+    case LiveResult::Off: return "off";
+    case LiveResult::NoTag: return "no-marker";
+    case LiveResult::Scanning: return "scanning";
+    case LiveResult::NotFound: return "not-found";
+    case LiveResult::Ambiguous: return "ambiguous";
+    case LiveResult::Trying: return "trying";
+    case LiveResult::Applied: return "applied";
+    case LiveResult::NoLongerOurs: return "no-longer-ours";
+    case LiveResult::Exhausted: return "exhausted";
+    }
+    return "?";
+}
+
+LiveResult SetLiveFraction(double fraction)
 {
     std::lock_guard<std::mutex> lk(g_m);
     auto& L = g_live;
-    if (!L.have_tag || !(fraction > 0) || fraction > 2.0) {
-        std::snprintf(L.stats.note, sizeof L.stats.note, "No tagged render-scale value was read at start-up.");
-        return 0;
+    if (!(fraction > 0) || fraction > 2.0) return set_result(LiveResult::Off, "requested %.4f is out of range", fraction);
+    if (!L.have_tag) return set_result(LiveResult::NoTag, "no marked render-scale value was read at start-up");
+    L.pending = fraction;
+    if (L.scanned) return apply_locked();
+    if (!L.scanning) {
+        if (!g_scan_done) g_scan_done = CreateEventW(nullptr, TRUE, TRUE, nullptr);
+        if (!g_scan_done) return set_result(LiveResult::NotFound, "could not start the scan");
+        ResetEvent(g_scan_done);
+        const HANDLE t = CreateThread(nullptr, 0, &scan_thread, nullptr, 0, nullptr);
+        if (!t) { SetEvent(g_scan_done); return set_result(LiveResult::NotFound, "could not start the scan thread"); }
+        CloseHandle(t);
+        L.scanning = true;
     }
-    if (!L.scanned) scan_locked();
-    const size_t hits = L.floats.size() + L.doubles.size();
-    char line[300];
-    if (hits == 0 || hits > 8) {
-        std::snprintf(L.stats.note, sizeof L.stats.note, hits ? "%zu copies of the tagged value: ambiguous, nothing written."
-                                                              : "The tagged value was not found in memory (%zu).", hits);
-        std::snprintf(line, sizeof line, "live switch unavailable: %s (scanned %llu MB)", L.stats.note, (unsigned long long)L.stats.scanned_mb);
-        log_line(line);
-        return 0;
+    L.stats.result = LiveResult::Scanning;
+    std::snprintf(L.stats.note, sizeof L.stats.note, "scanning for the marked value; %.4f is applied when it ends", fraction);
+    return LiveResult::Scanning;
+}
+
+void ReportLiveOutcome(bool extent_changed)
+{
+    std::lock_guard<std::mutex> lk(g_m);
+    auto& L = g_live;
+    if (L.control >= 0 || L.trying < 0 || L.trying >= static_cast<int>(L.cand.size())) return;
+    Candidate& c = L.cand[static_cast<size_t>(L.trying)];
+    if (extent_changed) {
+        L.control = L.trying;
+        L.stats.control = L.control;
+        L.stats.trying = -1;
+        L.trying = -1;
+        set_result(LiveResult::Applied, "candidate %d is the control (%s at %p)", L.control + 1, c.is_double ? "double" : "float",
+                   reinterpret_cast<void*>(c.addr));
+        return;
     }
-    const double nv = L.unit == Unit::Percent ? fraction * 100.0 : fraction;
-    const float nf = static_cast<float>(nv);
-    int written = 0;
-    auto put = [&](std::vector<uintptr_t>& v, const void* expect, const void* val, size_t n) {
-        for (size_t i = 0; i < v.size();) {
-            unsigned char cur[8] = {};
-            SIZE_T got = 0;
-            if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(v[i]), cur, n, &got) || got != n ||
-                std::memcmp(cur, expect, n) != 0) { v.erase(v.begin() + static_cast<std::ptrdiff_t>(i)); continue; } // no longer ours
-            SIZE_T put_n = 0;
-            if (WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(v[i]), val, n, &put_n) && put_n == n) ++written;
-            ++i;
-        }
-    };
-    put(L.floats, &L.last_f, &nf, 4);
-    put(L.doubles, &L.last_d, &nv, 8);
-    L.last_f = nf;
-    L.last_d = nv;
-    L.stats.writes += static_cast<uint32_t>(written);
-    std::snprintf(L.stats.note, sizeof L.stats.note, "wrote %.4f to %d cop%s (float %zu, double %zu)", nv, written, written == 1 ? "y" : "ies",
-                  L.floats.size(), L.doubles.size());
-    std::snprintf(line, sizeof line, "live switch: %s", L.stats.note);
+    // Did not move the picture: put it back exactly as it was, if it still holds what we wrote.
+    if (holds(c, c.last) && store(c, c.before)) ++L.stats.restores;
+    c.written = false;
+    const int next = L.trying + 1;
+    L.trying = next < static_cast<int>(L.cand.size()) ? next : static_cast<int>(L.cand.size());
+    L.stats.trying = -1;
+    char line[200];
+    std::snprintf(line, sizeof line, "live switch: candidate %d did not change the picture; put back", next);
     log_line(line);
-    return written;
+}
+
+bool WaitLiveScan(uint32_t timeout_ms)
+{
+    HANDLE e = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_m);
+        if (!g_live.scanning) return true;
+        e = g_scan_done;
+    }
+    return e && WaitForSingleObject(e, timeout_ms) == WAIT_OBJECT_0;
 }
 
 LiveStats GetLiveStats()
