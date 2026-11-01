@@ -55,7 +55,7 @@ public:
     bool Record(ID3D12GraphicsCommandList* list, ID3D12Resource* color, DXGI_FORMAT color_format, bool reset, uint32_t slot);
 
     ID3D12Resource* Output() const { return out_.res.Get(); }  // R16G16_SINT, COMMON after Record
-    ID3D12Resource* SceneChange() const { return scd_out_.Get(); } // R32_UINT 3x1, UNORDERED_ACCESS
+    ID3D12Resource* SceneChange() const { return scd_out_.res.Get(); } // R32_UINT 3x1, UNORDERED_ACCESS
     uint32_t OutWidth() const { return out_w_; }
     uint32_t OutHeight() const { return out_h_; }
     uint32_t Width() const { return w_; }
@@ -69,7 +69,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         uint32_t w = 0, h = 0;
     };
-    struct Pass {
+    struct Pipeline { // one per na::ffx_flow::Pass
         Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
         Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
     };
@@ -94,7 +94,7 @@ private:
     D3D12_GPU_DESCRIPTOR_HANDLE gpu(uint32_t index) const;
 
     Microsoft::WRL::ComPtr<ID3D12Device> device_;
-    Pass passes_[7];
+    Pipeline passes_[7];
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap_, clear_heap_; // shader-visible; CPU-only copy for clears
     UINT stride_ = 0;
     uint32_t slots_ = 0, slot_ = 0, cursor_ = 0, clears_ = 0; // next dispatch table / clear view within the slot

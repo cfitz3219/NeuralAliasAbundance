@@ -34,7 +34,11 @@ constexpr uint32_t kCostMax = 160;     // engine cost above this rejects the blo
 // between the engine and camera+jitter on still scenery, not objects. The half-size
 // engine cannot resolve the DLAA jitter shift (<= 1 px between frames); moving ships
 // and people move several pixels per frame.
-constexpr float kSnapPx = 1.0f;
+// fda517d Anno run (Cort): with the 1 px snap AND the temporal test, 88-99 % of the picture was
+// "small" and 0.00 % accepted: at ~100 fps most real movement in Anno is under 1 px per frame.
+// The temporal direction test now carries the flicker rejection, so the snap drops to 0.5 px
+// (above the engine's ~0.5 px flat-area fill, which the texture gate also removes).
+constexpr float kSnapPx = 0.5f;
 constexpr float kImageAbs = 0.08f;     // the flow must explain the image (mean luma error, 3x3 encoded texels)
 constexpr float kImageMargin = 0.02f;  // and never clearly worse than the camera alone (flat areas: both explain it)
 // Minimum local contrast (3x3 encoded luma, max - min) for a residual to count. On flat

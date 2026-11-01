@@ -246,10 +246,10 @@ bool Flow::Record(ID3D12GraphicsCommandList* list, ID3D12Resource* color, DXGI_F
     ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
     list->SetDescriptorHeaps(1, heaps);
 
-    const bool clear = reset || first_;
+    const bool do_clear = reset || first_;
     first_ = false;
-    frame_index_ = clear ? 0 : frame_index_ + 1;
-    if (clear) {
+    frame_index_ = do_clear ? 0 : frame_index_ + 1;
+    if (do_clear) {
         ++stats_.resets;
         clear(list, scd_temp_);
         clear(list, scd_out_);
