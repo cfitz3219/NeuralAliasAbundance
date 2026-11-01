@@ -31,6 +31,9 @@ in COMMS before edits, as P4-4 says.
 - **No-profile guidance (non-technical users):** the overlay shows live, in plain words, the mode
   the detected size maps to ("Now: DLSS Quality", from QualityForScale), a hint at 100% to lower
   the game's Resolution Scale, and a warning when very low. No percentages to know.
+  This lives in a small non-interactive corner badge (like an FPS counter) shown while our menu is
+  closed, so the user can move the game's own slider with the mouse ("Help me set it up" toggle;
+  the badge fades a few seconds after reaching the chosen mode). Overlay = Astra's file.
 
 History: rev 1 (corner/subrect), rev 2 (creation-time shrink), rev 3 (game's FSR as the Anno pilot)
 and rev 4 (no game scaler at all) are superseded; see COMMS a285862 to 8ed6614.
