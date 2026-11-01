@@ -15,6 +15,7 @@
 #include "host_dx12/observe/producers.hpp"
 
 #include <array>
+#include <memory>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -400,6 +401,83 @@ int main()
         CHECK(st.out_w == W && st.out_h == H && st.upscaled_frames == up0 + 3);
         CHECK(fake::U(fake::last_create, NVSDK_NGX_Parameter_OutWidth) == W);
         na::j2::SetUpscaleTarget({});
+
+        // P4-4 Layer2 physical-input override (Astra's no-slider route). J2 evaluates private
+        // companions (not observed, states supplied) into the snapshot's full-size output; the
+        // logical ids stay the identity. Provided / Unavailable / Failed each get one outcome.
+        {
+            auto pc = test::CreateTexture(dev, W, H, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_NONE);
+            auto pd = test::CreateTexture(dev, W, H, DXGI_FORMAT_R32G8X24_TYPELESS, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+            REQUIRE(pc && pd);
+            struct Ctx {
+                int mode = 0; // 0 provide, 1 unavailable, 2 provide with the wrong logical id
+                std::shared_ptr<na::j2::PhysicalInput> payload;
+                int outcomes = 0;
+                uint64_t last_gen = 0;
+                na::j2::PhysicalOutcome last = na::j2::PhysicalOutcome::Failed;
+                uint64_t seen_color = 0, seen_depth = 0;
+            } ctx;
+            ctx.payload = std::make_shared<na::j2::PhysicalInput>();
+            auto& pi = *ctx.payload;
+            pi.generation = 7;
+            pi.color = pc.Get();
+            pi.depth = pd.Get();
+            pi.color_state = pi.depth_state = pi.output_state = D3D12_RESOURCE_STATE_COMMON;
+            pi.render_w = 40;
+            pi.render_h = 20;
+            pi.output = dest.Get();
+            pi.owner = std::shared_ptr<void>(pc.Get(), [](void*) {}); // the test owns pc/pd/dest
+            na::j2::PhysicalInputProvider prov;
+            prov.ctx = &ctx;
+            prov.lookup = [](void* c, uint64_t lc, uint64_t ld, ID3D12GraphicsCommandList*, std::shared_ptr<const na::j2::PhysicalInput>* out) {
+                auto& x = *static_cast<Ctx*>(c);
+                x.seen_color = lc;
+                x.seen_depth = ld;
+                if (x.mode == 1) return na::j2::PhysicalLookup::Unavailable;
+                x.payload->logical_color = x.mode == 2 ? lc + 1 : lc;
+                x.payload->logical_depth = ld;
+                *out = x.payload;
+                return na::j2::PhysicalLookup::Provided;
+            };
+            prov.outcome = [](void* c, uint64_t gen, na::j2::PhysicalOutcome r, const char*) {
+                auto& x = *static_cast<Ctx*>(c);
+                ++x.outcomes;
+                x.last_gen = gen;
+                x.last = r;
+            };
+            na::j2::SetPhysicalInputProvider(prov);
+            const auto st0 = na::j2::GetStats();
+            int ev2 = fake::evals;
+            na::j2::OnPresent(d.queue.Get());
+            frame(504);
+            st = na::j2::GetStats();
+            std::printf("physical: evaluated %llu, %ux%u -> %ux%u, outcomes %d, reason \"%s\"\n", (unsigned long long)st.physical_evaluated,
+                        st.render_w, st.render_h, st.out_w, st.out_h, ctx.outcomes, st.reason);
+            CHECK(ctx.seen_color == na::observe::IdOf(color.Get()) && ctx.seen_depth == na::observe::IdOf(depth.Get())); // logical identity
+            CHECK(fake::evals == ev2 + 1 && st.physical_evaluated == st0.physical_evaluated + 1);
+            CHECK(ctx.outcomes == 1 && ctx.last == na::j2::PhysicalOutcome::Evaluated && ctx.last_gen == 7);
+            CHECK(st.render_w == 40 && st.render_h == 20 && st.out_w == OW && st.out_h == OH);
+            const auto pcorner = ReadTexel(d, dest.Get(), OW - 1, OH - 1);
+            CHECK(pcorner[0] == 0.0f && pcorner[3] == 1.0f); // written into the snapshot's output
+            // Redirected but unavailable: nothing evaluated, the owner is told.
+            ctx.mode = 1;
+            ev2 = fake::evals;
+            na::j2::OnPresent(d.queue.Get());
+            frame(504.1);
+            st = na::j2::GetStats();
+            CHECK(fake::evals == ev2 && ctx.outcomes == 2 && ctx.last == na::j2::PhysicalOutcome::Unavailable);
+            CHECK(st.physical_unavailable == st0.physical_unavailable + 1);
+            // Provided but naming other logical ids: refused, reported Failed, never drawn as DLAA.
+            ctx.mode = 2;
+            ev2 = fake::evals;
+            na::j2::OnPresent(d.queue.Get());
+            frame(504.2);
+            st = na::j2::GetStats();
+            CHECK(fake::evals == ev2 && ctx.outcomes == 3 && ctx.last == na::j2::PhysicalOutcome::Failed);
+            CHECK(st.physical_failed == st0.physical_failed + 1);
+            na::j2::SetPhysicalInputProvider({});
+            d.WaitIdle();
+        }
         na::j2::SetDebugView(0);
         CHECK(na::j2::JitterPhasesFor(64, 64) == 8 && na::j2::JitterPhasesFor(10, 100) == 64);
         CHECK(std::fabs(na::j2::UpscaleMipBias(64, 64) + 1.0f) < 1e-6f && std::fabs(na::j2::UpscaleMipBias(50, 100) + 2.0f) < 1e-6f);

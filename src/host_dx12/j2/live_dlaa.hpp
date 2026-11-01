@@ -25,6 +25,7 @@
 #pragma once
 #include <d3d12.h>
 #include <cstdint>
+#include <memory>
 
 namespace na::j2 {
 
@@ -67,6 +68,47 @@ struct UpscaleTarget {
 };
 void SetUpscaleTarget(const UpscaleTarget& t);
 UpscaleTarget GetUpscaleTarget();
+// P4-4 no-slider route (Astra's Layer2, contract agreed on COMMS 2026-11-01): an optional
+// immutable logical -> physical snapshot. Discovery, the camera and every identity stay on the
+// LOGICAL scene colour/depth ids; J2 evaluates the provider's PHYSICAL (reduced) companions and
+// writes the full-size output. The provider's resources are private host-owned textures, not
+// discovery candidates, so their exact states travel in the payload; J2 restores exactly those
+// states after its use. The output is in the same payload (same generation), never paired with
+// the separately changing UpscaleTarget.
+struct PhysicalInput {
+    uint64_t logical_color = 0, logical_depth = 0; // must equal the frame's discovered ids
+    uint64_t generation = 0;                       // the recording's snapshot generation
+    ID3D12Resource* color = nullptr; uint32_t color_sub = 0, color_state = 0;
+    ID3D12Resource* depth = nullptr; uint32_t depth_sub = 0, depth_state = 0;
+    uint32_t render_w = 0, render_h = 0;            // active extent at the top left of color/depth
+    ID3D12Resource* output = nullptr; uint32_t output_sub = 0, output_state = 0; // full size
+    std::shared_ptr<void> owner; // keeps the raw resources alive; J2 retains the payload through
+                                 // every submission of the recording that uses it
+};
+enum class PhysicalLookup {
+    None,        // no override for this frame: today's logical path
+    Provided,    // use *out
+    Unavailable, // this recording was redirected but its replacement is not available: J2 does
+                 // NOT evaluate the stale logical picture; the owner repairs the frame
+};
+enum class PhysicalOutcome {
+    Evaluated,   // DLSS evaluated the physical inputs into the payload's output
+    Unavailable, // the provider reported Unavailable: nothing evaluated
+    Failed,      // provided, but J2 could not use it (validation, retention, DLSS): nothing usable
+                 // was written to the output; the owner promotes its own current-frame output
+};
+struct PhysicalInputProvider {
+    // Called on J2's recording thread with the frame's logical ids and the game list being
+    // recorded (null on the between-lists route).
+    PhysicalLookup (*lookup)(void* ctx, uint64_t logical_color, uint64_t logical_depth,
+                             ID3D12GraphicsCommandList* game_list, std::shared_ptr<const PhysicalInput>* out) = nullptr;
+    // Every Provided / Unavailable lookup gets exactly one outcome, before J2's record returns.
+    void (*outcome)(void* ctx, uint64_t generation, PhysicalOutcome result, const char* reason) = nullptr;
+    void* ctx = nullptr;
+};
+// Null lookup = no provider (default). Not changed while a frame records.
+void SetPhysicalInputProvider(const PhysicalInputProvider& p);
+
 // Jitter phases for a render -> output ratio (8 for DLAA, 8 x ratio^2 upscaling, max 64).
 uint32_t JitterPhasesFor(uint32_t render_w, uint32_t out_w);
 // Texture mip bias for upscaling: log2(render / output) - 1 (DLSS guidance; -1 at DLAA).
@@ -160,6 +202,7 @@ struct Stats {
     // upscaled frames, and why a destination was not used (fell back to DLAA).
     uint32_t render_w = 0, render_h = 0, out_w = 0, out_h = 0, jitter_phases = 0;
     uint64_t upscaled_frames = 0, upscale_refused = 0;
+    uint64_t physical_evaluated = 0, physical_unavailable = 0, physical_failed = 0; // P4-4 Layer2 override
     char upscale_note[160] = {};
     // Shape of the selected resources (reported even when J2 refuses them).
     uint32_t color_sub = 0, color_mips = 0, color_slices = 0, color_samples = 0, depth_slices = 0, depth_samples = 0;

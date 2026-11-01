@@ -14,6 +14,7 @@
 #include "core/temporal_jitter.hpp"
 #include "host_dx12/depth_format.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
+#include "host_dx12/nr/native_fg.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/settings.hpp"
 #include "providers/camera/camera_tracker.hpp"
@@ -47,6 +48,8 @@ struct Slot {
     ComPtr<ID3D12CommandAllocator> alloc;
     ComPtr<ID3D12GraphicsCommandList> list;
     UINT64 fence_value = 0;
+    std::shared_ptr<const PhysicalInput> physical; // Layer2 payload used by this slot's list: kept
+                                                   // until the slot is reused (its fence completed)
 };
 
 struct PendingHistory {
@@ -179,6 +182,19 @@ State& g = *new State;
 // P4-4 upscale target: set by Stage P / tests from any thread, read at recording.
 std::mutex g_up_m;
 UpscaleTarget g_up;
+PhysicalInputProvider g_phys; // under g_up_m
+
+// Exactly one outcome per Provided / Unavailable lookup, on every exit of record().
+struct PhysicalReport {
+    PhysicalInputProvider p;
+    uint64_t generation = 0;
+    bool armed = false;
+    PhysicalOutcome result = PhysicalOutcome::Failed;
+    char why[160] = {};
+    void arm(const PhysicalInputProvider& pp, uint64_t gen) { p = pp; generation = gen; armed = true; }
+    void fail(const char* w) { result = PhysicalOutcome::Failed; std::snprintf(why, sizeof why, "%s", w); }
+    ~PhysicalReport();
+};
 
 void reason(const char* r) { std::snprintf(g.stats.reason, sizeof(g.stats.reason), "%s", r); }
 
@@ -960,9 +976,44 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             bool* touched = nullptr, const SceneInput* saved = nullptr, UINT prefix = 0,
             na::j2::flow::Ticket* flow_ticket = nullptr, bool flow_pair_ok = false)
 {
+    // P4-4 Layer2: an optional immutable physical snapshot for these logical ids.
+    std::shared_ptr<const PhysicalInput> phys;
+    PhysicalReport phys_report;
+    {
+        PhysicalInputProvider pp;
+        { std::lock_guard<std::mutex> lk(g_up_m); pp = g_phys; }
+        if (pp.lookup) {
+            const PhysicalLookup pl = pp.lookup(pp.ctx, color_id, depth_id, inl, &phys);
+            if (pl == PhysicalLookup::Unavailable) {
+                phys_report.arm(pp, phys ? phys->generation : 0);
+                phys_report.result = PhysicalOutcome::Unavailable;
+                std::snprintf(phys_report.why, sizeof phys_report.why, "replacement unavailable");
+                reason("Layer2: this recording was redirected but its replacement is unavailable; not evaluated.");
+                return false;
+            }
+            if (pl != PhysicalLookup::Provided) phys.reset();
+            else {
+                phys_report.arm(pp, phys ? phys->generation : 0);
+                if (!phys || !phys->color || !phys->depth || !phys->output || !phys->owner || !phys->render_w || !phys->render_h ||
+                    phys->logical_color != color_id || phys->logical_depth != depth_id || phys->output == phys->color) {
+                    phys_report.fail("the physical snapshot is incomplete or names other logical ids");
+                    reason("Layer2: the physical snapshot is incomplete or names other logical ids.");
+                    return false;
+                }
+            }
+        }
+    }
+    const auto phys_fail = [&](const char* why) {
+        if (phys) phys_report.fail(why);
+        reason(why);
+        return false;
+    };
     ComPtr<ID3D12Resource> color, depth;
-    color.Attach(na::observe::AcquireResource(color_id));
-    depth.Attach(na::observe::AcquireResource(depth_id));
+    if (phys) { color = phys->color; depth = phys->depth; } // logical ids remain the identity
+    else {
+        color.Attach(na::observe::AcquireResource(color_id));
+        depth.Attach(na::observe::AcquireResource(depth_id));
+    }
     if (!color || !depth) { reason("Scene resources are not available."); return false; }
     const D3D12_RESOURCE_DESC cd = color->GetDesc(), dd = depth->GetDesc();
     g.stats.color_mips = cd.MipLevels ? cd.MipLevels : 1;
@@ -979,8 +1030,10 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // The subresources (mip + slice) the scene pass rendered into, from its views:
     // arrays and mip chains are fine, J2 works on exactly that one through its own copies.
     uint32_t csub = 0, dsub = 0;
-    if (saved) { csub = saved->color_sub; dsub = saved->depth_sub; }
-    if ((!saved && !na::observe::ListSceneSubresource(lists[scene], color_id, depth_id, &csub, &dsub)) || csub == 0xFFFFFFFFu || dsub == 0xFFFFFFFFu) {
+    if (phys) { csub = phys->color_sub; dsub = phys->depth_sub; }
+    else if (saved) { csub = saved->color_sub; dsub = saved->depth_sub; }
+    if ((!phys && !saved && !na::observe::ListSceneSubresource(lists[scene], color_id, depth_id, &csub, &dsub)) || csub == 0xFFFFFFFFu || dsub == 0xFFFFFFFFu) {
+        if (phys) return phys_fail("Layer2: the physical subresources are invalid.");
         reason("The scene is drawn through a view NeuralAlias cannot place (several array slices at once, or an unusual view).");
         return false;
     }
@@ -999,8 +1052,9 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     const auto state_of = [&](na_object_id id, uint32_t sub, uint32_t* st) {
         return saved ? entry_state(id, sub, st) : inl ? state_now(id, sub, st) : state_after(lists, scene, id, sub, st);
     };
-    const bool have_sc = state_of(color_id, csub, &sc);
-    const bool have_sd = state_of(depth_id, dsub, &sd);
+    // Layer2 companions are private textures, not observed: their exact states come with them.
+    const bool have_sc = phys ? (sc = phys->color_state, true) : state_of(color_id, csub, &sc);
+    const bool have_sd = phys ? (sd = phys->depth_state, true) : state_of(depth_id, dsub, &sd);
     if (!have_sc || !have_sd) {
         ++g.stats.no_state;
         if (!have_sc) ++g.stats.no_state_color; else ++g.stats.no_state_depth;
@@ -1034,8 +1088,15 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         ++g.stats.upscale_refused;
         std::snprintf(g.stats.upscale_note, sizeof g.stats.upscale_note, "%s", why);
     };
-    if (up.dest) {
-        dest.Attach(na::observe::AcquireResource(up.dest));
+    if (phys) { // Layer2: the destination and extent come from the same snapshot
+        up.dest = 0;
+        up.dest_sub = phys->output_sub;
+        up.render_w = phys->render_w;
+        up.render_h = phys->render_h;
+    }
+    if (phys || up.dest) {
+        if (phys) dest = phys->output;
+        else dest.Attach(na::observe::AcquireResource(up.dest));
         const uint32_t erw = up.render_w ? up.render_w : w, erh = up.render_h ? up.render_h : h;
         if (!dest) refuse_upscale("Upscale destination is not available.");
         else if (color_msaa) refuse_upscale("Upscaling from an MSAA scene colour is not supported.");
@@ -1057,10 +1118,16 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             }
         }
     }
-    if (dest && up.dest == color_id) refuse_upscale("The upscale destination is the scene colour itself.");
-    // The destination may be untouched by the game until after J2's insertion: then the
-    // state all submitted work left it in.
-    if (dest && !state_of(up.dest, dsub_out, &sdest) && !na::observe::KnownSubStateNow(up.dest, dsub_out, &sdest)) refuse_upscale("Waiting: the upscale destination's state is not established.");
+    if (phys) {
+        // A Layer2 frame never falls back to DLAA: that would write into its private companion.
+        if (!dest) return phys_fail(g.stats.upscale_note[0] ? g.stats.upscale_note : "Layer2: the physical output cannot be used.");
+        sdest = phys->output_state;
+    } else {
+        if (dest && up.dest == color_id) refuse_upscale("The upscale destination is the scene colour itself.");
+        // The destination may be untouched by the game until after J2's insertion: then the
+        // state all submitted work left it in.
+        if (dest && !state_of(up.dest, dsub_out, &sdest) && !na::observe::KnownSubStateNow(up.dest, dsub_out, &sdest)) refuse_upscale("Waiting: the upscale destination's state is not established.");
+    }
     const bool upscaling = dest != nullptr;
 
     // Camera first (nothing is allocated for a frame that cannot run); the tracker
@@ -1152,6 +1219,14 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         fs.slot = g.slot;
         *flow_ticket = na::j2::flow::Prepare(g.device.Get(), g.queue.Get(), fs);
     }
+    // Layer2 payload lifetime, before any command references it: J2's own list keeps it in its
+    // ring slot (released when the slot is reused, after its fence); a game list retains it
+    // through every submission (the existing recording retention). No retention = no use.
+    if (phys && inl) {
+        const auto lease = na::nr::native::RetainRecording(inl, std::shared_ptr<void>(std::const_pointer_cast<PhysicalInput>(phys)));
+        if (!lease) return phys_fail("Layer2: the game list's recording could not retain the physical inputs.");
+    }
+    if (!inl) s.physical = phys; // the previous use of this slot has completed (checked above)
     if (!inl && (FAILED(s.alloc->Reset()) || FAILED(s.list->Reset(s.alloc.Get(), nullptr)))) { reason("Could not reset the DLAA command list."); return false; }
     ID3D12GraphicsCommandList* l = inl ? inl : s.list.Get();
     if (touched) *touched = true;
@@ -1417,6 +1492,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     g.stats.out_h = oh;
     g.stats.jitter_phases = jitter_phases();
     if (upscaling) { ++g.stats.upscaled_frames; g.stats.upscale_note[0] = 0; }
+    if (phys) phys_report.result = PhysicalOutcome::Evaluated;
     *out_list = l;
     return true;
 }
@@ -1665,6 +1741,15 @@ void SetEnabled(bool on)
     if (on) na::observe::SetTableBindCallback(&on_table_bind);
 }
 bool Enabled() { return na::settings::EffectsReady() && g.enabled.load(); }
+PhysicalReport::~PhysicalReport()
+{
+    if (!armed) return;
+    if (result == PhysicalOutcome::Evaluated) ++g.stats.physical_evaluated;
+    else if (result == PhysicalOutcome::Unavailable) ++g.stats.physical_unavailable;
+    else ++g.stats.physical_failed;
+    if (p.outcome) p.outcome(p.ctx, generation, result, why[0] ? why : "J2 could not evaluate this frame (see its status)");
+}
+void SetPhysicalInputProvider(const PhysicalInputProvider& p) { std::lock_guard<std::mutex> lk(g_up_m); g_phys = p; }
 void SetUpscaleTarget(const UpscaleTarget& t) { std::lock_guard<std::mutex> lk(g_up_m); g_up = t; }
 UpscaleTarget GetUpscaleTarget() { std::lock_guard<std::mutex> lk(g_up_m); return g_up; }
 uint32_t JitterPhasesFor(uint32_t render_w, uint32_t out_w)
