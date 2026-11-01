@@ -28,6 +28,9 @@ in COMMS before edits, as P4-4 says.
   (Sniper verified; other Rebellion titles likely, unverified). No profile -> the menu asks the user
   to set the game's slider once to ~65-70%. No auto-scan confirmed on a later launch (that is
   learn-then-apply, ruled out).
+- **No-profile guidance (non-technical users):** the overlay shows live, in plain words, the mode
+  the detected size maps to ("Now: DLSS Quality", from QualityForScale), a hint at 100% to lower
+  the game's Resolution Scale, and a warning when very low. No percentages to know.
 
 History: rev 1 (corner/subrect), rev 2 (creation-time shrink), rev 3 (game's FSR as the Anno pilot)
 and rev 4 (no game scaler at all) are superseded; see COMMS a285862 to 8ed6614.
