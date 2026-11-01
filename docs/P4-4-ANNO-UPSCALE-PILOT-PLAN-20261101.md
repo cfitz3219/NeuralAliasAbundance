@@ -168,3 +168,24 @@ value there and confirm from J2's detected extent within a few frames (log wheth
 reacted). Unknown per game whether the engine re-reads it live; if not, the menu says "applies on
 next launch". Cort (22:43Z): Sniper Elite 5's Render Scale applies instantly in its own menu
 (slide back and forth live), so the live path is expected to work there. Several hits -> write none (log). Never touch memory we did not find this way.
+
+## Stage M test package (Sniper, slider at ~67 %), 2026-11-01
+
+Built (3cd6feb): `pass_map.hpp` + the diagnostic adapter's `[stage_m]` section. Read-only: no J2, no DLSS change, nothing written to the game.
+
+INI for the package (NeuralAliasHost.ini, next to the DLL):
+```
+[discovery]
+enabled=1
+read_only=1
+log=%LOCALAPPDATA%\NeuralAlias\sniper-discovery-<date>.jsonl
+[stage_m]
+map=1
+log=%LOCALAPPDATA%\NeuralAlias\sniper-stage-m-<date>.txt
+frames=4
+first_after_presents=1800
+every_presents=1800
+```
+Cort's steps: set Sniper's Render Scale to about 67 % in its own menu, launch, play in a level for about two minutes (four maps, one every ~30 s at 60 fps), quit. The map log saves itself; nothing to read on screen.
+
+What the log answers: the reduced-size passes, the "STRETCH CANDIDATE" (the game's own upscale to full size: what it reads and writes), and every pass after it (tonemap, HUD). Stage P replaces that stretch with DLSS. The same package on Anno (scale 100 %) gives Astra the native operation map she asked for.
