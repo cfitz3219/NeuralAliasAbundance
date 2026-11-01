@@ -151,7 +151,7 @@ target_link_libraries(host_nvof PUBLIC abundance_options d3d12 d3dcompiler)
 # P4-0c: AMD FidelityFX optical flow (compute; inline route and NVOFA fallback). Shaders are
 # compiled by DXC at build time (cmake/ffx_flow_shaders.cmake); without DXC it is a stub.
 include(cmake/ffx_flow_shaders.cmake)
-add_library(host_ffx_flow STATIC src/host_dx12/ffx_flow/ffx_flow_shaders.cpp)
+add_library(host_ffx_flow STATIC src/host_dx12/ffx_flow/ffx_flow_shaders.cpp src/host_dx12/ffx_flow/ffx_flow.cpp)
 target_link_libraries(host_ffx_flow PUBLIC abundance_options d3d12)
 if(NA_HAVE_FFX_FLOW)
   target_compile_definitions(host_ffx_flow PUBLIC NA_HAVE_FFX_FLOW)
@@ -183,6 +183,7 @@ add_library(host_dx12 STATIC
   src/host_dx12/nr/fg_states.cpp
   src/host_dx12/j2/live_dlaa.cpp
   src/host_dx12/j2/j2_flow.cpp
+  src/host_dx12/j2/compute_flow.cpp
   src/host_dx12/j2/nis_sharpen.cpp
   src/host_dx12/motion/live_flow.cpp
   src/host_dx12/latency/nvidia_latency.cpp

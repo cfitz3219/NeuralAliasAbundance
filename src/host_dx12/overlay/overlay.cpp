@@ -43,6 +43,7 @@
 #include "host_dx12/nr/nr_pass.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
+#include "host_dx12/j2/compute_flow.hpp"
 #include "host_dx12/overlay/menu.hpp"
 #include "host_dx12/overlay/na_style.hpp"
 #include "host_dx12/overlay/presenter.hpp"
@@ -1153,6 +1154,11 @@ UINT64 menu_completed_prefix() {
 // Diagnostic polling must never wait on the render thread or on the GPU.
 void write_menu_progress(HANDLE log)
 {
+    const auto cf=na::j2::compute_flow::GetStats();char cfline[420];DWORD cfw=0;
+    const int cfn=snprintf(cfline,sizeof cfline,"j2compute engine=amd recorded=%llu submitted=%llu pairs=%llu busy=%llu accepted=%llu total=%llu ms=%.3f reason=\"%s\"\r\n",
+        static_cast<unsigned long long>(cf.recorded),static_cast<unsigned long long>(cf.submitted),static_cast<unsigned long long>(cf.pairs),
+        static_cast<unsigned long long>(cf.busy),static_cast<unsigned long long>(cf.accepted),static_cast<unsigned long long>(cf.total),cf.ms,cf.reason);
+    if(cfn>0)WriteFile(log,cfline,(std::min)(DWORD(cfn),DWORD(sizeof(cfline)-1)),&cfw,nullptr);
     auto ps = na::present::GetStats();
     char p_line[256];
     int pn = snprintf(p_line, sizeof(p_line), "present_gpu submitted=%llu completed=%llu owned=%u device_hr=0x%08lX queried_latency_handle=0x%llX\r\n",

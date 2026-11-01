@@ -18,6 +18,11 @@
 #include "host_dx12/dlss/dlss_backend.hpp"
 #include "host_dx12/host_observe.h"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/j2/j2_flow.hpp"
+#include "host_dx12/j2/compute_flow.hpp"
+#include "host_dx12/ffx_flow/ffx_flow_shaders.hpp"
+#include "host_dx12/nr/nr_pass.hpp"
+#include "host_dx12/nr/native_fg.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/observe/producers.hpp"
 
@@ -58,6 +63,7 @@ std::string ReadText(const std::wstring& path)
 void __stdcall Forward(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists)
 {
     g_forwarded.assign(lists, lists + n);
+    na::nr::native::Submission recording(q,n,lists); // same lifetime wrapper as production ForwardThroughNr
     q->ExecuteCommandLists(n, lists); // queue not hooked in this test: the plain runtime call
 }
 // The overlay's sequence around a game submission.
@@ -138,7 +144,9 @@ int main(int argc, char** argv)
     // the Anno shape) after its learning frames.
     const bool auto_inline = argc > 3 && std::strcmp(argv[3], "--auto-inline") == 0;
     const bool auto_between = argc > 3 && std::strcmp(argv[3], "--auto-between") == 0;
-    const bool inline_list = auto_inline || inline_record_first || inline_copy || (argc > 3 && std::strcmp(argv[3], "--inline") == 0);
+    const bool inline_flow=argc>3 && std::strcmp(argv[3],"--inline-flow")==0;
+    if(inline_flow && !na::ffx_flow::Built())return test::kSkip;
+    const bool inline_list = inline_flow || auto_inline || inline_record_first || inline_copy || (argc > 3 && std::strcmp(argv[3], "--inline") == 0);
     // auto-between needs an OBSERVABLE consumer (a copy of the colour): a barrier-only
     // hand-back is not evidence of a list boundary (Astra R3).
     const bool post_reader = argc > 3 && !real_ngx && !planes && !split && !inline_list;
@@ -154,12 +162,17 @@ int main(int argc, char** argv)
     ID3D12Device* dev = d.device.Get();
     ID3D12CommandQueue* q = d.queue.Get();
     REQUIRE(na::observe::InstallProducers(dev, q, /*hook_queue_execute=*/false));
+    if(inline_flow)REQUIRE(na::observe::InstallListResetTracking(dev,na::nr::OnCommandListReset));
     na_observe_config cfg{};
     cfg.size_bytes = sizeof(cfg);
     REQUIRE(na_observe_start(&cfg, &Sink, nullptr) == NA_OK);
     if (!real_ngx) na::dlss::SetInitOwnOverrideForTests([](ID3D12Device* device, const wchar_t*) { return na::dlss::Attach(device, fake::MakeApi()); });
 
+#if defined(NA_J2_TEST_COMPUTE)
+    constexpr uint32_t W=512,H=256;
+#else
     constexpr uint32_t W = 64, H = 32;
+#endif
     for (auto pair : {std::make_pair(DXGI_FORMAT_R16G16B16A16_FLOAT,samples), std::make_pair(DXGI_FORMAT_D32_FLOAT_S8X24_UINT,depth_samples)}) {
         D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels{pair.first,pair.second,D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE,0};
         REQUIRE(SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,&levels,sizeof levels)));
@@ -455,6 +468,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
     // the auto modes exercise the selector.
     na::settings::Get().j2_route.store((auto_inline || auto_between || inline_list) ? 0u : 1u);
     na::j2::SetEnabled(true);
+    na::j2::flow::SetEnabled(inline_flow);
     na::j2::SetJitter(true); // J1 is off by default in the game; the tests exercise it
     na::observe::SetLiveSelection(na::observe::IdOf(depth.Get()), na::observe::IdOf(color.Get()));
     // Auto modes also exercise the J2 evidence capture: 3 consecutive evaluations, each
@@ -715,6 +729,10 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         // identical signatures) to hand over from the boundary matcher.
         const int frames = inline_copy ? 22 : 4;
         for (int f = 0; f < frames; ++f) REQUIRE(frame(0.25 * (f % 4)) == 0);
+        if(inline_flow){const auto flow=na::j2::compute_flow::GetStats();
+            printf("inline AMD: recorded=%llu submitted=%llu pairs=%llu %s\n",(unsigned long long)flow.recorded,(unsigned long long)flow.submitted,(unsigned long long)flow.pairs,flow.reason);
+            CHECK(flow.submitted>=2 && flow.pairs>=1);
+        }
         if (inline_record_first) REQUIRE(frame(1.0, true) == 0);
         const auto is = na::j2::GetStats();
         std::printf("inline: mode %u, candidates %llu, recorded %llu, frames %llu (inline %llu), refused %llu, evals %llu, forwarded %zu, \"%s\"\n",

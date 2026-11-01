@@ -26,6 +26,7 @@
 #include "host_dx12/fg/frame_gen.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
+#include "host_dx12/j2/compute_flow.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/fg/preset_profile.hpp"
 #include "host_dx12/motion/live_flow.hpp"
@@ -967,11 +968,17 @@ void DrawLiveDlaa()
     {
         // P4-0b: moving-object motion from NVIDIA hardware optical flow (test; off by default).
         bool fl = na::j2::flow::Enabled();
-        BeginRow("Moving-object motion (test)", "Measures how ships, people and other moving things move (NVIDIA optical flow) so DLAA does not smear them. Still scenery is unchanged. Costs a few milliseconds per frame. Turn it off to compare; the Motion vectors debug view shows the result.", SwitchWidth());
+        BeginRow("Moving-object motion (test)", "Adds estimated motion for moving objects. Uses NVIDIA flow between command lists, or AMD compute flow inside the game's list. Requires extra GPU time. Turn it off to compare; the Motion vectors debug view shows the result.", SwitchWidth());
         if (Switch("j2flow", &fl)) na::j2::flow::SetEnabled(fl);
         EndRow();
         if (fl) {
             const na::j2::flow::Stats fs = na::j2::flow::GetStats();
+            const auto cs=na::j2::compute_flow::GetStats();
+            if(na::j2::GetStats().inline_mode || (!fs.available && cs.recorded)){
+                char line[350];std::snprintf(line,sizeof line,"AMD compute: %s Pairs %llu, submitted %llu, busy %llu. Accepted %.1f%%, GPU %.2f ms.",cs.reason,
+                    static_cast<unsigned long long>(cs.pairs),static_cast<unsigned long long>(cs.submitted),static_cast<unsigned long long>(cs.busy),cs.total?100.0*double(cs.accepted)/double(cs.total):0.0,cs.ms);
+                StatusLine(0,line);
+            }else{
             const uint64_t px = fs.px_accepted + fs.px_invalid + fs.px_small + fs.px_cost + fs.px_offscreen + fs.px_image;
             const double pct = px ? 100.0 * static_cast<double>(fs.px_accepted) / static_cast<double>(px) : 0.0;
             char tb[360];
@@ -980,6 +987,7 @@ void DrawLiveDlaa()
                           static_cast<unsigned long long>(fs.encode_only + fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_split),
                           static_cast<unsigned long long>(fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_reset));
             StatusLine(fs.latched ? 2 : 0, tb);
+            }
         }
     }
     {
