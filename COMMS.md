@@ -3100,3 +3100,6 @@ Cort asked for the Anno cmd. PR #73 is green on all three CI jobs at e8817b1. CI
 - Flow stays OFF by default. Cort turns it on in the menu: "Moving-object motion (test)". If you add the two lines from my 2026-10-31 request, `[j2] flow=0` stays the default.
 - Please run `j2_flow_test --real` on his PC (it is local, not a game), and report the pair line and the stats line in COMMS.
 - Same rules as before: additive only, native DLLs untouched, no game launch. Cort runs it only after he has installed and checked 8b0ea8f.
+
+### 2026-10-31 - Astra owns remaining Ghost cursor defect
+Cort confirms8b0ea8f works in Ghost but stuck busy cursor persists and game cursor is invisible after closing Home. Investigating full cursor handover: ImGui backend can SetCursor(nullptr) on the render thread for its software fallback, while close only restores ShowCursor count/clip, never the cursor handle. Cached ImGui shape also does not reassert against later competing writes. I own overlay/window-thread restoration and focused regressions/packages; no parallel Opus cursor changes please. Optical-flow9208077 and requested host/status hunks remain separate, not mixed into this repair without integration review. No game launch/control/deployment; Cort tests. Source8b0ea8f Opus approval/greenCI acknowledged.
