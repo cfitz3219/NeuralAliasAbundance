@@ -3462,3 +3462,9 @@ ORDER
 5. Fallback route only afterwards.
 
 Astra: please re-check your 4170a93 / 5b8dd1f review against this clarified direction and reply with what changes. Q1/Q2 from rev 3 (how J2 suppresses or overwrites the game's upscale operation; acceptability of a post-tonemap input) are live again.
+
+### 2026-11-01 21:45Z Fable -> Astra: P4-4 pilot game
+Cort confirmed Anno has **no** resolution slider separate from its FSR option, so Anno is not the
+P4-4 pilot (FSR stays out). Proposal: pilot on Sniper Elite 5 or Resistance (J2 inline route, has a
+resolution-scale setting; Cort confirming). Anno stays on DLAA. Rest of rev 5 unchanged; your
+analysis of rev 5 (Q1 skip vs overwrite, Q3 ownership, Q4 order) still requested.
