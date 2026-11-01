@@ -7,11 +7,49 @@ with a hash-checked immutable payload so testing needs no fresh build.
 import argparse
 import hashlib
 import json
+import shutil
+from datetime import datetime
 from pathlib import Path
 
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest().upper()
+
+
+def publish_commands(docs, commit):
+    """Point both familiar DLAA and flow commands at the verified candidates.
+
+    Validate BOTH packages before changing any command. Keep byte-for-byte
+    backups of previous launchers; the existing PS1 templates stay intact.
+    This only prepares commands, never executes a game installer.
+    """
+    packages = {game: docs / f"NA-{game.upper()}-AMD-flow-{commit[:7]}"
+                for game in ("ser", "se5")}
+    for package in packages.values():
+        manifest = json.loads((package / "package.json").read_text(encoding="utf-8-sig"))
+        if manifest["source_commit"] != commit:
+            raise ValueError(f"Wrong source commit: {package}")
+        for payload in manifest["payload"]:
+            if digest(package / payload["name"]) != payload["sha256"]:
+                raise ValueError(f"Payload mismatch: {package / payload['name']}")
+    backup = docs / ("NA-Sniper-launchers-before-" + commit[:7] + "-" +
+                     datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
+    backup.mkdir()
+    commands = {}
+    for game, package in packages.items():
+        for suffix, action in (("flow-update", "Deploy"), ("flow-rollback", "Rollback"),
+                               ("dlaa", "Deploy"), ("dlaa-rollback", "Rollback")):
+            target = docs / f"NA-{game}-{suffix}.cmd"
+            commands[target] = ('@echo off\n' +
+                f'echo NeuralAlias {game.upper()} - build {commit[:7]} - AMD motion available\n' +
+                f'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{package / "deploy.ps1"}" -Action {action}\n' +
+                'pause\n')
+            if target.exists():
+                shutil.copy2(target, backup / target.name)
+    for target, content in commands.items():
+        target.write_text(content, encoding="utf-8")
+    print(f"Current Sniper DLAA and flow commands refreshed; backups: {backup}")
+    return backup
 
 
 def prepare(docs, dll, runtime, source, commit):
@@ -65,10 +103,8 @@ def prepare(docs, dll, runtime, source, commit):
         (package / "package.json").write_text(json.dumps({"source_commit": commit, "payload": [
             {"name": f.name, "sha256": digest(f)} for f in sorted(package.iterdir()) if f.is_file()
         ]}, indent=2), encoding="utf-8")
-        for action, verb in (("update", "Deploy"), ("rollback", "Rollback")):
-            target = docs / f"NA-{game}-flow-{action}.cmd"
-            target.write_text('@echo off\n' + f'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{package / "deploy.ps1"}" -Action {verb}\npause\n', encoding="utf-8")
         print(package)
+    publish_commands(docs, commit)
 
 
 if __name__ == "__main__":
