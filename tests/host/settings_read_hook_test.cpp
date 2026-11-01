@@ -69,8 +69,9 @@ int main()
         auto* game_d = new double(std::atof(seen.c_str() + at));
         const int w = na::scale::SetLiveFraction(0.5);
         const auto ls = na::scale::GetLiveStats();
-        std::printf("live: wrote %d, hits float %u double %u, scanned %llu MB, \"%s\"\n", w, ls.float_hits, ls.double_hits,
-                    (unsigned long long)ls.scanned_mb, ls.note);
+        std::printf("live: wrote %d, hits float %u double %u, scanned %llu KB, regions %u writable %u, game copies at %p %p, \"%s\"\n", w,
+                    ls.float_hits, ls.double_hits, (unsigned long long)ls.scanned_kb, ls.regions, ls.writable_regions,
+                    static_cast<void*>(game_f), static_cast<void*>(game_d), ls.note);
         CHECK(w == 2 && *game_f == 0.5f && *game_d == 0.5);
         CHECK(na::scale::SetLiveFraction(1.0 / 1.72) == 2 && *game_d == 1.0 / 1.72); // a second change follows its own last value
         *game_d = 0.75; // the user moved the game's slider: that copy is no longer ours

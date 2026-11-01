@@ -48,7 +48,8 @@ ReadHookStats GetReadHookStats();
 int SetLiveFraction(double fraction);
 struct LiveStats {
     uint32_t float_hits = 0, double_hits = 0, writes = 0;
-    uint64_t scanned_mb = 0;
+    uint64_t scanned_mb = 0, scanned_kb = 0;
+    uint32_t regions = 0, writable_regions = 0; // memory regions seen / writable ones (diagnostics)
     double tag = 0;          // the tagged value the game parsed (its unit)
     char note[160] = {};
 };

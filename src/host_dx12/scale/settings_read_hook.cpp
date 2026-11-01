@@ -301,20 +301,26 @@ template <class F> uint64_t for_each_region(const void* skip_a, size_t skip_n, F
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        reinterpret_cast<LPCWSTR>(&g_live), &self);
     uint64_t scanned = 0;
+    uint32_t regions = 0, writable = 0;
     MEMORY_BASIC_INFORMATION mi{};
     for (uintptr_t a = 0x10000; VirtualQuery(reinterpret_cast<void*>(a), &mi, sizeof mi) == sizeof mi;) {
         const uintptr_t base = reinterpret_cast<uintptr_t>(mi.BaseAddress), next = base + mi.RegionSize;
         if (next <= a) break;
         a = next;
+        ++regions;
         if (mi.State != MEM_COMMIT || (mi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) continue;
         if (!(mi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE))) continue;
+        ++writable;
         if (self && mi.AllocationBase == self) continue;
         const uintptr_t sa = reinterpret_cast<uintptr_t>(skip_a);
         if (sa >= base && sa < next && skip_n) continue;
-        if (scanned + mi.RegionSize > (16ull << 30)) break; // bounded
+        if (mi.RegionSize > (2ull << 30)) continue;          // one huge region: not a settings value's home
+        if (scanned + mi.RegionSize > (16ull << 30)) break;  // bounded in total
         scanned += mi.RegionSize;
         f(base, static_cast<size_t>(mi.RegionSize));
     }
+    g_live.stats.regions = regions;
+    g_live.stats.writable_regions = writable;
     return scanned;
 }
 void scan_locked()
@@ -351,6 +357,7 @@ void scan_locked()
     g_live.stats.float_hits = static_cast<uint32_t>(g_live.floats.size());
     g_live.stats.double_hits = static_cast<uint32_t>(g_live.doubles.size());
     g_live.stats.scanned_mb = bytes >> 20;
+    g_live.stats.scanned_kb = bytes >> 10;
 }
 } // namespace
 
