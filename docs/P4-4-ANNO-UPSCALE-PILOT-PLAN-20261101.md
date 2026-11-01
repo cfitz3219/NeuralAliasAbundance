@@ -17,6 +17,11 @@ in COMMS before edits, as P4-4 says.
   and set the game's render-scale value ourselves (live through an engine setter where an adapter
   exists, else the game's settings file). A game that only accepts steps (55/60/65) gets the
   nearest accepted value; DLSS is told the real size (any size works) and the menu shows it.
+- **Sniper (found 2026-11-01, read-only):** both Sniper Elite 5 and Resistance keep
+  `RenderScale` (float, 0.5-2.0, continuous) in `%LOCALAPPDATA%\<game>\GraphicsOptions.ini`.
+  Pilot mechanism: write the DLSS ratio (e.g. 0.666667) there at process start, before the game
+  reads the file, so it applies on the first launch; a mid-game change applies on the next launch
+  until a live engine setter is found. To verify in the first run: the game keeps the value.
 
 History: rev 1 (corner/subrect), rev 2 (creation-time shrink), rev 3 (game's FSR as the Anno pilot)
 and rev 4 (no game scaler at all) are superseded; see COMMS a285862 to 8ed6614.
