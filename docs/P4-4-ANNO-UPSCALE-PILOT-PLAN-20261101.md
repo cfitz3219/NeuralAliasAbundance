@@ -1,52 +1,53 @@
-# P4-4 pilot: DLSS upscaling on the J2 route, Anno first (plan rev 2, 2026-11-01)
+# P4-4 pilot: DLSS upscaling on the J2 route, Anno first (plan rev 4, 2026-11-01)
+
+**Cort's binding direction (2026-11-01, repeated):** we do NOT use a game's FSR or any game scaler,
+not even as the first proving case, because that limits the program to games that ship one. Every
+route below makes a game with no scaler render smaller. Rev 4 removes the "game's own scale" route
+of rev 2/3 (COMMS 4563ef8) and the stages that depended on it; COMMS has the correction entry.
+
 
 Status: plan for review (Astra/Sol). No code yet. Owner of the J2 side: Fable/Opus. Shared files
 (observation hooks, overlay, settings) need ownership agreed in COMMS before edits, as P4-4 says.
 
-Rev 2 (same day): Cort supplied a second proposal (two stages: J2 upscaling from a smaller scene
+Rev 2 (same day, history): Cort supplied a second proposal (two stages: J2 upscaling from a smaller scene
 pair; shrinking the scene textures at creation instead of drawing into a corner). Its critique of
 the corner approach matches Sol's correction 2 and is adopted; the corner method is kept only for
-engines already built for dynamic resolution. Stage 1 below is that proposal's first stage; Stage
+engines already built for dynamic resolution. Stage 1 below is that proposal's first stage minus its reliance on a game scaler; Stage
 P2 is its second, with the safety rules it lacks.
 
 ## Goal and constraints
 
 - Cort (2026-11-01): DLSS upscaling must work in games that have no upscaler of their own. A game's
-  own FSR/scaler option is not the plan (it may be used where it exists, never required).
+  own FSR/scaler option is not used at all.
 - Pilot: Anno 1800, one reduced size only (DLSS Quality at 3440x1440, size taken from NGX's optimal
   settings query, not hard-coded), output 3440x1440. Off by default; J2 DLAA stays the default.
 - Success is judged by matched pictures and GPU time, not by "it runs". A smaller raster area does
   not guarantee higher fps (Sol, COMMS a285862).
 
-## Why no single method is universal
+## Why the shrink-at-creation route, and where the corner route still fits
 
-| | corner (subrect in full buffers) | game's own scale | shrink scene textures at creation |
-|---|---|---|---|
-| full-screen quads sampling UV 0..1 | wrong pixels | fine | fine |
-| compute dispatches | ignore the viewport | fine | extra threads, otherwise fine |
-| screen-size constants, pixel-addressed loads | wrong | fine | still wrong (must be found and patched) |
-| which textures are the scene | known from J2 | n/a | decided at creation, before any frame evidence |
-| copies between scene and other textures | fine | fine | size mismatch = device removed (crash) |
-| full-size DLSS result into later passes | copy-back as today | replaces the game's final upscale | needs descriptor redirection |
-| depth/motion read later at full size | fine | n/a | needs full-size copies |
-| games covered | DRS-built engines only | games with a slider | the rest, where the map allows |
+| | corner (subrect in full buffers) | shrink scene textures at creation |
+|---|---|---|
+| full-screen quads sampling UV 0..1 | wrong pixels | fine |
+| compute dispatches | ignore the viewport | extra threads, otherwise fine |
+| screen-size constants, pixel-addressed loads | wrong | still wrong (must be found and patched) |
+| which textures are the scene | known from J2 | decided at creation, before any frame evidence |
+| copies between scene and other textures | fine | size mismatch = device removed (crash) |
+| full-size DLSS result into later passes | copy-back as today | needs descriptor redirection |
+| depth/motion read later at full size | fine | needs full-size copies |
+| games covered | DRS-built engines only | the rest, where the map allows |
 
-All three depend on knowing the game's pass structure, so the map comes first in every case.
+Both depend on knowing the game's pass structure, so the map comes first in every case.
 
-## Stage 1: J2 upscales from a smaller scene pair (prerequisite for everything)
+## Stage 1: J2 upscales from a smaller scene (prerequisite)
 
-Teach J2 render != output: detect a scene colour + depth pair at W_in x H_in below the swapchain
-size, evaluate DLSS W_in x H_in -> W_out x H_out (the backend already takes separate sizes and input
-subrects, dlss_backend.cpp 678-687; J2 sets them equal today, live_dlaa.cpp 1165-1167), carry the
-render extent explicitly through camera/jitter, motion, depth, optical flow and the mip bias
-(log2(render/display) - 1), and write the result where the game's own spatial upscale would have
-written. In games with a resolution/render-scale slider this alone gives DLSS upscaling; the
-insertion logic must learn that final-upscale spot (post-FX in such games usually runs at the small
-size, so DLSS sees a post-processed image there; quality is judged in Stage E).
-
-Open check (Cort, menus only): do Anno 1800, Sniper Elite 5 and Sniper Elite Resistance have a
-resolution-scale slider? Anno's only known scale control is its FSR option (engine.ini
-FSRUpscaling). Stage 1 is built regardless, because Stage P2 needs it too.
+Teach J2 render != output: evaluate DLSS W_in x H_in -> W_out x H_out (the backend already takes
+separate sizes and input subrects, dlss_backend.cpp 678-687; J2 sets them equal today,
+live_dlaa.cpp 1165-1167, and copies back into the same scene resource, 1261-1280), into a distinct
+full-size output target, carrying the active render extent explicitly through camera/jitter (phase
+count from the ratio), motion units, depth sampling, optical flow and the mip bias
+(log2(render/display) - 1). Built and tested on fixtures (a synthetic scene rendered small, a
+full-size consumer reading J2's output); no game setting is changed for it.
 
 ## Stage M: scene map (read-only, before any shrinking code)
 
@@ -82,7 +83,7 @@ screen-size constant patched; dispatch size adjusted; copy partner also shrunk; 
 follow"). Any "cannot follow" pass or copy that the main picture needs means no-go for Anno
 (stays on DLAA), with the map as evidence. Otherwise the Stage P2 estimate is given from the list.
 
-## Stage P2: shrink the scene set at creation (only after D1, games without a slider)
+## Stage P2: shrink the scene set at creation (only after D1)
 
 - Creation hooks (CreateCommittedResource / CreatePlacedResource, swapchain buffers excluded)
   shrink only textures matching the Stage M fingerprint whitelist for this game; applied on the
@@ -105,6 +106,6 @@ existing timestamps, the j2 log. Cort judges the picture.
 
 ## Not in this plan
 
-No new extraction solver, no renderer replacement, no reliance on the game's own scaler for the
-general case, no change to the DLAA default. Estimates: Stage 1 about 2-3 days; Stage M about 1-2
+No new extraction solver, no renderer replacement, no use of any game's own scaler (FSR, DRS,
+resolution slider), no change to the DLAA default. Estimates: Stage 1 about 2-3 days; Stage M about 1-2
 days; Stage P2 only after D1.
