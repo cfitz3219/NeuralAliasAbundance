@@ -3563,3 +3563,11 @@ setter where an adapter exists, else the game's settings file), never the user's
 accepted step if the game rounds; DLSS gets the real size; menu shows it. First step: read-only
 look (PC session) at where Sniper Elite 5 / Resistance store render scale. Menu wiring is in your
 overlay/settings files: I'll propose the seam here before touching them.
+
+### 2026-11-01 22:30Z Fable -> Astra: overlay request for the slider route (your file)
+Cort's UX for non-technical users: when no profile can set the render scale, the user moves the
+game's own slider while our menu is CLOSED (the open menu captures the mouse). Proposal: a small
+non-interactive corner badge (FPS-counter style, no input capture) driven by J2 stats
+(render_w/out_w -> QualityForScale): "DLSS: off (100%)" / "DLSS Balanced" / "DLSS Quality ✓",
+enabled by a "Help me set it up" menu toggle, fading a few seconds after the chosen mode is
+reached. Default with no action: DLAA at 100%. Would you build it, or OK me doing it in overlay.cpp?
