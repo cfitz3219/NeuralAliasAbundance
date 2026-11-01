@@ -6,14 +6,22 @@
 //   game lists ... last scene list
 //   PRE list (ours): copy the scene colour's subresource, encode it to BGRA8
 //                    with ONE fixed transform (linear float: Reinhard + sRGB;
-//                    UNORM: as stored), into an input ring slot
+//                    UNORM: as stored), into an input ring slot. The encode is
+//                    JITTER-STABILISED: texel q is sampled at q + jitter of its
+//                    frame, so both images of a pair sit in the unjittered frame
+//                    and DLAA's sub-pixel shake never reaches the engine (Sol's
+//                    idea B, COMMS 6cb1720; the Anno post shimmer was the engine
+//                    reading that shake on thin edges as 1-4 px motion).
 //   Signal(ready)  -> NVOFA (its own engine) computes current -> previous flow
-//                     and a per-block matching cost, then signals flow_done
+//                     and a per-block matching cost, then signals flow_done.
+//                     Temporal hints are on only when the engine's previous job
+//                     was the preceding pair of the same chain (idea A).
 //   Wait(flow_done)   (GPU wait on J2's queue; the CPU never waits)
 //   J2's DLAA list: depth copy, then RecordFusion (expand the grid depth-aware,
-//                   subtract this pair's camera motion and jitter once, accept a
-//                   residual only where the engine's cost and an image check
-//                   agree), the arbiter (camera + accepted residual), DLSS
+//                   subtract this pair's camera motion once (no jitter term: the
+//                   images were stabilised), accept a residual only where the
+//                   engine's cost, an image check and the previous pair agree),
+//                   the arbiter (camera + accepted residual), DLSS
 //   ... the rest of the game's batch
 //
 // Pairing: the previous image is used only when it is the frame J2's camera
@@ -59,8 +67,12 @@ public:
     virtual bool RegisterCost(ID3D12Resource* r, ID3D12Fence* f, uint64_t wait, uint64_t signal, void** out) = 0;
     virtual bool Unregister(void* h) = 0;
     virtual uint32_t Outstanding() const = 0;
+    // `hints`: the engine may use its previous result as temporal hints. True only when that
+    // result was the immediately preceding pair of the same chain (prev image = that pair's
+    // current image, same generation, nothing abandoned in between); false on the first pair
+    // after a cut, gap, resize, restart, abandoned job or switch-on.
     virtual bool Execute(void* cur, void* prev, void* grid, void* cost, ID3D12Fence* wait_fence, uint64_t wait_value,
-                         ID3D12Fence* signal_fence, uint64_t signal_value) = 0;
+                         ID3D12Fence* signal_fence, uint64_t signal_value, bool hints) = 0;
     virtual bool Shutdown() = 0;
     virtual const char* LastError() const = 0;
 };
@@ -134,6 +146,7 @@ struct Stats {
     uint32_t enabled = 0, available = 0, active = 0, latched = 0, cost = 0;
     uint32_t width = 0, height = 0, engine_w = 0, engine_h = 0, grid = 0, perf = 0, downscale = 0;
     uint64_t pairs = 0, encode_only = 0, consumed = 0, abandoned = 0;
+    uint64_t hinted = 0;          // pairs the engine ran with temporal hints (continuous chain)
     uint64_t skipped_busy = 0, skipped_split = 0, skipped_msaa = 0, skipped_reset = 0, skipped_resize = 0;
     uint64_t engine_failed = 0, watchdog_trips = 0;
     // Last read-back frame (pixels): accepted residual, and why others were not.

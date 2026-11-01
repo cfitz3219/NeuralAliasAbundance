@@ -62,6 +62,18 @@ constexpr float kTextureMin = 0.03f;
 constexpr uint32_t kAgreeMin = 1;   // previous agreeing pairs needed (the second pair is the first accepted)
 constexpr float kAgreeCos = 0.5f;   // cos 60: direction agreement
 constexpr float kAgreePx = 3.0f;    // |r - r_prev| <= max(kAgreePx, |r|)
+// Jitter-stabilised input (Sol, COMMS 6cb1720, idea B). J1 renders frame t with its raster
+// sample at pixel centre - j_t in the unjittered projection, so the scene point that belongs
+// at unjittered position q is found at texel q + j_t. The encode samples there: both images
+// of a pair are then in the SAME (unjittered) frame, the engine never sees the shake, and
+// its flow F0 is already jitter-free: residual = F0 - V_cam, with NO (j_prev - j_cur) term
+// (DeriveResidual is given jitter_prev = jitter_cur). The image check, the expansion and the
+// history lookup all work on the stabilised images and F0, so they share that convention.
+// The cost is one bilinear half-texel resample, which the half-size encode did anyway.
+// Temporal hints (idea A): NVOFA may seed a job from its previous output. That is only a
+// valid seed when the previous job was the preceding pair of the same chain, so hints are
+// on exactly then and off after a cut, gap, resize, restart, switch-on or abandoned job
+// (an abandoned job still runs, on a stale image: its output must never seed the next).
 
 // ------------------------------------------------------------------ shaders
 const char kShader[] = R"(
@@ -84,14 +96,17 @@ cbuffer C : register(b0) {
     uint cnt_off, gw, gh, pad0;
     float snap_px, image_margin, image_abs, texture_min;
     uint have_hist, agree_min, pad1, pad2;
-    float agree_px, agree_cos, pad4, pad5;
+    float agree_px, agree_cos, jitter_x, jitter_y;
 };
 float3 srgb_encode(float3 v) { v = saturate(v); return v <= 0.0031308 ? 12.92 * v : 1.055 * pow(v, 1.0 / 2.4) - 0.055; }
-// One fixed transform for every image (both images of a pair are encoded alike).
+// One fixed transform for every image (both images of a pair are encoded alike), sampled
+// at the frame's jitter offset so the encoded image is in the unjittered frame: texel
+// (id + 0.5) covers full-size position q = (id + 0.5) * w / ew, found at texel q + jitter.
 [numthreads(8, 8, 1)]
 void encode(uint3 id : SV_DispatchThreadID) {
     if (id.x >= ew || id.y >= eh) return;
-    float2 uv = (float2(id.xy) + 0.5) / float2(ew, eh);
+    float2 q = (float2(id.xy) + 0.5) * float2(w, h) / float2(ew, eh);
+    float2 uv = (q + float2(jitter_x, jitter_y)) / float2(w, h);
     float3 c = t_color.SampleLevel(s_lin, uv, 0).rgb;
     if (any(isnan(c)) || any(isinf(c))) c = float3(0, 0, 0);
     if (mode == 1) { c = max(c, 0.0); c = srgb_encode(c / (1.0 + c)); }
@@ -189,7 +204,7 @@ struct Constants {
     uint32_t cnt_off, gw, gh, pad0;
     float snap_px, image_margin, image_abs, texture_min;
     uint32_t have_hist, agree_min, pad1, pad2;
-    float agree_px, agree_cos, pad4, pad5;
+    float agree_px, agree_cos, jitter_x, jitter_y; // jitter: encode only (this frame's, render pixels)
 };
 constexpr UINT kConstantWords = static_cast<UINT>(sizeof(Constants) / 4);
 constexpr uint32_t kUav = 8;    // first UAV descriptor in a table (SRVs t0..t7 before it)
@@ -224,9 +239,9 @@ public:
     }
     bool Unregister(void* hb) override { return f_.Unregister(hb); }
     uint32_t Outstanding() const override { return f_.OutstandingRegistrations(); }
-    bool Execute(void* cur, void* prev, void* grid, void* cost, ID3D12Fence* wf, uint64_t wv, ID3D12Fence* sf, uint64_t sv) override
+    bool Execute(void* cur, void* prev, void* grid, void* cost, ID3D12Fence* wf, uint64_t wv, ID3D12Fence* sf, uint64_t sv, bool hints) override
     {
-        return f_.Execute(cur, prev, grid, wf, wv, sf, sv, true, cost);
+        return f_.Execute(cur, prev, grid, wf, wv, sf, sv, !hints, cost);
     }
     bool Shutdown() override { return f_.Shutdown(); }
     const char* LastError() const override { return f_.LastError(); }
@@ -307,6 +322,10 @@ struct State {
     Grid grids[kGrids];
     uint32_t next_grid = 0;
     int last_committed = -1;
+    // Temporal hints: frame/generation of the current image of the last engine job that was
+    // committed (0: none). The next pair may use hints only when its previous image is it.
+    uint64_t hint_frame = 0;
+    uint32_t hint_generation = 0;
     Pre pre[kPre];
     uint32_t pre_next = 0;
     // Watchdog.
@@ -554,6 +573,7 @@ void release_set()
     if (g.built && g.engine->Outstanding() == 0) g.engine->Shutdown();
     g.built = false;
     g.last_committed = -1;
+    g.hint_frame = 0;
     ++g.epoch;
 }
 
@@ -738,6 +758,7 @@ void SetEnabled(bool on)
     if (!on) { g.stats.active = 0; if (!g.latched) set_reason("Off."); }
     else if (!g.latched) set_reason("Waiting for the first frame.");
     g.last_committed = -1; // a pair never spans an off period
+    g.hint_frame = 0;
 }
 bool Enabled() { return g.enabled.load(); }
 void SetAllowSplit(bool on) { g.allow_split.store(on); }
@@ -842,6 +863,8 @@ Ticket Prepare(ID3D12Device* device, ID3D12CommandQueue* queue, const Source& sr
     Constants c{};
     c.w = src.width; c.h = src.height; c.ew = g.ew; c.eh = g.eh;
     c.mode = is_float(src.format) ? 1u : 0u;
+    c.jitter_x = src.jitter_px[0]; // stabilised encode: sample at q + this frame's jitter
+    c.jitter_y = src.jitter_px[1];
     ID3D12DescriptorHeap* heaps[] = {g.heap.Get()};
     l->SetDescriptorHeaps(1, heaps);
     l->SetComputeRootSignature(g.root.Get());
@@ -872,7 +895,9 @@ Ticket Prepare(ID3D12Device* device, ID3D12CommandQueue* queue, const Source& sr
     if (pair) {
         const Image& pv = g.img[prev];
         const uint64_t fv = g.done_next++;
-        if (!g.engine->Execute(im.handle, pv.handle, gr->handle, gr->cost_handle, g.ready.Get(), t.ready_value, g.done.Get(), fv)) {
+        // Hints only when the engine's last committed job ended on this pair's previous image.
+        const bool hints = g.hint_frame != 0 && pv.frame == g.hint_frame && pv.generation == g.hint_generation;
+        if (!g.engine->Execute(im.handle, pv.handle, gr->handle, gr->cost_handle, g.ready.Get(), t.ready_value, g.done.Get(), fv, hints)) {
             ++g.stats.engine_failed;
             char b[160];
             std::snprintf(b, sizeof b, "Moving-object motion stopped: %.120s", g.engine->LastError());
@@ -891,6 +916,7 @@ Ticket Prepare(ID3D12Device* device, ID3D12CommandQueue* queue, const Source& sr
             g.next_grid = (gi + 1) % kGrids;
             track_job(fv, t.ready_value);
             ++g.stats.pairs;
+            if (hints) ++g.stats.hinted;
         }
     }
     if (!t.pair) ++g.stats.encode_only;
@@ -935,8 +961,11 @@ bool RecordFusion(ID3D12GraphicsCommandList* l, Ticket& t, ID3D12Resource* depth
                                        transition(g.residual.Get(), NPSR, UAVS), transition(g.valid.Get(), NPSR, UAVS)};
         l->ResourceBarrier(6, b);
     }
-    // 3. Residual = raw - camera motion - (jitter_prev - jitter_cur), this exact pair, once.
-    ok = ok && g.derive.DispatchDeriveResidual(l, g.raw.Get(), depth32, camera, t.jitter_prev, g.residual.Get(), g.valid.Get(),
+    // 3. Residual = raw - camera motion, this exact pair, once. Both images were encoded in
+    //    the unjittered frame (stabilised encode), so the raw flow carries no jitter shift and
+    //    DeriveResidual's (jitter_prev - jitter_cur) term must be zero: it is given the
+    //    current jitter as the previous one. (t.jitter_prev stays recorded for diagnosis.)
+    ok = ok && g.derive.DispatchDeriveResidual(l, g.raw.Get(), depth32, camera, camera.jitter_current_px, g.residual.Get(), g.valid.Get(),
                                                g.w, g.h, slot, g.expand_valid.Get());
     {
         D3D12_RESOURCE_BARRIER b[5] = {uav(g.residual.Get()), uav(g.valid.Get()),
@@ -1055,6 +1084,10 @@ void Committed(Ticket& t, ID3D12Fence* j2_fence, uint64_t value)
     im.jitter[0] = t.jitter_cur[0];
     im.jitter[1] = t.jitter_cur[1];
     g.last_committed = static_cast<int>(t.cur);
+    // The engine's last job (if this frame had one) ended on this image; an encode-only
+    // frame breaks the chain, so the next pair starts without hints.
+    g.hint_frame = t.pair ? t.frame : 0;
+    g.hint_generation = t.generation;
     if (t.consumed) {
         im.last_j2 = value;
         g.img[t.prev].last_j2 = value;
@@ -1074,6 +1107,7 @@ void Abandon(ID3D12CommandQueue* queue, Ticket& t)
     if (queue && g.ready) queue->Signal(g.ready.Get(), t.ready_value);
     if (t.epoch == g.epoch) g.img[t.cur].committed = false;
     g.last_committed = -1;
+    g.hint_frame = 0; // the released job ran on a stale image: never a seed for the next
     ++g.stats.abandoned;
     t = Ticket{};
 }

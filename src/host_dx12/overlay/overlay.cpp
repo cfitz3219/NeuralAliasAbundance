@@ -705,9 +705,9 @@ void write_status_line()
             const auto fs = na::j2::flow::GetStats();
             char fl[640];
             const int fn = snprintf(fl, sizeof(fl),
-                "j2flow on=%u available=%u active=%u latched=%u cost=%u size=%ux%u engine=%ux%u grid=%u perf=%u ds=%u pairs=%llu consumed=%llu encode_only=%llu abandoned=%llu skip_busy=%llu skip_split=%llu skip_msaa=%llu skip_reset=%llu skip_resize=%llu engine_failed=%llu watchdog=%llu px_acc=%llu px_inv=%llu px_small=%llu px_cost=%llu px_off=%llu px_img=%llu px_flk=%llu mean_cost=%.1f ms=%.2f ms_avg=%.2f \"%s\"\r\n",
+                "j2flow on=%u available=%u active=%u latched=%u cost=%u size=%ux%u engine=%ux%u grid=%u perf=%u ds=%u pairs=%llu hinted=%llu consumed=%llu encode_only=%llu abandoned=%llu skip_busy=%llu skip_split=%llu skip_msaa=%llu skip_reset=%llu skip_resize=%llu engine_failed=%llu watchdog=%llu px_acc=%llu px_inv=%llu px_small=%llu px_cost=%llu px_off=%llu px_img=%llu px_flk=%llu mean_cost=%.1f ms=%.2f ms_avg=%.2f \"%s\"\r\n",
                 fs.enabled, fs.available, fs.active, fs.latched, fs.cost, fs.width, fs.height, fs.engine_w, fs.engine_h, fs.grid, fs.perf, fs.downscale,
-                static_cast<unsigned long long>(fs.pairs), static_cast<unsigned long long>(fs.consumed), static_cast<unsigned long long>(fs.encode_only),
+                static_cast<unsigned long long>(fs.pairs), static_cast<unsigned long long>(fs.hinted), static_cast<unsigned long long>(fs.consumed), static_cast<unsigned long long>(fs.encode_only),
                 static_cast<unsigned long long>(fs.abandoned), static_cast<unsigned long long>(fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_split),
                 static_cast<unsigned long long>(fs.skipped_msaa), static_cast<unsigned long long>(fs.skipped_reset), static_cast<unsigned long long>(fs.skipped_resize),
                 static_cast<unsigned long long>(fs.engine_failed), static_cast<unsigned long long>(fs.watchdog_trips),

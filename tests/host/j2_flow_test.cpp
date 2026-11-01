@@ -4,10 +4,13 @@
 // chosen grid (and cost), then signals. A CPU-controlled gate holds it so the
 // tests can prove ordering instead of hoping for it.
 //
-//   pair        object moving over a still background (with camera jitter): the
-//               split submission (2 forwards), the GPU wait (J2's list does not
-//               run before the engine), residual on the object only, final motion
-//               = camera + residual, nothing on the background
+//   pair        object moving over a still background, every frame rendered with J1's
+//               jitter phase: the split submission (2 forwards), the GPU wait (J2's
+//               list does not run before the engine), residual on the object only,
+//               final motion = camera + residual, nothing on the background, temporal
+//               hints from the chain's second pair on
+//   still-jitter thin posts that never move, rendered under the 8-phase jitter: the
+//               stabilised encode must leave nothing accepted and nothing fused
 //   flicker     the engine reports a true back-and-forth 4 px motion that reverses
 //               every pair (Anno jitter misread): temporal agreement rejects all of it
 //   false-flow  smooth but wrong flow over a textured still scene is rejected by
@@ -72,8 +75,8 @@ public:
     bool gated = false, fail_execute = false, available = true, support_cost = true;
     int16_t grid[GH][GW][2] = {};
     uint8_t cost_value = 10;
-    uint32_t inits = 0, last_w = 0, last_h = 0, registered = 0, unregisters = 0, executes = 0;
-    bool cost_on = false;
+    uint32_t inits = 0, last_w = 0, last_h = 0, registered = 0, unregisters = 0, executes = 0, hinted = 0;
+    bool cost_on = false, hints_last = false;
     uint32_t w = 0, h = 0, grid_n = 4;
     std::vector<ComPtr<ID3D12CommandAllocator>> allocs;
     std::vector<ComPtr<ID3D12GraphicsCommandList>> lists;
@@ -121,10 +124,12 @@ public:
     }
     bool Unregister(void*) override { if (registered) --registered; ++unregisters; return true; }
     uint32_t Outstanding() const override { return registered; }
-    bool Execute(void*, void*, void* out_grid, void* out_cost, ID3D12Fence* wf, uint64_t wv, ID3D12Fence* sf, uint64_t sv) override
+    bool Execute(void*, void*, void* out_grid, void* out_cost, ID3D12Fence* wf, uint64_t wv, ID3D12Fence* sf, uint64_t sv, bool hints) override
     {
         if (fail_execute) return false;
         ++executes;
+        hints_last = hints;
+        if (hints) ++hinted;
         q->Wait(wf, wv);
         if (gated) q->Wait(gate.Get(), ++gate_needed);
         ID3D12Device* dev = d->device.Get();
@@ -239,23 +244,52 @@ void upload_r32f(test::Device& d, ID3D12Resource* tex, float v, D3D12_RESOURCE_S
 // (x0 < 0: none). Its texture (random 2x2 blocks) moves with it; flat pixels stay camera-only.
 // Large enough (6x4 flow blocks) to have an interior: pixels next to the background are
 // correctly marked unreliable by the depth-aware expansion (neighbour-flow spread).
-std::vector<float> picture(int x0, bool checker)
+// Scene luminance at integer scene position (x, y) (unjittered frame).
+float scene_at(int x0, bool checker, int x, int y)
+{
+    float v = checker ? ((((x >> 2) + (y >> 2)) & 1) ? 1.0f : 0.05f) : 0.05f;
+    if (x0 >= 0 && x >= x0 && x < x0 + 48 && y >= 16 && y < 48) {
+        const uint32_t a = static_cast<uint32_t>(x - x0) / 2, b = static_cast<uint32_t>(y) / 2;
+        const uint32_t hsh = ((a * 73856093u) ^ (b * 19349663u)) * 2654435761u;
+        v = 0.3f + 4.0f * static_cast<float>((hsh >> 16) & 1023u) / 1023.f;
+    }
+    return v;
+}
+// Still scenery with thin edges (the Anno posts): 2 px bright vertical posts every 16 px and
+// one 2 px horizontal bar, on a dark background. Nothing in it ever moves.
+float posts_at(int x, int y)
+{
+    const bool post = (x & 15) >= 7 && (x & 15) <= 8 && y >= 4 && y < static_cast<int>(H) - 4;
+    const bool bar = y == 30 || y == 31;
+    return post || bar ? 0.9f : 0.05f;
+}
+// Renders a frame of a scene the way J1 renders a jittered frame: the raster sample of pixel
+// p sits at scene position p - jitter (bilinear between integer scene positions), so the
+// picture content shifts by the jitter each frame while the scene itself stands still.
+template <class F>
+std::vector<float> render(F scene, float jx, float jy)
 {
     std::vector<float> px(W * H * 4);
     for (uint32_t y = 0; y < H; ++y)
         for (uint32_t x = 0; x < W; ++x) {
-            float v = checker ? (((x / 4) + (y / 4)) % 2 ? 1.0f : 0.05f) : 0.05f;
-            if (x0 >= 0 && static_cast<int>(x) >= x0 && static_cast<int>(x) < x0 + 48 && y >= 16 && y < 48) {
-                const uint32_t a = static_cast<uint32_t>(static_cast<int>(x) - x0) / 2, b = y / 2;
-                const uint32_t hsh = ((a * 73856093u) ^ (b * 19349663u)) * 2654435761u;
-                v = 0.3f + 4.0f * static_cast<float>((hsh >> 16) & 1023u) / 1023.f;
-            }
+            const float sx = static_cast<float>(x) - jx, sy = static_cast<float>(y) - jy;
+            const int ix = static_cast<int>(std::floor(sx)), iy = static_cast<int>(std::floor(sy));
+            const float fx = sx - static_cast<float>(ix), fy = sy - static_cast<float>(iy);
+            const float v = (1 - fx) * (1 - fy) * scene(ix, iy) + fx * (1 - fy) * scene(ix + 1, iy) +
+                            (1 - fx) * fy * scene(ix, iy + 1) + fx * fy * scene(ix + 1, iy + 1);
             float* q = &px[(y * W + x) * 4];
             q[0] = q[1] = q[2] = v;
             q[3] = 1.f;
         }
     return px;
 }
+std::vector<float> picture(int x0, bool checker, float jx = 0.f, float jy = 0.f)
+{
+    return render([&](int x, int y) { return scene_at(x0, checker, x, y); }, jx, jy);
+}
+// Eight-phase Halton (2, 3) jitter, centred, as J1 uses it (render pixels).
+constexpr float kJitter[8][2] = {{-0.5f, -0.5f}, {0.0f, -0.1667f}, {-0.25f, 0.1667f}, {0.25f, -0.3889f},
+                                 {-0.375f, -0.0556f}, {0.125f, 0.2778f}, {-0.125f, -0.2778f}, {0.375f, 0.0556f}};
 
 struct Harness {
     test::Device& d;
@@ -382,41 +416,39 @@ void reset_module(fl::Engine* e)
     fl::SetEnabled(true);
 }
 
-// Object moves +4 px per frame (v = -4 on its new position) over four frames: three pairs.
-// Temporal agreement (kAgreeMin = 1) trusts a residual from the second agreeing pair on, so
-// pair 1 fuses nothing and pairs 2 and 3 fuse the object.
+// Object moves +4 px per frame (v = -4 on its new position) over four frames: three pairs,
+// every frame rendered with J1's jitter phase. Temporal agreement (kAgreeMin = 1) trusts a
+// residual from the second agreeing pair on, so pair 1 fuses nothing and pairs 2 and 3 fuse
+// the object. The stabilised encode removes the jitter before the engine, so the fake grid
+// holds the true motion only and the real engine must measure it through the jitter.
+// Temporal hints: off for the first pair of the chain, on for the following ones.
 int case_pair(test::Device& d, FakeEngine* fake)
 {
     std::printf("-- pair%s\n", fake ? "" : " (real engine)");
     Harness h(d);
     REQUIRE(h.Init());
     reset_module(fake);
-    // Fake engine: the jitter's image shift is put into the grid it returns. The real
-    // engine sees the synthetic pictures, which are NOT re-rendered with jitter, so a
-    // non-zero jitter there would (correctly) produce a residual on the still background.
-    // In a game the picture is rendered with the jitter, so its shift is in the flow.
-    const float jp[2] = {0.f, 0.f}, jc[2] = {0.f, 0.f}; // jitter subtraction itself: arbiter DeriveResidual tests
     if (fake) {
-        // Engine pixels (downscale 2), S10.5. Background: the jitter's image shift jp - jc.
-        const int16_t bx = static_cast<int16_t>((jp[0] - jc[0]) / 2 * 32), by = static_cast<int16_t>((jp[1] - jc[1]) / 2 * 32);
-        const int16_t ox = static_cast<int16_t>((-4.f + jp[0] - jc[0]) / 2 * 32), oy = by;
-        fake->SetGrid(bx, by, 5, 12, 1, 6, ox, oy); // blocks of 8 px: x 40..104, y 8..56 keep the rectangle clear of the
-                                                   // expansion's boundary band (half a block each side is marked invalid)
+        // Engine pixels (downscale 2), S10.5: -4 px -> -64 on the object, 0 on the background.
+        fake->SetGrid(0, 0, 5, 12, 1, 6, -64, 0); // blocks of 8 px: x 40..104, y 8..56 keep the rectangle clear of the
+                                                 // expansion's boundary band (half a block each side is marked invalid)
         fake->gated = true;
     }
-    h.SetPicture(picture(36, false));
-    fl::Ticket t1 = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(1, 0, jp[0], jp[1]));
+    auto jit = [](int frame, int axis) { return kJitter[(frame - 1) & 7][axis]; };
+    h.SetPicture(picture(36, false, jit(1, 0), jit(1, 1)));
+    fl::Ticket t1 = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(1, 0, jit(1, 0), jit(1, 1)));
     CHECK(t1.valid && !t1.pair);
     size_t calls = 0;
-    h.Frame(t1, jp[0], jp[1], &calls);
+    h.Frame(t1, jit(1, 0), jit(1, 1), &calls);
     CHECK(calls == 1);
     REQUIRE(h.WaitJ2(5000));
     float v[2];
     for (int f = 2; f <= 4; ++f) {
-        h.SetPicture(picture(36 + 4 * (f - 1), false));
-        fl::Ticket t = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(f, f - 1, jc[0], jc[1]));
+        h.SetPicture(picture(36 + 4 * (f - 1), false, jit(f, 0), jit(f, 1)));
+        fl::Ticket t = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(f, f - 1, jit(f, 0), jit(f, 1)));
         CHECK(t.valid && t.pair);
-        const bool fused = h.Frame(t, jc[0], jc[1], &calls);
+        if (fake) CHECK(fake->hints_last == (f > 2)); // the chain's first pair has no seed
+        const bool fused = h.Frame(t, jit(f, 0), jit(f, 1), &calls);
         CHECK(fused);
         CHECK(calls == 2); // [scene, pre] then [ours]
         if (fake && f == 2) {
@@ -436,19 +468,68 @@ int case_pair(test::Device& d, FakeEngine* fake)
         CHECK(std::fabs(v[0]) < 0.1f && std::fabs(v[1]) < 0.1f);
     }
     // Read-back of the counters happens at the next Prepare.
-    fl::Ticket t5 = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(5, 4, jp[0], jp[1]));
+    fl::Ticket t5 = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(5, 4, jit(5, 0), jit(5, 1)));
     const fl::Stats st = fl::GetStats();
-    recap("pair stats: pairs %llu consumed %llu acc %llu inv %llu small %llu cost %llu off %llu img %llu flk %llu mean %.1f",
-                (unsigned long long)st.pairs, (unsigned long long)st.consumed, (unsigned long long)st.px_accepted, (unsigned long long)st.px_invalid,
-                (unsigned long long)st.px_small, (unsigned long long)st.px_cost, (unsigned long long)st.px_offscreen, (unsigned long long)st.px_image,
-                (unsigned long long)st.px_flicker, st.mean_cost);
+    recap("pair stats: pairs %llu hinted %llu consumed %llu acc %llu inv %llu small %llu cost %llu off %llu img %llu flk %llu mean %.1f",
+                (unsigned long long)st.pairs, (unsigned long long)st.hinted, (unsigned long long)st.consumed, (unsigned long long)st.px_accepted,
+                (unsigned long long)st.px_invalid, (unsigned long long)st.px_small, (unsigned long long)st.px_cost, (unsigned long long)st.px_offscreen,
+                (unsigned long long)st.px_image, (unsigned long long)st.px_flicker, st.mean_cost);
     recap("pair reason: %s", st.reason);
     // Object 48x32 plus an edge band up to 8 px (the texture window touches the object;
     // flat background there matches flat background either way). Real RTX 5070 Ti: 2000.
     CHECK(st.pairs >= 3 && st.consumed == 3 && st.px_accepted > 200 && st.px_accepted <= 3072);
+    CHECK(st.hinted == st.pairs - 1); // every pair after the chain's first
     if (fake) CHECK(st.cost == 1 && std::fabs(st.mean_cost - 10.f) < 0.5f);
     fl::Abandon(d.queue.Get(), t5);
     if (fake) fake->OpenGate();
+    d.WaitIdle();
+    return 0;
+}
+
+// Sol's ground-truth regression (COMMS 6cb1720): still thin posts under the real 8-phase
+// jitter. The scene never moves; only the raster jitter shifts the picture by up to half a
+// pixel each frame. With the stabilised encode the engine sees two identical images and
+// nothing may be accepted or fused; without it, this is exactly Anno's post shimmer. With
+// the fake engine (grid 0) the case only exercises the encode and the jd = 0 residual.
+int case_still_jitter(test::Device& d, FakeEngine* fake)
+{
+    std::printf("-- still posts under jitter%s\n", fake ? "" : " (real engine)");
+    Harness h(d);
+    REQUIRE(h.Init());
+    reset_module(fake);
+    if (fake) { fake->SetGrid(0, 0, 0, -1, 0, -1, 0, 0); fake->gated = false; }
+    auto frame_picture = [&](int f) { h.SetPicture(render(posts_at, kJitter[(f - 1) & 7][0], kJitter[(f - 1) & 7][1])); };
+    frame_picture(1);
+    fl::Ticket t1 = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(1, 0, kJitter[0][0], kJitter[0][1]));
+    CHECK(t1.valid && !t1.pair);
+    h.Frame(t1, kJitter[0][0], kJitter[0][1], nullptr);
+    REQUIRE(h.WaitJ2(5000));
+    float v[2];
+    float worst = 0.f;
+    for (int f = 2; f <= 9; ++f) {
+        const float jx = kJitter[(f - 1) & 7][0], jy = kJitter[(f - 1) & 7][1];
+        frame_picture(f);
+        fl::Ticket t = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(f, f - 1, jx, jy));
+        CHECK(t.valid && t.pair);
+        CHECK(h.Frame(t, jx, jy, nullptr));
+        REQUIRE(h.WaitJ2(10000));
+        // Post edges (x = 7/8 + 16k), the bar (y = 30/31) and the background: all still.
+        const uint32_t probes[][2] = {{23, 20}, {24, 40}, {71, 12}, {72, 50}, {103, 31}, {50, 30}, {100, 10}, {5, 58}};
+        for (const auto& p : probes) {
+            h.Motion(p[0], p[1], v);
+            worst = (std::max)(worst, (std::max)(std::fabs(v[0]), std::fabs(v[1])));
+        }
+        if (f % 4 == 1) recap("still jitter: pairs 1..%d worst fused motion so far %.3f px", f - 1, worst);
+    }
+    fl::Ticket t10 = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(10, 9, kJitter[1][0], kJitter[1][1]));
+    const fl::Stats st = fl::GetStats();
+    recap("still jitter stats (last pair): acc %llu small %llu img %llu flk %llu hinted %llu/%llu, worst fused motion %.3f px",
+          (unsigned long long)st.px_accepted, (unsigned long long)st.px_small, (unsigned long long)st.px_image,
+          (unsigned long long)st.px_flicker, (unsigned long long)st.hinted, (unsigned long long)st.pairs, worst);
+    CHECK(worst < 0.1f);
+    CHECK(st.px_accepted == 0);
+    CHECK(st.consumed == 8 && st.hinted == st.pairs - 1);
+    fl::Abandon(d.queue.Get(), t10);
     d.WaitIdle();
     return 0;
 }
@@ -641,7 +722,19 @@ int case_split_reset(test::Device& d, FakeEngine& fake)
     h.Frame(t4, 0, 0, nullptr);
     fl::Ticket t5 = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(6, 5, 0, 0));
     CHECK(t5.valid && t5.pair);
+    CHECK(!fake.hints_last); // frame 5 was encode-only: no seed for this pair
     h.Frame(t5, 0, 0, nullptr);
+    fl::Ticket t6 = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(7, 6, 0, 0));
+    CHECK(t6.valid && t6.pair);
+    CHECK(fake.hints_last); // continues the chain 5 -> 6 -> 7
+    fl::Abandon(d.queue.Get(), t6); // its job still runs, on an image that was never committed
+    fl::Ticket t7 = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(8, 7, 0, 0));
+    CHECK(t7.valid && !t7.pair); // nothing to pair with after an abandon
+    h.Frame(t7, 0, 0, nullptr);
+    fl::Ticket t8 = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(9, 8, 0, 0));
+    CHECK(t8.valid && t8.pair);
+    CHECK(!fake.hints_last); // the abandoned job's output is never a seed
+    h.Frame(t8, 0, 0, nullptr);
     REQUIRE(h.WaitJ2(5000));
     d.WaitIdle();
     return 0;
@@ -662,6 +755,7 @@ int main(int argc, char** argv)
             return test::kSkip;
         }
         case_pair(d, nullptr);
+        case_still_jitter(d, nullptr);
         fl::Shutdown();
         for (const std::string& r : g_recap) std::printf("recap: %s\n", r.c_str());
         return test::finish("j2_flow_test --real");
@@ -669,6 +763,7 @@ int main(int argc, char** argv)
     FakeEngine fake;
     REQUIRE(fake.Create(d));
     case_pair(d, &fake);
+    case_still_jitter(d, &fake);
     case_flicker(d, fake);
     case_false_flow(d, fake);
     case_engine_fail(d, fake);
