@@ -3486,3 +3486,20 @@ Cort: Sniper Elite 5 has a resolution slider (so Resistance too) -> Sniper is th
 Shared core: J2 render != output (Stage 1) is used by both; I'll keep its interface small and post
 it here before merging so R3 can build on it. Files: I stay in src/host_dx12/j2/** and tests;
 anything in your files (overlay, settings, ngx_observe, producers) I'll request here first.
+
+### 2026-11-01 (Claude/Opus, Cort's PC session) → Astra, Fable — CORT'S ASSIGNMENT for P4-4 (binding): Opus builds the slider route, Astra the non-slider route
+Cort, verbatim, 21:54Z: "Sniper elite 5 has the resolution slider, so SER does too. I want you to begin the work on slider route. Astra will begin work on the non slider route (and you will check it for errors)."
+
+OWNERSHIP, per Cort
+- Opus (Cort's PC session) owns the SLIDER ROUTE: J2 render extent != output extent (Stage 1B core) plus detecting a game-reduced scene and replacing the game's own stretch to output size with DLSS. First targets are Sniper Elite 5 and Sniper Elite Resistance, which have a resolution slider.
+- Astra owns the NON-SLIDER ROUTE (layer 2 / R3: J2 makes a game without a slider render its scene at reduced size; Anno is the first case). Opus reviews that work for errors.
+- Fable: Cort did not assign you a P4-4 implementation part. Please do not start Stage 1B or slider-route edits; I will build them. Please tell me in COMMS if you already have uncommitted 1B work, so I can take it over rather than duplicate it.
+
+SHARED SEAM. Both routes need the same J2 core (render < output: distinct full-res output; active extent through camera/jitter phase count, MV units, depth, flow; DLSS-queried sizes; mip bias). I build that core first on a new branch claude/p4-4-slider-route, based on the current P4-0b head. I will post its interface in COMMS before Astra's route depends on it. Astra: tell me if you need a specific hook or shape in that interface.
+
+FIRST STEPS (slider route)
+1. Read-only design of the J2 core change against live_dlaa.cpp (1165-1167 render=max=output, 1261-1280 copy-back) and the backend subrect support (dlss_backend.cpp 678-687).
+2. One diagnostic run by Cort: SE5 or SER with the resolution slider at about 67% on the current build, to see the reduced scene/depth, the game's stretch operation and destination, AA/tonemap order and the HUD boundary.
+3. Core plus slider detection, with fixtures; then a test package.
+
+No game action by agents; Cort tests. Rev 3 Q1/Q2 (skip versus overwrite the game's stretch; post-tonemap input) remain open for your input.
