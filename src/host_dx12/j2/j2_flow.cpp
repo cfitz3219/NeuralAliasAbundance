@@ -27,7 +27,7 @@ constexpr uint32_t kInputs = 3;  // encoded images: current, previous, one retir
 constexpr uint32_t kGrids = 2;   // engine outputs (one being read while the other is written)
 constexpr uint32_t kSlots = 8;   // >= J2's ring (6): descriptor blocks and read-back slots
 constexpr uint32_t kPre = 8;     // pre-list allocators
-constexpr uint32_t kCounters = 8; // per slot: accepted, invalid, small, cost, offscreen, image, cost_sum, cost_n
+constexpr uint32_t kCounters = 10; // per slot: accepted, invalid, small, cost, offscreen, image, flicker, (unused), cost_sum, cost_n
 constexpr uint32_t kCostMax = 160;     // engine cost above this rejects the block (tuning target, reported as mean_cost)
 // Residuals below 1 px are not trusted. Anno run (d927268, 3440x1440, engine at half
 // size): ~70% of the picture carried an accepted residual, i.e. sub-pixel disagreement
@@ -42,6 +42,16 @@ constexpr float kImageMargin = 0.02f;  // and never clearly worse than the camer
 // flat background), cost and image checks cannot reject them, and camera motion
 // reprojects a flat area just as well. Flat pixels stay camera-only.
 constexpr float kTextureMin = 0.03f;
+// Temporal agreement. Anno capture j2-20261031-182516 (1a43e50, still camera, 30 frames): 0.5-7.7 %
+// of the picture carried 1-4 px residuals spread over the whole screen, flipping direction
+// between consecutive frames (agreement -0.97..-1.00) in step with the DLAA jitter: the
+// half-size engine misreads the sub-pixel jitter shift of thin edges (posts, rigging) as
+// block motion, and texture, cost and image checks all pass. A residual is only trusted once
+// the same object point has carried an agreeing residual (same direction, within kAgreePx or
+// half its size) for kAgreeMin consecutive pairs; the history is looked up at the pixel the
+// flow says the point came from. Jitter flicker reverses every frame and never qualifies.
+constexpr uint32_t kAgreeMin = 2;  // pairs of agreement before acceptance (the third pair is the first accepted)
+constexpr float kAgreePx = 1.0f;
 
 // ------------------------------------------------------------------ shaders
 const char kShader[] = R"(
@@ -52,15 +62,19 @@ Texture2D<float>  t_valid : register(t3);
 Texture2D<uint>   t_cost  : register(t4);
 Texture2D<float4> t_cur   : register(t5);
 Texture2D<float4> t_prev  : register(t6);
+Texture2D<float4> t_hist  : register(t7); // previous pair: xy residual candidate, z agreeing pairs so far
 RWTexture2D<float4> u_enc : register(u0);
 RWTexture2D<float>  u_mask : register(u1);
 RWByteAddressBuffer u_cnt : register(u2);
+RWTexture2D<float4> u_hist : register(u3);
 SamplerState s_lin : register(s0);
 cbuffer C : register(b0) {
     uint w, h, ew, eh;
     uint mode, block, has_cost, cost_max;
     uint cnt_off, gw, gh, pad0;
     float snap_px, image_margin, image_abs, texture_min;
+    uint have_hist, agree_min, pad1, pad2;
+    float agree_px, pad3, pad4, pad5;
 };
 float3 srgb_encode(float3 v) { v = saturate(v); return v <= 0.0031308 ? 12.92 * v : 1.055 * pow(v, 1.0 / 2.4) - 0.055; }
 // One fixed transform for every image (both images of a pair are encoded alike).
@@ -102,13 +116,14 @@ float texture_at(float2 p) {
     }
     return hi - lo;
 }
-groupshared uint gs[8];
+groupshared uint gs[10];
 [numthreads(8, 8, 1)]
 void accept(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
-    if (gi < 8) gs[gi] = 0;
+    if (gi < 10) gs[gi] = 0;
     GroupMemoryBarrierWithGroupSync();
     if (id.x < w && id.y < h) {
-        uint why = 0; // 0 accepted, 1 invalid, 2 small, 3 cost, 4 offscreen, 5 image (or flat)
+        uint why = 0; // 0 accepted, 1 invalid, 2 small, 3 cost, 4 offscreen, 5 image (or flat), 6 flicker (no agreement yet)
+        float streak = 0;
         uint cost = 0;
         bool costed = false;
         float v = t_valid[id.xy];
@@ -135,12 +150,24 @@ void accept(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
                 if (!(e_flow <= image_abs && e_flow <= e_cam + image_margin)) why = 5;
             }
         }
+        if (why == 0) {
+            // Temporal agreement: the previous pair's candidate where this point came from.
+            if (have_hist != 0) {
+                float4 hp = t_hist.Load(int3(clamp(int2(floor(p + raw)), int2(0, 0), int2(w - 1, h - 1)), 0));
+                float2 hr = hp.xy;
+                bool agree = all(isfinite(hr)) && length(hr) >= snap_px && dot(r, hr) > 0.0 &&
+                             length(r - hr) <= max(agree_px, 0.5 * length(r));
+                streak = agree ? hp.z + 1.0 : 0.0;
+            }
+            if (streak < float(agree_min)) why = 6;
+        }
+        u_hist[id.xy] = why == 0 || why == 6 ? float4(r, streak, 0.0) : float4(0, 0, 0, 0);
         u_mask[id.xy] = why == 0 ? 1.0 : 0.0;
         InterlockedAdd(gs[why], 1u);
-        if (costed) { InterlockedAdd(gs[6], cost); InterlockedAdd(gs[7], 1u); }
+        if (costed) { InterlockedAdd(gs[8], cost); InterlockedAdd(gs[9], 1u); }
     }
     GroupMemoryBarrierWithGroupSync();
-    if (gi < 8 && gs[gi] != 0) u_cnt.InterlockedAdd(cnt_off + gi * 4, gs[gi]);
+    if (gi < 10 && gs[gi] != 0) u_cnt.InterlockedAdd(cnt_off + gi * 4, gs[gi]);
 }
 )";
 
@@ -149,8 +176,12 @@ struct Constants {
     uint32_t mode, block, has_cost, cost_max;
     uint32_t cnt_off, gw, gh, pad0;
     float snap_px, image_margin, image_abs, texture_min;
+    uint32_t have_hist, agree_min, pad1, pad2;
+    float agree_px, pad3, pad4, pad5;
 };
 constexpr UINT kConstantWords = static_cast<UINT>(sizeof(Constants) / 4);
+constexpr uint32_t kUav = 8;    // first UAV descriptor in a table (SRVs t0..t7 before it)
+constexpr uint32_t kTable = 12; // descriptors per table
 
 // ------------------------------------------------------------------ engine
 class NvofEngine final : public Engine {
@@ -256,6 +287,10 @@ struct State {
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
     ComPtr<ID3D12Resource> color_copy;                          // COPY_DEST at rest
     ComPtr<ID3D12Resource> raw, expand_valid, residual, valid, mask; // NON_PIXEL_SHADER_RESOURCE at rest
+    ComPtr<ID3D12Resource> hist[2];  // RGBA16F temporal history (ping-pong per consumed pair), NPSR at rest
+    uint32_t hist_read = 0;          // index read by the next fusion; the other one is written
+    uint64_t hist_frame = 0;         // frame of the last consumed pair's current image (0: no history)
+    uint32_t hist_generation = 0;
     Image img[kInputs];
     Grid grids[kGrids];
     uint32_t next_grid = 0;
@@ -356,11 +391,11 @@ bool build_programs()
         return false;
     D3D12_DESCRIPTOR_RANGE ranges[2]{};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    ranges[0].NumDescriptors = 7;
+    ranges[0].NumDescriptors = 8;
     ranges[0].OffsetInDescriptorsFromTableStart = 0;
     ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    ranges[1].NumDescriptors = 3;
-    ranges[1].OffsetInDescriptorsFromTableStart = 7;
+    ranges[1].NumDescriptors = 4;
+    ranges[1].OffsetInDescriptorsFromTableStart = 8;
     D3D12_ROOT_PARAMETER params[2]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[0].DescriptorTable.NumDescriptorRanges = 2;
@@ -391,7 +426,7 @@ bool build_programs()
     if (FAILED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_accept)))) return false;
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = kSlots * 2 * 10; // per slot: encode table, accept table
+    hd.NumDescriptors = kSlots * 2 * kTable; // per slot: encode table, accept table
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g.heap)))) return false;
     g.stride = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -425,13 +460,13 @@ bool build_programs()
 D3D12_CPU_DESCRIPTOR_HANDLE cpu_desc(uint32_t slot, uint32_t table, uint32_t i)
 {
     D3D12_CPU_DESCRIPTOR_HANDLE hnd = g.heap->GetCPUDescriptorHandleForHeapStart();
-    hnd.ptr += static_cast<SIZE_T>((slot * 2 + table) * 10 + i) * g.stride;
+    hnd.ptr += static_cast<SIZE_T>((slot * 2 + table) * kTable + i) * g.stride;
     return hnd;
 }
 D3D12_GPU_DESCRIPTOR_HANDLE gpu_table(uint32_t slot, uint32_t table)
 {
     D3D12_GPU_DESCRIPTOR_HANDLE hnd = g.heap->GetGPUDescriptorHandleForHeapStart();
-    hnd.ptr += static_cast<UINT64>((slot * 2 + table) * 10) * g.stride;
+    hnd.ptr += static_cast<UINT64>((slot * 2 + table) * kTable) * g.stride;
     return hnd;
 }
 void srv(uint32_t slot, uint32_t table, uint32_t i, ID3D12Resource* r, DXGI_FORMAT f)
@@ -462,13 +497,15 @@ void uav_raw(uint32_t slot, uint32_t table, uint32_t i)
 // Fills every descriptor of a table (unused ones get valid placeholder views).
 void table_defaults(uint32_t slot, uint32_t table)
 {
-    for (uint32_t i = 0; i < 7; ++i) {
+    for (uint32_t i = 0; i < 8; ++i) {
         const bool is_uint = i == 4;
-        srv(slot, table, i, is_uint ? g.dummy_uint.Get() : g.raw.Get(), is_uint ? DXGI_FORMAT_R8_UINT : DXGI_FORMAT_R32G32_FLOAT);
+        srv(slot, table, i, is_uint ? g.dummy_uint.Get() : i == 7 ? g.hist[0].Get() : g.raw.Get(),
+            is_uint ? DXGI_FORMAT_R8_UINT : i == 7 ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R32G32_FLOAT);
     }
-    uav_tex(slot, table, 7, g.img[0].tex.Get(), DXGI_FORMAT_B8G8R8A8_UNORM);
-    uav_tex(slot, table, 8, g.mask.Get(), DXGI_FORMAT_R32_FLOAT);
-    uav_raw(slot, table, 9);
+    uav_tex(slot, table, kUav + 0, g.img[0].tex.Get(), DXGI_FORMAT_B8G8R8A8_UNORM);
+    uav_tex(slot, table, kUav + 1, g.mask.Get(), DXGI_FORMAT_R32_FLOAT);
+    uav_raw(slot, table, kUav + 2);
+    uav_tex(slot, table, kUav + 3, g.hist[1].Get(), DXGI_FORMAT_R16G16B16A16_FLOAT);
 }
 
 // True when every GPU use of the size-dependent set has finished.
@@ -499,6 +536,7 @@ void release_set()
     for (Image& im : g.img) im = Image{};
     for (Grid& gr : g.grids) gr = Grid{};
     g.color_copy.Reset(); g.raw.Reset(); g.expand_valid.Reset(); g.residual.Reset(); g.valid.Reset(); g.mask.Reset();
+    g.hist[0].Reset(); g.hist[1].Reset(); g.hist_frame = 0; g.hist_read = 0;
     if (g.built && g.engine->Outstanding() == 0) g.engine->Shutdown();
     g.built = false;
     g.last_committed = -1;
@@ -529,7 +567,9 @@ bool build_set(uint32_t w, uint32_t h, DXGI_FORMAT f)
               texture(w, h, DXGI_FORMAT_R32_FLOAT, true, NPSR, g.expand_valid) &&
               texture(w, h, DXGI_FORMAT_R32G32_FLOAT, true, NPSR, g.residual) &&
               texture(w, h, DXGI_FORMAT_R32_FLOAT, true, NPSR, g.valid) &&
-              texture(w, h, DXGI_FORMAT_R32_FLOAT, true, NPSR, g.mask);
+              texture(w, h, DXGI_FORMAT_R32_FLOAT, true, NPSR, g.mask) &&
+              texture(w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, true, NPSR, g.hist[0]) &&
+              texture(w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, true, NPSR, g.hist[1]);
     for (Image& im : g.img) ok = ok && texture(ew, eh, DXGI_FORMAT_B8G8R8A8_UNORM, true, kCommon, im.tex);
     for (Grid& gr : g.grids) {
         ok = ok && texture(g.engine->OutWidth(), g.engine->OutHeight(), DXGI_FORMAT_R16G16_SINT, false, kCommon, gr.tex);
@@ -633,8 +673,8 @@ void read_back()
         uint32_t c[kCounters];
         std::memcpy(c, g.readback_ptr + s * (kCounters * 4 + 16), sizeof c);
         g.stats.px_accepted = c[0]; g.stats.px_invalid = c[1]; g.stats.px_small = c[2];
-        g.stats.px_cost = c[3]; g.stats.px_offscreen = c[4]; g.stats.px_image = c[5];
-        g.stats.mean_cost = c[7] ? static_cast<float>(c[6]) / static_cast<float>(c[7]) : 0.f;
+        g.stats.px_cost = c[3]; g.stats.px_offscreen = c[4]; g.stats.px_image = c[5]; g.stats.px_flicker = c[6];
+        g.stats.mean_cost = c[9] ? static_cast<float>(c[8]) / static_cast<float>(c[9]) : 0.f;
         if (g.slot_has_ts[s] && g.ts_freq > 0) {
             uint64_t ts[2];
             std::memcpy(ts, g.readback_ptr + s * (kCounters * 4 + 16) + kCounters * 4, sizeof ts);
@@ -780,7 +820,7 @@ Ticket Prepare(ID3D12Device* device, ID3D12CommandQueue* queue, const Source& sr
     }
     table_defaults(slot, 0);
     srv(slot, 0, 0, g.color_copy.Get(), src.format);
-    uav_tex(slot, 0, 7, im.tex.Get(), DXGI_FORMAT_B8G8R8A8_UNORM);
+    uav_tex(slot, 0, kUav + 0, im.tex.Get(), DXGI_FORMAT_B8G8R8A8_UNORM);
     Constants c{};
     c.w = src.width; c.h = src.height; c.ew = g.ew; c.eh = g.eh;
     c.mode = is_float(src.format) ? 1u : 0u;
@@ -902,7 +942,18 @@ bool RecordFusion(ID3D12GraphicsCommandList* l, Ticket& t, ID3D12Resource* depth
     srv(slot, 1, 4, cost ? gr.cost.Get() : g.dummy_uint.Get(), DXGI_FORMAT_R8_UINT);
     srv(slot, 1, 5, cur.tex.Get(), DXGI_FORMAT_B8G8R8A8_UNORM);
     srv(slot, 1, 6, prev.tex.Get(), DXGI_FORMAT_B8G8R8A8_UNORM);
-    uav_tex(slot, 1, 8, g.mask.Get(), DXGI_FORMAT_R32_FLOAT);
+    uav_tex(slot, 1, kUav + 1, g.mask.Get(), DXGI_FORMAT_R32_FLOAT);
+    // Temporal history: read the last consumed pair's candidates when this pair continues it
+    // (its previous image is that pair's current image); write this pair's into the other one.
+    ID3D12Resource* hist_in = g.hist[g.hist_read].Get();
+    ID3D12Resource* hist_out = g.hist[g.hist_read ^ 1].Get();
+    const bool have_hist = g.hist_frame != 0 && prev.frame == g.hist_frame && prev.generation == g.hist_generation;
+    srv(slot, 1, 7, hist_in, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    uav_tex(slot, 1, kUav + 3, hist_out, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    {
+        D3D12_RESOURCE_BARRIER b = transition(hist_out, NPSR, UAVS);
+        l->ResourceBarrier(1, &b);
+    }
     Constants c{};
     c.w = g.w; c.h = g.h; c.ew = g.ew; c.eh = g.eh;
     c.block = g.grid_n * g.ds;
@@ -911,6 +962,7 @@ bool RecordFusion(ID3D12GraphicsCommandList* l, Ticket& t, ID3D12Resource* depth
     c.cnt_off = off;
     c.gw = g.engine->OutWidth(); c.gh = g.engine->OutHeight();
     c.snap_px = kSnapPx; c.image_margin = kImageMargin; c.image_abs = kImageAbs; c.texture_min = kTextureMin;
+    c.have_hist = have_hist ? 1u : 0u; c.agree_min = kAgreeMin; c.agree_px = kAgreePx;
     ID3D12DescriptorHeap* heaps[] = {g.heap.Get()};
     l->SetDescriptorHeaps(1, heaps);
     l->SetComputeRootSignature(g.root.Get());
@@ -919,10 +971,12 @@ bool RecordFusion(ID3D12GraphicsCommandList* l, Ticket& t, ID3D12Resource* depth
     l->SetComputeRoot32BitConstants(1, kConstantWords, &c, 0);
     if (ok) l->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
     {
-        D3D12_RESOURCE_BARRIER b[8];
+        D3D12_RESOURCE_BARRIER b[10];
         UINT n = 0;
         b[n++] = uav(g.mask.Get());
         b[n++] = uav(g.counters.Get());
+        b[n++] = uav(hist_out);
+        b[n++] = transition(hist_out, UAVS, NPSR);
         b[n++] = transition(g.mask.Get(), UAVS, NPSR);
         b[n++] = transition(g.counters.Get(), UAVS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         b[n++] = transition(gr.tex.Get(), NPSR, kCommon);
@@ -943,6 +997,9 @@ bool RecordFusion(ID3D12GraphicsCommandList* l, Ticket& t, ID3D12Resource* depth
     }
     if (!ok) return false;
     t.consumed = true;
+    g.hist_read ^= 1;
+    g.hist_frame = cur.frame;
+    g.hist_generation = cur.generation;
     out->residual = g.residual.Get();
     out->mask = g.mask.Get();
     out->valid = g.valid.Get();

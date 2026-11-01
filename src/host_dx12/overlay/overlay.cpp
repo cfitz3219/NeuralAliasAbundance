@@ -705,7 +705,7 @@ void write_status_line()
             const auto fs = na::j2::flow::GetStats();
             char fl[640];
             const int fn = snprintf(fl, sizeof(fl),
-                "j2flow on=%u available=%u active=%u latched=%u cost=%u size=%ux%u engine=%ux%u grid=%u perf=%u ds=%u pairs=%llu consumed=%llu encode_only=%llu abandoned=%llu skip_busy=%llu skip_split=%llu skip_msaa=%llu skip_reset=%llu skip_resize=%llu engine_failed=%llu watchdog=%llu px_acc=%llu px_inv=%llu px_small=%llu px_cost=%llu px_off=%llu px_img=%llu mean_cost=%.1f ms=%.2f ms_avg=%.2f \"%s\"\r\n",
+                "j2flow on=%u available=%u active=%u latched=%u cost=%u size=%ux%u engine=%ux%u grid=%u perf=%u ds=%u pairs=%llu consumed=%llu encode_only=%llu abandoned=%llu skip_busy=%llu skip_split=%llu skip_msaa=%llu skip_reset=%llu skip_resize=%llu engine_failed=%llu watchdog=%llu px_acc=%llu px_inv=%llu px_small=%llu px_cost=%llu px_off=%llu px_img=%llu px_flk=%llu mean_cost=%.1f ms=%.2f ms_avg=%.2f \"%s\"\r\n",
                 fs.enabled, fs.available, fs.active, fs.latched, fs.cost, fs.width, fs.height, fs.engine_w, fs.engine_h, fs.grid, fs.perf, fs.downscale,
                 static_cast<unsigned long long>(fs.pairs), static_cast<unsigned long long>(fs.consumed), static_cast<unsigned long long>(fs.encode_only),
                 static_cast<unsigned long long>(fs.abandoned), static_cast<unsigned long long>(fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_split),
@@ -713,6 +713,7 @@ void write_status_line()
                 static_cast<unsigned long long>(fs.engine_failed), static_cast<unsigned long long>(fs.watchdog_trips),
                 static_cast<unsigned long long>(fs.px_accepted), static_cast<unsigned long long>(fs.px_invalid), static_cast<unsigned long long>(fs.px_small),
                 static_cast<unsigned long long>(fs.px_cost), static_cast<unsigned long long>(fs.px_offscreen), static_cast<unsigned long long>(fs.px_image),
+                static_cast<unsigned long long>(fs.px_flicker),
                 fs.mean_cost, fs.ms_last, fs.ms_avg, fs.reason);
             if (fn > 0) WriteFile(f, fl, static_cast<DWORD>((std::min)(fn, static_cast<int>(sizeof(fl) - 1))), &written, nullptr);
         }

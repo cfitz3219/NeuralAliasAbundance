@@ -972,11 +972,12 @@ void DrawLiveDlaa()
         EndRow();
         if (fl) {
             const na::j2::flow::Stats fs = na::j2::flow::GetStats();
-            const uint64_t px = fs.px_accepted + fs.px_invalid + fs.px_small + fs.px_cost + fs.px_offscreen + fs.px_image;
+            const uint64_t px = fs.px_accepted + fs.px_invalid + fs.px_small + fs.px_cost + fs.px_offscreen + fs.px_image + fs.px_flicker;
             const double pct = px ? 100.0 * static_cast<double>(fs.px_accepted) / static_cast<double>(px) : 0.0;
             char tb[360];
-            std::snprintf(tb, sizeof tb, "%s Moving pixels found: %.1f%% of the picture. Cost %.2f ms (average %.2f). Pairs %llu, camera-only frames %llu (batch %llu, busy %llu, reset %llu).",
-                          fs.reason, pct, fs.ms_last, fs.ms_avg, static_cast<unsigned long long>(fs.consumed),
+            const double flick = px ? 100.0 * static_cast<double>(fs.px_flicker) / static_cast<double>(px) : 0.0;
+            std::snprintf(tb, sizeof tb, "%s Moving pixels found: %.1f%% of the picture (%.1f%% rejected as jitter flicker). Cost %.2f ms (average %.2f). Pairs %llu, camera-only frames %llu (batch %llu, busy %llu, reset %llu).",
+                          fs.reason, pct, flick, fs.ms_last, fs.ms_avg, static_cast<unsigned long long>(fs.consumed),
                           static_cast<unsigned long long>(fs.encode_only + fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_split),
                           static_cast<unsigned long long>(fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_reset));
             StatusLine(fs.latched ? 2 : 0, tb);
