@@ -435,7 +435,9 @@ int case_pair(test::Device& d, FakeEngine* fake)
                 (unsigned long long)st.px_small, (unsigned long long)st.px_cost, (unsigned long long)st.px_offscreen, (unsigned long long)st.px_image,
                 st.mean_cost);
     recap("pair reason: %s", st.reason);
-    CHECK(st.pairs >= 1 && st.consumed == 1 && st.px_accepted > 200 && st.px_accepted <= 1536);
+    // Object 48x32 plus an edge band up to 8 px (the texture window touches the object;
+    // flat background there matches flat background either way). Real RTX 5070 Ti: 2000.
+    CHECK(st.pairs >= 1 && st.consumed == 1 && st.px_accepted > 200 && st.px_accepted <= 3072);
     if (fake) CHECK(st.cost == 1 && std::fabs(st.mean_cost - 10.f) < 0.5f);
     fl::Abandon(d.queue.Get(), t3);
     if (fake) fake->OpenGate();
