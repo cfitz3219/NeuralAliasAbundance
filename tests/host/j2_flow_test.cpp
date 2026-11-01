@@ -724,11 +724,21 @@ int case_split_reset(test::Device& d, FakeEngine& fake)
     CHECK(t5.valid && t5.pair);
     CHECK(!fake.hints_last); // frame 5 was encode-only: no seed for this pair
     h.Frame(t5, 0, 0, nullptr);
+    REQUIRE(h.WaitJ2(5000));
     fl::Ticket t6 = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(7, 6, 0, 0));
     CHECK(t6.valid && t6.pair);
     CHECK(fake.hints_last); // continues the chain 5 -> 6 -> 7
     fl::Abandon(d.queue.Get(), t6); // its job still runs, on an image that was never committed
+    {
+        // Let that job finish on the engine's queue: the module never waits, and the next
+        // Prepare needs a free image slot (all three are busy until the job's fence passes).
+        ComPtr<ID3D12Fence> f;
+        d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f));
+        fake.q->Signal(f.Get(), 1);
+        REQUIRE(test::WaitFence(f.Get(), 1, d.event, 5000) == test::WaitResult::Ok);
+    }
     fl::Ticket t7 = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(8, 7, 0, 0));
+    if (!t7.valid) recap("split/reset after abandon: %s", fl::GetStats().reason);
     CHECK(t7.valid && !t7.pair); // nothing to pair with after an abandon
     h.Frame(t7, 0, 0, nullptr);
     fl::Ticket t8 = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(9, 8, 0, 0));
