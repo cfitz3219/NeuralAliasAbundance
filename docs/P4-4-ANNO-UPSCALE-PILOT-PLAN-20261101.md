@@ -22,6 +22,12 @@ in COMMS before edits, as P4-4 says.
   Pilot mechanism: write the DLSS ratio (e.g. 0.666667) there at process start, before the game
   reads the file, so it applies on the first launch; a mid-game change applies on the next launch
   until a live engine setter is found. To verify in the first run: the game keeps the value.
+- **Coverage:** the DLSS path never depends on where the setting lives (J2 detects the real
+  reduced extent; any slider step works). One-click needs a per-engine profile (file, key,
+  format): Unreal screen percentage (existing), Rebellion's GraphicsOptions.ini RenderScale
+  (Sniper verified; other Rebellion titles likely, unverified). No profile -> the menu asks the user
+  to set the game's slider once to ~65-70%. No auto-scan confirmed on a later launch (that is
+  learn-then-apply, ruled out).
 
 History: rev 1 (corner/subrect), rev 2 (creation-time shrink), rev 3 (game's FSR as the Anno pilot)
 and rev 4 (no game scaler at all) are superseded; see COMMS a285862 to 8ed6614.
