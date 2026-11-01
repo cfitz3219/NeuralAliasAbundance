@@ -153,7 +153,8 @@ void accept(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         if (why == 0) {
             // Temporal agreement: the previous pair's candidate where this point came from.
             if (have_hist != 0) {
-                float4 hp = t_hist.Load(int3(clamp(int2(floor(p + raw)), int2(0, 0), int2(w - 1, h - 1)), 0));
+                float2 from = float2(id.xy) + 0.5 + raw;
+                float4 hp = t_hist.Load(int3(clamp(int2(floor(from)), int2(0, 0), int2(int(w) - 1, int(h) - 1)), 0));
                 float2 hr = hp.xy;
                 bool agree = all(isfinite(hr)) && length(hr) >= snap_px && dot(r, hr) > 0.0 &&
                              length(r - hr) <= max(agree_px, 0.5 * length(r));
@@ -387,8 +388,10 @@ bool build_programs()
     if (g.programs) return true;
     ComPtr<ID3DBlob> cs_encode, cs_accept, err;
     if (FAILED(D3DCompile(kShader, sizeof kShader - 1, "j2_flow", nullptr, nullptr, "encode", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs_encode, &err)) ||
-        FAILED(D3DCompile(kShader, sizeof kShader - 1, "j2_flow", nullptr, nullptr, "accept", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs_accept, &err)))
+        FAILED(D3DCompile(kShader, sizeof kShader - 1, "j2_flow", nullptr, nullptr, "accept", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs_accept, &err))) {
+        if (err) std::snprintf(g.reason, sizeof g.reason, "j2_flow shader: %.140s", static_cast<const char*>(err->GetBufferPointer()));
         return false;
+    }
     D3D12_DESCRIPTOR_RANGE ranges[2]{};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     ranges[0].NumDescriptors = 8;
@@ -656,7 +659,11 @@ bool ensure_engine(ID3D12Device* device, ID3D12CommandQueue* queue)
     }
     if (!g.available) return false;
     if (!typed_uav_store(DXGI_FORMAT_B8G8R8A8_UNORM)) { latch("Moving-object motion cannot write its engine input format here."); return false; }
-    if (!build_programs()) { latch("Moving-object motion could not build its GPU programs."); return false; }
+    if (!build_programs()) {
+        if (std::strncmp(g.reason, "j2_flow shader", 14) != 0) set_reason("Moving-object motion could not build its GPU programs.");
+        g.latched = true; // a shader compile error keeps its own text (the test recap shows it)
+        return false;
+    }
     if (!g.watchdog_started) {
         g.watchdog_started = true;
         std::thread(watchdog_loop).detach();
