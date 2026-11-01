@@ -148,6 +148,17 @@ else()
 endif()
 target_link_libraries(host_nvof PUBLIC abundance_options d3d12 d3dcompiler)
 
+# P4-0c: AMD FidelityFX optical flow (compute; inline route and NVOFA fallback). Shaders are
+# compiled by DXC at build time (cmake/ffx_flow_shaders.cmake); without DXC it is a stub.
+include(cmake/ffx_flow_shaders.cmake)
+add_library(host_ffx_flow STATIC src/host_dx12/ffx_flow/ffx_flow_shaders.cpp)
+target_link_libraries(host_ffx_flow PUBLIC abundance_options d3d12)
+if(NA_HAVE_FFX_FLOW)
+  target_compile_definitions(host_ffx_flow PUBLIC NA_HAVE_FFX_FLOW)
+  target_include_directories(host_ffx_flow PRIVATE "${CMAKE_BINARY_DIR}/generated/ffx_flow")
+  add_dependencies(host_ffx_flow ffx_flow_shaders)
+endif()
+
 # ---------------------------------------------------------------- host_dx12
 # The in-game host. These modules reference each other freely (overlay <->
 # ngx_observe <-> nr/fg/motion <-> latency <-> tlou1), so they form one library.
@@ -196,7 +207,7 @@ endif()
 # NVIDIA Image Scaling (MIT, vendored): sharpen-only stage of J2's Sharpness slider.
 target_include_directories(host_dx12 SYSTEM PRIVATE third_party/nis)
 target_link_libraries(host_dx12
-  PUBLIC abundance_options host_hooking host_settings host_capture host_nvof core_gpu imgui nvapi_headers host_dlss host_upscalers host_observe_producers
+  PUBLIC abundance_options host_hooking host_settings host_capture host_nvof host_ffx_flow core_gpu imgui nvapi_headers host_dlss host_upscalers host_observe_producers
          d3d12 dxgi d3dcompiler user32 gdi32 shell32 ole32 bcrypt dbghelp winmm)
 if(NA_HAVE_NGX_SDK)
   target_compile_definitions(host_dx12 PUBLIC NA_HAVE_NGX_SDK)
