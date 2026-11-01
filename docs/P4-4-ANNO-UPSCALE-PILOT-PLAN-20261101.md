@@ -159,3 +159,11 @@ Corrections adopted:
   (reduced resource pointers/subresources, actual states, active extent, one group generation);
   logical native ids stay for discovery/camera. Fable builds it.
 - Flow off while upscaling stays a documented pilot limit.
+
+## Live mode switching idea (Cort asked 22:41Z; to test in the Sniper package)
+Startup substitution sets the launch mode. For live switching: substitute a tagged value (e.g.
+0.6666671, distinguishable from any value the game would write), then scan the game's writable
+memory once for that exact float/double after the settings parse; to switch modes, write the new
+value there and confirm from J2's detected extent within a few frames (log whether the game
+reacted). Unknown per game whether the engine re-reads it live; if not, the menu says "applies on
+next launch". Several hits -> write none (log). Never touch memory we did not find this way.
