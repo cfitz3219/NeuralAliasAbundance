@@ -256,9 +256,9 @@ BOOL WINAPI read_file(HANDLE h, LPVOID buf, DWORD n, LPDWORD got, LPOVERLAPPED o
 bool ours_value(const Patched& p, const std::string& text, double v)
 {
     if (text == p.ours) return true;
-    const auto near = [&](double a) { return std::fabs(v - a) <= 1e-5 * (std::max)(1.0, std::fabs(a)); };
-    if (near(p.ours_value)) return true;
-    for (double w : g_live.values_written) if (near(w)) return true;
+    const auto close_to = [&](double a) { return std::fabs(v - a) <= 1e-5 * (std::max)(1.0, std::fabs(a)); };
+    if (close_to(p.ours_value)) return true;
+    for (double w : g_live.values_written) if (close_to(w)) return true;
     return false;
 }
 
