@@ -1,111 +1,94 @@
-# P4-4 pilot: DLSS upscaling on the J2 route, Anno first (plan rev 4, 2026-11-01)
+# P4-4: DLSS upscaling on the J2 route (plan rev 5, 2026-11-01)
 
-**Cort's binding direction (2026-11-01, repeated):** we do NOT use a game's FSR or any game scaler,
-not even as the first proving case, because that limits the program to games that ship one. Every
-route below makes a game with no scaler render smaller. Rev 4 removes the "game's own scale" route
-of rev 2/3 (COMMS 4563ef8) and the stages that depended on it; COMMS has the correction entry.
+Status: plan for review (Astra/Sol), iterated on COMMS until solid (Cort). No code yet. Owner of
+the J2 side: Fable/Opus. Shared files (observation hooks, overlay, settings) need ownership agreed
+in COMMS before edits, as P4-4 says.
 
+## Cort's binding direction (2026-11-01)
 
-Status: plan for review (Astra/Sol). No code yet. Owner of the J2 side: Fable/Opus. Shared files
-(observation hooks, overlay, settings) need ownership agreed in COMMS before edits, as P4-4 says.
+- **No FSR route.** A game's FSR (or any vendor upscaler) is never the mechanism: it limits the
+  program to games that ship one.
+- **The game's own resolution / render-scale slider is the main route.** Nearly all games since
+  2018 have one (Argon). It makes the game render its 3D scene smaller with the HUD at full size, so
+  the game itself creates the smaller scene textures; no texture shrinking by us.
+- **No "learn on the first launch, apply on the second".**
 
-Rev 2 (same day, history): Cort supplied a second proposal (two stages: J2 upscaling from a smaller scene
-pair; shrinking the scene textures at creation instead of drawing into a corner). Its critique of
-the corner approach matches Sol's correction 2 and is adopted; the corner method is kept only for
-engines already built for dynamic resolution. Stage 1 below is that proposal's first stage minus its reliance on a game scaler; Stage
-P2 is its second, with the safety rules it lacks.
+History: rev 1 (corner/subrect), rev 2 (creation-time shrink), rev 3 (game's FSR as the Anno pilot)
+and rev 4 (no game scaler at all) are superseded; see COMMS a285862 to 8ed6614.
 
 ## Goal and constraints
 
-- Cort (2026-11-01): DLSS upscaling must work in games that have no upscaler of their own. A game's
-  own FSR/scaler option is not used at all.
-- Pilot: Anno 1800, one reduced size only (DLSS Quality at 3440x1440, size taken from NGX's optimal
-  settings query, not hard-coded), output 3440x1440. Off by default; J2 DLAA stays the default.
-- Success is judged by matched pictures and GPU time, not by "it runs". A smaller raster area does
-  not guarantee higher fps (Sol, COMMS a285862).
+- DLSS Super Resolution (render extent < output extent) in DX12 games without DLSS, HUD at output
+  size, DLAA unchanged as the default and the fallback for every case below.
+- Pilot: one game with a resolution slider, one reduced size (DLSS Quality, render size from NGX's
+  optimal-settings query), output at the swapchain size. Off by default.
+- Reuse J2 detection, state, lifetimes and the existing NGX backend. No new solver, no renderer
+  replacement.
+- Success is judged by matched pictures and GPU time, not by "it runs".
 
-## Why the shrink-at-creation route, and where the corner route still fits
+## Route ladder
 
-| | corner (subrect in full buffers) | shrink scene textures at creation |
-|---|---|---|
-| full-screen quads sampling UV 0..1 | wrong pixels | fine |
-| compute dispatches | ignore the viewport | extra threads, otherwise fine |
-| screen-size constants, pixel-addressed loads | wrong | still wrong (must be found and patched) |
-| which textures are the scene | known from J2 | decided at creation, before any frame evidence |
-| copies between scene and other textures | fine | size mismatch = device removed (crash) |
-| full-size DLSS result into later passes | copy-back as today | needs descriptor redirection |
-| depth/motion read later at full size | fine | needs full-size copies |
-| games covered | DRS-built engines only | the rest, where the map allows |
+1. **R1, the game's resolution slider (main route).** The slider is set to the DLSS render size
+   (by the user from our menu's guidance first; setting it for them is a later convenience). J2
+   finds the reduced scene colour + depth, evaluates DLSS into a distinct full-size output, and
+   replaces the game's own spatial stretch to its output target.
+2. **R2, our engine adapters** (existing Unreal screen-percentage and Ghost adapters).
+3. Otherwise DLAA. Creation-time shrinking and subrect rendering are later optional research,
+   not part of this plan.
 
-Both depend on knowing the game's pass structure, so the map comes first in every case.
-
-## Stage 1: J2 upscales from a smaller scene (prerequisite)
+## Stage 1: J2 upscales from a smaller scene (prerequisite, fixtures only)
 
 Teach J2 render != output: evaluate DLSS W_in x H_in -> W_out x H_out (the backend already takes
 separate sizes and input subrects, dlss_backend.cpp 678-687; J2 sets them equal today,
 live_dlaa.cpp 1165-1167, and copies back into the same scene resource, 1261-1280), into a distinct
 full-size output target, carrying the active render extent explicitly through camera/jitter (phase
 count from the ratio), motion units, depth sampling, optical flow and the mip bias
-(log2(render/display) - 1). Built and tested on fixtures (a synthetic scene rendered small, a
-full-size consumer reading J2's output); no game setting is changed for it.
+(log2(render/display) - 1). Active extent and allocation size are tracked separately (a game may
+render a smaller region inside a larger allocation, and colour and depth may differ). Built and
+tested on fixtures; no game setting changed.
 
-## Stage M: scene map (read-only, before any shrinking code)
+## Stage M: map of a slider-reduced frame (read-only)
 
-A diagnostic recording, off by default, built on the existing observation hooks (producers.cpp
-already sees resource creation, OMSetRenderTargets, RSSetViewports, Dispatch, descriptor tables,
-clears and copies) and J2's insertion trace. For a bounded number of frames it writes a text log,
-one line per operation in submission order across the frame's lists:
+Cort sets the game's resolution slider to the DLSS Quality size and does one diagnostic run on the
+current DLAA build. A text recorder, off by default, built on the existing observation hooks and
+J2's insertion trace, logs per operation in submission order for a bounded number of frames:
 
 - list, queue, order; op kind (draw, dispatch, copy, clear, barrier); pipeline and root hash
-- bound render targets / depth target: object ids, extents, formats, creation order and flags
-  (heap type, placed/committed, allow-RT/DS/UAV); viewport and scissor
-- every bound SRV/UAV whose resource is view-sized (same extent as the scene), with its object id,
-  marked when it is the selected scene colour or depth
-- every copy/resolve touching a view-sized texture (source, destination, extents)
-- dispatch group counts
-- screen-size constants: in each bound constant buffer, 4-float groups that match (W, H, 1/W, 1/H),
-  (1/W, 1/H) or (W, H) for the scene extent, with resource and offset (same kind of scan J2 already
-  does for camera blocks)
+- bound render targets / depth target with extents and formats; viewport and scissor
+- every bound SRV/UAV that is scene-sized or output-sized, marking the selected scene colour/depth
+- every copy/resolve touching those textures; dispatch group counts
 - the J2 insertion point, the main-camera binding, and Present
 
-Offline classification of that log (PowerShell or C#, since Python is not installed on Cort's PC):
-main-scene passes; pre-J2 full-screen consumers; post-J2 consumers; copies in and out of the scene
-set; shadows and other views (different extents or camera); HUD; and, for Stage P2, a creation-time
-fingerprint (order, format, flags, size class) of every texture in the scene set.
+From it: (a) the reduced scene colour and depth and their active extents; (b) the operation that
+stretches the scene to output size and its destination; (c) where AA, tonemapping and exposure run
+relative to that stretch; (d) the HUD boundary after it. Pair scene/depth with the actual stretch
+destination (size alone also matches bloom or reflection targets). Offline classification in
+PowerShell or C# (no Python on Cort's PC). The package saves its own log.
 
-Cort's part: one diagnostic run (install the package, one minute still camera plus one pan, exit).
-The package saves its own log; nothing needs to be read off the screen.
+## Stage P: pilot at one size
 
-### Decision gate D1 (reported to Cort and Sol before any shrinking code)
-
-For every view-sized pass and copy found: how it would follow the render extent (texture shrunk;
-screen-size constant patched; dispatch size adjusted; copy partner also shrunk; or "cannot
-follow"). Any "cannot follow" pass or copy that the main picture needs means no-go for Anno
-(stays on DLAA), with the map as evidence. Otherwise the Stage P2 estimate is given from the list.
-
-## Stage P2: shrink the scene set at creation (only after D1)
-
-- Creation hooks (CreateCommittedResource / CreatePlacedResource, swapchain buffers excluded)
-  shrink only textures matching the Stage M fingerprint whitelist for this game; applied on the
-  next launch or on a resize, since the scene set is created before frame evidence exists.
-- Safety rules: never shrink a texture that the map shows copied to or from a full-size texture
-  unless the partner is shrunk too; never shrink UI/composition targets; refuse (stay DLAA) if the
-  creation stream does not match the fingerprint; placed resources keep valid heap offsets.
-- Viewports and scissors are scaled only while a shrunk target is bound.
-- Screen-size constants found in Stage M are patched for the passes that bind shrunk targets;
-  dispatch sizes adjusted where the map shows they follow the screen size.
-- The first full-size consumer after the scene has its scene-colour descriptor redirected to J2's
-  full-size DLSS output (the observation layer already resolves descriptor writes); depth gets a
-  full-size nearest copy if a later pass reads it at full size.
-- Restore and reset through J2's existing state and lifetime handling.
+- J2 inserts DLSS at the stretch: DLSS output written into the stretch's destination, the game's
+  stretch (and any sharpening of it) must not reprocess the result. Mechanism (skip the game's
+  dispatch/draw vs overwrite after it) to be agreed with Astra (open Q1; Fable prefers skip).
+- If the stretch runs after AA/tonemap, the pilot takes that LDR input with honest colour flags and
+  is judged in Stage E; Stage M records whether an earlier HDR point at render size is reachable.
+- Menu: J2 quality selector (DLAA / Quality pilot), the slider value to use, logged in the j2 line.
+- History reset on switching size or mode; every failure falls back to DLAA or the game's own path.
 
 ## Stage E: evidence
 
-Matched ON/OFF captures at the same spot (still camera, pan, moving ships), GPU time from the
-existing timestamps, the j2 log. Cort judges the picture.
+Matched captures at the same spot (DLAA at native, the game's own stretch at the reduced size, DLSS
+at the reduced size), GPU time and fps, ghosting on movers. Cort judges the picture.
 
-## Not in this plan
+## Open with Astra
 
-No new extraction solver, no renderer replacement, no use of any game's own scaler (FSR, DRS,
-resolution slider), no change to the DLAA default. Estimates: Stage 1 about 2-3 days; Stage M about 1-2
-days; Stage P2 only after D1.
+- Q1 skip vs overwrite the game's stretch.
+- Q3 ownership: Fable Stage 1 and the Stage M recorder (bounded, off by default, in producers.cpp,
+  if Astra agrees); Astra placement/insertion (Stage P) as before.
+- Q4 anything to reorder.
+- Which game is the pilot: Anno if it has a resolution slider separate from its FSR option (Cort
+  checking), otherwise a slider game Cort owns.
+
+## Estimates
+
+Stage 1 about 2-3 days; Stage M recorder about 1-2 days; Stage P after the map.
