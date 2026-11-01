@@ -6,7 +6,6 @@
 #include "host_dx12/adapters/unreal/locator.hpp"
 #include <intrin.h>
 #include <array>
-#include "host_dx12/hooking/vtable_hook.hpp"
 
 #include <atomic>
 #include <cmath>
@@ -112,7 +111,9 @@ void process(uintptr_t caller) {
     Pending req;Ownership handback;
     {
         std::lock_guard<std::mutex> lock(g_m);
+        ++g_status.sink_calls;
         if(caller!=g_caller || g_executing)return;
+        ++g_status.game_thread_calls;
         g_executing=true;
         if(g_handback){handback=g_owner;g_owner={};g_handback=false;}
         req=g_pending;g_pending={};
@@ -176,6 +177,28 @@ void sink_detour(void* manager) {
     process(reinterpret_cast<uintptr_t>(_ReturnAddress()));
     g_sink(manager); // newly changed cvars participate in this ordinary sink pass
 }
+bool attach_sink(void** slot,void* expected,char* error,size_t capacity) {
+    if(!slot || !expected){strncpy_s(error,capacity,"Unreal sink slot is missing.",_TRUNCATE);return false;}
+    // Reuse the host's data-vtable patching pattern (observe/producers.cpp).
+    // This exact slot/function/caller association was checked by the locator.
+    // Keep the whole table and original function intact; hooks live for the
+    // pinned module's process lifetime, just like the other host callbacks.
+    DWORD protect=0;
+    if(!VirtualProtect(slot,sizeof(void*),PAGE_READWRITE,&protect)) {
+        snprintf(error,capacity,"Unreal sink slot protection failed (Win32 %lu).",GetLastError());return false;
+    }
+    g_sink=reinterpret_cast<Sink>(expected); // publish before atomic installation
+    void* previous=InterlockedCompareExchangePointer(slot,reinterpret_cast<void*>(&sink_detour),expected);
+    DWORD ignored=0;const bool restored=VirtualProtect(slot,sizeof(void*),protect,&ignored)!=FALSE;
+    if(previous!=expected){strncpy_s(error,capacity,"Unreal sink slot is owned by another callback.",_TRUNCATE);return false;}
+    if(!restored) {
+        const DWORD failure=GetLastError();
+        InterlockedCompareExchangePointer(slot,expected,reinterpret_cast<void*>(&sink_detour));
+        VirtualProtect(slot,sizeof(void*),protect,&ignored);
+        snprintf(error,capacity,"Unreal sink protection restore failed (Win32 %lu); attachment rolled back.",failure);return false;
+    }
+    return true;
+}
 bool image_readable(const Image& image) {
     for(const auto& s:image.sections) {
         size_t at=0;
@@ -214,6 +237,7 @@ DWORD WINAPI worker(LPVOID from_apply) {
     if(valid)found=locator::locate(locator::pe::mapped_image(image.base,image.size,reinterpret_cast<uintptr_t>(image.base)));
     valid=valid && bool(found);
     const char* why=found.reason;
+    char attachment_error[200]{};
     if(valid) {
         // Registration can finish later than module load. Resolve once, then
         // retry the cheap object binding without calling any engine code.
@@ -227,11 +251,9 @@ DWORD WINAPI worker(LPVOID from_apply) {
         g_float_set=reinterpret_cast<Setter>(const_cast<uint8_t*>(image.base)+found.setters[0]);
         g_int_set=reinterpret_cast<Setter>(const_cast<uint8_t*>(image.base)+found.setters[1]);
         g_caller=reinterpret_cast<uintptr_t>(image.base)+found.caller;
-        if(na::hooking::BeginInstallWait("adapters/unreal/screen_percentage.cpp")) {
-            valid=na::hooking::PrepareHook(const_cast<uint8_t*>(image.base)+found.sink,reinterpret_cast<void*>(&sink_detour),reinterpret_cast<void**>(&g_sink));
-            if(valid)valid=na::hooking::CommitInstall();else na::hooking::AbandonInstall();
-        } else valid=false;
-        if(!valid)why="Unreal console interface found, but its game-thread hook could not attach.";
+        auto** slot=reinterpret_cast<void**>(const_cast<uint8_t*>(image.base)+found.manager_table+0x58);
+        valid=attach_sink(slot,const_cast<uint8_t*>(image.base)+found.sink,attachment_error,sizeof attachment_error);
+        if(!valid)why=attachment_error;
     }
     std::lock_guard<std::mutex> lock(g_m);g_status.available=valid;g_status.candidates=found?1:0;
     g_status.state=valid?SpState::Ready:SpState::NotFound;
@@ -289,5 +311,11 @@ void ConfigureForTest(void* f,void* i,Setter fs,Setter is) {
 }
 void DiscoveryForTest(void (*probe)()) {std::lock_guard<std::mutex> lock(g_m);g_discovery_probe=probe;g_started=false;g_start_allowed=false;g_status={};}
 void ProcessForTest(uintptr_t caller){process(caller);}
+bool AttachSinkForTest(void** slot,void* expected,uintptr_t caller,char* error,size_t cap){g_caller=caller;return attach_sink(slot,expected,error,cap);}
+bool RestoreSinkForTest(void** slot) {
+    DWORD p=0,unused=0;if(!VirtualProtect(slot,sizeof(void*),PAGE_READWRITE,&p))return false;
+    const bool ours=InterlockedCompareExchangePointer(slot,reinterpret_cast<void*>(g_sink),reinterpret_cast<void*>(&sink_detour))==reinterpret_cast<void*>(&sink_detour);
+    return VirtualProtect(slot,sizeof(void*),p,&unused)!=FALSE && ours;
+}
 #endif
 } // namespace na::unreal

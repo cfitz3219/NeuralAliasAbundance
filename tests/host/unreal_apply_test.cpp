@@ -2,17 +2,29 @@
 #include "test_support.hpp"
 #include "host_dx12/adapters/unreal/screen_percentage.hpp"
 #include "host_dx12/adapters/mode_control.hpp"
+#include "host_dx12/hooking/vtable_hook.hpp"
+#include <intrin.h>
 #include <array>
 #include <atomic>
 namespace na::unreal {
 void ConfigureForTest(void*,void*,void(*)(void*,const wchar_t*,const void*),void(*)(void*,const wchar_t*,const void*));
 void ProcessForTest(uintptr_t);
 void DiscoveryForTest(void(*)());
+bool AttachSinkForTest(void**,void*,uintptr_t,char*,size_t);
+bool RestoreSinkForTest(void**);
 }
 namespace {
 std::array<uint8_t,0x58> float_object{},int_object{};
 int calls=0;DWORD setter_thread=0;
 std::atomic<int> discovery_calls{0};
+uintptr_t observed_sink_caller=0;LONG tick_returns=0;
+using TestSink=void(*)(void*);
+__declspec(noinline) void probe_sink(void*){observed_sink_caller=reinterpret_cast<uintptr_t>(_ReturnAddress());}
+__declspec(noinline) void invoke_tick(void* manager){
+    auto** table=*static_cast<void***>(manager);
+    const auto sink=*reinterpret_cast<TestSink volatile*>(table+11);
+    sink(manager);InterlockedIncrement(&tick_returns); // preserve a real call, not a tail jump
+}
 template<class T> void put(std::array<uint8_t,0x58>& b,size_t at,T v){std::memcpy(b.data()+at,&v,sizeof(v));}
 template<class T> T get(const std::array<uint8_t,0x58>& b,size_t at){T v{};std::memcpy(&v,b.data()+at,sizeof(v));return v;}
 void set(void* object,const wchar_t* text,const void* params) {
@@ -52,6 +64,36 @@ int main(){
         write(0x40,reinterpret_cast<uintptr_t>(float_object.data())+0x50);CHECK(!BindForTest(image.data(),resolved));
         write(0x40,reinterpret_cast<uintptr_t>(int_object.data())+0x50);put<uintptr_t>(int_object,0,base+0x300);CHECK(!BindForTest(image.data(),resolved));
         put<uintptr_t>(int_object,0,base+0x400);write(0x10,base+0x200);CHECK(!BindForTest(image.data(),resolved));CHECK(calls==0);
+    }
+    {
+        // Exercise actual vtable -> detour -> native setter -> original sink.
+        // A valid one-byte RET function cannot host MinHook's inline patch;
+        // the engine's existing virtual dispatch must work without such a patch.
+        setup();
+        auto* code=static_cast<uint8_t*>(VirtualAlloc(nullptr,4096,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));REQUIRE(code);
+        memset(code,0xf1,4096);code[128]=0xc3;DWORD protect=0;
+        REQUIRE(VirtualProtect(code,4096,PAGE_EXECUTE_READ,&protect));FlushInstructionCache(GetCurrentProcess(),code,4096);
+        void* tiny=code+128;void* unused=nullptr;
+        REQUIRE(na::hooking::Initialize());REQUIRE(na::hooking::BeginInstall());
+        CHECK(!na::hooking::PrepareHook(tiny,reinterpret_cast<void*>(&probe_sink),&unused));
+        na::hooking::AbandonInstall();na::hooking::Shutdown();
+        auto** table=static_cast<void**>(VirtualAlloc(nullptr,4096,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));REQUIRE(table);
+        for(unsigned n=0;n<16;++n)table[n]=reinterpret_cast<void*>(&probe_sink);
+        struct Manager{void** table;} manager{table};invoke_tick(&manager);REQUIRE(observed_sink_caller);
+        table[11]=tiny;REQUIRE(VirtualProtect(table,4096,PAGE_READONLY,&protect));
+        char error[200]{};REQUIRE(AttachSinkForTest(table+11,tiny,observed_sink_caller,error,sizeof error));
+        MEMORY_BASIC_INFORMATION mbi{};REQUIRE(VirtualQuery(table,&mbi,sizeof mbi));CHECK(mbi.Protect==PAGE_READONLY);
+        CHECK(RequestScreenPercentage(66.7f,3440,1440));
+        reinterpret_cast<TestSink>(table[11])(&manager);CHECK(calls==0); // unrelated caller cannot write
+        invoke_tick(&manager);CHECK(calls==2);CHECK(setter_thread==GetCurrentThreadId());
+        CHECK(get<float>(float_object,0x50)==66.7f && get<int>(int_object,0x50)==0);
+        CHECK(GetScreenPercentageStatus().sink_calls==2 && GetScreenPercentageStatus().game_thread_calls==1);
+        CHECK(HandBackScreenPercentage());invoke_tick(&manager);CHECK(calls==4);
+        CHECK(get<float>(float_object,0x50)==50.f && get<int>(int_object,0x50)==2);
+        CHECK(RestoreSinkForTest(table+11));CHECK(table[11]==tiny);CHECK(code[128]==0xc3 && code[127]==0xf1 && code[129]==0xf1);
+        CHECK(!AttachSinkForTest(table+11,reinterpret_cast<void*>(&probe_sink),observed_sink_caller,error,sizeof error));
+        CHECK(table[11]==tiny);for(unsigned n=0;n<16;++n)if(n!=11)CHECK(table[n]==reinterpret_cast<void*>(&probe_sink));
+        VirtualFree(table,0,MEM_RELEASE);VirtualFree(code,0,MEM_RELEASE);
     }
     setup();CHECK(RequestScreenPercentage(66.7f,3440,1440));CHECK(calls==0);
     CHECK(!RequestScreenPercentage(58,3440,1440));

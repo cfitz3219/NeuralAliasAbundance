@@ -27,6 +27,7 @@ struct SpStatus {
     uint32_t seen_w = 0, seen_h = 0;     // game's latest observed DLSS evaluation size
     uint64_t request_id = 0;
     uint32_t candidates = 0;     // validated candidate objects (1 = unambiguous)
+    uint64_t sink_calls = 0, game_thread_calls = 0;
     char reason[200] = "";
 };
 
