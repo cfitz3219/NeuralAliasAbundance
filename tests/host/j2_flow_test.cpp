@@ -400,7 +400,8 @@ int case_pair(test::Device& d, FakeEngine* fake)
         // Engine pixels (downscale 2), S10.5. Background: the jitter's image shift jp - jc.
         const int16_t bx = static_cast<int16_t>((jp[0] - jc[0]) / 2 * 32), by = static_cast<int16_t>((jp[1] - jc[1]) / 2 * 32);
         const int16_t ox = static_cast<int16_t>((-4.f + jp[0] - jc[0]) / 2 * 32), oy = by;
-        fake->SetGrid(bx, by, 5, 12, 2, 5, ox, oy); // blocks of 8 px: x 40..104 covers the rectangle on every frame
+        fake->SetGrid(bx, by, 5, 12, 1, 6, ox, oy); // blocks of 8 px: x 40..104, y 8..56 keep the rectangle clear of the
+                                                   // expansion's boundary band (half a block each side is marked invalid)
         fake->gated = true;
     }
     h.SetPicture(picture(36, false));
@@ -469,7 +470,7 @@ int case_flicker(test::Device& d, FakeEngine& fake)
     float v[2];
     for (int f = 2; f <= 5; ++f) {
         const bool forward = (f & 1) == 0;        // frame 2: at 40 (moved +4), frame 3: back at 36, ...
-        fake.SetGrid(0, 0, 4, 12, 2, 5, static_cast<int16_t>(forward ? -64 : 64), 0);
+        fake.SetGrid(0, 0, 4, 12, 1, 6, static_cast<int16_t>(forward ? -64 : 64), 0);
         h.SetPicture(picture(forward ? 40 : 36, false));
         fl::Ticket t = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(f, f - 1, 0, 0));
         CHECK(t.pair);

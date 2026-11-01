@@ -1005,8 +1005,8 @@ bool RecordFusion(ID3D12GraphicsCommandList* l, Ticket& t, ID3D12Resource* depth
     if (!ok) return false;
     t.consumed = true;
     g.hist_read ^= 1;
-    g.hist_frame = cur.frame;
-    g.hist_generation = cur.generation;
+    g.hist_frame = t.frame; // cur.frame is only assigned at Committed, after this
+    g.hist_generation = t.generation;
     out->residual = g.residual.Get();
     out->mask = g.mask.Get();
     out->valid = g.valid.Get();
