@@ -701,6 +701,16 @@ void write_status_line()
             static_cast<unsigned long long>(j2.camera_offset), j2.later_passes, static_cast<unsigned long long>(j2.duplicate_submissions), static_cast<unsigned long long>(j2.jitter_writes), static_cast<unsigned long long>(j2.camera_learned_hits), static_cast<unsigned long long>(j2.camera_scans), static_cast<long long>(j2.camera_inv_delta), static_cast<long long>(j2.camera_proj_delta), static_cast<unsigned long long>(j2.jitter_proj_writes), static_cast<unsigned long long>(j2.jitter_rebased), na::observe::SamplerMipBias(), static_cast<unsigned long long>(mb_s), static_cast<unsigned long long>(mb_st), static_cast<unsigned long long>(j2.post_camera_lists), static_cast<unsigned long long>(j2.post_depth_lists), static_cast<unsigned long long>(j2.other_camera_blocks), j2.depth_reversed ? 1u : 0u, dlss.feature_preset, na::settings::Get().j2_sharpness.load(), static_cast<unsigned long long>(j2.nis_frames), j2.scene_batches, j2.scene_batches_max, j2.scene_batches_target, static_cast<unsigned long long>(j2.waited_batches), static_cast<unsigned long long>(j2.post_scene_batches), j2.inline_mode, j2.inline_target, static_cast<unsigned long long>(j2.inline_candidates), static_cast<unsigned long long>(j2.inline_waited), static_cast<unsigned long long>(j2.inline_recorded), static_cast<unsigned long long>(j2.inline_frames), static_cast<unsigned long long>(j2.inline_refused), j2.color_sub, j2.color_mips, j2.color_slices, j2.color_samples, j2.depth_slices, j2.depth_samples, j2.width, j2.height, j2.color_format, j2.reason);
         if (jn > 0) WriteFile(f, jl, static_cast<DWORD>((std::min)(jn, static_cast<int>(sizeof(jl) - 1))), &written, nullptr);
         {
+            char cl[320]; // camera choice and loss reasons (Sniper steep-view flicker, 2026-11-01)
+            const int cn = snprintf(cl, sizeof(cl),
+                "j2_camera contested=%llu alternatives=%llu lost_unread=%llu lost_no_vp=%llu lost_no_inverse=%llu lost_capped=%llu other_cam=%llu jitter_slot_other=%llu\r\n",
+                static_cast<unsigned long long>(j2.camera_contested), static_cast<unsigned long long>(j2.camera_alternatives),
+                static_cast<unsigned long long>(j2.camera_lost_unread), static_cast<unsigned long long>(j2.camera_lost_no_vp),
+                static_cast<unsigned long long>(j2.camera_lost_no_inverse), static_cast<unsigned long long>(j2.camera_lost_capped),
+                static_cast<unsigned long long>(j2.other_camera_blocks), static_cast<unsigned long long>(j2.jitter_slot_other_camera));
+            if (cn > 0) WriteFile(f, cl, static_cast<DWORD>((std::min)(cn, static_cast<int>(sizeof(cl) - 1))), &written, nullptr);
+        }
+        {
             // P4-0b moving-object motion (Opus; one status line, read-only snapshot).
             const auto fs = na::j2::flow::GetStats();
             char fl[640];

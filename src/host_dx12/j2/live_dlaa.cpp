@@ -642,6 +642,23 @@ bool same_camera(const na::camera::Matrix& m)
     return dot > 0.98 && std::abs(v.sy - p.sy) <= 0.05 * std::abs(p.sy) && d2 <= 0.01 * len2 + 100.0;
 }
 
+// A block from the camera slot starts this frame's jitter only if it continues the last main
+// camera: a water reflection's mirrored camera (or a sky / light camera) can sit in the same slot
+// and be bound earlier in the frame. Generous enough for real motion within one frame.
+bool continues_main_camera(const na::camera::Matrix& m)
+{
+    na::camera::VpGeometry v{};
+    if (!g_jit_cam.valid) return true;
+    if (!na::camera::DecomposeViewProjection(m, v)) return false;
+    const auto& p = g_jit_cam.geo;
+    double dot = 0, d2 = 0;
+    for (int j = 0; j < 3; ++j) {
+        dot += v.forward[j] * p.forward[j];
+        d2 += (v.position[j] - p.position[j]) * (v.position[j] - p.position[j]);
+    }
+    return std::acos(std::clamp(dot, -1.0, 1.0)) <= 0.25 && d2 <= 25.0 * 25.0 && std::abs(v.sy - p.sy) <= 0.05 * std::abs(p.sy);
+}
+
 bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& in_bytes, bool slot)
 {
     const size_t n = in_bytes.size();
@@ -653,6 +670,7 @@ bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& in_byt
         na::camera::Candidate c{};
         if (!na::camera::ViewProjection(m, c)) continue;
         if (!slot && !same_camera(m)) continue;
+        if (slot && !continues_main_camera(m)) { ++g.stats.jitter_slot_other_camera; continue; }
         // The inverse at its learned position. A block from the camera slot must
         // carry it; another block (an earlier pass with a smaller constant buffer)
         // may start the frame from the ViewProjection alone, the inverse being
@@ -864,6 +882,48 @@ bool check_learned(const std::vector<uint8_t>& bytes, na::camera::Matrix* vp, bo
 
 bool g_injected = false; // the camera found this frame carries J1's jitter (g.jit.px)
 
+// Several blocks can hold a valid ViewProjection + inverse in the same frame: the main camera,
+// a water reflection's mirrored camera, a sky camera, a light's. Ranking blocks by how often they
+// are bound picks whichever dominates the frame's draws, which changes with where the player
+// looks (Sniper: looking down at water or up at the sky alternated cameras: no camera, false cuts,
+// unjittered frames, flicker; Cort 2026-11-01). Among the candidates the one most continuous with the
+// last main camera wins (holding the matrix J1 jittered is only a tie-break).
+struct CamPick {
+    na::camera::Matrix vp{};
+    bool reversed = false, injected = false;
+    double score = 0;
+    const Block* block = nullptr;
+    int64_t offset = 0, inv_delta = 0, proj_delta = INT64_MIN;
+};
+bool holds_jittered(const std::vector<uint8_t>& bytes, size_t off)
+{
+    return g.jit.valid && off + 64 <= bytes.size() &&
+           (!std::memcmp(bytes.data() + off, g.jit.jvp[0], 64) || !std::memcmp(bytes.data() + off, g.jit.jvp[1], 64));
+}
+double continuity(const na::camera::Matrix& m, bool injected)
+{
+    // Holding J1's jittered matrix is only a tie-break: J1 could have started on the wrong camera.
+    const double bonus = injected ? -0.05 : 0.0;
+    na::camera::VpGeometry v{};
+    if (!g_jit_cam.valid) return bonus;
+    if (!na::camera::DecomposeViewProjection(m, v)) return 1e9;
+    const auto& p = g_jit_cam.geo;
+    double dot = 0, d2 = 0;
+    for (int j = 0; j < 3; ++j) {
+        dot += v.forward[j] * p.forward[j];
+        d2 += (v.position[j] - p.position[j]) * (v.position[j] - p.position[j]);
+    }
+    return bonus + std::acos(std::clamp(dot, -1.0, 1.0)) + std::sqrt(d2) / 25.0 + std::abs(v.sy - p.sy);
+}
+const CamPick* best_pick(const std::vector<CamPick>& v)
+{
+    const CamPick* best = nullptr;
+    for (const auto& c : v) if (!best || c.score < best->score) best = &c;
+    if (best && best != &v.front()) ++g.stats.camera_alternatives;
+    if (v.size() > 1) ++g.stats.camera_contested;
+    return best;
+}
+
 bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, na::camera::Matrix* vp, bool* reversed)
 {
     g_cd = {};
@@ -907,14 +967,13 @@ bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth
     if (order.size() > kMaxBlocks) order.resize(kMaxBlocks);
     g_cd.blocks = order.size();
     std::vector<uint8_t> bytes(kMaxBlockRead);
-    for (const Block* o : order) {
+    const auto read_block = [&](const Block* o, na::camera::Snapshot& s) {
         const uint32_t want = o->size < kMaxBlockRead ? o->size : kMaxBlockRead;
         const uint32_t n = na::observe::ReadBuffer(o->resource, o->offset, bytes.data(), want);
-        if (n < 128) continue;
+        if (n < 128) return false;
         ++g_cd.read;
         // An in-process read at submission time, inside the submitting call:
         // its scope is known (FindMatrices rejects snapshots without one).
-        na::camera::Snapshot s{};
         s.session = s.epoch = 1;
         s.submission = s.content_version = g.frame;
         s.resource = o->resource;
@@ -922,41 +981,77 @@ bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth
         s.complete = s.lifetime_valid = true;
         s.sync = na::camera::Sync::AppSyncUnknown;
         s.bytes.assign(bytes.begin(), bytes.begin() + n);
-        if (learned(o) && check_learned(s.bytes, vp, reversed)) {
-            ++g.stats.camera_learned_hits;
-            const size_t lo = static_cast<size_t>(g.camera_offset);
-            g_injected = g.jit.valid && lo + 64 <= s.bytes.size() &&
-                         (!std::memcmp(s.bytes.data() + lo, g.jit.jvp[0], 64) || !std::memcmp(s.bytes.data() + lo, g.jit.jvp[1], 64));
-            return true;
-        }
+        return true;
+    };
+    // 1. The learned slot: every block bound there this frame is a candidate (bounded).
+    std::vector<CamPick> picks;
+    for (const Block* o : order) {
+        if (!learned(o) || picks.size() >= 8) break;
+        na::camera::Snapshot s{};
+        if (!read_block(o, s)) continue;
+        CamPick c;
+        if (!check_learned(s.bytes, &c.vp, &c.reversed)) continue;
+        c.injected = holds_jittered(s.bytes, static_cast<size_t>(g.camera_offset));
+        c.score = continuity(c.vp, c.injected);
+        c.block = o;
+        picks.push_back(c);
+    }
+    if (const CamPick* p = picks.empty() ? nullptr : best_pick(picks)) {
+        ++g.stats.camera_learned_hits;
+        *vp = p->vp;
+        *reversed = p->reversed;
+        g_injected = p->injected;
+        return true;
+    }
+    // 2. A full search; a few candidates are compared the same way before the slot is relearned.
+    for (const Block* o : order) {
+        if (picks.size() >= 4) break;
+        na::camera::Snapshot s{};
+        if (!read_block(o, s)) continue;
         const auto scan = na::camera::FindMatrices(s);
         g_cd.cands += scan.candidates.size();
         for (const auto& c : scan.candidates) {
             if (c.kind == na::camera::Kind::ViewProjection) ++g_cd.vp;
             if (c.kind != na::camera::Kind::ViewProjection || !c.has_inverse_pair) continue;
-            g.camera_offset = static_cast<int64_t>(c.byte_offset);
-            g.camera_inv_delta = static_cast<int64_t>(c.inverse_byte_offset) - static_cast<int64_t>(c.byte_offset);
-            g.camera_proj_delta = INT64_MIN;
+            CamPick k;
+            k.vp = c.matrix;
+            k.reversed = c.reversed;
+            k.block = o;
+            k.offset = static_cast<int64_t>(c.byte_offset);
+            k.inv_delta = static_cast<int64_t>(c.inverse_byte_offset) - static_cast<int64_t>(c.byte_offset);
             for (const auto& pc : scan.candidates)
                 if (pc.kind == na::camera::Kind::Projection && pc.layout == c.layout && is_projection_of(pc.matrix, c.matrix)) {
-                    g.camera_proj_delta = static_cast<int64_t>(pc.byte_offset) - static_cast<int64_t>(c.byte_offset);
+                    k.proj_delta = static_cast<int64_t>(pc.byte_offset) - static_cast<int64_t>(c.byte_offset);
                     break;
                 }
-            g.stats.camera_proj_delta = g.camera_proj_delta == INT64_MIN ? 0 : g.camera_proj_delta;
-            g.stats.camera_inv_delta = g.camera_inv_delta;
-            ++g.stats.camera_scans;
-            g.camera_param = static_cast<int64_t>(o->param);
-            g.camera_table = o->table;
-            g.stats.camera_offset = c.byte_offset;
-            *vp = c.matrix;
-            *reversed = c.reversed;
-            const size_t lo = static_cast<size_t>(c.byte_offset);
-            g_injected = g.jit.valid && lo + 64 <= s.bytes.size() &&
-                         (!std::memcmp(s.bytes.data() + lo, g.jit.jvp[0], 64) || !std::memcmp(s.bytes.data() + lo, g.jit.jvp[1], 64));
-            return true;
+            k.injected = holds_jittered(s.bytes, c.byte_offset);
+            k.score = continuity(k.vp, k.injected);
+            picks.push_back(k);
+            break; // one per block
         }
     }
-    return false;
+    const CamPick* p = picks.empty() ? nullptr : best_pick(picks);
+    if (!p) {
+        // Why the camera was lost (diagnostics for frames like Sniper's steep views).
+        if (!g_cd.read) ++g.stats.camera_lost_unread;
+        else if (!g_cd.vp) ++g.stats.camera_lost_no_vp;
+        else ++g.stats.camera_lost_no_inverse;
+        if (g_cd.blocks >= kMaxBlocks) ++g.stats.camera_lost_capped;
+        return false;
+    }
+    g.camera_offset = p->offset;
+    g.camera_inv_delta = p->inv_delta;
+    g.camera_proj_delta = p->proj_delta;
+    g.stats.camera_proj_delta = g.camera_proj_delta == INT64_MIN ? 0 : g.camera_proj_delta;
+    g.stats.camera_inv_delta = g.camera_inv_delta;
+    ++g.stats.camera_scans;
+    g.camera_param = static_cast<int64_t>(p->block->param);
+    g.camera_table = p->block->table;
+    g.stats.camera_offset = static_cast<uint64_t>(p->offset);
+    *vp = p->vp;
+    *reversed = p->reversed;
+    g_injected = p->injected;
+    return true;
 }
 
 na::motion::Mat4 to_mat4(const na::camera::Matrix& m)

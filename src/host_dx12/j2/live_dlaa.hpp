@@ -156,6 +156,12 @@ struct Stats {
     uint64_t nis_frames = 0;       // NIS added on top (Sharpness above 100 %)
     uint64_t jitter_writes = 0;   // J1: camera matrices replaced by jittered copies
     uint64_t camera_learned_hits = 0, camera_scans = 0; // camera found at the learned slot / by a full search
+    // Several valid cameras in one frame (reflection, sky, light): frames where more than one
+    // candidate was seen / where the chosen one was not the first-ranked. Lost-camera reasons:
+    // nothing readable, no ViewProjection, a ViewProjection without its inverse; capped = the
+    // block bound was reached.
+    uint64_t camera_contested = 0, camera_alternatives = 0, jitter_slot_other_camera = 0;
+    uint64_t camera_lost_unread = 0, camera_lost_no_vp = 0, camera_lost_no_inverse = 0, camera_lost_capped = 0;
     int64_t camera_inv_delta = 0; // bytes from the ViewProjection to its inverse in the camera block
     int64_t camera_proj_delta = 0; // bytes to the camera's separate projection matrix (0 = none found)
     uint64_t jitter_proj_writes = 0; // J1: projection matrices replaced by jittered copies
