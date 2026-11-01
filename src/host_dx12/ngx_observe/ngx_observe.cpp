@@ -168,7 +168,11 @@ NgxResult InitExtImpl(CoreSlot& s, unsigned long long app_id, const wchar_t* dat
                       uint32_t sdk_version, const void* params)
 {
     NgxResult r = s.init_ext(app_id, data_path, device, sdk_version, params);
-    if (r == 1) { s.has_device.store(device!=nullptr); on_core_initialised(s); na::nr::native::PrepareDevice(static_cast<ID3D12Device*>(device)); }
+    if (r == 1) {
+        s.has_device.store(device!=nullptr);
+        if(device && !na::dlss::IsInjectorCall())na::host::RendererInitialized();
+        on_core_initialised(s); na::nr::native::PrepareDevice(static_cast<ID3D12Device*>(device));
+    }
     g_inits.fetch_add(1, std::memory_order_relaxed);
     push_record(CallKind::Init, r, 0, app_id, 0, 0);
     return r;
@@ -178,7 +182,11 @@ NgxResult InitProjectIdImpl(CoreSlot& s, const char* project_id, uint32_t engine
                             const wchar_t* data_path, void* device, uint32_t sdk_version, const void* params)
 {
     NgxResult r = s.init_pid(project_id, engine_type, engine_version, data_path, device, sdk_version, params);
-    if (r == 1) { s.has_device.store(device!=nullptr); on_core_initialised(s); na::nr::native::PrepareDevice(static_cast<ID3D12Device*>(device)); }
+    if (r == 1) {
+        s.has_device.store(device!=nullptr);
+        if(device && !na::dlss::IsInjectorCall())na::host::RendererInitialized();
+        on_core_initialised(s); na::nr::native::PrepareDevice(static_cast<ID3D12Device*>(device));
+    }
     g_inits.fetch_add(1, std::memory_order_relaxed);
     push_record(CallKind::Init, r, 0, 0, 0, 0);
     return r;

@@ -33,14 +33,15 @@ struct Params { uint32_t magic; uint8_t pad[4092]; };
 void* g_query_params = nullptr;
 int32_t g_query_result = 1;
 int32_t g_release_result = 1;
+int32_t g_init_result = 1;
 } // namespace
 
 #define NGX_EXPORT extern "C" __declspec(dllexport)
 
 NGX_EXPORT int32_t __cdecl NVSDK_NGX_D3D12_Init_Ext(unsigned long long app_id, const wchar_t*, void*, uint32_t sdk_version, const void*)
-{ ++g_state.inits; g_state.last_app_id = app_id; g_state.last_sdk_version = sdk_version; return 1; }
+{ ++g_state.inits; g_state.last_app_id = app_id; g_state.last_sdk_version = sdk_version; return g_init_result; }
 NGX_EXPORT int32_t __cdecl NVSDK_NGX_D3D12_Init_ProjectID(const char*, uint32_t, const char*, const wchar_t*, void*, uint32_t sdk_version, const void*)
-{ ++g_state.inits; g_state.last_app_id = 0x5EED; g_state.last_sdk_version = sdk_version; return 1; }
+{ ++g_state.inits; g_state.last_app_id = 0x5EED; g_state.last_sdk_version = sdk_version; return g_init_result; }
 NGX_EXPORT int32_t __cdecl NVSDK_NGX_D3D12_CreateFeature(void* cmd_list, uint32_t feature_id, void*, void** out_handle)
 {
     ++g_state.creates; g_state.last_cmd_list = cmd_list; g_state.last_feature_id = feature_id;
@@ -69,5 +70,6 @@ NGX_EXPORT void __cdecl NgxStubSetResults(int32_t create_result, int32_t eval_re
 NGX_EXPORT void __cdecl NgxStubSetQuery(void* params, int32_t result)
 { g_query_params = params; g_query_result = result; }
 NGX_EXPORT void __cdecl NgxStubSetReleaseResult(int32_t result) { g_release_result=result; }
+NGX_EXPORT void __cdecl NgxStubSetInitResult(int32_t result) { g_init_result=result; }
 
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID) { if (reason == DLL_PROCESS_ATTACH) DisableThreadLibraryCalls(h); return TRUE; }
