@@ -1058,7 +1058,9 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         }
     }
     if (dest && up.dest == color_id) refuse_upscale("The upscale destination is the scene colour itself.");
-    if (dest && !state_of(up.dest, dsub_out, &sdest)) refuse_upscale("Waiting: the upscale destination's state is not established.");
+    // The destination may be untouched by the game until after J2's insertion: then the
+    // state all submitted work left it in.
+    if (dest && !state_of(up.dest, dsub_out, &sdest) && !na::observe::KnownSubStateNow(up.dest, dsub_out, &sdest)) refuse_upscale("Waiting: the upscale destination's state is not established.");
     const bool upscaling = dest != nullptr;
 
     // Camera first (nothing is allocated for a frame that cannot run); the tracker

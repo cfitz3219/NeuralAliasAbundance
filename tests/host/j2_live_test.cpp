@@ -171,7 +171,7 @@ int main()
     test::List scene, consumer;
     REQUIRE(scene.Create(dev) && consumer.Create(dev));
     REQUIRE(SUCCEEDED(scene.list->Close()) && SUCCEEDED(consumer.list->Close()));
-    const auto frame = [&](double cam_x) {
+    const auto frame = [&](double cam_x, ID3D12Resource* touched = nullptr) {
         d.WaitIdle();
         // Camera block at 512 (VP at +80, inverse at +144), a junk block at 1024.
         std::memset(cpu, 0, 4096);
@@ -196,6 +196,12 @@ int main()
         scene.list->SetGraphicsRootDescriptorTable(1, cbvh->GetGPUDescriptorHandleForHeapStart()); // camera (table CBV)
         D3D12_RESOURCE_BARRIER out = test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         scene.list->ResourceBarrier(1, &out);
+        if (touched) { // a texture the game also uses this frame (P4-4: its stretch destination), left in COMMON
+            D3D12_RESOURCE_BARRIER t[2] = {test::Transition(touched, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
+                                           test::Transition(touched, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON)};
+            scene.list->ResourceBarrier(1, &t[0]);
+            scene.list->ResourceBarrier(1, &t[1]);
+        }
         REQUIRE(SUCCEEDED(scene.list->Close()));
         consumer.Reset();
         D3D12_RESOURCE_BARRIER back[2] = {test::Transition(color.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
@@ -349,7 +355,7 @@ int main()
         const auto up0 = na::j2::GetStats().upscaled_frames;
         const int ev = fake::evals;
         na::j2::OnPresent(d.queue.Get());
-        frame(503);
+        frame(503, dest.Get());
         st = na::j2::GetStats();
         std::printf("upscale: %ux%u -> %ux%u, upscaled %llu, phases %u, note \"%s\", reason \"%s\"\n", st.render_w, st.render_h, st.out_w, st.out_h,
                     static_cast<unsigned long long>(st.upscaled_frames), st.jitter_phases, st.upscale_note, st.reason);
@@ -371,7 +377,7 @@ int main()
         // Active extent smaller than the allocation (render at the top left): 48x24 -> 96x48.
         na::j2::SetUpscaleTarget({na::observe::IdOf(dest.Get()), 0, 48, 24});
         na::j2::OnPresent(d.queue.Get());
-        frame(503.1);
+        frame(503.1, dest.Get());
         st = na::j2::GetStats();
         CHECK(st.render_w == 48 && st.render_h == 24 && st.out_w == OW && st.upscaled_frames == up0 + 2);
         CHECK(st.jitter_phases == 32);
@@ -379,7 +385,7 @@ int main()
         CHECK(fake::I(fake::last_create, NVSDK_NGX_Parameter_PerfQualityValue) == static_cast<int>(na::dlss::Quality::MaxPerformance));
         // Jitter stays inside a render pixel and the next frame keeps history.
         na::j2::OnPresent(d.queue.Get());
-        frame(503.2);
+        frame(503.2, dest.Get());
         CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
         CHECK(std::fabs(fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_X)) < 0.5);
 
@@ -387,7 +393,7 @@ int main()
         const auto refused0 = na::j2::GetStats().upscale_refused;
         na::j2::SetUpscaleTarget({na::observe::IdOf(ldr.Get()), 0, 0, 0});
         na::j2::OnPresent(d.queue.Get());
-        frame(503.3);
+        frame(503.3, ldr.Get());
         st = na::j2::GetStats();
         std::printf("refused: \"%s\", out %ux%u\n", st.upscale_note, st.out_w, st.out_h);
         CHECK(st.upscale_refused == refused0 + 1 && st.upscale_note[0] != 0);
