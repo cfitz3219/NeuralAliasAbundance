@@ -33,8 +33,13 @@ and rev 4 (no game scaler at all) are superseded; see COMMS a285862 to 8ed6614.
    finds the reduced scene colour + depth, evaluates DLSS into a distinct full-size output, and
    replaces the game's own spatial stretch to its output target.
 2. **R2, our engine adapters** (existing Unreal screen-percentage and Ghost adapters).
-3. Otherwise DLAA. Creation-time shrinking and subrect rendering are later optional research,
-   not part of this plan.
+3. **R3, no slider (next after R1, Anno as test case):** Argon's layer 2, shrink the 3D-scene
+   textures at creation (whole texture, never a corner, so 0..1 UVs stay right) with matching
+   viewports. Open pieces: recognise scene textures on the first launch with no learning run
+   (built-in per-game profile from a recording, format combinations, or create both sizes and pick
+   in frame 1); never shrink a texture copied to/from a full-size one; fix stored screen-size
+   constants and dispatch sizes; redirect later passes to the DLSS output. Stage M maps come first.
+4. Otherwise DLAA. Subrect/corner rendering is rejected.
 
 ## Stage 1: J2 upscales from a smaller scene (prerequisite, fixtures only)
 
