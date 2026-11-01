@@ -166,4 +166,5 @@ Startup substitution sets the launch mode. For live switching: substitute a tagg
 memory once for that exact float/double after the settings parse; to switch modes, write the new
 value there and confirm from J2's detected extent within a few frames (log whether the game
 reacted). Unknown per game whether the engine re-reads it live; if not, the menu says "applies on
-next launch". Several hits -> write none (log). Never touch memory we did not find this way.
+next launch". Cort (22:43Z): Sniper Elite 5's Render Scale applies instantly in its own menu
+(slide back and forth live), so the live path is expected to work there. Several hits -> write none (log). Never touch memory we did not find this way.
