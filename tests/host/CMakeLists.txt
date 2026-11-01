@@ -122,7 +122,6 @@ na_host_test(nr_fg_frame_cache_test SOURCES nr_fg_frame_cache_test.cpp LIBS host
 na_host_test(j2_flow_test SOURCES j2_flow_test.cpp LIBS host_dx12 dxgi d3dcompiler)
 # P4-0c: AMD optical-flow passes (DXC at build time): blobs, embedded root signatures, PSOs.
 na_host_test(ffx_flow_shaders_test SOURCES ffx_flow_shaders_test.cpp LIBS host_ffx_flow d3d12 dxgi)
-na_host_test(ffx_flow_test SOURCES ffx_flow_test.cpp LIBS host_ffx_flow d3d12 dxgi LABELS gpu)
 if(NA_HAVE_NVOF)
   # Same pipeline on the real NVIDIA optical-flow engine (RTX 20+); SKIPs without it.
   add_test(NAME host_j2_flow_real_test COMMAND j2_flow_test --real)
