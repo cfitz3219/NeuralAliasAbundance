@@ -3209,6 +3209,12 @@ bool g_reset_registered = false; // installation thread only
 bool g_barriers_registered=false;
 std::atomic<void (*)(ID3D12GraphicsCommandList*,UINT,const D3D12_RESOURCE_BARRIER*)> g_barrier_listener{nullptr};
 std::atomic<bool> g_full_list_tracking{false};
+struct ShaderHooks { std::shared_ptr<ShaderOperationHook> lane[2]; };
+// Like the existing live registry, do not run D3D12-owning destructors during
+// static teardown. Registration changes happen on the control/setup worker.
+auto& g_shader_hooks = *new std::shared_ptr<const ShaderHooks>();
+std::mutex g_shader_hooks_m;
+std::atomic<bool> g_shader_hooks_enabled{false};
 
 void capture_raster_targets(GL* list, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets,
     BOOL contiguous, const D3D12_CPU_DESCRIPTOR_HANDLE* depth)
@@ -3330,6 +3336,44 @@ struct ListHook<Slot, R(A...)> {
             }
             if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced || Slot == sl::list::Dispatch)
                 if (scope.outermost && !scope.ambiguous) before_shader_use(l, Slot == sl::list::Dispatch);
+            if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced || Slot == sl::list::Dispatch) {
+                if (!t_host_work && scope.outermost && !scope.ambiguous && g_shader_hooks_enabled.load(std::memory_order_acquire)) {
+                    const auto hooks = std::atomic_load_explicit(&g_shader_hooks, std::memory_order_acquire);
+                    if (hooks) {
+                        ShaderCall call;
+                        if constexpr (Slot == sl::list::Dispatch) call.kind = ShaderKind::Dispatch;
+                        else if constexpr (Slot == sl::list::DrawInstanced) call.kind = ShaderKind::Draw;
+                        else call.kind = ShaderKind::DrawIndexed;
+                        size_t arg_index = 0;
+                        ((call.args[arg_index++] = static_cast<int64_t>(a)), ...);
+                        ShaderScope saved[2];
+                        unsigned entered = 0;
+                        bool replaced = false;
+                        for (unsigned i = 0; i < 2; ++i) {
+                            entered = i + 1;
+                            if (!hooks->lane[i]) continue;
+                            { HostWorkScope own; saved[i] = hooks->lane[i]->Before(l, call); }
+                            if (saved[i].action == ShaderAction::Replaced) { replaced = true; break; }
+                        }
+                        if (!replaced) {
+                            if constexpr (Slot == sl::list::Dispatch) {
+                                fn(l, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]));
+                                On<Slot>::run(l, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]));
+                            } else if constexpr (Slot == sl::list::DrawInstanced) {
+                                fn(l, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), UINT(call.args[3]));
+                                On<Slot>::run(l, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), UINT(call.args[3]));
+                            } else {
+                                fn(l, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), INT(call.args[3]), UINT(call.args[4]));
+                                On<Slot>::run(l, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), INT(call.args[3]), UINT(call.args[4]));
+                            }
+                        } // A skipped native command is NOT emitted as an executed game draw/write.
+                        for (unsigned i = entered; i > 0; --i) if (hooks->lane[i - 1]) {
+                            HostWorkScope own; hooks->lane[i - 1]->After(l, call, saved[i - 1]);
+                        }
+                        return;
+                    }
+                }
+            }
             fn(l, a...);
             if constexpr (Slot == sl::list::CopyResource || Slot == sl::list::ResolveSubresource || Slot == sl::list::CopyTextureRegion) {
                 if (scope.outermost && !scope.ambiguous) {
@@ -4838,6 +4882,22 @@ bool ListStateRestorable(ID3D12CommandList* l)
     if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
     std::lock_guard<std::mutex> bl(ls->bind_m);
     return ls->restorable && !ls->in_render_pass;
+}
+void SetShaderOperationHook(ShaderLane lane, std::shared_ptr<ShaderOperationHook> hook)
+{
+    const auto index = static_cast<unsigned>(lane);
+    if (index >= 2) return;
+    std::shared_ptr<const ShaderHooks> prior;
+    {
+        std::lock_guard<std::mutex> lock(g_shader_hooks_m);
+        prior = std::atomic_load_explicit(&g_shader_hooks, std::memory_order_acquire);
+        auto next = std::make_shared<ShaderHooks>();
+        if (prior) *next = *prior;
+        next->lane[index] = std::move(hook);
+        const bool enabled = !!next->lane[0] || !!next->lane[1];
+        std::atomic_store_explicit(&g_shader_hooks, std::shared_ptr<const ShaderHooks>(next), std::memory_order_release);
+        g_shader_hooks_enabled.store(enabled, std::memory_order_release);
+    } // old callbacks/resources can be destroyed outside the registration lock
 }
 void SetRasterStateTracking(bool enabled) { g_raster_tracking.store(enabled, std::memory_order_release); }
 bool ListRasterStateRestorable(ID3D12CommandList* list)

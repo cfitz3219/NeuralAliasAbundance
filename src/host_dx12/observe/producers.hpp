@@ -29,6 +29,7 @@
 #include <memory>
 
 #include "host_dx12/host_observe.h"
+#include "host_dx12/observe/shader_operation.hpp"
 
 struct ID3D12Device;
 struct ID3D12CommandQueue;

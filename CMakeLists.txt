@@ -124,7 +124,8 @@ target_link_libraries(host_observe PUBLIC abundance_options)
 
 # Layer 2 owns independent reduced scene allocations; the game's native
 # resources remain the bypass. Recognition/binding integration is separate.
-add_library(host_scene_scale STATIC src/host_dx12/scale/scene_group.cpp src/host_dx12/scale/depth_restore.cpp)
+add_library(host_scene_scale STATIC src/host_dx12/scale/scene_group.cpp src/host_dx12/scale/depth_restore.cpp
+  src/host_dx12/scale/gpu_constants.cpp)
 target_link_libraries(host_scene_scale PUBLIC abundance_options d3d12 d3dcompiler)
 
 # C8a: H1 observation producers (device/queue hooks emitting ABI events).

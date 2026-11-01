@@ -10,7 +10,7 @@ namespace {
 void __cdecl sink(const na_event_batch*, void*) {}
 test::ComPtr<ID3DBlob> shader(const char* entry, const char* target) {
     constexpr char text[] = R"(
-float4 vs(uint i:SV_VertexID):SV_Position { return float4(float2(float(i&1),float(i>>1))*2-1,0,1); }
+float4 vs(uint i:SV_VertexID):SV_Position { return float4(float2(float(i&1),float(i>>1))*2-1,.25,1); }
 float4 ps():SV_Target { return float4(0,1,0,1); }
 )";
     test::ComPtr<ID3DBlob> code, errors;
@@ -31,13 +31,19 @@ int main()
     auto b=test::CreateTexture(dev,w,h,DXGI_FORMAT_R32G32B32A32_FLOAT,D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     auto plane=test::CreateTexture(dev,8,4,DXGI_FORMAT_R32_FLOAT,D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     auto depth=test::CreateTexture(dev,w,h,DXGI_FORMAT_R32_TYPELESS,D3D12_RESOURCE_STATE_DEPTH_WRITE,D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
-    REQUIRE(a&&b&&plane&&depth);
+    auto other_depth=test::CreateTexture(dev,w,h,DXGI_FORMAT_R32_TYPELESS,D3D12_RESOURCE_STATE_DEPTH_WRITE,D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    REQUIRE(a&&b&&plane&&depth&&other_depth);
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,2,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
     test::ComPtr<ID3D12DescriptorHeap> heap; REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&heap))));
     auto handle=heap->GetCPUDescriptorHandleForHeapStart();
     auto plane_handle=handle;plane_handle.ptr+=dev->GetDescriptorHandleIncrementSize(hd.Type);
     dev->CreateRenderTargetView(plane.Get(),nullptr,plane_handle);
     dev->CreateRenderTargetView(a.Get(),nullptr,handle);
+    D3D12_DESCRIPTOR_HEAP_DESC dhd{D3D12_DESCRIPTOR_HEAP_TYPE_DSV,1,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
+    test::ComPtr<ID3D12DescriptorHeap> depth_heap;REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&dhd,IID_PPV_ARGS(&depth_heap))));
+    const auto depth_handle=depth_heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_DEPTH_STENCIL_VIEW_DESC dv{};dv.Format=DXGI_FORMAT_D32_FLOAT;dv.ViewDimension=D3D12_DSV_DIMENSION_TEXTURE2D;
+    dev->CreateDepthStencilView(depth.Get(),&dv,depth_handle);
     D3D12_ROOT_SIGNATURE_DESC rd{}; rd.Flags=D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     test::ComPtr<ID3DBlob> blob,err; REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rd,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&err)));
     test::ComPtr<ID3D12RootSignature> root; REQUIRE(SUCCEEDED(dev->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&root))));
@@ -46,6 +52,8 @@ int main()
     pd.VS={vs->GetBufferPointer(),vs->GetBufferSize()};pd.PS={ps->GetBufferPointer(),ps->GetBufferSize()};
     pd.RasterizerState.FillMode=D3D12_FILL_MODE_SOLID;pd.RasterizerState.CullMode=D3D12_CULL_MODE_NONE;pd.RasterizerState.DepthClipEnable=TRUE;
     pd.BlendState.RenderTarget[0].RenderTargetWriteMask=D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.DepthStencilState.DepthEnable=TRUE;pd.DepthStencilState.DepthWriteMask=D3D12_DEPTH_WRITE_MASK_ZERO;
+    pd.DepthStencilState.DepthFunc=D3D12_COMPARISON_FUNC_LESS;pd.DSVFormat=DXGI_FORMAT_D32_FLOAT;
     pd.SampleMask=UINT_MAX;pd.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pd.NumRenderTargets=1;pd.RTVFormats[0]=DXGI_FORMAT_R32G32B32A32_FLOAT;pd.SampleDesc={1,0};
     test::ComPtr<ID3D12PipelineState> pso; REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&pd,IID_PPV_ARGS(&pso))));
@@ -55,9 +63,11 @@ int main()
     const float clear[4]={0,0,0,1},blue[4]={0,0,1,1};
     const float plane_clear[4]={.5f,.5f,.5f,.5f};list->ClearRenderTargetView(plane_handle,plane_clear,0,nullptr);
     auto input_ready=test::Transition(plane.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);list->ResourceBarrier(1,&input_ready);
-    list->ClearRenderTargetView(handle,clear,0,nullptr);list->OMSetRenderTargets(1,&handle,FALSE,nullptr);
+    list->ClearRenderTargetView(handle,clear,0,nullptr);list->ClearDepthStencilView(depth_handle,D3D12_CLEAR_FLAG_DEPTH,1,0,0,nullptr);
+    list->OMSetRenderTargets(1,&handle,FALSE,&depth_handle);
     // Legal reuse: OMSetRenderTargets consumed this CPU descriptor immediately.
     dev->CreateRenderTargetView(b.Get(),nullptr,handle);list->ClearRenderTargetView(handle,blue,0,nullptr);
+    dev->CreateDepthStencilView(other_depth.Get(),&dv,depth_handle);list->ClearDepthStencilView(depth_handle,D3D12_CLEAR_FLAG_DEPTH,0,0,0,nullptr);
     list->SetGraphicsRootSignature(root.Get());list->SetPipelineState(pso.Get());
     D3D12_VIEWPORT viewport{8,4,16,8,0,1};D3D12_RECT scissor{12,4,24,12};
     list->RSSetViewports(1,&viewport);list->RSSetScissorRects(1,&scissor);list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
