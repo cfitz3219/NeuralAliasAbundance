@@ -17,9 +17,14 @@ namespace {
 std::array<uint8_t,0x58> float_object{},int_object{};
 int calls=0;DWORD setter_thread=0;
 std::atomic<int> discovery_calls{0};
-uintptr_t observed_sink_caller=0;LONG tick_returns=0;
+uintptr_t observed_sink_caller=0;LONG tick_returns=0;int forwarded_sinks=0;
 using TestSink=void(*)(void*);
-__declspec(noinline) void probe_sink(void*){observed_sink_caller=reinterpret_cast<uintptr_t>(_ReturnAddress());}
+__declspec(noinline) void probe_sink(void*){
+    observed_sink_caller=reinterpret_cast<uintptr_t>(_ReturnAddress());++forwarded_sinks;
+    // Fixture's original engine sink propagates the changed value. Production
+    // never writes this shadow directly; its native sink must be called.
+    memcpy(float_object.data()+0x54,float_object.data()+0x50,sizeof(float));
+}
 __declspec(noinline) void invoke_tick(void* manager){
     auto** table=*static_cast<void***>(manager);
     const auto sink=*reinterpret_cast<TestSink volatile*>(table+11);
@@ -80,8 +85,9 @@ int main(){
         auto** table=static_cast<void**>(VirtualAlloc(nullptr,4096,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));REQUIRE(table);
         for(unsigned n=0;n<16;++n)table[n]=reinterpret_cast<void*>(&probe_sink);
         struct Manager{void** table;} manager{table};invoke_tick(&manager);REQUIRE(observed_sink_caller);
+        const uintptr_t tick_callsite=observed_sink_caller;
         table[11]=tiny;REQUIRE(VirtualProtect(table,4096,PAGE_READONLY,&protect));
-        char error[200]{};REQUIRE(AttachSinkForTest(table+11,tiny,observed_sink_caller,error,sizeof error));
+        char error[200]{};REQUIRE(AttachSinkForTest(table+11,tiny,tick_callsite,error,sizeof error));
         MEMORY_BASIC_INFORMATION mbi{};REQUIRE(VirtualQuery(table,&mbi,sizeof mbi));CHECK(mbi.Protect==PAGE_READONLY);
         CHECK(RequestScreenPercentage(66.7f,3440,1440));
         reinterpret_cast<TestSink>(table[11])(&manager);CHECK(calls==0); // unrelated caller cannot write
@@ -91,8 +97,16 @@ int main(){
         CHECK(HandBackScreenPercentage());invoke_tick(&manager);CHECK(calls==4);
         CHECK(get<float>(float_object,0x50)==50.f && get<int>(int_object,0x50)==2);
         CHECK(RestoreSinkForTest(table+11));CHECK(table[11]==tiny);CHECK(code[128]==0xc3 && code[127]==0xf1 && code[129]==0xf1);
-        CHECK(!AttachSinkForTest(table+11,reinterpret_cast<void*>(&probe_sink),observed_sink_caller,error,sizeof error));
+        CHECK(!AttachSinkForTest(table+11,reinterpret_cast<void*>(&probe_sink),tick_callsite,error,sizeof error));
         CHECK(table[11]==tiny);for(unsigned n=0;n<16;++n)if(n!=11)CHECK(table[n]==reinterpret_cast<void*>(&probe_sink));
+        REQUIRE(VirtualProtect(table,4096,PAGE_READWRITE,&protect));table[11]=reinterpret_cast<void*>(&probe_sink);
+        REQUIRE(VirtualProtect(table,4096,PAGE_READONLY,&protect));setup();const int forwarded_before=forwarded_sinks;
+        REQUIRE(AttachSinkForTest(table+11,reinterpret_cast<void*>(&probe_sink),tick_callsite,error,sizeof error));
+        REQUIRE(RequestScreenPercentage(58.f,3440,1440));invoke_tick(&manager);
+        CHECK(calls==2 && forwarded_sinks==forwarded_before+1);CHECK(get<float>(float_object,0x54)==58.f);
+        CHECK(HandBackScreenPercentage());invoke_tick(&manager);
+        CHECK(calls==4 && forwarded_sinks==forwarded_before+2);CHECK(get<float>(float_object,0x54)==50.f);
+        CHECK(RestoreSinkForTest(table+11));CHECK(table[11]==reinterpret_cast<void*>(&probe_sink));
         VirtualFree(table,0,MEM_RELEASE);VirtualFree(code,0,MEM_RELEASE);
     }
     setup();CHECK(RequestScreenPercentage(66.7f,3440,1440));CHECK(calls==0);
