@@ -12,6 +12,11 @@ in COMMS before edits, as P4-4 says.
   2018 have one (Argon). It makes the game render its 3D scene smaller with the HUD at full size, so
   the game itself creates the smaller scene textures; no texture shrinking by us.
 - **No "learn on the first launch, apply on the second".**
+- **One click (Cort, 22:20Z):** the user picks DLAA / Quality / Balanced / Performance in our
+  menu and it just works; the user never touches the game's slider. We query DLSS's render size
+  and set the game's render-scale value ourselves (live through an engine setter where an adapter
+  exists, else the game's settings file). A game that only accepts steps (55/60/65) gets the
+  nearest accepted value; DLSS is told the real size (any size works) and the menu shows it.
 
 History: rev 1 (corner/subrect), rev 2 (creation-time shrink), rev 3 (game's FSR as the Anno pilot)
 and rev 4 (no game scaler at all) are superseded; see COMMS a285862 to 8ed6614.
