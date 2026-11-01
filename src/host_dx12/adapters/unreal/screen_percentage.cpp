@@ -70,6 +70,10 @@ uintptr_t g_caller=0;
 std::mutex g_m;
 SpStatus g_status;
 std::atomic<bool> g_started{false};
+std::atomic<bool> g_start_allowed{false};
+#ifdef NA_UNREAL_APPLY_TEST
+void (*g_discovery_probe)()=nullptr;
+#endif
 struct Pending {bool set=false;float percent=0;uint32_t ow=0,oh=0;uint64_t generation=0;} g_pending;
 uint64_t g_generation=0,g_confirm=0;
 bool g_handback=false,g_executing=false;
@@ -202,8 +206,8 @@ bool bind_variables(const Image& image,const locator::Result& found) {
     }
     g_float=objects[0];g_int=objects[1];return values().valid;
 }
-DWORD WINAPI worker(LPVOID) {
-    Sleep(5000);
+DWORD WINAPI worker(LPVOID from_apply) {
+    if(!from_apply)Sleep(5000); // startup grace; a live Apply need not wait again
     Image image;
     locator::Result found;
     bool valid=load_image(image) && image_readable(image);
@@ -240,7 +244,28 @@ uint32_t ExpectedExtent(uint32_t out,float percent) {
     const double value=std::ceil(double(out)*double(percent)/100.-1e-6);
     return value<=UINT32_MAX?uint32_t(value):0;
 }
-void StartScreenPercentage() {if(g_started.exchange(true))return;if(HANDLE t=CreateThread(nullptr,0,worker,nullptr,0,nullptr))CloseHandle(t);}
+static void start_screen_percentage(bool from_apply) {
+    if(g_started.exchange(true))return;
+#ifdef NA_UNREAL_APPLY_TEST
+    if(g_discovery_probe){g_discovery_probe();return;}
+#endif
+    if(HANDLE t=CreateThread(nullptr,0,worker,from_apply?reinterpret_cast<void*>(1):nullptr,0,nullptr))CloseHandle(t);
+    else {std::lock_guard<std::mutex> lock(g_m);g_status.state=SpState::NotFound;strcpy_s(g_status.reason,"Unreal resolution locator could not start.");}
+}
+void StartScreenPercentage() {start_screen_percentage(false);}
+void ConfigureScreenPercentage(bool enabled,bool defer_until_apply) {
+    g_start_allowed.store(enabled);
+    if(enabled && !defer_until_apply)StartScreenPercentage();
+    else if(!g_started.load()) {
+        std::lock_guard<std::mutex> lock(g_m);
+        strcpy_s(g_status.reason,enabled?"Recovery mode: press Apply to initialize live resolution control.":"Unreal resolution control is disabled in this installation.");
+    }
+}
+bool ResumeScreenPercentageForApply() {
+    if(!g_start_allowed.load())return false;
+    start_screen_percentage(true);
+    return GetScreenPercentageStatus().state==SpState::Unknown;
+}
 bool RequestScreenPercentage(float percent,uint32_t ow,uint32_t oh) {
     std::lock_guard<std::mutex> lock(g_m);
     if(!g_status.available || !sane_percent(percent)||!ow||!oh||!ExpectedExtent(ow,percent)||!ExpectedExtent(oh,percent)||g_executing||g_pending.set||g_status.state==SpState::Applying||g_handback)return false;
@@ -260,8 +285,9 @@ bool HandBackScreenPercentage() {
 bool BindForTest(const uint8_t* base,const locator::Result& result){Image image;image.base=base;return bind_variables(image,result);}
 void ConfigureForTest(void* f,void* i,Setter fs,Setter is) {
     std::lock_guard<std::mutex> lock(g_m);g_float=f;g_int=i;g_float_set=fs;g_int_set=is;g_caller=0xabc;
-    g_status={};g_status.available=true;g_pending={};g_owner={};g_confirm=0;g_executing=g_handback=false;
+    g_status={};g_status.available=true;g_status.state=SpState::Ready;g_pending={};g_owner={};g_confirm=0;g_executing=g_handback=false;
 }
+void DiscoveryForTest(void (*probe)()) {std::lock_guard<std::mutex> lock(g_m);g_discovery_probe=probe;g_started=false;g_start_allowed=false;g_status={};}
 void ProcessForTest(uintptr_t caller){process(caller);}
 #endif
 } // namespace na::unreal

@@ -1,14 +1,18 @@
 #include "host_dx12/adapters/unreal/locator.hpp"
 #include "test_support.hpp"
 #include "host_dx12/adapters/unreal/screen_percentage.hpp"
+#include "host_dx12/adapters/mode_control.hpp"
 #include <array>
+#include <atomic>
 namespace na::unreal {
 void ConfigureForTest(void*,void*,void(*)(void*,const wchar_t*,const void*),void(*)(void*,const wchar_t*,const void*));
 void ProcessForTest(uintptr_t);
+void DiscoveryForTest(void(*)());
 }
 namespace {
 std::array<uint8_t,0x58> float_object{},int_object{};
 int calls=0;DWORD setter_thread=0;
+std::atomic<int> discovery_calls{0};
 template<class T> void put(std::array<uint8_t,0x58>& b,size_t at,T v){std::memcpy(b.data()+at,&v,sizeof(v));}
 template<class T> T get(const std::array<uint8_t,0x58>& b,size_t at){T v{};std::memcpy(&v,b.data()+at,sizeof(v));return v;}
 void set(void* object,const wchar_t* text,const void* params) {
@@ -27,6 +31,8 @@ void setup(){
     put<uint32_t>(float_object,0x18,0x08000020);put<uint32_t>(int_object,0x18,0x08000000);
     na::unreal::ConfigureForTest(float_object.data(),int_object.data(),set,set);
 }
+void discover(){setup();++discovery_calls;}
+void discover_pending(){++discovery_calls;}
 }
 namespace na::unreal {bool BindForTest(const uint8_t*,const locator::Result&);}
 int main(){
@@ -60,5 +66,31 @@ int main(){
     put<float>(float_object,0x50,75.0f);put<int>(int_object,0x50,1);CHECK(HandBackScreenPercentage());ProcessForTest(0xabc);
     CHECK(get<float>(float_object,0x50)==75.0f);CHECK(get<int>(int_object,0x50)==1);CHECK(calls==2);
     setup();CHECK(!RequestScreenPercentage(0,3440,1440));CHECK(!RequestScreenPercentage(58,UINT32_MAX,1440));
+    // A recovery start must remain deferred, but explicit overlay Apply must
+    // discover the adapter before choosing its fallback methods.
+    DiscoveryForTest(discover);ConfigureScreenPercentage(true,true);
+    CHECK(discovery_calls==0 && !GetScreenPercentageStatus().available);
+    na::mode::Start();na::mode::Request request;
+    request.mode=1;request.out_w=3440;request.out_h=1440;request.render_w=2296;request.render_h=960;request.unreal_percent=66.7f;
+    CHECK(na::mode::RequestApply(request));
+    const ULONGLONG until=GetTickCount64()+1500;
+    while(GetTickCount64()<until && GetScreenPercentageStatus().state!=SpState::Applying)Sleep(10);
+    CHECK(discovery_calls==1);
+    CHECK((na::mode::GetStatus().available_mask & (1u<<uint32_t(na::mode::Layer::Unreal)))!=0);
+    CHECK(GetScreenPercentageStatus().state==SpState::Applying);
+    if(discovery_calls==1){ProcessForTest(0xabc);CHECK(calls==2);}
+    na::mode::Cancel(true);Sleep(80);if(discovery_calls==1)ProcessForTest(0xabc);
+    CHECK(!ResumeScreenPercentageForApply());CHECK(discovery_calls==1); // already initialized, no second scan
+    // Cancelling while the worker waits for discovery must not enqueue an
+    // engine change when discovery becomes ready afterwards.
+    DiscoveryForTest(discover_pending);ConfigureScreenPercentage(true,true);
+    CHECK(na::mode::RequestApply(request));
+    const ULONGLONG pending_until=GetTickCount64()+1500;
+    while(discovery_calls<2 && GetTickCount64()<pending_until)Sleep(10);
+    CHECK(discovery_calls==2);na::mode::Cancel(true);setup();Sleep(80);
+    ProcessForTest(0xabc);CHECK(calls==0);CHECK(na::mode::GetStatus().state==na::mode::State::Cancelled);
+    DiscoveryForTest(discover);ConfigureScreenPercentage(false,true);
+    CHECK(!ResumeScreenPercentageForApply());CHECK(discovery_calls==2);CHECK(!GetScreenPercentageStatus().available);
+    ConfigureScreenPercentage(true,false);CHECK(discovery_calls==3);CHECK(calls==0); // ordinary startup remains supported
     return test::finish("unreal_apply_test");
 }
