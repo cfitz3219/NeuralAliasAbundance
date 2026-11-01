@@ -8,6 +8,8 @@
 //               split submission (2 forwards), the GPU wait (J2's list does not
 //               run before the engine), residual on the object only, final motion
 //               = camera + residual, nothing on the background
+//   flicker     the engine reports a true back-and-forth 4 px motion that reverses
+//               every pair (Anno jitter misread): temporal agreement rejects all of it
 //   false-flow  smooth but wrong flow over a textured still scene is rejected by
 //               the image check: motion stays camera-only
 //   engine-fail a failed engine call enqueues no wait (the queue never stalls)
@@ -380,7 +382,9 @@ void reset_module(fl::Engine* e)
     fl::SetEnabled(true);
 }
 
-// Object moves +4 px (v = -4 on its new position); camera jitter changes between the frames.
+// Object moves +4 px per frame (v = -4 on its new position) over four frames: three pairs.
+// Temporal agreement (kAgreeMin = 2) trusts a residual only on the third consecutive agreeing
+// pair, so pair 1 fuses nothing and pair 3 fuses the object.
 int case_pair(test::Device& d, FakeEngine* fake)
 {
     std::printf("-- pair%s\n", fake ? "" : " (real engine)");
@@ -396,7 +400,8 @@ int case_pair(test::Device& d, FakeEngine* fake)
         // Engine pixels (downscale 2), S10.5. Background: the jitter's image shift jp - jc.
         const int16_t bx = static_cast<int16_t>((jp[0] - jc[0]) / 2 * 32), by = static_cast<int16_t>((jp[1] - jc[1]) / 2 * 32);
         const int16_t ox = static_cast<int16_t>((-4.f + jp[0] - jc[0]) / 2 * 32), oy = by;
-        fake->SetGrid(bx, by, 5, 10, 2, 5, ox, oy); // blocks of 8 px: the rectangle at x 40..88, y 16..48
+        fake->SetGrid(bx, by, 5, 12, 1, 6, ox, oy); // blocks of 8 px: x 40..104, y 8..56 keep the rectangle clear of the
+                                                   // expansion's boundary band (half a block each side is marked invalid)
         fake->gated = true;
     }
     h.SetPicture(picture(36, false));
@@ -406,41 +411,81 @@ int case_pair(test::Device& d, FakeEngine* fake)
     h.Frame(t1, jp[0], jp[1], &calls);
     CHECK(calls == 1);
     REQUIRE(h.WaitJ2(5000));
-    h.SetPicture(picture(40, false));
-    fl::Ticket t2 = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(2, 1, jc[0], jc[1]));
-    CHECK(t2.valid && t2.pair);
-    const bool fused = h.Frame(t2, jc[0], jc[1], &calls);
-    CHECK(fused);
-    CHECK(calls == 2); // [scene, pre] then [ours]
-    if (fake) {
-        Sleep(300);
-        CHECK(h.j2->GetCompletedValue() < h.j2_value); // J2's list waits for the engine
-        fake->OpenGate();
-    }
-    REQUIRE(h.WaitJ2(10000));
     float v[2];
-    h.Motion(64, 32, v);
-    recap("pair: object motion (%.3f, %.3f)", v[0], v[1]);
-    CHECK(std::fabs(v[0] + 4.f) < (fake ? 0.1f : 1.0f) && std::fabs(v[1]) < (fake ? 0.1f : 1.0f));
-    h.Motion(10, 10, v);
-    recap("pair: background motion (%.3f, %.3f)", v[0], v[1]);
-    CHECK(std::fabs(v[0]) < 0.1f && std::fabs(v[1]) < 0.1f);
-    h.Motion(120, 58, v);
-    CHECK(std::fabs(v[0]) < 0.1f && std::fabs(v[1]) < 0.1f);
+    for (int f = 2; f <= 4; ++f) {
+        h.SetPicture(picture(36 + 4 * (f - 1), false));
+        fl::Ticket t = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(f, f - 1, jc[0], jc[1]));
+        CHECK(t.valid && t.pair);
+        const bool fused = h.Frame(t, jc[0], jc[1], &calls);
+        CHECK(fused);
+        CHECK(calls == 2); // [scene, pre] then [ours]
+        if (fake && f == 2) {
+            Sleep(300);
+            CHECK(h.j2->GetCompletedValue() < h.j2_value); // J2's list waits for the engine
+        }
+        if (fake) fake->OpenGate();
+        REQUIRE(h.WaitJ2(10000));
+        h.Motion(72, 32, v);
+        recap("pair %d: object motion (%.3f, %.3f)", f - 1, v[0], v[1]);
+        if (f < 4) CHECK(std::fabs(v[0]) < 0.1f && std::fabs(v[1]) < 0.1f); // not trusted yet: camera only
+        else CHECK(std::fabs(v[0] + 4.f) < (fake ? 0.1f : 1.0f) && std::fabs(v[1]) < (fake ? 0.1f : 1.0f));
+        h.Motion(10, 10, v);
+        if (f == 4) recap("pair: background motion (%.3f, %.3f)", v[0], v[1]);
+        CHECK(std::fabs(v[0]) < 0.1f && std::fabs(v[1]) < 0.1f);
+        h.Motion(120, 58, v);
+        CHECK(std::fabs(v[0]) < 0.1f && std::fabs(v[1]) < 0.1f);
+    }
     // Read-back of the counters happens at the next Prepare.
-    fl::Ticket t3 = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(3, 2, jp[0], jp[1]));
+    fl::Ticket t5 = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(5, 4, jp[0], jp[1]));
     const fl::Stats st = fl::GetStats();
-    recap("pair stats: pairs %llu consumed %llu acc %llu inv %llu small %llu cost %llu off %llu img %llu mean %.1f",
+    recap("pair stats: pairs %llu consumed %llu acc %llu inv %llu small %llu cost %llu off %llu img %llu flk %llu mean %.1f",
                 (unsigned long long)st.pairs, (unsigned long long)st.consumed, (unsigned long long)st.px_accepted, (unsigned long long)st.px_invalid,
                 (unsigned long long)st.px_small, (unsigned long long)st.px_cost, (unsigned long long)st.px_offscreen, (unsigned long long)st.px_image,
-                st.mean_cost);
+                (unsigned long long)st.px_flicker, st.mean_cost);
     recap("pair reason: %s", st.reason);
     // Object 48x32 plus an edge band up to 8 px (the texture window touches the object;
     // flat background there matches flat background either way). Real RTX 5070 Ti: 2000.
-    CHECK(st.pairs >= 1 && st.consumed == 1 && st.px_accepted > 200 && st.px_accepted <= 3072);
+    CHECK(st.pairs >= 3 && st.consumed == 3 && st.px_accepted > 200 && st.px_accepted <= 3072);
     if (fake) CHECK(st.cost == 1 && std::fabs(st.mean_cost - 10.f) < 0.5f);
-    fl::Abandon(d.queue.Get(), t3);
+    fl::Abandon(d.queue.Get(), t5);
     if (fake) fake->OpenGate();
+    d.WaitIdle();
+    return 0;
+}
+
+// Anno finding (capture j2-20261031-182516): jitter flicker. The object really moves back
+// and forth 4 px each frame and the engine reports it exactly, so snap, texture, cost and
+// image checks all pass, but the direction reverses every pair. Nothing may be accepted.
+int case_flicker(test::Device& d, FakeEngine& fake)
+{
+    std::printf("-- flicker\n");
+    Harness h(d);
+    REQUIRE(h.Init());
+    reset_module(&fake);
+    fake.gated = false;
+    h.SetPicture(picture(36, false));
+    fl::Ticket t1 = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(1, 0, 0, 0));
+    h.Frame(t1, 0, 0, nullptr);
+    REQUIRE(h.WaitJ2(5000));
+    float v[2];
+    for (int f = 2; f <= 5; ++f) {
+        const bool forward = (f & 1) == 0;        // frame 2: at 40 (moved +4), frame 3: back at 36, ...
+        fake.SetGrid(0, 0, 4, 12, 1, 6, static_cast<int16_t>(forward ? -64 : 64), 0);
+        h.SetPicture(picture(forward ? 40 : 36, false));
+        fl::Ticket t = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(f, f - 1, 0, 0));
+        CHECK(t.pair);
+        CHECK(h.Frame(t, 0, 0, nullptr));
+        REQUIRE(h.WaitJ2(10000));
+        h.Motion(64, 32, v);
+        recap("flicker pair %d: object motion (%.3f, %.3f)", f - 1, v[0], v[1]);
+        CHECK(std::fabs(v[0]) < 0.1f && std::fabs(v[1]) < 0.1f);
+    }
+    fl::Ticket t6 = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(6, 5, 0, 0));
+    const fl::Stats st = fl::GetStats();
+    recap("flicker stats: accepted %llu flicker %llu image %llu", (unsigned long long)st.px_accepted,
+          (unsigned long long)st.px_flicker, (unsigned long long)st.px_image);
+    CHECK(st.px_accepted == 0 && st.px_flicker > 200);
+    fl::Abandon(d.queue.Get(), t6);
     d.WaitIdle();
     return 0;
 }
@@ -624,6 +669,7 @@ int main(int argc, char** argv)
     FakeEngine fake;
     REQUIRE(fake.Create(d));
     case_pair(d, &fake);
+    case_flicker(d, fake);
     case_false_flow(d, fake);
     case_engine_fail(d, fake);
     case_saturation(d, fake);

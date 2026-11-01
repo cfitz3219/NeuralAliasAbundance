@@ -960,7 +960,7 @@ void DrawLiveDlaa()
     {
         static const char* kViews[] = {"Off (normal picture)", "Motion vectors", "Fine motion (sub-pixel)", "Depth"};
         int dv = na::j2::DebugView();
-        BeginRow("Debug view", "Shows what DLAA is given instead of its result. Motion: colour = direction, brightness = speed, black = still. Fine motion makes tiny false motion visible. Magenta = broken values.", S(220));
+        BeginRow("Debug view", "Shows what DLAA is given instead of its result. Motion: colour = direction, brightness = speed, black = still. Fine motion makes tiny false motion visible (0.2 px = full colour). Colour wheel: red = right, green = down-left, blue = up-left, magenta = right-and-up. White = broken values.", S(220));
         ImGui::SetNextItemWidth(S(220));
         if (ImGui::Combo("##j2dbg", &dv, kViews, 4)) na::j2::SetDebugView(dv);
         EndRow();
@@ -973,6 +973,7 @@ void DrawLiveDlaa()
         EndRow();
         if (fl) {
             const na::j2::flow::Stats fs = na::j2::flow::GetStats();
+<<<<<<< HEAD
             const auto cs=na::j2::compute_flow::GetStats();
             if(na::j2::GetStats().inline_mode || (!fs.available && cs.recorded)){
                 char line[350];std::snprintf(line,sizeof line,"AMD compute: %s Pairs %llu, submitted %llu, busy %llu. Accepted %.1f%%, GPU %.2f ms.",cs.reason,
@@ -980,10 +981,14 @@ void DrawLiveDlaa()
                 StatusLine(0,line);
             }else{
             const uint64_t px = fs.px_accepted + fs.px_invalid + fs.px_small + fs.px_cost + fs.px_offscreen + fs.px_image;
+=======
+            const uint64_t px = fs.px_accepted + fs.px_invalid + fs.px_small + fs.px_cost + fs.px_offscreen + fs.px_image + fs.px_flicker;
+>>>>>>> origin/claude/project-thread-pfxnx8
             const double pct = px ? 100.0 * static_cast<double>(fs.px_accepted) / static_cast<double>(px) : 0.0;
             char tb[360];
-            std::snprintf(tb, sizeof tb, "%s Moving pixels found: %.1f%% of the picture. Cost %.2f ms (average %.2f). Pairs %llu, camera-only frames %llu (batch %llu, busy %llu, reset %llu).",
-                          fs.reason, pct, fs.ms_last, fs.ms_avg, static_cast<unsigned long long>(fs.consumed),
+            const double flick = px ? 100.0 * static_cast<double>(fs.px_flicker) / static_cast<double>(px) : 0.0;
+            std::snprintf(tb, sizeof tb, "%s Moving pixels found: %.1f%% of the picture (%.1f%% rejected as jitter flicker). Cost %.2f ms (average %.2f). Pairs %llu, camera-only frames %llu (batch %llu, busy %llu, reset %llu).",
+                          fs.reason, pct, flick, fs.ms_last, fs.ms_avg, static_cast<unsigned long long>(fs.consumed),
                           static_cast<unsigned long long>(fs.encode_only + fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_split),
                           static_cast<unsigned long long>(fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_reset));
             StatusLine(fs.latched ? 2 : 0, tb);
