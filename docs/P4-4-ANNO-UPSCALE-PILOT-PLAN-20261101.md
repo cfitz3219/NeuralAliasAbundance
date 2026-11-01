@@ -33,7 +33,7 @@ in COMMS before edits, as P4-4 says.
   the game's Resolution Scale, and a warning when very low. No percentages to know.
   This lives in a small non-interactive corner badge (like an FPS counter) shown while our menu is
   closed, so the user can move the game's own slider with the mouse ("Help me set it up" toggle;
-  at 100% it reads "DLAA (100%)"; the badge fades a few seconds after reaching the chosen mode). Overlay = Astra's file.
+  lowering the slider steps DLAA (100%) -> Quality (~67%) -> Balanced (~58%) -> Performance (50%) -> Ultra Performance (~33%); the badge fades a few seconds after reaching the chosen mode). Overlay = Astra's file.
 
 History: rev 1 (corner/subrect), rev 2 (creation-time shrink), rev 3 (game's FSR as the Anno pilot)
 and rev 4 (no game scaler at all) are superseded; see COMMS a285862 to 8ed6614.
