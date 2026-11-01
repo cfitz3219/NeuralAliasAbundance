@@ -40,7 +40,14 @@ constexpr uint32_t kCostMax = 160;     // engine cost above this rejects the blo
 // (above the engine's ~0.5 px flat-area fill, which the texture gate also removes).
 constexpr float kSnapPx = 0.5f;
 constexpr float kImageAbs = 0.08f;     // the flow must explain the image (mean luma error, 3x3 encoded texels)
-constexpr float kImageMargin = 0.02f;  // and never clearly worse than the camera alone (flat areas: both explain it)
+constexpr float kImageMargin = 0.02f;  // both errors within this: the image cannot tell (flat areas), accept
+// The flow must explain the image clearly better than the camera alone: e_flow <= kImageRatio *
+// e_cam (or both within kImageMargin). Still posts under jitter (bfed885, RTX 5070 Ti): the
+// stabilised encode leaves a different sub-pixel blur on each frame's edges, so e_cam is not 0
+// at an edge (~0.05-0.1); a coherent 2 px flow along a post axis near its end (aperture
+// ambiguity, kept alive by temporal hints) had e_flow ~ e_cam and passed the old
+// e_flow <= e_cam + margin test: a 1-3 px halo of false motion past every post end and bar.
+constexpr float kImageRatio = 0.5f;
 // Minimum local contrast (3x3 encoded luma, max - min) for a residual to count. On flat
 // areas the engine fills vectors in from nearby edges (RTX 5070 Ti: ~0.5 px drift on a
 // flat background), cost and image checks cannot reject them, and camera motion
@@ -93,7 +100,7 @@ SamplerState s_lin : register(s0);
 cbuffer C : register(b0) {
     uint w, h, ew, eh;
     uint mode, block, has_cost, cost_max;
-    uint cnt_off, gw, gh, pad0;
+    uint cnt_off, gw, gh; float image_ratio;
     float snap_px, image_margin, image_abs, texture_min;
     uint have_hist, agree_min, pad1, pad2;
     float agree_px, agree_cos, jitter_x, jitter_y;
@@ -170,9 +177,10 @@ void accept(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             else {
                 float e_flow = image_error(p, raw);
                 float e_cam = image_error(p, raw - r);
-                // Rejected when the image contradicts the flow; accepted where the image
-                // cannot tell (flat interiors of moving objects), cost permitting.
-                if (!(e_flow <= image_abs && e_flow <= e_cam + image_margin)) why = 5;
+                // Rejected when the image contradicts the flow, or does not clearly prefer it
+                // over the camera alone; accepted where the image cannot tell (flat interiors
+                // of moving objects: both errors within image_margin), cost permitting.
+                if (!(e_flow <= image_abs && e_flow <= max(image_margin, image_ratio * e_cam))) why = 5;
             }
         }
         if (why == 0) {
@@ -201,7 +209,7 @@ void accept(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
 struct Constants {
     uint32_t w, h, ew, eh;
     uint32_t mode, block, has_cost, cost_max;
-    uint32_t cnt_off, gw, gh, pad0;
+    uint32_t cnt_off, gw, gh; float image_ratio;
     float snap_px, image_margin, image_abs, texture_min;
     uint32_t have_hist, agree_min, pad1, pad2;
     float agree_px, agree_cos, jitter_x, jitter_y; // jitter: encode only (this frame's, render pixels)
@@ -1008,7 +1016,7 @@ bool RecordFusion(ID3D12GraphicsCommandList* l, Ticket& t, ID3D12Resource* depth
     c.cost_max = kCostMax;
     c.cnt_off = off;
     c.gw = g.engine->OutWidth(); c.gh = g.engine->OutHeight();
-    c.snap_px = kSnapPx; c.image_margin = kImageMargin; c.image_abs = kImageAbs; c.texture_min = kTextureMin;
+    c.snap_px = kSnapPx; c.image_margin = kImageMargin; c.image_abs = kImageAbs; c.texture_min = kTextureMin; c.image_ratio = kImageRatio;
     c.have_hist = have_hist ? 1u : 0u; c.agree_min = kAgreeMin; c.agree_px = kAgreePx; c.agree_cos = kAgreeCos;
     ID3D12DescriptorHeap* heaps[] = {g.heap.Get()};
     l->SetDescriptorHeaps(1, heaps);
