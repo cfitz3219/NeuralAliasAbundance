@@ -118,6 +118,9 @@ add_library(host_hooking STATIC
   src/host_dx12/hooking/vtable_hook.cpp
   src/host_dx12/hooking/variant_registry.cpp)
 target_link_libraries(host_hooking PUBLIC abundance_options d3d12 PRIVATE minhook)
+# P4-4 slider route: read-time render-scale substitution (Fable; installed by host_boot on request).
+add_library(host_scale STATIC src/host_dx12/scale/settings_read_hook.cpp)
+target_link_libraries(host_scale PUBLIC abundance_options host_hooking)
 
 add_library(host_observe STATIC src/host_dx12/host_observe.cpp)
 target_link_libraries(host_observe PUBLIC abundance_options)
