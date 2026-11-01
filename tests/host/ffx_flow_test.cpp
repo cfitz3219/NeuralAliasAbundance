@@ -7,6 +7,7 @@
 #include "test_support.hpp"
 
 #include "host_dx12/ffx_flow/ffx_flow.hpp"
+#include "host_dx12/ffx_flow/ffx_flow_shaders.hpp"
 
 #include <cmath>
 #include <cstdarg>
@@ -32,6 +33,7 @@ void recap(const char* fmt, ...)
     std::printf("%s\n", b);
     g_recap.emplace_back(b);
 }
+#undef CHECK // test_support.hpp has one; this file collects failures for the recap
 #define CHECK(c) do { if (!(c)) { ++g_failures; recap("FAIL line %d: %s", __LINE__, #c); } } while (0)
 
 // BGRA8 picture: flat mid-grey background, a bright randomly textured 48x32 rectangle at x0.
