@@ -96,6 +96,7 @@ set_tests_properties(host_overlay_hardware_test PROPERTIES TIMEOUT 30 SKIP_RETUR
 # Parameter-object tests need the NVIDIA NGX SDK headers (local SDK folder, or
 # the CI job that fetches the public DLSS repo's headers at build time).
 if(NA_HAVE_NGX_SDK)
+  na_host_test(scoped_bindings_test SOURCES scoped_bindings_test.cpp LIBS host_dx12 d3dcompiler)
   target_compile_definitions(nvngx_stub PRIVATE NA_HAVE_NGX_SDK)
   target_include_directories(nvngx_stub SYSTEM PRIVATE "${NA_NGX_SDK_INCLUDE}")
   na_host_test(ngx_params_test SOURCES ngx_params_test.cpp LIBS host_dx12)

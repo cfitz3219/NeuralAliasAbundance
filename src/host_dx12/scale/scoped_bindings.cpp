@@ -1,0 +1,156 @@
+#include "scoped_bindings.hpp"
+#include "host_dx12/observe/producers.hpp"
+#include "host_dx12/nr/native_fg.hpp"
+#include <algorithm>
+namespace na::scale {
+std::shared_ptr<const PreparedBindings> PreparedBindings::Create(ID3D12Device* device, BindingSpec spec, std::string& error)
+{
+    error.clear();
+    const auto fail = [&](const char* why) -> std::shared_ptr<const PreparedBindings> { error = why; return {}; };
+    if (!device || !spec.group || !spec.root || spec.views.size() > 4096 || spec.colors.size() > 8 ||
+        spec.viewports.size() > 16 || spec.scissors.size() > 16) return fail("incomplete operation bindings");
+    if (spec.compute && (!spec.colors.empty() || spec.depth.member || !spec.viewports.empty() || !spec.scissors.empty()))
+        return fail("compute operation contains raster bindings");
+    if (!spec.compute && (spec.threads_x || spec.threads_y)) return fail("raster operation contains dispatch dimensions");
+    auto p = std::shared_ptr<PreparedBindings>(new PreparedBindings);
+    p->spec_ = std::move(spec); const auto& s = p->spec_;
+    if (s.views.empty() != s.tables.empty()) return fail("private heap and table bindings must be supplied together");
+    for (const auto& t : s.tables) {
+        if (t.param >= 64 || t.first >= s.views.size() || (p->tables_mask_ & (uint64_t(1) << t.param)))
+            return fail("invalid or duplicate private table binding");
+        p->tables_mask_ |= uint64_t(1) << t.param;
+    }
+    for (size_t i = 0; i < s.constants.size(); ++i) {
+        if (!s.constants[i].buffer) return fail("missing prepared constant buffer");
+        for (size_t j = 0; j < i; ++j) if (s.constants[i].buffer == s.constants[j].buffer)
+            return fail("duplicate GPU copy of one constant buffer in the same scope");
+    }
+    for (const auto& c : s.root_cbvs) {
+        if (c.param >= 64 || c.constant >= s.constants.size() || (p->cbv_mask_ & (uint64_t(1) << c.param)) ||
+            (p->tables_mask_ & (uint64_t(1) << c.param))) return fail("invalid root constant-buffer binding");
+        p->cbv_mask_ |= uint64_t(1) << c.param;
+    }
+    for (size_t i = 0; i < s.uses.size(); ++i) {
+        const auto& use = s.uses[i]; const auto* member = s.group->Find(use.member);
+        if (!member || member->initial_state != D3D12_RESOURCE_STATE_COMMON) return fail("private member is not prepared in COMMON");
+        D3D12_FEATURE_DATA_FORMAT_INFO info{member->reduced_desc.Format};
+        if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &info, sizeof info)) ||
+            (use.subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && use.subresource >=
+             uint32_t(member->reduced_desc.MipLevels) * member->reduced_desc.DepthOrArraySize * info.PlaneCount))
+            return fail("private resource subresource is outside its allocation");
+        if (s.compute && (use.state & (D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_DEPTH_WRITE |
+                                      D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)))
+            return fail("compute operation requests graphics-only resource state");
+        for (size_t j = 0; j < i; ++j) if (s.uses[j].member == use.member &&
+            (s.uses[j].subresource == use.subresource || s.uses[j].subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES ||
+             use.subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES)) return fail("overlapping private resource state entries");
+        if (use.state != D3D12_RESOURCE_STATE_COMMON) {
+            D3D12_RESOURCE_BARRIER b{}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition = {member->reduced.Get(), use.subresource, D3D12_RESOURCE_STATE_COMMON, use.state};
+            p->enter_.push_back(b); std::swap(b.Transition.StateBefore, b.Transition.StateAfter); p->leave_.push_back(b);
+        }
+    }
+    for (const auto& v : s.viewports) { D3D12_VIEWPORT scaled;
+        if (!ScaleViewport(v, s.native_extent, s.render_extent, scaled)) return fail("invalid operation viewport");
+        p->viewports_.push_back(scaled);
+    }
+    for (const auto& r : s.scissors) { D3D12_RECT scaled;
+        if (!ScaleScissor(r, s.native_extent, s.render_extent, scaled)) return fail("invalid operation scissor");
+        p->scissors_.push_back(scaled);
+    }
+    if ((s.threads_x || s.threads_y) && !DispatchForExtent(s.render_extent, s.threads_x, s.threads_y, p->dispatch_x_, p->dispatch_y_))
+        return fail("invalid screen-space compute layout");
+    if (!s.views.empty()) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, static_cast<UINT>(s.views.size()), D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&p->views_)))) return fail("private shader descriptor heap failed");
+        p->increment_ = device->GetDescriptorHandleIncrementSize(hd.Type);
+        auto cpu = p->views_->GetCPUDescriptorHandleForHeapStart();
+        for (const auto& v : s.views) {
+            if (v.kind == ShaderView::Kind::PatchedCbv) {
+                if (v.constant >= s.constants.size()) return fail("invalid table constant-buffer index");
+                const auto& c = s.constants[v.constant].buffer;
+                D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{c->Address(), (c->Bytes() + 255u) & ~255u};
+                device->CreateConstantBufferView(&cbv, cpu);
+            } else if (v.kind == ShaderView::Kind::Srv) device->CreateShaderResourceView(v.resource.Get(), &v.srv, cpu);
+            else device->CreateUnorderedAccessView(v.resource.Get(), v.counter.Get(), &v.uav, cpu);
+            cpu.ptr += p->increment_;
+        }
+    }
+    if (!s.colors.empty()) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, static_cast<UINT>(s.colors.size()), D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&p->rtvs_)))) return fail("private RTV heap failed");
+        auto cpu = p->rtvs_->GetCPUDescriptorHandleForHeapStart();
+        const auto inc = device->GetDescriptorHandleIncrementSize(hd.Type);
+        for (const auto& v : s.colors) {
+            const auto* m = s.group->Find(v.member); if (!m) return fail("unknown colour member");
+            if (!(m->reduced_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) || v.view.Format == DXGI_FORMAT_UNKNOWN)
+                return fail("colour member lacks an explicit render target view");
+            device->CreateRenderTargetView(m->reduced.Get(), &v.view, cpu); cpu.ptr += inc;
+        }
+    }
+    if (s.depth.member) {
+        const auto* m = s.group->Find(s.depth.member); if (!m) return fail("unknown depth member");
+        if (!(m->reduced_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) || s.depth.view.Format == DXGI_FORMAT_UNKNOWN)
+            return fail("depth member lacks an explicit depth target view");
+        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&p->dsv_)))) return fail("private DSV heap failed");
+        device->CreateDepthStencilView(m->reduced.Get(), &s.depth.view, p->dsv_->GetCPUDescriptorHandleForHeapStart());
+    }
+    return p;
+}
+na::observe::ShaderScope BindingHook::Before(ID3D12GraphicsCommandList* list, na::observe::ShaderCall& call) noexcept
+{
+    auto p = provider_ ? provider_->Acquire(list, call) : nullptr;
+    if (!p) return {};
+    const auto refused = [&](const char* reason) { provider_->Refused(list, call, reason); return na::observe::ShaderScope{}; };
+    const auto& s = p->spec_;
+    if (s.compute != (call.kind == na::observe::ShaderKind::Dispatch) ||
+        (!s.compute && !na::observe::ListRasterStateRestorable(list))) return refused("operation kind or native raster state changed");
+    na::observe::ShaderState native;
+    if (!na::observe::ListShaderState(list, s.compute, native) || native.root != s.root.Get() ||
+        (p->cbv_mask_ & native.cbv_params) != p->cbv_mask_) return refused("native root bindings changed");
+    uint64_t tables = 0;
+    for (uint32_t i = 0; i < native.count; ++i) if (!native.tables[i].sampler) tables |= uint64_t(1) << native.tables[i].param;
+    if (p->views_ && tables != p->tables_mask_) return refused("private table map does not cover every native resource table");
+    for (const auto& c : s.constants) if (!c.buffer->CanRecord(list, c.source_state)) return refused("source constant state is not usable");
+    auto retained = std::const_pointer_cast<PreparedBindings>(p);
+    if (!na::nr::native::RetainRecording(list, retained)) return refused("recording lifetime is not available");
+    for (const auto& c : s.constants) c.buffer->RecordBefore(list, c.source_state);
+    if (!p->enter_.empty()) list->ResourceBarrier(static_cast<UINT>(p->enter_.size()), p->enter_.data());
+    if (p->views_) {
+        ID3D12DescriptorHeap* heaps[]{p->views_.Get(), native.samplers};
+        list->SetDescriptorHeaps(native.samplers ? 2 : 1, heaps);
+        for (uint32_t i = 0; i < native.count; ++i) if (native.tables[i].sampler) {
+            const auto t = native.tables[i];
+            if (s.compute) list->SetComputeRootDescriptorTable(t.param, {t.handle});
+            else list->SetGraphicsRootDescriptorTable(t.param, {t.handle});
+        }
+        const auto base = p->views_->GetGPUDescriptorHandleForHeapStart();
+        for (const auto& t : s.tables) {
+            const D3D12_GPU_DESCRIPTOR_HANDLE gpu{base.ptr + uint64_t(t.first) * p->increment_};
+            if (s.compute) list->SetComputeRootDescriptorTable(t.param, gpu); else list->SetGraphicsRootDescriptorTable(t.param, gpu);
+        }
+    }
+    for (const auto& c : s.root_cbvs) {
+        const auto address = s.constants[c.constant].buffer->Address();
+        if (s.compute) list->SetComputeRootConstantBufferView(c.param, address); else list->SetGraphicsRootConstantBufferView(c.param, address);
+    }
+    if (p->rtvs_ || p->dsv_) {
+        const auto rt = p->rtvs_ ? p->rtvs_->GetCPUDescriptorHandleForHeapStart() : D3D12_CPU_DESCRIPTOR_HANDLE{};
+        const auto ds = p->dsv_ ? p->dsv_->GetCPUDescriptorHandleForHeapStart() : D3D12_CPU_DESCRIPTOR_HANDLE{};
+        list->OMSetRenderTargets(static_cast<UINT>(s.colors.size()), rt.ptr ? &rt : nullptr, TRUE, ds.ptr ? &ds : nullptr);
+    }
+    if (!p->viewports_.empty()) list->RSSetViewports(static_cast<UINT>(p->viewports_.size()), p->viewports_.data());
+    if (!p->scissors_.empty()) list->RSSetScissorRects(static_cast<UINT>(p->scissors_.size()), p->scissors_.data());
+    if (p->dispatch_x_) { call.args[0] = p->dispatch_x_; call.args[1] = p->dispatch_y_; }
+    return {na::observe::ShaderAction::Forward, std::move(retained)};
+}
+void BindingHook::After(ID3D12GraphicsCommandList* list, const na::observe::ShaderCall&, na::observe::ShaderScope& scope) noexcept
+{
+    const auto p = std::static_pointer_cast<PreparedBindings>(scope.state);
+    if (!p) return;
+    na::observe::RestoreListState(list);
+    if (!p->leave_.empty()) list->ResourceBarrier(static_cast<UINT>(p->leave_.size()), p->leave_.data());
+    for (auto c = p->spec_.constants.rbegin(); c != p->spec_.constants.rend(); ++c) c->buffer->RecordAfter(list);
+}
+} // namespace na::scale

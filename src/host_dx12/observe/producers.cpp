@@ -4883,6 +4883,41 @@ bool ListStateRestorable(ID3D12CommandList* l)
     std::lock_guard<std::mutex> bl(ls->bind_m);
     return ls->restorable && !ls->in_render_pass;
 }
+bool ListShaderState(ID3D12CommandList* l, bool compute, ShaderState& out)
+{
+    ShaderState result;
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = l ? list_state_locked(l, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    if (!ls->restorable || ls->in_render_pass) return false;
+    result.root = static_cast<ID3D12RootSignature*>(const_cast<void*>(ls->root_sig[compute ? 1 : 0]));
+    for (uint32_t i = 0; i < ls->nheaps; ++i) {
+        const DescHeap* heap = nullptr;
+        for (const auto& h : g_heaps) if (h && h->key == ls->heaps[i]) { heap = h.get(); break; }
+        if (!heap) return false;
+        if (heap->type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) result.resources = ls->heaps[i];
+        else if (heap->type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) result.samplers = ls->heaps[i];
+        else return false;
+    }
+    const auto& args = ls->args[compute ? 1 : 0];
+    if (args.size() > 64) return false;
+    for (uint32_t p = 0; p < args.size(); ++p) {
+        const auto& a = args[p];
+        if (a.type == 2) result.cbv_params |= uint64_t(1) << p;
+        if (a.type != 1) continue;
+        const DescHeap* heap = nullptr;
+        for (const auto& h : g_heaps) if (h &&
+            (h->key == result.resources || h->key == result.samplers) && h->increment &&
+            a.value >= h->gpu_start && (a.value - h->gpu_start) / h->increment < h->count &&
+            (a.value - h->gpu_start) % h->increment == 0) { heap = h.get(); break; }
+        if (!heap) return false;
+        result.tables[result.count++] = {p, a.value, heap->type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER};
+    }
+    out = result;
+    return result.root != nullptr;
+}
 void SetShaderOperationHook(ShaderLane lane, std::shared_ptr<ShaderOperationHook> hook)
 {
     const auto index = static_cast<unsigned>(lane);

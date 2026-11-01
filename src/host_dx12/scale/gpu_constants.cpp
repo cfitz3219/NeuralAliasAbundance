@@ -22,7 +22,7 @@ std::shared_ptr<const GpuConstants> GpuConstants::Create(ID3D12Device* device, I
 {
     error.clear();
     const auto fail = [&](const char* reason) -> std::shared_ptr<const GpuConstants> { error = reason; return {}; };
-    if (!device || !source || !bytes || (offset & 255)) return fail("invalid source constant-buffer binding");
+    if (!device || !source || !bytes || bytes > 65536 || (offset & 255)) return fail("invalid source constant-buffer binding");
     const auto desc = source->GetDesc();
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || offset > desc.Width || bytes > desc.Width - offset)
         return fail("source constant-buffer range is outside the resource");
@@ -53,12 +53,16 @@ std::shared_ptr<const GpuConstants> GpuConstants::Create(ID3D12Device* device, I
     copy->patch_data_->Unmap(0, nullptr);
     return copy;
 }
-bool GpuConstants::RecordBefore(ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES source_state) const
+bool GpuConstants::CanRecord(ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES source_state) const
 {
     if (!list || (list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT && list->GetType() != D3D12_COMMAND_LIST_TYPE_COMPUTE))
         return false;
+    return !fixed_source_state_ || (source_state & D3D12_RESOURCE_STATE_COPY_SOURCE) != 0;
+}
+bool GpuConstants::RecordBefore(ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES source_state) const
+{
+    if (!CanRecord(list, source_state)) return false;
     const bool readable = (source_state & D3D12_RESOURCE_STATE_COPY_SOURCE) != 0;
-    if (fixed_source_state_ && !readable) return false;
     auto b = transition(owned_.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     list->ResourceBarrier(1, &b);
     if (!readable) {

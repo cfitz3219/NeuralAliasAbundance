@@ -36,6 +36,8 @@ struct ID3D12CommandQueue;
 struct ID3D12CommandList;
 struct ID3D12GraphicsCommandList;
 struct ID3D12Resource;
+struct ID3D12RootSignature;
+struct ID3D12DescriptorHeap;
 struct D3D12_RESOURCE_BARRIER;
 struct IDXGISwapChain;
 
@@ -144,6 +146,18 @@ bool RestoreListState(ID3D12GraphicsCommandList* list);
 void SetRasterStateTracking(bool enabled);
 bool ListRasterStateRestorable(ID3D12CommandList* list);
 bool ListStateRestorable(ID3D12CommandList* list); // RestoreListState would succeed
+// Bounded snapshot of the current native shader bindings, for scoped private
+// descriptor heaps. Rebind ALL resource tables when changing their heap, and
+// preserve the sampler heap/tables. No descriptor memory is copied here.
+struct ShaderState {
+    ID3D12RootSignature* root = nullptr;
+    ID3D12DescriptorHeap* resources = nullptr;
+    ID3D12DescriptorHeap* samplers = nullptr;
+    uint64_t cbv_params = 0;
+    struct Table { uint32_t param; uint64_t handle; bool sampler; } tables[64]{};
+    uint32_t count = 0;
+};
+bool ListShaderState(ID3D12CommandList* list, bool compute, ShaderState& out);
 // First render target and depth currently bound in the recording.
 bool ListCurrentTargets(ID3D12CommandList* list, na_object_id* rt, na_object_id* ds);
 // Identity of the list's current recording (changes on every Reset); 0 if unknown.

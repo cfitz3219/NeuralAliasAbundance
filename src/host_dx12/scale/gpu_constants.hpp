@@ -16,9 +16,10 @@ public:
     // Address() to the selected operation's root CBV/private table CBV.
     // Source state is explicit, and restored before this returns.
     bool RecordBefore(ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES source_state) const;
+    bool CanRecord(ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES source_state) const;
     // After the affected draw/dispatch and after rebinding the game's CB, return
-    // the owned buffer to COMMON. Balanced calls support replay, including twice
-    // in one Execute. Concurrent queues require their own copies or GPU ordering;
+    // the owned buffer to COMMON. Balanced calls support legal replay after
+    // completion of the prior execution. Concurrent queues need private copies or ordering;
     // a shared_ptr/recording lease alone does not serialize GPU writes.
     void RecordAfter(ID3D12GraphicsCommandList* list) const;
     D3D12_GPU_VIRTUAL_ADDRESS Address() const { return owned_->GetGPUVirtualAddress(); }
