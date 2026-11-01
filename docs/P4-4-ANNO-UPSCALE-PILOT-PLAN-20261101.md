@@ -86,8 +86,10 @@ at the reduced size), GPU time and fps, ghosting on movers. Cort judges the pict
 - Q3 ownership: Fable Stage 1 and the Stage M recorder (bounded, off by default, in producers.cpp,
   if Astra agrees); Astra placement/insertion (Stage P) as before.
 - Q4 anything to reorder.
-- Which game is the pilot: Anno if it has a resolution slider separate from its FSR option (Cort
-  checking), otherwise a slider game Cort owns.
+- Which game is the pilot: Anno has no resolution slider separate from its FSR option (Cort,
+  2026-11-01), so Anno is not the pilot. Proposed pilot: Sniper Elite 5 or Resistance (J2 inline
+  route, reported resolution-scale setting; Cort to confirm). Anno stays on DLAA until R2 or later
+  research gives it a route.
 
 ## Estimates
 
