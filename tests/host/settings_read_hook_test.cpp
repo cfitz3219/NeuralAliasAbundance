@@ -68,7 +68,7 @@ int main()
     static float* volatile game_f = nullptr;
     static double* volatile game_d = nullptr;
     {
-        const size_t at = seen.find("RenderScale = ") + 14;
+        const size_t at = seen.find("\nRenderScale = ") + 15; // not the comment line above it
         game_f = new float(0);
         game_d = new double(0);
         *game_f = static_cast<float>(std::atof(seen.c_str() + at));
@@ -81,7 +81,7 @@ int main()
         std::printf("live scan: %u candidates (float %u double %u), %llu KB in %llu ms, regions %u writable %u stacks %u, copies at %p %p, \"%s\"\n",
                     ls.candidates, ls.float_hits, ls.double_hits, (unsigned long long)ls.scanned_kb, (unsigned long long)ls.scan_ms, ls.regions,
                     ls.writable_regions, ls.stack_allocations_skipped, static_cast<void*>(game_f), static_cast<void*>(game_d), ls.note);
-        CHECK(ls.tagged && ls.candidates >= 2 && ls.float_hits >= 1 && ls.double_hits >= 1);
+        CHECK(ls.tagged && ls.candidates == 2 && ls.float_hits == 1 && ls.double_hits == 1); // nothing of ours
         // One candidate at a time; a candidate that did not move the picture is put back.
         int tries = 0;
         for (LiveResult r = ls.result; r == LiveResult::Trying && tries < 8; ++tries) {

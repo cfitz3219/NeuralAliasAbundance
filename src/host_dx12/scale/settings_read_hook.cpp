@@ -42,7 +42,7 @@ struct Patched { // per file: what we changed, to put back in the game's own wri
     std::string key;
     Unit unit = Unit::Fraction;
     double original_value = 0;  // the game's value, its unit
-    double ours_value = 0;
+    // (our value is kept as text only: a double copy in our heap would be found by the scan)
     bool async_logged = false;
 };
 
@@ -226,12 +226,11 @@ BOOL WINAPI read_file(HANDLE h, LPVOID buf, DWORD n, LPDWORD got, LPOVERLAPPED o
         p.key = m.key;
         p.unit = m.unit;
         p.original_value = m.current;
-        p.ours_value = std::atof(info.written);
         // Live discovery only from a marker that really is in the bytes and survives float
         // conversion; startup substitution works either way.
         g_live.have_tag = info.tagged;
         g_live.unit = m.unit;
-        g_live.tag = info.tagged ? p.ours_value : 0;
+        g_live.tag = info.tagged ? std::atof(info.written) : 0; // g_live is in our module: not scanned
         ++g_live.generation;
         g_live.scanned = false;
         g_live.cand.clear();
@@ -257,7 +256,7 @@ bool ours_value(const Patched& p, const std::string& text, double v)
 {
     if (text == p.ours) return true;
     const auto close_to = [&](double a) { return std::fabs(v - a) <= 1e-5 * (std::max)(1.0, std::fabs(a)); };
-    if (close_to(p.ours_value)) return true;
+    if (close_to(std::atof(p.ours.c_str()))) return true;
     for (double w : g_live.values_written) if (close_to(w)) return true;
     return false;
 }
@@ -382,8 +381,9 @@ bool InstallSettingsReadHook()
 namespace {
 constexpr size_t kMaxCandidates = 8; // more than this: ambiguous, nothing is tried
 
+struct Hit { uintptr_t addr; bool is_double; };
 struct ScanOut {
-    std::vector<Candidate> cand;
+    std::vector<Hit> cand;
     uint32_t floats = 0, doubles = 0, regions = 0, writable = 0, stacks = 0;
     uint64_t bytes = 0;
 };
@@ -430,24 +430,16 @@ void scan_memory(double v, ScanOut& o)
             SIZE_T got = 0;
             if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(r.base + off), buf, n, &got) || got < 4) continue;
             for (size_t i = 0; i + 4 <= got; i += 4) {
-                Candidate c;
-                c.addr = r.base + off + i;
+                // Only addresses are recorded here; the candidates' expected bytes are filled in
+                // after the scan, so no copy of the marker sits in our own heap while it runs.
+                const uintptr_t at = r.base + off + i;
                 float f;
                 std::memcpy(&f, buf + i, 4);
-                if (f == fv) {
-                    ++o.floats;
-                    std::memcpy(c.last, &f, 4);
-                    o.cand.push_back(c);
-                }
+                if (f == fv) { ++o.floats; o.cand.push_back({at, false}); }
                 if (i + 8 <= got) {
                     double dv;
                     std::memcpy(&dv, buf + i, 8);
-                    if (dv == v) {
-                        ++o.doubles;
-                        c.is_double = true;
-                        std::memcpy(c.last, &dv, 8);
-                        o.cand.push_back(c);
-                    }
+                    if (dv == v) { ++o.doubles; o.cand.push_back({at, true}); }
                 }
                 if (o.cand.size() > kMaxCandidates) { full = true; break; }
             }
@@ -566,7 +558,14 @@ DWORD WINAPI scan_thread(void*)
             SetEvent(g_scan_done);
             return 0;
         }
-        L.cand = std::move(o.cand);
+        L.cand.clear();
+        for (const Hit& h : o.cand) {
+            Candidate c;
+            c.addr = h.addr;
+            c.is_double = h.is_double;
+            encode(c, tag, c.last);
+            L.cand.push_back(c);
+        }
         L.scanned = true;
         L.scanning = false;
         L.trying = L.control = -1;
