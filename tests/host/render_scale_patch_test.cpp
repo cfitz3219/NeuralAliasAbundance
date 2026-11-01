@@ -5,9 +5,9 @@
 #include <string>
 
 namespace {
-std::string patch(std::string s, double f, int* n = nullptr, na::scale::Match* m = nullptr)
+std::string patch(std::string s, double f, int* n = nullptr, na::scale::Match* m = nullptr, bool tag = false)
 {
-    const int k = na::scale::PatchRenderScale(s.data(), s.size(), f, m);
+    const int k = na::scale::PatchRenderScale(s.data(), s.size(), f, m, tag);
     if (n) *n = k;
     return s;
 }
@@ -60,6 +60,12 @@ int main()
         const std::string out = patch("ResolutionScale=100.0\n", 0.5, &n, &m);
         CHECK(m.unit == Unit::Percent);
         CHECK(n == 1 && out == "ResolutionScale=50.00\n");
+    }
+    // Tagged (live switching): last decimal nudged; integers cannot be tagged and stay exact.
+    {
+        int n = 0;
+        CHECK(patch("RenderScale = 1.000000\n", 0.666667, &n, nullptr, true) == "RenderScale = 0.666668\n" && n == 1);
+        CHECK(patch("ScreenPercentage=100\n", 0.5, &n, nullptr, true) == "ScreenPercentage= 50\n" && n == 1);
     }
     return test::finish("render_scale_patch_test");
 }

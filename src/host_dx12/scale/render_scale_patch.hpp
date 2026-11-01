@@ -108,7 +108,9 @@ inline bool FindRenderScale(const char* d, size_t n, Match* m, size_t from = 0)
 // `fraction` (render / output, e.g. 0.666667) in the match's unit, written in exactly
 // value_len characters. Shorter numbers get trailing zeros after a decimal point, or a leading
 // space when the value is unquoted. False when it cannot be written within 1 % in that width.
-inline bool FormatSameWidth(double fraction, const Match& m, char* out /* value_len + 1 */)
+// `tag`: nudge the last decimal digit by one (0.666667 -> 0.666668) so the value the game parses
+// is distinguishable in its memory (live mode switching); only with at least 4 decimals.
+inline bool FormatSameWidth(double fraction, const Match& m, char* out /* value_len + 1 */, bool tag = false)
 {
     const size_t w = m.value_len;
     if (!w || w > 15 || !(fraction > 0)) return false;
@@ -132,13 +134,19 @@ inline bool FormatSameWidth(double fraction, const Match& m, char* out /* value_
         l = w;
     }
     s[l] = 0;
+    if (tag) {
+        const char* dot = std::strchr(s, '.');
+        if (!dot || static_cast<size_t>(l - (dot - s) - 1) < 4) return false;
+        char& last = s[l - 1];
+        last = last == '9' ? '8' : static_cast<char>(last + 1);
+    }
     std::memcpy(out, s, w + 1);
     return true;
 }
 
 // Rewrites every non-comment render-scale value in place (same length). Returns how many were
 // rewritten; `first` gets the first match (also when nothing could be written).
-inline int PatchRenderScale(char* d, size_t n, double fraction, Match* first = nullptr)
+inline int PatchRenderScale(char* d, size_t n, double fraction, Match* first = nullptr, bool tag = false)
 {
     int patched = 0;
     bool have_first = false;
@@ -146,7 +154,7 @@ inline int PatchRenderScale(char* d, size_t n, double fraction, Match* first = n
     for (size_t from = 0; FindRenderScale(d, n, &m, from); from = m.value_pos + m.value_len) {
         if (!have_first && first) { *first = m; have_first = true; }
         char v[16] = {};
-        if (!FormatSameWidth(fraction, m, v)) continue;
+        if (!FormatSameWidth(fraction, m, v, tag) && !(tag && FormatSameWidth(fraction, m, v))) continue;
         std::memcpy(d + m.value_pos, v, m.value_len);
         ++patched;
     }

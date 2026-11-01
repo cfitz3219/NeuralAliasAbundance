@@ -37,4 +37,21 @@ struct ReadHookStats {
 };
 ReadHookStats GetReadHookStats();
 
+// Live mode change (Sniper applies Render Scale instantly in its own menu). The value substituted
+// at read time is tagged (last decimal nudged by one), so after the game parsed it the exact
+// float/double holding it can be found in the game's writable memory. SetLiveFraction finds those
+// copies once (worker thread only: it scans memory; never from a render callback), then writes
+// the new value into each copy that still holds the last value we put there. Returns how many
+// copies were written; 0 = live change not available (the menu says "applies on next launch").
+// More than 8 copies is treated as ambiguous and nothing is written. The caller confirms the
+// change from J2's detected render extent.
+int SetLiveFraction(double fraction);
+struct LiveStats {
+    uint32_t float_hits = 0, double_hits = 0, writes = 0;
+    uint64_t scanned_mb = 0;
+    double tag = 0;          // the tagged value the game parsed (its unit)
+    char note[160] = {};
+};
+LiveStats GetLiveStats();
+
 } // namespace na::scale

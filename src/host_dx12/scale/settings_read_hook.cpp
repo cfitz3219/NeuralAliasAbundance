@@ -12,6 +12,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace na::scale {
 namespace {
@@ -43,6 +44,17 @@ std::wstring g_log;
 std::map<HANDLE, Tracked> g_handles;
 std::map<std::wstring, Patched> g_patched; // lower-cased path
 ReadHookStats g_stats;
+// Live switching: the tagged value the game parsed, in its unit, and where copies were found.
+struct Live {
+    bool have_tag = false;
+    Unit unit = Unit::Fraction;
+    double tag = 0;
+    bool scanned = false;
+    std::vector<uintptr_t> floats, doubles;
+    float last_f = 0;
+    double last_d = 0;
+    LiveStats stats;
+} g_live;
 bool g_installed = false;
 thread_local int t_inside = 0; // our own file work (the log) is not observed
 // Lock-free fast path: ReadFile/WriteFile run for every file the game touches, so untracked
@@ -163,7 +175,7 @@ BOOL WINAPI read_file(HANDLE h, LPVOID buf, DWORD n, LPDWORD got, LPOVERLAPPED o
     Match m;
     if (!FindRenderScale(d, *got, &m)) return ok;
     const std::string original(d + m.value_pos, m.value_len);
-    const int k = PatchRenderScale(d, *got, g_fraction, &m);
+    const int k = PatchRenderScale(d, *got, g_fraction, &m, /*tag=*/true);
     char line[600];
     if (k > 0) {
         ++g_stats.reads_patched;
@@ -175,6 +187,11 @@ BOOL WINAPI read_file(HANDLE h, LPVOID buf, DWORD n, LPDWORD got, LPOVERLAPPED o
         p.original = original;
         p.ours.assign(d + m.value_pos, m.value_len);
         p.key = m.key;
+        g_live.have_tag = true;
+        g_live.unit = m.unit;
+        g_live.tag = std::atof(p.ours.c_str());
+        g_live.stats.tag = g_live.tag;
+        g_live.scanned = false;
         std::snprintf(g_stats.note, sizeof g_stats.note, "%s %s -> %s (%d value%s)", m.key, original.c_str(), p.ours.c_str(), k, k == 1 ? "" : "s");
         std::snprintf(line, sizeof line, "patched read of %s: %s", file.c_str(), g_stats.note);
     } else {
@@ -274,6 +291,117 @@ bool InstallSettingsReadHook()
     std::lock_guard<std::mutex> lk(g_m);
     g_installed = true; // hooks persist for the process lifetime (vtable_hook.hpp threading rules)
     return true;
+}
+
+namespace {
+// Committed, writable, readable regions of this process outside our own module and buffers.
+template <class F> uint64_t for_each_region(const void* skip_a, size_t skip_n, F&& f)
+{
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&g_live), &self);
+    uint64_t scanned = 0;
+    MEMORY_BASIC_INFORMATION mi{};
+    for (uintptr_t a = 0x10000; VirtualQuery(reinterpret_cast<void*>(a), &mi, sizeof mi) == sizeof mi;) {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(mi.BaseAddress), next = base + mi.RegionSize;
+        if (next <= a) break;
+        a = next;
+        if (mi.State != MEM_COMMIT || (mi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) continue;
+        if (!(mi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE))) continue;
+        if (self && mi.AllocationBase == self) continue;
+        const uintptr_t sa = reinterpret_cast<uintptr_t>(skip_a);
+        if (sa >= base && sa < next && skip_n) continue;
+        if (scanned + mi.RegionSize > (16ull << 30)) break; // bounded
+        scanned += mi.RegionSize;
+        f(base, static_cast<size_t>(mi.RegionSize));
+    }
+    return scanned;
+}
+void scan_locked()
+{
+    g_live.floats.clear();
+    g_live.doubles.clear();
+    const double v = g_live.tag;
+    const float fv = static_cast<float>(v);
+    ULONG_PTR stack_lo = 0, stack_hi = 0; // this thread's own locals hold the tag too
+    GetCurrentThreadStackLimits(&stack_lo, &stack_hi);
+    const auto ours = [&](uintptr_t addr) { return addr >= stack_lo && addr < stack_hi; };
+    constexpr size_t kChunk = 1u << 20;
+    auto* buf = static_cast<unsigned char*>(VirtualAlloc(nullptr, kChunk, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!buf) return;
+    const uint64_t bytes = for_each_region(buf, kChunk, [&](uintptr_t base, size_t size) {
+        for (size_t off = 0; off < size; off += kChunk) {
+            const size_t n = (std::min)(kChunk, size - off);
+            SIZE_T got = 0;
+            if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(base + off), buf, n, &got) || got < 8) continue;
+            for (size_t i = 0; i + 8 <= got; i += 4) {
+                float f;
+                std::memcpy(&f, buf + i, 4);
+                if (f == fv && !ours(base + off + i) && g_live.floats.size() < 16) g_live.floats.push_back(base + off + i);
+                double dv;
+                std::memcpy(&dv, buf + i, 8);
+                if (dv == v && !ours(base + off + i) && g_live.doubles.size() < 16) g_live.doubles.push_back(base + off + i);
+            }
+        }
+    });
+    VirtualFree(buf, 0, MEM_RELEASE);
+    g_live.scanned = true;
+    g_live.last_f = fv;
+    g_live.last_d = v;
+    g_live.stats.float_hits = static_cast<uint32_t>(g_live.floats.size());
+    g_live.stats.double_hits = static_cast<uint32_t>(g_live.doubles.size());
+    g_live.stats.scanned_mb = bytes >> 20;
+}
+} // namespace
+
+int SetLiveFraction(double fraction)
+{
+    std::lock_guard<std::mutex> lk(g_m);
+    auto& L = g_live;
+    if (!L.have_tag || !(fraction > 0) || fraction > 2.0) {
+        std::snprintf(L.stats.note, sizeof L.stats.note, "No tagged render-scale value was read at start-up.");
+        return 0;
+    }
+    if (!L.scanned) scan_locked();
+    const size_t hits = L.floats.size() + L.doubles.size();
+    char line[300];
+    if (hits == 0 || hits > 8) {
+        std::snprintf(L.stats.note, sizeof L.stats.note, hits ? "%zu copies of the tagged value: ambiguous, nothing written."
+                                                              : "The tagged value was not found in memory (%zu).", hits);
+        std::snprintf(line, sizeof line, "live switch unavailable: %s (scanned %llu MB)", L.stats.note, (unsigned long long)L.stats.scanned_mb);
+        log_line(line);
+        return 0;
+    }
+    const double nv = L.unit == Unit::Percent ? fraction * 100.0 : fraction;
+    const float nf = static_cast<float>(nv);
+    int written = 0;
+    auto put = [&](std::vector<uintptr_t>& v, const void* expect, const void* val, size_t n) {
+        for (size_t i = 0; i < v.size();) {
+            unsigned char cur[8] = {};
+            SIZE_T got = 0;
+            if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(v[i]), cur, n, &got) || got != n ||
+                std::memcmp(cur, expect, n) != 0) { v.erase(v.begin() + static_cast<std::ptrdiff_t>(i)); continue; } // no longer ours
+            SIZE_T put_n = 0;
+            if (WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(v[i]), val, n, &put_n) && put_n == n) ++written;
+            ++i;
+        }
+    };
+    put(L.floats, &L.last_f, &nf, 4);
+    put(L.doubles, &L.last_d, &nv, 8);
+    L.last_f = nf;
+    L.last_d = nv;
+    L.stats.writes += static_cast<uint32_t>(written);
+    std::snprintf(L.stats.note, sizeof L.stats.note, "wrote %.4f to %d cop%s (float %zu, double %zu)", nv, written, written == 1 ? "y" : "ies",
+                  L.floats.size(), L.doubles.size());
+    std::snprintf(line, sizeof line, "live switch: %s", L.stats.note);
+    log_line(line);
+    return written;
+}
+
+LiveStats GetLiveStats()
+{
+    std::lock_guard<std::mutex> lk(g_m);
+    return g_live.stats;
 }
 
 ReadHookStats GetReadHookStats()

@@ -6,6 +6,7 @@
 #include "host_dx12/scale/settings_read_hook.hpp"
 
 #include <windows.h>
+#include <cstdlib>
 #include <string>
 
 namespace {
@@ -54,12 +55,29 @@ int main()
     na::scale::Configure(na::scale::FractionForMode(1), log.c_str());
     const std::string seen = read_all(opt);
     std::printf("game reads: %s\n", seen.c_str());
-    CHECK(seen.size() == ini.size() && seen.find("RenderScale = 0.666667\r\n") != std::string::npos);
+    CHECK(seen.size() == ini.size() && seen.find("RenderScale = 0.666668\r\n") != std::string::npos); // tagged for live switching
     CHECK(read_all(other) == ini); // not a settings-file extension
     const auto st = na::scale::GetReadHookStats();
     std::printf("stats: opened %llu patched %llu note \"%s\" file \"%s\"\n", (unsigned long long)st.files_opened,
                 (unsigned long long)st.reads_patched, st.note, st.file);
     CHECK(st.reads_patched >= 1 && st.original == 1.0 && std::string(st.key) == "RenderScale");
+
+    // Live switch: the "game" parsed the tagged value into its own heap (a float and a double copy).
+    {
+        const size_t at = seen.find("RenderScale = ") + 14;
+        auto* game_f = new float(static_cast<float>(std::atof(seen.c_str() + at)));
+        auto* game_d = new double(std::atof(seen.c_str() + at));
+        const int w = na::scale::SetLiveFraction(0.5);
+        const auto ls = na::scale::GetLiveStats();
+        std::printf("live: wrote %d, hits float %u double %u, scanned %llu MB, \"%s\"\n", w, ls.float_hits, ls.double_hits,
+                    (unsigned long long)ls.scanned_mb, ls.note);
+        CHECK(w == 2 && *game_f == 0.5f && *game_d == 0.5);
+        CHECK(na::scale::SetLiveFraction(1.0 / 1.72) == 2 && *game_d == 1.0 / 1.72); // a second change follows its own last value
+        *game_d = 0.75; // the user moved the game's slider: that copy is no longer ours
+        CHECK(na::scale::SetLiveFraction(0.5) == 1 && *game_d == 0.75 && *game_f == 0.5f);
+        delete game_f;
+        delete game_d;
+    }
 
     // The "game" saves what it read: the disk keeps the user's original value.
     CHECK(write_all(opt, seen));
