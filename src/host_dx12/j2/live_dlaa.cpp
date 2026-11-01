@@ -5,6 +5,7 @@
 #include "host_dx12/j2/consumer_profile.hpp"
 #include "host_dx12/j2/jitter_writes.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
+#include "host_dx12/j2/compute_flow.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 #include "host_dx12/upscalers/ffx_intercept.hpp"
@@ -56,6 +57,7 @@ struct PendingHistory {
     na::camera::CameraTracker tracker;
     bool cut = false;
     uint32_t capture = 0; // J2 evidence capture token for this evaluation (0 = none)
+    na::j2::compute_flow::Ticket compute_flow;
 };
 
 // CPU metadata of this frame's last submitted scene. No pooled command-list
@@ -1384,6 +1386,17 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         // projection; the arbiter removes it before reprojecting (Astra, 378663e finding).
         in.jitter_current_px[0] = static_cast<float>(cam.jitter_px_x);
         in.jitter_current_px[1] = static_cast<float>(cam.jitter_px_y);
+        // AMD is an in-list dispatch, after this frame's resolved pre-DLAA
+        // colour/depth copies. It needs no batch split or external queue wait.
+        if(na::j2::flow::Enabled() && (inl || !flow_ticket || !flow_ticket->valid)){
+            na::j2::compute_flow::Frame frame;frame.frame=g.frame;frame.previous=g.submitted_frame;
+            frame.generation=g.router.Current().history_generation;frame.slot=g.slot;
+            frame.reset=cam.camera_cut || resize || g.resume_reset;frame.hdr=is_float_color(cf);
+            frame.jitter[0]=in.jitter_current_px[0];frame.jitter[1]=in.jitter_current_px[1];
+            na::j2::compute_flow::Tier3 tier;
+            pending.compute_flow=na::j2::compute_flow::Record(l,g.queue.Get(),g.color_in.Get(),g.depth32.Get(),in,frame,tier);
+            if(tier.residual){in.tier3_valid_flag=true;in.tier3_residual=tier.residual;in.tier3_valid=tier.valid;in.tier3_mask=tier.mask;}
+        }
         // P4-0b: camera + accepted moving-object residual (tier 3) when this frame's pair ran.
         na::j2::flow::Tier3 t3;
         if (flow_ticket && flow_ticket->pair && na::j2::flow::RecordFusion(l, *flow_ticket, g.depth32.Get(), in, &t3)) {
@@ -2183,6 +2196,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
                 slot.fence_value = g.fence_next++;
                 queue->Signal(g.fence.Get(), slot.fence_value);
                 na::capture::j2::Submitted(pending.capture, queue, g.stats.submissions);
+                na::j2::compute_flow::Committed(pending.compute_flow);
                 reason("Live DLAA is running before a learned post-processing consumer in a separate list.");
                 return;
             }
@@ -2203,6 +2217,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         g.slots[g.inl.slot].fence_value = g.fence_next++;
         queue->Signal(g.fence.Get(), g.slots[g.inl.slot].fence_value);
         na::capture::j2::Submitted(g.inl.history.capture, queue, g.stats.submissions);
+        na::j2::compute_flow::Committed(g.inl.history.compute_flow);
         g.inl.history.capture = 0;
         g.inl.valid = false;
         reason("Live DLAA is running inside the game's scene list (post-processing shares it).");
@@ -2335,6 +2350,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     s.fence_value = g.fence_next++;
     queue->Signal(g.fence.Get(), s.fence_value);
     na::j2::flow::Committed(flow_ticket, g.fence.Get(), s.fence_value);
+    na::j2::compute_flow::Committed(pending.compute_flow);
     na::capture::j2::Submitted(pending.capture, queue, g.stats.submissions);
 }
 
@@ -2351,6 +2367,7 @@ void Shutdown()
     g.msaa = MsaaResolve{};
     for (auto& s : g.slots) { s.list.Reset(); s.alloc.Reset(); s.fence_value = 0; }
     na::j2::flow::Shutdown(); // before the device and J2's fence go
+    na::j2::compute_flow::Reset();
     g.fence.Reset(); g.queue.Reset(); g.device.Reset();
     g.arbiter = na::motion::gpu::Arbiter{};
     g_dbg = DebugPass{};
