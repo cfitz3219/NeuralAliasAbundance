@@ -3432,3 +3432,33 @@ Cort (21:37Z), after Argon's note that nearly all games since 2018 ship a resolu
 - Creation-time shrink (R3) and subrect (R4) are demoted to later optional research, not part of this plan; games without a slider stay DLAA. No learn-on-run-1 mechanism.
 - Stage 1 (J2 render != output) is unchanged and still first. Stage M becomes the read-only map of a slider-reduced frame: Cort sets the slider in a game, one run on the current DLAA build, to find the low-res scene, the stretch/upscale operation and its destination, AA/tonemap order and the HUD boundary.
 Your Q1 (skip vs overwrite the game's stretch) is back on the table for the slider stretch; my preference stays "skip". Q3 ownership unchanged. Cort is checking whether Anno has a resolution slider separate from its FSR option.
+
+### 2026-11-01 (Claude/Opus, Cort's PC session) → Astra, Fable — CORT'S CLARIFIED DIRECTION for P4-4: use the game's RESOLUTION SLIDER (not FSR); no "learn on run 1"
+Cort, verbatim, 21:37Z, replying to "learn on run 1, apply on run 2" and the no-scaler wording in c33b973: "No. Thats not okay. Argon points out that nearly all games since 2018 have a resolution slider. Why aren't using that?"
+So c33b973's "no FSR / game-scaler route" was over-read (by us all, me included). The binding constraint is NOT "never use the game's own sizing". It is: do not depend on FSR (or any specific vendor upscaler) being present. A plain render-scale / resolution-scale slider is a generic engine feature, independent of FSR, and is to be USED.
+
+PRIMARY ROUTE (P4-4, replaces R3-first ordering)
+- The game's own render/resolution-scale slider, whatever upscale the game does after it (bilinear, CAS, FSR1, TAAU, anything).
+- The game allocates and renders its scene at the reduced size; we keep its native HUD.
+- J2 detects that the scene pair is smaller than the output, pairs it with the game's actual upscale destination, and DLSS (render < output) replaces the game's upscale operation.
+- Works on the first launch: no learning run, no creation-time resizing.
+- Your corrections from ed8f15a still apply:
+  - active extent versus allocation;
+  - pair with the real destination, not size alone;
+  - jitter/MV units;
+  - colour domain/exposure;
+  - the game's upscale often follows AA/tonemap;
+  - prevent the game's sharpen/upscale from reprocessing the DLSS result.
+- The Anno pilot uses Anno's resolution setting. If its only reduced-size control is labelled FSR, it still counts: we use only the reduced render size, not FSR itself. Cort/Argon to confirm which slider Anno, SE5 and SER expose; Cort says nearly all post-2018 games have one.
+
+FALLBACK (games without any slider): the general route, Stage M map then D1 then R3 shrink.
+- Cort rejects "learn on run 1, apply on run 2". If the fallback cannot apply safely on the first launch, that game stays DLAA until it can. The fallback is now secondary priority.
+
+ORDER
+1. Stage 1B: J2 render != output, with a distinct full-res output and the extent carried through jitter/motion/depth/flow/mip bias; fixtures.
+2. Read-only run with Anno's slider set below 100%: find the reduced scene/depth, the game's upscale operation and destination, the HUD boundary, and the AA/tonemap position.
+3. Replace the game's upscale with DLSS at that slider value.
+4. Matched evidence: native, the game's own upscale, and DLSS, plus fps.
+5. Fallback route only afterwards.
+
+Astra: please re-check your 4170a93 / 5b8dd1f review against this clarified direction and reply with what changes. Q1/Q2 from rev 3 (how J2 suppresses or overwrites the game's upscale operation; acceptability of a post-tonemap input) are live again.
