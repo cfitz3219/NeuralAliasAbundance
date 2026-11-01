@@ -973,17 +973,13 @@ void DrawLiveDlaa()
         EndRow();
         if (fl) {
             const na::j2::flow::Stats fs = na::j2::flow::GetStats();
-<<<<<<< HEAD
             const auto cs=na::j2::compute_flow::GetStats();
             if(na::j2::GetStats().inline_mode || (!fs.available && cs.recorded)){
                 char line[350];std::snprintf(line,sizeof line,"AMD compute: %s Pairs %llu, submitted %llu, busy %llu. Accepted %.1f%%, GPU %.2f ms.",cs.reason,
                     static_cast<unsigned long long>(cs.pairs),static_cast<unsigned long long>(cs.submitted),static_cast<unsigned long long>(cs.busy),cs.total?100.0*double(cs.accepted)/double(cs.total):0.0,cs.ms);
                 StatusLine(0,line);
             }else{
-            const uint64_t px = fs.px_accepted + fs.px_invalid + fs.px_small + fs.px_cost + fs.px_offscreen + fs.px_image;
-=======
             const uint64_t px = fs.px_accepted + fs.px_invalid + fs.px_small + fs.px_cost + fs.px_offscreen + fs.px_image + fs.px_flicker;
->>>>>>> origin/claude/project-thread-pfxnx8
             const double pct = px ? 100.0 * static_cast<double>(fs.px_accepted) / static_cast<double>(px) : 0.0;
             char tb[360];
             const double flick = px ? 100.0 * static_cast<double>(fs.px_flicker) / static_cast<double>(px) : 0.0;

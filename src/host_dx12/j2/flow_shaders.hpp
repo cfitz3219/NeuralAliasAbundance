@@ -1,5 +1,5 @@
 #pragma once
-// Shared scene encode / image-consistency acceptance. NeuralAlias code, not a new optical-flow solver.
+// AMD-path scene encode / image-consistency acceptance reused from j2_flow at aa68134. NeuralAlias code, not a new optical-flow solver.
 namespace na::j2 {
 inline const char kFlowShader[] = R"(
 Texture2D<float4> t_color : register(t0);
