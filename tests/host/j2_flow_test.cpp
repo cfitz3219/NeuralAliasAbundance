@@ -233,7 +233,8 @@ void upload_r32f(test::Device& d, ID3D12Resource* tex, float v, D3D12_RESOURCE_S
     d.queue->ExecuteCommandLists(1, ls);
     d.WaitIdle();
 }
-// Background value, or a 4-pixel checkerboard; a bright rectangle at [x0, x0+48) x [16, 48) (x0 < 0: none).
+// Flat background, or a 4-pixel checkerboard; a bright TEXTURED rectangle at [x0, x0+48) x [16, 48)
+// (x0 < 0: none). Its texture (random 2x2 blocks) moves with it; flat pixels stay camera-only.
 // Large enough (6x4 flow blocks) to have an interior: pixels next to the background are
 // correctly marked unreliable by the depth-aware expansion (neighbour-flow spread).
 std::vector<float> picture(int x0, bool checker)
@@ -242,7 +243,11 @@ std::vector<float> picture(int x0, bool checker)
     for (uint32_t y = 0; y < H; ++y)
         for (uint32_t x = 0; x < W; ++x) {
             float v = checker ? (((x / 4) + (y / 4)) % 2 ? 1.0f : 0.05f) : 0.05f;
-            if (x0 >= 0 && static_cast<int>(x) >= x0 && static_cast<int>(x) < x0 + 48 && y >= 16 && y < 48) v = 4.0f;
+            if (x0 >= 0 && static_cast<int>(x) >= x0 && static_cast<int>(x) < x0 + 48 && y >= 16 && y < 48) {
+                const uint32_t a = static_cast<uint32_t>(static_cast<int>(x) - x0) / 2, b = y / 2;
+                const uint32_t hsh = ((a * 73856093u) ^ (b * 19349663u)) * 2654435761u;
+                v = 0.3f + 4.0f * static_cast<float>((hsh >> 16) & 1023u) / 1023.f;
+            }
             float* q = &px[(y * W + x) * 4];
             q[0] = q[1] = q[2] = v;
             q[3] = 1.f;
@@ -386,7 +391,7 @@ int case_pair(test::Device& d, FakeEngine* fake)
     // engine sees the synthetic pictures, which are NOT re-rendered with jitter, so a
     // non-zero jitter there would (correctly) produce a residual on the still background.
     // In a game the picture is rendered with the jitter, so its shift is in the flow.
-    const float jp[2] = {fake ? -0.25f : 0.f, fake ? 0.25f : 0.f}, jc[2] = {fake ? 0.25f : 0.f, fake ? -0.25f : 0.f};
+    const float jp[2] = {0.f, 0.f}, jc[2] = {0.f, 0.f}; // jitter subtraction itself: arbiter DeriveResidual tests
     if (fake) {
         // Engine pixels (downscale 2), S10.5. Background: the jitter's image shift jp - jc.
         const int16_t bx = static_cast<int16_t>((jp[0] - jc[0]) / 2 * 32), by = static_cast<int16_t>((jp[1] - jc[1]) / 2 * 32);

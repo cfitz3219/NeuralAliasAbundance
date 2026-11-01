@@ -136,7 +136,7 @@ struct Stats {
     uint64_t skipped_busy = 0, skipped_split = 0, skipped_msaa = 0, skipped_reset = 0, skipped_resize = 0;
     uint64_t engine_failed = 0, watchdog_trips = 0;
     // Last read-back frame (pixels): accepted residual, and why others were not.
-    uint64_t px_accepted = 0, px_invalid = 0, px_small = 0, px_cost = 0, px_offscreen = 0, px_image = 0;
+    uint64_t px_accepted = 0, px_invalid = 0, px_small = 0, px_cost = 0, px_offscreen = 0, px_image = 0; // px_image includes flat pixels
     float mean_cost = 0;          // over pixels that reached the cost check
     float ms_last = 0, ms_avg = 0; // GPU time from the pre list's start to the end of fusion
     char reason[160] = {};

@@ -32,6 +32,11 @@ constexpr uint32_t kCostMax = 160;     // engine cost above this rejects the blo
 constexpr float kSnapPx = 0.25f;       // same as the arbiter's snap: smaller residuals are noise
 constexpr float kImageAbs = 0.08f;     // the flow must explain the image (mean luma error, 3x3 encoded texels)
 constexpr float kImageMargin = 0.02f;  // and never clearly worse than the camera alone (flat areas: both explain it)
+// Minimum local contrast (3x3 encoded luma, max - min) for a residual to count. On flat
+// areas the engine fills vectors in from nearby edges (RTX 5070 Ti: ~0.5 px drift on a
+// flat background), cost and image checks cannot reject them, and camera motion
+// reprojects a flat area just as well. Flat pixels stay camera-only.
+constexpr float kTextureMin = 0.03f;
 
 // ------------------------------------------------------------------ shaders
 const char kShader[] = R"(
@@ -50,7 +55,7 @@ cbuffer C : register(b0) {
     uint w, h, ew, eh;
     uint mode, block, has_cost, cost_max;
     uint cnt_off, gw, gh, pad0;
-    float snap_px, image_margin, image_abs, pad1;
+    float snap_px, image_margin, image_abs, texture_min;
 };
 float3 srgb_encode(float3 v) { v = saturate(v); return v <= 0.0031308 ? 12.92 * v : 1.055 * pow(v, 1.0 / 2.4) - 0.055; }
 // One fixed transform for every image (both images of a pair are encoded alike).
@@ -80,13 +85,25 @@ float image_error(float2 p, float2 v) {
     }
     return e / 9.0;
 }
+// Local contrast of the current image around p (same 3x3 encoded texels).
+float texture_at(float2 p) {
+    float step_x = float(w) / float(ew), step_y = float(h) / float(eh);
+    float lo = 1e9, hi = -1e9;
+    [unroll] for (int j = -1; j <= 1; ++j) {
+        [unroll] for (int i = -1; i <= 1; ++i) {
+            float l = luma(t_cur.SampleLevel(s_lin, (p + float2(i * step_x, j * step_y)) / float2(w, h), 0).rgb);
+            lo = min(lo, l); hi = max(hi, l);
+        }
+    }
+    return hi - lo;
+}
 groupshared uint gs[8];
 [numthreads(8, 8, 1)]
 void accept(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if (gi < 8) gs[gi] = 0;
     GroupMemoryBarrierWithGroupSync();
     if (id.x < w && id.y < h) {
-        uint why = 0; // 0 accepted, 1 invalid, 2 small, 3 cost, 4 offscreen, 5 image
+        uint why = 0; // 0 accepted, 1 invalid, 2 small, 3 cost, 4 offscreen, 5 image (or flat)
         uint cost = 0;
         bool costed = false;
         float v = t_valid[id.xy];
@@ -104,6 +121,7 @@ void accept(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             float2 p = float2(id.xy) + 0.5;
             float2 q = p + raw;
             if (q.x < 0.0 || q.y < 0.0 || q.x > float(w) || q.y > float(h)) why = 4;
+            else if (texture_at(p) < texture_min) why = 5; // flat: the image cannot confirm a residual
             else {
                 float e_flow = image_error(p, raw);
                 float e_cam = image_error(p, raw - r);
@@ -125,7 +143,7 @@ struct Constants {
     uint32_t w, h, ew, eh;
     uint32_t mode, block, has_cost, cost_max;
     uint32_t cnt_off, gw, gh, pad0;
-    float snap_px, image_margin, image_abs, pad1;
+    float snap_px, image_margin, image_abs, texture_min;
 };
 constexpr UINT kConstantWords = static_cast<UINT>(sizeof(Constants) / 4);
 
@@ -879,7 +897,7 @@ bool RecordFusion(ID3D12GraphicsCommandList* l, Ticket& t, ID3D12Resource* depth
     c.cost_max = kCostMax;
     c.cnt_off = off;
     c.gw = g.engine->OutWidth(); c.gh = g.engine->OutHeight();
-    c.snap_px = kSnapPx; c.image_margin = kImageMargin; c.image_abs = kImageAbs;
+    c.snap_px = kSnapPx; c.image_margin = kImageMargin; c.image_abs = kImageAbs; c.texture_min = kTextureMin;
     ID3D12DescriptorHeap* heaps[] = {g.heap.Get()};
     l->SetDescriptorHeaps(1, heaps);
     l->SetComputeRootSignature(g.root.Get());
