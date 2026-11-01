@@ -275,6 +275,9 @@ using PfnSetCursorPos = BOOL(WINAPI*)(int, int);
 using PfnSetCursor = HCURSOR(WINAPI*)(HCURSOR);
 PfnSetCursor g_orig_set_cursor=nullptr;
 HCURSOR g_menu_cursor=nullptr;
+std::atomic<DWORD> g_cursor_thread{0};
+std::atomic<HCURSOR> g_game_cursor{nullptr};
+std::atomic<bool> g_cursor_owned{false},g_cursor_message_pending{false};
 using PfnGetAsyncKeyState = SHORT(WINAPI*)(int);
 using PfnGetKeyboardState = BOOL(WINAPI*)(PBYTE);
 using PfnGetKeyState = SHORT(WINAPI*)(int);
@@ -341,6 +344,11 @@ BOOL WINAPI DetourGetCursorPos(LPPOINT p)
 }
 HCURSOR WINAPI DetourSetCursor(HCURSOR cursor)
 {
+    // Remember the window owner's latest intent, including NULL (game-drawn
+    // cursor). Our own writes bypass this detour. A render/worker thread must
+    // not replace the window thread's restore handle.
+    if(g_cursor_owned.load(std::memory_order_acquire) && !t_overlay_input &&
+       GetCurrentThreadId()==g_cursor_thread.load())g_game_cursor.store(cursor);
     return g_orig_set_cursor(lock_input_for_this_thread() && g_menu_cursor ? g_menu_cursor : cursor);
 }
 BOOL WINAPI DetourSetCursorPos(int x, int y)
@@ -478,6 +486,7 @@ void remove_input_hooks()
 }
 // Originals for our own use (valid after install_input_hooks; plain exports otherwise).
 inline BOOL real_get_cursor_pos(LPPOINT p) { return g_orig_get_cursor_pos ? g_orig_get_cursor_pos(p) : GetCursorPos(p); }
+inline HCURSOR real_set_cursor(HCURSOR c) { return g_orig_set_cursor ? g_orig_set_cursor(c) : SetCursor(c); }
 inline SHORT real_get_async_key_state(int vk) { return g_orig_get_async_key_state ? g_orig_get_async_key_state(vk) : GetAsyncKeyState(vk); }
 inline UINT real_get_raw_input_data(HRAWINPUT h, UINT cmd, LPVOID d, PUINT s, UINT hs)
 {
@@ -1134,6 +1143,13 @@ void write_menu_progress(HANDLE log)
         static_cast<unsigned long>(ps.device_hr), static_cast<unsigned long long>(ps.queried_latency_handle));
     DWORD pw = 0;
     if (pn > 0) WriteFile(log, p_line, static_cast<DWORD>(pn), &pw, nullptr);
+    CURSORINFO ci{};ci.cbSize=sizeof(ci);const bool have_cursor=GetCursorInfo(&ci)!=FALSE;
+    pn=snprintf(p_line,sizeof(p_line),"menu_cursor open=%u owned=%u window_thread=%lu pending=%u global_visible=%u global_shape=0x%llX game_shape=0x%llX\r\n",
+        g_open.load()?1u:0u,g_cursor_owned.load()?1u:0u,g_cursor_thread.load(),g_cursor_message_pending.load()?1u:0u,
+        have_cursor && (ci.flags&CURSOR_SHOWING)?1u:0u,
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(ci.hCursor)),
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(g_game_cursor.load())));
+    if(pn>0)WriteFile(log,p_line,static_cast<DWORD>(pn),&pw,nullptr);
     std::unique_lock<std::mutex> lock(g_state.mutex, std::try_to_lock);
     if (!lock.owns_lock() || !g_state.device) return;
     char line[400];
@@ -1235,6 +1251,36 @@ constexpr uint32_t kNudgeRestoreRetries = 8;   // A64: restore attempts before g
 int g_cursor_shows = 0;      // ShowCursor(TRUE) calls we made (window thread)
 RECT g_saved_clip{};
 bool g_saved_clip_valid = false;
+void request_cursor_sync(HWND hwnd){
+    if(hwnd && !g_cursor_message_pending.exchange(true))
+        if(!PostMessageW(hwnd,kMsgCursorShow,0,0))g_cursor_message_pending.store(false);
+}
+// Window thread only. Messages carry no stale open/close command: always
+// reconcile with current state, so rapid toggles cannot acquire twice or
+// restore a cursor after a subsequent reopen.
+void sync_cursor(){
+    const bool open=g_open.load(std::memory_order_acquire) && g_initialized.load() &&
+        g_menu_enabled.load() && !g_stopping.load();
+    if(open){
+        if(!g_cursor_owned.load()){
+            g_cursor_thread.store(GetCurrentThreadId());g_game_cursor.store(GetCursor());
+            g_saved_clip_valid=GetClipCursor(&g_saved_clip)!=FALSE;
+            POINT frozen{};
+            if(real_get_cursor_pos(&frozen)){g_frozen_x.store(frozen.x);g_frozen_y.store(frozen.y);}
+            while(g_cursor_shows<64){++g_cursor_shows;if(ShowCursor(TRUE)>=0)break;}
+            g_cursor_owned.store(true,std::memory_order_release);
+        }
+        ClipCursor(nullptr);
+        // ImGui caches its last cursor and may not notice another overlay or
+        // the game changed it. Reassert on the INPUT owner, not Present's thread.
+        real_set_cursor(g_menu_cursor);
+    }else if(g_cursor_owned.exchange(false,std::memory_order_acq_rel)){
+        while(g_cursor_shows>0){ShowCursor(FALSE);--g_cursor_shows;}
+        real_set_cursor(g_game_cursor.load());
+        if(g_saved_clip_valid)ClipCursor(&g_saved_clip);
+        g_saved_clip_valid=false;
+    }
+}
 // A63/A64 picture-rebuild nudge: state machine, window thread only except the
 // request counter and the readable snapshot.
 std::atomic<uint32_t> g_nudge_requests{0}, g_nudge_pending{0};
@@ -1303,6 +1349,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     na::latency::pcl::Message(msg, wp);
     if (msg == WM_KEYDOWN && wp == VK_HOME && !(lp & (1 << 30))) {
         g_open.store(!g_open.load(std::memory_order_relaxed), std::memory_order_release);
+        sync_cursor(); // close restores even if the game stops presenting
         return 0;
     }
     if (msg == WM_KEYDOWN && !(lp & (1 << 30)) && na::j2::Enabled()) {
@@ -1310,26 +1357,9 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (key && wp == key && !na::capture::j2::Armed()) // J2 evidence capture, N consecutive frames
             na::capture::j2::RequestTimestamped(na::settings::Get().j2_capture_frames.load());
     }
-    if (msg == kMsgCursorShow) {
-        GetClipCursor(&g_saved_clip);
-        g_saved_clip_valid = true;
-        ClipCursor(nullptr);
-        POINT frozen{};
-        if (real_get_cursor_pos(&frozen)) { // what the game keeps seeing while the menu is open (A44)
-            g_frozen_x.store(frozen.x, std::memory_order_relaxed);
-            g_frozen_y.store(frozen.y, std::memory_order_relaxed);
-        }
-        // Count every increment, including the one that makes it visible.
-        // The previous loop omitted that last increment and left Windows'
-        // cursor count one higher after each Home open/close cycle.
-        while(g_cursor_shows<64){++g_cursor_shows;if(ShowCursor(TRUE)>=0)break;}
-        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
-        return 0;
-    }
-    if (msg == kMsgCursorRestore) {
-        while (g_cursor_shows > 0) { ShowCursor(FALSE); --g_cursor_shows; }
-        if (g_saved_clip_valid) ClipCursor(&g_saved_clip);
-        g_saved_clip_valid = false;
+    if (msg == kMsgCursorShow || msg == kMsgCursorRestore) {
+        g_cursor_message_pending.store(false);
+        sync_cursor();
         return 0;
     }
     if (msg == kMsgNudge) { // A63/A64: one pixel smaller; the game sees WM_SIZE and (hopefully) rebuilds
@@ -1401,7 +1431,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_CHAR: case WM_SYSCHAR: case WM_MOUSEHWHEEL: case WM_XBUTTONDOWN: case WM_XBUTTONUP:
         return 0;
     case WM_SETCURSOR:
-        SetCursor(LoadCursorW(nullptr, IDC_ARROW)); // the real cursor IS the menu cursor (A42)
+        sync_cursor();
         return TRUE;
     default:
         return CallWindowProcW(g_state.orig_wndproc, hwnd, msg, wp, lp);
@@ -1699,6 +1729,10 @@ bool ensure_init_locked(IDXGISwapChain* sc)
     // Keep controller navigation; text fields still receive keyboard input.
     io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+    // OS cursor ownership belongs to the window thread. In particular the
+    // software fallback must not call SetCursor(NULL) from Present and leave
+    // that invisible shape behind when the menu stops rendering.
+    io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
     io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
     na::ui::SetBoldText(na::settings::Get().text_bold.load() != 0);
     na::ui::ApplyStyle();
@@ -2044,7 +2078,7 @@ void draw_panel(bool just_opened)
     ImGui::TextColored(save == 2 ? kWarn : kTextDim, "%s", right);
     PopFont();
     ImGui::End();
-    if (close) g_open.store(false, std::memory_order_release);
+    if (close) {g_open.store(false, std::memory_order_release);request_cursor_sync(g_state.hwnd);}
 }
 
 void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_opened, ID3D12Resource* frame = nullptr)
@@ -2293,8 +2327,7 @@ void menu_step(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool open, ID3D12R
     bool just_opened = open && !g_state.was_open;
     bool just_closed = !open && g_state.was_open;
     g_state.was_open = open;
-    if (just_opened && g_state.hwnd) PostMessageW(g_state.hwnd, kMsgCursorShow, 0, 0);
-    if (just_closed && g_state.hwnd) PostMessageW(g_state.hwnd, kMsgCursorRestore, 0, 0);
+    if(open || just_closed)request_cursor_sync(g_state.hwnd);
     if (!open) return;
     render_with_fault_receipt(sc, queue, just_opened, frame);
 }
@@ -3058,6 +3091,13 @@ bool Stop()
         return false;
     }
     g_stop_incomplete.store(0, std::memory_order_release);
+    // Restore before removing the subclass; queued messages cannot perform
+    // cleanup once the original WndProc has been reinstated.
+    if(g_cursor_owned.load()){
+        if(GetCurrentThreadId()==g_cursor_thread.load())sync_cursor();
+        else {DWORD_PTR result=0;SendMessageTimeoutW(g_state.hwnd,kMsgCursorRestore,0,0,SMTO_ABORTIFHUNG,200,&result);}
+        if(g_cursor_owned.load()){g_stop_incomplete.store(1);return false;}
+    }
     remove_input_hooks();
     std::lock_guard<std::mutex> lock(g_state.mutex);
     if (g_state.imgui_ready) {
