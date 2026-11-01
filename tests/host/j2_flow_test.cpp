@@ -383,8 +383,8 @@ void reset_module(fl::Engine* e)
 }
 
 // Object moves +4 px per frame (v = -4 on its new position) over four frames: three pairs.
-// Temporal agreement (kAgreeMin = 2) trusts a residual only on the third consecutive agreeing
-// pair, so pair 1 fuses nothing and pair 3 fuses the object.
+// Temporal agreement (kAgreeMin = 1) trusts a residual from the second agreeing pair on, so
+// pair 1 fuses nothing and pairs 2 and 3 fuse the object.
 int case_pair(test::Device& d, FakeEngine* fake)
 {
     std::printf("-- pair%s\n", fake ? "" : " (real engine)");
@@ -427,7 +427,7 @@ int case_pair(test::Device& d, FakeEngine* fake)
         REQUIRE(h.WaitJ2(10000));
         h.Motion(72, 32, v);
         recap("pair %d: object motion (%.3f, %.3f)", f - 1, v[0], v[1]);
-        if (f < 4) CHECK(std::fabs(v[0]) < 0.1f && std::fabs(v[1]) < 0.1f); // not trusted yet: camera only
+        if (f < 3) CHECK(std::fabs(v[0]) < 0.1f && std::fabs(v[1]) < 0.1f); // not trusted yet: camera only
         else CHECK(std::fabs(v[0] + 4.f) < (fake ? 0.1f : 1.0f) && std::fabs(v[1]) < (fake ? 0.1f : 1.0f));
         h.Motion(10, 10, v);
         if (f == 4) recap("pair: background motion (%.3f, %.3f)", v[0], v[1]);

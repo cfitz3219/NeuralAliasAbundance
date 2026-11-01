@@ -50,8 +50,14 @@ constexpr float kTextureMin = 0.03f;
 // the same object point has carried an agreeing residual (same direction, within kAgreePx or
 // half its size) for kAgreeMin consecutive pairs; the history is looked up at the pixel the
 // flow says the point came from. Jitter flicker reverses every frame and never qualifies.
-constexpr uint32_t kAgreeMin = 2;  // pairs of agreement before acceptance (the third pair is the first accepted)
-constexpr float kAgreePx = 1.0f;
+// Middle ground (Cort, fda517d Anno run: "nearly everything is rejected now, 0.0 % moving"):
+// the capture showed the flicker's direction agreement at -0.97..-1.00, so DIRECTION is the
+// discriminating test. Slow movers (1-3 px/frame) carry the same +-1-2 px misread on top of
+// their true motion, so a tight magnitude match rejected them. Now: one previous agreeing pair
+// (accepted from the second pair on), direction within 60 degrees, magnitude loosely bounded.
+constexpr uint32_t kAgreeMin = 1;   // previous agreeing pairs needed (the second pair is the first accepted)
+constexpr float kAgreeCos = 0.5f;   // cos 60: direction agreement
+constexpr float kAgreePx = 3.0f;    // |r - r_prev| <= max(kAgreePx, |r|)
 
 // ------------------------------------------------------------------ shaders
 const char kShader[] = R"(
@@ -74,7 +80,7 @@ cbuffer C : register(b0) {
     uint cnt_off, gw, gh, pad0;
     float snap_px, image_margin, image_abs, texture_min;
     uint have_hist, agree_min, pad1, pad2;
-    float agree_px, pad3, pad4, pad5;
+    float agree_px, agree_cos, pad4, pad5;
 };
 float3 srgb_encode(float3 v) { v = saturate(v); return v <= 0.0031308 ? 12.92 * v : 1.055 * pow(v, 1.0 / 2.4) - 0.055; }
 // One fixed transform for every image (both images of a pair are encoded alike).
@@ -156,8 +162,9 @@ void accept(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
                 float2 from = float2(id.xy) + 0.5 + raw;
                 float4 hp = t_hist.Load(int3(clamp(int2(floor(from)), int2(0, 0), int2(int(w) - 1, int(h) - 1)), 0));
                 float2 hr = hp.xy;
-                bool agree = all(isfinite(hr)) && length(hr) >= snap_px && dot(r, hr) > 0.0 &&
-                             length(r - hr) <= max(agree_px, 0.5 * length(r));
+                float lr = length(r), lh = length(hr);
+                bool agree = all(isfinite(hr)) && lh >= snap_px && dot(r, hr) > agree_cos * lr * lh &&
+                             length(r - hr) <= max(agree_px, lr);
                 streak = agree ? hp.z + 1.0 : 0.0;
             }
             if (streak < float(agree_min)) why = 6;
@@ -178,7 +185,7 @@ struct Constants {
     uint32_t cnt_off, gw, gh, pad0;
     float snap_px, image_margin, image_abs, texture_min;
     uint32_t have_hist, agree_min, pad1, pad2;
-    float agree_px, pad3, pad4, pad5;
+    float agree_px, agree_cos, pad4, pad5;
 };
 constexpr UINT kConstantWords = static_cast<UINT>(sizeof(Constants) / 4);
 constexpr uint32_t kUav = 8;    // first UAV descriptor in a table (SRVs t0..t7 before it)
@@ -969,7 +976,7 @@ bool RecordFusion(ID3D12GraphicsCommandList* l, Ticket& t, ID3D12Resource* depth
     c.cnt_off = off;
     c.gw = g.engine->OutWidth(); c.gh = g.engine->OutHeight();
     c.snap_px = kSnapPx; c.image_margin = kImageMargin; c.image_abs = kImageAbs; c.texture_min = kTextureMin;
-    c.have_hist = have_hist ? 1u : 0u; c.agree_min = kAgreeMin; c.agree_px = kAgreePx;
+    c.have_hist = have_hist ? 1u : 0u; c.agree_min = kAgreeMin; c.agree_px = kAgreePx; c.agree_cos = kAgreeCos;
     ID3D12DescriptorHeap* heaps[] = {g.heap.Get()};
     l->SetDescriptorHeaps(1, heaps);
     l->SetComputeRootSignature(g.root.Get());
