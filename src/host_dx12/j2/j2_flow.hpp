@@ -70,8 +70,9 @@ void SetWatchdogMsForTests(uint32_t ms); // default 1000
 // The menu switch ([j2] flow=1 sets it at start). Off by default.
 void SetEnabled(bool on);
 bool Enabled();
-// Diagnostic: also pair frames whose scene list is followed by more game lists in
-// the same submission (the batch is then split there). Off: such frames stay camera-only.
+// Pair frames whose scene list is followed by more game lists in the same submission
+// (the batch is then split there: the game's lists still run once, in order). On by
+// default: Anno's batches always continue after the scene. Off: such frames stay camera-only.
 void SetAllowSplit(bool on);
 bool AllowSplit();
 

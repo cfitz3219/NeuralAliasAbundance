@@ -219,7 +219,7 @@ struct Outstanding {
 
 struct State {
     std::mutex m;
-    std::atomic<bool> enabled{false}, allow_split{false};
+    std::atomic<bool> enabled{false}, allow_split{true}; // split on: Anno always has a later list reading the scene in the same batch
     Engine* engine = nullptr;
     NvofEngine nvof;
     bool latched = false, available_known = false, available = false;
@@ -730,7 +730,7 @@ Ticket Prepare(ID3D12Device* device, ID3D12CommandQueue* queue, const Source& sr
     if (pair && !src.allow_pair) {
         pair = false;
         ++g.stats.skipped_split;
-        why_not = "Camera-only: the game sends more of its own work right after the scene in the same batch (batch split is off).";
+        why_not = "Camera-only: the game sends more of its own work right after the scene in the same batch (batch split is switched off).";
     }
     Grid* gr = nullptr;
     uint32_t gi = 0;

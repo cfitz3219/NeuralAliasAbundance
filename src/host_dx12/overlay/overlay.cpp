@@ -42,6 +42,7 @@
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 #include "host_dx12/nr/nr_pass.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/j2/j2_flow.hpp"
 #include "host_dx12/overlay/menu.hpp"
 #include "host_dx12/overlay/na_style.hpp"
 #include "host_dx12/overlay/presenter.hpp"
@@ -699,6 +700,22 @@ void write_status_line()
             static_cast<unsigned long long>(j2.busy), static_cast<unsigned long long>(j2.dlss_failed), static_cast<unsigned long long>(j2.cuts),
             static_cast<unsigned long long>(j2.camera_offset), j2.later_passes, static_cast<unsigned long long>(j2.duplicate_submissions), static_cast<unsigned long long>(j2.jitter_writes), static_cast<unsigned long long>(j2.camera_learned_hits), static_cast<unsigned long long>(j2.camera_scans), static_cast<long long>(j2.camera_inv_delta), static_cast<long long>(j2.camera_proj_delta), static_cast<unsigned long long>(j2.jitter_proj_writes), static_cast<unsigned long long>(j2.jitter_rebased), na::observe::SamplerMipBias(), static_cast<unsigned long long>(mb_s), static_cast<unsigned long long>(mb_st), static_cast<unsigned long long>(j2.post_camera_lists), static_cast<unsigned long long>(j2.post_depth_lists), static_cast<unsigned long long>(j2.other_camera_blocks), j2.depth_reversed ? 1u : 0u, dlss.feature_preset, na::settings::Get().j2_sharpness.load(), static_cast<unsigned long long>(j2.nis_frames), j2.scene_batches, j2.scene_batches_max, j2.scene_batches_target, static_cast<unsigned long long>(j2.waited_batches), static_cast<unsigned long long>(j2.post_scene_batches), j2.inline_mode, j2.inline_target, static_cast<unsigned long long>(j2.inline_candidates), static_cast<unsigned long long>(j2.inline_waited), static_cast<unsigned long long>(j2.inline_recorded), static_cast<unsigned long long>(j2.inline_frames), static_cast<unsigned long long>(j2.inline_refused), j2.color_sub, j2.color_mips, j2.color_slices, j2.color_samples, j2.depth_slices, j2.depth_samples, j2.width, j2.height, j2.color_format, j2.reason);
         if (jn > 0) WriteFile(f, jl, static_cast<DWORD>((std::min)(jn, static_cast<int>(sizeof(jl) - 1))), &written, nullptr);
+        {
+            // P4-0b moving-object motion (Opus; one status line, read-only snapshot).
+            const auto fs = na::j2::flow::GetStats();
+            char fl[640];
+            const int fn = snprintf(fl, sizeof(fl),
+                "j2flow on=%u available=%u active=%u latched=%u cost=%u size=%ux%u engine=%ux%u grid=%u perf=%u ds=%u pairs=%llu consumed=%llu encode_only=%llu abandoned=%llu skip_busy=%llu skip_split=%llu skip_msaa=%llu skip_reset=%llu skip_resize=%llu engine_failed=%llu watchdog=%llu px_acc=%llu px_inv=%llu px_small=%llu px_cost=%llu px_off=%llu px_img=%llu mean_cost=%.1f ms=%.2f ms_avg=%.2f \"%s\"\r\n",
+                fs.enabled, fs.available, fs.active, fs.latched, fs.cost, fs.width, fs.height, fs.engine_w, fs.engine_h, fs.grid, fs.perf, fs.downscale,
+                static_cast<unsigned long long>(fs.pairs), static_cast<unsigned long long>(fs.consumed), static_cast<unsigned long long>(fs.encode_only),
+                static_cast<unsigned long long>(fs.abandoned), static_cast<unsigned long long>(fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_split),
+                static_cast<unsigned long long>(fs.skipped_msaa), static_cast<unsigned long long>(fs.skipped_reset), static_cast<unsigned long long>(fs.skipped_resize),
+                static_cast<unsigned long long>(fs.engine_failed), static_cast<unsigned long long>(fs.watchdog_trips),
+                static_cast<unsigned long long>(fs.px_accepted), static_cast<unsigned long long>(fs.px_invalid), static_cast<unsigned long long>(fs.px_small),
+                static_cast<unsigned long long>(fs.px_cost), static_cast<unsigned long long>(fs.px_offscreen), static_cast<unsigned long long>(fs.px_image),
+                fs.mean_cost, fs.ms_last, fs.ms_avg, fs.reason);
+            if (fn > 0) WriteFile(f, fl, static_cast<DWORD>((std::min)(fn, static_cast<int>(sizeof(fl) - 1))), &written, nullptr);
+        }
         char coverage[256];
         if (j2.depth_state_evidence[0]) {
             WriteFile(f, "j2_depth_evidence ", 18, &written, nullptr);
