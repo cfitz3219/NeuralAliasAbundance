@@ -266,7 +266,11 @@ struct ResKnown {
     bool has_all = false;
     uint32_t all = kStatePending;
     std::unordered_map<uint32_t, uint32_t> subs;
+    uint8_t reset_why = 0;  // diagnostics: why its states last became unknown (KnownReset)
 };
+// Why a carried state became unknown (diagnostics only; DescribeStateEvidence names it).
+enum KnownReset : uint8_t { kResetNone, kResetStoreClear, kResetOverlap, kResetUnordered, kResetOtherQueue, kResetSubs, kResetPendingNote };
+const char* const kResetNames[] = {"none", "store_clear", "overlapped_submissions", "unordered_submission", "other_queue", "too_many_subresources", "split_or_aliasing_barrier"};
 constexpr size_t kMaxKnown = 65536, kMaxKnownSubs = 64;
 std::mutex g_known_m;
 std::unordered_map<na_object_id, ResKnown> g_known; // under g_known_m (never taken before g_m or g_samples_m)
@@ -287,8 +291,9 @@ void known_forget(na_object_id id)
     std::lock_guard<std::mutex> lock(g_known_m);
     g_known.erase(id);
 }
-void known_reset_locked(ResKnown& k)
+void known_reset_locked(ResKnown& k, KnownReset why)
 {
+    k.reset_why = why;
     k.queue = 0;
     k.has_all = false;
     k.all = kStatePending;
@@ -297,7 +302,7 @@ void known_reset_locked(ResKnown& k)
 // Entries stay (eligibility and in-flight marks are kept); states become unknown.
 void known_clear_locked()
 {
-    for (auto& kv : g_known) known_reset_locked(kv.second);
+    for (auto& kv : g_known) known_reset_locked(kv.second, kResetStoreClear);
     ++g_known_epoch;
     g_c.known_clears.fetch_add(1);
 }
@@ -4128,7 +4133,7 @@ void known_publish(SubmissionCapture& c, na_object_id qid, bool ambiguous)
         auto it = g_known.find(m.id);
         if (it == g_known.end()) continue; // retired meanwhile
         if (valid && m.alone && it->second.mark_seq == m.seq) good.push_back(m.id);
-        else known_reset_locked(it->second); // overlapped / ambiguous / cleared / copy-queue decay
+        else known_reset_locked(it->second, valid ? kResetOverlap : kResetUnordered); // overlapped / ambiguous / cleared / copy-queue decay
     }
     std::sort(good.begin(), good.end());
     std::vector<na_object_id> claimed; // ids whose queue ownership was settled in this publication
@@ -4137,7 +4142,7 @@ void known_publish(SubmissionCapture& c, na_object_id qid, bool ambiguous)
         ResKnown& k = g_known[n.resource];
         if (std::find(claimed.begin(), claimed.end(), n.resource) == claimed.end()) {
             claimed.push_back(n.resource);
-            if (k.queue && k.queue != qid) known_reset_locked(k); // another queue's timeline: start over
+            if (k.queue && k.queue != qid) known_reset_locked(k, kResetOtherQueue); // another queue's timeline: start over
             k.queue = qid;
         }
         if (n.subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) {
@@ -4145,11 +4150,12 @@ void known_publish(SubmissionCapture& c, na_object_id qid, bool ambiguous)
             k.all = n.state_after;
             k.subs.clear();
         } else if (k.subs.size() >= kMaxKnownSubs && !k.subs.count(n.subresource)) {
-            known_reset_locked(k);
+            known_reset_locked(k, kResetSubs);
             k.queue = qid;
         } else {
             k.subs[n.subresource] = n.state_after;
         }
+        if (n.state_after == kStatePending) k.reset_why = kResetPendingNote;
     }
     for (const auto& m : c.marks) {
         auto it = g_known.find(m.id);
@@ -4964,12 +4970,14 @@ void DescribeStateEvidence(ID3D12CommandList* list, na_object_id id, uint32_t su
     std::lock_guard<std::mutex> lock(g_known_m);
     const auto k = g_known.find(id);
     uint32_t value = kStatePending;
+    const char* why = kResetNames[kResetNone];
     if (k != g_known.end()) {
         const auto s = k->second.subs.find(sub);
         value = s != k->second.subs.end() ? s->second : k->second.has_all ? k->second.all : kStatePending;
+        if (k->second.reset_why < sizeof kResetNames / sizeof kResetNames[0]) why = kResetNames[k->second.reset_why];
     }
-    std::snprintf(text, capacity, "kind=%u list_covered=%u list_complete=%u registered=%u state=0x%x marks=%u unknown_submissions=%u disabled=%u unhooked_queues=%llu",
-                  kind, covered ? 1u : 0u, complete ? 1u : 0u, k != g_known.end() ? 1u : 0u, value,
+    std::snprintf(text, capacity, "kind=%u list_covered=%u list_complete=%u registered=%u state=0x%x last_unknown=%s marks=%u unknown_submissions=%u disabled=%u unhooked_queues=%llu",
+                  kind, covered ? 1u : 0u, complete ? 1u : 0u, k != g_known.end() ? 1u : 0u, value, why,
                   k != g_known.end() ? k->second.in_flight : 0u, g_unknown_inflight,
                   g_known_disabled.load() ? 1u : 0u, static_cast<unsigned long long>(g_unhooked_queues.load()));
 }
