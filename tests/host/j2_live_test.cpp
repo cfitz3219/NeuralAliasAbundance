@@ -68,6 +68,46 @@ void Store(uint8_t* dst, const M& m)
 {
     for (int i = 0; i < 16; ++i) { const float f = static_cast<float>(m[i]); std::memcpy(dst + i * 4, &f, 4); }
 }
+float Half(uint16_t h)
+{
+    const uint32_t e = (h >> 10) & 31, m = h & 1023;
+    const float v = e == 0 ? std::ldexp(static_cast<float>(m), -24) : std::ldexp(static_cast<float>(m | 1024), static_cast<int>(e) - 25);
+    return (h & 0x8000) ? -v : v;
+}
+// RGBA16F texel (x, y) of `tex` (in COMMON); the GPU is idle afterwards.
+std::array<float, 4> ReadTexel(test::Device& d, ID3D12Resource* tex, uint32_t x, uint32_t y)
+{
+    ID3D12Device* dev = d.device.Get();
+    const D3D12_RESOURCE_DESC td = tex->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+    UINT64 total = 0;
+    dev->GetCopyableFootprints(&td, 0, 1, 0, &fp, nullptr, nullptr, &total);
+    auto rb = test::CreateBuffer(dev, total, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    test::List l;
+    std::array<float, 4> out{-1, -1, -1, -1};
+    if (!rb || !l.Create(dev)) return out;
+    D3D12_RESOURCE_BARRIER b = test::Transition(tex, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    l.list->ResourceBarrier(1, &b);
+    D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+    src.pResource = tex;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.pResource = rb.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint = fp;
+    l.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    b = test::Transition(tex, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    l.list->ResourceBarrier(1, &b);
+    l.list->Close();
+    ID3D12CommandList* ls[] = {l.list.Get()};
+    d.queue->ExecuteCommandLists(1, ls);
+    d.WaitIdle();
+    uint8_t* p = nullptr;
+    if (FAILED(rb->Map(0, nullptr, reinterpret_cast<void**>(&p))) || !p) return out;
+    const uint16_t* t = reinterpret_cast<const uint16_t*>(p + fp.Offset + static_cast<size_t>(y) * fp.Footprint.RowPitch) + x * 4;
+    for (int i = 0; i < 4; ++i) out[i] = Half(t[i]);
+    rb->Unmap(0, nullptr);
+    return out;
+}
 } // namespace
 
 int main()
@@ -274,6 +314,91 @@ int main()
         CHECK(std::strncmp(ds.reason, "Stopped", 7) != 0);
     }
     na::j2::SetDebugView(0);
+
+    // P4-4 Stage 1: upscaling into a distinct full-size destination (slider route).
+    // The depth debug view gives a known output (depth cleared to 0 -> black, alpha 1),
+    // so the readback shows that J2's full-size result reached every corner of `dest`.
+    {
+        constexpr uint32_t OW = 96, OH = 48; // 1.5x: DLSS Quality
+        auto dest = test::CreateTexture(dev, OW, OH, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        auto ldr = test::CreateTexture(dev, OW, OH, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        REQUIRE(dest && ldr);
+        {   // fill dest with grey so a missing copy shows
+            test::ComPtr<ID3D12DescriptorHeap> h;
+            D3D12_DESCRIPTOR_HEAP_DESC rh{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&h))));
+            dev->CreateRenderTargetView(dest.Get(), nullptr, h->GetCPUDescriptorHandleForHeapStart());
+            test::List c;
+            REQUIRE(c.Create(dev));
+            D3D12_RESOURCE_BARRIER b = test::Transition(dest.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            c.list->ResourceBarrier(1, &b);
+            const float grey[4] = {0.5f, 0.5f, 0.5f, 0.5f};
+            c.list->ClearRenderTargetView(h->GetCPUDescriptorHandleForHeapStart(), grey, 0, nullptr);
+            b = test::Transition(dest.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON);
+            c.list->ResourceBarrier(1, &b);
+            REQUIRE(SUCCEEDED(c.list->Close()));
+            ID3D12CommandList* ls[] = {c.list.Get()};
+            d.queue->ExecuteCommandLists(1, ls);
+            d.WaitIdle();
+        }
+        const auto before = ReadTexel(d, dest.Get(), OW - 1, OH - 1);
+        CHECK(std::fabs(before[0] - 0.5f) < 0.01f);
+
+        na::j2::SetDebugView(3);
+        na::j2::SetUpscaleTarget({na::observe::IdOf(dest.Get()), 0, 0, 0});
+        const auto up0 = na::j2::GetStats().upscaled_frames;
+        const int ev = fake::evals;
+        na::j2::OnPresent(d.queue.Get());
+        frame(503);
+        st = na::j2::GetStats();
+        std::printf("upscale: %ux%u -> %ux%u, upscaled %llu, phases %u, note \"%s\", reason \"%s\"\n", st.render_w, st.render_h, st.out_w, st.out_h,
+                    static_cast<unsigned long long>(st.upscaled_frames), st.jitter_phases, st.upscale_note, st.reason);
+        CHECK(fake::evals == ev + 1 && st.upscaled_frames == up0 + 1);
+        CHECK(st.render_w == W && st.render_h == H && st.out_w == OW && st.out_h == OH);
+        CHECK(st.jitter_phases == 18); // ceil(8 * 1.5^2)
+        CHECK(fake::U(fake::last_create, NVSDK_NGX_Parameter_Width) == W && fake::U(fake::last_create, NVSDK_NGX_Parameter_Height) == H);
+        CHECK(fake::U(fake::last_create, NVSDK_NGX_Parameter_OutWidth) == OW && fake::U(fake::last_create, NVSDK_NGX_Parameter_OutHeight) == OH);
+        CHECK(fake::I(fake::last_create, NVSDK_NGX_Parameter_PerfQualityValue) == static_cast<int>(na::dlss::Quality::MaxQuality));
+        CHECK(fake::U(fake::last_eval, NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width) == W);
+        void* o = fake::P(fake::last_eval, NVSDK_NGX_Parameter_Output);
+        CHECK(o != dest.Get() && o != color.Get()); // J2's own full-size target, then copied
+        CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 1); // new target: history restarts
+        const auto corner = ReadTexel(d, dest.Get(), OW - 1, OH - 1), origin = ReadTexel(d, dest.Get(), 0, 0);
+        std::printf("upscale dest: corner %.3f %.3f %.3f %.3f, origin %.3f %.3f %.3f %.3f\n", corner[0], corner[1], corner[2], corner[3],
+                    origin[0], origin[1], origin[2], origin[3]);
+        CHECK(corner[0] == 0.0f && corner[3] == 1.0f && origin[0] == 0.0f && origin[3] == 1.0f);
+
+        // Active extent smaller than the allocation (render at the top left): 48x24 -> 96x48.
+        na::j2::SetUpscaleTarget({na::observe::IdOf(dest.Get()), 0, 48, 24});
+        na::j2::OnPresent(d.queue.Get());
+        frame(503.1);
+        st = na::j2::GetStats();
+        CHECK(st.render_w == 48 && st.render_h == 24 && st.out_w == OW && st.upscaled_frames == up0 + 2);
+        CHECK(st.jitter_phases == 32);
+        CHECK(fake::U(fake::last_eval, NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width) == 48);
+        CHECK(fake::I(fake::last_create, NVSDK_NGX_Parameter_PerfQualityValue) == static_cast<int>(na::dlss::Quality::MaxPerformance));
+        // Jitter stays inside a render pixel and the next frame keeps history.
+        na::j2::OnPresent(d.queue.Get());
+        frame(503.2);
+        CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
+        CHECK(std::fabs(fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_X)) < 0.5);
+
+        // A destination J2 cannot use (different format) falls back to DLAA, with a reason.
+        const auto refused0 = na::j2::GetStats().upscale_refused;
+        na::j2::SetUpscaleTarget({na::observe::IdOf(ldr.Get()), 0, 0, 0});
+        na::j2::OnPresent(d.queue.Get());
+        frame(503.3);
+        st = na::j2::GetStats();
+        std::printf("refused: \"%s\", out %ux%u\n", st.upscale_note, st.out_w, st.out_h);
+        CHECK(st.upscale_refused == refused0 + 1 && st.upscale_note[0] != 0);
+        CHECK(st.out_w == W && st.out_h == H && st.upscaled_frames == up0 + 3);
+        CHECK(fake::U(fake::last_create, NVSDK_NGX_Parameter_OutWidth) == W);
+        na::j2::SetUpscaleTarget({});
+        na::j2::SetDebugView(0);
+        CHECK(na::j2::JitterPhasesFor(64, 64) == 8 && na::j2::JitterPhasesFor(10, 100) == 64);
+        CHECK(std::fabs(na::j2::UpscaleMipBias(64, 64) + 1.0f) < 1e-6f && std::fabs(na::j2::UpscaleMipBias(50, 100) + 2.0f) < 1e-6f);
+        d.WaitIdle();
+    }
     CHECK(dev->GetDeviceRemovedReason() == S_OK);
     na::j2::SetEnabled(false);
     d.WaitIdle();

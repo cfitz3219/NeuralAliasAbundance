@@ -50,6 +50,28 @@ int DebugView();
 void SetJitter(bool on);     // the overlay's camera-jitter switch (J1), on by default
 bool Jitter();
 
+// P4-4 (DLSS upscaling, slider route). With no destination J2 runs DLAA as before:
+// DLSS at the scene's size, written back into the scene colour. With a destination,
+// DLSS upscales the scene's active extent (render_w x render_h at the top left of the
+// scene colour and depth; 0 = the whole texture) into J2's own target at the
+// destination's size and copies it into `dest` (single-sample 2D, copy-compatible
+// with the scene colour, at least as large as the extent); the scene colour is left
+// as the game drew it. Camera jitter, the jitter phase count and motion use the active
+// extent. A destination J2 cannot use falls back to DLAA with the reason in Stats.
+// Changing the target restarts DLSS history. Stage P sets it from the game's stretch
+// to output size; the tests set it directly.
+struct UpscaleTarget {
+    uint64_t dest = 0;       // na_object_id of the destination texture; 0 = DLAA
+    uint32_t dest_sub = 0;   // its subresource (mip + slice)
+    uint32_t render_w = 0, render_h = 0;
+};
+void SetUpscaleTarget(const UpscaleTarget& t);
+UpscaleTarget GetUpscaleTarget();
+// Jitter phases for a render -> output ratio (8 for DLAA, 8 x ratio^2 upscaling, max 64).
+uint32_t JitterPhasesFor(uint32_t render_w, uint32_t out_w);
+// Texture mip bias for upscaling: log2(render / output) - 1 (DLSS guidance; -1 at DLAA).
+float UpscaleMipBias(uint32_t render_w, uint32_t out_w);
+
 // Called once at the game view's non-TEST Present boundary, including while
 // paused. Presenter-generated frames must not call this. Single-view J2 uses
 // its execution queue; other queues do not advance its camera history.
@@ -134,6 +156,11 @@ struct Stats {
     char class_note[200] = {};            // latest consumer class not accepted (explains a missed frame)
     bool depth_reversed = false;  // reverse-Z as classified from the camera    // other render targets bound after the scene in the same list (insertion may be late)
     uint32_t width = 0, height = 0, color_format = 0;
+    // P4-4: the last evaluated frame's active render extent and output size (equal = DLAA),
+    // upscaled frames, and why a destination was not used (fell back to DLAA).
+    uint32_t render_w = 0, render_h = 0, out_w = 0, out_h = 0, jitter_phases = 0;
+    uint64_t upscaled_frames = 0, upscale_refused = 0;
+    char upscale_note[160] = {};
     // Shape of the selected resources (reported even when J2 refuses them).
     uint32_t color_sub = 0, color_mips = 0, color_slices = 0, color_samples = 0, depth_slices = 0, depth_samples = 0;
     bool active = false;          // the last batch with the scene was processed

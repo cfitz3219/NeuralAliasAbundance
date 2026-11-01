@@ -85,7 +85,9 @@ struct State {
     MsaaResolve msaa;
     UINT samples = 1, depth_samples = 1, sample_quality = 0, depth_quality = 0;
     DXGI_FORMAT depth_format = DXGI_FORMAT_UNKNOWN;
-    uint32_t w = 0, h = 0;
+    uint32_t w = 0, h = 0;          // scene colour/depth allocation (J2's input copies)
+    uint32_t rw = 0, rh = 0;        // P4-4: active render extent (camera, jitter, motion); == w,h for DLAA
+    uint32_t ow = 0, oh = 0;        // P4-4: output size (output/sharp textures); == w,h for DLAA
     DXGI_FORMAT color_format = DXGI_FORMAT_UNKNOWN;
     na::motion::gpu::Arbiter arbiter;
     bool arbiter_ok = false;
@@ -174,6 +176,9 @@ struct State {
 // Never destroyed: at process exit the observation hooks' own state may already
 // be gone, and releasing D3D12 objects then would call into them.
 State& g = *new State;
+// P4-4 upscale target: set by Stage P / tests from any thread, read at recording.
+std::mutex g_up_m;
+UpscaleTarget g_up;
 
 void reason(const char* r) { std::snprintf(g.stats.reason, sizeof(g.stats.reason), "%s", r); }
 
@@ -272,16 +277,17 @@ constexpr char kDebugHlsl[] = R"(
 Texture2D<float2> t_mv : register(t0);
 Texture2D<float> t_depth : register(t1);
 RWTexture2D<float4> u_out : register(u0);
-cbuffer C : register(b0) { uint mode; float scale; uint w; uint h; };
+cbuffer C : register(b0) { uint mode; float scale; uint w; uint h; uint iw; uint ih; };
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= w || id.y >= h) return;
+    uint2 p = id.xy * uint2(iw, ih) / uint2(w, h); // output pixel -> render pixel (P4-4)
     float3 c;
     if (mode == 3) {
-        float d = t_depth[id.xy];
+        float d = t_depth[p];
         c = frac(d * float3(1.0, 16.0, 256.0));
     } else {
-        float2 v = t_mv[id.xy];
+        float2 v = t_mv[p];
         if (any(isnan(v)) || any(isinf(v))) { c = float3(1, 1, 1); }
         else {
             float a = atan2(v.y, v.x) / 6.2831853;
@@ -306,7 +312,7 @@ bool debug_init()
     p[0].DescriptorTable.NumDescriptorRanges = 2;
     p[0].DescriptorTable.pDescriptorRanges = r;
     p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    p[1].Constants.Num32BitValues = 4;
+    p[1].Constants.Num32BitValues = 6;
     D3D12_ROOT_SIGNATURE_DESC rd{2, p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     ComPtr<ID3DBlob> sig, err, code;
     if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
@@ -353,10 +359,10 @@ bool debug_record(ID3D12GraphicsCommandList* l, int mode, DXGI_FORMAT out_format
     l->SetPipelineState(g_dbg.pso.Get());
     l->SetComputeRootDescriptorTable(0, gh);
     const float scale = mode == 2 ? 5.0f : 0.25f;
-    uint32_t k[4] = {static_cast<uint32_t>(mode), 0, g.w, g.h};
+    uint32_t k[6] = {static_cast<uint32_t>(mode), 0, g.ow, g.oh, g.rw, g.rh};
     std::memcpy(&k[1], &scale, 4);
-    l->SetComputeRoot32BitConstants(1, 4, k, 0);
-    l->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
+    l->SetComputeRoot32BitConstants(1, 6, k, 0);
+    l->Dispatch((g.ow + 7) / 8, (g.oh + 7) / 8, 1);
     return true;
 }
 
@@ -483,7 +489,7 @@ bool rcas_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Resou
 na::j2::NisSharpen g_nis;
 bool rcas_record(ID3D12GraphicsCommandList* l, uint32_t percent, DXGI_FORMAT fmt)
 {
-    return g.sharp && rcas_dispatch(l, g.output.Get(), g.sharp.Get(), g.w, g.h, percent, fmt, g.slot);
+    return g.sharp && rcas_dispatch(l, g.output.Get(), g.sharp.Get(), g.ow, g.oh, percent, fmt, g.slot);
 }
 
 bool ensure_device(ID3D12CommandQueue* q)
@@ -574,7 +580,8 @@ bool state_after(ID3D12CommandList* const* lists, UINT last, na_object_id id, ui
 // known sample to the camera tracker (which removes it exactly) and to DLSS.
 // Runs only while DLAA is producing frames, so the shake is never left
 // unresolved on screen.
-constexpr uint32_t kJitterPhases = 8;
+constexpr uint32_t kJitterPhases = 8; // DLAA; upscaling uses JitterPhasesFor (8 x ratio^2)
+uint32_t jitter_phases() { return g.ow && g.rw ? JitterPhasesFor(g.rw, g.ow) : kJitterPhases; }
 
 void store_matrix(const na::camera::Matrix& m, na::camera::Layout layout, uint8_t out[64])
 {
@@ -622,7 +629,7 @@ bool same_camera(const na::camera::Matrix& m)
 bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& in_bytes, bool slot)
 {
     const size_t n = in_bytes.size();
-    if (g.camera_offset < 0 || static_cast<uint64_t>(g.camera_offset) + 64 > n || !g.w || !g.h) return false;
+    if (g.camera_offset < 0 || static_cast<uint64_t>(g.camera_offset) + 64 > n || !g.rw || !g.rh) return false;
     // jitter_batch has normalized this exact buffer range using the write ledger.
     const auto& bytes = in_bytes;
     for (auto layout : {na::camera::Layout::RowMajor, na::camera::Layout::ColumnMajor}) {
@@ -647,10 +654,10 @@ bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& in_byt
             if (slot || !na::camera::Invert(m, inv)) continue;
         }
         g_jit_cam.valid = na::camera::DecomposeViewProjection(m, g_jit_cam.geo);
-        const neural_alias::JitterSample js = neural_alias::temporal_jitter(++g.jit.phase, kJitterPhases);
+        const neural_alias::JitterSample js = neural_alias::temporal_jitter(++g.jit.phase, jitter_phases());
         std::array<double, 16> src{};
         for (int i = 0; i < 16; ++i) src[i] = m[i];
-        const auto jm = neural_alias::jitter_projection(src, js, g.w, g.h);
+        const auto jm = neural_alias::jitter_projection(src, js, g.rw, g.rh);
         na::camera::Matrix jvp{}, jinv{};
         for (int i = 0; i < 16; ++i) jvp[i] = jm[i];
         if (!na::camera::Invert(jvp, jinv)) return false;
@@ -680,7 +687,7 @@ bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& in_byt
             if (is_projection_of(pm, m)) {
                 std::array<double, 16> ps{};
                 for (int i = 0; i < 16; ++i) ps[i] = pm[i];
-                const auto jp = neural_alias::jitter_projection(ps, js, g.w, g.h);
+                const auto jp = neural_alias::jitter_projection(ps, js, g.rw, g.rh);
                 na::camera::Matrix jpm{};
                 for (int i = 0; i < 16; ++i) jpm[i] = jp[i];
                 std::memcpy(j.proj, bytes.data() + po, 64);
@@ -761,7 +768,7 @@ void jitter_batch(ID3D12CommandList* const* lists, UINT count)
                 if (is_projection_of(pm, vm)) {
                     std::array<double, 16> ps{};
                     for (int i = 0; i < 16; ++i) ps[i] = pm[i];
-                    const auto jp = neural_alias::jitter_projection(ps, neural_alias::JitterSample{g.jit.px[0], g.jit.px[1]}, g.w, g.h);
+                    const auto jp = neural_alias::jitter_projection(ps, neural_alias::JitterSample{g.jit.px[0], g.jit.px[1]}, g.rw, g.rh);
                     na::camera::Matrix jpm{};
                     for (int i = 0; i < 16; ++i) jpm[i] = jp[i];
                     std::memcpy(g.jit.proj, view.data() + po, 64);
@@ -989,8 +996,11 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         return prefix ? state_after(lists, prefix - 1, id, sub, st)
                       : na::observe::KnownSubStateInCurrentSubmission(id, sub, st);
     };
-    const bool have_sc = saved ? entry_state(color_id, csub, &sc) : inl ? state_now(color_id, csub, &sc) : state_after(lists, scene, color_id, csub, &sc);
-    const bool have_sd = saved ? entry_state(depth_id, dsub, &sd) : inl ? state_now(depth_id, dsub, &sd) : state_after(lists, scene, depth_id, dsub, &sd);
+    const auto state_of = [&](na_object_id id, uint32_t sub, uint32_t* st) {
+        return saved ? entry_state(id, sub, st) : inl ? state_now(id, sub, st) : state_after(lists, scene, id, sub, st);
+    };
+    const bool have_sc = state_of(color_id, csub, &sc);
+    const bool have_sd = state_of(depth_id, dsub, &sd);
     if (!have_sc || !have_sd) {
         ++g.stats.no_state;
         if (!have_sc) ++g.stats.no_state_color; else ++g.stats.no_state_depth;
@@ -1011,6 +1021,45 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     }
     const DXGI_FORMAT cf = typed(cd.Format); // our copies' format
     const bool color_msaa = cd.SampleDesc.Count > 1, depth_msaa = dd.SampleDesc.Count > 1;
+
+    // P4-4: upscaling destination (slider route). Any reason not to use it falls back
+    // to DLAA at the scene's size, written back as before.
+    UpscaleTarget up;
+    { std::lock_guard<std::mutex> lk(g_up_m); up = g_up; }
+    ComPtr<ID3D12Resource> dest;
+    uint32_t rw = w, rh = h, ow = w, oh = h, dsub_out = 0, sdest = 0;
+    const auto refuse_upscale = [&](const char* why) {
+        dest.Reset();
+        rw = ow = w; rh = oh = h;
+        ++g.stats.upscale_refused;
+        std::snprintf(g.stats.upscale_note, sizeof g.stats.upscale_note, "%s", why);
+    };
+    if (up.dest) {
+        dest.Attach(na::observe::AcquireResource(up.dest));
+        const uint32_t erw = up.render_w ? up.render_w : w, erh = up.render_h ? up.render_h : h;
+        if (!dest) refuse_upscale("Upscale destination is not available.");
+        else if (color_msaa) refuse_upscale("Upscaling from an MSAA scene colour is not supported.");
+        else if (erw > w || erh > h) refuse_upscale("The render extent is larger than the scene colour.");
+        else {
+            const D3D12_RESOURCE_DESC od = dest->GetDesc();
+            const uint32_t omips = od.MipLevels ? od.MipLevels : 1u;
+            const uint32_t omip = up.dest_sub % omips;
+            const uint32_t dw = (std::max)(1u, static_cast<uint32_t>(od.Width >> omip)), dh = (std::max)(1u, od.Height >> omip);
+            if (od.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || od.SampleDesc.Count != 1 ||
+                up.dest_sub >= omips * od.DepthOrArraySize)
+                refuse_upscale("The upscale destination is not a single-sample 2D texture.");
+            else if (typed(od.Format) != cf)
+                refuse_upscale("The upscale destination's format differs from the scene colour (no conversion yet).");
+            else if (dw < erw || dh < erh)
+                refuse_upscale("The upscale destination is smaller than the render extent.");
+            else {
+                rw = erw; rh = erh; ow = dw; oh = dh; dsub_out = up.dest_sub;
+            }
+        }
+    }
+    if (dest && up.dest == color_id) refuse_upscale("The upscale destination is the scene colour itself.");
+    if (dest && !state_of(up.dest, dsub_out, &sdest)) refuse_upscale("Waiting: the upscale destination's state is not established.");
+    const bool upscaling = dest != nullptr;
 
     // Camera first (nothing is allocated for a frame that cannot run); the tracker
     // update comes after the size check, because a resize resets the tracker.
@@ -1033,6 +1082,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (done == UINT64_MAX) { reason("Device removed."); return false; }
     if (s.fence_value && done < s.fence_value) { ++g.stats.busy; reason("Skipped: the previous use of this frame slot is still running."); return false; }
     const bool resize = !g.output || !g.color_in || g.w != w || g.h != h || g.color_format != cf ||
+                        g.rw != rw || g.rh != rh || g.ow != ow || g.oh != oh ||
                         g.samples != cd.SampleDesc.Count || g.sample_quality != cd.SampleDesc.Quality ||
                         g.depth_samples != dd.SampleDesc.Count || g.depth_quality != dd.SampleDesc.Quality || g.depth_format != dd.Format;
     if (resize) {
@@ -1052,14 +1102,15 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         if (!texture(w, h, DXGI_FORMAT_R32_FLOAT, depth_msaa, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g.depth32) ||
             !texture(w, h, DXGI_FORMAT_R32G32_FLOAT, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.motion) ||
             !texture(w, h, DXGI_FORMAT_R8_UINT, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.provenance) ||
-            !texture(w, h, cf, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.output) ||
+            !texture(ow, oh, cf, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.output) ||
             !texture(w, h, cf, false, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g.color_in) ||
-            !texture(w, h, cf, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.sharp)) {
+            !texture(ow, oh, cf, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.sharp)) {
             g.output.Reset();
             reason("Could not allocate the DLAA working textures.");
             return false;
         }
         g.w = w; g.h = h; g.color_format = cf;
+        g.rw = rw; g.rh = rh; g.ow = ow; g.oh = oh;
         g.samples = cd.SampleDesc.Count; g.sample_quality = cd.SampleDesc.Quality;
         g.depth_samples = dd.SampleDesc.Count; g.depth_quality = dd.SampleDesc.Quality; g.depth_format = dd.Format;
         g.resume_reset = true; // remains pending if this recording is not submitted
@@ -1074,13 +1125,14 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     constexpr uint64_t kMaxGapFrames = 4;
     const bool tracker_restart = g.resume_reset || (g.submitted_frame && g.frame > g.submitted_frame + kMaxGapFrames);
     if (tracker_restart) pending.tracker.Reset();
-    const na::camera::CameraFrame cam = pending.tracker.Update(vp, g.frame, w, h, injected);
+    const na::camera::CameraFrame cam = pending.tracker.Update(vp, g.frame, rw, rh, injected); // active extent
     if (!cam.valid) { ++g.stats.no_camera; reason("The camera matrix could not be inverted."); return false; }
     pending.cut = cam.camera_cut;
     // P4-0b: moving-object motion (between-lists route only). The pre list is
     // submitted right before this list; the flow pairs with the frame the camera
     // history pairs with. Any failure leaves this frame camera-only.
-    if (flow_ticket && !inl && !color_msaa && na::j2::flow::Enabled()) {
+    // Flow works on the whole colour at DLAA size; upscaled frames stay camera-only for now.
+    if (flow_ticket && !inl && !color_msaa && !upscaling && na::j2::flow::Enabled()) {
         na::j2::flow::Source fs;
         fs.color = color.Get();
         fs.subresource = csub;
@@ -1171,8 +1223,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         na::motion::gpu::Outputs o{};
         o.xy = g.motion.Get();
         o.provenance = g.provenance.Get();
-        o.width = w;
-        o.height = h;
+        o.width = rw; // the active extent (top left); render pixels
+        o.height = rh;
         have_motion = g.arbiter.Dispatch(l, in, o, g.slot);
     }
     if (!have_motion) {
@@ -1195,9 +1247,11 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     e.depth = g.depth32.Get();
     e.motion = g.motion.Get();
     e.output = g.output.Get();
-    e.render_w = e.max_render_w = e.out_w = w;
-    e.render_h = e.max_render_h = e.out_h = h;
-    e.quality = na::dlss::Quality::DLAA;
+    e.render_w = e.max_render_w = rw; // active extent at the top left of the inputs
+    e.render_h = e.max_render_h = rh;
+    e.out_w = ow;
+    e.out_h = oh;
+    e.quality = na::dlss::QualityForScale(rw, rh, ow, oh); // DLAA when equal
     e.preset = na::settings::Get().j2_preset.load(); // Cort: preset L by default
     e.view_id = kViewId;
     e.jitter_x = static_cast<float>(cam.jitter_px_x); // DLSS: colour sampled at pixel centre - jitter
@@ -1267,7 +1321,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
                 add(b, g.sharp.Get(), UAV, NPSR);
                 add(b, g.output.Get(), NPSR, UAV);
                 flush(l, b);
-                if (g_nis.Dispatch(g.device.Get(), l, g.sharp.Get(), g.output.Get(), g.w, g.h, cf, is_float_color(cf), pct, g.slot)) {
+                if (g_nis.Dispatch(g.device.Get(), l, g.sharp.Get(), g.output.Get(), g.ow, g.oh, cf, is_float_color(cf), pct, g.slot)) {
                     ++g.stats.nis_frames;
                     add(b, g.sharp.Get(), NPSR, UAV);
                 } else { // NIS unavailable: keep the RCAS result
@@ -1294,8 +1348,23 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             flush(l, b);
         }
     }
-    // 5. result -> scene colour, everything back to the game's states
-    if (evaluated) {
+    // 5. result -> scene colour (DLAA) or the upscale destination, everything back to the game's states
+    if (evaluated && upscaling) {
+        b.push_back(uav_barrier(g.output.Get()));
+        add(b, g.output.Get(), UAV, SRC);
+        addsub(b, color.Get(), csub, color_source, sc); // the game's scene colour is left as drawn
+        addsub(b, dest.Get(), dsub_out, sdest, DST);
+        flush(l, b);
+        D3D12_TEXTURE_COPY_LOCATION cs{}, cdst{};
+        cs.Type = cdst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        cs.pResource = g.output.Get();
+        cdst.pResource = dest.Get();
+        cdst.SubresourceIndex = dsub_out;
+        const D3D12_BOX box{0, 0, 0, ow, oh, 1};
+        l->CopyTextureRegion(&cdst, 0, 0, 0, &cs, &box);
+        add(b, g.output.Get(), SRC, UAV);
+        addsub(b, dest.Get(), dsub_out, DST, sdest);
+    } else if (evaluated) {
         b.push_back(uav_barrier(g.output.Get()));
         const UINT output_read = color_msaa ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : SRC;
         const UINT color_write = color_msaa ? D3D12_RESOURCE_STATE_RENDER_TARGET : DST;
@@ -1340,6 +1409,12 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     g.stats.width = w;
     g.stats.height = h;
     g.stats.color_format = static_cast<uint32_t>(cd.Format);
+    g.stats.render_w = rw;
+    g.stats.render_h = rh;
+    g.stats.out_w = ow;
+    g.stats.out_h = oh;
+    g.stats.jitter_phases = jitter_phases();
+    if (upscaling) { ++g.stats.upscaled_frames; g.stats.upscale_note[0] = 0; }
     *out_list = l;
     return true;
 }
@@ -1588,6 +1663,19 @@ void SetEnabled(bool on)
     if (on) na::observe::SetTableBindCallback(&on_table_bind);
 }
 bool Enabled() { return na::settings::EffectsReady() && g.enabled.load(); }
+void SetUpscaleTarget(const UpscaleTarget& t) { std::lock_guard<std::mutex> lk(g_up_m); g_up = t; }
+UpscaleTarget GetUpscaleTarget() { std::lock_guard<std::mutex> lk(g_up_m); return g_up; }
+uint32_t JitterPhasesFor(uint32_t render_w, uint32_t out_w)
+{
+    if (!render_w || out_w <= render_w) return kJitterPhases;
+    const double r = static_cast<double>(out_w) / render_w;
+    return static_cast<uint32_t>((std::min)(64.0, std::ceil(kJitterPhases * r * r)));
+}
+float UpscaleMipBias(uint32_t render_w, uint32_t out_w)
+{
+    if (!render_w || !out_w) return -1.0f;
+    return static_cast<float>(std::log2(static_cast<double>(render_w) / out_w)) - 1.0f;
+}
 bool Configured() { return g.configured.load(); }
 void SetPaused(bool paused)
 {
@@ -2117,6 +2205,7 @@ void Shutdown()
     g.inline_camera_submitted = false;
     g.resume_reset = false;
     g.w = g.h = 0;
+    g.rw = g.rh = g.ow = g.oh = 0;
 }
 
 } // namespace na::j2
