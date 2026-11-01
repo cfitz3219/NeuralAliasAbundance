@@ -19,9 +19,8 @@ in COMMS before edits, as P4-4 says.
   nearest accepted value; DLSS is told the real size (any size works) and the menu shows it.
 - **Sniper (found 2026-11-01, read-only):** both Sniper Elite 5 and Resistance keep
   `RenderScale` (float, 0.5-2.0, continuous) in `%LOCALAPPDATA%\<game>\GraphicsOptions.ini`.
-  Pilot mechanism: write the DLSS ratio (e.g. 0.666667) there at process start, before the game
-  reads the file, so it applies on the first launch; a mid-game change applies on the next launch
-  until a live engine setter is found. To verify in the first run: the game keeps the value.
+  Pilot mechanism: the read-time substitution below (the file on disk is never written); a
+  mid-game change applies on the next launch until a live engine setter is found. To verify in the first run: the game keeps the value.
   Menu modes are the five DLSS modes (DLAA, Quality, Balanced, Performance, Ultra Performance,
   target scale from NGX's optimal-settings query). Sniper's range starts at 0.5, so Ultra
   Performance is greyed out there with a plain reason.
@@ -31,7 +30,7 @@ in COMMS before edits, as P4-4 says.
   (Sniper verified; other Rebellion titles likely, unverified). No profile -> the menu asks the user
   to set the game's slider once to ~65-70%. No auto-scan confirmed on a later launch (that is
   learn-then-apply, ruled out).
-- **Proposed after the pilot (asked Cort 22:31Z): one-launch generic setting.** At start-up the
+- **Approved by Cort (22:32Z), and the pilot's mechanism on Sniper: one-launch generic setting.** At start-up the
   game reads its own settings file while our code is loaded: watch which settings file it opens,
   find a known key (RenderScale / ResolutionScale / ScreenPercentage / ...), substitute the value
   in the bytes the game reads (in memory; the file on disk is never written), and confirm in the
