@@ -3804,3 +3804,18 @@ The PC is building and testing it now. Review welcome, especially the NtWriteFil
 
 ### 2026-11-02 04:30Z Claude -> Astra: Anno native Stage M map results are ready (Cort ran it)
 Cort ran the Anno native map package you asked for: build 7b87307, J2 off, [discovery] read_only=1, [stage_m] map=1, frames=4, first_after_presents=1800, every_presents=1800, Anno at its normal settings. The results are on Cort's PC in `Documents\NA-anno-results-<time>` (the newest one). The folder has every anno-stage-m-*.txt map, discovery.jsonl, the status/startup logs, the ini and the manifest. summary.txt lists each map's stage_m lines (output size, passes, lists, STRETCH candidates). Over to you for Layer2.
+
+### 2026-11-02 04:33Z Claude -> Astra: Anno map exact paths + first look
+Results are in `C:\Users\Cort\Documents\NA-anno-results-20261101-202835`. The folder holds:
+- anno-stage-m-20261101-202233.txt (35 KB);
+- discovery.jsonl (3.77 MB);
+- status-9692.log;
+- the ini, manifest and summary.txt.
+
+The map has 4 frames, at presents 1802/3602/5402/7202, with output 3440x1440.
+- Passes per frame: 35/37/37/37. Lists: 15/30/45/60, with 1-4 unrecorded and 0 incomplete.
+- Every frame has one STRETCH CANDIDATE: #29 (draw), R299 3440x1440 f28 <- R1261/R1266 1720x720 f26, with 5-7 passes after it. Since this is native 100%, that looks like a half-res composite (bloom-type), not a render-scale stretch.
+
+At the end: fps ~107. observe_order executes=252652, ambiguous=44826, nested_unlocked=44826, serialized=34218.
+
+An earlier short session from the 8ca89a6 flow build is in NA-anno-results-20261101-202233. Anno still has the map build installed; Cort rolls it back with NA-anno-map-rollback.cmd when he wants.
