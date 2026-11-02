@@ -537,6 +537,10 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                 // a table binding the colour, but nothing in the list consumes it. That looks like
                 // a scene end; the exact placement must not run DLAA here (withheld), because the
                 // scene continues in the NEXT list.
+                ID3D12DescriptorHeap* ch0[] = {cbvh.Get()}; // a scene list: it draws with the camera bound
+                scene2.list->SetDescriptorHeaps(1, ch0);
+                scene2.list->SetGraphicsRootSignature(rs.Get());
+                scene2.list->SetGraphicsRootDescriptorTable(0, cbvh->GetGPUDescriptorHandleForHeapStart());
                 D3D12_RESOURCE_BARRIER to_read = test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 scene2.list->ResourceBarrier(1, &to_read);
                 ID3D12DescriptorHeap* ph0[] = {post_heap.Get()};
