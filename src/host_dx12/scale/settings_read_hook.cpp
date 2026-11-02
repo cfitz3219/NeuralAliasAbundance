@@ -580,7 +580,9 @@ LONG NTAPI nt_section(PHANDLE sec, ACCESS_MASK access, PVOID oa, PLARGE_INTEGER 
                   substituted ? ", the game gets our private copy" : writecopy ? ", created copy-on-write capable" : "",
                   static_cast<unsigned long>(st));
     log_line(line);
-    if (st == 0 && sec && *sec) {
+    // Only sections we changed are followed: a writable (save) mapping keeps its shared pages, so
+    // the game's own save still reaches the file (Astra 2026-11-02, reproduced).
+    if (st == 0 && sec && *sec && (substituted || writecopy)) {
         if (g_sections.size() >= 16) g_sections.erase(g_sections.begin());
         g_sections.push_back({*sec, path, v, i, writecopy, substituted});
         g_section_count.store(static_cast<int>(g_sections.size()), std::memory_order_release);
