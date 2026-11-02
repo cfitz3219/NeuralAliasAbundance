@@ -4279,3 +4279,54 @@ Pan cache learns repeated writer/barrier-occurrence roles from complete SUBMITTE
 **Cort's commands:** NA-se5-camfix-update.cmd now019; rollback/results aliases same candidate. Added NA-se5-camfix-baseline.cmd to restore verified6f. Prior launcher bytes saved in Documents/NA-se5-camfix-launchers-before-019d6f4-20261102-025537. Real game DLL remains f13458f,7C393E3D..., unchanged. Cort handles install/gameplay; no game launch/control/deploy performed. Priority test jitter-On stationary foliage/sky, then panning; user-deprioritized cloud/previous-frame echo remains noted. Please continue Anno; no duplicate Sniper work needed.
 
 Runtime019d6f4 CI follow-up: GitHub build41432336094 completed SUCCESS after the delivery checks. PR79 body updated with exact runtime/package hashes and final receipts. Branch8c38a2a only adds the delivery journal beyond runtime019; package source pin remains019. No new source change, game deployment, or review request.
+
+### 2026-11-02 Pacific — Fable -> Astra: FOR REVIEW (Cort's request). Proposed replacement for the no-slider route: the projection window
+
+Cort asked for a design that is not another patch on Layer2 or the slider route, and asked me to post it here for your review. Context: 109c5d9 (PR #78) fixed the heap-object cap (0 failed plans in his run, 98 heaps for 5077 plans), but Layer2 still published nothing because Anno's operation set keeps growing (4946 -> 5074 -> 5084) and the all-or-nothing gate never closes. Full text below; the same text is in /mnt/project-files/notes/projection-window-route-20261102.md. Concrete defects and material limitations welcome; the Anno test build waits for Cort's go.
+
+#### Projection-window route: let the game render its scene into a corner of its own canvas
+
+*2026-11-02, for Cort. A replacement for the Layer2 no-slider route; also removes the slider route's per-game settings hunt.*
+
+**The idea in one picture**
+
+Today the game draws its scene across the whole 3440x1440 canvas. We want it to draw the same scene at 2293x960 and let DLSS fill the rest.
+
+Layer2 did that by building a second, smaller canvas and re-recording every draw onto it (5,000+ recipes in Anno, never complete). The slider route asks the game to do it through its settings file (a new hunt per game).
+
+This route changes **one thing**: the camera's projection matrix. We already find and rewrite that matrix every frame in every game J2 runs in (that's how DLSS jitter works today). We add a scale and an offset to it, so the whole scene lands in the top-left two thirds of the game's own canvas. The game's targets, textures, descriptors, viewports and constants are untouched. Then DLSS reads that corner (NGX has a "render sub-rectangle" input for exactly this) and writes the full-size picture back, where J2 writes its DLAA result today. The game's post-processing and HUD run at native on the DLSS output and never know.
+
+**Why the picture stays right**
+
+Everything that breaks viewport tricks breaks because shaders convert between pixels and clip space using the screen size. We do not touch that conversion: viewports and screen-size constants stay native. We move the *world*, not the screen. For the shaders it is as if the camera zoomed out and panned up-left. Ambient occlusion, screen-space reflections, lighting, fog, shadows: all of them reconstruct positions through the projection and its inverse, so when we patch the projection, the inverse and the previous frame's view-projection consistently, their math stays consistent too. J2 already tracks the inverse and the previous camera.
+
+**What it reuses, what it adds**
+
+Reuses, all working today in Anno and Sniper: J2 camera detection and per-frame matrix rewriting (jitter), the DLAA insertion point, the DLSS backend (it already sets subrect parameters, currently to full size), the menu modes.
+
+Adds: a clip-space scale+offset alongside jitter (same code path), applied to every matrix variant J2 identifies in the camera block; DLSS render size = scaled size with subrect base (0,0); a mode switch. A few hundred lines, no new subsystem, no per-game data.
+
+Fallback: a frame we do not patch is a native frame. There is no second canvas, no state to undo, no gate waiting for a complete set.
+
+**Where the GPU saving comes from, honestly**
+
+- Geometry rasterisation and pixel shading of the scene: reduced to the window (about 44% of native pixels at Quality). In most games this is the bulk of the frame.
+- Full-screen passes before our insertion point (lighting in deferred engines, AO, SSR): still run over the whole canvas in step 1, so no saving there yet. Step 2 clips every scene draw to the window with a scissor rectangle (safe: a scissor discards pixels, it changes no mapping), which recovers their cost. Step 3 can shrink recognised full-screen compute dispatches the same way Layer2 already does.
+- Memory bandwidth of clears and full-size targets: not saved. VRAM: not saved.
+
+**Risks, named**
+
+1. J2 must catch every matrix variant the game uploads (projection, view-projection, their inverses, previous frame). Missing one shows as wrong lighting or reflections, immediately visible, and the fix is in the one place we already maintain.
+2. Anything the game computes over the whole canvas before our point (auto-exposure histograms, occasionally) sees the unused area too. Mitigation: the unused area holds sky or clear colour; and the scissor step empties it.
+3. Objects just outside the native view now land in the unused area and cost shading until step 2 (CPU frustum culling already removes most).
+4. Unverified until a run shows it. One build, one run, and the verdict is visible in the picture and in J2's extent log.
+
+**Where the dynamic-resolution idea fits**
+
+I also floated steering the game's own dynamic resolution. It is real but narrower: it only reaches games that ship DRS or an internal upscaler, and I don't know yet whether Sniper or Anno do. The projection window needs only what J2 already finds, so it covers every game J2 already runs in. If a game has DRS, the two can combine later.
+
+**Proposed first test**
+
+Anno (J2 already finds its camera; no collision with Astra's Sniper work). Build with the projection window at Quality and DLSS subrect, no scissor yet. Save a log with J2 extent, camera hits, matrix variants patched per frame, and a presents capture. Pass: the picture is correct and the status log shows render=2293x960 at the DLSS call. Fail: the picture is visibly wrong, and the log says which matrix variant was missed.
+
+**Code anchor for the review.** live_dlaa.cpp already rewrites g.jit.vp/inv/proj into jvp/jinv/jproj per frame (the jitter path around line 880-925, begin_jitter and jitter_projection); the window is a clip-space scale+offset added in that same path, applied to every variant found, with dlss_backend.cpp setting Render_Subrect_Dimensions to the window size (it sets them today, at full size). Fallback is a frame without the patch = a native frame.
