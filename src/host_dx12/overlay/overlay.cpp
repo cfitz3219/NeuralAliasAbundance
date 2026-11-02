@@ -717,16 +717,17 @@ void write_status_line()
             const auto rh = na::scale::GetReadHookStats();
             const auto lv = na::scale::GetLiveStats();
             const auto dr = na::scale::GetDriverStats();
-            char sl[900];
+            char sl[1400];
             const int sn = snprintf(sl, sizeof(sl),
                 "scale mode=%d fraction=%.4f requested=%.4f baseline_w=%u scene=%ux%u judged=%u changed=%u unchanged=%u state=\"%s\" "
-                "read files=%llu patched=%llu restored=%llu unpatched=%llu async=%llu utf16=%llu mapped=%llu key=%s original=%.6f file=\"%s\" note=\"%s\" "
+                "read files=%llu patched=%llu restored=%llu unpatched=%llu async=%llu utf16=%llu mapped=%llu adopted=%llu key=%s original=%.6f file=\"%s\" note=\"%s\" "
                 "live result=%s tagged=%u tag=%.6f hits=%u/%u candidates=%u trying=%d control=%d writes=%u restores=%u scanned_kb=%llu scan_ms=%llu live_note=\"%s\"\r\n",
                 dr.mode, dr.fraction, dr.requested, dr.baseline_w, j2.width, j2.height, dr.judged, dr.changed, dr.unchanged, dr.state,
                 static_cast<unsigned long long>(rh.files_opened), static_cast<unsigned long long>(rh.reads_patched),
                 static_cast<unsigned long long>(rh.writes_restored), static_cast<unsigned long long>(rh.reads_unpatched),
                 static_cast<unsigned long long>(rh.reads_async), static_cast<unsigned long long>(rh.reads_utf16),
-                static_cast<unsigned long long>(rh.files_mapped), rh.key, rh.original, rh.file, rh.note,
+                static_cast<unsigned long long>(rh.files_mapped),
+                static_cast<unsigned long long>(rh.handles_adopted), rh.key, rh.original, rh.file, rh.note,
                 na::scale::LiveResultName(lv.result), lv.tagged ? 1u : 0u, lv.tag, lv.float_hits, lv.double_hits, lv.candidates, lv.trying, lv.control,
                 lv.writes, lv.restores, static_cast<unsigned long long>(lv.scanned_kb), static_cast<unsigned long long>(lv.scan_ms), lv.note);
             if (sn > 0) WriteFile(f, sl, static_cast<DWORD>((std::min)(sn, static_cast<int>(sizeof(sl) - 1))), &written, nullptr);

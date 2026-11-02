@@ -163,6 +163,27 @@ int main()
         CHECK(na::scale::SetLiveFraction(1.0 / 1.5) == na::scale::LiveResult::NoTag);
         na::scale::Configure(0, nullptr);
     }
+    // A read through a handle whose open we never saw (SE5 2026-11-02: GraphicsOptions.ini opened
+    // through CreateFileW, read elsewhere): recognised by its bytes and path, adopted, patched.
+    {
+        CHECK(write_all(opt, ini));
+        na::scale::Configure(na::scale::FractionForMode(1), log.c_str());
+        const HANDLE f = CreateFileW(opt.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        HANDLE dup = nullptr;
+        CHECK(f != INVALID_HANDLE_VALUE &&
+              DuplicateHandle(GetCurrentProcess(), f, GetCurrentProcess(), &dup, 0, FALSE, DUPLICATE_SAME_ACCESS));
+        CloseHandle(f);
+        std::string s(4096, '\0');
+        DWORD r = 0;
+        CHECK(dup && ReadFile(dup, s.data(), static_cast<DWORD>(s.size()), &r, nullptr));
+        if (dup) CloseHandle(dup);
+        s.resize(r);
+        std::printf("read through an unseen handle: %s\n", s.c_str());
+        CHECK(s.find("\nRenderScale = 0.666668\r\n") != std::string::npos);
+        CHECK(na::scale::GetReadHookStats().handles_adopted >= 1);
+        CHECK(read_all(other) == ini); // a non-settings file with the same bytes is still left alone
+        na::scale::Configure(0, nullptr);
+    }
     delete game_f;
     delete game_d;
 
@@ -170,6 +191,7 @@ int main()
     std::printf("log:\n%s", lg.c_str());
     CHECK(lg.find("patched read of") != std::string::npos && lg.find("kept the original") != std::string::npos);
     CHECK(lg.find("asynchronously") != std::string::npos && lg.find("is the control") != std::string::npos);
+    CHECK(lg.find("through a handle we did not see opened") != std::string::npos);
     DeleteFileW(opt.c_str());
     DeleteFileW(other.c_str());
     DeleteFileW(log.c_str());

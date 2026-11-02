@@ -38,6 +38,7 @@ struct ReadHookStats {
     uint64_t reads_async = 0;     // tracked files read with OVERLAPPED (not inspected; diagnostics)
     uint64_t reads_utf16 = 0;     // patched reads that were UTF-16LE text
     uint64_t files_mapped = 0;    // tracked files opened as a file mapping (not inspected; diagnostics)
+    uint64_t handles_adopted = 0; // settings reads/saves on handles whose open we did not see (content route)
     double original = 0;          // the value the game had stored (its own unit)
     char key[40] = {};
     char file[260] = {};          // last patched file (UTF-8)

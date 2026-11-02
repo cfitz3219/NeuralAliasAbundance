@@ -28,16 +28,16 @@ using CreateFileAFn = HANDLE(WINAPI*)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTE
 struct IoSb { union { LONG Status; PVOID Pointer; }; ULONG_PTR Information; };
 using NtReadFileFn = LONG(NTAPI*)(HANDLE, HANDLE, PVOID, PVOID, IoSb*, PVOID, ULONG, PLARGE_INTEGER, PULONG);
 using NtWriteFileFn = LONG(NTAPI*)(HANDLE, HANDLE, PVOID, PVOID, IoSb*, PVOID, ULONG, PLARGE_INTEGER, PULONG);
-using CreateMappingWFn = HANDLE(WINAPI*)(HANDLE, LPSECURITY_ATTRIBUTES, DWORD, DWORD, DWORD, LPCWSTR);
-using CreateMappingAFn = HANDLE(WINAPI*)(HANDLE, LPSECURITY_ATTRIBUTES, DWORD, DWORD, DWORD, LPCSTR);
+using NtCreateSectionFn = LONG(NTAPI*)(PHANDLE, ACCESS_MASK, PVOID, PLARGE_INTEGER, ULONG, ULONG, HANDLE);
+using NtQueryInformationFileFn = LONG(NTAPI*)(HANDLE, IoSb*, PVOID, ULONG, ULONG);
 constexpr LONG kStatusPending = 0x103;
 
 CreateFileWFn o_create_w = nullptr;
 CreateFileAFn o_create_a = nullptr;
 NtReadFileFn o_ntread = nullptr;
 NtWriteFileFn o_ntwrite = nullptr;
-CreateMappingWFn o_map_w = nullptr;
-CreateMappingAFn o_map_a = nullptr;
+NtCreateSectionFn o_ntsection = nullptr;
+NtQueryInformationFileFn p_query_file = nullptr; // not hooked: the handle's synchronous mode
 
 constexpr uint64_t kMaxFileBytes = 1u << 20;
 
@@ -65,6 +65,15 @@ std::map<HANDLE, Tracked> g_handles;
 std::map<std::wstring, Patched> g_patched; // lower-cased path
 ReadHookStats g_stats;
 int g_open_logs = 0; // diagnostics: tracked opens logged (bounded)
+// Content route (2026-11-02): SE5 opened GraphicsOptions.ini through CreateFileW but no NtReadFile
+// or save ever arrived on that handle, while other files' reads did. So a read or save on an
+// UNTRACKED handle whose bytes look like settings text is checked by its file path and adopted.
+std::atomic<bool> g_any_candidate{false}; // a candidate settings file was opened for reading
+std::atomic<bool> g_any_patch{false};     // something was substituted: saves need checking
+struct Identity { DWORD volume; uint64_t index; std::wstring path; };
+// Files checked by path and not a candidate, by identity (handle values are reused; bounded).
+std::vector<std::pair<DWORD, uint64_t>> g_rejected;
+std::vector<Identity> g_known;            // candidate files opened for reading (bounded)
 // Live switching: the marked value the game parsed, in its unit, and the candidates found.
 struct Candidate {
     uintptr_t addr = 0;
@@ -211,6 +220,12 @@ void on_open(HANDLE h, std::wstring path, DWORD access, DWORD flags)
     t.read = rd;
     t.write = wr;
     t.overlapped = (flags & FILE_FLAG_OVERLAPPED) != 0;
+    if (rd) {
+        g_any_candidate.store(true, std::memory_order_release);
+        bool have = false;
+        for (const Identity& k : g_known) have |= k.volume == t.volume && k.index == t.index;
+        if (!have && g_known.size() < 64) g_known.push_back({t.volume, t.index, t.path});
+    }
     if (g_handles.size() > 256) g_handles.clear(); // bounded: stale entries only
     g_handles[h] = std::move(t);
     track_slot(h);
@@ -254,7 +269,13 @@ void inspect_read(HANDLE h, void* buf, size_t got_n)
     if (!(g_fraction > 0) || g_handles.empty()) return;
     const auto it = g_handles.find(h);
     if (it == g_handles.end() || !it->second.read) return;
-    if (!still_same(h, it->second)) { g_handles.erase(it); return; }
+    if (!still_same(h, it->second)) {
+        char line[600];
+        std::snprintf(line, sizeof line, "read on a reused handle (was %s): no longer tracked", utf8(it->second.path).c_str());
+        log_line(line);
+        g_handles.erase(it);
+        return;
+    }
     const size_t* got = &got_n;
     char* d = static_cast<char*>(buf);
     PatchInfo info;
@@ -273,6 +294,7 @@ void inspect_read(HANDLE h, void* buf, size_t got_n)
     }
     it->second.read_logged = true;
     if (wide) ++g_stats.reads_utf16;
+    if (k > 0) g_any_patch.store(true, std::memory_order_release);
     if (k > 0) {
         const Match& m = info.m; // the first entry actually rewritten
         ++g_stats.reads_patched;
@@ -308,42 +330,118 @@ void inspect_read(HANDLE h, void* buf, size_t got_n)
     log_line(line);
 }
 
+// Cheap test on bytes from an untracked handle: could they hold a render-scale key? Every key in
+// kKeys contains "cale" or "ercent" (any case of the letter before); UTF-16 as well.
+constexpr size_t kSniffBytes = 64 * 1024; // settings files are a few KB; bounds the cost on streaming reads
+bool contains(const char* d, size_t n, const char* pat, size_t pn)
+{
+    for (const char* p = d; n >= pn;) {
+        const void* f = std::memchr(p, pat[0], n - pn + 1);
+        if (!f) return false;
+        const char* q = static_cast<const char*>(f);
+        if (std::memcmp(q, pat, pn) == 0) return true;
+        n -= static_cast<size_t>(q - p) + 1;
+        p = q + 1;
+    }
+    return false;
+}
+bool sniff(const void* buf, size_t n)
+{
+    if (!buf || n < 8 || n > kSniffBytes) return false;
+    const char* d = static_cast<const char*>(buf);
+    return contains(d, n, "cale", 4) || contains(d, n, "ercent", 6) || contains(d, n, "c\0a\0l\0e\0", 8) ||
+           contains(d, n, "e\0r\0c\0e\0n\0t\0", 12);
+}
+// Starts tracking `h` when it names a candidate settings file (path checked here, outside g_m).
+// `why` goes in the log. True when tracked now.
+bool adopt(HANDLE h, const char* why)
+{
+    {
+        std::lock_guard<std::mutex> lk(g_m);
+        if (!(g_fraction > 0)) return false;
+        if (g_handles.count(h)) return true; // tracked by another thread meanwhile
+    }
+    ++t_inside;
+    Tracked t;
+    bool ok = identity(h, &t.volume, &t.index);
+    if (ok) {
+        std::lock_guard<std::mutex> lk(g_m);
+        const auto id = std::make_pair(t.volume, t.index);
+        if (std::find(g_rejected.begin(), g_rejected.end(), id) != g_rejected.end()) { --t_inside; return false; }
+    }
+    if (ok) {
+        t.path = final_path(h, L"");
+        ok = !t.path.empty() && candidate(t.path);
+    }
+    ULONG mode = 0;
+    IoSb io{};
+    const bool sync = ok && p_query_file && p_query_file(h, &io, &mode, sizeof mode, 16 /*FileModeInformation*/) == 0 &&
+                      (mode & 0x30 /*FILE_SYNCHRONOUS_IO_ALERT | _NONALERT*/) != 0;
+    --t_inside;
+    std::lock_guard<std::mutex> lk(g_m);
+    if (!ok) {
+        if (t.index || t.volume) {
+            if (g_rejected.size() >= 512) g_rejected.erase(g_rejected.begin(), g_rejected.begin() + 256);
+            g_rejected.emplace_back(t.volume, t.index);
+        }
+        return false;
+    }
+    bool known = false;
+    for (const Identity& k : g_known) known |= k.volume == t.volume && k.index == t.index;
+    t.read = t.write = true; // the game just read or wrote through it
+    t.overlapped = !sync;    // unknown mode is treated as asynchronous: saves are not substituted
+    char line[700];
+    std::snprintf(line, sizeof line, "%s of %s through a handle we did not see opened%s%s: now tracked", why, utf8(t.path).c_str(),
+                  known ? " (same file as an open we saw)" : "", sync ? "" : " (asynchronous handle)");
+    log_line(line);
+    ++g_stats.handles_adopted;
+    if (g_handles.size() > 256) g_handles.clear();
+    g_handles[h] = std::move(t);
+    track_slot(h);
+    return true;
+}
+
 LONG NTAPI nt_read(HANDLE h, HANDLE ev, PVOID apc, PVOID ctx, IoSb* io, PVOID buf, ULONG n, PLARGE_INTEGER off, PULONG key)
 {
     const LONG st = o_ntread(h, ev, apc, ctx, io, buf, n, off, key);
-    if (t_inside || !tracked_fast(h)) return st;
+    if (t_inside) return st;
+    if (!tracked_fast(h)) {
+        if (st != 0 || !io || !g_any_candidate.load(std::memory_order_acquire) || !sniff(buf, io->Information) || !adopt(h, "read"))
+            return st;
+    }
     if (st == kStatusPending) { note_async_read(h, n); return st; }
     if (st != 0 || !buf || !io || !io->Information) return st; // STATUS_SUCCESS only: the bytes are in buf now
     inspect_read(h, buf, static_cast<size_t>(io->Information));
     return st;
 }
 
-// Diagnostics only: a tracked settings file mapped into memory is read without NtReadFile.
+// Diagnostics only: a candidate settings file mapped into memory is read without NtReadFile.
+// NtCreateSection is under every file mapping (CreateFileMapping* and the loader alike).
 void note_mapping(HANDLE file)
 {
-    if (t_inside || !file || file == INVALID_HANDLE_VALUE || !tracked_fast(file)) return;
-    std::lock_guard<std::mutex> lk(g_m);
-    const auto it = g_handles.find(file);
-    if (it == g_handles.end() || it->second.map_logged || !still_same(file, it->second)) return;
-    it->second.map_logged = true;
-    ++g_stats.files_mapped;
-    char line[600];
-    std::snprintf(line, sizeof line, "%s is read through a file mapping: not inspected", utf8(it->second.path).c_str());
-    log_line(line);
-}
-HANDLE WINAPI map_w(HANDLE f, LPSECURITY_ATTRIBUTES sa, DWORD prot, DWORD hi, DWORD lo, LPCWSTR name)
-{
-    const HANDLE m = o_map_w(f, sa, prot, hi, lo, name);
-    if (m) note_mapping(f);
-    return m;
-}
-HANDLE WINAPI map_a(HANDLE f, LPSECURITY_ATTRIBUTES sa, DWORD prot, DWORD hi, DWORD lo, LPCSTR name)
-{
-    ++t_inside; // may forward to CreateFileMappingW: observe once, here
-    const HANDLE m = o_map_a(f, sa, prot, hi, lo, name);
+    if (t_inside || !file || file == INVALID_HANDLE_VALUE || !g_any_candidate.load(std::memory_order_acquire)) return;
+    ++t_inside;
+    DWORD v = 0;
+    uint64_t i = 0;
+    const bool id = identity(file, &v, &i);
     --t_inside;
-    if (m) note_mapping(f);
-    return m;
+    if (!id) return;
+    std::lock_guard<std::mutex> lk(g_m);
+    for (const Identity& k : g_known) {
+        if (k.volume != v || k.index != i) continue;
+        ++g_stats.files_mapped;
+        if (g_stats.files_mapped > 8) return; // logged a few times, not per view
+        char line[600];
+        std::snprintf(line, sizeof line, "%s is read through a file mapping: not inspected", utf8(k.path).c_str());
+        log_line(line);
+        return;
+    }
+}
+LONG NTAPI nt_section(PHANDLE sec, ACCESS_MASK access, PVOID oa, PLARGE_INTEGER max, ULONG prot, ULONG attrib, HANDLE file)
+{
+    const LONG st = o_ntsection(sec, access, oa, max, prot, attrib, file);
+    if (st == 0 && file && !(attrib & 0x01000000 /*SEC_IMAGE*/)) note_mapping(file);
+    return st;
 }
 
 // A value in the game's save is one we put there: the substituted text, or (any formatting)
@@ -359,7 +457,9 @@ bool ours_value(const Patched& p, const std::string& text, double v)
 
 LONG NTAPI nt_write(HANDLE h, HANDLE ev, PVOID apc, PVOID ctx, IoSb* io, PVOID buf, ULONG n, PLARGE_INTEGER off, PULONG key)
 {
-    if (!buf || !n || t_inside || !tracked_fast(h)) return o_ntwrite(h, ev, apc, ctx, io, buf, n, off, key);
+    if (!buf || !n || t_inside) return o_ntwrite(h, ev, apc, ctx, io, buf, n, off, key);
+    if (!tracked_fast(h) && !(g_any_patch.load(std::memory_order_acquire) && sniff(buf, n) && adopt(h, "save")))
+        return o_ntwrite(h, ev, apc, ctx, io, buf, n, off, key);
     std::string fixed;
     {
         std::lock_guard<std::mutex> lk(g_m);
@@ -462,9 +562,9 @@ bool InstallSettingsReadHook()
     if (!kb) return false;
     void* cw = reinterpret_cast<void*>(GetProcAddress(kb, "CreateFileW"));
     void* ca = reinterpret_cast<void*>(GetProcAddress(kb, "CreateFileA"));
-    void* mw = reinterpret_cast<void*>(GetProcAddress(kb, "CreateFileMappingW"));
-    void* ma = reinterpret_cast<void*>(GetProcAddress(kb, "CreateFileMappingA"));
     HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    void* cs = nt ? reinterpret_cast<void*>(GetProcAddress(nt, "NtCreateSection")) : nullptr;
+    p_query_file = nt ? reinterpret_cast<NtQueryInformationFileFn>(GetProcAddress(nt, "NtQueryInformationFile")) : nullptr;
     void* rf = nt ? reinterpret_cast<void*>(GetProcAddress(nt, "NtReadFile")) : nullptr;
     void* wf = nt ? reinterpret_cast<void*>(GetProcAddress(nt, "NtWriteFile")) : nullptr;
     if (!cw || !ca || !rf || !wf || !na::hooking::Initialize()) return false;
@@ -474,8 +574,7 @@ bool InstallSettingsReadHook()
         !na::hooking::PrepareHook(ca, reinterpret_cast<void*>(&create_a), reinterpret_cast<void**>(&o_create_a)) ||
         !na::hooking::PrepareHook(rf, reinterpret_cast<void*>(&nt_read), reinterpret_cast<void**>(&o_ntread)) ||
         !na::hooking::PrepareHook(wf, reinterpret_cast<void*>(&nt_write), reinterpret_cast<void**>(&o_ntwrite)) ||
-        (mw && !na::hooking::PrepareHook(mw, reinterpret_cast<void*>(&map_w), reinterpret_cast<void**>(&o_map_w))) ||
-        (ma && !na::hooking::PrepareHook(ma, reinterpret_cast<void*>(&map_a), reinterpret_cast<void**>(&o_map_a)))) {
+        (cs && !na::hooking::PrepareHook(cs, reinterpret_cast<void*>(&nt_section), reinterpret_cast<void**>(&o_ntsection)))) {
         na::hooking::AbandonInstall();
         na::hooking::Shutdown();
         return false;
