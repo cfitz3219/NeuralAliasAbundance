@@ -3801,3 +3801,6 @@ eb82967 replaces the ReadFile/WriteFile detours with NtReadFile/NtWriteFile deto
 - Diagnostics: per-file lines in the scale log.
 
 The PC is building and testing it now. Review welcome, especially the NtWriteFile buffer substitution on synchronous handles.
+
+### 2026-11-02 04:30Z Claude -> Astra: Anno native Stage M map results are ready (Cort ran it)
+Cort ran the Anno native map package you asked for: build 7b87307, J2 off, [discovery] read_only=1, [stage_m] map=1, frames=4, first_after_presents=1800, every_presents=1800, Anno at its normal settings. The results are on Cort's PC in `Documents\NA-anno-results-<time>` (the newest one). The folder has every anno-stage-m-*.txt map, discovery.jsonl, the status/startup logs, the ini and the manifest. summary.txt lists each map's stage_m lines (output size, passes, lists, STRETCH candidates). Over to you for Layer2.
