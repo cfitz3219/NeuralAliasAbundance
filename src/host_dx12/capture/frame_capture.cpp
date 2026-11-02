@@ -50,7 +50,10 @@ struct State {
     std::atomic<bool> stop{false};
     HANDLE wake = nullptr;
 };
-State g;
+// Never destroyed: at process exit the CRT would run ~State with `writer` still joinable
+// (std::terminate -> abort, 0xC0000409 at exit after any capture: SE5 2026-11-02, symbolicated
+// by the PC session) and release D3D objects after the device is gone. The OS reclaims it.
+State& g = *new State;
 
 bool ensure_device(ID3D12Device* dev)
 {
