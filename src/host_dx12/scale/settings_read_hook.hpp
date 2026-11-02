@@ -13,8 +13,10 @@
 // its value in the cases we intercept, not unconditionally.
 // A tracked handle is re-identified by volume + file index (handle values are reused).
 // Mapped reads (Sniper Elite 5 maps GraphicsOptions.ini): a read-only section on a candidate file
-// is created copy-on-write capable (needs only read access), and its first view is substituted in
-// PRIVATE copy-on-write pages, which are never written back to the file.
+// is replaced by a pagefile-backed section holding the substituted bytes (read through our own
+// handle), so every view of it shows our value however it is mapped; the file is never written.
+// Fallback when that fails: the section is created copy-on-write capable and its first view is
+// substituted in private copy-on-write pages.
 // Reads/saves on handles whose open was not seen are recognised by their bytes, then their path.
 // J2 confirms in the same launch (its detected render extent); nothing here assumes success.
 //

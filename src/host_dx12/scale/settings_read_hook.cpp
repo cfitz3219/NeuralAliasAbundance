@@ -80,7 +80,7 @@ std::vector<std::pair<DWORD, uint64_t>> g_rejected;
 // Sections created on a candidate settings file (mapped route, SE5 2026-11-02). Each is created
 // copy-on-write capable, and its first view gets the substitution in PRIVATE pages: a
 // copy-on-write page is never written back to the file.
-struct SettingsSection { HANDLE section; std::wstring path; DWORD volume; uint64_t index; bool writecopy; };
+struct SettingsSection { HANDLE section; std::wstring path; DWORD volume; uint64_t index; bool writecopy; bool substituted; };
 std::vector<SettingsSection> g_sections;
 std::atomic<int> g_section_count{0}; // g_sections.size(), readable without g_m (fast path)
 std::vector<Identity> g_known;            // candidate files opened for reading (bounded)
@@ -459,6 +459,65 @@ bool known_mapping_file(HANDLE file, DWORD* v, uint64_t* i, std::wstring* path)
     return true;
 }
 
+// Reads the whole settings file through our own handle (the game's handle and file position are
+// left alone), substitutes, and creates a pagefile-backed section of the same size holding those
+// bytes, returned to the game in place of the file-backed one. False (nothing created) when the
+// file has no render-scale key or anything fails: the caller then maps the file as the game asked.
+bool substitute_section(PHANDLE sec, ACCESS_MASK access, PVOID oa, PLARGE_INTEGER max, const std::wstring& path, DWORD v,
+                        uint64_t i, LONG* st_out)
+{
+    if (!sec) return false;
+    ++t_inside;
+    std::string bytes;
+    const HANDLE f = o_create_w(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        char buf[16384];
+        DWORD r = 0;
+        while (bytes.size() <= kMaxFileBytes && ReadFile(f, buf, sizeof buf, &r, nullptr) && r) bytes.append(buf, r);
+        CloseHandle(f);
+    }
+    --t_inside;
+    if (bytes.empty() || bytes.size() > kMaxFileBytes) return false;
+    {
+        Match m; // cheap pre-check outside the lock: no key, nothing to substitute
+        const bool wide = LooksUtf16LE(bytes.data(), bytes.size());
+        const std::string view = wide ? NarrowUtf16LE(bytes.data(), bytes.size()) : bytes;
+        if (!FindRenderScale(view.data(), view.size(), &m)) return false;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_m);
+        Tracked t;
+        t.path = path;
+        t.volume = v;
+        t.index = i;
+        t.read = true;
+        const uint64_t before = g_stats.reads_patched;
+        patch_locked(t, bytes.data(), bytes.size());
+        if (g_stats.reads_patched == before) return false; // found but not substitutable: the game's own bytes
+    }
+    LARGE_INTEGER size{};
+    size.QuadPart = static_cast<LONGLONG>(bytes.size());
+    if (max && max->QuadPart > size.QuadPart) size = *max; // the game asked for more: zero-filled like a file mapping
+    const ACCESS_MASK acc = access | SECTION_MAP_READ | SECTION_MAP_WRITE | SECTION_QUERY;
+    const LONG st = o_ntsection(sec, acc, oa, &size, PAGE_READWRITE, SEC_COMMIT, nullptr);
+    if (st != 0 || !*sec) return false;
+    ++t_inside;
+    void* w = MapViewOfFile(*sec, FILE_MAP_WRITE, 0, 0, 0);
+    if (w) {
+        std::memcpy(w, bytes.data(), bytes.size());
+        UnmapViewOfFile(w);
+    }
+    --t_inside;
+    if (!w) {
+        CloseHandle(*sec);
+        *sec = nullptr;
+        return false;
+    }
+    *st_out = st;
+    return true;
+}
+
 // NtCreateSection is under every file mapping (CreateFileMapping* and the loader alike).
 LONG NTAPI nt_section(PHANDLE sec, ACCESS_MASK access, PVOID oa, PLARGE_INTEGER max, ULONG prot, ULONG attrib, HANDLE file)
 {
@@ -472,24 +531,32 @@ LONG NTAPI nt_section(PHANDLE sec, ACCESS_MASK access, PVOID oa, PLARGE_INTEGER 
         std::lock_guard<std::mutex> lk(g_m);
         fraction = g_fraction;
     }
-    // A read-only section is created copy-on-write capable instead (needs only read access to
-    // the file); views stay read-only unless we make a private copy of their pages.
+    // First choice (2026-11-02, SE5 pid 38132: its section was created but no view of it ever
+    // reached our map hooks): hand the game a PAGEFILE-backed section holding the substituted
+    // bytes. However it then maps the section, it sees our value; the file is never involved.
     LONG st = -1;
+    bool substituted = false;
+    if (fraction > 0 && (prot == PAGE_READONLY || prot == PAGE_WRITECOPY))
+        substituted = substitute_section(sec, access, oa, max, path, v, i, &st);
     bool writecopy = false;
-    if (fraction > 0 && prot == PAGE_READONLY) {
+    // Otherwise a read-only section is created copy-on-write capable (needs only read access to
+    // the file); views stay read-only unless we make a private copy of their pages.
+    if (!substituted && fraction > 0 && prot == PAGE_READONLY) {
         st = o_ntsection(sec, access, oa, max, PAGE_WRITECOPY, attrib, file);
         writecopy = st == 0;
     }
-    if (!writecopy) st = o_ntsection(sec, access, oa, max, prot, attrib, file);
+    if (!writecopy && !substituted) st = o_ntsection(sec, access, oa, max, prot, attrib, file);
     std::lock_guard<std::mutex> lk(g_m);
     ++g_stats.files_mapped;
     char line[700];
-    std::snprintf(line, sizeof line, "%s is read through a file mapping (protection 0x%lx%s, status 0x%lx)", utf8(path).c_str(),
-                  static_cast<unsigned long>(prot), writecopy ? ", created copy-on-write capable" : "", static_cast<unsigned long>(st));
+    std::snprintf(line, sizeof line, "%s is read through a file mapping (protection 0x%lx, attributes 0x%lx%s, status 0x%lx)",
+                  utf8(path).c_str(), static_cast<unsigned long>(prot), static_cast<unsigned long>(attrib),
+                  substituted ? ", the game gets our private copy" : writecopy ? ", created copy-on-write capable" : "",
+                  static_cast<unsigned long>(st));
     log_line(line);
     if (st == 0 && sec && *sec) {
         if (g_sections.size() >= 16) g_sections.erase(g_sections.begin());
-        g_sections.push_back({*sec, path, v, i, writecopy});
+        g_sections.push_back({*sec, path, v, i, writecopy, substituted});
         g_section_count.store(static_cast<int>(g_sections.size()), std::memory_order_release);
     }
     return st;
@@ -508,6 +575,12 @@ void on_view(HANDLE section, HANDLE process, PVOID* base, PSIZE_T size, ULONG pr
     g_sections.erase(it); // one view per section creation: a reused section handle is never patched
     g_section_count.store(static_cast<int>(g_sections.size()), std::memory_order_release);
     char line[700];
+    if (sct.substituted) { // already holds our bytes: just confirm the game looked at it
+        std::snprintf(line, sizeof line, "the game mapped our copy of %s (%zu bytes, protection 0x%lx)", utf8(sct.path).c_str(),
+                      static_cast<size_t>(*size), static_cast<unsigned long>(protect));
+        log_line(line);
+        return;
+    }
     if (!(g_fraction > 0)) return;
     char* d = static_cast<char*>(*base);
     const size_t n = strnlen(d, (std::min)(static_cast<size_t>(*size), static_cast<size_t>(kMaxFileBytes)));

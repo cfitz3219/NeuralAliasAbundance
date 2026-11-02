@@ -215,7 +215,7 @@ int main()
     CHECK(lg.find("patched read of") != std::string::npos && lg.find("kept the original") != std::string::npos);
     CHECK(lg.find("asynchronously") != std::string::npos && lg.find("is the control") != std::string::npos);
     CHECK(lg.find("through a handle we did not see opened") != std::string::npos);
-    CHECK(lg.find("private copy-on-write pages") != std::string::npos);
+    CHECK(lg.find("the game gets our private copy") != std::string::npos && lg.find("the game mapped our copy") != std::string::npos);
     DeleteFileW(opt.c_str());
     DeleteFileW(other.c_str());
     DeleteFileW(log.c_str());
