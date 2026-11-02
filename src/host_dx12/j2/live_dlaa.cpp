@@ -1024,14 +1024,33 @@ bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth
         return true;
     }
     // 2. A full search; a few candidates are compared the same way before the slot is relearned.
+    struct BlockNote { uint32_t param, size, uses, read; bool table; uint32_t vp, inv, proj, view; };
+    std::vector<BlockNote> notes;
+    CamPick loose;               // a ViewProjection WITHOUT its inverse that continues the main camera
+    bool have_loose = false;     // (accepted for this frame only; the slot is not relearned from it)
     for (const Block* o : order) {
         if (picks.size() >= 4) break;
         na::camera::Snapshot s{};
-        if (!read_block(o, s)) continue;
+        const bool read_ok = read_block(o, s);
+        const bool noted = notes.size() < 12;
+        if (noted) notes.push_back({o->param, o->size, o->uses, read_ok ? static_cast<uint32_t>(s.bytes.size()) : 0u, o->table, 0, 0, 0, 0});
+        if (!read_ok) continue;
         const auto scan = na::camera::FindMatrices(s);
         g_cd.cands += scan.candidates.size();
         for (const auto& c : scan.candidates) {
+            if (noted) {
+                BlockNote& bn = notes.back();
+                if (c.kind == na::camera::Kind::ViewProjection) { ++bn.vp; if (c.has_inverse_pair) ++bn.inv; }
+                else if (c.kind == na::camera::Kind::Projection) ++bn.proj;
+                else ++bn.view;
+            }
             if (c.kind == na::camera::Kind::ViewProjection) ++g_cd.vp;
+            if (c.kind == na::camera::Kind::ViewProjection && !c.has_inverse_pair && !have_loose && same_camera(c.matrix)) {
+                loose.vp = c.matrix;
+                loose.reversed = c.reversed;
+                loose.block = o;
+                have_loose = true;
+            }
             if (c.kind != na::camera::Kind::ViewProjection || !c.has_inverse_pair) continue;
             CamPick k;
             k.vp = c.matrix;
@@ -1051,12 +1070,35 @@ bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth
         }
     }
     const CamPick* p = picks.empty() ? nullptr : best_pick(picks);
+    if (!p && have_loose) {
+        // The main camera's ViewProjection without an inverse beside it (a smaller per-view
+        // block): the tracker inverts it itself; the inverse pair was only a validation, and
+        // continuity with the last main camera validates it instead. The slot is left as learned.
+        ++g.stats.camera_inverse_computed;
+        *vp = loose.vp;
+        *reversed = loose.reversed;
+        g_injected = false;
+        return true;
+    }
     if (!p) {
         // Why the camera was lost (diagnostics for frames like Sniper's steep views).
         if (!g_cd.read) ++g.stats.camera_lost_unread;
         else if (!g_cd.vp) ++g.stats.camera_lost_no_vp;
         else ++g.stats.camera_lost_no_inverse;
         if (g_cd.blocks >= kMaxBlocks) ++g.stats.camera_lost_capped;
+        // What the frame held (the last loss only; the status log writes it).
+        char* t = g.stats.camera_lost_evidence;
+        size_t cap = sizeof g.stats.camera_lost_evidence;
+        int n = std::snprintf(t, cap, "frame=%llu lists=%zu binds=%zu blocks=%zu read=%zu vp=%zu cands=%zu learned{param=%lld table=%d off=%lld inv=%lld} main_cam=%d blocks[param/table size uses read vp/inv/proj/view]:",
+                              static_cast<unsigned long long>(g.frame), g_cd.lists, g_cd.binds, g_cd.blocks, g_cd.read, g_cd.vp, g_cd.cands,
+                              static_cast<long long>(g.camera_param), g.camera_table ? 1 : 0, static_cast<long long>(g.camera_offset),
+                              static_cast<long long>(g.camera_inv_delta), g_jit_cam.valid ? 1 : 0);
+        for (const auto& bn : notes) {
+            if (n < 0 || static_cast<size_t>(n) >= cap) break;
+            const int m = std::snprintf(t + n, cap - static_cast<size_t>(n), " %u/%d %u %u %u %u/%u/%u/%u", bn.param, bn.table ? 1 : 0, bn.size, bn.uses, bn.read, bn.vp, bn.inv, bn.proj, bn.view);
+            if (m < 0) break;
+            n += m;
+        }
         return false;
     }
     g.camera_offset = p->offset;
@@ -1301,6 +1343,11 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     }
     const double zero[2] = {0, 0};
     const double* injected = saved ? saved->jitter : g_injected ? g.jit.px : zero; // sample belongs to the captured camera
+    if (!saved && !g_injected && g.jitter_on) { // a DLAA frame without J1's jitter: why
+        if (!g.jit.valid) ++g.stats.unjit_no_sample;
+        else if (!g.jit.applied) ++g.stats.unjit_not_applied;
+        else ++g.stats.unjit_not_held;
+    }
     pending.tracker = g.tracker;
     // DLSS's history is the last frame it evaluated, and the tracker's previous
     // camera is that same frame, so motion stays correct across a few skipped game
@@ -1941,6 +1988,12 @@ void OnPresent(ID3D12CommandQueue* queue)
             na::capture::j2::OnFrameClosed(g.frame, late - g.route_prev_late); // evidence capture identity
             o.camera_missed = g.stats.no_camera > g.route_prev_no_camera;
             o.depth_state_missed = g.stats.no_state > g.route_prev_no_state;
+            if (!o.executed && g.stats.frames) { // a present without DLAA, once DLAA has run at all: why
+                if (o.camera_missed) ++g.stats.miss_no_camera;
+                else if (o.depth_state_missed) ++g.stats.miss_no_state;
+                else if (g.inline_mode && g.inl_frame != g.frame) ++g.stats.miss_no_candidate;
+                else ++g.stats.miss_other;
+            }
             {
                 // Current-frame ownership by a supported upscaler: the GAME's own evaluations
                 // this frame (J2's NGX calls are marked as injector calls and excluded).

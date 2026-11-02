@@ -162,6 +162,14 @@ struct Stats {
     // block bound was reached.
     uint64_t camera_contested = 0, camera_alternatives = 0, jitter_slot_other_camera = 0;
     uint64_t camera_lost_unread = 0, camera_lost_no_vp = 0, camera_lost_no_inverse = 0, camera_lost_capped = 0;
+    // SE5 2026-11-02 (Cort: the camera fix changed nothing): per PRESENT, why the frame ended
+    // without DLAA, and why a DLAA frame ran without J1's jitter. Counted once per present.
+    uint64_t miss_no_camera = 0, miss_no_state = 0, miss_no_candidate = 0, miss_other = 0;
+    uint64_t unjit_no_sample = 0;    // no jitter sample was started in any earlier batch
+    uint64_t unjit_not_applied = 0;  // started, but no camera block was rewritten
+    uint64_t unjit_not_held = 0;     // rewritten, but the camera the scene list used did not hold it
+    uint64_t camera_inverse_computed = 0; // a ViewProjection without its inverse, continuing the main camera, accepted
+    char camera_lost_evidence[480] = {};  // the last lost frame: every block searched and what it held
     int64_t camera_inv_delta = 0; // bytes from the ViewProjection to its inverse in the camera block
     int64_t camera_proj_delta = 0; // bytes to the camera's separate projection matrix (0 = none found)
     uint64_t jitter_proj_writes = 0; // J1: projection matrices replaced by jittered copies
