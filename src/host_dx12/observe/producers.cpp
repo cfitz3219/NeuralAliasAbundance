@@ -269,8 +269,10 @@ struct ResKnown {
     uint8_t reset_why = 0;  // diagnostics: why its states last became unknown (KnownReset)
 };
 // Why a carried state became unknown (diagnostics only; DescribeStateEvidence names it).
-enum KnownReset : uint8_t { kResetNone, kResetStoreClear, kResetOverlap, kResetUnordered, kResetOtherQueue, kResetSubs, kResetPendingNote };
-const char* const kResetNames[] = {"none", "store_clear", "overlapped_submissions", "unordered_submission", "other_queue", "too_many_subresources", "split_or_aliasing_barrier"};
+enum KnownReset : uint8_t { kResetNone, kResetStoreClear, kResetOverlap, kResetUnordered, kResetOtherQueue, kResetSubs, kResetPendingNote,
+                            kResetAmbiguous, kResetTainted, kResetEpoch, kResetCopyQueue };
+const char* const kResetNames[] = {"none", "store_clear", "overlapped_submissions", "unordered_submission", "other_queue", "too_many_subresources", "split_or_aliasing_barrier",
+                                   "ambiguous_queue_order", "unknown_submission_in_flight", "store_cleared_meanwhile", "copy_queue_decay"};
 constexpr size_t kMaxKnown = 65536, kMaxKnownSubs = 64;
 std::mutex g_known_m;
 std::unordered_map<na_object_id, ResKnown> g_known; // under g_known_m (never taken before g_m or g_samples_m)
@@ -4133,7 +4135,8 @@ void known_publish(SubmissionCapture& c, na_object_id qid, bool ambiguous)
         auto it = g_known.find(m.id);
         if (it == g_known.end()) continue; // retired meanwhile
         if (valid && m.alone && it->second.mark_seq == m.seq) good.push_back(m.id);
-        else known_reset_locked(it->second, valid ? kResetOverlap : kResetUnordered); // overlapped / ambiguous / cleared / copy-queue decay
+        else known_reset_locked(it->second, valid ? kResetOverlap : ambiguous ? kResetAmbiguous : c.tainted ? kResetTainted :
+                                             c.epoch != g_known_epoch ? kResetEpoch : kResetCopyQueue); // the exact cause, for the log
     }
     std::sort(good.begin(), good.end());
     std::vector<na_object_id> claimed; // ids whose queue ownership was settled in this publication
