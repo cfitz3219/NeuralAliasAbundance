@@ -855,6 +855,85 @@ bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& in_byt
     return false;
 }
 
+// Projection window: matrices the game DERIVED from its camera (inverse projection,
+// clip->UV / pixel transforms of VP or P, the inverse VP times a UV->clip transform, and
+// the same of the previous VP) are rebased onto the windowed camera, in any bound block.
+// Generic: core/projection_window.hpp derive_rebase recognises only screen-like transforms
+// of THIS frame's camera (canonical values, rebuilt to float precision), so another
+// camera, a camera pan or arbitrary data is never touched.
+struct DerivedBase { na::camera::Matrix b{}, binv{}, bnew{}, bnewinv{}; const char* name = ""; };
+struct DerivedBases { uint64_t frame = UINT64_MAX; uint32_t phase = 0; int count = 0; DerivedBase base[3]; } g_derived;
+void build_derived_bases()
+{
+    auto& d = g_derived;
+    if (d.frame == g.frame && d.phase == g.jit.phase) return;
+    d.frame = g.frame;
+    d.phase = g.jit.phase;
+    d.count = 0;
+    const auto L = g.jit.layout ? na::camera::Layout::ColumnMajor : na::camera::Layout::RowMajor;
+    auto add = [&](const uint8_t* orig, const uint8_t* rep, const char* name) {
+        const std::vector<uint8_t> ob(orig, orig + 64), rb(rep, rep + 64);
+        DerivedBase& x = d.base[d.count];
+        x.b = na::camera::LoadMatrix(ob, 0, L);
+        x.bnew = na::camera::LoadMatrix(rb, 0, L);
+        x.name = name;
+        if (na::camera::Invert(x.b, x.binv) && na::camera::Invert(x.bnew, x.bnewinv)) ++d.count;
+    };
+    add(g.jit.vp[g.jit.layout], g.jit.wvp[g.jit.layout], "VP");
+    if (g.jit.has_proj) add(g.jit.proj, g.jit.wproj, "P");
+    if (g.jit.has_prev) add(g.jit.prev, g.jit.wprev, "prevVP");
+}
+template <class JB>
+void window_derived(const JB& k, std::vector<uint8_t>& view, std::vector<bool>& touched)
+{
+    build_derived_bases();
+    const auto& d = g_derived;
+    if (!d.count) return;
+    const neural_alias::DerivedSpace space{double(g.win.w), double(g.win.h)};
+    const size_t n = view.size();
+    for (size_t o = 0; o + 64 <= n; o += 16) {
+        if (touched[o / 16]) continue;
+        // Cheap reject: a camera-derived matrix is never mostly zero or non-finite.
+        const float* f = reinterpret_cast<const float*>(view.data() + o);
+        int nz = 0;
+        bool finite = true;
+        for (int i = 0; i < 16; ++i) { if (!std::isfinite(f[i])) { finite = false; break; } if (f[i] != 0) ++nz; }
+        if (!finite || nz < 4) continue;
+        for (int l = 0; l < 2; ++l) {
+            const auto L = l ? na::camera::Layout::ColumnMajor : na::camera::Layout::RowMajor;
+            const auto m = na::camera::LoadMatrix(view, o, L);
+            int form = 0, bi = 0;
+            std::array<double, 16> out{};
+            for (; bi < d.count && !form; ++bi) {
+                const DerivedBase& x = d.base[bi];
+                form = neural_alias::derive_rebase(m, x.b, x.binv, x.bnew, x.bnewinv, space, out);
+            }
+            if (!form) continue;
+            --bi;
+            uint8_t rep[64];
+            na::camera::Matrix om{};
+            for (int i = 0; i < 16; ++i) om[i] = out[i];
+            store_matrix(om, L, rep);
+            if (std::memcmp(rep, view.data() + o, 64) &&
+                g.jitter_writes.Apply(k.res, k.off + o, view.data() + o, rep, [&] {
+                    return na::observe::WriteBuffer(k.res, k.off + o, rep, 64) == 64;
+                })) {
+                ++g.stats.jitter_writes;
+                if (form == 1) ++g.stats.window_derived_forward; else ++g.stats.window_derived_inverse;
+                // First kinds seen, for the log: e.g. "inv(P)+272c".
+                char tag[40];
+                std::snprintf(tag, sizeof tag, "%s(%s)+%u%s ", form == 1 ? "scr" : "inv", d.base[bi].name,
+                              static_cast<unsigned>(o), l ? "c" : "r");
+                auto& note = g.stats.window_derived_note;
+                if (!std::strstr(note, tag) && std::strlen(note) + std::strlen(tag) < sizeof note)
+                    std::strcat(note, tag);
+            }
+            touched[o / 16] = true;
+            break;
+        }
+    }
+}
+
 // Replaces this frame's VP / inverse in the bound constant buffers of this batch.
 // The frame's sample starts at the first block holding a VP + inverse at the
 // learned offset (blocks of the learned camera slot are tried first); then every
@@ -938,6 +1017,7 @@ void jitter_batch(ID3D12CommandList* const* lists, UINT count)
             }
         }
         const bool w = g.jit.windowed;
+        std::vector<bool> touched(n / 16 + 1, false);
         for (size_t o = 0; o + 64 <= n; o += 16)
             for (int l = 0; l < 2; ++l) {
                 const uint8_t* rep = nullptr;
@@ -958,8 +1038,9 @@ void jitter_batch(ID3D12CommandList* const* lists, UINT count)
                         else ++g.stats.window_prev_writes;
                     }
                 }
-                if (rep) break;
+                if (rep) { touched[o / 16] = true; break; }
             }
+        if (w) window_derived(*k, view, touched);
     }
 }
 

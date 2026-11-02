@@ -70,4 +70,51 @@ int main() { return test::run({
         test::invalid_argument([&] { window_projection(m, 0, 0.5); });
         test::invalid_argument([&] { window_projection(m, 0.5, 1.5); });
     }},
+    {"derived camera matrices (inverse projection, clip->UV) are recognised and rebased", [] {
+        const double W = 3440, H = 1440, sx = 2293.0 / W, sy = 960.0 / H;
+        const DerivedSpace sp{W, H};
+        const M p{1.2, 0, 0, 0, 0, 2.1, 0, 0, 0, 0, 0.001, 0.5, 0, 0, 1, 0};
+        const M vp = camera();
+        auto inv = [](const M& m) { // Gauss-Jordan
+            double a[4][8]{};
+            for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) { a[r][c] = m[r * 4 + c]; a[r][c + 4] = r == c; }
+            for (int c = 0; c < 4; ++c) {
+                int q = c; for (int r = c + 1; r < 4; ++r) if (std::fabs(a[r][c]) > std::fabs(a[q][c])) q = r;
+                for (int k = 0; k < 8; ++k) std::swap(a[c][k], a[q][k]);
+                const double d = a[c][c]; for (double& v : a[c]) v /= d;
+                for (int r = 0; r < 4; ++r) if (r != c) { const double f = a[r][c]; for (int k = 0; k < 8; ++k) a[r][k] -= f * a[c][k]; }
+            }
+            M o{}; for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) o[r * 4 + c] = a[r][c + 4]; return o;
+        };
+        auto near = [](const M& a, const M& b) { for (int i = 0; i < 16; ++i) if (std::fabs(a[i] - b[i]) > 1e-6 * (1 + std::fabs(b[i]))) return false; return true; };
+        const M wp = window_projection(p, sx, sy), wvp = window_projection(vp, sx, sy);
+        const M uv{.5, 0, 0, .5, 0, -.5, 0, .5, 0, 0, 1, 0, 0, 0, 0, 1};   // clip -> UV
+        const M uvi = inv(uv);                                            // UV -> clip
+        M out{};
+        CHECK(derive_rebase(inv(p), p, inv(p), wp, inv(wp), sp, out) == 2); CHECK(near(out, inv(wp)));
+        CHECK(derive_rebase(mat_mul(uv, vp), vp, inv(vp), wvp, inv(wvp), sp, out) == 1); CHECK(near(out, mat_mul(uv, wvp)));
+        CHECK(derive_rebase(mat_mul(inv(vp), uvi), vp, inv(vp), wvp, inv(wvp), sp, out) == 2); CHECK(near(out, mat_mul(inv(wvp), uvi)));
+        const M px{W / 2, 0, 0, W / 2, 0, -H / 2, 0, H / 2, 0, 0, 1, 0, 0, 0, 0, 1}; // clip -> native pixels
+        CHECK(derive_rebase(mat_mul(px, p), p, inv(p), wp, inv(wp), sp, out) == 1); CHECK(near(out, mat_mul(px, wp)));
+        // Not derived: another camera, the view alone, a pan of the camera (prev VP), noise.
+        M other = camera(); other[0] = 0.9; other[2] = 0.7;
+        CHECK(derive_rebase(other, vp, inv(vp), wvp, inv(wvp), sp, out) == 0);
+        M pan{1, 0, 0, 0.0137, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+        CHECK(derive_rebase(mat_mul(pan, vp), vp, inv(vp), wvp, inv(wvp), sp, out) == 0);
+        CHECK(derive_rebase(inv(mat_mul(pan, vp)), vp, inv(vp), wvp, inv(wvp), sp, out) == 0);
+        M id{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+        CHECK(derive_rebase(id, vp, inv(vp), wvp, inv(wvp), sp, out) == 0);
+        M noise{}; for (int i = 0; i < 16; ++i) noise[i] = std::sin(i * 1.7) * 3;
+        CHECK(derive_rebase(noise, vp, inv(vp), wvp, inv(wvp), sp, out) == 0);
+        M zero{}; CHECK(derive_rebase(zero, p, inv(p), wp, inv(wp), sp, out) == 0);
+        // Anno-like: a camera thousands of units from the origin, the game's inverse in float.
+        M far = vp; far[3] += 4200 * far[0] - 6100 * far[2]; far[7] += 4200 * far[4] - 6100 * far[6];
+        far[11] += 4200 * far[8] - 6100 * far[10]; far[15] += 4200 * far[12] - 6100 * far[14];
+        M finv = inv(far); for (double& v : finv) v = static_cast<float>(v);
+        M ff = far; for (double& v : ff) v = static_cast<float>(v);
+        const M wfar = window_projection(ff, sx, sy);
+        CHECK(derive_rebase(finv, ff, inv(ff), wfar, inv(wfar), sp, out) == 2);
+        M fuv = mat_mul(uv, ff); for (double& v : fuv) v = static_cast<float>(v);
+        CHECK(derive_rebase(fuv, ff, inv(ff), wfar, inv(wfar), sp, out) == 1);
+    }},
 }); }

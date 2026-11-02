@@ -253,6 +253,8 @@ struct Stats {
     uint64_t window_frames = 0, window_missed = 0, window_engagements = 0;
     uint64_t window_vp_writes = 0, window_inv_writes = 0, window_proj_writes = 0, window_prev_writes = 0, window_post_lists = 0;
     uint64_t window_scissored = 0, window_scissor_restored = 0;
+    uint64_t window_derived_forward = 0, window_derived_inverse = 0; // camera-derived matrices rebased (see window_derived)
+    char window_derived_note[160] = {};
     char window_note[120] = {};
     char upscale_note[160] = {};
     // Shape of the selected resources (reported even when J2 refuses them).
