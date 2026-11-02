@@ -36,7 +36,7 @@ Correction to earlier journal/interface wording: submitting the same direct comm
 
 These shaders are controlled DX12 fixtures, not DLSS or game-quality evidence. Full-suite totals and source receipts are recorded in WORKLOG/COMMS after the run.
 
-## Remaining integration
+## Remaining integration at ca61235 (historical; update below)
 
 The Layer 2 route is not automatically enabled in Anno. It still needs the same-launch native operation/dependency map, actual clear/copy/resolve and history routing for that group, and the shared J2 logical-to-physical input/output interface. Prepared binding plans and fallback helpers must be connected to that recognized closure. Typeless colour conversion and arbitrary bindless shader resource accesses are not supplied by the current typed-view helper.
 
@@ -47,3 +47,21 @@ Once those pieces are connected and the automated regressions pass, prepare the 
 - [Microsoft: setting descriptor heaps](https://learn.microsoft.com/en-us/windows/win32/direct3d12/setting-descriptor-heaps): a changed heap invalidates descriptor-table state, and SetDescriptorHeaps supplies all active heaps together.
 - [Microsoft: copying descriptors](https://learn.microsoft.com/en-us/windows/win32/direct3d12/copying-descriptors): CPU descriptor-copy sources must be non-shader-visible.
 - [Microsoft: ExecuteCommandLists](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12commandqueue-executecommandlists): the previous execution of a reused command list must have completed.
+
+## November 1 continuation: resource operations and frame ownership
+
+Merged the shared runtime through d6dc848 at 745acd1, preserving the Layer 2 raster/binding hooks, both build/test additions and both append-only journals. The shared J2 `PhysicalInputProvider` is now present in this branch.
+
+`TextureOperationHook` extends the existing command-list detours for RTV/DSV clears, whole-resource copies, texture-region copies and resolves. It adds no second API hook. A callback snapshot survives unregistration until After; native calls forward once or are completely replaced. Host operations never recurse into the callback. `PreparedTransfer` supplies private views, correctly remaps supported mip/slice indices, scales exactly representable boxes/rectangles, and balances private COMMON transitions. It retains resources/descriptors through executable recordings and all submitted uses. A copy with an outside-group endpoint or unrepresentable region is refused before private commands; the route's existing Refused callback owns promotion before forwarding.
+
+`SceneFrame` owns each admitted frame's prepared fallback and history work. It seeds identified colour histories from the previous full-size native image, with separate explicit states for the seed and finish boundaries. The owner marks actual written dependencies and marks the scene ready. Its J2 input carries the exact reduced colour/depth, full-size destination, states, extent and one group generation. A redirected but incomplete frame returns Unavailable. Finishing a failed/unavailable replacement restores the current colour and written dependencies, including depth, to their native size; finishing a successful replacement preserves the DLSS colour. Raster state is restored before the original full-size consumer/HUD continues.
+
+`PhysicalInputBridge` binds a frame to its actual list identity and recording generation using the existing RecordingLease. Inline J2 lookup uses that exact recording. `SubmissionScope` selects the same snapshot around a between-lists J2 call. Reset, stale identity, unrelated logical IDs and missing submission scope cannot reuse the previous frame. No second GPU-fence service is introduced.
+
+New/extended actual GPU tests cover the transfer hooks, partial-copy output, a 2x MSAA resolve, lifetime after completion versus Reset, history seed/copy-back, complete colour/depth promotion, native HUD pixels and preserved enhanced colour. The bridge's provided/unavailable/failure and inline/between/reset cases exercise the actual callback contract. The successful-colour fixture explicitly simulates an evaluated output; it is not a real neural-model image-quality result. Full-suite receipts are appended in WORKLOG and COMMS.
+
+The implemented transfer set is typed RTV/DSV clears and copies/resolves, not arbitrary UAV clears, ExecuteIndirect or render-pass rewriting. Frame promotion currently supports plain resolved members, typed colour and identified D32/R32 depth. The admitting map must exclude unresolved operations or promote before their native consumer; arbitrary bindless/typeless conversion is not supplied by this increment. No claim of complete coverage is inferred from the fixtures.
+
+### Integration input still needed from the game/recorder lane
+
+No usable same-launch native Anno dependency/binding map has been supplied. The existing Stage M PassMap diagnostic merges operations and approximates table reads with 16 slots; it is not itself an executable per-operation plan or proof of semantic dimension fields. The actual recognized map must select the complete group, typed views, dimension fields, current states, initialization/history and consumer boundaries; bind its frame through PhysicalInputBridge, use the scoped binding/transfer providers, and call Finish before each required native consumer. Those runtime admission/provider connections and actual Anno qualification are still pending, rather than secretly enabled from matching dimensions. No game deployment, installer publication or game launch occurred in this continuation; Cort retains game testing and the SE5 installer hold is preserved.

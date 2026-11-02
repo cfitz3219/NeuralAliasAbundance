@@ -8,6 +8,7 @@
 
 #include "queue_occurrences.hpp"
 #include "host_dx12/j2/insertion_trace.hpp"
+#include "host_dx12/observe/texture_operation.hpp"
 #include <tuple>
 #include <algorithm>
 #include <system_error>
@@ -3226,6 +3227,7 @@ struct ShaderHooks { std::shared_ptr<ShaderOperationHook> lane[2]; };
 auto& g_shader_hooks = *new std::shared_ptr<const ShaderHooks>();
 std::mutex g_shader_hooks_m;
 std::atomic<bool> g_shader_hooks_enabled{false};
+auto& g_texture_hook = *new std::shared_ptr<TextureOperationHook>();
 
 void capture_raster_targets(GL* list, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets,
     BOOL contiguous, const D3D12_CPU_DESCRIPTOR_HANDLE* depth)
@@ -3381,6 +3383,49 @@ struct ListHook<Slot, R(A...)> {
                         for (unsigned i = entered; i > 0; --i) if (hooks->lane[i - 1]) {
                             HostWorkScope own; hooks->lane[i - 1]->After(l, call, saved[i - 1]);
                         }
+                        return;
+                    }
+                }
+            }
+            if constexpr (Slot == sl::list::ClearRenderTargetView || Slot == sl::list::ClearDepthStencilView ||
+                          Slot == sl::list::CopyResource || Slot == sl::list::CopyTextureRegion || Slot == sl::list::ResolveSubresource) {
+                if (!t_host_work && scope.outermost && !scope.ambiguous) {
+                    const auto hook = std::atomic_load_explicit(&g_texture_hook, std::memory_order_acquire);
+                    if (hook) {
+                        TextureCall call;
+                        const auto args = std::forward_as_tuple(a...);
+                        if constexpr (Slot == sl::list::ClearRenderTargetView) {
+                            call.kind = TextureKind::ClearColor; call.target = std::get<0>(args);
+                            call.target_id = cpu_ref(call.target).resource;
+                            if (std::get<1>(args)) std::memcpy(call.color, std::get<1>(args), sizeof call.color);
+                            call.rect_count = std::get<2>(args); call.rects = std::get<3>(args);
+                        } else if constexpr (Slot == sl::list::ClearDepthStencilView) {
+                            call.kind = TextureKind::ClearDepth; call.target = std::get<0>(args);
+                            call.target_id = cpu_ref(call.target).resource; call.flags = std::get<1>(args);
+                            call.depth = std::get<2>(args); call.stencil = std::get<3>(args);
+                            call.rect_count = std::get<4>(args); call.rects = std::get<5>(args);
+                        } else if constexpr (Slot == sl::list::CopyResource) {
+                            call.kind = TextureKind::Copy; call.destination = std::get<0>(args); call.source = std::get<1>(args);
+                        } else if constexpr (Slot == sl::list::CopyTextureRegion) {
+                            call.kind = TextureKind::CopyRegion;
+                            if (std::get<0>(args)) call.destination_location = *std::get<0>(args);
+                            if (std::get<4>(args)) call.source_location = *std::get<4>(args);
+                            call.destination = call.destination_location.pResource; call.source = call.source_location.pResource;
+                            call.x = std::get<1>(args); call.y = std::get<2>(args); call.z = std::get<3>(args); call.box = std::get<5>(args);
+                        } else {
+                            call.kind = TextureKind::Resolve; call.destination = std::get<0>(args); call.destination_sub = std::get<1>(args);
+                            call.source = std::get<2>(args); call.source_sub = std::get<3>(args); call.format = std::get<4>(args);
+                        }
+                        ShaderScope saved;
+                        { HostWorkScope own; saved = hook->Before(l, call); }
+                        if (saved.action == ShaderAction::Replaced) {
+                            HostWorkScope own; hook->After(l, call, saved); return;
+                        }
+                        fn(l, a...);
+                        if constexpr (Slot == sl::list::CopyResource || Slot == sl::list::CopyTextureRegion || Slot == sl::list::ResolveSubresource)
+                            after_texture_copy(l, call.destination);
+                        On<Slot>::run(l, a...);
+                        { HostWorkScope own; hook->After(l, call, saved); }
                         return;
                     }
                 }
@@ -4953,6 +4998,10 @@ void SetShaderOperationHook(ShaderLane lane, std::shared_ptr<ShaderOperationHook
         std::atomic_store_explicit(&g_shader_hooks, std::shared_ptr<const ShaderHooks>(next), std::memory_order_release);
         g_shader_hooks_enabled.store(enabled, std::memory_order_release);
     } // old callbacks/resources can be destroyed outside the registration lock
+}
+void SetTextureOperationHook(std::shared_ptr<TextureOperationHook> hook)
+{
+    auto prior = std::atomic_exchange_explicit(&g_texture_hook, std::move(hook), std::memory_order_acq_rel);
 }
 void SetRasterStateTracking(bool enabled) { g_raster_tracking.store(enabled, std::memory_order_release); }
 bool ListRasterStateRestorable(ID3D12CommandList* list)

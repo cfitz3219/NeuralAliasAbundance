@@ -3,10 +3,12 @@
 #include "test_support.hpp"
 #include "host_dx12/scale/scoped_bindings.hpp"
 #include "host_dx12/scale/depth_restore.hpp"
+#include "host_dx12/scale/scene_frame.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/nr/native_fg.hpp"
 #include <d3dcompiler.h>
 #include <d3d12sdklayers.h>
+#include <cmath>
 namespace {
 using namespace na::scale;
 void __cdecl sink(const na_event_batch*, void*) {}
@@ -43,12 +45,13 @@ struct Readback {
         std::printf("%ux%u output, wrong pixels %u\n",w,h,wrong);CHECK(wrong==0);buffer->Unmap(0,nullptr);
     }
 };
-int Raster(test::Device& d)
+int Raster(test::Device& d, int frame_mode=0)
 {
     auto* dev=d.device.Get();constexpr UINT w=32,h=16,rw=21,rh=11;const auto fmt=DXGI_FORMAT_R32G32B32A32_FLOAT;
     na::observe::SetRasterStateTracking(true);
     auto color=test::CreateTexture(dev,w,h,fmt,D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     auto depth=test::CreateTexture(dev,w,h,DXGI_FORMAT_D32_FLOAT,D3D12_RESOURCE_STATE_DEPTH_WRITE,D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    auto history=test::CreateTexture(dev,w,h,fmt,D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     auto cb=test::CreateBuffer(dev,256,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);REQUIRE(color&&depth&&cb);
     const float source[4]={float(w),float(h),3,0};void* mapped=nullptr;REQUIRE(SUCCEEDED(cb->Map(0,nullptr,&mapped)));std::memcpy(mapped,source,sizeof source);
     const char code[]=R"(
@@ -76,9 +79,11 @@ float4 ps():SV_Target{return float4(width,rh,marker,.75);})";
     const auto rtv=rt->GetCPUDescriptorHandleForHeapStart(),dsv=ds->GetCPUDescriptorHandleForHeapStart();dev->CreateRenderTargetView(color.Get(),nullptr,rtv);dev->CreateDepthStencilView(depth.Get(),nullptr,dsv);
     D3D12_CONSTANT_BUFFER_VIEW_DESC cv{cb->GetGPUVirtualAddress(),256};dev->CreateConstantBufferView(&cv,heap->GetCPUDescriptorHandleForHeapStart());
     std::string error;std::shared_ptr<const SceneGroup> group;std::shared_ptr<const PreparedBindings> plan;std::shared_ptr<const ColorRestore> promote;
+    std::shared_ptr<SceneFrame> frame;PhysicalInputBridge bridge;
     {
         na::observe::HostWorkScope host;
-        group=SceneGroup::Create(dev,13,{w,h},{rw,rh},{{1,color.Get(),Role::Color,{rw,rh}},{2,depth.Get(),Role::Depth,{rw,rh}}},error);REQUIRE(group);
+        group=SceneGroup::Create(dev,13,{w,h},{rw,rh},{{1,color.Get(),Role::Color,{rw,rh}},{2,depth.Get(),Role::Depth,{rw,rh}},
+            {3,history.Get(),Role::History,{rw,rh}}},error);REQUIRE(group);
         auto constants=GpuConstants::Create(dev,cb.Get(),0,source,sizeof source,{{0,Scalar::Float,Dimension::Width,{w,h},{rw,rh}},
             {4,Scalar::Float,Dimension::Height,{w,h},{rw,rh}}},error);REQUIRE(constants);
         BindingSpec s;s.group=group;s.root=root;s.native_extent={w,h};s.render_extent={rw,rh};s.viewports={{0,0,float(w),float(h),0,1}};s.scissors={{0,0,LONG(w),LONG(h)}};
@@ -88,34 +93,79 @@ float4 ps():SV_Target{return float4(width,rh,marker,.75);})";
         s.uses={{1,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,D3D12_RESOURCE_STATE_RENDER_TARGET},{2,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,D3D12_RESOURCE_STATE_DEPTH_WRITE}};
         plan=PreparedBindings::Create(dev,s,error);REQUIRE(plan);
         promote=ColorRestore::Create(dev,group->Find(1)->reduced.Get(),color.Get(),0,fmt,error);REQUIRE(promote);
+        if(frame_mode){FrameSpec f;f.group=group;f.color=1;f.depth=2;f.members={{1,D3D12_RESOURCE_STATE_RENDER_TARGET},{2,D3D12_RESOURCE_STATE_DEPTH_WRITE},{3,D3D12_RESOURCE_STATE_RENDER_TARGET,true,D3D12_RESOURCE_STATE_RENDER_TARGET}};
+            frame=SceneFrame::Create(dev,f,error);REQUIRE(frame);}
     }
     auto provider=std::make_shared<Provider>();provider->plan=plan;
     na::observe::SetShaderOperationHook(na::observe::ShaderLane::Bindings,std::make_shared<BindingHook>(provider));
     Readback cr,dr,nr,nd;cr.Prepare(dev,group->Find(1)->reduced.Get());dr.Prepare(dev,group->Find(2)->reduced.Get());nr.Prepare(dev,color.Get());nd.Prepare(dev,depth.Get());
+    Readback history_seed,history_full;
+    test::ComPtr<ID3D12DescriptorHeap> history_views;
+    if(frame){na::observe::HostWorkScope host;
+        D3D12_DESCRIPTOR_HEAP_DESC hh{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,2,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
+        REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hh,IID_PPV_ARGS(&history_views))));
+        auto hc=history_views->GetCPUDescriptorHandleForHeapStart();dev->CreateRenderTargetView(history.Get(),nullptr,hc);
+        hc.ptr+=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);dev->CreateRenderTargetView(group->Find(3)->reduced.Get(),nullptr,hc);
+        history_seed.Prepare(dev,group->Find(3)->reduced.Get());history_full.Prepare(dev,history.Get());}
     test::List recording;REQUIRE(recording.Create(dev));auto* list=recording.list.Get();REQUIRE(SUCCEEDED(list->Close()));REQUIRE(SUCCEEDED(list->Reset(recording.alloc.Get(),nullptr)));
     provider->recording=list;
+    if(frame){REQUIRE(bridge.Bind(list,frame));std::shared_ptr<const na::j2::PhysicalInput> input;const auto callbacks=bridge.Callbacks();
+        CHECK(callbacks.lookup(callbacks.ctx,1,2,list,&input)==na::j2::PhysicalLookup::None);}
     const float clear[4]={0,0,0,0};list->ClearRenderTargetView(rtv,clear,0,nullptr);list->ClearDepthStencilView(dsv,D3D12_CLEAR_FLAG_DEPTH,.2f,0,0,nullptr);
     list->SetGraphicsRootSignature(root.Get());list->SetPipelineState(pso.Get());ID3D12DescriptorHeap* heaps[]{heap.Get()};list->SetDescriptorHeaps(1,heaps);
     list->SetGraphicsRootDescriptorTable(0,heap->GetGPUDescriptorHandleForHeapStart());list->SetGraphicsRootConstantBufferView(1,cb->GetGPUVirtualAddress());
     list->OMSetRenderTargets(1,&rtv,FALSE,&dsv);const D3D12_VIEWPORT vp{0,0,float(w),float(h),0,1};const D3D12_RECT sc{0,0,w,h};
     list->RSSetViewports(1,&vp);list->RSSetScissorRects(1,&sc);list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    if(frame){na::observe::HostWorkScope host;const float old_history[4]={99,77,4,.125f};
+        list->ClearRenderTargetView(history_views->GetCPUDescriptorHandleForHeapStart(),old_history,0,nullptr);
+        REQUIRE(frame->SeedHistories(list));history_seed.Record(list,group->Find(3)->reduced.Get(),D3D12_RESOURCE_STATE_COMMON);}
     list->DrawInstanced(3,1,0,0);provider->plan.reset(); // private complete21x11 colour/depth scene
+    if(frame){na::observe::HostWorkScope host;auto b=test::Transition(group->Find(3)->reduced.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_RENDER_TARGET);list->ResourceBarrier(1,&b);
+        auto hc=history_views->GetCPUDescriptorHandleForHeapStart();hc.ptr+=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        const float new_history[4]={5,6,7,.5f};list->ClearRenderTargetView(hc,new_history,0,nullptr);
+        std::swap(b.Transition.StateBefore,b.Transition.StateAfter);list->ResourceBarrier(1,&b);frame->Written(3);}
+    if(frame){frame->Written(1);frame->Written(2);std::shared_ptr<const na::j2::PhysicalInput> input;const auto callbacks=bridge.Callbacks();
+        CHECK(callbacks.lookup(callbacks.ctx,1,2,list,&input)==na::j2::PhysicalLookup::Unavailable);
+        CHECK(input&&input->generation==13);callbacks.outcome(callbacks.ctx,13,na::j2::PhysicalOutcome::Unavailable,"not ready");
+        if(frame_mode!=3){frame->Ready();CHECK(callbacks.lookup(callbacks.ctx,1,2,list,&input)==na::j2::PhysicalLookup::Provided);
+            CHECK(input&&input->color==group->Find(1)->reduced.Get()&&input->depth==group->Find(2)->reduced.Get());
+            CHECK(input&&input->output==color.Get()&&input->render_w==rw&&input->render_h==rh&&input->owner);
+            callbacks.outcome(callbacks.ctx,13,na::j2::PhysicalOutcome::Failed,"test model failure");}
+        {PhysicalInputBridge::SubmissionScope submission(bridge,list);
+            CHECK(callbacks.lookup(callbacks.ctx,1,2,nullptr,&input)==(frame_mode==3?na::j2::PhysicalLookup::Unavailable:na::j2::PhysicalLookup::Provided));
+            callbacks.outcome(callbacks.ctx,13,na::j2::PhysicalOutcome::Failed,"between-list failure");}
+        CHECK(callbacks.lookup(callbacks.ctx,1,2,nullptr,&input)==na::j2::PhysicalLookup::None);
+        CHECK(callbacks.lookup(callbacks.ctx,99,2,list,&input)==na::j2::PhysicalLookup::None&&!input);
+    }
     {
-        na::observe::HostWorkScope host;auto b=test::Transition(group->Find(1)->reduced.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);list->ResourceBarrier(1,&b);
-        REQUIRE(promote->Record(list));REQUIRE(na::observe::RestoreListState(list));std::swap(b.Transition.StateBefore,b.Transition.StateAfter);list->ResourceBarrier(1,&b);
+        na::observe::HostWorkScope host;
+        if(frame){
+            if(frame_mode==2){const float enhanced[4]={float(w+100),float(h+100),9,.75f};list->ClearRenderTargetView(rtv,enhanced,0,nullptr);
+                frame->Outcome(na::j2::PhysicalOutcome::Evaluated);}
+            REQUIRE(frame->Finish(list));
+        }else{auto b=test::Transition(group->Find(1)->reduced.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);list->ResourceBarrier(1,&b);
+            REQUIRE(promote->Record(list));REQUIRE(na::observe::RestoreListState(list));std::swap(b.Transition.StateBefore,b.Transition.StateAfter);list->ResourceBarrier(1,&b);}
     }
     const D3D12_RECT hud{29,13,32,16};list->RSSetScissorRects(1,&hud);list->DrawInstanced(3,1,0,0); // native dimensions, only9native HUD pixels
     {na::observe::HostWorkScope host;cr.Record(list,group->Find(1)->reduced.Get(),D3D12_RESOURCE_STATE_COMMON);dr.Record(list,group->Find(2)->reduced.Get(),D3D12_RESOURCE_STATE_COMMON);
         nr.Record(list,color.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET);nd.Record(list,depth.Get(),D3D12_RESOURCE_STATE_DEPTH_WRITE);}
+    if(frame){na::observe::HostWorkScope host;history_full.Record(list,history.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET);}
     REQUIRE(SUCCEEDED(list->Close()));static_cast<float*>(mapped)[2]=9;cb->Unmap(0,nullptr);ID3D12CommandList* lists[]{list};
     {na::nr::native::Submission receipt(d.queue.Get(),1,lists);d.queue->ExecuteCommandLists(1,lists);}d.WaitIdle();cr.Check(rw,rh,rw,rh);
     void* p=nullptr;REQUIRE(SUCCEEDED(nr.buffer->Map(0,nullptr,&p)));unsigned wrong=0;
     for(UINT y=0;y<h;++y)for(UINT x=0;x<w;++x){float v[4];std::memcpy(v,static_cast<char*>(p)+nr.fp.Offset+y*nr.fp.Footprint.RowPitch+x*16,16);const bool in_hud=x>=29&&y>=13;
-        wrong+=v[0]!=(in_hud?w:rw)||v[1]!=(in_hud?h:rh)||v[2]!=9||v[3]!=.75f;}nr.buffer->Unmap(0,nullptr);CHECK(wrong==0);
+        wrong+=v[0]!=(in_hud?w:frame_mode==2?w+100:rw)||v[1]!=(in_hud?h:frame_mode==2?h+100:rh)||v[2]!=9||v[3]!=.75f;}nr.buffer->Unmap(0,nullptr);CHECK(wrong==0);
     for(int which=0;which<2;++which){auto& rb=which?nd:dr;REQUIRE(SUCCEEDED(rb.buffer->Map(0,nullptr,&p)));wrong=0;const UINT tw=which?w:rw,th=which?h:rh;
         for(UINT y=0;y<th;++y)for(UINT x=0;x<tw;++x){float value;std::memcpy(&value,static_cast<char*>(p)+rb.fp.Offset+y*rb.fp.Footprint.RowPitch+x*4,4);
-            wrong+=value!=((!which||(x>=29&&y>=13))?.5f:.2f);}rb.buffer->Unmap(0,nullptr);CHECK(wrong==0);}
+            wrong+=value!=((frame_mode||!which||(x>=29&&y>=13))?.5f:.2f);}rb.buffer->Unmap(0,nullptr);CHECK(wrong==0);}
+    if(frame)for(int which=0;which<2;++which){auto& rb=which?history_full:history_seed;REQUIRE(SUCCEEDED(rb.buffer->Map(0,nullptr,&p)));wrong=0;
+        const UINT tw=which?w:rw,th=which?h:rh;const float old_history[4]={99,77,4,.125f},new_history[4]={5,6,7,.5f};
+        for(UINT y=0;y<th;++y)for(UINT x=0;x<tw;++x){float pixel[4];std::memcpy(pixel,static_cast<char*>(p)+rb.fp.Offset+y*rb.fp.Footprint.RowPitch+x*16,16);
+            for(int channel=0;channel<4;++channel)wrong+=std::fabs(pixel[channel]-(which?new_history[channel]:old_history[channel]))>.0001f;}
+        rb.buffer->Unmap(0,nullptr);CHECK(wrong==0);}
     REQUIRE(SUCCEEDED(list->Reset(recording.alloc.Get(),nullptr)));REQUIRE(SUCCEEDED(list->Close()));na::nr::native::Maintain();
+    if(frame){std::shared_ptr<const na::j2::PhysicalInput> input;const auto callbacks=bridge.Callbacks();
+        CHECK(callbacks.lookup(callbacks.ctx,1,2,list,&input)==na::j2::PhysicalLookup::None);}
     na::observe::SetShaderOperationHook(na::observe::ShaderLane::Bindings,{});na::observe::SetRasterStateTracking(false);return 0;
 }
 }
@@ -211,6 +261,7 @@ RWTexture2D<float4> target:register(u0);Texture2D<float> image:register(t0);Samp
     gate->Signal(1);d.WaitIdle();na::nr::native::Maintain();CHECK(lifetime.expired());
     reduced_rb.Check(rw,rh,rw,rh);native_rb.Check(w,h,w,h);
     REQUIRE(Raster(d)==0);
+    for(int mode=1;mode<=3;++mode)REQUIRE(Raster(d,mode)==0);
     na::observe::SetShaderOperationHook(na::observe::ShaderLane::Bindings,{});na_observe_stop();
     if(info)for(UINT64 i=0;i<info->GetNumStoredMessages();++i){SIZE_T n=0;info->GetMessage(i,nullptr,&n);std::vector<uint8_t> data(n);
         auto* m=reinterpret_cast<D3D12_MESSAGE*>(data.data());if(SUCCEEDED(info->GetMessage(i,m,&n))&&m->Severity<=D3D12_MESSAGE_SEVERITY_ERROR){
