@@ -2254,7 +2254,20 @@ void process_frame(ID3D12CommandQueue* queue, ID3D12Resource* frame)
     DXGI_COLOR_SPACE_TYPE cs = static_cast<DXGI_COLOR_SPACE_TYPE>(g_color_space.load(std::memory_order_acquire));
     na::nr::OnPresent(queue, frame, cs);      // live Neural Rendering (before capture and the menu)
     na::motion::OnPresent(queue, frame, cs);  // A52: live optical flow (after NR, before capture)
-    if (na::capture::Pending()) na::capture::OnPresent(queue, frame); // phase-1 capture
+    if (na::capture::Pending()) {
+        // What J2 did on this present (SE5 flashing, 2026-11-02): DLAA frames since the last
+        // present, its jitter, and the misses, so a flashing present can be matched to a cause.
+        static uint64_t pf = 0, pnc = 0, pns = 0, pcut = 0, pmc = 0;
+        const auto js = na::j2::GetStats();
+        char note[240];
+        snprintf(note, sizeof note, "j2_frames=%llu jitter=%.3f,%.3f no_camera=%llu no_state=%llu cuts=%llu miss_no_candidate=%llu active=%u",
+                 static_cast<unsigned long long>(js.frames - pf), js.inline_jitter_x, js.inline_jitter_y,
+                 static_cast<unsigned long long>(js.no_camera - pnc), static_cast<unsigned long long>(js.no_state - pns),
+                 static_cast<unsigned long long>(js.cuts - pcut), static_cast<unsigned long long>(js.miss_no_candidate - pmc), js.active ? 1u : 0u);
+        pf = js.frames; pnc = js.no_camera; pns = js.no_state; pcut = js.cuts; pmc = js.miss_no_candidate;
+        na::capture::NotePresent(note);
+        na::capture::OnPresent(queue, frame); // phase-1 capture
+    }
     {
         // J2 evidence capture: the presented image joins this frame's evaluation (if one
         // was captured). Executed unhooked so J2 never observes our copy as game work.

@@ -26,6 +26,7 @@ struct Plane {
 struct Frame {
     uint32_t index = 0;
     EvalInputs in{};
+    char note[256] = {};
     std::vector<Plane> planes; // color, depth, motion, dlss_output, backbuffer
     UINT64 fence_value = 0;
 };
@@ -35,6 +36,8 @@ struct State {
     std::atomic<bool> pending{false};
     std::atomic<ULONGLONG> start_at{0}; // A44: tick count at which the capture starts
     uint32_t requested = 0, evaluated = 0, written = 0, errors = 0;
+    bool presents_only = false;
+    char note[256] = {};
     wchar_t dir[MAX_PATH] = {};
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandAllocator> alloc;
@@ -132,9 +135,10 @@ void write_frame(const Frame& f)
     if (_wfopen_s(&fp, path, L"wb") == 0 && fp) {
         fprintf(fp, "{\n  \"frame\": %u,\n  \"render\": [%u, %u],\n  \"output\": [%u, %u],\n"
                     "  \"jitter\": [%.6f, %.6f],\n  \"mv_scale\": [%.4f, %.4f],\n  \"reset\": %u,\n"
+                    "  \"note\": \"%s\",\n"
                     "  \"planes\": [\n",
                 f.index, f.in.render_w, f.in.render_h, f.in.out_w, f.in.out_h, f.in.jitter_x,
-                f.in.jitter_y, f.in.mv_scale_x, f.in.mv_scale_y, f.in.reset);
+                f.in.jitter_y, f.in.mv_scale_x, f.in.mv_scale_y, f.in.reset, f.note);
         bool first = true;
         for (const Plane& p : f.planes) {
             if (!p.readback) continue;
@@ -179,6 +183,7 @@ void Request(uint32_t frames, const wchar_t* out_dir, uint32_t delay_ms)
 {
     std::lock_guard<std::mutex> lock(g.m);
     if (!out_dir || frames == 0) return;
+    g.presents_only = false;
     g.start_at = GetTickCount64() + delay_ms;
     wcsncpy_s(g.dir, out_dir, _TRUNCATE);
     CreateDirectoryW(g.dir, nullptr);
@@ -193,6 +198,19 @@ void Request(uint32_t frames, const wchar_t* out_dir, uint32_t delay_ms)
         g.writer = std::thread(&writer_main);
     }
     g.pending.store(true, std::memory_order_release);
+}
+
+void RequestPresents(uint32_t frames, const wchar_t* out_dir, uint32_t delay_ms)
+{
+    Request(frames, out_dir, delay_ms);
+    std::lock_guard<std::mutex> lock(g.m);
+    g.presents_only = g.pending.load();
+}
+
+void NotePresent(const char* text)
+{
+    std::lock_guard<std::mutex> lock(g.m);
+    snprintf(g.note, sizeof g.note, "%s", text ? text : "");
 }
 
 bool Pending()
@@ -243,6 +261,16 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer)
 {
     if (!Pending() || !queue) return;
     std::lock_guard<std::mutex> lock(g.m);
+    if (!g.current && g.presents_only && g.evaluated < g.requested) {
+        ComPtr<ID3D12Device> dev;
+        if (FAILED(queue->GetDevice(IID_PPV_ARGS(&dev))) || !ensure_device(dev.Get())) { ++g.errors; return; }
+        auto f = std::make_unique<Frame>();
+        f->index = g.evaluated;
+        f->planes.resize(5);
+        snprintf(f->note, sizeof f->note, "%s", g.note);
+        g.current = std::move(f);
+        ++g.evaluated;
+    }
     if (!g.current || !g.device) return;
     // One allocator: it may only be reset once the GPU has finished the previous
     // capture copy recorded with it. Resetting it while that copy still runs is

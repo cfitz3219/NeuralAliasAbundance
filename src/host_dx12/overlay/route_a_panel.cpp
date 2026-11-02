@@ -1071,6 +1071,35 @@ void DrawLiveDlaa()
                           cs.recorded, cs.requested, cs.written, cs.dropped_busy + cs.discarded + cs.retired, cs.without_present, cs.errors);
             StatusLine(0, cl);
         }
+        // Every presented frame for a short burst, DLAA or not, with what J2 did on each: the
+        // only way to see WHICH presents flash (Cort, SE5 2026-11-02). Starts 3 s after the click.
+        const na::capture::Stats pc = na::capture::GetStats();
+        constexpr uint32_t kPresentFrames = 40;
+        BeginRow("Capture every presented frame", "Saves the picture you saw for the next 40 frames in a row, whether DLAA ran on them or not, with a note of what DLAA did on each. For finding flashing. About 1.6 GB; to LocalAppData\\NeuralAlias\\captures.", ButtonWidth("Capture 40 presents"));
+        ImGui::BeginDisabled(pc.frames_requested != 0 && pc.frames_written < pc.frames_requested);
+        if (Button("Capture 40 presents")) {
+            wchar_t* local = nullptr;
+            if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local)) && local) {
+                wchar_t dir[MAX_PATH];
+                swprintf_s(dir, L"%s\\NeuralAlias\\captures", local);
+                CreateDirectoryW(dir, nullptr);
+                SYSTEMTIME t;
+                GetLocalTime(&t);
+                swprintf_s(dir, L"%s\\NeuralAlias\\captures\\presents-%04u%02u%02u-%02u%02u%02u", local, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+                CoTaskMemFree(local);
+                na::capture::RequestPresents(kPresentFrames, dir, 3000);
+                na::overlay::SetOpen(false);
+            }
+        }
+        ImGui::EndDisabled();
+        EndRow();
+        if (pc.frames_requested) {
+            char pl[160];
+            const uint32_t wait_ms = na::capture::DelayRemainingMs();
+            if (wait_ms) std::snprintf(pl, sizeof pl, "Capturing in %u s: close the menu and play.", (wait_ms + 999) / 1000);
+            else std::snprintf(pl, sizeof pl, "Presented frames: %u of %u saved, %u errors.", pc.frames_written, pc.frames_requested, pc.errors);
+            StatusLine(0, pl);
+        }
     }
     char buf[320];
     if (!on) {
