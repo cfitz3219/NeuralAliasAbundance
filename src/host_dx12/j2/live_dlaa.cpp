@@ -925,8 +925,8 @@ void window_derived(const JB& k, std::vector<uint8_t>& view, std::vector<bool>& 
                 std::snprintf(tag, sizeof tag, "%s(%s)+%u%s ", form == 1 ? "scr" : "inv", d.base[bi].name,
                               static_cast<unsigned>(o), l ? "c" : "r");
                 auto& note = g.stats.window_derived_note;
-                if (!std::strstr(note, tag) && std::strlen(note) + std::strlen(tag) < sizeof note)
-                    std::strcat(note, tag);
+                const size_t used = std::strlen(note), add = std::strlen(tag);
+                if (!std::strstr(note, tag) && used + add < sizeof note) std::memcpy(note + used, tag, add + 1);
             }
             touched[o / 16] = true;
             break;
