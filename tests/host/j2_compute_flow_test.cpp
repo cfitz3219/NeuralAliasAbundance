@@ -25,7 +25,7 @@ int main(int argc,char**){
         dst.pResource=r.Get();dst.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;l.list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
         auto tr=test::Transition(r.Get(),D3D12_RESOURCE_STATE_COPY_DEST,S);l.list->ResourceBarrier(1,&tr);uploads.push_back(up);return r;
     };
-    auto before=image(0,false),after=image(8,false),depth=image(0,true);
+    auto before=image(0,false),after=image(8,false),later=image(16,false),depth=image(0,true);
     auto execute=[&](){l.list->Close();ID3D12CommandList* lists[]={l.list.Get()};{na::nr::native::Submission track(d.queue.Get(),1,lists);d.queue->ExecuteCommandLists(1,lists);}d.WaitIdle();};
     auto reset=[&](){na::nr::native::Reset(l.list.Get());na::nr::native::Maintain();l.Reset();};execute();reset();
     na::motion::gpu::Inputs camera;camera.depth=depth.Get();camera.tier2_valid_flag=true;
@@ -35,7 +35,14 @@ int main(int argc,char**){
     // Completion without Reset is insufficient: the closed list can be replayed.
     auto busy=cf::Record(l.list.Get(),d.queue.Get(),after.Get(),depth.Get(),camera,f,tier);CHECK(!busy.context);reset();
     f.frame=2;f.previous=1;
-    auto pair=cf::Record(l.list.Get(),d.queue.Get(),after.Get(),depth.Get(),camera,f,tier);REQUIRE(pair.context && tier.residual);
+    // First pair: every moving pixel passes the image checks but has no agreeing previous pair yet
+    // (temporal agreement, j2_flow 5c5fb0d), so it is held back as flicker; the second pair accepts.
+    auto first=cf::Record(l.list.Get(),d.queue.Get(),after.Get(),depth.Get(),camera,f,tier);REQUIRE(first.context && tier.residual);
+    execute();cf::Committed(first);reset();
+    {auto s1=cf::GetStats();std::printf("first pair: accepted=%llu flicker=%llu total=%llu\n",(unsigned long long)s1.accepted,(unsigned long long)s1.rejected_flicker,(unsigned long long)s1.total);
+     CHECK(s1.accepted==0);CHECK(s1.rejected_flicker>0);}
+    f.frame=3;f.previous=2;
+    auto pair=cf::Record(l.list.Get(),d.queue.Get(),later.Get(),depth.Get(),camera,f,tier);REQUIRE(pair.context && tier.residual);
     auto output=test::CreateTexture(d.device.Get(),w,h,DXGI_FORMAT_R32G32_FLOAT,U,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     auto prov=test::CreateTexture(d.device.Get(),w,h,DXGI_FORMAT_R8_UINT,U,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     na::motion::gpu::Arbiter arbiter;REQUIRE(arbiter.Init(d.device.Get()));camera.tier3_valid_flag=true;camera.tier3_residual=tier.residual;camera.tier3_valid=tier.valid;camera.tier3_mask=tier.mask;
@@ -47,13 +54,13 @@ int main(int argc,char**){
     execute();cf::Committed(pair);reset();
     float* p=nullptr;rb->Map(0,nullptr,reinterpret_cast<void**>(&p));unsigned good=0,total=0,bg_wrong=0;
     for(unsigned y=0;y<h;++y)for(unsigned x=0;x<w;++x){const float vx=p[(y*w+x)*2],vy=p[(y*w+x)*2+1];
-        if(x>=152 && x<248 && y>=80 && y<176){++total;if(std::abs(vx+8)<1 && std::abs(vy)<1)++good;}
-        if((x<110 || x>282 || y<40 || y>216) && (std::abs(vx)>.01f || std::abs(vy)>.01f))++bg_wrong;
+        if(x>=160 && x<256 && y>=80 && y<176){++total;if(std::abs(vx+8)<1 && std::abs(vy)<1)++good;}
+        if((x<110 || x>290 || y<40 || y>216) && (std::abs(vx)>.01f || std::abs(vy)>.01f))++bg_wrong;
     }rb->Unmap(0,nullptr);std::printf("AMD->expand->residual->arbiter: object %u/%u correct, background errors %u\n",good,total,bg_wrong);CHECK(good>total*8/10);CHECK(bg_wrong==0);
-    auto stats=cf::GetStats();std::printf("pairs=%llu accepted=%llu total=%llu GPU=%.3fms %s\n",(unsigned long long)stats.pairs,(unsigned long long)stats.accepted,(unsigned long long)stats.total,stats.ms,stats.reason);CHECK(stats.pairs==1);
+    auto stats=cf::GetStats();std::printf("pairs=%llu accepted=%llu total=%llu GPU=%.3fms %s\n",(unsigned long long)stats.pairs,(unsigned long long)stats.accepted,(unsigned long long)stats.total,stats.ms,stats.reason);CHECK(stats.pairs==2);CHECK(stats.accepted>0);
     // Reset, skipped history and a new generation cannot use a stale pair.
-    f.frame=3;f.previous=99;f.generation=2;auto gap=cf::Record(l.list.Get(),d.queue.Get(),after.Get(),depth.Get(),camera,f,tier);CHECK(gap.context && !tier.residual);execute();cf::Committed(gap);reset();
-    f.frame=4;f.previous=3;f.reset=true;auto cut=cf::Record(l.list.Get(),d.queue.Get(),after.Get(),depth.Get(),camera,f,tier);CHECK(cut.context && !tier.residual);execute();cf::Committed(cut);reset();
+    f.frame=30;f.previous=99;f.generation=2;auto gap=cf::Record(l.list.Get(),d.queue.Get(),after.Get(),depth.Get(),camera,f,tier);CHECK(gap.context && !tier.residual);execute();cf::Committed(gap);reset();
+    f.frame=4;f.previous=30;f.reset=true;auto cut=cf::Record(l.list.Get(),d.queue.Get(),after.Get(),depth.Get(),camera,f,tier);CHECK(cut.context && !tier.residual);execute();cf::Committed(cut);reset();
     f.frame=5;f.previous=4;f.reset=false;auto abandoned=cf::Record(l.list.Get(),d.queue.Get(),after.Get(),depth.Get(),camera,f,tier);CHECK(abandoned.context && tier.residual);
     l.list->Close();reset(); // deliberately discard, never publish frame5 as history
     f.frame=6;f.previous=5;auto next=cf::Record(l.list.Get(),d.queue.Get(),after.Get(),depth.Get(),camera,f,tier);CHECK(next.context && !tier.residual);execute();cf::Committed(next);reset();

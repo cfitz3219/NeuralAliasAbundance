@@ -1221,12 +1221,12 @@ UINT64 menu_completed_prefix() {
 void write_menu_progress(HANDLE log)
 {
     const auto cf=na::j2::compute_flow::GetStats();char cfline[950];DWORD cfw=0;
-    const int cfn=snprintf(cfline,sizeof cfline,"j2compute engine=amd recorded=%llu submitted=%llu pairs=%llu busy=%llu accepted=%llu total=%llu ms=%.3f reason=\"%s\" attempts=%llu paired_submissions=%llu unavailable=%llu history_only=%llu last_frame=%llu submit_age_ms=%llu sample_frame=%llu sample_age_ms=%llu samples=%llu excluded{invalid=%llu small=%llu cost=%llu offscreen=%llu image=%llu} pool{recordings=%u images=%u}\r\n",
+    const int cfn=snprintf(cfline,sizeof cfline,"j2compute engine=amd recorded=%llu submitted=%llu pairs=%llu busy=%llu accepted=%llu total=%llu ms=%.3f reason=\"%s\" attempts=%llu paired_submissions=%llu unavailable=%llu history_only=%llu last_frame=%llu submit_age_ms=%llu sample_frame=%llu sample_age_ms=%llu samples=%llu excluded{invalid=%llu small=%llu cost=%llu offscreen=%llu image=%llu flicker=%llu} pool{recordings=%u images=%u}\r\n",
         static_cast<unsigned long long>(cf.recorded),static_cast<unsigned long long>(cf.submitted),static_cast<unsigned long long>(cf.pairs),
         static_cast<unsigned long long>(cf.busy),static_cast<unsigned long long>(cf.accepted),static_cast<unsigned long long>(cf.total),cf.ms,cf.reason,
         (unsigned long long)cf.attempts,(unsigned long long)cf.submitted_pairs,(unsigned long long)cf.unavailable,(unsigned long long)cf.waiting_history,
         (unsigned long long)cf.last_submitted_frame,(unsigned long long)cf.submit_age_ms,(unsigned long long)cf.sample_frame,(unsigned long long)cf.sample_age_ms,(unsigned long long)cf.samples,
-        (unsigned long long)cf.rejected_invalid,(unsigned long long)cf.rejected_small,(unsigned long long)cf.rejected_cost,(unsigned long long)cf.rejected_offscreen,(unsigned long long)cf.rejected_image,cf.recording_slots,cf.image_slots);
+        (unsigned long long)cf.rejected_invalid,(unsigned long long)cf.rejected_small,(unsigned long long)cf.rejected_cost,(unsigned long long)cf.rejected_offscreen,(unsigned long long)cf.rejected_image,(unsigned long long)cf.rejected_flicker,cf.recording_slots,cf.image_slots);
     if(cfn>0)WriteFile(log,cfline,(std::min)(DWORD(cfn),DWORD(sizeof(cfline)-1)),&cfw,nullptr);
     auto ps = na::present::GetStats();
     char p_line[256];
