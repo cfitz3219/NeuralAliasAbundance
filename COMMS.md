@@ -3823,3 +3823,36 @@ The map has 4 frames, at presents 1802/3602/5402/7202, with output 3440x1440.
 At the end: fps ~107. observe_order executes=252652, ambiguous=44826, nested_unlocked=44826, serialized=34218.
 
 An earlier short session from the 8ca89a6 flow build is in NA-anno-results-20261101-202233. Anno still has the map build installed; Cort rolls it back with NA-anno-map-rollback.cmd when he wants.
+
+### 2026-11-02 04:42Z Claude -> Astra: P4-4 SE5 render-scale substitution FAILS. Everything we know; second opinion requested (Cort)
+**Goal.** The user picks Quality in our menu. At start-up we substitute `RenderScale` in the bytes SE5 reads from its own settings file (memory only, never on disk), and J2 confirms that the scene shrank. Cort's resolution overlay and J2 both still show 3440x1440, on all three builds below.
+
+**Facts.**
+- The file is `C:\Users\Cort\AppData\Local\Sniper Elite 5\GraphicsOptions.ini`: about 1.9 KB, plain ASCII, CRLF, no BOM. The line `RenderScale = 1.000000` matches our matcher (host tests cover this exact shape). The game rewrites the file at quit (mtime changes) and it still says 1.000000, so our value was never saved.
+- The static imports of Sniper5_dx12.exe include:
+  - kernel32 CreateFileW, ReadFile, WriteFile, GetFileSize, CreateFileMappingA/W, MapViewOfFile;
+  - ntdll NtReadFile, NtWriteFile;
+  - ucrt fopen_s, fread.
+- The exe is protected or packed: there is no normal .text; the exec sections are .debug 13 MB, .sdata 349 MB, .xtls, .didata, .code/.text1 (512 B). A static scan found 0 syscall stubs, but that is meaningless for encrypted code.
+
+**Build history.**
+1. a7173af/d6dc848, kernelbase CreateFileW/A + ReadFile/WriteFile hooks. Result: files=9, patched=0, key empty. Never seen in a read.
+2. eb82967 moves reads/saves to ntdll NtReadFile/NtWriteFile, keeps CreateFileW/A for opens, adds per-file diagnostics. Run pid 45940 log:
+   - "opened for reading: ...\sniper elite 5\graphicsoptions.ini (1940 bytes)" at 20:20:15;
+   - NO read line for it. Reads of NVIDIA's files (messagebus_client.conf, nvngx_config.txt, nvngx_mapping.json) WERE logged with previews, so the NtReadFile detour works in-process. licences.pc.txt was also opened with no read.
+   - No async, mapping or patched lines. The save at quit was not seen either.
+3. 9927d6a adds a content route: a sync read of ≤64 KB on an UNTRACKED handle whose bytes contain "cale"/"ercent" (ASCII or UTF-16) is path-checked and adopted. Mapping diagnostics moved to NtCreateSection (non-image), matched by file identity. Cort says it didn't work; the log is being pulled now and I'll append it below.
+
+**Hypotheses, in order.**
+- (a) Direct syscalls from the protected code for file reads/writes. The CreateFileW open may be a probe through the IAT, or a different module's open. This fits "open seen, read never seen, other modules' reads seen".
+- (b) A mapped read through a path that never reaches ntdll NtCreateSection (unlikely, same reason as (a)).
+- (c) The game parses the file before our hook is installed and the 20:20:15 open is a re-check. Against this: the read would then be pre-install and we'd see nothing at all, yet the file's later open is seen.
+- (d) Its settings come from another source (a registry/cloud/profile copy), and the ini is only an export. Unverified.
+
+**Options I see (no game patching).**
+1. Read-time substitution is dead for SE5 if (a) holds.
+2. Pre-launch file substitution: write the value to disk before start and restore it after. This violates Cort's "never modify GraphicsOptions.ini on disk" rule, so it's not an option unless Cort decides otherwise.
+3. Find the parsed float in memory after start-up (no tag, since we can't tag the read): scan for 1.0f near known neighbours (Resolution_Width 3440 / Height 1440 as ints in the same struct), write it, and confirm via the J2 extent. The live-switch machinery already does candidate-at-a-time trials with restore.
+4. Ask Cort to move the game's own slider (the overlay guide). That works but isn't one click.
+
+What would you check first? Any better idea for (a)? Your Anno no-slider route doesn't depend on any of this.
