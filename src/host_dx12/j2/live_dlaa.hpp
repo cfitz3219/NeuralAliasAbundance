@@ -25,6 +25,7 @@
 #pragma once
 #include <d3d12.h>
 #include <cstdint>
+#include <memory>
 
 namespace na::j2 {
 
@@ -49,6 +50,69 @@ bool RecordNisForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID
 int DebugView();
 void SetJitter(bool on);     // the overlay's camera-jitter switch (J1), on by default
 bool Jitter();
+
+// P4-4 (DLSS upscaling, slider route). With no destination J2 runs DLAA as before:
+// DLSS at the scene's size, written back into the scene colour. With a destination,
+// DLSS upscales the scene's active extent (render_w x render_h at the top left of the
+// scene colour and depth; 0 = the whole texture) into J2's own target at the
+// destination's size and copies it into `dest` (single-sample 2D, copy-compatible
+// with the scene colour, at least as large as the extent); the scene colour is left
+// as the game drew it. Camera jitter, the jitter phase count and motion use the active
+// extent. A destination J2 cannot use falls back to DLAA with the reason in Stats.
+// Changing the target restarts DLSS history. Stage P sets it from the game's stretch
+// to output size; the tests set it directly.
+struct UpscaleTarget {
+    uint64_t dest = 0;       // na_object_id of the destination texture; 0 = DLAA
+    uint32_t dest_sub = 0;   // its subresource (mip + slice)
+    uint32_t render_w = 0, render_h = 0;
+};
+void SetUpscaleTarget(const UpscaleTarget& t);
+UpscaleTarget GetUpscaleTarget();
+// P4-4 no-slider route (Astra's Layer2, contract agreed on COMMS 2026-11-01): an optional
+// immutable logical -> physical snapshot. Discovery, the camera and every identity stay on the
+// LOGICAL scene colour/depth ids; J2 evaluates the provider's PHYSICAL (reduced) companions and
+// writes the full-size output. The provider's resources are private host-owned textures, not
+// discovery candidates, so their exact states travel in the payload; J2 restores exactly those
+// states after its use. The output is in the same payload (same generation), never paired with
+// the separately changing UpscaleTarget.
+struct PhysicalInput {
+    uint64_t logical_color = 0, logical_depth = 0; // must equal the frame's discovered ids
+    uint64_t generation = 0;                       // the recording's snapshot generation
+    ID3D12Resource* color = nullptr; uint32_t color_sub = 0, color_state = 0;
+    ID3D12Resource* depth = nullptr; uint32_t depth_sub = 0, depth_state = 0;
+    uint32_t render_w = 0, render_h = 0;            // active extent at the top left of color/depth
+    ID3D12Resource* output = nullptr; uint32_t output_sub = 0, output_state = 0; // full size
+    std::shared_ptr<void> owner; // keeps the raw resources alive; J2 retains the payload through
+                                 // every submission of the recording that uses it
+};
+enum class PhysicalLookup {
+    None,        // no override for this frame: today's logical path
+    Provided,    // use *out
+    Unavailable, // this recording was redirected but its replacement is not available: J2 does
+                 // NOT evaluate the stale logical picture; the owner repairs the frame
+};
+enum class PhysicalOutcome {
+    Evaluated,   // DLSS evaluated the physical inputs into the payload's output
+    Unavailable, // the provider reported Unavailable: nothing evaluated
+    Failed,      // provided, but J2 could not use it (validation, retention, DLSS): nothing usable
+                 // was written to the output; the owner promotes its own current-frame output
+};
+struct PhysicalInputProvider {
+    // Called on J2's recording thread with the frame's logical ids and the game list being
+    // recorded (null on the between-lists route).
+    PhysicalLookup (*lookup)(void* ctx, uint64_t logical_color, uint64_t logical_depth,
+                             ID3D12GraphicsCommandList* game_list, std::shared_ptr<const PhysicalInput>* out) = nullptr;
+    // Every Provided / Unavailable lookup gets exactly one outcome, before J2's record returns.
+    void (*outcome)(void* ctx, uint64_t generation, PhysicalOutcome result, const char* reason) = nullptr;
+    void* ctx = nullptr;
+};
+// Null lookup = no provider (default). Not changed while a frame records.
+void SetPhysicalInputProvider(const PhysicalInputProvider& p);
+
+// Jitter phases for a render -> output ratio (8 for DLAA, 8 x ratio^2 upscaling, max 64).
+uint32_t JitterPhasesFor(uint32_t render_w, uint32_t out_w);
+// Texture mip bias for upscaling: log2(render / output) - 1 (DLSS guidance; -1 at DLAA).
+float UpscaleMipBias(uint32_t render_w, uint32_t out_w);
 
 // Called once at the game view's non-TEST Present boundary, including while
 // paused. Presenter-generated frames must not call this. Single-view J2 uses
@@ -89,9 +153,34 @@ struct Stats {
     uint64_t camera_offset = 0;   // byte offset of the camera matrix inside its constant block
     uint32_t later_passes = 0;
     uint64_t sharpened_frames = 0; // RCAS applied to the DLAA result
-    uint64_t nis_frames = 0;       // NIS added on top (Sharpness above 100 %)
+    uint64_t nis_frames = 0;       // Legacy log field; live sharpening is RCAS-only.
     uint64_t jitter_writes = 0;   // J1: camera matrices replaced by jittered copies
     uint64_t camera_learned_hits = 0, camera_scans = 0; // camera found at the learned slot / by a full search
+    // Several valid cameras in one frame (reflection, sky, light): frames where more than one
+    // candidate was seen / where the chosen one was not the first-ranked. Lost-camera reasons:
+    // nothing readable, no ViewProjection, a ViewProjection without its inverse; capped = the
+    // block bound was reached.
+    uint64_t camera_contested = 0, camera_alternatives = 0, jitter_slot_other_camera = 0;
+    uint64_t camera_lost_unread = 0, camera_lost_no_vp = 0, camera_lost_no_inverse = 0, camera_lost_capped = 0;
+    // SE5 2026-11-02 (Cort: the camera fix changed nothing): per PRESENT, why the frame ended
+    // without DLAA, and why a DLAA frame ran without J1's jitter. Counted once per present.
+    uint64_t miss_no_camera = 0, miss_no_state = 0, miss_no_candidate = 0, miss_other = 0;
+    uint64_t unjit_no_sample = 0;    // no jitter sample was started in any earlier batch
+    uint64_t unjit_not_applied = 0;  // started, but no camera block was rewritten
+    uint64_t unjit_not_held = 0;     // rewritten, but the camera the scene list used did not hold it
+    uint64_t camera_inverse_computed = 0; // a ViewProjection without its inverse, continuing the main camera, accepted
+    // SE5 flashing: frames whose camera could not be read ran DLAA on a camera predicted
+    // from the last two (extrapolated) or the last one (held), instead of showing the raw frame.
+    uint64_t camera_held = 0, camera_extrapolated = 0;
+    // Cuts at record time by cause (restart = tracker reset by resume/gap; gap = tracker frame gap;
+    // motion = translation/rotation/fov jump), and the last few as "tick100ms:why=value[/held][/j1]".
+    uint64_t cut_restarts = 0, cut_gap = 0, cut_motion = 0;
+    char recent_cuts[240] = {};
+    uint64_t camera_from_j1 = 0; // the scene list held no camera; J1's camera of this same frame (with its jitter) was used
+    // SE5 menu: frames whose depth state lookup failed and that used the state learned from
+    // the same scene end (identical on 30+ known frames in a row).
+    uint64_t depth_state_assumed = 0;
+    char camera_lost_evidence[480] = {};  // the last lost frame: every block searched and what it held
     int64_t camera_inv_delta = 0; // bytes from the ViewProjection to its inverse in the camera block
     int64_t camera_proj_delta = 0; // bytes to the camera's separate projection matrix (0 = none found)
     uint64_t jitter_proj_writes = 0; // J1: projection matrices replaced by jittered copies
@@ -134,6 +223,12 @@ struct Stats {
     char class_note[200] = {};            // latest consumer class not accepted (explains a missed frame)
     bool depth_reversed = false;  // reverse-Z as classified from the camera    // other render targets bound after the scene in the same list (insertion may be late)
     uint32_t width = 0, height = 0, color_format = 0;
+    // P4-4: the last evaluated frame's active render extent and output size (equal = DLAA),
+    // upscaled frames, and why a destination was not used (fell back to DLAA).
+    uint32_t render_w = 0, render_h = 0, out_w = 0, out_h = 0, jitter_phases = 0;
+    uint64_t upscaled_frames = 0, upscale_refused = 0;
+    uint64_t physical_evaluated = 0, physical_unavailable = 0, physical_failed = 0; // P4-4 Layer2 override
+    char upscale_note[160] = {};
     // Shape of the selected resources (reported even when J2 refuses them).
     uint32_t color_sub = 0, color_mips = 0, color_slices = 0, color_samples = 0, depth_slices = 0, depth_samples = 0;
     bool active = false;          // the last batch with the scene was processed

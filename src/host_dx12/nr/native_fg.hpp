@@ -16,6 +16,7 @@ class RecordingLease {
 public:
     bool Ready(ID3D12CommandQueue* consumer) const;
     bool Retired() const;
+    bool SameRecording(const RecordingLease& other) const;
     explicit operator bool() const { return !!retired_; }
 private:
     std::weak_ptr<void> record_;

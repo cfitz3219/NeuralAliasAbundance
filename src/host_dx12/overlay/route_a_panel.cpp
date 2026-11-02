@@ -25,6 +25,8 @@
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/fg/frame_gen.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/j2/j2_flow.hpp"
+#include "host_dx12/j2/compute_flow.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/fg/preset_profile.hpp"
 #include "host_dx12/motion/live_flow.hpp"
@@ -35,6 +37,7 @@
 #include "host_dx12/overlay/na_style.hpp"
 #include "host_dx12/overlay/overlay.hpp"
 #include "host_dx12/settings.hpp"
+#include "host_dx12/scale/live_driver.hpp"
 #include "host_dx12/latency/nvidia_latency.hpp"
 
 namespace na::overlay {
@@ -924,12 +927,28 @@ void DrawLiveDlaa()
     if (Switch("j2", &on)) na::j2::SetPaused(!on);
     EndRow();
     Hint("For sharpest results and best FPS, set Anti-Aliasing to Off in the game's video settings.");
+    if (na::scale::SliderRouteActive()) {
+        // P4-4 slider route: the mode sets the game's own render scale (read at start-up; live
+        // when the game allows it). The game's own Render Scale slider is left to the user.
+        na::settings::Settings& ss = na::settings::Get();
+        int mode = static_cast<int>(ss.j2_scale_mode.load());
+        if (mode < 0 || mode > 4) mode = 0;
+        BeginRow("Render mode", "DLAA draws the game at full resolution. Quality, Balanced, Performance and Ultra Performance draw it smaller for more FPS (67%, 58%, 50%, 33%). NeuralAlias sets the game's Render Scale for you; leave the game's own slider at 100%.", S(220));
+        ImGui::SetNextItemWidth(S(220));
+        if (ImGui::Combo("##j2scale", &mode, kModes, 5)) {
+            ss.j2_scale_mode.store(static_cast<uint32_t>(mode));
+            na::settings::Save();
+            na::scale::RequestMode(mode);
+        }
+        EndRow();
+        StatusLine(0, na::scale::GetDriverStats().state);
+    }
     {
         na::settings::Settings& ss = na::settings::Get();
         int sharp = static_cast<int>(ss.j2_sharpness.load());
-        BeginRow("Sharpness", "Sharpening after DLAA; the HUD is never sharpened. 0-100%: AMD RCAS (halo-free, up to its designed maximum). 101-200%: NVIDIA Image Scaling sharpening added on top for extra bite; edge outlines can appear near 200%. 0 = off.", S(220));
+        BeginRow("Sharpness", "Sharpening after DLAA, before the HUD. 0 = off. 1-100%: standard RCAS strength. 101-150%: extended RCAS strength in the same pass. Higher values emphasize detail and can emphasize edge outlines or noise.", S(220));
         ImGui::SetNextItemWidth(S(220));
-        if (ImGui::SliderInt("##j2sharp", &sharp, 0, 200, sharp ? (sharp > 100 ? "%d%% (RCAS + NIS)" : "%d%%") : "Off")) {
+        if (ImGui::SliderInt("##j2sharp", &sharp, 0, 150, sharp ? (sharp > 100 ? "%d%% (RCAS+)" : "%d%%") : "Off", ImGuiSliderFlags_AlwaysClamp)) {
             ss.j2_sharpness.store(static_cast<uint32_t>(sharp));
         }
         if (ImGui::IsItemDeactivatedAfterEdit()) na::settings::Save();
@@ -958,10 +977,40 @@ void DrawLiveDlaa()
     {
         static const char* kViews[] = {"Off (normal picture)", "Motion vectors", "Fine motion (sub-pixel)", "Depth"};
         int dv = na::j2::DebugView();
-        BeginRow("Debug view", "Shows what DLAA is given instead of its result. Motion: colour = direction, brightness = speed, black = still. Fine motion makes tiny false motion visible. Magenta = broken values.", S(220));
+        BeginRow("Debug view", "Shows what DLAA is given instead of its result. Motion: colour = direction, brightness = speed, black = still. Fine motion makes tiny false motion visible (0.2 px = full colour). Colour wheel: red = right, green = down-left, blue = up-left, magenta = right-and-up. White = broken values.", S(220));
         ImGui::SetNextItemWidth(S(220));
         if (ImGui::Combo("##j2dbg", &dv, kViews, 4)) na::j2::SetDebugView(dv);
         EndRow();
+    }
+    {
+        // P4-0b: moving-object motion from NVIDIA hardware optical flow (test; off by default).
+        bool fl = na::j2::flow::Enabled();
+        BeginRow("Moving-object motion (test)", "Adds estimated motion for moving objects. Uses NVIDIA flow between command lists, or AMD compute flow inside the game's list. Requires extra GPU time. Turn it off to compare; the Motion vectors debug view shows the result.", SwitchWidth());
+        if (Switch("j2flow", &fl)) na::j2::flow::SetEnabled(fl);
+        EndRow();
+        if (fl) {
+            const na::j2::flow::Stats fs = na::j2::flow::GetStats();
+            const auto cs=na::j2::compute_flow::GetStats();
+            if(na::j2::GetStats().inline_mode || (!fs.available && cs.recorded)){
+                char line[500];na::j2::compute_flow::DescribeStats(cs,line,sizeof line);
+                StatusLine(0,line);
+                if(cs.samples && cs.total){char detail[330];std::snprintf(detail,sizeof detail,
+                    "Last sample excluded: small motion %.1f%%, invalid/depth %.1f%%, image/flat %.1f%%, offscreen %.1f%%. Recording resources %u, history images %u.",
+                    100.0*double(cs.rejected_small)/double(cs.total),100.0*double(cs.rejected_invalid)/double(cs.total),
+                    100.0*double(cs.rejected_image)/double(cs.total),100.0*double(cs.rejected_offscreen)/double(cs.total),cs.recording_slots,cs.image_slots);
+                    Hint(detail);}
+            }else{
+            const uint64_t px = fs.px_accepted + fs.px_invalid + fs.px_small + fs.px_cost + fs.px_offscreen + fs.px_image + fs.px_flicker;
+            const double pct = px ? 100.0 * static_cast<double>(fs.px_accepted) / static_cast<double>(px) : 0.0;
+            char tb[360];
+            const double flick = px ? 100.0 * static_cast<double>(fs.px_flicker) / static_cast<double>(px) : 0.0;
+            std::snprintf(tb, sizeof tb, "%s Moving pixels found: %.1f%% of the picture (%.1f%% rejected as jitter flicker). Cost %.2f ms (average %.2f). Pairs %llu, camera-only frames %llu (batch %llu, busy %llu, reset %llu).",
+                          fs.reason, pct, flick, fs.ms_last, fs.ms_avg, static_cast<unsigned long long>(fs.consumed),
+                          static_cast<unsigned long long>(fs.encode_only + fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_split),
+                          static_cast<unsigned long long>(fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_reset));
+            StatusLine(fs.latched ? 2 : 0, tb);
+            }
+        }
     }
     {
         // Texture detail (negative mip bias, NVIDIA DLSS guide 3.5: -1 at native).
@@ -1025,6 +1074,35 @@ void DrawLiveDlaa()
             std::snprintf(cl, sizeof cl, "Capture: %u of %u recorded, %u saved, %u skipped (busy), %u without the presented picture, %u errors.",
                           cs.recorded, cs.requested, cs.written, cs.dropped_busy + cs.discarded + cs.retired, cs.without_present, cs.errors);
             StatusLine(0, cl);
+        }
+        // Every presented frame for a short burst, DLAA or not, with what J2 did on each: the
+        // only way to see WHICH presents flash (Cort, SE5 2026-11-02). Starts 3 s after the click.
+        const na::capture::Stats pc = na::capture::GetStats();
+        constexpr uint32_t kPresentFrames = 40;
+        BeginRow("Capture every presented frame", "Saves the picture you saw for the next 40 frames in a row, whether DLAA ran on them or not, with a note of what DLAA did on each. For finding flashing. About 1.6 GB; to LocalAppData\\NeuralAlias\\captures.", ButtonWidth("Capture 40 presents"));
+        ImGui::BeginDisabled(pc.frames_requested != 0 && pc.frames_written < pc.frames_requested);
+        if (Button("Capture 40 presents")) {
+            wchar_t* local = nullptr;
+            if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local)) && local) {
+                wchar_t dir[MAX_PATH];
+                swprintf_s(dir, L"%s\\NeuralAlias\\captures", local);
+                CreateDirectoryW(dir, nullptr);
+                SYSTEMTIME t;
+                GetLocalTime(&t);
+                swprintf_s(dir, L"%s\\NeuralAlias\\captures\\presents-%04u%02u%02u-%02u%02u%02u", local, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+                CoTaskMemFree(local);
+                na::capture::RequestPresents(kPresentFrames, dir, 3000);
+                na::overlay::SetOpen(false);
+            }
+        }
+        ImGui::EndDisabled();
+        EndRow();
+        if (pc.frames_requested) {
+            char pl[160];
+            const uint32_t wait_ms = na::capture::DelayRemainingMs();
+            if (wait_ms) std::snprintf(pl, sizeof pl, "Capturing in %u s: close the menu and play.", (wait_ms + 999) / 1000);
+            else std::snprintf(pl, sizeof pl, "Presented frames: %u of %u saved, %u errors.", pc.frames_written, pc.frames_requested, pc.errors);
+            StatusLine(0, pl);
         }
     }
     char buf[320];

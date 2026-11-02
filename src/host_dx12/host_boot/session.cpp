@@ -7,6 +7,7 @@
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 #include "host_dx12/sl_boundary/sl_boundary.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/j2/j2_flow.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/upscalers/ffx_intercept.hpp"
 #include "host_dx12/upscalers/xess_intercept.hpp"
@@ -89,6 +90,7 @@ void ActivateSavedRequests(const wchar_t* ini){
     if(settings::CanPersist())na::fg::preset::Initialize();
     slb::SetFgRequest(safe?slb::FgRequest{}:slb::FgRequest{static_cast<slb::FgMode>(st.native_fg_mode.load()),st.native_fg_frames.load()});
     j2::SetPaused(safe);
+    if(safe)j2::flow::SetEnabled(false);
     if(j2::Configured())observe::SetSamplerMipBias(static_cast<float>(st.j2_mip_bias_x100.load())/100.f);
     if(GetPrivateProfileIntW(L"fsr",L"enabled",1,ini)==1)
         ffx::SetMode(!safe && GetPrivateProfileIntW(L"fsr",L"replace",0,ini)==1?ffx::Mode::ReplaceWithDlss:ffx::Mode::Observe);

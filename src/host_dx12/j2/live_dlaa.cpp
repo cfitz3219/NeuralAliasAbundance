@@ -4,6 +4,8 @@
 #include "host_dx12/j2/route_selector.hpp"
 #include "host_dx12/j2/consumer_profile.hpp"
 #include "host_dx12/j2/jitter_writes.hpp"
+#include "host_dx12/j2/j2_flow.hpp"
+#include "host_dx12/j2/compute_flow.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 #include "host_dx12/upscalers/ffx_intercept.hpp"
@@ -13,6 +15,7 @@
 #include "core/temporal_jitter.hpp"
 #include "host_dx12/depth_format.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
+#include "host_dx12/nr/native_fg.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/settings.hpp"
 #include "providers/camera/camera_tracker.hpp"
@@ -46,12 +49,15 @@ struct Slot {
     ComPtr<ID3D12CommandAllocator> alloc;
     ComPtr<ID3D12GraphicsCommandList> list;
     UINT64 fence_value = 0;
+    std::shared_ptr<const PhysicalInput> physical; // Layer2 payload used by this slot's list: kept
+                                                   // until the slot is reused (its fence completed)
 };
 
 struct PendingHistory {
     na::camera::CameraTracker tracker;
     bool cut = false;
     uint32_t capture = 0; // J2 evidence capture token for this evaluation (0 = none)
+    na::j2::compute_flow::Ticket compute_flow;
 };
 
 // CPU metadata of this frame's last submitted scene. No pooled command-list
@@ -84,11 +90,30 @@ struct State {
     MsaaResolve msaa;
     UINT samples = 1, depth_samples = 1, sample_quality = 0, depth_quality = 0;
     DXGI_FORMAT depth_format = DXGI_FORMAT_UNKNOWN;
-    uint32_t w = 0, h = 0;
+    uint32_t w = 0, h = 0;          // scene colour/depth allocation (J2's input copies)
+    uint32_t rw = 0, rh = 0;        // P4-4: active render extent (camera, jitter, motion); == w,h for DLAA
+    uint32_t ow = 0, oh = 0;        // P4-4: output size (output/sharp textures); == w,h for DLAA
     DXGI_FORMAT color_format = DXGI_FORMAT_UNKNOWN;
     na::motion::gpu::Arbiter arbiter;
     bool arbiter_ok = false;
     na::camera::CameraTracker tracker;
+    // SE5 flashing (Cort 2026-11-02): ~10 % of frames had no readable camera, so they kept
+    // the game's raw (aliased, mip-biased, unsharpened) colour between DLAA'd neighbours:
+    // a flash on detailed texture. The last two unjittered cameras let such a frame run
+    // DLAA on a predicted camera instead (see record(): 4 frames moving, 120 still).
+    na::camera::Matrix cam_u0{}, cam_u1{}; // unjittered VPs of the last two read frames (u1 newest)
+    uint64_t cam_f0 = 0, cam_f1 = 0;       // their frames (0 = none)
+    bool cam_rev = false;
+    // SE5 main menu (Cort 2026-11-02): the depth's state at the scene end was unknown on ~1/4
+    // of frames (the state store reset: ambiguous_queue_order). The same scene end reports
+    // the same depth state frame after frame; once it has been the same on kDepthLearnFrames
+    // known frames in a row, a frame whose lookup fails but whose scene list did render into
+    // that depth uses it, instead of showing the raw frame.
+    uint32_t depth_learned_state = 0;
+    uint32_t depth_learned_sub = 0xFFFFFFFFu;
+    na_object_id depth_learned_id = 0;
+    uint32_t depth_learned_streak = 0;
+    uint64_t depth_learned_frame = 0; // last frame the state was known
     uint64_t frame = 1;             // game Present interval, not Execute attempt
     uint64_t submitted_frame = 0;   // last interval that actually submitted DLAA
     // Games may draw the scene across several submissions per frame (Sniper Elite
@@ -173,6 +198,22 @@ struct State {
 // Never destroyed: at process exit the observation hooks' own state may already
 // be gone, and releasing D3D12 objects then would call into them.
 State& g = *new State;
+// P4-4 upscale target: set by Stage P / tests from any thread, read at recording.
+std::mutex g_up_m;
+UpscaleTarget g_up;
+PhysicalInputProvider g_phys; // under g_up_m
+
+// Exactly one outcome per Provided / Unavailable lookup, on every exit of record().
+struct PhysicalReport {
+    PhysicalInputProvider p;
+    uint64_t generation = 0;
+    bool armed = false;
+    PhysicalOutcome result = PhysicalOutcome::Failed;
+    char why[160] = {};
+    void arm(const PhysicalInputProvider& pp, uint64_t gen) { p = pp; generation = gen; armed = true; }
+    void fail(const char* w) { result = PhysicalOutcome::Failed; std::snprintf(why, sizeof why, "%s", w); }
+    ~PhysicalReport();
+};
 
 void reason(const char* r) { std::snprintf(g.stats.reason, sizeof(g.stats.reason), "%s", r); }
 
@@ -257,7 +298,8 @@ bool is_float_color(DXGI_FORMAT f)
 // Replaces the DLAA result with a picture of what DLAA was given, so it can be
 // judged in the game: 1 motion (hue = direction, brightness = speed, 4 px = full;
 // black = no motion), 2 fine motion (0.2 px = full: reveals sub-pixel false
-// motion on a still camera), 3 depth (banded). Magenta = non-finite motion.
+// motion on a still camera), 3 depth (banded). White = non-finite motion (no direction
+// hue is ever white; magenta is the right-and-up hue, which misled the first Anno read).
 std::atomic<int> g_debug_view{0};
 struct DebugPass {
     ComPtr<ID3D12RootSignature> root;
@@ -270,17 +312,18 @@ constexpr char kDebugHlsl[] = R"(
 Texture2D<float2> t_mv : register(t0);
 Texture2D<float> t_depth : register(t1);
 RWTexture2D<float4> u_out : register(u0);
-cbuffer C : register(b0) { uint mode; float scale; uint w; uint h; };
+cbuffer C : register(b0) { uint mode; float scale; uint w; uint h; uint iw; uint ih; };
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= w || id.y >= h) return;
+    uint2 p = id.xy * uint2(iw, ih) / uint2(w, h); // output pixel -> render pixel (P4-4)
     float3 c;
     if (mode == 3) {
-        float d = t_depth[id.xy];
+        float d = t_depth[p];
         c = frac(d * float3(1.0, 16.0, 256.0));
     } else {
-        float2 v = t_mv[id.xy];
-        if (any(isnan(v)) || any(isinf(v))) { c = float3(1, 0, 1); }
+        float2 v = t_mv[p];
+        if (any(isnan(v)) || any(isinf(v))) { c = float3(1, 1, 1); }
         else {
             float a = atan2(v.y, v.x) / 6.2831853;
             float3 hue = saturate(abs(frac(a + float3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0);
@@ -304,7 +347,7 @@ bool debug_init()
     p[0].DescriptorTable.NumDescriptorRanges = 2;
     p[0].DescriptorTable.pDescriptorRanges = r;
     p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    p[1].Constants.Num32BitValues = 4;
+    p[1].Constants.Num32BitValues = 6;
     D3D12_ROOT_SIGNATURE_DESC rd{2, p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     ComPtr<ID3DBlob> sig, err, code;
     if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
@@ -351,21 +394,23 @@ bool debug_record(ID3D12GraphicsCommandList* l, int mode, DXGI_FORMAT out_format
     l->SetPipelineState(g_dbg.pso.Get());
     l->SetComputeRootDescriptorTable(0, gh);
     const float scale = mode == 2 ? 5.0f : 0.25f;
-    uint32_t k[4] = {static_cast<uint32_t>(mode), 0, g.w, g.h};
+    uint32_t k[6] = {static_cast<uint32_t>(mode), 0, g.ow, g.oh, g.rw, g.rh};
     std::memcpy(&k[1], &scale, 4);
-    l->SetComputeRoot32BitConstants(1, 4, k, 0);
-    l->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
+    l->SetComputeRoot32BitConstants(1, 6, k, 0);
+    l->Dispatch((g.ow + 7) / 8, (g.oh + 7) / 8, 1);
     return true;
 }
 
 // ---- Sharpening: RCAS (Robust Contrast-Adaptive Sharpening) ------------------
 // AMD FidelityFX Super Resolution 1 "RCAS" (ffx_fsr1.h, MIT licence, (c) Advanced
-// Micro Devices): a 5-tap cross whose sharpening lobe is limited so the result
-// never leaves the local min/max (no ringing / halos), with its noise detection
+// Micro Devices): a 5-tap cross with contrast-dependent clipping limiters
+// (not a guarantee against edge halos), with its noise detection
 // (FSR_RCAS_DENOISE) so flat noisy areas are not amplified. Runs on the DLAA
 // result before the game's tonemap and HUD, in a Reinhard-compressed copy of the
 // HDR values (RCAS expects 0..1), expanded back afterwards. Slider 1..100 maps to
-// RCAS sharpness 2..0 stops (100 = strongest); 0 skips the pass entirely.
+// RCAS sharpness 2..0 stops; 0 skips the pass entirely. NeuralAlias's 101..150
+// extension raises only the global lobe ceiling from 3/16 to 13/64. Contrast
+// limiters and noise attenuation remain; 1+4*lobe stays >=3/16. No second filter.
 struct RcasPass {
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> pso;
@@ -376,8 +421,7 @@ struct RcasPass {
 constexpr char kRcasHlsl[] = R"(
 Texture2D<float4> t_in : register(t0);
 RWTexture2D<float4> u_out : register(u0);
-cbuffer C : register(b0) { float con; uint w; uint h; uint pad; };
-#define RCAS_LIMIT (0.25 - (1.0 / 16.0))
+cbuffer C : register(b0) { float con; uint w; uint h; float lobeLimit; };
 float3 fwd(float3 x) { x = max(x, 0.0); return x / (1.0 + x); }
 float3 inv(float3 t) { t = min(t, 0.99990); return t / (1.0 - t); }
 float3 tap(int2 p) { p = clamp(p, int2(0, 0), int2(w - 1, h - 1)); return fwd(t_in[p].rgb); }
@@ -404,7 +448,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     float3 hitMin = min(mn4, e) / max(4.0 * mx4, 1e-6);
     float3 hitMax = (peakC.x - max(mx4, e)) / (4.0 * mn4 + peakC.y);
     float3 lobeRGB = max(-hitMin, hitMax);
-    float lobe = max(-RCAS_LIMIT, min(max3(lobeRGB.r, lobeRGB.g, lobeRGB.b), 0.0)) * con;
+    float lobe = max(-lobeLimit, min(max3(lobeRGB.r, lobeRGB.g, lobeRGB.b), 0.0)) * con;
     lobe *= nz;
     float rcpL = 1.0 / (4.0 * lobe + 1.0);
     float3 o = (lobe * b + lobe * d + lobe * hh + lobe * f + e) * rcpL;
@@ -471,17 +515,20 @@ bool rcas_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Resou
     l->SetComputeRootDescriptorTable(0, gh);
     const float stops = 2.0f * (1.0f - static_cast<float>(percent > 100 ? 100 : percent) / 100.0f);
     const float con = std::exp2(-stops);
+    const float extra = percent > 100 ? float((std::min)(percent, 150u) - 100u) / 100.0f : 0.0f;
+    const float limit = 3.0f / 16.0f + extra / 32.0f;
     uint32_t k[4] = {0, w, h, 0};
     std::memcpy(&k[0], &con, 4);
+    std::memcpy(&k[3], &limit, 4);
     l->SetComputeRoot32BitConstants(1, 4, k, 0);
     l->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
     return true;
 }
-// 101..200 %: NVIDIA Image Scaling sharpen-only on top of full-strength RCAS.
+// Retained for the standalone NIS test helper; the live slider uses RCAS only.
 na::j2::NisSharpen g_nis;
 bool rcas_record(ID3D12GraphicsCommandList* l, uint32_t percent, DXGI_FORMAT fmt)
 {
-    return g.sharp && rcas_dispatch(l, g.output.Get(), g.sharp.Get(), g.w, g.h, percent, fmt, g.slot);
+    return g.sharp && rcas_dispatch(l, g.output.Get(), g.sharp.Get(), g.ow, g.oh, percent, fmt, g.slot);
 }
 
 bool ensure_device(ID3D12CommandQueue* q)
@@ -572,7 +619,8 @@ bool state_after(ID3D12CommandList* const* lists, UINT last, na_object_id id, ui
 // known sample to the camera tracker (which removes it exactly) and to DLSS.
 // Runs only while DLAA is producing frames, so the shake is never left
 // unresolved on screen.
-constexpr uint32_t kJitterPhases = 8;
+constexpr uint32_t kJitterPhases = 8; // DLAA; upscaling uses JitterPhasesFor (8 x ratio^2)
+uint32_t jitter_phases() { return g.ow && g.rw ? JitterPhasesFor(g.rw, g.ow) : kJitterPhases; }
 
 void store_matrix(const na::camera::Matrix& m, na::camera::Layout layout, uint8_t out[64])
 {
@@ -601,7 +649,23 @@ bool is_projection_of(const na::camera::Matrix& p, const na::camera::Matrix& vp)
 // A camera block's bytes hold a VP + inverse at the learned offset: start this frame's jitter.
 // Last main camera the jitter started from (a block outside the learned camera
 // slot may start a frame only if it shows that same camera, not a light's).
-struct { bool valid = false; na::camera::VpGeometry geo{}; } g_jit_cam;
+struct { bool valid = false; na::camera::VpGeometry geo{}; int hand = 0; } g_jit_cam;
+
+// Winding of a ViewProjection: the sign of the determinant of its x, y and w rows (3x3 part).
+// A mirrored camera (a planar water / mirror reflection) has the opposite winding of the main
+// camera in every engine, whatever its own convention (left- or right-handed): a universal
+// tell, used once the main camera is known.
+int handedness(const na::camera::Matrix& m)
+{
+    const double a = m[0], b = m[1], c = m[2], d = m[4], e = m[5], f = m[6], g3 = m[12], h = m[13], i = m[14];
+    const double det = a * (e * i - f * h) - b * (d * i - f * g3) + c * (d * h - e * g3);
+    return det > 0 ? 1 : det < 0 ? -1 : 0;
+}
+void remember_main_camera(const na::camera::Matrix& m)
+{
+    g_jit_cam.valid = na::camera::DecomposeViewProjection(m, g_jit_cam.geo);
+    g_jit_cam.hand = handedness(m);
+}
 
 bool same_camera(const na::camera::Matrix& m)
 {
@@ -617,10 +681,28 @@ bool same_camera(const na::camera::Matrix& m)
     return dot > 0.98 && std::abs(v.sy - p.sy) <= 0.05 * std::abs(p.sy) && d2 <= 0.01 * len2 + 100.0;
 }
 
+// A block from the camera slot starts this frame's jitter only if it continues the last main
+// camera: a water reflection's mirrored camera (or a sky / light camera) can sit in the same slot
+// and be bound earlier in the frame. Generous enough for real motion within one frame.
+bool continues_main_camera(const na::camera::Matrix& m)
+{
+    na::camera::VpGeometry v{};
+    if (!g_jit_cam.valid) return true;
+    if (!na::camera::DecomposeViewProjection(m, v)) return false;
+    if (g_jit_cam.hand && handedness(m) == -g_jit_cam.hand) return false; // mirrored: a reflection
+    const auto& p = g_jit_cam.geo;
+    double dot = 0, d2 = 0;
+    for (int j = 0; j < 3; ++j) {
+        dot += v.forward[j] * p.forward[j];
+        d2 += (v.position[j] - p.position[j]) * (v.position[j] - p.position[j]);
+    }
+    return std::acos(std::clamp(dot, -1.0, 1.0)) <= 0.25 && d2 <= 25.0 * 25.0 && std::abs(v.sy - p.sy) <= 0.05 * std::abs(p.sy);
+}
+
 bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& in_bytes, bool slot)
 {
     const size_t n = in_bytes.size();
-    if (g.camera_offset < 0 || static_cast<uint64_t>(g.camera_offset) + 64 > n || !g.w || !g.h) return false;
+    if (g.camera_offset < 0 || static_cast<uint64_t>(g.camera_offset) + 64 > n || !g.rw || !g.rh) return false;
     // jitter_batch has normalized this exact buffer range using the write ledger.
     const auto& bytes = in_bytes;
     for (auto layout : {na::camera::Layout::RowMajor, na::camera::Layout::ColumnMajor}) {
@@ -628,6 +710,7 @@ bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& in_byt
         na::camera::Candidate c{};
         if (!na::camera::ViewProjection(m, c)) continue;
         if (!slot && !same_camera(m)) continue;
+        if (slot && !continues_main_camera(m)) { ++g.stats.jitter_slot_other_camera; continue; }
         // The inverse at its learned position. A block from the camera slot must
         // carry it; another block (an earlier pass with a smaller constant buffer)
         // may start the frame from the ViewProjection alone, the inverse being
@@ -644,11 +727,11 @@ bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& in_byt
         } else {
             if (slot || !na::camera::Invert(m, inv)) continue;
         }
-        g_jit_cam.valid = na::camera::DecomposeViewProjection(m, g_jit_cam.geo);
-        const neural_alias::JitterSample js = neural_alias::temporal_jitter(++g.jit.phase, kJitterPhases);
+        remember_main_camera(m);
+        const neural_alias::JitterSample js = neural_alias::temporal_jitter(++g.jit.phase, jitter_phases());
         std::array<double, 16> src{};
         for (int i = 0; i < 16; ++i) src[i] = m[i];
-        const auto jm = neural_alias::jitter_projection(src, js, g.w, g.h);
+        const auto jm = neural_alias::jitter_projection(src, js, g.rw, g.rh);
         na::camera::Matrix jvp{}, jinv{};
         for (int i = 0; i < 16; ++i) jvp[i] = jm[i];
         if (!na::camera::Invert(jvp, jinv)) return false;
@@ -678,7 +761,7 @@ bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& in_byt
             if (is_projection_of(pm, m)) {
                 std::array<double, 16> ps{};
                 for (int i = 0; i < 16; ++i) ps[i] = pm[i];
-                const auto jp = neural_alias::jitter_projection(ps, js, g.w, g.h);
+                const auto jp = neural_alias::jitter_projection(ps, js, g.rw, g.rh);
                 na::camera::Matrix jpm{};
                 for (int i = 0; i < 16; ++i) jpm[i] = jp[i];
                 std::memcpy(j.proj, bytes.data() + po, 64);
@@ -759,7 +842,7 @@ void jitter_batch(ID3D12CommandList* const* lists, UINT count)
                 if (is_projection_of(pm, vm)) {
                     std::array<double, 16> ps{};
                     for (int i = 0; i < 16; ++i) ps[i] = pm[i];
-                    const auto jp = neural_alias::jitter_projection(ps, neural_alias::JitterSample{g.jit.px[0], g.jit.px[1]}, g.w, g.h);
+                    const auto jp = neural_alias::jitter_projection(ps, neural_alias::JitterSample{g.jit.px[0], g.jit.px[1]}, g.rw, g.rh);
                     na::camera::Matrix jpm{};
                     for (int i = 0; i < 16; ++i) jpm[i] = jp[i];
                     std::memcpy(g.jit.proj, view.data() + po, 64);
@@ -839,6 +922,49 @@ bool check_learned(const std::vector<uint8_t>& bytes, na::camera::Matrix* vp, bo
 
 bool g_injected = false; // the camera found this frame carries J1's jitter (g.jit.px)
 
+// Several blocks can hold a valid ViewProjection + inverse in the same frame: the main camera,
+// a water reflection's mirrored camera, a sky camera, a light's. Ranking blocks by how often they
+// are bound picks whichever dominates the frame's draws, which changes with where the player
+// looks (Sniper: looking down at water or up at the sky alternated cameras: no camera, false cuts,
+// unjittered frames, flicker; Cort 2026-11-01). Among the candidates the one most continuous with the
+// last main camera wins (holding the matrix J1 jittered is only a tie-break).
+struct CamPick {
+    na::camera::Matrix vp{};
+    bool reversed = false, injected = false;
+    double score = 0;
+    const Block* block = nullptr;
+    int64_t offset = 0, inv_delta = 0, proj_delta = INT64_MIN;
+};
+bool holds_jittered(const std::vector<uint8_t>& bytes, size_t off)
+{
+    return g.jit.valid && off + 64 <= bytes.size() &&
+           (!std::memcmp(bytes.data() + off, g.jit.jvp[0], 64) || !std::memcmp(bytes.data() + off, g.jit.jvp[1], 64));
+}
+double continuity(const na::camera::Matrix& m, bool injected)
+{
+    // Holding J1's jittered matrix is only a tie-break: J1 could have started on the wrong camera.
+    const double bonus = injected ? -0.05 : 0.0;
+    na::camera::VpGeometry v{};
+    if (!g_jit_cam.valid) return bonus;
+    if (!na::camera::DecomposeViewProjection(m, v)) return 1e9;
+    const double mirrored = g_jit_cam.hand && handedness(m) == -g_jit_cam.hand ? 10.0 : 0.0; // a reflection's camera
+    const auto& p = g_jit_cam.geo;
+    double dot = 0, d2 = 0;
+    for (int j = 0; j < 3; ++j) {
+        dot += v.forward[j] * p.forward[j];
+        d2 += (v.position[j] - p.position[j]) * (v.position[j] - p.position[j]);
+    }
+    return bonus + mirrored + std::acos(std::clamp(dot, -1.0, 1.0)) + std::sqrt(d2) / 25.0 + std::abs(v.sy - p.sy);
+}
+const CamPick* best_pick(const std::vector<CamPick>& v)
+{
+    const CamPick* best = nullptr;
+    for (const auto& c : v) if (!best || c.score < best->score) best = &c;
+    if (best && best != &v.front()) ++g.stats.camera_alternatives;
+    if (v.size() > 1) ++g.stats.camera_contested;
+    return best;
+}
+
 bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, na::camera::Matrix* vp, bool* reversed)
 {
     g_cd = {};
@@ -882,14 +1008,13 @@ bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth
     if (order.size() > kMaxBlocks) order.resize(kMaxBlocks);
     g_cd.blocks = order.size();
     std::vector<uint8_t> bytes(kMaxBlockRead);
-    for (const Block* o : order) {
+    const auto read_block = [&](const Block* o, na::camera::Snapshot& s) {
         const uint32_t want = o->size < kMaxBlockRead ? o->size : kMaxBlockRead;
         const uint32_t n = na::observe::ReadBuffer(o->resource, o->offset, bytes.data(), want);
-        if (n < 128) continue;
+        if (n < 128) return false;
         ++g_cd.read;
         // An in-process read at submission time, inside the submitting call:
         // its scope is known (FindMatrices rejects snapshots without one).
-        na::camera::Snapshot s{};
         s.session = s.epoch = 1;
         s.submission = s.content_version = g.frame;
         s.resource = o->resource;
@@ -897,41 +1022,119 @@ bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth
         s.complete = s.lifetime_valid = true;
         s.sync = na::camera::Sync::AppSyncUnknown;
         s.bytes.assign(bytes.begin(), bytes.begin() + n);
-        if (learned(o) && check_learned(s.bytes, vp, reversed)) {
-            ++g.stats.camera_learned_hits;
-            const size_t lo = static_cast<size_t>(g.camera_offset);
-            g_injected = g.jit.valid && lo + 64 <= s.bytes.size() &&
-                         (!std::memcmp(s.bytes.data() + lo, g.jit.jvp[0], 64) || !std::memcmp(s.bytes.data() + lo, g.jit.jvp[1], 64));
-            return true;
-        }
+        return true;
+    };
+    // 1. The learned slot: every block bound there this frame is a candidate (bounded).
+    std::vector<CamPick> picks;
+    for (const Block* o : order) {
+        if (!learned(o) || picks.size() >= 8) break;
+        na::camera::Snapshot s{};
+        if (!read_block(o, s)) continue;
+        CamPick c;
+        if (!check_learned(s.bytes, &c.vp, &c.reversed)) continue;
+        c.injected = holds_jittered(s.bytes, static_cast<size_t>(g.camera_offset));
+        c.score = continuity(c.vp, c.injected);
+        c.block = o;
+        picks.push_back(c);
+    }
+    if (const CamPick* p = picks.empty() ? nullptr : best_pick(picks)) {
+        ++g.stats.camera_learned_hits;
+        *vp = p->vp;
+        *reversed = p->reversed;
+        g_injected = p->injected;
+        return true;
+    }
+    // 2. A full search; a few candidates are compared the same way before the slot is relearned.
+    struct BlockNote { uint32_t param, size, uses, read; bool table; uint32_t vp, inv, proj, view; };
+    std::vector<BlockNote> notes;
+    CamPick loose;               // a ViewProjection WITHOUT its inverse that continues the main camera
+    bool have_loose = false;     // (accepted for this frame only; the slot is not relearned from it)
+    for (const Block* o : order) {
+        if (picks.size() >= 4) break;
+        na::camera::Snapshot s{};
+        const bool read_ok = read_block(o, s);
+        const bool noted = notes.size() < 12;
+        if (noted) notes.push_back({o->param, o->size, o->uses, read_ok ? static_cast<uint32_t>(s.bytes.size()) : 0u, o->table, 0, 0, 0, 0});
+        if (!read_ok) continue;
         const auto scan = na::camera::FindMatrices(s);
         g_cd.cands += scan.candidates.size();
         for (const auto& c : scan.candidates) {
+            if (noted) {
+                BlockNote& bn = notes.back();
+                if (c.kind == na::camera::Kind::ViewProjection) { ++bn.vp; if (c.has_inverse_pair) ++bn.inv; }
+                else if (c.kind == na::camera::Kind::Projection) ++bn.proj;
+                else ++bn.view;
+            }
             if (c.kind == na::camera::Kind::ViewProjection) ++g_cd.vp;
+            if (c.kind == na::camera::Kind::ViewProjection && !c.has_inverse_pair && !have_loose && same_camera(c.matrix)) {
+                loose.vp = c.matrix;
+                loose.reversed = c.reversed;
+                loose.block = o;
+                have_loose = true;
+            }
             if (c.kind != na::camera::Kind::ViewProjection || !c.has_inverse_pair) continue;
-            g.camera_offset = static_cast<int64_t>(c.byte_offset);
-            g.camera_inv_delta = static_cast<int64_t>(c.inverse_byte_offset) - static_cast<int64_t>(c.byte_offset);
-            g.camera_proj_delta = INT64_MIN;
+            CamPick k;
+            k.vp = c.matrix;
+            k.reversed = c.reversed;
+            k.block = o;
+            k.offset = static_cast<int64_t>(c.byte_offset);
+            k.inv_delta = static_cast<int64_t>(c.inverse_byte_offset) - static_cast<int64_t>(c.byte_offset);
             for (const auto& pc : scan.candidates)
                 if (pc.kind == na::camera::Kind::Projection && pc.layout == c.layout && is_projection_of(pc.matrix, c.matrix)) {
-                    g.camera_proj_delta = static_cast<int64_t>(pc.byte_offset) - static_cast<int64_t>(c.byte_offset);
+                    k.proj_delta = static_cast<int64_t>(pc.byte_offset) - static_cast<int64_t>(c.byte_offset);
                     break;
                 }
-            g.stats.camera_proj_delta = g.camera_proj_delta == INT64_MIN ? 0 : g.camera_proj_delta;
-            g.stats.camera_inv_delta = g.camera_inv_delta;
-            ++g.stats.camera_scans;
-            g.camera_param = static_cast<int64_t>(o->param);
-            g.camera_table = o->table;
-            g.stats.camera_offset = c.byte_offset;
-            *vp = c.matrix;
-            *reversed = c.reversed;
-            const size_t lo = static_cast<size_t>(c.byte_offset);
-            g_injected = g.jit.valid && lo + 64 <= s.bytes.size() &&
-                         (!std::memcmp(s.bytes.data() + lo, g.jit.jvp[0], 64) || !std::memcmp(s.bytes.data() + lo, g.jit.jvp[1], 64));
-            return true;
+            k.injected = holds_jittered(s.bytes, c.byte_offset);
+            k.score = continuity(k.vp, k.injected);
+            picks.push_back(k);
+            break; // one per block
         }
     }
-    return false;
+    const CamPick* p = picks.empty() ? nullptr : best_pick(picks);
+    if (!p && have_loose) {
+        // The main camera's ViewProjection without an inverse beside it (a smaller per-view
+        // block): the tracker inverts it itself; the inverse pair was only a validation, and
+        // continuity with the last main camera validates it instead. The slot is left as learned.
+        ++g.stats.camera_inverse_computed;
+        *vp = loose.vp;
+        *reversed = loose.reversed;
+        g_injected = false;
+        return true;
+    }
+    if (!p) {
+        // Why the camera was lost (diagnostics for frames like Sniper's steep views).
+        if (!g_cd.read) ++g.stats.camera_lost_unread;
+        else if (!g_cd.vp) ++g.stats.camera_lost_no_vp;
+        else ++g.stats.camera_lost_no_inverse;
+        if (g_cd.blocks >= kMaxBlocks) ++g.stats.camera_lost_capped;
+        // What the frame held (the last loss only; the status log writes it).
+        char* t = g.stats.camera_lost_evidence;
+        size_t cap = sizeof g.stats.camera_lost_evidence;
+        int n = std::snprintf(t, cap, "frame=%llu lists=%zu binds=%zu blocks=%zu read=%zu vp=%zu cands=%zu learned{param=%lld table=%d off=%lld inv=%lld} main_cam=%d blocks[param/table size uses read vp/inv/proj/view]:",
+                              static_cast<unsigned long long>(g.frame), g_cd.lists, g_cd.binds, g_cd.blocks, g_cd.read, g_cd.vp, g_cd.cands,
+                              static_cast<long long>(g.camera_param), g.camera_table ? 1 : 0, static_cast<long long>(g.camera_offset),
+                              static_cast<long long>(g.camera_inv_delta), g_jit_cam.valid ? 1 : 0);
+        for (const auto& bn : notes) {
+            if (n < 0 || static_cast<size_t>(n) >= cap) break;
+            const int m = std::snprintf(t + n, cap - static_cast<size_t>(n), " %u/%d %u %u %u %u/%u/%u/%u", bn.param, bn.table ? 1 : 0, bn.size, bn.uses, bn.read, bn.vp, bn.inv, bn.proj, bn.view);
+            if (m < 0) break;
+            n += m;
+        }
+        return false;
+    }
+    g.camera_offset = p->offset;
+    g.camera_inv_delta = p->inv_delta;
+    g.camera_proj_delta = p->proj_delta;
+    g.stats.camera_proj_delta = g.camera_proj_delta == INT64_MIN ? 0 : g.camera_proj_delta;
+    g.stats.camera_inv_delta = g.camera_inv_delta;
+    ++g.stats.camera_scans;
+    g.camera_param = static_cast<int64_t>(p->block->param);
+    g.camera_table = p->block->table;
+    g.stats.camera_offset = static_cast<uint64_t>(p->offset);
+    *vp = p->vp;
+    *reversed = p->reversed;
+    g_injected = p->injected;
+    return true;
 }
 
 na::motion::Mat4 to_mat4(const na::camera::Matrix& m)
@@ -948,11 +1151,47 @@ na::motion::Mat4 to_mat4(const na::camera::Matrix& m)
 // recorded into it (the caller then restores the game's state).
 bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, na_object_id color_id,
             ID3D12GraphicsCommandList** out_list, PendingHistory& pending, ID3D12GraphicsCommandList* inl = nullptr,
-            bool* touched = nullptr, const SceneInput* saved = nullptr, UINT prefix = 0)
+            bool* touched = nullptr, const SceneInput* saved = nullptr, UINT prefix = 0,
+            na::j2::flow::Ticket* flow_ticket = nullptr, bool flow_pair_ok = false)
 {
+    // P4-4 Layer2: an optional immutable physical snapshot for these logical ids.
+    std::shared_ptr<const PhysicalInput> phys;
+    PhysicalReport phys_report;
+    {
+        PhysicalInputProvider pp;
+        { std::lock_guard<std::mutex> lk(g_up_m); pp = g_phys; }
+        if (pp.lookup) {
+            const PhysicalLookup pl = pp.lookup(pp.ctx, color_id, depth_id, inl, &phys);
+            if (pl == PhysicalLookup::Unavailable) {
+                phys_report.arm(pp, phys ? phys->generation : 0);
+                phys_report.result = PhysicalOutcome::Unavailable;
+                std::snprintf(phys_report.why, sizeof phys_report.why, "replacement unavailable");
+                reason("Layer2: this recording was redirected but its replacement is unavailable; not evaluated.");
+                return false;
+            }
+            if (pl != PhysicalLookup::Provided) phys.reset();
+            else {
+                phys_report.arm(pp, phys ? phys->generation : 0);
+                if (!phys || !phys->color || !phys->depth || !phys->output || !phys->owner || !phys->render_w || !phys->render_h ||
+                    phys->logical_color != color_id || phys->logical_depth != depth_id || phys->output == phys->color) {
+                    phys_report.fail("the physical snapshot is incomplete or names other logical ids");
+                    reason("Layer2: the physical snapshot is incomplete or names other logical ids.");
+                    return false;
+                }
+            }
+        }
+    }
+    const auto phys_fail = [&](const char* why) {
+        if (phys) phys_report.fail(why);
+        reason(why);
+        return false;
+    };
     ComPtr<ID3D12Resource> color, depth;
-    color.Attach(na::observe::AcquireResource(color_id));
-    depth.Attach(na::observe::AcquireResource(depth_id));
+    if (phys) { color = phys->color; depth = phys->depth; } // logical ids remain the identity
+    else {
+        color.Attach(na::observe::AcquireResource(color_id));
+        depth.Attach(na::observe::AcquireResource(depth_id));
+    }
     if (!color || !depth) { reason("Scene resources are not available."); return false; }
     const D3D12_RESOURCE_DESC cd = color->GetDesc(), dd = depth->GetDesc();
     g.stats.color_mips = cd.MipLevels ? cd.MipLevels : 1;
@@ -969,8 +1208,10 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // The subresources (mip + slice) the scene pass rendered into, from its views:
     // arrays and mip chains are fine, J2 works on exactly that one through its own copies.
     uint32_t csub = 0, dsub = 0;
-    if (saved) { csub = saved->color_sub; dsub = saved->depth_sub; }
-    if ((!saved && !na::observe::ListSceneSubresource(lists[scene], color_id, depth_id, &csub, &dsub)) || csub == 0xFFFFFFFFu || dsub == 0xFFFFFFFFu) {
+    if (phys) { csub = phys->color_sub; dsub = phys->depth_sub; }
+    else if (saved) { csub = saved->color_sub; dsub = saved->depth_sub; }
+    if ((!phys && !saved && !na::observe::ListSceneSubresource(lists[scene], color_id, depth_id, &csub, &dsub)) || csub == 0xFFFFFFFFu || dsub == 0xFFFFFFFFu) {
+        if (phys) return phys_fail("Layer2: the physical subresources are invalid.");
         reason("The scene is drawn through a view NeuralAlias cannot place (several array slices at once, or an unusual view).");
         return false;
     }
@@ -986,8 +1227,35 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         return prefix ? state_after(lists, prefix - 1, id, sub, st)
                       : na::observe::KnownSubStateInCurrentSubmission(id, sub, st);
     };
-    const bool have_sc = saved ? entry_state(color_id, csub, &sc) : inl ? state_now(color_id, csub, &sc) : state_after(lists, scene, color_id, csub, &sc);
-    const bool have_sd = saved ? entry_state(depth_id, dsub, &sd) : inl ? state_now(depth_id, dsub, &sd) : state_after(lists, scene, depth_id, dsub, &sd);
+    const auto state_of = [&](na_object_id id, uint32_t sub, uint32_t* st) {
+        return saved ? entry_state(id, sub, st) : inl ? state_now(id, sub, st) : state_after(lists, scene, id, sub, st);
+    };
+    // Layer2 companions are private textures, not observed: their exact states come with them.
+    const bool have_sc = phys ? (sc = phys->color_state, true) : state_of(color_id, csub, &sc);
+    bool have_sd = phys ? (sd = phys->depth_state, true) : state_of(depth_id, dsub, &sd);
+    if (inl && !phys && !saved) {
+        // Inline only, learning and using only the state the list STARTED with (this list has
+        // not transitioned the depth so far): Astra, COMMS 2026-11-02, rendering into the depth
+        // proves its use, not its state. The same scene end reported that entry state on
+        // kDepthLearnFrames known frames in a row before it is used for an unknown one.
+        constexpr uint32_t kDepthLearnFrames = 30;
+        constexpr uint64_t kDepthLearnMaxAge = 300;
+        uint32_t in_list = 0;
+        const bool untouched = na::observe::ListStateSub(inl, depth_id, dsub, &in_list) == na::observe::StateLookup::Absent;
+        const bool same_target = g.depth_learned_id == depth_id && g.depth_learned_sub == dsub;
+        if (have_sd && untouched) {
+            if (g.depth_learned_frame != g.frame) { // once per frame
+                if (same_target && g.depth_learned_state == sd) ++g.depth_learned_streak;
+                else { g.depth_learned_streak = 1; g.depth_learned_state = sd; g.depth_learned_id = depth_id; g.depth_learned_sub = dsub; }
+                g.depth_learned_frame = g.frame;
+            }
+        } else if (!have_sd && untouched && have_sc && same_target && g.depth_learned_streak >= kDepthLearnFrames &&
+                   g.frame - g.depth_learned_frame <= kDepthLearnMaxAge && na::observe::ListRendersTo(inl, color_id, depth_id)) {
+            sd = g.depth_learned_state;
+            have_sd = true;
+            ++g.stats.depth_state_assumed;
+        }
+    }
     if (!have_sc || !have_sd) {
         ++g.stats.no_state;
         if (!have_sc) ++g.stats.no_state_color; else ++g.stats.no_state_depth;
@@ -1009,12 +1277,104 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     const DXGI_FORMAT cf = typed(cd.Format); // our copies' format
     const bool color_msaa = cd.SampleDesc.Count > 1, depth_msaa = dd.SampleDesc.Count > 1;
 
+    // P4-4: upscaling destination (slider route). Any reason not to use it falls back
+    // to DLAA at the scene's size, written back as before.
+    UpscaleTarget up;
+    { std::lock_guard<std::mutex> lk(g_up_m); up = g_up; }
+    ComPtr<ID3D12Resource> dest;
+    uint32_t rw = w, rh = h, ow = w, oh = h, dsub_out = 0, sdest = 0;
+    const auto refuse_upscale = [&](const char* why) {
+        dest.Reset();
+        rw = ow = w; rh = oh = h;
+        ++g.stats.upscale_refused;
+        std::snprintf(g.stats.upscale_note, sizeof g.stats.upscale_note, "%s", why);
+    };
+    if (phys) { // Layer2: the destination and extent come from the same snapshot
+        up.dest = 0;
+        up.dest_sub = phys->output_sub;
+        up.render_w = phys->render_w;
+        up.render_h = phys->render_h;
+    }
+    if (phys || up.dest) {
+        if (phys) dest = phys->output;
+        else dest.Attach(na::observe::AcquireResource(up.dest));
+        const uint32_t erw = up.render_w ? up.render_w : w, erh = up.render_h ? up.render_h : h;
+        if (!dest) refuse_upscale("Upscale destination is not available.");
+        else if (color_msaa) refuse_upscale("Upscaling from an MSAA scene colour is not supported.");
+        else if (erw > w || erh > h) refuse_upscale("The render extent is larger than the scene colour.");
+        else {
+            const D3D12_RESOURCE_DESC od = dest->GetDesc();
+            const uint32_t omips = od.MipLevels ? od.MipLevels : 1u;
+            const uint32_t omip = up.dest_sub % omips;
+            const uint32_t dw = (std::max)(1u, static_cast<uint32_t>(od.Width >> omip)), dh = (std::max)(1u, od.Height >> omip);
+            if (od.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || od.SampleDesc.Count != 1 ||
+                up.dest_sub >= omips * od.DepthOrArraySize)
+                refuse_upscale("The upscale destination is not a single-sample 2D texture.");
+            else if (typed(od.Format) != cf)
+                refuse_upscale("The upscale destination's format differs from the scene colour (no conversion yet).");
+            else if (dw < erw || dh < erh)
+                refuse_upscale("The upscale destination is smaller than the render extent.");
+            else {
+                rw = erw; rh = erh; ow = dw; oh = dh; dsub_out = up.dest_sub;
+            }
+        }
+    }
+    if (phys) {
+        // A Layer2 frame never falls back to DLAA: that would write into its private companion.
+        if (!dest) return phys_fail(g.stats.upscale_note[0] ? g.stats.upscale_note : "Layer2: the physical output cannot be used.");
+        sdest = phys->output_state;
+    } else {
+        if (dest && up.dest == color_id) refuse_upscale("The upscale destination is the scene colour itself.");
+        // The destination may be untouched by the game until after J2's insertion: then the
+        // state all submitted work left it in.
+        if (dest && !state_of(up.dest, dsub_out, &sdest) && !na::observe::KnownSubStateNow(up.dest, dsub_out, &sdest)) refuse_upscale("Waiting: the upscale destination's state is not established.");
+    }
+    const bool upscaling = dest != nullptr;
+
     // Camera first (nothing is allocated for a frame that cannot run); the tracker
     // update comes after the size check, because a resize resets the tracker.
     na::camera::Matrix vp{};
     bool reversed = false;
+    bool held = false, from_j1 = false;
     if (saved) { vp = saved->vp; reversed = saved->reversed; }
-    if (!saved && !find_camera(lists, scene, depth_id, &vp, &reversed)) {
+    const bool found = saved || find_camera(lists, scene, depth_id, &vp, &reversed);
+    if (!found && g.jit.valid && g.jit.applied && g.cam_f1) {
+        // Astra (COMMS 2026-11-02): the scene list's own blocks may not hold the camera, but
+        // J1 found this frame's camera in an earlier batch and rewrote it with this sample:
+        // that is the camera the frame was rendered with, and its jitter is known.
+        const auto L = g.jit.layout ? na::camera::Layout::ColumnMajor : na::camera::Layout::RowMajor;
+        const std::vector<uint8_t> jb(g.jit.jvp[g.jit.layout], g.jit.jvp[g.jit.layout] + 64);
+        const na::camera::Matrix m = na::camera::LoadMatrix(jb, 0, L);
+        na::camera::Candidate c{};
+        if (na::camera::ViewProjection(m, c)) {
+            vp = m;
+            reversed = g.cam_rev;
+            from_j1 = true;
+            ++g.stats.camera_from_j1;
+        }
+    }
+    if (!found && !from_j1) {
+        // A camera read within the last few frames: predict this frame's (unjittered,
+        // so no jitter is claimed for it) rather than leave the game's raw picture showing.
+        // A still camera (the last two reads identical: SE5's menu) holds much longer; a
+        // moving one stays within the tracker's gap limit. The same frame may also reuse
+        // its own camera (an earlier attempt read it but did not run).
+        constexpr uint64_t kMaxHeldFrames = 4, kMaxStillHeldFrames = 120;
+        bool still = g.cam_f0 != 0;
+        for (size_t i = 0; still && i < 16; ++i)
+            still = std::fabs(g.cam_u0[i] - g.cam_u1[i]) <= 1e-7 * (std::max)(1.0, std::fabs(g.cam_u1[i]));
+        const uint64_t limit = still ? kMaxStillHeldFrames : kMaxHeldFrames;
+        const bool fresh = g.cam_f1 && g.frame >= g.cam_f1 && g.frame - g.cam_f1 <= limit;
+        if (fresh && !g.resume_reset) {
+            const bool velocity = g.cam_f0 && g.cam_f1 == g.cam_f0 + 1 && g.frame == g.cam_f1 + 1;
+            vp = velocity ? na::camera::ExtrapolateViewProjection(g.cam_u0, g.cam_u1) : g.cam_u1;
+            reversed = g.cam_rev;
+            held = true;
+            ++g.stats.camera_held;
+            if (velocity) ++g.stats.camera_extrapolated;
+        }
+    }
+    if (!found && !held && !from_j1) {
         ++g.stats.no_camera;
         g.camera_offset = g.camera_param = -1; // relearn
         char why[160];
@@ -1023,13 +1383,14 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         reason(why);
         return false;
     }
-    g_jit_cam.valid = na::camera::DecomposeViewProjection(vp, g_jit_cam.geo); // J1: the main camera, for earlier batches next frame
+    if (!held) remember_main_camera(vp); // J1: the main camera, for earlier batches next frame
     // Ring slot (never wait) and size/format changes (only once the GPU is done with the old set).
     const UINT64 done = g.fence->GetCompletedValue();
     Slot& s = g.slots[g.slot];
     if (done == UINT64_MAX) { reason("Device removed."); return false; }
     if (s.fence_value && done < s.fence_value) { ++g.stats.busy; reason("Skipped: the previous use of this frame slot is still running."); return false; }
     const bool resize = !g.output || !g.color_in || g.w != w || g.h != h || g.color_format != cf ||
+                        g.rw != rw || g.rh != rh || g.ow != ow || g.oh != oh ||
                         g.samples != cd.SampleDesc.Count || g.sample_quality != cd.SampleDesc.Quality ||
                         g.depth_samples != dd.SampleDesc.Count || g.depth_quality != dd.SampleDesc.Quality || g.depth_format != dd.Format;
     if (resize) {
@@ -1049,30 +1410,85 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         if (!texture(w, h, DXGI_FORMAT_R32_FLOAT, depth_msaa, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g.depth32) ||
             !texture(w, h, DXGI_FORMAT_R32G32_FLOAT, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.motion) ||
             !texture(w, h, DXGI_FORMAT_R8_UINT, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.provenance) ||
-            !texture(w, h, cf, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.output) ||
+            !texture(ow, oh, cf, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.output) ||
             !texture(w, h, cf, false, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g.color_in) ||
-            !texture(w, h, cf, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.sharp)) {
+            !texture(ow, oh, cf, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.sharp)) {
             g.output.Reset();
             reason("Could not allocate the DLAA working textures.");
             return false;
         }
         g.w = w; g.h = h; g.color_format = cf;
+        g.rw = rw; g.rh = rh; g.ow = ow; g.oh = oh;
         g.samples = cd.SampleDesc.Count; g.sample_quality = cd.SampleDesc.Quality;
         g.depth_samples = dd.SampleDesc.Count; g.depth_quality = dd.SampleDesc.Quality; g.depth_format = dd.Format;
         g.resume_reset = true; // remains pending if this recording is not submitted
     }
     const double zero[2] = {0, 0};
-    const double* injected = saved ? saved->jitter : g_injected ? g.jit.px : zero; // sample belongs to the captured camera
+    const double* injected = held ? zero : from_j1 ? g.jit.px : saved ? saved->jitter : g_injected ? g.jit.px : zero; // sample belongs to the captured camera
+    if (!saved && !held && !from_j1 && !g_injected && g.jitter_on) { // a DLAA frame without J1's jitter: why
+        if (!g.jit.valid) ++g.stats.unjit_no_sample;
+        else if (!g.jit.applied) ++g.stats.unjit_not_applied;
+        else ++g.stats.unjit_not_held;
+    }
     pending.tracker = g.tracker;
     // DLSS's history is the last frame it evaluated, and the tracker's previous
     // camera is that same frame, so motion stays correct across a few skipped game
     // frames (a frame whose scene submissions differed): no reset, no visible
     // restart. A long gap (or resume/resize) starts over.
     constexpr uint64_t kMaxGapFrames = 4;
-    if (g.resume_reset || (g.submitted_frame && g.frame > g.submitted_frame + kMaxGapFrames)) pending.tracker.Reset();
-    const na::camera::CameraFrame cam = pending.tracker.Update(vp, g.frame, w, h, injected);
+    const bool tracker_restart = g.resume_reset || (g.submitted_frame && g.frame > g.submitted_frame + kMaxGapFrames);
+    if (tracker_restart) pending.tracker.Reset();
+    const na::camera::CameraFrame cam = pending.tracker.Update(vp, g.frame, rw, rh, injected); // active extent
     if (!cam.valid) { ++g.stats.no_camera; reason("The camera matrix could not be inverted."); return false; }
+    if (!held) { // the newest read camera (one per frame: a later attempt in the same frame replaces it)
+        if (g.cam_f1 != g.frame) { g.cam_u0 = g.cam_u1; g.cam_f0 = g.cam_f1; }
+        g.cam_u1 = cam.unjittered; g.cam_f1 = g.frame; g.cam_rev = reversed;
+    }
     pending.cut = cam.camera_cut;
+    if (cam.camera_cut) { // Cort 2026-11-02: an on/off blink every ~30 s matched cuts while standing still: record why
+        static const char* const kWhy[] = {"none", "no_history", "gap", "translation", "rotation", "fov", "origin"};
+        const char* why = tracker_restart ? (g.resume_reset ? "restart_resume" : "restart_gap") : kWhy[cam.cut_reason < 7 ? cam.cut_reason : 0];
+        char one[120];
+        std::snprintf(one, sizeof one, "%llu:%s=%.3g%s%s ", static_cast<unsigned long long>(GetTickCount64() / 100 % 100000000),
+                      why, cam.cut_value, held ? "/held" : "", from_j1 ? "/j1" : "");
+        // Newest first, keep what fits.
+        char merged[sizeof g.stats.recent_cuts];
+        std::snprintf(merged, sizeof merged, "%s%s", one, g.stats.recent_cuts);
+        std::memcpy(g.stats.recent_cuts, merged, sizeof merged);
+        if (tracker_restart) ++g.stats.cut_restarts;
+        else if (cam.cut_reason == 2) ++g.stats.cut_gap;
+        else if (cam.cut_reason >= 3 && cam.cut_reason <= 5) ++g.stats.cut_motion;
+    }
+    // P4-0b: moving-object motion (between-lists route only). The pre list is
+    // submitted right before this list; the flow pairs with the frame the camera
+    // history pairs with. Any failure leaves this frame camera-only.
+    // Flow works on the whole colour at DLAA size; upscaled frames stay camera-only for now.
+    if (flow_ticket && !inl && !color_msaa && !upscaling && na::j2::flow::Enabled()) {
+        na::j2::flow::Source fs;
+        fs.color = color.Get();
+        fs.subresource = csub;
+        fs.state = sc;
+        fs.format = cf;
+        fs.width = w;
+        fs.height = h;
+        fs.frame = g.frame;
+        fs.previous_frame = g.submitted_frame;
+        fs.generation = g.route_gen_applied;
+        fs.reset = tracker_restart || cam.camera_cut || resize;
+        fs.allow_pair = flow_pair_ok;
+        fs.jitter_px[0] = static_cast<float>(cam.jitter_px_x);
+        fs.jitter_px[1] = static_cast<float>(cam.jitter_px_y);
+        fs.slot = g.slot;
+        *flow_ticket = na::j2::flow::Prepare(g.device.Get(), g.queue.Get(), fs);
+    }
+    // Layer2 payload lifetime, before any command references it: J2's own list keeps it in its
+    // ring slot (released when the slot is reused, after its fence); a game list retains it
+    // through every submission (the existing recording retention). No retention = no use.
+    if (phys && inl) {
+        const auto lease = na::nr::native::RetainRecording(inl, std::shared_ptr<void>(std::const_pointer_cast<PhysicalInput>(phys)));
+        if (!lease) return phys_fail("Layer2: the game list's recording could not retain the physical inputs.");
+    }
+    if (!inl) s.physical = phys; // the previous use of this slot has completed (checked above)
     if (!inl && (FAILED(s.alloc->Reset()) || FAILED(s.list->Reset(s.alloc.Get(), nullptr)))) { reason("Could not reset the DLAA command list."); return false; }
     ID3D12GraphicsCommandList* l = inl ? inl : s.list.Get();
     if (touched) *touched = true;
@@ -1135,11 +1551,30 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         // projection; the arbiter removes it before reprojecting (Astra, 378663e finding).
         in.jitter_current_px[0] = static_cast<float>(cam.jitter_px_x);
         in.jitter_current_px[1] = static_cast<float>(cam.jitter_px_y);
+        // AMD is an in-list dispatch, after this frame's resolved pre-DLAA
+        // colour/depth copies. It needs no batch split or external queue wait.
+        if(na::j2::flow::Enabled() && (inl || !flow_ticket || !flow_ticket->valid)){
+            na::j2::compute_flow::Frame frame;frame.frame=g.frame;frame.previous=g.submitted_frame;
+            frame.generation=g.router.Current().history_generation;frame.slot=g.slot;
+            frame.reset=cam.camera_cut || resize || g.resume_reset;frame.hdr=is_float_color(cf);
+            frame.jitter[0]=in.jitter_current_px[0];frame.jitter[1]=in.jitter_current_px[1];
+            na::j2::compute_flow::Tier3 tier;
+            pending.compute_flow=na::j2::compute_flow::Record(l,g.queue.Get(),g.color_in.Get(),g.depth32.Get(),in,frame,tier);
+            if(tier.residual){in.tier3_valid_flag=true;in.tier3_residual=tier.residual;in.tier3_valid=tier.valid;in.tier3_mask=tier.mask;}
+        }
+        // P4-0b: camera + accepted moving-object residual (tier 3) when this frame's pair ran.
+        na::j2::flow::Tier3 t3;
+        if (flow_ticket && flow_ticket->pair && na::j2::flow::RecordFusion(l, *flow_ticket, g.depth32.Get(), in, &t3)) {
+            in.tier3_residual = t3.residual;
+            in.tier3_mask = t3.mask;
+            in.tier3_valid = t3.valid;
+            in.tier3_valid_flag = true;
+        }
         na::motion::gpu::Outputs o{};
         o.xy = g.motion.Get();
         o.provenance = g.provenance.Get();
-        o.width = w;
-        o.height = h;
+        o.width = rw; // the active extent (top left); render pixels
+        o.height = rh;
         have_motion = g.arbiter.Dispatch(l, in, o, g.slot);
     }
     if (!have_motion) {
@@ -1162,9 +1597,11 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     e.depth = g.depth32.Get();
     e.motion = g.motion.Get();
     e.output = g.output.Get();
-    e.render_w = e.max_render_w = e.out_w = w;
-    e.render_h = e.max_render_h = e.out_h = h;
-    e.quality = na::dlss::Quality::DLAA;
+    e.render_w = e.max_render_w = rw; // active extent at the top left of the inputs
+    e.render_h = e.max_render_h = rh;
+    e.out_w = ow;
+    e.out_h = oh;
+    e.quality = na::dlss::QualityForScale(rw, rh, ow, oh); // DLAA when equal
     e.preset = na::settings::Get().j2_preset.load(); // Cort: preset L by default
     e.view_id = kViewId;
     e.jitter_x = static_cast<float>(cam.jitter_px_x); // DLSS: colour sampled at pixel centre - jitter
@@ -1225,28 +1662,10 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             debug_record(l, dv, cf); // replaces the DLAA result with the debug picture
         } else if (const uint32_t pct = na::settings::Get().j2_sharpness.load(std::memory_order_relaxed)) {
             // RCAS: output -> sharp, then back into output so the write-back path is unchanged.
-            // Above 100 %, NIS sharpens sharp -> output instead of the copy.
             b.push_back(uav_barrier(g.output.Get()));
             add(b, g.output.Get(), UAV, NPSR);
             flush(l, b);
-            if (pct > 100 && rcas_record(l, 100, cf)) {
-                b.push_back(uav_barrier(g.sharp.Get()));
-                add(b, g.sharp.Get(), UAV, NPSR);
-                add(b, g.output.Get(), NPSR, UAV);
-                flush(l, b);
-                if (g_nis.Dispatch(g.device.Get(), l, g.sharp.Get(), g.output.Get(), g.w, g.h, cf, is_float_color(cf), pct, g.slot)) {
-                    ++g.stats.nis_frames;
-                    add(b, g.sharp.Get(), NPSR, UAV);
-                } else { // NIS unavailable: keep the RCAS result
-                    add(b, g.output.Get(), UAV, DST);
-                    add(b, g.sharp.Get(), NPSR, SRC);
-                    flush(l, b);
-                    l->CopyResource(g.output.Get(), g.sharp.Get());
-                    add(b, g.output.Get(), DST, UAV);
-                    add(b, g.sharp.Get(), SRC, UAV);
-                }
-                ++g.stats.sharpened_frames;
-            } else if (pct <= 100 && rcas_record(l, pct, cf)) {
+            if (rcas_record(l, pct, cf)) {
                 b.push_back(uav_barrier(g.sharp.Get()));
                 add(b, g.sharp.Get(), UAV, SRC);
                 add(b, g.output.Get(), NPSR, DST);
@@ -1261,8 +1680,23 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             flush(l, b);
         }
     }
-    // 5. result -> scene colour, everything back to the game's states
-    if (evaluated) {
+    // 5. result -> scene colour (DLAA) or the upscale destination, everything back to the game's states
+    if (evaluated && upscaling) {
+        b.push_back(uav_barrier(g.output.Get()));
+        add(b, g.output.Get(), UAV, SRC);
+        addsub(b, color.Get(), csub, color_source, sc); // the game's scene colour is left as drawn
+        addsub(b, dest.Get(), dsub_out, sdest, DST);
+        flush(l, b);
+        D3D12_TEXTURE_COPY_LOCATION cs{}, cdst{};
+        cs.Type = cdst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        cs.pResource = g.output.Get();
+        cdst.pResource = dest.Get();
+        cdst.SubresourceIndex = dsub_out;
+        const D3D12_BOX box{0, 0, 0, ow, oh, 1};
+        l->CopyTextureRegion(&cdst, 0, 0, 0, &cs, &box);
+        add(b, g.output.Get(), SRC, UAV);
+        addsub(b, dest.Get(), dsub_out, DST, sdest);
+    } else if (evaluated) {
         b.push_back(uav_barrier(g.output.Get()));
         const UINT output_read = color_msaa ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : SRC;
         const UINT color_write = color_msaa ? D3D12_RESOURCE_STATE_RENDER_TARGET : DST;
@@ -1307,6 +1741,13 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     g.stats.width = w;
     g.stats.height = h;
     g.stats.color_format = static_cast<uint32_t>(cd.Format);
+    g.stats.render_w = rw;
+    g.stats.render_h = rh;
+    g.stats.out_w = ow;
+    g.stats.out_h = oh;
+    g.stats.jitter_phases = jitter_phases();
+    if (upscaling) { ++g.stats.upscaled_frames; g.stats.upscale_note[0] = 0; }
+    if (phys) phys_report.result = PhysicalOutcome::Evaluated;
     *out_list = l;
     return true;
 }
@@ -1555,6 +1996,28 @@ void SetEnabled(bool on)
     if (on) na::observe::SetTableBindCallback(&on_table_bind);
 }
 bool Enabled() { return na::settings::EffectsReady() && g.enabled.load(); }
+PhysicalReport::~PhysicalReport()
+{
+    if (!armed) return;
+    if (result == PhysicalOutcome::Evaluated) ++g.stats.physical_evaluated;
+    else if (result == PhysicalOutcome::Unavailable) ++g.stats.physical_unavailable;
+    else ++g.stats.physical_failed;
+    if (p.outcome) p.outcome(p.ctx, generation, result, why[0] ? why : "J2 could not evaluate this frame (see its status)");
+}
+void SetPhysicalInputProvider(const PhysicalInputProvider& p) { std::lock_guard<std::mutex> lk(g_up_m); g_phys = p; }
+void SetUpscaleTarget(const UpscaleTarget& t) { std::lock_guard<std::mutex> lk(g_up_m); g_up = t; }
+UpscaleTarget GetUpscaleTarget() { std::lock_guard<std::mutex> lk(g_up_m); return g_up; }
+uint32_t JitterPhasesFor(uint32_t render_w, uint32_t out_w)
+{
+    if (!render_w || out_w <= render_w) return kJitterPhases;
+    const double r = static_cast<double>(out_w) / render_w;
+    return static_cast<uint32_t>((std::min)(64.0, std::ceil(kJitterPhases * r * r)));
+}
+float UpscaleMipBias(uint32_t render_w, uint32_t out_w)
+{
+    if (!render_w || !out_w) return -1.0f;
+    return static_cast<float>(std::log2(static_cast<double>(render_w) / out_w)) - 1.0f;
+}
 bool Configured() { return g.configured.load(); }
 void SetPaused(bool paused)
 {
@@ -1607,6 +2070,12 @@ void OnPresent(ID3D12CommandQueue* queue)
             na::capture::j2::OnFrameClosed(g.frame, late - g.route_prev_late); // evidence capture identity
             o.camera_missed = g.stats.no_camera > g.route_prev_no_camera;
             o.depth_state_missed = g.stats.no_state > g.route_prev_no_state;
+            if (!o.executed && g.stats.frames) { // a present without DLAA, once DLAA has run at all: why
+                if (o.camera_missed) ++g.stats.miss_no_camera;
+                else if (o.depth_state_missed) ++g.stats.miss_no_state;
+                else if (g.inline_mode && g.inl_frame != g.frame) ++g.stats.miss_no_candidate;
+                else ++g.stats.miss_other;
+            }
             {
                 // Current-frame ownership by a supported upscaler: the GAME's own evaluations
                 // this frame (J2's NGX calls are marked as injector calls and excluded).
@@ -1880,6 +2349,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
                 slot.fence_value = g.fence_next++;
                 queue->Signal(g.fence.Get(), slot.fence_value);
                 na::capture::j2::Submitted(pending.capture, queue, g.stats.submissions);
+                na::j2::compute_flow::Committed(pending.compute_flow);
                 reason("Live DLAA is running before a learned post-processing consumer in a separate list.");
                 return;
             }
@@ -1900,6 +2370,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         g.slots[g.inl.slot].fence_value = g.fence_next++;
         queue->Signal(g.fence.Get(), g.slots[g.inl.slot].fence_value);
         na::capture::j2::Submitted(g.inl.history.capture, queue, g.stats.submissions);
+        na::j2::compute_flow::Committed(g.inl.history.compute_flow);
         g.inl.history.capture = 0;
         g.inl.valid = false;
         reason("Live DLAA is running inside the game's scene list (post-processing shares it).");
@@ -1972,6 +2443,11 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     const bool wait_later = scene >= 0 && g.scene_batches_cur < g.scene_batches_target;
     ID3D12GraphicsCommandList* ours = nullptr;
     PendingHistory pending;
+    // P4-0b: the flow pair needs a GPU wait between our pre list and our DLAA list.
+    // Without the diagnostic split switch that is only done when no game list follows
+    // the scene list in this submission (the game's lists keep their grouping).
+    na::j2::flow::Ticket flow_ticket;
+    const bool flow_pair_ok = scene >= 0 && (static_cast<UINT>(scene) + 1 == count || na::j2::flow::AllowSplit());
     if (scene < 0) {
         ++g.stats.no_scene_list;
     } else if (wait_later) {
@@ -1981,7 +2457,8 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     } else {
         if (!dlss_on()) {
             // reason set
-        } else if (record(lists, static_cast<UINT>(scene), depth_id, color_id, &ours, pending)) {
+        } else if (record(lists, static_cast<UINT>(scene), depth_id, color_id, &ours, pending, nullptr, nullptr, nullptr, 0,
+                          &flow_ticket, flow_pair_ok)) {
             g.stats.later_passes = na::observe::ListTargetsAfter(lists[scene], color_id, depth_id);
         }
     }
@@ -1989,6 +2466,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     if (scene >= 0 && !wait_later) g.jit.valid = false; // the scene closes this frame's jitter: the next camera block starts a new sample
     if (!ours) {
         na::capture::j2::Discard(pending.capture, false); // our list is reset before any GPU use
+        na::j2::flow::Abandon(queue, flow_ticket);        // never leaves the flow engine waiting
         lock.unlock();
         forward(queue, count, lists);
         return;
@@ -1996,12 +2474,14 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     if (before_reader) ++g.stats.between_observed; // an observed reader follows in this batch
     else ++g.stats.between_predicted;              // placed after a predicted last scene list
     std::vector<ID3D12CommandList*> batch(lists, lists + count);
-    batch.insert(batch.begin() + scene + 1, ours);
+    UINT ours_at = static_cast<UINT>(scene) + 1;
+    if (flow_ticket.valid) batch.insert(batch.begin() + ours_at++, flow_ticket.pre); // P4-0b pre list, right before ours
+    batch.insert(batch.begin() + ours_at, ours);
     const UINT n2 = static_cast<UINT>(batch.size());
     Slot& s = g.slots[g.slot];
     g.slot = (g.slot + 1) % kRing;
     na::dlss::BeforeExecute(queue, n2, batch.data());
-    forward(queue, n2, batch.data());
+    na::j2::flow::Submit(queue, flow_ticket, batch.data(), n2, ours_at, forward); // one forward unless a flow pair is consumed
     if (g.jitter_on) count_post_dlaa(lists, static_cast<UINT>(scene) + 1, count, depth_id); // same batch, after the DLAA list
     // The void D3D12 forward has now submitted our list. Failed recording/NGX
     // attempts above must never replace the previous submitted camera.
@@ -2022,6 +2502,8 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     na::dlss::OnExecuted(queue, n2, batch.data());
     s.fence_value = g.fence_next++;
     queue->Signal(g.fence.Get(), s.fence_value);
+    na::j2::flow::Committed(flow_ticket, g.fence.Get(), s.fence_value);
+    na::j2::compute_flow::Committed(pending.compute_flow);
     na::capture::j2::Submitted(pending.capture, queue, g.stats.submissions);
 }
 
@@ -2037,6 +2519,8 @@ void Shutdown()
     g.depth32.Reset(); g.motion.Reset(); g.provenance.Reset(); g.output.Reset(); g.color_in.Reset(); g.sharp.Reset();
     g.msaa = MsaaResolve{};
     for (auto& s : g.slots) { s.list.Reset(); s.alloc.Reset(); s.fence_value = 0; }
+    na::j2::flow::Shutdown(); // before the device and J2's fence go
+    na::j2::compute_flow::Reset();
     g.fence.Reset(); g.queue.Reset(); g.device.Reset();
     g.arbiter = na::motion::gpu::Arbiter{};
     g_dbg = DebugPass{};
@@ -2044,6 +2528,8 @@ void Shutdown()
     g_nis.Reset();
     g.arbiter_ok = false;
     g.tracker.Reset();
+    g.cam_f0 = g.cam_f1 = 0;
+    g.depth_learned_streak = 0; g.depth_learned_frame = 0; g.depth_learned_id = 0; g.depth_learned_sub = 0xFFFFFFFFu;
     g.frame = 1;
     g.submitted_frame = 0;
     g.scene_batches_cur = g.scene_batches_target = 0;
@@ -2073,6 +2559,7 @@ void Shutdown()
     g.inline_camera_submitted = false;
     g.resume_reset = false;
     g.w = g.h = 0;
+    g.rw = g.rh = g.ow = g.oh = 0;
 }
 
 } // namespace na::j2

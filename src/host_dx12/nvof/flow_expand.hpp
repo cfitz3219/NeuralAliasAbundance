@@ -62,11 +62,12 @@ public:
     // Depth-aware expansion with validity.
     bool DispatchDepthAware(ID3D12GraphicsCommandList* list, ID3D12Resource* grid_rg16_sint, uint32_t grid,
                             const ExpandParams& params, ID3D12Resource* out_rg32f, uint32_t out_w, uint32_t out_h,
-                            uint32_t frame_slot);
+                            uint32_t frame_slot, Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>* recording_heap=nullptr);
 
 private:
     bool dispatch(ID3D12GraphicsCommandList* list, ID3D12Resource* grid_tex, uint32_t grid, const ExpandParams* params,
-                  ID3D12Resource* out, uint32_t out_w, uint32_t out_h, uint32_t frame_slot);
+                  ID3D12Resource* out, uint32_t out_w, uint32_t out_h, uint32_t frame_slot,
+                  Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>* recording_heap=nullptr);
     float vector_scale_ = 1.0f;
     Microsoft::WRL::ComPtr<ID3D12Device> device_;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> root_;

@@ -227,7 +227,7 @@ std::unordered_map<na_object_id, const void*> g_res_keys; // resource id -> cano
 std::atomic<uint64_t> g_next_id{1};
 
 struct Counters {
-    std::atomic<uint64_t> nested_unlocked{0};
+    std::atomic<uint64_t> nested_unlocked{0}, serialized{0};
     std::atomic<uint64_t> snap_reread{0}, preexisting_resources{0}, preexisting_heaps{0}, sample_known_state{0}, known_clears{0};
     std::atomic<uint64_t> sample_missing_recording{0}, sample_partial_coverage{0}, sample_partial_states{0}, sample_no_transition{0};
     std::atomic<uint64_t> live{0}, created{0}, retired{0}, writes{0}, copies{0}, unresolved{0}, sentinel_fail{0},
@@ -275,7 +275,13 @@ struct ResKnown {
     bool has_all = false;
     uint32_t all = kStatePending;
     std::unordered_map<uint32_t, uint32_t> subs;
+    uint8_t reset_why = 0;  // diagnostics: why its states last became unknown (KnownReset)
 };
+// Why a carried state became unknown (diagnostics only; DescribeStateEvidence names it).
+enum KnownReset : uint8_t { kResetNone, kResetStoreClear, kResetOverlap, kResetUnordered, kResetOtherQueue, kResetSubs, kResetPendingNote,
+                            kResetAmbiguous, kResetTainted, kResetEpoch, kResetCopyQueue };
+const char* const kResetNames[] = {"none", "store_clear", "overlapped_submissions", "unordered_submission", "other_queue", "too_many_subresources", "split_or_aliasing_barrier",
+                                   "ambiguous_queue_order", "unknown_submission_in_flight", "store_cleared_meanwhile", "copy_queue_decay"};
 constexpr size_t kMaxKnown = 65536, kMaxKnownSubs = 64;
 std::mutex g_known_m;
 std::unordered_map<na_object_id, ResKnown> g_known; // under g_known_m (never taken before g_m or g_samples_m)
@@ -296,8 +302,9 @@ void known_forget(na_object_id id)
     std::lock_guard<std::mutex> lock(g_known_m);
     g_known.erase(id);
 }
-void known_reset_locked(ResKnown& k)
+void known_reset_locked(ResKnown& k, KnownReset why)
 {
+    k.reset_why = why;
     k.queue = 0;
     k.has_all = false;
     k.all = kStatePending;
@@ -306,7 +313,7 @@ void known_reset_locked(ResKnown& k)
 // Entries stay (eligibility and in-flight marks are kept); states become unknown.
 void known_clear_locked()
 {
-    for (auto& kv : g_known) known_reset_locked(kv.second);
+    for (auto& kv : g_known) known_reset_locked(kv.second, kResetStoreClear);
     ++g_known_epoch;
     g_c.known_clears.fetch_add(1);
 }
@@ -438,8 +445,12 @@ private:
     uint32_t kind_;
 };
 
+std::atomic<bool> g_process_exiting{false};
 void RetireSentinel::retire(const void* key, na_object_id id, uint32_t kind)
 {
+    // SE5 exit crashes (c0000005 at retire, symbolicated 2026-11-02): exit-time destructors of
+    // other statics released D3D12 objects after the CRT had destroyed g_m / g_heaps / g_va.
+    if (g_process_exiting.load(std::memory_order_acquire)) return;
     g_retire_gen.fetch_add(1, std::memory_order_acq_rel);
     std::shared_ptr<Obj::Twins> drop; // parked, never released here (we are inside the owner's destruction)
     {
@@ -4272,7 +4283,8 @@ void known_publish(SubmissionCapture& c, na_object_id qid, bool ambiguous)
         auto it = g_known.find(m.id);
         if (it == g_known.end()) continue; // retired meanwhile
         if (valid && m.alone && it->second.mark_seq == m.seq) good.push_back(m.id);
-        else known_reset_locked(it->second); // overlapped / ambiguous / cleared / copy-queue decay
+        else known_reset_locked(it->second, valid ? kResetOverlap : ambiguous ? kResetAmbiguous : c.tainted ? kResetTainted :
+                                             c.epoch != g_known_epoch ? kResetEpoch : kResetCopyQueue); // the exact cause, for the log
     }
     std::sort(good.begin(), good.end());
     std::vector<na_object_id> claimed; // ids whose queue ownership was settled in this publication
@@ -4281,7 +4293,7 @@ void known_publish(SubmissionCapture& c, na_object_id qid, bool ambiguous)
         ResKnown& k = g_known[n.resource];
         if (std::find(claimed.begin(), claimed.end(), n.resource) == claimed.end()) {
             claimed.push_back(n.resource);
-            if (k.queue && k.queue != qid) known_reset_locked(k); // another queue's timeline: start over
+            if (k.queue && k.queue != qid) known_reset_locked(k, kResetOtherQueue); // another queue's timeline: start over
             k.queue = qid;
         }
         if (n.subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) {
@@ -4289,11 +4301,12 @@ void known_publish(SubmissionCapture& c, na_object_id qid, bool ambiguous)
             k.all = n.state_after;
             k.subs.clear();
         } else if (k.subs.size() >= kMaxKnownSubs && !k.subs.count(n.subresource)) {
-            known_reset_locked(k);
+            known_reset_locked(k, kResetSubs);
             k.queue = qid;
         } else {
             k.subs[n.subresource] = n.state_after;
         }
+        if (n.state_after == kStatePending) k.reset_why = kResetPendingNote;
     }
     for (const auto& m : c.marks) {
         auto it = g_known.find(m.id);
@@ -4649,12 +4662,19 @@ ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue, uint32_t count, ID3D12Comma
     t_cur_qid = qid;
     t.cur_set = true;
     t.list_type = static_cast<uint32_t>(type);
-    if (!t_host_work && t_submit_depth == 0 && g_armed.load(std::memory_order_acquire)) { // C9B-R3
+    // Serialize game work per queue (C9B-R3 for samples; SE5 2026-11-02 for the known-state
+    // store): two threads submitting to one queue at once leave the GPU order unknown, which
+    // resets every carried state they touch (ambiguous_queue_order) and cost J2 the depth state
+    // on ~1/4 of SE5's menu frames. The runtime serializes a queue's submissions anyway, so the
+    // lock only fixes the order we observe to the order the queue receives.
+    const bool armed = g_armed.load(std::memory_order_acquire);
+    if (!t_host_work && t_submit_depth == 0) { // Signal/Wait too: they share the queue's order
         qs->submit_m.lock();
         ++t_submit_depth;
         t.submit_locked = true;
+        if (!armed) g_c.serialized.fetch_add(1);
         static const SubmissionCapture kNoLists;
-        acquire_sample_sources(queue, qid, type, cap ? *cap : kNoLists); // before the original runs (C9B-REVIEW-2 #2)
+        if (armed) acquire_sample_sources(queue, qid, type, cap ? *cap : kNoLists); // before the original runs (C9B-REVIEW-2 #2)
     }
     const auto occurrence = qs->occurrences.Begin();
     t.queue_state = qs;
@@ -5196,12 +5216,14 @@ void DescribeStateEvidence(ID3D12CommandList* list, na_object_id id, uint32_t su
     std::lock_guard<std::mutex> lock(g_known_m);
     const auto k = g_known.find(id);
     uint32_t value = kStatePending;
+    const char* why = kResetNames[kResetNone];
     if (k != g_known.end()) {
         const auto s = k->second.subs.find(sub);
         value = s != k->second.subs.end() ? s->second : k->second.has_all ? k->second.all : kStatePending;
+        if (k->second.reset_why < sizeof kResetNames / sizeof kResetNames[0]) why = kResetNames[k->second.reset_why];
     }
-    std::snprintf(text, capacity, "kind=%u list_covered=%u list_complete=%u registered=%u state=0x%x marks=%u unknown_submissions=%u disabled=%u unhooked_queues=%llu",
-                  kind, covered ? 1u : 0u, complete ? 1u : 0u, k != g_known.end() ? 1u : 0u, value,
+    std::snprintf(text, capacity, "kind=%u list_covered=%u list_complete=%u registered=%u state=0x%x last_unknown=%s marks=%u unknown_submissions=%u disabled=%u unhooked_queues=%llu",
+                  kind, covered ? 1u : 0u, complete ? 1u : 0u, k != g_known.end() ? 1u : 0u, value, why,
                   k != g_known.end() ? k->second.in_flight : 0u, g_unknown_inflight,
                   g_known_disabled.load() ? 1u : 0u, static_cast<unsigned long long>(g_unhooked_queues.load()));
 }
@@ -5323,6 +5345,8 @@ void SetExecuteForwarder(void(STDMETHODCALLTYPE* fwd)(ID3D12CommandQueue*, UINT,
     g_exec_forward.store(fwd, std::memory_order_release);
 }
 
+void SetProcessExiting() { g_process_exiting.store(true, std::memory_order_release); }
+
 ProducerStats GetProducerStats()
 {
     ProducerStats s{};
@@ -5348,6 +5372,7 @@ ProducerStats GetProducerStats()
     s.sample_partial_states = g_c.sample_partial_states.load();
     s.sample_no_transition = g_c.sample_no_transition.load();
     s.nested_unlocked = g_c.nested_unlocked.load();
+    s.serialized_submissions = g_c.serialized.load();
     s.snapshots_reread = g_c.snap_reread.load();
     s.preexisting_resources = g_c.preexisting_resources.load();
     s.preexisting_heaps = g_c.preexisting_heaps.load();
