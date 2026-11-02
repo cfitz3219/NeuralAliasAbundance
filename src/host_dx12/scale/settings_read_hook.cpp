@@ -615,13 +615,17 @@ LONG NTAPI nt_map_ex(HANDLE sec, HANDLE proc, PVOID* base, PLARGE_INTEGER off, P
 }
 
 // A value in the game's save is one we put there: the substituted text, or (any formatting)
-// the substituted value or a live value we wrote.
+// the substituted value or a live value we wrote, or that value ROUNDED to the game's own slider
+// step (SE5 2026-11-02: given 0.666668 it used and saved 0.65, its 5 % step, which a strict match
+// missed and Cort's file kept 65 %). Within 5 % (one coarse slider step) of a value we wrote counts
+// as ours; a user who moves the game's slider to within 5 % of our value gets the original back.
 bool ours_value(const Patched& p, const std::string& text, double v)
 {
     if (text == p.ours) return true;
-    const auto close_to = [&](double a) { return std::fabs(v - a) <= 1e-5 * (std::max)(1.0, std::fabs(a)); };
-    if (close_to(std::atof(p.ours.c_str()))) return true;
-    for (double w : g_live.values_written) if (close_to(w)) return true;
+    const double step = p.unit == Unit::Percent ? 5.0 : 0.05;
+    const auto near_to = [&](double a) { return std::fabs(v - a) <= step + 1e-6 * (std::max)(1.0, std::fabs(a)); };
+    if (near_to(std::atof(p.ours.c_str()))) return true;
+    for (double w : g_live.values_written) if (near_to(w)) return true;
     return false;
 }
 

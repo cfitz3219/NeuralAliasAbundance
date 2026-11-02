@@ -147,6 +147,15 @@ int main()
         DeleteFileW(twin.c_str());
         RemoveDirectoryW(dir.c_str());
     }
+    // The game rounds our value to its slider step and saves that (SE5: 0.666668 -> 0.65): put back.
+    {
+        std::string snapped = ini;
+        snapped.replace(snapped.find("1.000000"), 8, "0.650000");
+        na::scale::Configure(0.5, log.c_str());
+        CHECK(write_all(opt, snapped));
+        na::scale::Configure(0, nullptr);
+        CHECK(read_all(opt) == ini);
+    }
     // A value the user changed in the game's menu is saved as it is.
     std::string user = ini;
     user.replace(user.find("1.000000"), 8, "0.800000");
