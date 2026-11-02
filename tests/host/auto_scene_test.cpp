@@ -167,7 +167,7 @@ float4 water(float4 position:SV_Position):SV_Target{uint2 p=uint2(position.xy);f
         d.WaitIdle();na::scale::PollAutomaticScene();const auto status=na::scale::GetAutomaticSceneStats();
         std::printf("automatic: %u plans %u members %ux%u, redirected %llu misses %llu: %s | J2: %s\n",status.plans,status.members,status.render_w,status.render_h,(unsigned long long)status.redirected,(unsigned long long)status.misses,status.reason,na::j2::GetStats().reason);
     };
-    for(int i=0;i<4;++i)frame(false);
+    for(int i=0;i<8;++i)frame(false);
     auto status=na::scale::GetAutomaticSceneStats();
     if(unsupported){
         CHECK(status.failed_plans>0&&status.redirected==0);
@@ -179,6 +179,23 @@ float4 water(float4 position:SV_Position):SV_Target{uint2 p=uint2(position.xy);f
         REQUIRE(pixels(d,color.Get(),w-.5f,h)==0);
     }else{
     CHECK(status.plans>0&&status.members==4&&status.redirected>0);
+    // A one-Present menu candidate must not discard the learned scene. A
+    // stable alternate selection may switch, then restoring the original pair
+    // must reuse its prepared group rather than allocate/relearn everything.
+    auto alternate_color=test::CreateTexture(dev,w,h,DXGI_FORMAT_R16G16B16A16_FLOAT,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    auto alternate_depth=test::CreateTexture(dev,w,h,depth_resource,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    REQUIRE(alternate_color&&alternate_depth);
+    const auto learned_generation=status.generation,learned_builds=status.group_builds;
+    na::observe::SetLiveSelection(na::observe::IdOf(alternate_depth.Get()),na::observe::IdOf(alternate_color.Get()));
+    na::scale::AutomaticScenePresent();
+    na::observe::SetLiveSelection(na::observe::IdOf(depth.Get()),na::observe::IdOf(color.Get()));
+    frame(false);CHECK(na::scale::GetAutomaticSceneStats().generation==learned_generation);
+    na::observe::SetLiveSelection(na::observe::IdOf(alternate_depth.Get()),na::observe::IdOf(alternate_color.Get()));
+    for(int i=0;i<3;++i)na::scale::AutomaticScenePresent();
+    na::observe::SetLiveSelection(na::observe::IdOf(depth.Get()),na::observe::IdOf(color.Get()));
+    for(int i=0;i<3;++i)na::scale::AutomaticScenePresent();
+    frame(false);status=na::scale::GetAutomaticSceneStats();
+    CHECK(status.generation==learned_generation&&status.group_builds==learned_builds);
     REQUIRE(pixels(d,color.Get(),float(status.render_w)+.5f,float(status.render_h))==0);
     REQUIRE(pixels(d,color_copy.Get(),float(status.render_w),float(status.render_h))==0);
     frame(true);const auto js=na::j2::GetStats();

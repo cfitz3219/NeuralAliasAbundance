@@ -59,30 +59,51 @@ struct Run {
 struct Bound {std::shared_ptr<Run> run;na::nr::native::RecordingLease lease;};
 struct Submission {std::shared_ptr<Run> run;ComPtr<ID3D12CommandQueue> queue;std::vector<ID3D12CommandList*> lists;};
 thread_local std::shared_ptr<Submission> submission,reporting;
-
-class Automatic final:public BindingProvider,public na::observe::TextureOperationHook,public std::enable_shared_from_this<Automatic>{
-public:
-    std::mutex mutex;bool enabled=false;uint64_t epoch=1,color=0,depth=0,model=0,next_generation=1;
+struct SelectionContext {
+    uint64_t color=0,depth=0,model=0;
     std::map<uint64_t,MemberSeed> members;
     std::map<uint64_t,std::pair<uint64_t,ComPtr<ID3D12Resource>>> copied_from;
     std::unordered_map<uint64_t,std::shared_ptr<const NativeOperation>> observed;
     std::unordered_map<uint64_t,uint64_t> last_seen;
     std::deque<uint64_t> pending;
     std::unordered_set<uint64_t> queued;
-    std::atomic<bool> work_pending{false};
     uint64_t group_revision=1,worker_revision=0,failed_group_revision=0,last_novel_epoch=0;
     int worker_mode=-1,failed_group_mode=-1;
     bool worker_optimal=false,failed_group_optimal=false;
     std::map<TransferKey,TransferSpec> observed_transfers;
     std::shared_ptr<Built> built,prepared;std::shared_ptr<Run> current;
     std::map<uint64_t,uint64_t> list_queues;
+    ComPtr<ID3D12CommandQueue> execution_queue;
+};
+class Automatic final:public SelectionContext,public BindingProvider,public na::observe::TextureOperationHook,public std::enable_shared_from_this<Automatic>{
+public:
+    std::mutex mutex;bool enabled=false;uint64_t epoch=1,next_generation=1;
+    std::atomic<bool> work_pending{false};
+    std::deque<SelectionContext> selections,retired_selections;
+    uint64_t candidate_color=0,candidate_depth=0,candidate_since=0;
     std::map<std::pair<uint64_t,uint64_t>,Bound> bound;
-    AutomaticSceneStats stats;ComPtr<ID3D12CommandQueue> execution_queue;
+    AutomaticSceneStats stats;
     void note(const char* text){std::snprintf(stats.reason,sizeof stats.reason,"%s",text);}
     bool selected(uint64_t c,uint64_t d){return c&&d&&color==c&&depth==d;}
-    void select(uint64_t c,uint64_t d){
-        if(selected(c,d))return;color=c;depth=d;members.clear();copied_from.clear();observed.clear();last_seen.clear();observed_transfers.clear();built.reset();current.reset();++model;
-        prepared.reset();execution_queue.Reset();list_queues.clear();pending.clear();queued.clear();++group_revision;work_pending.store(true);note("Identifying the scene's rendering operations.");
+    bool select(uint64_t c,uint64_t d){
+        if(selected(c,d)){candidate_color=candidate_depth=candidate_since=0;return true;}
+        if(candidate_color!=c||candidate_depth!=d){candidate_color=c;candidate_depth=d;candidate_since=epoch;return false;}
+        if(epoch-candidate_since<2)return false;
+        SelectionContext previous=std::move(static_cast<SelectionContext&>(*this));
+        const auto cached=std::find_if(selections.begin(),selections.end(),[&](const auto& s){return s.color==c&&s.depth==d;});
+        if(cached!=selections.end()){static_cast<SelectionContext&>(*this)=std::move(*cached);selections.erase(cached);}
+        else{static_cast<SelectionContext&>(*this)=SelectionContext{};color=c;depth=d;}
+        current.reset();if(previous.color&&previous.depth)selections.push_back(std::move(previous));
+        // Current + one archived scene. Release discarded COM references on
+        // the control worker, never while a recording thread holds this lock.
+        while(selections.size()>1){retired_selections.push_back(std::move(selections.front()));selections.pop_front();}
+        candidate_color=candidate_depth=candidate_since=0;work_pending.store(true);
+        const auto latest=prepared?prepared:built;
+        if(latest&&latest->group){stats.generation=latest->group->Generation();stats.render_w=latest->group->Render().width;stats.render_h=latest->group->Render().height;
+            stats.out_w=latest->group->Output().width;stats.out_h=latest->group->Output().height;stats.members=UINT(members.size());stats.plans=UINT(latest->bindings.size());
+            stats.failed_plans=latest->failed.size()+latest->failed_transfers.size();note("Using the scene's previously prepared rendering path.");}
+        else note("Identifying the scene's rendering operations.");
+        return true;
     }
     bool member(uint64_t id,ID3D12Resource* resource,Role role){
         if(!id||!resource||members.count(id))return false;
@@ -141,7 +162,7 @@ public:
         if(na::settings::Get().j2_scale_mode.load()==0)return {};
         uint64_t d=0,c=0;na::observe::GetLiveSelection(&d,&c);if(!c||!d)return {};
         NativeOperation op;const bool have=na::observe::ListNativeOperation(list,call.kind==na::observe::ShaderKind::Dispatch,op);
-        std::lock_guard<std::mutex> lock(mutex);if(!enabled)return {};select(c,d);++stats.operations;
+        std::lock_guard<std::mutex> lock(mutex);if(!enabled||!selected(c,d))return {};++stats.operations;
         auto run=run_for(list);
         if(!have){if(run)abort(list,run,"An operation's native bindings are not yet available.");return {};}
         bool scene=!op.compute&&op.depth.view.resource==d;
@@ -200,9 +221,10 @@ public:
     }
     na::observe::ShaderScope Before(ID3D12GraphicsCommandList* list,const TextureCall& call)noexcept override{
         if(na::settings::Get().j2_scale_mode.load()==0)return {};
+        uint64_t d=0,c=0;na::observe::GetLiveSelection(&d,&c);
         const auto key=transfer_key(call);na::observe::OperationDescriptor descriptor;
         if(call.target.ptr)na::observe::NativeDescriptor(call.target,descriptor);
-        std::lock_guard<std::mutex> lock(mutex);if(!enabled)return {};
+        std::lock_guard<std::mutex> lock(mutex);if(!enabled||!selected(c,d))return {};
         if((call.kind==TextureKind::Copy||call.kind==TextureKind::CopyRegion||call.kind==TextureKind::Resolve)&&(members.count(key.source)||copied_from.count(key.source))&&call.destination){
             const auto a=call.source->GetDesc(),b=call.destination->GetDesc();
             if(a.Width==b.Width&&a.Height==b.Height&&(copied_from.size()<256||copied_from.count(key.destination)))copied_from[key.destination]={key.source,call.destination};
@@ -269,8 +291,10 @@ void PollAutomaticScene(){
     const bool optimal_available=na::dlss::GetCapabilities().optimal_settings;
     std::map<uint64_t,MemberSeed> members;std::unordered_map<uint64_t,std::shared_ptr<const NativeOperation>> observed;
     std::vector<std::shared_ptr<const NativeOperation>> retired_requests;
+    std::deque<SelectionContext> retired_selections;
     std::map<TransferKey,TransferSpec> transfers;std::shared_ptr<Built> previous;uint64_t model=0,color=0,depth=0,generation=0,group_revision=0;int mode=0;
     {std::lock_guard<std::mutex> lock(a->mutex);mode=static_cast<int>(na::settings::Get().j2_scale_mode.load());
+        retired_selections.swap(a->retired_selections);
         // Material/streaming resources belong to executable recordings, not an
         // immortal discovery cache. Evicted plans remain alive through leases.
         for(auto it=a->last_seen.begin();it!=a->last_seen.end();)if(a->epoch-it->second>240){
@@ -347,7 +371,8 @@ void PollAutomaticScene(){
     a->work_pending.store(more);
 }
 bool AutomaticSceneWorkPending(){auto a=automatic();return a&&a->work_pending.load();}
-void AutomaticScenePresent(){auto a=automatic();if(!a)return;std::lock_guard<std::mutex> lock(a->mutex);++a->epoch;a->current.reset();
+void AutomaticScenePresent(){auto a=automatic();if(!a)return;uint64_t depth=0,color=0;na::observe::GetLiveSelection(&depth,&color);
+    std::lock_guard<std::mutex> lock(a->mutex);++a->epoch;a->current.reset();if(color&&depth)a->select(color,depth);
     if(na::settings::Get().j2_scale_mode.load()==0){a->built.reset();a->stats.active=false;a->note("Rendering at native resolution.");}else if(a->prepared)a->built=a->prepared;}
 AutomaticSceneStats GetAutomaticSceneStats(){auto a=automatic();if(!a)return {};std::lock_guard<std::mutex> lock(a->mutex);return a->stats;}
 AutomaticSceneSubmission::AutomaticSceneSubmission(ID3D12CommandQueue* queue,UINT count,ID3D12CommandList* const* lists){
