@@ -6,7 +6,6 @@
 #include "host_dx12/adapters/unreal/locator.hpp"
 #include <intrin.h>
 #include <array>
-#include "host_dx12/hooking/vtable_hook.hpp"
 
 #include <atomic>
 #include <cmath>
@@ -70,6 +69,10 @@ uintptr_t g_caller=0;
 std::mutex g_m;
 SpStatus g_status;
 std::atomic<bool> g_started{false};
+std::atomic<bool> g_start_allowed{false};
+#ifdef NA_UNREAL_APPLY_TEST
+void (*g_discovery_probe)()=nullptr;
+#endif
 struct Pending {bool set=false;float percent=0;uint32_t ow=0,oh=0;uint64_t generation=0;} g_pending;
 uint64_t g_generation=0,g_confirm=0;
 bool g_handback=false,g_executing=false;
@@ -108,7 +111,9 @@ void process(uintptr_t caller) {
     Pending req;Ownership handback;
     {
         std::lock_guard<std::mutex> lock(g_m);
+        ++g_status.sink_calls;
         if(caller!=g_caller || g_executing)return;
+        ++g_status.game_thread_calls;
         g_executing=true;
         if(g_handback){handback=g_owner;g_owner={};g_handback=false;}
         req=g_pending;g_pending={};
@@ -172,6 +177,28 @@ void sink_detour(void* manager) {
     process(reinterpret_cast<uintptr_t>(_ReturnAddress()));
     g_sink(manager); // newly changed cvars participate in this ordinary sink pass
 }
+bool attach_sink(void** slot,void* expected,char* error,size_t capacity) {
+    if(!slot || !expected){strncpy_s(error,capacity,"Unreal sink slot is missing.",_TRUNCATE);return false;}
+    // Reuse the host's data-vtable patching pattern (observe/producers.cpp).
+    // This exact slot/function/caller association was checked by the locator.
+    // Keep the whole table and original function intact; hooks live for the
+    // pinned module's process lifetime, just like the other host callbacks.
+    DWORD protect=0;
+    if(!VirtualProtect(slot,sizeof(void*),PAGE_READWRITE,&protect)) {
+        snprintf(error,capacity,"Unreal sink slot protection failed (Win32 %lu).",GetLastError());return false;
+    }
+    g_sink=reinterpret_cast<Sink>(expected); // publish before atomic installation
+    void* previous=InterlockedCompareExchangePointer(slot,reinterpret_cast<void*>(&sink_detour),expected);
+    DWORD ignored=0;const bool restored=VirtualProtect(slot,sizeof(void*),protect,&ignored)!=FALSE;
+    if(previous!=expected){strncpy_s(error,capacity,"Unreal sink slot is owned by another callback.",_TRUNCATE);return false;}
+    if(!restored) {
+        const DWORD failure=GetLastError();
+        InterlockedCompareExchangePointer(slot,expected,reinterpret_cast<void*>(&sink_detour));
+        VirtualProtect(slot,sizeof(void*),protect,&ignored);
+        snprintf(error,capacity,"Unreal sink protection restore failed (Win32 %lu); attachment rolled back.",failure);return false;
+    }
+    return true;
+}
 bool image_readable(const Image& image) {
     for(const auto& s:image.sections) {
         size_t at=0;
@@ -202,14 +229,15 @@ bool bind_variables(const Image& image,const locator::Result& found) {
     }
     g_float=objects[0];g_int=objects[1];return values().valid;
 }
-DWORD WINAPI worker(LPVOID) {
-    Sleep(5000);
+DWORD WINAPI worker(LPVOID from_apply) {
+    if(!from_apply)Sleep(5000); // startup grace; a live Apply need not wait again
     Image image;
     locator::Result found;
     bool valid=load_image(image) && image_readable(image);
     if(valid)found=locator::locate(locator::pe::mapped_image(image.base,image.size,reinterpret_cast<uintptr_t>(image.base)));
     valid=valid && bool(found);
     const char* why=found.reason;
+    char attachment_error[200]{};
     if(valid) {
         // Registration can finish later than module load. Resolve once, then
         // retry the cheap object binding without calling any engine code.
@@ -223,11 +251,9 @@ DWORD WINAPI worker(LPVOID) {
         g_float_set=reinterpret_cast<Setter>(const_cast<uint8_t*>(image.base)+found.setters[0]);
         g_int_set=reinterpret_cast<Setter>(const_cast<uint8_t*>(image.base)+found.setters[1]);
         g_caller=reinterpret_cast<uintptr_t>(image.base)+found.caller;
-        if(na::hooking::BeginInstallWait("adapters/unreal/screen_percentage.cpp")) {
-            valid=na::hooking::PrepareHook(const_cast<uint8_t*>(image.base)+found.sink,reinterpret_cast<void*>(&sink_detour),reinterpret_cast<void**>(&g_sink));
-            if(valid)valid=na::hooking::CommitInstall();else na::hooking::AbandonInstall();
-        } else valid=false;
-        if(!valid)why="Unreal console interface found, but its game-thread hook could not attach.";
+        auto** slot=reinterpret_cast<void**>(const_cast<uint8_t*>(image.base)+found.manager_table+0x58);
+        valid=attach_sink(slot,const_cast<uint8_t*>(image.base)+found.sink,attachment_error,sizeof attachment_error);
+        if(!valid)why=attachment_error;
     }
     std::lock_guard<std::mutex> lock(g_m);g_status.available=valid;g_status.candidates=found?1:0;
     g_status.state=valid?SpState::Ready:SpState::NotFound;
@@ -240,7 +266,28 @@ uint32_t ExpectedExtent(uint32_t out,float percent) {
     const double value=std::ceil(double(out)*double(percent)/100.-1e-6);
     return value<=UINT32_MAX?uint32_t(value):0;
 }
-void StartScreenPercentage() {if(g_started.exchange(true))return;if(HANDLE t=CreateThread(nullptr,0,worker,nullptr,0,nullptr))CloseHandle(t);}
+static void start_screen_percentage(bool from_apply) {
+    if(g_started.exchange(true))return;
+#ifdef NA_UNREAL_APPLY_TEST
+    if(g_discovery_probe){g_discovery_probe();return;}
+#endif
+    if(HANDLE t=CreateThread(nullptr,0,worker,from_apply?reinterpret_cast<void*>(1):nullptr,0,nullptr))CloseHandle(t);
+    else {std::lock_guard<std::mutex> lock(g_m);g_status.state=SpState::NotFound;strcpy_s(g_status.reason,"Unreal resolution locator could not start.");}
+}
+void StartScreenPercentage() {start_screen_percentage(false);}
+void ConfigureScreenPercentage(bool enabled,bool defer_until_apply) {
+    g_start_allowed.store(enabled);
+    if(enabled && !defer_until_apply)StartScreenPercentage();
+    else if(!g_started.load()) {
+        std::lock_guard<std::mutex> lock(g_m);
+        strcpy_s(g_status.reason,enabled?"Recovery mode: press Apply to initialize live resolution control.":"Unreal resolution control is disabled in this installation.");
+    }
+}
+bool ResumeScreenPercentageForApply() {
+    if(!g_start_allowed.load())return false;
+    start_screen_percentage(true);
+    return GetScreenPercentageStatus().state==SpState::Unknown;
+}
 bool RequestScreenPercentage(float percent,uint32_t ow,uint32_t oh) {
     std::lock_guard<std::mutex> lock(g_m);
     if(!g_status.available || !sane_percent(percent)||!ow||!oh||!ExpectedExtent(ow,percent)||!ExpectedExtent(oh,percent)||g_executing||g_pending.set||g_status.state==SpState::Applying||g_handback)return false;
@@ -260,8 +307,15 @@ bool HandBackScreenPercentage() {
 bool BindForTest(const uint8_t* base,const locator::Result& result){Image image;image.base=base;return bind_variables(image,result);}
 void ConfigureForTest(void* f,void* i,Setter fs,Setter is) {
     std::lock_guard<std::mutex> lock(g_m);g_float=f;g_int=i;g_float_set=fs;g_int_set=is;g_caller=0xabc;
-    g_status={};g_status.available=true;g_pending={};g_owner={};g_confirm=0;g_executing=g_handback=false;
+    g_status={};g_status.available=true;g_status.state=SpState::Ready;g_pending={};g_owner={};g_confirm=0;g_executing=g_handback=false;
 }
+void DiscoveryForTest(void (*probe)()) {std::lock_guard<std::mutex> lock(g_m);g_discovery_probe=probe;g_started=false;g_start_allowed=false;g_status={};}
 void ProcessForTest(uintptr_t caller){process(caller);}
+bool AttachSinkForTest(void** slot,void* expected,uintptr_t caller,char* error,size_t cap){g_caller=caller;return attach_sink(slot,expected,error,cap);}
+bool RestoreSinkForTest(void** slot) {
+    DWORD p=0,unused=0;if(!VirtualProtect(slot,sizeof(void*),PAGE_READWRITE,&p))return false;
+    const bool ours=InterlockedCompareExchangePointer(slot,reinterpret_cast<void*>(g_sink),reinterpret_cast<void*>(&sink_detour))==reinterpret_cast<void*>(&sink_detour);
+    return VirtualProtect(slot,sizeof(void*),p,&unused)!=FALSE && ours;
+}
 #endif
 } // namespace na::unreal

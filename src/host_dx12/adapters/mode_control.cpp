@@ -167,6 +167,19 @@ Outcome try_rebuild(const Request& r, uint64_t generation)
 
 void run(const Request& r, uint64_t generation)
 {
+    // Recovery postpones optional engine hooks. The user's Apply is explicit
+    // permission to initialize this configured adapter, not to restore saved
+    // effects. Wait on this worker so the available-method snapshot includes it.
+    if(!na::tsushima::GetApplyStatus().available && !na::tlou1::GetApplyStatus().available &&
+       na::unreal::ResumeScreenPercentageForApply()) {
+        set_reason("Checking the game's live resolution interface...");
+        const ULONGLONG end=GetTickCount64()+10000;
+        while(na::unreal::GetScreenPercentageStatus().state==na::unreal::SpState::Unknown && GetTickCount64()<end) {
+            if(cancelled(generation))return;
+            Sleep(25);
+        }
+    }
+    if(cancelled(generation))return;
     Layer order[static_cast<uint32_t>(Layer::Count)];
     Layer learned;
     {
@@ -376,15 +389,19 @@ int FormatStatus(char* out, size_t cap)
     if (!out || !cap) return 0;
     const na::slb::dlss::ModeState d = na::slb::dlss::GetModeState();
     const Status ms = GetStatus();
+    const auto u=na::unreal::GetScreenPercentageStatus();
     const int n = _snprintf_s(out, cap, _TRUNCATE,
         "picture_mode state=%u layer=%u learned=%u tried=0x%x available=0x%x request=%llu \"%s\""
-        " | sl_dlss hooks=%u/%u calls=%llu/%llu gen=%llu gen_calls=%llu rewritten=%llu game=%u sent=%u size=%ux%u bounds=%ux%u-%ux%u label=%u->%u",
+        " | sl_dlss hooks=%u/%u calls=%llu/%llu gen=%llu gen_calls=%llu rewritten=%llu game=%u sent=%u size=%ux%u bounds=%ux%u-%ux%u label=%u->%u"
+        " | unreal available=%u state=%u percent=%.3f requested=%.3f expected=%ux%u seen=%ux%u sink=%llu tick=%llu \"%s\"",
         static_cast<uint32_t>(ms.state), static_cast<uint32_t>(ms.layer), static_cast<uint32_t>(ms.learned), ms.tried_mask,
         ms.available_mask, static_cast<unsigned long long>(ms.request_id), ms.reason, d.optimal_hooked, d.set_hooked,
         static_cast<unsigned long long>(d.optimal_calls), static_cast<unsigned long long>(d.set_calls),
         static_cast<unsigned long long>(d.generation), static_cast<unsigned long long>(d.optimal_calls_this_generation),
         static_cast<unsigned long long>(d.rewritten_this_generation), d.game_mode, d.sent_mode, d.optimal_w, d.optimal_h,
-        d.min_w, d.min_h, d.max_w, d.max_h, d.set_game_mode, d.set_sent_mode);
+        d.min_w, d.min_h, d.max_w, d.max_h, d.set_game_mode, d.set_sent_mode,
+        u.available?1u:0u,uint32_t(u.state),double(u.current),double(u.requested),u.expect_w,u.expect_h,u.seen_w,u.seen_h,
+        static_cast<unsigned long long>(u.sink_calls),static_cast<unsigned long long>(u.game_thread_calls),u.reason);
     return n < 0 ? static_cast<int>(strlen(out)) : n;
 }
 

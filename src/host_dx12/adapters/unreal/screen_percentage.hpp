@@ -27,11 +27,16 @@ struct SpStatus {
     uint32_t seen_w = 0, seen_h = 0;     // game's latest observed DLSS evaluation size
     uint64_t request_id = 0;
     uint32_t candidates = 0;     // validated candidate objects (1 = unambiguous)
+    uint64_t sink_calls = 0, game_thread_calls = 0;
     char reason[200] = "";
 };
 
 // Starts the locator thread (no writes). Safe to call more than once.
 void StartScreenPercentage();
+// Recovery defers hook discovery until an explicit Apply, without restoring
+// saved effects or ignoring an installation's screen_percentage=0 preference.
+void ConfigureScreenPercentage(bool enabled, bool defer_until_apply);
+bool ResumeScreenPercentageForApply(); // true while the permitted locator is pending
 // Asynchronous: queues engine Set(percent), disables DRS and checks frames for
 // ceil(out * percent / 100). Returns false (state Refused) when unavailable or busy.
 bool RequestScreenPercentage(float percent, uint32_t out_w, uint32_t out_h);

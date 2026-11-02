@@ -256,8 +256,8 @@ DWORD WINAPI InitThread(LPVOID)
     // quality setting still requires an explicit user request.
     if(route_a){
         if(GetPrivateProfileIntW(L"unreal",L"probe",1,g_ini)==1)na::unreal::StartCvarProbe();
-        if(!na::settings::SafeStart() && GetPrivateProfileIntW(L"unreal",L"screen_percentage",1,g_ini)==1)
-            na::unreal::StartScreenPercentage();
+        na::unreal::ConfigureScreenPercentage(GetPrivateProfileIntW(L"unreal",L"screen_percentage",1,g_ini)==1,
+                                             na::settings::SafeStart());
         na::tlou1::InitializeApply();
         na::tsushima::InitializeApply();
     }
