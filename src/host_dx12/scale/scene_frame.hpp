@@ -4,8 +4,11 @@
 #include "host_dx12/nr/native_fg.hpp"
 #include <mutex>
 #include <set>
+#include <map>
+#include <array>
 
 namespace na::scale {
+struct ResourceUse;
 struct FrameMemberState {
     uint64_t member = 0;
     D3D12_RESOURCE_STATES native_state = D3D12_RESOURCE_STATE_COMMON;
@@ -18,6 +21,8 @@ struct FrameMemberState {
     // native and private transfer operations. NativeCurrent acknowledges that
     // exact write; a pending write cannot silently use this exception.
     bool native_transfer_only = false;
+    // Which native planes this state observation describes (depth=1, stencil=2).
+    uint32_t native_planes = 3;
 };
 struct FrameSpec {
     std::shared_ptr<const SceneGroup> group;
@@ -38,6 +43,9 @@ public:
     // and the inherited stencil plane. Repeated calls are harmless.
     bool SeedHistories(ID3D12GraphicsCommandList*);
     void Written(uint64_t member, ID3D12GraphicsCommandList* recording = nullptr);
+    void ObserveNativeUses(ID3D12GraphicsCommandList*,const std::vector<ResourceUse>&);
+    void Applied(ID3D12GraphicsCommandList*,const std::vector<ResourceUse>&);
+    void Applied(uint64_t list,uint64_t recording,const std::vector<ResourceUse>&);
     void StencilCleared(uint64_t member);
     void NativeCurrent(uint64_t member, ID3D12GraphicsCommandList* recording = nullptr);
     void UpdateStates(const std::vector<FrameMemberState>&, bool seed = false);
@@ -67,11 +75,13 @@ private:
         bool written = false;
         bool pending = false, stencil_initialized = false;
         std::set<std::pair<uint64_t,uint64_t>> pending_recordings;
+        std::map<std::pair<uint64_t,uint64_t>,std::array<D3D12_RESOURCE_STATES,2>> native_recordings;
     };
     FrameSpec spec_;
-    bool Promote(ID3D12GraphicsCommandList*, bool final);
+    bool Promote(ID3D12GraphicsCommandList*, bool final,const std::vector<FrameMemberState>* current=nullptr);
     std::vector<Promotion> promotions_;
-    void Stencil(ID3D12GraphicsCommandList*,Promotion&,bool seed);
+    void Stencil(ID3D12GraphicsCommandList*,Promotion&,bool seed,D3D12_RESOURCE_STATES native);
+    void ObserveUsesLocked(const std::pair<uint64_t,uint64_t>&,const std::vector<ResourceUse>&,bool written);
     std::mutex mutex_;
     bool dirty_ = false, ready_ = false, finished_ = false, seeded_ = false;
     na::j2::PhysicalOutcome outcome_ = na::j2::PhysicalOutcome::Unavailable;

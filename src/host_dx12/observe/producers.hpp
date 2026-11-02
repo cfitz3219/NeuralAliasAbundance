@@ -138,6 +138,11 @@ void ResetDerived();
 // pipeline state of this recording. False (nothing issued) if the state is not fully
 // known (unobserved recording, a bundle was executed).
 bool RestoreListState(ID3D12GraphicsCommandList* list);
+// Scoped bindings change neither PSO/root signatures nor IA state. Restore only
+// touched bindings, with bounded inline snapshots and no RootArg vector clones.
+// Changing a resource heap invalidates tables in BOTH shader pipelines.
+bool RestoreBindingState(ID3D12GraphicsCommandList*,bool compute,bool heaps,uint64_t cbvs,
+    bool targets,bool viewports,bool scissors);
 // Layer2 raster work also changes RTV/DSV, viewport/scissor and IA topology.
 // Opt-in: private CPU descriptor snapshots are taken before OMSetRenderTargets
 // (the game's source descriptors may legally be reused immediately afterwards).
@@ -154,6 +159,7 @@ struct ShaderState {
     ID3D12DescriptorHeap* resources = nullptr;
     ID3D12DescriptorHeap* samplers = nullptr;
     uint64_t cbv_params = 0;
+    bool raster_restorable=false;
     struct Table { uint32_t param; uint64_t handle; bool sampler; } tables[64]{};
     uint32_t count = 0;
 };

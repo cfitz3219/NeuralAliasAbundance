@@ -1,4 +1,5 @@
 #include "scene_frame.hpp"
+#include "scoped_bindings.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/depth_format.hpp"
 #include <algorithm>
@@ -73,7 +74,7 @@ std::shared_ptr<SceneFrame> SceneFrame::Create(ID3D12Device* dev,FrameSpec spec,
 std::shared_ptr<SceneFrame> SceneFrame::NewFrame() {
     std::lock_guard<std::mutex> lock(mutex_);
     auto next=std::shared_ptr<SceneFrame>(new SceneFrame);next->spec_=spec_;next->promotions_=promotions_;
-    for(auto& x:next->promotions_){x.written=x.pending=x.stencil_initialized=false;x.pending_recordings.clear();}
+    for(auto& x:next->promotions_){x.written=x.pending=x.stencil_initialized=false;x.pending_recordings.clear();x.native_recordings.clear();}
     return next;
 }
 void SceneFrame::NativeCurrent(uint64_t member,ID3D12GraphicsCommandList* recording) {
@@ -93,6 +94,7 @@ bool SceneFrame::SeedHistories(ID3D12GraphicsCommandList* l) {
     if(seeded_)return true;
     if(!l||!na::observe::ListRasterStateRestorable(l))return false;
     if(!na::nr::native::RetainRecording(l,shared_from_this()))return false;
+    const auto recording=std::make_pair(na::observe::IdOf(l),na::observe::ListRecording(l));
     for(auto& x:promotions_) {
       if(x.seed && !x.written) {
         transition(l,x.member->native.Get(),x.state.seed_state,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -101,15 +103,16 @@ bool SceneFrame::SeedHistories(ID3D12GraphicsCommandList* l) {
         transition(l,x.member->reduced.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COMMON);
         transition(l,x.member->native.Get(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,x.state.seed_state);
       }
-      if(x.seed_stencil && !x.stencil_initialized){Stencil(l,x,true);x.stencil_initialized=true;}
+      if(x.seed_stencil && !x.stencil_initialized){const auto native=x.native_recordings.find(recording);
+          Stencil(l,x,true,native!=x.native_recordings.end()?native->second[1]:x.state.seed_state);x.stencil_initialized=true;}
     }
     seeded_=na::observe::RestoreListState(l);return seeded_;
 }
-void SceneFrame::Stencil(ID3D12GraphicsCommandList* l,Promotion& x,bool seed) {
+void SceneFrame::Stencil(ID3D12GraphicsCommandList* l,Promotion& x,bool seed,D3D12_RESOURCE_STATES native) {
     auto* source=seed?x.member->native.Get():x.member->reduced.Get();
     auto* target=seed?x.member->reduced.Get():x.member->native.Get();
     auto* a=seed?x.stencil_full.Get():x.stencil_small.Get();auto* b=seed?x.stencil_small.Get():x.stencil_full.Get();
-    const auto ss=seed?x.state.seed_state:D3D12_RESOURCE_STATE_COMMON;
+    const auto ss=seed?native:D3D12_RESOURCE_STATE_COMMON;
     const auto ts=seed?D3D12_RESOURCE_STATE_COMMON:D3D12_RESOURCE_STATE_DEPTH_READ;
     transition(l,source,ss,D3D12_RESOURCE_STATE_COPY_SOURCE,1);transition(l,a,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
     copy(l,source,1,a,0);transition(l,source,D3D12_RESOURCE_STATE_COPY_SOURCE,ss,1);
@@ -119,13 +122,34 @@ void SceneFrame::Stencil(ID3D12GraphicsCommandList* l,Promotion& x,bool seed) {
     transition(l,a,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
     transition(l,b,D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_SOURCE);
     transition(l,target,ts,D3D12_RESOURCE_STATE_COPY_DEST,1);copy(l,b,0,target,1);
-    transition(l,target,D3D12_RESOURCE_STATE_COPY_DEST,seed?ts:x.state.native_state,1);
+    transition(l,target,D3D12_RESOURCE_STATE_COPY_DEST,seed?ts:native,1);
     transition(l,b,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
 }
 void SceneFrame::Written(uint64_t member,ID3D12GraphicsCommandList* recording) {
     const auto key=std::make_pair(na::observe::IdOf(recording),na::observe::ListRecording(recording));
     std::lock_guard<std::mutex> lock(mutex_);if(finished_)return;
     for(auto& x:promotions_)if(x.state.member==member){x.written=x.pending=true;x.pending_recordings.insert(key);dirty_=true;outcome_=na::j2::PhysicalOutcome::Unavailable;return;}
+}
+void SceneFrame::ObserveUsesLocked(const std::pair<uint64_t,uint64_t>& key,const std::vector<ResourceUse>& uses,bool written){
+    constexpr UINT writes=D3D12_RESOURCE_STATE_RENDER_TARGET|D3D12_RESOURCE_STATE_DEPTH_WRITE|D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    for(const auto& use:uses)for(auto& x:promotions_)if(x.state.member==use.member){
+        auto state=x.native_recordings.emplace(key,std::array<D3D12_RESOURCE_STATES,2>{x.state.native_state,x.state.native_state}).first;
+        if(use.subresource==D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES||use.subresource==0)state->second[0]=use.state;
+        if(use.subresource==D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES||use.subresource==1)state->second[1]=use.state;
+        if(written&&(use.state&writes)){x.written=x.pending=dirty_=true;x.pending_recordings.insert(key);outcome_=na::j2::PhysicalOutcome::Unavailable;}
+        break;
+    }
+}
+void SceneFrame::ObserveNativeUses(ID3D12GraphicsCommandList* list,const std::vector<ResourceUse>& uses){
+    const auto key=std::make_pair(na::observe::IdOf(list),na::observe::ListRecording(list));std::lock_guard<std::mutex> lock(mutex_);
+    if(!finished_)ObserveUsesLocked(key,uses,false);
+}
+void SceneFrame::Applied(ID3D12GraphicsCommandList* list,const std::vector<ResourceUse>& uses){
+    Applied(na::observe::IdOf(list),na::observe::ListRecording(list),uses);
+}
+void SceneFrame::Applied(uint64_t list,uint64_t recording,const std::vector<ResourceUse>& uses){
+    const auto key=std::make_pair(list,recording);std::lock_guard<std::mutex> lock(mutex_);
+    if(!finished_){ObserveUsesLocked(key,uses,true);ready_=true;}
 }
 void SceneFrame::StencilCleared(uint64_t member) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -154,15 +178,14 @@ bool SceneFrame::Finish(ID3D12GraphicsCommandList* l) {
     return Promote(l,true);
 }
 bool SceneFrame::Checkpoint(ID3D12GraphicsCommandList* l,const std::vector<FrameMemberState>& current) {
-    UpdateStates(current);
-    return Promote(l,false);
+    return Promote(l,false,&current);
 }
 bool SceneFrame::HasPending(ID3D12GraphicsCommandList* list) {
     const auto recording=std::make_pair(na::observe::IdOf(list),na::observe::ListRecording(list));
     std::lock_guard<std::mutex> lock(mutex_);const std::pair<uint64_t,uint64_t> legacy{};
     return std::any_of(promotions_.begin(),promotions_.end(),[&](const auto& x){return x.pending&&(x.pending_recordings.count(recording)||x.pending_recordings.count(legacy));});
 }
-bool SceneFrame::Promote(ID3D12GraphicsCommandList* l,bool final) {
+bool SceneFrame::Promote(ID3D12GraphicsCommandList* l,bool final,const std::vector<FrameMemberState>* current) {
     const na::observe::HostWorkScope host;
     std::lock_guard<std::mutex> lock(mutex_);
     if(finished_||!dirty_)return true;
@@ -175,6 +198,10 @@ bool SceneFrame::Promote(ID3D12GraphicsCommandList* l,bool final) {
     for(auto& x:promotions_) {
         if(!x.pending||(!final&&!x.pending_recordings.count(legacy)&&!x.pending_recordings.count(recording)))continue;
         if(x.state.native_transfer_only)return false; // owner must mirror/acknowledge its native transfer
+        const auto recorded=x.native_recordings.find(recording);
+        auto native_states=recorded!=x.native_recordings.end()?recorded->second:std::array<D3D12_RESOURCE_STATES,2>{x.state.native_state,x.state.native_state};
+        if(current)for(const auto& state:*current)if(state.member==x.state.member){
+            if(state.native_planes&1)native_states[0]=state.native_state;if(state.native_planes&2)native_states[1]=state.native_state;}
         const auto published=[&]{if(final)x.pending_recordings.clear();else{x.pending_recordings.erase(legacy);x.pending_recordings.erase(recording);}x.pending=!x.pending_recordings.empty();};
         if(x.state.member==spec_.color&&outcome_==na::j2::PhysicalOutcome::Evaluated){published();continue;}
         auto* reduced=x.member->reduced.Get();auto* native=x.member->native.Get();
@@ -186,16 +213,16 @@ bool SceneFrame::Promote(ID3D12GraphicsCommandList* l,bool final) {
             transition(l,reduced,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
             transition(l,x.plane.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             const UINT depth_sub=x.stencil?0:D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            transition(l,native,x.state.native_state,D3D12_RESOURCE_STATE_DEPTH_WRITE,depth_sub);
-            if(x.stencil)transition(l,native,x.state.native_state,D3D12_RESOURCE_STATE_DEPTH_READ,1);
+            transition(l,native,native_states[0],D3D12_RESOURCE_STATE_DEPTH_WRITE,depth_sub);
+            if(x.stencil)transition(l,native,native_states[1],D3D12_RESOURCE_STATE_DEPTH_READ,1);
             x.depth->Record(l);
-            transition(l,native,D3D12_RESOURCE_STATE_DEPTH_WRITE,x.state.native_state,depth_sub);
+            transition(l,native,D3D12_RESOURCE_STATE_DEPTH_WRITE,native_states[0],depth_sub);
             transition(l,x.plane.Get(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
-            if(x.stencil)Stencil(l,x,false);
+            if(x.stencil)Stencil(l,x,false,native_states[1]);
         } else {
             transition(l,reduced,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            transition(l,native,x.state.native_state,D3D12_RESOURCE_STATE_RENDER_TARGET);x.color->Record(l);
-            transition(l,native,D3D12_RESOURCE_STATE_RENDER_TARGET,x.state.native_state);
+            transition(l,native,native_states[0],D3D12_RESOURCE_STATE_RENDER_TARGET);x.color->Record(l);
+            transition(l,native,D3D12_RESOURCE_STATE_RENDER_TARGET,native_states[0]);
             transition(l,reduced,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
         }
         published();

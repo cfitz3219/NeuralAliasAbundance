@@ -17,6 +17,7 @@ struct AutomaticSceneStats {
     uint64_t fast_hits=0,snapshots=0,presents=0,redirected_frames=0;
     uint64_t unknown_operations=0,binding_failures=0,native_boundaries=0,transfer_failures=0;
     uint64_t control_wait_us=0,control_hold_us=0,control_max_us=0,worker_us=0;
+    uint64_t constant_copies=0,constant_reuses=0;
     char reason[192]{};
 };
 AutomaticSceneStats GetAutomaticSceneStats();

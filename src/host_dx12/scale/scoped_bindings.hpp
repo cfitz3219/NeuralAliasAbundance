@@ -55,6 +55,7 @@ class PreparedBindings {
 public:
     static std::shared_ptr<const PreparedBindings> Create(ID3D12Device*, BindingSpec, std::string& error);
     const std::vector<uint64_t>& WrittenMembers()const{return written_;}
+    const std::vector<ResourceUse>& Uses()const{return spec_.uses;}
 private:
     BindingSpec spec_;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> views_, rtvs_, dsv_;
@@ -72,6 +73,13 @@ public:
     virtual ~BindingProvider() = default;
     virtual void Closing(ID3D12GraphicsCommandList*) noexcept {}
     virtual void NativeBoundary(ID3D12GraphicsCommandList*) noexcept {}
+    // An automatic owner may retain its immutable Built (and thus every plan)
+    // once per recording, and batch immutable-upload CB copies until Close.
+    virtual bool RecordingOwnsPlans()const noexcept{return false;}
+    virtual void OperationScope(ID3D12GraphicsCommandList*,na::observe::ShaderScope&)noexcept{}
+    virtual bool RecordConstants(ID3D12GraphicsCommandList*,const std::vector<ConstantUse>&,const na::observe::ShaderScope&)noexcept{return false;}
+    virtual void RestoreConstants(ID3D12GraphicsCommandList*,const std::vector<ConstantUse>&)noexcept{}
+    virtual bool RecordResources(ID3D12GraphicsCommandList*,const std::vector<ResourceUse>&,const na::observe::ShaderScope&)noexcept{return false;}
     // Current recording/op recognition and coherent group admission belong to
     // the provider. It must never infer authority from resolution alone. Return
     // null for unrelated operations. A plan is immutable for all recorded uses.
@@ -86,6 +94,8 @@ public:
     // its written dependencies here, not in Acquire (which can still refuse).
     virtual void Applied(ID3D12GraphicsCommandList*, const na::observe::ShaderCall&,
         const std::shared_ptr<const PreparedBindings>&) noexcept {}
+    virtual void AppliedScope(ID3D12GraphicsCommandList* list,const na::observe::ShaderCall& call,
+        const std::shared_ptr<const PreparedBindings>& plan,const na::observe::ShaderScope&)noexcept{Applied(list,call,plan);}
 };
 // Actual adapter for the existing Bindings shader-operation lane. Retains the
 // prepared payload through the EXISTING executable-recording/submission lease,

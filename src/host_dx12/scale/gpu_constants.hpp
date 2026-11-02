@@ -24,6 +24,9 @@ public:
     void RecordAfter(ID3D12GraphicsCommandList* list) const;
     D3D12_GPU_VIRTUAL_ADDRESS Address() const { return owned_->GetGPUVirtualAddress(); }
     UINT Bytes() const { return static_cast<UINT>(bytes_); }
+    // UPLOAD/GPU_UPLOAD cannot be GPU-written in the middle of a list. One
+    // recorded copy still sees late CPU/J1 uploads on every executable replay.
+    bool ReusableWithinRecording()const{return fixed_source_state_;}
 private:
     Microsoft::WRL::ComPtr<ID3D12Resource> source_, owned_, patch_data_;
     uint64_t source_offset_ = 0, bytes_ = 0;

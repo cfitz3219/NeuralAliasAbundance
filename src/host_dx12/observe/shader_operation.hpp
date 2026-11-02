@@ -13,6 +13,11 @@ enum class ShaderAction { Forward, Replaced };
 struct ShaderScope {
     ShaderAction action = ShaderAction::Forward;
     std::shared_ptr<void> state;
+    // Exact outer operation context survives nested runtime-internal calls.
+    // No allocation: the provider supplies its already-retained recording owner.
+    std::shared_ptr<void> context;
+    void* opaque=nullptr;
+    uint64_t list_id=0,recording=0;
 };
 class ShaderOperationHook {
 public:

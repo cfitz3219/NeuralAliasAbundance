@@ -79,7 +79,15 @@ struct Run {
     std::shared_ptr<Built> built;std::shared_ptr<SceneFrame> frame;
     uint64_t epoch=0,color=0,depth=0;std::atomic<bool> aborted{false},seeded{false},redirected{false};
 };
-struct Bound {std::shared_ptr<Run> run;na::nr::native::RecordingLease lease;};
+struct Bound {std::shared_ptr<Run> run;na::nr::native::RecordingLease lease;
+    std::unordered_set<const GpuConstants*> constants;std::vector<const GpuConstants*> constant_tail;
+    struct PrivateState{ID3D12Resource* resource=nullptr;D3D12_RESOURCE_STATES state=D3D12_RESOURCE_STATE_COMMON;};
+    std::map<std::pair<uint64_t,UINT>,PrivateState> private_states;
+    bool batch_open=false;
+};
+class Automatic;
+struct Acquisition{Automatic* owner=nullptr;ID3D12GraphicsCommandList* list=nullptr;Bound* bound=nullptr;uint64_t list_id=0,recording=0;};
+thread_local Acquisition acquisition;
 struct Submission {std::shared_ptr<Run> run;ComPtr<ID3D12CommandQueue> queue;std::vector<ID3D12CommandList*> lists;};
 thread_local std::shared_ptr<Submission> submission,reporting;
 struct SelectionContext {
@@ -107,13 +115,74 @@ class Automatic final:public SelectionContext,public BindingProvider,public na::
 public:
     std::shared_mutex mutex;bool enabled=false;uint64_t epoch=1,next_generation=1;
     Costs cost;
-    std::atomic<uint64_t> operations{0},redirected{0},fast_hits{0},snapshots{0},redirected_frames{0};
+    std::atomic<uint64_t> operations{0},redirected{0},fast_hits{0},snapshots{0},redirected_frames{0},constant_copies{0},constant_reuses{0};
+    std::atomic<uint32_t> open_batches{0};
+    std::atomic<bool> current_recording{false};
     std::atomic<bool> work_pending{false};
     std::deque<SelectionContext> selections,retired_selections;
     uint64_t candidate_color=0,candidate_depth=0,candidate_since=0;
     std::map<std::pair<uint64_t,uint64_t>,Bound> bound;
+    std::deque<Bound> retired_recordings;
+    std::deque<std::shared_ptr<Run>> retired_runs;
+    std::deque<std::shared_ptr<Built>> retired_profiles;
     AutomaticSceneStats stats;
     void note(const char* text){std::snprintf(stats.reason,sizeof stats.reason,"%s",text);}
+    void acquired(ID3D12GraphicsCommandList* list,Bound& binding,uint64_t id,uint64_t recording){acquisition={this,list,&binding,id,recording};}
+    void acquired(ID3D12GraphicsCommandList* list){const auto id=na::observe::IdOf(list),recording=na::observe::ListRecording(list);
+        const auto found=bound.find({id,recording});if(found!=bound.end())acquired(list,found->second,id,recording);}
+    bool RecordingOwnsPlans()const noexcept override{return true;}
+    void OperationScope(ID3D12GraphicsCommandList* list,na::observe::ShaderScope& scope)noexcept override{
+        if(acquisition.owner!=this||acquisition.list!=list||!acquisition.bound)return;
+        scope.context=acquisition.bound->run;scope.opaque=acquisition.bound;scope.list_id=acquisition.list_id;scope.recording=acquisition.recording;
+    }
+    bool RecordConstants(ID3D12GraphicsCommandList* list,const std::vector<ConstantUse>& constants,const na::observe::ShaderScope& scope)noexcept override{
+        if(!scope.opaque)return false;
+        auto& recording=*static_cast<Bound*>(scope.opaque);
+        for(const auto& use:constants){const auto* buffer=use.buffer.get();
+            if(buffer->ReusableWithinRecording()){
+                if(recording.constants.count(buffer)){++constant_reuses;continue;}
+                if(!buffer->RecordBefore(list,use.source_state))return false;
+                recording.constants.insert(buffer);recording.constant_tail.push_back(buffer);++constant_copies;
+            }else{if(!buffer->RecordBefore(list,use.source_state))return false;++constant_copies;}}
+        return true;
+    }
+    void RestoreConstants(ID3D12GraphicsCommandList* list,const std::vector<ConstantUse>& constants)noexcept override{
+        for(auto use=constants.rbegin();use!=constants.rend();++use)if(!use->buffer->ReusableWithinRecording())use->buffer->RecordAfter(list);
+    }
+    bool RecordResources(ID3D12GraphicsCommandList* list,const std::vector<ResourceUse>& uses,const na::observe::ShaderScope& scope)noexcept override{
+        if(!scope.opaque)return false;auto& recording=*static_cast<Bound*>(scope.opaque);
+        D3D12_RESOURCE_BARRIER barriers[32]{};UINT count=0;
+        const auto add=[&](D3D12_RESOURCE_BARRIER value){barriers[count++]=value;if(count==32){list->ResourceBarrier(count,barriers);count=0;}};
+        for(const auto& use:uses){const auto* member=recording.run->built->group->Find(use.member);if(!member)return false;
+            const auto format=member->reduced_desc.Format;
+            const bool stencil=format==DXGI_FORMAT_R32G8X24_TYPELESS||format==DXGI_FORMAT_D32_FLOAT_S8X24_UINT||format==DXGI_FORMAT_R24G8_TYPELESS||format==DXGI_FORMAT_D24_UNORM_S8_UINT;
+            const UINT first=use.subresource==D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES?0:use.subresource;
+            const UINT end=use.subresource==D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES?(stencil?2u:1u):first+1;
+            bool unordered=false;
+            for(UINT sub=first;sub<end;++sub){auto& state=recording.private_states[{use.member,sub}];state.resource=member->reduced.Get();
+                if(state.state!=use.state){D3D12_RESOURCE_BARRIER barrier{};barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    barrier.Transition={state.resource,sub,state.state,use.state};add(barrier);state.state=use.state;}
+                else unordered|=(use.state&D3D12_RESOURCE_STATE_UNORDERED_ACCESS)!=0;
+            }
+            if(unordered){D3D12_RESOURCE_BARRIER barrier{};barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;barrier.UAV.pResource=member->reduced.Get();add(barrier);}
+        }
+        if(count)list->ResourceBarrier(count,barriers);
+        if(!recording.batch_open){recording.batch_open=true;++open_batches;}return true;
+    }
+    void flush_resources(ID3D12GraphicsCommandList* list,Bound& recording){
+        if(!recording.batch_open)return;const na::observe::HostWorkScope host;
+        D3D12_RESOURCE_BARRIER barriers[32]{};UINT count=0;
+        for(auto& entry:recording.private_states){auto& state=entry.second;if(state.state==D3D12_RESOURCE_STATE_COMMON)continue;
+            auto& barrier=barriers[count++];barrier={};barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition={state.resource,entry.first.second,state.state,D3D12_RESOURCE_STATE_COMMON};state.state=D3D12_RESOURCE_STATE_COMMON;
+            if(count==32){list->ResourceBarrier(count,barriers);count=0;}}
+        if(count)list->ResourceBarrier(count,barriers);recording.batch_open=false;--open_batches;
+    }
+    void requested_native(ID3D12GraphicsCommandList* list,bool force=false){
+        if(!force&&!current_recording.load())return;ControlLock lock(mutex,cost);
+        const auto found=bound.find({na::observe::IdOf(list),na::observe::ListRecording(list)});
+        if(found!=bound.end()){checkpoint(list,found->second.run);found->second.run->aborted=true;}
+    }
     bool selected(uint64_t c,uint64_t d){return c&&d&&color==c&&depth==d;}
     bool select(uint64_t c,uint64_t d){
         if(selected(c,d)){candidate_color=candidate_depth=candidate_since=0;return true;}
@@ -123,7 +192,7 @@ public:
         const auto cached=std::find_if(selections.begin(),selections.end(),[&](const auto& s){return s.color==c&&s.depth==d;});
         if(cached!=selections.end()){static_cast<SelectionContext&>(*this)=std::move(*cached);selections.erase(cached);}
         else{static_cast<SelectionContext&>(*this)=SelectionContext{};color=c;depth=d;}
-        current.reset();if(previous.color&&previous.depth)selections.push_back(std::move(previous));
+        if(current)retired_runs.push_back(std::move(current));if(previous.color&&previous.depth)selections.push_back(std::move(previous));
         // Current + one archived scene. Release discarded COM references on
         // the control worker, never while a recording thread holds this lock.
         while(selections.size()>1){retired_selections.push_back(std::move(selections.front()));selections.pop_front();}
@@ -154,7 +223,9 @@ public:
     bool bind(ID3D12GraphicsCommandList* list,const std::shared_ptr<Run>& run){
         const auto key=std::make_pair(na::observe::IdOf(list),na::observe::ListRecording(list));if(!key.first||!key.second)return false;
         auto found=bound.find(key);if(found!=bound.end())return found->second.run==run;
-        for(auto i=bound.begin();i!=bound.end();)if(i->second.lease.Retired())i=bound.erase(i);else++i;
+        for(auto i=bound.begin();i!=bound.end();)if(i->second.lease.Retired()){
+            retired_recordings.push_back(std::move(i->second));i=bound.erase(i);
+        }else++i;
         if(bound.size()>=1024)return false;
         auto lease=na::nr::native::RetainRecording(list,run);if(!lease)return false;
         bound.emplace(key,Bound{run,std::move(lease)});return true;
@@ -168,6 +239,7 @@ public:
         if(!current||current->epoch!=epoch){
             if(built->mode!=static_cast<int>(na::settings::Get().j2_scale_mode.load()))return {};
             current=std::make_shared<Run>();current->built=built;current->frame=built->prototype->NewFrame();current->epoch=epoch;current->color=color;current->depth=depth;++stats.frames;
+            current_recording=true;
             char text[192];std::snprintf(text,sizeof text,"Scene rendering at %u x %u; DLSS status is shown below.",built->group->Render().width,built->group->Render().height);note(text);
         }
         if(!bind(list,current))return {};return current;
@@ -175,15 +247,20 @@ public:
     std::vector<FrameMemberState> states(ID3D12GraphicsCommandList* list,const std::shared_ptr<Run>& run,bool seed=false){
         std::vector<FrameMemberState> result;
         for(const auto& m:run->built->group->Members()){
-            uint32_t state=0;const UINT sub=seed&&m.role==Role::Depth&&m.native_desc.Format==DXGI_FORMAT_R32G8X24_TYPELESS?1:0;
-            const auto lookup=na::observe::ListStateSub(list,m.id,sub,&state);
-            if(lookup==na::observe::StateLookup::Known||(lookup==na::observe::StateLookup::Absent&&na::observe::KnownSubStateNow(m.id,sub,&state)))
-                result.push_back({m.id,static_cast<D3D12_RESOURCE_STATES>(state)});
+            const bool stencil=m.role==Role::Depth&&m.native_desc.Format==DXGI_FORMAT_R32G8X24_TYPELESS;
+            const UINT first=seed&&stencil?1:0,count=stencil&&!seed?2:first+1;
+            for(UINT sub=first;sub<count;++sub){uint32_t state=0;
+                // An absent local barrier is inherited from earlier GPU lists,
+                // not from whichever CPU thread updated global evidence last.
+                // The frame also has the original typed use of this recording.
+                if(na::observe::ListStateSub(list,m.id,sub,&state)==na::observe::StateLookup::Known){
+                    FrameMemberState value{m.id,static_cast<D3D12_RESOURCE_STATES>(state)};value.native_planes=1u<<sub;result.push_back(value);}}
         }
         return result;
     }
     bool checkpoint(ID3D12GraphicsCommandList* list,const std::shared_ptr<Run>& run){
-        if(!run||run->aborted)return true;
+        if(!run)return true;
+        const auto found=bound.find({na::observe::IdOf(list),na::observe::ListRecording(list)});if(found!=bound.end())flush_resources(list,found->second);
         if(!run->frame->HasPending(list))return true;
         if(!run->frame->Checkpoint(list,states(list,run)))return false;
         ++stats.checkpoints;return true;
@@ -192,24 +269,26 @@ public:
         if(run&&!run->aborted){checkpoint(list,run);run->aborted=true;}stats.active=false;++stats.misses;note(why);
     }
     std::shared_ptr<const PreparedBindings> Acquire(ID3D12GraphicsCommandList* list,const na::observe::ShaderCall& call)noexcept override{
-        if(na::settings::Get().j2_scale_mode.load()==0)return {};
-        uint64_t d=0,c=0;na::observe::GetLiveSelection(&d,&c);if(!c||!d)return {};
+        acquisition={};
+        if(na::settings::Get().j2_scale_mode.load()==0){requested_native(list);return {};}
+        uint64_t d=0,c=0;na::observe::GetLiveSelection(&d,&c);if(!c||!d){requested_native(list);return {};}
         const bool compute=call.kind==na::observe::ShaderKind::Dispatch;
         na::observe::NativeOperationKey stamp;bool known=false;
         {
-            std::shared_lock<std::shared_mutex> lock(mutex);if(!enabled||!selected(c,d))return {};
+            std::shared_lock<std::shared_mutex> lock(mutex);if(!enabled||!selected(c,d)){lock.unlock();requested_native(list);return {};}
             known=na::observe::ListNativeOperationKey(list,compute,key_members.data(),key_members.size(),stamp);
             if(!known&&(!stamp.list||(!stamp.recording&&!na::observe::ListRecording(list))))return {}; // no observed executable recording
             if(known){const auto binding=bound.find({stamp.list,stamp.recording});
                 if(binding!=bound.end()){const auto& run=binding->second.run;
                     if(run->epoch==epoch&&!run->aborted&&run->seeded){const auto plan=run->built->bindings.find(stamp.key);
                         if(plan!=run->built->bindings.end()){const auto seen=run->built->last_seen.find(stamp.key);if(seen!=run->built->last_seen.end())seen->second->store(epoch,std::memory_order_relaxed);
-                            ++operations;++fast_hits;return plan->second;}}
+                            acquired(list,binding->second,stamp.list,stamp.recording);++operations;++fast_hits;return plan->second;}}
                 }
                 const bool learning=unsupported||work_pending.load()||!built||built->model!=model||epoch-last_novel_epoch<3||
                     !built->failed.empty()||!built->failed_transfers.empty();
                 if(observed.count(stamp.key)&&(learning||(binding!=bound.end()&&binding->second.run->aborted))){
-                    const auto seen=last_seen.find(stamp.key);if(seen!=last_seen.end())seen->second->store(epoch,std::memory_order_relaxed);++operations;return {};}
+                    const auto seen=last_seen.find(stamp.key);if(seen!=last_seen.end())seen->second->store(epoch,std::memory_order_relaxed);++operations;
+                    const bool has_run=binding!=bound.end();lock.unlock();if(has_run)requested_native(list,true);return {};}
             }
         }
         if(known){
@@ -221,9 +300,10 @@ public:
             if(run&&!run->aborted){const auto plan=run->built->bindings.find(stamp.key);
                 if(plan!=run->built->bindings.end()){
                     if(!run->seeded){run->frame->UpdateStates(states(list,run,true),true);
+                        run->frame->ObserveNativeUses(list,plan->second->Uses());
                         if(!run->frame->SeedHistories(list)){abort(list,run,"The scene's initial contents are not available yet.");return {};}run->seeded=true;}
                     const auto seen=run->built->last_seen.find(stamp.key);if(seen!=run->built->last_seen.end())seen->second->store(epoch,std::memory_order_relaxed);
-                    ++operations;++fast_hits;return plan->second;
+                    acquired(list);++operations;++fast_hits;return plan->second;
                 }
             }
         }
@@ -263,24 +343,24 @@ public:
         const auto plan=run->built->bindings.find(key);
         if(plan==run->built->bindings.end()){++stats.unknown_operations;abort(list,run,"Preparing a newly observed scene operation.");return {};}
         if(!run->seeded){run->frame->UpdateStates(states(list,run,true),true);
+            run->frame->ObserveNativeUses(list,plan->second->Uses());
             if(!run->frame->SeedHistories(list)){abort(list,run,"The scene's initial contents are not available yet.");return {};}run->seeded=true;}
-        return plan->second;
+        acquired(list);return plan->second;
     }
     void Refused(ID3D12GraphicsCommandList* list,const na::observe::ShaderCall&,const char* why)noexcept override{
         ControlLock lock(mutex,cost);const auto found=bound.find({na::observe::IdOf(list),na::observe::ListRecording(list)});
         ++stats.binding_failures;unsupported=true;
         abort(list,found==bound.end()?nullptr:found->second.run,why);
     }
-    void Applied(ID3D12GraphicsCommandList* list,const na::observe::ShaderCall&,const std::shared_ptr<const PreparedBindings>& plan)noexcept override{
-        std::shared_ptr<Run> run;
-        {std::shared_lock<std::shared_mutex> lock(mutex);const auto found=bound.find({na::observe::IdOf(list),na::observe::ListRecording(list)});
-            if(found!=bound.end())run=found->second.run;}
-        if(!run||run->aborted)return;
-        for(const auto id:plan->WrittenMembers())run->frame->Written(id,list);
-        run->frame->Ready();++redirected;run->redirected=true;
+    void AppliedScope(ID3D12GraphicsCommandList*,const na::observe::ShaderCall&,const std::shared_ptr<const PreparedBindings>& plan,const na::observe::ShaderScope& scope)noexcept override{
+        const auto run=std::static_pointer_cast<Run>(scope.context);
+        if(!run)return; // an already-recorded draw must be marked even if another list just aborted
+        run->frame->Applied(scope.list_id,scope.recording,plan->Uses());++redirected;run->redirected=true;
     }
     void Closing(ID3D12GraphicsCommandList* list)noexcept override{
         ControlLock lock(mutex,cost);const auto found=bound.find({na::observe::IdOf(list),na::observe::ListRecording(list)});
+        if(found!=bound.end())flush_resources(list,found->second);
+        if(found!=bound.end()){for(const auto* buffer:found->second.constant_tail)buffer->RecordAfter(list);found->second.constant_tail.clear();found->second.constants.clear();}
         if(found!=bound.end()&&!checkpoint(list,found->second.run))abort(list,found->second.run,"A scene list could not publish its full-size dependencies.");
     }
     void NativeBoundary(ID3D12GraphicsCommandList* list)noexcept override{
@@ -328,7 +408,8 @@ std::shared_ptr<Automatic>& automatic(){static auto* value=new std::shared_ptr<A
 na::j2::PhysicalLookup lookup(void*,uint64_t color,uint64_t depth,ID3D12GraphicsCommandList* list,std::shared_ptr<const na::j2::PhysicalInput>* out){
     auto a=automatic();if(!a||!out)return na::j2::PhysicalLookup::None;out->reset();std::shared_ptr<Run> run;
     {ControlLock lock(a->mutex,a->cost);
-        if(list){const auto found=a->bound.find({na::observe::IdOf(list),na::observe::ListRecording(list)});if(found!=a->bound.end())run=found->second.run;}
+        if(list){const auto found=a->bound.find({na::observe::IdOf(list),na::observe::ListRecording(list)});if(found!=a->bound.end()){
+            a->flush_resources(list,found->second);run=found->second.run;}}
         else if(submission)run=submission->run;
         if(!run||run->aborted||run->color!=color||run->depth!=depth)return na::j2::PhysicalLookup::None;
         if(submission)reporting=submission;else{reporting=std::make_shared<Submission>();reporting->run=run;}
@@ -364,9 +445,13 @@ void PollAutomaticScene(){
     std::unordered_map<uint64_t,std::shared_ptr<std::atomic<uint64_t>>> usage;
     struct Probe{uint64_t key,evidence;std::shared_ptr<const NativeOperation> request;};std::vector<Probe> probes;
     std::deque<SelectionContext> retired_selections;
+    std::deque<Bound> retired_recordings;
+    std::deque<std::shared_ptr<Run>> retired_runs;
+    std::deque<std::shared_ptr<Built>> retired_profiles;
     std::map<TransferKey,TransferSpec> transfers;std::shared_ptr<Built> previous;uint64_t model=0,color=0,depth=0,generation=0,group_revision=0;int mode=0;
     {ControlLock lock(a->mutex,a->cost);mode=static_cast<int>(na::settings::Get().j2_scale_mode.load());
         retired_selections.swap(a->retired_selections);
+        retired_recordings.swap(a->retired_recordings);retired_runs.swap(a->retired_runs);retired_profiles.swap(a->retired_profiles);
         // Material/streaming resources belong to executable recordings, not an
         // immortal discovery cache. Evicted plans remain alive through leases.
         const size_t sweep=std::min(size_t(16),a->expiry_queue.size());
@@ -375,7 +460,8 @@ void PollAutomaticScene(){
             if(a->epoch-seen->second->load(std::memory_order_relaxed)>240){const auto old=a->observed.find(key);
                 if(old!=a->observed.end()){retired_requests.push_back(std::move(old->second));a->observed.erase(old);}expired.push_back(key);a->last_seen.erase(seen);
             }else a->expiry_queue.push_back(key);}
-        if(!a->enabled||!a->color||!a->depth||a->members.size()<2||mode<=0){if(mode<=0){a->prepared.reset();a->failed_group_revision=0;a->worker_revision=0;}a->work_pending.store(false);return;}
+        if(!a->enabled||!a->color||!a->depth||a->members.size()<2||mode<=0){if(mode<=0){
+            if(a->prepared)retired_profiles.push_back(std::move(a->prepared));a->failed_group_revision=0;a->worker_revision=0;}a->work_pending.store(false);return;}
         const auto latest=a->prepared?a->prepared:a->built;
         if(a->failed_group_revision==a->group_revision&&a->failed_group_mode==mode&&a->failed_group_optimal==optimal_available){a->work_pending.store(false);return;}
         const bool current_basis=latest&&latest->mode==mode&&latest->group_revision==a->group_revision&&latest->optimal_available==optimal_available;
@@ -406,7 +492,7 @@ void PollAutomaticScene(){
             a->failure_probe+=probe_budget;
         }
         if(current_basis&&observed.empty()&&transfers.empty()&&probes.empty()&&expired.empty()){a->work_pending.store(false);return;}
-        members=a->members;previous=latest;model=a->model;color=a->color;depth=a->depth;generation=a->next_generation++;group_revision=a->group_revision;
+        members=a->members;previous=latest;model=a->model;color=a->color;depth=a->depth;group_revision=a->group_revision;
     }
     std::vector<uint64_t> retry;
     for(const auto& probe:probes)if(preparation_evidence(*probe.request)!=probe.evidence){observed.emplace(probe.key,probe.request);retry.push_back(probe.key);}
@@ -428,6 +514,7 @@ void PollAutomaticScene(){
         next->bindings=previous->bindings;next->failed=previous->failed;next->failed_evidence=previous->failed_evidence;next->last_seen=previous->last_seen;
         next->transfers=previous->transfers;next->failed_transfers=previous->failed_transfers;}
     else{
+        {ControlLock lock(a->mutex,a->cost);generation=a->next_generation++;}
         std::vector<MemberRequest> requests;for(const auto& value:members)requests.push_back({value.first,value.second.resource.Get(),value.second.role,render});
         next->group=SceneGroup::Create(device.Get(),generation,output,render,requests,error);
         if(next->group){FrameSpec frame;frame.group=next->group;frame.color=color;frame.depth=depth;
@@ -466,10 +553,12 @@ void PollAutomaticScene(){
 bool AutomaticSceneWorkPending(){auto a=automatic();return a&&a->work_pending.load();}
 void AutomaticScenePresent(){auto a=automatic();if(!a)return;uint64_t depth=0,color=0;na::observe::GetLiveSelection(&depth,&color);
     ControlLock lock(a->mutex,a->cost);if(a->current&&a->current->redirected&&!a->current->aborted)++a->redirected_frames;
-    ++a->epoch;a->current.reset();if(color&&depth)a->select(color,depth);
-    if(na::settings::Get().j2_scale_mode.load()==0){a->built.reset();a->stats.active=false;a->note("Rendering at native resolution.");}else if(a->prepared)a->built=a->prepared;}
+    ++a->epoch;a->current_recording=false;if(a->current)a->retired_runs.push_back(std::move(a->current));if(color&&depth)a->select(color,depth);
+    if(na::settings::Get().j2_scale_mode.load()==0){if(a->built)a->retired_profiles.push_back(std::move(a->built));a->stats.active=false;a->note("Rendering at native resolution.");}
+    else if(a->prepared&&a->built!=a->prepared){if(a->built)a->retired_profiles.push_back(std::move(a->built));a->built=a->prepared;}}
 AutomaticSceneStats GetAutomaticSceneStats(){auto a=automatic();if(!a)return {};std::shared_lock<std::shared_mutex> lock(a->mutex);auto result=a->stats;
     result.operations=a->operations.load();result.redirected=a->redirected.load();result.fast_hits=a->fast_hits.load();result.snapshots=a->snapshots.load();
+    result.constant_copies=a->constant_copies.load();result.constant_reuses=a->constant_reuses.load();
     result.presents=a->epoch-1;result.redirected_frames=a->redirected_frames.load();result.active=a->current&&a->current->redirected&&!a->current->aborted;
     result.control_wait_us=a->cost.wait_ns.load()/1000;result.control_hold_us=a->cost.hold_ns.load()/1000;result.control_max_us=a->cost.max_hold_ns.load()/1000;result.worker_us=a->cost.worker_ns.load()/1000;return result;}
 AutomaticSceneSubmission::AutomaticSceneSubmission(ID3D12CommandQueue* queue,UINT count,ID3D12CommandList* const* lists){

@@ -105,21 +105,25 @@ na::observe::ShaderScope BindingHook::Before(ID3D12GraphicsCommandList* list, na
 {
     auto p = provider_ ? provider_->Acquire(list, call) : nullptr;
     if (!p) return {};
+    na::observe::ShaderScope scope;scope.state=std::const_pointer_cast<PreparedBindings>(p);provider_->OperationScope(list,scope);
     const auto refused = [&](const char* reason) { provider_->Refused(list, call, reason); return na::observe::ShaderScope{}; };
     const auto& s = p->spec_;
-    if (s.compute != (call.kind == na::observe::ShaderKind::Dispatch) ||
-        (!s.compute && !na::observe::ListRasterStateRestorable(list))) return refused("operation kind or native raster state changed");
+    if (s.compute != (call.kind == na::observe::ShaderKind::Dispatch)) return refused("operation kind changed");
     na::observe::ShaderState native;
-    if (!na::observe::ListShaderState(list, s.compute, native) || native.root != s.root.Get() ||
+    if (!na::observe::ListShaderState(list, s.compute, native) || (!s.compute&&!native.raster_restorable) || native.root != s.root.Get() ||
         (p->cbv_mask_ & native.cbv_params) != p->cbv_mask_) return refused("native root bindings changed");
     uint64_t tables = 0;
     for (uint32_t i = 0; i < native.count; ++i) if (!native.tables[i].sampler) tables |= uint64_t(1) << native.tables[i].param;
     if (p->views_ && tables != p->tables_mask_) return refused("private table map does not cover every native resource table");
     for (const auto& c : s.constants) if (!c.buffer->CanRecord(list, c.source_state)) return refused("source constant state is not usable");
     auto retained = std::const_pointer_cast<PreparedBindings>(p);
-    if (!na::nr::native::RetainRecording(list, retained)) return refused("recording lifetime is not available");
-    for (const auto& c : s.constants) c.buffer->RecordBefore(list, c.source_state);
-    if (!p->enter_.empty()) list->ResourceBarrier(static_cast<UINT>(p->enter_.size()), p->enter_.data());
+    if (!provider_->RecordingOwnsPlans()&&!na::nr::native::RetainRecording(list, retained)) return refused("recording lifetime is not available");
+    if(provider_->RecordingOwnsPlans()){
+        if(!provider_->RecordConstants(list,s.constants,scope))return refused("recording constants are not available");
+    }else for (const auto& c : s.constants) c.buffer->RecordBefore(list, c.source_state);
+    if(provider_->RecordingOwnsPlans()){
+        if(!provider_->RecordResources(list,s.uses,scope))return refused("recording resources are not available");
+    }else if (!p->enter_.empty()) list->ResourceBarrier(static_cast<UINT>(p->enter_.size()), p->enter_.data());
     if (p->views_) {
         ID3D12DescriptorHeap* heaps[]{p->views_.Get(), native.samplers};
         list->SetDescriptorHeaps(native.samplers ? 2 : 1, heaps);
@@ -146,15 +150,17 @@ na::observe::ShaderScope BindingHook::Before(ID3D12GraphicsCommandList* list, na
     if (!p->viewports_.empty()) list->RSSetViewports(static_cast<UINT>(p->viewports_.size()), p->viewports_.data());
     if (!p->scissors_.empty()) list->RSSetScissorRects(static_cast<UINT>(p->scissors_.size()), p->scissors_.data());
     if (p->dispatch_x_) { call.args[0] = p->dispatch_x_; call.args[1] = p->dispatch_y_; }
-    return {na::observe::ShaderAction::Forward, std::move(retained)};
+    return scope;
 }
 void BindingHook::After(ID3D12GraphicsCommandList* list, const na::observe::ShaderCall& call, na::observe::ShaderScope& scope) noexcept
 {
     const auto p = std::static_pointer_cast<PreparedBindings>(scope.state);
     if (!p) return;
-    na::observe::RestoreListState(list);
-    if (!p->leave_.empty()) list->ResourceBarrier(static_cast<UINT>(p->leave_.size()), p->leave_.data());
-    for (auto c = p->spec_.constants.rbegin(); c != p->spec_.constants.rend(); ++c) c->buffer->RecordAfter(list);
-    provider_->Applied(list,call,p);
+    na::observe::RestoreBindingState(list,p->spec_.compute,!!p->views_,p->cbv_mask_,
+        !!p->rtvs_||!!p->dsv_,!p->viewports_.empty(),!p->scissors_.empty());
+    if (!provider_->RecordingOwnsPlans()&&!p->leave_.empty()) list->ResourceBarrier(static_cast<UINT>(p->leave_.size()), p->leave_.data());
+    if(provider_->RecordingOwnsPlans())provider_->RestoreConstants(list,p->spec_.constants);
+    else for (auto c = p->spec_.constants.rbegin(); c != p->spec_.constants.rend(); ++c) c->buffer->RecordAfter(list);
+    provider_->AppliedScope(list,call,p,scope);
 }
 } // namespace na::scale

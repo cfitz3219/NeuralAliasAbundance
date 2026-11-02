@@ -5051,6 +5051,7 @@ bool ListShaderState(ID3D12CommandList* l, bool compute, ShaderState& out)
     std::lock_guard<std::mutex> bl(ls->bind_m);
     if (!ls->restorable || ls->in_render_pass) return false;
     result.root = static_cast<ID3D12RootSignature*>(const_cast<void*>(ls->root_sig[compute ? 1 : 0]));
+    result.raster_restorable=ls->raster_tracking&&ls->raster_targets_known&&ls->raster_viewports_known&&ls->raster_scissors_known;
     for (uint32_t i = 0; i < ls->nheaps; ++i) {
         const DescHeap* heap = nullptr;
         for (const auto& h : g_heaps) if (h && h->key == ls->heaps[i]) { heap = h.get(); break; }
@@ -5176,6 +5177,40 @@ bool RestoreListState(ID3D12GraphicsCommandList* l)
     if (vp_known) l->RSSetViewports(viewport_count, viewport_count ? viewports : nullptr);
     if (sc_known) l->RSSetScissorRects(scissor_count, scissor_count ? scissors : nullptr);
     if (topology_known) l->IASetPrimitiveTopology(topology);
+    return true;
+}
+bool RestoreBindingState(ID3D12GraphicsCommandList* l,bool compute,bool restore_heaps,uint64_t cbvs,bool targets,bool vp,bool sc){
+    ID3D12DescriptorHeap* heaps[2]{};UINT heap_count=0;
+    struct Table{UINT param;uint64_t address;};Table tables[2][64]{};UINT table_count[2]{};
+    uint64_t addresses[64]{};D3D12_VIEWPORT viewports[16]{};D3D12_RECT scissors[16]{};
+    UINT viewport_count=0,scissor_count=0,rt_count=0;bool depth=false;
+    std::shared_ptr<Obj::Twins> storage;
+    {std::shared_lock<std::shared_mutex> lock(g_m);na_object_id id=0;auto* ls=l?list_state_locked(l,&id):nullptr;
+        if(!ls||!ls->recording_observed.load()||!ls->coverage_complete.load())return false;
+        std::lock_guard<std::mutex> bind(ls->bind_m);if(!ls->restorable||ls->in_render_pass)return false;
+        if(restore_heaps){heap_count=ls->nheaps;std::copy_n(ls->heaps,heap_count,heaps);
+            for(UINT c=0;c<2;++c){if(ls->args[c].size()>64)return false;
+                for(UINT p=0;p<ls->args[c].size();++p)if(ls->args[c][p].type==1)tables[c][table_count[c]++]={p,ls->args[c][p].value};}}
+        for(UINT p=0;p<64;++p)if(cbvs&(uint64_t(1)<<p)){
+            if(p>=ls->args[compute].size()||ls->args[compute][p].type!=2)return false;addresses[p]=ls->args[compute][p].value;}
+        if(targets||vp||sc){if(!ls->raster_tracking)return false;
+            if(targets){if(!ls->raster_targets_known)return false;const auto owner=g_objs.find(canon(l));
+                if(owner==g_objs.end()||!owner->second.twins||!owner->second.twins->obj[0]||!owner->second.twins->obj[1])return false;
+                storage=owner->second.twins;rt_count=ls->raster_rt_count;depth=ls->raster_has_depth;}
+            if(vp){if(!ls->raster_viewports_known)return false;viewport_count=ls->raster_viewport_count;std::copy_n(ls->raster_viewports,viewport_count,viewports);}
+            if(sc){if(!ls->raster_scissors_known)return false;scissor_count=ls->raster_scissor_count;std::copy_n(ls->raster_scissors,scissor_count,scissors);}}
+    }
+    if(restore_heaps){l->SetDescriptorHeaps(heap_count,heap_count?heaps:nullptr);
+        for(UINT c=0;c<2;++c)for(UINT i=0;i<table_count[c];++i){const auto& table=tables[c][i];
+            if(c)l->SetComputeRootDescriptorTable(table.param,{table.address});else l->SetGraphicsRootDescriptorTable(table.param,{table.address});}}
+    for(UINT p=0;p<64;++p)if(cbvs&(uint64_t(1)<<p)){
+        if(compute)l->SetComputeRootConstantBufferView(p,addresses[p]);else l->SetGraphicsRootConstantBufferView(p,addresses[p]);}
+    if(targets){if(!storage->obj[0]||!storage->obj[1])return false;
+        const auto rt=static_cast<ID3D12DescriptorHeap*>(storage->obj[0])->GetCPUDescriptorHandleForHeapStart();
+        const auto ds=static_cast<ID3D12DescriptorHeap*>(storage->obj[1])->GetCPUDescriptorHandleForHeapStart();
+        l->OMSetRenderTargets(rt_count,rt_count?&rt:nullptr,TRUE,depth?&ds:nullptr);}
+    if(vp)l->RSSetViewports(viewport_count,viewport_count?viewports:nullptr);
+    if(sc)l->RSSetScissorRects(scissor_count,scissor_count?scissors:nullptr);
     return true;
 }
 bool ListClearsTarget(ID3D12CommandList* list, na_object_id target)
