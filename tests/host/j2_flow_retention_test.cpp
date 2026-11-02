@@ -70,7 +70,7 @@ int main()
     CHECK(after.recorded==280&&after.submitted==280&&after.pairs==279&&after.busy==0);
     CHECK(after.samples>=250&&after.sample_frame==280&&after.submitted_pairs==279);
     CHECK(after.recording_slots<=25&&after.image_slots<=26); // resources plateau and recycle
-    CHECK(after.total==w*h&&after.accepted+after.rejected_invalid+after.rejected_small+after.rejected_cost+after.rejected_offscreen+after.rejected_image==after.total);
+    CHECK(after.total==w*h&&after.accepted+after.rejected_invalid+after.rejected_small+after.rejected_cost+after.rejected_offscreen+after.rejected_image+after.rejected_flicker==after.total);
     char line[500];cf::DescribeStats(after,line,sizeof line);CHECK(std::strstr(line,"Last completed sample")&&std::strstr(line,"frames behind"));
     auto stale=after;stale.submit_age_ms=10000;cf::DescribeStats(stale,line,sizeof line);CHECK(std::strstr(line,"no new submission")&&!std::strstr(line,"moving pixels"));
     // Old executable work remains valid after later recordings change bindings.
