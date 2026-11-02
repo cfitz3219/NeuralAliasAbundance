@@ -295,7 +295,7 @@ int main(int argc, char** argv)
     std::printf("result: extra switched-off evaluate %s; bounded over time=%s\n",
                 planned.max == 0 ? "bit-exact" : "not bit-exact", bounded ? "yes" : "NO");
     const bool clean = planned.max <= 0.05 && planned.mean <= control.mean * 0.01 && bounded;
-    const bool sensitive = control.mean > 10 * tol_mean;
+    const bool sensitive = control.mean > 10 * (noise.mean + 1e-5);
     std::printf("result: within tolerance (max<=0.05, mean<=1%% of control, bounded)=%s; control detectable=%s\n",
                 clean ? "yes" : "NO", sensitive ? "yes" : "NO (test inconclusive)");
     CHECK(sensitive);
