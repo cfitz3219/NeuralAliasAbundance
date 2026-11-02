@@ -6,7 +6,7 @@
 #include <cstring>
 namespace na::scale {
 bool NativeBindingSpec(const na::observe::NativeOperation& op, std::shared_ptr<const SceneGroup> group,
-                       BindingSpec& out, std::string& error)
+                       BindingSpec& out, std::string& error,bool submission_constants)
 {
     out = {}; error.clear();
     const auto fail = [&](const char* why) { error = why; return false; };
@@ -71,7 +71,7 @@ bool NativeBindingSpec(const na::observe::NativeOperation& op, std::shared_ptr<c
                 if(!std::isfinite(actual)||std::fabs(actual-expected)>std::max(std::fabs(expected)*1e-6f,1e-9f))continue;}
             patches.push_back({field.offset,field.integer?Scalar::UInt:Scalar::Float,static_cast<Dimension>(field.dimension),s.native_extent,s.render_extent});}
         Microsoft::WRL::ComPtr<ID3D12Device> device;if(!c.resource||FAILED(c.resource->GetDevice(IID_PPV_ARGS(&device))))return fail("constant-buffer device is unavailable");
-        auto constants=GpuConstants::Create(device.Get(),c.resource.Get(),c.offset,bytes.data(),bytes.size(),patches,error);if(!constants)return false;
+        auto constants=GpuConstants::Create(device.Get(),c.resource.Get(),c.offset,bytes.data(),bytes.size(),patches,error,submission_constants);if(!constants)return false;
         D3D12_HEAP_PROPERTIES heap{};if(FAILED(c.resource->GetHeapProperties(&heap,nullptr)))return fail("constant-buffer heap is unavailable");
         D3D12_RESOURCE_STATES state=D3D12_RESOURCE_STATE_GENERIC_READ;
         if(heap.Type!=D3D12_HEAP_TYPE_UPLOAD&&heap.Type!=static_cast<D3D12_HEAP_TYPE>(5)) {

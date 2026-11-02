@@ -71,6 +71,7 @@ struct ListState {
     std::mutex bind_m;
     std::vector<Binding> bindings;
     const void* root_sig[2] = {nullptr, nullptr}; // graphics, compute (recording thread)
+    uint64_t root_serial[2]{},host_restore_serial=0;
     // C9b: explicit transitions recorded in this recording, in order (under bind_m).
     struct StateNote {
         na_object_id resource;
@@ -106,6 +107,7 @@ struct ListState {
     struct RootArg {
         uint8_t type = 0; // 0 unset, 1 table, 2 CBV, 3 SRV, 4 UAV, 5 constants
         uint64_t value = 0;
+        uint64_t serial = 0;
         std::vector<uint32_t> consts;
     };
     ID3D12PipelineState* pso = nullptr;
@@ -126,6 +128,7 @@ struct ListState {
     bool raster_targets_known = false, raster_has_depth = false;
     bool raster_tracking = false; // latched at Reset; an Off request cannot undo restoration mid-recording
     std::vector<std::shared_ptr<const DescriptorDetails>> native_colors;
+    uint64_t target_serial=0,viewport_serial=0,scissor_serial=0;
     std::shared_ptr<const DescriptorDetails> native_depth;
     int8_t mip_level = -1;               // live mip bias: twin level latched at Reset (-1 = the game's own objects)
 };
@@ -2470,7 +2473,7 @@ struct On<sl::list::RSSetViewports> {
         if (!begin_op(l, &r)) return;
         with_list_state(l, [&](ListState& ls) {
             std::lock_guard<std::mutex> bl(ls.bind_m);
-            ls.raster_viewports_known = n <= D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE && (!n || v);
+            ++ls.viewport_serial;ls.raster_viewports_known = n <= D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE && (!n || v);
             if (ls.raster_viewports_known) {
                 ls.raster_viewport_count = n;
                 if (n) std::copy_n(v, n, ls.raster_viewports);
@@ -2497,7 +2500,7 @@ struct On<sl::list::RSSetScissorRects> {
         if (!begin_op(l, &r)) return;
         with_list_state(l, [&](ListState& ls) {
             std::lock_guard<std::mutex> bl(ls.bind_m);
-            ls.raster_scissors_known = n <= D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE && (!n || rc);
+            ++ls.scissor_serial;ls.raster_scissors_known = n <= D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE && (!n || rc);
             if (ls.raster_scissors_known) {
                 ls.raster_scissor_count = n;
                 if (n) std::copy_n(rc, n, ls.raster_scissors);
@@ -2657,9 +2660,8 @@ void root_sig(GL* l, ID3D12RootSignature* rs)
     if (!begin_op(l, &r)) return;
     emit_op(r, NA_OP_SET_ROOT_SIGNATURE, {id_or_unknown(rs), Compute});
     with_list_state(l, [&](ListState& ls) {
-        const bool changed = ls.root_sig[Compute] != rs;
-        ls.root_sig[Compute] = rs;
         std::lock_guard<std::mutex> bl(ls.bind_m);
+        const bool changed = ls.root_sig[Compute] != rs;ls.root_sig[Compute] = rs;++ls.root_serial[Compute];
         if (changed) ls.args[Compute].clear(); // a different root signature invalidates every root argument
     });
 }
@@ -2675,6 +2677,7 @@ void shadow_arg(GL* l, uint32_t compute, UINT param, uint8_t type, uint64_t valu
         auto& v = ls.args[compute];
         if (v.size() <= param) v.resize(param + 1);
         ListState::RootArg& a = v[param];
+        ++a.serial;
         if (type == 5) {
             if (a.type != 5) a.consts.clear();
             if (dest + count > 64) return;
@@ -3301,7 +3304,7 @@ void capture_raster_targets(GL* list, UINT count, const D3D12_CPU_DESCRIPTOR_HAN
         na_object_id id = 0; auto* ls = list_state_locked(list, &id);
         if (ls) {
             std::lock_guard<std::mutex> bl(ls->bind_m);
-            ls->native_colors.clear(); ls->native_depth.reset();
+            ++ls->target_serial;ls->native_colors.clear(); ls->native_depth.reset();
             UINT stride = 0;
             if (count) { uint32_t slot = 0; if (auto* heap = heap_for_cpu_locked(targets[0].ptr, &slot)) stride = heap->increment; }
             for (UINT i = 0; i < count; ++i) {
@@ -5052,6 +5055,8 @@ bool ListShaderState(ID3D12CommandList* l, bool compute, ShaderState& out)
     if (!ls->restorable || ls->in_render_pass) return false;
     result.root = static_cast<ID3D12RootSignature*>(const_cast<void*>(ls->root_sig[compute ? 1 : 0]));
     result.raster_restorable=ls->raster_tracking&&ls->raster_targets_known&&ls->raster_viewports_known&&ls->raster_scissors_known;
+    result.target_serial=ls->target_serial;result.viewport_serial=ls->viewport_serial;result.scissor_serial=ls->scissor_serial;
+    result.root_serial=ls->root_serial[compute];result.restore_serial=ls->host_restore_serial;
     for (uint32_t i = 0; i < ls->nheaps; ++i) {
         const DescHeap* heap = nullptr;
         for (const auto& h : g_heaps) if (h && h->key == ls->heaps[i]) { heap = h.get(); break; }
@@ -5064,7 +5069,7 @@ bool ListShaderState(ID3D12CommandList* l, bool compute, ShaderState& out)
     if (args.size() > 64) return false;
     for (uint32_t p = 0; p < args.size(); ++p) {
         const auto& a = args[p];
-        if (a.type == 2) result.cbv_params |= uint64_t(1) << p;
+        if (a.type == 2){result.cbv_params |= uint64_t(1) << p;result.cbv_serial[p]=a.serial;}
         if (a.type != 1) continue;
         const DescHeap* heap = nullptr;
         for (const auto& h : g_heaps) if (h &&
@@ -5131,6 +5136,7 @@ bool RestoreListState(ID3D12GraphicsCommandList* l)
         std::lock_guard<std::mutex> bl(ls->bind_m);
         if (!ls->restorable || ls->in_render_pass) return false;
         pso = ls->pso;
+        ++ls->host_restore_serial;
         nheaps = ls->nheaps;
         heaps[0] = ls->heaps[0];
         heaps[1] = ls->heaps[1];
@@ -5179,7 +5185,7 @@ bool RestoreListState(ID3D12GraphicsCommandList* l)
     if (topology_known) l->IASetPrimitiveTopology(topology);
     return true;
 }
-bool RestoreBindingState(ID3D12GraphicsCommandList* l,bool compute,bool restore_heaps,uint64_t cbvs,bool targets,bool vp,bool sc){
+bool RestoreBindingState(ID3D12GraphicsCommandList* l,bool compute,bool restore_heaps,uint64_t cbvs,bool targets,bool vp,bool sc,ID3D12RootSignature* expected_root){
     ID3D12DescriptorHeap* heaps[2]{};UINT heap_count=0;
     struct Table{UINT param;uint64_t address;};Table tables[2][64]{};UINT table_count[2]{};
     uint64_t addresses[64]{};D3D12_VIEWPORT viewports[16]{};D3D12_RECT scissors[16]{};
@@ -5188,6 +5194,7 @@ bool RestoreBindingState(ID3D12GraphicsCommandList* l,bool compute,bool restore_
     {std::shared_lock<std::shared_mutex> lock(g_m);na_object_id id=0;auto* ls=l?list_state_locked(l,&id):nullptr;
         if(!ls||!ls->recording_observed.load()||!ls->coverage_complete.load())return false;
         std::lock_guard<std::mutex> bind(ls->bind_m);if(!ls->restorable||ls->in_render_pass)return false;
+        if(expected_root&&ls->root_sig[compute]!=expected_root)cbvs=0;
         if(restore_heaps){heap_count=ls->nheaps;std::copy_n(ls->heaps,heap_count,heaps);
             for(UINT c=0;c<2;++c){if(ls->args[c].size()>64)return false;
                 for(UINT p=0;p<ls->args[c].size();++p)if(ls->args[c][p].type==1)tables[c][table_count[c]++]={p,ls->args[c][p].value};}}
@@ -5694,6 +5701,11 @@ bool ResolveGpuVa(uint64_t va, na_object_id* resource, uint64_t* offset)
 void SetExecuteForwarder(void(STDMETHODCALLTYPE* fwd)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*))
 {
     g_exec_forward.store(fwd, std::memory_order_release);
+}
+bool HostExecuteAvailable(){return g_exec_forward.load(std::memory_order_acquire)||o_ExecuteCommandLists;}
+bool ExecuteHostCommands(ID3D12CommandQueue* queue,UINT count,ID3D12CommandList* const* lists){
+    auto forward=g_exec_forward.load(std::memory_order_acquire);if(!forward)forward=o_ExecuteCommandLists;
+    if(!queue||!forward||!count||!lists)return false;const HostWorkScope host;forward(queue,count,lists);return true;
 }
 
 void SetProcessExiting() { g_process_exiting.store(true, std::memory_order_release); }

@@ -82,6 +82,10 @@ struct ExecuteToken {
 // C9b: the game host's original ExecuteCommandLists, used to submit the host's
 // own sample copies without re-entering the host's execute detour.
 void SetExecuteForwarder(void(__stdcall* fwd)(ID3D12CommandQueue*, unsigned int, ID3D12CommandList* const*));
+// Reuse the established original forwarder for host preparation. Never recurse
+// through the presenter/J2/NR execute detours; no waits or ownership inference.
+bool HostExecuteAvailable();
+bool ExecuteHostCommands(ID3D12CommandQueue*,uint32_t,ID3D12CommandList* const*);
 
 // Begin also takes the C9 constant-data snapshots of the submitted recordings.
 ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue, uint32_t count = 0, ID3D12CommandList* const* lists = nullptr);
@@ -142,7 +146,7 @@ bool RestoreListState(ID3D12GraphicsCommandList* list);
 // touched bindings, with bounded inline snapshots and no RootArg vector clones.
 // Changing a resource heap invalidates tables in BOTH shader pipelines.
 bool RestoreBindingState(ID3D12GraphicsCommandList*,bool compute,bool heaps,uint64_t cbvs,
-    bool targets,bool viewports,bool scissors);
+    bool targets,bool viewports,bool scissors,ID3D12RootSignature* expected_root=nullptr);
 // Layer2 raster work also changes RTV/DSV, viewport/scissor and IA topology.
 // Opt-in: private CPU descriptor snapshots are taken before OMSetRenderTargets
 // (the game's source descriptors may legally be reused immediately afterwards).
@@ -160,6 +164,8 @@ struct ShaderState {
     ID3D12DescriptorHeap* samplers = nullptr;
     uint64_t cbv_params = 0;
     bool raster_restorable=false;
+    uint64_t target_serial=0,viewport_serial=0,scissor_serial=0,cbv_serial[64]{};
+    uint64_t root_serial=0,restore_serial=0;
     struct Table { uint32_t param; uint64_t handle; bool sampler; } tables[64]{};
     uint32_t count = 0;
 };

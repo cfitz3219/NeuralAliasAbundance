@@ -1,6 +1,11 @@
 #include "host_dx12/nr/sl_consumer.hpp"
 #include "host_dx12/nr/native_fg.hpp"
 #include "host_dx12/nr/queue_trace.hpp"
+#include <atomic>
+namespace na::nr::native {
+namespace {std::atomic<SubmissionPrepareCallback> submission_prepare{nullptr};}
+void SetSubmissionPrepareCallback(SubmissionPrepareCallback callback){submission_prepare.store(callback,std::memory_order_release);}
+}
 #ifdef NA_HAVE_NGX_SDK
 #include "host_dx12/nr/fg_contract.hpp"
 #include "host_dx12/nr/fg_frame_cache.hpp"
@@ -618,6 +623,7 @@ Submission::Submission(ID3D12CommandQueue* q,UINT n,ID3D12CommandList* const* li
     ++internal;entered_=true;queue_=q;
     for(uint32_t i=0;i<count_;++i){auto& r=*static_cast<Recording*>(records_[i].get());
         r.forwarding.fetch_add(1);locks_[i]=std::unique_lock<std::mutex>(r.submission_mutex);}
+    if(auto prepare=submission_prepare.load(std::memory_order_acquire))prepare(q,n,lists);
 }
 Submission::~Submission() {
     if(!queue_)return;

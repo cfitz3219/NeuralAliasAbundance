@@ -124,6 +124,7 @@ na::observe::ShaderScope BindingHook::Before(ID3D12GraphicsCommandList* list, na
     if(provider_->RecordingOwnsPlans()){
         if(!provider_->RecordResources(list,s.uses,scope))return refused("recording resources are not available");
     }else if (!p->enter_.empty()) list->ResourceBarrier(static_cast<UINT>(p->enter_.size()), p->enter_.data());
+    const auto changes=provider_->BindingChanges(p,native,scope);
     if (p->views_) {
         ID3D12DescriptorHeap* heaps[]{p->views_.Get(), native.samplers};
         list->SetDescriptorHeaps(native.samplers ? 2 : 1, heaps);
@@ -139,16 +140,17 @@ na::observe::ShaderScope BindingHook::Before(ID3D12GraphicsCommandList* list, na
         }
     }
     for (const auto& c : s.root_cbvs) {
+        if(!(changes.cbvs&(uint64_t(1)<<c.param)))continue;
         const auto address = s.constants[c.constant].buffer->Address();
         if (s.compute) list->SetComputeRootConstantBufferView(c.param, address); else list->SetGraphicsRootConstantBufferView(c.param, address);
     }
-    if (p->rtvs_ || p->dsv_) {
+    if (changes.targets&&(p->rtvs_ || p->dsv_)) {
         const auto rt = p->rtvs_ ? p->rtvs_->GetCPUDescriptorHandleForHeapStart() : D3D12_CPU_DESCRIPTOR_HANDLE{};
         const auto ds = p->dsv_ ? p->dsv_->GetCPUDescriptorHandleForHeapStart() : D3D12_CPU_DESCRIPTOR_HANDLE{};
         list->OMSetRenderTargets(static_cast<UINT>(s.colors.size()), rt.ptr ? &rt : nullptr, TRUE, ds.ptr ? &ds : nullptr);
     }
-    if (!p->viewports_.empty()) list->RSSetViewports(static_cast<UINT>(p->viewports_.size()), p->viewports_.data());
-    if (!p->scissors_.empty()) list->RSSetScissorRects(static_cast<UINT>(p->scissors_.size()), p->scissors_.data());
+    if (changes.viewports&&!p->viewports_.empty()) list->RSSetViewports(static_cast<UINT>(p->viewports_.size()), p->viewports_.data());
+    if (changes.scissors&&!p->scissors_.empty()) list->RSSetScissorRects(static_cast<UINT>(p->scissors_.size()), p->scissors_.data());
     if (p->dispatch_x_) { call.args[0] = p->dispatch_x_; call.args[1] = p->dispatch_y_; }
     return scope;
 }
@@ -156,8 +158,9 @@ void BindingHook::After(ID3D12GraphicsCommandList* list, const na::observe::Shad
 {
     const auto p = std::static_pointer_cast<PreparedBindings>(scope.state);
     if (!p) return;
-    na::observe::RestoreBindingState(list,p->spec_.compute,!!p->views_,p->cbv_mask_,
-        !!p->rtvs_||!!p->dsv_,!p->viewports_.empty(),!p->scissors_.empty());
+    const bool keep=provider_->KeepNativeBindings();
+    if(!keep||p->views_)na::observe::RestoreBindingState(list,p->spec_.compute,!!p->views_,keep?0:p->cbv_mask_,
+        !keep&&(!!p->rtvs_||!!p->dsv_),!keep&&!p->viewports_.empty(),!keep&&!p->scissors_.empty());
     if (!provider_->RecordingOwnsPlans()&&!p->leave_.empty()) list->ResourceBarrier(static_cast<UINT>(p->leave_.size()), p->leave_.data());
     if(provider_->RecordingOwnsPlans())provider_->RestoreConstants(list,p->spec_.constants);
     else for (auto c = p->spec_.constants.rbegin(); c != p->spec_.constants.rend(); ++c) c->buffer->RecordAfter(list);

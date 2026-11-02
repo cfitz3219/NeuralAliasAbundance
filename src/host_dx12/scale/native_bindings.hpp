@@ -6,5 +6,5 @@ namespace na::scale {
 // This helper selects no game or scene: the automatic scene owner supplies the
 // observed dependency group. Native material views and CBVs remain intact.
 bool NativeBindingSpec(const na::observe::NativeOperation&, std::shared_ptr<const SceneGroup>,
-                       BindingSpec&, std::string&);
+                       BindingSpec&, std::string&,bool submission_constants=false);
 }

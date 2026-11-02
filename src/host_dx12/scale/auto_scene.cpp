@@ -73,8 +73,29 @@ struct Built {
     std::vector<uint64_t> failed_keys;
     std::unordered_map<uint64_t,std::shared_ptr<std::atomic<uint64_t>>> last_seen;
     std::map<TransferKey,std::string> failed_transfers;
+    ComPtr<ID3D12CommandAllocator> constant_allocator;
+    ComPtr<ID3D12GraphicsCommandList> constant_prologue;
+    std::vector<std::shared_ptr<const GpuConstants>> submission_constants;
+    bool ready=false;
     uint64_t model=0,group_revision=0;int mode=0;bool optimal=false,optimal_available=false;
 };
+bool prepare_constants(ID3D12Device* device,Built& built,std::string& error){
+    std::unordered_set<const GpuConstants*> seen;
+    for(const auto& binding:built.bindings)for(const auto& use:binding.second->Constants())
+        if(use.buffer->SubmissionCopy()&&seen.insert(use.buffer.get()).second)built.submission_constants.push_back(use.buffer);
+    if(built.submission_constants.empty())return true;
+    if(!na::observe::HostExecuteAvailable()){error="Waiting for the scene queue's original submission path.";return false;}
+    if(FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&built.constant_allocator)))||
+        FAILED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,built.constant_allocator.Get(),nullptr,IID_PPV_ARGS(&built.constant_prologue)))){
+        error="Could not prepare the scene's constant-copy commands.";return false;}
+    std::vector<D3D12_RESOURCE_BARRIER> barriers;barriers.reserve(built.submission_constants.size());
+    for(const auto& buffer:built.submission_constants)barriers.push_back(buffer->Transition(D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,D3D12_RESOURCE_STATE_COPY_DEST));
+    built.constant_prologue->ResourceBarrier(UINT(barriers.size()),barriers.data());
+    for(const auto& buffer:built.submission_constants)buffer->CopyPrepared(built.constant_prologue.Get());
+    for(auto& barrier:barriers)std::swap(barrier.Transition.StateBefore,barrier.Transition.StateAfter);
+    built.constant_prologue->ResourceBarrier(UINT(barriers.size()),barriers.data());
+    if(FAILED(built.constant_prologue->Close())){error="Could not close the scene's constant-copy commands.";return false;}return true;
+}
 struct Run {
     std::shared_ptr<Built> built;std::shared_ptr<SceneFrame> frame;
     uint64_t epoch=0,color=0,depth=0;std::atomic<bool> aborted{false},seeded{false},redirected{false};
@@ -84,11 +105,17 @@ struct Bound {std::shared_ptr<Run> run;na::nr::native::RecordingLease lease;
     struct PrivateState{ID3D12Resource* resource=nullptr;D3D12_RESOURCE_STATES state=D3D12_RESOURCE_STATE_COMMON;};
     std::map<std::pair<uint64_t,UINT>,PrivateState> private_states;
     bool batch_open=false;
+    const PreparedBindings* targets_plan=nullptr,*viewports_plan=nullptr,*scissors_plan=nullptr;
+    uint64_t target_serial=0,viewport_serial=0,scissor_serial=0,restore_serial=0;
+    ID3D12RootSignature* roots[2]{};uint64_t root_serial[2]{},root_restore_serial[2]{},restore_cbvs[2]{},cbv_serial[2][64]{},cbv_address[2][64]{};
+    bool restore_targets=false,restore_viewports=false,restore_scissors=false;
 };
 class Automatic;
 struct Acquisition{Automatic* owner=nullptr;ID3D12GraphicsCommandList* list=nullptr;Bound* bound=nullptr;uint64_t list_id=0,recording=0;};
 thread_local Acquisition acquisition;
-struct Submission {std::shared_ptr<Run> run;ComPtr<ID3D12CommandQueue> queue;std::vector<ID3D12CommandList*> lists;};
+struct Submission {std::shared_ptr<Run> run;ComPtr<ID3D12CommandQueue> queue;std::vector<ID3D12CommandList*> lists;
+    struct Part{ID3D12CommandList* list;std::shared_ptr<Run> run;};std::vector<Part> parts;
+};
 thread_local std::shared_ptr<Submission> submission,reporting;
 struct SelectionContext {
     uint64_t color=0,depth=0,model=0;
@@ -131,6 +158,35 @@ public:
     void acquired(ID3D12GraphicsCommandList* list){const auto id=na::observe::IdOf(list),recording=na::observe::ListRecording(list);
         const auto found=bound.find({id,recording});if(found!=bound.end())acquired(list,found->second,id,recording);}
     bool RecordingOwnsPlans()const noexcept override{return true;}
+    bool KeepNativeBindings()const noexcept override{return true;}
+    Changes BindingChanges(const std::shared_ptr<const PreparedBindings>& plan,const na::observe::ShaderState& native,const na::observe::ShaderScope& scope)noexcept override{
+        Changes changes;changes.cbvs=0;if(!scope.opaque)return changes;auto& recording=*static_cast<Bound*>(scope.opaque);const auto& spec=plan->Spec();const unsigned c=spec.compute?1:0;
+        const bool host_changed=recording.restore_serial!=native.restore_serial;
+        const bool root_changed=recording.roots[c]!=native.root||recording.root_serial[c]!=native.root_serial||recording.root_restore_serial[c]!=native.restore_serial;
+        if(recording.roots[c]!=native.root)recording.restore_cbvs[c]=0;
+        recording.roots[c]=native.root;recording.root_serial[c]=native.root_serial;recording.root_restore_serial[c]=native.restore_serial;
+        for(const auto& root:spec.root_cbvs){const auto address=spec.constants[root.constant].buffer->Address();const auto bit=uint64_t(1)<<root.param;
+            if(root_changed||recording.cbv_serial[c][root.param]!=native.cbv_serial[root.param]||recording.cbv_address[c][root.param]!=address)changes.cbvs|=bit;
+            recording.restore_cbvs[c]|=bit;recording.cbv_serial[c][root.param]=native.cbv_serial[root.param];recording.cbv_address[c][root.param]=address;}
+        const auto targets_equal=[&]{const auto* old=recording.targets_plan;if(!old)return false;const auto& prior=old->Spec();
+            if(prior.colors.size()!=spec.colors.size()||prior.depth.member!=spec.depth.member||std::memcmp(&prior.depth.view,&spec.depth.view,sizeof spec.depth.view))return false;
+            for(size_t i=0;i<spec.colors.size();++i)if(prior.colors[i].member!=spec.colors[i].member||std::memcmp(&prior.colors[i].view,&spec.colors[i].view,sizeof spec.colors[i].view))return false;return true;};
+        const auto same=[](const auto& a,const auto& b){return a.size()==b.size()&&(a.empty()||!std::memcmp(a.data(),b.data(),a.size()*sizeof(a[0])));};
+        if(!spec.compute){changes.targets=host_changed||recording.target_serial!=native.target_serial||!targets_equal();
+            changes.viewports=host_changed||recording.viewport_serial!=native.viewport_serial||!recording.viewports_plan||!same(recording.viewports_plan->Viewports(),plan->Viewports());
+            changes.scissors=host_changed||recording.scissor_serial!=native.scissor_serial||!recording.scissors_plan||!same(recording.scissors_plan->Scissors(),plan->Scissors());
+            recording.targets_plan=recording.viewports_plan=recording.scissors_plan=plan.get();recording.target_serial=native.target_serial;recording.viewport_serial=native.viewport_serial;recording.scissor_serial=native.scissor_serial;
+            recording.restore_targets|=!spec.colors.empty()||spec.depth.member!=0;recording.restore_viewports|=!plan->Viewports().empty();recording.restore_scissors|=!plan->Scissors().empty();}
+        if(!spec.compute)recording.restore_serial=native.restore_serial;return changes;
+    }
+    void restore_bindings(ID3D12GraphicsCommandList* list,Bound& recording){
+        bool targets=recording.restore_targets,viewports=recording.restore_viewports,scissors=recording.restore_scissors;
+        for(unsigned c=0;c<2;++c){const auto mask=recording.restore_cbvs[c];
+            if(mask||targets||viewports||scissors){na::observe::RestoreBindingState(list,c!=0,false,mask,targets,viewports,scissors,recording.roots[c]);targets=viewports=scissors=false;}
+            recording.restore_cbvs[c]=0;}
+        recording.restore_targets=recording.restore_viewports=recording.restore_scissors=false;
+        recording.targets_plan=recording.viewports_plan=recording.scissors_plan=nullptr;
+    }
     void OperationScope(ID3D12GraphicsCommandList* list,na::observe::ShaderScope& scope)noexcept override{
         if(acquisition.owner!=this||acquisition.list!=list||!acquisition.bound)return;
         scope.context=acquisition.bound->run;scope.opaque=acquisition.bound;scope.list_id=acquisition.list_id;scope.recording=acquisition.recording;
@@ -139,6 +195,7 @@ public:
         if(!scope.opaque)return false;
         auto& recording=*static_cast<Bound*>(scope.opaque);
         for(const auto& use:constants){const auto* buffer=use.buffer.get();
+            if(buffer->SubmissionCopy()){++constant_reuses;continue;}
             if(buffer->ReusableWithinRecording()){
                 if(recording.constants.count(buffer)){++constant_reuses;continue;}
                 if(!buffer->RecordBefore(list,use.source_state))return false;
@@ -170,7 +227,7 @@ public:
         if(!recording.batch_open){recording.batch_open=true;++open_batches;}return true;
     }
     void flush_resources(ID3D12GraphicsCommandList* list,Bound& recording){
-        if(!recording.batch_open)return;const na::observe::HostWorkScope host;
+        const na::observe::HostWorkScope host;restore_bindings(list,recording);if(!recording.batch_open)return;
         D3D12_RESOURCE_BARRIER barriers[32]{};UINT count=0;
         for(auto& entry:recording.private_states){auto& state=entry.second;if(state.state==D3D12_RESOURCE_STATE_COMMON)continue;
             auto& barrier=barriers[count++];barrier={};barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -233,7 +290,7 @@ public:
     std::shared_ptr<Run> run_for(ID3D12GraphicsCommandList* list){
         const auto key=std::make_pair(na::observe::IdOf(list),na::observe::ListRecording(list));
         const auto found=bound.find(key);if(found!=bound.end())return found->second.run;
-        if(unsupported||work_pending.load()||!built||built->model!=model||epoch-last_novel_epoch<3||!built->failed.empty()||!built->failed_transfers.empty()||built->bindings.empty()||!na::j2::Enabled()||na::j2::Paused())return {};
+        if(unsupported||work_pending.load()||!built||!built->ready||built->model!=model||epoch-last_novel_epoch<3||!built->failed.empty()||!built->failed_transfers.empty()||built->bindings.empty()||!na::j2::Enabled()||na::j2::Paused())return {};
         const auto q=list_queues.find(key.first);
         if(!execution_queue||q==list_queues.end()||q->second!=na::observe::IdOf(execution_queue.Get()))return {};
         if(!current||current->epoch!=epoch){
@@ -405,6 +462,18 @@ public:
     }
 };
 std::shared_ptr<Automatic>& automatic(){static auto* value=new std::shared_ptr<Automatic>();return *value;}
+void submit_constants(ID3D12CommandQueue* queue,UINT count,ID3D12CommandList* const* lists){
+    const auto current=submission;if(!current||current->queue.Get()!=queue)return;
+    std::vector<const Built*> done;done.reserve(current->parts.size());const na::observe::HostWorkScope host;
+    for(const auto& part:current->parts){bool included=false;for(UINT i=0;i<count;++i)included|=lists[i]==part.list;
+        const auto& built=part.run->built;if(!included||!built->constant_prologue||std::find(done.begin(),done.end(),built.get())!=done.end())continue;
+        done.push_back(built.get());ID3D12CommandList* prologue=built->constant_prologue.Get();
+        // Run's existing game-recording lease owns Built and these commands
+        // through every submitted occurrence. J1's late upload writes precede
+        // this actual-forward boundary; the copies execute on the same queue.
+        na::observe::ExecuteHostCommands(queue,1,&prologue);if(auto owner=automatic())owner->constant_copies.fetch_add(built->submission_constants.size());
+    }
+}
 na::j2::PhysicalLookup lookup(void*,uint64_t color,uint64_t depth,ID3D12GraphicsCommandList* list,std::shared_ptr<const na::j2::PhysicalInput>* out){
     auto a=automatic();if(!a||!out)return na::j2::PhysicalLookup::None;out->reset();std::shared_ptr<Run> run;
     {ControlLock lock(a->mutex,a->cost);
@@ -434,6 +503,7 @@ void ConfigureAutomaticScene(bool enabled){
     na::observe::SetOperationSnapshots(true);na::observe::SetRasterStateTracking(true);
     na::observe::SetShaderOperationHook(na::observe::ShaderLane::Bindings,std::make_shared<BindingHook>(a));
     na::observe::SetTextureOperationHook(a);na::j2::SetPhysicalInputProvider({&lookup,&outcome,nullptr,true});
+    na::nr::native::SetSubmissionPrepareCallback(&submit_constants);
 }
 void PollAutomaticScene(){
     auto a=automatic();if(!a)return;
@@ -449,6 +519,7 @@ void PollAutomaticScene(){
     std::deque<std::shared_ptr<Run>> retired_runs;
     std::deque<std::shared_ptr<Built>> retired_profiles;
     std::map<TransferKey,TransferSpec> transfers;std::shared_ptr<Built> previous;uint64_t model=0,color=0,depth=0,generation=0,group_revision=0;int mode=0;
+    bool batch_complete=false;size_t source_operations=0,source_transfers=0;
     {ControlLock lock(a->mutex,a->cost);mode=static_cast<int>(na::settings::Get().j2_scale_mode.load());
         retired_selections.swap(a->retired_selections);
         retired_recordings.swap(a->retired_recordings);retired_runs.swap(a->retired_runs);retired_profiles.swap(a->retired_profiles);
@@ -493,6 +564,7 @@ void PollAutomaticScene(){
         }
         if(current_basis&&observed.empty()&&transfers.empty()&&probes.empty()&&expired.empty()){a->work_pending.store(false);return;}
         members=a->members;previous=latest;model=a->model;color=a->color;depth=a->depth;group_revision=a->group_revision;
+        batch_complete=a->pending.empty();source_operations=a->observed.size();source_transfers=a->observed_transfers.size();
     }
     std::vector<uint64_t> retry;
     for(const auto& probe:probes)if(preparation_evidence(*probe.request)!=probe.evidence){observed.emplace(probe.key,probe.request);retry.push_back(probe.key);}
@@ -529,7 +601,7 @@ void PollAutomaticScene(){
         for(const auto& value:usage)next->last_seen[value.first]=value.second;
         for(const auto& op:observed)if(!next->bindings.count(op.first)&&!next->failed.count(op.first)){
             const auto fingerprint=preparation_evidence(*op.second);
-            BindingSpec spec;if(!NativeBindingSpec(*op.second,next->group,spec,error)){next->failed.emplace(op.first,error);next->failed_evidence.emplace(op.first,fingerprint);continue;}
+            BindingSpec spec;if(!NativeBindingSpec(*op.second,next->group,spec,error,true)){next->failed.emplace(op.first,error);next->failed_evidence.emplace(op.first,fingerprint);continue;}
             auto plan=PreparedBindings::Create(device.Get(),std::move(spec),error);if(plan)next->bindings.emplace(op.first,std::move(plan));else{next->failed.emplace(op.first,error);next->failed_evidence.emplace(op.first,fingerprint);}
         }
         for(auto transfer:transfers)if(!next->transfers.count(transfer.first)&&!next->failed_transfers.count(transfer.first)){
@@ -537,6 +609,8 @@ void PollAutomaticScene(){
         }
     }
     next->failed_keys.reserve(next->failed.size());for(const auto& failure:next->failed)next->failed_keys.push_back(failure.first);
+    const bool complete=batch_complete&&next->bindings.size()>=source_operations&&next->transfers.size()>=source_transfers&&next->failed.empty()&&next->failed_transfers.empty();
+    if(next->prototype&&complete)next->ready=prepare_constants(device.Get(),*next,error);
     ControlLock lock(a->mutex,a->cost);
     ++a->stats.poll_builds;
     if(a->color!=color||a->depth!=depth||mode!=static_cast<int>(na::settings::Get().j2_scale_mode.load())||a->group_revision!=group_revision){a->worker_revision=0;return;}
@@ -546,7 +620,7 @@ void PollAutomaticScene(){
     a->stats.out_w=output.width;a->stats.out_h=output.height;a->stats.members=UINT(members.size());a->stats.plans=UINT(a->prepared->bindings.size());
     a->stats.failed_plans=a->prepared->failed.size()+a->prepared->failed_transfers.size();if(!same)++a->stats.group_builds;
     if(a->stats.failed_plans)a->note(!a->prepared->failed.empty()?a->prepared->failed.begin()->second.c_str():a->prepared->failed_transfers.begin()->second.c_str());
-    else a->note("Reduced scene prepared; applying at the next frame boundary.");
+    else a->note(complete&&!a->prepared->ready?error.c_str():"Reduced scene prepared; applying at the next frame boundary.");
     bool more=!a->pending.empty();for(const auto& transfer:a->observed_transfers)more|=!a->prepared->transfers.count(transfer.first)&&!a->prepared->failed_transfers.count(transfer.first);
     a->work_pending.store(more);
 }
@@ -555,7 +629,7 @@ void AutomaticScenePresent(){auto a=automatic();if(!a)return;uint64_t depth=0,co
     ControlLock lock(a->mutex,a->cost);if(a->current&&a->current->redirected&&!a->current->aborted)++a->redirected_frames;
     ++a->epoch;a->current_recording=false;if(a->current)a->retired_runs.push_back(std::move(a->current));if(color&&depth)a->select(color,depth);
     if(na::settings::Get().j2_scale_mode.load()==0){if(a->built)a->retired_profiles.push_back(std::move(a->built));a->stats.active=false;a->note("Rendering at native resolution.");}
-    else if(a->prepared&&a->built!=a->prepared){if(a->built)a->retired_profiles.push_back(std::move(a->built));a->built=a->prepared;}}
+    else if(a->prepared&&a->prepared->ready&&a->built!=a->prepared){if(a->built)a->retired_profiles.push_back(std::move(a->built));a->built=a->prepared;}}
 AutomaticSceneStats GetAutomaticSceneStats(){auto a=automatic();if(!a)return {};std::shared_lock<std::shared_mutex> lock(a->mutex);auto result=a->stats;
     result.operations=a->operations.load();result.redirected=a->redirected.load();result.fast_hits=a->fast_hits.load();result.snapshots=a->snapshots.load();
     result.constant_copies=a->constant_copies.load();result.constant_reuses=a->constant_reuses.load();
@@ -564,13 +638,15 @@ AutomaticSceneStats GetAutomaticSceneStats(){auto a=automatic();if(!a)return {};
 AutomaticSceneSubmission::AutomaticSceneSubmission(ID3D12CommandQueue* queue,UINT count,ID3D12CommandList* const* lists){
     prior_=submission;auto a=automatic();if(!a){submission.reset();return;}
     auto value=std::make_shared<Submission>();value->queue=queue;value->lists.assign(lists,lists+count);
-    ControlLock lock(a->mutex,a->cost);
+    ControlLock lock(a->mutex,a->cost);bool mixed=false;
     for(UINT i=0;i<count;++i){const auto key=std::make_pair(na::observe::IdOf(lists[i]),na::observe::ListRecording(lists[i]));
         const uint64_t queue_id=na::observe::IdOf(queue);const auto old=a->list_queues.find(key.first);
         if(old!=a->list_queues.end()&&old->second!=queue_id)old->second=0;else if(old==a->list_queues.end())a->list_queues.emplace(key.first,queue_id);
         if(!a->execution_queue&&queue->GetDesc().Type==D3D12_COMMAND_LIST_TYPE_DIRECT&&a->color&&a->depth&&na::observe::ListRendersTo(lists[i],a->color,a->depth))a->execution_queue=queue;
         const auto found=a->bound.find(key);
-        if(found==a->bound.end())continue;if(value->run&&value->run!=found->second.run){value->run.reset();break;}value->run=found->second.run;}
+        if(found==a->bound.end())continue;value->parts.push_back({lists[i],found->second.run});
+        if(value->run&&value->run!=found->second.run)mixed=true;else if(!value->run)value->run=found->second.run;}
+    if(mixed)value->run.reset();
     if(value->run){if(a->execution_queue&&a->execution_queue.Get()!=queue)value->run->aborted=true;else a->execution_queue=queue;}
     submission=std::move(value);
 }

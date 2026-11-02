@@ -2,6 +2,7 @@
 #include "gpu_constants.hpp"
 #include "host_dx12/observe/shader_operation.hpp"
 
+namespace na::observe{struct ShaderState;}
 namespace na::scale {
 // Prepared from the recognized operation's real view/layout metadata, on the
 // setup worker under HostWorkScope. No shader-visible heap is used as a CPU
@@ -56,6 +57,10 @@ public:
     static std::shared_ptr<const PreparedBindings> Create(ID3D12Device*, BindingSpec, std::string& error);
     const std::vector<uint64_t>& WrittenMembers()const{return written_;}
     const std::vector<ResourceUse>& Uses()const{return spec_.uses;}
+    const std::vector<ConstantUse>& Constants()const{return spec_.constants;}
+    const BindingSpec& Spec()const{return spec_;}
+    const std::vector<D3D12_VIEWPORT>& Viewports()const{return viewports_;}
+    const std::vector<D3D12_RECT>& Scissors()const{return scissors_;}
 private:
     BindingSpec spec_;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> views_, rtvs_, dsv_;
@@ -76,6 +81,9 @@ public:
     // An automatic owner may retain its immutable Built (and thus every plan)
     // once per recording, and batch immutable-upload CB copies until Close.
     virtual bool RecordingOwnsPlans()const noexcept{return false;}
+    struct Changes{bool targets=true,viewports=true,scissors=true;uint64_t cbvs=~uint64_t(0);};
+    virtual bool KeepNativeBindings()const noexcept{return false;}
+    virtual Changes BindingChanges(const std::shared_ptr<const PreparedBindings>&,const na::observe::ShaderState&,const na::observe::ShaderScope&)noexcept{return {};}
     virtual void OperationScope(ID3D12GraphicsCommandList*,na::observe::ShaderScope&)noexcept{}
     virtual bool RecordConstants(ID3D12GraphicsCommandList*,const std::vector<ConstantUse>&,const na::observe::ShaderScope&)noexcept{return false;}
     virtual void RestoreConstants(ID3D12GraphicsCommandList*,const std::vector<ConstantUse>&)noexcept{}

@@ -72,6 +72,7 @@ int main(int argc,char** argv){
     const bool split=argc>1&&std::strcmp(argv[1],"--split")==0;
     const bool unsupported=argc>1&&std::strcmp(argv[1],"--unsupported")==0;
     const bool materials=argc>1&&std::strcmp(argv[1],"--materials")==0;
+    const bool repeat=argc>1&&std::strcmp(argv[1],"--repeat")==0;
     setvbuf(stdout,nullptr,_IONBF,0);test::ComPtr<ID3D12Debug> debug;
     if(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))debug->EnableDebugLayer();
     test::Device d;if(!test::CreateDevice(d))return test::SkipNoDevice("auto_scene_test");auto* dev=d.device.Get();
@@ -145,9 +146,10 @@ float4 water(float4 position:SV_Position):SV_Target{uint2 p=uint2(position.xy);f
     void* arguments=nullptr;REQUIRE(SUCCEEDED(indirect_args->Map(0,nullptr,&arguments)));const D3D12_DRAW_ARGUMENTS draw{3,1,0,0};std::memcpy(arguments,&draw,sizeof draw);indirect_args->Unmap(0,nullptr);
     test::List scene;REQUIRE(scene.Create(dev));REQUIRE(SUCCEEDED(scene.list->Close()));
     test::List tail;REQUIRE(tail.Create(dev));REQUIRE(SUCCEEDED(tail.list->Close()));
-    unsigned frame_number=0;float material_value=0;
+    unsigned frame_number=0;float material_value=0;bool replayed=false;
     const auto frame=[&](bool reconstruct){
         d.WaitIdle();if(materials){const auto index=frame_number++%2;material_value=index?.75f:.25f;dev->CreateShaderResourceView(material_textures[index].Get(),&srv,material_slot);}
+        if(repeat){const float before_submit=7;std::memcpy(mapped+8,&before_submit,4);}
         na::scale::AutomaticScenePresent();na::j2::OnPresent(d.queue.Get());scene.Reset();auto* list=scene.list.Get();
         D3D12_RESOURCE_BARRIER start[]={test::Transition(color.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_RENDER_TARGET),test::Transition(depth.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_DEPTH_WRITE)};list->ResourceBarrier(2,start);
         list->SetGraphicsRootSignature(root.Get());list->SetPipelineState(pso.Get());list->SetGraphicsRootConstantBufferView(0,cb->GetGPUVirtualAddress());
@@ -155,6 +157,7 @@ float4 water(float4 position:SV_Position):SV_Target{uint2 p=uint2(position.xy);f
         list->OMSetRenderTargets(1,&rtv,FALSE,&dsv);D3D12_VIEWPORT viewport{0,0,w,h,0,1};D3D12_RECT scissor{0,0,w,h};list->RSSetViewports(1,&viewport);list->RSSetScissorRects(1,&scissor);list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         const float clear[4]={0,0,0,0};list->ClearRenderTargetView(rtv,clear,0,nullptr);
         list->ClearDepthStencilView(dsv,static_cast<D3D12_CLEAR_FLAGS>(D3D12_CLEAR_FLAG_DEPTH|(stencil?D3D12_CLEAR_FLAG_STENCIL:0)),1,0x5a,0,nullptr);list->DrawInstanced(3,1,0,0);
+        if(repeat)for(int i=0;i<31;++i)list->DrawInstanced(3,1,0,0);
         D3D12_RESOURCE_BARRIER copies[]={test::Transition(color.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_SOURCE),test::Transition(depth.Get(),D3D12_RESOURCE_STATE_DEPTH_WRITE,D3D12_RESOURCE_STATE_COPY_SOURCE),
             test::Transition(color_copy.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST),test::Transition(depth_copy.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST)};
         list->ResourceBarrier(4,copies);list->CopyResource(color_copy.Get(),color.Get());list->CopyResource(depth_copy.Get(),depth.Get());
@@ -177,10 +180,21 @@ float4 water(float4 position:SV_Position):SV_Target{uint2 p=uint2(position.xy);f
         }
         D3D12_RESOURCE_BARRIER finish[]={test::Transition(color.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COMMON),test::Transition(depth.Get(),D3D12_RESOURCE_STATE_DEPTH_WRITE,D3D12_RESOURCE_STATE_COMMON)};list->ResourceBarrier(2,finish);CHECK(SUCCEEDED(list->Close()));
         ID3D12CommandList* lists[]={scene.list.Get(),tail.list.Get()};const UINT count=split?2:1;
+        const auto copies_before=na::scale::GetAutomaticSceneStats().constant_copies;
         na::scale::AutomaticSceneSubmission receipt(d.queue.Get(),count,lists);
+        if(repeat){CHECK(na::scale::GetAutomaticSceneStats().constant_copies==copies_before);
+            const float late_upload=9;std::memcpy(mapped+8,&late_upload,4);}
         if(reconstruct)na::j2::Execute(d.queue.Get(),count,lists,&forward);else forward(d.queue.Get(),count,lists);
         d.WaitIdle();na::scale::PollAutomaticScene();const auto status=na::scale::GetAutomaticSceneStats();
         std::printf("automatic: %u plans %u members %ux%u, redirected %llu misses %llu: %s | J2: %s\n",status.plans,status.members,status.render_w,status.render_h,(unsigned long long)status.redirected,(unsigned long long)status.misses,status.reason,na::j2::GetStats().reason);
+        if(repeat&&!reconstruct&&status.active&&!replayed){
+            // Execute the SAME closed recording with fresh upload bytes. Its
+            // prologue must refresh inputs on each occurrence, not just Reset.
+            const float changed=11;std::memcpy(mapped+8,&changed,4);forward(d.queue.Get(),count,lists);d.WaitIdle();
+            CHECK(pixels(d,color.Get(),float(status.render_w)+.5f,float(status.render_h),11)==0);
+            const float original=9;std::memcpy(mapped+8,&original,4);forward(d.queue.Get(),count,lists);d.WaitIdle();
+            CHECK(pixels(d,color.Get(),float(status.render_w)+.5f,float(status.render_h))==0);replayed=true;
+        }
     };
     for(int i=0;i<8;++i)frame(false);
     auto status=na::scale::GetAutomaticSceneStats();
@@ -200,6 +214,7 @@ float4 water(float4 position:SV_Position):SV_Target{uint2 p=uint2(position.xy);f
         CHECK(na::scale::GetAutomaticSceneStats().operations==operations);REQUIRE(pixels(d,color.Get(),w+.5f,h)==0);
     }else{
     CHECK(status.plans>0&&status.members==4&&status.redirected>0);
+    if(repeat)CHECK(replayed&&status.constant_reuses>status.constant_copies);
     if(materials){const auto attempts=status.poll_builds,snapshots=status.snapshots,misses=status.misses;
         for(int i=0;i<24;++i){frame(false);REQUIRE(pixels(d,color_copy.Get(),float(status.render_w),float(status.render_h),9+material_value)==0);}
         status=na::scale::GetAutomaticSceneStats();std::printf("material churn: builds %llu->%llu snapshots %llu->%llu misses %llu->%llu fast %llu\n",

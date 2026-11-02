@@ -18,7 +18,7 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, D3D12_RESOURCE_STATE
 }
 }
 std::shared_ptr<const GpuConstants> GpuConstants::Create(ID3D12Device* device, ID3D12Resource* source,
-    uint64_t offset, const void* observed, size_t bytes, const std::vector<ConstantPatch>& patches, std::string& error)
+    uint64_t offset, const void* observed, size_t bytes, const std::vector<ConstantPatch>& patches, std::string& error,bool submission_copy)
 {
     error.clear();
     const auto fail = [&](const char* reason) -> std::shared_ptr<const GpuConstants> { error = reason; return {}; };
@@ -41,9 +41,11 @@ std::shared_ptr<const GpuConstants> GpuConstants::Create(ID3D12Device* device, I
     // GPU_UPLOAD is value5; older supported Windows SDK headers predate its
     // symbolic name, while the runtime can still return that public heap type.
     copy->fixed_source_state_ = hp.Type == D3D12_HEAP_TYPE_UPLOAD || hp.Type == static_cast<D3D12_HEAP_TYPE>(5);
+    copy->submission_copy_=submission_copy&&copy->fixed_source_state_;
     for (const auto& p : patches) if (std::find(copy->offsets_.begin(), copy->offsets_.end(), p.offset) == copy->offsets_.end())
         copy->offsets_.push_back(p.offset);
-    if (!buffer(device, (bytes + 255) & ~uint64_t(255), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, copy->owned_) ||
+    if (!buffer(device, (bytes + 255) & ~uint64_t(255), D3D12_HEAP_TYPE_DEFAULT,
+            copy->submission_copy_?D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER:D3D12_RESOURCE_STATE_COMMON, copy->owned_) ||
         !buffer(device, std::max<size_t>(4, copy->offsets_.size() * 4), D3D12_HEAP_TYPE_UPLOAD,
             D3D12_RESOURCE_STATE_GENERIC_READ, copy->patch_data_)) return fail("owned constant-buffer preparation failed");
     void* mapped = nullptr;
@@ -63,23 +65,29 @@ bool GpuConstants::RecordBefore(ID3D12GraphicsCommandList* list, D3D12_RESOURCE_
 {
     if (!CanRecord(list, source_state)) return false;
     const bool readable = (source_state & D3D12_RESOURCE_STATE_COPY_SOURCE) != 0;
-    auto b = transition(owned_.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+    auto b = transition(owned_.Get(), submission_copy_?D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER:D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     list->ResourceBarrier(1, &b);
     if (!readable) {
         b = transition(source_.Get(), source_state, D3D12_RESOURCE_STATE_COPY_SOURCE); list->ResourceBarrier(1, &b);
     }
-    list->CopyBufferRegion(owned_.Get(), 0, source_.Get(), source_offset_, bytes_);
+    CopyPrepared(list);
     if (!readable) {
         b = transition(source_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, source_state); list->ResourceBarrier(1, &b);
     }
-    for (size_t i = 0; i < offsets_.size(); ++i)
-        list->CopyBufferRegion(owned_.Get(), offsets_[i], patch_data_.Get(), i * 4, 4);
     b = transition(owned_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
     list->ResourceBarrier(1, &b);
     return true;
 }
 void GpuConstants::RecordAfter(ID3D12GraphicsCommandList* list) const {
+    if(submission_copy_)return;
     const auto b = transition(owned_.Get(), D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, D3D12_RESOURCE_STATE_COMMON);
     list->ResourceBarrier(1, &b);
+}
+D3D12_RESOURCE_BARRIER GpuConstants::Transition(D3D12_RESOURCE_STATES before,D3D12_RESOURCE_STATES after)const{return transition(owned_.Get(),before,after);}
+void GpuConstants::CopyPrepared(ID3D12GraphicsCommandList* list)const{
+    list->CopyBufferRegion(owned_.Get(),0,source_.Get(),source_offset_,bytes_);
+    for(size_t first=0;first<offsets_.size();){size_t end=first+1;
+        while(end<offsets_.size()&&offsets_[end]==offsets_[first]+4*(end-first))++end;
+        list->CopyBufferRegion(owned_.Get(),offsets_[first],patch_data_.Get(),first*4,(end-first)*4);first=end;}
 }
 } // namespace na::scale

@@ -10,7 +10,7 @@ class GpuConstants {
 public:
     static std::shared_ptr<const GpuConstants> Create(ID3D12Device* device, ID3D12Resource* source,
         uint64_t offset, const void* observed_bytes, size_t bytes,
-        const std::vector<ConstantPatch>& patches, std::string& error);
+        const std::vector<ConstantPatch>& patches, std::string& error,bool submission_copy=false);
     // Copy the latest GPU-visible source, apply only prepared size fields, then
     // expose the owned buffer in VERTEX_AND_CONSTANT_BUFFER state. Caller binds
     // Address() to the selected operation's root CBV/private table CBV.
@@ -27,10 +27,14 @@ public:
     // UPLOAD/GPU_UPLOAD cannot be GPU-written in the middle of a list. One
     // recorded copy still sees late CPU/J1 uploads on every executable replay.
     bool ReusableWithinRecording()const{return fixed_source_state_;}
+    bool SubmissionCopy()const{return submission_copy_;}
+    D3D12_RESOURCE_BARRIER Transition(D3D12_RESOURCE_STATES,D3D12_RESOURCE_STATES)const;
+    void CopyPrepared(ID3D12GraphicsCommandList*)const; // caller places owned buffer in COPY_DEST
 private:
     Microsoft::WRL::ComPtr<ID3D12Resource> source_, owned_, patch_data_;
     uint64_t source_offset_ = 0, bytes_ = 0;
     bool fixed_source_state_ = false;
+    bool submission_copy_ = false;
     std::vector<uint32_t> offsets_;
 };
 } // namespace na::scale
