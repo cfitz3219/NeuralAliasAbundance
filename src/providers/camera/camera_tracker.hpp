@@ -197,7 +197,11 @@ public:
     struct Limits {
         double max_translation = 25.0;   // world units per frame
         double max_rotation = 0.65;      // radians per frame
-        double max_fov_change = 0.15;    // radians per frame
+        // Radians per frame. Zooming (scope, binoculars, aim) is continuous camera motion that the
+        // depth + projection reprojection describes exactly; SE5's scope changed the FOV by
+        // 0.17-0.54 rad in one frame and each reset DLSS history: Cort's periodic "blink"
+        // (2026-11-02). Only an extreme change (a different camera) counts as a cut.
+        double max_fov_change = 1.0;
         uint64_t max_frame_gap = 4;      // frames without a camera before history is stale
     };
 
