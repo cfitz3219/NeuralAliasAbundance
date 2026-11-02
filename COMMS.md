@@ -4219,3 +4219,45 @@ The existing Documents/NA-anno-layer2-update.cmd now targets tested runtime 500d
 **Starting point.** PR75 astra/p44-layer2 head 220b935, packaged runtime 500d999, Documents/NA-anno-layer2-update.cmd. Built with na_discovery_diagnostics + own NGX. Production code at src/host_dx12/scale/{auto_scene,native_bindings,scoped_bindings,gpu_constants}. Integration history, Fable's seven efficiency findings and benchmark receipts are in docs/P4-4-LAYER2-INTEGRATION.md and WORKLOG.md there. d2fea72 fixed parallel resource states and destruction hitches. 2e7b393 batched constants at submission and reused bindings. 5a5c969/78d7f60 cached keys and added shared shader-visible slabs. The benchmark used 500 signatures; the live working set is thousands. Keep the original GPU leases and later-write/full-native fallback intact.
 
 **First engineering lead.** PreparedBindings::Create still creates a separate CPU-only RTV and DSV heap per plan. NativeBindingSpec can also build dedicated constant resources for variants. Inspect how many plans have identical target/depth view descriptions or identical allocation/patch inputs, and how often only upload offsets, material tables or scissors differ. Measure live vs historical heap/resource counts by type. Reuse those identical views/allocations with correct lifetime; avoid assuming all 2,657 failures had one cause or that simply permitting a partial frame is safe. Success in Anno means redirected and reduced frame counts advance and J2 actually consumes the smaller image at native output. No additional review required by Cort. I have stopped editing Anno.
+
+### 2026-11-02 10:10Z Claude (PC) -> Astra: SE5 pan flicker handoff. FIRST: revert SE5 to the previous state
+**Revert first (Cort's instruction).** The last SE5 change, cross-list exact placement (481dfc4..5ae1910 on claude/project-thread-pfxnx8), made the flicker FAR worse. Please return SE5 to the state before exact placement and work from there: **6f6b806**, which is ded3bf0 (camfix, Cort's "90% fixed") + the AMD flow accept port b9ce594 + the diagnostic-only j2_late status line. Payload backups on the PC: Documents\NA-SE5-camfix-6f6b806-superseded (DLL F40312AC...) and NA-SE5-camfix-ded3bf0-superseded. The installed build is currently 5ae1910; Cort runs any reinstall.
+
+**Problem.** Inline DLAA (SE5 post-processing lives in the scene's own list) still flickers, but ONLY while panning. A standing camera is clean.
+- The camera tracker is not involved: 0 rotation/translation/fov cuts in every run; every restart is restart_resume (route relearn) or restart_gap.
+- The real cause is placement. SE5 draws the 3D scene in 5-7 command lists per frame (e.g. L68..L82), each submitted in its own ExecuteCommandLists (about 8.5 Executes per frame). While panning, the number and order of scene segments changes, so the learned "scene ends here" point sometimes lands before more scene drawing.
+
+**Evidence, per run (status logs in C:\Users\Cort\NeuralAliasAbundance\local\j2-se5-dlaa\; earlier ones were overwritten by later runs):**
+- **ded3bf0, about 2 h, status-41792:** 107 route changes / 106 history resets (each = a visible blink); placed_before_scene_work 432 (barrier contradictions 436); missed 591.
+  - Contradiction attribution: at least 191 legacy boundary matcher firing at a barrier event, at most 245 barrier-class acceptances. matched{class 183, pair 1, barrier 53907, legacy 248735}.
+  - The real post-process reader class (op=6 root=7770664282846240434) stays ambiguous, never accepted.
+  - j2_profile is capped at 256 entries and filled within a minute (LRU evicts demotions).
+- **6f6b806 pan run, about 35 s of panning, status-38636:** 42 early placements, 24 history resets, 84 missed.
+  - j2_late tally: 28 boundary@barrier, 5 barrier@barrier; 27 same_list, 6 later_list.
+  - Main pattern: producer 1921362112 → late writer 1921362112 in the SAME list (2-11 more depth-tested draws), i.e. the main scene pass is split by colour barriers.
+  - Second pattern: 1989857600 → 1877176944, ~88 draws, same list.
+  - Inline rejects during the pan: writer +1165, occurrence +998 (the learned writer/occurrence stops matching).
+- **f13458f, in-list exact placement, status-44444:** exact 1611/1616 inside the chosen list, but 41 early / 22 resets: no better, no worse.
+  - The misfires moved to LATER lists: 31 of 36 later_list, e.g. 3229888208 → 1958614608, ~72-83 draws.
+  - j2_frame showed producer 3229888208 is the last writer of the penultimate scene list (L80), the final list being L82 (writer 1958413872).
+- **5ae1910, cross-list "list is the end only if consumed", status-40048, 60 s:** DLAA ran on only 595 of 1216 scene frames. missed=456, withheld=636, missed-at-Present 438, 51 restart_gap. This is the FAR worse result.
+  - j2_frame shows c0 (no consumer after the last write) on EVERY scene list including the true last one, e.g. `L68 c0 ... L80:w4/r2/f1/c0/t1/...*`. SE5's post-processing never appears as an observed in-list consumer after the final write, so the rule withheld the real end too.
+
+**Fixes tried, and the outcome of each:**
+1. **Learner patch (profile keeps demotions, producer-wide ambiguity, history kept across same-route relearn).** Built and tested (consumer_profile/j2_route pass) but never shipped. Cort rejected it as treating the symptom. Uncommitted in C:\Users\Cort\NA-wt-flowfix.
+2. **6f6b806:** diagnostic only (j2_late names the late writer). The first package of it was built without the game adapter (my mistake; DLAA never started) and was rebuilt with NA_GAME_ADAPTER_LIB=na_discovery_diagnostics.
+3. **8a39900..f13458f, exact in-list placement.** A predicated DLAA candidate at every boundary of the triggering list; at Execute, only the one after the list's final write is switched on.
+   - NGX check (dlss_predication_test): a predicated-off evaluate is NOT bit-exact. Max 0.0186, mean 6.3e-5 (about 0.04% of a wrong evaluate). The pixels don't matter; the call's existence does. It stays bounded over 256 frames.
+   - Result in game: no better.
+4. **481dfc4..5ae1910, cross-list.** Per-recording candidates; a list counts as the end only if a non-barrier consumer follows its final write; otherwise it's withheld and the next list takes the frame.
+   - Result in game: FAR worse (the c0 everywhere issue above).
+
+**Open hypotheses for you:**
+- The frame's true end is the last scene-writing list in SUBMISSION order, and only Present/the next frame reveals it.
+- Candidates in a list submitted before a later scene list can't be undone, because the GPU reads predicates at execution.
+- Options:
+  - learn the per-frame count/identity of scene lists (e.g. last-writer PSO set) and withhold until the expected last one, falling back to the last submitted when Present arrives early;
+  - or move DLAA to between-lists before the first non-scene list.
+- Whatever you choose, count misses (frames ending without DLAA) as harmful as misfires: 5ae1910 showed misses are worse.
+
+Logs, tallies and verbatim lines are also in the coordinator thread. I'm moving to Anno (Cort's swap). Thanks.
