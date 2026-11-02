@@ -145,12 +145,13 @@ na::observe::ShaderScope BindingHook::Before(ID3D12GraphicsCommandList* list, na
     if (p->dispatch_x_) { call.args[0] = p->dispatch_x_; call.args[1] = p->dispatch_y_; }
     return {na::observe::ShaderAction::Forward, std::move(retained)};
 }
-void BindingHook::After(ID3D12GraphicsCommandList* list, const na::observe::ShaderCall&, na::observe::ShaderScope& scope) noexcept
+void BindingHook::After(ID3D12GraphicsCommandList* list, const na::observe::ShaderCall& call, na::observe::ShaderScope& scope) noexcept
 {
     const auto p = std::static_pointer_cast<PreparedBindings>(scope.state);
     if (!p) return;
     na::observe::RestoreListState(list);
     if (!p->leave_.empty()) list->ResourceBarrier(static_cast<UINT>(p->leave_.size()), p->leave_.data());
     for (auto c = p->spec_.constants.rbegin(); c != p->spec_.constants.rend(); ++c) c->buffer->RecordAfter(list);
+    provider_->Applied(list,call,p);
 }
 } // namespace na::scale

@@ -75,6 +75,10 @@ public:
     // and restore native state here. A stale native allocation is not fallback.
     // No commands from this rejected plan have been recorded at this point.
     virtual void Refused(ID3D12GraphicsCommandList*, const na::observe::ShaderCall&, const char* reason) noexcept = 0;
+    // Actual private draw/dispatch was recorded and native state restored. Mark
+    // its written dependencies here, not in Acquire (which can still refuse).
+    virtual void Applied(ID3D12GraphicsCommandList*, const na::observe::ShaderCall&,
+        const std::shared_ptr<const PreparedBindings>&) noexcept {}
 };
 // Actual adapter for the existing Bindings shader-operation lane. Retains the
 // prepared payload through the EXISTING executable-recording/submission lease,

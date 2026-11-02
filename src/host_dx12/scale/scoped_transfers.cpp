@@ -121,6 +121,7 @@ na::observe::ShaderScope TransferHook::Before(ID3D12GraphicsCommandList* list,co
     const auto p=provider_?provider_->Acquire(list,c):nullptr;if(!p)return {};
     const char* why="transfer unavailable";
     if(!p->Record(list,c,&why)){provider_->Refused(list,c,why);return {};}
+    provider_->Applied(list,c,p);
     return {na::observe::ShaderAction::Replaced,std::const_pointer_cast<PreparedTransfer>(p)};
 }
 } // namespace na::scale

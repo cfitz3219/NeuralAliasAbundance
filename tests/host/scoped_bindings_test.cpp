@@ -17,6 +17,10 @@ public:
     std::shared_ptr<const PreparedBindings> plan;
     ID3D12GraphicsCommandList* recording = nullptr;
     unsigned refused = 0;
+    std::shared_ptr<SceneFrame> frame;
+    void Applied(ID3D12GraphicsCommandList*,const na::observe::ShaderCall&,const std::shared_ptr<const PreparedBindings>&)noexcept override {
+        if(frame){frame->Written(1);frame->Written(2);}
+    }
     std::shared_ptr<const PreparedBindings> Acquire(ID3D12GraphicsCommandList* list, const na::observe::ShaderCall&) noexcept override {
         return list == recording ? plan : nullptr;
     }
@@ -96,7 +100,7 @@ float4 ps():SV_Target{return float4(width,rh,marker,.75);})";
         if(frame_mode){FrameSpec f;f.group=group;f.color=1;f.depth=2;f.members={{1,D3D12_RESOURCE_STATE_RENDER_TARGET},{2,D3D12_RESOURCE_STATE_DEPTH_WRITE},{3,D3D12_RESOURCE_STATE_RENDER_TARGET,true,D3D12_RESOURCE_STATE_RENDER_TARGET}};
             frame=SceneFrame::Create(dev,f,error);REQUIRE(frame);}
     }
-    auto provider=std::make_shared<Provider>();provider->plan=plan;
+    auto provider=std::make_shared<Provider>();provider->plan=plan;provider->frame=frame;
     na::observe::SetShaderOperationHook(na::observe::ShaderLane::Bindings,std::make_shared<BindingHook>(provider));
     Readback cr,dr,nr,nd;cr.Prepare(dev,group->Find(1)->reduced.Get());dr.Prepare(dev,group->Find(2)->reduced.Get());nr.Prepare(dev,color.Get());nd.Prepare(dev,depth.Get());
     Readback history_seed,history_full;
@@ -126,7 +130,7 @@ float4 ps():SV_Target{return float4(width,rh,marker,.75);})";
         auto hc=history_views->GetCPUDescriptorHandleForHeapStart();hc.ptr+=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         const float new_history[4]={5,6,7,.5f};list->ClearRenderTargetView(hc,new_history,0,nullptr);
         std::swap(b.Transition.StateBefore,b.Transition.StateAfter);list->ResourceBarrier(1,&b);frame->Written(3);}
-    if(frame){frame->Written(1);frame->Written(2);std::shared_ptr<const na::j2::PhysicalInput> input;const auto callbacks=bridge.Callbacks();
+    if(frame){std::shared_ptr<const na::j2::PhysicalInput> input;const auto callbacks=bridge.Callbacks();
         CHECK(callbacks.lookup(callbacks.ctx,1,2,list,&input)==na::j2::PhysicalLookup::Unavailable);
         CHECK(input&&input->generation==13);callbacks.outcome(callbacks.ctx,13,na::j2::PhysicalOutcome::Unavailable,"not ready");
         if(frame_mode!=3){frame->Ready();CHECK(callbacks.lookup(callbacks.ctx,1,2,list,&input)==na::j2::PhysicalLookup::Provided);

@@ -16,6 +16,8 @@ public:
     std::shared_ptr<const PreparedTransfer> clear_ms,resolve;
     unsigned refused=0;
     unsigned calls=0;
+    unsigned applied=0;
+    void Applied(ID3D12GraphicsCommandList*,const na::observe::TextureCall&,const std::shared_ptr<const PreparedTransfer>&)noexcept override {++applied;}
     std::shared_ptr<const PreparedTransfer> Acquire(ID3D12GraphicsCommandList* l,const na::observe::TextureCall& c)noexcept override {
         if(l!=list)return {};
         ++calls;
@@ -83,6 +85,7 @@ int main(){
     const D3D12_BOX box{0,0,0,16,8,1};l->CopyTextureRegion(&dst,16,8,0,&src,&box);
     l->ClearDepthStencilView(zv,D3D12_CLEAR_FLAG_DEPTH,.375f,0,0,nullptr);
     CHECK(p->refused==0);
+    CHECK(p->applied==6);
     const auto calls=p->calls;
     na::observe::TextureCall direct;direct.kind=Kind::ClearColor;direct.target_id=aid;
     std::copy(blue,blue+4,direct.color);const char* direct_error=nullptr;
@@ -131,7 +134,7 @@ int main(){
         if(!x&&!y)std::printf("resolved sample %u %u %u %u\n",pixel[0],pixel[1],pixel[2],pixel[3]);
         // UNORM clear/resolve conversion can differ by one code value.
         wrong+=pixel[0]<63||pixel[0]>65||pixel[1]<127||pixel[1]>129||pixel[2]<190||pixel[2]>192||pixel[3]!=255;}
-    resolved_rb.data->Unmap(0,nullptr);CHECK(wrong==0);CHECK(p->refused==0);
+    resolved_rb.data->Unmap(0,nullptr);CHECK(wrong==0);CHECK(p->refused==0);CHECK(p->applied==8);
     na::observe::SetTextureOperationHook({});recording.Reset();recording.list->Close();na::nr::native::Maintain();
     if(messages)for(UINT64 i=0;i<messages->GetNumStoredMessages();++i){SIZE_T n=0;messages->GetMessage(i,nullptr,&n);std::vector<unsigned char> storage(n);
         auto* m=reinterpret_cast<D3D12_MESSAGE*>(storage.data());if(SUCCEEDED(messages->GetMessage(i,m,&n))&&m->Severity<=D3D12_MESSAGE_SEVERITY_ERROR){std::printf("GPU: %s\n",m->pDescription);CHECK(false);}}

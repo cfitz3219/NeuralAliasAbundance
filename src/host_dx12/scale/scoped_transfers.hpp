@@ -26,6 +26,8 @@ public:
     virtual ~TransferProvider() = default;
     virtual std::shared_ptr<const PreparedTransfer> Acquire(ID3D12GraphicsCommandList*, const na::observe::TextureCall&) noexcept = 0;
     virtual void Refused(ID3D12GraphicsCommandList*, const na::observe::TextureCall&, const char*) noexcept = 0;
+    virtual void Applied(ID3D12GraphicsCommandList*, const na::observe::TextureCall&,
+        const std::shared_ptr<const PreparedTransfer>&) noexcept {}
 };
 class TransferHook final : public na::observe::TextureOperationHook {
 public:
