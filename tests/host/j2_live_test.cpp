@@ -65,6 +65,13 @@ M Camera(double x)
     for (int r = 0; r < 3; ++r) v[r * 4 + 3] = -(v[r * 4] * pos[0] + v[r * 4 + 1] * pos[1] + v[r * 4 + 2] * pos[2]);
     return Mul(p, v);
 }
+// A planar reflection's camera (water, mirror): the main camera mirrored in y = 0
+// (view-projection times the reflection diag(1, -1, 1, 1)); opposite winding.
+M Reflection(double x)
+{
+    const M r{1, 0, 0, 0, 0, -1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    return Mul(Camera(x), r);
+}
 void Store(uint8_t* dst, const M& m)
 {
     for (int i = 0; i < 16; ++i) { const float f = static_cast<float>(m[i]); std::memcpy(dst + i * 4, &f, 4); }
@@ -160,11 +167,19 @@ int main()
     }
     test::ComPtr<ID3D12DescriptorHeap> cbvh;
     {
-        D3D12_DESCRIPTOR_HEAP_DESC chd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        D3D12_DESCRIPTOR_HEAP_DESC chd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&chd, IID_PPV_ARGS(&cbvh))));
         D3D12_CONSTANT_BUFFER_VIEW_DESC cv{cb->GetGPUVirtualAddress() + 512, 256};
         dev->CreateConstantBufferView(&cv, cbvh->GetCPUDescriptorHandleForHeapStart());
+        // Second descriptor: another camera's block at 1536 (same layout), used by the
+        // several-cameras-in-one-frame case.
+        D3D12_CONSTANT_BUFFER_VIEW_DESC cv2{cb->GetGPUVirtualAddress() + 1536, 256};
+        D3D12_CPU_DESCRIPTOR_HANDLE h2 = cbvh->GetCPUDescriptorHandleForHeapStart();
+        h2.ptr += dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        dev->CreateConstantBufferView(&cv2, h2);
     }
+    D3D12_GPU_DESCRIPTOR_HANDLE other_cam_table = cbvh->GetGPUDescriptorHandleForHeapStart();
+    other_cam_table.ptr += dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     uint8_t* cpu = nullptr;
     REQUIRE(SUCCEEDED(cb->Map(0, nullptr, reinterpret_cast<void**>(&cpu))) && cpu); // persistent, like a game's upload ring
     const D3D12_GPU_VIRTUAL_ADDRESS va = cb->GetGPUVirtualAddress();
@@ -172,7 +187,7 @@ int main()
     test::List scene, consumer;
     REQUIRE(scene.Create(dev) && consumer.Create(dev));
     REQUIRE(SUCCEEDED(scene.list->Close()) && SUCCEEDED(consumer.list->Close()));
-    const auto frame = [&](double cam_x, ID3D12Resource* touched = nullptr) {
+    const auto frame = [&](double cam_x, ID3D12Resource* touched = nullptr, bool other_camera = false) {
         d.WaitIdle();
         // Camera block at 512 (VP at +80, inverse at +144), a junk block at 1024.
         std::memset(cpu, 0, 4096);
@@ -182,6 +197,13 @@ int main()
         Store(cpu + 512 + 80, vp);
         Store(cpu + 512 + 144, inv);
         for (int i = 0; i < 64; ++i) cpu[1024 + i] = static_cast<uint8_t>(i * 7);
+        if (other_camera) { // a water reflection's camera: the main camera mirrored in the plane y = 0
+            const M ov = Reflection(cam_x);
+            M oinv{};
+            Inverse(ov, oinv);
+            Store(cpu + 1536 + 80, ov);
+            Store(cpu + 1536 + 144, oinv);
+        }
         scene.Reset();
         D3D12_RESOURCE_BARRIER in[2] = {test::Transition(color.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
                                         test::Transition(depth.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_DEPTH_WRITE)};
@@ -194,6 +216,8 @@ int main()
         ID3D12DescriptorHeap* heaps[] = {cbvh.Get()};
         scene.list->SetDescriptorHeaps(1, heaps);
         for (int i = 0; i < 3; ++i) scene.list->SetGraphicsRootConstantBufferView(0, va + 1024); // junk: most bound
+        if (other_camera) // bound through the camera slot first and more often than the main camera
+            for (int i = 0; i < 2; ++i) scene.list->SetGraphicsRootDescriptorTable(1, other_cam_table);
         scene.list->SetGraphicsRootDescriptorTable(1, cbvh->GetGPUDescriptorHandleForHeapStart()); // camera (table CBV)
         D3D12_RESOURCE_BARRIER out = test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         scene.list->ResourceBarrier(1, &out);
@@ -321,6 +345,32 @@ int main()
         CHECK(std::strncmp(ds.reason, "Stopped", 7) != 0);
     }
     na::j2::SetDebugView(0);
+
+    // Several valid cameras in one frame (Sniper Elite 5: a water reflection's camera, the sky's;
+    // any engine: shadow, environment, scope cameras). The other camera is bound in the learned
+    // camera slot first and more often; J2 must stay on the camera continuing the last main one:
+    // no history reset, the other block never jittered.
+    {
+        const auto before = na::j2::GetStats();
+        for (int k = 1; k <= 3; ++k) {
+            na::j2::OnPresent(d.queue.Get());
+            frame(501.3 + k * 0.1, nullptr, true);
+            CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
+            uint8_t other[64];
+            Store(other, Reflection(501.3 + k * 0.1));
+            CHECK(std::memcmp(cpu + 1536 + 80, other, 64) == 0); // J1 left the other camera alone
+        }
+        const auto after = na::j2::GetStats();
+        std::printf("several cameras: frames +%llu cuts +%llu contested +%llu alternatives +%llu jitter_slot_other +%llu \"%s\"\n",
+                    (unsigned long long)(after.frames - before.frames), (unsigned long long)(after.cuts - before.cuts),
+                    (unsigned long long)(after.camera_contested - before.camera_contested),
+                    (unsigned long long)(after.camera_alternatives - before.camera_alternatives),
+                    (unsigned long long)(after.jitter_slot_other_camera - before.jitter_slot_other_camera), after.reason);
+        CHECK(after.frames == before.frames + 3);
+        CHECK(after.cuts == before.cuts);
+        CHECK(after.camera_contested >= before.camera_contested + 3);
+        CHECK(after.camera_alternatives >= before.camera_alternatives + 3); // the first-ranked block was not chosen
+    }
 
     // P4-4 Stage 1: upscaling into a distinct full-size destination (slider route).
     // The depth debug view gives a known output (depth cleared to 0 -> black, alpha 1),

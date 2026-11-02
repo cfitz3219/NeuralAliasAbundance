@@ -628,7 +628,23 @@ bool is_projection_of(const na::camera::Matrix& p, const na::camera::Matrix& vp)
 // A camera block's bytes hold a VP + inverse at the learned offset: start this frame's jitter.
 // Last main camera the jitter started from (a block outside the learned camera
 // slot may start a frame only if it shows that same camera, not a light's).
-struct { bool valid = false; na::camera::VpGeometry geo{}; } g_jit_cam;
+struct { bool valid = false; na::camera::VpGeometry geo{}; int hand = 0; } g_jit_cam;
+
+// Winding of a ViewProjection: the sign of the determinant of its x, y and w rows (3x3 part).
+// A mirrored camera (a planar water / mirror reflection) has the opposite winding of the main
+// camera in every engine, whatever its own convention (left- or right-handed): a universal
+// tell, used once the main camera is known.
+int handedness(const na::camera::Matrix& m)
+{
+    const double a = m[0], b = m[1], c = m[2], d = m[4], e = m[5], f = m[6], g3 = m[12], h = m[13], i = m[14];
+    const double det = a * (e * i - f * h) - b * (d * i - f * g3) + c * (d * h - e * g3);
+    return det > 0 ? 1 : det < 0 ? -1 : 0;
+}
+void remember_main_camera(const na::camera::Matrix& m)
+{
+    g_jit_cam.valid = na::camera::DecomposeViewProjection(m, g_jit_cam.geo);
+    g_jit_cam.hand = handedness(m);
+}
 
 bool same_camera(const na::camera::Matrix& m)
 {
@@ -652,6 +668,7 @@ bool continues_main_camera(const na::camera::Matrix& m)
     na::camera::VpGeometry v{};
     if (!g_jit_cam.valid) return true;
     if (!na::camera::DecomposeViewProjection(m, v)) return false;
+    if (g_jit_cam.hand && handedness(m) == -g_jit_cam.hand) return false; // mirrored: a reflection
     const auto& p = g_jit_cam.geo;
     double dot = 0, d2 = 0;
     for (int j = 0; j < 3; ++j) {
@@ -689,7 +706,7 @@ bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& in_byt
         } else {
             if (slot || !na::camera::Invert(m, inv)) continue;
         }
-        g_jit_cam.valid = na::camera::DecomposeViewProjection(m, g_jit_cam.geo);
+        remember_main_camera(m);
         const neural_alias::JitterSample js = neural_alias::temporal_jitter(++g.jit.phase, jitter_phases());
         std::array<double, 16> src{};
         for (int i = 0; i < 16; ++i) src[i] = m[i];
@@ -909,13 +926,14 @@ double continuity(const na::camera::Matrix& m, bool injected)
     na::camera::VpGeometry v{};
     if (!g_jit_cam.valid) return bonus;
     if (!na::camera::DecomposeViewProjection(m, v)) return 1e9;
+    const double mirrored = g_jit_cam.hand && handedness(m) == -g_jit_cam.hand ? 10.0 : 0.0; // a reflection's camera
     const auto& p = g_jit_cam.geo;
     double dot = 0, d2 = 0;
     for (int j = 0; j < 3; ++j) {
         dot += v.forward[j] * p.forward[j];
         d2 += (v.position[j] - p.position[j]) * (v.position[j] - p.position[j]);
     }
-    return bonus + std::acos(std::clamp(dot, -1.0, 1.0)) + std::sqrt(d2) / 25.0 + std::abs(v.sy - p.sy);
+    return bonus + mirrored + std::acos(std::clamp(dot, -1.0, 1.0)) + std::sqrt(d2) / 25.0 + std::abs(v.sy - p.sy);
 }
 const CamPick* best_pick(const std::vector<CamPick>& v)
 {
@@ -1241,7 +1259,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         reason(why);
         return false;
     }
-    g_jit_cam.valid = na::camera::DecomposeViewProjection(vp, g_jit_cam.geo); // J1: the main camera, for earlier batches next frame
+    remember_main_camera(vp); // J1: the main camera, for earlier batches next frame
     // Ring slot (never wait) and size/format changes (only once the GPU is done with the old set).
     const UINT64 done = g.fence->GetCompletedValue();
     Slot& s = g.slots[g.slot];
