@@ -1229,19 +1229,24 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // Layer2 companions are private textures, not observed: their exact states come with them.
     const bool have_sc = phys ? (sc = phys->color_state, true) : state_of(color_id, csub, &sc);
     bool have_sd = phys ? (sd = phys->depth_state, true) : state_of(depth_id, dsub, &sd);
-    if (!phys && !saved) {
+    if (inl && !phys && !saved) {
+        // Inline only, learning and using only the state the list STARTED with (this list has
+        // not transitioned the depth so far): Astra, COMMS 2026-11-02, rendering into the depth
+        // proves its use, not its state. The same scene end reported that entry state on
+        // kDepthLearnFrames known frames in a row before it is used for an unknown one.
         constexpr uint32_t kDepthLearnFrames = 30;
         constexpr uint64_t kDepthLearnMaxAge = 300;
+        uint32_t in_list = 0;
+        const bool untouched = na::observe::ListStateSub(inl, depth_id, dsub, &in_list) == na::observe::StateLookup::Absent;
         const bool same_target = g.depth_learned_id == depth_id && g.depth_learned_sub == dsub;
-        if (have_sd) {
+        if (have_sd && untouched) {
             if (g.depth_learned_frame != g.frame) { // once per frame
                 if (same_target && g.depth_learned_state == sd) ++g.depth_learned_streak;
                 else { g.depth_learned_streak = 1; g.depth_learned_state = sd; g.depth_learned_id = depth_id; g.depth_learned_sub = dsub; }
                 g.depth_learned_frame = g.frame;
             }
-        } else if (have_sc && same_target && g.depth_learned_streak >= kDepthLearnFrames &&
-                   g.frame - g.depth_learned_frame <= kDepthLearnMaxAge &&
-                   na::observe::ListRendersTo(inl ? inl : lists[scene], color_id, depth_id)) {
+        } else if (!have_sd && untouched && have_sc && same_target && g.depth_learned_streak >= kDepthLearnFrames &&
+                   g.frame - g.depth_learned_frame <= kDepthLearnMaxAge && na::observe::ListRendersTo(inl, color_id, depth_id)) {
             sd = g.depth_learned_state;
             have_sd = true;
             ++g.stats.depth_state_assumed;
@@ -1326,10 +1331,25 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // update comes after the size check, because a resize resets the tracker.
     na::camera::Matrix vp{};
     bool reversed = false;
-    bool held = false;
+    bool held = false, from_j1 = false;
     if (saved) { vp = saved->vp; reversed = saved->reversed; }
     const bool found = saved || find_camera(lists, scene, depth_id, &vp, &reversed);
-    if (!found) {
+    if (!found && g.jit.valid && g.jit.applied && g.cam_f1) {
+        // Astra (COMMS 2026-11-02): the scene list's own blocks may not hold the camera, but
+        // J1 found this frame's camera in an earlier batch and rewrote it with this sample:
+        // that is the camera the frame was rendered with, and its jitter is known.
+        const auto L = g.jit.layout ? na::camera::Layout::ColumnMajor : na::camera::Layout::RowMajor;
+        const std::vector<uint8_t> jb(g.jit.jvp[g.jit.layout], g.jit.jvp[g.jit.layout] + 64);
+        const na::camera::Matrix m = na::camera::LoadMatrix(jb, 0, L);
+        na::camera::Candidate c{};
+        if (na::camera::ViewProjection(m, c)) {
+            vp = m;
+            reversed = g.cam_rev;
+            from_j1 = true;
+            ++g.stats.camera_from_j1;
+        }
+    }
+    if (!found && !from_j1) {
         // A camera read within the last few frames: predict this frame's (unjittered,
         // so no jitter is claimed for it) rather than leave the game's raw picture showing.
         // A still camera (the last two reads identical: SE5's menu) holds much longer; a
@@ -1350,7 +1370,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             if (velocity) ++g.stats.camera_extrapolated;
         }
     }
-    if (!found && !held) {
+    if (!found && !held && !from_j1) {
         ++g.stats.no_camera;
         g.camera_offset = g.camera_param = -1; // relearn
         char why[160];
@@ -1400,8 +1420,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         g.resume_reset = true; // remains pending if this recording is not submitted
     }
     const double zero[2] = {0, 0};
-    const double* injected = held ? zero : saved ? saved->jitter : g_injected ? g.jit.px : zero; // sample belongs to the captured camera
-    if (!saved && !held && !g_injected && g.jitter_on) { // a DLAA frame without J1's jitter: why
+    const double* injected = held ? zero : from_j1 ? g.jit.px : saved ? saved->jitter : g_injected ? g.jit.px : zero; // sample belongs to the captured camera
+    if (!saved && !held && !from_j1 && !g_injected && g.jitter_on) { // a DLAA frame without J1's jitter: why
         if (!g.jit.valid) ++g.stats.unjit_no_sample;
         else if (!g.jit.applied) ++g.stats.unjit_not_applied;
         else ++g.stats.unjit_not_held;

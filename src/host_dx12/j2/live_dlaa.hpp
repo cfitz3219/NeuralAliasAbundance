@@ -172,6 +172,7 @@ struct Stats {
     // SE5 flashing: frames whose camera could not be read ran DLAA on a camera predicted
     // from the last two (extrapolated) or the last one (held), instead of showing the raw frame.
     uint64_t camera_held = 0, camera_extrapolated = 0;
+    uint64_t camera_from_j1 = 0; // the scene list held no camera; J1's camera of this same frame (with its jitter) was used
     // SE5 menu: frames whose depth state lookup failed and that used the state learned from
     // the same scene end (identical on 30+ known frames in a row).
     uint64_t depth_state_assumed = 0;

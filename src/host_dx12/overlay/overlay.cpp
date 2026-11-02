@@ -740,14 +740,15 @@ void write_status_line()
                 static_cast<unsigned long long>(j2.camera_inverse_computed));
             if (cn > 0) WriteFile(f, cl, static_cast<DWORD>((std::min)(cn, static_cast<int>(sizeof(cl) - 1))), &written, nullptr);
             // Per present: why a frame had no DLAA / why a DLAA frame had no jitter (SE5 flicker, 2026-11-02).
-            char ml[320];
+            char ml[384];
             const int mn = snprintf(ml, sizeof(ml),
-                "j2_misses no_dlaa{no_camera=%llu no_state=%llu no_candidate=%llu other=%llu} unjittered{no_sample=%llu not_applied=%llu not_held=%llu} camera_held=%llu extrapolated=%llu depth_assumed=%llu\r\n",
+                "j2_misses no_dlaa{no_camera=%llu no_state=%llu no_candidate=%llu other=%llu} unjittered{no_sample=%llu not_applied=%llu not_held=%llu} camera_held=%llu extrapolated=%llu depth_assumed=%llu camera_from_j1=%llu\r\n",
                 static_cast<unsigned long long>(j2.miss_no_camera), static_cast<unsigned long long>(j2.miss_no_state),
                 static_cast<unsigned long long>(j2.miss_no_candidate), static_cast<unsigned long long>(j2.miss_other),
                 static_cast<unsigned long long>(j2.unjit_no_sample), static_cast<unsigned long long>(j2.unjit_not_applied),
                 static_cast<unsigned long long>(j2.unjit_not_held), static_cast<unsigned long long>(j2.camera_held),
-                static_cast<unsigned long long>(j2.camera_extrapolated), static_cast<unsigned long long>(j2.depth_state_assumed));
+                static_cast<unsigned long long>(j2.camera_extrapolated), static_cast<unsigned long long>(j2.depth_state_assumed),
+                static_cast<unsigned long long>(j2.camera_from_j1));
             if (mn > 0) WriteFile(f, ml, static_cast<DWORD>((std::min)(mn, static_cast<int>(sizeof(ml) - 1))), &written, nullptr);
             if (j2.camera_lost_evidence[0]) {
                 WriteFile(f, "j2_camera_lost ", 15, &written, nullptr);
