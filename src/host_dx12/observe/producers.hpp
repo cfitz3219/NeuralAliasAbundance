@@ -242,5 +242,8 @@ struct ProducerStats {
     uint64_t unhooked_queues;        // queues whose table differs from the hooked one
 };
 ProducerStats GetProducerStats();
+// Process exit: object retirement becomes a no-op (the CRT is about to destroy, or has
+// destroyed, the tables it would update; the OS reclaims everything).
+void SetProcessExiting();
 
 } // namespace na::observe

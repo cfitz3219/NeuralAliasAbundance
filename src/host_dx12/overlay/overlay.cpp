@@ -1191,7 +1191,8 @@ struct State {
     LARGE_INTEGER qpc_freq{};
     void* dummy_swapchain_identity = nullptr;
 };
-State g_state;
+// Never destroyed: FrameCtx's D3D12 objects would be released by the CRT at exit (c0000005).
+State& g_state = *new State;
 
 // A slot is not signaled again until its previous use completes. Independent
 // queues therefore cannot advance one another's completion receipts.

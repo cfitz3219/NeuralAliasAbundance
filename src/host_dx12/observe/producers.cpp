@@ -436,8 +436,12 @@ private:
     uint32_t kind_;
 };
 
+std::atomic<bool> g_process_exiting{false};
 void RetireSentinel::retire(const void* key, na_object_id id, uint32_t kind)
 {
+    // SE5 exit crashes (c0000005 at retire, symbolicated 2026-11-02): exit-time destructors of
+    // other statics released D3D12 objects after the CRT had destroyed g_m / g_heaps / g_va.
+    if (g_process_exiting.load(std::memory_order_acquire)) return;
     g_retire_gen.fetch_add(1, std::memory_order_acq_rel);
     std::shared_ptr<Obj::Twins> drop; // parked, never released here (we are inside the owner's destruction)
     {
@@ -5108,6 +5112,8 @@ void SetExecuteForwarder(void(STDMETHODCALLTYPE* fwd)(ID3D12CommandQueue*, UINT,
 {
     g_exec_forward.store(fwd, std::memory_order_release);
 }
+
+void SetProcessExiting() { g_process_exiting.store(true, std::memory_order_release); }
 
 ProducerStats GetProducerStats()
 {

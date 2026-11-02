@@ -291,6 +291,8 @@ DWORD WINAPI InitThread(LPVOID)
 
 } // namespace
 
+void NotifyProcessExit() { na::observe::SetProcessExiting(); }
+
 bool StartFromIni(HMODULE self, const wchar_t* ini_name, const char* default_tag)
 {
     g_self = self;

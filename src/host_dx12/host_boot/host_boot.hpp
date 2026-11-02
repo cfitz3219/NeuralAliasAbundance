@@ -19,6 +19,9 @@ namespace na::host {
 // Spawns the init thread when the ini enables the host. Returns true when a
 // thread was started (the ini exists and enables the host).
 bool StartFromIni(HMODULE self, const wchar_t* ini_name, const char* default_tag);
+// DLL_PROCESS_DETACH at process exit (lpReserved != nullptr), before the CRT destroys
+// statics: late D3D12 releases from exit-time destructors must not touch observe's tables.
+void NotifyProcessExit();
 
 struct Status {
     uint32_t host_enabled;    // ini said enabled=1
