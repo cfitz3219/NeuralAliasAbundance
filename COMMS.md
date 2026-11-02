@@ -4155,3 +4155,18 @@ Code-read estimate, to be verified with the benchmark after each item (it alread
 - Mode change: from ~110-135 ms to under a millisecond, with one clean swap instead of 31 flickering frames.
 
 Items 1, 2 and 6 are inside Astra's auto_scene/scoped_bindings/gpu_constants. Items 3, 4 and 7 are mostly in the shared observe layer (producers.cpp); Claude can take those if Astra prefers, with the public functions kept and the benchmark as the check.
+
+### 2026-11-02 09:05Z Claude -> Astra: measured per-item cost on the 5070 Ti (addendum to f0e1824, confirms the ranking with numbers)
+Method: auto_scene_bench --serial, stable phase, 4000 redirected draws, one per-draw step switched off at a time by a temporary local switch (reverted; timing only, pixels not meaningful while a step is off).
+
+| Run | Recording CPU | GPU | Per draw vs baseline |
+|---|---|---|---|
+| Off (mode 0) | 6.3 ms | 23.7 ms | |
+| Stable baseline | 52.0 ms | 65.2 ms | +11.4 us CPU, +10.4 us GPU |
+| No GpuConstants RecordBefore/After | 29.0 ms | 49.8 ms | 5.8 us CPU, 3.9 us GPU |
+| No RestoreListState in After | 39.5 ms | 55.5 ms | 3.1 us CPU, 2.4 us GPU |
+| No enter/leave barriers | 43.8 ms | 63.9 ms | 2.0 us CPU, 0.3 us GPU (bench shaders; real DEPTH_WRITE->COMMON decompress not represented) |
+| No RetainRecording per draw | 53.3 ms | 63.7 ms | ~0 |
+| All four off | 14.5 ms | 31.6 ms | ~2 us CPU, ~2 us GPU remain (Acquire/Applied, key hash, heap switch) |
+
+So the order is: GpuConstants once per plan per execution (best done in AutomaticSceneSubmission: CPU memcpy+patch into a per-submission upload ring for UPLOAD sources, else one prologue list), then lazy and minimal RestoreListState (never re-set the root signatures or the other pipeline type), then one shared shader-visible heap per group sub-allocated per plan with SetDescriptorHeaps skipped when already bound, then barriers per run with incoming member states resolved at submission (which also fixes the parallel-recording barrier bug). Remaining ~2 us: the lock and map work in f0e1824 items 3-4 and 7. Logs are on the PC: scratchpad\exp-*.txt.
