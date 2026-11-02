@@ -970,10 +970,6 @@ void DrawLiveDlaa()
         }
         EndRow();
     }
-    bool ka = na::j2::KeepAlpha();
-    BeginRow("Keep game's alpha (test)", "Gives the game back its own alpha channel under the DLAA picture. The game's later effects can read it; without it, frames with and without DLAA look different (flashing). Switch off to compare.", SwitchWidth());
-    if (Switch("j2alpha", &ka)) na::j2::SetKeepAlpha(ka);
-    EndRow();
     bool jit = na::j2::Jitter();
     BeginRow("Camera jitter", "Shifts the camera by a fraction of a pixel each frame so DLAA can sharpen as well as smooth. Switch off if the picture shimmers or flickers.", SwitchWidth());
     if (Switch("j2jit", &jit)) na::j2::SetJitter(jit);

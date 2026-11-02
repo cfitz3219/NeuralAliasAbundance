@@ -235,7 +235,6 @@ DWORD WINAPI InitThread(LPVOID)
                        GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1);
     if (na::j2::Configured()) na::overlay::RegisterLiveDlaaMenu();
     na::j2::flow::SetEnabled(GetPrivateProfileIntW(L"j2",L"flow",0,g_ini)==1);
-    na::j2::SetKeepAlpha(GetPrivateProfileIntW(L"j2", L"keep_alpha", 1, g_ini) != 0);
     if(na::settings::SafeStart())na::j2::SetPaused(true);
     bool started = na::overlay::StartCore(tag, nullptr);
     signal_install_attempted(); // producers were installed (or could not be) inside Start
