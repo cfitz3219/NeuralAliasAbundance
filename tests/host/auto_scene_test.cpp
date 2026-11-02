@@ -234,14 +234,20 @@ float4 water(float4 position:SV_Position):SV_Target{uint2 p=uint2(position.xy);f
     status=na::scale::GetAutomaticSceneStats();CHECK(status.render_w==w/2&&status.render_h==h/2);
     CHECK(na::j2::GetStats().render_w==(boundary?w:w/2));
     REQUIRE(pixels(d,color.Get(),55,66)==0);
-    fake::eval_result=NVSDK_NGX_Result_FAIL_InvalidParameter;frame(true);REQUIRE(pixels(d,color.Get(),float(boundary?w:status.render_w)+.5f,float(boundary?h:status.render_h))==0);
-    fake::eval_result=NVSDK_NGX_Result_Success;
+    // Exercise live Off->On while the backend is healthy. The separate failure
+    // phase below deliberately latches NGX unavailable for this device.
     na::settings::Get().j2_scale_mode.store(0);frame(false);CHECK(!na::scale::GetAutomaticSceneStats().active);
     REQUIRE(pixels(d,color.Get(),w+.5f,h)==0);
     na::settings::Get().j2_scale_mode.store(1);na::scale::PollAutomaticScene();frame(true);
     status=na::scale::GetAutomaticSceneStats();CHECK(status.plans>0&&status.failed_plans==0);
     CHECK(na::j2::GetStats().render_w==(boundary?w:status.render_w));
     REQUIRE(pixels(d,color.Get(),55,66)==0);
+    na::settings::Get().j2_scale_mode.store(3);na::scale::PollAutomaticScene();frame(true);
+    status=na::scale::GetAutomaticSceneStats();REQUIRE(pixels(d,color.Get(),55,66)==0);
+    fake::eval_result=NVSDK_NGX_Result_FAIL_InvalidParameter;frame(true);REQUIRE(pixels(d,color.Get(),float(boundary?w:status.render_w)+.5f,float(boundary?h:status.render_h))==0);
+    fake::eval_result=NVSDK_NGX_Result_Success;
+    na::settings::Get().j2_scale_mode.store(0);frame(false);CHECK(!na::scale::GetAutomaticSceneStats().active);
+    REQUIRE(pixels(d,color.Get(),w+.5f,h)==0);
     }
     cb->Unmap(0,nullptr);na::j2::Shutdown();na::dlss::Shutdown();na::dlss::SetInitOwnOverrideForTests(nullptr);
     na::observe::SetShaderOperationHook(na::observe::ShaderLane::Bindings,{});na::observe::SetTextureOperationHook({});na::j2::SetPhysicalInputProvider({});na_observe_stop();
