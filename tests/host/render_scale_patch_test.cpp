@@ -90,5 +90,21 @@ int main()
         CHECK(!detail::tag_survives("0.66666670000001", "0.66666670000000"));
         CHECK(detail::tag_survives("0.666668", "0.666667"));
     }
+    // UTF-16LE file (BOM FF FE): patched through a narrow view, same byte length, still UTF-16.
+    {
+        const std::string ascii = "[Display Settings]\r\nRenderScale = 1.000000\r\n";
+        std::string w = "\xFF\xFE";
+        for (char c : ascii) { w += c; w += '\0'; }
+        const std::string orig = w;
+        CHECK(LooksUtf16LE(w.data(), w.size()) && !LooksUtf16LE(ascii.data(), ascii.size()));
+        PatchInfo info;
+        bool wide = false;
+        CHECK(PatchRenderScaleText(w.data(), w.size(), 0.666667, &info, true, &wide) == 1 && wide);
+        CHECK(w.size() == orig.size() && w[0] == '\xFF' && w[1] == '\xFE');
+        CHECK(NarrowUtf16LE(w.data(), w.size()).find("RenderScale = 0.666668\r\n") != std::string::npos);
+        CHECK(info.tagged && std::string(info.original) == "1.000000");
+        std::string a2 = ascii; // plain text still goes the normal way
+        CHECK(PatchRenderScaleText(a2.data(), a2.size(), 0.666667, nullptr, false, &wide) == 1 && !wide);
+    }
     return test::finish("render_scale_patch_test");
 }

@@ -1389,6 +1389,10 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     Slot& s = g.slots[g.slot];
     if (done == UINT64_MAX) { reason("Device removed."); return false; }
     if (s.fence_value && done < s.fence_value) { ++g.stats.busy; reason("Skipped: the previous use of this frame slot is still running."); return false; }
+    // Astra (COMMS 2026-11-02): J1 jitters the camera with the extent known at that moment
+    // (g.rw/g.rh), which a render-scale change only updates below. The frame was rasterised with
+    // a clip offset of 2*px/old_extent, i.e. px*new/old pixels at the new extent: rescale it.
+    const uint32_t jit_rw = g.rw, jit_rh = g.rh;
     const bool resize = !g.output || !g.color_in || g.w != w || g.h != h || g.color_format != cf ||
                         g.rw != rw || g.rh != rh || g.ow != ow || g.oh != oh ||
                         g.samples != cd.SampleDesc.Count || g.sample_quality != cd.SampleDesc.Quality ||
@@ -1425,6 +1429,13 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     }
     const double zero[2] = {0, 0};
     const double* injected = held ? zero : from_j1 ? g.jit.px : saved ? saved->jitter : g_injected ? g.jit.px : zero; // sample belongs to the captured camera
+    double rescaled[2] = {0, 0};
+    if (injected != zero && jit_rw && jit_rh && (jit_rw != rw || jit_rh != rh)) {
+        rescaled[0] = injected[0] * double(rw) / double(jit_rw);
+        rescaled[1] = injected[1] * double(rh) / double(jit_rh);
+        injected = rescaled;
+        ++g.stats.jitter_extent_rescaled;
+    }
     if (!saved && !held && !from_j1 && !g_injected && g.jitter_on) { // a DLAA frame without J1's jitter: why
         if (!g.jit.valid) ++g.stats.unjit_no_sample;
         else if (!g.jit.applied) ++g.stats.unjit_not_applied;

@@ -4690,6 +4690,19 @@ ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue, uint32_t count, ID3D12Comma
         g_c.nested_unlocked.fetch_add(1);
         t.nested_unlocked = true;
     }
+    // Serialize game work per queue FIRST (C9B-R3 for samples; SE5 2026-11-02 for the
+    // known-state store): two threads submitting to one queue at once leave the GPU order
+    // unknown, which resets every carried state they touch. The store's marks must be taken
+    // under the same lock, or a second thread marks inside the first one's submission
+    // (Astra reproduced that race on db60492: kResetOverlap). The runtime serializes a queue's
+    // submissions anyway, so the lock only fixes the observed order to the queue's.
+    const bool armed = g_armed.load(std::memory_order_acquire);
+    if (!t_host_work && t_submit_depth == 0) { // Signal/Wait too: they share the queue's order
+        qs->submit_m.lock();
+        ++t_submit_depth;
+        t.submit_locked = true;
+        if (!armed) g_c.serialized.fetch_add(1);
+    }
     // Evidence for sampling and the known-state store, captured before the
     // original runs (review PR40 #2); the store marks what it may change.
     std::shared_ptr<SubmissionCapture> cap; // none for queue sync operations and host work
@@ -4707,19 +4720,9 @@ ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue, uint32_t count, ID3D12Comma
     t_cur_qid = qid;
     t.cur_set = true;
     t.list_type = static_cast<uint32_t>(type);
-    // Serialize game work per queue (C9B-R3 for samples; SE5 2026-11-02 for the known-state
-    // store): two threads submitting to one queue at once leave the GPU order unknown, which
-    // resets every carried state they touch (ambiguous_queue_order) and cost J2 the depth state
-    // on ~1/4 of SE5's menu frames. The runtime serializes a queue's submissions anyway, so the
-    // lock only fixes the order we observe to the order the queue receives.
-    const bool armed = g_armed.load(std::memory_order_acquire);
-    if (!t_host_work && t_submit_depth == 0) { // Signal/Wait too: they share the queue's order
-        qs->submit_m.lock();
-        ++t_submit_depth;
-        t.submit_locked = true;
-        if (!armed) g_c.serialized.fetch_add(1);
+    if (t.submit_locked && armed) {
         static const SubmissionCapture kNoLists;
-        if (armed) acquire_sample_sources(queue, qid, type, cap ? *cap : kNoLists); // before the original runs (C9B-REVIEW-2 #2)
+        acquire_sample_sources(queue, qid, type, cap ? *cap : kNoLists); // before the original runs (C9B-REVIEW-2 #2)
     }
     const auto occurrence = qs->occurrences.Begin();
     t.queue_state = qs;
