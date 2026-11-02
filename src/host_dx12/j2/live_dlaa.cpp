@@ -165,6 +165,7 @@ struct State {
     uint64_t route_prev_external = 0; // the game's own upscaler evaluations so far (NGX + FSR + XeSS)
     uint32_t frame_rejects = 0;       // inline trigger rejections in the current frame
     char frame_reject_text[320] = {}; // the frame's first rejection, with both boundaries
+    char frame_record_failure[200] = {}; // actual input/recording failure, independent of matcher rejections
     uint64_t dlss_tried_frame = ~0ull; // one early start attempt per frame
     bool inline_sample_locked = false; // NGX recorded: no new raster sample may start this frame
     bool inline_camera_submitted = false; // an earlier depth/camera batch may already be executing
@@ -2007,7 +2008,10 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
         reason("Stopped: the game's list state could not be restored after inline DLAA.");
         return;
     }
-    if (!ok) { na::capture::j2::Discard(pending.capture, true); return; } // the game's list still runs our copies
+    if (!ok) {
+        std::snprintf(g.frame_record_failure,sizeof g.frame_record_failure,"%s",g.stats.reason);
+        na::capture::j2::Discard(pending.capture, true);return;
+    } // the game's list still runs our copies
     g.slot = (g.slot + 1) % kRing;
     g.inl.list = l;
     g.inl.rec = rec;
@@ -2232,12 +2236,14 @@ void OnPresent(ID3D12CommandQueue* queue)
                 // earlier success string); else no candidate reached the matcher.
                 std::snprintf(g.stats.insertion_last_miss, sizeof g.stats.insertion_last_miss,
                     "frame=%llu rejects=%u %s", (unsigned long long)g.frame, g.frame_rejects,
-                    g.frame_reject_text[0] ? g.frame_reject_text
+                    g.frame_record_failure[0] ? g.frame_record_failure : g.frame_reject_text[0] ? g.frame_reject_text
                                            : "no candidate reached the matcher (no read of the scene colour after its last write was seen in a scene recording)");
             if (g.insertion_frame.decision.writes && g.submitted_frame != g.frame) {
                 char why[200];
-                std::snprintf(why, sizeof why, "Inline DLAA missed this frame (%s).",
-                              g.frame_reject_text[0] ? "the scene boundary did not match the learned one; see j2_last_miss" : "no boundary candidate");
+                std::snprintf(why, sizeof why, "%s",
+                              g.frame_record_failure[0] ? g.frame_record_failure :
+                              g.frame_reject_text[0] ? "Inline DLAA missed this frame (boundary mismatch; see j2_last_miss)." :
+                              "Inline DLAA missed this frame (no boundary candidate).");
                 reason(why); // not the previous frame's "running" text
             }
             g.stats.active = g.submitted_frame == g.frame;
@@ -2292,6 +2298,7 @@ void OnPresent(ID3D12CommandQueue* queue)
         g.stats.inline_frame_rejects = g.frame_rejects;
         g.frame_rejects = 0;
         g.frame_reject_text[0] = 0;
+        g.frame_record_failure[0] = 0;
         if (g.scene_batches_cur) {
             g.batch_hist[g.batch_hist_n++ % 16] = static_cast<uint8_t>(g.scene_batches_cur > 255 ? 255 : g.scene_batches_cur);
             uint32_t votes[256] = {};
@@ -2666,6 +2673,7 @@ void Shutdown()
     g.dlss_tried_frame = ~0ull;
     g.frame_rejects = 0;
     g.frame_reject_text[0] = 0;
+    g.frame_record_failure[0] = 0;
     g.profile.Clear();
     g.boundary_roles={};
     g.waiting_scene = {};

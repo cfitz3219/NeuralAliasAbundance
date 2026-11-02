@@ -22,6 +22,7 @@ struct Stats {
     uint64_t recorded=0,submitted=0,pairs=0,busy=0,resets=0,accepted=0,total=0;
     uint64_t attempts=0,submitted_pairs=0,waiting_history=0,unavailable=0,samples=0;
     uint64_t last_submitted_frame=0,sample_frame=0,submit_age_ms=0,sample_age_ms=0;
+    uint64_t image_moving=0; // valid estimated TOTAL image motion >=0.5px, before camera subtraction/checks
     uint64_t rejected_invalid=0,rejected_small=0,rejected_cost=0,rejected_offscreen=0,rejected_image=0,rejected_flicker=0; // flicker: passed every check, no agreeing previous pair yet
     uint32_t recording_slots=0,image_slots=0;
     double ms=0;char reason[160]{};

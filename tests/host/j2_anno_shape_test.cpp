@@ -25,6 +25,7 @@
 #include "host_dx12/nr/native_fg.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/observe/producers.hpp"
+#include "host_dx12/overlay/submission_tracking.hpp"
 
 #include <d3dcompiler.h>
 #include <array>
@@ -69,12 +70,16 @@ void __stdcall Forward(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* 
 // The overlay's sequence around a game submission.
 void Submit(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists, bool j2)
 {
+    const auto before = na::observe::GetProducerStats();
     const na::observe::ExecuteToken t = na::observe::ExecuteBegin(q, n, lists);
-    na::dlss::BeforeExecute(q, n, lists); // as the overlay: DLSS completion tracking of inline recordings
+    na::overlay::BeforeGameSubmission(q,n,lists);
     if (j2) na::j2::Execute(q, n, lists, &Forward);
     else q->ExecuteCommandLists(n, lists);
-    na::dlss::OnExecuted(q, n, lists);
+    na::overlay::AfterGameSubmission(q,n,lists);
     na::observe::ExecuteEnd(t, q, n, lists);
+    const auto after = na::observe::GetProducerStats();
+    CHECK(after.ambiguous_executes == before.ambiguous_executes);
+    CHECK(after.nested_unlocked == before.nested_unlocked);
 }
 using M = std::array<double, 16>;
 M Mul(const M& a, const M& b)
@@ -793,6 +798,10 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         if(inline_pan) {
             CHECK(is.segment_deferrals>0 && is.segment_miss_recoveries==0);
             CHECK(is.inline_late_writes==0 && is.post_scene_batches<=2); // cold learning only
+            uint32_t csub=0,dsub=0,state=0;
+            REQUIRE(na::observe::ListSceneSubresource(scene.list.Get(),na::observe::IdOf(color.Get()),na::observe::IdOf(depth.Get()),&csub,&dsub));
+            CHECK(na::observe::KnownSubStateNow(na::observe::IdOf(depth.Get()),dsub,&state));
+            CHECK(state==D3D12_RESOURCE_STATE_DEPTH_WRITE && is.no_state==0);
             CHECK(dev->GetDeviceRemovedReason()==S_OK);
             printf("pan: %llu early barriers deferred, %llu misses recovered, %llu frames\n",(unsigned long long)is.segment_deferrals,(unsigned long long)is.segment_miss_recoveries,(unsigned long long)is.frames);
             return test::finish("j2_anno_shape_test (pan across Executes)");

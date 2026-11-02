@@ -1437,6 +1437,7 @@ HRESULT STDMETHODCALLTYPE D_Signal(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64
 }
 HRESULT STDMETHODCALLTYPE D_Wait(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v)
 {
+    if (t_host_work) return o_Wait(q, f, v); // private cross-queue completion, like D_Signal
     const auto token = ExecuteBegin(q);
     const HRESULT hr = o_Wait(q, f, v);
     sync_event(NA_EV_QUEUE_WAIT, token, f, v, hr);

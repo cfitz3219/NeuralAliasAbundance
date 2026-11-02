@@ -985,7 +985,7 @@ void DrawLiveDlaa()
     {
         // P4-0b: moving-object motion from NVIDIA hardware optical flow (test; off by default).
         bool fl = na::j2::flow::Enabled();
-        BeginRow("Moving-object motion (test)", "Adds estimated motion for moving objects. Uses NVIDIA flow between command lists, or AMD compute flow inside the game's list. Requires extra GPU time. Turn it off to compare; the Motion vectors debug view shows the result.", SwitchWidth());
+        BeginRow("Moving-object motion (test)", "Camera motion is supplied even with this off. This adds estimated motion for independently moving objects; the correction percentage is not all movement on screen. Uses NVIDIA flow between command lists, or AMD compute flow inside the game's list. Requires extra GPU time. Turn it off to compare; the Motion vectors debug view shows the result.", SwitchWidth());
         if (Switch("j2flow", &fl)) na::j2::flow::SetEnabled(fl);
         EndRow();
         if (fl) {
@@ -1004,7 +1004,7 @@ void DrawLiveDlaa()
             const double pct = px ? 100.0 * static_cast<double>(fs.px_accepted) / static_cast<double>(px) : 0.0;
             char tb[360];
             const double flick = px ? 100.0 * static_cast<double>(fs.px_flicker) / static_cast<double>(px) : 0.0;
-            std::snprintf(tb, sizeof tb, "%s Moving pixels found: %.1f%% of the picture (%.1f%% rejected as jitter flicker). Cost %.2f ms (average %.2f). Pairs %llu, camera-only frames %llu (batch %llu, busy %llu, reset %llu).",
+            std::snprintf(tb, sizeof tb, "%s Accepted object corrections: %.1f%% of the picture (%.1f%% waiting for agreement). Cost %.2f ms (average %.2f). Pairs %llu, camera-only frames %llu (batch %llu, busy %llu, reset %llu).",
                           fs.reason, pct, flick, fs.ms_last, fs.ms_avg, static_cast<unsigned long long>(fs.consumed),
                           static_cast<unsigned long long>(fs.encode_only + fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_split),
                           static_cast<unsigned long long>(fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_reset));

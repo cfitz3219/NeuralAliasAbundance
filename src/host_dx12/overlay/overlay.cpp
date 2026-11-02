@@ -10,6 +10,7 @@
 #include "host_dx12/overlay/input_handover.hpp"
 #include "host_dx12/overlay/present_queues.hpp"
 #include "host_dx12/overlay/boundary_fallback.hpp"
+#include "host_dx12/overlay/submission_tracking.hpp"
 
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -1228,12 +1229,12 @@ UINT64 menu_completed_prefix() {
 void write_menu_progress(HANDLE log)
 {
     const auto cf=na::j2::compute_flow::GetStats();char cfline[950];DWORD cfw=0;
-    const int cfn=snprintf(cfline,sizeof cfline,"j2compute engine=amd recorded=%llu submitted=%llu pairs=%llu busy=%llu accepted=%llu total=%llu ms=%.3f reason=\"%s\" attempts=%llu paired_submissions=%llu unavailable=%llu history_only=%llu last_frame=%llu submit_age_ms=%llu sample_frame=%llu sample_age_ms=%llu samples=%llu excluded{invalid=%llu small=%llu cost=%llu offscreen=%llu image=%llu flicker=%llu} pool{recordings=%u images=%u}\r\n",
+    const int cfn=snprintf(cfline,sizeof cfline,"j2compute engine=amd recorded=%llu submitted=%llu pairs=%llu busy=%llu accepted=%llu total=%llu ms=%.3f reason=\"%s\" attempts=%llu paired_submissions=%llu unavailable=%llu history_only=%llu last_frame=%llu submit_age_ms=%llu sample_frame=%llu sample_age_ms=%llu samples=%llu excluded{invalid=%llu small=%llu cost=%llu offscreen=%llu image=%llu flicker=%llu} pool{recordings=%u images=%u} image_moving=%llu\r\n",
         static_cast<unsigned long long>(cf.recorded),static_cast<unsigned long long>(cf.submitted),static_cast<unsigned long long>(cf.pairs),
         static_cast<unsigned long long>(cf.busy),static_cast<unsigned long long>(cf.accepted),static_cast<unsigned long long>(cf.total),cf.ms,cf.reason,
         (unsigned long long)cf.attempts,(unsigned long long)cf.submitted_pairs,(unsigned long long)cf.unavailable,(unsigned long long)cf.waiting_history,
         (unsigned long long)cf.last_submitted_frame,(unsigned long long)cf.submit_age_ms,(unsigned long long)cf.sample_frame,(unsigned long long)cf.sample_age_ms,(unsigned long long)cf.samples,
-        (unsigned long long)cf.rejected_invalid,(unsigned long long)cf.rejected_small,(unsigned long long)cf.rejected_cost,(unsigned long long)cf.rejected_offscreen,(unsigned long long)cf.rejected_image,(unsigned long long)cf.rejected_flicker,cf.recording_slots,cf.image_slots);
+        (unsigned long long)cf.rejected_invalid,(unsigned long long)cf.rejected_small,(unsigned long long)cf.rejected_cost,(unsigned long long)cf.rejected_offscreen,(unsigned long long)cf.rejected_image,(unsigned long long)cf.rejected_flicker,cf.recording_slots,cf.image_slots,(unsigned long long)cf.image_moving);
     if(cfn>0)WriteFile(log,cfline,(std::min)(DWORD(cfn),DWORD(sizeof(cfline)-1)),&cfw,nullptr);
     auto ps = na::present::GetStats();
     char p_line[256];
@@ -2768,17 +2769,15 @@ void STDMETHODCALLTYPE DetourExecute(ID3D12CommandQueue* q, UINT n,
     if (sub) {
         ExecuteContext ctx{q, n, lists, g_exec_ticket.fetch_add(1, std::memory_order_relaxed) + 1, uncovered, sub->user};
         if (sub->begin) sub->begin(&ctx);
-        na::dlss::BeforeExecute(q, n, lists); // R-303: wait for this view's previous DLSS frame on another queue
+        na::overlay::BeforeGameSubmission(q,n,lists);
         na::j2::Execute(q, n, lists, ForwardThroughNr);
-        na::gputime::OnExecuted(q, n, lists); // R-202: completion fence on the queue that ran the lists
-        na::dlss::OnExecuted(q, n, lists);    // C6: completion evidence before retired DLSS features are released
+        na::overlay::AfterGameSubmission(q,n,lists);
         if (sub->end) sub->end(&ctx);
         g_exec_scoped.fetch_add(1, std::memory_order_relaxed);
     } else {
-        na::dlss::BeforeExecute(q, n, lists); // R-303: wait for this view's previous DLSS frame on another queue
+        na::overlay::BeforeGameSubmission(q,n,lists);
         na::j2::Execute(q, n, lists, ForwardThroughNr);
-        na::gputime::OnExecuted(q, n, lists); // R-202: completion fence on the queue that ran the lists
-        na::dlss::OnExecuted(q, n, lists);    // C6: completion evidence before retired DLSS features are released
+        na::overlay::AfterGameSubmission(q,n,lists);
     }
     na::nr::states::Submitted(q,n,lists);
     if (obs_token.queue_state) na::observe::ExecuteEnd(obs_token, q, n, lists);

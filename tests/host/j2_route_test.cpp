@@ -254,6 +254,27 @@ int main()
         for(uint64_t f=20;f<24;++f){roles.Submitted(10,0,2);roles.Close({write,barrier,write},true,true,f);}
         CHECK(roles.Judge(10,7,1,24)==BoundaryRoles::Unknown);
     }
+    {
+        BoundaryRoles roles;roles.Select(1,2);
+        ColorEvent write{};write.write=true;write.op=Op::DrawWrite;write.producer=7;write.with_depth=true;
+        ColorEvent barrier{};barrier.op=Op::Barrier;barrier.producer=7;
+        const std::vector<ColorEvent> e{write,barrier,write,barrier};
+        // A pooled list is occasionally terminal, usually intermediate. Keeping
+        // it active in one role must not age away the contradictory other role.
+        for(uint64_t f=1;f<=3;++f){roles.Submitted(10,0,2);roles.Close({write,barrier},true,true,f);}
+        for(uint64_t f=4;f<=130;++f){roles.Submitted(10,0,2);roles.Submitted(11,2,4);roles.Close(e,true,true,f);}
+        CHECK(roles.Judge(10,7,1,131)==BoundaryRoles::Unknown);
+        // The reverse must not re-qualify a previously intermediate occurrence
+        // as a guaranteed end either: that causes an early placement on return.
+        for(uint64_t f=131;f<=260;++f){roles.Submitted(10,0,2);roles.Close({write,barrier},true,true,f);}
+        CHECK(roles.Judge(10,7,1,261)==BoundaryRoles::Unknown);
+        // Entirely unused entries still retire; a new resource pair also resets.
+        roles.Close({},true,false,500);
+        CHECK(roles.Judge(10,7,1,501)==BoundaryRoles::Unknown);
+        for(uint64_t f=501;f<=503;++f){roles.Submitted(10,0,2);roles.Close({write,barrier},true,true,f);}
+        CHECK(roles.Judge(10,7,1,504)==BoundaryRoles::End);
+        roles.Select(3,4);CHECK(roles.Judge(10,7,1,504)==BoundaryRoles::Unknown);
+    }
     if (g_failures) { std::printf("j2_route_test: FAILED (%d failures)\n", g_failures); return 1; }
     std::printf("j2_route_test: OK\n");
     return 0;
