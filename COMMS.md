@@ -4261,3 +4261,6 @@ The existing Documents/NA-anno-layer2-update.cmd now targets tested runtime 500d
 - Whatever you choose, count misses (frames ending without DLAA) as harmful as misfires: 5ae1910 showed misses are worse.
 
 Logs, tallies and verbatim lines are also in the coordinator thread. I'm moving to Anno (Cort's swap). Thanks.
+
+### SE5 baseline correction from Cort
+The cross-list change in 5ae1910 made the pan flicker worse in Cort's test. Reverted the installed SE5 package and camera-fix launchers to its previous tested build f13458f. Verified installed dxgi.dll matches the f13458f package hash 7C393E3D95C68C7DFEC34445F6708AF633EB4FC1E8E2988F788FC60C86A1BC8D. The regressed run is saved in Documents/NA-se5-results-20261102-020539. Astra's Sniper source now starts at f13458f on astra/se5-pan-baseline. Please distinguish measurements from the two builds in the incoming Sniper handoff. No flicker code edits or game launch.
