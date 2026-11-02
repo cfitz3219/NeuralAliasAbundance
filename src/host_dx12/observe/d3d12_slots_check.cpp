@@ -60,6 +60,7 @@ NA_SLOT(ID3D12GraphicsCommandListVtbl, RSSetScissorRects, s::list::RSSetScissorR
 NA_SLOT(ID3D12GraphicsCommandListVtbl, SetPipelineState, s::list::SetPipelineState);
 NA_SLOT(ID3D12GraphicsCommandListVtbl, ResourceBarrier, s::list::ResourceBarrier);
 NA_SLOT(ID3D12GraphicsCommandListVtbl, ExecuteBundle, s::list::ExecuteBundle);
+NA_SLOT(ID3D12GraphicsCommandListVtbl, SetPredication, s::list::SetPredication);
 NA_SLOT(ID3D12GraphicsCommandListVtbl, SetDescriptorHeaps, s::list::SetDescriptorHeaps);
 NA_SLOT(ID3D12GraphicsCommandListVtbl, SetComputeRootSignature, s::list::SetComputeRootSignature);
 NA_SLOT(ID3D12GraphicsCommandListVtbl, SetGraphicsRootSignature, s::list::SetGraphicsRootSignature);

@@ -795,6 +795,16 @@ void write_status_line()
                 (unsigned long long)(GetTickCount64() / 100 % 100000000), j2.late_detail);
             if (ln > 0) WriteFile(f, ll, static_cast<DWORD>((std::min)(ln, static_cast<int>(sizeof(ll) - 1))), &written, nullptr);
         }
+        {   // Exact inline placement: candidates per scene recording, and how often the trigger was early.
+            char el[256];
+            const int en = snprintf(el, sizeof el, "j2_exact frames=%llu exact=%llu moved_later=%llu later_candidates=%llu full=%llu last_count=%u late_writes=%llu any_boundary=%llu relaxed{writer=%llu occ=%llu ordinal=%llu}\r\n",
+                (unsigned long long)j2.inline_frames, (unsigned long long)j2.inline_exact, (unsigned long long)j2.inline_moved_later,
+                (unsigned long long)j2.inline_later_candidates, (unsigned long long)j2.inline_candidates_full, j2.inline_last_count,
+                (unsigned long long)j2.inline_late_writes, (unsigned long long)j2.boundary_any_matched,
+                (unsigned long long)j2.inline_relaxed_rejects[0], (unsigned long long)j2.inline_relaxed_rejects[1],
+                (unsigned long long)j2.inline_relaxed_rejects[2]);
+            if (en > 0) WriteFile(f, el, static_cast<DWORD>((std::min)(en, static_cast<int>(sizeof(el) - 1))), &written, nullptr);
+        }
         {   // Why carried resource states are lost (SE5 depth no_state: ambiguous_queue_order).
             const auto ps = na::observe::GetProducerStats();
             char ol[192];

@@ -119,7 +119,7 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
     auto c=current;collect(*c);
     // Retain context through every submission/replay or discard of this exact recording.
     auto lease=na::nr::native::RetainRecording(l,c);if(!lease){++stats.unavailable;reason("AMD flow recording lifetime unavailable; camera motion used");return {};}
-    for(const auto& s:c->leases)if(!s->lease.Retired() && s->lease.SameRecording(lease)){
+    if(!f.speculative)for(const auto& s:c->leases)if(!s->lease.Retired() && s->lease.SameRecording(lease)){
         ++stats.busy;reason("AMD flow already belongs to this executable recording; camera motion used");return {};}
     unsigned work=0;while(work<c->leases.size() && c->leases[work]->lease && !c->leases[work]->lease.Retired())++work;
     if(work==c->leases.size())c->leases.push_back(std::make_unique<Slot>());

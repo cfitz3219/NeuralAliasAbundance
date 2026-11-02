@@ -23,6 +23,12 @@ inline std::map<std::string, test::FakeParams::Value> last_create, last_eval;
 inline uintptr_t last_eval_handle = 0, next_handle = 0x1000;
 inline bool last_create_injector = false, last_eval_injector = false;
 inline void (*eval_hook)() = nullptr; // runs inside EvaluateFeature (tests of lock ordering)
+// Optional GPU evidence of which evaluations actually RAN (predication): each evaluation k
+// (0-based, in recording order) copies 8 bytes from gpu_log_src[k] to gpu_log[k]. A copy is
+// predicated like the real work, so gpu_log[k] == gpu_log_src[k] only if evaluation k executed.
+inline ID3D12Resource* gpu_log = nullptr;
+inline ID3D12Resource* gpu_log_src = nullptr;
+inline int gpu_log_entries = 0;
 
 inline NVSDK_NGX_Result NVSDK_CONV Optimal(NVSDK_NGX_Parameter* p)
 {
@@ -80,6 +86,8 @@ inline NVSDK_NGX_Result NVSDK_CONV Eval(ID3D12GraphicsCommandList* list, const N
     if (eval_hook) eval_hook();
     if (!list || !h) return NVSDK_NGX_Result_FAIL_InvalidParameter;
     last_eval = static_cast<const test::FakeParams*>(p)->values;
+    if (gpu_log && gpu_log_src && evals - 1 < gpu_log_entries)
+        list->CopyBufferRegion(gpu_log, UINT64(evals - 1) * 8, gpu_log_src, UINT64(evals - 1) * 8, 8);
     last_eval_handle = reinterpret_cast<uintptr_t>(h);
     return eval_result;
 }

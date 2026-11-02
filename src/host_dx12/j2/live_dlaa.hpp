@@ -220,6 +220,14 @@ struct Stats {
     uint64_t class_contradictions = 0;   // class-triggered frames followed by more scene content (class demoted)
     uint64_t labelled_frames = 0, unlabelled_frames = 0; // frames that taught the profile / could not (truncated trace)
     uint64_t expired_inline = 0;         // inline recordings never submitted within two frames (released)
+    // Exact inline placement: predicated candidates per scene recording, one switched on at submission.
+    uint64_t inline_later_candidates = 0; // extra candidates recorded after more scene content
+    uint64_t inline_exact = 0;            // submissions whose chosen candidate follows the final colour write
+    uint64_t inline_moved_later = 0;      // ... where the first (trigger) candidate was too early
+    uint64_t inline_candidates_full = 0;  // a further possible end found with all candidates in use
+    uint32_t inline_last_count = 0;       // candidates in the last submitted scene recording
+    uint64_t boundary_any_matched = 0;    // first candidates at a scene boundary whose writer/ordinal differed from the learned one
+    uint64_t inline_relaxed_rejects[3] = {}; // ... by what differed: writer, occurrence, transition/candidate ordinal
     uint64_t between_observed = 0, between_predicted = 0; // between-list placements before an observed reader / after a predicted last scene list
     char class_note[200] = {};            // latest consumer class not accepted (explains a missed frame)
     // SE5 2026-11-02 (Cort: flicker only while panning): every frame whose DLAA ran and was then

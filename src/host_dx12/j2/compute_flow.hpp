@@ -8,6 +8,9 @@ namespace na::j2::compute_flow {
 struct Frame {
     // slot is the caller's ring hint; private resources follow recording leases.
     uint64_t frame=0,previous=0;uint32_t generation=0,slot=0;bool reset=false,hdr=false;
+    // One of several predicated candidates in the same recording: at most one of them runs on
+    // the GPU and only that one is Committed, so a second Record in the recording is allowed.
+    bool speculative=false;
     float jitter[2]{};
 };
 struct Ticket {std::shared_ptr<void> context;uint32_t image=0,previous=0,slot=0;Frame frame;bool pair=false;};

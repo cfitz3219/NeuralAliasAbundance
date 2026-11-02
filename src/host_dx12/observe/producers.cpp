@@ -114,6 +114,8 @@ struct ListState {
     uint32_t cur_ds_sub = NA_UNKNOWN_U32;
     bool restorable = true;              // false after work whose state effects we cannot replay
     bool in_render_pass = false;         // between BeginRenderPass and EndRenderPass (no host copy/dispatch allowed)
+    bool game_predication = false;       // the game's SetPredication is active: host work would be predicated with it,
+                                         // and host predication would replace it (no host copy/dispatch allowed)
     int8_t mip_level = -1;               // live mip bias: twin level latched at Reset (-1 = the game's own objects)
 };
 
@@ -2236,6 +2238,7 @@ struct On<sl::list::Reset> {
                     ls->cur_nrt = 0;
                     ls->restorable = true;
                     ls->in_render_pass = false;
+                    ls->game_predication = false;
                 }
                 ls->root_sig[0] = ls->root_sig[1] = nullptr;
                 ls->coverage_complete.store(cov == na::hooking::variants::Coverage::Complete);
@@ -2528,6 +2531,15 @@ struct On<sl::list::ExecuteBundle> {
         if (!begin_op(l, &r)) return;
         emit_op(r, NA_OP_EXECUTE_BUNDLE, {id_or_unknown(bundle)}, nullptr, 0, 0, NA_EVF_METHOD_UNOBSERVED);
         with_list_state(l, [&](ListState& ls) { std::lock_guard<std::mutex> bl(ls.bind_m); ls.restorable = false; }); // a bundle's state changes are not observed
+    }
+};
+template <>
+struct On<sl::list::SetPredication> {
+    static void run(GL* l, ID3D12Resource* buffer, UINT64, D3D12_PREDICATION_OP)
+    {
+        Rec r;
+        if (!begin_op(l, &r)) return; // host work (ours) is not the game's predication
+        with_list_state(l, [&](ListState& ls) { std::lock_guard<std::mutex> bl(ls.bind_m); ls.game_predication = buffer != nullptr; });
     }
 };
 template <>
@@ -3280,6 +3292,7 @@ bool register_list_slots()
         ListHook<L::SetPipelineState, void(ID3D12PipelineState*)>::spec(),
         ListHook<L::ResourceBarrier, void(UINT, const D3D12_RESOURCE_BARRIER*)>::spec(),
         ListHook<L::ExecuteBundle, void(ID3D12GraphicsCommandList*)>::spec(),
+        ListHook<L::SetPredication, void(ID3D12Resource*, UINT64, D3D12_PREDICATION_OP)>::spec(),
         ListHook<L::SetDescriptorHeaps, void(UINT, ID3D12DescriptorHeap* const*)>::spec(),
         ListHook<L::SetComputeRootSignature, void(ID3D12RootSignature*)>::spec(),
         ListHook<L::SetGraphicsRootSignature, void(ID3D12RootSignature*)>::spec(),
@@ -4760,7 +4773,7 @@ bool ListStateRestorable(ID3D12CommandList* l)
     ListState* ls = l ? list_state_locked(l, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
     std::lock_guard<std::mutex> bl(ls->bind_m);
-    return ls->restorable && !ls->in_render_pass;
+    return ls->restorable && !ls->in_render_pass && !ls->game_predication;
 }
 bool RestoreListState(ID3D12GraphicsCommandList* l)
 {
