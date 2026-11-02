@@ -8,6 +8,7 @@ namespace na::scale {
 namespace {
 constexpr char kSource[] = R"(
 Texture2D<float4> plane : register(t0);
+Texture2D<uint> stencil_plane : register(t0);
 SamplerState linear_clamp : register(s0);
 cbuffer Sizes : register(b0) { uint2 source_size; uint2 destination_size; };
 float4 vs(uint i : SV_VertexID) : SV_Position {
@@ -20,6 +21,10 @@ float ps(float4 position : SV_Position) : SV_Depth {
 }
 float4 color_ps(float4 position : SV_Position) : SV_Target {
     return plane.SampleLevel(linear_clamp, position.xy / destination_size, 0);
+}
+uint stencil_ps(float4 position : SV_Position) : SV_Target {
+    uint2 p = min(uint2(position.xy * float2(source_size) / destination_size), source_size - 1);
+    return stencil_plane.Load(int3(p, 0));
 })";
 DXGI_FORMAT depth_format(DXGI_FORMAT f) {
     switch (f) {
@@ -75,9 +80,10 @@ std::shared_ptr<const DepthRestore> DepthRestore::CreateInternal(ID3D12Device* d
         // The first bypass supports exact typed formats. Typeless reinterpretation
         // requires an explicit compatible view contract, not guessed colour space.
         D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
-        if (!filterable_color(format) || src.Format != format || dst.Format != format ||
+        const bool stencil = format == DXGI_FORMAT_R8_UINT;
+        if ((!stencil && !filterable_color(format)) || src.Format != format || dst.Format != format ||
             FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof support)) ||
-            !(support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) || !(support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET))
+            !(support.Support1 & (stencil ? D3D12_FORMAT_SUPPORT1_SHADER_LOAD : D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE)) || !(support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET))
             return fail("color bypass requires matching filterable typed views and a render target");
     }
     Microsoft::WRL::ComPtr<IUnknown> expected;
@@ -139,7 +145,7 @@ std::shared_ptr<const DepthRestore> DepthRestore::CreateInternal(ID3D12Device* d
     Microsoft::WRL::ComPtr<ID3DBlob> blob, errors, vs, ps;
     if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors)) ||
         FAILED(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&pass->root_))) ||
-        !compile("vs", "vs_5_0", vs) || !compile(color ? "color_ps" : "ps", "ps_5_0", ps)) return fail("raster restoration shader preparation failed");
+        !compile("vs", "vs_5_0", vs) || !compile(color ? (format == DXGI_FORMAT_R8_UINT ? "stencil_ps" : "color_ps") : "ps", "ps_5_0", ps)) return fail("raster restoration shader preparation failed");
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = pass->root_.Get(); pd.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
     pd.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};

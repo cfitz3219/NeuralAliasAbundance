@@ -123,4 +123,38 @@ int main() { return test::run({
         m.OnPresent();
         CHECK(m.Report().find("unrecorded 1") != std::string::npos);
     }},
+    {"a later recording does not erase the generation being submitted", [] {
+        PassMap m;m.Arm(0);m.OnPresent();resource(m,1,32,16);resource(m,2,32,16);
+        targets(m,9,{1},0);viewport(m,9,32,16);feed(m,op(9,NA_OP_DRAW,{3,1}));
+        auto later=op(9,NA_OP_SET_PIPELINE,{99});
+        reinterpret_cast<na_ev_list_op*>(later.bytes.data())->recording_generation=2;feed(m,later);
+        const na_list_ref ref{9,1};m.OnExecute(&ref,1);m.OnPresent();
+        CHECK(m.Passes().size()==1);CHECK(m.Report().find("unrecorded 0")!=std::string::npos);
+    }},
+    {"rearm retains executable cached recordings and resets per-frame counters", [] {
+        PassMap m;m.Arm(0);resource(m,1,32,16);targets(m,9,{1},0);
+        viewport(m,9,32,16);feed(m,op(9,NA_OP_DRAW,{3,1}));const na_list_ref ref{9,1};
+        m.OnPresent();m.OnExecute(&ref,1);m.OnPresent();CHECK(m.Passes().size()==1);
+        m.Arm(0);m.OnPresent();m.OnExecute(&ref,1);m.OnPresent();
+        CHECK(m.Passes().size()==1);CHECK(m.Report().find("lists executed 1 (unrecorded 0")!=std::string::npos);
+    }},
+    {"pipeline changes preserve separate executable pass identities", [] {
+        PassMap m;m.Arm(0);m.OnPresent();resource(m,1,32,16);targets(m,9,{1},0);viewport(m,9,32,16);
+        feed(m,op(9,NA_OP_SET_PIPELINE,{10}));feed(m,op(9,NA_OP_DRAW,{3,1}));
+        feed(m,op(9,NA_OP_SET_PIPELINE,{11}));feed(m,op(9,NA_OP_DRAW_INDEXED,{36,1}));
+        const na_list_ref ref{9,1};m.OnExecute(&ref,1);m.OnPresent();
+        const auto p=m.Passes();CHECK(p.size()==2);if(p.size()==2)CHECK(p[0].pipeline==10&&p[1].pipeline==11);
+    }},
+    {"native scene plus half-size effects is a composite, not a render-scale stretch", [] {
+        PassMap m;m.Arm(0);m.OnPresent();m.OnSwapchain(3440,1440);
+        resource(m,294,3440,1440,10);resource(m,295,3440,1440,19);
+        resource(m,1261,1720,720,26);resource(m,299,3440,1440,28);
+        targets(m,117,{1261},0);viewport(m,117,1720,720);feed(m,op(117,NA_OP_DRAW,{3,1}));
+        m.OnDescriptor(5,0,NA_DESC_SRV,1261);m.OnDescriptor(5,1,NA_DESC_SRV,294);m.OnDescriptor(5,2,NA_DESC_SRV,295);
+        targets(m,117,{299},0);viewport(m,117,3440,1440);
+        feed(m,op(117,NA_OP_SET_ROOT_TABLE,{5,0,1,0,0}));feed(m,op(117,NA_OP_DRAW,{3,1}));
+        const na_list_ref ref{117,1};m.OnExecute(&ref,1);m.OnPresent();
+        const auto report=m.Report();CHECK(report.find("STRETCH CANDIDATE")==std::string::npos);
+        CHECK(report.find("MIXED-SIZE COMPOSITE")!=std::string::npos);
+    }},
 }); }

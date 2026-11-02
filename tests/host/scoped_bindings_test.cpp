@@ -31,13 +31,14 @@ public:
 struct Readback {
     test::ComPtr<ID3D12Resource> buffer;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
-    void Prepare(ID3D12Device* device, ID3D12Resource* texture) {
-        auto desc=texture->GetDesc();UINT64 bytes=0;device->GetCopyableFootprints(&desc,0,1,0,&fp,nullptr,nullptr,&bytes);
+    void Prepare(ID3D12Device* device, ID3D12Resource* texture, UINT sub=0) {
+        auto desc=texture->GetDesc();UINT64 bytes=0;device->GetCopyableFootprints(&desc,sub,1,0,&fp,nullptr,nullptr,&bytes);
         buffer=test::CreateBuffer(device,bytes,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
     }
-    void Record(ID3D12GraphicsCommandList* l, ID3D12Resource* texture, D3D12_RESOURCE_STATES state) {
-        auto b=test::Transition(texture,state,D3D12_RESOURCE_STATE_COPY_SOURCE);l->ResourceBarrier(1,&b);
+    void Record(ID3D12GraphicsCommandList* l, ID3D12Resource* texture, D3D12_RESOURCE_STATES state, UINT sub=0) {
+        auto b=test::Transition(texture,state,D3D12_RESOURCE_STATE_COPY_SOURCE);b.Transition.Subresource=sub;l->ResourceBarrier(1,&b);
         D3D12_TEXTURE_COPY_LOCATION s{},d{};s.pResource=texture;s.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        s.SubresourceIndex=sub;
         d.pResource=buffer.Get();d.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;d.PlacedFootprint=fp;l->CopyTextureRegion(&d,0,0,0,&s,nullptr);
         std::swap(b.Transition.StateBefore,b.Transition.StateAfter);l->ResourceBarrier(1,&b);
     }
@@ -49,12 +50,14 @@ struct Readback {
         std::printf("%ux%u output, wrong pixels %u\n",w,h,wrong);CHECK(wrong==0);buffer->Unmap(0,nullptr);
     }
 };
-int Raster(test::Device& d, int frame_mode=0)
+int Raster(test::Device& d, int frame_mode=0, bool stencil=false)
 {
     auto* dev=d.device.Get();constexpr UINT w=32,h=16,rw=21,rh=11;const auto fmt=DXGI_FORMAT_R32G32B32A32_FLOAT;
     na::observe::SetRasterStateTracking(true);
     auto color=test::CreateTexture(dev,w,h,fmt,D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
-    auto depth=test::CreateTexture(dev,w,h,DXGI_FORMAT_D32_FLOAT,D3D12_RESOURCE_STATE_DEPTH_WRITE,D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    const auto depth_resource=stencil?DXGI_FORMAT_R32G8X24_TYPELESS:DXGI_FORMAT_D32_FLOAT;
+    const auto depth_view=stencil?DXGI_FORMAT_D32_FLOAT_S8X24_UINT:DXGI_FORMAT_D32_FLOAT;
+    auto depth=test::CreateTexture(dev,w,h,depth_resource,D3D12_RESOURCE_STATE_DEPTH_WRITE,D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
     auto history=test::CreateTexture(dev,w,h,fmt,D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     auto cb=test::CreateBuffer(dev,256,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);REQUIRE(color&&depth&&cb);
     const float source[4]={float(w),float(h),3,0};void* mapped=nullptr;REQUIRE(SUCCEEDED(cb->Map(0,nullptr,&mapped)));std::memcpy(mapped,source,sizeof source);
@@ -75,12 +78,16 @@ float4 ps():SV_Target{return float4(width,rh,marker,.75);})";
     pd.BlendState.RenderTarget[0].RenderTargetWriteMask=D3D12_COLOR_WRITE_ENABLE_ALL;pd.DepthStencilState.DepthEnable=TRUE;
     pd.DepthStencilState.DepthFunc=D3D12_COMPARISON_FUNC_ALWAYS;pd.DepthStencilState.DepthWriteMask=D3D12_DEPTH_WRITE_MASK_ALL;
     pd.DepthStencilState.FrontFace=pd.DepthStencilState.BackFace={D3D12_STENCIL_OP_KEEP,D3D12_STENCIL_OP_KEEP,D3D12_STENCIL_OP_KEEP,D3D12_COMPARISON_FUNC_ALWAYS};
-    pd.SampleMask=UINT_MAX;pd.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;pd.NumRenderTargets=1;pd.RTVFormats[0]=fmt;pd.DSVFormat=DXGI_FORMAT_D32_FLOAT;pd.SampleDesc.Count=1;
+    const bool stencil_writes=stencil&&frame_mode!=2;
+    if(stencil_writes){pd.DepthStencilState.StencilEnable=TRUE;pd.DepthStencilState.StencilReadMask=pd.DepthStencilState.StencilWriteMask=0xff;
+        pd.DepthStencilState.FrontFace.StencilPassOp=pd.DepthStencilState.BackFace.StencilPassOp=D3D12_STENCIL_OP_REPLACE;}
+    pd.SampleMask=UINT_MAX;pd.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;pd.NumRenderTargets=1;pd.RTVFormats[0]=fmt;pd.DSVFormat=depth_view;pd.SampleDesc.Count=1;
     test::ComPtr<ID3D12PipelineState> pso;REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&pd,IID_PPV_ARGS(&pso))));
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,1,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};test::ComPtr<ID3D12DescriptorHeap> rt,ds,heap;
     REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&rt))));hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_DSV;REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&ds))));
     hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&heap))));
-    const auto rtv=rt->GetCPUDescriptorHandleForHeapStart(),dsv=ds->GetCPUDescriptorHandleForHeapStart();dev->CreateRenderTargetView(color.Get(),nullptr,rtv);dev->CreateDepthStencilView(depth.Get(),nullptr,dsv);
+    const auto rtv=rt->GetCPUDescriptorHandleForHeapStart(),dsv=ds->GetCPUDescriptorHandleForHeapStart();dev->CreateRenderTargetView(color.Get(),nullptr,rtv);
+    D3D12_DEPTH_STENCIL_VIEW_DESC native_ds{};native_ds.Format=depth_view;native_ds.ViewDimension=D3D12_DSV_DIMENSION_TEXTURE2D;dev->CreateDepthStencilView(depth.Get(),&native_ds,dsv);
     D3D12_CONSTANT_BUFFER_VIEW_DESC cv{cb->GetGPUVirtualAddress(),256};dev->CreateConstantBufferView(&cv,heap->GetCPUDescriptorHandleForHeapStart());
     std::string error;std::shared_ptr<const SceneGroup> group;std::shared_ptr<const PreparedBindings> plan;std::shared_ptr<const ColorRestore> promote;
     std::shared_ptr<SceneFrame> frame;PhysicalInputBridge bridge;
@@ -93,17 +100,19 @@ float4 ps():SV_Target{return float4(width,rh,marker,.75);})";
         BindingSpec s;s.group=group;s.root=root;s.native_extent={w,h};s.render_extent={rw,rh};s.viewports={{0,0,float(w),float(h),0,1}};s.scissors={{0,0,LONG(w),LONG(h)}};
         s.constants={{constants,D3D12_RESOURCE_STATE_GENERIC_READ}};s.root_cbvs={{1,0}};s.tables={{0,0}};ShaderView c;c.kind=ShaderView::Kind::PatchedCbv;s.views.push_back(c);
         ColorTarget target;target.member=1;target.view.Format=fmt;target.view.ViewDimension=D3D12_RTV_DIMENSION_TEXTURE2D;s.colors.push_back(target);
-        s.depth.member=2;s.depth.view.Format=DXGI_FORMAT_D32_FLOAT;s.depth.view.ViewDimension=D3D12_DSV_DIMENSION_TEXTURE2D;
+        s.depth.member=2;s.depth.view.Format=depth_view;s.depth.view.ViewDimension=D3D12_DSV_DIMENSION_TEXTURE2D;
         s.uses={{1,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,D3D12_RESOURCE_STATE_RENDER_TARGET},{2,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,D3D12_RESOURCE_STATE_DEPTH_WRITE}};
         plan=PreparedBindings::Create(dev,s,error);REQUIRE(plan);
         promote=ColorRestore::Create(dev,group->Find(1)->reduced.Get(),color.Get(),0,fmt,error);REQUIRE(promote);
         if(frame_mode){FrameSpec f;f.group=group;f.color=1;f.depth=2;f.members={{1,D3D12_RESOURCE_STATE_RENDER_TARGET},{2,D3D12_RESOURCE_STATE_DEPTH_WRITE},{3,D3D12_RESOURCE_STATE_RENDER_TARGET,true,D3D12_RESOURCE_STATE_RENDER_TARGET}};
+            if(stencil)f.members[1].seed_state=D3D12_RESOURCE_STATE_DEPTH_WRITE;
             frame=SceneFrame::Create(dev,f,error);REQUIRE(frame);}
     }
     auto provider=std::make_shared<Provider>();provider->plan=plan;provider->frame=frame;
     na::observe::SetShaderOperationHook(na::observe::ShaderLane::Bindings,std::make_shared<BindingHook>(provider));
     Readback cr,dr,nr,nd;cr.Prepare(dev,group->Find(1)->reduced.Get());dr.Prepare(dev,group->Find(2)->reduced.Get());nr.Prepare(dev,color.Get());nd.Prepare(dev,depth.Get());
-    Readback history_seed,history_full;
+    Readback history_seed,history_full,stencil_seed,stencil_result;
+    if(stencil){stencil_seed.Prepare(dev,group->Find(2)->reduced.Get(),1);stencil_result.Prepare(dev,depth.Get(),1);}
     test::ComPtr<ID3D12DescriptorHeap> history_views;
     if(frame){na::observe::HostWorkScope host;
         D3D12_DESCRIPTOR_HEAP_DESC hh{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,2,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
@@ -115,7 +124,9 @@ float4 ps():SV_Target{return float4(width,rh,marker,.75);})";
     provider->recording=list;
     if(frame){REQUIRE(bridge.Bind(list,frame));std::shared_ptr<const na::j2::PhysicalInput> input;const auto callbacks=bridge.Callbacks();
         CHECK(callbacks.lookup(callbacks.ctx,1,2,list,&input)==na::j2::PhysicalLookup::None);}
-    const float clear[4]={0,0,0,0};list->ClearRenderTargetView(rtv,clear,0,nullptr);list->ClearDepthStencilView(dsv,D3D12_CLEAR_FLAG_DEPTH,.2f,0,0,nullptr);
+    const float clear[4]={0,0,0,0};list->ClearRenderTargetView(rtv,clear,0,nullptr);
+    const auto clear_flags=static_cast<D3D12_CLEAR_FLAGS>(D3D12_CLEAR_FLAG_DEPTH|(stencil?D3D12_CLEAR_FLAG_STENCIL:0));
+    list->ClearDepthStencilView(dsv,clear_flags,.2f,0x5a,0,nullptr);list->OMSetStencilRef(0xa7);
     list->SetGraphicsRootSignature(root.Get());list->SetPipelineState(pso.Get());ID3D12DescriptorHeap* heaps[]{heap.Get()};list->SetDescriptorHeaps(1,heaps);
     list->SetGraphicsRootDescriptorTable(0,heap->GetGPUDescriptorHandleForHeapStart());list->SetGraphicsRootConstantBufferView(1,cb->GetGPUVirtualAddress());
     list->OMSetRenderTargets(1,&rtv,FALSE,&dsv);const D3D12_VIEWPORT vp{0,0,float(w),float(h),0,1};const D3D12_RECT sc{0,0,w,h};
@@ -124,12 +135,14 @@ float4 ps():SV_Target{return float4(width,rh,marker,.75);})";
         {na::observe::HostWorkScope host;const float old_history[4]={99,77,4,.125f};
             list->ClearRenderTargetView(history_views->GetCPUDescriptorHandleForHeapStart(),old_history,0,nullptr);}
         REQUIRE(frame->SeedHistories(list)); // public frame operation owns its HostWorkScope
+        if(stencil){na::observe::HostWorkScope host;stencil_seed.Record(list,group->Find(2)->reduced.Get(),D3D12_RESOURCE_STATE_COMMON,1);}
         {na::observe::HostWorkScope host;history_seed.Record(list,group->Find(3)->reduced.Get(),D3D12_RESOURCE_STATE_COMMON);}}
     list->DrawInstanced(3,1,0,0);provider->plan.reset(); // private complete21x11 colour/depth scene
     if(frame){na::observe::HostWorkScope host;auto b=test::Transition(group->Find(3)->reduced.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_RENDER_TARGET);list->ResourceBarrier(1,&b);
         auto hc=history_views->GetCPUDescriptorHandleForHeapStart();hc.ptr+=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         const float new_history[4]={5,6,7,.5f};list->ClearRenderTargetView(hc,new_history,0,nullptr);
         std::swap(b.Transition.StateBefore,b.Transition.StateAfter);list->ResourceBarrier(1,&b);frame->Written(3);}
+    if(frame)REQUIRE(frame->SeedHistories(list)); // must not reseed over current writes
     if(frame){std::shared_ptr<const na::j2::PhysicalInput> input;const auto callbacks=bridge.Callbacks();
         CHECK(callbacks.lookup(callbacks.ctx,1,2,list,&input)==na::j2::PhysicalLookup::Unavailable);
         CHECK(input&&input->generation==13);callbacks.outcome(callbacks.ctx,13,na::j2::PhysicalOutcome::Unavailable,"not ready");
@@ -153,6 +166,7 @@ float4 ps():SV_Target{return float4(width,rh,marker,.75);})";
     {na::observe::HostWorkScope host;cr.Record(list,group->Find(1)->reduced.Get(),D3D12_RESOURCE_STATE_COMMON);dr.Record(list,group->Find(2)->reduced.Get(),D3D12_RESOURCE_STATE_COMMON);
         nr.Record(list,color.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET);nd.Record(list,depth.Get(),D3D12_RESOURCE_STATE_DEPTH_WRITE);}
     if(frame){na::observe::HostWorkScope host;history_full.Record(list,history.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET);}
+    if(stencil){na::observe::HostWorkScope host;stencil_result.Record(list,depth.Get(),D3D12_RESOURCE_STATE_DEPTH_WRITE,1);}
     REQUIRE(SUCCEEDED(list->Close()));static_cast<float*>(mapped)[2]=9;cb->Unmap(0,nullptr);ID3D12CommandList* lists[]{list};
     {na::nr::native::Submission receipt(d.queue.Get(),1,lists);d.queue->ExecuteCommandLists(1,lists);}d.WaitIdle();cr.Check(rw,rh,rw,rh);
     void* p=nullptr;REQUIRE(SUCCEEDED(nr.buffer->Map(0,nullptr,&p)));unsigned wrong=0;
@@ -166,6 +180,10 @@ float4 ps():SV_Target{return float4(width,rh,marker,.75);})";
         for(UINT y=0;y<th;++y)for(UINT x=0;x<tw;++x){float pixel[4];std::memcpy(pixel,static_cast<char*>(p)+rb.fp.Offset+y*rb.fp.Footprint.RowPitch+x*16,16);
             for(int channel=0;channel<4;++channel)wrong+=std::fabs(pixel[channel]-(which?new_history[channel]:old_history[channel]))>.0001f;}
         rb.buffer->Unmap(0,nullptr);CHECK(wrong==0);}
+    if(stencil)for(int which=0;which<2;++which){auto& rb=which?stencil_result:stencil_seed;REQUIRE(SUCCEEDED(rb.buffer->Map(0,nullptr,&p)));wrong=0;
+        const UINT tw=which?w:rw,th=which?h:rh;const UINT8 expected=which&&stencil_writes?0xa7:0x5a;
+        for(UINT y=0;y<th;++y)for(UINT x=0;x<tw;++x)wrong+=static_cast<UINT8*>(p)[rb.fp.Offset+y*rb.fp.Footprint.RowPitch+x]!=expected;
+        std::printf("D32S8 %s stencil wrong %u\n",which?"promoted":"seeded",wrong);rb.buffer->Unmap(0,nullptr);CHECK(wrong==0);}
     REQUIRE(SUCCEEDED(list->Reset(recording.alloc.Get(),nullptr)));REQUIRE(SUCCEEDED(list->Close()));na::nr::native::Maintain();
     if(frame){std::shared_ptr<const na::j2::PhysicalInput> input;const auto callbacks=bridge.Callbacks();
         CHECK(callbacks.lookup(callbacks.ctx,1,2,list,&input)==na::j2::PhysicalLookup::None);}
@@ -265,6 +283,7 @@ RWTexture2D<float4> target:register(u0);Texture2D<float> image:register(t0);Samp
     reduced_rb.Check(rw,rh,rw,rh);native_rb.Check(w,h,w,h);
     REQUIRE(Raster(d)==0);
     for(int mode=1;mode<=3;++mode)REQUIRE(Raster(d,mode)==0);
+    for(int mode=1;mode<=3;++mode)REQUIRE(Raster(d,mode,true)==0);
     na::observe::SetShaderOperationHook(na::observe::ShaderLane::Bindings,{});na_observe_stop();
     if(info)for(UINT64 i=0;i<info->GetNumStoredMessages();++i){SIZE_T n=0;info->GetMessage(i,nullptr,&n);std::vector<uint8_t> data(n);
         auto* m=reinterpret_cast<D3D12_MESSAGE*>(data.data());if(SUCCEEDED(info->GetMessage(i,m,&n))&&m->Severity<=D3D12_MESSAGE_SEVERITY_ERROR){

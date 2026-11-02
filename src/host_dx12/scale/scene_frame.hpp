@@ -11,6 +11,7 @@ struct FrameMemberState {
     // Only history members are seeded from the previous full-size native image.
     bool seed_history = false;
     // The seed boundary can have a different native state from the finish boundary.
+    // Also required for D32S8 stencil initialization, even without colour history.
     D3D12_RESOURCE_STATES seed_state = static_cast<D3D12_RESOURCE_STATES>(~0u);
 };
 struct FrameSpec {
@@ -25,6 +26,8 @@ struct FrameSpec {
 class SceneFrame : public std::enable_shared_from_this<SceneFrame> {
 public:
     static std::shared_ptr<SceneFrame> Create(ID3D12Device*, FrameSpec, std::string&);
+    // Call once before the first private scene operation: initializes histories
+    // and the inherited stencil plane. Repeated calls are harmless.
     bool SeedHistories(ID3D12GraphicsCommandList*);
     void Written(uint64_t member);
     void Ready();
@@ -43,12 +46,15 @@ private:
         std::shared_ptr<const ColorRestore> color, seed;
         std::shared_ptr<const DepthRestore> depth;
         Microsoft::WRL::ComPtr<ID3D12Resource> plane;
+        Microsoft::WRL::ComPtr<ID3D12Resource> stencil_small, stencil_full;
+        std::shared_ptr<const ColorRestore> stencil, seed_stencil;
         bool written = false;
     };
     FrameSpec spec_;
     std::vector<Promotion> promotions_;
+    void Stencil(ID3D12GraphicsCommandList*,Promotion&,bool seed);
     std::mutex mutex_;
-    bool dirty_ = false, ready_ = false, finished_ = false;
+    bool dirty_ = false, ready_ = false, finished_ = false, seeded_ = false;
     na::j2::PhysicalOutcome outcome_ = na::j2::PhysicalOutcome::Unavailable;
 };
 

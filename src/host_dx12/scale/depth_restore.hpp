@@ -28,7 +28,8 @@ private:
     Extent input_{}, output_{};
     bool color_ = false;
 };
-// Full-output spatial bypass for a reduced scene; explicitly not DLSS. Setup,
+// Full-output spatial bypass for a reduced scene; explicitly not DLSS. R8_UINT
+// uses integer point loads for stencil plane scaling; colour uses linear filtering. Setup,
 // resource-state, restoration and recording-lifetime rules match DepthRestore.
 class ColorRestore {
 public:

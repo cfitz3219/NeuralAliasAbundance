@@ -1,11 +1,16 @@
 #include "scene_frame.hpp"
 #include "host_dx12/observe/producers.hpp"
+#include "host_dx12/depth_format.hpp"
 #include <algorithm>
 namespace na::scale {
 namespace {
-void transition(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b) {
+void transition(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b,UINT sub=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) {
     if(a==b)return;D3D12_RESOURCE_BARRIER x{};x.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    x.Transition={r,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,a,b};l->ResourceBarrier(1,&x);
+    x.Transition={r,sub,a,b};l->ResourceBarrier(1,&x);
+}
+void copy(ID3D12GraphicsCommandList* l,ID3D12Resource* src,UINT ss,ID3D12Resource* dst,UINT ds) {
+    D3D12_TEXTURE_COPY_LOCATION a{},b{};a.pResource=src;a.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;a.SubresourceIndex=ss;
+    b.pResource=dst;b.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;b.SubresourceIndex=ds;l->CopyTextureRegion(&b,0,0,0,&a,nullptr);
 }
 }
 std::shared_ptr<SceneFrame> SceneFrame::Create(ID3D12Device* dev,FrameSpec spec,std::string& error) {
@@ -29,13 +34,26 @@ std::shared_ptr<SceneFrame> SceneFrame::Create(ID3D12Device* dev,FrameSpec spec,
             return fail("frame promotion needs resolved plain scene members");
         Promotion x;x.state=state;x.member=m;
         if(m->role==Role::Depth) {
-            if(d.Format!=DXGI_FORMAT_D32_FLOAT&&d.Format!=DXGI_FORMAT_R32_TYPELESS)
+            if(!na::depth::PlaneZeroCopiesToR32F(d.Format))
                 return fail("frame depth promotion currently requires the identified 32-bit plane");
             D3D12_RESOURCE_DESC plane=d;plane.Format=DXGI_FORMAT_R32_FLOAT;plane.Flags=D3D12_RESOURCE_FLAG_NONE;
             D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;
             if(FAILED(dev->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&plane,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&x.plane))))
                 return fail("frame depth plane allocation failed");
             x.depth=DepthRestore::Create(dev,x.plane.Get(),m->native.Get(),0,error);if(!x.depth)return {};
+            D3D12_FEATURE_DATA_FORMAT_INFO fi{d.Format};
+            if(FAILED(dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO,&fi,sizeof fi)))return fail("frame depth plane count unavailable");
+            if(fi.PlaneCount==2) {
+                if(state.seed_state==static_cast<D3D12_RESOURCE_STATES>(~0u))return fail("stencil initialization needs its actual native entry state");
+                plane.Format=DXGI_FORMAT_R8_UINT;plane.Flags=D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+                if(FAILED(dev->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&plane,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&x.stencil_small))))
+                    return fail("frame reduced stencil plane allocation failed");
+                plane.Width=m->native_desc.Width;plane.Height=m->native_desc.Height;
+                if(FAILED(dev->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&plane,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&x.stencil_full))))
+                    return fail("frame full stencil plane allocation failed");
+                x.stencil=ColorRestore::Create(dev,x.stencil_small.Get(),x.stencil_full.Get(),0,DXGI_FORMAT_R8_UINT,error);if(!x.stencil)return {};
+                x.seed_stencil=ColorRestore::Create(dev,x.stencil_full.Get(),x.stencil_small.Get(),0,DXGI_FORMAT_R8_UINT,error);if(!x.seed_stencil)return {};
+            }
         } else {
             x.color=ColorRestore::Create(dev,m->reduced.Get(),m->native.Get(),0,d.Format,error);if(!x.color)return {};
         }
@@ -49,16 +67,38 @@ std::shared_ptr<SceneFrame> SceneFrame::Create(ID3D12Device* dev,FrameSpec spec,
 }
 bool SceneFrame::SeedHistories(ID3D12GraphicsCommandList* l) {
     const na::observe::HostWorkScope host;
-    if(!l||!na::observe::ListStateRestorable(l))return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if(seeded_)return true;
+    if(!l||!na::observe::ListRasterStateRestorable(l))return false;
     if(!na::nr::native::RetainRecording(l,shared_from_this()))return false;
-    for(auto& x:promotions_)if(x.seed) {
+    for(auto& x:promotions_) {
+      if(x.seed) {
         transition(l,x.member->native.Get(),x.state.seed_state,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         transition(l,x.member->reduced.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_RENDER_TARGET);
         x.seed->Record(l);
         transition(l,x.member->reduced.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COMMON);
         transition(l,x.member->native.Get(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,x.state.seed_state);
+      }
+      if(x.seed_stencil)Stencil(l,x,true);
     }
-    return na::observe::RestoreListState(l);
+    seeded_=na::observe::RestoreListState(l);return seeded_;
+}
+void SceneFrame::Stencil(ID3D12GraphicsCommandList* l,Promotion& x,bool seed) {
+    auto* source=seed?x.member->native.Get():x.member->reduced.Get();
+    auto* target=seed?x.member->reduced.Get():x.member->native.Get();
+    auto* a=seed?x.stencil_full.Get():x.stencil_small.Get();auto* b=seed?x.stencil_small.Get():x.stencil_full.Get();
+    const auto ss=seed?x.state.seed_state:D3D12_RESOURCE_STATE_COMMON;
+    const auto ts=seed?D3D12_RESOURCE_STATE_COMMON:D3D12_RESOURCE_STATE_DEPTH_READ;
+    transition(l,source,ss,D3D12_RESOURCE_STATE_COPY_SOURCE,1);transition(l,a,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
+    copy(l,source,1,a,0);transition(l,source,D3D12_RESOURCE_STATE_COPY_SOURCE,ss,1);
+    transition(l,a,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    transition(l,b,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_RENDER_TARGET);
+    (seed?x.seed_stencil:x.stencil)->Record(l);
+    transition(l,a,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+    transition(l,b,D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_SOURCE);
+    transition(l,target,ts,D3D12_RESOURCE_STATE_COPY_DEST,1);copy(l,b,0,target,1);
+    transition(l,target,D3D12_RESOURCE_STATE_COPY_DEST,seed?ts:x.state.native_state,1);
+    transition(l,b,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
 }
 void SceneFrame::Written(uint64_t member) {
     std::lock_guard<std::mutex> lock(mutex_);if(finished_)return;
@@ -98,9 +138,13 @@ bool SceneFrame::Finish(ID3D12GraphicsCommandList* l) {
             dst.pResource=x.plane.Get();dst.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;l->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
             transition(l,reduced,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
             transition(l,x.plane.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            transition(l,native,x.state.native_state,D3D12_RESOURCE_STATE_DEPTH_WRITE);x.depth->Record(l);
-            transition(l,native,D3D12_RESOURCE_STATE_DEPTH_WRITE,x.state.native_state);
+            const UINT depth_sub=x.stencil?0:D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            transition(l,native,x.state.native_state,D3D12_RESOURCE_STATE_DEPTH_WRITE,depth_sub);
+            if(x.stencil)transition(l,native,x.state.native_state,D3D12_RESOURCE_STATE_DEPTH_READ,1);
+            x.depth->Record(l);
+            transition(l,native,D3D12_RESOURCE_STATE_DEPTH_WRITE,x.state.native_state,depth_sub);
             transition(l,x.plane.Get(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+            if(x.stencil)Stencil(l,x,false);
         } else {
             transition(l,reduced,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             transition(l,native,x.state.native_state,D3D12_RESOURCE_STATE_RENDER_TARGET);x.color->Record(l);
