@@ -178,7 +178,7 @@ int main(int argc, char** argv)
     { ID3D12CommandList* ls[] = {l.list.Get()}; d.queue->ExecuteCommandLists(1, ls); }
     d.WaitIdle();
 
-    enum Mode { kSingle, kPredicated, kUnpredicated };
+    enum Mode { kSingle, kPredicated, kUnpredicated, kOnOnly, kOffSameColor, kOffNoLaterOn };
     bool color_in_srv = false, all_ok = true;
     const auto run = [&](Mode mode, std::vector<float>& out) -> bool {
         const uint32_t kFrames = 64;
@@ -214,16 +214,24 @@ int main(int argc, char** argv)
             e.reset = i == 0;
             e.quality = na::dlss::Quality::DLAA;
             bool ok = true;
-            if (mode != kSingle) { // the early, wrong candidate (a half-drawn picture)
-                if (mode == kPredicated) l.list->SetPredication(pred.Get(), 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
-                e.color = grey.Get();
+            // Isolation variants (informational): which part changes DLSS?
+            //   kOnOnly        only the predicated-ON real evaluate (no early candidate)
+            //   kOffSameColor  the early candidate sees the CORRECT picture: a difference then
+            //                  comes from state outside the GPU data (CPU side), not the pixels
+            //   kOffNoLaterOn  early candidate predicated off, real evaluate NOT predicated
+            const bool early = mode == kPredicated || mode == kUnpredicated || mode == kOffSameColor || mode == kOffNoLaterOn;
+            const bool early_pred = mode != kUnpredicated;
+            const bool real_pred = mode == kPredicated || mode == kOnOnly || mode == kOffSameColor;
+            if (early) {
+                if (early_pred) l.list->SetPredication(pred.Get(), 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+                e.color = mode == kOffSameColor ? color.Get() : grey.Get();
                 ok = na::dlss::Evaluate(l.list.Get(), e) && ok;
-                if (mode == kPredicated) l.list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+                if (early_pred) l.list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
             }
-            if (mode == kPredicated) l.list->SetPredication(pred.Get(), 8, D3D12_PREDICATION_OP_EQUAL_ZERO);
+            if (real_pred) l.list->SetPredication(pred.Get(), 8, D3D12_PREDICATION_OP_EQUAL_ZERO);
             e.color = color.Get();
             ok = na::dlss::Evaluate(l.list.Get(), e) && ok;
-            if (mode == kPredicated) l.list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+            if (real_pred) l.list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
             if (!ok) {
                 std::printf("FAIL evaluate mode %d frame %u: %s\n", static_cast<int>(mode), i, na::dlss::GetStats().reason);
                 return false;
@@ -258,9 +266,17 @@ int main(int argc, char** argv)
         rb->Unmap(0, &none);
         return true;
     };
-    std::vector<float> a, b, c, a2;
-    all_ok = run(kSingle, a) && run(kPredicated, b) && run(kUnpredicated, c) && run(kSingle, a2);
+    std::vector<float> a, b, c, a2, on_only, same_color, off_plain;
+    all_ok = run(kSingle, a) && run(kPredicated, b) && run(kUnpredicated, c) && run(kSingle, a2) &&
+             run(kOnOnly, on_only) && run(kOffSameColor, same_color) && run(kOffNoLaterOn, off_plain);
     REQUIRE(all_ok);
+    {
+        const Diff d1 = Compare(a, on_only), d2 = Compare(a, same_color), d3 = Compare(a, off_plain), d4 = Compare(b, same_color);
+        std::printf("isolate on-only        A vs D: max %.6f mean %.8f (real evaluate predicated ON, nothing else)\n", d1.max, d1.mean);
+        std::printf("isolate off-same-color A vs E: max %.6f mean %.8f (early candidate sees the correct picture)\n", d2.max, d2.mean);
+        std::printf("isolate off-plain-real A vs F: max %.6f mean %.8f (early off, real evaluate not predicated)\n", d3.max, d3.mean);
+        std::printf("isolate B vs E               : max %.6f mean %.8f (0 = the early candidate's pixels do not matter)\n", d4.max, d4.mean);
+    }
     const Diff noise = Compare(a, a2), planned = Compare(a, b), control = Compare(a, c);
     std::printf("noise floor   A vs A2: max %.6f mean %.8f\n", noise.max, noise.mean);
     std::printf("planned       A vs B : max %.6f mean %.8f (predicated-off wrong evaluate, then predicated-on real one)\n",
