@@ -226,6 +226,11 @@ struct Stats {
     uint64_t inline_moved_later = 0;      // ... where the first (trigger) candidate was too early
     uint64_t inline_candidates_full = 0;  // a further possible end found with all candidates in use
     uint32_t inline_last_count = 0;       // candidates in the last submitted scene recording
+    uint64_t inline_withheld = 0;         // scene lists submitted with candidates but no consumer after the last write: not the end
+    uint64_t inline_withheld_rejected = 0; // ... because the exact candidate's pattern is known mid-scene
+    uint64_t inline_withheld_missed = 0;  // frames with a withheld list and then no DLAA at all (a miss, not a misfire)
+    uint64_t inline_superseded = 0;       // lists with candidates submitted after the frame was already taken
+    uint32_t inline_last_consumers = 0;   // consumers after the final write in the last chosen list
     uint64_t boundary_any_matched = 0;    // first candidates at a scene boundary whose writer/ordinal differed from the learned one
     uint64_t inline_relaxed_rejects[3] = {}; // ... by what differed: writer, occurrence, transition/candidate ordinal
     uint64_t between_observed = 0, between_predicted = 0; // between-list placements before an observed reader / after a predicted last scene list

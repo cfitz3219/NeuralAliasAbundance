@@ -39,9 +39,9 @@ using Microsoft::WRL::ComPtr;
 namespace na::j2 {
 namespace {
 
-constexpr uint32_t kRing = 24;           // recordings in flight before a slot is reused (never waited on):
-                                         // up to kMaxCandidates per frame (exact inline placement)
-constexpr uint32_t kMaxCandidates = 6;   // predicated inline DLAA candidates in one scene recording
+constexpr uint32_t kRing = 48;           // candidate recordings in flight before a slot is reused (never waited on):
+                                         // up to kMaxCandidates per frame over several scene lists (exact inline placement)
+constexpr uint32_t kMaxCandidates = 16;  // predicated inline DLAA candidates pending at once (all scene lists of a frame)
 constexpr uint32_t kBlockBytes = 512;    // root CBVs have no size: read this much (the producer's own bound)
 constexpr size_t kMaxBlocks = 256;       // unique constant blocks examined per frame (until the camera slot is learned)
 constexpr uint32_t kMaxBlockRead = 1024; // bytes read from one constant buffer
@@ -192,10 +192,12 @@ struct State {
         // What placed this candidate (credited/blamed only if it is the one that runs).
         uint32_t mode = 0;
         bool by_class = false, at_barrier = false;
+        bool rejected = false; // the profile knows this pattern as mid-scene (recorded anyway as a later candidate)
         na::j2::ClassKey cls;
         uint64_t producer = 0, context = 0;
     } inl[kMaxCandidates];
-    uint32_t inl_n = 0; // candidates of the pending recording (all in one list/recording, one frame)
+    uint32_t inl_n = 0; // pending candidates: several scene recordings of one frame (parallel recording) can each hold some
+    uint64_t withheld_frame = 0; // last frame in which a list's candidates were withheld (not the frame's end)
     ComPtr<ID3D12Resource> pred; // upload, one 8-byte predicate per ring slot (GENERIC_READ includes PREDICATION)
     uint64_t* pred_cpu = nullptr;
     int64_t camera_offset = -1; // learned offset of the ViewProjection inside its block
@@ -610,6 +612,18 @@ void discard_inline(bool switched_off = false)
         g.inl[i].history.capture = 0;
     }
     g.inl_n = 0;
+}
+// Removes the candidates of one recording (their predicates already 0 for this submission).
+void withdraw_recording(const void* list, uint64_t rec)
+{
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < g.inl_n; ++i) {
+        auto& c = g.inl[i];
+        if (c.list == list && c.rec == rec) { na::capture::j2::Withdraw(c.history.capture); c.history.capture = 0; continue; }
+        if (n != i) g.inl[n] = c;
+        ++n;
+    }
+    g.inl_n = n;
 }
 void apply_route_locked(ID3D12CommandQueue* queue)
 {
@@ -1872,12 +1886,19 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     // A later possible end in the SAME recording as this frame's first candidate: more scene
     // content was drawn since the previous candidate, so the previous one may have been too
     // early. Record another (predicated) candidate; submission picks the exact one.
-    const bool later = g.inl_n && g.inl[0].frame == g.frame;
+    // Scene lists may be recorded in parallel (SE5: 5-7 per frame): each recording keeps its own
+    // candidates; submission decides per list, in submission order.
+    int last_here = -1; // this recording's newest candidate
+    bool stale = false;  // a candidate of an earlier frame was never submitted (a real stall)
+    for (uint32_t i = 0; i < g.inl_n; ++i) {
+        if (g.inl[i].frame != g.frame) stale = true;
+        else if (g.inl[i].list == l && g.inl[i].rec == rec) last_here = static_cast<int>(i);
+    }
+    const bool later = last_here >= 0;
     if (later) {
-        if (g.inl[0].list != l || g.inl[0].rec != rec) return; // one scene recording per frame
-        if (current.writes <= g.inl[g.inl_n - 1].writes) return; // nothing new since the last candidate
-        if (g.inl_n == kMaxCandidates) { ++g.stats.inline_candidates_full; return; }
-    } else if (g.inl_frame == g.frame) return; // this frame's candidates were already released
+        if (current.writes <= g.inl[last_here].writes) return; // nothing new since this recording's last candidate
+    }
+    if (g.inl_n == kMaxCandidates) { ++g.stats.inline_candidates_full; return; }
     const auto& learned = g.insertion_learned;
     // Role-class trigger (placement design): at the ACTUAL consumer (draw/dispatch/copy),
     // fire when its class is accepted by the profile. A class known to be a temporary
@@ -1889,6 +1910,7 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     na::j2::ClassKey live_class;
     uint64_t live_producer = 0, live_context = 0;
     bool fired_at_barrier = false; // the event being judged is a barrier (whichever trigger fires)
+    bool rejected_pattern = false; // the profile knows this consumer/barrier pattern as mid-scene
     {
         const auto live = na::observe::ListLiveConsumer(l, color_id);
         // An MSAA depth resolve draws (render target, viewport, topology), which the state
@@ -1910,6 +1932,7 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
             // A learned mid-scene read cannot START a frame's candidates; a later candidate is
             // recorded anyway (submission decides with the complete list, not the profile).
             if (v == V::Rejected && !later) { ++g.stats.barrier_vetoes; return; }
+            if (v == V::Rejected) rejected_pattern = true;
             // Ambiguous (the pattern was seen both mid-scene and at completion, and the
             // context does not separate them): the boundary matcher below is the
             // distinguishing check: it fires only when the writer pipeline, its
@@ -1925,6 +1948,7 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
             using V = na::j2::ConsumerProfile::Verdict;
             const V v = g.profile.Judge(live_class, live_producer);
             if (v == V::Rejected && !later) { ++g.stats.class_rejected_skips; return; }
+            if (v == V::Rejected) rejected_pattern = true;
             if (v == V::Accepted || v == V::AcceptedWithProducer) {
                 by_class = true;
                 matched_mode = v == V::Accepted ? kByClass : kByPair;
@@ -1940,7 +1964,7 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     if (later) {
         // A later candidate needs no trigger match: submission decides with the complete list.
     } else if (by_class) {
-        if (g.inl_n) {
+        if (stale) {
             ++g.stats.inline_waited;
             ++g.stats.inline_rejects[Stats::kRejPending];
             if (!g.frame_rejects++)
@@ -1978,7 +2002,7 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     if (rej == S::kRejCount && current.pipeline != learned.decision.pipeline) rej = S::kRejPipeline;
     if (rej == S::kRejCount && relaxed) matched_mode = kByBoundaryAny;
     if (rej == S::kRejCount) g.stats.inline_target = learned.decision.final_candidate;
-    if (rej == S::kRejCount && g.inl_n) rej = S::kRejPending; // the previous recording was never submitted (a real stall)
+    if (rej == S::kRejCount && stale) rej = S::kRejPending; // an earlier frame's recording was never submitted (a real stall)
     if (rej != S::kRejCount) {
         ++g.stats.inline_waited;
         ++g.stats.inline_rejects[rej];
@@ -2019,10 +2043,11 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
         reason("Skipped: the previous use of this frame slot is still running.");
         return;
     }
-    // A later candidate exists only because the scene was written after every earlier one,
-    // so none of those can be chosen any more (choose_inline): their capture slots go back.
+    // A later candidate exists only because this recording wrote the scene after every earlier
+    // one of its own, so none of those can be chosen any more: their capture slots go back.
     if (later)
-        for (uint32_t k = 0; k < g.inl_n; ++k) { na::capture::j2::Withdraw(g.inl[k].history.capture); g.inl[k].history.capture = 0; }
+        for (uint32_t k = 0; k < g.inl_n; ++k)
+            if (g.inl[k].list == l && g.inl[k].rec == rec) { na::capture::j2::Withdraw(g.inl[k].history.capture); g.inl[k].history.capture = 0; }
     // Every command of this candidate runs only if submission switches its predicate on.
     // The game's own predication is not active here (ListStateRestorable), so clearing it after is exact.
     g.pred_cpu[slot] = 0;
@@ -2050,6 +2075,7 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     c.mode = later ? 6u : matched_mode; // 6: a later candidate (no trigger)
     c.by_class = !later && by_class;
     c.at_barrier = fired_at_barrier;
+    c.rejected = rejected_pattern;
     c.cls = live_class;
     c.producer = live_producer;
     c.context = live_context;
@@ -2063,15 +2089,39 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     else ++g.stats.legacy_matched;
 }
 
+bool has_candidates(const void* list)
+{
+    for (uint32_t k = 0; k < g.inl_n; ++k) if (g.inl[k].list == list) return true;
+    return false;
+}
 // Exact placement at submission: the first candidate after the recording's final colour
 // write. None (the last write has no read after it in this list) -> the last candidate,
 // which has the fewest late writes (the behaviour before exact placement).
-uint32_t choose_inline(uint32_t total_writes, bool* exact)
+// kNotTheEnd: the list ends at a bare barrier after its last write and nothing in it consumed
+// the picture (SE5 pan run 2026-11-02: 5-7 scene lists per frame, each ending that way; 31 of
+// 36 misfires were a candidate in such a list, the scene continuing in the next list). No
+// candidate of this list runs; the frame stays open for the next scene list's candidates (or
+// the between-list fallback).
+// Also kNotTheEnd when the exact candidate's pattern is one the profile knows as mid-scene
+// (recorded as a later candidate): the frames that taught that saw the scene continue after it.
+constexpr uint32_t kNotTheEnd = ~0u;
+uint32_t choose_inline(const void* list, uint64_t rec, const na::j2::InsertionDecision& d, bool* exact, uint32_t* why)
 {
     *exact = false;
-    for (uint32_t i = 0; i < g.inl_n; ++i)
-        if (g.inl[i].writes >= total_writes) { *exact = true; return i; }
-    return g.inl_n - 1;
+    *why = 0;
+    int last = -1;
+    for (uint32_t i = 0; i < g.inl_n; ++i) {
+        const auto& c = g.inl[i];
+        if (c.list != list || c.rec != rec) continue;
+        last = static_cast<int>(i);
+        if (c.writes >= d.writes) {
+            *exact = true;
+            if (!d.final_consumers) { *why = 1; return kNotTheEnd; }
+            if (c.rejected) { *why = 2; return kNotTheEnd; }
+            return i;
+        }
+    }
+    return last < 0 ? kNotTheEnd : static_cast<uint32_t>(last);
 }
 
 // Inline and between-list are complementary opportunities in the SAME frame.
@@ -2210,6 +2260,7 @@ void OnPresent(ID3D12CommandQueue* queue)
             na::capture::j2::OnFrameClosed(g.frame, late - g.route_prev_late); // evidence capture identity
             o.camera_missed = g.stats.no_camera > g.route_prev_no_camera;
             o.depth_state_missed = g.stats.no_state > g.route_prev_no_state;
+            if (!o.executed && g.withheld_frame == g.frame) ++g.stats.inline_withheld_missed; // candidates withheld, no later list took the frame
             if (!o.executed && g.stats.frames) { // a present without DLAA, once DLAA has run at all: why
                 if (o.camera_missed) ++g.stats.miss_no_camera;
                 else if (o.depth_state_missed) ++g.stats.miss_no_state;
@@ -2414,10 +2465,11 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         }
         if ((decision.writes || decision.all_reads) && g.insertion_trace_used < sizeof g.insertion_trace - 160) {
             const int n = std::snprintf(g.insertion_trace + g.insertion_trace_used, sizeof g.insertion_trace - g.insertion_trace_used,
-                " L%llu:w%u/r%u/f%u/d%llu/p%llu/b%llu:%u%s", (unsigned long long)id, decision.writes,
-                decision.all_reads, decision.final_candidate, (unsigned long long)decision.destination,
+                " L%llu:w%u/r%u/f%u/c%u/t%u/d%llu/p%llu/b%llu:%u%s", (unsigned long long)id, decision.writes,
+                decision.all_reads, decision.final_candidate, decision.final_consumers, decision.transitions,
+                (unsigned long long)decision.destination,
                 (unsigned long long)decision.pipeline, (unsigned long long)decision.boundary_writer,
-                decision.writer_occurrence, g.inl_n && g.inl[0].list == lists[i] ? "*" : "");
+                decision.writer_occurrence, has_candidates(lists[i]) ? "*" : "");
             if (n > 0) g.insertion_trace_used += static_cast<size_t>(n);
         }
         if (!na::observe::ListRendersTo(lists[i], selected_color, selected_depth)) continue;
@@ -2448,21 +2500,67 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         bool after = g.submitted_frame == g.frame;
         bool has = false;
         uint32_t chosen = 0;
+        const void* chosen_list = nullptr;
+        uint64_t chosen_rec = 0;
+        // Ring slots whose (switched-off) commands are in this submission: reusable only after it.
+        uint32_t touched[kMaxCandidates];
+        uint32_t touched_n = 0;
+        const auto touch_recording = [&](const void* list, uint64_t rec) {
+            for (uint32_t k = 0; k < g.inl_n; ++k)
+                if (g.inl[k].list == list && g.inl[k].rec == rec && touched_n < kMaxCandidates) touched[touched_n++] = g.inl[k].slot;
+        };
+        // Decide per list, in submission order, before forwarding: the whole recording is known now.
         for (UINT i = 0; i < count; ++i) {
             if (!lists[i]) continue;
             const auto d = na::observe::ListInsertionDecision(lists[i], selected_color);
-            if (g.inl_n && !has && lists[i] == g.inl[0].list && na::observe::ListRecording(lists[i]) == g.inl[0].rec) {
-                // The whole recording is known now: switch on exactly one candidate, before forwarding.
+            const uint64_t rec_i = na::observe::ListRecording(lists[i]);
+            bool mine = false;
+            for (uint32_t k = 0; k < g.inl_n && !mine; ++k) mine = g.inl[k].list == lists[i] && g.inl[k].rec == rec_i;
+            if (mine && !after) {
                 bool exact = false;
-                chosen = choose_inline(d.writes, &exact);
-                for (uint32_t k = 0; k < g.inl_n; ++k) g.pred_cpu[g.inl[k].slot] = k == chosen ? 1u : 0u;
+                uint32_t why = 0;
+                const uint32_t pick = choose_inline(lists[i], rec_i, d, &exact, &why);
+                if (pick == kNotTheEnd) {
+                    // Not the frame's end: nothing in this list consumed the picture after its last
+                    // write (why 1), or the exact candidate's pattern is known mid-scene (why 2).
+                    // Its candidates stay switched off; a later scene list of this frame decides,
+                    // else the between-list path.
+                    for (uint32_t k = 0; k < g.inl_n; ++k) if (g.inl[k].list == lists[i] && g.inl[k].rec == rec_i) g.pred_cpu[g.inl[k].slot] = 0;
+                    touch_recording(lists[i], rec_i);
+                    withdraw_recording(lists[i], rec_i);
+                    g.inl_frame = 0;
+                    ++g.stats.inline_withheld;
+                    if (why == 2) ++g.stats.inline_withheld_rejected;
+                    g.withheld_frame = g.frame;
+                    continue;
+                }
+                uint32_t n_here = 0, before_chosen = 0;
+                for (uint32_t k = 0; k < g.inl_n; ++k) {
+                    if (g.inl[k].list != lists[i] || g.inl[k].rec != rec_i) continue;
+                    g.pred_cpu[g.inl[k].slot] = k == pick ? 1u : 0u;
+                    ++n_here;
+                    if (k < pick) ++before_chosen;
+                }
                 if (exact) ++g.stats.inline_exact;
-                if (chosen) ++g.stats.inline_moved_later; // the first (trigger) candidate was too early
-                g.stats.inline_last_count = g.inl_n;
-                const auto& c = g.inl[chosen];
+                if (before_chosen) ++g.stats.inline_moved_later; // the first (trigger) candidate was too early
+                g.stats.inline_last_count = n_here;
+                g.stats.inline_last_consumers = d.final_consumers;
+                const auto& c = g.inl[pick];
                 if (d.writes > c.writes) { g.stats.inline_late_writes += d.writes - c.writes; note_late_writer(lists[i], selected_color, c.writes, 1, d.writes - c.writes); }
+                chosen = pick; chosen_list = lists[i]; chosen_rec = rec_i;
+                touch_recording(lists[i], rec_i);
                 has = after = true;
-            } else if (after) { g.stats.inline_late_writes += d.writes; if (d.writes) note_late_writer(lists[i], selected_color, 0, 2, d.writes); }
+            } else {
+                if (mine) {
+                    // A list with candidates after the frame was already taken (an earlier list in
+                    // submission order): they never run.
+                    for (uint32_t k = 0; k < g.inl_n; ++k) if (g.inl[k].list == lists[i] && g.inl[k].rec == rec_i) g.pred_cpu[g.inl[k].slot] = 0;
+                    touch_recording(lists[i], rec_i);
+                    withdraw_recording(lists[i], rec_i);
+                    ++g.stats.inline_superseded;
+                }
+                if (after) { g.stats.inline_late_writes += d.writes; if (d.writes) note_late_writer(lists[i], selected_color, 0, 2, d.writes); }
+            }
         }
         // Inline mode: no J2 list is inserted; DLAA is already inside the game's list.
         // Its history is committed when that list is actually submitted.
@@ -2504,9 +2602,16 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         }
         lock.unlock();
         forward(queue, count, lists);
-        if (!has) return;
+        if (!has && !touched_n) return;
         lock.lock();
-        if (chosen >= g.inl_n) { discard_inline(); return; } // released while unlocked (route change)
+        UINT64 fv = 0;
+        if (touched_n) { // every candidate recorded in this submission, switched on or off, holds its slot until it completes
+            fv = g.fence_next++;
+            for (uint32_t k = 0; k < touched_n; ++k) g.slots[touched[k]].fence_value = fv;
+            queue->Signal(g.fence.Get(), fv);
+        }
+        if (!has) return;
+        if (chosen >= g.inl_n || g.inl[chosen].list != chosen_list || g.inl[chosen].rec != chosen_rec) { discard_inline(); return; } // released while unlocked (route change)
         auto& c = g.inl[chosen];
         g.tracker = c.history.tracker;
         g.submitted_frame = g.frame;
@@ -2516,10 +2621,6 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         ++g.stats.inline_frames;
         if (g.stats.inline_jitter_x != 0 || g.stats.inline_jitter_y != 0) ++g.stats.inline_jittered;
         g.stats.active = true;
-        // Every candidate's commands (even switched off) and its predicate are in this submission.
-        const UINT64 fv = g.fence_next++;
-        for (uint32_t k = 0; k < g.inl_n; ++k) g.slots[g.inl[k].slot].fence_value = fv;
-        queue->Signal(g.fence.Get(), fv);
         na::capture::j2::Submitted(c.history.capture, queue, g.stats.submissions);
         c.history.capture = 0;
         na::j2::compute_flow::Committed(c.history.compute_flow);
@@ -2530,7 +2631,9 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         g.fired_class = c.cls;
         g.fired_producer = c.producer;
         g.fired_context = c.context;
-        discard_inline(true); // the others never ran (predicate 0 in this submission); their captures are free again
+        c.history.capture = 0;
+        withdraw_recording(chosen_list, chosen_rec); // the others of this recording never ran (predicate 0 in this submission)
+        // Candidates of other recordings of this frame still pending: they will be superseded at their submission.
         reason("Live DLAA is running inside the game's scene list (post-processing shares it).");
         return;
     }

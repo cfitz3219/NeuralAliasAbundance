@@ -797,12 +797,14 @@ void write_status_line()
         }
         {   // Exact inline placement: candidates per scene recording, and how often the trigger was early.
             char el[256];
-            const int en = snprintf(el, sizeof el, "j2_exact frames=%llu exact=%llu moved_later=%llu later_candidates=%llu full=%llu last_count=%u late_writes=%llu any_boundary=%llu relaxed{writer=%llu occ=%llu ordinal=%llu}\r\n",
+            const int en = snprintf(el, sizeof el, "j2_exact frames=%llu exact=%llu moved_later=%llu later_candidates=%llu full=%llu last_count=%u late_writes=%llu any_boundary=%llu relaxed{writer=%llu occ=%llu ordinal=%llu} withheld=%llu/rejected=%llu/missed=%llu superseded=%llu last_consumers=%u\r\n",
                 (unsigned long long)j2.inline_frames, (unsigned long long)j2.inline_exact, (unsigned long long)j2.inline_moved_later,
                 (unsigned long long)j2.inline_later_candidates, (unsigned long long)j2.inline_candidates_full, j2.inline_last_count,
                 (unsigned long long)j2.inline_late_writes, (unsigned long long)j2.boundary_any_matched,
                 (unsigned long long)j2.inline_relaxed_rejects[0], (unsigned long long)j2.inline_relaxed_rejects[1],
-                (unsigned long long)j2.inline_relaxed_rejects[2]);
+                (unsigned long long)j2.inline_relaxed_rejects[2], (unsigned long long)j2.inline_withheld,
+                (unsigned long long)j2.inline_withheld_rejected, (unsigned long long)j2.inline_withheld_missed,
+                (unsigned long long)j2.inline_superseded, j2.inline_last_consumers);
             if (en > 0) WriteFile(f, el, static_cast<DWORD>((std::min)(en, static_cast<int>(sizeof(el) - 1))), &written, nullptr);
         }
         {   // Why carried resource states are lost (SE5 depth no_state: ambiguous_queue_order).

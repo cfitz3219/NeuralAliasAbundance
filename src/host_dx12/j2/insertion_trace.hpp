@@ -95,6 +95,10 @@ struct InsertionDecision {
     uint64_t boundary_writer = 0;
     uint32_t writer_occurrence = 0;
     uint32_t derived_reads = 0; // reads of textures copied from the colour this frame
+    // Actual consumers (draw/dispatch/copy, not barriers) of the colour after its LAST write in
+    // this recording. 0 with writes: the list ended at a bare barrier, nobody used the picture
+    // yet (SE5 spreads one scene over 5-7 lists, each ending that way; only the last has reads).
+    uint32_t final_consumers = 0;
 };
 // A write or an actual consumer of the selected colour, in recording order (frame labelling).
 struct ColorEvent {
@@ -130,9 +134,11 @@ public:
                 result.destination = result.pipeline = 0;
                 result.boundary_writer = 0;
                 result.writer_occurrence = 0;
+                result.final_consumers = 0;
             } else if (result.writes && event.destination != color) {
                 const uint32_t occurrence = event.pipeline == UINT64_MAX ? ++writer_reads[writer] : 0;
                 ++result.candidates;
+                if (event.pipeline != UINT64_MAX) ++result.final_consumers;
                 // First downstream read after the LAST scene write, not last read:
                 // later reads can already be HUD/compositing on processed content.
                 if (!result.final_candidate) {

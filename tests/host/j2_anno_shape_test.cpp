@@ -514,7 +514,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         fake::gpu_log_entries = kLog;
     }
     const auto ran = [&](int k) { return log_cpu && k < kLog && log_cpu[k] == 0xC0DE000000000000ull + k; };
-    int ran_wrong = 0, frames_with_extra = 0, extra_runs_checked = 0;
+    int ran_wrong = 0, frames_with_extra = 0, extra_runs_checked = 0, early_list_candidates = 0;
     const auto frame = [&](double cam_x, bool unpatched_prepass = false) {
         // Copy case: every 4th frame the LAST scene write comes from a different pipeline
         // (another object drawn last). The boundary matcher keys on the final writer, so it
@@ -532,6 +532,22 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             scene2.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
             const float early[4] = {0, 0, 0, 1};
             scene2.list->ClearRenderTargetView(rtv, early, 0, nullptr);
+            if (inline_segments) {
+                // SE5: every mid-frame scene list ends with a bare barrier to a readable state and
+                // a table binding the colour, but nothing in the list consumes it. That looks like
+                // a scene end; the exact placement must not run DLAA here (withheld), because the
+                // scene continues in the NEXT list.
+                D3D12_RESOURCE_BARRIER to_read = test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                scene2.list->ResourceBarrier(1, &to_read);
+                ID3D12DescriptorHeap* ph0[] = {post_heap.Get()};
+                scene2.list->SetDescriptorHeaps(1, ph0);
+                scene2.list->SetGraphicsRootSignature(post_root.Get());
+                const int before_bind = fake::evals;
+                scene2.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart());
+                early_list_candidates += fake::evals - before_bind; // a candidate may be RECORDED (switched off)
+                std::swap(to_read.Transition.StateBefore, to_read.Transition.StateAfter);
+                scene2.list->ResourceBarrier(1, &to_read);
+            }
             REQUIRE(SUCCEEDED(scene2.list->Close()));
             ID3D12CommandList* first[] = {scene2.list.Get()};
             Submit(q, 1, first, true);
@@ -688,7 +704,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                 for (int k = frame_evals; k < fake::evals; ++k) {
                     if (!ran(k)) continue;
                     ++runs;
-                    if (k != final_eval) ++ran_wrong;
+                    if (k != final_eval) ++ran_wrong; // includes any candidate of the early list
                 }
                 if (runs != 1 || !ran(final_eval))
                     std::printf("EXACT frame evals [%d,%d) final=%d runs=%d\n", frame_evals, fake::evals, final_eval, runs);
@@ -820,6 +836,10 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         if (!real_ngx) CHECK(is.inline_exact == is.inline_frames); // every DLAA that ran followed the final scene write
         CHECK(is.inline_late_writes == 0);
         if (inline_segments) {
+            std::printf("segments: early-list candidates recorded %d, withheld lists %llu\n", early_list_candidates,
+                        (unsigned long long)is.inline_withheld);
+            CHECK(early_list_candidates >= frames - 2);              // the early list looked like an end...
+            CHECK(is.inline_withheld >= static_cast<uint64_t>(frames - 2)); // ...and was withheld every time
             CHECK(frames_with_extra >= 3);
             CHECK(is.inline_moved_later >= 1);   // the learned boundary matched too early, and was not used
             CHECK(extra_runs_checked >= 1);      // ...proved on the GPU
