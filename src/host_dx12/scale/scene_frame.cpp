@@ -48,6 +48,7 @@ std::shared_ptr<SceneFrame> SceneFrame::Create(ID3D12Device* dev,FrameSpec spec,
     return p;
 }
 bool SceneFrame::SeedHistories(ID3D12GraphicsCommandList* l) {
+    const na::observe::HostWorkScope host;
     if(!l||!na::observe::ListStateRestorable(l))return false;
     if(!na::nr::native::RetainRecording(l,shared_from_this()))return false;
     for(auto& x:promotions_)if(x.seed) {
@@ -83,6 +84,7 @@ na::j2::PhysicalLookup SceneFrame::Input(std::shared_ptr<const na::j2::PhysicalI
 }
 void SceneFrame::Outcome(na::j2::PhysicalOutcome x){std::lock_guard<std::mutex> lock(mutex_);if(!finished_)outcome_=x;}
 bool SceneFrame::Finish(ID3D12GraphicsCommandList* l) {
+    const na::observe::HostWorkScope host;
     std::lock_guard<std::mutex> lock(mutex_);
     if(finished_||!dirty_)return true;
     if(!l||!na::observe::ListRasterStateRestorable(l)||!na::nr::native::RetainRecording(l,shared_from_this()))return false;

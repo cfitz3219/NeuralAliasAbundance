@@ -15,8 +15,10 @@ public:
     uint64_t multisample=0;
     std::shared_ptr<const PreparedTransfer> clear_ms,resolve;
     unsigned refused=0;
+    unsigned calls=0;
     std::shared_ptr<const PreparedTransfer> Acquire(ID3D12GraphicsCommandList* l,const na::observe::TextureCall& c)noexcept override {
         if(l!=list)return {};
+        ++calls;
         if(c.kind==Kind::ClearColor)return c.target_id==a?clear_a:c.target_id==b?clear_b:c.target_id==multisample?clear_ms:nullptr;
         if(c.kind==Kind::ClearDepth&&c.target_id==depth)return clear_depth;
         if(c.kind==Kind::Copy)return copy;
@@ -81,6 +83,10 @@ int main(){
     const D3D12_BOX box{0,0,0,16,8,1};l->CopyTextureRegion(&dst,16,8,0,&src,&box);
     l->ClearDepthStencilView(zv,D3D12_CLEAR_FLAG_DEPTH,.375f,0,0,nullptr);
     CHECK(p->refused==0);
+    const auto calls=p->calls;
+    na::observe::TextureCall direct;direct.kind=Kind::ClearColor;direct.target_id=aid;
+    std::copy(blue,blue+4,direct.color);const char* direct_error=nullptr;
+    REQUIRE(p->clear_a->Record(l,direct,&direct_error));CHECK(p->calls==calls); // public Record self-isolates its private API calls
     // Fractional copy edges must be refused before private commands. The owning
     // route will promote before forwarding; do not submit an invalid toy native copy.
     {na::observe::HostWorkScope host;na::observe::TextureCall c;c.kind=Kind::CopyRegion;c.source=a.Get();c.destination=b.Get();

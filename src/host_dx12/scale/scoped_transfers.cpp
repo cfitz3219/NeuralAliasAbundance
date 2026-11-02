@@ -1,5 +1,6 @@
 #include "scoped_transfers.hpp"
 #include "host_dx12/nr/native_fg.hpp"
+#include "host_dx12/observe/producers.hpp"
 #include <algorithm>
 namespace na::scale {
 namespace {
@@ -65,6 +66,7 @@ std::shared_ptr<const PreparedTransfer> PreparedTransfer::Create(ID3D12Device* d
     return p;
 }
 bool PreparedTransfer::Record(ID3D12GraphicsCommandList* list,const na::observe::TextureCall& c,const char** why)const {
+    const na::observe::HostWorkScope host;
     const auto fail=[&](const char* w){if(why)*why=w;return false;};
     const auto* dst=spec_.group->Find(spec_.destination);const auto* src=spec_.group->Find(spec_.source);
     if(!list||c.kind!=spec_.kind)return fail("transfer operation changed");

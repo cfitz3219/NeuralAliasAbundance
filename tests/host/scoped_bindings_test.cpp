@@ -116,9 +116,11 @@ float4 ps():SV_Target{return float4(width,rh,marker,.75);})";
     list->SetGraphicsRootDescriptorTable(0,heap->GetGPUDescriptorHandleForHeapStart());list->SetGraphicsRootConstantBufferView(1,cb->GetGPUVirtualAddress());
     list->OMSetRenderTargets(1,&rtv,FALSE,&dsv);const D3D12_VIEWPORT vp{0,0,float(w),float(h),0,1};const D3D12_RECT sc{0,0,w,h};
     list->RSSetViewports(1,&vp);list->RSSetScissorRects(1,&sc);list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    if(frame){na::observe::HostWorkScope host;const float old_history[4]={99,77,4,.125f};
-        list->ClearRenderTargetView(history_views->GetCPUDescriptorHandleForHeapStart(),old_history,0,nullptr);
-        REQUIRE(frame->SeedHistories(list));history_seed.Record(list,group->Find(3)->reduced.Get(),D3D12_RESOURCE_STATE_COMMON);}
+    if(frame){
+        {na::observe::HostWorkScope host;const float old_history[4]={99,77,4,.125f};
+            list->ClearRenderTargetView(history_views->GetCPUDescriptorHandleForHeapStart(),old_history,0,nullptr);}
+        REQUIRE(frame->SeedHistories(list)); // public frame operation owns its HostWorkScope
+        {na::observe::HostWorkScope host;history_seed.Record(list,group->Find(3)->reduced.Get(),D3D12_RESOURCE_STATE_COMMON);}}
     list->DrawInstanced(3,1,0,0);provider->plan.reset(); // private complete21x11 colour/depth scene
     if(frame){na::observe::HostWorkScope host;auto b=test::Transition(group->Find(3)->reduced.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_RENDER_TARGET);list->ResourceBarrier(1,&b);
         auto hc=history_views->GetCPUDescriptorHandleForHeapStart();hc.ptr+=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
@@ -137,15 +139,12 @@ float4 ps():SV_Target{return float4(width,rh,marker,.75);})";
         CHECK(callbacks.lookup(callbacks.ctx,1,2,nullptr,&input)==na::j2::PhysicalLookup::None);
         CHECK(callbacks.lookup(callbacks.ctx,99,2,list,&input)==na::j2::PhysicalLookup::None&&!input);
     }
-    {
-        na::observe::HostWorkScope host;
-        if(frame){
-            if(frame_mode==2){const float enhanced[4]={float(w+100),float(h+100),9,.75f};list->ClearRenderTargetView(rtv,enhanced,0,nullptr);
+    if(frame){
+            if(frame_mode==2){na::observe::HostWorkScope host;const float enhanced[4]={float(w+100),float(h+100),9,.75f};list->ClearRenderTargetView(rtv,enhanced,0,nullptr);
                 frame->Outcome(na::j2::PhysicalOutcome::Evaluated);}
-            REQUIRE(frame->Finish(list));
-        }else{auto b=test::Transition(group->Find(1)->reduced.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);list->ResourceBarrier(1,&b);
+            REQUIRE(frame->Finish(list)); // caller need not create a host-work guard
+    }else{na::observe::HostWorkScope host;auto b=test::Transition(group->Find(1)->reduced.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);list->ResourceBarrier(1,&b);
             REQUIRE(promote->Record(list));REQUIRE(na::observe::RestoreListState(list));std::swap(b.Transition.StateBefore,b.Transition.StateAfter);list->ResourceBarrier(1,&b);}
-    }
     const D3D12_RECT hud{29,13,32,16};list->RSSetScissorRects(1,&hud);list->DrawInstanced(3,1,0,0); // native dimensions, only9native HUD pixels
     {na::observe::HostWorkScope host;cr.Record(list,group->Find(1)->reduced.Get(),D3D12_RESOURCE_STATE_COMMON);dr.Record(list,group->Find(2)->reduced.Get(),D3D12_RESOURCE_STATE_COMMON);
         nr.Record(list,color.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET);nd.Record(list,depth.Get(),D3D12_RESOURCE_STATE_DEPTH_WRITE);}
