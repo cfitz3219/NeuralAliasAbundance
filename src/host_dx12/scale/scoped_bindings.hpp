@@ -31,8 +31,9 @@ struct BindingSpec {
     std::shared_ptr<const SceneGroup> group;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
     bool compute = false;
-    // All resource descriptor tables of this operation must be rebased. Native
-    // sampler tables are retained/rebound automatically from the host shadow.
+    // If any private resource heap is needed, all native resource tables must
+    // be rebased. Empty views/tables leave native material tables in place.
+    // Native sampler tables are retained/rebound from the host shadow.
     struct Table { uint32_t param, first; };
     struct RootCbv { uint32_t param, constant; };
     std::vector<ShaderView> views;

@@ -70,6 +70,7 @@ struct Built {
     std::map<TransferKey,std::shared_ptr<const PreparedTransfer>> transfers;
     std::unordered_map<uint64_t,std::string> failed;
     std::unordered_map<uint64_t,uint64_t> failed_evidence;
+    std::vector<uint64_t> failed_keys;
     std::unordered_map<uint64_t,std::shared_ptr<std::atomic<uint64_t>>> last_seen;
     std::map<TransferKey,std::string> failed_transfers;
     uint64_t model=0,group_revision=0;int mode=0;bool optimal=false,optimal_available=false;
@@ -396,12 +397,12 @@ void PollAutomaticScene(){
             if(current_basis&&(latest->transfers.count(transfer.first)||latest->failed_transfers.count(transfer.first)))continue;
             if(transfers.size()+observed.size()>=budget)break;transfers.insert(transfer);
         }
-        if(current_basis&&!latest->failed.empty()&&observed.size()+transfers.size()<budget){
-            const auto start=a->failure_probe%latest->failed.size();auto failure=latest->failed.begin();std::advance(failure,start);
+        if(current_basis&&!latest->failed_keys.empty()&&observed.size()+transfers.size()<budget){
+            const auto start=a->failure_probe%latest->failed_keys.size();
             const auto probe_budget=budget-observed.size()-transfers.size();
-            for(size_t i=0;i<std::min(probe_budget,latest->failed.size());++i){if(failure==latest->failed.end())failure=latest->failed.begin();
-                const auto request=a->observed.find(failure->first),seen=a->observed.end();const auto fingerprint=latest->failed_evidence.find(failure->first);
-                if(request!=seen&&fingerprint!=latest->failed_evidence.end())probes.push_back({failure->first,fingerprint->second,request->second});++failure;}
+            for(size_t i=0;i<std::min(probe_budget,latest->failed_keys.size());++i){const auto key=latest->failed_keys[(start+i)%latest->failed_keys.size()];
+                const auto request=a->observed.find(key),seen=a->observed.end();const auto fingerprint=latest->failed_evidence.find(key);
+                if(request!=seen&&fingerprint!=latest->failed_evidence.end())probes.push_back({key,fingerprint->second,request->second});}
             a->failure_probe+=probe_budget;
         }
         if(current_basis&&observed.empty()&&transfers.empty()&&probes.empty()&&expired.empty()){a->work_pending.store(false);return;}
@@ -448,6 +449,7 @@ void PollAutomaticScene(){
             transfer.second.group=next->group;auto plan=PreparedTransfer::Create(device.Get(),std::move(transfer.second),error);if(plan)next->transfers.emplace(transfer.first,std::move(plan));else next->failed_transfers.emplace(transfer.first,error);
         }
     }
+    next->failed_keys.reserve(next->failed.size());for(const auto& failure:next->failed)next->failed_keys.push_back(failure.first);
     ControlLock lock(a->mutex,a->cost);
     ++a->stats.poll_builds;
     if(a->color!=color||a->depth!=depth||mode!=static_cast<int>(na::settings::Get().j2_scale_mode.load())||a->group_revision!=group_revision){a->worker_revision=0;return;}
