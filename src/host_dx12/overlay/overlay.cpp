@@ -728,6 +728,11 @@ void write_status_line()
                 (unsigned long long)automatic.control_wait_us,(unsigned long long)automatic.control_hold_us,(unsigned long long)automatic.control_max_us,
                 (unsigned long long)automatic.worker_us,automatic.reason);
                 if(automatic_bytes>0)WriteFile(f,automatic_line,DWORD((std::min)(automatic_bytes,int(sizeof automatic_line-1))),&written,nullptr);
+                const int heap_bytes=snprintf(automatic_line,sizeof automatic_line,
+                    "layer2_heaps shader_heaps=%llu shader_descriptors=%llu shared_tables=%llu rtv_heaps=%llu dsv_heaps=%llu heap_failures=%llu heap_hr=0x%08X failure_kinds=\"%s\"\r\n",
+                    (unsigned long long)automatic.shader_heaps,(unsigned long long)automatic.shader_descriptors,(unsigned long long)automatic.shared_tables,
+                    (unsigned long long)automatic.rtv_heaps,(unsigned long long)automatic.dsv_heaps,(unsigned long long)automatic.heap_failures,automatic.heap_hr,automatic.failure_kinds);
+                if(heap_bytes>0)WriteFile(f,automatic_line,DWORD((std::min)(heap_bytes,int(sizeof automatic_line-1))),&written,nullptr);
             }
         }
         if (na::scale::SliderRouteActive()) {

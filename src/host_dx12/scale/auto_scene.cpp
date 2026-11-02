@@ -65,6 +65,8 @@ TransferKey transfer_key(const TextureCall& c){return {c.kind,c.source?na::obser
 struct MemberSeed {uint64_t id=0;ComPtr<ID3D12Resource> resource;Role role{};};
 struct Built {
     std::shared_ptr<ShaderDescriptorArena> descriptors=std::make_shared<ShaderDescriptorArena>();
+    std::shared_ptr<ShaderDescriptorArena> rtv_descriptors=std::make_shared<ShaderDescriptorArena>(D3D12_DESCRIPTOR_HEAP_TYPE_RTV,1024);
+    std::shared_ptr<ShaderDescriptorArena> dsv_descriptors=std::make_shared<ShaderDescriptorArena>(D3D12_DESCRIPTOR_HEAP_TYPE_DSV,1024);
     std::shared_ptr<const SceneGroup> group;
     std::shared_ptr<SceneFrame> prototype;
     std::unordered_map<uint64_t,std::shared_ptr<const PreparedBindings>> bindings;
@@ -587,7 +589,7 @@ void PollAutomaticScene(){
     auto next=std::make_shared<Built>();next->mode=mode;next->model=model;next->group_revision=group_revision;next->optimal=optimal_used;next->optimal_available=optimal_available;std::string error;
     bool same=previous&&previous->mode==mode&&previous->group->Render()==render&&previous->group->Output()==output&&previous->group->Members().size()==members.size();
     if(same)for(const auto& m:members)same&=previous->group->Find(m.first)!=nullptr;
-    if(same){next->group=previous->group;next->prototype=previous->prototype;next->descriptors=previous->descriptors;
+    if(same){next->group=previous->group;next->prototype=previous->prototype;next->descriptors=previous->descriptors;next->rtv_descriptors=previous->rtv_descriptors;next->dsv_descriptors=previous->dsv_descriptors;
         next->bindings=previous->bindings;next->failed=previous->failed;next->failed_evidence=previous->failed_evidence;next->last_seen=previous->last_seen;
         next->transfers=previous->transfers;next->failed_transfers=previous->failed_transfers;}
     else{
@@ -607,11 +609,11 @@ void PollAutomaticScene(){
         for(const auto& op:observed)if(!next->bindings.count(op.first)&&!next->failed.count(op.first)){
             const auto fingerprint=preparation_evidence(*op.second);
             BindingSpec spec;if(!NativeBindingSpec(*op.second,next->group,spec,error,true)){next->failed.emplace(op.first,error);next->failed_evidence.emplace(op.first,fingerprint);continue;}
-            spec.descriptors=next->descriptors;
+            spec.descriptors=next->descriptors;spec.rtv_descriptors=next->rtv_descriptors;spec.dsv_descriptors=next->dsv_descriptors;
             auto plan=PreparedBindings::Create(device.Get(),std::move(spec),error);if(plan)next->bindings.emplace(op.first,std::move(plan));else{next->failed.emplace(op.first,error);next->failed_evidence.emplace(op.first,fingerprint);}
         }
         for(auto transfer:transfers)if(!next->transfers.count(transfer.first)&&!next->failed_transfers.count(transfer.first)){
-            transfer.second.group=next->group;auto plan=PreparedTransfer::Create(device.Get(),std::move(transfer.second),error);if(plan)next->transfers.emplace(transfer.first,std::move(plan));else next->failed_transfers.emplace(transfer.first,error);
+            transfer.second.group=next->group;transfer.second.rtv_descriptors=next->rtv_descriptors;transfer.second.dsv_descriptors=next->dsv_descriptors;auto plan=PreparedTransfer::Create(device.Get(),std::move(transfer.second),error);if(plan)next->transfers.emplace(transfer.first,std::move(plan));else next->failed_transfers.emplace(transfer.first,error);
         }
     }
     next->failed_keys.reserve(next->failed.size());for(const auto& failure:next->failed)next->failed_keys.push_back(failure.first);
@@ -625,6 +627,14 @@ void PollAutomaticScene(){
     a->prepared=std::move(next);a->stats.generation=a->prepared->group->Generation();a->stats.render_w=render.width;a->stats.render_h=render.height;
     a->stats.out_w=output.width;a->stats.out_h=output.height;a->stats.members=UINT(members.size());a->stats.plans=UINT(a->prepared->bindings.size());
     a->stats.failed_plans=a->prepared->failed.size()+a->prepared->failed_transfers.size();if(!same)++a->stats.group_builds;
+    {const auto v=a->prepared->descriptors->GetStats(),r=a->prepared->rtv_descriptors->GetStats(),d=a->prepared->dsv_descriptors->GetStats();
+        a->stats.shader_heaps=v.heaps;a->stats.shader_descriptors=v.descriptors;a->stats.shared_tables=v.shared_hits;
+        a->stats.rtv_heaps=r.heaps;a->stats.dsv_heaps=d.heaps;a->stats.heap_failures=v.failures+r.failures+d.failures;
+        a->stats.heap_hr=v.last_hr?v.last_hr:r.last_hr?r.last_hr:d.last_hr;
+        std::map<std::string,uint64_t> kinds;for(const auto& f:a->prepared->failed)++kinds[f.second.substr(0,f.second.find(" ("))];
+        for(const auto& f:a->prepared->failed_transfers)++kinds["transfer: "+f.second.substr(0,f.second.find(" ("))];
+        std::string summary;for(const auto& k:kinds){if(!summary.empty())summary+="; ";summary+=std::to_string(k.second)+"x "+k.first;}
+        std::snprintf(a->stats.failure_kinds,sizeof a->stats.failure_kinds,"%s",summary.c_str());}
     if(a->stats.failed_plans)a->note(!a->prepared->failed.empty()?a->prepared->failed.begin()->second.c_str():a->prepared->failed_transfers.begin()->second.c_str());
     else if(!complete){char text[160];std::snprintf(text,sizeof text,"Preparing scene bindings (%u of %u operations).",UINT(a->prepared->bindings.size()),UINT(source_operations));a->note(text);}
     else a->note(!a->prepared->ready?error.c_str():"Reduced scene prepared; applying at the next frame boundary.");

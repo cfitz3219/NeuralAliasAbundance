@@ -31,6 +31,10 @@ int ArenaRetirement(ID3D12Device* device){
     // Roll over many slabs while a simulated executable plan owns the first.
     for(unsigned i=0;i<64;++i){REQUIRE(arena.Allocate(device,4096,latest,first));CHECK(first==0);}
     CHECK(destroyed==0);retained.Reset();CHECK(destroyed==1); // arena must NOT own every historical slab
+    // CPU-only RTV arena: thousands of single views use a handful of heap objects.
+    ShaderDescriptorArena rtvs(D3D12_DESCRIPTOR_HEAP_TYPE_RTV,1024);
+    for(unsigned i=0;i<5000;++i){REQUIRE(rtvs.Allocate(device,1,latest,first));}
+    CHECK(rtvs.GetStats().heaps==5&&first==5000-4*1024-1);
     return 0;
 }
 uint64_t CheckKey(ID3D12GraphicsCommandList* list,bool compute){
@@ -141,9 +145,21 @@ float4 ps():SV_Target{return float4(ScreenWidth,RenderHeight,marker,.75);})";
         ColorTarget target;target.member=1;target.view.Format=fmt;target.view.ViewDimension=D3D12_RTV_DIMENSION_TEXTURE2D;s.colors.push_back(target);
         s.depth.member=2;s.depth.view.Format=depth_view;s.depth.view.ViewDimension=D3D12_DSV_DIMENSION_TEXTURE2D;
         s.uses={{1,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,D3D12_RESOURCE_STATE_RENDER_TARGET},{2,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,D3D12_RESOURCE_STATE_DEPTH_WRITE}};
-        s.descriptors=std::make_shared<ShaderDescriptorArena>();auto first_slice=PreparedBindings::Create(dev,s,error);REQUIRE(first_slice);
+        s.descriptors=std::make_shared<ShaderDescriptorArena>();
+        s.rtv_descriptors=std::make_shared<ShaderDescriptorArena>(D3D12_DESCRIPTOR_HEAP_TYPE_RTV,64);
+        s.dsv_descriptors=std::make_shared<ShaderDescriptorArena>(D3D12_DESCRIPTOR_HEAP_TYPE_DSV,64);
+        // A plan with a different private constant buffer gets its own slice in the same slab.
+        auto other=GpuConstants::Create(dev,cb.Get(),0,source,sizeof source,{{0,Scalar::Float,Dimension::Width,{w,h},{rw,rh}}},error);REQUIRE(other);
+        auto distinct=s;distinct.constants={{other,D3D12_RESOURCE_STATE_GENERIC_READ}};
+        auto first_slice=PreparedBindings::Create(dev,distinct,error);REQUIRE(first_slice);
+        auto shared_a=PreparedBindings::Create(dev,s,error);REQUIRE(shared_a);
         plan=PreparedBindings::Create(dev,s,error);REQUIRE(plan);
         CHECK(first_slice->ShaderHeap()==plan->ShaderHeap()&&plan->ShaderOffset()>first_slice->ShaderOffset());
+        // Byte-identical tables are written once and shared; RTV/DSV come from one arena heap each.
+        CHECK(shared_a->ShaderHeap()==plan->ShaderHeap()&&shared_a->ShaderOffset()==plan->ShaderOffset());
+        CHECK(s.descriptors->GetStats().shared_hits==1&&s.descriptors->GetStats().heaps==1&&s.descriptors->GetStats().descriptors==2);
+        CHECK(s.rtv_descriptors->GetStats().heaps==1&&s.rtv_descriptors->GetStats().descriptors==3);
+        CHECK(s.dsv_descriptors->GetStats().heaps==1&&s.dsv_descriptors->GetStats().descriptors==3);
         promote=ColorRestore::Create(dev,group->Find(1)->reduced.Get(),color.Get(),0,fmt,error);REQUIRE(promote);
         if(frame_mode){FrameSpec f;f.group=group;f.color=1;f.depth=2;f.members={{1,D3D12_RESOURCE_STATE_RENDER_TARGET},{2,D3D12_RESOURCE_STATE_DEPTH_WRITE},{3,D3D12_RESOURCE_STATE_RENDER_TARGET,true,D3D12_RESOURCE_STATE_RENDER_TARGET}};
             if(stencil)f.members[1].seed_state=D3D12_RESOURCE_STATE_DEPTH_WRITE;

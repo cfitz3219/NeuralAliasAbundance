@@ -59,9 +59,12 @@ std::shared_ptr<const PreparedTransfer> PreparedTransfer::Create(ID3D12Device* d
         const bool ms=dst->reduced_desc.SampleDesc.Count>1;
         if(!ms&&mip>=dst->reduced_desc.MipLevels)return fail("clear mip was removed by reduction");
         D3D12_DESCRIPTOR_HEAP_DESC hd{depth?D3D12_DESCRIPTOR_HEAP_TYPE_DSV:D3D12_DESCRIPTOR_HEAP_TYPE_RTV,1,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
-        if(FAILED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&p->clear_))))return fail("private clear view allocation failed");
-        if(depth)dev->CreateDepthStencilView(dst->reduced.Get(),&p->spec_.depth,p->clear_->GetCPUDescriptorHandleForHeapStart());
-        else dev->CreateRenderTargetView(dst->reduced.Get(),&p->spec_.color,p->clear_->GetCPUDescriptorHandleForHeapStart());
+        const auto& arena=depth?p->spec_.dsv_descriptors:p->spec_.rtv_descriptors;UINT first=0;
+        if(arena){std::string why;if(!arena->Allocate(dev,1,p->clear_,first,&why))return fail("private clear view allocation failed");}
+        else if(FAILED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&p->clear_))))return fail("private clear view allocation failed");
+        p->clear_view_=p->clear_->GetCPUDescriptorHandleForHeapStart();p->clear_view_.ptr+=SIZE_T(first)*dev->GetDescriptorHandleIncrementSize(hd.Type);
+        if(depth)dev->CreateDepthStencilView(dst->reduced.Get(),&p->spec_.depth,p->clear_view_);
+        else dev->CreateRenderTargetView(dst->reduced.Get(),&p->spec_.color,p->clear_view_);
     }
     return p;
 }
@@ -108,8 +111,8 @@ bool PreparedTransfer::Record(ID3D12GraphicsCommandList* list,const na::observe:
     auto db=barrier(dst->reduced.Get(),D3D12_RESOURCE_STATE_COMMON,target);list->ResourceBarrier(1,&db);
     if(!clear){auto sb=barrier(src->reduced.Get(),D3D12_RESOURCE_STATE_COMMON,input);list->ResourceBarrier(1,&sb);}
     switch(c.kind) {
-    case Kind::ClearColor:list->ClearRenderTargetView(clear_->GetCPUDescriptorHandleForHeapStart(),c.color,c.rect_count,c.rect_count?rects:nullptr);break;
-    case Kind::ClearDepth:list->ClearDepthStencilView(clear_->GetCPUDescriptorHandleForHeapStart(),c.flags,c.depth,c.stencil,c.rect_count,c.rect_count?rects:nullptr);break;
+    case Kind::ClearColor:list->ClearRenderTargetView(clear_view_,c.color,c.rect_count,c.rect_count?rects:nullptr);break;
+    case Kind::ClearDepth:list->ClearDepthStencilView(clear_view_,c.flags,c.depth,c.stencil,c.rect_count,c.rect_count?rects:nullptr);break;
     case Kind::Copy:list->CopyResource(dst->reduced.Get(),src->reduced.Get());break;
     case Kind::CopyRegion:list->CopyTextureRegion(&a,x,y,0,&b,c.box?&box:nullptr);break;
     case Kind::Resolve:list->ResolveSubresource(dst->reduced.Get(),resolve_dst,src->reduced.Get(),resolve_src,c.format);break;

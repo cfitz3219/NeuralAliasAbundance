@@ -1,19 +1,35 @@
 #pragma once
 #include "gpu_constants.hpp"
 #include "host_dx12/observe/shader_operation.hpp"
+#include <map>
+#include <memory>
 #include <mutex>
 
 namespace na::observe{struct ShaderState;}
 namespace na::scale {
 // Setup-worker allocation only. Immutable slices share a group-owned heap;
 // no descriptor is recycled while an executable recording may reference it.
+// One arena per descriptor type: shader-visible CBV/SRV/UAV tables, and
+// CPU-only RTV/DSV views (a heap object per plan exhausted the driver in Anno).
 class ShaderDescriptorArena {
 public:
+    explicit ShaderDescriptorArena(D3D12_DESCRIPTOR_HEAP_TYPE type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,UINT capacity=4096)
+        :type_(type),capacity_(capacity){}
     bool Allocate(ID3D12Device*,UINT count,Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>&,UINT& first,std::string* error=nullptr);
+    // An immutable, already written table slice shared by every plan whose
+    // descriptor contents are byte-identical. The slice retains its heap.
+    struct Slice{Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;UINT first=0,count=0;};
+    std::shared_ptr<const Slice> Find(const std::vector<uint8_t>& content);
+    void Remember(const std::vector<uint8_t>& content,const std::shared_ptr<const Slice>&);
+    struct Stats{uint64_t heaps=0,descriptors=0,shared_hits=0,failures=0;uint32_t last_hr=0;};
+    Stats GetStats();
 private:
     struct Block {Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;UINT used=0,capacity=0;};
+    D3D12_DESCRIPTOR_HEAP_TYPE type_;UINT capacity_;
     std::mutex mutex_;
     Block current_; // older heaps are owned only by their immutable plans/recording leases
+    std::map<std::vector<uint8_t>,std::weak_ptr<const Slice>> shared_;
+    Stats stats_;
 };
 // Prepared from the recognized operation's real view/layout metadata, on the
 // setup worker under HostWorkScope. No shader-visible heap is used as a CPU
@@ -42,6 +58,8 @@ struct DepthTarget { uint64_t member = 0; D3D12_DEPTH_STENCIL_VIEW_DESC view{}; 
 struct BindingSpec {
     std::shared_ptr<const SceneGroup> group;
     std::shared_ptr<ShaderDescriptorArena> descriptors;
+    // Optional CPU-only RTV/DSV arenas; without them a heap is created per plan.
+    std::shared_ptr<ShaderDescriptorArena> rtv_descriptors,dsv_descriptors;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
     bool compute = false;
     // If any private resource heap is needed, all native resource tables must
@@ -78,6 +96,8 @@ public:
 private:
     BindingSpec spec_;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> views_, rtvs_, dsv_;
+    std::shared_ptr<const ShaderDescriptorArena::Slice> shared_views_;
+    UINT rtvs_first_ = 0, dsv_first_ = 0, rtv_increment_ = 0, dsv_increment_ = 0;
     std::vector<D3D12_RESOURCE_BARRIER> enter_, leave_;
     std::vector<D3D12_VIEWPORT> viewports_;
     std::vector<D3D12_RECT> scissors_;

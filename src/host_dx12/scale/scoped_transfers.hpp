@@ -1,9 +1,12 @@
 #pragma once
 #include "scene_group.hpp"
+#include "scoped_bindings.hpp"
 #include "host_dx12/observe/texture_operation.hpp"
 namespace na::scale {
 struct TransferSpec {
     std::shared_ptr<const SceneGroup> group;
+    // Optional CPU-only view arenas (one heap object per clear exhausts the driver's heap count).
+    std::shared_ptr<ShaderDescriptorArena> rtv_descriptors,dsv_descriptors;
     na::observe::TextureKind kind = na::observe::TextureKind::Copy;
     uint64_t source = 0, destination = 0;
     D3D12_RENDER_TARGET_VIEW_DESC color{};
@@ -20,6 +23,7 @@ public:
 private:
     TransferSpec spec_;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> clear_;
+    D3D12_CPU_DESCRIPTOR_HANDLE clear_view_{};
 };
 class TransferProvider {
 public:

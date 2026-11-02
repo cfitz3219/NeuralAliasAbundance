@@ -18,6 +18,8 @@ struct AutomaticSceneStats {
     uint64_t unknown_operations=0,binding_failures=0,native_boundaries=0,transfer_failures=0;
     uint64_t control_wait_us=0,control_hold_us=0,control_max_us=0,worker_us=0;
     uint64_t constant_copies=0,constant_reuses=0;
+    uint64_t shader_heaps=0,shader_descriptors=0,shared_tables=0,rtv_heaps=0,dsv_heaps=0,heap_failures=0;uint32_t heap_hr=0;
+    char failure_kinds[256]{};
     char reason[192]{};
 };
 AutomaticSceneStats GetAutomaticSceneStats();
