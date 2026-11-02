@@ -201,6 +201,13 @@ if(NA_HAVE_NGX_LIB)
     add_custom_command(TARGET dlss_real_test POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:dlss_real_test>")
   endif()
+  # Exact inline placement: does a predicated-off NGX evaluate leave DLSS untouched?
+  na_host_test(dlss_predication_test SOURCES dlss_predication_test.cpp LIBS host_dlss dxgi
+               ARGS "${CMAKE_CURRENT_BINARY_DIR}/dlss-predication-test" LABELS "gpu;nvidia")
+  if(NA_DLSS_DLL)
+    add_custom_command(TARGET dlss_predication_test POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:dlss_predication_test>")
+  endif()
 endif()
 
 if(NA_HAVE_NGX_LIB)
