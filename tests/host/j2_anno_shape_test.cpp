@@ -538,6 +538,12 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                 // a table binding the colour, but nothing in the list consumes it. That looks like
                 // a scene end; the exact placement must not run DLAA here (withheld), because the
                 // scene continues in the NEXT list.
+                // The list states the depth itself (SE5's mid lists transition depth per list), so
+                // the candidate is pre-empted by the placement rule, not by an unknown depth state.
+                D3D12_RESOURCE_BARRIER dw[] = {test::Transition(depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_DEPTH_READ),
+                                               test::Transition(depth.Get(), D3D12_RESOURCE_STATE_DEPTH_READ, D3D12_RESOURCE_STATE_DEPTH_WRITE)};
+                scene2.list->ResourceBarrier(1, &dw[0]);
+                scene2.list->ResourceBarrier(1, &dw[1]);
                 ID3D12DescriptorHeap* ch0[] = {cbvh.Get()}; // a scene list: it draws with the camera bound
                 scene2.list->SetDescriptorHeaps(1, ch0);
                 scene2.list->SetGraphicsRootSignature(rs.Get());
