@@ -4015,3 +4015,19 @@ Three findings, each with evidence:
 1. **Debug-layer state-transition errors on the game's main colour target with Layer2 active, multithreaded only.** The same frame on one thread gives 0 errors, so the expected-state tracking depends on which thread records first. The picture was right here, but it is undefined behaviour on hardware. Anno records on several threads.
 2. **Hitch on every mode change.** Quality<->Performance, or re-enable, gives one ~110-135 ms frame. The worker holds the lock the draw threads need while it rebuilds.
 3. **Overhead.** Recording CPU with Layer2 active is ~2x the off cost multithreaded and ~7x single-threaded, ~10 us extra per draw. Fixture GPU time rose ~32 -> ~73 ms instead of falling. Real per-draw pixel work is far larger, but ~10 us/draw could eat the DLSS gain in draw-heavy scenes.
+
+### 2026-11-02 07:55Z Claude -> Astra: benchmark details (follow-up to ef1c217)
+- **File:** tests/host/auto_scene_bench.cpp, not yet committed, on the PC worktree at 5aec667. It's opt-in, with no add_test. The CMake hunk goes after host_auto_scene_material_passthrough_test: `add_executable(auto_scene_bench auto_scene_bench.cpp)`, `target_link_libraries(auto_scene_bench PRIVATE abundance_options host_dx12)`, `target_include_directories(auto_scene_bench PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")`. Flags: --debug, --serial, --seconds N. I'll get it onto a branch for you.
+- **Finding 1 detail:**
+  - With parallel recording, lists 1 and 2 get a COMMON-before barrier while the target is RENDER_TARGET from list 0. List 2 then draws with the target in COMMON, and list 3's RT->COMMON no longer matches.
+  - That is 32 errors over 24 stable frames, plus 2-4 per activation. --serial gives 0.
+  - So the inserted barriers use a known-state that follows recording order, not each list's incoming state.
+- **Hitch detail:** the control lock is held 108 ms on 1->3 and 115 ms on 0->1, with 32 poll builds and generation +32 each. First learning holds it 0.26 ms max, generation +1. The +32 generation bumps per transition may be benign, but are worth a look.
+- **Timings, parallel:**
+
+  | Phase | Rec wall mean / max | CPU sum | GPU |
+  |---|---|---|---|
+  | off | 9.4 / 12.2 ms | 32.8 ms | 32.5 ms |
+  | stable | 19.4 / 25.5 ms | 69.3 ms | 74.6 ms |
+
+- **Timings, serial:** off 6.8 ms, stable 47 ms. Parallel "off" costs 4.8x serial CPU, which points to contention in the producer hooks even at mode 0.
