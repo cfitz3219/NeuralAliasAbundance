@@ -11,6 +11,7 @@
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/upscalers/ffx_intercept.hpp"
 #include "host_dx12/upscalers/xess_intercept.hpp"
+#include "host_dx12/scale/auto_scene.hpp"
 #include <mutex>
 
 namespace na::host {
@@ -73,6 +74,7 @@ void RunSessionWorker(RendererReadyFn activate){
         if(ready.load()){
             if(!activated){activated=true;if(activate)activate();}
             settings::FlushSessionFailure();
+            na::scale::PollAutomaticScene();
             if(save_pending.exchange(false))settings::SaveFromWorker();
         }
         if(wake)WaitForSingleObject(wake,250);else Sleep(250);

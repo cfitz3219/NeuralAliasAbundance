@@ -105,6 +105,9 @@ struct PhysicalInputProvider {
     // Every Provided / Unavailable lookup gets exactly one outcome, before J2's record returns.
     void (*outcome)(void* ctx, uint64_t generation, PhysicalOutcome result, const char* reason) = nullptr;
     void* ctx = nullptr;
+    // Opt-in: lookup receives the exact source recording on the between-lists
+    // route as well. Existing providers retain the historical null argument.
+    bool source_recording = false;
 };
 // Null lookup = no provider (default). Not changed while a frame records.
 void SetPhysicalInputProvider(const PhysicalInputProvider& p);

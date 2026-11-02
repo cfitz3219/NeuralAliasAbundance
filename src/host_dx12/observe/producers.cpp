@@ -1583,7 +1583,10 @@ void bytecode(na_ev_pipeline_created& e, uint32_t stage, const D3D12_SHADER_BYTE
     if (!b.pShaderBytecode || !b.BytecodeLength) return;
     e.stage_hash[stage] = fnv1a(b.pShaderBytecode, b.BytecodeLength);
     e.stage_bytes[stage] = static_cast<uint32_t>(b.BytecodeLength);
-    if(g_operation_snapshots.load()&&!t_host_work)ReflectDimensions(b,g_next_dimensions);
+    if(g_operation_snapshots.load()&&!t_host_work){
+        const uint32_t visibility[]={D3D12_SHADER_VISIBILITY_VERTEX,D3D12_SHADER_VISIBILITY_PIXEL,D3D12_SHADER_VISIBILITY_DOMAIN,D3D12_SHADER_VISIBILITY_HULL,D3D12_SHADER_VISIBILITY_GEOMETRY};
+        ReflectDimensions(b,g_next_dimensions,stage<5?visibility[stage]:D3D12_SHADER_VISIBILITY_ALL);
+    }
 }
 
 void depth_blend(na_ev_pipeline_created& e, BOOL depth_enable, D3D12_DEPTH_WRITE_MASK mask, D3D12_COMPARISON_FUNC func)
@@ -5427,6 +5430,18 @@ void MipBiasCounts(uint64_t* samplers, uint64_t* static_samplers)
 HostWorkScope::HostWorkScope() : prev_(t_host_work) { t_host_work = true; }
 HostWorkScope::~HostWorkScope() { t_host_work = prev_; }
 void SetOperationSnapshots(bool enabled) { g_operation_snapshots.store(enabled); }
+bool NativeDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle,OperationDescriptor& out) {
+    out={};DescriptorDetails details;uint64_t version=0;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_m);uint32_t slot=0;
+        const auto* heap=heap_for_cpu_locked(handle.ptr,&slot);if(!heap||!heap->info[slot].details)return false;
+        details=*heap->info[slot].details;version=heap->versions[slot];
+    }
+    OperationDescriptor next;next.view=details;next.version=version;
+    if(details.resource){next.resource.Attach(AcquireResource(details.resource));if(!next.resource)return false;}
+    if(details.counter){next.counter.Attach(AcquireResource(details.counter));if(!next.counter)return false;}
+    out=std::move(next);return true;
+}
 bool ListNativeOperation(ID3D12GraphicsCommandList* list, bool compute, NativeOperation& out)
 {
     out = {};
@@ -5482,6 +5497,7 @@ bool ListNativeOperation(ID3D12GraphicsCommandList* list, bool compute, NativeOp
         if(pipeline!=g_objs.end())for(const auto& field:pipeline->second.dimensions) {
             for(uint32_t param=0;param<rs->second.root_params.size()&&param<args.size();++param) {
                 const auto& p=rs->second.root_params[param];uint32_t descriptor=UINT_MAX;uint64_t address=0;
+                if(p.visibility!=D3D12_SHADER_VISIBILITY_ALL&&field.visibility!=D3D12_SHADER_VISIBILITY_ALL&&p.visibility!=field.visibility)continue;
                 if(p.param_type==NA_ROOT_CBV&&args[param].type==2&&p.shader_register==field.shader_register&&p.register_space==field.space)address=args[param].value;
                 else if(p.param_type==NA_ROOT_TABLE&&args[param].type==1) {
                     const auto table=std::find_if(next.tables.begin(),next.tables.end(),[&](const auto& t){return t.param==param;});

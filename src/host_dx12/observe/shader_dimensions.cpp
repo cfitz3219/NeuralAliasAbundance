@@ -35,18 +35,20 @@ void variable(ID3D12ShaderReflectionType* type,const char* name,uint32_t offset,
         for(UINT i=2;i<4;++i)if(offset+4*i+4<=bytes)out.push_back({reg,space,offset+4*i,bytes,i,false});
 }
 }
-void ReflectDimensions(const D3D12_SHADER_BYTECODE& code,std::vector<ShaderDimension>& out) {
+void ReflectDimensions(const D3D12_SHADER_BYTECODE& code,std::vector<ShaderDimension>& out,uint32_t visibility) {
     if(!code.pShaderBytecode||!code.BytecodeLength)return;
     Microsoft::WRL::ComPtr<ID3D12ShaderReflection> shader;
     if(FAILED(D3DReflect(code.pShaderBytecode,code.BytecodeLength,IID_PPV_ARGS(&shader))))return;
     D3D12_SHADER_DESC desc{};if(FAILED(shader->GetDesc(&desc)))return;
+    const size_t start=out.size();
     for(UINT i=0;i<desc.ConstantBuffers;++i){auto* cb=shader->GetConstantBufferByIndex(i);D3D12_SHADER_BUFFER_DESC b{};
         if(!cb||FAILED(cb->GetDesc(&b))||b.Type!=D3D_CT_CBUFFER||b.Size>65536)continue;
         D3D12_SHADER_INPUT_BIND_DESC binding{};if(FAILED(shader->GetResourceBindingDescByName(b.Name,&binding)))continue;
         for(UINT j=0;j<b.Variables;++j){auto* v=cb->GetVariableByIndex(j);D3D12_SHADER_VARIABLE_DESC value{};
             if(v&&SUCCEEDED(v->GetDesc(&value)))variable(v->GetType(),value.Name,value.StartOffset,binding.BindPoint,binding.Space,b.Size,out);}
     }
-    std::sort(out.begin(),out.end(),[](const auto& a,const auto& b){return std::tie(a.space,a.shader_register,a.offset,a.dimension)<std::tie(b.space,b.shader_register,b.offset,b.dimension);});
-    out.erase(std::unique(out.begin(),out.end(),[](const auto& a,const auto& b){return a.space==b.space&&a.shader_register==b.shader_register&&a.offset==b.offset&&a.dimension==b.dimension&&a.integer==b.integer;}),out.end());
+    for(size_t i=start;i<out.size();++i)out[i].visibility=visibility;
+    std::sort(out.begin(),out.end(),[](const auto& a,const auto& b){return std::tie(a.visibility,a.space,a.shader_register,a.offset,a.dimension)<std::tie(b.visibility,b.space,b.shader_register,b.offset,b.dimension);});
+    out.erase(std::unique(out.begin(),out.end(),[](const auto& a,const auto& b){return a.visibility==b.visibility&&a.space==b.space&&a.shader_register==b.shader_register&&a.offset==b.offset&&a.dimension==b.dimension&&a.integer==b.integer;}),out.end());
 }
 }

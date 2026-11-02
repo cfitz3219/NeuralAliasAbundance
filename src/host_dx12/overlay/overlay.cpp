@@ -43,6 +43,7 @@
 #include "host_dx12/nr/nr_pass.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/scale/live_driver.hpp"
+#include "host_dx12/scale/auto_scene.hpp"
 #include "host_dx12/scale/settings_read_hook.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
 #include "host_dx12/j2/compute_flow.hpp"
@@ -712,6 +713,17 @@ void write_status_line()
             static_cast<unsigned long long>(j2.busy), static_cast<unsigned long long>(j2.dlss_failed), static_cast<unsigned long long>(j2.cuts),
             static_cast<unsigned long long>(j2.camera_offset), j2.later_passes, static_cast<unsigned long long>(j2.duplicate_submissions), static_cast<unsigned long long>(j2.jitter_writes), static_cast<unsigned long long>(j2.camera_learned_hits), static_cast<unsigned long long>(j2.camera_scans), static_cast<long long>(j2.camera_inv_delta), static_cast<long long>(j2.camera_proj_delta), static_cast<unsigned long long>(j2.jitter_proj_writes), static_cast<unsigned long long>(j2.jitter_rebased), na::observe::SamplerMipBias(), static_cast<unsigned long long>(mb_s), static_cast<unsigned long long>(mb_st), static_cast<unsigned long long>(j2.post_camera_lists), static_cast<unsigned long long>(j2.post_depth_lists), static_cast<unsigned long long>(j2.other_camera_blocks), j2.depth_reversed ? 1u : 0u, dlss.feature_preset, na::settings::Get().j2_sharpness.load(), static_cast<unsigned long long>(j2.nis_frames), j2.scene_batches, j2.scene_batches_max, j2.scene_batches_target, static_cast<unsigned long long>(j2.waited_batches), static_cast<unsigned long long>(j2.post_scene_batches), j2.inline_mode, j2.inline_target, static_cast<unsigned long long>(j2.inline_candidates), static_cast<unsigned long long>(j2.inline_waited), static_cast<unsigned long long>(j2.inline_recorded), static_cast<unsigned long long>(j2.inline_frames), static_cast<unsigned long long>(j2.inline_refused), j2.color_sub, j2.color_mips, j2.color_slices, j2.color_samples, j2.depth_slices, j2.depth_samples, j2.width, j2.height, j2.color_format, j2.reason);
         if (jn > 0) WriteFile(f, jl, static_cast<DWORD>((std::min)(jn, static_cast<int>(sizeof(jl) - 1))), &written, nullptr);
+        {
+            const auto automatic=na::scale::GetAutomaticSceneStats();
+            if(automatic.enabled){char automatic_line[768];const int automatic_bytes=snprintf(automatic_line,sizeof automatic_line,
+                "layer2 mode=%u active=%u generation=%llu render=%ux%u output=%ux%u members=%u plans=%u operations=%llu redirected=%llu checkpoints=%llu misses=%llu frames=%llu reason=\"%s\"\r\n",
+                na::settings::Get().j2_scale_mode.load(),automatic.active?1u:0u,(unsigned long long)automatic.generation,
+                automatic.render_w,automatic.render_h,automatic.out_w,automatic.out_h,automatic.members,automatic.plans,
+                (unsigned long long)automatic.operations,(unsigned long long)automatic.redirected,(unsigned long long)automatic.checkpoints,
+                (unsigned long long)automatic.misses,(unsigned long long)automatic.frames,automatic.reason);
+                if(automatic_bytes>0)WriteFile(f,automatic_line,DWORD((std::min)(automatic_bytes,int(sizeof automatic_line-1))),&written,nullptr);
+            }
+        }
         if (na::scale::SliderRouteActive()) {
             // P4-4 slider route: what our mode did to the game's render scale (start-up and live).
             const auto rh = na::scale::GetReadHookStats();
@@ -2447,6 +2459,7 @@ void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue_hint = nullptr)
     ComPtr<ID3D12CommandQueue> retained_queue;
     if (!present_prelude(sc, queue,retained_queue,queue_hint)) return;
     na::j2::OnPresent(queue); // one game-frame boundary, never a TEST Present
+    na::scale::AutomaticScenePresent();
     if (na::scale::SliderRouteActive()) na::scale::TickLive(na::j2::GetStats().width); // P4-4: confirm a live render-scale change
     UINT idx = real_index(sc);
     { // frame processing uses the actual buffer, independently of menu allocation
@@ -2757,6 +2770,7 @@ void STDMETHODCALLTYPE DetourExecute(ID3D12CommandQueue* q, UINT n,
     // C8: H1/H2 observation of the game's submissions ([observe] producers=1).
     const na::observe::ExecuteToken obs_token =
         na::observe::ProducersActive() ? na::observe::ExecuteBegin(q, n, lists) : na::observe::ExecuteToken{};
+    na::scale::AutomaticSceneSubmission automatic_scene(q,n,lists);
     ExecuteSubscriber* sub = g_exec_sub.load(std::memory_order_acquire);
     if (sub) {
         ExecuteContext ctx{q, n, lists, g_exec_ticket.fetch_add(1, std::memory_order_relaxed) + 1, uncovered, sub->user};

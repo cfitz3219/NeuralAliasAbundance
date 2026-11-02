@@ -11,6 +11,7 @@
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
 #include "host_dx12/scale/live_driver.hpp"
+#include "host_dx12/scale/auto_scene.hpp"
 
 #include <atomic>
 #include <cstdlib>
@@ -233,6 +234,7 @@ DWORD WINAPI InitThread(LPVOID)
     // J2 live DLAA (needs the producers and the discovery adapter): off unless [j2] enabled=1.
     na::j2::SetEnabled(GetPrivateProfileIntW(L"j2", L"enabled", 0, g_ini) == 1 &&
                        GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1);
+    na::scale::ConfigureAutomaticScene(na::j2::Configured()&&GetPrivateProfileIntW(L"layer2",L"enabled",0,g_ini)==1);
     if (na::j2::Configured()) na::overlay::RegisterLiveDlaaMenu();
     na::j2::flow::SetEnabled(GetPrivateProfileIntW(L"j2",L"flow",0,g_ini)==1);
     if(na::settings::SafeStart())na::j2::SetPaused(true);

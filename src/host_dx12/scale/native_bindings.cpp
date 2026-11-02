@@ -8,8 +8,8 @@ bool NativeBindingSpec(const na::observe::NativeOperation& op, std::shared_ptr<c
 {
     out = {}; error.clear();
     const auto fail = [&](const char* why) { error = why; return false; };
-    if (!group || !op.root || op.compute) return fail("native raster bindings are required");
-    BindingSpec s; s.group = group; s.root = op.root; s.native_extent = group->Output(); s.render_extent = group->Render();
+    if (!group || !op.root) return fail("native operation bindings are required");
+    BindingSpec s; s.group = group; s.root = op.root; s.compute=op.compute;s.native_extent = group->Output(); s.render_extent = group->Render();
     const auto use = [&](uint64_t member, D3D12_RESOURCE_STATES state, UINT sub = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) {
         for (auto& u : s.uses) if (u.member == member && u.subresource == sub) { u.state |= state; return; }
         s.uses.push_back({member, sub, state});
@@ -21,7 +21,7 @@ bool NativeBindingSpec(const na::observe::NativeOperation& op, std::shared_ptr<c
         if (d.view.kind == NA_DESC_CBV) { v.kind = ShaderView::Kind::NativeCbv; v.cbv = d.view.cbv; }
         else if (d.view.kind == NA_DESC_SRV) {
             v.kind = ShaderView::Kind::Srv; v.srv = d.view.srv;
-            if (member) use(member->id, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            if (member) use(member->id, op.compute ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                 member->role == Role::Depth && v.srv.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D ? v.srv.Texture2D.PlaneSlice : D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
         } else if (d.view.kind == NA_DESC_UAV) {
             v.kind = ShaderView::Kind::Uav; v.uav = d.view.uav;
@@ -72,7 +72,7 @@ bool NativeBindingSpec(const na::observe::NativeOperation& op, std::shared_ptr<c
         else if(c.descriptor<s.views.size()){s.views[c.descriptor].kind=ShaderView::Kind::PatchedCbv;s.views[c.descriptor].constant=index;}
         else return fail("reflected descriptor is outside its table");
     }
-    s.viewports = op.viewports; s.scissors = op.scissors;
+    if(!op.compute){s.viewports = op.viewports; s.scissors = op.scissors;}
     out = std::move(s); return true;
 }
 }

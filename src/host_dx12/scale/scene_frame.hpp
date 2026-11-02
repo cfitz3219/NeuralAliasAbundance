@@ -3,6 +3,7 @@
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/nr/native_fg.hpp"
 #include <mutex>
+#include <set>
 
 namespace na::scale {
 struct FrameMemberState {
@@ -13,6 +14,10 @@ struct FrameMemberState {
     // The seed boundary can have a different native state from the finish boundary.
     // Also required for D32S8 stencil initialization, even without colour history.
     D3D12_RESOURCE_STATES seed_state = static_cast<D3D12_RESOURCE_STATES>(~0u);
+    // A copied companion with no render/depth/UAV writes is mirrored by BOTH
+    // native and private transfer operations. NativeCurrent acknowledges that
+    // exact write; a pending write cannot silently use this exception.
+    bool native_transfer_only = false;
 };
 struct FrameSpec {
     std::shared_ptr<const SceneGroup> group;
@@ -26,11 +31,16 @@ struct FrameSpec {
 class SceneFrame : public std::enable_shared_from_this<SceneFrame> {
 public:
     static std::shared_ptr<SceneFrame> Create(ID3D12Device*, FrameSpec, std::string&);
+    // Setup payloads/PSOs are immutable; a new frame needs fresh CPU bookkeeping,
+    // not another shader compilation/allocation. The scene owner orders GPU uses.
+    std::shared_ptr<SceneFrame> NewFrame();
     // Call once before the first private scene operation: initializes histories
     // and the inherited stencil plane. Repeated calls are harmless.
     bool SeedHistories(ID3D12GraphicsCommandList*);
-    void Written(uint64_t member);
+    void Written(uint64_t member, ID3D12GraphicsCommandList* recording = nullptr);
     void StencilCleared(uint64_t member);
+    void NativeCurrent(uint64_t member, ID3D12GraphicsCommandList* recording = nullptr);
+    void UpdateStates(const std::vector<FrameMemberState>&, bool seed = false);
     void Ready();
     // Nonterminal native-consumer/list-end checkpoint. Inputs stay available
     // for the existing J2 insertion, while the native renderer has a current
@@ -55,6 +65,7 @@ private:
         std::shared_ptr<const ColorRestore> stencil, seed_stencil;
         bool written = false;
         bool pending = false, stencil_initialized = false;
+        std::set<std::pair<uint64_t,uint64_t>> pending_recordings;
     };
     FrameSpec spec_;
     bool Promote(ID3D12GraphicsCommandList*, bool final);

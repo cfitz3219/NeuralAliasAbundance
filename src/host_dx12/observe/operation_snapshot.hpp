@@ -8,6 +8,7 @@ namespace na::observe {
 struct ShaderDimension {
     uint32_t shader_register = 0, space = 0, offset = 0, bytes = 0, dimension = 0;
     bool integer = false;
+    uint32_t visibility = D3D12_SHADER_VISIBILITY_ALL;
 };
 // Exact creation arguments, carried through the existing descriptor-copy shadow.
 // Resource identities remain live-process identities. No game/build profiles.
@@ -52,4 +53,5 @@ void SetOperationSnapshots(bool enabled);
 // ranges (4096 descriptors), never table-head guessing or event-delivery order.
 // False leaves out empty and the game's operation untouched.
 bool ListNativeOperation(ID3D12GraphicsCommandList*, bool compute, NativeOperation& out);
+bool NativeDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE, OperationDescriptor& out);
 } // namespace na::observe

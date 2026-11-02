@@ -1161,7 +1161,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         PhysicalInputProvider pp;
         { std::lock_guard<std::mutex> lk(g_up_m); pp = g_phys; }
         if (pp.lookup) {
-            const PhysicalLookup pl = pp.lookup(pp.ctx, color_id, depth_id, inl, &phys);
+            const PhysicalLookup pl = pp.lookup(pp.ctx, color_id, depth_id,
+                inl ? inl : pp.source_recording ? static_cast<ID3D12GraphicsCommandList*>(lists[scene]) : nullptr, &phys);
             if (pl == PhysicalLookup::Unavailable) {
                 phys_report.arm(pp, phys ? phys->generation : 0);
                 phys_report.result = PhysicalOutcome::Unavailable;

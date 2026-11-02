@@ -1,0 +1,317 @@
+#include "auto_scene.hpp"
+#include "native_bindings.hpp"
+#include "scoped_transfers.hpp"
+#include "scene_frame.hpp"
+#include "host_dx12/observe/producers.hpp"
+#include "host_dx12/settings.hpp"
+#include "host_dx12/dlss/dlss_backend.hpp"
+#include "host_dx12/scale/settings_read_hook.hpp"
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <unordered_map>
+#include <cmath>
+#include <tuple>
+
+namespace na::scale {
+namespace {
+using Microsoft::WRL::ComPtr;
+using na::observe::NativeOperation;
+using na::observe::TextureCall;
+using na::observe::TextureKind;
+uint64_t hash_bytes(uint64_t h,const void* data,size_t bytes){const auto* p=static_cast<const unsigned char*>(data);while(bytes--){h^=*p++;h*=1099511628211ull;}return h;}
+template<class T>void hash_value(uint64_t& h,const T& value){h=hash_bytes(h,&value,sizeof value);}
+uint64_t signature(const NativeOperation& op){
+    uint64_t h=1469598103934665603ull;hash_value(h,op.pipeline_id);hash_value(h,op.compute);
+    for(const auto& d:op.descriptors){hash_value(h,d.view.kind);hash_value(h,d.view.resource);hash_value(h,d.view.counter);hash_value(h,d.view.explicit_view);
+        if(d.view.kind==NA_DESC_CBV)hash_value(h,d.view.cbv);else if(d.view.kind==NA_DESC_SRV)hash_value(h,d.view.srv);else hash_value(h,d.view.uav);}
+    for(const auto& d:op.colors){hash_value(h,d.view.resource);hash_value(h,d.view.rtv);}
+    hash_value(h,op.depth.view.resource);hash_value(h,op.depth.view.dsv);
+    for(const auto& c:op.constants){hash_value(h,c.param);hash_value(h,c.descriptor);hash_value(h,c.resource_id);hash_value(h,c.offset);}
+    for(const auto& v:op.viewports)hash_value(h,v);for(const auto& s:op.scissors)hash_value(h,s);
+    return h;
+}
+struct TransferKey {
+    TextureKind kind{};uint64_t source=0,destination=0;DXGI_FORMAT format{};
+    bool operator<(const TransferKey& b)const{return std::tie(kind,source,destination,format)<std::tie(b.kind,b.source,b.destination,b.format);}
+};
+TransferKey transfer_key(const TextureCall& c){return {c.kind,c.source?na::observe::IdOf(c.source):0,
+    c.destination?na::observe::IdOf(c.destination):c.target_id,c.format};}
+struct MemberSeed {uint64_t id=0;ComPtr<ID3D12Resource> resource;Role role{};};
+struct Built {
+    std::shared_ptr<const SceneGroup> group;
+    std::shared_ptr<SceneFrame> prototype;
+    std::unordered_map<uint64_t,std::shared_ptr<const PreparedBindings>> bindings;
+    std::map<TransferKey,std::shared_ptr<const PreparedTransfer>> transfers;
+    uint64_t model=0;int mode=0;bool optimal=false;
+};
+struct Run {
+    std::shared_ptr<Built> built;std::shared_ptr<SceneFrame> frame;
+    uint64_t epoch=0,color=0,depth=0;bool aborted=false,seeded=false;
+};
+struct Bound {std::shared_ptr<Run> run;na::nr::native::RecordingLease lease;};
+struct Submission {std::shared_ptr<Run> run;ComPtr<ID3D12CommandQueue> queue;std::vector<ID3D12CommandList*> lists;};
+thread_local std::shared_ptr<Submission> submission,reporting;
+
+class Automatic final:public BindingProvider,public na::observe::TextureOperationHook,public std::enable_shared_from_this<Automatic>{
+public:
+    std::mutex mutex;bool enabled=false;uint64_t epoch=1,color=0,depth=0,model=0,next_generation=1;
+    std::map<uint64_t,MemberSeed> members;
+    std::map<uint64_t,std::pair<uint64_t,ComPtr<ID3D12Resource>>> copied_from;
+    std::unordered_map<uint64_t,NativeOperation> observed;
+    std::unordered_map<uint64_t,uint64_t> last_seen;
+    std::map<TransferKey,TransferSpec> observed_transfers;
+    std::shared_ptr<Built> built,prepared;std::shared_ptr<Run> current;
+    std::map<uint64_t,uint64_t> list_queues;
+    std::map<std::pair<uint64_t,uint64_t>,Bound> bound;
+    AutomaticSceneStats stats;ComPtr<ID3D12CommandQueue> execution_queue;
+    void note(const char* text){std::snprintf(stats.reason,sizeof stats.reason,"%s",text);}
+    bool selected(uint64_t c,uint64_t d){return c&&d&&color==c&&depth==d;}
+    void select(uint64_t c,uint64_t d){
+        if(selected(c,d))return;color=c;depth=d;members.clear();copied_from.clear();observed.clear();last_seen.clear();observed_transfers.clear();built.reset();current.reset();++model;
+        prepared.reset();execution_queue.Reset();list_queues.clear();note("Identifying the scene's rendering operations.");
+    }
+    bool member(uint64_t id,ID3D12Resource* resource,Role role){
+        if(!id||!resource||members.count(id))return false;
+        const auto d=resource->GetDesc();if(d.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||d.MipLevels!=1||d.DepthOrArraySize!=1||d.SampleDesc.Count!=1)return false;
+        MemberSeed value;value.id=id;value.resource=resource;value.role=role;members.emplace(id,std::move(value));++model;return true;
+    }
+    void dependency(uint64_t id){
+        std::vector<uint64_t> chain;
+        while(!members.count(id)&&chain.size()<32){
+            if(std::find(chain.begin(),chain.end(),id)!=chain.end())return;
+            const auto copy=copied_from.find(id);if(copy==copied_from.end())return;chain.push_back(id);id=copy->second.first;
+        }
+        if(!members.count(id))return;const auto role=members.at(id).role==Role::Depth?Role::Depth:Role::Intermediate;
+        for(auto it=chain.rbegin();it!=chain.rend();++it)member(*it,copied_from.at(*it).second.Get(),role);
+    }
+    bool bind(ID3D12GraphicsCommandList* list,const std::shared_ptr<Run>& run){
+        const auto key=std::make_pair(na::observe::IdOf(list),na::observe::ListRecording(list));if(!key.first||!key.second)return false;
+        auto found=bound.find(key);if(found!=bound.end())return found->second.run==run;
+        for(auto i=bound.begin();i!=bound.end();)if(i->second.lease.Retired())i=bound.erase(i);else++i;
+        if(bound.size()>=1024)return false;
+        auto lease=na::nr::native::RetainRecording(list,run);if(!lease)return false;
+        bound.emplace(key,Bound{run,std::move(lease)});return true;
+    }
+    std::shared_ptr<Run> run_for(ID3D12GraphicsCommandList* list){
+        const auto key=std::make_pair(na::observe::IdOf(list),na::observe::ListRecording(list));
+        const auto found=bound.find(key);if(found!=bound.end())return found->second.run;
+        if(!built||!na::j2::Enabled()||na::j2::Paused())return {};
+        const auto q=list_queues.find(key.first);
+        if(!execution_queue||q==list_queues.end()||q->second!=na::observe::IdOf(execution_queue.Get()))return {};
+        if(!current||current->epoch!=epoch){
+            if(built->mode!=static_cast<int>(na::settings::Get().j2_scale_mode.load()))return {};
+            current=std::make_shared<Run>();current->built=built;current->frame=built->prototype->NewFrame();current->epoch=epoch;current->color=color;current->depth=depth;++stats.frames;
+        }
+        if(!bind(list,current))return {};return current;
+    }
+    std::vector<FrameMemberState> states(ID3D12GraphicsCommandList* list,const std::shared_ptr<Run>& run,bool seed=false){
+        std::vector<FrameMemberState> result;
+        for(const auto& m:run->built->group->Members()){
+            uint32_t state=0;const UINT sub=seed&&m.role==Role::Depth&&m.native_desc.Format==DXGI_FORMAT_R32G8X24_TYPELESS?1:0;
+            const auto lookup=na::observe::ListStateSub(list,m.id,sub,&state);
+            if(lookup==na::observe::StateLookup::Known||(lookup==na::observe::StateLookup::Absent&&na::observe::KnownSubStateNow(m.id,sub,&state)))
+                result.push_back({m.id,static_cast<D3D12_RESOURCE_STATES>(state)});
+        }
+        return result;
+    }
+    bool checkpoint(ID3D12GraphicsCommandList* list,const std::shared_ptr<Run>& run){
+        if(!run||run->aborted)return true;
+        if(!na::observe::ListRasterStateRestorable(list))return false;
+        if(!run->frame->Checkpoint(list,states(list,run)))return false;
+        ++stats.checkpoints;return true;
+    }
+    void abort(ID3D12GraphicsCommandList* list,const std::shared_ptr<Run>& run,const char* why){
+        if(run&&!run->aborted){checkpoint(list,run);run->aborted=true;}++stats.misses;note(why);
+    }
+    std::shared_ptr<const PreparedBindings> Acquire(ID3D12GraphicsCommandList* list,const na::observe::ShaderCall& call)noexcept override{
+        uint64_t d=0,c=0;na::observe::GetLiveSelection(&d,&c);if(!c||!d)return {};
+        NativeOperation op;const bool have=na::observe::ListNativeOperation(list,call.kind==na::observe::ShaderKind::Dispatch,op);
+        std::lock_guard<std::mutex> lock(mutex);if(!enabled)return {};select(c,d);++stats.operations;
+        auto run=run_for(list);
+        if(!have){if(run)abort(list,run,"An operation's native bindings are not yet available.");return {};}
+        bool scene=!op.compute&&op.depth.view.resource==d;
+        if(!scene&&!op.compute)for(const auto& rt:op.colors)scene|=rt.view.resource==c;
+        bool reads_depth=false,buffer_outputs=true,has_buffer_output=false;
+        for(const auto& v:op.descriptors){reads_depth|=v.view.kind==NA_DESC_SRV&&v.view.resource==d;
+            if(v.view.kind==NA_DESC_UAV&&v.resource){const bool buffer=v.resource->GetDesc().Dimension==D3D12_RESOURCE_DIMENSION_BUFFER;buffer_outputs&=buffer;has_buffer_output|=buffer;}}
+        scene|=op.compute&&reads_depth&&buffer_outputs&&has_buffer_output;
+        if(!scene){if(run&&!checkpoint(list,run))abort(list,run,"A native consumer could not restore its current scene.");return {};}
+        ComPtr<ID3D12Resource> native_color;native_color.Attach(na::observe::AcquireResource(c));
+        ComPtr<ID3D12Resource> native_depth;native_depth.Attach(na::observe::AcquireResource(d));
+        if(!native_color||!native_depth)return {};
+        const auto native_size=native_color->GetDesc();member(c,native_color.Get(),Role::Color);member(d,native_depth.Get(),Role::Depth);
+        // A copied full-size picture is a scene dependency only when scene
+        // work actually binds it. Presentation copies are native consumers.
+        for(const auto& view:op.descriptors)if(view.view.kind==NA_DESC_SRV)dependency(view.view.resource);
+        for(const auto& rt:op.colors)if(rt.resource){const auto size=rt.resource->GetDesc();
+            if(size.Width==native_size.Width&&size.Height==native_size.Height)member(rt.view.resource,rt.resource.Get(),rt.view.resource==c?Role::Color:Role::Intermediate);}
+        const uint64_t key=signature(op);
+        last_seen[key]=epoch;
+        if(!observed.count(key)&&observed.size()<16384){observed.emplace(key,std::move(op));++model;}
+        if(!run||run->aborted)return {};
+        const auto learned=observed.find(key);if(learned==observed.end()){abort(list,run,"The bounded scene plan cache is full.");return {};}
+        for(const auto& descriptor:learned->second.descriptors)if(members.count(descriptor.view.resource)&&!run->built->group->Find(descriptor.view.resource)){
+            abort(list,run,"Preparing a newly observed scene dependency.");return {};
+        }
+        const auto plan=run->built->bindings.find(key);
+        if(plan==run->built->bindings.end()){abort(list,run,"Preparing a newly observed scene operation.");return {};}
+        if(!run->seeded){run->frame->UpdateStates(states(list,run,true),true);
+            if(!run->frame->SeedHistories(list)){abort(list,run,"The scene's initial contents are not available yet.");return {};}run->seeded=true;}
+        return plan->second;
+    }
+    void Refused(ID3D12GraphicsCommandList* list,const na::observe::ShaderCall&,const char* why)noexcept override{
+        std::lock_guard<std::mutex> lock(mutex);const auto found=bound.find({na::observe::IdOf(list),na::observe::ListRecording(list)});
+        abort(list,found==bound.end()?nullptr:found->second.run,why);
+    }
+    void Applied(ID3D12GraphicsCommandList* list,const na::observe::ShaderCall& call,const std::shared_ptr<const PreparedBindings>&)noexcept override{
+        NativeOperation op;if(!na::observe::ListNativeOperation(list,call.kind==na::observe::ShaderKind::Dispatch,op))return;
+        std::lock_guard<std::mutex> lock(mutex);auto run=run_for(list);if(!run||run->aborted)return;
+        for(const auto& rt:op.colors)run->frame->Written(rt.view.resource,list);
+        if(op.depth.view.resource&&!(op.depth.view.dsv.Flags&D3D12_DSV_FLAG_READ_ONLY_DEPTH))run->frame->Written(op.depth.view.resource,list);
+        for(const auto& view:op.descriptors)if(view.view.kind==NA_DESC_UAV&&run->built->group->Find(view.view.resource))run->frame->Written(view.view.resource,list);
+        run->frame->Ready();++stats.redirected;stats.active=true;
+    }
+    void Closing(ID3D12GraphicsCommandList* list)noexcept override{
+        std::lock_guard<std::mutex> lock(mutex);const auto found=bound.find({na::observe::IdOf(list),na::observe::ListRecording(list)});
+        if(found!=bound.end()&&!checkpoint(list,found->second.run))abort(list,found->second.run,"A scene list could not publish its full-size dependencies.");
+    }
+    na::observe::ShaderScope Before(ID3D12GraphicsCommandList* list,const TextureCall& call)noexcept override{
+        const auto key=transfer_key(call);na::observe::OperationDescriptor descriptor;
+        if(call.target.ptr)na::observe::NativeDescriptor(call.target,descriptor);
+        std::lock_guard<std::mutex> lock(mutex);if(!enabled)return {};
+        if((call.kind==TextureKind::Copy||call.kind==TextureKind::CopyRegion||call.kind==TextureKind::Resolve)&&(members.count(key.source)||copied_from.count(key.source))&&call.destination){
+            const auto a=call.source->GetDesc(),b=call.destination->GetDesc();
+            if(a.Width==b.Width&&a.Height==b.Height&&(copied_from.size()<256||copied_from.count(key.destination)))copied_from[key.destination]={key.source,call.destination};
+        }
+        if(members.count(key.destination)&&(key.source==0||members.count(key.source))&&!observed_transfers.count(key)){
+            TransferSpec value;value.kind=key.kind;value.source=key.source;value.destination=key.destination;value.resolve_format=key.format;
+            value.color=descriptor.view.rtv;value.depth=descriptor.view.dsv;
+            if(!descriptor.view.explicit_view&&descriptor.resource){value.color.Format=value.depth.Format=descriptor.resource->GetDesc().Format;
+                value.color.ViewDimension=D3D12_RTV_DIMENSION_TEXTURE2D;value.depth.ViewDimension=D3D12_DSV_DIMENSION_TEXTURE2D;}
+            observed_transfers.emplace(key,value);++model;
+        }
+        auto run=run_for(list);if(!run||run->aborted)return {};
+        if(!run->built->group->Find(key.destination)&&!run->built->group->Find(key.source))return {};
+        // Publish pending scene writes before the native copy reads them. The
+        // native operation still runs, keeping full-size clear/copy semantics.
+        if(!checkpoint(list,run)&&run->seeded){abort(list,run,"A scene transfer could not publish its input.");return {};}
+        const auto transfer=run->built->transfers.find(key);
+        if(transfer==run->built->transfers.end()){
+            if(run->built->group->Find(key.destination))abort(list,run,"Preparing a newly observed scene transfer.");return {};
+        }
+        const char* why=nullptr;
+        if(!transfer->second->Record(list,call,&why)){abort(list,run,why?why:"The scene transfer changed.");return {};}
+        if(call.kind==TextureKind::ClearDepth&&(call.flags&D3D12_CLEAR_FLAG_STENCIL))run->frame->StencilCleared(key.destination);
+        return {na::observe::ShaderAction::Forward,run};
+    }
+    void After(ID3D12GraphicsCommandList* list,const TextureCall& call,na::observe::ShaderScope& scope)noexcept override{
+        const auto run=std::static_pointer_cast<Run>(scope.state);if(!run)return;
+        std::lock_guard<std::mutex> lock(mutex);const auto key=transfer_key(call);
+        run->frame->Written(key.destination,list);run->frame->NativeCurrent(key.destination,list);
+    }
+};
+std::shared_ptr<Automatic>& automatic(){static auto* value=new std::shared_ptr<Automatic>();return *value;}
+na::j2::PhysicalLookup lookup(void*,uint64_t color,uint64_t depth,ID3D12GraphicsCommandList* list,std::shared_ptr<const na::j2::PhysicalInput>* out){
+    auto a=automatic();if(!a||!out)return na::j2::PhysicalLookup::None;out->reset();std::shared_ptr<Run> run;
+    {std::lock_guard<std::mutex> lock(a->mutex);
+        if(list){const auto found=a->bound.find({na::observe::IdOf(list),na::observe::ListRecording(list)});if(found!=a->bound.end())run=found->second.run;}
+        else if(submission)run=submission->run;
+        if(!run||run->aborted||run->color!=color||run->depth!=depth)return na::j2::PhysicalLookup::None;
+        if(submission)reporting=submission;else{reporting=std::make_shared<Submission>();reporting->run=run;}
+    }
+    if(list){std::vector<FrameMemberState> current;
+        for(const auto& member:run->built->group->Members()){
+            uint32_t state=0;const auto evidence=na::observe::ListStateSub(list,member.id,0,&state);
+            if(evidence==na::observe::StateLookup::Known||(evidence==na::observe::StateLookup::Absent&&na::observe::KnownSubStateInCurrentSubmission(member.id,0,&state)))
+                current.push_back({member.id,static_cast<D3D12_RESOURCE_STATES>(state)});
+        }
+        run->frame->UpdateStates(current);
+    }
+    return run->frame->Input(out);
+}
+void outcome(void*,uint64_t generation,na::j2::PhysicalOutcome result,const char*){
+    auto report=std::move(reporting);if(report&&report->run&&report->run->built->group->Generation()==generation)report->run->frame->Outcome(result);
+}
+}
+void ConfigureAutomaticScene(bool enabled){
+    if(!enabled)return;
+    auto a=std::make_shared<Automatic>();a->enabled=true;a->stats.enabled=true;a->note("Waiting for the game's scene selection.");automatic()=a;
+    na::observe::SetOperationSnapshots(true);na::observe::SetRasterStateTracking(true);
+    na::observe::SetShaderOperationHook(na::observe::ShaderLane::Bindings,std::make_shared<BindingHook>(a));
+    na::observe::SetTextureOperationHook(a);na::j2::SetPhysicalInputProvider({&lookup,&outcome,nullptr,true});
+}
+void PollAutomaticScene(){
+    auto a=automatic();if(!a)return;
+    const bool optimal_available=na::dlss::GetCapabilities().optimal_settings;
+    std::map<uint64_t,MemberSeed> members;std::unordered_map<uint64_t,NativeOperation> observed;
+    std::map<TransferKey,TransferSpec> transfers;std::shared_ptr<Built> previous;uint64_t model=0,color=0,depth=0,generation=0;int mode=0;
+    {std::lock_guard<std::mutex> lock(a->mutex);mode=static_cast<int>(na::settings::Get().j2_scale_mode.load());
+        // Material/streaming resources belong to executable recordings, not an
+        // immortal discovery cache. Evicted plans remain alive through leases.
+        for(auto it=a->last_seen.begin();it!=a->last_seen.end();)if(a->epoch-it->second>240){a->observed.erase(it->first);it=a->last_seen.erase(it);++a->model;}else++it;
+        if(!a->enabled||!a->color||!a->depth||a->members.size()<2||mode<=0){if(mode<=0)a->prepared.reset();return;}
+        const auto latest=a->prepared?a->prepared:a->built;
+        if(latest&&latest->optimal==optimal_available&&latest->model==a->model&&latest->mode==mode&&latest->bindings.size()==a->observed.size()&&latest->transfers.size()==a->observed_transfers.size())return;
+        members=a->members;observed=a->observed;transfers=a->observed_transfers;previous=latest;model=a->model;color=a->color;depth=a->depth;generation=a->next_generation++;
+    }
+    const na::observe::HostWorkScope host;
+    ComPtr<ID3D12Device> device;if(FAILED(members.at(color).resource->GetDevice(IID_PPV_ARGS(&device))))return;
+    const auto native=members.at(color).resource->GetDesc();const Extent output{UINT(native.Width),native.Height};
+    const double fraction=FractionForMode(mode);Extent render{UINT(std::max(1.0,std::round(output.width*fraction))),UINT(std::max(1.0,std::round(output.height*fraction)))};
+    const na::dlss::Quality qualities[]={na::dlss::Quality::DLAA,na::dlss::Quality::MaxQuality,na::dlss::Quality::Balanced,na::dlss::Quality::MaxPerformance,na::dlss::Quality::UltraPerformance};
+    na::dlss::OptimalSettings optimal;
+    const bool optimal_used=mode>=1&&mode<=4&&na::dlss::IsBoundTo(device.Get())&&na::dlss::QueryOptimal(output.width,output.height,qualities[mode],&optimal)&&optimal.valid;
+    if(optimal_used)
+        render={optimal.render_w,optimal.render_h};
+    auto next=std::make_shared<Built>();next->mode=mode;next->model=model;next->optimal=optimal_used;std::string error;
+    bool same=previous&&previous->mode==mode&&previous->group->Render()==render&&previous->group->Output()==output&&previous->group->Members().size()==members.size();
+    if(same)for(const auto& m:members)same&=previous->group->Find(m.first)!=nullptr;
+    if(same){next->group=previous->group;next->prototype=previous->prototype;
+        for(const auto& binding:previous->bindings)if(observed.count(binding.first))next->bindings.insert(binding);
+        next->transfers=previous->transfers;}
+    else{
+        std::vector<MemberRequest> requests;for(const auto& value:members)requests.push_back({value.first,value.second.resource.Get(),value.second.role,render});
+        next->group=SceneGroup::Create(device.Get(),generation,output,render,requests,error);
+        if(next->group){FrameSpec frame;frame.group=next->group;frame.color=color;frame.depth=depth;
+            for(const auto& m:members){const auto state=m.second.role==Role::Depth?D3D12_RESOURCE_STATE_DEPTH_WRITE:D3D12_RESOURCE_STATE_RENDER_TARGET;
+                const bool transfer_only=(m.second.resource->GetDesc().Flags&(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET|D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL|D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))==0;
+                frame.members.push_back({m.first,state,false,state,transfer_only});}
+            next->prototype=SceneFrame::Create(device.Get(),std::move(frame),error);}
+    }
+    if(next->prototype){
+        for(const auto& op:observed)if(!next->bindings.count(op.first)){
+            BindingSpec spec;if(!NativeBindingSpec(op.second,next->group,spec,error))continue;
+            auto plan=PreparedBindings::Create(device.Get(),std::move(spec),error);if(plan)next->bindings.emplace(op.first,std::move(plan));
+        }
+        for(auto transfer:transfers)if(!next->transfers.count(transfer.first)){
+            transfer.second.group=next->group;auto plan=PreparedTransfer::Create(device.Get(),std::move(transfer.second),error);if(plan)next->transfers.emplace(transfer.first,std::move(plan));
+        }
+    }
+    std::lock_guard<std::mutex> lock(a->mutex);
+    if(a->color!=color||a->depth!=depth||mode!=static_cast<int>(na::settings::Get().j2_scale_mode.load())||members.size()!=a->members.size())return;
+    if(!next->prototype||next->bindings.empty()){a->note(error.empty()?"Preparing scene bindings.":error.c_str());return;}
+    a->prepared=std::move(next);a->stats.generation=a->prepared->group->Generation();a->stats.render_w=render.width;a->stats.render_h=render.height;
+    a->stats.out_w=output.width;a->stats.out_h=output.height;a->stats.members=UINT(members.size());a->stats.plans=UINT(a->prepared->bindings.size());a->note("Reduced scene prepared; applying at the next frame boundary.");
+}
+void AutomaticScenePresent(){auto a=automatic();if(!a)return;std::lock_guard<std::mutex> lock(a->mutex);++a->epoch;a->current.reset();
+    if(na::settings::Get().j2_scale_mode.load()==0){a->built.reset();a->stats.active=false;}else if(a->prepared)a->built=a->prepared;}
+AutomaticSceneStats GetAutomaticSceneStats(){auto a=automatic();if(!a)return {};std::lock_guard<std::mutex> lock(a->mutex);return a->stats;}
+AutomaticSceneSubmission::AutomaticSceneSubmission(ID3D12CommandQueue* queue,UINT count,ID3D12CommandList* const* lists){
+    prior_=submission;auto a=automatic();if(!a){submission.reset();return;}
+    auto value=std::make_shared<Submission>();value->queue=queue;value->lists.assign(lists,lists+count);
+    std::lock_guard<std::mutex> lock(a->mutex);
+    for(UINT i=0;i<count;++i){const auto key=std::make_pair(na::observe::IdOf(lists[i]),na::observe::ListRecording(lists[i]));
+        const uint64_t queue_id=na::observe::IdOf(queue);const auto old=a->list_queues.find(key.first);
+        if(old!=a->list_queues.end()&&old->second!=queue_id)old->second=0;else if(old==a->list_queues.end())a->list_queues.emplace(key.first,queue_id);
+        if(!a->execution_queue&&queue->GetDesc().Type==D3D12_COMMAND_LIST_TYPE_DIRECT&&a->color&&a->depth&&na::observe::ListRendersTo(lists[i],a->color,a->depth))a->execution_queue=queue;
+        const auto found=a->bound.find(key);
+        if(found==a->bound.end())continue;if(value->run&&value->run!=found->second.run){value->run.reset();break;}value->run=found->second.run;}
+    if(value->run){if(a->execution_queue&&a->execution_queue.Get()!=queue)value->run->aborted=true;else a->execution_queue=queue;}
+    submission=std::move(value);
+}
+AutomaticSceneSubmission::~AutomaticSceneSubmission(){submission=std::static_pointer_cast<Submission>(prior_);}
+}

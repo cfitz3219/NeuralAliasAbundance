@@ -33,6 +33,11 @@ std::shared_ptr<SceneFrame> SceneFrame::Create(ID3D12Device* dev,FrameSpec spec,
         if(d.MipLevels!=1||d.DepthOrArraySize!=1||d.SampleDesc.Count!=1||m->native_desc.MipLevels!=1||m->native_desc.DepthOrArraySize!=1)
             return fail("frame promotion needs resolved plain scene members");
         Promotion x;x.state=state;x.member=m;
+        if(state.native_transfer_only){
+            if((m->native_desc.Flags&(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET|D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL|D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))||state.seed_history||m->id==p->spec_.color||m->id==p->spec_.depth)
+                return fail("transfer-only companion has a shader-write or primary-scene role");
+            p->promotions_.push_back(std::move(x));continue;
+        }
         if(m->role==Role::Depth) {
             if(!na::depth::PlaneZeroCopiesToR32F(d.Format))
                 return fail("frame depth promotion currently requires the identified 32-bit plane");
@@ -64,6 +69,23 @@ std::shared_ptr<SceneFrame> SceneFrame::Create(ID3D12Device* dev,FrameSpec spec,
         p->promotions_.push_back(std::move(x));
     }
     return p;
+}
+std::shared_ptr<SceneFrame> SceneFrame::NewFrame() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto next=std::shared_ptr<SceneFrame>(new SceneFrame);next->spec_=spec_;next->promotions_=promotions_;
+    for(auto& x:next->promotions_){x.written=x.pending=x.stencil_initialized=false;x.pending_recordings.clear();}
+    return next;
+}
+void SceneFrame::NativeCurrent(uint64_t member,ID3D12GraphicsCommandList* recording) {
+    const auto key=std::make_pair(na::observe::IdOf(recording),na::observe::ListRecording(recording));
+    std::lock_guard<std::mutex> lock(mutex_);for(auto& x:promotions_)if(x.state.member==member){
+        x.pending_recordings.erase(key);x.pending=!x.pending_recordings.empty();}
+}
+void SceneFrame::UpdateStates(const std::vector<FrameMemberState>& current,bool seed) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for(const auto& state:current)for(auto& x:promotions_)if(x.state.member==state.member){
+        if(seed)x.state.seed_state=state.native_state;else x.state.native_state=state.native_state;
+    }
 }
 bool SceneFrame::SeedHistories(ID3D12GraphicsCommandList* l) {
     const na::observe::HostWorkScope host;
@@ -100,9 +122,10 @@ void SceneFrame::Stencil(ID3D12GraphicsCommandList* l,Promotion& x,bool seed) {
     transition(l,target,D3D12_RESOURCE_STATE_COPY_DEST,seed?ts:x.state.native_state,1);
     transition(l,b,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
 }
-void SceneFrame::Written(uint64_t member) {
+void SceneFrame::Written(uint64_t member,ID3D12GraphicsCommandList* recording) {
+    const auto key=std::make_pair(na::observe::IdOf(recording),na::observe::ListRecording(recording));
     std::lock_guard<std::mutex> lock(mutex_);if(finished_)return;
-    for(auto& x:promotions_)if(x.state.member==member){x.written=x.pending=true;dirty_=true;outcome_=na::j2::PhysicalOutcome::Unavailable;return;}
+    for(auto& x:promotions_)if(x.state.member==member){x.written=x.pending=true;x.pending_recordings.insert(key);dirty_=true;outcome_=na::j2::PhysicalOutcome::Unavailable;return;}
 }
 void SceneFrame::StencilCleared(uint64_t member) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -131,10 +154,7 @@ bool SceneFrame::Finish(ID3D12GraphicsCommandList* l) {
     return Promote(l,true);
 }
 bool SceneFrame::Checkpoint(ID3D12GraphicsCommandList* l,const std::vector<FrameMemberState>& current) {
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for(const auto& state:current)for(auto& x:promotions_)if(x.state.member==state.member)x.state.native_state=state.native_state;
-    }
+    UpdateStates(current);
     return Promote(l,false);
 }
 bool SceneFrame::Promote(ID3D12GraphicsCommandList* l,bool final) {
@@ -142,9 +162,13 @@ bool SceneFrame::Promote(ID3D12GraphicsCommandList* l,bool final) {
     std::lock_guard<std::mutex> lock(mutex_);
     if(finished_||!dirty_)return true;
     if(!l||!na::observe::ListRasterStateRestorable(l)||!na::nr::native::RetainRecording(l,shared_from_this()))return false;
+    const auto recording=std::make_pair(na::observe::IdOf(l),na::observe::ListRecording(l));
     for(auto& x:promotions_) {
-        if(!x.pending)continue;
-        if(x.state.member==spec_.color&&outcome_==na::j2::PhysicalOutcome::Evaluated){x.pending=false;continue;}
+        const std::pair<uint64_t,uint64_t> legacy{};
+        if(!x.pending||(!final&&!x.pending_recordings.count(legacy)&&!x.pending_recordings.count(recording)))continue;
+        if(x.state.native_transfer_only)return false; // owner must mirror/acknowledge its native transfer
+        const auto published=[&]{if(final)x.pending_recordings.clear();else{x.pending_recordings.erase(legacy);x.pending_recordings.erase(recording);}x.pending=!x.pending_recordings.empty();};
+        if(x.state.member==spec_.color&&outcome_==na::j2::PhysicalOutcome::Evaluated){published();continue;}
         auto* reduced=x.member->reduced.Get();auto* native=x.member->native.Get();
         if(x.depth) {
             transition(l,reduced,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -166,7 +190,7 @@ bool SceneFrame::Promote(ID3D12GraphicsCommandList* l,bool final) {
             transition(l,native,D3D12_RESOURCE_STATE_RENDER_TARGET,x.state.native_state);
             transition(l,reduced,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
         }
-        x.pending=false;
+        published();
     }
     if(!na::observe::RestoreListState(l))return false;
     finished_=final;return true;

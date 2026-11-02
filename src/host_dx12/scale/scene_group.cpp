@@ -1,4 +1,5 @@
 #include "scene_group.hpp"
+#include "host_dx12/depth_format.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -57,8 +58,11 @@ std::shared_ptr<const SceneGroup> SceneGroup::Create(ID3D12Device* device, uint6
             request.reduced.height > d.Height || d.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN ||
             (d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)))
             return fail("member cannot use an independent reduced Texture2D");
-        if ((request.role == Role::Depth) != ((d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0))
+        if (request.role != Role::Depth && (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
             return fail("depth role disagrees with resource capabilities");
+        if(request.role==Role::Depth&&!(d.Flags&D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)&&
+           ((d.Flags&(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET|D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))||!na::depth::PlaneZeroCopiesToR32F(d.Format)))
+            return fail("copied depth must be an identified plain depth-plane format");
         member.reduced_desc = d;
         member.reduced_desc.Width = request.reduced.width;
         member.reduced_desc.Height = request.reduced.height;
