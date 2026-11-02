@@ -41,7 +41,9 @@ public:
         }
         if(complete && ordered_ && !spans_.empty() && spans_.back().end<=events.size()) {
             size_t last_write=events.size();
-            for(const auto& s:spans_)for(size_t i=s.begin;i<s.end;++i)if(events[i].write)last_write=i;
+            // A later colour writer need not bind the main depth (sky or a
+            // separate scene segment). It still invalidates an earlier end.
+            for(size_t i=0;i<events.size();++i)if(events[i].write)last_write=i;
             bool end_available=false;
             for(const auto& s:spans_)for(size_t i=s.begin;i<s.end;++i)if(i>last_write && events[i].op==Op::Barrier)end_available=true;
             for(const auto& s:spans_) {

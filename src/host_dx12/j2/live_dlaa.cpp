@@ -2396,8 +2396,8 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
                 decision.writer_occurrence, g.inl.valid && g.inl.list == lists[i] ? "*" : "");
             if (n > 0) g.insertion_trace_used += static_cast<size_t>(n);
         }
+        if(g.queue && queue!=g.queue.Get() && decision.writes)g.boundary_roles.OtherQueueWroteScene();
         if (!na::observe::ListRendersTo(lists[i], selected_color, selected_depth)) continue;
-        if(queue!=g.queue.Get() && decision.writes)g.boundary_roles.OtherQueueWroteScene();
         if(decision.writes)g.boundary_roles.Submitted(id,event_begin,g.frame_seq.size());
         // Command-list objects are pooled/reused. Learn the last scene-writing
         // recording in SUBMISSION order across this frame, not the prior job

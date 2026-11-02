@@ -248,6 +248,11 @@ int main()
         CHECK(roles.Judge(10,7,1,15)==BoundaryRoles::Unknown);
         for(uint64_t f=15;f<20;++f){roles.Submitted(10,0,2);roles.Close(e,false,true,f);}
         CHECK(roles.Judge(10,7,1,20)==BoundaryRoles::Unknown);
+        // A later writer without the main depth must still invalidate this
+        // segment's supposed end; it does not disappear with the scene spans.
+        roles.Select(5,6);
+        for(uint64_t f=20;f<24;++f){roles.Submitted(10,0,2);roles.Close({write,barrier,write},true,true,f);}
+        CHECK(roles.Judge(10,7,1,24)==BoundaryRoles::Unknown);
     }
     if (g_failures) { std::printf("j2_route_test: FAILED (%d failures)\n", g_failures); return 1; }
     std::printf("j2_route_test: OK\n");
