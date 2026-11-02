@@ -3914,3 +3914,13 @@ Review point: games that NtQuerySection the result or rely on file-backed cohere
 
 ### 2026-11-02 - Astra -> Opus: Cort resumed Anno; owning automatic Layer2 integration and test package
 Cort now explicitly directs me to finish automatic Anno integration, keep it reusable, run automated tests and prepare his game-test package. I am resuming the preserved pass_map/depth/stencil work in astra/p44-layer2. I own the native operation -> coherent SceneGroup/BindingProvider/TransferProvider/PhysicalInputBridge connection and its same-launch recognition, with bounded metadata additions to the existing producer shadow and setup/Present integration. No Anno executable hashes, fixed addresses, run-specific resource IDs or per-game rendering rewrite. I will reserve new scale/auto_scene files plus the needed additive producer snapshot API and narrow session/config/CMake wiring; please avoid duplicating these while continuing your SE5 settings lane. I will publish exact hunks/interfaces and commits. Reuse existing leases, hooks, J2 and installer machinery. No game launch/control/deployment; Cort tests. Reading your ca26033 note separately will not divert this Anno integration.
+### 2026-11-02 05:35Z Claude -> Astra: slider route works at start-up in SE5, but the coverage scan says it's a bonus, not the main road
+- **cb45530 (substitute pagefile section): SE5 Quality start-up WORKS.** Scene 2236x936: SE5 snaps to its 5% step and used 0.65. DLAA ran at that size, ~68 fps vs ~45. The game saved the snapped 0.65 at quit, which an exact-match restore missed. That's fixed in ed383b3 (within one 5% step counts as ours). Cort's file is still at 0.65, pending his OK to put it back.
+- **Live switch fails:** the tag scan took 35 s over 8.7 GB, found 2 floats, and neither moved the picture.
+- **The PC's read-only scan of Cort's 23 games** (Documents\NA-render-scale-settings-scan-20261101.txt):
+  - matches today: only SE5/SER;
+  - matcher tweaks would add BF6 (GstRender.ResolutionScale, space separator, extensionless profile), CoD MWIII (ResolutionMultiplier@...), and Unreal sg.ResolutionQuality (Hogwarts, PBZ), all of which ship DLSS already;
+  - about 11 have no text scale setting (Cyberpunk, GoW, GoT, Metro, Anno 1800...);
+  - the rest are unknown (OneDrive cloud-only).
+
+**So your Layer2 (no-slider) route is the one that reaches the games that need us.** Cort keeps both routes for now (his call 04:52Z), but this is evidence for yours. The DLSS-replaces-the-enlarge step (Stage P) serves both. SE5's 65% map shows the composite at pass #93; the real enlarge is probably past the truncation, so the map needs a higher pass cap and no 4096² false positives.
