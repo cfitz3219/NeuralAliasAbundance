@@ -50,7 +50,7 @@ void __stdcall forward(ID3D12CommandQueue* q,UINT n,ID3D12CommandList* const* li
     na::nr::native::Submission retained(q,n,lists);q->ExecuteCommandLists(n,lists);
 }
 float half(uint16_t h){const uint32_t e=(h>>10)&31,m=h&1023;const float v=e?std::ldexp(float(m|1024),int(e)-25):std::ldexp(float(m),-24);return h&0x8000?-v:v;}
-int pixels(test::Device& device,ID3D12Resource* color,float expected_x,float expected_y){
+int pixels(test::Device& device,ID3D12Resource* color,float expected_x,float expected_y,float expected_blue=9){
     const na::observe::HostWorkScope own;const auto desc=color->GetDesc();D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};UINT64 bytes=0;
     device.device->GetCopyableFootprints(&desc,0,1,0,&footprint,nullptr,nullptr,&bytes);
     auto readback=test::CreateBuffer(device.device.Get(),bytes,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);test::List copy;REQUIRE(readback&&copy.Create(device.device.Get()));
@@ -61,7 +61,7 @@ int pixels(test::Device& device,ID3D12Resource* color,float expected_x,float exp
     ID3D12CommandList* lists[]={copy.list.Get()};device.queue->ExecuteCommandLists(1,lists);device.WaitIdle();
     unsigned char* mapped=nullptr;REQUIRE(SUCCEEDED(readback->Map(0,nullptr,reinterpret_cast<void**>(&mapped))));unsigned wrong=0;
     for(UINT y=0;y<desc.Height;++y)for(UINT x=0;x<desc.Width;++x){const auto* p=reinterpret_cast<const uint16_t*>(mapped+footprint.Offset+y*footprint.Footprint.RowPitch+x*8);
-        wrong+=half(p[0])!=expected_x||half(p[1])!=expected_y||half(p[2])!=9||half(p[3])!=.75f;}
+        wrong+=half(p[0])!=expected_x||half(p[1])!=expected_y||half(p[2])!=expected_blue||half(p[3])!=.75f;}
     readback->Unmap(0,nullptr);std::printf("automatic native pixels %g/%g: wrong %u\n",expected_x,expected_y,wrong);CHECK(wrong==0);return 0;
 }
 }
@@ -71,6 +71,7 @@ int main(int argc,char** argv){
     const bool boundary=argc>1&&std::strcmp(argv[1],"--boundary")==0;
     const bool split=argc>1&&std::strcmp(argv[1],"--split")==0;
     const bool unsupported=argc>1&&std::strcmp(argv[1],"--unsupported")==0;
+    const bool materials=argc>1&&std::strcmp(argv[1],"--materials")==0;
     setvbuf(stdout,nullptr,_IONBF,0);test::ComPtr<ID3D12Debug> debug;
     if(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))debug->EnableDebugLayer();
     test::Device d;if(!test::CreateDevice(d))return test::SkipNoDevice("auto_scene_test");auto* dev=d.device.Get();
@@ -98,12 +99,14 @@ int main(int argc,char** argv){
         : "cbuffer View:register(b0){float2 ScreenSize;float marker,pad;float4 junk[4];float4x4 VP;float4x4 VPInv;};\n#define INVERSE_ERROR 0\n";
     code+=R"(
 Texture2D<float4> CopiedColor:register(t0);Texture2D<float> CopiedDepth:register(t1);
+Texture2D<float4> Material:register(t2);
 float4 vs(uint i:SV_VertexID):SV_Position{return float4(float2((i<<1)&2,i&2)*2-1,.5,1);}
-float4 ps():SV_Target{return float4(ScreenSize.xy,marker+INVERSE_ERROR,.75);}
+float4 ps():SV_Target{return float4(ScreenSize.xy,marker+INVERSE_ERROR+MATERIAL,.75);}
 float4 water(float4 position:SV_Position):SV_Target{uint2 p=uint2(position.xy);float4 c=CopiedColor.Load(int3(p,0));float d=CopiedDepth.Load(int3(p,0));return float4(c.xy+float2(d,0),marker+INVERSE_ERROR,.75);})";
+    code=std::string(materials?"#define MATERIAL Material.Load(int3(0,0,0)).x\n":"#define MATERIAL 0\n")+code;
     test::ComPtr<ID3DBlob> vs,ps,blob,error;REQUIRE(SUCCEEDED(D3DCompile(code.data(),code.size(),nullptr,nullptr,nullptr,"vs","vs_5_0",0,0,&vs,&error)));
     REQUIRE(SUCCEEDED(D3DCompile(code.data(),code.size(),nullptr,nullptr,nullptr,"ps","ps_5_0",0,0,&ps,&error)));
-    D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV,2,0,0,0};D3D12_ROOT_PARAMETER rp[2]{};rp[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;rp[0].Descriptor={0,0};
+    D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV,3,0,0,0};D3D12_ROOT_PARAMETER rp[2]{};rp[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;rp[0].Descriptor={0,0};
     rp[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;rp[1].DescriptorTable={1,&range};
     D3D12_ROOT_SIGNATURE_DESC rs{};rs.NumParameters=2;rs.pParameters=rp;
     REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rs,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&error)));
@@ -120,9 +123,19 @@ float4 water(float4 position:SV_Position):SV_Target{uint2 p=uint2(position.xy);f
     REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&rt))));hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_DSV;REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&ds))));
     const auto rtv=rt->GetCPUDescriptorHandleForHeapStart(),dsv=ds->GetCPUDescriptorHandleForHeapStart();dev->CreateRenderTargetView(color.Get(),nullptr,rtv);
     D3D12_DEPTH_STENCIL_VIEW_DESC dd{};dd.Format=depth_view;dd.ViewDimension=D3D12_DSV_DIMENSION_TEXTURE2D;dev->CreateDepthStencilView(depth.Get(),&dd,dsv);
-    hd={D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,2,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};test::ComPtr<ID3D12DescriptorHeap> texture_heap;REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&texture_heap))));
+    hd={D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,3,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};test::ComPtr<ID3D12DescriptorHeap> texture_heap;REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&texture_heap))));
     auto view=texture_heap->GetCPUDescriptorHandleForHeapStart();D3D12_SHADER_RESOURCE_VIEW_DESC srv{};srv.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;srv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;srv.Texture2D.MipLevels=1;dev->CreateShaderResourceView(color_copy.Get(),&srv,view);
     view.ptr+=dev->GetDescriptorHandleIncrementSize(hd.Type);srv.Format=stencil?DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:DXGI_FORMAT_R32_FLOAT;dev->CreateShaderResourceView(depth_copy.Get(),&srv,view);
+    view.ptr+=dev->GetDescriptorHandleIncrementSize(hd.Type);const auto material_slot=view;
+    std::array<test::ComPtr<ID3D12Resource>,2> material_textures;
+    for(auto& texture:material_textures){texture=test::CreateTexture(dev,4,4,DXGI_FORMAT_R16G16B16A16_FLOAT,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);REQUIRE(texture);}
+    if(materials){const na::observe::HostWorkScope own;test::List init;REQUIRE(init.Create(dev));test::ComPtr<ID3D12DescriptorHeap> material_rt;
+        D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,2,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&desc,IID_PPV_ARGS(&material_rt))));
+        auto target=material_rt->GetCPUDescriptorHandleForHeapStart();for(UINT i=0;i<2;++i){dev->CreateRenderTargetView(material_textures[i].Get(),nullptr,target);
+            auto transition=test::Transition(material_textures[i].Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_RENDER_TARGET);init.list->ResourceBarrier(1,&transition);
+            const float values[4]={i?.75f:.25f,0,0,0};init.list->ClearRenderTargetView(target,values,0,nullptr);std::swap(transition.Transition.StateBefore,transition.Transition.StateAfter);init.list->ResourceBarrier(1,&transition);target.ptr+=dev->GetDescriptorHandleIncrementSize(desc.Type);}
+        init.list->Close();ID3D12CommandList* lists[]={init.list.Get()};d.queue->ExecuteCommandLists(1,lists);d.WaitIdle();}
+    srv.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;dev->CreateShaderResourceView(material_textures[0].Get(),&srv,material_slot);
     na::observe::SetLiveSelection(na::observe::IdOf(depth.Get()),na::observe::IdOf(color.Get()));
     test::ComPtr<ID3D12CommandSignature> indirect_signature;
     auto indirect_args=test::CreateBuffer(dev,256,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);REQUIRE(indirect_args);
@@ -132,8 +145,10 @@ float4 water(float4 position:SV_Position):SV_Target{uint2 p=uint2(position.xy);f
     void* arguments=nullptr;REQUIRE(SUCCEEDED(indirect_args->Map(0,nullptr,&arguments)));const D3D12_DRAW_ARGUMENTS draw{3,1,0,0};std::memcpy(arguments,&draw,sizeof draw);indirect_args->Unmap(0,nullptr);
     test::List scene;REQUIRE(scene.Create(dev));REQUIRE(SUCCEEDED(scene.list->Close()));
     test::List tail;REQUIRE(tail.Create(dev));REQUIRE(SUCCEEDED(tail.list->Close()));
+    unsigned frame_number=0;float material_value=0;
     const auto frame=[&](bool reconstruct){
-        d.WaitIdle();na::scale::AutomaticScenePresent();na::j2::OnPresent(d.queue.Get());scene.Reset();auto* list=scene.list.Get();
+        d.WaitIdle();if(materials){const auto index=frame_number++%2;material_value=index?.75f:.25f;dev->CreateShaderResourceView(material_textures[index].Get(),&srv,material_slot);}
+        na::scale::AutomaticScenePresent();na::j2::OnPresent(d.queue.Get());scene.Reset();auto* list=scene.list.Get();
         D3D12_RESOURCE_BARRIER start[]={test::Transition(color.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_RENDER_TARGET),test::Transition(depth.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_DEPTH_WRITE)};list->ResourceBarrier(2,start);
         list->SetGraphicsRootSignature(root.Get());list->SetPipelineState(pso.Get());list->SetGraphicsRootConstantBufferView(0,cb->GetGPUVirtualAddress());
         ID3D12DescriptorHeap* heap=texture_heap.Get();list->SetDescriptorHeaps(1,&heap);list->SetGraphicsRootDescriptorTable(1,texture_heap->GetGPUDescriptorHandleForHeapStart());
@@ -171,14 +186,25 @@ float4 water(float4 position:SV_Position):SV_Target{uint2 p=uint2(position.xy);f
     auto status=na::scale::GetAutomaticSceneStats();
     if(unsupported){
         CHECK(status.failed_plans>0&&status.redirected==0);
-        const auto attempts=status.poll_builds,groups=status.group_builds,operations=status.operations;
+        const auto attempts=status.poll_builds,groups=status.group_builds;
         for(int i=0;i<32;++i)na::scale::PollAutomaticScene();
         CHECK(na::scale::GetAutomaticSceneStats().poll_builds==attempts&&na::scale::GetAutomaticSceneStats().group_builds==groups);
-        na::settings::Get().j2_scale_mode.store(0);frame(false);
-        CHECK(na::scale::GetAutomaticSceneStats().operations==operations);
         REQUIRE(pixels(d,color.Get(),w-.5f,h)==0);
+        // Negative caching is evidence-based: the same address becomes usable
+        // once its actual named dimensions change. No group reallocation.
+        const float correct_width=w;std::memcpy(mapped,&correct_width,4);na::settings::Get().j2_scale_mode.store(1);
+        for(int i=0;i<8;++i)frame(false);
+        const auto recovered=na::scale::GetAutomaticSceneStats();CHECK(recovered.failed_plans==0&&recovered.redirected>0&&recovered.group_builds==groups);
+        REQUIRE(pixels(d,color.Get(),float(recovered.render_w)+.5f,float(recovered.render_h))==0);
+        const auto operations=recovered.operations;na::settings::Get().j2_scale_mode.store(0);frame(false);
+        CHECK(na::scale::GetAutomaticSceneStats().operations==operations);REQUIRE(pixels(d,color.Get(),w+.5f,h)==0);
     }else{
     CHECK(status.plans>0&&status.members==4&&status.redirected>0);
+    if(materials){const auto attempts=status.poll_builds,snapshots=status.snapshots,misses=status.misses;
+        for(int i=0;i<24;++i){frame(false);REQUIRE(pixels(d,color_copy.Get(),float(status.render_w),float(status.render_h),9+material_value)==0);}
+        status=na::scale::GetAutomaticSceneStats();std::printf("material churn: builds %llu->%llu snapshots %llu->%llu misses %llu->%llu fast %llu\n",
+            attempts,status.poll_builds,snapshots,status.snapshots,misses,status.misses,status.fast_hits);
+        CHECK(status.poll_builds==attempts&&status.snapshots==snapshots&&status.misses==misses&&status.fast_hits>=48);}
     // A one-Present menu candidate must not discard the learned scene. A
     // stable alternate selection may switch, then restoring the original pair
     // must reuse its prepared group rather than allocate/relearn everything.
@@ -196,8 +222,11 @@ float4 water(float4 position:SV_Position):SV_Target{uint2 p=uint2(position.xy);f
     for(int i=0;i<3;++i)na::scale::AutomaticScenePresent();
     frame(false);status=na::scale::GetAutomaticSceneStats();
     CHECK(status.generation==learned_generation&&status.group_builds==learned_builds);
-    REQUIRE(pixels(d,color.Get(),float(status.render_w)+.5f,float(status.render_h))==0);
-    REQUIRE(pixels(d,color_copy.Get(),float(status.render_w),float(status.render_h))==0);
+    REQUIRE(pixels(d,color.Get(),float(boundary?w:status.render_w)+.5f,float(boundary?h:status.render_h))==0);
+    REQUIRE(pixels(d,color_copy.Get(),float(boundary?w:status.render_w),float(boundary?h:status.render_h),9+material_value)==0);
+    CHECK(status.fast_hits>0);
+    if(boundary){const auto redirected=status.redirected,misses=status.misses;frame(false);frame(false);
+        CHECK(na::scale::GetAutomaticSceneStats().redirected==redirected&&na::scale::GetAutomaticSceneStats().misses==misses);}
     frame(true);const auto js=na::j2::GetStats();
     CHECK(boundary?(js.physical_evaluated==0&&js.render_w==w):(js.physical_evaluated>0&&js.render_w==status.render_w&&js.out_w==w));
     REQUIRE(pixels(d,color.Get(),55,66)==0);
@@ -205,7 +234,7 @@ float4 water(float4 position:SV_Position):SV_Target{uint2 p=uint2(position.xy);f
     status=na::scale::GetAutomaticSceneStats();CHECK(status.render_w==w/2&&status.render_h==h/2);
     CHECK(na::j2::GetStats().render_w==(boundary?w:w/2));
     REQUIRE(pixels(d,color.Get(),55,66)==0);
-    fake::eval_result=NVSDK_NGX_Result_FAIL_InvalidParameter;frame(true);REQUIRE(pixels(d,color.Get(),float(status.render_w)+.5f,float(status.render_h))==0);
+    fake::eval_result=NVSDK_NGX_Result_FAIL_InvalidParameter;frame(true);REQUIRE(pixels(d,color.Get(),float(boundary?w:status.render_w)+.5f,float(boundary?h:status.render_h))==0);
     fake::eval_result=NVSDK_NGX_Result_Success;
     na::settings::Get().j2_scale_mode.store(0);frame(false);CHECK(!na::scale::GetAutomaticSceneStats().active);
     REQUIRE(pixels(d,color.Get(),w+.5f,h)==0);

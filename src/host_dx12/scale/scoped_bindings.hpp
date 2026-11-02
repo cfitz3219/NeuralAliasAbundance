@@ -53,12 +53,14 @@ struct BindingSpec {
 class PreparedBindings {
 public:
     static std::shared_ptr<const PreparedBindings> Create(ID3D12Device*, BindingSpec, std::string& error);
+    const std::vector<uint64_t>& WrittenMembers()const{return written_;}
 private:
     BindingSpec spec_;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> views_, rtvs_, dsv_;
     std::vector<D3D12_RESOURCE_BARRIER> enter_, leave_;
     std::vector<D3D12_VIEWPORT> viewports_;
     std::vector<D3D12_RECT> scissors_;
+    std::vector<uint64_t> written_;
     UINT dispatch_x_ = 0, dispatch_y_ = 0;
     uint64_t tables_mask_ = 0, cbv_mask_ = 0;
     UINT increment_ = 0;

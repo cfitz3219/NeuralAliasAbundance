@@ -16,9 +16,15 @@ bool NativeBindingSpec(const na::observe::NativeOperation& op, std::shared_ptr<c
         for (auto& u : s.uses) if (u.member == member && u.subresource == sub) { u.state |= state; return; }
         s.uses.push_back({member, sub, state});
     };
-    for (const auto& t : op.tables) s.tables.push_back({t.param,t.first});
+    bool rebase=false;
+    for(const auto& d:op.descriptors)rebase|=d.used&&(group->Find(d.view.resource)||group->Find(d.view.counter));
+    for(const auto& c:op.constants)rebase|=c.descriptor!=UINT_MAX;
+    if(rebase)for (const auto& t : op.tables) s.tables.push_back({t.param,t.first});
+    if(rebase)
     for (const auto& d : op.descriptors) {
         ShaderView v; const auto* member = group->Find(d.view.resource);
+        if(!d.used){v.kind=ShaderView::Kind::Srv;v.srv.Format=DXGI_FORMAT_R8_UNORM;v.srv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
+            v.srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;v.srv.Texture2D.MipLevels=1;s.views.push_back(std::move(v));continue;}
         v.resource = member ? member->reduced : d.resource; v.counter = d.counter; v.default_view = !d.view.explicit_view;
         if (d.view.kind == NA_DESC_CBV) { v.kind = ShaderView::Kind::NativeCbv; v.cbv = d.view.cbv; }
         else if (d.view.kind == NA_DESC_SRV) {

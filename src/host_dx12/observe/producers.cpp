@@ -140,6 +140,8 @@ struct Obj {
     std::vector<na_root_range> root_ranges;
     uint64_t root_hash = 0;                 // structural layout hash (role classes; stable across sessions)
     std::vector<ShaderDimension> dimensions;
+    std::vector<ShaderResource> shader_resources;
+    bool reflection_complete=false;
     // Live mip bias: per-level twins of a root signature / pipeline state (index = level).
     // same[i]: the game's own object is already correct for level i (nothing to swap).
     // Immutable once published; owns a reference on every twin. A twin is never one of
@@ -1578,6 +1580,8 @@ uint64_t fnv1a(const void* data, size_t n)
 }
 
 thread_local std::vector<ShaderDimension> g_next_dimensions;
+thread_local std::vector<ShaderResource> g_next_shader_resources;
+thread_local bool g_next_reflection_complete=true;
 void bytecode(na_ev_pipeline_created& e, uint32_t stage, const D3D12_SHADER_BYTECODE& b)
 {
     if (!b.pShaderBytecode || !b.BytecodeLength) return;
@@ -1585,7 +1589,7 @@ void bytecode(na_ev_pipeline_created& e, uint32_t stage, const D3D12_SHADER_BYTE
     e.stage_bytes[stage] = static_cast<uint32_t>(b.BytecodeLength);
     if(g_operation_snapshots.load()&&!t_host_work){
         const uint32_t visibility[]={D3D12_SHADER_VISIBILITY_VERTEX,D3D12_SHADER_VISIBILITY_PIXEL,D3D12_SHADER_VISIBILITY_DOMAIN,D3D12_SHADER_VISIBILITY_HULL,D3D12_SHADER_VISIBILITY_GEOMETRY};
-        ReflectDimensions(b,g_next_dimensions,stage<5?visibility[stage]:D3D12_SHADER_VISIBILITY_ALL);
+        g_next_reflection_complete &= ReflectDimensions(b,g_next_dimensions,stage<5?visibility[stage]:D3D12_SHADER_VISIBILITY_ALL,&g_next_shader_resources);
     }
 }
 
@@ -1622,7 +1626,9 @@ void emit_pipeline(ID3D12Device* dev, IUnknown* obj, na_ev_pipeline_created& e, 
     remember_creation(obj, e);
     if(g_operation_snapshots.load()&&!t_host_work){
         std::unique_lock<std::shared_mutex> lock(g_m);
-        const auto found=g_objs.find(canon(obj));if(found!=g_objs.end())found->second.dimensions=g_next_dimensions;
+        const auto found=g_objs.find(canon(obj));if(found!=g_objs.end()){
+            found->second.dimensions=g_next_dimensions;found->second.shader_resources=g_next_shader_resources;
+            found->second.reflection_complete=g_next_reflection_complete;}
     }
     emit(e, NA_GROUP_PIPELINE);
 }
@@ -1880,7 +1886,7 @@ HRESULT STDMETHODCALLTYPE D_CreateGraphicsPipelineState(ID3D12Device* dev, const
     const HRESULT hr = o_CreateGraphicsPipelineState(dev, d, riid, out);
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj || !d) return hr;
-    g_next_dimensions.clear();
+    g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;
     na_ev_pipeline_created e;
     init_header(e, NA_EV_PIPELINE_CREATED, NA_EVF_FOUNDATIONAL);
     e.pipeline_kind = NA_PIPELINE_GRAPHICS;
@@ -1912,7 +1918,7 @@ HRESULT STDMETHODCALLTYPE D_CreateComputePipelineState(ID3D12Device* dev, const 
     const HRESULT hr = o_CreateComputePipelineState(dev, d, riid, out);
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj || !d) return hr;
-    g_next_dimensions.clear();
+    g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;
     na_ev_pipeline_created e;
     init_header(e, NA_EV_PIPELINE_CREATED, NA_EVF_FOUNDATIONAL);
     e.pipeline_kind = NA_PIPELINE_COMPUTE;
@@ -1986,7 +1992,7 @@ HRESULT STDMETHODCALLTYPE D_CreatePipelineState(ID3D12Device2* dev, const D3D12_
     const HRESULT hr = o_CreatePipelineState(dev, d, riid, out);
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj || !d || !d->pPipelineStateSubobjectStream) return hr;
-    g_next_dimensions.clear();
+    g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;
     na_ev_pipeline_created e;
     init_header(e, NA_EV_PIPELINE_CREATED, NA_EVF_FOUNDATIONAL);
     e.pipeline_kind = NA_PIPELINE_STREAM;
@@ -5438,6 +5444,16 @@ void MipBiasCounts(uint64_t* samplers, uint64_t* static_samplers)
 HostWorkScope::HostWorkScope() : prev_(t_host_work) { t_host_work = true; }
 HostWorkScope::~HostWorkScope() { t_host_work = prev_; }
 void SetOperationSnapshots(bool enabled) { g_operation_snapshots.store(enabled); }
+namespace {
+bool shader_uses(const Obj& pipeline,const na_root_param& param,const na_root_range& range,uint32_t index){
+    if(!pipeline.reflection_complete)return true;
+    for(const auto& used:pipeline.shader_resources){
+        if(param.visibility!=D3D12_SHADER_VISIBILITY_ALL&&used.visibility!=D3D12_SHADER_VISIBILITY_ALL&&param.visibility!=used.visibility)continue;
+        if(used.type==range.range_type&&used.space==range.register_space&&index>=used.first&&
+            (used.count==UINT_MAX||index-used.first<used.count))return true;}
+    return false;
+}
+}
 bool NativeDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle,OperationDescriptor& out) {
     out={};DescriptorDetails details;uint64_t version=0;
     {
@@ -5449,6 +5465,66 @@ bool NativeDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle,OperationDescriptor& ou
     if(details.resource){next.resource.Attach(AcquireResource(details.resource));if(!next.resource)return false;}
     if(details.counter){next.counter.Attach(AcquireResource(details.counter));if(!next.counter)return false;}
     out=std::move(next);return true;
+}
+bool ListNativeOperationKey(ID3D12GraphicsCommandList* list,bool compute,const uint64_t* members,size_t count,NativeOperationKey& out){
+    out={};OperationKey key;
+    std::shared_lock<std::shared_mutex> lock(g_m);
+    auto* ls=list?list_state_locked(list,&out.list):nullptr;
+    if(!ls||!ls->recording_observed.load()||!ls->coverage_complete.load()||!ls->generation_known.load())return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    if(!ls->restorable||ls->in_render_pass)return false;
+    const auto rs=g_objs.find(canon(ls->root_sig[compute])),pipeline=g_objs.find(canon(ls->pso));
+    if(rs==g_objs.end()||pipeline==g_objs.end()||rs->second.root_params.size()>64)return false;
+    out.recording=ls->generation.load()+1;
+    OperationKey::add(key.state,pipeline->second.id);OperationKey::add(key.state,compute);
+    const auto root=reinterpret_cast<uintptr_t>(ls->root_sig[compute]);OperationKey::add(key.state,root);
+    const auto& args=ls->args[compute];bool rebase=false;uint32_t descriptor_count=0;
+    const auto member=[&](uint64_t id){for(size_t i=0;i<count;++i)if(members[i]==id)return true;return false;};
+    for(uint32_t param=0;param<rs->second.root_params.size();++param){const auto& p=rs->second.root_params[param];
+        if(p.param_type!=NA_ROOT_TABLE||param>=args.size()||args[param].type!=1)continue;
+        if(p.first_range>rs->second.root_ranges.size()||p.count>rs->second.root_ranges.size()-p.first_range)return false;
+        uint32_t span=0;bool sampler=false;
+        for(uint32_t r=0;r<p.count;++r){const auto& range=rs->second.root_ranges[p.first_range+r];
+            if(range.num_descriptors==UINT_MAX||range.table_offset==UINT_MAX||range.num_descriptors>4096||range.table_offset>4096-range.num_descriptors)return false;
+            sampler|=range.range_type==D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;span=std::max(span,range.table_offset+range.num_descriptors);}
+        if(sampler)continue;
+        uint32_t slot=0;const auto* heap=heap_for_gpu_locked(args[param].value,&slot);
+        if(!heap||span>heap->count-slot||span>4096-descriptor_count)return false;
+        for(uint32_t i=0;i<span;++i){bool used=!pipeline->second.reflection_complete;
+            if(!used)for(uint32_t r=0;r<p.count;++r){const auto& range=rs->second.root_ranges[p.first_range+r];
+                if(i>=range.table_offset&&i-range.table_offset<range.num_descriptors)used|=shader_uses(pipeline->second,p,range,range.base_register+i-range.table_offset);}
+            const auto& details=heap->info[slot+i].details;if(used&&!details)return false;
+            if(details){key.descriptor(*details,used);rebase|=used&&(member(details->resource)||member(details->counter));}
+            else key.descriptor({},false);
+        }
+        descriptor_count+=span;
+    }
+    // Hash only named, used dimension bindings. Per-object/material CBVs and
+    // native table addresses are not copied or retained by passthrough plans.
+    for(const auto& field:pipeline->second.dimensions)for(uint32_t param=0;param<rs->second.root_params.size()&&param<args.size();++param){
+        const auto& p=rs->second.root_params[param];uint32_t descriptor=UINT_MAX;uint64_t address=0;
+        if(p.visibility!=D3D12_SHADER_VISIBILITY_ALL&&field.visibility!=D3D12_SHADER_VISIBILITY_ALL&&p.visibility!=field.visibility)continue;
+        if(p.param_type==NA_ROOT_CBV&&args[param].type==2&&p.shader_register==field.shader_register&&p.register_space==field.space)address=args[param].value;
+        else if(p.param_type==NA_ROOT_TABLE&&args[param].type==1){uint32_t first=0;
+            for(uint32_t previous=0;previous<param;++previous){const auto& t=rs->second.root_params[previous];
+                if(t.param_type!=NA_ROOT_TABLE||previous>=args.size()||args[previous].type!=1)continue;
+                uint32_t span=0;bool sampler=false;for(uint32_t r=0;r<t.count;++r){const auto& range=rs->second.root_ranges[t.first_range+r];sampler|=range.range_type==D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;span=std::max(span,range.table_offset+range.num_descriptors);}if(!sampler)first+=span;}
+            uint32_t slot=0;const auto* heap=heap_for_gpu_locked(args[param].value,&slot);if(!heap)return false;
+            for(uint32_t r=0;r<p.count;++r){const auto& range=rs->second.root_ranges[p.first_range+r];
+                if(range.range_type!=D3D12_DESCRIPTOR_RANGE_TYPE_CBV||range.register_space!=field.space||field.shader_register<range.base_register||field.shader_register-range.base_register>=range.num_descriptors)continue;
+                const auto offset=range.table_offset+field.shader_register-range.base_register;
+                const auto& details=heap->info[slot+offset].details;if(!details)return false;address=details->cbv.BufferLocation;descriptor=first+offset;}
+        }
+        uint64_t resource=0,offset=0;if(address&&resolve_va_locked(address,&resource,&offset)){key.constant(param,descriptor,resource,offset,field);rebase|=descriptor!=UINT_MAX;}
+    }
+    if(!compute){if(!ls->raster_tracking||!ls->raster_targets_known||!ls->raster_viewports_known||!ls->raster_scissors_known)return false;
+        for(const auto& rt:ls->native_colors){if(!rt)return false;OperationKey::add(key.state,rt->resource);OperationKey::add(key.state,rt->rtv);}
+        const DescriptorDetails empty{};const auto& depth=ls->native_depth?*ls->native_depth:empty;
+        if(!ls->native_depth&&ls->raster_has_depth)return false;
+        OperationKey::add(key.state,depth.resource);OperationKey::add(key.state,depth.dsv);
+        for(UINT i=0;i<ls->raster_viewport_count;++i)OperationKey::add(key.state,ls->raster_viewports[i]);
+        for(UINT i=0;i<ls->raster_scissor_count;++i)OperationKey::add(key.state,ls->raster_scissors[i]);}
+    out.key=key.finish(rebase);return true;
 }
 bool ListNativeOperation(ID3D12GraphicsCommandList* list, bool compute, NativeOperation& out)
 {
@@ -5467,6 +5543,7 @@ bool ListNativeOperation(ID3D12GraphicsCommandList* list, bool compute, NativeOp
         next.pipeline = ls->pso;
         const auto pipeline = g_objs.find(canon(ls->pso));
         if (pipeline != g_objs.end()) next.pipeline_id = pipeline->second.id;
+        next.reflection_complete=pipeline!=g_objs.end()&&pipeline->second.reflection_complete;
         const auto& args = ls->args[compute];
         for (uint32_t param = 0; param < rs->second.root_params.size(); ++param) {
             const auto& p = rs->second.root_params[param];
@@ -5486,8 +5563,12 @@ bool ListNativeOperation(ID3D12GraphicsCommandList* list, bool compute, NativeOp
             next.tables.push_back({param, static_cast<uint32_t>(next.descriptors.size()), span});
             for (uint32_t i = 0; i < span; ++i) {
                 const auto& info = heap->info[slot + i];
-                if (!info.details) return false;
-                OperationDescriptor d; d.view = *info.details; d.version = heap->versions[slot + i];
+                OperationDescriptor d;d.used=!next.reflection_complete;
+                if(next.reflection_complete)for(uint32_t r=0;r<p.count;++r){const auto& range=rs->second.root_ranges[p.first_range+r];
+                    if(i>=range.table_offset&&i-range.table_offset<range.num_descriptors)
+                        d.used|=shader_uses(pipeline->second,p,range,range.base_register+i-range.table_offset);}
+                if (!info.details&&d.used) return false;
+                if(info.details)d.view = *info.details; d.version = heap->versions[slot + i];
                 next.descriptors.push_back(std::move(d));
             }
         }
@@ -5530,7 +5611,7 @@ bool ListNativeOperation(ID3D12GraphicsCommandList* list, bool compute, NativeOp
         if (d.view.counter) { d.counter.Attach(AcquireResource(d.view.counter)); if (!d.counter) return false; }
         return true;
     };
-    for (auto& d : next.descriptors) if (!acquire(d)) return false;
+    for (auto& d : next.descriptors) if (d.used&&!acquire(d)) return false;
     for (auto& d : next.colors) if (!acquire(d)) return false;
     if (next.depth.view.resource && !acquire(next.depth)) return false;
     for(auto& c:next.constants){c.resource.Attach(AcquireResource(c.resource_id));if(!c.resource)return false;}

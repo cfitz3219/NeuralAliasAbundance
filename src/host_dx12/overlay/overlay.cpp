@@ -715,12 +715,18 @@ void write_status_line()
         if (jn > 0) WriteFile(f, jl, static_cast<DWORD>((std::min)(jn, static_cast<int>(sizeof(jl) - 1))), &written, nullptr);
         {
             const auto automatic=na::scale::GetAutomaticSceneStats();
-            if(automatic.enabled){char automatic_line[768];const int automatic_bytes=snprintf(automatic_line,sizeof automatic_line,
-                "layer2 mode=%u active=%u generation=%llu render=%ux%u output=%ux%u members=%u plans=%u operations=%llu redirected=%llu checkpoints=%llu misses=%llu frames=%llu reason=\"%s\"\r\n",
+            if(automatic.enabled){char automatic_line[1400];const int automatic_bytes=snprintf(automatic_line,sizeof automatic_line,
+                "layer2 mode=%u active=%u generation=%llu render=%ux%u output=%ux%u members=%u plans=%u operations=%llu redirected=%llu checkpoints=%llu misses=%llu frames=%llu presents=%llu reduced_frames=%llu reduced_pct=%.2f fast_hits=%llu snapshots=%llu failed_plans=%llu poll_builds=%llu group_builds=%llu unknown_ops=%llu binding_failures=%llu native_boundaries=%llu transfer_failures=%llu control_wait_us=%llu control_hold_us=%llu control_max_us=%llu worker_us=%llu reason=\"%s\"\r\n",
                 na::settings::Get().j2_scale_mode.load(),automatic.active?1u:0u,(unsigned long long)automatic.generation,
                 automatic.render_w,automatic.render_h,automatic.out_w,automatic.out_h,automatic.members,automatic.plans,
                 (unsigned long long)automatic.operations,(unsigned long long)automatic.redirected,(unsigned long long)automatic.checkpoints,
-                (unsigned long long)automatic.misses,(unsigned long long)automatic.frames,automatic.reason);
+                (unsigned long long)automatic.misses,(unsigned long long)automatic.frames,(unsigned long long)automatic.presents,
+                (unsigned long long)automatic.redirected_frames,automatic.presents?100.0*automatic.redirected_frames/automatic.presents:0.0,
+                (unsigned long long)automatic.fast_hits,(unsigned long long)automatic.snapshots,(unsigned long long)automatic.failed_plans,
+                (unsigned long long)automatic.poll_builds,(unsigned long long)automatic.group_builds,(unsigned long long)automatic.unknown_operations,
+                (unsigned long long)automatic.binding_failures,(unsigned long long)automatic.native_boundaries,(unsigned long long)automatic.transfer_failures,
+                (unsigned long long)automatic.control_wait_us,(unsigned long long)automatic.control_hold_us,(unsigned long long)automatic.control_max_us,
+                (unsigned long long)automatic.worker_us,automatic.reason);
                 if(automatic_bytes>0)WriteFile(f,automatic_line,DWORD((std::min)(automatic_bytes,int(sizeof automatic_line-1))),&written,nullptr);
             }
         }

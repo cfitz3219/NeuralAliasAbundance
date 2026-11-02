@@ -38,20 +38,29 @@ void variable(ID3D12ShaderReflectionType* type,const char* name,uint32_t offset,
     }
 }
 }
-void ReflectDimensions(const D3D12_SHADER_BYTECODE& code,std::vector<ShaderDimension>& out,uint32_t visibility) {
-    if(!code.pShaderBytecode||!code.BytecodeLength)return;
+bool ReflectDimensions(const D3D12_SHADER_BYTECODE& code,std::vector<ShaderDimension>& out,uint32_t visibility,std::vector<ShaderResource>* resources) {
+    if(!code.pShaderBytecode||!code.BytecodeLength)return false;
     Microsoft::WRL::ComPtr<ID3D12ShaderReflection> shader;
-    if(FAILED(D3DReflect(code.pShaderBytecode,code.BytecodeLength,IID_PPV_ARGS(&shader))))return;
-    D3D12_SHADER_DESC desc{};if(FAILED(shader->GetDesc(&desc)))return;
+    if(FAILED(D3DReflect(code.pShaderBytecode,code.BytecodeLength,IID_PPV_ARGS(&shader))))return false;
+    D3D12_SHADER_DESC desc{};if(FAILED(shader->GetDesc(&desc)))return false;
+    if(resources)for(UINT i=0;i<desc.BoundResources;++i){D3D12_SHADER_INPUT_BIND_DESC b{};
+        if(FAILED(shader->GetResourceBindingDesc(i,&b)))return false;
+        uint32_t type=D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        if(b.Type==D3D_SIT_CBUFFER)type=D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
+        else if(b.Type==D3D_SIT_SAMPLER)type=D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+        else if(b.Type==D3D_SIT_UAV_RWTYPED||b.Type==D3D_SIT_UAV_RWSTRUCTURED||b.Type==D3D_SIT_UAV_RWBYTEADDRESS||
+                b.Type==D3D_SIT_UAV_APPEND_STRUCTURED||b.Type==D3D_SIT_UAV_CONSUME_STRUCTURED||b.Type==D3D_SIT_UAV_RWSTRUCTURED_WITH_COUNTER)type=D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        resources->push_back({type,b.BindPoint,b.BindCount,b.Space,visibility});}
     const size_t start=out.size();
     for(UINT i=0;i<desc.ConstantBuffers;++i){auto* cb=shader->GetConstantBufferByIndex(i);D3D12_SHADER_BUFFER_DESC b{};
         if(!cb||FAILED(cb->GetDesc(&b))||b.Type!=D3D_CT_CBUFFER||b.Size>65536)continue;
         D3D12_SHADER_INPUT_BIND_DESC binding{};if(FAILED(shader->GetResourceBindingDescByName(b.Name,&binding)))continue;
         for(UINT j=0;j<b.Variables;++j){auto* v=cb->GetVariableByIndex(j);D3D12_SHADER_VARIABLE_DESC value{};
-            if(v&&SUCCEEDED(v->GetDesc(&value)))variable(v->GetType(),value.Name,value.StartOffset,binding.BindPoint,binding.Space,b.Size,out);}
+            if(v&&SUCCEEDED(v->GetDesc(&value))&&(value.uFlags&D3D_SVF_USED))variable(v->GetType(),value.Name,value.StartOffset,binding.BindPoint,binding.Space,b.Size,out);}
     }
     for(size_t i=start;i<out.size();++i)out[i].visibility=visibility;
     std::sort(out.begin(),out.end(),[](const auto& a,const auto& b){return std::tie(a.visibility,a.space,a.shader_register,a.offset,a.dimension)<std::tie(b.visibility,b.space,b.shader_register,b.offset,b.dimension);});
     out.erase(std::unique(out.begin(),out.end(),[](const auto& a,const auto& b){return a.visibility==b.visibility&&a.space==b.space&&a.shader_register==b.shader_register&&a.offset==b.offset&&a.dimension==b.dimension&&a.integer==b.integer;}),out.end());
+    return true;
 }
 }

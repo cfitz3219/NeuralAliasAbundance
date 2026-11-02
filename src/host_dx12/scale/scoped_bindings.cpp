@@ -45,6 +45,8 @@ std::shared_ptr<const PreparedBindings> PreparedBindings::Create(ID3D12Device* d
             (s.uses[j].subresource == use.subresource || s.uses[j].subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES ||
              use.subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES)) return fail("overlapping private resource state entries");
         if (use.state != D3D12_RESOURCE_STATE_COMMON) {
+            if((use.state&(D3D12_RESOURCE_STATE_RENDER_TARGET|D3D12_RESOURCE_STATE_DEPTH_WRITE|D3D12_RESOURCE_STATE_UNORDERED_ACCESS))&&
+                std::find(p->written_.begin(),p->written_.end(),use.member)==p->written_.end())p->written_.push_back(use.member);
             D3D12_RESOURCE_BARRIER b{}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             b.Transition = {member->reduced.Get(), use.subresource, D3D12_RESOURCE_STATE_COMMON, use.state};
             p->enter_.push_back(b); std::swap(b.Transition.StateBefore, b.Transition.StateAfter); p->leave_.push_back(b);

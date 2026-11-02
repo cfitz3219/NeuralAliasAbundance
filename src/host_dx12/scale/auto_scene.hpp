@@ -14,6 +14,9 @@ struct AutomaticSceneStats {
     uint32_t render_w=0,render_h=0,out_w=0,out_h=0,members=0,plans=0;
     uint64_t generation=0,operations=0,redirected=0,checkpoints=0,misses=0,frames=0;
     uint64_t poll_builds=0,failed_plans=0,group_builds=0;
+    uint64_t fast_hits=0,snapshots=0,presents=0,redirected_frames=0;
+    uint64_t unknown_operations=0,binding_failures=0,native_boundaries=0,transfer_failures=0;
+    uint64_t control_wait_us=0,control_hold_us=0,control_max_us=0,worker_us=0;
     char reason[192]{};
 };
 AutomaticSceneStats GetAutomaticSceneStats();
