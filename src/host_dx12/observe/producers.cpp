@@ -218,7 +218,7 @@ std::unordered_map<na_object_id, const void*> g_res_keys; // resource id -> cano
 std::atomic<uint64_t> g_next_id{1};
 
 struct Counters {
-    std::atomic<uint64_t> nested_unlocked{0};
+    std::atomic<uint64_t> nested_unlocked{0}, serialized{0};
     std::atomic<uint64_t> snap_reread{0}, preexisting_resources{0}, preexisting_heaps{0}, sample_known_state{0}, known_clears{0};
     std::atomic<uint64_t> sample_missing_recording{0}, sample_partial_coverage{0}, sample_partial_states{0}, sample_no_transition{0};
     std::atomic<uint64_t> live{0}, created{0}, retired{0}, writes{0}, copies{0}, unresolved{0}, sentinel_fail{0},
@@ -4514,12 +4514,19 @@ ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue, uint32_t count, ID3D12Comma
     t_cur_qid = qid;
     t.cur_set = true;
     t.list_type = static_cast<uint32_t>(type);
-    if (!t_host_work && t_submit_depth == 0 && g_armed.load(std::memory_order_acquire)) { // C9B-R3
+    // Serialize game work per queue (C9B-R3 for samples; SE5 2026-11-02 for the known-state
+    // store): two threads submitting to one queue at once leave the GPU order unknown, which
+    // resets every carried state they touch (ambiguous_queue_order) and cost J2 the depth state
+    // on ~1/4 of SE5's menu frames. The runtime serializes a queue's submissions anyway, so the
+    // lock only fixes the order we observe to the order the queue receives.
+    const bool armed = g_armed.load(std::memory_order_acquire);
+    if (!t_host_work && t_submit_depth == 0) { // Signal/Wait too: they share the queue's order
         qs->submit_m.lock();
         ++t_submit_depth;
         t.submit_locked = true;
+        if (!armed) g_c.serialized.fetch_add(1);
         static const SubmissionCapture kNoLists;
-        acquire_sample_sources(queue, qid, type, cap ? *cap : kNoLists); // before the original runs (C9B-REVIEW-2 #2)
+        if (armed) acquire_sample_sources(queue, qid, type, cap ? *cap : kNoLists); // before the original runs (C9B-REVIEW-2 #2)
     }
     const auto occurrence = qs->occurrences.Begin();
     t.queue_state = qs;
@@ -5127,6 +5134,7 @@ ProducerStats GetProducerStats()
     s.sample_partial_states = g_c.sample_partial_states.load();
     s.sample_no_transition = g_c.sample_no_transition.load();
     s.nested_unlocked = g_c.nested_unlocked.load();
+    s.serialized_submissions = g_c.serialized.load();
     s.snapshots_reread = g_c.snap_reread.load();
     s.preexisting_resources = g_c.preexisting_resources.load();
     s.preexisting_heaps = g_c.preexisting_heaps.load();

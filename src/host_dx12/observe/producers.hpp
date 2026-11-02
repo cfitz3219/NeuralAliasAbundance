@@ -229,6 +229,7 @@ struct ProducerStats {
     uint32_t sample_workers_started; // C9B-REVIEW-2 #1: at most 1 per process
     uint64_t sample_missing_recording, sample_partial_coverage, sample_partial_states, sample_no_transition;
     uint64_t nested_unlocked;        // ASTRA-P3-R8: queue ops nested in a forwarded submission (no lock taken)
+    uint64_t serialized_submissions; // game submissions forwarded under their queue's lock for the known-state store
     uint64_t snapshots_reread;       // G3-02: app-unmapped upload buffers captured by a host read-only Map
     uint64_t preexisting_resources;  // G3-03: resources registered lazily on first sight
     uint64_t preexisting_heaps;      // G3-03: descriptor heaps registered lazily in SetDescriptorHeaps

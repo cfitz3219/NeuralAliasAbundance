@@ -779,6 +779,14 @@ void write_status_line()
             WriteFile(f, j2.depth_state_evidence, static_cast<DWORD>(std::strlen(j2.depth_state_evidence)), &written, nullptr);
             WriteFile(f, "\r\n", 2, &written, nullptr);
         }
+        {   // Why carried resource states are lost (SE5 depth no_state: ambiguous_queue_order).
+            const auto ps = na::observe::GetProducerStats();
+            char ol[192];
+            const int on = snprintf(ol, sizeof ol, "observe_order executes=%llu ambiguous=%llu nested_unlocked=%llu known_clears=%llu serialized=%llu\r\n",
+                (unsigned long long)ps.executes, (unsigned long long)ps.ambiguous_executes, (unsigned long long)ps.nested_unlocked,
+                (unsigned long long)ps.known_state_clears, (unsigned long long)ps.serialized_submissions);
+            if (on > 0) WriteFile(f, ol, static_cast<DWORD>((std::min)(on, static_cast<int>(sizeof(ol) - 1))), &written, nullptr);
+        }
         const DWORD trace_len = static_cast<DWORD>(std::strlen(j2.insertion_frame_trace));
         WriteFile(f, "j2_frame", 8, &written, nullptr);
         WriteFile(f, j2.insertion_frame_trace, trace_len, &written, nullptr);
