@@ -30,6 +30,8 @@ using NtReadFileFn = LONG(NTAPI*)(HANDLE, HANDLE, PVOID, PVOID, IoSb*, PVOID, UL
 using NtWriteFileFn = LONG(NTAPI*)(HANDLE, HANDLE, PVOID, PVOID, IoSb*, PVOID, ULONG, PLARGE_INTEGER, PULONG);
 using NtCreateSectionFn = LONG(NTAPI*)(PHANDLE, ACCESS_MASK, PVOID, PLARGE_INTEGER, ULONG, ULONG, HANDLE);
 using NtQueryInformationFileFn = LONG(NTAPI*)(HANDLE, IoSb*, PVOID, ULONG, ULONG);
+using NtMapViewOfSectionFn = LONG(NTAPI*)(HANDLE, HANDLE, PVOID*, ULONG_PTR, SIZE_T, PLARGE_INTEGER, PSIZE_T, DWORD, ULONG, ULONG);
+using NtMapViewOfSectionExFn = LONG(NTAPI*)(HANDLE, HANDLE, PVOID*, PLARGE_INTEGER, PSIZE_T, ULONG, ULONG, PVOID, ULONG);
 constexpr LONG kStatusPending = 0x103;
 
 CreateFileWFn o_create_w = nullptr;
@@ -37,6 +39,8 @@ CreateFileAFn o_create_a = nullptr;
 NtReadFileFn o_ntread = nullptr;
 NtWriteFileFn o_ntwrite = nullptr;
 NtCreateSectionFn o_ntsection = nullptr;
+NtMapViewOfSectionFn o_ntmap = nullptr;
+NtMapViewOfSectionExFn o_ntmap_ex = nullptr;
 NtQueryInformationFileFn p_query_file = nullptr; // not hooked: the handle's synchronous mode
 
 constexpr uint64_t kMaxFileBytes = 1u << 20;
@@ -73,6 +77,12 @@ std::atomic<bool> g_any_patch{false};     // something was substituted: saves ne
 struct Identity { DWORD volume; uint64_t index; std::wstring path; };
 // Files checked by path and not a candidate, by identity (handle values are reused; bounded).
 std::vector<std::pair<DWORD, uint64_t>> g_rejected;
+// Sections created on a candidate settings file (mapped route, SE5 2026-11-02). Each is created
+// copy-on-write capable, and its first view gets the substitution in PRIVATE pages: a
+// copy-on-write page is never written back to the file.
+struct SettingsSection { HANDLE section; std::wstring path; DWORD volume; uint64_t index; bool writecopy; };
+std::vector<SettingsSection> g_sections;
+std::atomic<int> g_section_count{0}; // g_sections.size(), readable without g_m (fast path)
 std::vector<Identity> g_known;            // candidate files opened for reading (bounded)
 // Live switching: the marked value the game parsed, in its unit, and the candidates found.
 struct Candidate {
@@ -217,6 +227,13 @@ void on_open(HANDLE h, std::wstring path, DWORD access, DWORD flags)
     Tracked t;
     if (!identity(h, &t.volume, &t.index)) return;
     t.path = final_path(h, path);
+    if (wr && g_open_logs < 48) { // the save route (diagnostics, bounded)
+        ++g_open_logs;
+        char line[600];
+        std::snprintf(line, sizeof line, "opened for writing%s: %s%s", rd ? " and reading" : "", utf8(t.path).c_str(),
+                      (flags & FILE_FLAG_OVERLAPPED) ? " (asynchronous)" : "");
+        log_line(line);
+    }
     t.read = rd;
     t.write = wr;
     t.overlapped = (flags & FILE_FLAG_OVERLAPPED) != 0;
@@ -263,6 +280,7 @@ void note_async_read(HANDLE h, ULONG n)
     log_line(line);
 }
 
+void patch_locked(Tracked& t, char* d, size_t got_n);
 void inspect_read(HANDLE h, void* buf, size_t got_n)
 {
     std::lock_guard<std::mutex> lk(g_m);
@@ -276,23 +294,28 @@ void inspect_read(HANDLE h, void* buf, size_t got_n)
         g_handles.erase(it);
         return;
     }
+    patch_locked(it->second, static_cast<char*>(buf), got_n);
+}
+
+// g_m held. Substitutes in `d` (bytes of the settings file `t` names, read or mapped) and logs.
+void patch_locked(Tracked& t, char* d, size_t got_n)
+{
     const size_t* got = &got_n;
-    char* d = static_cast<char*>(buf);
     PatchInfo info;
     bool wide = false;
     const int k = PatchRenderScaleText(d, *got, g_fraction, &info, /*tag=*/true, &wide);
     char line[600];
-    const std::string file = utf8(it->second.path);
+    const std::string file = utf8(t.path);
     if (k == 0 && !info.m.key[0]) { // no render-scale key in these bytes: say what they were (once per handle)
-        if (!it->second.read_logged) {
-            it->second.read_logged = true;
+        if (!t.read_logged) {
+            t.read_logged = true;
             std::snprintf(line, sizeof line, "read of %s: %lu bytes%s, no render-scale key; starts: %s", file.c_str(),
                           static_cast<unsigned long>(got_n), wide ? " (UTF-16)" : "", preview(d, *got, wide).c_str());
             log_line(line);
         }
         return;
     }
-    it->second.read_logged = true;
+    t.read_logged = true;
     if (wide) ++g_stats.reads_utf16;
     if (k > 0) g_any_patch.store(true, std::memory_order_release);
     if (k > 0) {
@@ -301,7 +324,7 @@ void inspect_read(HANDLE h, void* buf, size_t got_n)
         g_stats.original = m.current;
         std::snprintf(g_stats.key, sizeof g_stats.key, "%s", m.key);
         std::snprintf(g_stats.file, sizeof g_stats.file, "%s", file.c_str());
-        Patched& p = g_patched[it->second.path];
+        Patched& p = g_patched[t.path];
         p.original = info.original;
         p.ours = info.written;
         p.key = m.key;
@@ -415,32 +438,106 @@ LONG NTAPI nt_read(HANDLE h, HANDLE ev, PVOID apc, PVOID ctx, IoSb* io, PVOID bu
     return st;
 }
 
-// Diagnostics only: a candidate settings file mapped into memory is read without NtReadFile.
-// NtCreateSection is under every file mapping (CreateFileMapping* and the loader alike).
-void note_mapping(HANDLE file)
+// The candidate settings file `file` names, by identity (empty when it is none).
+const Identity* known_file_locked(DWORD v, uint64_t i)
 {
-    if (t_inside || !file || file == INVALID_HANDLE_VALUE || !g_any_candidate.load(std::memory_order_acquire)) return;
-    ++t_inside;
-    DWORD v = 0;
-    uint64_t i = 0;
-    const bool id = identity(file, &v, &i);
-    --t_inside;
-    if (!id) return;
-    std::lock_guard<std::mutex> lk(g_m);
-    for (const Identity& k : g_known) {
-        if (k.volume != v || k.index != i) continue;
-        ++g_stats.files_mapped;
-        if (g_stats.files_mapped > 8) return; // logged a few times, not per view
-        char line[600];
-        std::snprintf(line, sizeof line, "%s is read through a file mapping: not inspected", utf8(k.path).c_str());
-        log_line(line);
-        return;
-    }
+    for (const Identity& k : g_known)
+        if (k.volume == v && k.index == i) return &k;
+    return nullptr;
 }
+bool known_mapping_file(HANDLE file, DWORD* v, uint64_t* i, std::wstring* path)
+{
+    if (t_inside || !file || file == INVALID_HANDLE_VALUE || !g_any_candidate.load(std::memory_order_acquire)) return false;
+    ++t_inside;
+    const bool id = identity(file, v, i);
+    --t_inside;
+    if (!id) return false;
+    std::lock_guard<std::mutex> lk(g_m);
+    const Identity* k = known_file_locked(*v, *i);
+    if (!k) return false;
+    *path = k->path;
+    return true;
+}
+
+// NtCreateSection is under every file mapping (CreateFileMapping* and the loader alike).
 LONG NTAPI nt_section(PHANDLE sec, ACCESS_MASK access, PVOID oa, PLARGE_INTEGER max, ULONG prot, ULONG attrib, HANDLE file)
 {
-    const LONG st = o_ntsection(sec, access, oa, max, prot, attrib, file);
-    if (st == 0 && file && !(attrib & 0x01000000 /*SEC_IMAGE*/)) note_mapping(file);
+    DWORD v = 0;
+    uint64_t i = 0;
+    std::wstring path;
+    if (!file || (attrib & 0x01000000 /*SEC_IMAGE*/) || !known_mapping_file(file, &v, &i, &path))
+        return o_ntsection(sec, access, oa, max, prot, attrib, file);
+    double fraction = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_m);
+        fraction = g_fraction;
+    }
+    // A read-only section is created copy-on-write capable instead (needs only read access to
+    // the file); views stay read-only unless we make a private copy of their pages.
+    LONG st = -1;
+    bool writecopy = false;
+    if (fraction > 0 && prot == PAGE_READONLY) {
+        st = o_ntsection(sec, access, oa, max, PAGE_WRITECOPY, attrib, file);
+        writecopy = st == 0;
+    }
+    if (!writecopy) st = o_ntsection(sec, access, oa, max, prot, attrib, file);
+    std::lock_guard<std::mutex> lk(g_m);
+    ++g_stats.files_mapped;
+    char line[700];
+    std::snprintf(line, sizeof line, "%s is read through a file mapping (protection 0x%lx%s, status 0x%lx)", utf8(path).c_str(),
+                  static_cast<unsigned long>(prot), writecopy ? ", created copy-on-write capable" : "", static_cast<unsigned long>(st));
+    log_line(line);
+    if (st == 0 && sec && *sec) {
+        if (g_sections.size() >= 16) g_sections.erase(g_sections.begin());
+        g_sections.push_back({*sec, path, v, i, writecopy});
+        g_section_count.store(static_cast<int>(g_sections.size()), std::memory_order_release);
+    }
+    return st;
+}
+
+bool current_process(HANDLE p) { return p == GetCurrentProcess() || GetProcessId(p) == GetCurrentProcessId(); }
+
+// After a view of a tracked settings section is mapped: substitute in private copy-on-write pages.
+void on_view(HANDLE section, HANDLE process, PVOID* base, PSIZE_T size, ULONG protect)
+{
+    if (t_inside || !base || !*base || !size || !*size || !current_process(process)) return;
+    std::lock_guard<std::mutex> lk(g_m);
+    auto it = std::find_if(g_sections.begin(), g_sections.end(), [&](const SettingsSection& x) { return x.section == section; });
+    if (it == g_sections.end()) return;
+    const SettingsSection sct = *it;
+    g_sections.erase(it); // one view per section creation: a reused section handle is never patched
+    g_section_count.store(static_cast<int>(g_sections.size()), std::memory_order_release);
+    char line[700];
+    if (!(g_fraction > 0)) return;
+    char* d = static_cast<char*>(*base);
+    const size_t n = strnlen(d, (std::min)(static_cast<size_t>(*size), static_cast<size_t>(kMaxFileBytes)));
+    DWORD old = 0;
+    const bool priv = n && VirtualProtect(d, n, PAGE_WRITECOPY, &old);
+    std::snprintf(line, sizeof line, "view of %s: %zu bytes, view protection 0x%lx%s", utf8(sct.path).c_str(), n,
+                  static_cast<unsigned long>(protect), priv ? ", private copy-on-write pages" : ", could not make private pages: not patched");
+    log_line(line);
+    if (!priv) return;
+    Tracked t;
+    t.path = sct.path;
+    t.volume = sct.volume;
+    t.index = sct.index;
+    t.read = true;
+    patch_locked(t, d, n); // writes touch only private copies of the pages
+    DWORD tmp = 0;
+    VirtualProtect(d, n, old, &tmp);
+}
+LONG NTAPI nt_map(HANDLE sec, HANDLE proc, PVOID* base, ULONG_PTR zero, SIZE_T commit, PLARGE_INTEGER off, PSIZE_T size, DWORD inherit,
+                  ULONG type, ULONG protect)
+{
+    const LONG st = o_ntmap(sec, proc, base, zero, commit, off, size, inherit, type, protect);
+    if (st == 0 && g_section_count.load(std::memory_order_acquire) > 0) on_view(sec, proc, base, size, protect);
+    return st;
+}
+LONG NTAPI nt_map_ex(HANDLE sec, HANDLE proc, PVOID* base, PLARGE_INTEGER off, PSIZE_T size, ULONG type, ULONG protect, PVOID ext,
+                     ULONG ext_n)
+{
+    const LONG st = o_ntmap_ex(sec, proc, base, off, size, type, protect, ext, ext_n);
+    if (st == 0 && g_section_count.load(std::memory_order_acquire) > 0) on_view(sec, proc, base, size, protect);
     return st;
 }
 
@@ -564,6 +661,8 @@ bool InstallSettingsReadHook()
     void* ca = reinterpret_cast<void*>(GetProcAddress(kb, "CreateFileA"));
     HMODULE nt = GetModuleHandleW(L"ntdll.dll");
     void* cs = nt ? reinterpret_cast<void*>(GetProcAddress(nt, "NtCreateSection")) : nullptr;
+    void* mv = nt ? reinterpret_cast<void*>(GetProcAddress(nt, "NtMapViewOfSection")) : nullptr;
+    void* mx = nt ? reinterpret_cast<void*>(GetProcAddress(nt, "NtMapViewOfSectionEx")) : nullptr; // Windows 10 1803+
     p_query_file = nt ? reinterpret_cast<NtQueryInformationFileFn>(GetProcAddress(nt, "NtQueryInformationFile")) : nullptr;
     void* rf = nt ? reinterpret_cast<void*>(GetProcAddress(nt, "NtReadFile")) : nullptr;
     void* wf = nt ? reinterpret_cast<void*>(GetProcAddress(nt, "NtWriteFile")) : nullptr;
@@ -574,7 +673,9 @@ bool InstallSettingsReadHook()
         !na::hooking::PrepareHook(ca, reinterpret_cast<void*>(&create_a), reinterpret_cast<void**>(&o_create_a)) ||
         !na::hooking::PrepareHook(rf, reinterpret_cast<void*>(&nt_read), reinterpret_cast<void**>(&o_ntread)) ||
         !na::hooking::PrepareHook(wf, reinterpret_cast<void*>(&nt_write), reinterpret_cast<void**>(&o_ntwrite)) ||
-        (cs && !na::hooking::PrepareHook(cs, reinterpret_cast<void*>(&nt_section), reinterpret_cast<void**>(&o_ntsection)))) {
+        (cs && !na::hooking::PrepareHook(cs, reinterpret_cast<void*>(&nt_section), reinterpret_cast<void**>(&o_ntsection))) ||
+        (mv && !na::hooking::PrepareHook(mv, reinterpret_cast<void*>(&nt_map), reinterpret_cast<void**>(&o_ntmap))) ||
+        (mx && !na::hooking::PrepareHook(mx, reinterpret_cast<void*>(&nt_map_ex), reinterpret_cast<void**>(&o_ntmap_ex)))) {
         na::hooking::AbandonInstall();
         na::hooking::Shutdown();
         return false;

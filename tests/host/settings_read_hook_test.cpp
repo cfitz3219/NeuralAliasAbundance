@@ -184,6 +184,28 @@ int main()
         CHECK(read_all(other) == ini); // a non-settings file with the same bytes is still left alone
         na::scale::Configure(0, nullptr);
     }
+    // Mapped read (SE5 2026-11-02 maps GraphicsOptions.ini): the view shows our value in private
+    // copy-on-write pages; the file on disk keeps its own.
+    {
+        CHECK(write_all(opt, ini));
+        na::scale::Configure(na::scale::FractionForMode(1), log.c_str());
+        const HANDLE f = CreateFileW(opt.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        CHECK(f != INVALID_HANDLE_VALUE);
+        const HANDLE m = f != INVALID_HANDLE_VALUE ? CreateFileMappingW(f, nullptr, PAGE_READONLY, 0, 0, nullptr) : nullptr;
+        CHECK(m != nullptr);
+        const char* v = m ? static_cast<const char*>(MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0)) : nullptr;
+        CHECK(v != nullptr);
+        if (v) {
+            const std::string seen_map(v, ini.size());
+            std::printf("mapped view: %s\n", seen_map.c_str());
+            CHECK(seen_map.find("\nRenderScale = 0.666668\r\n") != std::string::npos);
+            UnmapViewOfFile(v);
+        }
+        if (m) CloseHandle(m);
+        if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+        na::scale::Configure(0, nullptr);
+        CHECK(read_all(opt) == ini); // never written back to the file
+    }
     delete game_f;
     delete game_d;
 
@@ -192,6 +214,7 @@ int main()
     CHECK(lg.find("patched read of") != std::string::npos && lg.find("kept the original") != std::string::npos);
     CHECK(lg.find("asynchronously") != std::string::npos && lg.find("is the control") != std::string::npos);
     CHECK(lg.find("through a handle we did not see opened") != std::string::npos);
+    CHECK(lg.find("private copy-on-write pages") != std::string::npos);
     DeleteFileW(opt.c_str());
     DeleteFileW(other.c_str());
     DeleteFileW(log.c_str());
