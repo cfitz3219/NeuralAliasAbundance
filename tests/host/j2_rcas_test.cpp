@@ -149,11 +149,11 @@ int main()
     CHECK(std::fabs(hdr - 4.0f) < 0.05f);                   // HDR above 1 survives
     // Exercise the actual GPU shader across the old ceiling and the new range.
     // Keep 100% byte-equivalent, a smooth 101% transition, stronger soft-edge
-    // contrast at 200%, flat/HDR/alpha preservation, and clamp out-of-range input.
+    // contrast at 150%, flat/HDR/alpha preservation, and clamp out-of-range input.
     const float baseContrast = o[y * W + 25] - o[y * W + 18];
     float previousContrast = baseContrast;
     std::vector<float> maximum;
-    for (uint32_t percent : {100u, 101u, 125u, 150u, 175u, 200u, 201u, 0xFFFFFFFFu}) {
+    for (uint32_t percent : {100u, 101u, 125u, 150u, 151u, 200u, 0xFFFFFFFFu}) {
         REQUIRE(SUCCEEDED(l.alloc->Reset()));
         REQUIRE(SUCCEEDED(l.list->Reset(l.alloc.Get(), nullptr)));
         b = test::Transition(out.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -185,8 +185,8 @@ int main()
         CHECK(std::fabs(result[y * W + 60] - 4.0f) < 0.05f);
         if (percent == 100) CHECK(result == o);
         if (percent == 101) for (size_t i = 0; i < result.size(); ++i) CHECK(std::fabs(result[i] - o[i]) < 0.02f);
-        if (percent == 200) { CHECK(contrast > baseContrast + 0.01f); maximum = result; }
-        if (percent > 200) CHECK(result == maximum);
+        if (percent == 150) { CHECK(contrast > baseContrast + 0.005f); maximum = result; }
+        if (percent > 150) CHECK(result == maximum);
         std::printf("RCAS %u%%: soft-edge contrast %.6f (100%% %.6f)\n", percent, contrast, baseContrast);
     }
     return test::finish("j2_rcas_test");

@@ -292,7 +292,7 @@ int main()
     fake::eval_result = NVSDK_NGX_Result_Success;
     REQUIRE(na::dlss::Attach(dev, fake::MakeApi()));
     const auto sharp_before = na::j2::GetStats().sharpened_frames;
-    const auto saved_sharpness = na::settings::Get().j2_sharpness.exchange(200);
+    const auto saved_sharpness = na::settings::Get().j2_sharpness.exchange(150);
     frame(0.5); // camera moved a little: same history
     na::settings::Get().j2_sharpness.store(saved_sharpness);
     st = na::j2::GetStats();

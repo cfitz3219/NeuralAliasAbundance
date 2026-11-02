@@ -399,9 +399,9 @@ bool debug_record(ID3D12GraphicsCommandList* l, int mode, DXGI_FORMAT out_format
 // (FSR_RCAS_DENOISE) so flat noisy areas are not amplified. Runs on the DLAA
 // result before the game's tonemap and HUD, in a Reinhard-compressed copy of the
 // HDR values (RCAS expects 0..1), expanded back afterwards. Slider 1..100 maps to
-// RCAS sharpness 2..0 stops; 0 skips the pass entirely. NeuralAlias's 101..200
-// extension raises only the global lobe ceiling from 3/16 to 7/32. Contrast
-// limiters and noise attenuation remain; 1+4*lobe stays >=1/8. No second filter.
+// RCAS sharpness 2..0 stops; 0 skips the pass entirely. NeuralAlias's 101..150
+// extension raises only the global lobe ceiling from 3/16 to 13/64. Contrast
+// limiters and noise attenuation remain; 1+4*lobe stays >=3/16. No second filter.
 struct RcasPass {
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> pso;
@@ -506,7 +506,7 @@ bool rcas_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Resou
     l->SetComputeRootDescriptorTable(0, gh);
     const float stops = 2.0f * (1.0f - static_cast<float>(percent > 100 ? 100 : percent) / 100.0f);
     const float con = std::exp2(-stops);
-    const float extra = percent > 100 ? float((std::min)(percent, 200u) - 100u) / 100.0f : 0.0f;
+    const float extra = percent > 100 ? float((std::min)(percent, 150u) - 100u) / 100.0f : 0.0f;
     const float limit = 3.0f / 16.0f + extra / 32.0f;
     uint32_t k[4] = {0, w, h, 0};
     std::memcpy(&k[0], &con, 4);

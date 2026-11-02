@@ -946,9 +946,9 @@ void DrawLiveDlaa()
     {
         na::settings::Settings& ss = na::settings::Get();
         int sharp = static_cast<int>(ss.j2_sharpness.load());
-        BeginRow("Sharpness", "Sharpening after DLAA, before the HUD. 0 = off. 1-100%: standard RCAS strength. 101-200%: extended RCAS strength in the same pass. Higher values emphasize detail and can emphasize edge outlines or noise.", S(220));
+        BeginRow("Sharpness", "Sharpening after DLAA, before the HUD. 0 = off. 1-100%: standard RCAS strength. 101-150%: extended RCAS strength in the same pass. Higher values emphasize detail and can emphasize edge outlines or noise.", S(220));
         ImGui::SetNextItemWidth(S(220));
-        if (ImGui::SliderInt("##j2sharp", &sharp, 0, 200, sharp ? (sharp > 100 ? "%d%% (RCAS+)" : "%d%%") : "Off")) {
+        if (ImGui::SliderInt("##j2sharp", &sharp, 0, 150, sharp ? (sharp > 100 ? "%d%% (RCAS+)" : "%d%%") : "Off", ImGuiSliderFlags_AlwaysClamp)) {
             ss.j2_sharpness.store(static_cast<uint32_t>(sharp));
         }
         if (ImGui::IsItemDeactivatedAfterEdit()) na::settings::Save();
