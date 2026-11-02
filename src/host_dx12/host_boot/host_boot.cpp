@@ -233,6 +233,7 @@ DWORD WINAPI InitThread(LPVOID)
     // J2 live DLAA (needs the producers and the discovery adapter): off unless [j2] enabled=1.
     na::j2::SetEnabled(GetPrivateProfileIntW(L"j2", L"enabled", 0, g_ini) == 1 &&
                        GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1);
+    na::j2::SetRasterJitter(GetPrivateProfileIntW(L"j2", L"raster_jitter", 0, g_ini) == 1);
     if (na::j2::Configured()) na::overlay::RegisterLiveDlaaMenu();
     na::j2::flow::SetEnabled(GetPrivateProfileIntW(L"j2",L"flow",0,g_ini)==1);
     if(na::settings::SafeStart())na::j2::SetPaused(true);

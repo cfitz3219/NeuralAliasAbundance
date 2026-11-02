@@ -4,6 +4,7 @@
 #include "host_dx12/j2/route_selector.hpp"
 #include "host_dx12/j2/consumer_profile.hpp"
 #include "host_dx12/j2/jitter_writes.hpp"
+#include "host_dx12/j2/boundary_roles.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
 #include "host_dx12/j2/compute_flow.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
@@ -167,6 +168,8 @@ struct State {
     uint64_t dlss_tried_frame = ~0ull; // one early start attempt per frame
     bool inline_sample_locked = false; // NGX recorded: no new raster sample may start this frame
     bool inline_camera_submitted = false; // an earlier depth/camera batch may already be executing
+    bool raster_jitter = false;
+    BoundaryRoles boundary_roles;
     struct LearnedInsertion { uint64_t color = 0, depth = 0; na::j2::InsertionDecision decision; };
     LearnedInsertion insertion_frame, insertion_learned;
     char insertion_trace[2048] = {};
@@ -790,6 +793,7 @@ bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& in_byt
 // must see the same jittered camera as the scene, or depth tests disagree.
 void jitter_batch(ID3D12CommandList* const* lists, UINT count)
 {
+    if (g.raster_jitter) return; // raster and matrix injection must never stack
     // Only while DLAA is producing frames: the previous game frame submitted one
     // (a batch without the scene must not count as "not running").
     const bool running = g.submitted_frame && g.frame == g.submitted_frame + 1;
@@ -885,6 +889,7 @@ void count_post_dlaa(ID3D12CommandList* const* lists, UINT first, UINT count, na
     for (UINT i = first; i < count; ++i) {
         if (!lists[i]) continue;
         if (depth_id && na::observe::ListReferences(lists[i], depth_id)) ++g.stats.post_depth_lists;
+        if (g.raster_jitter) continue; // no matrix writes in this mode
         if (g.camera_offset < 0) continue;
         for (const auto& b : na::observe::ListRootConstantBuffers(lists[i])) {
             if (na::observe::ReadBuffer(b.resource, b.offset + lo, bytes.data(), 64) != 64) continue;
@@ -944,7 +949,7 @@ struct CamPick {
 };
 bool holds_jittered(const std::vector<uint8_t>& bytes, size_t off)
 {
-    return g.jit.valid && off + 64 <= bytes.size() &&
+    return !g.raster_jitter && g.jit.valid && off + 64 <= bytes.size() &&
            (!std::memcmp(bytes.data() + off, g.jit.jvp[0], 64) || !std::memcmp(bytes.data() + off, g.jit.jvp[1], 64));
 }
 double continuity(const na::camera::Matrix& m, bool injected)
@@ -1378,7 +1383,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     bool held = false, from_j1 = false;
     if (saved) { vp = saved->vp; reversed = saved->reversed; }
     const bool found = saved || find_camera(lists, scene, depth_id, &vp, &reversed);
-    if (!found && g.jit.valid && g.jit.applied && g.cam_f1) {
+    if (!found && !g.raster_jitter && g.jit.valid && g.jit.applied && g.cam_f1) {
         // Astra (COMMS 2026-11-02): the scene list's own blocks may not hold the camera, but
         // J1 found this frame's camera in an earlier batch and rewrote it with this sample:
         // that is the camera the frame was rendered with, and its jitter is known.
@@ -1468,7 +1473,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         g.resume_reset = true; // remains pending if this recording is not submitted
     }
     const double zero[2] = {0, 0};
-    const double* injected = held ? zero : from_j1 ? g.jit.px : saved ? saved->jitter : g_injected ? g.jit.px : zero; // sample belongs to the captured camera
+    const double* injected = g.raster_jitter ? zero : held ? zero : from_j1 ? g.jit.px : saved ? saved->jitter : g_injected ? g.jit.px : zero; // sample belongs to the captured camera
     double rescaled[2] = {0, 0};
     if (injected != zero && jit_rw && jit_rh && (jit_rw != rw || jit_rh != rh)) {
         rescaled[0] = injected[0] * double(rw) / double(jit_rw);
@@ -1476,7 +1481,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         injected = rescaled;
         ++g.stats.jitter_extent_rescaled;
     }
-    if (!saved && !held && !from_j1 && !g_injected && g.jitter_on) { // a DLAA frame without J1's jitter: why
+    if (!g.raster_jitter && !saved && !held && !from_j1 && !g_injected && g.jitter_on) { // a DLAA frame without J1's jitter: why
         if (!g.jit.valid) ++g.stats.unjit_no_sample;
         else if (!g.jit.applied) ++g.stats.unjit_not_applied;
         else ++g.stats.unjit_not_held;
@@ -1489,8 +1494,24 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     constexpr uint64_t kMaxGapFrames = 4;
     const bool tracker_restart = g.resume_reset || (g.submitted_frame && g.frame > g.submitted_frame + kMaxGapFrames);
     if (tracker_restart) pending.tracker.Reset();
-    const na::camera::CameraFrame cam = pending.tracker.Update(vp, g.frame, rw, rh, injected); // active extent
+    na::camera::CameraFrame cam = pending.tracker.Update(vp, g.frame, rw, rh, injected); // active extent
     if (!cam.valid) { ++g.stats.no_camera; reason("The camera matrix could not be inverted."); return false; }
+    if (g.raster_jitter) {
+        // The camera matrices were NOT translated. Build reprojection from the
+        // raw camera, then attach the actual raster sample for depth/flow/NGX.
+        // Removing this sample from the raw VP would manufacture camera motion.
+        double x = 0, y = 0;
+        bool applied = false;
+        for (size_t i = 0; i <= scene; ++i) {
+            double lx = 0, ly = 0;
+            if (na::observe::ListRasterJitter(lists[i], &lx, &ly)) { x = lx; y = ly; applied = true; }
+        }
+        if (!applied && saved) { x = saved->jitter[0]; y = saved->jitter[1]; applied = true; }
+        if (!applied && g.jit.valid && g.jit.applied) { x = g.jit.px[0]; y = g.jit.px[1]; applied = true; }
+        if (!applied && g.jitter_on) ++g.stats.unjit_no_sample;
+        cam.jitter_known = true;
+        cam.jitter_px_x = x; cam.jitter_px_y = y;
+    }
     if (!held) { // the newest read camera (one per frame: a later attempt in the same frame replaces it)
         if (g.cam_f1 != g.frame) { g.cam_u0 = g.cam_u1; g.cam_f0 = g.cam_f1; }
         g.cam_u1 = cam.unjittered; g.cam_f1 = g.frame; g.cam_rev = reversed;
@@ -1807,6 +1828,23 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
 // include scene colour. The consuming PSO/targets are now established; bindings
 // alone are not reads. Prior recordings teach the first use after the final
 // scene write. The host restores game state before forwarding the real call.
+bool on_raster_jitter(uint32_t w, uint32_t h, double* x, double* y)
+{
+    if (!na::settings::EffectsReady() || !g.enabled.load() || g.paused.load()) return false;
+    std::lock_guard<std::mutex> lock(g.m);
+    if (!g.raster_jitter || !g.jitter_on || g.latched || !g.stats.frames ||
+        w != g.rw || h != g.rh || (g.inline_sample_locked && !g.jit.valid)) return false;
+    if (!g.jit.valid) {
+        const auto sample = neural_alias::temporal_jitter(++g.jit.phase, jitter_phases());
+        g.jit.px[0] = sample.x_pixels; g.jit.px[1] = sample.y_pixels;
+        g.jit.valid = true;
+    }
+    g.jit.applied = true;
+    *x = g.jit.px[0]; *y = g.jit.px[1];
+    ++g.stats.raster_jitter_draws;
+    return true;
+}
+
 void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint32_t n, bool compute)
 {
     if (!na::settings::EffectsReady() || !g.enabled.load(std::memory_order_relaxed) || g.paused.load(std::memory_order_relaxed)) return;
@@ -1833,6 +1871,10 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     if (g.inl_frame == g.frame || g.submitted_frame == g.frame) return; // either placement path already owns this frame
     const auto current = na::observe::ListInsertionDecision(l, color_id);
     const auto& learned = g.insertion_learned;
+    // A known intermediate boundary remains intermediate at its following
+    // draw/copy too; otherwise the class matcher can bypass the barrier veto.
+    const auto boundary_role=g.boundary_roles.Judge(na::observe::IdOf(l),current.boundary_writer,current.writer_occurrence,g.frame);
+    if(boundary_role==BoundaryRoles::Middle) {++g.stats.segment_deferrals;return;}
     // Role-class trigger (placement design): at the ACTUAL consumer (draw/dispatch/copy),
     // fire when its class is accepted by the profile. A class known to be a temporary
     // reader blocks the boundary matcher too (a fact from earlier frames). Otherwise the
@@ -1859,9 +1901,11 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
             live_producer = live.producer_pso;
             live_context = live.has_prior && g.scene_w ? na::j2::ClassHash(na::j2::MakeClass(live.prior, g.scene_w, g.scene_h)) : 0;
             fired_at_barrier = true;
+            const auto role=boundary_role;
+            if(role==BoundaryRoles::End) {by_class=true;matched_mode=kByBarrier;}
             using V = na::j2::ConsumerProfile::Verdict;
             const V v = g.profile.Judge(live_class, live_producer, live_context);
-            if (v == V::Rejected) { ++g.stats.barrier_vetoes; return; }
+            if (v == V::Rejected && role!=BoundaryRoles::End) { ++g.stats.barrier_vetoes; return; }
             // Ambiguous (the pattern was seen both mid-scene and at completion, and the
             // context does not separate them): the boundary matcher below is the
             // distinguishing check: it fires only when the writer pipeline, its
@@ -2034,8 +2078,8 @@ int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
                 na::observe::ListSceneSubresource(lists[i], color, depth, &saved.color_sub, &saved.depth_sub) &&
                 find_camera(lists, i, depth, &saved.vp, &saved.reversed)) {
                 saved.frame = g.frame; saved.color = color; saved.depth = depth; saved.producer = producer;
-                saved.jitter[0] = g_injected ? g.jit.px[0] : 0;
-                saved.jitter[1] = g_injected ? g.jit.px[1] : 0;
+                saved.jitter[0] = (g_injected || (g.raster_jitter && g.jit.valid && g.jit.applied)) ? g.jit.px[0] : 0;
+                saved.jitter[1] = (g_injected || (g.raster_jitter && g.jit.valid && g.jit.applied)) ? g.jit.px[1] : 0;
             }
         }
     }
@@ -2048,7 +2092,11 @@ void SetEnabled(bool on)
 {
     g.enabled.store(on);
     g.configured.store(on);
-    if (on) na::observe::SetTableBindCallback(&on_table_bind);
+    if (on) {
+        na::observe::SetTableBindCallback(&on_table_bind);
+    }
+    std::lock_guard<std::mutex> lock(g.m);
+    na::observe::SetRasterJitterCallback(on && g.raster_jitter ? &on_raster_jitter : nullptr);
 }
 bool Enabled() { return na::settings::EffectsReady() && g.enabled.load(); }
 PhysicalReport::~PhysicalReport()
@@ -2110,6 +2158,14 @@ bool Jitter()
 {
     std::lock_guard<std::mutex> lock(g.m);
     return g.jitter_on;
+}
+void SetRasterJitter(bool on)
+{
+    std::lock_guard<std::mutex> lock(g.m);
+    if (g.raster_jitter != on) { g.resume_reset = true; g.jit.valid = false; }
+    g.raster_jitter = on;
+    g.stats.raster_jitter = on;
+    na::observe::SetRasterJitterCallback(on && g.enabled.load() ? &on_raster_jitter : nullptr);
 }
 
 void OnPresent(ID3D12CommandQueue* queue)
@@ -2211,6 +2267,7 @@ void OnPresent(ID3D12CommandQueue* queue)
             g.class_fired = false;
             g.fired_mode = 0;
             g.fired_barrier_event = false;
+            if(g.boundary_roles.Close(g.frame_seq,g.frame_seq_complete,g.submitted_frame==g.frame,g.frame)) ++g.stats.segment_miss_recoveries;
             g.frame_seq.clear();
             g.frame_seq_complete = true;
             na::observe::ResetDerived();
@@ -2277,6 +2334,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     }
     uint64_t selected_depth = 0, selected_color = 0;
     na::observe::GetLiveSelection(&selected_depth, &selected_color);
+    g.boundary_roles.Select(selected_color,selected_depth);
     if (selected_color && selected_color != g.scene_color_id) {
         // A different scene image: its size is the class reference; the old profile does not apply.
         g.scene_color_id = selected_color;
@@ -2294,6 +2352,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         if (!lists[i]) continue;
         const auto id = na::observe::IdOf(lists[i]);
         const auto decision = na::observe::ListInsertionDecision(lists[i], selected_color);
+        const size_t event_begin=g.frame_seq.size();
         if ((decision.writes || decision.all_reads) && g.frame_seq_complete) {
             // Placement profile: this list's writes and consumers, in submission order.
             // 512 events silently dropped later lists in the Sniper frames and
@@ -2338,6 +2397,8 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
             if (n > 0) g.insertion_trace_used += static_cast<size_t>(n);
         }
         if (!na::observe::ListRendersTo(lists[i], selected_color, selected_depth)) continue;
+        if(queue!=g.queue.Get() && decision.writes)g.boundary_roles.OtherQueueWroteScene();
+        if(decision.writes)g.boundary_roles.Submitted(id,event_begin,g.frame_seq.size());
         // Command-list objects are pooled/reused. Learn the last scene-writing
         // recording in SUBMISSION order across this frame, not the prior job
         // assigned to this particular object. A later write-only list invalidates
@@ -2606,6 +2667,7 @@ void Shutdown()
     g.frame_rejects = 0;
     g.frame_reject_text[0] = 0;
     g.profile.Clear();
+    g.boundary_roles={};
     g.waiting_scene = {};
     g.jitter_writes.Clear();
     g.frame_seq.clear();

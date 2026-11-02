@@ -807,10 +807,11 @@ void write_status_line()
         WriteFile(f, "j2_frame", 8, &written, nullptr);
         WriteFile(f, j2.insertion_frame_trace, trace_len, &written, nullptr);
         WriteFile(f, "\r\n", 2, &written, nullptr);
-        const int nc = snprintf(coverage, sizeof coverage, "j2_coverage presents=%llu covered=%llu later_writes=%llu jittered=%llu jitter=(%.4f,%.4f)\r\n",
+        const int nc = snprintf(coverage, sizeof coverage, "j2_coverage presents=%llu covered=%llu later_writes=%llu jittered=%llu jitter=(%.4f,%.4f) raster=%u raster_draws=%llu deferred=%llu recovered=%llu\r\n",
             (unsigned long long)j2.inline_presents, (unsigned long long)j2.inline_covered,
             (unsigned long long)j2.inline_late_writes, (unsigned long long)j2.inline_jittered,
-            j2.inline_jitter_x, j2.inline_jitter_y);
+            j2.inline_jitter_x, j2.inline_jitter_y, j2.raster_jitter ? 1u : 0u, (unsigned long long)j2.raster_jitter_draws,
+            (unsigned long long)j2.segment_deferrals, (unsigned long long)j2.segment_miss_recoveries);
         if (nc > 0) WriteFile(f, coverage, static_cast<DWORD>((std::min)(nc, static_cast<int>(sizeof(coverage)-1))), &written, nullptr);
         {
             static const char* kRoutes[] = {"none", "between", "inline", "interceptor"};

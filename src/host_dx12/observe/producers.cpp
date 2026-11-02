@@ -112,6 +112,10 @@ struct ListState {
     na_object_id cur_rts[8] = {};
     uint32_t cur_nrt = 0;
     uint32_t cur_ds_sub = NA_UNKNOWN_U32;
+    D3D12_VIEWPORT viewports[16] = {};
+    uint32_t nviewports = 0;
+    bool raster_jittered = false;
+    double raster_jitter[2] = {};
     bool restorable = true;              // false after work whose state effects we cannot replay
     bool in_render_pass = false;         // between BeginRenderPass and EndRenderPass (no host copy/dispatch allowed)
     int8_t mip_level = -1;               // live mip bias: twin level latched at Reset (-1 = the game's own objects)
@@ -2234,6 +2238,9 @@ struct On<sl::list::Reset> {
                     ls->args[1].clear();
                     ls->cur_rt = ls->cur_ds = 0;
                     ls->cur_nrt = 0;
+                    ls->nviewports = 0;
+                    ls->raster_jittered = false;
+                    ls->raster_jitter[0] = ls->raster_jitter[1] = 0;
                     ls->restorable = true;
                     ls->in_render_pass = false;
                 }
@@ -2398,6 +2405,11 @@ struct On<sl::list::RSSetViewports> {
     {
         Rec r;
         if (!begin_op(l, &r) || !n || !v) return;
+        with_list_state(l, [&](ListState& ls) {
+            std::lock_guard<std::mutex> bl(ls.bind_m);
+            ls.nviewports = n <= 16 ? n : 0;
+            if (ls.nviewports) std::copy(v, v + n, ls.viewports);
+        });
         // Every viewport (review): 6 floats each, first one also in a[].
         constexpr UINT kMax = D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
         float all[kMax * 6];
@@ -3011,6 +3023,66 @@ void after_texture_copy(GL* l, ID3D12Resource* dst)
     ls->insertion.Add({destination, 0, 0, true, na::j2::Op::CopyWrite});
 }
 
+std::atomic<RasterJitterCallback> g_raster_jitter_cb{nullptr};
+thread_local bool t_raster_draw = false; // validation wrappers can forward to another hooked list
+// Translate raster coordinates, rather than assuming a readable camera block
+// is the one the vertex shader uses. Scope the change to one actual draw: a
+// following fullscreen pass, HUD, copy or host dispatch sees the game's state.
+struct RasterJitterDraw {
+    GL* list = nullptr;
+    D3D12_VIEWPORT original[16] = {};
+    UINT count = 0;
+    RasterJitterDraw(GL* l) {
+        const auto cb = g_raster_jitter_cb.load(std::memory_order_acquire);
+        if (!l || !cb || t_raster_draw || t_host_work || !na::observe_internal::Started()) return;
+        uint64_t depth = 0, color = 0;
+        GetLiveSelection(&depth, &color);
+        uint32_t w = 0, h = 0, f = 0;
+        {
+            std::shared_lock<std::shared_mutex> rl(g_m);
+            na_object_id lid = 0;
+            auto* ls = list_state_locked(l, &lid);
+            if (!ls || !depth) return;
+            std::lock_guard<std::mutex> bl(ls->bind_m);
+            if (ls->cur_ds != depth) return;
+            const auto pso = g_objs.find(canon(ls->pso));
+            if (pso == g_objs.end() || pso->second.created.size() < sizeof(na_ev_pipeline_created)) return;
+            const auto* p = reinterpret_cast<const na_ev_pipeline_created*>(pso->second.created.data());
+            if (p->depth_enable != 1 || ls->nviewports != 1 ||
+                !resource_dims_locked(depth, &w, &h, &f)) return;
+            // Main-view raster only. Shadow/reflection atlases and split views
+            // keep their own sampling. A depth-only prepass qualifies too.
+            const auto& v = ls->viewports[0];
+            if (v.TopLeftX != 0 || v.TopLeftY != 0 || v.Width != float(w) || v.Height != float(h)) return;
+            original[0] = v;
+            count = 1;
+        }
+        double x = 0, y = 0;
+        if (!cb(w, h, &x, &y) || !std::isfinite(x) || !std::isfinite(y)) { count = 0; return; }
+        {
+            std::shared_lock<std::shared_mutex> rl(g_m);
+            na_object_id lid = 0;
+            auto* ls = list_state_locked(l, &lid);
+            if (!ls) { count = 0; return; }
+            std::lock_guard<std::mutex> bl(ls->bind_m);
+            ls->raster_jittered = true;
+            ls->raster_jitter[0] = x; ls->raster_jitter[1] = y;
+        }
+        auto shifted = original[0];
+        shifted.TopLeftX += float(x); shifted.TopLeftY += float(y);
+        const HostWorkScope host;
+        l->RSSetViewports(1, &shifted);
+        list = l;
+        t_raster_draw = true;
+    }
+    ~RasterJitterDraw() {
+        if (!list) return;
+        const HostWorkScope host;
+        list->RSSetViewports(count, original);
+        t_raster_draw = false;
+    }
+};
+
 void before_shader_use(GL* l, bool compute)
 {
     if (t_host_work || !na::observe_internal::Started()) return;
@@ -3242,7 +3314,10 @@ struct ListHook<Slot, R(A...)> {
             }
             if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced || Slot == sl::list::Dispatch)
                 if (scope.outermost && !scope.ambiguous) before_shader_use(l, Slot == sl::list::Dispatch);
-            fn(l, a...);
+            if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced) {
+                RasterJitterDraw raster(scope.outermost && !scope.ambiguous ? l : nullptr);
+                fn(l, a...);
+            } else fn(l, a...);
             if constexpr (Slot == sl::list::CopyResource || Slot == sl::list::ResolveSubresource || Slot == sl::list::CopyTextureRegion) {
                 if (scope.outermost && !scope.ambiguous) {
                     auto args = std::forward_as_tuple(a...);
@@ -4734,6 +4809,18 @@ na::j2::LiveConsumer ListLiveConsumer(ID3D12CommandList* list, na_object_id colo
     return ls->insertion.Live(color);
 }
 void SetTableBindCallback(TableBindCallback cb) { g_table_cb.store(cb, std::memory_order_release); }
+void SetRasterJitterCallback(RasterJitterCallback cb) { g_raster_jitter_cb.store(cb, std::memory_order_release); }
+bool ListRasterJitter(ID3D12CommandList* list, double* x, double* y)
+{
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    auto* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    if (!ls->raster_jittered) return false;
+    *x = ls->raster_jitter[0]; *y = ls->raster_jitter[1];
+    return true;
+}
 bool ListCurrentTargets(ID3D12CommandList* list, na_object_id* rt, na_object_id* ds)
 {
     std::shared_lock<std::shared_mutex> rl(g_m);

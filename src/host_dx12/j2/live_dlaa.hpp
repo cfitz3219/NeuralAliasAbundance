@@ -50,6 +50,9 @@ bool RecordNisForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID
 int DebugView();
 void SetJitter(bool on);     // the overlay's camera-jitter switch (J1), on by default
 bool Jitter();
+// Direct raster translation, for renderers whose bound global camera is not
+// the vertex transform. Opt-in; does not also rewrite game camera constants.
+void SetRasterJitter(bool on);
 
 // P4-4 (DLSS upscaling, slider route). With no destination J2 runs DLAA as before:
 // DLSS at the scene's size, written back into the scene colour. With a destination,
@@ -155,6 +158,9 @@ struct Stats {
     uint64_t sharpened_frames = 0; // RCAS applied to the DLAA result
     uint64_t nis_frames = 0;       // Legacy log field; live sharpening is RCAS-only.
     uint64_t jitter_writes = 0;   // J1: camera matrices replaced by jittered copies
+    uint64_t raster_jitter_draws = 0;
+    uint64_t segment_deferrals = 0, segment_miss_recoveries = 0;
+    bool raster_jitter = false;
     uint64_t camera_learned_hits = 0, camera_scans = 0; // camera found at the learned slot / by a full search
     // Several valid cameras in one frame (reflection, sky, light): frames where more than one
     // candidate was seen / where the chosen one was not the first-ranked. Lost-camera reasons:

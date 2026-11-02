@@ -204,6 +204,12 @@ private:
 // Writes into a CPU-visible (upload) buffer of the game, e.g. J1 jittering the
 // camera constants of a submission before it is forwarded. Returns bytes written.
 uint32_t WriteBuffer(na_object_id res, uint64_t offset, const void* src, uint32_t n);
+// Optional J1 raster sample. Called before a depth-tested scene draw, without
+// registry locks held. Returning true translates the game's viewport for this
+// draw only; it is restored immediately afterwards. Camera constants stay raw.
+using RasterJitterCallback = bool(*)(uint32_t width, uint32_t height, double* x, double* y);
+void SetRasterJitterCallback(RasterJitterCallback cb);
+bool ListRasterJitter(ID3D12CommandList* list, double* x, double* y);
 ID3D12Resource* AcquireResource(na_object_id id);                         // AddRef'd, or null
 // Current discovery picks (written by the discovery adapter, read by J2).
 void SetLiveSelection(uint64_t depth, uint64_t color);
