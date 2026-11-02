@@ -2019,6 +2019,10 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
         reason("Skipped: the previous use of this frame slot is still running.");
         return;
     }
+    // A later candidate exists only because the scene was written after every earlier one,
+    // so none of those can be chosen any more (choose_inline): their capture slots go back.
+    if (later)
+        for (uint32_t k = 0; k < g.inl_n; ++k) { na::capture::j2::Withdraw(g.inl[k].history.capture); g.inl[k].history.capture = 0; }
     // Every command of this candidate runs only if submission switches its predicate on.
     // The game's own predication is not active here (ListStateRestorable), so clearing it after is exact.
     g.pred_cpu[slot] = 0;
