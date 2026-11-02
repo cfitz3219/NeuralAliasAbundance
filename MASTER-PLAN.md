@@ -2,6 +2,8 @@
 
 **Written by:** Claude, 2026-10-23, at Cort's direction. Incorporates Codex/Astra's recovery review (`docs/CLAUDE-HANDOFF.md`) and roadmap (`docs/INPUT-ACQUISITION-ROADMAP.md`).
 **Audience:** Claude, Astra (Codex), Gemini Argon (independent gate auditor), and Cort.
+
+> **Layer 2 continuation status, 2026-11-01 Pacific:** Astra's execution backend is pushed at `bf528ca`, PR75 into the shared development branch. Scoped bindings/dimensions, private clear/copy/resolve, frame ownership and colour/depth/history fallback are implemented; local full-suite and final focused receipts are in COMMS, and all three CI jobs pass at the final source. **Automatic Anno admission/provider wiring is still unfinished and remains Astra's task.** It needs the actual native Anno dependency/binding capture requested from Opus and the shared early active-extent/J1 handoff. The available SE5 Stage M summary cannot supply Anno's plan. No Layer 2 Anno activation, installer or game test has occurred. Cort retains game testing; preserve the separate SE5 combined-installer hold.
 **Status:** ACTIVE. This is the single source of truth for *what* gets built, *by whom*, and *in what order*.
 **Where we are (2026-10-26):** Phases 1–3 are done. **Live DLAA runs in Anno 1800** (J2, PR #44), a game with no DLSS of its own, and Cort has confirmed it in the game. Next is Phase 4: lock in DLAA, then Reflex, then Frame Generation, then a second-game check for universality, then DLSS upscaling. See §2, Phase 4.
 
