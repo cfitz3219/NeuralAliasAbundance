@@ -75,6 +75,7 @@ struct Settings {
     std::atomic<uint32_t> j2_capture_frames{30};
     std::atomic<uint32_t> j2_capture_key{0x77}; // F8
     std::atomic<uint32_t> j2_capture_after_s{0};
+    std::atomic<uint32_t> j2_scale_mode{0}; // P4-4 slider route: DlssMode the game renders at ([j2] scale_mode; 0 = DLAA)
     std::atomic<uint32_t> j2_preset{12};     // J2 DLAA: DLSS render preset ([j2] preset=L; 12 = L, 0 = NVIDIA default)
     std::atomic<uint32_t> nr_structure{100};
     std::atomic<uint32_t> nr_tone{0};

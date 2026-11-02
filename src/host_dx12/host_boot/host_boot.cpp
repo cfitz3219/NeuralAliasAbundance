@@ -10,6 +10,7 @@
 #include "host_dx12/host_boot/session.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
+#include "host_dx12/scale/live_driver.hpp"
 
 #include <atomic>
 #include <cstdlib>
@@ -86,6 +87,27 @@ DWORD WINAPI InitThread(LPVOID)
     na::settings::SetIniPath(g_ini);
     na::settings::Load();
     na::host::StartSession();
+    // P4-4 slider route (step 1): our menu's mode sets the game's render scale. The read hook
+    // must be in before the game reads its settings file, so it goes in first. Opt-in per game
+    // ([j2] read_hook=1, with J2 on); never in safe start. Its log beside the status log.
+    if (GetPrivateProfileIntW(L"j2", L"read_hook", 0, g_ini) == 1 && GetPrivateProfileIntW(L"j2", L"enabled", 0, g_ini) == 1 &&
+        !na::settings::SafeStart()) {
+        wchar_t scale_log[MAX_PATH];
+        lstrcpynW(scale_log, g_ini, MAX_PATH);
+        for (int i = lstrlenW(scale_log) - 1; i >= 0; --i)
+            if (scale_log[i] == L'\\' || scale_log[i] == L'/') { scale_log[i] = 0; break; }
+        wchar_t custom[MAX_PATH] = {};
+        if (GetPrivateProfileStringW(L"host", L"status_log", L"", custom, MAX_PATH, g_ini) > 0) {
+            lstrcpynW(scale_log, custom, MAX_PATH);
+            for (int i = lstrlenW(scale_log) - 1; i >= 0; --i)
+                if (scale_log[i] == L'\\' || scale_log[i] == L'/') { scale_log[i] = 0; break; }
+        }
+        wchar_t name[64];
+        swprintf_s(name, L"\\NeuralAlias-scale-%lu.log", GetCurrentProcessId());
+        lstrcatW(scale_log, name);
+        const int mode = static_cast<int>(na::settings::Get().j2_scale_mode.load());
+        boot_log(na::scale::StartSliderRoute(mode, scale_log) ? "slider route: settings read hook installed" : "slider route: read hook failed");
+    }
     // J2 DLAA reconstructs texture detail over frames: the game's mip-mapped
     // samplers sample one mip sharper (temporal-upscaler rule log2(render/display) - 1
     // = -1 at native). Configure before installing producer hooks, after the
