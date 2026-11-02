@@ -1445,6 +1445,20 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         g.cam_u1 = cam.unjittered; g.cam_f1 = g.frame; g.cam_rev = reversed;
     }
     pending.cut = cam.camera_cut;
+    if (cam.camera_cut) { // Cort 2026-11-02: an on/off blink every ~30 s matched cuts while standing still: record why
+        static const char* const kWhy[] = {"none", "no_history", "gap", "translation", "rotation", "fov", "origin"};
+        const char* why = tracker_restart ? (g.resume_reset ? "restart_resume" : "restart_gap") : kWhy[cam.cut_reason < 7 ? cam.cut_reason : 0];
+        char one[120];
+        std::snprintf(one, sizeof one, "%llu:%s=%.3g%s%s ", static_cast<unsigned long long>(GetTickCount64() / 100 % 100000000),
+                      why, cam.cut_value, held ? "/held" : "", from_j1 ? "/j1" : "");
+        // Newest first, keep what fits.
+        char merged[sizeof g.stats.recent_cuts];
+        std::snprintf(merged, sizeof merged, "%s%s", one, g.stats.recent_cuts);
+        std::memcpy(g.stats.recent_cuts, merged, sizeof merged);
+        if (tracker_restart) ++g.stats.cut_restarts;
+        else if (cam.cut_reason == 2) ++g.stats.cut_gap;
+        else if (cam.cut_reason >= 3 && cam.cut_reason <= 5) ++g.stats.cut_motion;
+    }
     // P4-0b: moving-object motion (between-lists route only). The pre list is
     // submitted right before this list; the flow pairs with the frame the camera
     // history pairs with. Any failure leaves this frame camera-only.

@@ -33,6 +33,10 @@ namespace na::camera {
 struct CameraFrame {
     bool valid{};                 // matrix is a perspective ViewProjection and the unjittered matrix inverts
     bool camera_cut{};            // reset temporal history this frame
+    // Why (diagnostics): 0 none, 1 no history, 2 frame order/gap, 3 translation, 4 rotation, 5 fov, 6 origin mode;
+    // cut_value: frames (2), world units (3), radians (4, 5).
+    uint8_t cut_reason{};
+    double cut_value{};
     bool jitter_known{};          // jitter came from the injected sample, not estimated
     double jitter_px_x{}, jitter_px_y{}; // render pixels, +X right, +Y down
     double fov_y{}, aspect{};     // radians; width/height of the projection scales
@@ -219,6 +223,9 @@ public:
         // Cut detection against the previous accepted frame.
         bool cut = !have_ || bool(world_origin) != previous_relative_ ||
                    frame <= last_frame_ || frame - last_frame_ > lim.max_frame_gap;
+        if (!have_) f.cut_reason = 1;
+        else if (bool(world_origin) != previous_relative_) f.cut_reason = 6;
+        else if (cut) { f.cut_reason = 2; f.cut_value = double(frame) - double(last_frame_); }
         if (!cut) {
             double d2 = 0, dot = 0;
             for (size_t j = 0; j < 3; ++j) {
@@ -227,8 +234,9 @@ public:
                 dot += g.forward[j] * prev_.forward[j];
             }
             const double angle = std::acos(std::clamp(dot, -1.0, 1.0));
-            if (d2 > lim.max_translation * lim.max_translation || angle > lim.max_rotation ||
-                std::abs(f.fov_y - prev_fov_) > lim.max_fov_change) cut = true;
+            if (d2 > lim.max_translation * lim.max_translation) { cut = true; f.cut_reason = 3; f.cut_value = std::sqrt(d2); }
+            else if (angle > lim.max_rotation) { cut = true; f.cut_reason = 4; f.cut_value = angle; }
+            else if (std::abs(f.fov_y - prev_fov_) > lim.max_fov_change) { cut = true; f.cut_reason = 5; f.cut_value = f.fov_y - prev_fov_; }
         }
         // Jitter: known injected sample, else offset from the running mean.
         double jx = 0, jy = 0; // clip-space translate-by-W amounts to remove
