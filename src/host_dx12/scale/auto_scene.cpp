@@ -42,7 +42,7 @@ struct WorkerCost{Costs& cost;Clock::time_point start=Clock::now();~WorkerCost()
 uint64_t signature(const NativeOperation& op,const std::vector<uint64_t>& members){
     na::observe::OperationKey key;using K=na::observe::OperationKey;
     K::add(key.state,op.pipeline_id);K::add(key.state,op.compute);const auto root=reinterpret_cast<uintptr_t>(op.root.Get());K::add(key.state,root);
-    bool rebase=false;const auto member=[&](uint64_t id){return std::find(members.begin(),members.end(),id)!=members.end();};
+    bool rebase=false;const auto member=[&](uint64_t id){return std::binary_search(members.begin(),members.end(),id);};
     for(const auto& d:op.descriptors){key.descriptor(d.view,d.used);rebase|=d.used&&(member(d.view.resource)||member(d.view.counter));}
     for(const auto& c:op.constants){for(const auto& f:c.dimensions)key.constant(c.param,c.descriptor,c.resource_id,c.offset,f);rebase|=c.descriptor!=UINT_MAX;}
     for(const auto& d:op.colors){K::add(key.state,d.view.resource);K::add(key.state,d.view.rtv);}
@@ -64,6 +64,7 @@ TransferKey transfer_key(const TextureCall& c){return {c.kind,c.source?na::obser
     c.destination?na::observe::IdOf(c.destination):c.target_id,c.format};}
 struct MemberSeed {uint64_t id=0;ComPtr<ID3D12Resource> resource;Role role{};};
 struct Built {
+    std::shared_ptr<ShaderDescriptorArena> descriptors=std::make_shared<ShaderDescriptorArena>();
     std::shared_ptr<const SceneGroup> group;
     std::shared_ptr<SceneFrame> prototype;
     std::unordered_map<uint64_t,std::shared_ptr<const PreparedBindings>> bindings;
@@ -101,6 +102,7 @@ struct Run {
     uint64_t epoch=0,color=0,depth=0;std::atomic<bool> aborted{false},seeded{false},redirected{false};
 };
 struct Bound {std::shared_ptr<Run> run;na::nr::native::RecordingLease lease;
+    std::vector<FrameMemberState> checkpoint_states;
     std::unordered_set<const GpuConstants*> constants;std::vector<const GpuConstants*> constant_tail;
     struct PrivateState{ID3D12Resource* resource=nullptr;D3D12_RESOURCE_STATES state=D3D12_RESOURCE_STATE_COMMON;};
     std::map<std::pair<uint64_t,UINT>,PrivateState> private_states;
@@ -266,7 +268,7 @@ public:
     bool member(uint64_t id,ID3D12Resource* resource,Role role){
         if(!id||!resource||members.count(id))return false;
         const auto d=resource->GetDesc();if(d.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||d.MipLevels!=1||d.DepthOrArraySize!=1||d.SampleDesc.Count!=1)return false;
-        MemberSeed value;value.id=id;value.resource=resource;value.role=role;members.emplace(id,std::move(value));key_members.push_back(id);++model;++group_revision;work_pending.store(true);return true;
+        MemberSeed value;value.id=id;value.resource=resource;value.role=role;members.emplace(id,std::move(value));key_members.insert(std::lower_bound(key_members.begin(),key_members.end(),id),id);++model;++group_revision;work_pending.store(true);return true;
     }
     void dependency(uint64_t id){
         std::vector<uint64_t> chain;
@@ -285,7 +287,8 @@ public:
         }else++i;
         if(bound.size()>=1024)return false;
         auto lease=na::nr::native::RetainRecording(list,run);if(!lease)return false;
-        bound.emplace(key,Bound{run,std::move(lease)});return true;
+        Bound recording{run,std::move(lease)};recording.checkpoint_states.reserve(run->built->group->Members().size()*2);
+        bound.emplace(key,std::move(recording));return true;
     }
     std::shared_ptr<Run> run_for(ID3D12GraphicsCommandList* list){
         const auto key=std::make_pair(na::observe::IdOf(list),na::observe::ListRecording(list));
@@ -301,8 +304,10 @@ public:
         }
         if(!bind(list,current))return {};return current;
     }
-    std::vector<FrameMemberState> states(ID3D12GraphicsCommandList* list,const std::shared_ptr<Run>& run,bool seed=false){
-        std::vector<FrameMemberState> result;
+    const std::vector<FrameMemberState>& states(ID3D12GraphicsCommandList* list,const std::shared_ptr<Run>& run,bool seed=false){
+        const auto found=bound.find({na::observe::IdOf(list),na::observe::ListRecording(list)});
+        static const std::vector<FrameMemberState> empty;if(found==bound.end())return empty;
+        auto& result=found->second.checkpoint_states;result.clear();
         for(const auto& m:run->built->group->Members()){
             const bool stencil=m.role==Role::Depth&&m.native_desc.Format==DXGI_FORMAT_R32G8X24_TYPELESS;
             const UINT first=seed&&stencil?1:0,count=stencil&&!seed?2:first+1;
@@ -582,7 +587,7 @@ void PollAutomaticScene(){
     auto next=std::make_shared<Built>();next->mode=mode;next->model=model;next->group_revision=group_revision;next->optimal=optimal_used;next->optimal_available=optimal_available;std::string error;
     bool same=previous&&previous->mode==mode&&previous->group->Render()==render&&previous->group->Output()==output&&previous->group->Members().size()==members.size();
     if(same)for(const auto& m:members)same&=previous->group->Find(m.first)!=nullptr;
-    if(same){next->group=previous->group;next->prototype=previous->prototype;
+    if(same){next->group=previous->group;next->prototype=previous->prototype;next->descriptors=previous->descriptors;
         next->bindings=previous->bindings;next->failed=previous->failed;next->failed_evidence=previous->failed_evidence;next->last_seen=previous->last_seen;
         next->transfers=previous->transfers;next->failed_transfers=previous->failed_transfers;}
     else{
@@ -602,6 +607,7 @@ void PollAutomaticScene(){
         for(const auto& op:observed)if(!next->bindings.count(op.first)&&!next->failed.count(op.first)){
             const auto fingerprint=preparation_evidence(*op.second);
             BindingSpec spec;if(!NativeBindingSpec(*op.second,next->group,spec,error,true)){next->failed.emplace(op.first,error);next->failed_evidence.emplace(op.first,fingerprint);continue;}
+            spec.descriptors=next->descriptors;
             auto plan=PreparedBindings::Create(device.Get(),std::move(spec),error);if(plan)next->bindings.emplace(op.first,std::move(plan));else{next->failed.emplace(op.first,error);next->failed_evidence.emplace(op.first,fingerprint);}
         }
         for(auto transfer:transfers)if(!next->transfers.count(transfer.first)&&!next->failed_transfers.count(transfer.first)){

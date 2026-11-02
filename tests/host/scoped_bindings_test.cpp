@@ -11,9 +11,26 @@
 #include <d3dcompiler.h>
 #include <d3d12sdklayers.h>
 #include <cmath>
+#include <algorithm>
 namespace {
 using namespace na::scale;
 void __cdecl sink(const na_event_batch*, void*) {}
+uint64_t CheckKey(ID3D12GraphicsCommandList* list,bool compute){
+    using K=na::observe::OperationKey;na::observe::NativeOperation op;
+    CHECK(na::observe::ListNativeOperation(list,compute,op));
+    std::vector<uint64_t> members;for(const auto& color:op.colors)members.push_back(color.view.resource);members.push_back(op.depth.view.resource);
+    std::sort(members.begin(),members.end());members.erase(std::unique(members.begin(),members.end()),members.end());
+    const auto member=[&](uint64_t id){return std::binary_search(members.begin(),members.end(),id);};K expected;
+    K::add(expected.state,op.pipeline_id);K::add(expected.state,compute);const auto root=reinterpret_cast<uintptr_t>(op.root.Get());K::add(expected.state,root);
+    bool rebase=false;for(const auto& desc:op.descriptors){expected.descriptor(desc.view,desc.used);rebase|=desc.used&&(member(desc.view.resource)||member(desc.view.counter));}
+    for(const auto& c:op.constants){for(const auto& field:c.dimensions)expected.constant(c.param,c.descriptor,c.resource_id,c.offset,field);rebase|=c.descriptor!=UINT_MAX;}
+    for(const auto& color:op.colors){K::add(expected.state,color.view.resource);K::add(expected.state,color.view.rtv);}
+    if(!compute){K::add(expected.state,op.depth.view.resource);K::add(expected.state,op.depth.view.dsv);}
+    for(const auto& viewport:op.viewports)K::add(expected.state,viewport);for(const auto& scissor:op.scissors)K::add(expected.state,scissor);
+    const auto key=expected.finish(rebase);na::observe::NativeOperationKey actual;
+    for(int cached=0;cached<2;++cached){CHECK(na::observe::ListNativeOperationKey(list,compute,members.data(),members.size(),actual));CHECK(actual.key==key);}
+    return actual.key;
+}
 class Provider final : public BindingProvider {
 public:
     std::shared_ptr<const PreparedBindings> plan;
@@ -106,7 +123,9 @@ float4 ps():SV_Target{return float4(ScreenWidth,RenderHeight,marker,.75);})";
         ColorTarget target;target.member=1;target.view.Format=fmt;target.view.ViewDimension=D3D12_RTV_DIMENSION_TEXTURE2D;s.colors.push_back(target);
         s.depth.member=2;s.depth.view.Format=depth_view;s.depth.view.ViewDimension=D3D12_DSV_DIMENSION_TEXTURE2D;
         s.uses={{1,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,D3D12_RESOURCE_STATE_RENDER_TARGET},{2,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,D3D12_RESOURCE_STATE_DEPTH_WRITE}};
+        s.descriptors=std::make_shared<ShaderDescriptorArena>();auto first_slice=PreparedBindings::Create(dev,s,error);REQUIRE(first_slice);
         plan=PreparedBindings::Create(dev,s,error);REQUIRE(plan);
+        CHECK(first_slice->ShaderHeap()==plan->ShaderHeap()&&plan->ShaderOffset()>first_slice->ShaderOffset());
         promote=ColorRestore::Create(dev,group->Find(1)->reduced.Get(),color.Get(),0,fmt,error);REQUIRE(promote);
         if(frame_mode){FrameSpec f;f.group=group;f.color=1;f.depth=2;f.members={{1,D3D12_RESOURCE_STATE_RENDER_TARGET},{2,D3D12_RESOURCE_STATE_DEPTH_WRITE},{3,D3D12_RESOURCE_STATE_RENDER_TARGET,true,D3D12_RESOURCE_STATE_RENDER_TARGET}};
             if(stencil)f.members[1].seed_state=D3D12_RESOURCE_STATE_DEPTH_WRITE;
@@ -135,6 +154,15 @@ float4 ps():SV_Target{return float4(ScreenWidth,RenderHeight,marker,.75);})";
     list->SetGraphicsRootDescriptorTable(0,heap->GetGPUDescriptorHandleForHeapStart());list->SetGraphicsRootConstantBufferView(1,cb->GetGPUVirtualAddress());
     list->OMSetRenderTargets(1,&rtv,FALSE,&dsv);const D3D12_VIEWPORT vp{0,0,float(w),float(h),0,1};const D3D12_RECT sc{0,0,w,h};
     list->RSSetViewports(1,&vp);list->RSSetScissorRects(1,&sc);list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const auto native_key=CheckKey(list,false);
+    auto alternate_cb=test::CreateBuffer(dev,256,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);REQUIRE(alternate_cb);
+    list->SetGraphicsRootConstantBufferView(1,alternate_cb->GetGPUVirtualAddress());CHECK(CheckKey(list,false)!=native_key);
+    list->SetGraphicsRootConstantBufferView(1,cb->GetGPUVirtualAddress());CHECK(CheckKey(list,false)==native_key);
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC changed_cb{alternate_cb->GetGPUVirtualAddress(),256};
+    dev->CreateConstantBufferView(&changed_cb,heap->GetCPUDescriptorHandleForHeapStart());CHECK(CheckKey(list,false)!=native_key);
+    dev->CreateConstantBufferView(&cv,heap->GetCPUDescriptorHandleForHeapStart());CHECK(CheckKey(list,false)==native_key);
+    auto small_sc=sc;--small_sc.right;list->RSSetScissorRects(1,&small_sc);CHECK(CheckKey(list,false)!=native_key);
+    list->RSSetScissorRects(1,&sc);CHECK(CheckKey(list,false)==native_key);
     na::observe::NativeOperation observed;
     REQUIRE(na::observe::ListNativeOperation(list,false,observed));
     CHECK(observed.colors.size()==1&&observed.colors[0].resource==color&&observed.depth.resource==depth);
@@ -143,7 +171,9 @@ float4 ps():SV_Target{return float4(ScreenWidth,RenderHeight,marker,.75);})";
     // Live identities are mapped to this fixture's prepared group identities here only.
     observed.colors[0].view.resource=1;observed.depth.view.resource=2;
     BindingSpec automatic;REQUIRE(NativeBindingSpec(observed,group,automatic,error));
+    automatic.descriptors=plan->Spec().descriptors;
     auto automatic_plan=PreparedBindings::Create(dev,std::move(automatic),error);REQUIRE(automatic_plan);
+    CHECK(automatic_plan->ShaderHeap()==plan->ShaderHeap()&&automatic_plan->ShaderOffset()>plan->ShaderOffset());
     provider->plan=automatic_plan; // use the reflected/observed plan for the real draw below
     if(frame){
         {na::observe::HostWorkScope host;const float old_history[4]={99,77,4,.125f};
@@ -278,6 +308,7 @@ RWTexture2D<float4> target:register(u0);Texture2D<float> image:register(t0);Samp
     const auto gpu=heap->GetGPUDescriptorHandleForHeapStart();for(UINT i=0;i<3;++i)list->SetComputeRootDescriptorTable(i,{gpu.ptr+uint64_t(i)*inc});
     list->SetComputeRootDescriptorTable(3,samplers->GetGPUDescriptorHandleForHeapStart());list->SetComputeRootConstantBufferView(4,cb->GetGPUVirtualAddress());
     na::observe::ShaderState shadow;REQUIRE(na::observe::ListShaderState(list,true,shadow));CHECK(shadow.count==4&&shadow.resources==heap.Get()&&shadow.samplers==samplers.Get());
+    CheckKey(list,true);
     na::observe::NativeOperation operation;
     REQUIRE(na::observe::ListNativeOperation(list,true,operation));
     CHECK(operation.list==na::observe::IdOf(list)&&operation.recording==na::observe::ListRecording(list));

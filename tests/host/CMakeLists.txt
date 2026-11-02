@@ -16,6 +16,11 @@ endfunction()
 na_host_test(fg_profile_test SOURCES fg_profile_test.cpp LIBS host_settings nvapi_headers)
 na_host_test(ffx_flow_test SOURCES ffx_flow_test.cpp LIBS host_ffx_flow dxgi LABELS gpu)
 if(NA_HAVE_NGX_SDK)
+  # Opus's optional CPU recording benchmark; uses a fake model and real DX12.
+  # It is deliberately not a CTest or part of the default/CI build.
+  add_executable(auto_scene_bench EXCLUDE_FROM_ALL auto_scene_bench.cpp)
+  target_link_libraries(auto_scene_bench PRIVATE abundance_options host_dx12)
+  target_include_directories(auto_scene_bench PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
   na_host_test(auto_scene_test SOURCES auto_scene_test.cpp LIBS host_dx12 LABELS gpu)
   add_test(NAME host_auto_scene_stencil_test COMMAND auto_scene_test --stencil)
   set_tests_properties(host_auto_scene_stencil_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")

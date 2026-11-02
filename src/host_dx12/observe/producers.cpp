@@ -55,6 +55,7 @@ struct QueueState {
     std::mutex submit_m;
 };
 
+struct DescHeap;
 struct ListState {
     std::atomic<uint64_t> generation{0};
     std::atomic<bool> generation_known{false};
@@ -112,7 +113,21 @@ struct ListState {
     };
     ID3D12PipelineState* pso = nullptr;
     ID3D12DescriptorHeap* heaps[2] = {nullptr, nullptr};
+    DescHeap* heap_metadata[2]{}; // borrowed only under g_m, invalidated by heap_registry_revision
+    uint64_t heap_metadata_revision=0;
     uint32_t nheaps = 0;
+    struct KeyCache {
+        OperationKey prefix;
+        uint64_t state_revision=0,registry_revision=0,dimension_cbvs=0;
+        std::vector<uint64_t> members;
+        bool valid=false,rebase=false;
+    } operation_key[2];
+    uint64_t key_revision[2]{};
+    struct ShaderReads {
+        uint64_t state_revision=0,registry_revision=0,color=0;
+        na_object_id srvs[16]{},uav=0;
+        uint32_t count=0;uint8_t color_srvs=0;bool valid=false;
+    } shader_reads[2];
     std::vector<RootArg> args[2]; // [graphics, compute], by root parameter
     na_object_id cur_rt = 0, cur_ds = 0; // currently bound first render target / depth
     na_object_id cur_rts[8] = {};
@@ -218,6 +233,9 @@ void ReleaseParkedTwins()
 }
 std::vector<std::unique_ptr<DescHeap>> g_heaps;
 std::vector<VaRange> g_va; // sorted by begin
+// Protected by the existing g_m. No additional hot-path setter lock. Identity
+// reuse, descriptor writes/copies and heap retirement invalidate borrowed data.
+uint64_t g_operation_revision=1,g_heap_registry_revision=1;
 struct BufferInfo {
     uint32_t heap_type = NA_UNKNOWN_U32;
     uint64_t width = 0;
@@ -468,6 +486,7 @@ void RetireSentinel::retire(const void* key, na_object_id id, uint32_t kind)
     std::shared_ptr<Obj::Twins> drop; // parked, never released here (we are inside the owner's destruction)
     {
         std::unique_lock<std::shared_mutex> lock(g_m);
+        ++g_operation_revision;++g_heap_registry_revision;
         auto it = g_objs.find(key);
         if (it != g_objs.end() && it->second.id == id) { drop = std::move(it->second.twins); g_objs.erase(it); }
         g_heaps.erase(std::remove_if(g_heaps.begin(), g_heaps.end(), [&](const std::unique_ptr<DescHeap>& h) { return h->id == id; }),
@@ -536,6 +555,7 @@ na_object_id register_object(IUnknown* object, uint32_t kind)
     {
         std::unique_lock<std::shared_mutex> lock(g_m);
         Obj& o = g_objs[key];
+        ++g_operation_revision;
         if (o.id) g_c.live.fetch_sub(1); // address reused without a retirement we saw
         drop = std::move(o.twins);
         o = fresh_obj(id, kind);
@@ -562,6 +582,7 @@ na_object_id ensure_registered(IUnknown* object, uint32_t kind, bool* created)
         auto it = g_objs.find(key);
         if (it != g_objs.end() && it->second.kind == kind) return it->second.id;
         id = g_next_id.fetch_add(1);
+        ++g_operation_revision;
         if (it != g_objs.end()) { g_c.live.fetch_sub(1); drop = std::move(it->second.twins); }
         g_objs[key] = fresh_obj(id, kind);
     }
@@ -686,6 +707,7 @@ void note_resource(ID3D12Device* dev, IUnknown* obj, uint32_t creation_kind, ID3
         std::unique_lock<std::shared_mutex> lock(g_m);
         VaRange r{va, va + d.Width, id, obj};
         g_va.insert(std::upper_bound(g_va.begin(), g_va.end(), r, [](const VaRange& a, const VaRange& b) { return a.begin < b.begin; }), r);
+        ++g_operation_revision;
     }
     emit(e, NA_GROUP_RESOURCE);
 }
@@ -745,6 +767,7 @@ na_object_id ensure_resource_registered(ID3D12Resource* res)
         if (va) {
             VaRange r{va, va + d.Width, id, res};
             g_va.insert(std::upper_bound(g_va.begin(), g_va.end(), r, [](const VaRange& a, const VaRange& b) { return a.begin < b.begin; }), r);
+            ++g_operation_revision;
         }
     }
     emit(e, NA_GROUP_RESOURCE);
@@ -813,6 +836,7 @@ void note_descriptor_write(D3D12_CPU_DESCRIPTOR_HANDLE dst, uint32_t kind, IUnkn
         e.heap = h->id;
         e.slot = slot;
         e.slot_version = ++h->versions[slot];
+        ++g_operation_revision;
         e.resource = resource ? id_locked(resource) : 0;
         if (resource && !e.resource) {
             e.resource = NA_UNKNOWN_U64; // resource-backed, but created before observation
@@ -846,6 +870,7 @@ void note_descriptor_copy(uint64_t dst, uint64_t src, uint32_t count, uint32_t i
                 return;
             }
             run = std::min({count, dh->count - ds, sh->count - ss});
+            ++g_operation_revision;
             for (uint32_t i = 0; i < run; ++i) {
                 ++dh->versions[ds + i];
                 dh->info[ds + i] = sh->info[ss + i]; // contents follow the source's record-time view
@@ -1042,6 +1067,7 @@ void register_heap(ID3D12Device* dev, IUnknown* obj, ID3D12DescriptorHeap* h, co
         g_heaps.erase(std::remove_if(g_heaps.begin(), g_heaps.end(), [&](const std::unique_ptr<DescHeap>& x) { return x->key == obj; }),
                       g_heaps.end());
         g_heaps.push_back(std::move(dh));
+        ++g_operation_revision;++g_heap_registry_revision;
     }
     remember_creation(obj, e);
     emit(e, NA_GROUP_DESCRIPTOR);
@@ -1078,6 +1104,7 @@ void remember_view(D3D12_CPU_DESCRIPTOR_HANDLE handle, std::shared_ptr<Descripto
         view->kind = heap->info[slot].kind;
         view->resource = heap->info[slot].resource;
         heap->info[slot].details = std::move(view);
+        ++g_operation_revision;
     }
 }
 void STDMETHODCALLTYPE D_CreateConstantBufferView(ID3D12Device* dev, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE h)
@@ -1105,6 +1132,7 @@ void STDMETHODCALLTYPE D_CreateConstantBufferView(ID3D12Device* dev, const D3D12
         e.heap = dh->id;
         e.slot = slot;
         e.slot_version = ++dh->versions[slot];
+        ++g_operation_revision;
         dh->info[slot] = DescHeap::SlotInfo{NA_DESC_CBV, desc && desc->BufferLocation ? (known ? res : NA_UNKNOWN_U64) : 0, NA_UNKNOWN_U32, 0,
                                             known ? off : 0, desc ? desc->SizeInBytes : 0};
     }
@@ -2219,6 +2247,24 @@ DescHeap* heap_for_gpu_locked(uint64_t ptr, uint32_t* slot)
     return nullptr;
 }
 
+// g_m and the list's bind_m are held. Registry changes invalidate the raw
+// pointers BEFORE they may be inspected; game-owned heaps retain their native
+// lifetime rules. A table lookup examines at most the two currently bound heaps.
+void bound_heaps_locked(ListState& ls){
+    if(ls.heap_metadata_revision==g_heap_registry_revision)return;
+    ls.heap_metadata[0]=ls.heap_metadata[1]=nullptr;
+    for(uint32_t i=0;i<ls.nheaps;++i){const auto* key=canon(ls.heaps[i]);
+        for(const auto& h:g_heaps)if(h->key==ls.heaps[i]||h->key==key){ls.heap_metadata[i]=h.get();break;}}
+    ls.heap_metadata_revision=g_heap_registry_revision;
+}
+DescHeap* bound_heap_for_gpu_locked(ListState& ls,uint64_t ptr,uint32_t* slot){
+    bound_heaps_locked(ls);
+    for(uint32_t i=0;i<ls.nheaps;++i){auto* h=ls.heap_metadata[i];if(!h||!h->gpu_start||!h->increment||ptr<h->gpu_start)continue;
+        const auto offset=ptr-h->gpu_start;if(offset%h->increment||offset/h->increment>=h->count)continue;
+        *slot=static_cast<uint32_t>(offset/h->increment);return h;}
+    return nullptr;
+}
+
 na_view_ref view_ref_locked(DescHeap* h, uint32_t slot)
 {
     na_view_ref v{};
@@ -2300,6 +2346,9 @@ struct On<sl::list::Reset> {
                     ls->pso = pso;
                     ls->heaps[0] = ls->heaps[1] = nullptr;
                     ls->nheaps = 0;
+                    ls->heap_metadata_revision=0;
+                    ls->operation_key[0].valid=ls->operation_key[1].valid=false;
+                    ++ls->key_revision[0];++ls->key_revision[1];
                     ls->args[0].clear();
                     ls->args[1].clear();
                     ls->cur_rt = ls->cur_ds = 0;
@@ -2537,7 +2586,8 @@ struct On<sl::list::SetPipelineState> {
         Rec r;
         if (!begin_op(l, &r)) return;
         emit_op(r, NA_OP_SET_PIPELINE, {id_or_unknown(p)});
-        with_list_state(l, [&](ListState& ls) { std::lock_guard<std::mutex> bl(ls.bind_m); ls.pso = p; });
+        with_list_state(l, [&](ListState& ls) { std::lock_guard<std::mutex> bl(ls.bind_m);
+            if(ls.pso!=p){++ls.key_revision[0];++ls.key_revision[1];ls.operation_key[0].valid=ls.operation_key[1].valid=false;}ls.pso = p; });
     }
 };
 template <>
@@ -2649,6 +2699,7 @@ struct On<sl::list::SetDescriptorHeaps> {
         with_list_state(l, [&](ListState& ls) {
             std::lock_guard<std::mutex> bl(ls.bind_m);
             ls.nheaps = 0;
+            ls.heap_metadata_revision=0;++ls.key_revision[0];++ls.key_revision[1];
             for (UINT i = 0; h && i < n && i < 2; ++i) ls.heaps[ls.nheaps++] = h[i];
         });
     }
@@ -2662,6 +2713,7 @@ void root_sig(GL* l, ID3D12RootSignature* rs)
     with_list_state(l, [&](ListState& ls) {
         std::lock_guard<std::mutex> bl(ls.bind_m);
         const bool changed = ls.root_sig[Compute] != rs;ls.root_sig[Compute] = rs;++ls.root_serial[Compute];
+        if(changed){++ls.key_revision[Compute];ls.operation_key[Compute].valid=false;}
         if (changed) ls.args[Compute].clear(); // a different root signature invalidates every root argument
     });
 }
@@ -2677,6 +2729,10 @@ void shadow_arg(GL* l, uint32_t compute, UINT param, uint8_t type, uint64_t valu
         auto& v = ls.args[compute];
         if (v.size() <= param) v.resize(param + 1);
         ListState::RootArg& a = v[param];
+        if(a.type!=type||a.value!=value||type==5){
+            const auto& cached=ls.operation_key[compute];
+            if(type!=2||(a.type!=2&&a.type!=0)||!cached.valid||(cached.dimension_cbvs&(uint64_t(1)<<param)))++ls.key_revision[compute];
+        }
         ++a.serial;
         if (type == 5) {
             if (a.type != 5) a.consts.clear();
@@ -3133,13 +3189,18 @@ void before_shader_use(GL* l, bool compute)
         na_object_id srv_ids[16] = {};
         uint32_t nsrv = 0;
         bool reads_derived = false;
+        auto& cached=ls->shader_reads[compute];
+        if(cached.valid&&cached.state_revision==ls->key_revision[compute]&&cached.registry_revision==g_operation_revision&&cached.color==color){
+            color_srvs=cached.color_srvs;reads_color=color_srvs!=0;nsrv=cached.count;
+            std::copy_n(cached.srvs,nsrv,srv_ids);if(compute)destination=cached.uav;
+        }else{
         const auto& params = signature->second.root_params;
         const auto& ranges = signature->second.root_ranges;
         for (size_t p = 0; p < ls->args[compute].size() && p < params.size(); ++p) {
             const auto& arg = ls->args[compute][p];
             if (arg.type != 1 || params[p].param_type != NA_ROOT_TABLE) continue;
             uint32_t slot = 0;
-            auto* heap = heap_for_gpu_locked(arg.value, &slot);
+            auto* heap = bound_heap_for_gpu_locked(*ls,arg.value, &slot);
             if (!heap) continue;
             bool bound = false;
             for (uint32_t h = 0; h < ls->nheaps; ++h) bound |= heap->key == ls->heaps[h];
@@ -3163,6 +3224,10 @@ void before_shader_use(GL* l, bool compute)
                         destination = info.resource;
                 }
             }
+        }
+        cached.state_revision=ls->key_revision[compute];cached.registry_revision=g_operation_revision;cached.color=color;
+        cached.color_srvs=color_srvs;cached.count=nsrv;cached.uav=compute?destination:0;
+        std::copy_n(srv_ids,nsrv,cached.srvs);cached.valid=true;
         }
         if (reads_color) {
             // Role-class inputs (only for the few draws that read the scene colour).
@@ -5057,9 +5122,9 @@ bool ListShaderState(ID3D12CommandList* l, bool compute, ShaderState& out)
     result.raster_restorable=ls->raster_tracking&&ls->raster_targets_known&&ls->raster_viewports_known&&ls->raster_scissors_known;
     result.target_serial=ls->target_serial;result.viewport_serial=ls->viewport_serial;result.scissor_serial=ls->scissor_serial;
     result.root_serial=ls->root_serial[compute];result.restore_serial=ls->host_restore_serial;
+    bound_heaps_locked(*ls);
     for (uint32_t i = 0; i < ls->nheaps; ++i) {
-        const DescHeap* heap = nullptr;
-        for (const auto& h : g_heaps) if (h && h->key == ls->heaps[i]) { heap = h.get(); break; }
+        const DescHeap* heap = ls->heap_metadata[i];
         if (!heap) return false;
         if (heap->type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) result.resources = ls->heaps[i];
         else if (heap->type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) result.samplers = ls->heaps[i];
@@ -5071,11 +5136,7 @@ bool ListShaderState(ID3D12CommandList* l, bool compute, ShaderState& out)
         const auto& a = args[p];
         if (a.type == 2){result.cbv_params |= uint64_t(1) << p;result.cbv_serial[p]=a.serial;}
         if (a.type != 1) continue;
-        const DescHeap* heap = nullptr;
-        for (const auto& h : g_heaps) if (h &&
-            (h->key == result.resources || h->key == result.samplers) && h->increment &&
-            a.value >= h->gpu_start && (a.value - h->gpu_start) / h->increment < h->count &&
-            (a.value - h->gpu_start) % h->increment == 0) { heap = h.get(); break; }
+        uint32_t slot=0;const DescHeap* heap=bound_heap_for_gpu_locked(*ls,a.value,&slot);
         if (!heap) return false;
         result.tables[result.count++] = {p, a.value, heap->type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER};
     }
@@ -5121,7 +5182,8 @@ bool RestoreListState(ID3D12GraphicsCommandList* l)
     ID3D12DescriptorHeap* heaps[2] = {};
     uint32_t nheaps = 0;
     const void* rs[2] = {};
-    std::vector<ListState::RootArg> args[2];
+    struct RootReplay {uint8_t type=0;uint64_t value=0;UINT count=0;uint32_t consts[64]{};};
+    RootReplay args[2][64];UINT nargs[2]{};
     std::shared_ptr<Obj::Twins> raster_storage;
     D3D12_VIEWPORT viewports[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
     D3D12_RECT scissors[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
@@ -5142,8 +5204,10 @@ bool RestoreListState(ID3D12GraphicsCommandList* l)
         heaps[1] = ls->heaps[1];
         rs[0] = ls->root_sig[0];
         rs[1] = ls->root_sig[1];
-        args[0] = ls->args[0];
-        args[1] = ls->args[1];
+        for(UINT c=0;c<2;++c){if(ls->args[c].size()>64)return false;nargs[c]=UINT(ls->args[c].size());
+            for(UINT p=0;p<nargs[c];++p){const auto& from=ls->args[c][p];auto& to=args[c][p];
+                if(from.consts.size()>64)return false;to.type=from.type;to.value=from.value;to.count=UINT(from.consts.size());
+                if(to.count)std::copy_n(from.consts.data(),to.count,to.consts);}}
         if (ls->raster_tracking) {
             vp_known = ls->raster_viewports_known; viewport_count = ls->raster_viewport_count;
             sc_known = ls->raster_scissors_known; scissor_count = ls->raster_scissor_count;
@@ -5162,14 +5226,14 @@ bool RestoreListState(ID3D12GraphicsCommandList* l)
         if (!rs[c]) continue;
         auto* sig = static_cast<ID3D12RootSignature*>(const_cast<void*>(rs[c]));
         if (c) l->SetComputeRootSignature(sig); else l->SetGraphicsRootSignature(sig);
-        for (UINT p = 0; p < args[c].size(); ++p) {
-            const ListState::RootArg& a = args[c][p];
+        for (UINT p = 0; p < nargs[c]; ++p) {
+            const auto& a = args[c][p];
             switch (a.type) {
             case 1: { D3D12_GPU_DESCRIPTOR_HANDLE h{a.value}; if (c) l->SetComputeRootDescriptorTable(p, h); else l->SetGraphicsRootDescriptorTable(p, h); break; }
             case 2: if (c) l->SetComputeRootConstantBufferView(p, a.value); else l->SetGraphicsRootConstantBufferView(p, a.value); break;
             case 3: if (c) l->SetComputeRootShaderResourceView(p, a.value); else l->SetGraphicsRootShaderResourceView(p, a.value); break;
             case 4: if (c) l->SetComputeRootUnorderedAccessView(p, a.value); else l->SetGraphicsRootUnorderedAccessView(p, a.value); break;
-            case 5: if (!a.consts.empty()) { if (c) l->SetComputeRoot32BitConstants(p, static_cast<UINT>(a.consts.size()), a.consts.data(), 0); else l->SetGraphicsRoot32BitConstants(p, static_cast<UINT>(a.consts.size()), a.consts.data(), 0); } break;
+            case 5: if (a.count) { if (c) l->SetComputeRoot32BitConstants(p, a.count, a.consts, 0); else l->SetGraphicsRoot32BitConstants(p, a.count, a.consts, 0); } break;
             default: break;
             }
         }
@@ -5515,13 +5579,19 @@ bool ListNativeOperationKey(ID3D12GraphicsCommandList* list,bool compute,const u
     if(!ls||!ls->recording_observed.load()||!ls->coverage_complete.load()||!ls->generation_known.load())return false;
     std::lock_guard<std::mutex> bl(ls->bind_m);
     if(!ls->restorable||ls->in_render_pass)return false;
+    out.recording=ls->generation.load()+1;
+    auto& cached=ls->operation_key[compute];bool rebase=false;
+    if(cached.valid&&cached.state_revision==ls->key_revision[compute]&&cached.registry_revision==g_operation_revision&&
+       count==cached.members.size()&&std::equal(cached.members.begin(),cached.members.end(),members)){
+        key=cached.prefix;rebase=cached.rebase;
+    }else{
+    cached.valid=false;cached.dimension_cbvs=0;
     const auto rs=g_objs.find(canon(ls->root_sig[compute])),pipeline=g_objs.find(canon(ls->pso));
     if(rs==g_objs.end()||pipeline==g_objs.end()||rs->second.root_params.size()>64)return false;
-    out.recording=ls->generation.load()+1;
     OperationKey::add(key.state,pipeline->second.id);OperationKey::add(key.state,compute);
     const auto root=reinterpret_cast<uintptr_t>(ls->root_sig[compute]);OperationKey::add(key.state,root);
-    const auto& args=ls->args[compute];bool rebase=false;uint32_t descriptor_count=0;
-    const auto member=[&](uint64_t id){for(size_t i=0;i<count;++i)if(members[i]==id)return true;return false;};
+    const auto& args=ls->args[compute];uint32_t descriptor_count=0,table_first[64]{};
+    const auto member=[&](uint64_t id){return count&&std::binary_search(members,members+count,id);};
     for(uint32_t param=0;param<rs->second.root_params.size();++param){const auto& p=rs->second.root_params[param];
         if(p.param_type!=NA_ROOT_TABLE||param>=args.size()||args[param].type!=1)continue;
         if(p.first_range>rs->second.root_ranges.size()||p.count>rs->second.root_ranges.size()-p.first_range)return false;
@@ -5530,8 +5600,9 @@ bool ListNativeOperationKey(ID3D12GraphicsCommandList* list,bool compute,const u
             if(range.num_descriptors==UINT_MAX||range.table_offset==UINT_MAX||range.num_descriptors>4096||range.table_offset>4096-range.num_descriptors)return false;
             sampler|=range.range_type==D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;span=std::max(span,range.table_offset+range.num_descriptors);}
         if(sampler)continue;
-        uint32_t slot=0;const auto* heap=heap_for_gpu_locked(args[param].value,&slot);
+        uint32_t slot=0;const auto* heap=bound_heap_for_gpu_locked(*ls,args[param].value,&slot);
         if(!heap||span>heap->count-slot||span>4096-descriptor_count)return false;
+        table_first[param]=descriptor_count;
         for(uint32_t i=0;i<span;++i){bool used=!pipeline->second.reflection_complete;
             if(!used)for(uint32_t r=0;r<p.count;++r){const auto& range=rs->second.root_ranges[p.first_range+r];
                 if(i>=range.table_offset&&i-range.table_offset<range.num_descriptors)used|=shader_uses(pipeline->second,p,range,range.base_register+i-range.table_offset);}
@@ -5543,21 +5614,24 @@ bool ListNativeOperationKey(ID3D12GraphicsCommandList* list,bool compute,const u
     }
     // Hash only named, used dimension bindings. Per-object/material CBVs and
     // native table addresses are not copied or retained by passthrough plans.
-    for(const auto& field:pipeline->second.dimensions)for(uint32_t param=0;param<rs->second.root_params.size()&&param<args.size();++param){
+    for(const auto& field:pipeline->second.dimensions)for(uint32_t param=0;param<rs->second.root_params.size();++param){
         const auto& p=rs->second.root_params[param];uint32_t descriptor=UINT_MAX;uint64_t address=0;
         if(p.visibility!=D3D12_SHADER_VISIBILITY_ALL&&field.visibility!=D3D12_SHADER_VISIBILITY_ALL&&p.visibility!=field.visibility)continue;
-        if(p.param_type==NA_ROOT_CBV&&args[param].type==2&&p.shader_register==field.shader_register&&p.register_space==field.space)address=args[param].value;
-        else if(p.param_type==NA_ROOT_TABLE&&args[param].type==1){uint32_t first=0;
-            for(uint32_t previous=0;previous<param;++previous){const auto& t=rs->second.root_params[previous];
-                if(t.param_type!=NA_ROOT_TABLE||previous>=args.size()||args[previous].type!=1)continue;
-                uint32_t span=0;bool sampler=false;for(uint32_t r=0;r<t.count;++r){const auto& range=rs->second.root_ranges[t.first_range+r];sampler|=range.range_type==D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;span=std::max(span,range.table_offset+range.num_descriptors);}if(!sampler)first+=span;}
-            uint32_t slot=0;const auto* heap=heap_for_gpu_locked(args[param].value,&slot);if(!heap)return false;
+        if(p.param_type==NA_ROOT_CBV&&p.shader_register==field.shader_register&&p.register_space==field.space)cached.dimension_cbvs|=uint64_t(1)<<param;
+        if(param>=args.size())continue;
+        if(p.param_type==NA_ROOT_CBV&&p.shader_register==field.shader_register&&p.register_space==field.space){
+            if(args[param].type==2)address=args[param].value;}
+        else if(p.param_type==NA_ROOT_TABLE&&args[param].type==1){
+            uint32_t slot=0;const auto* heap=bound_heap_for_gpu_locked(*ls,args[param].value,&slot);if(!heap)return false;
             for(uint32_t r=0;r<p.count;++r){const auto& range=rs->second.root_ranges[p.first_range+r];
                 if(range.range_type!=D3D12_DESCRIPTOR_RANGE_TYPE_CBV||range.register_space!=field.space||field.shader_register<range.base_register||field.shader_register-range.base_register>=range.num_descriptors)continue;
                 const auto offset=range.table_offset+field.shader_register-range.base_register;
-                const auto& details=heap->info[slot+offset].details;if(!details)return false;address=details->cbv.BufferLocation;descriptor=first+offset;}
+                const auto& details=heap->info[slot+offset].details;if(!details)return false;address=details->cbv.BufferLocation;descriptor=table_first[param]+offset;}
         }
         uint64_t resource=0,offset=0;if(address&&resolve_va_locked(address,&resource,&offset)){key.constant(param,descriptor,resource,offset,field);rebase|=descriptor!=UINT_MAX;}
+    }
+    cached.prefix=key;cached.rebase=rebase;cached.state_revision=ls->key_revision[compute];cached.registry_revision=g_operation_revision;
+    cached.members.clear();if(count)cached.members.assign(members,members+count);cached.valid=true;
     }
     if(!compute){if(!ls->raster_tracking||!ls->raster_targets_known||!ls->raster_viewports_known||!ls->raster_scissors_known)return false;
         for(const auto& rt:ls->native_colors){if(!rt)return false;OperationKey::add(key.state,rt->resource);OperationKey::add(key.state,rt->rtv);}

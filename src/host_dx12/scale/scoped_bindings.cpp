@@ -3,6 +3,14 @@
 #include "host_dx12/nr/native_fg.hpp"
 #include <algorithm>
 namespace na::scale {
+bool ShaderDescriptorArena::Allocate(ID3D12Device* device,UINT count,Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>& heap,UINT& first){
+    if(!device||!count||count>4096)return false;const na::observe::HostWorkScope host;std::lock_guard<std::mutex> lock(mutex_);
+    if(blocks_.empty()||count>blocks_.back().capacity-blocks_.back().used){
+        Block block;block.capacity=4096;
+        const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,block.capacity,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
+        if(FAILED(device->CreateDescriptorHeap(&desc,IID_PPV_ARGS(&block.heap))))return false;blocks_.push_back(std::move(block));}
+    auto& block=blocks_.back();heap=block.heap;first=block.used;block.used+=count;return true;
+}
 std::shared_ptr<const PreparedBindings> PreparedBindings::Create(ID3D12Device* device, BindingSpec spec, std::string& error)
 {
     error.clear();
@@ -64,9 +72,11 @@ std::shared_ptr<const PreparedBindings> PreparedBindings::Create(ID3D12Device* d
         return fail("invalid screen-space compute layout");
     if (!s.views.empty()) {
         D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, static_cast<UINT>(s.views.size()), D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
-        if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&p->views_)))) return fail("private shader descriptor heap failed");
+        if(s.descriptors){if(!s.descriptors->Allocate(device,hd.NumDescriptors,p->views_,p->views_first_))return fail("private shader descriptor arena failed");}
+        else if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&p->views_)))) return fail("private shader descriptor heap failed");
         p->increment_ = device->GetDescriptorHandleIncrementSize(hd.Type);
         auto cpu = p->views_->GetCPUDescriptorHandleForHeapStart();
+        cpu.ptr+=SIZE_T(p->views_first_)*p->increment_;
         for (const auto& v : s.views) {
             if (v.kind == ShaderView::Kind::PatchedCbv) {
                 if (v.constant >= s.constants.size()) return fail("invalid table constant-buffer index");
@@ -135,7 +145,7 @@ na::observe::ShaderScope BindingHook::Before(ID3D12GraphicsCommandList* list, na
         }
         const auto base = p->views_->GetGPUDescriptorHandleForHeapStart();
         for (const auto& t : s.tables) {
-            const D3D12_GPU_DESCRIPTOR_HANDLE gpu{base.ptr + uint64_t(t.first) * p->increment_};
+            const D3D12_GPU_DESCRIPTOR_HANDLE gpu{base.ptr + uint64_t(p->views_first_+t.first) * p->increment_};
             if (s.compute) list->SetComputeRootDescriptorTable(t.param, gpu); else list->SetGraphicsRootDescriptorTable(t.param, gpu);
         }
     }

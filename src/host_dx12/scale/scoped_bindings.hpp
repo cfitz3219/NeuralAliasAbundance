@@ -1,9 +1,20 @@
 #pragma once
 #include "gpu_constants.hpp"
 #include "host_dx12/observe/shader_operation.hpp"
+#include <mutex>
 
 namespace na::observe{struct ShaderState;}
 namespace na::scale {
+// Setup-worker allocation only. Immutable slices share a group-owned heap;
+// no descriptor is recycled while an executable recording may reference it.
+class ShaderDescriptorArena {
+public:
+    bool Allocate(ID3D12Device*,UINT count,Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>&,UINT& first);
+private:
+    struct Block {Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;UINT used=0,capacity=0;};
+    std::mutex mutex_;
+    std::vector<Block> blocks_;
+};
 // Prepared from the recognized operation's real view/layout metadata, on the
 // setup worker under HostWorkScope. No shader-visible heap is used as a CPU
 // descriptor-copy source. Every descriptor in this private heap is created
@@ -30,6 +41,7 @@ struct ColorTarget { uint64_t member = 0; D3D12_RENDER_TARGET_VIEW_DESC view{}; 
 struct DepthTarget { uint64_t member = 0; D3D12_DEPTH_STENCIL_VIEW_DESC view{}; };
 struct BindingSpec {
     std::shared_ptr<const SceneGroup> group;
+    std::shared_ptr<ShaderDescriptorArena> descriptors;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
     bool compute = false;
     // If any private resource heap is needed, all native resource tables must
@@ -61,6 +73,8 @@ public:
     const BindingSpec& Spec()const{return spec_;}
     const std::vector<D3D12_VIEWPORT>& Viewports()const{return viewports_;}
     const std::vector<D3D12_RECT>& Scissors()const{return scissors_;}
+    ID3D12DescriptorHeap* ShaderHeap()const{return views_.Get();}
+    UINT ShaderOffset()const{return views_first_;}
 private:
     BindingSpec spec_;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> views_, rtvs_, dsv_;
@@ -71,6 +85,7 @@ private:
     UINT dispatch_x_ = 0, dispatch_y_ = 0;
     uint64_t tables_mask_ = 0, cbv_mask_ = 0;
     UINT increment_ = 0;
+    UINT views_first_ = 0;
     friend class BindingHook;
 };
 class BindingProvider {

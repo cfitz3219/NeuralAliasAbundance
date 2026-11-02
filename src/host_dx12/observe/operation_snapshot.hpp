@@ -74,6 +74,7 @@ struct NativeOperationKey {
 };
 // Does not retain resources, allocate descriptor snapshots, or call GetDesc.
 // Reads existing per-list shadow plus immutable PSO/compiler metadata only.
+// members must be sorted unique IDs (the automatic owner's canonical group).
 bool ListNativeOperationKey(ID3D12GraphicsCommandList*,bool compute,const uint64_t* members,size_t member_count,NativeOperationKey&);
 // Setup only, before the game's descriptors are created. Does not enable scaling.
 void SetOperationSnapshots(bool enabled);
