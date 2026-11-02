@@ -562,11 +562,19 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                 const bool vetoed = post.barrier_vetoes + post.class_rejected_skips > pre.barrier_vetoes + pre.class_rejected_skips;
                 const bool withheld = post.inline_withheld > pre.inline_withheld;
                 if (vetoed || withheld) ++early_list_candidates;
-                if (frame_no > 1 && !vetoed && !withheld)
-                    std::printf("EARLY LIST not pre-empted: candidates %llu waited %llu rejects(pending=%llu) \"%s\"\n",
-                                (unsigned long long)(post.inline_candidates - pre.inline_candidates),
-                                (unsigned long long)(post.inline_waited - pre.inline_waited),
-                                (unsigned long long)post.inline_rejects[8], post.reason);
+                if (!vetoed && !withheld) {
+                    std::printf("EARLY LIST frame %d not pre-empted: d{cands %llu waited %llu refused %llu busy %llu no_camera %llu no_state %llu "
+                                "vetoes %llu ambiguous %llu rejected_skips %llu recorded %llu} rejects{",
+                                segment_no, (unsigned long long)(post.inline_candidates - pre.inline_candidates),
+                                (unsigned long long)(post.inline_waited - pre.inline_waited), (unsigned long long)(post.inline_refused - pre.inline_refused),
+                                (unsigned long long)(post.busy - pre.busy), (unsigned long long)(post.no_camera - pre.no_camera),
+                                (unsigned long long)(post.no_state - pre.no_state), (unsigned long long)(post.barrier_vetoes - pre.barrier_vetoes),
+                                (unsigned long long)(post.barrier_ambiguous_skips - pre.barrier_ambiguous_skips),
+                                (unsigned long long)(post.class_rejected_skips - pre.class_rejected_skips),
+                                (unsigned long long)(post.inline_recorded - pre.inline_recorded));
+                    for (int r = 0; r < 9; ++r) std::printf("%llu%s", (unsigned long long)(post.inline_rejects[r] - pre.inline_rejects[r]), r < 8 ? "," : "");
+                    std::printf("} \"%s\"\n", post.reason);
+                }
             }
         }
         std::memset(cpu, 0, 4096);
