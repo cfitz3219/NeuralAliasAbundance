@@ -125,7 +125,7 @@ na::observe::ShaderScope BindingHook::Before(ID3D12GraphicsCommandList* list, na
     uint64_t tables = 0;
     for (uint32_t i = 0; i < native.count; ++i) if (!native.tables[i].sampler) tables |= uint64_t(1) << native.tables[i].param;
     if (p->views_ && tables != p->tables_mask_) return refused("private table map does not cover every native resource table");
-    for (const auto& c : s.constants) if (!c.buffer->CanRecord(list, c.source_state)) return refused("source constant state is not usable");
+    for (const auto& c : s.constants) if (!c.buffer->CanRecord(native.list_type, c.source_state)) return refused("source constant state is not usable");
     auto retained = std::const_pointer_cast<PreparedBindings>(p);
     if (!provider_->RecordingOwnsPlans()&&!na::nr::native::RetainRecording(list, retained)) return refused("recording lifetime is not available");
     if(provider_->RecordingOwnsPlans()){

@@ -57,6 +57,7 @@ struct QueueState {
 
 struct DescHeap;
 struct ListState {
+    uint32_t list_type=NA_UNKNOWN_U32; // immutable creation metadata
     std::atomic<uint64_t> generation{0};
     std::atomic<bool> generation_known{false};
     std::atomic<uint64_t> op_index{0};
@@ -604,6 +605,7 @@ void remember_creation(const void* object, E& e)
     if (it->second.retirement_unobservable) e.hdr.flags |= NA_EVF_METHOD_UNOBSERVED;
     const auto* b = reinterpret_cast<const uint8_t*>(&e);
     it->second.created.assign(b, b + sizeof(E));
+    if constexpr(std::is_same_v<E,na_ev_list_created>)if(it->second.list)it->second.list->list_type=e.list_type;
 }
 
 na_object_id id_locked(const void* object)
@@ -5119,6 +5121,7 @@ bool ListShaderState(ID3D12CommandList* l, bool compute, ShaderState& out)
     std::lock_guard<std::mutex> bl(ls->bind_m);
     if (!ls->restorable || ls->in_render_pass) return false;
     result.root = static_cast<ID3D12RootSignature*>(const_cast<void*>(ls->root_sig[compute ? 1 : 0]));
+    result.list_type=ls->list_type;
     result.raster_restorable=ls->raster_tracking&&ls->raster_targets_known&&ls->raster_viewports_known&&ls->raster_scissors_known;
     result.target_serial=ls->target_serial;result.viewport_serial=ls->viewport_serial;result.scissor_serial=ls->scissor_serial;
     result.root_serial=ls->root_serial[compute];result.restore_serial=ls->host_restore_serial;

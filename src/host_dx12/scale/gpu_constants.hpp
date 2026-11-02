@@ -17,6 +17,7 @@ public:
     // Source state is explicit, and restored before this returns.
     bool RecordBefore(ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES source_state) const;
     bool CanRecord(ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES source_state) const;
+    bool CanRecord(uint32_t observed_list_type,D3D12_RESOURCE_STATES source_state)const;
     // After the affected draw/dispatch and after rebinding the game's CB, return
     // the owned buffer to COMMON. Balanced calls support legal replay after
     // completion of the prior execution. Concurrent queues need private copies or ordering;

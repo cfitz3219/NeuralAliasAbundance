@@ -57,8 +57,10 @@ std::shared_ptr<const GpuConstants> GpuConstants::Create(ID3D12Device* device, I
 }
 bool GpuConstants::CanRecord(ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES source_state) const
 {
-    if (!list || (list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT && list->GetType() != D3D12_COMMAND_LIST_TYPE_COMPUTE))
-        return false;
+    return list&&CanRecord(static_cast<uint32_t>(list->GetType()),source_state);
+}
+bool GpuConstants::CanRecord(uint32_t type,D3D12_RESOURCE_STATES source_state)const{
+    if(type!=D3D12_COMMAND_LIST_TYPE_DIRECT&&type!=D3D12_COMMAND_LIST_TYPE_COMPUTE)return false;
     return !fixed_source_state_ || (source_state & D3D12_RESOURCE_STATE_COPY_SOURCE) != 0;
 }
 bool GpuConstants::RecordBefore(ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES source_state) const

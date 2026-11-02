@@ -159,6 +159,7 @@ bool ListStateRestorable(ID3D12CommandList* list); // RestoreListState would suc
 // descriptor heaps. Rebind ALL resource tables when changing their heap, and
 // preserve the sampler heap/tables. No descriptor memory is copied here.
 struct ShaderState {
+    uint32_t list_type=NA_UNKNOWN_U32;
     ID3D12RootSignature* root = nullptr;
     ID3D12DescriptorHeap* resources = nullptr;
     ID3D12DescriptorHeap* samplers = nullptr;

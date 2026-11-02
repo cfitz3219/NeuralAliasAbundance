@@ -308,7 +308,7 @@ RWTexture2D<float4> target:register(u0);Texture2D<float> image:register(t0);Samp
     const auto gpu=heap->GetGPUDescriptorHandleForHeapStart();for(UINT i=0;i<3;++i)list->SetComputeRootDescriptorTable(i,{gpu.ptr+uint64_t(i)*inc});
     list->SetComputeRootDescriptorTable(3,samplers->GetGPUDescriptorHandleForHeapStart());list->SetComputeRootConstantBufferView(4,cb->GetGPUVirtualAddress());
     na::observe::ShaderState shadow;REQUIRE(na::observe::ListShaderState(list,true,shadow));CHECK(shadow.count==4&&shadow.resources==heap.Get()&&shadow.samplers==samplers.Get());
-    CheckKey(list,true);
+    CHECK(shadow.list_type==D3D12_COMMAND_LIST_TYPE_DIRECT);CheckKey(list,true);
     na::observe::NativeOperation operation;
     REQUIRE(na::observe::ListNativeOperation(list,true,operation));
     CHECK(operation.list==na::observe::IdOf(list)&&operation.recording==na::observe::ListRecording(list));
