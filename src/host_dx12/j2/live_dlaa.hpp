@@ -169,6 +169,9 @@ struct Stats {
     uint64_t unjit_not_applied = 0;  // started, but no camera block was rewritten
     uint64_t unjit_not_held = 0;     // rewritten, but the camera the scene list used did not hold it
     uint64_t camera_inverse_computed = 0; // a ViewProjection without its inverse, continuing the main camera, accepted
+    // SE5 flashing: frames whose camera could not be read ran DLAA on a camera predicted
+    // from the last two (extrapolated) or the last one (held), instead of showing the raw frame.
+    uint64_t camera_held = 0, camera_extrapolated = 0;
     char camera_lost_evidence[480] = {};  // the last lost frame: every block searched and what it held
     int64_t camera_inv_delta = 0; // bytes from the ViewProjection to its inverse in the camera block
     int64_t camera_proj_delta = 0; // bytes to the camera's separate projection matrix (0 = none found)

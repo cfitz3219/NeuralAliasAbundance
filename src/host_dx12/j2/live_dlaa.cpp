@@ -97,6 +97,14 @@ struct State {
     na::motion::gpu::Arbiter arbiter;
     bool arbiter_ok = false;
     na::camera::CameraTracker tracker;
+    // SE5 flashing (Cort 2026-11-02): ~10 % of frames had no readable camera, so they kept
+    // the game's raw (aliased, mip-biased, unsharpened) colour between DLAA'd neighbours:
+    // a flash on detailed texture. The last two unjittered cameras let such a frame run
+    // DLAA on a predicted camera instead (at most kMaxHeldFrames in a row).
+    na::camera::Matrix cam_u0{}, cam_u1{}; // unjittered VPs of the last two read frames (u1 newest)
+    uint64_t cam_f0 = 0, cam_f1 = 0;       // their frames (0 = none)
+    bool cam_rev = false;
+    uint32_t cam_held_run = 0;             // consecutive frames on a predicted camera
     uint64_t frame = 1;             // game Present interval, not Execute attempt
     uint64_t submitted_frame = 0;   // last interval that actually submitted DLAA
     // Games may draw the scene across several submissions per frame (Sniper Elite
@@ -1291,8 +1299,24 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // update comes after the size check, because a resize resets the tracker.
     na::camera::Matrix vp{};
     bool reversed = false;
+    bool held = false;
     if (saved) { vp = saved->vp; reversed = saved->reversed; }
-    if (!saved && !find_camera(lists, scene, depth_id, &vp, &reversed)) {
+    const bool found = saved || find_camera(lists, scene, depth_id, &vp, &reversed);
+    if (!found) {
+        // A camera read within the last frame or two: predict this frame's (unjittered,
+        // so no jitter is claimed for it) rather than leave the game's raw picture showing.
+        constexpr uint32_t kMaxHeldFrames = 2;
+        const bool fresh = g.cam_f1 && g.frame > g.cam_f1 && g.frame - g.cam_f1 <= kMaxHeldFrames && g.cam_held_run < kMaxHeldFrames;
+        if (fresh && !g.resume_reset) {
+            const bool velocity = g.cam_f0 && g.cam_f1 == g.cam_f0 + 1 && g.frame == g.cam_f1 + 1;
+            vp = velocity ? na::camera::ExtrapolateViewProjection(g.cam_u0, g.cam_u1) : g.cam_u1;
+            reversed = g.cam_rev;
+            held = true;
+            ++g.stats.camera_held;
+            if (velocity) ++g.stats.camera_extrapolated;
+        }
+    }
+    if (!found && !held) {
         ++g.stats.no_camera;
         g.camera_offset = g.camera_param = -1; // relearn
         char why[160];
@@ -1301,7 +1325,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         reason(why);
         return false;
     }
-    remember_main_camera(vp); // J1: the main camera, for earlier batches next frame
+    if (!held) remember_main_camera(vp); // J1: the main camera, for earlier batches next frame
     // Ring slot (never wait) and size/format changes (only once the GPU is done with the old set).
     const UINT64 done = g.fence->GetCompletedValue();
     Slot& s = g.slots[g.slot];
@@ -1342,8 +1366,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         g.resume_reset = true; // remains pending if this recording is not submitted
     }
     const double zero[2] = {0, 0};
-    const double* injected = saved ? saved->jitter : g_injected ? g.jit.px : zero; // sample belongs to the captured camera
-    if (!saved && !g_injected && g.jitter_on) { // a DLAA frame without J1's jitter: why
+    const double* injected = held ? zero : saved ? saved->jitter : g_injected ? g.jit.px : zero; // sample belongs to the captured camera
+    if (!saved && !held && !g_injected && g.jitter_on) { // a DLAA frame without J1's jitter: why
         if (!g.jit.valid) ++g.stats.unjit_no_sample;
         else if (!g.jit.applied) ++g.stats.unjit_not_applied;
         else ++g.stats.unjit_not_held;
@@ -1358,6 +1382,12 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (tracker_restart) pending.tracker.Reset();
     const na::camera::CameraFrame cam = pending.tracker.Update(vp, g.frame, rw, rh, injected); // active extent
     if (!cam.valid) { ++g.stats.no_camera; reason("The camera matrix could not be inverted."); return false; }
+    if (held) ++g.cam_held_run;
+    else { // the newest read camera (one per frame: a later attempt in the same frame replaces it)
+        if (g.cam_f1 != g.frame) { g.cam_u0 = g.cam_u1; g.cam_f0 = g.cam_f1; }
+        g.cam_u1 = cam.unjittered; g.cam_f1 = g.frame; g.cam_rev = reversed;
+        g.cam_held_run = 0;
+    }
     pending.cut = cam.camera_cut;
     // P4-0b: moving-object motion (between-lists route only). The pre list is
     // submitted right before this list; the flow pairs with the frame the camera
@@ -2446,6 +2476,7 @@ void Shutdown()
     g_nis.Reset();
     g.arbiter_ok = false;
     g.tracker.Reset();
+    g.cam_f0 = g.cam_f1 = 0; g.cam_held_run = 0;
     g.frame = 1;
     g.submitted_frame = 0;
     g.scene_batches_cur = g.scene_batches_target = 0;

@@ -89,6 +89,32 @@ inline Matrix ComposeReprojectionRow(const Matrix& inv_view_proj_current_row, co
     return m;
 }
 
+// A frame whose camera block could not be read (SE5: the scene list's camera slot held
+// no ViewProjection on ~10 % of frames): predict this frame's unjittered VP from the two
+// before it at constant camera velocity, column-vector algebra. With VP = P * V,
+// cur * inv(prev) * cur = P * (V1 * inv(V0)) * V1: the last view step applied once more.
+// Falls back to `cur` (hold) when `prev` does not invert or the prediction is not a
+// perspective ViewProjection.
+inline Matrix ExtrapolateViewProjection(const Matrix& prev, const Matrix& cur) {
+    Matrix inv{};
+    if (!Invert(prev, inv)) return cur;
+    Matrix step{}, out{};
+    for (size_t r = 0; r < 4; ++r)
+        for (size_t c = 0; c < 4; ++c) {
+            double v = 0;
+            for (size_t k = 0; k < 4; ++k) v += cur[r * 4 + k] * inv[k * 4 + c];
+            step[r * 4 + c] = v;
+        }
+    for (size_t r = 0; r < 4; ++r)
+        for (size_t c = 0; c < 4; ++c) {
+            double v = 0;
+            for (size_t k = 0; k < 4; ++k) v += step[r * 4 + k] * cur[k * 4 + c];
+            out[r * 4 + c] = v;
+        }
+    Candidate check{};
+    return ViewProjection(out, check) ? out : cur;
+}
+
 // Exact inverse of core/temporal_jitter.hpp for a KNOWN pixel offset.
 // Unknown native jitter still needs a baseline; decomposition alone cannot
 // distinguish jitter from a deliberately off-centre projection.

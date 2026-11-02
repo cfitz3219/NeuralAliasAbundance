@@ -206,5 +206,26 @@ int main()
              CHECK(!t.Update(world, 2, W, H).valid);
              CHECK(!t.Update(Mul(Perspective(true, 1.0), View(0, 0, 0, 0)), 3, 0, H).valid);
          }},
+        {"a missing camera frame is predicted at constant velocity", [] {
+             for (const bool reverse : {true, false})
+                 for (const double sign : {1.0, -1.0}) {
+                     const Matrix p = Perspective(reverse, sign);
+                     // Turning and walking at a constant rate: frame 3 follows from 1 and 2.
+                     const Matrix a = Mul(p, View(0.10, 1.0, 2, -3.0));
+                     const Matrix b = Mul(p, View(0.13, 1.5, 2, -3.4));
+                     const Matrix expect = Mul(p, Mul(Mul(View(0.13, 1.5, 2, -3.4), [&] {
+                         Matrix i{}; CHECK(Invert(View(0.10, 1.0, 2, -3.0), i)); return i; }()), View(0.13, 1.5, 2, -3.4)));
+                     CHECK(Close(ExtrapolateViewProjection(a, b), expect, 1e-9));
+                     // Pure yaw about a fixed point is exactly the next yaw.
+                     CHECK(Close(ExtrapolateViewProjection(Mul(p, View(0.2, 0, 0, 0)), Mul(p, View(0.25, 0, 0, 0))),
+                                 Mul(p, View(0.30, 0, 0, 0)), 1e-9));
+                     // A still camera stays exactly still.
+                     CHECK(Close(ExtrapolateViewProjection(b, b), b, 1e-12));
+                 }
+             // Unusable history: hold the last camera.
+             const Matrix b = Mul(Perspective(true, 1), View(0.13, 1.5, 2, -3.4));
+             Matrix zero{};
+             CHECK(Close(ExtrapolateViewProjection(zero, b), b, 0));
+         }},
     });
 }

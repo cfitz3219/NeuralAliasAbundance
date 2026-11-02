@@ -742,11 +742,12 @@ void write_status_line()
             // Per present: why a frame had no DLAA / why a DLAA frame had no jitter (SE5 flicker, 2026-11-02).
             char ml[320];
             const int mn = snprintf(ml, sizeof(ml),
-                "j2_misses no_dlaa{no_camera=%llu no_state=%llu no_candidate=%llu other=%llu} unjittered{no_sample=%llu not_applied=%llu not_held=%llu}\r\n",
+                "j2_misses no_dlaa{no_camera=%llu no_state=%llu no_candidate=%llu other=%llu} unjittered{no_sample=%llu not_applied=%llu not_held=%llu} camera_held=%llu extrapolated=%llu\r\n",
                 static_cast<unsigned long long>(j2.miss_no_camera), static_cast<unsigned long long>(j2.miss_no_state),
                 static_cast<unsigned long long>(j2.miss_no_candidate), static_cast<unsigned long long>(j2.miss_other),
                 static_cast<unsigned long long>(j2.unjit_no_sample), static_cast<unsigned long long>(j2.unjit_not_applied),
-                static_cast<unsigned long long>(j2.unjit_not_held));
+                static_cast<unsigned long long>(j2.unjit_not_held), static_cast<unsigned long long>(j2.camera_held),
+                static_cast<unsigned long long>(j2.camera_extrapolated));
             if (mn > 0) WriteFile(f, ml, static_cast<DWORD>((std::min)(mn, static_cast<int>(sizeof(ml) - 1))), &written, nullptr);
             if (j2.camera_lost_evidence[0]) {
                 WriteFile(f, "j2_camera_lost ", 15, &written, nullptr);
@@ -2257,14 +2258,15 @@ void process_frame(ID3D12CommandQueue* queue, ID3D12Resource* frame)
     if (na::capture::Pending()) {
         // What J2 did on this present (SE5 flashing, 2026-11-02): DLAA frames since the last
         // present, its jitter, and the misses, so a flashing present can be matched to a cause.
-        static uint64_t pf = 0, pnc = 0, pns = 0, pcut = 0, pmc = 0;
+        static uint64_t pf = 0, pnc = 0, pns = 0, pcut = 0, pmc = 0, pheld = 0;
         const auto js = na::j2::GetStats();
         char note[240];
-        snprintf(note, sizeof note, "j2_frames=%llu jitter=%.3f,%.3f no_camera=%llu no_state=%llu cuts=%llu miss_no_candidate=%llu active=%u",
+        snprintf(note, sizeof note, "j2_frames=%llu jitter=%.3f,%.3f no_camera=%llu no_state=%llu cuts=%llu miss_no_candidate=%llu camera_held=%llu active=%u",
                  static_cast<unsigned long long>(js.frames - pf), js.inline_jitter_x, js.inline_jitter_y,
                  static_cast<unsigned long long>(js.no_camera - pnc), static_cast<unsigned long long>(js.no_state - pns),
-                 static_cast<unsigned long long>(js.cuts - pcut), static_cast<unsigned long long>(js.miss_no_candidate - pmc), js.active ? 1u : 0u);
-        pf = js.frames; pnc = js.no_camera; pns = js.no_state; pcut = js.cuts; pmc = js.miss_no_candidate;
+                 static_cast<unsigned long long>(js.cuts - pcut), static_cast<unsigned long long>(js.miss_no_candidate - pmc),
+                 static_cast<unsigned long long>(js.camera_held - pheld), js.active ? 1u : 0u);
+        pf = js.frames; pnc = js.no_camera; pns = js.no_state; pcut = js.cuts; pmc = js.miss_no_candidate; pheld = js.camera_held;
         na::capture::NotePresent(note);
         na::capture::OnPresent(queue, frame); // phase-1 capture
     }
