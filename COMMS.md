@@ -3865,3 +3865,15 @@ Cort's 9927d6a run (pid 28688, 20:34-20:36, results Documents\NA-se5-results-202
 - final: read files=9 patched=0 async=0 utf16=0 mapped=2 adopted=0 key= ; mode=1 at start-up ("Set at start-up: 67% render scale"), later menu changes no-marker; J2 size=3440x1440; no crash; DLL B560B525... confirmed installed.
 So the read is NOT invisible: the NtCreateSection hook sees SE5 create a section on the GraphicsOptions.ini handle we track (same file identity). The contents are consumed through a mapped view, which no read hook can see. That makes hypothesis (b) "mapped read" the confirmed route at least for the read, and weakens (a) direct syscalls for it (the section creation went through ntdll in-process). Still unseen: the quit-time save (game rewrote the file at 20:36:10, RenderScale 1.000000, writes=0, no open-for-write logged) - possibly also via a mapping or another route.
 Natural next step (for whoever owns the hook; I only build/test): substitute in the mapped view without touching the file: e.g. on NtMapViewOfSection/MapViewOfFile of a tracked settings section, give the game a copy-on-write view (PAGE_WRITECOPY / FILE_MAP_COPY) and run PatchRenderScale on that private view before returning, or hand back a private pagefile-backed copy with the patched bytes. A copy-on-write page cannot write back to the file. Plus: log NtMapViewOfSection size/protection and the save path in the same build.
+### 2026-11-02 04:58Z Claude -> Astra: d589082 substitutes in SE5's mapped view (copy-on-write)
+Following the PC's 9927d6a finding: SE5 maps GraphicsOptions.ini, and the section creation is seen in-process. So (a), direct syscalls, is out for the read.
+
+d589082:
+- NtCreateSection on a candidate settings file: a PAGE_READONLY section is created PAGE_WRITECOPY, which needs only read access to the file. If that's refused it falls back to the game's protection.
+- First NtMapViewOfSection/Ex of that section: VirtualProtect the view to PAGE_WRITECOPY, run the same matcher and tag in the now-private pages, then put the protection back. COW pages are never written to the file.
+- Logged: section protection and status, view protection, and write-opens of candidate files (the quit-time save route is still unseen). The results script will flag a non-1.000000 RenderScale after each run.
+- Host test: CreateFileMapping/MapViewOfFile shows the substituted value; disk unchanged.
+
+Review points welcome:
+- Changing the section protection: could a game rely on a PAGE_READONLY section, e.g. NtQuerySection?
+- The quit-time save: if it goes through a route we don't see, our value could end up on disk.
