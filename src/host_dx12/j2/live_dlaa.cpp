@@ -3,6 +3,7 @@
 #include "host_dx12/j2/nis_sharpen.hpp"
 #include "host_dx12/j2/route_selector.hpp"
 #include "host_dx12/j2/consumer_profile.hpp"
+#include "host_dx12/j2/scene_list_roles.hpp"
 #include "host_dx12/j2/jitter_writes.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
 #include "host_dx12/j2/compute_flow.hpp"
@@ -145,6 +146,7 @@ struct State {
     // colour's consumers, learned from SUBMITTED frames; the inline trigger fires at an
     // accepted class, else the boundary matcher decides as before.
     na::j2::ConsumerProfile profile;
+    SceneListRoles segment_roles;
     SceneInput waiting_scene;
     JitterWrites jitter_writes;
     std::vector<na::j2::ColorEvent> frame_seq; // this frame's writes/consumers of the colour, submission order
@@ -1895,6 +1897,10 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
         // restore does not cover: graphics consumers with MSAA depth stay on the boundary matcher.
         const bool raster_safe = live.op != na::j2::Op::GraphicsRead || g.depth_samples <= 1;
         if (live.barrier && live.after_write) {
+            if (!later && g.segment_roles.Defer(color_id, depth_id, na::observe::IdOf(l), live.producer_pso, g.frame)) {
+                ++g.stats.segment_deferrals;
+                return;
+            }
             // Qualified scene-ending pattern: the drawing pipeline of the last write before
             // this barrier, plus (when that pipeline also appears mid-scene) the class of
             // the latest consumer earlier in this recording. Accepted -> fire here (boundary
@@ -2296,6 +2302,8 @@ void OnPresent(ID3D12CommandQueue* queue)
             g.class_fired = false;
             g.fired_mode = 0;
             g.fired_barrier_event = false;
+            if (g.segment_roles.Close(g.frame_seq, g.frame_seq_complete, g.submitted_frame == g.frame, g.frame))
+                ++g.stats.segment_miss_recoveries;
             g.frame_seq.clear();
             g.frame_seq_complete = true;
             na::observe::ResetDerived();
@@ -2360,6 +2368,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     }
     uint64_t selected_depth = 0, selected_color = 0;
     na::observe::GetLiveSelection(&selected_depth, &selected_color);
+    g.segment_roles.Select(selected_color, selected_depth);
     if (selected_color && selected_color != g.scene_color_id) {
         // A different scene image: its size is the class reference; the old profile does not apply.
         g.scene_color_id = selected_color;
@@ -2377,6 +2386,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         if (!lists[i]) continue;
         const auto id = na::observe::IdOf(lists[i]);
         const auto decision = na::observe::ListInsertionDecision(lists[i], selected_color);
+        const size_t trace_begin = g.frame_seq.size();
         if ((decision.writes || decision.all_reads) && g.frame_seq_complete) {
             // Placement profile: this list's writes and consumers, in submission order.
             // 512 events silently dropped later lists in the Sniper frames and
@@ -2426,6 +2436,9 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         // assigned to this particular object. A later write-only list invalidates
         // an earlier consumer; a later consumer after that write replaces it.
         if (decision.writes) {
+            if (g.inline_mode && g.queue.Get() != queue) g.segment_roles.OtherQueueWroteScene();
+            if (g.inline_mode && g.queue.Get() == queue && g.frame_seq_complete)
+                g.segment_roles.Submitted(id, trace_begin, g.frame_seq.size(), decision.final_candidate != 0);
             if (g.insertion_frame.decision.final_candidate != decision.final_candidate)
                 ++g.stats.insertion_changes;
             // Learned in SUBMISSION order from recordings actually submitted (Astra #4);
@@ -2715,6 +2728,7 @@ void Shutdown()
     g.class_fired = false;
     g.route_prev_late_class = 0;
     g.insertion_frame = g.insertion_learned = {};
+    g.segment_roles = {};
     g.inl_n = 0;
     g.inl_frame = 0;
     if (g.pred) g.pred->Unmap(0, nullptr);

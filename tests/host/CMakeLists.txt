@@ -164,6 +164,8 @@ if(NA_HAVE_NGX_SDK)
   # SE5 pan flicker: an extra scene segment makes the learned boundary match too early;
   # only the predicated candidate after the final scene write may run (GPU-checked).
   add_test(NAME host_j2_inline_segments_test COMMAND j2_anno_shape_test 1 1 --inline-segments)
+  add_test(NAME host_j2_inline_pan_test COMMAND j2_anno_shape_test 1 1 --inline-pan)
+  set_tests_properties(host_j2_inline_pan_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS host)
   set_tests_properties(host_j2_inline_segments_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS host)
   add_test(NAME host_j2_inline_record_first_test COMMAND j2_anno_shape_test 1 1 --inline-record-first)
   set_tests_properties(host_j2_inline_record_first_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS host)

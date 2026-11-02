@@ -14,6 +14,7 @@
 //   - overrides; route changes bump the history generation exactly once
 // Self-contained (no D3D12): also compiles with a host compiler for quick checks.
 #include "host_dx12/j2/route_selector.hpp"
+#include "host_dx12/j2/scene_list_roles.hpp"
 
 #include <cstdio>
 #include <vector>
@@ -221,6 +222,30 @@ int main()
         CHECK(rs.Current().route == Route::Between);
         rs.OnFrame(frame({scene_list()}));
         CHECK(rs.Current().route == Route::None && rs.Current().missing[0] != 0);
+    }
+    // A pooled list can change jobs. A missed fallback must restore normal matching
+    // even when the replacement list provided no usable observations that frame.
+    {
+        SceneListRoles roles;
+        roles.Select(10, 20);
+        ColorEvent write, barrier;
+        write.write = true;
+        barrier.op = Op::Barrier;
+        barrier.producer = 37;
+        const std::vector<ColorEvent> events{write, barrier, write, barrier};
+        for (unsigned frame = 1; frame <= 4; ++frame) {
+            roles.Submitted(100, 0, 2, true);
+            roles.Submitted(200, 2, 4, true);
+            if (frame <= 2) roles.OtherQueueWroteScene();
+            roles.Close(events, true, true, frame);
+            if (frame == 3) CHECK(!roles.Defer(10,20,100,37,4));
+        }
+        CHECK(roles.Defer(10,20,100,37,5));
+        CHECK(!roles.Defer(10,20,200,37,5));
+        CHECK(roles.Close({}, false, false, 5));
+        CHECK(!roles.Defer(10,20,100,37,6));
+        roles.Select(30,20);
+        CHECK(!roles.Defer(30,20,100,37,7));
     }
     if (g_failures) { std::printf("j2_route_test: FAILED (%d failures)\n", g_failures); return 1; }
     std::printf("j2_route_test: OK\n");

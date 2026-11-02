@@ -223,6 +223,8 @@ struct Stats {
     // Exact inline placement: predicated candidates per scene recording, one switched on at submission.
     uint64_t inline_later_candidates = 0; // extra candidates recorded after more scene content
     uint64_t inline_exact = 0;            // submissions whose chosen candidate follows the final colour write
+    uint64_t segment_deferrals = 0;       // recurring barrier in an earlier scene recording
+    uint64_t segment_miss_recoveries = 0; // missed frames that restored normal matching for a deferred pattern
     uint64_t inline_moved_later = 0;      // ... where the first (trigger) candidate was too early
     uint64_t inline_candidates_full = 0;  // a further possible end found with all candidates in use
     uint32_t inline_last_count = 0;       // candidates in the last submitted scene recording

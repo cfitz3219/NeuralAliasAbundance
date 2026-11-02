@@ -150,7 +150,8 @@ int main(int argc, char** argv)
     // before the end, as Sniper Elite 5 does while panning. The learned boundary then matches
     // too early; exact placement must run only the candidate after the final scene write.
     const bool inline_segments = argc > 3 && std::strcmp(argv[3], "--inline-segments") == 0;
-    const bool inline_list = inline_flow || auto_inline || inline_record_first || inline_copy || inline_segments ||
+    const bool inline_pan = argc > 3 && std::strcmp(argv[3], "--inline-pan") == 0;
+    const bool inline_list = inline_pan || inline_flow || auto_inline || inline_record_first || inline_copy || inline_segments ||
                              (argc > 3 && std::strcmp(argv[3], "--inline") == 0);
     // auto-between needs an OBSERVABLE consumer (a copy of the colour): a barrier-only
     // hand-back is not evidence of a list boundary (Astra R3).
@@ -514,7 +515,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         fake::gpu_log_entries = kLog;
     }
     const auto ran = [&](int k) { return log_cpu && k < kLog && log_cpu[k] == 0xC0DE000000000000ull + k; };
-    int ran_wrong = 0, frames_with_extra = 0, extra_runs_checked = 0;
+    int ran_wrong = 0, frames_with_extra = 0, extra_runs_checked = 0, pan_frame = 0, pan_checked = 0;
     const auto frame = [&](double cam_x, bool unpatched_prepass = false) {
         // Copy case: every 4th frame the LAST scene write comes from a different pipeline
         // (another object drawn last). The boundary matcher keys on the final writer, so it
@@ -524,7 +525,11 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         d.WaitIdle();
         const int frame_evals = fake::evals;
         int final_eval = -1;
-        if (inline_list) {
+        ++pan_frame;
+        // At frame 25 the old intermediate list takes over the final job.
+        if (inline_pan && pan_frame == 25) std::swap(scene, scene2);
+        const bool measure = !inline_pan || pan_frame > 5;
+        if (inline_list && !inline_pan) {
             // Pooled list objects alternate between an early write-only job and
             // the final scene/post job. Learning by object identity fails here.
             std::swap(scene, scene2);
@@ -559,6 +564,31 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                 d.WaitIdle(); // test-only: finish the unrecognized camera batch
                 Store(cpu + kPre + kVp, vp);
             }
+        }
+        if (inline_pan && pan_frame <= 24 && pan_frame % 4 != 0) {
+            scene2.Reset();
+            scene2.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+            const float early[4]{};
+            scene2.list->ClearRenderTargetView(rtv, early, 0, nullptr);
+            D3D12_RESOURCE_BARRIER dw[] = {test::Transition(depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_DEPTH_READ),
+                                           test::Transition(depth.Get(), D3D12_RESOURCE_STATE_DEPTH_READ, D3D12_RESOURCE_STATE_DEPTH_WRITE)};
+            scene2.list->ResourceBarrier(1, &dw[0]);
+            scene2.list->ResourceBarrier(1, &dw[1]);
+            ID3D12DescriptorHeap* ch0[] = {cbvh.Get()}; // a scene list: it draws with the camera bound
+            scene2.list->SetDescriptorHeaps(1, ch0);
+            scene2.list->SetGraphicsRootSignature(rs.Get());
+            scene2.list->SetGraphicsRootDescriptorTable(0, cbvh->GetGPUDescriptorHandleForHeapStart());
+            D3D12_RESOURCE_BARRIER to_read = test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            scene2.list->ResourceBarrier(1, &to_read);
+            ID3D12DescriptorHeap* ph0[] = {post_heap.Get()};
+            scene2.list->SetDescriptorHeaps(1, ph0);
+            scene2.list->SetGraphicsRootSignature(post_root.Get());
+            scene2.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart());
+            std::swap(to_read.Transition.StateBefore, to_read.Transition.StateAfter);
+            scene2.list->ResourceBarrier(1, &to_read);
+            REQUIRE(SUCCEEDED(scene2.list->Close()));
+            ID3D12CommandList* first[]{scene2.list.Get()};
+            Submit(q, 1, first, true);
         }
         scene.Reset(); // no colour/depth transitions in the scene list: carried state
         scene.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
@@ -633,7 +663,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                 scene.list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
                 for (auto& b : cbars) std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
                 scene.list->ResourceBarrier(2, cbars);
-            } else scene.list->DrawInstanced(3, 1, 0, 0); // final actual read
+            } else if (!inline_pan) scene.list->DrawInstanced(3, 1, 0, 0); // final actual read
             if (fake::evals < evals_before_read + (na::j2::GetStats().inline_mode ? 1 : 0)) {
                 const auto ds = na::j2::GetStats();
                 std::printf("MISS evals=%d before=%d accepted=%u rejected_skips=%llu cands=%llu waited=%llu refused=%llu rec=%llu no_camera=%llu no_state=%llu busy=%llu pending=%llu reason=\"%s\"\n",
@@ -642,8 +672,8 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                             (unsigned long long)ds.inline_recorded, (unsigned long long)ds.no_camera, (unsigned long long)ds.no_state,
                             (unsigned long long)ds.busy, (unsigned long long)ds.inline_rejects[8], ds.reason);
             }
-            REQUIRE(fake::evals >= evals_before_read + (na::j2::GetStats().inline_mode ? 1 : 0)); // a candidate exists before the final consumer ran
-            REQUIRE(fake::evals > evals_before_final || !na::j2::GetStats().inline_mode); // ...and one follows the final scene write
+            if (measure) REQUIRE(fake::evals >= evals_before_read + (na::j2::GetStats().inline_mode ? 1 : 0)); // a candidate exists before the final consumer ran
+            if (measure) REQUIRE(fake::evals > evals_before_final || !na::j2::GetStats().inline_mode); // ...and one follows the final scene write
             final_eval = evals_before_final;
             std::swap(rd2.Transition.StateBefore, rd2.Transition.StateAfter);
             scene.list->ResourceBarrier(1, &rd2);
@@ -680,7 +710,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             }
             ID3D12CommandList* one[] = {scene.list.Get()};
             Submit(q, 1, one, true);
-            if (log_cpu && fake::evals > frame_evals) {
+            if (log_cpu && measure && (fake::evals > frame_evals || inline_pan)) {
                 // Exactly the candidate recorded after the final scene write ran; every earlier
                 // (too early) candidate stayed switched off on the GPU.
                 d.WaitIdle();
@@ -692,10 +722,11 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                 }
                 if (runs != 1 || !ran(final_eval))
                     std::printf("EXACT frame evals [%d,%d) final=%d runs=%d\n", frame_evals, fake::evals, final_eval, runs);
-                REQUIRE(runs == 1 && ran(final_eval));
+                REQUIRE(final_eval >= 0 && final_eval < fake::evals && runs == 1 && ran(final_eval));
+                if (inline_pan) ++pan_checked;
                 if (fake::evals - frame_evals > 1) ++extra_runs_checked;
             }
-            if (fake::evals > frame_evals) {
+            if (measure && fake::evals > frame_evals) {
                 const double jx = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_X);
                 const double jy = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_Y);
                 uint8_t original[64]; Store(original, vp);
@@ -787,7 +818,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
     if (inline_list) {
         // The copy case runs long enough for the consumer anchor's stability gate (16
         // identical signatures) to hand over from the boundary matcher.
-        const int frames = inline_copy ? 22 : inline_segments ? 12 : 4;
+        const int frames = inline_pan ? 27 : inline_copy ? 22 : inline_segments ? 12 : 4;
         for (int f = 0; f < frames; ++f) REQUIRE(frame(0.25 * (f % 4)) == 0);
         if(inline_flow){const auto flow=na::j2::compute_flow::GetStats();
             printf("inline AMD: recorded=%llu submitted=%llu pairs=%llu %s\n",(unsigned long long)flow.recorded,(unsigned long long)flow.submitted,(unsigned long long)flow.pairs,flow.reason);
@@ -818,6 +849,14 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                     ran_wrong, extra_runs_checked, frames_with_extra);
         CHECK(ran_wrong == 0);
         if (!real_ngx) CHECK(is.inline_exact == is.inline_frames); // every DLAA that ran followed the final scene write
+        if (inline_pan) {
+            CHECK(pan_checked == frames - 5);
+            CHECK(is.segment_deferrals > 0);
+            std::printf("pan across submissions: %d GPU-verified final frames, %llu earlier barriers deferred, %llu miss recoveries\n",
+                        pan_checked, (unsigned long long)is.segment_deferrals, (unsigned long long)is.segment_miss_recoveries);
+            CHECK(dev->GetDeviceRemovedReason() == S_OK);
+            return test::finish("j2_anno_shape_test (pan across submissions)");
+        }
         CHECK(is.inline_late_writes == 0);
         if (inline_segments) {
             CHECK(frames_with_extra >= 3);
