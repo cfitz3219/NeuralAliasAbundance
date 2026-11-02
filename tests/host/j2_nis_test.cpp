@@ -1,4 +1,4 @@
-// J2 Sharpness 101..200 %: NVIDIA Image Scaling sharpen-only stacked on RCAS, on a
+// Standalone legacy NIS helper (no longer stacked on live RCAS), on a
 // real D3D12 device (WARP on CI). Over the whole slider range:
 //   - every percent 0..200 gives finite values (no NaN/Inf, nothing negative);
 //   - <= 100 % records no NIS pass (RCAS alone, unchanged behaviour);

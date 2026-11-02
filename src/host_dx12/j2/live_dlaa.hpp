@@ -153,7 +153,7 @@ struct Stats {
     uint64_t camera_offset = 0;   // byte offset of the camera matrix inside its constant block
     uint32_t later_passes = 0;
     uint64_t sharpened_frames = 0; // RCAS applied to the DLAA result
-    uint64_t nis_frames = 0;       // NIS added on top (Sharpness above 100 %)
+    uint64_t nis_frames = 0;       // Legacy log field; live sharpening is RCAS-only.
     uint64_t jitter_writes = 0;   // J1: camera matrices replaced by jittered copies
     uint64_t camera_learned_hits = 0, camera_scans = 0; // camera found at the learned slot / by a full search
     // Several valid cameras in one frame (reflection, sky, light): frames where more than one

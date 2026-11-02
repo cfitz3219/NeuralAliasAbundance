@@ -1,9 +1,9 @@
 #pragma once
-// Extra-strength sharpening for J2 live DLAA: NVIDIA Image Scaling (NIS) in
+// Standalone NVIDIA Image Scaling (NIS) sharpening helper, retained for reference/tests.
+// The live J2 sharpness slider now uses extended RCAS alone. NIS uses
 // sharpen-only mode (NVIDIAGameWorks/NVIDIAImageScaling v1.0.3, MIT licence,
-// vendored in third_party/nis). It runs AFTER RCAS when the Sharpness slider is
-// above 100%: RCAS covers 0..100% at AMD's designed maximum, and NIS fades in
-// on top for 101..200% (edge-directional, with its own HDR-linear mode).
+// vendored in third_party/nis). Its legacy 101..200 input range fades in
+// edge-directional sharpening, with its own HDR-linear mode.
 #include <d3d12.h>
 #include <atomic>
 #include <cstdint>
