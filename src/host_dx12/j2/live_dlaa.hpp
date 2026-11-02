@@ -176,7 +176,8 @@ struct Stats {
     // motion = translation/rotation/fov jump), and the last few as "tick100ms:why=value[/held][/j1]".
     uint64_t cut_restarts = 0, cut_gap = 0, cut_motion = 0;
     char recent_cuts[240] = {};
-    uint64_t camera_from_j1 = 0; // the scene list held no camera; J1's camera of this same frame (with its jitter) was used
+    uint64_t camera_from_j1 = 0;
+    uint64_t jitter_extent_rescaled = 0; // the render extent changed after J1 jittered this frame: sample rescaled // the scene list held no camera; J1's camera of this same frame (with its jitter) was used
     // SE5 menu: frames whose depth state lookup failed and that used the state learned from
     // the same scene end (identical on 30+ known frames in a row).
     uint64_t depth_state_assumed = 0;
