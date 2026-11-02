@@ -70,6 +70,7 @@ int main(int argc,char** argv){
     const bool vector4=argc>1&&std::strcmp(argv[1],"--vector4")==0;
     const bool boundary=argc>1&&std::strcmp(argv[1],"--boundary")==0;
     const bool split=argc>1&&std::strcmp(argv[1],"--split")==0;
+    const bool unsupported=argc>1&&std::strcmp(argv[1],"--unsupported")==0;
     setvbuf(stdout,nullptr,_IONBF,0);test::ComPtr<ID3D12Debug> debug;
     if(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))debug->EnableDebugLayer();
     test::Device d;if(!test::CreateDevice(d))return test::SkipNoDevice("auto_scene_test");auto* dev=d.device.Get();
@@ -90,6 +91,7 @@ int main(int argc,char** argv){
     auto depth_copy=test::CreateTexture(dev,w,h,depth_resource,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_FLAG_NONE);REQUIRE(color_copy&&depth_copy);
     char* mapped=nullptr;REQUIRE(SUCCEEDED(cb->Map(0,nullptr,reinterpret_cast<void**>(&mapped))));std::memset(mapped,0,4096);
     float sizes[4]={w,h,9,0};std::memcpy(mapped,sizes,sizeof sizes);const auto vp=camera();store(mapped+80,vp);store(mapped+144,inverse(vp));
+    if(unsupported){const float wrong_width=w-1.f;std::memcpy(mapped,&wrong_width,4);}
     if(vector4){const float values[8]={w,h,1.f/w,1.f/h,9,0,0,0};std::memcpy(mapped,values,sizeof values);}
     std::string code=vector4
         ? "cbuffer View:register(b0){float4 ScreenSize;float marker;float3 pad;float4 junk[3];float4x4 VP;float4x4 VPInv;};\n#define INVERSE_ERROR (abs(ScreenSize.x*ScreenSize.z-1)+abs(ScreenSize.y*ScreenSize.w-1))\n"
@@ -166,7 +168,17 @@ float4 water(float4 position:SV_Position):SV_Target{uint2 p=uint2(position.xy);f
         std::printf("automatic: %u plans %u members %ux%u, redirected %llu misses %llu: %s | J2: %s\n",status.plans,status.members,status.render_w,status.render_h,(unsigned long long)status.redirected,(unsigned long long)status.misses,status.reason,na::j2::GetStats().reason);
     };
     for(int i=0;i<4;++i)frame(false);
-    auto status=na::scale::GetAutomaticSceneStats();CHECK(status.plans>0&&status.members==4&&status.redirected>0);
+    auto status=na::scale::GetAutomaticSceneStats();
+    if(unsupported){
+        CHECK(status.failed_plans>0&&status.redirected==0);
+        const auto attempts=status.poll_builds,groups=status.group_builds,operations=status.operations;
+        for(int i=0;i<32;++i)na::scale::PollAutomaticScene();
+        CHECK(na::scale::GetAutomaticSceneStats().poll_builds==attempts&&na::scale::GetAutomaticSceneStats().group_builds==groups);
+        na::settings::Get().j2_scale_mode.store(0);frame(false);
+        CHECK(na::scale::GetAutomaticSceneStats().operations==operations);
+        REQUIRE(pixels(d,color.Get(),w-.5f,h)==0);
+    }else{
+    CHECK(status.plans>0&&status.members==4&&status.redirected>0);
     REQUIRE(pixels(d,color.Get(),float(status.render_w)+.5f,float(status.render_h))==0);
     REQUIRE(pixels(d,color_copy.Get(),float(status.render_w),float(status.render_h))==0);
     frame(true);const auto js=na::j2::GetStats();
@@ -180,6 +192,7 @@ float4 water(float4 position:SV_Position):SV_Target{uint2 p=uint2(position.xy);f
     fake::eval_result=NVSDK_NGX_Result_Success;
     na::settings::Get().j2_scale_mode.store(0);frame(false);CHECK(!na::scale::GetAutomaticSceneStats().active);
     REQUIRE(pixels(d,color.Get(),w+.5f,h)==0);
+    }
     cb->Unmap(0,nullptr);na::j2::Shutdown();na::dlss::Shutdown();na::dlss::SetInitOwnOverrideForTests(nullptr);
     na::observe::SetShaderOperationHook(na::observe::ShaderLane::Bindings,{});na::observe::SetTextureOperationHook({});na::j2::SetPhysicalInputProvider({});na_observe_stop();
     if(info)for(UINT64 i=0;i<info->GetNumStoredMessages();++i){SIZE_T size=0;info->GetMessage(i,nullptr,&size);std::vector<unsigned char> bytes(size);

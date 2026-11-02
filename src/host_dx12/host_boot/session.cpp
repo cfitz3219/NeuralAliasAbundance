@@ -77,7 +77,8 @@ void RunSessionWorker(RendererReadyFn activate){
             na::scale::PollAutomaticScene();
             if(save_pending.exchange(false))settings::SaveFromWorker();
         }
-        if(wake)WaitForSingleObject(wake,250);else Sleep(250);
+        const DWORD interval=na::scale::AutomaticSceneWorkPending()?10u:250u;
+        if(wake)WaitForSingleObject(wake,interval);else Sleep(interval);
     }
     std::lock_guard<std::mutex> lock(qualification);
     if(ready.load()){

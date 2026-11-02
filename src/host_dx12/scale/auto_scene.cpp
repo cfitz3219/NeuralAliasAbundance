@@ -15,6 +15,8 @@
 #include <unordered_map>
 #include <cmath>
 #include <tuple>
+#include <deque>
+#include <unordered_set>
 
 namespace na::scale {
 namespace {
@@ -46,7 +48,9 @@ struct Built {
     std::shared_ptr<SceneFrame> prototype;
     std::unordered_map<uint64_t,std::shared_ptr<const PreparedBindings>> bindings;
     std::map<TransferKey,std::shared_ptr<const PreparedTransfer>> transfers;
-    uint64_t model=0;int mode=0;bool optimal=false;
+    std::unordered_map<uint64_t,std::string> failed;
+    std::map<TransferKey,std::string> failed_transfers;
+    uint64_t model=0,group_revision=0;int mode=0;bool optimal=false,optimal_available=false;
 };
 struct Run {
     std::shared_ptr<Built> built;std::shared_ptr<SceneFrame> frame;
@@ -61,8 +65,14 @@ public:
     std::mutex mutex;bool enabled=false;uint64_t epoch=1,color=0,depth=0,model=0,next_generation=1;
     std::map<uint64_t,MemberSeed> members;
     std::map<uint64_t,std::pair<uint64_t,ComPtr<ID3D12Resource>>> copied_from;
-    std::unordered_map<uint64_t,NativeOperation> observed;
+    std::unordered_map<uint64_t,std::shared_ptr<const NativeOperation>> observed;
     std::unordered_map<uint64_t,uint64_t> last_seen;
+    std::deque<uint64_t> pending;
+    std::unordered_set<uint64_t> queued;
+    std::atomic<bool> work_pending{false};
+    uint64_t group_revision=1,worker_revision=0,failed_group_revision=0,last_novel_epoch=0;
+    int worker_mode=-1,failed_group_mode=-1;
+    bool worker_optimal=false,failed_group_optimal=false;
     std::map<TransferKey,TransferSpec> observed_transfers;
     std::shared_ptr<Built> built,prepared;std::shared_ptr<Run> current;
     std::map<uint64_t,uint64_t> list_queues;
@@ -72,12 +82,12 @@ public:
     bool selected(uint64_t c,uint64_t d){return c&&d&&color==c&&depth==d;}
     void select(uint64_t c,uint64_t d){
         if(selected(c,d))return;color=c;depth=d;members.clear();copied_from.clear();observed.clear();last_seen.clear();observed_transfers.clear();built.reset();current.reset();++model;
-        prepared.reset();execution_queue.Reset();list_queues.clear();note("Identifying the scene's rendering operations.");
+        prepared.reset();execution_queue.Reset();list_queues.clear();pending.clear();queued.clear();++group_revision;work_pending.store(true);note("Identifying the scene's rendering operations.");
     }
     bool member(uint64_t id,ID3D12Resource* resource,Role role){
         if(!id||!resource||members.count(id))return false;
         const auto d=resource->GetDesc();if(d.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||d.MipLevels!=1||d.DepthOrArraySize!=1||d.SampleDesc.Count!=1)return false;
-        MemberSeed value;value.id=id;value.resource=resource;value.role=role;members.emplace(id,std::move(value));++model;return true;
+        MemberSeed value;value.id=id;value.resource=resource;value.role=role;members.emplace(id,std::move(value));++model;++group_revision;work_pending.store(true);return true;
     }
     void dependency(uint64_t id){
         std::vector<uint64_t> chain;
@@ -99,7 +109,7 @@ public:
     std::shared_ptr<Run> run_for(ID3D12GraphicsCommandList* list){
         const auto key=std::make_pair(na::observe::IdOf(list),na::observe::ListRecording(list));
         const auto found=bound.find(key);if(found!=bound.end())return found->second.run;
-        if(!built||!na::j2::Enabled()||na::j2::Paused())return {};
+        if(!built||!built->failed.empty()||!built->failed_transfers.empty()||built->bindings.empty()||!na::j2::Enabled()||na::j2::Paused())return {};
         const auto q=list_queues.find(key.first);
         if(!execution_queue||q==list_queues.end()||q->second!=na::observe::IdOf(execution_queue.Get()))return {};
         if(!current||current->epoch!=epoch){
@@ -128,6 +138,7 @@ public:
         if(run&&!run->aborted){checkpoint(list,run);run->aborted=true;}stats.active=false;++stats.misses;note(why);
     }
     std::shared_ptr<const PreparedBindings> Acquire(ID3D12GraphicsCommandList* list,const na::observe::ShaderCall& call)noexcept override{
+        if(na::settings::Get().j2_scale_mode.load()==0)return {};
         uint64_t d=0,c=0;na::observe::GetLiveSelection(&d,&c);if(!c||!d)return {};
         NativeOperation op;const bool have=na::observe::ListNativeOperation(list,call.kind==na::observe::ShaderKind::Dispatch,op);
         std::lock_guard<std::mutex> lock(mutex);if(!enabled)return {};select(c,d);++stats.operations;
@@ -151,10 +162,11 @@ public:
             if(size.Width==native_size.Width&&size.Height==native_size.Height)member(rt.view.resource,rt.resource.Get(),rt.view.resource==c?Role::Color:Role::Intermediate);}
         const uint64_t key=signature(op);
         last_seen[key]=epoch;
-        if(!observed.count(key)&&observed.size()<16384){observed.emplace(key,std::move(op));++model;}
+        if(!observed.count(key)&&observed.size()<16384){observed.emplace(key,std::make_shared<const NativeOperation>(std::move(op)));++model;
+            pending.push_back(key);queued.insert(key);work_pending.store(true);last_novel_epoch=epoch;}
         if(!run||run->aborted)return {};
         const auto learned=observed.find(key);if(learned==observed.end()){abort(list,run,"The bounded scene plan cache is full.");return {};}
-        for(const auto& descriptor:learned->second.descriptors)if(members.count(descriptor.view.resource)&&!run->built->group->Find(descriptor.view.resource)){
+        for(const auto& descriptor:learned->second->descriptors)if(members.count(descriptor.view.resource)&&!run->built->group->Find(descriptor.view.resource)){
             abort(list,run,"Preparing a newly observed scene dependency.");return {};
         }
         const auto plan=run->built->bindings.find(key);
@@ -187,6 +199,7 @@ public:
         if(found!=bound.end())abort(list,found->second.run,"The scene uses an indirect, bundle or render-pass operation; using its current native picture.");
     }
     na::observe::ShaderScope Before(ID3D12GraphicsCommandList* list,const TextureCall& call)noexcept override{
+        if(na::settings::Get().j2_scale_mode.load()==0)return {};
         const auto key=transfer_key(call);na::observe::OperationDescriptor descriptor;
         if(call.target.ptr)na::observe::NativeDescriptor(call.target,descriptor);
         std::lock_guard<std::mutex> lock(mutex);if(!enabled)return {};
@@ -199,7 +212,7 @@ public:
             value.color=descriptor.view.rtv;value.depth=descriptor.view.dsv;
             if(!descriptor.view.explicit_view&&descriptor.resource){value.color.Format=value.depth.Format=descriptor.resource->GetDesc().Format;
                 value.color.ViewDimension=D3D12_RTV_DIMENSION_TEXTURE2D;value.depth.ViewDimension=D3D12_DSV_DIMENSION_TEXTURE2D;}
-            observed_transfers.emplace(key,value);++model;
+            observed_transfers.emplace(key,value);++model;work_pending.store(true);last_novel_epoch=epoch;
         }
         auto run=run_for(list);if(!run||run->aborted)return {};
         if(!run->built->group->Find(key.destination)&&!run->built->group->Find(key.source))return {};
@@ -254,16 +267,39 @@ void ConfigureAutomaticScene(bool enabled){
 void PollAutomaticScene(){
     auto a=automatic();if(!a)return;
     const bool optimal_available=na::dlss::GetCapabilities().optimal_settings;
-    std::map<uint64_t,MemberSeed> members;std::unordered_map<uint64_t,NativeOperation> observed;
-    std::map<TransferKey,TransferSpec> transfers;std::shared_ptr<Built> previous;uint64_t model=0,color=0,depth=0,generation=0;int mode=0;
+    std::map<uint64_t,MemberSeed> members;std::unordered_map<uint64_t,std::shared_ptr<const NativeOperation>> observed;
+    std::vector<std::shared_ptr<const NativeOperation>> retired_requests;
+    std::map<TransferKey,TransferSpec> transfers;std::shared_ptr<Built> previous;uint64_t model=0,color=0,depth=0,generation=0,group_revision=0;int mode=0;
     {std::lock_guard<std::mutex> lock(a->mutex);mode=static_cast<int>(na::settings::Get().j2_scale_mode.load());
         // Material/streaming resources belong to executable recordings, not an
         // immortal discovery cache. Evicted plans remain alive through leases.
-        for(auto it=a->last_seen.begin();it!=a->last_seen.end();)if(a->epoch-it->second>240){a->observed.erase(it->first);it=a->last_seen.erase(it);++a->model;}else++it;
-        if(!a->enabled||!a->color||!a->depth||a->members.size()<2||mode<=0){if(mode<=0)a->prepared.reset();return;}
+        for(auto it=a->last_seen.begin();it!=a->last_seen.end();)if(a->epoch-it->second>240){
+            const auto old=a->observed.find(it->first);if(old!=a->observed.end()){retired_requests.push_back(std::move(old->second));a->observed.erase(old);}it=a->last_seen.erase(it);
+        }else++it;
+        if(!a->enabled||!a->color||!a->depth||a->members.size()<2||mode<=0){if(mode<=0){a->prepared.reset();a->failed_group_revision=0;}a->work_pending.store(false);return;}
         const auto latest=a->prepared?a->prepared:a->built;
-        if(latest&&latest->optimal==optimal_available&&latest->model==a->model&&latest->mode==mode&&latest->bindings.size()==a->observed.size()&&latest->transfers.size()==a->observed_transfers.size())return;
-        members=a->members;observed=a->observed;transfers=a->observed_transfers;previous=latest;model=a->model;color=a->color;depth=a->depth;generation=a->next_generation++;
+        if(a->failed_group_revision==a->group_revision&&a->failed_group_mode==mode&&a->failed_group_optimal==optimal_available){a->work_pending.store(false);return;}
+        const bool current_basis=latest&&latest->mode==mode&&latest->group_revision==a->group_revision&&latest->optimal_available==optimal_available;
+        if(a->worker_revision!=a->group_revision||a->worker_mode!=mode||a->worker_optimal!=optimal_available){
+            a->pending.clear();a->queued.clear();
+            for(const auto& op:a->observed){a->pending.push_back(op.first);a->queued.insert(op.first);}
+            a->worker_revision=a->group_revision;a->worker_mode=mode;a->worker_optimal=optimal_available;
+        }
+        // Only shared request pointers cross the control lock; descriptor
+        // vectors/resources are immutable and prepared outside it.
+        constexpr size_t budget=16;
+        while(!a->pending.empty()&&observed.size()<budget){const auto key=a->pending.front();a->pending.pop_front();a->queued.erase(key);
+            const auto request=a->observed.find(key);if(request==a->observed.end())continue;
+            if(current_basis&&(latest->bindings.count(key)||latest->failed.count(key)))continue;
+            observed.insert(*request);
+        }
+        for(const auto& transfer:a->observed_transfers){
+            if(current_basis&&(latest->transfers.count(transfer.first)||latest->failed_transfers.count(transfer.first)))continue;
+            if(transfers.size()+observed.size()>=budget)break;transfers.insert(transfer);
+        }
+        if(current_basis&&observed.empty()&&transfers.empty()){a->work_pending.store(false);return;}
+        ++a->stats.poll_builds;
+        members=a->members;previous=latest;model=a->model;color=a->color;depth=a->depth;generation=a->next_generation++;group_revision=a->group_revision;
     }
     const na::observe::HostWorkScope host;
     ComPtr<ID3D12Device> device;if(FAILED(members.at(color).resource->GetDevice(IID_PPV_ARGS(&device))))return;
@@ -274,12 +310,12 @@ void PollAutomaticScene(){
     const bool optimal_used=mode>=1&&mode<=4&&na::dlss::IsBoundTo(device.Get())&&na::dlss::QueryOptimal(output.width,output.height,qualities[mode],&optimal)&&optimal.valid;
     if(optimal_used)
         render={optimal.render_w,optimal.render_h};
-    auto next=std::make_shared<Built>();next->mode=mode;next->model=model;next->optimal=optimal_used;std::string error;
+    auto next=std::make_shared<Built>();next->mode=mode;next->model=model;next->group_revision=group_revision;next->optimal=optimal_used;next->optimal_available=optimal_available;std::string error;
     bool same=previous&&previous->mode==mode&&previous->group->Render()==render&&previous->group->Output()==output&&previous->group->Members().size()==members.size();
     if(same)for(const auto& m:members)same&=previous->group->Find(m.first)!=nullptr;
     if(same){next->group=previous->group;next->prototype=previous->prototype;
-        for(const auto& binding:previous->bindings)if(observed.count(binding.first))next->bindings.insert(binding);
-        next->transfers=previous->transfers;}
+        next->bindings=previous->bindings;next->failed=previous->failed;
+        next->transfers=previous->transfers;next->failed_transfers=previous->failed_transfers;}
     else{
         std::vector<MemberRequest> requests;for(const auto& value:members)requests.push_back({value.first,value.second.resource.Get(),value.second.role,render});
         next->group=SceneGroup::Create(device.Get(),generation,output,render,requests,error);
@@ -290,20 +326,27 @@ void PollAutomaticScene(){
             next->prototype=SceneFrame::Create(device.Get(),std::move(frame),error);}
     }
     if(next->prototype){
-        for(const auto& op:observed)if(!next->bindings.count(op.first)){
-            BindingSpec spec;if(!NativeBindingSpec(op.second,next->group,spec,error))continue;
-            auto plan=PreparedBindings::Create(device.Get(),std::move(spec),error);if(plan)next->bindings.emplace(op.first,std::move(plan));
+        for(const auto& op:observed)if(!next->bindings.count(op.first)&&!next->failed.count(op.first)){
+            BindingSpec spec;if(!NativeBindingSpec(*op.second,next->group,spec,error)){next->failed.emplace(op.first,error);continue;}
+            auto plan=PreparedBindings::Create(device.Get(),std::move(spec),error);if(plan)next->bindings.emplace(op.first,std::move(plan));else next->failed.emplace(op.first,error);
         }
-        for(auto transfer:transfers)if(!next->transfers.count(transfer.first)){
-            transfer.second.group=next->group;auto plan=PreparedTransfer::Create(device.Get(),std::move(transfer.second),error);if(plan)next->transfers.emplace(transfer.first,std::move(plan));
+        for(auto transfer:transfers)if(!next->transfers.count(transfer.first)&&!next->failed_transfers.count(transfer.first)){
+            transfer.second.group=next->group;auto plan=PreparedTransfer::Create(device.Get(),std::move(transfer.second),error);if(plan)next->transfers.emplace(transfer.first,std::move(plan));else next->failed_transfers.emplace(transfer.first,error);
         }
     }
     std::lock_guard<std::mutex> lock(a->mutex);
-    if(a->color!=color||a->depth!=depth||mode!=static_cast<int>(na::settings::Get().j2_scale_mode.load())||members.size()!=a->members.size())return;
-    if(!next->prototype||next->bindings.empty()){a->note(error.empty()?"Preparing scene bindings.":error.c_str());return;}
+    if(a->color!=color||a->depth!=depth||mode!=static_cast<int>(na::settings::Get().j2_scale_mode.load())||a->group_revision!=group_revision){a->worker_revision=0;return;}
+    if(!next->prototype){a->failed_group_revision=group_revision;a->failed_group_mode=mode;a->failed_group_optimal=optimal_available;
+        a->stats.failed_plans=1;a->work_pending.store(false);a->note(error.empty()?"Preparing scene bindings.":error.c_str());return;}
     a->prepared=std::move(next);a->stats.generation=a->prepared->group->Generation();a->stats.render_w=render.width;a->stats.render_h=render.height;
-    a->stats.out_w=output.width;a->stats.out_h=output.height;a->stats.members=UINT(members.size());a->stats.plans=UINT(a->prepared->bindings.size());a->note("Reduced scene prepared; applying at the next frame boundary.");
+    a->stats.out_w=output.width;a->stats.out_h=output.height;a->stats.members=UINT(members.size());a->stats.plans=UINT(a->prepared->bindings.size());
+    a->stats.failed_plans=a->prepared->failed.size()+a->prepared->failed_transfers.size();if(!same)++a->stats.group_builds;
+    if(a->stats.failed_plans)a->note(!a->prepared->failed.empty()?a->prepared->failed.begin()->second.c_str():a->prepared->failed_transfers.begin()->second.c_str());
+    else a->note("Reduced scene prepared; applying at the next frame boundary.");
+    bool more=!a->pending.empty();for(const auto& transfer:a->observed_transfers)more|=!a->prepared->transfers.count(transfer.first)&&!a->prepared->failed_transfers.count(transfer.first);
+    a->work_pending.store(more);
 }
+bool AutomaticSceneWorkPending(){auto a=automatic();return a&&a->work_pending.load();}
 void AutomaticScenePresent(){auto a=automatic();if(!a)return;std::lock_guard<std::mutex> lock(a->mutex);++a->epoch;a->current.reset();
     if(na::settings::Get().j2_scale_mode.load()==0){a->built.reset();a->stats.active=false;a->note("Rendering at native resolution.");}else if(a->prepared)a->built=a->prepared;}
 AutomaticSceneStats GetAutomaticSceneStats(){auto a=automatic();if(!a)return {};std::lock_guard<std::mutex> lock(a->mutex);return a->stats;}
