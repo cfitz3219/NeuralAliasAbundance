@@ -16,6 +16,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
+#include <string>
 
 namespace na::scale {
 
@@ -192,6 +194,51 @@ inline int PatchRenderScale(char* d, size_t n, double fraction, PatchInfo* info 
         ++r.patched;
     }
     return r.patched;
+}
+
+// UTF-16LE settings files (some engines write their .ini as UTF-16, BOM FF FE). The matcher works
+// on ASCII, so such bytes are viewed through a narrow copy: one char per UTF-16 unit, non-ASCII
+// units become '?'. The rewritten digits are ASCII, so mapping back keeps the exact byte length.
+inline bool LooksUtf16LE(const char* d, size_t n)
+{
+    if (!d || n < 4) return false;
+    if (static_cast<unsigned char>(d[0]) == 0xFF && static_cast<unsigned char>(d[1]) == 0xFE) return true;
+    if (n < 16) return false;
+    const size_t pairs = (std::min)(n / 2, static_cast<size_t>(64));
+    size_t ascii = 0;
+    for (size_t i = 0; i < pairs; ++i)
+        if (d[2 * i + 1] == 0 && d[2 * i] != 0) ++ascii;
+    return ascii * 10 >= pairs * 9;
+}
+inline std::string NarrowUtf16LE(const char* d, size_t n)
+{
+    std::string s(n / 2, '?');
+    for (size_t i = 0; i < n / 2; ++i) {
+        const unsigned char lo = static_cast<unsigned char>(d[2 * i]);
+        if (d[2 * i + 1] == 0 && lo != 0 && lo < 0x80) s[i] = static_cast<char>(lo);
+    }
+    return s;
+}
+// Writes back the units where `now` differs from `before` (both from NarrowUtf16LE of d).
+inline void WidenChangedUtf16LE(const std::string& before, const std::string& now, char* d, size_t n)
+{
+    for (size_t i = 0; i < now.size() && i < before.size() && 2 * i + 1 < n; ++i) {
+        if (now[i] == before[i]) continue;
+        d[2 * i] = now[i];
+        d[2 * i + 1] = 0;
+    }
+}
+// PatchRenderScale for ASCII/UTF-8 or UTF-16LE bytes. `wide` (optional) says which was seen.
+inline int PatchRenderScaleText(char* d, size_t n, double fraction, PatchInfo* info = nullptr, bool tag = false, bool* wide = nullptr)
+{
+    const bool w = LooksUtf16LE(d, n);
+    if (wide) *wide = w;
+    if (!w) return PatchRenderScale(d, n, fraction, info, tag);
+    const std::string before = NarrowUtf16LE(d, n);
+    std::string now = before;
+    const int k = PatchRenderScale(now.data(), now.size(), fraction, info, tag);
+    if (k > 0) WidenChangedUtf16LE(before, now, d, n);
+    return k;
 }
 
 } // namespace na::scale

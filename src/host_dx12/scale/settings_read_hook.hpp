@@ -3,7 +3,7 @@
 //
 // Hooks CreateFileW / CreateFileA / ReadFile / WriteFile in KernelBase. For a small text
 // settings file (.ini .cfg .json .xml .txt .yaml .yml .conf .config, at most 1 MB) opened for
-// reading, the bytes a SYNCHRONOUS ReadFile returns are passed to render_scale_patch.hpp, which
+// reading, the bytes a synchronous ntdll!NtReadFile returns (ReadFile and direct NtReadFile callers alike) are passed to render_scale_patch.hpp, which
 // rewrites a known render-scale value in place (same length). We never open the file for writing.
 // When the game later saves synchronously to the same file (same final path), a value we put
 // there (the substituted one, or a live value we wrote, in any number formatting) is put back to
@@ -35,6 +35,9 @@ struct ReadHookStats {
     uint64_t reads_patched = 0;   // ReadFile results rewritten
     uint64_t writes_restored = 0; // game writes where our value was put back to the original
     uint64_t reads_unpatched = 0; // a key was found but the value could not be written in its width
+    uint64_t reads_async = 0;     // tracked files read with OVERLAPPED (not inspected; diagnostics)
+    uint64_t reads_utf16 = 0;     // patched reads that were UTF-16LE text
+    uint64_t files_mapped = 0;    // tracked files opened as a file mapping (not inspected; diagnostics)
     double original = 0;          // the value the game had stored (its own unit)
     char key[40] = {};
     char file[260] = {};          // last patched file (UTF-8)

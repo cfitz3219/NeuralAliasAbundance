@@ -21,13 +21,23 @@ namespace {
 
 using CreateFileWFn = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 using CreateFileAFn = HANDLE(WINAPI*)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
-using ReadFileFn = BOOL(WINAPI*)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
-using WriteFileFn = BOOL(WINAPI*)(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED);
+// The game's reads and saves are observed at ntdll!NtReadFile / NtWriteFile: Sniper Elite 5
+// imports NtReadFile/NtWriteFile directly, so kernelbase!ReadFile never saw its settings bytes
+// (2026-11-02: files opened, patched=0). ReadFile/WriteFile end in these too, so one layer
+// covers both, and nothing is processed twice.
+struct IoSb { union { LONG Status; PVOID Pointer; }; ULONG_PTR Information; };
+using NtReadFileFn = LONG(NTAPI*)(HANDLE, HANDLE, PVOID, PVOID, IoSb*, PVOID, ULONG, PLARGE_INTEGER, PULONG);
+using NtWriteFileFn = LONG(NTAPI*)(HANDLE, HANDLE, PVOID, PVOID, IoSb*, PVOID, ULONG, PLARGE_INTEGER, PULONG);
+using CreateMappingWFn = HANDLE(WINAPI*)(HANDLE, LPSECURITY_ATTRIBUTES, DWORD, DWORD, DWORD, LPCWSTR);
+using CreateMappingAFn = HANDLE(WINAPI*)(HANDLE, LPSECURITY_ATTRIBUTES, DWORD, DWORD, DWORD, LPCSTR);
+constexpr LONG kStatusPending = 0x103;
 
 CreateFileWFn o_create_w = nullptr;
 CreateFileAFn o_create_a = nullptr;
-ReadFileFn o_read = nullptr;
-WriteFileFn o_write = nullptr;
+NtReadFileFn o_ntread = nullptr;
+NtWriteFileFn o_ntwrite = nullptr;
+CreateMappingWFn o_map_w = nullptr;
+CreateMappingAFn o_map_a = nullptr;
 
 constexpr uint64_t kMaxFileBytes = 1u << 20;
 
@@ -36,6 +46,8 @@ struct Tracked {
     DWORD volume = 0;
     uint64_t index = 0;         // volume serial + file index: the file's identity
     bool read = false, write = false;
+    bool overlapped = false;    // opened with FILE_FLAG_OVERLAPPED: its I/O may complete later
+    bool read_logged = false, async_logged = false, map_logged = false; // diagnostics, once per handle
 };
 struct Patched { // per file: what we changed, to put back in the game's own writes
     std::string original, ours; // value text, same length
@@ -52,6 +64,7 @@ std::wstring g_log;
 std::map<HANDLE, Tracked> g_handles;
 std::map<std::wstring, Patched> g_patched; // lower-cased path
 ReadHookStats g_stats;
+int g_open_logs = 0; // diagnostics: tracked opens logged (bounded)
 // Live switching: the marked value the game parsed, in its unit, and the candidates found.
 struct Candidate {
     uintptr_t addr = 0;
@@ -117,7 +130,7 @@ std::string utf8(const std::wstring& w)
 }
 void log_line(const char* text)
 {
-    if (g_log.empty() || !o_create_w || !o_write) return;
+    if (g_log.empty() || !o_create_w) return;
     ++t_inside;
     const HANDLE f = o_create_w(g_log.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f != INVALID_HANDLE_VALUE) {
@@ -127,10 +140,24 @@ void log_line(const char* text)
         const int n = std::snprintf(buf, sizeof buf, "%04u-%02u-%02u %02u:%02u:%02u render_scale: %s\r\n", st.wYear, st.wMonth, st.wDay,
                                     st.wHour, st.wMinute, st.wSecond, text);
         DWORD w = 0;
-        if (n > 0) o_write(f, buf, static_cast<DWORD>((std::min)(n, static_cast<int>(sizeof buf) - 1)), &w, nullptr);
+        if (n > 0) WriteFile(f, buf, static_cast<DWORD>((std::min)(n, static_cast<int>(sizeof buf) - 1)), &w, nullptr);
         CloseHandle(f);
     }
     --t_inside;
+}
+
+// First bytes of a read, printable (diagnostics: why no render-scale key was found).
+std::string preview(const char* d, size_t n, bool wide)
+{
+    const std::string s = wide ? NarrowUtf16LE(d, n) : std::string(d, n);
+    std::string o;
+    for (size_t i = 0; i < s.size() && o.size() < 120; ++i) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c == '\r') continue;
+        if (c == '\n') o += " | ";
+        else o += (c >= 0x20 && c < 0x7F) ? static_cast<char>(c) : '?';
+    }
+    return o;
 }
 
 bool identity(HANDLE h, DWORD* vol, uint64_t* idx)
@@ -159,7 +186,7 @@ bool still_same(HANDLE h, const Tracked& t)
     return identity(h, &v, &i) && v == t.volume && i == t.index;
 }
 
-void on_open(HANDLE h, std::wstring path, DWORD access)
+void on_open(HANDLE h, std::wstring path, DWORD access, DWORD flags)
 {
     if (h == INVALID_HANDLE_VALUE || t_inside || !candidate(path)) return;
     const bool rd = (access & (GENERIC_READ | FILE_READ_DATA | GENERIC_ALL)) != 0;
@@ -170,12 +197,20 @@ void on_open(HANDLE h, std::wstring path, DWORD access)
         LARGE_INTEGER sz{};
         if (!GetFileSizeEx(h, &sz) || static_cast<uint64_t>(sz.QuadPart) > kMaxFileBytes) return;
         ++g_stats.files_opened;
+        if (g_open_logs < 48) { // which files the game opens (diagnostics, bounded)
+            ++g_open_logs;
+            char line[600];
+            std::snprintf(line, sizeof line, "opened for reading: %s (%lld bytes)", utf8(final_path(h, path)).c_str(),
+                          static_cast<long long>(sz.QuadPart));
+            log_line(line);
+        }
     }
     Tracked t;
     if (!identity(h, &t.volume, &t.index)) return;
     t.path = final_path(h, path);
     t.read = rd;
     t.write = wr;
+    t.overlapped = (flags & FILE_FLAG_OVERLAPPED) != 0;
     if (g_handles.size() > 256) g_handles.clear(); // bounded: stale entries only
     g_handles[h] = std::move(t);
     track_slot(h);
@@ -184,7 +219,7 @@ void on_open(HANDLE h, std::wstring path, DWORD access)
 HANDLE WINAPI create_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disp, DWORD flags, HANDLE tmpl)
 {
     const HANDLE h = o_create_w(name, access, share, sa, disp, flags, tmpl);
-    if (name && !t_inside) on_open(h, name, access);
+    if (name && !t_inside) on_open(h, name, access, flags);
     return h;
 }
 HANDLE WINAPI create_a(LPCSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disp, DWORD flags, HANDLE tmpl)
@@ -194,26 +229,50 @@ HANDLE WINAPI create_a(LPCSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIB
     --t_inside;
     if (name && !t_inside) {
         wchar_t w[MAX_PATH * 2] = {};
-        if (MultiByteToWideChar(CP_ACP, 0, name, -1, w, MAX_PATH * 2) > 0) on_open(h, w, access);
+        if (MultiByteToWideChar(CP_ACP, 0, name, -1, w, MAX_PATH * 2) > 0) on_open(h, w, access, flags);
     }
     return h;
 }
 
-BOOL WINAPI read_file(HANDLE h, LPVOID buf, DWORD n, LPDWORD got, LPOVERLAPPED ov)
+// Asynchronous read of a tracked file: its bytes arrive later and are not inspected (logged once).
+void note_async_read(HANDLE h, ULONG n)
 {
-    const BOOL ok = o_read(h, buf, n, got, ov);
-    if (!ok || !buf || t_inside || ov || !got || !*got || !tracked_fast(h)) return ok;
     std::lock_guard<std::mutex> lk(g_m);
-    if (!(g_fraction > 0) || g_handles.empty()) return ok;
     const auto it = g_handles.find(h);
-    if (it == g_handles.end() || !it->second.read) return ok;
-    if (!still_same(h, it->second)) { g_handles.erase(it); return ok; }
+    if (it == g_handles.end() || !it->second.read || it->second.async_logged) return;
+    it->second.async_logged = true;
+    ++g_stats.reads_async;
+    char line[600];
+    std::snprintf(line, sizeof line, "asynchronous read of %s (%lu bytes asked): not inspected", utf8(it->second.path).c_str(),
+                  static_cast<unsigned long>(n));
+    log_line(line);
+}
+
+void inspect_read(HANDLE h, void* buf, size_t got_n)
+{
+    std::lock_guard<std::mutex> lk(g_m);
+    if (!(g_fraction > 0) || g_handles.empty()) return;
+    const auto it = g_handles.find(h);
+    if (it == g_handles.end() || !it->second.read) return;
+    if (!still_same(h, it->second)) { g_handles.erase(it); return; }
+    const size_t* got = &got_n;
     char* d = static_cast<char*>(buf);
     PatchInfo info;
-    const int k = PatchRenderScale(d, *got, g_fraction, &info, /*tag=*/true);
-    if (k == 0 && !info.m.key[0]) return ok; // no render-scale key in these bytes
+    bool wide = false;
+    const int k = PatchRenderScaleText(d, *got, g_fraction, &info, /*tag=*/true, &wide);
     char line[600];
     const std::string file = utf8(it->second.path);
+    if (k == 0 && !info.m.key[0]) { // no render-scale key in these bytes: say what they were (once per handle)
+        if (!it->second.read_logged) {
+            it->second.read_logged = true;
+            std::snprintf(line, sizeof line, "read of %s: %lu bytes%s, no render-scale key; starts: %s", file.c_str(),
+                          static_cast<unsigned long>(got_n), wide ? " (UTF-16)" : "", preview(d, *got, wide).c_str());
+            log_line(line);
+        }
+        return;
+    }
+    it->second.read_logged = true;
+    if (wide) ++g_stats.reads_utf16;
     if (k > 0) {
         const Match& m = info.m; // the first entry actually rewritten
         ++g_stats.reads_patched;
@@ -247,7 +306,44 @@ BOOL WINAPI read_file(HANDLE h, LPVOID buf, DWORD n, LPDWORD got, LPOVERLAPPED o
         std::snprintf(line, sizeof line, "not patched (%s): %s", file.c_str(), g_stats.note);
     }
     log_line(line);
-    return ok;
+}
+
+LONG NTAPI nt_read(HANDLE h, HANDLE ev, PVOID apc, PVOID ctx, IoSb* io, PVOID buf, ULONG n, PLARGE_INTEGER off, PULONG key)
+{
+    const LONG st = o_ntread(h, ev, apc, ctx, io, buf, n, off, key);
+    if (t_inside || !tracked_fast(h)) return st;
+    if (st == kStatusPending) { note_async_read(h, n); return st; }
+    if (st != 0 || !buf || !io || !io->Information) return st; // STATUS_SUCCESS only: the bytes are in buf now
+    inspect_read(h, buf, static_cast<size_t>(io->Information));
+    return st;
+}
+
+// Diagnostics only: a tracked settings file mapped into memory is read without NtReadFile.
+void note_mapping(HANDLE file)
+{
+    if (t_inside || !file || file == INVALID_HANDLE_VALUE || !tracked_fast(file)) return;
+    std::lock_guard<std::mutex> lk(g_m);
+    const auto it = g_handles.find(file);
+    if (it == g_handles.end() || it->second.map_logged || !still_same(file, it->second)) return;
+    it->second.map_logged = true;
+    ++g_stats.files_mapped;
+    char line[600];
+    std::snprintf(line, sizeof line, "%s is read through a file mapping: not inspected", utf8(it->second.path).c_str());
+    log_line(line);
+}
+HANDLE WINAPI map_w(HANDLE f, LPSECURITY_ATTRIBUTES sa, DWORD prot, DWORD hi, DWORD lo, LPCWSTR name)
+{
+    const HANDLE m = o_map_w(f, sa, prot, hi, lo, name);
+    if (m) note_mapping(f);
+    return m;
+}
+HANDLE WINAPI map_a(HANDLE f, LPSECURITY_ATTRIBUTES sa, DWORD prot, DWORD hi, DWORD lo, LPCSTR name)
+{
+    ++t_inside; // may forward to CreateFileMappingW: observe once, here
+    const HANDLE m = o_map_a(f, sa, prot, hi, lo, name);
+    --t_inside;
+    if (m) note_mapping(f);
+    return m;
 }
 
 // A value in the game's save is one we put there: the substituted text, or (any formatting)
@@ -261,16 +357,16 @@ bool ours_value(const Patched& p, const std::string& text, double v)
     return false;
 }
 
-BOOL WINAPI write_file(HANDLE h, LPCVOID buf, DWORD n, LPDWORD done, LPOVERLAPPED ov)
+LONG NTAPI nt_write(HANDLE h, HANDLE ev, PVOID apc, PVOID ctx, IoSb* io, PVOID buf, ULONG n, PLARGE_INTEGER off, PULONG key)
 {
-    if (!buf || !n || t_inside || !tracked_fast(h)) return o_write(h, buf, n, done, ov);
+    if (!buf || !n || t_inside || !tracked_fast(h)) return o_ntwrite(h, ev, apc, ctx, io, buf, n, off, key);
     std::string fixed;
     {
         std::lock_guard<std::mutex> lk(g_m);
         const auto it = g_handles.find(h);
         if (it != g_handles.end() && it->second.write && still_same(h, it->second)) {
             const auto p = g_patched.find(it->second.path);
-            if (p != g_patched.end() && ov) {
+            if (p != g_patched.end() && it->second.overlapped) {
                 // Asynchronous save: the bytes must stay valid until completion, which a temporary
                 // here would not. Forwarded untouched (Astra 2026-11-01); logged once.
                 if (!p->second.async_logged) {
@@ -282,6 +378,10 @@ BOOL WINAPI write_file(HANDLE h, LPCVOID buf, DWORD n, LPDWORD done, LPOVERLAPPE
                 }
             } else if (p != g_patched.end()) {
                 fixed.assign(static_cast<const char*>(buf), n);
+                const bool wide = LooksUtf16LE(fixed.data(), fixed.size());
+                const std::string wide_before = wide ? NarrowUtf16LE(fixed.data(), fixed.size()) : std::string();
+                std::string raw; // UTF-16: the bytes to send; `fixed` becomes their narrow view
+                if (wide) { raw.swap(fixed); fixed = wide_before; }
                 const Patched& pp = p->second;
                 Match m;
                 int restored = 0, failed = 0;
@@ -317,11 +417,14 @@ BOOL WINAPI write_file(HANDLE h, LPCVOID buf, DWORD n, LPDWORD done, LPOVERLAPPE
                     log_line(line);
                 }
                 if (!restored) fixed.clear();
+                else if (wide) { WidenChangedUtf16LE(wide_before, fixed, raw.data(), raw.size()); fixed.swap(raw); }
             }
         }
     }
-    if (!fixed.empty()) return o_write(h, fixed.data(), static_cast<DWORD>(fixed.size()), done, ov);
-    return o_write(h, buf, n, done, ov);
+    // Same length as the game's bytes; the I/O is synchronous (the handle is not overlapped), so
+    // `fixed` outlives it.
+    if (!fixed.empty()) return o_ntwrite(h, ev, apc, ctx, io, fixed.data(), n, off, key);
+    return o_ntwrite(h, ev, apc, ctx, io, buf, n, off, key);
 }
 
 } // namespace
@@ -359,15 +462,20 @@ bool InstallSettingsReadHook()
     if (!kb) return false;
     void* cw = reinterpret_cast<void*>(GetProcAddress(kb, "CreateFileW"));
     void* ca = reinterpret_cast<void*>(GetProcAddress(kb, "CreateFileA"));
-    void* rf = reinterpret_cast<void*>(GetProcAddress(kb, "ReadFile"));
-    void* wf = reinterpret_cast<void*>(GetProcAddress(kb, "WriteFile"));
+    void* mw = reinterpret_cast<void*>(GetProcAddress(kb, "CreateFileMappingW"));
+    void* ma = reinterpret_cast<void*>(GetProcAddress(kb, "CreateFileMappingA"));
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    void* rf = nt ? reinterpret_cast<void*>(GetProcAddress(nt, "NtReadFile")) : nullptr;
+    void* wf = nt ? reinterpret_cast<void*>(GetProcAddress(nt, "NtWriteFile")) : nullptr;
     if (!cw || !ca || !rf || !wf || !na::hooking::Initialize()) return false;
     if (!na::hooking::BeginInstallWait("render-scale read hook")) { na::hooking::Shutdown(); return false; }
     // Originals first (publish-before-enable); the detours never run before they are set.
     if (!na::hooking::PrepareHook(cw, reinterpret_cast<void*>(&create_w), reinterpret_cast<void**>(&o_create_w)) ||
         !na::hooking::PrepareHook(ca, reinterpret_cast<void*>(&create_a), reinterpret_cast<void**>(&o_create_a)) ||
-        !na::hooking::PrepareHook(rf, reinterpret_cast<void*>(&read_file), reinterpret_cast<void**>(&o_read)) ||
-        !na::hooking::PrepareHook(wf, reinterpret_cast<void*>(&write_file), reinterpret_cast<void**>(&o_write))) {
+        !na::hooking::PrepareHook(rf, reinterpret_cast<void*>(&nt_read), reinterpret_cast<void**>(&o_ntread)) ||
+        !na::hooking::PrepareHook(wf, reinterpret_cast<void*>(&nt_write), reinterpret_cast<void**>(&o_ntwrite)) ||
+        (mw && !na::hooking::PrepareHook(mw, reinterpret_cast<void*>(&map_w), reinterpret_cast<void**>(&o_map_w))) ||
+        (ma && !na::hooking::PrepareHook(ma, reinterpret_cast<void*>(&map_a), reinterpret_cast<void**>(&o_map_a)))) {
         na::hooking::AbandonInstall();
         na::hooking::Shutdown();
         return false;
