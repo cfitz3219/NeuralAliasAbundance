@@ -350,6 +350,17 @@ void Discard(uint32_t token, bool may_still_run)
     }
 }
 
+void Withdraw(uint32_t token)
+{
+    std::lock_guard<std::mutex> lock(g.m);
+    Slot* s = slot_of(token);
+    if (!s || s->state != SlotState::Recorded) return;
+    s->state = SlotState::Free;
+    ++g.stats.withdrawn;
+    if (g.stats.recorded) --g.stats.recorded;
+    if (g.stats.recorded < g.requested) g.armed.store(true, std::memory_order_release);
+}
+
 void OnFrameClosed(uint64_t present_ordinal, uint64_t late_writes)
 {
     std::lock_guard<std::mutex> lock(g.m);

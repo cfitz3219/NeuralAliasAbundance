@@ -69,6 +69,10 @@ void Submitted(uint32_t token, ID3D12CommandQueue* queue, uint64_t submission);
 // The token's list will not be submitted by J2. `may_still_run`: the copies are in a
 // list someone else may still submit (inline) -> the slot is retired, never reused.
 void Discard(uint32_t token, bool may_still_run);
+// The token's copies were recorded inside a GPU-predicated region that was switched off in
+// its only submission (exact inline placement: a candidate that was not chosen). They never
+// run, so the slot is free again and the evaluation does not count toward the request.
+void Withdraw(uint32_t token);
 // J2 closed a frame at Present: late scene writes observed after our insertion in it.
 void OnFrameClosed(uint64_t present_ordinal, uint64_t late_writes);
 // The image handed to Present (PRESENT state). Attached to this frame's submitted
@@ -78,7 +82,7 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn e
 
 struct Stats {
     uint32_t requested = 0, recorded = 0, submitted = 0, written = 0;
-    uint32_t dropped_busy = 0, discarded = 0, retired = 0, errors = 0;
+    uint32_t dropped_busy = 0, discarded = 0, retired = 0, errors = 0, withdrawn = 0;
     uint32_t without_present = 0; // frames written without a presented image
 };
 Stats GetStats();

@@ -827,8 +827,12 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             CHECK(dev->GetDeviceRemovedReason() == S_OK);
             return test::finish("j2_anno_shape_test (inline segments)");
         }
-        if (inline_copy) CHECK(is.profile_accepted >= 1 && is.class_matched >= 3 && is.legacy_matched + is.boundary_any_matched >= 8 &&
-                               is.class_contradictions == 0 && is.class_rejected_skips >= 10 &&
+        // Exact placement: every scene boundary records a candidate, so the first one is the
+        // earliest boundary (before any class consumer), and frames whose final writer changed
+        // are covered by the same mechanism. The profile still learns the copy as the post
+        // entry; it no longer decides placement here.
+        if (inline_copy) CHECK(is.profile_accepted >= 1 && is.class_contradictions == 0 &&
+                               is.inline_moved_later >= static_cast<uint64_t>(frames - 2) &&
                                is.inline_recorded == static_cast<uint64_t>(frames - 1)); // only the cold first frame missed
         else CHECK(is.profile_ambiguous >= 1 && is.legacy_matched + is.boundary_any_matched == is.inline_recorded && is.class_matched == 0);
         CHECK(is.inline_target == 3); // intermediate transition + draw, then final transition

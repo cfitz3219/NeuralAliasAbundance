@@ -600,10 +600,13 @@ bool dlss_on()
 
 // Carry out the route selector's decision (under g.m): inline mode for the inline
 // trigger, device + DLSS ready for it, and a history reset when the route changes.
-void discard_inline()
+// switched_off: the recording was just submitted with every remaining candidate's predicate
+// at 0 (they never run). Otherwise the list may still be submitted later: retire captures.
+void discard_inline(bool switched_off = false)
 {
     for (uint32_t i = 0; i < g.inl_n; ++i) {
-        na::capture::j2::Discard(g.inl[i].history.capture, true);
+        if (switched_off) na::capture::j2::Withdraw(g.inl[i].history.capture);
+        else na::capture::j2::Discard(g.inl[i].history.capture, true);
         g.inl[i].history.capture = 0;
     }
     g.inl_n = 0;
@@ -2523,7 +2526,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         g.fired_class = c.cls;
         g.fired_producer = c.producer;
         g.fired_context = c.context;
-        discard_inline(); // the others never ran; their captures are released
+        discard_inline(true); // the others never ran (predicate 0 in this submission); their captures are free again
         reason("Live DLAA is running inside the game's scene list (post-processing shares it).");
         return;
     }
