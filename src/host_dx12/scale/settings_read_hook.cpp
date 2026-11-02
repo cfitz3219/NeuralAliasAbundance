@@ -118,6 +118,13 @@ bool tracked_fast(HANDLE h)
     for (auto& x : g_slot) if (x.load(std::memory_order_acquire) == h) return true;
     return false;
 }
+void untrack_slot(HANDLE h) // a stale hint: later calls on this handle skip the lock again
+{
+    for (auto& x : g_slot) {
+        HANDLE e = h;
+        x.compare_exchange_strong(e, nullptr, std::memory_order_acq_rel);
+    }
+}
 void track_slot(HANDLE h)
 {
     if (tracked_fast(h)) return;
@@ -377,12 +384,31 @@ bool sniff(const void* buf, size_t n)
 }
 // Starts tracking `h` when it names a candidate settings file (path checked here, outside g_m).
 // `why` goes in the log. True when tracked now.
+// A fast-path hit is only a hint: the slot or the entry may be a closed handle's whose value was
+// reused (CI 2026-11-02: a stale write-only entry hid a read of the settings file). True when `h`
+// is tracked for this use and still names the same file; a stale entry is dropped.
+bool tracked_for(HANDLE h, bool for_write)
+{
+    if (!tracked_fast(h)) return false;
+    std::lock_guard<std::mutex> lk(g_m);
+    const auto it = g_handles.find(h);
+    if (it == g_handles.end()) { untrack_slot(h); return false; }
+    const bool same = still_same(h, it->second);
+    if (same && (for_write ? it->second.write : it->second.read)) return true;
+    if (!same) { g_handles.erase(it); untrack_slot(h); }
+    return false;
+}
+
 bool adopt(HANDLE h, const char* why)
 {
     {
         std::lock_guard<std::mutex> lk(g_m);
         if (!(g_fraction > 0)) return false;
-        if (g_handles.count(h)) return true; // tracked by another thread meanwhile
+        const auto it = g_handles.find(h);
+        if (it != g_handles.end()) { // tracked by another thread meanwhile, or a stale entry
+            if (still_same(h, it->second)) { it->second.read = it->second.write = true; return true; }
+            g_handles.erase(it);
+        }
     }
     ++t_inside;
     Tracked t;
@@ -428,7 +454,7 @@ LONG NTAPI nt_read(HANDLE h, HANDLE ev, PVOID apc, PVOID ctx, IoSb* io, PVOID bu
 {
     const LONG st = o_ntread(h, ev, apc, ctx, io, buf, n, off, key);
     if (t_inside) return st;
-    if (!tracked_fast(h)) {
+    if (!tracked_for(h, false)) {
         if (st != 0 || !io || !g_any_candidate.load(std::memory_order_acquire) || !sniff(buf, io->Information) || !adopt(h, "read"))
             return st;
     }
@@ -632,7 +658,7 @@ bool ours_value(const Patched& p, const std::string& text, double v)
 LONG NTAPI nt_write(HANDLE h, HANDLE ev, PVOID apc, PVOID ctx, IoSb* io, PVOID buf, ULONG n, PLARGE_INTEGER off, PULONG key)
 {
     if (!buf || !n || t_inside) return o_ntwrite(h, ev, apc, ctx, io, buf, n, off, key);
-    if (!tracked_fast(h) && !(g_any_patch.load(std::memory_order_acquire) && sniff(buf, n) && adopt(h, "save")))
+    if (!tracked_for(h, true) && !(g_any_patch.load(std::memory_order_acquire) && sniff(buf, n) && adopt(h, "save")))
         return o_ntwrite(h, ev, apc, ctx, io, buf, n, off, key);
     std::string fixed;
     {
