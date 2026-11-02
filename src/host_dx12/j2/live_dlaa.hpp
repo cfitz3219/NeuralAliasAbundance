@@ -41,6 +41,9 @@ bool Paused();
 void SetDebugView(int mode);
 // Test hook: records the RCAS sharpening pass from `in` (NON_PIXEL_SHADER_RESOURCE)
 // into `out` (UNORDERED_ACCESS). percent 0 records nothing and returns false.
+// Keep the game's scene-colour alpha under J2's result (default on; SE5 flashing 2026-11-02).
+void SetKeepAlpha(bool on);
+bool KeepAlpha();
 bool RecordRcasForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* in, ID3D12Resource* out,
                         uint32_t w, uint32_t h, uint32_t percent, DXGI_FORMAT fmt);
 // Test hook: the 101..200 % stage (NVIDIA Image Scaling sharpen-only) from `in`
@@ -168,6 +171,7 @@ struct Stats {
     uint64_t unjit_no_sample = 0;    // no jitter sample was started in any earlier batch
     uint64_t unjit_not_applied = 0;  // started, but no camera block was rewritten
     uint64_t unjit_not_held = 0;     // rewritten, but the camera the scene list used did not hold it
+    uint64_t alpha_restored = 0;          // frames whose result got the game's own alpha back
     uint64_t camera_inverse_computed = 0; // a ViewProjection without its inverse, continuing the main camera, accepted
     char camera_lost_evidence[480] = {};  // the last lost frame: every block searched and what it held
     int64_t camera_inv_delta = 0; // bytes from the ViewProjection to its inverse in the camera block

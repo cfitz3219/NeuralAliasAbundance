@@ -503,6 +503,99 @@ bool rcas_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Resou
     l->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
     return true;
 }
+// ---- Keep the game's alpha ----------------------------------------------------
+// J2 writes its result back into the game's scene colour, and post-processing after it may read
+// that texture's ALPHA (a mask or weight). DLSS does not carry the input alpha through, so a frame
+// with our result and a frame without it gave post-processing different alphas: a different
+// picture on every frame J2 missed (SE5 flashing, 2026-11-02). This pass puts the game's own
+// alpha (J2's pre-DLSS copy, scaled for upscaling) back under our colour. [j2] keep_alpha=0 or
+// the menu switch turns it off for comparison.
+std::atomic<bool> g_keep_alpha{true};
+struct AlphaPass {
+    ComPtr<ID3D12RootSignature> root;
+    ComPtr<ID3D12PipelineState> pso;
+    ComPtr<ID3D12DescriptorHeap> heap;
+    UINT inc = 0;
+    bool tried = false, ok = false;
+} g_alpha;
+constexpr char kAlphaHlsl[] = R"(
+Texture2D<float4> t_rgb : register(t0);
+Texture2D<float4> t_a : register(t1);
+RWTexture2D<float4> u_out : register(u0);
+cbuffer C : register(b0) { uint w; uint h; uint aw; uint ah; };
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= w || id.y >= h) return;
+    uint2 q = uint2(min((id.x * aw) / w, aw - 1), min((id.y * ah) / h, ah - 1));
+    u_out[id.xy] = float4(t_rgb[id.xy].rgb, t_a[q].a);
+})";
+bool alpha_init()
+{
+    if (g_alpha.tried) return g_alpha.ok;
+    g_alpha.tried = true;
+    D3D12_DESCRIPTOR_RANGE r[2]{};
+    r[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    r[0].NumDescriptors = 2;
+    r[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    r[1].NumDescriptors = 1;
+    r[1].OffsetInDescriptorsFromTableStart = 2;
+    D3D12_ROOT_PARAMETER p[2]{};
+    p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    p[0].DescriptorTable.NumDescriptorRanges = 2;
+    p[0].DescriptorTable.pDescriptorRanges = r;
+    p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    p[1].Constants.Num32BitValues = 4;
+    D3D12_ROOT_SIGNATURE_DESC rd{2, p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ComPtr<ID3DBlob> sig, err, code;
+    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
+        FAILED(g.device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&g_alpha.root))))
+        return false;
+    if (FAILED(D3DCompile(kAlphaHlsl, sizeof(kAlphaHlsl) - 1, "j2_alpha.hlsl", nullptr, nullptr, "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err)))
+        return false;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = g_alpha.root.Get();
+    pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+    if (FAILED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_alpha.pso)))) return false;
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRing * 3, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    if (FAILED(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_alpha.heap)))) return false;
+    g_alpha.inc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    g_alpha.ok = true;
+    return true;
+}
+// rgb from `rgb` (NPSR, w x h), alpha from `alpha_src` (NPSR, its active extent aw x ah) into `out` (UAV).
+bool alpha_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* rgb, ID3D12Resource* alpha_src, ID3D12Resource* out,
+                    uint32_t w, uint32_t h, uint32_t aw, uint32_t ah, DXGI_FORMAT fmt, DXGI_FORMAT alpha_fmt, UINT slot)
+{
+    if (!rgb || !alpha_src || !out || !aw || !ah || !alpha_init()) return false;
+    D3D12_CPU_DESCRIPTOR_HANDLE c = g_alpha.heap->GetCPUDescriptorHandleForHeapStart();
+    c.ptr += static_cast<SIZE_T>(slot * 3) * g_alpha.inc;
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Texture2D.MipLevels = 1;
+    sv.Format = fmt;
+    g.device->CreateShaderResourceView(rgb, &sv, c);
+    c.ptr += g_alpha.inc;
+    sv.Format = alpha_fmt;
+    g.device->CreateShaderResourceView(alpha_src, &sv, c);
+    c.ptr += g_alpha.inc;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+    uv.Format = fmt;
+    uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    g.device->CreateUnorderedAccessView(out, nullptr, &uv, c);
+    D3D12_GPU_DESCRIPTOR_HANDLE gh = g_alpha.heap->GetGPUDescriptorHandleForHeapStart();
+    gh.ptr += static_cast<UINT64>(slot * 3) * g_alpha.inc;
+    ID3D12DescriptorHeap* heaps[] = {g_alpha.heap.Get()};
+    l->SetDescriptorHeaps(1, heaps);
+    l->SetComputeRootSignature(g_alpha.root.Get());
+    l->SetPipelineState(g_alpha.pso.Get());
+    l->SetComputeRootDescriptorTable(0, gh);
+    const uint32_t k[4] = {w, h, aw, ah};
+    l->SetComputeRoot32BitConstants(1, 4, k, 0);
+    l->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+    return true;
+}
+
 // 101..200 %: NVIDIA Image Scaling sharpen-only on top of full-strength RCAS.
 na::j2::NisSharpen g_nis;
 bool rcas_record(ID3D12GraphicsCommandList* l, uint32_t percent, DXGI_FORMAT fmt)
@@ -1598,6 +1691,22 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             flush(l, b);
         }
     }
+    // 4b. The game's own alpha under our colour (see AlphaPass): output -> sharp (copy), then
+    // rgb from sharp + alpha from J2's pre-DLSS copy -> output.
+    if (evaluated && g.sharp && g_keep_alpha.load(std::memory_order_relaxed)) {
+        b.push_back(uav_barrier(g.output.Get()));
+        add(b, g.output.Get(), UAV, SRC);
+        add(b, g.sharp.Get(), UAV, DST);
+        flush(l, b);
+        l->CopyResource(g.sharp.Get(), g.output.Get());
+        add(b, g.sharp.Get(), DST, NPSR);
+        add(b, g.output.Get(), SRC, UAV);
+        flush(l, b);
+        if (alpha_dispatch(l, g.sharp.Get(), g.color_in.Get(), g.output.Get(), g.ow, g.oh, g.rw, g.rh, cf, cf, g.slot)) ++g.stats.alpha_restored;
+        b.push_back(uav_barrier(g.output.Get()));
+        add(b, g.sharp.Get(), NPSR, UAV);
+        flush(l, b);
+    }
     // 5. result -> scene colour (DLAA) or the upscale destination, everything back to the game's states
     if (evaluated && upscaling) {
         b.push_back(uav_barrier(g.output.Get()));
@@ -1943,6 +2052,8 @@ void SetPaused(bool paused)
     g.paused.store(paused);
 }
 bool Paused() { return g.paused.load(); }
+void SetKeepAlpha(bool on) { g_keep_alpha.store(on); }
+bool KeepAlpha() { return g_keep_alpha.load(); }
 bool RecordRcasForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* in, ID3D12Resource* out,
                         uint32_t w, uint32_t h, uint32_t percent, DXGI_FORMAT fmt)
 {
