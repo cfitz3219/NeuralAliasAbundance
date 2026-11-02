@@ -30,6 +30,7 @@ public:
     // current dependencies to native allocations before another list consumes
     // them. Runs without registry locks, under HostWorkScope.
     virtual void Closing(ID3D12GraphicsCommandList*) noexcept {}
+    virtual void NativeBoundary(ID3D12GraphicsCommandList*) noexcept {}
 };
 // Reconstruction first; Bindings only if forwarding remains necessary. Keeping
 // two explicit lanes lets Layer1 and Layer2 share the existing host hook rather

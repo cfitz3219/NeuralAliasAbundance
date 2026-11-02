@@ -31,8 +31,11 @@ void variable(ID3D12ShaderReflectionType* type,const char* name,uint32_t offset,
     if(first<0)return;const UINT count=t.Columns>=2?2:1;
     for(UINT i=0;i<count;++i)if(offset+4*i+4<=bytes&&!(t.Type==D3D_SVT_UINT&&first>=2))
         out.push_back({reg,space,offset+4*i,bytes,static_cast<uint32_t>(first+i),t.Type==D3D_SVT_UINT});
-    if(t.Columns==4&&t.Type==D3D_SVT_FLOAT&&(n=="viewsizeandinvsize"||n=="viewsizeandinversesize"))
+    if(t.Columns==4&&t.Type==D3D_SVT_FLOAT&&(n=="viewsizeandinvsize"||n=="viewsizeandinversesize")){
         for(UINT i=2;i<4;++i)if(offset+4*i+4<=bytes)out.push_back({reg,space,offset+4*i,bytes,i,false});
+    }else if(t.Columns==4&&t.Type==D3D_SVT_FLOAT&&(size||inverse)){
+        for(UINT i=0;i<2;++i)if(offset+8+4*i+4<=bytes){ShaderDimension field{reg,space,offset+8+4*i,bytes,(inverse?0u:2u)+i,false};field.optional=true;out.push_back(field);}
+    }
 }
 }
 void ReflectDimensions(const D3D12_SHADER_BYTECODE& code,std::vector<ShaderDimension>& out,uint32_t visibility) {

@@ -3381,6 +3381,14 @@ struct ListHook<Slot, R(A...)> {
         // pipelines and the learned profile at every level except the game's own.
         constexpr bool kMipSlot = Slot == sl::list::SetPipelineState || Slot == sl::list::SetGraphicsRootSignature ||
                                   Slot == sl::list::SetComputeRootSignature || Slot == sl::list::Reset;
+        if constexpr (Slot == sl::list::ExecuteBundle || Slot == sl::list::ExecuteIndirect || Slot == sl::list::BeginRenderPass) {
+            if (!t_host_work && scope.outermost && !scope.ambiguous && g_shader_hooks_enabled.load(std::memory_order_acquire)) {
+                const auto hooks = std::atomic_load_explicit(&g_shader_hooks, std::memory_order_acquire);
+                if (hooks) for (const auto& hook : hooks->lane) if (hook) {
+                    HostWorkScope own; hook->NativeBoundary(l);
+                }
+            }
+        }
         if constexpr (Slot == sl::list::Close) {
             if (!t_host_work && scope.outermost && !scope.ambiguous && g_shader_hooks_enabled.load(std::memory_order_acquire)) {
                 const auto hooks = std::atomic_load_explicit(&g_shader_hooks, std::memory_order_acquire);

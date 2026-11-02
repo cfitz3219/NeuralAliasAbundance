@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 namespace {
 std::wstring temp_path(const wchar_t* name)
@@ -170,17 +171,20 @@ int main()
         CHECK(write_all(opt, ini));
         na::scale::Configure(na::scale::FractionForMode(1), log.c_str());
         const HANDLE f = CreateFileW(opt.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        HANDLE dup = nullptr;
-        CHECK(f != INVALID_HANDLE_VALUE &&
-              DuplicateHandle(GetCurrentProcess(), f, GetCurrentProcess(), &dup, 0, FALSE, DUPLICATE_SAME_ACCESS));
-        CloseHandle(f);
-        std::string s(4096, '\0');
-        DWORD r = 0;
-        CHECK(dup && ReadFile(dup, s.data(), static_cast<DWORD>(s.size()), &r, nullptr));
-        if (dup) CloseHandle(dup);
-        s.resize(r);
-        std::printf("read through an unseen handle: %s\n", s.c_str());
-        CHECK(s.find("\nRenderScale = 0.666668\r\n") != std::string::npos);
+        // Closed numeric handles may be reused for this SAME file and already
+        // be correctly recognized. Hold more distinct aliases than the bounded
+        // 257-entry tracker can contain, so this exercises genuine adoption.
+        std::vector<HANDLE> aliases;
+        for(unsigned i=0;i<260;++i){HANDLE alias=nullptr;
+            REQUIRE(f!=INVALID_HANDLE_VALUE&&DuplicateHandle(GetCurrentProcess(),f,GetCurrentProcess(),&alias,0,FALSE,DUPLICATE_SAME_ACCESS));aliases.push_back(alias);}
+        const auto adopted_before=na::scale::GetReadHookStats().handles_adopted;bool exercised=false;
+        for(HANDLE alias:aliases){std::string s(4096,'\0');DWORD r=0;LARGE_INTEGER start{};
+            CHECK(SetFilePointerEx(alias,start,nullptr,FILE_BEGIN));
+            CHECK(ReadFile(alias,s.data(),static_cast<DWORD>(s.size()),&r,nullptr));s.resize(r);
+            if(na::scale::GetReadHookStats().handles_adopted>adopted_before){
+                CHECK(s.find("\nRenderScale = 0.666668\r\n") != std::string::npos);exercised=true;break;}}
+        for(HANDLE alias:aliases)CloseHandle(alias);CloseHandle(f);
+        CHECK(exercised);
         CHECK(na::scale::GetReadHookStats().handles_adopted >= 1);
         CHECK(read_all(other) == ini); // a non-settings file with the same bytes is still left alone
         na::scale::Configure(0, nullptr);

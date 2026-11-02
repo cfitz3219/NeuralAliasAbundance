@@ -68,6 +68,7 @@ class BindingProvider {
 public:
     virtual ~BindingProvider() = default;
     virtual void Closing(ID3D12GraphicsCommandList*) noexcept {}
+    virtual void NativeBoundary(ID3D12GraphicsCommandList*) noexcept {}
     // Current recording/op recognition and coherent group admission belong to
     // the provider. It must never infer authority from resolution alone. Return
     // null for unrelated operations. A plan is immutable for all recorded uses.
@@ -94,6 +95,7 @@ public:
     na::observe::ShaderScope Before(ID3D12GraphicsCommandList*, na::observe::ShaderCall&) noexcept override;
     void After(ID3D12GraphicsCommandList*, const na::observe::ShaderCall&, na::observe::ShaderScope&) noexcept override;
     void Closing(ID3D12GraphicsCommandList* list) noexcept override { if(provider_)provider_->Closing(list); }
+    void NativeBoundary(ID3D12GraphicsCommandList* list) noexcept override { if(provider_)provider_->NativeBoundary(list); }
 private:
     std::shared_ptr<BindingProvider> provider_;
 };

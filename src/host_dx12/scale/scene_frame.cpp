@@ -157,14 +157,22 @@ bool SceneFrame::Checkpoint(ID3D12GraphicsCommandList* l,const std::vector<Frame
     UpdateStates(current);
     return Promote(l,false);
 }
+bool SceneFrame::HasPending(ID3D12GraphicsCommandList* list) {
+    const auto recording=std::make_pair(na::observe::IdOf(list),na::observe::ListRecording(list));
+    std::lock_guard<std::mutex> lock(mutex_);const std::pair<uint64_t,uint64_t> legacy{};
+    return std::any_of(promotions_.begin(),promotions_.end(),[&](const auto& x){return x.pending&&(x.pending_recordings.count(recording)||x.pending_recordings.count(legacy));});
+}
 bool SceneFrame::Promote(ID3D12GraphicsCommandList* l,bool final) {
     const na::observe::HostWorkScope host;
     std::lock_guard<std::mutex> lock(mutex_);
     if(finished_||!dirty_)return true;
-    if(!l||!na::observe::ListRasterStateRestorable(l)||!na::nr::native::RetainRecording(l,shared_from_this()))return false;
     const auto recording=std::make_pair(na::observe::IdOf(l),na::observe::ListRecording(l));
+    const std::pair<uint64_t,uint64_t> legacy{};
+    if(!std::any_of(promotions_.begin(),promotions_.end(),[&](const auto& x){return x.pending&&(final||x.pending_recordings.count(recording)||x.pending_recordings.count(legacy));})){
+        finished_=final;return true;
+    }
+    if(!l||!na::observe::ListRasterStateRestorable(l)||!na::nr::native::RetainRecording(l,shared_from_this()))return false;
     for(auto& x:promotions_) {
-        const std::pair<uint64_t,uint64_t> legacy{};
         if(!x.pending||(!final&&!x.pending_recordings.count(legacy)&&!x.pending_recordings.count(recording)))continue;
         if(x.state.native_transfer_only)return false; // owner must mirror/acknowledge its native transfer
         const auto published=[&]{if(final)x.pending_recordings.clear();else{x.pending_recordings.erase(legacy);x.pending_recordings.erase(recording);}x.pending=!x.pending_recordings.empty();};

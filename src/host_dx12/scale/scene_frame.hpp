@@ -46,6 +46,7 @@ public:
     // for the existing J2 insertion, while the native renderer has a current
     // full-size picture even when J2 skips. Only newly written members promote.
     bool Checkpoint(ID3D12GraphicsCommandList*, const std::vector<FrameMemberState>& current);
+    bool HasPending(ID3D12GraphicsCommandList*);
     na::j2::PhysicalLookup Input(std::shared_ptr<const na::j2::PhysicalInput>*);
     void Outcome(na::j2::PhysicalOutcome);
     // Called before the first native consumer, including an unavailable/failed

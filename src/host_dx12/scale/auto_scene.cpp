@@ -120,12 +120,12 @@ public:
     }
     bool checkpoint(ID3D12GraphicsCommandList* list,const std::shared_ptr<Run>& run){
         if(!run||run->aborted)return true;
-        if(!na::observe::ListRasterStateRestorable(list))return false;
+        if(!run->frame->HasPending(list))return true;
         if(!run->frame->Checkpoint(list,states(list,run)))return false;
         ++stats.checkpoints;return true;
     }
     void abort(ID3D12GraphicsCommandList* list,const std::shared_ptr<Run>& run,const char* why){
-        if(run&&!run->aborted){checkpoint(list,run);run->aborted=true;}++stats.misses;note(why);
+        if(run&&!run->aborted){checkpoint(list,run);run->aborted=true;}stats.active=false;++stats.misses;note(why);
     }
     std::shared_ptr<const PreparedBindings> Acquire(ID3D12GraphicsCommandList* list,const na::observe::ShaderCall& call)noexcept override{
         uint64_t d=0,c=0;na::observe::GetLiveSelection(&d,&c);if(!c||!d)return {};
@@ -171,13 +171,20 @@ public:
         NativeOperation op;if(!na::observe::ListNativeOperation(list,call.kind==na::observe::ShaderKind::Dispatch,op))return;
         std::lock_guard<std::mutex> lock(mutex);auto run=run_for(list);if(!run||run->aborted)return;
         for(const auto& rt:op.colors)run->frame->Written(rt.view.resource,list);
-        if(op.depth.view.resource&&!(op.depth.view.dsv.Flags&D3D12_DSV_FLAG_READ_ONLY_DEPTH))run->frame->Written(op.depth.view.resource,list);
+        const bool stencil=op.depth.view.dsv.Format==DXGI_FORMAT_D32_FLOAT_S8X24_UINT||op.depth.view.dsv.Format==DXGI_FORMAT_D24_UNORM_S8_UINT;
+        if(op.depth.view.resource&&(!(op.depth.view.dsv.Flags&D3D12_DSV_FLAG_READ_ONLY_DEPTH)||(stencil&&!(op.depth.view.dsv.Flags&D3D12_DSV_FLAG_READ_ONLY_STENCIL))))
+            run->frame->Written(op.depth.view.resource,list);
         for(const auto& view:op.descriptors)if(view.view.kind==NA_DESC_UAV&&run->built->group->Find(view.view.resource))run->frame->Written(view.view.resource,list);
         run->frame->Ready();++stats.redirected;stats.active=true;
+        char text[192];std::snprintf(text,sizeof text,"Scene rendering at %u x %u; DLSS status is shown below.",run->built->group->Render().width,run->built->group->Render().height);note(text);
     }
     void Closing(ID3D12GraphicsCommandList* list)noexcept override{
         std::lock_guard<std::mutex> lock(mutex);const auto found=bound.find({na::observe::IdOf(list),na::observe::ListRecording(list)});
         if(found!=bound.end()&&!checkpoint(list,found->second.run))abort(list,found->second.run,"A scene list could not publish its full-size dependencies.");
+    }
+    void NativeBoundary(ID3D12GraphicsCommandList* list)noexcept override{
+        std::lock_guard<std::mutex> lock(mutex);const auto found=bound.find({na::observe::IdOf(list),na::observe::ListRecording(list)});
+        if(found!=bound.end())abort(list,found->second.run,"The scene uses an indirect, bundle or render-pass operation; using its current native picture.");
     }
     na::observe::ShaderScope Before(ID3D12GraphicsCommandList* list,const TextureCall& call)noexcept override{
         const auto key=transfer_key(call);na::observe::OperationDescriptor descriptor;
@@ -298,7 +305,7 @@ void PollAutomaticScene(){
     a->stats.out_w=output.width;a->stats.out_h=output.height;a->stats.members=UINT(members.size());a->stats.plans=UINT(a->prepared->bindings.size());a->note("Reduced scene prepared; applying at the next frame boundary.");
 }
 void AutomaticScenePresent(){auto a=automatic();if(!a)return;std::lock_guard<std::mutex> lock(a->mutex);++a->epoch;a->current.reset();
-    if(na::settings::Get().j2_scale_mode.load()==0){a->built.reset();a->stats.active=false;}else if(a->prepared)a->built=a->prepared;}
+    if(na::settings::Get().j2_scale_mode.load()==0){a->built.reset();a->stats.active=false;a->note("Rendering at native resolution.");}else if(a->prepared)a->built=a->prepared;}
 AutomaticSceneStats GetAutomaticSceneStats(){auto a=automatic();if(!a)return {};std::lock_guard<std::mutex> lock(a->mutex);return a->stats;}
 AutomaticSceneSubmission::AutomaticSceneSubmission(ID3D12CommandQueue* queue,UINT count,ID3D12CommandList* const* lists){
     prior_=submission;auto a=automatic();if(!a){submission.reset();return;}

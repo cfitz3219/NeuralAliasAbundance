@@ -9,6 +9,7 @@ struct ShaderDimension {
     uint32_t shader_register = 0, space = 0, offset = 0, bytes = 0, dimension = 0;
     bool integer = false;
     uint32_t visibility = D3D12_SHADER_VISIBILITY_ALL;
+    bool optional = false; // a named size vector's trailing pair may carry inverse size or unrelated padding
 };
 // Exact creation arguments, carried through the existing descriptor-copy shadow.
 // Resource identities remain live-process identities. No game/build profiles.
