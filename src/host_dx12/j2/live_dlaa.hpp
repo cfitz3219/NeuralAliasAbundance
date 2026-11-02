@@ -51,6 +51,19 @@ int DebugView();
 void SetJitter(bool on);     // the overlay's camera-jitter switch (J1), on by default
 bool Jitter();
 
+// P4-4 projection window (no-slider route, 2026-11-02). With [j2] window=1 and a render
+// mode below DLAA, J1 also scales and shifts the camera it already rewrites, so the game
+// draws its whole scene into the top-left render-size corner of its own full-size
+// targets; DLSS reads that corner and writes the full picture back at the DLAA point.
+// Viewports, screen-size constants and every resource stay native. Engages after DLAA
+// has run on 30 frames in a row; disengages on mode 0, a size change or repeated misses.
+void SetProjectionWindow(bool on);
+void SetProjectionWindowScissor(bool on); // [j2] window_scissor: clip scene draws to the corner (GPU cost), default on
+bool ProjectionWindow();
+// Recording-time view for the scissor hook: scene draws (depth target == `depth`) are
+// clipped to the top-left ew x eh corner while engaged. False = leave draws alone.
+bool ProjectionWindowScissor(uint64_t* depth, uint32_t* ew, uint32_t* eh);
+
 // P4-4 (DLSS upscaling, slider route). With no destination J2 runs DLAA as before:
 // DLSS at the scene's size, written back into the scene colour. With a destination,
 // DLSS upscales the scene's active extent (render_w x render_h at the top left of the
@@ -232,6 +245,15 @@ struct Stats {
     uint32_t render_w = 0, render_h = 0, out_w = 0, out_h = 0, jitter_phases = 0;
     uint64_t upscaled_frames = 0, upscale_refused = 0;
     uint64_t physical_evaluated = 0, physical_unavailable = 0, physical_failed = 0; // P4-4 Layer2 override
+    // P4-4 projection window: engaged state, the corner, frames evaluated from it,
+    // windowed frames that presented without DLSS, matrix writes by kind, post-DLAA
+    // lists that bound a windowed camera, engagements and why the last one ended.
+    bool window_engaged = false;
+    uint32_t window_w = 0, window_h = 0;
+    uint64_t window_frames = 0, window_missed = 0, window_engagements = 0;
+    uint64_t window_vp_writes = 0, window_inv_writes = 0, window_proj_writes = 0, window_prev_writes = 0, window_post_lists = 0;
+    uint64_t window_scissored = 0, window_scissor_restored = 0;
+    char window_note[120] = {};
     char upscale_note[160] = {};
     // Shape of the selected resources (reported even when J2 refuses them).
     uint32_t color_sub = 0, color_mips = 0, color_slices = 0, color_samples = 0, depth_slices = 0, depth_samples = 0;

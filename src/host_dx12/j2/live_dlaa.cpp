@@ -13,11 +13,13 @@
 
 #include "core/motion_arbiter_gpu.hpp"
 #include "core/temporal_jitter.hpp"
+#include "core/projection_window.hpp"
 #include "host_dx12/depth_format.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
 #include "host_dx12/nr/native_fg.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/settings.hpp"
+#include "host_dx12/scale/settings_read_hook.hpp"
 #include "providers/camera/camera_tracker.hpp"
 
 #include <windows.h>
@@ -191,13 +193,38 @@ struct State {
         uint8_t proj[64], jproj[64];         // as the game stores it / jittered
         uint32_t phase = 0;
         int layout = 0;                      // 0 row-major, 1 column-major (as the game stores it)
+        // Projection window: the extent the sample was taken at (window or render size),
+        // and the windowed replacements actually written when `windowed`.
+        bool windowed = false;
+        uint32_t ew = 0, eh = 0;
+        uint8_t wvp[2][64], winv[2][64], wproj[64];
+        // The previous frame's camera as the game stored it, and its windowed copy.
+        bool has_prev = false;
+        uint64_t frame = 0;                  // frame this sample was started in
+        uint8_t prev[64], wprev[64];
     } jit;
+    // Projection window engagement (see SetProjectionWindow).
+    struct Window {
+        bool engaged = false;
+        uint64_t engage_frame = 0, last_frame = 0, hold_until = 0;
+        uint32_t w = 0, h = 0, ew = 0, eh = 0;
+        uint64_t drain_until = 0, scissor_from = UINT64_MAX;
+        int mode = 0;
+        uint32_t streak = 0;                 // consecutive presents with DLAA
+        uint32_t recent_frames = 0, recent_missed = 0;
+    } win;
     bool jitter_on = true; // DLAA needs jitter (with the texture mip bias set at start-up)
     Stats stats;
 };
 // Never destroyed: at process exit the observation hooks' own state may already
 // be gone, and releasing D3D12 objects then would call into them.
 State& g = *new State;
+// Projection window, read by the scissor hook on game recording threads (no g.m there).
+std::atomic<bool> g_window_enabled{false};
+std::atomic<bool> g_window_scissor{false};
+std::atomic<bool> g_window_scissor_wanted{true}; // [j2] window_scissor (default on)
+std::atomic<uint64_t> g_window_depth{0};
+std::atomic<uint32_t> g_window_ew{0}, g_window_eh{0};
 // P4-4 upscale target: set by Stage P / tests from any thread, read at recording.
 std::mutex g_up_m;
 UpscaleTarget g_up;
@@ -631,6 +658,31 @@ void store_matrix(const na::camera::Matrix& m, na::camera::Layout layout, uint8_
         }
 }
 
+// Projection window: clip' = W * clip, W mapping NDC x [-1,1] -> [-1, 2sx-1] and
+// y [-1,1] -> [1-2sy, 1] (the top-left sx*w x sy*h pixels, D3D viewport, y up).
+// Same convention as jitter_projection (row-major storage, column vectors, row 3 = w).
+na::camera::Matrix window_of(const na::camera::Matrix& m, double sx, double sy)
+{
+    return neural_alias::window_projection(m, sx, sy);
+}
+bool window_now()
+{
+    return g.win.engaged && g.frame >= g.win.engage_frame && g.win.ew && g.win.eh;
+}
+// J2's own reads see the jittered (unwindowed) camera: windowed bytes the game's blocks
+// now hold are mapped back, so camera search, continuity and tracking are unchanged.
+void unwindow(uint8_t* bytes, size_t n)
+{
+    if (!g.jit.windowed) return;
+    for (size_t o = 0; o + 64 <= n; o += 16)
+        for (int l = 0; l < 2; ++l) {
+            if (!std::memcmp(bytes + o, g.jit.wvp[l], 64)) { std::memcpy(bytes + o, g.jit.jvp[l], 64); break; }
+            if (!std::memcmp(bytes + o, g.jit.winv[l], 64)) { std::memcpy(bytes + o, g.jit.jinv[l], 64); break; }
+            if (l == 0 && g.jit.has_proj && !std::memcmp(bytes + o, g.jit.wproj, 64)) { std::memcpy(bytes + o, g.jit.jproj, 64); break; }
+            if (l == 0 && g.jit.has_prev && !std::memcmp(bytes + o, g.jit.wprev, 64)) { std::memcpy(bytes + o, g.jit.prev, 64); break; }
+        }
+}
+
 // P is this camera's projection when P^-1 * VP is a rigid view (VP = P * V).
 bool is_projection_of(const na::camera::Matrix& p, const na::camera::Matrix& vp)
 {
@@ -702,7 +754,9 @@ bool continues_main_camera(const na::camera::Matrix& m)
 bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& in_bytes, bool slot)
 {
     const size_t n = in_bytes.size();
-    if (g.camera_offset < 0 || static_cast<uint64_t>(g.camera_offset) + 64 > n || !g.rw || !g.rh) return false;
+    const bool windowed = window_now();
+    const uint32_t jw = windowed ? g.win.ew : g.rw, jh = windowed ? g.win.eh : g.rh; // extent the sample is taken at
+    if (g.camera_offset < 0 || static_cast<uint64_t>(g.camera_offset) + 64 > n || !jw || !jh) return false;
     // jitter_batch has normalized this exact buffer range using the write ledger.
     const auto& bytes = in_bytes;
     for (auto layout : {na::camera::Layout::RowMajor, na::camera::Layout::ColumnMajor}) {
@@ -728,14 +782,35 @@ bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& in_byt
             if (slot || !na::camera::Invert(m, inv)) continue;
         }
         remember_main_camera(m);
-        const neural_alias::JitterSample js = neural_alias::temporal_jitter(++g.jit.phase, jitter_phases());
+        const uint32_t phases = windowed ? JitterPhasesFor(jw, g.win.w) : jitter_phases();
+        const neural_alias::JitterSample js = neural_alias::temporal_jitter(++g.jit.phase, phases);
         std::array<double, 16> src{};
         for (int i = 0; i < 16; ++i) src[i] = m[i];
-        const auto jm = neural_alias::jitter_projection(src, js, g.rw, g.rh);
+        const auto jm = neural_alias::jitter_projection(src, js, jw, jh);
         na::camera::Matrix jvp{}, jinv{};
         for (int i = 0; i < 16; ++i) jvp[i] = jm[i];
         if (!na::camera::Invert(jvp, jinv)) return false;
+        const double sx = windowed ? double(jw) / double(g.win.w) : 1.0, sy = windowed ? double(jh) / double(g.win.h) : 1.0;
+        na::camera::Matrix wvp{}, winv{};
+        if (windowed) {
+            wvp = window_of(jvp, sx, sy);
+            if (!na::camera::Invert(wvp, winv)) return false;
+        }
         auto& j = g.jit;
+        // The previous frame's camera bytes (games keep it for their own reprojection):
+        // its windowed copy keeps those passes consistent with this frame's corner.
+        const bool prev_ok = j.frame && j.frame + 1 == g.frame && j.layout == (layout == na::camera::Layout::RowMajor ? 0 : 1);
+        if (prev_ok) std::memcpy(j.prev, j.vp[j.layout], 64);
+        j.has_prev = prev_ok && windowed;
+        if (j.has_prev) {
+            const std::vector<uint8_t> pb(j.prev, j.prev + 64);
+            store_matrix(window_of(na::camera::LoadMatrix(pb, 0, layout), sx, sy), layout, j.wprev);
+            if (!std::memcmp(j.prev, bytes.data() + g.camera_offset, 64)) j.has_prev = false; // a still camera: the current VP
+        }
+        j.frame = g.frame;
+        j.windowed = windowed;
+        j.ew = jw;
+        j.eh = jh;
         j.applied = false;
         j.res = res;
         j.off = off;
@@ -748,6 +823,10 @@ bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& in_byt
             store_matrix(inv, L, j.inv[l]);
             store_matrix(jvp, L, j.jvp[l]);
             store_matrix(jinv, L, j.jinv[l]);
+            if (windowed) {
+                store_matrix(wvp, L, j.wvp[l]);
+                store_matrix(winv, L, j.winv[l]);
+            }
         }
         // Keep the bytes exactly as the game stored them for matching (float round trip).
         std::memcpy(j.vp[j.layout], bytes.data() + g.camera_offset, 64);
@@ -761,11 +840,12 @@ bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& in_byt
             if (is_projection_of(pm, m)) {
                 std::array<double, 16> ps{};
                 for (int i = 0; i < 16; ++i) ps[i] = pm[i];
-                const auto jp = neural_alias::jitter_projection(ps, js, g.rw, g.rh);
+                const auto jp = neural_alias::jitter_projection(ps, js, jw, jh);
                 na::camera::Matrix jpm{};
                 for (int i = 0; i < 16; ++i) jpm[i] = jp[i];
                 std::memcpy(j.proj, bytes.data() + po, 64);
                 store_matrix(jpm, layout, j.jproj);
+                if (windowed) store_matrix(window_of(jpm, sx, sy), layout, j.wproj);
                 j.has_proj = true;
             }
         }
@@ -789,8 +869,11 @@ void jitter_batch(ID3D12CommandList* const* lists, UINT count)
     // Inline NGX parameters are fixed at recording. An earlier submitted camera
     // batch may start the sample; recording then freezes that choice. Never start
     // a new sample at submission after NGX already recorded zero jitter.
+    // An engaged projection window draws every frame into the corner: it keeps jittering
+    // (and windowing) through a frame without DLAA rather than show a full-size frame
+    // on the windowed recordings' clipped targets.
     if (!g.jitter_on || (g.inline_mode && g.inline_sample_locked && !g.jit.valid) ||
-        g.camera_param < 0 || g.camera_offset < 0 || !running || !g.w) return;
+        g.camera_param < 0 || g.camera_offset < 0 || (!running && !window_now()) || !g.w) return;
     struct JB { uint64_t res, off; uint32_t size; bool slot; };
     std::map<std::pair<uint64_t, uint64_t>, JB> blocks;
     for (UINT i = 0; i < count && blocks.size() < 256; ++i) {
@@ -820,7 +903,7 @@ void jitter_batch(ID3D12CommandList* const* lists, UINT count)
             return false;
         };
         if (!g.jit.valid || !holds(g.jit.vp)) {
-            if (g.jit.valid && holds(g.jit.jvp)) continue; // already jittered by an earlier batch of this frame
+            if (g.jit.valid && (holds(g.jit.jvp) || (g.jit.windowed && holds(g.jit.wvp)))) continue; // already written by an earlier batch of this frame
             if (g.jit.valid) { ++g.stats.other_camera_blocks; continue; } // a different matrix (another camera): leave it
             if (!begin_jitter(k->res, k->off, view, k->slot)) continue;
         }
@@ -842,26 +925,38 @@ void jitter_batch(ID3D12CommandList* const* lists, UINT count)
                 if (is_projection_of(pm, vm)) {
                     std::array<double, 16> ps{};
                     for (int i = 0; i < 16; ++i) ps[i] = pm[i];
-                    const auto jp = neural_alias::jitter_projection(ps, neural_alias::JitterSample{g.jit.px[0], g.jit.px[1]}, g.rw, g.rh);
+                    const auto jp = neural_alias::jitter_projection(ps, neural_alias::JitterSample{g.jit.px[0], g.jit.px[1]},
+                                                                    g.jit.ew ? g.jit.ew : g.rw, g.jit.eh ? g.jit.eh : g.rh);
                     na::camera::Matrix jpm{};
                     for (int i = 0; i < 16; ++i) jpm[i] = jp[i];
                     std::memcpy(g.jit.proj, view.data() + po, 64);
                     store_matrix(jpm, L, g.jit.jproj);
+                    if (g.jit.windowed)
+                        store_matrix(window_of(jpm, double(g.jit.ew) / g.win.w, double(g.jit.eh) / g.win.h), L, g.jit.wproj);
                     g.jit.has_proj = true;
                 }
             }
         }
+        const bool w = g.jit.windowed;
         for (size_t o = 0; o + 64 <= n; o += 16)
             for (int l = 0; l < 2; ++l) {
                 const uint8_t* rep = nullptr;
-                if (!std::memcmp(view.data() + o, g.jit.vp[l], 64)) rep = g.jit.jvp[l];
-                else if (!std::memcmp(view.data() + o, g.jit.inv[l], 64)) rep = g.jit.jinv[l];
-                else if (l == 0 && g.jit.has_proj && !std::memcmp(view.data() + o, g.jit.proj, 64)) { rep = g.jit.jproj; ++g.stats.jitter_proj_writes; }
+                int kind = 0; // 1 vp, 2 inverse, 3 projection, 4 previous vp
+                if (!std::memcmp(view.data() + o, g.jit.vp[l], 64)) { rep = w ? g.jit.wvp[l] : g.jit.jvp[l]; kind = 1; }
+                else if (!std::memcmp(view.data() + o, g.jit.inv[l], 64)) { rep = w ? g.jit.winv[l] : g.jit.jinv[l]; kind = 2; }
+                else if (l == 0 && g.jit.has_proj && !std::memcmp(view.data() + o, g.jit.proj, 64)) { rep = w ? g.jit.wproj : g.jit.jproj; kind = 3; ++g.stats.jitter_proj_writes; }
+                else if (l == 0 && w && g.jit.has_prev && !std::memcmp(view.data() + o, g.jit.prev, 64)) { rep = g.jit.wprev; kind = 4; }
                 if (rep && g.jitter_writes.Apply(k->res, k->off + o, view.data() + o, rep, [&] {
                     return na::observe::WriteBuffer(k->res, k->off + o, rep, 64) == 64;
                 })) {
                     ++g.stats.jitter_writes;
-                    if (rep == g.jit.jvp[l]) g.jit.applied = true;
+                    if (kind == 1) g.jit.applied = true;
+                    if (w) {
+                        if (kind == 1) { ++g.stats.window_vp_writes; g.win.last_frame = g.frame; }
+                        else if (kind == 2) ++g.stats.window_inv_writes;
+                        else if (kind == 3) ++g.stats.window_proj_writes;
+                        else ++g.stats.window_prev_writes;
+                    }
                 }
                 if (rep) break;
             }
@@ -882,6 +977,9 @@ void count_post_dlaa(ID3D12CommandList* const* lists, UINT first, UINT count, na
         for (const auto& b : na::observe::ListRootConstantBuffers(lists[i])) {
             if (na::observe::ReadBuffer(b.resource, b.offset + lo, bytes.data(), 64) != 64) continue;
             if (!std::memcmp(bytes.data(), g.jit.jvp[0], 64) || !std::memcmp(bytes.data(), g.jit.jvp[1], 64)) { ++g.stats.post_camera_lists; break; }
+            if (g.jit.windowed && (!std::memcmp(bytes.data(), g.jit.wvp[0], 64) || !std::memcmp(bytes.data(), g.jit.wvp[1], 64))) {
+                ++g.stats.post_camera_lists; ++g.stats.window_post_lists; break; // drawn on the full-size output with the corner camera
+            }
         }
     }
 }
@@ -1022,6 +1120,7 @@ bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth
         s.complete = s.lifetime_valid = true;
         s.sync = na::camera::Sync::AppSyncUnknown;
         s.bytes.assign(bytes.begin(), bytes.begin() + n);
+        unwindow(s.bytes.data(), s.bytes.size());
         return true;
     };
     // 1. The learned slot: every block bound there this frame is a candidate (bounded).
@@ -1331,6 +1430,15 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         if (dest && !state_of(up.dest, dsub_out, &sdest) && !na::observe::KnownSubStateNow(up.dest, dsub_out, &sdest)) refuse_upscale("Waiting: the upscale destination's state is not established.");
     }
     const bool upscaling = dest != nullptr;
+    // Projection window: this frame's scene was drawn into the top-left corner of the
+    // scene colour/depth (J1 wrote the windowed camera). DLSS reads that corner and the
+    // full-size output is written back into the scene colour exactly like DLAA.
+    const bool windowed = !phys && !upscaling && g.jit.windowed && g.jit.frame == g.frame && g.win.last_frame == g.frame &&
+                          g.jit.ew && g.jit.eh && g.jit.ew <= w && g.jit.eh <= h && w == g.win.w && h == g.win.h;
+    if (windowed) {
+        if (color_msaa) { reason("Projection window: MSAA scene colour is not supported."); return false; }
+        rw = g.jit.ew; rh = g.jit.eh; ow = w; oh = h;
+    }
 
     // Camera first (nothing is allocated for a frame that cannot run); the tracker
     // update comes after the size check, because a resize resets the tracker.
@@ -1393,7 +1501,13 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // Astra (COMMS 2026-11-02): J1 jitters the camera with the extent known at that moment
     // (g.rw/g.rh), which a render-scale change only updates below. The frame was rasterised with
     // a clip offset of 2*px/old_extent, i.e. px*new/old pixels at the new extent: rescale it.
-    const uint32_t jit_rw = g.rw, jit_rh = g.rh;
+    const uint32_t jit_rw = g.jit.frame == g.frame && g.jit.ew ? g.jit.ew : g.rw, jit_rh = g.jit.frame == g.frame && g.jit.eh ? g.jit.eh : g.rh;
+    // A projection window changes only the active extent: the working textures keep the
+    // scene's size, so no wait for the GPU (a frame drawn into the corner must not skip).
+    if (g.output && g.color_in && g.w == w && g.h == h && g.ow == ow && g.oh == oh && (g.rw != rw || g.rh != rh) && ow == w && oh == h) {
+        g.rw = rw; g.rh = rh;
+        g.resume_reset = true; // a new extent restarts DLSS history
+    }
     const bool resize = !g.output || !g.color_in || g.w != w || g.h != h || g.color_format != cf ||
                         g.rw != rw || g.rh != rh || g.ow != ow || g.oh != oh ||
                         g.samples != cd.SampleDesc.Count || g.sample_quality != cd.SampleDesc.Quality ||
@@ -1475,7 +1589,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // submitted right before this list; the flow pairs with the frame the camera
     // history pairs with. Any failure leaves this frame camera-only.
     // Flow works on the whole colour at DLAA size; upscaled frames stay camera-only for now.
-    if (flow_ticket && !inl && !color_msaa && !upscaling && na::j2::flow::Enabled()) {
+    if (flow_ticket && !inl && !color_msaa && !upscaling && !windowed && na::j2::flow::Enabled()) {
         na::j2::flow::Source fs;
         fs.color = color.Get();
         fs.subresource = csub;
@@ -1565,7 +1679,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         in.jitter_current_px[1] = static_cast<float>(cam.jitter_px_y);
         // AMD is an in-list dispatch, after this frame's resolved pre-DLAA
         // colour/depth copies. It needs no batch split or external queue wait.
-        if(na::j2::flow::Enabled() && (inl || !flow_ticket || !flow_ticket->valid)){
+        if(na::j2::flow::Enabled() && !windowed && (inl || !flow_ticket || !flow_ticket->valid)){
             na::j2::compute_flow::Frame frame;frame.frame=g.frame;frame.previous=g.submitted_frame;
             frame.generation=g.router.Current().history_generation;frame.slot=g.slot;
             frame.reset=cam.camera_cut || resize || g.resume_reset;frame.hdr=is_float_color(cf);
@@ -1759,6 +1873,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     g.stats.out_h = oh;
     g.stats.jitter_phases = jitter_phases();
     if (upscaling) { ++g.stats.upscaled_frames; g.stats.upscale_note[0] = 0; }
+    if (windowed) ++g.stats.window_frames;
     if (phys) phys_report.result = PhysicalOutcome::Evaluated;
     *out_list = l;
     return true;
@@ -2056,6 +2171,17 @@ bool RecordNisForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID
 }
 void SetDebugView(int mode) { g_debug_view.store(mode < 0 || mode > 3 ? 0 : mode); }
 int DebugView() { return g_debug_view.load(); }
+void SetProjectionWindow(bool on) { g_window_enabled.store(on); }
+void SetProjectionWindowScissor(bool on) { g_window_scissor_wanted.store(on); }
+bool ProjectionWindow() { return g_window_enabled.load(); }
+bool ProjectionWindowScissor(uint64_t* depth, uint32_t* ew, uint32_t* eh)
+{
+    if (!g_window_scissor.load(std::memory_order_acquire)) return false;
+    if (depth) *depth = g_window_depth.load();
+    if (ew) *ew = g_window_ew.load();
+    if (eh) *eh = g_window_eh.load();
+    return true;
+}
 void SetJitter(bool on)
 {
     std::lock_guard<std::mutex> lock(g.m);
@@ -2067,6 +2193,67 @@ bool Jitter()
 {
     std::lock_guard<std::mutex> lock(g.m);
     return g.jitter_on;
+}
+
+// Projection window engagement, once per present under g.m. Game command lists are
+// recorded before the frame they belong to is submitted, so the two switches are ordered:
+// a windowed frame without the scissor only costs more GPU time, while a scissored frame
+// without the window would lose its picture outside the corner. So the scissor starts
+// three frames after windowing starts, and stops three frames before windowing stops.
+void update_window(bool executed)
+{
+    auto& w = g.win;
+    constexpr uint64_t kLag = 3;
+    const auto stop = [&](const char* why, uint64_t hold) {
+        if (!w.engaged || w.drain_until) return;
+        std::snprintf(g.stats.window_note, sizeof g.stats.window_note, "%s", why);
+        w.drain_until = g.frame + kLag; // windowing continues while scissored recordings drain
+        w.hold_until = g.frame + kLag + hold;
+        w.scissor_from = UINT64_MAX;
+    };
+    w.streak = executed ? w.streak + 1 : 0;
+    const int mode = static_cast<int>(na::settings::Get().j2_scale_mode.load());
+    const double f = mode > 0 && mode <= 4 ? na::scale::FractionForMode(mode) : 1.0;
+    const bool wanted = g_window_enabled.load() && f < 1.0 && !g.paused.load() && !g.latched && g.w && g.h && g.jitter_on;
+    if (w.engaged && w.last_frame == g.frame) { // a windowed frame is presenting now
+        ++w.recent_frames;
+        if (!executed) { ++w.recent_missed; ++g.stats.window_missed; }
+        if (w.recent_frames >= 300) w.recent_frames = w.recent_missed = 0;
+        if (w.recent_missed > 10) stop("Stopped: more than 10 of 300 windowed frames presented without DLSS.", 600);
+    }
+    if (w.engaged && w.drain_until && g.frame >= w.drain_until) { w.engaged = false; w.drain_until = 0; }
+    if (!wanted) stop(mode == 0 ? "Render mode DLAA." : "Projection window switched off.", 0);
+    else if (w.engaged && (g.w != w.w || g.h != w.h)) stop("The scene size changed.", 30);
+    else if (w.engaged && !w.drain_until && mode != w.mode) { // live mode change: new corner
+        w.mode = mode;
+        w.ew = (std::max)(1u, static_cast<uint32_t>(std::lround(g.w * f)));
+        w.eh = (std::max)(1u, static_cast<uint32_t>(std::lround(g.h * f)));
+        w.scissor_from = g.frame + kLag; // no scissor until recordings use the new corner
+    } else if (!w.engaged && g.frame >= w.hold_until && w.streak >= 30) {
+        w.engaged = true;
+        w.engage_frame = g.frame + 1;
+        w.scissor_from = w.engage_frame + kLag;
+        w.drain_until = 0;
+        w.mode = mode;
+        w.w = g.w; w.h = g.h;
+        w.ew = (std::max)(1u, static_cast<uint32_t>(std::lround(g.w * f)));
+        w.eh = (std::max)(1u, static_cast<uint32_t>(std::lround(g.h * f)));
+        w.recent_frames = w.recent_missed = 0;
+        ++g.stats.window_engagements;
+        g.stats.window_note[0] = 0;
+    }
+    const bool scissor = w.engaged && !w.drain_until && g.frame + 1 >= w.scissor_from && g_window_scissor_wanted.load();
+    if (scissor) {
+        uint64_t depth = 0, color = 0;
+        na::observe::GetLiveSelection(&depth, &color);
+        g_window_depth.store(depth);
+        g_window_ew.store(w.ew);
+        g_window_eh.store(w.eh);
+        g_window_scissor.store(depth != 0, std::memory_order_release);
+    } else g_window_scissor.store(false, std::memory_order_release);
+    g.stats.window_engaged = w.engaged;
+    g.stats.window_w = w.engaged ? w.ew : 0;
+    g.stats.window_h = w.engaged ? w.eh : 0;
 }
 
 void OnPresent(ID3D12CommandQueue* queue)
@@ -2182,6 +2369,7 @@ void OnPresent(ID3D12CommandQueue* queue)
             }
         }
         g.insertion_frame = {};
+        update_window(g.submitted_frame == g.frame);
         ++g.frame;
         g.jit.valid = false; // J1: the next camera block starts a new jitter sample
         g.inline_sample_locked = false;

@@ -173,6 +173,21 @@ struct ShaderState {
 bool ListShaderState(ID3D12CommandList* list, bool compute, ShaderState& out);
 // First render target and depth currently bound in the recording.
 bool ListCurrentTargets(ID3D12CommandList* list, na_object_id* rt, na_object_id* ds);
+// The game's own scissor rectangles and depth target as last set in this recording
+// (host work is not observed, so a host override never replaces them). False when the
+// recording or its scissors are not known (then leave the list alone).
+struct RasterScissors {
+    uint64_t recording = 0, scissor_serial = 0;
+    na_object_id ds = 0;
+    uint32_t count = 0;
+    struct Rect { int32_t left = 0, top = 0, right = 0, bottom = 0; } rects[16]{}; // D3D12_RECT layout
+};
+bool ListRasterScissors(ID3D12CommandList* list, RasterScissors& out);
+// Called on the recording thread after the game's OMSetRenderTargets / RSSetScissorRects
+// was forwarded and observed, with the list's new state; no observer locks held, inside
+// HostWorkScope (commands it records are host work). Null = none (default).
+using RasterStateListener = void (*)(ID3D12GraphicsCommandList* list, const RasterScissors& state);
+void SetRasterStateListener(RasterStateListener listener);
 // Identity of the list's current recording (changes on every Reset); 0 if unknown.
 uint64_t ListRecording(ID3D12CommandList* list);
 // True when this recording cleared `target` with ClearRenderTargetView.

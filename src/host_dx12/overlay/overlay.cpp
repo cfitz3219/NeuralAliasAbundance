@@ -42,6 +42,7 @@
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 #include "host_dx12/nr/nr_pass.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/j2/projection_window.hpp"
 #include "host_dx12/scale/live_driver.hpp"
 #include "host_dx12/scale/auto_scene.hpp"
 #include "host_dx12/scale/settings_read_hook.hpp"
@@ -713,6 +714,18 @@ void write_status_line()
             static_cast<unsigned long long>(j2.busy), static_cast<unsigned long long>(j2.dlss_failed), static_cast<unsigned long long>(j2.cuts),
             static_cast<unsigned long long>(j2.camera_offset), j2.later_passes, static_cast<unsigned long long>(j2.duplicate_submissions), static_cast<unsigned long long>(j2.jitter_writes), static_cast<unsigned long long>(j2.camera_learned_hits), static_cast<unsigned long long>(j2.camera_scans), static_cast<long long>(j2.camera_inv_delta), static_cast<long long>(j2.camera_proj_delta), static_cast<unsigned long long>(j2.jitter_proj_writes), static_cast<unsigned long long>(j2.jitter_rebased), na::observe::SamplerMipBias(), static_cast<unsigned long long>(mb_s), static_cast<unsigned long long>(mb_st), static_cast<unsigned long long>(j2.post_camera_lists), static_cast<unsigned long long>(j2.post_depth_lists), static_cast<unsigned long long>(j2.other_camera_blocks), j2.depth_reversed ? 1u : 0u, dlss.feature_preset, na::settings::Get().j2_sharpness.load(), static_cast<unsigned long long>(j2.nis_frames), j2.scene_batches, j2.scene_batches_max, j2.scene_batches_target, static_cast<unsigned long long>(j2.waited_batches), static_cast<unsigned long long>(j2.post_scene_batches), j2.inline_mode, j2.inline_target, static_cast<unsigned long long>(j2.inline_candidates), static_cast<unsigned long long>(j2.inline_waited), static_cast<unsigned long long>(j2.inline_recorded), static_cast<unsigned long long>(j2.inline_frames), static_cast<unsigned long long>(j2.inline_refused), j2.color_sub, j2.color_mips, j2.color_slices, j2.color_samples, j2.depth_slices, j2.depth_samples, j2.width, j2.height, j2.color_format, j2.reason);
         if (jn > 0) WriteFile(f, jl, static_cast<DWORD>((std::min)(jn, static_cast<int>(sizeof(jl) - 1))), &written, nullptr);
+        if (na::j2::ProjectionWindow()) {
+            char wl[700];
+            const int wn = snprintf(wl, sizeof wl,
+                "j2_window engaged=%u corner=%ux%u mode=%u frames=%llu missed=%llu engagements=%llu render=%ux%u out=%ux%u writes{vp=%llu inv=%llu proj=%llu prev=%llu} post_lists=%llu scissored=%llu restored=%llu note=\"%s\"\r\n",
+                j2.window_engaged ? 1u : 0u, j2.window_w, j2.window_h, na::settings::Get().j2_scale_mode.load(),
+                (unsigned long long)j2.window_frames, (unsigned long long)j2.window_missed, (unsigned long long)j2.window_engagements,
+                j2.render_w, j2.render_h, j2.out_w, j2.out_h,
+                (unsigned long long)j2.window_vp_writes, (unsigned long long)j2.window_inv_writes, (unsigned long long)j2.window_proj_writes,
+                (unsigned long long)j2.window_prev_writes, (unsigned long long)j2.window_post_lists,
+                (unsigned long long)na::j2::ProjectionWindowScissored(), (unsigned long long)na::j2::ProjectionWindowScissorRestored(), j2.window_note);
+            if (wn > 0) WriteFile(f, wl, DWORD((std::min)(wn, int(sizeof wl - 1))), &written, nullptr);
+        }
         {
             const auto automatic=na::scale::GetAutomaticSceneStats();
             if(automatic.enabled){char automatic_line[1400];const int automatic_bytes=snprintf(automatic_line,sizeof automatic_line,

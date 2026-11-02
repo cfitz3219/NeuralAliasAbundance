@@ -2516,6 +2516,16 @@ struct On<sl::list::ResolveSubresource> {
         note_uses(l, {d, s});
     }
 };
+std::atomic<RasterStateListener> g_raster_listener{nullptr};
+void notify_raster_state(GL* l)
+{
+    const auto listener = g_raster_listener.load(std::memory_order_acquire);
+    if (!listener) return;
+    RasterScissors s;
+    if (!ListRasterScissors(l, s)) return;
+    HostWorkScope own;
+    listener(l, s);
+}
 template <>
 struct On<sl::list::RSSetViewports> {
     static void run(GL* l, UINT n, const D3D12_VIEWPORT* v)
@@ -2557,6 +2567,7 @@ struct On<sl::list::RSSetScissorRects> {
                 if (n) std::copy_n(rc, n, ls.raster_scissors);
             }
         });
+        notify_raster_state(l);
         if (!n || !rc) return;
         const auto pack = [](LONG a, LONG b) { return static_cast<uint64_t>(static_cast<uint32_t>(a)) | (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32); };
         constexpr UINT kMax = D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
@@ -2922,6 +2933,7 @@ struct On<sl::list::OMSetRenderTargets> {
             std::lock_guard<std::mutex> bl(ls.bind_m);
             set_targets_locked(ls, refs, m, dsv != nullptr);
         });
+        notify_raster_state(l);
     }
 };
 template <>
@@ -5092,6 +5104,23 @@ bool ListCurrentTargets(ID3D12CommandList* list, na_object_id* rt, na_object_id*
     std::lock_guard<std::mutex> bl(ls->bind_m);
     if (rt) *rt = ls->cur_rt;
     if (ds) *ds = ls->cur_ds;
+    return true;
+}
+void SetRasterStateListener(RasterStateListener listener) { g_raster_listener.store(listener, std::memory_order_release); }
+bool ListRasterScissors(ID3D12CommandList* list, RasterScissors& out)
+{
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load() || !ls->generation_known.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    if (!ls->raster_scissors_known || ls->in_render_pass) return false;
+    out.recording = ls->generation.load() + 1;
+    out.scissor_serial = ls->scissor_serial;
+    out.ds = ls->cur_ds;
+    out.count = ls->raster_scissor_count < 16 ? ls->raster_scissor_count : 16;
+    static_assert(sizeof(RasterScissors::Rect) == sizeof(D3D12_RECT), "D3D12_RECT layout");
+    std::memcpy(out.rects, ls->raster_scissors, out.count * sizeof(D3D12_RECT));
     return true;
 }
 uint64_t ListRecording(ID3D12CommandList* list)

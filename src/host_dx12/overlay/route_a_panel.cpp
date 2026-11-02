@@ -928,13 +928,13 @@ void DrawLiveDlaa()
     if (Switch("j2", &on)) na::j2::SetPaused(!on);
     EndRow();
     Hint("For sharpest results and best FPS, set Anti-Aliasing to Off in the game's video settings.");
-    if (na::scale::SliderRouteActive()||na::scale::GetAutomaticSceneStats().enabled) {
+    if (na::scale::SliderRouteActive()||na::scale::GetAutomaticSceneStats().enabled||na::j2::ProjectionWindow()) {
         // P4-4 slider route: the mode sets the game's own render scale (read at start-up; live
         // when the game allows it). The game's own Render Scale slider is left to the user.
         na::settings::Settings& ss = na::settings::Get();
         int mode = static_cast<int>(ss.j2_scale_mode.load());
         if (mode < 0 || mode > 4) mode = 0;
-        BeginRow("Render mode", na::scale::GetAutomaticSceneStats().enabled
+        BeginRow("Render mode", na::scale::GetAutomaticSceneStats().enabled||na::j2::ProjectionWindow()
             ? "DLAA uses full resolution. Quality, Balanced, Performance and Ultra Performance render the scene smaller for more FPS. Menus and the HUD keep their normal size. Changes apply while you play."
             : "DLAA draws the game at full resolution. Quality, Balanced, Performance and Ultra Performance draw it smaller for more FPS (67%, 58%, 50%, 33%). NeuralAlias sets the game's Render Scale for you; leave the game's own slider at 100%.", S(220));
         ImGui::SetNextItemWidth(S(220));
@@ -944,7 +944,12 @@ void DrawLiveDlaa()
             if(na::scale::SliderRouteActive())na::scale::RequestMode(mode);
         }
         EndRow();
-          if(na::scale::GetAutomaticSceneStats().enabled){const auto automatic=na::scale::GetAutomaticSceneStats();
+          if(na::j2::ProjectionWindow()){const auto j2=na::j2::GetStats();
+              char note[200];
+              if(j2.window_engaged)std::snprintf(note,sizeof note,"Rendering the scene at %ux%u, DLSS to full size.",j2.window_w,j2.window_h);
+              else std::snprintf(note,sizeof note,"%s",j2.window_note[0]?j2.window_note:(mode?"Starting once DLAA is running steadily.":"Rendering at full resolution."));
+              StatusLine(j2.window_engaged?1:0,note);}
+          else if(na::scale::GetAutomaticSceneStats().enabled){const auto automatic=na::scale::GetAutomaticSceneStats();
               StatusLine(automatic.active?1:0,automatic.reason);}
           else StatusLine(0, na::scale::GetDriverStats().state);
     }
