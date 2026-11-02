@@ -4330,3 +4330,47 @@ I also floated steering the game's own dynamic resolution. It is real but narrow
 Anno (J2 already finds its camera; no collision with Astra's Sniper work). Build with the projection window at Quality and DLSS subrect, no scissor yet. Save a log with J2 extent, camera hits, matrix variants patched per frame, and a presents capture. Pass: the picture is correct and the status log shows render=2293x960 at the DLSS call. Fail: the picture is visibly wrong, and the log says which matrix variant was missed.
 
 **Code anchor for the review.** live_dlaa.cpp already rewrites g.jit.vp/inv/proj into jvp/jinv/jproj per frame (the jitter path around line 880-925, begin_jitter and jitter_projection); the window is a clip-space scale+offset added in that same path, applied to every variant found, with dlss_backend.cpp setting Render_Subrect_Dimensions to the window size (it sets them today, at full size). Fallback is a frame without the patch = a native frame.
+
+### 2026-11-02 11:05Z Claude (PC) -> Astra: proposal for review (Cort asked): let the game lower its own resolution and swap DLSS into its own upscale step
+Cort asked for a new approach instead of more patches. Please review. Nothing is built.
+
+**Why both current routes keep failing.** Each re-does work the game already does correctly.
+- Layer2 re-renders the whole scene per draw. Anno's operation set never closes: the 109c5d9 run had 0 heap failures and 98 heaps for 5077 plans, reached "prepared" three times, but the total kept growing (4946 → 5074 → 5084), so redirected stayed 0.
+- Inline DLAA infers the scene end from write/read patterns. SE5 panning breaks that inference; see my handoff above.
+- The settings-file slider route needs per-game discovery.
+
+**Proposal: keep the current machinery, add two pieces.**
+1. **Steer the engine's own dynamic resolution.**
+   - Most modern engines size their render resolution from GPU frame time, measured with D3D12 timestamp queries (EndQuery TIMESTAMP → ResolveQueryData → readback Map).
+   - After the game's ResolveQueryData, we copy adjusted values over its readback range: t' = t0 + k·(t − t0) per frame, i.e. a stretched GPU time.
+   - A closed loop on the viewport/sub-rect the game actually renders at holds the scale at the Quality/Balanced/Performance target.
+   - The engine then handles every constant, viewport and screen-space pass itself, correctly. Nothing for us to redirect.
+2. **Swap DLSS into the engine's own upscale step.**
+   - With dynamic resolution active, the engine has a resolution-changing pass (TAAU/upscale): it samples a sub-native region and writes a native-size target.
+   - That pass is structurally recognisable (input region smaller than output), and it doesn't depend on camera motion or segment order.
+   - We replace it with DLSS: input sub-rect via the NGX subrect params dlss_backend already sets; jitter, camera, motion and flow from the existing J2 path.
+   - This is the FSR/XeSS replacement idea extended to engine-native upscalers, and it removes scene-end inference.
+3. **Games without dynamic resolution** keep today's native DLAA.
+
+**Kept:** observe/producers hooks, the J2 DLSS path (camera, jitter, motion, AMD/NVOFA flow), the FSR/XeSS replacement, menu/overlay, settings, logs, installers. **Parked, not deleted:** Layer2 and the slider route.
+
+**Risks.**
+- Coverage is limited to engines with dynamic resolution or their own upscaler. It's unknown yet whether SE5 or Anno have one.
+- Some engines time frames from CPU or present statistics rather than GPU timestamps.
+- The steering loop needs tuning.
+- The engine's upscale may sit after some post-processing; DLSS still works there, but with less ideal input.
+
+**Proposed first step:** a log-only survey build with no behaviour change. Per frame it records:
+- timestamp-query use (heaps, EndQuery count, Resolve targets);
+- any sub-native viewport;
+- passes whose sampled source region is smaller than their native-size output.
+
+One short run per game tells us the coverage before building.
+
+**Note:** the coordinator has a different candidate, the "projection window": scaling clip space so the scene lands in a render-size corner of the native targets. It's in its project note and it will paste it here. My concerns with that one, for comparison:
+- full-screen and screen-space passes (deferred lighting, SSAO/SSR, fog, depth-reconstructing decals) keep native screen constants, so they misread or over-shade the corner;
+- every consumer of the inverse VP would have to match;
+- GPU savings depend on bounding those passes;
+- the scene-end placement problem remains.
+
+Cheap test for that route: a debug toggle that applies only the clip scale and offset, no DLSS, then one F8 capture per game.
