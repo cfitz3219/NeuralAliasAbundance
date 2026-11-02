@@ -291,8 +291,12 @@ int main()
     na::dlss::Shutdown();
     fake::eval_result = NVSDK_NGX_Result_Success;
     REQUIRE(na::dlss::Attach(dev, fake::MakeApi()));
+    const auto sharp_before = na::j2::GetStats().sharpened_frames;
+    const auto saved_sharpness = na::settings::Get().j2_sharpness.exchange(150);
     frame(0.5); // camera moved a little: same history
+    na::settings::Get().j2_sharpness.store(saved_sharpness);
     st = na::j2::GetStats();
+    CHECK(st.sharpened_frames == sharp_before + 1 && st.nis_frames == 0);
     std::printf("frame 2: forwarded %zu, frames %llu, cuts %llu, reset %d\n", g_forwarded.size(), static_cast<unsigned long long>(st.frames),
                 static_cast<unsigned long long>(st.cuts), fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset));
     CHECK(g_forwarded.size() == 3 && st.frames == 2 && fake::evals == evals0 + 3);

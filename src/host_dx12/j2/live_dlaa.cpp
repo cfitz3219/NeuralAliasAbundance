@@ -403,12 +403,14 @@ bool debug_record(ID3D12GraphicsCommandList* l, int mode, DXGI_FORMAT out_format
 
 // ---- Sharpening: RCAS (Robust Contrast-Adaptive Sharpening) ------------------
 // AMD FidelityFX Super Resolution 1 "RCAS" (ffx_fsr1.h, MIT licence, (c) Advanced
-// Micro Devices): a 5-tap cross whose sharpening lobe is limited so the result
-// never leaves the local min/max (no ringing / halos), with its noise detection
+// Micro Devices): a 5-tap cross with contrast-dependent clipping limiters
+// (not a guarantee against edge halos), with its noise detection
 // (FSR_RCAS_DENOISE) so flat noisy areas are not amplified. Runs on the DLAA
 // result before the game's tonemap and HUD, in a Reinhard-compressed copy of the
 // HDR values (RCAS expects 0..1), expanded back afterwards. Slider 1..100 maps to
-// RCAS sharpness 2..0 stops (100 = strongest); 0 skips the pass entirely.
+// RCAS sharpness 2..0 stops; 0 skips the pass entirely. NeuralAlias's 101..150
+// extension raises only the global lobe ceiling from 3/16 to 13/64. Contrast
+// limiters and noise attenuation remain; 1+4*lobe stays >=3/16. No second filter.
 struct RcasPass {
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> pso;
@@ -419,8 +421,7 @@ struct RcasPass {
 constexpr char kRcasHlsl[] = R"(
 Texture2D<float4> t_in : register(t0);
 RWTexture2D<float4> u_out : register(u0);
-cbuffer C : register(b0) { float con; uint w; uint h; uint pad; };
-#define RCAS_LIMIT (0.25 - (1.0 / 16.0))
+cbuffer C : register(b0) { float con; uint w; uint h; float lobeLimit; };
 float3 fwd(float3 x) { x = max(x, 0.0); return x / (1.0 + x); }
 float3 inv(float3 t) { t = min(t, 0.99990); return t / (1.0 - t); }
 float3 tap(int2 p) { p = clamp(p, int2(0, 0), int2(w - 1, h - 1)); return fwd(t_in[p].rgb); }
@@ -447,7 +448,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     float3 hitMin = min(mn4, e) / max(4.0 * mx4, 1e-6);
     float3 hitMax = (peakC.x - max(mx4, e)) / (4.0 * mn4 + peakC.y);
     float3 lobeRGB = max(-hitMin, hitMax);
-    float lobe = max(-RCAS_LIMIT, min(max3(lobeRGB.r, lobeRGB.g, lobeRGB.b), 0.0)) * con;
+    float lobe = max(-lobeLimit, min(max3(lobeRGB.r, lobeRGB.g, lobeRGB.b), 0.0)) * con;
     lobe *= nz;
     float rcpL = 1.0 / (4.0 * lobe + 1.0);
     float3 o = (lobe * b + lobe * d + lobe * hh + lobe * f + e) * rcpL;
@@ -514,13 +515,16 @@ bool rcas_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Resou
     l->SetComputeRootDescriptorTable(0, gh);
     const float stops = 2.0f * (1.0f - static_cast<float>(percent > 100 ? 100 : percent) / 100.0f);
     const float con = std::exp2(-stops);
+    const float extra = percent > 100 ? float((std::min)(percent, 150u) - 100u) / 100.0f : 0.0f;
+    const float limit = 3.0f / 16.0f + extra / 32.0f;
     uint32_t k[4] = {0, w, h, 0};
     std::memcpy(&k[0], &con, 4);
+    std::memcpy(&k[3], &limit, 4);
     l->SetComputeRoot32BitConstants(1, 4, k, 0);
     l->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
     return true;
 }
-// 101..200 %: NVIDIA Image Scaling sharpen-only on top of full-strength RCAS.
+// Retained for the standalone NIS test helper; the live slider uses RCAS only.
 na::j2::NisSharpen g_nis;
 bool rcas_record(ID3D12GraphicsCommandList* l, uint32_t percent, DXGI_FORMAT fmt)
 {
@@ -1644,28 +1648,10 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             debug_record(l, dv, cf); // replaces the DLAA result with the debug picture
         } else if (const uint32_t pct = na::settings::Get().j2_sharpness.load(std::memory_order_relaxed)) {
             // RCAS: output -> sharp, then back into output so the write-back path is unchanged.
-            // Above 100 %, NIS sharpens sharp -> output instead of the copy.
             b.push_back(uav_barrier(g.output.Get()));
             add(b, g.output.Get(), UAV, NPSR);
             flush(l, b);
-            if (pct > 100 && rcas_record(l, 100, cf)) {
-                b.push_back(uav_barrier(g.sharp.Get()));
-                add(b, g.sharp.Get(), UAV, NPSR);
-                add(b, g.output.Get(), NPSR, UAV);
-                flush(l, b);
-                if (g_nis.Dispatch(g.device.Get(), l, g.sharp.Get(), g.output.Get(), g.ow, g.oh, cf, is_float_color(cf), pct, g.slot)) {
-                    ++g.stats.nis_frames;
-                    add(b, g.sharp.Get(), NPSR, UAV);
-                } else { // NIS unavailable: keep the RCAS result
-                    add(b, g.output.Get(), UAV, DST);
-                    add(b, g.sharp.Get(), NPSR, SRC);
-                    flush(l, b);
-                    l->CopyResource(g.output.Get(), g.sharp.Get());
-                    add(b, g.output.Get(), DST, UAV);
-                    add(b, g.sharp.Get(), SRC, UAV);
-                }
-                ++g.stats.sharpened_frames;
-            } else if (pct <= 100 && rcas_record(l, pct, cf)) {
+            if (rcas_record(l, pct, cf)) {
                 b.push_back(uav_barrier(g.sharp.Get()));
                 add(b, g.sharp.Get(), UAV, SRC);
                 add(b, g.output.Get(), NPSR, DST);
