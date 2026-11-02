@@ -789,6 +789,12 @@ void write_status_line()
                 (unsigned long long)(GetTickCount64() / 100 % 100000000), j2.recent_cuts);
             if (cn2 > 0) WriteFile(f, cl2, static_cast<DWORD>((std::min)(cn2, static_cast<int>(sizeof(cl2) - 1))), &written, nullptr);
         }
+        {   // Frames whose DLAA ran before the last scene draw (SE5 pan-only flicker): placement + late writer.
+            char ll[1000];
+            const int ln = snprintf(ll, sizeof ll, "j2_late frames=%llu now=%llu recent=%s\r\n", (unsigned long long)j2.late_frames,
+                (unsigned long long)(GetTickCount64() / 100 % 100000000), j2.late_detail);
+            if (ln > 0) WriteFile(f, ll, static_cast<DWORD>((std::min)(ln, static_cast<int>(sizeof(ll) - 1))), &written, nullptr);
+        }
         {   // Why carried resource states are lost (SE5 depth no_state: ambiguous_queue_order).
             const auto ps = na::observe::GetProducerStats();
             char ol[192];

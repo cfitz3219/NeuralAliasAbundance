@@ -222,6 +222,10 @@ struct Stats {
     uint64_t expired_inline = 0;         // inline recordings never submitted within two frames (released)
     uint64_t between_observed = 0, between_predicted = 0; // between-list placements before an observed reader / after a predicted last scene list
     char class_note[200] = {};            // latest consumer class not accepted (explains a missed frame)
+    // SE5 2026-11-02 (Cort: flicker only while panning): every frame whose DLAA ran and was then
+    // followed by more scene drawing, newest first: what placed it and what drew after it.
+    uint64_t late_frames = 0;
+    char late_detail[900] = {};
     bool depth_reversed = false;  // reverse-Z as classified from the camera    // other render targets bound after the scene in the same list (insertion may be late)
     uint32_t width = 0, height = 0, color_format = 0;
     // P4-4: the last evaluated frame's active render extent and output size (equal = DLAA),

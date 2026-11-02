@@ -153,6 +153,13 @@ struct State {
     na::j2::ClassKey fired_class;
     uint64_t fired_producer = 0;
     uint64_t fired_context = 0;
+    uint32_t fired_mode = 0;                    // 1 class, 2 pair, 3 barrier, 4 boundary matcher, 5 between-list reader
+    bool fired_barrier_event = false;           // the placement was judged at a barrier event
+    // First scene write after this frame's DLAA (the late writer): pipeline, depth bound, where
+    // (1 same list after our insertion, 2 a later list of the same batch, 3 a later batch).
+    uint64_t late_frame = 0, late_pso = 0;
+    uint32_t late_where = 0, late_writes = 0;
+    bool late_depth = false;
     uint64_t route_prev_late_class = 0;
     uint64_t route_prev_external = 0; // the game's own upscaler evaluations so far (NGX + FSR + XeSS)
     uint32_t frame_rejects = 0;       // inline trigger rejections in the current frame
@@ -1149,6 +1156,39 @@ na::motion::Mat4 to_mat4(const na::camera::Matrix& m)
 // inl: record INTO this game command list (inline insertion, during the game's
 // recording) instead of J2's own list; *touched reports whether anything was
 // recorded into it (the caller then restores the game's state).
+// SE5 late-scene diagnostic (Cort 2026-11-02: flicker only while panning). Records the first
+// scene write after this frame's DLAA; note_late_frame logs it with what placed the DLAA.
+void note_late_writer(ID3D12CommandList* list, uint64_t color, uint32_t skip_writes, uint32_t where, uint32_t writes)
+{
+    if (g.late_frame == g.frame) { g.late_writes += writes; return; }
+    g.late_frame = g.frame; g.late_where = where; g.late_writes = writes; g.late_pso = 0; g.late_depth = false;
+    std::vector<na::j2::ColorEvent> events;
+    if (!list || !na::observe::ListColorEvents(list, color, events)) return;
+    uint32_t seen = 0;
+    for (const auto& e : events) {
+        if (!e.write) continue;
+        if (seen++ < skip_writes) continue;
+        g.late_pso = e.producer; g.late_depth = e.with_depth; return;
+    }
+}
+void note_late_frame()
+{
+    static const char* const kMode[] = {"none", "class", "pair", "barrier", "boundary", "between"};
+    static const char* const kWhere[] = {"?", "same_list", "later_list", "later_batch"};
+    char one[200];
+    const bool have = g.late_frame == g.frame;
+    std::snprintf(one, sizeof one, "%llu:%s%s/op=%u/prod=%llu/ctx=%llu->late{%s pso=%llu depth=%u writes=%u} ",
+        static_cast<unsigned long long>(GetTickCount64() / 100 % 100000000), kMode[g.fired_mode < 6 ? g.fired_mode : 0],
+        g.fired_barrier_event ? "@barrier" : "", static_cast<unsigned>(g.fired_class.op),
+        (unsigned long long)g.fired_producer, (unsigned long long)g.fired_context,
+        have ? kWhere[g.late_where < 4 ? g.late_where : 0] : "?", have ? (unsigned long long)g.late_pso : 0ull,
+        have && g.late_depth ? 1u : 0u, have ? g.late_writes : 0u);
+    char merged[sizeof g.stats.late_detail];
+    std::snprintf(merged, sizeof merged, "%s%s", one, g.stats.late_detail); // newest first, keep what fits
+    std::memcpy(g.stats.late_detail, merged, sizeof merged);
+    ++g.stats.late_frames;
+}
+
 bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, na_object_id color_id,
             ID3D12GraphicsCommandList** out_list, PendingHistory& pending, ID3D12GraphicsCommandList* inl = nullptr,
             bool* touched = nullptr, const SceneInput* saved = nullptr, UINT prefix = 0,
@@ -1942,6 +1982,8 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     // Remember what placed this frame's DLAA, so a later scene write demotes exactly that
     // pattern/class - including a boundary-matcher placement at a barrier.
     g.class_fired = by_class || fired_at_barrier;
+    g.fired_mode = matched_mode;
+    g.fired_barrier_event = fired_at_barrier;
     g.fired_class = live_class;
     g.fired_producer = live_producer;
     g.fired_context = live_context;
@@ -1972,6 +2014,8 @@ int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
                 if ((verdict == V::Accepted || verdict == V::AcceptedWithProducer) &&
                     record(lists, 0, depth, color, ours, pending, nullptr, nullptr, &saved, i)) {
                     g.class_fired = true;
+                    g.fired_mode = 5;
+                    g.fired_barrier_event = false;
                     g.fired_class = cls;
                     g.fired_producer = saved.producer;
                     g.fired_context = 0;
@@ -2154,6 +2198,7 @@ void OnPresent(ID3D12CommandQueue* queue)
             } else if (!g.frame_seq.empty()) {
                 ++g.stats.unlabelled_frames;
             }
+            if (g.submitted_frame == g.frame && g.stats.inline_late_writes + g.stats.post_scene_batches > g.route_prev_late_class) note_late_frame();
             // A class-triggered DLAA followed by more scene content: demote that class now.
             if (g.class_fired && g.submitted_frame == g.frame && g.stats.inline_late_writes + g.stats.post_scene_batches > g.route_prev_late_class) {
                 // The route tolerates an isolated misplacement; the pattern that caused it
@@ -2164,6 +2209,8 @@ void OnPresent(ID3D12CommandQueue* queue)
             }
             g.route_prev_late_class = g.stats.inline_late_writes + g.stats.post_scene_batches;
             g.class_fired = false;
+            g.fired_mode = 0;
+            g.fired_barrier_event = false;
             g.frame_seq.clear();
             g.frame_seq_complete = true;
             na::observe::ResetDerived();
@@ -2320,9 +2367,9 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
             if (!lists[i]) continue;
             const auto d = na::observe::ListInsertionDecision(lists[i], selected_color);
             if (g.inl.valid && lists[i] == g.inl.list && na::observe::ListRecording(lists[i]) == g.inl.rec) {
-                if (d.writes > g.inl.writes) g.stats.inline_late_writes += d.writes - g.inl.writes;
+                if (d.writes > g.inl.writes) { g.stats.inline_late_writes += d.writes - g.inl.writes; note_late_writer(lists[i], selected_color, g.inl.writes, 1, d.writes - g.inl.writes); }
                 after = true;
-            } else if (after) g.stats.inline_late_writes += d.writes;
+            } else if (after) { g.stats.inline_late_writes += d.writes; if (d.writes) note_late_writer(lists[i], selected_color, 0, 2, d.writes); }
         }
         // Inline mode: no J2 list is inserted; DLAA is already inside the game's list.
         // Its history is committed when that list is actually submitted.
@@ -2416,7 +2463,11 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
                     if (na::observe::ListClearsTarget(lists[i], csel)) restarts = true;
                 }
             }
-            if (scene_here && !restarts) { ++g.scene_batches_cur; ++g.stats.post_scene_batches; }
+            if (scene_here && !restarts) {
+                ++g.scene_batches_cur; ++g.stats.post_scene_batches;
+                for (UINT i = 0; i < count; ++i)
+                    if (lists[i] && na::observe::ListRendersTo(lists[i], csel, dsel)) { note_late_writer(lists[i], csel, 0, 3, 1); break; }
+            }
         }
         lock.unlock();
         forward(queue, count, lists);
