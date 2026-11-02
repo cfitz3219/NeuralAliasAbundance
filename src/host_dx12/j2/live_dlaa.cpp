@@ -105,6 +105,16 @@ struct State {
     uint64_t cam_f0 = 0, cam_f1 = 0;       // their frames (0 = none)
     bool cam_rev = false;
     uint32_t cam_held_run = 0;             // consecutive frames on a predicted camera
+    // SE5 main menu (Cort 2026-11-02): the depth's state at the scene end was unknown on ~1/4
+    // of frames (the state store reset: ambiguous_queue_order). The same scene end reports
+    // the same depth state frame after frame; once it has been the same on kDepthLearnFrames
+    // known frames in a row, a frame whose lookup fails but whose scene list did render into
+    // that depth uses it, instead of showing the raw frame.
+    uint32_t depth_learned_state = 0;
+    uint32_t depth_learned_sub = 0xFFFFFFFFu;
+    na_object_id depth_learned_id = 0;
+    uint32_t depth_learned_streak = 0;
+    uint64_t depth_learned_frame = 0; // last frame the state was known
     uint64_t frame = 1;             // game Present interval, not Execute attempt
     uint64_t submitted_frame = 0;   // last interval that actually submitted DLAA
     // Games may draw the scene across several submissions per frame (Sniper Elite
@@ -1219,7 +1229,25 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     };
     // Layer2 companions are private textures, not observed: their exact states come with them.
     const bool have_sc = phys ? (sc = phys->color_state, true) : state_of(color_id, csub, &sc);
-    const bool have_sd = phys ? (sd = phys->depth_state, true) : state_of(depth_id, dsub, &sd);
+    bool have_sd = phys ? (sd = phys->depth_state, true) : state_of(depth_id, dsub, &sd);
+    if (!phys && !saved) {
+        constexpr uint32_t kDepthLearnFrames = 30;
+        constexpr uint64_t kDepthLearnMaxAge = 300;
+        const bool same_target = g.depth_learned_id == depth_id && g.depth_learned_sub == dsub;
+        if (have_sd) {
+            if (g.depth_learned_frame != g.frame) { // once per frame
+                if (same_target && g.depth_learned_state == sd) ++g.depth_learned_streak;
+                else { g.depth_learned_streak = 1; g.depth_learned_state = sd; g.depth_learned_id = depth_id; g.depth_learned_sub = dsub; }
+                g.depth_learned_frame = g.frame;
+            }
+        } else if (have_sc && same_target && g.depth_learned_streak >= kDepthLearnFrames &&
+                   g.frame - g.depth_learned_frame <= kDepthLearnMaxAge &&
+                   na::observe::ListRendersTo(inl ? inl : lists[scene], color_id, depth_id)) {
+            sd = g.depth_learned_state;
+            have_sd = true;
+            ++g.stats.depth_state_assumed;
+        }
+    }
     if (!have_sc || !have_sd) {
         ++g.stats.no_state;
         if (!have_sc) ++g.stats.no_state_color; else ++g.stats.no_state_depth;
@@ -1305,7 +1333,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (!found) {
         // A camera read within the last frame or two: predict this frame's (unjittered,
         // so no jitter is claimed for it) rather than leave the game's raw picture showing.
-        constexpr uint32_t kMaxHeldFrames = 2;
+        constexpr uint32_t kMaxHeldFrames = 4; // == kMaxGapFrames: the tracker keeps history this long
         const bool fresh = g.cam_f1 && g.frame > g.cam_f1 && g.frame - g.cam_f1 <= kMaxHeldFrames && g.cam_held_run < kMaxHeldFrames;
         if (fresh && !g.resume_reset) {
             const bool velocity = g.cam_f0 && g.cam_f1 == g.cam_f0 + 1 && g.frame == g.cam_f1 + 1;
@@ -2477,6 +2505,7 @@ void Shutdown()
     g.arbiter_ok = false;
     g.tracker.Reset();
     g.cam_f0 = g.cam_f1 = 0; g.cam_held_run = 0;
+    g.depth_learned_streak = 0; g.depth_learned_frame = 0; g.depth_learned_id = 0; g.depth_learned_sub = 0xFFFFFFFFu;
     g.frame = 1;
     g.submitted_frame = 0;
     g.scene_batches_cur = g.scene_batches_target = 0;
