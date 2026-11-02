@@ -2,14 +2,18 @@
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/nr/native_fg.hpp"
 #include <algorithm>
+#include <cstdio>
 namespace na::scale {
-bool ShaderDescriptorArena::Allocate(ID3D12Device* device,UINT count,Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>& heap,UINT& first){
-    if(!device||!count||count>4096)return false;const na::observe::HostWorkScope host;std::lock_guard<std::mutex> lock(mutex_);
-    if(blocks_.empty()||count>blocks_.back().capacity-blocks_.back().used){
+bool ShaderDescriptorArena::Allocate(ID3D12Device* device,UINT count,Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>& heap,UINT& first,std::string* error){
+    if(!device||!count||count>4096){if(error)*error="Invalid private descriptor allocation size.";return false;}
+    const na::observe::HostWorkScope host;std::lock_guard<std::mutex> lock(mutex_);
+    if(!current_.heap||count>current_.capacity-current_.used){
         Block block;block.capacity=4096;
         const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,block.capacity,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
-        if(FAILED(device->CreateDescriptorHeap(&desc,IID_PPV_ARGS(&block.heap))))return false;blocks_.push_back(std::move(block));}
-    auto& block=blocks_.back();heap=block.heap;first=block.used;block.used+=count;return true;
+        const auto result=device->CreateDescriptorHeap(&desc,IID_PPV_ARGS(&block.heap));
+        if(FAILED(result)){if(error){char text[160];std::snprintf(text,sizeof text,"Private descriptor heap allocation failed (0x%08X; %u requested, %u capacity).",unsigned(result),count,block.capacity);*error=text;}return false;}
+        current_=std::move(block);}
+    heap=current_.heap;first=current_.used;current_.used+=count;return true;
 }
 std::shared_ptr<const PreparedBindings> PreparedBindings::Create(ID3D12Device* device, BindingSpec spec, std::string& error)
 {
@@ -72,7 +76,7 @@ std::shared_ptr<const PreparedBindings> PreparedBindings::Create(ID3D12Device* d
         return fail("invalid screen-space compute layout");
     if (!s.views.empty()) {
         D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, static_cast<UINT>(s.views.size()), D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
-        if(s.descriptors){if(!s.descriptors->Allocate(device,hd.NumDescriptors,p->views_,p->views_first_))return fail("private shader descriptor arena failed");}
+        if(s.descriptors){if(!s.descriptors->Allocate(device,hd.NumDescriptors,p->views_,p->views_first_,&error))return {};}
         else if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&p->views_)))) return fail("private shader descriptor heap failed");
         p->increment_ = device->GetDescriptorHandleIncrementSize(hd.Type);
         auto cpu = p->views_->GetCPUDescriptorHandleForHeapStart();

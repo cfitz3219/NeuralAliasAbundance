@@ -9,11 +9,11 @@ namespace na::scale {
 // no descriptor is recycled while an executable recording may reference it.
 class ShaderDescriptorArena {
 public:
-    bool Allocate(ID3D12Device*,UINT count,Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>&,UINT& first);
+    bool Allocate(ID3D12Device*,UINT count,Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>&,UINT& first,std::string* error=nullptr);
 private:
     struct Block {Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;UINT used=0,capacity=0;};
     std::mutex mutex_;
-    std::vector<Block> blocks_;
+    Block current_; // older heaps are owned only by their immutable plans/recording leases
 };
 // Prepared from the recognized operation's real view/layout metadata, on the
 // setup worker under HostWorkScope. No shader-visible heap is used as a CPU

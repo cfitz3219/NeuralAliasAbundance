@@ -15,6 +15,24 @@
 namespace {
 using namespace na::scale;
 void __cdecl sink(const na_event_batch*, void*) {}
+class HeapLifetime final:public IUnknown {
+    ULONG refs_=1;unsigned& destroyed_;
+public:
+    explicit HeapLifetime(unsigned& destroyed):destroyed_(destroyed){}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id,void** out)override{if(!out)return E_POINTER;*out=nullptr;if(id!=__uuidof(IUnknown))return E_NOINTERFACE;*out=this;AddRef();return S_OK;}
+    ULONG STDMETHODCALLTYPE AddRef()override{return ++refs_;}
+    ULONG STDMETHODCALLTYPE Release()override{const auto left=--refs_;if(!left){++destroyed_;delete this;}return left;}
+};
+int ArenaRetirement(ID3D12Device* device){
+    unsigned destroyed=0;ShaderDescriptorArena arena;test::ComPtr<ID3D12DescriptorHeap> retained,latest;UINT first=0;
+    REQUIRE(arena.Allocate(device,4096,retained,first));CHECK(first==0);
+    constexpr GUID key{0x8aee232d,0x56fa,0x43e8,{0x99,0xc1,0x26,0x13,0x65,0x19,0x71,0x82}};
+    auto* probe=new HeapLifetime(destroyed);const auto hr=retained->SetPrivateDataInterface(key,probe);probe->Release();REQUIRE(SUCCEEDED(hr));
+    // Roll over many slabs while a simulated executable plan owns the first.
+    for(unsigned i=0;i<64;++i){REQUIRE(arena.Allocate(device,4096,latest,first));CHECK(first==0);}
+    CHECK(destroyed==0);retained.Reset();CHECK(destroyed==1); // arena must NOT own every historical slab
+    return 0;
+}
 uint64_t CheckKey(ID3D12GraphicsCommandList* list,bool compute){
     using K=na::observe::OperationKey;na::observe::NativeOperation op;
     CHECK(na::observe::ListNativeOperation(list,compute,op));
@@ -339,7 +357,7 @@ RWTexture2D<float4> target:register(u0);Texture2D<float> image:register(t0);Samp
     REQUIRE(SUCCEEDED(list->Reset(fresh.Get(),nullptr)));REQUIRE(SUCCEEDED(list->Close()));na::nr::native::Maintain();CHECK(!lifetime.expired());
     gate->Signal(1);d.WaitIdle();na::nr::native::Maintain();CHECK(lifetime.expired());
     reduced_rb.Check(rw,rh,rw,rh);native_rb.Check(w,h,w,h);
-    REQUIRE(Raster(d)==0);
+    REQUIRE(ArenaRetirement(dev)==0);REQUIRE(Raster(d)==0);
     for(int mode=1;mode<=3;++mode)REQUIRE(Raster(d,mode)==0);
     for(int mode=1;mode<=3;++mode)REQUIRE(Raster(d,mode,true)==0);
     na::observe::SetShaderOperationHook(na::observe::ShaderLane::Bindings,{});na_observe_stop();

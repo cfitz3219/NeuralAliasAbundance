@@ -626,7 +626,8 @@ void PollAutomaticScene(){
     a->stats.out_w=output.width;a->stats.out_h=output.height;a->stats.members=UINT(members.size());a->stats.plans=UINT(a->prepared->bindings.size());
     a->stats.failed_plans=a->prepared->failed.size()+a->prepared->failed_transfers.size();if(!same)++a->stats.group_builds;
     if(a->stats.failed_plans)a->note(!a->prepared->failed.empty()?a->prepared->failed.begin()->second.c_str():a->prepared->failed_transfers.begin()->second.c_str());
-    else a->note(complete&&!a->prepared->ready?error.c_str():"Reduced scene prepared; applying at the next frame boundary.");
+    else if(!complete){char text[160];std::snprintf(text,sizeof text,"Preparing scene bindings (%u of %u operations).",UINT(a->prepared->bindings.size()),UINT(source_operations));a->note(text);}
+    else a->note(!a->prepared->ready?error.c_str():"Reduced scene prepared; applying at the next frame boundary.");
     bool more=!a->pending.empty();for(const auto& transfer:a->observed_transfers)more|=!a->prepared->transfers.count(transfer.first)&&!a->prepared->failed_transfers.count(transfer.first);
     a->work_pending.store(more);
 }
