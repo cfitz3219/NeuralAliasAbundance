@@ -100,11 +100,10 @@ struct State {
     // SE5 flashing (Cort 2026-11-02): ~10 % of frames had no readable camera, so they kept
     // the game's raw (aliased, mip-biased, unsharpened) colour between DLAA'd neighbours:
     // a flash on detailed texture. The last two unjittered cameras let such a frame run
-    // DLAA on a predicted camera instead (at most kMaxHeldFrames in a row).
+    // DLAA on a predicted camera instead (see record(): 4 frames moving, 120 still).
     na::camera::Matrix cam_u0{}, cam_u1{}; // unjittered VPs of the last two read frames (u1 newest)
     uint64_t cam_f0 = 0, cam_f1 = 0;       // their frames (0 = none)
     bool cam_rev = false;
-    uint32_t cam_held_run = 0;             // consecutive frames on a predicted camera
     // SE5 main menu (Cort 2026-11-02): the depth's state at the scene end was unknown on ~1/4
     // of frames (the state store reset: ambiguous_queue_order). The same scene end reports
     // the same depth state frame after frame; once it has been the same on kDepthLearnFrames
@@ -1331,10 +1330,17 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (saved) { vp = saved->vp; reversed = saved->reversed; }
     const bool found = saved || find_camera(lists, scene, depth_id, &vp, &reversed);
     if (!found) {
-        // A camera read within the last frame or two: predict this frame's (unjittered,
+        // A camera read within the last few frames: predict this frame's (unjittered,
         // so no jitter is claimed for it) rather than leave the game's raw picture showing.
-        constexpr uint32_t kMaxHeldFrames = 4; // == kMaxGapFrames: the tracker keeps history this long
-        const bool fresh = g.cam_f1 && g.frame > g.cam_f1 && g.frame - g.cam_f1 <= kMaxHeldFrames && g.cam_held_run < kMaxHeldFrames;
+        // A still camera (the last two reads identical: SE5's menu) holds much longer; a
+        // moving one stays within the tracker's gap limit. The same frame may also reuse
+        // its own camera (an earlier attempt read it but did not run).
+        constexpr uint64_t kMaxHeldFrames = 4, kMaxStillHeldFrames = 120;
+        bool still = g.cam_f0 != 0;
+        for (size_t i = 0; still && i < 16; ++i)
+            still = std::fabs(g.cam_u0[i] - g.cam_u1[i]) <= 1e-7 * (std::max)(1.0, std::fabs(g.cam_u1[i]));
+        const uint64_t limit = still ? kMaxStillHeldFrames : kMaxHeldFrames;
+        const bool fresh = g.cam_f1 && g.frame >= g.cam_f1 && g.frame - g.cam_f1 <= limit;
         if (fresh && !g.resume_reset) {
             const bool velocity = g.cam_f0 && g.cam_f1 == g.cam_f0 + 1 && g.frame == g.cam_f1 + 1;
             vp = velocity ? na::camera::ExtrapolateViewProjection(g.cam_u0, g.cam_u1) : g.cam_u1;
@@ -1410,11 +1416,9 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (tracker_restart) pending.tracker.Reset();
     const na::camera::CameraFrame cam = pending.tracker.Update(vp, g.frame, rw, rh, injected); // active extent
     if (!cam.valid) { ++g.stats.no_camera; reason("The camera matrix could not be inverted."); return false; }
-    if (held) ++g.cam_held_run;
-    else { // the newest read camera (one per frame: a later attempt in the same frame replaces it)
+    if (!held) { // the newest read camera (one per frame: a later attempt in the same frame replaces it)
         if (g.cam_f1 != g.frame) { g.cam_u0 = g.cam_u1; g.cam_f0 = g.cam_f1; }
         g.cam_u1 = cam.unjittered; g.cam_f1 = g.frame; g.cam_rev = reversed;
-        g.cam_held_run = 0;
     }
     pending.cut = cam.camera_cut;
     // P4-0b: moving-object motion (between-lists route only). The pre list is
@@ -2504,7 +2508,7 @@ void Shutdown()
     g_nis.Reset();
     g.arbiter_ok = false;
     g.tracker.Reset();
-    g.cam_f0 = g.cam_f1 = 0; g.cam_held_run = 0;
+    g.cam_f0 = g.cam_f1 = 0;
     g.depth_learned_streak = 0; g.depth_learned_frame = 0; g.depth_learned_id = 0; g.depth_learned_sub = 0xFFFFFFFFu;
     g.frame = 1;
     g.submitted_frame = 0;
