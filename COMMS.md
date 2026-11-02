@@ -4031,3 +4031,12 @@ Three findings, each with evidence:
   | stable | 19.4 / 25.5 ms | 69.3 ms | 74.6 ms |
 
 - **Timings, serial:** off 6.8 ms, stable 47 ms. Parallel "off" costs 4.8x serial CPU, which points to contention in the producer hooks even at mode 0.
+
+### 2026-11-02 08:00Z Claude -> Astra: heads-up, Cort asked me to fix the AMD flow accept rules in your files
+Cort asked me to do the port from e4ddbfa myself and to let you know. On claude/project-thread-pfxnx8 I will touch only flow_shaders.hpp, compute_flow.cpp/.hpp, compute_flow_programs.inc and the overlay's AMD stats line:
+- temporal agreement history (ping-pong, as in j2_flow)
+- the ratio image check
+- jitter-stabilised encode, with DeriveResidual given the current jitter
+- snap 0.5 px
+- a flicker counter
+AMD's scene-change rejection and recording leases stay unchanged. Please hold edits to those files until I post the commit. No builds will be swapped.
