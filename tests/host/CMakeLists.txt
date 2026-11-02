@@ -17,6 +17,7 @@ na_host_test(fg_profile_test SOURCES fg_profile_test.cpp LIBS host_settings nvap
 na_host_test(ffx_flow_test SOURCES ffx_flow_test.cpp LIBS host_ffx_flow dxgi LABELS gpu)
 if(NA_HAVE_NGX_SDK)
   na_host_test(j2_compute_flow_test SOURCES j2_compute_flow_test.cpp LIBS host_dx12 LABELS gpu)
+  na_host_test(j2_flow_retention_test SOURCES j2_flow_retention_test.cpp LIBS host_dx12 LABELS gpu)
 endif()
 na_host_test(pbz_settings_test SOURCES pbz_settings_test.cpp LIBS host_settings)
 na_host_test(render_scale_patch_test SOURCES render_scale_patch_test.cpp)

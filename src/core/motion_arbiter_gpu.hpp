@@ -84,7 +84,8 @@ public:
     bool DispatchDeriveResidual(ID3D12GraphicsCommandList* list, ID3D12Resource* raw_flow, ID3D12Resource* depth,
                                 const Inputs& camera, const float jitter_previous_px[2], ID3D12Resource* residual_out,
                                 ID3D12Resource* valid_out, uint32_t width, uint32_t height, uint32_t frame_slot,
-                                ID3D12Resource* raw_valid = nullptr);
+                                ID3D12Resource* raw_valid = nullptr,
+                                Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>* recording_heap = nullptr);
     // Converts a read-back stats buffer (from the most recent Dispatch) into
     // the shared Stats struct, adding whole-tier extent rejections that were
     // decided on the CPU side.

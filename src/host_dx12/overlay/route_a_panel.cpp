@@ -992,9 +992,13 @@ void DrawLiveDlaa()
             const na::j2::flow::Stats fs = na::j2::flow::GetStats();
             const auto cs=na::j2::compute_flow::GetStats();
             if(na::j2::GetStats().inline_mode || (!fs.available && cs.recorded)){
-                char line[350];std::snprintf(line,sizeof line,"AMD compute: %s Pairs %llu, submitted %llu, busy %llu. Accepted %.1f%%, GPU %.2f ms.",cs.reason,
-                    static_cast<unsigned long long>(cs.pairs),static_cast<unsigned long long>(cs.submitted),static_cast<unsigned long long>(cs.busy),cs.total?100.0*double(cs.accepted)/double(cs.total):0.0,cs.ms);
+                char line[500];na::j2::compute_flow::DescribeStats(cs,line,sizeof line);
                 StatusLine(0,line);
+                if(cs.samples && cs.total){char detail[330];std::snprintf(detail,sizeof detail,
+                    "Last sample excluded: small motion %.1f%%, invalid/depth %.1f%%, image/flat %.1f%%, offscreen %.1f%%. Recording resources %u, history images %u.",
+                    100.0*double(cs.rejected_small)/double(cs.total),100.0*double(cs.rejected_invalid)/double(cs.total),
+                    100.0*double(cs.rejected_image)/double(cs.total),100.0*double(cs.rejected_offscreen)/double(cs.total),cs.recording_slots,cs.image_slots);
+                    Hint(detail);}
             }else{
             const uint64_t px = fs.px_accepted + fs.px_invalid + fs.px_small + fs.px_cost + fs.px_offscreen + fs.px_image + fs.px_flicker;
             const double pct = px ? 100.0 * static_cast<double>(fs.px_accepted) / static_cast<double>(px) : 0.0;
