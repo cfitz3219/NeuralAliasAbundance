@@ -6,7 +6,7 @@ param([ValidateSet('Deploy','Rollback','Results')] [string] $Action = 'Deploy',
 $ErrorActionPreference = 'Stop'
 $Docs     = $DocumentsDirectory
 $Log      = Join-Path $Docs 'NA-anno-layer2-log.txt'
-$TestCommit = '78d7f609176f6544f1bad0826d33c6d27fc6fb21'
+$TestCommit = '500d9996e6f7c6513bc345154cfd100c3cfd12a9'
 
 $Local    = $LocalRoot
 $Evid     = Join-Path $Local 'j2-anno-flow'
