@@ -29,11 +29,12 @@ std::string read_all(const std::wstring& p)
 {
     const HANDLE f = CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return {};
-    std::string s(4096, '\0');
+    // Whole file: the log outgrows any fixed buffer (CI's longer temp path cut the last line).
+    std::string s;
+    char buf[4096];
     DWORD r = 0;
-    ReadFile(f, s.data(), static_cast<DWORD>(s.size()), &r, nullptr);
+    while (ReadFile(f, buf, sizeof buf, &r, nullptr) && r) s.append(buf, r);
     CloseHandle(f);
-    s.resize(r);
     return s;
 }
 } // namespace
