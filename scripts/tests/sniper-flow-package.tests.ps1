@@ -1,6 +1,7 @@
-param([Parameter(Mandatory=$true)][string]$PackageRoot,[ValidateSet('ser','se5')][string]$Game='ser')
+param([Parameter(Mandatory=$true)][string]$PackageRoot,[ValidateSet('ser','se5')][string]$Game='ser',[ValidateSet(0,1)][int]$ExpectedFlow=0)
 $ErrorActionPreference='Stop'
 $root=Join-Path ([IO.Path]::GetTempPath()) ('na-sniper-flow-'+[guid]::NewGuid().ToString('N'))
+$env:LOCALAPPDATA=Join-Path $root 'LocalAppData' # isolate optional capture/result scanning
 $pkg=Join-Path $root 'package';$fakeGame=Join-Path $root 'game';$docs=Join-Path $root 'Documents';$evid=Join-Path $root 'evidence'
 New-Item -ItemType Directory -Path $pkg,$fakeGame,$docs|Out-Null
 Get-ChildItem -LiteralPath $PackageRoot -File|ForEach-Object{Copy-Item -LiteralPath $_.FullName -Destination $pkg}
@@ -23,11 +24,25 @@ $exe=if($Game -eq 'ser'){'SniperResistance_dx12.exe'}else{'Sniper5_dx12.exe'}
 'original native game library'|Set-Content -LiteralPath (Join-Path $fakeGame 'original.dll')
 $original=(Get-FileHash -LiteralPath (Join-Path $fakeGame 'original.dll')).Hash
 $ps=Join-Path $env:WINDIR 'System32/WindowsPowerShell/v1.0/powershell.exe'
-function Run($action){& $ps -NoProfile -ExecutionPolicy Bypass -File $path -Action $action *> (Join-Path $root ($action+'.log'));return $LASTEXITCODE}
+function Run($action){
+    # The transaction archives its evidence directory. Verify every substituted
+    # target and the archive's parent before the child can move any directory.
+    $prefix=[IO.Path]::GetFullPath($root).TrimEnd('\')+'\'
+    foreach($target in @($pkg,$fakeGame,$docs,$evid,($evid+'-archive'))){
+        if(![IO.Path]::GetFullPath($target).StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase)){throw "Fixture target escaped root: $target"}
+    }
+    & $ps -NoProfile -ExecutionPolicy Bypass -File $path -Action $action *> (Join-Path $root ($action+'.log'));return $LASTEXITCODE
+}
 function Check($ok,$why){if(!$ok){throw $why}}
 Check ((Run 'Deploy') -eq 0) 'Fixture deployment failed'
 Check (Test-Path -LiteralPath (Join-Path $fakeGame 'NeuralAlias-AMD-OpticalFlow-LICENSE.txt')) 'MIT notice not deployed'
-Check ((Get-Content -LiteralPath (Join-Path $fakeGame 'NeuralAliasHost.ini') -Raw).Contains('flow=0')) 'Flow must start off'
+Check ((Get-Content -LiteralPath (Join-Path $fakeGame 'NeuralAliasHost.ini') -Raw).Contains(('flow='+$ExpectedFlow))) 'Incorrect initial flow mode'
+if($text.Contains("'Results'")){
+    'j2compute engine=amd recorded=280 submitted=280 pairs=279 busy=0 accepted=7 total=100 ms=0.8' | Set-Content -LiteralPath (Join-Path $evid 'status-99.log')
+    Check ((Run 'Results') -eq 0) 'Results export failed'
+    $flowReports=@(Get-ChildItem -LiteralPath $docs -Recurse -File -Filter '*-amd-flow.txt')
+    Check ($flowReports.Count -gt 0) 'AMD flow report not saved with results'
+}
 $installed=(Get-FileHash -LiteralPath (Join-Path $fakeGame 'dxgi.dll')).Hash
 # Invalid replacement must leave the installed candidate intact.
 Add-Content -LiteralPath (Join-Path $pkg 'NeuralAliasDXGI.dll') -Value 'corrupt-fixture'
@@ -43,4 +58,4 @@ Check ((Get-FileHash -LiteralPath (Join-Path $fakeGame 'original.dll')).Hash -eq
 $native=(Get-FileHash -LiteralPath (Join-Path $fakeGame 'nvngx_dlss.dll')).Hash
 Check ((Run 'Deploy') -ne 0) 'Existing native DLSS was overwritten'
 Check ((Get-FileHash -LiteralPath (Join-Path $fakeGame 'nvngx_dlss.dll')).Hash -eq $native) 'Native DLSS hash changed'
-Write-Host "PASS: $Game prebuilt additive install, MIT notice, default off, corrupt replacement preservation, receipt upgrade, rollback, native-file refusal. Fixture $root"
+Write-Host "PASS: $Game prebuilt additive install, MIT notice, flow=$ExpectedFlow, corrupt replacement preservation, receipt upgrade, rollback, native-file refusal. Fixture $root"

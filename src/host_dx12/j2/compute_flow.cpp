@@ -14,22 +14,27 @@
 namespace na::j2::compute_flow {
 using Microsoft::WRL::ComPtr;using Lease=na::nr::native::RecordingLease;
 namespace {
-constexpr unsigned slots=8;constexpr auto S=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,U=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+constexpr unsigned warm_images=8;constexpr auto S=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,U=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 D3D12_RESOURCE_BARRIER tr(ID3D12Resource* r,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b){D3D12_RESOURCE_BARRIER x{};x.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;x.Transition={r,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,a,b};return x;}
 void move(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b){auto x=tr(r,a,b);l->ResourceBarrier(1,&x);}
 void order(ID3D12GraphicsCommandList* l){D3D12_RESOURCE_BARRIER x{};x.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;l->ResourceBarrier(1,&x);}
 struct Constants {unsigned w,h,ew,eh,mode,block,cost,cost_max,offset,gw,gh,pad;float snap=1,margin=.02f,absolute=.08f,texture=.03f;};
 struct Image {ComPtr<ID3D12Resource> tex;std::vector<Lease> uses;Lease producer;uint64_t frame=0;unsigned generation=0;float jitter[2]{};};
-struct Slot {Lease lease;bool pair=false,submitted=false;};
+struct Slot {
+    Lease lease;bool pair=false,submitted=false;uint64_t frame=0;
+    ComPtr<ID3D12DescriptorHeap> heap,engine_heap,expand_heap,derive_heap;
+    ComPtr<ID3D12Resource> readback;ComPtr<ID3D12QueryHeap> timestamps;
+    ComPtr<ID3D12Resource> color_input,depth_input;
+};
 struct Context {
     ComPtr<ID3D12Device> device;ComPtr<ID3D12CommandQueue> queue;unsigned w=0,h=0,stride=0;int last=-1;
-    ComPtr<ID3D12RootSignature> root;ComPtr<ID3D12PipelineState> pso_encode,pso_accept;ComPtr<ID3D12DescriptorHeap> heap;
-    ComPtr<ID3D12Resource> raw,expanded,residual,valid,mask,counters,zero,readback;
-    ComPtr<ID3D12QueryHeap> timestamps;UINT64 frequency=0;
+    ComPtr<ID3D12RootSignature> root;ComPtr<ID3D12PipelineState> pso_encode,pso_accept;
+    ComPtr<ID3D12Resource> raw,expanded,residual,valid,mask,counters,zero;
+    UINT64 frequency=0;
     na::ffx_flow::PairFlow engine;na::nvof::FlowExpand expand;na::motion::gpu::Arbiter derive;
-    Image images[slots];Slot leases[slots];
-    D3D12_CPU_DESCRIPTOR_HANDLE cpu(unsigned slot,unsigned table,unsigned i){auto a=heap->GetCPUDescriptorHandleForHeapStart();a.ptr+=SIZE_T((slot*2+table)*10+i)*stride;return a;}
-    D3D12_GPU_DESCRIPTOR_HANDLE gpu(unsigned slot,unsigned table){auto a=heap->GetGPUDescriptorHandleForHeapStart();a.ptr+=UINT64((slot*2+table)*10)*stride;return a;}
+    std::vector<std::unique_ptr<Image>> images;std::vector<std::unique_ptr<Slot>> leases;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu(unsigned slot,unsigned table,unsigned i){auto a=leases[slot]->heap->GetCPUDescriptorHandleForHeapStart();a.ptr+=SIZE_T(table*10+i)*stride;return a;}
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu(unsigned slot,unsigned table){auto a=leases[slot]->heap->GetGPUDescriptorHandleForHeapStart();a.ptr+=UINT64(table*10)*stride;return a;}
     bool tex(DXGI_FORMAT f,ComPtr<ID3D12Resource>& r){
         D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;D3D12_RESOURCE_DESC d{};d.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         d.Width=w;d.Height=h;d.DepthOrArraySize=d.MipLevels=1;d.SampleDesc.Count=1;d.Format=f;d.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
@@ -47,89 +52,115 @@ struct Context {
         srv(slot,table,2,nullptr,DXGI_FORMAT_R32G32_FLOAT);srv(slot,table,3,nullptr,DXGI_FORMAT_R32_FLOAT);
         srv(slot,table,4,nullptr,DXGI_FORMAT_R8_UINT);srv(slot,table,5,nullptr,DXGI_FORMAT_R8G8B8A8_UNORM);srv(slot,table,6,nullptr,DXGI_FORMAT_R8G8B8A8_UNORM);
         uav(slot,table,7,nullptr,DXGI_FORMAT_R8G8B8A8_UNORM);uav(slot,table,8,nullptr,DXGI_FORMAT_R32_FLOAT);
-        D3D12_UNORDERED_ACCESS_VIEW_DESC d{};d.Format=DXGI_FORMAT_R32_TYPELESS;d.ViewDimension=D3D12_UAV_DIMENSION_BUFFER;d.Buffer.NumElements=slots*8;d.Buffer.Flags=D3D12_BUFFER_UAV_FLAG_RAW;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC d{};d.Format=DXGI_FORMAT_R32_TYPELESS;d.ViewDimension=D3D12_UAV_DIMENSION_BUFFER;d.Buffer.NumElements=8;d.Buffer.Flags=D3D12_BUFFER_UAV_FLAG_RAW;
         device->CreateUnorderedAccessView(counters.Get(),nullptr,&d,cpu(slot,table,9));
     }
     void dispatch(ID3D12GraphicsCommandList* l,unsigned slot,unsigned table,ID3D12PipelineState* pso,const Constants& c){
-        ID3D12DescriptorHeap* heaps[]={heap.Get()};l->SetDescriptorHeaps(1,heaps);l->SetComputeRootSignature(root.Get());l->SetPipelineState(pso);
+        ID3D12DescriptorHeap* heaps[]={leases[slot]->heap.Get()};l->SetDescriptorHeaps(1,heaps);l->SetComputeRootSignature(root.Get());l->SetPipelineState(pso);
         l->SetComputeRootDescriptorTable(0,gpu(slot,table));l->SetComputeRoot32BitConstants(1,16,&c,0);l->Dispatch((w+7)/8,(h+7)/8,1);
     }
 };
-std::mutex mutex;std::shared_ptr<Context> current;Stats stats;
+std::mutex mutex;std::shared_ptr<Context> current;Stats stats;uint64_t last_submit_tick=0,sample_tick=0;
 void reason(const char* r){strncpy_s(stats.reason,r,_TRUNCATE);}
 bool programs(Context& g){
 #include "compute_flow_programs.inc"
 }
 bool build(Context& c,ID3D12Device* device,ID3D12CommandQueue* queue,unsigned w,unsigned h){
     c.device=device;c.queue=queue;c.w=w;c.h=h;c.stride=device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    if(!c.engine.Init(device,w,h,slots)){reason(c.engine.Error());return false;}
-    if(!programs(c) || !c.expand.Init(device,slots) || !c.derive.Init(device,slots))return false;
-    D3D12_DESCRIPTOR_HEAP_DESC hd{};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;hd.NumDescriptors=slots*20;
-    if(FAILED(device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&c.heap))))return false;
-    for(auto& i:c.images)if(!c.tex(DXGI_FORMAT_R8G8B8A8_UNORM,i.tex))return false;
+    if(!c.engine.Init(device,w,h,1)){reason(c.engine.Error());return false;}
+    if(!programs(c) || !c.expand.Init(device,1) || !c.derive.Init(device,1))return false;
+    for(unsigned i=0;i<warm_images;++i){auto image=std::make_unique<Image>();if(!c.tex(DXGI_FORMAT_R8G8B8A8_UNORM,image->tex))return false;c.images.push_back(std::move(image));}
     if(!c.tex(DXGI_FORMAT_R32G32_FLOAT,c.raw) || !c.tex(DXGI_FORMAT_R32_FLOAT,c.expanded) || !c.tex(DXGI_FORMAT_R32G32_FLOAT,c.residual) || !c.tex(DXGI_FORMAT_R32_FLOAT,c.valid) || !c.tex(DXGI_FORMAT_R32_FLOAT,c.mask) ||
-       !c.buffer(slots*32,D3D12_HEAP_TYPE_DEFAULT,U,c.counters) || !c.buffer(32,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ,c.zero) || !c.buffer(slots*48,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST,c.readback))return false;
+       !c.buffer(32,D3D12_HEAP_TYPE_DEFAULT,U,c.counters) || !c.buffer(32,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ,c.zero))return false;
     void* p=nullptr;if(FAILED(c.zero->Map(0,nullptr,&p)))return false;memset(p,0,32);c.zero->Unmap(0,nullptr);
-    D3D12_QUERY_HEAP_DESC qd{};qd.Type=D3D12_QUERY_HEAP_TYPE_TIMESTAMP;qd.Count=slots*2;
-    if(FAILED(device->CreateQueryHeap(&qd,IID_PPV_ARGS(&c.timestamps))))c.timestamps.Reset();queue->GetTimestampFrequency(&c.frequency);return true;
+    queue->GetTimestampFrequency(&c.frequency);return true;
 }
 bool free(Image& i){i.uses.erase(std::remove_if(i.uses.begin(),i.uses.end(),[](const Lease& l){return l.Retired();}),i.uses.end());return i.uses.empty();}
-void collect(Context& c){for(unsigned s=0;s<slots;++s)if(c.leases[s].pair && c.leases[s].lease.Retired()){
-    if(!c.leases[s].submitted){c.leases[s].pair=false;continue;} // discarded commands never wrote telemetry
-    void* p=nullptr;D3D12_RANGE range{SIZE_T(s*48),SIZE_T((s+1)*48)};
-    if(SUCCEEDED(c.readback->Map(0,&range,&p))){auto b=static_cast<const unsigned char*>(p)+s*48;const auto v=reinterpret_cast<const unsigned*>(b);stats.accepted=v[0];stats.total=0;for(unsigned j=0;j<6;++j)stats.total+=v[j];
-        if(c.timestamps && c.frequency){UINT64 t[2]{};memcpy(t,b+32,16);stats.ms=double(t[1]-t[0])*1000.0/double(c.frequency);}
-        D3D12_RANGE none{};c.readback->Unmap(0,&none);}
-    c.leases[s].pair=false;
+void collect(Context& c){for(auto& entry:c.leases){auto& s=*entry;if(!s.pair || !s.lease.Retired())continue;
+    if(!s.submitted){s.pair=false;continue;} // discarded commands never wrote telemetry
+    if(s.frame>=stats.sample_frame){void* p=nullptr;D3D12_RANGE range{0,48};
+        if(SUCCEEDED(s.readback->Map(0,&range,&p))){const auto* b=static_cast<const unsigned char*>(p);const auto* v=reinterpret_cast<const unsigned*>(b);
+            stats.accepted=v[0];stats.rejected_invalid=v[1];stats.rejected_small=v[2];stats.rejected_cost=v[3];stats.rejected_offscreen=v[4];stats.rejected_image=v[5];
+            stats.total=0;for(unsigned j=0;j<6;++j)stats.total+=v[j];stats.sample_frame=s.frame;sample_tick=GetTickCount64();++stats.samples;
+            if(s.timestamps && c.frequency){UINT64 t[2]{};memcpy(t,b+32,16);stats.ms=t[1]>=t[0]?double(t[1]-t[0])*1000.0/double(c.frequency):0;}
+            D3D12_RANGE none{};s.readback->Unmap(0,&none);}}
+    s.pair=false;
 }}
+bool prepare_slot(Context& c,Slot& slot){
+    if(slot.heap)return true;
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,20,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
+    if(FAILED(c.device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&slot.heap))) ||
+       !c.buffer(48,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST,slot.readback)){slot.heap.Reset();return false;}
+    D3D12_QUERY_HEAP_DESC qd{};qd.Type=D3D12_QUERY_HEAP_TYPE_TIMESTAMP;qd.Count=2;
+    c.device->CreateQueryHeap(&qd,IID_PPV_ARGS(&slot.timestamps));return true;
+}
 }
 Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resource* color,ID3D12Resource* depth,
               const na::motion::gpu::Inputs& camera,const Frame& f,Tier3& out){
     na::nr::native::Maintain(); // nonblocking retirement collection, before our lock
     std::lock_guard<std::mutex> lock(mutex);out={};
-    if(!l || !queue || !color || !depth || !na::ffx_flow::Built() || f.slot>=slots){reason("AMD compute shaders unavailable or invalid frame");return {};}
+    ++stats.attempts;
+    if(!l || !queue || !color || !depth || !na::ffx_flow::Built()){++stats.unavailable;reason("AMD compute shaders unavailable or invalid frame");return {};}
     ComPtr<ID3D12Device> device;if(FAILED(l->GetDevice(IID_PPV_ARGS(&device))))return {};
     auto d=color->GetDesc();const unsigned w=static_cast<unsigned>(d.Width),h=d.Height;
     if(!current || current->device.Get()!=device.Get() || current->queue.Get()!=queue || current->w!=w || current->h!=h){
         reason("AMD working resources unavailable; camera motion used");
         auto next=std::make_shared<Context>();if(!build(*next,device.Get(),queue,w,h))return {};current=std::move(next);++stats.resets;
     }
-    auto c=current;collect(*c);auto& slot=c->leases[f.slot];
-    if(slot.lease && !slot.lease.Retired()){++stats.busy;reason("AMD flow slot still executable/in flight; camera motion used");return {};}
-    int image=-1;for(unsigned j=0;j<slots;++j)if(static_cast<int>(j)!=c->last && free(c->images[j])){image=static_cast<int>(j);break;}
-    if(image<0){++stats.busy;reason("AMD flow images still in use; camera motion used");return {};}
+    auto c=current;collect(*c);
     // Retain context through every submission/replay or discard of this exact recording.
-    auto lease=na::nr::native::RetainRecording(l,c);if(!lease){reason("AMD flow recording lifetime unavailable; camera motion used");return {};}
-    slot.lease=lease;slot.pair=false;slot.submitted=false;auto& im=c->images[image];im.uses.push_back(lease);im.producer=lease;
+    auto lease=na::nr::native::RetainRecording(l,c);if(!lease){++stats.unavailable;reason("AMD flow recording lifetime unavailable; camera motion used");return {};}
+    for(const auto& s:c->leases)if(!s->lease.Retired() && s->lease.SameRecording(lease)){
+        ++stats.busy;reason("AMD flow already belongs to this executable recording; camera motion used");return {};}
+    unsigned work=0;while(work<c->leases.size() && c->leases[work]->lease && !c->leases[work]->lease.Retired())++work;
+    if(work==c->leases.size())c->leases.push_back(std::make_unique<Slot>());
+    auto& slot=*c->leases[work];if(!prepare_slot(*c,slot)){++stats.unavailable;reason("AMD recording descriptor allocation failed; camera motion used");return {};}
+    int image=-1;for(unsigned j=0;j<c->images.size();++j)if(static_cast<int>(j)!=c->last && free(*c->images[j])){image=static_cast<int>(j);break;}
+    if(image<0){auto next=std::make_unique<Image>();if(!c->tex(DXGI_FORMAT_R8G8B8A8_UNORM,next->tex)){++stats.unavailable;reason("AMD history image allocation failed; camera motion used");return {};}
+        image=static_cast<int>(c->images.size());c->images.push_back(std::move(next));}
+    slot.lease=lease;slot.pair=false;slot.submitted=false;slot.frame=f.frame;auto& im=*c->images[image];im.uses.push_back(lease);im.producer=lease;
+    slot.color_input=color;slot.depth_input=depth;
+    stats.recording_slots=static_cast<uint32_t>(c->leases.size());stats.image_slots=static_cast<uint32_t>(c->images.size());
     const int previous=c->last;
-    bool pair=!f.reset && previous>=0 && c->images[previous].frame==f.previous && f.previous && c->images[previous].generation==f.generation && c->images[previous].producer.Ready(queue);
-    Ticket t;t.context=c;t.image=static_cast<unsigned>(image);t.previous=previous<0?0u:static_cast<unsigned>(previous);t.slot=f.slot;t.frame=f;t.pair=pair;
-    Constants cb{};cb.w=cb.ew=w;cb.h=cb.eh=h;cb.mode=f.hdr?1u:0u;cb.block=8;cb.offset=f.slot*32;cb.gw=(w+7)/8;cb.gh=(h+7)/8;
-    if(c->timestamps)l->EndQuery(c->timestamps.Get(),D3D12_QUERY_TYPE_TIMESTAMP,f.slot*2);
-    move(l,im.tex.Get(),S,U);c->defaults(f.slot,0);c->srv(f.slot,0,0,color,d.Format);c->uav(f.slot,0,7,im.tex.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);
-    c->dispatch(l,f.slot,0,c->pso_encode.Get(),cb);order(l);move(l,im.tex.Get(),U,S);++stats.recorded;
-    if(!pair){reason("AMD flow capturing matching scene history; camera motion used");return t;}
-    auto& prev=c->images[previous];prev.uses.push_back(lease);
-    if(!c->engine.Record(l,im.tex.Get(),prev.tex.Get(),f.slot)){reason("AMD flow refused image pair; camera motion used");return t;}
+    bool pair=!f.reset && previous>=0 && c->images[previous]->frame==f.previous && f.previous && c->images[previous]->generation==f.generation && c->images[previous]->producer.Ready(queue);
+    Ticket t;t.context=c;t.image=static_cast<unsigned>(image);t.previous=previous<0?0u:static_cast<unsigned>(previous);t.slot=work;t.frame=f;t.pair=pair;
+    Constants cb{};cb.w=cb.ew=w;cb.h=cb.eh=h;cb.mode=f.hdr?1u:0u;cb.block=8;cb.gw=(w+7)/8;cb.gh=(h+7)/8;
+    if(slot.timestamps)l->EndQuery(slot.timestamps.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0);
+    move(l,im.tex.Get(),S,U);c->defaults(work,0);c->srv(work,0,0,color,d.Format);c->uav(work,0,7,im.tex.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);
+    c->dispatch(l,work,0,c->pso_encode.Get(),cb);order(l);move(l,im.tex.Get(),U,S);++stats.recorded;
+    if(!pair){++stats.waiting_history;reason("AMD flow capturing matching scene history; camera motion used");return t;}
+    auto& prev=*c->images[previous];prev.uses.push_back(lease);
+    if(!c->engine.Record(l,im.tex.Get(),prev.tex.Get(),0,&slot.engine_heap)){++stats.unavailable;reason("AMD flow refused image pair; camera motion used");return t;}
     move(l,c->raw.Get(),S,U);move(l,c->expanded.Get(),S,U);
     // AMD outputs integral pixels; FlowExpand decodes NVOFA S10.5. Cancel
     // its /32 here. Grid spacing and value scale are separate conventions.
     c->expand.SetVectorScale(32.f);na::nvof::ExpandParams ep;ep.depth=depth;ep.validity_out=c->expanded.Get();ep.depth_clear=camera.depth_clear;
-    bool ok=c->expand.DispatchDepthAware(l,c->engine.Grid(),8,ep,c->raw.Get(),w,h,f.slot);
+    bool ok=c->expand.DispatchDepthAware(l,c->engine.Grid(),8,ep,c->raw.Get(),w,h,0,&slot.expand_heap);
     order(l);move(l,c->raw.Get(),U,S);move(l,c->expanded.Get(),U,S);move(l,c->residual.Get(),S,U);move(l,c->valid.Get(),S,U);
-    ok=ok && c->derive.DispatchDeriveResidual(l,c->raw.Get(),depth,camera,prev.jitter,c->residual.Get(),c->valid.Get(),w,h,f.slot,c->expanded.Get());
+    ok=ok && c->derive.DispatchDeriveResidual(l,c->raw.Get(),depth,camera,prev.jitter,c->residual.Get(),c->valid.Get(),w,h,0,c->expanded.Get(),&slot.derive_heap);
     order(l);move(l,c->residual.Get(),U,S);move(l,c->valid.Get(),U,S);move(l,c->mask.Get(),S,U);
-    move(l,c->counters.Get(),U,D3D12_RESOURCE_STATE_COPY_DEST);l->CopyBufferRegion(c->counters.Get(),f.slot*32,c->zero.Get(),0,32);move(l,c->counters.Get(),D3D12_RESOURCE_STATE_COPY_DEST,U);
-    cb.cost=2;c->defaults(f.slot,1);c->srv(f.slot,1,4,c->engine.SceneChange(),DXGI_FORMAT_R32_UINT);
-    c->srv(f.slot,1,1,c->raw.Get(),DXGI_FORMAT_R32G32_FLOAT);c->srv(f.slot,1,2,c->residual.Get(),DXGI_FORMAT_R32G32_FLOAT);
-    c->srv(f.slot,1,3,c->valid.Get(),DXGI_FORMAT_R32_FLOAT);c->srv(f.slot,1,5,im.tex.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);c->srv(f.slot,1,6,prev.tex.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);c->uav(f.slot,1,8,c->mask.Get(),DXGI_FORMAT_R32_FLOAT);
-    if(ok)c->dispatch(l,f.slot,1,c->pso_accept.Get(),cb);order(l);move(l,c->mask.Get(),U,S);c->engine.Finish(l);
-    move(l,c->counters.Get(),U,D3D12_RESOURCE_STATE_COPY_SOURCE);l->CopyBufferRegion(c->readback.Get(),f.slot*48,c->counters.Get(),f.slot*32,32);move(l,c->counters.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,U);
-    if(c->timestamps){l->EndQuery(c->timestamps.Get(),D3D12_QUERY_TYPE_TIMESTAMP,f.slot*2+1);l->ResolveQueryData(c->timestamps.Get(),D3D12_QUERY_TYPE_TIMESTAMP,f.slot*2,2,c->readback.Get(),f.slot*48+32);}
+    move(l,c->counters.Get(),U,D3D12_RESOURCE_STATE_COPY_DEST);l->CopyBufferRegion(c->counters.Get(),0,c->zero.Get(),0,32);move(l,c->counters.Get(),D3D12_RESOURCE_STATE_COPY_DEST,U);
+    cb.cost=2;c->defaults(work,1);c->srv(work,1,4,c->engine.SceneChange(),DXGI_FORMAT_R32_UINT);
+    c->srv(work,1,1,c->raw.Get(),DXGI_FORMAT_R32G32_FLOAT);c->srv(work,1,2,c->residual.Get(),DXGI_FORMAT_R32G32_FLOAT);
+    c->srv(work,1,3,c->valid.Get(),DXGI_FORMAT_R32_FLOAT);c->srv(work,1,5,im.tex.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);c->srv(work,1,6,prev.tex.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);c->uav(work,1,8,c->mask.Get(),DXGI_FORMAT_R32_FLOAT);
+    if(ok)c->dispatch(l,work,1,c->pso_accept.Get(),cb);order(l);move(l,c->mask.Get(),U,S);c->engine.Finish(l);
+    move(l,c->counters.Get(),U,D3D12_RESOURCE_STATE_COPY_SOURCE);l->CopyBufferRegion(slot.readback.Get(),0,c->counters.Get(),0,32);move(l,c->counters.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,U);
+    if(slot.timestamps){l->EndQuery(slot.timestamps.Get(),D3D12_QUERY_TYPE_TIMESTAMP,1);l->ResolveQueryData(slot.timestamps.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0,2,slot.readback.Get(),32);}
     if(ok){out={c->residual.Get(),c->valid.Get(),c->mask.Get()};slot.pair=true;++stats.pairs;reason("AMD same-frame optical flow recorded before DLAA");}
+    else {++stats.unavailable;reason("AMD flow expansion/residual unavailable; camera motion used");}
     return t;
 }
-void Committed(const Ticket& t){if(!t.context)return;std::lock_guard<std::mutex> lock(mutex);auto c=std::static_pointer_cast<Context>(t.context);auto& im=c->images[t.image];im.frame=t.frame.frame;im.generation=t.frame.generation;memcpy(im.jitter,t.frame.jitter,sizeof im.jitter);c->last=static_cast<int>(t.image);c->leases[t.slot].submitted=true;++stats.submitted;}
-void Reset(){std::lock_guard<std::mutex> lock(mutex);current.reset();}
-Stats GetStats(){std::lock_guard<std::mutex> lock(mutex);if(current)collect(*current);return stats;}
+void Committed(const Ticket& t){if(!t.context)return;std::lock_guard<std::mutex> lock(mutex);auto c=std::static_pointer_cast<Context>(t.context);if(c!=current)return;auto& im=*c->images[t.image];im.frame=t.frame.frame;im.generation=t.frame.generation;memcpy(im.jitter,t.frame.jitter,sizeof im.jitter);c->last=static_cast<int>(t.image);auto& slot=*c->leases[t.slot];slot.submitted=true;++stats.submitted;if(slot.pair)++stats.submitted_pairs;stats.last_submitted_frame=t.frame.frame;last_submit_tick=GetTickCount64();}
+void Reset(){std::lock_guard<std::mutex> lock(mutex);current.reset();last_submit_tick=sample_tick=0;stats={};}
+Stats GetStats(){na::nr::native::Maintain();std::lock_guard<std::mutex> lock(mutex);if(current)collect(*current);const auto now=GetTickCount64();stats.submit_age_ms=last_submit_tick?now-last_submit_tick:0;stats.sample_age_ms=sample_tick?now-sample_tick:0;return stats;}
+void DescribeStats(const Stats& s,char* text,size_t capacity){
+    if(!text || !capacity)return;
+    if(!s.submitted || s.submit_age_ms>2000){std::snprintf(text,capacity,"AMD flow: no new submission%s. %s Frames submitted %llu, paired %llu, skipped %llu.",
+        s.submitted?" recently":" yet",s.reason,(unsigned long long)s.submitted,(unsigned long long)s.submitted_pairs,(unsigned long long)(s.busy+s.unavailable));return;}
+    if(!s.samples || !s.total){std::snprintf(text,capacity,"AMD flow: frames submitting. Paired %llu / %llu, skipped %llu. Waiting for a completed pixel sample.",
+        (unsigned long long)s.submitted_pairs,(unsigned long long)s.submitted,(unsigned long long)(s.busy+s.unavailable));return;}
+    std::snprintf(text,capacity,"AMD flow: paired %llu / %llu frames, skipped %llu. Last completed sample: %.2f%% moving pixels, %.2f ms (frame %llu, %llu frames behind).",
+        (unsigned long long)s.submitted_pairs,(unsigned long long)s.submitted,(unsigned long long)(s.busy+s.unavailable),100.0*double(s.accepted)/double(s.total),s.ms,
+        (unsigned long long)s.sample_frame,(unsigned long long)(s.last_submitted_frame>=s.sample_frame?s.last_submitted_frame-s.sample_frame:0));
+}
 }

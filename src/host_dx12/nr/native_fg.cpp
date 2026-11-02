@@ -405,7 +405,7 @@ RecordingLease RetainRecording(ID3D12GraphicsCommandList* list,std::shared_ptr<v
     if(FAILED(list->GetDevice(IID_PPV_ARGS(&device))))return lease;
     std::lock_guard<std::mutex> lock(mutex);Collect();
     auto* r=Track(list,device.Get());if(!r)return lease;
-    r->retained.push_back(std::move(payload));
+    if(std::find(r->retained.begin(),r->retained.end(),payload)==r->retained.end())r->retained.push_back(std::move(payload));
     for(const auto& entry:recordings)if(entry.get()==r){lease.record_=entry;lease.retired_=r->retired;lease.completed_=r->completed;break;}
     return lease;
 }
@@ -423,6 +423,9 @@ bool RecordingLease::Ready(ID3D12CommandQueue* consumer) const {
 }
 bool RecordingLease::Retired() const {
     return retired_ && retired_->load(std::memory_order_acquire);
+}
+bool RecordingLease::SameRecording(const RecordingLease& other) const {
+    return retired_ && retired_==other.retired_;
 }
 void TraceGpuProgress(){
     std::unique_lock<std::mutex> lock(mutex,std::try_to_lock);
@@ -642,6 +645,7 @@ std::shared_ptr<const std::atomic<bool>> TrackUse(ID3D12GraphicsCommandList*){re
 RecordingLease RetainRecording(ID3D12GraphicsCommandList*,std::shared_ptr<void>){return {};}
 bool RecordingLease::Ready(ID3D12CommandQueue*)const{return false;}
 bool RecordingLease::Retired()const{return false;}
+bool RecordingLease::SameRecording(const RecordingLease&)const{return false;}
 void TraceGpuProgress(){}
 void PrepareDevice(ID3D12Device*){}
 void MarkSwapchainBuffer(ID3D12Resource*){}

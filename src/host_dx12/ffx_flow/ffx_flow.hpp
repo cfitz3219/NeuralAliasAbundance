@@ -18,7 +18,11 @@ public:
     PairFlow(); ~PairFlow();
     PairFlow(const PairFlow&)=delete;PairFlow& operator=(const PairFlow&)=delete;
     bool Init(ID3D12Device*,unsigned width,unsigned height,unsigned slots=8);
-    bool Record(ID3D12GraphicsCommandList*,ID3D12Resource* current,ID3D12Resource* previous,unsigned slot);
+    // Optional descriptor storage owned by one executable recording. The caller
+    // may reuse a supplied heap only after its recording lease retires; null
+    // preserves the original frame-slot API. Scratch remains on the same queue.
+    bool Record(ID3D12GraphicsCommandList*,ID3D12Resource* current,ID3D12Resource* previous,unsigned slot,
+                Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>* recording_heap=nullptr);
     void Finish(ID3D12GraphicsCommandList*); // after consumers: return outputs to UAV, so discarded/replayed lists have no CPU state
     ID3D12Resource* Grid() const; // NPSR after Record, valid until next Record on this queue
     ID3D12Resource* SceneChange() const; // R32_UINT 3x1, NPSR; AMD's scene-change/history output

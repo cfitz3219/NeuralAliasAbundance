@@ -17,13 +17,14 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource* r,D3D12_RESOURCE_STATES a,D3D1
 }
 }
 struct PairFlow::Impl {
-    ComPtr<ID3D12Device> device;ComPtr<ID3D12DescriptorHeap> heap;
+    ComPtr<ID3D12Device> device;ComPtr<ID3D12DescriptorHeap> heap,clear_heap;
+    ID3D12DescriptorHeap* active_heap=nullptr; // selected only within serialized Record/Init
     ComPtr<ID3D12RootSignature> root[7];ComPtr<ID3D12PipelineState> pso[7];
     std::vector<Tex> tex;unsigned w=0,h=0,slots=0,stride=0,table=0;
     unsigned luma[2][7]{},flow[2][7]{},hist=0,previous_hist=0,temp=0,scd=0;
     bool initialized=false;const char* error="Not initialized";
-    D3D12_CPU_DESCRIPTOR_HANDLE cpu(unsigned i){auto a=heap->GetCPUDescriptorHandleForHeapStart();a.ptr+=SIZE_T(i)*stride;return a;}
-    D3D12_GPU_DESCRIPTOR_HANDLE gpu(unsigned i){auto a=heap->GetGPUDescriptorHandleForHeapStart();a.ptr+=UINT64(i)*stride;return a;}
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu(unsigned i){auto a=active_heap->GetCPUDescriptorHandleForHeapStart();a.ptr+=SIZE_T(i)*stride;return a;}
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu(unsigned i){auto a=active_heap->GetGPUDescriptorHandleForHeapStart();a.ptr+=UINT64(i)*stride;return a;}
     void view(unsigned i,ID3D12Resource* r,DXGI_FORMAT f,bool uav){
         if(uav){D3D12_UNORDERED_ACCESS_VIEW_DESC d{};d.Format=f;d.ViewDimension=D3D12_UAV_DIMENSION_TEXTURE2D;device->CreateUnorderedAccessView(r,nullptr,&d,cpu(i));}
         else{D3D12_SHADER_RESOURCE_VIEW_DESC d{};d.Format=f;d.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;d.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;d.Texture2D.MipLevels=1;device->CreateShaderResourceView(r,&d,cpu(i));}
@@ -33,13 +34,19 @@ struct PairFlow::Impl {
         D3D12_RESOURCE_DESC d{};d.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;d.Width=width;d.Height=height;
         d.DepthOrArraySize=d.MipLevels=1;d.SampleDesc.Count=1;d.Format=format;d.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         if(FAILED(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&d,U,nullptr,IID_PPV_ARGS(&t.r))))return false;
-        index=static_cast<unsigned>(tex.size());tex.push_back(std::move(t));view(index,tex.back().r.Get(),format,true);return true;
+        index=static_cast<unsigned>(tex.size());tex.push_back(std::move(t));view(index,tex.back().r.Get(),format,true);
+        // ClearUAV reads its CPU descriptor immediately. A shader-visible heap
+        // is CPU write-only; keep the same typed UAV in a non-visible heap.
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};uv.Format=format;uv.ViewDimension=D3D12_UAV_DIMENSION_TEXTURE2D;
+        auto cpu_clear=clear_heap->GetCPUDescriptorHandleForHeapStart();cpu_clear.ptr+=SIZE_T(index)*stride;
+        device->CreateUnorderedAccessView(tex.back().r.Get(),nullptr,&uv,cpu_clear);return true;
     }
     void barrier(ID3D12GraphicsCommandList* l){D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;l->ResourceBarrier(1,&b);}
     void clear(ID3D12GraphicsCommandList* l,unsigned i){
         const UINT z[4]{};const float f[4]{};auto& t=tex[i];
-        if(t.f==DXGI_FORMAT_R32_FLOAT)l->ClearUnorderedAccessViewFloat(gpu(i),cpu(i),t.r.Get(),f,0,nullptr);
-        else l->ClearUnorderedAccessViewUint(gpu(i),cpu(i),t.r.Get(),z,0,nullptr);
+        auto cpu_clear=clear_heap->GetCPUDescriptorHandleForHeapStart();cpu_clear.ptr+=SIZE_T(i)*stride;
+        if(t.f==DXGI_FORMAT_R32_FLOAT)l->ClearUnorderedAccessViewFloat(gpu(i),cpu_clear,t.r.Get(),f,0,nullptr);
+        else l->ClearUnorderedAccessViewUint(gpu(i),cpu_clear,t.r.Get(),z,0,nullptr);
     }
     struct Binding {unsigned reg,index;};
     void run(ID3D12GraphicsCommandList* l,Pass pass,std::initializer_list<Binding> srvs,std::initializer_list<Binding> uavs,
@@ -73,6 +80,9 @@ bool PairFlow::Init(ID3D12Device* dev,unsigned w,unsigned h,unsigned slots){
     p->device=dev;p->w=w;p->h=h;p->slots=slots;p->stride=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     D3D12_DESCRIPTOR_HEAP_DESC hd{};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;hd.NumDescriptors=permanent+slots*per_slot;
     if(FAILED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&p->heap))))return false;
+    p->active_heap=p->heap.Get();
+    hd.NumDescriptors=permanent;hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    if(FAILED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&p->clear_heap))))return false;
     for(unsigned i=0;i<7;++i){const auto b=Shader(static_cast<Pass>(i),false);
         if(FAILED(dev->CreateRootSignature(0,b.data,b.size,IID_PPV_ARGS(&p->root[i]))))return false;
         D3D12_COMPUTE_PIPELINE_STATE_DESC d{};d.pRootSignature=p->root[i].Get();d.CS={b.data,b.size};
@@ -87,10 +97,15 @@ bool PairFlow::Init(ID3D12Device* dev,unsigned w,unsigned h,unsigned slots){
        !p->add(3,1,DXGI_FORMAT_R32_UINT,p->temp) || !p->add(3,1,DXGI_FORMAT_R32_UINT,p->scd))return false;
     p->initialized=true;p->error="";return true;
 }
-bool PairFlow::Record(ID3D12GraphicsCommandList* l,ID3D12Resource* cur,ID3D12Resource* prev,unsigned slot){
+bool PairFlow::Record(ID3D12GraphicsCommandList* l,ID3D12Resource* cur,ID3D12Resource* prev,unsigned slot,
+                     ComPtr<ID3D12DescriptorHeap>* recording_heap){
     if(!l || !cur || !prev || !p->initialized || slot>=p->slots)return false;
     for(auto r:{cur,prev}){auto d=r->GetDesc();if(d.Width!=p->w || d.Height!=p->h || d.SampleDesc.Count!=1 || d.DepthOrArraySize!=1 || d.MipLevels!=1)return false;}
-    ID3D12DescriptorHeap* heap=p->heap.Get();l->SetDescriptorHeaps(1,&heap);
+    if(recording_heap && !*recording_heap){auto hd=p->heap->GetDesc();
+        if(FAILED(p->device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(recording_heap->ReleaseAndGetAddressOf()))))return false;}
+    p->active_heap=recording_heap?recording_heap->Get():p->heap.Get();
+    if(recording_heap)for(unsigned i=0;i<p->tex.size();++i)p->view(i,p->tex[i].r.Get(),p->tex[i].f,true);
+    ID3D12DescriptorHeap* heap=p->active_heap;l->SetDescriptorHeaps(1,&heap);
     p->table=permanent+slot*per_slot;
     for(unsigned i=0;i<p->tex.size();++i)p->clear(l,i);p->barrier(l);
     for(unsigned image=0;image<2;++image){
