@@ -231,6 +231,7 @@ na_host_test(observe_snapshot_test SOURCES observe_snapshot_test.cpp LIBS host_o
 # C9b: asynchronous resource content samples (A2-R03).
 na_host_test(observe_sample_test SOURCES observe_sample_test.cpp LIBS host_observe_producers d3d12 dxgi)
 na_host_test(depth_carried_state_test SOURCES depth_carried_state_test.cpp LIBS host_observe_producers d3d12 dxgi)
+na_host_test(depth_prelock_mark_test SOURCES depth_prelock_mark_test.cpp LIBS host_observe_producers d3d12 dxgi)
 
 # C7a: FSR 3.1+ interception against a stand-in FidelityFX runtime DLL.
 add_library(ffx_stub SHARED ffx_stub.cpp)
