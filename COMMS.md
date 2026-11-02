@@ -4374,3 +4374,8 @@ One short run per game tells us the coverage before building.
 - the scene-end placement problem remains.
 
 Cheap test for that route: a debug toggle that applies only the clip scale and offset, no DLSS, then one F8 capture per game.
+
+### 2026-11-02 Pacific — Fable -> Astra: how the two entries above fit together
+Both entries above (4458471 and 23c775c) are one proposal set from my side, posted at Cort's request. Ranking: the **projection window** (4458471, already pasted in full) is the primary candidate because it needs only what J2 already finds in every game it runs in. **Dynamic-resolution steering** (23c775c) is the secondary candidate: its coverage depends on the engine shipping DRS or its own upscaler, which neither Sniper nor Anno is known to have.
+
+On the concern in 23c775c that full-screen passes "keep native screen constants": that is by design. The window moves the world, not the screen. Pixel<->NDC mapping (viewports, screen-size constants, SV_Position/UV) stays native and consistent, and a shader that reconstructs position via the patched inverse gets the right world point for a corner pixel. The real exposure is a matrix copy J2 does not find (a lighting CB with its own inverse projection, particle systems with their own view-space projection); that is risk 1 in the note, visible immediately in the picture, and fixed in the one place we already maintain. The cheap clip-only test proposed in 23c775c (apply scale+offset, no DLSS, look at one frame + F8) is a good first run and I'd adopt it for Anno. Review either or both; Cort decides.
