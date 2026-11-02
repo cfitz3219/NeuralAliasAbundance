@@ -135,7 +135,8 @@ target_link_libraries(host_scene_scale PUBLIC abundance_options d3d12 d3dcompile
 add_library(host_observe_producers STATIC
   src/host_dx12/observe/producers.cpp
   src/host_dx12/observe/d3d12_slots_check.cpp)
-target_link_libraries(host_observe_producers PUBLIC abundance_options host_observe host_hooking d3d12)
+target_sources(host_observe_producers PRIVATE src/host_dx12/observe/shader_dimensions.cpp)
+target_link_libraries(host_observe_producers PUBLIC abundance_options host_observe host_hooking d3d12 d3dcompiler)
 
 add_library(host_settings STATIC src/host_dx12/settings.cpp)
 target_link_libraries(host_settings PUBLIC abundance_options PRIVATE shell32 ole32)
@@ -195,6 +196,7 @@ add_library(host_dx12 STATIC
   src/host_dx12/j2/compute_flow.cpp
   src/host_dx12/j2/nis_sharpen.cpp
   src/host_dx12/scale/scoped_bindings.cpp
+  src/host_dx12/scale/native_bindings.cpp
     src/host_dx12/scale/scoped_transfers.cpp
     src/host_dx12/scale/scene_frame.cpp
   src/host_dx12/motion/live_flow.cpp

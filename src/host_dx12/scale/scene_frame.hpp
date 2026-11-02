@@ -30,7 +30,12 @@ public:
     // and the inherited stencil plane. Repeated calls are harmless.
     bool SeedHistories(ID3D12GraphicsCommandList*);
     void Written(uint64_t member);
+    void StencilCleared(uint64_t member);
     void Ready();
+    // Nonterminal native-consumer/list-end checkpoint. Inputs stay available
+    // for the existing J2 insertion, while the native renderer has a current
+    // full-size picture even when J2 skips. Only newly written members promote.
+    bool Checkpoint(ID3D12GraphicsCommandList*, const std::vector<FrameMemberState>& current);
     na::j2::PhysicalLookup Input(std::shared_ptr<const na::j2::PhysicalInput>*);
     void Outcome(na::j2::PhysicalOutcome);
     // Called before the first native consumer, including an unavailable/failed
@@ -49,8 +54,10 @@ private:
         Microsoft::WRL::ComPtr<ID3D12Resource> stencil_small, stencil_full;
         std::shared_ptr<const ColorRestore> stencil, seed_stencil;
         bool written = false;
+        bool pending = false, stencil_initialized = false;
     };
     FrameSpec spec_;
+    bool Promote(ID3D12GraphicsCommandList*, bool final);
     std::vector<Promotion> promotions_;
     void Stencil(ID3D12GraphicsCommandList*,Promotion&,bool seed);
     std::mutex mutex_;

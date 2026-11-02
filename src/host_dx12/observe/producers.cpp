@@ -9,6 +9,8 @@
 #include "queue_occurrences.hpp"
 #include "host_dx12/j2/insertion_trace.hpp"
 #include "host_dx12/observe/texture_operation.hpp"
+#include "host_dx12/observe/operation_snapshot.hpp"
+#include "host_dx12/observe/shader_dimensions.hpp"
 #include <tuple>
 #include <algorithm>
 #include <system_error>
@@ -123,6 +125,8 @@ struct ListState {
     bool raster_viewports_known = false, raster_scissors_known = false, raster_topology_known = false;
     bool raster_targets_known = false, raster_has_depth = false;
     bool raster_tracking = false; // latched at Reset; an Off request cannot undo restoration mid-recording
+    std::vector<std::shared_ptr<const DescriptorDetails>> native_colors;
+    std::shared_ptr<const DescriptorDetails> native_depth;
     int8_t mip_level = -1;               // live mip bias: twin level latched at Reset (-1 = the game's own objects)
 };
 
@@ -135,6 +139,7 @@ struct Obj {
     std::vector<na_root_param> root_params; // root signatures (C9 table resolution)
     std::vector<na_root_range> root_ranges;
     uint64_t root_hash = 0;                 // structural layout hash (role classes; stable across sessions)
+    std::vector<ShaderDimension> dimensions;
     // Live mip bias: per-level twins of a root signature / pipeline state (index = level).
     // same[i]: the game's own object is already correct for level i (nothing to swap).
     // Immutable once published; owns a reference on every twin. A twin is never one of
@@ -159,6 +164,7 @@ struct DescHeap {
         uint32_t first_sub = NA_UNKNOWN_U32;
         uint64_t cbv_offset = 0; // CBV: byte offset in `resource`
         uint32_t cbv_size = 0;   // CBV: SizeInBytes
+        std::shared_ptr<const DescriptorDetails> details;
     };
     std::vector<SlotInfo> info; // last observed write per slot (record-time CPU view)
 };
@@ -174,6 +180,7 @@ std::shared_mutex g_m; // registry, heaps, VA table. Never held across a D3D12 c
 // Release can retire an object through its sentinel, which takes g_m and walks this map).
 std::unordered_map<const void*, Obj>& g_objs = *new std::unordered_map<const void*, Obj>();
 std::atomic<bool> g_raster_tracking{false};
+std::atomic<bool> g_operation_snapshots{false};
 void ReleaseTwinsLater(std::shared_ptr<Obj::Twins>&& t); // live mip bias: see the definition
 void ReleaseParkedTwins();
 std::atomic<uint64_t> g_mip_shared_skips{0}; // twin levels dropped: D3D12 returned one of the game's own root signatures
@@ -1057,6 +1064,17 @@ void ensure_heap_registered(ID3D12DescriptorHeap* h)
     dev->Release();
 }
 
+void remember_view(D3D12_CPU_DESCRIPTOR_HANDLE handle, std::shared_ptr<DescriptorDetails> view)
+{
+    if (!view || t_host_work) return;
+    std::unique_lock<std::shared_mutex> lock(g_m);
+    uint32_t slot = 0;
+    if (auto* heap = heap_for_cpu_locked(handle.ptr, &slot)) {
+        view->kind = heap->info[slot].kind;
+        view->resource = heap->info[slot].resource;
+        heap->info[slot].details = std::move(view);
+    }
+}
 void STDMETHODCALLTYPE D_CreateConstantBufferView(ID3D12Device* dev, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE h)
 {
     o_CreateConstantBufferView(dev, desc, h);
@@ -1092,6 +1110,10 @@ void STDMETHODCALLTYPE D_CreateConstantBufferView(ID3D12Device* dev, const D3D12
     e.subresource_count = 1;
     g_c.writes.fetch_add(1);
     emit(e, NA_GROUP_DESCRIPTOR);
+    if (g_operation_snapshots.load() && !t_host_work && desc) {
+        auto view = std::make_shared<DescriptorDetails>(); view->explicit_view = true; view->cbv = *desc;
+        remember_view(h, std::move(view));
+    }
 }
 
 void STDMETHODCALLTYPE D_CreateShaderResourceView(ID3D12Device* dev, ID3D12Resource* r, const D3D12_SHADER_RESOURCE_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
@@ -1100,6 +1122,10 @@ void STDMETHODCALLTYPE D_CreateShaderResourceView(ID3D12Device* dev, ID3D12Resou
     uint32_t first = NA_UNKNOWN_U32, count = NA_UNKNOWN_U32;
     if (d && d->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) { first = d->Texture2D.MostDetailedMip; count = d->Texture2D.MipLevels; }
     note_descriptor_write(h, NA_DESC_SRV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count);
+    if (g_operation_snapshots.load() && !t_host_work) {
+        auto view = std::make_shared<DescriptorDetails>(); view->explicit_view = d != nullptr; if (d) view->srv = *d;
+        remember_view(h, std::move(view));
+    }
 }
 
 void STDMETHODCALLTYPE D_CreateUnorderedAccessView(ID3D12Device* dev, ID3D12Resource* r, ID3D12Resource* counter,
@@ -1109,6 +1135,11 @@ void STDMETHODCALLTYPE D_CreateUnorderedAccessView(ID3D12Device* dev, ID3D12Reso
     uint32_t first = NA_UNKNOWN_U32, count = NA_UNKNOWN_U32;
     if (d && d->ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D) { first = d->Texture2D.MipSlice; count = 1; }
     note_descriptor_write(h, NA_DESC_UAV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count);
+    if (g_operation_snapshots.load() && !t_host_work) {
+        auto view = std::make_shared<DescriptorDetails>(); view->explicit_view = d != nullptr; if (d) view->uav = *d;
+        bool created = false; view->counter = counter ? ensure_registered(counter, NA_OBJ_RESOURCE, &created) : 0;
+        remember_view(h, std::move(view));
+    }
 }
 
 void STDMETHODCALLTYPE D_CreateRenderTargetView(ID3D12Device* dev, ID3D12Resource* r, const D3D12_RENDER_TARGET_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
@@ -1127,6 +1158,10 @@ void STDMETHODCALLTYPE D_CreateRenderTargetView(ID3D12Device* dev, ID3D12Resourc
         first = d->Texture2DMSArray.FirstArraySlice; count = 1; // MSAA textures have exactly one mip
     }
     note_descriptor_write(h, NA_DESC_RTV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count);
+    if (g_operation_snapshots.load() && !t_host_work) {
+        auto view = std::make_shared<DescriptorDetails>(); view->explicit_view = d != nullptr; if (d) view->rtv = *d;
+        remember_view(h, std::move(view));
+    }
 }
 
 void STDMETHODCALLTYPE D_CreateDepthStencilView(ID3D12Device* dev, ID3D12Resource* r, const D3D12_DEPTH_STENCIL_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
@@ -1144,6 +1179,10 @@ void STDMETHODCALLTYPE D_CreateDepthStencilView(ID3D12Device* dev, ID3D12Resourc
         first = d->Texture2DMSArray.FirstArraySlice; count = 1;
     }
     note_descriptor_write(h, NA_DESC_DSV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count);
+    if (g_operation_snapshots.load() && !t_host_work) {
+        auto view = std::make_shared<DescriptorDetails>(); view->explicit_view = d != nullptr; if (d) view->dsv = *d;
+        remember_view(h, std::move(view));
+    }
 }
 
 // Texture LOD (mip) bias for temporal reconstruction (J2 DLAA): with jitter and
@@ -1538,11 +1577,13 @@ uint64_t fnv1a(const void* data, size_t n)
     return h;
 }
 
+thread_local std::vector<ShaderDimension> g_next_dimensions;
 void bytecode(na_ev_pipeline_created& e, uint32_t stage, const D3D12_SHADER_BYTECODE& b)
 {
     if (!b.pShaderBytecode || !b.BytecodeLength) return;
     e.stage_hash[stage] = fnv1a(b.pShaderBytecode, b.BytecodeLength);
     e.stage_bytes[stage] = static_cast<uint32_t>(b.BytecodeLength);
+    if(g_operation_snapshots.load()&&!t_host_work)ReflectDimensions(b,g_next_dimensions);
 }
 
 void depth_blend(na_ev_pipeline_created& e, BOOL depth_enable, D3D12_DEPTH_WRITE_MASK mask, D3D12_COMPARISON_FUNC func)
@@ -1576,6 +1617,10 @@ void emit_pipeline(ID3D12Device* dev, IUnknown* obj, na_ev_pipeline_created& e, 
     e.pipeline = register_object(obj, NA_OBJ_PIPELINE_HOST);
     e.root_signature = rs ? lookup(rs) : 0;
     remember_creation(obj, e);
+    if(g_operation_snapshots.load()&&!t_host_work){
+        std::unique_lock<std::shared_mutex> lock(g_m);
+        const auto found=g_objs.find(canon(obj));if(found!=g_objs.end())found->second.dimensions=g_next_dimensions;
+    }
     emit(e, NA_GROUP_PIPELINE);
 }
 
@@ -1832,6 +1877,7 @@ HRESULT STDMETHODCALLTYPE D_CreateGraphicsPipelineState(ID3D12Device* dev, const
     const HRESULT hr = o_CreateGraphicsPipelineState(dev, d, riid, out);
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj || !d) return hr;
+    g_next_dimensions.clear();
     na_ev_pipeline_created e;
     init_header(e, NA_EV_PIPELINE_CREATED, NA_EVF_FOUNDATIONAL);
     e.pipeline_kind = NA_PIPELINE_GRAPHICS;
@@ -1863,6 +1909,7 @@ HRESULT STDMETHODCALLTYPE D_CreateComputePipelineState(ID3D12Device* dev, const 
     const HRESULT hr = o_CreateComputePipelineState(dev, d, riid, out);
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj || !d) return hr;
+    g_next_dimensions.clear();
     na_ev_pipeline_created e;
     init_header(e, NA_EV_PIPELINE_CREATED, NA_EVF_FOUNDATIONAL);
     e.pipeline_kind = NA_PIPELINE_COMPUTE;
@@ -1936,6 +1983,7 @@ HRESULT STDMETHODCALLTYPE D_CreatePipelineState(ID3D12Device2* dev, const D3D12_
     const HRESULT hr = o_CreatePipelineState(dev, d, riid, out);
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj || !d || !d->pPipelineStateSubobjectStream) return hr;
+    g_next_dimensions.clear();
     na_ev_pipeline_created e;
     init_header(e, NA_EV_PIPELINE_CREATED, NA_EVF_FOUNDATIONAL);
     e.pipeline_kind = NA_PIPELINE_STREAM;
@@ -3239,6 +3287,23 @@ void capture_raster_targets(GL* list, UINT count, const D3D12_CPU_DESCRIPTOR_HAN
     });
     if (!enabled) return;
     if (count > 8 || (count && !targets)) return;
+    if (g_operation_snapshots.load()) {
+        std::shared_lock<std::shared_mutex> lock(g_m);
+        na_object_id id = 0; auto* ls = list_state_locked(list, &id);
+        if (ls) {
+            std::lock_guard<std::mutex> bl(ls->bind_m);
+            ls->native_colors.clear(); ls->native_depth.reset();
+            UINT stride = 0;
+            if (count) { uint32_t slot = 0; if (auto* heap = heap_for_cpu_locked(targets[0].ptr, &slot)) stride = heap->increment; }
+            for (UINT i = 0; i < count; ++i) {
+                uint32_t slot = 0;
+                const auto handle = contiguous ? targets[0].ptr + SIZE_T(i) * stride : targets[i].ptr;
+                const auto* heap = heap_for_cpu_locked(handle, &slot);
+                ls->native_colors.push_back(heap ? heap->info[slot].details : nullptr);
+            }
+            if (depth) { uint32_t slot = 0; if (const auto* heap = heap_for_cpu_locked(depth->ptr, &slot)) ls->native_depth = heap->info[slot].details; }
+        }
+    }
     std::shared_ptr<Obj::Twins> storage;
     {
         std::shared_lock<std::shared_mutex> lock(g_m);
@@ -3313,6 +3378,14 @@ struct ListHook<Slot, R(A...)> {
         // pipelines and the learned profile at every level except the game's own.
         constexpr bool kMipSlot = Slot == sl::list::SetPipelineState || Slot == sl::list::SetGraphicsRootSignature ||
                                   Slot == sl::list::SetComputeRootSignature || Slot == sl::list::Reset;
+        if constexpr (Slot == sl::list::Close) {
+            if (!t_host_work && scope.outermost && !scope.ambiguous && g_shader_hooks_enabled.load(std::memory_order_acquire)) {
+                const auto hooks = std::atomic_load_explicit(&g_shader_hooks, std::memory_order_acquire);
+                if (hooks) for (const auto& hook : hooks->lane) if (hook) {
+                    HostWorkScope own; hook->Closing(l);
+                }
+            }
+        }
         if constexpr (kMipSlot) {
             const std::tuple<std::decay_t<A>...> game{a...}; // what the game passed
             {
@@ -5353,6 +5426,92 @@ void MipBiasCounts(uint64_t* samplers, uint64_t* static_samplers)
 }
 HostWorkScope::HostWorkScope() : prev_(t_host_work) { t_host_work = true; }
 HostWorkScope::~HostWorkScope() { t_host_work = prev_; }
+void SetOperationSnapshots(bool enabled) { g_operation_snapshots.store(enabled); }
+bool ListNativeOperation(ID3D12GraphicsCommandList* list, bool compute, NativeOperation& out)
+{
+    out = {};
+    NativeOperation next; next.compute = compute;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_m);
+        auto* ls = list ? list_state_locked(list, &next.list) : nullptr;
+        if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load() || !ls->generation_known.load()) return false;
+        std::lock_guard<std::mutex> bl(ls->bind_m);
+        if (!ls->restorable || ls->in_render_pass) return false;
+        next.recording = ls->generation.load() + 1; // same public identity as ListRecording
+        auto rs = g_objs.find(canon(ls->root_sig[compute]));
+        if (rs == g_objs.end() || !ls->pso || rs->second.root_params.size() > 64) return false;
+        next.root = static_cast<ID3D12RootSignature*>(const_cast<void*>(ls->root_sig[compute]));
+        next.pipeline = ls->pso;
+        const auto pipeline = g_objs.find(canon(ls->pso));
+        if (pipeline != g_objs.end()) next.pipeline_id = pipeline->second.id;
+        const auto& args = ls->args[compute];
+        for (uint32_t param = 0; param < rs->second.root_params.size(); ++param) {
+            const auto& p = rs->second.root_params[param];
+            if (p.param_type != NA_ROOT_TABLE || param >= args.size() || args[param].type != 1) continue;
+            if (p.first_range > rs->second.root_ranges.size() || p.count > rs->second.root_ranges.size() - p.first_range) return false;
+            uint32_t span = 0; bool sampler = false;
+            for (uint32_t r = 0; r < p.count; ++r) {
+                const auto& range = rs->second.root_ranges[p.first_range + r];
+                if (range.num_descriptors == UINT_MAX || range.table_offset == UINT_MAX ||
+                    range.num_descriptors > 4096 || range.table_offset > 4096 - range.num_descriptors) return false;
+                sampler |= range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+                span = std::max(span, range.table_offset + range.num_descriptors);
+            }
+            if (sampler) continue;
+            uint32_t slot = 0; const auto* heap = heap_for_gpu_locked(args[param].value, &slot);
+            if (!heap || span > heap->count - slot || span > 4096 - next.descriptors.size()) return false;
+            next.tables.push_back({param, static_cast<uint32_t>(next.descriptors.size()), span});
+            for (uint32_t i = 0; i < span; ++i) {
+                const auto& info = heap->info[slot + i];
+                if (!info.details) return false;
+                OperationDescriptor d; d.view = *info.details; d.version = heap->versions[slot + i];
+                next.descriptors.push_back(std::move(d));
+            }
+        }
+        if (!compute) {
+            if (!ls->raster_tracking || !ls->raster_targets_known || !ls->raster_viewports_known || !ls->raster_scissors_known) return false;
+            for (const auto& c : ls->native_colors) {
+                if (!c) return false;
+                OperationDescriptor d; d.view = *c; next.colors.push_back(std::move(d));
+            }
+            if (ls->native_depth) next.depth.view = *ls->native_depth;
+            else if (ls->raster_has_depth) return false;
+            next.viewports.assign(ls->raster_viewports, ls->raster_viewports + ls->raster_viewport_count);
+            next.scissors.assign(ls->raster_scissors, ls->raster_scissors + ls->raster_scissor_count);
+        }
+        if(pipeline!=g_objs.end())for(const auto& field:pipeline->second.dimensions) {
+            for(uint32_t param=0;param<rs->second.root_params.size()&&param<args.size();++param) {
+                const auto& p=rs->second.root_params[param];uint32_t descriptor=UINT_MAX;uint64_t address=0;
+                if(p.param_type==NA_ROOT_CBV&&args[param].type==2&&p.shader_register==field.shader_register&&p.register_space==field.space)address=args[param].value;
+                else if(p.param_type==NA_ROOT_TABLE&&args[param].type==1) {
+                    const auto table=std::find_if(next.tables.begin(),next.tables.end(),[&](const auto& t){return t.param==param;});
+                    if(table==next.tables.end())continue;
+                    for(uint32_t r=0;r<p.count;++r){const auto& range=rs->second.root_ranges[p.first_range+r];
+                        if(range.range_type!=D3D12_DESCRIPTOR_RANGE_TYPE_CBV||range.register_space!=field.space||
+                           field.shader_register<range.base_register||field.shader_register-range.base_register>=range.num_descriptors)continue;
+                        descriptor=table->first+range.table_offset+field.shader_register-range.base_register;
+                        if(descriptor<next.descriptors.size())address=next.descriptors[descriptor].view.cbv.BufferLocation;
+                    }
+                }
+                uint64_t resource=0,offset=0;if(!address||!resolve_va_locked(address,&resource,&offset))continue;
+                auto c=std::find_if(next.constants.begin(),next.constants.end(),[&](const auto& x){return x.param==param&&x.descriptor==descriptor;});
+                if(c==next.constants.end()){NativeOperation::Constant value;value.param=param;value.descriptor=descriptor;value.resource_id=resource;value.offset=offset;
+                    next.constants.push_back(std::move(value));c=std::prev(next.constants.end());}
+                c->bytes=std::max(c->bytes,field.bytes);c->dimensions.push_back(field);
+            }
+        }
+    }
+    const auto acquire = [](OperationDescriptor& d) {
+        if (d.view.resource) { d.resource.Attach(AcquireResource(d.view.resource)); if (!d.resource) return false; }
+        if (d.view.counter) { d.counter.Attach(AcquireResource(d.view.counter)); if (!d.counter) return false; }
+        return true;
+    };
+    for (auto& d : next.descriptors) if (!acquire(d)) return false;
+    for (auto& d : next.colors) if (!acquire(d)) return false;
+    if (next.depth.view.resource && !acquire(next.depth)) return false;
+    for(auto& c:next.constants){c.resource.Attach(AcquireResource(c.resource_id));if(!c.resource)return false;}
+    out = std::move(next); return true;
+}
 ID3D12Resource* AcquireResource(na_object_id id)
 {
     std::shared_lock<std::shared_mutex> lock(g_m);

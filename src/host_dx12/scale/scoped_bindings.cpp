@@ -71,8 +71,9 @@ std::shared_ptr<const PreparedBindings> PreparedBindings::Create(ID3D12Device* d
                 const auto& c = s.constants[v.constant].buffer;
                 D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{c->Address(), (c->Bytes() + 255u) & ~255u};
                 device->CreateConstantBufferView(&cbv, cpu);
-            } else if (v.kind == ShaderView::Kind::Srv) device->CreateShaderResourceView(v.resource.Get(), &v.srv, cpu);
-            else device->CreateUnorderedAccessView(v.resource.Get(), v.counter.Get(), &v.uav, cpu);
+            } else if (v.kind == ShaderView::Kind::NativeCbv) device->CreateConstantBufferView(&v.cbv, cpu);
+            else if (v.kind == ShaderView::Kind::Srv) device->CreateShaderResourceView(v.resource.Get(), v.default_view ? nullptr : &v.srv, cpu);
+            else device->CreateUnorderedAccessView(v.resource.Get(), v.counter.Get(), v.default_view ? nullptr : &v.uav, cpu);
             cpu.ptr += p->increment_;
         }
     }

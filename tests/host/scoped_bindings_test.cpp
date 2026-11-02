@@ -4,7 +4,9 @@
 #include "host_dx12/scale/scoped_bindings.hpp"
 #include "host_dx12/scale/depth_restore.hpp"
 #include "host_dx12/scale/scene_frame.hpp"
+#include "host_dx12/scale/native_bindings.hpp"
 #include "host_dx12/observe/producers.hpp"
+#include "host_dx12/observe/operation_snapshot.hpp"
 #include "host_dx12/nr/native_fg.hpp"
 #include <d3dcompiler.h>
 #include <d3d12sdklayers.h>
@@ -18,6 +20,8 @@ public:
     ID3D12GraphicsCommandList* recording = nullptr;
     unsigned refused = 0;
     std::shared_ptr<SceneFrame> frame;
+    unsigned closing = 0;
+    void Closing(ID3D12GraphicsCommandList* list) noexcept override { if(list==recording)++closing; }
     void Applied(ID3D12GraphicsCommandList*,const na::observe::ShaderCall&,const std::shared_ptr<const PreparedBindings>&)noexcept override {
         if(frame){frame->Written(1);frame->Written(2);}
     }
@@ -62,9 +66,9 @@ int Raster(test::Device& d, int frame_mode=0, bool stencil=false)
     auto cb=test::CreateBuffer(dev,256,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);REQUIRE(color&&depth&&cb);
     const float source[4]={float(w),float(h),3,0};void* mapped=nullptr;REQUIRE(SUCCEEDED(cb->Map(0,nullptr,&mapped)));std::memcpy(mapped,source,sizeof source);
     const char code[]=R"(
-cbuffer C:register(b0){float width,height,marker,pad;};cbuffer R:register(b1){float rw,rh,rm,rp;};
+cbuffer C:register(b0){float ScreenWidth,ScreenHeight,marker,pad;};cbuffer R:register(b1){float RenderWidth,RenderHeight,rm,rp;};
 float4 vs(uint i:SV_VertexID):SV_Position{return float4(float2((i<<1)&2,i&2)*2-1,.5,1);}
-float4 ps():SV_Target{return float4(width,rh,marker,.75);})";
+float4 ps():SV_Target{return float4(ScreenWidth,RenderHeight,marker,.75);})";
     test::ComPtr<ID3DBlob> vs,ps,blob,errors;REQUIRE(SUCCEEDED(D3DCompile(code,sizeof code-1,nullptr,nullptr,nullptr,"vs","vs_5_0",0,0,&vs,&errors)));
     REQUIRE(SUCCEEDED(D3DCompile(code,sizeof code-1,nullptr,nullptr,nullptr,"ps","ps_5_0",0,0,&ps,&errors)));
     D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_CBV,1,0,0,0};D3D12_ROOT_PARAMETER params[2]{};
@@ -131,6 +135,16 @@ float4 ps():SV_Target{return float4(width,rh,marker,.75);})";
     list->SetGraphicsRootDescriptorTable(0,heap->GetGPUDescriptorHandleForHeapStart());list->SetGraphicsRootConstantBufferView(1,cb->GetGPUVirtualAddress());
     list->OMSetRenderTargets(1,&rtv,FALSE,&dsv);const D3D12_VIEWPORT vp{0,0,float(w),float(h),0,1};const D3D12_RECT sc{0,0,w,h};
     list->RSSetViewports(1,&vp);list->RSSetScissorRects(1,&sc);list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    na::observe::NativeOperation observed;
+    REQUIRE(na::observe::ListNativeOperation(list,false,observed));
+    CHECK(observed.colors.size()==1&&observed.colors[0].resource==color&&observed.depth.resource==depth);
+    CHECK(observed.depth.view.dsv.Format==depth_view);
+    // The automatic translator consumes real bindings, not hand-written table/view plans.
+    // Live identities are mapped to this fixture's prepared group identities here only.
+    observed.colors[0].view.resource=1;observed.depth.view.resource=2;
+    BindingSpec automatic;REQUIRE(NativeBindingSpec(observed,group,automatic,error));
+    auto automatic_plan=PreparedBindings::Create(dev,std::move(automatic),error);REQUIRE(automatic_plan);
+    provider->plan=automatic_plan; // use the reflected/observed plan for the real draw below
     if(frame){
         {na::observe::HostWorkScope host;const float old_history[4]={99,77,4,.125f};
             list->ClearRenderTargetView(history_views->GetCPUDescriptorHandleForHeapStart(),old_history,0,nullptr);}
@@ -155,6 +169,11 @@ float4 ps():SV_Target{return float4(width,rh,marker,.75);})";
             callbacks.outcome(callbacks.ctx,13,na::j2::PhysicalOutcome::Failed,"between-list failure");}
         CHECK(callbacks.lookup(callbacks.ctx,1,2,nullptr,&input)==na::j2::PhysicalLookup::None);
         CHECK(callbacks.lookup(callbacks.ctx,99,2,list,&input)==na::j2::PhysicalLookup::None&&!input);
+        // A list-end/native-reader checkpoint supplies a current fallback,
+        // while retaining reduced inputs for J2's later between-lists insertion.
+        REQUIRE(frame->Checkpoint(list,{}));
+        CHECK(callbacks.lookup(callbacks.ctx,1,2,list,&input)==(frame_mode==3?na::j2::PhysicalLookup::Unavailable:na::j2::PhysicalLookup::Provided));
+        callbacks.outcome(callbacks.ctx,13,na::j2::PhysicalOutcome::Failed,"after checkpoint");
     }
     if(frame){
             if(frame_mode==2){na::observe::HostWorkScope host;const float enhanced[4]={float(w+100),float(h+100),9,.75f};list->ClearRenderTargetView(rtv,enhanced,0,nullptr);
@@ -196,6 +215,7 @@ int main()
     test::Device d;if(!test::CreateDevice(d))return test::SkipNoDevice("scoped_bindings_test");auto* dev=d.device.Get();
     test::ComPtr<ID3D12InfoQueue> info;dev->QueryInterface(IID_PPV_ARGS(&info));
     REQUIRE(na::observe::InstallProducers(dev,d.queue.Get(),true));
+    na::observe::SetOperationSnapshots(true);
     REQUIRE(na::observe::InstallListResetTracking(dev,&na::nr::native::Reset));
     na_observe_config cfg{};cfg.size_bytes=sizeof cfg;REQUIRE(na_observe_start(&cfg,sink,nullptr)==NA_OK);
     constexpr UINT w=32,h=16,rw=21,rh=11;const auto fmt=DXGI_FORMAT_R32G32B32A32_FLOAT;
@@ -258,6 +278,13 @@ RWTexture2D<float4> target:register(u0);Texture2D<float> image:register(t0);Samp
     const auto gpu=heap->GetGPUDescriptorHandleForHeapStart();for(UINT i=0;i<3;++i)list->SetComputeRootDescriptorTable(i,{gpu.ptr+uint64_t(i)*inc});
     list->SetComputeRootDescriptorTable(3,samplers->GetGPUDescriptorHandleForHeapStart());list->SetComputeRootConstantBufferView(4,cb->GetGPUVirtualAddress());
     na::observe::ShaderState shadow;REQUIRE(na::observe::ListShaderState(list,true,shadow));CHECK(shadow.count==4&&shadow.resources==heap.Get()&&shadow.samplers==samplers.Get());
+    na::observe::NativeOperation operation;
+    REQUIRE(na::observe::ListNativeOperation(list,true,operation));
+    CHECK(operation.list==na::observe::IdOf(list)&&operation.recording==na::observe::ListRecording(list));
+    CHECK(operation.root==root&&operation.pipeline==pso&&operation.tables.size()==3&&operation.descriptors.size()==3);
+    CHECK(operation.descriptors[0].view.kind==NA_DESC_CBV&&operation.descriptors[0].view.cbv.BufferLocation==cb->GetGPUVirtualAddress());
+    CHECK(operation.descriptors[1].view.kind==NA_DESC_UAV&&operation.descriptors[1].resource==native);
+    CHECK(operation.descriptors[2].view.kind==NA_DESC_SRV&&operation.descriptors[2].resource==input);
     list->Dispatch(w/8,h/4,1); // incomplete private table map: original executes untouched
     CHECK(provider->refused==1);
     provider->plan=plan;list->Dispatch(w/8,h/4,1); // actual private21x11 dispatch/CBVs/SRV/UAV, native sampler

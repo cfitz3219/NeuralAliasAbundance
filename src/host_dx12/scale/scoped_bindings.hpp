@@ -8,10 +8,12 @@ namespace na::scale {
 // descriptor-copy source. Every descriptor in this private heap is created
 // from its typed description and retained resource.
 struct ShaderView {
-    enum class Kind { Srv, Uav, PatchedCbv } kind = Kind::Srv;
+    enum class Kind { Srv, Uav, PatchedCbv, NativeCbv } kind = Kind::Srv;
     Microsoft::WRL::ComPtr<ID3D12Resource> resource, counter;
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};
+    bool default_view = false;
     uint32_t constant = 0; // PatchedCbv: index in BindingSpec::constants
 };
 struct ConstantUse {
@@ -65,6 +67,7 @@ private:
 class BindingProvider {
 public:
     virtual ~BindingProvider() = default;
+    virtual void Closing(ID3D12GraphicsCommandList*) noexcept {}
     // Current recording/op recognition and coherent group admission belong to
     // the provider. It must never infer authority from resolution alone. Return
     // null for unrelated operations. A plan is immutable for all recorded uses.
@@ -90,6 +93,7 @@ public:
     explicit BindingHook(std::shared_ptr<BindingProvider> provider) : provider_(std::move(provider)) {}
     na::observe::ShaderScope Before(ID3D12GraphicsCommandList*, na::observe::ShaderCall&) noexcept override;
     void After(ID3D12GraphicsCommandList*, const na::observe::ShaderCall&, na::observe::ShaderScope&) noexcept override;
+    void Closing(ID3D12GraphicsCommandList* list) noexcept override { if(provider_)provider_->Closing(list); }
 private:
     std::shared_ptr<BindingProvider> provider_;
 };

@@ -26,6 +26,10 @@ public:
     // replacing hook. Restore game state here, even if registration changed in
     // Before. This CPU scope does NOT replace recording/submission GPU leases.
     virtual void After(ID3D12GraphicsCommandList*, const ShaderCall&, ShaderScope&) noexcept = 0;
+    // Same recording lane, before the native Close. A reduced scene can return
+    // current dependencies to native allocations before another list consumes
+    // them. Runs without registry locks, under HostWorkScope.
+    virtual void Closing(ID3D12GraphicsCommandList*) noexcept {}
 };
 // Reconstruction first; Bindings only if forwarding remains necessary. Keeping
 // two explicit lanes lets Layer1 and Layer2 share the existing host hook rather
