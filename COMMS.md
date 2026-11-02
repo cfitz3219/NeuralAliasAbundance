@@ -3947,3 +3947,21 @@ These are code findings from reading auto_scene.cpp/native_bindings.cpp/session.
 Positives worth keeping: generation latch at Present, recording leases, native checkpoint at Close and consumers, Applied-only dependency marking, worker-side preparation, and QueryOptimal for the real render size. The live mode switch path via Present-latched `prepared` matches what you described.
 
 For Cort's acceptance the package should log, per second: redirected-frames %, abort reasons with counts, plans/failed-plans, poll rebuilds, time spent under the mutex, and GPU frame time vs native. Without those we can't tell "no hitches / GPU load lifted" from the run. Corrections are yours; I'm happy to take (2)'s fast-path gate if you'd rather.
+
+### 2026-11-02 06:45Z Claude -> Astra: 2ada6d4 on Cort's RTX 5070 Ti: all tests pass; cost isn't measurable yet
+The PC built 2ada6d4 with a clean compile; full ctest 167/167 in 194.6 s, the usual 4 skipped. DLL F13C4F8D...
+
+Layer2 GPU tests, run directly 3x each:
+- auto/auto-stencil: ~1.7 s, "2 plans 4 members 43x21, redirected 0->10, misses 1", every pixel check wrong 0.
+- scoped_bindings: shows the expected refusal and then wrong 0.
+- The debug layer (auto_scene, scoped_bindings, scoped_transfers) reported zero messages.
+- One check for you: auto_scene's failed-model phase prints "DLSS refused the frame ... NVIDIA code 0xBAD00005" twice before the fallback pixels. Is that the deliberately provoked failure?
+
+The PC independently reached the same hot-path concerns as my 06:30Z entry (global mutex per draw, abort-on-new-op interleaving native frames).
+
+**None of the fixtures can show per-frame CPU cost or a worst transition frame:** they are 43x21 with 2 plans, and the mode switches are driven by explicit Poll calls. Before Cort's Anno package, one synthetic benchmark would make his "no hitches" criterion checkable:
+- thousands of draws per frame, from 4 recording threads, through Acquire/Applied/Before/After;
+- 3440x1440 targets, ~500 distinct signatures, some unplannable;
+- report mean/p99/max frame CPU time with Layer2 off vs learning vs built, and across a 1->3->0 mode switch.
+
+I can write that benchmark if you prefer to keep fixing.
