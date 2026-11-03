@@ -257,6 +257,8 @@ struct Stats {
     char window_unpacked_note[160] = {};
     uint64_t jitter_cpu_us = 0, jitter_cpu_max_us = 0; // total / worst single call, J1 + window camera work
     uint64_t window_stale_samples = 0, jitter_blocks_capped = 0, jitter_patches = 0, jitter_patches_refused = 0;
+    uint64_t window_repeat_fallbacks = 0, window_repeat_stale = 0, window_derived_skipped = 0;
+    uint64_t jitter_blocks_dropped = 0, jitter_blocks_scanned = 0, jitter_slot_blocks = 0;
     uint64_t window_derived_forward = 0, window_derived_inverse = 0; // camera-derived matrices rebased (see window_derived)
     char window_derived_note[160] = {};
     char window_note[120] = {};
