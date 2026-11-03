@@ -42,6 +42,7 @@ struct ExpandParams {
     float depth_clear = 1.0f;
     float depth_tolerance = 0.02f;        // |Î” raw depth| accepted as "same surface" (relative to |depth|+0.01)
     float consistency_px = 2.0f;          // max spread among depth-matching neighbours before validity = 0
+    bool sky = false;                     // clear depth counts as a surface (looser flow rules)
 };
 
 class FlowExpand {

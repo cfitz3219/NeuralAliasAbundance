@@ -7,11 +7,13 @@
 #include "core/motion_arbiter_gpu.hpp"
 #include <d3dcompiler.h>
 #include <mutex>
+#include <atomic>
 #include <vector>
 #include <algorithm>
 #include <cstdio>
 
 namespace na::j2::compute_flow {
+std::atomic<uint32_t> g_loosen{50}; // SetLoosen; read at each Record
 using Microsoft::WRL::ComPtr;using Lease=na::nr::native::RecordingLease;
 namespace {
 constexpr unsigned warm_images=8;constexpr auto S=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,U=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -133,7 +135,10 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
     const int previous=c->last;
     bool pair=!f.reset && previous>=0 && c->images[previous]->frame==f.previous && f.previous && c->images[previous]->generation==f.generation && c->images[previous]->producer.Ready(queue);
     Ticket t;t.context=c;t.image=static_cast<unsigned>(image);t.previous=previous<0?0u:static_cast<unsigned>(previous);t.slot=work;t.frame=f;t.pair=pair;
-    Constants cb{};cb.w=cb.ew=w;cb.h=cb.eh=h;cb.mode=f.hdr?1u:0u;cb.block=8;cb.gw=(w+7)/8;cb.gh=(h+7)/8;
+    const Gates gates=GatesFor(g_loosen.load(std::memory_order_relaxed));
+    Constants cb{};cb.ratio=gates.image_ratio;cb.absolute=gates.image_abs;cb.texture=gates.texture_min;
+    cb.agree_px=gates.agree_px;cb.agree_cos=gates.agree_cos;cb.agree_min=gates.agree_min;
+    cb.w=cb.ew=w;cb.h=cb.eh=h;cb.mode=f.hdr?1u:0u;cb.block=8;cb.gw=(w+7)/8;cb.gh=(h+7)/8;
     // Jitter-stabilised encode (j2_flow fe8ea3e): sample texel q at q + this frame's jitter so both
     // images of a pair sit in the unjittered frame and the engine never sees DLAA's shake.
     cb.jitter_x=f.jitter[0];cb.jitter_y=f.jitter[1];
@@ -146,7 +151,7 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
     move(l,c->raw.Get(),S,U);move(l,c->expanded.Get(),S,U);
     // AMD outputs integral pixels; FlowExpand decodes NVOFA S10.5. Cancel
     // its /32 here. Grid spacing and value scale are separate conventions.
-    c->expand.SetVectorScale(32.f);na::nvof::ExpandParams ep;ep.depth=depth;ep.validity_out=c->expanded.Get();ep.depth_clear=camera.depth_clear;
+    c->expand.SetVectorScale(32.f);na::nvof::ExpandParams ep;ep.depth=depth;ep.validity_out=c->expanded.Get();ep.depth_clear=camera.depth_clear;ep.consistency_px=gates.consistency_px;ep.sky=gates.sky;
     bool ok=c->expand.DispatchDepthAware(l,c->engine.Grid(),8,ep,c->raw.Get(),w,h,0,&slot.expand_heap);
     order(l);move(l,c->raw.Get(),U,S);move(l,c->expanded.Get(),U,S);move(l,c->residual.Get(),S,U);move(l,c->valid.Get(),S,U);
     // Stabilised images: the raw flow carries no jitter shift, so (jitter_prev - jitter_cur) must be 0.
@@ -169,6 +174,20 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
     else {++stats.unavailable;reason("AMD flow expansion/residual unavailable; camera motion used");}
     return t;
 }
+Gates GatesFor(uint32_t percent){
+    const float k=float(percent>100?100:percent)/100.f;
+    Gates g{};
+    g.image_ratio=.5f+.5f*k;      // flow must beat camera-only by this ratio: 0.5 -> 1.0 (just not worse)
+    g.image_abs=.08f+.12f*k;      // absolute image error allowed: 0.08 -> 0.20
+    g.texture_min=.03f-.02f*k;    // local contrast needed to trust a match: 0.03 -> 0.01
+    g.agree_px=3.f+3.f*k;         // temporal agreement distance: 3 -> 6 px
+    g.agree_cos=.5f-.4f*k;        // temporal agreement direction: 60 -> ~84 degrees
+    g.agree_min=k>=.5f?0u:1u;     // from 50: a first sighting counts without a previous agreeing pair
+    g.consistency_px=2.f+2.f*k;   // neighbouring-block spread: 2 -> 4 px
+    g.sky=k>0.f;                  // objects against clear depth (sky) are no longer rejected
+    return g;
+}
+void SetLoosen(uint32_t percent){g_loosen.store(percent>100?100u:percent,std::memory_order_relaxed);}
 void Committed(const Ticket& t){if(!t.context)return;std::lock_guard<std::mutex> lock(mutex);auto c=std::static_pointer_cast<Context>(t.context);if(c!=current)return;auto& im=*c->images[t.image];im.frame=t.frame.frame;im.generation=t.frame.generation;memcpy(im.jitter,t.frame.jitter,sizeof im.jitter);c->last=static_cast<int>(t.image);auto& slot=*c->leases[t.slot];slot.submitted=true;++stats.submitted;if(slot.pair)++stats.submitted_pairs;
     if(slot.pair && slot.hist_written>=0){c->hist_read=static_cast<unsigned>(slot.hist_written);c->hist_frame=t.frame.frame;c->hist_generation=t.frame.generation;slot.hist_written=-1;}stats.last_submitted_frame=t.frame.frame;last_submit_tick=GetTickCount64();}
 void Reset(){std::lock_guard<std::mutex> lock(mutex);current.reset();last_submit_tick=sample_tick=0;stats={};}

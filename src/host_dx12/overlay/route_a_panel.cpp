@@ -970,10 +970,6 @@ void DrawLiveDlaa()
         }
         EndRow();
     }
-    bool jit = na::j2::Jitter();
-    BeginRow("Camera jitter", "Shifts the camera by a fraction of a pixel each frame so DLAA can sharpen as well as smooth. Switch off if the picture shimmers or flickers.", SwitchWidth());
-    if (Switch("j2jit", &jit)) na::j2::SetJitter(jit);
-    EndRow();
     {
         static const char* kViews[] = {"Off (normal picture)", "Motion vectors", "Fine motion (sub-pixel)", "Depth"};
         int dv = na::j2::DebugView();
@@ -981,71 +977,6 @@ void DrawLiveDlaa()
         ImGui::SetNextItemWidth(S(220));
         if (ImGui::Combo("##j2dbg", &dv, kViews, 4)) na::j2::SetDebugView(dv);
         EndRow();
-    }
-    {
-        // P4-0b: moving-object motion from NVIDIA hardware optical flow (test; off by default).
-        bool fl = na::j2::flow::Enabled();
-        BeginRow("Moving-object motion (test)", "Adds estimated motion for moving objects. Uses NVIDIA flow between command lists, or AMD compute flow inside the game's list. Requires extra GPU time. Turn it off to compare; the Motion vectors debug view shows the result.", SwitchWidth());
-        if (Switch("j2flow", &fl)) na::j2::flow::SetEnabled(fl);
-        EndRow();
-        if (fl) {
-            const na::j2::flow::Stats fs = na::j2::flow::GetStats();
-            const auto cs=na::j2::compute_flow::GetStats();
-            if(na::j2::GetStats().inline_mode || (!fs.available && cs.recorded)){
-                char line[500];na::j2::compute_flow::DescribeStats(cs,line,sizeof line);
-                StatusLine(0,line);
-                if(cs.samples && cs.total){char detail[330];std::snprintf(detail,sizeof detail,
-                    "Last sample excluded: small motion %.1f%%, invalid/depth %.1f%%, image/flat %.1f%%, offscreen %.1f%%. Recording resources %u, history images %u.",
-                    100.0*double(cs.rejected_small)/double(cs.total),100.0*double(cs.rejected_invalid)/double(cs.total),
-                    100.0*double(cs.rejected_image)/double(cs.total),100.0*double(cs.rejected_offscreen)/double(cs.total),cs.recording_slots,cs.image_slots);
-                    Hint(detail);}
-            }else{
-            const uint64_t px = fs.px_accepted + fs.px_invalid + fs.px_small + fs.px_cost + fs.px_offscreen + fs.px_image + fs.px_flicker;
-            const double pct = px ? 100.0 * static_cast<double>(fs.px_accepted) / static_cast<double>(px) : 0.0;
-            char tb[360];
-            const double flick = px ? 100.0 * static_cast<double>(fs.px_flicker) / static_cast<double>(px) : 0.0;
-            std::snprintf(tb, sizeof tb, "%s Moving pixels found: %.1f%% of the picture (%.1f%% rejected as jitter flicker). Cost %.2f ms (average %.2f). Pairs %llu, camera-only frames %llu (batch %llu, busy %llu, reset %llu).",
-                          fs.reason, pct, flick, fs.ms_last, fs.ms_avg, static_cast<unsigned long long>(fs.consumed),
-                          static_cast<unsigned long long>(fs.encode_only + fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_split),
-                          static_cast<unsigned long long>(fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_reset));
-            StatusLine(fs.latched ? 2 : 0, tb);
-            }
-        }
-    }
-    {
-        // Texture detail (negative mip bias, NVIDIA DLSS guide 3.5: -1 at native).
-        // Games build their samplers at load, so a change applies at the next start;
-        // the setting lives in this game's own NeuralAliasHost.ini (per game).
-        static const char* kDetail[] = {"Off (game's own)", "Light (-0.5)", "Standard (-1, NVIDIA)"};
-        static const int kDetailX100[] = {0, -50, -100};
-        na::settings::Settings& ss = na::settings::Get();
-        const int cur = ss.j2_mip_bias_x100.load();
-        int idx = 2;
-        for (int i = 0; i < 3; ++i) if (kDetailX100[i] == cur) idx = i;
-        const auto ml = na::observe::GetMipLiveStats();
-        const bool live = ml.enabled && (ml.twin_pipelines > 0 || ml.twin_root_signatures > 0);
-        BeginRow("Texture detail", "Samples surface textures sharper so DLAA can rebuild their full detail (NVIDIA's DLSS guide recommends -1 at native resolution). Very fine patterns such as fabric weaves can shimmer at -1; Light is gentler. Screen effects are never changed. Switches live (from the next frame); remembered for this game.", S(220));
-        ImGui::SetNextItemWidth(S(220));
-        if (ImGui::Combo("##j2detail", &idx, kDetail, 3)) {
-            ss.j2_mip_bias_x100.store(kDetailX100[idx]);
-            na::observe::SetSamplerMipBiasLive(kDetailX100[idx] / 100.0f);
-            na::settings::Save();
-        }
-        EndRow();
-        uint64_t ns = 0, nst = 0;
-        na::observe::MipBiasCounts(&ns, &nst);
-        na::observe::NativeBiasStats nb;
-        na::observe::NativeMipBiases(&nb);
-        char tb[400];
-        const float active = na::observe::SamplerMipBias();
-        std::snprintf(tb, sizeof tb, "Now: %.1f (game loaded at %.1f; %llu root signatures and %llu pipelines prepared for switching, %llu fixed, %llu fall-backs). Game's own bias on its surface textures: %llu below 0, %llu at 0, %llu above.",
-                      active, ml.game_bias, static_cast<unsigned long long>(ml.twin_root_signatures), static_cast<unsigned long long>(ml.twin_pipelines),
-                      static_cast<unsigned long long>(ml.untwinned_pipelines), static_cast<unsigned long long>(ml.fallbacks),
-                      static_cast<unsigned long long>(nb.negative), static_cast<unsigned long long>(nb.zero), static_cast<unsigned long long>(nb.positive));
-        StatusLine(0, tb);
-        (void)ns; (void)nst;
-        if (!live && static_cast<int>(ml.game_bias * -100.0f + 0.5f) != -cur)
-            StatusLine(2, "Live switching is not available in this session (no prepared pipelines): restart the game to see this change.");
     }
     {
         // Where DLAA is placed in this game's frame, chosen automatically (or forced in the ini).
@@ -1120,11 +1051,102 @@ void DrawLiveDlaa()
     EndGroupBox();
 }
 
+
+// Cort 2026-11-03: the DLAA enhancements (camera jitter, moving-object motion, texture detail)
+// live on the Enhancements page, the same for every game.
+void DrawLiveDlaaEnhancements()
+{
+    using namespace na::ui;
+    if (!na::j2::Configured()) return;
+    BeginGroupBox("DLAA enhancements");
+    bool jit = na::j2::Jitter();
+    BeginRow("Camera jitter", "Shifts the camera by a fraction of a pixel each frame so DLAA can sharpen as well as smooth. Switch off if the picture shimmers or flickers.", SwitchWidth());
+    if (Switch("j2jit", &jit)) na::j2::SetJitter(jit);
+    EndRow();
+    {
+        // P4-0b: moving-object motion from NVIDIA hardware optical flow (test; off by default).
+        bool fl = na::j2::flow::Enabled();
+        BeginRow("Moving-object motion (test)", "Adds estimated motion for moving objects. Uses NVIDIA flow between command lists, or AMD compute flow inside the game's list. Requires extra GPU time. Turn it off to compare; the Motion vectors debug view shows the result.", SwitchWidth());
+        if (Switch("j2flow", &fl)) na::j2::flow::SetEnabled(fl);
+        EndRow();
+        {
+            na::settings::Settings& ss = na::settings::Get();
+            int loose = static_cast<int>(ss.j2_flow_loosen.load());
+            BeginRow("Moving-object rules", "How much of what the optical flow finds is accepted. 0% = the original strict rules. Higher accepts more moving objects (including ones against the sky) but can add smearing or shimmer. Compare with the Motion vectors debug view.", S(220));
+            ImGui::SetNextItemWidth(S(220));
+            if (ImGui::SliderInt("##j2flowloose", &loose, 0, 100, loose ? "%d%% looser" : "Strict (original)", ImGuiSliderFlags_AlwaysClamp))
+                ss.j2_flow_loosen.store(static_cast<uint32_t>(loose));
+            if (ImGui::IsItemDeactivatedAfterEdit()) na::settings::Save();
+            EndRow();
+        }
+        if (fl) {
+            const na::j2::flow::Stats fs = na::j2::flow::GetStats();
+            const auto cs=na::j2::compute_flow::GetStats();
+            if(na::j2::GetStats().inline_mode || (!fs.available && cs.recorded)){
+                char line[500];na::j2::compute_flow::DescribeStats(cs,line,sizeof line);
+                StatusLine(0,line);
+                if(cs.samples && cs.total){char detail[330];std::snprintf(detail,sizeof detail,
+                    "Last sample excluded: small motion %.1f%%, invalid/depth %.1f%%, image/flat %.1f%%, offscreen %.1f%%. Recording resources %u, history images %u.",
+                    100.0*double(cs.rejected_small)/double(cs.total),100.0*double(cs.rejected_invalid)/double(cs.total),
+                    100.0*double(cs.rejected_image)/double(cs.total),100.0*double(cs.rejected_offscreen)/double(cs.total),cs.recording_slots,cs.image_slots);
+                    Hint(detail);}
+            }else{
+            const uint64_t px = fs.px_accepted + fs.px_invalid + fs.px_small + fs.px_cost + fs.px_offscreen + fs.px_image + fs.px_flicker;
+            const double pct = px ? 100.0 * static_cast<double>(fs.px_accepted) / static_cast<double>(px) : 0.0;
+            char tb[360];
+            const double flick = px ? 100.0 * static_cast<double>(fs.px_flicker) / static_cast<double>(px) : 0.0;
+            std::snprintf(tb, sizeof tb, "%s Moving pixels found: %.1f%% of the picture (%.1f%% rejected as jitter flicker). Cost %.2f ms (average %.2f). Pairs %llu, camera-only frames %llu (batch %llu, busy %llu, reset %llu).",
+                          fs.reason, pct, flick, fs.ms_last, fs.ms_avg, static_cast<unsigned long long>(fs.consumed),
+                          static_cast<unsigned long long>(fs.encode_only + fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_split),
+                          static_cast<unsigned long long>(fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_reset));
+            StatusLine(fs.latched ? 2 : 0, tb);
+            }
+        }
+    }
+    {
+        // Texture detail (negative mip bias, NVIDIA DLSS guide 3.5: -1 at native).
+        // Games build their samplers at load, so a change applies at the next start;
+        // the setting lives in this game's own NeuralAliasHost.ini (per game).
+        static const char* kDetail[] = {"Off (game's own)", "Light (-0.5)", "Standard (-1, NVIDIA)"};
+        static const int kDetailX100[] = {0, -50, -100};
+        na::settings::Settings& ss = na::settings::Get();
+        const int cur = ss.j2_mip_bias_x100.load();
+        int idx = 2;
+        for (int i = 0; i < 3; ++i) if (kDetailX100[i] == cur) idx = i;
+        const auto ml = na::observe::GetMipLiveStats();
+        const bool live = ml.enabled && (ml.twin_pipelines > 0 || ml.twin_root_signatures > 0);
+        BeginRow("Texture detail", "Samples surface textures sharper so DLAA can rebuild their full detail (NVIDIA's DLSS guide recommends -1 at native resolution). Very fine patterns such as fabric weaves can shimmer at -1; Light is gentler. Screen effects are never changed. Switches live (from the next frame); remembered for this game.", S(220));
+        ImGui::SetNextItemWidth(S(220));
+        if (ImGui::Combo("##j2detail", &idx, kDetail, 3)) {
+            ss.j2_mip_bias_x100.store(kDetailX100[idx]);
+            na::observe::SetSamplerMipBiasLive(kDetailX100[idx] / 100.0f);
+            na::settings::Save();
+        }
+        EndRow();
+        uint64_t ns = 0, nst = 0;
+        na::observe::MipBiasCounts(&ns, &nst);
+        na::observe::NativeBiasStats nb;
+        na::observe::NativeMipBiases(&nb);
+        char tb[400];
+        const float active = na::observe::SamplerMipBias();
+        std::snprintf(tb, sizeof tb, "Now: %.1f (game loaded at %.1f; %llu root signatures and %llu pipelines prepared for switching, %llu fixed, %llu fall-backs). Game's own bias on its surface textures: %llu below 0, %llu at 0, %llu above.",
+                      active, ml.game_bias, static_cast<unsigned long long>(ml.twin_root_signatures), static_cast<unsigned long long>(ml.twin_pipelines),
+                      static_cast<unsigned long long>(ml.untwinned_pipelines), static_cast<unsigned long long>(ml.fallbacks),
+                      static_cast<unsigned long long>(nb.negative), static_cast<unsigned long long>(nb.zero), static_cast<unsigned long long>(nb.positive));
+        StatusLine(0, tb);
+        (void)ns; (void)nst;
+        if (!live && static_cast<int>(ml.game_bias * -100.0f + 0.5f) != -cur)
+            StatusLine(2, "Live switching is not available in this session (no prepared pipelines): restart the game to see this change.");
+    }
+    EndGroupBox();
+}
+
 } // namespace
 
 void RegisterLiveDlaaMenu()
 {
     na::menu::Register({"Live DLAA", na::menu::Availability::Available, nullptr, &DrawLiveDlaa, na::menu::Page::Picture});
+    na::menu::Register({"DLAA enhancements", na::menu::Availability::Available, nullptr, &DrawLiveDlaaEnhancements, na::menu::Page::Enhancements});
 }
 
 void RegisterRouteAMenu()

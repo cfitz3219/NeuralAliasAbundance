@@ -30,7 +30,14 @@ int main(int argc,char**){
     auto reset=[&](){na::nr::native::Reset(l.list.Get());na::nr::native::Maintain();l.Reset();};execute();reset();
     na::motion::gpu::Inputs camera;camera.depth=depth.Get();camera.tier2_valid_flag=true;
     for(int j=0;j<16;++j)camera.inv_view_proj_current.m[j]=camera.view_proj_previous.m[j]=(j%5==0)?1.f:0.f;
-    namespace cf=na::j2::compute_flow;cf::Frame f;f.frame=1;f.generation=1;cf::Tier3 tier;
+    namespace cf=na::j2::compute_flow;
+    // The original gates (flow_loosen 0) are what this case pins down; the looser levels below.
+    {const auto g0=cf::GatesFor(0),g50=cf::GatesFor(50),g100=cf::GatesFor(100);
+     CHECK(g0.agree_min==1 && !g0.sky && g0.image_ratio==.5f && g0.texture_min==.03f && g0.consistency_px==2.f);
+     CHECK(g50.agree_min==0 && g50.sky && g50.image_ratio>g0.image_ratio && g50.texture_min<g0.texture_min);
+     CHECK(g100.image_ratio==1.f && g100.agree_px==6.f && g100.consistency_px==4.f && cf::GatesFor(500).image_ratio==1.f);}
+    cf::SetLoosen(0);
+    cf::Frame f;f.frame=1;f.generation=1;cf::Tier3 tier;
     auto seed=cf::Record(l.list.Get(),d.queue.Get(),before.Get(),depth.Get(),camera,f,tier);REQUIRE(seed.context);CHECK(!tier.residual);execute();cf::Committed(seed);
     // Completion without Reset is insufficient: the closed list can be replayed.
     auto busy=cf::Record(l.list.Get(),d.queue.Get(),after.Get(),depth.Get(),camera,f,tier);CHECK(!busy.context);reset();

@@ -17,6 +17,12 @@ struct Tier3 {ID3D12Resource *residual=nullptr,*valid=nullptr,*mask=nullptr;};
 Ticket Record(ID3D12GraphicsCommandList*,ID3D12CommandQueue*,ID3D12Resource* color,ID3D12Resource* depth,
               const na::motion::gpu::Inputs&,const Frame&,Tier3&);
 void Committed(const Ticket&); // only after J2's actual submission, never on record
+// Acceptance looseness 0..100 (Cort 2026-11-03): 0 = the original Anno-run gates; higher values
+// widen the image, temporal and depth-neighbour tests and let objects against clear depth (sky)
+// through. Read at each Record.
+void SetLoosen(uint32_t percent);
+struct Gates { float image_ratio, image_abs, texture_min, agree_px, agree_cos, consistency_px; uint32_t agree_min; bool sky; };
+Gates GatesFor(uint32_t percent); // pure, for tests and the panel
 void Reset(); // old contexts stay retained by their executable/GPU recordings
 struct Stats {
     uint64_t recorded=0,submitted=0,pairs=0,busy=0,resets=0,accepted=0,total=0;

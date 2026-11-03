@@ -101,6 +101,8 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
     {
         const int v = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpness", 100, ini));
         target.j2_sharpness.store(static_cast<uint32_t>(v < 0 ? 0 : (v > 150 ? 150 : v))); // 101..150 extends RCAS
+        const int fl = static_cast<int>(GetPrivateProfileIntW(L"j2", L"flow_loosen", 50, ini));
+        target.j2_flow_loosen.store(static_cast<uint32_t>(fl < 0 ? 0 : (fl > 100 ? 100 : fl)));
         wchar_t mb[32] = {};
         GetPrivateProfileStringW(L"j2", L"mip_bias", L"-1.0", mb, 32, ini);
         double mbv = _wtof(mb);
@@ -254,6 +256,8 @@ bool SaveFromWorker()
     const auto sharpness = g_settings.j2_sharpness.load();
     swprintf_s(v, L"%u", sharpness > 150 ? 150 : sharpness);
     ok &= WritePrivateProfileStringW(L"j2", L"sharpness", v, ini) != 0;
+    swprintf_s(v, L"%u", g_settings.j2_flow_loosen.load() > 100 ? 100u : g_settings.j2_flow_loosen.load());
+    ok &= WritePrivateProfileStringW(L"j2", L"flow_loosen", v, ini) != 0;
     {
         const uint32_t pv = g_settings.j2_preset.load();
         if (pv >= 1 && pv <= 26) swprintf_s(v, L"%c", static_cast<wchar_t>(L'A' + pv - 1));
