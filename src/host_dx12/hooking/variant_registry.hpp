@@ -60,8 +60,8 @@ constexpr uint32_t kScopeDepth = 32;
 // separate kind so (a) objects are only snapshotted through a pointer obtained by
 // QueryInterface(ID3D12GraphicsCommandList4) (never reading past a shorter table)
 // and (b) base command-list coverage never depends on these optional slots.
-enum class Kind : uint32_t { CommandList = 0, Device = 1, CommandList4 = 2 };
-constexpr uint32_t kKinds = 3;
+enum class Kind : uint32_t { CommandList = 0, Device = 1, CommandList4 = 2, CommandList7 = 3 };
+constexpr uint32_t kKinds = 4;
 
 struct SlotSpec {
     uint32_t slot;          // vtable index (e.g. 30 = ID3D12GraphicsCommandList::SetGraphicsRootSignature)

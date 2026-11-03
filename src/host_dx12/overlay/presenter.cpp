@@ -29,7 +29,7 @@ constexpr uint32_t kMaxGenerated = 5; // 6x
 constexpr uint32_t kPresentsPerSlot = kMaxGenerated + 1;
 constexpr uint32_t kQueriesPerSlot = 2 + kPresentsPerSlot;
 constexpr uint32_t kJobs = 4;
-constexpr uint32_t kChains = 2;
+constexpr uint32_t kChains = 16; // eight proxy/base pairs; GPU objects remain lazy
 
 Originals g_orig;
 std::atomic<bool> g_enabled{false};
@@ -107,7 +107,11 @@ struct Chain {
     std::atomic<UINT64> presentation_last{0};
     bool queues_bound=false;
     std::vector<ComPtr<ID3D12Resource>> proxies;
-    UINT virtual_index = 0;
+    std::atomic<bool> external_owner{false};
+    std::mutex buffers_m; // never held across callbacks or while acquiring m
+    std::vector<ComPtr<ID3D12Resource>> resize_proxies;
+    UINT resize_index=0;
+    std::atomic<UINT> virtual_index{0},proxy_count{0};
     ComPtr<ID3D12GraphicsCommandList> list_gen, list_present;
     Slot slots[kSlots];
     ComPtr<ID3D12Fence> fence;
@@ -194,6 +198,7 @@ bool uav_supported(Chain& c, DXGI_FORMAT fmt)
 // Proxies: created at the game's first GetBuffer (or after a resize).
 bool ensure_proxies_locked(Chain& c)
 {
+    std::lock_guard<std::mutex> buffers_lock(c.buffers_m);
     if (!c.proxies.empty()) return true;
     if (FAILED(c.sc->GetDesc(&c.desc))) return false;
     if (!c.device && FAILED(c.sc->GetDevice(IID_PPV_ARGS(&c.device)))) return false;
@@ -203,6 +208,7 @@ bool ensure_proxies_locked(Chain& c)
     for (UINT i = 0; i < n; ++i) {
         if (!create_texture(c, c.desc.BufferDesc.Width, c.desc.BufferDesc.Height, c.desc.BufferDesc.Format, c.uav_ok, true,
                             D3D12_RESOURCE_STATE_PRESENT, c.proxies[i])) {
+            c.proxy_count.store(0,std::memory_order_release);
             c.proxies.clear();
             return false;
         }
@@ -213,6 +219,7 @@ bool ensure_proxies_locked(Chain& c)
     c.virtual_index = 0;
     c.display_hz = refresh_hz_for(c.desc.OutputWindow);
     g_display_hz.store(c.display_hz);
+    c.proxy_count.store(n,std::memory_order_release);
     g_proxied.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
@@ -277,7 +284,7 @@ bool ensure_ready_locked(Chain& c)
     if (!c.queried_latency_handle && g_orig.get_latency_object && (c.desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))
         c.queried_latency_handle = g_orig.get_latency_object(c.sc3.Get());
     if (!g_orig.get_buffer || !g_orig.get_index || !g_orig.present) return false;
-    if(!c.queues_bound && g_orig.resize_queues && g_orig.execute) {
+    if(!c.external_owner && !c.queues_bound && g_orig.resize_queues && g_orig.execute) {
         if(!c.presentation_queue) {
             D3D12_COMMAND_QUEUE_DESC q{}; q.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
             if(FAILED(c.device->CreateCommandQueue(&q,IID_PPV_ARGS(&c.presentation_queue)))) return false;
@@ -387,7 +394,11 @@ bool release_size_dependent_locked(Chain& c)
 {
     if (!drain_locked(c, 2000) || !wait_fence(c, c.last_signal.load(), 2000) || !wait_presentation(c,c.presentation_last.load(),2000)) return false;
     if (!c.proxies.empty()) g_proxied.fetch_sub(1, std::memory_order_relaxed);
-    c.proxies.clear();
+    {
+        std::lock_guard<std::mutex> buffers_lock(c.buffers_m);
+        c.proxy_count.store(0,std::memory_order_release);
+        c.proxies.clear();
+    }
     for (Slot& s : c.slots) {
         s.real_copy.Reset();
         for (auto& t : s.interp) t.Reset();
@@ -714,7 +725,26 @@ bool Proxied(IDXGISwapChain* sc)
     if (!Enabled() || !sc) return false;
     std::lock_guard<std::mutex> lock(g_chains_m);
     Chain* c = find_chain(sc);
-    return c && !c->proxies.empty();
+    return c && c->proxy_count.load(std::memory_order_acquire)!=0;
+}
+
+bool NoteExternalOwner(IDXGISwapChain* sc) {
+    if(!sc)return false;Chain* c=nullptr;
+    {std::lock_guard<std::mutex> lock(g_chains_m);
+        c=find_chain(sc);if(!c)for(auto& slot:g_chains)if(!slot.sc){c=&slot;c->sc=sc;break;}}
+    if(!c)return false;
+    std::lock_guard<std::mutex> lock(c->m);c->external_owner=true;
+    return c->proxies.empty() && c->resize_proxies.empty();
+}
+void AfterResize(IDXGISwapChain* sc,HRESULT result) {
+    Chain* c=nullptr;{std::lock_guard<std::mutex> lock(g_chains_m);c=find_chain(sc);}
+    if(!c)return;std::lock_guard<std::mutex> lock(c->m);
+    if(FAILED(result) && c->proxies.empty() && !c->resize_proxies.empty()){
+        std::lock_guard<std::mutex> buffers_lock(c->buffers_m);
+        c->proxies=std::move(c->resize_proxies);c->virtual_index=c->resize_index;c->proxy_count.store(static_cast<UINT>(c->proxies.size()),std::memory_order_release);
+        g_proxied.fetch_add(1,std::memory_order_relaxed);
+    }
+    c->resize_proxies.clear();
 }
 
 bool HandleGetBuffer(IDXGISwapChain* sc, UINT index, REFIID riid, void** out, HRESULT* hr)
@@ -730,11 +760,24 @@ bool HandleGetBuffer(IDXGISwapChain* sc, UINT index, REFIID riid, void** out, HR
             c->sc = sc;
         }
     }
+    // SL's consumer may hold its own mutex while asking for this buffer.
+    // Already-acquired images never acquire the presenter state mutex: Present
+    // calls the NR consumer while holding that mutex. This avoids that inversion.
+    auto acquired=[&](){
+        if(c->proxies.empty())return false;
+        if(index>=c->proxies.size()){*hr=DXGI_ERROR_INVALID_CALL;*out=nullptr;return true;}
+        *hr=c->proxies[index]->QueryInterface(riid,out);return true;
+    };
+    {
+        std::lock_guard<std::mutex> buffers_lock(c->buffers_m);
+        if(acquired())return true;
+        if(c->external_owner.load(std::memory_order_acquire))return false;
+    }
     std::lock_guard<std::mutex> lock(c->m);
-    if (!ensure_proxies_locked(*c)) return false; // fall back to the original buffers
-    if (index >= c->proxies.size()) { *hr = DXGI_ERROR_INVALID_CALL; *out = nullptr; return true; }
-    *hr = c->proxies[index]->QueryInterface(riid, out);
-    return true;
+    if(c->external_owner.load(std::memory_order_acquire))return false;
+    if(!ensure_proxies_locked(*c))return false;
+    std::lock_guard<std::mutex> buffers_lock(c->buffers_m);
+    return acquired();
 }
 
 bool HandleGetIndex(IDXGISwapChain* sc, UINT* out)
@@ -742,25 +785,31 @@ bool HandleGetIndex(IDXGISwapChain* sc, UINT* out)
     if (!Enabled() || !sc || !out) return false;
     std::lock_guard<std::mutex> lock(g_chains_m);
     Chain* c = find_chain(sc);
-    if (!c || c->proxies.empty()) return false;
-    *out = c->virtual_index;
+    if (!c || !c->proxy_count.load(std::memory_order_acquire)) return false;
+    *out = c->virtual_index.load(std::memory_order_relaxed);
     return true;
 }
 
-void BeforeResize(IDXGISwapChain* sc)
+bool BeforeResize(IDXGISwapChain* sc)
 {
-    if (!Enabled() || !sc) return;
+    if (!Enabled() || !sc) return true;
     Chain* c = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_chains_m);
         c = find_chain(sc);
     }
-    if (!c) return;
+    if (!c) return true;
     std::lock_guard<std::mutex> lock(c->m);
     // The feature is bound to the old size and is re-created on the next frame,
     // but only once draining succeeded: on a timeout its GPU work may still be
     // running, so FG keeps its feature and copies (ASTRA-P4-3).
-    if (release_size_dependent_locked(*c)) fg::Shutdown();
+    // Preserve only our own textures while DXGI decides. Native buffers and
+    // pending GPU work still use the existing drain/retirement path.
+    auto saved=c->proxies;const auto index=c->virtual_index.load();
+    if (release_size_dependent_locked(*c)) {
+        c->resize_proxies=std::move(saved);c->resize_index=index;fg::Shutdown();return true;
+    }
+    return false; // DXGI must not resize underneath submitted presenter work
 }
 
 HRESULT Present(const PresentArgs& a)
@@ -851,7 +900,7 @@ HRESULT Present(const PresentArgs& a)
     read_timing_locked(*c, s, si);
     bool fg_on = na::settings::Get().fg_enabled.load(std::memory_order_relaxed) != 0;
     if (fg_on) c->worker_owner = true;
-    bool want_fg = c->uav_ok && !a.menu_open && fg_on;
+    bool want_fg = !c->external_owner && c->uav_ok && !a.menu_open && fg_on;
     // A73: say WHY nothing is generated right now instead of leaving the last
     // message standing (session 13: "starting" stayed on screen because the
     // menu that showed it also pauses generation).
@@ -922,7 +971,7 @@ HRESULT Present(const PresentArgs& a)
             D3D12_RESOURCE_BARRIER b2 = transition(s.veto.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             c->list_gen->ResourceBarrier(1, &b2);
         }
-        count = fg::Generate(c->list_gen.Get(), c->device.Get(), fi, outs, kMaxGenerated);
+        count = c->external_owner ? 0 : fg::Generate(c->list_gen.Get(), c->device.Get(), fi, outs, kMaxGenerated);
         if (count) { // copy the runtime's answer out for the present thread
             D3D12_RESOURCE_BARRIER b3 = transition(s.veto.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
             c->list_gen->ResourceBarrier(1, &b3);
@@ -1039,7 +1088,12 @@ bool teardown_chain_locked(Chain& c, uint32_t timeout_ms)
     if (!stop_thread(c, timeout_ms)) return false;
     if (!wait_fence(c, c.last_signal.load(), timeout_ms) || !wait_presentation(c,c.presentation_last.load(),timeout_ms)) return false;
     if (!c.proxies.empty()) g_proxied.fetch_sub(1, std::memory_order_relaxed);
-    c.proxies.clear();
+    {
+        std::lock_guard<std::mutex> buffers_lock(c.buffers_m);
+        c.proxy_count.store(0,std::memory_order_release);
+        c.proxies.clear();
+    }
+    c.resize_proxies.clear();c.external_owner=false;
     c.uav_ok = false;
     for (Slot& s : c.slots) {
         s.real_copy.Reset();

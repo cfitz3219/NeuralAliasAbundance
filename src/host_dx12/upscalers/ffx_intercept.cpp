@@ -1,3 +1,4 @@
+#include "host_dx12/settings.hpp"
 // C7a: FSR 3.1+ (FidelityFX API) interception. See ffx_intercept.hpp.
 #include "host_dx12/upscalers/ffx_intercept.hpp"
 
@@ -361,7 +362,7 @@ ffxReturnCode_t DetourDispatch(ffxContext* context, const ffxDispatchDescHeader*
             std::lock_guard<std::mutex> lock(g_m);
             o = observe_locked(context, *u);
             if (const ContextInfo* ci = find_context(o.context)) { view_id = ci->view_id; last = ci->last; }
-            replace = static_cast<Mode>(g_mode.load(std::memory_order_relaxed)) == Mode::ReplaceWithDlss;
+            replace = na::settings::EffectsReady() && static_cast<Mode>(g_mode.load(std::memory_order_relaxed)) == Mode::ReplaceWithDlss;
         }
         // ARGON-G2-005: NGX start-up and evaluation run without g_m.
         const char* why = nullptr;
@@ -427,7 +428,7 @@ uint32_t install_slot(HMODULE m)
     // table honest); Configure and Query are pass-through and hooked when possible.
     if (!GetProcAddress(m, "ffxDispatch") || !GetProcAddress(m, "ffxCreateContext") || !GetProcAddress(m, "ffxDestroyContext"))
         return 0;
-    if (!na::hooking::BeginInstall()) return 0;
+    if (!na::hooking::BeginInstallWait("upscalers/ffx_intercept.cpp")) return 0;
     uint32_t hooked = 0;
     for (size_t i = 0; i < sizeof(specs) / sizeof(specs[0]); ++i) {
         const Spec& s = specs[i];

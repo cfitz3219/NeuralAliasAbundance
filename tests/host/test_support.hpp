@@ -10,15 +10,88 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <string>
+#include <dbghelp.h>
+#include <tlhelp32.h>
 
 namespace test {
 using Microsoft::WRL::ComPtr;
 constexpr int kSkip = 77;
 inline int g_failures = 0;
+inline DWORD g_main_thread = GetCurrentThreadId(); // initialised on the thread that runs main()
 #define CHECK(cond) do { if (!(cond)) { std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); ++test::g_failures; } } while (0)
 #define REQUIRE(cond) do { if (!(cond)) { std::printf("FATAL %s:%d: %s\n", __FILE__, __LINE__, #cond); return 1; } } while (0)
+// Exit watchdog (diagnostic, 2026-10-28): a test that has reported its result but has
+// not exited 20 s later prints every thread's stack (module+offset, symbol when a PDB
+// is present) and terminates with 3, instead of hanging until CTest's timeout. Covers
+// teardown after finish(): locals' destructors, atexit and static destructors.
+// "exit: atexit reached" marks where in teardown a hang sits.
+inline void DumpThreadStacks() {
+    HMODULE dh = LoadLibraryW(L"dbghelp.dll");
+    if (!dh) { std::printf("exit watchdog: dbghelp unavailable\n"); return; }
+    auto sym_init = reinterpret_cast<decltype(&SymInitialize)>(GetProcAddress(dh, "SymInitialize"));
+    auto walk = reinterpret_cast<decltype(&StackWalk64)>(GetProcAddress(dh, "StackWalk64"));
+    auto fta = reinterpret_cast<decltype(&SymFunctionTableAccess64)>(GetProcAddress(dh, "SymFunctionTableAccess64"));
+    auto modbase = reinterpret_cast<decltype(&SymGetModuleBase64)>(GetProcAddress(dh, "SymGetModuleBase64"));
+    auto from_addr = reinterpret_cast<decltype(&SymFromAddr)>(GetProcAddress(dh, "SymFromAddr"));
+    if (!sym_init || !walk || !fta || !modbase || !from_addr) return;
+    HANDLE proc = GetCurrentProcess();
+    sym_init(proc, nullptr, TRUE);
+    const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    THREADENTRY32 te{}; te.dwSize = sizeof te;
+    // Two passes: the main (exiting) thread first, then the rest; idle thread-pool
+    // workers (NtWaitForWorkViaWorkerFactory) are skipped so the dump stays short.
+    for (int pass = 0; pass < 2; ++pass)
+    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+        if ((te.th32ThreadID == g_main_thread) != (pass == 0)) continue;
+        HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+        if (!th) continue;
+        SuspendThread(th);
+        CONTEXT ctx{}; ctx.ContextFlags = CONTEXT_FULL;
+        if (GetThreadContext(th, &ctx)) {
+            STACKFRAME64 f{};
+            std::string lines;
+            bool idle_pool = false;
+            f.AddrPC.Offset = ctx.Rip; f.AddrPC.Mode = AddrModeFlat;
+            f.AddrFrame.Offset = ctx.Rbp; f.AddrFrame.Mode = AddrModeFlat;
+            f.AddrStack.Offset = ctx.Rsp; f.AddrStack.Mode = AddrModeFlat;
+            for (int i = 0; i < 48 && walk(IMAGE_FILE_MACHINE_AMD64, proc, th, &f, &ctx, nullptr, fta, modbase, nullptr) && f.AddrPC.Offset; ++i) {
+                const DWORD64 pc = f.AddrPC.Offset, base = modbase(proc, pc);
+                char mod[MAX_PATH] = "?";
+                if (base) { GetModuleFileNameA(reinterpret_cast<HMODULE>(base), mod, MAX_PATH); }
+                const char* m = std::strrchr(mod, '\\'); m = m ? m + 1 : mod;
+                alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 256] = {};
+                auto* si = reinterpret_cast<SYMBOL_INFO*>(buf); si->SizeOfStruct = sizeof(SYMBOL_INFO); si->MaxNameLen = 255;
+                DWORD64 disp = 0;
+                const bool named = from_addr(proc, pc, &disp, si) != FALSE;
+                char line[512];
+                std::snprintf(line, sizeof line, "  %s+0x%llx %s\n", m, static_cast<unsigned long long>(pc - base), named ? si->Name : "");
+                lines += line;
+                if (i == 0 && named && std::strcmp(si->Name, "NtWaitForWorkViaWorkerFactory") == 0) idle_pool = true;
+            }
+            if (!idle_pool) std::printf("exit watchdog: thread %lu%s\n%s", te.th32ThreadID, te.th32ThreadID == g_main_thread ? " (main)" : "", lines.c_str());
+        }
+        ResumeThread(th);
+        CloseHandle(th);
+    }
+    CloseHandle(snap);
+    std::fflush(stdout);
+}
+inline DWORD WINAPI ExitWatchdog(void*) {
+    Sleep(20000);
+    std::printf("exit watchdog: still running 20 s after the result: teardown hang\n");
+    DumpThreadStacks();
+    std::fflush(stdout);
+    TerminateProcess(GetCurrentProcess(), 3);
+    return 0;
+}
 inline int finish(const char* name) {
     std::printf("%s: %s (%d failure%s)\n", name, test::g_failures ? "FAILED" : "ok", test::g_failures, test::g_failures == 1 ? "" : "s");
+    std::fflush(stdout);
+    std::atexit([] { std::printf("exit: atexit reached\n"); std::fflush(stdout); });
+    if (HANDLE t = CreateThread(nullptr, 0, ExitWatchdog, nullptr, 0, nullptr)) CloseHandle(t);
     return test::g_failures ? 1 : 0;
 }
 

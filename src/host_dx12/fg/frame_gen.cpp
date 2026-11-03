@@ -323,7 +323,7 @@ bool HasRuntime() { return g.has_rt.load(std::memory_order_acquire) != 0; }
 
 bool WantsInputs()
 {
-    return HasRuntime() && na::settings::Get().fg_enabled.load(std::memory_order_relaxed) != 0 &&
+    return na::settings::EffectsReady() && HasRuntime() && na::settings::Get().fg_enabled.load(std::memory_order_relaxed) != 0 &&
            !g.latched.load(std::memory_order_acquire);
 }
 
@@ -473,7 +473,7 @@ uint32_t Generate(ID3D12GraphicsCommandList* list, ID3D12Device* device, const F
                   ID3D12Resource* const* outputs, uint32_t capacity)
 {
     const na::settings::Settings& st = na::settings::Get();
-    if (!st.fg_enabled.load(std::memory_order_relaxed)) {
+    if (!na::settings::EffectsReady() || !st.fg_enabled.load(std::memory_order_relaxed)) {
         g.active.store(0, std::memory_order_release);
         return 0;
     }

@@ -394,7 +394,7 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer, DXGI_COLOR
 {
     if (!queue || !backbuffer) return;
     const na::settings::Settings& st = na::settings::Get();
-    if (!st.motion_enabled.load(std::memory_order_relaxed)) { g.active.store(0, std::memory_order_release); return; }
+    if (!na::settings::EffectsReady() || !st.motion_enabled.load(std::memory_order_relaxed)) { g.active.store(0, std::memory_order_release); return; }
     std::lock_guard<std::mutex> lock(g.m);
     if (g.latched.load(std::memory_order_acquire)) return;
     ComPtr<ID3D12Device> dev;
@@ -618,7 +618,7 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer, DXGI_COLOR
 
 bool WantsInputs()
 {
-    return na::settings::Get().motion_enabled.load(std::memory_order_relaxed) != 0 && !g.latched.load(std::memory_order_acquire);
+    return na::settings::EffectsReady() && na::settings::Get().motion_enabled.load(std::memory_order_relaxed) != 0 && !g.latched.load(std::memory_order_acquire);
 }
 
 void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalRef& in)

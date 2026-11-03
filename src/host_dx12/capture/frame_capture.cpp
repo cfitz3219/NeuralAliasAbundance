@@ -213,6 +213,12 @@ bool OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
     if (!Pending() || !list) return false;
     std::lock_guard<std::mutex> lock(g.m);
     if (g.evaluated >= g.requested) return false;
+    // One capture frame per Present. A game that evaluates several NGX features per
+    // frame (Phantom Blade Zero: Ray Reconstruction, then Frame Generation) used to
+    // replace g.current here, releasing the readback buffers that copies already
+    // recorded into the game's command list still target: a GPU write into freed
+    // memory (frame 0 never reached disk; the game died). Keep the first one.
+    if (g.current) return false;
     ComPtr<ID3D12Device> dev;
     if (FAILED(list->GetDevice(IID_PPV_ARGS(&dev))) || !ensure_device(dev.Get())) {
         ++g.errors;
@@ -238,6 +244,20 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer)
     if (!Pending() || !queue) return;
     std::lock_guard<std::mutex> lock(g.m);
     if (!g.current || !g.device) return;
+    // One allocator: it may only be reset once the GPU has finished the previous
+    // capture copy recorded with it. Resetting it while that copy still runs is
+    // illegal and removed the device (Phantom Blade Zero with Frame Generation:
+    // frame 1 saved, the game died on frame 2). Wait briefly; if the copy is
+    // still running, skip this frame and try again on the next Present.
+    if (g.fence_next > 1 && g.fence->GetCompletedValue() < g.fence_next - 1) {
+        HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        bool done = false;
+        if (ev) {
+            if (SUCCEEDED(g.fence->SetEventOnCompletion(g.fence_next - 1, ev))) done = WaitForSingleObject(ev, 100) == WAIT_OBJECT_0;
+            CloseHandle(ev);
+        }
+        if (!done && g.fence->GetCompletedValue() < g.fence_next - 1) return; // g.current stays for the next Present
+    }
     std::unique_ptr<Frame> f = std::move(g.current);
     g.alloc->Reset();
     g.list->Reset(g.alloc.Get(), nullptr);

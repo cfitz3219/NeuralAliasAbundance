@@ -5,7 +5,9 @@
 // Present/Present1/ResizeBuffers/ExecuteCommandLists on those vtables makes
 // the GAME's swapchain and queues route through us. On the game's first
 // Present we lazily create the D3D objects and ImGui backends against the
-// game's device and its most recently executing DIRECT queue.
+// game's device and its verified creation/resize DIRECT queue (or submitted
+// per-buffer evidence on late native attachment). Streamline chains prefer
+// their game-facing Present; associated generated Presents do not draw again.
 //
 // Input model (A20/A42/A44, ReShade-like): while the menu is open the game
 // receives NO input. The subclassed WndProc consumes raw input (WM_INPUT),
@@ -16,7 +18,8 @@
 // user32 entry points a game may read input through directly
 // (GetRawInputData/Buffer, GetCursorPos/SetCursorPos, GetAsyncKeyState,
 // GetKeyboardState) are hooked so every thread but the overlay's own sees a
-// frozen cursor, no buttons and no keys. Controller input is read through an XInputGetState hook:
+// frozen cursor, no buttons and no keys. Controller input uses an XInputGetState hook
+// with independent live menu polling (never a stale game-poll snapshot):
 // the game sees a neutral pad while the menu is open; the menu navigates
 // with d-pad/left stick, A = select, B = back. Closing with Home restores
 // everything. The game itself keeps running (we cannot pause its
@@ -25,9 +28,11 @@
 
 #include <cstdint>
 
+struct IDXGISwapChain;
 struct ID3D12Device;
 struct ID3D12CommandQueue;
 struct ID3D12CommandList;
+struct ID3D12Resource;
 
 namespace na::overlay {
 
@@ -38,7 +43,14 @@ using PanelFn = void (*)();
 // "Â· ROUTE B") is shown only on the Details page. `controls`, when not null,
 // is a legacy full-body PanelFn drawn instead of the pages (kept for
 // compatibility; both routes now pass nullptr).
-bool Start(const char* route_tag, PanelFn controls);
+bool StartCore(const char* route_tag, PanelFn controls);
+bool StartMenu(); // input/menu readiness; core remains attached on failure
+bool Start(const char* route_tag, PanelFn controls); // compatibility: both
+void FailNextMenuStartForTests();
+void FailNextMenuCreateForTests();
+void FailOptionalInputForTests(unsigned attempts);
+void FailCursorCleanupForTests();
+void* CursorOriginalForTests();
 // A51: returns false, with SeamStats.stop_incomplete set and NOTHING torn
 // down, when an Execute callback or the discovery worker/producers could not
 // be proven quiescent within the timeout; call again later. true = fully stopped.
@@ -53,19 +65,23 @@ struct Stats {
     uint64_t frames_rendered;
     uint64_t presents_seen;
     uint32_t initialized;
+    uint32_t core_ready, menu_enabled;
     uint32_t open;
     uint32_t have_queue;
     uint32_t gamepad_hooked;    // number of XInput modules hooked
     float fps;                  // smoothed, from Present cadence
     float frame_ms;             // smoothed CPU frame interval
     float mouse_x, mouse_y;     // menu cursor (client px) last applied
-    uint32_t input_hooks;       // A44: user32 input entry points hooked (6 when complete)
+    uint32_t input_hooks;       // A44: user32 input entry points hooked (8 when complete)
     uint32_t retargets;         // A31: swap chain re-targets after 2 s of silence
     uint32_t chain_gone;        // A71: chains observed destroyed at the game's final Release (immediate re-target)
+    uintptr_t present_queue;   // queue selected for the current DXGI buffer
 };
 Stats GetStats();
 
 void SetOpen(bool open);
+// Opt-in local fault receipt for user-owned game testing; never handles a fault.
+void SetMenuDiagnostics(bool enabled);
 
 // A63 experiment (Astra's request): ask the game to rebuild its picture
 // pipeline by nudging its window size by one pixel and back a few frames
@@ -157,5 +173,12 @@ void SetStatusLogPath(const wchar_t* path);
 int CurrentPageIndex();
 // Last DXGI_COLOR_SPACE_TYPE the game set on its swap chain (DXGI_COLOR_SPACE_CUSTOM = never).
 int SwapChainColorSpace();
+// Exact creation/ResizeBuffers1 binding. Returned queue is AddRef-owned.
+ID3D12CommandQueue* AcquirePresentQueue(IDXGISwapChain* chain);
+int SwapChainColorSpace(IDXGISwapChain* chain);
+// Test seam: render the existing menu into a caller-owned PRESENT-state
+// texture using the normal draw path, without DXGI Present pacing. Requires
+// an initialized/open overlay; caller owns queue synchronization and texture.
+void DrawMenuForTests(ID3D12CommandQueue* queue,ID3D12Resource* frame);
 
 } // namespace na::overlay

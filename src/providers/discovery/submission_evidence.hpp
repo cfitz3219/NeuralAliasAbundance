@@ -115,7 +115,8 @@ private:
             // Copy lineage is not a draw-produced version; never silently keep
             // an earlier render result after its storage has been overwritten.
             if(r.invalidated.size()==max_writes) r.bad=true;
-            else r.invalidated.insert(e.a[0]);break;
+            else r.invalidated.insert(e.a[0]);
+            break;
         case NA_OP_RESOURCE_BARRIER:
             for(uint64_t i=0;i<e.a[0];++i) {
                 const auto b=Load<na_barrier>(p+e.payload_offset+i*e.payload_stride);

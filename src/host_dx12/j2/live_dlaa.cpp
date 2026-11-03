@@ -3,6 +3,7 @@
 #include "host_dx12/j2/nis_sharpen.hpp"
 #include "host_dx12/j2/route_selector.hpp"
 #include "host_dx12/j2/consumer_profile.hpp"
+#include "host_dx12/j2/jitter_writes.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 #include "host_dx12/upscalers/ffx_intercept.hpp"
@@ -51,6 +52,16 @@ struct PendingHistory {
     na::camera::CameraTracker tracker;
     bool cut = false;
     uint32_t capture = 0; // J2 evidence capture token for this evaluation (0 = none)
+};
+
+// CPU metadata of this frame's last submitted scene. No pooled command-list
+// pointer survives Execute: games reset those lists before the consumer arrives.
+struct SceneInput {
+    uint64_t frame = 0, color = 0, depth = 0, producer = 0;
+    uint32_t color_sub = 0, depth_sub = 0;
+    na::camera::Matrix vp{};
+    bool reversed = false;
+    double jitter[2] = {};
 };
 
 struct State {
@@ -107,6 +118,8 @@ struct State {
     // colour's consumers, learned from SUBMITTED frames; the inline trigger fires at an
     // accepted class, else the boundary matcher decides as before.
     na::j2::ConsumerProfile profile;
+    SceneInput waiting_scene;
+    JitterWrites jitter_writes;
     std::vector<na::j2::ColorEvent> frame_seq; // this frame's writes/consumers of the colour, submission order
     bool frame_seq_complete = true;
     uint64_t scene_color_id = 0;
@@ -520,6 +533,7 @@ void apply_route_locked(ID3D12CommandQueue* queue)
         g.resume_reset = true;   // output of the old route must not feed the new one
         if (g.inl.valid) na::capture::j2::Discard(g.inl.history.capture, true);
         g.inl.valid = false;     // an inline recording from the old route is not committed
+        g.waiting_scene = {};
         g.scene_batches_target = 0;
     }
     // Ready before the game RECORDS the next scene list (the inline trigger runs then).
@@ -538,8 +552,11 @@ void apply_route_locked(ID3D12CommandQueue* queue)
 // subresource alone (depth vs stencil plane, one mip or slice) or all of them.
 bool state_after(ID3D12CommandList* const* lists, UINT last, na_object_id id, uint32_t sub, uint32_t* st)
 {
-    for (int i = static_cast<int>(last); i >= 0; --i)
-        if (na::observe::ListLastStateSub(lists[i], id, sub, st)) return true;
+    for (int i = static_cast<int>(last); i >= 0; --i) {
+        const auto evidence = na::observe::ListStateSub(lists[i], id, sub, st);
+        if (evidence == na::observe::StateLookup::Known) return true;
+        if (evidence == na::observe::StateLookup::Unavailable) return false;
+    }
     // Not transitioned in this batch up to the scene: the state it carried in.
     return na::observe::KnownSubStateInCurrentSubmission(id, sub, st);
 }
@@ -600,10 +617,12 @@ bool same_camera(const na::camera::Matrix& m)
     return dot > 0.98 && std::abs(v.sy - p.sy) <= 0.05 * std::abs(p.sy) && d2 <= 0.01 * len2 + 100.0;
 }
 
-bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& bytes, bool slot)
+bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& in_bytes, bool slot)
 {
-    const size_t n = bytes.size();
+    const size_t n = in_bytes.size();
     if (g.camera_offset < 0 || static_cast<uint64_t>(g.camera_offset) + 64 > n || !g.w || !g.h) return false;
+    // jitter_batch has normalized this exact buffer range using the write ledger.
+    const auto& bytes = in_bytes;
     for (auto layout : {na::camera::Layout::RowMajor, na::camera::Layout::ColumnMajor}) {
         const auto m = na::camera::LoadMatrix(bytes, static_cast<size_t>(g.camera_offset), layout);
         na::camera::Candidate c{};
@@ -711,6 +730,7 @@ void jitter_batch(ID3D12CommandList* const* lists, UINT count)
         const uint32_t n = na::observe::ReadBuffer(k->res, k->off, bytes.data(), k->size);
         if (n < 64) continue;
         std::vector<uint8_t> view(bytes.begin(), bytes.begin() + n);
+        g.stats.jitter_rebased += g.jitter_writes.Normalize(k->res, k->off, view.data(), view.size());
         const auto holds = [&](const uint8_t (&m)[2][64]) {
             for (size_t o = 0; o + 64 <= n; o += 16)
                 if (!std::memcmp(view.data() + o, m[0], 64) || !std::memcmp(view.data() + o, m[1], 64)) return true;
@@ -754,7 +774,9 @@ void jitter_batch(ID3D12CommandList* const* lists, UINT count)
                 if (!std::memcmp(view.data() + o, g.jit.vp[l], 64)) rep = g.jit.jvp[l];
                 else if (!std::memcmp(view.data() + o, g.jit.inv[l], 64)) rep = g.jit.jinv[l];
                 else if (l == 0 && g.jit.has_proj && !std::memcmp(view.data() + o, g.jit.proj, 64)) { rep = g.jit.jproj; ++g.stats.jitter_proj_writes; }
-                if (rep && na::observe::WriteBuffer(k->res, k->off + o, rep, 64) == 64) {
+                if (rep && g.jitter_writes.Apply(k->res, k->off + o, view.data() + o, rep, [&] {
+                    return na::observe::WriteBuffer(k->res, k->off + o, rep, 64) == 64;
+                })) {
                     ++g.stats.jitter_writes;
                     if (rep == g.jit.jvp[l]) g.jit.applied = true;
                 }
@@ -926,7 +948,7 @@ na::motion::Mat4 to_mat4(const na::camera::Matrix& m)
 // recorded into it (the caller then restores the game's state).
 bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, na_object_id color_id,
             ID3D12GraphicsCommandList** out_list, PendingHistory& pending, ID3D12GraphicsCommandList* inl = nullptr,
-            bool* touched = nullptr)
+            bool* touched = nullptr, const SceneInput* saved = nullptr, UINT prefix = 0)
 {
     ComPtr<ID3D12Resource> color, depth;
     color.Attach(na::observe::AcquireResource(color_id));
@@ -947,7 +969,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // The subresources (mip + slice) the scene pass rendered into, from its views:
     // arrays and mip chains are fine, J2 works on exactly that one through its own copies.
     uint32_t csub = 0, dsub = 0;
-    if (!na::observe::ListSceneSubresource(lists[scene], color_id, depth_id, &csub, &dsub) || csub == 0xFFFFFFFFu || dsub == 0xFFFFFFFFu) {
+    if (saved) { csub = saved->color_sub; dsub = saved->depth_sub; }
+    if ((!saved && !na::observe::ListSceneSubresource(lists[scene], color_id, depth_id, &csub, &dsub)) || csub == 0xFFFFFFFFu || dsub == 0xFFFFFFFFu) {
         reason("The scene is drawn through a view NeuralAlias cannot place (several array slices at once, or an unusual view).");
         return false;
     }
@@ -955,13 +978,21 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     uint32_t sc = 0, sd = 0;
     // Inline: the state recorded so far in this list, else the state all submitted work left.
     const auto state_now = [&](na_object_id id, uint32_t sub, uint32_t* st) {
-        return na::observe::ListLastStateSub(inl, id, sub, st) || na::observe::KnownSubStateNow(id, sub, st);
+        const auto evidence = na::observe::ListStateSub(inl, id, sub, st);
+        return evidence == na::observe::StateLookup::Known ||
+               (evidence == na::observe::StateLookup::Absent && na::observe::KnownSubStateNow(id, sub, st));
     };
-    const bool have_sc = inl ? state_now(color_id, csub, &sc) : state_after(lists, scene, color_id, csub, &sc);
-    const bool have_sd = inl ? state_now(depth_id, dsub, &sd) : state_after(lists, scene, depth_id, dsub, &sd);
+    const auto entry_state = [&](na_object_id id, uint32_t sub, uint32_t* st) {
+        return prefix ? state_after(lists, prefix - 1, id, sub, st)
+                      : na::observe::KnownSubStateInCurrentSubmission(id, sub, st);
+    };
+    const bool have_sc = saved ? entry_state(color_id, csub, &sc) : inl ? state_now(color_id, csub, &sc) : state_after(lists, scene, color_id, csub, &sc);
+    const bool have_sd = saved ? entry_state(depth_id, dsub, &sd) : inl ? state_now(depth_id, dsub, &sd) : state_after(lists, scene, depth_id, dsub, &sd);
     if (!have_sc || !have_sd) {
         ++g.stats.no_state;
         if (!have_sc) ++g.stats.no_state_color; else ++g.stats.no_state_depth;
+        if (!have_sd) na::observe::DescribeStateEvidence(inl ? inl : saved ? nullptr : lists[scene], depth_id, dsub,
+                                                        g.stats.depth_state_evidence, sizeof g.stats.depth_state_evidence);
         reason(!have_sc ? "Waiting: the scene colour's state at the end of the scene pass is not established."
                         : "Waiting: the scene depth's state at the end of the scene pass is not established.");
         return false;
@@ -982,7 +1013,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // update comes after the size check, because a resize resets the tracker.
     na::camera::Matrix vp{};
     bool reversed = false;
-    if (!find_camera(lists, scene, depth_id, &vp, &reversed)) {
+    if (saved) { vp = saved->vp; reversed = saved->reversed; }
+    if (!saved && !find_camera(lists, scene, depth_id, &vp, &reversed)) {
         ++g.stats.no_camera;
         g.camera_offset = g.camera_param = -1; // relearn
         char why[160];
@@ -1030,7 +1062,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         g.resume_reset = true; // remains pending if this recording is not submitted
     }
     const double zero[2] = {0, 0};
-    const double* injected = g_injected ? g.jit.px : zero; // J1: the exact sample we injected (removed from the matrix)
+    const double* injected = saved ? saved->jitter : g_injected ? g.jit.px : zero; // sample belongs to the captured camera
     pending.tracker = g.tracker;
     // DLSS's history is the last frame it evaluated, and the tracker's previous
     // camera is that same frame, so motion stays correct across a few skipped game
@@ -1285,7 +1317,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
 // scene write. The host restores game state before forwarding the real call.
 void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint32_t n, bool compute)
 {
-    if (!g.enabled.load(std::memory_order_relaxed) || g.paused.load(std::memory_order_relaxed)) return;
+    if (!na::settings::EffectsReady() || !g.enabled.load(std::memory_order_relaxed) || g.paused.load(std::memory_order_relaxed)) return;
     uint64_t depth_id = 0, color_id = 0;
     na::observe::GetLiveSelection(&depth_id, &color_id);
     if (!color_id || !depth_id) return;
@@ -1306,7 +1338,7 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
                          (na::observe::ListLastStateSub(l, color_id, csub, &cst) && !(cst & D3D12_RESOURCE_STATE_RENDER_TARGET));
     if (!reading) return;
     ++g.stats.inline_candidates;
-    if (g.inl_frame == g.frame) return; // one DLAA per frame: later candidates are post-processing
+    if (g.inl_frame == g.frame || g.submitted_frame == g.frame) return; // either placement path already owns this frame
     const auto current = na::observe::ListInsertionDecision(l, color_id);
     const auto& learned = g.insertion_learned;
     // Role-class trigger (placement design): at the ACTUAL consumer (draw/dispatch/copy),
@@ -1338,7 +1370,14 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
             using V = na::j2::ConsumerProfile::Verdict;
             const V v = g.profile.Judge(live_class, live_producer, live_context);
             if (v == V::Rejected) { ++g.stats.barrier_vetoes; return; }
-            if (v == V::Ambiguous) { ++g.stats.barrier_ambiguous_skips; return; }
+            // Ambiguous (the pattern was seen both mid-scene and at completion, and the
+            // context does not separate them): the boundary matcher below is the
+            // distinguishing check: it fires only when the writer pipeline, its
+            // occurrence, destination and pipeline all equal the learned boundary. A
+            // wrong fire is still a contradiction that demotes this pattern
+            // (fired_at_barrier). An ambiguous pattern is not completion proof;
+            // the between-list consumer path can also recover a missed boundary.
+            if (v == V::Ambiguous) ++g.stats.barrier_ambiguous_skips;
             if (v == V::AcceptedWithProducer || v == V::AcceptedQualified) { by_class = true; matched_mode = kByBarrier; }
         } else if (live.valid && live.after_write && raster_safe && g.scene_w) {
             live_class = na::j2::MakeClass(live.raw, g.scene_w, g.scene_h);
@@ -1456,6 +1495,57 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     g.fired_context = live_context;
 }
 
+// Inline and between-list are complementary opportunities in the SAME frame.
+// Only an actual, learned post-entry consumer can trigger this fallback. No
+// previous-frame batch ordinal and no guess about the final drawing PSO is used.
+int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
+                            uint64_t color, uint64_t depth,
+                            ID3D12GraphicsCommandList** ours, PendingHistory& pending)
+{
+    auto& saved = g.waiting_scene;
+    if (saved.frame != g.frame || saved.color != color || saved.depth != depth) saved = {};
+    for (UINT i = 0; i < count; ++i) {
+        if (!lists[i]) continue;
+        std::vector<na::j2::ColorEvent> events;
+        if (!na::observe::ListColorEvents(lists[i], color, events)) { saved = {}; continue; }
+        bool writes = false, consumed = false;
+        uint64_t producer = 0;
+        for (const auto& e : events) {
+            if (e.write) { writes = true; consumed = false; producer = e.producer; continue; }
+            if (!na::j2::IsConsumer(e.op)) continue; // a barrier alone is not a consumer
+            if (!writes && !consumed && saved.frame == g.frame) {
+                const auto cls = na::j2::MakeClass(e.raw, g.scene_w, g.scene_h);
+                const auto verdict = g.profile.Judge(cls, saved.producer);
+                using V = na::j2::ConsumerProfile::Verdict;
+                if ((verdict == V::Accepted || verdict == V::AcceptedWithProducer) &&
+                    record(lists, 0, depth, color, ours, pending, nullptr, nullptr, &saved, i)) {
+                    g.class_fired = true;
+                    g.fired_class = cls;
+                    g.fired_producer = saved.producer;
+                    g.fired_context = 0;
+                    saved = {};
+                    return static_cast<int>(i);
+                }
+            }
+            consumed = true;
+            saved = {}; // never insert later after a consumer already carried the image onward
+        }
+        if (writes) {
+            saved = {};
+            // End-of-list metadata is useful only if its final image has not
+            // already been consumed within that recording.
+            if (!consumed && na::observe::ListRendersTo(lists[i], color, depth) &&
+                na::observe::ListSceneSubresource(lists[i], color, depth, &saved.color_sub, &saved.depth_sub) &&
+                find_camera(lists, i, depth, &saved.vp, &saved.reversed)) {
+                saved.frame = g.frame; saved.color = color; saved.depth = depth; saved.producer = producer;
+                saved.jitter[0] = g_injected ? g.jit.px[0] : 0;
+                saved.jitter[1] = g_injected ? g.jit.px[1] : 0;
+            }
+        }
+    }
+    return -1;
+}
+
 } // namespace
 
 void SetEnabled(bool on)
@@ -1464,7 +1554,7 @@ void SetEnabled(bool on)
     g.configured.store(on);
     if (on) na::observe::SetTableBindCallback(&on_table_bind);
 }
-bool Enabled() { return g.enabled.load(); }
+bool Enabled() { return na::settings::EffectsReady() && g.enabled.load(); }
 bool Configured() { return g.configured.load(); }
 void SetPaused(bool paused)
 {
@@ -1636,7 +1726,7 @@ void OnPresent(ID3D12CommandQueue* queue)
 
 void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists, ExecuteFn forward)
 {
-    if (!g.enabled.load(std::memory_order_relaxed) || g.paused.load(std::memory_order_relaxed) || !queue || !lists || !count) {
+    if (!na::settings::EffectsReady() || !g.enabled.load(std::memory_order_relaxed) || g.paused.load(std::memory_order_relaxed) || !queue || !lists || !count) {
         forward(queue, count, lists);
         return;
     }
@@ -1677,9 +1767,17 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         if (!lists[i]) continue;
         const auto id = na::observe::IdOf(lists[i]);
         const auto decision = na::observe::ListInsertionDecision(lists[i], selected_color);
-        if ((decision.writes || decision.all_reads) && g.frame_seq.size() < 512) {
+        if ((decision.writes || decision.all_reads) && g.frame_seq_complete) {
             // Placement profile: this list's writes and consumers, in submission order.
+            // 512 events silently dropped later lists in the Sniper frames and
+            // taught early barriers as final ones. Bound the complete frame, and
+            // never train on an unmarked prefix when that bound is exceeded.
             if (!na::observe::ListColorEvents(lists[i], selected_color, g.frame_seq)) g.frame_seq_complete = false;
+            constexpr size_t kMaxFrameEvents = 16384;
+            if (g.frame_seq.size() > kMaxFrameEvents) {
+                g.frame_seq.resize(kMaxFrameEvents);
+                g.frame_seq_complete = false;
+            }
         }
         {
             // Structure for the route selector, in submission order.
@@ -1740,7 +1838,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         bool after = g.submitted_frame == g.frame;
         for (UINT i = 0; i < count; ++i) {
             if (!lists[i]) continue;
-            const auto d = na::observe::ListInsertionDecision(lists[i], g.inl.color);
+            const auto d = na::observe::ListInsertionDecision(lists[i], selected_color);
             if (g.inl.valid && lists[i] == g.inl.list && na::observe::ListRecording(lists[i]) == g.inl.rec) {
                 if (d.writes > g.inl.writes) g.stats.inline_late_writes += d.writes - g.inl.writes;
                 after = true;
@@ -1757,6 +1855,36 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
             if (lists[i] && na::observe::ListReferences(lists[i], selected_depth) &&
                 !na::observe::ListRootConstantBuffers(lists[i]).empty())
                 g.inline_camera_submitted = true;
+        if (!g.inl.valid && g.submitted_frame != g.frame && g.queue.Get() == queue && g.dlss_ready &&
+            selected_color && selected_depth && g.router.Mode() == na::j2::RouteMode::Auto) {
+            ID3D12GraphicsCommandList* ours = nullptr;
+            PendingHistory pending;
+            const int before = record_between_consumer(lists, count, selected_color, selected_depth, &ours, pending);
+            if (before >= 0) {
+                std::vector<ID3D12CommandList*> batch(lists, lists + count);
+                batch.insert(batch.begin() + before, ours);
+                Slot& slot = g.slots[g.slot];
+                g.slot = (g.slot + 1) % kRing;
+                na::dlss::BeforeExecute(queue, static_cast<UINT>(batch.size()), batch.data());
+                forward(queue, static_cast<UINT>(batch.size()), batch.data());
+                na::dlss::OnExecuted(queue, static_cast<UINT>(batch.size()), batch.data());
+                g.tracker = pending.tracker;
+                g.submitted_frame = g.frame;
+                g.resume_reset = false;
+                g.stats.active = true;
+                ++g.stats.frames;
+                ++g.stats.between_observed;
+                if (pending.cut) ++g.stats.cuts;
+                for (UINT i = static_cast<UINT>(before); i < count; ++i)
+                    if (lists[i]) g.stats.inline_late_writes += na::observe::ListInsertionDecision(lists[i], selected_color).writes;
+                slot.fence_value = g.fence_next++;
+                queue->Signal(g.fence.Get(), slot.fence_value);
+                na::capture::j2::Submitted(pending.capture, queue, g.stats.submissions);
+                reason("Live DLAA is running before a learned post-processing consumer in a separate list.");
+                return;
+            }
+            na::capture::j2::Discard(pending.capture, false);
+        }
         lock.unlock();
         forward(queue, count, lists);
         if (!has) return;
@@ -1930,6 +2058,8 @@ void Shutdown()
     g.frame_rejects = 0;
     g.frame_reject_text[0] = 0;
     g.profile.Clear();
+    g.waiting_scene = {};
+    g.jitter_writes.Clear();
     g.frame_seq.clear();
     g.frame_seq_complete = true;
     g.scene_color_id = 0;

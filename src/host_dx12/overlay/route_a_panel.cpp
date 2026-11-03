@@ -1,4 +1,8 @@
 #include "host_dx12/adapters/tlou1/apply.hpp"
+#include "host_dx12/adapters/tsushima/apply.hpp"
+#include "host_dx12/adapters/unreal/screen_percentage.hpp"
+#include "host_dx12/adapters/mode_control.hpp"
+#include "host_dx12/sl_boundary/sl_boundary.hpp"
 // Route A menu content (A30 redesign): the Picture page (status, master
 // switch, mode cards, preset), the Enhancements rows (Ray Reconstruction;
 // Neural Rendering and Frame Generation placeholders) and the Details rows
@@ -35,6 +39,11 @@
 
 namespace na::overlay {
 namespace {
+na::tlou1::ApplyStatus engine_apply_status() {
+    auto ghost=na::tsushima::GetApplyStatus();
+    return ghost.available ? ghost : na::tlou1::GetApplyStatus();
+}
+
 
 using na::settings::DlssMode;
 
@@ -61,16 +70,19 @@ void note_request()
     g_req.evaluates_at = s.evaluates;
 }
 
-void requested_size(const na::ngx::OptimalStats& opt, int mode, unsigned* rw, unsigned* rh)
-{
-    float scale = na::settings::ScaleForMode(static_cast<DlssMode>(mode));
-    *rw = opt.last_user_w;
-    *rh = opt.last_user_h;
-    if (mode != 0) {
-        *rw = ((static_cast<unsigned>(opt.last_user_w * scale + 0.5f)) + 7u) & ~7u;
-        *rh = ((static_cast<unsigned>(opt.last_user_h * scale + 0.5f)) + 7u) & ~7u;
-    }
+// The render size a mode asks for, from the display size the game's DLSS
+// actually outputs. NOT from the last optimal-settings call: other callers
+// probe it with unrelated sizes (PBZ: 1000x1000, which produced "584x584").
+void requested_size(unsigned out_w,unsigned out_h,int mode,unsigned* rw,unsigned* rh){
+    *rw=na::mode::AlignedRenderExtent(out_w,mode);*rh=na::mode::AlignedRenderExtent(out_h,mode);
 }
+
+bool valid_size(unsigned w, unsigned h) { return w && h && w != 0xFFFFFFFFu && h != 0xFFFFFFFFu; }
+
+// Unreal: the screen percentage for a mode, from the ratios NVIDIA gave the
+// engine at startup (PBZ asked with 1000x1000: 333/500/580/667/1000), so our
+// request lands exactly on the engine's own table. Defaults if not seen.
+float unreal_percent_for_mode(int mode){return na::mode::UnrealPercentForMode(mode);}
 
 enum class Conn { NoDlss, Interrupted, Connected };
 
@@ -91,14 +103,15 @@ bool confirmed(const na::ngx::Stats& ngx, unsigned rw, unsigned rh)
     return ngx.last_sr_in_w == rw && ngx.last_sr_in_h == rh;
 }
 
-static const char* kModes[] = {"DLAA", "Quality", "Balanced", "Performance"};
-static const char* kModeLine1[] = {"Full resolution", "More detail", "Middle ground", "More speed"};
-static const char* kModeLine2[] = {"Highest GPU cost", "Less GPU work", "Detail & speed", "Less fine detail"};
+static const char* kModes[] = {"DLAA", "Quality", "Balanced", "Performance", "Ultra Performance"};
+static const char* kModeLine1[] = {"Full resolution", "More detail", "Middle ground", "More speed", "Maximum speed"};
+static const char* kModeLine2[] = {"Highest GPU cost", "Less GPU work", "Detail & speed", "Less fine detail", "Lowest input resolution"};
 static const char* kModeHelp[] = {
     "DLAA smooths edges while keeping the game's full drawing resolution.",
     "Quality draws fewer pixels and reconstructs the full-size picture.",
     "Balanced reduces drawing resolution further to favor performance.",
-    "Performance prioritizes speed with a larger reduction in drawing resolution."};
+    "Performance prioritizes speed with a larger reduction in drawing resolution.",
+    "Ultra Performance draws at one third of each output dimension. Preset L is the recommended starting point."};
 // Presets offered: only the ones NVIDIA's SDK marks as usable (A42). Aâ€“D are
 // removed, E/F deprecated, G/H/I/N/O revert to default; J and K are the
 // current models for DLAA/Quality/Balanced, L and M are the defaults for
@@ -111,6 +124,15 @@ static int preset_index(int value)
         if (kPresetValues[i] == value) return i;
     return 0;
 }
+// Ray Reconstruction's own presets: the SDK marks only D, E and F usable.
+static const char* kRrPresets[] = {"Automatic", "D (transformer)", "E (latest transformer)", "F (Ray Reconstruction 2)"};
+static const int kRrPresetValues[] = {0, 4, 5, 6};
+static int rr_preset_index(int value)
+{
+    for (int i = 1; i < 4; ++i)
+        if (kRrPresetValues[i] == value) return i;
+    return 0;
+}
 
 void DrawPicture()
 {
@@ -120,13 +142,42 @@ void DrawPicture()
     na::ngx::OptimalStats opt = na::ngx::GetOptimalStats();
     char buf[200];
 
-    auto engine_apply = na::tlou1::GetApplyStatus();
+    auto engine_apply = engine_apply_status();
     bool engine_busy = engine_apply.stage == na::tlou1::Stage::Queued || engine_apply.stage == na::tlou1::Stage::Entered || engine_apply.stage == na::tlou1::Stage::Rebuilding;
     bool enabled = st.enabled.load() != 0;
+    bool follow_game = st.follow_game_resolution.load() != 0;
     int mode = static_cast<int>(st.dlss_mode.load());
-    if (mode > 3) mode = 3;
+    if (mode < 0 || mode >= static_cast<int>(DlssMode::Count)) mode = 0;
+    // Display size: the game's last DLSS creation output (the one-pixel rebuild
+    // nudge is ignored by rounding through the mode's scale). Fall back to the
+    // optimal-callback size only before any creation has been seen.
+    unsigned out_w = valid_size(ngx.last_sr_out_w, ngx.last_sr_out_h) ? ngx.last_sr_out_w : opt.last_user_w;
+    unsigned out_h = valid_size(ngx.last_sr_out_w, ngx.last_sr_out_h) ? ngx.last_sr_out_h : opt.last_user_h;
+    // True when no optimal-settings query for the game's display size has been
+    // seen. That is NOT proof the game ignores DLSS's answer: an engine may ask
+    // with a reference size (PBZ: 1000x1000) at startup. Used for guidance only.
+    const bool game_sets_size = !engine_apply_status().available && valid_size(ngx.last_sr_out_w, ngx.last_sr_out_h) &&
+                                !na::ngx::OptimalQueriedFor(ngx.last_sr_out_w, ngx.last_sr_out_h);
+    // No longer locks the picture mode (Cort's 16:41 run: the game's only
+    // queries were 1000x1000, possibly an engine reference size read at
+    // startup, so "no display-size query" is not proof the size can't change).
+    // Unreal games: live render-resolution control through the engine's own
+    // r.ScreenPercentage (the setting its DLSS menu changes).
+    const na::unreal::SpStatus sp = na::unreal::GetScreenPercentageStatus();
+    const bool unreal_size = sp.available && !engine_apply_status().available;
     unsigned rw = 0, rh = 0;
-    if (opt.last_user_w && opt.last_user_h) requested_size(opt, mode, &rw, &rh);
+    if (valid_size(out_w, out_h)) {
+        if (unreal_size) {
+            const float pct = unreal_percent_for_mode(mode);
+            rw = na::unreal::ExpectedExtent(out_w, pct);
+            rh = na::unreal::ExpectedExtent(out_h, pct);
+        } else {
+            requested_size(out_w, out_h, mode, &rw, &rh);
+        }
+    }
+    if (follow_game && valid_size(ngx.last_sr_in_w, ngx.last_sr_in_h)) {
+        rw = ngx.last_sr_in_w; rh = ngx.last_sr_in_h;
+    }
     Conn conn = connection(ngx);
     bool blocked = conn != Conn::Connected;
 
@@ -146,6 +197,14 @@ void DrawPicture()
         }
     } else if (engine_busy) {
         text = engine_apply.reason;
+    } else if (game_sets_size && follow_game && !unreal_size) {
+        state = 1;
+        snprintf(buf, sizeof(buf), "This game has not asked DLSS for its render size in a way NeuralAlias can change (%ux%u now). Pick Performance, Balanced or Quality in the game's video settings; NeuralAlias sets the DLSS preset.", rw, rh);
+        text = buf;
+    } else if (follow_game) {
+        state = 1;
+        snprintf(buf, sizeof(buf), "Using the game's resolution: %ux%u. Presets can be changed below.", rw, rh);
+        text = buf;
     } else if (engine_apply.stage == na::tlou1::Stage::Failed && engine_apply.choice.mode == static_cast<uint32_t>(mode) && engine_apply.choice.width == rw && engine_apply.choice.height == rh) {
         text = engine_apply.reason;
     } else if (rw && confirmed(ngx, rw, rh)) {
@@ -157,14 +216,35 @@ void DrawPicture()
                  kModes[mode]);
         text = buf;
     }
+    // An NVIDIA app override takes DLSS model control away from NeuralAlias;
+    // say so where it is seen first, not only under the preset row.
+    {
+        const auto drv = na::fg::preset::GetUpscalerOverrides();
+        if (state == 1 && enabled && conn == Conn::Connected && (ngx.active_upscaler == 13 ? drv.RrForced() : drv.SrForced())) {
+            state = 2;
+            text = "A driver DLSS model override is enabled. In the NVIDIA app, set DLSS Override to \"Use 3D app setting\", then restart the game (details under DLSS preset).";
+        }
+    }
     StatusBanner(state, text);
 
     // Master switch.
     ImGui::Dummy(ImVec2(0, S(6)));
     ImGui::BeginDisabled(engine_busy || (blocked && conn == Conn::NoDlss));
-    BeginRow("Use NeuralAlias", "Choose your picture settings here instead of in the game.", SwitchWidth());
+    BeginRow("Use NeuralAlias", "Control DLSS presets and supported picture settings.", SwitchWidth());
     if (Switch("master", &enabled)) {
         st.enabled.store(enabled ? 1u : 0u);
+        if (!enabled) na::mode::Cancel(true); // hand resolution control back to the game
+        note_request();
+        na::settings::Save();
+    }
+    EndRow();
+    ImGui::EndDisabled();
+
+    ImGui::BeginDisabled(!enabled || engine_busy);
+    BeginRow("Use game's resolution", "Choose DLAA, Quality or Ultra Performance in the game's video settings. NeuralAlias can still change presets.", SwitchWidth());
+    if (Switch("follow_game_resolution", &follow_game)) {
+        st.follow_game_resolution.store(follow_game ? 1u : 0u);
+        if (follow_game) na::mode::Cancel(true); // the game's resolution again
         note_request();
         na::settings::Save();
     }
@@ -172,23 +252,28 @@ void DrawPicture()
     ImGui::EndDisabled();
 
     // Mode cards.
+    if (na::tsushima::GetApplyStatus().available && !follow_game)
+        Hint("Apply uses Ghost's live graphics-settings update. Fixed picture modes turn dynamic resolution off.");
     SectionTitle("Picture mode");
-    ImGui::BeginDisabled(!enabled || blocked || engine_busy);
+    ImGui::BeginDisabled(!enabled || blocked || engine_busy || follow_game);
     float avail = ImGui::GetContentRegionAvail().x;
     int cols = avail < S(640) ? 2 : 4; // A44: reflow by available width only
     float gap = S(9);
     float card_w = (avail - gap * (cols - 1)) / cols;
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < static_cast<int>(DlssMode::Count); ++i) {
         if (i % cols != 0) ImGui::SameLine(0.0f, gap);
-        if (ModeCard(kModes[i], kModeLine1[i], kModeLine2[i], i == mode, card_w) && i != mode) {
+        if (ModeCard(kModes[i], kModeLine1[i], kModeLine2[i], !follow_game && i == mode, card_w) && i != mode) {
             mode = i;
             st.dlss_mode.store(static_cast<uint32_t>(mode));
+            na::mode::Cancel(false); // a running Apply was for the previous choice
             note_request();
             na::settings::Save();
         }
     }
     ImGui::EndDisabled();
-    Hint(kModeHelp[mode]);
+    Hint(unreal_size && !follow_game ? "Apply changes the game's own resolution setting, the same one its DLSS menu uses. No restart needed." :
+         game_sets_size && !follow_game ? "This game has not asked DLSS for its render size while running. It may only read it at startup: if Apply does not change the size, keep this mode selected and restart the game." :
+         follow_game ? "Picture mode follows the game's video settings, including Ultra Performance." : kModeHelp[mode]);
 
     // Preset + Apply. (A46: the disabled Sharpness row is gone until a
     // sharpening backend exists; a dead control only invites clicks.)
@@ -196,19 +281,41 @@ void DrawPicture()
     BeginGroupBox("picture-group");
     {
         ImGui::BeginDisabled(!enabled || blocked || engine_busy);
-        int preset = st.preset.load();
-        int sel = preset_index(preset);
-        BeginRow("DLSS preset",
-                 "Leave on Automatic unless a particular preset looks better.\nJ and K suit DLAA, Quality and Balanced; L and M are meant for Performance modes.",
-                 DropdownWidth());
-        if (Combo("preset", &sel, kPresets, 5, DropdownWidth())) {
-            st.preset.store(kPresetValues[sel]);
-            note_request();
-            na::settings::Save();
+        // The game's upscaler decides which preset list applies: Ray Reconstruction
+        // (feature 13) has its own keys and only presets D/E/F.
+        const bool rr_upscaler = ngx.active_upscaler == 13; // what the game uses NOW (follows its RR toggle)
+        int sel = 0;
+        if (rr_upscaler) {
+            sel = rr_preset_index(st.rr_preset.load());
+            BeginRow("Ray Reconstruction preset",
+                     "This game upscales with Ray Reconstruction, which has its own models.\nLeave on Automatic unless one looks better. E is required by games that use its depth-of-field guide.",
+                     DropdownWidth());
+            if (Combo("rr_preset", &sel, kRrPresets, 4, DropdownWidth())) {
+                st.rr_preset.store(kRrPresetValues[sel]);
+                note_request();
+                na::settings::Save();
+            }
+        } else {
+            sel = preset_index(st.preset.load());
+            BeginRow("DLSS preset",
+                     "Leave on Automatic unless a particular preset looks better.\nJ and K suit DLAA, Quality and Balanced; L and M are meant for Performance modes.",
+                     DropdownWidth());
+            if (Combo("preset", &sel, kPresets, 5, DropdownWidth())) {
+                st.preset.store(kPresetValues[sel]);
+                note_request();
+                na::settings::Save();
+            }
         }
         EndRow();
         ImGui::EndDisabled();
-        if (ngx.preset_rejected) {
+        // The NVIDIA app's "DLSS Override - Model presets" replaces whatever preset
+        // the game or NeuralAlias asks for: every choice here would look the same.
+        const auto drv = na::fg::preset::GetUpscalerOverrides();
+        if (rr_upscaler ? drv.RrForced() : drv.SrForced()) {
+            StatusLine(2, rr_upscaler
+                ? "A driver Ray Reconstruction model override is enabled and may replace this preset request. In the NVIDIA app, open this game's settings and set DLSS Override (Ray Reconstruction) to \"Use 3D app setting\", then restart the game."
+                : "A driver DLSS model override is enabled and may replace this preset request. In the NVIDIA app, open this game's settings and set DLSS Override (Super Resolution model presets) to \"Use 3D app setting\", then restart the game.");
+        } else if (ngx.preset_rejected) {
             // The runtime refused a preset hint; the detour already reset the
             // setting in memory (A42). Persist it and say so.
             static bool saved = false;
@@ -218,7 +325,7 @@ void DrawPicture()
             Hint("Automatic lets NVIDIA's software choose.");
         } else {
             snprintf(buf, sizeof(buf), "Preset %s requested. Whether NVIDIA's software uses it is not confirmed.",
-                     kPresets[sel]);
+                     rr_upscaler ? kRrPresets[sel] : kPresets[sel]);
             Hint(buf);
         }
         if (ngx.quality_rejected)
@@ -227,25 +334,90 @@ void DrawPicture()
         bool size_matches = rw && ngx.last_sr_in_w == rw && ngx.last_sr_in_h == rh;
         static bool engine_clicked = false;
         static bool admission_failed = false;
-        ImGui::BeginDisabled(!enabled || blocked || ngx.sr_creates == 0 || engine_busy);
-        BeginRow("Apply changes", "Update the picture mode and preset together.", ButtonWidth("Apply"));
+        static bool rebuild_clicked = false;   // generic: window nudge so the game rebuilds its DLSS
+        static bool rebuild_refused = false;
+        static uint32_t rebuild_attempts_at = 0;
+        static bool unreal_clicked = false;
+        static bool unreal_refused = false;
+        static bool mode_clicked = false;     // one Apply across all resolution methods (mode_control)
+        static bool mode_refused = false;
+        // Any game upscaler counts: plain DLSS (feature 1) or Ray Reconstruction (13).
+        const bool have_upscaler = ngx.active_upscaler != 0;
+        // Picture-mode changes go through na::mode (mode_control.hpp): it picks the
+        // method this game responds to and confirms the rendered size. Preset-only
+        // changes keep the in-place path; with "Use game's resolution" a rebuild
+        // carries the preset into the game's own re-creation.
+        ImGui::BeginDisabled(!enabled || blocked || !have_upscaler || engine_busy);
+        BeginRow("Apply changes", follow_game ? "Update the preset while keeping the game's resolution." : "Update the picture mode and preset together.", ButtonWidth("Apply"));
         if (Button("Apply")) {
             admission_failed = false;
-            engine_clicked = !size_matches;
-            if (engine_clicked) {
-                admission_failed = !na::tlou1::RequestApply({static_cast<uint32_t>(mode), rw, rh, st.preset.load()});
-                g_apply_clicked = false;
-            } else {
+            engine_clicked = rebuild_clicked = rebuild_refused = unreal_clicked = unreal_refused = mode_clicked = mode_refused = false;
+            g_apply_clicked = false;
+            // Plain DLSS can take a new PRESET in place (A46). A size change, or any
+            // change while the game uses Ray Reconstruction, needs the game to
+            // re-create its DLSS feature.
+            const bool in_place = size_matches && ngx.active_upscaler == 1;
+            if (in_place) {
                 na::ngx::RequestReapply();
                 g_apply_ok_at = ngx.reapplies;
                 g_apply_fail_at = ngx.reapply_failures;
                 g_apply_clicked = true;
+            } else if (!follow_game) {
+                // Picture mode: one Apply that picks the method this game responds to
+                // (Streamline query, Unreal setting, this game's settings path, rebuild),
+                // confirmed by the size the game's DLSS actually renders.
+                na::mode::Request mr;
+                mr.mode = static_cast<uint32_t>(mode);
+                mr.preset = st.preset.load();
+                mr.out_w = out_w;
+                mr.out_h = out_h;
+                mr.render_w = rw;
+                mr.render_h = rh;
+                mr.unreal_percent = unreal_percent_for_mode(mode);
+                mode_clicked = true;
+                mode_refused = !na::mode::RequestApply(mr);
+            } else {
+                rebuild_clicked = true;
+                rebuild_attempts_at = na::overlay::GetPictureRebuild().attempts;
+                rebuild_refused = !na::overlay::RequestPictureRebuild(rw, rh);
             }
         }
         EndRow();
         ImGui::EndDisabled();
+        if (!have_upscaler && enabled)
+            Hint("Apply becomes available once the game has started DLSS.");
+        if (rebuild_clicked) {
+            const auto pr = na::overlay::GetPictureRebuild();
+            const auto check = na::ngx::GetSizeConfirmation();
+            if (rebuild_refused)
+                StatusLine(2, "A previous Apply is still in progress. Try again in a moment.");
+            else if (pr.state == 4)
+                StatusLine(2, pr.reason[0] ? pr.reason : "The picture could not be rebuilt.");
+            else if (pr.attempts == rebuild_attempts_at || pr.state == 1 || pr.state == 2)
+                StatusLine(0, "Asking the game to rebuild its picture...");
+            else if (check.id && check.id == pr.confirm_id && check.state == 3)
+                StatusLine(1, follow_game ? "DLSS rebuilt with the preset request; the game's resolution is retained." : "Applied: the game is now rendering at the selected mode.");
+            else if (check.id && check.id == pr.confirm_id && check.state == 4) {
+                snprintf(buf, sizeof(buf), check.creations
+                    ? "DLSS rebuilt, but the game kept %ux%u. It may only read the render size at startup: keep this mode selected and restart the game, or choose the mode in the game's menu."
+                    : "No DLSS rebuild was observed (last %ux%u). Change DLSS or ray tracing once in the game's menu.", check.last_w, check.last_h);
+                StatusLine(2, buf);
+            } else
+                StatusLine(0, "Picture rebuilt; checking the new size...");
+        }
+        if (mode_clicked) {
+            const na::mode::Status ms = na::mode::GetStatus();
+            StatusLine(ms.state == na::mode::State::Confirmed ? 1 : ms.state == na::mode::State::Trying ? 0 : 2,
+                       mode_refused && ms.state != na::mode::State::Trying ? "A previous Apply is still running. Try again in a moment." : ms.reason);
+        }
+        if (unreal_clicked) {
+            const na::unreal::SpStatus now = na::unreal::GetScreenPercentageStatus();
+            const int level = now.state == na::unreal::SpState::Confirmed ? 1 :
+                              now.state == na::unreal::SpState::Applying ? 0 : 2;
+            StatusLine(unreal_refused && now.state != na::unreal::SpState::Applying ? 2 : level, now.reason);
+        }
         if (engine_clicked) {
-            auto progress = na::tlou1::GetApplyStatus();
+            auto progress = engine_apply_status();
             if (admission_failed)
                 StatusLine(2, progress.available ? "Another change is in progress, or the selection changed. Try Apply again." : progress.reason);
             else if (progress.choice.mode != st.dlss_mode.load() || progress.choice.preset != st.preset.load())
@@ -256,23 +428,45 @@ void DrawPicture()
         } else if (ngx.reapply_pending)
             StatusLine(0, "Applying the preset at the next frame.");
         else if (g_apply_clicked && ngx.reapplies > g_apply_ok_at)
-            StatusLine(1, "Preset applied. The picture mode already matches your selection.");
+            StatusLine(1, follow_game ? "Preset request applied; the game's resolution is retained." : "Preset applied. The picture mode already matches your selection.");
         else if (g_apply_clicked && ngx.reapply_failures > g_apply_fail_at)
             StatusLine(2, "The preset could not be applied. The previous setup is still in use.");
         if (BeginDetails("Apply details")) {
-            auto progress = na::tlou1::GetApplyStatus();
+            auto progress = engine_apply_status();
             auto check = na::ngx::GetSizeConfirmation();
-            Hint(progress.available ? (progress.stage == na::tlou1::Stage::Confirmed ? "The requested resolution was observed with coherent inputs. Visual quality is checked separately." : "Uses this game's graphics-settings update and waits for matching rendered frames.") : progress.reason);
-            snprintf(buf, sizeof(buf), "Request %llu; engine updates %llu; rebuilds requested %llu; thread %u.",
-                     static_cast<unsigned long long>(progress.request_id), static_cast<unsigned long long>(progress.frame_calls),
-                     static_cast<unsigned long long>(progress.triggers), progress.trigger_thread);
-            Hint(buf);
-            if (progress.request_id && progress.request_id == check.id) {
-                snprintf(buf, sizeof(buf), "Requested %ux%u; observed %ux%u; %u of %u consecutive frames; result %u/%u.",
-                         check.req_w, check.req_h, check.last_w, check.last_h, check.streak, check.need, check.state, check.reason);
+            if (progress.available) {
+                // A game with a hand-written engine adapter (TLOU).
+                Hint(progress.stage == na::tlou1::Stage::Confirmed ? "The requested resolution was observed with coherent inputs. Visual quality is checked separately." : "Uses this game's graphics-settings update and waits for matching rendered frames.");
+                snprintf(buf, sizeof(buf), "Request %llu; engine updates %llu; rebuilds requested %llu; thread %u.",
+                         static_cast<unsigned long long>(progress.request_id), static_cast<unsigned long long>(progress.frame_calls),
+                         static_cast<unsigned long long>(progress.triggers), progress.trigger_thread);
                 Hint(buf);
+                if (progress.request_id && progress.request_id == check.id) {
+                    snprintf(buf, sizeof(buf), "Requested %ux%u; observed %ux%u; %u of %u consecutive frames; result %u/%u.",
+                             check.req_w, check.req_h, check.last_w, check.last_h, check.streak, check.need, check.state, check.reason);
+                    Hint(buf);
+                }
+            } else if (unreal_size) {
+                Hint("Unreal game: Apply sets the engine's r.ScreenPercentage, then checks that the game's next DLSS creation uses the expected size.");
+                snprintf(buf, sizeof(buf), "Engine setting now %.1f%%; requested %.1f%% (expect %ux%u); game's DLSS input %ux%u; request %llu.",
+                         sp.current, sp.requested, sp.expect_w, sp.expect_h, sp.seen_w, sp.seen_h,
+                         static_cast<unsigned long long>(sp.request_id));
+                Hint(buf);
+            } else {
+                // Every other game: the general rebuild (no game-specific code).
+                const auto pr = na::overlay::GetPictureRebuild();
+                Hint(follow_game ? "Apply retains the engine's render size and quality value. Ray Reconstruction asks the game to rebuild its feature; the preset is a request to NVIDIA's runtime."
+                     : ngx.active_upscaler == 1
+                         ? "A preset change is applied directly to the game's DLSS. A mode change asks the game to rebuild its picture (its window is resized by one pixel and back), then checks the size it renders."
+                         : "Apply asks the game to rebuild its picture (its window is resized by one pixel and back) so it re-creates its DLSS with your mode and preset, then checks the size it renders.");
+                snprintf(buf, sizeof(buf), "Rebuilds tried %u, failed %u.", pr.attempts, pr.failures);
+                Hint(buf);
+                if (pr.confirm_id && pr.confirm_id == check.id) {
+                    snprintf(buf, sizeof(buf), "Requested %ux%u; observed %ux%u; %u of %u consecutive frames; result %u/%u.",
+                             check.req_w, check.req_h, check.last_w, check.last_h, check.streak, check.need, check.state, check.reason);
+                    Hint(buf);
+                }
             }
-
         }
 
     }
@@ -312,15 +506,20 @@ void DrawNeuralRenderingRows()
     BeginRow("Neural Rendering", help, SwitchWidth());
     ImGui::BeginDisabled(!can);
     if (Switch("nr", &on)) {
-        st.nr_enabled.store(on ? 1u : 0u);
+        const uint32_t input_flags=(ImGui::IsMouseReleased(ImGuiMouseButton_Left)?1u:0u) |
+            (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceDown,false)?2u:0u) |
+            (ImGui::IsKeyPressed(ImGuiKey_Enter,false)?4u:0u) |
+            (ImGui::IsKeyPressed(ImGuiKey_Space,false)?8u:0u);
+        na::settings::SetNrEnabled(on,na::settings::NrWriteSource::Overlay,input_flags);
         if (on) na::nr::ResetLatch();
+        nr = na::nr::GetStats();
         na::settings::Save();
     }
     ImGui::EndDisabled();
     EndRow();
     if (on) {
         int state = nr.latched_off ? 2 : (nr.active ? 1 : 0);
-        StatusLine(state, nr.reason);
+        StatusLine(state, nr.active ? "Neural Rendering is active." : nr.reason);
         if (nr.gpu_samples) {
             snprintf(buf, sizeof(buf), "Graphics-card time for Neural Rendering: %.1f ms per frame (average %.1f ms).",
                      nr.last_ms, nr.avg_ms);
@@ -410,33 +609,18 @@ void DrawMotionRow()
 
 // A59 Frame Generation: NVIDIA's DLSS Frame Generation driven by NeuralAlias
 // (the game never asked for it). Off / Fixed / Dynamic with a multiplier.
-void DrawFrameGenerationRow()
+// Driver-profile FG model request and the freeze note: these apply to the
+// game's own frame generation and to ours alike.
+void DrawFgDriverPresetRows()
 {
     using namespace na::ui;
     na::settings::Settings& st = na::settings::Get();
-    na::ngx::Stats ngx = na::ngx::GetStats();
-    na::fg::Stats fs = na::fg::GetStats();
-    na::present::Stats pr = na::present::GetStats();
     char buf[240];
-    bool on = st.fg_enabled.load() != 0;
-    bool possible = na::present::Enabled();
-    const char* help = ngx.fg_seen
-        ? "Creates extra pictures between rendered frames.\nThis game runs NVIDIA's own Frame Generation; switching this on as well is not recommended."
-        : "Creates extra pictures between rendered frames using NVIDIA's Frame Generation. Smoother motion; the delay between your input and the picture grows a little.";
-    BeginRow("Frame Generation", possible ? help : "Creates extra pictures between rendered frames.\nNot available on this route.", SwitchWidth());
-    ImGui::BeginDisabled(!possible);
-    if (Switch("fg", &on)) {
-        st.fg_enabled.store(on ? 1u : 0u);
-        if (on) { na::fg::ResetLatch(); st.fg_frozen_at.store(0); } // A69: re-enabling clears the safe-mode note
-        na::settings::Save();
-    }
-    ImGui::EndDisabled();
-    EndRow();
-    RowDivider();
-    int preset_choice = st.fg_preset.load() == 2 ? 1 : 0;
-    const char* presets[] = {"Preset A", "Preset B"};
+    int preset_choice = static_cast<int>(st.fg_preset.load()) - 1;
+    if (preset_choice < 0 || preset_choice > 2) preset_choice = 0;
+    const char* presets[] = {"Preset A", "Preset B", "Preset C (Performance)"};
     BeginRow("Frame Generation preset", "Chooses NVIDIA's driver model request for this game. Restart the game after changing it.", DropdownWidth());
-    if (Combo("fg_preset", &preset_choice, presets, 2, DropdownWidth())) {
+    if (Combo("fg_preset", &preset_choice, presets, 3, DropdownWidth())) {
         st.fg_preset.store(static_cast<uint32_t>(preset_choice + 1));
         na::settings::Save(); na::fg::preset::Request(static_cast<uint32_t>(preset_choice + 1));
     }
@@ -455,6 +639,128 @@ void DrawFrameGenerationRow()
                  lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min);
         StatusLine(2, buf);
     }
+}
+
+// The GAME's own frame generation (Streamline DLSS-G): controls go to the
+// game's slDLSSGSetOptions through the SL boundary. The game keeps presenting;
+// our own generator is never stacked on top.
+void DrawNativeFrameGenerationRows(const na::ngx::Stats& ngx)
+{
+    using namespace na::ui;
+    na::settings::Settings& st = na::settings::Get();
+    const na::slb::FgState fg = na::slb::GetFgState();
+    char buf[260];
+    const bool hooked = fg.set_hooked != 0;
+    static const char* kNativeFgModes[] = {"Game's setting", "Off", "On", "Dynamic"};
+    int mode = static_cast<int>(st.native_fg_mode.load());
+    if (mode < 0 || mode > 3) mode = 0;
+    const int modes_shown = fg.dynamic_supported == 1 ? 4 : 3; // Dynamic only where the runtime reports it
+    if (mode >= modes_shown) mode = 0;
+    BeginRow("Game's Frame Generation",
+             "This game runs NVIDIA's own Frame Generation. NeuralAlias can switch it or change how many pictures it makes, through the game's own settings call. \"Game's setting\" leaves it exactly as the game asks.",
+             DropdownWidth());
+    ImGui::BeginDisabled(!hooked);
+    if (Combo("native_fg_mode", &mode, kNativeFgModes, modes_shown, DropdownWidth())) {
+        st.native_fg_mode.store(static_cast<uint32_t>(mode));
+        na::slb::SetFgRequest({static_cast<na::slb::FgMode>(mode), st.native_fg_frames.load()});
+        na::settings::Save();
+    }
+    ImGui::EndDisabled();
+    EndRow();
+    static const char* kMults[] = {"Game's", "2x", "3x", "4x", "5x", "6x"};
+    int frames = static_cast<int>(st.native_fg_frames.load());
+    if (frames < 0 || frames > 5) frames = 0;
+    int shown = fg.max_frames == 0xFFFFFFFFu ? 1 : static_cast<int>(fg.max_frames) + 1; // "Game's" + supported multipliers
+    if (shown > 6) shown = 6;
+    if (frames >= shown) frames = 0;
+    BeginRow(mode == 3 ? "Maximum" : "Multiplier",
+             "Pictures shown per rendered frame. Only multipliers this system reports are listed.", DropdownWidth());
+    ImGui::BeginDisabled(!hooked || mode == 1 || shown <= 1);
+    if (Combo("native_fg_frames", &frames, kMults, shown, DropdownWidth())) {
+        st.native_fg_frames.store(static_cast<uint32_t>(frames));
+        na::slb::SetFgRequest({static_cast<na::slb::FgMode>(mode), static_cast<uint32_t>(frames)});
+        na::settings::Save();
+    }
+    ImGui::EndDisabled();
+    EndRow();
+    // A Streamline older than 2.7 (Ghost of Tsushima ships 2.4.0) can request
+    // one generated frame only, and its state has no usable frame limit, so
+    // the limit reads 0 while the game runs 2x. Name the version the boundary
+    // read from sl.interposer.dll instead of leaving the multiplier greyed out
+    // without a word; without a version, say only what was observed.
+    const bool sl_version_known = fg.sl_version[0] != 0 || fg.sl_version[1] != 0;
+    const bool sl_before_27 = sl_version_known && (fg.sl_version[0] < 2 || (fg.sl_version[0] == 2 && fg.sl_version[1] < 7));
+    const bool no_multi_frame = hooked && fg.max_frames == 0 && shown <= 1;
+    char sl_text[48] = "";
+    if (sl_version_known) snprintf(sl_text, sizeof(sl_text), "Streamline %u.%u.%u", fg.sl_version[0], fg.sl_version[1], fg.sl_version[2]);
+    if (no_multi_frame && sl_before_27) {
+        snprintf(buf, sizeof(buf), "Only 2x here: this game ships %s, which can request one generated frame only (2.7 or newer is needed for 3x and 4x). Off and On still work.", sl_text);
+        Hint(buf);
+    } else if (no_multi_frame) {
+        Hint("Only 2x here: this game's Streamline reports no multi-frame limit. Off and On still work.");
+    }
+    // Requested versus what actually reached Streamline (and what it reports).
+    static const char* kSlModes[] = {"off", "on", "auto", "dynamic"};
+    auto mode_name = [](uint32_t m) { return m < 4 ? kSlModes[m] : "unknown"; };
+    if (!hooked) {
+        StatusLine(0, ngx.fg_seen ? "Waiting for the game's frame generation settings call..." : "The game has not started its frame generation.");
+    } else if (fg.set_calls == 0) {
+        StatusLine(0, "Waiting for the game to update its frame generation settings.");
+    } else {
+        // Applied = what reached NVIDIA is what was asked for (the game's value where "Game's").
+        static const uint32_t kToSl[] = {0xFFFFFFFFu, 0u, 1u, 3u};
+        const uint32_t want_mode = mode == 0 ? fg.game_mode : kToSl[mode];
+        const uint32_t want_frames = frames == 0 ? fg.game_frames : static_cast<uint32_t>(frames);
+        const bool applied = fg.sent_mode == want_mode && (want_mode == 0 || fg.sent_frames == want_frames);
+        // Lead with what reached NVIDIA; the game's own request is constant and
+        // was being read as "the control did nothing" when it came first.
+        snprintf(buf, sizeof(buf), "Sent to NVIDIA: %s %ux. (The game itself keeps asking for %s %ux; that part never changes.) %s",
+                 mode_name(fg.sent_mode), fg.sent_frames + 1, mode_name(fg.game_mode), fg.game_frames + 1, fg.reason);
+        StatusLine(fg.last_result == 0 && applied ? 1 : 2, buf);
+    }
+    if (BeginDetails("Game frame generation details")) {
+        char max_text[64] = "not reported yet";
+        if (no_multi_frame) snprintf(max_text, sizeof(max_text), "not reported (%s)", sl_version_known ? sl_text : "no frame limit in state");
+        else if (fg.max_frames != 0xFFFFFFFFu) snprintf(max_text, sizeof(max_text), "%ux", fg.max_frames + 1);
+        snprintf(buf, sizeof(buf), "Settings calls %llu; state reads %llu; system maximum %s; dynamic %s; status 0x%x; pictures presented at last read %u.",
+                 static_cast<unsigned long long>(fg.set_calls), static_cast<unsigned long long>(fg.get_calls), max_text,
+                 fg.dynamic_supported < 0 ? "unknown" : (fg.dynamic_supported ? "supported" : "not supported"), fg.status, fg.presented);
+        Hint(buf);
+    }
+}
+
+void DrawFrameGenerationRow()
+{
+    using namespace na::ui;
+    na::settings::Settings& st = na::settings::Get();
+    na::ngx::Stats ngx = na::ngx::GetStats();
+    na::fg::Stats fs = na::fg::GetStats();
+    na::present::Stats pr = na::present::GetStats();
+    char buf[240];
+    bool on = st.fg_enabled.load() != 0;
+    // A game with its own frame generation keeps it: controls go to the game's
+    // generator, and ours is not offered on top (never two schedulers).
+    if (ngx.fg_seen || na::slb::GetFgState().set_hooked) {
+        DrawNativeFrameGenerationRows(ngx);
+        RowDivider();
+        DrawFgDriverPresetRows();
+        return;
+    }
+    bool possible = na::present::Enabled();
+    const char* help = ngx.fg_seen
+        ? "Creates extra pictures between rendered frames.\nThis game runs NVIDIA's own Frame Generation; switching this on as well is not recommended."
+        : "Creates extra pictures between rendered frames using NVIDIA's Frame Generation. Smoother motion; the delay between your input and the picture grows a little.";
+    BeginRow("Frame Generation", possible ? help : "Creates extra pictures between rendered frames.\nNot available on this route.", SwitchWidth());
+    ImGui::BeginDisabled(!possible);
+    if (Switch("fg", &on)) {
+        st.fg_enabled.store(on ? 1u : 0u);
+        if (on) { na::fg::ResetLatch(); st.fg_frozen_at.store(0); } // A69: re-enabling clears the safe-mode note
+        na::settings::Save();
+    }
+    ImGui::EndDisabled();
+    EndRow();
+    RowDivider();
+    DrawFgDriverPresetRows();
     if (!on || !possible) return;
     static const char* kFgModes[] = {"Fixed", "Dynamic"};
     int mode = st.fg_mode.load() ? 1 : 0;
@@ -489,24 +795,24 @@ void DrawFrameGenerationRow()
     }
 }
 
-void DrawRayReconstructionRow()
+// Which DLSS upscaler the game itself created (status only). Ray Reconstruction cannot
+// be switched on from outside: it replaces the game's ray-tracing denoiser and needs
+// the un-denoised lighting plus albedo / normal / roughness guides that only the game
+// produces. The former on/off switch saved a choice nothing read; removed (Cort).
+void DrawDlssInUseRow()
 {
     using namespace na::ui;
-    na::settings::Settings& st = na::settings::Get();
     na::ngx::Stats ngx = na::ngx::GetStats();
-    bool rr = st.ray_reconstruction.load() != 0;
-    bool available = ngx.rr_seen != 0;
-    BeginRow("Ray Reconstruction",
-             available ? "Refines ray-traced effects in games that support it."
-                       : "Refines ray-traced effects in games that support it.\nNot available in this game.",
-             SwitchWidth());
-    ImGui::BeginDisabled(!available);
-    if (Switch("rr", &rr)) {
-        st.ray_reconstruction.store(rr ? 1u : 0u);
-        note_request();
-        na::settings::Save();
-    }
-    ImGui::EndDisabled();
+    // The upscaler the game is using NOW (its most recent DLSS creation): many games
+    // offer ray reconstruction as a toggle, and switching it re-creates DLSS.
+    const bool rr = ngx.active_upscaler == 13, sr = ngx.active_upscaler == 1;
+    const char* badge = rr ? "RAY RECONSTRUCTION" : sr ? "SUPER RESOLUTION" : "NOT YET SEEN";
+    const char* help =
+        rr   ? "The game is using Ray Reconstruction now (its ray-traced DLSS, switched on in its settings). Turn it off there and the game switches to plain DLSS; NeuralAlias follows either way."
+        : sr ? "The game is using plain DLSS Super Resolution now. If it offers Ray Reconstruction, turning that on switches DLSS over; NeuralAlias follows either way."
+             : "The game has not started DLSS yet. Enable DLSS in its video settings.";
+    BeginRow("DLSS in use", help, BadgeWidth(badge));
+    Badge(badge);
     EndRow();
 }
 
@@ -607,6 +913,10 @@ void DrawCaptureRow()
 void DrawLiveDlaa()
 {
     using namespace na::ui;
+    // Our DLAA injector for games WITHOUT DLSS ([j2] enabled=1 per game). In a game
+    // that runs its own DLSS it never starts, and "Not running yet ... 0 frames
+    // improved" only confused (Cort, Phantom Blade Zero): draw nothing there.
+    if (!na::j2::Configured()) return;
     const na::j2::Stats st = na::j2::GetStats();
     BeginGroupBox("Live DLAA");
     bool on = !na::j2::Paused();
@@ -752,8 +1062,7 @@ void RegisterRouteAMenu()
                         Page::Enhancements});
     na::menu::Register({"Responsiveness", Availability::Available, nullptr, &DrawLatencyRow, Page::Enhancements});
     na::menu::Register({"Latency and display", Availability::Available, nullptr, &DrawLatencyDetails, Page::Details});
-    na::menu::Register({"Ray Reconstruction", Availability::Available, nullptr, &DrawRayReconstructionRow,
-                        Page::Enhancements});
+    na::menu::Register({"DLSS in use", Availability::Available, nullptr, &DrawDlssInUseRow, Page::Enhancements});
     na::menu::Register({"Motion analysis", Availability::Available, nullptr, &DrawMotionRow, Page::Enhancements});
     na::menu::Register({"Connection", Availability::Available, nullptr, &DrawConnectionRow, Page::Details});
     na::menu::Register({"Save pictures for analysis", Availability::Available, nullptr, &DrawCaptureRow,
