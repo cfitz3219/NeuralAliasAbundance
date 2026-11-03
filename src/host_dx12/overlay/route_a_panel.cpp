@@ -1058,10 +1058,22 @@ void DrawLiveDlaa()
         const bool live = ml.enabled && (ml.twin_pipelines > 0 || ml.twin_root_signatures > 0);
         BeginRow("Texture detail", "Samples surface textures sharper so DLAA can rebuild their full detail (NVIDIA's DLSS guide recommends -1 at native resolution). Very fine patterns such as fabric weaves can shimmer at -1; Light is gentler. Screen effects are never changed. Switches live (from the next frame); remembered for this game.", S(220));
         ImGui::SetNextItemWidth(S(220));
-        if (ImGui::Combo("##j2detail", &idx, kDetail, 3)) {
+        // Render-small DLSS modes set it automatically (NVIDIA: -1 + log2(render/output)):
+        // greyed out, showing the value for the current mode. DLAA keeps the menu's choice.
+        const float small_scale = na::j2::RenderSmall() ? na::present::RenderScale() : 1.f;
+        if (small_scale > 0.f && small_scale < 1.f) {
+            const int detail_mode = static_cast<int>(ss.j2_scale_mode.load());
+            char autod[64];
+            std::snprintf(autod, sizeof autod, "Automatic (%.2f, %s)", na::j2::SmallMipBias(0.f, small_scale),
+                          detail_mode >= 1 && detail_mode <= 4 ? kModes[detail_mode] : "DLSS");
+            const char* one[] = {autod};
+            int zero = 0;
+            ImGui::BeginDisabled();
+            ImGui::Combo("##j2detail", &zero, one, 1);
+            ImGui::EndDisabled();
+        } else if (ImGui::Combo("##j2detail", &idx, kDetail, 3)) {
             ss.j2_mip_bias_x100.store(kDetailX100[idx]);
-            na::observe::SetSamplerMipBiasLive(na::j2::RenderSmall() ? na::j2::SmallMipBias(kDetailX100[idx] / 100.0f, na::present::RenderScale())
-                                                                     : kDetailX100[idx] / 100.0f);
+            na::observe::SetSamplerMipBiasLive(kDetailX100[idx] / 100.0f);
             na::settings::Save();
         }
         EndRow();

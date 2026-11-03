@@ -166,7 +166,7 @@ struct Obj {
     // Immutable once published; owns a reference on every twin. A twin is never one of
     // the game's own objects (see D_CreateRootSignature), so twins cannot form cycles.
     // Never destroyed inside another D3D12 object's destruction: see ReleaseTwinsLater.
-    struct Twins { IUnknown* obj[5] = {}; bool same[5] = {}; ~Twins() { for (auto* o : obj) if (o) o->Release(); } };
+    struct Twins { IUnknown* obj[6] = {}; bool same[6] = {}; ~Twins() { for (auto* o : obj) if (o) o->Release(); } };
     std::shared_ptr<Twins> twins;
     bool retirement_unobservable = false;   // the sentinel could not be attached
     uint64_t present_ordinal = 0;
@@ -1231,10 +1231,11 @@ std::atomic<float> g_mip_bias{0.0f};
 // into its root signatures and pipelines at load, so every root signature and pipeline
 // gets twins built at creation for the other menu levels; command lists are switched to
 // the twins of the level latched at their Reset. Levels = the menu's choices.
-// -1.5 and -2 are for render-small, where the menu level adds log2(render/output); only the
-// levels that can be reached get twins (g_mip_level_mask), so other games build two as before.
-constexpr int kMipCount = 5;
-constexpr float kMipLevels[kMipCount] = {0.0f, -0.5f, -1.0f, -1.5f, -2.0f};
+// Render-small's DLSS modes use NVIDIA's -1 + log2(render/output) exactly: Quality (1/1.5)
+// -1.585, Balanced (1/1.72) -1.782, Performance (1/2) -2. Only the levels that can be reached
+// get twins (g_mip_level_mask), so other games build two as before.
+constexpr int kMipCount = 6;
+constexpr float kMipLevels[kMipCount] = {0.0f, -0.5f, -1.0f, -1.5849625f, -1.7824086f, -2.0f};
 std::atomic<uint32_t> g_mip_level_mask{0x7u}; // levels twins are built for (bit i = kMipLevels[i])
 std::atomic<int> g_mip_game_level{0};      // level the game's own objects are built with (0 = no bias unless J2 sets it)
 std::atomic<int> g_mip_live_level{0};      // level selected in the menu
@@ -1686,7 +1687,7 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
     ID3DBlob* rebuilt = nullptr;
     const int game_level = g_mip_game_level.load(std::memory_order_relaxed);
     ID3DBlob* level_blob[kMipCount] = {};
-    bool level_same[kMipCount] = {true, true, true, true, true};
+    bool level_same[kMipCount] = {true, true, true, true, true, true};
     const uint32_t level_mask = g_mip_level_mask.load(std::memory_order_relaxed);
     bool decodable = false;
     if (blob && size && !t_host_work && depth.outermost()) { // also when off: native biases are recorded
