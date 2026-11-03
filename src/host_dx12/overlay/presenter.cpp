@@ -223,12 +223,12 @@ bool ensure_proxies_locked(Chain& c)
     {
         const float scale = g_render_scale.load(std::memory_order_acquire);
         const UINT W = c.desc.BufferDesc.Width, H = c.desc.BufferDesc.Height;
-        const bool small = scale > 0.f && scale < 1.f;
-        const bool full = !small && g_present_dlaa.load(std::memory_order_acquire); // DLAA at Present
-        c.scaled = (small || full) && c.uav_ok && g_upscale.load(std::memory_order_acquire) && W > 1 && H > 1;
-        c.pw = c.scaled && small ? (std::max)(1u, static_cast<UINT>(std::lround(W * static_cast<double>(scale)))) : W;
-        c.ph = c.scaled && small ? (std::max)(1u, static_cast<UINT>(std::lround(H * static_cast<double>(scale)))) : H;
-        if (c.scaled && small && (c.pw >= W || c.ph >= H)) { c.scaled = false; c.pw = W; c.ph = H; }
+        const bool reduced = scale > 0.f && scale < 1.f;
+        const bool full = !reduced && g_present_dlaa.load(std::memory_order_acquire); // DLAA at Present
+        c.scaled = (reduced || full) && c.uav_ok && g_upscale.load(std::memory_order_acquire) && W > 1 && H > 1;
+        c.pw = c.scaled && reduced ? (std::max)(1u, static_cast<UINT>(std::lround(W * static_cast<double>(scale)))) : W;
+        c.ph = c.scaled && reduced ? (std::max)(1u, static_cast<UINT>(std::lround(H * static_cast<double>(scale)))) : H;
+        if (c.scaled && reduced && (c.pw >= W || c.ph >= H)) { c.scaled = false; c.pw = W; c.ph = H; }
         g_scaled_w.store(c.scaled ? c.pw : 0); g_scaled_h.store(c.scaled ? c.ph : 0);
         g_native_w.store(W); g_native_h.store(H);
         if (scale < 1.f && !c.scaled)
