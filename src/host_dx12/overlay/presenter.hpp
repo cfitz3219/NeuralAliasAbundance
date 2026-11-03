@@ -78,6 +78,10 @@ using UpscaleFn = bool (*)(ID3D12CommandQueue* queue, ID3D12Resource* frame, uin
                            ID3D12Resource* out, uint32_t ow, uint32_t oh, bool hdr, void* user);
 void SetRenderScale(float scale, UpscaleFn upscale, void* user);
 float RenderScale();
+// [present] present_dlaa=1: at scale 1.0 the presenter still hands the frame to the upscaler
+// (render == output, DLSS runs as DLAA at Present). Set before the swap chain's first GetBuffer.
+void SetPresentDlaa(bool on);
+bool PresentDlaa();
 // True while the served chain's proxies are render size (J2 then defers DLSS to Present).
 bool Scaling();
 // The buffer size the game is served for `sc` (render size while scaled). false = this

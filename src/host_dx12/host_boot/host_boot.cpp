@@ -268,6 +268,10 @@ DWORD WINAPI InitThread(LPVOID)
         if (na::settings::Get().j2_scale_mode.load() > 3) na::settings::Get().j2_scale_mode.store(3);
         const int small_mode = static_cast<int>(na::settings::Get().j2_scale_mode.load());
         const float small_f = small_mode > 0 && small_mode <= 4 ? static_cast<float>(na::scale::FractionForMode(small_mode)) : 1.f;
+        // Comparison mode: DLAA also runs at Present (full-size proxies), not inside the frame.
+        const bool present_dlaa = GetPrivateProfileIntW(L"present", L"present_dlaa", 0, g_ini) == 1;
+        na::present::SetPresentDlaa(present_dlaa);
+        if (present_dlaa) boot_log("render-small: DLAA runs at Present too ([present] present_dlaa=1)");
         na::present::SetRenderScale(small_f, &na::j2::PresentUpscale, nullptr);
         char small_line[96];
         std::snprintf(small_line, sizeof small_line, "render-small: enabled (mode %d, scale %.3f)", small_mode, small_f);

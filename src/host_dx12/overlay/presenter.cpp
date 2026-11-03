@@ -56,6 +56,10 @@ std::atomic<uint32_t> g_requested_sync{0}, g_requested_flags{0};
 // Render-small (SetRenderScale).
 std::atomic<float> g_render_scale{1.f};
 std::atomic<UpscaleFn> g_upscale{nullptr};
+// [present] present_dlaa=1: at full size (DLAA) the presenter still takes the game's frame and
+// J2 runs DLAA at Present, exactly like the render-small path but with render == output. For
+// comparing Present-time DLAA with in-frame DLAA on the same game (Astra, COMMS cc47232).
+std::atomic<bool> g_present_dlaa{false};
 std::atomic<void*> g_upscale_user{nullptr};
 std::atomic<uint64_t> g_upscaled{0}, g_upscale_failed{0};
 std::atomic<uint32_t> g_scaled_w{0}, g_scaled_h{0}, g_native_w{0}, g_native_h{0};
@@ -219,10 +223,12 @@ bool ensure_proxies_locked(Chain& c)
     {
         const float scale = g_render_scale.load(std::memory_order_acquire);
         const UINT W = c.desc.BufferDesc.Width, H = c.desc.BufferDesc.Height;
-        c.scaled = scale > 0.f && scale < 1.f && c.uav_ok && g_upscale.load(std::memory_order_acquire) && W > 1 && H > 1;
-        c.pw = c.scaled ? (std::max)(1u, static_cast<UINT>(std::lround(W * static_cast<double>(scale)))) : W;
-        c.ph = c.scaled ? (std::max)(1u, static_cast<UINT>(std::lround(H * static_cast<double>(scale)))) : H;
-        if (c.scaled && (c.pw >= W || c.ph >= H)) { c.scaled = false; c.pw = W; c.ph = H; }
+        const bool small = scale > 0.f && scale < 1.f;
+        const bool full = !small && g_present_dlaa.load(std::memory_order_acquire); // DLAA at Present
+        c.scaled = (small || full) && c.uav_ok && g_upscale.load(std::memory_order_acquire) && W > 1 && H > 1;
+        c.pw = c.scaled && small ? (std::max)(1u, static_cast<UINT>(std::lround(W * static_cast<double>(scale)))) : W;
+        c.ph = c.scaled && small ? (std::max)(1u, static_cast<UINT>(std::lround(H * static_cast<double>(scale)))) : H;
+        if (c.scaled && small && (c.pw >= W || c.ph >= H)) { c.scaled = false; c.pw = W; c.ph = H; }
         g_scaled_w.store(c.scaled ? c.pw : 0); g_scaled_h.store(c.scaled ? c.ph : 0);
         g_native_w.store(W); g_native_h.store(H);
         if (scale < 1.f && !c.scaled)
@@ -713,6 +719,8 @@ void SetRenderScale(float scale, UpscaleFn upscale, void* user)
     g_upscale.store(upscale, std::memory_order_release);
     g_render_scale.store(scale > 0.f && scale < 1.f ? scale : 1.f, std::memory_order_release);
 }
+void SetPresentDlaa(bool on) { g_present_dlaa.store(on, std::memory_order_release); }
+bool PresentDlaa() { return g_present_dlaa.load(std::memory_order_acquire); }
 float RenderScale() { return g_render_scale.load(std::memory_order_acquire); }
 bool Scaling() { return g_scaled_w.load(std::memory_order_acquire) != 0; }
 bool GameBufferSize(IDXGISwapChain* sc, UINT* w, UINT* h)
