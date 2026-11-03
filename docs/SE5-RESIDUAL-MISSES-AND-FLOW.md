@@ -288,3 +288,26 @@ cases. They do not establish that all live dropouts/shimmer are gone; Cort's
 game test remains the picture qualification. Depthless/compute/indirect scene
 structures and cross-recording frame ownership must not be advertised as newly
 qualified by these two regressions. Evidence: local/se5-stability-20261102.
+
+### Stability repair delivery
+
+Runtime4ce21f610ea29491c55e6493921a0a7ef346f526: full rebuilt Release and
+170 registered tests complete in191.81s;165pass,5skip,0fail. The skips are the
+NR runtime probe, three unsupported16xMSAA cases, and the upscaler jitter
+runtime case. Existing raster/pan/state/overlay and real-NGX cases pass alongside
+the three new GPU reproductions and precise-profile CPU cases. Earlier failed
+attempts remain in the local evidence and are not used as the final receipt.
+
+Documents/NA-SE5-camfix-4ce21f6 is prepared; DLL SHA256
+DD72211DFE99BFAF3C91D16E88CA704704BADD94CD490A521EE4BBF5CB7A81C4.
+The usual NA-se5-camfix-update/results/rollback CMDs select it. Prior launcher
+bytes are in Documents/NA-se5-camfix-launchers-before-4ce21f6-20261102-221442.
+Known-good019 and historical6f launchers/packages are unchanged. The isolated
+WindowsPowerShell019->candidate->019->original roundtrip passes, retaining
+raster mode, prior sharpness and native-file contents; all payload hashes match.
+
+Actual SE5 installation remains ebfd468/87834104..., unchanged by Astra.
+No game launch, control or deployment. Cort's next game run determines whether
+these corrected causes close both visible reports. Opus's Anno native-present
+branch and installer remain separate. PR81 contains the source and evidence;
+no further review cycle was introduced.
