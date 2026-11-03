@@ -293,7 +293,7 @@ void end_to_end(test::Device& d)
     d.WaitIdle();
     CHECK(dev->GetDeviceRemovedReason() == S_OK);
 
-    const nh::Stats st = nh::GetStats();
+    const nh::Stats st = nh::GetStats(); // before TakeFrame: this frame's counts are in the totals
     const bool got = nh::TakeFrame(proxy.Get(), RW, RH, OW, OH, &layer);
     std::printf("native HUD: layer=%d %s\n", got ? 1 : 0, nh::StatusLine().c_str());
     CHECK(got);

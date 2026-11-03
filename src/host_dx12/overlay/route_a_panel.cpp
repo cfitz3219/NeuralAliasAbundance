@@ -975,9 +975,9 @@ void DrawLiveDlaa()
         EndRow();
     }
     if (na::j2::RenderSmall() && na::j2::native_hud::Installed()) {
-        bool on = na::j2::native_hud::Enabled();
+        bool native_on = na::j2::native_hud::Enabled();
         BeginRow("Native-resolution HUD", "Draws the game's HUD and text at your screen's full resolution, on top of the DLSS picture, instead of upscaling them with the 3D scene. DLSS then gets the scene without the HUD. Off draws the HUD at render size as before. Not saved.", SwitchWidth());
-        if (Switch("j2nativehud", &on)) na::j2::native_hud::SetEnabled(on);
+        if (Switch("j2nativehud", &native_on)) na::j2::native_hud::SetEnabled(native_on);
         EndRow();
         if (!na::j2::HudMaskEnabled()) {
             bool view = na::j2::HudMaskView();
