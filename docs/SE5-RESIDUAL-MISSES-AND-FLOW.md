@@ -211,3 +211,80 @@ The actual installed DLL remains ea7534d/D648D72D..., unchanged by Astra. Flow
 remains defaultOff as Cort requested. This fixes a reproduced false-camera
 selection; Cort's next game run determines actual picture improvement. No game
 launch/control/deployment or live image-quality success is claimed.
+
+## Latest stability investigation: saved 212919 (2026-11-02 Pacific)
+
+Cort distinguishes foliage shimmer from actual DLAA dropouts: the NVIDIA
+registry indicator disappears with the latter. This is evidence of a picture
+problem, not grounds for changing only the Home status.
+
+The saved manifest and installed payload identify ebfd468, not a stale package.
+The learned camera is now offset128; state, busy and NGX failure counters stay0.
+There are874 missed **observed scene frames**,218 early placements and35 route
+changes in the long run. A further39676 no-candidate Presents includes intervals
+with no tracked selected-scene work at all. These cannot honestly be called
+39676 proven missed gameplay frames, or assumed idle without further evidence.
+The previous results script's98.7% held share is a ratio of held-camera events
+to camera failures, not scene coverage or picture quality.
+
+Five capture sets contain150 successful evaluations, all with zero late writes.
+Their background is mostly stationary; near-zero reconstructed camera motion
+is consequently not proof of another camera-selection failure. Successful
+evaluation captures do not contain the missing evaluations. The recorded-list
+generation is469 behind the Present ordinal throughout those sets, which does
+not support duplicate Present calls as the bulk explanation there.
+
+Two production-path defects were reproduced and corrected:
+
+1. **A recording could change raster phase halfway through its geometry.**
+   Present/another worker can advance the global suggestion while the list is
+   still open. Previously every draw replaced the recording's sample; NGX only
+   received the last one. The new actual-DX12 regression changes the suggestion
+   between two halves of one shared edge. Old code changes93 GPU pixels and
+   reports the wrong sample; corrected code changes0. The first actual sample
+   now belongs to the recording until Reset, including a temporary failure to
+   obtain a later suggestion. A separate-list saved camera carries the actual
+   recorded raster sample instead of the global suggestion.
+
+2. **Different consumer shaders were collapsed into one ambiguous role class.**
+   With that class unavailable, placement fell back to the previous frame's
+   final scene writer. The log explicitly contains different-writer/occurrence
+   rejections. The existing profile now learns an additional exact consumer
+   identity with the same three completed-frame observations and temporary-pass
+   rejection. Structural matching remains available for shader variants. The
+   DX12 regression gives middle/post consumers identical structural inputs and
+   uses a new final geometry pipeline every frame. Old code processes0/24;
+   corrected code processes21/24 (three learning frames), with0 early writes,
+   camera failures or depth-state failures. This is real command-list/GPU work
+   using a fake NGX model, not a neural image-quality demonstration.
+
+   A second case keeps the final writer stable, then introduces optional drawing
+   after its previously final barrier. Simply adding precise matching was not
+   enough: the earlier barrier still won, giving4 late writes. Recent qualified
+   exact consumers now take priority over that prediction; the same24-frame
+   run processes23frames(one cold) with0 late writes. The preference requires
+   the actual post consumer to have appeared in the immediately previous frame;
+   a missing or contradicted consumer does not permanently suppress barrier-only
+   routing. A read before later texture clear/reuse also cannot suppress a
+   barrier-only completion. The existing pan fixture caught that distinction;
+   the corrected eligibility preserves its26/27(one cold). MSAA retains its
+   existing barrier timing because its depth conversion changes graphics state.
+   These priority, reuse and expiry cases are exercised in the regressions.
+
+The exact identities use the observer's monotonic, retirement-aware PSO IDs,
+not allocation addresses that can be recycled. Pipeline-library/preexisting
+objects receive an unknown-description identity on first use; their state and
+shader properties are not invented. A replaced lifetime does not inherit the
+old consumer's approval. Late writes demote the exact trigger too. The profile
+remains bounded (512 entries including the new qualifications); existing class
+counters retain their structural-class meaning. `j2_profile matched{...exact=}`
+reports actual uses of the precise tier.
+
+No trace cap or camera acceptance threshold was relaxed, no state/evaluation
+failure was hidden, and no duplicate NGX evaluation or previous-picture replay
+was introduced. Flow stays Off by default and visible under Enhancements.
+These reproductions establish defects and corrected behavior in their exact
+cases. They do not establish that all live dropouts/shimmer are gone; Cort's
+game test remains the picture qualification. Depthless/compute/indirect scene
+structures and cross-recording frame ownership must not be advertised as newly
+qualified by these two regressions. Evidence: local/se5-stability-20261102.

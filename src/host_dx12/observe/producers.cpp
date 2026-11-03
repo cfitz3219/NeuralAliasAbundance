@@ -2192,6 +2192,22 @@ uint64_t float_bits(float a, float b)
 
 using GL = ID3D12GraphicsCommandList;
 
+// Pipeline-library loads (and objects predating observation) do not pass through
+// Create*PipelineState. Use the retirement-aware identity service for them too.
+void preexisting_pipeline(ID3D12PipelineState* pso)
+{
+    if (!pso || t_host_work || !na::observe_internal::Started() || lookup(pso)) return;
+    bool created = false;
+    const auto id = ensure_registered(pso, NA_OBJ_PIPELINE_HOST, &created);
+    if (!created) return;
+    na_ev_pipeline_created e;
+    init_header(e, NA_EV_PIPELINE_CREATED, NA_EVF_FOUNDATIONAL | NA_EVF_PREEXISTING);
+    pipeline_unknowns(e);
+    e.pipeline = id; e.pipeline_kind = NA_UNKNOWN_U32; e.rt_count = NA_UNKNOWN_U32;
+    remember_creation(pso, e);
+    emit(e, NA_GROUP_PIPELINE);
+}
+
 // Per-slot recording, run after the original call (only on the outermost scope).
 template <uint32_t Slot>
 struct On;
@@ -2201,6 +2217,7 @@ struct On<sl::list::Reset> {
     static void run(GL* l, HRESULT hr, ID3D12CommandAllocator* alloc, ID3D12PipelineState* pso)
     {
         if (t_host_work) return;
+        if (SUCCEEDED(hr)) preexisting_pipeline(pso);
         na_object_id id = 0;
         bool known = false;
         uint64_t gen = 0;
@@ -2291,13 +2308,14 @@ void note_draw(GL* l) {
     std::lock_guard<std::mutex> bl(ls->bind_m);
     uint64_t sel_depth = 0, sel_color = 0;
     GetLiveSelection(&sel_depth, &sel_color);
+    const auto pipeline = g_objs.find(canon(ls->pso));
+    const auto pipeline_id = pipeline == g_objs.end() ? 0 : pipeline->second.id;
     for (uint32_t i = 0; i < ls->cur_nrt; ++i)
         if (ls->cur_rts[i]) {
-            na::j2::InsertionEvent ev{ls->cur_rts[i], 0, reinterpret_cast<uint64_t>(ls->pso), true, na::j2::Op::DrawWrite};
+            na::j2::InsertionEvent ev{ls->cur_rts[i], 0, pipeline_id, true, na::j2::Op::DrawWrite};
             ev.with_depth = sel_depth && ls->cur_ds == sel_depth; // scene content, not a reuse of the texture
             ls->insertion.Add(ev);
         }
-    auto pipeline = g_objs.find(canon(ls->pso));
     if (ls->cur_ds && ls->cur_ds_sub != NA_UNKNOWN_U32 && pipeline != g_objs.end() &&
         pipeline->second.created.size() >= sizeof(na_ev_pipeline_created)) {
         const auto* p = reinterpret_cast<const na_ev_pipeline_created*>(pipeline->second.created.data());
@@ -2448,6 +2466,7 @@ struct On<sl::list::SetPipelineState> {
     {
         Rec r;
         if (!begin_op(l, &r)) return;
+        preexisting_pipeline(p);
         emit_op(r, NA_OP_SET_PIPELINE, {id_or_unknown(p)});
         with_list_state(l, [&](ListState& ls) { std::lock_guard<std::mutex> bl(ls.bind_m); ls.pso = p; });
     }
@@ -3039,6 +3058,8 @@ struct RasterJitterDraw {
         uint64_t depth = 0, color = 0;
         GetLiveSelection(&depth, &color);
         uint32_t w = 0, h = 0, f = 0;
+        bool already_applied = false;
+        double x = 0, y = 0;
         {
             std::shared_lock<std::shared_mutex> rl(g_m);
             na_object_id lid = 0;
@@ -3057,17 +3078,32 @@ struct RasterJitterDraw {
             if (v.TopLeftX != 0 || v.TopLeftY != 0 || v.Width != float(w) || v.Height != float(h)) return;
             original[0] = v;
             count = 1;
+            already_applied = ls->raster_jittered;
+            if (already_applied) { x = ls->raster_jitter[0]; y = ls->raster_jitter[1]; }
         }
-        double x = 0, y = 0;
-        if (!cb(w, h, &x, &y) || !std::isfinite(x) || !std::isfinite(y)) { count = 0; return; }
+        double suggested_x = 0, suggested_y = 0;
+        const bool suggested = cb(w, h, &suggested_x, &suggested_y);
+        if (!already_applied) {
+            x = suggested_x; y = suggested_y;
+            if (!suggested || !std::isfinite(x) || !std::isfinite(y)) { count = 0; return; }
+        }
         {
             std::shared_lock<std::shared_mutex> rl(g_m);
             na_object_id lid = 0;
             auto* ls = list_state_locked(l, &lid);
             if (!ls) { count = 0; return; }
             std::lock_guard<std::mutex> bl(ls->bind_m);
-            ls->raster_jittered = true;
-            ls->raster_jitter[0] = x; ls->raster_jitter[1] = y;
+            // Present can advance the suggested sample while a render worker
+            // is still recording. Keep one actual sample for this recording;
+            // NGX cannot unjitter different parts of one image with two phases.
+            // Reset clears this ownership. The callback still counts each
+            // qualifying draw, but cannot replace an already applied sample.
+            if (ls->raster_jittered) {
+                x = ls->raster_jitter[0]; y = ls->raster_jitter[1];
+            } else {
+                ls->raster_jittered = true;
+                ls->raster_jitter[0] = x; ls->raster_jitter[1] = y;
+            }
         }
         auto shifted = original[0];
         shifted.TopLeftX += float(x); shifted.TopLeftY += float(y);
@@ -3099,6 +3135,8 @@ void before_shader_use(GL* l, bool compute)
         std::lock_guard<std::mutex> bl(ls->bind_m);
         const auto signature = g_objs.find(canon(ls->root_sig[compute]));
         if (signature == g_objs.end()) return;
+        const auto pipeline = g_objs.find(canon(ls->pso));
+        const auto pipeline_id = pipeline == g_objs.end() ? 0 : pipeline->second.id;
         na_object_id destination = compute ? 0 : ls->cur_rt;
         uint8_t color_srvs = 0;
         na_object_id srv_ids[16] = {};
@@ -3137,7 +3175,7 @@ void before_shader_use(GL* l, bool compute)
         }
         if (reads_color) {
             // Role-class inputs (only for the few draws that read the scene colour).
-            na::j2::InsertionEvent ev{color, destination, reinterpret_cast<uint64_t>(ls->pso), false,
+            na::j2::InsertionEvent ev{color, destination, pipeline_id, false,
                                       compute ? na::j2::Op::ComputeRead : na::j2::Op::GraphicsRead,
                                       signature->second.root_hash};
             ev.color_srvs = color_srvs;
@@ -3152,7 +3190,7 @@ void before_shader_use(GL* l, bool compute)
         } else {
             reads_derived = is_derived_any(srv_ids, nsrv);
             if (reads_derived) // lineage only: the scene chain continues through a copy
-                ls->insertion.Add({color, destination, reinterpret_cast<uint64_t>(ls->pso), false, na::j2::Op::DerivedRead});
+                ls->insertion.Add({color, destination, pipeline_id, false, na::j2::Op::DerivedRead});
         }
     }
     if (reads_color) if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, compute);

@@ -154,7 +154,7 @@ struct State {
     na::j2::ClassKey fired_class;
     uint64_t fired_producer = 0;
     uint64_t fired_context = 0;
-    uint32_t fired_mode = 0;                    // 1 class, 2 pair, 3 barrier, 4 boundary matcher, 5 between-list reader
+    uint32_t fired_mode = 0;                    // 1 class, 2 pair, 3 barrier, 4 boundary, 5 between-list, 6 exact consumer
     bool fired_barrier_event = false;           // the placement was judged at a barrier event
     // First scene write after this frame's DLAA (the late writer): pipeline, depth bound, where
     // (1 same list after our insertion, 2 a later list of the same batch, 3 a later batch).
@@ -1183,12 +1183,12 @@ void note_late_writer(ID3D12CommandList* list, uint64_t color, uint32_t skip_wri
 }
 void note_late_frame()
 {
-    static const char* const kMode[] = {"none", "class", "pair", "barrier", "boundary", "between"};
+    static const char* const kMode[] = {"none", "class", "pair", "barrier", "boundary", "between", "exact-consumer"};
     static const char* const kWhere[] = {"?", "same_list", "later_list", "later_batch"};
     char one[200];
     const bool have = g.late_frame == g.frame;
     std::snprintf(one, sizeof one, "%llu:%s%s/op=%u/prod=%llu/ctx=%llu->late{%s pso=%llu depth=%u writes=%u} ",
-        static_cast<unsigned long long>(GetTickCount64() / 100 % 100000000), kMode[g.fired_mode < 6 ? g.fired_mode : 0],
+        static_cast<unsigned long long>(GetTickCount64() / 100 % 100000000), kMode[g.fired_mode < 7 ? g.fired_mode : 0],
         g.fired_barrier_event ? "@barrier" : "", static_cast<unsigned>(g.fired_class.op),
         (unsigned long long)g.fired_producer, (unsigned long long)g.fired_context,
         have ? kWhere[g.late_where < 4 ? g.late_where : 0] : "?", have ? (unsigned long long)g.late_pso : 0ull,
@@ -1882,9 +1882,10 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     if(boundary_role==BoundaryRoles::Middle) {++g.stats.segment_deferrals;return;}
     // Role-class trigger (placement design): at the ACTUAL consumer (draw/dispatch/copy),
     // fire when its class is accepted by the profile. A class known to be a temporary
-    // reader blocks the boundary matcher too (a fact from earlier frames). Otherwise the
-    // boundary matcher below decides exactly as before, so coverage never drops below it.
-    enum : uint32_t { kByClass = 1, kByPair = 2, kByBarrier = 3, kByLegacy = 4 };
+    // reader blocks the boundary matcher too (a fact from earlier frames). A recent
+    // qualified actual consumer takes priority over speculative barrier placement;
+    // otherwise the existing boundary matcher remains available.
+    enum : uint32_t { kByClass = 1, kByPair = 2, kByBarrier = 3, kByLegacy = 4, kByExact = 6 };
     uint32_t matched_mode = kByLegacy;
     bool by_class = false;
     na::j2::ClassKey live_class;
@@ -1896,6 +1897,12 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
         // restore does not cover: graphics consumers with MSAA depth stay on the boundary matcher.
         const bool raster_safe = live.op != na::j2::Op::GraphicsRead || g.depth_samples <= 1;
         if (live.barrier && live.after_write) {
+            // MSAA depth conversion changes graphics state that this inline
+            // consumer path cannot yet restore: keep its existing barrier path.
+            if (g.depth_samples <= 1 && g.profile.HasRecentExactEntry(g.frame)) {
+                ++g.stats.exact_consumer_waits;
+                return; // optional drawing can still follow this transition
+            }
             // Qualified scene-ending pattern: the drawing pipeline of the last write before
             // this barrier, plus (when that pipeline also appears mid-scene) the class of
             // the latest consumer earlier in this recording. Accepted -> fire here (boundary
@@ -1924,11 +1931,16 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
             live_class = na::j2::MakeClass(live.raw, g.scene_w, g.scene_h);
             live_producer = live.producer_pso;
             using V = na::j2::ConsumerProfile::Verdict;
-            const V v = g.profile.Judge(live_class, live_producer);
+            auto exact = live_class;
+            exact.pipeline = live.pso;
+            const V ev = live.pso && live.pso != UINT64_MAX ? g.profile.Judge(exact, live_producer) : V::Unknown;
+            const bool exact_ok = ev == V::Accepted || ev == V::AcceptedWithProducer;
+            const V v = exact_ok ? ev : g.profile.Judge(live_class, live_producer);
             if (v == V::Rejected) { ++g.stats.class_rejected_skips; return; }
             if (v == V::Accepted || v == V::AcceptedWithProducer) {
                 by_class = true;
-                matched_mode = v == V::Accepted ? kByClass : kByPair;
+                matched_mode = exact_ok ? kByExact : v == V::Accepted ? kByClass : kByPair;
+                if (exact_ok) live_class = exact;
             } else {
                 std::snprintf(g.stats.class_note, sizeof g.stats.class_note,
                     "%s class{op=%u root=%llu size=%u/%u fmt=%u srvs=%u/%u} producer=%llu",
@@ -2030,6 +2042,7 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     if (matched_mode == kByClass) ++g.stats.class_matched;
     else if (matched_mode == kByPair) ++g.stats.class_pair_matched;
     else if (matched_mode == kByBarrier) ++g.stats.barrier_matched;
+    else if (matched_mode == kByExact) ++g.stats.exact_consumer_matched;
     else ++g.stats.legacy_matched;
     // Remember what placed this frame's DLAA, so a later scene write demotes exactly that
     // pattern/class - including a boundary-matcher placement at a barrier.
@@ -2060,9 +2073,13 @@ int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
             if (e.write) { writes = true; consumed = false; producer = e.producer; continue; }
             if (!na::j2::IsConsumer(e.op)) continue; // a barrier alone is not a consumer
             if (!writes && !consumed && saved.frame == g.frame) {
-                const auto cls = na::j2::MakeClass(e.raw, g.scene_w, g.scene_h);
-                const auto verdict = g.profile.Judge(cls, saved.producer);
+                auto cls = na::j2::MakeClass(e.raw, g.scene_w, g.scene_h);
                 using V = na::j2::ConsumerProfile::Verdict;
+                auto exact = cls; exact.pipeline = e.raw.pipeline;
+                const auto ev = exact.pipeline && exact.pipeline != UINT64_MAX ? g.profile.Judge(exact, saved.producer) : V::Unknown;
+                const bool exact_ok = ev == V::Accepted || ev == V::AcceptedWithProducer;
+                const auto verdict = exact_ok ? ev : g.profile.Judge(cls, saved.producer);
+                if (exact_ok) cls = exact;
                 if ((verdict == V::Accepted || verdict == V::AcceptedWithProducer) &&
                     record(lists, 0, depth, color, ours, pending, nullptr, nullptr, &saved, i)) {
                     g.class_fired = true;
@@ -2071,6 +2088,7 @@ int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
                     g.fired_class = cls;
                     g.fired_producer = saved.producer;
                     g.fired_context = 0;
+                    if (exact_ok) ++g.stats.exact_consumer_matched;
                     saved = {};
                     return static_cast<int>(i);
                 }
@@ -2086,8 +2104,13 @@ int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
                 na::observe::ListSceneSubresource(lists[i], color, depth, &saved.color_sub, &saved.depth_sub) &&
                 find_camera(lists, i, depth, &saved.vp, &saved.reversed)) {
                 saved.frame = g.frame; saved.color = color; saved.depth = depth; saved.producer = producer;
-                saved.jitter[0] = (g_injected || (g.raster_jitter && g.jit.valid && g.jit.applied)) ? g.jit.px[0] : 0;
-                saved.jitter[1] = (g_injected || (g.raster_jitter && g.jit.valid && g.jit.applied)) ? g.jit.px[1] : 0;
+                // The recorded image owns its sample. The global suggestion
+                // may already belong to another worker/recording by now.
+                if (g.raster_jitter) {
+                    na::observe::ListRasterJitter(lists[i], &saved.jitter[0], &saved.jitter[1]);
+                } else if (g_injected) {
+                    saved.jitter[0] = g.jit.px[0]; saved.jitter[1] = g.jit.px[1];
+                }
             }
         }
     }
