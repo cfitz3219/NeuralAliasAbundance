@@ -63,7 +63,7 @@ def prepare(template, dll, documents, source, commit):
     return package
 
 
-def publish(documents, package, commit):
+def publish(documents, package, commit, title="AMD flow repair"):
     validate(package, commit)  # validate ALL bytes before changing any launcher
     actions = {"dlaa": "Deploy", "flow-update": "Deploy", "camfix-update": "Deploy",
                "dlaa-rollback": "Rollback", "flow-rollback": "Rollback", "camfix-rollback": "Rollback",
@@ -75,7 +75,7 @@ def publish(documents, package, commit):
         if target.exists():
             shutil.copy2(target, backup / target.name)
     for suffix, action in actions.items():
-        text = ('@echo off\r\n' + f'echo NeuralAlias SE5 - AMD flow repair {commit[:7]}\r\n' +
+        text = ('@echo off\r\n' + f'echo NeuralAlias SE5 - {title} {commit[:7]}\r\n' +
                 f'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{package / "deploy.ps1"}" -Action {action}\r\n' + 'pause\r\n')
         (documents / ("NA-se5-" + suffix + ".cmd")).write_bytes(text.encode("utf-8"))
     return backup
