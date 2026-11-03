@@ -107,3 +107,24 @@ next game test qualifies the resulting actual picture.
 
 Full-suite and package results are appended after completion. Current installed
 game and prior camfix packages remain intact during engineering verification.
+
+Runtime source0403a0b2dc866097a30516fb4d121aaaed088ee6 passes the complete rebuilt
+Release suite:174registered cases,169passed,5skipped,0failed,229.72seconds. Skips
+are the opt-in NR probe, three unsupported16xMSAA cases and upscaler-jitter.
+Detailed LastTest output preserves the17/17 indirect-handoff contribution and
+unchanged optional-tail/split-consumer results, not merely a successful process.
+
+Documents/NA-SE5-camfix-0403a0b is selected by the existing camfix
+update/results/rollback CMDs. DLL SHA256:
+F692958F3EFD5240C3C7FFBC5211355E7984FFEC04D83ABFC4CE78B7A3F8BC00.
+Temporary-folder WindowsPowerShell019->candidate->019->original roundtrip and
+all payload hashes pass; raster mode, retained sharpness and native files are
+preserved. Prior launchers are backed up at before-0403a0b-20261103-015242;
+known-good019 and6f baseline launchers/packages are untouched. Results now warn
+that shared capture folders can include other games, rather than calling their
+contents attributable SE5 captures. No extra capture plane or live readback.
+
+Actual game DLL remains a7fce1f/57A568AA... before and after publication. No game
+launch, control or deployment by Astra. This is an automated-qualified candidate
+for Cort's next game test; PR79 remains outside main pending that actual picture
+result. The earlier failed broad reversal is retained only as local evidence.
