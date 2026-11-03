@@ -16,14 +16,16 @@ class PostEntryProfile {
         return {e.pipeline,e.root,e.destination,e.dst_w,e.dst_h,e.dst_fmt,compute};
     }
 public:
+    enum class Verdict { Unknown, Learning, Middle, Accepted };
     void Clear(){items_.clear();}
     size_t Size()const{return items_.size();}
-    bool Accepts(const InsertionEvent& e)const {
-        if(!IsEntry(e.op) || !e.pipeline || !e.root)return false;
+    Verdict Judge(const InsertionEvent& e)const {
+        if(!IsEntry(e.op) || !e.pipeline || !e.root)return Verdict::Unknown;
         const auto k=key(e);
-        for(const auto& i:items_)if(i.key==k)return i.ends>=3 && !i.middle;
-        return false;
+        for(const auto& i:items_)if(i.key==k)return i.middle?Verdict::Middle:i.ends>=3?Verdict::Accepted:Verdict::Learning;
+        return Verdict::Unknown;
     }
+    bool Accepts(const InsertionEvent& e)const {return Judge(e)==Verdict::Accepted;}
     bool Ready()const {for(const auto& i:items_)if(i.ends>=3 && !i.middle)return true;return false;}
     void Observe(const std::vector<ColorEvent>& events,bool complete,uint64_t frame) {
         if(!complete)return;

@@ -1435,6 +1435,7 @@ HRESULT STDMETHODCALLTYPE D_Signal(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64
 }
 HRESULT STDMETHODCALLTYPE D_Wait(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v)
 {
+    if (t_host_work) return o_Wait(q, f, v); // private completion, as for D_Signal
     const auto token = ExecuteBegin(q);
     const HRESULT hr = o_Wait(q, f, v);
     sync_event(NA_EV_QUEUE_WAIT, token, f, v, hr);
@@ -5000,6 +5001,11 @@ uint32_t ReadBuffer(na_object_id res, uint64_t offset, void* dst, uint32_t n)
     t_host_work = was_host;
     reread->Release();
     return ok ? n : 0;
+}
+bool KnownSubStateOnQueueNow(ID3D12CommandQueue* queue, na_object_id id, uint32_t sub, uint32_t* state)
+{
+    const auto qid=queue?lookup(queue):0;
+    return qid && state && id && known_state(id,sub,qid,0,state);
 }
 bool KnownSubStateNow(na_object_id id, uint32_t sub, uint32_t* state)
 {

@@ -25,6 +25,7 @@
 #include "host_dx12/nr/native_fg.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/observe/producers.hpp"
+#include "host_dx12/overlay/submission_tracking.hpp"
 
 #include <d3dcompiler.h>
 #include <array>
@@ -70,10 +71,10 @@ void __stdcall Forward(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* 
 void Submit(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists, bool j2)
 {
     const na::observe::ExecuteToken t = na::observe::ExecuteBegin(q, n, lists);
-    na::dlss::BeforeExecute(q, n, lists); // as the overlay: DLSS completion tracking of inline recordings
+    na::overlay::BeforeGameSubmission(q,n,lists);
     if (j2) na::j2::Execute(q, n, lists, &Forward);
     else q->ExecuteCommandLists(n, lists);
-    na::dlss::OnExecuted(q, n, lists);
+    na::overlay::AfterGameSubmission(q,n,lists);
     na::observe::ExecuteEnd(t, q, n, lists);
 }
 using M = std::array<double, 16>;
@@ -578,7 +579,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         scene.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
         const float clear[4] = {0.2f, 0.3f, 0.4f, 1};
         scene.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
-        scene.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
+        if(!entry_test)scene.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
         ID3D12DescriptorHeap* heaps[] = {cbvh.Get()};
         scene.list->SetDescriptorHeaps(1, heaps);
         scene.list->SetGraphicsRootSignature(rs.Get());
@@ -794,6 +795,11 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         printf("POST ENTRY %u/%u downstream; matches %llu frames %llu late %llu real %u\n",entry_delivered,entry_checks,(unsigned long long)st.entry_matched,(unsigned long long)st.frames,(unsigned long long)st.inline_late_writes,real_ngx);
         CHECK(entry_checks==17 && entry_delivered==17 && st.entry_matched>=17);
         CHECK(st.no_camera==0 && st.no_state==0 && st.inline_late_writes==0);
+        CHECK(st.depth_sources[1]>=17 && st.depth_state_assumed==0); // inherited, never guessed
+        uint64_t depth_total=0,camera_total=0;
+        for(const auto value:st.depth_sources)depth_total+=value;
+        for(const auto value:st.camera_sources)camera_total+=value;
+        CHECK(depth_total==st.frames && camera_total==st.frames); // count submissions, not attempts
         CHECK(evaluations()-evals0>=17 && evaluations()-evals0<=24);
         CHECK(dev->GetDeviceRemovedReason()==S_OK);
         na::capture::j2::Shutdown();

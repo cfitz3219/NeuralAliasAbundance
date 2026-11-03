@@ -167,6 +167,9 @@ bool KnownSubStateInCurrentSubmission(na_object_id id, uint32_t sub, uint32_t* s
 // The subresource's state after all work submitted so far (no submission context:
 // for host work recorded during the game's recording). False when unknown/in flight.
 bool KnownSubStateNow(na_object_id id, uint32_t sub, uint32_t* state);
+// Recording-time consumer with an established queue: also require that this
+// queue owns the carried state. A state from another queue is not an ordering edge.
+bool KnownSubStateOnQueueNow(ID3D12CommandQueue* queue, na_object_id id, uint32_t sub, uint32_t* state);
 void DescribeStateEvidence(ID3D12CommandList* list, na_object_id id, uint32_t sub, char* text, size_t capacity);
 bool ListLastStateSub(ID3D12CommandList* list, na_object_id id, uint32_t sub, uint32_t* state);
 enum class StateLookup { Absent, Known, Unavailable };

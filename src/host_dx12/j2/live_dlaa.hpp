@@ -178,10 +178,16 @@ struct Stats {
     char recent_cuts[240] = {};
     uint64_t camera_from_j1 = 0;
     uint64_t jitter_extent_rescaled = 0; // the render extent changed after J1 jittered this frame: sample rescaled // the scene list held no camera; J1's camera of this same frame (with its jitter) was used
-    // SE5 menu: frames whose depth state lookup failed and that used the state learned from
-    // the same scene end (identical on 30+ known frames in a row).
+    // Historical field retained for Results compatibility; learned depth guesses
+    // are removed and this stays zero. Exact source counts below are evaluations.
     uint64_t depth_state_assumed = 0;
-    char camera_lost_evidence[480] = {};  // the last lost frame: every block searched and what it held
+    // Successful submitted evaluations only. Depth: local, inherited, supplied,
+    // submitted-prefix; camera: fresh, J1, held-still, held-moving, predicted, saved.
+    uint64_t depth_sources[4] = {};
+    uint64_t camera_sources[6] = {};
+    uint32_t depth_source_last = 0, camera_source_last = 0;
+    uint64_t camera_age_last = 0, camera_age_max = 0;
+    char camera_lost_evidence[768] = {};  // bounded last-loss block/offset/read/shape evidence
     int64_t camera_inv_delta = 0; // bytes from the ViewProjection to its inverse in the camera block
     int64_t camera_proj_delta = 0; // bytes to the camera's separate projection matrix (0 = none found)
     uint64_t jitter_proj_writes = 0; // J1: projection matrices replaced by jittered copies
@@ -223,6 +229,7 @@ struct Stats {
     uint64_t between_observed = 0, between_predicted = 0; // between-list placements before an observed reader / after a predicted last scene list
     char class_note[200] = {};            // latest consumer class not accepted (explains a missed frame)
     uint64_t entry_matched=0;
+    uint64_t entry_unknown=0,entry_learning=0,entry_middle=0;
     uint32_t entry_keys=0;
     // SE5 2026-11-02 (Cort: flicker only while panning): every frame whose DLAA ran and was then
     // followed by more scene drawing, newest first: what placed it and what drew after it.

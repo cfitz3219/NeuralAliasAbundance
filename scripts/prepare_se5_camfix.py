@@ -25,12 +25,12 @@ def prepare(template, dll, documents, source, commit):
     script = script.replace("mip_bias = '-1.0' }", "mip_bias = '-1.0'; flow_loosen = '50' }")
     script = script.replace("foreach ($k in 'sharpness', 'preset', 'mip_bias')", "foreach ($k in 'sharpness', 'preset', 'mip_bias', 'flow_loosen')")
     script = script.replace("flow=1\n", "flow=1\nflow_loosen=$($Keep['flow_loosen'])\n")
-    script = script.replace("foreach ($p in '^j2 on=',", "foreach ($p in '^j2_entry ', '^j2 on=',")
+    script = script.replace("foreach ($p in '^j2 on=',", "foreach ($p in '^j2_input_sources ', '^j2_last_miss ', '^j2_entry ', '^j2 on=',")
     script = script.replace("AMD moving-object flow: accepted", "AMD residual corrections: accepted")
     script = script.replace("Home > Moving-object motion (test)", "Home > Enhancements > DLAA enhancements > Moving-object motion (test)")
     script = script.replace("flicker-diagnostic", "post-entry and flow").replace("flicker diagnostic", "post-entry and flow")
     # Header describes this increment; the historical original remains intact.
-    script = ("# Original6f transaction, completed post-entry repair + Claude flow/UI676368f.\n"
+    script = ("# Original6f transaction, post-entry + depth provenance repair + Claude flow/UI/logging.\n"
               "# Additive installation only; previous logs/settings retained; rollback uses the existing receipt.\n"
               + script[script.index("param("):])
     if "flow_loosen=$($Keep['flow_loosen'])" not in script:
@@ -42,14 +42,16 @@ def prepare(template, dll, documents, source, commit):
     (package / "deploy.ps1").write_text(script, encoding="utf-8-sig")
     shutil.copy2(dll, package / "NeuralAliasDXGI.dll")
     shutil.copy2(source / "docs/SE5-POST-ENTRY-REPAIR.md", package / "ENGINEERING.md")
+    shutil.copy2(source / "docs/SE5-DEPTH-PROVENANCE-20261103.md", package / "DEPTH-REPAIR.md")
     (package / "README.txt").write_text(
         "NeuralAlias SE5 camfix " + commit + "\n"
-        "Original6f + actual post-entry placement + Claude flow/UI676368f.\n"
+        "Original6f + actual post-entry placement + private-completion depth repair + Claude flow/UI/logging.\n"
         "Close SE5, run Documents\\NA-se5-camfix-update.cmd, then use the existing NA-se5-play.cmd.\n"
         "Home > Enhancements > DLAA enhancements: moving-object motion, rules, jitter, texture detail.\n"
         "Flow starts ON. Moving-object rules defaults to 50%; 0% restores the original strict gates.\n"
         "Retains saved sharpness/preset/mip-bias/rules. Camera jitter behavior remains the original baseline.\n"
         "Placement learns for a few frames; j2_entry in saved results records actual-operation matches.\n"
+        "Depth uses observed state rather than learned guesses; j2_input_sources reports committed inputs and camera age.\n"
         "F8 saves evaluation/final-image captures. After exiting, run NA-se5-camfix-results.cmd.\n"
         "NA-se5-camfix-rollback.cmd removes this additive installation using its receipt.\n"
         "Original/rejected packages and launcher backups remain available. Native files are never replaced.\n"
@@ -61,7 +63,7 @@ def prepare(template, dll, documents, source, commit):
         "The usual rollback command restores the installation's original files, rather than selecting a prior build.\n",
         encoding="utf-8")
     manifest = {"source_commit": commit, "base_commit": baseline["source_commit"],
-        "claude_flow_commit": "676368fc9d5850ac0f552f4353c8ecd7ec1ff4a5",
+        "claude_flow_commit": "b033474da3e8e088e8681c1f9ca06a855cdbb53c",
         "payload": [{"name": p.name, "sha256": digest(p)} for p in sorted(package.iterdir())
                     if p.is_file() and p.name != "package.json"]}
     (package / "package.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")

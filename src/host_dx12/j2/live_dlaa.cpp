@@ -59,6 +59,8 @@ struct PendingHistory {
     bool cut = false;
     uint32_t capture = 0; // J2 evidence capture token for this evaluation (0 = none)
     na::j2::compute_flow::Ticket compute_flow;
+    uint32_t depth_source=0, camera_source=0;
+    uint64_t camera_age=0;
 };
 
 // CPU metadata of this frame's last submitted scene. No pooled command-list
@@ -105,16 +107,6 @@ struct State {
     na::camera::Matrix cam_u0{}, cam_u1{}; // unjittered VPs of the last two read frames (u1 newest)
     uint64_t cam_f0 = 0, cam_f1 = 0;       // their frames (0 = none)
     bool cam_rev = false;
-    // SE5 main menu (Cort 2026-11-02): the depth's state at the scene end was unknown on ~1/4
-    // of frames (the state store reset: ambiguous_queue_order). The same scene end reports
-    // the same depth state frame after frame; once it has been the same on kDepthLearnFrames
-    // known frames in a row, a frame whose lookup fails but whose scene list did render into
-    // that depth uses it, instead of showing the raw frame.
-    uint32_t depth_learned_state = 0;
-    uint32_t depth_learned_sub = 0xFFFFFFFFu;
-    na_object_id depth_learned_id = 0;
-    uint32_t depth_learned_streak = 0;
-    uint64_t depth_learned_frame = 0; // last frame the state was known
     uint64_t frame = 1;             // game Present interval, not Execute attempt
     uint64_t submitted_frame = 0;   // last interval that actually submitted DLAA
     // Games may draw the scene across several submissions per frame (Sniper Elite
@@ -226,6 +218,13 @@ struct PhysicalReport {
 };
 
 void reason(const char* r) { std::snprintf(g.stats.reason, sizeof(g.stats.reason), "%s", r); }
+void committed_sources(const PendingHistory& p) {
+    if(p.depth_source>=1 && p.depth_source<=4)++g.stats.depth_sources[p.depth_source-1];
+    if(p.camera_source>=1 && p.camera_source<=6)++g.stats.camera_sources[p.camera_source-1];
+    g.stats.depth_source_last=p.depth_source;g.stats.camera_source_last=p.camera_source;
+    g.stats.camera_age_last=p.camera_age;
+    g.stats.camera_age_max=(std::max)(g.stats.camera_age_max,p.camera_age);
+}
 
 D3D12_RESOURCE_BARRIER transition(ID3D12Resource* r, UINT before, UINT after)
 {
@@ -901,7 +900,10 @@ void count_post_dlaa(ID3D12CommandList* const* lists, UINT first, UINT count, na
 // and CBVs reached through descriptor tables both count (Anno binds its camera
 // through a table). Lists that use the scene depth are searched first, then the
 // rest; within that, the binding slot that held the camera last time leads.
-struct CamDiag { size_t lists = 0, binds = 0, blocks = 0, read = 0, vp = 0, cands = 0; } g_cd;
+struct CamDiag {
+    size_t lists=0,binds=0,blocks=0,read=0,vp=0,cands=0;
+    size_t learned_seen=0,learned_bounds=0,learned_shape=0,learned_inverse=0;
+} g_cd;
 
 struct Block {
     uint64_t resource = 0, offset = 0;
@@ -912,14 +914,18 @@ struct Block {
 bool check_learned(const std::vector<uint8_t>& bytes, na::camera::Matrix* vp, bool* reversed)
 {
     const size_t n = bytes.size();
-    if (g.camera_offset < 0 || static_cast<uint64_t>(g.camera_offset) + 64 > n) return false;
+    ++g_cd.learned_seen;
+    if (g.camera_offset < 0 || static_cast<uint64_t>(g.camera_offset) + 64 > n) {++g_cd.learned_bounds;return false;}
+    bool have_vp=false,have_inverse_bytes=false;
     for (auto layout : {na::camera::Layout::RowMajor, na::camera::Layout::ColumnMajor}) {
         const auto m = na::camera::LoadMatrix(bytes, static_cast<size_t>(g.camera_offset), layout);
         na::camera::Candidate c{};
         if (!na::camera::ViewProjection(m, c)) continue;
+        have_vp=true;
         for (int64_t d : {g.camera_inv_delta}) { // the learned inverse position (Anno: not adjacent)
             const int64_t off = g.camera_offset + d;
             if (off < 0 || static_cast<uint64_t>(off) + 64 > n) continue;
+            have_inverse_bytes=true;
             if (na::camera::IsInversePair(m, na::camera::LoadMatrix(bytes, static_cast<size_t>(off), layout))) {
                 *vp = m;
                 *reversed = c.reversed;
@@ -927,6 +933,9 @@ bool check_learned(const std::vector<uint8_t>& bytes, na::camera::Matrix* vp, bo
             }
         }
     }
+    if(!have_vp)++g_cd.learned_shape;
+    else if(!have_inverse_bytes)++g_cd.learned_bounds;
+    else ++g_cd.learned_inverse;
     return false;
 }
 
@@ -1055,7 +1064,7 @@ bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth
         return true;
     }
     // 2. A full search; a few candidates are compared the same way before the slot is relearned.
-    struct BlockNote { uint32_t param, size, uses, read; bool table; uint32_t vp, inv, proj, view; };
+    struct BlockNote { uint32_t param, size, uses, read; bool table; uint32_t vp, inv, proj, view; uint64_t resource,offset; };
     std::vector<BlockNote> notes;
     CamPick loose;               // a ViewProjection WITHOUT its inverse that continues the main camera
     bool have_loose = false;     // (accepted for this frame only; the slot is not relearned from it)
@@ -1064,7 +1073,7 @@ bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth
         na::camera::Snapshot s{};
         const bool read_ok = read_block(o, s);
         const bool noted = notes.size() < 12;
-        if (noted) notes.push_back({o->param, o->size, o->uses, read_ok ? static_cast<uint32_t>(s.bytes.size()) : 0u, o->table, 0, 0, 0, 0});
+        if (noted) notes.push_back({o->param, o->size, o->uses, read_ok ? static_cast<uint32_t>(s.bytes.size()) : 0u, o->table, 0, 0, 0, 0,o->resource,o->offset});
         if (!read_ok) continue;
         const auto scan = na::camera::FindMatrices(s);
         g_cd.cands += scan.candidates.size();
@@ -1120,13 +1129,13 @@ bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth
         // What the frame held (the last loss only; the status log writes it).
         char* t = g.stats.camera_lost_evidence;
         size_t cap = sizeof g.stats.camera_lost_evidence;
-        int n = std::snprintf(t, cap, "frame=%llu lists=%zu binds=%zu blocks=%zu read=%zu vp=%zu cands=%zu learned{param=%lld table=%d off=%lld inv=%lld} main_cam=%d blocks[param/table size uses read vp/inv/proj/view]:",
+        int n = std::snprintf(t, cap, "frame=%llu lists=%zu binds=%zu blocks=%zu read=%zu vp=%zu cands=%zu learned{param=%lld table=%d off=%lld inv=%lld checked=%zu bounds=%zu shape=%zu inverse=%zu} main_cam=%d blocks[param/table size uses read vp/inv/proj/view resource@offset]:",
                               static_cast<unsigned long long>(g.frame), g_cd.lists, g_cd.binds, g_cd.blocks, g_cd.read, g_cd.vp, g_cd.cands,
                               static_cast<long long>(g.camera_param), g.camera_table ? 1 : 0, static_cast<long long>(g.camera_offset),
-                              static_cast<long long>(g.camera_inv_delta), g_jit_cam.valid ? 1 : 0);
+                              static_cast<long long>(g.camera_inv_delta),g_cd.learned_seen,g_cd.learned_bounds,g_cd.learned_shape,g_cd.learned_inverse, g_jit_cam.valid ? 1 : 0);
         for (const auto& bn : notes) {
             if (n < 0 || static_cast<size_t>(n) >= cap) break;
-            const int m = std::snprintf(t + n, cap - static_cast<size_t>(n), " %u/%d %u %u %u %u/%u/%u/%u", bn.param, bn.table ? 1 : 0, bn.size, bn.uses, bn.read, bn.vp, bn.inv, bn.proj, bn.view);
+            const int m = std::snprintf(t + n, cap - static_cast<size_t>(n), " %u/%d %u %u %u %u/%u/%u/%u %llu@%llu", bn.param, bn.table ? 1 : 0, bn.size, bn.uses, bn.read, bn.vp, bn.inv, bn.proj, bn.view,(unsigned long long)bn.resource,(unsigned long long)bn.offset);
             if (m < 0) break;
             n += m;
         }
@@ -1263,8 +1272,11 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // Inline: the state recorded so far in this list, else the state all submitted work left.
     const auto state_now = [&](na_object_id id, uint32_t sub, uint32_t* st) {
         const auto evidence = na::observe::ListStateSub(inl, id, sub, st);
-        return evidence == na::observe::StateLookup::Known ||
-               (evidence == na::observe::StateLookup::Absent && na::observe::KnownSubStateNow(id, sub, st));
+        if(evidence==na::observe::StateLookup::Known){if(id==depth_id)pending.depth_source=1;return true;}
+        if(evidence==na::observe::StateLookup::Absent && na::observe::KnownSubStateOnQueueNow(g.queue.Get(),id,sub,st)){
+            if(id==depth_id)pending.depth_source=2;return true;
+        }
+        return false;
     };
     const auto entry_state = [&](na_object_id id, uint32_t sub, uint32_t* st) {
         return prefix ? state_after(lists, prefix - 1, id, sub, st)
@@ -1276,29 +1288,9 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // Layer2 companions are private textures, not observed: their exact states come with them.
     const bool have_sc = phys ? (sc = phys->color_state, true) : state_of(color_id, csub, &sc);
     bool have_sd = phys ? (sd = phys->depth_state, true) : state_of(depth_id, dsub, &sd);
-    if (inl && !phys && !saved) {
-        // Inline only, learning and using only the state the list STARTED with (this list has
-        // not transitioned the depth so far): Astra, COMMS 2026-11-02, rendering into the depth
-        // proves its use, not its state. The same scene end reported that entry state on
-        // kDepthLearnFrames known frames in a row before it is used for an unknown one.
-        constexpr uint32_t kDepthLearnFrames = 30;
-        constexpr uint64_t kDepthLearnMaxAge = 300;
-        uint32_t in_list = 0;
-        const bool untouched = na::observe::ListStateSub(inl, depth_id, dsub, &in_list) == na::observe::StateLookup::Absent;
-        const bool same_target = g.depth_learned_id == depth_id && g.depth_learned_sub == dsub;
-        if (have_sd && untouched) {
-            if (g.depth_learned_frame != g.frame) { // once per frame
-                if (same_target && g.depth_learned_state == sd) ++g.depth_learned_streak;
-                else { g.depth_learned_streak = 1; g.depth_learned_state = sd; g.depth_learned_id = depth_id; g.depth_learned_sub = dsub; }
-                g.depth_learned_frame = g.frame;
-            }
-        } else if (!have_sd && untouched && have_sc && same_target && g.depth_learned_streak >= kDepthLearnFrames &&
-                   g.frame - g.depth_learned_frame <= kDepthLearnMaxAge && na::observe::ListRendersTo(inl, color_id, depth_id)) {
-            sd = g.depth_learned_state;
-            have_sd = true;
-            ++g.stats.depth_state_assumed;
-        }
-    }
+    // Never replace missing state provenance with a state learned on old frames.
+    // Private completion bookkeeping must preserve the real carried state instead.
+    if(have_sd && !pending.depth_source)pending.depth_source=phys?3u:4u;
     if (!have_sc || !have_sd) {
         ++g.stats.no_state;
         if (!have_sc) ++g.stats.no_state_color; else ++g.stats.no_state_depth;
@@ -1370,7 +1362,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         if (dest && up.dest == color_id) refuse_upscale("The upscale destination is the scene colour itself.");
         // The destination may be untouched by the game until after J2's insertion: then the
         // state all submitted work left it in.
-        if (dest && !state_of(up.dest, dsub_out, &sdest) && !na::observe::KnownSubStateNow(up.dest, dsub_out, &sdest)) refuse_upscale("Waiting: the upscale destination's state is not established.");
+        if (dest && !state_of(up.dest, dsub_out, &sdest) && !na::observe::KnownSubStateOnQueueNow(g.queue.Get(),up.dest, dsub_out, &sdest)) refuse_upscale("Waiting: the upscale destination's state is not established.");
     }
     const bool upscaling = dest != nullptr;
 
@@ -1378,7 +1370,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // update comes after the size check, because a resize resets the tracker.
     na::camera::Matrix vp{};
     bool reversed = false;
-    bool held = false, from_j1 = false;
+    bool held = false, from_j1 = false, held_still=false, extrapolated=false;
     if (saved) { vp = saved->vp; reversed = saved->reversed; }
     const bool found = saved || find_camera(lists, scene, depth_id, &vp, &reversed);
     if (!found && g.jit.valid && g.jit.applied && g.cam_f1) {
@@ -1413,6 +1405,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             vp = velocity ? na::camera::ExtrapolateViewProjection(g.cam_u0, g.cam_u1) : g.cam_u1;
             reversed = g.cam_rev;
             held = true;
+            held_still=still;extrapolated=velocity;
             ++g.stats.camera_held;
             if (velocity) ++g.stats.camera_extrapolated;
         }
@@ -1426,6 +1419,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         reason(why);
         return false;
     }
+    pending.camera_source=saved?6u:from_j1?2u:held?(extrapolated?5u:held_still?3u:4u):1u;
+    pending.camera_age=held?g.frame-g.cam_f1:0u;
     if (!held) remember_main_camera(vp); // J1: the main camera, for earlier batches next frame
     // Ring slot (never wait) and size/format changes (only once the GPU is done with the old set).
     const UINT64 done = g.fence->GetCompletedValue();
@@ -1857,10 +1852,27 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
     na::j2::ClassKey live_class;
     uint64_t live_producer = 0, live_context = 0;
     bool fired_at_barrier = false; // the event being judged is a barrier (whichever trigger fires)
-    if(entry && g.entries.Accepts(*entry)) {
-        by_class=true;matched_mode=kByEntry;
-    } else if(entry) return;
-    else {
+    if(entry) {
+        using V=na::j2::PostEntryProfile::Verdict;
+        const auto verdict=g.entries.Judge(*entry);
+        if(verdict==V::Accepted){by_class=true;matched_mode=kByEntry;}
+        else {
+            const char* why=verdict==V::Unknown?"new_or_unidentified":verdict==V::Learning?"learning":"seen_mid_scene";
+            if(verdict==V::Unknown)++g.stats.entry_unknown;
+            else if(verdict==V::Learning)++g.stats.entry_learning;
+            else ++g.stats.entry_middle;
+            // Prefer a new/learning key over ordinary intermediate entries in
+            // the bounded last-miss packet. No change to admission or learning.
+            if(!g.frame_rejects || verdict!=V::Middle)
+                std::snprintf(g.frame_reject_text,sizeof g.frame_reject_text,
+                    "entry=%s pso=%llu root=%llu dst=%llu kind=%u recording=%llu op=%llu barrier=%u",
+                    why,(unsigned long long)entry->pipeline,(unsigned long long)entry->root,
+                    (unsigned long long)entry->destination,static_cast<unsigned>(entry->op),
+                    (unsigned long long)entry->recording,(unsigned long long)entry->operation,entry->barrier);
+            ++g.frame_rejects;
+            return;
+        }
+    } else {
         const auto live = na::observe::ListLiveConsumer(l, color_id);
         // An MSAA depth resolve draws (render target, viewport, topology), which the state
         // restore does not cover: graphics consumers with MSAA depth stay on the boundary matcher.
@@ -2428,6 +2440,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
                 forward(queue, static_cast<UINT>(batch.size()), batch.data());
                 na::dlss::OnExecuted(queue, static_cast<UINT>(batch.size()), batch.data());
                 g.tracker = pending.tracker;
+                committed_sources(pending);
                 g.submitted_frame = g.frame;
                 g.resume_reset = false;
                 g.stats.active = true;
@@ -2450,6 +2463,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         if (!has) return;
         lock.lock();
         g.tracker = g.inl.history.tracker;
+        committed_sources(g.inl.history);
         g.submitted_frame = g.frame;
         g.resume_reset = false;
         if (g.inl.history.cut) ++g.stats.cuts;
@@ -2580,6 +2594,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     // The void D3D12 forward has now submitted our list. Failed recording/NGX
     // attempts above must never replace the previous submitted camera.
     g.tracker = pending.tracker;
+    committed_sources(pending);
     g.submitted_frame = g.frame;
     g.resume_reset = false;
     ++g.stats.frames;
@@ -2623,7 +2638,6 @@ void Shutdown()
     g.arbiter_ok = false;
     g.tracker.Reset();
     g.cam_f0 = g.cam_f1 = 0;
-    g.depth_learned_streak = 0; g.depth_learned_frame = 0; g.depth_learned_id = 0; g.depth_learned_sub = 0xFFFFFFFFu;
     g.frame = 1;
     g.submitted_frame = 0;
     g.scene_batches_cur = g.scene_batches_target = 0;

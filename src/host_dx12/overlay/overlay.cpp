@@ -10,6 +10,7 @@
 #include "host_dx12/overlay/input_handover.hpp"
 #include "host_dx12/overlay/present_queues.hpp"
 #include "host_dx12/overlay/boundary_fallback.hpp"
+#include "host_dx12/overlay/submission_tracking.hpp"
 
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -753,6 +754,16 @@ void write_status_line()
                 static_cast<unsigned long long>(j2.camera_extrapolated), static_cast<unsigned long long>(j2.depth_state_assumed),
                 static_cast<unsigned long long>(j2.camera_from_j1));
             if (mn > 0) WriteFile(f, ml, static_cast<DWORD>((std::min)(mn, static_cast<int>(sizeof(ml) - 1))), &written, nullptr);
+            char sources[640];
+            const int sn=snprintf(sources,sizeof sources,
+                "j2_input_sources evaluated{depth_local=%llu depth_inherited=%llu depth_supplied=%llu depth_submitted=%llu camera_fresh=%llu camera_j1=%llu camera_still=%llu camera_moving=%llu camera_predicted=%llu camera_saved=%llu} last{depth=%u camera=%u age=%llu max_age=%llu}\r\n",
+                (unsigned long long)j2.depth_sources[0],(unsigned long long)j2.depth_sources[1],
+                (unsigned long long)j2.depth_sources[2],(unsigned long long)j2.depth_sources[3],
+                (unsigned long long)j2.camera_sources[0],(unsigned long long)j2.camera_sources[1],
+                (unsigned long long)j2.camera_sources[2],(unsigned long long)j2.camera_sources[3],
+                (unsigned long long)j2.camera_sources[4],(unsigned long long)j2.camera_sources[5],
+                j2.depth_source_last,j2.camera_source_last,(unsigned long long)j2.camera_age_last,(unsigned long long)j2.camera_age_max);
+            if(sn>0)WriteFile(f,sources,static_cast<DWORD>((std::min)(sn,static_cast<int>(sizeof(sources)-1))),&written,nullptr);
             if (j2.camera_lost_evidence[0]) {
                 WriteFile(f, "j2_camera_lost ", 15, &written, nullptr);
                 WriteFile(f, j2.camera_lost_evidence, static_cast<DWORD>(std::strlen(j2.camera_lost_evidence)), &written, nullptr);
@@ -849,7 +860,8 @@ void write_status_line()
                 (unsigned long long)j2.labelled_frames, (unsigned long long)j2.unlabelled_frames, (unsigned long long)j2.expired_inline,
                 (unsigned long long)j2.between_observed, (unsigned long long)j2.between_predicted, j2.class_note);
             if (na2 > 0) WriteFile(f, al, static_cast<DWORD>((std::min)(na2, static_cast<int>(sizeof al - 1))), &written, nullptr);
-            const int en=snprintf(al,sizeof al,"j2_entry keys=%u matched=%llu source=actual_operation\r\n",j2.entry_keys,(unsigned long long)j2.entry_matched);
+            const int en=snprintf(al,sizeof al,"j2_entry keys=%u matched=%llu source=actual_operation rejected{new=%llu learning=%llu middle=%llu}\r\n",j2.entry_keys,(unsigned long long)j2.entry_matched,
+                (unsigned long long)j2.entry_unknown,(unsigned long long)j2.entry_learning,(unsigned long long)j2.entry_middle);
             if(en>0)WriteFile(f,al,static_cast<DWORD>(en),&written,nullptr);
             const auto cs = na::capture::j2::GetStats();
             {
@@ -2769,17 +2781,15 @@ void STDMETHODCALLTYPE DetourExecute(ID3D12CommandQueue* q, UINT n,
     if (sub) {
         ExecuteContext ctx{q, n, lists, g_exec_ticket.fetch_add(1, std::memory_order_relaxed) + 1, uncovered, sub->user};
         if (sub->begin) sub->begin(&ctx);
-        na::dlss::BeforeExecute(q, n, lists); // R-303: wait for this view's previous DLSS frame on another queue
+        na::overlay::BeforeGameSubmission(q,n,lists);
         na::j2::Execute(q, n, lists, ForwardThroughNr);
-        na::gputime::OnExecuted(q, n, lists); // R-202: completion fence on the queue that ran the lists
-        na::dlss::OnExecuted(q, n, lists);    // C6: completion evidence before retired DLSS features are released
+        na::overlay::AfterGameSubmission(q,n,lists);
         if (sub->end) sub->end(&ctx);
         g_exec_scoped.fetch_add(1, std::memory_order_relaxed);
     } else {
-        na::dlss::BeforeExecute(q, n, lists); // R-303: wait for this view's previous DLSS frame on another queue
+        na::overlay::BeforeGameSubmission(q,n,lists);
         na::j2::Execute(q, n, lists, ForwardThroughNr);
-        na::gputime::OnExecuted(q, n, lists); // R-202: completion fence on the queue that ran the lists
-        na::dlss::OnExecuted(q, n, lists);    // C6: completion evidence before retired DLSS features are released
+        na::overlay::AfterGameSubmission(q,n,lists);
     }
     na::nr::states::Submitted(q,n,lists);
     if (obs_token.queue_state) na::observe::ExecuteEnd(obs_token, q, n, lists);
