@@ -90,3 +90,32 @@ test logs. Full rebuilt-suite results and final source pin are recorded below
 when complete. The new window-pan case is registered in CTest. Existing core,
 backend, acquired-camera validators, ledger, lifetimes and repeat fallback are
 retained. No fixture result is called a successful game run.
+
+## Final receipt and newer user run
+
+During this work Cort installed **8a0ee44** and reported it worse. Actual
+status41592 ends at1,203windowed frames,187repeats(15.54%),115stale repeats,
+zero dropped/capped camera blocks and about1.364ms camera work/frame. Thus the
+broader scan did remove budget omissions but did not eliminate stutter. This
+does not establish how many of those187frames each correction above resolves;
+the accepted VP-only fallback was used only once in that log. Keep reproduction
+evidence separate from attribution of every real-game repeated frame.
+
+Runtime **2ffc23d54321aa7d7519c1b3160577ef86c7b4a9**, PR83 against
+claude/p44-projection-window: full Release build and182registered tests,
+178passed/4skipped/0failed in212.42s. Reproduced old failures and corrected
+window15fresh/0repeats are retained in local receipts. No game CPU target or
+image-quality pass is inferred from those tests.
+
+Prepared Documents/NA-Anno-layer2-package-2ffc23d, DLL SHA256
+FDFC79380BECE2DDA3E7214952ADCD656E68B28A2F31F1BC40D306DFEEBD3B17.
+Existing Anno layer2 update/results/rollback CMDs now select it. Previous CMDs
+are preserved in Documents/NA-anno-layer2-launchers-before-2ffc23d-20261102-185542.
+Isolated WindowsPowerShell old->candidate->old->original install/rollback tests
+pass both with and without a pre-existing native DLSS library. Original files
+and final inventory are verified; payload hashes verified before publication.
+Actual Anno remains8a0ee44/7D7C0B39..., unchanged by Astra. Cort runs the game.
+
+The candidate includes the narrow patcher corrections, not write-watch. Opus
+has the source and ownership split in COMMS so it can be integrated without
+duplicating his memory-tracking work. No additional review gate is requested.
