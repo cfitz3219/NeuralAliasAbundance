@@ -107,7 +107,11 @@ resize identity, failure/retry/expiry, scratch message storage, negative monitor
 origin, polling vs messages, clipping, absolute vs relative input and concurrent
 snapshots. No mouse movement, foreground changes or game process is involved.
 
-Initial result: **12 cases pass**, Release `/W4 /WX`. This proves helper behavior,
+Initial result: **12 cases pass**; follow-up with a separate engine/overlay DLL
+and actual posted-message WndProc dispatch: **14 cases pass**, Release `/W4 /WX`.
+The posted-message case re-enters the helper from the simulated game callback,
+queries the new size, commits it, and verifies the physical window never moved.
+This proves helper behavior,
 not that Anno or SE5 has accepted the smaller output. The first actual game run
 belongs to Cort, after Opus integrates C1-C4 and these helpers.
 

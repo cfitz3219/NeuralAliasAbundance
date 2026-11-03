@@ -10,9 +10,9 @@ extern "C" __declspec(dllimport) BOOL WINAPI FixtureClientRect(HWND,RECT*);
 namespace {
 struct Window {
     HWND hwnd = nullptr;
-    Window() {
-        hwnd=CreateWindowExW(0,L"STATIC",L"NA hidden sizing fixture",WS_OVERLAPPEDWINDOW,
-            -1700,120,1000,700,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+    explicit Window(const wchar_t* cls=L"STATIC", void* context=nullptr) {
+        hwnd=CreateWindowExW(0,cls,L"NA hidden sizing fixture",WS_OVERLAPPEDWINDOW,
+            -1700,120,1000,700,nullptr,nullptr,GetModuleHandleW(nullptr),context);
         CHECK(hwnd);
     }
     ~Window() { Detach(hwnd); DestroyWindow(hwnd); }
@@ -24,6 +24,27 @@ void deliver(HWND hwnd,uint64_t token) {
     UINT msg=ResizeMessage(); WPARAM wp=static_cast<WPARAM>(token); LPARAM lp=0; WINDOWPOS scratch{};
     CHECK(PrepareSizeMessage(hwnd,msg,wp,lp,scratch)==MessageAction::Changed);
     CHECK(msg==WM_SIZE && LOWORD(lp)==1720 && HIWORD(lp)==720);
+}
+struct PostedGame { uint64_t token=0; Size queried{}; bool committed=false; unsigned calls=0; };
+LRESULT CALLBACK posted_proc(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam) {
+    if(message==WM_NCCREATE) SetWindowLongPtrW(hwnd,GWLP_USERDATA,
+        reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(lparam)->lpCreateParams));
+    auto* game=reinterpret_cast<PostedGame*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));
+    UINT msg=message; WPARAM wp=wparam; LPARAM lp=lparam; WINDOWPOS scratch{};
+    const auto action=PrepareSizeMessage(hwnd,msg,wp,lp,scratch);
+    if(action==MessageAction::Consume) return 0;
+    if(game && game->token && msg==WM_SIZE && wp!=SIZE_MINIMIZED) {
+        GameScopeForTest scope; RECT r{};
+        if(GetClientRect(hwnd,&r)) {
+            game->queried={static_cast<UINT>(r.right),static_cast<UINT>(r.bottom)}; ++game->calls;
+            // Real game callback re-enters the helper. This would deadlock if
+            // request dispatch held its state mutex while calling the game.
+            const auto current=GetSizeState();
+            game->committed=current.request==game->token && CompleteResize(game->token,true,game->queried);
+        }
+        return 0;
+    }
+    return DefWindowProcW(hwnd,msg,wp,lp);
 }
 }
 int main() {
@@ -89,6 +110,21 @@ int main() {
             CHECK(committed.render.w==1720 && committed.generation==token);
             CHECK(!CompleteResize(token,true,{1720,720}));
             CHECK(RequestRenderSize({1720,720})==0);
+        }},
+        {"posted resize reaches game WndProc without moving HWND or deadlocking re-entry", [] {
+            WNDCLASSW cls{}; cls.lpfnWndProc=posted_proc; cls.hInstance=GetModuleHandleW(nullptr);
+            cls.lpszClassName=L"NA.NativeSizing.PostedFixture";
+            CHECK(RegisterClassW(&cls) || GetLastError()==ERROR_CLASS_ALREADY_EXISTS);
+            PostedGame game; Window w(cls.lpszClassName,&game);
+            CHECK(Attach(w.hwnd,{3440,1440},{2293,960}));
+            RECT before{}; { NativeScope n; CHECK(GetWindowRect(w.hwnd,&before)); }
+            game.token=RequestRenderSize({1720,720}); CHECK(game.token);
+            MSG message{}; CHECK(PeekMessageW(&message,w.hwnd,ResizeMessage(),ResizeMessage(),PM_REMOVE));
+            DispatchMessageW(&message);
+            CHECK(game.calls==1 && game.committed && game.queried.w==1720 && game.queried.h==720);
+            CHECK(GetSizeState().request==0 && GetSizeState().render.w==1720);
+            RECT after{}; { NativeScope n; CHECK(GetWindowRect(w.hwnd,&after)); }
+            CHECK(std::memcmp(&before,&after,sizeof before)==0);
         }},
         {"failed resize restores old advertised geometry and allows retry", [] {
             Window w; CHECK(Attach(w.hwnd,{3440,1440},{2293,960}));
