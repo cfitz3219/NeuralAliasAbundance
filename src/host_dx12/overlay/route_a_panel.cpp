@@ -973,7 +973,7 @@ void DrawLiveDlaa()
         if (ImGui::IsItemDeactivatedAfterEdit()) na::settings::Save();
         EndRow();
     }
-    if (na::j2::RenderSmall()) {
+    if (na::j2::RenderSmall() && na::j2::HudMaskEnabled()) {
         na::settings::Settings& ss = na::settings::Get();
         int hud = static_cast<int>(ss.j2_hud_nis.load());
         BeginRow("HUD sharpness (NIS)", "Keeps the game's HUD and text out of DLSS and upscales them with NVIDIA Image Scaling at this sharpness instead. Off sends the HUD through DLSS with the 3D picture. The HUD is found within a few frames (from our camera jitter, and from camera movement when the game's own anti-aliasing hides the jitter).", S(220));

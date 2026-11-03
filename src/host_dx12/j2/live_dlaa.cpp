@@ -2483,6 +2483,7 @@ struct SmallRing {
 } g_small;
 na::j2::NisScaler g_hud_nis;
 std::atomic<bool> g_hud_view{false}; // tint HUD pixels (menu: Show HUD mask)
+std::atomic<bool> g_hud_mask_on{false}; // [present] hud_mask=1: the pixel-guessing HUD mask (off: it misread scenery in Anno)
 constexpr char kHudHlsl[] = R"(
 Texture2D<float4> t0 : register(t0);
 Texture2D<float4> t1 : register(t1);
@@ -2806,6 +2807,8 @@ void small_note(const char* t) { std::snprintf(g.stats.small_note, sizeof g.stat
 void SetRenderSmall(bool on) { g_render_small.store(on); }
 bool RenderSmall() { return g_render_small.load(); }
 void SetHudMaskView(bool on) { g_hud_view.store(on); }
+void SetHudMaskEnabled(bool on) { g_hud_mask_on.store(on); }
+bool HudMaskEnabled() { return g_hud_mask_on.load(); }
 // Native-HUD investigation (render-small): every render-target bind of a frame (target, depth,
 // first scissor) and the presented proxy's id, so a run's log shows where the HUD is drawn.
 namespace {
@@ -2885,7 +2888,8 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
     bool dlss = false;
     // HUD separation: on when [j2] hud_nis > 0, for SDR pictures, once the last frame is held.
     const uint32_t hud_nis = na::settings::Get().j2_hud_nis.load(std::memory_order_relaxed);
-    const bool hud_want = hud_nis > 0 && !hdr && can_dlss && hud_init() && hud_targets(frame, rw, rh, ow, oh);
+    const bool hud_want = g_hud_mask_on.load(std::memory_order_relaxed) && hud_nis > 0 && !hdr && can_dlss && hud_init() &&
+                          hud_targets(frame, rw, rh, ow, oh);
     bool hud_mask = false; // mask holds this frame's HUD (NON_PIXEL_SHADER_RESOURCE until the composite)
     const DXGI_FORMAT ff = typed(frame->GetDesc().Format);
     if (can_dlss) {
@@ -3036,7 +3040,7 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         add(b, frame, SRC, NPSR);
         add(b, g_small.prev.Get(), DST, NPSR);
         g_small.prev_valid = true;
-    } else if (!can_dlss || hud_nis == 0) {
+    } else if (!can_dlss || hud_nis == 0 || !g_hud_mask_on.load(std::memory_order_relaxed)) {
         g_small.prev_valid = false; // a gap: the next comparison would be against an old frame
     }
     b.push_back(uav_barrier(out));

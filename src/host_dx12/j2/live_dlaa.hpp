@@ -72,6 +72,10 @@ void SetRenderSmall(bool on);
 bool RenderSmall();
 // Render-small HUD separation: tint the pixels taken as HUD (diagnostic, not saved).
 void SetHudMaskView(bool on);
+// The pixel-guessing HUD mask + NIS ([present] hud_mask=1; off by default: in Anno it took
+// scenery for HUD and showed the raw jittered frame there).
+void SetHudMaskEnabled(bool on);
+bool HudMaskEnabled();
 bool HudMaskView();
 // Native-HUD investigation: logs every render-target bind of one frame in 120 (render-small).
 void InstallHudProbe();
