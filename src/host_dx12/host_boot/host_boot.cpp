@@ -9,6 +9,7 @@
 #include "host_dx12/host_boot/host_boot.hpp"
 #include "host_dx12/host_boot/session.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/native_present/size_spoof.hpp"
 #include "host_dx12/j2/projection_window.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
 #include "host_dx12/scale/live_driver.hpp"
@@ -245,12 +246,13 @@ DWORD WINAPI InitThread(LPVOID)
                               GetPrivateProfileIntW(L"present", L"render_small", 0, g_ini) == 1;
     na::j2::SetRenderSmall(render_small);
     if (render_small) {
-        const int mode = static_cast<int>(na::settings::Get().j2_scale_mode.load());
-        const float f = mode > 0 && mode <= 4 ? static_cast<float>(na::scale::FractionForMode(mode)) : 1.f;
-        na::present::SetRenderScale(f, &na::j2::PresentUpscale, nullptr);
-        char line[96];
-        std::snprintf(line, sizeof line, "render-small: enabled (mode %d, scale %.3f)", mode, f);
-        boot_log(line);
+        boot_log(na::native_present::InstallSizeHooks() ? "render-small: size hooks installed" : "render-small: size hooks FAILED");
+        const int small_mode = static_cast<int>(na::settings::Get().j2_scale_mode.load());
+        const float small_f = small_mode > 0 && small_mode <= 4 ? static_cast<float>(na::scale::FractionForMode(small_mode)) : 1.f;
+        na::present::SetRenderScale(small_f, &na::j2::PresentUpscale, nullptr);
+        char small_line[96];
+        std::snprintf(small_line, sizeof small_line, "render-small: enabled (mode %d, scale %.3f)", small_mode, small_f);
+        boot_log(small_line);
     }
     const bool projection_window = !render_small && na::j2::Configured() && GetPrivateProfileIntW(L"j2", L"window", 0, g_ini) == 1;
     na::j2::SetProjectionWindow(projection_window);

@@ -1,4 +1,9 @@
 #include "host_dx12/host_boot/process_log.hpp"
+#include "host_dx12/native_present/size_spoof.hpp"
+#include "host_dx12/native_present/input_map.hpp"
+#include <intrin.h>
+#include <algorithm>
+#include <cmath>
 #include "host_dx12/adapters/mode_control.hpp"
 #include "host_dx12/nr/native_fg.hpp"
 #include "host_dx12/sl_boundary/sl_boundary.hpp"
@@ -69,6 +74,8 @@ constexpr uint32_t kSwapPresentSlot = 8;
 constexpr uint32_t kSwapGetBufferSlot = 9;        // IDXGISwapChain::GetBuffer (A59 presenter)
 constexpr uint32_t kSwapResizeBuffersSlot = 13;
 constexpr uint32_t kSwap1Present1Slot = 22;
+constexpr uint32_t kSwapGetDescSlot = 12;   // IDXGISwapChain::GetDesc (render-small size spoof)
+constexpr uint32_t kSwap1GetDesc1Slot = 18; // IDXGISwapChain1::GetDesc1
 constexpr uint32_t kSwap2SetMaxLatencySlot = 31;  // IDXGISwapChain2::SetMaximumFrameLatency (A62)
 constexpr uint32_t kSwap2GetMaxLatencySlot = 32;  // IDXGISwapChain2::GetMaximumFrameLatency (A62)
 constexpr uint32_t kSwap2GetLatencyObjectSlot = 33;
@@ -199,17 +206,71 @@ CreateForHwndFn g_orig_create_for_hwnd = nullptr;
 CreateForCoreWindowFn g_orig_create_for_core_window = nullptr;
 CreateForCompositionFn g_orig_create_for_composition = nullptr;
 
+// Render-small (S1 integration, docs/NATIVE-PRESENT-SIZING.md): the REAL chain is always created at
+// the window's physical size. A game that already learned the advertised render size and passes it
+// back gets the physical size instead (else the presenter would scale an already small chain again).
+void small_native_dims(HWND w, UINT& width, UINT& height)
+{
+    if (!na::j2::RenderSmall() || !w) return;
+    const auto st = na::native_present::GetSizeState();
+    if (st.enabled && st.hwnd == w && width == st.render.w && height == st.render.h) { width = st.output.w; height = st.output.h; }
+}
+// After creation: attach the size spoof to this window with the presenter's rounding.
+void small_attach(HWND w, IDXGISwapChain* sc)
+{
+    if (!na::j2::RenderSmall() || !w || !sc) return;
+    DXGI_SWAP_CHAIN_DESC real{};
+    { na::native_present::NativeScope native; if (FAILED(sc->GetDesc(&real))) return; }
+    const UINT W = real.BufferDesc.Width, H = real.BufferDesc.Height;
+    const double f = na::present::RenderScale();
+    na::native_present::Size render{W, H};
+    if (f < 1.0) {
+        render.w = (std::max)(1u, static_cast<UINT>(std::lround(W * f)));
+        render.h = (std::max)(1u, static_cast<UINT>(std::lround(H * f)));
+        if (render.w >= W || render.h >= H) render = {W, H};
+    }
+    na::native_present::Attach(w, {W, H}, render);
+}
 HRESULT STDMETHODCALLTYPE DetourCreateSwapChain(IDXGIFactory* f, IUnknown* dev, DXGI_SWAP_CHAIN_DESC* d, IDXGISwapChain** out)
 {
-    const HRESULT hr = g_orig_create_swapchain(f, dev, d, out);
-    if (SUCCEEDED(hr) && out && *out) note_swapchain_queue(dev, *out);
+    DXGI_SWAP_CHAIN_DESC copy{};
+    if (d && na::j2::RenderSmall()) { copy = *d; small_native_dims(copy.OutputWindow, copy.BufferDesc.Width, copy.BufferDesc.Height); }
+    HRESULT hr;
+    { na::native_present::NativeScope native; hr = g_orig_create_swapchain(f, dev, d && na::j2::RenderSmall() ? &copy : d, out); }
+    if (SUCCEEDED(hr) && out && *out) { note_swapchain_queue(dev, *out); if (d) small_attach(d->OutputWindow, *out); }
     return hr;
 }
 HRESULT STDMETHODCALLTYPE DetourCreateForHwnd(IDXGIFactory2* f, IUnknown* dev, HWND w, const DXGI_SWAP_CHAIN_DESC1* d,
                                               const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs, IDXGIOutput* o, IDXGISwapChain1** out)
 {
-    const HRESULT hr = g_orig_create_for_hwnd(f, dev, w, d, fs, o, out);
-    if (SUCCEEDED(hr) && out && *out) note_swapchain_queue(dev, *out);
+    DXGI_SWAP_CHAIN_DESC1 copy{};
+    if (d && na::j2::RenderSmall()) { copy = *d; small_native_dims(w, copy.Width, copy.Height); }
+    HRESULT hr;
+    { na::native_present::NativeScope native; hr = g_orig_create_for_hwnd(f, dev, w, d && na::j2::RenderSmall() ? &copy : d, fs, o, out); }
+    if (SUCCEEDED(hr) && out && *out) { note_swapchain_queue(dev, *out); small_attach(w, *out); }
+    return hr;
+}
+// Render-small: the game's own descriptor queries see the render size; ours and other modules' stay real.
+using GetDescFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, DXGI_SWAP_CHAIN_DESC*);
+using GetDesc1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, DXGI_SWAP_CHAIN_DESC1*);
+GetDescFn g_orig_get_desc = nullptr;
+GetDesc1Fn g_orig_get_desc1 = nullptr;
+HRESULT STDMETHODCALLTYPE DetourGetDesc(IDXGISwapChain* sc, DXGI_SWAP_CHAIN_DESC* d)
+{
+    const void* caller = _ReturnAddress();
+    const HRESULT hr = g_orig_get_desc(sc, d);
+    if (SUCCEEDED(hr) && d && na::native_present::GameCaller(caller)) na::native_present::RewriteDesc(d);
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE DetourGetDesc1(IDXGISwapChain1* sc, DXGI_SWAP_CHAIN_DESC1* d)
+{
+    const void* caller = _ReturnAddress();
+    const HRESULT hr = g_orig_get_desc1(sc, d);
+    if (SUCCEEDED(hr) && d && na::native_present::GameCaller(caller)) {
+        HWND w = nullptr;
+        { na::native_present::NativeScope native; if (FAILED(sc->GetHwnd(&w))) w = nullptr; }
+        if (w) na::native_present::RewriteDesc1(w, d);
+    }
     return hr;
 }
 HRESULT STDMETHODCALLTYPE DetourCreateForCoreWindow(IDXGIFactory2* f, IUnknown* dev, IUnknown* w, const DXGI_SWAP_CHAIN_DESC1* d,
@@ -318,20 +379,31 @@ void neutralise_raw(RAWINPUT* ri)
         ri->data.keyboard.Flags |= RI_KEY_BREAK; // every key reads as released
     }
 }
+// Render-small (S2): absolute raw mouse positions follow the game's virtual window; relative deltas never change.
+void small_map_raw(RAWINPUT* ri, const void* caller)
+{
+    if (ri && ri->header.dwType == RIM_TYPEMOUSE) na::native_present::MapRawMouseRead(ri->data.mouse, caller);
+}
 UINT WINAPI DetourGetRawInputData(HRAWINPUT h, UINT cmd, LPVOID data, PUINT size, UINT header)
 {
+    const void* caller = _ReturnAddress();
     UINT r = g_orig_get_raw_input_data(h, cmd, data, size, header);
-    if (r != static_cast<UINT>(-1) && data && cmd == RID_INPUT && r >= sizeof(RAWINPUTHEADER) && lock_input_for_this_thread())
-        neutralise_raw(static_cast<RAWINPUT*>(data));
+    if (r != static_cast<UINT>(-1) && data && cmd == RID_INPUT && r >= sizeof(RAWINPUTHEADER)) {
+        if (lock_input_for_this_thread()) neutralise_raw(static_cast<RAWINPUT*>(data));
+        else small_map_raw(static_cast<RAWINPUT*>(data), caller);
+    }
     return r;
 }
 UINT WINAPI DetourGetRawInputBuffer(PRAWINPUT data, PUINT size, UINT header)
 {
+    const void* caller = _ReturnAddress();
     UINT r = g_orig_get_raw_input_buffer(data, size, header);
-    if (r != static_cast<UINT>(-1) && r != 0 && data && lock_input_for_this_thread()) {
+    const bool locked = lock_input_for_this_thread();
+    if (r != static_cast<UINT>(-1) && r != 0 && data && (locked || na::j2::RenderSmall())) {
         RAWINPUT* p = data;
         for (UINT i = 0; i < r; ++i) {
-            neutralise_raw(p);
+            if (locked) neutralise_raw(p);
+            else small_map_raw(p, caller);
             // NEXTRAWINPUTBLOCK without the QWORD type the lean headers omit: 8-byte aligned on x64.
             uintptr_t next = reinterpret_cast<uintptr_t>(reinterpret_cast<BYTE*>(p) + p->header.dwSize);
             p = reinterpret_cast<RAWINPUT*>((next + sizeof(uint64_t) - 1) & ~(sizeof(uint64_t) - 1));
@@ -341,12 +413,16 @@ UINT WINAPI DetourGetRawInputBuffer(PRAWINPUT data, PUINT size, UINT header)
 }
 BOOL WINAPI DetourGetCursorPos(LPPOINT p)
 {
+    const void* caller = _ReturnAddress();
     if (p && lock_input_for_this_thread()) {
         p->x = g_frozen_x.load(std::memory_order_relaxed);
         p->y = g_frozen_y.load(std::memory_order_relaxed);
+        na::native_present::MapCursorRead(p, caller); // the frozen point is real; the game reads virtual
         return TRUE;
     }
-    return g_orig_get_cursor_pos(p);
+    const BOOL ok = g_orig_get_cursor_pos(p);
+    if (ok && p) na::native_present::MapCursorRead(p, caller);
+    return ok;
 }
 HCURSOR WINAPI DetourSetCursor(HCURSOR cursor)
 {
@@ -360,7 +436,28 @@ HCURSOR WINAPI DetourSetCursor(HCURSOR cursor)
 BOOL WINAPI DetourSetCursorPos(int x, int y)
 {
     if (lock_input_for_this_thread()) return TRUE; // the game may not re-centre the menu cursor
+    na::native_present::MapCursorWrite(x, y, _ReturnAddress());
     return g_orig_set_cursor_pos(x, y);
+}
+// Render-small (S2): the game's cursor clip is in its virtual screen space. Not counted in
+// input_hooks (installed only in this mode, on top of the eight).
+using PfnClipCursor = BOOL(WINAPI*)(const RECT*);
+using PfnGetClipCursor = BOOL(WINAPI*)(LPRECT);
+PfnClipCursor g_orig_clip_cursor = nullptr;
+PfnGetClipCursor g_orig_get_clip_cursor = nullptr;
+void* g_clip_hook_targets[2] = {};
+BOOL WINAPI DetourClipCursor(const RECT* r)
+{
+    RECT physical{};
+    if (r && na::native_present::MapClipRect(r, physical, _ReturnAddress())) return g_orig_clip_cursor(&physical);
+    return g_orig_clip_cursor(r);
+}
+BOOL WINAPI DetourGetClipCursor(LPRECT r)
+{
+    const void* caller = _ReturnAddress();
+    const BOOL ok = g_orig_get_clip_cursor(r);
+    if (ok && r) na::native_present::MapClipRead(r, caller);
+    return ok;
 }
 SHORT WINAPI DetourGetAsyncKeyState(int vk)
 {
@@ -477,9 +574,25 @@ void install_input_hooks()
         }
     }
     g_input_hooks.store(n, std::memory_order_release);
+    if (na::j2::RenderSmall()) {
+        const struct { const char* name; void* detour; void** original; } clip[2] = {
+            {"ClipCursor", reinterpret_cast<void*>(&DetourClipCursor), reinterpret_cast<void**>(&g_orig_clip_cursor)},
+            {"GetClipCursor", reinterpret_cast<void*>(&DetourGetClipCursor), reinterpret_cast<void**>(&g_orig_get_clip_cursor)},
+        };
+        for (int i = 0; i < 2; ++i) {
+            if (g_clip_hook_targets[i]) continue;
+            void* target = reinterpret_cast<void*>(GetProcAddress(u, clip[i].name));
+            if (target && install_input_function(target, clip[i].detour, clip[i].original)) g_clip_hook_targets[i] = target;
+            else if (!*clip[i].original) *clip[i].original = target;
+        }
+    }
 }
 void remove_input_hooks()
 {
+    for (void*& t : g_clip_hook_targets) {
+        if (t) na::hooking::Unhook(t);
+        t = nullptr;
+    }
     for (void*& t : g_di_targets) {
         if (t) na::hooking::Unhook(t);
         t = nullptr;
@@ -735,6 +848,13 @@ void write_status_line()
                 j2.frames ? double(j2.jitter_cpu_us) / double(j2.frames) : 0.0, (unsigned long long)j2.jitter_cpu_max_us,
                 j2.window_unpacked_note, j2.window_note);
             if (wn > 0) WriteFile(f, wl, DWORD((std::min)(wn, int(sizeof wl - 1))), &written, nullptr);
+        }
+        if (na::j2::RenderSmall()) { // render-small S1/S2 counters (Astra's formatters)
+            char size_text[512] = {}, input_text[512] = {}, size_line[1100];
+            na::native_present::FormatSizeStatus(size_text, sizeof size_text);
+            na::native_present::FormatInputStatus(input_text, sizeof input_text);
+            const int size_n = snprintf(size_line, sizeof size_line, "%s\r\n%s\r\n", size_text, input_text);
+            if (size_n > 0) WriteFile(f, size_line, DWORD((std::min)(size_n, int(sizeof size_line - 1))), &written, nullptr);
         }
         if (na::j2::RenderSmall()) { // P4-4 render-small: one line per status write
             const auto ps = na::present::GetStats();
@@ -1494,6 +1614,19 @@ void nudge_restore(HWND hwnd)
     } // else the timer fires again
 }
 
+// Every message the GAME's window procedure receives, after our own input handling.
+// Render-small: a posted live-size request becomes the game's virtual WM_SIZE, and mouse
+// coordinates are mapped once into the game's render-size client (docs/NATIVE-PRESENT-SIZING.md).
+LRESULT call_game_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (na::j2::RenderSmall()) {
+        WINDOWPOS scratch{}; // must outlive the game's call
+        if (na::native_present::PrepareSizeMessage(hwnd, msg, wp, lp, scratch) == na::native_present::MessageAction::Consume) return 0;
+        na::native_present::MapGameMouseMessage(hwnd, msg, lp);
+        return CallWindowProcW(g_state.orig_wndproc, hwnd, msg, wp, lp);
+    }
+    return CallWindowProcW(g_state.orig_wndproc, hwnd, msg, wp, lp);
+}
 LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     na::latency::pcl::Message(msg, wp);
@@ -1539,7 +1672,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     if (!g_open.load(std::memory_order_acquire) || !g_state.imgui_ready)
-        return CallWindowProcW(g_state.orig_wndproc, hwnd, msg, wp, lp);
+        return call_game_wndproc(hwnd, msg, wp, lp);
 
     switch (msg) {
     case WM_INPUT:
@@ -1584,7 +1717,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         sync_cursor();
         return TRUE;
     default:
-        return CallWindowProcW(g_state.orig_wndproc, hwnd, msg, wp, lp);
+        return call_game_wndproc(hwnd, msg, wp, lp);
     }
 }
 
@@ -2524,6 +2657,29 @@ void presenter_menu_cb(IDXGISwapChain* sc, ID3D12CommandQueue* queue, ID3D12Reso
     menu_step(sc, queue, *static_cast<const bool*>(user), frame);
 }
 
+// Render-small live mode change: the presenter's next proxies use the new scale, and the game is
+// asked (posted virtual WM_SIZE) to rebuild at that size; no restart, the real window never moves.
+// A request already pending is retried next frame. The game ignoring it expires after 5 s.
+float g_small_asked = -1.f; // the scale last asked of the game (presenter thread)
+void small_follow_mode()
+{
+    namespace np = na::native_present;
+    np::ExpireResize();
+    const int mode = static_cast<int>(na::settings::Get().j2_scale_mode.load());
+    const float f = mode > 0 && mode <= 4 ? static_cast<float>(na::scale::FractionForMode(mode)) : 1.f;
+    if (g_small_asked < 0.f) g_small_asked = na::present::RenderScale(); // the boot scale needs no request
+    if (f == g_small_asked) return;
+    na::present::SetRenderScale(f, &na::j2::PresentUpscale, nullptr);
+    const np::SizeState st = np::GetSizeState();
+    if (!st.enabled) { g_small_asked = f; return; }
+    np::Size r = st.output;
+    if (f < 1.f) {
+        r.w = (std::max)(1u, static_cast<UINT>(std::lround(st.output.w * static_cast<double>(f))));
+        r.h = (std::max)(1u, static_cast<UINT>(std::lround(st.output.h * static_cast<double>(f))));
+        if (r.w >= st.output.w || r.h >= st.output.h) r = st.output;
+    }
+    if ((r.w == st.render.w && r.h == st.render.h) || np::RequestRenderSize(r)) g_small_asked = f;
+}
 HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* pp)
 {
     std::lock_guard<std::mutex> lock(g_state.mutex);
@@ -2536,11 +2692,7 @@ HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_
     }
     na::present::PresentArgs a;
     na::j2::OnPresent(queue); // game call only; the presenter's generated frames bypass this
-    if (na::j2::RenderSmall()) { // render-small: follow the menu's mode (applies at the next resize)
-        const int mode = static_cast<int>(na::settings::Get().j2_scale_mode.load());
-        const float f = mode > 0 && mode <= 4 ? static_cast<float>(na::scale::FractionForMode(mode)) : 1.f;
-        if (f != na::present::RenderScale()) na::present::SetRenderScale(f, &na::j2::PresentUpscale, nullptr);
-    }
+    if (na::j2::RenderSmall()) small_follow_mode();
     if (na::scale::SliderRouteActive()) na::scale::TickLive(na::j2::GetStats().width); // P4-4: confirm a live render-scale change
     g_present_caller.store(GetCurrentThreadId());
     g_present_queue_identity.store(reinterpret_cast<uintptr_t>(queue));
@@ -3100,6 +3252,12 @@ bool StartCore(const char* route_tag, PanelFn controls)
                 // Swap-chain creation on the shared factory vtable (after our own dummy
                 // chain exists, so it is never recorded). Late attachments recover
                 // per-buffer queues from submitted writes instead.
+                if (na::j2::RenderSmall()) { // render-small size spoof on the game's descriptor queries
+                    prepare_start_hook(sc.Get(), kSwapGetDescSlot, reinterpret_cast<void*>(&DetourGetDesc),
+                                       reinterpret_cast<void**>(&g_orig_get_desc));
+                    prepare_start_hook(sc.Get(), kSwap1GetDesc1Slot, reinterpret_cast<void*>(&DetourGetDesc1),
+                                       reinterpret_cast<void**>(&g_orig_get_desc1));
+                }
                 prepare_start_hook(factory.Get(), kFactoryCreateSwapChainSlot,
                                             reinterpret_cast<void*>(&DetourCreateSwapChain),
                                             reinterpret_cast<void**>(&g_orig_create_swapchain));
@@ -3340,6 +3498,8 @@ void SetOpen(bool open) { g_open.store(open, std::memory_order_release); }
 
 bool RequestPictureRebuild(uint32_t render_w, uint32_t render_h)
 {
+    // Render-small: the game-visible window is virtual; its live resize is the posted WM_SIZE instead.
+    if (na::j2::RenderSmall()) return false;
     nudge_tick();
     // A67: refuse while a nudge is in flight (posted or window shrunk) or
     // while an earlier request has not been admitted yet; nothing about the

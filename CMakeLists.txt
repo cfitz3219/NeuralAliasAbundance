@@ -118,6 +118,8 @@ add_library(host_hooking STATIC
   src/host_dx12/hooking/vtable_hook.cpp
   src/host_dx12/hooking/variant_registry.cpp)
 target_link_libraries(host_hooking PUBLIC abundance_options d3d12 PRIVATE minhook)
+# P4-4 render-small S1/S2 (Astra): game-facing window size and input mapping.
+add_subdirectory(src/host_dx12/native_present)
 # P4-4 slider route: read-time render-scale substitution (Fable; installed by host_boot on request).
 add_library(host_scale STATIC src/host_dx12/scale/settings_read_hook.cpp src/host_dx12/scale/live_driver.cpp)
 target_link_libraries(host_scale PUBLIC abundance_options host_hooking)
@@ -224,7 +226,7 @@ endif()
 # NVIDIA Image Scaling (MIT, vendored): sharpen-only stage of J2's Sharpness slider.
 target_include_directories(host_dx12 SYSTEM PRIVATE third_party/nis)
 target_link_libraries(host_dx12
-  PUBLIC abundance_options host_hooking host_scale host_settings host_capture host_nvof host_ffx_flow core_gpu imgui nvapi_headers host_dlss host_upscalers host_observe_producers host_scene_scale
+  PUBLIC abundance_options host_hooking host_native_present host_scale host_settings host_capture host_nvof host_ffx_flow core_gpu imgui nvapi_headers host_dlss host_upscalers host_observe_producers host_scene_scale
          d3d12 dxgi d3dcompiler user32 gdi32 shell32 ole32 bcrypt dbghelp winmm)
 if(NA_HAVE_NGX_SDK)
   target_compile_definitions(host_dx12 PUBLIC NA_HAVE_NGX_SDK)

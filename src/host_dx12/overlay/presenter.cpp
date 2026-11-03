@@ -16,6 +16,7 @@
 
 #include "host_dx12/fg/frame_gen.hpp"
 #include "host_dx12/settings.hpp"
+#include "host_dx12/native_present/size_spoof.hpp"
 #include "host_dx12/latency/nvidia_latency.hpp"
 #include "host_dx12/adapters/tlou1/timing.hpp"
 
@@ -241,6 +242,13 @@ bool ensure_proxies_locked(Chain& c)
         c.proxies[i]->SetName(name);
     }
     c.virtual_index = 0;
+    if (g_upscale.load(std::memory_order_acquire)) { // render-small: what the game is told follows the proxies it got
+        namespace np = na::native_present;
+        const np::Size out{c.desc.BufferDesc.Width, c.desc.BufferDesc.Height}, act{c.pw, c.ph};
+        const np::SizeState st = np::GetSizeState();
+        if (st.enabled && st.hwnd == c.desc.OutputWindow && st.request && st.request_delivered) np::CompleteResize(st.request, true, act);
+        else np::CommitBuffers(c.desc.OutputWindow, out, act);
+    }
     c.display_hz = refresh_hz_for(c.desc.OutputWindow);
     g_display_hz.store(c.display_hz);
     c.proxy_count.store(n,std::memory_order_release);
@@ -795,6 +803,10 @@ bool NoteExternalOwner(IDXGISwapChain* sc) {
 void AfterResize(IDXGISwapChain* sc,HRESULT result) {
     Chain* c=nullptr;{std::lock_guard<std::mutex> lock(g_chains_m);c=find_chain(sc);}
     if(!c)return;std::lock_guard<std::mutex> lock(c->m);
+    if(FAILED(result) && g_upscale.load(std::memory_order_acquire)){ // render-small: a pending live size did not happen
+        const auto st=na::native_present::GetSizeState();
+        if(st.request && st.request_delivered)na::native_present::CompleteResize(st.request,false,{});
+    }
     if(FAILED(result) && c->proxies.empty() && !c->resize_proxies.empty()){
         std::lock_guard<std::mutex> buffers_lock(c->buffers_m);
         c->proxies=std::move(c->resize_proxies);c->virtual_index=c->resize_index;c->proxy_count.store(static_cast<UINT>(c->proxies.size()),std::memory_order_release);
