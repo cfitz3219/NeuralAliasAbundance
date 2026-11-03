@@ -377,5 +377,8 @@ int main()
     if (!test::CreateDevice(d)) return test::SkipNoDevice("j2_native_hud_test");
     if (classify(d)) return 1;
     if (end_to_end(d)) return 1;
+    // The native layers are observed objects held by statics: like the game host at exit,
+    // retirement must not run against the observer's already-destroyed tables.
+    na::observe::SetProcessExiting();
     return test::finish("j2_native_hud_test");
 }
