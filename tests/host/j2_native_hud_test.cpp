@@ -113,7 +113,7 @@ void helpers()
     CHECK(r[0] == 0 && r[1] == 0 && r[2] == 96 && r[3] == 48);
 }
 
-void classify(test::Device& d)
+int classify(test::Device& d)
 {
     ID3D12Device* dev = d.device.Get();
     constexpr uint32_t W = 16, H = 16;
@@ -156,6 +156,7 @@ void classify(test::Device& d)
             CHECK(outside == 0.f);
         }
     }
+    return 0;
 }
 
 constexpr char kDraw[] = R"(
@@ -201,7 +202,7 @@ const Hud kHud[3] = {{Blend::Over, {1.f, 0.2f, 0.1f, 0.6f}, {8, 4, 40, 20}},
                      {Blend::Add, {0.1f, 0.1f, 0.3f, 1.f}, {24, 12, 56, 28}},
                      {Blend::Opaque, {0.9f, 0.9f, 0.9f, 1.f}, {0, 26, 10, 32}}};
 
-void end_to_end(test::Device& d)
+int end_to_end(test::Device& d)
 {
     ID3D12Device* dev = d.device.Get();
     nh::Install(); // before the observer sees any recording (raster snapshots latch at Reset)
@@ -361,6 +362,7 @@ void end_to_end(test::Device& d)
                 at(have, OW, 45, 22, 0), at(have, OW, 45, 22, 1), at(have, OW, 45, 22, 2));
     CHECK(worst <= 4);
     na_observe_stop();
+    return 0;
 }
 } // namespace
 
@@ -373,7 +375,7 @@ int main()
     CHECK(compiled);
     test::Device d;
     if (!test::CreateDevice(d)) return test::SkipNoDevice("j2_native_hud_test");
-    classify(d);
-    end_to_end(d);
+    if (classify(d)) return 1;
+    if (end_to_end(d)) return 1;
     return test::finish("j2_native_hud_test");
 }
