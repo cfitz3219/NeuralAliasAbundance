@@ -242,8 +242,16 @@ DWORD WINAPI InitThread(LPVOID)
     // P4-4 render-small ([present] render_small=1, plan COMMS 4e30a94): the game renders its whole
     // frame at render size into the presenter's proxies; J2 upscales it at Present. Needs the
     // presenter and J2; the projection window and Layer2 stay off with it.
-    const bool render_small = na::j2::Configured() && na::present::Enabled() &&
-                              GetPrivateProfileIntW(L"present", L"render_small", 0, g_ini) == 1;
+    const bool small_asked = GetPrivateProfileIntW(L"present", L"render_small", 0, g_ini) == 1;
+    // Render-small needs the presenter, which Route A normally switches on. A game with
+    // [route_a] enabled=0 (Anno) still gets it here; [present] proxy=0 keeps it off.
+    if (small_asked && !route_a && na::j2::Configured() &&
+        GetPrivateProfileIntW(L"present", L"proxy", 1, g_ini) == 1)
+        na::present::SetEnabled(true);
+    const bool render_small = small_asked && na::j2::Configured() && na::present::Enabled();
+    if (small_asked && !render_small)
+        boot_log(!na::j2::Configured() ? "render-small: requested but OFF ([j2] enabled=1 and [observe] producers=1 needed)"
+                                       : "render-small: requested but OFF ([present] proxy=0)");
     na::j2::SetRenderSmall(render_small);
     if (render_small) {
         boot_log(na::native_present::InstallSizeHooks() ? "render-small: size hooks installed" : "render-small: size hooks FAILED");
