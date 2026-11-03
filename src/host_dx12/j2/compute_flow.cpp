@@ -135,7 +135,8 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
     const int previous=c->last;
     bool pair=!f.reset && previous>=0 && c->images[previous]->frame==f.previous && f.previous && c->images[previous]->generation==f.generation && c->images[previous]->producer.Ready(queue);
     Ticket t;t.context=c;t.image=static_cast<unsigned>(image);t.previous=previous<0?0u:static_cast<unsigned>(previous);t.slot=work;t.frame=f;t.pair=pair;
-    const Gates gates=GatesFor(g_loosen.load(std::memory_order_relaxed));
+    stats.loosen=g_loosen.load(std::memory_order_relaxed);
+    const Gates gates=GatesFor(stats.loosen);
     Constants cb{};cb.ratio=gates.image_ratio;cb.absolute=gates.image_abs;cb.texture=gates.texture_min;
     cb.agree_px=gates.agree_px;cb.agree_cos=gates.agree_cos;cb.agree_min=gates.agree_min;
     cb.w=cb.ew=w;cb.h=cb.eh=h;cb.mode=f.hdr?1u:0u;cb.block=8;cb.gw=(w+7)/8;cb.gh=(h+7)/8;
