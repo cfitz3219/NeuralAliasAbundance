@@ -970,10 +970,6 @@ void DrawLiveDlaa()
         }
         EndRow();
     }
-    bool jit = na::j2::Jitter();
-    BeginRow("Camera jitter", "Shifts the camera by a fraction of a pixel each frame so DLAA can sharpen as well as smooth. Switch off if the picture shimmers or flickers.", SwitchWidth());
-    if (Switch("j2jit", &jit)) na::j2::SetJitter(jit);
-    EndRow();
     {
         static const char* kViews[] = {"Off (normal picture)", "Motion vectors", "Fine motion (sub-pixel)", "Depth"};
         int dv = na::j2::DebugView();
@@ -982,6 +978,91 @@ void DrawLiveDlaa()
         if (ImGui::Combo("##j2dbg", &dv, kViews, 4)) na::j2::SetDebugView(dv);
         EndRow();
     }
+    {
+        // Where DLAA is placed in this game's frame, chosen automatically (or forced in the ini).
+        const auto& rt = st.route;
+        static const char* kWhere[] = {"not placed yet", "between the game's command lists", "inside the game's scene list", "handled by the game's own upscaler call"};
+        char pl[360];
+        std::snprintf(pl, sizeof pl, "Placement: %s%s%s (%s). %s%s%s", kWhere[rt.route < 4 ? rt.route : 0],
+                      rt.mode ? ", forced in settings" : "", rt.state ? "" : ", still learning",
+                      rt.mode ? "override" : "automatic", rt.reason, rt.missing[0] ? " Missing: " : "", rt.missing);
+        StatusLine(0, pl);
+    }
+    {
+        // Evidence capture: N consecutive DLAA frames (inputs, DLAA output, presented
+        // picture) for analysis. Also on the capture key (F8 by default) and the ini.
+        const auto cs = na::capture::j2::GetStats();
+        const uint32_t n = na::settings::Get().j2_capture_frames.load();
+        char lbl[64];
+        std::snprintf(lbl, sizeof lbl, "Capture %u frames", n);
+        BeginRow("Capture DLAA frames", "Saves what DLAA was given, what it produced and the picture you saw, for the next few frames, to LocalAppData\\NeuralAlias\\captures. Large files; for diagnosis only.", ButtonWidth(lbl));
+        ImGui::BeginDisabled(!on || na::capture::j2::Armed());
+        if (Button(lbl)) na::capture::j2::RequestTimestamped(n);
+        ImGui::EndDisabled();
+        EndRow();
+        if (cs.requested) {
+            char cl[200];
+            std::snprintf(cl, sizeof cl, "Capture: %u of %u recorded, %u saved, %u skipped (busy), %u without the presented picture, %u errors.",
+                          cs.recorded, cs.requested, cs.written, cs.dropped_busy + cs.discarded + cs.retired, cs.without_present, cs.errors);
+            StatusLine(0, cl);
+        }
+        // Every presented frame for a short burst, DLAA or not, with what J2 did on each: the
+        // only way to see WHICH presents flash (Cort, SE5 2026-11-02). Starts 3 s after the click.
+        const na::capture::Stats pc = na::capture::GetStats();
+        constexpr uint32_t kPresentFrames = 40;
+        BeginRow("Capture every presented frame", "Saves the picture you saw for the next 40 frames in a row, whether DLAA ran on them or not, with a note of what DLAA did on each. For finding flashing. About 1.6 GB; to LocalAppData\\NeuralAlias\\captures.", ButtonWidth("Capture 40 presents"));
+        ImGui::BeginDisabled(pc.frames_requested != 0 && pc.frames_written < pc.frames_requested);
+        if (Button("Capture 40 presents")) {
+            wchar_t* local = nullptr;
+            if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local)) && local) {
+                wchar_t dir[MAX_PATH];
+                swprintf_s(dir, L"%s\\NeuralAlias\\captures", local);
+                CreateDirectoryW(dir, nullptr);
+                SYSTEMTIME t;
+                GetLocalTime(&t);
+                swprintf_s(dir, L"%s\\NeuralAlias\\captures\\presents-%04u%02u%02u-%02u%02u%02u", local, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+                CoTaskMemFree(local);
+                na::capture::RequestPresents(kPresentFrames, dir, 3000);
+                na::overlay::SetOpen(false);
+            }
+        }
+        ImGui::EndDisabled();
+        EndRow();
+        if (pc.frames_requested) {
+            char pl[160];
+            const uint32_t wait_ms = na::capture::DelayRemainingMs();
+            if (wait_ms) std::snprintf(pl, sizeof pl, "Capturing in %u s: close the menu and play.", (wait_ms + 999) / 1000);
+            else std::snprintf(pl, sizeof pl, "Presented frames: %u of %u saved, %u errors.", pc.frames_written, pc.frames_requested, pc.errors);
+            StatusLine(0, pl);
+        }
+    }
+    char buf[320];
+    if (!on) {
+        StatusLine(0, "Off: you are seeing the game's own picture.");
+    } else if (st.active) {
+        std::snprintf(buf, sizeof buf, "Running: %ux%u, %llu frames improved so far.", st.width, st.height,
+                      static_cast<unsigned long long>(st.frames));
+        StatusLine(1, buf);
+    } else {
+        std::snprintf(buf, sizeof buf, "Not running yet: %s (%llu frames improved so far)", st.reason[0] ? st.reason : "starting.",
+                      static_cast<unsigned long long>(st.frames));
+        StatusLine(2, buf);
+    }
+    EndGroupBox();
+}
+
+
+// Cort 2026-11-03: the DLAA enhancements (camera jitter, moving-object motion, texture detail)
+// live on the Enhancements page, the same for every game.
+void DrawLiveDlaaEnhancements()
+{
+    using namespace na::ui;
+    if (!na::j2::Configured()) return;
+    BeginGroupBox("DLAA enhancements");
+    bool jit = na::j2::Jitter();
+    BeginRow("Camera jitter", "Shifts the camera by a fraction of a pixel each frame so DLAA can sharpen as well as smooth. Switch off if the picture shimmers or flickers.", SwitchWidth());
+    if (Switch("j2jit", &jit)) na::j2::SetJitter(jit);
+    EndRow();
     {
         // P4-0b: moving-object motion from NVIDIA hardware optical flow (test; off by default).
         bool fl = na::j2::flow::Enabled();
@@ -1057,76 +1138,6 @@ void DrawLiveDlaa()
         if (!live && static_cast<int>(ml.game_bias * -100.0f + 0.5f) != -cur)
             StatusLine(2, "Live switching is not available in this session (no prepared pipelines): restart the game to see this change.");
     }
-    {
-        // Where DLAA is placed in this game's frame, chosen automatically (or forced in the ini).
-        const auto& rt = st.route;
-        static const char* kWhere[] = {"not placed yet", "between the game's command lists", "inside the game's scene list", "handled by the game's own upscaler call"};
-        char pl[360];
-        std::snprintf(pl, sizeof pl, "Placement: %s%s%s (%s). %s%s%s", kWhere[rt.route < 4 ? rt.route : 0],
-                      rt.mode ? ", forced in settings" : "", rt.state ? "" : ", still learning",
-                      rt.mode ? "override" : "automatic", rt.reason, rt.missing[0] ? " Missing: " : "", rt.missing);
-        StatusLine(0, pl);
-    }
-    {
-        // Evidence capture: N consecutive DLAA frames (inputs, DLAA output, presented
-        // picture) for analysis. Also on the capture key (F8 by default) and the ini.
-        const auto cs = na::capture::j2::GetStats();
-        const uint32_t n = na::settings::Get().j2_capture_frames.load();
-        char lbl[64];
-        std::snprintf(lbl, sizeof lbl, "Capture %u frames", n);
-        BeginRow("Capture DLAA frames", "Saves what DLAA was given, what it produced and the picture you saw, for the next few frames, to LocalAppData\\NeuralAlias\\captures. Large files; for diagnosis only.", ButtonWidth(lbl));
-        ImGui::BeginDisabled(!on || na::capture::j2::Armed());
-        if (Button(lbl)) na::capture::j2::RequestTimestamped(n);
-        ImGui::EndDisabled();
-        EndRow();
-        if (cs.requested) {
-            char cl[200];
-            std::snprintf(cl, sizeof cl, "Capture: %u of %u recorded, %u saved, %u skipped (busy), %u without the presented picture, %u errors.",
-                          cs.recorded, cs.requested, cs.written, cs.dropped_busy + cs.discarded + cs.retired, cs.without_present, cs.errors);
-            StatusLine(0, cl);
-        }
-        // Every presented frame for a short burst, DLAA or not, with what J2 did on each: the
-        // only way to see WHICH presents flash (Cort, SE5 2026-11-02). Starts 3 s after the click.
-        const na::capture::Stats pc = na::capture::GetStats();
-        constexpr uint32_t kPresentFrames = 40;
-        BeginRow("Capture every presented frame", "Saves the picture you saw for the next 40 frames in a row, whether DLAA ran on them or not, with a note of what DLAA did on each. For finding flashing. About 1.6 GB; to LocalAppData\\NeuralAlias\\captures.", ButtonWidth("Capture 40 presents"));
-        ImGui::BeginDisabled(pc.frames_requested != 0 && pc.frames_written < pc.frames_requested);
-        if (Button("Capture 40 presents")) {
-            wchar_t* local = nullptr;
-            if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local)) && local) {
-                wchar_t dir[MAX_PATH];
-                swprintf_s(dir, L"%s\\NeuralAlias\\captures", local);
-                CreateDirectoryW(dir, nullptr);
-                SYSTEMTIME t;
-                GetLocalTime(&t);
-                swprintf_s(dir, L"%s\\NeuralAlias\\captures\\presents-%04u%02u%02u-%02u%02u%02u", local, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
-                CoTaskMemFree(local);
-                na::capture::RequestPresents(kPresentFrames, dir, 3000);
-                na::overlay::SetOpen(false);
-            }
-        }
-        ImGui::EndDisabled();
-        EndRow();
-        if (pc.frames_requested) {
-            char pl[160];
-            const uint32_t wait_ms = na::capture::DelayRemainingMs();
-            if (wait_ms) std::snprintf(pl, sizeof pl, "Capturing in %u s: close the menu and play.", (wait_ms + 999) / 1000);
-            else std::snprintf(pl, sizeof pl, "Presented frames: %u of %u saved, %u errors.", pc.frames_written, pc.frames_requested, pc.errors);
-            StatusLine(0, pl);
-        }
-    }
-    char buf[320];
-    if (!on) {
-        StatusLine(0, "Off: you are seeing the game's own picture.");
-    } else if (st.active) {
-        std::snprintf(buf, sizeof buf, "Running: %ux%u, %llu frames improved so far.", st.width, st.height,
-                      static_cast<unsigned long long>(st.frames));
-        StatusLine(1, buf);
-    } else {
-        std::snprintf(buf, sizeof buf, "Not running yet: %s (%llu frames improved so far)", st.reason[0] ? st.reason : "starting.",
-                      static_cast<unsigned long long>(st.frames));
-        StatusLine(2, buf);
-    }
     EndGroupBox();
 }
 
@@ -1135,6 +1146,7 @@ void DrawLiveDlaa()
 void RegisterLiveDlaaMenu()
 {
     na::menu::Register({"Live DLAA", na::menu::Availability::Available, nullptr, &DrawLiveDlaa, na::menu::Page::Picture});
+    na::menu::Register({"DLAA enhancements", na::menu::Availability::Available, nullptr, &DrawLiveDlaaEnhancements, na::menu::Page::Enhancements});
 }
 
 void RegisterRouteAMenu()
