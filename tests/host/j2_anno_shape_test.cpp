@@ -152,7 +152,9 @@ int main(int argc, char** argv)
     const bool inline_flow=argc>3 && std::strcmp(argv[3],"--inline-flow")==0;
     if(inline_flow && !na::ffx_flow::Built())return test::kSkip;
     const bool inline_consumer_tail = argc > 3 && std::strcmp(argv[3], "--inline-consumer-tail") == 0;
-    const bool inline_consumer = inline_consumer_tail || (argc > 3 && std::strcmp(argv[3], "--inline-consumer") == 0);
+    const bool close_control = argc > 3 && std::strcmp(argv[3], "--inline-consumer-gap-old") == 0;
+    const bool inline_consumer_gap = close_control || (argc > 3 && std::strcmp(argv[3], "--inline-consumer-gap") == 0);
+    const bool inline_consumer = inline_consumer_gap || inline_consumer_tail || (argc > 3 && std::strcmp(argv[3], "--inline-consumer") == 0);
     const bool inline_raster = inline_consumer || (argc > 3 && std::strcmp(argv[3], "--inline-raster") == 0);
     const bool inline_pan = argc > 3 && std::strcmp(argv[3], "--inline-pan") == 0;
     const bool inline_list = inline_pan || inline_raster || inline_flow || auto_inline || inline_record_first || inline_copy || (argc > 3 && std::strcmp(argv[3], "--inline") == 0);
@@ -481,6 +483,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
     // the auto modes exercise the selector.
     na::settings::Get().j2_route.store((auto_inline || auto_between || inline_list) ? 0u : 1u);
     na::j2::SetEnabled(true);
+    if (close_control) na::observe::SetListCloseCallback(nullptr); // negative control: the old missing opportunity
     na::j2::flow::SetEnabled(inline_flow);
     na::j2::SetJitter(true); // J1 is off by default in the game; the tests exercise it
     na::j2::SetRasterJitter(inline_raster);
@@ -540,6 +543,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         d.WaitIdle();
         const int frame_evals = fake::evals;
         const int pan_frame = (inline_pan || inline_consumer) ? ++frame_no : 0;
+        const bool gap_frame = inline_consumer_gap && pan_frame>=12 && pan_frame%4==0;
         if (inline_list && !inline_pan) {
             // Pooled list objects alternate between an early write-only job and
             // the final scene/post job. Learning by object identity fails here.
@@ -598,6 +602,13 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                 Store(cpu + kPre + kVp, vp);
             }
         }
+        if (gap_frame) {
+            // The main camera was available in the earlier submitted prepass,
+            // but this final recording has no readable copy. The main record()
+            // path can retain its coherent camera; the old between helper
+            // required find_camera() to succeed again and silently lost it.
+            std::memset(cpu+kBlock+kVp,0,64);
+        }
         scene.Reset(); // no colour/depth transitions in the scene list: carried state
         scene.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
         const float clear[4] = {0.2f, 0.3f, 0.4f, 1};
@@ -639,7 +650,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                 scene.list->SetGraphicsRootSignature(rs.Get());
                 ID3D12DescriptorHeap* camera_heap[]={cbvh.Get()};scene.list->SetDescriptorHeaps(1,camera_heap);
                 scene.list->SetGraphicsRootDescriptorTable(0,cbvh->GetGPUDescriptorHandleForHeapStart());
-                scene.list->SetPipelineState(inline_consumer ? final_writers.at(inline_consumer_tail ? 0 : pan_frame-1).Get() : raster_pso.Get());scene.list->DrawInstanced(3,1,0,0);
+                scene.list->SetPipelineState(inline_consumer ? final_writers.at((inline_consumer_tail || inline_consumer_gap) ? 0 : pan_frame-1).Get() : raster_pso.Get());scene.list->DrawInstanced(3,1,0,0);
                 scene.list->SetDescriptorHeaps(1,ph);scene.list->SetGraphicsRootSignature(post_root.Get());
                 scene.list->SetPipelineState(post_pso.Get());
             }
@@ -682,7 +693,8 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                 scene.list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
                 for (auto& b : cbars) std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
                 scene.list->ResourceBarrier(2, cbars);
-            } else if (!inline_pan) scene.list->DrawInstanced(3, 1, 0, 0); // final actual read
+            } else if (!inline_pan && !gap_frame)
+                scene.list->DrawInstanced(3, 1, 0, 0); // some frames hand this read to another recording
             if (!inline_consumer && fake::evals != evals_before_read + (na::j2::GetStats().inline_mode ? 1 : 0)) {
                 const auto ds = na::j2::GetStats();
                 std::printf("MISS evals=%d before=%d accepted=%u rejected_skips=%llu cands=%llu waited=%llu refused=%llu rec=%llu no_camera=%llu no_state=%llu busy=%llu pending=%llu reason=\"%s\"\n",
@@ -718,6 +730,20 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             consumer.list->ResourceBarrier(2, b);
             consumer.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
         }
+        if (gap_frame) {
+            // The real downstream read is in a separate list. It must receive
+            // the replacement already recorded before the scene list closed.
+            auto read = test::Transition(color.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            consumer.list->ResourceBarrier(1,&read);
+            consumer.list->OMSetRenderTargets(1,&post_rtv,FALSE,nullptr);
+            ID3D12DescriptorHeap* ph[]={post_heap.Get()};consumer.list->SetDescriptorHeaps(1,ph);
+            consumer.list->SetGraphicsRootSignature(post_root.Get());consumer.list->SetPipelineState(final_post_pso.Get());
+            consumer.list->SetGraphicsRootDescriptorTable(0,post_heap->GetGPUDescriptorHandleForHeapStart());
+            D3D12_VIEWPORT v{0,0,float(W),float(H),0,1};D3D12_RECT r{0,0,LONG(W),LONG(H)};
+            consumer.list->RSSetViewports(1,&v);consumer.list->RSSetScissorRects(1,&r);
+            consumer.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);consumer.list->DrawInstanced(3,1,0,0);
+            std::swap(read.Transition.StateBefore,read.Transition.StateAfter);consumer.list->ResourceBarrier(1,&read);
+        }
         REQUIRE(SUCCEEDED(consumer.list->Close()));
         g_forwarded.clear();
         if (inline_list) {
@@ -727,12 +753,14 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             }
             ID3D12CommandList* one[] = {scene.list.Get()};
             Submit(q, 1, one, true);
+            if (gap_frame) { ID3D12CommandList* post[]={consumer.list.Get()};Submit(q,1,post,true); }
             if (fake::evals > frame_evals) {
                 const double jx = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_X);
                 const double jy = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_Y);
                 uint8_t original[64]; Store(original, vp);
                 const auto f = [](const uint8_t* p, size_t i) { float v; std::memcpy(&v, p + i * 4, 4); return double(v); };
                 for (size_t block : {size_t(kBlock), size_t(kPre)}) {
+                    if (gap_frame && block==kBlock) continue; // deliberately absent camera copy
                     const auto* raster = cpu + block + kVp;
                     const double dx = (f(raster, 3) / f(raster, 15) - f(original, 3) / f(original, 15)) * W / 2;
                     const double dy = -(f(raster, 7) / f(raster, 15) - f(original, 7) / f(original, 15)) * H / 2;
@@ -836,8 +864,27 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         if (inline_consumer) {
             std::printf("changing final writer: %llu/%d frames evaluated, late writes %llu, camera failures %llu\n",
                 (unsigned long long)is.frames,frames,(unsigned long long)is.inline_late_writes,(unsigned long long)is.no_camera);
-            CHECK(inline_consumer_tail ? is.frames>=uint64_t(frames-3) : is.frames == uint64_t(frames-3));
+            CHECK(inline_consumer_gap ? is.frames==uint64_t(frames-1) : inline_consumer_tail ? is.frames>=uint64_t(frames-3) : is.frames == uint64_t(frames-3));
             CHECK(is.inline_late_writes == 0 && is.no_camera == 0 && is.no_state == 0);
+            if (inline_consumer_gap) {
+                CHECK(is.close_recovered==4);
+                // Offline GPU readback: final frame24 is a split-consumer frame.
+                // Fake NGX writes black; unprocessed source is .2/.3/.4. This
+                // checks contribution to the downstream draw, not just a call.
+                const auto desc=post_rt->GetDesc();D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};UINT64 bytes=0;
+                dev->GetCopyableFootprints(&desc,0,1,0,&fp,nullptr,nullptr,&bytes);
+                auto rb=test::CreateBuffer(dev,bytes,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);REQUIRE(rb);
+                test::List copy;REQUIRE(copy.Create(dev));auto b=test::Transition(post_rt.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_SOURCE);
+                copy.list->ResourceBarrier(1,&b);D3D12_TEXTURE_COPY_LOCATION from{},to{};
+                from.pResource=post_rt.Get();from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                to.pResource=rb.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=fp;
+                copy.list->CopyTextureRegion(&to,0,0,0,&from,nullptr);std::swap(b.Transition.StateBefore,b.Transition.StateAfter);copy.list->ResourceBarrier(1,&b);
+                REQUIRE(SUCCEEDED(copy.list->Close()));ID3D12CommandList* lists[]={copy.list.Get()};PlainExecute(q,1,lists);d.WaitIdle();
+                void* data=nullptr;REQUIRE(SUCCEEDED(rb->Map(0,nullptr,&data)));uint16_t rgb[3]{};
+                std::memcpy(rgb,static_cast<uint8_t*>(data)+fp.Offset+fp.Footprint.RowPitch*(H/2)+8*(W/2),sizeof rgb);rb->Unmap(0,nullptr);
+                std::printf("split consumer pixel: %04x %04x %04x; close recoveries %llu\n",rgb[0],rgb[1],rgb[2],(unsigned long long)is.close_recovered);
+                CHECK(rgb[0]==0 && rgb[1]==0 && rgb[2]==0);
+            }
             return test::finish("j2_anno_shape_test (exact consumer)");
         }
         if(inline_pan) {

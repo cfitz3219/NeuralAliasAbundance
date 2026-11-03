@@ -117,6 +117,7 @@ struct ListState {
     bool raster_jittered = false;
     double raster_jitter[2] = {};
     bool restorable = true;              // false after work whose state effects we cannot replay
+    bool closed = false;                 // no appending after Close until successful Reset
     bool in_render_pass = false;         // between BeginRenderPass and EndRenderPass (no host copy/dispatch allowed)
     int8_t mip_level = -1;               // live mip bias: twin level latched at Reset (-1 = the game's own objects)
 };
@@ -2241,6 +2242,7 @@ struct On<sl::list::Reset> {
                 {
                     std::lock_guard<std::mutex> bl(ls->bind_m);
                     ls->bindings.clear();
+                    ls->closed = false;
                     ls->states.clear();
                     ls->evidence_complete = true;
                     ls->uses.clear();
@@ -2292,6 +2294,7 @@ struct On<sl::list::Close> {
     {
         Rec r;
         if (!begin_op(l, &r)) return;
+        with_list_state(l, [&](ListState& ls) { std::lock_guard<std::mutex> bl(ls.bind_m); ls.closed = true; });
         na_ev_list_reset_close e;
         init_header(e, NA_EV_LIST_CLOSE, 0);
         e.list = r.list;
@@ -2622,6 +2625,7 @@ void shadow_arg(GL* l, uint32_t compute, UINT param, uint8_t type, uint64_t valu
     });
 }
 std::atomic<TableBindCallback> g_table_cb{nullptr};
+std::atomic<ListCloseCallback> g_close_cb{nullptr};
 template <uint32_t Compute>
 void root_table(GL* l, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE h)
 {
@@ -3045,6 +3049,21 @@ void after_texture_copy(GL* l, ID3D12Resource* dst)
 
 std::atomic<RasterJitterCallback> g_raster_jitter_cb{nullptr};
 thread_local bool t_raster_draw = false; // validation wrappers can forward to another hooked list
+// Append only while the recording is open, before the original Close call.
+void before_list_close(GL* l)
+{
+    const auto cb = g_close_cb.load(std::memory_order_acquire);
+    if (!cb || !l || t_host_work || !na::observe_internal::Started()) return;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_m);
+        na_object_id id = 0;
+        auto* ls = list_state_locked(l, &id);
+        if (!ls || !ls->recording_observed.load()) return;
+        std::lock_guard<std::mutex> bl(ls->bind_m);
+        if (ls->closed) return;
+    }
+    cb(l);
+}
 // Translate raster coordinates, rather than assuming a readable camera block
 // is the one the vertex shader uses. Scope the change to one actual draw: a
 // following fullscreen pass, HUD, copy or host dispatch sees the game's state.
@@ -3301,6 +3320,8 @@ struct ListHook<Slot, R(A...)> {
     {
         na::hooking::variants::CallScope scope(l, Slot);
         auto fn = reinterpret_cast<Pfn>(orig[I]);
+        if constexpr (Slot == sl::list::Close)
+            if (scope.outermost && !scope.ambiguous) before_list_close(l);
         if constexpr (Slot == sl::list::ResourceBarrier) {
             if(scope.outermost && !scope.ambiguous)if(auto listener=g_barrier_listener.load())listener(l,a...);
             if(!g_full_list_tracking.load()){fn(l,a...);return;}
@@ -4838,16 +4859,17 @@ void ResetDerived()
     std::lock_guard<std::mutex> lk(g_derived_m);
     g_derived_n.store(0, std::memory_order_release);
 }
-na::j2::LiveConsumer ListLiveConsumer(ID3D12CommandList* list, na_object_id color)
+na::j2::LiveConsumer ListLiveConsumer(ID3D12CommandList* list, na_object_id color, bool at_end)
 {
     std::shared_lock<std::shared_mutex> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return {};
     std::lock_guard<std::mutex> bl(ls->bind_m);
-    return ls->insertion.Live(color);
+    return ls->insertion.Live(color, at_end);
 }
 void SetTableBindCallback(TableBindCallback cb) { g_table_cb.store(cb, std::memory_order_release); }
+void SetListCloseCallback(ListCloseCallback cb) { g_close_cb.store(cb, std::memory_order_release); }
 void SetRasterJitterCallback(RasterJitterCallback cb) { g_raster_jitter_cb.store(cb, std::memory_order_release); }
 bool ListRasterJitter(ID3D12CommandList* list, double* x, double* y)
 {

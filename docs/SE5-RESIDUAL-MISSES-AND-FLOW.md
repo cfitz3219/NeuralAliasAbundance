@@ -311,3 +311,49 @@ No game launch, control or deployment. Cort's next game run determines whether
 these corrected causes close both visible reports. Opus's Anno native-present
 branch and installer remain separate. PR81 contains the source and evidence;
 no further review cycle was introduced.
+
+## User rejects4ce21f6: wait rule missed the end of a recording
+
+Cort reports far worse Sniper flicker after4ce21f6. Saved231539 identifies that
+exact package and ends584processed/745observed scene frames,161misses,0early
+placements,0depth-state/NGX/busy failures. The subsequent36908run likewise shows
+138/174processed,36misses. This is a real regression; the earlier automated
+receipt is not a live stability qualification.
+
+The added wait for a recent exact consumer had no final recording opportunity
+when that consumer was absent from the scene's own command list. Some frames
+hand the downstream read to another list. The existing between-list helper
+could also silently lose the guides when find_camera() failed on that final
+recording, although record() could have retained its coherent tracked camera.
+The live traces contain the expected last scene barrier without its actual
+consumer and zero matcher rejection reasons on missed frames.
+
+A new actual-DX12/fakeNGX regression alternates this structure on frames12/16/
+20/24, with a stable final writer. It moves the real downstream draw into a
+separate submitted list and removes the readable main-camera copy in those
+final scene recordings. The earlier prepass still has its camera. The old
+opportunity set processes19/24; the four intermittent misses plus one cold
+frame recreate the live roughly one-in-five loss. A negative control disables
+only the new Close listener and reproduces all four misses.
+
+The correction reuses the observer's existing Close hook to notify J2 BEFORE
+the original Close. At the end of an observed open recording, an established
+final barrier with no observed consumer after its final write gets one last
+placement attempt. It reuses the normal boundary qualification, camera/state
+validation, exact raster sample and single-evaluation ownership. A recording
+already consumed downstream is excluded; middle-boundary vetoes and truncated
+traces remain excluded. Unrelated final targets can be ignored when inspecting
+the selected colour's last event. No closed list is modified, and only an
+actual submission commits history or increments close_recovered.
+
+The corrected split-consumer case processes23/24(one cold), with4Close
+recoveries,0late writes,0camera/state failures. Offline GPU readback of the
+downstream post target confirms contribution: old control reads the unprocessed
+half-float colour3266/34cc/3666(.2/.3/.4), corrected reads the fake-model output
+0000/0000/0000. This is more than an NGX-call counter, while still not NVIDIA
+model quality or a new game run. The15focused CPU/raster/inline regressions
+pass25.85s; full exact-source verification and packaging follow.
+
+Original Close documentation: https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist-close
+No synchronous GPU readback/wait was added to live callbacks; readback is confined
+to the offline test. Evidence/control logs: local/se5-close-gap-20261102.

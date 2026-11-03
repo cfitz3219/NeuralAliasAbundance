@@ -122,11 +122,17 @@ bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id dep
 // HostWorkScope and end with RestoreListState(list).
 using TableBindCallback = void (*)(ID3D12GraphicsCommandList* list, const na_object_id* srvs, uint32_t count, bool compute);
 void SetTableBindCallback(TableBindCallback cb);
+// Final recording opportunity, before the game's original Close. Only observed
+// open recordings; no observer locks held. Host commands use HostWorkScope.
+using ListCloseCallback = void (*)(ID3D12GraphicsCommandList* list);
+void SetListCloseCallback(ListCloseCallback cb);
 na::j2::InsertionDecision ListInsertionDecision(ID3D12CommandList* list, na_object_id color);
 // P4-0D consumer anchor: the first actual consumer of `color` after its final write in
 // this recording (learned at submission), and the latest event as seen by a live trigger.
 na::j2::ConsumerSignature ListConsumerSignature(ID3D12CommandList* list, na_object_id color);
-na::j2::LiveConsumer ListLiveConsumer(ID3D12CommandList* list, na_object_id color);
+// at_end: before Close, inspect the selected colour's final event even when
+// unrelated targets were subsequently used. Truncated traces stay unknown.
+na::j2::LiveConsumer ListLiveConsumer(ID3D12CommandList* list, na_object_id color, bool at_end = false);
 // Placement design: the recording's writes and actual consumers of `color` in order (false:
 // unobserved or truncated). ResetDerived clears the per-frame lineage set (J2, at Present).
 bool ListColorEvents(ID3D12CommandList* list, na_object_id color, std::vector<na::j2::ColorEvent>& out);

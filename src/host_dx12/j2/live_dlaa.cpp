@@ -184,6 +184,7 @@ struct State {
         uint64_t color = 0;
         PendingHistory history;
         bool valid = false;
+        bool at_close = false;
     } inl;
     int64_t camera_offset = -1; // learned offset of the ViewProjection inside its block
     int64_t camera_param = -1;  // learned root parameter that binds the camera block
@@ -1850,7 +1851,7 @@ bool on_raster_jitter(uint32_t w, uint32_t h, double* x, double* y)
     return true;
 }
 
-void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint32_t n, bool compute)
+void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint32_t n, bool compute, bool closing)
 {
     if (!na::settings::EffectsReady() || !g.enabled.load(std::memory_order_relaxed) || g.paused.load(std::memory_order_relaxed)) return;
     uint64_t depth_id = 0, color_id = 0;
@@ -1869,7 +1870,7 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     if (!na::observe::ListSceneSubresource(l, color_id, depth_id, &csub, &dsub)) return;
     na_object_id cur_rt = 0, cur_ds = 0;
     na::observe::ListCurrentTargets(l, &cur_rt, &cur_ds);
-    const bool reading = compute || cur_rt != color_id ||
+    const bool reading = closing || compute || cur_rt != color_id ||
                          (na::observe::ListLastStateSub(l, color_id, csub, &cst) && !(cst & D3D12_RESOURCE_STATE_RENDER_TARGET));
     if (!reading) return;
     ++g.stats.inline_candidates;
@@ -1892,14 +1893,14 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     uint64_t live_producer = 0, live_context = 0;
     bool fired_at_barrier = false; // the event being judged is a barrier (whichever trigger fires)
     {
-        const auto live = na::observe::ListLiveConsumer(l, color_id);
+        const auto live = na::observe::ListLiveConsumer(l, color_id, closing);
         // An MSAA depth resolve draws (render target, viewport, topology), which the state
         // restore does not cover: graphics consumers with MSAA depth stay on the boundary matcher.
         const bool raster_safe = live.op != na::j2::Op::GraphicsRead || g.depth_samples <= 1;
         if (live.barrier && live.after_write) {
             // MSAA depth conversion changes graphics state that this inline
             // consumer path cannot yet restore: keep its existing barrier path.
-            if (g.depth_samples <= 1 && g.profile.HasRecentExactEntry(g.frame)) {
+            if (!closing && g.depth_samples <= 1 && g.profile.HasRecentExactEntry(g.frame)) {
                 ++g.stats.exact_consumer_waits;
                 return; // optional drawing can still follow this transition
             }
@@ -2037,6 +2038,7 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     g.inl.color = color_id;
     g.inl.history = pending;
     g.inl.valid = true;
+    g.inl.at_close = closing;
     g.inl_frame = g.frame;
     ++g.stats.inline_recorded;
     if (matched_mode == kByClass) ++g.stats.class_matched;
@@ -2052,6 +2054,25 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     g.fired_class = live_class;
     g.fired_producer = live_producer;
     g.fired_context = live_context;
+}
+
+void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint32_t n, bool compute)
+{
+    on_table_bind_impl(l, srvs, n, compute, false);
+}
+void on_list_closing(ID3D12GraphicsCommandList* l)
+{
+    if (!na::settings::EffectsReady() || !g.enabled.load() || g.paused.load()) return;
+    uint64_t depth = 0, color = 0;
+    na::observe::GetLiveSelection(&depth, &color);
+    if (!color || !depth || !na::observe::ListRendersTo(l, color, depth)) return;
+    const auto last = na::observe::ListLiveConsumer(l, color, true);
+    if (!last.barrier || !last.after_write) return; // also rejects incomplete traces
+    if (na::observe::ListConsumerSignature(l, color).mode != na::j2::ConsumerSignature::None) return;
+    // At the end of this observed recording, the awaited downstream read is
+    // absent. Append at this established end before Close, retaining
+    // the usual boundary, camera/state and one-evaluation ownership checks.
+    on_table_bind_impl(l, &color, 1, false, true);
 }
 
 // Inline and between-list are complementary opportunities in the SAME frame.
@@ -2123,6 +2144,7 @@ void SetEnabled(bool on)
 {
     g.enabled.store(on);
     g.configured.store(on);
+    na::observe::SetListCloseCallback(on ? &on_list_closing : nullptr);
     if (on) {
         na::observe::SetTableBindCallback(&on_table_bind);
     }
@@ -2518,6 +2540,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         if (g.inl.history.cut) ++g.stats.cuts;
         ++g.stats.frames;
         ++g.stats.inline_frames;
+        if (g.inl.at_close) ++g.stats.close_recovered;
         if (g.stats.inline_jitter_x != 0 || g.stats.inline_jitter_y != 0) ++g.stats.inline_jittered;
         g.stats.active = true;
         g.slots[g.inl.slot].fence_value = g.fence_next++;
@@ -2672,6 +2695,7 @@ Stats GetStats()
 
 void Shutdown()
 {
+    na::observe::SetListCloseCallback(nullptr);
     std::lock_guard<std::mutex> lock(g.m);
     g.depth32.Reset(); g.motion.Reset(); g.provenance.Reset(); g.output.Reset(); g.color_in.Reset(); g.sharp.Reset();
     g.msaa = MsaaResolve{};

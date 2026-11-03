@@ -843,10 +843,10 @@ void write_status_line()
             if (nrej > 0) WriteFile(f, rl, static_cast<DWORD>((std::min)(nrej, static_cast<int>(sizeof rl - 1))), &written, nullptr);
             char al[700];
             const int na2 = snprintf(al, sizeof al,
-                "j2_profile accepted=%u rejected=%u ambiguous=%u entries=%u matched{class=%llu pair=%llu barrier=%llu legacy=%llu exact=%llu} exact_waits=%llu rejected_skips=%llu barrier_vetoes=%llu barrier_ambiguous=%llu contradictions{class=%llu barrier=%llu} labelled=%llu unlabelled=%llu expired=%llu between{observed=%llu predicted=%llu} note=\"%s\"\r\n",
+                "j2_profile accepted=%u rejected=%u ambiguous=%u entries=%u matched{class=%llu pair=%llu barrier=%llu legacy=%llu exact=%llu} exact_waits=%llu close_recovered=%llu rejected_skips=%llu barrier_vetoes=%llu barrier_ambiguous=%llu contradictions{class=%llu barrier=%llu} labelled=%llu unlabelled=%llu expired=%llu between{observed=%llu predicted=%llu} note=\"%s\"\r\n",
                 j2.profile_accepted, j2.profile_rejected, j2.profile_ambiguous, j2.profile_entries,
                 (unsigned long long)j2.class_matched, (unsigned long long)j2.class_pair_matched, (unsigned long long)j2.barrier_matched,
-                (unsigned long long)j2.legacy_matched, (unsigned long long)j2.exact_consumer_matched, (unsigned long long)j2.exact_consumer_waits, (unsigned long long)j2.class_rejected_skips, (unsigned long long)j2.barrier_vetoes,
+                (unsigned long long)j2.legacy_matched, (unsigned long long)j2.exact_consumer_matched, (unsigned long long)j2.exact_consumer_waits, (unsigned long long)j2.close_recovered, (unsigned long long)j2.class_rejected_skips, (unsigned long long)j2.barrier_vetoes,
                 (unsigned long long)j2.barrier_ambiguous_skips, (unsigned long long)j2.class_contradictions, (unsigned long long)j2.barrier_contradictions,
                 (unsigned long long)j2.labelled_frames, (unsigned long long)j2.unlabelled_frames, (unsigned long long)j2.expired_inline,
                 (unsigned long long)j2.between_observed, (unsigned long long)j2.between_predicted, j2.class_note);
