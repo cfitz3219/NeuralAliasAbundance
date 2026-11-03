@@ -1011,7 +1011,20 @@ bool window_extra_camera(uint64_t res, uint64_t off, std::vector<uint8_t>& view)
 // exact copy of that VP / inverse in ANY bound block of the batch is replaced,
 // because an earlier pass (a depth pre-pass, often with its own root signature)
 // must see the same jittered camera as the scene, or depth tests disagree.
+void jitter_batch_impl(ID3D12CommandList* const* lists, UINT count);
+// CPU cost of J1/window camera work on the game's submit thread (Cort: latency must stay low).
 void jitter_batch(ID3D12CommandList* const* lists, UINT count)
+{
+    LARGE_INTEGER a, b, f;
+    QueryPerformanceCounter(&a);
+    jitter_batch_impl(lists, count);
+    QueryPerformanceCounter(&b);
+    QueryPerformanceFrequency(&f);
+    const uint64_t us = static_cast<uint64_t>((b.QuadPart - a.QuadPart) * 1000000 / f.QuadPart);
+    g.stats.jitter_cpu_us += us;
+    if (us > g.stats.jitter_cpu_max_us) g.stats.jitter_cpu_max_us = us;
+}
+void jitter_batch_impl(ID3D12CommandList* const* lists, UINT count)
 {
     // Only while DLAA is producing frames: the previous game frame submitted one
     // (a batch without the scene must not count as "not running").

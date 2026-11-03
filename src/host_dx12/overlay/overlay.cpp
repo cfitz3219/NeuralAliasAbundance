@@ -717,7 +717,7 @@ void write_status_line()
         if (na::j2::ProjectionWindow()) {
             char wl[1400];
             const int wn = snprintf(wl, sizeof wl,
-                "j2_window engaged=%u corner=%ux%u mode=%u frames=%llu missed=%llu engagements=%llu render=%ux%u out=%ux%u writes{vp=%llu inv=%llu proj=%llu prev=%llu} post_lists=%llu scissored=%llu restored=%llu derived{forward=%llu inverse=%llu kinds=\"%s\"} unpacked=%llu repeated=%llu extra_cameras=%llu stale_samples=%llu blocks_capped=%llu patches=%llu refused=%llu last_unpacked=\"%s\" note=\"%s\"\r\n",
+                "j2_window engaged=%u corner=%ux%u mode=%u frames=%llu missed=%llu engagements=%llu render=%ux%u out=%ux%u writes{vp=%llu inv=%llu proj=%llu prev=%llu} post_lists=%llu scissored=%llu restored=%llu derived{forward=%llu inverse=%llu kinds=\"%s\"} unpacked=%llu repeated=%llu extra_cameras=%llu stale_samples=%llu blocks_capped=%llu patches=%llu refused=%llu cpu_us_per_frame=%.1f cpu_max_us=%llu last_unpacked=\"%s\" note=\"%s\"\r\n",
                 j2.window_engaged ? 1u : 0u, j2.window_w, j2.window_h, na::settings::Get().j2_scale_mode.load(),
                 (unsigned long long)j2.window_frames, (unsigned long long)j2.window_missed, (unsigned long long)j2.window_engagements,
                 j2.render_w, j2.render_h, j2.out_w, j2.out_h,
@@ -727,7 +727,9 @@ void write_status_line()
                 (unsigned long long)j2.window_derived_forward, (unsigned long long)j2.window_derived_inverse, j2.window_derived_note,
                 (unsigned long long)j2.window_unpacked, (unsigned long long)j2.window_repeated, (unsigned long long)j2.window_extra_cameras,
                 (unsigned long long)j2.window_stale_samples, (unsigned long long)j2.jitter_blocks_capped, (unsigned long long)j2.jitter_patches,
-                (unsigned long long)j2.jitter_patches_refused, j2.window_unpacked_note, j2.window_note);
+                (unsigned long long)j2.jitter_patches_refused,
+                j2.frames ? double(j2.jitter_cpu_us) / double(j2.frames) : 0.0, (unsigned long long)j2.jitter_cpu_max_us,
+                j2.window_unpacked_note, j2.window_note);
             if (wn > 0) WriteFile(f, wl, DWORD((std::min)(wn, int(sizeof wl - 1))), &written, nullptr);
         }
         {
