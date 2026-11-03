@@ -1231,11 +1231,11 @@ std::atomic<float> g_mip_bias{0.0f};
 // into its root signatures and pipelines at load, so every root signature and pipeline
 // gets twins built at creation for the other menu levels; command lists are switched to
 // the twins of the level latched at their Reset. Levels = the menu's choices.
-// Render-small's DLSS modes use NVIDIA's -1 + log2(render/output) exactly: Quality (1/1.5)
-// -1.585, Balanced (1/1.72) -1.782, Performance (1/2) -2. Only the levels that can be reached
-// get twins (g_mip_level_mask), so other games build two as before.
+// Render-small's DLSS modes (Cort, 2026-11-03): Quality -1.585 (NVIDIA's -1 + log2(1/1.5)),
+// Balanced -2, Performance -2.5. Only the levels that can be reached get twins
+// (g_mip_level_mask), so other games build two as before.
 constexpr int kMipCount = 6;
-constexpr float kMipLevels[kMipCount] = {0.0f, -0.5f, -1.0f, -1.5849625f, -1.7824086f, -2.0f};
+constexpr float kMipLevels[kMipCount] = {0.0f, -0.5f, -1.0f, -1.5849625f, -2.0f, -2.5f};
 std::atomic<uint32_t> g_mip_level_mask{0x7u}; // levels twins are built for (bit i = kMipLevels[i])
 std::atomic<int> g_mip_game_level{0};      // level the game's own objects are built with (0 = no bias unless J2 sets it)
 std::atomic<int> g_mip_live_level{0};      // level selected in the menu

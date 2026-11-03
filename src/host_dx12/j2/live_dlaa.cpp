@@ -2471,9 +2471,11 @@ struct SmallRing {
     // uses), hudup = NIS-upscaled frame at output size (RGBA16F, UAV between uses).
     bool hud_tried = false, hud_ok = false;
     ComPtr<ID3D12RootSignature> hud_root;
-    ComPtr<ID3D12PipelineState> hud_pso[3]; // classify, dilate, composite
-    ComPtr<ID3D12DescriptorHeap> hud_heap;  // kRing x 3 passes x (3 SRV, 3 UAV)
+    ComPtr<ID3D12PipelineState> hud_pso[4]; // classify, dilate, composite, clear
+    ComPtr<ID3D12DescriptorHeap> hud_heap;  // kRing x 4 passes x (3 SRV, 4 UAV)
     ComPtr<ID3D12Resource> prev, hud, mask, hudup;
+    ComPtr<ID3D12Resource> hud_stats; // 4 uints: per frame parity, detailed pixels and still ones
+    uint32_t hud_parity = 0;
     uint32_t hud_w = 0, hud_h = 0, up_w = 0, up_h = 0;
     DXGI_FORMAT prev_f = DXGI_FORMAT_UNKNOWN;
     bool prev_valid = false;
@@ -2487,31 +2489,56 @@ Texture2D<float4> t2 : register(t2);
 RWTexture2D<float4> u0 : register(u0);
 RWTexture2D<float> u1 : register(u1);
 RWTexture2D<float> u2 : register(u2);
+RWByteAddressBuffer stats : register(u3);
 SamplerState s_lin : register(s0);
-cbuffer C : register(b0) { uint w; uint h; uint ow; uint oh; uint flags; uint p0; uint p1; uint p2; };
+// flags: 1 = tint the HUD (composite), 2 = the camera is jittered this frame. cur = parity.
+cbuffer C : register(b0) { uint w; uint h; uint ow; uint oh; uint flags; uint cur; uint p1; uint p2; };
+groupshared uint gs_detail, gs_still;
 float luma(float3 c) { return dot(min(c, 1.0), float3(0.299, 0.587, 0.114)); }
 int2 at(int2 p, int2 d) { return clamp(p + d, int2(0, 0), int2(int(w) - 1, int(h) - 1)); }
-// The HUD is drawn without the camera's motion and without jitter. A detailed pixel that
-// stays exactly the same while the camera moves under it is HUD evidence; a detailed pixel
-// that changes is scene evidence. Flat pixels and a still camera keep what was learned.
-// t0 this frame, t1 the previous frame, t2 motion (render pixels); u1 evidence.
+// The HUD is drawn without our jitter and without the camera's motion. The 3D picture moves
+// a fraction of a pixel every frame (jitter), so a detailed pixel that stays exactly the
+// same is HUD evidence; with the camera moving under it, stronger evidence. A detailed pixel
+// that changes is scene evidence. Flat pixels keep what was learned.
+// Guard: if the game's own anti-aliasing removes the jitter, the whole picture stands still.
+// Last frame's counts (other parity): when half or more of the detailed pixels stood still,
+// jitter is not visible and only camera motion counts.
+// t0 this frame, t1 the previous frame, t2 motion (render pixels); u1 evidence; u3 counts.
 [numthreads(8, 8, 1)]
-void classify(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= w || id.y >= h) return;
-    const int2 p = int2(id.xy);
-    float lo = 2.0, hi = -1.0;
-    [unroll] for (int y = -1; y <= 1; ++y)
-        [unroll] for (int x = -1; x <= 1; ++x) { const float l = luma(t0[at(p, int2(x, y))].rgb); lo = min(lo, l); hi = max(hi, l); }
-    const float3 d3 = abs(min(t0[p].rgb, 1.0) - min(t1[p].rgb, 1.0));
-    const float d = max(d3.r, max(d3.g, d3.b));
-    const float2 m = t2[p].xy;
-    float e = u1[p];
-    if (hi - lo > 0.1) {
-        if (d > 0.04) e -= 0.5;
-        else if (d < 0.006 && dot(m, m) >= 1.0) e += 0.25;
+void classify(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+    if (gi == 0) { gs_detail = 0; gs_still = 0; }
+    GroupMemoryBarrierWithGroupSync();
+    if (id.x < w && id.y < h) {
+        const int2 p = int2(id.xy);
+        float lo = 2.0, hi = -1.0;
+        [unroll] for (int y = -1; y <= 1; ++y)
+            [unroll] for (int x = -1; x <= 1; ++x) { const float l = luma(t0[at(p, int2(x, y))].rgb); lo = min(lo, l); hi = max(hi, l); }
+        const float3 d3 = abs(min(t0[p].rgb, 1.0) - min(t1[p].rgb, 1.0));
+        const float d = max(d3.r, max(d3.g, d3.b));
+        const float2 m = t2[p].xy;
+        const uint other = (cur ^ 1u) * 8u;
+        const uint pd = stats.Load(other), ps = stats.Load(other + 4u);
+        const bool jitter_seen = (flags & 2u) != 0u && pd > 2000u && ps * 2u < pd;
+        float e = u1[p];
+        if (hi - lo > 0.1) {
+            uint dummy;
+            InterlockedAdd(gs_detail, 1u, dummy);
+            if (d < 0.006) InterlockedAdd(gs_still, 1u, dummy);
+            if (d > 0.04) e -= 0.5;
+            else if (d < 0.006 && dot(m, m) >= 1.0) e += 0.25;
+            else if (d < 0.006 && jitter_seen) e += 0.125;
+        }
+        u1[p] = saturate(e);
     }
-    u1[p] = saturate(e);
+    GroupMemoryBarrierWithGroupSync();
+    if (gi == 0) {
+        stats.InterlockedAdd(cur * 8u, gs_detail);
+        stats.InterlockedAdd(cur * 8u + 4u, gs_still);
+    }
 }
+// Zeroes this frame's counts before classify.
+[numthreads(1, 1, 1)]
+void clear(uint3 id : SV_DispatchThreadID) { stats.Store2(cur * 8u, uint2(0, 0)); }
 // u1 evidence -> u2 mask (3x3 max, so text edges blended with the scene count too);
 // HUD pixels get no motion (u0 = the motion DLSS reads), so DLSS does not drag them.
 [numthreads(8, 8, 1)]
@@ -2544,7 +2571,7 @@ bool hud_init()
     r[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     r[0].NumDescriptors = 3;
     r[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    r[1].NumDescriptors = 3;
+    r[1].NumDescriptors = 4;
     r[1].OffsetInDescriptorsFromTableStart = 3;
     D3D12_ROOT_PARAMETER p[2]{};
     p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -2562,8 +2589,8 @@ bool hud_init()
     if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
         FAILED(dev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&g_small.hud_root))))
         return false;
-    const char* entries[3] = {"classify", "dilate", "composite"};
-    for (int i = 0; i < 3; ++i) {
+    const char* entries[4] = {"classify", "dilate", "composite", "clear"};
+    for (int i = 0; i < 4; ++i) {
         ComPtr<ID3DBlob> code, cerr;
         if (FAILED(D3DCompile(kHudHlsl, sizeof(kHudHlsl) - 1, "j2_small_hud.hlsl", nullptr, nullptr, entries[i], "cs_5_0",
                               D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &cerr)))
@@ -2573,8 +2600,21 @@ bool hud_init()
         pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
         if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_small.hud_pso[i])))) return false;
     }
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRing * 18, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRing * 28, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_small.hud_heap)))) return false;
+    D3D12_HEAP_PROPERTIES bhp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = 256;
+    bd.Height = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (FAILED(dev->CreateCommittedResource(&bhp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                            IID_PPV_ARGS(&g_small.hud_stats))))
+        return false;
     g_small.hud_ok = true;
     return true;
 }
@@ -2611,7 +2651,7 @@ void hud_pass(ID3D12GraphicsCommandList* l, int pass, uint32_t slot, ID3D12Resou
               ID3D12Resource* const uav[3], const DXGI_FORMAT uf[3], const uint32_t k[8], uint32_t gx, uint32_t gy)
 {
     ID3D12Device* dev = g_small.device.Get();
-    const UINT base = (slot * 3 + static_cast<UINT>(pass)) * 6;
+    const UINT base = (slot * 4 + static_cast<UINT>(pass)) * 7;
     D3D12_CPU_DESCRIPTOR_HANDLE c = g_small.hud_heap->GetCPUDescriptorHandleForHeapStart();
     c.ptr += static_cast<SIZE_T>(base) * g_small.inc;
     for (int i = 0; i < 3; ++i, c.ptr += g_small.inc) {
@@ -2627,6 +2667,14 @@ void hud_pass(ID3D12GraphicsCommandList* l, int pass, uint32_t slot, ID3D12Resou
         uv.Format = uav[i] ? uf[i] : (i == 0 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R32_FLOAT);
         uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
         dev->CreateUnorderedAccessView(uav[i], nullptr, &uv, c);
+    }
+    {   // u3: the counts buffer (raw)
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+        uv.Format = DXGI_FORMAT_R32_TYPELESS;
+        uv.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        uv.Buffer.NumElements = 4;
+        uv.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        dev->CreateUnorderedAccessView(g_small.hud_stats.Get(), nullptr, &uv, c);
     }
     D3D12_GPU_DESCRIPTOR_HANDLE gh = g_small.hud_heap->GetGPUDescriptorHandleForHeapStart();
     gh.ptr += static_cast<UINT64>(base) * g_small.inc;
@@ -2801,7 +2849,17 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         add(b, g.motion.Get(), UAV, NPSR);
         flush(l, b);
         if (hud_want && g_small.prev_valid) {
-            const uint32_t k[8] = {rw, rh, ow, oh, 0, 0, 0, 0};
+            g_small.hud_parity ^= 1u;
+            const uint32_t k[8] = {rw, rh, ow, oh, (d.jx != 0.f || d.jy != 0.f) ? 2u : 0u, g_small.hud_parity, 0, 0};
+            {
+                ID3D12Resource* const srv[3] = {nullptr, nullptr, nullptr};
+                const DXGI_FORMAT sf[3] = {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
+                ID3D12Resource* const uav[3] = {nullptr, nullptr, nullptr};
+                const DXGI_FORMAT uf[3] = {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
+                hud_pass(l, 3, si, srv, sf, uav, uf, k, 1, 1);
+            }
+            b.push_back(uav_barrier(g_small.hud_stats.Get()));
+            flush(l, b);
             {
                 ID3D12Resource* const srv[3] = {frame, g_small.prev.Get(), g.motion.Get()};
                 const DXGI_FORMAT sf[3] = {ff, ff, DXGI_FORMAT_R32G32_FLOAT};
@@ -2810,6 +2868,7 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
                 hud_pass(l, 0, si, srv, sf, uav, uf, k, (rw + 7) / 8, (rh + 7) / 8);
             }
             b.push_back(uav_barrier(g_small.hud.Get()));
+            b.push_back(uav_barrier(g_small.hud_stats.Get()));
             add(b, g.motion.Get(), NPSR, UAV);
             flush(l, b);
             {
@@ -3007,7 +3066,7 @@ bool RecordRcasForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, I
 }
 bool CompileHudShadersForTests(char* why, size_t why_size)
 {
-    for (const char* entry : {"classify", "dilate", "composite"}) {
+    for (const char* entry : {"classify", "dilate", "composite", "clear"}) {
         ComPtr<ID3DBlob> code, err;
         if (FAILED(D3DCompile(kHudHlsl, sizeof(kHudHlsl) - 1, "j2_small_hud.hlsl", nullptr, nullptr, entry, "cs_5_0",
                               D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err))) {

@@ -72,9 +72,14 @@ bool RenderSmall();
 // Render-small HUD separation: tint the pixels taken as HUD (diagnostic, not saved).
 void SetHudMaskView(bool on);
 bool HudMaskView();
-// Render-small texture bias: DLSS modes use NVIDIA's -1 + log2(render scale) (the menu is
-// greyed out there); DLAA (scale 1) uses the menu's choice.
-inline float SmallMipBias(float user, float scale) { return scale > 0.f && scale < 1.f ? -1.f + std::log2(scale) : user; }
+// Render-small texture bias per DLSS mode (Cort, 2026-11-03; the menu is greyed out there):
+// Quality (67%) -1.585, Balanced (58%) -2, Performance (50%) -2.5. DLAA (scale 1) uses the
+// menu's choice.
+inline float SmallMipBias(float user, float scale)
+{
+    if (!(scale > 0.f && scale < 1.f)) return user;
+    return scale >= 0.62f ? -1.5849625f : (scale >= 0.54f ? -2.0f : -2.5f);
+}
 bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t rw, uint32_t rh,
                     ID3D12Resource* out, uint32_t ow, uint32_t oh, bool hdr, void* user);
 void SetProjectionWindow(bool on);

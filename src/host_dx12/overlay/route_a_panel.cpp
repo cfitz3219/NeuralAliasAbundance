@@ -976,7 +976,7 @@ void DrawLiveDlaa()
     if (na::j2::RenderSmall()) {
         na::settings::Settings& ss = na::settings::Get();
         int hud = static_cast<int>(ss.j2_hud_nis.load());
-        BeginRow("HUD sharpness (NIS)", "Keeps the game's HUD and text out of DLSS and upscales them with NVIDIA Image Scaling at this sharpness instead. Off sends the HUD through DLSS with the 3D picture. The HUD is found once the camera moves.", S(220));
+        BeginRow("HUD sharpness (NIS)", "Keeps the game's HUD and text out of DLSS and upscales them with NVIDIA Image Scaling at this sharpness instead. Off sends the HUD through DLSS with the 3D picture. The HUD is found within a few frames (from our camera jitter, and from camera movement when the game's own anti-aliasing hides the jitter).", S(220));
         ImGui::SetNextItemWidth(S(220));
         if (ImGui::SliderInt("##j2hudnis", &hud, 0, 100, hud ? "%d%%" : "Off", ImGuiSliderFlags_AlwaysClamp)) ss.j2_hud_nis.store(static_cast<uint32_t>(hud));
         if (ImGui::IsItemDeactivatedAfterEdit()) na::settings::Save();
