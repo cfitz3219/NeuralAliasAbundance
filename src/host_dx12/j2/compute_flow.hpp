@@ -30,6 +30,7 @@ struct Stats {
     uint64_t last_submitted_frame=0,sample_frame=0,submit_age_ms=0,sample_age_ms=0;
     uint64_t rejected_invalid=0,rejected_small=0,rejected_cost=0,rejected_offscreen=0,rejected_image=0,rejected_flicker=0; // flicker: passed every check, no agreeing previous pair yet
     uint32_t recording_slots=0,image_slots=0;
+    uint32_t loosen=0; // flow_loosen used by the latest recording
     double ms=0;char reason[160]{};
 };
 Stats GetStats();
