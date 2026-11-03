@@ -697,3 +697,8 @@ Cort's latest53295cb captures confirm ongoing genuine on/off flicker. Report3415
 ### 2026-11-03 Pacific — Sniper output-delivery correction packaged for user testing
 PR81 runtime a7fce1f, final receipt 585572e. Fixed the observer's 64-SRV prefix blind spot with sparse lookup over the full bound descriptor range; an invisible post consumer could receive raw pixels before a successful late Close evaluation. Actual DX12/fake-NGX downstream reproduction: 10/17 before, 17/17 after, same 23/24 evaluations. Final finite/unbounded copy/offset/null-invalidation cases and existing pan/tail/split/raster/native-NGX cases pass. Full Release 173 cases: 168 pass, five skip, zero fail, 237.52s. Scope/limits in docs/SE5-DOWNSTREAM-DELIVERY-FIX-20261103.md. No claim that saved game captures prove this is the only live cause.
 Usual Documents/NA-se5-camfix-update/results/rollback.cmd now point to NA-SE5-camfix-a7fce1f, DLL57A568AA... . Reversible temporary-folder roundtrip and payload checks pass; known-good019, baseline6f and previous packages retained. Actual installed53295cb/41C3805A unchanged. No game launch/control/deployment. Next: Cort tests the actual picture. Status wide_scene_reads and F8 placement/at_close identify the previously hidden consumer/recovery. Anno and SER installers remain untouched; no new review gate.
+
+### 2026-10-29 — Poise preview milestone
+
+Cort authorized font and preview only. design/poise has Poise0.1, Jost-derived OFL font in Light/Regular/Medium, actual specimen and editable offline preview. No integration/system installation. Do not wire into NeuralAlias without later instruction. Source, licenses, builder and validation limits included.
+

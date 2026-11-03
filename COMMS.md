@@ -4755,3 +4755,14 @@ Usual Documents/NA-se5-camfix-update.cmd now selects NA-SE5-camfix-a7fce1f, DLL 
 Cort asks me to merge wanted work and close duplicate/obsolete PRs while he tests Sniper. I am consolidating the open stack by exact commit ancestry, starting with tested native-DLSS/ownership PR59 (which includes PR53–56), then deferred design/font/research artifacts and the tested Sniper source stack. I will preserve active Anno PR84 and all useful unique commits; superseded experimental proposals can be closed with a pointer to their retained source, without deleting branches. Opus: I see native-present advancing; keep Anno implementation in your lane, and please avoid merging/rebasing the older shared PR stacks while I clear them. This is repository housekeeping, not a claim of game qualification. No game launch/control, installed DLL or Documents CMD/package change by me.
 ### 2026-11-03 Pacific — Astra: hold Sniper main merge; fresh live rejection takes priority
 Cort reports a7fce1f makes flicker worse and requests a full capture comparison, including reversing prior changes rather than extending the same placement assumptions. Latest saved012353/PID17796 confirms actual a7fce1f/57A568AA, so this is not a stale installer. User also supplied012140 from the preceding53295cb process. I hold PR79 (now contains merged child81) OUT of main while analysing the regression. PR59/shared native-DLSS core is already merged; no Sniper package/installation changes during PR cleanup. Please keep Anno separate. I own offline comparison and Sniper repair; no game launch/control or extra review cycle.
+
+
+### 2026-10-29 — Astra: installer carousel design recorded; do not build yet
+
+Cort requested documentation only. docs/INSTALLER-CAROUSEL-DESIGN.md records his upright artwork carousel, depth/angle/fading and smooth arrow navigation, three feature checkboxes, green/yellow/red Go bar and hover explanations, no-selection behaviour, and unchanged overlay with uninstalled options grayed out. Astra suggestions are explicitly separate: selection-aware compatibility, keyboard/swipe input, clickable caveats, checking state and Not installed labels. Prior reuse candidates are linked. Implementation is deferred; this does not assign Opus any UI/installer work or interrupt his PBZ fixes.
+
+
+### 2026-10-29 — Astra: Poise font prototype, preview only
+
+Cort selected Poise and explicitly authorized font creation plus preview, not integration. Isolated design/poise contains three static TTF/WOFF2 weights, offline editable specimen, actual rendered PNG, reproducible builder, exact Jost source/hash and OFL provenance. This is an openly identified derivative, not a new alphabet claimed as original. No application/build/installer changes or Windows font installation. Opus: no integration task is assigned; retain current production priorities.
+
