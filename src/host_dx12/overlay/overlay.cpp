@@ -736,6 +736,18 @@ void write_status_line()
                 j2.window_unpacked_note, j2.window_note);
             if (wn > 0) WriteFile(f, wl, DWORD((std::min)(wn, int(sizeof wl - 1))), &written, nullptr);
         }
+        if (na::j2::RenderSmall()) { // P4-4 render-small: one line per status write
+            const auto ps = na::present::GetStats();
+            char sl[640];
+            const int sn = snprintf(sl, sizeof sl,
+                "native_present mode=%u scale=%.3f proxies=%ux%u native=%ux%u scene=%ux%u deferred=%llu dlss=%llu stretched=%llu failed=%llu dlss_refused=%llu presenter_upscaled=%llu presenter_kept_old=%llu dlss_in=%ux%u dlss_out=%ux%u jitter_phases=%u mip_bias=%.2f note=\"%s\"\r\n",
+                na::settings::Get().j2_scale_mode.load(), na::present::RenderScale(), ps.scaled_w, ps.scaled_h, ps.native_w, ps.native_h,
+                j2.width, j2.height, (unsigned long long)j2.small_deferred, (unsigned long long)j2.small_dlss,
+                (unsigned long long)j2.small_stretched, (unsigned long long)j2.small_failed, (unsigned long long)j2.small_dlss_failed,
+                (unsigned long long)ps.upscaled, (unsigned long long)ps.upscale_failed, j2.small_rw, j2.small_rh, j2.small_ow, j2.small_oh,
+                j2.jitter_phases, na::observe::SamplerMipBias(), j2.small_note);
+            if (sn > 0) WriteFile(f, sl, DWORD((std::min)(sn, int(sizeof sl - 1))), &written, nullptr);
+        }
         {
             const auto automatic=na::scale::GetAutomaticSceneStats();
             if(automatic.enabled){char automatic_line[1400];const int automatic_bytes=snprintf(automatic_line,sizeof automatic_line,
@@ -2524,6 +2536,11 @@ HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_
     }
     na::present::PresentArgs a;
     na::j2::OnPresent(queue); // game call only; the presenter's generated frames bypass this
+    if (na::j2::RenderSmall()) { // render-small: follow the menu's mode (applies at the next resize)
+        const int mode = static_cast<int>(na::settings::Get().j2_scale_mode.load());
+        const float f = mode > 0 && mode <= 4 ? static_cast<float>(na::scale::FractionForMode(mode)) : 1.f;
+        if (f != na::present::RenderScale()) na::present::SetRenderScale(f, &na::j2::PresentUpscale, nullptr);
+    }
     if (na::scale::SliderRouteActive()) na::scale::TickLive(na::j2::GetStats().width); // P4-4: confirm a live render-scale change
     g_present_caller.store(GetCurrentThreadId());
     g_present_queue_identity.store(reinterpret_cast<uintptr_t>(queue));
@@ -2699,6 +2716,7 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT count, UI
         if (g_state.swapchain == sc) release_buffers_locked();
     }
     if(!na::present::BeforeResize(sc))return DXGI_ERROR_INVALID_CALL; // outstanding buffer use; size unchanged
+    na::present::TranslateResize(sc,&w,&h); // render-small: the real chain follows the window
     const auto result=g_orig_resize(sc,count,w,h,fmt,flags);
     na::present::AfterResize(sc,result);return result;
 }
@@ -2712,6 +2730,7 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT count, 
         if (g_state.swapchain == sc) release_buffers_locked();
     }
     if(!na::present::BeforeResize(sc))return DXGI_ERROR_INVALID_CALL; // outstanding buffer use; size unchanged
+    na::present::TranslateResize(sc,&w,&h); // render-small: the real chain follows the window
     const auto result=g_orig_resize1(sc, count, w, h, fmt, flags, node_masks, queues);
     na::present::AfterResize(sc,result);
     if(SUCCEEDED(result) && queues){

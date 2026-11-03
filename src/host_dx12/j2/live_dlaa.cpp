@@ -19,6 +19,7 @@
 #include "host_dx12/nr/native_fg.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/settings.hpp"
+#include "host_dx12/overlay/presenter.hpp"
 #include "host_dx12/scale/settings_read_hook.hpp"
 #include "providers/camera/camera_tracker.hpp"
 
@@ -218,6 +219,17 @@ struct State {
         uint64_t last_eval = 0;              // last frame DLSS evaluated a windowed corner (g.output holds it)
     } win;
     bool jitter_on = true; // DLAA needs jitter (with the texture mip bias set at start-up)
+    // Render-small: this frame's DLSS inputs other than colour, kept for PresentUpscale. depth32
+    // and motion hold them (motion back in UAV at rest); the game queue orders them before Present.
+    struct Deferred {
+        bool valid = false;
+        uint64_t frame = 0;          // J2 frame the inputs belong to (Present runs after OnPresent: frame + 1)
+        float jx = 0.f, jy = 0.f;    // this frame's jitter, render pixels
+        bool reset = false, reversed = false;
+        uint32_t w = 0, h = 0;       // depth / motion size (the scene's)
+    } def;
+    uint64_t small_last = 0;         // J2 frame PresentUpscale's DLSS last evaluated (history continues only from frame - 1)
+    uint32_t small_ow = 0, small_oh = 0, small_rw = 0, small_rh = 0; // its last sizes
     Stats stats;
 };
 // Never destroyed: at process exit the observation hooks' own state may already
@@ -225,6 +237,9 @@ struct State {
 State& g = *new State;
 // Projection window, read by the scissor hook on game recording threads (no g.m there).
 std::atomic<bool> g_window_enabled{false};
+std::atomic<bool> g_render_small{false};
+std::atomic<ExecuteFn> g_forward{nullptr}; // the host's original ExecuteCommandLists (for PresentUpscale)
+constexpr uint64_t kSmallViewId = kViewId + 1; // render-small: DLSS on the finished picture, its own history
 std::atomic<bool> g_window_scissor{false};
 std::atomic<bool> g_window_scissor_wanted{true}; // [j2] window_scissor (default on)
 std::atomic<uint64_t> g_window_depth{0};
@@ -651,7 +666,12 @@ bool state_after(ID3D12CommandList* const* lists, UINT last, na_object_id id, ui
 // Runs only while DLAA is producing frames, so the shake is never left
 // unresolved on screen.
 constexpr uint32_t kJitterPhases = 8; // DLAA; upscaling uses JitterPhasesFor (8 x ratio^2)
-uint32_t jitter_phases() { return g.ow && g.rw ? JitterPhasesFor(g.rw, g.ow) : kJitterPhases; }
+uint32_t jitter_phases()
+{
+    // Render-small: the output is the window, known once PresentUpscale has run.
+    if (g_render_small.load(std::memory_order_relaxed) && g.rw && g.stats.small_ow) return JitterPhasesFor(g.rw, g.stats.small_ow);
+    return g.ow && g.rw ? JitterPhasesFor(g.rw, g.ow) : kJitterPhases;
+}
 
 void store_matrix(const na::camera::Matrix& m, na::camera::Layout layout, uint8_t out[64])
 {
@@ -1666,6 +1686,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // full-size output is written back into the scene colour exactly like DLAA.
     const bool windowed = !phys && !upscaling && g.jit.windowed && g.jit.frame == g.frame && g.win.last_frame == g.frame &&
                           g.jit.ew && g.jit.eh && g.jit.ew <= w && g.jit.eh <= h && w == g.win.w && h == g.win.h;
+    // Render-small: the scene is the game's own (render-size) frame; DLSS runs at Present.
+    const bool deferred = g_render_small.load(std::memory_order_relaxed) && na::present::Scaling() && !phys && !upscaling && !windowed;
     if (windowed) {
         if (color_msaa) { reason("Projection window: MSAA scene colour is not supported."); return false; }
         rw = g.jit.ew; rh = g.jit.eh; ow = w; oh = h;
@@ -1994,6 +2016,27 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     b.push_back(uav_barrier(g.motion.Get()));
     add(b, g.motion.Get(), UAV, NPSR);
     flush(l, b);
+    if (deferred) { // render-small: keep depth + motion for Present; the scene colour stays as drawn
+        addsub(b, color.Get(), csub, color_source, sc);
+        add(b, g.motion.Get(), NPSR, UAV);
+        flush(l, b);
+        if (!inl && FAILED(l->Close())) { reason("Render-small: could not close the depth and motion list."); g.latched = true; return false; }
+        const bool carry = g.def.valid && g.def.reset; // a reset whose frame never reached DLSS still applies
+        g.def.valid = true;
+        g.def.frame = g.frame;
+        g.def.jx = static_cast<float>(cam.jitter_px_x);
+        g.def.jy = static_cast<float>(cam.jitter_px_y);
+        g.def.reset = cam.camera_cut || resize || g.resume_reset || carry;
+        g.def.reversed = reversed;
+        g.def.w = w; g.def.h = h;
+        ++g.stats.small_deferred;
+        g.stats.width = w; g.stats.height = h;
+        g.stats.color_format = static_cast<uint32_t>(cd.Format);
+        g.stats.render_w = rw; g.stats.render_h = rh;
+        g.stats.jitter_phases = jitter_phases();
+        *out_list = l;
+        return true;
+    }
     // 4. DLSS at native resolution
     na::dlss::EvalDesc e{};
     e.color = g.color_in.Get();
@@ -2398,7 +2441,226 @@ int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
     return -1;
 }
 
+// ---- Render-small: PresentUpscale's own ring and the bilinear stretch ---------------------
+// Its own allocators and fence (on the present queue), separate from J2's scene ring, so a
+// present never waits on, or reuses, a scene slot. The stretch is the picture for frames
+// without this frame's depth + motion: never a blank or render-size corner.
+struct SmallRing {
+    ComPtr<ID3D12Device> device;
+    ComPtr<ID3D12CommandQueue> queue;
+    ComPtr<ID3D12CommandAllocator> alloc[kRing];
+    UINT64 value[kRing] = {};
+    ComPtr<ID3D12GraphicsCommandList> list;
+    ComPtr<ID3D12Fence> fence;
+    UINT64 next = 1;
+    uint32_t slot = 0;
+    ComPtr<ID3D12RootSignature> root;
+    ComPtr<ID3D12PipelineState> pso;
+    ComPtr<ID3D12DescriptorHeap> heap; // kRing x (SRV, UAV)
+    UINT inc = 0;
+    bool tried = false, ok = false;
+} g_small;
+constexpr char kStretchHlsl[] = R"(
+Texture2D<float4> t_in : register(t0);
+RWTexture2D<float4> u_out : register(u0);
+SamplerState s_lin : register(s0);
+cbuffer C : register(b0) { uint ow; uint oh; float rx; float ry; };
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= ow || id.y >= oh) return;
+    u_out[id.xy] = t_in.SampleLevel(s_lin, (float2(id.xy) + 0.5) * float2(rx, ry), 0);
+})";
+bool small_init(ID3D12CommandQueue* q)
+{
+    if (g_small.tried) return g_small.ok && g_small.queue.Get() == q;
+    g_small.tried = true;
+    if (FAILED(q->GetDevice(IID_PPV_ARGS(&g_small.device)))) return false;
+    ID3D12Device* dev = g_small.device.Get();
+    g_small.queue = q;
+    const D3D12_COMMAND_LIST_TYPE type = q->GetDesc().Type;
+    for (auto& a : g_small.alloc)
+        if (FAILED(dev->CreateCommandAllocator(type, IID_PPV_ARGS(&a)))) return false;
+    if (FAILED(dev->CreateCommandList(0, type, g_small.alloc[0].Get(), nullptr, IID_PPV_ARGS(&g_small.list)))) return false;
+    g_small.list->Close();
+    g_small.list->SetName(L"NeuralAlias render-small upscale");
+    if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_small.fence)))) return false;
+    D3D12_DESCRIPTOR_RANGE r[2]{};
+    r[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    r[0].NumDescriptors = 1;
+    r[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    r[1].NumDescriptors = 1;
+    r[1].OffsetInDescriptorsFromTableStart = 1;
+    D3D12_ROOT_PARAMETER p[2]{};
+    p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    p[0].DescriptorTable.NumDescriptorRanges = 2;
+    p[0].DescriptorTable.pDescriptorRanges = r;
+    p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    p[1].Constants.Num32BitValues = 4;
+    D3D12_STATIC_SAMPLER_DESC ss{};
+    ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    ss.MaxLOD = D3D12_FLOAT32_MAX;
+    ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rd{2, p, 1, &ss, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ComPtr<ID3DBlob> sig, err, code;
+    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
+        FAILED(dev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&g_small.root))))
+        return false;
+    if (FAILED(D3DCompile(kStretchHlsl, sizeof(kStretchHlsl) - 1, "j2_small_stretch.hlsl", nullptr, nullptr, "main", "cs_5_0",
+                          D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err)))
+        return false;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = g_small.root.Get();
+    pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+    if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_small.pso)))) return false;
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRing * 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_small.heap)))) return false;
+    g_small.inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    g_small.ok = true;
+    return true;
+}
+// `in` readable (NON_PIXEL_SHADER_RESOURCE), `out` in UNORDERED_ACCESS.
+void small_stretch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Resource* out, uint32_t ow, uint32_t oh, uint32_t slot)
+{
+    ID3D12Device* dev = g_small.device.Get();
+    D3D12_CPU_DESCRIPTOR_HANDLE c = g_small.heap->GetCPUDescriptorHandleForHeapStart();
+    c.ptr += static_cast<SIZE_T>(slot) * 2 * g_small.inc;
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = typed(in->GetDesc().Format);
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Texture2D.MipLevels = 1;
+    dev->CreateShaderResourceView(in, &sv, c);
+    c.ptr += g_small.inc;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+    uv.Format = typed(out->GetDesc().Format);
+    uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    dev->CreateUnorderedAccessView(out, nullptr, &uv, c);
+    D3D12_GPU_DESCRIPTOR_HANDLE gh = g_small.heap->GetGPUDescriptorHandleForHeapStart();
+    gh.ptr += static_cast<UINT64>(slot) * 2 * g_small.inc;
+    ID3D12DescriptorHeap* heaps[] = {g_small.heap.Get()};
+    l->SetDescriptorHeaps(1, heaps);
+    l->SetComputeRootSignature(g_small.root.Get());
+    l->SetPipelineState(g_small.pso.Get());
+    l->SetComputeRootDescriptorTable(0, gh);
+    const float rx = 1.0f / static_cast<float>(ow), ry = 1.0f / static_cast<float>(oh);
+    uint32_t k[4] = {ow, oh, 0, 0};
+    std::memcpy(&k[2], &rx, 4);
+    std::memcpy(&k[3], &ry, 4);
+    l->SetComputeRoot32BitConstants(1, 4, k, 0);
+    l->Dispatch((ow + 7) / 8, (oh + 7) / 8, 1);
+}
+void small_note(const char* t) { std::snprintf(g.stats.small_note, sizeof g.stats.small_note, "%s", t); }
+
 } // namespace
+
+void SetRenderSmall(bool on) { g_render_small.store(on); }
+bool RenderSmall() { return g_render_small.load(); }
+
+bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t rw, uint32_t rh,
+                    ID3D12Resource* out, uint32_t ow, uint32_t oh, bool hdr, void*)
+{
+    if (!queue || !frame || !out || !rw || !rh || !ow || !oh) return false;
+    const ExecuteFn forward = g_forward.load(std::memory_order_relaxed);
+    const na::observe::HostWorkScope host; // our list is never observed as the game's
+    std::lock_guard<std::mutex> lock(g.m);
+    if (!forward) { ++g.stats.small_failed; small_note("Render-small: no game submission seen yet."); return false; }
+    if (!small_init(queue)) { ++g.stats.small_failed; small_note("Render-small could not set up its upscale pass on this queue."); return false; }
+    g.stats.small_rw = rw; g.stats.small_rh = rh; g.stats.small_ow = ow; g.stats.small_oh = oh;
+    const uint32_t si = g_small.slot;
+    if (g_small.value[si] && g_small.fence->GetCompletedValue() < g_small.value[si]) {
+        // Six presents behind: never wait on the game's thread; the presenter keeps its old picture.
+        ++g.stats.small_failed;
+        small_note("Render-small: the upscale ring is still busy (GPU six frames behind).");
+        return false;
+    }
+    ID3D12GraphicsCommandList* l = g_small.list.Get();
+    if (FAILED(g_small.alloc[si]->Reset()) || FAILED(l->Reset(g_small.alloc[si].Get(), nullptr))) {
+        ++g.stats.small_failed; small_note("Render-small: could not reset its list."); return false;
+    }
+    constexpr UINT PRESENT = D3D12_RESOURCE_STATE_PRESENT, NPSR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                   UAV = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    std::vector<D3D12_RESOURCE_BARRIER> b;
+    add(b, frame, PRESENT, NPSR);
+    add(b, out, NPSR, UAV);
+    // DLSS needs this frame's depth + motion, recorded on this same queue (so the GPU runs them
+    // first), at the picture's size, and a DLSS instance on this device.
+    const auto& d = g.def;
+    const bool fresh = d.valid && d.frame + 1 == g.frame && d.w == rw && d.h == rh;
+    const bool can_dlss = fresh && forward && g.dlss_ready && g.device && g.device.Get() == g_small.device.Get() &&
+                          g.queue.Get() == queue && g.depth32 && g.motion && g.paused.load() == false;
+    bool dlss = false;
+    if (can_dlss) {
+        add(b, g.motion.Get(), UAV, NPSR);
+        flush(l, b);
+        na::dlss::EvalDesc e{};
+        e.color = frame;
+        e.depth = g.depth32.Get();
+        e.motion = g.motion.Get();
+        e.output = out;
+        e.render_w = e.max_render_w = rw;
+        e.render_h = e.max_render_h = rh;
+        e.out_w = ow;
+        e.out_h = oh;
+        e.quality = na::dlss::QualityForScale(rw, rh, ow, oh);
+        e.preset = na::settings::Get().j2_preset.load();
+        e.view_id = kSmallViewId;
+        e.jitter_x = d.jx;
+        e.jitter_y = d.jy;
+        // History continues only from the previous frame's evaluation at the same sizes.
+        e.reset = d.reset || g.small_last == 0 || d.frame != g.small_last + 1 ||
+                  g.small_ow != ow || g.small_oh != oh || g.small_rw != rw || g.small_rh != rh;
+        e.hdr = hdr;
+        e.depth_inverted = d.reversed;
+        e.auto_exposure = true;
+        dlss = na::dlss::Evaluate(l, e);
+        add(b, g.motion.Get(), NPSR, UAV);
+        if (dlss) {
+            g.small_last = d.frame;
+            g.small_ow = ow; g.small_oh = oh; g.small_rw = rw; g.small_rh = rh;
+        } else {
+            ++g.stats.small_dlss_failed;
+            char why[128];
+            std::snprintf(why, sizeof why, "Render-small: DLSS refused the frame (%s); stretched.",
+                          na::dlss::GetStats().reason[0] ? na::dlss::GetStats().reason : "no reason given");
+            small_note(why);
+        }
+        g.def.valid = false; // used (or refused) once
+    } else {
+        small_note(!d.valid ? "Render-small: no depth and motion yet for this frame; stretched."
+                   : d.frame + 1 != g.frame ? "Render-small: this frame's scene was not captured; stretched."
+                   : (d.w != rw || d.h != rh) ? "Render-small: the scene is not the picture's size; stretched."
+                   : g.queue.Get() != queue ? "Render-small: the scene was drawn on another queue; stretched."
+                   : "Render-small: DLSS is not ready; stretched.");
+    }
+    if (!dlss) {
+        flush(l, b);
+        small_stretch(l, frame, out, ow, oh, si);
+        g.small_last = 0; // DLSS history is no longer the previous picture
+    }
+    b.push_back(uav_barrier(out));
+    add(b, frame, NPSR, PRESENT);
+    add(b, out, UAV, PRESENT);
+    flush(l, b);
+    if (FAILED(l->Close())) {
+        // The list may hold transitions already recorded: never submit it. The presenter
+        // keeps its old picture; the frame/out states are unchanged because nothing ran.
+        ++g.stats.small_failed;
+        small_note("Render-small: its upscale list was rejected.");
+        g.latched = true;
+        return false;
+    }
+    ID3D12CommandList* lists[] = {l};
+    if (dlss) na::dlss::BeforeExecute(queue, 1, lists);
+    forward(queue, 1, lists); // the original entry point: the host's hook would re-enter J2 under g.m
+    if (dlss) na::dlss::OnExecuted(queue, 1, lists);
+    g_small.value[si] = g_small.next++;
+    queue->Signal(g_small.fence.Get(), g_small.value[si]);
+    g_small.slot = (si + 1) % kRing;
+    if (dlss) { ++g.stats.small_dlss; if (g.stats.small_note[0] && std::strstr(g.stats.small_note, "stretched")) g.stats.small_note[0] = 0; }
+    else ++g.stats.small_stretched;
+    return true;
+}
 
 void SetEnabled(bool on)
 {
@@ -2687,6 +2949,7 @@ void OnPresent(ID3D12CommandQueue* queue)
 
 void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists, ExecuteFn forward)
 {
+    if (forward) g_forward.store(forward, std::memory_order_relaxed);
     if (!na::settings::EffectsReady() || !g.enabled.load(std::memory_order_relaxed) || g.paused.load(std::memory_order_relaxed) || !queue || !lists || !count) {
         forward(queue, count, lists);
         return;

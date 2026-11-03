@@ -7,6 +7,8 @@
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 #include "host_dx12/sl_boundary/sl_boundary.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/overlay/presenter.hpp"
+#include <cmath>
 #include "host_dx12/j2/j2_flow.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/upscalers/ffx_intercept.hpp"
@@ -94,7 +96,13 @@ void ActivateSavedRequests(const wchar_t* ini){
     slb::SetFgRequest(safe?slb::FgRequest{}:slb::FgRequest{static_cast<slb::FgMode>(st.native_fg_mode.load()),st.native_fg_frames.load()});
     j2::SetPaused(safe);
     if(safe)j2::flow::SetEnabled(false);
-    if(j2::Configured())observe::SetSamplerMipBias(static_cast<float>(st.j2_mip_bias_x100.load())/100.f);
+    if(j2::Configured()){
+        float bias=static_cast<float>(st.j2_mip_bias_x100.load())/100.f;
+        // Render-small: textures are sampled at render size; DLSS guidance adds log2(render/output).
+        const float scale=present::RenderScale();
+        if(j2::RenderSmall() && scale>0.f && scale<1.f && bias!=0.f)bias+=std::log2(scale);
+        observe::SetSamplerMipBias(bias);
+    }
     if(GetPrivateProfileIntW(L"fsr",L"enabled",1,ini)==1)
         ffx::SetMode(!safe && GetPrivateProfileIntW(L"fsr",L"replace",0,ini)==1?ffx::Mode::ReplaceWithDlss:ffx::Mode::Observe);
     if(GetPrivateProfileIntW(L"xess",L"enabled",1,ini)==1)

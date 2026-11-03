@@ -65,6 +65,29 @@ UINT LatencyFloor(IDXGISwapChain* sc);
 void SetEnabled(bool enabled);
 bool Enabled();
 
+// P4-4 render-small ("native present", plan COMMS 4e30a94/f0de8b4). With a scale below 1
+// the game's proxies are render size (round(real * scale)) while the real chain stays at
+// the window's size, and every finished render-size picture goes through `upscale` into the
+// native slot texture before the menu, Frame Generation and presentation see it. The scale
+// applies when proxies are next created (the first GetBuffer, or after a resize); a chain
+// whose format cannot be written by a shader stays unscaled. 1 = off (default).
+// `frame` is in PRESENT state and must be returned in it; `out` (render-target and UAV
+// capable) arrives in NON_PIXEL_SHADER_RESOURCE and must be left in PRESENT (COMMON) state
+// when the call returns true; on false it must be left untouched (the slot keeps its old picture).
+using UpscaleFn = bool (*)(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t rw, uint32_t rh,
+                           ID3D12Resource* out, uint32_t ow, uint32_t oh, bool hdr, void* user);
+void SetRenderScale(float scale, UpscaleFn upscale, void* user);
+float RenderScale();
+// True while the served chain's proxies are render size (J2 then defers DLSS to Present).
+bool Scaling();
+// The buffer size the game is served for `sc` (render size while scaled). false = this
+// chain has no proxies from us.
+bool GameBufferSize(IDXGISwapChain* sc, UINT* w, UINT* h);
+// A resize while scaled: the game asks for the size it believes; the real chain must
+// follow the window instead. Rewrites w/h to 0 (DXGI: the window's client size) when
+// scaling is on. Call before the original ResizeBuffers / ResizeBuffers1.
+void TranslateResize(IDXGISwapChain* sc, UINT* w, UINT* h);
+
 // Overlay detours call these first. They return true when the presenter
 // handled the call (proxy mode active for `sc`); otherwise the detour
 // forwards to the original.
@@ -131,6 +154,8 @@ struct Stats {
     float shown_fps;           // rate on the real chain
     float display_hz;          // refresh rate of the display the game is on (0 unknown)
     float fg_ms, fg_avg_ms;    // GPU time of the copy + generation work per real frame
+    uint32_t scaled_w, scaled_h, native_w, native_h; // render-small: proxy and real sizes (0 = not scaled)
+    uint64_t upscaled, upscale_failed;               // render-small: pictures upscaled / left with the old picture
     char reason[112];
 };
 Stats GetStats();

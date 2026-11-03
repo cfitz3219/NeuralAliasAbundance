@@ -13,6 +13,7 @@
 #include "host_dx12/j2/j2_flow.hpp"
 #include "host_dx12/scale/live_driver.hpp"
 #include "host_dx12/scale/auto_scene.hpp"
+#include "host_dx12/scale/settings_read_hook.hpp"
 
 #include <atomic>
 #include <cstdlib>
@@ -237,11 +238,25 @@ DWORD WINAPI InitThread(LPVOID)
                        GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1);
     // P4-4 projection window ([j2] window=1): the no-slider route that windows J1's camera;
     // Layer2 stays off with it (both would change the scene's render size).
-    const bool projection_window = na::j2::Configured() && GetPrivateProfileIntW(L"j2", L"window", 0, g_ini) == 1;
+    // P4-4 render-small ([present] render_small=1, plan COMMS 4e30a94): the game renders its whole
+    // frame at render size into the presenter's proxies; J2 upscales it at Present. Needs the
+    // presenter and J2; the projection window and Layer2 stay off with it.
+    const bool render_small = na::j2::Configured() && na::present::Enabled() &&
+                              GetPrivateProfileIntW(L"present", L"render_small", 0, g_ini) == 1;
+    na::j2::SetRenderSmall(render_small);
+    if (render_small) {
+        const int mode = static_cast<int>(na::settings::Get().j2_scale_mode.load());
+        const float f = mode > 0 && mode <= 4 ? static_cast<float>(na::scale::FractionForMode(mode)) : 1.f;
+        na::present::SetRenderScale(f, &na::j2::PresentUpscale, nullptr);
+        char line[96];
+        std::snprintf(line, sizeof line, "render-small: enabled (mode %d, scale %.3f)", mode, f);
+        boot_log(line);
+    }
+    const bool projection_window = !render_small && na::j2::Configured() && GetPrivateProfileIntW(L"j2", L"window", 0, g_ini) == 1;
     na::j2::SetProjectionWindow(projection_window);
     na::j2::SetProjectionWindowScissor(GetPrivateProfileIntW(L"j2", L"window_scissor", 1, g_ini) != 0);
     if (projection_window) { na::j2::InstallProjectionWindowScissor(); boot_log("projection window: enabled"); }
-    na::scale::ConfigureAutomaticScene(!projection_window&&na::j2::Configured()&&GetPrivateProfileIntW(L"layer2",L"enabled",0,g_ini)==1);
+    na::scale::ConfigureAutomaticScene(!render_small&&!projection_window&&na::j2::Configured()&&GetPrivateProfileIntW(L"layer2",L"enabled",0,g_ini)==1);
     if (na::j2::Configured()) na::overlay::RegisterLiveDlaaMenu();
     na::j2::flow::SetEnabled(GetPrivateProfileIntW(L"j2",L"flow",0,g_ini)==1);
     if(na::settings::SafeStart())na::j2::SetPaused(true);

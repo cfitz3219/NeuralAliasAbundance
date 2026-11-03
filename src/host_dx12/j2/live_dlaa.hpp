@@ -57,6 +57,17 @@ bool Jitter();
 // targets; DLSS reads that corner and writes the full picture back at the DLAA point.
 // Viewports, screen-size constants and every resource stay native. Engages after DLAA
 // has run on 30 frames in a row; disengages on mode 0, a size change or repeated misses.
+// P4-4 render-small (native present, COMMS 4e30a94/f0de8b4): the game renders its WHOLE frame
+// at render size into the presenter's proxies, and the presenter shows it at the window's size.
+// J2 keeps jittering the camera and builds the frame's depth and motion at its usual point,
+// but leaves the scene colour as drawn; DLSS runs at Present on the finished render-size
+// picture (PresentUpscale, the presenter's UpscaleFn). A frame without this frame's depth and
+// motion (J2 not running yet, a missed scene, another queue) is stretched bilinearly instead,
+// so a picture is always shown and the mode never switches itself off. Off by default.
+void SetRenderSmall(bool on);
+bool RenderSmall();
+bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t rw, uint32_t rh,
+                    ID3D12Resource* out, uint32_t ow, uint32_t oh, bool hdr, void* user);
 void SetProjectionWindow(bool on);
 void SetProjectionWindowScissor(bool on); // [j2] window_scissor: clip scene draws to the corner (GPU cost), default on
 bool ProjectionWindow();
@@ -260,6 +271,11 @@ struct Stats {
     uint64_t window_repeat_fallbacks = 0, window_repeat_stale = 0, window_derived_skipped = 0;
     uint64_t jitter_blocks_dropped = 0, jitter_blocks_scanned = 0, jitter_slot_blocks = 0;
     uint64_t jitter_blocks_probed_out = 0; // blocks skipped after the 64-byte probe
+    // Render-small: frames whose depth + motion were kept for Present; pictures DLSS upscaled at
+    // Present / stretched (no fresh depth + motion) / not produced (the presenter kept its old one).
+    uint64_t small_deferred = 0, small_dlss = 0, small_stretched = 0, small_failed = 0, small_dlss_failed = 0;
+    uint32_t small_rw = 0, small_rh = 0, small_ow = 0, small_oh = 0;
+    char small_note[128] = {};
     uint64_t window_derived_forward = 0, window_derived_inverse = 0; // camera-derived matrices rebased (see window_derived)
     char window_derived_note[160] = {};
     char window_note[120] = {};
