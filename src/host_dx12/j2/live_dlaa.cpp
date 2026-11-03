@@ -3090,11 +3090,39 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         g_small.prev_valid = false; // a gap: the next comparison would be against an old frame
         g_small.hud_fresh = true;   // and the evidence describes an old picture
     }
+    // Evidence capture (F8 / "Capture"): render-small had none, so a flicker in the upscaled
+    // picture could not be measured (Cort's e7acb94 capture came out empty). Colour = DLSS's
+    // input (the proxy, scene only), output = the final picture with the native HUD on it.
+    uint32_t capture = 0;
+    if (dlss && na::capture::j2::Armed()) {
+        b.push_back(uav_barrier(out));
+        flush(l, b);
+        na::capture::j2::Planes cp;
+        cp.color = frame;                  // NPSR
+        cp.depth = g.depth32.Get();        // NPSR
+        cp.motion = g.motion.Get();        cp.motion_state = UAV;
+        cp.output = out;                   // UAV
+        na::capture::j2::Identity ci;
+        ci.present_ordinal = g.frame;
+        ci.submission = g.stats.submissions;
+        ci.view_id = static_cast<uint32_t>(kSmallViewId);
+        ci.route = static_cast<uint32_t>(na::j2::Route::Between);
+        ci.width = rw;
+        ci.height = rh;
+        ci.color_format = static_cast<uint32_t>(ff);
+        ci.jitter_x = d.jx;
+        ci.jitter_y = d.jy;
+        ci.reset = (d.reset || g.small_last == 0) ? 1u : 0u;
+        ci.preset = na::settings::Get().j2_preset.load();
+        ci.sharpness = na::settings::Get().j2_sharpness.load(std::memory_order_relaxed);
+        capture = na::capture::j2::RecordEvaluation(l, cp, ci);
+    }
     b.push_back(uav_barrier(out));
     add(b, frame, NPSR, PRESENT);
     add(b, out, UAV, PRESENT);
     flush(l, b);
     if (FAILED(l->Close())) {
+        na::capture::j2::Discard(capture, false);
         // The list may hold transitions already recorded: never submit it. The presenter
         // keeps its old picture; the frame/out states are unchanged because nothing ran.
         ++g.stats.small_failed;
@@ -3106,6 +3134,7 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
     if (dlss) na::dlss::BeforeExecute(queue, 1, lists);
     forward(queue, 1, lists); // the original entry point: the host's hook would re-enter J2 under g.m
     if (dlss) na::dlss::OnExecuted(queue, 1, lists);
+    if (capture) na::capture::j2::Submitted(capture, queue, g.stats.submissions);
     g_small.value[si] = g_small.next++;
     queue->Signal(g_small.fence.Get(), g_small.value[si]);
     g_small.slot = (si + 1) % kRing;
