@@ -74,3 +74,29 @@ https://learn.microsoft.com/en-us/windows/win32/direct3d12/dynamic-indexing-usin
 Local receipts/scripts: C:/Users/Cort/NeuralAliasAbundance/local/se5-delivery-fix-20261103.
 Negative-control logs retain the original minimal96-entry/zero-base case; final
 regressions include the extended copy/offset/unbounded cases described above.
+
+## Final automated qualification and package
+
+Runtimea7fce1f87dd56b0b8c55abc9a45c1c97a174ec2e: full rebuilt Release and
+173registered CTest cases complete in237.52s,168pass/5skip/0fail. Both expanded
+finite/unbounded cases deliver17/17 checked pictures with23/24evaluations,
+0Close recoveries and0late/camera/state errors. Existing pan, optional-tail,
+split-consumer, raster, real-NGX, observer, overlay and input cases pass. Skips
+remain the opt-in NR probe, three unsupported16xMSAA cases and upscaler-jitter.
+Detailed per-case output is preserved from CTest's LastTest.log without reruns.
+
+Documents/NA-SE5-camfix-a7fce1f is published through the usual
+NA-se5-camfix-update/results/rollback CMDs. DLL SHA256:
+57A568AA2E7FF65F1AE7CFB488B023903C9D052FBEA101FBA40EE4885F9D5421.
+The same reversible installer is reused; result summaries retain profile and
+wide-read counters and explicitly distinguish evaluation from delivery.
+Temporary-folder WindowsPowerShell019->candidate->019->original roundtrip
+passes, including raster mode, retained sharpness and native-file preservation.
+All payload hashes pass. Launchers were backed up before-a7fce1f-20261103-011524;
+019known-good,6fbaseline and all earlier packages remain available.
+
+The actual installed game DLL stays53295cb/41C3805A... before and after this
+publication. No game launch, control or deployment occurred. Cort performs the
+live picture test; this receipt does not promote the fixture to a game pass.
+PR81 contains the correction and updated scope/validation description; no
+additional review cycle is required by this delivery.
