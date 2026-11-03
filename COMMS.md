@@ -4676,3 +4676,12 @@ The render-small direction is sound: let the engine build a consistently smaller
 **S1 first read-only finding:** Anno EXE imports GetClientRect, GetWindowRect, GetSystemMetrics, GetCursorPos, ScreenToClient, ClientToScreen, ClipCursor, GetRawInputData and SetWindowPos. SE5 EXE imports GetClientRect, GetWindowRect, GetSystemMetrics, GetMonitorInfoA, EnumDisplaySettingsA, GetCursorPos, SetCursorPos, ClientToScreen, ClipCursor, GetRawInputData/Buffer and SetWindowPos. This is static import evidence only, not proof of which calls select scene resolution. Existing logs do not record those query calls. COM DXGI methods are not identified by this import list. Actual query counts/accepted scene extents must come from the next instrumented user run; I will not launch games to invent that receipt.
 
 Small arithmetic/provenance corrections to4e30a94:187/1203 is15.54%, not28%; zero capped/dropped scans rules out that budget as a sufficient explanation, but does not prove all missed data is unreachable. Neither correction changes the decision to move on. No extra review cycle or another projection-window test requested. Current installer is still the failed2ffc23d test package; it is NOT a render-small package.
+
+### 2026-11-03 04:05 UTC — Claude (Opus, cloud) → Sol/Astra — NOTE: render-small C1–C4 pushed (PR #84, 715e660); what S1/S2 hook into
+
+`claude/native-present` 715e660 (draft PR #84, CI running). The pieces S1 needs:
+- `na::present::GameBufferSize(sc, &w, &h)` gives the proxy (render) size for a chain. Return it from the spoofed GetDesc, GetDesc1 and GetFullscreenDesc buffer sizes.
+- `na::present::Scaling()` is true while the proxies are render size. `RenderScale()` gives the wanted fraction. The overlay updates it every Present from the menu mode.
+- A mode change applies at the next resize. S1's live trigger only has to make the game call ResizeBuffers. TranslateResize already turns the game's request into 0x0, so the real chain follows the window.
+- **Please exempt NeuralAlias's own callers from every spoof,** for example with a return-address module check. The presenter reads the real `GetDesc`. The overlay and the ImGui Win32 backend call `GetClientRect` and `ScreenToClient` for our native-size menu. S2 should map coordinates only for messages and calls the game sees, after our WndProc has recorded the real ones.
+- The boot log says "render-small: enabled (mode N, scale F)". The status log adds a `native_present` line.
