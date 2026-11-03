@@ -31,7 +31,7 @@ class PassMap {
 public:
     static constexpr uint32_t kTableSpan = 16;       // descriptors read from each bound table's start
     static constexpr size_t kMaxDescriptors = 1u << 20;
-    static constexpr size_t kMaxRecordings = 1024, kMaxPassesPerRecording = 2048, kMaxIds = 24;
+    static constexpr size_t kMaxRecordings = 1024, kMaxGenerations = 4, kMaxPassesPerRecording = 2048, kMaxIds = 24;
 
     enum class Kind { Raster, Compute, Copy, Resolve, Clear };
     struct Pass {
@@ -51,7 +51,11 @@ public:
         skip_ = skip_presents;
         capturing_ = done_ = false;
         frame_.clear();
-        recordings_.clear();
+        missing_.clear();
+        executed_lists_ = unrecorded_lists_ = incomplete_lists_ = 0;
+        truncated_ = false;
+        // Rearming a frame window does not invalidate executable cached lists.
+        // Their generation is the identity; Reset is not guaranteed each frame.
     }
     bool Armed() const { return armed_; }
     bool Done() const { return done_; }
@@ -118,7 +122,7 @@ public:
                                  (e.op == NA_OP_EXECUTE_INDIRECT && r.targets.empty()); // indirect: guess by targets
             Pass* p = r.passes.empty() ? nullptr : &r.passes.back();
             const Kind k = compute ? Kind::Compute : Kind::Raster;
-            const bool same = p && p->kind == k && (compute ? p->pipeline == r.pipeline
+            const bool same = p && p->kind == k && p->pipeline == r.pipeline && (compute ? true
                                                             : p->targets == r.targets && p->vp_w == r.vp_w && p->vp_h == r.vp_h);
             if (!same) {
                 if (!push(r)) return;
@@ -140,7 +144,7 @@ public:
                     auto it = desc_.find(key(t.heap, t.slot + s));
                     if (it == desc_.end() || !it->second.resource || it->second.resource == NA_UNKNOWN_U64) continue;
                     if (it->second.kind == NA_DESC_SRV) { add(p->reads, it->second.resource, p); p->approx_reads = true; }
-                    else if (it->second.kind == NA_DESC_UAV) add(p->writes, it->second.resource, p);
+                    else if (it->second.kind == NA_DESC_UAV) { add(p->writes, it->second.resource, p); p->approx_reads = true; }
                 }
             }
             break;
@@ -176,9 +180,14 @@ public:
         for (uint32_t i = 0; i < n; ++i) {
             auto it = recordings_.find(refs[i].list);
             ++executed_lists_;
-            if (it == recordings_.end() || it->second.gen != refs[i].recording_generation) { ++unrecorded_lists_; continue; }
-            if (it->second.incomplete) ++incomplete_lists_;
-            for (const Pass& p : it->second.passes) frame_.push_back({refs[i].list, p});
+            if (it == recordings_.end() || !it->second.count(refs[i].recording_generation)) {
+                ++unrecorded_lists_;
+                if (missing_.size() < kMaxRecordings) missing_.push_back(refs[i]);
+                continue;
+            }
+            const auto& r = it->second.at(refs[i].recording_generation);
+            if (r.incomplete) ++incomplete_lists_;
+            for (const Pass& p : r.passes) frame_.push_back({refs[i].list, p});
         }
     }
     void OnPresent()
@@ -199,6 +208,12 @@ public:
                       frame_.size(), executed_lists_, unrecorded_lists_, incomplete_lists_, desc_overflow_ ? ", descriptor map full" : "",
                       truncated_ ? ", passes truncated" : "");
         s += line;
+        for (const auto& ref : missing_) {
+            std::snprintf(line, sizeof line, "stage_m: unrecorded list %llu generation %llu (not an empty list)\n",
+                          (unsigned long long)ref.list, (unsigned long long)ref.recording_generation);
+            s += line;
+        }
+        s += "stage_m: ordering is per-thread event delivery; cross-thread execution order is not established by this summary\n";
         std::set<uint64_t> reduced_written; // resources written by a pass at a reduced size
         int stretch = -1;
         for (size_t i = 0; i < frame_.size(); ++i) {
@@ -208,13 +223,21 @@ public:
             const bool full = ow && tw >= ow && th >= oh && (!p.vp_w || p.vp_w >= ow * 97 / 100);
             bool reads_reduced = false;
             for (uint64_t r : p.reads) reads_reduced = reads_reduced || reduced_written.count(r);
-            const bool cand = full && reads_reduced && stretch < 0 && (p.kind == Kind::Raster || p.kind == Kind::Compute || p.kind == Kind::Copy);
+            // A native-resolution picture plus half-size bloom/other effects is
+            // a composite, not evidence that the main scene was rendered small.
+            bool reads_full_color = false;
+            for (uint64_t r : p.reads) {
+                const auto it = res_.find(r);
+                reads_full_color |= it != res_.end() && it->second.w == ow && it->second.h == oh && color_format(it->second.format);
+            }
+            const bool mixed = full && reads_reduced && reads_full_color;
+            const bool cand = full && reads_reduced && !mixed && stretch < 0 && (p.kind == Kind::Raster || p.kind == Kind::Compute || p.kind == Kind::Copy);
             if (cand) stretch = static_cast<int>(i);
             if (reduced) for (uint64_t w : p.writes) reduced_written.insert(w);
             std::snprintf(line, sizeof line, "#%zu list %llu %s x%u%s target %s viewport %ux%u%s%s\n", i, (unsigned long long)frame_[i].list,
                           kind_name(p.kind), p.ops, p.pipeline ? (" pso " + std::to_string(p.pipeline)).c_str() : "",
                           ids(p.targets).c_str(), p.vp_w, p.vp_h, reduced ? " REDUCED" : full ? " FULL" : "",
-                          cand ? " <- STRETCH CANDIDATE" : "");
+                          cand ? " <- STRETCH CANDIDATE" : mixed ? " <- MIXED-SIZE COMPOSITE (full-size colour also read)" : "");
             s += line;
             s += "    reads " + ids(p.reads) + (p.approx_reads ? " (table heads, approx)" : "") + "\n";
             s += "    writes " + ids(p.writes) + (p.truncated ? " (truncated)" : "") + "\n";
@@ -225,7 +248,7 @@ public:
                           kind_name(p.kind), ids(p.writes).c_str(), ids(reduced_reads(p, reduced_written)).c_str(),
                           frame_.size() - static_cast<size_t>(stretch) - 1);
         } else {
-            std::snprintf(line, sizeof line, "stage_m: no stretch candidate (no full-size pass read a reduced-size result)%s\n",
+            std::snprintf(line, sizeof line, "stage_m: no stretch candidate (no isolated reduced-to-full picture transfer)%s\n",
                           reduced_written.empty() ? "; no reduced-size pass either: is the render scale below 100 %?" : "");
         }
         s += line;
@@ -259,14 +282,15 @@ private:
     static uint64_t key(uint64_t heap, uint32_t slot) { return (heap << 24) ^ slot; }
     Rec& rec(uint64_t list, uint64_t gen)
     {
-        // A new recording of a list replaces its previous one (bounded by lists, not by time).
+        // Worker rings do not impose an order across threads. In particular a
+        // later Reset/op can arrive before an older generation's Execute event.
+        // Keep a bounded set of exact generations, never roll one mutable Rec
+        // back and forth as events from those threads arrive.
         auto it = recordings_.find(list);
-        if (it != recordings_.end()) {
-            if (it->second.gen != gen) { it->second = Rec{}; it->second.gen = gen; }
-            return it->second;
-        }
-        if (recordings_.size() >= kMaxRecordings) { truncated_ = true; recordings_.erase(recordings_.begin()); }
-        Rec& r = recordings_[list];
+        if (it == recordings_.end() && recordings_.size() >= kMaxRecordings) { truncated_ = true; recordings_.erase(recordings_.begin()); }
+        auto& versions = recordings_[list];
+        if (!versions.count(gen) && versions.size() >= kMaxGenerations) versions.erase(versions.begin());
+        Rec& r = versions[gen];
         r.gen = gen;
         return r;
     }
@@ -281,6 +305,15 @@ private:
         if (!id || id == NA_UNKNOWN_U64 || std::find(v.begin(), v.end(), id) != v.end()) return;
         if (v.size() >= kMaxIds) { p->truncated = true; return; }
         v.push_back(id);
+    }
+    static bool color_format(uint32_t f) {
+        // DXGI colour formats used for scene/tonemap targets. Depth-family and
+        // unknown formats do not become colour merely by matching dimensions.
+        switch (f) {
+        case 2: case 6: case 10: case 11: case 16: case 24: case 26:
+        case 28: case 29: case 87: case 88: case 90: case 91: case 93: return true;
+        default: return false;
+        }
     }
     std::pair<uint32_t, uint32_t> target_size(const Pass& p) const
     {
@@ -341,8 +374,9 @@ private:
     uint32_t skip_ = 0, out_w_ = 0, out_h_ = 0, executed_lists_ = 0, unrecorded_lists_ = 0, incomplete_lists_ = 0;
     std::unordered_map<uint64_t, Res> res_;
     std::unordered_map<uint64_t, Desc> desc_;
-    std::unordered_map<uint64_t, Rec> recordings_;
+    std::unordered_map<uint64_t, std::map<uint64_t, Rec>> recordings_;
     std::vector<FramePass> frame_;
+    std::vector<na_list_ref> missing_;
 };
 
 } // namespace na::discovery

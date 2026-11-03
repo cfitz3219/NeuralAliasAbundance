@@ -17,7 +17,7 @@
 // from %LOCALAPPDATA%\NeuralAlias\NeuralAliasSL.ini.
 namespace na::settings {
 namespace {
-#define NA_PERSISTED_FIELDS(F) F(enabled) F(dlss_mode) F(follow_game_resolution) F(preset) F(rr_preset) F(text_bold) F(win_x) F(win_y) F(win_w) F(win_h) F(nr_enabled) F(nr_intensity) F(nr_structure) F(nr_tone) F(nr_skin) F(nr_paper_white) F(nr_hdr_mode) F(nr_model) F(motion_enabled) F(motion_grid) F(motion_perf) F(motion_downscale) F(j2_sharpness) F(j2_scale_mode) F(j2_preset) F(j2_mip_bias_x100) F(reflex_mode) F(fg_enabled) F(fg_mode) F(fg_preset) F(fg_multiplier) F(fg_target_fps) F(fg_frozen_at) F(fg_profile_override) F(native_fg_mode) F(native_fg_frames)
+#define NA_PERSISTED_FIELDS(F) F(enabled) F(dlss_mode) F(follow_game_resolution) F(preset) F(rr_preset) F(text_bold) F(win_x) F(win_y) F(win_w) F(win_h) F(nr_enabled) F(nr_intensity) F(nr_structure) F(nr_tone) F(nr_skin) F(nr_paper_white) F(nr_hdr_mode) F(nr_model) F(motion_enabled) F(motion_grid) F(motion_perf) F(motion_downscale) F(j2_sharpness) F(j2_hud_nis) F(j2_scale_mode) F(j2_preset) F(j2_mip_bias_x100) F(reflex_mode) F(fg_enabled) F(fg_mode) F(fg_preset) F(fg_multiplier) F(fg_target_fps) F(fg_frozen_at) F(fg_profile_override) F(native_fg_mode) F(native_fg_frames)
 Settings g_settings;
 Settings g_loaded_values;
 std::atomic<bool> g_nr_user_touched{false};
@@ -99,8 +99,16 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
     else target.nr_enabled.store(nr?1u:0u);
     target.nr_intensity.store(pct(L"intensity", 100));
     {
-        const int v = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpness", 100, ini));
-        target.j2_sharpness.store(static_cast<uint32_t>(v < 0 ? 0 : (v > 150 ? 150 : v))); // 101..150 extends RCAS
+        // [j2] sharpen: the menu's 0..100 (= RCAS 0..200). Older files only have [j2] sharpness
+        // on the RCAS scale (0..150): halved, rounded up, so 150 -> 75 and 100 -> 50.
+        int v = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpen", -1, ini));
+        if (v < 0) {
+            const int old = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpness", 100, ini));
+            v = old <= 0 ? 0 : (old + 1) / 2;
+        }
+        target.j2_sharpness.store(static_cast<uint32_t>(v > 100 ? 100 : v));
+        const int hud = static_cast<int>(GetPrivateProfileIntW(L"j2", L"hud_nis", 50, ini));
+        target.j2_hud_nis.store(static_cast<uint32_t>(hud < 0 ? 0 : (hud > 100 ? 100 : hud)));
         const int fl = static_cast<int>(GetPrivateProfileIntW(L"j2", L"flow_loosen", 50, ini));
         target.j2_flow_loosen.store(static_cast<uint32_t>(fl < 0 ? 0 : (fl > 100 ? 100 : fl)));
         wchar_t mb[32] = {};
@@ -254,8 +262,11 @@ bool SaveFromWorker()
         ok &= WritePrivateProfileStringW(L"motion", kv.key, v, ini) != 0;
     }
     const auto sharpness = g_settings.j2_sharpness.load();
-    swprintf_s(v, L"%u", sharpness > 150 ? 150 : sharpness);
-    ok &= WritePrivateProfileStringW(L"j2", L"sharpness", v, ini) != 0;
+    swprintf_s(v, L"%u", sharpness > 100 ? 100 : sharpness);
+    ok &= WritePrivateProfileStringW(L"j2", L"sharpen", v, ini) != 0;
+    WritePrivateProfileStringW(L"j2", L"sharpness", nullptr, ini); // the old RCAS-scale key
+    swprintf_s(v, L"%u", (std::min)(g_settings.j2_hud_nis.load(), 100u));
+    ok &= WritePrivateProfileStringW(L"j2", L"hud_nis", v, ini) != 0;
     swprintf_s(v, L"%u", g_settings.j2_flow_loosen.load() > 100 ? 100u : g_settings.j2_flow_loosen.load());
     ok &= WritePrivateProfileStringW(L"j2", L"flow_loosen", v, ini) != 0;
     {

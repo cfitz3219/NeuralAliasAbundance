@@ -9,8 +9,13 @@
 #include "host_dx12/host_boot/host_boot.hpp"
 #include "host_dx12/host_boot/session.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/j2/native_hud.hpp"
+#include "host_dx12/native_present/size_spoof.hpp"
+#include "host_dx12/j2/projection_window.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
 #include "host_dx12/scale/live_driver.hpp"
+#include "host_dx12/scale/auto_scene.hpp"
+#include "host_dx12/scale/settings_read_hook.hpp"
 
 #include <atomic>
 #include <cstdlib>
@@ -233,6 +238,50 @@ DWORD WINAPI InitThread(LPVOID)
     // J2 live DLAA (needs the producers and the discovery adapter): off unless [j2] enabled=1.
     na::j2::SetEnabled(GetPrivateProfileIntW(L"j2", L"enabled", 0, g_ini) == 1 &&
                        GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1);
+    // P4-4 projection window ([j2] window=1): the no-slider route that windows J1's camera;
+    // Layer2 stays off with it (both would change the scene's render size).
+    // P4-4 render-small ([present] render_small=1, plan COMMS 4e30a94): the game renders its whole
+    // frame at render size into the presenter's proxies; J2 upscales it at Present. Needs the
+    // presenter and J2; the projection window and Layer2 stay off with it.
+    const bool small_asked = GetPrivateProfileIntW(L"present", L"render_small", 0, g_ini) == 1;
+    // Render-small needs the presenter, which Route A normally switches on. A game with
+    // [route_a] enabled=0 (Anno) still gets it here; [present] proxy=0 keeps it off.
+    if (small_asked && !route_a && na::j2::Configured() &&
+        GetPrivateProfileIntW(L"present", L"proxy", 1, g_ini) == 1)
+        na::present::SetEnabled(true);
+    const bool render_small = small_asked && na::j2::Configured() && na::present::Enabled();
+    if (small_asked && !render_small)
+        boot_log(!na::j2::Configured() ? "render-small: requested but OFF ([j2] enabled=1 and [observe] producers=1 needed)"
+                                       : "render-small: requested but OFF ([present] proxy=0)");
+    na::j2::SetRenderSmall(render_small);
+    if (render_small) {
+        boot_log(na::native_present::InstallSizeHooks() ? "render-small: size hooks installed" : "render-small: size hooks FAILED");
+        // Native-resolution HUD (Sol's plan): the game's HUD draws go to native-size layers and
+        // DLSS gets the scene only. [present] native_hud=0 keeps the HUD in the proxy as before.
+        if (GetPrivateProfileIntW(L"present", L"native_hud", 1, g_ini) == 1) {
+            na::j2::native_hud::Install();
+            na::j2::native_hud::SetCoverRule(GetPrivateProfileIntW(L"present", L"hud_cover", 0, g_ini) == 1);
+            boot_log("render-small: native-resolution HUD on");
+        } else boot_log("render-small: native-resolution HUD off ([present] native_hud=0)");
+        na::j2::SetHudMaskEnabled(GetPrivateProfileIntW(L"present", L"hud_mask", 0, g_ini) == 1);
+        // Ultra Performance is not offered with render-small (the HUD would be drawn at 33%).
+        if (na::settings::Get().j2_scale_mode.load() > 3) na::settings::Get().j2_scale_mode.store(3);
+        const int small_mode = static_cast<int>(na::settings::Get().j2_scale_mode.load());
+        const float small_f = small_mode > 0 && small_mode <= 4 ? static_cast<float>(na::scale::FractionForMode(small_mode)) : 1.f;
+        // Comparison mode: DLAA also runs at Present (full-size proxies), not inside the frame.
+        const bool present_dlaa = GetPrivateProfileIntW(L"present", L"present_dlaa", 0, g_ini) == 1;
+        na::present::SetPresentDlaa(present_dlaa);
+        if (present_dlaa) boot_log("render-small: DLAA runs at Present too ([present] present_dlaa=1)");
+        na::present::SetRenderScale(small_f, &na::j2::PresentUpscale, nullptr);
+        char small_line[96];
+        std::snprintf(small_line, sizeof small_line, "render-small: enabled (mode %d, scale %.3f)", small_mode, small_f);
+        boot_log(small_line);
+    }
+    const bool projection_window = !render_small && na::j2::Configured() && GetPrivateProfileIntW(L"j2", L"window", 0, g_ini) == 1;
+    na::j2::SetProjectionWindow(projection_window);
+    na::j2::SetProjectionWindowScissor(GetPrivateProfileIntW(L"j2", L"window_scissor", 1, g_ini) != 0);
+    if (projection_window) { na::j2::InstallProjectionWindowScissor(); boot_log("projection window: enabled"); }
+    na::scale::ConfigureAutomaticScene(!render_small&&!projection_window&&na::j2::Configured()&&GetPrivateProfileIntW(L"layer2",L"enabled",0,g_ini)==1);
     if (na::j2::Configured()) na::overlay::RegisterLiveDlaaMenu();
     na::j2::flow::SetEnabled(GetPrivateProfileIntW(L"j2",L"flow",0,g_ini)==1);
     if(na::settings::SafeStart())na::j2::SetPaused(true);

@@ -22,8 +22,10 @@
 #include <imgui.h>
 
 #include "host_dx12/capture/frame_capture.hpp"
+#include "host_dx12/capture/capture_session.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/fg/frame_gen.hpp"
+#include "host_dx12/j2/native_hud.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
 #include "host_dx12/j2/compute_flow.hpp"
@@ -38,6 +40,7 @@
 #include "host_dx12/overlay/overlay.hpp"
 #include "host_dx12/settings.hpp"
 #include "host_dx12/scale/live_driver.hpp"
+#include "host_dx12/scale/auto_scene.hpp"
 #include "host_dx12/latency/nvidia_latency.hpp"
 
 namespace na::overlay {
@@ -927,31 +930,74 @@ void DrawLiveDlaa()
     if (Switch("j2", &on)) na::j2::SetPaused(!on);
     EndRow();
     Hint("For sharpest results and best FPS, set Anti-Aliasing to Off in the game's video settings.");
-    if (na::scale::SliderRouteActive()) {
+    if (na::scale::SliderRouteActive()||na::scale::GetAutomaticSceneStats().enabled||na::j2::ProjectionWindow()||na::j2::RenderSmall()) {
         // P4-4 slider route: the mode sets the game's own render scale (read at start-up; live
         // when the game allows it). The game's own Render Scale slider is left to the user.
         na::settings::Settings& ss = na::settings::Get();
         int mode = static_cast<int>(ss.j2_scale_mode.load());
-        if (mode < 0 || mode > 4) mode = 0;
-        BeginRow("Render mode", "DLAA draws the game at full resolution. Quality, Balanced, Performance and Ultra Performance draw it smaller for more FPS (67%, 58%, 50%, 33%). NeuralAlias sets the game's Render Scale for you; leave the game's own slider at 100%.", S(220));
+        // Render-small draws the HUD small too: Ultra Performance (33%) is not offered there.
+        const int modes = na::j2::RenderSmall() ? 4 : 5;
+        if (mode < 0 || mode >= modes) mode = mode >= modes ? modes - 1 : 0;
+        BeginRow("Render mode", na::j2::RenderSmall()
+            ? "DLAA uses full resolution. Quality, Balanced and Performance draw the whole game smaller for more FPS (67%, 58%, 50%) and DLSS brings it back to full size. The game's own HUD is drawn smaller too, so text is a little softer. Changes apply while you play."
+            : na::scale::GetAutomaticSceneStats().enabled||na::j2::ProjectionWindow()
+            ? "DLAA uses full resolution. Quality, Balanced, Performance and Ultra Performance render the scene smaller for more FPS. Menus and the HUD keep their normal size. Changes apply while you play."
+            : "DLAA draws the game at full resolution. Quality, Balanced, Performance and Ultra Performance draw it smaller for more FPS (67%, 58%, 50%, 33%). NeuralAlias sets the game's Render Scale for you; leave the game's own slider at 100%.", S(220));
         ImGui::SetNextItemWidth(S(220));
-        if (ImGui::Combo("##j2scale", &mode, kModes, 5)) {
+        if (ImGui::Combo("##j2scale", &mode, kModes, modes)) {
             ss.j2_scale_mode.store(static_cast<uint32_t>(mode));
             na::settings::Save();
-            na::scale::RequestMode(mode);
+            if(na::scale::SliderRouteActive())na::scale::RequestMode(mode);
         }
         EndRow();
-        StatusLine(0, na::scale::GetDriverStats().state);
+          if(na::j2::RenderSmall()){const auto j2=na::j2::GetStats();const auto ps=na::present::GetStats();
+              char note[200];
+              if(ps.scaled_w)std::snprintf(note,sizeof note,"Rendering the game at %ux%u, DLSS to %ux%u.",ps.scaled_w,ps.scaled_h,ps.native_w,ps.native_h);
+              else std::snprintf(note,sizeof note,"%s",mode?"Waiting for the game to rebuild at the smaller size.":"Rendering at full resolution.");
+              StatusLine(ps.scaled_w&&j2.small_dlss?1:0,note);}
+          else if(na::j2::ProjectionWindow()){const auto j2=na::j2::GetStats();
+              char note[200];
+              if(j2.window_engaged)std::snprintf(note,sizeof note,"Rendering the scene at %ux%u, DLSS to full size.",j2.window_w,j2.window_h);
+              else std::snprintf(note,sizeof note,"%s",j2.window_note[0]?j2.window_note:(mode?"Starting once DLAA is running steadily.":"Rendering at full resolution."));
+              StatusLine(j2.window_engaged?1:0,note);}
+          else if(na::scale::GetAutomaticSceneStats().enabled){const auto automatic=na::scale::GetAutomaticSceneStats();
+              StatusLine(automatic.active?1:0,automatic.reason);}
+          else StatusLine(0, na::scale::GetDriverStats().state);
     }
     {
         na::settings::Settings& ss = na::settings::Get();
         int sharp = static_cast<int>(ss.j2_sharpness.load());
-        BeginRow("Sharpness", "Sharpening after DLAA, before the HUD. 0 = off. 1-100%: standard RCAS strength. 101-150%: extended RCAS strength in the same pass. Higher values emphasize detail and can emphasize edge outlines or noise.", S(220));
+        BeginRow("Sharpness", "RCAS sharpening after DLSS. 0 = off. 50% is standard RCAS at full strength; above 50% is extra strength in the same pass, up to 100%. Higher values emphasize detail and can emphasize edge outlines or noise.", S(220));
         ImGui::SetNextItemWidth(S(220));
-        if (ImGui::SliderInt("##j2sharp", &sharp, 0, 150, sharp ? (sharp > 100 ? "%d%% (RCAS+)" : "%d%%") : "Off", ImGuiSliderFlags_AlwaysClamp)) {
+        if (ImGui::SliderInt("##j2sharp", &sharp, 0, 100, sharp ? "%d%%" : "Off", ImGuiSliderFlags_AlwaysClamp)) {
             ss.j2_sharpness.store(static_cast<uint32_t>(sharp));
         }
         if (ImGui::IsItemDeactivatedAfterEdit()) na::settings::Save();
+        EndRow();
+    }
+    if (na::j2::RenderSmall() && na::j2::native_hud::Installed()) {
+        bool native_on = na::j2::native_hud::Enabled();
+        BeginRow("Native-resolution HUD", "Draws the game's HUD and text at your screen's full resolution, on top of the DLSS picture, instead of upscaling them with the 3D scene. DLSS then gets the scene without the HUD. Off draws the HUD at render size as before. Not saved.", SwitchWidth());
+        if (Switch("j2nativehud", &native_on)) na::j2::native_hud::SetEnabled(native_on);
+        EndRow();
+        if (!na::j2::HudMaskEnabled()) {
+            bool view = na::j2::HudMaskView();
+            BeginRow("Show HUD layer", "Tints in pink what is drawn as native-resolution HUD, to check it. Not saved.", SwitchWidth());
+            if (Switch("j2hudview", &view)) na::j2::SetHudMaskView(view);
+            EndRow();
+        }
+    }
+    if (na::j2::RenderSmall() && na::j2::HudMaskEnabled()) {
+        na::settings::Settings& ss = na::settings::Get();
+        int hud = static_cast<int>(ss.j2_hud_nis.load());
+        BeginRow("HUD sharpness (NIS)", "Experimental fallback ([present] hud_mask=1). Guesses which pixels are HUD from the picture and replaces them with an NVIDIA Image Scaling copy at this sharpness. The HUD is still part of what DLSS gets, and a wrong guess shows unsmoothed scenery. Not used on frames where the native-resolution HUD works.", S(220));
+        ImGui::SetNextItemWidth(S(220));
+        if (ImGui::SliderInt("##j2hudnis", &hud, 0, 100, hud ? "%d%%" : "Off", ImGuiSliderFlags_AlwaysClamp)) ss.j2_hud_nis.store(static_cast<uint32_t>(hud));
+        if (ImGui::IsItemDeactivatedAfterEdit()) na::settings::Save();
+        EndRow();
+        bool view = na::j2::HudMaskView();
+        BeginRow("Show HUD mask", "Tints in pink what is being treated as HUD, to check it. Not saved.", SwitchWidth());
+        if (Switch("j2hudview", &view)) na::j2::SetHudMaskView(view);
         EndRow();
     }
     {
@@ -1013,15 +1059,8 @@ void DrawLiveDlaa()
         BeginRow("Capture every presented frame", "Saves the picture you saw for the next 40 frames in a row, whether DLAA ran on them or not, with a note of what DLAA did on each. For finding flashing. About 1.6 GB; to LocalAppData\\NeuralAlias\\captures.", ButtonWidth("Capture 40 presents"));
         ImGui::BeginDisabled(pc.frames_requested != 0 && pc.frames_written < pc.frames_requested);
         if (Button("Capture 40 presents")) {
-            wchar_t* local = nullptr;
-            if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local)) && local) {
-                wchar_t dir[MAX_PATH];
-                swprintf_s(dir, L"%s\\NeuralAlias\\captures", local);
-                CreateDirectoryW(dir, nullptr);
-                SYSTEMTIME t;
-                GetLocalTime(&t);
-                swprintf_s(dir, L"%s\\NeuralAlias\\captures\\presents-%04u%02u%02u-%02u%02u%02u", local, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
-                CoTaskMemFree(local);
+            wchar_t dir[MAX_PATH];
+            if (na::capture::MakeDir(L"presents", dir, MAX_PATH)) { // ...-<exe>-p<pid>, with session.json
                 na::capture::RequestPresents(kPresentFrames, dir, 3000);
                 na::overlay::SetOpen(false);
             }
@@ -1117,7 +1156,20 @@ void DrawLiveDlaaEnhancements()
         const bool live = ml.enabled && (ml.twin_pipelines > 0 || ml.twin_root_signatures > 0);
         BeginRow("Texture detail", "Samples surface textures sharper so DLAA can rebuild their full detail (NVIDIA's DLSS guide recommends -1 at native resolution). Very fine patterns such as fabric weaves can shimmer at -1; Light is gentler. Screen effects are never changed. Switches live (from the next frame); remembered for this game.", S(220));
         ImGui::SetNextItemWidth(S(220));
-        if (ImGui::Combo("##j2detail", &idx, kDetail, 3)) {
+        // Render-small DLSS modes set it automatically (NVIDIA: -1 + log2(render/output)):
+        // greyed out, showing the value for the current mode. DLAA keeps the menu's choice.
+        const float small_scale = na::j2::RenderSmall() ? na::present::RenderScale() : 1.f;
+        if (small_scale > 0.f && small_scale < 1.f) {
+            const int detail_mode = static_cast<int>(ss.j2_scale_mode.load());
+            char autod[64];
+            std::snprintf(autod, sizeof autod, "Automatic (%.2f, %s)", na::j2::SmallMipBias(0.f, small_scale),
+                          detail_mode >= 1 && detail_mode <= 4 ? kModes[detail_mode] : "DLSS");
+            const char* one[] = {autod};
+            int zero = 0;
+            ImGui::BeginDisabled();
+            ImGui::Combo("##j2detail", &zero, one, 1);
+            ImGui::EndDisabled();
+        } else if (ImGui::Combo("##j2detail", &idx, kDetail, 3)) {
             ss.j2_mip_bias_x100.store(kDetailX100[idx]);
             na::observe::SetSamplerMipBiasLive(kDetailX100[idx] / 100.0f);
             na::settings::Save();
@@ -1140,6 +1192,7 @@ void DrawLiveDlaaEnhancements()
     }
     EndGroupBox();
 }
+
 
 } // namespace
 

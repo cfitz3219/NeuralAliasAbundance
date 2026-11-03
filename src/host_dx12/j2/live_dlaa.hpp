@@ -26,6 +26,8 @@
 #include <d3d12.h>
 #include <cstdint>
 #include <memory>
+#include <cmath>
+#include <string>
 
 namespace na::j2 {
 
@@ -43,6 +45,16 @@ void SetDebugView(int mode);
 // into `out` (UNORDERED_ACCESS). percent 0 records nothing and returns false.
 bool RecordRcasForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* in, ID3D12Resource* out,
                         uint32_t w, uint32_t h, uint32_t percent, DXGI_FORMAT fmt);
+// Test hook: compiles the render-small HUD passes (classify, dilate, composite); false + why.
+bool CompileHudShadersForTests(char* why, size_t why_size);
+// Tests: the native-HUD composite (pass "layer") from `picture` and the two layers (all in
+// NON_PIXEL_SHADER_RESOURCE) into `out` (UNORDERED_ACCESS), and one HUD-mask classify pass
+// (cur/prev/motion readable, evidence R32_FLOAT in UNORDERED_ACCESS). Set up on `queue`'s device.
+bool RecordHudLayerForTests(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list, ID3D12Resource* picture, DXGI_FORMAT picture_format,
+                            ID3D12Resource* n0, ID3D12Resource* n1, DXGI_FORMAT view, float grey, bool srgb, ID3D12Resource* out,
+                            uint32_t w, uint32_t h);
+bool RecordHudClassifyForTests(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list, ID3D12Resource* cur, ID3D12Resource* prev,
+                               DXGI_FORMAT color_format, ID3D12Resource* motion, ID3D12Resource* evidence, uint32_t w, uint32_t h, uint32_t flags);
 // Test hook: the 101..200 % stage (NVIDIA Image Scaling sharpen-only) from `in`
 // (NON_PIXEL_SHADER_RESOURCE) into `out` (UNORDERED_ACCESS). <= 100 % records nothing.
 bool RecordNisForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* in, ID3D12Resource* out,
@@ -50,6 +62,49 @@ bool RecordNisForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID
 int DebugView();
 void SetJitter(bool on);     // the overlay's camera-jitter switch (J1), on by default
 bool Jitter();
+
+// P4-4 projection window (no-slider route, 2026-11-02). With [j2] window=1 and a render
+// mode below DLAA, J1 also scales and shifts the camera it already rewrites, so the game
+// draws its whole scene into the top-left render-size corner of its own full-size
+// targets; DLSS reads that corner and writes the full picture back at the DLAA point.
+// Viewports, screen-size constants and every resource stay native. Engages after DLAA
+// has run on 30 frames in a row; disengages on mode 0, a size change or repeated misses.
+// P4-4 render-small (native present, COMMS 4e30a94/f0de8b4): the game renders its WHOLE frame
+// at render size into the presenter's proxies, and the presenter shows it at the window's size.
+// J2 keeps jittering the camera and builds the frame's depth and motion at its usual point,
+// but leaves the scene colour as drawn; DLSS runs at Present on the finished render-size
+// picture (PresentUpscale, the presenter's UpscaleFn). A frame without this frame's depth and
+// motion (J2 not running yet, a missed scene, another queue) is stretched bilinearly instead,
+// so a picture is always shown and the mode never switches itself off. Off by default.
+void SetRenderSmall(bool on);
+bool RenderSmall();
+// Native HUD: the CBV binding (resource, root slot) is one J2 jitters as the camera, so the
+// draw is drawn with the camera and belongs in the proxy (DLSS removes its jitter there).
+bool CameraBinding(uint64_t resource, uint64_t offset, uint32_t param, bool table);
+// Render-small HUD: tint the pixels taken as HUD (diagnostic, not saved). With the native HUD
+// (native_hud.hpp) it tints where the native HUD layers draw; with the mask, the mask.
+void SetHudMaskView(bool on);
+// The pixel-guessing HUD mask + NIS ([present] hud_mask=1; off by default: in Anno it took
+// scenery for HUD and showed the raw jittered frame there).
+void SetHudMaskEnabled(bool on);
+bool HudMaskEnabled();
+bool HudMaskView();
+// Render-small texture bias per DLSS mode (Cort, 2026-11-03; the menu is greyed out there):
+// Quality (67%) -1.585, Balanced (58%) -2, Performance (50%) -2.5. DLAA (scale 1) uses the
+// menu's choice.
+inline float SmallMipBias(float user, float scale)
+{
+    if (!(scale > 0.f && scale < 1.f)) return user;
+    return scale >= 0.62f ? -1.5849625f : (scale >= 0.54f ? -2.0f : -2.5f);
+}
+bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t rw, uint32_t rh,
+                    ID3D12Resource* out, uint32_t ow, uint32_t oh, bool hdr, void* user);
+void SetProjectionWindow(bool on);
+void SetProjectionWindowScissor(bool on); // [j2] window_scissor: clip scene draws to the corner (GPU cost), default on
+bool ProjectionWindow();
+// Recording-time view for the scissor hook: scene draws (depth target == `depth`) are
+// clipped to the top-left ew x eh corner while engaged. False = leave draws alone.
+bool ProjectionWindowScissor(uint64_t* depth, uint32_t* ew, uint32_t* eh);
 
 // P4-4 (DLSS upscaling, slider route). With no destination J2 runs DLAA as before:
 // DLSS at the scene's size, written back into the scene colour. With a destination,
@@ -105,6 +160,9 @@ struct PhysicalInputProvider {
     // Every Provided / Unavailable lookup gets exactly one outcome, before J2's record returns.
     void (*outcome)(void* ctx, uint64_t generation, PhysicalOutcome result, const char* reason) = nullptr;
     void* ctx = nullptr;
+    // Opt-in: lookup receives the exact source recording on the between-lists
+    // route as well. Existing providers retain the historical null argument.
+    bool source_recording = false;
 };
 // Null lookup = no provider (default). Not changed while a frame records.
 void SetPhysicalInputProvider(const PhysicalInputProvider& p);
@@ -242,6 +300,29 @@ struct Stats {
     uint32_t render_w = 0, render_h = 0, out_w = 0, out_h = 0, jitter_phases = 0;
     uint64_t upscaled_frames = 0, upscale_refused = 0;
     uint64_t physical_evaluated = 0, physical_unavailable = 0, physical_failed = 0; // P4-4 Layer2 override
+    // P4-4 projection window: engaged state, the corner, frames evaluated from it,
+    // windowed frames that presented without DLSS, matrix writes by kind, post-DLAA
+    // lists that bound a windowed camera, engagements and why the last one ended.
+    bool window_engaged = false;
+    uint32_t window_w = 0, window_h = 0;
+    uint64_t window_frames = 0, window_missed = 0, window_engagements = 0;
+    uint64_t window_vp_writes = 0, window_inv_writes = 0, window_proj_writes = 0, window_prev_writes = 0, window_post_lists = 0;
+    uint64_t window_scissored = 0, window_scissor_restored = 0;
+    uint64_t window_unpacked = 0, window_repeated = 0, window_extra_cameras = 0; // full-size frames caught / repeated; extra copies of the camera windowed
+    char window_unpacked_note[160] = {};
+    uint64_t jitter_cpu_us = 0, jitter_cpu_max_us = 0; // total / worst single call, J1 + window camera work
+    uint64_t window_stale_samples = 0, jitter_blocks_capped = 0, jitter_patches = 0, jitter_patches_refused = 0;
+    uint64_t window_repeat_fallbacks = 0, window_repeat_stale = 0, window_derived_skipped = 0;
+    uint64_t jitter_blocks_dropped = 0, jitter_blocks_scanned = 0, jitter_slot_blocks = 0;
+    uint64_t jitter_blocks_probed_out = 0; // blocks skipped after the 64-byte probe
+    // Render-small: frames whose depth + motion were kept for Present; pictures DLSS upscaled at
+    // Present / stretched (no fresh depth + motion) / not produced (the presenter kept its old one).
+    uint64_t small_deferred = 0, small_dlss = 0, small_stretched = 0, small_failed = 0, small_dlss_failed = 0, small_sharpened = 0, small_hud = 0, small_hud_layer = 0;
+    uint32_t small_rw = 0, small_rh = 0, small_ow = 0, small_oh = 0;
+    char small_note[128] = {};
+    uint64_t window_derived_forward = 0, window_derived_inverse = 0; // camera-derived matrices rebased (see window_derived)
+    char window_derived_note[160] = {};
+    char window_note[120] = {};
     char upscale_note[160] = {};
     // Shape of the selected resources (reported even when J2 refuses them).
     uint32_t color_sub = 0, color_mips = 0, color_slices = 0, color_samples = 0, depth_slices = 0, depth_samples = 0;

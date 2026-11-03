@@ -369,6 +369,24 @@ int main(int argc, char** argv)
             na::observe::SetSamplerMipBiasLive(-1.0f); // back to the game's own objects
             na::observe::SetSamplerMipBiasLiveEnabled(false);
         }
+        {
+            // Render-small levels per DLSS mode (Q -1.585, B -2, P -2.5); only the wanted
+            // levels are chosen (Light -0.5 is not wanted, so -0.6 picks -1).
+            const float wanted[4] = {-1.0f, na::j2::SmallMipBias(-1.0f, 1.0f / 1.5f), na::j2::SmallMipBias(-1.0f, 1.0f / 1.72f),
+                                     na::j2::SmallMipBias(-1.0f, 0.5f)};
+            na::observe::SetSamplerMipLevelsWanted(wanted, 4);
+            na::observe::SetSamplerMipBiasLive(wanted[1]);
+            CHECK(std::fabs(na::observe::SamplerMipBias() + 1.585f) < 0.001f);
+            na::observe::SetSamplerMipBiasLive(wanted[2]);
+            CHECK(na::observe::SamplerMipBias() == -2.0f);
+            na::observe::SetSamplerMipBiasLive(wanted[3]);
+            CHECK(na::observe::SamplerMipBias() == -2.5f);
+            na::observe::SetSamplerMipBiasLive(-0.6f);
+            CHECK(na::observe::SamplerMipBias() == -1.0f);
+            const float classic[3] = {0.0f, -0.5f, -1.0f};
+            na::observe::SetSamplerMipLevelsWanted(classic, 3);
+            na::observe::SetSamplerMipBiasLive(-1.0f);
+        }
         na::observe::SetSamplerMipBias(0.0f);
     }
     test::ComPtr<ID3D12RootSignature> rs_pre; // the pre-pass's own root signature: one root CBV

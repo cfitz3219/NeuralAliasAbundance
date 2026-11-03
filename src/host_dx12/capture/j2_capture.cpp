@@ -1,4 +1,5 @@
 #include "host_dx12/capture/j2_capture.hpp"
+#include "host_dx12/capture/capture_session.hpp"
 
 #include <windows.h>
 #include <shlobj.h>
@@ -180,14 +181,14 @@ void write_slot(const Slot& s)
     FILE* fp = nullptr;
     if (_wfopen_s(&fp, path, L"wb") == 0 && fp) {
         std::fprintf(fp,
-            "{\n  \"format\": \"na-j2-capture-1\",\n  \"index\": %u,\n  \"present_ordinal\": %llu,\n"
+            "{\n  \"format\": \"na-j2-capture-1\",\n  \"exe\": \"%ls\",\n  \"pid\": %u,\n  \"index\": %u,\n  \"present_ordinal\": %llu,\n"
             "  \"submission\": %llu,\n  \"queue_submission\": %llu,\n  \"recording\": %llu,\n"
             "  \"view\": {\"color\": %llu, \"depth\": %llu, \"dlss_view_id\": %u, \"color_sub\": %u},\n"
             "  \"route\": %u,\n  \"route_mode\": %u,\n  \"history_generation\": %u,\n  \"insertion_signature\": %llu,\n"
             "  \"size\": [%u, %u],\n  \"color_format\": %u,\n  \"jitter_px\": [%.6f, %.6f],\n  \"mv_scale\": [%.4f, %.4f],\n"
             "  \"reset\": %u,\n  \"camera_cut\": %u,\n  \"preset\": %u,\n  \"sharpness\": %u,\n  \"debug_view\": %u,\n"
             "  \"late_writes\": %llu,\n  \"frame_closed\": %s,\n",
-            s.index, (unsigned long long)id.present_ordinal, (unsigned long long)id.submission,
+            ThisProcess().exe, ThisProcess().pid, s.index, (unsigned long long)id.present_ordinal, (unsigned long long)id.submission,
             (unsigned long long)s.submit_ordinal, (unsigned long long)id.recording,
             (unsigned long long)id.view_color, (unsigned long long)id.view_depth, id.view_id, id.color_sub,
             id.route, id.route_mode, id.history_generation, (unsigned long long)id.insertion_signature,
@@ -258,6 +259,7 @@ void Request(uint32_t frames, const wchar_t* dir, uint32_t delay_ms)
     std::lock_guard<std::mutex> lock(g.m);
     wcsncpy_s(g.dir, dir, _TRUNCATE);
     CreateDirectoryW(g.dir, nullptr);
+    TagDir(g.dir, "j2");
     ++g.session;
     g.requested = (std::min)(frames, kMaxFrames);
     const Stats keep = g.stats;
@@ -276,18 +278,8 @@ void Request(uint32_t frames, const wchar_t* dir, uint32_t delay_ms)
 
 bool RequestTimestamped(uint32_t frames, uint32_t delay_ms)
 {
-    wchar_t* local = nullptr;
-    if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local)) || !local) return false;
     wchar_t dir[MAX_PATH];
-    swprintf_s(dir, L"%s\\NeuralAlias", local);
-    CreateDirectoryW(dir, nullptr);
-    swprintf_s(dir, L"%s\\NeuralAlias\\captures", local);
-    CreateDirectoryW(dir, nullptr);
-    SYSTEMTIME t{};
-    GetLocalTime(&t);
-    swprintf_s(dir, L"%s\\NeuralAlias\\captures\\j2-%04u%02u%02u-%02u%02u%02u", local, t.wYear, t.wMonth, t.wDay, t.wHour,
-               t.wMinute, t.wSecond);
-    CoTaskMemFree(local);
+    if (!MakeDir(L"j2", dir, MAX_PATH)) return false;
     Request(frames, dir, delay_ms);
     return true;
 }

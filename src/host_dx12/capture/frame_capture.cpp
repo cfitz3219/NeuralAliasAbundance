@@ -1,4 +1,5 @@
 #include "host_dx12/capture/frame_capture.hpp"
+#include "host_dx12/capture/capture_session.hpp"
 
 #include <windows.h>
 #include <wrl/client.h>
@@ -136,11 +137,11 @@ void write_frame(const Frame& f)
     swprintf_s(path, L"%s\\frame%u-meta.json", g.dir, f.index);
     FILE* fp = nullptr;
     if (_wfopen_s(&fp, path, L"wb") == 0 && fp) {
-        fprintf(fp, "{\n  \"frame\": %u,\n  \"render\": [%u, %u],\n  \"output\": [%u, %u],\n"
+        fprintf(fp, "{\n  \"exe\": \"%ls\",\n  \"pid\": %u,\n  \"frame\": %u,\n  \"render\": [%u, %u],\n  \"output\": [%u, %u],\n"
                     "  \"jitter\": [%.6f, %.6f],\n  \"mv_scale\": [%.4f, %.4f],\n  \"reset\": %u,\n"
                     "  \"note\": \"%s\",\n"
                     "  \"planes\": [\n",
-                f.index, f.in.render_w, f.in.render_h, f.in.out_w, f.in.out_h, f.in.jitter_x,
+                ThisProcess().exe, ThisProcess().pid, f.index, f.in.render_w, f.in.render_h, f.in.out_w, f.in.out_h, f.in.jitter_x,
                 f.in.jitter_y, f.in.mv_scale_x, f.in.mv_scale_y, f.in.reset, f.note);
         bool first = true;
         for (const Plane& p : f.planes) {
@@ -190,6 +191,7 @@ void Request(uint32_t frames, const wchar_t* out_dir, uint32_t delay_ms)
     g.start_at = GetTickCount64() + delay_ms;
     wcsncpy_s(g.dir, out_dir, _TRUNCATE);
     CreateDirectoryW(g.dir, nullptr);
+    TagDir(g.dir, "frames");
     g.requested = frames;
     g.evaluated = 0;
     g.written = 0;
