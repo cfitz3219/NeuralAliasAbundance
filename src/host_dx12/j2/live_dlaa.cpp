@@ -1061,14 +1061,21 @@ void jitter_batch_impl(ID3D12CommandList* const* lists, UINT count)
         for (const auto& b : na::observe::ListRootConstantBuffers(lists[i])) {
             const bool slot = b.param == static_cast<uint32_t>(g.camera_param) && b.table == g.camera_table;
             const bool known = g_camera_resources.count(b.resource) != 0;
-            auto it = blocks.find({b.resource, b.offset});
-            if (it != blocks.end()) { if (slot && !it->second.slot) { it->second.slot = true; ++slot_blocks; --other_blocks; } continue; }
-            if (slot ? slot_blocks >= kSlotBlocks : other_blocks >= kOtherBlocks) { ++dropped; continue; }
             const uint32_t sz = b.table && b.size ? b.size : kBlockBytes;
+            const uint32_t bounded_size=(std::min)(sz,kMaxBlockRead);
+            auto it = blocks.find({b.resource, b.offset});
+            if (it != blocks.end()) {
+                // One upload address can be bound through several CBV ranges.
+                // A short first view must not hide a later camera/inverse.
+                it->second.size=(std::max)(it->second.size,bounded_size);
+                if (slot && !it->second.slot) { it->second.slot = true; ++slot_blocks; --other_blocks; }
+                continue;
+            }
+            if (slot ? slot_blocks >= kSlotBlocks : other_blocks >= kOtherBlocks) { ++dropped; continue; }
             JB& k = blocks[{b.resource, b.offset}];
             k.res = b.resource;
             k.off = b.offset;
-            k.size = sz < kMaxBlockRead ? sz : kMaxBlockRead;
+            k.size = bounded_size;
             k.slot = slot;
             k.known = known;
             if (slot) ++slot_blocks; else ++other_blocks;
@@ -1085,27 +1092,10 @@ void jitter_batch_impl(ID3D12CommandList* const* lists, UINT count)
     g.stats.jitter_blocks_dropped += dropped;
     g.stats.jitter_blocks_scanned += order.size();
     g.stats.jitter_slot_blocks += slot_blocks;
-    // Cheap probe for blocks outside the camera slot: 64 bytes at the learned camera offset (and
-    // at 0 for a small block). A block whose probe is neither this frame's camera bytes nor a
-    // perspective matrix of the main camera cannot need a write, so it is never read in full.
-    // Reading ~700 blocks in full cost 1.2 ms a frame (cf65722, fab5928).
-    uint8_t probe[64];
-    const auto probe_hit = [&](const JB& k) {
-        const uint64_t po = g.camera_offset >= 0 && static_cast<uint64_t>(g.camera_offset) + 64 <= k.size ? static_cast<uint64_t>(g.camera_offset) : 0;
-        if (na::observe::ReadBuffer(k.res, k.off + po, probe, 64) != 64) return false;
-        if (g.jit.valid)
-            for (int l = 0; l < 2; ++l)
-                if (!std::memcmp(probe, g.jit.vp[l], 64) || !std::memcmp(probe, g.jit.jvp[l], 64) || (g.jit.windowed && !std::memcmp(probe, g.jit.wvp[l], 64))) return true;
-        const std::vector<uint8_t> pb(probe, probe + 64);
-        for (auto L : {na::camera::Layout::RowMajor, na::camera::Layout::ColumnMajor}) {
-            const auto m = na::camera::LoadMatrix(pb, 0, L);
-            na::camera::Candidate c{};
-            if (na::camera::ViewProjection(m, c) && same_camera(m)) return true;
-        }
-        return false;
-    };
+    // Read each bounded range once. A single-offset probe cannot exclude camera
+    // copies elsewhere, nor standalone P/inverse/previous matrices. The cheap
+    // byte comparisons below cover the whole range without a general solver.
     for (const JB* k : order) {
-        if (!k->slot && !k->known && !probe_hit(*k)) { ++g.stats.jitter_blocks_probed_out; continue; }
         const uint32_t n = na::observe::ReadBuffer(k->res, k->off, bytes.data(), k->size);
         if (n < 64) continue;
         std::vector<uint8_t> view(bytes.begin(), bytes.begin() + n);
@@ -1116,12 +1106,21 @@ void jitter_batch_impl(ID3D12CommandList* const* lists, UINT count)
             return false;
         };
         if (!g.jit.valid || !holds(g.jit.vp)) {
-            if (g.jit.valid && (holds(g.jit.jvp) || (g.jit.windowed && holds(g.jit.wvp)))) continue; // already written by an earlier batch of this frame
             // Projection window: EVERY copy of the main camera must be windowed, or the draws using it
             // land full size (a frame-old copy, or a camera updated between passes while panning).
             if (g.jit.valid && g.jit.windowed && window_extra_camera(k->res, k->off, view)) continue;
-            if (g.jit.valid) { ++g.stats.other_camera_blocks; continue; } // a different matrix (another camera): leave it
-            if (!begin_jitter(k->res, k->off, view, k->slot)) continue;
+            const auto holds_one=[&](const uint8_t* m) {
+                for(size_t o=0;o+64<=n;o+=16) if(!std::memcmp(view.data()+o,m,64)) return true;
+                return false;
+            };
+            // Camera components can be uploaded separately. Finding the exact
+            // known component is sufficient to patch it; requiring a VP beside
+            // it silently skipped projection-only/inverse-only consumers.
+            const bool component=g.jit.valid && (holds(g.jit.inv) ||
+                (g.jit.has_proj && holds_one(g.jit.proj)) ||
+                (g.jit.windowed && g.jit.has_prev && holds_one(g.jit.prev)));
+            if (g.jit.valid && !component) { ++g.stats.other_camera_blocks; ++g.stats.jitter_blocks_probed_out; continue; }
+            if (!g.jit.valid && !begin_jitter(k->res, k->off, view, k->slot)) continue;
         }
         if (k->slot) { // adopt the game's exact inverse bytes (they may differ from a computed inverse)
             const int64_t vo = g.camera_offset, io = vo + g.camera_inv_delta;
@@ -1320,6 +1319,7 @@ bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth
                 k.table = b.table;
                 k.list_rank = ol.first;
             }
+            k.size=(std::max)(k.size,b.table && b.size ? b.size : kBlockBytes);
             ++k.uses;
         }
     }
@@ -1397,6 +1397,7 @@ bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth
             if (c.kind == na::camera::Kind::ViewProjection && !c.has_inverse_pair && !have_loose && same_camera(c.matrix)) {
                 loose.vp = c.matrix;
                 loose.reversed = c.reversed;
+                loose.injected = holds_jittered(s.bytes, c.byte_offset);
                 loose.block = o;
                 have_loose = true;
             }
@@ -1426,7 +1427,7 @@ bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth
         ++g.stats.camera_inverse_computed;
         *vp = loose.vp;
         *reversed = loose.reversed;
-        g_injected = false;
+        g_injected = loose.injected; // VP-only blocks retain exact patched-sample provenance too
         return true;
     }
     if (!p) {

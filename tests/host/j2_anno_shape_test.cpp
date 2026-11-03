@@ -138,6 +138,7 @@ int main(int argc, char** argv)
     // (Sniper Elite Resistance); DLAA must be recorded inside it, before the post
     // pass binds the colour for reading, and the game's state handed back.
     const bool inline_copy = argc > 3 && std::strcmp(argv[3], "--inline-copy") == 0;
+    const bool window_test = argc > 3 && std::strcmp(argv[3], "--window") == 0;
     const bool inline_record_first = argc > 3 && std::strcmp(argv[3], "--inline-record-first") == 0;
     // --auto-inline / --auto-between: no override; the route selector must choose the
     // route from the frame structure (inline for scene+post in one list, between for
@@ -210,7 +211,7 @@ int main(int argc, char** argv)
     REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvh))));
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
     REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dsvh))));
-    D3D12_DESCRIPTOR_HEAP_DESC chd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    D3D12_DESCRIPTOR_HEAP_DESC chd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&chd, IID_PPV_ARGS(&cbvh))));
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvh->GetCPUDescriptorHandleForHeapStart(), dsv = dsvh->GetCPUDescriptorHandleForHeapStart();
     D3D12_RENDER_TARGET_VIEW_DESC rvd{};
@@ -241,6 +242,15 @@ int main(int argc, char** argv)
     constexpr uint32_t kBlock = 1024, kVp = 336;
     D3D12_CONSTANT_BUFFER_VIEW_DESC cv{cb->GetGPUVirtualAddress() + kBlock, 768};
     dev->CreateConstantBufferView(&cv, cbvh->GetCPUDescriptorHandleForHeapStart());
+    auto small_cpu=cbvh->GetCPUDescriptorHandleForHeapStart();
+    auto small_gpu=cbvh->GetGPUDescriptorHandleForHeapStart();
+    const auto cbv_step=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    small_cpu.ptr+=cbv_step;small_gpu.ptr+=cbv_step;
+    auto short_cv=cv;short_cv.SizeInBytes=256;
+    dev->CreateConstantBufferView(&short_cv,small_cpu);
+    auto lens_copy=test::CreateBuffer(dev,1024,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+    REQUIRE(lens_copy);uint8_t* lens_cpu=nullptr;
+    REQUIRE(SUCCEEDED(lens_copy->Map(0,nullptr,reinterpret_cast<void**>(&lens_cpu))));
     test::ComPtr<ID3D12RootSignature> rs;
     {
         D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0, 0, 0};
@@ -468,6 +478,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
     // the auto modes exercise the selector.
     na::settings::Get().j2_route.store((auto_inline || auto_between || inline_list) ? 0u : 1u);
     na::j2::SetEnabled(true);
+    if(window_test) { na::settings::Get().j2_scale_mode.store(1);na::j2::SetProjectionWindow(true); }
     na::j2::flow::SetEnabled(inline_flow);
     na::j2::SetJitter(true); // J1 is off by default in the game; the tests exercise it
     na::observe::SetLiveSelection(na::observe::IdOf(depth.Get()), na::observe::IdOf(color.Get()));
@@ -491,6 +502,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         na::capture::j2::Request(3, cap_dir.c_str(), 0);
     }
     int frame_no = 0;
+    int window_frame = 0;
     const auto frame = [&](double cam_x, bool unpatched_prepass = false) {
         // Copy case: every 4th frame the LAST scene write comes from a different pipeline
         // (another object drawn last). The boundary matcher keys on the final writer, so it
@@ -518,9 +530,13 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         for (int i = 0; i < 300; ++i) cpu[kBlock + i] = static_cast<uint8_t>(i * 13); // other constants before the camera
         Store(cpu + kBlock + kVp, vp);
         Store(cpu + kBlock + kVp + 128, inv);
+        // After learning/warmup, a submission can supply only the current VP.
+        // The actual patched bytes still establish its jitter/window provenance.
+        if(window_test && ++window_frame>35) std::memset(cpu+kBlock+kVp+128,0,64);
         Store(cpu + kBlock + kVp + 192, Proj()); // the camera's own projection, in the same block
         Store(cpu + kPre + kVp, vp); // the pre-pass's own copy of the camera
         Store(cpu + kPre + kVp + 128, inv);
+        std::memset(lens_cpu,0,1024);Store(lens_cpu+16,Proj());
         prepass.Reset(); // earlier batch: depth only, its own root signature
         prepass.list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
         prepass.list->SetGraphicsRootSignature(rs_pre.Get());
@@ -542,7 +558,14 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         scene.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
         ID3D12DescriptorHeap* heaps[] = {cbvh.Get()};
         scene.list->SetDescriptorHeaps(1, heaps);
+        // A standalone projection copy can use a different root/layout. It
+        // still needs the same jitter even though it has no VP at +336.
+        scene.list->SetGraphicsRootSignature(rs_pre.Get());
+        scene.list->SetGraphicsRootConstantBufferView(0,lens_copy->GetGPUVirtualAddress());
         scene.list->SetGraphicsRootSignature(rs.Get());
+        // Same address, first a short view and then the actual camera view.
+        // Deduplication must retain the largest observed bound range.
+        if(!GetEnvironmentVariableA("NA_TEST_NO_CAMERA_ALIAS",nullptr,0)) scene.list->SetGraphicsRootDescriptorTable(0,small_gpu);
         for (int i = 0; i < 3; ++i) scene.list->SetGraphicsRootDescriptorTable(0, cbvh->GetGPUDescriptorHandleForHeapStart());
         if (inline_list) { // ...then, in the SAME list, post-processing reads the colour
             D3D12_RESOURCE_BARRIER rd2 = test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -778,6 +801,16 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         CHECK(g_forwarded.size() == 3 && g_forwarded[0] == scene2.list.Get() && g_forwarded[2] == consumer.list.Get()); // ...and follow the second
         return test::finish("j2_anno_shape_test (split)");
     }
+    if(window_test) {
+        for(int i=0;i<45;++i) REQUIRE(frame(.02*i)==0);
+        const auto ws=na::j2::GetStats();
+        std::printf("window pan: frames=%llu unpacked=%llu repeated=%llu extra=%llu\n",
+            (unsigned long long)ws.window_frames,(unsigned long long)ws.window_unpacked,
+            (unsigned long long)ws.window_repeated,(unsigned long long)ws.window_extra_cameras);
+        CHECK(ws.window_frames>=10 && ws.window_unpacked==0 && ws.window_repeated==0);
+        CHECK(dev->GetDeviceRemovedReason()==S_OK);
+        return test::finish("j2_anno_shape_test (window pan, camera-only block)");
+    }
     REQUIRE(frame(0) == 0);
     auto st = na::j2::GetStats();
     CHECK(g_forwarded.size() == 3 && st.frames == 1 && evaluations() == evals0 + 1);
@@ -798,6 +831,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
     CHECK(st.jitter_writes >= 2);
     CHECK(st.camera_inv_delta == 128 && st.camera_learned_hits >= 1);
     CHECK(st.camera_proj_delta == 192 && st.jitter_proj_writes >= 1); // the separate projection is jittered too
+    { uint8_t original[64];Store(original,Proj());CHECK(std::memcmp(lens_cpu+16,original,64)!=0); }
     if (!real_ngx) {
     CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
     const double jx = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_X), jy = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_Y);
