@@ -22,6 +22,7 @@
 #include <imgui.h>
 
 #include "host_dx12/capture/frame_capture.hpp"
+#include "host_dx12/capture/capture_session.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/fg/frame_gen.hpp"
 #include "host_dx12/j2/native_hud.hpp"
@@ -1058,15 +1059,8 @@ void DrawLiveDlaa()
         BeginRow("Capture every presented frame", "Saves the picture you saw for the next 40 frames in a row, whether DLAA ran on them or not, with a note of what DLAA did on each. For finding flashing. About 1.6 GB; to LocalAppData\\NeuralAlias\\captures.", ButtonWidth("Capture 40 presents"));
         ImGui::BeginDisabled(pc.frames_requested != 0 && pc.frames_written < pc.frames_requested);
         if (Button("Capture 40 presents")) {
-            wchar_t* local = nullptr;
-            if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local)) && local) {
-                wchar_t dir[MAX_PATH];
-                swprintf_s(dir, L"%s\\NeuralAlias\\captures", local);
-                CreateDirectoryW(dir, nullptr);
-                SYSTEMTIME t;
-                GetLocalTime(&t);
-                swprintf_s(dir, L"%s\\NeuralAlias\\captures\\presents-%04u%02u%02u-%02u%02u%02u", local, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
-                CoTaskMemFree(local);
+            wchar_t dir[MAX_PATH];
+            if (na::capture::MakeDir(L"presents", dir, MAX_PATH)) { // ...-<exe>-p<pid>, with session.json
                 na::capture::RequestPresents(kPresentFrames, dir, 3000);
                 na::overlay::SetOpen(false);
             }
