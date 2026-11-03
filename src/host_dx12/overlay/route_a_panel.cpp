@@ -1132,6 +1132,7 @@ void DrawLiveDlaa()
 void RegisterLiveDlaaMenu()
 {
     na::menu::Register({"Live DLAA", na::menu::Availability::Available, nullptr, &DrawLiveDlaa, na::menu::Page::Picture});
+    na::menu::Register({"Optical flow", na::menu::Availability::Available, nullptr, &DrawMovingObjectMotion, na::menu::Page::Enhancements});
 }
 
 void RegisterRouteAMenu()
@@ -1149,7 +1150,6 @@ void RegisterRouteAMenu()
     na::menu::Register({"Latency and display", Availability::Available, nullptr, &DrawLatencyDetails, Page::Details});
     na::menu::Register({"DLSS in use", Availability::Available, nullptr, &DrawDlssInUseRow, Page::Enhancements});
     na::menu::Register({"Motion analysis", Availability::Available, nullptr, &DrawMotionRow, Page::Enhancements});
-    na::menu::Register({"Optical flow", Availability::Available, nullptr, &DrawMovingObjectMotion, Page::Enhancements});
     na::menu::Register({"Connection", Availability::Available, nullptr, &DrawConnectionRow, Page::Details});
     na::menu::Register({"Save pictures for analysis", Availability::Available, nullptr, &DrawCaptureRow,
                         Page::Details});
