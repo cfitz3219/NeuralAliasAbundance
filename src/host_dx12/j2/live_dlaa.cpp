@@ -714,12 +714,13 @@ std::set<uint64_t> g_camera_resources; // buffers that have carried the camera (
 // buffers and the camera's root slot.
 std::mutex g_cam_pub_m;
 uint64_t g_cam_pub[64]; size_t g_cam_pub_n = 0; int64_t g_cam_pub_param = -1; bool g_cam_pub_table = false;
+int64_t g_cam_pub_offset = -1; bool g_cam_pub_geo_valid = false; na::camera::VpGeometry g_cam_pub_geo{};
 void publish_camera_resources_locked()
 {
     std::lock_guard<std::mutex> lock(g_cam_pub_m);
     g_cam_pub_n = 0;
     for (uint64_t r : g_camera_resources) if (g_cam_pub_n < 64) g_cam_pub[g_cam_pub_n++] = r;
-    g_cam_pub_param = g.camera_param; g_cam_pub_table = g.camera_table;
+    g_cam_pub_param = g.camera_param; g_cam_pub_table = g.camera_table; g_cam_pub_offset = g.camera_offset;
 }
 std::vector<WindowExtra> g_window_extras;
 uint64_t g_window_extras_frame = UINT64_MAX;
@@ -774,6 +775,9 @@ void remember_main_camera(const na::camera::Matrix& m)
 {
     g_jit_cam.valid = na::camera::DecomposeViewProjection(m, g_jit_cam.geo);
     g_jit_cam.hand = handedness(m);
+    std::lock_guard<std::mutex> lock(g_cam_pub_m);
+    g_cam_pub_geo_valid = g_jit_cam.valid;
+    g_cam_pub_geo = g_jit_cam.geo;
 }
 
 bool same_camera(const na::camera::Matrix& m)
@@ -2886,11 +2890,38 @@ void SetHudMaskEnabled(bool on) { g_hud_mask_on.store(on); }
 bool HudMaskEnabled() { return g_hud_mask_on.load(); }
 bool HudMaskView() { return g_hud_view.load(); }
 
-bool CameraBinding(uint64_t resource, uint32_t param, bool table)
+bool CameraBinding(uint64_t resource, uint64_t offset, uint32_t param, bool table)
 {
-    std::lock_guard<std::mutex> lock(g_cam_pub_m);
-    if (g_cam_pub_param < 0 || param != static_cast<uint32_t>(g_cam_pub_param) || table != g_cam_pub_table) return false;
-    for (size_t i = 0; i < g_cam_pub_n; ++i) if (g_cam_pub[i] == resource) return true;
+    int64_t co = -1;
+    na::camera::VpGeometry main{};
+    {
+        std::lock_guard<std::mutex> lock(g_cam_pub_m);
+        if (g_cam_pub_param < 0 || param != static_cast<uint32_t>(g_cam_pub_param) || table != g_cam_pub_table || !g_cam_pub_geo_valid) return false;
+        bool known = false;
+        for (size_t i = 0; i < g_cam_pub_n && !known; ++i) known = g_cam_pub[i] == resource;
+        if (!known) return false;
+        co = g_cam_pub_offset;
+        main = g_cam_pub_geo;
+    }
+    // The same buffer and slot also carry other constants (Anno: the UI's own blocks in the same
+    // ring buffer, 0ff948f lost most UI text). Only a block that holds the main camera itself, at
+    // the camera's offset, makes the draw a world draw.
+    if (co < 0) return false;
+    std::vector<uint8_t> bytes(64);
+    if (na::observe::ReadBuffer(resource, offset + static_cast<uint64_t>(co), bytes.data(), 64) != 64) return false;
+    for (auto layout : {na::camera::Layout::RowMajor, na::camera::Layout::ColumnMajor}) {
+        const auto m = na::camera::LoadMatrix(bytes, 0, layout);
+        na::camera::Candidate c{};
+        na::camera::VpGeometry v{};
+        if (!na::camera::ViewProjection(m, c) || !na::camera::DecomposeViewProjection(m, v)) continue;
+        double dot = 0, d2 = 0, len2 = 0;
+        for (int j = 0; j < 3; ++j) {
+            dot += v.forward[j] * main.forward[j];
+            d2 += (v.position[j] - main.position[j]) * (v.position[j] - main.position[j]);
+            len2 += main.position[j] * main.position[j];
+        }
+        if (dot > 0.98 && std::abs(v.sy - main.sy) <= 0.05 * std::abs(main.sy) && d2 <= 0.01 * len2 + 100.0) return true;
+    }
     return false;
 }
 bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t rw, uint32_t rh,

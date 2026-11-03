@@ -279,7 +279,7 @@ na::observe::ShaderScope redirect(ID3D12GraphicsCommandList* l, na::observe::Sha
         na::observe::LiveBinding cb[16];
         const uint32_t n = na::observe::ListCurrentGraphicsCbvs(l, cb, 16);
         for (uint32_t i = 0; i < n; ++i)
-            if (na::j2::CameraBinding(cb[i].resource, cb[i].param, cb[i].table)) {
+            if (na::j2::CameraBinding(cb[i].resource, cb[i].offset, cb[i].param, cb[i].table)) {
                 ++p->world;
                 ++g_stats.world;
                 return {};
