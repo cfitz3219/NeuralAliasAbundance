@@ -78,6 +78,9 @@ bool Jitter();
 // so a picture is always shown and the mode never switches itself off. Off by default.
 void SetRenderSmall(bool on);
 bool RenderSmall();
+// Native HUD: the CBV binding (resource, root slot) is one J2 jitters as the camera, so the
+// draw is drawn with the camera and belongs in the proxy (DLSS removes its jitter there).
+bool CameraBinding(uint64_t resource, uint32_t param, bool table);
 // Render-small HUD: tint the pixels taken as HUD (diagnostic, not saved). With the native HUD
 // (native_hud.hpp) it tints where the native HUD layers draw; with the mask, the mask.
 void SetHudMaskView(bool on);

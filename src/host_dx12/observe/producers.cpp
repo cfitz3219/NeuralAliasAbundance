@@ -5041,6 +5041,27 @@ std::vector<LiveBinding> ListRootConstantBuffers(ID3D12CommandList* list)
             out.push_back({b.resource, b.offset, b.size, b.op_index, b.param, b.kind == NA_SNAP_TABLE_CBV});
     return out;
 }
+uint32_t ListCurrentGraphicsCbvs(ID3D12CommandList* list, LiveBinding* out, uint32_t max)
+{
+    if (!out || !max) return 0;
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return 0;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    uint32_t n = 0;
+    size_t scanned = 0;
+    for (auto it = ls->bindings.rbegin(); it != ls->bindings.rend() && n < max && scanned < 512; ++it, ++scanned) {
+        const auto& b = *it;
+        if (!b.resource || b.compute || (b.kind != NA_SNAP_ROOT_CBV && b.kind != NA_SNAP_TABLE_CBV)) continue;
+        const bool table = b.kind == NA_SNAP_TABLE_CBV;
+        bool seen = false; // a later binding of the same root parameter replaced this one
+        for (uint32_t i = 0; i < n && !seen; ++i) seen = out[i].param == b.param && out[i].table == table && !table;
+        if (seen) continue;
+        out[n++] = {b.resource, b.offset, b.size, b.op_index, b.param, table};
+    }
+    return n;
+}
 bool ListReferences(ID3D12CommandList* list, na_object_id id)
 {
     if (!id) return false;

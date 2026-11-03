@@ -374,6 +374,7 @@ int end_to_end(test::Device& d)
     // scene copy) covers everything; it must go to the proxy and restart the layers, and later
     // HUD draws still go native.
     const float back[4] = {0.f, 0.6f, 0.2f, 1.f};
+    nh::SetCoverRule(true); // opt-in ([present] hud_cover=1): the rule under test
     REQUIRE(SUCCEEDED(game.alloc->Reset()) && SUCCEEDED(l->Reset(game.alloc.Get(), nullptr)));
     l->SetGraphicsRootSignature(root.Get());
     l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -423,6 +424,7 @@ int end_to_end(test::Device& d)
     REQUIRE(readback(d, layer2.n0, RTS, 4, px));
     CHECK(at(px, OW, 30, 15, 0) == 0 && at(px, OW, 30, 15, 1) == 0); // the covered HUD draw is gone from the layer
     CHECK(std::abs(at(px, OW, 5, 44, 0) - 230) <= 1);                 // the later panel is there, at native size
+    nh::SetCoverRule(false);
     na_observe_stop();
     return 0;
 }

@@ -121,6 +121,9 @@ na_object_id IdOf(const void* object);
 struct LiveBinding { na_object_id resource; uint64_t offset; uint32_t size; uint64_t op_index; uint32_t param = 0; bool table = false; };
 std::vector<LiveBinding> ListRootConstantBuffers(ID3D12CommandList* list); // graphics CBVs of the recording: root CBVs and CBVs reached through descriptor tables
 bool ListReferences(ID3D12CommandList* list, na_object_id id);            // the recording referenced the resource
+// The CBVs currently bound for graphics (the latest binding of each root parameter / table slot), at
+// record time; for a draw hook. Returns the count written (at most `max`).
+uint32_t ListCurrentGraphicsCbvs(ID3D12CommandList* list, LiveBinding* out, uint32_t max);
 // True when the recording bound `color` as a render target together with `depth` as its depth target.
 bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id depth);
 // Inline insertion (J2). Called on the recording thread before a draw/dispatch uses

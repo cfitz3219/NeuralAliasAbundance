@@ -710,6 +710,17 @@ bool window_frame_now()
 // windowed bytes -> jittered (unwindowed) bytes, for J2's own reads, VP and inverse.
 struct WindowExtra { uint8_t written[64], jittered[64]; bool vp; };
 std::set<uint64_t> g_camera_resources; // buffers that have carried the camera (priority when scanning)
+// Record-time copy for the native HUD's draw hook (never under g.m there): the camera-carrying
+// buffers and the camera's root slot.
+std::mutex g_cam_pub_m;
+uint64_t g_cam_pub[64]; size_t g_cam_pub_n = 0; int64_t g_cam_pub_param = -1; bool g_cam_pub_table = false;
+void publish_camera_resources_locked()
+{
+    std::lock_guard<std::mutex> lock(g_cam_pub_m);
+    g_cam_pub_n = 0;
+    for (uint64_t r : g_camera_resources) if (g_cam_pub_n < 64) g_cam_pub[g_cam_pub_n++] = r;
+    g_cam_pub_param = g.camera_param; g_cam_pub_table = g.camera_table;
+}
 std::vector<WindowExtra> g_window_extras;
 uint64_t g_window_extras_frame = UINT64_MAX;
 // J2's own reads see the jittered (unwindowed) camera: windowed bytes the game's blocks
@@ -1037,7 +1048,7 @@ bool window_extra_camera(uint64_t res, uint64_t off, std::vector<uint8_t>& view)
         if (is_projection_of(pm, m)) put(po, windowed(pm));
     }
     ++g.stats.window_extra_cameras;
-    if (g_camera_resources.size() < 64) g_camera_resources.insert(res);
+    if (g_camera_resources.size() < 64) { g_camera_resources.insert(res); publish_camera_resources_locked(); }
     return true;
 }
 
@@ -1207,7 +1218,7 @@ void jitter_batch_impl(ID3D12CommandList* const* lists, UINT count)
                 }
                 if (rep) { touched[o / 16] = true; matched = true; break; }
             }
-        if (matched && g_camera_resources.size() < 64) g_camera_resources.insert(k->res);
+        if (matched && g_camera_resources.size() < 64 && !g_camera_resources.count(k->res)) { g_camera_resources.insert(k->res); publish_camera_resources_locked(); }
         // Derived matrices live beside the camera (the blocks that hold it); scanning every
         // other block for them is what cost 1.2 ms a frame.
         if (w && (k->slot || matched)) window_derived(*k, view, touched);
@@ -1487,6 +1498,7 @@ bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth
     ++g.stats.camera_scans;
     g.camera_param = static_cast<int64_t>(p->block->param);
     g.camera_table = p->block->table;
+    publish_camera_resources_locked();
     g.stats.camera_offset = static_cast<uint64_t>(p->offset);
     *vp = p->vp;
     *reversed = p->reversed;
@@ -2874,6 +2886,13 @@ void SetHudMaskEnabled(bool on) { g_hud_mask_on.store(on); }
 bool HudMaskEnabled() { return g_hud_mask_on.load(); }
 bool HudMaskView() { return g_hud_view.load(); }
 
+bool CameraBinding(uint64_t resource, uint32_t param, bool table)
+{
+    std::lock_guard<std::mutex> lock(g_cam_pub_m);
+    if (g_cam_pub_param < 0 || param != static_cast<uint32_t>(g_cam_pub_param) || table != g_cam_pub_table) return false;
+    for (size_t i = 0; i < g_cam_pub_n; ++i) if (g_cam_pub[i] == resource) return true;
+    return false;
+}
 bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t rw, uint32_t rh,
                     ID3D12Resource* out, uint32_t ow, uint32_t oh, bool hdr, void*)
 {

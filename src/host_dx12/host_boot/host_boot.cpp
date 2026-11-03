@@ -260,6 +260,7 @@ DWORD WINAPI InitThread(LPVOID)
         // DLSS gets the scene only. [present] native_hud=0 keeps the HUD in the proxy as before.
         if (GetPrivateProfileIntW(L"present", L"native_hud", 1, g_ini) == 1) {
             na::j2::native_hud::Install();
+            na::j2::native_hud::SetCoverRule(GetPrivateProfileIntW(L"present", L"hud_cover", 0, g_ini) == 1);
             boot_log("render-small: native-resolution HUD on");
         } else boot_log("render-small: native-resolution HUD off ([present] native_hud=0)");
         na::j2::SetHudMaskEnabled(GetPrivateProfileIntW(L"present", L"hud_mask", 0, g_ini) == 1);
