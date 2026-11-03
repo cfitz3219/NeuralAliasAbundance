@@ -3,6 +3,7 @@
 #include "host_dx12/j2/nis_sharpen.hpp"
 #include "host_dx12/j2/route_selector.hpp"
 #include "host_dx12/j2/consumer_profile.hpp"
+#include "host_dx12/j2/post_entry.hpp"
 #include "host_dx12/j2/jitter_writes.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
 #include "host_dx12/j2/compute_flow.hpp"
@@ -143,6 +144,8 @@ struct State {
     // colour's consumers, learned from SUBMITTED frames; the inline trigger fires at an
     // accepted class, else the boundary matcher decides as before.
     na::j2::ConsumerProfile profile;
+    na::j2::PostEntryProfile entries;
+    na::j2::InsertionEvent capture_entry;
     SceneInput waiting_scene;
     JitterWrites jitter_writes;
     std::vector<na::j2::ColorEvent> frame_seq; // this frame's writes/consumers of the colour, submission order
@@ -1703,6 +1706,9 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         ci.preset = static_cast<uint32_t>(e.preset);
         ci.sharpness = na::settings::Get().j2_sharpness.load(std::memory_order_relaxed);
         ci.debug_view = static_cast<uint32_t>(g_debug_view.load(std::memory_order_relaxed));
+        ci.entry_pipeline=g.capture_entry.pipeline;ci.entry_root=g.capture_entry.root;
+        ci.entry_destination=g.capture_entry.destination;ci.entry_operation=g.capture_entry.operation;
+        ci.entry_barrier=g.capture_entry.barrier;ci.entry_kind=static_cast<uint32_t>(g.capture_entry.op);
         pending.capture = na::capture::j2::RecordEvaluation(l, cp, ci);
     }
     if (evaluated) {
@@ -1803,11 +1809,12 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     return true;
 }
 
-// Inline insertion runs immediately before a draw/dispatch whose bound SRVs
-// include scene colour. The consuming PSO/targets are now established; bindings
-// alone are not reads. Prior recordings teach the first use after the final
-// scene write. The host restores game state before forwarding the real call.
-void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint32_t n, bool compute)
+// Inline insertion runs before the actual operation. Completed submitted frames
+// teach a terminal post-entry PSO/root even when its colour SRV is unresolved.
+// The original boundary matcher remains the warm-up path. Host commands restore
+// the game's state before forwarding the real operation; nothing runs at Close.
+void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint32_t n, bool compute,
+                        const na::j2::InsertionEvent* entry=nullptr)
 {
     if (!na::settings::EffectsReady() || !g.enabled.load(std::memory_order_relaxed) || g.paused.load(std::memory_order_relaxed)) return;
     uint64_t depth_id = 0, color_id = 0;
@@ -1819,6 +1826,12 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     const na::observe::HostWorkScope host; // our commands in the game's list are not the game's
     std::lock_guard<std::mutex> lock(g.m);
     if (!g.inline_mode || g.latched || !g.device) return;
+    // The existing MSAA-depth path changes raster state which this restore does
+    // not replay. Keep it at its original boundary, as for resolved consumers.
+    if(entry && g.depth_samples>1)return;
+    // Match an actual operation even with unresolved SRVs; never recover at Close.
+    if(!entry && g.depth_samples<=1 && g.entries.Ready() &&
+       na::observe::ListLiveConsumer(l,color_id).op!=na::j2::Op::CopyRead)return;
     if (!na::observe::ListRendersTo(l, color_id, depth_id)) return; // the scene was not drawn in this recording
     const uint64_t rec = na::observe::ListRecording(l);
     if (!rec) return;
@@ -1837,13 +1850,16 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     // fire when its class is accepted by the profile. A class known to be a temporary
     // reader blocks the boundary matcher too (a fact from earlier frames). Otherwise the
     // boundary matcher below decides exactly as before, so coverage never drops below it.
-    enum : uint32_t { kByClass = 1, kByPair = 2, kByBarrier = 3, kByLegacy = 4 };
+    enum : uint32_t { kByClass = 1, kByPair = 2, kByBarrier = 3, kByLegacy = 4, kByEntry=6 };
     uint32_t matched_mode = kByLegacy;
     bool by_class = false;
     na::j2::ClassKey live_class;
     uint64_t live_producer = 0, live_context = 0;
     bool fired_at_barrier = false; // the event being judged is a barrier (whichever trigger fires)
-    {
+    if(entry && g.entries.Accepts(*entry)) {
+        by_class=true;matched_mode=kByEntry;
+    } else if(entry) return;
+    else {
         const auto live = na::observe::ListLiveConsumer(l, color_id);
         // An MSAA depth resolve draws (render target, viewport, topology), which the state
         // restore does not cover: graphics consumers with MSAA depth stay on the boundary matcher.
@@ -1955,7 +1971,9 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     ID3D12GraphicsCommandList* out = nullptr;
     bool touched = false;
     const uint32_t slot = g.slot;
+    g.capture_entry=entry?*entry:na::j2::InsertionEvent{};
     const bool ok = record(one, 0, depth_id, color_id, &out, pending, l, &touched);
+    g.capture_entry={};
     if (touched && !na::observe::RestoreListState(l)) {
         // Checked as restorable above; this cannot normally happen. Stop for the session.
         g.latched = true;
@@ -1975,18 +1993,27 @@ void on_table_bind(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint3
     g.inl.valid = true;
     g.inl_frame = g.frame;
     ++g.stats.inline_recorded;
-    if (matched_mode == kByClass) ++g.stats.class_matched;
+    if(matched_mode==kByEntry)++g.stats.entry_matched;
+    else if (matched_mode == kByClass) ++g.stats.class_matched;
     else if (matched_mode == kByPair) ++g.stats.class_pair_matched;
     else if (matched_mode == kByBarrier) ++g.stats.barrier_matched;
     else ++g.stats.legacy_matched;
     // Remember what placed this frame's DLAA, so a later scene write demotes exactly that
     // pattern/class - including a boundary-matcher placement at a barrier.
-    g.class_fired = by_class || fired_at_barrier;
+    g.class_fired = matched_mode!=kByEntry && (by_class || fired_at_barrier);
     g.fired_mode = matched_mode;
     g.fired_barrier_event = fired_at_barrier;
     g.fired_class = live_class;
     g.fired_producer = live_producer;
     g.fired_context = live_context;
+}
+
+void on_table_bind(ID3D12GraphicsCommandList* l,const na_object_id* srvs,uint32_t n,bool compute) {
+    on_table_bind_impl(l,srvs,n,compute);
+}
+void on_entry(ID3D12GraphicsCommandList* l,const na::j2::InsertionEvent& entry) {
+    const bool compute=entry.op==na::j2::Op::ComputeEntry || entry.op==na::j2::Op::IndirectComputeEntry;
+    on_table_bind_impl(l,&entry.resource,1,compute,&entry);
 }
 
 // Inline and between-list are complementary opportunities in the SAME frame.
@@ -2049,6 +2076,7 @@ void SetEnabled(bool on)
     g.enabled.store(on);
     g.configured.store(on);
     if (on) na::observe::SetTableBindCallback(&on_table_bind);
+    na::observe::SetEntryCallback(on?&on_entry:nullptr);
 }
 bool Enabled() { return na::settings::EffectsReady() && g.enabled.load(); }
 PhysicalReport::~PhysicalReport()
@@ -2191,6 +2219,8 @@ void OnPresent(ID3D12CommandQueue* queue)
             // Placement profile: label this frame's consumers from the submission-ordered
             // writes and reads (facts once the frame is closed) and learn their classes.
             if (g.frame_seq_complete && !g.frame_seq.empty() && g.scene_w) {
+                g.entries.Observe(g.frame_seq,true,g.frame);
+                g.stats.entry_keys=static_cast<uint32_t>(g.entries.Size());
                 std::vector<na::j2::Labelled> labels;
                 na::j2::LabelFrame(g.frame_seq, g.scene_w, g.scene_h, labels);
                 for (const auto& lab : labels) g.profile.Observe(lab, g.frame);
@@ -2282,6 +2312,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         g.scene_color_id = selected_color;
         g.scene_w = g.scene_h = 0;
         g.profile.Clear();
+        g.entries.Clear();
         ComPtr<ID3D12Resource> c;
         c.Attach(na::observe::AcquireResource(selected_color));
         if (c) {
@@ -2606,6 +2637,7 @@ void Shutdown()
     g.frame_rejects = 0;
     g.frame_reject_text[0] = 0;
     g.profile.Clear();
+    g.entries.Clear();
     g.waiting_scene = {};
     g.jitter_writes.Clear();
     g.frame_seq.clear();

@@ -222,6 +222,8 @@ struct Stats {
     uint64_t expired_inline = 0;         // inline recordings never submitted within two frames (released)
     uint64_t between_observed = 0, between_predicted = 0; // between-list placements before an observed reader / after a predicted last scene list
     char class_note[200] = {};            // latest consumer class not accepted (explains a missed frame)
+    uint64_t entry_matched=0;
+    uint32_t entry_keys=0;
     // SE5 2026-11-02 (Cort: flicker only while panning): every frame whose DLAA ran and was then
     // followed by more scene drawing, newest first: what placed it and what drew after it.
     uint64_t late_frames = 0;

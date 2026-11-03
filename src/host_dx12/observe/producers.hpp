@@ -122,6 +122,8 @@ bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id dep
 // HostWorkScope and end with RestoreListState(list).
 using TableBindCallback = void (*)(ID3D12GraphicsCommandList* list, const na_object_id* srvs, uint32_t count, bool compute);
 void SetTableBindCallback(TableBindCallback cb);
+using EntryCallback = void (*)(ID3D12GraphicsCommandList*, const na::j2::InsertionEvent&);
+void SetEntryCallback(EntryCallback cb);
 na::j2::InsertionDecision ListInsertionDecision(ID3D12CommandList* list, na_object_id color);
 // P4-0D consumer anchor: the first actual consumer of `color` after its final write in
 // this recording (learned at submission), and the latest event as seen by a live trigger.

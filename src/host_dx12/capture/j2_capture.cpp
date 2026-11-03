@@ -186,7 +186,7 @@ void write_slot(const Slot& s)
             "  \"route\": %u,\n  \"route_mode\": %u,\n  \"history_generation\": %u,\n  \"insertion_signature\": %llu,\n"
             "  \"size\": [%u, %u],\n  \"color_format\": %u,\n  \"jitter_px\": [%.6f, %.6f],\n  \"mv_scale\": [%.4f, %.4f],\n"
             "  \"reset\": %u,\n  \"camera_cut\": %u,\n  \"preset\": %u,\n  \"sharpness\": %u,\n  \"debug_view\": %u,\n"
-            "  \"late_writes\": %llu,\n  \"frame_closed\": %s,\n  \"planes\": [\n",
+            "  \"late_writes\": %llu,\n  \"frame_closed\": %s,\n",
             s.index, (unsigned long long)id.present_ordinal, (unsigned long long)id.submission,
             (unsigned long long)s.submit_ordinal, (unsigned long long)id.recording,
             (unsigned long long)id.view_color, (unsigned long long)id.view_depth, id.view_id, id.color_sub,
@@ -194,6 +194,9 @@ void write_slot(const Slot& s)
             id.width, id.height, id.color_format, id.jitter_x, id.jitter_y, id.mv_scale_x, id.mv_scale_y,
             id.reset, id.camera_cut, id.preset, id.sharpness, id.debug_view,
             (unsigned long long)s.late_writes, s.closed ? "true" : "false");
+        std::fprintf(fp,"  \"entry_identity\": {\"pipeline\": %llu, \"root\": %llu, \"destination\": %llu, \"operation\": %llu, \"barrier\": %u, \"kind\": %u}, \"process_id\": %lu,\n  \"planes\": [\n",
+            (unsigned long long)id.entry_pipeline,(unsigned long long)id.entry_root,(unsigned long long)id.entry_destination,
+            (unsigned long long)id.entry_operation,id.entry_barrier,id.entry_kind,GetCurrentProcessId());
         bool first = true;
         for (int i = 0; i < kPlaneCount; ++i) {
             const Plane& p = s.planes[i];

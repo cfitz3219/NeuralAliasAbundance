@@ -112,6 +112,8 @@ struct ListState {
     na_object_id cur_rts[8] = {};
     uint32_t cur_nrt = 0;
     uint32_t cur_ds_sub = NA_UNKNOWN_U32;
+    na_object_id pending_entry = 0; // selected colour whose handoff awaits its first actual operation
+    uint32_t entry_barrier=0;
     bool restorable = true;              // false after work whose state effects we cannot replay
     bool in_render_pass = false;         // between BeginRenderPass and EndRenderPass (no host copy/dispatch allowed)
     int8_t mip_level = -1;               // live mip bias: twin level latched at Reset (-1 = the game's own objects)
@@ -2225,6 +2227,8 @@ struct On<sl::list::Reset> {
                     ls->uses_complete = true;
                     ls->targets.clear();
                     ls->insertion.Reset();
+                    ls->pending_entry = 0;
+                    ls->entry_barrier=0;
                     ls->sampled_textures.clear();
                     ls->cleared.clear();
                     ls->pso = pso;
@@ -2590,6 +2594,7 @@ void shadow_arg(GL* l, uint32_t compute, UINT param, uint8_t type, uint64_t valu
     });
 }
 std::atomic<TableBindCallback> g_table_cb{nullptr};
+std::atomic<EntryCallback> g_entry_cb{nullptr};
 template <uint32_t Compute>
 void root_table(GL* l, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE h)
 {
@@ -2795,6 +2800,7 @@ struct On<sl::list::ClearRenderTargetView> {
         with_list_state(l, [&](ListState& ls) {
             std::lock_guard<std::mutex> bl(ls.bind_m);
             if (v.resource) ls.insertion.Add({v.resource, 0, 0, true, na::j2::Op::ClearWrite});
+            if (v.resource == ls.pending_entry) ls.pending_entry = 0;
             if (v.resource && ls.cleared.size() < 64 && std::find(ls.cleared.begin(), ls.cleared.end(), v.resource) == ls.cleared.end())
                 ls.cleared.push_back(v.resource);
         });
@@ -2806,6 +2812,20 @@ struct On<sl::list::ExecuteIndirect> {
     {
         Rec r;
         if (begin_op(l, &r)) emit_op(r, NA_OP_EXECUTE_INDIRECT, {max}, nullptr, 0, 0, NA_EVF_METHOD_UNOBSERVED);
+        bool graphics=false;
+        {
+            std::shared_lock<std::shared_mutex> lock(g_m);
+            na_object_id id=0;auto* ls=list_state_locked(l,&id);
+            if(ls) {
+                std::lock_guard<std::mutex> bl(ls->bind_m);
+                const auto p=g_objs.find(canon(ls->pso));
+                if(p!=g_objs.end() && p->second.created.size()>=sizeof(na_ev_pipeline_created)) {
+                    const auto* d=reinterpret_cast<const na_ev_pipeline_created*>(p->second.created.data());
+                    graphics=d->pipeline_kind==NA_PIPELINE_GRAPHICS || (d->pipeline_kind==NA_PIPELINE_STREAM && !d->stage_bytes[NA_STAGE_CS]);
+                }
+            }
+        }
+        if(r.list && graphics)note_draw(l);
     }
 };
 
@@ -2969,6 +2989,8 @@ void before_read_transition(GL* l, UINT count, const D3D12_RESOURCE_BARRIER* bar
                 ls->states.insert(ls->states.end(), entry_states.begin(), entry_states.end());
             else ls->evidence_complete = false;
             ls->insertion.Add({color, 0, UINT64_MAX, false, na::j2::Op::Barrier});
+            ls->pending_entry = color;
+            ++ls->entry_barrier;
         }
         if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, true);
         break; // our pass runs before the whole original barrier batch
@@ -2982,6 +3004,14 @@ void before_texture_copy(GL* l, ID3D12Resource* dst, ID3D12Resource* src)
     GetLiveSelection(&depth, &color);
     const auto source = resource_id(src), destination = resource_id(dst);
     if (!color) return;
+    // A real copy consumes or replaces the handoff before any shader operation.
+    // Do not later label an unrelated draw as its first entry.
+    if (source == color || destination == color) {
+        with_list_state(l, [&](ListState& ls) {
+            std::lock_guard<std::mutex> bl(ls.bind_m);
+            ls.pending_entry = 0;
+        });
+    }
     const bool from_color = source == color;
     if (!from_color && !is_derived(source)) return;
     add_derived(destination); // lineage: the copy carries the scene on
@@ -3011,21 +3041,37 @@ void after_texture_copy(GL* l, ID3D12Resource* dst)
     ls->insertion.Add({destination, 0, 0, true, na::j2::Op::CopyWrite});
 }
 
-void before_shader_use(GL* l, bool compute)
+void before_shader_use(GL* l, bool compute, bool indirect=false)
 {
     if (t_host_work || !na::observe_internal::Started()) return;
     uint64_t depth = 0, color = 0;
     GetLiveSelection(&depth, &color);
     if (!color) return;
     bool reads_color = false;
+    na::j2::InsertionEvent entry;
     {
         std::shared_lock<std::shared_mutex> lock(g_m);
         na_object_id lid = 0;
         auto* ls = list_state_locked(l, &lid);
         if (!ls) return;
         std::lock_guard<std::mutex> bl(ls->bind_m);
+        const auto current_pso = g_objs.find(canon(ls->pso));
+        if(indirect) {
+            if(current_pso==g_objs.end() || current_pso->second.created.size()<sizeof(na_ev_pipeline_created))return;
+            const auto* pd=reinterpret_cast<const na_ev_pipeline_created*>(current_pso->second.created.data());
+            compute=pd->pipeline_kind==NA_PIPELINE_COMPUTE || pd->stage_bytes[NA_STAGE_CS]!=0;
+        }
         const auto signature = g_objs.find(canon(ls->root_sig[compute]));
         if (signature == g_objs.end()) return;
+        if(ls->pending_entry==color) {
+            ls->pending_entry=0;
+            entry={color,compute?0:ls->cur_rt,current_pso==g_objs.end()?0:current_pso->second.id,false,
+                indirect?(compute?na::j2::Op::IndirectComputeEntry:na::j2::Op::IndirectGraphicsEntry):
+                         (compute?na::j2::Op::ComputeEntry:na::j2::Op::GraphicsEntry),signature->second.root_hash};
+            resource_dims_locked(entry.destination,&entry.dst_w,&entry.dst_h,&entry.dst_fmt);
+            entry.recording=ls->generation.load();entry.operation=ls->op_index.load()+1;entry.barrier=ls->entry_barrier;
+            ls->insertion.Add(entry);
+        }
         na_object_id destination = compute ? 0 : ls->cur_rt;
         uint8_t color_srvs = 0;
         na_object_id srv_ids[16] = {};
@@ -3082,6 +3128,7 @@ void before_shader_use(GL* l, bool compute)
                 ls->insertion.Add({color, destination, reinterpret_cast<uint64_t>(ls->pso), false, na::j2::Op::DerivedRead});
         }
     }
+    if(entry.resource)if(auto cb=g_entry_cb.load(std::memory_order_acquire))cb(l,entry);
     if (reads_color) if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, compute);
 }
 
@@ -3242,6 +3289,8 @@ struct ListHook<Slot, R(A...)> {
             }
             if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced || Slot == sl::list::Dispatch)
                 if (scope.outermost && !scope.ambiguous) before_shader_use(l, Slot == sl::list::Dispatch);
+            if constexpr(Slot==sl::list::ExecuteIndirect)
+                if(scope.outermost && !scope.ambiguous)before_shader_use(l,false,true);
             fn(l, a...);
             if constexpr (Slot == sl::list::CopyResource || Slot == sl::list::ResolveSubresource || Slot == sl::list::CopyTextureRegion) {
                 if (scope.outermost && !scope.ambiguous) {
@@ -4734,6 +4783,7 @@ na::j2::LiveConsumer ListLiveConsumer(ID3D12CommandList* list, na_object_id colo
     return ls->insertion.Live(color);
 }
 void SetTableBindCallback(TableBindCallback cb) { g_table_cb.store(cb, std::memory_order_release); }
+void SetEntryCallback(EntryCallback cb) { g_entry_cb.store(cb, std::memory_order_release); }
 bool ListCurrentTargets(ID3D12CommandList* list, na_object_id* rt, na_object_id* ds)
 {
     std::shared_lock<std::shared_mutex> rl(g_m);

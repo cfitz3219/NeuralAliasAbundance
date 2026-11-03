@@ -13,7 +13,8 @@ enum class Op : uint8_t {
     Unknown = 0, DrawWrite, ClearWrite, CopyWrite,  // writes
     Barrier,                                        // RT -> read transition (not a consumer)
     GraphicsRead, ComputeRead, CopyRead,            // actual consumers
-    DerivedRead                                     // read of a texture copied from the colour this frame (lineage only)
+    DerivedRead,                                    // read of a texture copied from the colour this frame (lineage only)
+    GraphicsEntry, ComputeEntry, IndirectGraphicsEntry, IndirectComputeEntry
 };
 struct InsertionEvent {
     uint64_t resource = 0, destination = 0, pipeline = 0;
@@ -25,6 +26,8 @@ struct InsertionEvent {
     uint8_t color_srvs = 0;  // descriptors of the scene colour in the bound tables
     uint8_t view_srvs = 0;   // other view-sized textures read alongside (history etc.)
     bool with_depth = false; // write: the selected scene depth was bound (scene content, not reuse)
+    uint64_t recording=0,operation=0;
+    uint32_t barrier=0;
 };
 inline Op ClassifyOp(const InsertionEvent& e)
 {
@@ -34,6 +37,7 @@ inline Op ClassifyOp(const InsertionEvent& e)
     return e.pipeline ? Op::GraphicsRead : Op::CopyRead;
 }
 inline bool IsConsumer(Op op) { return op == Op::GraphicsRead || op == Op::ComputeRead || op == Op::CopyRead; }
+inline bool IsEntry(Op op) { return op == Op::GraphicsEntry || op == Op::ComputeEntry || op == Op::IndirectGraphicsEntry || op == Op::IndirectComputeEntry; }
 
 // P4-0D (Argon's PostEntryPSO, with Astra's corrections): the first ACTUAL consumer of
 // the selected colour after its final write in a recording, learned from completed,
@@ -119,6 +123,7 @@ public:
         std::map<uint64_t, uint32_t> writer_reads;
         for (const auto& event : events_) {
             if (event.resource != color) continue;
+            if (IsEntry(event.op)) continue; // operation evidence is not proof of a resource read
             if (event.op == Op::DerivedRead) { ++result.derived_reads; continue; } // lineage only
             if (!event.write) ++result.all_reads;
             if (!event.write && event.pipeline == UINT64_MAX) ++result.transitions;
@@ -245,7 +250,7 @@ public:
                 c.producer = producer;
                 c.list_start = first; first = false;
                 out.push_back(c);
-            } else if ((IsConsumer(op) && e.destination != color) || op == Op::Barrier) {
+            } else if ((IsConsumer(op) && e.destination != color) || op == Op::Barrier || IsEntry(op)) {
                 ColorEvent c;
                 c.op = op; c.raw = e; c.producer = producer;
                 c.list_start = first; first = false;

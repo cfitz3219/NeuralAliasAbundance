@@ -88,7 +88,7 @@ inline void LabelFrame(const std::vector<ColorEvent>& seq, uint32_t scene_w, uin
     bool post_barrier_found = false;
     // A barrier (RT -> read transition) is not a consumer: it never counts as "the colour
     // consumed again", and never as copying the image onward.
-    const auto consumes = [](const ColorEvent& e) { return !e.write && e.op != Op::Barrier; };
+    const auto consumes = [](const ColorEvent& e) { return !e.write && e.op != Op::Barrier && !IsEntry(e.op); };
     // Scene construction continues after `from`: a draw into the colour (depth attachment
     // or not) before the image is copied onward. Clears/copies into the colour are reuse.
     const auto continued = [&](size_t from) {
@@ -102,6 +102,7 @@ inline void LabelFrame(const std::vector<ColorEvent>& seq, uint32_t scene_w, uin
     uint64_t last_producer = 0; // submission order also spans a writer/consumer list split
     for (size_t i = 0; i < seq.size(); ++i) {
         const ColorEvent& c = seq[i];
+        if (IsEntry(c.op)) continue;
         if (c.list_start) list_context = 0;
         if (c.write) { last_producer = c.producer; continue; }
         if (c.op == Op::Barrier) {

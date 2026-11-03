@@ -43,6 +43,8 @@ struct Identity {
     float mv_scale_x = 1, mv_scale_y = 1;
     uint32_t reset = 0, camera_cut = 0;
     uint32_t preset = 0, sharpness = 0, debug_view = 0;
+    uint64_t entry_pipeline=0,entry_root=0,entry_destination=0,entry_operation=0;
+    uint32_t entry_barrier=0,entry_kind=0;
 };
 
 // Planes recorded after the evaluate, in the states they are in at that point.

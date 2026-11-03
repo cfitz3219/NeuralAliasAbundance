@@ -849,6 +849,8 @@ void write_status_line()
                 (unsigned long long)j2.labelled_frames, (unsigned long long)j2.unlabelled_frames, (unsigned long long)j2.expired_inline,
                 (unsigned long long)j2.between_observed, (unsigned long long)j2.between_predicted, j2.class_note);
             if (na2 > 0) WriteFile(f, al, static_cast<DWORD>((std::min)(na2, static_cast<int>(sizeof al - 1))), &written, nullptr);
+            const int en=snprintf(al,sizeof al,"j2_entry keys=%u matched=%llu source=actual_operation\r\n",j2.entry_keys,(unsigned long long)j2.entry_matched);
+            if(en>0)WriteFile(f,al,static_cast<DWORD>(en),&written,nullptr);
             const auto cs = na::capture::j2::GetStats();
             {
                 // Four separate outcomes (Astra): frames without DLAA, DLAA placed before more
