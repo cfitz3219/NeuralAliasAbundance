@@ -209,6 +209,15 @@ CreateForCompositionFn g_orig_create_for_composition = nullptr;
 // Render-small (S1 integration, docs/NATIVE-PRESENT-SIZING.md): the REAL chain is always created at
 // the window's physical size. A game that already learned the advertised render size and passes it
 // back gets the physical size instead (else the presenter would scale an already small chain again).
+// The presenter's rounding (presenter.cpp ensure_proxies_locked): round(real * scale), full size
+// when that would not be smaller.
+na::native_present::Size small_render_for(na::native_present::Size out, double f)
+{
+    if (!(f < 1.0) || !out.w || !out.h) return out;
+    na::native_present::Size r{(std::max)(1u, static_cast<UINT>(std::lround(out.w * f))),
+                               (std::max)(1u, static_cast<UINT>(std::lround(out.h * f)))};
+    return r.w >= out.w || r.h >= out.h ? out : r;
+}
 void small_native_dims(HWND w, UINT& width, UINT& height)
 {
     if (!na::j2::RenderSmall() || !w) return;
@@ -221,15 +230,8 @@ void small_attach(HWND w, IDXGISwapChain* sc)
     if (!na::j2::RenderSmall() || !w || !sc) return;
     DXGI_SWAP_CHAIN_DESC real{};
     { na::native_present::NativeScope native; if (FAILED(sc->GetDesc(&real))) return; }
-    const UINT W = real.BufferDesc.Width, H = real.BufferDesc.Height;
-    const double f = na::present::RenderScale();
-    na::native_present::Size render{W, H};
-    if (f < 1.0) {
-        render.w = (std::max)(1u, static_cast<UINT>(std::lround(W * f)));
-        render.h = (std::max)(1u, static_cast<UINT>(std::lround(H * f)));
-        if (render.w >= W || render.h >= H) render = {W, H};
-    }
-    na::native_present::Attach(w, {W, H}, render);
+    const na::native_present::Size out{real.BufferDesc.Width, real.BufferDesc.Height};
+    na::native_present::Attach(w, out, small_render_for(out, static_cast<double>(na::present::RenderScale())));
 }
 HRESULT STDMETHODCALLTYPE DetourCreateSwapChain(IDXGIFactory* f, IUnknown* dev, DXGI_SWAP_CHAIN_DESC* d, IDXGISwapChain** out)
 {
@@ -1621,6 +1623,12 @@ LRESULT call_game_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     if (na::j2::RenderSmall()) {
         WINDOWPOS scratch{}; // must outlive the game's call
+        // A REAL window resize (not our posted request): the new physical size and its render size
+        // go together, with the presenter's exact scale and rounding.
+        if (msg == WM_SIZE && wp != SIZE_MINIMIZED && msg != na::native_present::ResizeMessage()) {
+            const na::native_present::Size out{LOWORD(lp), HIWORD(lp)};
+            if (out.w && out.h) na::native_present::BeginWindowResize(hwnd, out, small_render_for(out, static_cast<double>(na::present::RenderScale())));
+        }
         if (na::native_present::PrepareSizeMessage(hwnd, msg, wp, lp, scratch) == na::native_present::MessageAction::Consume) return 0;
         na::native_present::MapGameMouseMessage(hwnd, msg, lp);
         return CallWindowProcW(g_state.orig_wndproc, hwnd, msg, wp, lp);
@@ -2672,12 +2680,7 @@ void small_follow_mode()
     na::present::SetRenderScale(f, &na::j2::PresentUpscale, nullptr);
     const np::SizeState st = np::GetSizeState();
     if (!st.enabled) { g_small_asked = f; return; }
-    np::Size r = st.output;
-    if (f < 1.f) {
-        r.w = (std::max)(1u, static_cast<UINT>(std::lround(st.output.w * static_cast<double>(f))));
-        r.h = (std::max)(1u, static_cast<UINT>(std::lround(st.output.h * static_cast<double>(f))));
-        if (r.w >= st.output.w || r.h >= st.output.h) r = st.output;
-    }
+    const np::Size r = small_render_for(st.output, static_cast<double>(f));
     if ((r.w == st.render.w && r.h == st.render.h) || np::RequestRenderSize(r)) g_small_asked = f;
 }
 HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* pp)
