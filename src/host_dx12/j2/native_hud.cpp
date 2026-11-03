@@ -38,7 +38,7 @@ struct Proxy {
     na_object_id mirrored = 0;   // the game depth target our native depths currently mirror
     DXGI_FORMAT view = DXGI_FORMAT_UNKNOWN;
     uint32_t scene = 0, redirected = 0, forwarded = 0;
-    uint32_t depth_draws = 0, blended = 0; // of `redirected`: with a depth target / with RT0 blending
+    uint32_t depth_draws = 0, blended = 0, covered = 0; // of `redirected`: with a depth target / with RT0 blending
 };
 struct Clear { D3D12_CLEAR_FLAGS flags = D3D12_CLEAR_FLAG_DEPTH; float depth = 1.f; uint8_t stencil = 0; };
 struct Layers {
@@ -270,13 +270,30 @@ na::observe::ShaderScope redirect(ID3D12GraphicsCommandList* l, na::observe::Sha
     std::lock_guard<std::mutex> lock(g_m);
     Proxy* p = find_locked(st.rt);
     if (!p || !p->ow) return {};
+    const bool shaped = SceneShaped(st.pipeline_known && st.blend_mask != NA_UNKNOWN_U32, st.blend_mask, uint64_t(call.args[0]), uint64_t(call.args[1]));
     if (!p->hud) {
-        if (SceneShaped(st.pipeline_known && st.blend_mask != NA_UNKNOWN_U32, st.blend_mask, uint64_t(call.args[0]), uint64_t(call.args[1]))) {
+        if (shaped) {
             ++p->scene;
             ++g_stats.scene_draws;
             return {};
         }
         p->hud = true;
+    } else if (call.args[0] <= 6 && call.args[1] == 1 &&
+               CoversTarget(st.viewport_count ? st.viewports[0] : nullptr, st.scissor_count ? st.scissors[0] : nullptr, p->rw, p->rh)) {
+        // A full-screen draw after the HUD started (Anno's pause menu: a blurred copy of the scene,
+        // read by pixel position, so at native size it showed the render-size picture in the top-left
+        // corner and edge streaks elsewhere, Cort 2026-11-03). Full-screen passes belong with the
+        // picture: it goes to the proxy, where DLSS takes it. An opaque one hides everything drawn
+        // before it, so the layers start again; a blended one leaves the earlier HUD on top.
+        if (shaped && p->cleared) {
+            const float grey = stored_grey(g_l.typeless);
+            const float black[4] = {0.f, 0.f, 0.f, 1.f}, back[4] = {grey, grey, grey, 1.f};
+            l->ClearRenderTargetView(clear_rtv_locked(0), black, 0, nullptr);
+            l->ClearRenderTargetView(clear_rtv_locked(1), back, 0, nullptr);
+        }
+        ++p->covered;
+        ++g_stats.covered;
+        return {};
     }
     const char* why = nullptr;
     const DXGI_FORMAT view = static_cast<DXGI_FORMAT>(st.rtv_format);
@@ -432,6 +449,13 @@ bool SceneShaped(bool blend_known, uint32_t blend_mask, uint64_t count, uint64_t
 {
     return blend_known && (blend_mask & 1u) == 0 && count >= 3 && count <= 6 && instances == 1;
 }
+bool CoversTarget(const float* vp, const int32_t* sc, uint32_t w, uint32_t h)
+{
+    if (!vp || !sc || !w || !h) return false;
+    const bool v = vp[0] <= 0.5f && vp[1] <= 0.5f && vp[0] + vp[2] >= float(w) - 0.5f && vp[1] + vp[3] >= float(h) - 0.5f;
+    const bool s = sc[0] <= 0 && sc[1] <= 0 && sc[2] >= int32_t(w) && sc[3] >= int32_t(h);
+    return v && s;
+}
 void ScaleViewport(const float in[6], float sx, float sy, float out[6])
 {
     out[0] = in[0] * sx; out[1] = in[1] * sy; out[2] = in[2] * sx; out[3] = in[3] * sy; out[4] = in[4]; out[5] = in[5];
@@ -490,14 +514,14 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
     ++g_stats.frames;
     if (hud) ++g_stats.hud_frames;
     g_stats.last_scene = p->scene; g_stats.last_redirected = p->redirected; g_stats.last_forwarded = p->forwarded;
-    g_stats.last_depth = p->depth_draws; g_stats.last_blended = p->blended;
+    g_stats.last_depth = p->depth_draws; g_stats.last_blended = p->blended; g_stats.last_covered = p->covered;
     g_stats.proxy_format = uint32_t(p->format); g_stats.view_format = uint32_t(p->view);
     g_stats.grey = p->view != DXGI_FORMAT_UNKNOWN ? GreyFor(p->view) : 0.f;
     p->hud = p->cleared = false;
     p->mirrored = 0;
     p->view = DXGI_FORMAT_UNKNOWN;
     p->scene = p->redirected = p->forwarded = 0;
-    p->depth_draws = p->blended = 0;
+    p->depth_draws = p->blended = p->covered = 0;
     return hud;
 }
 
@@ -512,10 +536,10 @@ std::string StatusLine()
     char b[512];
     std::snprintf(b, sizeof b,
                   "native_hud on=%u frames=%llu hud_frames=%llu scene_draws=%llu redirected=%llu forwarded=%llu restore_failed=%llu "
-                  "last_frame=scene:%u,hud:%u,forwarded:%u,depth:%u,blended:%u proxy_fmt=%u view_fmt=%u grey=%.4f last_forward=\"%s\"",
+                  "covered=%llu last_frame=scene:%u,hud:%u,forwarded:%u,depth:%u,blended:%u,covered:%u proxy_fmt=%u view_fmt=%u grey=%.4f last_forward=\"%s\"",
                   Enabled() ? 1u : 0u, (unsigned long long)s.frames, (unsigned long long)s.hud_frames, (unsigned long long)s.scene_draws,
-                  (unsigned long long)s.redirected, (unsigned long long)s.forwarded, (unsigned long long)s.restore_failed,
-                  s.last_scene, s.last_redirected, s.last_forwarded, s.last_depth, s.last_blended, s.proxy_format, s.view_format,
+                  (unsigned long long)s.redirected, (unsigned long long)s.forwarded, (unsigned long long)s.restore_failed, (unsigned long long)s.covered,
+                  s.last_scene, s.last_redirected, s.last_forwarded, s.last_depth, s.last_blended, s.last_covered, s.proxy_format, s.view_format,
                   double(s.grey), s.last_forward);
     return b;
 }

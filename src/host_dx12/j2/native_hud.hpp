@@ -49,8 +49,9 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
 struct Stats {
     uint64_t frames = 0, hud_frames = 0;    // frames presented while learned / with a HUD layer
     uint64_t scene_draws = 0, redirected = 0, forwarded = 0, restore_failed = 0;
+    uint64_t covered = 0; // opaque full-screen draws after the HUD started: sent to the proxy, layers restarted
     uint32_t last_scene = 0, last_redirected = 0, last_forwarded = 0; // the last presented frame
-    uint32_t last_depth = 0, last_blended = 0;  // of its redirected draws: depth-tested / blended
+    uint32_t last_depth = 0, last_blended = 0, last_covered = 0;  // of its redirected draws: depth-tested / blended
     uint32_t proxy_format = 0, view_format = 0; // DXGI formats of the proxy and of the HUD's views
     float grey = 0.f;                           // the grey layer's background as read through the view
     char last_forward[80] = {};             // why the last forwarded HUD draw was not redirected
@@ -62,6 +63,7 @@ std::string StatusLine();
 DXGI_FORMAT TypelessOf(DXGI_FORMAT f);      // the layer's resource format; UNKNOWN = not supported
 float GreyFor(DXGI_FORMAT view);            // N1's background as the shader reads it through `view`
 bool SceneShaped(bool blend_known, uint32_t blend_mask, uint64_t count, uint64_t instances);
+bool CoversTarget(const float* viewport6, const int32_t* scissor4, uint32_t w, uint32_t h); // the whole w x h target
 void ScaleViewport(const float in[6], float sx, float sy, float out[6]);
 void ScaleScissor(const int32_t in[4], float sx, float sy, uint32_t ow, uint32_t oh, int32_t out[4]);
 

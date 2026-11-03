@@ -97,6 +97,14 @@ void helpers()
     CHECK(nh::SceneShaped(true, 0, 3, 1));        // full-screen triangle, opaque
     CHECK(nh::SceneShaped(true, 0, 6, 1));        // quad
     CHECK(!nh::SceneShaped(true, 1, 3, 1));       // blended: HUD
+    {
+        const float vp[6] = {0, 0, 64, 32, 0, 1}, half[6] = {0, 0, 32, 32, 0, 1};
+        const int32_t all[4] = {0, 0, 64, 32}, part[4] = {0, 0, 64, 16};
+        CHECK(nh::CoversTarget(vp, all, 64, 32));
+        CHECK(!nh::CoversTarget(half, all, 64, 32));
+        CHECK(!nh::CoversTarget(vp, part, 64, 32));
+        CHECK(!nh::CoversTarget(nullptr, all, 64, 32));
+    }
     CHECK(!nh::SceneShaped(true, 0, 600, 1));     // geometry: HUD
     CHECK(!nh::SceneShaped(true, 0, 6, 40));      // instanced quads (glyphs): HUD
     CHECK(!nh::SceneShaped(false, 0, 3, 1));      // unknown blending: never taken for the scene
@@ -361,6 +369,60 @@ int end_to_end(test::Device& d)
                 at(have, OW, 20, 10, 0), at(have, OW, 20, 10, 1), at(have, OW, 20, 10, 2),
                 at(have, OW, 45, 22, 0), at(have, OW, 45, 22, 1), at(have, OW, 45, 22, 2));
     CHECK(worst <= 4);
+
+    // Second frame, Anno's pause menu: after a HUD draw, an opaque full-screen draw (the blurred
+    // scene copy) covers everything; it must go to the proxy and restart the layers, and later
+    // HUD draws still go native.
+    const float back[4] = {0.f, 0.6f, 0.2f, 1.f};
+    REQUIRE(SUCCEEDED(game.alloc->Reset()) && SUCCEEDED(l->Reset(game.alloc.Get(), nullptr)));
+    l->SetGraphicsRootSignature(root.Get());
+    l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    l->OMSetRenderTargets(1, &rtv[0], FALSE, nullptr);
+    l->RSSetViewports(1, &full);
+    l->RSSetScissorRects(1, &all);
+    l->SetPipelineState(plain[0].Get());
+    l->SetGraphicsRoot32BitConstants(0, 4, kScene, 0);
+    l->DrawInstanced(3, 1, 0, 0); // composite
+    l->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.f, 0, 0, nullptr);
+    l->OMSetRenderTargets(1, &rtv[0], FALSE, &dsv);
+    {
+        const D3D12_RECT r{kHud[0].rect[0], kHud[0].rect[1], kHud[0].rect[2], kHud[0].rect[3]};
+        l->RSSetScissorRects(1, &r);
+        l->SetPipelineState(with_depth[int(kHud[0].blend)].Get());
+        l->SetGraphicsRoot32BitConstants(0, 4, kHud[0].color, 0);
+        l->DrawInstanced(3, 1, 0, 0); // HUD: native
+    }
+    l->OMSetRenderTargets(1, &rtv[0], FALSE, nullptr);
+    l->RSSetScissorRects(1, &all);
+    l->SetPipelineState(plain[0].Get());
+    l->SetGraphicsRoot32BitConstants(0, 4, back, 0);
+    l->DrawInstanced(3, 1, 0, 0); // pause background: covers the screen
+    l->OMSetRenderTargets(1, &rtv[0], FALSE, &dsv);
+    {
+        const D3D12_RECT r{kHud[2].rect[0], kHud[2].rect[1], kHud[2].rect[2], kHud[2].rect[3]};
+        l->RSSetScissorRects(1, &r);
+        l->SetPipelineState(with_depth[int(kHud[2].blend)].Get());
+        l->SetGraphicsRoot32BitConstants(0, 4, kHud[2].color, 0);
+        l->DrawInstanced(3, 1, 0, 0); // menu panel: native
+    }
+    REQUIRE(SUCCEEDED(l->Close()));
+    d.queue->ExecuteCommandLists(1, lists);
+    d.WaitIdle();
+    CHECK(dev->GetDeviceRemovedReason() == S_OK);
+    const nh::Stats s2 = nh::GetStats();
+    nh::Layer layer2;
+    const bool got2 = nh::TakeFrame(proxy.Get(), RW, RH, OW, OH, &layer2);
+    std::printf("native HUD pause frame: layer=%d %s\n", got2 ? 1 : 0, nh::StatusLine().c_str());
+    CHECK(got2);
+    CHECK(s2.scene_draws - st.scene_draws == 1);
+    CHECK(s2.redirected - st.redirected == 2);
+    CHECK(s2.covered - st.covered == 1);
+    REQUIRE(got2 && layer2.n0);
+    REQUIRE(readback(d, proxy.Get(), RTS, 4, px));
+    CHECK(std::abs(at(px, RW, 20, 10, 1) - 153) <= 1 && at(px, RW, 20, 10, 0) == 0); // the background, in DLSS's input
+    REQUIRE(readback(d, layer2.n0, RTS, 4, px));
+    CHECK(at(px, OW, 30, 15, 0) == 0 && at(px, OW, 30, 15, 1) == 0); // the covered HUD draw is gone from the layer
+    CHECK(std::abs(at(px, OW, 5, 44, 0) - 230) <= 1);                 // the later panel is there, at native size
     na_observe_stop();
     return 0;
 }
