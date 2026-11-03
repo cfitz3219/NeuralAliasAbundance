@@ -62,6 +62,11 @@ bool RewriteDesc1(HWND hwnd, DXGI_SWAP_CHAIN_DESC1* desc);
 // Returns a token, or 0 for failure/no change/pending request. No callback or
 // physical SetWindowPos occurs under a helper lock (or at all here).
 uint64_t RequestRenderSize(Size render);
+// Already on the window thread for a REAL WM_SIZE: caller computes render
+// with the presenter's exact scale/rounding and supplies the new physical
+// output. Supersedes an older pending request, without posting another message.
+// Call before PrepareSizeMessage, never for our registered synthetic message.
+uint64_t BeginWindowResize(HWND hwnd, Size output, Size render);
 UINT ResizeMessage();
 enum class MessageAction { Forward, Changed, Consume };
 MessageAction PrepareSizeMessage(HWND hwnd, UINT& msg, WPARAM& wp,
