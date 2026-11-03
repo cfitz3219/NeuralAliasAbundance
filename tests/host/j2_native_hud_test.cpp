@@ -386,8 +386,8 @@ int end_to_end(test::Device& d)
     l->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.f, 0, 0, nullptr);
     l->OMSetRenderTargets(1, &rtv[0], FALSE, &dsv);
     {
-        const D3D12_RECT r{kHud[0].rect[0], kHud[0].rect[1], kHud[0].rect[2], kHud[0].rect[3]};
-        l->RSSetScissorRects(1, &r);
+        const D3D12_RECT hr{kHud[0].rect[0], kHud[0].rect[1], kHud[0].rect[2], kHud[0].rect[3]};
+        l->RSSetScissorRects(1, &hr);
         l->SetPipelineState(with_depth[int(kHud[0].blend)].Get());
         l->SetGraphicsRoot32BitConstants(0, 4, kHud[0].color, 0);
         l->DrawInstanced(3, 1, 0, 0); // HUD: native
@@ -399,8 +399,8 @@ int end_to_end(test::Device& d)
     l->DrawInstanced(3, 1, 0, 0); // pause background: covers the screen
     l->OMSetRenderTargets(1, &rtv[0], FALSE, &dsv);
     {
-        const D3D12_RECT r{kHud[2].rect[0], kHud[2].rect[1], kHud[2].rect[2], kHud[2].rect[3]};
-        l->RSSetScissorRects(1, &r);
+        const D3D12_RECT hr{kHud[2].rect[0], kHud[2].rect[1], kHud[2].rect[2], kHud[2].rect[3]};
+        l->RSSetScissorRects(1, &hr);
         l->SetPipelineState(with_depth[int(kHud[2].blend)].Get());
         l->SetGraphicsRoot32BitConstants(0, 4, kHud[2].color, 0);
         l->DrawInstanced(3, 1, 0, 0); // menu panel: native
