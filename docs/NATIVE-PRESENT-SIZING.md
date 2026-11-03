@@ -54,6 +54,13 @@ desktop modes. They give the game a coherent client extent and map input to it.
    `ExpireResize()` so a game ignoring WM_SIZE cannot strand a pending request.
    Old input mapping stays active throughout the pending period. This changes
    no route and introduces no old-picture repeats.
+   For a REAL physical WM_SIZE, call `BeginWindowResize(hwnd,newOutput,newRender)`
+   first, using the presenter's exact fraction/rounding, then prepare the game
+   message. This supersedes a queued mode request and commits both output and
+   render extents together when proxies exist. Do not derive the new fraction
+   from rounded old pixel dimensions (that can differ by one pixel). Do not
+   call this for the helper's registered synthetic message. Otherwise a real
+   window resize would incorrectly tell the game its old render dimensions.
 8. Add `FormatSizeStatus` and `FormatInputStatus` to the existing worker log.
    Those functions format only: no disk I/O or readbacks occur in hooks. These
    counters prove which implemented surfaces a game queried; static EXE imports
@@ -109,6 +116,10 @@ snapshots. No mouse movement, foreground changes or game process is involved.
 
 Initial result: **12 cases pass**; follow-up with a separate engine/overlay DLL
 and actual posted-message WndProc dispatch: **14 cases pass**, Release `/W4 /WX`.
+The final physical-window resize/superseded-request case brings this to
+**15 cases passing**. Full rebuilt host/baseline suite at the initial helper
+increment: **178 passed, 4 skipped, 0 failed / 182**, 341.11 seconds; the final
+helper changes were separately rebuilt and all 15 focused cases rerun.
 The posted-message case re-enters the helper from the simulated game callback,
 queries the new size, commits it, and verifies the physical window never moved.
 This proves helper behavior,

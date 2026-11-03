@@ -137,6 +137,19 @@ int main() {
             CHECK(!CompleteResize(retry,true,{1720,720})); deliver(w.hwnd,final);
             CHECK(CompleteResize(final,true,{1720,720}));
         }},
+        {"physical window resize supplies exact presenter rounding and supersedes queued mode", [] {
+            Window w; CHECK(Attach(w.hwnd,{3440,1440},{2293,960}));
+            const auto old=RequestRenderSize({1720,720}); CHECK(old);
+            const auto token=BeginWindowResize(w.hwnd,{2560,1440},{1707,960}); CHECK(token>old);
+            CHECK(BeginWindowResize(w.hwnd,{2560,1440},{1707,960})==token);
+            CHECK(!CompleteResize(old,true,{1720,720}));
+            UINT msg=WM_SIZE; WPARAM wp=SIZE_RESTORED; LPARAM lp=MAKELPARAM(2560,1440); WINDOWPOS scratch{};
+            CHECK(PrepareSizeMessage(w.hwnd,msg,wp,lp,scratch)==MessageAction::Changed);
+            CHECK(LOWORD(lp)==1707 && HIWORD(lp)==960);
+            CHECK(GetSizeState().render.w==2293 && GetSizeState().output.w==3440);
+            CHECK(CompleteResize(token,true,{1707,960}));
+            CHECK(GetSizeState().render.w==1707 && GetSizeState().output.w==2560);
+        }},
         {"window position message uses scratch and minimization stays zero", [] {
             Window w; CHECK(Attach(w.hwnd,{3440,1440},{2293,960}));
             WINDOWPOS pos{w.hwnd,nullptr,-1700,120,1000,700,SWP_NOZORDER}; const auto original=pos;
