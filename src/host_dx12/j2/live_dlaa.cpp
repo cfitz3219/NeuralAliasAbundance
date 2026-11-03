@@ -3100,7 +3100,7 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         na::capture::j2::Planes cp;
         cp.color = frame;                  // NPSR
         cp.depth = g.depth32.Get();        // NPSR
-        cp.motion = g.motion.Get();        cp.motion_state = UAV;
+        cp.motion = g.motion.Get();        cp.motion_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         cp.output = out;                   // UAV
         na::capture::j2::Identity ci;
         ci.present_ordinal = g.frame;
