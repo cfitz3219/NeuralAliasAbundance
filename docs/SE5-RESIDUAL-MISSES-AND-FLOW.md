@@ -111,3 +111,51 @@ These sources support the input requirements and algorithm limits. The split
 into reconstructed camera motion and accepted residual motion is NeuralAlias's
 existing integration, verified here with its numerical fixtures. No claim of a
 new successful game test or universal optical-flow accuracy is made.
+
+## 2 November, 18:12 user results: image regression confirmed
+
+Cort reports the new SE5 picture is much worse. Installed DLL and results
+manifest both identify ea7534d / D648D72D596B834852A95A79F4153043832C8C0629276D03ACFADE8F8C59CB63.
+Results: Documents/NA-se5-results-20261102-181231, status-33188.log.
+Archive, previews and offline numerical analyses: local/se5-regression-20261102.
+
+Depth-state failures, busy-slot failures and DLSS evaluation failures are zero.
+The route counts 15,810 processed scene frames of 15,821 (99.9305%), 11 misses
+and five early placements. Those counters do not establish motion correctness.
+
+The three actual SE5 capture sets j2-20261102-181141, -181159 and -181203 contain
+90 evaluated gameplay frames. All have nonzero jitter metadata, no reset and no
+observed later scene write. Sampled supplied motion is effectively zero in all
+90: maximum magnitude 0.000173 px; maximum 95th percentile 0.0001221 px. Flow was
+Off throughout the retained run: zero AMD attempts/submissions. The image itself
+is moving. Offline local phase correlation on consecutive captured Presents,
+with their jitter difference removed, measures about 8.5 px displacement on the
+static wall in 181203 frames0->1. That region's supplied motion has median0 and
+95th percentile0.000063 px. Other building/ground patches also move multiple
+pixels. This is supporting image evidence, not a recovered engine camera;
+capture gaps are excluded from consecutive-frame comparisons.
+
+The concrete defect exposed is **unrepresented background motion in DLSS's
+input**, despite successful evaluation. The live camera path calls ordinary
+CameraTracker::Update; the existing UpdateCameraRelative origin-composition
+helper has no live caller here. Incomplete camera-relative transforms or selection
+of an unmoving projection-like block could cause this. These captures do not
+store selected camera bytes/matrices, so they do not distinguish those causes.
+Do not claim the origin hypothesis proven or choose a float3 by guesswork.
+
+My default-Off recommendation was premature: the synthetic AMD test proves the
+shader can recover known camera/object motion, not that SE5's acquired camera
+describes all world motion. Flow-On masking this defect in the successful run
+is plausible, not a controlled comparison. Retain Cort's requested default
+until a deliberate correction is agreed; no live setting was changed here.
+
+Correction to preliminary commentary: full-run held-camera counts mix menus/
+loading and gameplay. At18:09:08 the held counter was already5,081 of the final
+5,108; only27 additional holds occur through18:12:08. The32% whole-run ratio is
+not evidence of32% gameplay camera loss. Global capture175558 is Anno and was
+excluded after image inspection. Retain019d6f4 as the successful comparison.
+
+Next work is actual acquired-camera identity/current-previous motion. No boundary
+relaxation, preset change or new resolution-control route follows from this
+evidence. No source fix, game action, installer update or new game-success claim
+was made during this results investigation.
