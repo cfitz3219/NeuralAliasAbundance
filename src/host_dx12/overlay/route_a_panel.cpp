@@ -913,6 +913,43 @@ void DrawCaptureRow()
 
 // J2: live DLAA for games without an upscaler. A switch to compare with and
 // without, and what it is doing (or waiting for) right now.
+void DrawMovingObjectMotion()
+{
+    using namespace na::ui;
+    if (!na::j2::Configured()) return;
+    {
+        // P4-0b: moving-object motion from NVIDIA hardware optical flow (test; off by default).
+        bool fl = na::j2::flow::Enabled();
+        BeginRow("Optical flow", "Helps track independently moving people and vehicles. Try it if they leave trails; uses extra GPU time. Camera motion remains available when off.", SwitchWidth());
+        if (Switch("j2flow", &fl)) na::j2::flow::SetEnabled(fl);
+        EndRow();
+        Hint("Helps track moving people and vehicles. Try it if they leave trails; uses extra GPU time.");
+        if (fl) {
+            const na::j2::flow::Stats fs = na::j2::flow::GetStats();
+            const auto cs=na::j2::compute_flow::GetStats();
+            if(na::j2::GetStats().inline_mode || (!fs.available && cs.recorded)){
+                char line[500];na::j2::compute_flow::DescribeStats(cs,line,sizeof line);
+                StatusLine(0,line);
+                if(cs.samples && cs.total){char detail[330];std::snprintf(detail,sizeof detail,
+                    "Last sample excluded: small motion %.1f%%, invalid/depth %.1f%%, image/flat %.1f%%, offscreen %.1f%%. Recording resources %u, history images %u.",
+                    100.0*double(cs.rejected_small)/double(cs.total),100.0*double(cs.rejected_invalid)/double(cs.total),
+                    100.0*double(cs.rejected_image)/double(cs.total),100.0*double(cs.rejected_offscreen)/double(cs.total),cs.recording_slots,cs.image_slots);
+                    Hint(detail);}
+            }else{
+            const uint64_t px = fs.px_accepted + fs.px_invalid + fs.px_small + fs.px_cost + fs.px_offscreen + fs.px_image + fs.px_flicker;
+            const double pct = px ? 100.0 * static_cast<double>(fs.px_accepted) / static_cast<double>(px) : 0.0;
+            char tb[360];
+            const double flick = px ? 100.0 * static_cast<double>(fs.px_flicker) / static_cast<double>(px) : 0.0;
+            std::snprintf(tb, sizeof tb, "%s Accepted object corrections: %.1f%% of the picture (%.1f%% waiting for agreement). Cost %.2f ms (average %.2f). Pairs %llu, camera-only frames %llu (batch %llu, busy %llu, reset %llu).",
+                          fs.reason, pct, flick, fs.ms_last, fs.ms_avg, static_cast<unsigned long long>(fs.consumed),
+                          static_cast<unsigned long long>(fs.encode_only + fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_split),
+                          static_cast<unsigned long long>(fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_reset));
+            StatusLine(fs.latched ? 2 : 0, tb);
+            }
+        }
+    }
+}
+
 void DrawLiveDlaa()
 {
     using namespace na::ui;
@@ -981,36 +1018,6 @@ void DrawLiveDlaa()
         ImGui::SetNextItemWidth(S(220));
         if (ImGui::Combo("##j2dbg", &dv, kViews, 4)) na::j2::SetDebugView(dv);
         EndRow();
-    }
-    {
-        // P4-0b: moving-object motion from NVIDIA hardware optical flow (test; off by default).
-        bool fl = na::j2::flow::Enabled();
-        BeginRow("Moving-object motion (test)", "Camera motion is supplied even with this off. This adds estimated motion for independently moving objects; the correction percentage is not all movement on screen. Uses NVIDIA flow between command lists, or AMD compute flow inside the game's list. Requires extra GPU time. Turn it off to compare; the Motion vectors debug view shows the result.", SwitchWidth());
-        if (Switch("j2flow", &fl)) na::j2::flow::SetEnabled(fl);
-        EndRow();
-        if (fl) {
-            const na::j2::flow::Stats fs = na::j2::flow::GetStats();
-            const auto cs=na::j2::compute_flow::GetStats();
-            if(na::j2::GetStats().inline_mode || (!fs.available && cs.recorded)){
-                char line[500];na::j2::compute_flow::DescribeStats(cs,line,sizeof line);
-                StatusLine(0,line);
-                if(cs.samples && cs.total){char detail[330];std::snprintf(detail,sizeof detail,
-                    "Last sample excluded: small motion %.1f%%, invalid/depth %.1f%%, image/flat %.1f%%, offscreen %.1f%%. Recording resources %u, history images %u.",
-                    100.0*double(cs.rejected_small)/double(cs.total),100.0*double(cs.rejected_invalid)/double(cs.total),
-                    100.0*double(cs.rejected_image)/double(cs.total),100.0*double(cs.rejected_offscreen)/double(cs.total),cs.recording_slots,cs.image_slots);
-                    Hint(detail);}
-            }else{
-            const uint64_t px = fs.px_accepted + fs.px_invalid + fs.px_small + fs.px_cost + fs.px_offscreen + fs.px_image + fs.px_flicker;
-            const double pct = px ? 100.0 * static_cast<double>(fs.px_accepted) / static_cast<double>(px) : 0.0;
-            char tb[360];
-            const double flick = px ? 100.0 * static_cast<double>(fs.px_flicker) / static_cast<double>(px) : 0.0;
-            std::snprintf(tb, sizeof tb, "%s Accepted object corrections: %.1f%% of the picture (%.1f%% waiting for agreement). Cost %.2f ms (average %.2f). Pairs %llu, camera-only frames %llu (batch %llu, busy %llu, reset %llu).",
-                          fs.reason, pct, flick, fs.ms_last, fs.ms_avg, static_cast<unsigned long long>(fs.consumed),
-                          static_cast<unsigned long long>(fs.encode_only + fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_split),
-                          static_cast<unsigned long long>(fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_reset));
-            StatusLine(fs.latched ? 2 : 0, tb);
-            }
-        }
     }
     {
         // Texture detail (negative mip bias, NVIDIA DLSS guide 3.5: -1 at native).
@@ -1142,6 +1149,7 @@ void RegisterRouteAMenu()
     na::menu::Register({"Latency and display", Availability::Available, nullptr, &DrawLatencyDetails, Page::Details});
     na::menu::Register({"DLSS in use", Availability::Available, nullptr, &DrawDlssInUseRow, Page::Enhancements});
     na::menu::Register({"Motion analysis", Availability::Available, nullptr, &DrawMotionRow, Page::Enhancements});
+    na::menu::Register({"Optical flow", Availability::Available, nullptr, &DrawMovingObjectMotion, Page::Enhancements});
     na::menu::Register({"Connection", Availability::Available, nullptr, &DrawConnectionRow, Page::Details});
     na::menu::Register({"Save pictures for analysis", Availability::Available, nullptr, &DrawCaptureRow,
                         Page::Details});
