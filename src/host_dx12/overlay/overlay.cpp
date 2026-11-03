@@ -2679,6 +2679,8 @@ void small_follow_mode()
     if (g_small_asked < 0.f) g_small_asked = na::present::RenderScale(); // the boot scale needs no request
     if (f == g_small_asked) return;
     na::present::SetRenderScale(f, &na::j2::PresentUpscale, nullptr);
+    // Texture detail follows the mode: the menu bias plus log2(render scale), from the next list.
+    na::observe::SetSamplerMipBiasLive(na::j2::SmallMipBias(static_cast<float>(na::settings::Get().j2_mip_bias_x100.load()) / 100.f, f));
     const np::SizeState st = np::GetSizeState();
     if (!st.enabled) { g_small_asked = f; return; }
     const np::Size r = small_render_for(st.output, static_cast<double>(f));

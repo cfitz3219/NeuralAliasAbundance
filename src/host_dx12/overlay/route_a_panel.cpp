@@ -1047,7 +1047,8 @@ void DrawLiveDlaa()
         ImGui::SetNextItemWidth(S(220));
         if (ImGui::Combo("##j2detail", &idx, kDetail, 3)) {
             ss.j2_mip_bias_x100.store(kDetailX100[idx]);
-            na::observe::SetSamplerMipBiasLive(kDetailX100[idx] / 100.0f);
+            na::observe::SetSamplerMipBiasLive(na::j2::RenderSmall() ? na::j2::SmallMipBias(kDetailX100[idx] / 100.0f, na::present::RenderScale())
+                                                                     : kDetailX100[idx] / 100.0f);
             na::settings::Save();
         }
         EndRow();

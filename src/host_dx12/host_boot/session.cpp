@@ -14,6 +14,7 @@
 #include "host_dx12/upscalers/ffx_intercept.hpp"
 #include "host_dx12/upscalers/xess_intercept.hpp"
 #include "host_dx12/scale/auto_scene.hpp"
+#include "host_dx12/scale/settings_read_hook.hpp"
 #include <mutex>
 
 namespace na::host {
@@ -97,10 +98,16 @@ void ActivateSavedRequests(const wchar_t* ini){
     j2::SetPaused(safe);
     if(safe)j2::flow::SetEnabled(false);
     if(j2::Configured()){
-        float bias=static_cast<float>(st.j2_mip_bias_x100.load())/100.f;
-        // Render-small: textures are sampled at render size; DLSS guidance adds log2(render/output).
-        const float scale=present::RenderScale();
-        if(j2::RenderSmall() && scale>0.f && scale<1.f && bias!=0.f)bias+=std::log2(scale);
+        const float user=static_cast<float>(st.j2_mip_bias_x100.load())/100.f;
+        float bias=user;
+        if(j2::RenderSmall()){
+            // Render-small: textures are sampled at render size; DLSS guidance adds
+            // log2(render/output), per mode, live (overlay small_follow_mode).
+            float wanted[4]={user,user,user,user};
+            for(int m=1;m<=3;++m)wanted[m]=j2::SmallMipBias(user,static_cast<float>(scale::FractionForMode(m)));
+            observe::SetSamplerMipLevelsWanted(wanted,4);
+            bias=j2::SmallMipBias(user,present::RenderScale());
+        }
         observe::SetSamplerMipBias(bias);
     }
     if(GetPrivateProfileIntW(L"fsr",L"enabled",1,ini)==1)

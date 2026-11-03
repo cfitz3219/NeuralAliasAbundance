@@ -26,6 +26,7 @@
 #include <d3d12.h>
 #include <cstdint>
 #include <memory>
+#include <cmath>
 
 namespace na::j2 {
 
@@ -66,6 +67,8 @@ bool Jitter();
 // so a picture is always shown and the mode never switches itself off. Off by default.
 void SetRenderSmall(bool on);
 bool RenderSmall();
+// Render-small texture bias: the menu bias plus log2(render scale) (DLSS guidance); 0 stays 0.
+inline float SmallMipBias(float user, float scale) { return user != 0.f && scale > 0.f && scale < 1.f ? user + std::log2(scale) : user; }
 bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t rw, uint32_t rh,
                     ID3D12Resource* out, uint32_t ow, uint32_t oh, bool hdr, void* user);
 void SetProjectionWindow(bool on);

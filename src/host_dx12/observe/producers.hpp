@@ -228,6 +228,8 @@ void SetSamplerMipBias(float bias);
 // twins of the level selected when it was Reset. SamplerMipBias() reports that level.
 void SetSamplerMipBiasLive(float bias);
 void SetSamplerMipBiasLiveEnabled(bool on); // before the game creates its pipelines
+// The biases live switching may ask for (nearest levels get twins); before SetSamplerMipBias.
+void SetSamplerMipLevelsWanted(const float* biases, int n);
 struct MipLiveStats {
     bool enabled = false;
     float game_bias = 0, live_bias = 0;

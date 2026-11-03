@@ -166,7 +166,7 @@ struct Obj {
     // Immutable once published; owns a reference on every twin. A twin is never one of
     // the game's own objects (see D_CreateRootSignature), so twins cannot form cycles.
     // Never destroyed inside another D3D12 object's destruction: see ReleaseTwinsLater.
-    struct Twins { IUnknown* obj[3] = {}; bool same[3] = {}; ~Twins() { for (auto* o : obj) if (o) o->Release(); } };
+    struct Twins { IUnknown* obj[5] = {}; bool same[5] = {}; ~Twins() { for (auto* o : obj) if (o) o->Release(); } };
     std::shared_ptr<Twins> twins;
     bool retirement_unobservable = false;   // the sentinel could not be attached
     uint64_t present_ordinal = 0;
@@ -1231,7 +1231,11 @@ std::atomic<float> g_mip_bias{0.0f};
 // into its root signatures and pipelines at load, so every root signature and pipeline
 // gets twins built at creation for the other menu levels; command lists are switched to
 // the twins of the level latched at their Reset. Levels = the menu's choices.
-constexpr float kMipLevels[3] = {0.0f, -0.5f, -1.0f};
+// -1.5 and -2 are for render-small, where the menu level adds log2(render/output); only the
+// levels that can be reached get twins (g_mip_level_mask), so other games build two as before.
+constexpr int kMipCount = 5;
+constexpr float kMipLevels[kMipCount] = {0.0f, -0.5f, -1.0f, -1.5f, -2.0f};
+std::atomic<uint32_t> g_mip_level_mask{0x7u}; // levels twins are built for (bit i = kMipLevels[i])
 std::atomic<int> g_mip_game_level{0};      // level the game's own objects are built with (0 = no bias unless J2 sets it)
 std::atomic<int> g_mip_live_level{0};      // level selected in the menu
 std::atomic<bool> g_mip_switched{false};   // a level other than the game's has been selected (enables lookups)
@@ -1239,8 +1243,10 @@ std::atomic<bool> g_mip_live_enabled{false}; // twins are built only when J2 ena
 std::atomic<uint64_t> g_mip_twin_rs{0}, g_mip_twin_pso{0}, g_mip_untwinned{0}, g_mip_fallbacks{0}, g_mip_twin_fail{0};
 int nearest_mip_level(float b)
 {
+    const uint32_t mask = g_mip_level_mask.load(std::memory_order_relaxed) | 1u;
     int best = 0;
-    for (int i = 1; i < 3; ++i) if (std::fabs(b - kMipLevels[i]) < std::fabs(b - kMipLevels[best])) best = i;
+    for (int i = 1; i < kMipCount; ++i)
+        if ((mask >> i & 1u) && std::fabs(b - kMipLevels[i]) < std::fabs(b - kMipLevels[best])) best = i;
     return best;
 }
 std::atomic<uint64_t> g_biased_samplers{0}, g_biased_static{0};
@@ -1679,8 +1685,9 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
     // gets the startup level; twins for the other menu levels are built right after.
     ID3DBlob* rebuilt = nullptr;
     const int game_level = g_mip_game_level.load(std::memory_order_relaxed);
-    ID3DBlob* level_blob[3] = {};
-    bool level_same[3] = {true, true, true};
+    ID3DBlob* level_blob[kMipCount] = {};
+    bool level_same[kMipCount] = {true, true, true, true, true};
+    const uint32_t level_mask = g_mip_level_mask.load(std::memory_order_relaxed);
     bool decodable = false;
     if (blob && size && !t_host_work && depth.outermost()) { // also when off: native biases are recorded
         ID3D12VersionedRootSignatureDeserializer* rd = nullptr;
@@ -1693,8 +1700,8 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
             const D3D12_STATIC_SAMPLER_DESC* src = u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 ? u->Desc_1_0.pStaticSamplers : u->Desc_1_1.pStaticSamplers;
             for (UINT i = 0; i < ns; ++i) if (sampler_wants_bias(src[i])) note_native(src[i].MipLODBias);
             const bool live = g_mip_live_enabled.load(std::memory_order_relaxed);
-            for (int level = 0; level < 3; ++level) {
-                if (level != game_level && !live) continue;
+            for (int level = 0; level < kMipCount; ++level) {
+                if (level != game_level && (!live || !(level_mask >> level & 1u))) continue;
                 D3D12_VERSIONED_ROOT_SIGNATURE_DESC copy = *u;
                 std::vector<D3D12_STATIC_SAMPLER_DESC> ss(src, src + ns);
                 uint32_t changed = 0;
@@ -1725,8 +1732,8 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
     std::shared_ptr<Obj::Twins> rs_twins;
     if (decodable && SUCCEEDED(hr) && out && *out) {
         // Twins for the other levels: same as the game's blob -> nothing to swap.
-        for (int level = 0; level < 3; ++level) {
-            if (level == game_level) continue;
+        for (int level = 0; level < kMipCount; ++level) {
+            if (level == game_level || !(level_mask >> level & 1u)) continue;
             const bool same_as_game = level_same[level] && level_same[game_level];
             if (same_as_game) continue; // marked below if any other level needs twins
             if (!rs_twins) rs_twins = std::make_shared<Obj::Twins>();
@@ -1754,7 +1761,7 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
             } else g_mip_twin_fail.fetch_add(1, std::memory_order_relaxed);
         }
         if (rs_twins)
-            for (int level = 0; level < 3; ++level)
+            for (int level = 0; level < kMipCount; ++level)
                 rs_twins->same[level] = level == game_level || (level_same[level] && level_same[game_level]);
     }
     for (auto* b : level_blob) if (b) b->Release();
@@ -1897,7 +1904,7 @@ void make_pso_twins(IUnknown* pso, const void* rs, Make make)
         g_mip_untwinned.fetch_add(1, std::memory_order_relaxed);
     } else if (rt) {
         pt = std::make_shared<Obj::Twins>();
-        for (int level = 0; level < 3; ++level) {
+        for (int level = 0; level < kMipCount; ++level) {
             if (rt->same[level]) { pt->same[level] = true; continue; }
             if (!rt->obj[level]) continue; // twin root signature failed: no swap for this level
             IUnknown* twin = make(level, static_cast<ID3D12RootSignature*>(rt->obj[level]));
@@ -5554,6 +5561,17 @@ void SetSamplerMipBiasLive(float bias)
     if (level != g_mip_game_level.load(std::memory_order_relaxed)) g_mip_switched.store(true, std::memory_order_release);
 }
 void SetSamplerMipBiasLiveEnabled(bool on) { g_mip_live_enabled.store(on, std::memory_order_relaxed); }
+void SetSamplerMipLevelsWanted(const float* biases, int n)
+{
+    uint32_t mask = 1u; // level 0 (the game's own) is always available
+    for (int i = 0; i < n; ++i) {
+        int best = 0;
+        for (int l = 1; l < kMipCount; ++l)
+            if (std::fabs(biases[i] - kMipLevels[l]) < std::fabs(biases[i] - kMipLevels[best])) best = l;
+        mask |= 1u << best;
+    }
+    g_mip_level_mask.store(mask, std::memory_order_relaxed);
+}
 MipLiveStats GetMipLiveStats()
 {
     MipLiveStats m;
