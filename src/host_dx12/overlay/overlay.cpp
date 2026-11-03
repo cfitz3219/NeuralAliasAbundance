@@ -153,6 +153,7 @@ UINT real_index(IDXGISwapChain* sc)
     return sc3->GetCurrentBackBufferIndex();
 }
 std::atomic<int> g_color_space{DXGI_COLOR_SPACE_CUSTOM}; // last SetColorSpace1 on the game's chain
+std::atomic<uint32_t> g_presented_format{0}; // the proxied chain's buffer format at its last present (status line)
 XInputGetStateFn g_orig_xinput[3] = {};
 std::atomic<XInputGetStateFn> g_menu_xinput{nullptr};
 uint64_t g_pad_retry_after=0; // render thread, under g_state.mutex
@@ -909,7 +910,9 @@ void write_status_line()
                 (unsigned long long)ps.upscaled, (unsigned long long)ps.upscale_failed, j2.small_rw, j2.small_rh, j2.small_ow, j2.small_oh,
                 j2.jitter_phases, na::observe::SamplerMipBias(), j2.small_note);
             if (sn > 0) WriteFile(f, sl, DWORD((std::min)(sn, int(sizeof sl - 1))), &written, nullptr);
-            const std::string hud = na::j2::native_hud::StatusLine() + " composited=" + std::to_string(j2.small_hud_layer) + "\r\n";
+            const std::string hud = na::j2::native_hud::StatusLine() + " composited=" + std::to_string(j2.small_hud_layer) +
+                " chain_fmt=" + std::to_string(g_presented_format.load(std::memory_order_relaxed)) +
+                " color_space=" + std::to_string(g_color_space.load(std::memory_order_acquire)) + "\r\n";
             WriteFile(f, hud.data(), DWORD(hud.size()), &written, nullptr);
         }
         {
@@ -2780,6 +2783,7 @@ HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_
     a.pp = pp;
     a.queue = queue;
     DXGI_SWAP_CHAIN_DESC picture_desc{}; sc->GetDesc(&picture_desc);
+    g_presented_format.store(uint32_t(picture_desc.BufferDesc.Format), std::memory_order_relaxed);
     a.hdr = na::color::IsHdr(na::color::Classify(picture_desc.BufferDesc.Format, static_cast<DXGI_COLOR_SPACE_TYPE>(g_color_space.load(std::memory_order_acquire)))); // A60
     bool open = g_open.load(std::memory_order_acquire);
     a.menu_open = open || g_state.was_open; // closing frame still processes cursor restoration
