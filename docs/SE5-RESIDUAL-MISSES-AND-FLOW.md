@@ -189,3 +189,25 @@ the true translated/rotated VP. CPU scanner13/13pass. Existing DX12 pan fixture
 now also includes the misleading signed lens/inverse ahead of the real camera,
 with flowOff and an explicit learned-camera offset assertion. Full rebuilt suite
 results follow below; this does not yet establish corrected in-game quality.
+
+### Correction delivery
+
+Runtime source bd5fd0403cc1f5a2f85fd7c30e7a500fbd083e1c: full Release build and
+167 registered tests complete in186.00s;162pass,5skip,0fail. The extended DX12 pan
+fixture selects the true VP with the signed-lens decoy present and flowOff;
+26processed frames/27(one cold),88intermediate deferrals,0miss recoveries and
+0depth-state failures. The captured-matrix replay and the13CPU scanner cases
+also pass. NGX fixture evidence is distinct from actual game image quality.
+
+Documents/NA-SE5-camfix-bd5fd04 is prepared, DLL SHA256
+4527331127D4B1012FCA13681EBCDBD25A9945545C840305A053498B1010E212.
+The existing camfix update/results/rollback CMDs now select it. Their previous
+bytes are preserved in Documents/NA-se5-camfix-launchers-before-bd5fd04-20261102-182701.
+The known-good019 command and historical6f command are unchanged. Windows
+PowerShell install->candidate->019->original roundtrip passes in an isolated
+directory, retaining raster mode, user sharpness and native-file contents.
+
+The actual installed DLL remains ea7534d/D648D72D..., unchanged by Astra. Flow
+remains defaultOff as Cort requested. This fixes a reproduced false-camera
+selection; Cort's next game run determines actual picture improvement. No game
+launch/control/deployment or live image-quality success is claimed.
