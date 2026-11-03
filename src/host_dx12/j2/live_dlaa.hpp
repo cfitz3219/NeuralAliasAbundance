@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <memory>
 #include <cmath>
+#include <string>
 
 namespace na::j2 {
 
@@ -72,6 +73,9 @@ bool RenderSmall();
 // Render-small HUD separation: tint the pixels taken as HUD (diagnostic, not saved).
 void SetHudMaskView(bool on);
 bool HudMaskView();
+// Native-HUD investigation: logs every render-target bind of one frame in 120 (render-small).
+void InstallHudProbe();
+std::string HudProbeLine();
 // Render-small texture bias per DLSS mode (Cort, 2026-11-03; the menu is greyed out there):
 // Quality (67%) -1.585, Balanced (58%) -2, Performance (50%) -2.5. DLAA (scale 1) uses the
 // menu's choice.

@@ -38,6 +38,7 @@
 #include <map>
 #include <mutex>
 #include <vector>
+#include <string>
 
 using Microsoft::WRL::ComPtr;
 
@@ -2805,12 +2806,54 @@ void small_note(const char* t) { std::snprintf(g.stats.small_note, sizeof g.stat
 void SetRenderSmall(bool on) { g_render_small.store(on); }
 bool RenderSmall() { return g_render_small.load(); }
 void SetHudMaskView(bool on) { g_hud_view.store(on); }
+// Native-HUD investigation (render-small): every render-target bind of a frame (target, depth,
+// first scissor) and the presented proxy's id, so a run's log shows where the HUD is drawn.
+namespace {
+struct HudBind { uint64_t recording; na_object_id rt, ds; int32_t sw, sh; uint32_t rects; };
+std::mutex g_probe_m;
+std::vector<HudBind> g_probe_cur;
+std::string g_probe_last;
+uint64_t g_probe_frames = 0;
+void hud_probe(ID3D12GraphicsCommandList* list, const na::observe::RasterScissors& s)
+{
+    na_object_id rt = 0, ds = 0;
+    na::observe::ListCurrentTargets(list, &rt, &ds);
+    std::lock_guard<std::mutex> lock(g_probe_m);
+    if (g_probe_cur.size() >= 128) return;
+    if (!g_probe_cur.empty() && g_probe_cur.back().recording == s.recording && g_probe_cur.back().rt == rt && g_probe_cur.back().ds == ds) return;
+    HudBind b{s.recording, rt, ds, 0, 0, s.count};
+    if (s.count) { b.sw = s.rects[0].right - s.rects[0].left; b.sh = s.rects[0].bottom - s.rects[0].top; }
+    g_probe_cur.push_back(b);
+}
+void hud_probe_present(ID3D12Resource* frame)
+{
+    std::lock_guard<std::mutex> lock(g_probe_m);
+    if (++g_probe_frames % 120 == 1) { // one frame in 120 is described
+        char head[96];
+        std::snprintf(head, sizeof head, "proxy=%llu binds=%zu:", static_cast<unsigned long long>(na::observe::IdOf(frame)), g_probe_cur.size());
+        std::string s = head;
+        uint64_t rec = 0;
+        uint32_t list_no = 0;
+        for (const auto& b : g_probe_cur) {
+            if (b.recording != rec) { rec = b.recording; ++list_no; }
+            char e[96];
+            std::snprintf(e, sizeof e, " L%u:rt=%lld,ds=%lld,sc=%dx%d", list_no, static_cast<long long>(b.rt), static_cast<long long>(b.ds), b.sw, b.sh);
+            s += e;
+        }
+        g_probe_last = s;
+    }
+    g_probe_cur.clear();
+}
+} // namespace
+void InstallHudProbe() { na::observe::SetRasterStateListener(&hud_probe); }
+std::string HudProbeLine() { std::lock_guard<std::mutex> lock(g_probe_m); return g_probe_last; }
 bool HudMaskView() { return g_hud_view.load(); }
 
 bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t rw, uint32_t rh,
                     ID3D12Resource* out, uint32_t ow, uint32_t oh, bool hdr, void*)
 {
     if (!queue || !frame || !out || !rw || !rh || !ow || !oh) return false;
+    hud_probe_present(frame);
     const ExecuteFn forward = g_forward.load(std::memory_order_relaxed);
     const na::observe::HostWorkScope host; // our list is never observed as the game's
     std::lock_guard<std::mutex> lock(g.m);

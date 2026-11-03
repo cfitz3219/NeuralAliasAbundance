@@ -871,6 +871,8 @@ void write_status_line()
                 (unsigned long long)ps.upscaled, (unsigned long long)ps.upscale_failed, j2.small_rw, j2.small_rh, j2.small_ow, j2.small_oh,
                 j2.jitter_phases, na::observe::SamplerMipBias(), j2.small_note);
             if (sn > 0) WriteFile(f, sl, DWORD((std::min)(sn, int(sizeof sl - 1))), &written, nullptr);
+            const std::string hud = "native_hud " + na::j2::HudProbeLine() + "\r\n";
+            WriteFile(f, hud.data(), DWORD(hud.size()), &written, nullptr);
         }
         {
             const auto automatic=na::scale::GetAutomaticSceneStats();
