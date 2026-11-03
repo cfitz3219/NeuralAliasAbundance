@@ -60,6 +60,7 @@ struct PendingHistory {
     bool cut = false;
     uint32_t capture = 0; // J2 evidence capture token for this evaluation (0 = none)
     na::j2::compute_flow::Ticket compute_flow;
+    bool keep_reset = false; // a repeated frame: DLSS did not run, a pending history reset still applies
 };
 
 // CPU metadata of this frame's last submitted scene. No pooled command-list
@@ -70,6 +71,7 @@ struct SceneInput {
     na::camera::Matrix vp{};
     bool reversed = false;
     double jitter[2] = {};
+    bool injected = false; // the scene's camera block held J1's (windowed) camera
 };
 
 struct State {
@@ -211,7 +213,8 @@ struct State {
         uint64_t drain_until = 0, scissor_from = UINT64_MAX;
         int mode = 0;
         uint32_t streak = 0;                 // consecutive presents with DLAA
-        uint32_t recent_frames = 0, recent_missed = 0;
+        uint32_t recent_frames = 0, recent_missed = 0, recent_repeated = 0;
+        uint64_t last_eval = 0;              // last frame DLSS evaluated a windowed corner (g.output holds it)
     } win;
     bool jitter_on = true; // DLAA needs jitter (with the texture mip bias set at start-up)
     Stats stats;
@@ -669,6 +672,11 @@ bool window_now()
 {
     return g.win.engaged && g.frame >= g.win.engage_frame && g.win.ew && g.win.eh;
 }
+// Extra windowed copies of the main camera written this frame (window_extra_camera): their
+// windowed bytes -> jittered (unwindowed) bytes, for J2's own reads, VP and inverse.
+struct WindowExtra { uint8_t written[64], jittered[64]; bool vp; };
+std::vector<WindowExtra> g_window_extras;
+uint64_t g_window_extras_frame = UINT64_MAX;
 // J2's own reads see the jittered (unwindowed) camera: windowed bytes the game's blocks
 // now hold are mapped back, so camera search, continuity and tracking are unchanged.
 void unwindow(uint8_t* bytes, size_t n)
@@ -680,6 +688,9 @@ void unwindow(uint8_t* bytes, size_t n)
             if (!std::memcmp(bytes + o, g.jit.winv[l], 64)) { std::memcpy(bytes + o, g.jit.jinv[l], 64); break; }
             if (l == 0 && g.jit.has_proj && !std::memcmp(bytes + o, g.jit.wproj, 64)) { std::memcpy(bytes + o, g.jit.jproj, 64); break; }
             if (l == 0 && g.jit.has_prev && !std::memcmp(bytes + o, g.jit.wprev, 64)) { std::memcpy(bytes + o, g.jit.prev, 64); break; }
+            if (l == 0 && g_window_extras_frame == g.frame)
+                for (const auto& x : g_window_extras)
+                    if (!std::memcmp(bytes + o, x.written, 64)) { std::memcpy(bytes + o, x.jittered, 64); break; }
         }
 }
 
@@ -934,6 +945,66 @@ void window_derived(const JB& k, std::vector<uint8_t>& view, std::vector<bool>& 
     }
 }
 
+// Projection window: a block holding ANOTHER copy of the main camera (same camera within
+// same_camera's bounds, e.g. last frame's copy still bound, or the camera updated between passes
+// while panning) gets the same jitter and window at its learned offsets, with its inverse and
+// projection. Left full size, its draws land unpacked (Cort's 8a0ce83 run: zoom pops).
+bool window_extra_camera(uint64_t res, uint64_t off, std::vector<uint8_t>& view)
+{
+    const size_t n = view.size();
+    const int64_t vo = g.camera_offset;
+    if (vo < 0 || static_cast<uint64_t>(vo) + 64 > n || !g.jit.ew || !g.jit.eh || !g.win.w || !g.win.h) return false;
+    const auto L = g.jit.layout ? na::camera::Layout::ColumnMajor : na::camera::Layout::RowMajor;
+    const auto m = na::camera::LoadMatrix(view, static_cast<size_t>(vo), L);
+    na::camera::Candidate c{};
+    if (!na::camera::ViewProjection(m, c) || !same_camera(m)) return false;
+    const double sx = double(g.jit.ew) / g.win.w, sy = double(g.jit.eh) / g.win.h;
+    const neural_alias::JitterSample js{g.jit.px[0], g.jit.px[1]};
+    auto jittered = [&](const na::camera::Matrix& src) {
+        std::array<double, 16> a{};
+        for (int i = 0; i < 16; ++i) a[i] = src[i];
+        const auto j = neural_alias::jitter_projection(a, js, g.jit.ew, g.jit.eh);
+        na::camera::Matrix jm{};
+        for (int i = 0; i < 16; ++i) jm[i] = j[i];
+        return jm;
+    };
+    auto windowed = [&](const na::camera::Matrix& src) { return window_of(jittered(src), sx, sy); };
+    if (g_window_extras_frame != g.frame) { g_window_extras.clear(); g_window_extras_frame = g.frame; }
+    auto remember = [&](const na::camera::Matrix& w, const na::camera::Matrix& j, bool is_vp) {
+        if (g_window_extras.size() >= 32) return;
+        WindowExtra x{};
+        store_matrix(w, L, x.written);
+        store_matrix(j, L, x.jittered);
+        x.vp = is_vp;
+        g_window_extras.push_back(x);
+    };
+    auto put = [&](int64_t o, const na::camera::Matrix& mat) {
+        uint8_t rep[64];
+        store_matrix(mat, L, rep);
+        if (g.jitter_writes.Apply(res, off + static_cast<uint64_t>(o), view.data() + o, rep, [&] {
+                return na::observe::WriteBuffer(res, off + static_cast<uint64_t>(o), rep, 64) == 64;
+            })) ++g.stats.jitter_writes;
+    };
+    const auto wm = windowed(m);
+    na::camera::Matrix wminv{};
+    if (!na::camera::Invert(wm, wminv)) return false;
+    const auto jm = jittered(m);
+    na::camera::Matrix jminv{};
+    if (!na::camera::Invert(jm, jminv)) return false;
+    put(vo, wm);
+    remember(wm, jm, true);
+    const int64_t io = vo + g.camera_inv_delta;
+    if (io >= 0 && static_cast<uint64_t>(io) + 64 <= n &&
+        na::camera::IsInversePair(m, na::camera::LoadMatrix(view, static_cast<size_t>(io), L))) { put(io, wminv); remember(wminv, jminv, false); }
+    const int64_t po = g.camera_proj_delta == INT64_MIN ? -1 : vo + g.camera_proj_delta;
+    if (po >= 0 && static_cast<uint64_t>(po) + 64 <= n) {
+        const auto pm = na::camera::LoadMatrix(view, static_cast<size_t>(po), L);
+        if (is_projection_of(pm, m)) put(po, windowed(pm));
+    }
+    ++g.stats.window_extra_cameras;
+    return true;
+}
+
 // Replaces this frame's VP / inverse in the bound constant buffers of this batch.
 // The frame's sample starts at the first block holding a VP + inverse at the
 // learned offset (blocks of the learned camera slot are tried first); then every
@@ -971,6 +1042,9 @@ void jitter_batch(ID3D12CommandList* const* lists, UINT count)
     for (const auto& kv : blocks) order.push_back(&kv.second);
     std::stable_sort(order.begin(), order.end(), [](const JB* a, const JB* b) { return a->slot && !b->slot; });
     std::vector<uint8_t> bytes(kMaxBlockRead);
+    // A windowed sample never carries over a Present: the next frame's camera starts its own.
+    if (g.jit.valid && g.jit.windowed && g.jit.frame != g.frame && !g.inline_mode) { g.jit.valid = false; ++g.stats.window_stale_samples; }
+    if (blocks.size() >= 256) ++g.stats.jitter_blocks_capped;
     for (const JB* k : order) {
         const uint32_t n = na::observe::ReadBuffer(k->res, k->off, bytes.data(), k->size);
         if (n < 64) continue;
@@ -983,6 +1057,9 @@ void jitter_batch(ID3D12CommandList* const* lists, UINT count)
         };
         if (!g.jit.valid || !holds(g.jit.vp)) {
             if (g.jit.valid && (holds(g.jit.jvp) || (g.jit.windowed && holds(g.jit.wvp)))) continue; // already written by an earlier batch of this frame
+            // Projection window: EVERY copy of the main camera must be windowed, or the draws using it
+            // land full size (a frame-old copy, or a camera updated between passes while panning).
+            if (g.jit.valid && g.jit.windowed && window_extra_camera(k->res, k->off, view)) continue;
             if (g.jit.valid) { ++g.stats.other_camera_blocks; continue; } // a different matrix (another camera): leave it
             if (!begin_jitter(k->res, k->off, view, k->slot)) continue;
         }
@@ -1042,6 +1119,8 @@ void jitter_batch(ID3D12CommandList* const* lists, UINT count)
             }
         if (w) window_derived(*k, view, touched);
     }
+    g.stats.jitter_patches = g.jitter_writes.Size();
+    g.stats.jitter_patches_refused = g.jitter_writes.Refused();
 }
 
 // J1 coverage diagnostics: work drawn AFTER this frame's DLAA that still uses the
@@ -1116,8 +1195,12 @@ struct CamPick {
 };
 bool holds_jittered(const std::vector<uint8_t>& bytes, size_t off)
 {
-    return g.jit.valid && off + 64 <= bytes.size() &&
-           (!std::memcmp(bytes.data() + off, g.jit.jvp[0], 64) || !std::memcmp(bytes.data() + off, g.jit.jvp[1], 64));
+    if (!g.jit.valid || off + 64 > bytes.size()) return false;
+    if (!std::memcmp(bytes.data() + off, g.jit.jvp[0], 64) || !std::memcmp(bytes.data() + off, g.jit.jvp[1], 64)) return true;
+    if (g_window_extras_frame == g.frame) // an extra windowed copy of the camera (same sample), already unwindowed
+        for (const auto& x : g_window_extras)
+            if (x.vp && !std::memcmp(bytes.data() + off, x.jittered, 64)) return true;
+    return false;
 }
 double continuity(const na::camera::Matrix& m, bool injected)
 {
@@ -1637,6 +1720,24 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         else if (!g.jit.applied) ++g.stats.unjit_not_applied;
         else ++g.stats.unjit_not_held;
     }
+    // Projection window safety: the scene's own camera block held the game's FULL-SIZE camera
+    // (J1's windowed copy did not reach it), so the frame was drawn unpacked and scissored to
+    // the corner. Upscaling that corner shows a 1/scale zoom of the top left (Cort's 8a0ce83 run:
+    // 1-2 frame pops while panning). Never evaluate it: show the last windowed result again.
+    const bool unpacked = windowed && !held && !from_j1 && (saved ? !saved->injected : !g_injected);
+    if (unpacked) {
+        ++g.stats.window_unpacked;
+        const uint32_t vpo = g.camera_offset >= 0 ? static_cast<uint32_t>(g.camera_offset) : 0u;
+        std::snprintf(g.stats.window_unpacked_note, sizeof g.stats.window_unpacked_note,
+                      "frame=%llu jit_frame=%llu applied=%d other_camera_blocks=%llu slot_other=%llu off=%u",
+                      static_cast<unsigned long long>(g.frame), static_cast<unsigned long long>(g.jit.frame), g.jit.applied ? 1 : 0,
+                      static_cast<unsigned long long>(g.stats.other_camera_blocks),
+                      static_cast<unsigned long long>(g.stats.jitter_slot_other_camera), vpo);
+        if (!g.win.last_eval || g.frame > g.win.last_eval + 4 || resize || !g.output) {
+            reason("Projection window: this frame was drawn full size and there is no recent result to repeat.");
+            return false;
+        }
+    }
     pending.tracker = g.tracker;
     // DLSS's history is the last frame it evaluated, and the tracker's previous
     // camera is that same frame, so motion stays correct across a few skipped game
@@ -1702,6 +1803,28 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     std::vector<D3D12_RESOURCE_BARRIER> b;
     constexpr UINT NPSR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, SRC = D3D12_RESOURCE_STATE_COPY_SOURCE,
                    DST = D3D12_RESOURCE_STATE_COPY_DEST, UAV = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    if (unpacked) { // the last windowed result (already sharpened) back into the scene colour; no DLSS, no history change
+        add(b, g.output.Get(), UAV, SRC);
+        addsub(b, color.Get(), csub, sc, DST);
+        flush(l, b);
+        D3D12_TEXTURE_COPY_LOCATION cs{}, cdst{};
+        cs.Type = cdst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        cs.pResource = g.output.Get();
+        cdst.pResource = color.Get();
+        cdst.SubresourceIndex = csub;
+        l->CopyTextureRegion(&cdst, 0, 0, 0, &cs, nullptr);
+        add(b, g.output.Get(), SRC, UAV);
+        addsub(b, color.Get(), csub, DST, sc);
+        flush(l, b);
+        if (!inl && FAILED(l->Close())) { reason("Could not close the repeat list."); return false; }
+        pending.tracker = g.tracker; // the tracker's previous camera stays the last evaluated frame
+        pending.cut = false;
+        pending.keep_reset = true;
+        ++g.stats.window_repeated;
+        ++g.win.recent_repeated;
+        *out_list = l;
+        return true;
+    }
     // 1. Copy or resolve exactly the scene views into single-sample DLSS inputs.
     const UINT color_source = color_msaa ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE : SRC;
     const UINT color_dest = color_msaa ? D3D12_RESOURCE_STATE_RESOLVE_DEST : DST;
@@ -1954,7 +2077,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     g.stats.out_h = oh;
     g.stats.jitter_phases = jitter_phases();
     if (upscaling) { ++g.stats.upscaled_frames; g.stats.upscale_note[0] = 0; }
-    if (windowed) ++g.stats.window_frames;
+    if (windowed) { ++g.stats.window_frames; g.win.last_eval = g.frame; }
     if (phys) phys_report.result = PhysicalOutcome::Evaluated;
     *out_list = l;
     return true;
@@ -2189,6 +2312,7 @@ int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
                 saved.frame = g.frame; saved.color = color; saved.depth = depth; saved.producer = producer;
                 saved.jitter[0] = g_injected ? g.jit.px[0] : 0;
                 saved.jitter[1] = g_injected ? g.jit.px[1] : 0;
+                saved.injected = g_injected;
             }
         }
     }
@@ -2299,8 +2423,9 @@ void update_window(bool executed)
     if (w.engaged && w.last_frame == g.frame) { // a windowed frame is presenting now
         ++w.recent_frames;
         if (!executed) { ++w.recent_missed; ++g.stats.window_missed; }
-        if (w.recent_frames >= 300) w.recent_frames = w.recent_missed = 0;
+        if (w.recent_frames >= 300) w.recent_frames = w.recent_missed = w.recent_repeated = 0;
         if (w.recent_missed > 10) stop("Stopped: more than 10 of 300 windowed frames presented without DLSS.", 600);
+        if (w.recent_repeated > 30) stop("Stopped: more than 30 of 300 windowed frames were drawn full size (repeated).", 600);
     }
     if (w.engaged && w.drain_until && g.frame >= w.drain_until) { w.engaged = false; w.drain_until = 0; }
     if (!wanted) stop(mode == 0 ? "Render mode DLAA." : "Projection window switched off.", 0);
@@ -2319,7 +2444,7 @@ void update_window(bool executed)
         w.w = g.w; w.h = g.h;
         w.ew = (std::max)(1u, static_cast<uint32_t>(std::lround(g.w * f)));
         w.eh = (std::max)(1u, static_cast<uint32_t>(std::lround(g.h * f)));
-        w.recent_frames = w.recent_missed = 0;
+        w.recent_frames = w.recent_missed = w.recent_repeated = 0;
         ++g.stats.window_engagements;
         g.stats.window_note[0] = 0;
     }
@@ -2620,7 +2745,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
                 na::dlss::OnExecuted(queue, static_cast<UINT>(batch.size()), batch.data());
                 g.tracker = pending.tracker;
                 g.submitted_frame = g.frame;
-                g.resume_reset = false;
+                if (!pending.keep_reset) g.resume_reset = false;
                 g.stats.active = true;
                 ++g.stats.frames;
                 ++g.stats.between_observed;
@@ -2642,7 +2767,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         lock.lock();
         g.tracker = g.inl.history.tracker;
         g.submitted_frame = g.frame;
-        g.resume_reset = false;
+        if (!g.inl.history.keep_reset) g.resume_reset = false;
         if (g.inl.history.cut) ++g.stats.cuts;
         ++g.stats.frames;
         ++g.stats.inline_frames;
@@ -2768,7 +2893,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     // attempts above must never replace the previous submitted camera.
     g.tracker = pending.tracker;
     g.submitted_frame = g.frame;
-    g.resume_reset = false;
+    if (!pending.keep_reset) g.resume_reset = false;
     ++g.stats.frames;
     if (pending.cut) ++g.stats.cuts;
     if (g.stats.later_passes) {

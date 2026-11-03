@@ -253,6 +253,9 @@ struct Stats {
     uint64_t window_frames = 0, window_missed = 0, window_engagements = 0;
     uint64_t window_vp_writes = 0, window_inv_writes = 0, window_proj_writes = 0, window_prev_writes = 0, window_post_lists = 0;
     uint64_t window_scissored = 0, window_scissor_restored = 0;
+    uint64_t window_unpacked = 0, window_repeated = 0, window_extra_cameras = 0; // full-size frames caught / repeated; extra copies of the camera windowed
+    char window_unpacked_note[160] = {};
+    uint64_t window_stale_samples = 0, jitter_blocks_capped = 0, jitter_patches = 0, jitter_patches_refused = 0;
     uint64_t window_derived_forward = 0, window_derived_inverse = 0; // camera-derived matrices rebased (see window_derived)
     char window_derived_note[160] = {};
     char window_note[120] = {};
