@@ -264,7 +264,7 @@ void draw(ID3D12GraphicsCommandList* l, const na::observe::ShaderCall& c)
 
 na::observe::ShaderScope redirect(ID3D12GraphicsCommandList* l, na::observe::ShaderCall& call)
 {
-    na::observe::DrawState st;
+    na::observe::DrawInfo st;
     if (!na::observe::ListDrawState(l, st) || st.recording != t_bind.recording || st.rt != t_bind.proxy) return {};
     std::lock_guard<std::mutex> lock(g_m);
     Proxy* p = find_locked(st.rt);

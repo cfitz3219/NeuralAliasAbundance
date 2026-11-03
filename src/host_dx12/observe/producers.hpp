@@ -193,7 +193,7 @@ void SetRasterStateListener(RasterStateListener listener);
 // are never observed), and the bound pipeline's target formats and blending. False when the
 // recording is unknown. `restorable` = RestoreBindingState can hand back targets, viewports
 // and scissors (raster tracking was on at this recording's Reset).
-struct DrawState {
+struct DrawInfo {
     uint64_t recording = 0;
     na_object_id rt = 0, ds = 0;
     uint32_t rt_count = 0;
@@ -204,7 +204,7 @@ struct DrawState {
     float viewports[16][6]{};   // x, y, width, height, min depth, max depth
     int32_t scissors[16][4]{};  // left, top, right, bottom
 };
-bool ListDrawState(ID3D12CommandList* list, DrawState& out);
+bool ListDrawState(ID3D12CommandList* list, DrawInfo& out);
 // Identity of the list's current recording (changes on every Reset); 0 if unknown.
 uint64_t ListRecording(ID3D12CommandList* list);
 // True when this recording cleared `target` with ClearRenderTargetView.

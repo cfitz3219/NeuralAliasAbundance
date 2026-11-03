@@ -5131,9 +5131,9 @@ bool ListRasterScissors(ID3D12CommandList* list, RasterScissors& out)
     std::memcpy(out.rects, ls->raster_scissors, out.count * sizeof(D3D12_RECT));
     return true;
 }
-bool ListDrawState(ID3D12CommandList* list, DrawState& out)
+bool ListDrawState(ID3D12CommandList* list, DrawInfo& out)
 {
-    DrawState r;
+    DrawInfo r;
     std::shared_lock<std::shared_mutex> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
