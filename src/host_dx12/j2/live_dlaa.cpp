@@ -1052,7 +1052,9 @@ void jitter_batch_impl(ID3D12CommandList* const* lists, UINT count)
     // matter for exact copies in other root signatures, within a budget, resources that
     // carried the camera before first.
     std::map<std::pair<uint64_t, uint64_t>, JB> blocks;
-    constexpr size_t kSlotBlocks = 1024, kOtherBlocks = 192;
+    // fab5928 dropped 1500 blocks a frame to a budget and still missed 15 % of frames while
+    // zooming: every block is kept; the cheap probe below decides which ones are read in full.
+    constexpr size_t kSlotBlocks = 1024, kOtherBlocks = 4096;
     size_t slot_blocks = 0, other_blocks = 0, dropped = 0;
     for (UINT i = 0; i < count; ++i) {
         if (!lists[i]) continue;
@@ -1061,7 +1063,7 @@ void jitter_batch_impl(ID3D12CommandList* const* lists, UINT count)
             const bool known = g_camera_resources.count(b.resource) != 0;
             auto it = blocks.find({b.resource, b.offset});
             if (it != blocks.end()) { if (slot && !it->second.slot) { it->second.slot = true; ++slot_blocks; --other_blocks; } continue; }
-            if (slot ? slot_blocks >= kSlotBlocks : (other_blocks >= kOtherBlocks && !known) || other_blocks >= 2 * kOtherBlocks) { ++dropped; continue; }
+            if (slot ? slot_blocks >= kSlotBlocks : other_blocks >= kOtherBlocks) { ++dropped; continue; }
             const uint32_t sz = b.table && b.size ? b.size : kBlockBytes;
             JB& k = blocks[{b.resource, b.offset}];
             k.res = b.resource;
@@ -1083,7 +1085,27 @@ void jitter_batch_impl(ID3D12CommandList* const* lists, UINT count)
     g.stats.jitter_blocks_dropped += dropped;
     g.stats.jitter_blocks_scanned += order.size();
     g.stats.jitter_slot_blocks += slot_blocks;
+    // Cheap probe for blocks outside the camera slot: 64 bytes at the learned camera offset (and
+    // at 0 for a small block). A block whose probe is neither this frame's camera bytes nor a
+    // perspective matrix of the main camera cannot need a write, so it is never read in full.
+    // Reading ~700 blocks in full cost 1.2 ms a frame (cf65722, fab5928).
+    uint8_t probe[64];
+    const auto probe_hit = [&](const JB& k) {
+        const uint64_t po = g.camera_offset >= 0 && static_cast<uint64_t>(g.camera_offset) + 64 <= k.size ? static_cast<uint64_t>(g.camera_offset) : 0;
+        if (na::observe::ReadBuffer(k.res, k.off + po, probe, 64) != 64) return false;
+        if (g.jit.valid)
+            for (int l = 0; l < 2; ++l)
+                if (!std::memcmp(probe, g.jit.vp[l], 64) || !std::memcmp(probe, g.jit.jvp[l], 64) || (g.jit.windowed && !std::memcmp(probe, g.jit.wvp[l], 64))) return true;
+        const std::vector<uint8_t> pb(probe, probe + 64);
+        for (auto L : {na::camera::Layout::RowMajor, na::camera::Layout::ColumnMajor}) {
+            const auto m = na::camera::LoadMatrix(pb, 0, L);
+            na::camera::Candidate c{};
+            if (na::camera::ViewProjection(m, c) && same_camera(m)) return true;
+        }
+        return false;
+    };
     for (const JB* k : order) {
+        if (!k->slot && !k->known && !probe_hit(*k)) { ++g.stats.jitter_blocks_probed_out; continue; }
         const uint32_t n = na::observe::ReadBuffer(k->res, k->off, bytes.data(), k->size);
         if (n < 64) continue;
         std::vector<uint8_t> view(bytes.begin(), bytes.begin() + n);
