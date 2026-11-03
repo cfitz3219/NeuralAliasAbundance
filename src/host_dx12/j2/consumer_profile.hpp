@@ -236,11 +236,14 @@ public:
     }
     size_t Size() const { return e_.size(); }
 
-    // Prefer a recent, unambiguous actual post consumer over a predicted end
-    // barrier. Barrier-only routing remains available when no such read is known.
-    bool HasRecentExactEntry(uint64_t frame) const
+    // Waiting discards an insertion opportunity, unlike accepting a consumer
+    // when it actually arrives. Evidence for a DIFFERENT final scene writer
+    // cannot justify waiting at this writer's barrier. Keep this decision on
+    // its repeated, current producer-qualified observations.
+    bool HasRecentExactEntry(uint64_t frame, uint64_t producer) const
     {
-        for (const auto& x : e_) if (x.cls.pipeline && !x.producer && !x.temp &&
+        if (!producer) return false;
+        for (const auto& x : e_) if (x.cls.pipeline && x.producer==producer && !x.temp &&
             x.final_post >= kAcceptHits && frame >= x.final_frame && frame-x.final_frame <= 1) return true;
         return false;
     }

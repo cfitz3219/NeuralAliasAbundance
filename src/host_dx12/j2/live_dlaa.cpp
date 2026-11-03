@@ -1898,11 +1898,12 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
         // restore does not cover: graphics consumers with MSAA depth stay on the boundary matcher.
         const bool raster_safe = live.op != na::j2::Op::GraphicsRead || g.depth_samples <= 1;
         if (live.barrier && live.after_write) {
-            // MSAA depth conversion changes graphics state that this inline
-            // consumer path cannot yet restore: keep its existing barrier path.
-            if (!closing && g.depth_samples <= 1 && g.profile.HasRecentExactEntry(g.frame)) {
+            // Do not let an unrelated recording's recent consumer disable this
+            // producer's final barrier. Its own read can be indirect or already
+            // carried onward by the time a later observed consumer/Close arrives.
+            if (!closing && g.depth_samples <= 1 && g.profile.HasRecentExactEntry(g.frame, live.producer_pso)) {
                 ++g.stats.exact_consumer_waits;
-                return; // optional drawing can still follow this transition
+                return;
             }
             // Qualified scene-ending pattern: the drawing pipeline of the last write before
             // this barrier, plus (when that pipeline also appears mid-scene) the class of

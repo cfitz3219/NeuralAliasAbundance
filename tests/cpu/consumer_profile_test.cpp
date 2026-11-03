@@ -194,18 +194,25 @@ int main()
         precise.pipeline = 502;
         check(p.Judge(structural,9000)==ConsumerProfile::Verdict::Ambiguous,"shared layout remains ambiguous");
         check(p.Judge(precise,9000)==ConsumerProfile::Verdict::Accepted,"exact post consumer survives new final objects");
-        check(p.HasRecentExactEntry(4),"recent exact consumer takes priority over barrier prediction");
-        check(!p.HasRecentExactEntry(5),"an absent consumer does not indefinitely suppress barrier-only routing");
+        check(!p.HasRecentExactEntry(4,9000),"a new final producer does not wait for another producer's consumer");
+        check(!p.HasRecentExactEntry(4,1003),"one producer-specific hit does not inherit the aggregate's three hits");
         precise.pipeline=501;
         check(p.Judge(precise,kGeo)==ConsumerProfile::Verdict::Rejected,"identical-layout middle shader stays rejected");
         precise.pipeline=503;
         check(p.Judge(precise,kGeo)==ConsumerProfile::Verdict::Unknown,"a replacement PSO lifetime does not inherit acceptance");
         precise.pipeline=502; p.Contradict(precise,9000,4);
         check(p.Judge(precise,9000)!=ConsumerProfile::Verdict::Accepted,"later scene work demotes the exact consumer too");
-        check(!p.HasRecentExactEntry(4),"a contradicted consumer no longer takes priority");
+        check(!p.HasRecentExactEntry(4,9000),"a contradicted consumer no longer takes priority");
         ConsumerProfile reused;
         for (uint64_t f=1;f<=3;++f) learn(reused,{write(),final,write(false,0,Op::ClearWrite)},f);
-        check(!reused.HasRecentExactEntry(4),"a read before clear/reuse does not suppress the final barrier-only path");
+        check(!reused.HasRecentExactEntry(4,kGeo),"a read before clear/reuse does not suppress the final barrier-only path");
+        ConsumerProfile stable;
+        final.producer=kGeo2;
+        for(uint64_t f=1;f<=3;++f)learn(stable,{write(true,kGeo2),final},f);
+        check(stable.HasRecentExactEntry(4,kGeo2),"same producer's repeated recent exact consumer can still take priority");
+        check(!stable.HasRecentExactEntry(4,kGeo),"an unrelated producer cannot suppress a qualified barrier");
+        check(!stable.HasRecentExactEntry(4,0),"unknown producer never defers a boundary");
+        check(!stable.HasRecentExactEntry(5,kGeo2),"a missing consumer does not indefinitely suppress barrier routing");
     }
     // Bounded: many distinct classes never grow past the cap.
     {

@@ -155,7 +155,8 @@ int main(int argc, char** argv)
     const bool close_control = argc > 3 && std::strcmp(argv[3], "--inline-consumer-gap-old") == 0;
     const bool inline_consumer_gap = close_control || (argc > 3 && std::strcmp(argv[3], "--inline-consumer-gap") == 0);
     const bool inline_unbounded_srv = argc > 3 && std::strcmp(argv[3], "--inline-unbounded-srv") == 0;
-    const bool inline_late_srv = inline_unbounded_srv || (argc > 3 && std::strcmp(argv[3], "--inline-late-srv") == 0);
+    const bool inline_indirect_handoff = argc > 3 && std::strcmp(argv[3], "--inline-indirect-handoff") == 0;
+    const bool inline_late_srv = inline_indirect_handoff || inline_unbounded_srv || (argc > 3 && std::strcmp(argv[3], "--inline-late-srv") == 0);
     const bool inline_consumer = inline_late_srv || inline_consumer_gap || inline_consumer_tail || (argc > 3 && std::strcmp(argv[3], "--inline-consumer") == 0);
     const bool inline_raster = inline_consumer || (argc > 3 && std::strcmp(argv[3], "--inline-raster") == 0);
     const bool inline_pan = argc > 3 && std::strcmp(argv[3], "--inline-pan") == 0;
@@ -530,6 +531,17 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         cap_dir = std::wstring(tmp) + L"na_j2_capture_" + std::to_wstring(GetCurrentProcessId()) + (auto_inline ? L"_inline" : L"_between");
         na::capture::j2::Request(3, cap_dir.c_str(), 0);
     }
+    test::ComPtr<ID3D12CommandSignature> post_indirect_signature;
+    test::ComPtr<ID3D12Resource> post_indirect_args;
+    if(inline_indirect_handoff) {
+        D3D12_INDIRECT_ARGUMENT_DESC argument{};argument.Type=D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+        D3D12_COMMAND_SIGNATURE_DESC desc{sizeof(D3D12_DRAW_ARGUMENTS),1,&argument,0};
+        REQUIRE(SUCCEEDED(dev->CreateCommandSignature(&desc,nullptr,IID_PPV_ARGS(&post_indirect_signature))));
+        post_indirect_args=test::CreateBuffer(dev,sizeof(D3D12_DRAW_ARGUMENTS),D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+        REQUIRE(post_indirect_args);
+        void* ptr=nullptr;REQUIRE(SUCCEEDED(post_indirect_args->Map(0,nullptr,&ptr)));
+        const D3D12_DRAW_ARGUMENTS draw{3,1,0,0};std::memcpy(ptr,&draw,sizeof draw);post_indirect_args->Unmap(0,nullptr);
+    }
     int frame_no = 0;
     unsigned delivered=0, delivery_checks=0;
     test::ComPtr<ID3D12PipelineState> raster_pso;
@@ -687,7 +699,8 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                 scene.list->SetGraphicsRootSignature(rs.Get());
                 ID3D12DescriptorHeap* camera_heap[]={cbvh.Get()};scene.list->SetDescriptorHeaps(1,camera_heap);
                 scene.list->SetGraphicsRootDescriptorTable(0,cbvh->GetGPUDescriptorHandleForHeapStart());
-                scene.list->SetPipelineState(inline_consumer ? final_writers.at((inline_late_srv || inline_consumer_tail || inline_consumer_gap) ? 0 : pan_frame-1).Get() : raster_pso.Get());scene.list->DrawInstanced(3,1,0,0);
+                const size_t final_writer=inline_indirect_handoff ? size_t(pan_frame%2) : (inline_late_srv || inline_consumer_tail || inline_consumer_gap) ? 0 : size_t(pan_frame-1);
+                scene.list->SetPipelineState(inline_consumer ? final_writers.at(final_writer).Get() : raster_pso.Get());scene.list->DrawInstanced(3,1,0,0);
                 scene.list->SetDescriptorHeaps(1,ph);scene.list->SetGraphicsRootSignature(post_root.Get());
                 if(inline_late_srv)scene.list->SetGraphicsRoot32BitConstant(1,source_slot,0);
                 scene.list->SetPipelineState(post_pso.Get());
@@ -731,6 +744,12 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                 scene.list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
                 for (auto& b : cbars) std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
                 scene.list->ResourceBarrier(2, cbars);
+            } else if(inline_indirect_handoff && pan_frame%2==0) {
+                // The GPU consumes the selected image here. Our observer does not
+                // identify the shader read inside an indirect command. Yesterday's
+                // direct consumer belongs to a DIFFERENT scene-ending producer:
+                // it must not suppress this producer's established final barrier.
+                scene.list->ExecuteIndirect(post_indirect_signature.Get(),1,post_indirect_args.Get(),0,nullptr,0);
             } else if (!inline_pan && !gap_frame)
                 scene.list->DrawInstanced(3, 1, 0, 0); // some frames hand this read to another recording
             if (!inline_consumer && fake::evals != evals_before_read + (na::j2::GetStats().inline_mode ? 1 : 0)) {
@@ -921,9 +940,13 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         const auto is = na::j2::GetStats();
         if (inline_consumer) {
             if(inline_late_srv){
-                printf("late SRV delivery %u/%u; evaluated %llu/%d, close %llu\n",delivered,delivery_checks,(unsigned long long)is.frames,frames,(unsigned long long)is.close_recovered);
+                printf("%s delivery %u/%u; evaluated %llu/%d, close %llu\n",inline_indirect_handoff?"indirect handoff":"late SRV",delivered,delivery_checks,(unsigned long long)is.frames,frames,(unsigned long long)is.close_recovered);
                 CHECK(delivered==delivery_checks && delivery_checks==17);
-                CHECK(is.frames==uint64_t(frames-1) && is.inline_late_writes==0 && is.no_state==0 && is.no_camera==0);
+                // Alternating producers/direct-vs-indirect reads have six
+                // qualification frames in BOTH the negative and corrected
+                // runs (18 evaluations). The other case has one cold frame.
+                // The regression changes actual delivery, not these counters.
+                CHECK(is.frames==uint64_t(frames-(inline_indirect_handoff?6:1)) && is.inline_late_writes==0 && is.no_state==0 && is.no_camera==0);
                 return test::finish("j2_anno_shape_test (late SRV delivery)");
             }
             std::printf("changing final writer: %llu/%d frames evaluated, late writes %llu, camera failures %llu\n",
