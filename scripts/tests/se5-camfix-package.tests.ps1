@@ -37,7 +37,8 @@ function Run([int]$index,[string]$action) {
 Run 0 'Deploy'
 $ini=Join-Path $game 'NeuralAliasHost.ini';$s=Get-Content -LiteralPath $ini -Raw
 $s=$s.Replace('preset=L','preset=K').Replace('sharpness=100','sharpness=36').Replace('mip_bias=-1.0','mip_bias=0.0')
-$s += "`nflow_loosen=77`n" # j2 is the existing final section
+if([regex]::IsMatch($s,'(?m)^flow_loosen=')){$s=[regex]::Replace($s,'(?m)^flow_loosen=[^\r\n]*','flow_loosen=77')}
+else{$s += "`nflow_loosen=77`n"} # j2 is the existing final section
 [IO.File]::WriteAllText($ini,$s)
 Run 1 'Deploy'
 if((Get-FileHash -LiteralPath (Join-Path $game 'dxgi.dll')).Hash -ne (Get-FileHash -LiteralPath (Join-Path $Candidate 'NeuralAliasDXGI.dll')).Hash){throw 'Candidate DLL mismatch'}
@@ -51,4 +52,4 @@ Run 1 'Results'
 Run 1 'Rollback'
 if(Test-Path -LiteralPath (Join-Path $game 'dxgi.dll')){throw 'Rollback left injector'}
 if((Get-FileHash -LiteralPath (Join-Path $game 'native-original.dll')).Hash -ne $nativeHash){throw 'Native file changed'}
-Write-Host "PASS: original6f -> combined candidate -> original installation; saved choices and native file preserved. $root"
+Write-Host "PASS: $([IO.Path]::GetFileName($Original)) -> candidate -> original installation; saved choices and native file preserved. $root"
