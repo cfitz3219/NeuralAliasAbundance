@@ -62,7 +62,9 @@ struct State {
     std::atomic<bool> stop{false};
     HANDLE wake = nullptr;
 };
-State g;
+// Never destroyed (as frame_capture.cpp): its Slots' D3D12 copies would be released by the
+// CRT at exit, after observe's tables are gone (c0000005, SE5 2026-11-02).
+State& g = *new State;
 
 bool ensure_device(ID3D12Device* dev)
 {
@@ -184,14 +186,14 @@ void write_slot(const Slot& s)
             "  \"route\": %u,\n  \"route_mode\": %u,\n  \"history_generation\": %u,\n  \"insertion_signature\": %llu,\n"
             "  \"size\": [%u, %u],\n  \"color_format\": %u,\n  \"jitter_px\": [%.6f, %.6f],\n  \"mv_scale\": [%.4f, %.4f],\n"
             "  \"reset\": %u,\n  \"camera_cut\": %u,\n  \"preset\": %u,\n  \"sharpness\": %u,\n  \"debug_view\": %u,\n"
-            "  \"late_writes\": %llu,\n  \"frame_closed\": %s,\n  \"planes\": [\n",
+            "  \"placement\": %u,\n  \"at_close\": %u,\n  \"late_writes\": %llu,\n  \"frame_closed\": %s,\n  \"planes\": [\n",
             s.index, (unsigned long long)id.present_ordinal, (unsigned long long)id.submission,
             (unsigned long long)s.submit_ordinal, (unsigned long long)id.recording,
             (unsigned long long)id.view_color, (unsigned long long)id.view_depth, id.view_id, id.color_sub,
             id.route, id.route_mode, id.history_generation, (unsigned long long)id.insertion_signature,
             id.width, id.height, id.color_format, id.jitter_x, id.jitter_y, id.mv_scale_x, id.mv_scale_y,
             id.reset, id.camera_cut, id.preset, id.sharpness, id.debug_view,
-            (unsigned long long)s.late_writes, s.closed ? "true" : "false");
+            id.placement,id.at_close,(unsigned long long)s.late_writes, s.closed ? "true" : "false");
         bool first = true;
         for (int i = 0; i < kPlaneCount; ++i) {
             const Plane& p = s.planes[i];
@@ -319,6 +321,15 @@ uint32_t RecordEvaluation(ID3D12GraphicsCommandList* list, const Planes& p, cons
     wcsncpy_s(s->dir, g.dir, _TRUNCATE);
     if (g.stats.recorded >= g.requested) g.armed.store(false, std::memory_order_release);
     return static_cast<uint32_t>(s - g.slots) + 1;
+}
+
+void AnnotatePlacement(uint32_t token, uint32_t placement, bool at_close)
+{
+    if(!token)return;
+    std::lock_guard<std::mutex> lock(g.m);
+    Slot* s=slot_of(token);
+    if(!s || s->state!=SlotState::Recorded)return;
+    s->id.placement=placement;s->id.at_close=at_close?1u:0u;
 }
 
 void Submitted(uint32_t token, ID3D12CommandQueue* queue, uint64_t submission)

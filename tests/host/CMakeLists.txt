@@ -14,8 +14,18 @@ function(na_host_test name)
 endfunction()
 
 na_host_test(fg_profile_test SOURCES fg_profile_test.cpp LIBS host_settings nvapi_headers)
+na_host_test(ffx_flow_test SOURCES ffx_flow_test.cpp LIBS host_ffx_flow dxgi LABELS gpu)
+if(NA_HAVE_NGX_SDK)
+  na_host_test(j2_compute_flow_test SOURCES j2_compute_flow_test.cpp LIBS host_dx12 LABELS gpu)
+  na_host_test(j2_flow_retention_test SOURCES j2_flow_retention_test.cpp LIBS host_dx12 LABELS gpu)
+endif()
 na_host_test(pbz_settings_test SOURCES pbz_settings_test.cpp LIBS host_settings)
+na_host_test(render_scale_patch_test SOURCES render_scale_patch_test.cpp)
+na_host_test(settings_read_hook_test SOURCES settings_read_hook_test.cpp LIBS host_scale)
 na_host_test(session_exit_test SOURCES session_exit_test.cpp LIBS host_dx12)
+na_host_test(raster_jitter_test SOURCES raster_jitter_test.cpp LIBS host_dx12 d3dcompiler LABELS gpu)
+add_test(NAME host_raster_jitter_validation COMMAND raster_jitter_test --validation)
+set_tests_properties(host_raster_jitter_validation PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
 na_host_test(nr_settings_trace_test SOURCES nr_settings_trace_test.cpp LIBS host_settings)
 na_host_test(route_a_menu_test SOURCES route_a_menu_test.cpp LIBS host_dx12)
 
@@ -25,6 +35,7 @@ set_target_properties(nvngx_stub PROPERTIES PREFIX "")
 target_link_libraries(nvngx_stub PRIVATE abundance_options)
 
 na_host_test(hooking_test SOURCES hooking_test.cpp LIBS host_hooking d3d12 dxgi)
+na_host_test(raster_recording_sample_test SOURCES raster_recording_sample_test.cpp LIBS host_dx12 d3dcompiler LABELS gpu)
 # Game-facing Streamline boundary: this exe plays sl.interposer (exports + RTTI proxy class).
 na_host_test(sl_boundary_test SOURCES sl_boundary_test.cpp LIBS host_dx12)
 na_host_test(sl_dlss_mode_test SOURCES sl_dlss_mode_test.cpp LIBS host_dx12)
@@ -119,6 +130,16 @@ na_host_test(depth_format_test SOURCES depth_format_test.cpp)
 na_host_test(nr_depth_test SOURCES nr_depth_test.cpp LIBS host_dx12)
 na_host_test(nr_fg_composition_test SOURCES nr_fg_composition_test.cpp LIBS host_dx12)
 na_host_test(nr_fg_frame_cache_test SOURCES nr_fg_frame_cache_test.cpp LIBS host_dx12)
+# P4-0b: moving-object motion for J2 from optical flow. Fake engine in CI (pairing,
+# false-flow rejection, engine failure, busy rings + watchdog, resize retirement).
+na_host_test(j2_flow_test SOURCES j2_flow_test.cpp LIBS host_dx12 dxgi d3dcompiler)
+# P4-0c: AMD optical-flow passes (DXC at build time): blobs, embedded root signatures, PSOs.
+na_host_test(ffx_flow_shaders_test SOURCES ffx_flow_shaders_test.cpp LIBS host_ffx_flow d3d12 dxgi)
+if(NA_HAVE_NVOF)
+  # Same pipeline on the real NVIDIA optical-flow engine (RTX 20+); SKIPs without it.
+  add_test(NAME host_j2_flow_real_test COMMAND j2_flow_test --real)
+  set_tests_properties(host_j2_flow_real_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
+endif()
 
 # C6: generic DLSS backend. The fake-runtime test needs only the NGX headers
 # (runs in CI); the real test needs our own NGX instance (static library from
@@ -130,6 +151,8 @@ if(NA_HAVE_NGX_SDK)
   na_host_test(j2_rcas_test SOURCES j2_rcas_test.cpp LIBS host_dx12 dxgi)
   na_host_test(j2_nis_test SOURCES j2_nis_test.cpp LIBS host_dx12 dxgi)
   na_host_test(j2_anno_shape_test SOURCES j2_anno_shape_test.cpp LIBS host_dx12 dxgi d3dcompiler)
+  na_host_test(j2_inline_compute_test SOURCES j2_anno_shape_test.cpp LIBS host_dx12 dxgi d3dcompiler ARGS 1 1 --inline-flow LABELS gpu)
+  target_compile_definitions(j2_inline_compute_test PRIVATE NA_J2_TEST_COMPUTE)
   add_test(NAME host_j2_msaa_shape_test COMMAND j2_anno_shape_test 2)
   set_tests_properties(host_j2_msaa_shape_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS host)
   # Depth and stencil planes transitioned separately (Sniper Elite Resistance).
@@ -143,6 +166,20 @@ if(NA_HAVE_NGX_SDK)
   add_test(NAME host_j2_inline_copy_test COMMAND j2_anno_shape_test 1 1 --inline-copy)
   set_tests_properties(host_j2_inline_copy_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS host)
   add_test(NAME host_j2_inline_record_first_test COMMAND j2_anno_shape_test 1 1 --inline-record-first)
+    add_test(NAME host_j2_inline_raster_test COMMAND j2_anno_shape_test 1 1 --inline-raster)
+    add_test(NAME host_j2_inline_pan_test COMMAND j2_anno_shape_test 1 1 --inline-pan)
+    add_test(NAME host_j2_inline_consumer_test COMMAND j2_anno_shape_test 1 1 --inline-consumer)
+    add_test(NAME host_j2_inline_consumer_tail_test COMMAND j2_anno_shape_test 1 1 --inline-consumer-tail)
+    add_test(NAME host_j2_inline_consumer_gap_test COMMAND j2_anno_shape_test 1 1 --inline-consumer-gap)
+    add_test(NAME host_j2_inline_late_srv_delivery_test COMMAND j2_anno_shape_test 1 1 --inline-late-srv)
+    add_test(NAME host_j2_inline_unbounded_srv_delivery_test COMMAND j2_anno_shape_test 1 1 --inline-unbounded-srv)
+    set_tests_properties(host_j2_inline_late_srv_delivery_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+    set_tests_properties(host_j2_inline_unbounded_srv_delivery_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+    set_tests_properties(host_j2_inline_consumer_gap_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+    set_tests_properties(host_j2_inline_consumer_tail_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+    set_tests_properties(host_j2_inline_consumer_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+    set_tests_properties(host_j2_inline_pan_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+    set_tests_properties(host_j2_inline_raster_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   set_tests_properties(host_j2_inline_record_first_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS host)
   set_tests_properties(host_j2_inline_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS host)
   # Automatic route selection: no override; the selector must pick inline / between.
@@ -212,6 +249,7 @@ na_host_test(observe_snapshot_test SOURCES observe_snapshot_test.cpp LIBS host_o
 # C9b: asynchronous resource content samples (A2-R03).
 na_host_test(observe_sample_test SOURCES observe_sample_test.cpp LIBS host_observe_producers d3d12 dxgi)
 na_host_test(depth_carried_state_test SOURCES depth_carried_state_test.cpp LIBS host_observe_producers d3d12 dxgi)
+na_host_test(depth_prelock_mark_test SOURCES depth_prelock_mark_test.cpp LIBS host_observe_producers d3d12 dxgi)
 
 # C7a: FSR 3.1+ interception against a stand-in FidelityFX runtime DLL.
 add_library(ffx_stub SHARED ffx_stub.cpp)

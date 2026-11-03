@@ -118,6 +118,9 @@ add_library(host_hooking STATIC
   src/host_dx12/hooking/vtable_hook.cpp
   src/host_dx12/hooking/variant_registry.cpp)
 target_link_libraries(host_hooking PUBLIC abundance_options d3d12 PRIVATE minhook)
+# P4-4 slider route: read-time render-scale substitution (Fable; installed by host_boot on request).
+add_library(host_scale STATIC src/host_dx12/scale/settings_read_hook.cpp src/host_dx12/scale/live_driver.cpp)
+target_link_libraries(host_scale PUBLIC abundance_options host_hooking)
 
 add_library(host_observe STATIC src/host_dx12/host_observe.cpp)
 target_link_libraries(host_observe PUBLIC abundance_options)
@@ -148,6 +151,17 @@ else()
 endif()
 target_link_libraries(host_nvof PUBLIC abundance_options d3d12 d3dcompiler)
 
+# P4-0c: AMD FidelityFX optical flow (compute; inline route and NVOFA fallback). Shaders are
+# compiled by DXC at build time (cmake/ffx_flow_shaders.cmake); without DXC it is a stub.
+include(cmake/ffx_flow_shaders.cmake)
+add_library(host_ffx_flow STATIC src/host_dx12/ffx_flow/ffx_flow_shaders.cpp src/host_dx12/ffx_flow/ffx_flow.cpp)
+target_link_libraries(host_ffx_flow PUBLIC abundance_options d3d12)
+if(NA_HAVE_FFX_FLOW)
+  target_compile_definitions(host_ffx_flow PUBLIC NA_HAVE_FFX_FLOW)
+  target_include_directories(host_ffx_flow PRIVATE "${CMAKE_BINARY_DIR}/generated/ffx_flow")
+  add_dependencies(host_ffx_flow ffx_flow_shaders)
+endif()
+
 # ---------------------------------------------------------------- host_dx12
 # The in-game host. These modules reference each other freely (overlay <->
 # ngx_observe <-> nr/fg/motion <-> latency <-> tlou1), so they form one library.
@@ -171,6 +185,8 @@ add_library(host_dx12 STATIC
   src/host_dx12/nr/native_fg.cpp
   src/host_dx12/nr/fg_states.cpp
   src/host_dx12/j2/live_dlaa.cpp
+  src/host_dx12/j2/j2_flow.cpp
+  src/host_dx12/j2/compute_flow.cpp
   src/host_dx12/j2/nis_sharpen.cpp
   src/host_dx12/motion/live_flow.cpp
   src/host_dx12/latency/nvidia_latency.cpp
@@ -195,7 +211,7 @@ endif()
 # NVIDIA Image Scaling (MIT, vendored): sharpen-only stage of J2's Sharpness slider.
 target_include_directories(host_dx12 SYSTEM PRIVATE third_party/nis)
 target_link_libraries(host_dx12
-  PUBLIC abundance_options host_hooking host_settings host_capture host_nvof core_gpu imgui nvapi_headers host_dlss host_upscalers host_observe_producers
+  PUBLIC abundance_options host_hooking host_scale host_settings host_capture host_nvof host_ffx_flow core_gpu imgui nvapi_headers host_dlss host_upscalers host_observe_producers
          d3d12 dxgi d3dcompiler user32 gdi32 shell32 ole32 bcrypt dbghelp winmm)
 if(NA_HAVE_NGX_SDK)
   target_compile_definitions(host_dx12 PUBLIC NA_HAVE_NGX_SDK)

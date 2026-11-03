@@ -17,7 +17,7 @@
 // from %LOCALAPPDATA%\NeuralAlias\NeuralAliasSL.ini.
 namespace na::settings {
 namespace {
-#define NA_PERSISTED_FIELDS(F) F(enabled) F(dlss_mode) F(follow_game_resolution) F(preset) F(rr_preset) F(text_bold) F(win_x) F(win_y) F(win_w) F(win_h) F(nr_enabled) F(nr_intensity) F(nr_structure) F(nr_tone) F(nr_skin) F(nr_paper_white) F(nr_hdr_mode) F(nr_model) F(motion_enabled) F(motion_grid) F(motion_perf) F(motion_downscale) F(j2_sharpness) F(j2_preset) F(j2_mip_bias_x100) F(reflex_mode) F(fg_enabled) F(fg_mode) F(fg_preset) F(fg_multiplier) F(fg_target_fps) F(fg_frozen_at) F(fg_profile_override) F(native_fg_mode) F(native_fg_frames)
+#define NA_PERSISTED_FIELDS(F) F(enabled) F(dlss_mode) F(follow_game_resolution) F(preset) F(rr_preset) F(text_bold) F(win_x) F(win_y) F(win_w) F(win_h) F(nr_enabled) F(nr_intensity) F(nr_structure) F(nr_tone) F(nr_skin) F(nr_paper_white) F(nr_hdr_mode) F(nr_model) F(motion_enabled) F(motion_grid) F(motion_perf) F(motion_downscale) F(j2_sharpness) F(j2_scale_mode) F(j2_preset) F(j2_mip_bias_x100) F(reflex_mode) F(fg_enabled) F(fg_mode) F(fg_preset) F(fg_multiplier) F(fg_target_fps) F(fg_frozen_at) F(fg_profile_override) F(native_fg_mode) F(native_fg_frames)
 Settings g_settings;
 Settings g_loaded_values;
 std::atomic<bool> g_nr_user_touched{false};
@@ -100,7 +100,7 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
     target.nr_intensity.store(pct(L"intensity", 100));
     {
         const int v = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpness", 100, ini));
-        target.j2_sharpness.store(static_cast<uint32_t>(v < 0 ? 0 : (v > 200 ? 200 : v))); // 101..200 adds NIS
+        target.j2_sharpness.store(static_cast<uint32_t>(v < 0 ? 0 : (v > 150 ? 150 : v))); // 101..150 extends RCAS
         wchar_t mb[32] = {};
         GetPrivateProfileStringW(L"j2", L"mip_bias", L"-1.0", mb, 32, ini);
         double mbv = _wtof(mb);
@@ -114,6 +114,8 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
         else if (!_wcsicmp(pz, L"default")) pv = 0;
         else if (pz[0] && !pz[1]) { const wchar_t c = towupper(pz[0]); pv = (c >= L'A' && c <= L'Z') ? static_cast<uint32_t>(c - L'A' + 1) : 12; }
         target.j2_preset.store(pv > 26 ? 12 : pv);
+        const uint32_t sm = GetPrivateProfileIntW(L"j2", L"scale_mode", 0, ini);
+        target.j2_scale_mode.store(sm > 4 ? 0 : sm);
     }
     target.nr_structure.store(pct(L"structure", 100));
     target.nr_tone.store(pct(L"tone", 0));
@@ -249,13 +251,16 @@ bool SaveFromWorker()
         swprintf_s(v, L"%u", kv.value);
         ok &= WritePrivateProfileStringW(L"motion", kv.key, v, ini) != 0;
     }
-    swprintf_s(v, L"%u", g_settings.j2_sharpness.load());
+    const auto sharpness = g_settings.j2_sharpness.load();
+    swprintf_s(v, L"%u", sharpness > 150 ? 150 : sharpness);
     ok &= WritePrivateProfileStringW(L"j2", L"sharpness", v, ini) != 0;
     {
         const uint32_t pv = g_settings.j2_preset.load();
         if (pv >= 1 && pv <= 26) swprintf_s(v, L"%c", static_cast<wchar_t>(L'A' + pv - 1));
         else swprintf_s(v, L"default");
         ok &= WritePrivateProfileStringW(L"j2", L"preset", v, ini) != 0;
+        swprintf_s(v, L"%u", g_settings.j2_scale_mode.load());
+        ok &= WritePrivateProfileStringW(L"j2", L"scale_mode", v, ini) != 0;
         swprintf_s(v, L"%.2f", static_cast<int32_t>(PersistedSwitch(5,static_cast<uint32_t>(g_settings.j2_mip_bias_x100.load()))) / 100.0);
         ok &= WritePrivateProfileStringW(L"j2", L"mip_bias", v, ini) != 0;
     }

@@ -1,0 +1,1092 @@
+#include "host_dx12/scale/settings_read_hook.hpp"
+#include "host_dx12/scale/render_scale_patch.hpp"
+#include "host_dx12/hooking/vtable_hook.hpp"
+
+#include <windows.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdarg>
+#include <cstdio>
+#include <cstring>
+#include <cwchar>
+#include <map>
+#include <mutex>
+#include <string>
+#include <vector>
+
+namespace na::scale {
+namespace {
+
+using CreateFileWFn = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+using CreateFileAFn = HANDLE(WINAPI*)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+// The game's reads and saves are observed at ntdll!NtReadFile / NtWriteFile: Sniper Elite 5
+// imports NtReadFile/NtWriteFile directly, so kernelbase!ReadFile never saw its settings bytes
+// (2026-11-02: files opened, patched=0). ReadFile/WriteFile end in these too, so one layer
+// covers both, and nothing is processed twice.
+struct IoSb { union { LONG Status; PVOID Pointer; }; ULONG_PTR Information; };
+using NtReadFileFn = LONG(NTAPI*)(HANDLE, HANDLE, PVOID, PVOID, IoSb*, PVOID, ULONG, PLARGE_INTEGER, PULONG);
+using NtWriteFileFn = LONG(NTAPI*)(HANDLE, HANDLE, PVOID, PVOID, IoSb*, PVOID, ULONG, PLARGE_INTEGER, PULONG);
+using NtCreateSectionFn = LONG(NTAPI*)(PHANDLE, ACCESS_MASK, PVOID, PLARGE_INTEGER, ULONG, ULONG, HANDLE);
+using NtQueryInformationFileFn = LONG(NTAPI*)(HANDLE, IoSb*, PVOID, ULONG, ULONG);
+using NtMapViewOfSectionFn = LONG(NTAPI*)(HANDLE, HANDLE, PVOID*, ULONG_PTR, SIZE_T, PLARGE_INTEGER, PSIZE_T, DWORD, ULONG, ULONG);
+using NtMapViewOfSectionExFn = LONG(NTAPI*)(HANDLE, HANDLE, PVOID*, PLARGE_INTEGER, PSIZE_T, ULONG, ULONG, PVOID, ULONG);
+constexpr LONG kStatusPending = 0x103;
+
+CreateFileWFn o_create_w = nullptr;
+CreateFileAFn o_create_a = nullptr;
+NtReadFileFn o_ntread = nullptr;
+NtWriteFileFn o_ntwrite = nullptr;
+NtCreateSectionFn o_ntsection = nullptr;
+NtMapViewOfSectionFn o_ntmap = nullptr;
+NtMapViewOfSectionExFn o_ntmap_ex = nullptr;
+NtQueryInformationFileFn p_query_file = nullptr; // not hooked: the handle's synchronous mode
+
+constexpr uint64_t kMaxFileBytes = 1u << 20;
+
+struct Tracked {
+    std::wstring path;          // lower-cased final path (GetFinalPathNameByHandleW)
+    DWORD volume = 0;
+    uint64_t index = 0;         // volume serial + file index: the file's identity
+    bool read = false, write = false;
+    bool overlapped = false;    // opened with FILE_FLAG_OVERLAPPED: its I/O may complete later
+    bool read_logged = false, async_logged = false, map_logged = false; // diagnostics, once per handle
+};
+struct Patched { // per file: what we changed, to put back in the game's own writes
+    std::string original, ours; // value text, same length
+    std::string key;
+    Unit unit = Unit::Fraction;
+    double original_value = 0;  // the game's value, its unit
+    // (our value is kept as text only: a double copy in our heap would be found by the scan)
+    bool async_logged = false;
+};
+
+std::mutex g_m;
+double g_fraction = 0;
+std::wstring g_log;
+std::map<HANDLE, Tracked> g_handles;
+std::map<std::wstring, Patched> g_patched; // lower-cased path
+ReadHookStats g_stats;
+int g_open_logs = 0; // diagnostics: tracked opens logged (bounded)
+// Content route (2026-11-02): SE5 opened GraphicsOptions.ini through CreateFileW but no NtReadFile
+// or save ever arrived on that handle, while other files' reads did. So a read or save on an
+// UNTRACKED handle whose bytes look like settings text is checked by its file path and adopted.
+std::atomic<bool> g_any_candidate{false}; // a candidate settings file was opened for reading
+std::atomic<bool> g_any_patch{false};     // something was substituted: saves need checking
+struct Identity { DWORD volume; uint64_t index; std::wstring path; };
+// Files checked by path and not a candidate, by identity (handle values are reused; bounded).
+std::vector<std::pair<DWORD, uint64_t>> g_rejected;
+// Sections created on a candidate settings file (mapped route, SE5 2026-11-02). Each is created
+// copy-on-write capable, and its first view gets the substitution in PRIVATE pages: a
+// copy-on-write page is never written back to the file.
+struct SettingsSection { HANDLE section; std::wstring path; DWORD volume; uint64_t index; bool writecopy; bool substituted; };
+std::vector<SettingsSection> g_sections;
+std::atomic<int> g_section_count{0}; // g_sections.size(), readable without g_m (fast path)
+std::vector<Identity> g_known;            // candidate files opened for reading (bounded)
+// Live switching: the marked value the game parsed, in its unit, and the candidates found.
+struct Candidate {
+    uintptr_t addr = 0;
+    bool is_double = false;
+    unsigned char last[8] = {};   // the bytes we expect there (marker, then what we wrote)
+    unsigned char before[8] = {}; // what was there before we tried it (put back on failure)
+    bool written = false;
+};
+struct Live {
+    bool have_tag = false;
+    Unit unit = Unit::Fraction;
+    double tag = 0;
+    uint32_t generation = 0;     // bumped on each marked read; a scan publishes only if current
+    bool scanned = false, scanning = false;
+    std::vector<Candidate> cand;
+    int trying = -1, control = -1;
+    std::vector<double> values_written; // every value we wrote (its unit): restored in saves
+    double pending = 0;           // latest requested fraction (0 = none)
+    LiveStats stats;
+} g_live;
+HANDLE g_scan_done = nullptr;     // manual-reset event: set while no scan runs
+bool g_installed = false;
+thread_local int t_inside = 0; // our own file work (the log) is not observed
+// Lock-free fast path: ReadFile/WriteFile run for every file the game touches, so untracked
+// handles return after scanning these few slots, without the mutex. Stale slots are harmless
+// (still_same() re-checks the file) and are overwritten round-robin.
+constexpr int kSlots = 16;
+std::atomic<HANDLE> g_slot[kSlots];
+std::atomic<uint32_t> g_slot_next{0};
+bool tracked_fast(HANDLE h)
+{
+    for (auto& x : g_slot) if (x.load(std::memory_order_acquire) == h) return true;
+    return false;
+}
+void untrack_slot(HANDLE h) // a stale hint: later calls on this handle skip the lock again
+{
+    for (auto& x : g_slot) {
+        HANDLE e = h;
+        x.compare_exchange_strong(e, nullptr, std::memory_order_acq_rel);
+    }
+}
+void track_slot(HANDLE h)
+{
+    if (tracked_fast(h)) return;
+    g_slot[g_slot_next.fetch_add(1) % kSlots].store(h, std::memory_order_release);
+}
+
+std::wstring lower(std::wstring s)
+{
+    for (auto& c : s) c = static_cast<wchar_t>(towlower(c));
+    return s;
+}
+bool candidate(const std::wstring& p)
+{
+    const size_t dot = p.find_last_of(L'.');
+    if (dot == std::wstring::npos || p.find_last_of(L"\\/") > dot) return false;
+    static const wchar_t* const exts[] = {L".ini", L".cfg", L".json", L".xml", L".txt", L".yaml", L".yml", L".conf", L".config"};
+    const std::wstring e = lower(p.substr(dot));
+    if (lower(p).find(L"neuralalias") != std::wstring::npos) return false; // never our own settings or logs
+    for (const wchar_t* x : exts) if (e == x) return true;
+    return false;
+}
+std::string utf8(const std::wstring& w)
+{
+    if (w.empty()) return {};
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+    std::string s(n > 0 ? n : 0, '\0');
+    if (n > 0) WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), s.data(), n, nullptr, nullptr);
+    return s;
+}
+void log_line(const char* text)
+{
+    if (g_log.empty() || !o_create_w) return;
+    ++t_inside;
+    const HANDLE f = o_create_w(g_log.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        char buf[700];
+        const int n = std::snprintf(buf, sizeof buf, "%04u-%02u-%02u %02u:%02u:%02u render_scale: %s\r\n", st.wYear, st.wMonth, st.wDay,
+                                    st.wHour, st.wMinute, st.wSecond, text);
+        DWORD w = 0;
+        if (n > 0) WriteFile(f, buf, static_cast<DWORD>((std::min)(n, static_cast<int>(sizeof buf) - 1)), &w, nullptr);
+        CloseHandle(f);
+    }
+    --t_inside;
+}
+
+// First bytes of a read, printable (diagnostics: why no render-scale key was found).
+std::string preview(const char* d, size_t n, bool wide)
+{
+    const std::string s = wide ? NarrowUtf16LE(d, n) : std::string(d, n);
+    std::string o;
+    for (size_t i = 0; i < s.size() && o.size() < 120; ++i) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c == '\r') continue;
+        if (c == '\n') o += " | ";
+        else o += (c >= 0x20 && c < 0x7F) ? static_cast<char>(c) : '?';
+    }
+    return o;
+}
+
+bool identity(HANDLE h, DWORD* vol, uint64_t* idx)
+{
+    BY_HANDLE_FILE_INFORMATION fi{};
+    if (!GetFileInformationByHandle(h, &fi)) return false;
+    *vol = fi.dwVolumeSerialNumber;
+    *idx = (static_cast<uint64_t>(fi.nFileIndexHigh) << 32) | fi.nFileIndexLow;
+    return true;
+}
+std::wstring final_path(HANDLE h, const std::wstring& fallback)
+{
+    wchar_t buf[MAX_PATH * 2] = {};
+    const DWORD n = GetFinalPathNameByHandleW(h, buf, MAX_PATH * 2, FILE_NAME_NORMALIZED);
+    if (!n || n >= MAX_PATH * 2) return lower(fallback);
+    std::wstring fin = lower(buf);
+    if (fin.rfind(L"\\\\?\\", 0) == 0) fin = fin.substr(4);
+    return fin;
+}
+// The tracked entry still names the same file: handle values are reused after CloseHandle, and
+// a same-named file in another folder is a different file (Astra 2026-11-01).
+bool still_same(HANDLE h, const Tracked& t)
+{
+    DWORD v = 0;
+    uint64_t i = 0;
+    return identity(h, &v, &i) && v == t.volume && i == t.index;
+}
+
+void on_open(HANDLE h, std::wstring path, DWORD access, DWORD flags)
+{
+    if (h == INVALID_HANDLE_VALUE || t_inside || !candidate(path)) return;
+    const bool rd = (access & (GENERIC_READ | FILE_READ_DATA | GENERIC_ALL)) != 0;
+    const bool wr = (access & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_ALL)) != 0;
+    std::lock_guard<std::mutex> lk(g_m);
+    if (!(g_fraction > 0)) return;
+    if (rd && !wr) {
+        LARGE_INTEGER sz{};
+        if (!GetFileSizeEx(h, &sz) || static_cast<uint64_t>(sz.QuadPart) > kMaxFileBytes) return;
+        ++g_stats.files_opened;
+        if (g_open_logs < 48) { // which files the game opens (diagnostics, bounded)
+            ++g_open_logs;
+            char line[600];
+            std::snprintf(line, sizeof line, "opened for reading: %s (%lld bytes)", utf8(final_path(h, path)).c_str(),
+                          static_cast<long long>(sz.QuadPart));
+            log_line(line);
+        }
+    }
+    Tracked t;
+    if (!identity(h, &t.volume, &t.index)) return;
+    t.path = final_path(h, path);
+    if (wr && g_open_logs < 48) { // the save route (diagnostics, bounded)
+        ++g_open_logs;
+        char line[600];
+        std::snprintf(line, sizeof line, "opened for writing%s: %s%s", rd ? " and reading" : "", utf8(t.path).c_str(),
+                      (flags & FILE_FLAG_OVERLAPPED) ? " (asynchronous)" : "");
+        log_line(line);
+    }
+    t.read = rd;
+    t.write = wr;
+    t.overlapped = (flags & FILE_FLAG_OVERLAPPED) != 0;
+    if (rd) {
+        g_any_candidate.store(true, std::memory_order_release);
+        bool have = false;
+        for (const Identity& k : g_known) have |= k.volume == t.volume && k.index == t.index;
+        if (!have && g_known.size() < 64) g_known.push_back({t.volume, t.index, t.path});
+    }
+    if (g_handles.size() > 256) g_handles.clear(); // bounded: stale entries only
+    g_handles[h] = std::move(t);
+    track_slot(h);
+}
+
+HANDLE WINAPI create_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disp, DWORD flags, HANDLE tmpl)
+{
+    const HANDLE h = o_create_w(name, access, share, sa, disp, flags, tmpl);
+    if (name && !t_inside) on_open(h, name, access, flags);
+    return h;
+}
+HANDLE WINAPI create_a(LPCSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disp, DWORD flags, HANDLE tmpl)
+{
+    ++t_inside; // CreateFileA may forward to CreateFileW: observe once, here
+    const HANDLE h = o_create_a(name, access, share, sa, disp, flags, tmpl);
+    --t_inside;
+    if (name && !t_inside) {
+        wchar_t w[MAX_PATH * 2] = {};
+        if (MultiByteToWideChar(CP_ACP, 0, name, -1, w, MAX_PATH * 2) > 0) on_open(h, w, access, flags);
+    }
+    return h;
+}
+
+// Asynchronous read of a tracked file: its bytes arrive later and are not inspected (logged once).
+void note_async_read(HANDLE h, ULONG n)
+{
+    std::lock_guard<std::mutex> lk(g_m);
+    const auto it = g_handles.find(h);
+    if (it == g_handles.end() || !it->second.read || it->second.async_logged) return;
+    it->second.async_logged = true;
+    ++g_stats.reads_async;
+    char line[600];
+    std::snprintf(line, sizeof line, "asynchronous read of %s (%lu bytes asked): not inspected", utf8(it->second.path).c_str(),
+                  static_cast<unsigned long>(n));
+    log_line(line);
+}
+
+void patch_locked(Tracked& t, char* d, size_t got_n);
+void inspect_read(HANDLE h, void* buf, size_t got_n)
+{
+    std::lock_guard<std::mutex> lk(g_m);
+    if (!(g_fraction > 0) || g_handles.empty()) return;
+    const auto it = g_handles.find(h);
+    if (it == g_handles.end() || !it->second.read) return;
+    if (!still_same(h, it->second)) {
+        char line[600];
+        std::snprintf(line, sizeof line, "read on a reused handle (was %s): no longer tracked", utf8(it->second.path).c_str());
+        log_line(line);
+        g_handles.erase(it);
+        return;
+    }
+    patch_locked(it->second, static_cast<char*>(buf), got_n);
+}
+
+// g_m held. Substitutes in `d` (bytes of the settings file `t` names, read or mapped) and logs.
+void patch_locked(Tracked& t, char* d, size_t got_n)
+{
+    const size_t* got = &got_n;
+    PatchInfo info;
+    bool wide = false;
+    const int k = PatchRenderScaleText(d, *got, g_fraction, &info, /*tag=*/true, &wide);
+    char line[600];
+    const std::string file = utf8(t.path);
+    if (k == 0 && !info.m.key[0]) { // no render-scale key in these bytes: say what they were (once per handle)
+        if (!t.read_logged) {
+            t.read_logged = true;
+            std::snprintf(line, sizeof line, "read of %s: %lu bytes%s, no render-scale key; starts: %s", file.c_str(),
+                          static_cast<unsigned long>(got_n), wide ? " (UTF-16)" : "", preview(d, *got, wide).c_str());
+            log_line(line);
+        }
+        return;
+    }
+    t.read_logged = true;
+    if (wide) ++g_stats.reads_utf16;
+    if (k > 0) g_any_patch.store(true, std::memory_order_release);
+    if (k > 0) {
+        const Match& m = info.m; // the first entry actually rewritten
+        ++g_stats.reads_patched;
+        g_stats.original = m.current;
+        std::snprintf(g_stats.key, sizeof g_stats.key, "%s", m.key);
+        std::snprintf(g_stats.file, sizeof g_stats.file, "%s", file.c_str());
+        Patched& p = g_patched[t.path];
+        p.original = info.original;
+        p.ours = info.written;
+        p.key = m.key;
+        p.unit = m.unit;
+        p.original_value = m.current;
+        // Live discovery only from a marker that really is in the bytes and survives float
+        // conversion; startup substitution works either way.
+        g_live.have_tag = info.tagged;
+        g_live.unit = m.unit;
+        g_live.tag = info.tagged ? std::atof(info.written) : 0; // g_live is in our module: not scanned
+        ++g_live.generation;
+        g_live.scanned = false;
+        g_live.cand.clear();
+        g_live.trying = g_live.control = -1;
+        g_live.stats.tagged = info.tagged;
+        g_live.stats.tag = g_live.tag;
+        g_live.stats.generation = g_live.generation;
+        std::snprintf(g_stats.note, sizeof g_stats.note, "%s %s -> %s (%d value%s, %s)", m.key, info.original, info.written, k,
+                      k == 1 ? "" : "s", info.tagged ? "marked for live switching" : "too short to mark: no live switching");
+        std::snprintf(line, sizeof line, "patched read of %s: %s", file.c_str(), g_stats.note);
+    } else {
+        ++g_stats.reads_unpatched;
+        std::snprintf(g_stats.note, sizeof g_stats.note, "%s = %.6g found, but %.4f does not fit its width", info.m.key, info.m.current, g_fraction);
+        std::snprintf(line, sizeof line, "not patched (%s): %s", file.c_str(), g_stats.note);
+    }
+    log_line(line);
+}
+
+// Cheap test on bytes from an untracked handle: could they hold a render-scale key? Every key in
+// kKeys contains "cale" or "ercent" (any case of the letter before); UTF-16 as well.
+constexpr size_t kSniffBytes = 64 * 1024; // settings files are a few KB; bounds the cost on streaming reads
+bool contains(const char* d, size_t n, const char* pat, size_t pn)
+{
+    for (const char* p = d; n >= pn;) {
+        const void* f = std::memchr(p, pat[0], n - pn + 1);
+        if (!f) return false;
+        const char* q = static_cast<const char*>(f);
+        if (std::memcmp(q, pat, pn) == 0) return true;
+        n -= static_cast<size_t>(q - p) + 1;
+        p = q + 1;
+    }
+    return false;
+}
+bool sniff(const void* buf, size_t n)
+{
+    if (!buf || n < 8 || n > kSniffBytes) return false;
+    const char* d = static_cast<const char*>(buf);
+    return contains(d, n, "cale", 4) || contains(d, n, "ercent", 6) || contains(d, n, "c\0a\0l\0e\0", 8) ||
+           contains(d, n, "e\0r\0c\0e\0n\0t\0", 12);
+}
+// Starts tracking `h` when it names a candidate settings file (path checked here, outside g_m).
+// `why` goes in the log. True when tracked now.
+// A fast-path hit is only a hint: the slot or the entry may be a closed handle's whose value was
+// reused (CI 2026-11-02: a stale write-only entry hid a read of the settings file). True when `h`
+// is tracked for this use and still names the same file; a stale entry is dropped.
+bool tracked_for(HANDLE h, bool for_write)
+{
+    if (!tracked_fast(h)) return false;
+    std::lock_guard<std::mutex> lk(g_m);
+    const auto it = g_handles.find(h);
+    if (it == g_handles.end()) { untrack_slot(h); return false; }
+    const bool same = still_same(h, it->second);
+    if (same && (for_write ? it->second.write : it->second.read)) return true;
+    if (!same) { g_handles.erase(it); untrack_slot(h); }
+    return false;
+}
+
+bool adopt(HANDLE h, const char* why)
+{
+    {
+        std::lock_guard<std::mutex> lk(g_m);
+        if (!(g_fraction > 0)) return false;
+        const auto it = g_handles.find(h);
+        if (it != g_handles.end()) { // tracked by another thread meanwhile, or a stale entry
+            if (still_same(h, it->second)) { it->second.read = it->second.write = true; return true; }
+            g_handles.erase(it);
+        }
+    }
+    ++t_inside;
+    Tracked t;
+    bool ok = identity(h, &t.volume, &t.index);
+    if (ok) {
+        std::lock_guard<std::mutex> lk(g_m);
+        const auto id = std::make_pair(t.volume, t.index);
+        if (std::find(g_rejected.begin(), g_rejected.end(), id) != g_rejected.end()) { --t_inside; return false; }
+    }
+    if (ok) {
+        t.path = final_path(h, L"");
+        ok = !t.path.empty() && candidate(t.path);
+    }
+    ULONG mode = 0;
+    IoSb io{};
+    const bool sync = ok && p_query_file && p_query_file(h, &io, &mode, sizeof mode, 16 /*FileModeInformation*/) == 0 &&
+                      (mode & 0x30 /*FILE_SYNCHRONOUS_IO_ALERT | _NONALERT*/) != 0;
+    --t_inside;
+    std::lock_guard<std::mutex> lk(g_m);
+    if (!ok) {
+        if (t.index || t.volume) {
+            if (g_rejected.size() >= 512) g_rejected.erase(g_rejected.begin(), g_rejected.begin() + 256);
+            g_rejected.emplace_back(t.volume, t.index);
+        }
+        return false;
+    }
+    bool known = false;
+    for (const Identity& k : g_known) known |= k.volume == t.volume && k.index == t.index;
+    t.read = t.write = true; // the game just read or wrote through it
+    t.overlapped = !sync;    // unknown mode is treated as asynchronous: saves are not substituted
+    char line[700];
+    std::snprintf(line, sizeof line, "%s of %s through a handle we did not see opened%s%s: now tracked", why, utf8(t.path).c_str(),
+                  known ? " (same file as an open we saw)" : "", sync ? "" : " (asynchronous handle)");
+    log_line(line);
+    ++g_stats.handles_adopted;
+    if (g_handles.size() > 256) g_handles.clear();
+    g_handles[h] = std::move(t);
+    track_slot(h);
+    return true;
+}
+
+LONG NTAPI nt_read(HANDLE h, HANDLE ev, PVOID apc, PVOID ctx, IoSb* io, PVOID buf, ULONG n, PLARGE_INTEGER off, PULONG key)
+{
+    const LONG st = o_ntread(h, ev, apc, ctx, io, buf, n, off, key);
+    if (t_inside) return st;
+    if (!tracked_for(h, false)) {
+        if (st != 0 || !io || !g_any_candidate.load(std::memory_order_acquire) || !sniff(buf, io->Information) || !adopt(h, "read"))
+            return st;
+    }
+    if (st == kStatusPending) { note_async_read(h, n); return st; }
+    if (st != 0 || !buf || !io || !io->Information) return st; // STATUS_SUCCESS only: the bytes are in buf now
+    inspect_read(h, buf, static_cast<size_t>(io->Information));
+    return st;
+}
+
+// The candidate settings file `file` names, by identity (empty when it is none).
+const Identity* known_file_locked(DWORD v, uint64_t i)
+{
+    for (const Identity& k : g_known)
+        if (k.volume == v && k.index == i) return &k;
+    return nullptr;
+}
+bool known_mapping_file(HANDLE file, DWORD* v, uint64_t* i, std::wstring* path)
+{
+    if (t_inside || !file || file == INVALID_HANDLE_VALUE || !g_any_candidate.load(std::memory_order_acquire)) return false;
+    ++t_inside;
+    const bool id = identity(file, v, i);
+    --t_inside;
+    if (!id) return false;
+    std::lock_guard<std::mutex> lk(g_m);
+    const Identity* k = known_file_locked(*v, *i);
+    if (!k) return false;
+    *path = k->path;
+    return true;
+}
+
+// Reads the whole settings file through our own handle (the game's handle and file position are
+// left alone), substitutes, and creates a pagefile-backed section of the same size holding those
+// bytes, returned to the game in place of the file-backed one. False (nothing created) when the
+// file has no render-scale key or anything fails: the caller then maps the file as the game asked.
+bool substitute_section(PHANDLE sec, ACCESS_MASK access, PVOID oa, PLARGE_INTEGER max, const std::wstring& path, DWORD v,
+                        uint64_t i, LONG* st_out)
+{
+    if (!sec) return false;
+    ++t_inside;
+    std::string bytes;
+    const HANDLE f = o_create_w(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        char buf[16384];
+        DWORD r = 0;
+        while (bytes.size() <= kMaxFileBytes && ReadFile(f, buf, sizeof buf, &r, nullptr) && r) bytes.append(buf, r);
+        CloseHandle(f);
+    }
+    --t_inside;
+    if (bytes.empty() || bytes.size() > kMaxFileBytes) return false;
+    {
+        Match m; // cheap pre-check outside the lock: no key, nothing to substitute
+        const bool wide = LooksUtf16LE(bytes.data(), bytes.size());
+        const std::string view = wide ? NarrowUtf16LE(bytes.data(), bytes.size()) : bytes;
+        if (!FindRenderScale(view.data(), view.size(), &m)) return false;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_m);
+        Tracked t;
+        t.path = path;
+        t.volume = v;
+        t.index = i;
+        t.read = true;
+        const uint64_t before = g_stats.reads_patched;
+        patch_locked(t, bytes.data(), bytes.size());
+        if (g_stats.reads_patched == before) return false; // found but not substitutable: the game's own bytes
+    }
+    LARGE_INTEGER size{};
+    size.QuadPart = static_cast<LONGLONG>(bytes.size());
+    if (max && max->QuadPart > size.QuadPart) size = *max; // the game asked for more: zero-filled like a file mapping
+    const ACCESS_MASK acc = access | SECTION_MAP_READ | SECTION_MAP_WRITE | SECTION_QUERY;
+    const LONG st = o_ntsection(sec, acc, oa, &size, PAGE_READWRITE, SEC_COMMIT, nullptr);
+    if (st != 0 || !*sec) return false;
+    ++t_inside;
+    void* w = MapViewOfFile(*sec, FILE_MAP_WRITE, 0, 0, 0);
+    if (w) {
+        std::memcpy(w, bytes.data(), bytes.size());
+        UnmapViewOfFile(w);
+    }
+    --t_inside;
+    if (!w) {
+        CloseHandle(*sec);
+        *sec = nullptr;
+        return false;
+    }
+    *st_out = st;
+    return true;
+}
+
+// NtCreateSection is under every file mapping (CreateFileMapping* and the loader alike).
+LONG NTAPI nt_section(PHANDLE sec, ACCESS_MASK access, PVOID oa, PLARGE_INTEGER max, ULONG prot, ULONG attrib, HANDLE file)
+{
+    DWORD v = 0;
+    uint64_t i = 0;
+    std::wstring path;
+    if (!file || (attrib & 0x01000000 /*SEC_IMAGE*/) || !known_mapping_file(file, &v, &i, &path))
+        return o_ntsection(sec, access, oa, max, prot, attrib, file);
+    double fraction = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_m);
+        fraction = g_fraction;
+    }
+    // First choice (2026-11-02, SE5 pid 38132: its section was created but no view of it ever
+    // reached our map hooks): hand the game a PAGEFILE-backed section holding the substituted
+    // bytes. However it then maps the section, it sees our value; the file is never involved.
+    LONG st = -1;
+    bool substituted = false;
+    if (fraction > 0 && (prot == PAGE_READONLY || prot == PAGE_WRITECOPY))
+        substituted = substitute_section(sec, access, oa, max, path, v, i, &st);
+    bool writecopy = false;
+    // Otherwise a read-only section is created copy-on-write capable (needs only read access to
+    // the file); views stay read-only unless we make a private copy of their pages.
+    if (!substituted && fraction > 0 && prot == PAGE_READONLY) {
+        st = o_ntsection(sec, access, oa, max, PAGE_WRITECOPY, attrib, file);
+        writecopy = st == 0;
+    }
+    if (!writecopy && !substituted) st = o_ntsection(sec, access, oa, max, prot, attrib, file);
+    std::lock_guard<std::mutex> lk(g_m);
+    ++g_stats.files_mapped;
+    char line[700];
+    std::snprintf(line, sizeof line, "%s is read through a file mapping (protection 0x%lx, attributes 0x%lx%s, status 0x%lx)",
+                  utf8(path).c_str(), static_cast<unsigned long>(prot), static_cast<unsigned long>(attrib),
+                  substituted ? ", the game gets our private copy" : writecopy ? ", created copy-on-write capable" : "",
+                  static_cast<unsigned long>(st));
+    log_line(line);
+    // Only sections we changed are followed: a writable (save) mapping keeps its shared pages, so
+    // the game's own save still reaches the file (Astra 2026-11-02, reproduced).
+    if (st == 0 && sec && *sec && (substituted || writecopy)) {
+        if (g_sections.size() >= 16) g_sections.erase(g_sections.begin());
+        g_sections.push_back({*sec, path, v, i, writecopy, substituted});
+        g_section_count.store(static_cast<int>(g_sections.size()), std::memory_order_release);
+    }
+    return st;
+}
+
+bool current_process(HANDLE p) { return p == GetCurrentProcess() || GetProcessId(p) == GetCurrentProcessId(); }
+
+// After a view of a tracked settings section is mapped: substitute in private copy-on-write pages.
+void on_view(HANDLE section, HANDLE process, PVOID* base, PSIZE_T size, ULONG protect)
+{
+    if (t_inside || !base || !*base || !size || !*size || !current_process(process)) return;
+    std::lock_guard<std::mutex> lk(g_m);
+    auto it = std::find_if(g_sections.begin(), g_sections.end(), [&](const SettingsSection& x) { return x.section == section; });
+    if (it == g_sections.end()) return;
+    const SettingsSection sct = *it;
+    g_sections.erase(it); // one view per section creation: a reused section handle is never patched
+    g_section_count.store(static_cast<int>(g_sections.size()), std::memory_order_release);
+    char line[700];
+    if (sct.substituted) { // already holds our bytes: just confirm the game looked at it
+        std::snprintf(line, sizeof line, "the game mapped our copy of %s (%zu bytes, protection 0x%lx)", utf8(sct.path).c_str(),
+                      static_cast<size_t>(*size), static_cast<unsigned long>(protect));
+        log_line(line);
+        return;
+    }
+    if (!(g_fraction > 0)) return;
+    char* d = static_cast<char*>(*base);
+    const size_t n = strnlen(d, (std::min)(static_cast<size_t>(*size), static_cast<size_t>(kMaxFileBytes)));
+    DWORD old = 0;
+    const bool priv = n && VirtualProtect(d, n, PAGE_WRITECOPY, &old);
+    std::snprintf(line, sizeof line, "view of %s: %zu bytes, view protection 0x%lx%s", utf8(sct.path).c_str(), n,
+                  static_cast<unsigned long>(protect), priv ? ", private copy-on-write pages" : ", could not make private pages: not patched");
+    log_line(line);
+    if (!priv) return;
+    Tracked t;
+    t.path = sct.path;
+    t.volume = sct.volume;
+    t.index = sct.index;
+    t.read = true;
+    patch_locked(t, d, n); // writes touch only private copies of the pages
+    DWORD tmp = 0;
+    VirtualProtect(d, n, old, &tmp);
+}
+LONG NTAPI nt_map(HANDLE sec, HANDLE proc, PVOID* base, ULONG_PTR zero, SIZE_T commit, PLARGE_INTEGER off, PSIZE_T size, DWORD inherit,
+                  ULONG type, ULONG protect)
+{
+    const LONG st = o_ntmap(sec, proc, base, zero, commit, off, size, inherit, type, protect);
+    if (st == 0 && g_section_count.load(std::memory_order_acquire) > 0) on_view(sec, proc, base, size, protect);
+    return st;
+}
+LONG NTAPI nt_map_ex(HANDLE sec, HANDLE proc, PVOID* base, PLARGE_INTEGER off, PSIZE_T size, ULONG type, ULONG protect, PVOID ext,
+                     ULONG ext_n)
+{
+    const LONG st = o_ntmap_ex(sec, proc, base, off, size, type, protect, ext, ext_n);
+    if (st == 0 && g_section_count.load(std::memory_order_acquire) > 0) on_view(sec, proc, base, size, protect);
+    return st;
+}
+
+// A value in the game's save is one we put there: the substituted text, or (any formatting)
+// the substituted value or a live value we wrote, or that value ROUNDED to the game's own slider
+// step (SE5 2026-11-02: given 0.666668 it used and saved 0.65, its 5 % step, which a strict match
+// missed and Cort's file kept 65 %). Within 5 % (one coarse slider step) of a value we wrote counts
+// as ours; a user who moves the game's slider to within 5 % of our value gets the original back.
+bool ours_value(const Patched& p, const std::string& text, double v)
+{
+    if (text == p.ours) return true;
+    const double step = p.unit == Unit::Percent ? 5.0 : 0.05;
+    const auto near_to = [&](double a) { return std::fabs(v - a) <= step + 1e-6 * (std::max)(1.0, std::fabs(a)); };
+    if (near_to(std::atof(p.ours.c_str()))) return true;
+    for (double w : g_live.values_written) if (near_to(w)) return true;
+    return false;
+}
+
+LONG NTAPI nt_write(HANDLE h, HANDLE ev, PVOID apc, PVOID ctx, IoSb* io, PVOID buf, ULONG n, PLARGE_INTEGER off, PULONG key)
+{
+    if (!buf || !n || t_inside) return o_ntwrite(h, ev, apc, ctx, io, buf, n, off, key);
+    if (!tracked_for(h, true) && !(g_any_patch.load(std::memory_order_acquire) && sniff(buf, n) && adopt(h, "save")))
+        return o_ntwrite(h, ev, apc, ctx, io, buf, n, off, key);
+    std::string fixed;
+    {
+        std::lock_guard<std::mutex> lk(g_m);
+        const auto it = g_handles.find(h);
+        if (it != g_handles.end() && it->second.write && still_same(h, it->second)) {
+            const auto p = g_patched.find(it->second.path);
+            if (p != g_patched.end() && it->second.overlapped) {
+                // Asynchronous save: the bytes must stay valid until completion, which a temporary
+                // here would not. Forwarded untouched (Astra 2026-11-01); logged once.
+                if (!p->second.async_logged) {
+                    p->second.async_logged = true;
+                    char line[400];
+                    std::snprintf(line, sizeof line, "game saved %s asynchronously: not restored (the saved value may be ours)",
+                                  utf8(it->second.path).c_str());
+                    log_line(line);
+                }
+            } else if (p != g_patched.end()) {
+                fixed.assign(static_cast<const char*>(buf), n);
+                const bool wide = LooksUtf16LE(fixed.data(), fixed.size());
+                const std::string wide_before = wide ? NarrowUtf16LE(fixed.data(), fixed.size()) : std::string();
+                std::string raw; // UTF-16: the bytes to send; `fixed` becomes their narrow view
+                if (wide) { raw.swap(fixed); fixed = wide_before; }
+                const Patched& pp = p->second;
+                Match m;
+                int restored = 0, failed = 0;
+                for (size_t from = 0; FindRenderScale(fixed.data(), fixed.size(), &m, from); from = m.value_pos + m.value_len) {
+                    const std::string text = fixed.substr(m.value_pos, m.value_len);
+                    if (!ours_value(pp, text, m.current)) continue; // the user's own value: saved as it is
+                    if (m.value_len == pp.original.size()) {
+                        fixed.replace(m.value_pos, m.value_len, pp.original);
+                        ++restored;
+                        continue;
+                    }
+                    char v[16] = {};
+                    const double frac = pp.unit == Unit::Percent ? pp.original_value / 100.0 : pp.original_value;
+                    Match mm = m;
+                    mm.unit = pp.unit;
+                    if (FormatSameWidth(frac, mm, v) && std::fabs(std::atof(v) - pp.original_value) <= 1e-6 * (std::max)(1.0, pp.original_value)) {
+                        fixed.replace(m.value_pos, m.value_len, v);
+                        ++restored;
+                    } else {
+                        ++failed;
+                    }
+                }
+                char line[400];
+                if (restored) {
+                    ++g_stats.writes_restored;
+                    std::snprintf(line, sizeof line, "game saved %s: kept the original %s = %s", utf8(it->second.path).c_str(), pp.key.c_str(),
+                                  pp.original.c_str());
+                    log_line(line);
+                }
+                if (failed) {
+                    std::snprintf(line, sizeof line, "game saved %s: our %s value could not be put back in its width (%d)",
+                                  utf8(it->second.path).c_str(), pp.key.c_str(), failed);
+                    log_line(line);
+                }
+                if (!restored) fixed.clear();
+                else if (wide) { WidenChangedUtf16LE(wide_before, fixed, raw.data(), raw.size()); fixed.swap(raw); }
+            }
+        }
+    }
+    // Same length as the game's bytes; the I/O is synchronous (the handle is not overlapped), so
+    // `fixed` outlives it.
+    if (!fixed.empty()) return o_ntwrite(h, ev, apc, ctx, io, fixed.data(), n, off, key);
+    return o_ntwrite(h, ev, apc, ctx, io, buf, n, off, key);
+}
+
+} // namespace
+
+void Configure(double fraction, const wchar_t* log_path)
+{
+    std::lock_guard<std::mutex> lk(g_m);
+    g_fraction = fraction > 0 && fraction <= 2.0 ? fraction : 0;
+    g_log = log_path ? log_path : L"";
+}
+double ConfiguredFraction()
+{
+    std::lock_guard<std::mutex> lk(g_m);
+    return g_fraction;
+}
+double FractionForMode(int mode)
+{
+    switch (mode) {
+    case 1: return 1.0 / 1.5;
+    case 2: return 1.0 / 1.72;
+    case 3: return 0.5;
+    case 4: return 1.0 / 3.0;
+    default: return 1.0;
+    }
+}
+
+bool InstallSettingsReadHook()
+{
+    {
+        std::lock_guard<std::mutex> lk(g_m);
+        if (g_installed) return true;
+    }
+    HMODULE kb = GetModuleHandleW(L"kernelbase.dll");
+    if (!kb) kb = GetModuleHandleW(L"kernel32.dll");
+    if (!kb) return false;
+    void* cw = reinterpret_cast<void*>(GetProcAddress(kb, "CreateFileW"));
+    void* ca = reinterpret_cast<void*>(GetProcAddress(kb, "CreateFileA"));
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    void* cs = nt ? reinterpret_cast<void*>(GetProcAddress(nt, "NtCreateSection")) : nullptr;
+    void* mv = nt ? reinterpret_cast<void*>(GetProcAddress(nt, "NtMapViewOfSection")) : nullptr;
+    void* mx = nt ? reinterpret_cast<void*>(GetProcAddress(nt, "NtMapViewOfSectionEx")) : nullptr; // Windows 10 1803+
+    p_query_file = nt ? reinterpret_cast<NtQueryInformationFileFn>(GetProcAddress(nt, "NtQueryInformationFile")) : nullptr;
+    void* rf = nt ? reinterpret_cast<void*>(GetProcAddress(nt, "NtReadFile")) : nullptr;
+    void* wf = nt ? reinterpret_cast<void*>(GetProcAddress(nt, "NtWriteFile")) : nullptr;
+    if (!cw || !ca || !rf || !wf || !na::hooking::Initialize()) return false;
+    if (!na::hooking::BeginInstallWait("render-scale read hook")) { na::hooking::Shutdown(); return false; }
+    // Originals first (publish-before-enable); the detours never run before they are set.
+    if (!na::hooking::PrepareHook(cw, reinterpret_cast<void*>(&create_w), reinterpret_cast<void**>(&o_create_w)) ||
+        !na::hooking::PrepareHook(ca, reinterpret_cast<void*>(&create_a), reinterpret_cast<void**>(&o_create_a)) ||
+        !na::hooking::PrepareHook(rf, reinterpret_cast<void*>(&nt_read), reinterpret_cast<void**>(&o_ntread)) ||
+        !na::hooking::PrepareHook(wf, reinterpret_cast<void*>(&nt_write), reinterpret_cast<void**>(&o_ntwrite)) ||
+        (cs && !na::hooking::PrepareHook(cs, reinterpret_cast<void*>(&nt_section), reinterpret_cast<void**>(&o_ntsection))) ||
+        (mv && !na::hooking::PrepareHook(mv, reinterpret_cast<void*>(&nt_map), reinterpret_cast<void**>(&o_ntmap))) ||
+        (mx && !na::hooking::PrepareHook(mx, reinterpret_cast<void*>(&nt_map_ex), reinterpret_cast<void**>(&o_ntmap_ex)))) {
+        na::hooking::AbandonInstall();
+        na::hooking::Shutdown();
+        return false;
+    }
+    if (!na::hooking::CommitInstall()) { na::hooking::Shutdown(); return false; }
+    std::lock_guard<std::mutex> lk(g_m);
+    g_installed = true; // hooks persist for the process lifetime (vtable_hook.hpp threading rules)
+    return true;
+}
+
+namespace {
+constexpr size_t kMaxCandidates = 8; // more than this: ambiguous, nothing is tried
+
+struct Hit { uintptr_t addr; bool is_double; };
+struct ScanOut {
+    std::vector<Hit> cand;
+    uint32_t floats = 0, doubles = 0, regions = 0, writable = 0, stacks = 0;
+    uint64_t bytes = 0;
+};
+
+// Committed, writable regions of this process, outside our own module, our scan buffer and
+// every thread's stack (an allocation holding a guard page is a stack: other threads' locals
+// and spills hold the marker transiently and are never a setting's home).
+void scan_memory(double v, ScanOut& o)
+{
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&g_live), &self);
+    struct Region { uintptr_t base; size_t size; void* alloc; };
+    std::vector<Region> list;
+    std::vector<void*> stacks;
+    MEMORY_BASIC_INFORMATION mi{};
+    for (uintptr_t a = 0x10000; VirtualQuery(reinterpret_cast<void*>(a), &mi, sizeof mi) == sizeof mi;) {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(mi.BaseAddress), next = base + mi.RegionSize;
+        if (next <= a) break;
+        a = next;
+        ++o.regions;
+        if (mi.State != MEM_COMMIT) continue;
+        if (mi.Protect & PAGE_GUARD) { stacks.push_back(mi.AllocationBase); continue; }
+        if (mi.Protect & PAGE_NOACCESS) continue;
+        if (!(mi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE))) continue;
+        ++o.writable;
+        if (self && mi.AllocationBase == self) continue;
+        if (mi.RegionSize > (2ull << 30)) continue; // one huge region: not a settings value's home
+        list.push_back({base, static_cast<size_t>(mi.RegionSize), mi.AllocationBase});
+    }
+    o.stacks = static_cast<uint32_t>(stacks.size());
+    const float fv = static_cast<float>(v);
+    constexpr size_t kChunk = 1u << 20;
+    auto* buf = static_cast<unsigned char*>(VirtualAlloc(nullptr, kChunk, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!buf) return;
+    bool full = false;
+    for (const Region& r : list) {
+        if (full) break;
+        if (std::find(stacks.begin(), stacks.end(), r.alloc) != stacks.end()) continue;
+        if (o.bytes + r.size > (16ull << 30)) break; // bounded in total
+        o.bytes += r.size;
+        for (size_t off = 0; off < r.size && !full; off += kChunk) {
+            const size_t n = (std::min)(kChunk, r.size - off);
+            SIZE_T got = 0;
+            if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(r.base + off), buf, n, &got) || got < 4) continue;
+            for (size_t i = 0; i + 4 <= got; i += 4) {
+                // Only addresses are recorded here; the candidates' expected bytes are filled in
+                // after the scan, so no copy of the marker sits in our own heap while it runs.
+                const uintptr_t at = r.base + off + i;
+                float f;
+                std::memcpy(&f, buf + i, 4);
+                if (f == fv) { ++o.floats; o.cand.push_back({at, false}); }
+                if (i + 8 <= got) {
+                    double dv;
+                    std::memcpy(&dv, buf + i, 8);
+                    if (dv == v) { ++o.doubles; o.cand.push_back({at, true}); }
+                }
+                if (o.cand.size() > kMaxCandidates) { full = true; break; }
+            }
+        }
+    }
+    VirtualFree(buf, 0, MEM_RELEASE);
+}
+
+size_t width(const Candidate& c) { return c.is_double ? 8 : 4; }
+bool holds(const Candidate& c, const unsigned char* expect)
+{
+    unsigned char cur[8] = {};
+    SIZE_T got = 0;
+    return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(c.addr), cur, width(c), &got) && got == width(c) &&
+           std::memcmp(cur, expect, width(c)) == 0;
+}
+bool store(Candidate& c, const unsigned char* bytes)
+{
+    SIZE_T put = 0;
+    if (!WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(c.addr), bytes, width(c), &put) || put != width(c)) return false;
+    std::memcpy(c.last, bytes, width(c));
+    return true;
+}
+void encode(const Candidate& c, double v, unsigned char* out)
+{
+    if (c.is_double) std::memcpy(out, &v, 8);
+    else { const float f = static_cast<float>(v); std::memcpy(out, &f, 4); }
+}
+
+LiveResult set_result(LiveResult r, const char* fmt, ...)
+{
+    g_live.stats.result = r;
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(g_live.stats.note, sizeof g_live.stats.note, fmt, ap);
+    va_end(ap);
+    char line[300];
+    std::snprintf(line, sizeof line, "live switch %s: %s", LiveResultName(r), g_live.stats.note);
+    log_line(line);
+    return r;
+}
+
+void remember(double v) // values we wrote, restored in the game's saves (bounded)
+{
+    auto& w = g_live.values_written;
+    if (std::find(w.begin(), w.end(), v) != w.end()) return;
+    if (w.size() >= 32) w.erase(w.begin());
+    w.push_back(v);
+}
+
+// g_m held. Writes the pending request to the confirmed control, or to the next untried candidate.
+LiveResult apply_locked()
+{
+    auto& L = g_live;
+    const double fraction = L.pending;
+    if (!(fraction > 0)) return L.stats.result;
+    const double nv = L.unit == Unit::Percent ? fraction * 100.0 : fraction;
+    L.stats.requested = nv;
+    if (L.cand.empty()) return set_result(LiveResult::NotFound, "the marked value %.6f was not found in memory", L.tag);
+    if (L.cand.size() > kMaxCandidates)
+        return set_result(LiveResult::Ambiguous, "more than %zu copies of the marked value: nothing written", kMaxCandidates);
+    unsigned char bytes[8] = {};
+    if (L.control >= 0) {
+        Candidate& c = L.cand[static_cast<size_t>(L.control)];
+        if (!holds(c, c.last)) return set_result(LiveResult::NoLongerOurs, "the control no longer holds our last value: left alone");
+        encode(c, nv, bytes);
+        if (!store(c, bytes)) return set_result(LiveResult::NoLongerOurs, "the control could not be written");
+        ++L.stats.writes;
+        remember(nv);
+        L.pending = 0;
+        return set_result(LiveResult::Applied, "wrote %.6f to the control (%s at %p); J2 confirms the extent", nv,
+                          c.is_double ? "double" : "float", reinterpret_cast<void*>(c.addr));
+    }
+    // Untried candidate, one at a time. A candidate already written and still being tried is rewritten.
+    for (int i = L.trying < 0 ? 0 : L.trying; i < static_cast<int>(L.cand.size()); ++i) {
+        Candidate& c = L.cand[static_cast<size_t>(i)];
+        if (!c.written && !holds(c, c.last)) continue; // reused for something else since the scan: skip
+        if (c.written && !holds(c, c.last)) continue;
+        if (!c.written) std::memcpy(c.before, c.last, sizeof c.before);
+        encode(c, nv, bytes);
+        if (!store(c, bytes)) continue;
+        c.written = true;
+        L.trying = i;
+        ++L.stats.writes;
+        remember(nv);
+        L.stats.trying = i;
+        L.pending = 0;
+        return set_result(LiveResult::Trying, "trying candidate %d of %zu (%s at %p) = %.6f; waiting for J2's extent", i + 1, L.cand.size(),
+                          c.is_double ? "double" : "float", reinterpret_cast<void*>(c.addr), nv);
+    }
+    L.trying = static_cast<int>(L.cand.size()); // stays exhausted until the next marked read
+    L.stats.trying = -1;
+    return set_result(LiveResult::Exhausted, "none of the %zu candidates changed the picture: applies on next launch", L.cand.size());
+}
+
+DWORD WINAPI scan_thread(void*)
+{
+    for (;;) {
+        double tag = 0;
+        uint32_t gen = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_m);
+            tag = g_live.tag;
+            gen = g_live.generation;
+        }
+        const ULONGLONG t0 = GetTickCount64();
+        ScanOut o;
+        scan_memory(tag, o); // outside g_m: the file hooks keep running meanwhile
+        const ULONGLONG ms = GetTickCount64() - t0;
+        std::lock_guard<std::mutex> lk(g_m);
+        auto& L = g_live;
+        if (gen != L.generation && L.have_tag) continue; // a newer marked read: scan again for it
+        if (gen != L.generation) { // a newer read carried no marker: nothing to publish
+            L.scanning = false;
+            L.cand.clear();
+            SetEvent(g_scan_done);
+            return 0;
+        }
+        L.cand.clear();
+        for (const Hit& h : o.cand) {
+            Candidate c;
+            c.addr = h.addr;
+            c.is_double = h.is_double;
+            encode(c, tag, c.last);
+            L.cand.push_back(c);
+        }
+        L.scanned = true;
+        L.scanning = false;
+        L.trying = L.control = -1;
+        L.stats.float_hits = o.floats;
+        L.stats.double_hits = o.doubles;
+        L.stats.candidates = static_cast<uint32_t>(L.cand.size());
+        L.stats.scanned_kb = o.bytes >> 10;
+        L.stats.scan_ms = ms;
+        L.stats.regions = o.regions;
+        L.stats.writable_regions = o.writable;
+        L.stats.stack_allocations_skipped = o.stacks;
+        char line[300];
+        std::snprintf(line, sizeof line, "scan for %.6f: %llu KB in %llu ms, %u float + %u double candidate%s, %u stacks skipped", tag,
+                      (unsigned long long)L.stats.scanned_kb, (unsigned long long)ms, o.floats, o.doubles,
+                      L.cand.size() == 1 ? "" : "s", o.stacks);
+        log_line(line);
+        apply_locked();
+        SetEvent(g_scan_done);
+        return 0;
+    }
+}
+} // namespace
+
+const char* LiveResultName(LiveResult r)
+{
+    switch (r) {
+    case LiveResult::Off: return "off";
+    case LiveResult::NoTag: return "no-marker";
+    case LiveResult::Scanning: return "scanning";
+    case LiveResult::NotFound: return "not-found";
+    case LiveResult::Ambiguous: return "ambiguous";
+    case LiveResult::Trying: return "trying";
+    case LiveResult::Applied: return "applied";
+    case LiveResult::NoLongerOurs: return "no-longer-ours";
+    case LiveResult::Exhausted: return "exhausted";
+    }
+    return "?";
+}
+
+LiveResult SetLiveFraction(double fraction)
+{
+    std::lock_guard<std::mutex> lk(g_m);
+    auto& L = g_live;
+    if (!(fraction > 0) || fraction > 2.0) return set_result(LiveResult::Off, "requested %.4f is out of range", fraction);
+    if (!L.have_tag) return set_result(LiveResult::NoTag, "no marked render-scale value was read at start-up");
+    L.pending = fraction;
+    if (L.scanned) return apply_locked();
+    if (!L.scanning) {
+        if (!g_scan_done) g_scan_done = CreateEventW(nullptr, TRUE, TRUE, nullptr);
+        if (!g_scan_done) return set_result(LiveResult::NotFound, "could not start the scan");
+        ResetEvent(g_scan_done);
+        const HANDLE t = CreateThread(nullptr, 0, &scan_thread, nullptr, 0, nullptr);
+        if (!t) { SetEvent(g_scan_done); return set_result(LiveResult::NotFound, "could not start the scan thread"); }
+        CloseHandle(t);
+        L.scanning = true;
+    }
+    L.stats.result = LiveResult::Scanning;
+    std::snprintf(L.stats.note, sizeof L.stats.note, "scanning for the marked value; %.4f is applied when it ends", fraction);
+    return LiveResult::Scanning;
+}
+
+void ReportLiveOutcome(bool extent_changed)
+{
+    std::lock_guard<std::mutex> lk(g_m);
+    auto& L = g_live;
+    if (L.control >= 0 || L.trying < 0 || L.trying >= static_cast<int>(L.cand.size())) return;
+    Candidate& c = L.cand[static_cast<size_t>(L.trying)];
+    if (extent_changed) {
+        L.control = L.trying;
+        L.stats.control = L.control;
+        L.stats.trying = -1;
+        L.trying = -1;
+        set_result(LiveResult::Applied, "candidate %d is the control (%s at %p)", L.control + 1, c.is_double ? "double" : "float",
+                   reinterpret_cast<void*>(c.addr));
+        return;
+    }
+    // Did not move the picture: put it back exactly as it was, if it still holds what we wrote.
+    if (holds(c, c.last) && store(c, c.before)) ++L.stats.restores;
+    c.written = false;
+    const int next = L.trying + 1;
+    L.trying = next < static_cast<int>(L.cand.size()) ? next : static_cast<int>(L.cand.size());
+    L.stats.trying = -1;
+    char line[200];
+    std::snprintf(line, sizeof line, "live switch: candidate %d did not change the picture; put back", next);
+    log_line(line);
+}
+
+bool WaitLiveScan(uint32_t timeout_ms)
+{
+    HANDLE e = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_m);
+        if (!g_live.scanning) return true;
+        e = g_scan_done;
+    }
+    return e && WaitForSingleObject(e, timeout_ms) == WAIT_OBJECT_0;
+}
+
+LiveStats GetLiveStats()
+{
+    std::lock_guard<std::mutex> lk(g_m);
+    return g_live.stats;
+}
+
+ReadHookStats GetReadHookStats()
+{
+    std::lock_guard<std::mutex> lk(g_m);
+    return g_stats;
+}
+
+} // namespace na::scale

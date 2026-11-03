@@ -18,8 +18,14 @@
 #include "host_dx12/dlss/dlss_backend.hpp"
 #include "host_dx12/host_observe.h"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/j2/j2_flow.hpp"
+#include "host_dx12/j2/compute_flow.hpp"
+#include "host_dx12/ffx_flow/ffx_flow_shaders.hpp"
+#include "host_dx12/nr/nr_pass.hpp"
+#include "host_dx12/nr/native_fg.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/observe/producers.hpp"
+#include "host_dx12/overlay/submission_tracking.hpp"
 
 #include <d3dcompiler.h>
 #include <array>
@@ -58,17 +64,22 @@ std::string ReadText(const std::wstring& path)
 void __stdcall Forward(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists)
 {
     g_forwarded.assign(lists, lists + n);
+    na::nr::native::Submission recording(q,n,lists); // same lifetime wrapper as production ForwardThroughNr
     q->ExecuteCommandLists(n, lists); // queue not hooked in this test: the plain runtime call
 }
 // The overlay's sequence around a game submission.
 void Submit(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists, bool j2)
 {
+    const auto before = na::observe::GetProducerStats();
     const na::observe::ExecuteToken t = na::observe::ExecuteBegin(q, n, lists);
-    na::dlss::BeforeExecute(q, n, lists); // as the overlay: DLSS completion tracking of inline recordings
+    na::overlay::BeforeGameSubmission(q,n,lists);
     if (j2) na::j2::Execute(q, n, lists, &Forward);
     else q->ExecuteCommandLists(n, lists);
-    na::dlss::OnExecuted(q, n, lists);
+    na::overlay::AfterGameSubmission(q,n,lists);
     na::observe::ExecuteEnd(t, q, n, lists);
+    const auto after = na::observe::GetProducerStats();
+    CHECK(after.ambiguous_executes == before.ambiguous_executes);
+    CHECK(after.nested_unlocked == before.nested_unlocked);
 }
 using M = std::array<double, 16>;
 M Mul(const M& a, const M& b)
@@ -138,7 +149,17 @@ int main(int argc, char** argv)
     // the Anno shape) after its learning frames.
     const bool auto_inline = argc > 3 && std::strcmp(argv[3], "--auto-inline") == 0;
     const bool auto_between = argc > 3 && std::strcmp(argv[3], "--auto-between") == 0;
-    const bool inline_list = auto_inline || inline_record_first || inline_copy || (argc > 3 && std::strcmp(argv[3], "--inline") == 0);
+    const bool inline_flow=argc>3 && std::strcmp(argv[3],"--inline-flow")==0;
+    if(inline_flow && !na::ffx_flow::Built())return test::kSkip;
+    const bool inline_consumer_tail = argc > 3 && std::strcmp(argv[3], "--inline-consumer-tail") == 0;
+    const bool close_control = argc > 3 && std::strcmp(argv[3], "--inline-consumer-gap-old") == 0;
+    const bool inline_consumer_gap = close_control || (argc > 3 && std::strcmp(argv[3], "--inline-consumer-gap") == 0);
+    const bool inline_unbounded_srv = argc > 3 && std::strcmp(argv[3], "--inline-unbounded-srv") == 0;
+    const bool inline_late_srv = inline_unbounded_srv || (argc > 3 && std::strcmp(argv[3], "--inline-late-srv") == 0);
+    const bool inline_consumer = inline_late_srv || inline_consumer_gap || inline_consumer_tail || (argc > 3 && std::strcmp(argv[3], "--inline-consumer") == 0);
+    const bool inline_raster = inline_consumer || (argc > 3 && std::strcmp(argv[3], "--inline-raster") == 0);
+    const bool inline_pan = argc > 3 && std::strcmp(argv[3], "--inline-pan") == 0;
+    const bool inline_list = inline_pan || inline_raster || inline_flow || auto_inline || inline_record_first || inline_copy || (argc > 3 && std::strcmp(argv[3], "--inline") == 0);
     // auto-between needs an OBSERVABLE consumer (a copy of the colour): a barrier-only
     // hand-back is not evidence of a list boundary (Astra R3).
     const bool post_reader = argc > 3 && !real_ngx && !planes && !split && !inline_list;
@@ -154,12 +175,17 @@ int main(int argc, char** argv)
     ID3D12Device* dev = d.device.Get();
     ID3D12CommandQueue* q = d.queue.Get();
     REQUIRE(na::observe::InstallProducers(dev, q, /*hook_queue_execute=*/false));
+    if(inline_flow)REQUIRE(na::observe::InstallListResetTracking(dev,na::nr::OnCommandListReset));
     na_observe_config cfg{};
     cfg.size_bytes = sizeof(cfg);
     REQUIRE(na_observe_start(&cfg, &Sink, nullptr) == NA_OK);
     if (!real_ngx) na::dlss::SetInitOwnOverrideForTests([](ID3D12Device* device, const wchar_t*) { return na::dlss::Attach(device, fake::MakeApi()); });
 
+#if defined(NA_J2_TEST_COMPUTE)
+    constexpr uint32_t W=512,H=256;
+#else
     constexpr uint32_t W = 64, H = 32;
+#endif
     for (auto pair : {std::make_pair(DXGI_FORMAT_R16G16B16A16_FLOAT,samples), std::make_pair(DXGI_FORMAT_D32_FLOAT_S8X24_UINT,depth_samples)}) {
         D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels{pair.first,pair.second,D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE,0};
         REQUIRE(SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,&levels,sizeof levels)));
@@ -372,26 +398,42 @@ int main(int argc, char** argv)
         D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_FLAG_NONE);
     REQUIRE(post_color);
     test::ComPtr<ID3D12DescriptorHeap> post_heap;
+    test::ComPtr<ID3D12DescriptorHeap> post_source_heap;
     test::ComPtr<ID3D12RootSignature> post_root;
+    const UINT post_base=inline_late_srv?17u:0u,post_offset=inline_late_srv?11u:0u;
+    const auto post_gpu=[&]{auto h=post_heap->GetGPUDescriptorHandleForHeapStart();h.ptr+=UINT64(post_base)*dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);return h;};
     if (post_reader || inline_list) {
         REQUIRE(!msaa);
-        REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&chd, IID_PPV_ARGS(&post_heap))));
+        auto phd = chd;
+        if (inline_late_srv) phd.NumDescriptors = 128;
+        REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&phd, IID_PPV_ARGS(&post_heap))));
         D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
         srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srv.Texture2DArray.MipLevels = 1; srv.Texture2DArray.FirstArraySlice = 1; srv.Texture2DArray.ArraySize = 1;
-        dev->CreateShaderResourceView(color.Get(), &srv, post_heap->GetCPUDescriptorHandleForHeapStart());
-        D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
-        D3D12_ROOT_PARAMETER p{}; p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p.DescriptorTable = {1, &range};
-        D3D12_ROOT_SIGNATURE_DESC rd{1, &p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        if (inline_late_srv) {
+            auto handle=post_heap->GetCPUDescriptorHandleForHeapStart();
+            const auto inc=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            for(UINT i=0;i<128;++i){dev->CreateShaderResourceView(nullptr,&srv,handle);handle.ptr+=inc;}
+            auto cpu=phd;cpu.NumDescriptors=2;cpu.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+            REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&cpu,IID_PPV_ARGS(&post_source_heap))));
+            auto source=post_source_heap->GetCPUDescriptorHandleForHeapStart();
+            dev->CreateShaderResourceView(color.Get(),&srv,source);source.ptr+=inc;dev->CreateShaderResourceView(nullptr,&srv,source);
+        }
+        auto first=post_heap->GetCPUDescriptorHandleForHeapStart();first.ptr+=SIZE_T(post_base+post_offset)*dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        dev->CreateShaderResourceView(color.Get(), &srv, first);
+        D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, inline_unbounded_srv ? UINT_MAX : inline_late_srv ? 96u : 1u, 0, 0, post_offset};
+        D3D12_ROOT_PARAMETER p[2]{}; p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[0].DescriptorTable = {1, &range};
+        p[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;p[1].Constants={0,0,1};
+        D3D12_ROOT_SIGNATURE_DESC rd{inline_late_srv ? 2u : 1u, p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
         test::ComPtr<ID3DBlob> blob, error;
         REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)));
         REQUIRE(SUCCEEDED(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&post_root))));
     }
     // Inline mode: the post pass draws into its own target (another resource).
-    test::ComPtr<ID3D12PipelineState> post_pso;
+    test::ComPtr<ID3D12PipelineState> post_pso, final_post_pso;
     test::ComPtr<ID3D12Resource> post_rt;
     test::ComPtr<ID3D12DescriptorHeap> post_rtvh;
     D3D12_CPU_DESCRIPTOR_HANDLE post_rtv{};
@@ -402,14 +444,19 @@ int main(int argc, char** argv)
         REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&phd, IID_PPV_ARGS(&post_rtvh))));
         post_rtv = post_rtvh->GetCPUDescriptorHandleForHeapStart();
         dev->CreateRenderTargetView(post_rt.Get(), nullptr, post_rtv);
-        const char* shader = R"(
+        const char* shader = inline_late_srv ? R"(
+Texture2DArray<float4> image[96] : register(t0);
+cbuffer C:register(b0){uint which;}
+float4 VS(uint id : SV_VertexID) : SV_Position { float2 p=float2((id<<1)&2,id&2); return float4(p*2-1,0,1); }
+float4 PS(float4 pos : SV_Position) : SV_Target { return image[which].Load(int4(int2(pos.xy),0,0)); }
+)" : R"(
 Texture2DArray<float4> image : register(t0);
 float4 VS(uint id : SV_VertexID) : SV_Position { float2 p=float2((id<<1)&2,id&2); return float4(p*2-1,0,1); }
 float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(pos.xy),0,0)); }
 )";
         test::ComPtr<ID3DBlob> vs, ps, err;
         REQUIRE(SUCCEEDED(D3DCompile(shader, std::strlen(shader), nullptr, nullptr, nullptr, "VS", "vs_5_0", 0, 0, &vs, &err)));
-        REQUIRE(SUCCEEDED(D3DCompile(shader, std::strlen(shader), nullptr, nullptr, nullptr, "PS", "ps_5_0", 0, 0, &ps, &err)));
+        REQUIRE(SUCCEEDED(D3DCompile(shader, std::strlen(shader), nullptr, nullptr, nullptr, "PS", inline_late_srv ? "ps_5_1" : "ps_5_0", 0, 0, &ps, &err)));
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
         pd.pRootSignature = post_root.Get();
         pd.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
@@ -421,6 +468,10 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         pd.NumRenderTargets = 1; pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
         REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&post_pso))));
+        if (inline_consumer) {
+            pd.RasterizerState.FrontCounterClockwise = TRUE; // same role class, distinct consumer object
+            REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&final_post_pso))));
+        }
     }
     uint8_t* cpu = nullptr;
     REQUIRE(SUCCEEDED(cb->Map(0, nullptr, reinterpret_cast<void**>(&cpu))) && cpu);
@@ -455,7 +506,10 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
     // the auto modes exercise the selector.
     na::settings::Get().j2_route.store((auto_inline || auto_between || inline_list) ? 0u : 1u);
     na::j2::SetEnabled(true);
+    if (close_control) na::observe::SetListCloseCallback(nullptr); // negative control: the old missing opportunity
+    na::j2::flow::SetEnabled(inline_flow);
     na::j2::SetJitter(true); // J1 is off by default in the game; the tests exercise it
+    na::j2::SetRasterJitter(inline_raster);
     na::observe::SetLiveSelection(na::observe::IdOf(depth.Get()), na::observe::IdOf(color.Get()));
     // Auto modes also exercise the J2 evidence capture: 3 consecutive evaluations, each
     // with its own slot, joined by the presented image (a stand-in in PRESENT state).
@@ -477,6 +531,33 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         na::capture::j2::Request(3, cap_dir.c_str(), 0);
     }
     int frame_no = 0;
+    unsigned delivered=0, delivery_checks=0;
+    test::ComPtr<ID3D12PipelineState> raster_pso;
+    std::vector<test::ComPtr<ID3D12PipelineState>> final_writers;
+    if (inline_raster) {
+        // Real geometry intentionally ignores the readable camera block. Merely
+        // rewriting that block cannot provide this shader's raster sample.
+        const char* sh = "float4 VS(uint i:SV_VertexID):SV_Position { float2 p=float2((i<<1)&2,i&2);return float4(p*2-1,0.5,1); } float4 PS():SV_Target{return float4(0.2,0.3,0.4,1);}";
+        test::ComPtr<ID3DBlob> vs, ps, err;
+        REQUIRE(SUCCEEDED(D3DCompile(sh,strlen(sh),nullptr,nullptr,nullptr,"VS","vs_5_0",0,0,&vs,&err)));
+        REQUIRE(SUCCEEDED(D3DCompile(sh,strlen(sh),nullptr,nullptr,nullptr,"PS","ps_5_0",0,0,&ps,&err)));
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};pd.pRootSignature=rs.Get();
+        pd.VS={vs->GetBufferPointer(),vs->GetBufferSize()};pd.PS={ps->GetBufferPointer(),ps->GetBufferSize()};
+        pd.RasterizerState.FillMode=D3D12_FILL_MODE_SOLID;pd.RasterizerState.CullMode=D3D12_CULL_MODE_NONE;pd.RasterizerState.DepthClipEnable=TRUE;
+        pd.BlendState.RenderTarget[0].RenderTargetWriteMask=15;pd.DepthStencilState.DepthEnable=TRUE;
+        pd.DepthStencilState.DepthWriteMask=D3D12_DEPTH_WRITE_MASK_ALL;pd.DepthStencilState.DepthFunc=D3D12_COMPARISON_FUNC_ALWAYS;
+        pd.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;pd.SampleMask=UINT_MAX;pd.NumRenderTargets=1;
+        pd.RTVFormats[0]=DXGI_FORMAT_R16G16B16A16_FLOAT;pd.DSVFormat=DXGI_FORMAT_D32_FLOAT_S8X24_UINT;pd.SampleDesc.Count=1;
+        REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&pd,IID_PPV_ARGS(&raster_pso))));
+        if (inline_consumer) for (int i=0;i<24;++i) {
+            // Optional final objects have never-before-seen pipelines. Placement
+            // must follow the stable post consumer, rather than yesterday's object.
+            pd.RasterizerState.DepthBias=i+1;
+            test::ComPtr<ID3D12PipelineState> writer;
+            REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&pd,IID_PPV_ARGS(&writer))));
+            final_writers.push_back(writer);
+        }
+    }
     const auto frame = [&](double cam_x, bool unpatched_prepass = false) {
         // Copy case: every 4th frame the LAST scene write comes from a different pipeline
         // (another object drawn last). The boundary matcher keys on the final writer, so it
@@ -485,7 +566,21 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         const bool other_writer = inline_copy && (frame_no++ % 4 == 3);
         d.WaitIdle();
         const int frame_evals = fake::evals;
-        if (inline_list) {
+        const int pan_frame = (inline_pan || inline_consumer) ? ++frame_no : 0;
+        const UINT source_slot=inline_late_srv && pan_frame>=12 && pan_frame%2==0 ? (pan_frame%4==0?72u:95u) : 0u;
+        const auto wide_before=na::observe::GetProducerStats().wide_scene_reads;
+        if(inline_late_srv){
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};srv.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;
+            srv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2DARRAY;srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Texture2DArray.MipLevels=1;srv.Texture2DArray.FirstArraySlice=1;srv.Texture2DArray.ArraySize=1;
+            const auto inc=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            for(UINT slot:{0u,72u,95u}){auto h=post_heap->GetCPUDescriptorHandleForHeapStart();h.ptr+=SIZE_T(post_base+post_offset+slot)*inc;
+                if(pan_frame%4==0){auto from=post_source_heap->GetCPUDescriptorHandleForHeapStart();if(slot!=source_slot)from.ptr+=inc;
+                    dev->CopyDescriptorsSimple(1,h,from,D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                }else dev->CreateShaderResourceView(slot==source_slot?color.Get():nullptr,&srv,h);}
+        }
+        const bool gap_frame = inline_consumer_gap && pan_frame>=12 && pan_frame%4==0;
+        if (inline_list && !inline_pan) {
             // Pooled list objects alternate between an early write-only job and
             // the final scene/post job. Learning by object identity fails here.
             std::swap(scene, scene2);
@@ -497,11 +592,33 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             ID3D12CommandList* first[] = {scene2.list.Get()};
             Submit(q, 1, first, true);
         }
+        if (inline_pan && pan_frame % 4 != 0) {
+            // Another Execute ends two earlier scene segments with the SAME
+            // writer/occurrence as the real final list. Neither end has a real
+            // observed consumer. The old legacy matcher takes this early list.
+            scene2.Reset();scene2.list->OMSetRenderTargets(1,&rtv,FALSE,&dsv);
+            const float early[4]{};
+            for(int i=0;i<2;++i){
+                scene2.list->ClearRenderTargetView(rtv,early,0,nullptr);
+                auto b=test::Transition(color.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                scene2.list->ResourceBarrier(1,&b);std::swap(b.Transition.StateBefore,b.Transition.StateAfter);scene2.list->ResourceBarrier(1,&b);
+            }
+            REQUIRE(SUCCEEDED(scene2.list->Close()));ID3D12CommandList* early_lists[]={scene2.list.Get()};Submit(q,1,early_lists,true);
+            if(pan_frame>6) REQUIRE(fake::evals==frame_evals); // no early CPU/GPU evaluate at all
+        }
         std::memset(cpu, 0, 4096);
         const M vp = Camera(cam_x);
         M inv{};
         Inverse(vp, inv);
         for (int i = 0; i < 300; ++i) cpu[kBlock + i] = static_cast<uint8_t>(i * 13); // other constants before the camera
+        if(inline_pan) {
+            // SE5's lens precedes its full moving VP and flips clip Y. The lens
+            // also has an inverse: it must not win camera selection just because
+            // the inverse-pair test passes. Keep flow Off in this pan fixture.
+            auto lens=Proj();lens[5]=-lens[5];M inverse_lens{};
+            REQUIRE(Inverse(lens,inverse_lens));
+            Store(cpu+kBlock+64,lens);Store(cpu+kBlock+256,inverse_lens);
+        }
         Store(cpu + kBlock + kVp, vp);
         Store(cpu + kBlock + kVp + 128, inv);
         Store(cpu + kBlock + kVp + 192, Proj()); // the camera's own projection, in the same block
@@ -521,6 +638,13 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                 Store(cpu + kPre + kVp, vp);
             }
         }
+        if (gap_frame) {
+            // The main camera was available in the earlier submitted prepass,
+            // but this final recording has no readable copy. The main record()
+            // path can retain its coherent camera; the old between helper
+            // required find_camera() to succeed again and silently lost it.
+            std::memset(cpu+kBlock+kVp,0,64);
+        }
         scene.Reset(); // no colour/depth transitions in the scene list: carried state
         scene.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
         const float clear[4] = {0.2f, 0.3f, 0.4f, 1};
@@ -530,6 +654,12 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         scene.list->SetDescriptorHeaps(1, heaps);
         scene.list->SetGraphicsRootSignature(rs.Get());
         for (int i = 0; i < 3; ++i) scene.list->SetGraphicsRootDescriptorTable(0, cbvh->GetGPUDescriptorHandleForHeapStart());
+        if (inline_raster) {
+            D3D12_VIEWPORT viewport{0,0,float(W),float(H),0,1};D3D12_RECT scissor{0,0,LONG(W),LONG(H)};
+            scene.list->RSSetViewports(1,&viewport);scene.list->RSSetScissorRects(1,&scissor);
+            scene.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            scene.list->SetPipelineState(raster_pso.Get());scene.list->DrawInstanced(3,1,0,0);
+        }
         if (inline_list) { // ...then, in the SAME list, post-processing reads the colour
             D3D12_RESOURCE_BARRIER rd2 = test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             scene.list->ResourceBarrier(1, &rd2);
@@ -537,13 +667,14 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             ID3D12DescriptorHeap* ph[] = {post_heap.Get()};
             scene.list->SetDescriptorHeaps(1, ph);
             scene.list->SetGraphicsRootSignature(post_root.Get());
+            if(inline_late_srv)scene.list->SetGraphicsRoot32BitConstant(1,source_slot,0);
             scene.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             D3D12_VIEWPORT viewport{0, 0, float(W), float(H), 0, 1};
             D3D12_RECT scissor{0, 0, LONG(W), LONG(H)};
             scene.list->RSSetViewports(1, &viewport);
             scene.list->RSSetScissorRects(1, &scissor);
             const int evals_before_read = fake::evals;
-            scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart()); // binding alone is not a read
+            scene.list->SetGraphicsRootDescriptorTable(0, post_gpu()); // binding alone is not a read
             REQUIRE(fake::evals == evals_before_read);
             scene.list->SetPipelineState(post_pso.Get()); // shader chosen AFTER the table
             scene.list->DrawInstanced(3, 1, 0, 0); // intermediate actual read
@@ -552,15 +683,39 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             scene.list->ResourceBarrier(1, &rd2);
             scene.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
             scene.list->ClearRenderTargetView(rtv, clear, 0, nullptr); // actual later scene write
+            if (inline_raster) {
+                scene.list->SetGraphicsRootSignature(rs.Get());
+                ID3D12DescriptorHeap* camera_heap[]={cbvh.Get()};scene.list->SetDescriptorHeaps(1,camera_heap);
+                scene.list->SetGraphicsRootDescriptorTable(0,cbvh->GetGPUDescriptorHandleForHeapStart());
+                scene.list->SetPipelineState(inline_consumer ? final_writers.at((inline_late_srv || inline_consumer_tail || inline_consumer_gap) ? 0 : pan_frame-1).Get() : raster_pso.Get());scene.list->DrawInstanced(3,1,0,0);
+                scene.list->SetDescriptorHeaps(1,ph);scene.list->SetGraphicsRootSignature(post_root.Get());
+                if(inline_late_srv)scene.list->SetGraphicsRoot32BitConstant(1,source_slot,0);
+                scene.list->SetPipelineState(post_pso.Get());
+            }
             if (other_writer) { // the final scene write is a draw with another pipeline
                 scene.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-                scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart());
+                scene.list->SetGraphicsRootDescriptorTable(0, post_gpu());
                 scene.list->DrawInstanced(3, 1, 0, 0);
             }
             std::swap(rd2.Transition.StateBefore, rd2.Transition.StateAfter);
             scene.list->ResourceBarrier(1, &rd2);
             scene.list->OMSetRenderTargets(1, &post_rtv, FALSE, nullptr);
-            scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart()); // final scene binding
+            scene.list->SetGraphicsRootDescriptorTable(0, post_gpu()); // final scene binding
+            if (inline_consumer) scene.list->SetPipelineState(final_post_pso.Get());
+            if (inline_consumer_tail && pan_frame>=12 && pan_frame%4==0) {
+                // An optional scene segment appears AFTER the previously final
+                // barrier. The actual post consumer remains unambiguous.
+                std::swap(rd2.Transition.StateBefore,rd2.Transition.StateAfter);scene.list->ResourceBarrier(1,&rd2);
+                scene.list->OMSetRenderTargets(1,&rtv,FALSE,&dsv);
+                scene.list->SetDescriptorHeaps(1,heaps);scene.list->SetGraphicsRootSignature(rs.Get());
+                scene.list->SetGraphicsRootDescriptorTable(0,cbvh->GetGPUDescriptorHandleForHeapStart());
+                scene.list->SetPipelineState(final_writers[1].Get());scene.list->DrawInstanced(3,1,0,0);
+                std::swap(rd2.Transition.StateBefore,rd2.Transition.StateAfter);scene.list->ResourceBarrier(1,&rd2);
+                scene.list->OMSetRenderTargets(1,&post_rtv,FALSE,nullptr);
+                scene.list->SetDescriptorHeaps(1,ph);scene.list->SetGraphicsRootSignature(post_root.Get());
+                scene.list->SetGraphicsRootDescriptorTable(0,post_gpu());
+                scene.list->SetPipelineState(final_post_pso.Get());
+            }
             // Legacy boundary matcher: injected at the final read transition. Consumer anchor
             // (P4-0D): injected just before the final actual consumer (below). Never twice.
             REQUIRE(fake::evals <= evals_before_read + 1);
@@ -576,8 +731,9 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                 scene.list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
                 for (auto& b : cbars) std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
                 scene.list->ResourceBarrier(2, cbars);
-            } else scene.list->DrawInstanced(3, 1, 0, 0); // final actual read
-            if (fake::evals != evals_before_read + (na::j2::GetStats().inline_mode ? 1 : 0)) {
+            } else if (!inline_pan && !gap_frame)
+                scene.list->DrawInstanced(3, 1, 0, 0); // some frames hand this read to another recording
+            if (!inline_consumer && fake::evals != evals_before_read + (na::j2::GetStats().inline_mode ? 1 : 0)) {
                 const auto ds = na::j2::GetStats();
                 std::printf("MISS evals=%d before=%d accepted=%u rejected_skips=%llu cands=%llu waited=%llu refused=%llu rec=%llu no_camera=%llu no_state=%llu busy=%llu pending=%llu reason=\"%s\"\n",
                             fake::evals, evals_before_read, ds.profile_accepted, (unsigned long long)ds.class_rejected_skips,
@@ -585,7 +741,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                             (unsigned long long)ds.inline_recorded, (unsigned long long)ds.no_camera, (unsigned long long)ds.no_state,
                             (unsigned long long)ds.busy, (unsigned long long)ds.inline_rejects[8], ds.reason);
             }
-            REQUIRE(fake::evals == evals_before_read + (na::j2::GetStats().inline_mode ? 1 : 0)); // exactly one, before the final consumer ran
+            if (!inline_consumer) REQUIRE(fake::evals == evals_before_read + (na::j2::GetStats().inline_mode ? 1 : 0)); // exactly one, before the final consumer ran
             std::swap(rd2.Transition.StateBefore, rd2.Transition.StateAfter);
             scene.list->ResourceBarrier(1, &rd2);
         }
@@ -599,7 +755,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             ID3D12DescriptorHeap* heaps2[] = {post_heap.Get()};
             consumer.list->SetDescriptorHeaps(1, heaps2);
             consumer.list->SetGraphicsRootSignature(post_root.Get());
-            consumer.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart());
+            consumer.list->SetGraphicsRootDescriptorTable(0, post_gpu());
             D3D12_RESOURCE_BARRIER b[] = {
                 test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
                 test::Transition(post_color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)};
@@ -612,6 +768,20 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             consumer.list->ResourceBarrier(2, b);
             consumer.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
         }
+        if (gap_frame) {
+            // The real downstream read is in a separate list. It must receive
+            // the replacement already recorded before the scene list closed.
+            auto read = test::Transition(color.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            consumer.list->ResourceBarrier(1,&read);
+            consumer.list->OMSetRenderTargets(1,&post_rtv,FALSE,nullptr);
+            ID3D12DescriptorHeap* ph[]={post_heap.Get()};consumer.list->SetDescriptorHeaps(1,ph);
+            consumer.list->SetGraphicsRootSignature(post_root.Get());consumer.list->SetPipelineState(final_post_pso.Get());
+            consumer.list->SetGraphicsRootDescriptorTable(0,post_gpu());
+            D3D12_VIEWPORT v{0,0,float(W),float(H),0,1};D3D12_RECT r{0,0,LONG(W),LONG(H)};
+            consumer.list->RSSetViewports(1,&v);consumer.list->RSSetScissorRects(1,&r);
+            consumer.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);consumer.list->DrawInstanced(3,1,0,0);
+            std::swap(read.Transition.StateBefore,read.Transition.StateAfter);consumer.list->ResourceBarrier(1,&read);
+        }
         REQUIRE(SUCCEEDED(consumer.list->Close()));
         g_forwarded.clear();
         if (inline_list) {
@@ -621,16 +791,24 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             }
             ID3D12CommandList* one[] = {scene.list.Get()};
             Submit(q, 1, one, true);
+            if (gap_frame) { ID3D12CommandList* post[]={consumer.list.Get()};Submit(q,1,post,true); }
             if (fake::evals > frame_evals) {
                 const double jx = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_X);
                 const double jy = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_Y);
                 uint8_t original[64]; Store(original, vp);
                 const auto f = [](const uint8_t* p, size_t i) { float v; std::memcpy(&v, p + i * 4, 4); return double(v); };
                 for (size_t block : {size_t(kBlock), size_t(kPre)}) {
+                    if (gap_frame && block==kBlock) continue; // deliberately absent camera copy
                     const auto* raster = cpu + block + kVp;
                     const double dx = (f(raster, 3) / f(raster, 15) - f(original, 3) / f(original, 15)) * W / 2;
                     const double dy = -(f(raster, 7) / f(raster, 15) - f(original, 7) / f(original, 15)) * H / 2;
-                    REQUIRE(std::abs(dx - jx) < 0.001 && std::abs(dy - jy) < 0.001);
+                    if (inline_raster) {
+                        REQUIRE(dx == 0 && dy == 0); // raw camera was not "unjittered" twice
+                        double rx=0,ry=0;
+                        const bool applied=na::observe::ListRasterJitter(scene.list.Get(),&rx,&ry);
+                        REQUIRE(std::abs(jx-rx)<1e-6 && std::abs(jy-ry)<1e-6);
+                        if (!inline_consumer && cam_x>=0.5) REQUIRE(applied && (jx!=0 || jy!=0));
+                    } else REQUIRE(std::abs(dx - jx) < 0.001 && std::abs(dy - jy) < 0.001);
                 }
                 if (unpatched_prepass) REQUIRE(jx == 0 && jy == 0);
                 else if (inline_record_first && cam_x >= 0.5) REQUIRE(jx != 0 || jy != 0);
@@ -656,7 +834,25 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         na::j2::OnPresent(q);
         if (capture) na::capture::j2::OnPresent(q, presented.Get(), &PlainExecute);
         d.WaitIdle();
+        if(inline_late_srv && pan_frame>=8){
+            // Offline GPU witness: the consumer's pixels, not the successful NGX counter.
+            const auto desc=post_rt->GetDesc();D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};UINT64 bytes=0;
+            dev->GetCopyableFootprints(&desc,0,1,0,&fp,nullptr,nullptr,&bytes);
+            auto rb=test::CreateBuffer(dev,bytes,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);REQUIRE(rb);
+            test::List copy;REQUIRE(copy.Create(dev));auto b=test::Transition(post_rt.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_SOURCE);
+            copy.list->ResourceBarrier(1,&b);D3D12_TEXTURE_COPY_LOCATION from{},to{};
+            from.pResource=post_rt.Get();from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            to.pResource=rb.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=fp;
+            copy.list->CopyTextureRegion(&to,0,0,0,&from,nullptr);std::swap(b.Transition.StateBefore,b.Transition.StateAfter);copy.list->ResourceBarrier(1,&b);
+            REQUIRE(SUCCEEDED(copy.list->Close()));ID3D12CommandList* lists[]={copy.list.Get()};PlainExecute(q,1,lists);d.WaitIdle();
+            void* data=nullptr;REQUIRE(SUCCEEDED(rb->Map(0,nullptr,&data)));uint16_t rgb[3]{};
+            std::memcpy(rgb,static_cast<uint8_t*>(data)+fp.Offset+fp.Footprint.RowPitch*(H/2)+8*(W/2),sizeof rgb);rb->Unmap(0,nullptr);
+            ++delivery_checks;if(rgb[0]==0 && rgb[1]==0 && rgb[2]==0)++delivered;
+            printf("delivery frame %d slot %u pixel %04x %04x %04x evals %llu\n",pan_frame,source_slot,rgb[0],rgb[1],rgb[2],(unsigned long long)na::j2::GetStats().frames);
+            CHECK(rgb[0]==0 && rgb[1]==0 && rgb[2]==0);
+        }
         const auto ps = na::observe::GetProducerStats();
+        if(inline_late_srv)CHECK(source_slot?ps.wide_scene_reads>wide_before:ps.wide_scene_reads==wide_before);
         std::printf("producers: known disabled %u unknown_inflight %u entries %llu unhooked_queues %llu clears %llu sample_known %llu\n",
                     ps.known_store_disabled, ps.known_unknown_inflight, (unsigned long long)ps.known_entries, (unsigned long long)ps.unhooked_queues,
                     (unsigned long long)ps.known_state_clears, (unsigned long long)ps.sample_known_state);
@@ -701,6 +897,8 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             const std::string meta = ReadText(b + L"meta.json");
             CHECK(meta.find(auto_inline ? "\"route\": 2," : "\"route\": 1,") != std::string::npos);
             CHECK(meta.find("\"frame_closed\": true") != std::string::npos);
+            CHECK(meta.find("\"placement\": ") != std::string::npos);
+            CHECK(meta.find("\"at_close\": 0") != std::string::npos);
             const size_t at = meta.find("\"present_ordinal\": ");
             CHECK(at != std::string::npos);
             const uint64_t ordinal = at == std::string::npos ? 0 : std::strtoull(meta.c_str() + at + 19, nullptr, 10);
@@ -713,10 +911,58 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
     if (inline_list) {
         // The copy case runs long enough for the consumer anchor's stability gate (16
         // identical signatures) to hand over from the boundary matcher.
-        const int frames = inline_copy ? 22 : 4;
+        const int frames = inline_consumer ? 24 : inline_pan ? 27 : inline_copy ? 22 : 4;
         for (int f = 0; f < frames; ++f) REQUIRE(frame(0.25 * (f % 4)) == 0);
+        if(inline_flow){const auto flow=na::j2::compute_flow::GetStats();
+            printf("inline AMD: recorded=%llu submitted=%llu pairs=%llu %s\n",(unsigned long long)flow.recorded,(unsigned long long)flow.submitted,(unsigned long long)flow.pairs,flow.reason);
+            CHECK(flow.submitted>=2 && flow.pairs>=1);
+        }
         if (inline_record_first) REQUIRE(frame(1.0, true) == 0);
         const auto is = na::j2::GetStats();
+        if (inline_consumer) {
+            if(inline_late_srv){
+                printf("late SRV delivery %u/%u; evaluated %llu/%d, close %llu\n",delivered,delivery_checks,(unsigned long long)is.frames,frames,(unsigned long long)is.close_recovered);
+                CHECK(delivered==delivery_checks && delivery_checks==17);
+                CHECK(is.frames==uint64_t(frames-1) && is.inline_late_writes==0 && is.no_state==0 && is.no_camera==0);
+                return test::finish("j2_anno_shape_test (late SRV delivery)");
+            }
+            std::printf("changing final writer: %llu/%d frames evaluated, late writes %llu, camera failures %llu\n",
+                (unsigned long long)is.frames,frames,(unsigned long long)is.inline_late_writes,(unsigned long long)is.no_camera);
+            CHECK(inline_consumer_gap ? is.frames==uint64_t(frames-1) : inline_consumer_tail ? is.frames>=uint64_t(frames-3) : is.frames == uint64_t(frames-3));
+            CHECK(is.inline_late_writes == 0 && is.no_camera == 0 && is.no_state == 0);
+            if (inline_consumer_gap) {
+                CHECK(is.close_recovered==4);
+                // Offline GPU readback: final frame24 is a split-consumer frame.
+                // Fake NGX writes black; unprocessed source is .2/.3/.4. This
+                // checks contribution to the downstream draw, not just a call.
+                const auto desc=post_rt->GetDesc();D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};UINT64 bytes=0;
+                dev->GetCopyableFootprints(&desc,0,1,0,&fp,nullptr,nullptr,&bytes);
+                auto rb=test::CreateBuffer(dev,bytes,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);REQUIRE(rb);
+                test::List copy;REQUIRE(copy.Create(dev));auto b=test::Transition(post_rt.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_SOURCE);
+                copy.list->ResourceBarrier(1,&b);D3D12_TEXTURE_COPY_LOCATION from{},to{};
+                from.pResource=post_rt.Get();from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                to.pResource=rb.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=fp;
+                copy.list->CopyTextureRegion(&to,0,0,0,&from,nullptr);std::swap(b.Transition.StateBefore,b.Transition.StateAfter);copy.list->ResourceBarrier(1,&b);
+                REQUIRE(SUCCEEDED(copy.list->Close()));ID3D12CommandList* lists[]={copy.list.Get()};PlainExecute(q,1,lists);d.WaitIdle();
+                void* data=nullptr;REQUIRE(SUCCEEDED(rb->Map(0,nullptr,&data)));uint16_t rgb[3]{};
+                std::memcpy(rgb,static_cast<uint8_t*>(data)+fp.Offset+fp.Footprint.RowPitch*(H/2)+8*(W/2),sizeof rgb);rb->Unmap(0,nullptr);
+                std::printf("split consumer pixel: %04x %04x %04x; close recoveries %llu\n",rgb[0],rgb[1],rgb[2],(unsigned long long)is.close_recovered);
+                CHECK(rgb[0]==0 && rgb[1]==0 && rgb[2]==0);
+            }
+            return test::finish("j2_anno_shape_test (exact consumer)");
+        }
+        if(inline_pan) {
+            CHECK(na::j2::GetStats().camera_offset==kVp);
+            CHECK(is.segment_deferrals>0 && is.segment_miss_recoveries==0);
+            CHECK(is.inline_late_writes==0 && is.post_scene_batches<=2); // cold learning only
+            uint32_t csub=0,dsub=0,state=0;
+            REQUIRE(na::observe::ListSceneSubresource(scene.list.Get(),na::observe::IdOf(color.Get()),na::observe::IdOf(depth.Get()),&csub,&dsub));
+            CHECK(na::observe::KnownSubStateNow(na::observe::IdOf(depth.Get()),dsub,&state));
+            CHECK(state==D3D12_RESOURCE_STATE_DEPTH_WRITE && is.no_state==0);
+            CHECK(dev->GetDeviceRemovedReason()==S_OK);
+            printf("pan: %llu early barriers deferred, %llu misses recovered, %llu frames\n",(unsigned long long)is.segment_deferrals,(unsigned long long)is.segment_miss_recoveries,(unsigned long long)is.frames);
+            return test::finish("j2_anno_shape_test (pan across Executes)");
+        }
         std::printf("inline: mode %u, candidates %llu, recorded %llu, frames %llu (inline %llu), refused %llu, evals %llu, forwarded %zu, \"%s\"\n",
                     is.inline_mode, (unsigned long long)is.inline_candidates, (unsigned long long)is.inline_recorded,
                     (unsigned long long)is.frames, (unsigned long long)is.inline_frames, (unsigned long long)is.inline_refused,
@@ -732,9 +978,10 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         // share one class AND one producer (clears) -> ambiguous -> the boundary matcher.
         // The boundary matcher fires first (at the final transition) whenever it matches; the
         // class trigger covers the frames where the final writer changed.
-        if (inline_copy) CHECK(is.profile_accepted >= 1 && is.class_matched >= 3 && is.legacy_matched >= 8 &&
-                               is.class_contradictions == 0 && is.class_rejected_skips >= 10 &&
+        if (inline_copy) CHECK(is.profile_accepted >= 1 && is.class_matched + is.barrier_matched >= 3 && is.legacy_matched + is.barrier_matched >= 8 &&
+                               is.class_contradictions == 0 && is.class_rejected_skips + is.segment_deferrals >= 10 &&
                                is.inline_recorded == static_cast<uint64_t>(frames - 1)); // only the cold first frame missed
+        else if (inline_raster) CHECK(is.profile_ambiguous >= 1 && is.legacy_matched + is.barrier_matched == is.inline_recorded && is.class_matched == 0);
         else CHECK(is.profile_ambiguous >= 1 && is.legacy_matched == is.inline_recorded && is.class_matched == 0);
         CHECK(is.inline_target == 3); // intermediate transition + draw, then final transition
         CHECK(is.inline_mode == 1);                  // detected on the first frame
@@ -743,7 +990,8 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         CHECK(evaluations() >= evals0 + 2);
         CHECK(g_forwarded.size() == 1);              // no J2 list was inserted
         CHECK(is.inline_refused == 0);
-        CHECK(is.jitter_writes >= 2);
+        if (inline_raster) CHECK(is.jitter_writes == 0 && is.raster_jitter_draws >= 2);
+        else CHECK(is.jitter_writes >= 2);
         CHECK(dev->GetDeviceRemovedReason() == S_OK); // the game's list (with our work and the restored state) ran
         return test::finish("j2_anno_shape_test (inline)");
     }

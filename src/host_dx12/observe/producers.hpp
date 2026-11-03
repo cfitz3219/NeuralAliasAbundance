@@ -122,11 +122,17 @@ bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id dep
 // HostWorkScope and end with RestoreListState(list).
 using TableBindCallback = void (*)(ID3D12GraphicsCommandList* list, const na_object_id* srvs, uint32_t count, bool compute);
 void SetTableBindCallback(TableBindCallback cb);
+// Final recording opportunity, before the game's original Close. Only observed
+// open recordings; no observer locks held. Host commands use HostWorkScope.
+using ListCloseCallback = void (*)(ID3D12GraphicsCommandList* list);
+void SetListCloseCallback(ListCloseCallback cb);
 na::j2::InsertionDecision ListInsertionDecision(ID3D12CommandList* list, na_object_id color);
 // P4-0D consumer anchor: the first actual consumer of `color` after its final write in
 // this recording (learned at submission), and the latest event as seen by a live trigger.
 na::j2::ConsumerSignature ListConsumerSignature(ID3D12CommandList* list, na_object_id color);
-na::j2::LiveConsumer ListLiveConsumer(ID3D12CommandList* list, na_object_id color);
+// at_end: before Close, inspect the selected colour's final event even when
+// unrelated targets were subsequently used. Truncated traces stay unknown.
+na::j2::LiveConsumer ListLiveConsumer(ID3D12CommandList* list, na_object_id color, bool at_end = false);
 // Placement design: the recording's writes and actual consumers of `color` in order (false:
 // unobserved or truncated). ResetDerived clears the per-frame lineage set (J2, at Present).
 bool ListColorEvents(ID3D12CommandList* list, na_object_id color, std::vector<na::j2::ColorEvent>& out);
@@ -204,6 +210,12 @@ private:
 // Writes into a CPU-visible (upload) buffer of the game, e.g. J1 jittering the
 // camera constants of a submission before it is forwarded. Returns bytes written.
 uint32_t WriteBuffer(na_object_id res, uint64_t offset, const void* src, uint32_t n);
+// Optional J1 raster sample. Called before a depth-tested scene draw, without
+// registry locks held. Returning true translates the game's viewport for this
+// draw only; it is restored immediately afterwards. Camera constants stay raw.
+using RasterJitterCallback = bool(*)(uint32_t width, uint32_t height, double* x, double* y);
+void SetRasterJitterCallback(RasterJitterCallback cb);
+bool ListRasterJitter(ID3D12CommandList* list, double* x, double* y);
 ID3D12Resource* AcquireResource(na_object_id id);                         // AddRef'd, or null
 // Current discovery picks (written by the discovery adapter, read by J2).
 void SetLiveSelection(uint64_t depth, uint64_t color);
@@ -229,6 +241,7 @@ struct ProducerStats {
     uint32_t sample_workers_started; // C9B-REVIEW-2 #1: at most 1 per process
     uint64_t sample_missing_recording, sample_partial_coverage, sample_partial_states, sample_no_transition;
     uint64_t nested_unlocked;        // ASTRA-P3-R8: queue ops nested in a forwarded submission (no lock taken)
+    uint64_t serialized_submissions; // game submissions forwarded under their queue's lock for the known-state store
     uint64_t snapshots_reread;       // G3-02: app-unmapped upload buffers captured by a host read-only Map
     uint64_t preexisting_resources;  // G3-03: resources registered lazily on first sight
     uint64_t preexisting_heaps;      // G3-03: descriptor heaps registered lazily in SetDescriptorHeaps
@@ -239,7 +252,11 @@ struct ProducerStats {
     uint32_t known_unknown_inflight; // incomplete submissions currently between Begin and End
     uint64_t known_entries;          // eligible textures in the store
     uint64_t unhooked_queues;        // queues whose table differs from the hooked one
+    uint64_t wide_scene_reads;      // selected scene SRV found beyond a table range's first64 descriptors
 };
 ProducerStats GetProducerStats();
+// Process exit: object retirement becomes a no-op (the CRT is about to destroy, or has
+// destroyed, the tables it would update; the OS reclaims everything).
+void SetProcessExiting();
 
 } // namespace na::observe

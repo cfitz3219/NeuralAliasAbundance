@@ -198,16 +198,19 @@ public:
         }
         return sig;
     }
-    LiveConsumer Live(uint64_t color) const {
+    LiveConsumer Live(uint64_t color, bool at_end = false) const {
         LiveConsumer live;
         if (!complete_ || !color || events_.empty()) return live;
-        const auto& e = events_.back();
+        size_t end = events_.size();
+        if (at_end) while (end && events_[end-1].resource != color) --end;
+        if (!end) return live;
+        const auto& e = events_[end-1];
         if (e.resource != color || e.write) return live;
         live.op = ClassifyOp(e);
         if (live.op == Op::Barrier) {
             live.barrier = true;
             live.raw = e;
-            for (size_t i = events_.size(); i-- > 0;) {
+            for (size_t i = end; i-- > 0;) {
                 const auto& p = events_[i];
                 if (p.resource != color) continue;
                 if (p.write && !live.after_write) { live.after_write = true; live.producer_pso = p.pipeline; }
@@ -221,7 +224,7 @@ public:
         live.pso = live.op == Op::CopyRead ? 0 : e.pipeline;
         live.root = e.root;
         live.destination = e.destination;
-        for (size_t i = events_.size(); i-- > 0;) {
+        for (size_t i = end; i-- > 0;) {
             const auto& p = events_[i];
             if (p.resource != color) continue;
             if (p.write) { live.after_write = true; live.producer_pso = p.pipeline; break; }

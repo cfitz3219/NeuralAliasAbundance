@@ -14,6 +14,7 @@
 //   - overrides; route changes bump the history generation exactly once
 // Self-contained (no D3D12): also compiles with a host compiler for quick checks.
 #include "host_dx12/j2/route_selector.hpp"
+#include "host_dx12/j2/boundary_roles.hpp"
 
 #include <cstdio>
 #include <vector>
@@ -221,6 +222,58 @@ int main()
         CHECK(rs.Current().route == Route::Between);
         rs.OnFrame(frame({scene_list()}));
         CHECK(rs.Current().route == Route::None && rs.Current().missing[0] != 0);
+    }
+    {
+        BoundaryRoles roles;roles.Select(1,2);
+        ColorEvent write{};write.write=true;write.op=Op::DrawWrite;write.producer=7;write.with_depth=true;
+        ColorEvent barrier{};barrier.op=Op::Barrier;barrier.producer=7;
+        // Same writer at two barriers in one list, and a third barrier in a
+        // later Execute. The first two are not the frame's end.
+        const std::vector<ColorEvent> e{write,barrier,write,barrier,write,barrier};
+        for(uint64_t f=1;f<=3;++f){roles.Submitted(10,0,4);roles.Submitted(11,4,6);roles.Close(e,true,true,f);}
+        CHECK(roles.Judge(10,7,1,4)==BoundaryRoles::Middle);
+        CHECK(roles.Judge(10,7,2,4)==BoundaryRoles::Middle);
+        CHECK(roles.Judge(11,7,1,4)==BoundaryRoles::End);
+        // A missed frame restores the deferred baseline; a pooled list taking
+        // the terminal job also prevents permanent suppression.
+        roles.Submitted(10,0,2);CHECK(roles.Close(e,true,false,4));
+        CHECK(roles.Judge(10,7,1,5)==BoundaryRoles::Unknown);
+        CHECK(roles.Judge(11,7,1,5)==BoundaryRoles::End);
+        roles.Select(3,4);CHECK(roles.Judge(11,7,1,5)==BoundaryRoles::Unknown);
+        // No usable end barrier: do not relearn the rejected 5ae1910 policy.
+        for(uint64_t f=6;f<10;++f){roles.Submitted(10,0,2);roles.Submitted(11,2,3);roles.Close(e,true,true,f);}
+        CHECK(roles.Judge(10,7,1,10)==BoundaryRoles::Unknown);
+        // Incomplete and unordered traces cannot qualify an end.
+        for(uint64_t f=10;f<15;++f){roles.Submitted(10,0,2);roles.OtherQueueWroteScene();roles.Close(e,true,true,f);}
+        CHECK(roles.Judge(10,7,1,15)==BoundaryRoles::Unknown);
+        for(uint64_t f=15;f<20;++f){roles.Submitted(10,0,2);roles.Close(e,false,true,f);}
+        CHECK(roles.Judge(10,7,1,20)==BoundaryRoles::Unknown);
+        // A later writer without the main depth must still invalidate this
+        // segment's supposed end; it does not disappear with the scene spans.
+        roles.Select(5,6);
+        for(uint64_t f=20;f<24;++f){roles.Submitted(10,0,2);roles.Close({write,barrier,write},true,true,f);}
+        CHECK(roles.Judge(10,7,1,24)==BoundaryRoles::Unknown);
+    }
+    {
+        BoundaryRoles roles;roles.Select(1,2);
+        ColorEvent write{};write.write=true;write.op=Op::DrawWrite;write.producer=7;write.with_depth=true;
+        ColorEvent barrier{};barrier.op=Op::Barrier;barrier.producer=7;
+        const std::vector<ColorEvent> e{write,barrier,write,barrier};
+        // A pooled list is occasionally terminal, usually intermediate. Keeping
+        // it active in one role must not age away the contradictory other role.
+        for(uint64_t f=1;f<=3;++f){roles.Submitted(10,0,2);roles.Close({write,barrier},true,true,f);}
+        for(uint64_t f=4;f<=130;++f){roles.Submitted(10,0,2);roles.Submitted(11,2,4);roles.Close(e,true,true,f);}
+        CHECK(roles.Judge(10,7,1,131)==BoundaryRoles::Unknown);
+        // The reverse must not re-qualify a previously intermediate occurrence
+        // as a guaranteed end either: that causes an early placement on return.
+        for(uint64_t f=131;f<=260;++f){roles.Submitted(10,0,2);roles.Close({write,barrier},true,true,f);}
+        CHECK(roles.Judge(10,7,1,261)==BoundaryRoles::Unknown);
+        // Entirely unused entries still retire; a new resource pair also resets.
+        roles.Close({},true,false,500);
+        CHECK(roles.Judge(10,7,1,501)==BoundaryRoles::Unknown);
+        for(uint64_t f=501;f<=503;++f){roles.Submitted(10,0,2);roles.Close({write,barrier},true,true,f);}
+        CHECK(roles.Judge(10,7,1,504)==BoundaryRoles::End);
+        roles.Select(3,4);CHECK(roles.Judge(10,7,1,504)==BoundaryRoles::Unknown);
     }
     if (g_failures) { std::printf("j2_route_test: FAILED (%d failures)\n", g_failures); return 1; }
     std::printf("j2_route_test: OK\n");

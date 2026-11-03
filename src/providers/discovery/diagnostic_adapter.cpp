@@ -8,6 +8,7 @@
 #include "resource_formats.hpp"
 #include "submission_evidence.hpp"
 #include "universal_heuristics.hpp"
+#include "pass_map.hpp"
 #include "providers/classifier/signal_candidates.hpp"
 #include "providers/camera/matrix_candidates.hpp"
 #include <cstdio>
@@ -43,6 +44,10 @@ struct Consumer {
     uint64_t live_depth{},live_color{},pick_challenger{}; unsigned pick_streak{}; // J2 pick hysteresis
     bool overflow{}; unsigned reports{};
     uint64_t draws{}, binds{}, unresolved_views{}, captured_snapshots{}, truncated_snapshots{}, unmapped_snapshots{}, gpu_snapshots{}, matrix_scans{};
+    // P4-4 Stage M ([stage_m] map=1): read-only pass maps of single frames, own log file.
+    na::discovery::PassMap pass_map;
+    FILE* map_log{};
+    unsigned maps_written{}, maps_wanted{}, map_interval{};
 };
 // The host owns process lifetime. No destructors race its callback at exit.
 Consumer*& consumer() { static auto* slot=new Consumer*(nullptr);return *slot; }
@@ -209,22 +214,51 @@ void __cdecl Sink(const na_event_batch* batch,void* user) {
             switch(item.header.kind) {
             case NA_EV_RESOURCE_CREATED: {
                 const auto e=Read<na_ev_resource_created>(p);
+                if(c.map_log) c.pass_map.OnResource(e);
                 if(c.resources.size()<32768 || c.resources.count(e.resource)) c.resources[e.resource].info=e;
                 else c.overflow=true;
                 break;
             }
             case NA_EV_OBJECT_RETIRED: {
                 const auto e=Read<na_ev_object_retired>(p);c.resources.erase(e.object);c.records.erase(e.object);
+                if(c.map_log) c.pass_map.OnRetire(e.object);
                 c.acquisition.Retire(e.object);
                 for(auto it=c.retry.begin();it!=c.retry.end();) it=it->first.first==e.object?c.retry.erase(it):std::next(it);
                 for(auto it=c.scanned.begin();it!=c.scanned.end();) it=it->first.first==e.object?c.scanned.erase(it):std::next(it);
                 for(auto it=c.camera_plans.begin();it!=c.camera_plans.end();) it=it->first.first==e.object?c.camera_plans.erase(it):std::next(it);
                 break;
             }
-            case NA_EV_PRESENT: ++c.presents;break;
-            case NA_EV_QUEUE_EXECUTE: ++c.submissions;break;
+            case NA_EV_PRESENT: {
+                ++c.presents;
+                if(c.map_log) {
+                    c.pass_map.OnPresent();
+                    if(c.pass_map.Done()) {
+                        const auto report=c.pass_map.Report();
+                        std::fprintf(c.map_log,"=== frame map %u (present %llu) ===\n%s\n",c.maps_written+1,c.presents,report.c_str());
+                        std::fflush(c.map_log);
+                        if(++c.maps_written<c.maps_wanted) c.pass_map.Arm(c.map_interval);
+                        else {std::fputs("stage_m: done\n",c.map_log);std::fclose(c.map_log);c.map_log=nullptr;}
+                    }
+                }
+                break;
+            }
+            case NA_EV_SWAPCHAIN_CREATED: if(c.map_log) {const auto e=Read<na_ev_swapchain_created>(p);c.pass_map.OnSwapchain(e.width,e.height);} break;
+            case NA_EV_SWAPCHAIN_RESIZED: if(c.map_log) {const auto e=Read<na_ev_swapchain_resized>(p);if(e.hresult>=0) c.pass_map.OnSwapchain(e.width,e.height);} break;
+            case NA_EV_DESCRIPTOR_WRITE: if(c.map_log) {const auto e=Read<na_ev_descriptor_write>(p);c.pass_map.OnDescriptor(e.heap,e.slot,e.descriptor_kind,e.resource);} break;
+            case NA_EV_DESCRIPTOR_COPY: if(c.map_log) {const auto e=Read<na_ev_descriptor_copy>(p);c.pass_map.OnDescriptorCopy(e.src_heap,e.src_slot,e.dst_heap,e.dst_slot,e.slot_count);} break;
+            case NA_EV_QUEUE_EXECUTE: {
+                ++c.submissions;
+                if(c.map_log && c.pass_map.Armed()) {
+                    const auto e=Read<na_ev_queue_execute>(p);
+                    std::vector<na_list_ref> refs;
+                    for(uint32_t k=0;k<e.list_count && k<4096;++k) refs.push_back(Read<na_list_ref>(p+e.refs_offset+size_t(k)*e.ref_stride));
+                    if(!refs.empty()) c.pass_map.OnExecute(refs.data(),static_cast<uint32_t>(refs.size()));
+                }
+                break;
+            }
             case NA_EV_LIST_OP: {
                 const auto e=Read<na_ev_list_op>(p);
+                if(c.map_log) c.pass_map.OnOp(e,p);
                 if(c.records.size()>=4096 && !c.records.count(e.list)) {c.overflow=true;break;}
                 auto& rec=c.records[e.list];
                 if(rec.generation!=e.recording_generation) {rec={};rec.generation=e.recording_generation;}
@@ -388,6 +422,15 @@ extern "C" int na_adapter_start() {
     c->evidence_dir=evidence_dir; // optional pre-created local directory; at most 128 MiB per session
     c->log=_wfsopen(path,L"w",_SH_DENYWR); // Permit live readers; refuse a second writer.
     if(!c->log) {delete c;return 0;}
+    // Stage M: frame maps written to their own log (Cort: test packages save their own results).
+    if(GetPrivateProfileIntW(L"stage_m",L"map",0,ini_path)==1) {
+        wchar_t map_path[MAX_PATH]{};GetPrivateProfileStringW(L"stage_m",L"log",L"",map_path,MAX_PATH,ini_path);
+        if(map_path[0]) c->map_log=_wfsopen(map_path,L"w",_SH_DENYWR);
+        c->maps_wanted=std::min(8u,std::max(1u,static_cast<unsigned>(GetPrivateProfileIntW(L"stage_m",L"frames",4,ini_path))));
+        c->map_interval=std::min(36000u,static_cast<unsigned>(GetPrivateProfileIntW(L"stage_m",L"every_presents",1800,ini_path)));
+        const unsigned first=std::min(36000u,static_cast<unsigned>(GetPrivateProfileIntW(L"stage_m",L"first_after_presents",1800,ini_path)));
+        if(c->map_log) {std::fprintf(c->map_log,"stage_m: read-only frame maps: %u frame(s), first after %u presents, then every %u\n",c->maps_wanted,first,c->map_interval);c->pass_map.Arm(first);}
+    }
     for(unsigned n=0;n<200 && !na::observe::ProducersActive();++n) Sleep(10); // host init thread only
     if(!na::observe::ProducersActive()) {std::fputs("{\"type\":\"error\",\"reason\":\"producers unavailable\"}\n",c->log);std::fclose(c->log);delete c;return 0;}
     na_observe_config cfg{};cfg.size_bytes=sizeof(cfg);
@@ -396,7 +439,9 @@ extern "C" int na_adapter_start() {
 }
 extern "C" void na_adapter_stop() {
     if(auto* c=consumer()) {
-        na_observe_stop();c->acquisition.Clear();std::fclose(c->log);delete c;consumer()=nullptr;
+        na_observe_stop();c->acquisition.Clear();std::fclose(c->log);
+        if(c->map_log) {std::fprintf(c->map_log,"stage_m: stopped after %u map(s)\n",c->maps_written);std::fclose(c->map_log);}
+        delete c;consumer()=nullptr;
     }
 }
 extern "C" const char* na_adapter_name() {return "Discovery diagnostics (read-only)";}

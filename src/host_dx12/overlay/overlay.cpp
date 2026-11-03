@@ -10,6 +10,7 @@
 #include "host_dx12/overlay/input_handover.hpp"
 #include "host_dx12/overlay/present_queues.hpp"
 #include "host_dx12/overlay/boundary_fallback.hpp"
+#include "host_dx12/overlay/submission_tracking.hpp"
 
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -42,6 +43,10 @@
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 #include "host_dx12/nr/nr_pass.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/scale/live_driver.hpp"
+#include "host_dx12/scale/settings_read_hook.hpp"
+#include "host_dx12/j2/j2_flow.hpp"
+#include "host_dx12/j2/compute_flow.hpp"
 #include "host_dx12/overlay/menu.hpp"
 #include "host_dx12/overlay/na_style.hpp"
 #include "host_dx12/overlay/presenter.hpp"
@@ -708,20 +713,106 @@ void write_status_line()
             static_cast<unsigned long long>(j2.busy), static_cast<unsigned long long>(j2.dlss_failed), static_cast<unsigned long long>(j2.cuts),
             static_cast<unsigned long long>(j2.camera_offset), j2.later_passes, static_cast<unsigned long long>(j2.duplicate_submissions), static_cast<unsigned long long>(j2.jitter_writes), static_cast<unsigned long long>(j2.camera_learned_hits), static_cast<unsigned long long>(j2.camera_scans), static_cast<long long>(j2.camera_inv_delta), static_cast<long long>(j2.camera_proj_delta), static_cast<unsigned long long>(j2.jitter_proj_writes), static_cast<unsigned long long>(j2.jitter_rebased), na::observe::SamplerMipBias(), static_cast<unsigned long long>(mb_s), static_cast<unsigned long long>(mb_st), static_cast<unsigned long long>(j2.post_camera_lists), static_cast<unsigned long long>(j2.post_depth_lists), static_cast<unsigned long long>(j2.other_camera_blocks), j2.depth_reversed ? 1u : 0u, dlss.feature_preset, na::settings::Get().j2_sharpness.load(), static_cast<unsigned long long>(j2.nis_frames), j2.scene_batches, j2.scene_batches_max, j2.scene_batches_target, static_cast<unsigned long long>(j2.waited_batches), static_cast<unsigned long long>(j2.post_scene_batches), j2.inline_mode, j2.inline_target, static_cast<unsigned long long>(j2.inline_candidates), static_cast<unsigned long long>(j2.inline_waited), static_cast<unsigned long long>(j2.inline_recorded), static_cast<unsigned long long>(j2.inline_frames), static_cast<unsigned long long>(j2.inline_refused), j2.color_sub, j2.color_mips, j2.color_slices, j2.color_samples, j2.depth_slices, j2.depth_samples, j2.width, j2.height, j2.color_format, j2.reason);
         if (jn > 0) WriteFile(f, jl, static_cast<DWORD>((std::min)(jn, static_cast<int>(sizeof(jl) - 1))), &written, nullptr);
+        if (na::scale::SliderRouteActive()) {
+            // P4-4 slider route: what our mode did to the game's render scale (start-up and live).
+            const auto rh = na::scale::GetReadHookStats();
+            const auto lv = na::scale::GetLiveStats();
+            const auto dr = na::scale::GetDriverStats();
+            char sl[1400];
+            const int sn = snprintf(sl, sizeof(sl),
+                "scale mode=%d fraction=%.4f requested=%.4f baseline_w=%u scene=%ux%u judged=%u changed=%u unchanged=%u state=\"%s\" "
+                "read files=%llu patched=%llu restored=%llu unpatched=%llu async=%llu utf16=%llu mapped=%llu adopted=%llu key=%s original=%.6f file=\"%s\" note=\"%s\" "
+                "live result=%s tagged=%u tag=%.6f hits=%u/%u candidates=%u trying=%d control=%d writes=%u restores=%u scanned_kb=%llu scan_ms=%llu live_note=\"%s\"\r\n",
+                dr.mode, dr.fraction, dr.requested, dr.baseline_w, j2.width, j2.height, dr.judged, dr.changed, dr.unchanged, dr.state,
+                static_cast<unsigned long long>(rh.files_opened), static_cast<unsigned long long>(rh.reads_patched),
+                static_cast<unsigned long long>(rh.writes_restored), static_cast<unsigned long long>(rh.reads_unpatched),
+                static_cast<unsigned long long>(rh.reads_async), static_cast<unsigned long long>(rh.reads_utf16),
+                static_cast<unsigned long long>(rh.files_mapped),
+                static_cast<unsigned long long>(rh.handles_adopted), rh.key, rh.original, rh.file, rh.note,
+                na::scale::LiveResultName(lv.result), lv.tagged ? 1u : 0u, lv.tag, lv.float_hits, lv.double_hits, lv.candidates, lv.trying, lv.control,
+                lv.writes, lv.restores, static_cast<unsigned long long>(lv.scanned_kb), static_cast<unsigned long long>(lv.scan_ms), lv.note);
+            if (sn > 0) WriteFile(f, sl, static_cast<DWORD>((std::min)(sn, static_cast<int>(sizeof(sl) - 1))), &written, nullptr);
+        }
+        {
+            char cl[320]; // camera choice and loss reasons (Sniper steep-view flicker, 2026-11-01)
+            const int cn = snprintf(cl, sizeof(cl),
+                "j2_camera contested=%llu alternatives=%llu lost_unread=%llu lost_no_vp=%llu lost_no_inverse=%llu lost_capped=%llu other_cam=%llu jitter_slot_other=%llu inverse_computed=%llu\r\n",
+                static_cast<unsigned long long>(j2.camera_contested), static_cast<unsigned long long>(j2.camera_alternatives),
+                static_cast<unsigned long long>(j2.camera_lost_unread), static_cast<unsigned long long>(j2.camera_lost_no_vp),
+                static_cast<unsigned long long>(j2.camera_lost_no_inverse), static_cast<unsigned long long>(j2.camera_lost_capped),
+                static_cast<unsigned long long>(j2.other_camera_blocks), static_cast<unsigned long long>(j2.jitter_slot_other_camera),
+                static_cast<unsigned long long>(j2.camera_inverse_computed));
+            if (cn > 0) WriteFile(f, cl, static_cast<DWORD>((std::min)(cn, static_cast<int>(sizeof(cl) - 1))), &written, nullptr);
+            // Per present: why a frame had no DLAA / why a DLAA frame had no jitter (SE5 flicker, 2026-11-02).
+            char ml[384];
+            const int mn = snprintf(ml, sizeof(ml),
+                "j2_misses no_dlaa{no_camera=%llu no_state=%llu no_candidate=%llu other=%llu} unjittered{no_sample=%llu not_applied=%llu not_held=%llu} camera_held=%llu extrapolated=%llu depth_assumed=%llu camera_from_j1=%llu\r\n",
+                static_cast<unsigned long long>(j2.miss_no_camera), static_cast<unsigned long long>(j2.miss_no_state),
+                static_cast<unsigned long long>(j2.miss_no_candidate), static_cast<unsigned long long>(j2.miss_other),
+                static_cast<unsigned long long>(j2.unjit_no_sample), static_cast<unsigned long long>(j2.unjit_not_applied),
+                static_cast<unsigned long long>(j2.unjit_not_held), static_cast<unsigned long long>(j2.camera_held),
+                static_cast<unsigned long long>(j2.camera_extrapolated), static_cast<unsigned long long>(j2.depth_state_assumed),
+                static_cast<unsigned long long>(j2.camera_from_j1));
+            if (mn > 0) WriteFile(f, ml, static_cast<DWORD>((std::min)(mn, static_cast<int>(sizeof(ml) - 1))), &written, nullptr);
+            if (j2.camera_lost_evidence[0]) {
+                WriteFile(f, "j2_camera_lost ", 15, &written, nullptr);
+                WriteFile(f, j2.camera_lost_evidence, static_cast<DWORD>(std::strlen(j2.camera_lost_evidence)), &written, nullptr);
+                WriteFile(f, "\r\n", 2, &written, nullptr);
+            }
+        }
+        {
+            // P4-0b moving-object motion (Opus; one status line, read-only snapshot).
+            const auto fs = na::j2::flow::GetStats();
+            char fl[640];
+            const int fn = snprintf(fl, sizeof(fl),
+                "j2flow on=%u available=%u active=%u latched=%u cost=%u size=%ux%u engine=%ux%u grid=%u perf=%u ds=%u pairs=%llu hinted=%llu consumed=%llu encode_only=%llu abandoned=%llu skip_busy=%llu skip_split=%llu skip_msaa=%llu skip_reset=%llu skip_resize=%llu engine_failed=%llu watchdog=%llu px_acc=%llu px_inv=%llu px_small=%llu px_cost=%llu px_off=%llu px_img=%llu px_flk=%llu mean_cost=%.1f ms=%.2f ms_avg=%.2f \"%s\"\r\n",
+                fs.enabled, fs.available, fs.active, fs.latched, fs.cost, fs.width, fs.height, fs.engine_w, fs.engine_h, fs.grid, fs.perf, fs.downscale,
+                static_cast<unsigned long long>(fs.pairs), static_cast<unsigned long long>(fs.hinted), static_cast<unsigned long long>(fs.consumed), static_cast<unsigned long long>(fs.encode_only),
+                static_cast<unsigned long long>(fs.abandoned), static_cast<unsigned long long>(fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_split),
+                static_cast<unsigned long long>(fs.skipped_msaa), static_cast<unsigned long long>(fs.skipped_reset), static_cast<unsigned long long>(fs.skipped_resize),
+                static_cast<unsigned long long>(fs.engine_failed), static_cast<unsigned long long>(fs.watchdog_trips),
+                static_cast<unsigned long long>(fs.px_accepted), static_cast<unsigned long long>(fs.px_invalid), static_cast<unsigned long long>(fs.px_small),
+                static_cast<unsigned long long>(fs.px_cost), static_cast<unsigned long long>(fs.px_offscreen), static_cast<unsigned long long>(fs.px_image),
+                static_cast<unsigned long long>(fs.px_flicker),
+                fs.mean_cost, fs.ms_last, fs.ms_avg, fs.reason);
+            if (fn > 0) WriteFile(f, fl, static_cast<DWORD>((std::min)(fn, static_cast<int>(sizeof(fl) - 1))), &written, nullptr);
+        }
         char coverage[256];
         if (j2.depth_state_evidence[0]) {
             WriteFile(f, "j2_depth_evidence ", 18, &written, nullptr);
             WriteFile(f, j2.depth_state_evidence, static_cast<DWORD>(std::strlen(j2.depth_state_evidence)), &written, nullptr);
             WriteFile(f, "\r\n", 2, &written, nullptr);
         }
+        {   // Why DLSS history restarted (Cort: a blink every ~30 s while standing still).
+            char cl2[400];
+            const int cn2 = snprintf(cl2, sizeof cl2, "j2_cuts restarts=%llu gap=%llu motion=%llu now=%llu recent=%s\r\n",
+                (unsigned long long)j2.cut_restarts, (unsigned long long)j2.cut_gap, (unsigned long long)j2.cut_motion,
+                (unsigned long long)(GetTickCount64() / 100 % 100000000), j2.recent_cuts);
+            if (cn2 > 0) WriteFile(f, cl2, static_cast<DWORD>((std::min)(cn2, static_cast<int>(sizeof(cl2) - 1))), &written, nullptr);
+        }
+        {   // Frames whose DLAA ran before the last scene draw (SE5 pan-only flicker): placement + late writer.
+            char ll[1000];
+            const int ln = snprintf(ll, sizeof ll, "j2_late frames=%llu now=%llu recent=%s\r\n", (unsigned long long)j2.late_frames,
+                (unsigned long long)(GetTickCount64() / 100 % 100000000), j2.late_detail);
+            if (ln > 0) WriteFile(f, ll, static_cast<DWORD>((std::min)(ln, static_cast<int>(sizeof(ll) - 1))), &written, nullptr);
+        }
+        {   // Why carried resource states are lost (SE5 depth no_state: ambiguous_queue_order).
+            const auto ps = na::observe::GetProducerStats();
+            char ol[192];
+            const int on = snprintf(ol, sizeof ol, "observe_order executes=%llu ambiguous=%llu nested_unlocked=%llu known_clears=%llu serialized=%llu wide_scene_reads=%llu\r\n",
+                (unsigned long long)ps.executes, (unsigned long long)ps.ambiguous_executes, (unsigned long long)ps.nested_unlocked,
+                (unsigned long long)ps.known_state_clears, (unsigned long long)ps.serialized_submissions,(unsigned long long)ps.wide_scene_reads);
+            if (on > 0) WriteFile(f, ol, static_cast<DWORD>((std::min)(on, static_cast<int>(sizeof(ol) - 1))), &written, nullptr);
+        }
         const DWORD trace_len = static_cast<DWORD>(std::strlen(j2.insertion_frame_trace));
         WriteFile(f, "j2_frame", 8, &written, nullptr);
         WriteFile(f, j2.insertion_frame_trace, trace_len, &written, nullptr);
         WriteFile(f, "\r\n", 2, &written, nullptr);
-        const int nc = snprintf(coverage, sizeof coverage, "j2_coverage presents=%llu covered=%llu later_writes=%llu jittered=%llu jitter=(%.4f,%.4f)\r\n",
+        const int nc = snprintf(coverage, sizeof coverage, "j2_coverage presents=%llu covered=%llu later_writes=%llu jittered=%llu jitter=(%.4f,%.4f) raster=%u raster_draws=%llu deferred=%llu recovered=%llu\r\n",
             (unsigned long long)j2.inline_presents, (unsigned long long)j2.inline_covered,
             (unsigned long long)j2.inline_late_writes, (unsigned long long)j2.inline_jittered,
-            j2.inline_jitter_x, j2.inline_jitter_y);
+            j2.inline_jitter_x, j2.inline_jitter_y, j2.raster_jitter ? 1u : 0u, (unsigned long long)j2.raster_jitter_draws,
+            (unsigned long long)j2.segment_deferrals, (unsigned long long)j2.segment_miss_recoveries);
         if (nc > 0) WriteFile(f, coverage, static_cast<DWORD>((std::min)(nc, static_cast<int>(sizeof(coverage)-1))), &written, nullptr);
         {
             static const char* kRoutes[] = {"none", "between", "inline", "interceptor"};
@@ -752,10 +843,10 @@ void write_status_line()
             if (nrej > 0) WriteFile(f, rl, static_cast<DWORD>((std::min)(nrej, static_cast<int>(sizeof rl - 1))), &written, nullptr);
             char al[700];
             const int na2 = snprintf(al, sizeof al,
-                "j2_profile accepted=%u rejected=%u ambiguous=%u entries=%u matched{class=%llu pair=%llu barrier=%llu legacy=%llu} rejected_skips=%llu barrier_vetoes=%llu barrier_ambiguous=%llu contradictions{class=%llu barrier=%llu} labelled=%llu unlabelled=%llu expired=%llu between{observed=%llu predicted=%llu} note=\"%s\"\r\n",
+                "j2_profile accepted=%u rejected=%u ambiguous=%u entries=%u matched{class=%llu pair=%llu barrier=%llu legacy=%llu exact=%llu} exact_waits=%llu close_recovered=%llu rejected_skips=%llu barrier_vetoes=%llu barrier_ambiguous=%llu contradictions{class=%llu barrier=%llu} labelled=%llu unlabelled=%llu expired=%llu between{observed=%llu predicted=%llu} note=\"%s\"\r\n",
                 j2.profile_accepted, j2.profile_rejected, j2.profile_ambiguous, j2.profile_entries,
                 (unsigned long long)j2.class_matched, (unsigned long long)j2.class_pair_matched, (unsigned long long)j2.barrier_matched,
-                (unsigned long long)j2.legacy_matched, (unsigned long long)j2.class_rejected_skips, (unsigned long long)j2.barrier_vetoes,
+                (unsigned long long)j2.legacy_matched, (unsigned long long)j2.exact_consumer_matched, (unsigned long long)j2.exact_consumer_waits, (unsigned long long)j2.close_recovered, (unsigned long long)j2.class_rejected_skips, (unsigned long long)j2.barrier_vetoes,
                 (unsigned long long)j2.barrier_ambiguous_skips, (unsigned long long)j2.class_contradictions, (unsigned long long)j2.barrier_contradictions,
                 (unsigned long long)j2.labelled_frames, (unsigned long long)j2.unlabelled_frames, (unsigned long long)j2.expired_inline,
                 (unsigned long long)j2.between_observed, (unsigned long long)j2.between_predicted, j2.class_note);
@@ -1118,7 +1209,8 @@ struct State {
     LARGE_INTEGER qpc_freq{};
     void* dummy_swapchain_identity = nullptr;
 };
-State g_state;
+// Never destroyed: FrameCtx's D3D12 objects would be released by the CRT at exit (c0000005).
+State& g_state = *new State;
 
 // A slot is not signaled again until its previous use completes. Independent
 // queues therefore cannot advance one another's completion receipts.
@@ -1136,6 +1228,14 @@ UINT64 menu_completed_prefix() {
 // Diagnostic polling must never wait on the render thread or on the GPU.
 void write_menu_progress(HANDLE log)
 {
+    const auto cf=na::j2::compute_flow::GetStats();char cfline[950];DWORD cfw=0;
+    const int cfn=snprintf(cfline,sizeof cfline,"j2compute engine=amd recorded=%llu submitted=%llu pairs=%llu busy=%llu accepted=%llu total=%llu ms=%.3f reason=\"%s\" attempts=%llu paired_submissions=%llu unavailable=%llu history_only=%llu last_frame=%llu submit_age_ms=%llu sample_frame=%llu sample_age_ms=%llu samples=%llu excluded{invalid=%llu small=%llu cost=%llu offscreen=%llu image=%llu flicker=%llu} pool{recordings=%u images=%u} image_moving=%llu\r\n",
+        static_cast<unsigned long long>(cf.recorded),static_cast<unsigned long long>(cf.submitted),static_cast<unsigned long long>(cf.pairs),
+        static_cast<unsigned long long>(cf.busy),static_cast<unsigned long long>(cf.accepted),static_cast<unsigned long long>(cf.total),cf.ms,cf.reason,
+        (unsigned long long)cf.attempts,(unsigned long long)cf.submitted_pairs,(unsigned long long)cf.unavailable,(unsigned long long)cf.waiting_history,
+        (unsigned long long)cf.last_submitted_frame,(unsigned long long)cf.submit_age_ms,(unsigned long long)cf.sample_frame,(unsigned long long)cf.sample_age_ms,(unsigned long long)cf.samples,
+        (unsigned long long)cf.rejected_invalid,(unsigned long long)cf.rejected_small,(unsigned long long)cf.rejected_cost,(unsigned long long)cf.rejected_offscreen,(unsigned long long)cf.rejected_image,(unsigned long long)cf.rejected_flicker,cf.recording_slots,cf.image_slots,(unsigned long long)cf.image_moving);
+    if(cfn>0)WriteFile(log,cfline,(std::min)(DWORD(cfn),DWORD(sizeof(cfline)-1)),&cfw,nullptr);
     auto ps = na::present::GetStats();
     char p_line[256];
     int pn = snprintf(p_line, sizeof(p_line), "present_gpu submitted=%llu completed=%llu owned=%u device_hr=0x%08lX queried_latency_handle=0x%llX\r\n",
@@ -2186,7 +2286,21 @@ void process_frame(ID3D12CommandQueue* queue, ID3D12Resource* frame)
     DXGI_COLOR_SPACE_TYPE cs = static_cast<DXGI_COLOR_SPACE_TYPE>(g_color_space.load(std::memory_order_acquire));
     na::nr::OnPresent(queue, frame, cs);      // live Neural Rendering (before capture and the menu)
     na::motion::OnPresent(queue, frame, cs);  // A52: live optical flow (after NR, before capture)
-    if (na::capture::Pending()) na::capture::OnPresent(queue, frame); // phase-1 capture
+    if (na::capture::Pending()) {
+        // What J2 did on this present (SE5 flashing, 2026-11-02): DLAA frames since the last
+        // present, its jitter, and the misses, so a flashing present can be matched to a cause.
+        static uint64_t pf = 0, pnc = 0, pns = 0, pcut = 0, pmc = 0, pheld = 0;
+        const auto js = na::j2::GetStats();
+        char note[240];
+        snprintf(note, sizeof note, "j2_frames=%llu jitter=%.3f,%.3f no_camera=%llu no_state=%llu cuts=%llu miss_no_candidate=%llu camera_held=%llu active=%u",
+                 static_cast<unsigned long long>(js.frames - pf), js.inline_jitter_x, js.inline_jitter_y,
+                 static_cast<unsigned long long>(js.no_camera - pnc), static_cast<unsigned long long>(js.no_state - pns),
+                 static_cast<unsigned long long>(js.cuts - pcut), static_cast<unsigned long long>(js.miss_no_candidate - pmc),
+                 static_cast<unsigned long long>(js.camera_held - pheld), js.active ? 1u : 0u);
+        pf = js.frames; pnc = js.no_camera; pns = js.no_state; pcut = js.cuts; pmc = js.miss_no_candidate; pheld = js.camera_held;
+        na::capture::NotePresent(note);
+        na::capture::OnPresent(queue, frame); // phase-1 capture
+    }
     {
         // J2 evidence capture: the presented image joins this frame's evaluation (if one
         // was captured). Executed unhooked so J2 never observes our copy as game work.
@@ -2341,6 +2455,7 @@ void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue_hint = nullptr)
     ComPtr<ID3D12CommandQueue> retained_queue;
     if (!present_prelude(sc, queue,retained_queue,queue_hint)) return;
     na::j2::OnPresent(queue); // one game-frame boundary, never a TEST Present
+    if (na::scale::SliderRouteActive()) na::scale::TickLive(na::j2::GetStats().width); // P4-4: confirm a live render-scale change
     UINT idx = real_index(sc);
     { // frame processing uses the actual buffer, independently of menu allocation
         ComPtr<ID3D12Resource> bb; // A71: this frame only
@@ -2370,6 +2485,7 @@ HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_
     }
     na::present::PresentArgs a;
     na::j2::OnPresent(queue); // game call only; the presenter's generated frames bypass this
+    if (na::scale::SliderRouteActive()) na::scale::TickLive(na::j2::GetStats().width); // P4-4: confirm a live render-scale change
     g_present_caller.store(GetCurrentThreadId());
     g_present_queue_identity.store(reinterpret_cast<uintptr_t>(queue));
     a.sc = sc;
@@ -2653,17 +2769,15 @@ void STDMETHODCALLTYPE DetourExecute(ID3D12CommandQueue* q, UINT n,
     if (sub) {
         ExecuteContext ctx{q, n, lists, g_exec_ticket.fetch_add(1, std::memory_order_relaxed) + 1, uncovered, sub->user};
         if (sub->begin) sub->begin(&ctx);
-        na::dlss::BeforeExecute(q, n, lists); // R-303: wait for this view's previous DLSS frame on another queue
+        na::overlay::BeforeGameSubmission(q,n,lists);
         na::j2::Execute(q, n, lists, ForwardThroughNr);
-        na::gputime::OnExecuted(q, n, lists); // R-202: completion fence on the queue that ran the lists
-        na::dlss::OnExecuted(q, n, lists);    // C6: completion evidence before retired DLSS features are released
+        na::overlay::AfterGameSubmission(q,n,lists);
         if (sub->end) sub->end(&ctx);
         g_exec_scoped.fetch_add(1, std::memory_order_relaxed);
     } else {
-        na::dlss::BeforeExecute(q, n, lists); // R-303: wait for this view's previous DLSS frame on another queue
+        na::overlay::BeforeGameSubmission(q,n,lists);
         na::j2::Execute(q, n, lists, ForwardThroughNr);
-        na::gputime::OnExecuted(q, n, lists); // R-202: completion fence on the queue that ran the lists
-        na::dlss::OnExecuted(q, n, lists);    // C6: completion evidence before retired DLSS features are released
+        na::overlay::AfterGameSubmission(q,n,lists);
     }
     na::nr::states::Submitted(q,n,lists);
     if (obs_token.queue_state) na::observe::ExecuteEnd(obs_token, q, n, lists);
