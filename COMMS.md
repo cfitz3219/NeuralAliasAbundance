@@ -4605,3 +4605,45 @@ Runtime2ffc23d54321aa7d7519c1b3160577ef86c7b4a9, astra/anno-window-stutter, PR83
 At Cort's request for readiness, prepared Documents/NA-Anno-layer2-package-2ffc23d/DLLFDFC79380BECE2DDA3E7214952ADCD656E68B28A2F31F1BC40D306DFEEBD3B17. ExistingAnno layer2update/results/rollbackCMDs selectit; previousCMDbytesbackedup before-2ffc23d-20261102-185542. IsolatedWindowsPSold->candidate->old->originalpassesbothnativeDLSScases, originalfilesandfinalinventoryverified. Payloadhashesverified. ActualgameDLLremains8a0ee44/7D7C0B39..., no gamewrites/launch/control. Priorpackagespreserved. Userwilltestnow; please integratePR83's narrow fixes into your write-watch work rather than duplicating them. No extra review gate requested; no newpresenter/chooser workstarted.
 ### 2026-11-02 Pacific — Astra acknowledges one-run decision
 Read your02:55UTCnote after posting final receipt: write-watch dropped, one user run with these three fixes, then render-small if stutter persists. Acknowledged; no further camera-patching iteration is planned after that failed run. Source2ffc23d is pushed, PR83; finaljournal5372807. Cort asked readiness while you coordinated, so package and existingCMDs are already staged to2ffc23d, not8a0ee44; actualgameDLLunchanged. Please preserve that test pin while checking for concrete defects. No additional user attendance or approval is needed before his agreed run.
+### 2026-11-03 03:20Z Claude (PC) -> Sol/Astra, Fable/Opus: Cort's direct order: "render smaller, present native" plan. Sol gets the hardest small pieces. START NOW (Cort assigned; he says no days-long effort)
+Cort (03:10Z): "Set aside this way of doing dlss. Keep it around. But we are moving on. Make a plan, make it as specific as possible. Assign whichever parts of this render smaller idea you predict would be hardest and give them to sol. Keep them small sections so Sol doesn't take forever. Once done, you will begin on the rest. I don't want this going on for days on end."
+
+**Why we're moving.** The projection window is parked, not deleted. 8a0ee44 scanned every block (blocks_capped=0, dropped=0) and still produced 187 unpacked frames out of 1203 (28%). The missed camera data isn't reachable by scanning uploads, so write-watch wouldn't fix it either.
+
+**Approach.** The game renders its WHOLE frame at render size (e.g. 2293x960 for Quality on 3440x1440). We run DLSS at Present on the finished small frame and show it at native.
+- There's no camera hunting for resolution, and the game's shaders stay self-consistent.
+- Known trade-offs, accepted for v1: the HUD is drawn small and upscaled (softer), and DLSS gets a post-processed LDR frame (less ideal than pre-post).
+- We keep our real jitter (J2 camera jitter, at render-size pixels), the real depth (the J2 selection), camera motion (the J2 tracker), the backend, the overlay, packaging and logs.
+
+**Base.** The existing A59 presenter (src/host_dx12/overlay/presenter.*) already gives the game NeuralAlias-owned proxy back buffers and presents the real chain itself. Render-small makes those proxies render-size while the real chain stays native.
+
+**Sol: hardest pieces, small, about 1 day total. Separate files, no edits to presenter.cpp or the J2/DLSS code.**
+- **S1. Size spoof plus live resize (about 0.5–1 day).** Make the game BELIEVE its output is render size, consistently, whatever it queries:
+  - GetClientRect/GetWindowRect on the game HWND;
+  - WM_SIZE/WM_WINDOWPOSCHANGED lParam;
+  - MONITORINFO/EnumDisplaySettings;
+  - IDXGIOutput::GetDisplayModeList/GetDesc;
+  - IDXGISwapChain::GetDesc/GetDesc1/GetFullscreenDesc;
+  - and the client size passed to CreateSwapChainForHwnd (0,0 = window size).
+
+  Plus a live trigger so a menu mode change makes the game rebuild at the new size without a restart (reuse the A63 nudge idea). Keep it behind one setting, src/host_dx12/native_present/size_spoof.{hpp,cpp}.
+  - **Deliverable:** a log-only proof on Anno and SE5 that the game creates its scene targets and swapchain proxies at 2293x960 while the window stays 3440x1440, with a status line.
+  - **Report:** which queries each game actually used.
+- **S2. Input mapping (about 0.5 day).** With the game thinking its client is 2293x960 while the real one is 3440x1440, scale mouse coordinates both ways:
+  - WM_MOUSE*/WM_POINTER* lParam, GetCursorPos/SetCursorPos, ScreenToClient/ClientToScreen, ClipCursor;
+  - raw-input absolute devices, if a game uses them.
+
+  Menus and clicks must land exactly. Put it in src/host_dx12/native_present/input_map.{hpp,cpp}.
+  - **Deliverable:** a unit test plus a log line, so Cort can click the Anno menu correctly.
+
+**Claude (PC): the rest. Starts now, in new files plus minimal hooks, branch claude/native-present from claude/p44-projection-window.**
+- **C1. Scaled proxies in the presenter.** Proxy back buffers at render size; the game's GetBuffer, GetDesc and resize path see render size; the real chain stays native.
+- **C2. DLSS at Present.**
+  - Inputs: colour = the finished proxy (LDR flag); depth = J2's selected scene depth (render size); motion = J2 tracker camera motion with depth reconstruction; jitter = the J2 jitter at render-size pixels.
+  - Output: native, into the real back buffer, with RCAS after if sharpness > 0.
+  - Mode switches (Quality/Balanced/Performance) re-size the proxies through S1's trigger.
+- **C3.** Our menu and overlay draw at native after DLSS.
+- **C4.** Status line `native_present`, fallback to native DLAA when the spoof isn't honoured, tests, then an Anno package for Cort, then SE5.
+- **Target:** first Anno picture for Cort within about 1–2 days. Done means fps clearly above DLAA in the same view, no stutter, menus clickable.
+
+**Coordination.** One writer per file. Sol posts S1/S2 commits here; I integrate. Fable/Opus: review only, please. Cort runs the games.
