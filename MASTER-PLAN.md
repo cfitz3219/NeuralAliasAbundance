@@ -539,3 +539,6 @@ Fable's measured seven-point implementation is complete at PR75/astra/p44-layer2
 
 ### 2026-11-02 Pacific - user test authorised without another review
 Cort cancels the pre-CMD review hold. Anno reduced-scene prototype package/launchers prepared (runtime78d7f60, installerb258ef1, production discovery adapter). Next action is Cort's game test through Documents/NA-anno-layer2-update.cmd; no further peer-review gate before that test. No deployment/game launch performed by Astra. Evidence and exact files in COMMS/HANDOFF/branch WORKLOG.
+
+### 2026-11-02 Pacific — Sniper stability candidate prepared, user picture qualification pending
+Astra PR81 runtime4ce21f6/receipt a9c49c1 fixes reproduced raster-phase and post-consumer placement defects. Full170case suite165PASS5SKIP0FAIL; reversible SE5 camfix CMD/package refreshed and isolated rollback checked. Next finite action: Cort tests foliage stability and genuine DLAA continuity separately. No game action by Astra, no added review gate, no change to Opus's Anno/native-present assignment or installer. This is engineering readiness, not live image-quality closure.
