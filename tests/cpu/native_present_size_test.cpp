@@ -1,0 +1,176 @@
+// S1/S2 regression: actual user32 hooks and hidden fixture HWNDs, no game.
+#include "test_support.hpp"
+#include "host_dx12/native_present/input_map.hpp"
+#include <windowsx.h>
+#include <cstring>
+#include <thread>
+#include <atomic>
+using namespace na::native_present;
+namespace {
+struct Window {
+    HWND hwnd = nullptr;
+    Window() {
+        hwnd=CreateWindowExW(0,L"STATIC",L"NA hidden sizing fixture",WS_OVERLAPPEDWINDOW,
+            -1700,120,1000,700,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+        CHECK(hwnd);
+    }
+    ~Window() { Detach(hwnd); DestroyWindow(hwnd); }
+};
+bool eq(POINT a,POINT b) { return a.x==b.x && a.y==b.y; }
+RECT native_client(HWND h) { NativeScope n; RECT r{}; CHECK(GetClientRect(h,&r)); return r; }
+InputGeometry geometry() { return {{-3440,100,0,1540},{2293,960},1}; }
+void deliver(HWND hwnd,uint64_t token) {
+    UINT msg=ResizeMessage(); WPARAM wp=static_cast<WPARAM>(token); LPARAM lp=0; WINDOWPOS scratch{};
+    CHECK(PrepareSizeMessage(hwnd,msg,wp,lp,scratch)==MessageAction::Changed);
+    CHECK(msg==WM_SIZE && LOWORD(lp)==1720 && HIWORD(lp)==720);
+}
+}
+int main() {
+    if (!InstallSizeHooks()) { std::fprintf(stderr,"size hook installation failed\n"); return 1; }
+    return test::run({
+        {"real hook sees game module, native bypass nests and other HWND stays physical", [] {
+            Window a,b; const auto physical=native_client(a.hwnd);
+            CHECK(Attach(a.hwnd,{3440,1440},{2293,960}));
+            RECT r{};
+            { GameScopeForTest game;
+                CHECK(GetClientRect(a.hwnd,&r)); CHECK(r.right==2293 && r.bottom==960);
+                CHECK(GetClientRect(b.hwnd,&r)); CHECK(r.right==native_client(b.hwnd).right);
+                { NativeScope n; { NativeScope n2; CHECK(GetClientRect(a.hwnd,&r)); CHECK(r.right==physical.right); }
+                    CHECK(GetClientRect(a.hwnd,&r)); CHECK(r.right==physical.right); }
+                CHECK(GetClientRect(a.hwnd,&r)); CHECK(r.right==2293);
+            }
+            CHECK(GetClientRect(a.hwnd,&r)); CHECK(r.right==physical.right); // same-module native exemption
+            Detach(a.hwnd);
+            { GameScopeForTest game; CHECK(GetClientRect(a.hwnd,&r)); CHECK(r.right==physical.right); }
+        }},
+        {"outer window preserves origin and nonclient border", [] {
+            Window w; CHECK(Attach(w.hwnd,{3440,1440},{2293,960}));
+            RECT physical{}; { NativeScope n; CHECK(GetWindowRect(w.hwnd,&physical)); }
+            const auto client=native_client(w.hwnd);
+            RECT changed{}; { GameScopeForTest game; CHECK(GetWindowRect(w.hwnd,&changed)); }
+            CHECK(changed.left==physical.left && changed.top==physical.top);
+            CHECK(changed.right-changed.left==physical.right-physical.left-client.right+2293);
+            RECT after{}; { NativeScope n; CHECK(GetWindowRect(w.hwnd,&after)); }
+            CHECK(std::memcmp(&after,&physical,sizeof after)==0);
+        }},
+        {"descriptors preserve format flags refresh HWND and sample fields", [] {
+            Window w; CHECK(Attach(w.hwnd,{3440,1440},{2293,960}));
+            DXGI_SWAP_CHAIN_DESC d{}; d.OutputWindow=w.hwnd; d.BufferDesc.Width=3440; d.BufferDesc.Height=1440;
+            d.BufferDesc.RefreshRate={144,1}; d.BufferDesc.Format=DXGI_FORMAT_R10G10B10A2_UNORM;
+            d.BufferCount=3; d.SampleDesc={1,0}; d.Flags=DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+            const auto original=d; CHECK(RewriteDesc(&d));
+            CHECK(d.BufferDesc.Width==2293 && d.BufferDesc.Height==960);
+            d.BufferDesc.Width=original.BufferDesc.Width; d.BufferDesc.Height=original.BufferDesc.Height;
+            CHECK(std::memcmp(&d,&original,sizeof d)==0);
+            DXGI_SWAP_CHAIN_DESC1 d1{}; d1.Width=3440; d1.Height=1440; d1.AlphaMode=DXGI_ALPHA_MODE_IGNORE;
+            CHECK(RewriteDesc1(w.hwnd,&d1)); CHECK(d1.Width==2293 && d1.AlphaMode==DXGI_ALPHA_MODE_IGNORE);
+        }},
+        {"live resize advertises on delivery and commits mapping only on matching success", [] {
+            Window w; CHECK(Attach(w.hwnd,{3440,1440},{2293,960}));
+            InputGeometry before{}; CHECK(GetInputGeometry(&before));
+            const auto token=RequestRenderSize({1720,720}); CHECK(token);
+            RECT r{}; CHECK(RewriteClientRect(w.hwnd,&r)); CHECK(r.right==2293); // not delivered yet
+            CHECK(RequestRenderSize({1147,480})==0); // exactly one request
+            deliver(w.hwnd,token); CHECK(RewriteClientRect(w.hwnd,&r)); CHECK(r.right==1720);
+            InputGeometry pending{}; CHECK(GetInputGeometry(&pending));
+            CHECK(pending.render.w==2293 && pending.generation==before.generation);
+            CHECK(!CompleteResize(token+1,true,{1720,720}));
+            CHECK(CompleteResize(token,true,{1720,720}));
+            InputGeometry committed{}; CHECK(GetInputGeometry(&committed));
+            CHECK(committed.render.w==1720 && committed.generation==token);
+            CHECK(!CompleteResize(token,true,{1720,720}));
+            CHECK(RequestRenderSize({1720,720})==0);
+        }},
+        {"failed resize restores old advertised geometry and allows retry", [] {
+            Window w; CHECK(Attach(w.hwnd,{3440,1440},{2293,960}));
+            const auto token=RequestRenderSize({1720,720}); CHECK(token); deliver(w.hwnd,token);
+            CHECK(!CompleteResize(token,false,{}));
+            RECT r{}; CHECK(RewriteClientRect(w.hwnd,&r)); CHECK(r.right==2293);
+            const auto retry=RequestRenderSize({1720,720}); CHECK(retry>token); deliver(w.hwnd,retry);
+            CHECK(!CompleteResize(retry,true,{1719,720})); CHECK(GetSizeState().render.w==2293);
+            const auto final=RequestRenderSize({1720,720}); CHECK(final>retry);
+            CHECK(!CompleteResize(retry,true,{1720,720})); deliver(w.hwnd,final);
+            CHECK(CompleteResize(final,true,{1720,720}));
+        }},
+        {"window position message uses scratch and minimization stays zero", [] {
+            Window w; CHECK(Attach(w.hwnd,{3440,1440},{2293,960}));
+            WINDOWPOS pos{w.hwnd,nullptr,-1700,120,1000,700,SWP_NOZORDER}; const auto original=pos;
+            WINDOWPOS scratch{}; UINT msg=WM_WINDOWPOSCHANGED; WPARAM wp=0; LPARAM lp=reinterpret_cast<LPARAM>(&pos);
+            CHECK(PrepareSizeMessage(w.hwnd,msg,wp,lp,scratch)==MessageAction::Changed);
+            CHECK(lp==reinterpret_cast<LPARAM>(&scratch)); CHECK(std::memcmp(&pos,&original,sizeof pos)==0);
+            CHECK(scratch.x==pos.x && scratch.flags==pos.flags);
+            CHECK(scratch.cx==1000-native_client(w.hwnd).right+2293);
+            msg=WM_SIZE; wp=SIZE_MINIMIZED; lp=0;
+            CHECK(PrepareSizeMessage(w.hwnd,msg,wp,lp,scratch)==MessageAction::Forward && lp==0);
+        }},
+        {"ignored resize expires without a window change or a stuck pending request", [] {
+            Window w; CHECK(Attach(w.hwnd,{3440,1440},{2293,960}));
+            const auto token=RequestRenderSize({1720,720}); CHECK(token); deliver(w.hwnd,token);
+            CHECK(!ExpireResize(5000,1)); CHECK(ExpireResize(5000,GetTickCount64()+5001));
+            CHECK(GetSizeState().request==0 && GetSizeState().render.w==2293);
+            UINT msg=ResizeMessage(); WPARAM wp=static_cast<WPARAM>(token); LPARAM lp=0; WINDOWPOS scratch{};
+            CHECK(PrepareSizeMessage(w.hwnd,msg,wp,lp,scratch)==MessageAction::Consume);
+            CHECK(RequestRenderSize({1720,720})!=0);
+        }},
+        {"roundtrip mapping keeps signed monitor origin and full clip extent", [] {
+            const auto g=geometry();
+            CHECK(eq(ToGameClient(g,{3440,1440}),{2293,960}));
+            CHECK(eq(ToGameScreen(g,{-3440,100}),{-3440,100}));
+            for (LONG y=0;y<=1440;y+=37) for (LONG x=0;x<=3440;x+=29) {
+                auto a=ToGameClient(g,{x,y}); auto b=ToNativeClient(g,a);
+                CHECK(std::abs(b.x-x)<=1 && std::abs(b.y-y)<=1);
+                auto c=ToNativeScreen(g,ToGameScreen(g,{x-3440,y+100}));
+                CHECK(std::abs(c.x-(x-3440))<=1 && std::abs(c.y-(y+100))<=1);
+            }
+            auto clip=ToNativeClip(g,{-3440,100,-3440+2293,1060});
+            CHECK(std::memcmp(&clip,&g.physical_client,sizeof clip)==0);
+            CHECK(eq(ToGameClient({}, {-7,5}),{-7,5}));
+        }},
+        {"cursor poll and message positions agree and overlay reads bypass mapping", [] {
+            Window w; CHECK(Attach(w.hwnd,{3440,1440},{2293,960})); InputGeometry g{}; CHECK(GetInputGeometry(&g));
+            POINT real{g.physical_client.left+100,g.physical_client.top+200};
+            POINT polled=real;
+            { GameScopeForTest game; CHECK(MapCursorRead(&polled,nullptr)); }
+            POINT local{polled.x-g.physical_client.left,polled.y-g.physical_client.top};
+            LPARAM lp=MAKELPARAM(100,200); CHECK(MapGameMouseMessage(w.hwnd,WM_MOUSEMOVE,lp));
+            CHECK(eq(local,{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)}));
+            LPARAM wheel=MAKELPARAM(real.x,real.y); CHECK(MapGameMouseMessage(w.hwnd,WM_MOUSEWHEEL,wheel));
+            CHECK(eq(polled,{GET_X_LPARAM(wheel),GET_Y_LPARAM(wheel)}));
+            int x=polled.x,y=polled.y;
+            { GameScopeForTest game; CHECK(MapCursorWrite(x,y,nullptr)); }
+            CHECK(std::abs(x-real.x)<=1 && std::abs(y-real.y)<=1);
+            RECT clip{g.physical_client.left,g.physical_client.top,g.physical_client.right,g.physical_client.bottom};
+            { GameScopeForTest game; CHECK(MapClipRead(&clip,nullptr));
+                RECT unscaled{}; CHECK(MapClipRect(&clip,unscaled,nullptr)); CHECK(std::memcmp(&unscaled,&g.physical_client,sizeof clip)==0); }
+            { GameScopeForTest game; NativeScope native; POINT p=real; CHECK(!MapCursorRead(&p,nullptr)); CHECK(eq(p,real)); }
+            LPARAM key=42; CHECK(!MapGameMouseMessage(w.hwnd,WM_KEYDOWN,key)); CHECK(key==42);
+        }},
+        {"raw relative motion untouched while absolute devices retain buttons", [] {
+            const auto g=geometry(); RAWMOUSE relative{}; relative.lLastX=-23; relative.lLastY=17;
+            const auto saved=relative; CHECK(!MapAbsoluteRaw(relative,g,{-3440,0,3440,1440}));
+            CHECK(std::memcmp(&relative,&saved,sizeof relative)==0);
+            RAWMOUSE absolute{}; absolute.usFlags=MOUSE_MOVE_ABSOLUTE|MOUSE_VIRTUAL_DESKTOP;
+            absolute.usButtonFlags=RI_MOUSE_LEFT_BUTTON_DOWN; absolute.ulExtraInformation=12345;
+            absolute.lLastX=32768; absolute.lLastY=32768;
+            CHECK(MapAbsoluteRaw(absolute,g,{-3440,0,3440,1440}));
+            CHECK(absolute.usFlags==(MOUSE_MOVE_ABSOLUTE|MOUSE_VIRTUAL_DESKTOP));
+            CHECK(absolute.usButtonFlags==RI_MOUSE_LEFT_BUTTON_DOWN && absolute.ulExtraInformation==12345);
+            CHECK(absolute.lLastX<32768);
+        }},
+        {"parallel input snapshots cannot mix dimensions from different commits", [] {
+            Window w; CHECK(Attach(w.hwnd,{3440,1440},{2293,960})); std::atomic<bool> bad{false};
+            std::thread reader([&] { for (unsigned i=0;i<3000;++i) {
+                auto s=GetSizeState(); if (!((s.render.w==2293 && s.render.h==960)||(s.render.w==1720 && s.render.h==720))) bad=true;
+            }});
+            for (unsigned i=0;i<1000;++i) CHECK(CommitBuffers(w.hwnd,{3440,1440}, i%2 ? Size{2293,960}:Size{1720,720}));
+            reader.join(); CHECK(!bad);
+        }},
+        {"status is bounded and disabled geometry is transparent", [] {
+            char short_status[8]; std::memset(short_status,0x55,sizeof short_status); FormatSizeStatus(short_status,sizeof short_status); CHECK(short_status[7]==0);
+            char large[1024]; FormatSizeStatus(large,sizeof large); CHECK(std::strstr(large,"queries{client="));
+            FormatInputStatus(large,sizeof large); CHECK(std::strstr(large,"raw_absolute="));
+            CHECK(GetSizeStats().client_queries>0 && GetSizeStats().completed>0 && GetSizeStats().failed>0);
+            InputGeometry g{}; CHECK(!GetInputGeometry(&g));
+        }}
+    });
+}
