@@ -43,6 +43,7 @@ struct Identity {
     float mv_scale_x = 1, mv_scale_y = 1;
     uint32_t reset = 0, camera_cut = 0;
     uint32_t preset = 0, sharpness = 0, debug_view = 0;
+    uint32_t placement = 0, at_close = 0; // inline trigger kind; whether the record was appended just before Close
 };
 
 // Planes recorded after the evaluate, in the states they are in at that point.
@@ -64,6 +65,7 @@ bool Armed(); // a capture is requested, its delay has passed, frames remain
 // In J2's recording, right after a successful DLSS evaluate on `list`. Returns a token
 // (0 = not captured: not armed, no free slot, allocation failed).
 uint32_t RecordEvaluation(ID3D12GraphicsCommandList* list, const Planes& planes, const Identity& id);
+void AnnotatePlacement(uint32_t token, uint32_t placement, bool at_close);
 // The list holding the token's copies was submitted on `queue` (signals the slot fence).
 void Submitted(uint32_t token, ID3D12CommandQueue* queue, uint64_t submission);
 // The token's list will not be submitted by J2. `may_still_run`: the copies are in a

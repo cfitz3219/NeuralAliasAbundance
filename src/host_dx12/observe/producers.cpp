@@ -157,6 +157,30 @@ struct DescHeap {
         uint32_t cbv_size = 0;   // CBV: SizeInBytes
     };
     std::vector<SlotInfo> info; // last observed write per slot (record-time CPU view)
+    // Sparse lookup of observed SRVs in shader-visible heaps. The selected
+    // scene may be anywhere in a finite/unbounded descriptor table, not just
+    // its first 64 entries. Updated with the existing descriptor shadow under
+    // g_m; a draw queries the selected resource rather than scanning the heap.
+    std::unordered_map<na_object_id, std::vector<uint32_t>> srv_slots;
+    void Store(uint32_t slot, SlotInfo value) {
+        const auto indexed=[](const SlotInfo& v){return v.kind==NA_DESC_SRV && v.resource && v.resource!=NA_UNKNOWN_U64;};
+        const SlotInfo old=info[slot];
+        if(gpu_start && (old.kind!=value.kind || old.resource!=value.resource)) {
+            if(indexed(old)) {
+                auto it=srv_slots.find(old.resource);
+                if(it!=srv_slots.end()) {
+                    auto& v=it->second;auto p=std::lower_bound(v.begin(),v.end(),slot);
+                    if(p!=v.end() && *p==slot)v.erase(p);
+                    if(v.empty())srv_slots.erase(it);
+                }
+            }
+            if(indexed(value)) {
+                auto& v=srv_slots[value.resource];auto p=std::lower_bound(v.begin(),v.end(),slot);
+                if(p==v.end() || *p!=slot)v.insert(p,slot);
+            }
+        }
+        info[slot]=value;
+    }
 };
 
 struct VaRange {
@@ -223,6 +247,7 @@ std::unordered_map<na_object_id, const void*> g_res_keys; // resource id -> cano
 std::atomic<uint64_t> g_next_id{1};
 
 struct Counters {
+    std::atomic<uint64_t> wide_scene_reads{0};
     std::atomic<uint64_t> nested_unlocked{0}, serialized{0};
     std::atomic<uint64_t> snap_reread{0}, preexisting_resources{0}, preexisting_heaps{0}, sample_known_state{0}, known_clears{0};
     std::atomic<uint64_t> sample_missing_recording{0}, sample_partial_coverage{0}, sample_partial_states{0}, sample_no_transition{0};
@@ -801,7 +826,7 @@ void note_descriptor_write(D3D12_CPU_DESCRIPTOR_HANDLE dst, uint32_t kind, IUnkn
             e.resource = NA_UNKNOWN_U64; // resource-backed, but created before observation
             e.hdr.flags |= NA_EVF_METHOD_UNOBSERVED;
         }
-        h->info[slot] = DescHeap::SlotInfo{kind, e.resource, format, first_sub, 0, 0};
+        h->Store(slot, DescHeap::SlotInfo{kind, e.resource, format, first_sub, 0, 0});
     }
     e.descriptor_kind = kind;
     e.format = format;
@@ -831,7 +856,7 @@ void note_descriptor_copy(uint64_t dst, uint64_t src, uint32_t count, uint32_t i
             run = std::min({count, dh->count - ds, sh->count - ss});
             for (uint32_t i = 0; i < run; ++i) {
                 ++dh->versions[ds + i];
-                dh->info[ds + i] = sh->info[ss + i]; // contents follow the source's record-time view
+                dh->Store(ds + i, sh->info[ss + i]); // contents follow the source's record-time view
             }
             e.src_heap = sh->id;
             e.dst_heap = dh->id;
@@ -1077,8 +1102,8 @@ void STDMETHODCALLTYPE D_CreateConstantBufferView(ID3D12Device* dev, const D3D12
         e.heap = dh->id;
         e.slot = slot;
         e.slot_version = ++dh->versions[slot];
-        dh->info[slot] = DescHeap::SlotInfo{NA_DESC_CBV, desc && desc->BufferLocation ? (known ? res : NA_UNKNOWN_U64) : 0, NA_UNKNOWN_U32, 0,
-                                            known ? off : 0, desc ? desc->SizeInBytes : 0};
+        dh->Store(slot, DescHeap::SlotInfo{NA_DESC_CBV, desc && desc->BufferLocation ? (known ? res : NA_UNKNOWN_U64) : 0, NA_UNKNOWN_U32, 0,
+                                            known ? off : 0, desc ? desc->SizeInBytes : 0});
     }
     e.descriptor_kind = NA_DESC_CBV;
     e.resource = desc && desc->BufferLocation ? (known ? res : NA_UNKNOWN_U64) : 0;
@@ -3145,7 +3170,7 @@ void before_shader_use(GL* l, bool compute)
     uint64_t depth = 0, color = 0;
     GetLiveSelection(&depth, &color);
     if (!color) return;
-    bool reads_color = false;
+    bool reads_color = false, wide_color = false;
     {
         std::shared_lock<std::shared_mutex> lock(g_m);
         na_object_id lid = 0;
@@ -3175,6 +3200,22 @@ void before_shader_use(GL* l, bool compute)
             for (uint32_t r = 0; r < params[p].count && params[p].first_range + r < ranges.size(); ++r) {
                 const auto& range = ranges[params[p].first_range + r];
                 if (range.table_offset == NA_UNKNOWN_U32) continue;
+                if(range.range_type==D3D12_DESCRIPTOR_RANGE_TYPE_SRV) {
+                    const auto found=heap->srv_slots.find(color);
+                    if(found!=heap->srv_slots.end()) {
+                        const uint64_t first=uint64_t(slot)+range.table_offset;
+                        const uint64_t end=(std::min)(uint64_t(heap->count),first+range.num_descriptors);
+                        // The small prefix below still collects role metadata.
+                        // This indexed suffix closes its scene-colour blind spot.
+                        const uint64_t suffix=first+(std::min)(range.num_descriptors,64u);
+                        if(suffix<end) {
+                            auto i=std::lower_bound(found->second.begin(),found->second.end(),static_cast<uint32_t>(suffix));
+                            for(;i!=found->second.end() && *i<end;++i) {
+                                reads_color=true;wide_color=true;if(color_srvs<255)++color_srvs;
+                            }
+                        }
+                    }
+                }
                 for (uint32_t k = 0; k < std::min<uint32_t>(range.num_descriptors, 64); ++k) {
                     const uint64_t index = uint64_t(slot) + range.table_offset + k;
                     if (index >= heap->count) break;
@@ -3212,6 +3253,7 @@ void before_shader_use(GL* l, bool compute)
                 ls->insertion.Add({color, destination, pipeline_id, false, na::j2::Op::DerivedRead});
         }
     }
+    if(wide_color)g_c.wide_scene_reads.fetch_add(1,std::memory_order_relaxed);
     if (reads_color) if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, compute);
 }
 
@@ -5297,6 +5339,7 @@ ProducerStats GetProducerStats()
     s.preexisting_heaps = g_c.preexisting_heaps.load();
     s.sample_known_state = g_c.sample_known_state.load();
     s.known_state_clears = g_c.known_clears.load();
+    s.wide_scene_reads = g_c.wide_scene_reads.load();
     s.known_store_disabled = g_known_disabled.load() ? 1u : 0u;
     s.unhooked_queues = g_unhooked_queues.load();
     {

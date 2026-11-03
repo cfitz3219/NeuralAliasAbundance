@@ -154,7 +154,9 @@ int main(int argc, char** argv)
     const bool inline_consumer_tail = argc > 3 && std::strcmp(argv[3], "--inline-consumer-tail") == 0;
     const bool close_control = argc > 3 && std::strcmp(argv[3], "--inline-consumer-gap-old") == 0;
     const bool inline_consumer_gap = close_control || (argc > 3 && std::strcmp(argv[3], "--inline-consumer-gap") == 0);
-    const bool inline_consumer = inline_consumer_gap || inline_consumer_tail || (argc > 3 && std::strcmp(argv[3], "--inline-consumer") == 0);
+    const bool inline_unbounded_srv = argc > 3 && std::strcmp(argv[3], "--inline-unbounded-srv") == 0;
+    const bool inline_late_srv = inline_unbounded_srv || (argc > 3 && std::strcmp(argv[3], "--inline-late-srv") == 0);
+    const bool inline_consumer = inline_late_srv || inline_consumer_gap || inline_consumer_tail || (argc > 3 && std::strcmp(argv[3], "--inline-consumer") == 0);
     const bool inline_raster = inline_consumer || (argc > 3 && std::strcmp(argv[3], "--inline-raster") == 0);
     const bool inline_pan = argc > 3 && std::strcmp(argv[3], "--inline-pan") == 0;
     const bool inline_list = inline_pan || inline_raster || inline_flow || auto_inline || inline_record_first || inline_copy || (argc > 3 && std::strcmp(argv[3], "--inline") == 0);
@@ -396,20 +398,36 @@ int main(int argc, char** argv)
         D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_FLAG_NONE);
     REQUIRE(post_color);
     test::ComPtr<ID3D12DescriptorHeap> post_heap;
+    test::ComPtr<ID3D12DescriptorHeap> post_source_heap;
     test::ComPtr<ID3D12RootSignature> post_root;
+    const UINT post_base=inline_late_srv?17u:0u,post_offset=inline_late_srv?11u:0u;
+    const auto post_gpu=[&]{auto h=post_heap->GetGPUDescriptorHandleForHeapStart();h.ptr+=UINT64(post_base)*dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);return h;};
     if (post_reader || inline_list) {
         REQUIRE(!msaa);
-        REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&chd, IID_PPV_ARGS(&post_heap))));
+        auto phd = chd;
+        if (inline_late_srv) phd.NumDescriptors = 128;
+        REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&phd, IID_PPV_ARGS(&post_heap))));
         D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
         srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srv.Texture2DArray.MipLevels = 1; srv.Texture2DArray.FirstArraySlice = 1; srv.Texture2DArray.ArraySize = 1;
-        dev->CreateShaderResourceView(color.Get(), &srv, post_heap->GetCPUDescriptorHandleForHeapStart());
-        D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
-        D3D12_ROOT_PARAMETER p{}; p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p.DescriptorTable = {1, &range};
-        D3D12_ROOT_SIGNATURE_DESC rd{1, &p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        if (inline_late_srv) {
+            auto handle=post_heap->GetCPUDescriptorHandleForHeapStart();
+            const auto inc=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            for(UINT i=0;i<128;++i){dev->CreateShaderResourceView(nullptr,&srv,handle);handle.ptr+=inc;}
+            auto cpu=phd;cpu.NumDescriptors=2;cpu.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+            REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&cpu,IID_PPV_ARGS(&post_source_heap))));
+            auto source=post_source_heap->GetCPUDescriptorHandleForHeapStart();
+            dev->CreateShaderResourceView(color.Get(),&srv,source);source.ptr+=inc;dev->CreateShaderResourceView(nullptr,&srv,source);
+        }
+        auto first=post_heap->GetCPUDescriptorHandleForHeapStart();first.ptr+=SIZE_T(post_base+post_offset)*dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        dev->CreateShaderResourceView(color.Get(), &srv, first);
+        D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, inline_unbounded_srv ? UINT_MAX : inline_late_srv ? 96u : 1u, 0, 0, post_offset};
+        D3D12_ROOT_PARAMETER p[2]{}; p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[0].DescriptorTable = {1, &range};
+        p[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;p[1].Constants={0,0,1};
+        D3D12_ROOT_SIGNATURE_DESC rd{inline_late_srv ? 2u : 1u, p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
         test::ComPtr<ID3DBlob> blob, error;
         REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)));
         REQUIRE(SUCCEEDED(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&post_root))));
@@ -426,14 +444,19 @@ int main(int argc, char** argv)
         REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&phd, IID_PPV_ARGS(&post_rtvh))));
         post_rtv = post_rtvh->GetCPUDescriptorHandleForHeapStart();
         dev->CreateRenderTargetView(post_rt.Get(), nullptr, post_rtv);
-        const char* shader = R"(
+        const char* shader = inline_late_srv ? R"(
+Texture2DArray<float4> image[96] : register(t0);
+cbuffer C:register(b0){uint which;}
+float4 VS(uint id : SV_VertexID) : SV_Position { float2 p=float2((id<<1)&2,id&2); return float4(p*2-1,0,1); }
+float4 PS(float4 pos : SV_Position) : SV_Target { return image[which].Load(int4(int2(pos.xy),0,0)); }
+)" : R"(
 Texture2DArray<float4> image : register(t0);
 float4 VS(uint id : SV_VertexID) : SV_Position { float2 p=float2((id<<1)&2,id&2); return float4(p*2-1,0,1); }
 float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(pos.xy),0,0)); }
 )";
         test::ComPtr<ID3DBlob> vs, ps, err;
         REQUIRE(SUCCEEDED(D3DCompile(shader, std::strlen(shader), nullptr, nullptr, nullptr, "VS", "vs_5_0", 0, 0, &vs, &err)));
-        REQUIRE(SUCCEEDED(D3DCompile(shader, std::strlen(shader), nullptr, nullptr, nullptr, "PS", "ps_5_0", 0, 0, &ps, &err)));
+        REQUIRE(SUCCEEDED(D3DCompile(shader, std::strlen(shader), nullptr, nullptr, nullptr, "PS", inline_late_srv ? "ps_5_1" : "ps_5_0", 0, 0, &ps, &err)));
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
         pd.pRootSignature = post_root.Get();
         pd.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
@@ -508,6 +531,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         na::capture::j2::Request(3, cap_dir.c_str(), 0);
     }
     int frame_no = 0;
+    unsigned delivered=0, delivery_checks=0;
     test::ComPtr<ID3D12PipelineState> raster_pso;
     std::vector<test::ComPtr<ID3D12PipelineState>> final_writers;
     if (inline_raster) {
@@ -543,6 +567,18 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         d.WaitIdle();
         const int frame_evals = fake::evals;
         const int pan_frame = (inline_pan || inline_consumer) ? ++frame_no : 0;
+        const UINT source_slot=inline_late_srv && pan_frame>=12 && pan_frame%2==0 ? (pan_frame%4==0?72u:95u) : 0u;
+        const auto wide_before=na::observe::GetProducerStats().wide_scene_reads;
+        if(inline_late_srv){
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};srv.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;
+            srv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2DARRAY;srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Texture2DArray.MipLevels=1;srv.Texture2DArray.FirstArraySlice=1;srv.Texture2DArray.ArraySize=1;
+            const auto inc=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            for(UINT slot:{0u,72u,95u}){auto h=post_heap->GetCPUDescriptorHandleForHeapStart();h.ptr+=SIZE_T(post_base+post_offset+slot)*inc;
+                if(pan_frame%4==0){auto from=post_source_heap->GetCPUDescriptorHandleForHeapStart();if(slot!=source_slot)from.ptr+=inc;
+                    dev->CopyDescriptorsSimple(1,h,from,D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                }else dev->CreateShaderResourceView(slot==source_slot?color.Get():nullptr,&srv,h);}
+        }
         const bool gap_frame = inline_consumer_gap && pan_frame>=12 && pan_frame%4==0;
         if (inline_list && !inline_pan) {
             // Pooled list objects alternate between an early write-only job and
@@ -631,13 +667,14 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             ID3D12DescriptorHeap* ph[] = {post_heap.Get()};
             scene.list->SetDescriptorHeaps(1, ph);
             scene.list->SetGraphicsRootSignature(post_root.Get());
+            if(inline_late_srv)scene.list->SetGraphicsRoot32BitConstant(1,source_slot,0);
             scene.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             D3D12_VIEWPORT viewport{0, 0, float(W), float(H), 0, 1};
             D3D12_RECT scissor{0, 0, LONG(W), LONG(H)};
             scene.list->RSSetViewports(1, &viewport);
             scene.list->RSSetScissorRects(1, &scissor);
             const int evals_before_read = fake::evals;
-            scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart()); // binding alone is not a read
+            scene.list->SetGraphicsRootDescriptorTable(0, post_gpu()); // binding alone is not a read
             REQUIRE(fake::evals == evals_before_read);
             scene.list->SetPipelineState(post_pso.Get()); // shader chosen AFTER the table
             scene.list->DrawInstanced(3, 1, 0, 0); // intermediate actual read
@@ -650,19 +687,20 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                 scene.list->SetGraphicsRootSignature(rs.Get());
                 ID3D12DescriptorHeap* camera_heap[]={cbvh.Get()};scene.list->SetDescriptorHeaps(1,camera_heap);
                 scene.list->SetGraphicsRootDescriptorTable(0,cbvh->GetGPUDescriptorHandleForHeapStart());
-                scene.list->SetPipelineState(inline_consumer ? final_writers.at((inline_consumer_tail || inline_consumer_gap) ? 0 : pan_frame-1).Get() : raster_pso.Get());scene.list->DrawInstanced(3,1,0,0);
+                scene.list->SetPipelineState(inline_consumer ? final_writers.at((inline_late_srv || inline_consumer_tail || inline_consumer_gap) ? 0 : pan_frame-1).Get() : raster_pso.Get());scene.list->DrawInstanced(3,1,0,0);
                 scene.list->SetDescriptorHeaps(1,ph);scene.list->SetGraphicsRootSignature(post_root.Get());
+                if(inline_late_srv)scene.list->SetGraphicsRoot32BitConstant(1,source_slot,0);
                 scene.list->SetPipelineState(post_pso.Get());
             }
             if (other_writer) { // the final scene write is a draw with another pipeline
                 scene.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-                scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart());
+                scene.list->SetGraphicsRootDescriptorTable(0, post_gpu());
                 scene.list->DrawInstanced(3, 1, 0, 0);
             }
             std::swap(rd2.Transition.StateBefore, rd2.Transition.StateAfter);
             scene.list->ResourceBarrier(1, &rd2);
             scene.list->OMSetRenderTargets(1, &post_rtv, FALSE, nullptr);
-            scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart()); // final scene binding
+            scene.list->SetGraphicsRootDescriptorTable(0, post_gpu()); // final scene binding
             if (inline_consumer) scene.list->SetPipelineState(final_post_pso.Get());
             if (inline_consumer_tail && pan_frame>=12 && pan_frame%4==0) {
                 // An optional scene segment appears AFTER the previously final
@@ -675,7 +713,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                 std::swap(rd2.Transition.StateBefore,rd2.Transition.StateAfter);scene.list->ResourceBarrier(1,&rd2);
                 scene.list->OMSetRenderTargets(1,&post_rtv,FALSE,nullptr);
                 scene.list->SetDescriptorHeaps(1,ph);scene.list->SetGraphicsRootSignature(post_root.Get());
-                scene.list->SetGraphicsRootDescriptorTable(0,post_heap->GetGPUDescriptorHandleForHeapStart());
+                scene.list->SetGraphicsRootDescriptorTable(0,post_gpu());
                 scene.list->SetPipelineState(final_post_pso.Get());
             }
             // Legacy boundary matcher: injected at the final read transition. Consumer anchor
@@ -717,7 +755,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             ID3D12DescriptorHeap* heaps2[] = {post_heap.Get()};
             consumer.list->SetDescriptorHeaps(1, heaps2);
             consumer.list->SetGraphicsRootSignature(post_root.Get());
-            consumer.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart());
+            consumer.list->SetGraphicsRootDescriptorTable(0, post_gpu());
             D3D12_RESOURCE_BARRIER b[] = {
                 test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
                 test::Transition(post_color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)};
@@ -738,7 +776,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             consumer.list->OMSetRenderTargets(1,&post_rtv,FALSE,nullptr);
             ID3D12DescriptorHeap* ph[]={post_heap.Get()};consumer.list->SetDescriptorHeaps(1,ph);
             consumer.list->SetGraphicsRootSignature(post_root.Get());consumer.list->SetPipelineState(final_post_pso.Get());
-            consumer.list->SetGraphicsRootDescriptorTable(0,post_heap->GetGPUDescriptorHandleForHeapStart());
+            consumer.list->SetGraphicsRootDescriptorTable(0,post_gpu());
             D3D12_VIEWPORT v{0,0,float(W),float(H),0,1};D3D12_RECT r{0,0,LONG(W),LONG(H)};
             consumer.list->RSSetViewports(1,&v);consumer.list->RSSetScissorRects(1,&r);
             consumer.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);consumer.list->DrawInstanced(3,1,0,0);
@@ -796,7 +834,25 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         na::j2::OnPresent(q);
         if (capture) na::capture::j2::OnPresent(q, presented.Get(), &PlainExecute);
         d.WaitIdle();
+        if(inline_late_srv && pan_frame>=8){
+            // Offline GPU witness: the consumer's pixels, not the successful NGX counter.
+            const auto desc=post_rt->GetDesc();D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};UINT64 bytes=0;
+            dev->GetCopyableFootprints(&desc,0,1,0,&fp,nullptr,nullptr,&bytes);
+            auto rb=test::CreateBuffer(dev,bytes,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);REQUIRE(rb);
+            test::List copy;REQUIRE(copy.Create(dev));auto b=test::Transition(post_rt.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_SOURCE);
+            copy.list->ResourceBarrier(1,&b);D3D12_TEXTURE_COPY_LOCATION from{},to{};
+            from.pResource=post_rt.Get();from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            to.pResource=rb.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=fp;
+            copy.list->CopyTextureRegion(&to,0,0,0,&from,nullptr);std::swap(b.Transition.StateBefore,b.Transition.StateAfter);copy.list->ResourceBarrier(1,&b);
+            REQUIRE(SUCCEEDED(copy.list->Close()));ID3D12CommandList* lists[]={copy.list.Get()};PlainExecute(q,1,lists);d.WaitIdle();
+            void* data=nullptr;REQUIRE(SUCCEEDED(rb->Map(0,nullptr,&data)));uint16_t rgb[3]{};
+            std::memcpy(rgb,static_cast<uint8_t*>(data)+fp.Offset+fp.Footprint.RowPitch*(H/2)+8*(W/2),sizeof rgb);rb->Unmap(0,nullptr);
+            ++delivery_checks;if(rgb[0]==0 && rgb[1]==0 && rgb[2]==0)++delivered;
+            printf("delivery frame %d slot %u pixel %04x %04x %04x evals %llu\n",pan_frame,source_slot,rgb[0],rgb[1],rgb[2],(unsigned long long)na::j2::GetStats().frames);
+            CHECK(rgb[0]==0 && rgb[1]==0 && rgb[2]==0);
+        }
         const auto ps = na::observe::GetProducerStats();
+        if(inline_late_srv)CHECK(source_slot?ps.wide_scene_reads>wide_before:ps.wide_scene_reads==wide_before);
         std::printf("producers: known disabled %u unknown_inflight %u entries %llu unhooked_queues %llu clears %llu sample_known %llu\n",
                     ps.known_store_disabled, ps.known_unknown_inflight, (unsigned long long)ps.known_entries, (unsigned long long)ps.unhooked_queues,
                     (unsigned long long)ps.known_state_clears, (unsigned long long)ps.sample_known_state);
@@ -841,6 +897,8 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             const std::string meta = ReadText(b + L"meta.json");
             CHECK(meta.find(auto_inline ? "\"route\": 2," : "\"route\": 1,") != std::string::npos);
             CHECK(meta.find("\"frame_closed\": true") != std::string::npos);
+            CHECK(meta.find("\"placement\": ") != std::string::npos);
+            CHECK(meta.find("\"at_close\": 0") != std::string::npos);
             const size_t at = meta.find("\"present_ordinal\": ");
             CHECK(at != std::string::npos);
             const uint64_t ordinal = at == std::string::npos ? 0 : std::strtoull(meta.c_str() + at + 19, nullptr, 10);
@@ -862,6 +920,12 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         if (inline_record_first) REQUIRE(frame(1.0, true) == 0);
         const auto is = na::j2::GetStats();
         if (inline_consumer) {
+            if(inline_late_srv){
+                printf("late SRV delivery %u/%u; evaluated %llu/%d, close %llu\n",delivered,delivery_checks,(unsigned long long)is.frames,frames,(unsigned long long)is.close_recovered);
+                CHECK(delivered==delivery_checks && delivery_checks==17);
+                CHECK(is.frames==uint64_t(frames-1) && is.inline_late_writes==0 && is.no_state==0 && is.no_camera==0);
+                return test::finish("j2_anno_shape_test (late SRV delivery)");
+            }
             std::printf("changing final writer: %llu/%d frames evaluated, late writes %llu, camera failures %llu\n",
                 (unsigned long long)is.frames,frames,(unsigned long long)is.inline_late_writes,(unsigned long long)is.no_camera);
             CHECK(inline_consumer_gap ? is.frames==uint64_t(frames-1) : inline_consumer_tail ? is.frames>=uint64_t(frames-3) : is.frames == uint64_t(frames-3));

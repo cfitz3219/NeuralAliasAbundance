@@ -2039,6 +2039,7 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
     g.inl.history = pending;
     g.inl.valid = true;
     g.inl.at_close = closing;
+    na::capture::j2::AnnotatePlacement(pending.capture,matched_mode,closing);
     g.inl_frame = g.frame;
     ++g.stats.inline_recorded;
     if (matched_mode == kByClass) ++g.stats.class_matched;

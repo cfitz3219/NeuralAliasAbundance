@@ -252,6 +252,7 @@ struct ProducerStats {
     uint32_t known_unknown_inflight; // incomplete submissions currently between Begin and End
     uint64_t known_entries;          // eligible textures in the store
     uint64_t unhooked_queues;        // queues whose table differs from the hooked one
+    uint64_t wide_scene_reads;      // selected scene SRV found beyond a table range's first64 descriptors
 };
 ProducerStats GetProducerStats();
 // Process exit: object retirement becomes a no-op (the CRT is about to destroy, or has
