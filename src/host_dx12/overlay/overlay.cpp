@@ -2713,10 +2713,30 @@ float g_small_asked = -1.f; // the scale last asked of the game (presenter threa
 void small_follow_mode()
 {
     namespace np = na::native_present;
-    np::ExpireResize();
+    const bool expired = np::ExpireResize();
     const int mode = (std::min)(static_cast<int>(na::settings::Get().j2_scale_mode.load()), 3); // no Ultra Performance here
     const float f = mode > 0 ? static_cast<float>(na::scale::FractionForMode(mode)) : 1.f;
     if (g_small_asked < 0.f) g_small_asked = na::present::RenderScale(); // the boot scale needs no request
+    // A request the game never completed (expired) or proxies that are not at the mode's size:
+    // ask again, at most every 2 s, so the game and the proxies cannot stay at different sizes
+    // (crash run a6f3f18: proxies 2293x960 with the game's scene at 2000x837, DLSS never ran).
+    {
+        static uint64_t last_retry = 0;
+        const uint64_t now = GetTickCount64();
+        const np::SizeState st = np::GetSizeState();
+        if (st.enabled && f == g_small_asked && now - last_retry > 2000) {
+            const np::Size want = small_render_for(st.output, static_cast<double>(f));
+            const bool idle = st.requested.w == 0 && st.requested.h == 0;
+            if (expired || (idle && (st.render.w != want.w || st.render.h != want.h))) {
+                last_retry = now;
+                char row[160];
+                snprintf(row, sizeof(row), "mode_retry %s render=%ux%u want=%ux%u\r\n", expired ? "expired" : "mismatch",
+                         static_cast<unsigned>(st.render.w), static_cast<unsigned>(st.render.h), static_cast<unsigned>(want.w), static_cast<unsigned>(want.h));
+                status_note(row);
+                if (st.render.w != want.w || st.render.h != want.h) np::RequestRenderSize(want);
+            }
+        }
+    }
     static bool crash_capture_on = false;
     if (!crash_capture_on) { crash_capture_on = true; AddVectoredExceptionHandler(0, &crash_capture); }
     if (f == g_small_asked) return;

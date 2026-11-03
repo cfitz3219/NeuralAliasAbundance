@@ -240,6 +240,9 @@ State& g = *new State;
 // Projection window, read by the scissor hook on game recording threads (no g.m there).
 std::atomic<bool> g_window_enabled{false};
 std::atomic<bool> g_render_small{false};
+// Render-small: presents in a row shown stretched (no DLSS). A stretched frame shows the
+// jittered picture as it is, so jitter stops after a few of them and resumes with DLSS.
+std::atomic<uint32_t> g_small_stretch_streak{0};
 std::atomic<ExecuteFn> g_forward{nullptr}; // the host's original ExecuteCommandLists (for PresentUpscale)
 constexpr uint64_t kSmallViewId = kViewId + 1; // render-small: DLSS on the finished picture, its own history
 std::atomic<bool> g_window_scissor{false};
@@ -1068,7 +1071,8 @@ void jitter_batch_impl(ID3D12CommandList* const* lists, UINT count)
     // (and windowing) through a frame without DLAA rather than show a full-size frame
     // on the windowed recordings' clipped targets.
     if (!g.jitter_on || (g.inline_mode && g.inline_sample_locked && !g.jit.valid) ||
-        g.camera_param < 0 || g.camera_offset < 0 || (!running && !window_now()) || !g.w) return;
+        g.camera_param < 0 || g.camera_offset < 0 || (!running && !window_now()) || !g.w ||
+        (g_render_small.load(std::memory_order_relaxed) && g_small_stretch_streak.load(std::memory_order_relaxed) >= 3)) return;
     struct JB { uint64_t res, off; uint32_t size; bool slot, known; };
     // Every list of the batch is listed (cf65722: listing stopped at 256 blocks, so under
     // zooming later lists, camera copies included, were never seen: 31035 capped batches).
@@ -3064,6 +3068,7 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
     g_small.slot = (si + 1) % kRing;
     if (dlss) { ++g.stats.small_dlss; if (g.stats.small_note[0] && std::strstr(g.stats.small_note, "stretched")) g.stats.small_note[0] = 0; }
     else ++g.stats.small_stretched;
+    g_small_stretch_streak.store(dlss ? 0u : g_small_stretch_streak.load(std::memory_order_relaxed) + 1u, std::memory_order_relaxed);
     return true;
 }
 
