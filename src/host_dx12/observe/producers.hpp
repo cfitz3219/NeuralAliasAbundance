@@ -188,6 +188,23 @@ bool ListRasterScissors(ID3D12CommandList* list, RasterScissors& out);
 // HostWorkScope (commands it records are host work). Null = none (default).
 using RasterStateListener = void (*)(ID3D12GraphicsCommandList* list, const RasterScissors& state);
 void SetRasterStateListener(RasterStateListener listener);
+// Native HUD (render-small): what the next draw of this recording will use, read in one
+// lock: first render target and depth, the game's viewports and scissors (host overrides
+// are never observed), and the bound pipeline's target formats and blending. False when the
+// recording is unknown. `restorable` = RestoreBindingState can hand back targets, viewports
+// and scissors (raster tracking was on at this recording's Reset).
+struct DrawState {
+    uint64_t recording = 0;
+    na_object_id rt = 0, ds = 0;
+    uint32_t rt_count = 0;
+    bool restorable = false, pipeline_known = false;
+    uint32_t pso_rt_count = 0, rtv_format = 0, dsv_format = 0, samples = 0;
+    uint32_t blend_mask = NA_UNKNOWN_U32, depth_enable = NA_UNKNOWN_U32, depth_func = NA_UNKNOWN_U32;
+    uint32_t viewport_count = 0, scissor_count = 0;
+    float viewports[16][6]{};   // x, y, width, height, min depth, max depth
+    int32_t scissors[16][4]{};  // left, top, right, bottom
+};
+bool ListDrawState(ID3D12CommandList* list, DrawState& out);
 // Identity of the list's current recording (changes on every Reset); 0 if unknown.
 uint64_t ListRecording(ID3D12CommandList* list);
 // True when this recording cleared `target` with ClearRenderTargetView.

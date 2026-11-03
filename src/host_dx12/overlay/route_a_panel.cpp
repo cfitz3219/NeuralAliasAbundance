@@ -24,6 +24,7 @@
 #include "host_dx12/capture/frame_capture.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/fg/frame_gen.hpp"
+#include "host_dx12/j2/native_hud.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
 #include "host_dx12/j2/compute_flow.hpp"
@@ -973,10 +974,22 @@ void DrawLiveDlaa()
         if (ImGui::IsItemDeactivatedAfterEdit()) na::settings::Save();
         EndRow();
     }
+    if (na::j2::RenderSmall() && na::j2::native_hud::Installed()) {
+        bool on = na::j2::native_hud::Enabled();
+        BeginRow("Native-resolution HUD", "Draws the game's HUD and text at your screen's full resolution, on top of the DLSS picture, instead of upscaling them with the 3D scene. DLSS then gets the scene without the HUD. Off draws the HUD at render size as before. Not saved.", SwitchWidth());
+        if (Switch("j2nativehud", &on)) na::j2::native_hud::SetEnabled(on);
+        EndRow();
+        if (!na::j2::HudMaskEnabled()) {
+            bool view = na::j2::HudMaskView();
+            BeginRow("Show HUD layer", "Tints in pink what is drawn as native-resolution HUD, to check it. Not saved.", SwitchWidth());
+            if (Switch("j2hudview", &view)) na::j2::SetHudMaskView(view);
+            EndRow();
+        }
+    }
     if (na::j2::RenderSmall() && na::j2::HudMaskEnabled()) {
         na::settings::Settings& ss = na::settings::Get();
         int hud = static_cast<int>(ss.j2_hud_nis.load());
-        BeginRow("HUD sharpness (NIS)", "Keeps the game's HUD and text out of DLSS and upscales them with NVIDIA Image Scaling at this sharpness instead. Off sends the HUD through DLSS with the 3D picture. The HUD is found within a few frames (from our camera jitter, and from camera movement when the game's own anti-aliasing hides the jitter).", S(220));
+        BeginRow("HUD sharpness (NIS)", "Experimental fallback ([present] hud_mask=1). Guesses which pixels are HUD from the picture and replaces them with an NVIDIA Image Scaling copy at this sharpness. The HUD is still part of what DLSS gets, and a wrong guess shows unsmoothed scenery. Not used on frames where the native-resolution HUD works.", S(220));
         ImGui::SetNextItemWidth(S(220));
         if (ImGui::SliderInt("##j2hudnis", &hud, 0, 100, hud ? "%d%%" : "Off", ImGuiSliderFlags_AlwaysClamp)) ss.j2_hud_nis.store(static_cast<uint32_t>(hud));
         if (ImGui::IsItemDeactivatedAfterEdit()) na::settings::Save();

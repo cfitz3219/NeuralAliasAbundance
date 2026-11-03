@@ -2,6 +2,7 @@
 #include "host_dx12/j2/msaa_resolve.hpp"
 #include "host_dx12/j2/nis_sharpen.hpp"
 #include "host_dx12/j2/nis_scaler.hpp"
+#include "host_dx12/j2/native_hud.hpp"
 #include "host_dx12/j2/route_selector.hpp"
 #include "host_dx12/j2/consumer_profile.hpp"
 #include "host_dx12/j2/jitter_writes.hpp"
@@ -2476,14 +2477,15 @@ struct SmallRing {
     // uses), hudup = NIS-upscaled frame at output size (RGBA16F, UAV between uses).
     bool hud_tried = false, hud_ok = false;
     ComPtr<ID3D12RootSignature> hud_root;
-    ComPtr<ID3D12PipelineState> hud_pso[4]; // classify, dilate, composite, clear
-    ComPtr<ID3D12DescriptorHeap> hud_heap;  // kRing x 4 passes x (3 SRV, 4 UAV)
+    ComPtr<ID3D12PipelineState> hud_pso[5]; // classify, dilate, composite, clear, layer (native HUD)
+    ComPtr<ID3D12DescriptorHeap> hud_heap;  // kRing x 5 passes x (3 SRV, 4 UAV)
     ComPtr<ID3D12Resource> prev, hud, mask, hudup;
     ComPtr<ID3D12Resource> hud_stats; // 4 uints: per frame parity, detailed pixels and still ones
     uint32_t hud_parity = 0;
     uint32_t hud_w = 0, hud_h = 0, up_w = 0, up_h = 0;
     DXGI_FORMAT prev_f = DXGI_FORMAT_UNKNOWN;
     bool prev_valid = false;
+    bool hud_fresh = true; // the evidence is from before a gap: start over at the next classify
 } g_small;
 na::j2::NisScaler g_hud_nis;
 std::atomic<bool> g_hud_view{false}; // tint HUD pixels (menu: Show HUD mask)
@@ -2497,7 +2499,7 @@ RWTexture2D<float> u1 : register(u1);
 RWTexture2D<float> u2 : register(u2);
 RWByteAddressBuffer stats : register(u3);
 SamplerState s_lin : register(s0);
-// flags: 1 = tint the HUD (composite), 2 = the camera is jittered this frame. cur = parity.
+// flags: 1 = tint the HUD (composite), 2 = the camera is jittered this frame, 4 = forget old evidence. cur = parity.
 cbuffer C : register(b0) { uint w; uint h; uint ow; uint oh; uint flags; uint cur; uint p1; uint p2; };
 groupshared uint gs_detail, gs_still;
 float luma(float3 c) { return dot(min(c, 1.0), float3(0.299, 0.587, 0.114)); }
@@ -2525,12 +2527,16 @@ void classify(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         const uint other = (cur ^ 1u) * 8u;
         const uint pd = stats.Load(other), ps = stats.Load(other + 4u);
         const bool jitter_seen = (flags & 2u) != 0u && pd > 2000u && ps * 2u < pd;
-        float e = u1[p];
+        // flags 4: start over (after a gap or a camera cut, old evidence describes another picture).
+        float e = (flags & 4u) != 0u ? 0.0 : u1[p];
+        // A large change is scene evidence even where the picture is now flat (Sol HUD-R2: a HUD
+        // element that disappears over a flat background must not stay HUD forever).
+        if (d > 0.04) e -= 0.5;
         if (hi - lo > 0.1) {
             uint dummy;
             InterlockedAdd(gs_detail, 1u, dummy);
             if (d < 0.006) InterlockedAdd(gs_still, 1u, dummy);
-            if (d > 0.04) e -= 0.5;
+            if (d > 0.04) {}
             else if (d < 0.006 && dot(m, m) >= 1.0) e += 0.25;
             else if (d < 0.006 && jitter_seen) e += 0.125;
         }
@@ -2567,6 +2573,28 @@ void composite(uint3 id : SV_DispatchThreadID) {
     float3 o = lerp(s.rgb, t1[id.xy].rgb, m);
     if (flags & 1u) o = lerp(o, float3(1, 0, 1), 0.5 * m);
     u0[id.xy] = float4(o, s.a);
+}
+// Native HUD (native_hud.hpp): t0 the DLSS (+RCAS) picture, t1 the HUD drawn over black, t2 the
+// HUD drawn over grey (asfloat(p1), as read through t1/t2), all output size; u0 result.
+// Per channel the game's blending is out = a + dst * b: a = t1, b = (t2 - t1) / grey.
+// flags: 1 = tint where there is HUD, 4 = the HUD was drawn through an sRGB view (blend in
+// linear; the picture is stored encoded).
+float3 srgb_to_linear(float3 c) { return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4); }
+float3 linear_to_srgb(float3 c) { c = saturate(c); return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1.0 / 2.4) - 0.055; }
+[numthreads(8, 8, 1)]
+void layer(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= ow || id.y >= oh) return;
+    const float4 s = t0[id.xy];
+    const float3 d = (flags & 4u) ? srgb_to_linear(s.rgb) : s.rgb;
+    const float3 a = t1[id.xy].rgb;
+    const float3 b = saturate((t2[id.xy].rgb - a) / asfloat(p1));
+    float3 o = a + d * b;
+    if (flags & 1u) {
+        const float hud = saturate(max(1.0 - min(b.r, min(b.g, b.b)), max(a.r, max(a.g, a.b)) * 8.0));
+        o = lerp(o, float3(1, 0, 1), 0.5 * hud);
+    }
+    if (flags & 4u) o = linear_to_srgb(o);
+    u0[id.xy] = float4(o, s.a);
 })";
 bool hud_init()
 {
@@ -2595,8 +2623,8 @@ bool hud_init()
     if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
         FAILED(dev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&g_small.hud_root))))
         return false;
-    const char* entries[4] = {"classify", "dilate", "composite", "clear"};
-    for (int i = 0; i < 4; ++i) {
+    const char* entries[5] = {"classify", "dilate", "composite", "clear", "layer"};
+    for (int i = 0; i < 5; ++i) {
         ComPtr<ID3DBlob> code, cerr;
         if (FAILED(D3DCompile(kHudHlsl, sizeof(kHudHlsl) - 1, "j2_small_hud.hlsl", nullptr, nullptr, entries[i], "cs_5_0",
                               D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &cerr)))
@@ -2606,7 +2634,7 @@ bool hud_init()
         pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
         if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_small.hud_pso[i])))) return false;
     }
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRing * 28, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRing * 35, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_small.hud_heap)))) return false;
     D3D12_HEAP_PROPERTIES bhp{D3D12_HEAP_TYPE_DEFAULT};
     D3D12_RESOURCE_DESC bd{};
@@ -2631,7 +2659,7 @@ bool hud_targets(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, u
     D3D12_RESOURCE_DESC fd = frame->GetDesc();
     if (!g_small.prev || g_small.hud_w != rw || g_small.hud_h != rh || g_small.prev_f != fd.Format) {
         g_small.prev.Reset(); g_small.hud.Reset(); g_small.mask.Reset();
-        g_small.prev_valid = false;
+        g_small.prev_valid = false; g_small.hud_fresh = true;
         D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
         D3D12_RESOURCE_DESC pd = fd;
         pd.Flags = D3D12_RESOURCE_FLAG_NONE;
@@ -2657,7 +2685,7 @@ void hud_pass(ID3D12GraphicsCommandList* l, int pass, uint32_t slot, ID3D12Resou
               ID3D12Resource* const uav[3], const DXGI_FORMAT uf[3], const uint32_t k[8], uint32_t gx, uint32_t gy)
 {
     ID3D12Device* dev = g_small.device.Get();
-    const UINT base = (slot * 4 + static_cast<UINT>(pass)) * 7;
+    const UINT base = (slot * 5 + static_cast<UINT>(pass)) * 7;
     D3D12_CPU_DESCRIPTOR_HANDLE c = g_small.hud_heap->GetCPUDescriptorHandleForHeapStart();
     c.ptr += static_cast<SIZE_T>(base) * g_small.inc;
     for (int i = 0; i < 3; ++i, c.ptr += g_small.inc) {
@@ -2805,6 +2833,37 @@ void small_stretch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Resou
     l->Dispatch((ow + 7) / 8, (oh + 7) / 8, 1);
 }
 void small_note(const char* t) { std::snprintf(g.stats.small_note, sizeof g.stats.small_note, "%s", t); }
+// Native HUD: lays this frame's HUD layers onto the upscaled picture. `cur` holds the picture
+// (UNORDERED_ACCESS, or NON_PIXEL_SHADER_RESOURCE when *cur_state says so) and is either `out`
+// or g_small.sharp; the result lands in the other one, which is returned (UNORDERED_ACCESS).
+// The layers go RENDER_TARGET -> NON_PIXEL_SHADER_RESOURCE -> RENDER_TARGET.
+ID3D12Resource* layer_composite(ID3D12GraphicsCommandList* l, uint32_t si, ID3D12Resource* cur, ID3D12Resource* out, UINT* out_state,
+                                DXGI_FORMAT of, uint32_t ow, uint32_t oh, const na::j2::native_hud::Layer& layer,
+                                std::vector<D3D12_RESOURCE_BARRIER>& b)
+{
+    constexpr UINT RT = D3D12_RESOURCE_STATE_RENDER_TARGET, NPSR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                   UAV = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    ID3D12Resource* sharp = g_small.sharp.Get();
+    ID3D12Resource* dst = cur == out ? sharp : out;
+    if (cur == out) { b.push_back(uav_barrier(out)); add(b, out, *out_state, NPSR); *out_state = NPSR; }
+    else { b.push_back(uav_barrier(sharp)); add(b, sharp, UAV, NPSR); add(b, out, *out_state, UAV); *out_state = UAV; }
+    add(b, layer.n0, RT, NPSR);
+    add(b, layer.n1, RT, NPSR);
+    flush(l, b);
+    uint32_t grey_bits = 0;
+    std::memcpy(&grey_bits, &layer.grey, 4);
+    const uint32_t k[8] = {ow, oh, ow, oh, (g_hud_view.load(std::memory_order_relaxed) ? 1u : 0u) | (layer.srgb ? 4u : 0u), 0, grey_bits, 0};
+    ID3D12Resource* const srv[3] = {cur, layer.n0, layer.n1};
+    const DXGI_FORMAT sf[3] = {of, layer.view, layer.view};
+    ID3D12Resource* const uav[3] = {dst, nullptr, nullptr};
+    const DXGI_FORMAT uf[3] = {of, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
+    hud_pass(l, 4, si, srv, sf, uav, uf, k, (ow + 7) / 8, (oh + 7) / 8);
+    b.push_back(uav_barrier(dst));
+    add(b, layer.n0, NPSR, RT);
+    add(b, layer.n1, NPSR, RT);
+    if (cur == sharp) add(b, sharp, NPSR, UAV);
+    return dst;
+}
 
 } // namespace
 
@@ -2813,54 +2872,16 @@ bool RenderSmall() { return g_render_small.load(); }
 void SetHudMaskView(bool on) { g_hud_view.store(on); }
 void SetHudMaskEnabled(bool on) { g_hud_mask_on.store(on); }
 bool HudMaskEnabled() { return g_hud_mask_on.load(); }
-// Native-HUD investigation (render-small): every render-target bind of a frame (target, depth,
-// first scissor) and the presented proxy's id, so a run's log shows where the HUD is drawn.
-namespace {
-struct HudBind { uint64_t recording; na_object_id rt, ds; int32_t sw, sh; uint32_t rects; };
-std::mutex g_probe_m;
-std::vector<HudBind> g_probe_cur;
-std::string g_probe_last;
-uint64_t g_probe_frames = 0;
-void hud_probe(ID3D12GraphicsCommandList* list, const na::observe::RasterScissors& s)
-{
-    na_object_id rt = 0, ds = 0;
-    na::observe::ListCurrentTargets(list, &rt, &ds);
-    std::lock_guard<std::mutex> lock(g_probe_m);
-    if (g_probe_cur.size() >= 128) return;
-    if (!g_probe_cur.empty() && g_probe_cur.back().recording == s.recording && g_probe_cur.back().rt == rt && g_probe_cur.back().ds == ds) return;
-    HudBind b{s.recording, rt, ds, 0, 0, s.count};
-    if (s.count) { b.sw = s.rects[0].right - s.rects[0].left; b.sh = s.rects[0].bottom - s.rects[0].top; }
-    g_probe_cur.push_back(b);
-}
-void hud_probe_present(ID3D12Resource* frame)
-{
-    std::lock_guard<std::mutex> lock(g_probe_m);
-    if (++g_probe_frames % 120 == 1) { // one frame in 120 is described
-        char head[96];
-        std::snprintf(head, sizeof head, "proxy=%llu binds=%zu:", static_cast<unsigned long long>(na::observe::IdOf(frame)), g_probe_cur.size());
-        std::string s = head;
-        uint64_t rec = 0;
-        uint32_t list_no = 0;
-        for (const auto& b : g_probe_cur) {
-            if (b.recording != rec) { rec = b.recording; ++list_no; }
-            char e[96];
-            std::snprintf(e, sizeof e, " L%u:rt=%lld,ds=%lld,sc=%dx%d", list_no, static_cast<long long>(b.rt), static_cast<long long>(b.ds), b.sw, b.sh);
-            s += e;
-        }
-        g_probe_last = s;
-    }
-    g_probe_cur.clear();
-}
-} // namespace
-void InstallHudProbe() { na::observe::SetRasterStateListener(&hud_probe); }
-std::string HudProbeLine() { std::lock_guard<std::mutex> lock(g_probe_m); return g_probe_last; }
 bool HudMaskView() { return g_hud_view.load(); }
 
 bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t rw, uint32_t rh,
                     ID3D12Resource* out, uint32_t ow, uint32_t oh, bool hdr, void*)
 {
     if (!queue || !frame || !out || !rw || !rh || !ow || !oh) return false;
-    hud_probe_present(frame);
+    // Native HUD: whether this frame's HUD was drawn into the native layers (then the proxy
+    // holds the scene only, which is what DLSS gets).
+    na::j2::native_hud::Layer layer;
+    const bool layer_frame = na::j2::native_hud::TakeFrame(frame, rw, rh, ow, oh, &layer);
     const ExecuteFn forward = g_forward.load(std::memory_order_relaxed);
     const na::observe::HostWorkScope host; // our list is never observed as the game's
     std::lock_guard<std::mutex> lock(g.m);
@@ -2892,8 +2913,11 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
     bool dlss = false;
     // HUD separation: on when [j2] hud_nis > 0, for SDR pictures, once the last frame is held.
     const uint32_t hud_nis = na::settings::Get().j2_hud_nis.load(std::memory_order_relaxed);
-    const bool hud_want = g_hud_mask_on.load(std::memory_order_relaxed) && hud_nis > 0 && !hdr && can_dlss && hud_init() &&
-                          hud_targets(frame, rw, rh, ow, oh);
+    const bool hud_want = !layer_frame && g_hud_mask_on.load(std::memory_order_relaxed) && hud_nis > 0 && !hdr && can_dlss &&
+                          hud_init() && hud_targets(frame, rw, rh, ow, oh);
+    const DXGI_FORMAT of = typed(out->GetDesc().Format);
+    const bool hud_layer = layer_frame && hud_init() && small_sharp_target(ow, oh, of);
+    if (layer_frame && !hud_layer) small_note("Render-small: the native HUD could not be laid on (no composite pass); HUD missing this frame.");
     bool hud_mask = false; // mask holds this frame's HUD (NON_PIXEL_SHADER_RESOURCE until the composite)
     const DXGI_FORMAT ff = typed(frame->GetDesc().Format);
     if (can_dlss) {
@@ -2901,7 +2925,9 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         flush(l, b);
         if (hud_want && g_small.prev_valid) {
             g_small.hud_parity ^= 1u;
-            const uint32_t k[8] = {rw, rh, ow, oh, (d.jx != 0.f || d.jy != 0.f) ? 2u : 0u, g_small.hud_parity, 0, 0};
+            const bool forget = g_small.hud_fresh || d.reset;
+            g_small.hud_fresh = false;
+            const uint32_t k[8] = {rw, rh, ow, oh, ((d.jx != 0.f || d.jy != 0.f) ? 2u : 0u) | (forget ? 4u : 0u), g_small.hud_parity, 0, 0};
             {
                 ID3D12Resource* const srv[3] = {nullptr, nullptr, nullptr};
                 const DXGI_FORMAT sf[3] = {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
@@ -2965,8 +2991,7 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
             // NIS over it where the mask says HUD. The picture moves between `out` and `sharp`
             // (`cur`); it ends in `out`, UNORDERED_ACCESS, as DLSS left it.
             const uint32_t pct = 2u * na::settings::Get().j2_sharpness.load(std::memory_order_relaxed);
-            const DXGI_FORMAT of = typed(out->GetDesc().Format);
-            const bool have_sharp = (pct || hud_mask) && small_sharp_target(ow, oh, of);
+            const bool have_sharp = (pct || hud_mask || hud_layer) && small_sharp_target(ow, oh, of);
             ID3D12Resource* sharp = g_small.sharp.Get();
             ID3D12Resource* cur = out;
             UINT out_state = UAV;
@@ -3003,6 +3028,10 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
                     ++g.stats.small_hud;
                 }
             }
+            if (hud_layer && have_sharp) {
+                cur = layer_composite(l, si, cur, out, &out_state, of, ow, oh, layer, b);
+                ++g.stats.small_hud_layer;
+            }
             if (cur == sharp) { // the picture is in `sharp`: back into `out`
                 constexpr UINT SRC = D3D12_RESOURCE_STATE_COPY_SOURCE, DST = D3D12_RESOURCE_STATE_COPY_DEST;
                 add(b, sharp, UAV, SRC);
@@ -3033,6 +3062,19 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         flush(l, b);
         small_stretch(l, frame, out, ow, oh, si);
         g.small_last = 0; // DLSS history is no longer the previous picture
+        if (hud_layer) { // the native HUD over the stretched scene, then back into `out`
+            UINT out_state = UAV;
+            layer_composite(l, si, out, out, &out_state, of, ow, oh, layer, b);
+            constexpr UINT SRC = D3D12_RESOURCE_STATE_COPY_SOURCE, DST = D3D12_RESOURCE_STATE_COPY_DEST;
+            ID3D12Resource* sharp = g_small.sharp.Get();
+            add(b, sharp, UAV, SRC);
+            add(b, out, out_state, DST);
+            flush(l, b);
+            l->CopyResource(out, sharp);
+            add(b, sharp, SRC, UAV);
+            add(b, out, DST, UAV);
+            ++g.stats.small_hud_layer;
+        }
     }
     // The HUD passes compare with this frame next time.
     if (hud_want) {
@@ -3046,6 +3088,7 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         g_small.prev_valid = true;
     } else if (!can_dlss || hud_nis == 0 || !g_hud_mask_on.load(std::memory_order_relaxed)) {
         g_small.prev_valid = false; // a gap: the next comparison would be against an old frame
+        g_small.hud_fresh = true;   // and the evidence describes an old picture
     }
     b.push_back(uav_barrier(out));
     add(b, frame, NPSR, PRESENT);
@@ -3118,7 +3161,7 @@ bool RecordRcasForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, I
 }
 bool CompileHudShadersForTests(char* why, size_t why_size)
 {
-    for (const char* entry : {"classify", "dilate", "composite", "clear"}) {
+    for (const char* entry : {"classify", "dilate", "composite", "clear", "layer"}) {
         ComPtr<ID3DBlob> code, err;
         if (FAILED(D3DCompile(kHudHlsl, sizeof(kHudHlsl) - 1, "j2_small_hud.hlsl", nullptr, nullptr, entry, "cs_5_0",
                               D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err))) {
@@ -3136,6 +3179,35 @@ bool RecordNisForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID
     const bool ok = g_nis.Dispatch(device, list, in, out, w, h, fmt, hdr, percent, 0);
     if (!ok && percent > 100) std::printf("NIS dispatch refused: %s\n", g_nis.Error());
     return ok;
+}
+bool RecordHudLayerForTests(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list, ID3D12Resource* picture, DXGI_FORMAT picture_format,
+                            ID3D12Resource* n0, ID3D12Resource* n1, DXGI_FORMAT view, float grey, bool srgb, ID3D12Resource* out,
+                            uint32_t w, uint32_t h)
+{
+    std::lock_guard<std::mutex> lock(g.m);
+    if (!small_init(queue) || !hud_init()) return false;
+    uint32_t grey_bits = 0;
+    std::memcpy(&grey_bits, &grey, 4);
+    const uint32_t k[8] = {w, h, w, h, srgb ? 4u : 0u, 0, grey_bits, 0};
+    ID3D12Resource* const srv[3] = {picture, n0, n1};
+    const DXGI_FORMAT sf[3] = {picture_format, view, view};
+    ID3D12Resource* const uav[3] = {out, nullptr, nullptr};
+    const DXGI_FORMAT uf[3] = {picture_format, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
+    hud_pass(list, 4, 0, srv, sf, uav, uf, k, (w + 7) / 8, (h + 7) / 8);
+    return true;
+}
+bool RecordHudClassifyForTests(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list, ID3D12Resource* cur, ID3D12Resource* prev,
+                               DXGI_FORMAT color_format, ID3D12Resource* motion, ID3D12Resource* evidence, uint32_t w, uint32_t h, uint32_t flags)
+{
+    std::lock_guard<std::mutex> lock(g.m);
+    if (!small_init(queue) || !hud_init()) return false;
+    const uint32_t k[8] = {w, h, w, h, flags, 0, 0, 0};
+    ID3D12Resource* const srv[3] = {cur, prev, motion};
+    const DXGI_FORMAT sf[3] = {color_format, color_format, DXGI_FORMAT_R32G32_FLOAT};
+    ID3D12Resource* const uav[3] = {nullptr, evidence, nullptr};
+    const DXGI_FORMAT uf[3] = {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_UNKNOWN};
+    hud_pass(list, 0, 0, srv, sf, uav, uf, k, (w + 7) / 8, (h + 7) / 8);
+    return true;
 }
 void SetDebugView(int mode) { g_debug_view.store(mode < 0 || mode > 3 ? 0 : mode); }
 int DebugView() { return g_debug_view.load(); }

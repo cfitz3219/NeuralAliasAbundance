@@ -5131,6 +5131,47 @@ bool ListRasterScissors(ID3D12CommandList* list, RasterScissors& out)
     std::memcpy(out.rects, ls->raster_scissors, out.count * sizeof(D3D12_RECT));
     return true;
 }
+bool ListDrawState(ID3D12CommandList* list, DrawState& out)
+{
+    DrawState r;
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load() || !ls->generation_known.load()) return false;
+    r.recording = ls->generation.load() + 1;
+    const bool complete = ls->coverage_complete.load();
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    r.rt = ls->cur_rt; r.ds = ls->cur_ds; r.rt_count = ls->cur_nrt;
+    r.restorable = complete && ls->raster_tracking && ls->restorable && !ls->in_render_pass && ls->raster_targets_known &&
+                   ls->raster_viewports_known && ls->raster_scissors_known;
+    if (ls->raster_viewports_known) {
+        r.viewport_count = ls->raster_viewport_count < 16 ? ls->raster_viewport_count : 16;
+        for (uint32_t i = 0; i < r.viewport_count; ++i) {
+            const D3D12_VIEWPORT& v = ls->raster_viewports[i];
+            const float f[6] = {v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth};
+            std::memcpy(r.viewports[i], f, sizeof f);
+        }
+    }
+    if (ls->raster_scissors_known) {
+        r.scissor_count = ls->raster_scissor_count < 16 ? ls->raster_scissor_count : 16;
+        for (uint32_t i = 0; i < r.scissor_count; ++i) {
+            const D3D12_RECT& c = ls->raster_scissors[i];
+            r.scissors[i][0] = c.left; r.scissors[i][1] = c.top; r.scissors[i][2] = c.right; r.scissors[i][3] = c.bottom;
+        }
+    }
+    const auto pipeline = ls->pso ? g_objs.find(canon(ls->pso)) : g_objs.end();
+    if (pipeline != g_objs.end() && pipeline->second.created.size() >= sizeof(na_ev_pipeline_created)) {
+        const auto* p = reinterpret_cast<const na_ev_pipeline_created*>(pipeline->second.created.data());
+        if (p->pipeline_kind == NA_PIPELINE_GRAPHICS || (p->pipeline_kind == NA_PIPELINE_STREAM && p->stage_hash[NA_STAGE_CS] == 0)) {
+            r.pipeline_known = true;
+            r.pso_rt_count = p->rt_count; r.rtv_format = p->rtv_formats[0]; r.dsv_format = p->dsv_format;
+            r.samples = p->sample_count; r.blend_mask = p->blend_enable_mask;
+            r.depth_enable = p->depth_enable; r.depth_func = p->depth_func;
+        }
+    }
+    out = r;
+    return true;
+}
 uint64_t ListRecording(ID3D12CommandList* list)
 {
     std::shared_lock<std::shared_mutex> rl(g_m);

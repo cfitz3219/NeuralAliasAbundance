@@ -9,6 +9,7 @@
 #include "host_dx12/host_boot/host_boot.hpp"
 #include "host_dx12/host_boot/session.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/j2/native_hud.hpp"
 #include "host_dx12/native_present/size_spoof.hpp"
 #include "host_dx12/j2/projection_window.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
@@ -255,7 +256,12 @@ DWORD WINAPI InitThread(LPVOID)
     na::j2::SetRenderSmall(render_small);
     if (render_small) {
         boot_log(na::native_present::InstallSizeHooks() ? "render-small: size hooks installed" : "render-small: size hooks FAILED");
-        na::j2::InstallHudProbe(); // logs where the HUD is drawn (status line native_hud)
+        // Native-resolution HUD (Sol's plan): the game's HUD draws go to native-size layers and
+        // DLSS gets the scene only. [present] native_hud=0 keeps the HUD in the proxy as before.
+        if (GetPrivateProfileIntW(L"present", L"native_hud", 1, g_ini) == 1) {
+            na::j2::native_hud::Install();
+            boot_log("render-small: native-resolution HUD on");
+        } else boot_log("render-small: native-resolution HUD off ([present] native_hud=0)");
         na::j2::SetHudMaskEnabled(GetPrivateProfileIntW(L"present", L"hud_mask", 0, g_ini) == 1);
         // Ultra Performance is not offered with render-small (the HUD would be drawn at 33%).
         if (na::settings::Get().j2_scale_mode.load() > 3) na::settings::Get().j2_scale_mode.store(3);

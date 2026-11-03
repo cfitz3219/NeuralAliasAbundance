@@ -47,6 +47,14 @@ bool RecordRcasForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, I
                         uint32_t w, uint32_t h, uint32_t percent, DXGI_FORMAT fmt);
 // Test hook: compiles the render-small HUD passes (classify, dilate, composite); false + why.
 bool CompileHudShadersForTests(char* why, size_t why_size);
+// Tests: the native-HUD composite (pass "layer") from `picture` and the two layers (all in
+// NON_PIXEL_SHADER_RESOURCE) into `out` (UNORDERED_ACCESS), and one HUD-mask classify pass
+// (cur/prev/motion readable, evidence R32_FLOAT in UNORDERED_ACCESS). Set up on `queue`'s device.
+bool RecordHudLayerForTests(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list, ID3D12Resource* picture, DXGI_FORMAT picture_format,
+                            ID3D12Resource* n0, ID3D12Resource* n1, DXGI_FORMAT view, float grey, bool srgb, ID3D12Resource* out,
+                            uint32_t w, uint32_t h);
+bool RecordHudClassifyForTests(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list, ID3D12Resource* cur, ID3D12Resource* prev,
+                               DXGI_FORMAT color_format, ID3D12Resource* motion, ID3D12Resource* evidence, uint32_t w, uint32_t h, uint32_t flags);
 // Test hook: the 101..200 % stage (NVIDIA Image Scaling sharpen-only) from `in`
 // (NON_PIXEL_SHADER_RESOURCE) into `out` (UNORDERED_ACCESS). <= 100 % records nothing.
 bool RecordNisForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* in, ID3D12Resource* out,
@@ -70,16 +78,14 @@ bool Jitter();
 // so a picture is always shown and the mode never switches itself off. Off by default.
 void SetRenderSmall(bool on);
 bool RenderSmall();
-// Render-small HUD separation: tint the pixels taken as HUD (diagnostic, not saved).
+// Render-small HUD: tint the pixels taken as HUD (diagnostic, not saved). With the native HUD
+// (native_hud.hpp) it tints where the native HUD layers draw; with the mask, the mask.
 void SetHudMaskView(bool on);
 // The pixel-guessing HUD mask + NIS ([present] hud_mask=1; off by default: in Anno it took
 // scenery for HUD and showed the raw jittered frame there).
 void SetHudMaskEnabled(bool on);
 bool HudMaskEnabled();
 bool HudMaskView();
-// Native-HUD investigation: logs every render-target bind of one frame in 120 (render-small).
-void InstallHudProbe();
-std::string HudProbeLine();
 // Render-small texture bias per DLSS mode (Cort, 2026-11-03; the menu is greyed out there):
 // Quality (67%) -1.585, Balanced (58%) -2, Performance (50%) -2.5. DLAA (scale 1) uses the
 // menu's choice.
@@ -295,7 +301,7 @@ struct Stats {
     uint64_t jitter_blocks_probed_out = 0; // blocks skipped after the 64-byte probe
     // Render-small: frames whose depth + motion were kept for Present; pictures DLSS upscaled at
     // Present / stretched (no fresh depth + motion) / not produced (the presenter kept its old one).
-    uint64_t small_deferred = 0, small_dlss = 0, small_stretched = 0, small_failed = 0, small_dlss_failed = 0, small_sharpened = 0, small_hud = 0;
+    uint64_t small_deferred = 0, small_dlss = 0, small_stretched = 0, small_failed = 0, small_dlss_failed = 0, small_sharpened = 0, small_hud = 0, small_hud_layer = 0;
     uint32_t small_rw = 0, small_rh = 0, small_ow = 0, small_oh = 0;
     char small_note[128] = {};
     uint64_t window_derived_forward = 0, window_derived_inverse = 0; // camera-derived matrices rebased (see window_derived)
