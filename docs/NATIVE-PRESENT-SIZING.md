@@ -21,6 +21,10 @@ desktop modes. They give the game a coherent client extent and map input to it.
 3. In game-facing GetDesc/GetDesc1 detours, filter the original return address
    through `GameCaller`, then call `RewriteDesc` / `RewriteDesc1`. The latter
    needs the HWND, obtained through the ORIGINAL chain or its recorded identity.
+   The main game EXE is registered automatically. An engine DLL can be added by
+   `RegisterGameModule(observedEngineCodeAddress)` from the boot/watch worker.
+   Unknown external overlays and system DLLs remain native; excluding only our
+   own DLL would otherwise inadvertently scale Steam's overlay input too.
    The presenter reads real descriptors: exclude our own module and use
    `NativeScope` for nested runtime calls. `GetFullscreenDesc` has no width or
    height fields. No display-mode or monitor lies are needed for these helpers.

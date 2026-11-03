@@ -36,6 +36,10 @@ struct GameScopeForTest {
     GameScopeForTest& operator=(const GameScopeForTest&) = delete;
 };
 bool GameCaller(const void* return_address);
+// Main EXE is registered automatically. If the engine's window/render code is
+// in a DLL, register an observed engine code address on the boot/watch worker.
+// Unknown injected overlays and system DLLs keep physical geometry/input.
+bool RegisterGameModule(const void* engine_code_address);
 
 // Install on the boot/watch worker only (not Present, WndProc or DllMain).
 // Uses the existing transactional hook owner. Hooks persist until the host's

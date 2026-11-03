@@ -6,6 +6,7 @@
 #include <thread>
 #include <atomic>
 using namespace na::native_present;
+extern "C" __declspec(dllimport) BOOL WINAPI FixtureClientRect(HWND,RECT*);
 namespace {
 struct Window {
     HWND hwnd = nullptr;
@@ -40,6 +41,7 @@ int main() {
                 CHECK(GetClientRect(a.hwnd,&r)); CHECK(r.right==2293);
             }
             CHECK(GetClientRect(a.hwnd,&r)); CHECK(r.right==physical.right); // same-module native exemption
+            CHECK(!GameCaller(reinterpret_cast<const void*>(&GetTickCount64))); // system callers stay native
             Detach(a.hwnd);
             { GameScopeForTest game; CHECK(GetClientRect(a.hwnd,&r)); CHECK(r.right==physical.right); }
         }},
@@ -52,6 +54,13 @@ int main() {
             CHECK(changed.right-changed.left==physical.right-physical.left-client.right+2293);
             RECT after{}; { NativeScope n; CHECK(GetWindowRect(w.hwnd,&after)); }
             CHECK(std::memcmp(&after,&physical,sizeof after)==0);
+        }},
+        {"foreign overlay stays native and registered engine DLL gets game geometry", [] {
+            Window w; CHECK(Attach(w.hwnd,{3440,1440},{2293,960})); RECT r{};
+            CHECK(FixtureClientRect(w.hwnd,&r)); CHECK(r.right==native_client(w.hwnd).right);
+            CHECK(RegisterGameModule(reinterpret_cast<const void*>(&FixtureClientRect)));
+            CHECK(FixtureClientRect(w.hwnd,&r)); CHECK(r.right==2293 && r.bottom==960);
+            { NativeScope native; CHECK(FixtureClientRect(w.hwnd,&r)); CHECK(r.right==native_client(w.hwnd).right); }
         }},
         {"descriptors preserve format flags refresh HWND and sample fields", [] {
             Window w; CHECK(Attach(w.hwnd,{3440,1440},{2293,960}));

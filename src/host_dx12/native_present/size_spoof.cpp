@@ -2,6 +2,7 @@
 #include "host_dx12/hooking/vtable_hook.hpp"
 #include <intrin.h>
 #include <atomic>
+#include <array>
 #include <cstdio>
 #include <limits>
 #include <mutex>
@@ -14,6 +15,10 @@ uint64_t g_next = 0;
 uint64_t g_request_tick = 0;
 thread_local unsigned t_native = 0, t_game = 0;
 uintptr_t g_module_begin = 0, g_module_end = 0;
+struct ModuleRange { uintptr_t begin = 0, end = 0; };
+std::array<ModuleRange,16> g_game_modules{};
+std::atomic<unsigned> g_game_module_count{0};
+std::mutex g_modules_mutex;
 bool g_installed = false;
 using RectFn = BOOL(WINAPI*)(HWND, LPRECT);
 RectFn g_client = nullptr, g_window = nullptr;
@@ -48,7 +53,27 @@ bool GameCaller(const void* caller) {
     if (t_native) return false;
     if (t_game) return true;
     const auto p = reinterpret_cast<uintptr_t>(caller);
-    return p && (p < g_module_begin || p >= g_module_end);
+    if (!p || (p >= g_module_begin && p < g_module_end)) return false;
+    const unsigned n = g_game_module_count.load(std::memory_order_acquire);
+    for (unsigned i=0;i<n;++i) if(p>=g_game_modules[i].begin && p<g_game_modules[i].end) return true;
+    return false;
+}
+bool RegisterGameModule(const void* address) {
+    if (!address) return false;
+    HMODULE module=nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(address),&module)) return false;
+    const auto base=reinterpret_cast<const unsigned char*>(module);
+    const auto dos=reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const auto nt=reinterpret_cast<const IMAGE_NT_HEADERS*>(base+dos->e_lfanew);
+    const uintptr_t begin=reinterpret_cast<uintptr_t>(base), end=begin+nt->OptionalHeader.SizeOfImage;
+    std::lock_guard<std::mutex> lock(g_modules_mutex);
+    const unsigned n=g_game_module_count.load(std::memory_order_relaxed);
+    for(unsigned i=0;i<n;++i) if(g_game_modules[i].begin==begin) return true;
+    if(n==g_game_modules.size()) return false;
+    g_game_modules[n]={begin,end};
+    g_game_module_count.store(n+1,std::memory_order_release);
+    return true;
 }
 bool InstallSizeHooks() {
     std::lock_guard<std::mutex> install(g_install_mutex);
@@ -61,6 +86,7 @@ bool InstallSizeHooks() {
     const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
     g_module_begin = reinterpret_cast<uintptr_t>(base);
     g_module_end = g_module_begin + nt->OptionalHeader.SizeOfImage;
+    if(!RegisterGameModule(GetModuleHandleW(nullptr))) return false;
     HMODULE u = GetModuleHandleW(L"user32.dll");
     if (!u || !na::hooking::Initialize()) return false;
     if (!na::hooking::BeginInstallWait("native-present size")) { na::hooking::Shutdown(); return false; }
