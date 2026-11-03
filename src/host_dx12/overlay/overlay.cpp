@@ -2810,7 +2810,15 @@ HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flag
     if (na::present::IsPresentThread()) return g_orig_present(sc, sync, flags); // never re-entered by design; safety
     if (!(flags & DXGI_PRESENT_TEST)) g_native_game_presents.fetch_add(1, std::memory_order_acq_rel);
     na::dlss::ReleaseIfDeviceRemoved(); // G2-004: never pin a removed device across the game's recovery
-    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc) && na::present::Proxied(sc)) return presenter_present(sc, sync, flags, nullptr);
+    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc) && na::present::Proxied(sc)) {
+        // Discovery must see the game's Present here too: without it, its frame never ends (scores add up
+        // from boot) and the swapchain size stays unknown, so after a render-size change a shadow map won
+        // the depth pick and the scene was never found again (Anno, 2026-11-03).
+        const auto observed = na::observe::PresentBegin(sc);
+        const HRESULT result = presenter_present(sc, sync, flags, nullptr);
+        na::observe::PresentEnd(observed, sync, flags, result);
+        return result;
+    }
     const auto observed = na::observe::PresentBegin(sc);
     na::nr::trace::Record("present_begin",sc);
     if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc)) on_present(sc);
@@ -2825,7 +2833,15 @@ HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT fl
     if (na::present::IsPresentThread()) return g_orig_present1(sc, sync, flags, pp);
     if (!(flags & DXGI_PRESENT_TEST)) g_native_game_presents.fetch_add(1, std::memory_order_acq_rel);
     na::dlss::ReleaseIfDeviceRemoved(); // G2-004: never pin a removed device across the game's recovery
-    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc) && na::present::Proxied(sc)) return presenter_present(sc, sync, flags, pp);
+    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc) && na::present::Proxied(sc)) {
+        // Discovery must see the game's Present here too: without it, its frame never ends (scores add up
+        // from boot) and the swapchain size stays unknown, so after a render-size change a shadow map won
+        // the depth pick and the scene was never found again (Anno, 2026-11-03).
+        const auto observed = na::observe::PresentBegin(sc);
+        const HRESULT result = presenter_present(sc, sync, flags, pp);
+        na::observe::PresentEnd(observed, sync, flags, result);
+        return result;
+    }
     const auto observed = na::observe::PresentBegin(sc);
     na::nr::trace::Record("present1_begin",sc);
     if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc)) on_present(sc);
