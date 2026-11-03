@@ -1,6 +1,7 @@
 // reconstructed 2026-10 — independent numerical truth and per-pixel provenance.
 #include "test_support.hpp"
 #include "core/motion_arbiter.hpp"
+#include "core/projection_window.hpp"
 #include <array>
 #include <algorithm>
 #include <cmath>
@@ -67,6 +68,9 @@ D16 inverse_d(const D16& m) {
     return o;
 }
 Mat4 f4(const D16& d) { Mat4 o{}; for (int i = 0; i < 16; ++i) o.m[i] = static_cast<float>(d[i]); return o; }
+D16 transpose_d(const D16& a) { D16 o{}; for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) o[c*4+r] = a[r*4+c]; return o; }
+// P4-4 projection window on a row-vector matrix (window_projection is column-vector).
+D16 window_row(const D16& m, double sx, double sy) { return transpose_d(neural_alias::window_projection(transpose_d(m), sx, sy)); }
 D16 mul_d(const D16& a, const D16& b) { D16 o{}; for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) for (int k = 0; k < 4; ++k) o[r*4+c] += a[r*4+k]*b[k*4+c]; return o; }
 }
 int main() { return test::run({
@@ -176,5 +180,52 @@ int main() { return test::run({
         CHECK(DeriveResidual({raw,1,1,2},c,current,previous,residual,valid,1,1));
         NEAR(valid[0],0,0); NEAR(residual[0],0,0);
         CHECK(!DeriveResidual({raw,2,1,4},c,current,previous,residual,valid,1,1));
+    }},
+    {"packed frame (P4-4 projection window): the corner of a native buffer gives the same motion", [] {
+        // The game draws the scene into the top-left ew x eh corner of its native W x H
+        // targets; J2 hands the arbiter the native depth with extent ew x eh and the
+        // logical (unwindowed) camera. That must equal a compact ew x eh frame exactly,
+        // read nothing outside the corner, and match what the windowed camera put on
+        // screen in native pixels (one render pixel is one native pixel).
+        const uint32_t W = 64, H = 32, ew = 43, eh = 18; // ~Quality ratio, odd sizes
+        const double sx = double(ew) / W, sy = double(eh) / H;
+        const D16 cur = cam_row_d(0.7, 4200.0, -6100.0), prev = cam_row_d(0.703, 4200.4, -6100.2);
+        std::array<float, W * H> packed; packed.fill(std::numeric_limits<float>::quiet_NaN());
+        std::array<float, ew * eh> compact{};
+        for (uint32_t y = 0; y < eh; ++y)
+            for (uint32_t x = 0; x < ew; ++x) {
+                const float z = (x + y) % 7 == 0 ? 1.f /* sky */ : .99f + .0001f * float((x * 13 + y * 7) % 90);
+                compact[y * ew + x] = z; packed[y * W + x] = z;
+            }
+        D16 id{}; id[0] = id[5] = id[10] = id[15] = 1;
+        auto logical = [&](const float* d, uint32_t stride) {
+            Tier2Input t{}; t.valid = true; t.depth = {d, ew, eh, stride};
+            t.inv_view_proj_current = f4(mul_d(inverse_d(cur), prev)); t.view_proj_previous = f4(id);
+            return t;
+        };
+        std::array<float, ew * eh * 2> oc{}, op{}; std::array<uint8_t, ew * eh> pc{}, pp{};
+        Output outc{oc.data(), pc.data(), ew, eh}, outp{op.data(), pp.data(), ew, eh};
+        Stats sc, sp;
+        CHECK(Arbitrate({}, logical(compact.data(), ew), {}, {}, outc, &sc));
+        CHECK(Arbitrate({}, logical(packed.data(), W), {}, {}, outp, &sp));
+        CHECK(sp.pixels_invalid == sc.pixels_invalid && sp.pixels_rejected == 0 && sp.pixels_camera == sc.pixels_camera);
+        CHECK(sp.pixels_camera > 0);
+        for (size_t i = 0; i < oc.size(); ++i) CHECK(oc[i] == op[i]);
+        for (size_t i = 0; i < pc.size(); ++i) CHECK(pc[i] == pp[i]);
+        // What the game drew: the windowed camera at native extent. Corner pixel (x,y)
+        // moves exactly as logical pixel (x,y) does at the corner extent.
+        const D16 wcur = window_row(cur, sx, sy), wprev = window_row(prev, sx, sy);
+        Tier2Input tw{}; tw.valid = true; tw.depth = {packed.data(), W, H, W};
+        tw.inv_view_proj_current = f4(mul_d(inverse_d(wcur), wprev)); tw.view_proj_previous = f4(id);
+        float worst = 0;
+        for (uint32_t y = 0; y < eh; ++y)
+            for (uint32_t x = 0; x < ew; ++x) {
+                const float z = compact[y * ew + x]; float vx = 0, vy = 0; bool off = false;
+                if (!ReprojectPixel(tw, W, H, x, y, z, &vx, &vy, &off)) continue;
+                const size_t i = (size_t(y) * ew + x) * 2;
+                worst = std::max(worst, std::max(std::fabs(vx - oc[i]), std::fabs(vy - oc[i + 1])));
+            }
+        std::printf("packed frame: worst windowed-vs-logical motion difference %.5f px\n", worst);
+        CHECK(worst < 0.01f);
     }},
 }); }

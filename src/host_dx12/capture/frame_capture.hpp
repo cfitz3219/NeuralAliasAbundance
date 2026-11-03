@@ -29,6 +29,11 @@ struct EvalInputs {
 // A44: `delay_ms` postpones the first captured frame so the user can close
 // the menu and move the camera first (Pending() stays false until then).
 void Request(uint32_t frames, const wchar_t* out_dir, uint32_t delay_ms = 0);
+// Presented frames only (no evaluate needed): every Present for `frames` presents, each with
+// the note last given to NotePresent (SE5 flashing, 2026-11-02: which presents flash, and what
+// J2 did on them). Same files: frameN-backbuffer.raw + frameN-meta.json ("note").
+void RequestPresents(uint32_t frames, const wchar_t* out_dir, uint32_t delay_ms = 0);
+void NotePresent(const char* text); // at most 240 characters; copied into the next present's meta
 bool Pending();
 // Milliseconds until an armed capture starts (0 when none or already started).
 uint32_t DelayRemainingMs();

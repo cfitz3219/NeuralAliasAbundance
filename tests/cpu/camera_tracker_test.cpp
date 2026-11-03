@@ -176,7 +176,7 @@ int main()
              for (uint32_t i = 0; i < 32; ++i) f = t.Update(neural_alias::jitter_projection(vp, shift, W, H), i + 1, W, H);
              CHECK(f.valid && std::abs(f.jitter_px_x) < 1e-6 && std::abs(f.jitter_px_y) < 1e-6);
          }},
-        {"cuts: teleport, fast turn, zoom and frame gaps reset history; ordinary motion does not", [] {
+        {"cuts: teleport, fast turn, an extreme FOV jump and frame gaps reset history; walking and scope zoom do not", [] {
              const Matrix p = Perspective(true, 1.0);
              CameraTracker t;
              CHECK(t.Update(Mul(p, View(0, 0, 0, 0)), 1, W, H).camera_cut);
@@ -187,8 +187,13 @@ int main()
              CHECK(t.Update(Mul(p, View(1.21, 200, 0, 0)), 12, W, H).camera_cut);       // camera missing 7 frames
              CameraTracker z;
              z.Update(Mul(p, View(0, 0, 0, 0)), 1, W, H);
-             Matrix zoom = p; zoom[0] *= 1.6; zoom[5] *= 1.6;                          // FOV change
-             CHECK(z.Update(Mul(zoom, View(0, 0, 0, 0)), 2, W, H).camera_cut);
+             Matrix zoom = p; zoom[0] *= 1.6; zoom[5] *= 1.6;                          // scope zoom: motion, not a cut
+             CHECK(!z.Update(Mul(zoom, View(0, 0, 0, 0)), 2, W, H).camera_cut);
+             Matrix x6 = p; x6[0] *= 6; x6[5] *= 6;                                    // 6x scope in one frame
+             CHECK(!z.Update(Mul(x6, View(0, 0, 0, 0)), 3, W, H).camera_cut);
+             Matrix wide = p; wide[0] *= 0.1; wide[5] *= 0.1;                          // a different camera entirely
+             const CameraFrame wf = z.Update(Mul(wide, View(0, 0, 0, 0)), 4, W, H);
+             CHECK(wf.camera_cut && wf.cut_reason == 5);
          }},
         {"previous-frame matrix for motion is the last unjittered camera, or the current one on a cut", [] {
              const Matrix p = Perspective(true, 1.0);
@@ -205,6 +210,27 @@ int main()
              Matrix world = View(0.3, 4, 5, 6); world[0] = 3; // scaled object transform
              CHECK(!t.Update(world, 2, W, H).valid);
              CHECK(!t.Update(Mul(Perspective(true, 1.0), View(0, 0, 0, 0)), 3, 0, H).valid);
+         }},
+        {"a missing camera frame is predicted at constant velocity", [] {
+             for (const bool reverse : {true, false})
+                 for (const double sign : {1.0, -1.0}) {
+                     const Matrix p = Perspective(reverse, sign);
+                     // Turning and walking at a constant rate: frame 3 follows from 1 and 2.
+                     const Matrix a = Mul(p, View(0.10, 1.0, 2, -3.0));
+                     const Matrix b = Mul(p, View(0.13, 1.5, 2, -3.4));
+                     const Matrix expect = Mul(p, Mul(Mul(View(0.13, 1.5, 2, -3.4), [&] {
+                         Matrix i{}; CHECK(Invert(View(0.10, 1.0, 2, -3.0), i)); return i; }()), View(0.13, 1.5, 2, -3.4)));
+                     CHECK(Close(ExtrapolateViewProjection(a, b), expect, 1e-9));
+                     // Pure yaw about a fixed point is exactly the next yaw.
+                     CHECK(Close(ExtrapolateViewProjection(Mul(p, View(0.2, 0, 0, 0)), Mul(p, View(0.25, 0, 0, 0))),
+                                 Mul(p, View(0.30, 0, 0, 0)), 1e-9));
+                     // A still camera stays exactly still.
+                     CHECK(Close(ExtrapolateViewProjection(b, b), b, 1e-12));
+                 }
+             // Unusable history: hold the last camera.
+             const Matrix b = Mul(Perspective(true, 1), View(0.13, 1.5, 2, -3.4));
+             Matrix zero{};
+             CHECK(Close(ExtrapolateViewProjection(zero, b), b, 0));
          }},
     });
 }

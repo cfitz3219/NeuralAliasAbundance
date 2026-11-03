@@ -62,7 +62,9 @@ struct State {
     std::atomic<bool> stop{false};
     HANDLE wake = nullptr;
 };
-State g;
+// Never destroyed (as frame_capture.cpp): its Slots' D3D12 copies would be released by the
+// CRT at exit, after observe's tables are gone (c0000005, SE5 2026-11-02).
+State& g = *new State;
 
 bool ensure_device(ID3D12Device* dev)
 {

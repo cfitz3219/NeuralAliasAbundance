@@ -1,0 +1,11 @@
+# Shared S1/S2 helper; root integration is owned by Opus.
+if(NOT TARGET host_native_present)
+  add_library(host_native_present STATIC size_spoof.cpp input_map.cpp)
+  target_include_directories(host_native_present PUBLIC "${CMAKE_CURRENT_LIST_DIR}/../..")
+  target_compile_features(host_native_present PUBLIC cxx_std_17)
+  target_compile_definitions(host_native_present PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
+  if(MSVC)
+    target_compile_options(host_native_present PRIVATE /W4 /WX /permissive- /utf-8)
+  endif()
+  target_link_libraries(host_native_present PUBLIC host_hooking user32)
+endif()

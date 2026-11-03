@@ -70,7 +70,9 @@ public:
 
     void Consume(const DecodedBatch& b, const na_observe_status& status) {
         if (session_ != status.session || epoch_ != status.epoch) {
+            const double max_ratio = max_ratio_;
             *this = UniversalHeuristics{};
+            max_ratio_ = max_ratio;
             session_ = status.session;
             epoch_ = status.epoch;
         }
@@ -272,6 +274,12 @@ public:
         return 0;
     }
 
+    // Render-small (P4-4): the game's whole scene is drawn at `min_scale` of the swapchain or more
+    // (Performance = 0.5, exactly half), so a buffer that small is not a half-res side buffer there.
+    // generic_depth's 1.85 limit stays for every other game.
+    void AllowRenderScale(double min_scale) {
+        if (min_scale > 0.0 && min_scale < 1.0) max_ratio_ = std::max(kGenericMaxRatio, 1.0 / min_scale + 0.01);
+    }
     uint32_t SwapchainWidth() const { return swap_w_; }
     uint32_t SwapchainHeight() const { return swap_h_; }
     const Metrics& Stats() const { return metrics_; }
@@ -317,6 +325,8 @@ private:
 
     uint64_t session_{}, epoch_{};
     uint32_t swap_w_{}, swap_h_{};
+    static constexpr double kGenericMaxRatio = 1.85;
+    double max_ratio_ = kGenericMaxRatio; // swapchain / buffer size; see AllowRenderScale
     std::map<uint64_t, na_ev_resource_created> resources_;
     std::map<uint64_t, Pipe> pipelines_;
     std::map<uint64_t, Recording> recordings_; // by list: the recording in progress or last closed
@@ -340,7 +350,7 @@ private:
         if (!swap_w_ || !swap_h_ || !w || !h) return false;
         const double delta = static_cast<double>(swap_w_) / swap_h_ - static_cast<double>(w) / h;
         const double w_ratio = static_cast<double>(swap_w_) / w, h_ratio = static_cast<double>(swap_h_) / h;
-        return std::abs(delta) <= 0.1 && w_ratio <= 1.85 && w_ratio >= 0.5 && h_ratio <= 1.85 && h_ratio >= 0.5;
+        return std::abs(delta) <= 0.1 && w_ratio <= max_ratio_ && w_ratio >= 0.5 && h_ratio <= max_ratio_ && h_ratio >= 0.5;
     }
     // Evicts the lowest list IDs over the cap, never `keep` (the recording the
     // caller is holding a reference to).

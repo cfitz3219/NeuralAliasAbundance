@@ -75,10 +75,11 @@ extern "C" int __cdecl AbundanceQueryProxyStatus(abundance::ProxyStatus* status)
 // [route_a] enabled=1 and [host] tag=ROUTE A in the ini). DllMain only spawns
 // the init thread when NeuralAliasHost.ini beside the DLL enables the host;
 // otherwise this stays a pure forwarder.
-BOOL WINAPI DllMain(HINSTANCE instance,DWORD reason,LPVOID) {
+BOOL WINAPI DllMain(HINSTANCE instance,DWORD reason,LPVOID reserved) {
     if(reason==DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(instance);
         na::host::StartFromIni(instance,L"NeuralAliasHost.ini","ROUTE B");
     }
+    if(reason==DLL_PROCESS_DETACH && reserved) na::host::NotifyProcessExit(); // before the CRT's static teardown
     return TRUE;
 }

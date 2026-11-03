@@ -189,6 +189,31 @@ int main() {
              CHECK(shadow_filtered && half_filtered);
              CHECK(ranked[0].last.queue == 7 && ranked[0].last.list == 5 && ranked[0].last.ticket == 3);
          }},
+        {"render-small Performance: a half-size scene depth passes, shadow and quarter-size still fail", [] {
+             // Anno at Performance renders 1720x720 for a 3440x1440 swapchain (2026-11-03).
+             Feed f;
+             f.h.AllowRenderScale(0.5);
+             f.Swapchain(1920, 1080);
+             f.Resource(3, 960, 540, 40);   // the scene depth, exactly half
+             f.Resource(4, 2048, 2048, 40); // shadow map
+             f.Resource(5, 480, 270, 40);   // quarter-size side buffer
+             f.Resource(6, 960, 540, 10);
+             f.Resource(7, 1920, 1080, 28);
+             f.Pipeline(10, 1, 1, 0);
+             f.Pipeline(11, 0, 0, 1);
+             f.Frame();
+             f.Frame();
+             f.Frame();
+             const auto ranked = f.h.RankDepth(4);
+             CHECK(!ranked.empty());
+             CHECK(ranked[0].resource == 3 && ranked[0].score > 0 && ranked[0].aspect_match);
+             bool shadow_filtered = false, quarter_filtered = false;
+             for (const auto& c : ranked) {
+                 if (c.resource == 4) shadow_filtered = c.score == 0 && !c.aspect_match;
+                 if (c.resource == 5) quarter_filtered = c.score == 0 && !c.aspect_match;
+             }
+             CHECK(shadow_filtered && quarter_filtered);
+         }},
         {"a loading-screen frame does not replace the last real frame", [] {
              Feed f;
              f.Swapchain(1920, 1080);

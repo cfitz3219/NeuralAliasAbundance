@@ -407,7 +407,8 @@ bool Arbiter::Dispatch(ID3D12GraphicsCommandList* list, const Inputs& in, const 
 bool Arbiter::DispatchDeriveResidual(ID3D12GraphicsCommandList* list, ID3D12Resource* raw_flow, ID3D12Resource* depth,
                                      const Inputs& camera, const float jitter_previous_px[2], ID3D12Resource* residual_out,
                                      ID3D12Resource* valid_out, uint32_t width, uint32_t height, uint32_t frame_slot,
-                                     ID3D12Resource* raw_valid)
+                                     ID3D12Resource* raw_valid,
+                                     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>* recording_heap)
 {
     if (!list || !pso_derive_ || !raw_flow || !depth || !residual_out || !valid_out || !jitter_previous_px ||
         width == 0 || height == 0 || frame_slot >= slots_ || !camera.tier2_valid_flag)
@@ -419,9 +420,14 @@ bool Arbiter::DispatchDeriveResidual(ID3D12GraphicsCommandList* list, ID3D12Reso
     if (!extent_ok(raw_flow) || !extent_ok(depth) || !extent_ok(residual_out) || !extent_ok(valid_out)) return false;
     if (raw_valid && !extent_ok(raw_valid)) return false;
 
+    // Optional recording-owned storage: old executable lists retain their
+    // descriptors; the caller reuses this heap only after that lease retires.
+    if(recording_heap && !*recording_heap){const auto hd=heap_->GetDesc();
+        if(FAILED(device_->CreateDescriptorHeap(&hd,IID_PPV_ARGS(recording_heap->ReleaseAndGetAddressOf()))))return false;}
+    auto* selected_heap=recording_heap?recording_heap->Get():heap_.Get();
     uint32_t base = frame_slot * 10;
     auto cpu = [&](uint32_t i) {
-        D3D12_CPU_DESCRIPTOR_HANDLE h = heap_->GetCPUDescriptorHandleForHeapStart();
+        D3D12_CPU_DESCRIPTOR_HANDLE h = selected_heap->GetCPUDescriptorHandleForHeapStart();
         h.ptr += static_cast<SIZE_T>(base + i) * stride_;
         return h;
     };
@@ -469,11 +475,11 @@ bool Arbiter::DispatchDeriveResidual(ID3D12GraphicsCommandList* list, ID3D12Reso
     c.width = width;
     c.height = height;
     c.flags = 4u | (raw_valid ? 32u : 0u); // tier 2 (+ raw validity supplied)
-    ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
+    ID3D12DescriptorHeap* heaps[] = {selected_heap};
     list->SetDescriptorHeaps(1, heaps);
     list->SetComputeRootSignature(root_.Get());
     list->SetPipelineState(pso_derive_.Get());
-    D3D12_GPU_DESCRIPTOR_HANDLE g = heap_->GetGPUDescriptorHandleForHeapStart();
+    D3D12_GPU_DESCRIPTOR_HANDLE g = selected_heap->GetGPUDescriptorHandleForHeapStart();
     g.ptr += static_cast<UINT64>(base) * stride_;
     list->SetComputeRootDescriptorTable(0, g);
     list->SetComputeRoot32BitConstants(1, sizeof(Constants) / 4, &c, 0);

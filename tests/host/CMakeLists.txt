@@ -14,7 +14,42 @@ function(na_host_test name)
 endfunction()
 
 na_host_test(fg_profile_test SOURCES fg_profile_test.cpp LIBS host_settings nvapi_headers)
+na_host_test(ffx_flow_test SOURCES ffx_flow_test.cpp LIBS host_ffx_flow dxgi LABELS gpu)
+if(NA_HAVE_NGX_SDK)
+  # Opus's optional CPU recording benchmark; uses a fake model and real DX12.
+  # It is deliberately not a CTest or part of the default/CI build.
+  add_executable(auto_scene_bench EXCLUDE_FROM_ALL auto_scene_bench.cpp)
+  target_link_libraries(auto_scene_bench PRIVATE abundance_options host_dx12)
+  target_include_directories(auto_scene_bench PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+  na_host_test(auto_scene_test SOURCES auto_scene_test.cpp LIBS host_dx12 LABELS gpu)
+  add_test(NAME host_auto_scene_stencil_test COMMAND auto_scene_test --stencil)
+  set_tests_properties(host_auto_scene_stencil_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+  add_test(NAME host_auto_scene_vector4_test COMMAND auto_scene_test --vector4)
+  set_tests_properties(host_auto_scene_vector4_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+  add_test(NAME host_auto_scene_native_boundary_test COMMAND auto_scene_test --boundary)
+  set_tests_properties(host_auto_scene_native_boundary_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+  add_test(NAME host_auto_scene_split_test COMMAND auto_scene_test --split)
+  set_tests_properties(host_auto_scene_split_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+  add_test(NAME host_auto_scene_failed_plan_cache_test COMMAND auto_scene_test --unsupported)
+  set_tests_properties(host_auto_scene_failed_plan_cache_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+  add_test(NAME host_auto_scene_material_passthrough_test COMMAND auto_scene_test --materials)
+  set_tests_properties(host_auto_scene_material_passthrough_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+  add_test(NAME host_auto_scene_replay_test COMMAND auto_scene_test --repeat)
+  set_tests_properties(host_auto_scene_replay_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+  na_host_test(j2_compute_flow_test SOURCES j2_compute_flow_test.cpp LIBS host_dx12 LABELS gpu)
+  na_host_test(j2_flow_retention_test SOURCES j2_flow_retention_test.cpp LIBS host_dx12 LABELS gpu)
+endif()
 na_host_test(pbz_settings_test SOURCES pbz_settings_test.cpp LIBS host_settings)
+na_host_test(scene_group_test SOURCES scene_group_test.cpp LIBS host_scene_scale d3d12 dxgi d3dcompiler)
+na_host_test(depth_restore_test SOURCES depth_restore_test.cpp LIBS host_scene_scale d3d12 dxgi d3dcompiler)
+na_host_test(color_restore_test SOURCES color_restore_test.cpp LIBS host_scene_scale d3d12 dxgi d3dcompiler)
+add_test(NAME host_color_restore_warp_test COMMAND color_restore_test --warp)
+set_tests_properties(host_color_restore_warp_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS host)
+na_host_test(raster_restore_test SOURCES raster_restore_test.cpp LIBS host_scene_scale host_observe_producers d3d12 dxgi d3dcompiler)
+na_host_test(gpu_constants_test SOURCES gpu_constants_test.cpp LIBS host_scene_scale d3d12 dxgi d3dcompiler)
+na_host_test(shader_operation_test SOURCES shader_operation_test.cpp LIBS host_observe_producers d3d12 dxgi d3dcompiler)
+na_host_test(render_scale_patch_test SOURCES render_scale_patch_test.cpp)
+na_host_test(settings_read_hook_test SOURCES settings_read_hook_test.cpp LIBS host_scale)
 na_host_test(session_exit_test SOURCES session_exit_test.cpp LIBS host_dx12)
 na_host_test(nr_settings_trace_test SOURCES nr_settings_trace_test.cpp LIBS host_settings)
 na_host_test(route_a_menu_test SOURCES route_a_menu_test.cpp LIBS host_dx12)
@@ -90,6 +125,8 @@ set_tests_properties(host_overlay_hardware_test PROPERTIES TIMEOUT 30 SKIP_RETUR
 # Parameter-object tests need the NVIDIA NGX SDK headers (local SDK folder, or
 # the CI job that fetches the public DLSS repo's headers at build time).
 if(NA_HAVE_NGX_SDK)
+  na_host_test(scoped_bindings_test SOURCES scoped_bindings_test.cpp LIBS host_dx12 d3dcompiler)
+  na_host_test(scoped_transfers_test SOURCES scoped_transfers_test.cpp LIBS host_dx12 d3dcompiler LABELS gpu)
   target_compile_definitions(nvngx_stub PRIVATE NA_HAVE_NGX_SDK)
   target_include_directories(nvngx_stub SYSTEM PRIVATE "${NA_NGX_SDK_INCLUDE}")
   na_host_test(ngx_params_test SOURCES ngx_params_test.cpp LIBS host_dx12)
@@ -119,6 +156,16 @@ na_host_test(depth_format_test SOURCES depth_format_test.cpp)
 na_host_test(nr_depth_test SOURCES nr_depth_test.cpp LIBS host_dx12)
 na_host_test(nr_fg_composition_test SOURCES nr_fg_composition_test.cpp LIBS host_dx12)
 na_host_test(nr_fg_frame_cache_test SOURCES nr_fg_frame_cache_test.cpp LIBS host_dx12)
+# P4-0b: moving-object motion for J2 from optical flow. Fake engine in CI (pairing,
+# false-flow rejection, engine failure, busy rings + watchdog, resize retirement).
+na_host_test(j2_flow_test SOURCES j2_flow_test.cpp LIBS host_dx12 dxgi d3dcompiler)
+# P4-0c: AMD optical-flow passes (DXC at build time): blobs, embedded root signatures, PSOs.
+na_host_test(ffx_flow_shaders_test SOURCES ffx_flow_shaders_test.cpp LIBS host_ffx_flow d3d12 dxgi)
+if(NA_HAVE_NVOF)
+  # Same pipeline on the real NVIDIA optical-flow engine (RTX 20+); SKIPs without it.
+  add_test(NAME host_j2_flow_real_test COMMAND j2_flow_test --real)
+  set_tests_properties(host_j2_flow_real_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
+endif()
 
 # C6: generic DLSS backend. The fake-runtime test needs only the NGX headers
 # (runs in CI); the real test needs our own NGX instance (static library from
@@ -129,7 +176,11 @@ if(NA_HAVE_NGX_SDK)
   na_host_test(j2_live_test SOURCES j2_live_test.cpp LIBS host_dx12 dxgi)
   na_host_test(j2_rcas_test SOURCES j2_rcas_test.cpp LIBS host_dx12 dxgi)
   na_host_test(j2_nis_test SOURCES j2_nis_test.cpp LIBS host_dx12 dxgi)
+  na_host_test(j2_hud_nis_test SOURCES j2_hud_nis_test.cpp LIBS host_dx12 dxgi)
+  na_host_test(j2_native_hud_test SOURCES j2_native_hud_test.cpp LIBS host_dx12 dxgi d3dcompiler)
   na_host_test(j2_anno_shape_test SOURCES j2_anno_shape_test.cpp LIBS host_dx12 dxgi d3dcompiler)
+  na_host_test(j2_inline_compute_test SOURCES j2_anno_shape_test.cpp LIBS host_dx12 dxgi d3dcompiler ARGS 1 1 --inline-flow LABELS gpu)
+  target_compile_definitions(j2_inline_compute_test PRIVATE NA_J2_TEST_COMPUTE)
   add_test(NAME host_j2_msaa_shape_test COMMAND j2_anno_shape_test 2)
   set_tests_properties(host_j2_msaa_shape_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS host)
   # Depth and stencil planes transitioned separately (Sniper Elite Resistance).
@@ -212,6 +263,7 @@ na_host_test(observe_snapshot_test SOURCES observe_snapshot_test.cpp LIBS host_o
 # C9b: asynchronous resource content samples (A2-R03).
 na_host_test(observe_sample_test SOURCES observe_sample_test.cpp LIBS host_observe_producers d3d12 dxgi)
 na_host_test(depth_carried_state_test SOURCES depth_carried_state_test.cpp LIBS host_observe_producers d3d12 dxgi)
+na_host_test(depth_prelock_mark_test SOURCES depth_prelock_mark_test.cpp LIBS host_observe_producers d3d12 dxgi)
 
 # C7a: FSR 3.1+ interception against a stand-in FidelityFX runtime DLL.
 add_library(ffx_stub SHARED ffx_stub.cpp)

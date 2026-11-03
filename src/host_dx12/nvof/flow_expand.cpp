@@ -147,7 +147,7 @@ bool FlowExpand::Dispatch(ID3D12GraphicsCommandList* list, ID3D12Resource* grid_
 
 bool FlowExpand::DispatchDepthAware(ID3D12GraphicsCommandList* list, ID3D12Resource* grid_tex, uint32_t grid,
                                     const ExpandParams& params, ID3D12Resource* out, uint32_t out_w, uint32_t out_h,
-                                    uint32_t frame_slot)
+                                    uint32_t frame_slot, Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>* recording_heap)
 {
     if (!params.depth) return false;
     // A39-DEPTH-EXPAND-REVIEW R2: reject bad numeric configuration before recording.
@@ -155,11 +155,12 @@ bool FlowExpand::DispatchDepthAware(ID3D12GraphicsCommandList* list, ID3D12Resou
     if (!finite(params.depth_tolerance) || params.depth_tolerance < 0.0f) return false;
     if (!finite(params.consistency_px) || params.consistency_px < 0.0f) return false;
     if (!finite(params.depth_clear) || params.depth_clear < 0.0f || params.depth_clear > 1.0f) return false;
-    return dispatch(list, grid_tex, grid, &params, out, out_w, out_h, frame_slot);
+    return dispatch(list, grid_tex, grid, &params, out, out_w, out_h, frame_slot, recording_heap);
 }
 
 bool FlowExpand::dispatch(ID3D12GraphicsCommandList* list, ID3D12Resource* grid_tex, uint32_t grid, const ExpandParams* p,
-                          ID3D12Resource* out, uint32_t out_w, uint32_t out_h, uint32_t frame_slot)
+                          ID3D12Resource* out, uint32_t out_w, uint32_t out_h, uint32_t frame_slot,
+                          Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>* recording_heap)
 {
     if (!list || !pso_plain_ || !grid_tex || !out || !grid || !out_w || !out_h || frame_slot >= slots_) return false;
     if (p) {
@@ -170,9 +171,12 @@ bool FlowExpand::dispatch(ID3D12GraphicsCommandList* list, ID3D12Resource* grid_
             if (vd.Width != out_w || vd.Height != out_h) return false;
         }
     }
+    if(recording_heap && !*recording_heap){const auto hd=heap_->GetDesc();
+        if(FAILED(device_->CreateDescriptorHeap(&hd,IID_PPV_ARGS(recording_heap->ReleaseAndGetAddressOf()))))return false;}
+    auto* selected_heap=recording_heap?recording_heap->Get():heap_.Get();
     uint32_t base = frame_slot * 4;
     auto cpu = [&](uint32_t i) {
-        D3D12_CPU_DESCRIPTOR_HANDLE h = heap_->GetCPUDescriptorHandleForHeapStart();
+        D3D12_CPU_DESCRIPTOR_HANDLE h = selected_heap->GetCPUDescriptorHandleForHeapStart();
         h.ptr += static_cast<SIZE_T>(base + i) * stride_;
         return h;
     };
@@ -191,11 +195,11 @@ bool FlowExpand::dispatch(ID3D12GraphicsCommandList* list, ID3D12Resource* grid_
     ud.Format = DXGI_FORMAT_R32_FLOAT;
     device_->CreateUnorderedAccessView(p && p->validity_out ? p->validity_out : dummy_uav_.Get(), nullptr, &ud, cpu(3));
     Constants c{grid, out_w, out_h, 0, p ? p->depth_clear : 1.0f, p ? p->depth_tolerance : 0.0f, p ? p->consistency_px : 0.0f, vector_scale_};
-    ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
+    ID3D12DescriptorHeap* heaps[] = {selected_heap};
     list->SetDescriptorHeaps(1, heaps);
     list->SetComputeRootSignature(root_.Get());
     list->SetPipelineState(p ? pso_depth_.Get() : pso_plain_.Get());
-    D3D12_GPU_DESCRIPTOR_HANDLE g = heap_->GetGPUDescriptorHandleForHeapStart();
+    D3D12_GPU_DESCRIPTOR_HANDLE g = selected_heap->GetGPUDescriptorHandleForHeapStart();
     g.ptr += static_cast<UINT64>(base) * stride_;
     list->SetComputeRootDescriptorTable(0, g);
     list->SetComputeRoot32BitConstants(1, sizeof(Constants) / 4, &c, 0);

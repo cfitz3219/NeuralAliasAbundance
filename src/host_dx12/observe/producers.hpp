@@ -29,12 +29,15 @@
 #include <memory>
 
 #include "host_dx12/host_observe.h"
+#include "host_dx12/observe/shader_operation.hpp"
 
 struct ID3D12Device;
 struct ID3D12CommandQueue;
 struct ID3D12CommandList;
 struct ID3D12GraphicsCommandList;
 struct ID3D12Resource;
+struct ID3D12RootSignature;
+struct ID3D12DescriptorHeap;
 struct D3D12_RESOURCE_BARRIER;
 struct IDXGISwapChain;
 
@@ -79,6 +82,10 @@ struct ExecuteToken {
 // C9b: the game host's original ExecuteCommandLists, used to submit the host's
 // own sample copies without re-entering the host's execute detour.
 void SetExecuteForwarder(void(__stdcall* fwd)(ID3D12CommandQueue*, unsigned int, ID3D12CommandList* const*));
+// Reuse the established original forwarder for host preparation. Never recurse
+// through the presenter/J2/NR execute detours; no waits or ownership inference.
+bool HostExecuteAvailable();
+bool ExecuteHostCommands(ID3D12CommandQueue*,uint32_t,ID3D12CommandList* const*);
 
 // Begin also takes the C9 constant-data snapshots of the submitted recordings.
 ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue, uint32_t count = 0, ID3D12CommandList* const* lists = nullptr);
@@ -135,9 +142,69 @@ void ResetDerived();
 // pipeline state of this recording. False (nothing issued) if the state is not fully
 // known (unobserved recording, a bundle was executed).
 bool RestoreListState(ID3D12GraphicsCommandList* list);
+// Scoped bindings change neither PSO/root signatures nor IA state. Restore only
+// touched bindings, with bounded inline snapshots and no RootArg vector clones.
+// Changing a resource heap invalidates tables in BOTH shader pipelines.
+bool RestoreBindingState(ID3D12GraphicsCommandList*,bool compute,bool heaps,uint64_t cbvs,
+    bool targets,bool viewports,bool scissors,ID3D12RootSignature* expected_root=nullptr);
+// Layer2 raster work also changes RTV/DSV, viewport/scissor and IA topology.
+// Opt-in: private CPU descriptor snapshots are taken before OMSetRenderTargets
+// (the game's source descriptors may legally be reused immediately afterwards).
+// Enable is latched at each observed Reset so Disable cannot interrupt a scope's
+// restoration. Existing executable recordings keep their captured state.
+void SetRasterStateTracking(bool enabled);
+bool ListRasterStateRestorable(ID3D12CommandList* list);
 bool ListStateRestorable(ID3D12CommandList* list); // RestoreListState would succeed
+// Bounded snapshot of the current native shader bindings, for scoped private
+// descriptor heaps. Rebind ALL resource tables when changing their heap, and
+// preserve the sampler heap/tables. No descriptor memory is copied here.
+struct ShaderState {
+    uint32_t list_type=NA_UNKNOWN_U32;
+    ID3D12RootSignature* root = nullptr;
+    ID3D12DescriptorHeap* resources = nullptr;
+    ID3D12DescriptorHeap* samplers = nullptr;
+    uint64_t cbv_params = 0;
+    bool raster_restorable=false;
+    uint64_t target_serial=0,viewport_serial=0,scissor_serial=0,cbv_serial[64]{};
+    uint64_t root_serial=0,restore_serial=0;
+    struct Table { uint32_t param; uint64_t handle; bool sampler; } tables[64]{};
+    uint32_t count = 0;
+};
+bool ListShaderState(ID3D12CommandList* list, bool compute, ShaderState& out);
 // First render target and depth currently bound in the recording.
 bool ListCurrentTargets(ID3D12CommandList* list, na_object_id* rt, na_object_id* ds);
+// The game's own scissor rectangles and depth target as last set in this recording
+// (host work is not observed, so a host override never replaces them). False when the
+// recording or its scissors are not known (then leave the list alone).
+struct RasterScissors {
+    uint64_t recording = 0, scissor_serial = 0;
+    na_object_id ds = 0;
+    uint32_t count = 0;
+    struct Rect { int32_t left = 0, top = 0, right = 0, bottom = 0; } rects[16]{}; // D3D12_RECT layout
+};
+bool ListRasterScissors(ID3D12CommandList* list, RasterScissors& out);
+// Called on the recording thread after the game's OMSetRenderTargets / RSSetScissorRects
+// was forwarded and observed, with the list's new state; no observer locks held, inside
+// HostWorkScope (commands it records are host work). Null = none (default).
+using RasterStateListener = void (*)(ID3D12GraphicsCommandList* list, const RasterScissors& state);
+void SetRasterStateListener(RasterStateListener listener);
+// Native HUD (render-small): what the next draw of this recording will use, read in one
+// lock: first render target and depth, the game's viewports and scissors (host overrides
+// are never observed), and the bound pipeline's target formats and blending. False when the
+// recording is unknown. `restorable` = RestoreBindingState can hand back targets, viewports
+// and scissors (raster tracking was on at this recording's Reset).
+struct DrawInfo {
+    uint64_t recording = 0;
+    na_object_id rt = 0, ds = 0;
+    uint32_t rt_count = 0;
+    bool restorable = false, pipeline_known = false;
+    uint32_t pso_rt_count = 0, rtv_format = 0, dsv_format = 0, samples = 0;
+    uint32_t blend_mask = NA_UNKNOWN_U32, depth_enable = NA_UNKNOWN_U32, depth_func = NA_UNKNOWN_U32;
+    uint32_t viewport_count = 0, scissor_count = 0;
+    float viewports[16][6]{};   // x, y, width, height, min depth, max depth
+    int32_t scissors[16][4]{};  // left, top, right, bottom
+};
+bool ListDrawState(ID3D12CommandList* list, DrawInfo& out);
 // Identity of the list's current recording (changes on every Reset); 0 if unknown.
 uint64_t ListRecording(ID3D12CommandList* list);
 // True when this recording cleared `target` with ClearRenderTargetView.
@@ -178,6 +245,8 @@ void SetSamplerMipBias(float bias);
 // twins of the level selected when it was Reset. SamplerMipBias() reports that level.
 void SetSamplerMipBiasLive(float bias);
 void SetSamplerMipBiasLiveEnabled(bool on); // before the game creates its pipelines
+// The biases live switching may ask for (nearest levels get twins); before SetSamplerMipBias.
+void SetSamplerMipLevelsWanted(const float* biases, int n);
 struct MipLiveStats {
     bool enabled = false;
     float game_bias = 0, live_bias = 0;
@@ -229,6 +298,7 @@ struct ProducerStats {
     uint32_t sample_workers_started; // C9B-REVIEW-2 #1: at most 1 per process
     uint64_t sample_missing_recording, sample_partial_coverage, sample_partial_states, sample_no_transition;
     uint64_t nested_unlocked;        // ASTRA-P3-R8: queue ops nested in a forwarded submission (no lock taken)
+    uint64_t serialized_submissions; // game submissions forwarded under their queue's lock for the known-state store
     uint64_t snapshots_reread;       // G3-02: app-unmapped upload buffers captured by a host read-only Map
     uint64_t preexisting_resources;  // G3-03: resources registered lazily on first sight
     uint64_t preexisting_heaps;      // G3-03: descriptor heaps registered lazily in SetDescriptorHeaps
@@ -241,5 +311,8 @@ struct ProducerStats {
     uint64_t unhooked_queues;        // queues whose table differs from the hooked one
 };
 ProducerStats GetProducerStats();
+// Process exit: object retirement becomes a no-op (the CRT is about to destroy, or has
+// destroyed, the tables it would update; the OS reclaims everything).
+void SetProcessExiting();
 
 } // namespace na::observe
