@@ -685,6 +685,43 @@ void menu_note(const char* text) {
     WriteFile(f, text, static_cast<DWORD>(strlen(text)), &written, nullptr);
     CloseHandle(f);
 }
+// Render-small test builds: a fatal exception anywhere in the process leaves a line (code,
+// module+offset, thread) and a minidump next to the status log, so a crash that Windows
+// does not report still has evidence. At most two dumps per process.
+void status_note(const char* text) {
+    if (!g_status_log[0]) return;
+    HANDLE f = CreateFileW(g_status_log, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(f, text, static_cast<DWORD>(strlen(text)), &written, nullptr);
+    CloseHandle(f);
+}
+LONG CALLBACK crash_capture(EXCEPTION_POINTERS* e) {
+    const DWORD code = e && e->ExceptionRecord ? e->ExceptionRecord->ExceptionCode : 0;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_STACK_OVERFLOW &&
+        code != 0xC0000409u /* stack buffer overrun / fail fast */ && code != 0xC0000374u /* heap corruption */ &&
+        code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != EXCEPTION_PRIV_INSTRUCTION)
+        return EXCEPTION_CONTINUE_SEARCH;
+    static std::atomic<int> count{0};
+    const int n = count.fetch_add(1);
+    if (n >= 2) return EXCEPTION_CONTINUE_SEARCH;
+    void* at = e->ExceptionRecord->ExceptionAddress;
+    HMODULE mod = nullptr;
+    char name[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCSTR>(at), &mod) && mod)
+        GetModuleFileNameA(mod, name, MAX_PATH);
+    const char* base = strrchr(name, '\\');
+    char row[512];
+    snprintf(row, sizeof(row), "crash code=0x%08lX at=%s+0x%llX thread=%lu info=%llu/%p mode=%u render_scale=%.3f\r\n", code,
+             base ? base + 1 : name, static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(at) - reinterpret_cast<uintptr_t>(mod)),
+             GetCurrentThreadId(), e->ExceptionRecord->NumberParameters ? static_cast<unsigned long long>(e->ExceptionRecord->ExceptionInformation[0]) : 0ull,
+             e->ExceptionRecord->NumberParameters > 1 ? reinterpret_cast<void*>(e->ExceptionRecord->ExceptionInformation[1]) : nullptr,
+             na::settings::Get().j2_scale_mode.load(), na::present::RenderScale());
+    status_note(row);
+    wchar_t path[MAX_PATH]{};
+    if (swprintf_s(path, L"%s.crash%d.dmp", g_status_log, n) > 0) na::freeze::WriteMiniDump(path, e);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 int menu_fault(EXCEPTION_POINTERS* exception) {
     na::settings::MarkSessionFailed("crash");
     if (g_menu_diagnostics) {
@@ -2680,7 +2717,18 @@ void small_follow_mode()
     const int mode = (std::min)(static_cast<int>(na::settings::Get().j2_scale_mode.load()), 3); // no Ultra Performance here
     const float f = mode > 0 ? static_cast<float>(na::scale::FractionForMode(mode)) : 1.f;
     if (g_small_asked < 0.f) g_small_asked = na::present::RenderScale(); // the boot scale needs no request
+    static bool crash_capture_on = false;
+    if (!crash_capture_on) { crash_capture_on = true; AddVectoredExceptionHandler(0, &crash_capture); }
     if (f == g_small_asked) return;
+    {
+        char row[160];
+        const np::SizeState before = np::GetSizeState();
+        snprintf(row, sizeof(row), "mode_switch mode=%d scale %.3f -> %.3f render=%ux%u requested=%ux%u delivered=%u\r\n", mode,
+                 static_cast<double>(g_small_asked), static_cast<double>(f), static_cast<unsigned>(before.render.w),
+                 static_cast<unsigned>(before.render.h), static_cast<unsigned>(before.requested.w), static_cast<unsigned>(before.requested.h),
+                 before.request_delivered ? 1u : 0u);
+        status_note(row);
+    }
     na::present::SetRenderScale(f, &na::j2::PresentUpscale, nullptr);
     // Texture detail follows the mode: the menu bias plus log2(render scale), from the next list.
     na::observe::SetSamplerMipBiasLive(na::j2::SmallMipBias(static_cast<float>(na::settings::Get().j2_mip_bias_x100.load()) / 100.f, f));
