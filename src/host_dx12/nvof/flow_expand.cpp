@@ -11,7 +11,7 @@ Texture2D<int2>  t_grid  : register(t0);
 Texture2D<float> t_depth : register(t1);
 RWTexture2D<float2> u_out   : register(u0);
 RWTexture2D<float>  u_valid : register(u1);
-cbuffer C : register(b0) { uint grid; uint out_w; uint out_h; uint pad; float depth_clear; float depth_tol; float consistency_px; float vector_scale; };
+cbuffer C : register(b0) { uint grid; uint out_w; uint out_h; uint sky; float depth_clear; float depth_tol; float consistency_px; float vector_scale; };
 
 float2 cell(int2 c, int2 dim) {
     c = clamp(c, int2(0, 0), dim - 1);
@@ -30,6 +30,15 @@ float cell_depth(int2 c, int2 dim) {
 // the destination depth AND every neighbouring block-centre depth.
 bool depth_ok(float d) {
     return (asuint(d) & 0x7fffffffu) < 0x7f800000u && d != depth_clear && d >= 0.0 && d <= 1.0;
+}
+// sky != 0 (Cort 2026-11-03, flow looser): clear depth is a surface of its own (sky, distant
+// layers), so objects against it are not rejected for having no depth-written neighbours.
+bool depth_fin(float d) { return (asuint(d) & 0x7fffffffu) < 0x7f800000u && d >= 0.0 && d <= 1.0; }
+bool same_surface(float d, float cd, float tol) {
+    if (sky == 0) return depth_ok(d) && depth_ok(cd) && abs(cd - d) <= tol;
+    if (!depth_fin(d) || !depth_fin(cd)) return false;
+    const bool dc = d == depth_clear, cc = cd == depth_clear;
+    return dc == cc && (dc || abs(cd - d) <= tol);
 }
 void neighbours(uint2 id, int2 dim, out int2 c0, out float2 f) {
     float2 g = (float2(id) + 0.5) / float(grid) - 0.5;
@@ -64,7 +73,7 @@ void expand_depth(uint3 id : SV_DispatchThreadID) {
     [unroll] for (int i = 0; i < 4; ++i) {
         float cd = cell_depth(cs[i], dim);
         float2 v = cell(cs[i], dim);
-        bool same = d_ok && depth_ok(cd) && abs(cd - d) <= tol;
+        bool same = same_surface(d, cd, tol);
         float w = same ? bw[i] : 0.0;
         acc += v * w; wsum += w;
         if (same) { vmin = min(vmin, v); vmax = max(vmax, v); }
@@ -74,6 +83,13 @@ void expand_depth(uint3 id : SV_DispatchThreadID) {
         bool consistent = max(spread.x, spread.y) <= consistency_px;
         u_out[id.xy] = acc / wsum;
         u_valid[id.xy] = consistent ? 1.0 : 0.0;
+    } else if (sky != 0 && depth_fin(d)) {
+        // A thin object whose neighbouring block centres all hit another surface: take the
+        // blocks as they are, valid only when they agree with each other.
+        float2 v00 = cell(cs[0], dim), v10 = cell(cs[1], dim), v01 = cell(cs[2], dim), v11 = cell(cs[3], dim);
+        float2 lo = min(min(v00, v10), min(v01, v11)), hi = max(max(v00, v10), max(v01, v11));
+        u_out[id.xy] = lerp(lerp(v00, v10, f.x), lerp(v01, v11, f.x), f.y);
+        u_valid[id.xy] = max(hi.x - lo.x, hi.y - lo.y) <= consistency_px ? 1.0 : 0.0;
     } else {
         // No block shares this pixel's surface (or invalid depth): not usable.
         u_out[id.xy] = 0;
@@ -81,7 +97,7 @@ void expand_depth(uint3 id : SV_DispatchThreadID) {
     }
 }
 )";
-struct Constants { uint32_t grid, out_w, out_h, pad; float depth_clear, depth_tol, consistency_px, vector_scale; };
+struct Constants { uint32_t grid, out_w, out_h, sky; float depth_clear, depth_tol, consistency_px, vector_scale; };
 
 bool compile(ID3D12Device* dev, ID3D12RootSignature* root, const char* entry, ComPtr<ID3D12PipelineState>& pso)
 {
@@ -194,7 +210,7 @@ bool FlowExpand::dispatch(ID3D12GraphicsCommandList* list, ID3D12Resource* grid_
     device_->CreateUnorderedAccessView(out, nullptr, &ud, cpu(2));
     ud.Format = DXGI_FORMAT_R32_FLOAT;
     device_->CreateUnorderedAccessView(p && p->validity_out ? p->validity_out : dummy_uav_.Get(), nullptr, &ud, cpu(3));
-    Constants c{grid, out_w, out_h, 0, p ? p->depth_clear : 1.0f, p ? p->depth_tolerance : 0.0f, p ? p->consistency_px : 0.0f, vector_scale_};
+    Constants c{grid, out_w, out_h, p && p->sky ? 1u : 0u, p ? p->depth_clear : 1.0f, p ? p->depth_tolerance : 0.0f, p ? p->consistency_px : 0.0f, vector_scale_};
     ID3D12DescriptorHeap* heaps[] = {selected_heap};
     list->SetDescriptorHeaps(1, heaps);
     list->SetComputeRootSignature(root_.Get());

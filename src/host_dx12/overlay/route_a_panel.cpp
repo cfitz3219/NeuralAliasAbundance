@@ -988,6 +988,16 @@ void DrawLiveDlaa()
         BeginRow("Moving-object motion (test)", "Adds estimated motion for moving objects. Uses NVIDIA flow between command lists, or AMD compute flow inside the game's list. Requires extra GPU time. Turn it off to compare; the Motion vectors debug view shows the result.", SwitchWidth());
         if (Switch("j2flow", &fl)) na::j2::flow::SetEnabled(fl);
         EndRow();
+        {
+            na::settings::Settings& ss = na::settings::Get();
+            int loose = static_cast<int>(ss.j2_flow_loosen.load());
+            BeginRow("Moving-object rules", "How much of what the optical flow finds is accepted. 0% = the original strict rules. Higher accepts more moving objects (including ones against the sky) but can add smearing or shimmer. Compare with the Motion vectors debug view.", S(220));
+            ImGui::SetNextItemWidth(S(220));
+            if (ImGui::SliderInt("##j2flowloose", &loose, 0, 100, loose ? "%d%% looser" : "Strict (original)", ImGuiSliderFlags_AlwaysClamp))
+                ss.j2_flow_loosen.store(static_cast<uint32_t>(loose));
+            if (ImGui::IsItemDeactivatedAfterEdit()) na::settings::Save();
+            EndRow();
+        }
         if (fl) {
             const na::j2::flow::Stats fs = na::j2::flow::GetStats();
             const auto cs=na::j2::compute_flow::GetStats();
