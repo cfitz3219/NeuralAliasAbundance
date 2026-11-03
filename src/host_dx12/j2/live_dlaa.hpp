@@ -44,6 +44,8 @@ void SetDebugView(int mode);
 // into `out` (UNORDERED_ACCESS). percent 0 records nothing and returns false.
 bool RecordRcasForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* in, ID3D12Resource* out,
                         uint32_t w, uint32_t h, uint32_t percent, DXGI_FORMAT fmt);
+// Test hook: compiles the render-small HUD passes (classify, dilate, composite); false + why.
+bool CompileHudShadersForTests(char* why, size_t why_size);
 // Test hook: the 101..200 % stage (NVIDIA Image Scaling sharpen-only) from `in`
 // (NON_PIXEL_SHADER_RESOURCE) into `out` (UNORDERED_ACCESS). <= 100 % records nothing.
 bool RecordNisForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* in, ID3D12Resource* out,
@@ -67,6 +69,9 @@ bool Jitter();
 // so a picture is always shown and the mode never switches itself off. Off by default.
 void SetRenderSmall(bool on);
 bool RenderSmall();
+// Render-small HUD separation: tint the pixels taken as HUD (diagnostic, not saved).
+void SetHudMaskView(bool on);
+bool HudMaskView();
 // Render-small texture bias: the menu bias plus log2(render scale) (DLSS guidance); 0 stays 0.
 inline float SmallMipBias(float user, float scale) { return user != 0.f && scale > 0.f && scale < 1.f ? user + std::log2(scale) : user; }
 bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t rw, uint32_t rh,
@@ -276,7 +281,7 @@ struct Stats {
     uint64_t jitter_blocks_probed_out = 0; // blocks skipped after the 64-byte probe
     // Render-small: frames whose depth + motion were kept for Present; pictures DLSS upscaled at
     // Present / stretched (no fresh depth + motion) / not produced (the presenter kept its old one).
-    uint64_t small_deferred = 0, small_dlss = 0, small_stretched = 0, small_failed = 0, small_dlss_failed = 0, small_sharpened = 0;
+    uint64_t small_deferred = 0, small_dlss = 0, small_stretched = 0, small_failed = 0, small_dlss_failed = 0, small_sharpened = 0, small_hud = 0;
     uint32_t small_rw = 0, small_rh = 0, small_ow = 0, small_oh = 0;
     char small_note[128] = {};
     uint64_t window_derived_forward = 0, window_derived_inverse = 0; // camera-derived matrices rebased (see window_derived)

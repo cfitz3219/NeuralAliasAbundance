@@ -198,6 +198,7 @@ add_library(host_dx12 STATIC
   src/host_dx12/j2/j2_flow.cpp
   src/host_dx12/j2/compute_flow.cpp
   src/host_dx12/j2/nis_sharpen.cpp
+  src/host_dx12/j2/nis_scaler.cpp
   src/host_dx12/scale/scoped_bindings.cpp
   src/host_dx12/scale/native_bindings.cpp
   src/host_dx12/scale/auto_scene.cpp

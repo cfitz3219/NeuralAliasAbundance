@@ -973,6 +973,19 @@ void DrawLiveDlaa()
         if (ImGui::IsItemDeactivatedAfterEdit()) na::settings::Save();
         EndRow();
     }
+    if (na::j2::RenderSmall()) {
+        na::settings::Settings& ss = na::settings::Get();
+        int hud = static_cast<int>(ss.j2_hud_nis.load());
+        BeginRow("HUD sharpness (NIS)", "Keeps the game's HUD and text out of DLSS and upscales them with NVIDIA Image Scaling at this sharpness instead. Off sends the HUD through DLSS with the 3D picture. The HUD is found once the camera moves.", S(220));
+        ImGui::SetNextItemWidth(S(220));
+        if (ImGui::SliderInt("##j2hudnis", &hud, 0, 100, hud ? "%d%%" : "Off", ImGuiSliderFlags_AlwaysClamp)) ss.j2_hud_nis.store(static_cast<uint32_t>(hud));
+        if (ImGui::IsItemDeactivatedAfterEdit()) na::settings::Save();
+        EndRow();
+        bool view = na::j2::HudMaskView();
+        BeginRow("Show HUD mask", "Tints in pink what is being treated as HUD, to check it. Not saved.", SwitchWidth());
+        if (Switch("j2hudview", &view)) na::j2::SetHudMaskView(view);
+        EndRow();
+    }
     {
         // DLSS render preset. NGX values: J 10, K 11, L 12, M 13; 0 = NVIDIA's default.
         static const char* kLivePresets[] = {"L (default)", "M", "K", "J", "NVIDIA default"};

@@ -1,6 +1,7 @@
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/msaa_resolve.hpp"
 #include "host_dx12/j2/nis_sharpen.hpp"
+#include "host_dx12/j2/nis_scaler.hpp"
 #include "host_dx12/j2/route_selector.hpp"
 #include "host_dx12/j2/consumer_profile.hpp"
 #include "host_dx12/j2/jitter_writes.hpp"
@@ -2464,7 +2465,179 @@ struct SmallRing {
     ComPtr<ID3D12Resource> sharp; // RCAS target at output size (UNORDERED_ACCESS between uses)
     uint32_t sharp_w = 0, sharp_h = 0;
     DXGI_FORMAT sharp_f = DXGI_FORMAT_UNKNOWN;
+    // HUD separation (render-small): which pixels are the game's HUD, kept out of DLSS and
+    // upscaled by NIS instead. prev = last presented small frame (NON_PIXEL_SHADER_RESOURCE),
+    // hud = per-pixel evidence 0..1 (R32F, UAV), mask = its 3x3 dilation (R16F, UAV between
+    // uses), hudup = NIS-upscaled frame at output size (RGBA16F, UAV between uses).
+    bool hud_tried = false, hud_ok = false;
+    ComPtr<ID3D12RootSignature> hud_root;
+    ComPtr<ID3D12PipelineState> hud_pso[3]; // classify, dilate, composite
+    ComPtr<ID3D12DescriptorHeap> hud_heap;  // kRing x 3 passes x (3 SRV, 3 UAV)
+    ComPtr<ID3D12Resource> prev, hud, mask, hudup;
+    uint32_t hud_w = 0, hud_h = 0, up_w = 0, up_h = 0;
+    DXGI_FORMAT prev_f = DXGI_FORMAT_UNKNOWN;
+    bool prev_valid = false;
 } g_small;
+na::j2::NisScaler g_hud_nis;
+std::atomic<bool> g_hud_view{false}; // tint HUD pixels (menu: Show HUD mask)
+constexpr char kHudHlsl[] = R"(
+Texture2D<float4> t0 : register(t0);
+Texture2D<float4> t1 : register(t1);
+Texture2D<float4> t2 : register(t2);
+RWTexture2D<float4> u0 : register(u0);
+RWTexture2D<float> u1 : register(u1);
+RWTexture2D<float> u2 : register(u2);
+SamplerState s_lin : register(s0);
+cbuffer C : register(b0) { uint w; uint h; uint ow; uint oh; uint flags; uint p0; uint p1; uint p2; };
+float luma(float3 c) { return dot(min(c, 1.0), float3(0.299, 0.587, 0.114)); }
+int2 at(int2 p, int2 d) { return clamp(p + d, int2(0, 0), int2(int(w) - 1, int(h) - 1)); }
+// The HUD is drawn without the camera's motion and without jitter. A detailed pixel that
+// stays exactly the same while the camera moves under it is HUD evidence; a detailed pixel
+// that changes is scene evidence. Flat pixels and a still camera keep what was learned.
+// t0 this frame, t1 the previous frame, t2 motion (render pixels); u1 evidence.
+[numthreads(8, 8, 1)]
+void classify(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= w || id.y >= h) return;
+    const int2 p = int2(id.xy);
+    float lo = 2.0, hi = -1.0;
+    [unroll] for (int y = -1; y <= 1; ++y)
+        [unroll] for (int x = -1; x <= 1; ++x) { const float l = luma(t0[at(p, int2(x, y))].rgb); lo = min(lo, l); hi = max(hi, l); }
+    const float3 d3 = abs(min(t0[p].rgb, 1.0) - min(t1[p].rgb, 1.0));
+    const float d = max(d3.r, max(d3.g, d3.b));
+    const float2 m = t2[p].xy;
+    float e = u1[p];
+    if (hi - lo > 0.1) {
+        if (d > 0.04) e -= 0.5;
+        else if (d < 0.006 && dot(m, m) >= 1.0) e += 0.25;
+    }
+    u1[p] = saturate(e);
+}
+// u1 evidence -> u2 mask (3x3 max, so text edges blended with the scene count too);
+// HUD pixels get no motion (u0 = the motion DLSS reads), so DLSS does not drag them.
+[numthreads(8, 8, 1)]
+void dilate(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= w || id.y >= h) return;
+    const int2 p = int2(id.xy);
+    float m = 0.0;
+    [unroll] for (int y = -1; y <= 1; ++y)
+        [unroll] for (int x = -1; x <= 1; ++x) m = max(m, u1[at(p, int2(x, y))]);
+    u2[p] = m;
+    if (m > 0.5) u0[p] = float4(0, 0, 0, 0);
+}
+// Output size: t0 the DLSS (+RCAS) picture, t1 the NIS-upscaled frame, t2 the mask; u0 result.
+[numthreads(8, 8, 1)]
+void composite(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= ow || id.y >= oh) return;
+    const float2 uv = (float2(id.xy) + 0.5) / float2(ow, oh);
+    const float m = smoothstep(0.35, 0.65, t2.SampleLevel(s_lin, uv, 0).r);
+    const float4 s = t0[id.xy];
+    float3 o = lerp(s.rgb, t1[id.xy].rgb, m);
+    if (flags & 1u) o = lerp(o, float3(1, 0, 1), 0.5 * m);
+    u0[id.xy] = float4(o, s.a);
+})";
+bool hud_init()
+{
+    if (g_small.hud_tried) return g_small.hud_ok;
+    g_small.hud_tried = true;
+    ID3D12Device* dev = g_small.device.Get();
+    D3D12_DESCRIPTOR_RANGE r[2]{};
+    r[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    r[0].NumDescriptors = 3;
+    r[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    r[1].NumDescriptors = 3;
+    r[1].OffsetInDescriptorsFromTableStart = 3;
+    D3D12_ROOT_PARAMETER p[2]{};
+    p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    p[0].DescriptorTable.NumDescriptorRanges = 2;
+    p[0].DescriptorTable.pDescriptorRanges = r;
+    p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    p[1].Constants.Num32BitValues = 8;
+    D3D12_STATIC_SAMPLER_DESC ss{};
+    ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    ss.MaxLOD = D3D12_FLOAT32_MAX;
+    ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rd{2, p, 1, &ss, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ComPtr<ID3DBlob> sig, err;
+    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
+        FAILED(dev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&g_small.hud_root))))
+        return false;
+    const char* entries[3] = {"classify", "dilate", "composite"};
+    for (int i = 0; i < 3; ++i) {
+        ComPtr<ID3DBlob> code, cerr;
+        if (FAILED(D3DCompile(kHudHlsl, sizeof(kHudHlsl) - 1, "j2_small_hud.hlsl", nullptr, nullptr, entries[i], "cs_5_0",
+                              D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &cerr)))
+            return false;
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = g_small.hud_root.Get();
+        pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+        if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_small.hud_pso[i])))) return false;
+    }
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRing * 18, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_small.hud_heap)))) return false;
+    g_small.hud_ok = true;
+    return true;
+}
+// Render-size and output-size targets for the HUD passes; false = no HUD pass this frame.
+bool hud_targets(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh)
+{
+    ID3D12Device* dev = g_small.device.Get();
+    D3D12_RESOURCE_DESC fd = frame->GetDesc();
+    if (!g_small.prev || g_small.hud_w != rw || g_small.hud_h != rh || g_small.prev_f != fd.Format) {
+        g_small.prev.Reset(); g_small.hud.Reset(); g_small.mask.Reset();
+        g_small.prev_valid = false;
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC pd = fd;
+        pd.Flags = D3D12_RESOURCE_FLAG_NONE;
+        pd.MipLevels = 1;
+        pd.DepthOrArraySize = 1;
+        if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &pd, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                                                IID_PPV_ARGS(&g_small.prev))) ||
+            !texture(rw, rh, DXGI_FORMAT_R32_FLOAT, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g_small.hud) ||
+            !texture(rw, rh, DXGI_FORMAT_R16_FLOAT, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g_small.mask)) {
+            g_small.prev.Reset(); g_small.hud.Reset(); g_small.mask.Reset();
+            return false;
+        }
+        g_small.hud_w = rw; g_small.hud_h = rh; g_small.prev_f = fd.Format;
+    }
+    if (!g_small.hudup || g_small.up_w != ow || g_small.up_h != oh) {
+        if (!texture(ow, oh, DXGI_FORMAT_R16G16B16A16_FLOAT, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g_small.hudup)) return false;
+        g_small.up_w = ow; g_small.up_h = oh;
+    }
+    return true;
+}
+// One HUD pass: SRVs t0..t2 and UAVs u0..u2 (nullptr = a null view), 8 constants.
+void hud_pass(ID3D12GraphicsCommandList* l, int pass, uint32_t slot, ID3D12Resource* const srv[3], const DXGI_FORMAT sf[3],
+              ID3D12Resource* const uav[3], const DXGI_FORMAT uf[3], const uint32_t k[8], uint32_t gx, uint32_t gy)
+{
+    ID3D12Device* dev = g_small.device.Get();
+    const UINT base = (slot * 3 + static_cast<UINT>(pass)) * 6;
+    D3D12_CPU_DESCRIPTOR_HANDLE c = g_small.hud_heap->GetCPUDescriptorHandleForHeapStart();
+    c.ptr += static_cast<SIZE_T>(base) * g_small.inc;
+    for (int i = 0; i < 3; ++i, c.ptr += g_small.inc) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = srv[i] ? sf[i] : DXGI_FORMAT_R8G8B8A8_UNORM;
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sv.Texture2D.MipLevels = 1;
+        dev->CreateShaderResourceView(srv[i], &sv, c);
+    }
+    for (int i = 0; i < 3; ++i, c.ptr += g_small.inc) {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+        uv.Format = uav[i] ? uf[i] : (i == 0 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R32_FLOAT);
+        uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        dev->CreateUnorderedAccessView(uav[i], nullptr, &uv, c);
+    }
+    D3D12_GPU_DESCRIPTOR_HANDLE gh = g_small.hud_heap->GetGPUDescriptorHandleForHeapStart();
+    gh.ptr += static_cast<UINT64>(base) * g_small.inc;
+    ID3D12DescriptorHeap* heaps[] = {g_small.hud_heap.Get()};
+    l->SetDescriptorHeaps(1, heaps);
+    l->SetComputeRootSignature(g_small.hud_root.Get());
+    l->SetPipelineState(g_small.hud_pso[pass].Get());
+    l->SetComputeRootDescriptorTable(0, gh);
+    l->SetComputeRoot32BitConstants(1, 8, k, 0);
+    l->Dispatch(gx, gy, 1);
+}
 // The RCAS target for the upscaled picture, (re)made when the output size or format changes.
 bool small_sharp_target(uint32_t w, uint32_t h, DXGI_FORMAT f)
 {
@@ -2583,6 +2756,8 @@ void small_note(const char* t) { std::snprintf(g.stats.small_note, sizeof g.stat
 
 void SetRenderSmall(bool on) { g_render_small.store(on); }
 bool RenderSmall() { return g_render_small.load(); }
+void SetHudMaskView(bool on) { g_hud_view.store(on); }
+bool HudMaskView() { return g_hud_view.load(); }
 
 bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t rw, uint32_t rh,
                     ID3D12Resource* out, uint32_t ow, uint32_t oh, bool hdr, void*)
@@ -2617,9 +2792,40 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
     const bool can_dlss = fresh && forward && g.dlss_ready && g.device && g.device.Get() == g_small.device.Get() &&
                           g.queue.Get() == queue && g.depth32 && g.motion && g.paused.load() == false;
     bool dlss = false;
+    // HUD separation: on when [j2] hud_nis > 0, for SDR pictures, once the last frame is held.
+    const uint32_t hud_nis = na::settings::Get().j2_hud_nis.load(std::memory_order_relaxed);
+    const bool hud_want = hud_nis > 0 && !hdr && can_dlss && hud_init() && hud_targets(frame, rw, rh, ow, oh);
+    bool hud_mask = false; // mask holds this frame's HUD (NON_PIXEL_SHADER_RESOURCE until the composite)
+    const DXGI_FORMAT ff = typed(frame->GetDesc().Format);
     if (can_dlss) {
         add(b, g.motion.Get(), UAV, NPSR);
         flush(l, b);
+        if (hud_want && g_small.prev_valid) {
+            const uint32_t k[8] = {rw, rh, ow, oh, 0, 0, 0, 0};
+            {
+                ID3D12Resource* const srv[3] = {frame, g_small.prev.Get(), g.motion.Get()};
+                const DXGI_FORMAT sf[3] = {ff, ff, DXGI_FORMAT_R32G32_FLOAT};
+                ID3D12Resource* const uav[3] = {nullptr, g_small.hud.Get(), nullptr};
+                const DXGI_FORMAT uf[3] = {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_UNKNOWN};
+                hud_pass(l, 0, si, srv, sf, uav, uf, k, (rw + 7) / 8, (rh + 7) / 8);
+            }
+            b.push_back(uav_barrier(g_small.hud.Get()));
+            add(b, g.motion.Get(), NPSR, UAV);
+            flush(l, b);
+            {
+                ID3D12Resource* const srv[3] = {nullptr, nullptr, nullptr};
+                const DXGI_FORMAT sf[3] = {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
+                ID3D12Resource* const uav[3] = {g.motion.Get(), g_small.hud.Get(), g_small.mask.Get()};
+                const DXGI_FORMAT uf[3] = {DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16_FLOAT};
+                hud_pass(l, 1, si, srv, sf, uav, uf, k, (rw + 7) / 8, (rh + 7) / 8);
+            }
+            b.push_back(uav_barrier(g.motion.Get()));
+            b.push_back(uav_barrier(g_small.mask.Get()));
+            add(b, g.motion.Get(), UAV, NPSR);
+            add(b, g_small.mask.Get(), UAV, NPSR);
+            flush(l, b);
+            hud_mask = true;
+        }
         na::dlss::EvalDesc e{};
         e.color = frame;
         e.depth = g.depth32.Get();
@@ -2645,27 +2851,58 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         if (dlss) {
             g.small_last = d.frame;
             g.small_ow = ow; g.small_oh = oh; g.small_rw = rw; g.small_rh = rh;
-            // RCAS on the upscaled picture (menu 0..100 = RCAS 0..200), then back into `out`.
+            // After DLSS: RCAS on the picture (menu 0..100 = RCAS 0..200), then the HUD from
+            // NIS over it where the mask says HUD. The picture moves between `out` and `sharp`
+            // (`cur`); it ends in `out`, UNORDERED_ACCESS, as DLSS left it.
             const uint32_t pct = 2u * na::settings::Get().j2_sharpness.load(std::memory_order_relaxed);
             const DXGI_FORMAT of = typed(out->GetDesc().Format);
-            if (pct && small_sharp_target(ow, oh, of)) {
-                constexpr UINT SRC = D3D12_RESOURCE_STATE_COPY_SOURCE, DST = D3D12_RESOURCE_STATE_COPY_DEST;
+            const bool have_sharp = (pct || hud_mask) && small_sharp_target(ow, oh, of);
+            ID3D12Resource* sharp = g_small.sharp.Get();
+            ID3D12Resource* cur = out;
+            UINT out_state = UAV;
+            if (pct && have_sharp) {
                 b.push_back(uav_barrier(out));
                 add(b, out, UAV, NPSR);
+                out_state = NPSR;
                 flush(l, b);
-                if (rcas_dispatch(l, out, g_small.sharp.Get(), ow, oh, pct, of, kRing + si)) {
-                    b.push_back(uav_barrier(g_small.sharp.Get()));
-                    add(b, g_small.sharp.Get(), UAV, SRC);
-                    add(b, out, NPSR, DST);
-                    flush(l, b);
-                    l->CopyResource(out, g_small.sharp.Get());
-                    add(b, g_small.sharp.Get(), SRC, UAV);
-                    add(b, out, DST, UAV);
+                if (rcas_dispatch(l, out, sharp, ow, oh, pct, of, kRing + si)) {
+                    b.push_back(uav_barrier(sharp));
+                    cur = sharp;
                     ++g.stats.small_sharpened;
-                } else {
-                    add(b, out, NPSR, UAV);
                 }
             }
+            if (hud_mask && have_sharp) {
+                if (g_hud_nis.Dispatch(g_small.device.Get(), l, frame, ff, rw, rh, g_small.hudup.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                       ow, oh, false, static_cast<float>(hud_nis) / 100.f, si)) {
+                    b.push_back(uav_barrier(g_small.hudup.Get()));
+                    add(b, g_small.hudup.Get(), UAV, NPSR);
+                    ID3D12Resource* dst = cur == out ? sharp : out;
+                    if (cur == out) { b.push_back(uav_barrier(out)); add(b, out, out_state, NPSR); out_state = NPSR; }
+                    else { add(b, sharp, UAV, NPSR); add(b, out, out_state, UAV); out_state = UAV; }
+                    flush(l, b);
+                    const uint32_t k[8] = {rw, rh, ow, oh, g_hud_view.load(std::memory_order_relaxed) ? 1u : 0u, 0, 0, 0};
+                    ID3D12Resource* const srv[3] = {cur, g_small.hudup.Get(), g_small.mask.Get()};
+                    const DXGI_FORMAT sf[3] = {of, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16_FLOAT};
+                    ID3D12Resource* const uav[3] = {dst, nullptr, nullptr};
+                    const DXGI_FORMAT uf[3] = {of, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
+                    hud_pass(l, 2, si, srv, sf, uav, uf, k, (ow + 7) / 8, (oh + 7) / 8);
+                    b.push_back(uav_barrier(dst));
+                    add(b, g_small.hudup.Get(), NPSR, UAV);
+                    if (cur == sharp) add(b, sharp, NPSR, UAV);
+                    cur = dst;
+                    ++g.stats.small_hud;
+                }
+            }
+            if (cur == sharp) { // the picture is in `sharp`: back into `out`
+                constexpr UINT SRC = D3D12_RESOURCE_STATE_COPY_SOURCE, DST = D3D12_RESOURCE_STATE_COPY_DEST;
+                add(b, sharp, UAV, SRC);
+                add(b, out, out_state, DST);
+                flush(l, b);
+                l->CopyResource(out, sharp);
+                add(b, sharp, SRC, UAV);
+                out_state = DST;
+            }
+            add(b, out, out_state, UAV);
         } else {
             ++g.stats.small_dlss_failed;
             char why[128];
@@ -2681,10 +2918,24 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
                    : g.queue.Get() != queue ? "Render-small: the scene was drawn on another queue; stretched."
                    : "Render-small: DLSS is not ready; stretched.");
     }
+    if (hud_mask) add(b, g_small.mask.Get(), NPSR, UAV);
     if (!dlss) {
         flush(l, b);
         small_stretch(l, frame, out, ow, oh, si);
         g.small_last = 0; // DLSS history is no longer the previous picture
+    }
+    // The HUD passes compare with this frame next time.
+    if (hud_want) {
+        constexpr UINT SRC = D3D12_RESOURCE_STATE_COPY_SOURCE, DST = D3D12_RESOURCE_STATE_COPY_DEST;
+        add(b, frame, NPSR, SRC);
+        add(b, g_small.prev.Get(), NPSR, DST);
+        flush(l, b);
+        l->CopyResource(g_small.prev.Get(), frame);
+        add(b, frame, SRC, NPSR);
+        add(b, g_small.prev.Get(), DST, NPSR);
+        g_small.prev_valid = true;
+    } else if (!can_dlss || hud_nis == 0) {
+        g_small.prev_valid = false; // a gap: the next comparison would be against an old frame
     }
     b.push_back(uav_barrier(out));
     add(b, frame, NPSR, PRESENT);
@@ -2753,6 +3004,18 @@ bool RecordRcasForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, I
     if (!g.device) g.device = device;
     if (g.device.Get() != device) return false;
     return rcas_dispatch(list, in, out, w, h, percent, fmt, 0);
+}
+bool CompileHudShadersForTests(char* why, size_t why_size)
+{
+    for (const char* entry : {"classify", "dilate", "composite"}) {
+        ComPtr<ID3DBlob> code, err;
+        if (FAILED(D3DCompile(kHudHlsl, sizeof(kHudHlsl) - 1, "j2_small_hud.hlsl", nullptr, nullptr, entry, "cs_5_0",
+                              D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err))) {
+            std::snprintf(why, why_size, "%s: %s", entry, err ? static_cast<const char*>(err->GetBufferPointer()) : "no message");
+            return false;
+        }
+    }
+    return true;
 }
 bool RecordNisForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* in, ID3D12Resource* out,
                        uint32_t w, uint32_t h, uint32_t percent, DXGI_FORMAT fmt, bool hdr)
