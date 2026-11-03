@@ -255,6 +255,8 @@ DWORD WINAPI InitThread(LPVOID)
     na::j2::SetRenderSmall(render_small);
     if (render_small) {
         boot_log(na::native_present::InstallSizeHooks() ? "render-small: size hooks installed" : "render-small: size hooks FAILED");
+        // Ultra Performance is not offered with render-small (the HUD would be drawn at 33%).
+        if (na::settings::Get().j2_scale_mode.load() > 3) na::settings::Get().j2_scale_mode.store(3);
         const int small_mode = static_cast<int>(na::settings::Get().j2_scale_mode.load());
         const float small_f = small_mode > 0 && small_mode <= 4 ? static_cast<float>(na::scale::FractionForMode(small_mode)) : 1.f;
         na::present::SetRenderScale(small_f, &na::j2::PresentUpscale, nullptr);

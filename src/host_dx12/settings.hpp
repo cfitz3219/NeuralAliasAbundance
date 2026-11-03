@@ -66,7 +66,7 @@ struct Settings {
     // Neural Rendering (A30, [nr] section). Off by default; percentages 0..100.
     std::atomic<uint32_t> nr_enabled{0};
     std::atomic<uint32_t> nr_intensity{100};
-    std::atomic<uint32_t> j2_sharpness{100}; // J2 DLAA: RCAS 0..100, extended RCAS 101..150 (0 = off; Cort's default 100)
+    std::atomic<uint32_t> j2_sharpness{50}; // J2 sharpening, menu scale 0..100 = RCAS 0..200 (0 = off; 50 = standard RCAS full strength)
     std::atomic<int32_t> j2_mip_bias_x100{-100}; // J2 texture detail: [j2] mip_bias x 100 (0, -50, -100); read at game start
     std::atomic<bool> j2_inline{false}; // legacy [j2] inline=1: same as route=inline (diagnostic override)
     std::atomic<uint32_t> j2_route{0};  // [j2] route: 0 auto (default), 1 between, 2 inline (diagnostic overrides)

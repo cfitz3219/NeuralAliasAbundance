@@ -933,14 +933,16 @@ void DrawLiveDlaa()
         // when the game allows it). The game's own Render Scale slider is left to the user.
         na::settings::Settings& ss = na::settings::Get();
         int mode = static_cast<int>(ss.j2_scale_mode.load());
-        if (mode < 0 || mode > 4) mode = 0;
+        // Render-small draws the HUD small too: Ultra Performance (33%) is not offered there.
+        const int modes = na::j2::RenderSmall() ? 4 : 5;
+        if (mode < 0 || mode >= modes) mode = mode >= modes ? modes - 1 : 0;
         BeginRow("Render mode", na::j2::RenderSmall()
-            ? "DLAA uses full resolution. Quality, Balanced, Performance and Ultra Performance draw the whole game smaller for more FPS (67%, 58%, 50%, 33%) and DLSS brings it back to full size. The game's own HUD is drawn smaller too, so text is a little softer. Changes apply while you play."
+            ? "DLAA uses full resolution. Quality, Balanced and Performance draw the whole game smaller for more FPS (67%, 58%, 50%) and DLSS brings it back to full size. The game's own HUD is drawn smaller too, so text is a little softer. Changes apply while you play."
             : na::scale::GetAutomaticSceneStats().enabled||na::j2::ProjectionWindow()
             ? "DLAA uses full resolution. Quality, Balanced, Performance and Ultra Performance render the scene smaller for more FPS. Menus and the HUD keep their normal size. Changes apply while you play."
             : "DLAA draws the game at full resolution. Quality, Balanced, Performance and Ultra Performance draw it smaller for more FPS (67%, 58%, 50%, 33%). NeuralAlias sets the game's Render Scale for you; leave the game's own slider at 100%.", S(220));
         ImGui::SetNextItemWidth(S(220));
-        if (ImGui::Combo("##j2scale", &mode, kModes, 5)) {
+        if (ImGui::Combo("##j2scale", &mode, kModes, modes)) {
             ss.j2_scale_mode.store(static_cast<uint32_t>(mode));
             na::settings::Save();
             if(na::scale::SliderRouteActive())na::scale::RequestMode(mode);
@@ -963,9 +965,9 @@ void DrawLiveDlaa()
     {
         na::settings::Settings& ss = na::settings::Get();
         int sharp = static_cast<int>(ss.j2_sharpness.load());
-        BeginRow("Sharpness", "Sharpening after DLAA, before the HUD. 0 = off. 1-100%: standard RCAS strength. 101-150%: extended RCAS strength in the same pass. Higher values emphasize detail and can emphasize edge outlines or noise.", S(220));
+        BeginRow("Sharpness", "RCAS sharpening after DLSS. 0 = off. 50% is standard RCAS at full strength; above 50% is extra strength in the same pass, up to 100%. Higher values emphasize detail and can emphasize edge outlines or noise.", S(220));
         ImGui::SetNextItemWidth(S(220));
-        if (ImGui::SliderInt("##j2sharp", &sharp, 0, 150, sharp ? (sharp > 100 ? "%d%% (RCAS+)" : "%d%%") : "Off", ImGuiSliderFlags_AlwaysClamp)) {
+        if (ImGui::SliderInt("##j2sharp", &sharp, 0, 100, sharp ? "%d%%" : "Off", ImGuiSliderFlags_AlwaysClamp)) {
             ss.j2_sharpness.store(static_cast<uint32_t>(sharp));
         }
         if (ImGui::IsItemDeactivatedAfterEdit()) na::settings::Save();

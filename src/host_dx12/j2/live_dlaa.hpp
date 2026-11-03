@@ -273,7 +273,7 @@ struct Stats {
     uint64_t jitter_blocks_probed_out = 0; // blocks skipped after the 64-byte probe
     // Render-small: frames whose depth + motion were kept for Present; pictures DLSS upscaled at
     // Present / stretched (no fresh depth + motion) / not produced (the presenter kept its old one).
-    uint64_t small_deferred = 0, small_dlss = 0, small_stretched = 0, small_failed = 0, small_dlss_failed = 0;
+    uint64_t small_deferred = 0, small_dlss = 0, small_stretched = 0, small_failed = 0, small_dlss_failed = 0, small_sharpened = 0;
     uint32_t small_rw = 0, small_rh = 0, small_ow = 0, small_oh = 0;
     char small_note[128] = {};
     uint64_t window_derived_forward = 0, window_derived_inverse = 0; // camera-derived matrices rebased (see window_derived)

@@ -454,8 +454,9 @@ bool debug_record(ID3D12GraphicsCommandList* l, int mode, DXGI_FORMAT out_format
 // (FSR_RCAS_DENOISE) so flat noisy areas are not amplified. Runs on the DLAA
 // result before the game's tonemap and HUD, in a Reinhard-compressed copy of the
 // HDR values (RCAS expects 0..1), expanded back afterwards. Slider 1..100 maps to
-// RCAS sharpness 2..0 stops; 0 skips the pass entirely. NeuralAlias's 101..150
-// extension raises only the global lobe ceiling from 3/16 to 13/64. Contrast
+// RCAS sharpness 2..0 stops; 0 skips the pass entirely. NeuralAlias's 101..200
+// extension raises only the global lobe ceiling from 3/16 to 7/32. The menu's 0..100
+// slider is half this scale (menu 50 = RCAS 100, menu 100 = 200). Contrast
 // limiters and noise attenuation remain; 1+4*lobe stays >=3/16. No second filter.
 struct RcasPass {
     ComPtr<ID3D12RootSignature> root;
@@ -527,7 +528,8 @@ bool rcas_init()
     pd.pRootSignature = g_rcas.root.Get();
     pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
     if (FAILED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_rcas.pso)))) return false;
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRing * 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    // Slots 0..kRing-1: the DLAA path; kRing..2*kRing-1: the render-small upscale ring.
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRing * 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     if (FAILED(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_rcas.heap)))) return false;
     g_rcas.inc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     g_rcas.ok = true;
@@ -561,7 +563,7 @@ bool rcas_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Resou
     l->SetComputeRootDescriptorTable(0, gh);
     const float stops = 2.0f * (1.0f - static_cast<float>(percent > 100 ? 100 : percent) / 100.0f);
     const float con = std::exp2(-stops);
-    const float extra = percent > 100 ? float((std::min)(percent, 150u) - 100u) / 100.0f : 0.0f;
+    const float extra = percent > 100 ? float((std::min)(percent, 200u) - 100u) / 100.0f : 0.0f;
     const float limit = 3.0f / 16.0f + extra / 32.0f;
     uint32_t k[4] = {0, w, h, 0};
     std::memcpy(&k[0], &con, 4);
@@ -2106,7 +2108,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             b.push_back(uav_barrier(g.output.Get()));
             flush(l, b);
             debug_record(l, dv, cf); // replaces the DLAA result with the debug picture
-        } else if (const uint32_t pct = na::settings::Get().j2_sharpness.load(std::memory_order_relaxed)) {
+        } else if (const uint32_t pct = 2u * na::settings::Get().j2_sharpness.load(std::memory_order_relaxed)) {
             // RCAS: output -> sharp, then back into output so the write-back path is unchanged.
             b.push_back(uav_barrier(g.output.Get()));
             add(b, g.output.Get(), UAV, NPSR);
@@ -2459,7 +2461,32 @@ struct SmallRing {
     ComPtr<ID3D12DescriptorHeap> heap; // kRing x (SRV, UAV)
     UINT inc = 0;
     bool tried = false, ok = false;
+    ComPtr<ID3D12Resource> sharp; // RCAS target at output size (UNORDERED_ACCESS between uses)
+    uint32_t sharp_w = 0, sharp_h = 0;
+    DXGI_FORMAT sharp_f = DXGI_FORMAT_UNKNOWN;
 } g_small;
+// The RCAS target for the upscaled picture, (re)made when the output size or format changes.
+bool small_sharp_target(uint32_t w, uint32_t h, DXGI_FORMAT f)
+{
+    if (g_small.sharp && g_small.sharp_w == w && g_small.sharp_h == h && g_small.sharp_f == f) return true;
+    g_small.sharp.Reset();
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = w;
+    rd.Height = h;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.Format = f;
+    rd.SampleDesc.Count = 1;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (FAILED(g_small.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                       IID_PPV_ARGS(&g_small.sharp))))
+        return false;
+    g_small.sharp->SetName(L"NeuralAlias render-small RCAS");
+    g_small.sharp_w = w; g_small.sharp_h = h; g_small.sharp_f = f;
+    return true;
+}
 constexpr char kStretchHlsl[] = R"(
 Texture2D<float4> t_in : register(t0);
 RWTexture2D<float4> u_out : register(u0);
@@ -2618,6 +2645,27 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         if (dlss) {
             g.small_last = d.frame;
             g.small_ow = ow; g.small_oh = oh; g.small_rw = rw; g.small_rh = rh;
+            // RCAS on the upscaled picture (menu 0..100 = RCAS 0..200), then back into `out`.
+            const uint32_t pct = 2u * na::settings::Get().j2_sharpness.load(std::memory_order_relaxed);
+            const DXGI_FORMAT of = typed(out->GetDesc().Format);
+            if (pct && small_sharp_target(ow, oh, of)) {
+                constexpr UINT SRC = D3D12_RESOURCE_STATE_COPY_SOURCE, DST = D3D12_RESOURCE_STATE_COPY_DEST;
+                b.push_back(uav_barrier(out));
+                add(b, out, UAV, NPSR);
+                flush(l, b);
+                if (rcas_dispatch(l, out, g_small.sharp.Get(), ow, oh, pct, of, kRing + si)) {
+                    b.push_back(uav_barrier(g_small.sharp.Get()));
+                    add(b, g_small.sharp.Get(), UAV, SRC);
+                    add(b, out, NPSR, DST);
+                    flush(l, b);
+                    l->CopyResource(out, g_small.sharp.Get());
+                    add(b, g_small.sharp.Get(), SRC, UAV);
+                    add(b, out, DST, UAV);
+                    ++g.stats.small_sharpened;
+                } else {
+                    add(b, out, NPSR, UAV);
+                }
+            }
         } else {
             ++g.stats.small_dlss_failed;
             char why[128];
