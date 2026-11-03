@@ -425,6 +425,87 @@ int end_to_end(test::Device& d)
     CHECK(at(px, OW, 30, 15, 0) == 0 && at(px, OW, 30, 15, 1) == 0); // the covered HUD draw is gone from the layer
     CHECK(std::abs(at(px, OW, 5, 44, 0) - 230) <= 1);                 // the later panel is there, at native size
     nh::SetCoverRule(false);
+
+    // Third frame, Anno's menu text: a UI clipping mask (a depth/stencil-only draw, no colour
+    // target) on the HUD's depth before the frame's first HUD draw, then text tested against it.
+    // The mask must reach the native depths too, or the text fails the stencil test there.
+    ComPtr<ID3D12PipelineState> mask_pso, masked_pso;
+    {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = root.Get();
+        pd.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+        pd.SampleMask = UINT_MAX;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = TRUE;
+        pd.DepthStencilState.DepthEnable = FALSE;
+        pd.DepthStencilState.StencilEnable = TRUE;
+        pd.DepthStencilState.StencilReadMask = pd.DepthStencilState.StencilWriteMask = 0xFF;
+        D3D12_DEPTH_STENCILOP_DESC write{D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_REPLACE, D3D12_COMPARISON_FUNC_ALWAYS};
+        pd.DepthStencilState.FrontFace = pd.DepthStencilState.BackFace = write;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets = 0;
+        pd.DSVFormat = DF;
+        pd.SampleDesc.Count = 1;
+        REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&mask_pso))));
+        pd.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+        auto& rt = pd.BlendState.RenderTarget[0];
+        rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        rt.BlendEnable = TRUE; // blended: HUD
+        rt.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        rt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        rt.BlendOp = rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        rt.SrcBlendAlpha = D3D12_BLEND_ONE;
+        rt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+        pd.DepthStencilState.StencilWriteMask = 0;
+        D3D12_DEPTH_STENCILOP_DESC test_eq{D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_EQUAL};
+        pd.DepthStencilState.FrontFace = pd.DepthStencilState.BackFace = test_eq;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = F;
+        REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&masked_pso))));
+    }
+    const float text[4] = {0.8f, 0.4f, 0.f, 1.f};
+    REQUIRE(SUCCEEDED(game.alloc->Reset()) && SUCCEEDED(l->Reset(game.alloc.Get(), nullptr)));
+    l->SetGraphicsRootSignature(root.Get());
+    l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    l->OMSetRenderTargets(1, &rtv[0], FALSE, nullptr);
+    l->RSSetViewports(1, &full);
+    l->RSSetScissorRects(1, &all);
+    l->SetPipelineState(plain[0].Get());
+    l->SetGraphicsRoot32BitConstants(0, 4, kScene, 0);
+    l->DrawInstanced(3, 1, 0, 0); // composite
+    l->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.f, 0, 0, nullptr);
+    l->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+    l->OMSetStencilRef(1);
+    {
+        const D3D12_RECT mr{kHud[0].rect[0], kHud[0].rect[1], kHud[0].rect[2], kHud[0].rect[3]};
+        l->RSSetScissorRects(1, &mr);
+        l->SetPipelineState(mask_pso.Get());
+        l->DrawInstanced(3, 1, 0, 0); // the mask: stencil 1 inside (8,4)-(40,20)
+    }
+    l->OMSetRenderTargets(1, &rtv[0], FALSE, &dsv);
+    l->RSSetScissorRects(1, &all);
+    l->SetPipelineState(masked_pso.Get());
+    l->SetGraphicsRoot32BitConstants(0, 4, text, 0);
+    l->DrawInstanced(3, 1, 0, 0); // the text: only where the mask is
+    REQUIRE(SUCCEEDED(l->Close()));
+    d.queue->ExecuteCommandLists(1, lists);
+    d.WaitIdle();
+    CHECK(dev->GetDeviceRemovedReason() == S_OK);
+    const nh::Stats s3 = nh::GetStats();
+    nh::Layer layer3;
+    const bool got3 = nh::TakeFrame(proxy.Get(), RW, RH, OW, OH, &layer3);
+    std::printf("native HUD mask frame: layer=%d %s\n", got3 ? 1 : 0, nh::StatusLine().c_str());
+    CHECK(got3);
+    CHECK(s3.masks - s2.masks == 1);
+    CHECK(s3.redirected - s2.redirected == 1);
+    CHECK(s3.restore_failed == s2.restore_failed);
+    REQUIRE(got3 && layer3.n0);
+    REQUIRE(readback(d, layer3.n0, RTS, 4, px));
+    CHECK(std::abs(at(px, OW, 30, 15, 0) - 204) <= 1 && std::abs(at(px, OW, 30, 15, 1) - 102) <= 1); // inside the mask (native 12,6-60,30)
+    CHECK(at(px, OW, 80, 40, 0) == 0 && at(px, OW, 5, 3, 0) == 0);                                   // outside: nothing
+    REQUIRE(readback(d, proxy.Get(), RTS, 4, px));
+    CHECK(std::abs(at(px, RW, 50, 25, 0) - 51) <= 1); // the proxy keeps the picture (the text went native)
     na_observe_stop();
     return 0;
 }

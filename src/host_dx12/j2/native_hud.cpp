@@ -37,9 +37,10 @@ struct Proxy {
     bool hud = false;            // the HUD has started: every later draw into the proxy is HUD
     bool cleared = false;        // the layers were cleared for this frame
     na_object_id mirrored = 0;   // the game depth target our native depths currently mirror
+    na_object_id hud_ds = 0;     // the depth target the HUD used last frame (kept across frames)
     DXGI_FORMAT view = DXGI_FORMAT_UNKNOWN;
     uint32_t scene = 0, redirected = 0, forwarded = 0;
-    uint32_t depth_draws = 0, blended = 0, covered = 0, world = 0; // of `redirected`: with a depth target / with RT0 blending
+    uint32_t depth_draws = 0, blended = 0, covered = 0, world = 0, masks = 0; // of `redirected`: with a depth target / with RT0 blending
 };
 struct Clear { D3D12_CLEAR_FLAGS flags = D3D12_CLEAR_FLAG_DEPTH; float depth = 1.f; uint8_t stencil = 0; };
 struct Layers {
@@ -71,7 +72,8 @@ std::unordered_map<na_object_id, D3D12_RESOURCE_DESC> g_ds;  // depth targets' d
 Stats g_stats;
 
 // The bind the recording thread made last (set by the raster listener, read by the draw hook).
-struct Bind { ID3D12GraphicsCommandList* list = nullptr; uint64_t recording = 0; na_object_id proxy = 0; };
+struct Bind { ID3D12GraphicsCommandList* list = nullptr; uint64_t recording = 0; na_object_id proxy = 0, mask_ds = 0; };
+constexpr uint32_t kEarlyMasks = 64; // depth-only draws mirrored per frame before the HUD's first draw
 thread_local Bind t_bind;
 
 Proxy* find_locked(na_object_id id)
@@ -264,10 +266,78 @@ void draw(ID3D12GraphicsCommandList* l, const na::observe::ShaderCall& c)
         l->DrawIndexedInstanced(UINT(c.args[0]), UINT(c.args[1]), UINT(c.args[2]), INT(c.args[3]), UINT(c.args[4]));
 }
 
+// A depth/stencil-only draw (no colour target) on the HUD's depth target while the HUD is being
+// drawn natively: UI clipping masks (stencil) and depth pre-passes of UI 3D models. Our native
+// depth mirrors must get them too, or the masked text and the model fail their tests in the
+// layers (Anno: menu text visible only in some places, the main menu's character head and the
+// loading tips missing, Cort 2026-11-03). The game's own draw still runs.
+void mirror_depth_only(ID3D12GraphicsCommandList* l, const na::observe::ShaderCall& call, const na::observe::DrawInfo& st)
+{
+    if (!st.ds || !st.pipeline_known || st.pso_rt_count != 0 || st.dsv_format == DXGI_FORMAT_UNKNOWN ||
+        !st.restorable || st.samples != 1 || !st.viewport_count || !st.scissor_count)
+        return;
+    std::lock_guard<std::mutex> lock(g_m);
+    // The HUD's depth target: the one mirrored now, or the one the HUD used last frame (a mask can
+    // come before the frame's first HUD draw).
+    Proxy* p = nullptr;
+    for (auto& q : g_proxy)
+        if (q.id && q.ow && (q.mirrored == st.ds || (!q.mirrored && q.hud_ds == st.ds))) { p = &q; break; }
+    if (!p || !g_on.load()) return;
+    // Before the HUD's first draw the target may still hold the picture's depth passes: only a few.
+    if (!p->hud && p->masks >= kEarlyMasks) return;
+    D3D12_RESOURCE_DESC dd{};
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv[2];
+    ComPtr<ID3D12Device> dev;
+    if (FAILED(l->GetDevice(IID_PPV_ARGS(&dev))) || !layers_locked(dev.Get(), *p)) return;
+    if (!ds_desc_locked(st.ds, &dd) || dd.SampleDesc.Count != 1 ||
+        !depth_locked(dd, static_cast<DXGI_FORMAT>(st.dsv_format), p->ow, p->oh, dsv))
+        return;
+    if (p->mirrored != st.ds) { // start the mirrors from the game's last clear of this target
+        Clear c{};
+        const auto it = g_clears.find(st.ds);
+        if (it != g_clears.end()) c = it->second;
+        else c.depth = (st.depth_func == D3D12_COMPARISON_FUNC_GREATER || st.depth_func == D3D12_COMPARISON_FUNC_GREATER_EQUAL) ? 0.f : 1.f;
+        const D3D12_CLEAR_FLAGS f = D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL;
+        l->ClearDepthStencilView(dsv[0], f, c.depth, c.stencil, 0, nullptr);
+        l->ClearDepthStencilView(dsv[1], f, c.depth, c.stencil, 0, nullptr);
+        p->mirrored = st.ds;
+    }
+    const float sx = float(p->ow) / float(p->rw), sy = float(p->oh) / float(p->rh);
+    D3D12_VIEWPORT vp[16];
+    D3D12_RECT sc[16];
+    for (uint32_t i = 0; i < st.viewport_count; ++i) {
+        float o[6];
+        ScaleViewport(st.viewports[i], sx, sy, o);
+        vp[i] = {o[0], o[1], o[2], o[3], o[4], o[5]};
+    }
+    for (uint32_t i = 0; i < st.scissor_count; ++i) {
+        int32_t o[4];
+        ScaleScissor(st.scissors[i], sx, sy, p->ow, p->oh, o);
+        sc[i] = {o[0], o[1], o[2], o[3]};
+    }
+    l->RSSetViewports(st.viewport_count, vp);
+    l->RSSetScissorRects(st.scissor_count, sc);
+    for (int k = 0; k < 2; ++k) {
+        l->OMSetRenderTargets(0, nullptr, FALSE, &dsv[k]);
+        draw(l, call);
+    }
+    if (!na::observe::RestoreBindingState(l, false, false, 0, true, true, true)) ++g_stats.restore_failed;
+    ++p->masks;
+    ++g_stats.masks;
+}
+
 na::observe::ShaderScope redirect(ID3D12GraphicsCommandList* l, na::observe::ShaderCall& call)
 {
     na::observe::DrawInfo st;
-    if (!na::observe::ListDrawState(l, st) || st.recording != t_bind.recording || st.rt != t_bind.proxy) return {};
+    if (!na::observe::ListDrawState(l, st) || st.recording != t_bind.recording) return {};
+    // Depth/stencil only (the game's draw still runs): no colour target bound, or a pipeline
+    // without one while the proxy is bound.
+    if (st.ds && (st.rt_count == 0 ? st.ds == t_bind.mask_ds
+                                   : t_bind.proxy && st.rt == t_bind.proxy && st.pipeline_known && st.pso_rt_count == 0)) {
+        mirror_depth_only(l, call, st);
+        return {};
+    }
+    if (!t_bind.proxy || st.rt != t_bind.proxy) return {};
     std::lock_guard<std::mutex> lock(g_m);
     Proxy* p = find_locked(st.rt);
     if (!p || !p->ow) return {};
@@ -385,7 +455,7 @@ class DrawHook final : public na::observe::ShaderOperationHook {
 public:
     na::observe::ShaderScope Before(ID3D12GraphicsCommandList* l, na::observe::ShaderCall& call) noexcept override
     {
-        if (call.kind == na::observe::ShaderKind::Dispatch || !t_bind.proxy || t_bind.list != l || !g_on.load(std::memory_order_relaxed)) return {};
+        if (call.kind == na::observe::ShaderKind::Dispatch || (!t_bind.proxy && !t_bind.mask_ds) || t_bind.list != l || !g_on.load(std::memory_order_relaxed)) return {};
         return redirect(l, call);
     }
     void After(ID3D12GraphicsCommandList*, const na::observe::ShaderCall&, na::observe::ShaderScope&) noexcept override {}
@@ -406,7 +476,7 @@ public:
             if (g_clears.size() > 512) g_clears.clear();
             if (c.rect_count || !g_l.d[0] || !g_l.dsv_count) return {};
             for (const auto& p : g_proxy)
-                if (p.id && p.hud && p.mirrored == c.target_id) {
+                if (p.id && p.mirrored == c.target_id) {
                     for (int i = 0; i < 2; ++i) {
                         D3D12_CPU_DESCRIPTOR_HANDLE h = g_l.dsv->GetCPUDescriptorHandleForHeapStart();
                         h.ptr += static_cast<SIZE_T>(i) * g_l.dsv_inc;
@@ -430,9 +500,14 @@ void on_bind(ID3D12GraphicsCommandList* l, const na::observe::RasterScissors& s)
 {
     na_object_id rt = 0, ds = 0;
     Bind b{l, s.recording, 0};
-    if (g_on.load(std::memory_order_relaxed) && na::observe::ListCurrentTargets(l, &rt, &ds) && rt) {
+    if (g_on.load(std::memory_order_relaxed) && na::observe::ListCurrentTargets(l, &rt, &ds) && (rt || ds)) {
         std::lock_guard<std::mutex> lock(g_m);
-        if (find_locked(rt)) b.proxy = rt;
+        if (rt) {
+            if (find_locked(rt)) b.proxy = rt;
+        } else {
+            for (const auto& q : g_proxy) // depth only: the HUD's depth target (a UI mask)?
+                if (q.id && (q.mirrored == ds || (!q.mirrored && q.hud_ds == ds))) { b.mask_ds = ds; break; }
+        }
     }
     t_bind = b;
 }
@@ -529,14 +604,15 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
     ++g_stats.frames;
     if (hud) ++g_stats.hud_frames;
     g_stats.last_scene = p->scene; g_stats.last_redirected = p->redirected; g_stats.last_forwarded = p->forwarded;
-    g_stats.last_depth = p->depth_draws; g_stats.last_blended = p->blended; g_stats.last_covered = p->covered; g_stats.last_world = p->world;
+    g_stats.last_depth = p->depth_draws; g_stats.last_blended = p->blended; g_stats.last_covered = p->covered; g_stats.last_world = p->world; g_stats.last_masks = p->masks;
     g_stats.proxy_format = uint32_t(p->format); g_stats.view_format = uint32_t(p->view);
     g_stats.grey = p->view != DXGI_FORMAT_UNKNOWN ? GreyFor(p->view) : 0.f;
     p->hud = p->cleared = false;
+    if (p->mirrored) p->hud_ds = p->mirrored;
     p->mirrored = 0;
     p->view = DXGI_FORMAT_UNKNOWN;
     p->scene = p->redirected = p->forwarded = 0;
-    p->depth_draws = p->blended = p->covered = p->world = 0;
+    p->depth_draws = p->blended = p->covered = p->world = p->masks = 0;
     return hud;
 }
 
@@ -551,10 +627,10 @@ std::string StatusLine()
     char b[512];
     std::snprintf(b, sizeof b,
                   "native_hud on=%u frames=%llu hud_frames=%llu scene_draws=%llu redirected=%llu forwarded=%llu restore_failed=%llu "
-                  "covered=%llu world=%llu last_frame=scene:%u,hud:%u,forwarded:%u,depth:%u,blended:%u,covered:%u,world:%u proxy_fmt=%u view_fmt=%u grey=%.4f last_forward=\"%s\"",
+                  "covered=%llu world=%llu masks=%llu last_frame=scene:%u,hud:%u,forwarded:%u,depth:%u,blended:%u,covered:%u,world:%u,masks:%u proxy_fmt=%u view_fmt=%u grey=%.4f last_forward=\"%s\"",
                   Enabled() ? 1u : 0u, (unsigned long long)s.frames, (unsigned long long)s.hud_frames, (unsigned long long)s.scene_draws,
-                  (unsigned long long)s.redirected, (unsigned long long)s.forwarded, (unsigned long long)s.restore_failed, (unsigned long long)s.covered, (unsigned long long)s.world,
-                  s.last_scene, s.last_redirected, s.last_forwarded, s.last_depth, s.last_blended, s.last_covered, s.last_world, s.proxy_format, s.view_format,
+                  (unsigned long long)s.redirected, (unsigned long long)s.forwarded, (unsigned long long)s.restore_failed, (unsigned long long)s.covered, (unsigned long long)s.world, (unsigned long long)s.masks,
+                  s.last_scene, s.last_redirected, s.last_forwarded, s.last_depth, s.last_blended, s.last_covered, s.last_world, s.last_masks, s.proxy_format, s.view_format,
                   double(s.grey), s.last_forward);
     return b;
 }
