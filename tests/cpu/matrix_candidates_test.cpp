@@ -53,6 +53,42 @@ int main() { return test::run({
         CHECK(!Projection(view(),c)); m[11]=0; CHECK(!Projection(m,c));
         m=perspective(); m[0]=std::nan(""); CHECK(!Projection(m,c));
     }},
+    {"signed lens projections never become full camera hypotheses", [] {
+        // SE5 uploads a Y-flipped lens before its moving view-projection. A
+        // lens/inverse pair is not evidence that this block contains view motion.
+        for (bool reverse : {false,true}) for (bool column : {false,true})
+        for (double sx : {-1.0,1.0}) for (double sy : {-1.0,1.0}) {
+            auto p=perspective(reverse); p[0]*=sx; p[5]*=sy;
+            Candidate c{}; CHECK(Projection(p,c) && ProjectionOnly(p));
+            const auto scan=FindMatrices(snapshot(p,column));
+            CHECK(!scan.candidates.empty());
+            for(const auto& v:scan.candidates) CHECK(v.kind==Kind::Projection);
+            Matrix inverse{}; CHECK(Invert(p,inverse));
+            CHECK(ProjectionOnly(inverse));
+            const auto inv_scan=FindMatrices(snapshot(inverse,column));
+            for(const auto& v:inv_scan.candidates)
+                CHECK(v.kind!=Kind::ViewProjection && v.kind!=Kind::InverseViewProjection);
+        }
+    }},
+    {"camera block selects moving VP after signed lens and its inverse", [] {
+        for (bool column : {false,true}) {
+            auto p=perspective(true);p[5]=-p[5];
+            Matrix v{.8,0,.6,-12,0,1,0,3,-.6,0,.8,-20,0,0,0,1};
+            Matrix vp{},ip{},ivp{};
+            for(size_t r=0;r<4;++r)for(size_t c=0;c<4;++c)for(size_t k=0;k<4;++k)
+                vp[r*4+c]+=p[r*4+k]*v[k*4+c];
+            CHECK(Invert(p,ip) && Invert(vp,ivp));
+            auto s=snapshot(v,column);s.base_offset=0;s.bytes.resize(384);
+            for(const auto& pair:std::array<std::pair<size_t,Matrix>,4>{{{64,p},{128,vp},{256,ip},{320,ivp}}}) {
+                const auto bytes=snapshot(pair.second,column).bytes;
+                std::copy(bytes.begin(),bytes.end(),s.bytes.begin()+pair.first);
+            }
+            const auto scan=FindMatrices(s);
+            const Candidate* first=nullptr;
+            for(const auto& c:scan.candidates)if(c.kind==Kind::ViewProjection && c.has_inverse_pair){first=&c;break;}
+            CHECK(first && first->byte_offset==128);
+        }
+    }},
     {"rigid view recovers position but object transforms stay hypotheses", [] {
         Candidate c{}; CHECK(RigidView(view(2),c)); NEAR(c.position[0],2,1e-9);
         auto m=view(); m[0]=2; CHECK(!RigidView(m,c));

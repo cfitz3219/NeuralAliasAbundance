@@ -47,7 +47,9 @@ inline bool Finite(const Matrix& m) {
     return true;
 }
 inline bool Projection(const Matrix& m, Candidate& c) {
-    if (!Finite(m) || m[0] <= 1e-6 || m[5] <= 1e-6 || m[0] > 1e5 || m[5] > 1e5 ||
+    // Negative focal axes are valid clip-space flips (SE5 uses negative Y).
+    // Rejecting them here lets a bare lens fall through as a combined camera.
+    if (!Finite(m) || std::abs(m[0]) <= 1e-6 || std::abs(m[5]) <= 1e-6 || std::abs(m[0]) > 1e5 || std::abs(m[5]) > 1e5 ||
         std::abs(m[2]) > 2 || std::abs(m[6]) > 2) return false;
     for (size_t index : {1u,3u,4u,7u,8u,9u,12u,13u,15u}) if (!Near(m[index],0)) return false;
     if (!Near(std::abs(m[14]),1) || std::abs(m[11]) <= 1e-12) return false;
@@ -94,6 +96,17 @@ inline bool Invert(const Matrix& m,Matrix& inverse) {
     }
     for(size_t r=0;r<4;++r) for(size_t col=0;col<4;++col) inverse[r*4+col]=a[r][col+4];
     return Finite(inverse);
+}
+// A lens or its inverse contains no view motion. Check both storage layouts at
+// the call site: the transposed inverse can otherwise resemble a valid VP too.
+inline bool ProjectionOnly(const Matrix& m) {
+    Candidate c{};
+    if (Projection(m,c)) return true;
+    // Sparse inverse-perspective shape; avoid inverting arbitrary scan windows.
+    if (!Near(std::abs(m[11]),1) || std::abs(m[14]) <= 1e-12) return false;
+    for (size_t i : {1u,2u,4u,6u,8u,9u,10u,12u,13u}) if (!Near(m[i],0)) return false;
+    Matrix inverse{};
+    return Invert(m,inverse) && Projection(inverse,c);
 }
 // Perspective times a rigid transform has a unit projective direction, a
 // parallel depth row, and orthogonal horizontal/vertical axes after removing
@@ -179,8 +192,8 @@ inline Scan FindMatrices(const Snapshot& s,bool allow_partial_hypotheses=false) 
         Matrix transposed{};
         for(size_t r=0;r<4;++r) for(size_t col=0;col<4;++col) transposed[r*4+col]=row[col*4+r];
         Candidate simple{};
-        const bool has_simple=Projection(row,simple) || RigidView(row,simple) ||
-            Projection(transposed,simple) || RigidView(transposed,simple);
+        const bool has_simple=ProjectionOnly(row) || RigidView(row,simple) ||
+            ProjectionOnly(transposed) || RigidView(transposed,simple);
         for (Layout layout : {Layout::RowMajor,Layout::ColumnMajor}) {
             Matrix m{};
             for (size_t r = 0; r < 4; ++r) for (size_t col = 0; col < 4; ++col)

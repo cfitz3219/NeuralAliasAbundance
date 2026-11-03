@@ -159,3 +159,33 @@ Next work is actual acquired-camera identity/current-previous motion. No boundar
 relaxation, preset change or new resolution-control route follows from this
 evidence. No source fix, game action, installer update or new game-success claim
 was made during this results investigation.
+
+### Subsequent matrix evidence identifies the classifier defect
+
+The discovery log does retain GPU-sampled matrix hypotheses, separate from F8's
+image metadata. Resource67/ticket4411 records one camera block containing view
+at+0, projection at+64, full VP at+128, inverse projection at+256 and inverse VP
+at+320. The projection's vertical focal scale is negative (clip Y flip); the full
+VP contains camera translation. This resolves the earlier evidence limitation
+for that sampled block without guessing a camera-origin field.
+
+Projection() incorrectly required positive focal axes. Thus FindMatrices failed
+to recognize the signed lens, classified it as a combined ViewProjection, found
+its inverse192bytes later, and offered it before the actual moving VP. That
+matches the run's learned64/inverse_delta192 and effectively zero motion. A replay
+of the actual saved matrices through the old compiled scanner selects offset64;
+the corrected scanner selects128. Raw matrices/replay inputs stay local.
+
+Corrected signed-axis projection classification and exclusion of inverse lenses
+from combined-camera candidates. The inverse-lens check first tests its sparse
+shape so ordinary scan windows do not incur another full inversion. Learned-slot
+validation now applies the same lens exclusion, allowing relearning instead of
+retaining the false camera. No game name, fixed camera offset or guessed origin
+enters the production correction.
+
+Two new generic CPU regressions fail on the old source and pass after correction:
+signed-axis lenses/inverses in both memory layouts, and lens/inverse preceding
+the true translated/rotated VP. CPU scanner13/13pass. Existing DX12 pan fixture
+now also includes the misleading signed lens/inverse ahead of the real camera,
+with flowOff and an explicit learned-camera offset assertion. Full rebuilt suite
+results follow below; this does not yet establish corrected in-game quality.

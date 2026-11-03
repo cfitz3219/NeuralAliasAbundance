@@ -916,6 +916,10 @@ bool check_learned(const std::vector<uint8_t>& bytes, na::camera::Matrix* vp, bo
 {
     const size_t n = bytes.size();
     if (g.camera_offset < 0 || static_cast<uint64_t>(g.camera_offset) + 64 > n) return false;
+    // A learned slot must obey the full scan's lens exclusion too. Otherwise a
+    // Y-flipped projection/inverse pair can stay cached as an unmoving camera.
+    const auto raw = na::camera::LoadMatrix(bytes, static_cast<size_t>(g.camera_offset), na::camera::Layout::RowMajor);
+    if (na::camera::ProjectionOnly(raw) || na::camera::ProjectionOnly(na::camera::TransposeMatrix(raw))) return false;
     for (auto layout : {na::camera::Layout::RowMajor, na::camera::Layout::ColumnMajor}) {
         const auto m = na::camera::LoadMatrix(bytes, static_cast<size_t>(g.camera_offset), layout);
         na::camera::Candidate c{};

@@ -556,6 +556,14 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         M inv{};
         Inverse(vp, inv);
         for (int i = 0; i < 300; ++i) cpu[kBlock + i] = static_cast<uint8_t>(i * 13); // other constants before the camera
+        if(inline_pan) {
+            // SE5's lens precedes its full moving VP and flips clip Y. The lens
+            // also has an inverse: it must not win camera selection just because
+            // the inverse-pair test passes. Keep flow Off in this pan fixture.
+            auto lens=Proj();lens[5]=-lens[5];M inverse_lens{};
+            REQUIRE(Inverse(lens,inverse_lens));
+            Store(cpu+kBlock+64,lens);Store(cpu+kBlock+256,inverse_lens);
+        }
         Store(cpu + kBlock + kVp, vp);
         Store(cpu + kBlock + kVp + 128, inv);
         Store(cpu + kBlock + kVp + 192, Proj()); // the camera's own projection, in the same block
@@ -796,6 +804,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         if (inline_record_first) REQUIRE(frame(1.0, true) == 0);
         const auto is = na::j2::GetStats();
         if(inline_pan) {
+            CHECK(na::j2::GetStats().camera_offset==kVp);
             CHECK(is.segment_deferrals>0 && is.segment_miss_recoveries==0);
             CHECK(is.inline_late_writes==0 && is.post_scene_batches<=2); // cold learning only
             uint32_t csub=0,dsub=0,state=0;
