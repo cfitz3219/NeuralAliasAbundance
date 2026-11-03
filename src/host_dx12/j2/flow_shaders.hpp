@@ -82,6 +82,9 @@ void accept(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         float v = t_valid[id.xy];
         float2 r = t_res[id.xy];
         float2 raw = t_raw[id.xy];
+        // Diagnostic only: total apparent image motion includes camera motion.
+        // Slot 7 is separate from the mutually exclusive acceptance bins 0..6.
+        if (v > 0.0 && v <= 1.0 && all(isfinite(raw)) && length(raw) >= snap_px) InterlockedAdd(gs[7], 1u);
         if (!(v > 0.0 && v <= 1.0) || any(isnan(r)) || any(isnan(raw)) || any(isinf(r)) || any(isinf(raw))) why = 1;
         else if (length(r) < snap_px) why = 2;
         // AMD scene-change output shares the uint input, with a distinct mode (has_cost 2).

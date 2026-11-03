@@ -12,13 +12,13 @@ int main(int argc,char**){
     if(!na::ffx_flow::DeviceSupported(d.device.Get())){std::puts("SKIP: AMD search needs 32/64-lane hardware waves");return test::kSkip;}
     const unsigned w=argc>1?1920:512,h=argc>1?1080:256;constexpr auto S=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,U=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     test::List l;REQUIRE(l.Create(d.device.Get()));std::vector<test::ComPtr<ID3D12Resource>> uploads;
-    auto image=[&](int dx,bool depth){
+    auto image=[&](int dx,bool depth,bool whole=false){
         auto fmt=depth?DXGI_FORMAT_R32_FLOAT:DXGI_FORMAT_R8G8B8A8_UNORM;
         auto r=test::CreateTexture(d.device.Get(),w,h,fmt,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_NONE);
         auto up=test::CreateBuffer(d.device.Get(),w*h*4,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);unsigned* p=nullptr;up->Map(0,nullptr,reinterpret_cast<void**>(&p));
         for(unsigned y=0;y<h;++y)for(unsigned x=0;x<w;++x){unsigned v=25;
             const int a=static_cast<int>(x)-dx;
-            if(a>=128 && a<256 && y>=64 && y<192){unsigned t=unsigned(a)*1664525u+y*1013904223u;t^=t>>13;t*=2246822519u;t^=t>>16;v=60+(t%190);}
+            if(whole || (a>=128 && a<256 && y>=64 && y<192)){unsigned t=unsigned(a)*1664525u+y*1013904223u;t^=t>>13;t*=2246822519u;t^=t>>16;v=60+(t%190);}
             p[y*w+x]=depth?0x3f000000u:0xff000000u|v*0x010101u;
         }up->Unmap(0,nullptr);D3D12_TEXTURE_COPY_LOCATION src{},dst{};
         src.pResource=up.Get();src.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;src.PlacedFootprint.Footprint={fmt,w,h,1,w*4};
@@ -64,5 +64,20 @@ int main(int argc,char**){
     f.frame=5;f.previous=4;f.reset=false;auto abandoned=cf::Record(l.list.Get(),d.queue.Get(),after.Get(),depth.Get(),camera,f,tier);CHECK(abandoned.context && tier.residual);
     l.list->Close();reset(); // deliberately discard, never publish frame5 as history
     f.frame=6;f.previous=5;auto next=cf::Record(l.list.Get(),d.queue.Get(),after.Get(),depth.Get(),camera,f,tier);CHECK(next.context && !tier.residual);execute();cf::Committed(next);reset();
+    cf::Reset();
+    // Same visible displacement, now a textured stationary world seen by a
+    // translating camera. Total image motion should be high while the extra
+    // object correction stays near zero: the camera already supplies -8px.
+    auto pan0=image(0,false,true),pan1=image(8,false,true),pan2=image(16,false,true);execute();reset();
+    camera.tier3_valid_flag=false;camera.tier3_residual=camera.tier3_valid=camera.tier3_mask=nullptr;
+    camera.view_proj_previous.m[12]=-16.f/float(w);
+    f={};f.generation=3;
+    ID3D12Resource* pans[]={pan0.Get(),pan1.Get(),pan2.Get()};
+    for(unsigned i=0;i<3;++i){f.frame=i+100;f.previous=i?f.frame-1:0;auto t=cf::Record(l.list.Get(),d.queue.Get(),pans[i],depth.Get(),camera,f,tier);REQUIRE(t.context);execute();cf::Committed(t);reset();}
+    const auto pan=cf::GetStats();
+    std::printf("camera pan: image-moving=%llu accepted-residual=%llu small=%llu total=%llu\n",(unsigned long long)pan.image_moving,(unsigned long long)pan.accepted,(unsigned long long)pan.rejected_small,(unsigned long long)pan.total);
+    CHECK(pan.image_moving>pan.total*8/10);
+    CHECK(pan.rejected_small>pan.total*8/10);
+    CHECK(pan.accepted<pan.total/20);
     cf::Reset();CHECK(d.device->GetDeviceRemovedReason()==S_OK);execute();return test::finish("j2_compute_flow_test");
 }

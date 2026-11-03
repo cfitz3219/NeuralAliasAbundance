@@ -90,6 +90,7 @@ void collect(Context& c){for(auto& entry:c.leases){auto& s=*entry;if(!s.pair || 
     if(s.frame>=stats.sample_frame){void* p=nullptr;D3D12_RANGE range{0,64};
         if(SUCCEEDED(s.readback->Map(0,&range,&p))){const auto* b=static_cast<const unsigned char*>(p);const auto* v=reinterpret_cast<const unsigned*>(b);
             stats.accepted=v[0];stats.rejected_invalid=v[1];stats.rejected_small=v[2];stats.rejected_cost=v[3];stats.rejected_offscreen=v[4];stats.rejected_image=v[5];stats.rejected_flicker=v[6];
+            stats.image_moving=v[7];
             stats.total=0;for(unsigned j=0;j<7;++j)stats.total+=v[j];stats.sample_frame=s.frame;sample_tick=GetTickCount64();++stats.samples;
             if(s.timestamps && c.frequency){UINT64 t[2]{};memcpy(t,b+48,16);stats.ms=t[1]>=t[0]?double(t[1]-t[0])*1000.0/double(c.frequency):0;}
             D3D12_RANGE none{};s.readback->Unmap(0,&none);}}
@@ -179,8 +180,8 @@ void DescribeStats(const Stats& s,char* text,size_t capacity){
         s.submitted?" recently":" yet",s.reason,(unsigned long long)s.submitted,(unsigned long long)s.submitted_pairs,(unsigned long long)(s.busy+s.unavailable));return;}
     if(!s.samples || !s.total){std::snprintf(text,capacity,"AMD flow: frames submitting. Paired %llu / %llu, skipped %llu. Waiting for a completed pixel sample.",
         (unsigned long long)s.submitted_pairs,(unsigned long long)s.submitted,(unsigned long long)(s.busy+s.unavailable));return;}
-    std::snprintf(text,capacity,"AMD flow: paired %llu / %llu frames, skipped %llu. Last completed sample: %.2f%% moving pixels, %.2f ms (frame %llu, %llu frames behind).",
-        (unsigned long long)s.submitted_pairs,(unsigned long long)s.submitted,(unsigned long long)(s.busy+s.unavailable),100.0*double(s.accepted)/double(s.total),s.ms,
+    std::snprintf(text,capacity,"AMD flow: paired %llu / %llu frames, skipped %llu. Last completed sample: image motion %.2f%%; object corrections %.2f%%; below 0.5 px %.1f%%. %.2f ms (frame %llu, %llu frames behind).",
+        (unsigned long long)s.submitted_pairs,(unsigned long long)s.submitted,(unsigned long long)(s.busy+s.unavailable),100.0*double(s.image_moving)/double(s.total),100.0*double(s.accepted)/double(s.total),100.0*double(s.rejected_small)/double(s.total),s.ms,
         (unsigned long long)s.sample_frame,(unsigned long long)(s.last_submitted_frame>=s.sample_frame?s.last_submitted_frame-s.sample_frame:0));
 }
 }

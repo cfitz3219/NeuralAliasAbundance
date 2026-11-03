@@ -117,6 +117,7 @@ struct ListState {
     bool raster_jittered = false;
     double raster_jitter[2] = {};
     bool restorable = true;              // false after work whose state effects we cannot replay
+    bool closed = false;                 // no appending after Close until successful Reset
     bool in_render_pass = false;         // between BeginRenderPass and EndRenderPass (no host copy/dispatch allowed)
     int8_t mip_level = -1;               // live mip bias: twin level latched at Reset (-1 = the game's own objects)
 };
@@ -156,6 +157,30 @@ struct DescHeap {
         uint32_t cbv_size = 0;   // CBV: SizeInBytes
     };
     std::vector<SlotInfo> info; // last observed write per slot (record-time CPU view)
+    // Sparse lookup of observed SRVs in shader-visible heaps. The selected
+    // scene may be anywhere in a finite/unbounded descriptor table, not just
+    // its first 64 entries. Updated with the existing descriptor shadow under
+    // g_m; a draw queries the selected resource rather than scanning the heap.
+    std::unordered_map<na_object_id, std::vector<uint32_t>> srv_slots;
+    void Store(uint32_t slot, SlotInfo value) {
+        const auto indexed=[](const SlotInfo& v){return v.kind==NA_DESC_SRV && v.resource && v.resource!=NA_UNKNOWN_U64;};
+        const SlotInfo old=info[slot];
+        if(gpu_start && (old.kind!=value.kind || old.resource!=value.resource)) {
+            if(indexed(old)) {
+                auto it=srv_slots.find(old.resource);
+                if(it!=srv_slots.end()) {
+                    auto& v=it->second;auto p=std::lower_bound(v.begin(),v.end(),slot);
+                    if(p!=v.end() && *p==slot)v.erase(p);
+                    if(v.empty())srv_slots.erase(it);
+                }
+            }
+            if(indexed(value)) {
+                auto& v=srv_slots[value.resource];auto p=std::lower_bound(v.begin(),v.end(),slot);
+                if(p==v.end() || *p!=slot)v.insert(p,slot);
+            }
+        }
+        info[slot]=value;
+    }
 };
 
 struct VaRange {
@@ -222,6 +247,7 @@ std::unordered_map<na_object_id, const void*> g_res_keys; // resource id -> cano
 std::atomic<uint64_t> g_next_id{1};
 
 struct Counters {
+    std::atomic<uint64_t> wide_scene_reads{0};
     std::atomic<uint64_t> nested_unlocked{0}, serialized{0};
     std::atomic<uint64_t> snap_reread{0}, preexisting_resources{0}, preexisting_heaps{0}, sample_known_state{0}, known_clears{0};
     std::atomic<uint64_t> sample_missing_recording{0}, sample_partial_coverage{0}, sample_partial_states{0}, sample_no_transition{0};
@@ -800,7 +826,7 @@ void note_descriptor_write(D3D12_CPU_DESCRIPTOR_HANDLE dst, uint32_t kind, IUnkn
             e.resource = NA_UNKNOWN_U64; // resource-backed, but created before observation
             e.hdr.flags |= NA_EVF_METHOD_UNOBSERVED;
         }
-        h->info[slot] = DescHeap::SlotInfo{kind, e.resource, format, first_sub, 0, 0};
+        h->Store(slot, DescHeap::SlotInfo{kind, e.resource, format, first_sub, 0, 0});
     }
     e.descriptor_kind = kind;
     e.format = format;
@@ -830,7 +856,7 @@ void note_descriptor_copy(uint64_t dst, uint64_t src, uint32_t count, uint32_t i
             run = std::min({count, dh->count - ds, sh->count - ss});
             for (uint32_t i = 0; i < run; ++i) {
                 ++dh->versions[ds + i];
-                dh->info[ds + i] = sh->info[ss + i]; // contents follow the source's record-time view
+                dh->Store(ds + i, sh->info[ss + i]); // contents follow the source's record-time view
             }
             e.src_heap = sh->id;
             e.dst_heap = dh->id;
@@ -1076,8 +1102,8 @@ void STDMETHODCALLTYPE D_CreateConstantBufferView(ID3D12Device* dev, const D3D12
         e.heap = dh->id;
         e.slot = slot;
         e.slot_version = ++dh->versions[slot];
-        dh->info[slot] = DescHeap::SlotInfo{NA_DESC_CBV, desc && desc->BufferLocation ? (known ? res : NA_UNKNOWN_U64) : 0, NA_UNKNOWN_U32, 0,
-                                            known ? off : 0, desc ? desc->SizeInBytes : 0};
+        dh->Store(slot, DescHeap::SlotInfo{NA_DESC_CBV, desc && desc->BufferLocation ? (known ? res : NA_UNKNOWN_U64) : 0, NA_UNKNOWN_U32, 0,
+                                            known ? off : 0, desc ? desc->SizeInBytes : 0});
     }
     e.descriptor_kind = NA_DESC_CBV;
     e.resource = desc && desc->BufferLocation ? (known ? res : NA_UNKNOWN_U64) : 0;
@@ -1437,6 +1463,7 @@ HRESULT STDMETHODCALLTYPE D_Signal(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64
 }
 HRESULT STDMETHODCALLTYPE D_Wait(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v)
 {
+    if (t_host_work) return o_Wait(q, f, v); // private cross-queue completion, like D_Signal
     const auto token = ExecuteBegin(q);
     const HRESULT hr = o_Wait(q, f, v);
     sync_event(NA_EV_QUEUE_WAIT, token, f, v, hr);
@@ -2191,6 +2218,22 @@ uint64_t float_bits(float a, float b)
 
 using GL = ID3D12GraphicsCommandList;
 
+// Pipeline-library loads (and objects predating observation) do not pass through
+// Create*PipelineState. Use the retirement-aware identity service for them too.
+void preexisting_pipeline(ID3D12PipelineState* pso)
+{
+    if (!pso || t_host_work || !na::observe_internal::Started() || lookup(pso)) return;
+    bool created = false;
+    const auto id = ensure_registered(pso, NA_OBJ_PIPELINE_HOST, &created);
+    if (!created) return;
+    na_ev_pipeline_created e;
+    init_header(e, NA_EV_PIPELINE_CREATED, NA_EVF_FOUNDATIONAL | NA_EVF_PREEXISTING);
+    pipeline_unknowns(e);
+    e.pipeline = id; e.pipeline_kind = NA_UNKNOWN_U32; e.rt_count = NA_UNKNOWN_U32;
+    remember_creation(pso, e);
+    emit(e, NA_GROUP_PIPELINE);
+}
+
 // Per-slot recording, run after the original call (only on the outermost scope).
 template <uint32_t Slot>
 struct On;
@@ -2200,6 +2243,7 @@ struct On<sl::list::Reset> {
     static void run(GL* l, HRESULT hr, ID3D12CommandAllocator* alloc, ID3D12PipelineState* pso)
     {
         if (t_host_work) return;
+        if (SUCCEEDED(hr)) preexisting_pipeline(pso);
         na_object_id id = 0;
         bool known = false;
         uint64_t gen = 0;
@@ -2223,6 +2267,7 @@ struct On<sl::list::Reset> {
                 {
                     std::lock_guard<std::mutex> bl(ls->bind_m);
                     ls->bindings.clear();
+                    ls->closed = false;
                     ls->states.clear();
                     ls->evidence_complete = true;
                     ls->uses.clear();
@@ -2274,6 +2319,7 @@ struct On<sl::list::Close> {
     {
         Rec r;
         if (!begin_op(l, &r)) return;
+        with_list_state(l, [&](ListState& ls) { std::lock_guard<std::mutex> bl(ls.bind_m); ls.closed = true; });
         na_ev_list_reset_close e;
         init_header(e, NA_EV_LIST_CLOSE, 0);
         e.list = r.list;
@@ -2290,13 +2336,14 @@ void note_draw(GL* l) {
     std::lock_guard<std::mutex> bl(ls->bind_m);
     uint64_t sel_depth = 0, sel_color = 0;
     GetLiveSelection(&sel_depth, &sel_color);
+    const auto pipeline = g_objs.find(canon(ls->pso));
+    const auto pipeline_id = pipeline == g_objs.end() ? 0 : pipeline->second.id;
     for (uint32_t i = 0; i < ls->cur_nrt; ++i)
         if (ls->cur_rts[i]) {
-            na::j2::InsertionEvent ev{ls->cur_rts[i], 0, reinterpret_cast<uint64_t>(ls->pso), true, na::j2::Op::DrawWrite};
+            na::j2::InsertionEvent ev{ls->cur_rts[i], 0, pipeline_id, true, na::j2::Op::DrawWrite};
             ev.with_depth = sel_depth && ls->cur_ds == sel_depth; // scene content, not a reuse of the texture
             ls->insertion.Add(ev);
         }
-    auto pipeline = g_objs.find(canon(ls->pso));
     if (ls->cur_ds && ls->cur_ds_sub != NA_UNKNOWN_U32 && pipeline != g_objs.end() &&
         pipeline->second.created.size() >= sizeof(na_ev_pipeline_created)) {
         const auto* p = reinterpret_cast<const na_ev_pipeline_created*>(pipeline->second.created.data());
@@ -2447,6 +2494,7 @@ struct On<sl::list::SetPipelineState> {
     {
         Rec r;
         if (!begin_op(l, &r)) return;
+        preexisting_pipeline(p);
         emit_op(r, NA_OP_SET_PIPELINE, {id_or_unknown(p)});
         with_list_state(l, [&](ListState& ls) { std::lock_guard<std::mutex> bl(ls.bind_m); ls.pso = p; });
     }
@@ -2602,6 +2650,7 @@ void shadow_arg(GL* l, uint32_t compute, UINT param, uint8_t type, uint64_t valu
     });
 }
 std::atomic<TableBindCallback> g_table_cb{nullptr};
+std::atomic<ListCloseCallback> g_close_cb{nullptr};
 template <uint32_t Compute>
 void root_table(GL* l, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE h)
 {
@@ -3025,6 +3074,21 @@ void after_texture_copy(GL* l, ID3D12Resource* dst)
 
 std::atomic<RasterJitterCallback> g_raster_jitter_cb{nullptr};
 thread_local bool t_raster_draw = false; // validation wrappers can forward to another hooked list
+// Append only while the recording is open, before the original Close call.
+void before_list_close(GL* l)
+{
+    const auto cb = g_close_cb.load(std::memory_order_acquire);
+    if (!cb || !l || t_host_work || !na::observe_internal::Started()) return;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_m);
+        na_object_id id = 0;
+        auto* ls = list_state_locked(l, &id);
+        if (!ls || !ls->recording_observed.load()) return;
+        std::lock_guard<std::mutex> bl(ls->bind_m);
+        if (ls->closed) return;
+    }
+    cb(l);
+}
 // Translate raster coordinates, rather than assuming a readable camera block
 // is the one the vertex shader uses. Scope the change to one actual draw: a
 // following fullscreen pass, HUD, copy or host dispatch sees the game's state.
@@ -3038,6 +3102,8 @@ struct RasterJitterDraw {
         uint64_t depth = 0, color = 0;
         GetLiveSelection(&depth, &color);
         uint32_t w = 0, h = 0, f = 0;
+        bool already_applied = false;
+        double x = 0, y = 0;
         {
             std::shared_lock<std::shared_mutex> rl(g_m);
             na_object_id lid = 0;
@@ -3056,17 +3122,32 @@ struct RasterJitterDraw {
             if (v.TopLeftX != 0 || v.TopLeftY != 0 || v.Width != float(w) || v.Height != float(h)) return;
             original[0] = v;
             count = 1;
+            already_applied = ls->raster_jittered;
+            if (already_applied) { x = ls->raster_jitter[0]; y = ls->raster_jitter[1]; }
         }
-        double x = 0, y = 0;
-        if (!cb(w, h, &x, &y) || !std::isfinite(x) || !std::isfinite(y)) { count = 0; return; }
+        double suggested_x = 0, suggested_y = 0;
+        const bool suggested = cb(w, h, &suggested_x, &suggested_y);
+        if (!already_applied) {
+            x = suggested_x; y = suggested_y;
+            if (!suggested || !std::isfinite(x) || !std::isfinite(y)) { count = 0; return; }
+        }
         {
             std::shared_lock<std::shared_mutex> rl(g_m);
             na_object_id lid = 0;
             auto* ls = list_state_locked(l, &lid);
             if (!ls) { count = 0; return; }
             std::lock_guard<std::mutex> bl(ls->bind_m);
-            ls->raster_jittered = true;
-            ls->raster_jitter[0] = x; ls->raster_jitter[1] = y;
+            // Present can advance the suggested sample while a render worker
+            // is still recording. Keep one actual sample for this recording;
+            // NGX cannot unjitter different parts of one image with two phases.
+            // Reset clears this ownership. The callback still counts each
+            // qualifying draw, but cannot replace an already applied sample.
+            if (ls->raster_jittered) {
+                x = ls->raster_jitter[0]; y = ls->raster_jitter[1];
+            } else {
+                ls->raster_jittered = true;
+                ls->raster_jitter[0] = x; ls->raster_jitter[1] = y;
+            }
         }
         auto shifted = original[0];
         shifted.TopLeftX += float(x); shifted.TopLeftY += float(y);
@@ -3089,7 +3170,7 @@ void before_shader_use(GL* l, bool compute)
     uint64_t depth = 0, color = 0;
     GetLiveSelection(&depth, &color);
     if (!color) return;
-    bool reads_color = false;
+    bool reads_color = false, wide_color = false;
     {
         std::shared_lock<std::shared_mutex> lock(g_m);
         na_object_id lid = 0;
@@ -3098,6 +3179,8 @@ void before_shader_use(GL* l, bool compute)
         std::lock_guard<std::mutex> bl(ls->bind_m);
         const auto signature = g_objs.find(canon(ls->root_sig[compute]));
         if (signature == g_objs.end()) return;
+        const auto pipeline = g_objs.find(canon(ls->pso));
+        const auto pipeline_id = pipeline == g_objs.end() ? 0 : pipeline->second.id;
         na_object_id destination = compute ? 0 : ls->cur_rt;
         uint8_t color_srvs = 0;
         na_object_id srv_ids[16] = {};
@@ -3117,6 +3200,22 @@ void before_shader_use(GL* l, bool compute)
             for (uint32_t r = 0; r < params[p].count && params[p].first_range + r < ranges.size(); ++r) {
                 const auto& range = ranges[params[p].first_range + r];
                 if (range.table_offset == NA_UNKNOWN_U32) continue;
+                if(range.range_type==D3D12_DESCRIPTOR_RANGE_TYPE_SRV) {
+                    const auto found=heap->srv_slots.find(color);
+                    if(found!=heap->srv_slots.end()) {
+                        const uint64_t first=uint64_t(slot)+range.table_offset;
+                        const uint64_t end=(std::min)(uint64_t(heap->count),first+range.num_descriptors);
+                        // The small prefix below still collects role metadata.
+                        // This indexed suffix closes its scene-colour blind spot.
+                        const uint64_t suffix=first+(std::min)(range.num_descriptors,64u);
+                        if(suffix<end) {
+                            auto i=std::lower_bound(found->second.begin(),found->second.end(),static_cast<uint32_t>(suffix));
+                            for(;i!=found->second.end() && *i<end;++i) {
+                                reads_color=true;wide_color=true;if(color_srvs<255)++color_srvs;
+                            }
+                        }
+                    }
+                }
                 for (uint32_t k = 0; k < std::min<uint32_t>(range.num_descriptors, 64); ++k) {
                     const uint64_t index = uint64_t(slot) + range.table_offset + k;
                     if (index >= heap->count) break;
@@ -3136,7 +3235,7 @@ void before_shader_use(GL* l, bool compute)
         }
         if (reads_color) {
             // Role-class inputs (only for the few draws that read the scene colour).
-            na::j2::InsertionEvent ev{color, destination, reinterpret_cast<uint64_t>(ls->pso), false,
+            na::j2::InsertionEvent ev{color, destination, pipeline_id, false,
                                       compute ? na::j2::Op::ComputeRead : na::j2::Op::GraphicsRead,
                                       signature->second.root_hash};
             ev.color_srvs = color_srvs;
@@ -3151,9 +3250,10 @@ void before_shader_use(GL* l, bool compute)
         } else {
             reads_derived = is_derived_any(srv_ids, nsrv);
             if (reads_derived) // lineage only: the scene chain continues through a copy
-                ls->insertion.Add({color, destination, reinterpret_cast<uint64_t>(ls->pso), false, na::j2::Op::DerivedRead});
+                ls->insertion.Add({color, destination, pipeline_id, false, na::j2::Op::DerivedRead});
         }
     }
+    if(wide_color)g_c.wide_scene_reads.fetch_add(1,std::memory_order_relaxed);
     if (reads_color) if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, compute);
 }
 
@@ -3262,6 +3362,8 @@ struct ListHook<Slot, R(A...)> {
     {
         na::hooking::variants::CallScope scope(l, Slot);
         auto fn = reinterpret_cast<Pfn>(orig[I]);
+        if constexpr (Slot == sl::list::Close)
+            if (scope.outermost && !scope.ambiguous) before_list_close(l);
         if constexpr (Slot == sl::list::ResourceBarrier) {
             if(scope.outermost && !scope.ambiguous)if(auto listener=g_barrier_listener.load())listener(l,a...);
             if(!g_full_list_tracking.load()){fn(l,a...);return;}
@@ -4799,16 +4901,17 @@ void ResetDerived()
     std::lock_guard<std::mutex> lk(g_derived_m);
     g_derived_n.store(0, std::memory_order_release);
 }
-na::j2::LiveConsumer ListLiveConsumer(ID3D12CommandList* list, na_object_id color)
+na::j2::LiveConsumer ListLiveConsumer(ID3D12CommandList* list, na_object_id color, bool at_end)
 {
     std::shared_lock<std::shared_mutex> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return {};
     std::lock_guard<std::mutex> bl(ls->bind_m);
-    return ls->insertion.Live(color);
+    return ls->insertion.Live(color, at_end);
 }
 void SetTableBindCallback(TableBindCallback cb) { g_table_cb.store(cb, std::memory_order_release); }
+void SetListCloseCallback(ListCloseCallback cb) { g_close_cb.store(cb, std::memory_order_release); }
 void SetRasterJitterCallback(RasterJitterCallback cb) { g_raster_jitter_cb.store(cb, std::memory_order_release); }
 bool ListRasterJitter(ID3D12CommandList* list, double* x, double* y)
 {
@@ -5236,6 +5339,7 @@ ProducerStats GetProducerStats()
     s.preexisting_heaps = g_c.preexisting_heaps.load();
     s.sample_known_state = g_c.sample_known_state.load();
     s.known_state_clears = g_c.known_clears.load();
+    s.wide_scene_reads = g_c.wide_scene_reads.load();
     s.known_store_disabled = g_known_disabled.load() ? 1u : 0u;
     s.unhooked_queues = g_unhooked_queues.load();
     {

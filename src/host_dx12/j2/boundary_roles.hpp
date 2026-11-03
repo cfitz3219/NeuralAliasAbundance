@@ -28,8 +28,12 @@ public:
         auto& r=it->second;
         const bool middle=r.middles>=2 && frame-r.middle<=age;
         const bool end=r.ends>=3 && frame-r.end<=age;
-        if(middle && (!r.end || frame-r.end>age) && frame>r.retry) {r.deferred=frame;return Middle;}
-        if(end && (!r.middle || frame-r.middle>age))return End;
+        // A pooled occurrence can alternate jobs less often than the freshness
+        // window. Retain that contradiction while the entry is active: aging
+        // just its less frequent role recreates both missed and early frames.
+        // Close still retires the whole entry after it becomes unused.
+        if(middle && !r.end && frame>r.retry) {r.deferred=frame;return Middle;}
+        if(end && !r.middle)return End;
         return Unknown; // a pooled list/writer seen in both jobs is ambiguous
     }
     bool Close(const std::vector<ColorEvent>& events,bool complete,bool ran,uint64_t frame) {

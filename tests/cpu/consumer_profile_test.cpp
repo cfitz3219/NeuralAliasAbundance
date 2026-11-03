@@ -180,6 +180,33 @@ int main()
         check(p4.Judge(bk, kGeo2, 0) == ConsumerProfile::Verdict::AcceptedWithProducer &&
               p4.Judge(cls_of(tonemap(401)), kGeo2) == ConsumerProfile::Verdict::Accepted, "gamma frame: barrier pattern and later-list consumer accepted");
     }
+    // Distinct shaders can share all structural inputs. The final scene object
+    // changes every frame; the actual post consumer remains the same shader.
+    {
+        ConsumerProfile p;
+        const auto middle = consumer(22, 501, W, H, 10, kGeo);
+        auto final = consumer(22, 502, W, H, 10, kGeo);
+        for (uint64_t f=1; f<=3; ++f) {
+            final.producer = 1000+f;
+            learn(p,{write(true,kGeo),middle,write(true,final.producer),final},f);
+        }
+        auto structural = cls_of(final), precise = structural;
+        precise.pipeline = 502;
+        check(p.Judge(structural,9000)==ConsumerProfile::Verdict::Ambiguous,"shared layout remains ambiguous");
+        check(p.Judge(precise,9000)==ConsumerProfile::Verdict::Accepted,"exact post consumer survives new final objects");
+        check(p.HasRecentExactEntry(4),"recent exact consumer takes priority over barrier prediction");
+        check(!p.HasRecentExactEntry(5),"an absent consumer does not indefinitely suppress barrier-only routing");
+        precise.pipeline=501;
+        check(p.Judge(precise,kGeo)==ConsumerProfile::Verdict::Rejected,"identical-layout middle shader stays rejected");
+        precise.pipeline=503;
+        check(p.Judge(precise,kGeo)==ConsumerProfile::Verdict::Unknown,"a replacement PSO lifetime does not inherit acceptance");
+        precise.pipeline=502; p.Contradict(precise,9000,4);
+        check(p.Judge(precise,9000)!=ConsumerProfile::Verdict::Accepted,"later scene work demotes the exact consumer too");
+        check(!p.HasRecentExactEntry(4),"a contradicted consumer no longer takes priority");
+        ConsumerProfile reused;
+        for (uint64_t f=1;f<=3;++f) learn(reused,{write(),final,write(false,0,Op::ClearWrite)},f);
+        check(!reused.HasRecentExactEntry(4),"a read before clear/reuse does not suppress the final barrier-only path");
+    }
     // Bounded: many distinct classes never grow past the cap.
     {
         ConsumerProfile p;

@@ -72,6 +72,8 @@ int main()
     CHECK(after.recording_slots<=25&&after.image_slots<=26); // resources plateau and recycle
     CHECK(after.total==w*h&&after.accepted+after.rejected_invalid+after.rejected_small+after.rejected_cost+after.rejected_offscreen+after.rejected_image+after.rejected_flicker==after.total);
     char line[500];cf::DescribeStats(after,line,sizeof line);CHECK(std::strstr(line,"Last completed sample")&&std::strstr(line,"frames behind"));
+    CHECK(std::strstr(line,"image motion") && std::strstr(line,"object corrections"));
+    CHECK(after.image_moving<=after.total);
     auto stale=after;stale.submit_age_ms=10000;cf::DescribeStats(stale,line,sizeof line);CHECK(std::strstr(line,"no new submission")&&!std::strstr(line,"moving pixels"));
     // Old executable work remains valid after later recordings change bindings.
     for(unsigned i=0;i<held.size();++i){auto& list=held[i];ID3D12CommandList* ls[]{list->list.Get()};{na::nr::native::Submission receipt(d.queue.Get(),1,ls);d.queue->ExecuteCommandLists(1,ls);}d.WaitIdle();

@@ -23,6 +23,16 @@ int main(){
     uint64_t sample{};REQUIRE(na_observe_sample_request(&r,&sample)==NA_OK);
     test::ComPtr<ID3D12Fence> fence;
     REQUIRE(SUCCEEDED(d.device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence))));
+    // Our private cross-queue completion wait is not a game reentry. It must
+    // leave the enclosing game's occurrence intact, just like a private Signal.
+    const auto private_before=na::observe::GetProducerStats();
+    const auto private_outer=na::observe::ExecuteBegin(d.queue.Get());
+    {
+        const na::observe::HostWorkScope host;
+        CHECK(SUCCEEDED(d.queue->Wait(fence.Get(),0)));
+    }
+    na::observe::ExecuteEnd(private_outer,d.queue.Get(),0,nullptr);
+    CHECK(na::observe::GetProducerStats().ambiguous_executes==private_before.ambiguous_executes);
     // Reproduce Anno's driver Wait callback inside the forwarded Execute scope.
     // This is not a game submission or evidence of texture-copy completion.
     const auto outer=na::observe::ExecuteBegin(d.queue.Get());
