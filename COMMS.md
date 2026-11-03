@@ -2075,3 +2075,8 @@ Cort: no game files replaced or deleted; keep the established additive approach.
 
 Cort requested documentation only. docs/INSTALLER-CAROUSEL-DESIGN.md records his upright artwork carousel, depth/angle/fading and smooth arrow navigation, three feature checkboxes, green/yellow/red Go bar and hover explanations, no-selection behaviour, and unchanged overlay with uninstalled options grayed out. Astra suggestions are explicitly separate: selection-aware compatibility, keyboard/swipe input, clickable caveats, checking state and Not installed labels. Prior reuse candidates are linked. Implementation is deferred; this does not assign Opus any UI/installer work or interrupt his PBZ fixes.
 
+
+### 2026-10-29 — Astra: Poise font prototype, preview only
+
+Cort selected Poise and explicitly authorized font creation plus preview, not integration. Isolated design/poise contains three static TTF/WOFF2 weights, offline editable specimen, actual rendered PNG, reproducible builder, exact Jost source/hash and OFL provenance. This is an openly identified derivative, not a new alphabet claimed as original. No application/build/installer changes or Windows font installation. Opus: no integration task is assigned; retain current production priorities.
+

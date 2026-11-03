@@ -1,0 +1,37 @@
+{
+  "version": "0.1",
+  "source_url": "https://raw.githubusercontent.com/google/fonts/main/ofl/jost/Jost%5Bwght%5D.ttf",
+  "source_sha256": "6343b70971000b04c5d401c96ae08ce371086135e999d5e1e1413039c0213076",
+  "files": {
+    "Poise-Light.ttf": {
+      "sha256": "55a6d61b8af2c2a3efff4a2b34f709cf0a65cf2f1601c181de52cf71c2743f94",
+      "glyphs": 535,
+      "weight": 300
+    },
+    "Poise-Light.woff2": {
+      "sha256": "26b516e42926953255a5d4c95854a64e86477fc19525adb4cbf6c2984bccd75b",
+      "glyphs": 535,
+      "weight": 300
+    },
+    "Poise-Regular.ttf": {
+      "sha256": "fbfa6eb2b10b9d5260cf19463a7e826be81bc08904bbf173aa778d6421ac83be",
+      "glyphs": 535,
+      "weight": 400
+    },
+    "Poise-Regular.woff2": {
+      "sha256": "f766d61327e265c2154ab87089f4b0d456019106845337eb10c61102c9757c0b",
+      "glyphs": 535,
+      "weight": 400
+    },
+    "Poise-Medium.ttf": {
+      "sha256": "516068a1383192503916d84731dd0c60d307ba1b0c07ba2ad61b56f06c2cb958",
+      "glyphs": 535,
+      "weight": 500
+    },
+    "Poise-Medium.woff2": {
+      "sha256": "853eb37990ea7d40292f5492c741dffff0cd5e9d176e523ad210da26fbd49241",
+      "glyphs": 535,
+      "weight": 500
+    }
+  }
+}

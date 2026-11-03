@@ -252,3 +252,8 @@ At Cort's instruction built but did not test. Installed combined consumer-anchor
 
 Recorded Cort's complete carousel/feature-selector/action-bar/overlay requirements in docs/INSTALLER-CAROUSEL-DESIGN.md. Separated assistant suggestions and earlier installer reuse ideas from user requirements; noted unresolved presentation choices without creating implementation tasks. User explicitly says not to build yet. No code/game/deployment changes or tests; documentation inspection only. No user attendance required.
 
+
+## 2026-10-29 — Poise 0.1 font prototype delivered separately
+
+Created Light/Regular/Medium static TTF and WOFF2 from Jost OFL source. Lowered A crossbar12/1000em, curved lowercase l foot, minor spacing changes; kept provenance and renamed derivative. Removed stale hinting on modified outlines. Reopened/decompiled all six files and verified required sample glyph coverage/family/weight metadata; rendered actual fonts via Pillow and visually inspected PNG. Added offline editable HTML with 12–18px samples. Initial upstream pinned source URL404; downloaded Google Fonts file and pinned exact bytes/SHA256 in package. No application/game/installer changes or system font install; no native DirectWrite or in-game qualification claimed. User attendance unnecessary. Full limitations in design/poise/README.md.
+
