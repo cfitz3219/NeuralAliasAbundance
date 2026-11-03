@@ -1,3 +1,5 @@
+#include <thread>
+#include <atomic>
 // Reconstructed 2026-10 (C3). Mirrors WORKLOG-ROUTE-A A5/A45/A46/A47:
 // hooks ID3D12CommandQueue::ExecuteCommandLists (vtable slot 10) on a real
 // device, proves the detour observes real submissions with correct args and
@@ -50,6 +52,20 @@ int main()
     REQUIRE(l.Create(d.device.Get()));
     REQUIRE(na::hooking::Initialize());
     CHECK(na::hooking::InstalledCount() == 0);
+
+    // Competing feature workers wait; nesting and a bounded timeout report a
+    // failure without acquiring or abandoning the other worker's transaction.
+    {
+        REQUIRE(na::hooking::BeginInstall());
+        CHECK(!na::hooking::BeginInstallWait("nested fixture",100));
+        std::atomic<bool> timed_out{false},acquired{false};
+        std::thread short_wait([&]{timed_out=!na::hooking::BeginInstallWait("timeout fixture",20);});
+        short_wait.join();CHECK(timed_out);
+        char reason[160]{};na::hooking::LastError(reason,sizeof(reason));
+        CHECK(std::strstr(reason,"timeout fixture") && std::strstr(reason,"timed out"));
+        std::thread worker([&]{acquired=na::hooking::BeginInstallWait("waiting feature",2000);if(acquired)na::hooking::AbandonInstall();});
+        Sleep(40);CHECK(!acquired);na::hooking::AbandonInstall();worker.join();CHECK(acquired);
+    }
 
     // 1. Hook slot 10 through the queue's vtable; original published before enable.
     REQUIRE(na::hooking::HookVTableSlot(d.queue.Get(), kSlotExecute, reinterpret_cast<void*>(&DetourExecute),

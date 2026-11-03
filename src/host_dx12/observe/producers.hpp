@@ -35,6 +35,7 @@ struct ID3D12CommandQueue;
 struct ID3D12CommandList;
 struct ID3D12GraphicsCommandList;
 struct ID3D12Resource;
+struct D3D12_RESOURCE_BARRIER;
 struct IDXGISwapChain;
 
 namespace na::observe {
@@ -45,6 +46,10 @@ namespace na::observe {
 // ExecuteCommandLists hook and passes false, calling ExecuteBegin/End from its
 // detour instead. Idempotent; returns false if a required hook failed.
 bool InstallProducers(ID3D12Device* device, ID3D12CommandQueue* queue, bool hook_queue_execute);
+// Lightweight recording lifetime hook when the full graphics observer is off.
+// Install-thread only; shares the Reset thunk with the full observer.
+bool InstallListResetTracking(ID3D12Device* device, void (*listener)(ID3D12GraphicsCommandList*),
+    void (*barriers)(ID3D12GraphicsCommandList*,unsigned int,const D3D12_RESOURCE_BARRIER*)=nullptr);
 
 // Game host wiring: [observe] producers=1 requests installation; the overlay
 // installs on its throwaway device/queue and then reports ProducersActive().
@@ -160,7 +165,10 @@ bool KnownSubStateInCurrentSubmission(na_object_id id, uint32_t sub, uint32_t* s
 // The subresource's state after all work submitted so far (no submission context:
 // for host work recorded during the game's recording). False when unknown/in flight.
 bool KnownSubStateNow(na_object_id id, uint32_t sub, uint32_t* state);
+void DescribeStateEvidence(ID3D12CommandList* list, na_object_id id, uint32_t sub, char* text, size_t capacity);
 bool ListLastStateSub(ID3D12CommandList* list, na_object_id id, uint32_t sub, uint32_t* state);
+enum class StateLookup { Absent, Known, Unavailable };
+StateLookup ListStateSub(ID3D12CommandList* list, na_object_id id, uint32_t sub, uint32_t* state);
 // Texture LOD bias added to the game's mip-mapped samplers (sampler descriptors
 // and root-signature static samplers) created from now on; 0 = off. For J2 DLAA
 // with jitter (temporal reconstruction needs sharper per-frame texture samples).

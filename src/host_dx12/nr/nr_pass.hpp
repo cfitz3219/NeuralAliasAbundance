@@ -1,21 +1,6 @@
-// Live Neural Rendering pass (phase 3 of docs/NR-INSERTION-DESIGN.md, A30).
-//
-// Runs NVIDIA's neural renderer (NGX feature 18, "DLSSNR" community
-// contract) on the finished frame at Present, on the game's direct queue,
-// using the game's own NGX instance (entry points handed in by the proxy).
-// Depth and motion vectors are copied into NeuralAlias-owned textures at the
-// DLSS evaluate (the game's buffers rotate), published at queue submission.
-// Scaled modes upsample depth/motion to the display extent before evaluation.
-//
-// Colour handling (docs/NR-TLOU-I-REPLAY.md): NR is proven on display-encoded
-// SDR. An HDR10 (PQ, RGB10A2) chain is decoded by a compute pass
-// (PQ -> nits / paper white -> sRGB-encoded RGBA16F) before NR and
-// re-encoded after. SDR chains are processed in their own format.
-//
-// Safety: any NGX or D3D failure latches the pass OFF with a reason; the
-// frame is then presented untouched. Never waits on the GPU in hooks. All
-// settings come from na::settings (menu + ini); nothing runs unless
-// `nr_enabled` is set and the runtime entry points are present.
+// NR routing: native_fg.hpp handles paired real-frame processing before native FG.
+// This module provides the non-FG Present fallback and submitted input snapshots.
+// Design, primary sources, automated evidence and limits: docs/PBZ-PRE-FG-NR.md.
 #pragma once
 
 #include <d3d12.h>
@@ -35,6 +20,8 @@ struct Runtime {
     void* destroy_parameters = nullptr;  // NVSDK_NGX_D3D12_DestroyParameters
     void* get_capability_parameters = nullptr; // NVSDK_NGX_D3D12_GetCapabilityParameters
 };
+// Called before the owning NGX core shuts down; never call its freed objects again.
+void OnRuntimeShutdown(const Runtime& runtime);
 void SetRuntime(const Runtime& rt);
 bool HasRuntime();
 
@@ -59,10 +46,17 @@ bool WantsInputs();
 // Inside the DLSS evaluate detour, after the original evaluate, on the
 // game's open list: copies depth + motion into our textures.
 void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in);
+// Called after a successful Reset, including when observation is disabled.
+// No host lock or GPU wait: invalidates only this list's private-data token.
+void OnCommandListReset(ID3D12GraphicsCommandList* list);
 
 // Wrap the actual queue forward. Recording a future list is NOT a ready frame.
-// Publish its inputs only after submission, serialized with OnPresent. No GPU
-// wait is added. The host calls this for every ExecuteCommandLists; test hosts
+// Publish its inputs only after submission, serialized with OnPresent. Different
+// producer/presentation queues use only already-completed snapshots; a busy
+// producer is deferred without inserting any wait into the presentation queue.
+// Snapshots are not reused until both copies and NR have completed; game queues
+// never wait for NR. The host
+// calls this for every ExecuteCommandLists; test hosts
 // must do likewise. This does not consume the adapter's Execute subscription.
 using ExecuteFn = void (STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists, ExecuteFn forward);
@@ -82,7 +76,9 @@ struct Stats {
     uint64_t evaluates;         // NR evaluates submitted
     uint64_t skipped;           // frames skipped (no inputs / extent mismatch)
     uint64_t inputs_seen, input_overwrites, missing_inputs, busy_slots;
+    uint64_t untracked_lists;  // initialization-only Reset tracking did not cover this implementation
     uint64_t gpu_submitted, gpu_completed;
+    uint64_t input_submitted, input_completed, cross_queue_waits;
     float last_ms, avg_ms;      // GPU time of the whole pass (transform + NR)
     uint32_t gpu_samples;
     char reason[96];            // plain-language reason when not active
@@ -90,6 +86,8 @@ struct Stats {
 Stats GetStats();
 // Clears a latch so the pass may try again (e.g. after the user re-enables).
 void ResetLatch();
+// Test-only failure after partial device allocation, before any GPU recording.
+void FailNextDeviceInitializationForTests();
 // Test seam (C12): builds the pass's device objects (compiling every shader) and
 // records the 24/16-bit depth -> R32F conversion of a region on `list`.
 bool RecordDepthToR32ForTests(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, DXGI_FORMAT view, ID3D12Resource* out,

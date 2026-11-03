@@ -99,7 +99,7 @@ void InitializeTiming() {
     if (attached.load() || !pinned_executable()) return;
     const auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     present_frame_return=base+0x21930cd;
-    if (!na::hooking::BeginInstall()) return;
+    if (!na::hooking::BeginInstallWait("adapters/tlou1/timing.cpp")) return;
     bool ok = na::hooking::PrepareHook(reinterpret_cast<void*>(base + 0x11df208), reinterpret_cast<void*>(&simulation_detour), reinterpret_cast<void**>(&simulation)) &&
         na::hooking::PrepareHook(reinterpret_cast<void*>(base + 0x1289078), reinterpret_cast<void*>(&input_detour), reinterpret_cast<void**>(&input)) &&
         na::hooking::PrepareHook(reinterpret_cast<void*>(base + 0x11c41e4), reinterpret_cast<void*>(&kick_detour), reinterpret_cast<void**>(&kick_render)) &&

@@ -32,7 +32,7 @@ std::once_flag g_init;
 ApplyRequest g_request;
 bool g_available = false;
 bool g_dispatch_active = false; // mutex protected; even cancelled invocations must return
-char g_reason[160] = "This game has no automatic picture-mode adapter.";
+char g_reason[160] = "No engine adapter for this game; Apply uses the general picture rebuild.";
 std::atomic<bool> g_queued{false};
 std::atomic<uint64_t> g_frame_calls{0}, g_predicate_calls{0}, g_triggers{0};
 std::atomic<uint64_t> g_resource_releases{0}, g_resource_release_failures{0};
@@ -44,7 +44,7 @@ Choice current_choice() {
     auto& st = na::settings::Get();
     auto opt = na::ngx::GetOptimalStats();
     Choice c{st.dlss_mode.load(), opt.last_user_w, opt.last_user_h, st.preset.load()};
-    if (c.mode && c.mode <= 3) {
+    if (c.mode && c.mode < static_cast<uint32_t>(settings::DlssMode::Count)) {
         float scale = na::settings::ScaleForMode(static_cast<na::settings::DlssMode>(c.mode));
         c.width = (static_cast<uint32_t>(c.width * scale + .5f) + 7u) & ~7u;
         c.height = (static_cast<uint32_t>(c.height * scale + .5f) + 7u) & ~7u;
@@ -188,7 +188,7 @@ bool code_matches(uintptr_t base, uint32_t rva, const unsigned char* bytes, size
 bool install(uintptr_t frame, uintptr_t predicate, uintptr_t caller, uintptr_t rebuild, uintptr_t rebuild_caller) {
     g_caller = caller;
     g_rebuild_caller = rebuild_caller;
-    if (!na::hooking::BeginInstall()) return false;
+    if (!na::hooking::BeginInstallWait("adapters/tlou1/apply.cpp")) return false;
     bool ok = na::hooking::PrepareHook(reinterpret_cast<void*>(frame), reinterpret_cast<void*>(&frame_detour), reinterpret_cast<void**>(&g_frame)) &&
               na::hooking::PrepareHook(reinterpret_cast<void*>(predicate), reinterpret_cast<void*>(&predicate_detour), reinterpret_cast<void**>(&g_predicate)) &&
               na::hooking::PrepareHook(reinterpret_cast<void*>(rebuild), reinterpret_cast<void*>(&rebuild_detour), reinterpret_cast<void**>(&g_rebuild));
@@ -230,7 +230,7 @@ bool RequestApply(Choice choice) {
     std::lock_guard<std::mutex> lock(g_mutex);
     refresh_locked();
     if (!g_available || g_dispatch_active || g_request.Busy() || !na::settings::Get().enabled.load() || !Same(choice, current_choice()) ||
-        choice.mode > 3 || !choice.width || !choice.height) return false;
+        choice.mode >= static_cast<uint32_t>(settings::DlssMode::Count) || !choice.width || !choice.height) return false;
     if (!g_free_resources) {
         // The original SL module is already loaded by the game by this point.
         // Never load a library or resolve an export inside a rendering detour.

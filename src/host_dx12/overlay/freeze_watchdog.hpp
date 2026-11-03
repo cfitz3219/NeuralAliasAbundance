@@ -19,6 +19,7 @@
 #pragma once
 
 #include <cstdint>
+struct _EXCEPTION_POINTERS;
 
 namespace na::freeze {
 
@@ -51,7 +52,7 @@ uint32_t FormatStack(const ThreadStack& t, char* out, uint32_t capacity);
 // Writes a minidump of this process to `path` (MiniDumpWithThreadInfo plus
 // indirectly referenced memory and unloaded modules; no full memory).
 // Returns false when dbghelp is unavailable or the write failed.
-bool WriteMiniDump(const wchar_t* path);
+bool WriteMiniDump(const wchar_t* path, _EXCEPTION_POINTERS* exception = nullptr);
 
 // The watchdog itself. `game_presents` is the game's Present counter; call at
 // a steady cadence (the status log's 5 s). Returns true on the first call

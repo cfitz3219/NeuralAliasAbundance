@@ -73,8 +73,12 @@ bool HandleGetIndex(IDXGISwapChain* sc, UINT* out);
 // Before the original ResizeBuffers: drains the present thread, releases
 // proxies and cached real buffers. The game must have released its proxy
 // references (it releases its "back buffers" before resizing, as DXGI requires).
-void BeforeResize(IDXGISwapChain* sc);
+bool BeforeResize(IDXGISwapChain* sc); // false: keep old images/size; submitted work has not retired
 bool Proxied(IDXGISwapChain* sc);
+// A known external presenter may not acquire new NeuralAlias buffers. Already
+// acquired proxies keep their delivery path until a successful resize.
+bool NoteExternalOwner(IDXGISwapChain* sc);
+void AfterResize(IDXGISwapChain* sc,HRESULT result);
 
 // Called on the finished frame (the proxy the game just presented; PRESENT
 // state) for Neural Rendering, motion analysis and capture. Records and

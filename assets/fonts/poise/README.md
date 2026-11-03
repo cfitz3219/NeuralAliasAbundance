@@ -1,0 +1,1 @@
+Poise 0.1: modified Jost derivative by Astra for NeuralAlias, selected by Cort. Original design Owen Earl / The Jost Project Authors. SIL OFL 1.1, see OFL.txt. Regular used for body, Medium for headings. Integration authorized 2026-10-31; original font development and specimen in Documents/NeuralAlias-Poise-0.1.

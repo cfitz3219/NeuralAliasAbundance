@@ -9,6 +9,7 @@
 
 #include <map>
 #include <string>
+#include <cstring>
 
 struct ID3D11Resource;
 
@@ -17,6 +18,7 @@ class FakeParams final : public NVSDK_NGX_Parameter {
 public:
     struct Value { enum Kind { U, I, F, D, P } kind; unsigned long long u; long long i; double d; void* p; };
     std::map<std::string, Value> values;
+    mutable unsigned non_fg_reads = 0;
     bool Has(const char* k) const { return values.count(k) != 0; }
 
     void Set(const char* n, unsigned long long v) override { values[n] = {Value::U, v, static_cast<long long>(v), static_cast<double>(v), nullptr}; }
@@ -42,6 +44,9 @@ public:
     int I(const char* n) const { auto v = find(n); return v ? static_cast<int>(v->i) : -999; }
 
 private:
-    const Value* find(const char* n) const { auto it = values.find(n); return it == values.end() ? nullptr : &it->second; }
+    const Value* find(const char* n) const {
+        if (std::strncmp(n, "DLSSG.", 6) != 0) ++non_fg_reads;
+        auto it = values.find(n); return it == values.end() ? nullptr : &it->second;
+    }
 };
 } // namespace test

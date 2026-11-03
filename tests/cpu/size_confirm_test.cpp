@@ -10,6 +10,28 @@ Monitor counting(uint32_t need = 2) {
 }
 }
 int main() { return test::run({
+    {"live resolution confirms an existing SR/RR handle without recreation", [] {
+        Monitor m;m.ArmLive(640,360,1920,1080,2,100,1000);m.MarkRestored(101);
+        auto e=good();e.upscaler=true;e.core=1;e.out_w=1920;e.out_h=1080;
+        auto unrelated=e;unrelated.out_w=1000;m.OnEvaluate(unrelated,102);
+        CHECK(m.snapshot().matching==0);m.OnEvaluate(e,103);m.OnEvaluate(e,104);
+        CHECK(m.state()==State::Confirmed);CHECK(m.snapshot().creations==0);
+    }},
+    {"live confirmation rejects ambiguous cores and non-upscalers", [] {
+        Monitor m;m.ArmLive(640,360,1920,1080,2,100,1000);m.MarkRestored(101);
+        auto e=good();e.core=1;e.out_w=1920;e.out_h=1080;
+        m.OnEvaluate(e,102);CHECK(m.snapshot().matching==0);
+        e.upscaler=true;m.OnEvaluate(e,103);e.core=2;m.OnEvaluate(e,104);
+        CHECK(m.state()==State::Failed);
+    }},
+    {"live replacement after release resets streak and keeps deadline", [] {
+        Monitor m;m.ArmLive(640,360,1920,1080,2,100,1000);m.MarkRestored(101);
+        auto e=good();e.upscaler=true;e.core=1;e.out_w=1920;e.out_h=1080;
+        m.OnEvaluate(e,102);m.OnRelease(e.handle,2,103);CHECK(m.snapshot().streak==1);
+        m.OnRelease(e.handle,1,104);CHECK(m.snapshot().streak==0);
+        e.handle=9;m.OnEvaluate(e,105);CHECK(m.state()==State::Counting);
+        m.OnEvaluate(e,106);CHECK(m.state()==State::Confirmed);
+    }},
     {"scalar poison, finite values and signed motion scales", [] {
         CHECK(ScalarInputsCoherent(.5f, -.5f, -640, 360));
         for (float invalid : {1e38f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity()}) {
@@ -29,6 +51,10 @@ int main() { return test::run({
         FeatureFlags f; f.Set(7, 1); f.Set(8, 2); CHECK(f.Get(7) == 1 && f.Get(8) == 2);
         f.Set(7, 3); CHECK(f.Get(7) == 3); f.Erase(7); CHECK(f.Get(7) == FeatureFlags::kUnknown);
         f.Set(0, 0); CHECK(f.Get(0) == FeatureFlags::kUnknown);
+        f.Set(7, 11, 100); f.Set(7, 22, 200);
+        CHECK(f.Get(7, 100) == 11 && f.Get(7, 200) == 22);
+        f.Erase(7, 100); CHECK(f.Get(7, 200) == 22);
+        f.EraseCore(200); CHECK(f.Get(7, 200) == FeatureFlags::kUnknown);
         for (uint64_t id = 10; id < 30; ++id) f.Set(id, static_cast<uint32_t>(id));
         CHECK(f.Get(29) == 29); CHECK(f.Get(10) == FeatureFlags::kUnknown);
     }},
