@@ -357,3 +357,21 @@ pass25.85s; full exact-source verification and packaging follow.
 Original Close documentation: https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist-close
 No synchronous GPU readback/wait was added to live callbacks; readback is confined
 to the offline test. Evidence/control logs: local/se5-close-gap-20261102.
+
+### Regression correction delivery
+
+Runtime53295cb7d73de7d0c377d6a9ae88a6c3ed51a134: full rebuilt Release and
+171registered tests complete in199.30s;166pass,5skip,0fail. Skips remain the NR
+runtime probe, three16xMSAA cases and upscaler-jitter runtime case. Existing
+pan26/27(one cold), coherent raster image, optional-later-segment, precise
+consumer, real-NGX, observer and overlay tests pass alongside the split-consumer
+GPU-contribution regression. No new game run was performed by Astra.
+
+Documents/NA-SE5-camfix-53295cb is prepared, DLL SHA256
+41C3805A10C58272B9DF843D958B0F5C4E732C002AE9555712EF706560965618.
+Usual camfix update/results/rollback commands select it after the isolated
+WindowsPowerShell019->candidate->019->original roundtrip and payload checks pass.
+Known-good019, historical6f and rejected4ce packages remain preserved. Actual
+installed game DLL stays4ce21f6/DD72211D..., unchanged by Astra. Live visual
+closure remains Cort's; this receipt establishes the reproduced regression's
+engineering correction and reversible package.
