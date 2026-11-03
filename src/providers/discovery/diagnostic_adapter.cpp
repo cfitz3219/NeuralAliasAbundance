@@ -418,6 +418,9 @@ extern "C" int na_adapter_start() {
     wchar_t path[MAX_PATH]{};GetPrivateProfileStringW(L"discovery",L"log",L"",path,MAX_PATH,ini_path);
     if(!path[0]) return 0;
     auto* c=new Consumer;
+    // Render-small: Performance draws the scene at exactly half the swapchain, which generic_depth's
+    // half-res rule rejected (Cort's 2026-11-03 run: every Performance frame stretched).
+    if(GetPrivateProfileIntW(L"present",L"render_small",0,ini_path)==1) c->heuristics.AllowRenderScale(0.5);
     wchar_t evidence_dir[MAX_PATH]{};GetPrivateProfileStringW(L"discovery",L"evidence_dir",L"",evidence_dir,MAX_PATH,ini_path);
     c->evidence_dir=evidence_dir; // optional pre-created local directory; at most 128 MiB per session
     c->log=_wfsopen(path,L"w",_SH_DENYWR); // Permit live readers; refuse a second writer.
