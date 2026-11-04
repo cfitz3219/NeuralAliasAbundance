@@ -107,7 +107,45 @@ So the input to DLSS now carries the jitter (slope ≈ -1 on scene colour and de
 
 Other lines in that run: `jitter_witness last_window{tested=16189995 unshifted=4224278 shifted=2745849} unseen_now=0`; final_colour convention=2 epoch=2. declared_none=880 of 4021 frames got no sample in the declaration.
 
-(The PC's full table, |dOut| comparisons against 0ce11a8 / 7ed5d30, and the evidence file list will be appended here.)
+
+### 4.1 Full table (PC, `lag2.ps1` / `lag2.txt`)
+Method: consecutive-present pairs; per plane, median of 96x96 tile Lucas-Kanade shifts s where prev(x+s)=cur(x) (content moved by -s); regressed against declared jitter delta, both axes pooled, lags -2..+3. Tiles include HUD and any real motion. |d| = mean abs luma difference between consecutive frames (0-255, comparable only within a plane). Slope uses render-px declared vs output-px shift, so a pure upscaled copy of input motion would be about scale x slope (P 2.0, Q 1.5, DLAA 1.0).
+
+Lag 0 slope (r), mean |shift| px, mean |d|:
+
+| set | build | mode | pairs | scene_color | input colour | depth | dlssout | present |
+|---|---|---|---|---|---|---|---|---|
+| 054219 | 32e25dd | Q (start) | 17 | -0.974 (-1.00) .625 | -0.805 (-1.00) .510 | -0.951 (-.99) .606 | -0.714 (-.87) .447 d2.54 | - |
+| 054225 | 32e25dd | Q | 10 | -0.995 (-1.00) .633 | -0.869 (-1.00) .552 | -0.850 (-.92) .616 | -1.010 (-.94) .648 d4.46 | - |
+| 054307 | 32e25dd | DLAA route 2 | 12 | - | -0.995 (-1.00) .647 | -0.942 (-.98) .618 | -0.788 (-.96) .526 d1.70 | -0.547 (-.95) .364 |
+| 054326 | 32e25dd | P | 18 | -0.993 (-1.00) .654 | -0.805 (-1.00) .520 | -0.997 (-.99) .647 | -1.446 (-.92) .943 d4.29 | - |
+| 054330 | 32e25dd | P, declared 0 on all 30 | 23 | 0.000 | 0.000 | 0.000 | 0.000 .000 d0.36 | - |
+| 012612 | 0ce11a8 | Q still | 16 | no plane | 0.000 | 0.000 | +0.703 (+.74) .500 d5.13 | - |
+| 012601 | 0ce11a8 | Q still | 21 | no plane | 0.000 | 0.000 | +0.033 (.51) .034 d0.88 | - |
+| 045647 | 7ed5d30 | Q startup | 16 | 0.070 (.31) | 0.000 | 0.000 | -0.066 (-.63) .016 d0.62 | - |
+
+At ±1 lag the 32e25dd slopes are +0.5..+1.15 and at ±2 about -0.05..-0.6 (Halton deltas anticorrelate); lag 0 has the largest |r| everywhere.
+
+Observations (PC, not interpreted further):
+- Input colour in render-small (-0.805 to -0.869) is lower than scene_color (-0.97 to -0.995). Unexplained (post-processing or HUD in the tile mix are candidates).
+- Output sign flipped vs 0ce11a8 (+0.703 with unmoved input there; negative with moved input here).
+- Per-frame example 054326 #3 o4449, declared (0.250,-0.389): scene (-0.488,0.546), colour (-0.276,0.497), depth (-0.377,0.597), output (-0.780,1.153). #1-2 had small output shifts (-0.128,-0.068), large from #3.
+- viewport_jitter: ~27 viewport sets per frame; other_frame=0; unknown_viewports=0; declared_none rose 565 -> 880 in the last block.
+- dlss_create seq=3 at Performance used preset 12 (L), not 13 (M) as Automatic says.
+- Mode timeline 05:42:02 Q, 05:43:02 DLAA, 05:43:22 P; sharp=100, jshift=0.
+- j2jitter `source=flow convention=2 epoch=1 changes=0`: flow treats the source as Unjittered (loaded verdict) while it now moves.
+- jitter_witness `frames=3029 windows=49 last_window{tested=16189995 unshifted=4224278 shifted=2745849} unseen_now=0 ... final_colour{convention=2 epoch=2 changes=0}`: the witness now sees 2.7M shifted (previously 100-200k); the saved final verdict did not update.
+- j2_coverage `presents=4942 covered=4711 jittered=1795`; j2_misses `no_camera=5 no_candidate=224; unjittered{no_sample=1058}; camera_held=3292 extrapolated=287`.
+- HUD: `native_hud on=1 hud_frames=0 redirected=0`, `hud_fallback frames=0`. HUD movement not separately measured.
+- Astra's own measurement (COMMS): stationary masonry MOTION vectors move ~0.69-0.86 x the jitter delta; not reproduced by the PC.
+
+Not measured: per-pixel motion-vector jitter content, HUD/post-pass shift separately, moving-play sets.
+
+### 4.2 Evidence folder `C:\Users\Cort\Documents\NA-se5-jitter-evidence-20261104` (copies only)
+0ce11a8-p23396-status.log, 5d5b0f5-p43844-status.log, be67bb1-p57140-status.log, 7ed5d30-p51716-status.log; 32e25dd-p44832-{status-44832.log, summary.txt, run-summary.txt, status-44832-j2_camera.txt, status-44832-amd-flow.txt, manifest.json, NeuralAliasHost.ini}; lag.txt, lag2.txt, jit5d.txt, jit5e.txt, dlaa.txt, camfit3.txt with scripts lag.ps1, lag2.ps1, jit5d.ps1, jit5e.ps1, dlaa.ps1; ngx-result-signcheck.txt, ngx-result-edges.txt, ngx-edges-012612.png, ngx-edges-031303.png (frozen-frame, invalid for quality), ngx-then-now-012612.png, ngx-then-now-loop.png, ngx-real-sequence-012612.png, ngx-ngxarms.cpp, ngx-run.ps1, ngx-build.cmd. Raw captures: `%LOCALAPPDATA%\NeuralAlias\captures\j2-20261104-05*-p44832`.
+
+Also withdrawn: "7ed5d30 cut the shake by two-thirds" came from the harness, which did not reproduce the in-game shake.
+
 
 ## 5. Other open items touching jitter
 
@@ -121,4 +159,4 @@ Other lines in that run: `jitter_witness last_window{tested=16189995 unshifted=4
 - Code: `src/host_dx12/j2/live_dlaa.cpp` (begin_jitter ~1075, vpj_advance/vpj_declared after jitter_phases, record() jitter handling ~2185-2250, jitter shift `kJitterShiftHlsl`), `src/host_dx12/observe/producers.cpp` (vpj_* before `struct ListHook`), `src/providers/camera/camera_tracker.hpp` (jitter convention).
 - Settings: `[j2] jitter_shift` (1/-1/0), `[j2] viewport_jitter` (1/-1/0), `[j2] jitter_conv_flow/final`.
 - Earlier notes: /mnt/project-files/notes/se5-motion-5d5b0f5-test-notes.md, se5-motion-be67bb1-test-notes.md. COMMS entries 7aab0bb, 913e389, e8f47b7, e68b775, 167939f.
-- PC evidence: offline harness `ngxarms` scratchpad (real-sequence-012612.png, 012612loop.csv, 031303loop.csv, then-now-012612.png); evidence folder for the 32e25dd run listed in section 4.
+- PC evidence: offline harness `ngxarms` scratchpad (real-sequence-012612.png, 012612loop.csv, 031303loop.csv, then-now-012612.png); evidence folder for the 32e25dd run listed in section 4.2.
