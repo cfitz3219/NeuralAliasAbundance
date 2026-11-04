@@ -82,7 +82,7 @@ struct Settings {
     std::atomic<uint32_t> j2_capture_auto{0};        // automatic capture sessions per run (0 = off)
     std::atomic<uint32_t> j2_capture_cooldown_s{20}; // seconds between automatic captures
     std::atomic<uint32_t> j2_scale_mode{0}; // P4-4 slider route: DlssMode the game renders at ([j2] scale_mode; 0 = DLAA)
-    std::atomic<uint32_t> j2_preset{12};     // J2 DLAA: DLSS render preset ([j2] preset=L; 12 = L, 0 = NVIDIA default)
+    std::atomic<uint32_t> j2_preset{255};    // J2 DLSS render preset ([j2] preset_v2; 255 = Automatic: L for DLAA/Quality, M for Balanced/Performance; 12 = L, 0 = NVIDIA default)
     std::atomic<uint32_t> nr_structure{100};
     std::atomic<uint32_t> nr_tone{0};
     std::atomic<uint32_t> nr_skin{100};

@@ -2245,7 +2245,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     e.out_w = ow;
     e.out_h = oh;
     e.quality = na::dlss::QualityForScale(rw, rh, ow, oh); // DLAA when equal
-    e.preset = na::settings::Get().j2_preset.load(); // Cort: preset L by default
+    e.preset = na::j2::PresetFor(na::settings::Get().j2_preset.load(), rw, ow); // Automatic: L for DLAA/Quality, M for Balanced/Performance
     e.view_id = kViewId;
     e.jitter_x = static_cast<float>(cam.jitter_px_x); // DLSS: colour sampled at pixel centre - jitter
     e.jitter_y = static_cast<float>(cam.jitter_px_y);
@@ -3511,7 +3511,7 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         e.out_w = ow;
         e.out_h = oh;
         e.quality = na::dlss::QualityForScale(rw, rh, ow, oh);
-        e.preset = na::settings::Get().j2_preset.load();
+        e.preset = na::j2::PresetFor(na::settings::Get().j2_preset.load(), rw, ow);
         e.view_id = kSmallViewId;
         e.jitter_x = d.jx;
         e.jitter_y = d.jy;
@@ -3668,7 +3668,7 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         ci.jitter_x = d.jx;
         ci.jitter_y = d.jy;
         ci.reset = (d.reset || g.small_last == 0) ? 1u : 0u;
-        ci.preset = na::settings::Get().j2_preset.load();
+        ci.preset = na::j2::PresetFor(na::settings::Get().j2_preset.load(), rw, ow);
         ci.sharpness = na::settings::Get().j2_sharpness.load(std::memory_order_relaxed);
         // 2026-11-04: this evaluation's output IS the presented picture (no overlay pairing),
         // plus the camera the motion shader used and the planes behind each motion vector.
