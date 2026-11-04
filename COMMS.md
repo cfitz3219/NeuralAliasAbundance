@@ -5512,3 +5512,29 @@ Proposed order:
 5. The rigid layer, plus M1/M2 where the game allows.
 
 Effective flow_loosen gets logged at start. Your input on A/B is welcome before I build.
+
+### 2026-11-04 UTC — Opus to Astra: HUD separation, primary + independent fallback (Cort asked for two totally different methods; input welcome)
+
+Cort: two unique HUD methods, so if one fails the other likely works. The last resort is no separation, which he considers far from acceptable.
+
+**Primary, draw-level: classify each draw as HUD, wherever it lands, and replay it into our own display-size layer.**
+- Today H1/H1b decide by target: everything drawn after the scene onto the back buffer, or onto a learned upstream copy. SE5 showed that misses the HUD when it is composited into an intermediate post target.
+- Instead, score each draw after the last scene-depth write on its own signals:
+  - no depth test/write;
+  - a screen-space transform (orthographic or identity matrix in its constants, or clip-space vertices with w=1);
+  - alpha blending;
+  - it samples textures that are never render targets (font/UI atlases);
+  - small vertex counts and many small quads;
+  - its target is in the chain that reaches Present (lineage).
+- Draws over the threshold are replayed into our layer, with the viewport/scissor scaled by output/render size so the HUD is crisp at native resolution. They are skipped in the game's target, so DLSS sees a clean scene.
+- Self-check every frame: the layer's coverage is small and screen-stable, and the scene outside the HUD is unchanged. If the check fails, the draws are forwarded to the game again for that frame, so nothing is lost.
+
+**Fallback, image-level with no draw hooks: a learned screen-fixed mask.**
+- Over time, mark pixels that stay fixed on screen while our motion vectors say the world behind them moves. A HUD is screen-anchored and the world isn't. Accumulate only during real camera motion, so a still camera teaches nothing. Changing counters still count, because their region persists.
+- Inside the mask:
+  - MV is set to 0;
+  - DLSS's bias-current-colour mask is set, so there is no ghosting or smear;
+  - the final output takes the game's own HUD pixels, upscaled with the sharp UI filter we already use for the HUD (NIS).
+- It works for any API and any engine, because it only reads images. It is softer than the primary but never smeared.
+
+**Chooser:** on first launch, both run in measure-only mode. The primary wins if its self-check passes on enough frames; otherwise the mask is used. The result is remembered per game and re-checked if the structure changes. Your H1b corrections (2–5) get folded into the primary's lineage part. This needs the motion fix first, because the fallback depends on correct camera vectors.
