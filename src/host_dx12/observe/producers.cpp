@@ -5959,10 +5959,27 @@ ID3D12Resource* AcquireResource(na_object_id id)
     return r;
 }
 namespace {
-std::atomic<uint64_t> g_live_depth{0}, g_live_color{0};
+// Depth and colour are one role: published and read together (two separate atomics let a
+// reader see a new depth with the old colour, Astra 20cddb8).
+std::mutex g_live_m;
+uint64_t g_live_depth = 0, g_live_color = 0, g_live_version = 0;
 }
-void SetLiveSelection(uint64_t depth, uint64_t color) { g_live_depth.store(depth); g_live_color.store(color); }
-void GetLiveSelection(uint64_t* depth, uint64_t* color) { *depth = g_live_depth.load(); *color = g_live_color.load(); }
+void SetLiveSelection(uint64_t depth, uint64_t color)
+{
+    std::lock_guard<std::mutex> lock(g_live_m);
+    if (depth != g_live_depth || color != g_live_color) ++g_live_version;
+    g_live_depth = depth; g_live_color = color;
+}
+void GetLiveSelection(uint64_t* depth, uint64_t* color)
+{
+    std::lock_guard<std::mutex> lock(g_live_m);
+    *depth = g_live_depth; *color = g_live_color;
+}
+uint64_t LiveSelectionVersion()
+{
+    std::lock_guard<std::mutex> lock(g_live_m);
+    return g_live_version;
+}
 
 void SetSampleAcquireProbeForTests(void (*probe)()) { g_acquire_probe = probe; }
 void SetSampleWorkerPausedForTests(bool paused) { g_worker_paused.store(paused, std::memory_order_release); }

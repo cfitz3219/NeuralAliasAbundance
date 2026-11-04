@@ -288,6 +288,8 @@ ID3D12Resource* AcquireResource(na_object_id id);                         // Add
 // Current discovery picks (written by the discovery adapter, read by J2).
 void SetLiveSelection(uint64_t depth, uint64_t color);
 void GetLiveSelection(uint64_t* depth, uint64_t* color);
+// Changes whenever the published depth/colour pair changes.
+uint64_t LiveSelectionVersion();
 
 // Buffer GPU VA -> (resource id, offset). False when unknown or ambiguous.
 bool ResolveGpuVa(uint64_t va, na_object_id* resource, uint64_t* offset);

@@ -70,6 +70,7 @@ struct PendingHistory {
     uint32_t depth_source=0, camera_source=0;
     uint64_t camera_age=0;
     bool keep_reset = false; // a repeated frame: DLSS did not run, a pending history reset still applies
+    uint64_t selection_version = 0; // live scene selection this evaluation used (same epoch = same version)
 };
 
 // CPU metadata of this frame's last submitted scene. No pooled command-list
@@ -124,6 +125,7 @@ struct State {
     bool cam_rev = false;
     uint64_t frame = 1;             // game Present interval, not Execute attempt
     uint64_t submitted_frame = 0;   // last interval that actually submitted DLAA
+    uint64_t eval_selection_version = 0; // live selection version of the last committed evaluation
     // Games may draw the scene across several submissions per frame (Sniper Elite
     // Resistance). DLAA belongs after the LAST of them, before post-processing
     // reads the colour. Counted per frame; the previous frame's count is the target.
@@ -1933,10 +1935,25 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // camera is that same frame, so motion stays correct across a few skipped game
     // frames (a frame whose scene submissions differed): no reset, no visible
     // restart. A long gap (or resume/resize) starts over.
-    constexpr uint64_t kMaxGapFrames = 4;
-    const bool tracker_restart = g.resume_reset || (g.submitted_frame && g.frame > g.submitted_frame + kMaxGapFrames);
+    // 2026-11-04 (Astra 20cddb8 point 2): a gap caused by OUR acquisition (the same live scene
+    // selection, so the same scene epoch) keeps the pose history: the previous camera is still
+    // exactly the last frame DLSS evaluated, so the motion stays correct over the longer step.
+    // Only a different selection, resume or resize starts over. Real cuts are still detected.
+    constexpr uint64_t kMaxGapFrames = 4, kMaxSameEpochGapFrames = 32;
+    pending.selection_version = na::observe::LiveSelectionVersion();
+    const bool same_epoch = g.eval_selection_version && g.eval_selection_version == pending.selection_version;
+    const uint64_t max_gap = same_epoch ? kMaxSameEpochGapFrames : kMaxGapFrames;
+    const bool tracker_restart = g.resume_reset || (g.submitted_frame && g.frame > g.submitted_frame + max_gap);
     if (tracker_restart) pending.tracker.Reset();
-    const na::camera::CameraFrame cam = pending.tracker.Update(vp, g.frame, rw, rh, injected); // active extent
+    na::camera::CameraTracker::Limits lim{};
+    lim.max_frame_gap = max_gap;
+    if (g.submitted_frame && g.frame > g.submitted_frame + 1) { // per-frame motion limits over the whole step
+        const double steps = static_cast<double>((std::min)(g.frame - g.submitted_frame, max_gap));
+        lim.max_translation *= steps;
+        lim.max_rotation = (std::min)(lim.max_rotation * steps, 3.0);
+    }
+    if (same_epoch && g.submitted_frame && g.frame > g.submitted_frame + kMaxGapFrames && !tracker_restart) ++g.stats.gap_bridged;
+    const na::camera::CameraFrame cam = pending.tracker.Update(vp, g.frame, rw, rh, injected, lim); // active extent
     if (!cam.valid) { ++g.stats.no_camera; reason("The camera matrix could not be inverted."); return false; }
     if (!held) { // the newest read camera (one per frame: a later attempt in the same frame replaces it)
         if (g.cam_f1 != g.frame) { g.cam_u0 = g.cam_u1; g.cam_f0 = g.cam_f1; }
@@ -3147,6 +3164,7 @@ bool present_source(ID3D12CommandQueue* queue, ExecuteFn forward)
     g.slots[slot].fence_value = g.fence_next++;
     queue->Signal(g.fence.Get(), g.slots[slot].fence_value);
     g.tracker = pending.tracker;
+    g.eval_selection_version = pending.selection_version;
     committed_sources(pending);
     g.submitted_frame = closed;
     if (!pending.keep_reset) g.resume_reset = false;
@@ -4044,6 +4062,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
                 forward(queue, static_cast<UINT>(batch.size()), batch.data());
                 na::dlss::OnExecuted(queue, static_cast<UINT>(batch.size()), batch.data());
                 g.tracker = pending.tracker;
+                g.eval_selection_version = pending.selection_version;
                 committed_sources(pending);
                 g.submitted_frame = g.frame;
                 if (!pending.keep_reset) g.resume_reset = false;
@@ -4067,6 +4086,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         if (!has) return;
         lock.lock();
         g.tracker = g.inl.history.tracker;
+        g.eval_selection_version = g.inl.history.selection_version;
         committed_sources(g.inl.history);
         g.submitted_frame = g.frame;
         if (!g.inl.history.keep_reset) g.resume_reset = false;
@@ -4207,6 +4227,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     // The void D3D12 forward has now submitted our list. Failed recording/NGX
     // attempts above must never replace the previous submitted camera.
     g.tracker = pending.tracker;
+    g.eval_selection_version = pending.selection_version;
     committed_sources(pending);
     g.submitted_frame = g.frame;
     if (!pending.keep_reset) g.resume_reset = false;
@@ -4254,6 +4275,7 @@ void Shutdown()
     g.cam_f0 = g.cam_f1 = 0;
     g.frame = 1;
     g.submitted_frame = 0;
+    g.eval_selection_version = 0;
     g.scene_batches_cur = g.scene_batches_target = 0;
     g.batch_hist_n = 0;
     g.inline_mode = false;
