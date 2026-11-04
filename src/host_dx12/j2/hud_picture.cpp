@@ -1,4 +1,5 @@
 #include "host_dx12/j2/hud_picture.hpp"
+#include "host_dx12/j2/native_hud.hpp"
 #include <d3dcompiler.h>
 #include <algorithm>
 #include <cmath>
@@ -47,7 +48,10 @@ groupshared uint mismatch;
 [numthreads(8,8,1)]void verify(uint3 id:SV_DispatchThreadID,uint gi:SV_GroupIndex){
  if(gi==0)mismatch=0;GroupMemoryBarrierWithGroupSync();
  if(id.x<w&&id.y<h){float3 a=frame[id.xy].rgb,b=full[id.xy].rgb;
-  if(any(!isfinite(a))||any(!isfinite(b))||any(abs(a-b)>tolerance*max(1,max(abs(a),abs(b)))))InterlockedOr(mismatch,1);}
+  if(any(!isfinite(a))||any(!isfinite(b))||any(abs(a-b)>tolerance*max(1,max(abs(a),abs(b)))))InterlockedOr(mismatch,1);
+  if(flags&8u){float4 c=n1[id.xy],d=full[id.xy];
+   if(any(!isfinite(c))||any(!isfinite(d))||any(abs(c-d)>tolerance*max(1,max(abs(c),abs(d))))||
+      abs(frame[id.xy].a-d.a)>tolerance*max(1,max(abs(frame[id.xy].a),abs(d.a))))InterlockedOr(mismatch,2);}}
  GroupMemoryBarrierWithGroupSync();if(gi==0&&mismatch)proof.InterlockedOr(0,1);
 }
 [numthreads(8,8,1)]void prepare(uint3 id:SV_DispatchThreadID){
@@ -70,6 +74,11 @@ groupshared uint mismatch;
 }
 [numthreads(8,8,1)]void compose(uint3 id:SV_DispatchThreadID){
  if(id.x>=ow||id.y>=oh)return;
+ float2 uv=(float2(id.xy)+.5)/float2(ow,oh);
+ if(flags&8u){float4 c=proof.Load(0)==0?n0[id.xy]:frame.SampleLevel(lin,uv,0);
+  if((flags&4u)&&proof.Load(0)==0){float3 d=abs(full.SampleLevel(lin,uv,0).rgb-scene.SampleLevel(lin,uv,0).rgb);
+   c.rgb=lerp(c.rgb,float3(1,0,1),.5*saturate(max(d.r,max(d.g,d.b))*16));}result[id.xy]=c;return;}
+ if(flags&16u){result[id.xy]=float4(picture[id.xy].rgb,scene.SampleLevel(lin,uv,0).a);return;}
  float4 s=picture[id.xy];float3 outc=s.rgb;
  if(proof.Load(0)==0){
   float2 uv=(float2(id.xy)+.5)/float2(ow,oh);
@@ -116,13 +125,14 @@ struct Picture::Impl {
  ComPtr<ID3D12Resource> scene,full,input,mask,proof,readback,result,frame,motion,n[2];ComPtr<ID3D12DescriptorHeap> heap;
  bool scene_ready=false,full_ready=false,scene_current=false,full_current=false,prepared=false,outputs_read=false;DXGI_FORMAT frame_view{},layer_view{},result_format{};
  bool proof_read=false;
+ UINT descriptor_page=0; // pre-HUD work and final Present may both be in flight
  struct K {UINT w,h,ow,oh,flags;float grey,tolerance;UINT pad;} constants{};
  bool snapshot(ID3D12GraphicsCommandList* l,ID3D12Resource* src,D3D12_RESOURCE_STATES state,ComPtr<ID3D12Resource>& dst,bool& ready){
   if(!l||!src)return false;auto d=src->GetDesc();if(d.Width!=w||d.Height!=h||d.Format!=source_format||d.MipLevels!=1||d.DepthOrArraySize!=1||d.SampleDesc.Count!=1)return false;
   move(l,src,state,CS);if(ready)move(l,dst.Get(),S,CD);l->CopyResource(dst.Get(),src);move(l,src,CS,state);move(l,dst.Get(),CD,S);ready=true;return true;
  }
  void bind(ID3D12GraphicsCommandList* l,UINT pass,ID3D12Resource* pic,DXGI_FORMAT pf){
-  auto cpu=heap->GetCPUDescriptorHandleForHeapStart();cpu.ptr+=SIZE_T(pass*11)*program->inc;
+  auto cpu=heap->GetCPUDescriptorHandleForHeapStart();cpu.ptr+=SIZE_T(descriptor_page*33+pass*11)*program->inc;
   ID3D12Resource* srvs[]={frame.Get(),full.Get(),scene.Get(),n[0].Get(),n[1].Get(),pic};
   DXGI_FORMAT formats[]={frame_view,frame_view,frame_view,layer_view,layer_view,pf};
   for(UINT i=0;i<6;++i){D3D12_SHADER_RESOURCE_VIEW_DESC v{};v.Format=srvs[i]?formats[i]:DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -135,7 +145,7 @@ struct Picture::Impl {
   D3D12_UNORDERED_ACCESS_VIEW_DESC v{};v.Format=DXGI_FORMAT_R32_TYPELESS;v.ViewDimension=D3D12_UAV_DIMENSION_BUFFER;v.Buffer.NumElements=4;v.Buffer.Flags=D3D12_BUFFER_UAV_FLAG_RAW;
   program->dev->CreateUnorderedAccessView(proof.Get(),nullptr,&v,cpu);
   ID3D12DescriptorHeap* heaps[]={heap.Get()};l->SetDescriptorHeaps(1,heaps);l->SetComputeRootSignature(program->root.Get());l->SetPipelineState(program->pso[pass].Get());
-  auto gpu=heap->GetGPUDescriptorHandleForHeapStart();gpu.ptr+=UINT64(pass*11)*program->inc;
+  auto gpu=heap->GetGPUDescriptorHandleForHeapStart();gpu.ptr+=UINT64(descriptor_page*33+pass*11)*program->inc;
   l->SetComputeRootDescriptorTable(0,gpu);l->SetComputeRoot32BitConstants(1,8,&constants,0);
  }
 };
@@ -148,26 +158,40 @@ std::shared_ptr<Picture> Picture::Create(ID3D12Device* dev,const D3D12_RESOURCE_
  if(!texture(dev,p.w,p.h,d.Format,false,CD,p.scene)||!texture(dev,p.w,p.h,d.Format,false,CD,p.full)||
     !texture(dev,p.w,p.h,DXGI_FORMAT_R16G16B16A16_FLOAT,true,U,p.input)||!texture(dev,p.w,p.h,DXGI_FORMAT_R16_FLOAT,true,U,p.mask)||
     !buffer(dev,D3D12_HEAP_TYPE_DEFAULT,U,p.proof)||!buffer(dev,D3D12_HEAP_TYPE_READBACK,CD,p.readback))return {};
- D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,33,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
+ D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,66,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
  if(FAILED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&p.heap))))return {};return result;
 }
 bool Picture::Matches(ID3D12Device* d,const D3D12_RESOURCE_DESC& s,uint32_t ow,uint32_t oh)const{return p_->program->dev.Get()==d&&p_->w==s.Width&&p_->h==s.Height&&p_->source_format==s.Format&&p_->ow==ow&&p_->oh==oh;}
 void Picture::BeginCycle(){p_->prepared=p_->scene_current=p_->full_current=p_->proof_read=false;p_->frame.Reset();p_->motion.Reset();p_->n[0].Reset();p_->n[1].Reset();}
 bool Picture::SnapshotScene(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES s){return p_->scene_current=p_->snapshot(l,r,s,p_->scene,p_->scene_ready);}
 bool Picture::SnapshotFull(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES s){return p_->full_current=p_->snapshot(l,r,s,p_->full,p_->full_ready);}
+bool Picture::Probe(ID3D12GraphicsCommandList* l,ID3D12Resource* frame,DXGI_FORMAT view){
+ auto& p=*p_;if(!l||!frame||!p.full_current)return false;
+ const auto d=frame->GetDesc();if(d.Width!=p.w||d.Height!=p.h||
+  TypelessOf(d.Format)!=TypelessOf(p.source_format)||TypelessOf(view)!=TypelessOf(p.source_format))return false;
+ p.frame=frame;p.frame_view=view;p.descriptor_page=0;
+ if(!p.result)p.result_format=DXGI_FORMAT_R16G16B16A16_FLOAT; // typed null UAV; retained real outputs keep their actual format
+ const float tolerance=view==DXGI_FORMAT_R16G16B16A16_FLOAT?.0005f:view==DXGI_FORMAT_R10G10B10A2_UNORM?2.f/1023.f:2.f/255.f;
+ p.constants={p.w,p.h,p.ow,p.oh,0,1.f,tolerance,0};
+ move(l,p.proof.Get(),U,CD);l->CopyBufferRegion(p.proof.Get(),0,p.program->zero.Get(),0,16);move(l,p.proof.Get(),CD,U);
+ p.bind(l,0,nullptr,DXGI_FORMAT_UNKNOWN);l->Dispatch((p.w+7)/8,(p.h+7)/8,1);order(l);
+ move(l,p.proof.Get(),U,CS);l->CopyBufferRegion(p.readback.Get(),0,p.proof.Get(),0,16);move(l,p.proof.Get(),CS,U);
+ p.prepared=true;return true;
+}
 bool Picture::Prepare(ID3D12GraphicsCommandList* l,ID3D12Resource* frame,DXGI_FORMAT fv,ID3D12Resource* motion,
  ID3D12Resource* n0,ID3D12Resource* n1,DXGI_FORMAT lv,float grey,bool srgb,bool clean,DXGI_FORMAT output_format,bool tint){
  auto& p=*p_;if(!l||!frame||!motion||!n0||!n1||!p.scene_current||!p.full_current||p.prepared||!std::isfinite(grey)||grey<=0)return false;
  auto fd=frame->GetDesc(),md=motion->GetDesc(),nd=n0->GetDesc();
  if(fd.Width!=p.w||fd.Height!=p.h||md.Width!=p.w||md.Height!=p.h||nd.Width!=p.ow||nd.Height!=p.oh)return false;
  if((!p.result||p.result_format!=output_format)&&!texture(p.program->dev.Get(),p.ow,p.oh,output_format,true,U,p.result))return false;
- p.result_format=output_format;p.frame=frame;p.motion=motion;p.n[0]=n0;p.n[1]=n1;p.frame_view=fv;p.layer_view=lv;
+ p.result_format=output_format;p.frame=frame;p.motion=motion;p.n[0]=n0;p.n[1]=n1;p.frame_view=fv;p.layer_view=lv;p.descriptor_page=0;
  const float tolerance=fv==DXGI_FORMAT_R16G16B16A16_FLOAT?.0005f:fv==DXGI_FORMAT_R10G10B10A2_UNORM?2.f/1023.f:2.f/255.f;
  p.constants={p.w,p.h,p.ow,p.oh,(clean?1u:0u)|(srgb?2u:0u)|(tint?4u:0u),grey,tolerance,0};
  if(p.outputs_read){move(l,p.input.Get(),S,U);move(l,p.mask.Get(),S,U);}
+ move(l,n0,R,S);move(l,n1,R,S);
  move(l,p.proof.Get(),U,CD);l->CopyBufferRegion(p.proof.Get(),0,p.program->zero.Get(),0,16);move(l,p.proof.Get(),CD,U);
  p.bind(l,0,nullptr,DXGI_FORMAT_UNKNOWN);l->Dispatch((p.w+7)/8,(p.h+7)/8,1);order(l);
- move(l,n0,R,S);move(l,n1,R,S);move(l,motion,S,U);
+ move(l,motion,S,U);
  p.bind(l,1,nullptr,DXGI_FORMAT_UNKNOWN);l->Dispatch((p.w+7)/8,(p.h+7)/8,1);order(l);
  move(l,p.proof.Get(),U,CS);l->CopyBufferRegion(p.readback.Get(),0,p.proof.Get(),0,16);move(l,p.proof.Get(),CS,U);
  move(l,n0,S,R);move(l,n1,S,R);move(l,motion,U,S);move(l,p.input.Get(),U,S);move(l,p.mask.Get(),U,S);
@@ -180,7 +204,7 @@ ID3D12Resource* Picture::Full()const{return p_->full.Get();}
 bool Picture::ProofAfterCompletion(bool& identity,bool& clean){
  auto& p=*p_;if(!p.prepared||p.proof_read)return false;void* data=nullptr;D3D12_RANGE range{0,4};
  if(FAILED(p.readback->Map(0,&range,&data)))return false;UINT flags=0;std::memcpy(&flags,data,4);D3D12_RANGE none{};p.readback->Unmap(0,&none);
- identity=flags==0;clean=identity&&(p.constants.flags&1u)!=0;p.proof_read=true;return true;
+ identity=flags==0;clean=identity&&(p.constants.flags&9u)!=0;p.proof_read=true;return true;
 }
 bool Picture::Composite(ID3D12GraphicsCommandList* l,ID3D12Resource* out){
  auto& p=*p_;if(!p.prepared||!l||!out)return false;const auto d=out->GetDesc();
@@ -189,5 +213,28 @@ bool Picture::Composite(ID3D12GraphicsCommandList* l,ID3D12Resource* out){
  p.bind(l,2,out,d.Format);l->Dispatch((p.ow+7)/8,(p.oh+7)/8,1);order(l);
  move(l,out,S,CD);move(l,p.result.Get(),U,CS);l->CopyResource(out,p.result.Get());move(l,p.result.Get(),CS,U);move(l,out,CD,U);
  move(l,p.n[0].Get(),S,R);move(l,p.n[1].Get(),S,R);return true;
+}
+bool Picture::SeedNativeAlpha(ID3D12GraphicsCommandList* l,ID3D12Resource* out){
+ const UINT flags=p_->constants.flags;p_->constants.flags=16;
+ const bool ok=Composite(l,out);p_->constants.flags=flags;return ok;
+}
+bool Picture::PresentNative(ID3D12GraphicsCommandList* l,ID3D12Resource* frame,DXGI_FORMAT view,
+                            ID3D12Resource* native,ID3D12Resource* check,ID3D12Resource* out,bool tint){
+ auto& p=*p_;if(!l||!frame||!native||!check||!out||!p.full_current||!p.scene_current)return false;
+ const auto fd=frame->GetDesc(),nd=native->GetDesc(),cd=check->GetDesc(),od=out->GetDesc();
+ if(fd.Width!=p.w||fd.Height!=p.h||cd.Width!=p.w||cd.Height!=p.h||nd.Width!=p.ow||nd.Height!=p.oh||
+    od.Width!=p.ow||od.Height!=p.oh||TypelessOf(fd.Format)!=TypelessOf(p.source_format)||
+    TypelessOf(cd.Format)!=TypelessOf(view)||TypelessOf(nd.Format)!=TypelessOf(view))return false;
+ if(p.result&&p.result_format!=od.Format)return false; // prior seed can still be in flight
+ if(!p.result&&!texture(p.program->dev.Get(),p.ow,p.oh,od.Format,true,U,p.result))return false;
+ p.result_format=od.Format;p.frame=frame;p.frame_view=p.layer_view=view;p.n[0]=native;p.n[1]=check;p.motion.Reset();
+ const float tolerance=view==DXGI_FORMAT_R16G16B16A16_FLOAT?.0005f:view==DXGI_FORMAT_R10G10B10A2_UNORM?2.f/1023.f:2.f/255.f;
+ p.constants={p.w,p.h,p.ow,p.oh,8u|(tint?4u:0u),1,tolerance,0};p.proof_read=false;p.descriptor_page=1;
+ move(l,p.proof.Get(),U,CD);l->CopyBufferRegion(p.proof.Get(),0,p.program->zero.Get(),0,16);move(l,p.proof.Get(),CD,U);
+ p.bind(l,0,nullptr,DXGI_FORMAT_UNKNOWN);l->Dispatch((p.w+7)/8,(p.h+7)/8,1);order(l);
+ p.bind(l,2,nullptr,DXGI_FORMAT_UNKNOWN);l->Dispatch((p.ow+7)/8,(p.oh+7)/8,1);order(l);
+ move(l,out,U,CD);move(l,p.result.Get(),U,CS);l->CopyResource(out,p.result.Get());move(l,p.result.Get(),CS,U);move(l,out,CD,U);
+ move(l,p.proof.Get(),U,CS);l->CopyBufferRegion(p.readback.Get(),0,p.proof.Get(),0,16);move(l,p.proof.Get(),CS,U);
+ p.prepared=true;return true;
 }
 }

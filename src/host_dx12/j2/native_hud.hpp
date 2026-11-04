@@ -27,6 +27,7 @@
 #include <memory>
 
 namespace na::observe { struct NativeOperation; }
+namespace na::capture::j2 {struct Identity;}
 namespace na::j2::native_hud {
 class Picture;
 
@@ -49,7 +50,20 @@ struct Layer {
     std::shared_ptr<void> owner;     // layers retained through source recordings and Present GPU completion
     std::shared_ptr<Picture> picture; // draw transfer: complete original was preserved, GPU chooses clean/protect
     bool clean_allowed = false;
+    // Independent discovery probe; valid even when no HUD layer was produced.
+    std::shared_ptr<Picture> probe;
+    std::shared_ptr<void> probe_owner;
+    uint64_t probe_source=0,probe_generation=0;
+    ID3D12Resource* native_picture=nullptr; // NPSR: DLSS scene followed by the actual native HUD draws
+    ID3D12Resource* native_check=nullptr; // original-resolution replay, independently compared with actual full colour
+    std::shared_ptr<void> native_owner;
+    std::shared_ptr<na::capture::j2::Identity> recording_identity;
 };
+// Runs after the original batch, before its application completion fence.
+// Only replays draws whose EVERY source recording belongs to this exact batch.
+void AfterSubmission(ID3D12CommandQueue*,uint32_t count,ID3D12CommandList* const*);
+using PreHudRenderer=bool(*)(ID3D12CommandQueue*,ID3D12Resource*,uint32_t,uint32_t,ID3D12Resource*,uint32_t,uint32_t,const Layer&,ID3D12CommandList*);
+void SetPreHudRendererForTests(PreHudRenderer); // null restores the production DLSS renderer
 // PresentUpscale, for the proxy `frame` about to be upscaled from rw x rh to ow x oh: learns
 // the proxy (its HUD draws are redirected from its next frame on) and returns true when this
 // frame's HUD went into the layers. Ends the frame either way.
@@ -81,9 +95,14 @@ struct Stats {
     uint64_t draw_transfer_frames = 0, draw_protect_frames = 0;
     uint64_t transfer_verified=0,transfer_changed=0,clean_verified=0,protection_verified=0;
     uint32_t last_draw_method=0; // completed GPU receipt: 1 native, 2 current-picture protection, 3 changed transfer
+    uint64_t canvas_candidates=0,canvas_probes=0,canvas_verified=0,canvas_changed=0,canvas_no_state=0;
+    uint64_t handoff_snapshot_missing=0,handoff_no_source=0,handoff_inferred=0;
+    uint64_t native_recorded=0,native_submitted=0,native_verified=0,native_rejected=0;
 };
 Stats GetStats();
 void ReportPictureResult(bool identity,bool clean); // completed GPU receipt, status only
+void ReportCanvasProbe(uint64_t source,uint64_t generation,bool identity);
+void ReportNativePictureResult(bool identity);
 std::string StatusLine();
 // Finished frame-structure traces (hud_trace JSON lines, CRLF), taken once; empty when none.
 std::string TakeTrace();

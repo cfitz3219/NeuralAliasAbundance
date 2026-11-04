@@ -3279,6 +3279,9 @@ void STDMETHODCALLTYPE DetourExecute(ID3D12CommandQueue* q, UINT n,
         na::overlay::AfterGameSubmission(q,n,lists);
     }
     na::nr::states::Submitted(q,n,lists);
+    // Same queue-serialization scope, after actual game work and before the
+    // application can signal completion/recycle its HUD buffers or tables.
+    na::j2::native_hud::AfterSubmission(q,n,lists);
     if (obs_token.queue_state) na::observe::ExecuteEnd(obs_token, q, n, lists);
     g_exec_active.fetch_sub(1, std::memory_order_acq_rel);
 }

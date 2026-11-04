@@ -214,6 +214,7 @@ void write_slot(const Slot& s)
         // Pairing and the camera actually passed to the motion shader (2026-11-04).
         std::fprintf(fp, "  \"raster_jitter_px\": [%.6f, %.6f],\n  \"jitter_convention\": %u,\n  \"jitter_epoch\": %llu,\n",
             id.raster_jitter_x, id.raster_jitter_y, id.jitter_convention, (unsigned long long)id.jitter_epoch);
+        std::fprintf(fp,"  \"capture_kind\": \"%s\",\n  \"evaluation_succeeded\": %s,\n",id.presentation_only?"hud_presentation":"evaluation",id.evaluation_succeeded?"true":"false");
         std::fprintf(fp, "  \"present_pairing\": \"%s\",\n  \"present_closed_frame\": %llu,\n  \"inputs_frame\": %llu,\n",
             id.owns_present ? "own_output" : (s.planes[kPresent].valid ? "overlay_present" : "none"),
             (unsigned long long)s.present_closed, (unsigned long long)id.inputs_frame);
@@ -364,6 +365,7 @@ bool Armed()
 uint32_t RecordEvaluation(ID3D12GraphicsCommandList* list, const Planes& p, const Identity& id)
 {
     if (!Armed() || !list) return 0;
+    if(!p.color||!p.output||(!id.presentation_only&&(!p.depth||!p.motion)))return 0;
     std::lock_guard<std::mutex> lock(g.m);
     if (g.stats.recorded >= g.requested) { g.armed.store(false); return 0; }
     ComPtr<ID3D12Device> dev;
@@ -373,14 +375,16 @@ uint32_t RecordEvaluation(ID3D12GraphicsCommandList* list, const Planes& p, cons
     if (!s) { ++g.stats.dropped_busy; return 0; } // never wait: the frame is skipped, counted
     ID3D12Resource* res[4] = {p.color, p.depth, p.motion, p.output};
     const D3D12_RESOURCE_STATES st[4] = {p.color_state, p.depth_state, p.motion_state, p.output_state};
-    for (int i = 0; i < 4; ++i)
-        if (!ensure_readback(s->planes[i], res[i])) { ++g.stats.errors; return 0; } // nothing recorded yet
-    for (int i = 0; i < 4; ++i) record_copy(list, res[i], st[i], s->planes[i]);
+    for (int i = 0; i < 4; ++i){
+        if(!res[i]){s->planes[i].valid=false;continue;}
+        if (!ensure_readback(s->planes[i], res[i])) { ++g.stats.errors; return 0; }
+    }
+    for (int i = 0; i < 4; ++i)if(res[i])record_copy(list, res[i], st[i], s->planes[i]);
     s->planes[kPresent].valid = false;
     // Extra planes within a per-slot byte budget (Astra 20cddb8: bounded, never GB of GPU copies).
     constexpr UINT64 kSlotBudget = 256ull << 20;
     UINT64 used = 0;
-    for (int i = 0; i < 4; ++i) used += s->planes[i].bytes;
+    for (int i = 0; i < 4; ++i) if(s->planes[i].valid) used += s->planes[i].bytes;
     for (uint32_t i = 0; i < kMaxExtra; ++i) { s->extra[i].valid = false; s->extra_name[i] = nullptr; }
     for (uint32_t i = 0; i < p.extra_count && i < kMaxExtra; ++i) {
         const ExtraPlane& x = p.extra[i];

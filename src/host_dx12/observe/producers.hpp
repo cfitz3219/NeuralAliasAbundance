@@ -152,7 +152,7 @@ void ResetDerived();
 // Re-applies the game's descriptor heaps, root signatures, every root argument and the
 // pipeline state of this recording. False (nothing issued) if the state is not fully
 // known (unobserved recording, a bundle was executed).
-bool RestoreListState(ID3D12GraphicsCommandList* list);
+bool RestoreListState(ID3D12GraphicsCommandList* list,ID3D12GraphicsCommandList* destination=nullptr,bool graphics_only=false);
 // Scoped bindings change neither PSO/root signatures nor IA state. Restore only
 // touched bindings, with bounded inline snapshots and no RootArg vector clones.
 // Changing a resource heap invalidates tables in BOTH shader pipelines.
@@ -211,6 +211,7 @@ struct DrawInfo {
     bool restorable = false, pipeline_known = false;
     bool native_hud_affine = false; // RT0 RGB representable by the black/grey HUD replay
     bool shader_readonly = false, query_active = false; // replay metadata, independent of table-prefix guesses
+    bool pixel_position=false;
     uint32_t pso_rt_count = 0, rtv_format = 0, dsv_format = 0, samples = 0;
     uint32_t blend_mask = NA_UNKNOWN_U32, depth_enable = NA_UNKNOWN_U32, depth_func = NA_UNKNOWN_U32;
     uint32_t viewport_count = 0, scissor_count = 0;
