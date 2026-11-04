@@ -8,13 +8,15 @@ namespace na::j2::compute_flow {
 struct Frame {
     // slot is the caller's ring hint; private resources follow recording leases.
     uint64_t frame=0,previous=0;uint32_t generation=0,slot=0;bool reset=false,hdr=false;
-    float jitter[2]{};
+    float jitter[2]{}; // nominal on input; Ticket.frame carries the calibrated encode shift
+    float raster_jitter[2]{}; bool raster_sample=false;
+    uint64_t source_generation=0;
     // false: only the M3 camera fit runs (the camera needs reconstructing but the user turned
     // the object-motion residual off); no residual, no tier 3.
     bool residual=true;
     bool camera_reconstruct=false; // the caller found the camera matrix carries no view (status only)
 };
-struct Ticket {std::shared_ptr<void> context;uint32_t image=0,previous=0,slot=0;Frame frame;bool pair=false;};
+struct Ticket {std::shared_ptr<void> context;uint32_t image=0,previous=0,slot=0;Frame frame;bool pair=false;uint64_t colour_epoch=0;uint32_t colour_convention=0;};
 // fix: the M3 camera correction buffer of this recording (camera_fit_gpu.hpp), or nullptr. The
 // residual was derived against the corrected camera, so the arbiter must use the same fix.
 struct Tier3 {ID3D12Resource *residual=nullptr,*valid=nullptr,*mask=nullptr,*fix=nullptr;};
@@ -37,6 +39,7 @@ struct Stats {
     uint64_t rejected_invalid=0,rejected_small=0,rejected_cost=0,rejected_offscreen=0,rejected_image=0,rejected_flicker=0; // flicker: passed every check, no agreeing previous pair yet
     uint32_t recording_slots=0,image_slots=0;
     uint32_t loosen=0; // flow_loosen used by the latest recording
+    uint32_t colour_jitter_convention=0;uint64_t colour_jitter_epoch=0,colour_jitter_changes=0;
     // Every completed pair's pixel counts summed (not one sample per 5 s): accepted, invalid,
     // small, cost, offscreen, image, flicker; and the pairs counted.
     uint64_t sum[7]{}; uint64_t sum_pairs=0;

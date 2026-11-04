@@ -6,6 +6,7 @@
 #include "host_dx12/nr/native_fg.hpp"
 #include "core/motion_arbiter_gpu.hpp"
 #include "core/camera_fit_gpu.hpp"
+#include "core/jitter_probe_gpu.hpp"
 #include <d3dcompiler.h>
 #include <mutex>
 #include <atomic>
@@ -27,9 +28,9 @@ struct Constants {unsigned w,h,ew,eh,mode,block,cost,cost_max,offset,gw,gh;float
     unsigned have_hist=0,agree_min=1;float dj_x=0,dj_y=0;float agree_px=3.f,agree_cos=.5f,jitter_x=0,jitter_y=0;};
 static_assert(sizeof(Constants)==24*4,"root constants");
 constexpr unsigned kTable=12,kUav=8; // descriptors per table: SRVs t0..t7, then UAVs u0..u3
-struct Image {ComPtr<ID3D12Resource> tex;std::vector<Lease> uses;Lease producer;uint64_t frame=0;unsigned generation=0;float jitter[2]{};};
+struct Image {ComPtr<ID3D12Resource> tex,raw_color;std::vector<Lease> uses;Lease producer;uint64_t frame=0,colour_epoch=0;unsigned generation=0;float jitter[2]{},raster_jitter[2]{};};
 struct Slot {
-    Lease lease;bool pair=false,submitted=false,fit_only=false;uint64_t frame=0;
+    Lease lease;bool pair=false,submitted=false,fit_only=false,probe=false;uint64_t frame=0;
     ComPtr<ID3D12DescriptorHeap> heap,engine_heap,expand_heap,derive_heap;
     ComPtr<ID3D12Resource> readback;ComPtr<ID3D12QueryHeap> timestamps;
     ComPtr<ID3D12Resource> color_input,depth_input;
@@ -42,6 +43,8 @@ struct Context {
     unsigned hist_read=0;uint64_t hist_frame=0;unsigned hist_generation=0; // last committed pair's candidates
     UINT64 frequency=0;
     na::ffx_flow::PairFlow engine;na::nvof::FlowExpand expand;na::motion::gpu::Arbiter derive;na::motion::gpu::CameraFit fit;
+    na::jitter::gpu::Probe jitter_probe;na::jitter::ColourDomain colour_jitter;
+    na::jitter::Evidence jitter_window{};uint32_t jitter_window_frames=0;uint64_t jitter_last_frame=0;
     std::vector<std::unique_ptr<Image>> images;std::vector<std::unique_ptr<Slot>> leases;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu(unsigned slot,unsigned table,unsigned i){auto a=leases[slot]->heap->GetCPUDescriptorHandleForHeapStart();a.ptr+=SIZE_T(table*kTable+i)*stride;return a;}
     D3D12_GPU_DESCRIPTOR_HANDLE gpu(unsigned slot,unsigned table){auto a=leases[slot]->heap->GetGPUDescriptorHandleForHeapStart();a.ptr+=UINT64(table*kTable)*stride;return a;}
@@ -81,7 +84,8 @@ bool build(Context& c,ID3D12Device* device,ID3D12CommandQueue* queue,unsigned w,
     if(!c.engine.Init(device,w,h,1)){reason(c.engine.Error());return false;}
     if(!programs(c) || !c.expand.Init(device,1) || !c.derive.Init(device,1))return false;
     c.fit.Init(device); // optional: without it the camera motion is used unchanged (Ready() false)
-    for(unsigned i=0;i<warm_images;++i){auto image=std::make_unique<Image>();if(!c.tex(DXGI_FORMAT_R8G8B8A8_UNORM,image->tex))return false;c.images.push_back(std::move(image));}
+    c.jitter_probe.Init(device);
+    for(unsigned i=0;i<warm_images;++i){auto image=std::make_unique<Image>();if(!c.tex(DXGI_FORMAT_R8G8B8A8_UNORM,image->tex) || !c.tex(DXGI_FORMAT_R8G8B8A8_UNORM,image->raw_color))return false;c.images.push_back(std::move(image));}
     if(!c.tex(DXGI_FORMAT_R32G32_FLOAT,c.raw) || !c.tex(DXGI_FORMAT_R32_FLOAT,c.expanded) || !c.tex(DXGI_FORMAT_R32G32_FLOAT,c.residual) || !c.tex(DXGI_FORMAT_R32_FLOAT,c.valid) || !c.tex(DXGI_FORMAT_R32_FLOAT,c.mask) ||
        !c.tex(DXGI_FORMAT_R16G16B16A16_FLOAT,c.hist[0]) || !c.tex(DXGI_FORMAT_R16G16B16A16_FLOAT,c.hist[1]) ||
        !c.buffer(48,D3D12_HEAP_TYPE_DEFAULT,U,c.counters) || !c.buffer(48,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ,c.zero))return false;
@@ -89,8 +93,19 @@ bool build(Context& c,ID3D12Device* device,ID3D12CommandQueue* queue,unsigned w,
     queue->GetTimestampFrequency(&c.frequency);return true;
 }
 bool free(Image& i){i.uses.erase(std::remove_if(i.uses.begin(),i.uses.end(),[](const Lease& l){return l.Retired();}),i.uses.end());return i.uses.empty();}
-void collect(Context& c){for(size_t index=0;index<c.leases.size();++index){auto& s=*c.leases[index];if(!s.pair || !s.lease.Retired())continue;
-    if(!s.submitted){s.pair=false;na::motion::gpu::FitResult drop;c.fit.Collect(static_cast<uint32_t>(index),&drop);continue;} // discarded commands never wrote telemetry
+void collect(Context& c){for(size_t index=0;index<c.leases.size();++index){auto& s=*c.leases[index];if((!s.pair && !s.probe) || !s.lease.Retired())continue;
+    if(!s.submitted){s.pair=s.probe=false;c.jitter_probe.Discard(static_cast<uint32_t>(index));na::motion::gpu::FitResult drop;c.fit.Collect(static_cast<uint32_t>(index),&drop);continue;} // discarded commands never wrote telemetry
+    if(s.probe){na::jitter::Source key;na::jitter::Evidence e;
+        if(c.jitter_probe.Collect(static_cast<uint32_t>(index),key,e) && key==c.colour_jitter.Key() && e.frame>c.jitter_last_frame){
+            c.jitter_last_frame=e.frame;auto& w=c.jitter_window;w.frame=e.frame;w.tested+=e.tested;
+            w.unshifted+=e.unshifted;w.raster+=e.raster;w.opposite+=e.opposite;
+            if(++c.jitter_window_frames>=60){
+                if(c.colour_jitter.Observe(key,w))++stats.colour_jitter_changes;
+                c.jitter_window={};c.jitter_window_frames=0;
+            }
+        }s.probe=false;
+    }
+    if(!s.pair)continue;
     {na::motion::gpu::FitResult r;if(c.fit.Collect(static_cast<uint32_t>(index),&r)){++stats.fit_collected;
         memcpy(stats.fit_theta,r.theta,sizeof r.theta);stats.fit_e0=r.energy0;stats.fit_e=r.energy;stats.fit_n0=r.samples0;stats.fit_n=r.samples;stats.fit_last_accepted=r.accepted;
         if(r.accepted){++stats.fit_accepted;stats.fit_e0_sum+=r.energy0;stats.fit_e_sum+=r.energy;}
@@ -129,7 +144,15 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
         reason("AMD working resources unavailable; camera motion used");
         auto next=std::make_shared<Context>();if(!build(*next,device.Get(),queue,w,h))return {};current=std::move(next);++stats.resets;
     }
-    auto c=current;collect(*c);
+    auto c=current;
+    const na::jitter::Source colour_key{f.source_generation,w,h,static_cast<uint32_t>(d.Format)};
+    if(!(colour_key==c->colour_jitter.Key())){
+        c->colour_jitter.Bind(colour_key);c->jitter_window={};c->jitter_window_frames=0;c->jitter_last_frame=0;
+    }
+    collect(*c);
+    const na::jitter::Sample raster{f.raster_sample?f.raster_jitter[0]:f.jitter[0],f.raster_sample?f.raster_jitter[1]:f.jitter[1]};
+    const auto encode=c->colour_jitter.Resolve(raster);
+    stats.colour_jitter_convention=static_cast<uint32_t>(c->colour_jitter.Get());stats.colour_jitter_epoch=c->colour_jitter.Epoch();
     // Retain context through every submission/replay or discard of this exact recording.
     auto lease=na::nr::native::RetainRecording(l,c);if(!lease){++stats.unavailable;reason("AMD flow recording lifetime unavailable; camera motion used");return {};}
     for(const auto& s:c->leases)if(!s->lease.Retired() && s->lease.SameRecording(lease)){
@@ -138,14 +161,17 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
     if(work==c->leases.size())c->leases.push_back(std::make_unique<Slot>());
     auto& slot=*c->leases[work];if(!prepare_slot(*c,slot)){++stats.unavailable;reason("AMD recording descriptor allocation failed; camera motion used");return {};}
     int image=-1;for(unsigned j=0;j<c->images.size();++j)if(static_cast<int>(j)!=c->last && free(*c->images[j])){image=static_cast<int>(j);break;}
-    if(image<0){auto next=std::make_unique<Image>();if(!c->tex(DXGI_FORMAT_R8G8B8A8_UNORM,next->tex)){++stats.unavailable;reason("AMD history image allocation failed; camera motion used");return {};}
+    if(image<0){auto next=std::make_unique<Image>();if(!c->tex(DXGI_FORMAT_R8G8B8A8_UNORM,next->tex) || !c->tex(DXGI_FORMAT_R8G8B8A8_UNORM,next->raw_color)){++stats.unavailable;reason("AMD history image allocation failed; camera motion used");return {};}
         image=static_cast<int>(c->images.size());c->images.push_back(std::move(next));}
-    slot.lease=lease;slot.pair=false;slot.submitted=false;slot.fit_only=!f.residual;slot.hist_written=-1;slot.frame=f.frame;auto& im=*c->images[image];im.uses.push_back(lease);im.producer=lease;
+    slot.lease=lease;slot.pair=slot.probe=false;slot.submitted=false;slot.fit_only=!f.residual;slot.hist_written=-1;slot.frame=f.frame;auto& im=*c->images[image];im.uses.push_back(lease);im.producer=lease;
     slot.color_input=color;slot.depth_input=depth;
     stats.recording_slots=static_cast<uint32_t>(c->leases.size());stats.image_slots=static_cast<uint32_t>(c->images.size());
     const int previous=c->last;
-    bool pair=!f.reset && previous>=0 && c->images[previous]->frame==f.previous && f.previous && c->images[previous]->generation==f.generation && c->images[previous]->producer.Ready(queue);
+    bool pair=!f.reset && previous>=0 && c->images[previous]->frame==f.previous && f.previous && c->images[previous]->generation==f.generation &&
+        c->images[previous]->colour_epoch==c->colour_jitter.Epoch() && c->images[previous]->producer.Ready(queue);
     Ticket t;t.context=c;t.image=static_cast<unsigned>(image);t.previous=previous<0?0u:static_cast<unsigned>(previous);t.slot=work;t.frame=f;t.pair=pair;
+    t.frame.jitter[0]=encode.x;t.frame.jitter[1]=encode.y;t.frame.raster_jitter[0]=raster.x;t.frame.raster_jitter[1]=raster.y;
+    t.frame.raster_sample=true;t.colour_epoch=c->colour_jitter.Epoch();t.colour_convention=static_cast<uint32_t>(c->colour_jitter.Get());
     stats.camera_reconstruct=f.camera_reconstruct;if(f.camera_reconstruct)++stats.reconstruct_frames;
     stats.loosen=g_loosen.load(std::memory_order_relaxed);
     const Gates gates=GatesFor(stats.loosen);
@@ -154,12 +180,18 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
     cb.w=cb.ew=w;cb.h=cb.eh=h;cb.mode=f.hdr?1u:0u;cb.block=8;cb.gw=(w+7)/8;cb.gh=(h+7)/8;
     // Jitter-stabilised encode (j2_flow fe8ea3e): sample texel q at q + this frame's jitter so both
     // images of a pair sit in the unjittered frame and the engine never sees DLAA's shake.
-    cb.jitter_x=f.jitter[0];cb.jitter_y=f.jitter[1];
+    cb.jitter_x=encode.x;cb.jitter_y=encode.y;
     if(slot.timestamps)l->EndQuery(slot.timestamps.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0);
-    move(l,im.tex.Get(),S,U);c->defaults(work,0);c->srv(work,0,0,color,d.Format);c->uav(work,0,kUav+0,im.tex.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);
-    c->dispatch(l,work,0,c->pso_encode.Get(),cb);order(l);move(l,im.tex.Get(),U,S);++stats.recorded;
+    move(l,im.tex.Get(),S,U);move(l,im.raw_color.Get(),S,U);
+    c->defaults(work,0);c->srv(work,0,0,color,d.Format);c->uav(work,0,kUav+0,im.tex.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);
+    c->uav(work,0,kUav+3,im.raw_color.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);
+    c->dispatch(l,work,0,c->pso_encode.Get(),cb);order(l);move(l,im.tex.Get(),U,S);move(l,im.raw_color.Get(),U,S);++stats.recorded;
     if(!pair){++stats.waiting_history;reason("AMD flow capturing matching scene history; camera motion used");return t;}
     auto& prev=*c->images[previous];prev.uses.push_back(lease);
+    // Calibration reads the unshifted source pair: comparing two differently
+    // bilinear-resampled encodes would confound sampling blur with real jitter.
+    slot.probe=c->jitter_probe.Record(l,work,im.raw_color.Get(),prev.raw_color.Get(),colour_key,f.frame,
+        {raster.x-prev.raster_jitter[0],raster.y-prev.raster_jitter[1]},{});
     if(!c->engine.Record(l,im.tex.Get(),prev.tex.Get(),0,&slot.engine_heap)){++stats.unavailable;reason("AMD flow refused image pair; camera motion used");return t;}
     move(l,c->raw.Get(),S,U);move(l,c->expanded.Get(),S,U);
     // AMD outputs integral pixels; FlowExpand decodes NVOFA S10.5. Cancel
@@ -172,7 +204,7 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
     ID3D12Resource* fix=nullptr;
     // The pair's images feed the fit's image check; dj = the stabilisation jitter delta of this
     // pair (current - previous), the shift the encode adds when the colour carries no jitter.
-    const float dj[2]={f.jitter[0]-prev.jitter[0],f.jitter[1]-prev.jitter[1]};
+    const float dj[2]={encode.x-prev.jitter[0],encode.y-prev.jitter[1]};
     cb.dj_x=dj[0];cb.dj_y=dj[1];
     if(ok && camera.fit_basis && c->fit.Ready()){
         na::motion::gpu::FitImages images;images.current=im.tex.Get();images.previous=prev.tex.Get();images.jitter_delta_px[0]=dj[0];images.jitter_delta_px[1]=dj[1];
@@ -188,7 +220,7 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
     na::motion::gpu::Inputs fitted=camera;fitted.fix=fix;
     move(l,c->residual.Get(),S,U);move(l,c->valid.Get(),S,U);
     // Stabilised images: the raw flow carries no jitter shift, so (jitter_prev - jitter_cur) must be 0.
-    ok=ok && c->derive.DispatchDeriveResidual(l,c->raw.Get(),depth,fitted,f.jitter,c->residual.Get(),c->valid.Get(),w,h,0,c->expanded.Get(),&slot.derive_heap);
+    ok=ok && c->derive.DispatchDeriveResidual(l,c->raw.Get(),depth,fitted,camera.jitter_current_px,c->residual.Get(),c->valid.Get(),w,h,0,c->expanded.Get(),&slot.derive_heap);
     order(l);move(l,c->residual.Get(),U,S);move(l,c->valid.Get(),U,S);move(l,c->mask.Get(),S,U);
     move(l,c->counters.Get(),U,D3D12_RESOURCE_STATE_COPY_DEST);l->CopyBufferRegion(c->counters.Get(),0,c->zero.Get(),0,40);move(l,c->counters.Get(),D3D12_RESOURCE_STATE_COPY_DEST,U);
     cb.cost=2;c->defaults(work,1);c->srv(work,1,4,c->engine.SceneChange(),DXGI_FORMAT_R32_UINT);
@@ -221,10 +253,10 @@ Gates GatesFor(uint32_t percent){
     return g;
 }
 void SetLoosen(uint32_t percent){g_loosen.store(percent>100?100u:percent,std::memory_order_relaxed);}
-void Committed(const Ticket& t){if(!t.context)return;std::lock_guard<std::mutex> lock(mutex);auto c=std::static_pointer_cast<Context>(t.context);if(c!=current)return;auto& im=*c->images[t.image];im.frame=t.frame.frame;im.generation=t.frame.generation;memcpy(im.jitter,t.frame.jitter,sizeof im.jitter);c->last=static_cast<int>(t.image);auto& slot=*c->leases[t.slot];slot.submitted=true;++stats.submitted;if(slot.pair)++stats.submitted_pairs;
+void Committed(const Ticket& t){if(!t.context)return;std::lock_guard<std::mutex> lock(mutex);auto c=std::static_pointer_cast<Context>(t.context);if(c!=current)return;auto& im=*c->images[t.image];im.frame=t.frame.frame;im.generation=t.frame.generation;memcpy(im.jitter,t.frame.jitter,sizeof im.jitter);memcpy(im.raster_jitter,t.frame.raster_jitter,sizeof im.raster_jitter);im.colour_epoch=t.colour_epoch;c->last=static_cast<int>(t.image);auto& slot=*c->leases[t.slot];slot.submitted=true;++stats.submitted;if(slot.pair)++stats.submitted_pairs;
     if(slot.pair && slot.hist_written>=0){c->hist_read=static_cast<unsigned>(slot.hist_written);c->hist_frame=t.frame.frame;c->hist_generation=t.frame.generation;slot.hist_written=-1;}stats.last_submitted_frame=t.frame.frame;last_submit_tick=GetTickCount64();}
 void Reset(){std::lock_guard<std::mutex> lock(mutex);current.reset();last_submit_tick=sample_tick=0;stats={};}
-Stats GetStats(){na::nr::native::Maintain();std::lock_guard<std::mutex> lock(mutex);if(current)collect(*current);const auto now=GetTickCount64();stats.submit_age_ms=last_submit_tick?now-last_submit_tick:0;stats.sample_age_ms=sample_tick?now-sample_tick:0;return stats;}
+Stats GetStats(){na::nr::native::Maintain();std::lock_guard<std::mutex> lock(mutex);if(current){collect(*current);stats.colour_jitter_convention=static_cast<uint32_t>(current->colour_jitter.Get());stats.colour_jitter_epoch=current->colour_jitter.Epoch();}const auto now=GetTickCount64();stats.submit_age_ms=last_submit_tick?now-last_submit_tick:0;stats.sample_age_ms=sample_tick?now-sample_tick:0;return stats;}
 void DescribeStats(const Stats& s,char* text,size_t capacity){
     if(!text || !capacity)return;
     if(!s.submitted || s.submit_age_ms>2000){std::snprintf(text,capacity,"AMD flow: no new submission%s. %s Frames submitted %llu, paired %llu, skipped %llu.",

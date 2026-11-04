@@ -4,6 +4,7 @@
 #include "host_dx12/ffx_flow/ffx_flow.hpp"
 #include "host_dx12/nr/native_fg.hpp"
 #include "core/motion_arbiter_gpu.hpp"
+#include "core/jitter_domain.hpp"
 #include <vector>
 #include <cmath>
 int main(int argc,char**){
@@ -71,5 +72,39 @@ int main(int argc,char**){
     f.frame=5;f.previous=4;f.reset=false;auto abandoned=cf::Record(l.list.Get(),d.queue.Get(),after.Get(),depth.Get(),camera,f,tier);CHECK(abandoned.context && tier.residual);
     l.list->Close();reset(); // deliberately discard, never publish frame5 as history
     f.frame=6;f.previous=5;auto next=cf::Record(l.list.Get(),d.queue.Get(),after.Get(),depth.Get(),camera,f,tier);CHECK(next.context && !tier.residual);execute();cf::Committed(next);reset();
+    if(argc==1){
+        // Real AMD pipeline, stationary UNJITTERED colour, but nonzero nominal
+        // raster samples. This is the captured SE5 failure, not ideal flow fed
+        // directly into the fitter. Calibration must remove the artificial
+        // encode shifts and seed a new image pair exactly once at changeover.
+        unsigned history_only=0;uint64_t last_epoch=0;unsigned stable=0;
+        f={};f.generation=4;f.source_generation=444;f.raster_sample=true;
+        for(unsigned i=0;i<156;++i){
+            f.frame=1000+i;f.previous=f.frame-1;f.jitter[0]=(i&1u)?.375f:-.375f;
+            f.raster_jitter[0]=f.jitter[0];
+            auto actual=cf::Record(l.list.Get(),d.queue.Get(),before.Get(),depth.Get(),camera,f,tier);
+            REQUIRE(actual.context);if(!actual.pair)++history_only;
+            if(actual.colour_convention==static_cast<uint32_t>(na::jitter::Convention::Unjittered)){
+                CHECK(actual.frame.jitter[0]==0.f && actual.frame.jitter[1]==0.f);
+                if(last_epoch)CHECK(last_epoch==actual.colour_epoch);
+                last_epoch=actual.colour_epoch;++stable;
+            }
+            execute();cf::Committed(actual);reset();
+        }
+        const auto calibrated=cf::GetStats();
+        std::printf("source calibration convention=%u changes=%llu stable_frames=%u history_only=%u\n",
+            calibrated.colour_jitter_convention,(unsigned long long)calibrated.colour_jitter_changes,stable,history_only);
+        CHECK(calibrated.colour_jitter_convention==static_cast<uint32_t>(na::jitter::Convention::Unjittered));
+        CHECK(stable>=20 && history_only==2);
+        // Correcting the still scene must preserve real object motion after
+        // that same source has calibrated, with nominal raster offsets on.
+        for(auto* moving:{after.Get(),later.Get()}){
+            ++f.frame;f.previous=f.frame-1;f.jitter[0]=-f.jitter[0];f.raster_jitter[0]=f.jitter[0];
+            auto actual=cf::Record(l.list.Get(),d.queue.Get(),moving,depth.Get(),camera,f,tier);
+            REQUIRE(actual.context && actual.pair && tier.residual);CHECK(actual.frame.jitter[0]==0.f);
+            execute();cf::Committed(actual);reset();
+        }
+        CHECK(cf::GetStats().accepted>0);
+    }
     cf::Reset();CHECK(d.device->GetDeviceRemovedReason()==S_OK);execute();return test::finish("j2_compute_flow_test");
 }
