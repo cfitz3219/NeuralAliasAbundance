@@ -62,6 +62,9 @@ struct FitImages {
     ID3D12Resource* current = nullptr;
     ID3D12Resource* previous = nullptr;
     float jitter_delta_px[2] = {};
+    // Fit samples and depth use the raster grid. These validation images can
+    // use a stabilised grid; image pixel = raster pixel + this offset.
+    float raster_to_image_px[2] = {};
 };
 
 class CameraFit {

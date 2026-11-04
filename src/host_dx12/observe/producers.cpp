@@ -153,7 +153,7 @@ struct ListState {
     // Viewport jitter: our offset copies of the game's viewports are bound now (vpj_value),
     // and the value the last scene draw of this recording was drawn with (vpj_scene, 0 = none).
     bool vpj_applied = false;
-    uint64_t vpj_value = 0, vpj_scene = 0;
+    uint64_t vpj_value = 0, vpj_scene = 0, vpj_depth = 0;
 };
 
 struct Obj {
@@ -3559,7 +3559,7 @@ void vpj_viewports_replaced(GL* l, bool reset)
     if (!ls) return;
     std::lock_guard<std::mutex> bl(ls->bind_m);
     ls->vpj_applied = false;
-    if (reset) ls->vpj_scene = 0;
+    if (reset) {ls->vpj_scene = 0;ls->vpj_depth=0;}
 }
 void vpj_before_draw(GL* l)
 {
@@ -3569,13 +3569,16 @@ void vpj_before_draw(GL* l)
     UINT n = 0;
     {
         uint64_t sel_depth = 0, sel_color = 0;
-        if (cur) GetLiveSelection(&sel_depth, &sel_color);
+        GetLiveSelection(&sel_depth, &sel_color);
         std::shared_lock<std::shared_mutex> lock(g_m);
         na_object_id id = 0;
         auto* ls = list_state_locked(l, &id);
         if (!ls) return;
         std::lock_guard<std::mutex> bl(ls->bind_m);
-        bool want = cur && sel_depth && ls->cur_ds == sel_depth;
+        // A Present on another thread must not change half a scene recording's
+        // sample. The first eligible draw owns it until this list is Reset.
+        const uint64_t sample=ls->vpj_scene&&ls->vpj_depth==sel_depth?ls->vpj_scene:cur;
+        bool want = sample && sel_depth && ls->cur_ds == sel_depth;
         if (want) {
             const auto pipeline = g_objs.find(canon(ls->pso));
             want = pipeline != g_objs.end() && pipeline->second.created.size() >= sizeof(na_ev_pipeline_created) &&
@@ -3583,13 +3586,14 @@ void vpj_before_draw(GL* l)
         }
         if (want && !(ls->raster_viewports_known && ls->raster_viewport_count)) { g_vpj_unknown.fetch_add(1, std::memory_order_relaxed); want = false; }
         if (want) {
-            ls->vpj_scene = cur;
+            ls->vpj_scene = sample;
+            ls->vpj_depth=sel_depth;
             g_vpj_draws.fetch_add(1, std::memory_order_relaxed);
-            if (ls->vpj_applied && ls->vpj_value == cur) return;
-            const float dx = vpj_axis(cur, 16), dy = vpj_axis(cur, 0);
+            if (ls->vpj_applied && ls->vpj_value == sample) return;
+            const float dx = vpj_axis(sample, 16), dy = vpj_axis(sample, 0);
             n = ls->raster_viewport_count;
             for (UINT i = 0; i < n; ++i) { v[i] = ls->raster_viewports[i]; v[i].TopLeftX += dx; v[i].TopLeftY += dy; }
-            ls->vpj_applied = true; ls->vpj_value = cur;
+            ls->vpj_applied = true; ls->vpj_value = sample;
             g_vpj_sets.fetch_add(1, std::memory_order_relaxed);
         } else {
             if (!ls->vpj_applied) return;
@@ -6120,14 +6124,14 @@ bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float
     if (y) *y = vpj_axis(packed, 0);
     return true;
 }
-uint64_t ListSceneViewportJitter(ID3D12CommandList* list)
+uint64_t ListSceneViewportJitter(ID3D12CommandList* list,uint64_t scene_depth)
 {
     std::shared_lock<std::shared_mutex> lock(g_m);
     na_object_id id = 0;
     auto* ls = list ? list_state_locked(list, &id) : nullptr;
     if (!ls) return 0;
     std::lock_guard<std::mutex> bl(ls->bind_m);
-    return ls->vpj_scene;
+    return !scene_depth||scene_depth==ls->vpj_depth?ls->vpj_scene:0;
 }
 ViewportJitterStats GetViewportJitterStats()
 {

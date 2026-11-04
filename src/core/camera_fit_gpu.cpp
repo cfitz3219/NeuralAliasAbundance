@@ -30,6 +30,7 @@ cbuffer K : register(b0) {
     float jx, jy, depth_clear, robust;
     uint iteration, iterations, groups, samples;
     float djx, djy; uint photo, pad0;
+    float2 raster_to_image; float2 pad1;
 };
 
 #define NV 32
@@ -261,7 +262,7 @@ void validate(uint3 dt : SV_DispatchThreadID) {
     const float2 dcam = float2((c0.x / c0.w + 1.0) * 0.5 * width, (1.0 - c0.y / c0.w) * 0.5 * height) - p;
     const float2 dfit = float2((cf.x / cf.w + 1.0) * 0.5 * width, (1.0 - cf.y / cf.w) * 0.5 * height) - p;
     if (!(finite1(dfit.x) && finite1(dfit.y) && abs(dfit.x) < 96.0 && abs(dfit.y) < 96.0)) return;
-    const float2 q = float2(x, y) + 0.5;
+    const float2 q = float2(x, y) + 0.5 + raster_to_image;
     if (texture_at(q) < 0.04) return;
     const float ef = image_error(q, dfit);
     const float ec = min(image_error(q, dcam), image_error(q, dcam + float2(djx, djy)));
@@ -300,8 +301,9 @@ struct Constants {
     uint32_t iteration, iterations, groups, samples;
     float djx, djy;
     uint32_t photo, pad0;
+    float raster_to_image[2]{},pad1[2]{};
 };
-static_assert(sizeof(Constants) == 16 * 4, "root constants");
+static_assert(sizeof(Constants) == 20 * 4, "root constants");
 
 D3D12_RESOURCE_BARRIER transition(ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b)
 {
@@ -467,6 +469,7 @@ ID3D12Resource* CameraFit::Record(ID3D12GraphicsCommandList* l, uint32_t slot, I
     c.jx = jitter_px[0]; c.jy = jitter_px[1]; c.depth_clear = depth_clear; c.robust = 1.5f;
     c.iterations = kIterations; c.groups = groups; c.samples = samples;
     if (images) { c.djx = images->jitter_delta_px[0]; c.djy = images->jitter_delta_px[1]; }
+    if(images){c.raster_to_image[0]=images->raster_to_image_px[0];c.raster_to_image[1]=images->raster_to_image_px[1];}
     c.photo = photo ? 1u : 0u;
     for (uint32_t it = 0; it <= kIterations; ++it) {
         c.iteration = it;

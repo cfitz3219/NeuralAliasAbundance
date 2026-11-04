@@ -301,7 +301,7 @@ uint64_t LiveSelectionVersion();
 void SetSceneViewportJitter(uint64_t frame, float x, float y);
 bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float* y);
 // Packed value the last scene draw of this recording used (0 = none since Reset).
-uint64_t ListSceneViewportJitter(ID3D12CommandList* list);
+uint64_t ListSceneViewportJitter(ID3D12CommandList* list,uint64_t scene_depth=0);
 struct ViewportJitterStats { uint64_t draws, sets, restores, unknown; };
 ViewportJitterStats GetViewportJitterStats();
 
