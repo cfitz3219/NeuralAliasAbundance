@@ -1047,10 +1047,10 @@ void write_status_line()
                 if (eff && eff[0]) { WriteFile(f, eff, static_cast<DWORD>(std::strlen(eff)), &written, nullptr); WriteFile(f, "\r\n", 2, &written, nullptr); }
             }
             // aca551b cost: standalone-projection search (cached = blocks skipped, solved = solver windows) and J1 CPU per frame.
-            const int pn = snprintf(cl2, sizeof cl2, "j2_pscan cached=%llu solved=%llu cpu_us_per_frame=%.1f cpu_max_us=%llu\r\n",
+            const int psn = snprintf(cl2, sizeof cl2, "j2_pscan cached=%llu solved=%llu cpu_us_per_frame=%.1f cpu_max_us=%llu\r\n",
                 (unsigned long long)j2.jitter_p_scan_cached, (unsigned long long)j2.jitter_p_scan_solved,
                 j2.frames ? double(j2.jitter_cpu_us) / double(j2.frames) : 0.0, (unsigned long long)j2.jitter_cpu_max_us);
-            if (pn > 0) WriteFile(f, cl2, static_cast<DWORD>((std::min)(pn, static_cast<int>(sizeof(cl2) - 1))), &written, nullptr);
+            if (psn > 0) WriteFile(f, cl2, static_cast<DWORD>((std::min)(psn, static_cast<int>(sizeof(cl2) - 1))), &written, nullptr);
         }
         {   // Frames whose DLAA ran before the last scene draw (SE5 pan-only flicker): placement + late writer.
             char ll[1000];
