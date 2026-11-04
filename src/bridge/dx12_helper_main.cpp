@@ -81,11 +81,11 @@ bool Parse(int argc, wchar_t** argv, Session* s)
 }
 
 template <class T>
-bool OpenShared(ID3D12Device* device, const std::wstring& name, ComPtr<T>* out)
+bool OpenShared(ID3D12Device* device, const std::wstring& name, ComPtr<T>& out) // by reference: ComPtr overloads operator&
 {
     HANDLE h = nullptr;
     if (FAILED(device->OpenSharedHandleByName(name.c_str(), GENERIC_ALL, &h)) || !h) return false;
-    const HRESULT hr = device->OpenSharedHandle(h, IID_PPV_ARGS(out->ReleaseAndGetAddressOf()));
+    const HRESULT hr = device->OpenSharedHandle(h, IID_PPV_ARGS(out.ReleaseAndGetAddressOf()));
     CloseHandle(h);
     return SUCCEEDED(hr);
 }
@@ -143,12 +143,12 @@ int Run(const Session& s)
 
     ComPtr<ID3D12Resource> color, depth, motion, output;
     ComPtr<ID3D12Fence> input_fence, output_fence;
-    if (!OpenShared(device.Get(), ObjectName(s.stem, Object::Color), &color) ||
-        !OpenShared(device.Get(), ObjectName(s.stem, Object::Depth), &depth) ||
-        !OpenShared(device.Get(), ObjectName(s.stem, Object::Motion), &motion) ||
-        !OpenShared(device.Get(), ObjectName(s.stem, Object::Output), &output) ||
-        !OpenShared(device.Get(), ObjectName(s.stem, Object::InputFence), &input_fence) ||
-        !OpenShared(device.Get(), ObjectName(s.stem, Object::OutputFence), &output_fence)) {
+    if (!OpenShared(device.Get(), ObjectName(s.stem, Object::Color), color) ||
+        !OpenShared(device.Get(), ObjectName(s.stem, Object::Depth), depth) ||
+        !OpenShared(device.Get(), ObjectName(s.stem, Object::Motion), motion) ||
+        !OpenShared(device.Get(), ObjectName(s.stem, Object::Output), output) ||
+        !OpenShared(device.Get(), ObjectName(s.stem, Object::InputFence), input_fence) ||
+        !OpenShared(device.Get(), ObjectName(s.stem, Object::OutputFence), output_fence)) {
         Report(HelperState::Failed, "The helper could not open the game's shared textures or fences.");
         return 9;
     }

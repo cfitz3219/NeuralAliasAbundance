@@ -168,11 +168,11 @@ struct Dx11Bridge::Impl {
             ComPtr<IDXGIResource1> r;
             hr = t.texture.As(&r);
             if (FAILED(hr)) return hr_reason("This DX11 device cannot share textures", hr);
-            HANDLE h = nullptr;
+            HANDLE raw = nullptr;
             hr = r->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
-                                       ObjectName(stem, name).c_str(), &h);
+                                       ObjectName(stem, name).c_str(), &raw);
             if (FAILED(hr)) return hr_reason("The bridge could not share a texture with the helper", hr);
-            t.shared.reset(h);
+            t.shared.reset(raw);
         }
         return nullptr;
     }
