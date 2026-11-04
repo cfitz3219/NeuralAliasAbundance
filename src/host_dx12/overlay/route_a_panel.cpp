@@ -967,7 +967,7 @@ void DrawLiveDlaa()
     {
         na::settings::Settings& ss = na::settings::Get();
         int sharp = static_cast<int>(ss.j2_sharpness.load());
-        BeginRow("Sharpness", "Sharpening after DLSS: RCAS with soft halo control, easing off at depth edges so silhouettes keep clean outlines. 0 = off. 50% is standard RCAS at full strength; above 50% raises its ceiling. Before the HUD, so text is unchanged.", S(220));
+        BeginRow("Sharpness", "Sharpening after DLSS: RCAS with soft halo control, easing off at depth edges so silhouettes keep clean outlines. 0 = off. The strength doubles every 25 points: 50% is standard RCAS at full strength, 75% is twice it and 100% four times. Before the HUD, so text is unchanged.", S(220));
         ImGui::SetNextItemWidth(S(220));
         if (ImGui::SliderInt("##j2sharp", &sharp, 0, 100, sharp ? "%d%%" : "Off", ImGuiSliderFlags_AlwaysClamp)) {
             ss.j2_sharpness.store(static_cast<uint32_t>(sharp));

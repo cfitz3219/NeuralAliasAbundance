@@ -516,11 +516,11 @@ bool debug_record(ID3D12GraphicsCommandList* l, int mode, ID3D12Resource* out, D
 // (not a guarantee against edge halos), with its noise detection
 // (FSR_RCAS_DENOISE) so flat noisy areas are not amplified. Runs on the DLAA
 // result before the game's tonemap and HUD, in a Reinhard-compressed copy of the
-// HDR values (RCAS expects 0..1), expanded back afterwards. Slider 1..100 maps to
-// RCAS sharpness 2..0 stops; 0 skips the pass entirely. NeuralAlias's 101..200
-// extension raises only the global lobe ceiling from 3/16 to 7/32. The menu's 0..100
-// slider is half this scale (menu 50 = RCAS 100, menu 100 = 200). Contrast
-// limiters and noise attenuation remain; 1+4*lobe stays >=3/16. No second filter.
+// HDR values (RCAS expects 0..1), expanded back afterwards. 100 is RCAS at full strength
+// (0 stops); 0 skips the pass. The sharpening gain doubles every 50 over 1..200 (x1/4 near 0,
+// x1 at 100, x4 at 200): one rate across the whole slider (Cort 2026-11-04: the top half barely
+// changed when only the lobe ceiling rose). The menu's 0..100 slider is half this scale (menu 50
+// = 100, menu 100 = 200). Contrast limiters and noise attenuation remain. No second filter.
 struct RcasPass {
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> pso;
@@ -536,7 +536,7 @@ Texture2D<float4> t_in : register(t0);
 Texture2D<float>  t_depth : register(t1);
 RWTexture2D<float4> u_out : register(u0);
 cbuffer C : register(b0) {
-    float con; uint w; uint h; float lobeLimit;
+    float gain; uint w; uint h; float open;
     uint has_depth; uint reversed; uint dw; uint dh;
 };
 float3 fwd(float3 x) { x = max(x, 0.0); return x / (1.0 + x); }
@@ -580,9 +580,17 @@ void main(uint3 id : SV_DispatchThreadID) {
     float3 hitMin = min(mn4, e) / max(4.0 * mx4, 1e-6);
     float3 hitMax = (peakC.x - max(mx4, e)) / (4.0 * mn4 + peakC.y);
     float3 lobeRGB = max(-hitMin, hitMax);
-    float lobe = max(-lobeLimit, min(max3(lobeRGB.r, lobeRGB.g, lobeRGB.b), 0.0)) * con;
+    float lobe = max(-3.0 / 16.0, min(max3(lobeRGB.r, lobeRGB.g, lobeRGB.b), 0.0));
     lobe *= nz;
     lobe *= lerp(1.0, 0.35, edge);
+    // Strength (Cort 2026-11-04: the same rate over the whole slider): RCAS at 100 % adds
+    // g1 = 4a/(1-4a) times (centre - cross mean); the slider multiplies that gain, doubling it
+    // every 50 % (x1/4 at 0+, x1 at 100 %, x4 at 200 %), and the lobe is solved back from it,
+    // so it stays below 1/4 (finite) at any strength. 100 % is RCAS unchanged.
+    if (gain != 1.0) {
+        const float a1 = -lobe, g = gain * 4.0 * a1 / (1.0 - 4.0 * a1);
+        lobe = -g / (4.0 * (1.0 + g));
+    }
     float rcpL = 1.0 / (4.0 * lobe + 1.0);
     float3 o = (lobe * b + lobe * d + lobe * hh + lobe * f + e) * rcpL;
     // Soft halo control (the idea of separate soft bright/dark overshoot limits is from
@@ -591,11 +599,10 @@ void main(uint3 id : SV_DispatchThreadID) {
     // range is compressed smoothly towards a small ceiling, tighter for bright halos (4 % of the
     // local range) than dark ones (6 %). A centre that is itself the local peak or trough is
     // fine detail and keeps up to half the range. Flat areas are untouched. Per channel, in the
-    // compressed 0..1 domain RCAS works in. Above 100 % (lobeLimit past 3/16) the ceilings open
-    // up with the extra strength, reaching half the range at 200 %, so the top of the slider
-    // still adds bite.
+    // compressed 0..1 domain RCAS works in. Above 100 % the ceilings open up with the extra
+    // strength (open 0..1), reaching half the range at 200 %, so the top of the slider still adds bite.
     {
-        const float x = saturate((lobeLimit - 3.0 / 16.0) * 32.0);
+        const float x = open;
         const float3 lo = min(mn4, e), hi = max(mx4, e), rng = hi - lo;
         const float3 peak = saturate(step(mx4, e) + step(e, mn4));
         const float3 kb = rng * lerp(0.04 + 0.46 * x, 0.5, peak) + 1e-6, kd = rng * lerp(0.06 + 0.44 * x, 0.5, peak) + 1e-6;
@@ -669,11 +676,11 @@ bool rcas_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Resou
     l->SetComputeRootSignature(g_rcas.root.Get());
     l->SetPipelineState(g_rcas.pso.Get());
     l->SetComputeRootDescriptorTable(0, gh);
-    const uint32_t p100 = percent > 100 ? 100 : percent;
-    const float stops = 2.0f * (1.0f - static_cast<float>(p100) / 100.0f);
-    const float con = std::exp2(-stops);
-    const float extra = percent > 100 ? float((std::min)(percent, 200u) - 100u) / 100.0f : 0.0f;
-    const float limit = 3.0f / 16.0f + extra / 32.0f;
+    // One rate over the whole range: the gain doubles every 50 % (menu: every 25 points).
+    const uint32_t pc = (std::min)(percent, 200u);
+    const float gain = pc == 100 ? 1.0f : std::exp2((static_cast<float>(pc) - 100.0f) / 50.0f);
+    const float open = pc > 100 ? (std::min)(1.0f, std::log2(gain) / 2.0f) : 0.0f;
+    const float con = gain, limit = open;
     uint32_t c[8] = {0, w, h, 0, depth ? 1u : 0u, reversed ? 1u : 0u, dw, dh};
     std::memcpy(&c[0], &con, 4);
     std::memcpy(&c[3], &limit, 4);
