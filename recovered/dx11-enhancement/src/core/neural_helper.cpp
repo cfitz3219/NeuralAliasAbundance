@@ -59,10 +59,8 @@ int run(int argc,wchar_t** argv){
     ngx(NVSDK_NGX_D3D12_Init_with_ProjectID("211347f0-e644-4da9-bbe8-5d7630b1f7c8",NVSDK_NGX_ENGINE_TYPE_CUSTOM,"0.11.1",cache.c_str(),b.device.Get(),&common),"initialize NR");b.initialized=true;
     ngx(NVSDK_NGX_D3D12_GetCapabilityParameters(&b.parameters),"NR capabilities");auto* p=b.parameters;
     int available=0;ngx(p->Get("DLSSNR.Available",&available),"NR availability");if(!available)throw std::runtime_error("NR unavailable");
+    // D3D12 node selection is infrastructure; image/quality options below are NR-specific.
     p->Set("CreationNodeMask",1u);p->Set("VisibilityNodeMask",1u);
-    p->Set("Width",w);p->Set("Height",h);p->Set("OutWidth",w);p->Set("OutHeight",h);
-    p->Set("PerfQualityValue",int(NVSDK_NGX_PerfQuality_Value_DLAA));
-    p->Set("DLSS.Feature.Create.Flags",int(NVSDK_NGX_DLSS_Feature_Flags_IsHDR|NVSDK_NGX_DLSS_Feature_Flags_MVLowRes));
     p->Set("DLSSNR.Enabled",1u);p->Set("DLSSNR.Width",w);p->Set("DLSSNR.Height",h);
     p->Set("DLSSNR.Hint.Render.Preset",static_cast<int>(settings.model));p->Set("DLSSNR.Intensity",settings.intensity);p->Set("DLSSNR.Style",settings.style);
     p->Set("DLSSNR.LocalStructureStrength",settings.structure);p->Set("DLSSNR.LocalToneStrength",settings.tone);p->Set("DLSSNR.SkinStructureStrength",settings.skin);

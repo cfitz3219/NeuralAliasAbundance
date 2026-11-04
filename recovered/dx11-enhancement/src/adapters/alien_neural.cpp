@@ -8,7 +8,7 @@ namespace alien_isolation {
 using Microsoft::WRL::ComPtr;
 static void check(HRESULT result,const char* message){if(FAILED(result))throw std::runtime_error(message);}
 void NeuralTrial::reset(){
-    bridge_.stop();view_.Reset();color_.Reset();last_frame_=UINT64_MAX;last_time_=0;frames_=0;waits_=0;
+    cuts_.clear();bridge_.stop();view_.Reset();color_.Reset();last_frame_=UINT64_MAX;last_time_=0;frames_=0;waits_=0;
     if(!failed_)status_=requested_?"Neural rendering: waiting for DLAA gameplay.":"Neural rendering: off.";
 }
 void NeuralTrial::request(bool enabled,dx11_enhancement::NeuralSettings settings){
@@ -18,9 +18,11 @@ void NeuralTrial::request(bool enabled,dx11_enhancement::NeuralSettings settings
     reshade::log::message(reshade::log::level::info,status_.c_str());
 }
 void NeuralTrial::render(ID3D11DeviceContext* context,ID3D11RenderTargetView* target,
-    ID3D11ShaderResourceView* depth,ID3D11ShaderResourceView* motion,uint64_t frame,bool current_dlaa){
+    ID3D11ShaderResourceView* depth,ID3D11ShaderResourceView* motion,uint64_t frame,bool current_dlaa,
+    const std::array<float,16>& view_projection,bool camera_valid){
     if(!requested_ || failed_)return;
     if(!current_dlaa){status_="Neural rendering: waiting for DLAA gameplay.";return;}
+    if(!camera_valid){cuts_.clear();status_="Neural rendering: waiting for current camera transform.";return;}
     try{
         if(!target || !depth || !motion)throw std::runtime_error("missing current-frame inputs");
         D3D11_RENDER_TARGET_VIEW_DESC vd{};target->GetDesc(&vd);
@@ -59,14 +61,20 @@ void NeuralTrial::render(ID3D11DeviceContext* context,ID3D11RenderTargetView* ta
         metadata.width=desc.Width;metadata.height=desc.Height;metadata.source_frame=frame;
         metadata.motion_scale_x=-float(desc.Width);metadata.motion_scale_y=-float(desc.Height);
         const auto now=GetTickCount64(),elapsed=last_time_?now-last_time_:0;
-        metadata.reset=last_frame_==UINT64_MAX || frame!=last_frame_+1 || elapsed>250;
+        const auto cut=cuts_.observe(view_projection,frame,now);
+        metadata.reset=last_frame_==UINT64_MAX || frame!=last_frame_+1 || elapsed>250 || cut.reset;
+        if(cut.reason==CameraCutDetector::Reason::jump || cut.reason==CameraCutDetector::Reason::invalid_matrix){
+            char line[192]{};std::snprintf(line,sizeof(line),"[DX11NeuralCut] frame=%llu reset=1 reason=%s normalized displacement=%.4f (heuristic).",
+                frame,cut.reason==CameraCutDetector::Reason::jump?"camera jump":"invalid matrix",cut.displacement);
+            reshade::log::message(reshade::log::level::info,line);
+        }
         metadata.frame_ms=elapsed && elapsed<=250?float(elapsed):16.6667f;
         bridge_.process(context,view_.Get(),depth,motion,target,metadata);
         last_frame_=frame;last_time_=now;++frames_;waits_+=bridge_.last_wait_ms();
-        status_="Neural rendering: active (experimental; includes game HUD).";
+        status_="Neural rendering: active at post-sharpen scene boundary (HUD ordering awaits validation).";
         if(frames_==1){
             char line[256]{};std::snprintf(line,sizeof(line),
-                "[DX11Neural] First result: final SDR %ux%u format=%u; before ReShade effects; HUD included; controls recorded in helper session settings.txt.",
+                "[DX11Neural] First result: post-sharpen SDR %ux%u format=%u; before next game draw; candidate pre-HUD stage; controls recorded in helper session settings.txt.",
                 desc.Width,desc.Height,static_cast<unsigned>(vd.Format));
             reshade::log::message(reshade::log::level::info,line);
         }

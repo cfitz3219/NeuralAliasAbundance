@@ -26,7 +26,7 @@
 void Neural_ControlCS(uint3 id : SV_DispatchThreadID) {}
 technique NeuralRendering <
     ui_label = "Neural rendering (experimental)";
-    ui_tooltip = "Requires DLAA. Global definitions: DX11_NR_MODEL 0=runtime choice, 1/2/3=requested hints (no difference observed in this runtime); STYLE 0/1/2=experimental profiles; INTENSITY=overall strength; STRUCTURE=fine detail; TONE=broad lighting/color (0 preserves original tone); SKIN=skin detail (-1 follows structure); AUTO_SKIN=skin detection 0/1 (not HUD protection). Strength range 0..2, start at 1. Reload after edits; only neural helper restarts. Game HUD is included and NOT protected by a UI mask. Status in DLAA status. Uncheck to compare with DLAA alone.";
+    ui_tooltip = "Requires DLAA. Global definitions: DX11_NR_MODEL 0=runtime choice, 1/2/3=requested hints (no difference observed in this runtime); STYLE 0/1/2=experimental profiles; INTENSITY=overall strength; STRUCTURE=fine detail; TONE=broad lighting/color (0 preserves original tone); SKIN=skin detail (-1 follows structure); AUTO_SKIN=skin detection 0/1 (not HUD protection). Strength range 0..2, start at 1. Reload after edits; only neural helper restarts. Requires the pinned Alias post-sharpen scene boundary; no final-backbuffer fallback. HUD ordering remains experimental. Status in DLAA status. Uncheck to compare with DLAA alone.";
     dx11_nr_model = DX11_NR_MODEL;
     dx11_nr_style = DX11_NR_STYLE;
     dx11_nr_intensity = 1.0 * DX11_NR_INTENSITY;

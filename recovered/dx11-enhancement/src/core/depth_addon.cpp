@@ -31,6 +31,12 @@ struct __declspec(uuid("8307be10-48d9-4669-a534-18582de42a72")) DepthState {
     dx11_enhancement::LiveBridge live;
     alien_isolation::NeuralTrial neural;
     uint64_t live_displayed_frame=UINT64_MAX;
+    diagnostics::ProjectionSnapshot neural_camera_snapshot,neural_sharpen_constants;
+    std::array<float,16> neural_view_projection{};
+    bool neural_camera_captured=false;
+    uint64_t neural_camera_frame=UINT64_MAX,neural_boundary_frame=UINT64_MAX;
+    ComPtr<ID3D11RenderTargetView> neural_scene_pending;
+    uint64_t neural_scene_frame=UINT64_MAX;
     diagnostics::TexturePreview live_depth,live_motion;
     diagnostics::ProjectionSnapshot live_projection;
     diagnostics::ProjectionVerifier live_verifier;
@@ -188,6 +194,9 @@ void live_submit(DepthState& state,ID3D11DeviceContext* context,ID3D11Resource* 
                 if(!trusted && state.live_verifier.trusted())log::message(log::level::info,"[DX11DLAACamera] Eight CPU uploads match GPU projection including changing jitter; cached upload path qualified.");
             }else state.live_verifier.reset();
         }
+        if(state.neural.needs_camera() && state.neural_camera_captured &&
+            SUCCEEDED(state.neural_camera_snapshot.inspect(context,state.neural_view_projection)))
+            state.neural_camera_frame=state.frame;
         state.live_projection_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-projection_begin).count();
         const auto motion_begin=std::chrono::steady_clock::now();
         if(FAILED(state.live_motion.capture_motion(context,state.live_motion_source.Get())) ||
@@ -269,6 +278,12 @@ void init_pipeline(api::device* device, api::pipeline_layout, uint32_t count,
         }
         if (objects[i].type != api::pipeline_subobject_type::pixel_shader || objects[i].count != 1) continue;
         const auto& shader = *static_cast<const api::shader_desc*>(objects[i].data);
+        if(alien_isolation::is_alias_sharpen_shader(shader.code,shader.code_size)){
+            const UINT tag=6;
+            reinterpret_cast<ID3D11PixelShader*>(pipeline.handle)->SetPrivateData(camera_tag,sizeof(tag),&tag);
+            log::message(log::level::info,"[DX11Neural] Pinned Alias sharpen shader identified; candidate post-sharpen/pre-HUD boundary.");
+            continue;
+        }
         const bool camera = alien_isolation::is_camera_motion_shader(shader.code, shader.code_size);
         const bool consumer = alien_isolation::is_temporal_consumer_shader(shader.code, shader.code_size);
         if (!camera && !consumer) continue;
@@ -285,6 +300,55 @@ UINT shader_role(ID3D11DeviceChild* shader) {
     UINT size = sizeof(UINT), tag = 0;
     return shader && SUCCEEDED(shader->GetPrivateData(camera_tag, &size, &tag)) ? tag : 0;
 }
+// Called before the following draw/command-list submission. The identified scene
+// draw has completed by this boundary. Never use begin_effects as an image fallback.
+void flush_neural_scene(DepthState& state,ID3D11DeviceContext* context){
+    if(!state.neural_scene_pending)return;
+    auto target=std::move(state.neural_scene_pending);
+    if(state.neural_scene_frame!=state.frame)return;
+    state.neural_boundary_frame=state.frame;
+    state.neural.render(context,target.Get(),state.live_depth.raw_view(),state.live_motion.raw_view(),
+        state.frame,state.live_enabled && state.live_displayed_frame==state.frame,
+        state.neural_view_projection,state.neural_camera_frame==state.frame);
+}
+void neural_command_boundary(api::command_list* commands){
+    auto* state=commands->get_device()->get_private_data<DepthState>();if(!state)return;
+    auto* context=reinterpret_cast<ID3D11DeviceContext*>(commands->get_native());
+    if(context->GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE)return;
+    std::lock_guard lock(state->mutex);flush_neural_scene(*state,context);
+}
+// Copies, clears and indirect work can occur between the scene and UI draws too.
+bool neural_indirect(api::command_list* c,api::indirect_command,api::resource,uint64_t,uint32_t,uint32_t){
+    neural_command_boundary(c);return false;
+}
+bool neural_clear(api::command_list* c,api::resource_view,const float[4],uint32_t,const api::rect*){
+    neural_command_boundary(c);return false;
+}
+bool neural_copy_region(api::command_list* c,api::resource,uint32_t,const api::subresource_box*,
+    api::resource,uint32_t,const api::subresource_box*,api::filter_mode){
+    neural_command_boundary(c);return false;
+}
+void neural_draw_boundary(api::command_list* commands){
+    auto* state=commands->get_device()->get_private_data<DepthState>();if(!state)return;
+    auto* context=reinterpret_cast<ID3D11DeviceContext*>(commands->get_native());
+    if(context->GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE)return;
+    std::lock_guard lock(state->mutex);
+    flush_neural_scene(*state,context);
+    if(!state->neural.needs_camera() || state->live_displayed_frame!=state->frame ||
+        state->neural_boundary_frame==state->frame)return;
+    ComPtr<ID3D11PixelShader> shader;context->PSGetShader(&shader,nullptr,nullptr);
+    if(shader_role(shader.Get())!=6)return;
+    // The pinned shader also draws Alias Isolation's startup logo. Wait until it fades.
+    UINT first=0;std::array<float,16> constants{};
+    if(FAILED(snapshot_pixel_constants(context,10,0,1,state->neural_sharpen_constants,first)) ||
+        FAILED(state->neural_sharpen_constants.inspect(context,constants)) ||
+        !std::isfinite(constants[0]) || constants[0]>0)return;
+    D3D11_VIEWPORT viewport{};UINT count=1;context->RSGetViewports(&count,&viewport);
+    if(count!=1 || viewport.TopLeftX!=0 || viewport.TopLeftY!=0 ||
+        viewport.Width!=float(state->live_depth.width()) || viewport.Height!=float(state->live_depth.height()))return;
+    context->OMGetRenderTargets(1,state->neural_scene_pending.ReleaseAndGetAddressOf(),nullptr);
+    state->neural_scene_frame=state->frame;
+}
 void bind_pipeline(api::command_list* commands, api::pipeline_stage stages, api::pipeline pipeline) {
     auto* state = commands->get_private_data<CommandState>();
     if (state && (stages & api::pipeline_stage::pixel_shader) != static_cast<api::pipeline_stage>(0))
@@ -294,11 +358,13 @@ void bind_pipeline(api::command_list* commands, api::pipeline_stage stages, api:
 }
 
 bool trace_dispatch(api::command_list* commands,uint32_t,uint32_t,uint32_t) {
+    neural_command_boundary(commands);
     auto* state=commands->get_private_data<CommandState>();
     if (state && state->taa_bound) state->taa_dispatched=true;
     return false;
 }
 bool trace_copy(api::command_list* commands,api::resource,api::resource destination) {
+    neural_command_boundary(commands);
     auto* state=commands->get_private_data<CommandState>();
     if (state && state->taa_dispatched) {
         state->taa_output=reinterpret_cast<ID3D11Resource*>(destination.handle);
@@ -322,6 +388,10 @@ void trace_secondary(api::command_list* primary,api::command_list* secondary) {
     }
     ComPtr<ID3D11DeviceContext> context;
     if (FAILED(native->QueryInterface(IID_PPV_ARGS(&context))) || context->GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE) return;
+    {
+        std::lock_guard lock(device_state->mutex);
+        flush_neural_scene(*device_state,context.Get());
+    }
     ComPtr<ID3D11CommandList> list;
     if (FAILED(reinterpret_cast<IUnknown*>(secondary->get_native())->QueryInterface(IID_PPV_ARGS(&list)))) return;
     ComPtr<ID3D11Resource> output;
@@ -370,6 +440,7 @@ void capture(api::command_list* commands) {
     const UINT role = shader_role(shader.Get());
     if (!role) return;
     std::lock_guard lock(state->mutex);
+    if (role == 6) return; // Scene-boundary bookkeeping is separate from depth capture.
     if (role == 3) {
         ComPtr<ID3D11VertexShader> vertex;
         context->VSGetShader(&vertex,nullptr,nullptr);
@@ -456,6 +527,13 @@ void capture(api::command_list* commands) {
     ++state->draws_this_frame;
     if(state->live_enabled) {
         state->live_camera=false;state->live_cpu_fresh=false;
+        state->neural_camera_captured=false;state->neural_camera_frame=UINT64_MAX;
+        if(state->neural.needs_camera()){
+            // Pinned camera PS cb0[0..3]: main ViewProj, maintained by Alias XSC hook.
+            // Do NOT use cb2[12..15]: Alias replaces it with current-to-previous reprojection.
+            UINT first=0;
+            state->neural_camera_captured=SUCCEEDED(snapshot_pixel_constants(context,0,0,4,state->neural_camera_snapshot,first));
+        }
         if(state->draws_this_frame!=1)live_failure(*state,"multiple camera-motion passes");
         else {
             ComPtr<ID3D11ShaderResourceView> depth;context->PSGetShaderResources(8,1,&depth);
@@ -533,8 +611,8 @@ void capture(api::command_list* commands) {
         state->first_capture_logged = true;
     }
 }
-bool draw(api::command_list* c, uint32_t, uint32_t, uint32_t, uint32_t) { capture(c); return false; }
-bool draw_indexed(api::command_list* c, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) { capture(c); return false; }
+bool draw(api::command_list* c, uint32_t, uint32_t, uint32_t, uint32_t) { neural_draw_boundary(c); capture(c); return false; }
+bool draw_indexed(api::command_list* c, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) { neural_draw_boundary(c); capture(c); return false; }
 
 void finish_pair(DepthState& state, ID3D11DeviceContext* context) {
     if (!state.pair_armed || !state.pair_trigger.ready()) return;
@@ -654,16 +732,16 @@ void sync_neural_controls(api::effect_runtime* runtime,DepthState& state){
     }
     state.neural.request(valid && runtime->get_effects_state() && runtime->get_technique_state(t),s);
 }
-void begin_effects(api::effect_runtime* runtime, api::command_list* commands, api::resource_view target, api::resource_view) {
+void begin_effects(api::effect_runtime* runtime, api::command_list* commands, api::resource_view, api::resource_view) {
     auto* state = runtime->get_device()->get_private_data<DepthState>();
     if (!state) return;
     std::lock_guard lock(state->mutex);
     state->rendered = false;
     auto* context = reinterpret_cast<ID3D11DeviceContext*>(commands->get_native());
     sync_neural_controls(runtime,*state);
-    state->neural.render(context,reinterpret_cast<ID3D11RenderTargetView*>(target.handle),
-        state->live_depth.raw_view(),state->live_motion.raw_view(),state->frame,
-        state->live_enabled && state->live_displayed_frame==state->frame);
+    // Too late to guarantee a clean image here: discard an unconsumed boundary.
+    state->neural_scene_pending.Reset();
+    if(state->neural_boundary_frame!=state->frame)state->neural.missing_stage();
     finish_pair(*state,context);
     if (state->trace_remaining && !state->pair_armed && state->trace_matrix_fresh) {
         D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -795,6 +873,8 @@ void reset_swapchain(api::swapchain* swapchain, bool) {
     std::lock_guard lock(state->mutex);
     state->live.stop();state->live_target.Reset();state->live_camera=state->live_submitted=false;
     state->neural.reset();state->live_displayed_frame=UINT64_MAX;
+    state->neural_scene_pending.Reset();state->neural_camera_captured=false;
+    state->neural_camera_frame=state->neural_scene_frame=state->neural_boundary_frame=UINT64_MAX;
     state->live_last_frame=UINT64_MAX;state->live_status="Display reset; DLAA helper will restart if enabled.";
     state->history.invalidate(diagnostics::ResetReason::display_reset);
     state->trace_remaining=0;state->trace_matrix.Reset();state->trace_output.Reset();
@@ -942,6 +1022,9 @@ void diagnostics::register_depth_events() {
     register_event<addon_event::bind_pipeline>(bind_pipeline);
     register_event<addon_event::dispatch>(trace_dispatch);
     register_event<addon_event::copy_resource>(trace_copy);
+    register_event<addon_event::copy_texture_region>(neural_copy_region);
+    register_event<addon_event::clear_render_target_view>(neural_clear);
+    register_event<addon_event::draw_or_dispatch_indirect>(neural_indirect);
     register_event<addon_event::execute_secondary_command_list>(trace_secondary);
     register_event<addon_event::draw>(draw);
     register_event<addon_event::draw_indexed>(draw_indexed);
