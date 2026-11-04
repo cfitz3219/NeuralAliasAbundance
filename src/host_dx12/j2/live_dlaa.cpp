@@ -585,11 +585,14 @@ void main(uint3 id : SV_DispatchThreadID) {
     // range is compressed smoothly towards a small ceiling, tighter for bright halos (4 % of the
     // local range) than dark ones (6 %). A centre that is itself the local peak or trough is
     // fine detail and keeps up to half the range. Flat areas are untouched. Per channel, in the
-    // compressed 0..1 domain RCAS works in.
+    // compressed 0..1 domain RCAS works in. Above 100 % (lobeLimit past 3/16) the ceilings open
+    // up with the extra strength, reaching half the range at 200 %, so the top of the slider
+    // still adds bite.
     {
+        const float x = saturate((lobeLimit - 3.0 / 16.0) * 32.0);
         const float3 lo = min(mn4, e), hi = max(mx4, e), rng = hi - lo;
         const float3 peak = saturate(step(mx4, e) + step(e, mn4));
-        const float3 kb = rng * lerp(0.04, 0.5, peak) + 1e-6, kd = rng * lerp(0.06, 0.5, peak) + 1e-6;
+        const float3 kb = rng * lerp(0.04 + 0.46 * x, 0.5, peak) + 1e-6, kd = rng * lerp(0.06 + 0.44 * x, 0.5, peak) + 1e-6;
         const float3 ov = max(o - hi, 0.0), un = max(lo - o, 0.0);
         o = o - ov + ov * kb / (kb + ov);
         o = o + un - un * kd / (kd + un);
