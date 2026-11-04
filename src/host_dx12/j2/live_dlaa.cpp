@@ -109,6 +109,7 @@ struct State {
     ComPtr<ID3D12Resource> depth32, motion, provenance, output;
     ComPtr<ID3D12Resource> color_in; // plain copy of the scene colour's first slice / mip (DLSS input)
     ComPtr<ID3D12Resource> sharp;    // RCAS output (when sharpening is on)
+    ComPtr<ID3D12Resource> jshift;   // jitter-shifted colour for DLAA (UNORDERED_ACCESS between uses)
     MsaaResolve msaa;
     UINT samples = 1, depth_samples = 1, sample_quality = 0, depth_quality = 0;
     DXGI_FORMAT depth_format = DXGI_FORMAT_UNKNOWN;
@@ -673,6 +674,154 @@ bool rcas_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Resou
     std::memcpy(&c[3], &limit, 4);
     l->SetComputeRoot32BitConstants(1, 8, c, 0);
     l->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+    return true;
+}
+
+// ---- Jitter shift (Cort 2026-11-04: "resolve the shaking from jitter") ----------
+// DLSS is told a jitter the game's colour does not carry (our raster write never reaches the
+// picture), so it moves the picture by the declared offset every frame: the shake. The colour
+// DLSS gets is therefore resampled by that offset first (Catmull-Rom, 16 taps, render size), so
+// the declared jitter and the colour agree and the output stands still. Depth and motion are
+// unchanged (a sub-pixel shift of depth would invent values at silhouettes). [j2] jitter_shift:
+// 1 on, -1 the opposite sign (if a run shows the sign is wrong), 0 off.
+struct JitterShift {
+    ComPtr<ID3D12RootSignature> root;
+    ComPtr<ID3D12PipelineState> pso;
+    ComPtr<ID3D12DescriptorHeap> heap; // kRing * 2 slots x (t0, u0)
+    UINT inc = 0;
+    bool tried = false, ok = false;
+} g_jshift;
+constexpr char kJitterShiftHlsl[] = R"(
+Texture2D<float4> t_in : register(t0);
+RWTexture2D<float4> u_out : register(u0);
+SamplerState s_lin : register(s0);
+cbuffer C : register(b0) { uint w; uint h; float jx; float jy; };
+float4 tap(float2 uv) { return t_in.SampleLevel(s_lin, uv, 0); }
+// Catmull-Rom with 9 bilinear fetches (the usual 16-tap reduction).
+float4 catmull(float2 pos) {
+    float2 c = floor(pos - 0.5) + 0.5, f = pos - c;
+    float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    float2 w3 = f * f * (-0.5 + 0.5 * f);
+    float2 w12 = w1 + w2, off12 = w2 / w12;
+    float2 t0 = c - 1.0, t3 = c + 2.0, t12 = c + off12;
+    float2 sz = float2(w, h);
+    float4 r = 0;
+    r += tap(float2(t0.x, t0.y) / sz) * w0.x * w0.y;  r += tap(float2(t12.x, t0.y) / sz) * w12.x * w0.y;  r += tap(float2(t3.x, t0.y) / sz) * w3.x * w0.y;
+    r += tap(float2(t0.x, t12.y) / sz) * w0.x * w12.y; r += tap(float2(t12.x, t12.y) / sz) * w12.x * w12.y; r += tap(float2(t3.x, t12.y) / sz) * w3.x * w12.y;
+    r += tap(float2(t0.x, t3.y) / sz) * w0.x * w3.y;  r += tap(float2(t12.x, t3.y) / sz) * w12.x * w3.y;  r += tap(float2(t3.x, t3.y) / sz) * w3.x * w3.y;
+    return r;
+}
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= w || id.y >= h) return;
+    const float2 pos = float2(id.xy) + 0.5 + float2(jx, jy);
+    float4 v = catmull(pos);
+    const float4 n = t_in[id.xy];
+    // Catmull-Rom can ring slightly: keep each channel inside the 3x3 range of the source.
+    float4 mn = n, mx = n;
+    [unroll] for (int j = -1; j <= 1; ++j) [unroll] for (int i = -1; i <= 1; ++i) {
+        const float4 s = t_in[clamp(int2(id.xy) + int2(i, j), int2(0, 0), int2(w - 1, h - 1))];
+        mn = min(mn, s); mx = max(mx, s);
+    }
+    u_out[id.xy] = clamp(v, mn, mx);
+})";
+bool jshift_init()
+{
+    if (g_jshift.tried) return g_jshift.ok;
+    g_jshift.tried = true;
+    D3D12_DESCRIPTOR_RANGE r[2]{};
+    r[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    r[0].NumDescriptors = 1;
+    r[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    r[1].NumDescriptors = 1;
+    r[1].OffsetInDescriptorsFromTableStart = 1;
+    D3D12_ROOT_PARAMETER p[2]{};
+    p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    p[0].DescriptorTable.NumDescriptorRanges = 2;
+    p[0].DescriptorTable.pDescriptorRanges = r;
+    p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    p[1].Constants.Num32BitValues = 4;
+    D3D12_STATIC_SAMPLER_DESC ss{};
+    ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    ss.MaxLOD = D3D12_FLOAT32_MAX;
+    ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rd{2, p, 1, &ss, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ComPtr<ID3DBlob> sig, err, code;
+    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
+        FAILED(g.device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&g_jshift.root))))
+        return false;
+    if (FAILED(D3DCompile(kJitterShiftHlsl, sizeof(kJitterShiftHlsl) - 1, "j2_jitter_shift.hlsl", nullptr, nullptr, "main", "cs_5_0",
+                          D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err)))
+        return false;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = g_jshift.root.Get();
+    pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+    if (FAILED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_jshift.pso)))) return false;
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRing * 2 * 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    if (FAILED(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_jshift.heap)))) return false;
+    g_jshift.inc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    g_jshift.ok = true;
+    return true;
+}
+// A render-size target in UNORDERED_ACCESS for the shifted colour (kept across frames; replaced
+// when the size or format changes).
+bool jshift_target(ComPtr<ID3D12Resource>& tex, uint32_t w, uint32_t h, DXGI_FORMAT f)
+{
+    if (tex) {
+        const auto d = tex->GetDesc();
+        if (d.Width == w && d.Height == h && d.Format == f) return true;
+        tex.Reset();
+    }
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = w; rd.Height = h; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.Format = f; rd.SampleDesc.Count = 1;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (FAILED(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&tex))))
+        return false;
+    tex->SetName(L"NeuralAlias jitter-shifted colour");
+    return true;
+}
+// `in` readable (NON_PIXEL_SHADER_RESOURCE), `out` UNORDERED_ACCESS (left so; the caller
+// transitions it for DLSS). Shift sign: output followed +declared in the runs, so the colour is
+// moved by -declared before DLSS, which is sampling at p + jitter.
+bool jshift_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Resource* out, uint32_t w, uint32_t h, DXGI_FORMAT f,
+                     float jx, float jy, UINT slot)
+{
+    if (!in || !out || slot >= 2 * kRing || !jshift_init()) return false;
+    const int sign = na::settings::Get().j2_jitter_shift.load(std::memory_order_relaxed);
+    if (!sign) return false;
+    D3D12_CPU_DESCRIPTOR_HANDLE c = g_jshift.heap->GetCPUDescriptorHandleForHeapStart();
+    c.ptr += static_cast<SIZE_T>(slot) * 2 * g_jshift.inc;
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = f;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Texture2D.MipLevels = 1;
+    g.device->CreateShaderResourceView(in, &sv, c);
+    c.ptr += g_jshift.inc;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+    uv.Format = f;
+    uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    g.device->CreateUnorderedAccessView(out, nullptr, &uv, c);
+    D3D12_GPU_DESCRIPTOR_HANDLE gh = g_jshift.heap->GetGPUDescriptorHandleForHeapStart();
+    gh.ptr += static_cast<UINT64>(slot) * 2 * g_jshift.inc;
+    ID3D12DescriptorHeap* heaps[] = {g_jshift.heap.Get()};
+    l->SetDescriptorHeaps(1, heaps);
+    l->SetComputeRootSignature(g_jshift.root.Get());
+    l->SetPipelineState(g_jshift.pso.Get());
+    l->SetComputeRootDescriptorTable(0, gh);
+    const float sx = static_cast<float>(sign) * jx, sy = static_cast<float>(sign) * jy;
+    uint32_t k[4] = {w, h, 0, 0};
+    std::memcpy(&k[2], &sx, 4);
+    std::memcpy(&k[3], &sy, 4);
+    l->SetComputeRoot32BitConstants(1, 4, k, 0);
+    l->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+    ++g.stats.jitter_shifted;
     return true;
 }
 // Retained for the standalone NIS test helper; the live slider uses RCAS only.
@@ -2295,6 +2444,19 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // 4. DLSS at native resolution
     na::dlss::EvalDesc e{};
     e.color = g.color_in.Get();
+    // Jitter shift: the declared offset moved into the colour, so the picture does not shake.
+    bool shifted = false;
+    flush(l, b); // colour is readable (NON_PIXEL_SHADER_RESOURCE) before the shift reads it
+    if ((cam.jitter_px_x != 0 || cam.jitter_px_y != 0) && na::settings::Get().j2_jitter_shift.load(std::memory_order_relaxed) != 0 &&
+        jshift_target(g.jshift, rw, rh, typed(cf))) {
+        shifted = jshift_dispatch(l, g.color_in.Get(), g.jshift.Get(), rw, rh, typed(cf), static_cast<float>(cam.jitter_px_x), static_cast<float>(cam.jitter_px_y), g.slot);
+        if (shifted) {
+            b.push_back(uav_barrier(g.jshift.Get()));
+            add(b, g.jshift.Get(), UAV, NPSR);
+            flush(l, b);
+            e.color = g.jshift.Get();
+        }
+    }
     e.depth = g.depth32.Get();
     e.motion = g.motion.Get();
     e.output = g.output.Get();
@@ -2326,11 +2488,12 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     }
     const bool evaluated = na::dlss::Evaluate(l, e);
     if (!evaluated) ++g.stats.dlss_failed;
+    if (shifted) { add(b, g.jshift.Get(), NPSR, UAV); flush(l, b); }
     if (evaluated && na::capture::j2::Armed()) {
         // Evidence capture: copied in this same list right after the evaluate, so the GPU
         // order makes them exactly this evaluation's inputs and raw DLSS output.
         na::capture::j2::Planes cp;
-        cp.color = g.color_in.Get();
+        cp.color = g.color_in.Get(); // the scene as drawn (scene_color below); DLSS got e.color
         cp.depth = g.depth32.Get();
         cp.motion = g.motion.Get();
         cp.output = g.output.Get();
@@ -2797,6 +2960,7 @@ struct SmallRing {
     uint32_t w_unseen_windows = 0;
     ComPtr<ID3D12DescriptorHeap> hud_heap;  // kRing x 5 passes x (3 SRV, 4 UAV)
     ComPtr<ID3D12Resource> prev, hud, mask, hudup;
+    ComPtr<ID3D12Resource> jshift; // jitter-shifted colour at render size (UNORDERED_ACCESS between uses)
     ComPtr<ID3D12Resource> hud_stats; // 4 uints: per frame parity, detailed pixels and still ones
     uint32_t hud_parity = 0;
     uint32_t hud_w = 0, hud_h = 0, up_w = 0, up_h = 0;
@@ -3510,6 +3674,7 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
     const na::jitter::Sample colour_jitter{d.jx, d.jy};
     bool dlss = false;
     bool evaluation_reset = false;
+    bool small_shifted = false; // DLSS got the jitter-shifted colour (g_small.jshift, back to UAV after)
     // HUD separation: on when [j2] hud_nis > 0, for SDR pictures, once the last frame is held.
     const uint32_t hud_nis = na::settings::Get().j2_hud_nis.load(std::memory_order_relaxed);
     const bool hud_want = !layer_frame && g_hud_mask_on.load(std::memory_order_relaxed) && hud_nis > 0 && !hdr && can_dlss &&
@@ -3617,6 +3782,16 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         }
         na::dlss::EvalDesc e{};
         e.color = draw_picture?layer.picture->Input():frame;
+        // Jitter shift: the declared offset moved into the colour, so the picture does not shake.
+        if ((colour_jitter.x != 0 || colour_jitter.y != 0) && na::settings::Get().j2_jitter_shift.load(std::memory_order_relaxed) != 0 &&
+            jshift_target(g_small.jshift, rw, rh, ff) &&
+            jshift_dispatch(l, e.color, g_small.jshift.Get(), rw, rh, ff, colour_jitter.x, colour_jitter.y, kRing + si)) {
+            b.push_back(uav_barrier(g_small.jshift.Get()));
+            add(b, g_small.jshift.Get(), UAV, NPSR);
+            flush(l, b);
+            e.color = g_small.jshift.Get();
+            small_shifted = true;
+        }
         e.depth = g.depth32.Get();
         e.motion = g.motion.Get();
         e.output = out;
@@ -3641,6 +3816,7 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         e.bias_current_color = draw_picture?layer.picture->Mask():hud_mask?g_small.mask.Get():nullptr;
         evaluation_reset = e.reset;
         dlss = na::dlss::Evaluate(l, e);
+        if (small_shifted) { add(b, g_small.jshift.Get(), NPSR, UAV); flush(l, b); }
         // Debug view (Cort 2026-11-04: the views showed nothing in render-small, where DLSS runs
         // here and the in-frame path that drew them no longer evaluates): replace the picture with
         // the motion/depth view, then skip sharpening and the HUD so the view is what you see.
@@ -4615,7 +4791,7 @@ Stats GetStats()
 void Shutdown()
 {
     std::lock_guard<std::mutex> lock(g.m);
-    g.depth32.Reset(); g.motion.Reset(); g.provenance.Reset(); g.output.Reset(); g.color_in.Reset(); g.sharp.Reset();
+    g.depth32.Reset(); g.motion.Reset(); g.provenance.Reset(); g.output.Reset(); g.color_in.Reset(); g.sharp.Reset(); g.jshift.Reset();
     g.msaa = MsaaResolve{};
     for (auto& s : g.slots) { s.list.Reset(); s.alloc.Reset(); s.fence_value = 0; }
     na::j2::flow::Shutdown(); // before the device and J2's fence go

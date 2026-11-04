@@ -138,6 +138,8 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
         const uint32_t jn = GetPrivateProfileIntW(L"j2", L"jitter_conv_final", 0, ini);
         target.j2_jitter_conv_flow.store(jf > 3 ? 0 : jf);
         target.j2_jitter_conv_final.store(jn > 3 ? 0 : jn);
+        const int js = static_cast<int>(GetPrivateProfileIntW(L"j2", L"jitter_shift", 1, ini));
+        target.j2_jitter_shift.store(js < 0 ? -1 : (js > 0 ? 1 : 0));
     }
     target.nr_structure.store(pct(L"structure", 100));
     target.nr_tone.store(pct(L"tone", 0));

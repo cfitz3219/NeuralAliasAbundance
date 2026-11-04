@@ -85,6 +85,9 @@ struct Settings {
     // Remembered jitter conventions (na::jitter::Convention; 0 = not learned yet), per game in the
     // user ini ([j2] jitter_conv_flow / jitter_conv_final): the calibration starts from them.
     std::atomic<uint32_t> j2_jitter_conv_flow{0}, j2_jitter_conv_final{0};
+    // [j2] jitter_shift: the colour DLSS gets is resampled by the declared jitter so the picture
+    // does not shake (1 = on, -1 = on with the opposite sign, 0 = off). Cort 2026-11-04.
+    std::atomic<int32_t> j2_jitter_shift{1};
     std::atomic<uint32_t> j2_preset{255};    // J2 DLSS render preset ([j2] preset_v2; 255 = Automatic: L for DLAA/Quality, M for Balanced/Performance; 12 = L, 0 = NVIDIA default)
     std::atomic<uint32_t> nr_structure{100};
     std::atomic<uint32_t> nr_tone{0};
