@@ -1519,6 +1519,9 @@ void write_menu_progress(HANDLE log)
         (unsigned long long)cf.sum_pairs,(unsigned long long)cf.sum[0],(unsigned long long)cf.sum[1],(unsigned long long)cf.sum[2],(unsigned long long)cf.sum[3],
         (unsigned long long)cf.sum[4],(unsigned long long)cf.sum[5],(unsigned long long)cf.sum[6]);
     if(cfn>0)WriteFile(log,cfline,(std::min)(DWORD(cfn),DWORD(sizeof(cfline)-1)),&cfw,nullptr);
+    {char line[160];const int n=snprintf(line,sizeof line,"j2jitter source=flow convention=%u epoch=%llu changes=%llu\r\n",
+        cf.colour_jitter_convention,(unsigned long long)cf.colour_jitter_epoch,(unsigned long long)cf.colour_jitter_changes);
+        if(n>0)WriteFile(log,line,DWORD((std::min)(n,int(sizeof(line)-1))),&cfw,nullptr);}
     {char fl[700];DWORD fw=0;const double acc=cf.fit_accepted?1.0/double(cf.fit_accepted):0.0;
         const int fn=snprintf(fl,sizeof fl,"j2camfit recorded=%llu collected=%llu accepted=%llu flow_passed=%llu rejected_jitter=%llu rejected_image=%llu fit_only=%llu reconstruct=%d reconstruct_frames=%llu accepted_e0_mean=%.4f accepted_e_mean=%.4f last{accepted=%d e0=%.4f e0_jitter=%.4f n0=%u e=%.4f n=%u t=[%.5f %.5f %.5f] r=[%.6f %.6f %.6f] image{tested=%u better=%u worse=%u e_fit=%.4f e_cam=%.4f regions=%u good=%u}}\r\n",
             (unsigned long long)cf.fit_recorded,(unsigned long long)cf.fit_collected,(unsigned long long)cf.fit_accepted,

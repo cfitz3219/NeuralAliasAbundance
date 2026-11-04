@@ -40,6 +40,14 @@ void encode(uint3 id : SV_DispatchThreadID) {
     if (mode == 1) { c = max(c, 0.0); c = srgb_encode(c / (1.0 + c)); }
     else c = saturate(c);
     u_enc[id.xy] = float4(c, 1.0); // UAV format B8G8R8A8_UNORM: the view swizzles
+    // The same fixed colour transform without an assumed jitter shift. The
+    // source calibration needs these exact raw-grid images, not two images
+    // that have already been resampled using the convention it is testing.
+    float3 raw_color = t_color.SampleLevel(s_lin, q / float2(w, h), 0).rgb;
+    if (any(isnan(raw_color)) || any(isinf(raw_color))) raw_color = 0;
+    if (mode == 1) { raw_color = max(raw_color, 0.0); raw_color = srgb_encode(raw_color / (1.0 + raw_color)); }
+    else raw_color = saturate(raw_color);
+    u_hist[id.xy] = float4(raw_color, 1.0); // encode pass's private raw-colour UAV
 }
 float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
 // Mean luma difference over 3x3 encoded texels between the current image at p

@@ -135,7 +135,7 @@ int main() {
     struct Result { bool collected = false; na::motion::gpu::FitResult fit; double err_fixed = 1e9, err_plain = 0; };
     // One case: fit, then arbiter tier 2 with and without the fix; mean error vs the true motion.
     // images: 0 none, 1 identical (a still picture), 2 the previous image warped by the true flow.
-    struct Options { bool phantom = false; float dj[2] = {0, 0}; int images = 0; };
+    struct Options { bool phantom = false; float dj[2] = {0, 0}; int images = 0; float phantom_flow[2]={-1.f,0.f}; };
     auto pattern = [](double x, double y) {
         return 0.5 + 0.2 * std::sin(0.31 * x + 0.9 * std::sin(0.05 * y)) * std::cos(0.23 * y) + 0.15 * std::sin(0.07 * x - 0.11 * y);
     };
@@ -149,8 +149,10 @@ int main() {
         Scene noisy = make(P, vp_cur, vp_true_prev, jit, corrupt);
         if (opt.phantom) // what the stabilised AMD pair shows on a still, unjittered picture: rounded dj
             for (size_t i = 0; i < size_t(W) * H; ++i) {
-                noisy.flow[i * 2] = std::round(opt.dj[0]);
-                noisy.flow[i * 2 + 1] = std::round(opt.dj[1]);
+                // The recorded false flow is the SAME before/after. Removing
+                // the fitter's hypothesis must not also remove its test input.
+                noisy.flow[i * 2] = opt.phantom_flow[0];
+                noisy.flow[i * 2 + 1] = opt.phantom_flow[1];
             }
         na::motion::gpu::FitImages images;
         test::ComPtr<ID3D12Resource> cur_image, prev_image;

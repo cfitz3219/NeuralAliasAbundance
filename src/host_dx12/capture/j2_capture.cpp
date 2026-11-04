@@ -228,8 +228,9 @@ void write_slot(const Slot& s)
         mat("vp_current_row", id.vp_cur, ",");
         mat("vp_previous_row", id.vp_prev, ",");
         mat("inv_vp_current_row", id.inv_vp_cur, "");
-        std::fprintf(fp, "  },\n  \"selection_version\": %llu,\n  \"tracker_restart\": %u,\n  \"cut_reason\": %u,\n  \"depth_reversed\": %u,\n  \"flow\": {\"ran\": %u, \"loosen\": %u},\n",
-            (unsigned long long)id.selection_version, id.tracker_restart, id.cut_reason, id.depth_reversed, id.flow_ran, id.flow_loosen);
+        std::fprintf(fp, "  },\n  \"selection_version\": %llu,\n  \"tracker_restart\": %u,\n  \"cut_reason\": %u,\n  \"depth_reversed\": %u,\n  \"flow\": {\"ran\": %u, \"loosen\": %u, \"colour_jitter\": [%.6f, %.6f], \"convention\": %u, \"epoch\": %llu},\n",
+            (unsigned long long)id.selection_version, id.tracker_restart, id.cut_reason, id.depth_reversed, id.flow_ran, id.flow_loosen,
+            id.flow_jitter_x,id.flow_jitter_y,id.flow_jitter_convention,(unsigned long long)id.flow_jitter_epoch);
         std::fprintf(fp,"  \"entry_identity\": {\"pipeline\": %llu, \"root\": %llu, \"destination\": %llu, \"operation\": %llu, \"barrier\": %u, \"kind\": %u}, \"process_id\": %lu,\n  \"planes\": [\n",
             (unsigned long long)id.entry_pipeline,(unsigned long long)id.entry_root,(unsigned long long)id.entry_destination,
             (unsigned long long)id.entry_operation,id.entry_barrier,id.entry_kind,GetCurrentProcessId());

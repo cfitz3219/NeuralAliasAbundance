@@ -255,6 +255,7 @@ struct State {
         uint64_t camera_age = 0, selection_version = 0;
         bool tracker_restart = false, flow_ran = false;
         ID3D12Resource* scene_color = nullptr; // exact pre-flow/pre-post copy of this deferred input
+        float flow_jitter_x=0,flow_jitter_y=0;uint32_t flow_jitter_convention=0;uint64_t flow_jitter_epoch=0;
         ID3D12Resource *flow_residual = nullptr, *flow_valid = nullptr, *flow_mask = nullptr; // this frame's tier 3 (NPSR)
     } def;
     std::array<double, 3> def_prev_forward{}; bool def_prev_forward_ok = false; // fast-turn capture trigger
@@ -2168,6 +2169,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             frame.generation=g.router.Current().history_generation;frame.slot=g.slot;
             frame.reset=cam.camera_cut || resize || g.resume_reset;frame.hdr=is_float_color(cf);
             frame.jitter[0]=in.jitter_current_px[0];frame.jitter[1]=in.jitter_current_px[1];
+            frame.raster_jitter[0]=frame.jitter[0];frame.raster_jitter[1]=frame.jitter[1];frame.raster_sample=true;
+            frame.source_generation=pending.selection_version;
             frame.residual=object_flow;frame.camera_reconstruct=reconstruct;
             na::j2::compute_flow::Tier3 tier;
             na::j2::compute_flow::SetLoosen(na::settings::Get().j2_flow_loosen.load(std::memory_order_relaxed));
@@ -2225,8 +2228,10 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         g.def.camera_source = pending.camera_source; g.def.camera_age = pending.camera_age;
         g.def.selection_version = pending.selection_version;
         g.def.tracker_restart = tracker_restart; g.def.cut_reason = cam.cut_reason;
-        g.def.flow_ran = flow_tier.residual != nullptr;
+        g.def.flow_ran = flow_tier.residual != nullptr || flow_tier.fix != nullptr;
         g.def.scene_color = g.color_in.Get();
+        g.def.flow_jitter_x=pending.compute_flow.frame.jitter[0];g.def.flow_jitter_y=pending.compute_flow.frame.jitter[1];
+        g.def.flow_jitter_convention=pending.compute_flow.colour_convention;g.def.flow_jitter_epoch=pending.compute_flow.colour_epoch;
         g.def.flow_residual = flow_tier.residual; g.def.flow_valid = flow_tier.valid; g.def.flow_mask = flow_tier.mask;
         if (saved && saved->at_present) ++g.stats.small_present_source;
         else { ++g.stats.small_deferred; g.small_color = color_id; g.small_depth = depth_id; g.small_csub = csub; g.small_dsub = dsub; }
@@ -2818,7 +2823,6 @@ void witness(uint3 id : SV_DispatchThreadID) {
     if (id.x + 2 >= w || id.y + 2 >= h || id.x < 2 || id.y < 2) return;
     const int2 p = int2(id.xy);
     const float2 m = t2[p].xy;
-    if (dot(m, m) > 1.0) return; // the camera moves here: no verdict
     float lo = 2.0, hi = -1.0;
     [unroll] for (int y = -1; y <= 1; ++y)
         [unroll] for (int x = -1; x <= 1; ++x) { const float l = luma(t0[p + int2(x, y)].rgb); lo = min(lo, l); hi = max(hi, l); }
@@ -2826,14 +2830,15 @@ void witness(uint3 id : SV_DispatchThreadID) {
     const float2 dj = float2(asfloat(p1), asfloat(p2));
     const float2 uv = (float2(p) + 0.5) / float2(w, h), du = dj / float2(w, h);
     const float3 c = t0[p].rgb;
+    uint dummy;
+    stats.InterlockedAdd(32u, 1u, dummy);
+    if (dot(m, m) > 1.0) return; // ambiguous world counts; it must not leave only HUD votes
     const float e0 = diff3(c, t1[p].rgb);
     // dj = current raster sample - previous. Separate the two signs: a
     // shifted match alone must not qualify an arbitrary jitter convention.
     const float ej = diff3(c, t1.SampleLevel(s_lin, uv - du, 0).rgb);
     const float eo = diff3(c, t1.SampleLevel(s_lin, uv + du, 0).rgb);
     if (min(e0, min(ej, eo)) > 0.06) return; // moving/unexplained colour is not calibration evidence
-    uint dummy;
-    stats.InterlockedAdd(32u, 1u, dummy);
     if (e0 * 2.0 < min(ej, eo)) stats.InterlockedAdd(36u, 1u, dummy);
     else if (ej * 2.0 < min(e0, eo)) stats.InterlockedAdd(40u, 1u, dummy);
     else if (eo * 2.0 < min(e0, ej)) stats.InterlockedAdd(44u, 1u, dummy);
@@ -3722,6 +3727,8 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         ci.camera_cut = d.reset ? 1u : 0u;
         ci.depth_reversed = d.reversed ? 1u : 0u;
         ci.flow_ran = d.flow_ran ? 1u : 0u;
+        ci.flow_jitter_x=d.flow_jitter_x;ci.flow_jitter_y=d.flow_jitter_y;
+        ci.flow_jitter_convention=d.flow_jitter_convention;ci.flow_jitter_epoch=d.flow_jitter_epoch;
         ci.flow_loosen = na::settings::Get().j2_flow_loosen.load(std::memory_order_relaxed);
         uint64_t sel_d = 0, sel_c = 0;
         na::observe::GetLiveSelection(&sel_d, &sel_c);
