@@ -337,6 +337,7 @@ set_tests_properties(host_overlay_bootstrap_recovery_test PROPERTIES TIMEOUT 30 
 add_test(NAME host_overlay_menu_failure_test COMMAND overlay_bootstrap_test --menu-failure)
 set_tests_properties(host_overlay_menu_failure_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "host;gpu")
 na_host_test(presenter_ownership_test SOURCES presenter_ownership_test.cpp LIBS host_dx12 user32)
+na_host_test(fullscreen_resize_test SOURCES fullscreen_resize_test.cpp LIBS host_dx12 user32)
 add_test(NAME host_sl_boundary_terminal_attach_test COMMAND sl_boundary_test --terminal-attach)
 set_tests_properties(host_sl_boundary_terminal_attach_test PROPERTIES TIMEOUT 20 LABELS host)
 add_test(NAME host_overlay_menu_create_failure_test COMMAND overlay_bootstrap_test --menu-create-failure)

@@ -11,8 +11,8 @@ extern "C" __declspec(dllimport) BOOL WINAPI FixtureClientRect(HWND,RECT*);
 namespace {
 struct Window {
     HWND hwnd = nullptr;
-    explicit Window(const wchar_t* cls=L"STATIC", void* context=nullptr) {
-        hwnd=CreateWindowExW(0,cls,L"NA hidden sizing fixture",WS_OVERLAPPEDWINDOW,
+    explicit Window(const wchar_t* cls=L"STATIC", void* context=nullptr, DWORD style=WS_OVERLAPPEDWINDOW) {
+        hwnd=CreateWindowExW(0,cls,L"NA hidden sizing fixture",style,
             -1700,120,1000,700,nullptr,nullptr,GetModuleHandleW(nullptr),context);
         CHECK(hwnd);
     }
@@ -26,7 +26,7 @@ void deliver(HWND hwnd,uint64_t token) {
     CHECK(PrepareSizeMessage(hwnd,msg,wp,lp,scratch)==MessageAction::Changed);
     CHECK(msg==WM_SIZE && LOWORD(lp)==1720 && HIWORD(lp)==720);
 }
-struct PostedGame { uint64_t token=0; Size queried{}; bool committed=false; unsigned calls=0; };
+struct PostedGame { uint64_t token=0; Size queried{}; bool committed=false; unsigned calls=0; bool fullscreen=false; };
 LRESULT CALLBACK posted_proc(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam) {
     if(message==WM_NCCREATE) SetWindowLongPtrW(hwnd,GWLP_USERDATA,
         reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(lparam)->lpCreateParams));
@@ -35,6 +35,10 @@ LRESULT CALLBACK posted_proc(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam)
     const auto action=PrepareSizeMessage(hwnd,msg,wp,lp,scratch);
     if(action==MessageAction::Consume) return 0;
     if(game && game->token && msg==WM_SIZE && wp!=SIZE_MINIMIZED) {
+        // Fullscreen/maximized handlers can treat SIZE_MAXIMIZED as a physical
+        // monitor-layout event and ignore its client extent. A render-only
+        // request must take the ordinary client-size branch instead.
+        if (game->fullscreen && wp==SIZE_MAXIMIZED) return 0;
         GameScopeForTest scope; RECT r{};
         if(GetClientRect(hwnd,&r)) {
             game->queried={static_cast<UINT>(r.right),static_cast<UINT>(r.bottom)}; ++game->calls;
@@ -96,6 +100,29 @@ int main() {
             DXGI_SWAP_CHAIN_DESC1 d1{}; d1.Width=3440; d1.Height=1440; d1.AlphaMode=DXGI_ALPHA_MODE_IGNORE;
             CHECK(RewriteDesc1(w.hwnd,&d1)); CHECK(d1.Width==2293 && d1.AlphaMode==DXGI_ALPHA_MODE_IGNORE);
         }},
+        {"display mode generation sees borderless and exclusive changes at the same output size", [] {
+            Window w; CHECK(Attach(w.hwnd,{3440,1440},{2293,960}));
+            ObserveWindowMode(w.hwnd,true); const auto first=GetSizeState(); CHECK(first.mode_generation);
+            ObserveWindowMode(w.hwnd,true); CHECK(GetSizeState().mode_generation==first.mode_generation);
+            const LONG_PTR style=GetWindowLongPtrW(w.hwnd,GWL_STYLE);
+            SetWindowLongPtrW(w.hwnd,GWL_STYLE,WS_POPUP);
+            ObserveWindowMode(w.hwnd,true); const auto borderless=GetSizeState();
+            CHECK(borderless.mode_generation!=first.mode_generation);
+            ObserveWindowMode(w.hwnd,false); const auto exclusive=GetSizeState();
+            CHECK(exclusive.mode_generation!=borderless.mode_generation);
+            CHECK(exclusive.render.w==2293 && exclusive.output.w==3440 && exclusive.request==0);
+            ObserveWindowMode(w.hwnd,false); CHECK(GetSizeState().mode_generation==exclusive.mode_generation);
+            SetWindowLongPtrW(w.hwnd,GWL_STYLE,style); ObserveWindowMode(w.hwnd,true);
+            CHECK(GetSizeState().mode_generation!=exclusive.mode_generation);
+        }},
+        {"physical maximize and minimize messages retain their OS meaning", [] {
+            Window w; CHECK(Attach(w.hwnd,{3440,1440},{2293,960}));
+            UINT msg=WM_SIZE; WPARAM wp=SIZE_MAXIMIZED; LPARAM lp=MAKELPARAM(3440,1440); WINDOWPOS scratch{};
+            CHECK(PrepareSizeMessage(w.hwnd,msg,wp,lp,scratch)==MessageAction::Changed);
+            CHECK(msg==WM_SIZE && wp==SIZE_MAXIMIZED && LOWORD(lp)==2293);
+            wp=SIZE_MINIMIZED; lp=0;
+            CHECK(PrepareSizeMessage(w.hwnd,msg,wp,lp,scratch)==MessageAction::Forward && wp==SIZE_MINIMIZED && lp==0);
+        }},
         {"live resize advertises on delivery and commits mapping only on matching success", [] {
             Window w; CHECK(Attach(w.hwnd,{3440,1440},{2293,960}));
             InputGeometry before{}; CHECK(GetInputGeometry(&before));
@@ -126,6 +153,28 @@ int main() {
             CHECK(GetSizeState().request==0 && GetSizeState().render.w==1720);
             RECT after{}; { NativeScope n; CHECK(GetWindowRect(w.hwnd,&after)); }
             CHECK(std::memcmp(&before,&after,sizeof before)==0);
+        }},
+        {"render-only resize works on maximized borderless HWND without changing its state", [] {
+            WNDCLASSW cls{}; cls.lpfnWndProc=posted_proc; cls.hInstance=GetModuleHandleW(nullptr);
+            cls.lpszClassName=L"NA.NativeSizing.FullscreenFixture";
+            CHECK(RegisterClassW(&cls) || GetLastError()==ERROR_CLASS_ALREADY_EXISTS);
+            PostedGame game; game.fullscreen=true;
+            Window w(cls.lpszClassName,&game,WS_POPUP|WS_MAXIMIZE);
+            CHECK(IsZoomed(w.hwnd) && !IsWindowVisible(w.hwnd));
+            CHECK(Attach(w.hwnd,{3440,1440},{3440,1440}));
+            const auto style=GetWindowLongPtrW(w.hwnd,GWL_STYLE);
+            RECT before{}; { NativeScope n; CHECK(GetWindowRect(w.hwnd,&before)); }
+            for (const Size target : {Size{2293,960},Size{1720,720},Size{3440,1440}}) {
+                game.committed=false; game.token=RequestRenderSize(target,true); CHECK(game.token);
+                MSG message{}; CHECK(PeekMessageW(&message,w.hwnd,ResizeMessage(),ResizeMessage(),PM_REMOVE));
+                DispatchMessageW(&message);
+                CHECK(game.committed && game.queried.w==target.w && game.queried.h==target.h);
+                CHECK(GetSizeState().render.w==target.w && GetSizeState().render.h==target.h);
+                CHECK(IsZoomed(w.hwnd) && GetWindowLongPtrW(w.hwnd,GWL_STYLE)==style);
+                RECT after{}; { NativeScope n; CHECK(GetWindowRect(w.hwnd,&after)); }
+                CHECK(std::memcmp(&before,&after,sizeof before)==0);
+            }
+            CHECK(game.calls==3);
         }},
         {"failed resize restores old advertised geometry and allows retry", [] {
             Window w; CHECK(Attach(w.hwnd,{3440,1440},{2293,960}));
