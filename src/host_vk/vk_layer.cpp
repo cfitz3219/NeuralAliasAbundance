@@ -2856,7 +2856,19 @@ NA_VK_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL NaVk_GetInstanceProcAddr(V
     return inst->gipa(instance, name);
 }
 
-NA_VK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* v)
+// vk_layer.h already declares this one (extern "C", no dllexport), so MSVC
+// refuses a dllexport redefinition (C2375); export it through the linker instead.
+#if defined(_WIN32)
+#if defined(_M_IX86)
+#pragma comment(linker, "/EXPORT:vkNegotiateLoaderLayerInterfaceVersion=_vkNegotiateLoaderLayerInterfaceVersion@4")
+#else
+#pragma comment(linker, "/EXPORT:vkNegotiateLoaderLayerInterfaceVersion")
+#endif
+#define NA_VK_NEGOTIATE_EXPORT extern "C"
+#else
+#define NA_VK_NEGOTIATE_EXPORT NA_VK_EXPORT
+#endif
+NA_VK_NEGOTIATE_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* v)
 {
     if (!v || v->sType != LAYER_NEGOTIATE_INTERFACE_STRUCT) return VK_ERROR_INITIALIZATION_FAILED;
     if (v->loaderLayerInterfaceVersion >= 2) {
