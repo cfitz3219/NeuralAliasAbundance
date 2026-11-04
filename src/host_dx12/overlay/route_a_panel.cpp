@@ -1108,6 +1108,8 @@ void DrawLiveDlaaEnhancements()
         BeginRow("Moving-object motion (test)", "Adds estimated motion for moving objects. Uses NVIDIA flow between command lists, or AMD compute flow inside the game's list. Requires extra GPU time. Turn it off to compare; the Motion vectors debug view shows the result.", SwitchWidth());
         if (Switch("j2flow", &fl)) na::j2::flow::SetEnabled(fl);
         EndRow();
+        if (na::j2::compute_flow::GetStats().camera_reconstruct)
+            ImGui::TextWrapped("This game's camera data has no camera movement, so camera motion is rebuilt from the picture. AMD flow keeps running (extra GPU time) even with the switch off; the switch only controls moving-object motion.");
         {
             na::settings::Settings& ss = na::settings::Get();
             int loose = static_cast<int>(ss.j2_flow_loosen.load());

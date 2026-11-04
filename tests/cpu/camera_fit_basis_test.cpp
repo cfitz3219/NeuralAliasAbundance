@@ -6,7 +6,8 @@
 //  - a combined translation + small rotation is recovered;
 //  - 25 % outliers (HUD, movers, bad matches) do not pull the fit;
 //  - a still scene is not accepted (nothing to fix);
-//  - reversed depth works the same.
+//  - reversed depth works the same;
+//  - CarriesNoView: a projection alone (SE5 0ce11a8) vs a matrix with a real orientation.
 #include "test_support.hpp"
 #include "core/camera_fit_basis.hpp"
 
@@ -236,6 +237,21 @@ int main() {
         }},
         {"reversed depth", [] {
             run_case({{1, 1.7, 2}, {1.08, 1.75, 2.3}, 0.5, 0.5, true, 0.1}, true);
+        }},
+        {"a projection alone carries no view; any real orientation does", [] {
+            M P = proj(false);
+            CHECK(CarriesNoView(P.data()));
+            P[8] = 0.0004; P[9] = -0.0003; // jitter / off-centre terms are allowed
+            CHECK(CarriesNoView(P.data()));
+            CHECK(CarriesNoView(proj(true).data()));
+            const double origin[3] = {0, 0, 0}, eye[3] = {3, 1.7, -2};
+            CHECK(CarriesNoView(mul(view(eye, 0), proj(false)).data())); // translation only: no orientation
+            CHECK(!CarriesNoView(mul(view(origin, 0.01), proj(false)).data())); // camera-relative, turned
+            CHECK(!CarriesNoView(mul(view(eye, -0.4), proj(true)).data()));
+            M pitch{1, 0, 0, 0, 0, std::cos(0.02), std::sin(0.02), 0, 0, -std::sin(0.02), std::cos(0.02), 0, 0, 0, 0, 1};
+            CHECK(!CarriesNoView(mul(pitch, proj(false)).data()));
+            M zero{};
+            CHECK(!CarriesNoView(zero.data()));
         }},
     });
 }

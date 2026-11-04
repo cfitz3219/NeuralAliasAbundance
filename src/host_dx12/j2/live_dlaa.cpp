@@ -2151,16 +2151,30 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         in.jitter_current_px[1] = static_cast<float>(cam.jitter_px_y);
         // AMD is an in-list dispatch, after this frame's resolved pre-DLAA
         // colour/depth copies. It needs no batch split or external queue wait.
-        if(na::j2::flow::Enabled() && !windowed && !(saved && saved->at_present) && (inl || !flow_ticket || !flow_ticket->valid)){
+        // Camera reconstruction (Cort 2026-11-04: flow on removed the oily smear because the M3 fit
+        // lived inside the flow toggle). When the selected matrix carries no view for 30 frames in a
+        // row, the camera term is zero whatever the player does: AMD flow + the M3 fit then run even
+        // with optical flow off (the toggle keeps only the object-motion residual); 30 frames with a
+        // view end it. Games with a real camera matrix are unaffected.
+        static int no_view_streak = 0, view_streak = 0;
+        static bool reconstruct = false;
+        if (na::motion::gpu::CarriesNoView(cam.view_proj_current_row.data())) { ++no_view_streak; view_streak = 0; }
+        else { ++view_streak; no_view_streak = 0; }
+        if (!reconstruct && no_view_streak >= 30) reconstruct = true;
+        if (reconstruct && view_streak >= 30) reconstruct = false;
+        const bool object_flow = na::j2::flow::Enabled();
+        if((object_flow || reconstruct) && !windowed && !(saved && saved->at_present) && (inl || !flow_ticket || !flow_ticket->valid)){
             na::j2::compute_flow::Frame frame;frame.frame=g.frame;frame.previous=g.submitted_frame;
             frame.generation=g.router.Current().history_generation;frame.slot=g.slot;
             frame.reset=cam.camera_cut || resize || g.resume_reset;frame.hdr=is_float_color(cf);
             frame.jitter[0]=in.jitter_current_px[0];frame.jitter[1]=in.jitter_current_px[1];
+            frame.residual=object_flow;frame.camera_reconstruct=reconstruct;
             na::j2::compute_flow::Tier3 tier;
             na::j2::compute_flow::SetLoosen(na::settings::Get().j2_flow_loosen.load(std::memory_order_relaxed));
             pending.compute_flow=na::j2::compute_flow::Record(l,g.queue.Get(),g.color_in.Get(),g.depth32.Get(),in,frame,tier);
             // The residual was derived against the fitted camera: tier 2 must use the same fix.
-            if(tier.residual){in.tier3_valid_flag=true;in.tier3_residual=tier.residual;in.tier3_valid=tier.valid;in.tier3_mask=tier.mask;in.fix=tier.fix;}
+            if(tier.residual){in.tier3_valid_flag=true;in.tier3_residual=tier.residual;in.tier3_valid=tier.valid;in.tier3_mask=tier.mask;}
+            in.fix=tier.fix; // also without a residual (camera reconstruction only)
             flow_tier=tier;
         }
         // P4-0b: camera + accepted moving-object residual (tier 3) when this frame's pair ran.

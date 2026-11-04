@@ -5,7 +5,11 @@
 //  - the arbiter's tier 2 with the fix reproduces the true motion (< 0.1 px mean), and without
 //    it the motion is the old ~0 (the bug), so the fix is what changes it;
 //  - a still scene is not accepted and the arbiter output is unchanged by the (invalid) buffer;
-//  - 25 % corrupted flow (HUD, movers) does not stop the fit.
+//  - 25 % corrupted flow (HUD, movers) does not stop the fit;
+//  - Cort's 0ce11a8 run: a still scene whose stabilised flow shows only the jitter delta
+//    (whole screen (-1, 0) at dj (-0.625, 0.333)) is accepted by the plain test (the bug) and
+//    rejected with dj; with the pair's images, a phantom fit is rejected by the image check even
+//    without dj, and a real walk with images is still accepted.
 #include "test_support.hpp"
 #include "core/camera_fit_gpu.hpp"
 #include "core/motion_arbiter_gpu.hpp"
@@ -130,18 +134,48 @@ int main() {
 
     struct Result { bool collected = false; na::motion::gpu::FitResult fit; double err_fixed = 1e9, err_plain = 0; };
     // One case: fit, then arbiter tier 2 with and without the fix; mean error vs the true motion.
-    auto run = [&](const double eye_prev[3], const double eye_cur[3], double corrupt) {
+    // images: 0 none, 1 identical (a still picture), 2 the previous image warped by the true flow.
+    struct Options { bool phantom = false; float dj[2] = {0, 0}; int images = 0; };
+    auto pattern = [](double x, double y) {
+        return 0.5 + 0.2 * std::sin(0.31 * x + 0.9 * std::sin(0.05 * y)) * std::cos(0.23 * y) + 0.15 * std::sin(0.07 * x - 0.11 * y);
+    };
+    auto run = [&](const double eye_prev[3], const double eye_cur[3], double corrupt, const Options& opt = Options{}) {
         const M P = proj();
         const M vp_cur = mul(view(eye_cur, 0.15), P), vp_true_prev = mul(view(eye_prev, 0.15), P);
         const M vp_tracked_prev = mul(view(eye_cur, 0.15), P); // translation missing
         const M inv_cur = inverse(vp_cur), composed = mul(inv_cur, vp_tracked_prev);
         const float jit[2] = {0.25f, -0.4f};
-        const Scene clean = make(P, vp_cur, vp_true_prev, jit, 0), noisy = make(P, vp_cur, vp_true_prev, jit, corrupt);
+        const Scene clean = make(P, vp_cur, vp_true_prev, jit, 0);
+        Scene noisy = make(P, vp_cur, vp_true_prev, jit, corrupt);
+        if (opt.phantom) // what the stabilised AMD pair shows on a still, unjittered picture: rounded dj
+            for (size_t i = 0; i < size_t(W) * H; ++i) {
+                noisy.flow[i * 2] = std::round(opt.dj[0]);
+                noisy.flow[i * 2 + 1] = std::round(opt.dj[1]);
+            }
+        na::motion::gpu::FitImages images;
+        test::ComPtr<ID3D12Resource> cur_image, prev_image;
+        if (opt.images) {
+            std::vector<uint32_t> a(size_t(W) * H), b(size_t(W) * H);
+            auto pack = [](double v) { const uint32_t g = uint32_t(std::lround(std::fmin(1.0, std::fmax(0.0, v)) * 255.0)); return g | g << 8 | g << 16 | 0xff000000u; };
+            for (unsigned y = 0; y < H; ++y)
+                for (unsigned x = 0; x < W; ++x) {
+                    const size_t i = size_t(y) * W + x;
+                    a[i] = pack(pattern(x + 0.5, y + 0.5));
+                    // prev(X + f) = cur(X): first order, prev(X) = cur(X - f(X)).
+                    b[i] = opt.images == 1 ? a[i] : pack(pattern(x + 0.5 - clean.flow[i * 2], y + 0.5 - clean.flow[i * 2 + 1]));
+                }
+            cur_image = upload(a.data(), 4, DXGI_FORMAT_R8G8B8A8_UNORM);
+            prev_image = upload(b.data(), 4, DXGI_FORMAT_R8G8B8A8_UNORM);
+            images.current = cur_image.Get();
+            images.previous = prev_image.Get();
+        }
+        images.jitter_delta_px[0] = opt.dj[0];
+        images.jitter_delta_px[1] = opt.dj[1];
         auto depth = upload(noisy.depth.data(), 4, DXGI_FORMAT_R32_FLOAT);
         auto flow = upload(noisy.flow.data(), 8, DXGI_FORMAT_R32G32_FLOAT);
         auto valid = upload(noisy.valid.data(), 4, DXGI_FORMAT_R32_FLOAT);
         const auto basis = na::motion::gpu::MakeFitBasis(composed.data(), inv_cur.data(), vp_tracked_prev.data(), eye_cur);
-        auto* fix = fit.Record(l.list.Get(), 0, depth.Get(), flow.Get(), valid.Get(), basis, jit, 1.f, W, H);
+        auto* fix = fit.Record(l.list.Get(), 0, depth.Get(), flow.Get(), valid.Get(), basis, jit, 1.f, W, H, &images);
         if (!fix) { CHECK(fix); return Result{}; }
         double err[2] = {};
         for (int pass = 0; pass < 2; ++pass) {
@@ -178,9 +212,12 @@ int main() {
         r.collected = fit.Collect(0, &r.fit);
         r.err_fixed = err[0];
         r.err_plain = err[1];
-        std::printf("fit accepted=%d e0=%.4f n0=%u e=%.4f n=%u t=[%.4f %.4f %.4f] r=[%.5f %.5f %.5f] error fixed=%.4f px plain=%.4f px\n",
-                    r.fit.accepted ? 1 : 0, r.fit.energy0, r.fit.samples0, r.fit.energy, r.fit.samples, r.fit.theta[0], r.fit.theta[1],
-                    r.fit.theta[2], r.fit.theta[3], r.fit.theta[4], r.fit.theta[5], r.err_fixed, r.err_plain);
+        std::printf("fit accepted=%d flow_passed=%d e0=%.4f e0_jitter=%.4f n0=%u e=%.4f n=%u t=[%.4f %.4f %.4f] r=[%.5f %.5f %.5f] "
+                    "image{tested=%u better=%u worse=%u e_fit=%.4f e_cam=%.4f regions=%u good=%u} error fixed=%.4f px plain=%.4f px\n",
+                    r.fit.accepted ? 1 : 0, r.fit.flow_accepted ? 1 : 0, r.fit.energy0, r.fit.energy_alt, r.fit.samples0, r.fit.energy, r.fit.samples,
+                    r.fit.theta[0], r.fit.theta[1], r.fit.theta[2], r.fit.theta[3], r.fit.theta[4], r.fit.theta[5], r.fit.photo_tested,
+                    r.fit.photo_better, r.fit.photo_worse, r.fit.photo_e_fit, r.fit.photo_e_cam, r.fit.photo_regions, r.fit.photo_regions_good,
+                    r.err_fixed, r.err_plain);
         return r;
     };
     {
@@ -200,6 +237,41 @@ int main() {
     {
         const double a[3] = {0, 1.7, 0}, b[3] = {-0.1, 1.72, 0.3};
         const auto r = run(a, b, 0.25);
+        CHECK(r.collected && r.fit.accepted);
+        CHECK(r.err_fixed < 0.15);
+    }
+    {
+        // The bug: a still picture, the stabilised flow shows the rounded jitter delta everywhere.
+        const double a[3] = {2, 1.7, 1};
+        Options o; o.phantom = true; o.dj[0] = -0.625f; o.dj[1] = 0.333f;
+        Options plain = o; plain.dj[0] = plain.dj[1] = 0; // what 0ce11a8 did (no dj)
+        const auto before = run(a, a, 0, plain);
+        CHECK(before.collected && before.fit.accepted); // documents the 0ce11a8 failure
+        CHECK(before.err_fixed > 0.5);
+        const auto after = run(a, a, 0, o);
+        CHECK(after.collected && !after.fit.accepted);
+        CHECK(std::fabs(after.err_fixed - after.err_plain) < 1e-6);
+        // Image check alone (no dj): the identical images refuse the 1 px phantom.
+        Options img = plain; img.images = 1;
+        const auto photo = run(a, a, 0, img);
+        CHECK(photo.collected && photo.fit.flow_accepted && !photo.fit.accepted);
+        CHECK(photo.fit.photo_tested >= 64 && photo.fit.photo_worse > photo.fit.photo_better);
+        CHECK(std::fabs(photo.err_fixed - photo.err_plain) < 1e-6);
+    }
+    {
+        // A real walk with the pair's images (and a jitter delta that is not in the picture): accepted.
+        const double a[3] = {0, 1.7, 0}, b[3] = {0.15, 1.7, 0.4};
+        Options o; o.images = 2; o.dj[0] = 0.5f; o.dj[1] = -0.556f;
+        const auto r = run(a, b, 0, o);
+        CHECK(r.collected && r.fit.accepted);
+        CHECK(r.fit.photo_better > 4 * r.fit.photo_worse);
+        CHECK(r.err_fixed < 0.1);
+    }
+    {
+        // Same walk, 25 % corrupted flow, images: still accepted.
+        const double a[3] = {0, 1.7, 0}, b[3] = {-0.1, 1.72, 0.3};
+        Options o; o.images = 2;
+        const auto r = run(a, b, 0.25, o);
         CHECK(r.collected && r.fit.accepted);
         CHECK(r.err_fixed < 0.15);
     }
