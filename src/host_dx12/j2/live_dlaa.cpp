@@ -4800,6 +4800,8 @@ void Shutdown()
     g.arbiter = na::motion::gpu::Arbiter{};
     g_dbg = DebugPass{};
     g_rcas = RcasPass{};
+    g_jshift = JitterShift{}; // released here, not in static destruction after D3D12 has gone
+    g_small.jshift.Reset();
     g_nis.Reset();
     g.arbiter_ok = false;
     g.tracker.Reset();
