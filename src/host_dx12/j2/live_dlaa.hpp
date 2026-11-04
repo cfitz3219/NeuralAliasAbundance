@@ -23,6 +23,7 @@
 // waits; a busy ring slot skips. Jitter injection (J1) is a separate step:
 // without it DLSS gets jitter 0 (temporally stable, not super-sampled).
 #pragma once
+#include "host_dx12/j2/native_hud.hpp"
 #include <d3d12.h>
 #include <cstdint>
 #include <memory>
@@ -113,6 +114,10 @@ inline uint32_t PresetFor(uint32_t setting, uint32_t render_w, uint32_t out_w)
 }
 bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t rw, uint32_t rh,
                     ID3D12Resource* out, uint32_t ow, uint32_t oh, bool hdr, void* user);
+// Exact original batch, before application fences: reuse the normal upscale
+// machinery on the saved pre-HUD scene, then execute the native HUD list.
+bool PreHudUpscale(ID3D12CommandQueue*,ID3D12Resource* frame,uint32_t rw,uint32_t rh,
+                   ID3D12Resource* out,uint32_t ow,uint32_t oh,const native_hud::Layer&,ID3D12CommandList* replay);
 void SetProjectionWindow(bool on);
 void SetProjectionWindowScissor(bool on); // [j2] window_scissor: clip scene draws to the corner (GPU cost), default on
 bool ProjectionWindow();

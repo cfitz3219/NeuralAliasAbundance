@@ -2974,6 +2974,7 @@ struct SmallRing {
     uint32_t slot = 0;
     std::shared_ptr<void> hud_owner[kRing];
     std::shared_ptr<na::j2::native_hud::Picture> hud_picture[kRing];
+    bool native_hud_result[kRing]{};
     struct CanvasProbe {
         std::shared_ptr<na::j2::native_hud::Picture> picture;
         std::shared_ptr<void> owner;
@@ -3661,17 +3662,20 @@ void hud_read(uint32_t si)
     // which keeps learning but is not protected (it would replace DLSS with NIS over that area).
     g_small.hud_protect_off = g.stats.hud_fb_cover_permille > 300;
 }
-bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t rw, uint32_t rh,
-                    ID3D12Resource* out, uint32_t ow, uint32_t oh, bool hdr, void*)
+static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t rw, uint32_t rh,
+                    ID3D12Resource* out, uint32_t ow, uint32_t oh, bool hdr,
+                    const native_hud::Layer* supplied,ID3D12CommandList* replay)
 {
     if (!queue || !frame || !out || !rw || !rh || !ow || !oh) return false;
     // Native HUD: whether this frame's HUD was drawn into the native layers (then the proxy
     // holds the scene only, which is what DLSS gets).
     na::j2::native_hud::Layer layer;
-    const bool layer_frame = na::j2::native_hud::TakeFrame(frame, rw, rh, ow, oh, &layer,queue);
+    const bool layer_frame = supplied?(layer=*supplied,true):na::j2::native_hud::TakeFrame(frame, rw, rh, ow, oh, &layer,queue);
     const ExecuteFn forward = g_forward.load(std::memory_order_relaxed);
     const na::observe::HostWorkScope host; // our list is never observed as the game's
     std::lock_guard<std::mutex> lock(g.m);
+    if(replay&&!(g.enabled.load()&&g.def.valid&&g.def.frame==g.frame&&g.def.w==rw&&g.def.h==rh&&
+        g.queue.Get()==queue&&g.dlss_ready))return false;
     if (!forward) { ++g.stats.small_failed; small_note("Render-small: no game submission seen yet."); return false; }
     if (!small_init(queue)) { ++g.stats.small_failed; small_note("Render-small could not set up its upscale pass on this queue."); return false; }
     g.stats.small_rw = rw; g.stats.small_rh = rh; g.stats.small_ow = ow; g.stats.small_oh = oh;
@@ -3686,7 +3690,11 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
     const auto hud_completed=g_small.fence->GetCompletedValue();
     if(hud_completed!=UINT64_MAX)for(uint32_t j=0;j<kRing;++j)if(g_small.value[j]&&hud_completed>=g_small.value[j]){
         bool identity=false,clean=false;
-        if(g_small.hud_picture[j]&&g_small.hud_picture[j]->ProofAfterCompletion(identity,clean))na::j2::native_hud::ReportPictureResult(identity,clean);
+        if(g_small.hud_picture[j]&&g_small.hud_picture[j]->ProofAfterCompletion(identity,clean)){
+            if(g_small.native_hud_result[j])na::j2::native_hud::ReportNativePictureResult(identity);
+            else na::j2::native_hud::ReportPictureResult(identity,clean);
+        }
+        g_small.native_hud_result[j]=false;
         auto& probe=g_small.canvas_probe[j];
         if(probe.picture&&probe.picture->ProofAfterCompletion(identity,clean))
             na::j2::native_hud::ReportCanvasProbe(probe.source,probe.generation,identity);
@@ -3694,7 +3702,7 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         g_small.hud_owner[j].reset();g_small.hud_picture[j].reset();
     }
     g_small.hud_owner[si]=layer.owner;
-    g_small.hud_picture[si]=layer_frame?layer.picture:nullptr;
+    g_small.hud_picture[si]=layer_frame&&!replay?layer.picture:nullptr;
     ID3D12GraphicsCommandList* l = g_small.list.Get();
     if (FAILED(g_small.alloc[si]->Reset()) || FAILED(l->Reset(g_small.alloc[si].Get(), nullptr))) {
         ++g.stats.small_failed; small_note("Render-small: could not reset its list."); return false;
@@ -3710,11 +3718,36 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         if(layer.probe->Probe(l,frame,frame->GetDesc().Format))
             g_small.canvas_probe[si]={layer.probe,layer.probe_owner,layer.probe_source,layer.probe_generation};
     }
+    if(layer.native_picture&&layer.native_check&&layer.picture){
+        flush(l,b);
+        const bool native=layer.picture->PresentNative(l,frame,typed(frame->GetDesc().Format),layer.native_picture,layer.native_check,out,g_hud_view.load(std::memory_order_relaxed));
+        if(!native){g_small.hud_picture[si].reset();small_stretch(l,frame,out,ow,oh,si);}
+        g_small.native_hud_result[si]=native;
+        uint32_t hud_capture=0;
+        if(na::capture::j2::Armed()&&layer.recording_identity){
+            auto id=*layer.recording_identity;id.presentation_only=true;id.owns_present=true;id.present_ordinal=g.frame;
+            na::capture::j2::Planes planes;
+            planes.color=id.evaluation_succeeded?layer.picture->Input():layer.picture->Scene();
+            planes.output=out;id.color_format=planes.color->GetDesc().Format;
+            planes.extra[planes.extra_count++]={"hud_scene",layer.picture->Scene(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+            planes.extra[planes.extra_count++]={"hud_full",layer.picture->Full(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+            planes.extra[planes.extra_count++]={"hud_native",layer.native_picture,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+            planes.extra[planes.extra_count++]={"hud_replay_check",layer.native_check,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+            hud_capture=na::capture::j2::RecordEvaluation(l,planes,id);
+        }
+        add(b,frame,NPSR,PRESENT);add(b,out,UAV,PRESENT);flush(l,b);
+        if(FAILED(l->Close())){na::capture::j2::Discard(hud_capture,false);return false;}
+        ID3D12CommandList* work[]={l};forward(queue,1,work);
+        if(hud_capture)na::capture::j2::Submitted(hud_capture,queue,g.stats.submissions);
+        g_small.value[si]=g_small.next++;queue->Signal(g_small.fence.Get(),g_small.value[si]);g_small.slot=(si+1)%kRing;
+        if(native)++g.stats.small_hud_layer;
+        return true; // DLSS already ran once, before this native HUD replay
+    }
     // DLSS needs this frame's depth + motion, recorded on this same queue (so the GPU runs them
     // first), at the picture's size, and a DLSS instance on this device.
-    if (!(g.def.valid && g.def.frame + 1 == g.frame)) present_source(queue, forward);
+    if (!replay&&!(g.def.valid && g.def.frame + 1 == g.frame)) present_source(queue, forward);
     const auto& d = g.def;
-    const bool fresh = d.valid && d.frame + 1 == g.frame && d.w == rw && d.h == rh;
+    const bool fresh = d.valid && d.frame + (replay?0u:1u) == g.frame && d.w == rw && d.h == rh;
     const bool can_dlss = fresh && forward && g.dlss_ready && g.device && g.device.Get() == g_small.device.Get() &&
                           g.queue.Get() == queue && g.depth32 && g.motion && g.paused.load() == false;
     if (can_dlss) {
@@ -3758,6 +3791,10 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         flush(l, b);
         if(layer_frame&&layer.picture) {
             draw_picture=layer.picture->Prepare(l,frame,ff,g.motion.Get(),layer.n0,layer.n1,layer.view,layer.grey,layer.srgb,layer.clean_allowed,of,g_hud_view.load(std::memory_order_relaxed));
+        }
+        if(replay&&!draw_picture){
+            l->Close();g_small.hud_picture[si].reset();g_small.hud_owner[si].reset();
+            return false; // no NGX creation/evaluation has been recorded
         }
         if (witness) {
             const DXGI_FORMAT wf = typed(frame->GetDesc().Format);
@@ -3971,7 +4008,7 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
     if (hud_ran) add(b, g_small.mask.Get(), NPSR, UAV);
     if (!dlss) {
         flush(l, b);
-        small_stretch(l, frame, out, ow, oh, si);
+        small_stretch(l, replay&&draw_picture?layer.picture->Input():frame, out, ow, oh, si);
         g.small_last = 0; // DLSS history is no longer the previous picture
         if (hud_layer) { // the native HUD over the stretched scene, then back into `out`
             UINT out_state = UAV;
@@ -3987,7 +4024,8 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
             ++g.stats.small_hud_layer;
         }
     }
-    if(dlss&&draw_picture){flush(l,b);layer.picture->Composite(l,out);}
+    if(dlss&&draw_picture&&!replay){flush(l,b);layer.picture->Composite(l,out);}
+    if(replay&&draw_picture){flush(l,b);layer.picture->SeedNativeAlpha(l,out);}
     // The jitter witness compares the next frame with this one.
     if (dlss && g.jitter_on && !g.jitter_unseen && witness_targets(frame, rw, rh)) {
         constexpr UINT SRC = D3D12_RESOURCE_STATE_COPY_SOURCE, DST = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -4019,7 +4057,7 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
     // picture could not be measured (Cort's e7acb94 capture came out empty). Colour = DLSS's
     // input (the proxy, scene only), output = the final picture with the native HUD on it.
     uint32_t capture = 0;
-    if (dlss && na::capture::j2::Armed()) {
+    if ((dlss||replay) && (na::capture::j2::Armed()||replay)) {
         b.push_back(uav_barrier(out));
         flush(l, b);
         na::capture::j2::Planes cp;
@@ -4078,7 +4116,9 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
             extra("hud_n1", layer.n1, D3D12_RESOURCE_STATE_RENDER_TARGET);
             if(draw_picture){extra("hud_scene",layer.picture->Scene(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);extra("hud_full",layer.picture->Full(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);extra("hud_draw_mask",layer.picture->Mask(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);}
         }
-        capture = na::capture::j2::RecordEvaluation(l, cp, ci);
+        ci.evaluation_succeeded=dlss;
+        if(replay&&layer.recording_identity)*layer.recording_identity=ci;
+        if(!replay)capture = na::capture::j2::RecordEvaluation(l, cp, ci);
     }
     b.push_back(uav_barrier(out));
     add(b, frame, NPSR, PRESENT);
@@ -4093,10 +4133,10 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         g.latched = true;
         return false;
     }
-    ID3D12CommandList* lists[] = {l};
-    if (dlss) na::dlss::BeforeExecute(queue, 1, lists);
-    forward(queue, 1, lists); // the original entry point: the host's hook would re-enter J2 under g.m
-    if (dlss) na::dlss::OnExecuted(queue, 1, lists);
+    ID3D12CommandList* lists[] = {l,replay};const UINT count=replay?2u:1u;
+    if (dlss) na::dlss::BeforeExecute(queue, count, lists);
+    forward(queue, count, lists); // original entry point; native HUD stays before this frame's completion fence
+    if (dlss) na::dlss::OnExecuted(queue, count, lists);
     if (capture) na::capture::j2::Submitted(capture, queue, g.stats.submissions);
     g_small.value[si] = g_small.next++;
     queue->Signal(g_small.fence.Get(), g_small.value[si]);
@@ -4131,6 +4171,13 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
     g_small_stretch_streak.store(dlss ? 0u : g_small_stretch_streak.load(std::memory_order_relaxed) + 1u, std::memory_order_relaxed);
     return true;
 }
+
+bool PresentUpscale(ID3D12CommandQueue* queue,ID3D12Resource* frame,uint32_t rw,uint32_t rh,
+                    ID3D12Resource* out,uint32_t ow,uint32_t oh,bool hdr,void*)
+{return present_upscale(queue,frame,rw,rh,out,ow,oh,hdr,nullptr,nullptr);}
+bool PreHudUpscale(ID3D12CommandQueue* queue,ID3D12Resource* frame,uint32_t rw,uint32_t rh,
+                   ID3D12Resource* out,uint32_t ow,uint32_t oh,const native_hud::Layer& layer,ID3D12CommandList* replay)
+{return present_upscale(queue,frame,rw,rh,out,ow,oh,is_float_color(frame->GetDesc().Format),&layer,replay);}
 
 void SetEnabled(bool on)
 {

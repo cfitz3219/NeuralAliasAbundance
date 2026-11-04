@@ -985,6 +985,8 @@ void DrawLiveDlaa()
             Hint(hud.last_draw_method==1?"Last checked frame: native HUD."
                  :hud.last_draw_method==2?"Last checked frame: HUD protected from the current game image."
                  :hud.last_draw_method==3?"Last checked frame: HUD kept in the game image; the final draw changes the picture."
+                 :hud.last_draw_method==4?"Last checked frame: final HUD drawn at native resolution after DLSS."
+                 :hud.last_draw_method==5?"Last checked frame: kept the game picture; the HUD redraw did not match."
                  :hud.hud_frames?"HUD uses a separate native layer.":"Locating the game's HUD draws.");
         }
         if (!na::j2::HudMaskEnabled()) {

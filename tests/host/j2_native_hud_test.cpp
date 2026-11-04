@@ -15,6 +15,8 @@
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/observe/operation_snapshot.hpp"
 #include "host_dx12/nr/native_fg.hpp"
+#include "host_dx12/observe/shader_dimensions.hpp"
+#include "host_dx12/capture/j2_capture.hpp"
 
 #include <d3dcompiler.h>
 #include <d3d12sdklayers.h>
@@ -212,6 +214,50 @@ int picture_paths(test::Device& d)
     return 0;
 }
 
+// The pre-HUD compute list and final Present list can be recorded before either
+// executes. Their shader descriptors must not overwrite one another. Also keep
+// HDR highlights and the game's destination alpha through the native redraw.
+int native_picture_phases(test::Device& d)
+{
+    constexpr UINT W=4,H=2,OW=8,OH=4;constexpr auto F=DXGI_FORMAT_R16G16B16A16_FLOAT;
+    constexpr auto S=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,U=D3D12_RESOURCE_STATE_UNORDERED_ACCESS,R=D3D12_RESOURCE_STATE_RENDER_TARGET;
+    auto rgba=[](UINT n,std::initializer_list<uint16_t> c){std::vector<uint16_t> v;for(UINT i=0;i<n;++i)v.insert(v.end(),c);return v;};
+    auto make=[&](UINT w,UINT h,const std::vector<uint16_t>& data,D3D12_RESOURCE_STATES state,D3D12_RESOURCE_FLAGS flags){
+        auto r=test::CreateTexture(d.device.Get(),w,h,F,D3D12_RESOURCE_STATE_COPY_DEST,flags);
+        if(r&&!upload(d,r.Get(),data.data(),8,state))r.Reset();return r;};
+    for(bool bad_alpha:{false,true}){
+        const auto scene=rgba(W*H,{0x4000,0x3c00,0x3800,0x3a00}); // 2,1,.5,.75
+        auto source=make(W,H,scene,S,D3D12_RESOURCE_FLAG_NONE);
+        auto check=make(W,H,rgba(W*H,{0x4000,0x3c00,0x3800,uint16_t(bad_alpha?0:0x3a00)}),S,D3D12_RESOURCE_FLAG_NONE);
+        auto native=make(OW,OH,rgba(OW*OH,{0x4400,0x4000,0x3c00,0}),U,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        auto out=make(OW,OH,rgba(OW*OH,{0,0,0,0}),U,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        auto n0=make(OW,OH,rgba(OW*OH,{0,0,0,0}),R,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        auto n1=make(OW,OH,rgba(OW*OH,{0x3c00,0x3c00,0x3c00,0}),R,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        std::vector<float> zero(W*H*2);auto mv=test::CreateTexture(d.device.Get(),W,H,DXGI_FORMAT_R32G32_FLOAT,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        REQUIRE(source&&check&&native&&out&&n0&&n1&&mv&&upload(d,mv.Get(),zero.data(),8,S));
+        auto p=nh::Picture::Create(d.device.Get(),source->GetDesc(),OW,OH);REQUIRE(p);
+        test::List seed,finish;REQUIRE(seed.Create(d.device.Get())&&finish.Create(d.device.Get()));
+        REQUIRE(p->SnapshotScene(seed.list.Get(),source.Get(),S)&&p->SnapshotFull(seed.list.Get(),source.Get(),S));
+        REQUIRE(p->Prepare(seed.list.Get(),source.Get(),F,mv.Get(),n0.Get(),n1.Get(),F,1.f,false,true,F));
+        REQUIRE(p->SeedNativeAlpha(seed.list.Get(),native.Get()));
+        auto barrier=test::Transition(native.Get(),U,S);seed.list->ResourceBarrier(1,&barrier);
+        REQUIRE(SUCCEEDED(seed.list->Close()));
+        REQUIRE(p->PresentNative(finish.list.Get(),source.Get(),F,native.Get(),check.Get(),out.Get()));
+        REQUIRE(SUCCEEDED(finish.list->Close()));
+        ID3D12CommandList* lists[]={seed.list.Get(),finish.list.Get()};d.queue->ExecuteCommandLists(2,lists);d.WaitIdle();
+        std::vector<uint8_t> pixels;REQUIRE(readback(d,out.Get(),U,8,pixels));uint16_t value[4]{};std::memcpy(value,pixels.data(),8);
+        CHECK(half_value(value[0])==(bad_alpha?2.f:4.f));CHECK(half_value(value[3])==.75f);
+        bool identity=false,clean=false;CHECK(p->ProofAfterCompletion(identity,clean)&&identity==!bad_alpha&&clean==!bad_alpha);
+    }
+    // Stripping optional RDEF must not hide executable UAV writes from replay admission.
+    ComPtr<ID3DBlob> code,stripped,error;
+    constexpr char cs[]="RWByteAddressBuffer b:register(u0);[numthreads(1,1,1)]void main(){b.Store(0,1);}";
+    REQUIRE(SUCCEEDED(D3DCompile(cs,sizeof(cs),nullptr,nullptr,nullptr,"main","cs_5_0",0,0,&code,&error)));
+    REQUIRE(SUCCEEDED(D3DStripShader(code->GetBufferPointer(),code->GetBufferSize(),D3DCOMPILER_STRIP_REFLECTION_DATA,&stripped)));
+    CHECK(!na::observe::ExecutableReadOnly({stripped->GetBufferPointer(),stripped->GetBufferSize()}));
+    return 0;
+}
+
 int jitter_evidence(test::Device& d)
 {
     constexpr uint32_t W=256,H=128;
@@ -252,6 +298,34 @@ int jitter_evidence(test::Device& d)
         const auto sample=source.Resolve({.75f,0.f});
         CHECK(sample.x==(mode==0?0.f:mode==1?.75f:-.75f));
     }
+    return 0;
+}
+
+int native_capture(test::Device& d)
+{
+    constexpr auto S=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,U=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    std::vector<uint32_t> pixels(32,0xff804020u);
+    auto source=test::CreateTexture(d.device.Get(),8,4,DXGI_FORMAT_R8G8B8A8_UNORM,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_NONE);
+    auto out=test::CreateTexture(d.device.Get(),8,4,DXGI_FORMAT_R8G8B8A8_UNORM,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    REQUIRE(source&&out&&upload(d,source.Get(),pixels.data(),4,S)&&upload(d,out.Get(),pixels.data(),4,U));
+    wchar_t temp[MAX_PATH]{},dir[MAX_PATH]{};REQUIRE(GetTempPathW(MAX_PATH,temp));
+    swprintf_s(dir,L"%sNA-HUD-capture-%lu",temp,GetCurrentProcessId());
+    na::capture::j2::Request(1,dir,0);
+    na::capture::j2::Identity id{};id.presentation_only=true;id.evaluation_succeeded=true;id.owns_present=true;id.width=8;id.height=4;
+    na::capture::j2::Planes planes{};planes.color=source.Get();planes.output=out.Get();
+    test::List list;REQUIRE(list.Create(d.device.Get()));
+    auto invalid=id;invalid.presentation_only=false;
+    CHECK(!na::capture::j2::RecordEvaluation(list.list.Get(),planes,invalid)); // never fabricate missing evaluation guides
+    const auto token=na::capture::j2::RecordEvaluation(list.list.Get(),planes,id);REQUIRE(token);
+    REQUIRE(SUCCEEDED(list.list->Close()));ID3D12CommandList* lists[]={list.list.Get()};d.queue->ExecuteCommandLists(1,lists);
+    na::capture::j2::Submitted(token,d.queue.Get(),1);d.WaitIdle();na::capture::j2::Shutdown();
+    const auto st=na::capture::j2::GetStats();CHECK(st.written==1&&st.errors==0);
+    const std::wstring base=std::wstring(dir)+L"\\00000-";
+    CHECK(GetFileAttributesW((base+L"color.raw").c_str())!=INVALID_FILE_ATTRIBUTES);
+    CHECK(GetFileAttributesW((base+L"depth.raw").c_str())==INVALID_FILE_ATTRIBUTES);
+    FILE* f=nullptr;REQUIRE(_wfopen_s(&f,(base+L"meta.json").c_str(),L"rb")==0&&f);
+    char text[16384]{};std::fread(text,1,sizeof(text)-1,f);std::fclose(f);
+    CHECK(std::strstr(text,"\"capture_kind\": \"hud_presentation\"")&&std::strstr(text,"\"evaluation_succeeded\": true"));
     return 0;
 }
 int classify(test::Device& d)
@@ -342,11 +416,13 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
 }
 float4 ps() : SV_Target { return color; })";
 enum class Blend { Opaque, Over, Add };
-ComPtr<ID3D12PipelineState> pipeline(ID3D12Device* dev, ID3D12RootSignature* root, ID3DBlob* vs, ID3DBlob* ps, Blend b, DXGI_FORMAT dsv)
+ComPtr<ID3D12PipelineState> pipeline(ID3D12Device* dev, ID3D12RootSignature* root, ID3DBlob* vs, ID3DBlob* ps, Blend b, DXGI_FORMAT dsv,bool vertex_input=false)
 {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = root;
     pd.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+    const D3D12_INPUT_ELEMENT_DESC element{"POSITION",0,DXGI_FORMAT_R32G32_FLOAT,0,0,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0};
+    if(vertex_input)pd.InputLayout={&element,1};
     pd.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
     auto& rt = pd.BlendState.RenderTarget[0];
     rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
@@ -376,6 +452,24 @@ constexpr float kScene[4] = {0.2f, 0.4f, 0.6f, 1.f};
 const Hud kHud[3] = {{Blend::Over, {1.f, 0.2f, 0.1f, 0.6f}, {8, 4, 40, 20}},
                      {Blend::Add, {0.1f, 0.1f, 0.3f, 1.f}, {24, 12, 56, 28}},
                      {Blend::Opaque, {0.9f, 0.9f, 0.9f, 1.f}, {0, 26, 10, 32}}};
+test::Device* native_fixture=nullptr;
+unsigned native_fixture_calls=0;
+bool native_fixture_renderer(ID3D12CommandQueue* queue,ID3D12Resource*,uint32_t,uint32_t,
+                             ID3D12Resource* out,uint32_t,uint32_t,const nh::Layer&,ID3D12CommandList* replay)
+{
+    // Explicit fake reconstruction, real native HUD draws and actual DX12.
+    // Waiting is test-only. This does not qualify DLSS model/image quality.
+    if(!native_fixture)return false;
+    na::observe::HostWorkScope host;
+    ComPtr<ID3D12DescriptorHeap> heap;D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,1,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
+    if(FAILED(native_fixture->device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&heap))))return false;
+    auto rtv=heap->GetCPUDescriptorHandleForHeapStart();native_fixture->device->CreateRenderTargetView(out,nullptr,rtv);
+    test::List seed;if(!seed.Create(native_fixture->device.Get()))return false;
+    auto b=test::Transition(out,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_RENDER_TARGET);seed.list->ResourceBarrier(1,&b);
+    seed.list->ClearRenderTargetView(rtv,kScene,0,nullptr);b=test::Transition(out,D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_PRESENT);seed.list->ResourceBarrier(1,&b);
+    if(FAILED(seed.list->Close()))return false;
+    ID3D12CommandList* work[]={seed.list.Get(),replay};queue->ExecuteCommandLists(2,work);native_fixture->WaitIdle();++native_fixture_calls;return true;
+}
 
 int source_lineage(test::Device& d)
 {
@@ -469,7 +563,7 @@ int canvas_probe(test::Device& d)
     return 0;
 }
 
-int draw_handoff(test::Device& d,bool unresolved=false)
+int draw_handoff(test::Device& d,bool unresolved=false,bool native=false)
 {
     auto* dev=d.device.Get();constexpr UINT W=64,H=32,OW=128,OH=64;constexpr auto F=DXGI_FORMAT_R8G8B8A8_UNORM;
     constexpr auto R=D3D12_RESOURCE_STATE_RENDER_TARGET,S=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,U=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -509,12 +603,23 @@ float4 altered(float4 p:SV_Position):SV_Target{return image.Load(int3(p.xy,0))*.
     auto copy_pso=pipeline(dev,transfer_root.Get(),vs.Get(),ps.Get(),Blend::Opaque,DXGI_FORMAT_UNKNOWN);
     auto process_pso=pipeline(dev,transfer_root.Get(),vs.Get(),processed.Get(),Blend::Opaque,DXGI_FORMAT_UNKNOWN);REQUIRE(copy_pso&&process_pso);
     D3D12_ROOT_PARAMETER color{};color.ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;color.Constants={0,0,4};
-    rd={1,&color,0,nullptr,D3D12_ROOT_SIGNATURE_FLAG_NONE};REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rd,D3D_ROOT_SIGNATURE_VERSION_1,&sig,&err)));
+    rd={1,&color,0,nullptr,native?D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT:D3D12_ROOT_SIGNATURE_FLAG_NONE};REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rd,D3D_ROOT_SIGNATURE_VERSION_1,&sig,&err)));
     REQUIRE(SUCCEEDED(dev->CreateRootSignature(0,sig->GetBufferPointer(),sig->GetBufferSize(),IID_PPV_ARGS(&hud_root))));
     REQUIRE(SUCCEEDED(D3DCompile(kDraw,sizeof kDraw-1,nullptr,nullptr,nullptr,"ps","ps_5_0",0,0,&ps,&err)));
-    auto scene_pso=pipeline(dev,hud_root.Get(),vs.Get(),ps.Get(),Blend::Opaque,DXGI_FORMAT_UNKNOWN);
-    auto hud_pso=pipeline(dev,hud_root.Get(),vs.Get(),ps.Get(),Blend::Over,DXGI_FORMAT_UNKNOWN);
-    auto add_pso=pipeline(dev,hud_root.Get(),vs.Get(),ps.Get(),Blend::Add,DXGI_FORMAT_UNKNOWN);REQUIRE(scene_pso&&hud_pso&&add_pso);
+    if(native){constexpr char vb_code[]="float4 main(float2 p:POSITION):SV_Position{return float4(p,.5,1);}";
+        REQUIRE(SUCCEEDED(D3DCompile(vb_code,sizeof vb_code-1,nullptr,nullptr,nullptr,"main","vs_5_0",0,0,&vs,&err)));}
+    if(unresolved){ComPtr<ID3DBlob> stripped;
+        REQUIRE(SUCCEEDED(D3DStripShader(vs->GetBufferPointer(),vs->GetBufferSize(),D3DCOMPILER_STRIP_REFLECTION_DATA,&stripped)));vs=stripped;
+        stripped.Reset();REQUIRE(SUCCEEDED(D3DStripShader(ps->GetBufferPointer(),ps->GetBufferSize(),D3DCOMPILER_STRIP_REFLECTION_DATA,&stripped)));ps=stripped;}
+    auto scene_pso=pipeline(dev,hud_root.Get(),vs.Get(),ps.Get(),Blend::Opaque,DXGI_FORMAT_UNKNOWN,native);
+    auto hud_pso=pipeline(dev,hud_root.Get(),vs.Get(),ps.Get(),Blend::Over,DXGI_FORMAT_UNKNOWN,native);
+    auto add_pso=pipeline(dev,hud_root.Get(),vs.Get(),ps.Get(),Blend::Add,DXGI_FORMAT_UNKNOWN,native);REQUIRE(scene_pso&&hud_pso&&add_pso);
+    auto vertices=test::CreateBuffer(dev,24,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+    auto indices=test::CreateBuffer(dev,12,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);REQUIRE(vertices&&indices);
+    void* mapped=nullptr;REQUIRE(SUCCEEDED(vertices->Map(0,nullptr,&mapped)));const float xy[]={-1,-1,-1,3,3,-1};std::memcpy(mapped,xy,sizeof xy);vertices->Unmap(0,nullptr);
+    REQUIRE(SUCCEEDED(indices->Map(0,nullptr,&mapped)));const UINT ids[]={0,1,2};std::memcpy(mapped,ids,sizeof ids);indices->Unmap(0,nullptr);
+    const D3D12_VERTEX_BUFFER_VIEW vb{vertices->GetGPUVirtualAddress(),24,8};const D3D12_INDEX_BUFFER_VIEW ib{indices->GetGPUVirtualAddress(),12,DXGI_FORMAT_R32_UINT};
+    if(native){native_fixture=&d;nh::SetPreHudRendererForTests(&native_fixture_renderer);}
     ComPtr<ID3D12QueryHeap> query;D3D12_QUERY_HEAP_DESC qd{};qd.Type=D3D12_QUERY_HEAP_TYPE_OCCLUSION;qd.Count=1;
     REQUIRE(SUCCEEDED(dev->CreateQueryHeap(&qd,IID_PPV_ARGS(&query))));
     test::List game;REQUIRE(game.Create(dev));REQUIRE(SUCCEEDED(game.list->Close()));
@@ -525,13 +630,28 @@ float4 altered(float4 p:SV_Position):SV_Target{return image.Load(int3(p.xy,0))*.
         std::printf("draw handoff frame=%u found=%d picture=%d clean=%d\n",frame,found,!!layer.picture,layer.clean_allowed);
         if(unresolved)std::printf("canvas replay: %s\n",nh::StatusLine().c_str());
         if(layer.probe){
-            test::List probe;REQUIRE(probe.Create(dev));auto barrier=test::Transition(shown,R,S);probe.list->ResourceBarrier(1,&barrier);
-            REQUIRE(layer.probe->Probe(probe.list.Get(),shown,F));barrier=test::Transition(shown,S,R);probe.list->ResourceBarrier(1,&barrier);
+            const auto state=native?D3D12_RESOURCE_STATE_PRESENT:R;
+            test::List probe;REQUIRE(probe.Create(dev));auto barrier=test::Transition(shown,state,S);probe.list->ResourceBarrier(1,&barrier);
+            REQUIRE(layer.probe->Probe(probe.list.Get(),shown,F));barrier=test::Transition(shown,S,state);probe.list->ResourceBarrier(1,&barrier);
             REQUIRE(SUCCEEDED(probe.list->Close()));ID3D12CommandList* lists[]={probe.list.Get()};d.queue->ExecuteCommandLists(1,lists);d.WaitIdle();
             bool identity=false,clean=false;REQUIRE(layer.probe->ProofAfterCompletion(identity,clean));CHECK(identity);
             nh::ReportCanvasProbe(layer.probe_source,layer.probe_generation,identity);
         }
         if(frame<(unresolved?2u:3u)||frame==6){CHECK(!found);return 0;}REQUIRE(found&&layer.picture&&layer.owner);CHECK(layer.clean_allowed==(frame!=5));
+        if(native){
+            REQUIRE(layer.native_picture&&layer.native_check);
+            auto out=test::CreateTexture(dev,OW,OH,F,U,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);REQUIRE(out);
+            test::List finish;REQUIRE(finish.Create(dev));auto barrier=test::Transition(shown,D3D12_RESOURCE_STATE_PRESENT,S);finish.list->ResourceBarrier(1,&barrier);
+            REQUIRE(layer.picture->PresentNative(finish.list.Get(),shown,F,layer.native_picture,layer.native_check,out.Get()));
+            barrier=test::Transition(shown,S,D3D12_RESOURCE_STATE_PRESENT);finish.list->ResourceBarrier(1,&barrier);REQUIRE(SUCCEEDED(finish.list->Close()));
+            ID3D12CommandList* work[]={finish.list.Get()};d.queue->ExecuteCommandLists(1,work);d.WaitIdle();
+            bool identity=false,clean=false;REQUIRE(layer.picture->ProofAfterCompletion(identity,clean));CHECK(identity==(frame!=4));CHECK(clean==identity);
+            std::vector<uint8_t> pixels,original;REQUIRE(readback(d,out.Get(),U,4,pixels));
+            REQUIRE(readback(d,shown,D3D12_RESOURCE_STATE_PRESENT,4,original));
+            CHECK(frame==4?std::abs(int(pixels[(20*OW+40)*4])-int(original[(10*W+20)*4]))<=1:pixels[(20*OW+40)*4]>=170);
+            if(frame!=4)CHECK(std::abs(int(pixels[(OH-2)*OW*4])-51)<=1);
+            nh::ReportNativePictureResult(identity);return 0;
+        }
         std::vector<uint8_t> pixels;REQUIRE(readback(d,shown,R,4,pixels));CHECK(pixels[(10*W+20)*4]>(frame==4?125:160));
         std::vector<float> mv(W*H*2,0);auto motion=test::CreateTexture(dev,W,H,DXGI_FORMAT_R32G32_FLOAT,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         REQUIRE(motion&&upload(d,motion.Get(),mv.data(),8,S));
@@ -548,27 +668,40 @@ float4 altered(float4 p:SV_Position):SV_Target{return image.Load(int3(p.xy,0))*.
         if(frame==3){REQUIRE(readback(d,layer.picture->Input(),S,8,pixels));uint16_t red=0;std::memcpy(&red,pixels.data()+(10*W+20)*8,2);CHECK(std::abs(half_value(red)-.2f)<.002f);}
         return 0;
     };
+    bool presented[2]{};
     for(UINT frame=0;frame<8;++frame){
         na::nr::native::Reset(game.list.Get());REQUIRE(SUCCEEDED(game.alloc->Reset()));REQUIRE(SUCCEEDED(game.list->Reset(game.alloc.Get(),nullptr)));
         auto* l=game.list.Get();l->OMSetRenderTargets(1,&a,FALSE,nullptr);l->SetGraphicsRootSignature(hud_root.Get());l->SetPipelineState(scene_pso.Get());
         l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);l->RSSetViewports(1,&vp);l->RSSetScissorRects(1,&all);
+        if(native){l->IASetVertexBuffers(0,1,&vb);l->IASetIndexBuffer(&ib);}
         const float different[4]={.4f,.1f,.2f,1.f};
-        l->SetGraphicsRoot32BitConstants(0,4,frame==4?different:kScene,0);l->DrawInstanced(3,1,0,0);
+        l->SetGraphicsRoot32BitConstants(0,4,frame==4?different:kScene,0);
+        if(native)l->DrawIndexedInstanced(3,1,0,0,0);else l->DrawInstanced(3,1,0,0);
         if(frame==6)l->BeginQuery(query.Get(),D3D12_QUERY_TYPE_BINARY_OCCLUSION,0);
         l->SetPipelineState(frame==5?add_pso.Get():hud_pso.Get());l->RSSetScissorRects(1,&hud);l->SetGraphicsRoot32BitConstants(0,4,hc,0);
         if(frame==6){na::observe::DrawInfo info;REQUIRE(na::observe::ListDrawState(l,info));CHECK(info.query_active&&info.shader_readonly);}
-        l->DrawInstanced(3,1,0,0);
+        if(native)l->DrawIndexedInstanced(3,1,0,0,0);else l->DrawInstanced(3,1,0,0);
         if(frame==6){l->EndQuery(query.Get(),D3D12_QUERY_TYPE_BINARY_OCCLUSION,0);na::observe::DrawInfo info;REQUIRE(na::observe::ListDrawState(l,info));CHECK(!info.query_active);}
         auto t=test::Transition(upstream.Get(),R,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);l->ResourceBarrier(1,&t);
+        if(native&&presented[frame==4?1:0]){t=test::Transition(frame==4?target2.Get():target.Get(),D3D12_RESOURCE_STATE_PRESENT,R);l->ResourceBarrier(1,&t);}
         l->OMSetRenderTargets(1,frame==4?&b2:&b,FALSE,nullptr);l->SetGraphicsRootSignature(transfer_root.Get());l->SetPipelineState(frame==4?process_pso.Get():copy_pso.Get());
         ID3D12DescriptorHeap* heaps[]={heap.Get()};l->SetDescriptorHeaps(1,heaps);l->SetGraphicsRootDescriptorTable(0,heap->GetGPUDescriptorHandleForHeapStart());
         l->RSSetViewports(1,&vp);l->RSSetScissorRects(1,&all);l->DrawInstanced(3,1,0,0);
         t=test::Transition(upstream.Get(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,R);l->ResourceBarrier(1,&t);
+        if(native){t=test::Transition(frame==4?target2.Get():target.Get(),R,D3D12_RESOURCE_STATE_PRESENT);l->ResourceBarrier(1,&t);presented[frame==4?1:0]=true;}
         REQUIRE(SUCCEEDED(l->Close()));ID3D12CommandList* lists[]={l};{na::nr::native::Submission submitted(d.queue.Get(),1,lists);d.queue->ExecuteCommandLists(1,lists);}d.WaitIdle();
+        if(native){
+            // An unrelated batch cannot licence replay of old game buffers.
+            test::List unrelated;REQUIRE(unrelated.Create(dev));REQUIRE(SUCCEEDED(unrelated.list->Close()));
+            ID3D12CommandList* other[]={unrelated.list.Get()};const auto before=native_fixture_calls;
+            nh::AfterSubmission(d.queue.Get(),1,other);CHECK(native_fixture_calls==before);
+            nh::AfterSubmission(d.queue.Get(),1,lists);
+        }
         if(frame==3)continue; // render-ahead: the next source reuses its resource before this Present
         if(frame==4){if(validate(target.Get(),3)||validate(target2.Get(),4))return 1;}
         else if(validate(target.Get(),frame))return 1;
     }
+    if(native){CHECK(native_fixture_calls>=5);native_fixture=nullptr;nh::SetPreHudRendererForTests(nullptr);}
     return 0;
 }
 
@@ -933,7 +1066,7 @@ int end_to_end(test::Device& d)
         REQUIRE(readback(d, proxy2.Get(), RTS, 4, px));
         CHECK(std::abs(at(px, RW, 24, 12, 0) - 51) <= 1);   // the back buffer got the scene only
     }
-    if(source_lineage(d)||draw_handoff(d)||draw_handoff(d,true))return 1;
+    if(source_lineage(d)||draw_handoff(d)||draw_handoff(d,true)||draw_handoff(d,true,true))return 1;
     na_observe_stop();
     return 0;
 }
@@ -954,8 +1087,10 @@ int main()
     if (jitter_evidence(d)) return 1;
     if (classify(d)) return 1;
     if (picture_paths(d)) return 1;
+    if (native_picture_phases(d)) return 1;
     if (canvas_probe(d)) return 1;
     if (end_to_end(d)) return 1;
+    if (native_capture(d)) return 1;
     if(info){UINT errors=0;for(UINT64 i=0;i<info->GetNumStoredMessagesAllowedByRetrievalFilter();++i){
         SIZE_T bytes=0;info->GetMessage(i,nullptr,&bytes);std::vector<uint8_t> data(bytes);auto* message=reinterpret_cast<D3D12_MESSAGE*>(data.data());
         if(SUCCEEDED(info->GetMessage(i,message,&bytes))&&message->Severity<=D3D12_MESSAGE_SEVERITY_ERROR){++errors;std::printf("DX12 ERROR: %s\n",message->pDescription);}
