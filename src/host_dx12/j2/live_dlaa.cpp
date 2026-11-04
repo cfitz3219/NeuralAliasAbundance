@@ -455,17 +455,20 @@ bool debug_init()
     pd.pRootSignature = g_dbg.root.Get();
     pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
     if (FAILED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_dbg.pso)))) return false;
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRing * 3, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    // Slots 0..kRing-1: the in-frame DLAA evaluation; kRing..2*kRing-1: render-small's DLSS at Present.
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRing * 2 * 3, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     if (FAILED(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_dbg.heap)))) return false;
     g_dbg.inc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     g_dbg.ok = true;
     return true;
 }
-// Writes the debug picture into g.output (UNORDERED_ACCESS); motion and depth32 are readable (NPSR).
-bool debug_record(ID3D12GraphicsCommandList* l, int mode, DXGI_FORMAT out_format)
+// Writes the debug picture into `out` (UNORDERED_ACCESS, ow x oh); motion and depth32 (rw x rh)
+// are readable (NPSR). slot < 2 * kRing (see debug_init).
+bool debug_record(ID3D12GraphicsCommandList* l, int mode, ID3D12Resource* out, DXGI_FORMAT out_format, uint32_t ow, uint32_t oh,
+                  uint32_t rw, uint32_t rh, uint32_t slot)
 {
-    if (!debug_init()) return false;
-    const UINT base = g.slot * 3;
+    if (!debug_init() || !out || slot >= 2 * kRing) return false;
+    const UINT base = slot * 3;
     D3D12_CPU_DESCRIPTOR_HANDLE c = g_dbg.heap->GetCPUDescriptorHandleForHeapStart();
     c.ptr += static_cast<SIZE_T>(base) * g_dbg.inc;
     D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
@@ -481,7 +484,7 @@ bool debug_record(ID3D12GraphicsCommandList* l, int mode, DXGI_FORMAT out_format
     D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
     uv.Format = out_format;
     uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    g.device->CreateUnorderedAccessView(g.output.Get(), nullptr, &uv, c);
+    g.device->CreateUnorderedAccessView(out, nullptr, &uv, c);
     D3D12_GPU_DESCRIPTOR_HANDLE gh = g_dbg.heap->GetGPUDescriptorHandleForHeapStart();
     gh.ptr += static_cast<UINT64>(base) * g_dbg.inc;
     ID3D12DescriptorHeap* heaps[] = {g_dbg.heap.Get()};
@@ -490,10 +493,10 @@ bool debug_record(ID3D12GraphicsCommandList* l, int mode, DXGI_FORMAT out_format
     l->SetPipelineState(g_dbg.pso.Get());
     l->SetComputeRootDescriptorTable(0, gh);
     const float scale = mode == 2 ? 5.0f : 0.25f;
-    uint32_t k[6] = {static_cast<uint32_t>(mode), 0, g.ow, g.oh, g.rw, g.rh};
+    uint32_t k[6] = {static_cast<uint32_t>(mode), 0, ow, oh, rw, rh};
     std::memcpy(&k[1], &scale, 4);
     l->SetComputeRoot32BitConstants(1, 6, k, 0);
-    l->Dispatch((g.ow + 7) / 8, (g.oh + 7) / 8, 1);
+    l->Dispatch((ow + 7) / 8, (oh + 7) / 8, 1);
     return true;
 }
 
@@ -2305,7 +2308,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         if (dv >= 1 && dv <= 3) {
             b.push_back(uav_barrier(g.output.Get()));
             flush(l, b);
-            debug_record(l, dv, cf); // replaces the DLAA result with the debug picture
+            debug_record(l, dv, g.output.Get(), cf, g.ow, g.oh, g.rw, g.rh, g.slot); // replaces the DLAA result with the debug picture
         } else if (const uint32_t pct = 2u * na::settings::Get().j2_sharpness.load(std::memory_order_relaxed)) {
             // RCAS: output -> sharp, then back into output so the write-back path is unchanged.
             b.push_back(uav_barrier(g.output.Get()));
@@ -3525,8 +3528,23 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         // HUD protection: DLSS trusts this frame's colour where the learned mask says HUD.
         e.bias_current_color = hud_mask ? g_small.mask.Get() : nullptr;
         dlss = na::dlss::Evaluate(l, e);
+        // Debug view (Cort 2026-11-04: the views showed nothing in render-small, where DLSS runs
+        // here and the in-frame path that drew them no longer evaluates): replace the picture with
+        // the motion/depth view, then skip sharpening and the HUD so the view is what you see.
+        const int dv = dlss ? g_debug_view.load(std::memory_order_relaxed) : 0;
+        bool debug_shown = false;
+        if (dv >= 1 && dv <= 3) {
+            b.push_back(uav_barrier(out));
+            flush(l, b);
+            debug_shown = debug_record(l, dv, out, of, ow, oh, rw, rh, kRing + si);
+            if (debug_shown) b.push_back(uav_barrier(out));
+        }
         add(b, g.motion.Get(), NPSR, UAV);
-        if (dlss) {
+        if (dlss && debug_shown) {
+            g.small_last = d.frame;
+            g.small_ow = ow; g.small_oh = oh; g.small_rw = rw; g.small_rh = rh;
+            flush(l, b);
+        } else if (dlss) {
             g.small_last = d.frame;
             g.small_ow = ow; g.small_oh = oh; g.small_rw = rw; g.small_rh = rh;
             // After DLSS: RCAS on the picture (menu 0..100 = RCAS 0..200), then the HUD from
