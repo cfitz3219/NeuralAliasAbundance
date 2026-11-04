@@ -192,9 +192,26 @@ int Run(const Session& s)
         if (const char* why = Validate(f, s.limits, expected)) { Report(HelperState::Failed, why); code = 13; break; }
 
         // Reuse an allocator only once the GPU finished with it (helper-side wait).
+        // Resetting an allocator the GPU still uses would remove the device, so
+        // never reset on a timeout: the game stopped feeding its fence (hung,
+        // paused on a modal dialog for too long, or its device was lost), and
+        // the bridge shows its last good frame in the meantime.
         if (own->GetCompletedValue() < alloc_value[slot]) {
             own->SetEventOnCompletion(alloc_value[slot], own_event.get());
-            WaitForSingleObject(own_event.get(), 1000);
+            HANDLE ws[3] = {own_event.get(), stop.get(), parent.get()};
+            const DWORD aw = WaitForMultipleObjects(3, ws, FALSE, 10000);
+            if (aw != WAIT_OBJECT_0) {
+                if (aw == WAIT_TIMEOUT) {
+                    Report(HelperState::Failed, "The helper's earlier frame never finished on the GPU (the game stopped signalling its inputs).");
+                    code = 16;
+                }
+                break;
+            }
+        }
+        if (FAILED(device->GetDeviceRemovedReason())) {
+            Report(HelperState::Failed, "The helper's DX12 device was lost (driver reset or GPU removed).");
+            code = 17;
+            break;
         }
         alloc[slot]->Reset();
         list->Reset(alloc[slot].Get(), nullptr);

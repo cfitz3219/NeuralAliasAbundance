@@ -18,8 +18,13 @@
 //
 // Misses never fall back to plain DLAA or to the game's own image: when a
 // frame's result is late, the last good result is shown again (Cort's rule,
-// 2026-11-03). The game's own state is preserved: all bridge drawing goes
-// through a deferred context replayed with state restore.
+// 2026-11-03). The game's own state is preserved: everything the bridge does
+// on the game's context (copies, draws, and in-process DLSS itself) runs inside
+// its own swapped-in context state (ID3D11DeviceContext1::SwapDeviceContextState),
+// so it works on single-threaded devices too and nothing leaks back.
+//
+// Robustness review against a Dunia-engine game (Far Cry 5 / New Dawn) is in
+// docs/DX11-BRIDGE.md ("What could break it").
 #pragma once
 
 #include "bridge/frame_record.hpp"
@@ -27,6 +32,7 @@
 #include <d3d11.h>
 
 #include <memory>
+#include <mutex>
 #include <string>
 
 namespace na::bridge {
@@ -51,7 +57,8 @@ struct Config {
     Backend backend = Backend::Auto;
     WaitMode wait = WaitMode::Gpu;
     std::wstring helper_path; // na_bridge_helper64.exe (Helper backend)
-    std::wstring data_path;   // writable folder for NGX logs/cache
+    std::wstring data_path;   // writable folder for NGX logs/cache; empty = %LOCALAPPDATA%/NeuralAlias/bridge
+                              // (game folders under Program Files are often read-only)
     uint32_t submit_deadline_ms = 20;  // Gpu mode: helper must queue its work by then
     uint32_t output_deadline_ms = 100; // CpuDeadline mode: result must be done by then
     uint32_t startup_deadline_ms = 15000;
@@ -60,19 +67,27 @@ struct Config {
     bool copy_test = false;
 };
 
-// This frame's inputs. Views are 2D, single-sample, at least render size.
-// Colour: any float/unorm colour format. Depth: R32_FLOAT, R24_UNORM_X8 or
-// R16_UNORM views (red channel). Motion: two-channel float.
+// This frame's inputs, each given EITHER as a shader view OR as the raw
+// texture (for textures the game made without shader access, such as most
+// back buffers and many depth buffers: the bridge then copies them into its
+// own readable texture, picking the right view format for typeless and depth
+// formats). Textures are 2D, at least render size. Colour may be multisampled
+// (it is resolved); depth and motion may not.
+// Colour: any float/unorm colour format, sRGB or not. Depth: any depth format
+// (D16, D24S8, D32, D32S8) or its red-channel view. Motion: two-channel.
 struct Inputs {
     ID3D11ShaderResourceView* color = nullptr;
     ID3D11ShaderResourceView* depth = nullptr;
     ID3D11ShaderResourceView* motion = nullptr;
+    ID3D11Resource* color_texture = nullptr;  // used when `color` is null
+    ID3D11Resource* depth_texture = nullptr;  // used when `depth` is null
+    ID3D11Resource* motion_texture = nullptr; // used when `motion` is null
 };
 
 enum class Result {
     Ok,        // target holds this frame's DLSS result
     Repeated,  // late result: target holds the last good result again
-    NotReady,  // still starting (or no good result yet): target untouched
+    NotReady,  // still starting, no good result yet, or NeedsRestart(): target untouched
     Failed,    // stopped for good; see Reason()
 };
 const char* ResultName(Result r);
@@ -96,6 +111,9 @@ public:
 
     Backend ActiveBackend() const;  // Auto resolves to one of the two once started
     const char* Reason() const;     // last failure or refusal, plain language ("" when none)
+    // The game changed size (resize, Alt-Tab, resolution change) or its device
+    // was replaced: Stop() and Start() again with the new sizes/context.
+    bool NeedsRestart() const;
     double LastWaitMs() const;      // CPU time the last Process spent waiting
     uint64_t Frames() const;        // results delivered (Ok)
     uint64_t Repeats() const;       // late frames shown as the last good result
@@ -103,6 +121,7 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    mutable std::mutex lock_; // hooks may call from the render thread and the present thread
 };
 
 } // namespace na::bridge
