@@ -506,6 +506,71 @@ int end_to_end(test::Device& d)
     CHECK(at(px, OW, 80, 40, 0) == 0 && at(px, OW, 5, 3, 0) == 0);                                   // outside: nothing
     REQUIRE(readback(d, proxy.Get(), RTS, 4, px));
     CHECK(std::abs(at(px, RW, 50, 25, 0) - 51) <= 1); // the proxy keeps the picture (the text went native)
+
+    // H1b: the game composes its picture and HUD in an intermediate target X and hands it to the
+    // back buffer with one CopyResource. X is learned from that structure (3 frames with no HUD
+    // in the back buffer itself), then its HUD draws go native and the copy carries the scene only.
+    {
+        auto proxy2 = test::CreateTexture(dev, RW, RH, F, RTS, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        auto x = test::CreateTexture(dev, RW, RH, F, RTS, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        REQUIRE(proxy2 && x);
+        D3D12_DESCRIPTOR_HEAP_DESC xd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        ComPtr<ID3D12DescriptorHeap> xh;
+        REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&xd, IID_PPV_ARGS(&xh))));
+        const D3D12_CPU_DESCRIPTOR_HANDLE xrtv = xh->GetCPUDescriptorHandleForHeapStart();
+        dev->CreateRenderTargetView(x.Get(), nullptr, xrtv);
+        nh::Layer lx;
+        CHECK(!nh::TakeFrame(proxy2.Get(), RW, RH, OW, OH, &lx)); // learns the back buffer
+        const Hud& h = kHud[0]; // "over" blend, 8,4-40,20
+        bool got_last = false;
+        nh::Layer last{};
+        for (int frame = 0; frame < 4; ++frame) {
+            REQUIRE(SUCCEEDED(l->Reset(game.alloc.Get(), nullptr)));
+            l->SetGraphicsRootSignature(root.Get());
+            l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            l->OMSetRenderTargets(1, &xrtv, FALSE, nullptr);
+            l->RSSetViewports(1, &full);
+            l->RSSetScissorRects(1, &all);
+            l->SetPipelineState(plain[0].Get());
+            l->SetGraphicsRoot32BitConstants(0, 4, kScene, 0);
+            l->DrawInstanced(3, 1, 0, 0); // scene composite into X
+            const D3D12_RECT r{h.rect[0], h.rect[1], h.rect[2], h.rect[3]};
+            l->RSSetScissorRects(1, &r);
+            l->SetPipelineState(plain[int(h.blend)].Get());
+            l->SetGraphicsRoot32BitConstants(0, 4, h.color, 0);
+            l->DrawInstanced(3, 1, 0, 0); // HUD into X
+            D3D12_RESOURCE_BARRIER tb[2]{};
+            for (int i = 0; i < 2; ++i) {
+                tb[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                tb[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            }
+            tb[0].Transition.pResource = x.Get(); tb[0].Transition.StateBefore = RTS; tb[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            tb[1].Transition.pResource = proxy2.Get(); tb[1].Transition.StateBefore = RTS; tb[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+            l->ResourceBarrier(2, tb);
+            l->CopyResource(proxy2.Get(), x.Get()); // the hand-off
+            for (auto& t : tb) std::swap(t.Transition.StateBefore, t.Transition.StateAfter);
+            l->ResourceBarrier(2, tb);
+            REQUIRE(SUCCEEDED(l->Close()));
+            d.queue->ExecuteCommandLists(1, lists);
+            d.WaitIdle();
+            CHECK(dev->GetDeviceRemovedReason() == S_OK);
+            const bool got = nh::TakeFrame(proxy2.Get(), RW, RH, OW, OH, &lx);
+            std::printf("native HUD upstream frame %d: layer=%d %s\n", frame, got ? 1 : 0, nh::StatusLine().c_str());
+            if (frame < 3) CHECK(!got);
+            else { got_last = got; last = lx; }
+        }
+        const nh::Stats su = nh::GetStats();
+        CHECK(su.upstream_learned == 1);
+        CHECK(su.upstream_now == 1);
+        CHECK(su.upstream_frames == 1);
+        CHECK(got_last);
+        REQUIRE(got_last && last.n0);
+        REQUIRE(readback(d, last.n0, RTS, 4, px));
+        CHECK(std::abs(at(px, OW, 36, 18, 0) - 153) <= 1);  // the HUD, native, over black (render 24,12)
+        CHECK(at(px, OW, 80, 40, 0) == 0);                    // outside it: nothing
+        REQUIRE(readback(d, proxy2.Get(), RTS, 4, px));
+        CHECK(std::abs(at(px, RW, 24, 12, 0) - 51) <= 1);   // the back buffer got the scene only
+    }
     na_observe_stop();
     return 0;
 }

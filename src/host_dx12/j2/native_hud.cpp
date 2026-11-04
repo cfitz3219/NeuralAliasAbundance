@@ -41,6 +41,13 @@ struct Proxy {
     DXGI_FORMAT view = DXGI_FORMAT_UNKNOWN;
     uint32_t scene = 0, redirected = 0, forwarded = 0;
     uint32_t depth_draws = 0, blended = 0, covered = 0, world = 0, masks = 0; // of `redirected`: with a depth target / with RT0 blending
+    // H1b (COMMS b07e083 / Astra 16bbca8): an UPSTREAM target is one the game composes the whole
+    // picture in (scene composite, then its HUD) before handing it to the back buffer in one
+    // full-screen copy or draw. It is learned from structure and then handled exactly like the
+    // back buffer: its HUD draws go to the native layers, so the copy carries the scene only.
+    bool upstream = false;
+    na_object_id source = 0;     // this frame: the single picture-sized input of the opaque full-screen hand-off into this proxy
+    bool source_ambiguous = false;
 };
 struct Clear { D3D12_CLEAR_FLAGS flags = D3D12_CLEAR_FLAG_DEPTH; float depth = 1.f; uint8_t stencil = 0; };
 struct Layers {
@@ -70,6 +77,11 @@ std::vector<Grave> g_grave;
 std::unordered_map<na_object_id, Clear> g_clears;            // the game's last depth clear per target
 std::unordered_map<na_object_id, D3D12_RESOURCE_DESC> g_ds;  // depth targets' descriptions
 Stats g_stats;
+// H1b learning: the hand-off source seen on consecutive presented frames without any HUD of its own.
+struct Candidate { na_object_id id = 0; uint32_t frames = 0; } g_cand;
+constexpr uint32_t kPromoteFrames = 3, kDemoteFrames = 120;
+uint32_t g_upstream_missing = 0; // presents in a row whose hand-off no longer came from the upstream
+bool g_layers_cleared = false;    // this frame's layers were cleared (by the back buffer or its upstream: once, never between them)
 
 // The bind the recording thread made last (set by the raster listener, read by the draw hook).
 struct Bind { ID3D12GraphicsCommandList* list = nullptr; uint64_t recording = 0; na_object_id proxy = 0, mask_ds = 0; };
@@ -251,6 +263,31 @@ bool ds_desc_locked(na_object_id id, D3D12_RESOURCE_DESC* out)
     return true;
 }
 
+// The resource's 2D size and format (0 = unknown).
+bool dims(na_object_id id, uint32_t* w, uint32_t* h, DXGI_FORMAT* f)
+{
+    ComPtr<ID3D12Resource> r;
+    r.Attach(na::observe::AcquireResource(id));
+    if (!r) return false;
+    const D3D12_RESOURCE_DESC d = r->GetDesc();
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return false;
+    *w = static_cast<uint32_t>(d.Width); *h = d.Height; *f = d.Format;
+    return true;
+}
+// H1b: an opaque full-screen draw into a back buffer before its HUD: note the one picture-sized
+// texture it reads (more than one = a composite of several inputs, not a hand-off: no source).
+void note_source_locked(Proxy& p, const na_object_id* srvs, uint32_t n)
+{
+    if (p.upstream) return;
+    na_object_id one = 0;
+    uint32_t matches = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint32_t w = 0, h = 0; DXGI_FORMAT f{};
+        if (srvs[i] != p.id && dims(srvs[i], &w, &h, &f) && w == p.rw && h == p.rh) { one = srvs[i]; ++matches; }
+    }
+    if (matches == 1 && !p.source_ambiguous) p.source = p.source && p.source != one ? (p.source_ambiguous = true, 0) : one;
+    else if (matches > 1) { p.source = 0; p.source_ambiguous = true; }
+}
 void note_forward_locked(Proxy& p, const char* why)
 {
     ++p.forwarded;
@@ -359,6 +396,11 @@ na::observe::ShaderScope redirect(ID3D12GraphicsCommandList* l, na::observe::Sha
         if (shaped) {
             ++p->scene;
             ++g_stats.scene_draws;
+            if (!p->upstream) {
+                na_object_id srv[16];
+                const uint32_t n = na::observe::ListCurrentGraphicsSrvs(l, srv, 16);
+                note_source_locked(*p, srv, n);
+            }
             return {};
         }
         p->hud = true;
@@ -406,10 +448,13 @@ na::observe::ShaderScope redirect(ID3D12GraphicsCommandList* l, na::observe::Sha
     const float sx = float(p->ow) / float(p->rw), sy = float(p->oh) / float(p->rh);
     // Everything below is recorded into the game's list (host work, not observed).
     if (!p->cleared) {
-        const float grey = stored_grey(g_l.typeless);
-        const float black[4] = {0.f, 0.f, 0.f, 1.f}, back[4] = {grey, grey, grey, 1.f};
-        l->ClearRenderTargetView(clear_rtv_locked(0), black, 0, nullptr);
-        l->ClearRenderTargetView(clear_rtv_locked(1), back, 0, nullptr);
+        if (!g_layers_cleared) {
+            const float grey = stored_grey(g_l.typeless);
+            const float black[4] = {0.f, 0.f, 0.f, 1.f}, back[4] = {grey, grey, grey, 1.f};
+            l->ClearRenderTargetView(clear_rtv_locked(0), black, 0, nullptr);
+            l->ClearRenderTargetView(clear_rtv_locked(1), back, 0, nullptr);
+            g_layers_cleared = true;
+        }
         p->cleared = true;
         p->view = view;
     }
@@ -467,6 +512,20 @@ class ClearHook final : public na::observe::TextureOperationHook {
 public:
     na::observe::ShaderScope Before(ID3D12GraphicsCommandList* l, const na::observe::TextureCall& c) noexcept override
     {
+        if ((c.kind == na::observe::TextureKind::Copy || c.kind == na::observe::TextureKind::CopyRegion) && c.destination && c.source) {
+            // H1b: a whole-picture copy into a back buffer is a hand-off from its source.
+            const na_object_id dst = na::observe::IdOf(c.destination), src = na::observe::IdOf(c.source);
+            std::lock_guard<std::mutex> lock(g_m);
+            Proxy* p = find_locked(dst);
+            if (p && !p->upstream && src && (c.kind == na::observe::TextureKind::Copy || (!c.box && !c.x && !c.y))) {
+                uint32_t w = 0, h = 0; DXGI_FORMAT f{};
+                if (dims(src, &w, &h, &f) && w == p->rw && h == p->rh) {
+                    if (p->source && p->source != src) { p->source = 0; p->source_ambiguous = true; }
+                    else if (!p->source_ambiguous) p->source = src;
+                }
+            }
+            return {};
+        }
         if (!c.target_id || (c.kind != na::observe::TextureKind::ClearDepth && c.kind != na::observe::TextureKind::ClearColor)) return {};
         std::lock_guard<std::mutex> lock(g_m);
         if (c.kind == na::observe::TextureKind::ClearDepth) {
@@ -578,13 +637,14 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
     const na_object_id id = na::observe::IdOf(frame);
     std::lock_guard<std::mutex> lock(g_m);
     ++g_frame;
+    g_layers_cleared = false; // the frame that presents now is complete
     g_grave.erase(std::remove_if(g_grave.begin(), g_grave.end(), [](const Grave& g) { return g.frame + kGraveFrames < g_frame; }), g_grave.end());
     if (!id) return false;
     Proxy* p = find_locked(id);
     if (!p || p->rw != rw || p->rh != rh || p->ow != ow || p->oh != oh) {
-        if (!p) { // learn it, replacing the proxy presented longest ago
+        if (!p) { // learn it, replacing the proxy presented longest ago (never the upstream)
             p = &g_proxy[0];
-            for (auto& q : g_proxy) if (q.used < p->used) p = &q;
+            for (auto& q : g_proxy) if (!q.upstream && q.used < p->used) p = &q;
         }
         *p = Proxy{};
         p->id = id; p->rw = rw; p->rh = rh; p->ow = ow; p->oh = oh;
@@ -593,7 +653,59 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
         return false;
     }
     p->used = g_frame;
-    const bool hud = g_on.load() && p->cleared && p->redirected > 0 && g_l.n[0] && g_l.w == ow && g_l.h == oh;
+    // H1b: the upstream picture for this output (handled like the back buffer), and learning.
+    Proxy* u = nullptr;
+    for (auto& q : g_proxy) if (q.id && q.upstream && q.ow == ow && q.oh == oh && q.rw == rw && q.rh == rh) { u = &q; break; }
+    if (u) {
+        u->used = g_frame;
+        if (p->source == u->id || u->redirected > 0) g_upstream_missing = 0;
+        else if (++g_upstream_missing >= kDemoteFrames) { // the structure changed: learn again
+            ++g_stats.upstream_dropped;
+            *u = Proxy{};
+            u = nullptr;
+            g_upstream_missing = 0;
+        }
+    } else if (g_on.load() && p->redirected == 0 && p->source && !p->source_ambiguous) {
+        if (g_cand.id == p->source) ++g_cand.frames; else g_cand = {p->source, 1};
+        if (g_cand.frames >= kPromoteFrames) {
+            uint32_t w = 0, h = 0; DXGI_FORMAT f{};
+            if (!dims(g_cand.id, &w, &h, &f)) std::snprintf(g_stats.upstream_why, sizeof g_stats.upstream_why, "candidate gone");
+            else if (TypelessOf(f) == DXGI_FORMAT_UNKNOWN || TypelessOf(f) != TypelessOf(p->format))
+                // A format change in the hand-off is a colour transformation, not a copy: laying the
+                // upstream HUD over the final picture would be wrong (Astra 16bbca8 point 4).
+                std::snprintf(g_stats.upstream_why, sizeof g_stats.upstream_why, "hand-off changes format %u->%u", unsigned(f), unsigned(p->format));
+            else {
+                Proxy* slot = &g_proxy[0];
+                for (auto& q : g_proxy) if (q.id != p->id && !q.upstream && q.used < slot->used) slot = &q;
+                *slot = Proxy{};
+                slot->id = g_cand.id; slot->upstream = true;
+                slot->rw = rw; slot->rh = rh; slot->ow = ow; slot->oh = oh; slot->format = f; slot->used = g_frame;
+                ++g_stats.upstream_learned;
+                g_stats.upstream_why[0] = 0;
+            }
+            g_cand = {};
+        }
+    } else if (p->redirected > 0) g_cand = {};
+    g_stats.upstream_now = u ? 1u : 0u;
+    g_stats.last_source = p->source ? 1u : p->source_ambiguous ? 2u : 0u;
+    p->source = 0; p->source_ambiguous = false;
+    bool hud = g_on.load() && p->cleared && p->redirected > 0 && g_l.n[0] && g_l.w == ow && g_l.h == oh;
+    const bool up_hud = !hud && u && g_on.load() && u->cleared && u->redirected > 0 && g_l.n[0] && g_l.w == ow && g_l.h == oh;
+    if (up_hud) {
+        hud = true;
+        ++g_stats.upstream_frames;
+        p->view = u->view;
+        p->redirected = u->redirected; p->forwarded += u->forwarded; p->world += u->world; p->masks += u->masks;
+        p->depth_draws = u->depth_draws; p->blended = u->blended;
+    }
+    if (u) { // the upstream's frame ends with the back buffer's
+        u->hud = u->cleared = false;
+        if (u->mirrored) u->hud_ds = u->mirrored;
+        u->mirrored = 0;
+        if (!up_hud) u->view = DXGI_FORMAT_UNKNOWN;
+        u->scene = u->redirected = u->forwarded = 0;
+        u->depth_draws = u->blended = u->covered = u->world = u->masks = 0;
+    }
     if (hud && out) {
         out->n0 = g_l.n[0].Get();
         out->n1 = g_l.n[1].Get();
@@ -624,14 +736,16 @@ Stats GetStats()
 std::string StatusLine()
 {
     const Stats s = GetStats();
-    char b[512];
+    char b[768];
     std::snprintf(b, sizeof b,
                   "native_hud on=%u frames=%llu hud_frames=%llu scene_draws=%llu redirected=%llu forwarded=%llu restore_failed=%llu "
-                  "covered=%llu world=%llu masks=%llu last_frame=scene:%u,hud:%u,forwarded:%u,depth:%u,blended:%u,covered:%u,world:%u,masks:%u proxy_fmt=%u view_fmt=%u grey=%.4f last_forward=\"%s\"",
+                  "covered=%llu world=%llu masks=%llu last_frame=scene:%u,hud:%u,forwarded:%u,depth:%u,blended:%u,covered:%u,world:%u,masks:%u proxy_fmt=%u view_fmt=%u grey=%.4f last_forward=\"%s\" "
+                  "upstream{now=%u learned=%llu dropped=%llu hud_frames=%llu last_source=%u why=\"%s\"}",
                   Enabled() ? 1u : 0u, (unsigned long long)s.frames, (unsigned long long)s.hud_frames, (unsigned long long)s.scene_draws,
                   (unsigned long long)s.redirected, (unsigned long long)s.forwarded, (unsigned long long)s.restore_failed, (unsigned long long)s.covered, (unsigned long long)s.world, (unsigned long long)s.masks,
                   s.last_scene, s.last_redirected, s.last_forwarded, s.last_depth, s.last_blended, s.last_covered, s.last_world, s.last_masks, s.proxy_format, s.view_format,
-                  double(s.grey), s.last_forward);
+                  double(s.grey), s.last_forward, s.upstream_now, (unsigned long long)s.upstream_learned, (unsigned long long)s.upstream_dropped,
+                  (unsigned long long)s.upstream_frames, s.last_source, s.upstream_why);
     return b;
 }
 

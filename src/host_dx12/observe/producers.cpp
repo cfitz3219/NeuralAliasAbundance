@@ -5120,6 +5120,44 @@ uint32_t ListCurrentGraphicsCbvs(ID3D12CommandList* list, LiveBinding* out, uint
     }
     return n;
 }
+uint32_t ListCurrentGraphicsSrvs(ID3D12CommandList* list, na_object_id* out, uint32_t max)
+{
+    if (!out || !max) return 0;
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return 0;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    const auto signature = g_objs.find(canon(ls->root_sig[0]));
+    if (signature == g_objs.end()) return 0;
+    const auto& params = signature->second.root_params;
+    const auto& ranges = signature->second.root_ranges;
+    uint32_t n = 0;
+    for (size_t p = 0; p < ls->args[0].size() && p < params.size() && n < max; ++p) {
+        const auto& arg = ls->args[0][p];
+        if (arg.type != 1 || params[p].param_type != NA_ROOT_TABLE) continue;
+        uint32_t slot = 0;
+        auto* heap = bound_heap_for_gpu_locked(*ls, arg.value, &slot);
+        if (!heap) continue;
+        bool bound = false;
+        for (uint32_t h = 0; h < ls->nheaps; ++h) bound |= heap->key == ls->heaps[h];
+        if (!bound) continue;
+        for (uint32_t r = 0; r < params[p].count && params[p].first_range + r < ranges.size() && n < max; ++r) {
+            const auto& range = ranges[params[p].first_range + r];
+            if (range.table_offset == NA_UNKNOWN_U32 || range.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_SRV) continue;
+            for (uint32_t k = 0; k < std::min<uint32_t>(range.num_descriptors, 64) && n < max; ++k) {
+                const uint64_t index = uint64_t(slot) + range.table_offset + k;
+                if (index >= heap->count) break;
+                const auto& info = heap->info[static_cast<size_t>(index)];
+                if (info.kind != NA_DESC_SRV || !info.resource) continue;
+                bool seen = false;
+                for (uint32_t i = 0; i < n && !seen; ++i) seen = out[i] == info.resource;
+                if (!seen) out[n++] = info.resource;
+            }
+        }
+    }
+    return n;
+}
 bool ListReferences(ID3D12CommandList* list, na_object_id id)
 {
     if (!id) return false;
