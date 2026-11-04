@@ -43,6 +43,9 @@ struct ExpandParams {
     float depth_tolerance = 0.02f;        // |Î” raw depth| accepted as "same surface" (relative to |depth|+0.01)
     float consistency_px = 2.0f;          // max spread among depth-matching neighbours before validity = 0
     bool sky = false;                     // clear depth counts as a surface (looser flow rules)
+    // Encoded image pixel q is the raw raster pixel q + this offset. Expand
+    // onto the RAW depth grid; neighbours' depth must use the inverse mapping.
+    float image_to_raster_px[2] = {};
 };
 
 class FlowExpand {

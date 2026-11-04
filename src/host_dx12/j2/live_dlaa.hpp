@@ -339,7 +339,7 @@ struct Stats {
     // Viewport jitter: frames a sample was set for, and where each DLSS frame's declaration came
     // from (the scene list's own draws / this frame's table entry / none), plus scene lists drawn
     // with another frame's sample (recorded ahead or late).
-    uint64_t vpj_frames = 0, vpj_from_list = 0, vpj_from_table = 0, vpj_none = 0, vpj_other_frame = 0;
+    uint64_t vpj_frames = 0, vpj_from_list = 0, vpj_from_submitted = 0, vpj_none = 0, vpj_other_frame = 0;
     // HUD protection fallback (screen-fixed map learned during movement; 2026-11-04): frames it
     // ran, frames it was applied (zero motion + DLSS current-colour bias + NIS HUD pixels), frames
     // learned only (coverage above 30 %: not applied), and the last completed frame's mask pixels,

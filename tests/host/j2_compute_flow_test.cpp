@@ -5,6 +5,7 @@
 #include "host_dx12/nr/native_fg.hpp"
 #include "core/motion_arbiter_gpu.hpp"
 #include "core/jitter_domain.hpp"
+#include "core/camera_fit_gpu.hpp"
 #include <vector>
 #include <cmath>
 int main(int argc,char**){
@@ -13,13 +14,16 @@ int main(int argc,char**){
     if(!na::ffx_flow::DeviceSupported(d.device.Get())){std::puts("SKIP: AMD search needs 32/64-lane hardware waves");return test::kSkip;}
     const unsigned w=argc>1?1920:512,h=argc>1?1080:256;constexpr auto S=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,U=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     test::List l;REQUIRE(l.Create(d.device.Get()));std::vector<test::ComPtr<ID3D12Resource>> uploads;
-    auto image=[&](int dx,bool depth){
+    auto image=[&](int dx,bool depth,float jx=0.f,float jy=0.f,bool world=false){
         auto fmt=depth?DXGI_FORMAT_R32_FLOAT:DXGI_FORMAT_R8G8B8A8_UNORM;
         auto r=test::CreateTexture(d.device.Get(),w,h,fmt,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_NONE);
         auto up=test::CreateBuffer(d.device.Get(),w*h*4,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);unsigned* p=nullptr;up->Map(0,nullptr,reinterpret_cast<void**>(&p));
         for(unsigned y=0;y<h;++y)for(unsigned x=0;x<w;++x){unsigned v=25;
             const int a=static_cast<int>(x)-dx;
             if(a>=128 && a<256 && y>=64 && y<192){unsigned t=unsigned(a)*1664525u+y*1013904223u;t^=t>>13;t*=2246822519u;t^=t>>16;v=60+(t%190);}
+            if(world){const float X=float(x)-dx-jx,Y=float(y)-jy;
+                const float z=.5f+.18f*std::sin(.17f*X)+.14f*std::sin(.11f*X+.13f*Y)+.12f*std::cos(.07f*Y)+.05f*std::sin(.09f*X-.21f*Y);
+                v=unsigned(std::lround(255.f*z));}
             p[y*w+x]=depth?0x3f000000u:0xff000000u|v*0x010101u;
         }up->Unmap(0,nullptr);D3D12_TEXTURE_COPY_LOCATION src{},dst{};
         src.pResource=up.Get();src.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;src.PlacedFootprint.Footprint={fmt,w,h,1,w*4};
@@ -105,6 +109,48 @@ int main(int argc,char**){
             execute();cf::Committed(actual);reset();
         }
         CHECK(cf::GetStats().accepted>0);
+    }
+    // p44832 reproduction: the earlier matrix writer trained an Unjittered cache.
+    // Real viewport jitter now reaches the scene, whose camera is projection-only.
+    // Run the actual AMD engine + reconstruction + arbiter, not synthetic flow.
+    {
+        na::jitter::Remembered().enabled=true;
+        na::jitter::Remembered().Put(na::jitter::kStageFlow,28,2);
+        double identity[16]{},eye[3]{};for(int k=0;k<16;++k)identity[k]=k%5==0?1.:0.;
+        const auto basis=na::motion::gpu::MakeFitBasis(identity,identity,identity,eye);
+        camera.tier3_valid_flag=false;camera.fit_basis=&basis;
+        cf::SetLoosen(100);
+        const float jx[]={-.4375f,.4375f,-.375f,.375f,-.3125f,.3125f,-.25f,.25f};
+        const float jy[]={.3889f,-.3889f,.2778f,-.2778f,.1667f,-.1667f,.0556f,-.0556f};
+        std::vector<test::ComPtr<ID3D12Resource>> scenes;
+        for(int i=0;i<12;++i)scenes.push_back(image(i<8?0:(i-7)*6,false,jx[i%8],jy[i%8],true));
+        execute();reset();
+        auto barrier=test::Transition(output.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,U);l.list->ResourceBarrier(1,&barrier);execute();reset();
+        for(bool confirmed:{false,true}){
+            cf::Reset();double still=0,moving=0;unsigned sn=0,mn=0;
+            for(unsigned i=0;i<scenes.size();++i){
+                cf::Frame jf;jf.frame=2000+i;jf.previous=i?jf.frame-1:0;jf.generation=77;jf.source_generation=77;
+                jf.residual=false;jf.camera_reconstruct=true;jf.raster_sample=true;jf.raster_confirmed=confirmed;
+                jf.jitter[0]=jf.raster_jitter[0]=jx[i%8];jf.jitter[1]=jf.raster_jitter[1]=jy[i%8];
+                camera.jitter_current_px[0]=jx[i%8];camera.jitter_current_px[1]=jy[i%8];
+                cf::Tier3 t;auto ticket=cf::Record(l.list.Get(),d.queue.Get(),scenes[i].Get(),depth.Get(),camera,jf,t);REQUIRE(ticket.context);
+                if(confirmed)CHECK(ticket.frame.jitter[0]==jx[i%8]);
+                camera.fix=t.fix;REQUIRE(arbiter.Dispatch(l.list.Get(),camera,out,0));
+                auto copy_barrier=test::Transition(output.Get(),U,D3D12_RESOURCE_STATE_COPY_SOURCE);l.list->ResourceBarrier(1,&copy_barrier);
+                l.list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);std::swap(copy_barrier.Transition.StateBefore,copy_barrier.Transition.StateAfter);l.list->ResourceBarrier(1,&copy_barrier);
+                execute();cf::Committed(ticket);reset();
+                float* data=nullptr;REQUIRE(SUCCEEDED(rb->Map(0,nullptr,reinterpret_cast<void**>(&data))));
+                double error=0;unsigned n=0;
+                for(unsigned y=32;y<h-32;y+=4)for(unsigned x=48;x<w-48;x+=4){const auto q=(y*w+x)*2;
+                    error+=std::hypot(data[q]+(i>=8?6.:0.),data[q+1]);++n;}
+                rb->Unmap(0,nullptr);
+                if(i>0&&i<8){still+=error/n;++sn;}if(i>=8){moving+=error/n;++mn;}
+            }
+            std::printf("real raster + remembered Unjittered, confirmed=%d: stationary motion %.4f px, moving error %.4f px\n",confirmed,still/sn,moving/mn);
+            if(confirmed){CHECK(still/sn<.08);CHECK(moving/mn<.35);}
+            else CHECK(still/sn>.15); // old failure is reproduced on the identical pictures
+        }
+        camera.fix=nullptr;camera.fit_basis=nullptr;na::jitter::Remembered().enabled=false;
     }
     cf::Reset();CHECK(d.device->GetDeviceRemovedReason()==S_OK);execute();return test::finish("j2_compute_flow_test");
 }
