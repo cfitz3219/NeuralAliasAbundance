@@ -1073,7 +1073,9 @@ int end_to_end(test::Device& d)
         REQUIRE(readback(d, proxy2.Get(), RTS, 4, px));
         CHECK(std::abs(at(px, RW, 24, 12, 0) - 51) <= 1);   // the back buffer got the scene only
     }
-    if(source_lineage(d)||draw_handoff(d)||draw_handoff(d,true)||draw_handoff(d,true,true))return 1;
+    if(source_lineage(d)||draw_handoff(d)||draw_handoff(d,true))return 1;
+    for(int resize=0;resize<5;++resize)if(draw_handoff(d,true,true))return 1;
+    CHECK(nh::GetStats().upstream_dropped>0); // obsolete canvas profiles cannot fill all eight discovery slots
     na_observe_stop();
     return 0;
 }

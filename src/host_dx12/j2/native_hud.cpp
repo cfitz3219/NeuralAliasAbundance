@@ -1370,6 +1370,14 @@ void ReportCanvasProbe(uint64_t source,uint64_t generation,bool identity)
     Proxy* slot=nullptr;
     for(auto& q:g_proxy)if(!q.id){slot=&q;break;}
     if(!slot)for(auto& q:g_proxy)if(!q.upstream&&q.used+8<g_frame&&(!slot||q.used<slot->used))slot=&q;
+    if(!slot){ // Profile eviction is not GPU retirement: recording/Present owners still retain every packet.
+        uint64_t oldest=UINT64_MAX;
+        for(auto& q:g_proxy)if(q.upstream&&q.pixel_proved&&!q.picture&&!q.replay&&!q.hud){
+            const auto previous=std::find_if(g_canvases.begin(),g_canvases.end(),[&](const auto& canvas){return canvas.id==q.id;});
+            if(previous!=g_canvases.end()&&previous->used+2<g_frame&&previous->used<oldest){slot=&q;oldest=previous->used;}
+        }
+        if(slot)++g_stats.upstream_dropped;
+    }
     if(!slot)return;
     *slot={};slot->id=source;slot->upstream=slot->preserve=slot->pixel_proved=true;
     slot->rw=c->rw;slot->rh=c->rh;slot->ow=c->ow;slot->oh=c->oh;slot->format=c->format;slot->used=g_frame;

@@ -176,3 +176,5 @@ composite and actual selected native output. No extra review cycle requested.
 - NVIDIA explanation: https://developer.nvidia.com/blog/nvidia-dlss-natively-supported-in-unity-2021-2
 - Microsoft shader reflection can be removed independently of executable code:
   https://learn.microsoft.com/en-us/windows/win32/api/d3dcompiler/ne-d3dcompiler-d3dcompiler_strip_flags
+
+Final receipt: source6ba04ef complete200case suite195PASS5SKIP0FAIL263.68s. Subsequent inactive discovery-profile cache repair passed the expanded GPU canvas replacement test and final seven affected regressions14.69s after a complete Release rebuild. Final commit is named in COMMS. Profile eviction releases learning slots; GPU data still follows recording/Present owners. No game test/deployment by Astra.
