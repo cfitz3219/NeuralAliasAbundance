@@ -16,7 +16,7 @@
     params[0].DescriptorTable.pDescriptorRanges = ranges;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[1].Constants.Num32BitValues = 24;
+    params[1].Constants.Num32BitValues = sizeof(Constants)/4;
     params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_STATIC_SAMPLER_DESC smp{};
     smp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;

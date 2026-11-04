@@ -10,6 +10,7 @@ struct Frame {
     uint64_t frame=0,previous=0;uint32_t generation=0,slot=0;bool reset=false,hdr=false;
     float jitter[2]{}; // nominal on input; Ticket.frame carries the calibrated encode shift
     float raster_jitter[2]{}; bool raster_sample=false;
+    bool raster_confirmed=false; // exact viewport writes reached this source recording; not a learned convention
     uint64_t source_generation=0;
     // false: only the M3 camera fit runs (the camera needs reconstructing but the user turned
     // the object-motion residual off); no residual, no tier 3.

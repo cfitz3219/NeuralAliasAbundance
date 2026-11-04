@@ -11,7 +11,7 @@ Texture2D<int2>  t_grid  : register(t0);
 Texture2D<float> t_depth : register(t1);
 RWTexture2D<float2> u_out   : register(u0);
 RWTexture2D<float>  u_valid : register(u1);
-cbuffer C : register(b0) { uint grid; uint out_w; uint out_h; uint sky; float depth_clear; float depth_tol; float consistency_px; float vector_scale; };
+cbuffer C : register(b0) { uint grid; uint out_w; uint out_h; uint sky; float depth_clear; float depth_tol; float consistency_px; float vector_scale; float2 image_to_raster; float2 pad; };
 
 float2 cell(int2 c, int2 dim) {
     c = clamp(c, int2(0, 0), dim - 1);
@@ -22,8 +22,8 @@ float2 cell(int2 c, int2 dim) {
 // Raw depth at a block centre (clamped to the frame).
 float cell_depth(int2 c, int2 dim) {
     c = clamp(c, int2(0, 0), dim - 1);
-    int2 p = int2(c.x * grid + grid / 2, c.y * grid + grid / 2);
-    p = min(p, int2(out_w - 1, out_h - 1));
+    int2 p = int2(floor(float2(c * grid + grid / 2) + image_to_raster));
+    p = clamp(p,int2(0,0),int2(out_w - 1, out_h - 1));
     return t_depth[p];
 }
 // A39-DEPTH-EXPAND-REVIEW R1: the same finite / [0,1] / not-clear rule for
@@ -41,7 +41,7 @@ bool same_surface(float d, float cd, float tol) {
     return dc == cc && (dc || abs(cd - d) <= tol);
 }
 void neighbours(uint2 id, int2 dim, out int2 c0, out float2 f) {
-    float2 g = (float2(id) + 0.5) / float(grid) - 0.5;
+    float2 g = (float2(id) + 0.5 - image_to_raster) / float(grid) - 0.5;
     c0 = int2(floor(g));
     f = g - float2(c0);
 }
@@ -97,7 +97,7 @@ void expand_depth(uint3 id : SV_DispatchThreadID) {
     }
 }
 )";
-struct Constants { uint32_t grid, out_w, out_h, sky; float depth_clear, depth_tol, consistency_px, vector_scale; };
+struct Constants { uint32_t grid, out_w, out_h, sky; float depth_clear, depth_tol, consistency_px, vector_scale; float image_to_raster[2]{},pad[2]{}; };
 
 bool compile(ID3D12Device* dev, ID3D12RootSignature* root, const char* entry, ComPtr<ID3D12PipelineState>& pso)
 {
@@ -171,6 +171,7 @@ bool FlowExpand::DispatchDepthAware(ID3D12GraphicsCommandList* list, ID3D12Resou
     if (!finite(params.depth_tolerance) || params.depth_tolerance < 0.0f) return false;
     if (!finite(params.consistency_px) || params.consistency_px < 0.0f) return false;
     if (!finite(params.depth_clear) || params.depth_clear < 0.0f || params.depth_clear > 1.0f) return false;
+    if (!finite(params.image_to_raster_px[0]) || !finite(params.image_to_raster_px[1])) return false;
     return dispatch(list, grid_tex, grid, &params, out, out_w, out_h, frame_slot, recording_heap);
 }
 
@@ -211,6 +212,7 @@ bool FlowExpand::dispatch(ID3D12GraphicsCommandList* list, ID3D12Resource* grid_
     ud.Format = DXGI_FORMAT_R32_FLOAT;
     device_->CreateUnorderedAccessView(p && p->validity_out ? p->validity_out : dummy_uav_.Get(), nullptr, &ud, cpu(3));
     Constants c{grid, out_w, out_h, p && p->sky ? 1u : 0u, p ? p->depth_clear : 1.0f, p ? p->depth_tolerance : 0.0f, p ? p->consistency_px : 0.0f, vector_scale_};
+    if(p){c.image_to_raster[0]=p->image_to_raster_px[0];c.image_to_raster[1]=p->image_to_raster_px[1];}
     ID3D12DescriptorHeap* heaps[] = {selected_heap};
     list->SetDescriptorHeaps(1, heaps);
     list->SetComputeRootSignature(root_.Get());

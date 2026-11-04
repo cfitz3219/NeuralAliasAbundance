@@ -25,6 +25,7 @@ cbuffer C : register(b0) {
     float snap_px, image_margin, image_abs, texture_min;
     uint have_hist, agree_min; float dj_x, dj_y; // dj: this pair's stabilisation jitter delta (current - previous)
     float agree_px, agree_cos, jitter_x, jitter_y;
+    float history_dx,history_dy,pad0,pad1;
 };
 float3 srgb_encode(float3 v) { v = saturate(v); return v <= 0.0031308 ? 12.92 * v : 1.055 * pow(v, 1.0 / 2.4) - 0.055; }
 // One fixed transform for every image (both images of a pair are encoded alike), sampled
@@ -101,7 +102,7 @@ void accept(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             if (cost > cost_max) why = 3;
         }
         if (why == 0) {
-            float2 p = float2(id.xy) + 0.5;
+            float2 p = float2(id.xy) + 0.5 - float2(jitter_x,jitter_y);
             float2 q = p + raw;
             if (q.x < 0.0 || q.y < 0.0 || q.x > float(w) || q.y > float(h)) why = 4;
             else if (texture_at(p) < texture_min) why = 5; // flat: the image cannot confirm a residual
@@ -119,7 +120,7 @@ void accept(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         if (why == 0) {
             // Temporal agreement: the previous pair's candidate where this point came from.
             if (have_hist != 0) {
-                float2 from = float2(id.xy) + 0.5 + raw;
+                float2 from = float2(id.xy) + 0.5 + raw + float2(history_dx,history_dy);
                 float4 hp = t_hist.Load(int3(clamp(int2(floor(from)), int2(0, 0), int2(int(w) - 1, int(h) - 1)), 0));
                 float2 hr = hp.xy;
                 float lr = length(r), lh = length(hr);

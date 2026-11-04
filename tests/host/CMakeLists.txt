@@ -16,6 +16,7 @@ endfunction()
 na_host_test(fg_profile_test SOURCES fg_profile_test.cpp LIBS host_settings nvapi_headers)
 na_host_test(ffx_flow_test SOURCES ffx_flow_test.cpp LIBS host_ffx_flow dxgi LABELS gpu)
 na_host_test(jitter_probe_test SOURCES jitter_probe_test.cpp LIBS core_gpu dxgi LABELS gpu)
+na_host_test(viewport_jitter_test SOURCES viewport_jitter_test.cpp LIBS host_observe_producers dxgi d3dcompiler LABELS gpu)
 if(NA_HAVE_NGX_SDK)
   # Opus's optional CPU recording benchmark; uses a fake model and real DX12.
   # It is deliberately not a CTest or part of the default/CI build.
