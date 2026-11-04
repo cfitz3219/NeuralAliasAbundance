@@ -9,7 +9,7 @@
 //   * six parameters (translation x/y/z, small rotation about the eye) as a correction of
 //     the existing composed reprojection C (FitBasis, motion_arbiter_gpu.hpp), never added
 //     twice: theta = 0 is exactly today's camera motion;
-//   * IRLS Gauss-Newton with a Cauchy weight (1.5 px), Jacobi-scaled and damped, 3 steps
+//   * IRLS Gauss-Newton with a Cauchy weight (1.5 px), Jacobi-scaled and damped, 6 steps
 //     from theta = 0; flow samples at 8x8 block centres (the AMD engine's grid);
 //   * HUD, sky (clear depth), moving objects and bad matches are down-weighted by the robust
 //     weight or excluded by validity; the expansion's depth-aware validity is required;

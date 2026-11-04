@@ -11,7 +11,7 @@ namespace na::motion::gpu {
 namespace {
 
 constexpr uint32_t kStep = 8;        // sample spacing (the AMD engine's 8x8 block grid)
-constexpr uint32_t kIterations = 3;  // Gauss-Newton steps from theta = 0
+constexpr uint32_t kIterations = 6;  // Gauss-Newton steps from theta = 0 (3 stopped short on real AMD flow, PC 2026-11-04)
 constexpr uint32_t kValues = 30;     // per-sample accumulators: H (21), g (6), energy, count, inliers
 
 const char kSource[] = R"(

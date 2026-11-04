@@ -98,7 +98,7 @@ struct Fit { double theta[6]{}; double e0 = 0, e = 0, n = 0; bool accepted = fal
 Fit fit(const std::vector<Sample>& samples, const FitBasis& b, const float jit[2], float depth_clear) {
     Fit r;
     float th[6] = {};
-    for (int it = 0; it <= 3; ++it) {
+    for (int it = 0; it <= 6; ++it) {
         double tot[30] = {};
         for (const auto& s : samples) {
             const float d = s.depth;
@@ -129,7 +129,7 @@ Fit fit(const std::vector<Sample>& samples, const FitBasis& b, const float jit[2
         }
         const double n = tot[28], e = n > 0 ? tot[27] / n : 0;
         if (it == 0) { r.e0 = e; }
-        if (it < 3) {
+        if (it < 6) {
             double A[6][6], bb[6], sc[6];
             int idx = 0;
             for (int a = 0; a < 6; ++a) for (int c = a; c < 6; ++c) { A[a][c] = A[c][a] = tot[idx++]; }
