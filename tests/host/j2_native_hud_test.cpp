@@ -534,8 +534,8 @@ int end_to_end(test::Device& d)
             l->SetPipelineState(plain[0].Get());
             l->SetGraphicsRoot32BitConstants(0, 4, kScene, 0);
             l->DrawInstanced(3, 1, 0, 0); // scene composite into X
-            const D3D12_RECT r{h.rect[0], h.rect[1], h.rect[2], h.rect[3]};
-            l->RSSetScissorRects(1, &r);
+            const D3D12_RECT hr{h.rect[0], h.rect[1], h.rect[2], h.rect[3]};
+            l->RSSetScissorRects(1, &hr);
             l->SetPipelineState(plain[int(h.blend)].Get());
             l->SetGraphicsRoot32BitConstants(0, 4, h.color, 0);
             l->DrawInstanced(3, 1, 0, 0); // HUD into X
@@ -554,10 +554,10 @@ int end_to_end(test::Device& d)
             d.queue->ExecuteCommandLists(1, lists);
             d.WaitIdle();
             CHECK(dev->GetDeviceRemovedReason() == S_OK);
-            const bool got = nh::TakeFrame(proxy2.Get(), RW, RH, OW, OH, &lx);
-            std::printf("native HUD upstream frame %d: layer=%d %s\n", frame, got ? 1 : 0, nh::StatusLine().c_str());
-            if (frame < 3) CHECK(!got);
-            else { got_last = got; last = lx; }
+            const bool got_up = nh::TakeFrame(proxy2.Get(), RW, RH, OW, OH, &lx);
+            std::printf("native HUD upstream frame %d: layer=%d %s\n", frame, got_up ? 1 : 0, nh::StatusLine().c_str());
+            if (frame < 3) CHECK(!got_up);
+            else { got_last = got_up; last = lx; }
         }
         const nh::Stats su = nh::GetStats();
         CHECK(su.upstream_learned == 1);
