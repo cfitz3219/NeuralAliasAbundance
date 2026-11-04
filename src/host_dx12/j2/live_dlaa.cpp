@@ -963,6 +963,8 @@ bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& in_byt
 // Generic: core/projection_window.hpp derive_rebase recognises only screen-like transforms
 // of THIS frame's camera (canonical values, rebuilt to float precision), so another
 // camera, a camera pan or arbitrary data is never touched.
+// Blocks already scanned for a separate projection without finding one: content hash per block.
+std::map<std::pair<uint64_t, uint64_t>, uint64_t> g_p_scan_negative;
 struct DerivedBase { na::camera::Matrix b{}, binv{}, bnew{}, bnewinv{}; const char* name = ""; };
 struct DerivedBases { uint64_t frame = UINT64_MAX; uint32_t phase = 0; bool projection = false; int count = 0; DerivedBase base[3]; } g_derived;
 void build_derived_bases()
@@ -1195,10 +1197,30 @@ void jitter_batch_impl(ID3D12CommandList* const* lists, UINT count)
             // A depth/VP-only submission can start the sample before a separately
             // uploaded P is consumed. Reuse the existing projection/rigid-view
             // predicates to establish P for this exact camera, not a guessed offset.
+            // Cost (Astra 20cddb8 point 4): only 64-byte windows with the shape of a perspective
+            // matrix (w row/column = 0,0,+-1,0 in either layout) reach the solver, and a block
+            // whose exact bytes held no such window is not scanned again (any new upload changes
+            // the bytes, so it is always scanned; a block holding a perspective-shaped window
+            // is never cached, because a different camera sample could match it).
+            uint64_t content = 1469598103934665603ull;
+            for (uint32_t i = 0; i < n; ++i) { content ^= view[i]; content *= 1099511628211ull; }
+            auto& seen = g_p_scan_negative[{k->res, k->off}];
+            const bool skip = seen == content;
+            if (skip) ++g.stats.jitter_p_scan_cached;
             const auto L = g.jit.layout ? na::camera::Layout::ColumnMajor : na::camera::Layout::RowMajor;
             const std::vector<uint8_t> vb(g.jit.vp[g.jit.layout], g.jit.vp[g.jit.layout] + 64);
             const auto vp = na::camera::LoadMatrix(vb, 0, L);
-            for (size_t o = 0; o + 64 <= n && !g.jit.has_proj; o += 16)
+            const auto perspective_shape = [&](size_t o) {
+                float f[16];
+                std::memcpy(f, view.data() + o, 64);
+                const auto one = [](float x) { return x == 1.0f || x == -1.0f; };
+                return f[15] == 0.0f && ((one(f[11]) && f[3] == 0.0f && f[7] == 0.0f) || (one(f[14]) && f[12] == 0.0f && f[13] == 0.0f));
+            };
+            bool shaped = false;
+            for (size_t o = 0; !skip && o + 64 <= n && !g.jit.has_proj; o += 16) {
+                if (!perspective_shape(o)) continue;
+                shaped = true;
+                ++g.stats.jitter_p_scan_solved;
                 for (auto PLayout : {na::camera::Layout::RowMajor, na::camera::Layout::ColumnMajor}) {
                     const auto p = na::camera::LoadMatrix(view, o, PLayout);
                     na::camera::Candidate candidate{};
@@ -1207,6 +1229,9 @@ void jitter_batch_impl(ID3D12CommandList* const* lists, UINT count)
                         break;
                     }
                 }
+            }
+            if (!skip && !shaped) seen = content;
+            if (g_p_scan_negative.size() > 16384) g_p_scan_negative.clear();
         }
         if (!g.jit.valid || !holds(g.jit.vp)) {
             // Projection window: EVERY copy of the main camera must be windowed, or the draws using it
@@ -3238,13 +3263,14 @@ void witness_read(uint32_t si)
     if (g_small.w_tested >= 20000) {
         if (g_small.w_unshifted > 3 * g_small.w_shifted) ++g_small.w_unseen_windows;
         else if (g_small.w_shifted > g_small.w_unshifted) g_small.w_unseen_windows = 0;
-        if (g_small.w_unseen_windows >= 2 && !g.jitter_unseen) {
-            g.jitter_unseen = true;
-            g.jitter_retest = g.frame + 3600;
-            g.resume_reset = true;
-            ++g.stats.jitter_unseen_count;
+        // Measurement only (Astra 20cddb8 point 4): the verdict is reported, it never switches
+        // jitter off or resets DLSS history (those switches changed the sampled camera and
+        // cut history without repairing anything).
+        if (g_small.w_unseen_windows >= 2) {
+            if (!g.stats.jitter_unseen) ++g.stats.jitter_unseen_count;
+            g.stats.jitter_unseen = true;
             g_small.w_unseen_windows = 0;
-        }
+        } else if (g_small.w_shifted > g_small.w_unshifted) g.stats.jitter_unseen = false;
     }
     g_small.w_frames = g_small.w_tested = g_small.w_unshifted = g_small.w_shifted = 0;
 }
@@ -3274,13 +3300,6 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         ++g.stats.small_failed; small_note("Render-small: could not reset its list."); return false;
     }
     witness_read(si);
-    if (g.jitter_unseen && g.frame >= g.jitter_retest) { // re-test: jitter on again, a fresh verdict
-        g.jitter_unseen = false;
-        g.resume_reset = true;
-        g_small.wprev_valid = false;
-        ++g.stats.jitter_retests;
-    }
-    g.stats.jitter_unseen = g.jitter_unseen;
     constexpr UINT PRESENT = D3D12_RESOURCE_STATE_PRESENT, NPSR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                    UAV = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     std::vector<D3D12_RESOURCE_BARRIER> b;

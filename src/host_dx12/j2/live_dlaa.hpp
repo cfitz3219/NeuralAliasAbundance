@@ -233,6 +233,7 @@ struct Stats {
     // Cuts at record time by cause (restart = tracker reset by resume/gap; gap = tracker frame gap;
     // motion = translation/rotation/fov jump), and the last few as "tick100ms:why=value[/held][/j1]".
     uint64_t cut_restarts = 0, cut_gap = 0, cut_motion = 0;
+    uint64_t jitter_p_scan_cached = 0, jitter_p_scan_solved = 0; // standalone-P search: skipped blocks / solver calls
     uint64_t gap_bridged = 0; // same-epoch acquisition gaps longer than 4 frames kept without a restart
     char recent_cuts[240] = {};
     uint64_t camera_from_j1 = 0;
