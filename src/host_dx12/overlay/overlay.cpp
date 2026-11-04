@@ -902,8 +902,8 @@ void write_status_line()
         if (na::native_present::SizeProbeInstalled()) { // read-only size-query probe ([present] size_probe=1)
             char probe[2400] = {};
             na::native_present::FormatSizeProbe(probe, sizeof probe - 2);
-            const size_t pn = std::strlen(probe);
-            if (pn) { probe[pn] = '\r'; probe[pn + 1] = '\n'; WriteFile(f, probe, DWORD(pn + 2), &written, nullptr); }
+            const size_t probe_n = std::strlen(probe);
+            if (probe_n) { probe[probe_n] = '\r'; probe[probe_n + 1] = '\n'; WriteFile(f, probe, DWORD(probe_n + 2), &written, nullptr); }
         }
         if (na::j2::RenderSmall()) { // P4-4 render-small: one line per status write
             const auto ps = na::present::GetStats();
