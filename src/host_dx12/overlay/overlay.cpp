@@ -77,6 +77,7 @@ constexpr uint32_t kSwapReleaseSlot = 2;          // IUnknown::Release on the sw
 constexpr uint32_t kSwapPresentSlot = 8;
 constexpr uint32_t kSwapGetBufferSlot = 9;        // IDXGISwapChain::GetBuffer (A59 presenter)
 constexpr uint32_t kSwapResizeBuffersSlot = 13;
+constexpr uint32_t kSwapResizeTargetSlot = 14;
 constexpr uint32_t kSwap1Present1Slot = 22;
 constexpr uint32_t kSwapGetDescSlot = 12;   // IDXGISwapChain::GetDesc (render-small size spoof)
 constexpr uint32_t kSwap1GetDesc1Slot = 18; // IDXGISwapChain1::GetDesc1
@@ -100,6 +101,7 @@ using Present1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT,
                                                const DXGI_PRESENT_PARAMETERS*);
 using ResizeFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT, UINT,
                                              DXGI_FORMAT, UINT);
+using ResizeTargetFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, const DXGI_MODE_DESC*);
 using Resize1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain3*, UINT, UINT, UINT, DXGI_FORMAT, UINT,
                                               const UINT*, IUnknown* const*);
 using GetBufferFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, REFIID, void**);
@@ -118,6 +120,7 @@ std::atomic<uint32_t> g_chain_gone{0};       // A71: chains observed destroyed (
 PresentFn g_orig_present = nullptr;
 Present1Fn g_orig_present1 = nullptr;
 ResizeFn g_orig_resize = nullptr;
+ResizeTargetFn g_orig_resize_target = nullptr;
 Resize1Fn g_orig_resize1 = nullptr;
 GetBufferFn g_orig_get_buffer = nullptr;
 GetIndexFn g_orig_get_index = nullptr;
@@ -3103,6 +3106,19 @@ void retire_nr_backbuffers(IDXGISwapChain* sc) {
     for(UINT i=0;i<desc.BufferCount;++i){ComPtr<ID3D12Resource> buffer;
         if(SUCCEEDED(real_get_buffer(sc,i,IID_PPV_ARGS(&buffer))))na::nr::native::RetireBackbuffer(buffer.Get());}
 }
+HRESULT STDMETHODCALLTYPE DetourResizeTarget(IDXGISwapChain* sc, const DXGI_MODE_DESC* requested)
+{
+    if (requested && na::native_present::GameCaller(_ReturnAddress())) {
+        DXGI_SWAP_CHAIN_DESC desc{};
+        HRESULT hr;
+        { const na::native_present::NativeScope native;
+          hr = sc->GetDesc(&desc); }
+        DXGI_MODE_DESC physical = *requested;
+        if (SUCCEEDED(hr) && na::native_present::RewriteResizeTarget(desc.OutputWindow, &physical))
+            return g_orig_resize_target(sc, &physical);
+    }
+    return g_orig_resize_target(sc, requested);
+}
 HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT count, UINT w,
                                               UINT h, DXGI_FORMAT fmt, UINT flags)
 {
@@ -3460,6 +3476,12 @@ bool StartCore(const char* route_tag, PanelFn controls)
                  prepare_start_hook(queue.Get(), kQueueExecuteSlot,
                                              reinterpret_cast<void*>(&DetourExecute),
                                              reinterpret_cast<void**>(&g_orig_execute));
+            // Only render-small needs to separate logical ResizeTarget from
+            // physical output. Native-DLSS routes retain their existing hooks.
+            if (ok && na::j2::RenderSmall())
+                ok = prepare_start_hook(sc.Get(), kSwapResizeTargetSlot,
+                                        reinterpret_cast<void*>(&DetourResizeTarget),
+                                        reinterpret_cast<void**>(&g_orig_resize_target));
             // A59 presenter: GetBuffer / GetCurrentBackBufferIndex / ResizeBuffers1.
             // The full observer owns these slots when requested. This narrow
             // trace is for Route A freezes with that observer disabled.
