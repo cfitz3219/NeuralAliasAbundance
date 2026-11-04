@@ -206,6 +206,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Vulkan loader + Mesa lavapipe (CPU Vulkan driver for the Vulkan layer test)
+        run: sudo apt-get update -q && sudo apt-get install -y -q libvulkan-dev mesa-vulkan-drivers
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - name: Build

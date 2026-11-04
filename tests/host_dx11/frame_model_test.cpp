@@ -237,6 +237,30 @@ int main()
         expect(!FindCamera(noise, 1).found, "random bytes give no camera");
     }
 
+    // ---- tags (Vulkan): the point is learned as the tag of the first read after the scene ----
+    {
+        FrameModel m;
+        Setup(m);
+        auto tagged = [](uint64_t refraction_tag, uint64_t tonemap_tag, uint64_t bloom_tag) {
+            std::vector<Event> f = Frame();
+            int n = 0;
+            for (Event& e : f)
+                if (e.kind == Kind::Read) e.tag = n == 0 ? refraction_tag : n == 1 ? tonemap_tag : bloom_tag, ++n;
+            return f;
+        };
+        for (int i = 0; i < 2; ++i) {
+            for (const Event& e : tagged(11, 22, 33)) m.Feed(e);
+            m.EndFrame();
+        }
+        expect(m.LearnedTag() == 22, "the tonemap read's tag is learned (not the mid-scene copy, not bloom)");
+        for (const Event& e : tagged(11, 22, 22)) m.Feed(e);
+        m.EndFrame();
+        expect(m.LearnedTag() == 0 && m.GetStats().tag_not_unique == 1, "a tag that names two reads is not learned");
+        for (const Event& e : tagged(11, 22, 33)) m.Feed(e);
+        m.EndFrame();
+        expect(m.LearnedTag() == 22, "and is learned again once it is unique");
+    }
+
     std::printf(g_failed ? "FAIL: %d check(s) failed\n" : "PASS: DX11 frame model\n", g_failed);
     return g_failed ? 1 : 0;
 }

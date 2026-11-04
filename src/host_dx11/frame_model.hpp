@@ -31,7 +31,14 @@
 // Selection changes need 3 frames in a row (hysteresis), so one odd frame (a
 // loading screen, a menu) does not flip the choice.
 //
-// Portable C++17 (Linux-tested); the DX11 hooks fill it.
+// Vulkan (src/host_vk) uses the same model. Its command buffers are recorded
+// before they are submitted, so it cannot fire at the read itself: each read
+// carries a `tag` (where the read sits inside its command buffer), the model
+// learns the tag of the first read after the last scene draw, and the Vulkan
+// layer records DLSS at the read with that tag in the next frame. A tag seen
+// more than once in a frame is not learned (it would not name one place).
+//
+// Portable C++17 (Linux-tested); the DX11 hooks and the Vulkan layer fill it.
 #pragma once
 
 #include <algorithm>
@@ -68,6 +75,7 @@ struct Event {
     uint64_t vertices = 0;        // Draw: vertices (indices) x instances; 0 for indirect
     bool indirect = false;
     Id vs_cb[kCbSlots] = {};      // Draw: vertex-shader constant buffers
+    uint64_t tag = 0;             // Read: the host's key for where the read sits (Vulkan); 0 = none
 };
 
 struct Selection {
@@ -91,6 +99,7 @@ public:
         uint64_t selection_changes = 0, loading_frames = 0;
         uint32_t last_scene_draws = 0, last_draws = 0, learned_read = 0, last_reads = 0;
         uint32_t camera_scene_draws = 0; // scene draws with the camera cb bound (last frame)
+        uint64_t tag_not_unique = 0;     // frames whose point's tag named more than one read
         double camera_share = 0;
         const char* last_miss = "";
     };
@@ -100,13 +109,15 @@ public:
     void Forget(Id id)
     {
         info_.erase(id);
-        if (sel_.depth == id || sel_.color == id) { sel_ = Selection{}; learned_read_ = 0; }
+        if (sel_.depth == id || sel_.color == id) { sel_ = Selection{}; learned_read_ = 0; learned_tag_ = 0; }
         if (sel_.camera_cb == id) { sel_.camera_cb = 0; sel_.camera_slot = -1; }
     }
     const Selection& Current() const { return sel_; }
     const Stats& GetStats() const { return stats_; }
     uint32_t SceneDrawsThisFrame() const { return scene_draws_; }
     bool FiredThisFrame() const { return fired_; }
+    // The tag of the read learned as the DLSS point (Vulkan); 0 = none or not unique.
+    uint64_t LearnedTag() const { return learned_tag_; }
 
     // ---- online decisions (before the event/list is forwarded to the game's context) ----
     // An immediate-context read of `resource` is about to happen.
@@ -160,7 +171,11 @@ public:
         case Kind::Read:
             if (sel_.color && e.resource == sel_.color) {
                 ++color_reads_;
-                if (last_scene_draw_event_ && !first_read_after_scene_pending_) first_read_after_scene_pending_ = color_reads_;
+                if (e.tag) ++read_tags_[e.tag];
+                if (last_scene_draw_event_ && !first_read_after_scene_pending_) {
+                    first_read_after_scene_pending_ = color_reads_;
+                    pending_tag_ = e.tag;
+                }
             }
             break;
         case Kind::CbUpdate: return ++cb_version_[e.resource];
@@ -214,6 +229,15 @@ public:
         // Learn the DLSS point for the next frame: the first read after the last scene draw.
         learned_read_ = sel_.valid() && first_read_after_scene_pending_ ? first_read_after_scene_pending_ : 0;
         stats_.learned_read = learned_read_;
+        learned_tag_ = 0;
+        if (learned_read_ && pending_tag_) {
+            const auto it = read_tags_.find(pending_tag_);
+            if (it != read_tags_.end() && it->second == 1) learned_tag_ = pending_tag_;
+            else {
+                ++stats_.tag_not_unique;
+                stats_.last_miss = "The scene colour's first read after the scene has the same position key as another read; no single place to insert.";
+            }
+        }
 
         Choose();
 
@@ -241,6 +265,8 @@ public:
         draws_ = scene_draws_ = color_reads_ = 0;
         events_ = last_scene_draw_event_ = 0;
         first_read_after_scene_pending_ = 0;
+        pending_tag_ = 0;
+        read_tags_.clear();
         unplaceable_this_frame_ = false;
         fired_ = false;
         fired_at_scene_draws_ = 0;
@@ -266,6 +292,7 @@ private:
             ++scene_draws_;
             last_scene_draw_event_ = events_;
             first_read_after_scene_pending_ = 0; // a read before this draw was mid-scene
+            pending_tag_ = 0;
             CountCbs(e);
             if (sel_.camera_cb && sel_.camera_slot >= 0 && e.vs_cb[sel_.camera_slot] == sel_.camera_cb)
                 ++camera_versions_[CbVersion(sel_.camera_cb)];
@@ -337,6 +364,7 @@ private:
             sel_.camera_cb = 0;
             sel_.camera_slot = -1;
             learned_read_ = 0; // learn the point with the new selection first
+            learned_tag_ = 0;
             pending_frames_ = 0;
         }
     }
@@ -364,6 +392,8 @@ private:
     uint64_t events_ = 0, last_scene_draw_event_ = 0;
     bool unplaceable_this_frame_ = false;
     uint32_t first_read_after_scene_pending_ = 0;
+    uint64_t pending_tag_ = 0, learned_tag_ = 0;
+    std::unordered_map<uint64_t, uint32_t> read_tags_;
     bool fired_ = false;
     uint32_t fired_at_scene_draws_ = 0;
     Stats stats_;
