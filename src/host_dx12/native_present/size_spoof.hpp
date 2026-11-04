@@ -89,4 +89,6 @@ struct SizeStats {
 };
 SizeStats GetSizeStats();
 void FormatSizeStatus(char* out, uint32_t capacity);
+// Tick of the pending live request (0 when none); the size probe's after_req window.
+uint64_t LastRequestTick();
 } // namespace na::native_present

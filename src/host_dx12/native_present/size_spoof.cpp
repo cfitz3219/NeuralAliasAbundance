@@ -1,4 +1,5 @@
 #include "host_dx12/native_present/size_spoof.hpp"
+#include "host_dx12/native_present/size_probe.hpp"
 #include "host_dx12/hooking/vtable_hook.hpp"
 #include <intrin.h>
 #include <atomic>
@@ -37,12 +38,18 @@ LONG bounded(int64_t v) {
 }
 BOOL WINAPI client_detour(HWND hwnd, LPRECT r) {
     const BOOL ok = g_client(hwnd, r);
-    if (ok && GameCaller(_ReturnAddress())) RewriteClientRect(hwnd, r);
+    if (ok && GameCaller(_ReturnAddress())) {
+        RewriteClientRect(hwnd, r);
+        if (r) NoteSizeQuery(SizeApi::ClientRect, _ReturnAddress(), static_cast<uint32_t>(r->right - r->left), static_cast<uint32_t>(r->bottom - r->top));
+    }
     return ok;
 }
 BOOL WINAPI window_detour(HWND hwnd, LPRECT r) {
     const BOOL ok = g_window(hwnd, r);
-    if (ok && GameCaller(_ReturnAddress())) RewriteWindowRect(hwnd, r);
+    if (ok && GameCaller(_ReturnAddress())) {
+        RewriteWindowRect(hwnd, r);
+        if (r) NoteSizeQuery(SizeApi::WindowRect, _ReturnAddress(), static_cast<uint32_t>(r->right - r->left), static_cast<uint32_t>(r->bottom - r->top));
+    }
     return ok;
 }
 }
@@ -245,6 +252,7 @@ SizeStats GetSizeStats() {
     return {g_client_queries.load(), g_window_queries.load(), g_desc_queries.load(),
         g_size_messages.load(), g_position_messages.load(), g_requests.load(), g_completed.load(), g_failed.load()};
 }
+uint64_t LastRequestTick() { std::lock_guard<std::mutex> lock(g_mutex); return g_state.request ? g_request_tick : 0; }
 void FormatSizeStatus(char* out, uint32_t capacity) {
     if (!out || !capacity) return;
     const auto s = GetSizeState(); const auto c = GetSizeStats();

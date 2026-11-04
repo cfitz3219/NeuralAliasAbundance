@@ -16,6 +16,7 @@
 #include "host_dx12/scale/live_driver.hpp"
 #include "host_dx12/scale/auto_scene.hpp"
 #include "host_dx12/scale/settings_read_hook.hpp"
+#include "host_dx12/native_present/size_probe.hpp"
 
 #include <atomic>
 #include <cstdlib>
@@ -254,6 +255,10 @@ DWORD WINAPI InitThread(LPVOID)
         boot_log(!na::j2::Configured() ? "render-small: requested but OFF ([j2] enabled=1 and [observe] producers=1 needed)"
                                        : "render-small: requested but OFF ([present] proxy=0)");
     na::j2::SetRenderSmall(render_small);
+    // Read-only size-query probe (COMMS 4bd474c I1.5): which window/monitor/display-mode/DXGI
+    // output calls the game uses to learn a size. Changes no answer. [present] size_probe=1.
+    if (GetPrivateProfileIntW(L"present", L"size_probe", 0, g_ini) == 1)
+        boot_log(na::native_present::InstallSizeProbe() ? "size probe: installed" : "size probe: FAILED to install");
     if (render_small) {
         boot_log(na::native_present::InstallSizeHooks() ? "render-small: size hooks installed" : "render-small: size hooks FAILED");
         // Native-resolution HUD (Sol's plan): the game's HUD draws go to native-size layers and

@@ -1,5 +1,6 @@
 #include "host_dx12/host_boot/process_log.hpp"
 #include "host_dx12/native_present/size_spoof.hpp"
+#include "host_dx12/native_present/size_probe.hpp"
 #include "host_dx12/native_present/input_map.hpp"
 #include <intrin.h>
 #include <algorithm>
@@ -897,6 +898,12 @@ void write_status_line()
             na::native_present::FormatInputStatus(input_text, sizeof input_text);
             const int size_n = snprintf(size_line, sizeof size_line, "%s\r\n%s\r\n", size_text, input_text);
             if (size_n > 0) WriteFile(f, size_line, DWORD((std::min)(size_n, int(sizeof size_line - 1))), &written, nullptr);
+        }
+        if (na::native_present::SizeProbeInstalled()) { // read-only size-query probe ([present] size_probe=1)
+            char probe[2400] = {};
+            na::native_present::FormatSizeProbe(probe, sizeof probe - 2);
+            const size_t pn = std::strlen(probe);
+            if (pn) { probe[pn] = '\r'; probe[pn + 1] = '\n'; WriteFile(f, probe, DWORD(pn + 2), &written, nullptr); }
         }
         if (na::j2::RenderSmall()) { // P4-4 render-small: one line per status write
             const auto ps = na::present::GetStats();

@@ -1,6 +1,7 @@
 // S1/S2 regression: actual user32 hooks and hidden fixture HWNDs, no game.
 #include "test_support.hpp"
 #include "host_dx12/native_present/input_map.hpp"
+#include "host_dx12/native_present/size_probe.hpp"
 #include <windowsx.h>
 #include <cstring>
 #include <thread>
@@ -229,6 +230,29 @@ int main() {
             FormatInputStatus(large,sizeof large); CHECK(std::strstr(large,"raw_absolute="));
             CHECK(GetSizeStats().client_queries>0 && GetSizeStats().completed>0 && GetSizeStats().failed>0);
             InputGeometry g{}; CHECK(!GetInputGeometry(&g));
+        }},
+        {"size probe records game size queries without changing answers", [] {
+            CHECK(InstallSizeProbe());
+            ResetSizeProbeForTest();
+            const int real_cx = [] { NativeScope n; return GetSystemMetrics(SM_CXSCREEN); }();
+            HMONITOR m = nullptr; MONITORINFO mi{}; mi.cbSize = sizeof mi;
+            int seen_cx = 0;
+            { GameScopeForTest game;
+                seen_cx = GetSystemMetrics(SM_CXSCREEN);
+                (void)GetSystemMetrics(SM_CXICON); // not a screen metric: not counted
+                m = MonitorFromWindow(GetDesktopWindow(), MONITOR_DEFAULTTOPRIMARY);
+                CHECK(m && GetMonitorInfoW(m, &mi));
+                DEVMODEW dm{}; dm.dmSize = sizeof dm; CHECK(EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm));
+            }
+            CHECK(seen_cx == real_cx); // the probe never changes a value
+            (void)GetSystemMetrics(SM_CXSCREEN); // outside the game scope: not counted
+            char line[2400]; FormatSizeProbe(line, sizeof line);
+            std::printf("%s\n", line);
+            CHECK(std::strstr(line, "system_metrics{n=1 "));
+            CHECK(std::strstr(line, "monitor_from_window{n=1 "));
+            CHECK(std::strstr(line, "monitor_info{n=1 "));
+            CHECK(std::strstr(line, "enum_display_settings{n=1 "));
+            char tiny[6]; std::memset(tiny, 0x55, sizeof tiny); FormatSizeProbe(tiny, sizeof tiny); CHECK(tiny[5] == 0);
         }}
     });
 }
