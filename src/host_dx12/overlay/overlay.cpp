@@ -2797,6 +2797,8 @@ int g_small_mode_now = 0;         // the user's mode this present
 uint64_t g_small_ask_after = 0;   // ms: no new ask before this (an ask the size layer refused backs off)
 int g_small_refused_mode = -1;    // a mode the game did not follow (for g_small_refused_output)
 na::native_present::Size g_small_refused_output{};
+uint64_t g_small_display_generation = 0;
+bool g_small_revalidate_display = false;
 void small_note_line(const char* what, const na::native_present::ctl::Status& c)
 {
     char row[256];
@@ -2813,6 +2815,13 @@ void small_follow_mode()
     if (!crash_capture_on) { crash_capture_on = true; AddVectoredExceptionHandler(0, &crash_capture); }
     const np::SizeState st = np::GetSizeState();
     if (!st.enabled) return;
+    if (st.mode_generation != g_small_display_generation) {
+        // An ignored request in one display mode says nothing about another.
+        // A same-size mode transition may also have rebuilt the native scene.
+        g_small_revalidate_display = g_small_display_generation != 0;
+        g_small_display_generation = st.mode_generation;
+        g_small_refused_mode = -1;
+    }
     const uint64_t now = GetTickCount64();
     g_small_mode_now = (std::min)(static_cast<int>(na::settings::Get().j2_scale_mode.load()), 3);
     {
@@ -2883,8 +2892,13 @@ void small_follow_mode()
     // A choice the game did not follow is not asked again for this output until the user changes it.
     if (g_small_refused_mode >= 0 && (g_small_refused_mode != mode || g_small_refused_output.w != st.output.w ||
                                       g_small_refused_output.h != st.output.h)) g_small_refused_mode = -1;
-    if (g_small_refused_mode == mode) return;
-    carry_out(ctl::Choose({want.w, want.h}, f, now));
+    if (g_small_refused_mode == mode && !g_small_revalidate_display) return;
+    const auto change = ctl::Choose({want.w, want.h}, f, now, g_small_revalidate_display);
+    if (change.kind == ctl::ActionKind::Ask && g_small_revalidate_display) {
+        g_small_refused_mode = -1; // the old mode's timeout may have completed during Tick above
+        g_small_revalidate_display = false;
+    }
+    carry_out(change);
 }
 HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* pp)
 {
@@ -2897,6 +2911,10 @@ HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_
         return g_orig_present(sc, sync, flags);
     }
     na::present::PresentArgs a;
+    DXGI_SWAP_CHAIN_DESC picture_desc{};
+    const HRESULT picture_desc_hr = sc->GetDesc(&picture_desc);
+    if (na::j2::RenderSmall() && SUCCEEDED(picture_desc_hr))
+        na::native_present::ObserveWindowMode(picture_desc.OutputWindow, picture_desc.Windowed != FALSE);
     na::j2::OnPresent(queue); // game call only; the presenter's generated frames bypass this
     if (na::j2::RenderSmall()) small_follow_mode();
     if (na::scale::SliderRouteActive()) na::scale::TickLive(na::j2::GetStats().width); // P4-4: confirm a live render-scale change
@@ -2907,7 +2925,6 @@ HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_
     a.flags = flags;
     a.pp = pp;
     a.queue = queue;
-    DXGI_SWAP_CHAIN_DESC picture_desc{}; sc->GetDesc(&picture_desc);
     g_presented_format.store(uint32_t(picture_desc.BufferDesc.Format), std::memory_order_relaxed);
     a.hdr = na::color::IsHdr(na::color::Classify(picture_desc.BufferDesc.Format, static_cast<DXGI_COLOR_SPACE_TYPE>(g_color_space.load(std::memory_order_acquire)))); // A60
     bool open = g_open.load(std::memory_order_acquire);

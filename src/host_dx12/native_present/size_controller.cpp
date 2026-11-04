@@ -24,12 +24,12 @@ void Reset(Extent output, Extent buffers, float applied_scale)
     g_sample_this_present = false;
 }
 
-Action Choose(Extent target, float scale, uint64_t now_ms)
+Action Choose(Extent target, float scale, uint64_t now_ms, bool revalidate)
 {
     std::lock_guard<std::mutex> lock(g_m);
     if (!valid(target) || !valid(g_s.output)) return {};
-    if (g_s.phase != Phase::Idle && Same(target, g_s.target)) return {};       // already on its way
-    if (g_s.phase == Phase::Idle && Same(target, g_s.applied)) {               // already applied
+    if (!revalidate && g_s.phase != Phase::Idle && Same(target, g_s.target)) return {};       // already on its way
+    if (!revalidate && g_s.phase == Phase::Idle && Same(target, g_s.applied)) {               // already applied
         g_s.target = target; g_s.target_scale = scale; g_s.applied_scale = scale;
         return {};
     }
