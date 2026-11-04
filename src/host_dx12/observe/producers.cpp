@@ -5570,7 +5570,7 @@ bool ListRasterStateRestorable(ID3D12CommandList* list)
     return ls->raster_tracking && ls->restorable && !ls->in_render_pass && ls->raster_targets_known &&
         ls->raster_viewports_known && ls->raster_scissors_known && ls->raster_topology_known;
 }
-bool RestoreListState(ID3D12GraphicsCommandList* l,ID3D12GraphicsCommandList* destination,bool graphics_only)
+bool RestoreListState(ID3D12GraphicsCommandList* l,ID3D12GraphicsCommandList* destination,bool graphics_only,std::vector<uint64_t>* graphics_reads)
 {
     // Snapshot under the locks, issue the calls without them (these calls run
     // under the caller's HostWorkScope, so they are not observed as the game's).
@@ -5600,6 +5600,33 @@ bool RestoreListState(ID3D12GraphicsCommandList* l,ID3D12GraphicsCommandList* de
         vertex_mask=ls->vertex_mask;std::copy_n(ls->vertex_buffers,32,vertices);index=ls->index_buffer;index_known=ls->index_known;
         std::copy_n(ls->blend_factor,4,blend);stencil=ls->stencil_ref;
         predicate=ls->predicate;predicate_offset=ls->predicate_offset;predicate_op=ls->predicate_op;
+        if(graphics_reads){
+            graphics_reads->clear();
+            const auto keep=[&](uint64_t id){if(id&&std::find(graphics_reads->begin(),graphics_reads->end(),id)==graphics_reads->end())graphics_reads->push_back(id);};
+            const auto address=[&](uint64_t va){uint64_t id=0,offset=0;if(!va)return true;if(!resolve_va_locked(va,&id,&offset))return false;keep(id);return true;};
+            for(UINT i=0;i<32;++i)if((vertex_mask&(1u<<i))&&!address(vertices[i].BufferLocation))return false;
+            if(index_known&&!address(index.BufferLocation))return false;
+            if(predicate){const auto p=g_objs.find(canon(predicate));if(p==g_objs.end())return false;keep(p->second.id);}
+            const auto root=g_objs.find(canon(ls->root_sig[0]));if(root==g_objs.end())return false;
+            for(UINT p=0;p<ls->args[0].size();++p){const auto& a=ls->args[0][p];
+                if(a.type==2||a.type==3){if(!address(a.value))return false;}
+                else if(a.type==4)return false;
+                else if(a.type==1){
+                    if(p>=root->second.root_params.size())return false;const auto& param=root->second.root_params[p];
+                    if(param.first_range>root->second.root_ranges.size()||param.count>root->second.root_ranges.size()-param.first_range)return false;
+                    UINT slot=0;const auto* heap=heap_for_gpu_locked(a.value,&slot);if(!heap)return false;
+                    for(UINT j=0;j<param.count;++j){const auto& range=root->second.root_ranges[param.first_range+j];
+                        if(range.range_type==D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER)continue;
+                        if(range.range_type==D3D12_DESCRIPTOR_RANGE_TYPE_UAV||range.num_descriptors==UINT_MAX||range.table_offset==UINT_MAX||
+                            range.table_offset>4096||range.num_descriptors>4096-range.table_offset||slot+range.table_offset>heap->count||range.num_descriptors>heap->count-slot-range.table_offset)return false;
+                        for(UINT j2=0;j2<range.num_descriptors;++j2){const auto& info=heap->info[slot+range.table_offset+j2];if(!info.details)return false;
+                            if(info.details->kind==NA_DESC_CBV){if(!address(info.details->cbv.BufferLocation))return false;}
+                            else keep(info.details->resource);
+                        }
+                    }
+                }
+            }
+        }
         ++ls->host_restore_serial;
         nheaps = ls->nheaps;
         heaps[0] = ls->heaps[0];

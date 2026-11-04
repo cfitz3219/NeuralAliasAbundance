@@ -13,6 +13,11 @@
 #include "host_dx12/host_observe.h"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/observe/producers.hpp"
+#include "host_dx12/overlay/presenter.hpp"
+#include "host_dx12/j2/native_hud.hpp"
+#include "host_dx12/j2/hud_picture.hpp"
+#include "host_dx12/capture/j2_capture.hpp"
+#include "host_dx12/native_present/size_spoof.hpp"
 
 #include <array>
 #include <memory>
@@ -537,6 +542,47 @@ int main()
         CHECK(std::fabs(na::j2::UpscaleMipBias(64, 64) + 1.0f) < 1e-6f && std::fabs(na::j2::UpscaleMipBias(50, 100) + 2.0f) < 1e-6f);
         d.WaitIdle();
     }
+    // Exercise the PRODUCTION pre-HUD upscaler callback with real deferred J2
+    // depth/motion acquisition. The model is fake; native replay mechanics have
+    // their actual indexed/stripped-shader GPU coverage in j2_native_hud_test.
+    {
+        namespace presenter=na::present;namespace hud=na::j2::native_hud;
+        HWND window=test::CreateTestWindow(L"pre-HUD callback",128,64);REQUIRE(window);
+        DXGI_SWAP_CHAIN_DESC1 desc{};desc.Width=128;desc.Height=64;desc.BufferCount=2;desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count=1;desc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;desc.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        test::ComPtr<IDXGISwapChain1> chain;REQUIRE(SUCCEEDED(d.factory->CreateSwapChainForHwnd(d.queue.Get(),window,&desc,nullptr,nullptr,&chain)));
+        presenter::Originals originals{};originals.get_buffer=[](IDXGISwapChain* sc,UINT index,REFIID riid,void** out)->HRESULT{return sc->GetBuffer(index,riid,out);};
+        presenter::SetOriginals(originals);presenter::SetRenderScale(.5f,&na::j2::PresentUpscale,nullptr);presenter::SetEnabled(true);
+        REQUIRE(na::native_present::Attach(window,{128,64},{64,32}));
+        test::ComPtr<ID3D12Resource> proxy;HRESULT hr=E_FAIL;
+        REQUIRE(presenter::HandleGetBuffer(chain.Get(),0,IID_PPV_ARGS(&proxy),&hr)&&SUCCEEDED(hr)&&presenter::Scaling());
+        na::j2::SetRenderSmall(true);na::j2::OnPresent(d.queue.Get());
+        const int before=fake::evals;REQUIRE(frame(505)==0);CHECK(fake::evals==before); // deferred, no early NGX
+        constexpr auto S=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,R=D3D12_RESOURCE_STATE_RENDER_TARGET;
+        auto native=test::CreateTexture(dev,W*2,H*2,DXGI_FORMAT_R16G16B16A16_FLOAT,S,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET|D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        auto n0=test::CreateTexture(dev,W*2,H*2,DXGI_FORMAT_R16G16B16A16_FLOAT,R,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        auto n1=test::CreateTexture(dev,W*2,H*2,DXGI_FORMAT_R16G16B16A16_FLOAT,R,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);REQUIRE(native&&n0&&n1);
+        auto picture=hud::Picture::Create(dev,color->GetDesc(),W*2,H*2);REQUIRE(picture);
+        test::ComPtr<ID3D12DescriptorHeap> heap;D3D12_DESCRIPTOR_HEAP_DESC hud_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,3,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
+        REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hud_heap_desc,IID_PPV_ARGS(&heap))));auto handle=heap->GetCPUDescriptorHandleForHeapStart();const UINT inc=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        test::List seed,replay;REQUIRE(seed.Create(dev)&&replay.Create(dev));const float black[4]{},grey[4]={1,1,1,0},marker[4]={.25f,.5f,.75f,1};
+        dev->CreateRenderTargetView(n0.Get(),nullptr,handle);seed.list->ClearRenderTargetView(handle,black,0,nullptr);handle.ptr+=inc;
+        dev->CreateRenderTargetView(n1.Get(),nullptr,handle);seed.list->ClearRenderTargetView(handle,grey,0,nullptr);handle.ptr+=inc;
+        REQUIRE(picture->SnapshotScene(seed.list.Get(),color.Get(),D3D12_RESOURCE_STATE_COMMON)&&picture->SnapshotFull(seed.list.Get(),color.Get(),D3D12_RESOURCE_STATE_COMMON));
+        REQUIRE(SUCCEEDED(seed.list->Close()));ID3D12CommandList* seeds[]={seed.list.Get()};d.queue->ExecuteCommandLists(1,seeds);d.WaitIdle();
+        dev->CreateRenderTargetView(native.Get(),nullptr,handle);auto barrier=test::Transition(native.Get(),D3D12_RESOURCE_STATE_PRESENT,R);replay.list->ResourceBarrier(1,&barrier);
+        replay.list->ClearRenderTargetView(handle,marker,0,nullptr);barrier=test::Transition(native.Get(),R,S);replay.list->ResourceBarrier(1,&barrier);REQUIRE(SUCCEEDED(replay.list->Close()));
+        hud::Layer layer;layer.n0=n0.Get();layer.n1=n1.Get();layer.view=DXGI_FORMAT_R16G16B16A16_FLOAT;layer.grey=1;layer.picture=picture;layer.clean_allowed=true;layer.owner=picture;
+        layer.recording_identity=std::make_shared<na::capture::j2::Identity>();
+        REQUIRE(na::j2::PreHudUpscale(d.queue.Get(),color.Get(),W,H,native.Get(),W*2,H*2,layer,replay.list.Get()));d.WaitIdle();
+        CHECK(fake::evals==before+1&&layer.recording_identity->evaluation_succeeded);
+        CHECK(fake::U(fake::last_create,NVSDK_NGX_Parameter_OutWidth)==W*2);
+        CHECK(!na::j2::PreHudUpscale(d.queue.Get(),color.Get(),W,H,native.Get(),W*2,H*2,layer,replay.list.Get())); // guides consumed once
+        test::List handback;REQUIRE(handback.Create(dev));barrier=test::Transition(native.Get(),S,D3D12_RESOURCE_STATE_COMMON);handback.list->ResourceBarrier(1,&barrier);
+        REQUIRE(SUCCEEDED(handback.list->Close()));ID3D12CommandList* finish[]={handback.list.Get()};d.queue->ExecuteCommandLists(1,finish);d.WaitIdle();
+        const auto pixel=ReadTexel(d,native.Get(),W,H);CHECK(pixel[0]==.25f&&pixel[1]==.5f&&pixel[2]==.75f&&pixel[3]==1);
+        na::j2::SetRenderSmall(false);proxy.Reset();d.WaitIdle();REQUIRE(presenter::Shutdown());presenter::SetEnabled(false);presenter::SetRenderScale(1,nullptr,nullptr);na::native_present::Detach(window);chain.Reset();DestroyWindow(window);
+    }
     CHECK(dev->GetDeviceRemovedReason() == S_OK);
     na::j2::SetEnabled(false);
     d.WaitIdle();
@@ -544,5 +590,6 @@ int main()
     na::dlss::Shutdown(); // GPU idle (WaitIdle above): release the fake runtime's features before exit
     na::dlss::SetInitOwnOverrideForTests(nullptr);
     na_observe_stop(); // the transport thread must not outlive main
+    na::observe::SetProcessExiting(); // same exit contract as the host before static GPU-owner teardown
     return test::finish("j2_live_test");
 }
