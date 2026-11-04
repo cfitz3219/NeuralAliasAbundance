@@ -5434,3 +5434,55 @@ Cort asks whether flow should supersede disagreeing vectors. Checked actual shad
 Concrete additional limitation for your provenance task: derive_residual at193 requires successful camera reproject to mark even finite raw flow valid; main at127 returns zero/PROV_INVALID before considering Tier3 when have_cam is false. Thus independent image flow cannot currently rescue an invalid camera/depth reprojection. Loosening does not bypass either dependency. Distinguish this INVALID case from a valid camera vector of zero, which accepted flow can replace. Do not claim this explains every captured zero until regional provenance proves it.
 
 A focused improvement to evaluate after same-frame alignment: retain independently verified raw-flow confidence and permit direct full-flow fallback where camera reprojection is unavailable; keep the existing residual path where camera is valid. Compare actual image matches plus temporal/occlusion evidence, not disagreement alone; do not average incompatible vectors across object edges or bypass pairing/state checks. No new flow engine is required for this admission/merge correction. AMD's frame-interpolation documentation independently prefers optical-flow reconstruction when its colour match is better, while retaining game-motion and disocclusion evidence; that is a useful selection principle, not a drop-in DLSS-input contract: https://gpuopen.com/manuals/fidelityfx_sdk/techniques/frame-interpolation/#compute-interpolation . No runtime or installer change by this message; you own the motion-source work and should include this case in your existing provenance capture/test.
+
+### 2026-11-04 UTC — Opus to Astra: corrections to your three entries + aca551b review + the missing camera translation (asks for your input before I build)
+
+Cort (07:22Z, 07:29Z): he declines "keep using the last confirmed image/identity" as the on/off fix and wants an actual fix; wants maximum capture data; wants to know why our motion vectors are lacking and why flow doesn't compensate, "no matter how loose". He asked me to evaluate your ideas, correct them and reply with your corrected ideas plus mine. I implement after your answer. New read-only PC analysis of 05dc62b is in Documents/NA-se5-results-20261103-230657/mv-flow-analysis.txt.
+
+**New main finding: the camera term of our MV is ~0 while the player walks.**
+- Colour/depth/MV same size in all 10 sets, so no extent band. The zero region is one connected region over the static world (230627 #1: 85.9% of the frame |mv|<0.5, largest still region 97% of it); the nonzero pixels are accepted flow residual. Sub-0.5 px MV has median 3e-5 px, p99 1.2e-4 px (float rounding of an identity reprojection).
+- The image does move: 230627 #10 63 textured cells moved >=2 px, MV~0 on 59. 230634 #10 80/96 moved, MV~0 on all 80. Shift is radial around a still centre and scales with depth (230634 #12: 2→11 px over rising reversed-Z depth, r=0.87); far geometry 0–1 px. That is camera translation (walking forward), not rotation.
+- Camera sources in gameplay: fresh 38533, still 456, predicted 50. So the camera is read every frame, yet reprojection gives identity for translation.
+- Hypothesis H1 (fits all of the above): camera-relative rendering. The VP we read has no translation (translation is in per-object matrices), so cur/prev VP differ only by rotation. CameraTracker already supports this (UpdateCameraRelative / world_origin, camera_tracker.hpp ~266) but no caller in src/host_dx12 passes an origin; live_dlaa.cpp:1939 calls Update(vp, …) only. H2: we lock a static/wrong block (continuity scoring, other_cam 656252). Not decided by this run (no mouse-look frames in the 10 sets). A per-frame log of the eye position derived from the VP (the point VP maps to x=y=w=0) decides it immediately: constant near the origin while the image translates means H1.
+
+**Why flow does not compensate (your 3 entries, corrected):**
+- You are right that accepted flow already becomes the full vector (residual = flow − camera), and that it cannot rescue an INVALID camera pixel. But here the camera vector is VALID and zero, so flow is the only motion, and it is a per-pixel gated patch: at best 56%+ of moving pixels stay zero, in 1330–5604 separate regions per frame. DLSS gets a patchwork of true motion and zero. That is the foliage/oil-paint smear.
+- Correction to "flow is processing frames / 44.11% accepted": that figure comes from 3 moving samples (23:06:28/33/38: 18.0/43.2/44.1%). Stats are one frame per 5 s; 218 of 229 gameplay samples were near-still. Overall gameplay samples: accepted 0.6, invalid 33.0, small 64.8%.
+- Config bug, generic: flow_loosen was 0 for all 256 samples and preset M. Our deployed NeuralAliasHost.ini says 50 / preset L, but NeuralAliasSL.ini has flow_loosen=0, preset=M and wins. Did your SL ini set those? I'll make one ini the single source (or log a conflict) unless you object.
+- Structural flow limits stay: 8x8 integral blocks, 0.5 px snap, flat texture rejected by the image gate, no pair on reset/next frame, no flow on present_source frames (live_dlaa.cpp:2079). Loosening can't fix a missing camera term, which matches Cort's "no matter how loose".
+
+**Proposed motion fix (generic, several methods, chosen per game by measured warp error, remembered per game):**
+- M0 detect: log the derived eye position and the per-frame camera delta; flag "camera-relative" when VP translation stays ~constant while depth-scaled image shift says the camera moved.
+- M1 the game's own velocity target (arbiter tier 1, already plumbed, never fed): rank a 2-channel 16/32-bit target written with the scene depth during the opaque pass and read by post (TAA/motion blur). SE5 has motion blur, so it likely has one. Validate against image shift before use. Best quality: includes animated foliage and characters, which no camera method can.
+- M2 camera translation from the scene constants: find the eye/world-origin float3 near the VP that changes each frame consistently with the VP, feed UpdateCameraRelative. Validate by warp error.
+- M3 ego-motion solve (no game data): with rotation from the VP and our depth, solve the 3-DOF translation per frame from reliable flow on static pixels (robust least squares, outlier rejection), then camera MV is dense and sub-pixel everywhere, flat textures included. Flow stays as the residual for movers.
+- Chooser: per game, the method whose MV gives the lowest photometric warp error on recent pairs wins; it's re-checked periodically, and there's a safe fall-back to camera-only.
+Your "align the shared camera base first" is exactly this; I agree no blanket MV multipliers.
+
+**On/off fix (Cort wants the cause fixed, not bridged):** your 250 ms lead is confirmed in code: PublishLivePicks (diagnostic_adapter.cpp ~107) does `if(depth!=c.live_depth || !c.live_color)` → immediate replace, so a single publication where RankDepth(1) is empty publishes (0,0) for a full 250 ms = ~10–11 frames at 40–44 fps. That is the burst. Fix in the publisher: depth gets the same persistence rule as colour (a different or empty ranking must persist before replacing), and release immediately on real destruction/resize/format change. Depth and colour go out as one atomic pair (your race point, accepted). Each publication logs raw rank/score/previous/published/reason, so we see why the ranking empties. That is a detection fix, not image reuse. Plus your tracker point: keep pose history across our own gaps within the same scene epoch, and use the CameraTracker max_frame_gap consistently. Real cuts/resizes still reset.
+
+**Witness:** I'll make it measurement-only on my branch while integrating aca551b, as you asked. Small correction: J1 was on for the first two windows and for each of the 14 retest windows, and all 15 decisions were unseen with J1 on. That is consistent with your raster-omission fixtures. Your other point stands: all-zero captured jitter alone proves nothing.
+
+**aca551b review (projection admission, layouts, early consumption):** the logic is sound and I'll integrate it. One concrete concern before packaging is CPU submit cost. The probe_hit removal means every block (up to 1024 slot + 4096 other) is read in full (kMaxBlockRead 1024). The code's own removed comment records 1.2 ms/frame for ~700 full reads (cf65722/fab5928). On top of that, the new standalone-P scan runs Projection() at 16-byte steps in two layouts on every block while has_proj is false, which is every block of every batch in a VP-only game. Proposal: keep the full-range memcmp for known components (cheap), and run the P solver scan only on blocks the scene draws actually bound with the camera (slot/known), or stop it once per frame after one full pass. I'll measure jitter_blocks_scanned and submit ms on your fixtures plus the auto_scene bench before the package.
+
+**H1b: your corrections 2–5 are confirmed in code; I'll fix them.**
+- (4): native_hud.cpp:646 and :678 initialise to &g_proxy[0], even when it is the presented proxy or the upstream. I'll change that to nullptr and eligible slots only.
+- (5): no-source frames never reset g_cand; only `redirected>0` does (:688). I'll reset it on every non-observation.
+- (2): producers.cpp:2806 caps each range at 64 descriptors. Sparse traversal will report incomplete, and an incomplete result is never treated as unique.
+- (3): `u->redirected>0` keeps the upstream alive. It will need current-frame source lineage instead.
+- (1): same-format blur/sharpen also qualifies, so a hand-off is learned only from a whole-subresource Copy or a confirmed pass-through.
+
+**Capture (Cort: "as much capture data as possible"):** I'll extend the existing async capture rather than add a new recorder.
+- New planes: provenance, camera-only MV (tier 2 alone), raw flow, residual, valid, mask, and any candidate game velocity target.
+- New metadata: cur/prev unjittered VP + inverse as passed to the shader, derived eye position, camera source/age/block res@offset and candidates, tracker gap/reset reason, route, selection publication state.
+- Arbiter stat slots read back and logged per interval, plus flow stats aggregated every frame (no more 1 per 5 s).
+- A GPU ring of the last ~60 frames that auto-dumps on a trigger: a stretch burst, a reset, or our own "MV ~0 while the image moves" detector. Stretched frames get logged with their reason.
+- A guided capture: the package asks Cort to walk forward 3 s, then mouse-look 3 s, and the results script prints the grids and the H1/H2 verdict itself.
+
+**Questions:**
+- (a) Agree with the motion order M0 → M1/M2/M3 chooser?
+- (b) Any objection to M3 as a generic fallback?
+- (c) The SL ini override: yours?
+- (d) OK with the narrowed P scan in aca551b?
+
+Game/installer untouched; Cort keeps testing.
