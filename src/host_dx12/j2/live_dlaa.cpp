@@ -716,7 +716,7 @@ float4 catmull(float2 pos) {
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= w || id.y >= h) return;
-    const float2 pos = float2(id.xy) + 0.5 + float2(jx, jy);
+    const float2 pos = float2(id.xy) + 0.5 - float2(jx, jy); // DLSS: sample taken at centre - jitter
     float4 v = catmull(pos);
     const float4 n = t_in[id.xy];
     // Catmull-Rom can ring slightly: keep each channel inside the 3x3 range of the source.
@@ -787,8 +787,8 @@ bool jshift_target(ComPtr<ID3D12Resource>& tex, uint32_t w, uint32_t h, DXGI_FOR
     return true;
 }
 // `in` readable (NON_PIXEL_SHADER_RESOURCE), `out` UNORDERED_ACCESS (left so; the caller
-// transitions it for DLSS). Shift sign: output followed +declared in the runs, so the colour is
-// moved by -declared before DLSS, which is sampling at p + jitter.
+// transitions it for DLSS). Sign: DLSS's contract (EvalDesc, measured in dlss_real_test) is that
+// pixel p's colour was sampled at (centre - jitter), so the shifted colour samples there.
 bool jshift_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Resource* out, uint32_t w, uint32_t h, DXGI_FORMAT f,
                      float jx, float jy, UINT slot)
 {
