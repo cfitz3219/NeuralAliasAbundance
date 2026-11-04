@@ -732,3 +732,6 @@ Astra astra/se5-hud-paths / PR93. Runtime commits961fb08,5165370,eb422f3;f626ca9
 
 ### 2026-11-04 Astra jitter repair ready, HUD follows
 Runtime6bc5731 on astra/se5-jitter-repair fixes actual viewport jitter being fitted as camera motion. Complete200case suite195PASS5SKIP0FAIL253.02s. Main COMMS contains exact Opus integration instructions and branch docs/SE5-JITTER-REPAIR-20261104.md. User retains live testing. HUD prototype resumes separately with jitter merged; not yet a release/HUD quality pass. No game deployment.
+
+### 2026-11-04 Astra jitter + HUD engineering handoff complete
+Jitter6bc5731 is independently fully tested/picked by Opus8339be8. HUD PR94 HEAD6367b06: pick e4868ee ca28b7a 6ba04ef 6367b06 in order onto that package; skip bf30f49 merge/duplicate jitter. Full200suite on6ba04ef195PASS5SKIP0FAIL263.68s; final profile fix6367b06 full Release rebuild and7affected regressions PASS14.69s. Branch docs/SE5-HUD-TRANSITION-20261104.md and main COMMS contain complete exact contracts/picks/evidence/limits. Opus stages combined additive package/CMD; user handles deployment/game visual test. No extra review cycle and no live HUD-success claim from fixtures. Native draw/alpha/HDR/lifetimes/capture qualified automatically; arbitrary changed-processing/bindless/DXIL UI remain explicitly outside this new redraw.
