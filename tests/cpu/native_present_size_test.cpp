@@ -115,6 +115,22 @@ int main() {
             SetWindowLongPtrW(w.hwnd,GWL_STYLE,style); ObserveWindowMode(w.hwnd,true);
             CHECK(GetSizeState().mode_generation!=exclusive.mode_generation);
         }},
+        {"ResizeTarget preserves only our delivered logical resize and all other mode fields", [] {
+            Window w,other; CHECK(Attach(w.hwnd,{3440,1440},{2293,960}));
+            DXGI_MODE_DESC mode{};mode.Width=1720;mode.Height=720;mode.RefreshRate={165,1};
+            mode.Format=DXGI_FORMAT_R10G10B10A2_UNORM;mode.Scaling=DXGI_MODE_SCALING_STRETCHED;
+            const auto original=mode;
+            const auto token=RequestRenderSize({1720,720});CHECK(token);
+            CHECK(!RewriteResizeTarget(w.hwnd,&mode)); // not delivered
+            deliver(w.hwnd,token);CHECK(!RewriteResizeTarget(other.hwnd,&mode));
+            CHECK(RewriteResizeTarget(w.hwnd,&mode) && mode.Width==3440 && mode.Height==1440);
+            mode.Width=original.Width;mode.Height=original.Height;
+            CHECK(std::memcmp(&mode,&original,sizeof mode)==0);
+            mode.Width=1920;mode.Height=1080;CHECK(!RewriteResizeTarget(w.hwnd,&mode)); // another real mode
+            CHECK(!CompleteResize(token,false,{}));mode=original;CHECK(!RewriteResizeTarget(w.hwnd,&mode));
+            CHECK(BeginWindowResize(w.hwnd,{1720,720},{1147,480}));
+            mode.Width=1147;mode.Height=480;CHECK(!RewriteResizeTarget(w.hwnd,&mode)); // natural window resize
+        }},
         {"physical maximize and minimize messages retain their OS meaning", [] {
             Window w; CHECK(Attach(w.hwnd,{3440,1440},{2293,960}));
             UINT msg=WM_SIZE; WPARAM wp=SIZE_MAXIMIZED; LPARAM lp=MAKELPARAM(3440,1440); WINDOWPOS scratch{};
@@ -186,6 +202,15 @@ int main() {
             const auto final=RequestRenderSize({1720,720}); CHECK(final>retry);
             CHECK(!CompleteResize(retry,true,{1720,720})); deliver(w.hwnd,final);
             CHECK(CompleteResize(final,true,{1720,720}));
+        }},
+        {"same-output OS notification cannot cancel the pending logical size", [] {
+            Window w; CHECK(Attach(w.hwnd,{3440,1440},{2293,960}));
+            const auto token=RequestRenderSize({1720,720}); CHECK(token); deliver(w.hwnd,token);
+            CHECK(BeginWindowResize(w.hwnd,{3440,1440},{2293,960})==token);
+            const auto state=GetSizeState();
+            CHECK(state.request==token && !state.request_window && state.requested.w==1720);
+            CHECK(CompleteResize(token,true,{1720,720}));
+            CHECK(GetSizeState().output.w==3440 && GetSizeState().render.w==1720);
         }},
         {"physical window resize supplies exact presenter rounding and supersedes queued mode", [] {
             Window w; CHECK(Attach(w.hwnd,{3440,1440},{2293,960}));

@@ -185,6 +185,14 @@ UINT ResizeMessage() {
     static const UINT id = RegisterWindowMessageW(L"NeuralAlias.RenderSmall.Resize.v1");
     return id;
 }
+bool RewriteResizeTarget(HWND hwnd, DXGI_MODE_DESC* mode) {
+    if (!mode) return false;
+    const auto s = GetSizeState();
+    if (!for_window(s, hwnd) || !s.request || !s.request_delivered || s.request_window ||
+        mode->Width != s.requested.w || mode->Height != s.requested.h) return false;
+    mode->Width = s.output.w; mode->Height = s.output.h;
+    return true;
+}
 uint64_t RequestRenderSize(Size render, bool force) {
     if (!valid(render) || !ResizeMessage()) return 0;
     HWND hwnd = nullptr; uint64_t token = 0;
@@ -205,6 +213,10 @@ uint64_t BeginWindowResize(HWND hwnd, Size output, Size render) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!for_window(g_state,hwnd)) return 0;
     if (!g_state.request && same(output,g_state.output) && same(render,g_state.render)) return 0;
+    // ResizeTarget/display transitions can notify WM_SIZE without changing
+    // the physical extent. Its scale is still the old committed scale; it
+    // must not replace our pending logical target with that old render size.
+    if (g_state.request && !g_state.request_window && same(output,g_request_output)) return g_state.request;
     if (g_state.request && g_state.request_delivered && same(output,g_request_output) && same(render,g_state.requested)) return g_state.request;
     g_state.requested=render; g_state.request=++g_next; g_state.request_delivered=true; g_state.request_window=true;
     g_request_tick=GetTickCount64(); g_request_output=output; ++g_requests;
