@@ -2744,7 +2744,8 @@ int2 at(int2 p, int2 d) { return clamp(p + d, int2(0, 0), int2(int(w) - 1, int(h
 // detail teach anything, so a still camera, the sky and flat areas learn nothing:
 //   * screen-fixed (same as last frame at the same place) AND not where the motion says the world
 //     came from: HUD evidence, +1/48 per frame (about a second of real movement at 50 fps);
-//   * follows the motion and not screen-fixed, or a large change: world evidence, -1/12 per frame;
+//   * follows the motion and not screen-fixed: world evidence, -1/12 per frame; a large change at
+//     the same place (any motion): -0.5;
 //   * anything else (a changing counter, a mover, a disocclusion): no change.
 // The evidence persists across camera cuts (a HUD survives them); only a new picture size clears it.
 // t0 this frame, t1 the previous frame, t2 motion (current -> previous, render pixels); u1 evidence;
@@ -2761,14 +2762,16 @@ void classify(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             [unroll] for (int x = -1; x <= 1; ++x) { const float l = luma(t0[at(p, int2(x, y))].rgb); lo = min(lo, l); hi = max(hi, l); }
         const float2 m = t2[p].xy;
         float e = (flags & 4u) != 0u ? 0.0 : u1[p];
-        if (all(abs(m) < 512.0) && dot(m, m) >= 2.25) {
-            const float3 c = t0[p].rgb;
-            const float still = maxdiff(c, t1[p].rgb);
+        const float3 c = t0[p].rgb;
+        const float still = maxdiff(c, t1[p].rgb);
+        // A large change at a fixed place, moving camera or not: not a still overlay now (Sol HUD-R2:
+        // a HUD element that disappears over a flat background must not stay HUD).
+        if (still > 0.15) e -= 0.5;
+        else if (all(abs(m) < 512.0) && dot(m, m) >= 2.25) {
             const float2 uv = (float2(p) + 0.5 + m) / float2(w, h);
             const bool inside = all(uv > 0.0) && all(uv < 1.0);
             const float follow = inside ? maxdiff(c, t1.SampleLevel(s_lin, uv, 0).rgb) : 1.0;
-            if (still > 0.15) e -= 1.0 / 12.0; // a large change at a fixed place: not a still overlay now
-            else if (hi - lo > 0.06) {
+            if (hi - lo > 0.06) {
                 uint dummy;
                 InterlockedAdd(gs_detail, 1u, dummy);
                 if (still < 0.02 && inside && follow > max(0.06, 3.0 * still)) e += 1.0 / 48.0;

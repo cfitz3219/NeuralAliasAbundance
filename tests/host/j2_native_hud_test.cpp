@@ -164,6 +164,40 @@ int classify(test::Device& d)
             CHECK(outside == 0.f);
         }
     }
+    // Motion-conditioned learning (2026-11-04 fallback): a detailed overlay that stays put while the
+    // camera vector moves the world 4 px gains evidence; the same picture with a still camera
+    // teaches nothing; a detailed area that follows the motion loses evidence.
+    {
+        std::vector<uint32_t> pic(W * H);
+        for (uint32_t y = 0; y < H; ++y)
+            for (uint32_t x = 0; x < W; ++x) pic[y * W + x] = ((x + y) & 1) ? 0xFFFFFFFFu : 0xFF000000u;
+        std::vector<float> half(W * H, 0.5f), still_mv(W * H * 2, 0.f), moving(W * H * 2, 0.f);
+        for (uint32_t i = 0; i < W * H; ++i) moving[i * 2] = 3.f; // odd shift: the checkerboard does not follow it
+        auto a = test::CreateTexture(dev, W, H, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
+        auto mv0 = test::CreateTexture(dev, W, H, DXGI_FORMAT_R32G32_FLOAT, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
+        auto mv1 = test::CreateTexture(dev, W, H, DXGI_FORMAT_R32G32_FLOAT, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
+        auto ev = test::CreateTexture(dev, W, H, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        REQUIRE(a && mv0 && mv1 && ev);
+        REQUIRE(upload(d, a.Get(), pic.data(), 4, NPSR) && upload(d, mv0.Get(), still_mv.data(), 8, NPSR) &&
+                upload(d, mv1.Get(), moving.data(), 8, NPSR) && upload(d, ev.Get(), half.data(), 4, UAV));
+        float got[2] = {};
+        for (int pass = 0; pass < 2; ++pass) {
+            test::List l;
+            REQUIRE(l.Create(dev));
+            REQUIRE(na::j2::RecordHudClassifyForTests(d.queue.Get(), l.list.Get(), a.Get(), a.Get(), DXGI_FORMAT_R8G8B8A8_UNORM,
+                                                      pass ? mv1.Get() : mv0.Get(), ev.Get(), W, H, 0u));
+            REQUIRE(SUCCEEDED(l.list->Close()));
+            ID3D12CommandList* lists[] = {l.list.Get()};
+            d.queue->ExecuteCommandLists(1, lists);
+            d.WaitIdle();
+            std::vector<uint8_t> raw;
+            REQUIRE(readback(d, ev.Get(), UAV, 4, raw));
+            std::memcpy(&got[pass], raw.data() + (8 * W + 8) * 4, 4);
+        }
+        std::printf("classify motion: still camera %.4f, moving camera %.4f (from 0.5)\n", got[0], got[1]);
+        CHECK(got[0] == 0.5f);  // a still camera teaches nothing
+        CHECK(got[1] > 0.51f);  // screen-fixed while the world moves: HUD evidence
+    }
     return 0;
 }
 
