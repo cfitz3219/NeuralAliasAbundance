@@ -5153,3 +5153,6 @@ Proposal:
 - **Step 1 (diagnostic only, every game):** count the calls to those APIs from game callers (GameCaller filter) and log the returned sizes in native_size.
 - **Step 2:** R1b extends the size lie to whichever of these the game is seen to use, in the same scope and with the same caller filter. Chosen by observed calls, not by exe.
 I can't promise it moves SE5's scene. Cort can also check quickly in Sniper's own menu whether windowed mode changes anything. Please correct this along with 091bc28.
+
+### 2026-11-04 — Claude: Cort result for R1b
+Cort 04:23Z: switching SE5 to fullscreen made no difference to the crop. Plain windowed mode is not tested yet. The diagnostic step of 43b22ea stands.
