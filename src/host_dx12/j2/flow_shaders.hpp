@@ -23,7 +23,7 @@ cbuffer C : register(b0) {
     uint mode, block, has_cost, cost_max;
     uint cnt_off, gw, gh; float image_ratio;
     float snap_px, image_margin, image_abs, texture_min;
-    uint have_hist, agree_min, pad1, pad2;
+    uint have_hist, agree_min; float dj_x, dj_y; // dj: this pair's stabilisation jitter delta (current - previous)
     float agree_px, agree_cos, jitter_x, jitter_y;
 };
 float3 srgb_encode(float3 v) { v = saturate(v); return v <= 0.0031308 ? 12.92 * v : 1.055 * pow(v, 1.0 / 2.4) - 0.055; }
@@ -99,7 +99,9 @@ void accept(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             else if (texture_at(p) < texture_min) why = 5; // flat: the image cannot confirm a residual
             else {
                 float e_flow = image_error(p, raw);
-                float e_cam = image_error(p, raw - r);
+                // Camera alone, under both jitter conventions: when the colour carries no jitter,
+                // the stabilised pair is shifted by dj and that shift is not object motion.
+                float e_cam = min(image_error(p, raw - r), image_error(p, raw - r + float2(dj_x, dj_y)));
                 // Rejected when the image contradicts the flow, or does not clearly prefer it
                 // over the camera alone; accepted where the image cannot tell (flat interiors
                 // of moving objects: both errors within image_margin), cost permitting.

@@ -24,12 +24,12 @@ void order(ID3D12GraphicsCommandList* l){D3D12_RESOURCE_BARRIER x{};x.Type=D3D12
 // Same layout and gate values as j2_flow.cpp's Constants/k* (the Anno-run tuning):
 // snap 0.5 px, image ratio 0.5, temporal agreement (one previous pair, 60 deg, 3 px).
 struct Constants {unsigned w,h,ew,eh,mode,block,cost,cost_max,offset,gw,gh;float ratio=.5f;float snap=.5f,margin=.02f,absolute=.08f,texture=.03f;
-    unsigned have_hist=0,agree_min=1,pad1=0,pad2=0;float agree_px=3.f,agree_cos=.5f,jitter_x=0,jitter_y=0;};
+    unsigned have_hist=0,agree_min=1;float dj_x=0,dj_y=0;float agree_px=3.f,agree_cos=.5f,jitter_x=0,jitter_y=0;};
 static_assert(sizeof(Constants)==24*4,"root constants");
 constexpr unsigned kTable=12,kUav=8; // descriptors per table: SRVs t0..t7, then UAVs u0..u3
 struct Image {ComPtr<ID3D12Resource> tex;std::vector<Lease> uses;Lease producer;uint64_t frame=0;unsigned generation=0;float jitter[2]{};};
 struct Slot {
-    Lease lease;bool pair=false,submitted=false;uint64_t frame=0;
+    Lease lease;bool pair=false,submitted=false,fit_only=false;uint64_t frame=0;
     ComPtr<ID3D12DescriptorHeap> heap,engine_heap,expand_heap,derive_heap;
     ComPtr<ID3D12Resource> readback;ComPtr<ID3D12QueryHeap> timestamps;
     ComPtr<ID3D12Resource> color_input,depth_input;
@@ -93,8 +93,12 @@ void collect(Context& c){for(size_t index=0;index<c.leases.size();++index){auto&
     if(!s.submitted){s.pair=false;na::motion::gpu::FitResult drop;c.fit.Collect(static_cast<uint32_t>(index),&drop);continue;} // discarded commands never wrote telemetry
     {na::motion::gpu::FitResult r;if(c.fit.Collect(static_cast<uint32_t>(index),&r)){++stats.fit_collected;
         memcpy(stats.fit_theta,r.theta,sizeof r.theta);stats.fit_e0=r.energy0;stats.fit_e=r.energy;stats.fit_n0=r.samples0;stats.fit_n=r.samples;stats.fit_last_accepted=r.accepted;
-        if(r.accepted){++stats.fit_accepted;stats.fit_e0_sum+=r.energy0;stats.fit_e_sum+=r.energy;}}}
-    {void* p=nullptr;D3D12_RANGE range{0,64};
+        if(r.accepted){++stats.fit_accepted;stats.fit_e0_sum+=r.energy0;stats.fit_e_sum+=r.energy;}
+        if(r.flow_accepted){++stats.fit_flow_passed;if(!r.accepted)++stats.fit_rejected_image;}
+        else if(r.samples>=256 && r.samples0>=256 && r.energy0>.05f && r.energy<.7f*r.energy0)++stats.fit_rejected_jitter; // plain test passed, quantised/jitter test refused
+        stats.fit_e_alt=r.energy_alt;stats.fit_photo_tested=r.photo_tested;stats.fit_photo_better=r.photo_better;stats.fit_photo_worse=r.photo_worse;
+        stats.fit_photo_regions=r.photo_regions;stats.fit_photo_good=r.photo_regions_good;stats.fit_photo_e_fit=r.photo_e_fit;stats.fit_photo_e_cam=r.photo_e_cam;}}
+    if(!s.fit_only){void* p=nullptr;D3D12_RANGE range{0,64};
         if(SUCCEEDED(s.readback->Map(0,&range,&p))){const auto* b=static_cast<const unsigned char*>(p);const auto* v=reinterpret_cast<const unsigned*>(b);
             for(unsigned j=0;j<7;++j)stats.sum[j]+=v[j];++stats.sum_pairs;
             if(s.frame<stats.sample_frame){D3D12_RANGE none0{};s.readback->Unmap(0,&none0);s.pair=false;continue;}
@@ -136,12 +140,13 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
     int image=-1;for(unsigned j=0;j<c->images.size();++j)if(static_cast<int>(j)!=c->last && free(*c->images[j])){image=static_cast<int>(j);break;}
     if(image<0){auto next=std::make_unique<Image>();if(!c->tex(DXGI_FORMAT_R8G8B8A8_UNORM,next->tex)){++stats.unavailable;reason("AMD history image allocation failed; camera motion used");return {};}
         image=static_cast<int>(c->images.size());c->images.push_back(std::move(next));}
-    slot.lease=lease;slot.pair=false;slot.submitted=false;slot.hist_written=-1;slot.frame=f.frame;auto& im=*c->images[image];im.uses.push_back(lease);im.producer=lease;
+    slot.lease=lease;slot.pair=false;slot.submitted=false;slot.fit_only=!f.residual;slot.hist_written=-1;slot.frame=f.frame;auto& im=*c->images[image];im.uses.push_back(lease);im.producer=lease;
     slot.color_input=color;slot.depth_input=depth;
     stats.recording_slots=static_cast<uint32_t>(c->leases.size());stats.image_slots=static_cast<uint32_t>(c->images.size());
     const int previous=c->last;
     bool pair=!f.reset && previous>=0 && c->images[previous]->frame==f.previous && f.previous && c->images[previous]->generation==f.generation && c->images[previous]->producer.Ready(queue);
     Ticket t;t.context=c;t.image=static_cast<unsigned>(image);t.previous=previous<0?0u:static_cast<unsigned>(previous);t.slot=work;t.frame=f;t.pair=pair;
+    stats.camera_reconstruct=f.camera_reconstruct;if(f.camera_reconstruct)++stats.reconstruct_frames;
     stats.loosen=g_loosen.load(std::memory_order_relaxed);
     const Gates gates=GatesFor(stats.loosen);
     Constants cb{};cb.ratio=gates.image_ratio;cb.absolute=gates.image_abs;cb.texture=gates.texture_min;
@@ -165,9 +170,21 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
     // M3 (camera_fit_gpu.hpp): fit the rigid camera correction on this exact pair, on the GPU, before
     // the residual is derived, so the residual and the arbiter's tier 2 use the same corrected camera.
     ID3D12Resource* fix=nullptr;
+    // The pair's images feed the fit's image check; dj = the stabilisation jitter delta of this
+    // pair (current - previous), the shift the encode adds when the colour carries no jitter.
+    const float dj[2]={f.jitter[0]-prev.jitter[0],f.jitter[1]-prev.jitter[1]};
+    cb.dj_x=dj[0];cb.dj_y=dj[1];
     if(ok && camera.fit_basis && c->fit.Ready()){
-        fix=c->fit.Record(l,work,depth,c->raw.Get(),c->expanded.Get(),*camera.fit_basis,camera.jitter_current_px,camera.depth_clear,w,h);
+        na::motion::gpu::FitImages images;images.current=im.tex.Get();images.previous=prev.tex.Get();images.jitter_delta_px[0]=dj[0];images.jitter_delta_px[1]=dj[1];
+        fix=c->fit.Record(l,work,depth,c->raw.Get(),c->expanded.Get(),*camera.fit_basis,camera.jitter_current_px,camera.depth_clear,w,h,&images);
         if(fix)++stats.fit_recorded;}
+    if(!f.residual){ // camera reconstruction only: no residual, no acceptance, no temporal history
+        c->engine.Finish(l);
+        if(slot.timestamps){l->EndQuery(slot.timestamps.Get(),D3D12_QUERY_TYPE_TIMESTAMP,1);l->ResolveQueryData(slot.timestamps.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0,2,slot.readback.Get(),48);}
+        if(ok && fix){out.fix=fix;slot.pair=true;++stats.pairs;++stats.fit_only;reason("AMD flow: camera motion reconstructed (object motion off)");}
+        else {++stats.unavailable;reason("AMD flow camera fit unavailable; camera motion used");}
+        return t;
+    }
     na::motion::gpu::Inputs fitted=camera;fitted.fix=fix;
     move(l,c->residual.Get(),S,U);move(l,c->valid.Get(),S,U);
     // Stabilised images: the raw flow carries no jitter shift, so (jitter_prev - jitter_cur) must be 0.
