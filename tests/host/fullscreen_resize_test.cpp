@@ -6,8 +6,10 @@
 #include "host_dx12/native_present/size_spoof.hpp"
 #include "host_dx12/native_present/size_controller.hpp"
 #include "host_dx12/hooking/vtable_hook.hpp"
+#include "host_dx12/j2/live_dlaa.hpp"
 #include <cmath>
 namespace na::overlay { long ReadNativeBufferForTests(IDXGISwapChain*,unsigned,REFIID,void**); }
+extern "C" __declspec(dllimport) HRESULT WINAPI FixtureResizeTarget(IDXGISwapChain*,const DXGI_MODE_DESC*);
 namespace np=na::native_present;
 namespace ctl=na::native_present::ctl;
 namespace {
@@ -20,17 +22,31 @@ struct Game {
     uint64_t token=0;
     UINT w=0,h=0,calls=0;
     HRESULT hr=E_FAIL;
+    bool rebuilding=false;
 };
 LRESULT CALLBACK proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
     if(msg==WM_NCCREATE) SetWindowLongPtrW(hwnd,GWLP_USERDATA,
         reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams));
     auto* game=reinterpret_cast<Game*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));
     WINDOWPOS scratch{};
+    if(msg==WM_SIZE && wp!=SIZE_MINIMIZED && LOWORD(lp) && HIWORD(lp)) {
+        const auto scale=na::present::RenderScale();
+        np::BeginWindowResize(hwnd,{LOWORD(lp),HIWORD(lp)},
+            {UINT(std::lround(LOWORD(lp)*scale)),UINT(std::lround(HIWORD(lp)*scale))});
+    }
     if(np::PrepareSizeMessage(hwnd,msg,wp,lp,scratch)==np::MessageAction::Consume)return 0;
-    if(game && game->token && msg==WM_SIZE) {
+    if(game && game->token && msg==WM_SIZE && !game->rebuilding) {
         if(wp==SIZE_MAXIMIZED || wp==SIZE_MINIMIZED)return 0;
+        struct Rebuilding { bool& active; Rebuilding(bool& b):active(b){active=true;} ~Rebuilding(){active=false;} } guard(game->rebuilding);
         RECT rect{};
         { const np::GameScopeForTest scope; if(!GetClientRect(hwnd,&rect))return 0; }
+        // Some engines resize their physical target as part of a logical
+        // rebuild. Exercise the actual vtable hook from a registered engine
+        // DLL, so DXGI/system callers still receive physical geometry.
+        DXGI_MODE_DESC mode{};mode.Width=UINT(rect.right);mode.Height=UINT(rect.bottom);
+        mode.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
+        game->hr=FixtureResizeTarget(game->chain.Get(),&mode);
+        if(FAILED(game->hr))return 0;
         game->buffer.Reset();
         game->hr=game->chain->ResizeBuffers(0,UINT(rect.right),UINT(rect.bottom),DXGI_FORMAT_UNKNOWN,0);
         if(SUCCEEDED(game->hr)) game->hr=game->chain->GetBuffer(0,IID_PPV_ARGS(&game->buffer));
@@ -90,9 +106,12 @@ int run(test::Device& device,bool maximized) {
 }
 }
 int main() {
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     SetEnvironmentVariableW(L"NEURALALIAS_TEST_WARP",L"1");
     test::Device d;if(!test::CreateDevice(d))return test::kSkip;
+    na::j2::SetRenderSmall(true);
     REQUIRE(na::hooking::Initialize() && na::overlay::StartCore("SIZING",nullptr) && np::InstallSizeHooks());
+    REQUIRE(np::RegisterGameModule(reinterpret_cast<const void*>(&FixtureResizeTarget)));
     na::present::SetEnabled(true);
     REQUIRE(run(d,false)==0);REQUIRE(run(d,true)==0);
     na::present::SetRenderScale(1.f,nullptr,nullptr);

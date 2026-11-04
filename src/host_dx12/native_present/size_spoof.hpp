@@ -61,6 +61,10 @@ bool RewriteClientRect(HWND hwnd, RECT* rect);
 bool RewriteWindowRect(HWND hwnd, RECT* rect);
 bool RewriteDesc(DXGI_SWAP_CHAIN_DESC* desc);
 bool RewriteDesc1(HWND hwnd, DXGI_SWAP_CHAIN_DESC1* desc);
+// A game's ResizeTarget during our delivered render-only request describes
+// the logical canvas. Keep the physical target at output size; unrelated
+// game mode changes and natural window resizes remain unchanged.
+bool RewriteResizeTarget(HWND hwnd, DXGI_MODE_DESC* mode);
 
 // Posts one registered message to the WINDOW thread. PrepareSizeMessage turns
 // it into a virtual WM_SIZE immediately before forwarding to the GAME WndProc.
