@@ -656,6 +656,10 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
         g.stats.feature_out_h = d.out_h;
         g.stats.feature_flags = flags;
         g.stats.feature_preset = d.preset;
+        {
+            auto& c = g.stats.creates[g.stats.create_seq % 8];
+            c = {++g.stats.create_seq, d.view_id, flags, d.preset, static_cast<uint32_t>(d.quality), create_w, create_h, d.out_w, d.out_h};
+        }
         collect_locked(); // the retired feature may already be free of uses
     }
     Feature& ft = g.features[view.feature];

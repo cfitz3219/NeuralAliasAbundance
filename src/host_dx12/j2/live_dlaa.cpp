@@ -2325,6 +2325,14 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     e.depth_inverted = reversed;
     g.stats.depth_reversed = reversed;
     e.auto_exposure = true;
+    {
+        // Cort 2026-11-04: after a few mode changes DLAA turned dark (highlights pinned near 1.0
+        // in DLSS's raw output, run p27200) and stayed dark; Quality, on its own feature, was fine.
+        // Coming back to DLAA from render-small therefore starts a fresh DLAA feature, so no state
+        // the old one built up survives a mode change.
+        static uint64_t small_seen = 0;
+        if (g.stats.small_dlss != small_seen) { small_seen = g.stats.small_dlss; na::dlss::ReleaseView(kViewId); ++g.stats.dlaa_fresh_features; }
+    }
     const bool evaluated = na::dlss::Evaluate(l, e);
     if (!evaluated) ++g.stats.dlss_failed;
     if (evaluated && na::capture::j2::Armed()) {

@@ -237,6 +237,10 @@ struct Stats {
     uint32_t feature_render_w = 0, feature_render_h = 0, feature_out_w = 0, feature_out_h = 0;
     uint32_t feature_flags = 0;
     uint32_t feature_preset = 0; // render preset requested at creation (0 = default)
+    // The last eight feature creations, for the status log (create_seq counts all of them).
+    struct Create { uint64_t seq = 0, view = 0; uint32_t flags = 0, preset = 0, quality = 0, rw = 0, rh = 0, ow = 0, oh = 0; };
+    Create creates[8] = {};
+    uint64_t create_seq = 0;
     int32_t last_ngx_result = 0;
     char reason[128] = {};
 };

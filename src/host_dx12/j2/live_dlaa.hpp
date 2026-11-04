@@ -334,6 +334,7 @@ struct Stats {
     // Render-small: frames whose depth + motion were kept for Present; pictures DLSS upscaled at
     // Present / stretched (no fresh depth + motion) / not produced (the presenter kept its old one).
     uint64_t small_deferred = 0, small_dlss = 0, small_stretched = 0, small_failed = 0, small_dlss_failed = 0, small_sharpened = 0, small_hud = 0, small_hud_layer = 0;
+    uint64_t dlaa_fresh_features = 0; // DLAA features started fresh on return from render-small
     // HUD protection fallback (screen-fixed map learned during movement; 2026-11-04): frames it
     // ran, frames it was applied (zero motion + DLSS current-colour bias + NIS HUD pixels), frames
     // learned only (coverage above 30 %: not applied), and the last completed frame's mask pixels,

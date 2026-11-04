@@ -852,6 +852,21 @@ void write_status_line()
         xess.hooked_functions, xess.contexts_initialized, xess.executes, xess.replaced, xess.fallbacks, xess.reason,
         dlss.evaluates, dlss.features_created, dlss.rejected, static_cast<unsigned>(dlss.last_ngx_result), dlss.reason);
     if (un > 0) WriteFile(f, upscalers, static_cast<DWORD>((std::min)(un, static_cast<int>(sizeof(upscalers) - 1))), &written, nullptr);
+    {   // Every DLSS feature creation since the last block (flags: 1 IsHDR, 2 MVLowRes, 4 MVJittered,
+        // 8 DepthInverted, 64 AutoExposure), so a changed DLSS state can be tied to a mode change.
+        static uint64_t printed = 0;
+        const uint64_t first = dlss.create_seq > 8 && printed < dlss.create_seq - 8 ? dlss.create_seq - 8 : printed;
+        for (uint64_t s = first + 1; s <= dlss.create_seq; ++s) {
+            const auto& c = dlss.creates[(s - 1) % 8];
+            if (c.seq != s) continue;
+            char row[256];
+            const int n = snprintf(row, sizeof(row), "dlss_create seq=%llu view=0x%llX flags=0x%X hdr=%u autoexp=%u inverted=%u preset=%u quality=%u render=%ux%u out=%ux%u\r\n",
+                                   static_cast<unsigned long long>(c.seq), static_cast<unsigned long long>(c.view), c.flags, (c.flags & 1u) ? 1u : 0u,
+                                   (c.flags & 64u) ? 1u : 0u, (c.flags & 8u) ? 1u : 0u, c.preset, c.quality, c.rw, c.rh, c.ow, c.oh);
+            if (n > 0) WriteFile(f, row, static_cast<DWORD>((std::min)(n, static_cast<int>(sizeof(row) - 1))), &written, nullptr);
+        }
+        printed = dlss.create_seq;
+    }
     char pacing[256];
     int pn = snprintf(pacing, sizeof(pacing), "present_boundary returned=%llu thread=%lu hr=0x%08lX game_latency_handle=0x%llX queue=0x%llX\r\n",
                       static_cast<unsigned long long>(g_present_returns.load()), g_present_caller.load(),
@@ -913,7 +928,7 @@ void write_status_line()
             const auto ps = na::present::GetStats();
             char sl[900];
             const int sn = snprintf(sl, sizeof sl,
-                "native_present mode=%u scale=%.3f proxies=%ux%u native=%ux%u scene=%ux%u deferred=%llu dlss=%llu stretched=%llu failed=%llu dlss_refused=%llu sharpened=%llu sharpness=%u hud_nis_frames=%llu hud_nis=%u presenter_upscaled=%llu presenter_kept_old=%llu dlss_in=%ux%u dlss_out=%ux%u jitter_phases=%u mip_bias=%.2f present_source=%llu present_refused=%llu depth_clears=%u present_why=\"%s\" note=\"%s\"\r\n",
+                "native_present mode=%u scale=%.3f proxies=%ux%u native=%ux%u scene=%ux%u deferred=%llu dlss=%llu stretched=%llu failed=%llu dlss_refused=%llu sharpened=%llu sharpness=%u hud_nis_frames=%llu hud_nis=%u presenter_upscaled=%llu presenter_kept_old=%llu dlss_in=%ux%u dlss_out=%ux%u jitter_phases=%u mip_bias=%.2f present_source=%llu present_refused=%llu depth_clears=%u dlaa_fresh=%llu present_why=\"%s\" note=\"%s\"\r\n",
                 na::settings::Get().j2_scale_mode.load(), na::present::RenderScale(), ps.scaled_w, ps.scaled_h, ps.native_w, ps.native_h,
                 j2.width, j2.height, (unsigned long long)j2.small_deferred, (unsigned long long)j2.small_dlss,
                 (unsigned long long)j2.small_stretched, (unsigned long long)j2.small_failed, (unsigned long long)j2.small_dlss_failed,
@@ -921,7 +936,7 @@ void write_status_line()
                 (unsigned long long)j2.small_hud, na::settings::Get().j2_hud_nis.load(),
                 (unsigned long long)ps.upscaled, (unsigned long long)ps.upscale_failed, j2.small_rw, j2.small_rh, j2.small_ow, j2.small_oh,
                 j2.jitter_phases, na::observe::SamplerMipBias(), (unsigned long long)j2.small_present_source,
-                (unsigned long long)j2.small_present_refused, j2.depth_clears_last, j2.small_present_why, j2.small_note);
+                (unsigned long long)j2.small_present_refused, j2.depth_clears_last, (unsigned long long)j2.dlaa_fresh_features, j2.small_present_why, j2.small_note);
             if (sn > 0) WriteFile(f, sl, DWORD((std::min)(sn, int(sizeof sl - 1))), &written, nullptr);
             {
                 char wl[320];
