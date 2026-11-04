@@ -11,6 +11,22 @@ Action present(Extent scene, uint64_t& t, uint64_t step = 16) { Observe(scene); 
 }
 int main() {
     return test::run({
+        {"same-size display mode change re-asks once and requires new scene confirmation", [] {
+            uint64_t t=1000;
+            Reset(kNative,kQuality,.667f);
+            CHECK(Choose(kQuality,.667f,t).kind==ActionKind::None);
+            CHECK(Choose(kQuality,.667f,t,true).kind==ActionKind::Ask);
+            Asked(80,t);
+            CHECK(Same(Get().buffers,kQuality) && Same(Get().applied,kQuality));
+            CHECK(Get().matches==0 && Get().phase==Phase::Allocated);
+            CHECK(present({},t).kind==ActionKind::None);
+            CHECK(present(kQuality,t).kind==ActionKind::None);
+            CHECK(present(kNative,t).kind==ActionKind::None); // contradiction clears partial confirmation
+            CHECK(present(kQuality,t).kind==ActionKind::None);
+            CHECK(present(kQuality,t).kind==ActionKind::None);
+            CHECK(present(kQuality,t).kind==ActionKind::Commit);
+            CHECK(Choose(kQuality,.667f,t).kind==ActionKind::None); // no request storm
+        }},
         {"native boot: the game follows Quality, the mode applies only after 3 fresh scene samples", [] {
             uint64_t t = 1000;
             Reset(kNative, kNative, 1.f);

@@ -42,7 +42,9 @@ constexpr uint64_t kTimeoutMs = 5000;
 void Reset(Extent output, Extent buffers, float applied_scale);
 // The user's mode (or native DLAA: scale 1, target = output). Returns Ask when the game must be
 // asked; None when it is already applied/pending at that size. Supersedes a pending change.
-Action Choose(Extent target, float scale, uint64_t now_ms);
+// revalidate: display mode changed at the same extent; ask again and require
+// new submitted scene observations instead of reusing the old applied result.
+Action Choose(Extent target, float scale, uint64_t now_ms, bool revalidate = false);
 // The size_spoof token for the Ask just carried out (0 = posting failed: the change is dropped).
 void Asked(uint64_t token, uint64_t now_ms);
 // The presenter allocated the game's buffers at this size (inside the game's ResizeBuffers/GetBuffer).

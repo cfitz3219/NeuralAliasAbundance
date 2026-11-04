@@ -13,6 +13,7 @@ struct SizeState {
     uint64_t generation = 0, request = 0;
     bool enabled = false, request_delivered = false;
     bool request_window = false; // the pending request is a REAL window resize (BeginWindowResize), not our ask
+    uint64_t mode_generation = 0; // real window style/monitor/exclusive state; independent of render requests
 };
 struct InputGeometry {
     RECT physical_client{}; // SCREEN coordinates, using real user32 calls
@@ -49,6 +50,9 @@ bool InstallSizeHooks();
 bool Attach(HWND hwnd, Size output, Size render);
 void Detach(HWND hwnd);
 SizeState GetSizeState();
+// Observe real DXGI Windowed state on the normal Present path. A mode change
+// can require a new size request even when physical output dimensions match.
+void ObserveWindowMode(HWND hwnd, bool windowed);
 bool GetInputGeometry(InputGeometry* out);
 
 // Caller-filter BEFORE invoking these explicit transforms from DXGI detours.

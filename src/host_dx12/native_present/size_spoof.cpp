@@ -22,6 +22,9 @@ std::array<ModuleRange,16> g_game_modules{};
 std::atomic<unsigned> g_game_module_count{0};
 std::mutex g_modules_mutex;
 bool g_installed = false;
+bool g_mode_valid = false, g_windowed = true;
+LONG_PTR g_window_style = 0;
+HMONITOR g_monitor = nullptr;
 using RectFn = BOOL(WINAPI*)(HWND, LPRECT);
 RectFn g_client = nullptr, g_window = nullptr;
 std::atomic<uint64_t> g_client_queries{0}, g_window_queries{0}, g_desc_queries{0};
@@ -114,13 +117,26 @@ bool Attach(HWND hwnd, Size output, Size render) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_state.enabled && g_state.hwnd == hwnd) return same(output, g_state.output) && same(render, g_state.render);
     g_state = {hwnd, output, render, {}, ++g_next, 0, true};
+    g_mode_valid = false;
     return true;
 }
 void Detach(HWND hwnd) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_state.hwnd == hwnd) { g_state = {}; ++g_next; }
+    if (g_state.hwnd == hwnd) { g_state = {}; g_mode_valid = false; ++g_next; }
 }
 SizeState GetSizeState() { std::lock_guard<std::mutex> lock(g_mutex); return g_state; }
+void ObserveWindowMode(HWND hwnd, bool windowed) {
+    if (!hwnd || !IsWindow(hwnd)) return;
+    const NativeScope native;
+    const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE) & (WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_MAXIMIZE);
+    const HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!for_window(g_state, hwnd)) return;
+    if (!g_mode_valid || g_windowed != windowed || g_window_style != style || g_monitor != monitor) {
+        g_windowed = windowed; g_window_style = style; g_monitor = monitor; g_mode_valid = true;
+        g_state.mode_generation = ++g_next;
+    }
+}
 bool GetInputGeometry(InputGeometry* out) {
     if (!out) return false;
     const auto s = GetSizeState();
@@ -204,7 +220,10 @@ MessageAction PrepareSizeMessage(HWND hwnd, UINT& msg, WPARAM& wp, LPARAM& lp, W
             if (g_state.request != s.request || g_state.hwnd != hwnd) return MessageAction::Consume;
             g_state.request_delivered = true; s.request_delivered = true;
         }
-        msg = WM_SIZE; wp = IsZoomed(hwnd) ? SIZE_MAXIMIZED : SIZE_RESTORED;
+        // This changes the logical render canvas, not the OS window state.
+        // SIZE_MAXIMIZED asks some engines to restore their monitor dimensions
+        // and ignore our smaller client extent. Real WM_SIZE keeps its wParam.
+        msg = WM_SIZE; wp = SIZE_RESTORED;
     } else if (msg == WM_SIZE) {
         if (wp == SIZE_MINIMIZED || !LOWORD(lp) || !HIWORD(lp)) return MessageAction::Forward;
     } else if (msg == WM_WINDOWPOSCHANGED) {
@@ -258,12 +277,13 @@ void FormatSizeStatus(char* out, uint32_t capacity) {
     if (!out || !capacity) return;
     const auto s = GetSizeState(); const auto c = GetSizeStats();
     std::snprintf(out, capacity,
-        "native_size on=%u output=%ux%u render=%ux%u requested=%ux%u generation=%llu pending=%llu queries{client=%llu window=%llu desc=%llu} messages{size=%llu pos=%llu} resize{asked=%llu ok=%llu failed=%llu}",
+        "native_size on=%u output=%ux%u render=%ux%u requested=%ux%u generation=%llu pending=%llu queries{client=%llu window=%llu desc=%llu} messages{size=%llu pos=%llu} resize{asked=%llu ok=%llu failed=%llu} mode_generation=%llu",
         s.enabled ? 1u : 0u, s.output.w,s.output.h,s.render.w,s.render.h,s.requested.w,s.requested.h,
         static_cast<unsigned long long>(s.generation),static_cast<unsigned long long>(s.request),
         static_cast<unsigned long long>(c.client_queries),static_cast<unsigned long long>(c.window_queries),
         static_cast<unsigned long long>(c.desc_queries),static_cast<unsigned long long>(c.size_messages),
         static_cast<unsigned long long>(c.position_messages),static_cast<unsigned long long>(c.requests),
-        static_cast<unsigned long long>(c.completed),static_cast<unsigned long long>(c.failed));
+        static_cast<unsigned long long>(c.completed),static_cast<unsigned long long>(c.failed),
+        static_cast<unsigned long long>(s.mode_generation));
 }
 } // namespace na::native_present
