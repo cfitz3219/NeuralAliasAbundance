@@ -579,6 +579,7 @@ na::observe::ShaderScope redirect(ID3D12GraphicsCommandList* l, na::observe::Sha
     }
     const char* why = nullptr;
     const DXGI_FORMAT view = static_cast<DXGI_FORMAT>(st.rtv_format);
+    if(p->preserve&&p->cleared&&p->view!=view)p->clean=false;
     if (!st.restorable) why = "the list's targets cannot be handed back";
     else if (!st.pipeline_known) why = "unknown pipeline";
     else if (st.rt_count != 1 || st.pso_rt_count != 1) why = "draws to more than one target";
@@ -1028,6 +1029,7 @@ void ReportPictureResult(bool identity,bool clean)
     std::lock_guard<std::mutex> lock(g_m);
     if(!identity)++g_stats.transfer_changed;
     else {++g_stats.transfer_verified;if(clean)++g_stats.clean_verified;else++g_stats.protection_verified;}
+    g_stats.last_draw_method=!identity?3u:clean?1u:2u;
 }
 std::string StatusLine()
 {

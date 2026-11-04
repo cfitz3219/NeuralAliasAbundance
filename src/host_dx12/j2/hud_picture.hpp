@@ -23,7 +23,7 @@ public:
     // to remove HUD on a later, structurally different frame.
     bool Prepare(ID3D12GraphicsCommandList*,ID3D12Resource* frame,DXGI_FORMAT frame_view,
                  ID3D12Resource* motion,ID3D12Resource* n0,ID3D12Resource* n1,
-                 DXGI_FORMAT layer_view,float grey,bool srgb,bool clean_allowed,DXGI_FORMAT output_format);
+                 DXGI_FORMAT layer_view,float grey,bool srgb,bool clean_allowed,DXGI_FORMAT output_format,bool tint=false);
     ID3D12Resource* Input() const; // NPSR, RGBA16F; same colour encoding as frame
     ID3D12Resource* Mask() const;  // NPSR, R16F; exact draw-derived protection
     ID3D12Resource* Scene() const;

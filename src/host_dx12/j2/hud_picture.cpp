@@ -81,6 +81,7 @@ groupshared uint mismatch;
    float m=coverage(a,b);
    outc=lerp(s.rgb,frame.SampleLevel(lin,uv,0).rgb,smoothstep(.01,.1,m));
   }
+  if(flags&4u)outc=lerp(outc,float3(1,0,1),.5*coverage(a,b));
  }
  result[id.xy]=float4(outc,s.a);
 })";
@@ -155,14 +156,14 @@ void Picture::BeginCycle(){p_->prepared=p_->scene_current=p_->full_current=p_->p
 bool Picture::SnapshotScene(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES s){return p_->scene_current=p_->snapshot(l,r,s,p_->scene,p_->scene_ready);}
 bool Picture::SnapshotFull(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES s){return p_->full_current=p_->snapshot(l,r,s,p_->full,p_->full_ready);}
 bool Picture::Prepare(ID3D12GraphicsCommandList* l,ID3D12Resource* frame,DXGI_FORMAT fv,ID3D12Resource* motion,
- ID3D12Resource* n0,ID3D12Resource* n1,DXGI_FORMAT lv,float grey,bool srgb,bool clean,DXGI_FORMAT output_format){
+ ID3D12Resource* n0,ID3D12Resource* n1,DXGI_FORMAT lv,float grey,bool srgb,bool clean,DXGI_FORMAT output_format,bool tint){
  auto& p=*p_;if(!l||!frame||!motion||!n0||!n1||!p.scene_current||!p.full_current||p.prepared||!std::isfinite(grey)||grey<=0)return false;
  auto fd=frame->GetDesc(),md=motion->GetDesc(),nd=n0->GetDesc();
  if(fd.Width!=p.w||fd.Height!=p.h||md.Width!=p.w||md.Height!=p.h||nd.Width!=p.ow||nd.Height!=p.oh)return false;
  if((!p.result||p.result_format!=output_format)&&!texture(p.program->dev.Get(),p.ow,p.oh,output_format,true,U,p.result))return false;
  p.result_format=output_format;p.frame=frame;p.motion=motion;p.n[0]=n0;p.n[1]=n1;p.frame_view=fv;p.layer_view=lv;
  const float tolerance=fv==DXGI_FORMAT_R16G16B16A16_FLOAT?.0005f:fv==DXGI_FORMAT_R10G10B10A2_UNORM?2.f/1023.f:2.f/255.f;
- p.constants={p.w,p.h,p.ow,p.oh,(clean?1u:0u)|(srgb?2u:0u),grey,tolerance,0};
+ p.constants={p.w,p.h,p.ow,p.oh,(clean?1u:0u)|(srgb?2u:0u)|(tint?4u:0u),grey,tolerance,0};
  if(p.outputs_read){move(l,p.input.Get(),S,U);move(l,p.mask.Get(),S,U);}
  move(l,p.proof.Get(),U,CD);l->CopyBufferRegion(p.proof.Get(),0,p.program->zero.Get(),0,16);move(l,p.proof.Get(),CD,U);
  p.bind(l,0,nullptr,DXGI_FORMAT_UNKNOWN);l->Dispatch((p.w+7)/8,(p.h+7)/8,1);order(l);

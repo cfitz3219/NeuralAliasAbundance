@@ -80,6 +80,7 @@ struct Stats {
     uint32_t traces = 0;      // frame-structure traces taken (hud_trace lines in the log)
     uint64_t draw_transfer_frames = 0, draw_protect_frames = 0;
     uint64_t transfer_verified=0,transfer_changed=0,clean_verified=0,protection_verified=0;
+    uint32_t last_draw_method=0; // completed GPU receipt: 1 native, 2 current-picture protection, 3 changed transfer
 };
 Stats GetStats();
 void ReportPictureResult(bool identity,bool clean); // completed GPU receipt, status only

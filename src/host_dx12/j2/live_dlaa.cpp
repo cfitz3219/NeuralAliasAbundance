@@ -3470,7 +3470,7 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         add(b, g.motion.Get(), UAV, NPSR);
         flush(l, b);
         if(layer_frame&&layer.picture) {
-            draw_picture=layer.picture->Prepare(l,frame,ff,g.motion.Get(),layer.n0,layer.n1,layer.view,layer.grey,layer.srgb,layer.clean_allowed,of);
+            draw_picture=layer.picture->Prepare(l,frame,ff,g.motion.Get(),layer.n0,layer.n1,layer.view,layer.grey,layer.srgb,layer.clean_allowed,of,g_hud_view.load(std::memory_order_relaxed));
         }
         if (witness) {
             const DXGI_FORMAT wf = typed(frame->GetDesc().Format);
