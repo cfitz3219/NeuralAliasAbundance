@@ -3503,7 +3503,11 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
     witness_read(si);
     g.stats.jitter_input_convention = static_cast<uint32_t>(g_small.final_jitter.Get());
     g.stats.jitter_input_epoch = g_small.final_jitter.Epoch();
-    const auto colour_jitter = g_small.final_jitter.Resolve({d.jx,d.jy});
+    // Declared jitter = the raster offset, as in 0ce11a8 (Cort 2026-11-04: since the calibration
+    // declared 0 from 5d5b0f5 on, jitter stopped improving the picture and it blurred over time;
+    // declaring the offset is the behaviour that looked far better). The calibration keeps
+    // measuring and logging (j2jitter / jitter_witness) but no longer changes the declaration.
+    const na::jitter::Sample colour_jitter{d.jx, d.jy};
     bool dlss = false;
     bool evaluation_reset = false;
     // HUD separation: on when [j2] hud_nis > 0, for SDR pictures, once the last frame is held.
