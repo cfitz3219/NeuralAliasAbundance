@@ -2307,6 +2307,15 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     e.view_id = kViewId;
     e.jitter_x = static_cast<float>(cam.jitter_px_x); // DLSS: colour sampled at pixel centre - jitter
     e.jitter_y = static_cast<float>(cam.jitter_px_y);
+    {
+        // Declare only the jitter the colour really carries (Cort 2026-11-04: DLAA vibrated while
+        // render-small, which already follows the measured convention, did not). This colour is
+        // the one the flow stage calibrates; without this frame's verdict, this game's saved one.
+        uint32_t conv = pending.compute_flow.context ? pending.compute_flow.colour_convention : 0u;
+        if (!conv) conv = na::jitter::Remembered().Get(na::jitter::kStageFlow, static_cast<uint32_t>(cf));
+        if (conv == static_cast<uint32_t>(na::jitter::Convention::Unjittered)) { e.jitter_x = 0.f; e.jitter_y = 0.f; }
+        else if (conv == static_cast<uint32_t>(na::jitter::Convention::Opposite)) { e.jitter_x = -e.jitter_x; e.jitter_y = -e.jitter_y; }
+    }
     if (inl) {
         g.stats.inline_jitter_x = e.jitter_x;
         g.stats.inline_jitter_y = e.jitter_y;
