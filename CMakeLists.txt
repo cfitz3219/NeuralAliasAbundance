@@ -41,6 +41,7 @@ if(NOT WIN32)
     add_subdirectory(tests/cpu)
   endif()
   add_subdirectory(tests/bridge)
+  add_subdirectory(tests/host_dx11)
   message(STATUS "Non-Windows: portable core + CPU tests only (DX12 host needs Windows/MSVC x64)")
   return()
 endif()
@@ -280,11 +281,17 @@ endif()
 
 # The DX12 end of the bridge (started hidden by the DX11 side).
 add_executable(na_bridge_helper64 WIN32 src/bridge/dx12_helper_main.cpp)
-target_link_libraries(na_bridge_helper64 PRIVATE bridge_record host_dlss d3d12 dxgi shell32)
+target_link_libraries(na_bridge_helper64 PRIVATE bridge_record host_dlss core_gpu d3d12 dxgi shell32)
 if(NA_DLSS_DLL AND EXISTS "${NA_DLSS_DLL}")
   add_custom_command(TARGET na_bridge_helper64 POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:na_bridge_helper64>")
 endif()
+
+# DX11 host (src/host_dx11/): hooks a DX11 game's device, contexts and swap
+# chain, finds scene depth/colour/camera with the game-agnostic frame model,
+# and runs DLSS through the bridge at the point before the tonemap/HUD.
+add_library(host_dx11 STATIC src/host_dx11/dx11_host.cpp)
+target_link_libraries(host_dx11 PUBLIC abundance_options bridge_dx11 host_hooking d3d11 dxgi)
 
 # ------------------------------------------------------------- host_upscalers
 # C7: FSR 3.1+ (FidelityFX API, MIT headers vendored in third_party/ffx-api)
@@ -305,7 +312,7 @@ target_link_libraries(NeuralAliasAbundance PRIVATE abundance_core d3d12 dxgi use
 # dxgi.dll proxy (deployed under that name by the deploy script; built as
 # NeuralAliasDXGI.dll so it is never auto-loaded by accident). Boots the host.
 add_library(NeuralAliasDXGI SHARED src/runtime/dxgi_proxy.cpp src/runtime/dxgi_proxy.def)
-target_link_libraries(NeuralAliasDXGI PRIVATE host_dx12)
+target_link_libraries(NeuralAliasDXGI PRIVATE host_dx12 host_dx11)
 
 # sl.interposer forwarding proxy (Route A, Streamline titles such as TLOU).
 add_library(NeuralAliasSLProxy SHARED src/host_dx12/sl_proxy/sl_proxy.cpp)
@@ -323,6 +330,7 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/host/CMakeLists.txt")
   add_subdirectory(tests/host)  # Claude (C3): GPU/host/proxy tests, stubs, fixture
 endif()
 add_subdirectory(tests/bridge)  # Claude: DX11 bridge (portable record test + DX11<->DX12 round trip)
+add_subdirectory(tests/host_dx11) # Claude: DX11 hooks (portable frame model + a synthetic DX11 game)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/CMakeLists.txt")
   add_subdirectory(tools)       # Claude (C5): nr_replay (local-only, needs SDK lib)
 endif()

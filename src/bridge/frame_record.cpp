@@ -68,6 +68,12 @@ const char* Validate(const FrameRecord& f, const SessionLimits& l, uint32_t expe
         return "The frame time is outside 0-1000 ms.";
     if (f.mode > static_cast<uint32_t>(Mode::DLAA)) return "The frame asks for an unknown DLSS mode.";
     if (f.flags & ~static_cast<uint32_t>(kKnownFlags)) return "The frame record carries unknown flags.";
+    if (f.flags & kCameraMotion) {
+        for (float v : f.reproject)
+            if (!std::isfinite(v)) return "The frame's camera reprojection is not a number.";
+        if (!std::isfinite(f.depth_clear) || f.depth_clear < 0.f || f.depth_clear > 1.f)
+            return "The frame's empty-depth value is outside 0-1.";
+    }
     const bool same_size = f.render_w == f.output_w && f.render_h == f.output_h;
     if (static_cast<Mode>(f.mode) == Mode::DLAA && !same_size)
         return "DLAA was asked for, but the render size is smaller than the output.";

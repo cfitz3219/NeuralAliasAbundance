@@ -551,7 +551,8 @@ struct Dx11Bridge::Impl {
         blit(ctx, views[0], color.rtv.Get(), f.render_w, f.render_h, Out::Copy);
         blit(ctx, views[1], depth.rtv.Get(), f.render_w, f.render_h, Out::Copy);
         const bool display_mv = (f.flags & kMvDisplayRes) != 0;
-        blit(ctx, views[2], motion.rtv.Get(), display_mv ? f.output_w : f.render_w, display_mv ? f.output_h : f.render_h, Out::Copy);
+        if (views[2]) // kCameraMotion: no motion texture, the helper builds it
+            blit(ctx, views[2], motion.rtv.Get(), display_mv ? f.output_w : f.render_w, display_mv ? f.output_h : f.render_h, Out::Copy);
     }
 
     Result process_helper(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* const* views, ID3D11RenderTargetView* target, FrameRecord& f, Out mode)
@@ -624,6 +625,7 @@ struct Dx11Bridge::Impl {
 
     Result process_inproc(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* const* views, ID3D11RenderTargetView* target, FrameRecord& f, Out mode)
     {
+        if (f.flags & kCameraMotion) return fail("Camera motion is built in the DX12 helper; start the bridge with the helper backend.");
         copy_in(ctx, views, f);
         f.sequence = sequence++;
         InProcResources r;
@@ -761,8 +763,9 @@ Result Dx11Bridge::Process(ID3D11DeviceContext* immediate, const Inputs& in, ID3
     ID3D11ShaderResourceView* views[3] = {};
     const char* bad = s.readable_view(immediate, 0, in.color, in.color_texture, frame.render_w, frame.render_h, true, &views[0]);
     if (!bad) bad = s.readable_view(immediate, 1, in.depth, in.depth_texture, frame.render_w, frame.render_h, false, &views[1]);
-    if (!bad) bad = s.readable_view(immediate, 2, in.motion, in.motion_texture, display_mv ? frame.output_w : frame.render_w,
-                                    display_mv ? frame.output_h : frame.render_h, false, &views[2]);
+    if (!bad && !(frame.flags & kCameraMotion))
+        bad = s.readable_view(immediate, 2, in.motion, in.motion_texture, display_mv ? frame.output_w : frame.render_w,
+                              display_mv ? frame.output_h : frame.render_h, false, &views[2]);
     D3D11_SHADER_RESOURCE_VIEW_DESC cv{};
     if (views[0]) views[0]->GetDesc(&cv);
     const Out mode = Impl::output_mode(cv.Format, tv.Format);
@@ -800,6 +803,12 @@ uint64_t Dx11Bridge::Repeats() const
 {
     std::lock_guard<std::mutex> g(lock_);
     return impl_ ? impl_->repeats : 0;
+}
+uint32_t Dx11Bridge::HelperMotionFrames() const
+{
+    std::lock_guard<std::mutex> g(lock_);
+    if (!impl_ || impl_->active != Backend::Helper || !impl_->memory.block()) return 0;
+    return *reinterpret_cast<volatile uint32_t*>(&impl_->memory.block()->status.motion_frames);
 }
 
 } // namespace na::bridge

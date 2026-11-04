@@ -11,8 +11,15 @@
 //        <max render w> <max render h> <output w> <output h> <motion w> <motion h>
 //        <data folder> [--copy-test]
 // --copy-test copies colour to output instead of DLSS (transport test on any GPU).
+//
+// v3 (kCameraMotion): the game sends no motion texture. The helper builds
+// camera motion from the shared depth and the record's reprojection matrix with
+// our existing motion arbiter (na::motion::gpu, tier 2), exactly as J2 does in
+// the DX12 host, and hands that to DLSS. In --copy-test the arbiter still runs
+// (so CI checks it), and the colour copy stays the output.
 #include "bridge/frame_record.hpp"
 #include "bridge/win_shared.hpp"
+#include "core/motion_arbiter_gpu.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
 
 #include <d3d12.h>
@@ -173,6 +180,30 @@ int Run(const Session& s)
         }
         g_memory.block()->status.dlss_available = 1;
     }
+    // Camera motion (v3): our arbiter and its two working textures, max render size.
+    na::motion::gpu::Arbiter arbiter;
+    const bool arbiter_ok = arbiter.Init(device.Get(), kRing);
+    ComPtr<ID3D12Resource> cam_motion, cam_provenance;
+    {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = s.limits.max_render_w;
+        rd.Height = s.limits.max_render_h;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        rd.Format = DXGI_FORMAT_R32G32_FLOAT;
+        bool made = SUCCEEDED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                              IID_PPV_ARGS(&cam_motion)));
+        rd.Format = DXGI_FORMAT_R8_UINT;
+        made = made && SUCCEEDED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                                 IID_PPV_ARGS(&cam_provenance)));
+        if (!made) { cam_motion.Reset(); cam_provenance.Reset(); }
+    }
+    const bool camera_motion_ok = arbiter_ok && cam_motion && cam_provenance;
     Report(HelperState::Ready, "");
 
     uint32_t expected = 0;
@@ -190,6 +221,12 @@ int Run(const Session& s)
         std::memcpy(&f, &g_memory.block()->frame, sizeof(f));
         if (f.sequence != expected) continue; // stale wake-up for a record already handled
         if (const char* why = Validate(f, s.limits, expected)) { Report(HelperState::Failed, why); code = 13; break; }
+        const bool want_motion = (f.flags & kCameraMotion) != 0;
+        if (want_motion && !camera_motion_ok) {
+            Report(HelperState::Failed, "The helper could not start its camera-motion pass (shader compile or memory).");
+            code = 18;
+            break;
+        }
 
         // Reuse an allocator only once the GPU finished with it (helper-side wait).
         // Resetting an allocator the GPU still uses would remove the device, so
@@ -216,6 +253,31 @@ int Run(const Session& s)
         alloc[slot]->Reset();
         list->Reset(alloc[slot].Get(), nullptr);
 
+        // Camera motion into cam_motion (UAV). Depth must be readable (NPSR) here.
+        const auto dispatch_motion = [&]() {
+            na::motion::gpu::Inputs in{};
+            in.depth = depth.Get();
+            in.tier2_valid_flag = true;
+            in.depth_clear = f.depth_clear;
+            std::memcpy(in.inv_view_proj_current.m, f.reproject, sizeof(f.reproject));
+            const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+            std::memcpy(in.view_proj_previous.m, identity, sizeof(identity));
+            in.jitter_current_px[0] = f.jitter_x;
+            in.jitter_current_px[1] = f.jitter_y;
+            na::motion::gpu::Outputs o{};
+            o.xy = cam_motion.Get();
+            o.provenance = cam_provenance.Get();
+            o.width = f.render_w;
+            o.height = f.render_h;
+            if (!arbiter.Dispatch(list.Get(), in, o, static_cast<uint32_t>(slot))) return false;
+            D3D12_RESOURCE_BARRIER u{};
+            u.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            u.UAV.pResource = cam_motion.Get();
+            list->ResourceBarrier(1, &u);
+            return true;
+        };
+        bool motion_built = false;
+
         if (s.copy_test) {
             ID3D12Resource* in[1] = {color.Get()};
             ID3D12Resource* outr[1] = {output.Get()};
@@ -230,15 +292,32 @@ int Run(const Session& s)
             list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
             Barrier(list.Get(), in, 1, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
             Barrier(list.Get(), outr, 1, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+            if (want_motion) {
+                ID3D12Resource* dr[1] = {depth.Get()};
+                Barrier(list.Get(), dr, 1, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                motion_built = dispatch_motion();
+                Barrier(list.Get(), dr, 1, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            }
         } else {
             ID3D12Resource* in[3] = {color.Get(), depth.Get(), motion.Get()};
             ID3D12Resource* outr[1] = {output.Get()};
             Barrier(list.Get(), in, 3, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             Barrier(list.Get(), outr, 1, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            ID3D12Resource* cm[1] = {cam_motion.Get()};
+            if (want_motion) {
+                motion_built = dispatch_motion();
+                if (motion_built) Barrier(list.Get(), cm, 1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            }
+            if (want_motion && !motion_built) {
+                Report(HelperState::Failed, "The helper's camera-motion pass refused this frame.");
+                list->Close();
+                code = 19;
+                break;
+            }
             na::dlss::EvalDesc d;
             d.color = color.Get();
             d.depth = depth.Get();
-            d.motion = motion.Get();
+            d.motion = want_motion ? cam_motion.Get() : motion.Get();
             d.output = output.Get();
             d.render_w = f.render_w;
             d.render_h = f.render_h;
@@ -248,8 +327,8 @@ int Run(const Session& s)
             d.out_h = f.output_h;
             d.jitter_x = f.jitter_x;
             d.jitter_y = f.jitter_y;
-            d.mv_scale_x = f.mv_scale_x;
-            d.mv_scale_y = f.mv_scale_y;
+            d.mv_scale_x = want_motion ? 1.f : f.mv_scale_x; // the arbiter writes render pixels
+            d.mv_scale_y = want_motion ? 1.f : f.mv_scale_y;
             d.pre_exposure = f.pre_exposure;
             d.exposure_scale = f.exposure_scale;
             d.view_id = 1;
@@ -258,8 +337,8 @@ int Run(const Session& s)
             d.reset = (f.flags & kReset) != 0;
             d.hdr = (f.flags & kHdr) != 0;
             d.depth_inverted = (f.flags & kDepthInverted) != 0;
-            d.mv_jittered = (f.flags & kMvJittered) != 0;
-            d.mv_display_res = (f.flags & kMvDisplayRes) != 0;
+            d.mv_jittered = !want_motion && (f.flags & kMvJittered) != 0; // arbiter motion is unjittered
+            d.mv_display_res = !want_motion && (f.flags & kMvDisplayRes) != 0;
             d.auto_exposure = (f.flags & kAutoExposure) != 0;
             if (!na::dlss::Evaluate(list.Get(), d)) {
                 const na::dlss::Stats st = na::dlss::GetStats();
@@ -270,6 +349,7 @@ int Run(const Session& s)
             }
             Barrier(list.Get(), in, 3, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
             Barrier(list.Get(), outr, 1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+            if (motion_built) Barrier(list.Get(), cm, 1, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
         if (FAILED(list->Close())) { Report(HelperState::Failed, "The helper could not record this frame."); code = 15; break; }
 
@@ -285,6 +365,7 @@ int Run(const Session& s)
         slot = (slot + 1) % kRing;
         ++expected;
 
+        if (motion_built) ++g_memory.block()->status.motion_frames;
         InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_memory.block()->status.last_submitted), static_cast<LONG64>(value));
         SetEvent(submitted.get());
     }

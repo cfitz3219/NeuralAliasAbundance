@@ -1,4 +1,4 @@
-// Bridge frame record v2: validation and mode choice (portable, CPU only).
+// Bridge frame record v3: validation and mode choice (portable, CPU only).
 #include "bridge/frame_record.hpp"
 
 #include <cmath>
@@ -74,6 +74,15 @@ int main()
     f = good(1280, 720, 1920, 1080, 0);
     f.flags = kReset | kDepthInverted | kMvJittered | kAutoExposure;
     expect(Validate(f, up, 0) == nullptr, "known flags are accepted");
+    f = good(1280, 720, 1920, 1080, 0);
+    f.flags = kCameraMotion;
+    expect(Validate(f, up, 0) == nullptr, "camera motion with the identity reprojection is accepted");
+    f.reproject[5] = std::numeric_limits<float>::quiet_NaN();
+    expect(Validate(f, up, 0) != nullptr, "a NaN camera reprojection is refused");
+    f = good(1280, 720, 1920, 1080, 0);
+    f.flags = kCameraMotion;
+    f.depth_clear = 2.f;
+    expect(Validate(f, up, 0) != nullptr, "an empty-depth value above 1 is refused");
 
     expect(ModeForScale(1920, 1080, 1920, 1080) == Mode::DLAA, "equal sizes pick DLAA");
     expect(ModeForScale(1280, 720, 1920, 1080) == Mode::Quality, "1.5x picks Quality");
@@ -83,6 +92,6 @@ int main()
     expect(ModeForScale(1477, 831, 1920, 1080) == Mode::UltraQuality, "1.3x picks Ultra Quality");
     expect(std::strcmp(ModeName(Mode::Balanced), "Balanced") == 0, "mode names read plainly");
 
-    std::printf(g_failed ? "FAIL: %d check(s) failed\n" : "PASS: frame record v2\n", g_failed);
+    std::printf(g_failed ? "FAIL: %d check(s) failed\n" : "PASS: frame record v3\n", g_failed);
     return g_failed ? 1 : 0;
 }

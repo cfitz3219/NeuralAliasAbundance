@@ -1,4 +1,4 @@
-// Bridge frame record (v2): what the game side tells the DLSS side about one
+// Bridge frame record (v3): what the game side tells the DLSS side about one
 // frame. Rebuilt from the recovered Alien bridge (recovered/dx11-enhancement,
 // bridge_protocol.hpp v1) and widened for real upscaling.
 //
@@ -16,7 +16,7 @@
 
 namespace na::bridge {
 
-constexpr uint32_t kRecordVersion = 2;
+constexpr uint32_t kRecordVersion = 3; // v3: camera motion built in the helper
 constexpr uint32_t kMaxExtent = 8192; // per side, render or output
 
 // Same numeric values as NVSDK_NGX_PerfQuality_Value (and na::dlss::Quality).
@@ -42,7 +42,10 @@ enum Flags : uint32_t {
     kMvJittered = 1u << 3,     // motion includes the jitter delta
     kMvDisplayRes = 1u << 4,   // motion is at output resolution
     kAutoExposure = 1u << 5,   // let DLSS work out exposure
-    kKnownFlags = (1u << 6) - 1,
+    // v3: no motion texture from the game; the helper builds camera motion from
+    // depth and `reproject` with our motion arbiter (as J2 does in DX12).
+    kCameraMotion = 1u << 6,
+    kKnownFlags = (1u << 7) - 1,
 };
 
 struct FrameRecord {
@@ -62,12 +65,19 @@ struct FrameRecord {
     uint32_t mode = static_cast<uint32_t>(Mode::DLAA);
     uint32_t preset = 0;  // DLSS render preset (10 J ... 13 M); 0 = NVIDIA default
     uint32_t flags = 0;
+    // kCameraMotion only: current clip -> previous clip in ONE matrix (row-major
+    // storage, row vectors: p_prev = p_cur * M), composed in double on the game
+    // side (na::camera::ComposeReprojectionRow), and the depth of an empty pixel.
+    float reproject[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    float depth_clear = 1.f;
+    uint32_t reserved = 0;
 };
 static_assert(std::is_standard_layout<FrameRecord>::value && std::is_trivially_copyable<FrameRecord>::value,
               "FrameRecord crosses processes as raw bytes");
-static_assert(sizeof(FrameRecord) == 72, "FrameRecord layout must match in 32-bit and 64-bit builds");
+static_assert(sizeof(FrameRecord) == 144, "FrameRecord layout must match in 32-bit and 64-bit builds");
 static_assert(offsetof(FrameRecord, source_frame) == 8 && offsetof(FrameRecord, jitter_x) == 32 &&
-                  offsetof(FrameRecord, flags) == 68,
+                  offsetof(FrameRecord, flags) == 68 && offsetof(FrameRecord, reproject) == 72 &&
+                  offsetof(FrameRecord, depth_clear) == 136,
               "FrameRecord field offsets are part of the wire format");
 
 // What the helper reports back (written only by the helper).
@@ -83,7 +93,7 @@ struct HelperStatus {
     uint32_t dlss_available = 0;
     uint64_t last_submitted = 0;  // highest sequence+1 whose GPU work was queued
     int32_t ngx_result = 0;
-    uint32_t reserved = 0;
+    uint32_t motion_frames = 0;   // frames whose camera motion the helper built (kCameraMotion)
     char reason[128] = {};
 };
 static_assert(std::is_standard_layout<HelperStatus>::value && std::is_trivially_copyable<HelperStatus>::value,
@@ -95,7 +105,7 @@ struct SharedBlock {
     FrameRecord frame;
     HelperStatus status;
 };
-static_assert(sizeof(SharedBlock) == 224, "SharedBlock layout must match in 32-bit and 64-bit builds");
+static_assert(sizeof(SharedBlock) == 296, "SharedBlock layout must match in 32-bit and 64-bit builds");
 
 // Sizes the session was created with (shared textures are this big).
 struct SessionLimits {

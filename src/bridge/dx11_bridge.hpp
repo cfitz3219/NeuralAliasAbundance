@@ -72,7 +72,8 @@ struct Config {
 // back buffers and many depth buffers: the bridge then copies them into its
 // own readable texture, picking the right view format for typeless and depth
 // formats). Textures are 2D, at least render size. Colour may be multisampled
-// (it is resolved); depth and motion may not.
+// (it is resolved); depth and motion may not. With kCameraMotion in the frame
+// record, motion is not needed (the helper builds it from depth + camera).
 // Colour: any float/unorm colour format, sRGB or not. Depth: any depth format
 // (D16, D24S8, D32, D32S8) or its red-channel view. Motion: two-channel.
 struct Inputs {
@@ -117,6 +118,7 @@ public:
     double LastWaitMs() const;      // CPU time the last Process spent waiting
     uint64_t Frames() const;        // results delivered (Ok)
     uint64_t Repeats() const;       // late frames shown as the last good result
+    uint32_t HelperMotionFrames() const; // frames whose camera motion the helper built (kCameraMotion)
 
 private:
     struct Impl;
