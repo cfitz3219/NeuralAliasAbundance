@@ -17,6 +17,9 @@ public:
     void BeginCycle(); // only after ALL source-recording and Present owners release it
     bool SnapshotScene(ID3D12GraphicsCommandList*,ID3D12Resource*,D3D12_RESOURCE_STATES);
     bool SnapshotFull(ID3D12GraphicsCommandList*,ID3D12Resource*,D3D12_RESOURCE_STATES);
+    // Discovery only: compare an immutable canvas with this exact final frame.
+    // Neither image is altered. Caller supplies its existing completion fence.
+    bool Probe(ID3D12GraphicsCommandList*,ID3D12Resource* frame,DXGI_FORMAT frame_view);
     // frame: NPSR, motion: NPSR, layers: RT. All are returned in those states.
     // The GPU verifies this frame against the captured transfer source BEFORE
     // choosing clean scene or untouched complete colour. No historical licence

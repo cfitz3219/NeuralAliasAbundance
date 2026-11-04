@@ -437,7 +437,39 @@ float4 ps(float4 p:SV_Position):SV_Target{return image.Load(int3(p.xy,0));}
     return 0;
 }
 
-int draw_handoff(test::Device& d)
+int canvas_probe(test::Device& d)
+{
+    // Final handoff bindings need not be known. Discovery compares immutable
+    // actual GPU pictures and cannot remove/change either picture on its own.
+    constexpr UINT W=64,H=32;constexpr auto F=DXGI_FORMAT_R8G8B8A8_UNORM;
+    constexpr auto S=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    std::vector<uint8_t> a(W*H*4),b(W*H*4);
+    for(UINT y=0;y<H;++y)for(UINT x=0;x<W;++x){const UINT i=(y*W+x)*4;
+        a[i]=uint8_t(20+x*3);a[i+1]=uint8_t(30+y*5);a[i+2]=90;a[i+3]=255;}
+    auto source=test::CreateTexture(d.device.Get(),W,H,F,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_NONE);
+    auto final=test::CreateTexture(d.device.Get(),W,H,F,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_NONE);
+    REQUIRE(source&&final&&upload(d,source.Get(),a.data(),4,S)&&upload(d,final.Get(),a.data(),4,S));
+    auto p=nh::Picture::Create(d.device.Get(),source->GetDesc(),W*2,H*2);REQUIRE(p);
+    for(int changed=0;changed<2;++changed){
+        p->BeginCycle();test::List l;REQUIRE(l.Create(d.device.Get()));
+        CHECK(!p->Probe(l.list.Get(),final.Get(),F)); // no stale snapshot permission
+        REQUIRE(p->SnapshotFull(l.list.Get(),source.Get(),S));
+        // One changed pixel, including at the edge, rejects the complete match.
+        if(changed){b=a;b[(W*H-1)*4]=240;
+            auto barrier=test::Transition(final.Get(),S,D3D12_RESOURCE_STATE_COPY_DEST);l.list->ResourceBarrier(1,&barrier);
+            REQUIRE(SUCCEEDED(l.list->Close()));ID3D12CommandList* q[]={l.list.Get()};d.queue->ExecuteCommandLists(1,q);d.WaitIdle();
+            REQUIRE(upload(d,final.Get(),b.data(),4,S));REQUIRE(l.Create(d.device.Get()));}
+        REQUIRE(p->Probe(l.list.Get(),final.Get(),F));
+        REQUIRE(SUCCEEDED(l.list->Close()));ID3D12CommandList* q[]={l.list.Get()};d.queue->ExecuteCommandLists(1,q);d.WaitIdle();
+        bool identity=false,clean=true;REQUIRE(p->ProofAfterCompletion(identity,clean));
+        CHECK(identity==!changed);CHECK(!clean);CHECK(!p->ProofAfterCompletion(identity,clean));
+        std::vector<uint8_t> pixels;REQUIRE(readback(d,source.Get(),S,4,pixels));CHECK(pixels==a);
+        REQUIRE(readback(d,final.Get(),S,4,pixels));CHECK(pixels==(changed?b:a));
+    }
+    return 0;
+}
+
+int draw_handoff(test::Device& d,bool unresolved=false)
 {
     auto* dev=d.device.Get();constexpr UINT W=64,H=32,OW=128,OH=64;constexpr auto F=DXGI_FORMAT_R8G8B8A8_UNORM;
     constexpr auto R=D3D12_RESOURCE_STATE_RENDER_TARGET,S=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,U=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -469,6 +501,11 @@ float4 altered(float4 p:SV_Position):SV_Target{return image.Load(int3(p.xy,0))*.
     REQUIRE(SUCCEEDED(D3DCompile(code,sizeof code-1,nullptr,nullptr,nullptr,"vs","vs_5_0",0,0,&vs,&err)));
     REQUIRE(SUCCEEDED(D3DCompile(code,sizeof code-1,nullptr,nullptr,nullptr,"ps","ps_5_0",0,0,&ps,&err)));
     REQUIRE(SUCCEEDED(D3DCompile(code,sizeof code-1,nullptr,nullptr,nullptr,"altered","ps_5_0",0,0,&processed,&err)));
+    if(unresolved){
+        ComPtr<ID3DBlob> stripped;
+        REQUIRE(SUCCEEDED(D3DStripShader(ps->GetBufferPointer(),ps->GetBufferSize(),D3DCOMPILER_STRIP_REFLECTION_DATA,&stripped)));ps=stripped;
+        stripped.Reset();REQUIRE(SUCCEEDED(D3DStripShader(processed->GetBufferPointer(),processed->GetBufferSize(),D3DCOMPILER_STRIP_REFLECTION_DATA,&stripped)));processed=stripped;
+    }
     auto copy_pso=pipeline(dev,transfer_root.Get(),vs.Get(),ps.Get(),Blend::Opaque,DXGI_FORMAT_UNKNOWN);
     auto process_pso=pipeline(dev,transfer_root.Get(),vs.Get(),processed.Get(),Blend::Opaque,DXGI_FORMAT_UNKNOWN);REQUIRE(copy_pso&&process_pso);
     D3D12_ROOT_PARAMETER color{};color.ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;color.Constants={0,0,4};
@@ -486,7 +523,15 @@ float4 altered(float4 p:SV_Position):SV_Target{return image.Load(int3(p.xy,0))*.
     auto validate=[&](ID3D12Resource* shown,UINT frame)->int {
         nh::Layer layer;const bool found=nh::TakeFrame(shown,W,H,OW,OH,&layer,d.queue.Get());
         std::printf("draw handoff frame=%u found=%d picture=%d clean=%d\n",frame,found,!!layer.picture,layer.clean_allowed);
-        if(frame<3||frame==6){CHECK(!found);return 0;}REQUIRE(found&&layer.picture&&layer.owner);CHECK(layer.clean_allowed==(frame!=5));
+        if(unresolved)std::printf("canvas replay: %s\n",nh::StatusLine().c_str());
+        if(layer.probe){
+            test::List probe;REQUIRE(probe.Create(dev));auto barrier=test::Transition(shown,R,S);probe.list->ResourceBarrier(1,&barrier);
+            REQUIRE(layer.probe->Probe(probe.list.Get(),shown,F));barrier=test::Transition(shown,S,R);probe.list->ResourceBarrier(1,&barrier);
+            REQUIRE(SUCCEEDED(probe.list->Close()));ID3D12CommandList* lists[]={probe.list.Get()};d.queue->ExecuteCommandLists(1,lists);d.WaitIdle();
+            bool identity=false,clean=false;REQUIRE(layer.probe->ProofAfterCompletion(identity,clean));CHECK(identity);
+            nh::ReportCanvasProbe(layer.probe_source,layer.probe_generation,identity);
+        }
+        if(frame<(unresolved?2u:3u)||frame==6){CHECK(!found);return 0;}REQUIRE(found&&layer.picture&&layer.owner);CHECK(layer.clean_allowed==(frame!=5));
         std::vector<uint8_t> pixels;REQUIRE(readback(d,shown,R,4,pixels));CHECK(pixels[(10*W+20)*4]>(frame==4?125:160));
         std::vector<float> mv(W*H*2,0);auto motion=test::CreateTexture(dev,W,H,DXGI_FORMAT_R32G32_FLOAT,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         REQUIRE(motion&&upload(d,motion.Get(),mv.data(),8,S));
@@ -888,7 +933,7 @@ int end_to_end(test::Device& d)
         REQUIRE(readback(d, proxy2.Get(), RTS, 4, px));
         CHECK(std::abs(at(px, RW, 24, 12, 0) - 51) <= 1);   // the back buffer got the scene only
     }
-    if(source_lineage(d)||draw_handoff(d))return 1;
+    if(source_lineage(d)||draw_handoff(d)||draw_handoff(d,true))return 1;
     na_observe_stop();
     return 0;
 }
@@ -896,6 +941,7 @@ int end_to_end(test::Device& d)
 
 int main()
 {
+    std::setvbuf(stdout,nullptr,_IONBF,0);
     ComPtr<ID3D12Debug> debug;if(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))debug->EnableDebugLayer();
     helpers();
     char why[1024] = {};
@@ -908,6 +954,7 @@ int main()
     if (jitter_evidence(d)) return 1;
     if (classify(d)) return 1;
     if (picture_paths(d)) return 1;
+    if (canvas_probe(d)) return 1;
     if (end_to_end(d)) return 1;
     if(info){UINT errors=0;for(UINT64 i=0;i<info->GetNumStoredMessagesAllowedByRetrievalFilter();++i){
         SIZE_T bytes=0;info->GetMessage(i,nullptr,&bytes);std::vector<uint8_t> data(bytes);auto* message=reinterpret_cast<D3D12_MESSAGE*>(data.data());

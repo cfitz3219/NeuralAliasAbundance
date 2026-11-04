@@ -1,4 +1,5 @@
 #include "host_dx12/j2/hud_picture.hpp"
+#include "host_dx12/j2/native_hud.hpp"
 #include <d3dcompiler.h>
 #include <algorithm>
 #include <cmath>
@@ -155,6 +156,19 @@ bool Picture::Matches(ID3D12Device* d,const D3D12_RESOURCE_DESC& s,uint32_t ow,u
 void Picture::BeginCycle(){p_->prepared=p_->scene_current=p_->full_current=p_->proof_read=false;p_->frame.Reset();p_->motion.Reset();p_->n[0].Reset();p_->n[1].Reset();}
 bool Picture::SnapshotScene(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES s){return p_->scene_current=p_->snapshot(l,r,s,p_->scene,p_->scene_ready);}
 bool Picture::SnapshotFull(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES s){return p_->full_current=p_->snapshot(l,r,s,p_->full,p_->full_ready);}
+bool Picture::Probe(ID3D12GraphicsCommandList* l,ID3D12Resource* frame,DXGI_FORMAT view){
+ auto& p=*p_;if(!l||!frame||!p.full_current)return false;
+ const auto d=frame->GetDesc();if(d.Width!=p.w||d.Height!=p.h||
+  TypelessOf(d.Format)!=TypelessOf(p.source_format)||TypelessOf(view)!=TypelessOf(p.source_format))return false;
+ p.frame=frame;p.frame_view=view;
+ if(!p.result)p.result_format=DXGI_FORMAT_R16G16B16A16_FLOAT; // typed null UAV; retained real outputs keep their actual format
+ const float tolerance=view==DXGI_FORMAT_R16G16B16A16_FLOAT?.0005f:view==DXGI_FORMAT_R10G10B10A2_UNORM?2.f/1023.f:2.f/255.f;
+ p.constants={p.w,p.h,p.ow,p.oh,0,1.f,tolerance,0};
+ move(l,p.proof.Get(),U,CD);l->CopyBufferRegion(p.proof.Get(),0,p.program->zero.Get(),0,16);move(l,p.proof.Get(),CD,U);
+ p.bind(l,0,nullptr,DXGI_FORMAT_UNKNOWN);l->Dispatch((p.w+7)/8,(p.h+7)/8,1);order(l);
+ move(l,p.proof.Get(),U,CS);l->CopyBufferRegion(p.readback.Get(),0,p.proof.Get(),0,16);move(l,p.proof.Get(),CS,U);
+ p.prepared=true;return true;
+}
 bool Picture::Prepare(ID3D12GraphicsCommandList* l,ID3D12Resource* frame,DXGI_FORMAT fv,ID3D12Resource* motion,
  ID3D12Resource* n0,ID3D12Resource* n1,DXGI_FORMAT lv,float grey,bool srgb,bool clean,DXGI_FORMAT output_format,bool tint){
  auto& p=*p_;if(!l||!frame||!motion||!n0||!n1||!p.scene_current||!p.full_current||p.prepared||!std::isfinite(grey)||grey<=0)return false;
