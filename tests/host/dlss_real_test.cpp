@@ -168,6 +168,9 @@ int main(int argc, char** argv)
 
     if (argc > 2 && std::string(argv[2]) == "--inspect-inputs") return InspectInputs(d);
 
+    const bool static_quality = argc > 2 && std::string(argv[2]).find("--static-quality") == 0;
+    const bool performance = static_quality && std::string(argv[2]) == "--static-quality-performance";
+    const auto quality = performance ? na::dlss::Quality::MaxPerformance : na::dlss::Quality::MaxQuality;
     const uint32_t ow = 1920, oh = 1080;
     for (na::dlss::Quality q : {na::dlss::Quality::MaxQuality, na::dlss::Quality::Balanced, na::dlss::Quality::MaxPerformance,
                                 na::dlss::Quality::UltraPerformance, na::dlss::Quality::DLAA}) {
@@ -179,7 +182,7 @@ int main(int argc, char** argv)
             std::printf("optimal %-17s not offered\n", na::dlss::QualityName(q));
     }
     na::dlss::OptimalSettings opt;
-    REQUIRE(na::dlss::QueryOptimal(ow, oh, na::dlss::Quality::MaxQuality, &opt));
+    REQUIRE(na::dlss::QueryOptimal(ow, oh, quality, &opt));
     const uint32_t rw = opt.render_w, rh = opt.render_h;
     const double kZone = 900.0 * 3.14159265358979 / 0.7071; // corner frequency ~ 900 cycles/width (< 960 output Nyquist)
 
@@ -264,15 +267,18 @@ int main(int argc, char** argv)
     double best = -1;
     int best_sign = 0;
     bool all_ok = true;
-    for (int sign : {+1, -1}) {
+    const std::vector<int> cases = static_quality ? std::vector<int>{+1, -1, 0, 2} : std::vector<int>{+1, -1};
+    for (int sign : cases) {
         for (uint32_t i = 0; i < kFrames; ++i) {
-            const float jx = Halton((i % 32) + 1, 2) - 0.5f, jy = Halton((i % 32) + 1, 3) - 0.5f;
+            const float jx = sign == 0 ? 0.f : Halton((i % 32) + 1, 2) - 0.5f;
+            const float jy = sign == 0 ? 0.f : Halton((i % 32) + 1, 3) - 0.5f;
+            const int sample_sign = sign == 2 ? 0 : sign; // declared jitter without a raster shift
             uint8_t* p = nullptr;
             REQUIRE(SUCCEEDED(up_c->Map(0, nullptr, reinterpret_cast<void**>(&p))));
             for (uint32_t y = 0; y < rh; ++y) {
                 uint16_t* row = reinterpret_cast<uint16_t*>(p + y * fc.Footprint.RowPitch);
                 for (uint32_t x = 0; x < rw; ++x) {
-                    const double u = (x + 0.5 + sign * jx) / rw, v = (y + 0.5 + sign * jy) / rh;
+                    const double u = (x + 0.5 + sample_sign * jx) / rw, v = (y + 0.5 + sample_sign * jy) / rh;
                     const uint16_t c = ToHalf(static_cast<float>(Zone(u, v, kZone)));
                     row[x * 4 + 0] = row[x * 4 + 1] = row[x * 4 + 2] = c;
                     row[x * 4 + 3] = ToHalf(1.f);
@@ -295,7 +301,8 @@ int main(int argc, char** argv)
             e.render_w = rw; e.render_h = rh; e.out_w = ow; e.out_h = oh;
             e.jitter_x = jx; e.jitter_y = jy;
             e.reset = i == 0;
-            e.quality = na::dlss::Quality::MaxQuality;
+            e.quality = quality;
+            if (static_quality) e.preset = 13; // same preset M used by the saved game run
             const bool ok = na::dlss::Evaluate(l.list.Get(), e);
             if (!ok) {
                 std::printf("FAIL evaluate frame %u: %s\n", i, na::dlss::GetStats().reason);
