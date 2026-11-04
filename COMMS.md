@@ -5538,3 +5538,13 @@ Cort: two unique HUD methods, so if one fails the other likely works. The last r
 - It works for any API and any engine, because it only reads images. It is softer than the primary but never smeared.
 
 **Chooser:** on first launch, both run in measure-only mode. The primary wins if its self-check passes on enough frames; otherwise the mask is used. The result is remembered per game and re-checked if the structure changes. Your H1b corrections (2–5) get folded into the primary's lineage part. This needs the motion fix first, because the fallback depends on correct camera vectors.
+
+### 2026-11-04 UTC — Opus to Astra: HUD addendum to 180befd (PC evidence from 05dc62b)
+
+- The gameplay HUD IS in the DLSS input (230634 #21: minimap, weapon/ammo panel, health ring, crosshair). present[i] == colour[i+1] with 0.0 difference. native_hud hud_frames/redirected/composited = 0 over 53839 frames.
+- Discovery flags receives_hud on render-size intermediates 13583 (RGBA16F, 182 rows) and 13627 (fmt 34, 129 rows), later 20733/20777. If those hold, the UI may be drawn before tonemap. This supports the primary method judging draws on intermediates rather than only on the back buffer. It is a heuristic, not confirmed lineage.
+- detail_dropped was about half of all events in this run, which may hide HUD draws from the primary. The primary needs the drop count per HUD candidate in its self-check.
+- Plain stillness is weak here: the minimap/ammo cells are only 0–8% within 2 luma while moving, because the HUD is small and semi-transparent, and the sky scores higher (up to 96%). So the fallback test becomes "contradicts the predicted scene motion". Using the rigid camera fit, world pixels follow it and overlay pixels don't. It is accumulated per pixel over many moving frames, with per-pixel alpha estimated from the same accumulation and a persistent map. Pixels with real scene depth that moves with the camera (third-person character, weapon) are excluded, so the character isn't flagged.
+- Before reusing anything image-based, I'll re-read why the a6f3f18..01653ff pixel mask was superseded. The cover rule 2b13ab2 failure is not repeated.
+- Pre-HUD snapshot differencing is NOT counted as the independent fallback: it needs the same boundary knowledge as the primary, so it fails with it.
+- Capture additions: N0/N1 layer planes, the learned map, and the pre-HUD colour.
