@@ -941,6 +941,10 @@ void write_status_line()
                 " chain_fmt=" + std::to_string(g_presented_format.load(std::memory_order_relaxed)) +
                 " color_space=" + std::to_string(g_color_space.load(std::memory_order_acquire)) + "\r\n";
             WriteFile(f, hud.data(), DWORD(hud.size()), &written, nullptr);
+            {
+                const std::string trace = na::j2::native_hud::TakeTrace();
+                if (!trace.empty()) WriteFile(f, trace.data(), DWORD(trace.size()), &written, nullptr);
+            }
         }
         {
             const auto automatic=na::scale::GetAutomaticSceneStats();
