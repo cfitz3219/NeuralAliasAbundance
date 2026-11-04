@@ -28,6 +28,11 @@ add_library(abundance_core STATIC
   src/core/motion_arbiter.cpp)
 target_link_libraries(abundance_core PUBLIC abundance_options)
 
+# Bridge frame record (portable; the wire format between a DX11 game and the
+# DX12 helper, see src/bridge/).
+add_library(bridge_record STATIC src/bridge/frame_record.cpp)
+target_link_libraries(bridge_record PUBLIC abundance_options)
+
 # Astra's CPU regression suite (tests/cpu/CMakeLists.txt is Astra's; it links
 # `host_observe` when that target exists, so it is added after the host libs
 # on Windows and here on other platforms).
@@ -35,6 +40,7 @@ if(NOT WIN32)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/CMakeLists.txt")
     add_subdirectory(tests/cpu)
   endif()
+  add_subdirectory(tests/bridge)
   message(STATUS "Non-Windows: portable core + CPU tests only (DX12 host needs Windows/MSVC x64)")
   return()
 endif()
@@ -245,6 +251,41 @@ if(NOT NA_XESS_INCLUDE AND EXISTS "${NA_SDK_ROOT}/xess/inc/xess/xess_d3d12.h")
 endif()
 message(STATUS "DLSS backend (C6): headers=${NA_HAVE_NGX_SDK}  own NGX instance=${NA_HAVE_NGX_LIB}  nvngx_dlss.dll='${NA_DLSS_DLL}'")
 
+# ---------------------------------------------------------------- DX11 bridge
+# Game-agnostic DX11 -> DLSS bridge (src/bridge/): in-process NGX D3D11 when the
+# NGX library is present, otherwise (and for 32-bit games / neural rendering)
+# shared textures + fences to the 64-bit DX12 helper below. Rebuilt from the
+# recovered Alien bridge (recovered/dx11-enhancement).
+if(NA_HAVE_NGX_LIB)
+  set(NA_BRIDGE_INPROC_SRC src/bridge/dx11_dlss_inproc.cpp)
+else()
+  set(NA_BRIDGE_INPROC_SRC src/bridge/dx11_dlss_inproc_stub.cpp)
+endif()
+add_library(bridge_dx11 STATIC src/bridge/dx11_bridge.cpp ${NA_BRIDGE_INPROC_SRC})
+target_link_libraries(bridge_dx11 PUBLIC bridge_record d3d11 dxgi d3dcompiler)
+if(NA_HAVE_NGX_LIB)
+  target_include_directories(bridge_dx11 SYSTEM PRIVATE "${NA_NGX_SDK_INCLUDE}")
+  if(EXISTS "${NA_NGX_LIB_DEBUG}")
+    target_link_libraries(bridge_dx11 PUBLIC "$<IF:$<CONFIG:Debug>,${NA_NGX_LIB_DEBUG},${NA_NGX_LIB}>")
+  else()
+    target_link_libraries(bridge_dx11 PUBLIC "${NA_NGX_LIB}")
+  endif()
+elseif(NA_HAVE_NGX_SDK)
+  # Headers but no library (CI): compile the real NGX D3D11 code so it is
+  # checked, without linking it into anything.
+  add_library(bridge_dx11_ngx_check STATIC src/bridge/dx11_dlss_inproc.cpp)
+  target_link_libraries(bridge_dx11_ngx_check PRIVATE bridge_record)
+  target_include_directories(bridge_dx11_ngx_check SYSTEM PRIVATE "${NA_NGX_SDK_INCLUDE}")
+endif()
+
+# The DX12 end of the bridge (started hidden by the DX11 side).
+add_executable(na_bridge_helper64 WIN32 src/bridge/dx12_helper_main.cpp)
+target_link_libraries(na_bridge_helper64 PRIVATE bridge_record host_dlss d3d12 dxgi shell32)
+if(NA_DLSS_DLL AND EXISTS "${NA_DLSS_DLL}")
+  add_custom_command(TARGET na_bridge_helper64 POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:na_bridge_helper64>")
+endif()
+
 # ------------------------------------------------------------- host_upscalers
 # C7: FSR 3.1+ (FidelityFX API, MIT headers vendored in third_party/ffx-api)
 # and XeSS (our own ABI declarations; Intel's headers are only used, when
@@ -281,6 +322,7 @@ endif()
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/host/CMakeLists.txt")
   add_subdirectory(tests/host)  # Claude (C3): GPU/host/proxy tests, stubs, fixture
 endif()
+add_subdirectory(tests/bridge)  # Claude: DX11 bridge (portable record test + DX11<->DX12 round trip)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/CMakeLists.txt")
   add_subdirectory(tools)       # Claude (C5): nr_replay (local-only, needs SDK lib)
 endif()
