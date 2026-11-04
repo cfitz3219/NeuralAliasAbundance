@@ -39,6 +39,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdarg>
+#include <share.h>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -1179,7 +1180,8 @@ void OpenLog(const HostConfig& cfg)
     }
     const auto dot = path.find_last_of(L'.');
     path.insert(dot == std::wstring::npos ? path.size() : dot, L"-" + std::to_wstring(GetCurrentProcessId()));
-    if (_wfopen_s(&g_log, path.c_str(), L"w") != 0) g_log = nullptr;
+    // Shared for reading: the log can be read (or collected) while the game runs.
+    g_log = _wfsopen(path.c_str(), L"w", _SH_DENYWR);
     WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, g_stats.log_path, MAX_PATH, nullptr, nullptr);
 }
 

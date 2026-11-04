@@ -27,6 +27,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <share.h>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -421,12 +422,19 @@ int main(int argc, char** argv)
     expect(s.color_w == 256 && s.color_h == 144 && s.delivered >= before + 10, "after the resize, the new scene colour is found and DLSS runs again");
 
     std::printf("log: %s\n", s.log_path);
-    if (FILE* f = nullptr; fopen_s(&f, s.log_path, "r") == 0 && f) {
+    bool log_selection = false, log_camera = false, log_bridge = false;
+    if (FILE* f = _fsopen(s.log_path, "r", _SH_DENYNO)) {
         char line[512];
         int n = 0;
-        while (std::fgets(line, sizeof(line), f) && n++ < 60) std::printf("  | %s", line);
+        while (std::fgets(line, sizeof(line), f)) {
+            if (n++ < 40) std::printf("  | %s", line);
+            log_selection = log_selection || std::strstr(line, "selection: scene depth") != nullptr;
+            log_camera = log_camera || std::strstr(line, "camera: found") != nullptr;
+            log_bridge = log_bridge || std::strstr(line, "bridge: started") != nullptr;
+        }
         std::fclose(f);
     }
+    expect(log_selection && log_camera && log_bridge, "the run's log records the selection, the camera and the bridge start");
     std::printf(g_failed ? "FAIL: %d check(s) failed\n" : "PASS: DX11 hooks on a synthetic game\n", g_failed);
     std::fflush(stdout);
     // The hooks stay installed for the process lifetime (as in a game); exit directly.
