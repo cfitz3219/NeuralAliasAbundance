@@ -240,6 +240,7 @@ struct State {
     struct VpjEntry { uint64_t frame = 0; float x = 0.f, y = 0.f; };
     VpjEntry vpj[8];
     uint32_t vpj_phase = 0;
+    uint64_t vpj_submitted_sample=0,vpj_submitted_frame=0,vpj_submitted_depth=0;
     // Render-small jitter witness: the picture DLSS gets did not show J1's sample shifts (still
     // detailed pixels matched unshifted, not at the declared jitter difference). No jitter is then
     // applied or declared until the next re-test (frame), so DLSS is never told about a shift that
@@ -944,20 +945,22 @@ void vpj_advance()
     na::observe::SetSceneViewportJitter(g.frame, e.x, e.y);
     ++g.stats.vpj_frames;
 }
-// The sample this frame's scene was really drawn with: the scene list's own draws first (exact,
-// whenever it was recorded), else this frame's table entry. False: no sample (declare 0).
+// Only the scene recording's actual draw sample may be declared. A frame-table
+// entry is a request, not evidence that any draw used it.
 bool vpj_declared(ID3D12CommandList* const* lists, UINT scene, float* x, float* y)
 {
     uint64_t packed = 0;
-    if (lists) for (UINT i = scene + 1; i-- > 0 && !packed;) if (lists[i]) packed = na::observe::ListSceneViewportJitter(lists[i]);
+    uint64_t depth=0,color=0;na::observe::GetLiveSelection(&depth,&color);
+    if (lists) for (UINT i = scene + 1; i-- > 0 && !packed;) if (lists[i]) packed = na::observe::ListSceneViewportJitter(lists[i],depth);
+    // Present-time acquisition has no source-list pointer. It may use the
+    // sample actually submitted for this exact scene/depth, never a request.
+    const bool submitted=!packed&&g.vpj_submitted_frame==g.frame&&g.vpj_submitted_depth==depth;
+    if(submitted)packed=g.vpj_submitted_sample;
     uint32_t f = 0;
     bool ok = false;
     if (packed && na::observe::DecodeSceneViewportJitter(packed, &f, x, y)) {
-        ok = true; ++g.stats.vpj_from_list;
+        ok = true;if(submitted)++g.stats.vpj_from_submitted;else ++g.stats.vpj_from_list;
         if (f != static_cast<uint32_t>(g.frame)) ++g.stats.vpj_other_frame;
-    } else if (g.vpj[g.frame % 8].frame == g.frame && g.frame) {
-        ok = true; ++g.stats.vpj_from_table;
-        *x = g.vpj[g.frame % 8].x; *y = g.vpj[g.frame % 8].y;
     }
     if (!ok) { ++g.stats.vpj_none; *x = *y = 0.f; return false; }
     if (na::settings::Get().j2_viewport_jitter.load(std::memory_order_relaxed) < 0) { *x = -*x; *y = -*y; }
@@ -2243,9 +2246,10 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (same_epoch && g.submitted_frame && g.frame > g.submitted_frame + kMaxGapFrames && !tracker_restart) ++g.stats.gap_bridged;
     na::camera::CameraFrame cam = pending.tracker.Update(vp, g.frame, rw, rh, injected, lim); // active extent
     if (!cam.valid) { ++g.stats.no_camera; reason("The camera matrix could not be inverted."); return false; }
+    bool viewport_sample_known=false;
     if (vpj_mode()) { // the camera is the game's own (no J1 write); the sample is in the viewports
         float vx = 0.f, vy = 0.f;
-        vpj_declared(lists, scene, &vx, &vy);
+        viewport_sample_known=vpj_declared(lists, scene, &vx, &vy);
         cam.jitter_px_x = vx; cam.jitter_px_y = vy; cam.jitter_known = true;
     }
     if (!held) { // the newest read camera (one per frame: a later attempt in the same frame replaces it)
@@ -2411,6 +2415,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             frame.reset=cam.camera_cut || resize || g.resume_reset;frame.hdr=is_float_color(cf);
             frame.jitter[0]=in.jitter_current_px[0];frame.jitter[1]=in.jitter_current_px[1];
             frame.raster_jitter[0]=frame.jitter[0];frame.raster_jitter[1]=frame.jitter[1];frame.raster_sample=true;
+            frame.raster_confirmed=viewport_sample_known;
             frame.source_generation=pending.selection_version;
             frame.residual=object_flow;frame.camera_reconstruct=reconstruct;
             na::j2::compute_flow::Tier3 tier;
@@ -4513,6 +4518,10 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     }
     uint64_t selected_depth = 0, selected_color = 0;
     na::observe::GetLiveSelection(&selected_depth, &selected_color);
+    if(vpj_mode()&&selected_depth)for(UINT i=0;i<count;++i){
+        const auto sample=na::observe::ListSceneViewportJitter(lists[i],selected_depth);
+        if(sample){g.vpj_submitted_sample=sample;g.vpj_submitted_frame=g.frame;g.vpj_submitted_depth=selected_depth;}
+    }
     if (selected_color && selected_color != g.scene_color_id) {
         // A different scene image: its size is the class reference; the old profile does not apply.
         g.scene_color_id = selected_color;
