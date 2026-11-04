@@ -524,13 +524,18 @@ struct RcasPass {
 // Depth awareness (Cort 2026-11-04): RCAS's lobe eases off at depth edges (a relative 1/z
 // jump to a 4-neighbour), so silhouettes do not get bright outlines. Without depth it is
 // neutral. (The clarity term tried in 7eb7adb was removed at Cort's request: it haloed.)
+// Motion awareness: where the picture moves fast (from 4 to 16 output pixels per frame) DLSS has
+// little history there, so sharpening brings out shimmer; the lobe eases to half. Still and
+// slow areas are unchanged. Without motion it is neutral.
 constexpr char kRcasHlsl[] = R"(
 Texture2D<float4> t_in : register(t0);
 Texture2D<float>  t_depth : register(t1);
+Texture2D<float2> t_motion : register(t2);
 RWTexture2D<float4> u_out : register(u0);
 cbuffer C : register(b0) {
     float con; uint w; uint h; float lobeLimit;
     uint has_depth; uint reversed; uint dw; uint dh;
+    uint has_motion; uint mw; uint mh; uint pad;
 };
 float3 fwd(float3 x) { x = max(x, 0.0); return x / (1.0 + x); }
 float3 inv(float3 t) { t = min(t, 0.99990); return t / (1.0 - t); }
@@ -576,6 +581,12 @@ void main(uint3 id : SV_DispatchThreadID) {
     float lobe = max(-lobeLimit, min(max3(lobeRGB.r, lobeRGB.g, lobeRGB.b), 0.0)) * con;
     lobe *= nz;
     lobe *= lerp(1.0, 0.35, edge);
+    if (has_motion != 0) {
+        const int2 q = clamp(int2((float2(p) + 0.5) * float2(mw, mh) / float2(w, h)), int2(0, 0), int2(mw - 1, mh - 1));
+        const float2 v = t_motion[q] * float2(w, h) / float2(mw, mh); // render pixels -> output pixels
+        const float sp = (any(isnan(v)) || any(isinf(v))) ? 0.0 : length(v);
+        lobe *= lerp(1.0, 0.5, smoothstep(4.0, 16.0, sp));
+    }
     float rcpL = 1.0 / (4.0 * lobe + 1.0);
     float3 o = (lobe * b + lobe * d + lobe * hh + lobe * f + e) * rcpL;
     u_out[p] = float4(inv(o), alpha);
@@ -586,16 +597,16 @@ bool rcas_init()
     g_rcas.tried = true;
     D3D12_DESCRIPTOR_RANGE r[2]{};
     r[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    r[0].NumDescriptors = 2;
+    r[0].NumDescriptors = 3;
     r[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
     r[1].NumDescriptors = 1;
-    r[1].OffsetInDescriptorsFromTableStart = 2;
+    r[1].OffsetInDescriptorsFromTableStart = 3;
     D3D12_ROOT_PARAMETER p[2]{};
     p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     p[0].DescriptorTable.NumDescriptorRanges = 2;
     p[0].DescriptorTable.pDescriptorRanges = r;
     p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    p[1].Constants.Num32BitValues = 8;
+    p[1].Constants.Num32BitValues = 12;
     D3D12_ROOT_SIGNATURE_DESC rd{2, p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     ComPtr<ID3DBlob> sig, err, code;
     if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
@@ -609,8 +620,8 @@ bool rcas_init()
     pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
     if (FAILED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_rcas.pso)))) return false;
     // Slots 0..kRing-1: the DLAA path; kRing..2*kRing-1: the render-small upscale ring. Each slot
-    // has one table of three descriptors (t0 in, t1 depth, u0 out).
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRing * 2 * 3, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    // has one table of four descriptors (t0 in, t1 depth, t2 motion, u0 out).
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRing * 2 * 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     if (FAILED(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_rcas.heap)))) return false;
     g_rcas.inc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     g_rcas.ok = true;
@@ -618,12 +629,14 @@ bool rcas_init()
 }
 // RCAS from `in` (readable, NON_PIXEL_SHADER_RESOURCE) into `out` (UNORDERED_ACCESS).
 // depth: optional R32_FLOAT dw x dh, NON_PIXEL_SHADER_RESOURCE (same picture, any size).
+// motion: optional R32G32_FLOAT in render pixels, the same dw x dh, NON_PIXEL_SHADER_RESOURCE.
 bool rcas_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Resource* out, uint32_t w, uint32_t h, uint32_t percent,
-                   DXGI_FORMAT fmt, UINT slot, ID3D12Resource* depth = nullptr, uint32_t dw = 0, uint32_t dh = 0, bool reversed = false)
+                   DXGI_FORMAT fmt, UINT slot, ID3D12Resource* depth = nullptr, uint32_t dw = 0, uint32_t dh = 0, bool reversed = false,
+                   ID3D12Resource* motion = nullptr)
 {
     if (!percent || !in || !out || slot >= 2 * kRing || !rcas_init()) return false;
-    if (!depth || !dw || !dh) depth = nullptr;
-    const UINT base = slot * 3;
+    if (!dw || !dh) depth = motion = nullptr;
+    const UINT base = slot * 4;
     auto cpu = [&](UINT i) { D3D12_CPU_DESCRIPTOR_HANDLE c = g_rcas.heap->GetCPUDescriptorHandleForHeapStart(); c.ptr += SIZE_T(base + i) * g_rcas.inc; return c; };
     D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -633,10 +646,12 @@ bool rcas_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Resou
     g.device->CreateShaderResourceView(in, &sv, cpu(0));
     sv.Format = DXGI_FORMAT_R32_FLOAT;
     g.device->CreateShaderResourceView(depth, &sv, cpu(1));
+    sv.Format = DXGI_FORMAT_R32G32_FLOAT;
+    g.device->CreateShaderResourceView(motion, &sv, cpu(2));
     D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
     uv.Format = fmt;
     uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    g.device->CreateUnorderedAccessView(out, nullptr, &uv, cpu(2));
+    g.device->CreateUnorderedAccessView(out, nullptr, &uv, cpu(3));
     D3D12_GPU_DESCRIPTOR_HANDLE gh = g_rcas.heap->GetGPUDescriptorHandleForHeapStart();
     gh.ptr += UINT64(base) * g_rcas.inc;
     ID3D12DescriptorHeap* heaps[] = {g_rcas.heap.Get()};
@@ -649,10 +664,10 @@ bool rcas_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Resou
     const float con = std::exp2(-stops);
     const float extra = percent > 100 ? float((std::min)(percent, 200u) - 100u) / 100.0f : 0.0f;
     const float limit = 3.0f / 16.0f + extra / 32.0f;
-    uint32_t c[8] = {0, w, h, 0, depth ? 1u : 0u, reversed ? 1u : 0u, dw, dh};
+    uint32_t c[12] = {0, w, h, 0, depth ? 1u : 0u, reversed ? 1u : 0u, dw, dh, motion ? 1u : 0u, dw, dh, 0};
     std::memcpy(&c[0], &con, 4);
     std::memcpy(&c[3], &limit, 4);
-    l->SetComputeRoot32BitConstants(1, 8, c, 0);
+    l->SetComputeRoot32BitConstants(1, 12, c, 0);
     l->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
     return true;
 }
@@ -660,7 +675,9 @@ bool rcas_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Resou
 na::j2::NisSharpen g_nis;
 bool rcas_record(ID3D12GraphicsCommandList* l, uint32_t percent, DXGI_FORMAT fmt)
 {
-    return g.sharp && rcas_dispatch(l, g.output.Get(), g.sharp.Get(), g.ow, g.oh, percent, fmt, g.slot, g.depth32.Get(), g.rw, g.rh, g.stats.depth_reversed);
+    // Motion is NON_PIXEL_SHADER_RESOURCE here (between its build and the end of the frame list).
+    return g.sharp && rcas_dispatch(l, g.output.Get(), g.sharp.Get(), g.ow, g.oh, percent, fmt, g.slot, g.depth32.Get(), g.rw, g.rh, g.stats.depth_reversed,
+                                    g.motion.Get());
 }
 
 bool ensure_device(ID3D12CommandQueue* q)
@@ -3627,12 +3644,19 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
                 b.push_back(uav_barrier(out));
                 add(b, out, UAV, NPSR);
                 out_state = NPSR;
+                // Motion's return to UNORDERED_ACCESS (queued above) waits until RCAS has read it.
+                bool queued = false;
+                for (auto it = b.begin(); it != b.end(); ++it)
+                    if (it->Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && it->Transition.pResource == g.motion.Get() &&
+                        static_cast<UINT>(it->Transition.StateAfter) == UAV) { b.erase(it); queued = true; break; }
+                if (!queued) add(b, g.motion.Get(), UAV, NPSR);
                 flush(l, b);
-                if (rcas_dispatch(l, out, sharp, ow, oh, pct, of, kRing + si, g.depth32.Get(), rw, rh, d.reversed)) {
+                if (rcas_dispatch(l, out, sharp, ow, oh, pct, of, kRing + si, g.depth32.Get(), rw, rh, d.reversed, g.motion.Get())) {
                     b.push_back(uav_barrier(sharp));
                     cur = sharp;
                     ++g.stats.small_sharpened;
                 }
+                add(b, g.motion.Get(), NPSR, UAV);
             }
             if (hud_mask && have_sharp) {
                 if (g_hud_nis.Dispatch(g_small.device.Get(), l, frame, ff, rw, rh, g_small.hudup.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
