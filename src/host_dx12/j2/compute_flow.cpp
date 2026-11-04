@@ -89,8 +89,10 @@ bool build(Context& c,ID3D12Device* device,ID3D12CommandQueue* queue,unsigned w,
 bool free(Image& i){i.uses.erase(std::remove_if(i.uses.begin(),i.uses.end(),[](const Lease& l){return l.Retired();}),i.uses.end());return i.uses.empty();}
 void collect(Context& c){for(auto& entry:c.leases){auto& s=*entry;if(!s.pair || !s.lease.Retired())continue;
     if(!s.submitted){s.pair=false;continue;} // discarded commands never wrote telemetry
-    if(s.frame>=stats.sample_frame){void* p=nullptr;D3D12_RANGE range{0,64};
+    {void* p=nullptr;D3D12_RANGE range{0,64};
         if(SUCCEEDED(s.readback->Map(0,&range,&p))){const auto* b=static_cast<const unsigned char*>(p);const auto* v=reinterpret_cast<const unsigned*>(b);
+            for(unsigned j=0;j<7;++j)stats.sum[j]+=v[j];++stats.sum_pairs;
+            if(s.frame<stats.sample_frame){D3D12_RANGE none0{};s.readback->Unmap(0,&none0);s.pair=false;continue;}
             stats.accepted=v[0];stats.rejected_invalid=v[1];stats.rejected_small=v[2];stats.rejected_cost=v[3];stats.rejected_offscreen=v[4];stats.rejected_image=v[5];stats.rejected_flicker=v[6];
             stats.total=0;for(unsigned j=0;j<7;++j)stats.total+=v[j];stats.sample_frame=s.frame;sample_tick=GetTickCount64();++stats.samples;
             if(s.timestamps && c.frequency){UINT64 t[2]{};memcpy(t,b+48,16);stats.ms=t[1]>=t[0]?double(t[1]-t[0])*1000.0/double(c.frequency):0;}

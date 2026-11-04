@@ -32,6 +32,7 @@
 #include <d3dcompiler.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <atomic>
@@ -246,7 +247,15 @@ struct State {
         float jx = 0.f, jy = 0.f;    // this frame's jitter, render pixels
         bool reset = false, reversed = false;
         uint32_t w = 0, h = 0;       // depth / motion size (the scene's)
+        // Evidence capture (2026-11-04): the camera actually passed to the motion shader.
+        na::camera::Matrix vp_cur{}, vp_prev{}, inv_cur{};
+        std::array<double, 3> eye{}, forward{};
+        uint32_t camera_source = 0, cut_reason = 0;
+        uint64_t camera_age = 0, selection_version = 0;
+        bool tracker_restart = false, flow_ran = false;
+        ID3D12Resource *flow_residual = nullptr, *flow_valid = nullptr, *flow_mask = nullptr; // this frame's tier 3 (NPSR)
     } def;
+    std::array<double, 3> def_prev_forward{}; bool def_prev_forward_ok = false; // fast-turn capture trigger
     // I1.4: J1's applied camera of the frame that just closed (OnPresent resets g.jit), for the
     // Present-time source; and the selected depth's clears seen while that frame was recorded.
     struct PresentCamera { bool valid = false; uint64_t frame = 0; na::camera::Matrix vp{}; double px[2] = {0, 0}; } pcam;
@@ -2113,6 +2122,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     flush(l, b);
     // 2/3. camera motion vectors
     bool have_motion = false;
+    na::j2::compute_flow::Tier3 flow_tier{}; // evidence capture
     if (g.arbiter_ok) {
         na::motion::gpu::Inputs in{};
         in.depth = g.depth32.Get();
@@ -2142,6 +2152,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             na::j2::compute_flow::SetLoosen(na::settings::Get().j2_flow_loosen.load(std::memory_order_relaxed));
             pending.compute_flow=na::j2::compute_flow::Record(l,g.queue.Get(),g.color_in.Get(),g.depth32.Get(),in,frame,tier);
             if(tier.residual){in.tier3_valid_flag=true;in.tier3_residual=tier.residual;in.tier3_valid=tier.valid;in.tier3_mask=tier.mask;}
+            flow_tier=tier;
         }
         // P4-0b: camera + accepted moving-object residual (tier 3) when this frame's pair ran.
         na::j2::flow::Tier3 t3;
@@ -2185,6 +2196,13 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         g.def.reset = cam.camera_cut || resize || g.resume_reset || carry;
         g.def.reversed = reversed;
         g.def.w = w; g.def.h = h;
+        g.def.vp_cur = cam.view_proj_current_row; g.def.vp_prev = cam.view_proj_previous_row; g.def.inv_cur = cam.inv_view_proj_current_row;
+        g.def.eye = cam.position; g.def.forward = cam.forward;
+        g.def.camera_source = pending.camera_source; g.def.camera_age = pending.camera_age;
+        g.def.selection_version = pending.selection_version;
+        g.def.tracker_restart = tracker_restart; g.def.cut_reason = cam.cut_reason;
+        g.def.flow_ran = flow_tier.residual != nullptr;
+        g.def.flow_residual = flow_tier.residual; g.def.flow_valid = flow_tier.valid; g.def.flow_mask = flow_tier.mask;
         if (saved && saved->at_present) ++g.stats.small_present_source;
         else { ++g.stats.small_deferred; g.small_color = color_id; g.small_depth = depth_id; g.small_csub = csub; g.small_dsub = dsub; }
         g.stats.width = w; g.stats.height = h;
@@ -3566,6 +3584,37 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         ci.reset = (d.reset || g.small_last == 0) ? 1u : 0u;
         ci.preset = na::settings::Get().j2_preset.load();
         ci.sharpness = na::settings::Get().j2_sharpness.load(std::memory_order_relaxed);
+        // 2026-11-04: this evaluation's output IS the presented picture (no overlay pairing),
+        // plus the camera the motion shader used and the planes behind each motion vector.
+        ci.owns_present = true;
+        ci.inputs_frame = d.frame;
+        ci.camera_valid = true;
+        for (int i = 0; i < 16; ++i) { ci.vp_cur[i] = d.vp_cur[i]; ci.vp_prev[i] = d.vp_prev[i]; ci.inv_vp_cur[i] = d.inv_cur[i]; }
+        for (int i = 0; i < 3; ++i) ci.eye[i] = d.eye[i];
+        ci.camera_source = d.camera_source; ci.camera_age = d.camera_age;
+        ci.camera_offset = g.camera_offset; ci.camera_param = g.camera_param;
+        ci.selection_version = d.selection_version;
+        ci.tracker_restart = d.tracker_restart ? 1u : 0u; ci.cut_reason = d.cut_reason;
+        ci.camera_cut = d.reset ? 1u : 0u;
+        ci.depth_reversed = d.reversed ? 1u : 0u;
+        ci.flow_ran = d.flow_ran ? 1u : 0u;
+        ci.flow_loosen = na::settings::Get().j2_flow_loosen.load(std::memory_order_relaxed);
+        uint64_t sel_d = 0, sel_c = 0;
+        na::observe::GetLiveSelection(&sel_d, &sel_c);
+        ci.view_depth = sel_d; ci.view_color = sel_c;
+        auto extra = [&](const char* name, ID3D12Resource* r, D3D12_RESOURCE_STATES st) {
+            if (r && cp.extra_count < na::capture::j2::kMaxExtra) cp.extra[cp.extra_count++] = {name, r, st};
+        };
+        extra("provenance", g.provenance.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (d.flow_ran) {
+            extra("flow_residual", d.flow_residual, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            extra("flow_valid", d.flow_valid, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            extra("flow_mask", d.flow_mask, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+        if (layer_frame) {
+            extra("hud_n0", layer.n0, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            extra("hud_n1", layer.n1, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        }
         capture = na::capture::j2::RecordEvaluation(l, cp, ci);
     }
     b.push_back(uav_barrier(out));
@@ -3589,6 +3638,31 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
     g_small.value[si] = g_small.next++;
     queue->Signal(g_small.fence.Get(), g_small.value[si]);
     g_small.slot = (si + 1) % kRing;
+    {   // Every frame, cheap (CPU): the capture's frames.csv shows the frames around a stretch/reset.
+        na::capture::j2::FrameNote fnote;
+        fnote.frame = g.frame;
+        fnote.dlss = dlss ? 1u : 0u;
+        fnote.reset = dlss && (d.reset || g.small_last == 0) ? 1u : 0u;
+        fnote.jitter_x = d.jx; fnote.jitter_y = d.jy;
+        na::observe::GetLiveSelection(&fnote.selection_depth, &fnote.selection_color);
+        fnote.selection_version = na::observe::LiveSelectionVersion();
+        fnote.camera_source = d.camera_source; fnote.camera_age = d.camera_age;
+        for (int i = 0; i < 3; ++i) fnote.eye[i] = d.eye[i];
+        strncpy_s(fnote.why, dlss ? "" : g.stats.small_note, _TRUNCATE);
+        na::capture::j2::NoteFrame(fnote);
+        // Automatic captures (test packages, [j2] capture_auto): the first stretched frame of a
+        // burst, a history reset, a fast camera turn, and otherwise periodically (cooldown).
+        const bool was_stretching = g_small_stretch_streak.load(std::memory_order_relaxed) != 0;
+        if (!dlss && !was_stretching) na::capture::j2::Trigger("stretch", 24);
+        else if (fnote.reset && g.small_last != 0) na::capture::j2::Trigger("reset", 24);
+        else if (dlss && g.def_prev_forward_ok) {
+            double dot = 0;
+            for (int i = 0; i < 3; ++i) dot += d.forward[i] * g.def_prev_forward[i];
+            if (std::acos((std::max)(-1.0, (std::min)(1.0, dot))) > 0.02) na::capture::j2::Trigger("camera_turn", 24);
+            else na::capture::j2::Trigger("periodic", 24);
+        }
+        g.def_prev_forward = d.forward; g.def_prev_forward_ok = dlss;
+    }
     if (dlss) { ++g.stats.small_dlss; if (g.stats.small_note[0] && std::strstr(g.stats.small_note, "stretched")) g.stats.small_note[0] = 0; }
     else ++g.stats.small_stretched;
     g_small_stretch_streak.store(dlss ? 0u : g_small_stretch_streak.load(std::memory_order_relaxed) + 1u, std::memory_order_relaxed);

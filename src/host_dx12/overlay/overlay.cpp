@@ -1042,6 +1042,10 @@ void write_status_line()
                 (unsigned long long)j2.cut_restarts, (unsigned long long)j2.cut_gap, (unsigned long long)j2.cut_motion, (unsigned long long)j2.gap_bridged,
                 (unsigned long long)(GetTickCount64() / 100 % 100000000), j2.recent_cuts);
             if (cn2 > 0) WriteFile(f, cl2, static_cast<DWORD>((std::min)(cn2, static_cast<int>(sizeof(cl2) - 1))), &written, nullptr);
+            {
+                const char* eff = na::settings::EffectiveSummary();
+                if (eff && eff[0]) { WriteFile(f, eff, static_cast<DWORD>(std::strlen(eff)), &written, nullptr); WriteFile(f, "\r\n", 2, &written, nullptr); }
+            }
             // aca551b cost: standalone-projection search (cached = blocks skipped, solved = solver windows) and J1 CPU per frame.
             const int pn = snprintf(cl2, sizeof cl2, "j2_pscan cached=%llu solved=%llu cpu_us_per_frame=%.1f cpu_max_us=%llu\r\n",
                 (unsigned long long)j2.jitter_p_scan_cached, (unsigned long long)j2.jitter_p_scan_solved,
@@ -1127,8 +1131,9 @@ void write_status_line()
             }
             if (cs.requested) {
                 char cl[300];
-                const int nc2 = snprintf(cl, sizeof cl, "j2_capture requested=%u recorded=%u submitted=%u written=%u busy=%u discarded=%u retired=%u no_present=%u errors=%u dir=\"%S\"\r\n",
+                const int nc2 = snprintf(cl, sizeof cl, "j2_capture requested=%u recorded=%u submitted=%u written=%u busy=%u discarded=%u retired=%u no_present=%u errors=%u triggers=%u extra_skipped=%u dir=\"%S\"\r\n",
                     cs.requested, cs.recorded, cs.submitted, cs.written, cs.dropped_busy, cs.discarded, cs.retired, cs.without_present, cs.errors,
+                    cs.triggers, cs.extra_skipped,
                     na::capture::j2::Directory());
                 if (nc2 > 0) WriteFile(f, cl, static_cast<DWORD>((std::min)(nc2, static_cast<int>(sizeof cl - 1))), &written, nullptr);
             }
@@ -1489,12 +1494,14 @@ UINT64 menu_completed_prefix() {
 void write_menu_progress(HANDLE log)
 {
     const auto cf=na::j2::compute_flow::GetStats();char cfline[950];DWORD cfw=0;
-    const int cfn=snprintf(cfline,sizeof cfline,"j2compute engine=amd recorded=%llu submitted=%llu pairs=%llu busy=%llu accepted=%llu total=%llu ms=%.3f reason=\"%s\" attempts=%llu paired_submissions=%llu unavailable=%llu history_only=%llu last_frame=%llu submit_age_ms=%llu sample_frame=%llu sample_age_ms=%llu samples=%llu excluded{invalid=%llu small=%llu cost=%llu offscreen=%llu image=%llu flicker=%llu} pool{recordings=%u images=%u} flow_loosen=%u\r\n",
+    const int cfn=snprintf(cfline,sizeof cfline,"j2compute engine=amd recorded=%llu submitted=%llu pairs=%llu busy=%llu accepted=%llu total=%llu ms=%.3f reason=\"%s\" attempts=%llu paired_submissions=%llu unavailable=%llu history_only=%llu last_frame=%llu submit_age_ms=%llu sample_frame=%llu sample_age_ms=%llu samples=%llu excluded{invalid=%llu small=%llu cost=%llu offscreen=%llu image=%llu flicker=%llu} pool{recordings=%u images=%u} flow_loosen=%u sum{pairs=%llu accepted=%llu invalid=%llu small=%llu cost=%llu offscreen=%llu image=%llu flicker=%llu}\r\n",
         static_cast<unsigned long long>(cf.recorded),static_cast<unsigned long long>(cf.submitted),static_cast<unsigned long long>(cf.pairs),
         static_cast<unsigned long long>(cf.busy),static_cast<unsigned long long>(cf.accepted),static_cast<unsigned long long>(cf.total),cf.ms,cf.reason,
         (unsigned long long)cf.attempts,(unsigned long long)cf.submitted_pairs,(unsigned long long)cf.unavailable,(unsigned long long)cf.waiting_history,
         (unsigned long long)cf.last_submitted_frame,(unsigned long long)cf.submit_age_ms,(unsigned long long)cf.sample_frame,(unsigned long long)cf.sample_age_ms,(unsigned long long)cf.samples,
-        (unsigned long long)cf.rejected_invalid,(unsigned long long)cf.rejected_small,(unsigned long long)cf.rejected_cost,(unsigned long long)cf.rejected_offscreen,(unsigned long long)cf.rejected_image,(unsigned long long)cf.rejected_flicker,cf.recording_slots,cf.image_slots,cf.loosen);
+        (unsigned long long)cf.rejected_invalid,(unsigned long long)cf.rejected_small,(unsigned long long)cf.rejected_cost,(unsigned long long)cf.rejected_offscreen,(unsigned long long)cf.rejected_image,(unsigned long long)cf.rejected_flicker,cf.recording_slots,cf.image_slots,cf.loosen,
+        (unsigned long long)cf.sum_pairs,(unsigned long long)cf.sum[0],(unsigned long long)cf.sum[1],(unsigned long long)cf.sum[2],(unsigned long long)cf.sum[3],
+        (unsigned long long)cf.sum[4],(unsigned long long)cf.sum[5],(unsigned long long)cf.sum[6]);
     if(cfn>0)WriteFile(log,cfline,(std::min)(DWORD(cfn),DWORD(sizeof(cfline)-1)),&cfw,nullptr);
     auto ps = na::present::GetStats();
     char p_line[256];
@@ -2588,6 +2595,14 @@ void process_frame(ID3D12CommandQueue* queue, ID3D12Resource* frame)
         if (!auto_armed && after && na::j2::Enabled()) {
             auto_armed = true;
             na::capture::j2::RequestTimestamped(na::settings::Get().j2_capture_frames.load(), after * 1000u);
+        }
+        {
+            static bool auto_set = false;
+            if (!auto_set) {
+                auto_set = true;
+                const uint32_t n = na::settings::Get().j2_capture_auto.load(std::memory_order_relaxed);
+                na::capture::j2::SetAutoTrigger(n != 0, n, na::settings::Get().j2_capture_cooldown_s.load(std::memory_order_relaxed) * 1000u);
+            }
         }
         na::capture::j2::OnPresent(queue, frame, g_orig_execute);
     }

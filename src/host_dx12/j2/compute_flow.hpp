@@ -31,6 +31,9 @@ struct Stats {
     uint64_t rejected_invalid=0,rejected_small=0,rejected_cost=0,rejected_offscreen=0,rejected_image=0,rejected_flicker=0; // flicker: passed every check, no agreeing previous pair yet
     uint32_t recording_slots=0,image_slots=0;
     uint32_t loosen=0; // flow_loosen used by the latest recording
+    // Every completed pair's pixel counts summed (not one sample per 5 s): accepted, invalid,
+    // small, cost, offscreen, image, flicker; and the pairs counted.
+    uint64_t sum[7]{}; uint64_t sum_pairs=0;
     double ms=0;char reason[160]{};
 };
 Stats GetStats();
