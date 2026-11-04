@@ -3048,7 +3048,7 @@ void present_refuse(const char* why)
     ++g.stats.small_present_refused;
     std::snprintf(g.stats.small_present_why, sizeof g.stats.small_present_why, "%s", why);
 }
-bool present_source(ID3D12CommandQueue* queue, ExecuteFn forward, uint32_t rw, uint32_t rh)
+bool present_source(ID3D12CommandQueue* queue, ExecuteFn forward)
 {
     if (!g_render_small.load(std::memory_order_relaxed) || !na::present::Scaling() || g.latched || !g.dlss_ready ||
         g.paused.load() || g.queue.Get() != queue || !forward || g.frame == 0)
@@ -3136,7 +3136,7 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
     add(b, out, NPSR, UAV);
     // DLSS needs this frame's depth + motion, recorded on this same queue (so the GPU runs them
     // first), at the picture's size, and a DLSS instance on this device.
-    if (!(g.def.valid && g.def.frame + 1 == g.frame)) present_source(queue, forward, rw, rh);
+    if (!(g.def.valid && g.def.frame + 1 == g.frame)) present_source(queue, forward);
     const auto& d = g.def;
     const bool fresh = d.valid && d.frame + 1 == g.frame && d.w == rw && d.h == rh;
     const bool can_dlss = fresh && forward && g.dlss_ready && g.device && g.device.Get() == g_small.device.Get() &&
