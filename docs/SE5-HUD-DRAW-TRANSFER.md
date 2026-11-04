@@ -37,7 +37,7 @@ Selected input uses RGBA16F while preserving the source's encoding; the existing
 
 The actual DX12 test exercises both GPU branches, a changed processing transfer, incomplete replay, exact used-SRV reflection, ordinary copy/native-HUD behaviour, clipped additive fallback and an active query followed by recovery. It also runs two different pictures through the same source resource before presenting the first; the first scene snapshot and native layer stay attached to their own destination. Reuse requires fresh current scene/full snapshots. Float-HDR composition checks values above one and alpha. The DirectX debug layer reports zero error messages in the focused test.
 
-Final complete-suite receipt is recorded in COMMS/WORKLOG after it finishes. Logs are local-only under `local/se5-flow-jitter-20261104/hud-complete-{build,tests}.log`. No game launch/control/deployment or independent installer change is part of this increment. Actual SE5 handoff acceptance, visual text quality and game-time GPU cost await Cort's test.
+Final runtime source eb422f3: full Release build passed; complete 199-case suite finished with 194 passed, five skipped and zero failed in 297.25 seconds. Skips are the optional NR runtime probe, three unsupported 16xMSAA cases and the existing upscaler jitter case. Logs are local-only under `local/se5-flow-jitter-20261104/hud-release-{build,tests}.log`. No game launch/control/deployment or independent installer change is part of this increment. Actual SE5 handoff acceptance, visual text quality and game-time GPU cost await Cort's test.
 
 ## Practical limits
 
