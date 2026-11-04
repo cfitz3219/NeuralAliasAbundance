@@ -91,8 +91,9 @@ struct Settings {
     // [j2] viewport_jitter: real sub-pixel samples. The game's scene draws (live scene depth bound,
     // depth test on) get viewports moved by the jitter, and DLSS is told exactly that value; the
     // camera-matrix write and jitter_shift are bypassed while on (1 = on, -1 = on, declared with
-    // the opposite sign, 0 = off: the camera-matrix route). Cort 2026-11-04.
-    std::atomic<int32_t> j2_viewport_jitter{1};
+    // the opposite sign, 0 = off: the camera-matrix route). Cort 2026-11-04. Loading the ini
+    // turns it on unless the ini says otherwise; without a Load (tests) the camera-matrix route stays.
+    std::atomic<int32_t> j2_viewport_jitter{0};
     std::atomic<uint32_t> j2_preset{255};    // J2 DLSS render preset ([j2] preset_v2; 255 = Automatic: L for DLAA/Quality, M for Balanced/Performance; 12 = L, 0 = NVIDIA default)
     std::atomic<uint32_t> nr_structure{100};
     std::atomic<uint32_t> nr_tone{0};
