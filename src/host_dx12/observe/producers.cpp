@@ -3423,6 +3423,7 @@ auto& g_shader_hooks = *new std::shared_ptr<const ShaderHooks>();
 std::mutex g_shader_hooks_m;
 std::atomic<bool> g_shader_hooks_enabled{false};
 auto& g_texture_hook = *new std::shared_ptr<TextureOperationHook>();
+std::atomic<DepthClearListener> g_depth_clear_listener{nullptr};
 
 void capture_raster_targets(GL* list, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets,
     BOOL contiguous, const D3D12_CPU_DESCRIPTOR_HANDLE* depth)
@@ -3619,6 +3620,13 @@ struct ListHook<Slot, R(A...)> {
             }
             if constexpr (Slot == sl::list::ClearRenderTargetView || Slot == sl::list::ClearDepthStencilView ||
                           Slot == sl::list::CopyResource || Slot == sl::list::CopyTextureRegion || Slot == sl::list::ResolveSubresource) {
+                if constexpr (Slot == sl::list::ClearDepthStencilView) {
+                    if (!t_host_work && scope.outermost && !scope.ambiguous) {
+                        const auto listen = g_depth_clear_listener.load(std::memory_order_acquire);
+                        const auto args = std::forward_as_tuple(a...);
+                        if (listen && (std::get<1>(args) & D3D12_CLEAR_FLAG_DEPTH)) listen(l, cpu_ref(std::get<0>(args)).resource);
+                    }
+                }
                 if (!t_host_work && scope.outermost && !scope.ambiguous) {
                     const auto hook = std::atomic_load_explicit(&g_texture_hook, std::memory_order_acquire);
                     if (hook) {
@@ -5312,6 +5320,7 @@ void SetShaderOperationHook(ShaderLane lane, std::shared_ptr<ShaderOperationHook
         g_shader_hooks_enabled.store(enabled, std::memory_order_release);
     } // old callbacks/resources can be destroyed outside the registration lock
 }
+void SetDepthClearListener(DepthClearListener listener) { g_depth_clear_listener.store(listener, std::memory_order_release); }
 void SetTextureOperationHook(std::shared_ptr<TextureOperationHook> hook)
 {
     auto prior = std::atomic_exchange_explicit(&g_texture_hook, std::move(hook), std::memory_order_acq_rel);

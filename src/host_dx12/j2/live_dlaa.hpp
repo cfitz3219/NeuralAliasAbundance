@@ -319,6 +319,11 @@ struct Stats {
     // Present / stretched (no fresh depth + motion) / not produced (the presenter kept its old one).
     uint64_t small_deferred = 0, small_dlss = 0, small_stretched = 0, small_failed = 0, small_dlss_failed = 0, small_sharpened = 0, small_hud = 0, small_hud_layer = 0;
     uint32_t small_rw = 0, small_rh = 0, small_ow = 0, small_oh = 0;
+    // I1.4: frames whose depth + motion came from the Present-time source (the in-frame detector
+    // missed); attempts it refused, and why last; selected-depth clears recorded in the last frame.
+    uint64_t small_present_source = 0, small_present_refused = 0;
+    uint32_t depth_clears_last = 0;
+    char small_present_why[96] = {};
     // Size observation independent of evaluation (COMMS 4bd474c I1.1): the selected scene colour's
     // size whenever a submitted list wrote it, and the frame it was written in (frame = current).
     uint32_t seen_scene_w = 0, seen_scene_h = 0;

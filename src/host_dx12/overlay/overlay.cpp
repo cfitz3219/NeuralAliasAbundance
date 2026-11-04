@@ -908,16 +908,17 @@ void write_status_line()
         }
         if (na::j2::RenderSmall()) { // P4-4 render-small: one line per status write
             const auto ps = na::present::GetStats();
-            char sl[640];
+            char sl[900];
             const int sn = snprintf(sl, sizeof sl,
-                "native_present mode=%u scale=%.3f proxies=%ux%u native=%ux%u scene=%ux%u deferred=%llu dlss=%llu stretched=%llu failed=%llu dlss_refused=%llu sharpened=%llu sharpness=%u hud_nis_frames=%llu hud_nis=%u presenter_upscaled=%llu presenter_kept_old=%llu dlss_in=%ux%u dlss_out=%ux%u jitter_phases=%u mip_bias=%.2f note=\"%s\"\r\n",
+                "native_present mode=%u scale=%.3f proxies=%ux%u native=%ux%u scene=%ux%u deferred=%llu dlss=%llu stretched=%llu failed=%llu dlss_refused=%llu sharpened=%llu sharpness=%u hud_nis_frames=%llu hud_nis=%u presenter_upscaled=%llu presenter_kept_old=%llu dlss_in=%ux%u dlss_out=%ux%u jitter_phases=%u mip_bias=%.2f present_source=%llu present_refused=%llu depth_clears=%u present_why=\"%s\" note=\"%s\"\r\n",
                 na::settings::Get().j2_scale_mode.load(), na::present::RenderScale(), ps.scaled_w, ps.scaled_h, ps.native_w, ps.native_h,
                 j2.width, j2.height, (unsigned long long)j2.small_deferred, (unsigned long long)j2.small_dlss,
                 (unsigned long long)j2.small_stretched, (unsigned long long)j2.small_failed, (unsigned long long)j2.small_dlss_failed,
                 (unsigned long long)j2.small_sharpened, na::settings::Get().j2_sharpness.load(),
                 (unsigned long long)j2.small_hud, na::settings::Get().j2_hud_nis.load(),
                 (unsigned long long)ps.upscaled, (unsigned long long)ps.upscale_failed, j2.small_rw, j2.small_rh, j2.small_ow, j2.small_oh,
-                j2.jitter_phases, na::observe::SamplerMipBias(), j2.small_note);
+                j2.jitter_phases, na::observe::SamplerMipBias(), (unsigned long long)j2.small_present_source,
+                (unsigned long long)j2.small_present_refused, j2.depth_clears_last, j2.small_present_why, j2.small_note);
             if (sn > 0) WriteFile(f, sl, DWORD((std::min)(sn, int(sizeof sl - 1))), &written, nullptr);
             const std::string hud = na::j2::native_hud::StatusLine() + " composited=" + std::to_string(j2.small_hud_layer) +
                 " chain_fmt=" + std::to_string(g_presented_format.load(std::memory_order_relaxed)) +

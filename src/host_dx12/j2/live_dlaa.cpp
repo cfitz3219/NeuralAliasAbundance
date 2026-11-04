@@ -21,6 +21,7 @@
 #include "host_dx12/dlss/dlss_backend.hpp"
 #include "host_dx12/nr/native_fg.hpp"
 #include "host_dx12/observe/producers.hpp"
+#include "host_dx12/observe/texture_operation.hpp"
 #include "host_dx12/settings.hpp"
 #include "host_dx12/overlay/presenter.hpp"
 #include "host_dx12/scale/settings_read_hook.hpp"
@@ -80,6 +81,11 @@ struct SceneInput {
     bool reversed = false;
     double jitter[2] = {};
     bool injected = false; // the scene's camera block held J1's (windowed) camera
+    // I1.4 (COMMS a066d76): the Present-time source. vp/jitter are only a camera when
+    // has_camera (J1's applied sample for that frame); otherwise record() predicts one from the
+    // recent reads. at_present: states are what all submitted work left on J2's queue.
+    bool has_camera = true;
+    bool at_present = false;
 };
 
 struct State {
@@ -233,6 +239,11 @@ struct State {
         bool reset = false, reversed = false;
         uint32_t w = 0, h = 0;       // depth / motion size (the scene's)
     } def;
+    // I1.4: J1's applied camera of the frame that just closed (OnPresent resets g.jit), for the
+    // Present-time source; and the selected depth's clears seen while that frame was recorded.
+    struct PresentCamera { bool valid = false; uint64_t frame = 0; na::camera::Matrix vp{}; double px[2] = {0, 0}; } pcam;
+    uint32_t depth_clears_closed = 0;
+    uint32_t small_csub = 0, small_dsub = 0; uint64_t small_color = 0, small_depth = 0; // last in-frame deferred record's views
     uint64_t small_last = 0;         // J2 frame PresentUpscale's DLSS last evaluated (history continues only from frame - 1)
     uint32_t small_ow = 0, small_oh = 0, small_rw = 0, small_rh = 0; // its last sizes
     Stats stats;
@@ -243,6 +254,13 @@ State& g = *new State;
 // Projection window, read by the scissor hook on game recording threads (no g.m there).
 std::atomic<bool> g_window_enabled{false};
 std::atomic<bool> g_render_small{false};
+// I1.4: clears of the selected scene depth recorded since the last present (record time, any thread).
+std::atomic<uint64_t> g_clear_watch{0};
+std::atomic<uint32_t> g_depth_clears{0};
+void on_depth_clear(ID3D12GraphicsCommandList*, uint64_t target)
+{
+    if (target && target == g_clear_watch.load(std::memory_order_relaxed)) g_depth_clears.fetch_add(1, std::memory_order_relaxed);
+}
 // Render-small: presents in a row shown stretched (no DLSS). A stretched frame shows the
 // jittered picture as it is, so jitter stops after a few of them and resumes with DLSS.
 std::atomic<uint32_t> g_small_stretch_streak{0};
@@ -1587,7 +1605,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     {
         PhysicalInputProvider pp;
         { std::lock_guard<std::mutex> lk(g_up_m); pp = g_phys; }
-        if (pp.lookup) {
+        if (pp.lookup && !(saved && saved->at_present)) {
             const PhysicalLookup pl = pp.lookup(pp.ctx, color_id, depth_id,
                 inl ? inl : pp.source_recording ? static_cast<ID3D12GraphicsCommandList*>(lists[scene]) : nullptr, &phys);
             if (pl == PhysicalLookup::Unavailable) {
@@ -1659,6 +1677,11 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
                       : na::observe::KnownSubStateInCurrentSubmission(id, sub, st);
     };
     const auto state_of = [&](na_object_id id, uint32_t sub, uint32_t* st) {
+        if (saved && saved->at_present) { // I1.4: after the whole frame was submitted
+            if (!na::observe::KnownSubStateOnQueueNow(g.queue.Get(), id, sub, st)) return false;
+            if (id == depth_id) pending.depth_source = 2;
+            return true;
+        }
         return saved ? entry_state(id, sub, st) : inl ? state_now(id, sub, st) : state_after(lists, scene, id, sub, st);
     };
     // Layer2 companions are private textures, not observed: their exact states come with them.
@@ -1761,9 +1784,9 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     na::camera::Matrix vp{};
     bool reversed = false;
     bool held = false, from_j1 = false, held_still=false, extrapolated=false;
-    if (saved) { vp = saved->vp; reversed = saved->reversed; }
+    if (saved && saved->has_camera) { vp = saved->vp; reversed = saved->reversed; }
     if (repeat_only) { vp = g.cam_u1; reversed = g.cam_rev; held = true; } // no camera search: the last one is only a placeholder
-    const bool found = repeat_only || saved || find_camera(lists, scene, depth_id, &vp, &reversed);
+    const bool found = repeat_only || (saved ? saved->has_camera : find_camera(lists, scene, depth_id, &vp, &reversed));
     if (!found && g.jit.valid && g.jit.applied && g.cam_f1) {
         // Astra (COMMS 2026-11-02): the scene list's own blocks may not hold the camera, but
         // J1 found this frame's camera in an earlier batch and rewrote it with this sample:
@@ -1810,7 +1833,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         reason(why);
         return false;
     }
-    pending.camera_source=saved?6u:from_j1?2u:held?(extrapolated?5u:held_still?3u:4u):1u;
+    pending.camera_source=(saved && saved->has_camera)?6u:from_j1?2u:held?(extrapolated?5u:held_still?3u:4u):1u;
     pending.camera_age=held?g.frame-g.cam_f1:0u;
     if (!held) remember_main_camera(vp); // J1: the main camera, for earlier batches next frame
     // Ring slot (never wait) and size/format changes (only once the GPU is done with the old set).
@@ -1863,7 +1886,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         g.resume_reset = true; // remains pending if this recording is not submitted
     }
     const double zero[2] = {0, 0};
-    const double* injected = held ? zero : from_j1 ? g.jit.px : saved ? saved->jitter : g_injected ? g.jit.px : zero; // sample belongs to the captured camera
+    const double* injected = held ? zero : from_j1 ? g.jit.px : saved ? (saved->has_camera ? saved->jitter : zero) : g_injected ? g.jit.px : zero; // sample belongs to the captured camera
     double rescaled[2] = {0, 0};
     if (injected != zero && jit_rw && jit_rh && (jit_rw != rw || jit_rh != rh)) {
         rescaled[0] = injected[0] * double(rw) / double(jit_rw);
@@ -2041,7 +2064,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         in.jitter_current_px[1] = static_cast<float>(cam.jitter_px_y);
         // AMD is an in-list dispatch, after this frame's resolved pre-DLAA
         // colour/depth copies. It needs no batch split or external queue wait.
-        if(na::j2::flow::Enabled() && !windowed && (inl || !flow_ticket || !flow_ticket->valid)){
+        if(na::j2::flow::Enabled() && !windowed && !(saved && saved->at_present) && (inl || !flow_ticket || !flow_ticket->valid)){
             na::j2::compute_flow::Frame frame;frame.frame=g.frame;frame.previous=g.submitted_frame;
             frame.generation=g.router.Current().history_generation;frame.slot=g.slot;
             frame.reset=cam.camera_cut || resize || g.resume_reset;frame.hdr=is_float_color(cf);
@@ -2093,7 +2116,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         g.def.reset = cam.camera_cut || resize || g.resume_reset || carry;
         g.def.reversed = reversed;
         g.def.w = w; g.def.h = h;
-        ++g.stats.small_deferred;
+        if (saved && saved->at_present) ++g.stats.small_present_source;
+        else { ++g.stats.small_deferred; g.small_color = color_id; g.small_depth = depth_id; g.small_csub = csub; g.small_dsub = dsub; }
         g.stats.width = w; g.stats.height = h;
         g.stats.color_format = static_cast<uint32_t>(cd.Format);
         g.stats.render_w = rw; g.stats.render_h = rh;
@@ -2967,7 +2991,11 @@ ID3D12Resource* layer_composite(ID3D12GraphicsCommandList* l, uint32_t si, ID3D1
 
 } // namespace
 
-void SetRenderSmall(bool on) { g_render_small.store(on); }
+void SetRenderSmall(bool on)
+{
+    g_render_small.store(on);
+    na::observe::SetDepthClearListener(on ? &on_depth_clear : nullptr);
+}
 bool RenderSmall() { return g_render_small.load(); }
 void SetHudMaskView(bool on) { g_hud_view.store(on); }
 void SetHudMaskEnabled(bool on) { g_hud_mask_on.store(on); }
@@ -3008,6 +3036,74 @@ bool CameraBinding(uint64_t resource, uint64_t offset, uint32_t param, bool tabl
     }
     return false;
 }
+// I1.4 (COMMS a066d76 point 4): the frame that just closed reached Present without a deferred
+// record (the in-frame detector missed it). Its depth and motion come from here instead: the
+// selected scene depth as all submitted work left it, and that frame's own applied camera and
+// jitter (else record()'s usual short prediction). Exactly one source per frame: only when no
+// deferred record exists for it, and the result is used by this same Present. A depth cleared
+// again after its first clear may no longer hold the scene: refused (counted) until a
+// record-time snapshot exists. Called with g.m held, inside PresentUpscale's HostWorkScope.
+void present_refuse(const char* why)
+{
+    ++g.stats.small_present_refused;
+    std::snprintf(g.stats.small_present_why, sizeof g.stats.small_present_why, "%s", why);
+}
+bool present_source(ID3D12CommandQueue* queue, ExecuteFn forward, uint32_t rw, uint32_t rh)
+{
+    if (!g_render_small.load(std::memory_order_relaxed) || !na::present::Scaling() || g.latched || !g.dlss_ready ||
+        g.paused.load() || g.queue.Get() != queue || !forward || g.frame == 0)
+        return false;
+    const uint64_t closed = g.frame - 1;
+    if (g.def.valid && g.def.frame == closed) return false; // the in-frame source already ran
+    if (g.submitted_frame == closed) return false;           // J2 ran for this frame some other way
+    uint64_t depth = 0, color = 0;
+    na::observe::GetLiveSelection(&depth, &color);
+    if (!depth || !color) { present_refuse("no selected scene depth and colour"); return false; }
+    if (g.depth_clears_closed > 1) { present_refuse("the scene depth was cleared again after the scene"); return false; }
+    SceneInput si;
+    si.frame = closed; si.color = color; si.depth = depth;
+    if (color == g.small_color && depth == g.small_depth) { si.color_sub = g.small_csub; si.depth_sub = g.small_dsub; }
+    else {
+        ComPtr<ID3D12Resource> c, d;
+        c.Attach(na::observe::AcquireResource(color));
+        d.Attach(na::observe::AcquireResource(depth));
+        if (!c || !d) { present_refuse("the scene resources are gone"); return false; }
+        const auto cd = c->GetDesc(), dd = d->GetDesc();
+        if (cd.MipLevels > 1 || cd.DepthOrArraySize > 1 || dd.MipLevels > 1 || dd.DepthOrArraySize > 1) {
+            present_refuse("no learned subresource for a mip/array scene");
+            return false;
+        }
+        si.color_sub = si.depth_sub = 0;
+    }
+    if (g.pcam.valid && g.pcam.frame == closed) {
+        si.has_camera = true; si.vp = g.pcam.vp; si.reversed = g.cam_rev;
+        si.jitter[0] = g.pcam.px[0]; si.jitter[1] = g.pcam.px[1]; si.injected = true;
+    } else si.has_camera = false;
+    si.at_present = true;
+    PendingHistory pending;
+    ID3D12GraphicsCommandList* ours = nullptr;
+    const uint32_t slot = g.slot;
+    g.frame = closed; // record() works in the frame the inputs belong to
+    const bool ok = record(nullptr, 0, depth, color, &ours, pending, nullptr, nullptr, &si);
+    g.frame = closed + 1;
+    if (!ok || !ours || !g.def.valid || g.def.frame != closed) {
+        na::capture::j2::Discard(pending.capture, true);
+        present_refuse(g.stats.reason[0] ? g.stats.reason : "record refused");
+        return false;
+    }
+    ID3D12CommandList* one[1] = {ours};
+    forward(queue, 1, one);
+    g.slot = (g.slot + 1) % kRing;
+    g.slots[slot].fence_value = g.fence_next++;
+    queue->Signal(g.fence.Get(), g.slots[slot].fence_value);
+    g.tracker = pending.tracker;
+    committed_sources(pending);
+    g.submitted_frame = closed;
+    if (!pending.keep_reset) g.resume_reset = false;
+    if (pending.cut) ++g.stats.cuts;
+    na::capture::j2::Discard(pending.capture, false);
+    return true;
+}
 bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t rw, uint32_t rh,
                     ID3D12Resource* out, uint32_t ow, uint32_t oh, bool hdr, void*)
 {
@@ -3040,6 +3136,7 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
     add(b, out, NPSR, UAV);
     // DLSS needs this frame's depth + motion, recorded on this same queue (so the GPU runs them
     // first), at the picture's size, and a DLSS instance on this device.
+    if (!(g.def.valid && g.def.frame + 1 == g.frame)) present_source(queue, forward, rw, rh);
     const auto& d = g.def;
     const bool fresh = d.valid && d.frame + 1 == g.frame && d.w == rw && d.h == rh;
     const bool can_dlss = fresh && forward && g.dlss_ready && g.device && g.device.Get() == g_small.device.Get() &&
@@ -3587,6 +3684,25 @@ void OnPresent(ID3D12CommandQueue* queue)
         }
         g.insertion_frame = {};
         update_window(g.submitted_frame == g.frame);
+        // I1.4: what the Present-time source may use for the frame that closes now.
+        g.pcam = {};
+        if (g.jit.valid && g.jit.applied && g.jit.frame == g.frame) {
+            const auto L = g.jit.layout ? na::camera::Layout::ColumnMajor : na::camera::Layout::RowMajor;
+            const std::vector<uint8_t> jb(g.jit.jvp[g.jit.layout], g.jit.jvp[g.jit.layout] + 64);
+            const na::camera::Matrix m = na::camera::LoadMatrix(jb, 0, L);
+            na::camera::Candidate c{};
+            if (na::camera::ViewProjection(m, c)) {
+                g.pcam.valid = true; g.pcam.frame = g.frame; g.pcam.vp = m;
+                g.pcam.px[0] = g.jit.px[0]; g.pcam.px[1] = g.jit.px[1];
+            }
+        }
+        g.depth_clears_closed = g_depth_clears.exchange(0, std::memory_order_relaxed);
+        {
+            uint64_t dsel = 0, csel = 0;
+            na::observe::GetLiveSelection(&dsel, &csel);
+            g_clear_watch.store(dsel, std::memory_order_relaxed);
+        }
+        g.stats.depth_clears_last = g.depth_clears_closed;
         ++g.frame;
         g.jit.valid = false; // J1: the next camera block starts a new jitter sample
         g.inline_sample_locked = false;
