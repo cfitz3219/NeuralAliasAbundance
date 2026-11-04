@@ -929,6 +929,14 @@ void write_status_line()
                     (unsigned long long)j2.jitter_unseen_count, (unsigned long long)j2.jitter_retests);
                 if (wn > 0) WriteFile(f, wl, DWORD((std::min)(wn, int(sizeof wl - 1))), &written, nullptr);
             }
+            {
+                char hl[320];
+                const int hn = snprintf(hl, sizeof hl,
+                    "hud_fallback on=%u frames=%llu applied=%llu learn_only=%llu last{mask_px=%u tested_px=%u cover_permille=%u}\r\n",
+                    na::j2::HudMaskEnabled() ? 1u : 0u, (unsigned long long)j2.hud_fb_frames, (unsigned long long)j2.hud_fb_applied,
+                    (unsigned long long)j2.hud_fb_learn_only, j2.hud_fb_mask_px, j2.hud_fb_tested_px, j2.hud_fb_cover_permille);
+                if (hn > 0) WriteFile(f, hl, DWORD((std::min)(hn, int(sizeof hl - 1))), &written, nullptr);
+            }
             const std::string hud = na::j2::native_hud::StatusLine() + " composited=" + std::to_string(j2.small_hud_layer) +
                 " chain_fmt=" + std::to_string(g_presented_format.load(std::memory_order_relaxed)) +
                 " color_space=" + std::to_string(g_color_space.load(std::memory_order_acquire)) + "\r\n";

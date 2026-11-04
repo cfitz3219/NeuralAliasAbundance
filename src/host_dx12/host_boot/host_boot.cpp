@@ -268,7 +268,9 @@ DWORD WINAPI InitThread(LPVOID)
             na::j2::native_hud::SetCoverRule(GetPrivateProfileIntW(L"present", L"hud_cover", 0, g_ini) == 1);
             boot_log("render-small: native-resolution HUD on");
         } else boot_log("render-small: native-resolution HUD off ([present] native_hud=0)");
-        na::j2::SetHudMaskEnabled(GetPrivateProfileIntW(L"present", L"hud_mask", 0, g_ini) == 1);
+        // HUD protection fallback (2026-11-04): on by default; it acts only on frames where the
+        // native HUD layer did not engage, and only on what it learned during real movement.
+        na::j2::SetHudMaskEnabled(GetPrivateProfileIntW(L"present", L"hud_mask", 1, g_ini) == 1);
         // Ultra Performance is not offered with render-small (the HUD would be drawn at 33%).
         if (na::settings::Get().j2_scale_mode.load() > 3) na::settings::Get().j2_scale_mode.store(3);
         const int small_mode = static_cast<int>(na::settings::Get().j2_scale_mode.load());

@@ -2715,7 +2715,10 @@ struct SmallRing {
     uint32_t hud_w = 0, hud_h = 0, up_w = 0, up_h = 0;
     DXGI_FORMAT prev_f = DXGI_FORMAT_UNKNOWN;
     bool prev_valid = false;
-    bool hud_fresh = true; // the evidence is from before a gap: start over at the next classify
+    bool hud_fresh = true; // a new picture size: start the evidence over at the next classify
+    ComPtr<ID3D12Resource> hread[kRing]; // HUD fallback counts per ring slot (read when the slot comes round)
+    bool hread_valid[kRing] = {};
+    bool hud_protect_off = false;        // last completed mask covered too much: learn, do not apply
 } g_small;
 na::j2::NisScaler g_hud_nis;
 std::atomic<bool> g_hud_view{false}; // tint HUD pixels (menu: Show HUD mask)
@@ -2734,14 +2737,19 @@ cbuffer C : register(b0) { uint w; uint h; uint ow; uint oh; uint flags; uint cu
 groupshared uint gs_detail, gs_still;
 float luma(float3 c) { return dot(min(c, 1.0), float3(0.299, 0.587, 0.114)); }
 int2 at(int2 p, int2 d) { return clamp(p + d, int2(0, 0), int2(int(w) - 1, int(h) - 1)); }
-// The HUD is drawn without our jitter and without the camera's motion. The 3D picture moves
-// a fraction of a pixel every frame (jitter), so a detailed pixel that stays exactly the
-// same is HUD evidence; with the camera moving under it, stronger evidence. A detailed pixel
-// that changes is scene evidence. Flat pixels keep what was learned.
-// Guard: if the game's own anti-aliasing removes the jitter, the whole picture stands still.
-// Last frame's counts (other parity): when half or more of the detailed pixels stood still,
-// jitter is not visible and only camera motion counts.
-// t0 this frame, t1 the previous frame, t2 motion (render pixels); u1 evidence; u3 counts.
+// HUD protection fallback (2026-11-04, Cort: two independent HUD methods; Astra 20cddb8/3dd71ab:
+// motion contradiction, not plain stillness; learned over seconds; protection, not separation).
+// A HUD pixel is anchored to the screen; the world under it moves with our motion vectors. Only
+// pixels where the camera vector says the world moves (>= 1.5 render px) and the picture has
+// detail teach anything, so a still camera, the sky and flat areas learn nothing:
+//   * screen-fixed (same as last frame at the same place) AND not where the motion says the world
+//     came from: HUD evidence, +1/48 per frame (about a second of real movement at 50 fps);
+//   * follows the motion and not screen-fixed, or a large change: world evidence, -1/12 per frame;
+//   * anything else (a changing counter, a mover, a disocclusion): no change.
+// The evidence persists across camera cuts (a HUD survives them); only a new picture size clears it.
+// t0 this frame, t1 the previous frame, t2 motion (current -> previous, render pixels); u1 evidence;
+// stats: byte 52 + 8*cur = detailed moving pixels tested this frame.
+float maxdiff(float3 a, float3 b) { const float3 d = abs(min(a, 1.0) - min(b, 1.0)); return max(d.r, max(d.g, d.b)); }
 [numthreads(8, 8, 1)]
 void classify(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if (gi == 0) { gs_detail = 0; gs_still = 0; }
@@ -2751,36 +2759,30 @@ void classify(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         float lo = 2.0, hi = -1.0;
         [unroll] for (int y = -1; y <= 1; ++y)
             [unroll] for (int x = -1; x <= 1; ++x) { const float l = luma(t0[at(p, int2(x, y))].rgb); lo = min(lo, l); hi = max(hi, l); }
-        const float3 d3 = abs(min(t0[p].rgb, 1.0) - min(t1[p].rgb, 1.0));
-        const float d = max(d3.r, max(d3.g, d3.b));
         const float2 m = t2[p].xy;
-        const uint other = (cur ^ 1u) * 8u;
-        const uint pd = stats.Load(other), ps = stats.Load(other + 4u);
-        const bool jitter_seen = (flags & 2u) != 0u && pd > 2000u && ps * 2u < pd;
-        // flags 4: start over (after a gap or a camera cut, old evidence describes another picture).
         float e = (flags & 4u) != 0u ? 0.0 : u1[p];
-        // A large change is scene evidence even where the picture is now flat (Sol HUD-R2: a HUD
-        // element that disappears over a flat background must not stay HUD forever).
-        if (d > 0.04) e -= 0.5;
-        if (hi - lo > 0.1) {
-            uint dummy;
-            InterlockedAdd(gs_detail, 1u, dummy);
-            if (d < 0.006) InterlockedAdd(gs_still, 1u, dummy);
-            if (d > 0.04) {}
-            else if (d < 0.006 && dot(m, m) >= 1.0) e += 0.25;
-            else if (d < 0.006 && jitter_seen) e += 0.125;
+        if (all(abs(m) < 512.0) && dot(m, m) >= 2.25) {
+            const float3 c = t0[p].rgb;
+            const float still = maxdiff(c, t1[p].rgb);
+            const float2 uv = (float2(p) + 0.5 + m) / float2(w, h);
+            const bool inside = all(uv > 0.0) && all(uv < 1.0);
+            const float follow = inside ? maxdiff(c, t1.SampleLevel(s_lin, uv, 0).rgb) : 1.0;
+            if (still > 0.15) e -= 1.0 / 12.0; // a large change at a fixed place: not a still overlay now
+            else if (hi - lo > 0.06) {
+                uint dummy;
+                InterlockedAdd(gs_detail, 1u, dummy);
+                if (still < 0.02 && inside && follow > max(0.06, 3.0 * still)) e += 1.0 / 48.0;
+                else if (inside && follow < 0.03 && still > 0.06) e -= 1.0 / 12.0;
+            }
         }
         u1[p] = saturate(e);
     }
     GroupMemoryBarrierWithGroupSync();
-    if (gi == 0) {
-        stats.InterlockedAdd(cur * 8u, gs_detail);
-        stats.InterlockedAdd(cur * 8u + 4u, gs_still);
-    }
+    if (gi == 0) stats.InterlockedAdd(52u + cur * 8u, gs_detail);
 }
 // Zeroes this frame's counts before classify.
 [numthreads(1, 1, 1)]
-void clear(uint3 id : SV_DispatchThreadID) { stats.Store2(cur * 8u, uint2(0, 0)); }
+void clear(uint3 id : SV_DispatchThreadID) { stats.Store2(cur * 8u, uint2(0, 0)); stats.Store2(48u + cur * 8u, uint2(0, 0)); }
 // Jitter witness (render size): t0 this frame, t1 the previous DLSS frame, t2 motion. On still,
 // detailed pixels, does this frame match the previous one unshifted, or shifted by the declared
 // jitter difference (asfloat(p1), asfloat(p2) render pixels; both signs tried)? Counts at byte 32:
@@ -2808,17 +2810,27 @@ void witness(uint3 id : SV_DispatchThreadID) {
 }
 [numthreads(1, 1, 1)]
 void wclear(uint3 id : SV_DispatchThreadID) { stats.Store4(32u, uint4(0, 0, 0, 0)); }
-// u1 evidence -> u2 mask (3x3 max, so text edges blended with the scene count too);
-// HUD pixels get no motion (u0 = the motion DLSS reads), so DLSS does not drag them.
+// u1 evidence -> u2 mask (3x3 max, so text edges blended with the scene count too), with
+// hysteresis on last frame's mask (on above 0.65, off below 0.3), so a pixel near the threshold
+// never flickers. Inside the mask the motion DLSS reads is zero (u0) unless flags 8 (protection
+// off this frame: the mask is learned but not applied). stats: byte 48 + 8*cur = mask pixels.
 [numthreads(8, 8, 1)]
-void dilate(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= w || id.y >= h) return;
-    const int2 p = int2(id.xy);
-    float m = 0.0;
-    [unroll] for (int y = -1; y <= 1; ++y)
-        [unroll] for (int x = -1; x <= 1; ++x) m = max(m, u1[at(p, int2(x, y))]);
-    u2[p] = m;
-    if (m > 0.5) u0[p] = float4(0, 0, 0, 0);
+void dilate(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+    if (gi == 0) gs_still = 0;
+    GroupMemoryBarrierWithGroupSync();
+    if (id.x < w && id.y < h) {
+        const int2 p = int2(id.xy);
+        float m = 0.0;
+        [unroll] for (int y = -1; y <= 1; ++y)
+            [unroll] for (int x = -1; x <= 1; ++x) m = max(m, u1[at(p, int2(x, y))]);
+        const float was = (flags & 4u) != 0u ? 0.0 : u2[p];
+        const bool on = was > 0.5 ? m > 0.3 : m > 0.65;
+        u2[p] = on ? 1.0 : 0.0;
+        if (on && (flags & 8u) == 0u) u0[p] = float4(0, 0, 0, 0);
+        if (on) { uint dummy; InterlockedAdd(gs_still, 1u, dummy); }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (gi == 0) stats.InterlockedAdd(48u + cur * 8u, gs_still);
 }
 // Output size: t0 the DLSS (+RCAS) picture, t1 the NIS-upscaled frame, t2 the mask; u0 result.
 [numthreads(8, 8, 1)]
@@ -2930,6 +2942,18 @@ bool hud_targets(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, u
             return false;
         }
         g_small.hud_w = rw; g_small.hud_h = rh; g_small.prev_f = fd.Format;
+    }
+    if (!g_small.hread[0]) {
+        D3D12_HEAP_PROPERTIES rp{D3D12_HEAP_TYPE_READBACK};
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = 256; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        for (uint32_t i = 0; i < kRing; ++i)
+            if (FAILED(dev->CreateCommittedResource(&rp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_small.hread[i])))) {
+                for (auto& r : g_small.hread) r.Reset();
+                return false;
+            }
     }
     if (!g_small.hudup || g_small.up_w != ow || g_small.up_h != oh) {
         if (!texture(ow, oh, DXGI_FORMAT_R16G16B16A16_FLOAT, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g_small.hudup)) return false;
@@ -3300,6 +3324,27 @@ void witness_read(uint32_t si)
     }
     g_small.w_frames = g_small.w_tested = g_small.w_unshifted = g_small.w_shifted = 0;
 }
+// HUD fallback counts of the frame that last used this ring slot (its GPU work has completed).
+void hud_read(uint32_t si)
+{
+    if (!g_small.hread_valid[si]) return;
+    g_small.hread_valid[si] = false;
+    uint32_t v[4] = {};
+    void* ptr = nullptr;
+    const D3D12_RANGE r{0, 16};
+    if (FAILED(g_small.hread[si]->Map(0, &r, &ptr)) || !ptr) return;
+    std::memcpy(v, ptr, sizeof v);
+    const D3D12_RANGE none{0, 0};
+    g_small.hread[si]->Unmap(0, &none);
+    // v[0] = mask pixels, v[1] = tested pixels (this slot's parity), at bytes 48 / 52 + 8 * parity.
+    const uint32_t px = g_small.hud_w * g_small.hud_h;
+    g.stats.hud_fb_mask_px = v[0];
+    g.stats.hud_fb_tested_px = v[1];
+    g.stats.hud_fb_cover_permille = px ? static_cast<uint32_t>(uint64_t(v[0]) * 1000u / px) : 0u;
+    // A HUD rarely covers a third of the screen; more is most likely a menu or misread scenery,
+    // which keeps learning but is not protected (it would replace DLSS with NIS over that area).
+    g_small.hud_protect_off = g.stats.hud_fb_cover_permille > 300;
+}
 bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t rw, uint32_t rh,
                     ID3D12Resource* out, uint32_t ow, uint32_t oh, bool hdr, void*)
 {
@@ -3326,6 +3371,7 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         ++g.stats.small_failed; small_note("Render-small: could not reset its list."); return false;
     }
     witness_read(si);
+    hud_read(si);
     constexpr UINT PRESENT = D3D12_RESOURCE_STATE_PRESENT, NPSR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                    UAV = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     std::vector<D3D12_RESOURCE_BARRIER> b;
@@ -3346,7 +3392,8 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
     const DXGI_FORMAT of = typed(out->GetDesc().Format);
     const bool hud_layer = layer_frame && hud_init() && small_sharp_target(ow, oh, of);
     if (layer_frame && !hud_layer) small_note("Render-small: the native HUD could not be laid on (no composite pass); HUD missing this frame.");
-    bool hud_mask = false; // mask holds this frame's HUD (NON_PIXEL_SHADER_RESOURCE until the composite)
+    bool hud_mask = false; // mask holds this frame's HUD and is applied
+    bool hud_ran = false;  // the fallback passes ran (mask in NON_PIXEL_SHADER_RESOURCE until the end)
     const DXGI_FORMAT ff = typed(frame->GetDesc().Format);
     // Jitter witness inputs: this frame against the previous DLSS frame, when consecutive and the
     // declared jitter moved by at least a fifth of a pixel (else no verdict is possible).
@@ -3388,9 +3435,11 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         }
         if (hud_want && g_small.prev_valid) {
             g_small.hud_parity ^= 1u;
-            const bool forget = g_small.hud_fresh || d.reset;
+            // The learned map survives camera cuts and gaps (a HUD does); only a new size clears it.
+            const bool forget = g_small.hud_fresh;
             g_small.hud_fresh = false;
-            const uint32_t k[8] = {rw, rh, ow, oh, ((d.jx != 0.f || d.jy != 0.f) ? 2u : 0u) | (forget ? 4u : 0u), g_small.hud_parity, 0, 0};
+            const uint32_t k[8] = {rw, rh, ow, oh, ((d.jx != 0.f || d.jy != 0.f) ? 2u : 0u) | (forget ? 4u : 0u) | (g_small.hud_protect_off ? 8u : 0u),
+                                   g_small.hud_parity, 0, 0};
             {
                 ID3D12Resource* const srv[3] = {nullptr, nullptr, nullptr};
                 const DXGI_FORMAT sf[3] = {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
@@ -3420,10 +3469,20 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
             }
             b.push_back(uav_barrier(g.motion.Get()));
             b.push_back(uav_barrier(g_small.mask.Get()));
+            b.push_back(uav_barrier(g_small.hud_stats.Get()));
             add(b, g.motion.Get(), UAV, NPSR);
             add(b, g_small.mask.Get(), UAV, NPSR);
+            add(b, g_small.hud_stats.Get(), UAV, D3D12_RESOURCE_STATE_COPY_SOURCE);
             flush(l, b);
-            hud_mask = true;
+            l->CopyBufferRegion(g_small.hread[si].Get(), 0, g_small.hud_stats.Get(), 48 + 8 * g_small.hud_parity, 8);
+            add(b, g_small.hud_stats.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, UAV);
+            flush(l, b);
+            g_small.hread_valid[si] = true;
+            hud_ran = true;
+            ++g.stats.hud_fb_frames;
+            // Applied: zero motion (dilate), DLSS's current-colour bias and the NIS HUD pixels.
+            hud_mask = !g_small.hud_protect_off;
+            if (hud_mask) ++g.stats.hud_fb_applied; else ++g.stats.hud_fb_learn_only;
         }
         na::dlss::EvalDesc e{};
         e.color = frame;
@@ -3446,6 +3505,8 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         e.hdr = hdr;
         e.depth_inverted = d.reversed;
         e.auto_exposure = true;
+        // HUD protection: DLSS trusts this frame's colour where the learned mask says HUD.
+        e.bias_current_color = hud_mask ? g_small.mask.Get() : nullptr;
         dlss = na::dlss::Evaluate(l, e);
         add(b, g.motion.Get(), NPSR, UAV);
         if (dlss) {
@@ -3521,7 +3582,7 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
                    : g.queue.Get() != queue ? "Render-small: the scene was drawn on another queue; stretched."
                    : "Render-small: DLSS is not ready; stretched.");
     }
-    if (hud_mask) add(b, g_small.mask.Get(), NPSR, UAV);
+    if (hud_ran) add(b, g_small.mask.Get(), NPSR, UAV);
     if (!dlss) {
         flush(l, b);
         small_stretch(l, frame, out, ow, oh, si);
@@ -3565,7 +3626,7 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         g_small.prev_valid = true;
     } else if (!can_dlss || hud_nis == 0 || !g_hud_mask_on.load(std::memory_order_relaxed)) {
         g_small.prev_valid = false; // a gap: the next comparison would be against an old frame
-        g_small.hud_fresh = true;   // and the evidence describes an old picture
+        // The learned map is kept: the HUD is still where it was (it is cleared on a new size).
     }
     // Evidence capture (F8 / "Capture"): render-small had none, so a flicker in the upscaled
     // picture could not be measured (Cort's e7acb94 capture came out empty). Colour = DLSS's

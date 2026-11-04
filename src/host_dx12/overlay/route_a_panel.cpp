@@ -990,7 +990,7 @@ void DrawLiveDlaa()
     if (na::j2::RenderSmall() && na::j2::HudMaskEnabled()) {
         na::settings::Settings& ss = na::settings::Get();
         int hud = static_cast<int>(ss.j2_hud_nis.load());
-        BeginRow("HUD sharpness (NIS)", "Experimental fallback ([present] hud_mask=1). Guesses which pixels are HUD from the picture and replaces them with an NVIDIA Image Scaling copy at this sharpness. The HUD is still part of what DLSS gets, and a wrong guess shows unsmoothed scenery. Not used on frames where the native-resolution HUD works.", S(220));
+        BeginRow("HUD sharpness (NIS)", "HUD protection fallback (on by default; [present] hud_mask=0 turns it off). While the camera moves, it learns which pixels stay fixed on screen when the world behind them moves. There DLSS gets no motion and trusts the current frame, and the HUD pixels are shown from an NVIDIA Image Scaling copy at this sharpness. The HUD is still part of what DLSS gets; this protects it rather than separating it. Not used on frames where the native-resolution HUD works.", S(220));
         ImGui::SetNextItemWidth(S(220));
         if (ImGui::SliderInt("##j2hudnis", &hud, 0, 100, hud ? "%d%%" : "Off", ImGuiSliderFlags_AlwaysClamp)) ss.j2_hud_nis.store(static_cast<uint32_t>(hud));
         if (ImGui::IsItemDeactivatedAfterEdit()) na::settings::Save();

@@ -320,6 +320,12 @@ struct Stats {
     // Render-small: frames whose depth + motion were kept for Present; pictures DLSS upscaled at
     // Present / stretched (no fresh depth + motion) / not produced (the presenter kept its old one).
     uint64_t small_deferred = 0, small_dlss = 0, small_stretched = 0, small_failed = 0, small_dlss_failed = 0, small_sharpened = 0, small_hud = 0, small_hud_layer = 0;
+    // HUD protection fallback (screen-fixed map learned during movement; 2026-11-04): frames it
+    // ran, frames it was applied (zero motion + DLSS current-colour bias + NIS HUD pixels), frames
+    // learned only (coverage above 30 %: not applied), and the last completed frame's mask pixels,
+    // detailed moving pixels tested and mask coverage in permille of the picture.
+    uint64_t hud_fb_frames = 0, hud_fb_applied = 0, hud_fb_learn_only = 0;
+    uint32_t hud_fb_mask_px = 0, hud_fb_tested_px = 0, hud_fb_cover_permille = 0;
     uint32_t small_rw = 0, small_rh = 0, small_ow = 0, small_oh = 0;
     // I1.4: frames whose depth + motion came from the Present-time source (the in-frame detector
     // missed); attempts it refused, and why last; selected-depth clears recorded in the last frame.

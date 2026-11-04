@@ -667,7 +667,7 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
     p->Set(NVSDK_NGX_Parameter_Output, d.output);
     p->Set(NVSDK_NGX_Parameter_ExposureTexture, d.exposure);
     p->Set(NVSDK_NGX_Parameter_TransparencyMask, static_cast<ID3D12Resource*>(nullptr));
-    p->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, static_cast<ID3D12Resource*>(nullptr));
+    p->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, d.bias_current_color);
     p->Set(NVSDK_NGX_Parameter_Jitter_Offset_X, d.jitter_x);
     p->Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, d.jitter_y);
     p->Set(NVSDK_NGX_Parameter_MV_Scale_X, d.mv_scale_x);
@@ -685,6 +685,10 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
     p->Set(NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_Y, 0u);
     p->Set(NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_X, 0u);
     p->Set(NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_Y, 0u);
+#ifdef NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_SubrectBase_X
+    p->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_SubrectBase_X, 0u);
+    p->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_SubrectBase_Y, 0u);
+#endif
     const NVSDK_NGX_Result r = reinterpret_cast<PfnEvaluate>(g.api.evaluate_feature)(list, static_cast<NVSDK_NGX_Handle*>(ft.handle), p, nullptr);
     g.stats.last_ngx_result = static_cast<int32_t>(r);
     if (NVSDK_NGX_FAILED(r)) {
