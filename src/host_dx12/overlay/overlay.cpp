@@ -920,6 +920,15 @@ void write_status_line()
                 j2.jitter_phases, na::observe::SamplerMipBias(), (unsigned long long)j2.small_present_source,
                 (unsigned long long)j2.small_present_refused, j2.depth_clears_last, j2.small_present_why, j2.small_note);
             if (sn > 0) WriteFile(f, sl, DWORD((std::min)(sn, int(sizeof sl - 1))), &written, nullptr);
+            {
+                char wl[320];
+                const int wn = snprintf(wl, sizeof wl,
+                    "jitter_witness frames=%llu windows=%llu last_window{tested=%llu unshifted=%llu shifted=%llu} unseen_now=%u unseen_count=%llu retests=%llu\r\n",
+                    (unsigned long long)j2.witness_frames, (unsigned long long)j2.witness_windows, (unsigned long long)j2.witness_tested,
+                    (unsigned long long)j2.witness_unshifted, (unsigned long long)j2.witness_shifted, j2.jitter_unseen ? 1u : 0u,
+                    (unsigned long long)j2.jitter_unseen_count, (unsigned long long)j2.jitter_retests);
+                if (wn > 0) WriteFile(f, wl, DWORD((std::min)(wn, int(sizeof wl - 1))), &written, nullptr);
+            }
             const std::string hud = na::j2::native_hud::StatusLine() + " composited=" + std::to_string(j2.small_hud_layer) +
                 " chain_fmt=" + std::to_string(g_presented_format.load(std::memory_order_relaxed)) +
                 " color_space=" + std::to_string(g_color_space.load(std::memory_order_acquire)) + "\r\n";

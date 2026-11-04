@@ -322,6 +322,11 @@ struct Stats {
     // I1.4: frames whose depth + motion came from the Present-time source (the in-frame detector
     // missed); attempts it refused, and why last; selected-depth clears recorded in the last frame.
     uint64_t small_present_source = 0, small_present_refused = 0;
+    // Jitter witness (render-small): frames tested, the last 60-frame window's pixel counts, how
+    // often jitter was found not to reach the picture (then off until a re-test), and whether off now.
+    uint64_t witness_frames = 0, witness_windows = 0, witness_tested = 0, witness_unshifted = 0, witness_shifted = 0;
+    uint64_t jitter_unseen_count = 0, jitter_retests = 0;
+    bool jitter_unseen = false;
     uint32_t depth_clears_last = 0;
     char small_present_why[96] = {};
     // Size observation independent of evaluation (COMMS 4bd474c I1.1): the selected scene colour's

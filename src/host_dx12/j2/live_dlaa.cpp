@@ -230,6 +230,12 @@ struct State {
         uint64_t last_eval = 0;              // last frame DLSS evaluated a windowed corner (g.output holds it)
     } win;
     bool jitter_on = true; // DLAA needs jitter (with the texture mip bias set at start-up)
+    // Render-small jitter witness: the picture DLSS gets did not show J1's sample shifts (still
+    // detailed pixels matched unshifted, not at the declared jitter difference). No jitter is then
+    // applied or declared until the next re-test (frame), so DLSS is never told about a shift that
+    // never reached the image (Astra 4cbbf44: 96.9% of a still patch identical while jitter changed).
+    bool jitter_unseen = false;
+    uint64_t jitter_retest = 0;
     // Render-small: this frame's DLSS inputs other than colour, kept for PresentUpscale. depth32
     // and motion hold them (motion back in UAV at rest); the game queue orders them before Present.
     struct Deferred {
@@ -1113,7 +1119,7 @@ void jitter_batch_impl(ID3D12CommandList* const* lists, UINT count)
     // An engaged projection window draws every frame into the corner: it keeps jittering
     // (and windowing) through a frame without DLAA rather than show a full-size frame
     // on the windowed recordings' clipped targets.
-    if (!g.jitter_on || (g.inline_mode && g.inline_sample_locked && !g.jit.valid) ||
+    if (!g.jitter_on || g.jitter_unseen || (g.inline_mode && g.inline_sample_locked && !g.jit.valid) ||
         g.camera_param < 0 || g.camera_offset < 0 || (!running && !window_now()) || !g.w ||
         (g_render_small.load(std::memory_order_relaxed) && g_small_stretch_streak.load(std::memory_order_relaxed) >= 3)) return;
     struct JB { uint64_t res, off; uint32_t size; bool slot, known; };
@@ -1889,7 +1895,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         g.resume_reset = true; // remains pending if this recording is not submitted
     }
     const double zero[2] = {0, 0};
-    const double* injected = held ? zero : from_j1 ? g.jit.px : saved ? (saved->has_camera ? saved->jitter : zero) : g_injected ? g.jit.px : zero; // sample belongs to the captured camera
+    const double* injected = (deferred && g.jitter_unseen) ? zero : held ? zero : from_j1 ? g.jit.px : saved ? (saved->has_camera ? saved->jitter : zero) : g_injected ? g.jit.px : zero; // sample belongs to the captured camera
     double rescaled[2] = {0, 0};
     if (injected != zero && jit_rw && jit_rh && (jit_rw != rw || jit_rh != rh)) {
         rescaled[0] = injected[0] * double(rw) / double(jit_rw);
@@ -2607,7 +2613,18 @@ struct SmallRing {
     // uses), hudup = NIS-upscaled frame at output size (RGBA16F, UAV between uses).
     bool hud_tried = false, hud_ok = false;
     ComPtr<ID3D12RootSignature> hud_root;
-    ComPtr<ID3D12PipelineState> hud_pso[5]; // classify, dilate, composite, clear, layer (native HUD)
+    ComPtr<ID3D12PipelineState> hud_pso[7]; // classify, dilate, composite, clear, layer (native HUD), witness, wclear
+    // Jitter witness: the last DLSS frame (render size), its declared jitter and J2 frame, and
+    // a readback of the counts per ring slot (read when the slot comes round again).
+    ComPtr<ID3D12Resource> wprev, wread[kRing];
+    bool wread_valid[kRing] = {};
+    uint32_t wprev_w = 0, wprev_h = 0;
+    DXGI_FORMAT wprev_f = DXGI_FORMAT_UNKNOWN;
+    bool wprev_valid = false;
+    uint64_t wprev_frame = 0;
+    float wjx = 0.f, wjy = 0.f, last_jx = 0.f, last_jy = 0.f; // last_*: the jitter DLSS was told this present
+    uint64_t w_frames = 0, w_tested = 0, w_unshifted = 0, w_shifted = 0; // the current window
+    uint32_t w_unseen_windows = 0;
     ComPtr<ID3D12DescriptorHeap> hud_heap;  // kRing x 5 passes x (3 SRV, 4 UAV)
     ComPtr<ID3D12Resource> prev, hud, mask, hudup;
     ComPtr<ID3D12Resource> hud_stats; // 4 uints: per frame parity, detailed pixels and still ones
@@ -2681,6 +2698,33 @@ void classify(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
 // Zeroes this frame's counts before classify.
 [numthreads(1, 1, 1)]
 void clear(uint3 id : SV_DispatchThreadID) { stats.Store2(cur * 8u, uint2(0, 0)); }
+// Jitter witness (render size): t0 this frame, t1 the previous DLSS frame, t2 motion. On still,
+// detailed pixels, does this frame match the previous one unshifted, or shifted by the declared
+// jitter difference (asfloat(p1), asfloat(p2) render pixels; both signs tried)? Counts at byte 32:
+// tested, unshifted wins, shifted wins.
+float diff3(float3 a, float3 b) { const float3 d = abs(min(a, 1.0) - min(b, 1.0)); return d.r + d.g + d.b; }
+[numthreads(8, 8, 1)]
+void witness(uint3 id : SV_DispatchThreadID) {
+    if (id.x + 2 >= w || id.y + 2 >= h || id.x < 2 || id.y < 2) return;
+    const int2 p = int2(id.xy);
+    const float2 m = t2[p].xy;
+    if (dot(m, m) > 1.0) return; // the camera moves here: no verdict
+    float lo = 2.0, hi = -1.0;
+    [unroll] for (int y = -1; y <= 1; ++y)
+        [unroll] for (int x = -1; x <= 1; ++x) { const float l = luma(t0[p + int2(x, y)].rgb); lo = min(lo, l); hi = max(hi, l); }
+    if (hi - lo < 0.1) return;   // flat: says nothing about sub-pixel shifts
+    const float2 dj = float2(asfloat(p1), asfloat(p2));
+    const float2 uv = (float2(p) + 0.5) / float2(w, h), du = dj / float2(w, h);
+    const float3 c = t0[p].rgb;
+    const float e0 = diff3(c, t1[p].rgb);
+    const float ej = min(diff3(c, t1.SampleLevel(s_lin, uv + du, 0).rgb), diff3(c, t1.SampleLevel(s_lin, uv - du, 0).rgb));
+    uint dummy;
+    stats.InterlockedAdd(32u, 1u, dummy);
+    if (e0 * 2.0 < ej) stats.InterlockedAdd(36u, 1u, dummy);
+    else if (ej * 2.0 < e0) stats.InterlockedAdd(40u, 1u, dummy);
+}
+[numthreads(1, 1, 1)]
+void wclear(uint3 id : SV_DispatchThreadID) { stats.Store4(32u, uint4(0, 0, 0, 0)); }
 // u1 evidence -> u2 mask (3x3 max, so text edges blended with the scene count too);
 // HUD pixels get no motion (u0 = the motion DLSS reads), so DLSS does not drag them.
 [numthreads(8, 8, 1)]
@@ -2753,8 +2797,8 @@ bool hud_init()
     if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
         FAILED(dev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&g_small.hud_root))))
         return false;
-    const char* entries[5] = {"classify", "dilate", "composite", "clear", "layer"};
-    for (int i = 0; i < 5; ++i) {
+    const char* entries[7] = {"classify", "dilate", "composite", "clear", "layer", "witness", "wclear"};
+    for (int i = 0; i < 7; ++i) {
         ComPtr<ID3DBlob> code, cerr;
         if (FAILED(D3DCompile(kHudHlsl, sizeof(kHudHlsl) - 1, "j2_small_hud.hlsl", nullptr, nullptr, entries[i], "cs_5_0",
                               D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &cerr)))
@@ -2764,7 +2808,7 @@ bool hud_init()
         pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
         if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_small.hud_pso[i])))) return false;
     }
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRing * 35, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRing * 49, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_small.hud_heap)))) return false;
     D3D12_HEAP_PROPERTIES bhp{D3D12_HEAP_TYPE_DEFAULT};
     D3D12_RESOURCE_DESC bd{};
@@ -2815,7 +2859,7 @@ void hud_pass(ID3D12GraphicsCommandList* l, int pass, uint32_t slot, ID3D12Resou
               ID3D12Resource* const uav[3], const DXGI_FORMAT uf[3], const uint32_t k[8], uint32_t gx, uint32_t gy)
 {
     ID3D12Device* dev = g_small.device.Get();
-    const UINT base = (slot * 5 + static_cast<UINT>(pass)) * 7;
+    const UINT base = (slot * 7 + static_cast<UINT>(pass)) * 7;
     D3D12_CPU_DESCRIPTOR_HANDLE c = g_small.hud_heap->GetCPUDescriptorHandleForHeapStart();
     c.ptr += static_cast<SIZE_T>(base) * g_small.inc;
     for (int i = 0; i < 3; ++i, c.ptr += g_small.inc) {
@@ -2836,7 +2880,7 @@ void hud_pass(ID3D12GraphicsCommandList* l, int pass, uint32_t slot, ID3D12Resou
         D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
         uv.Format = DXGI_FORMAT_R32_TYPELESS;
         uv.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-        uv.Buffer.NumElements = 4;
+        uv.Buffer.NumElements = 64; // 256 bytes: HUD counts at 0, jitter witness at 32
         uv.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
         dev->CreateUnorderedAccessView(g_small.hud_stats.Get(), nullptr, &uv, c);
     }
@@ -3110,6 +3154,67 @@ bool present_source(ID3D12CommandQueue* queue, ExecuteFn forward)
     na::capture::j2::Discard(pending.capture, false);
     return true;
 }
+// ---- Render-small jitter witness (generic: compares the game's own consecutive pictures) ----
+bool witness_targets(ID3D12Resource* frame, uint32_t rw, uint32_t rh)
+{
+    ID3D12Device* dev = g_small.device.Get();
+    const D3D12_RESOURCE_DESC fd = frame->GetDesc();
+    if (!g_small.wread[0]) {
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_READBACK};
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = 256; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        for (uint32_t i = 0; i < kRing; ++i)
+            if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_small.wread[i])))) {
+                for (auto& r : g_small.wread) r.Reset();
+                return false;
+            }
+    }
+    if (!g_small.wprev || g_small.wprev_w != rw || g_small.wprev_h != rh || g_small.wprev_f != fd.Format) {
+        g_small.wprev.Reset();
+        g_small.wprev_valid = false;
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC pd = fd;
+        pd.Flags = D3D12_RESOURCE_FLAG_NONE; pd.MipLevels = 1; pd.DepthOrArraySize = 1;
+        if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &pd, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                                                IID_PPV_ARGS(&g_small.wprev))))
+            return false;
+        g_small.wprev_w = rw; g_small.wprev_h = rh; g_small.wprev_f = fd.Format;
+    }
+    return true;
+}
+// The counts this ring slot recorded kRing presents ago (its fence has passed), and the verdict:
+// two 60-frame windows in a row where unshifted matches clearly beat the declared shift turn
+// jitter off (not applied, not declared) until a re-test about a minute later.
+void witness_read(uint32_t si)
+{
+    if (!g_small.wread_valid[si]) return;
+    g_small.wread_valid[si] = false;
+    uint32_t v[4] = {};
+    void* ptr = nullptr;
+    const D3D12_RANGE r{0, 16};
+    if (FAILED(g_small.wread[si]->Map(0, &r, &ptr)) || !ptr) return;
+    std::memcpy(v, ptr, sizeof v);
+    const D3D12_RANGE none{0, 0};
+    g_small.wread[si]->Unmap(0, &none);
+    g_small.w_tested += v[0]; g_small.w_unshifted += v[1]; g_small.w_shifted += v[2];
+    if (++g_small.w_frames < 60) return;
+    g.stats.witness_tested = g_small.w_tested; g.stats.witness_unshifted = g_small.w_unshifted; g.stats.witness_shifted = g_small.w_shifted;
+    ++g.stats.witness_windows;
+    if (g_small.w_tested >= 20000) {
+        if (g_small.w_unshifted > 3 * g_small.w_shifted) ++g_small.w_unseen_windows;
+        else if (g_small.w_shifted > g_small.w_unshifted) g_small.w_unseen_windows = 0;
+        if (g_small.w_unseen_windows >= 2 && !g.jitter_unseen) {
+            g.jitter_unseen = true;
+            g.jitter_retest = g.frame + 3600;
+            g.resume_reset = true;
+            ++g.stats.jitter_unseen_count;
+            g_small.w_unseen_windows = 0;
+        }
+    }
+    g_small.w_frames = g_small.w_tested = g_small.w_unshifted = g_small.w_shifted = 0;
+}
 bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t rw, uint32_t rh,
                     ID3D12Resource* out, uint32_t ow, uint32_t oh, bool hdr, void*)
 {
@@ -3135,6 +3240,14 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
     if (FAILED(g_small.alloc[si]->Reset()) || FAILED(l->Reset(g_small.alloc[si].Get(), nullptr))) {
         ++g.stats.small_failed; small_note("Render-small: could not reset its list."); return false;
     }
+    witness_read(si);
+    if (g.jitter_unseen && g.frame >= g.jitter_retest) { // re-test: jitter on again, a fresh verdict
+        g.jitter_unseen = false;
+        g.resume_reset = true;
+        g_small.wprev_valid = false;
+        ++g.stats.jitter_retests;
+    }
+    g.stats.jitter_unseen = g.jitter_unseen;
     constexpr UINT PRESENT = D3D12_RESOURCE_STATE_PRESENT, NPSR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                    UAV = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     std::vector<D3D12_RESOURCE_BARRIER> b;
@@ -3157,9 +3270,44 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
     if (layer_frame && !hud_layer) small_note("Render-small: the native HUD could not be laid on (no composite pass); HUD missing this frame.");
     bool hud_mask = false; // mask holds this frame's HUD (NON_PIXEL_SHADER_RESOURCE until the composite)
     const DXGI_FORMAT ff = typed(frame->GetDesc().Format);
+    // Jitter witness inputs: this frame against the previous DLSS frame, when consecutive and the
+    // declared jitter moved by at least a fifth of a pixel (else no verdict is possible).
+    const float wdx = d.jx - g_small.wjx, wdy = d.jy - g_small.wjy;
+    const bool witness = can_dlss && g.jitter_on && !g.jitter_unseen && g_small.wprev_valid && g_small.wprev_frame + 1 == d.frame &&
+                         g_small.wprev_w == rw && g_small.wprev_h == rh && g_small.wprev_f == frame->GetDesc().Format &&
+                         (wdx * wdx + wdy * wdy) >= 0.04f && hud_init();
     if (can_dlss) {
         add(b, g.motion.Get(), UAV, NPSR);
         flush(l, b);
+        if (witness) {
+            const DXGI_FORMAT wf = typed(frame->GetDesc().Format);
+            uint32_t k[8] = {rw, rh, 0, 0, 0, 0, 0, 0};
+            std::memcpy(&k[6], &wdx, 4); std::memcpy(&k[7], &wdy, 4);
+            {
+                ID3D12Resource* const srv[3] = {nullptr, nullptr, nullptr};
+                const DXGI_FORMAT sf[3] = {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
+                ID3D12Resource* const uav[3] = {nullptr, nullptr, nullptr};
+                const DXGI_FORMAT uf[3] = {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
+                hud_pass(l, 6, si, srv, sf, uav, uf, k, 1, 1);
+            }
+            b.push_back(uav_barrier(g_small.hud_stats.Get()));
+            flush(l, b);
+            {
+                ID3D12Resource* const srv[3] = {frame, g_small.wprev.Get(), g.motion.Get()};
+                const DXGI_FORMAT sf[3] = {wf, wf, DXGI_FORMAT_R32G32_FLOAT};
+                ID3D12Resource* const uav[3] = {nullptr, nullptr, nullptr};
+                const DXGI_FORMAT uf[3] = {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
+                hud_pass(l, 5, si, srv, sf, uav, uf, k, (rw + 7) / 8, (rh + 7) / 8);
+            }
+            b.push_back(uav_barrier(g_small.hud_stats.Get()));
+            add(b, g_small.hud_stats.Get(), UAV, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            flush(l, b);
+            l->CopyBufferRegion(g_small.wread[si].Get(), 0, g_small.hud_stats.Get(), 32, 16);
+            add(b, g_small.hud_stats.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, UAV);
+            flush(l, b);
+            g_small.wread_valid[si] = true;
+            ++g.stats.witness_frames;
+        }
         if (hud_want && g_small.prev_valid) {
             g_small.hud_parity ^= 1u;
             const bool forget = g_small.hud_fresh || d.reset;
@@ -3213,6 +3361,7 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         e.view_id = kSmallViewId;
         e.jitter_x = d.jx;
         e.jitter_y = d.jy;
+        g_small.last_jx = d.jx; g_small.last_jy = d.jy;
         // History continues only from the previous frame's evaluation at the same sizes.
         e.reset = d.reset || g.small_last == 0 || d.frame != g.small_last + 1 ||
                   g.small_ow != ow || g.small_oh != oh || g.small_rw != rw || g.small_rh != rh;
@@ -3313,6 +3462,19 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
             ++g.stats.small_hud_layer;
         }
     }
+    // The jitter witness compares the next frame with this one.
+    if (dlss && g.jitter_on && !g.jitter_unseen && witness_targets(frame, rw, rh)) {
+        constexpr UINT SRC = D3D12_RESOURCE_STATE_COPY_SOURCE, DST = D3D12_RESOURCE_STATE_COPY_DEST;
+        add(b, frame, NPSR, SRC);
+        add(b, g_small.wprev.Get(), NPSR, DST);
+        flush(l, b);
+        l->CopyResource(g_small.wprev.Get(), frame);
+        add(b, frame, SRC, NPSR);
+        add(b, g_small.wprev.Get(), DST, NPSR);
+        g_small.wprev_valid = true;
+        g_small.wprev_frame = g.small_last;
+        g_small.wjx = g_small.last_jx; g_small.wjy = g_small.last_jy;
+    } else g_small.wprev_valid = false;
     // The HUD passes compare with this frame next time.
     if (hud_want) {
         constexpr UINT SRC = D3D12_RESOURCE_STATE_COPY_SOURCE, DST = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -3428,7 +3590,7 @@ bool RecordRcasForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, I
 }
 bool CompileHudShadersForTests(char* why, size_t why_size)
 {
-    for (const char* entry : {"classify", "dilate", "composite", "clear", "layer"}) {
+    for (const char* entry : {"classify", "dilate", "composite", "clear", "layer", "witness", "wclear"}) {
         ComPtr<ID3DBlob> code, err;
         if (FAILED(D3DCompile(kHudHlsl, sizeof(kHudHlsl) - 1, "j2_small_hud.hlsl", nullptr, nullptr, entry, "cs_5_0",
                               D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err))) {
