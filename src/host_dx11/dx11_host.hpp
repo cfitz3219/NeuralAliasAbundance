@@ -45,6 +45,7 @@ struct HostStats {
     uint64_t presents = 0, fired = 0, delivered = 0, repeated = 0, not_ready = 0, failed = 0;
     uint64_t no_camera = 0, refused = 0, jitter_writes = 0, samplers_biased = 0;
     uint64_t lists_recorded = 0, lists_executed = 0;
+    uint32_t last_draws = 0, last_scene_draws = 0; // the last frame, as the model counted them
     uint32_t color_w = 0, color_h = 0, color_format = 0, depth_format = 0;
     uint64_t camera_offset = 0;
     bool depth_reversed = false;

@@ -338,6 +338,7 @@ int main(int argc, char** argv)
     expect(s.camera && s.camera_offset == 64, "the camera ViewProjection is found at byte 64 (with its inverse)");
     expect(!s.depth_reversed, "standard depth is recognised");
     expect(s.delivered >= 20, "DLSS (copy test) ran before the tonemap read, 20 frames");
+    expect(s.last_draws == 67 && s.last_scene_draws == 40, "immediate: every draw is counted exactly once");
     expect(s.helper_motion_frames >= 10, "the helper built camera motion with the shared motion arbiter");
     expect(s.jitter_writes >= 10, "jitter was written into the game's own camera upload");
 
@@ -395,6 +396,9 @@ int main(int argc, char** argv)
                 static_cast<unsigned long long>(s.delivered - fired1), static_cast<unsigned long long>(s.lists_executed),
                 static_cast<unsigned long long>(s.lists_recorded), s.reason);
     expect(s.lists_executed >= 40, "command lists from deferred contexts were replayed into the frame model");
+    // 20 shadow + 40 scene + 1 tonemap + 6 HUD, once each (not again from d3d11's own list replay).
+    std::printf("phase 2 last frame: draws=%u scene=%u\n", s.last_draws, s.last_scene_draws);
+    expect(s.last_draws == 67 && s.last_scene_draws == 40, "deferred: every draw is counted exactly once");
     expect(s.delivered - fired1 >= 15, "deferred: DLSS ran before the post-processing command list");
 
     // ---- resize: bridge stops, ResizeBuffers succeeds (no held back buffer), restarts ----

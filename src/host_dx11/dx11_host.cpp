@@ -877,7 +877,13 @@ void STDMETHODCALLTYPE ExecuteCommandList_d(ID3D11DeviceContext* c, ID3D11Comman
             }
         }
     }
+    // Drivers without native command lists (and WARP) have d3d11 replay the list
+    // through the immediate context's own (hooked) functions: those calls are
+    // already in the model from the recording, so they are not observed again.
+    const bool was_inside = t_inside;
+    t_inside = true;
     O(c, x).execute(c, list, restore);
+    t_inside = was_inside;
     if (x && !restore) x->reset_state();
 }
 
@@ -957,6 +963,8 @@ void OnPresent(IDXGISwapChain* swap)
     g_stats.color_h = s.color_info.height;
     g_stats.color_format = s.color_info.format;
     g_stats.depth_format = s.depth_info.format;
+    g_stats.last_draws = g_model.GetStats().last_draws;
+    g_stats.last_scene_draws = g_model.GetStats().last_scene_draws;
     // Next frame's jitter sample.
     g_jitter_written = false;
     g_jitter_active = g_cfg.jitter && g_camera.found && g_bridge.Started();
