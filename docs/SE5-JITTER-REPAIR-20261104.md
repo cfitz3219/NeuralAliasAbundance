@@ -154,3 +154,5 @@ sub-pixel samples, provide the current render-pixel offset, and distinguish
 jitter-containing vectors with the appropriate feature flag. This project
 continues to supply jitter-FREE motion rather than relabel its broken fit as
 jittered motion: https://raw.githubusercontent.com/NVIDIA/DLSS/main/doc/DLSS_Programming_Guide_Release.pdf
+
+Final receipt: runtime6bc5731, complete Release build PASS;200CTest cases,195PASS5SKIP0FAIL253.02s. See WORKLOG and local/se5-jitter-repair-20261104/release-tests.log. No runtime changes after that run.
