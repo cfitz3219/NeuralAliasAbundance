@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <string>
 
+namespace na::observe { struct NativeOperation; }
 namespace na::j2::native_hud {
 
 // Boot (render-small): the draw hook, the clear hook, the bind listener and the observer's
@@ -84,5 +85,10 @@ bool SceneShaped(bool blend_known, uint32_t blend_mask, uint64_t count, uint64_t
 bool CoversTarget(const float* viewport6, const int32_t* scissor4, uint32_t w, uint32_t h); // the whole w x h target
 void ScaleViewport(const float in[6], float sx, float sy, float out[6]);
 void ScaleScissor(const int32_t in[4], float sx, float sy, uint32_t ow, uint32_t oh, int32_t out[4]);
+// Finds the one picture-sized SRV the actual shaders can read. Unused table
+// entries do not establish lineage. This identifies a dependency, not proof
+// that a draw preserves its colour, spatial mapping or HUD composition.
+bool PictureSource(const na::observe::NativeOperation&, uint64_t destination,
+                   uint32_t width, uint32_t height, uint64_t& source);
 
 } // namespace na::j2::native_hud

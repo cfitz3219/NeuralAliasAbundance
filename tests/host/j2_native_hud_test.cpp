@@ -12,6 +12,7 @@
 #include "host_dx12/j2/native_hud.hpp"
 #include "core/jitter_domain.hpp"
 #include "host_dx12/observe/producers.hpp"
+#include "host_dx12/observe/operation_snapshot.hpp"
 
 #include <d3dcompiler.h>
 
@@ -286,6 +287,66 @@ constexpr float kScene[4] = {0.2f, 0.4f, 0.6f, 1.f};
 const Hud kHud[3] = {{Blend::Over, {1.f, 0.2f, 0.1f, 0.6f}, {8, 4, 40, 20}},
                      {Blend::Add, {0.1f, 0.1f, 0.3f, 1.f}, {24, 12, 56, 28}},
                      {Blend::Opaque, {0.9f, 0.9f, 0.9f, 1.f}, {0, 26, 10, 32}}};
+
+int source_lineage(test::Device& d)
+{
+    // The actual handoff shader reads t17. A plausible, stale picture at t0
+    // must not become its source merely because it occurs in a table prefix.
+    auto* dev=d.device.Get();
+    constexpr UINT W=64,H=32;
+    constexpr auto F=DXGI_FORMAT_R8G8B8A8_UNORM;
+    auto actual=test::CreateTexture(dev,W,H,F,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_FLAG_NONE);
+    auto stale=test::CreateTexture(dev,W,H,F,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_FLAG_NONE);
+    auto target=test::CreateTexture(dev,W,H,F,D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    REQUIRE(actual && stale && target);
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,32,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
+    ComPtr<ID3D12DescriptorHeap> heap,rtv;
+    REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&heap))));
+    hd={D3D12_DESCRIPTOR_HEAP_TYPE_RTV,1,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
+    REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&rtv))));
+    dev->CreateRenderTargetView(target.Get(),nullptr,rtv->GetCPUDescriptorHandleForHeapStart());
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};sv.Format=F;sv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;sv.Texture2D.MipLevels=1;
+    const UINT inc=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto h=heap->GetCPUDescriptorHandleForHeapStart();
+    for(UINT i=0;i<32;++i){dev->CreateShaderResourceView(i==17?actual.Get():stale.Get(),&sv,h);h.ptr+=inc;}
+    D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV,32,0,0,0};
+    D3D12_ROOT_PARAMETER param{};param.ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;param.DescriptorTable={1,&range};
+    D3D12_ROOT_SIGNATURE_DESC rd{1,&param,0,nullptr,D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ComPtr<ID3DBlob> sig,err,vs,ps;ComPtr<ID3D12RootSignature> root;
+    REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rd,D3D_ROOT_SIGNATURE_VERSION_1,&sig,&err)));
+    REQUIRE(SUCCEEDED(dev->CreateRootSignature(0,sig->GetBufferPointer(),sig->GetBufferSize(),IID_PPV_ARGS(&root))));
+    constexpr char code[]=R"(
+Texture2D<float4> image:register(t17);
+float4 vs(uint id:SV_VertexID):SV_Position{float2 uv=float2((id<<1)&2,id&2);return float4(uv*float2(2,-2)+float2(-1,1),.5,1);}
+float4 ps(float4 p:SV_Position):SV_Target{return image.Load(int3(p.xy,0));}
+)";
+    REQUIRE(SUCCEEDED(D3DCompile(code,sizeof(code)-1,nullptr,nullptr,nullptr,"vs","vs_5_0",0,0,&vs,&err)));
+    REQUIRE(SUCCEEDED(D3DCompile(code,sizeof(code)-1,nullptr,nullptr,nullptr,"ps","ps_5_0",0,0,&ps,&err)));
+    auto pso=pipeline(dev,root.Get(),vs.Get(),ps.Get(),Blend::Opaque,DXGI_FORMAT_UNKNOWN);REQUIRE(pso);
+    test::List l;REQUIRE(l.Create(dev));REQUIRE(SUCCEEDED(l.list->Close()));
+    REQUIRE(SUCCEEDED(l.list->Reset(l.alloc.Get(),nullptr)));
+    l.list->SetGraphicsRootSignature(root.Get());l.list->SetPipelineState(pso.Get());
+    ID3D12DescriptorHeap* heaps[]={heap.Get()};l.list->SetDescriptorHeaps(1,heaps);
+    l.list->SetGraphicsRootDescriptorTable(0,heap->GetGPUDescriptorHandleForHeapStart());
+    const auto rt=rtv->GetCPUDescriptorHandleForHeapStart();l.list->OMSetRenderTargets(1,&rt,FALSE,nullptr);
+    const D3D12_VIEWPORT vp{0,0,float(W),float(H),0,1};const D3D12_RECT sc{0,0,LONG(W),LONG(H)};
+    l.list->RSSetViewports(1,&vp);l.list->RSSetScissorRects(1,&sc);l.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    na::observe::NativeOperation op;REQUIRE(na::observe::ListNativeOperation(l.list.Get(),false,op));
+    CHECK(op.reflection_complete && op.descriptors.size()==32);
+    CHECK(!op.descriptors[0].used && op.descriptors[17].used);
+    uint64_t source=999;const auto destination=na::observe::IdOf(target.Get());
+    CHECK(nh::PictureSource(op,destination,W,H,source));CHECK(source==na::observe::IdOf(actual.Get()));
+    op.reflection_complete=false;CHECK(!nh::PictureSource(op,destination,W,H,source) && source==0);op.reflection_complete=true;
+    op.descriptors[0].used=true;op.descriptors[0].resource=stale;
+    CHECK(!nh::PictureSource(op,destination,W,H,source) && source==0); // actually two sources = ambiguous
+    op.descriptors[0].used=false;op.descriptors[17].view.srv.Texture2D.MostDetailedMip=1;
+    CHECK(nh::PictureSource(op,destination,W,H,source) && source==0); // not a whole-base image
+    l.list->DrawInstanced(3,1,0,0);REQUIRE(SUCCEEDED(l.list->Close()));
+    ID3D12CommandList* lists[]={l.list.Get()};d.queue->ExecuteCommandLists(1,lists);d.WaitIdle();
+    CHECK(dev->GetDeviceRemovedReason()==S_OK);
+    return 0;
+}
 
 int end_to_end(test::Device& d)
 {
@@ -648,6 +709,7 @@ int end_to_end(test::Device& d)
         REQUIRE(readback(d, proxy2.Get(), RTS, 4, px));
         CHECK(std::abs(at(px, RW, 24, 12, 0) - 51) <= 1);   // the back buffer got the scene only
     }
+    if(source_lineage(d))return 1;
     na_observe_stop();
     return 0;
 }

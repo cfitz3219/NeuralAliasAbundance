@@ -4,6 +4,7 @@
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/observe/shader_operation.hpp"
 #include "host_dx12/observe/texture_operation.hpp"
+#include "host_dx12/observe/operation_snapshot.hpp"
 
 #include <windows.h>
 #include <wrl/client.h>
@@ -294,18 +295,17 @@ bool dims(na_object_id id, uint32_t* w, uint32_t* h, DXGI_FORMAT* f)
 }
 // H1b: an opaque full-screen draw into a back buffer before its HUD: note the one picture-sized
 // texture it reads (more than one = a composite of several inputs, not a hand-off: no source).
-void note_source_locked(Proxy& p, const na_object_id* srvs, uint32_t n, bool incomplete)
+void note_source_locked(Proxy& p, ID3D12GraphicsCommandList* list)
 {
     if (p.upstream) return;
-    if (incomplete) { p.source = 0; p.source_ambiguous = true; return; } // never a unique source from a partial list
-    na_object_id one = 0;
-    uint32_t matches = 0;
-    for (uint32_t i = 0; i < n; ++i) {
-        uint32_t w = 0, h = 0; DXGI_FORMAT f{};
-        if (srvs[i] != p.id && dims(srvs[i], &w, &h, &f) && w == p.rw && h == p.rh) { one = srvs[i]; ++matches; }
+    na::observe::NativeOperation op;
+    uint64_t one = 0;
+    if (!na::observe::ListNativeOperation(list, false, op) ||
+        !PictureSource(op, p.id, p.rw, p.rh, one)) {
+        p.source = 0; p.source_ambiguous = true; return;
     }
-    if (matches == 1 && !p.source_ambiguous) p.source = p.source && p.source != one ? (p.source_ambiguous = true, 0) : one;
-    else if (matches > 1) { p.source = 0; p.source_ambiguous = true; }
+    if (one && !p.source_ambiguous)
+        p.source = p.source && p.source != one ? (p.source_ambiguous = true, 0) : one;
 }
 void note_forward_locked(Proxy& p, const char* why)
 {
@@ -475,10 +475,7 @@ na::observe::ShaderScope redirect(ID3D12GraphicsCommandList* l, na::observe::Sha
             ++p->scene;
             ++g_stats.scene_draws;
             if (!p->upstream) {
-                na_object_id srv[16];
-                bool incomplete = false;
-                const uint32_t n = na::observe::ListCurrentGraphicsSrvs(l, srv, 16, &incomplete);
-                note_source_locked(*p, srv, n, incomplete);
+                note_source_locked(*p, l);
                 p->source_copy = false;
             }
             return {};
@@ -713,6 +710,7 @@ void Install()
 {
     if (g_installed.exchange(true)) return;
     na::observe::SetRasterStateTracking(true); // the game's targets/viewports/scissors can be handed back
+    na::observe::SetOperationSnapshots(true); // exact used SRVs at candidate handoffs, not a table prefix
     na::observe::SetRasterStateListener(&on_bind);
     na::observe::SetShaderOperationHook(na::observe::ShaderLane::Reconstruction, std::make_shared<DrawHook>());
     na::observe::SetTextureOperationHook(std::make_shared<ClearHook>());
@@ -721,6 +719,30 @@ bool Installed() { return g_installed.load(); }
 void SetEnabled(bool on) { g_on.store(on); }
 void SetCoverRule(bool on) { g_cover.store(on); }
 bool Enabled() { return g_installed.load() && g_on.load(); }
+
+bool PictureSource(const na::observe::NativeOperation& op, uint64_t destination,
+                   uint32_t width, uint32_t height, uint64_t& source)
+{
+    source = 0;
+    if (op.compute || !op.reflection_complete || !width || !height) return false;
+    for (const auto& d : op.descriptors) {
+        if (!d.used || d.view.kind != NA_DESC_SRV || !d.view.resource || d.view.resource == destination) continue;
+        if (!d.resource) return false;
+        const auto desc = d.resource->GetDesc();
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 || desc.DepthOrArraySize != 1) continue;
+        // Only a whole base-level 2D image gives this initial lineage edge.
+        // Array/mip/subrect mappings need their actual view geometry, not a
+        // resource-size guess. Leave the game's complete picture untouched.
+        if (d.view.explicit_view && (d.view.srv.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D ||
+            d.view.srv.Texture2D.MostDetailedMip != 0 || d.view.srv.Texture2D.PlaneSlice != 0 ||
+            d.view.srv.Texture2D.ResourceMinLODClamp != 0.f ||
+            d.view.srv.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING)) continue;
+        if (desc.Width != width || desc.Height != height) continue;
+        if (source && source != d.view.resource) { source = 0; return false; }
+        source = d.view.resource;
+    }
+    return true;
+}
 
 bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, Layer* out)
 {
