@@ -2,6 +2,8 @@
 // tests/cpu/camera_fit_basis_test.cpp.
 #pragma once
 
+#include <cmath>
+
 namespace na::motion::gpu {
 
 // M3 rigid camera correction (2026-11-04, camera_fit_gpu.hpp): the composed current->previous
@@ -47,6 +49,22 @@ inline FitBasis MakeFitBasis(const double composed_row[16], const double inv_cur
                 b.G[k][r * 4 + c] = static_cast<float>(v);
             }
     return b;
+}
+
+// True when a row-vector view-projection matrix carries no camera orientation: no entry that
+// mixes x, y and z (roll: [0][1]/[1][0]; yaw: [0][2]; pitch: [1][2]) and nothing feeding w from
+// x or y. A projection alone (SE5 0ce11a8: every captured set, off-diagonals <= 8.4e-11) has
+// them all at zero; any real view rotation puts sine terms there. Jitter/off-centre terms
+// ([2][0], [2][1]) and translation are allowed. Then the camera term of the motion is zero
+// whatever the player does, and camera motion has to be reconstructed from the image (M3).
+inline bool CarriesNoView(const double vp_row[16])
+{
+    const double scale = std::fabs(vp_row[0]) > std::fabs(vp_row[5]) ? std::fabs(vp_row[0]) : std::fabs(vp_row[5]);
+    if (!(scale > 1e-9)) return false;
+    const int mixed[6] = {1, 2, 3, 4, 6, 7};
+    for (int i : mixed)
+        if (!(std::fabs(vp_row[i]) <= 1e-6 * scale)) return false;
+    return true;
 }
 
 } // namespace na::motion::gpu
