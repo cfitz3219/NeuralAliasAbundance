@@ -50,6 +50,8 @@ struct Identity {
     // overlay's Present copy must not be attached to it (the old pairing put frame N+1's
     // presented picture into frame N's slot).
     bool owns_present = false;
+    bool presentation_only=false; // HUD presentation capture; no substituted depth/motion from another frame
+    bool evaluation_succeeded=true;
     uint64_t inputs_frame = 0;      // J2 frame the depth/motion/camera belong to
     bool camera_valid = false;      // the matrices below were the ones passed to the motion shader
     double vp_cur[16]{}, vp_prev[16]{}, inv_vp_cur[16]{}; // unjittered, row-major storage, row-vector algebra

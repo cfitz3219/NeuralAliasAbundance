@@ -35,5 +35,10 @@ public:
     // out is UAV and returned UAV. Identity transfer + complete replay =>
     // native HUD composition; partial replay => current-picture protection.
     bool Composite(ID3D12GraphicsCommandList*,ID3D12Resource* out);
+    bool SeedNativeAlpha(ID3D12GraphicsCommandList*,ID3D12Resource* out);
+    // Both the final handoff AND original-size replay must match. Native and
+    // check are NPSR; out is UAV. Otherwise show the untouched final picture.
+    bool PresentNative(ID3D12GraphicsCommandList*,ID3D12Resource* frame,DXGI_FORMAT view,
+                       ID3D12Resource* native,ID3D12Resource* check,ID3D12Resource* out,bool tint=false);
 };
 }

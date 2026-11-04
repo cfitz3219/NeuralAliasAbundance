@@ -145,6 +145,12 @@ struct ListState {
     bool raster_viewports_known = false, raster_scissors_known = false, raster_topology_known = false;
     bool raster_targets_known = false, raster_has_depth = false;
     bool raster_tracking = false; // latched at Reset; an Off request cannot undo restoration mid-recording
+    D3D12_VERTEX_BUFFER_VIEW vertex_buffers[32]{};
+    uint32_t vertex_mask=0;
+    D3D12_INDEX_BUFFER_VIEW index_buffer{};
+    bool index_known=false;
+    float blend_factor[4]{};UINT stencil_ref=0;
+    ID3D12Resource* predicate=nullptr;UINT64 predicate_offset=0;D3D12_PREDICATION_OP predicate_op=D3D12_PREDICATION_OP_EQUAL_ZERO;
     uint32_t active_queries=0;
     std::vector<std::shared_ptr<const DescriptorDetails>> native_colors;
     uint64_t target_serial=0,viewport_serial=0,scissor_serial=0;
@@ -166,6 +172,7 @@ struct Obj {
     bool reflection_complete=false;
     bool native_hud_affine=false;
     bool shader_readonly=false;
+    bool pixel_position=false;
     // Live mip bias: per-level twins of a root signature / pipeline state (index = level).
     // same[i]: the game's own object is already correct for level i (nothing to swap).
     // Immutable once published; owns a reference on every twin. A twin is never one of
@@ -1628,6 +1635,8 @@ uint64_t fnv1a(const void* data, size_t n)
 thread_local std::vector<ShaderDimension> g_next_dimensions;
 thread_local std::vector<ShaderResource> g_next_shader_resources;
 thread_local bool g_next_reflection_complete=true;
+thread_local bool g_next_shader_readonly=true;
+thread_local bool g_next_pixel_position=false;
 void bytecode(na_ev_pipeline_created& e, uint32_t stage, const D3D12_SHADER_BYTECODE& b)
 {
     if (!b.pShaderBytecode || !b.BytecodeLength) return;
@@ -1635,7 +1644,12 @@ void bytecode(na_ev_pipeline_created& e, uint32_t stage, const D3D12_SHADER_BYTE
     e.stage_bytes[stage] = static_cast<uint32_t>(b.BytecodeLength);
     if(g_operation_snapshots.load()&&!t_host_work){
         const uint32_t visibility[]={D3D12_SHADER_VISIBILITY_VERTEX,D3D12_SHADER_VISIBILITY_PIXEL,D3D12_SHADER_VISIBILITY_DOMAIN,D3D12_SHADER_VISIBILITY_HULL,D3D12_SHADER_VISIBILITY_GEOMETRY};
-        g_next_reflection_complete &= ReflectDimensions(b,g_next_dimensions,stage<5?visibility[stage]:D3D12_SHADER_VISIBILITY_ALL,&g_next_shader_resources);
+        bool pixel_position=false;
+        const bool reflected=ReflectDimensions(b,g_next_dimensions,stage<5?visibility[stage]:D3D12_SHADER_VISIBILITY_ALL,&g_next_shader_resources,
+            stage==NA_STAGE_PS?&pixel_position:nullptr);
+        g_next_reflection_complete &= reflected;
+        if(!reflected)g_next_shader_readonly &= ExecutableReadOnly(b,stage==NA_STAGE_PS?&pixel_position:nullptr);
+        if(stage==NA_STAGE_PS)g_next_pixel_position=pixel_position;
     }
 }
 
@@ -1693,10 +1707,11 @@ void emit_pipeline(ID3D12Device* dev, IUnknown* obj, na_ev_pipeline_created& e, 
         const auto found=g_objs.find(canon(obj));if(found!=g_objs.end()){
             found->second.dimensions=g_next_dimensions;found->second.shader_resources=g_next_shader_resources;
             found->second.reflection_complete=g_next_reflection_complete;}
-        if(found!=g_objs.end())found->second.shader_readonly=g_next_reflection_complete&&!g_next_stream_output&&
+        if(found!=g_objs.end())found->second.shader_readonly=g_next_shader_readonly&&!g_next_stream_output&&
             std::none_of(g_next_shader_resources.begin(),g_next_shader_resources.end(),[](const auto& r){return r.type==D3D12_DESCRIPTOR_RANGE_TYPE_UAV;});
     }
-    {std::unique_lock<std::shared_mutex> lock(g_m);const auto found=g_objs.find(canon(obj));if(found!=g_objs.end())found->second.native_hud_affine=g_next_hud_affine;}
+    {std::unique_lock<std::shared_mutex> lock(g_m);const auto found=g_objs.find(canon(obj));if(found!=g_objs.end()){
+        found->second.native_hud_affine=g_next_hud_affine;found->second.pixel_position=g_next_pixel_position;}}
     emit(e, NA_GROUP_PIPELINE);
 }
 
@@ -1954,7 +1969,7 @@ HRESULT STDMETHODCALLTYPE D_CreateGraphicsPipelineState(ID3D12Device* dev, const
     const HRESULT hr = o_CreateGraphicsPipelineState(dev, d, riid, out);
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj || !d) return hr;
-    g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;
+    g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;g_next_shader_readonly=true;g_next_pixel_position=false;
     na_ev_pipeline_created e;
     init_header(e, NA_EV_PIPELINE_CREATED, NA_EVF_FOUNDATIONAL);
     e.pipeline_kind = NA_PIPELINE_GRAPHICS;
@@ -1988,7 +2003,7 @@ HRESULT STDMETHODCALLTYPE D_CreateComputePipelineState(ID3D12Device* dev, const 
     const HRESULT hr = o_CreateComputePipelineState(dev, d, riid, out);
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj || !d) return hr;
-    g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;
+    g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;g_next_shader_readonly=true;g_next_pixel_position=false;
     na_ev_pipeline_created e;
     init_header(e, NA_EV_PIPELINE_CREATED, NA_EVF_FOUNDATIONAL);
     e.pipeline_kind = NA_PIPELINE_COMPUTE;
@@ -2062,7 +2077,7 @@ HRESULT STDMETHODCALLTYPE D_CreatePipelineState(ID3D12Device2* dev, const D3D12_
     const HRESULT hr = o_CreatePipelineState(dev, d, riid, out);
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj || !d || !d->pPipelineStateSubobjectStream) return hr;
-    g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;
+    g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;g_next_shader_readonly=true;g_next_pixel_position=false;
     na_ev_pipeline_created e;
     init_header(e, NA_EV_PIPELINE_CREATED, NA_EVF_FOUNDATIONAL);
     e.pipeline_kind = NA_PIPELINE_STREAM;
@@ -2399,6 +2414,8 @@ struct On<sl::list::Reset> {
                     ls->active_queries=0;
                     ls->in_render_pass = false;
                     ls->raster_viewports_known = ls->raster_scissors_known = ls->raster_topology_known = false;
+                    ls->vertex_mask=0;ls->index_known=false;ls->index_buffer={};ls->stencil_ref=0;
+                    std::fill_n(ls->blend_factor,4,0.f);ls->predicate=nullptr;ls->predicate_offset=0;
                     ls->raster_targets_known = false;
                     ls->raster_tracking = g_raster_tracking.load(std::memory_order_acquire);
                 }
@@ -2638,6 +2655,46 @@ struct On<sl::list::IASetPrimitiveTopology> {
             ls.raster_topology = topology; ls.raster_topology_known = true;
         });
     }
+};
+template <>
+struct On<sl::list::ClearState> {
+    static void run(GL* l,ID3D12PipelineState* pso){with_list_state(l,[&](ListState& s){std::lock_guard<std::mutex> lock(s.bind_m);
+        s.pso=pso;s.root_sig[0]=s.root_sig[1]=nullptr;s.args[0].clear();s.args[1].clear();s.nheaps=0;
+        s.cur_rt=s.cur_ds=0;s.cur_nrt=0;s.native_colors.clear();s.native_depth.reset();
+        s.raster_rt_count=s.raster_viewport_count=s.raster_scissor_count=0;s.raster_has_depth=false;
+        s.raster_targets_known=s.raster_viewports_known=s.raster_scissors_known=s.raster_topology_known=true;
+        s.raster_topology=D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;s.restorable=true;
+        s.vertex_mask=0;s.index_known=false;s.index_buffer={};s.stencil_ref=0;std::fill_n(s.blend_factor,4,0.f);
+        s.predicate=nullptr;s.predicate_offset=0;++s.key_revision[0];++s.key_revision[1];
+    });}
+};
+template <>
+struct On<sl::list::SetPredication> {
+    static void run(GL* l,ID3D12Resource* buffer,UINT64 offset,D3D12_PREDICATION_OP op){with_list_state(l,[&](ListState& s){std::lock_guard<std::mutex> lock(s.bind_m);
+        s.predicate=buffer;s.predicate_offset=offset;s.predicate_op=op;});}
+};
+template <>
+struct On<sl::list::IASetVertexBuffers> {
+    static void run(GL* l,UINT first,UINT count,const D3D12_VERTEX_BUFFER_VIEW* views){
+        if(first>32||count>32-first)return;
+        with_list_state(l,[&](ListState& s){std::lock_guard<std::mutex> lock(s.bind_m);
+            if(!s.raster_tracking)return;
+            for(UINT i=0;i<count;++i){s.vertex_buffers[first+i]=views?views[i]:D3D12_VERTEX_BUFFER_VIEW{};s.vertex_mask|=1u<<(first+i);}});
+    }
+};
+template <>
+struct On<sl::list::IASetIndexBuffer> {
+    static void run(GL* l,const D3D12_INDEX_BUFFER_VIEW* view){with_list_state(l,[&](ListState& s){std::lock_guard<std::mutex> lock(s.bind_m);
+        if(s.raster_tracking){s.index_buffer=view?*view:D3D12_INDEX_BUFFER_VIEW{};s.index_known=true;}});}
+};
+template <>
+struct On<sl::list::OMSetBlendFactor> {
+    static void run(GL* l,const FLOAT factor[4]){with_list_state(l,[&](ListState& s){std::lock_guard<std::mutex> lock(s.bind_m);
+        if(s.raster_tracking)for(UINT i=0;i<4;++i)s.blend_factor[i]=factor?factor[i]:1.f;});}
+};
+template <>
+struct On<sl::list::OMSetStencilRef> {
+    static void run(GL* l,UINT value){with_list_state(l,[&](ListState& s){std::lock_guard<std::mutex> lock(s.bind_m);if(s.raster_tracking)s.stencil_ref=value;});}
 };
 template <>
 struct On<sl::list::SetPipelineState> {
@@ -3738,6 +3795,12 @@ bool register_list_slots()
         ListHook<L::CopyResource, void(ID3D12Resource*, ID3D12Resource*)>::spec(),
         ListHook<L::ResolveSubresource, void(ID3D12Resource*, UINT, ID3D12Resource*, UINT, DXGI_FORMAT)>::spec(),
         ListHook<L::IASetPrimitiveTopology, void(D3D12_PRIMITIVE_TOPOLOGY)>::spec(),
+        ListHook<L::ClearState,void(ID3D12PipelineState*)>::spec(),
+        ListHook<L::SetPredication,void(ID3D12Resource*,UINT64,D3D12_PREDICATION_OP)>::spec(),
+        ListHook<L::IASetVertexBuffers,void(UINT,UINT,const D3D12_VERTEX_BUFFER_VIEW*)>::spec(),
+        ListHook<L::IASetIndexBuffer,void(const D3D12_INDEX_BUFFER_VIEW*)>::spec(),
+        ListHook<L::OMSetBlendFactor,void(const FLOAT*)>::spec(),
+        ListHook<L::OMSetStencilRef,void(UINT)>::spec(),
         ListHook<L::RSSetViewports, void(UINT, const D3D12_VIEWPORT*)>::spec(),
         ListHook<L::RSSetScissorRects, void(UINT, const D3D12_RECT*)>::spec(),
         ListHook<L::SetPipelineState, void(ID3D12PipelineState*)>::spec(),
@@ -5333,6 +5396,7 @@ bool ListDrawState(ID3D12CommandList* list, DrawInfo& out)
             r.samples = p->sample_count; r.blend_mask = p->blend_enable_mask;
             r.native_hud_affine=pipeline->second.native_hud_affine;
             r.shader_readonly=pipeline->second.shader_readonly;
+            r.pixel_position=pipeline->second.pixel_position;
             r.depth_enable = p->depth_enable; r.depth_func = p->depth_func;
         }
     }
@@ -5423,7 +5487,7 @@ bool ListRasterStateRestorable(ID3D12CommandList* list)
     return ls->raster_tracking && ls->restorable && !ls->in_render_pass && ls->raster_targets_known &&
         ls->raster_viewports_known && ls->raster_scissors_known && ls->raster_topology_known;
 }
-bool RestoreListState(ID3D12GraphicsCommandList* l)
+bool RestoreListState(ID3D12GraphicsCommandList* l,ID3D12GraphicsCommandList* destination,bool graphics_only)
 {
     // Snapshot under the locks, issue the calls without them (these calls run
     // under the caller's HostWorkScope, so they are not observed as the game's).
@@ -5439,6 +5503,9 @@ bool RestoreListState(ID3D12GraphicsCommandList* l)
     UINT viewport_count = 0, scissor_count = 0, rt_count = 0;
     D3D12_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
     bool vp_known = false, sc_known = false, topology_known = false, has_depth = false;
+    D3D12_VERTEX_BUFFER_VIEW vertices[32]{};UINT vertex_mask=0;D3D12_INDEX_BUFFER_VIEW index{};bool index_known=false;
+    FLOAT blend[4]={1,1,1,1};UINT stencil=0;
+    ID3D12Resource* predicate=nullptr;UINT64 predicate_offset=0;D3D12_PREDICATION_OP predicate_op=D3D12_PREDICATION_OP_EQUAL_ZERO;
     {
         std::shared_lock<std::shared_mutex> rl(g_m);
         na_object_id lid = 0;
@@ -5447,13 +5514,16 @@ bool RestoreListState(ID3D12GraphicsCommandList* l)
         std::lock_guard<std::mutex> bl(ls->bind_m);
         if (!ls->restorable || ls->in_render_pass) return false;
         pso = ls->pso;
+        vertex_mask=ls->vertex_mask;std::copy_n(ls->vertex_buffers,32,vertices);index=ls->index_buffer;index_known=ls->index_known;
+        std::copy_n(ls->blend_factor,4,blend);stencil=ls->stencil_ref;
+        predicate=ls->predicate;predicate_offset=ls->predicate_offset;predicate_op=ls->predicate_op;
         ++ls->host_restore_serial;
         nheaps = ls->nheaps;
         heaps[0] = ls->heaps[0];
         heaps[1] = ls->heaps[1];
         rs[0] = ls->root_sig[0];
         rs[1] = ls->root_sig[1];
-        for(UINT c=0;c<2;++c){if(ls->args[c].size()>64)return false;nargs[c]=UINT(ls->args[c].size());
+        for(UINT c=0;c<(graphics_only?1u:2u);++c){if(ls->args[c].size()>64)return false;nargs[c]=UINT(ls->args[c].size());
             for(UINT p=0;p<nargs[c];++p){const auto& from=ls->args[c][p];auto& to=args[c][p];
                 if(from.consts.size()>64)return false;to.type=from.type;to.value=from.value;to.count=UINT(from.consts.size());
                 if(to.count)std::copy_n(from.consts.data(),to.count,to.consts);}}
@@ -5470,8 +5540,9 @@ bool RestoreListState(ID3D12GraphicsCommandList* l)
             }
         }
     }
+    if(destination)l=destination;
     if (nheaps) l->SetDescriptorHeaps(nheaps, heaps);
-    for (uint32_t c = 0; c < 2; ++c) {
+    for (uint32_t c = 0; c < (graphics_only?1u:2u); ++c) {
         if (!rs[c]) continue;
         auto* sig = static_cast<ID3D12RootSignature*>(const_cast<void*>(rs[c]));
         if (c) l->SetComputeRootSignature(sig); else l->SetGraphicsRootSignature(sig);
@@ -5488,6 +5559,12 @@ bool RestoreListState(ID3D12GraphicsCommandList* l)
         }
     }
     if (pso) l->SetPipelineState(pso);
+    if(destination){
+        for(UINT i=0;i<32;++i)if(vertex_mask&(1u<<i))l->IASetVertexBuffers(i,1,&vertices[i]);
+        if(index_known)l->IASetIndexBuffer(index.BufferLocation?&index:nullptr);
+        l->OMSetBlendFactor(blend);l->OMSetStencilRef(stencil);
+        l->SetPredication(predicate,predicate_offset,predicate_op);
+    }
     if (raster_storage && raster_storage->obj[0] && raster_storage->obj[1]) {
         const auto rt = static_cast<ID3D12DescriptorHeap*>(raster_storage->obj[0])->GetCPUDescriptorHandleForHeapStart();
         const auto ds = static_cast<ID3D12DescriptorHeap*>(raster_storage->obj[1])->GetCPUDescriptorHandleForHeapStart();
