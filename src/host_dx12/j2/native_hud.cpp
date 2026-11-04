@@ -32,6 +32,7 @@ constexpr uint64_t kGraveFrames = 8; // presents before a replaced layer is rele
 
 std::atomic<bool> g_installed{false}, g_on{true}, g_cover{false};
 struct CapturedPicture;
+struct ProbeCapture;
 
 struct Proxy {
     na_object_id id = 0;
@@ -51,10 +52,11 @@ struct Proxy {
     // full-screen copy or draw. It is learned from structure and then handled exactly like the
     // back buffer: its HUD draws go to the native layers, so the copy carries the scene only.
     bool upstream = false;
-    bool preserve = false, clean = true;
+    bool preserve = false, clean = true, pixel_proved = false;
     std::shared_ptr<Picture> picture;
     std::vector<na::nr::native::RecordingLease> picture_uses;
     std::shared_ptr<CapturedPicture> output; // exact handoff into this back-buffer identity
+    std::shared_ptr<ProbeCapture> probe;
     na_object_id source = 0;     // this frame: the single picture-sized input of the opaque full-screen hand-off into this proxy
     bool source_ambiguous = false;
     bool source_copy = false;    // that hand-off was a whole-resource Copy* (a transfer), not a draw (processing)
@@ -95,6 +97,22 @@ struct CapturedPicture {
     DXGI_FORMAT view=DXGI_FORMAT_UNKNOWN;
     bool clean=false;uint32_t draws=0,forwarded=0;
 };
+struct ProbeCapture {
+    std::shared_ptr<Picture> picture;
+    ComPtr<ID3D12Resource> source_resource;
+    na::nr::native::RecordingLease use;
+    uint64_t source=0,generation=0;
+};
+// Discovered from actual colour writes, independently of final SRV reflection.
+// A canvas is only a probe candidate until the GPU compares the exact pictures.
+struct Canvas {
+    uint64_t id=0,generation=0,last_write=0,last_2d=0,used=0,probed=0;
+    uint32_t rw=0,rh=0,ow=0,oh=0,blended=0,proofs=0;
+    DXGI_FORMAT format=DXGI_FORMAT_UNKNOWN;
+};
+std::vector<Canvas> g_canvases;
+std::unordered_map<uint64_t,D3D12_RESOURCE_DESC> g_canvas_shapes;
+uint64_t g_canvas_generation=0,g_draw_order=0;
 std::shared_ptr<LayerStorage> g_layer_owner;
 std::vector<std::shared_ptr<LayerStorage>> g_layer_pool;
 std::vector<std::shared_ptr<Picture>> g_picture_pool;
@@ -138,7 +156,7 @@ constexpr uint32_t kPromoteFrames = 3, kDemoteFrames = 3;
 bool g_layers_cleared = false;    // this frame's layers were cleared (by the back buffer or its upstream: once, never between them)
 
 // The bind the recording thread made last (set by the raster listener, read by the draw hook).
-struct Bind { ID3D12GraphicsCommandList* list = nullptr; uint64_t recording = 0; na_object_id proxy = 0, mask_ds = 0; };
+struct Bind { ID3D12GraphicsCommandList* list = nullptr; uint64_t recording = 0; na_object_id proxy = 0, mask_ds = 0, canvas = 0; };
 constexpr uint32_t kEarlyMasks = 64; // depth-only draws mirrored per frame before the HUD's first draw
 thread_local Bind t_bind;
 
@@ -340,6 +358,30 @@ bool dims(na_object_id id, uint32_t* w, uint32_t* h, DXGI_FORMAT* f)
     *w = static_cast<uint32_t>(d.Width); *h = d.Height; *f = d.Format;
     return true;
 }
+void probe_canvas_locked(Proxy& output,ID3D12GraphicsCommandList* list)
+{
+    Canvas* best=nullptr;
+    for(auto& c:g_canvases)if(c.id!=output.id&&c.rw==output.rw&&c.rh==output.rh&&
+        TypelessOf(c.format)==TypelessOf(output.format)&&c.blended&&c.last_2d==c.last_write&&c.used+2>=g_frame&&
+        (!best||c.probed<best->probed||(c.probed==best->probed&&c.last_2d>best->last_2d)))best=&c;
+    if(!best)return;
+    if(best->ow!=output.ow||best->oh!=output.oh){best->ow=output.ow;best->oh=output.oh;best->proofs=0;best->generation=++g_canvas_generation;}
+    best->probed=++g_draw_order;
+    uint32_t state=0;
+    if(na::observe::ListStateSub(list,best->id,0,&state)!=na::observe::StateLookup::Known){
+        ++g_stats.canvas_no_state;std::snprintf(g_stats.upstream_why,sizeof g_stats.upstream_why,"canvas probe: no local texture state");return;
+    }
+    ComPtr<ID3D12Resource> source;source.Attach(na::observe::AcquireResource(best->id));
+    ComPtr<ID3D12Device> device;if(!source||FAILED(source->GetDevice(IID_PPV_ARGS(&device))))return;
+    auto picture=picture_locked(device.Get(),source->GetDesc(),output.ow,output.oh);
+    if(!picture)return;
+    auto capture=std::make_shared<ProbeCapture>();capture->picture=picture;capture->source_resource=source;
+    auto lease=na::nr::native::RetainRecording(list,capture);
+    if(!lease||!picture->SnapshotFull(list,source.Get(),static_cast<D3D12_RESOURCE_STATES>(state)))return;
+    capture->use=std::move(lease);
+    capture->source=best->id;capture->generation=best->generation;output.probe=std::move(capture);
+    ++g_stats.canvas_probes;
+}
 // H1b: an opaque full-screen draw into a back buffer before its HUD: note the one picture-sized
 // texture it reads (more than one = a composite of several inputs, not a hand-off: no source).
 void note_source_locked(Proxy& p, ID3D12GraphicsCommandList* list)
@@ -347,12 +389,21 @@ void note_source_locked(Proxy& p, ID3D12GraphicsCommandList* list)
     if (p.upstream) return;
     na::observe::NativeOperation op;
     uint64_t one = 0;
-    if (!na::observe::ListNativeOperation(list, false, op) ||
-        !PictureSource(op, p.id, p.rw, p.rh, one)) {
-        p.source = 0; p.source_ambiguous = true; return;
+    const bool snapshot=na::observe::ListNativeOperation(list,false,op);
+    const bool identified=snapshot&&PictureSource(op,p.id,p.rw,p.rh,one)&&one;
+    // This opaque full-target write replaces earlier output contents. A failed
+    // earlier draw must not permanently poison a later valid handoff.
+    p.source=identified?one:0;p.source_ambiguous=!identified;p.source_copy=false;p.output.reset();p.probe.reset();
+    if(!identified){
+        if(!snapshot)++g_stats.handoff_snapshot_missing;else++g_stats.handoff_no_source;
+        // A learned canvas may be captured even when reflection cannot resolve
+        // the final shader. The SAME-FRAME GPU proof still chooses original
+        // complete colour if this is not the image actually presented.
+        for(const auto& u:g_proxy)if(u.id&&u.upstream&&u.pixel_proved&&u.rw==p.rw&&u.rh==p.rh&&u.ow==p.ow&&u.oh==p.oh){
+            p.source=u.id;p.source_ambiguous=false;++g_stats.handoff_inferred;break;
+        }
+        if(!p.source){probe_canvas_locked(p,list);return;}
     }
-    if (one && !p.source_ambiguous)
-        p.source = p.source && p.source != one ? (p.source_ambiguous = true, 0) : one;
     // Preserve the actual full upstream picture at the transfer occurrence.
     // Sampling the resource later at Present would permit another writer to
     // substitute a different frame. Original game draw is always forwarded.
@@ -553,7 +604,8 @@ na::observe::ShaderScope redirect(ID3D12GraphicsCommandList* l, na::observe::Sha
         if (shaped) {
             ++p->scene;
             ++g_stats.scene_draws;
-            if (!p->upstream) {
+            if (!p->upstream && CoversTarget(st.viewport_count?st.viewports[0]:nullptr,
+                st.scissor_count?st.scissors[0]:nullptr,p->rw,p->rh)) {
                 note_source_locked(*p, l);
                 p->source_copy = false;
             }
@@ -677,6 +729,20 @@ public:
     na::observe::ShaderScope Before(ID3D12GraphicsCommandList* l, na::observe::ShaderCall& call) noexcept override
     {
         if (g_tracing.load(std::memory_order_relaxed)) trace_draw(l, call);
+        if(call.kind!=na::observe::ShaderKind::Dispatch&&t_bind.canvas&&t_bind.list==l&&g_on.load()){
+            na::observe::DrawInfo info;
+            if(na::observe::ListDrawState(l,info)&&info.recording==t_bind.recording&&info.rt==t_bind.canvas){
+                std::lock_guard<std::mutex> lock(g_m);
+                for(auto& c:g_canvases)if(c.id==info.rt){
+                    c.last_write=++g_draw_order;c.used=g_frame;
+                    if(info.pipeline_known&&info.rt_count==1&&info.pso_rt_count==1&&info.samples==1&&
+                        info.blend_mask!=NA_UNKNOWN_U32&&(info.blend_mask&1u)&&info.depth_enable==0){
+                        c.last_2d=c.last_write;++c.blended;
+                    }
+                    break;
+                }
+            }
+        }
         if (call.kind == na::observe::ShaderKind::Dispatch || (!t_bind.proxy && !t_bind.mask_ds) || t_bind.list != l || !g_on.load(std::memory_order_relaxed)) return {};
         return redirect(l, call);
     }
@@ -750,6 +816,28 @@ void on_bind(ID3D12GraphicsCommandList* l, const na::observe::RasterScissors& s)
         std::lock_guard<std::mutex> lock(g_m);
         if (rt) {
             if (find_locked(rt)) b.proxy = rt;
+            auto c=std::find_if(g_canvases.begin(),g_canvases.end(),[&](const auto& q){return q.id==rt;});
+            if(c==g_canvases.end()&&!b.proxy){
+                auto shape=g_canvas_shapes.find(rt);
+                if(shape==g_canvas_shapes.end()){
+                    ComPtr<ID3D12Resource> resource;resource.Attach(na::observe::AcquireResource(rt));
+                    if(resource){if(g_canvas_shapes.size()==512)g_canvas_shapes.clear();shape=g_canvas_shapes.emplace(rt,resource->GetDesc()).first;}
+                }
+                const auto desc=shape==g_canvas_shapes.end()?D3D12_RESOURCE_DESC{}:shape->second;
+                const UINT w=UINT(desc.Width),h=desc.Height;const auto f=desc.Format;
+                if(desc.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D&&desc.MipLevels==1&&desc.DepthOrArraySize==1&&desc.SampleDesc.Count==1)
+                for(const auto& q:g_proxy)if(q.id&&!q.upstream&&q.rw==w&&q.rh==h&&TypelessOf(q.format)!=DXGI_FORMAT_UNKNOWN&&TypelessOf(q.format)==TypelessOf(f)){
+                    if(g_canvases.size()==32){
+                        auto old=std::min_element(g_canvases.begin(),g_canvases.end(),[](const auto& a,const auto& z){return a.used<z.used;});
+                        if(old->used+8>=g_frame)break;
+                        g_canvases.erase(old);
+                    }
+                    Canvas canvas;canvas.id=rt;canvas.generation=++g_canvas_generation;canvas.rw=w;canvas.rh=h;
+                    canvas.ow=q.ow;canvas.oh=q.oh;canvas.format=f;canvas.used=g_frame;g_canvases.push_back(canvas);
+                    c=std::prev(g_canvases.end());++g_stats.canvas_candidates;break;
+                }
+            }
+            if(c!=g_canvases.end())b.canvas=rt;
         } else {
             for (const auto& q : g_proxy) // depth only: the HUD's depth target (a UI mask)?
                 if (q.id && (q.mirrored == ds || (!q.mirrored && q.hud_ds == ds))) { b.mask_ds = ds; break; }
@@ -891,6 +979,9 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
         return false;
     }
     p->used = g_frame;
+    if(auto probe=std::move(p->probe);probe&&out&&g_on.load()&&queue&&probe->use.Ready(queue)){
+        out->probe=probe->picture;out->probe_owner=probe;out->probe_source=probe->source;out->probe_generation=probe->generation;
+    }
     if(p->output){
         auto capture=std::move(p->output);auto& layers=capture->owner->layers;
         const auto ready_use=[&](const auto& use){return use.Ready(queue);};
@@ -1031,10 +1122,26 @@ void ReportPictureResult(bool identity,bool clean)
     else {++g_stats.transfer_verified;if(clean)++g_stats.clean_verified;else++g_stats.protection_verified;}
     g_stats.last_draw_method=!identity?3u:clean?1u:2u;
 }
+void ReportCanvasProbe(uint64_t source,uint64_t generation,bool identity)
+{
+    std::lock_guard<std::mutex> lock(g_m);
+    auto c=std::find_if(g_canvases.begin(),g_canvases.end(),[&](const auto& q){return q.id==source&&q.generation==generation;});
+    if(c==g_canvases.end())return;
+    if(!identity){++g_stats.canvas_changed;c->proofs=0;return;}
+    ++g_stats.canvas_verified;if(++c->proofs<2)return;
+    if(auto* p=find_locked(source)){p->pixel_proved=true;return;}
+    Proxy* slot=nullptr;
+    for(auto& q:g_proxy)if(!q.id){slot=&q;break;}
+    if(!slot)for(auto& q:g_proxy)if(!q.upstream&&q.used+8<g_frame&&(!slot||q.used<slot->used))slot=&q;
+    if(!slot)return;
+    *slot={};slot->id=source;slot->upstream=slot->preserve=slot->pixel_proved=true;
+    slot->rw=c->rw;slot->rh=c->rh;slot->ow=c->ow;slot->oh=c->oh;slot->format=c->format;slot->used=g_frame;
+    ++g_stats.upstream_learned;g_stats.upstream_why[0]=0;
+}
 std::string StatusLine()
 {
     const Stats s = GetStats();
-    char b[1536];
+    char b[2048];
     std::snprintf(b, sizeof b,
                   "native_hud on=%u frames=%llu hud_frames=%llu scene_draws=%llu redirected=%llu forwarded=%llu restore_failed=%llu "
                   "covered=%llu world=%llu masks=%llu last_frame=scene:%u,hud:%u,forwarded:%u,depth:%u,blended:%u,covered:%u,world:%u,masks:%u proxy_fmt=%u view_fmt=%u grey=%.4f last_forward=\"%s\" "
@@ -1048,7 +1155,12 @@ std::string StatusLine()
                   (unsigned long long)s.lineage_recovered, (unsigned long long)s.world_depth, s.traces,
                   (unsigned long long)s.draw_transfer_frames,(unsigned long long)s.draw_protect_frames,(unsigned long long)s.transfer_verified,
                   (unsigned long long)s.transfer_changed,(unsigned long long)s.clean_verified,(unsigned long long)s.protection_verified);
-    return b;
+    std::string result=b;
+    std::snprintf(b,sizeof b," canvas{candidates=%llu probes=%llu verified=%llu changed=%llu no_state=%llu} handoff{snapshot_missing=%llu no_source=%llu inferred=%llu}",
+        (unsigned long long)s.canvas_candidates,(unsigned long long)s.canvas_probes,(unsigned long long)s.canvas_verified,
+        (unsigned long long)s.canvas_changed,(unsigned long long)s.canvas_no_state,(unsigned long long)s.handoff_snapshot_missing,
+        (unsigned long long)s.handoff_no_source,(unsigned long long)s.handoff_inferred);
+    result+=b;return result;
 }
 
 } // namespace na::j2::native_hud

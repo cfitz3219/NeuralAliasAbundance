@@ -2764,6 +2764,11 @@ struct SmallRing {
     uint32_t slot = 0;
     std::shared_ptr<void> hud_owner[kRing];
     std::shared_ptr<na::j2::native_hud::Picture> hud_picture[kRing];
+    struct CanvasProbe {
+        std::shared_ptr<na::j2::native_hud::Picture> picture;
+        std::shared_ptr<void> owner;
+        uint64_t source=0,generation=0;
+    } canvas_probe[kRing];
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> pso;
     ComPtr<ID3D12DescriptorHeap> heap; // kRing x (SRV, UAV)
@@ -3471,6 +3476,10 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
     if(hud_completed!=UINT64_MAX)for(uint32_t j=0;j<kRing;++j)if(g_small.value[j]&&hud_completed>=g_small.value[j]){
         bool identity=false,clean=false;
         if(g_small.hud_picture[j]&&g_small.hud_picture[j]->ProofAfterCompletion(identity,clean))na::j2::native_hud::ReportPictureResult(identity,clean);
+        auto& probe=g_small.canvas_probe[j];
+        if(probe.picture&&probe.picture->ProofAfterCompletion(identity,clean))
+            na::j2::native_hud::ReportCanvasProbe(probe.source,probe.generation,identity);
+        probe={};
         g_small.hud_owner[j].reset();g_small.hud_picture[j].reset();
     }
     g_small.hud_owner[si]=layer.owner;
@@ -3485,6 +3494,11 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
     std::vector<D3D12_RESOURCE_BARRIER> b;
     add(b, frame, PRESENT, NPSR);
     add(b, out, NPSR, UAV);
+    if(layer.probe){
+        flush(l,b);
+        if(layer.probe->Probe(l,frame,frame->GetDesc().Format))
+            g_small.canvas_probe[si]={layer.probe,layer.probe_owner,layer.probe_source,layer.probe_generation};
+    }
     // DLSS needs this frame's depth + motion, recorded on this same queue (so the GPU runs them
     // first), at the picture's size, and a DLSS instance on this device.
     if (!(g.def.valid && g.def.frame + 1 == g.frame)) present_source(queue, forward);
