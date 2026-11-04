@@ -10,6 +10,7 @@
 #include "test_support.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/native_hud.hpp"
+#include "core/jitter_domain.hpp"
 #include "host_dx12/observe/producers.hpp"
 
 #include <d3dcompiler.h>
@@ -121,6 +122,48 @@ void helpers()
     CHECK(r[0] == 0 && r[1] == 0 && r[2] == 96 && r[3] == 48);
 }
 
+int jitter_evidence(test::Device& d)
+{
+    constexpr uint32_t W=256,H=128;
+    constexpr auto S=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    auto* dev=d.device.Get();
+    std::vector<uint32_t> prev(W*H),cur(W*H);
+    std::vector<float> motion(W*H*2,0.f);
+    for(uint32_t y=0;y<H;++y)for(uint32_t x=0;x<W;++x){
+        const uint32_t v=((x*73856093u)^(y*19349663u))&255u;
+        prev[y*W+x]=0xff000000u|v|(v<<8)|(v<<16);
+    }
+    auto tp=test::CreateTexture(dev,W,H,DXGI_FORMAT_R8G8B8A8_UNORM,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_NONE);
+    auto mv=test::CreateTexture(dev,W,H,DXGI_FORMAT_R32G32_FLOAT,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_NONE);
+    REQUIRE(tp && mv && upload(d,tp.Get(),prev.data(),4,S) && upload(d,mv.Get(),motion.data(),8,S));
+    // Use the actual production compute kernel: stationary colour, a known
+    // raster displacement, and the opposite sign must give different votes.
+    for(int mode=0;mode<3;++mode){
+        for(uint32_t y=0;y<H;++y)for(uint32_t x=0;x<W;++x){
+            const float q=float(x)+(mode==1?-.75f:mode==2?.75f:0.f);
+            const int a=(std::max)(0,(std::min)(int(W)-1,int(std::floor(q))));
+            const int b=(std::max)(0,(std::min)(int(W)-1,int(std::floor(q))+1));
+            const float t=q-std::floor(q);
+            const auto v=uint32_t(std::lround((prev[y*W+a]&255u)*(1-t)+(prev[y*W+b]&255u)*t));
+            cur[y*W+x]=0xff000000u|v|(v<<8)|(v<<16);
+        }
+        auto tc=test::CreateTexture(dev,W,H,DXGI_FORMAT_R8G8B8A8_UNORM,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_NONE);
+        auto counts=test::CreateBuffer(dev,16,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
+        REQUIRE(tc && counts && upload(d,tc.Get(),cur.data(),4,S));
+        test::List l;REQUIRE(l.Create(dev));
+        REQUIRE(na::j2::RecordJitterWitnessForTests(d.queue.Get(),l.list.Get(),tc.Get(),tp.Get(),mv.Get(),W,H,.75f,0.f,counts.Get()));
+        REQUIRE(SUCCEEDED(l.list->Close()));ID3D12CommandList* lists[]={l.list.Get()};d.queue->ExecuteCommandLists(1,lists);d.WaitIdle();
+        void* p=nullptr;REQUIRE(SUCCEEDED(counts->Map(0,nullptr,&p)));uint32_t v[4];std::memcpy(v,p,16);counts->Unmap(0,nullptr);
+        std::printf("jitter evidence mode=%d tested=%u unjittered=%u raster=%u opposite=%u\n",mode,v[0],v[1],v[2],v[3]);
+        CHECK(v[0]>3000 && v[mode+1]>v[0]*9/10);
+        na::jitter::ColourDomain source;const na::jitter::Source key{1,W,H,28};source.Bind(key);
+        CHECK(!source.Observe(key,{60,v[0],v[1],v[2],v[3]}));
+        CHECK(source.Observe(key,{120,v[0],v[1],v[2],v[3]}));
+        const auto sample=source.Resolve({.75f,0.f});
+        CHECK(sample.x==(mode==0?0.f:mode==1?.75f:-.75f));
+    }
+    return 0;
+}
 int classify(test::Device& d)
 {
     ID3D12Device* dev = d.device.Get();
@@ -619,6 +662,7 @@ int main()
     CHECK(compiled);
     test::Device d;
     if (!test::CreateDevice(d)) return test::SkipNoDevice("j2_native_hud_test");
+    if (jitter_evidence(d)) return 1;
     if (classify(d)) return 1;
     if (end_to_end(d)) return 1;
     // The native layers are observed objects held by statics: like the game host at exit,

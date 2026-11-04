@@ -61,6 +61,9 @@ struct Identity {
     uint32_t tracker_restart = 0, cut_reason = 0;
     uint32_t depth_reversed = 0;
     uint32_t flow_loosen = 0, flow_ran = 0;
+    float raster_jitter_x = 0, raster_jitter_y = 0;
+    uint32_t jitter_convention = 0;
+    uint64_t jitter_epoch = 0;
 };
 
 // Extra named planes (provenance, camera-only motion, flow residual/valid/mask, HUD layers...).

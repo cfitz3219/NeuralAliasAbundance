@@ -926,10 +926,11 @@ void write_status_line()
             {
                 char wl[320];
                 const int wn = snprintf(wl, sizeof wl,
-                    "jitter_witness frames=%llu windows=%llu last_window{tested=%llu unshifted=%llu shifted=%llu} unseen_now=%u unseen_count=%llu retests=%llu\r\n",
+                    "jitter_witness frames=%llu windows=%llu last_window{tested=%llu unshifted=%llu shifted=%llu} unseen_now=%u unseen_count=%llu retests=%llu final_colour{convention=%u epoch=%llu changes=%llu}\r\n",
                     (unsigned long long)j2.witness_frames, (unsigned long long)j2.witness_windows, (unsigned long long)j2.witness_tested,
                     (unsigned long long)j2.witness_unshifted, (unsigned long long)j2.witness_shifted, j2.jitter_unseen ? 1u : 0u,
-                    (unsigned long long)j2.jitter_unseen_count, (unsigned long long)j2.jitter_retests);
+                    (unsigned long long)j2.jitter_unseen_count, (unsigned long long)j2.jitter_retests,
+                    j2.jitter_input_convention, (unsigned long long)j2.jitter_input_epoch, (unsigned long long)j2.jitter_input_changes);
                 if (wn > 0) WriteFile(f, wl, DWORD((std::min)(wn, int(sizeof wl - 1))), &written, nullptr);
             }
             {

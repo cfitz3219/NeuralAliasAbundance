@@ -212,6 +212,8 @@ void write_slot(const Slot& s)
             id.reset, id.camera_cut, id.preset, id.sharpness, id.debug_view,
             (unsigned long long)s.late_writes, s.closed ? "true" : "false");
         // Pairing and the camera actually passed to the motion shader (2026-11-04).
+        std::fprintf(fp, "  \"raster_jitter_px\": [%.6f, %.6f],\n  \"jitter_convention\": %u,\n  \"jitter_epoch\": %llu,\n",
+            id.raster_jitter_x, id.raster_jitter_y, id.jitter_convention, (unsigned long long)id.jitter_epoch);
         std::fprintf(fp, "  \"present_pairing\": \"%s\",\n  \"present_closed_frame\": %llu,\n  \"inputs_frame\": %llu,\n",
             id.owns_present ? "own_output" : (s.planes[kPresent].valid ? "overlay_present" : "none"),
             (unsigned long long)s.present_closed, (unsigned long long)id.inputs_frame);

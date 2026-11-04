@@ -55,6 +55,10 @@ bool RecordHudLayerForTests(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList
                             uint32_t w, uint32_t h);
 bool RecordHudClassifyForTests(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list, ID3D12Resource* cur, ID3D12Resource* prev,
                                DXGI_FORMAT color_format, ID3D12Resource* motion, ID3D12Resource* evidence, uint32_t w, uint32_t h, uint32_t flags);
+// Test-only recorder; caller waits outside live callbacks and reads four uints:
+// tested, unjittered, raster, opposite. `counts` is a COPY_DEST readback buffer.
+bool RecordJitterWitnessForTests(ID3D12CommandQueue*, ID3D12GraphicsCommandList*, ID3D12Resource* cur,
+    ID3D12Resource* prev, ID3D12Resource* motion, uint32_t w, uint32_t h, float dx, float dy, ID3D12Resource* counts);
 // Test hook: the 101..200 % stage (NVIDIA Image Scaling sharpen-only) from `in`
 // (NON_PIXEL_SHADER_RESOURCE) into `out` (UNORDERED_ACCESS). <= 100 % records nothing.
 bool RecordNisForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* in, ID3D12Resource* out,
@@ -333,6 +337,8 @@ struct Stats {
     // Jitter witness (render-small): frames tested, the last 60-frame window's pixel counts, how
     // often jitter was found not to reach the picture (then off until a re-test), and whether off now.
     uint64_t witness_frames = 0, witness_windows = 0, witness_tested = 0, witness_unshifted = 0, witness_shifted = 0;
+    uint32_t jitter_input_convention = 0; // jitter::Convention of final colour, not the raster write
+    uint64_t jitter_input_epoch = 0, jitter_input_changes = 0;
     uint64_t jitter_unseen_count = 0, jitter_retests = 0;
     bool jitter_unseen = false;
     uint32_t depth_clears_last = 0;
