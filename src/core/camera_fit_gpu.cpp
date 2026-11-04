@@ -1,0 +1,536 @@
+#include "core/camera_fit_gpu.hpp"
+
+#include <d3dcompiler.h>
+
+#include <cmath>
+#include <cstring>
+
+using Microsoft::WRL::ComPtr;
+
+namespace na::motion::gpu {
+namespace {
+
+constexpr uint32_t kStep = 8;        // sample spacing (the AMD engine's 8x8 block grid)
+constexpr uint32_t kIterations = 6;  // Gauss-Newton steps from theta = 0 (3 stopped short on real AMD flow, PC 2026-11-04)
+constexpr uint32_t kValues = 32;     // per-sample accumulators: H (21), g (6), energy, count, inliers, quantised energy, quantised jitter-delta energy
+
+const char kSource[] = R"(
+Texture2D<float>  t_depth  : register(t0);
+Texture2D<float2> t_flow   : register(t1);   // current -> previous, pixels, jitter-stabilised
+Texture2D<float>  t_fvalid : register(t2);
+ByteAddressBuffer t_basis  : register(t3);   // C (16 floats), then G_0..G_5 (16 each)
+Texture2D<float4> t_cur    : register(t4);   // the pair's encoded images (validation; photo != 0)
+Texture2D<float4> t_prev   : register(t5);
+RWByteAddressBuffer u_part : register(u0);   // groups x 32 partial sums
+RWByteAddressBuffer u_fix  : register(u1);   // see camera_fit_gpu.hpp
+SamplerState s_lin : register(s0);
+
+cbuffer K : register(b0) {
+    uint width, height, step, nbx;
+    float jx, jy, depth_clear, robust;
+    uint iteration, iterations, groups, samples;
+    float djx, djy; uint photo, pad0;
+};
+
+#define NV 32
+// AMD flow is integral: a prediction within half a pixel per axis matches it exactly.
+float qenergy(float2 r, float c2) { const float2 q = max(abs(r) - 0.5, 0.0); return 0.5 * c2 * log(1.0 + dot(q, q) / c2); }
+// Held-out split (photo != 0): the fit uses the even cells of the 8x8 grid, validation the odd ones.
+bool fit_cell(uint s) { return photo == 0 || (((s % nbx) + (s / nbx)) & 1u) == 0; }
+bool finite1(float a) { return (asuint(a) & 0x7fffffffu) < 0x7f800000u; }
+
+float4 mulrow(float4 p, float4x4 m) {
+    return float4(
+        p.x * m._11 + p.y * m._21 + p.z * m._31 + p.w * m._41,
+        p.x * m._12 + p.y * m._22 + p.z * m._32 + p.w * m._42,
+        p.x * m._13 + p.y * m._23 + p.z * m._33 + p.w * m._43,
+        p.x * m._14 + p.y * m._24 + p.z * m._34 + p.w * m._44);
+}
+float4x4 loadm(uint off) {
+    return float4x4(asfloat(t_basis.Load4(off)), asfloat(t_basis.Load4(off + 16)),
+                    asfloat(t_basis.Load4(off + 32)), asfloat(t_basis.Load4(off + 48)));
+}
+float theta(uint k) { return iteration > 0 ? asfloat(u_fix.Load((17 + k) * 4)) : 0.0; }
+
+groupshared float sh[64 * NV];
+
+[numthreads(64, 1, 1)]
+void accum(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
+    float v[NV];
+    [unroll] for (uint i = 0; i < NV; ++i) v[i] = 0;
+    const uint s = gid.x * 64 + gi;
+    const uint x = (s % nbx) * step + step / 2, y = (s / nbx) * step + step / 2;
+    if (s < samples && x < width && y < height && fit_cell(s)) {
+        const float d = t_depth[uint2(x, y)];
+        const float2 f = t_flow[uint2(x, y)];
+        const float fv = t_fvalid[uint2(x, y)];
+        const bool ok = finite1(d) && d > 0.0 && d < 1.0 && d != depth_clear && finite1(fv) && fv > 0.0 && fv <= 1.0 &&
+                        finite1(f.x) && finite1(f.y) && abs(f.x) < 96.0 && abs(f.y) < 96.0;
+        if (ok) {
+            // Same pixel convention as the arbiter's reproject(): sample at centre - jitter.
+            const float px = (float)x + 0.5 - jx, py = (float)y + 0.5 - jy;
+            const float4 ndc = float4(px / width * 2.0 - 1.0, 1.0 - py / height * 2.0, d, 1.0);
+            float4 clip = mulrow(ndc, loadm(0));
+            float4 dc[6];
+            [unroll] for (uint k = 0; k < 6; ++k) {
+                dc[k] = mulrow(ndc, loadm(64 + k * 64));
+                clip += theta(k) * dc[k];
+            }
+            if (finite1(clip.w) && clip.w > 1e-12) {
+                const float iw = 1.0 / clip.w;
+                const float2 pred = float2((clip.x * iw + 1.0) * 0.5 * width, (1.0 - clip.y * iw) * 0.5 * height);
+                const float2 r = f - (pred - float2(px, py)); // flow minus the camera vector
+                float J0[6], J1[6];
+                [unroll] for (uint k = 0; k < 6; ++k) {
+                    J0[k] = (dc[k].x * clip.w - clip.x * dc[k].w) * iw * iw * 0.5 * width;
+                    J1[k] = -(dc[k].y * clip.w - clip.y * dc[k].w) * iw * iw * 0.5 * height;
+                }
+                const float rr = dot(r, r), c2 = robust * robust;
+                const float w = 1.0 / (1.0 + rr / c2); // Cauchy IRLS weight
+                if (finite1(rr)) {
+                    uint idx = 0;
+                    [unroll] for (uint a = 0; a < 6; ++a)
+                        [unroll] for (uint b = a; b < 6; ++b) v[idx++] = w * (J0[a] * J0[b] + J1[a] * J1[b]);
+                    [unroll] for (uint a2 = 0; a2 < 6; ++a2) v[21 + a2] = w * (J0[a2] * r.x + J1[a2] * r.y);
+                    v[27] = 0.5 * c2 * log(1.0 + rr / c2);
+                    v[28] = 1.0;
+                    v[29] = rr < 4.0 ? 1.0 : 0.0;
+                    // Quantisation-aware energies: v[30] at this theta; v[31] the second camera
+                    // hypothesis (meaningful at theta = 0): the colour carries no jitter, so the
+                    // stabilised pair is shifted by the jitter delta dj, and that is not motion.
+                    v[30] = qenergy(r, c2);
+                    v[31] = qenergy(r - float2(djx, djy), c2);
+                }
+            }
+        }
+    }
+    [unroll] for (uint i2 = 0; i2 < NV; ++i2) sh[gi * NV + i2] = v[i2];
+    GroupMemoryBarrierWithGroupSync();
+    for (uint st = 32; st > 0; st >>= 1) {
+        if (gi < st) for (uint i3 = 0; i3 < NV; ++i3) sh[gi * NV + i3] += sh[(gi + st) * NV + i3];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0) for (uint i4 = 0; i4 < NV; ++i4) u_part.Store((gid.x * NV + i4) * 4, asuint(sh[i4]));
+}
+
+groupshared float red[256];
+groupshared float tot[NV];
+
+[numthreads(256, 1, 1)]
+void solve(uint gi : SV_GroupIndex) {
+    for (uint i = 0; i < NV; ++i) {
+        float s = 0;
+        for (uint g = gi; g < groups; g += 256) s += asfloat(u_part.Load((g * NV + i) * 4));
+        red[gi] = s;
+        GroupMemoryBarrierWithGroupSync();
+        for (uint st = 128; st > 0; st >>= 1) {
+            if (gi < st) red[gi] += red[gi + st];
+            GroupMemoryBarrierWithGroupSync();
+        }
+        if (gi == 0) tot[i] = red[0];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi != 0) return;
+    const float n = tot[28];
+    const float e = n > 0 ? tot[27] / n : 0;
+    float th[6];
+    [unroll] for (uint k = 0; k < 6; ++k) th[k] = theta(k);
+    if (iteration == 0) {
+        u_fix.Store(23 * 4, asuint(e)); u_fix.Store(24 * 4, asuint(n));
+        const float q0 = n > 0 ? tot[30] / n : 0.0, qa = n > 0 ? tot[31] / n : 0.0;
+        u_fix.Store(55 * 4, asuint(q0));
+        u_fix.Store(56 * 4, asuint(qa));
+        u_fix.Store(29 * 4, asuint(min(q0, qa)));
+        u_fix.Store(28 * 4, 0u);
+        for (uint z = 30; z < 55; ++z) u_fix.Store(z * 4, 0u);
+    }
+    if (iteration < iterations) {
+        float A[6][6], b[6], sc[6];
+        uint idx = 0;
+        [unroll] for (uint a = 0; a < 6; ++a)
+            [unroll] for (uint c = a; c < 6; ++c) { A[a][c] = tot[idx]; A[c][a] = tot[idx]; ++idx; }
+        [unroll] for (uint a1 = 0; a1 < 6; ++a1) { b[a1] = tot[21 + a1]; sc[a1] = A[a1][a1] > 1e-20 ? rsqrt(A[a1][a1]) : 0.0; }
+        // Jacobi scaling + Levenberg damping, then Cholesky.
+        [unroll] for (uint a2 = 0; a2 < 6; ++a2) {
+            [unroll] for (uint c2 = 0; c2 < 6; ++c2) A[a2][c2] *= sc[a2] * sc[c2];
+            A[a2][a2] = (sc[a2] > 0 ? A[a2][a2] : 0.0) + 0.01 + (sc[a2] > 0 ? 0.0 : 1.0);
+            b[a2] *= sc[a2];
+        }
+        bool ok = n >= 64;
+        float L[6][6];
+        [unroll] for (uint r = 0; r < 6; ++r) [unroll] for (uint c3 = 0; c3 < 6; ++c3) L[r][c3] = 0;
+        [unroll] for (uint j = 0; j < 6; ++j) {
+            float dsum = A[j][j];
+            [unroll] for (uint m = 0; m < j; ++m) dsum -= L[j][m] * L[j][m];
+            if (!(dsum > 1e-12)) ok = false;
+            L[j][j] = sqrt(max(dsum, 1e-12));
+            [unroll] for (uint i5 = j + 1; i5 < 6; ++i5) {
+                float t = A[i5][j];
+                [unroll] for (uint m2 = 0; m2 < j; ++m2) t -= L[i5][m2] * L[j][m2];
+                L[i5][j] = t / L[j][j];
+            }
+        }
+        float yv[6], xv[6];
+        [unroll] for (uint i6 = 0; i6 < 6; ++i6) {
+            float t = b[i6];
+            [unroll] for (uint m3 = 0; m3 < i6; ++m3) t -= L[i6][m3] * yv[m3];
+            yv[i6] = t / L[i6][i6];
+        }
+        [unroll] for (int i7 = 5; i7 >= 0; --i7) {
+            float t = yv[i7];
+            [unroll] for (int m4 = i7 + 1; m4 < 6; ++m4) t -= L[m4][i7] * xv[m4];
+            xv[i7] = t / L[i7][i7];
+        }
+        [unroll] for (uint k2 = 0; k2 < 6; ++k2) {
+            const float delta = xv[k2] * sc[k2];
+            if (!finite1(delta)) ok = false;
+            if (ok) th[k2] += delta;
+        }
+        if (!ok) {
+            [unroll] for (uint k3 = 0; k3 < 6; ++k3) th[k3] = theta(k3);
+        }
+        [unroll] for (uint k4 = 0; k4 < 6; ++k4) u_fix.Store((17 + k4) * 4, asuint(th[k4]));
+        return;
+    }
+    // Final evaluation (energy at the fitted theta): keep it only if it clearly explains the
+    // image better than today's camera motion, on enough samples, and there was motion to fix.
+    // Plain test as before, AND the same test quantisation-aware against the better of the two
+    // camera hypotheses (with / without the jitter delta): a fit that only explains dj, or only
+    // sub-pixel rounding of integral flow, fixes nothing.
+    const float e0 = asfloat(u_fix.Load(23 * 4)), n0 = asfloat(u_fix.Load(24 * 4));
+    const float qref = asfloat(u_fix.Load(29 * 4)), qfit = n > 0 ? tot[30] / n : 0.0;
+    u_fix.Store(57 * 4, asuint(qfit));
+    bool accept = n >= 256.0 && n0 >= 256.0 && e0 > 0.05 && e < 0.7 * e0 && qref > 0.05 && qfit < 0.7 * qref;
+    [unroll] for (uint k5 = 0; k5 < 6; ++k5) accept = accept && finite1(th[k5]);
+    u_fix.Store(25 * 4, asuint(e));
+    u_fix.Store(26 * 4, asuint(n));
+    u_fix.Store(28 * 4, accept ? 1u : 0u);       // flow test passed
+    u_fix.Store(27 * 4, accept && photo == 0 ? 1u : 0u); // final; with photo, decide() sets it
+    [unroll] for (uint r2 = 0; r2 < 4; ++r2) {
+        [unroll] for (uint c4 = 0; c4 < 4; ++c4) {
+            float gsum = 0;
+            [unroll] for (uint k6 = 0; k6 < 6; ++k6) gsum += th[k6] * asfloat(t_basis.Load(64 + k6 * 64 + (r2 * 4 + c4) * 4));
+            u_fix.Store((r2 * 4 + c4) * 4, asuint(accept ? gsum : 0.0));
+        }
+    }
+    u_fix.Store(16 * 4, accept && photo == 0 ? 1u : 0u);
+}
+
+// Image check on the held-out cells (Astra 2026-11-04: image-domain, held-out, same pair; a big
+// moving foreground must not become the camera). Per cell: mean |luma| difference over 5x5
+// between the current image at q and the previous image at q + v for v = the fitted vector and
+// v = each camera hypothesis (camera, camera + dj). Counted per 3x3 screen region.
+float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
+float image_error(float2 q, float2 v) {
+    const float2 inv = 1.0 / float2(width, height);
+    float e = 0;
+    [unroll] for (int j = -2; j <= 2; ++j)
+        [unroll] for (int i = -2; i <= 2; ++i) {
+            const float2 o = float2(i, j);
+            e += abs(luma(t_cur.SampleLevel(s_lin, (q + o) * inv, 0).rgb) - luma(t_prev.SampleLevel(s_lin, (q + o + v) * inv, 0).rgb));
+        }
+    return e / 25.0;
+}
+float texture_at(float2 q) {
+    const float2 inv = 1.0 / float2(width, height);
+    float lo = 1e9, hi = -1e9;
+    [unroll] for (int j = -1; j <= 1; ++j)
+        [unroll] for (int i = -1; i <= 1; ++i) {
+            const float l = luma(t_cur.SampleLevel(s_lin, (q + float2(i, j) * 2.0) * inv, 0).rgb);
+            lo = min(lo, l); hi = max(hi, l);
+        }
+    return hi - lo;
+}
+
+[numthreads(64, 1, 1)]
+void validate(uint3 dt : SV_DispatchThreadID) {
+    if (u_fix.Load(28 * 4) == 0u) return;
+    const uint s = dt.x;
+    if (s >= samples || fit_cell(s)) return;
+    const uint x = (s % nbx) * step + step / 2, y = (s / nbx) * step + step / 2;
+    if (x >= width || y >= height) return;
+    const float d = t_depth[uint2(x, y)];
+    if (!(finite1(d) && d > 0.0 && d < 1.0 && d != depth_clear)) return;
+    const float px = (float)x + 0.5 - jx, py = (float)y + 0.5 - jy;
+    const float4 ndc = float4(px / width * 2.0 - 1.0, 1.0 - py / height * 2.0, d, 1.0);
+    const float4 c0 = mulrow(ndc, loadm(0));
+    float4 cf = c0;
+    [unroll] for (uint k = 0; k < 6; ++k) cf += asfloat(u_fix.Load((17 + k) * 4)) * mulrow(ndc, loadm(64 + k * 64));
+    if (!(finite1(c0.w) && c0.w > 1e-12 && finite1(cf.w) && cf.w > 1e-12)) return;
+    const float2 p = float2(px, py);
+    const float2 dcam = float2((c0.x / c0.w + 1.0) * 0.5 * width, (1.0 - c0.y / c0.w) * 0.5 * height) - p;
+    const float2 dfit = float2((cf.x / cf.w + 1.0) * 0.5 * width, (1.0 - cf.y / cf.w) * 0.5 * height) - p;
+    if (!(finite1(dfit.x) && finite1(dfit.y) && abs(dfit.x) < 96.0 && abs(dfit.y) < 96.0)) return;
+    const float2 q = float2(x, y) + 0.5;
+    if (texture_at(q) < 0.04) return;
+    const float ef = image_error(q, dfit);
+    const float ec = min(image_error(q, dcam), image_error(q, dcam + float2(djx, djy)));
+    const uint region = min(2u, x * 3u / width) + 3u * min(2u, y * 3u / height);
+    u_fix.InterlockedAdd(30 * 4, 1u);
+    if (ef < 0.8 * ec - 0.004) { u_fix.InterlockedAdd(31 * 4, 1u); u_fix.InterlockedAdd((35 + region) * 4, 1u); }
+    else if (ef > ec + 0.004) { u_fix.InterlockedAdd(32 * 4, 1u); u_fix.InterlockedAdd((44 + region) * 4, 1u); }
+    u_fix.InterlockedAdd(33 * 4, (uint)(saturate(ef) * 4096.0));
+    u_fix.InterlockedAdd(34 * 4, (uint)(saturate(ec) * 4096.0));
+}
+
+// Final decision with the image check: the fit must clearly explain the held-out image better
+// than the best camera hypothesis, over most of the screen, not one region.
+[numthreads(1, 1, 1)]
+void decide() {
+    if (photo == 0u || u_fix.Load(28 * 4) == 0u) return;
+    const uint tested = u_fix.Load(30 * 4), better = u_fix.Load(31 * 4), worse = u_fix.Load(32 * 4);
+    const float sf = (float)u_fix.Load(33 * 4), sc = (float)u_fix.Load(34 * 4);
+    uint regions = 0, good = 0;
+    for (uint r = 0; r < 9; ++r) {
+        const uint b = u_fix.Load((35 + r) * 4), w = u_fix.Load((44 + r) * 4);
+        if (b + w >= 4u) { ++regions; if (b > w) ++good; }
+    }
+    const bool ok = tested >= 64u && better >= 2u * worse && better * 8u >= tested && sf < 0.85 * sc && regions >= 3u && 3u * good >= 2u * regions;
+    u_fix.Store(53 * 4, regions);
+    u_fix.Store(54 * 4, good);
+    u_fix.Store(27 * 4, ok ? 1u : 0u);
+    u_fix.Store(16 * 4, ok ? 1u : 0u);
+    if (!ok) for (uint i = 0; i < 16; ++i) u_fix.Store(i * 4, 0u);
+}
+)";
+
+struct Constants {
+    uint32_t width, height, step, nbx;
+    float jx, jy, depth_clear, robust;
+    uint32_t iteration, iterations, groups, samples;
+    float djx, djy;
+    uint32_t photo, pad0;
+};
+static_assert(sizeof(Constants) == 16 * 4, "root constants");
+
+D3D12_RESOURCE_BARRIER transition(ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b)
+{
+    D3D12_RESOURCE_BARRIER x{};
+    x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    x.Transition = {r, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, a, b};
+    return x;
+}
+D3D12_RESOURCE_BARRIER uav(ID3D12Resource* r)
+{
+    D3D12_RESOURCE_BARRIER x{};
+    x.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    x.UAV.pResource = r;
+    return x;
+}
+
+} // namespace
+
+bool CameraFit::Init(ID3D12Device* device)
+{
+    if (!device) return false;
+    device_ = device;
+    D3D12_DESCRIPTOR_RANGE ranges[2]{};
+    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[0].NumDescriptors = 6;
+    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    ranges[1].NumDescriptors = 2;
+    ranges[1].OffsetInDescriptorsFromTableStart = 6;
+    D3D12_ROOT_PARAMETER params[2]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[0].DescriptorTable.NumDescriptorRanges = 2;
+    params[0].DescriptorTable.pDescriptorRanges = ranges;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[1].Constants.Num32BitValues = sizeof(Constants) / 4;
+    D3D12_STATIC_SAMPLER_DESC sampler{};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rs{};
+    rs.NumParameters = 2;
+    rs.pParameters = params;
+    rs.NumStaticSamplers = 1;
+    rs.pStaticSamplers = &sampler;
+    ComPtr<ID3DBlob> sig, err, a, s, v, dc;
+    if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
+        FAILED(device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&root_))))
+        return false;
+    const UINT cf = D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS;
+    if (FAILED(D3DCompile(kSource, sizeof(kSource) - 1, "camera_fit.hlsl", nullptr, nullptr, "accum", "cs_5_0", cf, 0, &a, &err)) ||
+        FAILED(D3DCompile(kSource, sizeof(kSource) - 1, "camera_fit.hlsl", nullptr, nullptr, "solve", "cs_5_0", cf, 0, &s, &err)) ||
+        FAILED(D3DCompile(kSource, sizeof(kSource) - 1, "camera_fit.hlsl", nullptr, nullptr, "validate", "cs_5_0", cf, 0, &v, &err)) ||
+        FAILED(D3DCompile(kSource, sizeof(kSource) - 1, "camera_fit.hlsl", nullptr, nullptr, "decide", "cs_5_0", cf, 0, &dc, &err)))
+        return false;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = root_.Get();
+    pd.CS = {a->GetBufferPointer(), a->GetBufferSize()};
+    if (FAILED(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso_accum_)))) return false;
+    pd.CS = {s->GetBufferPointer(), s->GetBufferSize()};
+    if (FAILED(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso_solve_)))) { pso_accum_.Reset(); return false; }
+    pd.CS = {v->GetBufferPointer(), v->GetBufferSize()};
+    if (FAILED(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso_validate_)))) { pso_accum_.Reset(); return false; }
+    pd.CS = {dc->GetBufferPointer(), dc->GetBufferSize()};
+    if (FAILED(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso_decide_)))) { pso_accum_.Reset(); return false; }
+    stride_ = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    return true;
+}
+
+bool CameraFit::prepare(Slot& s, uint32_t groups)
+{
+    auto buffer = [&](UINT64 bytes, D3D12_HEAP_TYPE type, D3D12_RESOURCE_STATES state, bool uav_ok, ComPtr<ID3D12Resource>& r) {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = type;
+        D3D12_RESOURCE_DESC d{};
+        d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        d.Width = bytes;
+        d.Height = d.DepthOrArraySize = d.MipLevels = 1;
+        d.SampleDesc.Count = 1;
+        d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        d.Flags = uav_ok ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+        return SUCCEEDED(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, state, nullptr, IID_PPV_ARGS(&r)));
+    };
+    if (!s.heap) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        if (FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&s.heap)))) return false;
+        if (!buffer(sizeof(FitBasis), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false, s.upload) ||
+            !buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, true, s.fix) ||
+            !buffer(256, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false, s.readback)) {
+            s.heap.Reset();
+            return false;
+        }
+    }
+    if (s.groups < groups) {
+        s.part.Reset();
+        if (!buffer(UINT64(groups) * kValues * 4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true, s.part)) return false;
+        s.groups = groups;
+    }
+    return true;
+}
+
+ID3D12Resource* CameraFit::Record(ID3D12GraphicsCommandList* l, uint32_t slot, ID3D12Resource* depth, ID3D12Resource* flow,
+                                  ID3D12Resource* flow_valid, const FitBasis& basis, const float jitter_px[2], float depth_clear,
+                                  uint32_t width, uint32_t height, const FitImages* images)
+{
+    if (!Ready() || !l || !depth || !flow || !flow_valid || !jitter_px || !width || !height) return nullptr;
+    const uint32_t nbx = (width + kStep - 1) / kStep, nby = (height + kStep - 1) / kStep;
+    const uint32_t samples = nbx * nby, groups = (samples + 63) / 64;
+    if (slots_.size() <= slot) slots_.resize(slot + 1);
+    Slot& s = slots_[slot];
+    if (!prepare(s, groups)) return nullptr;
+    void* p = nullptr;
+    if (FAILED(s.upload->Map(0, nullptr, &p)) || !p) return nullptr;
+    std::memcpy(p, &basis, sizeof basis);
+    s.upload->Unmap(0, nullptr);
+
+    auto cpu = [&](uint32_t i) {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = s.heap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += SIZE_T(i) * stride_;
+        return h;
+    };
+    auto tex = [&](uint32_t i, ID3D12Resource* r, DXGI_FORMAT f) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC d{};
+        d.Format = f;
+        d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        d.Texture2D.MipLevels = 1;
+        device_->CreateShaderResourceView(r, &d, cpu(i));
+    };
+    tex(0, depth, DXGI_FORMAT_R32_FLOAT);
+    tex(1, flow, DXGI_FORMAT_R32G32_FLOAT);
+    tex(2, flow_valid, DXGI_FORMAT_R32_FLOAT);
+    const bool photo = images && images->current && images->previous;
+    tex(4, photo ? images->current : nullptr, DXGI_FORMAT_R8G8B8A8_UNORM);
+    tex(5, photo ? images->previous : nullptr, DXGI_FORMAT_R8G8B8A8_UNORM);
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC d{};
+        d.Format = DXGI_FORMAT_R32_TYPELESS;
+        d.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        d.Buffer.NumElements = sizeof(FitBasis) / 4;
+        d.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        device_->CreateShaderResourceView(s.upload.Get(), &d, cpu(3));
+        D3D12_UNORDERED_ACCESS_VIEW_DESC u{};
+        u.Format = DXGI_FORMAT_R32_TYPELESS;
+        u.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        u.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        u.Buffer.NumElements = groups * kValues;
+        device_->CreateUnorderedAccessView(s.part.Get(), nullptr, &u, cpu(6));
+        u.Buffer.NumElements = 64;
+        device_->CreateUnorderedAccessView(s.fix.Get(), nullptr, &u, cpu(7));
+    }
+    constexpr auto S = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, U = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    {
+        auto b = transition(s.fix.Get(), S, U);
+        l->ResourceBarrier(1, &b);
+    }
+    ID3D12DescriptorHeap* heaps[] = {s.heap.Get()};
+    l->SetDescriptorHeaps(1, heaps);
+    l->SetComputeRootSignature(root_.Get());
+    l->SetComputeRootDescriptorTable(0, s.heap->GetGPUDescriptorHandleForHeapStart());
+    Constants c{};
+    c.width = width; c.height = height; c.step = kStep; c.nbx = nbx;
+    c.jx = jitter_px[0]; c.jy = jitter_px[1]; c.depth_clear = depth_clear; c.robust = 1.5f;
+    c.iterations = kIterations; c.groups = groups; c.samples = samples;
+    if (images) { c.djx = images->jitter_delta_px[0]; c.djy = images->jitter_delta_px[1]; }
+    c.photo = photo ? 1u : 0u;
+    for (uint32_t it = 0; it <= kIterations; ++it) {
+        c.iteration = it;
+        l->SetComputeRoot32BitConstants(1, sizeof(Constants) / 4, &c, 0);
+        l->SetPipelineState(pso_accum_.Get());
+        l->Dispatch(groups, 1, 1);
+        D3D12_RESOURCE_BARRIER b[2] = {uav(s.part.Get()), uav(s.fix.Get())};
+        l->ResourceBarrier(2, b);
+        l->SetPipelineState(pso_solve_.Get());
+        l->Dispatch(1, 1, 1);
+        l->ResourceBarrier(2, b);
+    }
+    if (photo) {
+        l->SetPipelineState(pso_validate_.Get());
+        l->Dispatch(groups, 1, 1);
+        auto b = uav(s.fix.Get());
+        l->ResourceBarrier(1, &b);
+        l->SetPipelineState(pso_decide_.Get());
+        l->Dispatch(1, 1, 1);
+        l->ResourceBarrier(1, &b);
+    }
+    {
+        auto b = transition(s.fix.Get(), U, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        l->ResourceBarrier(1, &b);
+        l->CopyBufferRegion(s.readback.Get(), 0, s.fix.Get(), 0, 256);
+        b = transition(s.fix.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, S);
+        l->ResourceBarrier(1, &b);
+    }
+    s.recorded = true;
+    return s.fix.Get();
+}
+
+bool CameraFit::Collect(uint32_t slot, FitResult* out)
+{
+    if (!out || slot >= slots_.size() || !slots_[slot].recorded || !slots_[slot].readback) return false;
+    Slot& s = slots_[slot];
+    s.recorded = false;
+    void* p = nullptr;
+    D3D12_RANGE range{0, 256};
+    if (FAILED(s.readback->Map(0, &range, &p)) || !p) return false;
+    uint32_t w[64];
+    std::memcpy(w, p, sizeof w);
+    D3D12_RANGE none{0, 0};
+    s.readback->Unmap(0, &none);
+    auto f = [&](int i) { float v; std::memcpy(&v, &w[i], 4); return v; };
+    *out = FitResult{};
+    out->accepted = w[27] != 0;
+    for (int k = 0; k < 6; ++k) out->theta[k] = f(17 + k);
+    out->energy0 = f(23);
+    out->samples0 = static_cast<uint32_t>(f(24));
+    out->energy = f(25);
+    out->samples = static_cast<uint32_t>(f(26));
+    out->flow_accepted = w[28] != 0;
+    out->energy_alt = f(56);
+    out->energy_q0 = f(55);
+    out->energy_qfit = f(57);
+    out->photo_tested = w[30];
+    out->photo_better = w[31];
+    out->photo_worse = w[32];
+    out->photo_e_fit = w[30] ? float(w[33]) / 4096.f / float(w[30]) : 0.f;
+    out->photo_e_cam = w[30] ? float(w[34]) / 4096.f / float(w[30]) : 0.f;
+    out->photo_regions = w[53];
+    out->photo_regions_good = w[54];
+    return true;
+}
+
+} // namespace na::motion::gpu

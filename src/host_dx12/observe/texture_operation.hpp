@@ -30,4 +30,8 @@ public:
     virtual void After(ID3D12GraphicsCommandList*, const TextureCall&, ShaderScope&) noexcept = 0;
 };
 void SetTextureOperationHook(std::shared_ptr<TextureOperationHook>);
+// Observation only: called on the recording thread for each game ClearDepthStencilView that
+// clears depth, before it is forwarded, with the view's resource id. Records nothing.
+using DepthClearListener = void (*)(ID3D12GraphicsCommandList*, uint64_t target_id);
+void SetDepthClearListener(DepthClearListener);
 } // namespace na::observe

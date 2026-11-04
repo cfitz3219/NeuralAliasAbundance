@@ -60,9 +60,22 @@ struct Stats {
     uint32_t proxy_format = 0, view_format = 0; // DXGI formats of the proxy and of the HUD's views
     float grey = 0.f;                           // the grey layer's background as read through the view
     char last_forward[80] = {};             // why the last forwarded HUD draw was not redirected
+    // H1b upstream picture: in use now, learned / dropped (structure changed) counts, presents whose
+    // HUD came from it, the last frame's hand-off source (0 none, 1 one, 2 ambiguous), and why a
+    // candidate was refused.
+    uint32_t upstream_now = 0, last_source = 0;
+    uint64_t upstream_learned = 0, upstream_dropped = 0, upstream_frames = 0;
+    char upstream_why[64] = {};
+    // Current-lineage checks (Astra 20cddb8 H1b point 3): presents whose hand-off did not come
+    // from the upstream, and of those, frames whose already-redirected HUD was laid on anyway.
+    uint64_t lineage_miss = 0, lineage_recovered = 0;
+    uint64_t world_depth = 0; // draws left in the picture because they are depth-tested on the scene depth
+    uint32_t traces = 0;      // frame-structure traces taken (hud_trace lines in the log)
 };
 Stats GetStats();
 std::string StatusLine();
+// Finished frame-structure traces (hud_trace JSON lines, CRLF), taken once; empty when none.
+std::string TakeTrace();
 
 // Pure helpers (tests).
 DXGI_FORMAT TypelessOf(DXGI_FORMAT f);      // the layer's resource format; UNKNOWN = not supported

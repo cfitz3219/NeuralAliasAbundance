@@ -116,14 +116,21 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
         double mbv = _wtof(mb);
         mbv = mbv < -4.0 ? -4.0 : (mbv > 0.0 ? 0.0 : mbv);
         target.j2_mip_bias_x100.store(static_cast<int32_t>(mbv * 100.0 + (mbv < 0 ? -0.5 : 0.5)));
-        // [j2] preset: a letter J..M (NGX value = letter - 'A' + 1), "default", or a number.
+        // [j2] preset_v2: "auto", a letter J..M (NGX value = letter - 'A' + 1), "default", or a
+        // number. Without it, the old [j2] preset key: its "L" was the old default (every save
+        // wrote it), so it becomes Automatic (L for DLAA/Quality, M for Balanced/Performance,
+        // Cort 2026-11-04); any other old choice is kept.
         wchar_t pz[16] = {};
-        GetPrivateProfileStringW(L"j2", L"preset", L"L", pz, 16, ini);
-        uint32_t pv = 12;
-        if (pz[0] >= L'0' && pz[0] <= L'9') pv = static_cast<uint32_t>(_wtoi(pz));
+        GetPrivateProfileStringW(L"j2", L"preset_v2", L"", pz, 16, ini);
+        const bool v2 = pz[0] != 0;
+        if (!v2) GetPrivateProfileStringW(L"j2", L"preset", L"auto", pz, 16, ini);
+        uint32_t pv = 255;
+        if (!_wcsicmp(pz, L"auto")) pv = 255;
+        else if (pz[0] >= L'0' && pz[0] <= L'9') pv = static_cast<uint32_t>(_wtoi(pz));
         else if (!_wcsicmp(pz, L"default")) pv = 0;
-        else if (pz[0] && !pz[1]) { const wchar_t c = towupper(pz[0]); pv = (c >= L'A' && c <= L'Z') ? static_cast<uint32_t>(c - L'A' + 1) : 12; }
-        target.j2_preset.store(pv > 26 ? 12 : pv);
+        else if (pz[0] && !pz[1]) { const wchar_t c = towupper(pz[0]); pv = (c >= L'A' && c <= L'Z') ? static_cast<uint32_t>(c - L'A' + 1) : 255; }
+        if (!v2 && pv == 12) pv = 255;
+        target.j2_preset.store(pv > 26 && pv != 255 ? 255 : pv);
         const uint32_t sm = GetPrivateProfileIntW(L"j2", L"scale_mode", 0, ini);
         target.j2_scale_mode.store(sm > 4 ? 0 : sm);
     }
@@ -182,6 +189,37 @@ void SetIniPath(const wchar_t* path)
     if (path) wcsncpy_s(g_ini_defaults, path, _TRUNCATE);
 }
 
+namespace {
+char g_effective[1024] = {};
+// Where a key's effective value came from: the user ini wins when it holds the key
+// (load order above), else the game's deployed ini, else the built-in default.
+const char* source_of(const wchar_t* section, const wchar_t* key)
+{
+    wchar_t v[8] = {};
+    if (g_ini_user[0] && GetPrivateProfileStringW(section, key, L"\x01", v, 8, g_ini_user) && v[0] != 1) return "user";
+    if (g_ini_defaults[0] && GetPrivateProfileStringW(section, key, L"\x01", v, 8, g_ini_defaults) && v[0] != 1) return "game";
+    return "builtin";
+}
+void describe_effective()
+{
+    // Astra 20cddb8 point 5: the 05dc62b deploy log printed flow_loosen=50/preset L while the
+    // game ran 0/M from the saved user choices. Log every effective value with its source.
+    std::snprintf(g_effective, sizeof g_effective,
+        "settings_effective game_ini=\"%ls\" user_ini=\"%ls\" j2.flow_loosen=%u(%s) j2.preset=%u(%s) j2.sharpen=%u(%s) "
+        "j2.hud_nis=%u(%s) j2.scale_mode=%u(%s) j2.mip_bias_x100=%d(%s) dlss.mode=%u(%s) dlss.preset=%d(%s)",
+        g_ini_defaults, g_ini_user,
+        g_settings.j2_flow_loosen.load(), source_of(L"j2", L"flow_loosen"),
+        g_settings.j2_preset.load(), [] { const char* s = source_of(L"j2", L"preset_v2"); return strcmp(s, "builtin") ? s : source_of(L"j2", L"preset"); }(),
+        g_settings.j2_sharpness.load(), source_of(L"j2", L"sharpen"),
+        g_settings.j2_hud_nis.load(), source_of(L"j2", L"hud_nis"),
+        g_settings.j2_scale_mode.load(), source_of(L"j2", L"scale_mode"),
+        g_settings.j2_mip_bias_x100.load(), source_of(L"j2", L"mip_bias"),
+        g_settings.dlss_mode.load(), source_of(L"dlss", L"mode"),
+        g_settings.preset.load(), source_of(L"dlss", L"preset"));
+}
+} // namespace
+const char* EffectiveSummary() { return g_effective; }
+
 const wchar_t* UserIniPath()
 {
     resolve_user_ini();
@@ -208,10 +246,14 @@ void Load()
         g_settings.j2_capture_frames.store(f < 1 ? 1u : (f > 240 ? 240u : f));
         g_settings.j2_capture_key.store(GetPrivateProfileIntW(L"j2", L"capture_key", 0x77, g_ini_defaults) & 0xFFu);
         g_settings.j2_capture_after_s.store(GetPrivateProfileIntW(L"j2", L"capture_after_seconds", 0, g_ini_defaults));
+        // Automatic evidence captures (test packages): sessions per run, cooldown between them.
+        g_settings.j2_capture_auto.store(GetPrivateProfileIntW(L"j2", L"capture_auto", 0, g_ini_defaults));
+        g_settings.j2_capture_cooldown_s.store(GetPrivateProfileIntW(L"j2", L"capture_cooldown_seconds", 20, g_ini_defaults));
     }
 #define REMEMBER(member) g_loaded_values.member.store(g_settings.member.load());
     NA_PERSISTED_FIELDS(REMEMBER)
 #undef REMEMBER
+    describe_effective();
 
 }
 
@@ -271,8 +313,12 @@ bool SaveFromWorker()
     ok &= WritePrivateProfileStringW(L"j2", L"flow_loosen", v, ini) != 0;
     {
         const uint32_t pv = g_settings.j2_preset.load();
-        if (pv >= 1 && pv <= 26) swprintf_s(v, L"%c", static_cast<wchar_t>(L'A' + pv - 1));
+        if (pv == 255) swprintf_s(v, L"auto");
+        else if (pv >= 1 && pv <= 26) swprintf_s(v, L"%c", static_cast<wchar_t>(L'A' + pv - 1));
         else swprintf_s(v, L"default");
+        ok &= WritePrivateProfileStringW(L"j2", L"preset_v2", v, ini) != 0;
+        // Older builds read [j2] preset: they get L for Automatic.
+        if (pv == 255) swprintf_s(v, L"L");
         ok &= WritePrivateProfileStringW(L"j2", L"preset", v, ini) != 0;
         swprintf_s(v, L"%u", g_settings.j2_scale_mode.load());
         ok &= WritePrivateProfileStringW(L"j2", L"scale_mode", v, ini) != 0;

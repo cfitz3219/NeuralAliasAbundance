@@ -45,7 +45,27 @@ struct Identity {
     uint32_t preset = 0, sharpness = 0, debug_view = 0;
     uint64_t entry_pipeline=0,entry_root=0,entry_destination=0,entry_operation=0;
     uint32_t entry_barrier=0,entry_kind=0;
+    // 2026-11-04 capture work (Cort: as much data as possible; Astra 20cddb8 point 6).
+    // The evaluation records its own final output (render-small: the DLSS output + HUD), so the
+    // overlay's Present copy must not be attached to it (the old pairing put frame N+1's
+    // presented picture into frame N's slot).
+    bool owns_present = false;
+    uint64_t inputs_frame = 0;      // J2 frame the depth/motion/camera belong to
+    bool camera_valid = false;      // the matrices below were the ones passed to the motion shader
+    double vp_cur[16]{}, vp_prev[16]{}, inv_vp_cur[16]{}; // unjittered, row-major storage, row-vector algebra
+    double eye[3]{};                // camera position derived from the VP (camera-relative VPs keep it ~constant)
+    uint32_t camera_source = 0;     // 1 read, 2 from J1, 3 held still, 4 held, 5 extrapolated, 6 saved (Present source)
+    uint64_t camera_age = 0;
+    int64_t camera_offset = -1, camera_param = -1; // learned camera block slot
+    uint64_t selection_version = 0; // live scene selection version the inputs used
+    uint32_t tracker_restart = 0, cut_reason = 0;
+    uint32_t depth_reversed = 0;
+    uint32_t flow_loosen = 0, flow_ran = 0;
 };
+
+// Extra named planes (provenance, camera-only motion, flow residual/valid/mask, HUD layers...).
+constexpr uint32_t kMaxExtra = 8;
+struct ExtraPlane { const char* name = nullptr; ID3D12Resource* res = nullptr; D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE; };
 
 // Planes recorded after the evaluate, in the states they are in at that point.
 struct Planes {
@@ -53,6 +73,8 @@ struct Planes {
     ID3D12Resource* depth = nullptr;  D3D12_RESOURCE_STATES depth_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     ID3D12Resource* motion = nullptr; D3D12_RESOURCE_STATES motion_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     ID3D12Resource* output = nullptr; D3D12_RESOURCE_STATES output_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    ExtraPlane extra[kMaxExtra];
+    uint32_t extra_count = 0;
 };
 
 using ExecuteFn = void(__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
@@ -78,10 +100,29 @@ void OnFrameClosed(uint64_t present_ordinal, uint64_t late_writes);
 // entry point, so J2 never observes it).
 void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exec);
 
+// Compact per-frame record kept in a ring for every frame (also frames without DLSS), so a
+// capture shows the frames BEFORE and AROUND a stretch/reset, not only the evaluations.
+struct FrameNote {
+    uint64_t frame = 0, tick_ms = 0;
+    uint32_t dlss = 0;              // 1 evaluated, 0 stretched/refused
+    uint32_t reset = 0;
+    float jitter_x = 0, jitter_y = 0;
+    uint64_t selection_depth = 0, selection_color = 0, selection_version = 0;
+    uint32_t camera_source = 0; uint64_t camera_age = 0;
+    double eye[3]{};
+    char why[96]{};                 // refusal / route note
+};
+void NoteFrame(const FrameNote& n);
+// Automatic capture trigger (stretch burst, reset, fast camera motion, periodic). Arms
+// `frames` evaluations unless a capture is running or the cooldown has not passed. Cheap.
+void Trigger(const char* why, uint32_t frames);
+void SetAutoTrigger(bool on, uint32_t max_sessions, uint32_t cooldown_ms);
+
 struct Stats {
     uint32_t requested = 0, recorded = 0, submitted = 0, written = 0;
     uint32_t dropped_busy = 0, discarded = 0, retired = 0, errors = 0;
     uint32_t without_present = 0; // frames written without a presented image
+    uint32_t triggers = 0, extra_skipped = 0; // automatic captures started / extra planes over the byte budget
 };
 Stats GetStats();
 const wchar_t* Directory();

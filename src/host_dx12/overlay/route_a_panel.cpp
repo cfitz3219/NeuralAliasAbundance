@@ -990,7 +990,7 @@ void DrawLiveDlaa()
     if (na::j2::RenderSmall() && na::j2::HudMaskEnabled()) {
         na::settings::Settings& ss = na::settings::Get();
         int hud = static_cast<int>(ss.j2_hud_nis.load());
-        BeginRow("HUD sharpness (NIS)", "Experimental fallback ([present] hud_mask=1). Guesses which pixels are HUD from the picture and replaces them with an NVIDIA Image Scaling copy at this sharpness. The HUD is still part of what DLSS gets, and a wrong guess shows unsmoothed scenery. Not used on frames where the native-resolution HUD works.", S(220));
+        BeginRow("HUD sharpness (NIS)", "HUD protection fallback (on by default; [present] hud_mask=0 turns it off). While the camera moves, it learns which pixels stay fixed on screen when the world behind them moves. There DLSS gets no motion and trusts the current frame, and the HUD pixels are shown from an NVIDIA Image Scaling copy at this sharpness. The HUD is still part of what DLSS gets; this protects it rather than separating it. Not used on frames where the native-resolution HUD works.", S(220));
         ImGui::SetNextItemWidth(S(220));
         if (ImGui::SliderInt("##j2hudnis", &hud, 0, 100, hud ? "%d%%" : "Off", ImGuiSliderFlags_AlwaysClamp)) ss.j2_hud_nis.store(static_cast<uint32_t>(hud));
         if (ImGui::IsItemDeactivatedAfterEdit()) na::settings::Save();
@@ -1001,16 +1001,17 @@ void DrawLiveDlaa()
         EndRow();
     }
     {
-        // DLSS render preset. NGX values: J 10, K 11, L 12, M 13; 0 = NVIDIA's default.
-        static const char* kLivePresets[] = {"L (default)", "M", "K", "J", "NVIDIA default"};
-        static const uint32_t kLiveValues[] = {12, 13, 11, 10, 0};
+        // DLSS render preset. NGX values: J 10, K 11, L 12, M 13; 0 = NVIDIA's default;
+        // Automatic (Cort 2026-11-04): L for DLAA/Quality, M for Balanced/Performance.
+        static const char* kLivePresets[] = {"Automatic (L / M)", "L (all modes)", "M (all modes)", "K", "J", "NVIDIA default"};
+        static const uint32_t kLiveValues[] = {na::j2::kPresetAuto, 12, 13, 11, 10, 0};
         na::settings::Settings& ss = na::settings::Get();
         const uint32_t cur = ss.j2_preset.load();
         int idx = 0;
-        for (int i = 0; i < 5; ++i) if (kLiveValues[i] == cur) idx = i;
-        BeginRow("DLSS preset", "Which DLSS model runs. L and M are the newest (DLSS 4.5) transformer models; K and J are the earlier transformer models. Changing it restarts DLAA's history for one frame.", S(220));
+        for (int i = 0; i < 6; ++i) if (kLiveValues[i] == cur) idx = i;
+        BeginRow("DLSS preset", "Which DLSS model runs. Automatic uses L for DLAA and Quality and M for Balanced and Performance. L and M are the newest (DLSS 4.5) transformer models; K and J are the earlier transformer models. Changing it restarts DLAA's history for one frame.", S(220));
         ImGui::SetNextItemWidth(S(220));
-        if (ImGui::Combo("##j2preset", &idx, kLivePresets, 5)) {
+        if (ImGui::Combo("##j2preset", &idx, kLivePresets, 6)) {
             ss.j2_preset.store(kLiveValues[idx]);
             na::settings::Save();
         }
@@ -1108,6 +1109,8 @@ void DrawLiveDlaaEnhancements()
         BeginRow("Moving-object motion (test)", "Adds estimated motion for moving objects. Uses NVIDIA flow between command lists, or AMD compute flow inside the game's list. Requires extra GPU time. Turn it off to compare; the Motion vectors debug view shows the result.", SwitchWidth());
         if (Switch("j2flow", &fl)) na::j2::flow::SetEnabled(fl);
         EndRow();
+        if (na::j2::compute_flow::GetStats().camera_reconstruct)
+            ImGui::TextWrapped("This game's camera data has no camera movement, so camera motion is rebuilt from the picture. AMD flow keeps running (extra GPU time) even with the switch off; the switch only controls moving-object motion.");
         {
             na::settings::Settings& ss = na::settings::Get();
             int loose = static_cast<int>(ss.j2_flow_loosen.load());

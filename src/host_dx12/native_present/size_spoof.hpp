@@ -12,6 +12,8 @@ struct SizeState {
     Size output{}, render{}, requested{};
     uint64_t generation = 0, request = 0;
     bool enabled = false, request_delivered = false;
+    bool request_window = false; // the pending request is a REAL window resize (BeginWindowResize), not our ask
+    uint64_t mode_generation = 0; // real window style/monitor/exclusive state; independent of render requests
 };
 struct InputGeometry {
     RECT physical_client{}; // SCREEN coordinates, using real user32 calls
@@ -48,6 +50,9 @@ bool InstallSizeHooks();
 bool Attach(HWND hwnd, Size output, Size render);
 void Detach(HWND hwnd);
 SizeState GetSizeState();
+// Observe real DXGI Windowed state on the normal Present path. A mode change
+// can require a new size request even when physical output dimensions match.
+void ObserveWindowMode(HWND hwnd, bool windowed);
 bool GetInputGeometry(InputGeometry* out);
 
 // Caller-filter BEFORE invoking these explicit transforms from DXGI detours.
@@ -56,12 +61,20 @@ bool RewriteClientRect(HWND hwnd, RECT* rect);
 bool RewriteWindowRect(HWND hwnd, RECT* rect);
 bool RewriteDesc(DXGI_SWAP_CHAIN_DESC* desc);
 bool RewriteDesc1(HWND hwnd, DXGI_SWAP_CHAIN_DESC1* desc);
+// A game's ResizeTarget during our delivered render-only request describes
+// the logical canvas. Keep the physical target at output size; unrelated
+// game mode changes and natural window resizes remain unchanged.
+bool RewriteResizeTarget(HWND hwnd, DXGI_MODE_DESC* mode);
 
 // Posts one registered message to the WINDOW thread. PrepareSizeMessage turns
 // it into a virtual WM_SIZE immediately before forwarding to the GAME WndProc.
 // Returns a token, or 0 for failure/no change/pending request. No callback or
 // physical SetWindowPos occurs under a helper lock (or at all here).
-uint64_t RequestRenderSize(Size render);
+// force: ask even when `render` equals the committed size (the render-small controller's
+// restore/supersede: the game may already hold buffers of the abandoned request's size).
+uint64_t RequestRenderSize(Size render, bool force = false);
+// The size the game is currently told (requested while a delivered request is pending).
+Size AdvertisedSize();
 // Already on the window thread for a REAL WM_SIZE: caller computes render
 // with the presenter's exact scale/rounding and supplies the new physical
 // output. Supersedes an older pending request, without posting another message.
@@ -89,4 +102,6 @@ struct SizeStats {
 };
 SizeStats GetSizeStats();
 void FormatSizeStatus(char* out, uint32_t capacity);
+// Tick of the pending live request (0 when none); the size probe's after_req window.
+uint64_t LastRequestTick();
 } // namespace na::native_present

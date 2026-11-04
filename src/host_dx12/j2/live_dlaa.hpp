@@ -90,12 +90,22 @@ void SetHudMaskEnabled(bool on);
 bool HudMaskEnabled();
 bool HudMaskView();
 // Render-small texture bias per DLSS mode (Cort, 2026-11-03; the menu is greyed out there):
-// Quality (67%) -1.585, Balanced (58%) -2, Performance (50%) -2.5. DLAA (scale 1) uses the
-// menu's choice.
+// Quality (67%) -1.585, Balanced (58%) -2, Performance (50%) -2.25 (Cort 2026-11-04: -2.5 was
+// a little too strong). DLAA (scale 1) uses the menu's choice.
 inline float SmallMipBias(float user, float scale)
 {
     if (!(scale > 0.f && scale < 1.f)) return user;
-    return scale >= 0.62f ? -1.5849625f : (scale >= 0.54f ? -2.0f : -2.5f);
+    return scale >= 0.62f ? -1.5849625f : (scale >= 0.54f ? -2.0f : -2.25f);
+}
+// DLSS preset setting "Automatic" (Cort 2026-11-04): L for DLAA and Quality, M for Balanced and
+// Performance. Any other setting value is an explicit NGX preset (J 10, K 11, L 12, M 13, 0 =
+// NVIDIA's default) used in every mode.
+constexpr uint32_t kPresetAuto = 255;
+inline uint32_t PresetFor(uint32_t setting, uint32_t render_w, uint32_t out_w)
+{
+    if (setting != kPresetAuto) return setting;
+    const bool below_quality = render_w && out_w && double(render_w) / double(out_w) < 0.62;
+    return below_quality ? 13u : 12u;
 }
 bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t rw, uint32_t rh,
                     ID3D12Resource* out, uint32_t ow, uint32_t oh, bool hdr, void* user);
@@ -233,6 +243,8 @@ struct Stats {
     // Cuts at record time by cause (restart = tracker reset by resume/gap; gap = tracker frame gap;
     // motion = translation/rotation/fov jump), and the last few as "tick100ms:why=value[/held][/j1]".
     uint64_t cut_restarts = 0, cut_gap = 0, cut_motion = 0;
+    uint64_t jitter_p_scan_cached = 0, jitter_p_scan_solved = 0; // standalone-P search: skipped blocks / solver calls
+    uint64_t gap_bridged = 0; // same-epoch acquisition gaps longer than 4 frames kept without a restart
     char recent_cuts[240] = {};
     uint64_t camera_from_j1 = 0;
     uint64_t jitter_extent_rescaled = 0; // the render extent changed after J1 jittered this frame: sample rescaled // the scene list held no camera; J1's camera of this same frame (with its jitter) was used
@@ -318,7 +330,27 @@ struct Stats {
     // Render-small: frames whose depth + motion were kept for Present; pictures DLSS upscaled at
     // Present / stretched (no fresh depth + motion) / not produced (the presenter kept its old one).
     uint64_t small_deferred = 0, small_dlss = 0, small_stretched = 0, small_failed = 0, small_dlss_failed = 0, small_sharpened = 0, small_hud = 0, small_hud_layer = 0;
+    // HUD protection fallback (screen-fixed map learned during movement; 2026-11-04): frames it
+    // ran, frames it was applied (zero motion + DLSS current-colour bias + NIS HUD pixels), frames
+    // learned only (coverage above 30 %: not applied), and the last completed frame's mask pixels,
+    // detailed moving pixels tested and mask coverage in permille of the picture.
+    uint64_t hud_fb_frames = 0, hud_fb_applied = 0, hud_fb_learn_only = 0;
+    uint32_t hud_fb_mask_px = 0, hud_fb_tested_px = 0, hud_fb_cover_permille = 0;
     uint32_t small_rw = 0, small_rh = 0, small_ow = 0, small_oh = 0;
+    // I1.4: frames whose depth + motion came from the Present-time source (the in-frame detector
+    // missed); attempts it refused, and why last; selected-depth clears recorded in the last frame.
+    uint64_t small_present_source = 0, small_present_refused = 0;
+    // Jitter witness (render-small): frames tested, the last 60-frame window's pixel counts, how
+    // often jitter was found not to reach the picture (then off until a re-test), and whether off now.
+    uint64_t witness_frames = 0, witness_windows = 0, witness_tested = 0, witness_unshifted = 0, witness_shifted = 0;
+    uint64_t jitter_unseen_count = 0, jitter_retests = 0;
+    bool jitter_unseen = false;
+    uint32_t depth_clears_last = 0;
+    char small_present_why[96] = {};
+    // Size observation independent of evaluation (COMMS 4bd474c I1.1): the selected scene colour's
+    // size whenever a submitted list wrote it, and the frame it was written in (frame = current).
+    uint32_t seen_scene_w = 0, seen_scene_h = 0;
+    uint64_t seen_scene_frame = 0, frame_now = 0;
     char small_note[128] = {};
     uint64_t window_derived_forward = 0, window_derived_inverse = 0; // camera-derived matrices rebased (see window_derived)
     char window_derived_note[160] = {};

@@ -120,6 +120,43 @@ void Store(uint8_t* dst, const M& m)
 {
     for (int i = 0; i < 16; ++i) { const float f = static_cast<float>(m[i]); std::memcpy(dst + i * 4, &f, 4); }
 }
+// Test-only GPU consumer/readback. It observes the lens at this submission,
+// before a later camera upload could repair it and conceal the mismatch.
+int ProjectionShift(test::Device& d, ID3D12Resource* lens, UINT w, UINT h, bool column, float shift[2])
+{
+    const na::observe::HostWorkScope host;
+    auto* dev = d.device.Get();
+    D3D12_ROOT_PARAMETER params[2]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    D3D12_ROOT_SIGNATURE_DESC rd{2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    test::ComPtr<ID3DBlob> blob, err, cs;
+    REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err)));
+    test::ComPtr<ID3D12RootSignature> root;
+    REQUIRE(SUCCEEDED(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root))));
+    const std::string source = std::string("cbuffer Lens:register(b0){float4 pad;") +
+        (column ? "column_major" : "row_major") + " float4x4 P;}"
+        "RWByteAddressBuffer result:register(u0);[numthreads(1,1,1)]void CS(){"
+        "float4 p=mul(P,float4(0,0,1,1));result.Store2(0,asuint(p.xy/p.w*float2(" +
+        std::to_string(float(w) / 2.f) + "," + std::to_string(-float(h) / 2.f) + ")));}";
+    REQUIRE(SUCCEEDED(D3DCompile(source.data(), source.size(), nullptr, nullptr, nullptr, "CS", "cs_5_0", 0, 0, &cs, &err)));
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{}; pd.pRootSignature = root.Get();
+    pd.CS = {cs->GetBufferPointer(), cs->GetBufferSize()}; test::ComPtr<ID3D12PipelineState> pipeline;
+    REQUIRE(SUCCEEDED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pipeline))));
+    auto result = test::CreateBuffer(dev, 8, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto rb = test::CreateBuffer(dev, 8, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    REQUIRE(result && rb); test::List check; REQUIRE(check.Create(dev));
+    check.list->SetComputeRootSignature(root.Get()); check.list->SetPipelineState(pipeline.Get());
+    check.list->SetComputeRootConstantBufferView(0, lens->GetGPUVirtualAddress());
+    check.list->SetComputeRootUnorderedAccessView(1, result->GetGPUVirtualAddress()); check.list->Dispatch(1, 1, 1);
+    auto barrier = test::Transition(result.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    check.list->ResourceBarrier(1, &barrier); check.list->CopyBufferRegion(rb.Get(), 0, result.Get(), 0, 8);
+    REQUIRE(SUCCEEDED(check.list->Close())); ID3D12CommandList* lists[] = {check.list.Get()};
+    d.queue->ExecuteCommandLists(1, lists); d.WaitIdle();
+    void* p = nullptr; REQUIRE(SUCCEEDED(rb->Map(0, nullptr, &p)));
+    std::memcpy(shift, p, 8); rb->Unmap(0, nullptr);
+    return 0;
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -138,6 +175,10 @@ int main(int argc, char** argv)
     // --split: the scene is drawn across two submissions per frame (Sniper Elite
     // Resistance); DLAA must follow the second one, before the post pass.
     const bool split = argc > 3 && std::strcmp(argv[3], "--split") == 0;
+    const bool early_component = argc > 3 && std::strcmp(argv[3], "--jitter-early-component") == 0;
+    const bool column_component = argc > 3 && std::strcmp(argv[3], "--jitter-column-component") == 0;
+    const bool component_test = early_component || column_component || (argc > 3 && std::strcmp(argv[3], "--jitter-component") == 0);
+    const bool alias_test = argc > 3 && std::strcmp(argv[3], "--camera-alias") == 0;
     // --inline: the scene and its post-processing are recorded in ONE command list
     // (Sniper Elite Resistance); DLAA must be recorded inside it, before the post
     // pass binds the colour for reading, and the game's state handed back.
@@ -214,7 +255,7 @@ int main(int argc, char** argv)
     REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvh))));
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
     REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dsvh))));
-    D3D12_DESCRIPTOR_HEAP_DESC chd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    D3D12_DESCRIPTOR_HEAP_DESC chd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&chd, IID_PPV_ARGS(&cbvh))));
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvh->GetCPUDescriptorHandleForHeapStart(), dsv = dsvh->GetCPUDescriptorHandleForHeapStart();
     D3D12_RENDER_TARGET_VIEW_DESC rvd{};
@@ -245,6 +286,14 @@ int main(int argc, char** argv)
     constexpr uint32_t kBlock = 1024, kVp = 336;
     D3D12_CONSTANT_BUFFER_VIEW_DESC cv{cb->GetGPUVirtualAddress() + kBlock, 768};
     dev->CreateConstantBufferView(&cv, cbvh->GetCPUDescriptorHandleForHeapStart());
+    auto short_cpu = cbvh->GetCPUDescriptorHandleForHeapStart();
+    auto short_gpu = cbvh->GetGPUDescriptorHandleForHeapStart();
+    const UINT cbv_step = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    short_cpu.ptr += cbv_step; short_gpu.ptr += cbv_step;
+    auto short_cv = cv; short_cv.SizeInBytes = 256; dev->CreateConstantBufferView(&short_cv, short_cpu);
+    auto lens = test::CreateBuffer(dev, 256, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    REQUIRE(lens); uint8_t* lens_cpu = nullptr;
+    REQUIRE(SUCCEEDED(lens->Map(0, nullptr, reinterpret_cast<void**>(&lens_cpu))));
     test::ComPtr<ID3D12RootSignature> rs;
     {
         D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0, 0, 0};
@@ -370,7 +419,7 @@ int main(int argc, char** argv)
             na::observe::SetSamplerMipBiasLiveEnabled(false);
         }
         {
-            // Render-small levels per DLSS mode (Q -1.585, B -2, P -2.5); only the wanted
+            // Render-small levels per DLSS mode (Q -1.585, B -2, P -2.25 since Cort 2026-11-04); only the wanted
             // levels are chosen (Light -0.5 is not wanted, so -0.6 picks -1).
             const float wanted[4] = {-1.0f, na::j2::SmallMipBias(-1.0f, 1.0f / 1.5f), na::j2::SmallMipBias(-1.0f, 1.0f / 1.72f),
                                      na::j2::SmallMipBias(-1.0f, 0.5f)};
@@ -380,7 +429,16 @@ int main(int argc, char** argv)
             na::observe::SetSamplerMipBiasLive(wanted[2]);
             CHECK(na::observe::SamplerMipBias() == -2.0f);
             na::observe::SetSamplerMipBiasLive(wanted[3]);
-            CHECK(na::observe::SamplerMipBias() == -2.5f);
+            CHECK(na::observe::SamplerMipBias() == -2.25f);
+            // Automatic preset (Cort 2026-11-04): L for DLAA/Quality, M for Balanced/Performance;
+            // explicit presets apply in every mode.
+            CHECK(na::j2::PresetFor(na::j2::kPresetAuto, 3440, 3440) == 12u);
+            CHECK(na::j2::PresetFor(na::j2::kPresetAuto, 2293, 3440) == 12u);
+            CHECK(na::j2::PresetFor(na::j2::kPresetAuto, 2000, 3440) == 13u);
+            CHECK(na::j2::PresetFor(na::j2::kPresetAuto, 1720, 3440) == 13u);
+            CHECK(na::j2::PresetFor(12u, 1720, 3440) == 12u);
+            CHECK(na::j2::PresetFor(11u, 3440, 3440) == 11u);
+            CHECK(na::j2::PresetFor(0u, 1720, 3440) == 0u);
             na::observe::SetSamplerMipBiasLive(-0.6f);
             CHECK(na::observe::SamplerMipBias() == -1.0f);
             const float classic[3] = {0.0f, -0.5f, -1.0f};
@@ -484,8 +542,9 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
     REQUIRE(SUCCEEDED(cb->Map(0, nullptr, reinterpret_cast<void**>(&cpu))) && cpu);
 
     // An earlier submission leaves colour in RENDER_TARGET and depth in DEPTH_WRITE.
-    test::List setup, scene, consumer, prepass, scene2;
-    REQUIRE(setup.Create(dev) && scene.Create(dev) && consumer.Create(dev) && prepass.Create(dev) && scene2.Create(dev));
+    test::List setup, scene, consumer, prepass, scene2, lens_prepass;
+    REQUIRE(setup.Create(dev) && scene.Create(dev) && consumer.Create(dev) && prepass.Create(dev) && scene2.Create(dev) && lens_prepass.Create(dev));
+    REQUIRE(SUCCEEDED(lens_prepass.list->Close()));
     REQUIRE(SUCCEEDED(scene2.list->Close()));
     REQUIRE(SUCCEEDED(setup.list->Close()));
     {
@@ -547,6 +606,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
     }
     if(entry_test)na::j2::SetDebugView(3); // Native NGX is real; known post-NGX depth picture witnesses state handoff.
     int frame_no = 0;
+    float early_shift[2]{};
     unsigned entry_delivered=0,entry_checks=0;
     const auto frame = [&](double cam_x, bool unpatched_prepass = false) {
         // Copy case: every 4th frame the LAST scene write comes from a different pipeline
@@ -579,6 +639,10 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         Store(cpu + kBlock + kVp + 192, Proj()); // the camera's own projection, in the same block
         Store(cpu + kPre + kVp, vp); // the pre-pass's own copy of the camera
         Store(cpu + kPre + kVp + 128, inv);
+        std::memset(lens_cpu, 0, 256);
+        M lens_p = Proj();
+        if (column_component) for (int r = 0; r < 4; ++r) for (int c = r + 1; c < 4; ++c) std::swap(lens_p[r * 4 + c], lens_p[c * 4 + r]);
+        Store(lens_cpu + 16, lens_p);
         prepass.Reset(); // earlier batch: depth only, its own root signature
         prepass.list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
         prepass.list->SetGraphicsRootSignature(rs_pre.Get());
@@ -593,6 +657,15 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                 Store(cpu + kPre + kVp, vp);
             }
         }
+        if (early_component) {
+            lens_prepass.Reset();
+            lens_prepass.list->SetGraphicsRootSignature(rs_pre.Get());
+            lens_prepass.list->SetGraphicsRootConstantBufferView(0, lens->GetGPUVirtualAddress());
+            REQUIRE(SUCCEEDED(lens_prepass.list->Close()));
+            ID3D12CommandList* work[] = {lens_prepass.list.Get()};
+            Submit(q, 1, work, true);
+            REQUIRE(ProjectionShift(d, lens.Get(), W, H, false, early_shift) == 0);
+        }
         scene.Reset(); // no colour/depth transitions in the scene list: carried state
         scene.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
         const float clear[4] = {0.2f, 0.3f, 0.4f, 1};
@@ -600,7 +673,13 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         if(!entry_test)scene.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
         ID3D12DescriptorHeap* heaps[] = {cbvh.Get()};
         scene.list->SetDescriptorHeaps(1, heaps);
+        if (component_test) {
+            // A separate root/layout consumes the exact same lens, without a VP beside it.
+            scene.list->SetGraphicsRootSignature(rs_pre.Get());
+            scene.list->SetGraphicsRootConstantBufferView(0, lens->GetGPUVirtualAddress());
+        }
         scene.list->SetGraphicsRootSignature(rs.Get());
+        if (alias_test) scene.list->SetGraphicsRootDescriptorTable(0, short_gpu);
         for (int i = 0; i < 3; ++i) scene.list->SetGraphicsRootDescriptorTable(0, cbvh->GetGPUDescriptorHandleForHeapStart());
         if (inline_list) { // ...then, in the SAME list, post-processing reads the colour
             D3D12_RESOURCE_BARRIER rd2 = test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -911,6 +990,16 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
     CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
     const double jx = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_X), jy = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_Y);
     CHECK((jx != 0.0 || jy != 0.0) && std::fabs(jx) < 0.5 && std::fabs(jy) < 0.5);
+    if (component_test) {
+        float shift[2]{};
+        REQUIRE(ProjectionShift(d, lens.Get(), W, H, column_component, shift) == 0);
+        std::printf("standalone GPU projection shift=(%.6f,%.6f), NGX jitter=(%.6f,%.6f)\n", shift[0], shift[1], jx, jy);
+        CHECK(std::fabs(shift[0] - jx) < 1e-5 && std::fabs(shift[1] - jy) < 1e-5);
+        if (early_component) {
+            std::printf("earlier GPU projection shift=(%.6f,%.6f)\n", early_shift[0], early_shift[1]);
+            CHECK(std::fabs(early_shift[0] - jx) < 1e-5 && std::fabs(early_shift[1] - jy) < 1e-5);
+        }
+    }
     }
     {
         uint8_t orig[64];

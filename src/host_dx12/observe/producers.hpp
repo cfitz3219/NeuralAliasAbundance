@@ -124,6 +124,12 @@ bool ListReferences(ID3D12CommandList* list, na_object_id id);            // the
 // The CBVs currently bound for graphics (the latest binding of each root parameter / table slot), at
 // record time; for a draw hook. Returns the count written (at most `max`).
 uint32_t ListCurrentGraphicsCbvs(ID3D12CommandList* list, LiveBinding* out, uint32_t max);
+// The textures the current graphics descriptor tables expose as SRVs, at record time (for a draw
+// hook): distinct resource ids, at most `max`. Root SRVs and bindless heaps are not included.
+// incomplete (optional): set when the answer may miss textures: a range wider than the 1024
+// descriptors walked (incl. unbounded), `max` reached, or a table on an unknown heap (Astra
+// 20cddb8 H1b point 2: never infer a unique source from an incomplete prefix).
+uint32_t ListCurrentGraphicsSrvs(ID3D12CommandList* list, na_object_id* out, uint32_t max, bool* incomplete = nullptr);
 // True when the recording bound `color` as a render target together with `depth` as its depth target.
 bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id depth);
 // Inline insertion (J2). Called on the recording thread before a draw/dispatch uses
@@ -285,6 +291,8 @@ ID3D12Resource* AcquireResource(na_object_id id);                         // Add
 // Current discovery picks (written by the discovery adapter, read by J2).
 void SetLiveSelection(uint64_t depth, uint64_t color);
 void GetLiveSelection(uint64_t* depth, uint64_t* color);
+// Changes whenever the published depth/colour pair changes.
+uint64_t LiveSelectionVersion();
 
 // Buffer GPU VA -> (resource id, offset). False when unknown or ambiguous.
 bool ResolveGpuVa(uint64_t va, na_object_id* resource, uint64_t* offset);

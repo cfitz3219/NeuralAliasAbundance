@@ -42,6 +42,7 @@ struct Consumer {
     uint64_t saved_bytes{};
     uint64_t session{},epoch{},batches{},events{},malformed{},submissions{},presents{},snapshots{},matrices{},samples{},last_log{},last_sample{},last_pick{};
     uint64_t live_depth{},live_color{},pick_challenger{}; unsigned pick_streak{}; // J2 pick hysteresis
+    na::discovery::DepthPick pick; uint64_t pick_events{}; // depth role from accumulated frames
     bool overflow{}; unsigned reports{};
     uint64_t draws{}, binds{}, unresolved_views{}, captured_snapshots{}, truncated_snapshots{}, unmapped_snapshots{}, gpu_snapshots{}, matrix_scans{};
     // P4-4 Stage M ([stage_m] map=1): read-only pass maps of single frames, own log file.
@@ -93,11 +94,20 @@ void PublishLivePicks(Consumer& c) {
     // colour target, only those compete (a lit scene is HDR; albedo is not);
     // equal tickets are decided by the stronger pairing; and a published pick
     // is kept until a different answer has persisted for 2 s (8 publications).
+    // 2026-11-04: the depth role comes from every completed frame's top depth in a recent
+    // window (scene_pick.hpp), not from this one snapshot. SE5 lost the scene pass from one
+    // frame in ~9, which cleared the pick for a whole publication (~11 stretched frames).
     const auto d=c.heuristics.RankDepth(1);
-    const uint64_t depth=!d.empty() && d[0].score>0 ? d[0].resource : 0;
+    const uint64_t raw=!d.empty() && d[0].score>0 ? d[0].resource : 0;
+    const uint64_t before=c.pick.depth;
+    const auto why=c.pick.Publish(c.heuristics.RecentTopDepths(),!c.pick.depth || !c.heuristics.Retired(c.pick.depth));
+    const uint64_t depth=c.pick.depth;
     uint64_t color=0;
-    if(depth) {
-        const auto ks=c.heuristics.RankSceneColor(8);
+    // Colour is ranked against the published depth, and only from a snapshot that drew with it
+    // (a snapshot without the scene pass says nothing about the scene colour).
+    const bool colour_evidence=depth && c.heuristics.ScoredUses(depth);
+    if(colour_evidence) {
+        const auto ks=c.heuristics.RankSceneColor(8,depth);
         const auto is_float=[](uint32_t f){return f==2||f==10||f==26;}; // RGBA32F, RGBA16F, R11G11B10F
         uint64_t strongest=0;
         bool any_float=false;
@@ -113,15 +123,34 @@ void PublishLivePicks(Consumer& c) {
         }
     }
     constexpr unsigned kSwitchAfter=8; // publications (250 ms each)
-    if(depth!=c.live_depth || !c.live_color) {
-        c.live_depth=depth;c.live_color=color;c.pick_streak=0;c.pick_challenger=0; // first pick or new depth: immediate
-    } else if(color!=c.live_color) {
+    if(!depth) {
+        c.live_depth=0;c.live_color=0;c.pick_streak=0;c.pick_challenger=0;
+    } else if(depth!=c.live_depth || !c.live_color) {
+        // new depth role (or no colour yet): take this snapshot's colour; without colour evidence wait
+        if(depth!=c.live_depth) {c.live_color=0;}
+        c.live_depth=depth;
+        if(colour_evidence && color) c.live_color=color;
+        c.pick_streak=0;c.pick_challenger=0;
+    } else if(colour_evidence && color!=c.live_color) {
         // A different answer (including the current pick no longer qualifying) must persist.
         const uint64_t challenger=color;
         if(challenger==c.pick_challenger) ++c.pick_streak; else {c.pick_challenger=challenger;c.pick_streak=1;}
         if(c.pick_streak>=kSwitchAfter) {c.live_color=color;c.pick_streak=0;c.pick_challenger=0;}
-    } else {
+    } else if(colour_evidence) {
         c.pick_streak=0;c.pick_challenger=0;
+    }
+    // Raw vs published, at the publication boundary only (no per-draw log). A snapshot whose
+    // ranking disagrees with the published pick is the event that used to stretch frames.
+    if(c.log && (raw!=depth || depth!=before || why!=na::discovery::PickReason::kept)) {
+        ++c.pick_events;
+        if(c.pick_events<=2000) {
+            const auto& p=c.pick;
+            std::fprintf(c.log,"{\"type\":\"scene_pick\",\"raw_depth\":%llu,\"raw_score\":%.6g,\"published_depth\":%llu,\"previous_depth\":%llu,\"published_color\":%llu,\"reason\":\"%s\",\"window_frames\":%zu,\"leader\":%llu,\"leader_frames\":%zu,\"published_frames\":%zu,\"challenger_streak\":%u,\"absent_streak\":%u,\"snapshot_draws\":%llu,\"snapshot_depths\":%zu,\"snapshot_has_published\":%s,\"frames_without_depth\":%llu}\n",
+                (unsigned long long)raw,d.empty()?0.0:d[0].score,(unsigned long long)depth,(unsigned long long)before,(unsigned long long)c.live_color,
+                na::discovery::PickReasonName(why),p.frames,(unsigned long long)p.leader,p.leader_n,p.current_n,p.challenger_streak,p.absent_streak,
+                (unsigned long long)c.heuristics.ScoredDraws(),c.heuristics.ScoredDepthCount(),colour_evidence?"true":"false",
+                (unsigned long long)c.heuristics.FramesWithoutDepth());
+        }
     }
     na::observe::SetLiveSelection(c.live_depth,c.live_depth?c.live_color:0);
 }

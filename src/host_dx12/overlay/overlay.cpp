@@ -1,5 +1,7 @@
 #include "host_dx12/host_boot/process_log.hpp"
 #include "host_dx12/native_present/size_spoof.hpp"
+#include "host_dx12/native_present/size_probe.hpp"
+#include "host_dx12/native_present/size_controller.hpp"
 #include "host_dx12/native_present/input_map.hpp"
 #include <intrin.h>
 #include <algorithm>
@@ -75,6 +77,7 @@ constexpr uint32_t kSwapReleaseSlot = 2;          // IUnknown::Release on the sw
 constexpr uint32_t kSwapPresentSlot = 8;
 constexpr uint32_t kSwapGetBufferSlot = 9;        // IDXGISwapChain::GetBuffer (A59 presenter)
 constexpr uint32_t kSwapResizeBuffersSlot = 13;
+constexpr uint32_t kSwapResizeTargetSlot = 14;
 constexpr uint32_t kSwap1Present1Slot = 22;
 constexpr uint32_t kSwapGetDescSlot = 12;   // IDXGISwapChain::GetDesc (render-small size spoof)
 constexpr uint32_t kSwap1GetDesc1Slot = 18; // IDXGISwapChain1::GetDesc1
@@ -98,6 +101,7 @@ using Present1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT,
                                                const DXGI_PRESENT_PARAMETERS*);
 using ResizeFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT, UINT,
                                              DXGI_FORMAT, UINT);
+using ResizeTargetFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, const DXGI_MODE_DESC*);
 using Resize1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain3*, UINT, UINT, UINT, DXGI_FORMAT, UINT,
                                               const UINT*, IUnknown* const*);
 using GetBufferFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, REFIID, void**);
@@ -116,6 +120,7 @@ std::atomic<uint32_t> g_chain_gone{0};       // A71: chains observed destroyed (
 PresentFn g_orig_present = nullptr;
 Present1Fn g_orig_present1 = nullptr;
 ResizeFn g_orig_resize = nullptr;
+ResizeTargetFn g_orig_resize_target = nullptr;
 Resize1Fn g_orig_resize1 = nullptr;
 GetBufferFn g_orig_get_buffer = nullptr;
 GetIndexFn g_orig_get_index = nullptr;
@@ -898,23 +903,51 @@ void write_status_line()
             const int size_n = snprintf(size_line, sizeof size_line, "%s\r\n%s\r\n", size_text, input_text);
             if (size_n > 0) WriteFile(f, size_line, DWORD((std::min)(size_n, int(sizeof size_line - 1))), &written, nullptr);
         }
+        if (na::native_present::SizeProbeInstalled()) { // read-only size-query probe ([present] size_probe=1)
+            char probe[2400] = {};
+            na::native_present::FormatSizeProbe(probe, sizeof probe - 2);
+            const size_t probe_n = std::strlen(probe);
+            if (probe_n) { probe[probe_n] = '\r'; probe[probe_n + 1] = '\n'; WriteFile(f, probe, DWORD(probe_n + 2), &written, nullptr); }
+        }
         if (na::j2::RenderSmall()) { // P4-4 render-small: one line per status write
             const auto ps = na::present::GetStats();
-            char sl[640];
+            char sl[900];
             const int sn = snprintf(sl, sizeof sl,
-                "native_present mode=%u scale=%.3f proxies=%ux%u native=%ux%u scene=%ux%u deferred=%llu dlss=%llu stretched=%llu failed=%llu dlss_refused=%llu sharpened=%llu sharpness=%u hud_nis_frames=%llu hud_nis=%u presenter_upscaled=%llu presenter_kept_old=%llu dlss_in=%ux%u dlss_out=%ux%u jitter_phases=%u mip_bias=%.2f note=\"%s\"\r\n",
+                "native_present mode=%u scale=%.3f proxies=%ux%u native=%ux%u scene=%ux%u deferred=%llu dlss=%llu stretched=%llu failed=%llu dlss_refused=%llu sharpened=%llu sharpness=%u hud_nis_frames=%llu hud_nis=%u presenter_upscaled=%llu presenter_kept_old=%llu dlss_in=%ux%u dlss_out=%ux%u jitter_phases=%u mip_bias=%.2f present_source=%llu present_refused=%llu depth_clears=%u present_why=\"%s\" note=\"%s\"\r\n",
                 na::settings::Get().j2_scale_mode.load(), na::present::RenderScale(), ps.scaled_w, ps.scaled_h, ps.native_w, ps.native_h,
                 j2.width, j2.height, (unsigned long long)j2.small_deferred, (unsigned long long)j2.small_dlss,
                 (unsigned long long)j2.small_stretched, (unsigned long long)j2.small_failed, (unsigned long long)j2.small_dlss_failed,
                 (unsigned long long)j2.small_sharpened, na::settings::Get().j2_sharpness.load(),
                 (unsigned long long)j2.small_hud, na::settings::Get().j2_hud_nis.load(),
                 (unsigned long long)ps.upscaled, (unsigned long long)ps.upscale_failed, j2.small_rw, j2.small_rh, j2.small_ow, j2.small_oh,
-                j2.jitter_phases, na::observe::SamplerMipBias(), j2.small_note);
+                j2.jitter_phases, na::observe::SamplerMipBias(), (unsigned long long)j2.small_present_source,
+                (unsigned long long)j2.small_present_refused, j2.depth_clears_last, j2.small_present_why, j2.small_note);
             if (sn > 0) WriteFile(f, sl, DWORD((std::min)(sn, int(sizeof sl - 1))), &written, nullptr);
+            {
+                char wl[320];
+                const int wn = snprintf(wl, sizeof wl,
+                    "jitter_witness frames=%llu windows=%llu last_window{tested=%llu unshifted=%llu shifted=%llu} unseen_now=%u unseen_count=%llu retests=%llu\r\n",
+                    (unsigned long long)j2.witness_frames, (unsigned long long)j2.witness_windows, (unsigned long long)j2.witness_tested,
+                    (unsigned long long)j2.witness_unshifted, (unsigned long long)j2.witness_shifted, j2.jitter_unseen ? 1u : 0u,
+                    (unsigned long long)j2.jitter_unseen_count, (unsigned long long)j2.jitter_retests);
+                if (wn > 0) WriteFile(f, wl, DWORD((std::min)(wn, int(sizeof wl - 1))), &written, nullptr);
+            }
+            {
+                char hl[320];
+                const int hn = snprintf(hl, sizeof hl,
+                    "hud_fallback on=%u frames=%llu applied=%llu learn_only=%llu last{mask_px=%u tested_px=%u cover_permille=%u}\r\n",
+                    na::j2::HudMaskEnabled() ? 1u : 0u, (unsigned long long)j2.hud_fb_frames, (unsigned long long)j2.hud_fb_applied,
+                    (unsigned long long)j2.hud_fb_learn_only, j2.hud_fb_mask_px, j2.hud_fb_tested_px, j2.hud_fb_cover_permille);
+                if (hn > 0) WriteFile(f, hl, DWORD((std::min)(hn, int(sizeof hl - 1))), &written, nullptr);
+            }
             const std::string hud = na::j2::native_hud::StatusLine() + " composited=" + std::to_string(j2.small_hud_layer) +
                 " chain_fmt=" + std::to_string(g_presented_format.load(std::memory_order_relaxed)) +
                 " color_space=" + std::to_string(g_color_space.load(std::memory_order_acquire)) + "\r\n";
             WriteFile(f, hud.data(), DWORD(hud.size()), &written, nullptr);
+            {
+                const std::string trace = na::j2::native_hud::TakeTrace();
+                if (!trace.empty()) WriteFile(f, trace.data(), DWORD(trace.size()), &written, nullptr);
+            }
         }
         {
             const auto automatic=na::scale::GetAutomaticSceneStats();
@@ -1020,10 +1053,19 @@ void write_status_line()
         }
         {   // Why DLSS history restarted (Cort: a blink every ~30 s while standing still).
             char cl2[400];
-            const int cn2 = snprintf(cl2, sizeof cl2, "j2_cuts restarts=%llu gap=%llu motion=%llu now=%llu recent=%s\r\n",
-                (unsigned long long)j2.cut_restarts, (unsigned long long)j2.cut_gap, (unsigned long long)j2.cut_motion,
+            const int cn2 = snprintf(cl2, sizeof cl2, "j2_cuts restarts=%llu gap=%llu motion=%llu bridged=%llu now=%llu recent=%s\r\n",
+                (unsigned long long)j2.cut_restarts, (unsigned long long)j2.cut_gap, (unsigned long long)j2.cut_motion, (unsigned long long)j2.gap_bridged,
                 (unsigned long long)(GetTickCount64() / 100 % 100000000), j2.recent_cuts);
             if (cn2 > 0) WriteFile(f, cl2, static_cast<DWORD>((std::min)(cn2, static_cast<int>(sizeof(cl2) - 1))), &written, nullptr);
+            {
+                const char* eff = na::settings::EffectiveSummary();
+                if (eff && eff[0]) { WriteFile(f, eff, static_cast<DWORD>(std::strlen(eff)), &written, nullptr); WriteFile(f, "\r\n", 2, &written, nullptr); }
+            }
+            // aca551b cost: standalone-projection search (cached = blocks skipped, solved = solver windows) and J1 CPU per frame.
+            const int psn = snprintf(cl2, sizeof cl2, "j2_pscan cached=%llu solved=%llu cpu_us_per_frame=%.1f cpu_max_us=%llu\r\n",
+                (unsigned long long)j2.jitter_p_scan_cached, (unsigned long long)j2.jitter_p_scan_solved,
+                j2.frames ? double(j2.jitter_cpu_us) / double(j2.frames) : 0.0, (unsigned long long)j2.jitter_cpu_max_us);
+            if (psn > 0) WriteFile(f, cl2, static_cast<DWORD>((std::min)(psn, static_cast<int>(sizeof(cl2) - 1))), &written, nullptr);
         }
         {   // Frames whose DLAA ran before the last scene draw (SE5 pan-only flicker): placement + late writer.
             char ll[1000];
@@ -1104,8 +1146,9 @@ void write_status_line()
             }
             if (cs.requested) {
                 char cl[300];
-                const int nc2 = snprintf(cl, sizeof cl, "j2_capture requested=%u recorded=%u submitted=%u written=%u busy=%u discarded=%u retired=%u no_present=%u errors=%u dir=\"%S\"\r\n",
+                const int nc2 = snprintf(cl, sizeof cl, "j2_capture requested=%u recorded=%u submitted=%u written=%u busy=%u discarded=%u retired=%u no_present=%u errors=%u triggers=%u extra_skipped=%u dir=\"%S\"\r\n",
                     cs.requested, cs.recorded, cs.submitted, cs.written, cs.dropped_busy, cs.discarded, cs.retired, cs.without_present, cs.errors,
+                    cs.triggers, cs.extra_skipped,
                     na::capture::j2::Directory());
                 if (nc2 > 0) WriteFile(f, cl, static_cast<DWORD>((std::min)(nc2, static_cast<int>(sizeof cl - 1))), &written, nullptr);
             }
@@ -1466,13 +1509,23 @@ UINT64 menu_completed_prefix() {
 void write_menu_progress(HANDLE log)
 {
     const auto cf=na::j2::compute_flow::GetStats();char cfline[950];DWORD cfw=0;
-    const int cfn=snprintf(cfline,sizeof cfline,"j2compute engine=amd recorded=%llu submitted=%llu pairs=%llu busy=%llu accepted=%llu total=%llu ms=%.3f reason=\"%s\" attempts=%llu paired_submissions=%llu unavailable=%llu history_only=%llu last_frame=%llu submit_age_ms=%llu sample_frame=%llu sample_age_ms=%llu samples=%llu excluded{invalid=%llu small=%llu cost=%llu offscreen=%llu image=%llu flicker=%llu} pool{recordings=%u images=%u} flow_loosen=%u\r\n",
+    const int cfn=snprintf(cfline,sizeof cfline,"j2compute engine=amd recorded=%llu submitted=%llu pairs=%llu busy=%llu accepted=%llu total=%llu ms=%.3f reason=\"%s\" attempts=%llu paired_submissions=%llu unavailable=%llu history_only=%llu last_frame=%llu submit_age_ms=%llu sample_frame=%llu sample_age_ms=%llu samples=%llu excluded{invalid=%llu small=%llu cost=%llu offscreen=%llu image=%llu flicker=%llu} pool{recordings=%u images=%u} flow_loosen=%u sum{pairs=%llu accepted=%llu invalid=%llu small=%llu cost=%llu offscreen=%llu image=%llu flicker=%llu}\r\n",
         static_cast<unsigned long long>(cf.recorded),static_cast<unsigned long long>(cf.submitted),static_cast<unsigned long long>(cf.pairs),
         static_cast<unsigned long long>(cf.busy),static_cast<unsigned long long>(cf.accepted),static_cast<unsigned long long>(cf.total),cf.ms,cf.reason,
         (unsigned long long)cf.attempts,(unsigned long long)cf.submitted_pairs,(unsigned long long)cf.unavailable,(unsigned long long)cf.waiting_history,
         (unsigned long long)cf.last_submitted_frame,(unsigned long long)cf.submit_age_ms,(unsigned long long)cf.sample_frame,(unsigned long long)cf.sample_age_ms,(unsigned long long)cf.samples,
-        (unsigned long long)cf.rejected_invalid,(unsigned long long)cf.rejected_small,(unsigned long long)cf.rejected_cost,(unsigned long long)cf.rejected_offscreen,(unsigned long long)cf.rejected_image,(unsigned long long)cf.rejected_flicker,cf.recording_slots,cf.image_slots,cf.loosen);
+        (unsigned long long)cf.rejected_invalid,(unsigned long long)cf.rejected_small,(unsigned long long)cf.rejected_cost,(unsigned long long)cf.rejected_offscreen,(unsigned long long)cf.rejected_image,(unsigned long long)cf.rejected_flicker,cf.recording_slots,cf.image_slots,cf.loosen,
+        (unsigned long long)cf.sum_pairs,(unsigned long long)cf.sum[0],(unsigned long long)cf.sum[1],(unsigned long long)cf.sum[2],(unsigned long long)cf.sum[3],
+        (unsigned long long)cf.sum[4],(unsigned long long)cf.sum[5],(unsigned long long)cf.sum[6]);
     if(cfn>0)WriteFile(log,cfline,(std::min)(DWORD(cfn),DWORD(sizeof(cfline)-1)),&cfw,nullptr);
+    {char fl[700];DWORD fw=0;const double acc=cf.fit_accepted?1.0/double(cf.fit_accepted):0.0;
+        const int fn=snprintf(fl,sizeof fl,"j2camfit recorded=%llu collected=%llu accepted=%llu flow_passed=%llu rejected_jitter=%llu rejected_image=%llu fit_only=%llu reconstruct=%d reconstruct_frames=%llu accepted_e0_mean=%.4f accepted_e_mean=%.4f last{accepted=%d e0=%.4f e0_jitter=%.4f n0=%u e=%.4f n=%u t=[%.5f %.5f %.5f] r=[%.6f %.6f %.6f] image{tested=%u better=%u worse=%u e_fit=%.4f e_cam=%.4f regions=%u good=%u}}\r\n",
+            (unsigned long long)cf.fit_recorded,(unsigned long long)cf.fit_collected,(unsigned long long)cf.fit_accepted,
+            (unsigned long long)cf.fit_flow_passed,(unsigned long long)cf.fit_rejected_jitter,(unsigned long long)cf.fit_rejected_image,(unsigned long long)cf.fit_only,
+            cf.camera_reconstruct?1:0,(unsigned long long)cf.reconstruct_frames,cf.fit_e0_sum*acc,cf.fit_e_sum*acc,
+            cf.fit_last_accepted?1:0,cf.fit_e0,cf.fit_e_alt,cf.fit_n0,cf.fit_e,cf.fit_n,cf.fit_theta[0],cf.fit_theta[1],cf.fit_theta[2],cf.fit_theta[3],cf.fit_theta[4],cf.fit_theta[5],
+            cf.fit_photo_tested,cf.fit_photo_better,cf.fit_photo_worse,cf.fit_photo_e_fit,cf.fit_photo_e_cam,cf.fit_photo_regions,cf.fit_photo_good);
+        if(fn>0)WriteFile(log,fl,(std::min)(DWORD(fn),DWORD(sizeof(fl)-1)),&fw,nullptr);}
     auto ps = na::present::GetStats();
     char p_line[256];
     int pn = snprintf(p_line, sizeof(p_line), "present_gpu submitted=%llu completed=%llu owned=%u device_hr=0x%08lX queried_latency_handle=0x%llX\r\n",
@@ -2566,6 +2619,14 @@ void process_frame(ID3D12CommandQueue* queue, ID3D12Resource* frame)
             auto_armed = true;
             na::capture::j2::RequestTimestamped(na::settings::Get().j2_capture_frames.load(), after * 1000u);
         }
+        {
+            static bool auto_set = false;
+            if (!auto_set) {
+                auto_set = true;
+                const uint32_t n = na::settings::Get().j2_capture_auto.load(std::memory_order_relaxed);
+                na::capture::j2::SetAutoTrigger(n != 0, n, na::settings::Get().j2_capture_cooldown_s.load(std::memory_order_relaxed) * 1000u);
+            }
+        }
         na::capture::j2::OnPresent(queue, frame, g_orig_execute);
     }
 }
@@ -2730,56 +2791,120 @@ void presenter_menu_cb(IDXGISwapChain* sc, ID3D12CommandQueue* queue, ID3D12Reso
     menu_step(sc, queue, *static_cast<const bool*>(user), frame);
 }
 
-// Render-small live mode change: the presenter's next proxies use the new scale, and the game is
-// asked (posted virtual WM_SIZE) to rebuild at that size; no restart, the real window never moves.
-// A request already pending is retried next frame. The game ignoring it expires after 5 s.
-float g_small_asked = -1.f; // the scale last asked of the game (presenter thread)
+// Render-small mode changes (COMMS 4bd474c I1.2, Astra a066d76): one change at a time through the
+// size controller. A choice only ASKS the game (virtual WM_SIZE); the mode, mip bias and status
+// apply when the game's scene is seen at the new size (3 fresh samples after its buffers were
+// rebuilt). A game that ignores the request keeps native DLAA and the whole picture; one that
+// rebuilt but whose scene did not follow is asked back. No retry loop: a new choice re-asks.
+// Native DLAA (scale_mode 0, the "Off" of upscaling) is the same path with target = output.
+uint64_t g_small_token = 0;      // size_spoof token of the controller's current ask
+bool g_small_scene_seen = false; // the first scene sample: asking before it would race the game's start
+int g_small_mode_now = 0;         // the user's mode this present
+uint64_t g_small_ask_after = 0;   // ms: no new ask before this (an ask the size layer refused backs off)
+int g_small_refused_mode = -1;    // a mode the game did not follow (for g_small_refused_output)
+na::native_present::Size g_small_refused_output{};
+uint64_t g_small_display_generation = 0;
+bool g_small_revalidate_display = false;
+void small_note_line(const char* what, const na::native_present::ctl::Status& c)
+{
+    char row[256];
+    snprintf(row, sizeof(row), "mode_change %s applied=%ux%u (%.3f) target=%ux%u buffers=%ux%u output=%ux%u matches=%u contradictions=%u\r\n", what,
+             c.applied.w, c.applied.h, static_cast<double>(c.applied_scale), c.target.w, c.target.h, c.buffers.w, c.buffers.h,
+             c.output.w, c.output.h, c.matches, c.contradictions);
+    status_note(row);
+}
 void small_follow_mode()
 {
     namespace np = na::native_present;
-    const bool expired = np::ExpireResize();
-    const int mode = (std::min)(static_cast<int>(na::settings::Get().j2_scale_mode.load()), 3); // no Ultra Performance here
-    const float f = mode > 0 ? static_cast<float>(na::scale::FractionForMode(mode)) : 1.f;
-    if (g_small_asked < 0.f) g_small_asked = na::present::RenderScale(); // the boot scale needs no request
-    // A request the game never completed (expired) or proxies that are not at the mode's size:
-    // ask again, at most every 2 s, so the game and the proxies cannot stay at different sizes
-    // (crash run a6f3f18: proxies 2293x960 with the game's scene at 2000x837, DLSS never ran).
-    {
-        static uint64_t last_retry = 0;
-        const uint64_t now = GetTickCount64();
-        const np::SizeState st = np::GetSizeState();
-        if (st.enabled && f == g_small_asked && now - last_retry > 2000) {
-            const np::Size want = small_render_for(st.output, static_cast<double>(f));
-            const bool idle = st.requested.w == 0 && st.requested.h == 0;
-            if (expired || (idle && (st.render.w != want.w || st.render.h != want.h))) {
-                last_retry = now;
-                char row[160];
-                snprintf(row, sizeof(row), "mode_retry %s render=%ux%u want=%ux%u\r\n", expired ? "expired" : "mismatch",
-                         static_cast<unsigned>(st.render.w), static_cast<unsigned>(st.render.h), static_cast<unsigned>(want.w), static_cast<unsigned>(want.h));
-                status_note(row);
-                if (st.render.w != want.w || st.render.h != want.h) np::RequestRenderSize(want);
-            }
-        }
-    }
+    namespace ctl = na::native_present::ctl;
     static bool crash_capture_on = false;
     if (!crash_capture_on) { crash_capture_on = true; AddVectoredExceptionHandler(0, &crash_capture); }
-    if (f == g_small_asked) return;
-    {
-        char row[160];
-        const np::SizeState before = np::GetSizeState();
-        snprintf(row, sizeof(row), "mode_switch mode=%d scale %.3f -> %.3f render=%ux%u requested=%ux%u delivered=%u\r\n", mode,
-                 static_cast<double>(g_small_asked), static_cast<double>(f), static_cast<unsigned>(before.render.w),
-                 static_cast<unsigned>(before.render.h), static_cast<unsigned>(before.requested.w), static_cast<unsigned>(before.requested.h),
-                 before.request_delivered ? 1u : 0u);
-        status_note(row);
-    }
-    na::present::SetRenderScale(f, &na::j2::PresentUpscale, nullptr);
-    // Texture detail follows the mode: the menu bias plus log2(render scale), from the next list.
-    na::observe::SetSamplerMipBiasLive(na::j2::SmallMipBias(static_cast<float>(na::settings::Get().j2_mip_bias_x100.load()) / 100.f, f));
     const np::SizeState st = np::GetSizeState();
-    if (!st.enabled) { g_small_asked = f; return; }
-    const np::Size r = small_render_for(st.output, static_cast<double>(f));
-    if ((r.w == st.render.w && r.h == st.render.h) || np::RequestRenderSize(r)) g_small_asked = f;
+    if (!st.enabled) return;
+    if (st.mode_generation != g_small_display_generation) {
+        // An ignored request in one display mode says nothing about another.
+        // A same-size mode transition may also have rebuilt the native scene.
+        g_small_revalidate_display = g_small_display_generation != 0;
+        g_small_display_generation = st.mode_generation;
+        g_small_refused_mode = -1;
+    }
+    const uint64_t now = GetTickCount64();
+    g_small_mode_now = (std::min)(static_cast<int>(na::settings::Get().j2_scale_mode.load()), 3);
+    {
+        const ctl::Status c = ctl::Get();
+        if (!ctl::Same(c.output, {st.output.w, st.output.h})) {
+            // First attach or a real output change (window resized by the user): start from what the game has.
+            ctl::Reset({st.output.w, st.output.h}, {st.render.w, st.render.h}, na::present::RenderScale());
+        }
+    }
+    // One scene sample per present: J2's selected scene colour for this frame (0x0 = UNKNOWN).
+    // Fresh only: written in this frame or the previous one (OnPresent may already have advanced).
+    const auto js = na::j2::GetStats();
+    const bool fresh = js.seen_scene_frame && js.frame_now >= js.seen_scene_frame && js.frame_now - js.seen_scene_frame <= 1;
+    const ctl::Extent scene = fresh ? ctl::Extent{js.seen_scene_w, js.seen_scene_h} : ctl::Extent{};
+    if (scene.w && scene.h) g_small_scene_seen = true;
+    ctl::Observe(scene);
+    auto carry_out = [&](const ctl::Action& a) {
+        const ctl::Status c = ctl::Get();
+        switch (a.kind) {
+        case ctl::ActionKind::Ask:
+        case ctl::ActionKind::Restore: {
+            if (g_small_token) np::CompleteResize(g_small_token, false, {}); // supersede the old ask's advertisement
+            g_small_token = np::RequestRenderSize({a.size.w, a.size.h}, true);
+            ctl::Asked(g_small_token, now);
+            if (!g_small_token) { // refused by the size layer: say so once, try again in a second
+                g_small_ask_after = now + 1000;
+                small_note_line("ask_refused", ctl::Get());
+                break;
+            }
+            if (a.kind == ctl::ActionKind::Restore) { g_small_refused_mode = g_small_mode_now; g_small_refused_output = st.output; }
+            small_note_line(a.kind == ctl::ActionKind::Ask ? "ask" : "restore", ctl::Get());
+            break;
+        }
+        case ctl::ActionKind::Commit: {
+            if (g_small_token) np::CompleteResize(g_small_token, true, {a.size.w, a.size.h});
+            g_small_token = 0;
+            na::present::SetRenderScale(a.scale, &na::j2::PresentUpscale, nullptr);
+            // Texture detail follows the applied mode: the menu bias plus log2(render scale).
+            na::observe::SetSamplerMipBiasLive(na::j2::SmallMipBias(static_cast<float>(na::settings::Get().j2_mip_bias_x100.load()) / 100.f, a.scale));
+            small_note_line(a.scale < 1.f ? "applied" : "applied_native_dlaa", c);
+            break;
+        }
+        case ctl::ActionKind::Ignored: {
+            if (g_small_token) np::CompleteResize(g_small_token, false, {});
+            g_small_token = 0;
+            g_small_refused_mode = g_small_mode_now; g_small_refused_output = st.output;
+            small_note_line("not_followed", c);
+            break;
+        }
+        default: break;
+        }
+    };
+    const int mode = (std::min)(static_cast<int>(na::settings::Get().j2_scale_mode.load()), 3); // no Ultra Performance here
+    carry_out(ctl::Tick(now));
+    if (!g_small_scene_seen) return;
+    {
+        // Another request (a real window resize) is pending: never ask over it. One that never
+        // reached an allocation expires, so it cannot hold the changeover forever.
+        const np::SizeState now_st = np::GetSizeState();
+        if (now_st.request && now_st.request != g_small_token) {
+            if (np::ExpireResize(5000, now)) status_note("mode_change window_resize_expired\r\n");
+            return;
+        }
+    }
+    if (now < g_small_ask_after) return;
+    const float f = mode > 0 ? static_cast<float>(na::scale::FractionForMode(mode)) : 1.f;
+    const np::Size want = small_render_for(st.output, static_cast<double>(f));
+    // A choice the game did not follow is not asked again for this output until the user changes it.
+    if (g_small_refused_mode >= 0 && (g_small_refused_mode != mode || g_small_refused_output.w != st.output.w ||
+                                      g_small_refused_output.h != st.output.h)) g_small_refused_mode = -1;
+    if (g_small_refused_mode == mode && !g_small_revalidate_display) return;
+    const auto change = ctl::Choose({want.w, want.h}, f, now, g_small_revalidate_display);
+    if (change.kind == ctl::ActionKind::Ask && g_small_revalidate_display) {
+        g_small_refused_mode = -1; // the old mode's timeout may have completed during Tick above
+        g_small_revalidate_display = false;
+    }
+    carry_out(change);
 }
 HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* pp)
 {
@@ -2792,6 +2917,10 @@ HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_
         return g_orig_present(sc, sync, flags);
     }
     na::present::PresentArgs a;
+    DXGI_SWAP_CHAIN_DESC picture_desc{};
+    const HRESULT picture_desc_hr = sc->GetDesc(&picture_desc);
+    if (na::j2::RenderSmall() && SUCCEEDED(picture_desc_hr))
+        na::native_present::ObserveWindowMode(picture_desc.OutputWindow, picture_desc.Windowed != FALSE);
     na::j2::OnPresent(queue); // game call only; the presenter's generated frames bypass this
     if (na::j2::RenderSmall()) small_follow_mode();
     if (na::scale::SliderRouteActive()) na::scale::TickLive(na::j2::GetStats().width); // P4-4: confirm a live render-scale change
@@ -2802,7 +2931,6 @@ HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_
     a.flags = flags;
     a.pp = pp;
     a.queue = queue;
-    DXGI_SWAP_CHAIN_DESC picture_desc{}; sc->GetDesc(&picture_desc);
     g_presented_format.store(uint32_t(picture_desc.BufferDesc.Format), std::memory_order_relaxed);
     a.hdr = na::color::IsHdr(na::color::Classify(picture_desc.BufferDesc.Format, static_cast<DXGI_COLOR_SPACE_TYPE>(g_color_space.load(std::memory_order_acquire)))); // A60
     bool open = g_open.load(std::memory_order_acquire);
@@ -2973,6 +3101,19 @@ void retire_nr_backbuffers(IDXGISwapChain* sc) {
     if(FAILED(sc->GetDesc(&desc)))return;
     for(UINT i=0;i<desc.BufferCount;++i){ComPtr<ID3D12Resource> buffer;
         if(SUCCEEDED(real_get_buffer(sc,i,IID_PPV_ARGS(&buffer))))na::nr::native::RetireBackbuffer(buffer.Get());}
+}
+HRESULT STDMETHODCALLTYPE DetourResizeTarget(IDXGISwapChain* sc, const DXGI_MODE_DESC* requested)
+{
+    if (requested && na::native_present::GameCaller(_ReturnAddress())) {
+        DXGI_SWAP_CHAIN_DESC desc{};
+        HRESULT hr;
+        { const na::native_present::NativeScope native;
+          hr = sc->GetDesc(&desc); }
+        DXGI_MODE_DESC physical = *requested;
+        if (SUCCEEDED(hr) && na::native_present::RewriteResizeTarget(desc.OutputWindow, &physical))
+            return g_orig_resize_target(sc, &physical);
+    }
+    return g_orig_resize_target(sc, requested);
 }
 HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT count, UINT w,
                                               UINT h, DXGI_FORMAT fmt, UINT flags)
@@ -3331,6 +3472,12 @@ bool StartCore(const char* route_tag, PanelFn controls)
                  prepare_start_hook(queue.Get(), kQueueExecuteSlot,
                                              reinterpret_cast<void*>(&DetourExecute),
                                              reinterpret_cast<void**>(&g_orig_execute));
+            // Only render-small needs to separate logical ResizeTarget from
+            // physical output. Native-DLSS routes retain their existing hooks.
+            if (ok && na::j2::RenderSmall())
+                ok = prepare_start_hook(sc.Get(), kSwapResizeTargetSlot,
+                                        reinterpret_cast<void*>(&DetourResizeTarget),
+                                        reinterpret_cast<void**>(&g_orig_resize_target));
             // A59 presenter: GetBuffer / GetCurrentBackBufferIndex / ResizeBuffers1.
             // The full observer owns these slots when requested. This narrow
             // trace is for Route A freezes with that observer disabled.

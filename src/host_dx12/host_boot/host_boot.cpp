@@ -16,6 +16,7 @@
 #include "host_dx12/scale/live_driver.hpp"
 #include "host_dx12/scale/auto_scene.hpp"
 #include "host_dx12/scale/settings_read_hook.hpp"
+#include "host_dx12/native_present/size_probe.hpp"
 
 #include <atomic>
 #include <cstdlib>
@@ -254,6 +255,10 @@ DWORD WINAPI InitThread(LPVOID)
         boot_log(!na::j2::Configured() ? "render-small: requested but OFF ([j2] enabled=1 and [observe] producers=1 needed)"
                                        : "render-small: requested but OFF ([present] proxy=0)");
     na::j2::SetRenderSmall(render_small);
+    // Read-only size-query probe (COMMS 4bd474c I1.5): which window/monitor/display-mode/DXGI
+    // output calls the game uses to learn a size. Changes no answer. [present] size_probe=1.
+    if (GetPrivateProfileIntW(L"present", L"size_probe", 0, g_ini) == 1)
+        boot_log(na::native_present::InstallSizeProbe() ? "size probe: installed" : "size probe: FAILED to install");
     if (render_small) {
         boot_log(na::native_present::InstallSizeHooks() ? "render-small: size hooks installed" : "render-small: size hooks FAILED");
         // Native-resolution HUD (Sol's plan): the game's HUD draws go to native-size layers and
@@ -263,7 +268,9 @@ DWORD WINAPI InitThread(LPVOID)
             na::j2::native_hud::SetCoverRule(GetPrivateProfileIntW(L"present", L"hud_cover", 0, g_ini) == 1);
             boot_log("render-small: native-resolution HUD on");
         } else boot_log("render-small: native-resolution HUD off ([present] native_hud=0)");
-        na::j2::SetHudMaskEnabled(GetPrivateProfileIntW(L"present", L"hud_mask", 0, g_ini) == 1);
+        // HUD protection fallback (2026-11-04): on by default; it acts only on frames where the
+        // native HUD layer did not engage, and only on what it learned during real movement.
+        na::j2::SetHudMaskEnabled(GetPrivateProfileIntW(L"present", L"hud_mask", 1, g_ini) == 1);
         // Ultra Performance is not offered with render-small (the HUD would be drawn at 33%).
         if (na::settings::Get().j2_scale_mode.load() > 3) na::settings::Get().j2_scale_mode.store(3);
         const int small_mode = static_cast<int>(na::settings::Get().j2_scale_mode.load());
@@ -272,9 +279,12 @@ DWORD WINAPI InitThread(LPVOID)
         const bool present_dlaa = GetPrivateProfileIntW(L"present", L"present_dlaa", 0, g_ini) == 1;
         na::present::SetPresentDlaa(present_dlaa);
         if (present_dlaa) boot_log("render-small: DLAA runs at Present too ([present] present_dlaa=1)");
-        na::present::SetRenderScale(small_f, &na::j2::PresentUpscale, nullptr);
-        char small_line[96];
-        std::snprintf(small_line, sizeof small_line, "render-small: enabled (mode %d, scale %.3f)", small_mode, small_f);
+        // Native start (COMMS 4bd474c I1.3): the game is first told its real size and runs native
+        // DLAA; the controller asks for the mode's size once a scene has been seen, and applies the
+        // mode only when the game's scene follows. A game that ignores the request never shows a crop.
+        na::present::SetRenderScale(1.f, &na::j2::PresentUpscale, nullptr);
+        char small_line[128];
+        std::snprintf(small_line, sizeof small_line, "render-small: enabled (mode %d, scale %.3f requested after start; native DLAA until the game follows)", small_mode, small_f);
         boot_log(small_line);
     }
     const bool projection_window = !render_small && na::j2::Configured() && GetPrivateProfileIntW(L"j2", L"window", 0, g_ini) == 1;

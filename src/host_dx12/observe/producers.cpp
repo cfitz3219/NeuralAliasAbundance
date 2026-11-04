@@ -1234,10 +1234,10 @@ std::atomic<float> g_mip_bias{0.0f};
 // gets twins built at creation for the other menu levels; command lists are switched to
 // the twins of the level latched at their Reset. Levels = the menu's choices.
 // Render-small's DLSS modes (Cort, 2026-11-03): Quality -1.585 (NVIDIA's -1 + log2(1/1.5)),
-// Balanced -2, Performance -2.5. Only the levels that can be reached get twins
+// Balanced -2, Performance -2.25 (Cort 2026-11-04; was -2.5). Only the levels that can be reached get twins
 // (g_mip_level_mask), so other games build two as before.
 constexpr int kMipCount = 6;
-constexpr float kMipLevels[kMipCount] = {0.0f, -0.5f, -1.0f, -1.5849625f, -2.0f, -2.5f};
+constexpr float kMipLevels[kMipCount] = {0.0f, -0.5f, -1.0f, -1.5849625f, -2.0f, -2.25f};
 std::atomic<uint32_t> g_mip_level_mask{0x7u}; // levels twins are built for (bit i = kMipLevels[i])
 std::atomic<int> g_mip_game_level{0};      // level the game's own objects are built with (0 = no bias unless J2 sets it)
 std::atomic<int> g_mip_live_level{0};      // level selected in the menu
@@ -3423,6 +3423,7 @@ auto& g_shader_hooks = *new std::shared_ptr<const ShaderHooks>();
 std::mutex g_shader_hooks_m;
 std::atomic<bool> g_shader_hooks_enabled{false};
 auto& g_texture_hook = *new std::shared_ptr<TextureOperationHook>();
+std::atomic<DepthClearListener> g_depth_clear_listener{nullptr};
 
 void capture_raster_targets(GL* list, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets,
     BOOL contiguous, const D3D12_CPU_DESCRIPTOR_HANDLE* depth)
@@ -3619,6 +3620,13 @@ struct ListHook<Slot, R(A...)> {
             }
             if constexpr (Slot == sl::list::ClearRenderTargetView || Slot == sl::list::ClearDepthStencilView ||
                           Slot == sl::list::CopyResource || Slot == sl::list::CopyTextureRegion || Slot == sl::list::ResolveSubresource) {
+                if constexpr (Slot == sl::list::ClearDepthStencilView) {
+                    if (!t_host_work && scope.outermost && !scope.ambiguous) {
+                        const auto listen = g_depth_clear_listener.load(std::memory_order_acquire);
+                        const auto args = std::forward_as_tuple(a...);
+                        if (listen && (std::get<1>(args) & D3D12_CLEAR_FLAG_DEPTH)) listen(l, cpu_ref(std::get<0>(args)).resource);
+                    }
+                }
                 if (!t_host_work && scope.outermost && !scope.ambiguous) {
                     const auto hook = std::atomic_load_explicit(&g_texture_hook, std::memory_order_acquire);
                     if (hook) {
@@ -5112,6 +5120,54 @@ uint32_t ListCurrentGraphicsCbvs(ID3D12CommandList* list, LiveBinding* out, uint
     }
     return n;
 }
+uint32_t ListCurrentGraphicsSrvs(ID3D12CommandList* list, na_object_id* out, uint32_t max, bool* incomplete)
+{
+    bool cut = false;
+    struct Report { bool* to; bool* cut; ~Report() { if (to) *to = *cut; } } report{incomplete, &cut};
+    if (!out || !max) { cut = true; return 0; }
+    std::shared_lock<std::shared_mutex> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) { cut = true; return 0; }
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    const auto signature = g_objs.find(canon(ls->root_sig[0]));
+    if (signature == g_objs.end()) { cut = true; return 0; }
+    const auto& params = signature->second.root_params;
+    const auto& ranges = signature->second.root_ranges;
+    uint32_t n = 0;
+    for (size_t p = 0; p < ls->args[0].size() && p < params.size(); ++p) {
+        const auto& arg = ls->args[0][p];
+        if (params[p].param_type != NA_ROOT_TABLE) continue;
+        if (arg.type != 1) continue;
+        uint32_t slot = 0;
+        auto* heap = bound_heap_for_gpu_locked(*ls, arg.value, &slot);
+        if (!heap) { cut = true; continue; }
+        bool bound = false;
+        for (uint32_t h = 0; h < ls->nheaps; ++h) bound |= heap->key == ls->heaps[h];
+        if (!bound) { cut = true; continue; }
+        for (uint32_t r = 0; r < params[p].count && params[p].first_range + r < ranges.size(); ++r) {
+            const auto& range = ranges[params[p].first_range + r];
+            if (range.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_SRV) continue;
+            // Wide ranges are walked up to kWide descriptors (a bindless table beyond that is
+            // reported incomplete rather than read as its first entries).
+            constexpr uint32_t kWide = 1024;
+            if (range.table_offset == NA_UNKNOWN_U32 || range.num_descriptors > kWide) cut = true;
+            if (range.table_offset == NA_UNKNOWN_U32) continue;
+            for (uint32_t k = 0; k < std::min<uint32_t>(range.num_descriptors, kWide); ++k) {
+                const uint64_t index = uint64_t(slot) + range.table_offset + k;
+                if (index >= heap->count) break;
+                const auto& info = heap->info[static_cast<size_t>(index)];
+                if (info.kind != NA_DESC_SRV || !info.resource) continue;
+                bool seen = false;
+                for (uint32_t i = 0; i < n && !seen; ++i) seen = out[i] == info.resource;
+                if (seen) continue;
+                if (n == max) { cut = true; continue; }
+                out[n++] = info.resource;
+            }
+        }
+    }
+    return n;
+}
 bool ListReferences(ID3D12CommandList* list, na_object_id id)
 {
     if (!id) return false;
@@ -5312,6 +5368,7 @@ void SetShaderOperationHook(ShaderLane lane, std::shared_ptr<ShaderOperationHook
         g_shader_hooks_enabled.store(enabled, std::memory_order_release);
     } // old callbacks/resources can be destroyed outside the registration lock
 }
+void SetDepthClearListener(DepthClearListener listener) { g_depth_clear_listener.store(listener, std::memory_order_release); }
 void SetTextureOperationHook(std::shared_ptr<TextureOperationHook> hook)
 {
     auto prior = std::atomic_exchange_explicit(&g_texture_hook, std::move(hook), std::memory_order_acq_rel);
@@ -5912,10 +5969,27 @@ ID3D12Resource* AcquireResource(na_object_id id)
     return r;
 }
 namespace {
-std::atomic<uint64_t> g_live_depth{0}, g_live_color{0};
+// Depth and colour are one role: published and read together (two separate atomics let a
+// reader see a new depth with the old colour, Astra 20cddb8).
+std::mutex g_live_m;
+uint64_t g_live_depth = 0, g_live_color = 0, g_live_version = 0;
 }
-void SetLiveSelection(uint64_t depth, uint64_t color) { g_live_depth.store(depth); g_live_color.store(color); }
-void GetLiveSelection(uint64_t* depth, uint64_t* color) { *depth = g_live_depth.load(); *color = g_live_color.load(); }
+void SetLiveSelection(uint64_t depth, uint64_t color)
+{
+    std::lock_guard<std::mutex> lock(g_live_m);
+    if (depth != g_live_depth || color != g_live_color) ++g_live_version;
+    g_live_depth = depth; g_live_color = color;
+}
+void GetLiveSelection(uint64_t* depth, uint64_t* color)
+{
+    std::lock_guard<std::mutex> lock(g_live_m);
+    *depth = g_live_depth; *color = g_live_color;
+}
+uint64_t LiveSelectionVersion()
+{
+    std::lock_guard<std::mutex> lock(g_live_m);
+    return g_live_version;
+}
 
 void SetSampleAcquireProbeForTests(void (*probe)()) { g_acquire_probe = probe; }
 void SetSampleWorkerPausedForTests(bool paused) { g_worker_paused.store(paused, std::memory_order_release); }
