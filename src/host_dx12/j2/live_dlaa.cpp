@@ -513,20 +513,71 @@ bool debug_record(ID3D12GraphicsCommandList* l, int mode, ID3D12Resource* out, D
 // limiters and noise attenuation remain; 1+4*lobe stays >=3/16. No second filter.
 struct RcasPass {
     ComPtr<ID3D12RootSignature> root;
-    ComPtr<ID3D12PipelineState> pso;
+    ComPtr<ID3D12PipelineState> pso, down, blur;
     ComPtr<ID3D12DescriptorHeap> heap;
+    ComPtr<ID3D12Resource> base[2]; // clarity: quarter-size luma (0) and its edge-aware blur (1), UNORDERED_ACCESS
+    std::vector<ComPtr<ID3D12Resource>> retired; // old sizes, possibly still in flight; kept
+    uint32_t bw = 0, bh = 0;
     UINT inc = 0;
     bool tried = false, ok = false;
 } g_rcas;
+// Clarity (Cort 2026-11-04, one Sharpness slider drives both; our own local-contrast
+// enhancement, no third-party code): the classic large-radius detail boost (picture minus a
+// wide blur), with an edge-aware base so it does not glow across edges: a quarter-size luma
+// copy (down), a cross-bilateral blur of it guided by luma and depth (blur), then in RCAS's
+// pass L += k * (L - base), mid-tones weighted, capped, eased off at depth edges. RCAS's own
+// lobe also eases off at depth edges (fewer bright silhouette outlines). Without depth both
+// depth terms are neutral. k follows the slider: menu 50 (RCAS 100) = 0.5, menu 100 = 1.0.
 constexpr char kRcasHlsl[] = R"(
 Texture2D<float4> t_in : register(t0);
+Texture2D<float>  t_depth : register(t1);
+Texture2D<float>  t_base : register(t2);
 RWTexture2D<float4> u_out : register(u0);
-cbuffer C : register(b0) { float con; uint w; uint h; float lobeLimit; };
+RWTexture2D<float>  u_luma : register(u1);
+SamplerState s_lin : register(s0);
+cbuffer C : register(b0) {
+    float con; uint w; uint h; float lobeLimit;
+    float clarity; uint has_depth; uint reversed; uint dw;
+    uint dh; uint bw; uint bh; uint pad;
+};
 float3 fwd(float3 x) { x = max(x, 0.0); return x / (1.0 + x); }
 float3 inv(float3 t) { t = min(t, 0.99990); return t / (1.0 - t); }
 float3 tap(int2 p) { p = clamp(p, int2(0, 0), int2(w - 1, h - 1)); return fwd(t_in[p].rgb); }
 float min3(float a, float b, float c) { return min(a, min(b, c)); }
 float max3(float a, float b, float c) { return max(a, max(b, c)); }
+float luma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
+// Depth as a quantity that grows towards the camera for both conventions (reversed: d; standard:
+// 1 - d; both affine in 1/z), compared relatively: an edge heuristic, not a metric distance.
+float dlin(int2 q) { q = clamp(q, int2(0, 0), int2(dw - 1, dh - 1)); const float d = t_depth[q]; return reversed != 0 ? d : 1.0 - d; }
+float rel(float a, float b) { return abs(a - b) / max(max(a, b), 1e-7); }
+int2 to_depth(float2 full) { return int2(full * float2(dw, dh) / float2(w, h)); }
+
+[numthreads(8, 8, 1)]
+void down(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= bw || id.y >= bh) return;
+    float s = 0;
+    [unroll] for (int j = 0; j < 4; ++j) [unroll] for (int i = 0; i < 4; ++i) s += luma(tap(int2(id.xy) * 4 + int2(i, j)));
+    u_luma[id.xy] = s / 16.0;
+}
+[numthreads(8, 8, 1)]
+void blur(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= bw || id.y >= bh) return;
+    const int2 p = int2(id.xy);
+    const float c = t_base[p];
+    const float zc = has_depth != 0 ? dlin(to_depth((float2(p) + 0.5) * 4.0)) : 0.0;
+    float sum = 0, wsum = 0;
+    [unroll] for (int j = -3; j <= 3; ++j)
+        [unroll] for (int i = -3; i <= 3; ++i) {
+            const int2 q = clamp(p + int2(i, j), int2(0, 0), int2(bw - 1, bh - 1));
+            const float v = t_base[q];
+            const float dv = (v - c) / 0.1;
+            float wt = exp(-(float)(i * i + j * j) / 8.0) * exp(-dv * dv);
+            if (has_depth != 0) { const float r = rel(dlin(to_depth((float2(q) + 0.5) * 4.0)), zc) / 0.03; wt *= exp(-r * r); }
+            sum += wt * v; wsum += wt;
+        }
+    u_luma[p] = wsum > 0 ? sum / wsum : c;
+}
+
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= w || id.y >= h) return;
@@ -536,6 +587,15 @@ void main(uint3 id : SV_DispatchThreadID) {
     //    h
     float3 b = tap(p + int2(0, -1)), d = tap(p + int2(-1, 0)), e = tap(p), f = tap(p + int2(1, 0)), hh = tap(p + int2(0, 1));
     float alpha = t_in[p].a;
+    // Depth edge (relative 1/z jump to any 4-neighbour of the depth texel): 0 flat .. 1 edge.
+    float edge = 0;
+    if (has_depth != 0) {
+        const int2 q = to_depth(float2(p) + 0.5);
+        const float z = dlin(q);
+        const float r = max(max(rel(dlin(q + int2(1, 0)), z), rel(dlin(q - int2(1, 0)), z)),
+                            max(rel(dlin(q + int2(0, 1)), z), rel(dlin(q - int2(0, 1)), z)));
+        edge = smoothstep(0.01, 0.04, r);
+    }
     // Luma times 2 (FSR1) for noise detection.
     float bL = b.b * 0.5 + (b.r * 0.5 + b.g), dL = d.b * 0.5 + (d.r * 0.5 + d.g), eL = e.b * 0.5 + (e.r * 0.5 + e.g);
     float fL = f.b * 0.5 + (f.r * 0.5 + f.g), hL = hh.b * 0.5 + (hh.r * 0.5 + hh.g);
@@ -550,8 +610,17 @@ void main(uint3 id : SV_DispatchThreadID) {
     float3 lobeRGB = max(-hitMin, hitMax);
     float lobe = max(-lobeLimit, min(max3(lobeRGB.r, lobeRGB.g, lobeRGB.b), 0.0)) * con;
     lobe *= nz;
+    lobe *= lerp(1.0, 0.35, edge);
     float rcpL = 1.0 / (4.0 * lobe + 1.0);
     float3 o = (lobe * b + lobe * d + lobe * hh + lobe * f + e) * rcpL;
+    if (clarity > 0.0) {
+        const float L = luma(e);
+        const float B = t_base.SampleLevel(s_lin, (float2(p) + 0.5) / float2(w, h), 0);
+        float dc = clarity * (L - B) * saturate(4.0 * L * (1.0 - L)) * (1.0 - edge);
+        dc = clamp(dc, -0.12, 0.12);
+        const float Lo = max(luma(o), 1e-4);
+        o = saturate(o * clamp((Lo + dc) / Lo, 0.5, 2.0));
+    }
     u_out[p] = float4(inv(o), alpha);
 })";
 bool rcas_init()
@@ -560,76 +629,149 @@ bool rcas_init()
     g_rcas.tried = true;
     D3D12_DESCRIPTOR_RANGE r[2]{};
     r[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    r[0].NumDescriptors = 1;
+    r[0].NumDescriptors = 3;
     r[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    r[1].NumDescriptors = 1;
-    r[1].OffsetInDescriptorsFromTableStart = 1;
+    r[1].NumDescriptors = 2;
+    r[1].OffsetInDescriptorsFromTableStart = 3;
     D3D12_ROOT_PARAMETER p[2]{};
     p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     p[0].DescriptorTable.NumDescriptorRanges = 2;
     p[0].DescriptorTable.pDescriptorRanges = r;
     p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    p[1].Constants.Num32BitValues = 4;
-    D3D12_ROOT_SIGNATURE_DESC rd{2, p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
-    ComPtr<ID3DBlob> sig, err, code;
+    p[1].Constants.Num32BitValues = 12;
+    D3D12_STATIC_SAMPLER_DESC smp{};
+    smp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    smp.AddressU = smp.AddressV = smp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    smp.MaxLOD = D3D12_FLOAT32_MAX;
+    smp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rd{2, p, 1, &smp, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ComPtr<ID3DBlob> sig, err, code, cd, cb;
     if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
         FAILED(g.device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&g_rcas.root))))
         return false;
-    if (FAILED(D3DCompile(kRcasHlsl, sizeof(kRcasHlsl) - 1, "j2_rcas.hlsl", nullptr, nullptr, "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err)))
+    const UINT cf = D3DCOMPILE_OPTIMIZATION_LEVEL3;
+    if (FAILED(D3DCompile(kRcasHlsl, sizeof(kRcasHlsl) - 1, "j2_rcas.hlsl", nullptr, nullptr, "main", "cs_5_0", cf, 0, &code, &err)) ||
+        FAILED(D3DCompile(kRcasHlsl, sizeof(kRcasHlsl) - 1, "j2_rcas.hlsl", nullptr, nullptr, "down", "cs_5_0", cf, 0, &cd, &err)) ||
+        FAILED(D3DCompile(kRcasHlsl, sizeof(kRcasHlsl) - 1, "j2_rcas.hlsl", nullptr, nullptr, "blur", "cs_5_0", cf, 0, &cb, &err)))
         return false;
     D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = g_rcas.root.Get();
     pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
     if (FAILED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_rcas.pso)))) return false;
-    // Slots 0..kRing-1: the DLAA path; kRing..2*kRing-1: the render-small upscale ring.
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRing * 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    pd.CS = {cd->GetBufferPointer(), cd->GetBufferSize()};
+    if (FAILED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_rcas.down)))) return false;
+    pd.CS = {cb->GetBufferPointer(), cb->GetBufferSize()};
+    if (FAILED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_rcas.blur)))) return false;
+    // Slots 0..kRing-1: the DLAA path; kRing..2*kRing-1: the render-small upscale ring. Each slot
+    // has three tables (down, blur, main) of five descriptors (t0..t2, u0..u1).
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRing * 2 * 15, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     if (FAILED(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_rcas.heap)))) return false;
     g_rcas.inc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     g_rcas.ok = true;
     return true;
 }
-// RCAS from `in` (readable, NON_PIXEL_SHADER_RESOURCE) into `out` (UNORDERED_ACCESS).
-bool rcas_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Resource* out, uint32_t w, uint32_t h, uint32_t percent,
-                   DXGI_FORMAT fmt, UINT slot)
+bool rcas_base(uint32_t bw, uint32_t bh)
 {
-    if (!percent || !in || !out || !rcas_init()) return false;
-    const UINT base = slot * 2;
-    D3D12_CPU_DESCRIPTOR_HANDLE c = g_rcas.heap->GetCPUDescriptorHandleForHeapStart();
-    c.ptr += static_cast<SIZE_T>(base) * g_rcas.inc;
-    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
-    sv.Format = fmt;
-    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    sv.Texture2D.MipLevels = 1;
-    g.device->CreateShaderResourceView(in, &sv, c);
-    c.ptr += g_rcas.inc;
-    D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
-    uv.Format = fmt;
-    uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    g.device->CreateUnorderedAccessView(out, nullptr, &uv, c);
-    D3D12_GPU_DESCRIPTOR_HANDLE gh = g_rcas.heap->GetGPUDescriptorHandleForHeapStart();
-    gh.ptr += static_cast<UINT64>(base) * g_rcas.inc;
+    if (g_rcas.base[0] && g_rcas.bw == bw && g_rcas.bh == bh) return true;
+    for (auto& r : g_rcas.base) if (r) g_rcas.retired.push_back(r);
+    if (g_rcas.retired.size() > 32) g_rcas.retired.erase(g_rcas.retired.begin(), g_rcas.retired.begin() + 8); // sizes long gone
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC d{};
+    d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    d.Width = bw; d.Height = bh; d.DepthOrArraySize = d.MipLevels = 1; d.SampleDesc.Count = 1;
+    d.Format = DXGI_FORMAT_R16_FLOAT;
+    d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    for (auto& r : g_rcas.base) {
+        r.Reset();
+        if (FAILED(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&r)))) {
+            g_rcas.base[0].Reset(); g_rcas.base[1].Reset(); g_rcas.bw = g_rcas.bh = 0;
+            return false;
+        }
+    }
+    g_rcas.bw = bw; g_rcas.bh = bh;
+    return true;
+}
+// RCAS (+ clarity) from `in` (readable, NON_PIXEL_SHADER_RESOURCE) into `out` (UNORDERED_ACCESS).
+// depth: optional R32_FLOAT dw x dh, NON_PIXEL_SHADER_RESOURCE (same picture, any size).
+bool rcas_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Resource* out, uint32_t w, uint32_t h, uint32_t percent,
+                   DXGI_FORMAT fmt, UINT slot, ID3D12Resource* depth = nullptr, uint32_t dw = 0, uint32_t dh = 0, bool reversed = false)
+{
+    if (!percent || !in || !out || slot >= 2 * kRing || !rcas_init()) return false;
+    const uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4;
+    uint32_t clarity = (std::min)(percent, 200u); // the same slider; 0 if the base cannot be allocated
+    if (!rcas_base(bw, bh)) clarity = 0;
+    if (!depth || !dw || !dh) depth = nullptr;
+    const UINT base = slot * 15;
+    auto cpu = [&](UINT i) { D3D12_CPU_DESCRIPTOR_HANDLE c = g_rcas.heap->GetCPUDescriptorHandleForHeapStart(); c.ptr += SIZE_T(base + i) * g_rcas.inc; return c; };
+    auto gpu = [&](UINT t) { D3D12_GPU_DESCRIPTOR_HANDLE c = g_rcas.heap->GetGPUDescriptorHandleForHeapStart(); c.ptr += UINT64(base + t * 5) * g_rcas.inc; return c; };
+    auto srv = [&](UINT i, ID3D12Resource* r, DXGI_FORMAT f) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = f;
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sv.Texture2D.MipLevels = 1;
+        g.device->CreateShaderResourceView(r, &sv, cpu(i));
+    };
+    auto uav = [&](UINT i, ID3D12Resource* r, DXGI_FORMAT f) {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+        uv.Format = f;
+        uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        g.device->CreateUnorderedAccessView(r, nullptr, &uv, cpu(i));
+    };
+    ID3D12Resource* b0 = clarity ? g_rcas.base[0].Get() : nullptr;
+    ID3D12Resource* b1 = clarity ? g_rcas.base[1].Get() : nullptr;
+    // table 0 (down): t0 in -> u1 base0; table 1 (blur): t2 base0, t1 depth -> u1 base1;
+    // table 2 (main): t0 in, t1 depth, t2 base1 -> u0 out.
+    for (UINT t = 0; t < 3; ++t) {
+        srv(t * 5 + 0, t == 1 ? nullptr : in, fmt);
+        srv(t * 5 + 1, t == 0 ? nullptr : depth, DXGI_FORMAT_R32_FLOAT);
+        srv(t * 5 + 2, t == 0 ? nullptr : (t == 1 ? b0 : b1), DXGI_FORMAT_R16_FLOAT);
+        uav(t * 5 + 3, t == 2 ? out : nullptr, fmt);
+        uav(t * 5 + 4, t == 0 ? b0 : (t == 1 ? b1 : nullptr), DXGI_FORMAT_R16_FLOAT);
+    }
     ID3D12DescriptorHeap* heaps[] = {g_rcas.heap.Get()};
     l->SetDescriptorHeaps(1, heaps);
     l->SetComputeRootSignature(g_rcas.root.Get());
-    l->SetPipelineState(g_rcas.pso.Get());
-    l->SetComputeRootDescriptorTable(0, gh);
-    const float stops = 2.0f * (1.0f - static_cast<float>(percent > 100 ? 100 : percent) / 100.0f);
-    const float con = std::exp2(-stops);
+    const uint32_t p100 = percent > 100 ? 100 : percent;
+    const float stops = 2.0f * (1.0f - static_cast<float>(p100) / 100.0f);
+    const float con = percent ? std::exp2(-stops) : 0.0f;
     const float extra = percent > 100 ? float((std::min)(percent, 200u) - 100u) / 100.0f : 0.0f;
     const float limit = 3.0f / 16.0f + extra / 32.0f;
-    uint32_t k[4] = {0, w, h, 0};
-    std::memcpy(&k[0], &con, 4);
-    std::memcpy(&k[3], &limit, 4);
-    l->SetComputeRoot32BitConstants(1, 4, k, 0);
+    const float k = 0.5f * static_cast<float>(clarity) / 100.0f;
+    uint32_t c[12] = {0, w, h, 0, 0, depth ? 1u : 0u, reversed ? 1u : 0u, dw, dh, bw, bh, 0};
+    std::memcpy(&c[0], &con, 4);
+    std::memcpy(&c[3], &limit, 4);
+    std::memcpy(&c[4], &k, 4);
+    l->SetComputeRoot32BitConstants(1, 12, c, 0);
+    auto barrier = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES bb) {
+        D3D12_RESOURCE_BARRIER x{};
+        x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        x.Transition = {r, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, a, bb};
+        l->ResourceBarrier(1, &x);
+    };
+    constexpr auto U = D3D12_RESOURCE_STATE_UNORDERED_ACCESS, N = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    if (clarity) {
+        l->SetComputeRootDescriptorTable(0, gpu(0));
+        l->SetPipelineState(g_rcas.down.Get());
+        l->Dispatch((bw + 7) / 8, (bh + 7) / 8, 1);
+        barrier(b0, U, N);
+        l->SetComputeRootDescriptorTable(0, gpu(1));
+        l->SetPipelineState(g_rcas.blur.Get());
+        l->Dispatch((bw + 7) / 8, (bh + 7) / 8, 1);
+        barrier(b1, U, N);
+    }
+    l->SetComputeRootDescriptorTable(0, gpu(2));
+    l->SetPipelineState(g_rcas.pso.Get());
     l->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+    if (clarity) { barrier(b0, N, U); barrier(b1, N, U); }
     return true;
 }
 // Retained for the standalone NIS test helper; the live slider uses RCAS only.
 na::j2::NisSharpen g_nis;
 bool rcas_record(ID3D12GraphicsCommandList* l, uint32_t percent, DXGI_FORMAT fmt)
 {
-    return g.sharp && rcas_dispatch(l, g.output.Get(), g.sharp.Get(), g.ow, g.oh, percent, fmt, g.slot);
+    return g.sharp && rcas_dispatch(l, g.output.Get(), g.sharp.Get(), g.ow, g.oh, percent, fmt, g.slot, g.depth32.Get(), g.rw, g.rh, g.stats.depth_reversed);
 }
 
 bool ensure_device(ID3D12CommandQueue* q)
@@ -3560,7 +3702,7 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
                 add(b, out, UAV, NPSR);
                 out_state = NPSR;
                 flush(l, b);
-                if (rcas_dispatch(l, out, sharp, ow, oh, pct, of, kRing + si)) {
+                if (rcas_dispatch(l, out, sharp, ow, oh, pct, of, kRing + si, g.depth32.Get(), rw, rh, d.reversed)) {
                     b.push_back(uav_barrier(sharp));
                     cur = sharp;
                     ++g.stats.small_sharpened;
