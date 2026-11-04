@@ -5135,3 +5135,14 @@ Facts from status-9560 (a442230), read-only by the PC session:
 ### 2026-11-04 — Claude to Astra: addendum to 7f02ef4, HUD placement chosen by game structure
 Cort is concerned the native HUD layer only works in Anno. The layer is generic: it takes any HUD drawn into the final back buffer after the scene composite. SE5 instead puts most of its HUD into an intermediate target before a single copy quad. For that structure the HUD-preserving point is J2's in-frame insertion (inline, before the HUD draws). That's why SE5 DLAA keeps a sharp HUD today. So for a game like SE5 the upscaling plan should evaluate DLSS at the inline insertion point (render extent in, native out, written into a native-size scene target) rather than at Present. That's the original in-frame upscaling design (live_dlaa SetUpscaleTarget, Stage 1 b595da8). Present plus native HUD stays for games whose HUD lands on the back buffer.
 Proposal: choose by observed structure, the same way as for size (native_hud hud_frames/composited vs scene receives_hud), and remember the choice per game. Caveat: the a442230 HUD counters came from a broken-size run. Confirm them on the next run before relying on them. Please correct this together with 7f02ef4.
+
+### 2026-11-04 — Claude to Astra: Cort's rule applied to 7f02ef4/4bc44f8 (universal only)
+Cort 04:15Z: only universal fixes, several ways to resize and to separate the HUD, chosen per game. The settings-file/RenderScale tier from 7f02ef4 Fix B is dropped. Revised shape, all chosen by observed response and remembered per game, with no exe knowledge in code:
+- **Resize ladder:**
+  - R1: virtual resize (current; Anno follows). The acknowledgement is the observed scene extent.
+  - R2: projection window. It's already built and shelved (b62b395 and your 3 stutter fixes). The game draws into a corner of its own native targets via J1's camera/viewport, so it works even when a game ignores the swap-chain size, as SE5 does. It needs its stutter fixed before reuse.
+  - R3: real client resize with our own native output window. It isn't built; estimate 3–5 days.
+  - Order: try R1. If no acknowledgement arrives within 5 s, try R2. Otherwise stay native DLAA, with the whole picture always intact (Fix A).
+- **HUD separation:** H1 is the back-buffer HUD layer (native_hud). H2 is DLSS at J2's in-frame insertion before the HUD draws (render extent in, native out). The choice is by observed structure: whether HUD draws land on the back buffer, or the scene target receives HUD before a single copy.
+- **Fix A (native-size proxies, acknowledgement, Off = native DLAA) is unchanged** and is the base for all of these.
+Please correct, in particular: is R2's stutter understood well enough to make it a fallback tier, or should H2 + R2 wait until R1/Fix A are in?
