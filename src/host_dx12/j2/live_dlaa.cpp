@@ -2131,7 +2131,13 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         // One composed current->previous clip matrix (double, then float); the
         // arbiter's second matrix is identity. Never chain two float matrices
         // through world space (false motion on a still camera -> DLAA blur).
-        in.inv_view_proj_current = to_mat4(na::camera::ComposeReprojectionRow(cam.inv_view_proj_current_row, cam.view_proj_previous_row));
+        const na::camera::Matrix composed = na::camera::ComposeReprojectionRow(cam.inv_view_proj_current_row, cam.view_proj_previous_row);
+        in.inv_view_proj_current = to_mat4(composed);
+        // M3 (camera_fit_gpu.hpp): basis of the six rigid camera corrections around this composed
+        // matrix; compute_flow fits them on the GPU from depth + this pair's flow.
+        const na::motion::gpu::FitBasis fit_basis = na::motion::gpu::MakeFitBasis(
+            composed.data(), cam.inv_view_proj_current_row.data(), cam.view_proj_previous_row.data(), cam.position.data());
+        in.fit_basis = &fit_basis;
         {
             na::camera::Matrix id{};
             id[0] = id[5] = id[10] = id[15] = 1.0;
@@ -2151,13 +2157,15 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             na::j2::compute_flow::Tier3 tier;
             na::j2::compute_flow::SetLoosen(na::settings::Get().j2_flow_loosen.load(std::memory_order_relaxed));
             pending.compute_flow=na::j2::compute_flow::Record(l,g.queue.Get(),g.color_in.Get(),g.depth32.Get(),in,frame,tier);
-            if(tier.residual){in.tier3_valid_flag=true;in.tier3_residual=tier.residual;in.tier3_valid=tier.valid;in.tier3_mask=tier.mask;}
+            // The residual was derived against the fitted camera: tier 2 must use the same fix.
+            if(tier.residual){in.tier3_valid_flag=true;in.tier3_residual=tier.residual;in.tier3_valid=tier.valid;in.tier3_mask=tier.mask;in.fix=tier.fix;}
             flow_tier=tier;
         }
         // P4-0b: camera + accepted moving-object residual (tier 3) when this frame's pair ran.
         na::j2::flow::Tier3 t3;
         if (flow_ticket && flow_ticket->pair && na::j2::flow::RecordFusion(l, *flow_ticket, g.depth32.Get(), in, &t3)) {
             in.tier3_residual = t3.residual;
+            in.fix = nullptr; // the NVOFA residual is relative to the unfitted camera
             in.tier3_mask = t3.mask;
             in.tier3_valid = t3.valid;
             in.tier3_valid_flag = true;

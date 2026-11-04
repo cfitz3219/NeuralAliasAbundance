@@ -5,6 +5,7 @@
 #include "host_dx12/nvof/flow_expand.hpp"
 #include "host_dx12/nr/native_fg.hpp"
 #include "core/motion_arbiter_gpu.hpp"
+#include "core/camera_fit_gpu.hpp"
 #include <d3dcompiler.h>
 #include <mutex>
 #include <atomic>
@@ -40,7 +41,7 @@ struct Context {
     ComPtr<ID3D12Resource> raw,expanded,residual,valid,mask,counters,zero,hist[2];
     unsigned hist_read=0;uint64_t hist_frame=0;unsigned hist_generation=0; // last committed pair's candidates
     UINT64 frequency=0;
-    na::ffx_flow::PairFlow engine;na::nvof::FlowExpand expand;na::motion::gpu::Arbiter derive;
+    na::ffx_flow::PairFlow engine;na::nvof::FlowExpand expand;na::motion::gpu::Arbiter derive;na::motion::gpu::CameraFit fit;
     std::vector<std::unique_ptr<Image>> images;std::vector<std::unique_ptr<Slot>> leases;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu(unsigned slot,unsigned table,unsigned i){auto a=leases[slot]->heap->GetCPUDescriptorHandleForHeapStart();a.ptr+=SIZE_T(table*kTable+i)*stride;return a;}
     D3D12_GPU_DESCRIPTOR_HANDLE gpu(unsigned slot,unsigned table){auto a=leases[slot]->heap->GetGPUDescriptorHandleForHeapStart();a.ptr+=UINT64(table*kTable)*stride;return a;}
@@ -79,6 +80,7 @@ bool build(Context& c,ID3D12Device* device,ID3D12CommandQueue* queue,unsigned w,
     c.device=device;c.queue=queue;c.w=w;c.h=h;c.stride=device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     if(!c.engine.Init(device,w,h,1)){reason(c.engine.Error());return false;}
     if(!programs(c) || !c.expand.Init(device,1) || !c.derive.Init(device,1))return false;
+    c.fit.Init(device); // optional: without it the camera motion is used unchanged (Ready() false)
     for(unsigned i=0;i<warm_images;++i){auto image=std::make_unique<Image>();if(!c.tex(DXGI_FORMAT_R8G8B8A8_UNORM,image->tex))return false;c.images.push_back(std::move(image));}
     if(!c.tex(DXGI_FORMAT_R32G32_FLOAT,c.raw) || !c.tex(DXGI_FORMAT_R32_FLOAT,c.expanded) || !c.tex(DXGI_FORMAT_R32G32_FLOAT,c.residual) || !c.tex(DXGI_FORMAT_R32_FLOAT,c.valid) || !c.tex(DXGI_FORMAT_R32_FLOAT,c.mask) ||
        !c.tex(DXGI_FORMAT_R16G16B16A16_FLOAT,c.hist[0]) || !c.tex(DXGI_FORMAT_R16G16B16A16_FLOAT,c.hist[1]) ||
@@ -87,8 +89,11 @@ bool build(Context& c,ID3D12Device* device,ID3D12CommandQueue* queue,unsigned w,
     queue->GetTimestampFrequency(&c.frequency);return true;
 }
 bool free(Image& i){i.uses.erase(std::remove_if(i.uses.begin(),i.uses.end(),[](const Lease& l){return l.Retired();}),i.uses.end());return i.uses.empty();}
-void collect(Context& c){for(auto& entry:c.leases){auto& s=*entry;if(!s.pair || !s.lease.Retired())continue;
-    if(!s.submitted){s.pair=false;continue;} // discarded commands never wrote telemetry
+void collect(Context& c){for(size_t index=0;index<c.leases.size();++index){auto& s=*c.leases[index];if(!s.pair || !s.lease.Retired())continue;
+    if(!s.submitted){s.pair=false;na::motion::gpu::FitResult drop;c.fit.Collect(static_cast<uint32_t>(index),&drop);continue;} // discarded commands never wrote telemetry
+    {na::motion::gpu::FitResult r;if(c.fit.Collect(static_cast<uint32_t>(index),&r)){++stats.fit_collected;
+        memcpy(stats.fit_theta,r.theta,sizeof r.theta);stats.fit_e0=r.energy0;stats.fit_e=r.energy;stats.fit_n0=r.samples0;stats.fit_n=r.samples;stats.fit_last_accepted=r.accepted;
+        if(r.accepted){++stats.fit_accepted;stats.fit_e0_sum+=r.energy0;stats.fit_e_sum+=r.energy;}}}
     {void* p=nullptr;D3D12_RANGE range{0,64};
         if(SUCCEEDED(s.readback->Map(0,&range,&p))){const auto* b=static_cast<const unsigned char*>(p);const auto* v=reinterpret_cast<const unsigned*>(b);
             for(unsigned j=0;j<7;++j)stats.sum[j]+=v[j];++stats.sum_pairs;
@@ -156,9 +161,17 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
     // its /32 here. Grid spacing and value scale are separate conventions.
     c->expand.SetVectorScale(32.f);na::nvof::ExpandParams ep;ep.depth=depth;ep.validity_out=c->expanded.Get();ep.depth_clear=camera.depth_clear;ep.consistency_px=gates.consistency_px;ep.sky=gates.sky;
     bool ok=c->expand.DispatchDepthAware(l,c->engine.Grid(),8,ep,c->raw.Get(),w,h,0,&slot.expand_heap);
-    order(l);move(l,c->raw.Get(),U,S);move(l,c->expanded.Get(),U,S);move(l,c->residual.Get(),S,U);move(l,c->valid.Get(),S,U);
+    order(l);move(l,c->raw.Get(),U,S);move(l,c->expanded.Get(),U,S);
+    // M3 (camera_fit_gpu.hpp): fit the rigid camera correction on this exact pair, on the GPU, before
+    // the residual is derived, so the residual and the arbiter's tier 2 use the same corrected camera.
+    ID3D12Resource* fix=nullptr;
+    if(ok && camera.fit_basis && c->fit.Ready()){
+        fix=c->fit.Record(l,work,depth,c->raw.Get(),c->expanded.Get(),*camera.fit_basis,camera.jitter_current_px,camera.depth_clear,w,h);
+        if(fix)++stats.fit_recorded;}
+    na::motion::gpu::Inputs fitted=camera;fitted.fix=fix;
+    move(l,c->residual.Get(),S,U);move(l,c->valid.Get(),S,U);
     // Stabilised images: the raw flow carries no jitter shift, so (jitter_prev - jitter_cur) must be 0.
-    ok=ok && c->derive.DispatchDeriveResidual(l,c->raw.Get(),depth,camera,f.jitter,c->residual.Get(),c->valid.Get(),w,h,0,c->expanded.Get(),&slot.derive_heap);
+    ok=ok && c->derive.DispatchDeriveResidual(l,c->raw.Get(),depth,fitted,f.jitter,c->residual.Get(),c->valid.Get(),w,h,0,c->expanded.Get(),&slot.derive_heap);
     order(l);move(l,c->residual.Get(),U,S);move(l,c->valid.Get(),U,S);move(l,c->mask.Get(),S,U);
     move(l,c->counters.Get(),U,D3D12_RESOURCE_STATE_COPY_DEST);l->CopyBufferRegion(c->counters.Get(),0,c->zero.Get(),0,40);move(l,c->counters.Get(),D3D12_RESOURCE_STATE_COPY_DEST,U);
     cb.cost=2;c->defaults(work,1);c->srv(work,1,4,c->engine.SceneChange(),DXGI_FORMAT_R32_UINT);
@@ -173,7 +186,7 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
     if(ok)c->dispatch(l,work,1,c->pso_accept.Get(),cb);order(l);move(l,c->mask.Get(),U,S);move(l,c->hist[hist_out].Get(),U,S);c->engine.Finish(l);
     move(l,c->counters.Get(),U,D3D12_RESOURCE_STATE_COPY_SOURCE);l->CopyBufferRegion(slot.readback.Get(),0,c->counters.Get(),0,40);move(l,c->counters.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,U);
     if(slot.timestamps){l->EndQuery(slot.timestamps.Get(),D3D12_QUERY_TYPE_TIMESTAMP,1);l->ResolveQueryData(slot.timestamps.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0,2,slot.readback.Get(),48);}
-    if(ok){out={c->residual.Get(),c->valid.Get(),c->mask.Get()};slot.pair=true;slot.hist_written=static_cast<int>(hist_out);++stats.pairs;reason("AMD same-frame optical flow recorded before DLAA");}
+    if(ok){out={c->residual.Get(),c->valid.Get(),c->mask.Get(),fix};slot.pair=true;slot.hist_written=static_cast<int>(hist_out);++stats.pairs;reason("AMD same-frame optical flow recorded before DLAA");}
     else {++stats.unavailable;reason("AMD flow expansion/residual unavailable; camera motion used");}
     return t;
 }

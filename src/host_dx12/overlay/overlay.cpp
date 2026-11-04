@@ -1503,6 +1503,11 @@ void write_menu_progress(HANDLE log)
         (unsigned long long)cf.sum_pairs,(unsigned long long)cf.sum[0],(unsigned long long)cf.sum[1],(unsigned long long)cf.sum[2],(unsigned long long)cf.sum[3],
         (unsigned long long)cf.sum[4],(unsigned long long)cf.sum[5],(unsigned long long)cf.sum[6]);
     if(cfn>0)WriteFile(log,cfline,(std::min)(DWORD(cfn),DWORD(sizeof(cfline)-1)),&cfw,nullptr);
+    {char fl[400];DWORD fw=0;const double acc=cf.fit_accepted?1.0/double(cf.fit_accepted):0.0;
+        const int fn=snprintf(fl,sizeof fl,"j2camfit recorded=%llu collected=%llu accepted=%llu accepted_e0_mean=%.4f accepted_e_mean=%.4f last{accepted=%d e0=%.4f n0=%u e=%.4f n=%u t=[%.5f %.5f %.5f] r=[%.6f %.6f %.6f]}\r\n",
+            (unsigned long long)cf.fit_recorded,(unsigned long long)cf.fit_collected,(unsigned long long)cf.fit_accepted,cf.fit_e0_sum*acc,cf.fit_e_sum*acc,
+            cf.fit_last_accepted?1:0,cf.fit_e0,cf.fit_n0,cf.fit_e,cf.fit_n,cf.fit_theta[0],cf.fit_theta[1],cf.fit_theta[2],cf.fit_theta[3],cf.fit_theta[4],cf.fit_theta[5]);
+        if(fn>0)WriteFile(log,fl,(std::min)(DWORD(fn),DWORD(sizeof(fl)-1)),&fw,nullptr);}
     auto ps = na::present::GetStats();
     char p_line[256];
     int pn = snprintf(p_line, sizeof(p_line), "present_gpu submitted=%llu completed=%llu owned=%u device_hr=0x%08lX queried_latency_handle=0x%llX\r\n",

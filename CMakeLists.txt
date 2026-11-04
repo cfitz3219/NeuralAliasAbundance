@@ -146,7 +146,7 @@ target_link_libraries(host_settings PUBLIC abundance_options PRIVATE shell32 ole
 add_library(host_capture STATIC src/host_dx12/capture/frame_capture.cpp src/host_dx12/capture/j2_capture.cpp src/host_dx12/capture/capture_session.cpp)
 target_link_libraries(host_capture PUBLIC abundance_options d3d12 dxgi PRIVATE shell32 ole32)
 
-add_library(core_gpu STATIC src/core/motion_arbiter_gpu.cpp)
+add_library(core_gpu STATIC src/core/motion_arbiter_gpu.cpp src/core/camera_fit_gpu.cpp)
 target_link_libraries(core_gpu PUBLIC abundance_core d3d12 d3dcompiler)
 
 # Optical flow: real wrapper when the SDK headers exist, otherwise a stub that

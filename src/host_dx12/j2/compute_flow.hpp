@@ -11,7 +11,9 @@ struct Frame {
     float jitter[2]{};
 };
 struct Ticket {std::shared_ptr<void> context;uint32_t image=0,previous=0,slot=0;Frame frame;bool pair=false;};
-struct Tier3 {ID3D12Resource *residual=nullptr,*valid=nullptr,*mask=nullptr;};
+// fix: the M3 camera correction buffer of this recording (camera_fit_gpu.hpp), or nullptr. The
+// residual was derived against the corrected camera, so the arbiter must use the same fix.
+struct Tier3 {ID3D12Resource *residual=nullptr,*valid=nullptr,*mask=nullptr,*fix=nullptr;};
 // Called inside J2's restorable inline scope, AFTER its colour/depth resolve.
 // All inputs NPSR. No CPU waits; allocations/retirement reuse RecordingLease.
 Ticket Record(ID3D12GraphicsCommandList*,ID3D12CommandQueue*,ID3D12Resource* color,ID3D12Resource* depth,
@@ -34,6 +36,11 @@ struct Stats {
     // Every completed pair's pixel counts summed (not one sample per 5 s): accepted, invalid,
     // small, cost, offscreen, image, flicker; and the pairs counted.
     uint64_t sum[7]{}; uint64_t sum_pairs=0;
+    // M3 camera fit (every completed pair): fits recorded, collected, accepted; the last collected
+    // result (theta: translation x/y/z world units, rotation x/y/z rad; mean robust error before/after).
+    uint64_t fit_recorded=0,fit_collected=0,fit_accepted=0;
+    float fit_theta[6]{};float fit_e0=0,fit_e=0;uint32_t fit_n0=0,fit_n=0;bool fit_last_accepted=false;
+    double fit_e0_sum=0,fit_e_sum=0; // summed over accepted fits (mean = sum / fit_accepted)
     double ms=0;char reason[160]{};
 };
 Stats GetStats();
