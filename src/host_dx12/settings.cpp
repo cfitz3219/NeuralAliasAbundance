@@ -116,14 +116,21 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
         double mbv = _wtof(mb);
         mbv = mbv < -4.0 ? -4.0 : (mbv > 0.0 ? 0.0 : mbv);
         target.j2_mip_bias_x100.store(static_cast<int32_t>(mbv * 100.0 + (mbv < 0 ? -0.5 : 0.5)));
-        // [j2] preset: a letter J..M (NGX value = letter - 'A' + 1), "default", or a number.
+        // [j2] preset_v2: "auto", a letter J..M (NGX value = letter - 'A' + 1), "default", or a
+        // number. Without it, the old [j2] preset key: its "L" was the old default (every save
+        // wrote it), so it becomes Automatic (L for DLAA/Quality, M for Balanced/Performance,
+        // Cort 2026-11-04); any other old choice is kept.
         wchar_t pz[16] = {};
-        GetPrivateProfileStringW(L"j2", L"preset", L"L", pz, 16, ini);
-        uint32_t pv = 12;
-        if (pz[0] >= L'0' && pz[0] <= L'9') pv = static_cast<uint32_t>(_wtoi(pz));
+        GetPrivateProfileStringW(L"j2", L"preset_v2", L"", pz, 16, ini);
+        const bool v2 = pz[0] != 0;
+        if (!v2) GetPrivateProfileStringW(L"j2", L"preset", L"auto", pz, 16, ini);
+        uint32_t pv = 255;
+        if (!_wcsicmp(pz, L"auto")) pv = 255;
+        else if (pz[0] >= L'0' && pz[0] <= L'9') pv = static_cast<uint32_t>(_wtoi(pz));
         else if (!_wcsicmp(pz, L"default")) pv = 0;
-        else if (pz[0] && !pz[1]) { const wchar_t c = towupper(pz[0]); pv = (c >= L'A' && c <= L'Z') ? static_cast<uint32_t>(c - L'A' + 1) : 12; }
-        target.j2_preset.store(pv > 26 ? 12 : pv);
+        else if (pz[0] && !pz[1]) { const wchar_t c = towupper(pz[0]); pv = (c >= L'A' && c <= L'Z') ? static_cast<uint32_t>(c - L'A' + 1) : 255; }
+        if (!v2 && pv == 12) pv = 255;
+        target.j2_preset.store(pv > 26 && pv != 255 ? 255 : pv);
         const uint32_t sm = GetPrivateProfileIntW(L"j2", L"scale_mode", 0, ini);
         target.j2_scale_mode.store(sm > 4 ? 0 : sm);
     }
@@ -202,7 +209,7 @@ void describe_effective()
         "j2.hud_nis=%u(%s) j2.scale_mode=%u(%s) j2.mip_bias_x100=%d(%s) dlss.mode=%u(%s) dlss.preset=%d(%s)",
         g_ini_defaults, g_ini_user,
         g_settings.j2_flow_loosen.load(), source_of(L"j2", L"flow_loosen"),
-        g_settings.j2_preset.load(), source_of(L"j2", L"preset"),
+        g_settings.j2_preset.load(), [] { const char* s = source_of(L"j2", L"preset_v2"); return strcmp(s, "builtin") ? s : source_of(L"j2", L"preset"); }(),
         g_settings.j2_sharpness.load(), source_of(L"j2", L"sharpen"),
         g_settings.j2_hud_nis.load(), source_of(L"j2", L"hud_nis"),
         g_settings.j2_scale_mode.load(), source_of(L"j2", L"scale_mode"),
@@ -306,8 +313,12 @@ bool SaveFromWorker()
     ok &= WritePrivateProfileStringW(L"j2", L"flow_loosen", v, ini) != 0;
     {
         const uint32_t pv = g_settings.j2_preset.load();
-        if (pv >= 1 && pv <= 26) swprintf_s(v, L"%c", static_cast<wchar_t>(L'A' + pv - 1));
+        if (pv == 255) swprintf_s(v, L"auto");
+        else if (pv >= 1 && pv <= 26) swprintf_s(v, L"%c", static_cast<wchar_t>(L'A' + pv - 1));
         else swprintf_s(v, L"default");
+        ok &= WritePrivateProfileStringW(L"j2", L"preset_v2", v, ini) != 0;
+        // Older builds read [j2] preset: they get L for Automatic.
+        if (pv == 255) swprintf_s(v, L"L");
         ok &= WritePrivateProfileStringW(L"j2", L"preset", v, ini) != 0;
         swprintf_s(v, L"%u", g_settings.j2_scale_mode.load());
         ok &= WritePrivateProfileStringW(L"j2", L"scale_mode", v, ini) != 0;

@@ -419,7 +419,7 @@ int main(int argc, char** argv)
             na::observe::SetSamplerMipBiasLiveEnabled(false);
         }
         {
-            // Render-small levels per DLSS mode (Q -1.585, B -2, P -2.5); only the wanted
+            // Render-small levels per DLSS mode (Q -1.585, B -2, P -2.25 since Cort 2026-11-04); only the wanted
             // levels are chosen (Light -0.5 is not wanted, so -0.6 picks -1).
             const float wanted[4] = {-1.0f, na::j2::SmallMipBias(-1.0f, 1.0f / 1.5f), na::j2::SmallMipBias(-1.0f, 1.0f / 1.72f),
                                      na::j2::SmallMipBias(-1.0f, 0.5f)};
@@ -429,7 +429,16 @@ int main(int argc, char** argv)
             na::observe::SetSamplerMipBiasLive(wanted[2]);
             CHECK(na::observe::SamplerMipBias() == -2.0f);
             na::observe::SetSamplerMipBiasLive(wanted[3]);
-            CHECK(na::observe::SamplerMipBias() == -2.5f);
+            CHECK(na::observe::SamplerMipBias() == -2.25f);
+            // Automatic preset (Cort 2026-11-04): L for DLAA/Quality, M for Balanced/Performance;
+            // explicit presets apply in every mode.
+            CHECK(na::j2::PresetFor(na::j2::kPresetAuto, 3440, 3440) == 12u);
+            CHECK(na::j2::PresetFor(na::j2::kPresetAuto, 2293, 3440) == 12u);
+            CHECK(na::j2::PresetFor(na::j2::kPresetAuto, 2000, 3440) == 13u);
+            CHECK(na::j2::PresetFor(na::j2::kPresetAuto, 1720, 3440) == 13u);
+            CHECK(na::j2::PresetFor(12u, 1720, 3440) == 12u);
+            CHECK(na::j2::PresetFor(11u, 3440, 3440) == 11u);
+            CHECK(na::j2::PresetFor(0u, 1720, 3440) == 0u);
             na::observe::SetSamplerMipBiasLive(-0.6f);
             CHECK(na::observe::SamplerMipBias() == -1.0f);
             const float classic[3] = {0.0f, -0.5f, -1.0f};

@@ -1001,16 +1001,17 @@ void DrawLiveDlaa()
         EndRow();
     }
     {
-        // DLSS render preset. NGX values: J 10, K 11, L 12, M 13; 0 = NVIDIA's default.
-        static const char* kLivePresets[] = {"L (default)", "M", "K", "J", "NVIDIA default"};
-        static const uint32_t kLiveValues[] = {12, 13, 11, 10, 0};
+        // DLSS render preset. NGX values: J 10, K 11, L 12, M 13; 0 = NVIDIA's default;
+        // Automatic (Cort 2026-11-04): L for DLAA/Quality, M for Balanced/Performance.
+        static const char* kLivePresets[] = {"Automatic (L / M)", "L (all modes)", "M (all modes)", "K", "J", "NVIDIA default"};
+        static const uint32_t kLiveValues[] = {na::j2::kPresetAuto, 12, 13, 11, 10, 0};
         na::settings::Settings& ss = na::settings::Get();
         const uint32_t cur = ss.j2_preset.load();
         int idx = 0;
-        for (int i = 0; i < 5; ++i) if (kLiveValues[i] == cur) idx = i;
-        BeginRow("DLSS preset", "Which DLSS model runs. L and M are the newest (DLSS 4.5) transformer models; K and J are the earlier transformer models. Changing it restarts DLAA's history for one frame.", S(220));
+        for (int i = 0; i < 6; ++i) if (kLiveValues[i] == cur) idx = i;
+        BeginRow("DLSS preset", "Which DLSS model runs. Automatic uses L for DLAA and Quality and M for Balanced and Performance. L and M are the newest (DLSS 4.5) transformer models; K and J are the earlier transformer models. Changing it restarts DLAA's history for one frame.", S(220));
         ImGui::SetNextItemWidth(S(220));
-        if (ImGui::Combo("##j2preset", &idx, kLivePresets, 5)) {
+        if (ImGui::Combo("##j2preset", &idx, kLivePresets, 6)) {
             ss.j2_preset.store(kLiveValues[idx]);
             na::settings::Save();
         }
