@@ -579,6 +579,21 @@ void main(uint3 id : SV_DispatchThreadID) {
     lobe *= lerp(1.0, 0.35, edge);
     float rcpL = 1.0 / (4.0 * lobe + 1.0);
     float3 o = (lobe * b + lobe * d + lobe * hh + lobe * f + e) * rcpL;
+    // Soft halo control (the idea of separate soft bright/dark overshoot limits is from
+    // bacondither's Adaptive-sharpen, BSD-2; this is our own formulation): where the centre lies
+    // inside its cross's range (an edge or gradient, where halos form), overshoot beyond that
+    // range is compressed smoothly towards a small ceiling, tighter for bright halos (4 % of the
+    // local range) than dark ones (6 %). A centre that is itself the local peak or trough is
+    // fine detail and keeps up to half the range. Flat areas are untouched. Per channel, in the
+    // compressed 0..1 domain RCAS works in.
+    {
+        const float3 lo = min(mn4, e), hi = max(mx4, e), rng = hi - lo;
+        const float3 peak = saturate(step(mx4, e) + step(e, mn4));
+        const float3 kb = rng * lerp(0.04, 0.5, peak) + 1e-6, kd = rng * lerp(0.06, 0.5, peak) + 1e-6;
+        const float3 ov = max(o - hi, 0.0), un = max(lo - o, 0.0);
+        o = o - ov + ov * kb / (kb + ov);
+        o = o + un - un * kd / (kd + un);
+    }
     u_out[p] = float4(inv(o), alpha);
 })";
 bool rcas_init()
