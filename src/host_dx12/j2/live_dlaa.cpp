@@ -3,6 +3,7 @@
 #include "host_dx12/j2/nis_sharpen.hpp"
 #include "host_dx12/j2/nis_scaler.hpp"
 #include "host_dx12/j2/native_hud.hpp"
+#include "core/jitter_domain.hpp"
 #include "host_dx12/j2/route_selector.hpp"
 #include "host_dx12/j2/consumer_profile.hpp"
 #include "host_dx12/j2/post_entry.hpp"
@@ -253,6 +254,7 @@ struct State {
         uint32_t camera_source = 0, cut_reason = 0;
         uint64_t camera_age = 0, selection_version = 0;
         bool tracker_restart = false, flow_ran = false;
+        ID3D12Resource* scene_color = nullptr; // exact pre-flow/pre-post copy of this deferred input
         ID3D12Resource *flow_residual = nullptr, *flow_valid = nullptr, *flow_mask = nullptr; // this frame's tier 3 (NPSR)
     } def;
     std::array<double, 3> def_prev_forward{}; bool def_prev_forward_ok = false; // fast-turn capture trigger
@@ -2369,6 +2371,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         g.def.selection_version = pending.selection_version;
         g.def.tracker_restart = tracker_restart; g.def.cut_reason = cam.cut_reason;
         g.def.flow_ran = flow_tier.residual != nullptr;
+        g.def.scene_color = g.color_in.Get();
         g.def.flow_residual = flow_tier.residual; g.def.flow_valid = flow_tier.valid; g.def.flow_mask = flow_tier.mask;
         if (saved && saved->at_present) ++g.stats.small_present_source;
         else { ++g.stats.small_deferred; g.small_color = color_id; g.small_depth = depth_id; g.small_csub = csub; g.small_dsub = dsub; }
@@ -2860,12 +2863,17 @@ struct SmallRing {
     // a readback of the counts per ring slot (read when the slot comes round again).
     ComPtr<ID3D12Resource> wprev, wread[kRing];
     bool wread_valid[kRing] = {};
+    na::jitter::Source wread_source[kRing]{};
+    uint64_t wread_frame[kRing]{};
+    na::jitter::ColourDomain final_jitter;
+    uint64_t applied_jitter_epoch = 0;
     uint32_t wprev_w = 0, wprev_h = 0;
     DXGI_FORMAT wprev_f = DXGI_FORMAT_UNKNOWN;
     bool wprev_valid = false;
     uint64_t wprev_frame = 0;
-    float wjx = 0.f, wjy = 0.f, last_jx = 0.f, last_jy = 0.f; // last_*: the jitter DLSS was told this present
+    float wjx = 0.f, wjy = 0.f, last_jx = 0.f, last_jy = 0.f; // raster sample; independent of final colour's calibrated declaration
     uint64_t w_frames = 0, w_tested = 0, w_unshifted = 0, w_shifted = 0; // the current window
+    uint64_t w_opposite = 0;
     uint32_t w_unseen_windows = 0;
     ComPtr<ID3D12DescriptorHeap> hud_heap;  // kRing x 5 passes x (3 SRV, 4 UAV)
     ComPtr<ID3D12Resource> prev, hud, mask, hudup;
@@ -2964,11 +2972,16 @@ void witness(uint3 id : SV_DispatchThreadID) {
     const float2 uv = (float2(p) + 0.5) / float2(w, h), du = dj / float2(w, h);
     const float3 c = t0[p].rgb;
     const float e0 = diff3(c, t1[p].rgb);
-    const float ej = min(diff3(c, t1.SampleLevel(s_lin, uv + du, 0).rgb), diff3(c, t1.SampleLevel(s_lin, uv - du, 0).rgb));
+    // dj = current raster sample - previous. Separate the two signs: a
+    // shifted match alone must not qualify an arbitrary jitter convention.
+    const float ej = diff3(c, t1.SampleLevel(s_lin, uv - du, 0).rgb);
+    const float eo = diff3(c, t1.SampleLevel(s_lin, uv + du, 0).rgb);
+    if (min(e0, min(ej, eo)) > 0.06) return; // moving/unexplained colour is not calibration evidence
     uint dummy;
     stats.InterlockedAdd(32u, 1u, dummy);
-    if (e0 * 2.0 < ej) stats.InterlockedAdd(36u, 1u, dummy);
-    else if (ej * 2.0 < e0) stats.InterlockedAdd(40u, 1u, dummy);
+    if (e0 * 2.0 < min(ej, eo)) stats.InterlockedAdd(36u, 1u, dummy);
+    else if (ej * 2.0 < min(e0, eo)) stats.InterlockedAdd(40u, 1u, dummy);
+    else if (eo * 2.0 < min(e0, ej)) stats.InterlockedAdd(44u, 1u, dummy);
 }
 [numthreads(1, 1, 1)]
 void wclear(uint3 id : SV_DispatchThreadID) { stats.Store4(32u, uint4(0, 0, 0, 0)); }
@@ -3454,9 +3467,8 @@ bool witness_targets(ID3D12Resource* frame, uint32_t rw, uint32_t rh)
     }
     return true;
 }
-// The counts this ring slot recorded kRing presents ago (its fence has passed), and the verdict:
-// two 60-frame windows in a row where unshifted matches clearly beat the declared shift turn
-// jitter off (not applied, not declared) until a re-test about a minute later.
+// Completed counts qualify the same colour source for FUTURE frames. Raster
+// injection stays on, and evidence continues after a convention is learned.
 void witness_read(uint32_t si)
 {
     if (!g_small.wread_valid[si]) return;
@@ -3468,10 +3480,16 @@ void witness_read(uint32_t si)
     std::memcpy(v, ptr, sizeof v);
     const D3D12_RANGE none{0, 0};
     g_small.wread[si]->Unmap(0, &none);
-    g_small.w_tested += v[0]; g_small.w_unshifted += v[1]; g_small.w_shifted += v[2];
+    if (!(g_small.wread_source[si] == g_small.final_jitter.Key())) return;
+    g_small.w_tested += v[0]; g_small.w_unshifted += v[1]; g_small.w_shifted += v[2]; g_small.w_opposite += v[3];
     if (++g_small.w_frames < 60) return;
-    g.stats.witness_tested = g_small.w_tested; g.stats.witness_unshifted = g_small.w_unshifted; g.stats.witness_shifted = g_small.w_shifted;
+    g.stats.witness_tested = g_small.w_tested; g.stats.witness_unshifted = g_small.w_unshifted; g.stats.witness_shifted = g_small.w_shifted + g_small.w_opposite;
     ++g.stats.witness_windows;
+    if (g_small.final_jitter.Observe(g_small.wread_source[si],
+        {g_small.wread_frame[si],g_small.w_tested,g_small.w_unshifted,g_small.w_shifted,g_small.w_opposite}))
+        ++g.stats.jitter_input_changes;
+    g.stats.jitter_input_convention = static_cast<uint32_t>(g_small.final_jitter.Get());
+    g.stats.jitter_input_epoch = g_small.final_jitter.Epoch();
     if (g_small.w_tested >= 20000) {
         if (g_small.w_unshifted > 3 * g_small.w_shifted) ++g_small.w_unseen_windows;
         else if (g_small.w_shifted > g_small.w_unshifted) g_small.w_unseen_windows = 0;
@@ -3484,7 +3502,7 @@ void witness_read(uint32_t si)
             g_small.w_unseen_windows = 0;
         } else if (g_small.w_shifted > g_small.w_unshifted) g.stats.jitter_unseen = false;
     }
-    g_small.w_frames = g_small.w_tested = g_small.w_unshifted = g_small.w_shifted = 0;
+    g_small.w_frames = g_small.w_tested = g_small.w_unshifted = g_small.w_shifted = g_small.w_opposite = 0;
 }
 // HUD fallback counts of the frame that last used this ring slot (its GPU work has completed).
 void hud_read(uint32_t si)
@@ -3532,7 +3550,6 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
     if (FAILED(g_small.alloc[si]->Reset()) || FAILED(l->Reset(g_small.alloc[si].Get(), nullptr))) {
         ++g.stats.small_failed; small_note("Render-small: could not reset its list."); return false;
     }
-    witness_read(si);
     hud_read(si);
     constexpr UINT PRESENT = D3D12_RESOURCE_STATE_PRESENT, NPSR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                    UAV = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -3546,7 +3563,20 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
     const bool fresh = d.valid && d.frame + 1 == g.frame && d.w == rw && d.h == rh;
     const bool can_dlss = fresh && forward && g.dlss_ready && g.device && g.device.Get() == g_small.device.Get() &&
                           g.queue.Get() == queue && g.depth32 && g.motion && g.paused.load() == false;
+    if (can_dlss) {
+        const na::jitter::Source source{d.selection_version,rw,rh,static_cast<uint32_t>(frame->GetDesc().Format)};
+        if (!(source == g_small.final_jitter.Key())) {
+            g_small.final_jitter.Bind(source);
+            g_small.w_frames = g_small.w_tested = g_small.w_unshifted = g_small.w_shifted = g_small.w_opposite = 0;
+            g_small.wprev_valid = false;
+        }
+    }
+    witness_read(si);
+    g.stats.jitter_input_convention = static_cast<uint32_t>(g_small.final_jitter.Get());
+    g.stats.jitter_input_epoch = g_small.final_jitter.Epoch();
+    const auto colour_jitter = g_small.final_jitter.Resolve({d.jx,d.jy});
     bool dlss = false;
+    bool evaluation_reset = false;
     // HUD separation: on when [j2] hud_nis > 0, for SDR pictures, once the last frame is held.
     const uint32_t hud_nis = na::settings::Get().j2_hud_nis.load(std::memory_order_relaxed);
     const bool hud_want = !layer_frame && g_hud_mask_on.load(std::memory_order_relaxed) && hud_nis > 0 && !hdr && can_dlss &&
@@ -3593,6 +3623,8 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
             add(b, g_small.hud_stats.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, UAV);
             flush(l, b);
             g_small.wread_valid[si] = true;
+            g_small.wread_source[si] = g_small.final_jitter.Key();
+            g_small.wread_frame[si] = d.frame;
             ++g.stats.witness_frames;
         }
         if (hud_want && g_small.prev_valid) {
@@ -3658,17 +3690,19 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         e.quality = na::dlss::QualityForScale(rw, rh, ow, oh);
         e.preset = na::j2::PresetFor(na::settings::Get().j2_preset.load(), rw, ow);
         e.view_id = kSmallViewId;
-        e.jitter_x = d.jx;
-        e.jitter_y = d.jy;
+        e.jitter_x = colour_jitter.x;
+        e.jitter_y = colour_jitter.y;
         g_small.last_jx = d.jx; g_small.last_jy = d.jy;
         // History continues only from the previous frame's evaluation at the same sizes.
         e.reset = d.reset || g.small_last == 0 || d.frame != g.small_last + 1 ||
-                  g.small_ow != ow || g.small_oh != oh || g.small_rw != rw || g.small_rh != rh;
+                  g.small_ow != ow || g.small_oh != oh || g.small_rw != rw || g.small_rh != rh ||
+                  g_small.applied_jitter_epoch != g_small.final_jitter.Epoch();
         e.hdr = hdr;
         e.depth_inverted = d.reversed;
         e.auto_exposure = true;
         // HUD protection: DLSS trusts this frame's colour where the learned mask says HUD.
         e.bias_current_color = hud_mask ? g_small.mask.Get() : nullptr;
+        evaluation_reset = e.reset;
         dlss = na::dlss::Evaluate(l, e);
         // Debug view (Cort 2026-11-04: the views showed nothing in render-small, where DLSS runs
         // here and the in-frame path that drew them no longer evaluates): replace the picture with
@@ -3682,6 +3716,7 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
             if (debug_shown) b.push_back(uav_barrier(out));
         }
         add(b, g.motion.Get(), NPSR, UAV);
+        if (dlss) g_small.applied_jitter_epoch = g_small.final_jitter.Epoch();
         if (dlss && debug_shown) {
             g.small_last = d.frame;
             g.small_ow = ow; g.small_oh = oh; g.small_rw = rw; g.small_rh = rh;
@@ -3825,9 +3860,12 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         ci.width = rw;
         ci.height = rh;
         ci.color_format = static_cast<uint32_t>(ff);
-        ci.jitter_x = d.jx;
-        ci.jitter_y = d.jy;
-        ci.reset = (d.reset || g.small_last == 0) ? 1u : 0u;
+        ci.jitter_x = colour_jitter.x;
+        ci.jitter_y = colour_jitter.y;
+        ci.raster_jitter_x = d.jx; ci.raster_jitter_y = d.jy;
+        ci.jitter_convention = static_cast<uint32_t>(g_small.final_jitter.Get());
+        ci.jitter_epoch = g_small.final_jitter.Epoch();
+        ci.reset = evaluation_reset ? 1u : 0u;
         ci.preset = na::j2::PresetFor(na::settings::Get().j2_preset.load(), rw, ow);
         ci.sharpness = na::settings::Get().j2_sharpness.load(std::memory_order_relaxed);
         // 2026-11-04: this evaluation's output IS the presented picture (no overlay pairing),
@@ -3852,6 +3890,7 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
             if (r && cp.extra_count < na::capture::j2::kMaxExtra) cp.extra[cp.extra_count++] = {name, r, st};
         };
         extra("provenance", g.provenance.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        extra("scene_color", d.scene_color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         if (d.flow_ran) {
             extra("flow_residual", d.flow_residual, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             extra("flow_valid", d.flow_valid, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -3888,8 +3927,8 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         na::capture::j2::FrameNote fnote;
         fnote.frame = g.frame;
         fnote.dlss = dlss ? 1u : 0u;
-        fnote.reset = dlss && (d.reset || g.small_last == 0) ? 1u : 0u;
-        fnote.jitter_x = d.jx; fnote.jitter_y = d.jy;
+        fnote.reset = dlss && evaluation_reset ? 1u : 0u;
+        fnote.jitter_x = colour_jitter.x; fnote.jitter_y = colour_jitter.y;
         na::observe::GetLiveSelection(&fnote.selection_depth, &fnote.selection_color);
         fnote.selection_version = na::observe::LiveSelectionVersion();
         fnote.camera_source = d.camera_source; fnote.camera_age = d.camera_age;
@@ -4008,6 +4047,27 @@ bool RecordHudClassifyForTests(ID3D12CommandQueue* queue, ID3D12GraphicsCommandL
     ID3D12Resource* const uav[3] = {nullptr, evidence, nullptr};
     const DXGI_FORMAT uf[3] = {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_UNKNOWN};
     hud_pass(list, 0, 0, srv, sf, uav, uf, k, (w + 7) / 8, (h + 7) / 8);
+    return true;
+}
+bool RecordJitterWitnessForTests(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list, ID3D12Resource* cur,
+    ID3D12Resource* prev, ID3D12Resource* motion, uint32_t w, uint32_t h, float dx, float dy, ID3D12Resource* counts)
+{
+    std::lock_guard<std::mutex> lock(g.m);
+    if (!small_init(queue) || !hud_init() || !counts) return false;
+    uint32_t k[8] = {w,h,0,0,0,0,0,0};
+    std::memcpy(&k[6],&dx,4); std::memcpy(&k[7],&dy,4);
+    ID3D12Resource* const empty[3] = {nullptr,nullptr,nullptr};
+    const DXGI_FORMAT none[3] = {DXGI_FORMAT_UNKNOWN,DXGI_FORMAT_UNKNOWN,DXGI_FORMAT_UNKNOWN};
+    hud_pass(list,6,0,empty,none,empty,none,k,1,1);
+    auto barrier=uav_barrier(g_small.hud_stats.Get());list->ResourceBarrier(1,&barrier);
+    ID3D12Resource* const srv[3] = {cur,prev,motion};
+    const DXGI_FORMAT sf[3] = {typed(cur->GetDesc().Format),typed(prev->GetDesc().Format),DXGI_FORMAT_R32G32_FLOAT};
+    hud_pass(list,5,0,srv,sf,empty,none,k,(w+7)/8,(h+7)/8);
+    barrier=uav_barrier(g_small.hud_stats.Get());list->ResourceBarrier(1,&barrier);
+    std::vector<D3D12_RESOURCE_BARRIER> b;
+    add(b,g_small.hud_stats.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE);flush(list,b);
+    list->CopyBufferRegion(counts,0,g_small.hud_stats.Get(),32,16);
+    add(b,g_small.hud_stats.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);flush(list,b);
     return true;
 }
 void SetDebugView(int mode) { g_debug_view.store(mode < 0 || mode > 3 ? 0 : mode); }
