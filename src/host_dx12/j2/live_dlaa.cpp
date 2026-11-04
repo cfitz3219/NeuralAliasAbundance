@@ -1685,7 +1685,10 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         return saved ? entry_state(id, sub, st) : inl ? state_now(id, sub, st) : state_after(lists, scene, id, sub, st);
     };
     // Layer2 companions are private textures, not observed: their exact states come with them.
-    const bool have_sc = phys ? (sc = phys->color_state, true) : state_of(color_id, csub, &sc);
+    // I1.4: the Present-time source never touches the scene colour (DLSS reads the presented
+    // picture), so its state at Present is not needed (Cort's 9346113 run: every attempt waited on it).
+    const bool skip_color = saved && saved->at_present;
+    const bool have_sc = phys ? (sc = phys->color_state, true) : skip_color ? true : state_of(color_id, csub, &sc);
     bool have_sd = phys ? (sd = phys->depth_state, true) : state_of(depth_id, dsub, &sd);
     // Never replace missing state provenance with a state learned on old frames.
     // Private completion bookkeeping must preserve the real carried state instead.
@@ -2011,10 +2014,13 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     const UINT color_dest = color_msaa ? D3D12_RESOURCE_STATE_RESOLVE_DEST : DST;
     addsub(b, depth.Get(), dsub, sd, SRC);
     add(b, g.depth32.Get(), NPSR, depth_msaa ? UAV : DST);
-    addsub(b, color.Get(), csub, sc, color_source);
-    add(b, g.color_in.Get(), NPSR, color_dest);
+    if (!skip_color) {
+        addsub(b, color.Get(), csub, sc, color_source);
+        add(b, g.color_in.Get(), NPSR, color_dest);
+    }
     flush(l, b);
-    if (color_msaa) {
+    if (skip_color) {
+    } else if (color_msaa) {
         l->ResolveSubresource(g.color_in.Get(), 0, color.Get(), csub, cf);
     } else {
         D3D12_TEXTURE_COPY_LOCATION cs{}, cdst{};
@@ -2024,7 +2030,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         cdst.pResource = g.color_in.Get();
         l->CopyTextureRegion(&cdst, 0, 0, 0, &cs, nullptr);
     }
-    add(b, g.color_in.Get(), color_dest, NPSR);
+    if (!skip_color) add(b, g.color_in.Get(), color_dest, NPSR);
     D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
     src.Type = dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     src.pResource = depth.Get();
@@ -2104,7 +2110,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     add(b, g.motion.Get(), UAV, NPSR);
     flush(l, b);
     if (deferred) { // render-small: keep depth + motion for Present; the scene colour stays as drawn
-        addsub(b, color.Get(), csub, color_source, sc);
+        if (!skip_color) addsub(b, color.Get(), csub, color_source, sc);
         add(b, g.motion.Get(), NPSR, UAV);
         flush(l, b);
         if (!inl && FAILED(l->Close())) { reason("Render-small: could not close the depth and motion list."); g.latched = true; return false; }
