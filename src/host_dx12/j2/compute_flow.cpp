@@ -43,7 +43,7 @@ struct Context {
     unsigned hist_read=0;uint64_t hist_frame=0;unsigned hist_generation=0; // last committed pair's candidates
     UINT64 frequency=0;
     na::ffx_flow::PairFlow engine;na::nvof::FlowExpand expand;na::motion::gpu::Arbiter derive;na::motion::gpu::CameraFit fit;
-    na::jitter::gpu::Probe jitter_probe;na::jitter::ColourDomain colour_jitter;
+    na::jitter::gpu::Probe jitter_probe;na::jitter::ColourDomain colour_jitter{na::jitter::kStageFlow};
     na::jitter::Evidence jitter_window{};uint32_t jitter_window_frames=0;uint64_t jitter_last_frame=0;
     std::vector<std::unique_ptr<Image>> images;std::vector<std::unique_ptr<Slot>> leases;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu(unsigned slot,unsigned table,unsigned i){auto a=leases[slot]->heap->GetCPUDescriptorHandleForHeapStart();a.ptr+=SIZE_T(table*kTable+i)*stride;return a;}

@@ -40,6 +40,26 @@ int main() {
             CHECK(d.Observe(s,{360,100000,1000,95000,1000}));
             CHECK(d.Get()==Convention::Raster && d.Resolve({.25f,.5f}).y==.5f);
         }},
+        {"a remembered verdict survives source changes and still yields to new evidence", [] {
+            ColourDomain a(7), b(7), other(8);
+            const Source s1{10,2293,941,28}, s2{11,2000,820,28}, s3{12,2000,820,10};
+            { // memory is off until the host loads its settings: nothing is kept
+                ColourDomain x(7), y(7); x.Bind(s1);
+                x.Observe(s1,{60,100000,95000,1000,1000}); CHECK(x.Observe(s1,{120,100000,95000,1000,1000}));
+                y.Bind(s2); CHECK(y.Get()==Convention::Unknown);
+            }
+            na::jitter::Remembered().enabled.store(true);
+            a.Bind(s1);
+            a.Observe(s1,{60,100000,95000,1000,1000}); CHECK(a.Observe(s1,{120,100000,95000,1000,1000}));
+            b.Bind(s2); // new selection and size, same stage and format: no relearning
+            CHECK(b.Get()==Convention::Unjittered && b.Resolve({.25f,.5f}).x==0);
+            other.Bind(s2); CHECK(other.Get()==Convention::Unknown); // other stage: independent
+            b.Bind(s3); CHECK(b.Get()==Convention::Unknown); // other format and nothing saved for the stage
+            na::jitter::Remembered().Put(7, 0, static_cast<uint32_t>(Convention::Unjittered)); // saved per game
+            const Source s4{13,2000,820,24}; b.Bind(s4); CHECK(b.Get()==Convention::Unjittered);
+            CHECK(!b.Observe(s4,{60,100000,1000,95000,1000})); // one contrary window is not enough
+            CHECK(b.Observe(s4,{120,100000,1000,95000,1000}) && b.Get()==Convention::Raster);
+        }},
         {"opposite sign is established separately rather than guessed from any shifted match", [] {
             ColourDomain d;const Source s{1,640,360,28};d.Bind(s);
             d.Observe(s,{60,100000,1000,1000,95000});CHECK(d.Observe(s,{120,100000,1000,1000,95000}));

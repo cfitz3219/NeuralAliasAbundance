@@ -82,6 +82,9 @@ struct Settings {
     std::atomic<uint32_t> j2_capture_auto{0};        // automatic capture sessions per run (0 = off)
     std::atomic<uint32_t> j2_capture_cooldown_s{20}; // seconds between automatic captures
     std::atomic<uint32_t> j2_scale_mode{0}; // P4-4 slider route: DlssMode the game renders at ([j2] scale_mode; 0 = DLAA)
+    // Remembered jitter conventions (na::jitter::Convention; 0 = not learned yet), per game in the
+    // user ini ([j2] jitter_conv_flow / jitter_conv_final): the calibration starts from them.
+    std::atomic<uint32_t> j2_jitter_conv_flow{0}, j2_jitter_conv_final{0};
     std::atomic<uint32_t> j2_preset{255};    // J2 DLSS render preset ([j2] preset_v2; 255 = Automatic: L for DLAA/Quality, M for Balanced/Performance; 12 = L, 0 = NVIDIA default)
     std::atomic<uint32_t> nr_structure{100};
     std::atomic<uint32_t> nr_tone{0};

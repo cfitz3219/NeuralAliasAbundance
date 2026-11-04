@@ -1,4 +1,5 @@
 #include "host_dx12/settings.hpp"
+#include "core/jitter_domain.hpp"
 
 #include <shlobj.h>
 #include <windows.h>
@@ -133,6 +134,10 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
         target.j2_preset.store(pv > 26 && pv != 255 ? 255 : pv);
         const uint32_t sm = GetPrivateProfileIntW(L"j2", L"scale_mode", 0, ini);
         target.j2_scale_mode.store(sm > 4 ? 0 : sm);
+        const uint32_t jf = GetPrivateProfileIntW(L"j2", L"jitter_conv_flow", 0, ini);
+        const uint32_t jn = GetPrivateProfileIntW(L"j2", L"jitter_conv_final", 0, ini);
+        target.j2_jitter_conv_flow.store(jf > 3 ? 0 : jf);
+        target.j2_jitter_conv_final.store(jn > 3 ? 0 : jn);
     }
     target.nr_structure.store(pct(L"structure", 100));
     target.nr_tone.store(pct(L"tone", 0));
@@ -253,6 +258,16 @@ void Load()
 #define REMEMBER(member) g_loaded_values.member.store(g_settings.member.load());
     NA_PERSISTED_FIELDS(REMEMBER)
 #undef REMEMBER
+    // Jitter calibration starts from this game's saved verdicts (Cort 2026-11-04: no re-learning
+    // window after scene changes or at launch); a new verdict is saved again.
+    na::jitter::Remembered().enabled.store(true);
+    if (const uint32_t c = g_settings.j2_jitter_conv_flow.load()) na::jitter::Remembered().Put(na::jitter::kStageFlow, 0, c);
+    if (const uint32_t c = g_settings.j2_jitter_conv_final.load()) na::jitter::Remembered().Put(na::jitter::kStageFinal, 0, c);
+    na::jitter::OnRemember() = [](uint32_t stage, uint32_t c) {
+        auto& slot = stage == na::jitter::kStageFlow ? g_settings.j2_jitter_conv_flow : g_settings.j2_jitter_conv_final;
+        if (stage != na::jitter::kStageFlow && stage != na::jitter::kStageFinal) return;
+        if (slot.exchange(c) != c) Save();
+    };
     describe_effective();
 
 }
@@ -322,6 +337,10 @@ bool SaveFromWorker()
         ok &= WritePrivateProfileStringW(L"j2", L"preset", v, ini) != 0;
         swprintf_s(v, L"%u", g_settings.j2_scale_mode.load());
         ok &= WritePrivateProfileStringW(L"j2", L"scale_mode", v, ini) != 0;
+        swprintf_s(v, L"%u", g_settings.j2_jitter_conv_flow.load());
+        ok &= WritePrivateProfileStringW(L"j2", L"jitter_conv_flow", v, ini) != 0;
+        swprintf_s(v, L"%u", g_settings.j2_jitter_conv_final.load());
+        ok &= WritePrivateProfileStringW(L"j2", L"jitter_conv_final", v, ini) != 0;
         swprintf_s(v, L"%.2f", static_cast<int32_t>(PersistedSwitch(5,static_cast<uint32_t>(g_settings.j2_mip_bias_x100.load()))) / 100.0);
         ok &= WritePrivateProfileStringW(L"j2", L"mip_bias", v, ini) != 0;
     }

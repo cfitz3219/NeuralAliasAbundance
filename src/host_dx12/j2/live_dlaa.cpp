@@ -2756,7 +2756,7 @@ struct SmallRing {
     bool wread_valid[kRing] = {};
     na::jitter::Source wread_source[kRing]{};
     uint64_t wread_frame[kRing]{};
-    na::jitter::ColourDomain final_jitter;
+    na::jitter::ColourDomain final_jitter{na::jitter::kStageFinal};
     uint64_t applied_jitter_epoch = 0;
     uint32_t wprev_w = 0, wprev_h = 0;
     DXGI_FORMAT wprev_f = DXGI_FORMAT_UNKNOWN;
