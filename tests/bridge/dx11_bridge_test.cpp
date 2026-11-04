@@ -278,11 +278,13 @@ void CaseDunia(bool warp, const std::wstring& helper, const std::wstring& data)
     if (!(color && depth && motion && target && staging && dsv && motion_rtv && target_rtv)) return;
 
     // Game state the bridge must leave alone.
-    auto dummy = MakeTexture(device, 8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, nullptr, 0);
+    // Two textures: D3D11 itself unbinds a view whose texture is bound as the render target.
+    auto dummy_tex = MakeTexture(device, 8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_SHADER_RESOURCE, nullptr, 0);
+    auto dummy_rt = MakeTexture(device, 8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_RENDER_TARGET, nullptr, 0);
     ComPtr<ID3D11ShaderResourceView> dummy_srv;
     ComPtr<ID3D11RenderTargetView> dummy_rtv;
-    device->CreateShaderResourceView(dummy.Get(), nullptr, &dummy_srv);
-    device->CreateRenderTargetView(dummy.Get(), nullptr, &dummy_rtv);
+    device->CreateShaderResourceView(dummy_tex.Get(), nullptr, &dummy_srv);
+    device->CreateRenderTargetView(dummy_rt.Get(), nullptr, &dummy_rtv);
     ID3D11ShaderResourceView* srv0 = dummy_srv.Get();
     ID3D11RenderTargetView* rtv0 = dummy_rtv.Get();
     const FLOAT blend_factor[4] = {0.1f, 0.2f, 0.3f, 0.4f};
