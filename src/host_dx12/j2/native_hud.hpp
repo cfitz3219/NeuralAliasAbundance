@@ -24,9 +24,11 @@
 #include <d3d12.h>
 #include <cstdint>
 #include <string>
+#include <memory>
 
 namespace na::observe { struct NativeOperation; }
 namespace na::j2::native_hud {
+class Picture;
 
 // Boot (render-small): the draw hook, the clear hook, the bind listener and the observer's
 // raster-state snapshots. Before the game creates its command lists. Idempotent.
@@ -44,11 +46,15 @@ struct Layer {
     DXGI_FORMAT view = DXGI_FORMAT_UNKNOWN; // the format the game drew with (read with it)
     float grey = 0.f;              // N1's background as read through `view` (linear if sRGB)
     bool srgb = false;             // `view` is an sRGB format (the picture itself is stored encoded)
+    std::shared_ptr<void> owner;     // layers retained through source recordings and Present GPU completion
+    std::shared_ptr<Picture> picture; // draw transfer: complete original was preserved, GPU chooses clean/protect
+    bool clean_allowed = false;
 };
 // PresentUpscale, for the proxy `frame` about to be upscaled from rw x rh to ow x oh: learns
 // the proxy (its HUD draws are redirected from its next frame on) and returns true when this
 // frame's HUD went into the layers. Ends the frame either way.
-bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, Layer* out);
+bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, Layer* out,
+               ID3D12CommandQueue* queue = nullptr);
 
 struct Stats {
     uint64_t frames = 0, hud_frames = 0;    // frames presented while learned / with a HUD layer
@@ -72,8 +78,11 @@ struct Stats {
     uint64_t lineage_miss = 0, lineage_recovered = 0;
     uint64_t world_depth = 0; // draws left in the picture because they are depth-tested on the scene depth
     uint32_t traces = 0;      // frame-structure traces taken (hud_trace lines in the log)
+    uint64_t draw_transfer_frames = 0, draw_protect_frames = 0;
+    uint64_t transfer_verified=0,transfer_changed=0,clean_verified=0,protection_verified=0;
 };
 Stats GetStats();
+void ReportPictureResult(bool identity,bool clean); // completed GPU receipt, status only
 std::string StatusLine();
 // Finished frame-structure traces (hud_trace JSON lines, CRLF), taken once; empty when none.
 std::string TakeTrace();

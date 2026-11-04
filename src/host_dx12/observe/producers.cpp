@@ -145,6 +145,7 @@ struct ListState {
     bool raster_viewports_known = false, raster_scissors_known = false, raster_topology_known = false;
     bool raster_targets_known = false, raster_has_depth = false;
     bool raster_tracking = false; // latched at Reset; an Off request cannot undo restoration mid-recording
+    uint32_t active_queries=0;
     std::vector<std::shared_ptr<const DescriptorDetails>> native_colors;
     uint64_t target_serial=0,viewport_serial=0,scissor_serial=0;
     std::shared_ptr<const DescriptorDetails> native_depth;
@@ -163,6 +164,8 @@ struct Obj {
     std::vector<ShaderDimension> dimensions;
     std::vector<ShaderResource> shader_resources;
     bool reflection_complete=false;
+    bool native_hud_affine=false;
+    bool shader_readonly=false;
     // Live mip bias: per-level twins of a root signature / pipeline state (index = level).
     // same[i]: the game's own object is already correct for level i (nothing to swap).
     // Immutable once published; owns a reference on every twin. A twin is never one of
@@ -1652,8 +1655,26 @@ void blend_mask(na_ev_pipeline_created& e, const D3D12_BLEND_DESC& b)
     }
 }
 
+// RGB replay uses out=a+dst*b. Opaque, straight/premultiplied alpha-over,
+// and pure colour multiplication fit it without saturating the grey witness.
+// MIN/MAX/logic/additive-clipping and destination-alpha coupling instead keep
+// the original full picture and use the draw-derived protection method.
+thread_local bool g_next_hud_affine=false;
+thread_local bool g_next_stream_output=false;
+bool hud_affine(const D3D12_BLEND_DESC& blend)
+{
+    const auto& b=blend.RenderTarget[0];
+    if(b.LogicOpEnable)return false;
+    if(!b.BlendEnable)return true;
+    if(b.BlendOp!=D3D12_BLEND_OP_ADD)return false;
+    return ((b.SrcBlend==D3D12_BLEND_SRC_ALPHA||b.SrcBlend==D3D12_BLEND_ONE)&&b.DestBlend==D3D12_BLEND_INV_SRC_ALPHA)||
+           (b.SrcBlend==D3D12_BLEND_ZERO&&(b.DestBlend==D3D12_BLEND_SRC_COLOR||b.DestBlend==D3D12_BLEND_INV_SRC_COLOR));
+}
+
 void pipeline_unknowns(na_ev_pipeline_created& e)
 {
+    g_next_hud_affine=false;
+    g_next_stream_output=false;
     for (auto& f : e.rtv_formats) f = 0;
     e.dsv_format = 0;
     e.sample_count = NA_UNKNOWN_U32;
@@ -1672,7 +1693,10 @@ void emit_pipeline(ID3D12Device* dev, IUnknown* obj, na_ev_pipeline_created& e, 
         const auto found=g_objs.find(canon(obj));if(found!=g_objs.end()){
             found->second.dimensions=g_next_dimensions;found->second.shader_resources=g_next_shader_resources;
             found->second.reflection_complete=g_next_reflection_complete;}
+        if(found!=g_objs.end())found->second.shader_readonly=g_next_reflection_complete&&!g_next_stream_output&&
+            std::none_of(g_next_shader_resources.begin(),g_next_shader_resources.end(),[](const auto& r){return r.type==D3D12_DESCRIPTOR_RANGE_TYPE_UAV;});
     }
+    {std::unique_lock<std::shared_mutex> lock(g_m);const auto found=g_objs.find(canon(obj));if(found!=g_objs.end())found->second.native_hud_affine=g_next_hud_affine;}
     emit(e, NA_GROUP_PIPELINE);
 }
 
@@ -1945,6 +1969,8 @@ HRESULT STDMETHODCALLTYPE D_CreateGraphicsPipelineState(ID3D12Device* dev, const
     e.sample_count = d->SampleDesc.Count;
     depth_blend(e, d->DepthStencilState.DepthEnable, d->DepthStencilState.DepthWriteMask, d->DepthStencilState.DepthFunc);
     blend_mask(e, d->BlendState);
+    g_next_hud_affine=hud_affine(d->BlendState);
+    g_next_stream_output=d->StreamOutput.NumEntries!=0;
     emit_pipeline(dev, obj, e, d->pRootSignature);
     make_pso_twins(obj, d->pRootSignature, [&](int, ID3D12RootSignature* trs) -> IUnknown* {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC c = *d;
@@ -2066,7 +2092,8 @@ HRESULT STDMETHODCALLTYPE D_CreatePipelineState(ID3D12Device2* dev, const D3D12_
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS: bytecode(e, NA_STAGE_CS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: bytecode(e, NA_STAGE_AS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: bytecode(e, NA_STAGE_MS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: blend_mask(e, inner_of<D3D12_BLEND_DESC>(s)); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: blend_mask(e, inner_of<D3D12_BLEND_DESC>(s)); g_next_hud_affine=hud_affine(inner_of<D3D12_BLEND_DESC>(s)); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: g_next_stream_output=inner_of<D3D12_STREAM_OUTPUT_DESC>(s).NumEntries!=0;break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL: {
             const auto& ds = inner_of<D3D12_DEPTH_STENCIL_DESC>(s);
             depth_blend(e, ds.DepthEnable, ds.DepthWriteMask, ds.DepthFunc);
@@ -2369,6 +2396,7 @@ struct On<sl::list::Reset> {
                     ls->cur_rt = ls->cur_ds = 0;
                     ls->cur_nrt = 0;
                     ls->restorable = true;
+                    ls->active_queries=0;
                     ls->in_render_pass = false;
                     ls->raster_viewports_known = ls->raster_scissors_known = ls->raster_topology_known = false;
                     ls->raster_targets_known = false;
@@ -2443,6 +2471,12 @@ struct On<sl::list::DrawInstanced> {
         if (r.list) note_draw(l);
     }
 };
+template<> struct On<sl::list::BeginQuery>{static void run(GL* l,ID3D12QueryHeap*,D3D12_QUERY_TYPE type,UINT){
+    if(type!=D3D12_QUERY_TYPE_TIMESTAMP)with_list_state(l,[](ListState& s){std::lock_guard<std::mutex> lock(s.bind_m);++s.active_queries;});
+}};
+template<> struct On<sl::list::EndQuery>{static void run(GL* l,ID3D12QueryHeap*,D3D12_QUERY_TYPE type,UINT){
+    if(type!=D3D12_QUERY_TYPE_TIMESTAMP)with_list_state(l,[](ListState& s){std::lock_guard<std::mutex> lock(s.bind_m);if(s.active_queries)--s.active_queries;});
+}};
 template <>
 struct On<sl::list::DrawIndexedInstanced> {
     static void run(GL* l, UINT n, UINT i, UINT, INT, UINT)
@@ -3695,6 +3729,8 @@ bool register_list_slots()
         ListHook<L::Close, HRESULT()>::spec(),
         ListHook<L::Reset, HRESULT(ID3D12CommandAllocator*, ID3D12PipelineState*)>::spec(),
         ListHook<L::DrawInstanced, void(UINT, UINT, UINT, UINT)>::spec(),
+        ListHook<L::BeginQuery,void(ID3D12QueryHeap*,D3D12_QUERY_TYPE,UINT)>::spec(),
+        ListHook<L::EndQuery,void(ID3D12QueryHeap*,D3D12_QUERY_TYPE,UINT)>::spec(),
         ListHook<L::DrawIndexedInstanced, void(UINT, UINT, UINT, INT, UINT)>::spec(),
         ListHook<L::Dispatch, void(UINT, UINT, UINT)>::spec(),
         ListHook<L::CopyBufferRegion, void(ID3D12Resource*, UINT64, ID3D12Resource*, UINT64, UINT64)>::spec(),
@@ -5270,6 +5306,7 @@ bool ListDrawState(ID3D12CommandList* list, DrawInfo& out)
     const bool complete = ls->coverage_complete.load();
     std::lock_guard<std::mutex> bl(ls->bind_m);
     r.rt = ls->cur_rt; r.ds = ls->cur_ds; r.rt_count = ls->cur_nrt;
+    r.query_active=ls->active_queries!=0;
     r.restorable = complete && ls->raster_tracking && ls->restorable && !ls->in_render_pass && ls->raster_targets_known &&
                    ls->raster_viewports_known && ls->raster_scissors_known;
     if (ls->raster_viewports_known) {
@@ -5294,6 +5331,8 @@ bool ListDrawState(ID3D12CommandList* list, DrawInfo& out)
             r.pipeline_known = true;
             r.pso_rt_count = p->rt_count; r.rtv_format = p->rtv_formats[0]; r.dsv_format = p->dsv_format;
             r.samples = p->sample_count; r.blend_mask = p->blend_enable_mask;
+            r.native_hud_affine=pipeline->second.native_hud_affine;
+            r.shader_readonly=pipeline->second.shader_readonly;
             r.depth_enable = p->depth_enable; r.depth_func = p->depth_func;
         }
     }

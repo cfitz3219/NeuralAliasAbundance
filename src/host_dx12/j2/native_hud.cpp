@@ -1,5 +1,7 @@
 #include "host_dx12/j2/native_hud.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/j2/hud_picture.hpp"
+#include "host_dx12/nr/native_fg.hpp"
 
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/observe/shader_operation.hpp"
@@ -29,6 +31,7 @@ constexpr uint32_t kViews = 4;       // render-target view formats per layer (ty
 constexpr uint64_t kGraveFrames = 8; // presents before a replaced layer is released
 
 std::atomic<bool> g_installed{false}, g_on{true}, g_cover{false};
+struct CapturedPicture;
 
 struct Proxy {
     na_object_id id = 0;
@@ -48,6 +51,10 @@ struct Proxy {
     // full-screen copy or draw. It is learned from structure and then handled exactly like the
     // back buffer: its HUD draws go to the native layers, so the copy carries the scene only.
     bool upstream = false;
+    bool preserve = false, clean = true;
+    std::shared_ptr<Picture> picture;
+    std::vector<na::nr::native::RecordingLease> picture_uses;
+    std::shared_ptr<CapturedPicture> output; // exact handoff into this back-buffer identity
     na_object_id source = 0;     // this frame: the single picture-sized input of the opaque full-screen hand-off into this proxy
     bool source_ambiguous = false;
     bool source_copy = false;    // that hand-off was a whole-resource Copy* (a transfer), not a draw (processing)
@@ -80,6 +87,46 @@ std::mutex g_m;
 Proxy g_proxy[kProxies];
 uint64_t g_frame = 0;
 Layers g_l;
+struct LayerStorage { Layers layers; std::vector<na::nr::native::RecordingLease> uses; };
+struct CapturedPicture {
+    std::shared_ptr<Picture> picture;
+    std::shared_ptr<LayerStorage> owner;
+    std::vector<na::nr::native::RecordingLease> uses;
+    DXGI_FORMAT view=DXGI_FORMAT_UNKNOWN;
+    bool clean=false;uint32_t draws=0,forwarded=0;
+};
+std::shared_ptr<LayerStorage> g_layer_owner;
+std::vector<std::shared_ptr<LayerStorage>> g_layer_pool;
+std::vector<std::shared_ptr<Picture>> g_picture_pool;
+std::shared_ptr<Picture> picture_locked(ID3D12Device* dev,const D3D12_RESOURCE_DESC& desc,uint32_t ow,uint32_t oh)
+{
+    g_picture_pool.erase(std::remove_if(g_picture_pool.begin(),g_picture_pool.end(),[&](const auto& p){
+        return p.use_count()==1&&!p->Matches(dev,desc,ow,oh);
+    }),g_picture_pool.end());
+    for(const auto& p:g_picture_pool)if(p.use_count()==1&&p->Matches(dev,desc,ow,oh)){p->BeginCycle();return p;}
+    auto p=Picture::Create(dev,desc,ow,oh);if(p)g_picture_pool.push_back(p);return p;
+}
+// The source commands and our Present commands can overlap. A count of
+// Presents is not permission to overwrite a previous frame's native layers.
+bool retain_layers_locked(ID3D12GraphicsCommandList* l,const Proxy& proxy)
+{
+    if (!g_layer_owner) {
+        g_layer_pool.erase(std::remove_if(g_layer_pool.begin(),g_layer_pool.end(),[&](const auto& p){
+            return p.use_count()==1&&(p->layers.w!=proxy.ow||p->layers.h!=proxy.oh||p->layers.typeless!=TypelessOf(proxy.format))&&
+                std::all_of(p->uses.begin(),p->uses.end(),[](const auto& use){return use.Retired();});
+        }),g_layer_pool.end());
+        for (const auto& p : g_layer_pool) if (p.use_count()==1 &&
+            std::all_of(p->uses.begin(),p->uses.end(),[](const auto& use){return use.Retired();})) {
+            g_layer_owner=p;g_layer_owner->uses.clear();g_l=std::move(p->layers);break;
+        }
+        if (!g_layer_owner) { g_layer_owner=std::make_shared<LayerStorage>();g_layer_pool.push_back(g_layer_owner); }
+    }
+    auto lease=na::nr::native::RetainRecording(l,g_layer_owner);
+    if (!lease) return false;
+    if (std::none_of(g_layer_owner->uses.begin(),g_layer_owner->uses.end(),[&](const auto& v){return v.SameRecording(lease);}))
+        g_layer_owner->uses.push_back(lease);
+    return true;
+}
 struct Grave { uint64_t frame; ComPtr<ID3D12Resource> r; };
 std::vector<Grave> g_grave;
 std::unordered_map<na_object_id, Clear> g_clears;            // the game's last depth clear per target
@@ -306,6 +353,29 @@ void note_source_locked(Proxy& p, ID3D12GraphicsCommandList* list)
     }
     if (one && !p.source_ambiguous)
         p.source = p.source && p.source != one ? (p.source_ambiguous = true, 0) : one;
+    // Preserve the actual full upstream picture at the transfer occurrence.
+    // Sampling the resource later at Present would permit another writer to
+    // substitute a different frame. Original game draw is always forwarded.
+    if (auto* u=find_locked(p.source);u&&u->preserve) {
+        uint32_t state=0;const auto known=na::observe::ListStateSub(list,u->id,0,&state);
+        ComPtr<ID3D12Resource> source;source.Attach(na::observe::AcquireResource(u->id));
+        auto lease=u->picture?na::nr::native::RetainRecording(list,u->picture):na::nr::native::RecordingLease{};
+        if (source&&lease&&known==na::observe::StateLookup::Known&&g_layer_owner&&
+            u->picture->SnapshotFull(list,source.Get(),static_cast<D3D12_RESOURCE_STATES>(state))) {
+            auto capture=std::make_shared<CapturedPicture>();capture->picture=u->picture;capture->owner=g_layer_owner;
+            capture->uses=u->picture_uses;capture->uses.push_back(lease);capture->view=u->view;
+            capture->clean=u->clean&&u->forwarded==0;capture->draws=u->redirected;capture->forwarded=u->forwarded;
+            capture->owner->layers=std::move(g_l);g_layer_owner.reset();g_layers_cleared=false;
+            p.output=std::move(capture);
+            // End the source occurrence at the handoff, not at a later CPU
+            // Present. Render-ahead can already record the NEXT scene/HUD by
+            // the time this back buffer is presented.
+        }
+        if(g_layer_owner){g_layer_owner->layers=std::move(g_l);g_layer_owner.reset();g_layers_cleared=false;}
+        u->picture.reset();u->picture_uses.clear();u->hud=u->cleared=false;
+        u->mirrored=0;u->view=DXGI_FORMAT_UNKNOWN;u->clean=true;
+        u->scene=u->redirected=u->forwarded=u->depth_draws=u->blended=u->covered=u->world=u->masks=0;
+    }
 }
 void note_forward_locked(Proxy& p, const char* why)
 {
@@ -387,12 +457,13 @@ void mirror_depth_only(ID3D12GraphicsCommandList* l, const na::observe::ShaderCa
     for (auto& q : g_proxy)
         if (q.id && q.ow && (q.mirrored == st.ds || (!q.mirrored && q.hud_ds == st.ds))) { p = &q; break; }
     if (!p || !g_on.load()) return;
+    if(p->preserve&&(!st.shader_readonly||st.query_active)){p->clean=false;return;}
     // Before the HUD's first draw the target may still hold the picture's depth passes: only a few.
     if (!p->hud && p->masks >= kEarlyMasks) return;
     D3D12_RESOURCE_DESC dd{};
     D3D12_CPU_DESCRIPTOR_HANDLE dsv[2];
     ComPtr<ID3D12Device> dev;
-    if (FAILED(l->GetDevice(IID_PPV_ARGS(&dev))) || !layers_locked(dev.Get(), *p)) return;
+    if (FAILED(l->GetDevice(IID_PPV_ARGS(&dev))) || !retain_layers_locked(l,*p) || !layers_locked(dev.Get(), *p)) return;
     if (!ds_desc_locked(st.ds, &dd) || dd.SampleDesc.Count != 1 ||
         !depth_locked(dd, static_cast<DXGI_FORMAT>(st.dsv_format), p->ow, p->oh, dsv))
         return;
@@ -447,6 +518,12 @@ na::observe::ShaderScope redirect(ID3D12GraphicsCommandList* l, na::observe::Sha
     if (!p || !p->ow) return {};
     if (p->upstream && p->paused) return {}; // lineage not current: the original picture keeps its HUD
     const bool shaped = SceneShaped(st.pipeline_known && st.blend_mask != NA_UNKNOWN_U32, st.blend_mask, uint64_t(call.args[0]), uint64_t(call.args[1]));
+    bool observed_output=false;
+    if(!p->upstream)for(const auto& q:g_proxy)observed_output|=q.id&&q.upstream&&q.preserve&&q.rw==p->rw&&q.rh==p->rh&&q.ow==p->ow&&q.oh==p->oh;
+    if(observed_output&&!shaped){note_forward_locked(*p,"late output UI preserved in the complete picture");return {};}
+    if(p->preserve&&p->hud&&shaped&&CoversTarget(st.viewport_count?st.viewports[0]:nullptr,st.scissor_count?st.scissors[0]:nullptr,p->rw,p->rh)) {
+        p->clean=false;note_forward_locked(*p,"later full-picture processing preserved");return {};
+    }
     // A draw bound to the camera block J2 jitters is drawn with the (jittered) camera: part of the
     // picture, whatever its order. In the native layer it would keep its jitter and shimmer
     // (Anno's foliage flicker, 2026-11-03: Cort saw it stop when those draws left the layer).
@@ -457,6 +534,7 @@ na::observe::ShaderScope redirect(ID3D12GraphicsCommandList* l, na::observe::Sha
             if (na::j2::CameraBinding(cb[i].resource, cb[i].offset, cb[i].param, cb[i].table)) {
                 ++p->world;
                 ++g_stats.world;
+                if (p->hud) p->clean=false;
                 return {};
             }
         // Depth-tested against the published scene depth: drawn into the 3D picture (a world
@@ -467,6 +545,7 @@ na::observe::ShaderScope redirect(ID3D12GraphicsCommandList* l, na::observe::Sha
             st.dsv_format != DXGI_FORMAT_UNKNOWN) {
             ++p->world;
             ++g_stats.world_depth;
+            if (p->hud) p->clean=false;
             return {};
         }
     }
@@ -506,9 +585,24 @@ na::observe::ShaderScope redirect(ID3D12GraphicsCommandList* l, na::observe::Sha
     else if (st.samples != 1) why = "multisampled";
     else if (!st.viewport_count || !st.scissor_count) why = "no viewport or scissor";
     else if (TypelessOf(view) != TypelessOf(p->format)) why = "pipeline format differs from the back buffer";
-    if (why) { note_forward_locked(*p, why); return {}; }
+    if (why) { p->clean=false;note_forward_locked(*p, why); return {}; }
+    if(p->preserve) {
+        if(!st.shader_readonly||st.query_active) {
+            p->clean=false;note_forward_locked(*p,"draw has unqualified repeatable shader state");return {};
+        }
+        if(!st.native_hud_affine)p->clean=false;
+    }
     ComPtr<ID3D12Device> dev;
-    if (FAILED(l->GetDevice(IID_PPV_ARGS(&dev))) || !layers_locked(dev.Get(), *p)) { note_forward_locked(*p, "could not make the native layers"); return {}; }
+    if (FAILED(l->GetDevice(IID_PPV_ARGS(&dev))) || !retain_layers_locked(l,*p) || !layers_locked(dev.Get(), *p)) { p->clean=false;note_forward_locked(*p, "could not make the native layers"); return {}; }
+    if (p->preserve && !p->picture) {
+        ComPtr<ID3D12Resource> source;source.Attach(na::observe::AcquireResource(p->id));
+        if (source) p->picture=picture_locked(dev.Get(),source->GetDesc(),p->ow,p->oh);
+        auto lease=p->picture?na::nr::native::RetainRecording(l,p->picture):na::nr::native::RecordingLease{};
+        if (!source||!lease||!p->picture->SnapshotScene(l,source.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET)) {
+            p->picture.reset();p->clean=false;note_forward_locked(*p,"could not snapshot pre-HUD scene");return {};
+        }
+        p->picture_uses.push_back(lease);
+    }
     D3D12_CPU_DESCRIPTOR_HANDLE rtv[2], dsv[2];
     if (!rtv_locked(view, rtv)) { note_forward_locked(*p, "too many view formats"); return {}; }
     // Depth: the game's HUD depth is mirrored at native size by two targets (one per layer).
@@ -570,7 +664,11 @@ na::observe::ShaderScope redirect(ID3D12GraphicsCommandList* l, na::observe::Sha
     ++g_stats.redirected;
     if (depth) ++p->depth_draws;
     if (st.pipeline_known && st.blend_mask != NA_UNKNOWN_U32 && (st.blend_mask & 1u)) ++p->blended;
-    return {na::observe::ShaderAction::Replaced, nullptr};
+    // Observational upstream: replay gives native layers/coverage, but the
+    // original complete game picture remains until the same-frame GPU choice.
+    bool preserve=p->preserve;
+    for (const auto& q:g_proxy) preserve|=q.id&&q.upstream&&q.preserve&&q.rw==p->rw&&q.rh==p->rh&&q.ow==p->ow&&q.oh==p->oh;
+    return {preserve?na::observe::ShaderAction::Forward:na::observe::ShaderAction::Replaced, nullptr};
 }
 
 class DrawHook final : public na::observe::ShaderOperationHook {
@@ -744,13 +842,15 @@ bool PictureSource(const na::observe::NativeOperation& op, uint64_t destination,
     return true;
 }
 
-bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, Layer* out)
+bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, Layer* out,ID3D12CommandQueue* queue)
 {
     if (!g_installed.load() || !frame) return false;
     const na_object_id id = na::observe::IdOf(frame);
     std::lock_guard<std::mutex> lock(g_m);
+    struct FinishLayers {~FinishLayers(){if(g_layer_owner&&std::none_of(std::begin(g_proxy),std::end(g_proxy),[](const auto& p){return p.preserve&&p.picture;})){
+        g_layer_owner->layers=std::move(g_l);g_layer_owner.reset();g_layers_cleared=false;
+    }}} finish_layers;
     ++g_frame;
-    g_layers_cleared = false; // the frame that presents now is complete
     if (g_tracing.load(std::memory_order_relaxed)) { // the traced frame is complete
         g_tracing.store(false);
         char t[256];
@@ -790,6 +890,24 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
         return false;
     }
     p->used = g_frame;
+    if(p->output){
+        auto capture=std::move(p->output);auto& layers=capture->owner->layers;
+        const auto ready_use=[&](const auto& use){return use.Ready(queue);};
+        const bool ready=g_on.load()&&queue&&layers.n[0]&&layers.n[1]&&layers.w==ow&&layers.h==oh&&
+            std::all_of(capture->uses.begin(),capture->uses.end(),ready_use)&&std::all_of(capture->owner->uses.begin(),capture->owner->uses.end(),ready_use);
+        if(ready&&out){
+            out->n0=layers.n[0].Get();out->n1=layers.n[1].Get();out->view=capture->view;
+            out->grey=GreyFor(capture->view);out->srgb=is_srgb(capture->view);out->owner=capture->owner;
+            out->picture=capture->picture;out->clean_allowed=capture->clean;
+            ++g_stats.hud_frames;++g_stats.upstream_frames;
+            if(capture->clean)++g_stats.draw_transfer_frames;else++g_stats.draw_protect_frames;
+        }
+        ++g_stats.frames;g_stats.upstream_now=1;g_stats.last_source=1;
+        g_stats.last_redirected=capture->draws;g_stats.last_forwarded=capture->forwarded;
+        g_stats.proxy_format=p->format;g_stats.view_format=capture->view;g_stats.grey=GreyFor(capture->view);
+        p->source=0;p->source_ambiguous=p->source_copy=false;p->hud=p->cleared=false;p->scene=p->redirected=p->forwarded=0;
+        return ready;
+    }
     // H1b: the upstream picture for this output (handled like the back buffer), and learning.
     Proxy* u = nullptr;
     for (auto& q : g_proxy) if (q.id && q.upstream && q.ow == ow && q.oh == oh && q.rw == rw && q.rh == rh) { u = &q; break; }
@@ -812,11 +930,6 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
                 u = nullptr;
             }
         }
-    } else if (g_on.load() && p->redirected == 0 && p->source && !p->source_ambiguous && !p->source_copy) {
-        // A full-screen draw reading one picture-sized texture is processing (tonemap, blur,
-        // sharpen) until proven a transfer (Astra 20cddb8 H1b point 1): not promoted.
-        g_cand = {};
-        std::snprintf(g_stats.upstream_why, sizeof g_stats.upstream_why, "hand-off is a draw (processing), not a copy");
     } else if (g_on.load() && p->redirected == 0 && p->source && !p->source_ambiguous) {
         if (g_cand.id == p->source) ++g_cand.frames; else g_cand = {p->source, 1};
         if (g_cand.frames >= kPromoteFrames) {
@@ -833,6 +946,7 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
                 else {
                     *slot = Proxy{};
                     slot->id = g_cand.id; slot->upstream = true;
+                    slot->preserve=!p->source_copy; // draws are observed, never blindly treated as copies
                     slot->rw = rw; slot->rh = rh; slot->ow = ow; slot->oh = oh; slot->format = f; slot->used = g_frame;
                     ++g_stats.upstream_learned;
                     g_stats.upstream_why[0] = 0;
@@ -844,6 +958,11 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
     g_stats.upstream_now = u ? 1u : 0u;
     g_stats.last_source = p->source ? 1u : p->source_ambiguous ? 2u : 0u;
     p->source = 0; p->source_ambiguous = false; p->source_copy = false;
+    const bool observational=u&&u->preserve;
+    const auto picture=observational&&lineage?u->picture:std::shared_ptr<Picture>{};
+    const bool ready=picture&&queue&&std::all_of(u->picture_uses.begin(),u->picture_uses.end(),[&](const auto& use){return use.Ready(queue);})&&
+        g_layer_owner&&std::all_of(g_layer_owner->uses.begin(),g_layer_owner->uses.end(),[&](const auto& use){return use.Ready(queue);});
+    const bool clean=ready&&u->clean&&u->forwarded==0&&p->redirected==0;
     bool hud = g_on.load() && p->cleared && p->redirected > 0 && g_l.n[0] && g_l.w == ow && g_l.h == oh;
     const bool up_hud = !hud && u && (lineage || recovered) && g_on.load() && u->cleared && u->redirected > 0 && g_l.n[0] && g_l.w == ow && g_l.h == oh;
     if (up_hud) {
@@ -853,7 +972,7 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
         p->redirected = u->redirected; p->forwarded += u->forwarded; p->world += u->world; p->masks += u->masks;
         p->depth_draws = u->depth_draws; p->blended = u->blended;
     }
-    if (u) { // the upstream's frame ends with the back buffer's
+    if (u&&!u->preserve) { // observed draw occurrences end at their handoff, including render-ahead
         u->hud = u->cleared = false;
         if (u->mirrored) u->hud_ds = u->mirrored;
         u->mirrored = 0;
@@ -867,6 +986,14 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
         out->view = p->view;
         out->grey = GreyFor(p->view);
         out->srgb = is_srgb(p->view);
+        out->owner=g_layer_owner;
+        out->picture=ready?picture:std::shared_ptr<Picture>{};out->clean_allowed=clean;
+        if (observational) {
+            // If the exact source recording is not ready, the original full
+            // picture still exists. Do not lay its already-present HUD twice.
+            if (!ready) hud=false;
+            else if(clean)++g_stats.draw_transfer_frames;else++g_stats.draw_protect_frames;
+        }
     }
     ++g_stats.frames;
     if (hud) ++g_stats.hud_frames;
@@ -880,6 +1007,7 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
     p->view = DXGI_FORMAT_UNKNOWN;
     p->scene = p->redirected = p->forwarded = 0;
     p->depth_draws = p->blended = p->covered = p->world = p->masks = 0;
+    if(u&&!u->preserve){u->picture.reset();u->picture_uses.clear();u->clean=true;}
     return hud;
 }
 
@@ -895,20 +1023,29 @@ Stats GetStats()
     std::lock_guard<std::mutex> lock(g_m);
     return g_stats;
 }
+void ReportPictureResult(bool identity,bool clean)
+{
+    std::lock_guard<std::mutex> lock(g_m);
+    if(!identity)++g_stats.transfer_changed;
+    else {++g_stats.transfer_verified;if(clean)++g_stats.clean_verified;else++g_stats.protection_verified;}
+}
 std::string StatusLine()
 {
     const Stats s = GetStats();
-    char b[1024];
+    char b[1536];
     std::snprintf(b, sizeof b,
                   "native_hud on=%u frames=%llu hud_frames=%llu scene_draws=%llu redirected=%llu forwarded=%llu restore_failed=%llu "
                   "covered=%llu world=%llu masks=%llu last_frame=scene:%u,hud:%u,forwarded:%u,depth:%u,blended:%u,covered:%u,world:%u,masks:%u proxy_fmt=%u view_fmt=%u grey=%.4f last_forward=\"%s\" "
-                  "upstream{now=%u learned=%llu dropped=%llu hud_frames=%llu last_source=%u why=\"%s\" lineage_miss=%llu recovered=%llu} world_depth=%llu traces=%u",
+                  "upstream{now=%u learned=%llu dropped=%llu hud_frames=%llu last_source=%u why=\"%s\" lineage_miss=%llu recovered=%llu} world_depth=%llu traces=%u "
+                  "draw{candidates=%llu protect_candidates=%llu gpu_verified=%llu changed=%llu clean=%llu protected=%llu}",
                   Enabled() ? 1u : 0u, (unsigned long long)s.frames, (unsigned long long)s.hud_frames, (unsigned long long)s.scene_draws,
                   (unsigned long long)s.redirected, (unsigned long long)s.forwarded, (unsigned long long)s.restore_failed, (unsigned long long)s.covered, (unsigned long long)s.world, (unsigned long long)s.masks,
                   s.last_scene, s.last_redirected, s.last_forwarded, s.last_depth, s.last_blended, s.last_covered, s.last_world, s.last_masks, s.proxy_format, s.view_format,
                   double(s.grey), s.last_forward, s.upstream_now, (unsigned long long)s.upstream_learned, (unsigned long long)s.upstream_dropped,
                   (unsigned long long)s.upstream_frames, s.last_source, s.upstream_why, (unsigned long long)s.lineage_miss,
-                  (unsigned long long)s.lineage_recovered, (unsigned long long)s.world_depth, s.traces);
+                  (unsigned long long)s.lineage_recovered, (unsigned long long)s.world_depth, s.traces,
+                  (unsigned long long)s.draw_transfer_frames,(unsigned long long)s.draw_protect_frames,(unsigned long long)s.transfer_verified,
+                  (unsigned long long)s.transfer_changed,(unsigned long long)s.clean_verified,(unsigned long long)s.protection_verified);
     return b;
 }
 
