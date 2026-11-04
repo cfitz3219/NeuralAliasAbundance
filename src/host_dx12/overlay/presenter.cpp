@@ -262,7 +262,12 @@ bool ensure_proxies_locked(Chain& c)
         const np::SizeState st = np::GetSizeState();
         // A delivered live request completes only when the controller has seen the scene follow
         // (overlay small_follow_mode); here the controller only learns the real allocation.
-        if (!(st.enabled && st.hwnd == c.desc.OutputWindow && st.request && st.request_delivered)) np::CommitBuffers(c.desc.OutputWindow, out, act);
+        // A REAL window resize (the user or the OS changed the window) is the new output itself: it
+        // completes here, at the allocation, as before the controller existed.
+        const bool ours = st.enabled && st.hwnd == c.desc.OutputWindow && st.request && st.request_delivered;
+        if (ours && st.request_window) {
+            if (!np::CompleteResize(st.request, true, act)) np::CommitBuffers(c.desc.OutputWindow, out, act);
+        } else if (!ours) np::CommitBuffers(c.desc.OutputWindow, out, act);
         np::ctl::Allocated({act.w, act.h}, GetTickCount64());
     }
     c.display_hz = refresh_hz_for(c.desc.OutputWindow);

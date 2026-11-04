@@ -2748,6 +2748,7 @@ void presenter_menu_cb(IDXGISwapChain* sc, ID3D12CommandQueue* queue, ID3D12Reso
 uint64_t g_small_token = 0;      // size_spoof token of the controller's current ask
 bool g_small_scene_seen = false; // the first scene sample: asking before it would race the game's start
 int g_small_mode_now = 0;         // the user's mode this present
+uint64_t g_small_ask_after = 0;   // ms: no new ask before this (an ask the size layer refused backs off)
 int g_small_refused_mode = -1;    // a mode the game did not follow (for g_small_refused_output)
 na::native_present::Size g_small_refused_output{};
 void small_note_line(const char* what, const na::native_present::ctl::Status& c)
@@ -2790,6 +2791,11 @@ void small_follow_mode()
             if (g_small_token) np::CompleteResize(g_small_token, false, {}); // supersede the old ask's advertisement
             g_small_token = np::RequestRenderSize({a.size.w, a.size.h}, true);
             ctl::Asked(g_small_token, now);
+            if (!g_small_token) { // refused by the size layer: say so once, try again in a second
+                g_small_ask_after = now + 1000;
+                small_note_line("ask_refused", ctl::Get());
+                break;
+            }
             if (a.kind == ctl::ActionKind::Restore) { g_small_refused_mode = g_small_mode_now; g_small_refused_output = st.output; }
             small_note_line(a.kind == ctl::ActionKind::Ask ? "ask" : "restore", ctl::Get());
             break;
@@ -2816,6 +2822,16 @@ void small_follow_mode()
     const int mode = (std::min)(static_cast<int>(na::settings::Get().j2_scale_mode.load()), 3); // no Ultra Performance here
     carry_out(ctl::Tick(now));
     if (!g_small_scene_seen) return;
+    {
+        // Another request (a real window resize) is pending: never ask over it. One that never
+        // reached an allocation expires, so it cannot hold the changeover forever.
+        const np::SizeState now_st = np::GetSizeState();
+        if (now_st.request && now_st.request != g_small_token) {
+            if (np::ExpireResize(5000, now)) status_note("mode_change window_resize_expired\r\n");
+            return;
+        }
+    }
+    if (now < g_small_ask_after) return;
     const float f = mode > 0 ? static_cast<float>(na::scale::FractionForMode(mode)) : 1.f;
     const np::Size want = small_render_for(st.output, static_cast<double>(f));
     // A choice the game did not follow is not asked again for this output until the user changes it.

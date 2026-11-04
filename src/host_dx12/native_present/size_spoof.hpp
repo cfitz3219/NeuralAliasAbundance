@@ -12,6 +12,7 @@ struct SizeState {
     Size output{}, render{}, requested{};
     uint64_t generation = 0, request = 0;
     bool enabled = false, request_delivered = false;
+    bool request_window = false; // the pending request is a REAL window resize (BeginWindowResize), not our ask
 };
 struct InputGeometry {
     RECT physical_client{}; // SCREEN coordinates, using real user32 calls

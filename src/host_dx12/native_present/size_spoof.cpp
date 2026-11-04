@@ -176,7 +176,7 @@ uint64_t RequestRenderSize(Size render, bool force) {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (!g_state.enabled || g_state.request || (!force && same(render, g_state.render))) return 0;
         hwnd = g_state.hwnd; token = ++g_next;
-        g_state.requested = render; g_state.request = token; g_state.request_delivered = false;
+        g_state.requested = render; g_state.request = token; g_state.request_delivered = false; g_state.request_window = false;
         g_request_tick = GetTickCount64();
         g_request_output = g_state.output;
     }
@@ -190,7 +190,7 @@ uint64_t BeginWindowResize(HWND hwnd, Size output, Size render) {
     if (!for_window(g_state,hwnd)) return 0;
     if (!g_state.request && same(output,g_state.output) && same(render,g_state.render)) return 0;
     if (g_state.request && g_state.request_delivered && same(output,g_request_output) && same(render,g_state.requested)) return g_state.request;
-    g_state.requested=render; g_state.request=++g_next; g_state.request_delivered=true;
+    g_state.requested=render; g_state.request=++g_next; g_state.request_delivered=true; g_state.request_window=true;
     g_request_tick=GetTickCount64(); g_request_output=output; ++g_requests;
     return g_state.request;
 }
@@ -230,14 +230,14 @@ bool CompleteResize(uint64_t token, bool success, Size actual) {
     const bool accepted = success && valid(actual) && same(actual, g_state.requested);
     if (accepted) { g_state.render = actual; g_state.output = g_request_output; g_state.generation = token; ++g_completed; }
     else ++g_failed;
-    g_state.request = 0; g_state.requested = {}; g_state.request_delivered = false; g_request_tick = 0; g_request_output = {};
+    g_state.request = 0; g_state.requested = {}; g_state.request_delivered = false; g_state.request_window = false; g_request_tick = 0; g_request_output = {};
     return accepted;
 }
 bool ExpireResize(uint32_t timeout_ms, uint64_t now_ms) {
     if (!now_ms) now_ms = GetTickCount64();
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_state.request || now_ms < g_request_tick || now_ms-g_request_tick < timeout_ms) return false;
-    g_state.request = 0; g_state.requested = {}; g_state.request_delivered = false; g_request_tick = 0; g_request_output = {};
+    g_state.request = 0; g_state.requested = {}; g_state.request_delivered = false; g_state.request_window = false; g_request_tick = 0; g_request_output = {};
     ++g_failed; return true;
 }
 bool CommitBuffers(HWND hwnd, Size output, Size actual) {
