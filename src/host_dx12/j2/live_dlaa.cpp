@@ -236,6 +236,10 @@ struct State {
         uint64_t last_eval = 0;              // last frame DLSS evaluated a windowed corner (g.output holds it)
     } win;
     bool jitter_on = true; // DLAA needs jitter (with the texture mip bias set at start-up)
+    // Viewport jitter: the sample set for each recent frame (index frame % 8).
+    struct VpjEntry { uint64_t frame = 0; float x = 0.f, y = 0.f; };
+    VpjEntry vpj[8];
+    uint32_t vpj_phase = 0;
     // Render-small jitter witness: the picture DLSS gets did not show J1's sample shifts (still
     // detailed pixels matched unshifted, not at the declared jitter difference). No jitter is then
     // applied or declared until the next re-test (frame), so DLSS is never told about a shift that
@@ -926,6 +930,39 @@ uint32_t jitter_phases()
     if (g_render_small.load(std::memory_order_relaxed) && g.rw && g.stats.small_ow) return JitterPhasesFor(g.rw, g.stats.small_ow);
     return g.ow && g.rw ? JitterPhasesFor(g.rw, g.ow) : kJitterPhases;
 }
+// Viewport jitter ([j2] viewport_jitter): real samples through the game's own viewports.
+bool vpj_mode() { return na::settings::Get().j2_viewport_jitter.load(std::memory_order_relaxed) != 0; }
+// Frame start: the sample this frame's scene draws get, only while DLAA (or upscaling) is
+// producing frames, so a stopped DLAA never leaves the game's picture moving.
+void vpj_advance()
+{
+    const bool running = g.submitted_frame && g.frame <= g.submitted_frame + 2;
+    if (!vpj_mode() || !g.jitter_on || !running || !g.w) { na::observe::SetSceneViewportJitter(0, 0.f, 0.f); return; }
+    const neural_alias::JitterSample js = neural_alias::temporal_jitter(++g.vpj_phase, jitter_phases());
+    auto& e = g.vpj[g.frame % 8];
+    e.frame = g.frame; e.x = static_cast<float>(js.x_pixels); e.y = static_cast<float>(js.y_pixels);
+    na::observe::SetSceneViewportJitter(g.frame, e.x, e.y);
+    ++g.stats.vpj_frames;
+}
+// The sample this frame's scene was really drawn with: the scene list's own draws first (exact,
+// whenever it was recorded), else this frame's table entry. False: no sample (declare 0).
+bool vpj_declared(ID3D12CommandList* const* lists, UINT scene, float* x, float* y)
+{
+    uint64_t packed = 0;
+    if (lists) for (UINT i = scene + 1; i-- > 0 && !packed;) if (lists[i]) packed = na::observe::ListSceneViewportJitter(lists[i]);
+    uint32_t f = 0;
+    bool ok = false;
+    if (packed && na::observe::DecodeSceneViewportJitter(packed, &f, x, y)) {
+        ok = true; ++g.stats.vpj_from_list;
+        if (f != static_cast<uint32_t>(g.frame)) ++g.stats.vpj_other_frame;
+    } else if (g.vpj[g.frame % 8].frame == g.frame && g.frame) {
+        ok = true; ++g.stats.vpj_from_table;
+        *x = g.vpj[g.frame % 8].x; *y = g.vpj[g.frame % 8].y;
+    }
+    if (!ok) { ++g.stats.vpj_none; *x = *y = 0.f; return false; }
+    if (na::settings::Get().j2_viewport_jitter.load(std::memory_order_relaxed) < 0) { *x = -*x; *y = -*y; }
+    return true;
+}
 
 void store_matrix(const na::camera::Matrix& m, na::camera::Layout layout, uint8_t out[64])
 {
@@ -1341,7 +1378,7 @@ void jitter_batch_impl(ID3D12CommandList* const* lists, UINT count)
     // An engaged projection window draws every frame into the corner: it keeps jittering
     // (and windowing) through a frame without DLAA rather than show a full-size frame
     // on the windowed recordings' clipped targets.
-    if (!g.jitter_on || g.jitter_unseen || (g.inline_mode && g.inline_sample_locked && !g.jit.valid) ||
+    if (vpj_mode() || !g.jitter_on || g.jitter_unseen || (g.inline_mode && g.inline_sample_locked && !g.jit.valid) ||
         g.camera_param < 0 || g.camera_offset < 0 || (!running && !window_now()) || !g.w ||
         (g_render_small.load(std::memory_order_relaxed) && g_small_stretch_streak.load(std::memory_order_relaxed) >= 3)) return;
     struct JB { uint64_t res, off; uint32_t size; bool slot, known; };
@@ -2148,7 +2185,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         g.resume_reset = true; // remains pending if this recording is not submitted
     }
     const double zero[2] = {0, 0};
-    const double* injected = (deferred && g.jitter_unseen) ? zero : held ? zero : from_j1 ? g.jit.px : saved ? (saved->has_camera ? saved->jitter : zero) : g_injected ? g.jit.px : zero; // sample belongs to the captured camera
+    const double* injected = vpj_mode() ? zero : (deferred && g.jitter_unseen) ? zero : held ? zero : from_j1 ? g.jit.px : saved ? (saved->has_camera ? saved->jitter : zero) : g_injected ? g.jit.px : zero; // sample belongs to the captured camera
     double rescaled[2] = {0, 0};
     if (injected != zero && jit_rw && jit_rh && (jit_rw != rw || jit_rh != rh)) {
         rescaled[0] = injected[0] * double(rw) / double(jit_rw);
@@ -2204,8 +2241,13 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         lim.max_rotation = (std::min)(lim.max_rotation * steps, 3.0);
     }
     if (same_epoch && g.submitted_frame && g.frame > g.submitted_frame + kMaxGapFrames && !tracker_restart) ++g.stats.gap_bridged;
-    const na::camera::CameraFrame cam = pending.tracker.Update(vp, g.frame, rw, rh, injected, lim); // active extent
+    na::camera::CameraFrame cam = pending.tracker.Update(vp, g.frame, rw, rh, injected, lim); // active extent
     if (!cam.valid) { ++g.stats.no_camera; reason("The camera matrix could not be inverted."); return false; }
+    if (vpj_mode()) { // the camera is the game's own (no J1 write); the sample is in the viewports
+        float vx = 0.f, vy = 0.f;
+        vpj_declared(lists, scene, &vx, &vy);
+        cam.jitter_px_x = vx; cam.jitter_px_y = vy; cam.jitter_known = true;
+    }
     if (!held) { // the newest read camera (one per frame: a later attempt in the same frame replaces it)
         if (g.cam_f1 != g.frame) { g.cam_u0 = g.cam_u1; g.cam_f0 = g.cam_f1; }
         g.cam_u1 = cam.unjittered; g.cam_f1 = g.frame; g.cam_rev = reversed;
@@ -2447,7 +2489,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // Jitter shift: the declared offset moved into the colour, so the picture does not shake.
     bool shifted = false;
     flush(l, b); // colour is readable (NON_PIXEL_SHADER_RESOURCE) before the shift reads it
-    if ((cam.jitter_px_x != 0 || cam.jitter_px_y != 0) && na::settings::Get().j2_jitter_shift.load(std::memory_order_relaxed) != 0 &&
+    if (!vpj_mode() && (cam.jitter_px_x != 0 || cam.jitter_px_y != 0) && na::settings::Get().j2_jitter_shift.load(std::memory_order_relaxed) != 0 &&
         jshift_target(g.jshift, rw, rh, typed(cf))) {
         shifted = jshift_dispatch(l, g.color_in.Get(), g.jshift.Get(), rw, rh, typed(cf), static_cast<float>(cam.jitter_px_x), static_cast<float>(cam.jitter_px_y), g.slot);
         if (shifted) {
@@ -3783,7 +3825,7 @@ bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t r
         na::dlss::EvalDesc e{};
         e.color = draw_picture?layer.picture->Input():frame;
         // Jitter shift: the declared offset moved into the colour, so the picture does not shake.
-        if ((colour_jitter.x != 0 || colour_jitter.y != 0) && na::settings::Get().j2_jitter_shift.load(std::memory_order_relaxed) != 0 &&
+        if (!vpj_mode() && (colour_jitter.x != 0 || colour_jitter.y != 0) && na::settings::Get().j2_jitter_shift.load(std::memory_order_relaxed) != 0 &&
             jshift_target(g_small.jshift, rw, rh, ff) &&
             jshift_dispatch(l, e.color, g_small.jshift.Get(), rw, rh, ff, colour_jitter.x, colour_jitter.y, kRing + si)) {
             b.push_back(uav_barrier(g_small.jshift.Get()));
@@ -4421,6 +4463,7 @@ void OnPresent(ID3D12CommandQueue* queue)
         }
         g.stats.depth_clears_last = g.depth_clears_closed;
         ++g.frame;
+        vpj_advance();
         g.jit.valid = false; // J1: the next camera block starts a new jitter sample
         g.inline_sample_locked = false;
         g.inline_camera_submitted = false;

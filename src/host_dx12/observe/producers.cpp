@@ -150,6 +150,10 @@ struct ListState {
     uint64_t target_serial=0,viewport_serial=0,scissor_serial=0;
     std::shared_ptr<const DescriptorDetails> native_depth;
     int8_t mip_level = -1;               // live mip bias: twin level latched at Reset (-1 = the game's own objects)
+    // Viewport jitter: our offset copies of the game's viewports are bound now (vpj_value),
+    // and the value the last scene draw of this recording was drawn with (vpj_scene, 0 = none).
+    bool vpj_applied = false;
+    uint64_t vpj_value = 0, vpj_scene = 0;
 };
 
 struct Obj {
@@ -3531,6 +3535,76 @@ void capture_raster_targets(GL* list, UINT count, const D3D12_CPU_DESCRIPTOR_HAN
         ls.raster_rt_count = count; ls.raster_has_depth = depth != nullptr; ls.raster_targets_known = true;
     });
 }
+// ---- Viewport jitter (real sub-pixel samples) ------------------------------------------
+// The game's camera block is only half the story in some games (SE5: our matrix write never
+// moved the rasterised picture). Every D3D12 game sets its viewports, so the sample offset is
+// applied there instead: a draw whose bound depth is the live scene depth and whose pipeline
+// tests depth gets the game's viewports moved by (x, y) render pixels (+x right, +y down), the
+// content moves with them, and DLSS is told exactly that value. Post passes (no scene depth,
+// or depth test off: full-screen passes) keep the game's own viewports, so nothing is shifted
+// twice. Packed: frame (low 32 bits, never 0) << 32 | x << 16 | y, x/y int16 in 1/65536 px.
+std::atomic<uint64_t> g_vpj{0};
+std::atomic<bool> g_vpj_ever{false};
+std::atomic<uint64_t> g_vpj_sets{0}, g_vpj_restores{0}, g_vpj_draws{0}, g_vpj_unknown{0};
+thread_local bool t_vpj_self = false; // our own RSSetViewports: not a change of the game's
+float vpj_axis(uint64_t v, unsigned shift) { return static_cast<float>(static_cast<int16_t>(static_cast<uint16_t>(v >> shift))) / 65536.f; }
+// The game (or host work restoring the game's state) set viewports, or the list restarted:
+// our offset copies are no longer bound.
+void vpj_viewports_replaced(GL* l, bool reset)
+{
+    if (!g_vpj_ever.load(std::memory_order_relaxed) || t_vpj_self) return;
+    std::shared_lock<std::shared_mutex> lock(g_m);
+    na_object_id id = 0;
+    auto* ls = list_state_locked(l, &id);
+    if (!ls) return;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    ls->vpj_applied = false;
+    if (reset) ls->vpj_scene = 0;
+}
+void vpj_before_draw(GL* l)
+{
+    if (!g_vpj_ever.load(std::memory_order_relaxed)) return;
+    const uint64_t cur = g_vpj.load(std::memory_order_acquire);
+    D3D12_VIEWPORT v[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+    UINT n = 0;
+    {
+        uint64_t sel_depth = 0, sel_color = 0;
+        if (cur) GetLiveSelection(&sel_depth, &sel_color);
+        std::shared_lock<std::shared_mutex> lock(g_m);
+        na_object_id id = 0;
+        auto* ls = list_state_locked(l, &id);
+        if (!ls) return;
+        std::lock_guard<std::mutex> bl(ls->bind_m);
+        bool want = cur && sel_depth && ls->cur_ds == sel_depth;
+        if (want) {
+            const auto pipeline = g_objs.find(canon(ls->pso));
+            want = pipeline != g_objs.end() && pipeline->second.created.size() >= sizeof(na_ev_pipeline_created) &&
+                   reinterpret_cast<const na_ev_pipeline_created*>(pipeline->second.created.data())->depth_enable == 1;
+        }
+        if (want && !(ls->raster_viewports_known && ls->raster_viewport_count)) { g_vpj_unknown.fetch_add(1, std::memory_order_relaxed); want = false; }
+        if (want) {
+            ls->vpj_scene = cur;
+            g_vpj_draws.fetch_add(1, std::memory_order_relaxed);
+            if (ls->vpj_applied && ls->vpj_value == cur) return;
+            const float dx = vpj_axis(cur, 16), dy = vpj_axis(cur, 0);
+            n = ls->raster_viewport_count;
+            for (UINT i = 0; i < n; ++i) { v[i] = ls->raster_viewports[i]; v[i].TopLeftX += dx; v[i].TopLeftY += dy; }
+            ls->vpj_applied = true; ls->vpj_value = cur;
+            g_vpj_sets.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            if (!ls->vpj_applied) return;
+            ls->vpj_applied = false;
+            if (!ls->raster_viewports_known) return; // nothing known to hand back (the game sets its own before relying on them)
+            n = ls->raster_viewport_count;
+            std::copy_n(ls->raster_viewports, n, v);
+            g_vpj_restores.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    HostWorkScope own;
+    t_vpj_self = true;
+    l->RSSetViewports(n, n ? v : nullptr);
+    t_vpj_self = false;
+}
 template <uint32_t Slot, typename Sig>
 struct ListHook;
 template <uint32_t Slot, typename R, typename... A>
@@ -3542,6 +3616,11 @@ struct ListHook<Slot, R(A...)> {
     {
         na::hooking::variants::CallScope scope(l, Slot);
         auto fn = reinterpret_cast<Pfn>(orig[I]);
+        if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced ||
+                      Slot == sl::list::ExecuteIndirect || Slot == sl::list::ExecuteBundle)
+            if (!t_host_work && scope.outermost && !scope.ambiguous) vpj_before_draw(l);
+        if constexpr (Slot == sl::list::RSSetViewports || Slot == sl::list::Reset)
+            if (scope.outermost && !scope.ambiguous) vpj_viewports_replaced(l, Slot == sl::list::Reset);
         if constexpr (Slot == sl::list::ResourceBarrier) {
             if(scope.outermost && !scope.ambiguous)if(auto listener=g_barrier_listener.load())listener(l,a...);
             if(!g_full_list_tracking.load()){fn(l,a...);return;}
@@ -6023,6 +6102,37 @@ void GetLiveSelection(uint64_t* depth, uint64_t* color)
 {
     std::lock_guard<std::mutex> lock(g_live_m);
     *depth = g_live_depth; *color = g_live_color;
+}
+void SetSceneViewportJitter(uint64_t frame, float x, float y)
+{
+    if (!frame) { g_vpj.store(0, std::memory_order_release); return; }
+    const auto q = [](float f) { return static_cast<uint16_t>(static_cast<int16_t>(std::clamp(std::lround(double(f) * 65536.0), -32767L, 32767L))); };
+    uint32_t f32 = static_cast<uint32_t>(frame);
+    if (!f32) f32 = 1;
+    g_vpj_ever.store(true, std::memory_order_relaxed);
+    g_vpj.store(uint64_t(f32) << 32 | uint64_t(q(x)) << 16 | q(y), std::memory_order_release);
+}
+bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float* y)
+{
+    if (!packed) return false;
+    if (frame) *frame = static_cast<uint32_t>(packed >> 32);
+    if (x) *x = vpj_axis(packed, 16);
+    if (y) *y = vpj_axis(packed, 0);
+    return true;
+}
+uint64_t ListSceneViewportJitter(ID3D12CommandList* list)
+{
+    std::shared_lock<std::shared_mutex> lock(g_m);
+    na_object_id id = 0;
+    auto* ls = list ? list_state_locked(list, &id) : nullptr;
+    if (!ls) return 0;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return ls->vpj_scene;
+}
+ViewportJitterStats GetViewportJitterStats()
+{
+    return {g_vpj_draws.load(std::memory_order_relaxed), g_vpj_sets.load(std::memory_order_relaxed),
+            g_vpj_restores.load(std::memory_order_relaxed), g_vpj_unknown.load(std::memory_order_relaxed)};
 }
 uint64_t LiveSelectionVersion()
 {

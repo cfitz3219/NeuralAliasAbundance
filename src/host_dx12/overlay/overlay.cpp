@@ -924,6 +924,16 @@ void write_status_line()
             const size_t probe_n = std::strlen(probe);
             if (probe_n) { probe[probe_n] = '\r'; probe[probe_n + 1] = '\n'; WriteFile(f, probe, DWORD(probe_n + 2), &written, nullptr); }
         }
+        { // Viewport jitter ([j2] viewport_jitter): real samples through the game's viewports
+            const auto vps = na::observe::GetViewportJitterStats();
+            char vl[400];
+            const int vn = snprintf(vl, sizeof vl,
+                "viewport_jitter mode=%d frames=%llu declared_list=%llu declared_table=%llu declared_none=%llu other_frame=%llu scene_draws=%llu sets=%llu restores=%llu unknown_viewports=%llu\r\n",
+                na::settings::Get().j2_viewport_jitter.load(), (unsigned long long)j2.vpj_frames, (unsigned long long)j2.vpj_from_list,
+                (unsigned long long)j2.vpj_from_table, (unsigned long long)j2.vpj_none, (unsigned long long)j2.vpj_other_frame,
+                (unsigned long long)vps.draws, (unsigned long long)vps.sets, (unsigned long long)vps.restores, (unsigned long long)vps.unknown);
+            if (vn > 0) WriteFile(f, vl, DWORD((std::min)(vn, int(sizeof vl - 1))), &written, nullptr);
+        }
         if (na::j2::RenderSmall()) { // P4-4 render-small: one line per status write
             const auto ps = na::present::GetStats();
             char sl[900];

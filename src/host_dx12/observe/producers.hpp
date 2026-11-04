@@ -295,6 +295,15 @@ void SetLiveSelection(uint64_t depth, uint64_t color);
 void GetLiveSelection(uint64_t* depth, uint64_t* color);
 // Changes whenever the published depth/colour pair changes.
 uint64_t LiveSelectionVersion();
+// Viewport jitter: real sub-pixel samples. While set (frame != 0), every draw whose bound depth
+// is the live scene depth and whose pipeline tests depth is drawn with the game's viewports moved
+// by (x, y) render pixels (+x right, +y down). Other draws get the game's viewports back.
+void SetSceneViewportJitter(uint64_t frame, float x, float y);
+bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float* y);
+// Packed value the last scene draw of this recording used (0 = none since Reset).
+uint64_t ListSceneViewportJitter(ID3D12CommandList* list);
+struct ViewportJitterStats { uint64_t draws, sets, restores, unknown; };
+ViewportJitterStats GetViewportJitterStats();
 
 // Buffer GPU VA -> (resource id, offset). False when unknown or ambiguous.
 bool ResolveGpuVa(uint64_t va, na_object_id* resource, uint64_t* offset);
