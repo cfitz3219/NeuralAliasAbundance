@@ -9,7 +9,7 @@
 
 namespace na::native_present {
 enum class SizeApi : uint32_t {
-    ClientRect, WindowRect, MonitorFromWindow, GetMonitorInfo, EnumDisplaySettings, SystemMetrics,
+    ClientRect, WindowRect, MonitorFromWindowCall, MonitorInfo, DisplaySettings, SystemMetrics,
     OutputGetDesc, OutputGetDesc1, OutputModeList, OutputModeList1, Count
 };
 // Boot/watch worker only. Installs the user32 + DXGI output probes in one hook transaction.

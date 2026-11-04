@@ -60,37 +60,37 @@ uint32_t rect_h(const RECT& r) { return r.bottom > r.top ? static_cast<uint32_t>
 HMONITOR WINAPI mfw_detour(HWND w, DWORD f) {
     const void* c = _ReturnAddress();
     HMONITOR m; { Inside in; m = o_mfw(w, f); }
-    if (counted(c)) NoteSizeQuery(SizeApi::MonitorFromWindow, c, 0, 0);
+    if (counted(c)) NoteSizeQuery(SizeApi::MonitorFromWindowCall, c, 0, 0);
     return m;
 }
 BOOL WINAPI gmiw_detour(HMONITOR m, LPMONITORINFO i) {
     const void* c = _ReturnAddress();
     BOOL ok; { Inside in; ok = o_gmiw(m, i); }
-    if (ok && i && counted(c)) NoteSizeQuery(SizeApi::GetMonitorInfo, c, rect_w(i->rcMonitor), rect_h(i->rcMonitor));
+    if (ok && i && counted(c)) NoteSizeQuery(SizeApi::MonitorInfo, c, rect_w(i->rcMonitor), rect_h(i->rcMonitor));
     return ok;
 }
 BOOL WINAPI gmia_detour(HMONITOR m, LPMONITORINFO i) {
     const void* c = _ReturnAddress();
     BOOL ok; { Inside in; ok = o_gmia(m, i); }
-    if (ok && i && counted(c)) NoteSizeQuery(SizeApi::GetMonitorInfo, c, rect_w(i->rcMonitor), rect_h(i->rcMonitor));
+    if (ok && i && counted(c)) NoteSizeQuery(SizeApi::MonitorInfo, c, rect_w(i->rcMonitor), rect_h(i->rcMonitor));
     return ok;
 }
 BOOL WINAPI edsw_detour(LPCWSTR d, DWORD n, DEVMODEW* dm) {
     const void* c = _ReturnAddress();
     BOOL ok; { Inside in; ok = o_edsw(d, n, dm); }
-    if (ok && dm && counted(c)) NoteSizeQuery(SizeApi::EnumDisplaySettings, c, dm->dmPelsWidth, dm->dmPelsHeight);
+    if (ok && dm && counted(c)) NoteSizeQuery(SizeApi::DisplaySettings, c, dm->dmPelsWidth, dm->dmPelsHeight);
     return ok;
 }
 BOOL WINAPI edsa_detour(LPCSTR d, DWORD n, DEVMODEA* dm) {
     const void* c = _ReturnAddress();
     BOOL ok; { Inside in; ok = o_edsa(d, n, dm); }
-    if (ok && dm && counted(c)) NoteSizeQuery(SizeApi::EnumDisplaySettings, c, dm->dmPelsWidth, dm->dmPelsHeight);
+    if (ok && dm && counted(c)) NoteSizeQuery(SizeApi::DisplaySettings, c, dm->dmPelsWidth, dm->dmPelsHeight);
     return ok;
 }
 BOOL WINAPI edsexw_detour(LPCWSTR d, DWORD n, DEVMODEW* dm, DWORD f) {
     const void* c = _ReturnAddress();
     BOOL ok; { Inside in; ok = o_edsexw(d, n, dm, f); }
-    if (ok && dm && counted(c)) NoteSizeQuery(SizeApi::EnumDisplaySettings, c, dm->dmPelsWidth, dm->dmPelsHeight);
+    if (ok && dm && counted(c)) NoteSizeQuery(SizeApi::DisplaySettings, c, dm->dmPelsWidth, dm->dmPelsHeight);
     return ok;
 }
 int WINAPI gsm_detour(int index) {
