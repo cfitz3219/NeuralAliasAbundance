@@ -68,7 +68,7 @@ struct Identity {
 };
 
 // Extra named planes (provenance, camera-only motion, flow residual/valid/mask, HUD layers...).
-constexpr uint32_t kMaxExtra = 8;
+constexpr uint32_t kMaxExtra = 12; // scene/flow/provenance plus both HUD layers, scene/full snapshots and draw mask
 struct ExtraPlane { const char* name = nullptr; ID3D12Resource* res = nullptr; D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE; };
 
 // Planes recorded after the evaluate, in the states they are in at that point.

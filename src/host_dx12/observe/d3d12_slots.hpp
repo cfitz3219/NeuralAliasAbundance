@@ -85,6 +85,8 @@ constexpr uint32_t SetGraphicsRootUnorderedAccessView = 42;
 constexpr uint32_t OMSetRenderTargets = 46;
 constexpr uint32_t ClearDepthStencilView = 47;
 constexpr uint32_t ClearRenderTargetView = 48;
+constexpr uint32_t BeginQuery = 52;
+constexpr uint32_t EndQuery = 53;
 constexpr uint32_t ExecuteIndirect = 59;
 // ID3D12GraphicsCommandList4 (Kind::CommandList4; verified against the SDK vtable:
 // List1 adds 60-65, List2 66, List3 67). NOT 62/63 (OMSetDepthBounds/SetSamplePositions).

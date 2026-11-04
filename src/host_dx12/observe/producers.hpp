@@ -209,6 +209,8 @@ struct DrawInfo {
     na_object_id rt = 0, ds = 0;
     uint32_t rt_count = 0;
     bool restorable = false, pipeline_known = false;
+    bool native_hud_affine = false; // RT0 RGB representable by the black/grey HUD replay
+    bool shader_readonly = false, query_active = false; // replay metadata, independent of table-prefix guesses
     uint32_t pso_rt_count = 0, rtv_format = 0, dsv_format = 0, samples = 0;
     uint32_t blend_mask = NA_UNKNOWN_U32, depth_enable = NA_UNKNOWN_U32, depth_func = NA_UNKNOWN_U32;
     uint32_t viewport_count = 0, scissor_count = 0;
