@@ -206,15 +206,15 @@ struct State {
         double px[2] = {0, 0};               // sample, render pixels (DLSS: colour sampled at centre - jitter)
         uint8_t vp[2][64], inv[2][64];       // original matrices as stored (row / column layout)
         uint8_t jvp[2][64], jinv[2][64];     // jittered replacements
-        bool has_proj = false;               // the camera's separate projection matrix (same block)
-        uint8_t proj[64], jproj[64];         // as the game stores it / jittered
+        bool has_proj = false;               // this camera's separate projection, including separate blocks
+        uint8_t proj[2][64], jproj[2][64];   // original / jittered, row and column layouts
         uint32_t phase = 0;
         int layout = 0;                      // 0 row-major, 1 column-major (as the game stores it)
         // Projection window: the extent the sample was taken at (window or render size),
         // and the windowed replacements actually written when `windowed`.
         bool windowed = false;
         uint32_t ew = 0, eh = 0;
-        uint8_t wvp[2][64], winv[2][64], wproj[64];
+        uint8_t wvp[2][64], winv[2][64], wproj[2][64];
         // The previous frame's camera as the game stored it, and its windowed copy.
         bool has_prev = false;
         uint64_t frame = 0;                  // frame this sample was started in
@@ -768,7 +768,7 @@ void unwindow(uint8_t* bytes, size_t n)
         for (int l = 0; l < 2; ++l) {
             if (!std::memcmp(bytes + o, g.jit.wvp[l], 64)) { std::memcpy(bytes + o, g.jit.jvp[l], 64); break; }
             if (!std::memcmp(bytes + o, g.jit.winv[l], 64)) { std::memcpy(bytes + o, g.jit.jinv[l], 64); break; }
-            if (l == 0 && g.jit.has_proj && !std::memcmp(bytes + o, g.jit.wproj, 64)) { std::memcpy(bytes + o, g.jit.jproj, 64); break; }
+            if (g.jit.has_proj && !std::memcmp(bytes + o, g.jit.wproj[l], 64)) { std::memcpy(bytes + o, g.jit.jproj[l], 64); break; }
             if (l == 0 && g.jit.has_prev && !std::memcmp(bytes + o, g.jit.wprev, 64)) { std::memcpy(bytes + o, g.jit.prev, 64); break; }
             if (l == 0 && g_window_extras_frame == g.frame)
                 for (const auto& x : g_window_extras)
@@ -789,6 +789,20 @@ bool is_projection_of(const na::camera::Matrix& p, const na::camera::Matrix& vp)
         }
     na::camera::Candidate cand{};
     return na::camera::RigidView(v, cand);
+}
+
+void remember_projection(const na::camera::Matrix& p, const uint8_t* exact, na::camera::Layout layout)
+{
+    auto& j = g.jit;
+    const auto jp = neural_alias::jitter_projection(p, neural_alias::JitterSample{j.px[0], j.px[1]}, j.ew, j.eh);
+    for (int l = 0; l < 2; ++l) {
+        const auto L = l ? na::camera::Layout::ColumnMajor : na::camera::Layout::RowMajor;
+        store_matrix(p, L, j.proj[l]);
+        store_matrix(jp, L, j.jproj[l]);
+        if (j.windowed) store_matrix(window_of(jp, double(j.ew) / g.win.w, double(j.eh) / g.win.h), L, j.wproj[l]);
+    }
+    std::memcpy(j.proj[layout == na::camera::Layout::RowMajor ? 0 : 1], exact, 64);
+    j.has_proj = true;
 }
 
 // A camera block's bytes hold a VP + inverse at the learned offset: start this frame's jitter.
@@ -934,15 +948,7 @@ bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& in_byt
         if (po >= 0 && static_cast<uint64_t>(po) + 64 <= n) {
             const auto pm = na::camera::LoadMatrix(bytes, static_cast<size_t>(po), layout);
             if (is_projection_of(pm, m)) {
-                std::array<double, 16> ps{};
-                for (int i = 0; i < 16; ++i) ps[i] = pm[i];
-                const auto jp = neural_alias::jitter_projection(ps, js, jw, jh);
-                na::camera::Matrix jpm{};
-                for (int i = 0; i < 16; ++i) jpm[i] = jp[i];
-                std::memcpy(j.proj, bytes.data() + po, 64);
-                store_matrix(jpm, layout, j.jproj);
-                if (windowed) store_matrix(window_of(jpm, sx, sy), layout, j.wproj);
-                j.has_proj = true;
+                remember_projection(pm, bytes.data() + po, layout);
             }
         }
         j.valid = true;
@@ -958,13 +964,14 @@ bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& in_byt
 // of THIS frame's camera (canonical values, rebuilt to float precision), so another
 // camera, a camera pan or arbitrary data is never touched.
 struct DerivedBase { na::camera::Matrix b{}, binv{}, bnew{}, bnewinv{}; const char* name = ""; };
-struct DerivedBases { uint64_t frame = UINT64_MAX; uint32_t phase = 0; int count = 0; DerivedBase base[3]; } g_derived;
+struct DerivedBases { uint64_t frame = UINT64_MAX; uint32_t phase = 0; bool projection = false; int count = 0; DerivedBase base[3]; } g_derived;
 void build_derived_bases()
 {
     auto& d = g_derived;
-    if (d.frame == g.frame && d.phase == g.jit.phase) return;
+    if (d.frame == g.frame && d.phase == g.jit.phase && d.projection == g.jit.has_proj) return;
     d.frame = g.frame;
     d.phase = g.jit.phase;
+    d.projection = g.jit.has_proj;
     d.count = 0;
     const auto L = g.jit.layout ? na::camera::Layout::ColumnMajor : na::camera::Layout::RowMajor;
     auto add = [&](const uint8_t* orig, const uint8_t* rep, const char* name) {
@@ -976,7 +983,7 @@ void build_derived_bases()
         if (na::camera::Invert(x.b, x.binv) && na::camera::Invert(x.bnew, x.bnewinv)) ++d.count;
     };
     add(g.jit.vp[g.jit.layout], g.jit.wvp[g.jit.layout], "VP");
-    if (g.jit.has_proj) add(g.jit.proj, g.jit.wproj, "P");
+    if (g.jit.has_proj) add(g.jit.proj[g.jit.layout], g.jit.wproj[g.jit.layout], "P");
     if (g.jit.has_prev) add(g.jit.prev, g.jit.wprev, "prevVP");
 }
 template <class JB>
@@ -1132,7 +1139,7 @@ void jitter_batch_impl(ID3D12CommandList* const* lists, UINT count)
     // carried the camera before first.
     std::map<std::pair<uint64_t, uint64_t>, JB> blocks;
     // fab5928 dropped 1500 blocks a frame to a budget and still missed 15 % of frames while
-    // zooming: every block is kept; the cheap probe below decides which ones are read in full.
+    // zooming. Read bounded observed ranges; one negative offset cannot exclude a component.
     constexpr size_t kSlotBlocks = 1024, kOtherBlocks = 4096;
     size_t slot_blocks = 0, other_blocks = 0, dropped = 0;
     for (UINT i = 0; i < count; ++i) {
@@ -1140,14 +1147,21 @@ void jitter_batch_impl(ID3D12CommandList* const* lists, UINT count)
         for (const auto& b : na::observe::ListRootConstantBuffers(lists[i])) {
             const bool slot = b.param == static_cast<uint32_t>(g.camera_param) && b.table == g.camera_table;
             const bool known = g_camera_resources.count(b.resource) != 0;
-            auto it = blocks.find({b.resource, b.offset});
-            if (it != blocks.end()) { if (slot && !it->second.slot) { it->second.slot = true; ++slot_blocks; --other_blocks; } continue; }
-            if (slot ? slot_blocks >= kSlotBlocks : other_blocks >= kOtherBlocks) { ++dropped; continue; }
             const uint32_t sz = b.table && b.size ? b.size : kBlockBytes;
+            const uint32_t bounded_size=(std::min)(sz,kMaxBlockRead);
+            auto it = blocks.find({b.resource, b.offset});
+            if (it != blocks.end()) {
+                // One upload address can be bound through several CBV ranges.
+                // A short first view must not hide a later camera/inverse.
+                it->second.size=(std::max)(it->second.size,bounded_size);
+                if (slot && !it->second.slot) { it->second.slot = true; ++slot_blocks; --other_blocks; }
+                continue;
+            }
+            if (slot ? slot_blocks >= kSlotBlocks : other_blocks >= kOtherBlocks) { ++dropped; continue; }
             JB& k = blocks[{b.resource, b.offset}];
             k.res = b.resource;
             k.off = b.offset;
-            k.size = sz < kMaxBlockRead ? sz : kMaxBlockRead;
+            k.size = bounded_size;
             k.slot = slot;
             k.known = known;
             if (slot) ++slot_blocks; else ++other_blocks;
@@ -1164,27 +1178,10 @@ void jitter_batch_impl(ID3D12CommandList* const* lists, UINT count)
     g.stats.jitter_blocks_dropped += dropped;
     g.stats.jitter_blocks_scanned += order.size();
     g.stats.jitter_slot_blocks += slot_blocks;
-    // Cheap probe for blocks outside the camera slot: 64 bytes at the learned camera offset (and
-    // at 0 for a small block). A block whose probe is neither this frame's camera bytes nor a
-    // perspective matrix of the main camera cannot need a write, so it is never read in full.
-    // Reading ~700 blocks in full cost 1.2 ms a frame (cf65722, fab5928).
-    uint8_t probe[64];
-    const auto probe_hit = [&](const JB& k) {
-        const uint64_t po = g.camera_offset >= 0 && static_cast<uint64_t>(g.camera_offset) + 64 <= k.size ? static_cast<uint64_t>(g.camera_offset) : 0;
-        if (na::observe::ReadBuffer(k.res, k.off + po, probe, 64) != 64) return false;
-        if (g.jit.valid)
-            for (int l = 0; l < 2; ++l)
-                if (!std::memcmp(probe, g.jit.vp[l], 64) || !std::memcmp(probe, g.jit.jvp[l], 64) || (g.jit.windowed && !std::memcmp(probe, g.jit.wvp[l], 64))) return true;
-        const std::vector<uint8_t> pb(probe, probe + 64);
-        for (auto L : {na::camera::Layout::RowMajor, na::camera::Layout::ColumnMajor}) {
-            const auto m = na::camera::LoadMatrix(pb, 0, L);
-            na::camera::Candidate c{};
-            if (na::camera::ViewProjection(m, c) && same_camera(m)) return true;
-        }
-        return false;
-    };
+    // Read each bounded range once. A single-offset probe cannot exclude camera
+    // copies elsewhere, nor standalone P/inverse/previous matrices. The cheap
+    // byte comparisons below cover the whole range without a general solver.
     for (const JB* k : order) {
-        if (!k->slot && !k->known && !probe_hit(*k)) { ++g.stats.jitter_blocks_probed_out; continue; }
         const uint32_t n = na::observe::ReadBuffer(k->res, k->off, bytes.data(), k->size);
         if (n < 64) continue;
         std::vector<uint8_t> view(bytes.begin(), bytes.begin() + n);
@@ -1194,13 +1191,39 @@ void jitter_batch_impl(ID3D12CommandList* const* lists, UINT count)
                 if (!std::memcmp(view.data() + o, m[0], 64) || !std::memcmp(view.data() + o, m[1], 64)) return true;
             return false;
         };
+        if (g.jit.valid && !g.jit.has_proj) {
+            // A depth/VP-only submission can start the sample before a separately
+            // uploaded P is consumed. Reuse the existing projection/rigid-view
+            // predicates to establish P for this exact camera, not a guessed offset.
+            const auto L = g.jit.layout ? na::camera::Layout::ColumnMajor : na::camera::Layout::RowMajor;
+            const std::vector<uint8_t> vb(g.jit.vp[g.jit.layout], g.jit.vp[g.jit.layout] + 64);
+            const auto vp = na::camera::LoadMatrix(vb, 0, L);
+            for (size_t o = 0; o + 64 <= n && !g.jit.has_proj; o += 16)
+                for (auto PLayout : {na::camera::Layout::RowMajor, na::camera::Layout::ColumnMajor}) {
+                    const auto p = na::camera::LoadMatrix(view, o, PLayout);
+                    na::camera::Candidate candidate{};
+                    if (na::camera::Projection(p, candidate) && is_projection_of(p, vp)) {
+                        remember_projection(p, view.data() + o, PLayout);
+                        break;
+                    }
+                }
+        }
         if (!g.jit.valid || !holds(g.jit.vp)) {
-            if (g.jit.valid && (holds(g.jit.jvp) || (g.jit.windowed && holds(g.jit.wvp)))) continue; // already written by an earlier batch of this frame
             // Projection window: EVERY copy of the main camera must be windowed, or the draws using it
             // land full size (a frame-old copy, or a camera updated between passes while panning).
             if (g.jit.valid && g.jit.windowed && window_extra_camera(k->res, k->off, view)) continue;
-            if (g.jit.valid) { ++g.stats.other_camera_blocks; continue; } // a different matrix (another camera): leave it
-            if (!begin_jitter(k->res, k->off, view, k->slot)) continue;
+            const auto holds_one=[&](const uint8_t* m) {
+                for(size_t o=0;o+64<=n;o+=16) if(!std::memcmp(view.data()+o,m,64)) return true;
+                return false;
+            };
+            // Camera components can be uploaded separately. Finding the exact
+            // known component is sufficient to patch it; requiring a VP beside
+            // it silently skipped projection-only/inverse-only consumers.
+            const bool component=g.jit.valid && (holds(g.jit.inv) ||
+                (g.jit.has_proj && holds(g.jit.proj)) ||
+                (g.jit.windowed && g.jit.has_prev && holds_one(g.jit.prev)));
+            if (g.jit.valid && !component) { ++g.stats.other_camera_blocks; ++g.stats.jitter_blocks_probed_out; continue; }
+            if (!g.jit.valid && !begin_jitter(k->res, k->off, view, k->slot)) continue;
         }
         if (k->slot) { // adopt the game's exact inverse bytes (they may differ from a computed inverse)
             const int64_t vo = g.camera_offset, io = vo + g.camera_inv_delta;
@@ -1218,17 +1241,7 @@ void jitter_batch_impl(ID3D12CommandList* const* lists, UINT count)
                 const auto vm = na::camera::LoadMatrix(view, static_cast<size_t>(vo), L);
                 const auto pm = na::camera::LoadMatrix(view, static_cast<size_t>(po), L);
                 if (is_projection_of(pm, vm)) {
-                    std::array<double, 16> ps{};
-                    for (int i = 0; i < 16; ++i) ps[i] = pm[i];
-                    const auto jp = neural_alias::jitter_projection(ps, neural_alias::JitterSample{g.jit.px[0], g.jit.px[1]},
-                                                                    g.jit.ew ? g.jit.ew : g.rw, g.jit.eh ? g.jit.eh : g.rh);
-                    na::camera::Matrix jpm{};
-                    for (int i = 0; i < 16; ++i) jpm[i] = jp[i];
-                    std::memcpy(g.jit.proj, view.data() + po, 64);
-                    store_matrix(jpm, L, g.jit.jproj);
-                    if (g.jit.windowed)
-                        store_matrix(window_of(jpm, double(g.jit.ew) / g.win.w, double(g.jit.eh) / g.win.h), L, g.jit.wproj);
-                    g.jit.has_proj = true;
+                    remember_projection(pm, view.data() + po, L);
                 }
             }
         }
@@ -1241,7 +1254,7 @@ void jitter_batch_impl(ID3D12CommandList* const* lists, UINT count)
                 int kind = 0; // 1 vp, 2 inverse, 3 projection, 4 previous vp
                 if (!std::memcmp(view.data() + o, g.jit.vp[l], 64)) { rep = w ? g.jit.wvp[l] : g.jit.jvp[l]; kind = 1; }
                 else if (!std::memcmp(view.data() + o, g.jit.inv[l], 64)) { rep = w ? g.jit.winv[l] : g.jit.jinv[l]; kind = 2; }
-                else if (l == 0 && g.jit.has_proj && !std::memcmp(view.data() + o, g.jit.proj, 64)) { rep = w ? g.jit.wproj : g.jit.jproj; kind = 3; ++g.stats.jitter_proj_writes; }
+                else if (g.jit.has_proj && !std::memcmp(view.data() + o, g.jit.proj[l], 64)) { rep = w ? g.jit.wproj[l] : g.jit.jproj[l]; kind = 3; ++g.stats.jitter_proj_writes; }
                 else if (l == 0 && w && g.jit.has_prev && !std::memcmp(view.data() + o, g.jit.prev, 64)) { rep = g.jit.wprev; kind = 4; }
                 if (rep && g.jitter_writes.Apply(k->res, k->off + o, view.data() + o, rep, [&] {
                     return na::observe::WriteBuffer(k->res, k->off + o, rep, 64) == 64;
@@ -1409,6 +1422,7 @@ bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth
                 k.table = b.table;
                 k.list_rank = ol.first;
             }
+            k.size=(std::max)(k.size,b.table && b.size ? b.size : kBlockBytes);
             ++k.uses;
         }
     }
@@ -1486,6 +1500,7 @@ bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth
             if (c.kind == na::camera::Kind::ViewProjection && !c.has_inverse_pair && !have_loose && same_camera(c.matrix)) {
                 loose.vp = c.matrix;
                 loose.reversed = c.reversed;
+                loose.injected = holds_jittered(s.bytes, c.byte_offset);
                 loose.block = o;
                 have_loose = true;
             }
@@ -1515,7 +1530,7 @@ bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth
         ++g.stats.camera_inverse_computed;
         *vp = loose.vp;
         *reversed = loose.reversed;
-        g_injected = false;
+        g_injected = loose.injected; // VP-only blocks retain exact patched-sample provenance too
         return true;
     }
     if (!p) {

@@ -78,6 +78,61 @@ double Psnr(const std::vector<float>& a, const std::vector<double>& truth, uint3
     const double mse = se / static_cast<double>(n);
     return mse <= 0 ? 99.0 : 10.0 * std::log10(1.0 / mse);
 }
+
+// Optional real-runtime diagnostic: measure whether a post-Evaluate motion
+// capture still contains the supplied values. Wait/readback is test-only.
+int InspectInputs(test::Device& d)
+{
+    constexpr UINT w = 512, h = 256;
+    constexpr auto read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    ID3D12Device* dev = d.device.Get();
+    auto color = test::CreateTexture(dev, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
+    auto depth = test::CreateTexture(dev, w, h, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
+    auto motion = test::CreateTexture(dev, w, h, DXGI_FORMAT_R32G32_FLOAT, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto output = test::CreateTexture(dev, w * 2, h * 2, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    REQUIRE(color && depth && motion && output);
+    test::List l; REQUIRE(l.Create(dev));
+    ID3D12Resource* resources[] = {color.Get(), depth.Get(), motion.Get()};
+    std::vector<test::ComPtr<ID3D12Resource>> uploads;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fm{}; UINT64 motion_bytes = 0;
+    for (UINT i = 0; i < 3; ++i) {
+        auto desc = resources[i]->GetDesc(); D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{}; UINT64 bytes = 0;
+        dev->GetCopyableFootprints(&desc, 0, 1, 0, &fp, nullptr, nullptr, &bytes);
+        auto up = test::CreateBuffer(dev, bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        REQUIRE(up); uint8_t* p = nullptr; REQUIRE(SUCCEEDED(up->Map(0, nullptr, reinterpret_cast<void**>(&p))));
+        for (UINT y = 0; y < h; ++y) for (UINT x = 0; x < w; ++x) {
+            if (i == 0) reinterpret_cast<uint32_t*>(p + y * fp.Footprint.RowPitch)[x] = 0xff000000u | (((x * 13 + y * 31) & 255u) * 0x010101u);
+            else if (i == 1) reinterpret_cast<float*>(p + y * fp.Footprint.RowPitch)[x] = .005f + .01f * x / w;
+            else { float* v = reinterpret_cast<float*>(p + y * fp.Footprint.RowPitch) + 2 * x; v[0] = .375f + x * .001f; v[1] = -.125f + y * .002f; }
+        }
+        up->Unmap(0, nullptr);
+        D3D12_TEXTURE_COPY_LOCATION src{}, dst{}; src.pResource = up.Get(); src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; src.PlacedFootprint = fp;
+        dst.pResource = resources[i]; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; l.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        auto b = test::Transition(resources[i], D3D12_RESOURCE_STATE_COPY_DEST, read); l.list->ResourceBarrier(1, &b);
+        uploads.push_back(up); if (i == 2) { fm = fp; motion_bytes = bytes; }
+    }
+    na::dlss::EvalDesc e; e.color = color.Get(); e.depth = depth.Get(); e.motion = motion.Get(); e.output = output.Get();
+    e.render_w = w; e.render_h = h; e.out_w = w * 2; e.out_h = h * 2; e.quality = na::dlss::Quality::MaxPerformance;
+    e.preset = 13; e.hdr = false; e.reset = true; e.auto_exposure = true; e.jitter_x = .25f; e.jitter_y = -.125f;
+    REQUIRE(na::dlss::Evaluate(l.list.Get(), e));
+    auto rb = test::CreateBuffer(dev, motion_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST); REQUIRE(rb);
+    auto b = test::Transition(motion.Get(), read, D3D12_RESOURCE_STATE_COPY_SOURCE); l.list->ResourceBarrier(1, &b);
+    D3D12_TEXTURE_COPY_LOCATION src{}, dst{}; src.pResource = motion.Get(); src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.pResource = rb.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = fm;
+    l.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    REQUIRE(SUCCEEDED(l.list->Close())); ID3D12CommandList* lists[] = {l.list.Get()};
+    d.queue->ExecuteCommandLists(1, lists); na::dlss::OnExecuted(d.queue.Get(), 1, lists); d.WaitIdle();
+    uint8_t* p = nullptr; REQUIRE(SUCCEEDED(rb->Map(0, nullptr, reinterpret_cast<void**>(&p))));
+    uint64_t changed = 0; double max_error = 0;
+    for (UINT y = 0; y < h; ++y) for (UINT x = 0; x < w; ++x) {
+        const float* v = reinterpret_cast<const float*>(p + y * fm.Footprint.RowPitch) + 2 * x;
+        const float expected[] = {.375f + x * .001f, -.125f + y * .002f};
+        for (UINT c = 0; c < 2; ++c) { const double err = std::abs(double(v[c]) - expected[c]); if (err != 0) ++changed; max_error = (std::max)(max_error, err); }
+    }
+    rb->Unmap(0, nullptr); std::printf("real NGX motion-input preservation: changed=%llu/%u max_error=%.9g\n", static_cast<unsigned long long>(changed), w * h * 2, max_error);
+    na::dlss::Shutdown();
+    return 0; // Measurement only; a post-Evaluate capture must not assume preservation.
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -110,6 +165,8 @@ int main(int argc, char** argv)
                 caps.optimal_settings ? 1 : 0);
     if (caps.reason[0]) std::printf("reason: %s\n", caps.reason);
     REQUIRE(init_ok && caps.available);
+
+    if (argc > 2 && std::string(argv[2]) == "--inspect-inputs") return InspectInputs(d);
 
     const uint32_t ow = 1920, oh = 1080;
     for (na::dlss::Quality q : {na::dlss::Quality::MaxQuality, na::dlss::Quality::Balanced, na::dlss::Quality::MaxPerformance,

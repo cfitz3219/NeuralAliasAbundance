@@ -179,6 +179,13 @@ if(NA_HAVE_NGX_SDK)
   na_host_test(j2_hud_nis_test SOURCES j2_hud_nis_test.cpp LIBS host_dx12 dxgi)
   na_host_test(j2_native_hud_test SOURCES j2_native_hud_test.cpp LIBS host_dx12 dxgi d3dcompiler)
   na_host_test(j2_anno_shape_test SOURCES j2_anno_shape_test.cpp LIBS host_dx12 dxgi d3dcompiler)
+  add_test(NAME host_j2_standalone_jitter_test COMMAND j2_anno_shape_test 1 1 --jitter-component)
+  add_test(NAME host_j2_camera_view_alias_test COMMAND j2_anno_shape_test 1 1 --camera-alias)
+  add_test(NAME host_j2_early_projection_jitter_test COMMAND j2_anno_shape_test 1 1 --jitter-early-component)
+  add_test(NAME host_j2_column_projection_jitter_test COMMAND j2_anno_shape_test 1 1 --jitter-column-component)
+  set_tests_properties(host_j2_standalone_jitter_test host_j2_camera_view_alias_test
+    host_j2_early_projection_jitter_test host_j2_column_projection_jitter_test
+    PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   na_host_test(j2_inline_compute_test SOURCES j2_anno_shape_test.cpp LIBS host_dx12 dxgi d3dcompiler ARGS 1 1 --inline-flow LABELS gpu)
   target_compile_definitions(j2_inline_compute_test PRIVATE NA_J2_TEST_COMPUTE)
   add_test(NAME host_j2_msaa_shape_test COMMAND j2_anno_shape_test 2)
