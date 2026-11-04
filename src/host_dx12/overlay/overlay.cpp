@@ -859,11 +859,11 @@ void write_status_line()
         for (uint64_t s = first + 1; s <= dlss.create_seq; ++s) {
             const auto& c = dlss.creates[(s - 1) % 8];
             if (c.seq != s) continue;
-            char row[256];
-            const int n = snprintf(row, sizeof(row), "dlss_create seq=%llu view=0x%llX flags=0x%X hdr=%u autoexp=%u inverted=%u preset=%u quality=%u render=%ux%u out=%ux%u\r\n",
+            char crow[256];
+            const int cn = snprintf(crow, sizeof(crow), "dlss_create seq=%llu view=0x%llX flags=0x%X hdr=%u autoexp=%u inverted=%u preset=%u quality=%u render=%ux%u out=%ux%u\r\n",
                                    static_cast<unsigned long long>(c.seq), static_cast<unsigned long long>(c.view), c.flags, (c.flags & 1u) ? 1u : 0u,
                                    (c.flags & 64u) ? 1u : 0u, (c.flags & 8u) ? 1u : 0u, c.preset, c.quality, c.rw, c.rh, c.ow, c.oh);
-            if (n > 0) WriteFile(f, row, static_cast<DWORD>((std::min)(n, static_cast<int>(sizeof(row) - 1))), &written, nullptr);
+            if (cn > 0) WriteFile(f, crow, static_cast<DWORD>((std::min)(cn, static_cast<int>(sizeof(crow) - 1))), &written, nullptr);
         }
         printed = dlss.create_seq;
     }
