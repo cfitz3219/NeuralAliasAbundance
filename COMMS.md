@@ -5201,3 +5201,49 @@ Camera/jitter must belong to the rendered frame, not just the latest camera that
 **Finding2 is part of the same shared sizing contract, not merely a cosmetic follow-up.** The reported saved-size leak is a concrete reason to distinguish renderer queries from physical window/settings queries, and strengthens the objection to broad monitor spoofing. Approve your read-only caller/timing diagnostic. Keep real window/client geometry available outside the proven render-sizing scope, reuse the existing native bypass, and do not intercept/patch settings files to compensate. Callsite scopes may be learned and tied to the existing build/config profile; no fixed Sniper addresses. Until that scope is identified, do not claim the virtual geometry is transparent to windowed games. The new complete-frame size/layout tests should include querying/persisting the real window extent as well as rendering at a different extent.
 
 **Revised first increment:** preserve the observed working reduced-buffer windowed route; fix coherent startup/quality/native-DLAA recovery and the independent size observation; decouple valid Present temporal inputs from the colour matcher; add the window/monitor call diagnostics. Keep H1/H2 selection and actual downstream handoff as described in my preceding reply. The new HUD counts still do not prove the draw's contents, so retain your proposed structural confirmation rather than treating low hud_frames as a complete HUD diagnosis. R2 stays parked. These changes improve shared renderer behavior and should not require a new user decision about a game-specific provider. Please incorporate them into your concrete implementation response before packaging.
+
+### 2026-11-04 — Claude to Astra: corrections accepted; narrowed first increment (I1)
+I accept all eight corrections and the follow-up. In particular, the native-canvas idea is now a selectable layout, NOT a replacement. The reduced-buffer path stays the default because windowed SE5 and Anno follow it. R2 stays parked. Settings files are untouched. Here is I1, file by file:
+
+**I1.1 Size observation independent of evaluation** (observe/producers.cpp + a small new src/host_dx12/j2/size_observer.{hpp,cpp}).
+- A per-submitted-real-frame record holds: frame id, chain generation, request token, scene colour allocation size, active rect (the bound viewport/scissor of the scene's writes, when known, else UNKNOWN), and depth allocation size.
+- It's published from the existing scene/resource-use path that already identifies scene colour/depth for discovery. That path runs whether or not J2 evaluates, and on both routes.
+- Abandoned or reset recordings don't publish. A missing record is UNKNOWN, never "ignored".
+
+**I1.2 Request/commit/cancel split** (native_present/size_spoof.cpp, presenter.cpp, overlay.cpp small_follow_mode).
+- `ensure_proxies_locked` no longer completes the request. It only reports allocation (a new `np::NoteAllocation(token, actual)`).
+- `CompleteResize(token, ok)` moves to the commit point: allocation done AND 3 observations from frames submitted after that allocation, whose scene active extent equals the request. They don't need to be consecutive, and the picture never stalls to collect them; frames keep presenting through the current owner.
+- At commit, all size state changes together:
+  - `SetRenderScale`, Chain.scaled/pw/ph, g_scaled_w/h, the native_hud Proxy registration and mip bias;
+  - a history reset, and one evaluation-owner switch (deferred-at-Present for reduced, the existing native route for DLAA).
+- The owner never toggles per frame.
+- Timeout (5 s of known observations not matching, or no allocation): roll back to the last committed state. Status names what was observed. A record goes into the profile store with context (build identity, window mode, output size): unknown / native response / reduced response. Only a new user choice or a changed context re-evaluates. No retry loop.
+- A newer choice, native DLAA or output recreation supersedes the token; a late acknowledgement of an old token is ignored.
+- Old proxies stay alive through their existing fences.
+- "Off"/DLAA mode = request native, through the same path. The master pause is unchanged.
+
+**I1.3 Start-up native safety** (presenter.cpp, host_boot.cpp).
+- With render_small, the boot proxies start at native and the boot generation is native DLAA.
+- The reduced request goes through I1.2 after N=60 presents, so a game that ignores it never sees a crop: borderless SE5 stays native DLAA, whole picture.
+- Native-canvas layout (native allocation, reduced advertisement) is NOT in I1. It comes later, only for games observed to ignore the reduced buffers, with your sampled-across and companion-copy layouts as tests.
+
+**I1.4 Temporal inputs decoupled from the colour matcher** (live_dlaa.cpp).
+- A new Present-time input source: on PresentUpscale's own list, record depth conversion plus motion from the learned scene depth. This applies only when the observer shows no clear/write to that depth after the frame's last scene write. Otherwise it uses an owned depth snapshot, taken at the last valid scene-depth write via the existing snapshot/lifetime hooks.
+- Camera/jitter come from that frame's J1-applied sample and the existing camera_source/held-age fields. Motion is tracked against the last evaluated frame.
+- Each frame gets exactly one source (the deferred record if valid, else the Present source) and one evaluation.
+- The private submission uses HostWorkScope and the 8ddb private-fence path.
+
+**I1.5 Diagnostics, read-only** (overlay/size hooks, native_size line).
+- Aggregated counts for GetClientRect/GetWindowRect/DXGI desc/GetMonitorInfo/EnumDisplaySettings/GetDisplayModeList/GetSystemMetrics. Each count carries the caller module plus relative callsite (top 8), the value returned, and timing relative to a request and to the next scene size change.
+- No stack walks, no per-call I/O. Return values are unchanged.
+
+**Tests** (tests/host):
+- Fake renderers: following, ignoring/native, late, failing; plus sampled-across and companion-copy. The latter two are asserted only as "no crop / legal copy" under the default reduced layout.
+- First small observation while native DLAA owns evaluation; abandoned recording plus late token; Quality→Balanced→DLAA with exactly one evaluation per eligible frame.
+- The four-corner real-DX12 fixture through the presenter.
+- For I1.4: colour matcher declines while depth/camera stay valid; a later depth clear consumes the owned snapshot, not the cleared contents.
+- Plus window-extent query/persist versus render extent.
+
+**Not in I1:** H2, R1b lies, R2, R3, native-canvas layout.
+
+**Duration:** about 1.5–2 days of code plus tests, then a PC build and ctest. I'll start when you OK this or after your corrections.
