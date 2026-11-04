@@ -104,6 +104,7 @@ struct CapturedPicture {
     ComPtr<ID3D12Resource> final;
 };
 struct NativeReplay {
+    ID3D12Device* device=nullptr; // native/check textures retain it
     ComPtr<ID3D12Resource> native;
     ComPtr<ID3D12Resource> check;
     ComPtr<ID3D12DescriptorHeap> rtv;
@@ -115,6 +116,8 @@ struct NativeReplay {
     std::vector<Source> sources;
     std::vector<na::nr::native::RecordingLease> uses;
     bool closed=false,submitted=false,complete=true,attempted=false,restart=false;
+    struct Read {uint64_t id=0;uint32_t sub=0,state=0;na::observe::StateLookup lookup=na::observe::StateLookup::Absent;};
+    std::vector<Read> reads;
     ComPtr<ID3D12CommandQueue> queue;
     UINT rtv_inc=0;
     uint32_t rw=0,rh=0,ow=0,oh=0,draws=0;
@@ -130,6 +133,7 @@ struct NativeReplay {
         list->ResourceBarrier(2,b+1);
     }
 };
+std::vector<std::shared_ptr<NativeReplay>> g_replay_pool;
 struct ProbeCapture {
     std::shared_ptr<Picture> picture;
     ComPtr<ID3D12Resource> source_resource;
@@ -403,25 +407,40 @@ void record_native_hud_locked(Proxy& p,ID3D12GraphicsCommandList* game,
     if(!p.replay){
         ComPtr<ID3D12Resource> source;source.Attach(na::observe::AcquireResource(p.id));
         ComPtr<ID3D12Device> device;if(!source||FAILED(source->GetDevice(IID_PPV_ARGS(&device))))return;
-        auto r=std::make_shared<NativeReplay>();r->rw=p.rw;r->rh=p.rh;r->ow=p.ow;r->oh=p.oh;
+        const auto retired=[](const auto& r){return r.use_count()==1&&std::all_of(r->uses.begin(),r->uses.end(),[](const auto& use){return use.Retired();});};
+        const auto matches=[&](const auto& r){return r->device==device.Get()&&r->rw==p.rw&&r->rh==p.rh&&r->ow==p.ow&&r->oh==p.oh&&r->view==static_cast<DXGI_FORMAT>(state.rtv_format);};
+        g_replay_pool.erase(std::remove_if(g_replay_pool.begin(),g_replay_pool.end(),[&](const auto& r){return retired(r)&&!matches(r);}),g_replay_pool.end());
+        std::shared_ptr<NativeReplay> r;
+        for(const auto& q:g_replay_pool)if(retired(q)&&matches(q)){r=q;break;}
+        const bool reuse=!!r;
+        if(reuse){
+            if(!r->closed)r->list->Close();
+            if(FAILED(r->alloc->Reset())||FAILED(r->list->Reset(r->alloc.Get(),nullptr)))return;
+            r->picture->BeginCycle();r->uses.clear();r->sources.clear();r->reads.clear();r->queue.Reset();
+            r->closed=r->submitted=r->attempted=r->restart=false;r->complete=true;r->draws=0;*r->identity={};
+            ++g_stats.native_reused;
+        }else{
+            if(g_replay_pool.size()>=8)return; // older paths retain the original; never overwrite an executable packet
+            r=std::make_shared<NativeReplay>();r->device=device.Get();r->rw=p.rw;r->rh=p.rh;r->ow=p.ow;r->oh=p.oh;
+        }
         r->identity->evaluation_succeeded=false;
         r->view=static_cast<DXGI_FORMAT>(state.rtv_format);
         D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;
         auto desc=source->GetDesc();desc.Width=p.ow;desc.Height=p.oh;desc.Format=clear_view_of(TypelessOf(p.format));
         desc.Flags=D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET|D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,2,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
-        if(FAILED(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&r->native)))||
+        if(!reuse&&(FAILED(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&r->native)))||
            FAILED(device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&r->rtv)))||
            FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&r->alloc)))||
-           FAILED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,r->alloc.Get(),nullptr,IID_PPV_ARGS(&r->list))))return;
+           FAILED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,r->alloc.Get(),nullptr,IID_PPV_ARGS(&r->list)))))return;
         desc.Width=p.rw;desc.Height=p.rh;desc.Flags=D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-        if(FAILED(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&r->check))))return;
+        if(!reuse&&FAILED(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&r->check))))return;
         D3D12_RENDER_TARGET_VIEW_DESC view{};view.Format=r->view;view.ViewDimension=D3D12_RTV_DIMENSION_TEXTURE2D;
         device->CreateRenderTargetView(r->native.Get(),&view,r->rtv->GetCPUDescriptorHandleForHeapStart());
         r->rtv_inc=device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         auto check_view=r->rtv->GetCPUDescriptorHandleForHeapStart();check_view.ptr+=r->rtv_inc;
         device->CreateRenderTargetView(r->check.Get(),&view,check_view);
-        r->picture=picture_locked(device.Get(),source->GetDesc(),p.ow,p.oh);
+        if(!reuse){r->picture=picture_locked(device.Get(),source->GetDesc(),p.ow,p.oh);if(!r->picture)return;g_replay_pool.push_back(r);++g_stats.native_allocated;}
         auto use=na::nr::native::RetainRecording(game,r);
         if(!r->picture||!use||!r->picture->SnapshotScene(game,source.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET))return;
         r->Prefix();
@@ -435,7 +454,7 @@ void record_native_hud_locked(Proxy& p,ID3D12GraphicsCommandList* game,
         auto use=na::nr::native::RetainRecording(game,p.replay);
         if(!source||!use||!r.picture->SnapshotScene(game,source.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET)){r.complete=false;return;}
         r.uses.push_back(use);r.sources.clear();r.sources.push_back({game,state.recording,na::observe::IdOf(game)});
-        r.draws=0;r.complete=true;r.restart=false;r.Prefix();
+        r.draws=0;r.complete=true;r.restart=false;r.reads.clear();r.Prefix();
     }
     if(!r.complete||r.closed)return;
     if(r.view!=static_cast<DXGI_FORMAT>(state.rtv_format)){r.complete=false;return;}
@@ -443,7 +462,26 @@ void record_native_hud_locked(Proxy& p,ID3D12GraphicsCommandList* game,
         auto use=na::nr::native::RetainRecording(game,p.replay);if(!use){r.complete=false;return;}
         r.uses.push_back(use);r.sources.push_back({game,state.recording,na::observe::IdOf(game)});
     }
-    if(!na::observe::RestoreListState(game,r.list.Get(),true)){r.complete=false;return;}
+    std::vector<uint64_t> reads;
+    if(!na::observe::RestoreListState(game,r.list.Get(),true,&reads)){r.complete=false;return;}
+    for(const auto id:reads){
+        const auto old=std::find_if(r.reads.begin(),r.reads.end(),[&](const auto& value){return value.id==id;});
+        UINT subs=0;
+        if(old!=r.reads.end()){for(const auto& value:r.reads)if(value.id==id)++subs;}
+        else{ComPtr<ID3D12Resource> resource;resource.Attach(na::observe::AcquireResource(id));if(!resource){r.complete=false;return;}
+            const auto d=resource->GetDesc();subs=1;
+            if(d.Dimension!=D3D12_RESOURCE_DIMENSION_BUFFER){D3D12_FEATURE_DATA_FORMAT_INFO format{d.Format,1};
+                if(FAILED(r.device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO,&format,sizeof format))){r.complete=false;return;}
+                subs=UINT(d.MipLevels)*(d.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE3D?1u:d.DepthOrArraySize)*format.PlaneCount;
+                if(!subs||subs>4096){r.complete=false;return;}}
+        }
+        for(UINT sub=0;sub<subs;++sub){uint32_t resource_state=0;const auto lookup=na::observe::ListStateSub(game,id,sub,&resource_state);
+            if(lookup!=na::observe::StateLookup::Known&&lookup!=na::observe::StateLookup::Absent){r.complete=false;return;}
+            auto before=std::find_if(r.reads.begin(),r.reads.end(),[&](const auto& value){return value.id==id&&value.sub==sub;});
+            if(before==r.reads.end())r.reads.push_back({id,sub,resource_state,lookup});
+            else if(before->lookup!=lookup||before->state!=resource_state){r.complete=false;return;}
+        }
+    }
     auto target=r.rtv->GetCPUDescriptorHandleForHeapStart();r.list->OMSetRenderTargets(1,&target,FALSE,nullptr);
     D3D12_VIEWPORT vp[16]{};D3D12_RECT sc[16]{};const float sx=float(p.ow)/p.rw,sy=float(p.oh)/p.rh;
     for(UINT i=0;i<state.viewport_count;++i){float v[6];ScaleViewport(state.viewports[i],sx,sy,v);vp[i]={v[0],v[1],v[2],v[3],v[4],v[5]};}
@@ -499,10 +537,14 @@ void note_source_locked(Proxy& p, ID3D12GraphicsCommandList* list)
         // A learned canvas may be captured even when reflection cannot resolve
         // the final shader. The SAME-FRAME GPU proof still chooses original
         // complete colour if this is not the image actually presented.
+        const Proxy* newest=nullptr;uint64_t order=0;
         for(const auto& u:g_proxy)if(u.id&&u.upstream&&u.pixel_proved&&(u.picture||u.hud||u.redirected||u.forwarded)&&
             u.rw==p.rw&&u.rh==p.rh&&u.ow==p.ow&&u.oh==p.oh){
-            p.source=u.id;p.source_ambiguous=false;++g_stats.handoff_inferred;break;
+            const auto c=std::find_if(g_canvases.begin(),g_canvases.end(),[&](const auto& canvas){return canvas.id==u.id;});
+            const uint64_t written=c==g_canvases.end()?0:c->last_write;
+            if(!newest||written>order){newest=&u;order=written;}
         }
+        if(newest){p.source=newest->id;p.source_ambiguous=false;++g_stats.handoff_inferred;}
         if(!p.source){probe_canvas_locked(p,list);return;}
     }
     // Preserve the actual full upstream picture at the transfer occurrence.
@@ -1283,6 +1325,18 @@ void AfterSubmission(ID3D12CommandQueue* queue,uint32_t count,ID3D12CommandList*
                 if(na::observe::ListStateSub(lists[i],p.id,0,&state)==na::observe::StateLookup::Known)final_state=state;
             }
             if(final_state!=D3D12_RESOURCE_STATE_PRESENT)continue;
+            // The application fence remains behind this callback (the existing
+            // producer queue lock also serialises Signal/Wait). Bindings must
+            // additionally remain readable at this delayed replay point.
+            bool readable=!r.restart;
+            for(const auto& read:r.reads){auto lookup=read.lookup;uint32_t state=read.state;
+                for(UINT i=0;i<count;++i){uint32_t next=0;const auto found=na::observe::ListStateSub(lists[i],read.id,read.sub,&next);
+                    if(found!=na::observe::StateLookup::Absent){lookup=found;state=next;}}
+                constexpr UINT writes=D3D12_RESOURCE_STATE_RENDER_TARGET|D3D12_RESOURCE_STATE_UNORDERED_ACCESS|D3D12_RESOURCE_STATE_DEPTH_WRITE|
+                    D3D12_RESOURCE_STATE_COPY_DEST|D3D12_RESOURCE_STATE_RESOLVE_DEST|D3D12_RESOURCE_STATE_STREAM_OUT;
+                if(lookup!=read.lookup||(lookup==na::observe::StateLookup::Known&&(state!=read.state||(state&writes)))){readable=false;break;}
+            }
+            if(!readable){r.attempted=true;++g_stats.native_resource_changed;continue;}
             r.attempted=true;ready.push_back(std::move(capture));
         }
     }
@@ -1344,9 +1398,10 @@ std::string StatusLine()
         (unsigned long long)s.canvas_changed,(unsigned long long)s.canvas_no_state,(unsigned long long)s.handoff_snapshot_missing,
         (unsigned long long)s.handoff_no_source,(unsigned long long)s.handoff_inferred);
     result+=b;
-    std::snprintf(b,sizeof b," native{recorded=%llu submitted=%llu verified=%llu rejected=%llu}",
+    std::snprintf(b,sizeof b," native{recorded=%llu submitted=%llu verified=%llu rejected=%llu allocated=%llu reused=%llu resource_changed=%llu}",
         (unsigned long long)s.native_recorded,(unsigned long long)s.native_submitted,
-        (unsigned long long)s.native_verified,(unsigned long long)s.native_rejected);
+        (unsigned long long)s.native_verified,(unsigned long long)s.native_rejected,
+        (unsigned long long)s.native_allocated,(unsigned long long)s.native_reused,(unsigned long long)s.native_resource_changed);
     result+=b;return result;
 }
 

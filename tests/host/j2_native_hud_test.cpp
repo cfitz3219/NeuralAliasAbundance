@@ -614,9 +614,13 @@ float4 altered(float4 p:SV_Position):SV_Target{return image.Load(int3(p.xy,0))*.
     auto scene_pso=pipeline(dev,hud_root.Get(),vs.Get(),ps.Get(),Blend::Opaque,DXGI_FORMAT_UNKNOWN,native);
     auto hud_pso=pipeline(dev,hud_root.Get(),vs.Get(),ps.Get(),Blend::Over,DXGI_FORMAT_UNKNOWN,native);
     auto add_pso=pipeline(dev,hud_root.Get(),vs.Get(),ps.Get(),Blend::Add,DXGI_FORMAT_UNKNOWN,native);REQUIRE(scene_pso&&hud_pso&&add_pso);
-    auto vertices=test::CreateBuffer(dev,24,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+    auto vertices=test::CreateBuffer(dev,24,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_STATE_COPY_DEST);
+    auto vertex_upload=test::CreateBuffer(dev,24,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);REQUIRE(vertex_upload);
     auto indices=test::CreateBuffer(dev,12,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);REQUIRE(vertices&&indices);
-    void* mapped=nullptr;REQUIRE(SUCCEEDED(vertices->Map(0,nullptr,&mapped)));const float xy[]={-1,-1,-1,3,3,-1};std::memcpy(mapped,xy,sizeof xy);vertices->Unmap(0,nullptr);
+    void* mapped=nullptr;REQUIRE(SUCCEEDED(vertex_upload->Map(0,nullptr,&mapped)));const float xy[]={-1,-1,-1,3,3,-1};std::memcpy(mapped,xy,sizeof xy);vertex_upload->Unmap(0,nullptr);
+    test::List init;REQUIRE(init.Create(dev));init.list->CopyBufferRegion(vertices.Get(),0,vertex_upload.Get(),0,sizeof xy);
+    auto ready=test::Transition(vertices.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);init.list->ResourceBarrier(1,&ready);
+    REQUIRE(SUCCEEDED(init.list->Close()));ID3D12CommandList* setup[]={init.list.Get()};d.queue->ExecuteCommandLists(1,setup);d.WaitIdle();
     REQUIRE(SUCCEEDED(indices->Map(0,nullptr,&mapped)));const UINT ids[]={0,1,2};std::memcpy(mapped,ids,sizeof ids);indices->Unmap(0,nullptr);
     const D3D12_VERTEX_BUFFER_VIEW vb{vertices->GetGPUVirtualAddress(),24,8};const D3D12_INDEX_BUFFER_VIEW ib{indices->GetGPUVirtualAddress(),12,DXGI_FORMAT_R32_UINT};
     if(native){native_fixture=&d;nh::SetPreHudRendererForTests(&native_fixture_renderer);}
@@ -638,7 +642,7 @@ float4 altered(float4 p:SV_Position):SV_Target{return image.Load(int3(p.xy,0))*.
             nh::ReportCanvasProbe(layer.probe_source,layer.probe_generation,identity);
         }
         if(frame<(unresolved?2u:3u)||frame==6){CHECK(!found);return 0;}REQUIRE(found&&layer.picture&&layer.owner);CHECK(layer.clean_allowed==(frame!=5));
-        if(native){
+        if(native&&frame!=7){
             REQUIRE(layer.native_picture&&layer.native_check);
             auto out=test::CreateTexture(dev,OW,OH,F,U,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);REQUIRE(out);
             test::List finish;REQUIRE(finish.Create(dev));auto barrier=test::Transition(shown,D3D12_RESOURCE_STATE_PRESENT,S);finish.list->ResourceBarrier(1,&barrier);
@@ -652,14 +656,16 @@ float4 altered(float4 p:SV_Position):SV_Target{return image.Load(int3(p.xy,0))*.
             if(frame!=4)CHECK(std::abs(int(pixels[(OH-2)*OW*4])-51)<=1);
             nh::ReportNativePictureResult(identity);return 0;
         }
-        std::vector<uint8_t> pixels;REQUIRE(readback(d,shown,R,4,pixels));CHECK(pixels[(10*W+20)*4]>(frame==4?125:160));
+        if(native&&frame==7)CHECK(!layer.native_picture&&nh::GetStats().native_resource_changed>0);
+        const auto shown_state=native?D3D12_RESOURCE_STATE_PRESENT:R;
+        std::vector<uint8_t> pixels;REQUIRE(readback(d,shown,shown_state,4,pixels));CHECK(pixels[(10*W+20)*4]>(frame==4?125:160));
         std::vector<float> mv(W*H*2,0);auto motion=test::CreateTexture(dev,W,H,DXGI_FORMAT_R32G32_FLOAT,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         REQUIRE(motion&&upload(d,motion.Get(),mv.data(),8,S));
         auto out=test::CreateTexture(dev,OW,OH,F,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);REQUIRE(out);
         std::vector<UINT> dark(OW*OH,0xff1a1a1a);REQUIRE(upload(d,out.Get(),dark.data(),4,U));test::List finish;REQUIRE(finish.Create(dev));
-        auto t=test::Transition(shown,R,S);finish.list->ResourceBarrier(1,&t);
+        auto t=test::Transition(shown,shown_state,S);finish.list->ResourceBarrier(1,&t);
         REQUIRE(layer.picture->Prepare(finish.list.Get(),shown,F,motion.Get(),layer.n0,layer.n1,layer.view,layer.grey,layer.srgb,layer.clean_allowed,F));
-        REQUIRE(layer.picture->Composite(finish.list.Get(),out.Get()));t=test::Transition(shown,S,R);finish.list->ResourceBarrier(1,&t);
+        REQUIRE(layer.picture->Composite(finish.list.Get(),out.Get()));t=test::Transition(shown,S,shown_state);finish.list->ResourceBarrier(1,&t);
         REQUIRE(SUCCEEDED(finish.list->Close()));ID3D12CommandList* done[]={finish.list.Get()};d.queue->ExecuteCommandLists(1,done);d.WaitIdle();
         REQUIRE(readback(d,out.Get(),U,4,pixels));CHECK(pixels[(20*OW+40)*4]>(frame==4?20:150));
         if(frame==4)CHECK(pixels[(20*OW+40)*4]==26);
@@ -689,6 +695,7 @@ float4 altered(float4 p:SV_Position):SV_Target{return image.Load(int3(p.xy,0))*.
         l->RSSetViewports(1,&vp);l->RSSetScissorRects(1,&all);l->DrawInstanced(3,1,0,0);
         t=test::Transition(upstream.Get(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,R);l->ResourceBarrier(1,&t);
         if(native){t=test::Transition(frame==4?target2.Get():target.Get(),R,D3D12_RESOURCE_STATE_PRESENT);l->ResourceBarrier(1,&t);presented[frame==4?1:0]=true;}
+        if(native&&frame==7){t=test::Transition(vertices.Get(),D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,D3D12_RESOURCE_STATE_COPY_DEST);l->ResourceBarrier(1,&t);}
         REQUIRE(SUCCEEDED(l->Close()));ID3D12CommandList* lists[]={l};{na::nr::native::Submission submitted(d.queue.Get(),1,lists);d.queue->ExecuteCommandLists(1,lists);}d.WaitIdle();
         if(native){
             // An unrelated batch cannot licence replay of old game buffers.
@@ -701,7 +708,7 @@ float4 altered(float4 p:SV_Position):SV_Target{return image.Load(int3(p.xy,0))*.
         if(frame==4){if(validate(target.Get(),3)||validate(target2.Get(),4))return 1;}
         else if(validate(target.Get(),frame))return 1;
     }
-    if(native){CHECK(native_fixture_calls>=5);native_fixture=nullptr;nh::SetPreHudRendererForTests(nullptr);}
+    if(native){CHECK(native_fixture_calls>=4);CHECK(nh::GetStats().native_reused>0);native_fixture=nullptr;nh::SetPreHudRendererForTests(nullptr);}
     return 0;
 }
 

@@ -152,7 +152,8 @@ void ResetDerived();
 // Re-applies the game's descriptor heaps, root signatures, every root argument and the
 // pipeline state of this recording. False (nothing issued) if the state is not fully
 // known (unobserved recording, a bundle was executed).
-bool RestoreListState(ID3D12GraphicsCommandList* list,ID3D12GraphicsCommandList* destination=nullptr,bool graphics_only=false);
+bool RestoreListState(ID3D12GraphicsCommandList* list,ID3D12GraphicsCommandList* destination=nullptr,bool graphics_only=false,
+    std::vector<uint64_t>* graphics_reads=nullptr);
 // Scoped bindings change neither PSO/root signatures nor IA state. Restore only
 // touched bindings, with bounded inline snapshots and no RootArg vector clones.
 // Changing a resource heap invalidates tables in BOTH shader pipelines.
