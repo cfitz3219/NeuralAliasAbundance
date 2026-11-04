@@ -977,9 +977,16 @@ void DrawLiveDlaa()
     }
     if (na::j2::RenderSmall() && na::j2::native_hud::Installed()) {
         bool native_on = na::j2::native_hud::Enabled();
-        BeginRow("Native-resolution HUD", "Draws the game's HUD and text at your screen's full resolution, on top of the DLSS picture, instead of upscaling them with the 3D scene. DLSS then gets the scene without the HUD. Off draws the HUD at render size as before. Not saved.", SwitchWidth());
+        BeginRow("Native-resolution HUD", "Draws compatible HUD and text at your screen's full resolution after DLSS. When clean separation is unavailable, protects recognised HUD pixels from temporal movement. The original game picture stays available. Off leaves HUD in the game's image. Not saved.", SwitchWidth());
         if (Switch("j2nativehud", &native_on)) na::j2::native_hud::SetEnabled(native_on);
         EndRow();
+        if(native_on){
+            const auto hud=na::j2::native_hud::GetStats();
+            Hint(hud.last_draw_method==1?"Last checked frame: native HUD."
+                 :hud.last_draw_method==2?"Last checked frame: HUD protected from the current game image."
+                 :hud.last_draw_method==3?"Last checked frame: HUD kept in the game image; the final draw changes the picture."
+                 :hud.hud_frames?"HUD uses a separate native layer.":"Locating the game's HUD draws.");
+        }
         if (!na::j2::HudMaskEnabled()) {
             bool view = na::j2::HudMaskView();
             BeginRow("Show HUD layer", "Tints in pink what is drawn as native-resolution HUD, to check it. Not saved.", SwitchWidth());
