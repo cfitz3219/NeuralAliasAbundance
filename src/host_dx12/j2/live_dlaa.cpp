@@ -3655,6 +3655,9 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         if (!lists[i]) continue;
         const auto id = na::observe::IdOf(lists[i]);
         const auto decision = na::observe::ListInsertionDecision(lists[i], selected_color);
+        if (decision.writes && g.scene_w && g.scene_h) { // I1.1: this frame's scene was drawn at this size
+            g.stats.seen_scene_w = g.scene_w; g.stats.seen_scene_h = g.scene_h; g.stats.seen_scene_frame = g.frame;
+        }
         if ((decision.writes || decision.all_reads) && g.frame_seq_complete) {
             // Placement profile: this list's writes and consumers, in submission order.
             // 512 events silently dropped later lists in the Sniper frames and
@@ -3945,6 +3948,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
 Stats GetStats()
 {
     std::lock_guard<std::mutex> lock(g.m);
+    g.stats.frame_now = g.frame;
     return g.stats;
 }
 

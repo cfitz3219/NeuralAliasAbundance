@@ -17,6 +17,7 @@
 #include "host_dx12/fg/frame_gen.hpp"
 #include "host_dx12/settings.hpp"
 #include "host_dx12/native_present/size_spoof.hpp"
+#include "host_dx12/native_present/size_controller.hpp"
 #include "host_dx12/latency/nvidia_latency.hpp"
 #include "host_dx12/adapters/tlou1/timing.hpp"
 
@@ -221,17 +222,24 @@ bool ensure_proxies_locked(Chain& c)
     UINT n = c.desc.BufferCount ? c.desc.BufferCount : 2;
     c.uav_ok = uav_supported(c, c.desc.BufferDesc.Format);
     {
-        const float scale = g_render_scale.load(std::memory_order_acquire);
         const UINT W = c.desc.BufferDesc.Width, H = c.desc.BufferDesc.Height;
-        const bool reduced = scale > 0.f && scale < 1.f;
+        // Render-small: the proxies are the size the game is TOLD (size_spoof's advertisement:
+        // the delivered request while one is pending, else the committed size), never a size
+        // derived from the applied mode, so a game that has not rebuilt keeps buffers that fit
+        // what it draws (COMMS a066d76 point 1). Native boot advertises native.
+        UINT aw = W, ah = H;
+        if (g_upscale.load(std::memory_order_acquire)) {
+            const na::native_present::Size adv = na::native_present::AdvertisedSize();
+            if (adv.w && adv.h && adv.w <= W && adv.h <= H) { aw = adv.w; ah = adv.h; }
+        }
+        const bool reduced = aw < W || ah < H;
         const bool full = !reduced && g_present_dlaa.load(std::memory_order_acquire); // DLAA at Present
         c.scaled = (reduced || full) && c.uav_ok && g_upscale.load(std::memory_order_acquire) && W > 1 && H > 1;
-        c.pw = c.scaled && reduced ? (std::max)(1u, static_cast<UINT>(std::lround(W * static_cast<double>(scale)))) : W;
-        c.ph = c.scaled && reduced ? (std::max)(1u, static_cast<UINT>(std::lround(H * static_cast<double>(scale)))) : H;
-        if (c.scaled && reduced && (c.pw >= W || c.ph >= H)) { c.scaled = false; c.pw = W; c.ph = H; }
+        c.pw = c.scaled && reduced ? aw : W;
+        c.ph = c.scaled && reduced ? ah : H;
         g_scaled_w.store(c.scaled ? c.pw : 0); g_scaled_h.store(c.scaled ? c.ph : 0);
         g_native_w.store(W); g_native_h.store(H);
-        if (scale < 1.f && !c.scaled)
+        if (reduced && !c.scaled)
             set_reason(!c.uav_ok ? "Render-small is off for this picture format (no shader writes): full size."
                                  : "Render-small is off: no upscaler is attached.");
     }
@@ -252,8 +260,10 @@ bool ensure_proxies_locked(Chain& c)
         namespace np = na::native_present;
         const np::Size out{c.desc.BufferDesc.Width, c.desc.BufferDesc.Height}, act{c.pw, c.ph};
         const np::SizeState st = np::GetSizeState();
-        if (st.enabled && st.hwnd == c.desc.OutputWindow && st.request && st.request_delivered) np::CompleteResize(st.request, true, act);
-        else np::CommitBuffers(c.desc.OutputWindow, out, act);
+        // A delivered live request completes only when the controller has seen the scene follow
+        // (overlay small_follow_mode); here the controller only learns the real allocation.
+        if (!(st.enabled && st.hwnd == c.desc.OutputWindow && st.request && st.request_delivered)) np::CommitBuffers(c.desc.OutputWindow, out, act);
+        np::ctl::Allocated({act.w, act.h}, GetTickCount64());
     }
     c.display_hz = refresh_hz_for(c.desc.OutputWindow);
     g_display_hz.store(c.display_hz);
@@ -736,7 +746,9 @@ bool GameBufferSize(IDXGISwapChain* sc, UINT* w, UINT* h)
 void TranslateResize(IDXGISwapChain* sc, UINT* w, UINT* h)
 {
     if (!Enabled() || !sc || !w || !h) return;
-    if (!(g_render_scale.load(std::memory_order_acquire) < 1.f) || !g_upscale.load(std::memory_order_acquire)) return;
+    // Render-small: the real chain always keeps the window's physical size, whatever size the
+    // game believes (also on the way back to native, where the game may pass a stale small size).
+    if (!g_upscale.load(std::memory_order_acquire)) return;
     {
         std::lock_guard<std::mutex> lock(g_chains_m);
         Chain* c = find_chain(sc);

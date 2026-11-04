@@ -1,6 +1,7 @@
 #include "host_dx12/host_boot/process_log.hpp"
 #include "host_dx12/native_present/size_spoof.hpp"
 #include "host_dx12/native_present/size_probe.hpp"
+#include "host_dx12/native_present/size_controller.hpp"
 #include "host_dx12/native_present/input_map.hpp"
 #include <intrin.h>
 #include <algorithm>
@@ -2737,56 +2738,90 @@ void presenter_menu_cb(IDXGISwapChain* sc, ID3D12CommandQueue* queue, ID3D12Reso
     menu_step(sc, queue, *static_cast<const bool*>(user), frame);
 }
 
-// Render-small live mode change: the presenter's next proxies use the new scale, and the game is
-// asked (posted virtual WM_SIZE) to rebuild at that size; no restart, the real window never moves.
-// A request already pending is retried next frame. The game ignoring it expires after 5 s.
-float g_small_asked = -1.f; // the scale last asked of the game (presenter thread)
+// Render-small mode changes (COMMS 4bd474c I1.2, Astra a066d76): one change at a time through the
+// size controller. A choice only ASKS the game (virtual WM_SIZE); the mode, mip bias and status
+// apply when the game's scene is seen at the new size (3 fresh samples after its buffers were
+// rebuilt). A game that ignores the request keeps native DLAA and the whole picture; one that
+// rebuilt but whose scene did not follow is asked back. No retry loop: a new choice re-asks.
+// Native DLAA (scale_mode 0, the "Off" of upscaling) is the same path with target = output.
+uint64_t g_small_token = 0;      // size_spoof token of the controller's current ask
+bool g_small_scene_seen = false; // the first scene sample: asking before it would race the game's start
+int g_small_mode_now = 0;         // the user's mode this present
+int g_small_refused_mode = -1;    // a mode the game did not follow (for g_small_refused_output)
+na::native_present::Size g_small_refused_output{};
+void small_note_line(const char* what, const na::native_present::ctl::Status& c)
+{
+    char row[256];
+    snprintf(row, sizeof(row), "mode_change %s applied=%ux%u (%.3f) target=%ux%u buffers=%ux%u output=%ux%u matches=%u contradictions=%u\r\n", what,
+             c.applied.w, c.applied.h, static_cast<double>(c.applied_scale), c.target.w, c.target.h, c.buffers.w, c.buffers.h,
+             c.output.w, c.output.h, c.matches, c.contradictions);
+    status_note(row);
+}
 void small_follow_mode()
 {
     namespace np = na::native_present;
-    const bool expired = np::ExpireResize();
-    const int mode = (std::min)(static_cast<int>(na::settings::Get().j2_scale_mode.load()), 3); // no Ultra Performance here
-    const float f = mode > 0 ? static_cast<float>(na::scale::FractionForMode(mode)) : 1.f;
-    if (g_small_asked < 0.f) g_small_asked = na::present::RenderScale(); // the boot scale needs no request
-    // A request the game never completed (expired) or proxies that are not at the mode's size:
-    // ask again, at most every 2 s, so the game and the proxies cannot stay at different sizes
-    // (crash run a6f3f18: proxies 2293x960 with the game's scene at 2000x837, DLSS never ran).
-    {
-        static uint64_t last_retry = 0;
-        const uint64_t now = GetTickCount64();
-        const np::SizeState st = np::GetSizeState();
-        if (st.enabled && f == g_small_asked && now - last_retry > 2000) {
-            const np::Size want = small_render_for(st.output, static_cast<double>(f));
-            const bool idle = st.requested.w == 0 && st.requested.h == 0;
-            if (expired || (idle && (st.render.w != want.w || st.render.h != want.h))) {
-                last_retry = now;
-                char row[160];
-                snprintf(row, sizeof(row), "mode_retry %s render=%ux%u want=%ux%u\r\n", expired ? "expired" : "mismatch",
-                         static_cast<unsigned>(st.render.w), static_cast<unsigned>(st.render.h), static_cast<unsigned>(want.w), static_cast<unsigned>(want.h));
-                status_note(row);
-                if (st.render.w != want.w || st.render.h != want.h) np::RequestRenderSize(want);
-            }
-        }
-    }
+    namespace ctl = na::native_present::ctl;
     static bool crash_capture_on = false;
     if (!crash_capture_on) { crash_capture_on = true; AddVectoredExceptionHandler(0, &crash_capture); }
-    if (f == g_small_asked) return;
-    {
-        char row[160];
-        const np::SizeState before = np::GetSizeState();
-        snprintf(row, sizeof(row), "mode_switch mode=%d scale %.3f -> %.3f render=%ux%u requested=%ux%u delivered=%u\r\n", mode,
-                 static_cast<double>(g_small_asked), static_cast<double>(f), static_cast<unsigned>(before.render.w),
-                 static_cast<unsigned>(before.render.h), static_cast<unsigned>(before.requested.w), static_cast<unsigned>(before.requested.h),
-                 before.request_delivered ? 1u : 0u);
-        status_note(row);
-    }
-    na::present::SetRenderScale(f, &na::j2::PresentUpscale, nullptr);
-    // Texture detail follows the mode: the menu bias plus log2(render scale), from the next list.
-    na::observe::SetSamplerMipBiasLive(na::j2::SmallMipBias(static_cast<float>(na::settings::Get().j2_mip_bias_x100.load()) / 100.f, f));
     const np::SizeState st = np::GetSizeState();
-    if (!st.enabled) { g_small_asked = f; return; }
-    const np::Size r = small_render_for(st.output, static_cast<double>(f));
-    if ((r.w == st.render.w && r.h == st.render.h) || np::RequestRenderSize(r)) g_small_asked = f;
+    if (!st.enabled) return;
+    const uint64_t now = GetTickCount64();
+    g_small_mode_now = (std::min)(static_cast<int>(na::settings::Get().j2_scale_mode.load()), 3);
+    {
+        const ctl::Status c = ctl::Get();
+        if (!ctl::Same(c.output, {st.output.w, st.output.h})) {
+            // First attach or a real output change (window resized by the user): start from what the game has.
+            ctl::Reset({st.output.w, st.output.h}, {st.render.w, st.render.h}, na::present::RenderScale());
+        }
+    }
+    // One scene sample per present: J2's selected scene colour for this frame (0x0 = UNKNOWN).
+    // Fresh only: written in this frame or the previous one (OnPresent may already have advanced).
+    const auto js = na::j2::GetStats();
+    const bool fresh = js.seen_scene_frame && js.frame_now >= js.seen_scene_frame && js.frame_now - js.seen_scene_frame <= 1;
+    const ctl::Extent scene = fresh ? ctl::Extent{js.seen_scene_w, js.seen_scene_h} : ctl::Extent{};
+    if (scene.w && scene.h) g_small_scene_seen = true;
+    ctl::Observe(scene);
+    auto carry_out = [&](const ctl::Action& a) {
+        const ctl::Status c = ctl::Get();
+        switch (a.kind) {
+        case ctl::ActionKind::Ask:
+        case ctl::ActionKind::Restore: {
+            if (g_small_token) np::CompleteResize(g_small_token, false, {}); // supersede the old ask's advertisement
+            g_small_token = np::RequestRenderSize({a.size.w, a.size.h}, true);
+            ctl::Asked(g_small_token, now);
+            if (a.kind == ctl::ActionKind::Restore) { g_small_refused_mode = g_small_mode_now; g_small_refused_output = st.output; }
+            small_note_line(a.kind == ctl::ActionKind::Ask ? "ask" : "restore", ctl::Get());
+            break;
+        }
+        case ctl::ActionKind::Commit: {
+            if (g_small_token) np::CompleteResize(g_small_token, true, {a.size.w, a.size.h});
+            g_small_token = 0;
+            na::present::SetRenderScale(a.scale, &na::j2::PresentUpscale, nullptr);
+            // Texture detail follows the applied mode: the menu bias plus log2(render scale).
+            na::observe::SetSamplerMipBiasLive(na::j2::SmallMipBias(static_cast<float>(na::settings::Get().j2_mip_bias_x100.load()) / 100.f, a.scale));
+            small_note_line(a.scale < 1.f ? "applied" : "applied_native_dlaa", c);
+            break;
+        }
+        case ctl::ActionKind::Ignored: {
+            if (g_small_token) np::CompleteResize(g_small_token, false, {});
+            g_small_token = 0;
+            g_small_refused_mode = g_small_mode_now; g_small_refused_output = st.output;
+            small_note_line("not_followed", c);
+            break;
+        }
+        default: break;
+        }
+    };
+    const int mode = (std::min)(static_cast<int>(na::settings::Get().j2_scale_mode.load()), 3); // no Ultra Performance here
+    carry_out(ctl::Tick(now));
+    if (!g_small_scene_seen) return;
+    const float f = mode > 0 ? static_cast<float>(na::scale::FractionForMode(mode)) : 1.f;
+    const np::Size want = small_render_for(st.output, static_cast<double>(f));
+    // A choice the game did not follow is not asked again for this output until the user changes it.
+    if (g_small_refused_mode >= 0 && (g_small_refused_mode != mode || g_small_refused_output.w != st.output.w ||
+                                      g_small_refused_output.h != st.output.h)) g_small_refused_mode = -1;
+    if (g_small_refused_mode == mode) return;
+    carry_out(ctl::Choose({want.w, want.h}, f, now));
 }
 HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* pp)
 {

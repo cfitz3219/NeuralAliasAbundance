@@ -319,6 +319,10 @@ struct Stats {
     // Present / stretched (no fresh depth + motion) / not produced (the presenter kept its old one).
     uint64_t small_deferred = 0, small_dlss = 0, small_stretched = 0, small_failed = 0, small_dlss_failed = 0, small_sharpened = 0, small_hud = 0, small_hud_layer = 0;
     uint32_t small_rw = 0, small_rh = 0, small_ow = 0, small_oh = 0;
+    // Size observation independent of evaluation (COMMS 4bd474c I1.1): the selected scene colour's
+    // size whenever a submitted list wrote it, and the frame it was written in (frame = current).
+    uint32_t seen_scene_w = 0, seen_scene_h = 0;
+    uint64_t seen_scene_frame = 0, frame_now = 0;
     char small_note[128] = {};
     uint64_t window_derived_forward = 0, window_derived_inverse = 0; // camera-derived matrices rebased (see window_derived)
     char window_derived_note[160] = {};

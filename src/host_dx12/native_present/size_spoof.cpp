@@ -169,12 +169,12 @@ UINT ResizeMessage() {
     static const UINT id = RegisterWindowMessageW(L"NeuralAlias.RenderSmall.Resize.v1");
     return id;
 }
-uint64_t RequestRenderSize(Size render) {
+uint64_t RequestRenderSize(Size render, bool force) {
     if (!valid(render) || !ResizeMessage()) return 0;
     HWND hwnd = nullptr; uint64_t token = 0;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (!g_state.enabled || g_state.request || same(render, g_state.render)) return 0;
+        if (!g_state.enabled || g_state.request || (!force && same(render, g_state.render))) return 0;
         hwnd = g_state.hwnd; token = ++g_next;
         g_state.requested = render; g_state.request = token; g_state.request_delivered = false;
         g_request_tick = GetTickCount64();
@@ -223,6 +223,7 @@ MessageAction PrepareSizeMessage(HWND hwnd, UINT& msg, WPARAM& wp, LPARAM& lp, W
     lp = MAKELPARAM(size.w, size.h); ++g_size_messages;
     return MessageAction::Changed;
 }
+Size AdvertisedSize() { const auto s = GetSizeState(); return s.enabled ? advertised(s) : Size{}; }
 bool CompleteResize(uint64_t token, bool success, Size actual) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_state.enabled || !token || g_state.request != token) return false;

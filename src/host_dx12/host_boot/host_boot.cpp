@@ -277,9 +277,12 @@ DWORD WINAPI InitThread(LPVOID)
         const bool present_dlaa = GetPrivateProfileIntW(L"present", L"present_dlaa", 0, g_ini) == 1;
         na::present::SetPresentDlaa(present_dlaa);
         if (present_dlaa) boot_log("render-small: DLAA runs at Present too ([present] present_dlaa=1)");
-        na::present::SetRenderScale(small_f, &na::j2::PresentUpscale, nullptr);
-        char small_line[96];
-        std::snprintf(small_line, sizeof small_line, "render-small: enabled (mode %d, scale %.3f)", small_mode, small_f);
+        // Native start (COMMS 4bd474c I1.3): the game is first told its real size and runs native
+        // DLAA; the controller asks for the mode's size once a scene has been seen, and applies the
+        // mode only when the game's scene follows. A game that ignores the request never shows a crop.
+        na::present::SetRenderScale(1.f, &na::j2::PresentUpscale, nullptr);
+        char small_line[128];
+        std::snprintf(small_line, sizeof small_line, "render-small: enabled (mode %d, scale %.3f requested after start; native DLAA until the game follows)", small_mode, small_f);
         boot_log(small_line);
     }
     const bool projection_window = !render_small && na::j2::Configured() && GetPrivateProfileIntW(L"j2", L"window", 0, g_ini) == 1;

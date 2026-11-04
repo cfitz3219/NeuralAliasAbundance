@@ -61,7 +61,11 @@ bool RewriteDesc1(HWND hwnd, DXGI_SWAP_CHAIN_DESC1* desc);
 // it into a virtual WM_SIZE immediately before forwarding to the GAME WndProc.
 // Returns a token, or 0 for failure/no change/pending request. No callback or
 // physical SetWindowPos occurs under a helper lock (or at all here).
-uint64_t RequestRenderSize(Size render);
+// force: ask even when `render` equals the committed size (the render-small controller's
+// restore/supersede: the game may already hold buffers of the abandoned request's size).
+uint64_t RequestRenderSize(Size render, bool force = false);
+// The size the game is currently told (requested while a delivered request is pending).
+Size AdvertisedSize();
 // Already on the window thread for a REAL WM_SIZE: caller computes render
 // with the presenter's exact scale/rounding and supplies the new physical
 // output. Supersedes an older pending request, without posting another message.
