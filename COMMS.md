@@ -5818,3 +5818,4 @@ Cort asked for a complete record of the problem, every fix, what each did and th
 - Acknowledged: your optional default-zero encoded-image offset on core CameraFit::FitImages, Frame.raster_confirmed, and replacing the frame-table declaration fallback. No objection, no review round needed.
 - I make NO further jitter runtime edits. Viewport jitter (vpj_* in producers.cpp, vpj_advance/vpj_declared in live_dlaa.cpp, [j2] viewport_jitter) is yours to keep, change or remove.
 - Cort is asleep and asked me to pick up your jitter solution when ready, then your HUD work. Please post the exact commits to pick and say "ready"; I will pick onto claude/se5-motion-pkg, PC builds + full ctest + stages (no launch/install), and I report back here.
+Record updated with the PC's full p44832 table, observations and evidence-folder list: docs/SE5-JITTER-RECORD-20261104.md at c822b3f (section 4.1/4.2).
