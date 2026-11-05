@@ -1498,6 +1498,7 @@ std::mutex& g_var_m = *new std::mutex();   // the worker's wake-up and the want/
 std::condition_variable& g_var_cv = *new std::condition_variable();
 bool g_var_started = false;
 std::atomic<uint64_t> g_var_static_changed[kMipCount * 4]; // static samplers changed, per variant
+std::atomic<uint64_t> g_var_aniso_changed[kMipCount * 4]; // AF changes only, not mip-bias changes
 std::atomic<bool> g_mip_switched{false};   // a variant other than the game's has been in use (enables lookups)
 std::atomic<bool> g_mip_live_enabled{false}; // twins are built only when J2 enables live switching
 std::atomic<uint64_t> g_mip_twin_rs{0}, g_mip_twin_pso{0}, g_mip_untwinned{0}, g_mip_fallbacks{0}, g_mip_twin_fail{0};
@@ -1535,18 +1536,28 @@ bool sampler_wants_bias(const SD& d)
     const bool surface = aniso || (linear_min && (tiles(d.AddressU) || tiles(d.AddressV)));
     return surface && d.MaxLOD > 0.0f;
 }
+template <typename SD>
+bool sampler_wants_aniso(const SD& d)
+{
+    // Addressing does not determine the texture footprint. Atlased/unique-UV
+    // materials commonly clamp; exclude data/comparison/point lookups, but do
+    // not apply mip-bias's WRAP-only material heuristic to filtering.
+    return D3D12_DECODE_FILTER_REDUCTION(d.Filter)==D3D12_FILTER_REDUCTION_TYPE_STANDARD&&d.MaxLOD>0&&
+        (D3D12_DECODE_IS_ANISOTROPIC_FILTER(d.Filter)||D3D12_DECODE_MIN_FILTER(d.Filter)==D3D12_FILTER_TYPE_LINEAR);
+}
 float clamp_lod(float v) { return v < -16.0f ? -16.0f : (v > 15.99f ? 15.99f : v); }
-// Anisotropic filtering 4x/8x/16x (Cort 2026-11-05, menu selector, next game start): the game's
-// surface-texture samplers (the same ones the mip bias treats) are made anisotropic at that level.
+// Anisotropic filtering 4x/8x/16x: eligible standard linear samplers, including
+// clamp-addressed materials, are made anisotropic at that level.
 // It is applied where the game samples its textures, before DLSS, so DLSS gets the sharper
-// oblique detail. Comparison / min-max / point / screen-pass samplers are untouched.
+// oblique detail. Comparison / min-max / point samplers are untouched. Unlike mip bias,
+// an isotropic screen-space footprint needs no addressing-based exclusion.
 std::atomic<uint32_t> g_aniso_level{0}; // 0 off, else 4 / 8 / 16 (menu)
 std::atomic<uint64_t> g_aniso_samplers{0}, g_aniso_static{0}, g_aniso_already{0};
 template <typename SD>
 bool apply_aniso(SD& d)
 {
     const uint32_t level = g_aniso_level.load(std::memory_order_relaxed);
-    if (!level || !sampler_wants_bias(d)) return false;
+    if (!level || !sampler_wants_aniso(d)) return false;
     // Never lowers the game's own: an anisotropic sampler at or above the chosen level stays.
     if (D3D12_DECODE_IS_ANISOTROPIC_FILTER(d.Filter) && d.MaxAnisotropy >= level) {
         g_aniso_already.fetch_add(1, std::memory_order_relaxed);
@@ -1576,15 +1587,16 @@ bool aniso_to(SD& d, uint32_t level)
     return true;
 }
 // The game's static samplers as variant (level, af) wants them; returns how many changed.
-uint32_t variant_samplers(std::vector<D3D12_STATIC_SAMPLER_DESC>& ss, int level, int af)
+uint32_t variant_samplers(std::vector<D3D12_STATIC_SAMPLER_DESC>& ss, int level, int af,uint32_t* aniso_changed=nullptr)
 {
     uint32_t changed = 0;
     for (auto& x : ss) {
-        if (!sampler_wants_bias(x)) continue;
+        const bool bias=sampler_wants_bias(x),aniso=sampler_wants_aniso(x);
+        if(!bias&&!aniso)continue;
         bool c = false;
-        const float nb = biased(x.MipLODBias, kMipLevels[level]);
+        const float nb = bias?biased(x.MipLODBias, kMipLevels[level]):x.MipLODBias;
         if (nb != x.MipLODBias) { x.MipLODBias = nb; c = true; }
-        if (aniso_to(x, kAfLevels[af])) c = true;
+        if (aniso&&aniso_to(x, kAfLevels[af])) { c = true;if(aniso_changed)++*aniso_changed; }
         if (c) ++changed;
     }
     return changed;
@@ -1592,25 +1604,30 @@ uint32_t variant_samplers(std::vector<D3D12_STATIC_SAMPLER_DESC>& ss, int level,
 // The game's own biases on surface samplers, observed whether or not we bias.
 std::mutex g_native_m;
 uint64_t g_native_neg = 0, g_native_zero = 0, g_native_pos = 0;
+uint64_t g_native_surface = 0,g_native_af16 = 0;
 float g_native_min = 0.0f, g_native_max = 0.0f;
-void note_native(float b)
+void note_native(float b,uint32_t anisotropy,bool bias_eligible)
 {
     std::lock_guard<std::mutex> lock(g_native_m);
-    const bool first = !(g_native_neg || g_native_zero || g_native_pos);
-    if (b < 0.0f) ++g_native_neg; else if (b > 0.0f) ++g_native_pos; else ++g_native_zero;
-    if (first || b < g_native_min) g_native_min = b;
-    if (first || b > g_native_max) g_native_max = b;
+    if(bias_eligible){
+        const bool first = !(g_native_neg || g_native_zero || g_native_pos);
+        if (b < 0.0f) ++g_native_neg; else if (b > 0.0f) ++g_native_pos; else ++g_native_zero;
+        if (first || b < g_native_min) g_native_min = b;
+        if (first || b > g_native_max) g_native_max = b;
+    }
+    ++g_native_surface;if(anisotropy>=16)++g_native_af16;
 }
 
 void STDMETHODCALLTYPE D_CreateSampler(ID3D12Device* dev, const D3D12_SAMPLER_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
 {
     const float bias = g_mip_bias.load(std::memory_order_relaxed);
     const bool surface = d && !t_host_work && sampler_wants_bias(*d);
-    if (surface) note_native(d->MipLODBias);
+    const bool aniso_surface = d && !t_host_work && sampler_wants_aniso(*d);
+    if (aniso_surface) note_native(d->MipLODBias,D3D12_DECODE_IS_ANISOTROPIC_FILTER(d->Filter)?d->MaxAnisotropy:0,surface);
     D3D12_SAMPLER_DESC m = d ? *d : D3D12_SAMPLER_DESC{};
     const bool bias_it = surface && bias != 0.0f && biased(d->MipLODBias, bias) != d->MipLODBias;
     if (bias_it) m.MipLODBias = biased(m.MipLODBias, bias);
-    const bool aniso_it = surface && apply_aniso(m);
+    const bool aniso_it = aniso_surface && apply_aniso(m);
     if (bias_it || aniso_it) {
         o_CreateSampler(dev, &m, h);
         if (bias_it) g_biased_samplers.fetch_add(1, std::memory_order_relaxed);
@@ -2272,7 +2289,8 @@ std::shared_ptr<Obj::Twins> build_rs_set(const VariantRecipe& r, int af, uint32_
         set->built[level] = true;
         added = true;
         std::vector<D3D12_STATIC_SAMPLER_DESC> ss(src, src + ns);
-        const uint32_t changed = (level == 0 && af == 0) ? 0u : variant_samplers(ss, level, af);
+        uint32_t aniso_changed=0;
+        const uint32_t changed = (level == 0 && af == 0) ? 0u : variant_samplers(ss, level, af,&aniso_changed);
         if (!changed) { set->same[level] = true; continue; }
         D3D12_VERSIONED_ROOT_SIGNATURE_DESC copy = *u;
         if (u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0) copy.Desc_1_0.pStaticSamplers = ss.data();
@@ -2303,6 +2321,7 @@ std::shared_ptr<Obj::Twins> build_rs_set(const VariantRecipe& r, int af, uint32_
         set->obj[level] = twin;
         g_mip_twin_rs.fetch_add(1, std::memory_order_relaxed);
         g_var_static_changed[level * 4 + af].fetch_add(changed, std::memory_order_relaxed);
+        g_var_aniso_changed[level * 4 + af].fetch_add(aniso_changed, std::memory_order_relaxed);
     }
     rd->Release();
     return added ? set : nullptr;
@@ -2310,12 +2329,12 @@ std::shared_ptr<Obj::Twins> build_rs_set(const VariantRecipe& r, int af, uint32_
 // Pipeline twins matching a root-signature set: one per level that set prepared and `base`
 // has not. Same root signature -> the game's pipeline is right; no root twin -> none.
 template <typename Make>
-std::shared_ptr<Obj::Twins> build_pso_set(Make&& make, const Obj::Twins& rs_set, const Obj::Twins* base)
+std::shared_ptr<Obj::Twins> build_pso_set(Make&& make, const Obj::Twins& rs_set, const Obj::Twins* base,uint32_t levels)
 {
     auto set = base ? std::make_shared<Obj::Twins>(*base) : std::make_shared<Obj::Twins>();
     bool added = false;
     for (int level = 0; level < kMipCount; ++level) {
-        if (!rs_set.built[level] || set->built[level]) continue;
+        if (!(levels>>level&1u) || !rs_set.built[level] || set->built[level]) continue;
         set->built[level] = true;
         added = true;
         if (rs_set.same[level]) { set->same[level] = true; continue; }
@@ -2357,16 +2376,19 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
             decodable = true;
             const UINT ns = u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 ? u->Desc_1_0.NumStaticSamplers : u->Desc_1_1.NumStaticSamplers;
             const D3D12_STATIC_SAMPLER_DESC* src = u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 ? u->Desc_1_0.pStaticSamplers : u->Desc_1_1.pStaticSamplers;
-            for (UINT i = 0; i < ns; ++i) if (sampler_wants_bias(src[i])) { has_surface = true; note_native(src[i].MipLODBias); }
+            for (UINT i = 0; i < ns; ++i) if (sampler_wants_aniso(src[i])) {
+                has_surface=true;note_native(src[i].MipLODBias,D3D12_DECODE_IS_ANISOTROPIC_FILTER(src[i].Filter)?src[i].MaxAnisotropy:0,sampler_wants_bias(src[i]));
+            }
             const uint32_t want = g_var_want.load(std::memory_order_relaxed);
             if (!live && has_surface && want) {
                 std::vector<D3D12_STATIC_SAMPLER_DESC> ss(src, src + ns);
                 uint32_t biased_n = 0, aniso_n = 0;
                 for (auto& x : ss) {
-                    if (!sampler_wants_bias(x)) continue;
-                    const float nb = biased(x.MipLODBias, kMipLevels[var_level(want)]);
+                    const bool bias=sampler_wants_bias(x),aniso=sampler_wants_aniso(x);
+                    if(!bias&&!aniso)continue;
+                    const float nb = bias?biased(x.MipLODBias, kMipLevels[var_level(want)]):x.MipLODBias;
                     if (nb != x.MipLODBias) { x.MipLODBias = nb; ++biased_n; }
-                    if (aniso_to(x, kAfLevels[var_af(want)])) ++aniso_n;
+                    if (aniso&&aniso_to(x, kAfLevels[var_af(want)])) ++aniso_n;
                 }
                 if (biased_n || aniso_n) {
                     D3D12_VERSIONED_ROOT_SIGNATURE_DESC copy = *u;
@@ -6624,7 +6646,9 @@ size_t fill_pass(int level, int af, uint32_t v)
         }
         if (!rs_set || !rs_set->built[level]) { g_var_done.fetch_add(1, std::memory_order_relaxed); continue; } // next pass
         const VariantRecipe& r = *it.recipe;
-        publish(it, build_pso_set([&r](ID3D12RootSignature* trs) { return r.make(trs); }, *rs_set, it.base.get()));
+        // Static root variants are cheap and may already cover several levels.
+        // Compile only the requested PSO level before making this choice live.
+        publish(it, build_pso_set([&r](ID3D12RootSignature* trs) { return r.make(trs); }, *rs_set, it.base.get(),1u<<level));
     }
     return found;
 }
@@ -6757,8 +6781,9 @@ AnisoStats GetAnisoStats()
     a.level = g_mip_live_enabled.load(std::memory_order_relaxed) ? kAfLevels[var_af(live)] : g_aniso_level.load(std::memory_order_relaxed);
     a.samplers = g_aniso_samplers.load(std::memory_order_relaxed);
     a.static_samplers = g_aniso_static.load(std::memory_order_relaxed) +
-                        (var_af(live) ? g_var_static_changed[var_level(live) * 4 + var_af(live)].load(std::memory_order_relaxed) : 0);
+                        (var_af(live) ? g_var_aniso_changed[var_level(live) * 4 + var_af(live)].load(std::memory_order_relaxed) : 0);
     a.already = g_aniso_already.load(std::memory_order_relaxed);
+    {std::lock_guard<std::mutex> lock(g_native_m);a.native_surface=g_native_surface;a.native_16=g_native_af16;}
     return a;
 }
 HostWorkScope::HostWorkScope() : prev_(t_host_work) { t_host_work = true; }

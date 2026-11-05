@@ -288,12 +288,16 @@ struct MipLiveStats {
 MipLiveStats GetMipLiveStats();
 float SamplerMipBias();
 void MipBiasCounts(uint64_t* samplers, uint64_t* static_samplers);
-// Anisotropic filtering (0 off, 4 / 8 / 16) on the same surface-texture samplers the mip
-// bias treats. Live like the mip bias (same twins); sampler descriptors created from now on.
+// Anisotropic filtering (0 off, 4 / 8 / 16) on eligible standard linear samplers,
+// including clamp-addressed materials. Live static variants; newly created sampler descriptors.
 void SetSamplerAnisotropy(uint32_t level);
 // The saved anisotropic level: twins for it are built at creation (before activation).
 void SetSamplerAnisotropyPrebuild(uint32_t level);
-struct AnisoStats { uint32_t level = 0; uint64_t samplers = 0, static_samplers = 0, already = 0; };
+struct AnisoStats {
+    uint32_t level = 0;
+    uint64_t samplers = 0, static_samplers = 0, already = 0;
+    uint64_t native_surface=0,native_16=0; // original observed surface samplers, before our override
+};
 AnisoStats GetAnisoStats();
 // The game's own MipLODBias on surface-texture samplers (recorded whether or
 // not NeuralAlias biases): how many are negative / zero / positive, and range.
