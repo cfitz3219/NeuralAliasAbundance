@@ -465,6 +465,38 @@ const void* canon(const void* p)
     return out;
 }
 
+// ---- Hook cost (2026-11-05: with us loaded SE5 ran 35 fps CPU-bound vs 165 without) ----------
+// Wall time spent inside each outermost command-list hook (ours + the driver's call), per
+// slot, plus ExecuteCommandLists and pipeline creation. Thread-local sums are folded into the
+// shared totals every 512 calls, so the measurement itself adds no shared write per call.
+constexpr uint32_t kCostSlots = 128, kCostExec = 125, kCostPso = 126;
+std::atomic<uint64_t> g_cost_ticks[kCostSlots]{}, g_cost_calls[kCostSlots]{};
+thread_local uint64_t t_cost_ticks[kCostSlots]{}, t_cost_calls[kCostSlots]{};
+thread_local uint32_t t_cost_n = 0;
+inline uint64_t cost_now() { LARGE_INTEGER c; QueryPerformanceCounter(&c); return static_cast<uint64_t>(c.QuadPart); }
+void cost_flush()
+{
+    for (uint32_t i = 0; i < kCostSlots; ++i)
+        if (t_cost_calls[i]) {
+            g_cost_ticks[i].fetch_add(t_cost_ticks[i], std::memory_order_relaxed);
+            g_cost_calls[i].fetch_add(t_cost_calls[i], std::memory_order_relaxed);
+            t_cost_ticks[i] = t_cost_calls[i] = 0;
+        }
+    t_cost_n = 0;
+}
+struct CostScope {
+    uint32_t slot; uint64_t t0;
+    explicit CostScope(uint32_t s, bool on = true) : slot(on && s < kCostSlots ? s : kCostSlots), t0(slot < kCostSlots ? cost_now() : 0) {}
+    ~CostScope()
+    {
+        if (slot >= kCostSlots) return;
+        t_cost_ticks[slot] += cost_now() - t0; ++t_cost_calls[slot];
+        if (++t_cost_n >= 512 || slot >= kCostExec) cost_flush();
+    }
+    CostScope(const CostScope&) = delete;
+    CostScope& operator=(const CostScope&) = delete;
+};
+
 // Sentinel attached as private data: its last Release is the object's destruction.
 class RetireSentinel final : public IUnknown {
 public:
@@ -3676,37 +3708,6 @@ void vpj_before_draw(GL* l)
     l->RSSetViewports(n, n ? v : nullptr);
     t_vpj_self = false;
 }
-// ---- Hook cost (2026-11-05: with us loaded SE5 ran 35 fps CPU-bound vs 165 without) ----------
-// Wall time spent inside each outermost command-list hook (ours + the driver's call), per
-// slot, plus ExecuteCommandLists and pipeline creation. Thread-local sums are folded into the
-// shared totals every 512 calls, so the measurement itself adds no shared write per call.
-constexpr uint32_t kCostSlots = 128, kCostExec = 125, kCostPso = 126;
-std::atomic<uint64_t> g_cost_ticks[kCostSlots]{}, g_cost_calls[kCostSlots]{};
-thread_local uint64_t t_cost_ticks[kCostSlots]{}, t_cost_calls[kCostSlots]{};
-thread_local uint32_t t_cost_n = 0;
-inline uint64_t cost_now() { LARGE_INTEGER c; QueryPerformanceCounter(&c); return static_cast<uint64_t>(c.QuadPart); }
-void cost_flush()
-{
-    for (uint32_t i = 0; i < kCostSlots; ++i)
-        if (t_cost_calls[i]) {
-            g_cost_ticks[i].fetch_add(t_cost_ticks[i], std::memory_order_relaxed);
-            g_cost_calls[i].fetch_add(t_cost_calls[i], std::memory_order_relaxed);
-            t_cost_ticks[i] = t_cost_calls[i] = 0;
-        }
-    t_cost_n = 0;
-}
-struct CostScope {
-    uint32_t slot; uint64_t t0;
-    explicit CostScope(uint32_t s, bool on = true) : slot(on && s < kCostSlots ? s : kCostSlots), t0(slot < kCostSlots ? cost_now() : 0) {}
-    ~CostScope()
-    {
-        if (slot >= kCostSlots) return;
-        t_cost_ticks[slot] += cost_now() - t0; ++t_cost_calls[slot];
-        if (++t_cost_n >= 512 || slot >= kCostExec) cost_flush();
-    }
-    CostScope(const CostScope&) = delete;
-    CostScope& operator=(const CostScope&) = delete;
-};
 template <uint32_t Slot, typename Sig>
 struct ListHook;
 template <uint32_t Slot, typename R, typename... A>
