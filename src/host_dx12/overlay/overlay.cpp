@@ -943,8 +943,8 @@ void write_status_line()
         { // 16x anisotropic filtering ([j2] anisotropic)
             const auto as = na::observe::GetAnisoStats();
             char al[200];
-            const int an = snprintf(al, sizeof al, "anisotropic on=%u setting=%u samplers=%llu static=%llu already16=%llu\r\n",
-                as.on ? 1u : 0u, na::settings::Get().aniso16.load(), (unsigned long long)as.samplers,
+            const int an = snprintf(al, sizeof al, "anisotropic level=%u setting=%u samplers=%llu static=%llu already=%llu\r\n",
+                as.level, na::settings::Get().aniso16.load(), (unsigned long long)as.samplers,
                 (unsigned long long)as.static_samplers, (unsigned long long)as.already);
             if (an > 0) WriteFile(f, al, DWORD((std::min)(an, int(sizeof al - 1))), &written, nullptr);
         }

@@ -450,9 +450,9 @@ int main(int argc, char** argv)
         // 8x static sampler become 16x (the root signature is rebuilt even with no bias change);
         // shadow comparison and clamped screen-pass samplers are untouched; a 16x one is left.
         {
-            na::observe::SetSamplerAnisotropy16(true);
+            na::observe::SetSamplerAnisotropy(16);
             const auto a0 = na::observe::GetAnisoStats();
-            CHECK(a0.on);
+            CHECK(a0.level == 16);
             test::ComPtr<ID3D12RootSignature> rs_af;
             D3D12_ROOT_SIGNATURE_DESC rd2{1, &p, 1, &ss, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
             test::ComPtr<ID3DBlob> blob2, err2;
@@ -482,7 +482,7 @@ int main(int argc, char** argv)
             const auto a4 = na::observe::GetAnisoStats();
             CHECK(a4.samplers == a3.samplers);
             CHECK(a4.already == a3.already + 1);
-            na::observe::SetSamplerAnisotropy16(false);
+            na::observe::SetSamplerAnisotropy(0);
             sd.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
             sd.MaxAnisotropy = 1;
             dev->CreateSampler(&sd, h2);

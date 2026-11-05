@@ -1205,23 +1205,28 @@ void DrawLiveDlaaEnhancements()
     {
         // 16x anisotropic filtering on the game's surface textures (before DLSS, where the game
         // samples them). Samplers are built when the game loads: a change applies at the next start.
-        static const char* kAniso[] = {"Off (game's own)", "On (16x)"};
+        static const char* kAniso[] = {"Off (game's own)", "4x", "8x", "16x"};
+        static const uint32_t kAnisoLevel[] = {0, 4, 8, 16};
         na::settings::Settings& ss = na::settings::Get();
-        int idx = ss.aniso16.load() ? 1 : 0;
-        BeginRow("Anisotropic filtering", "Makes the game's surface textures 16x anisotropic, so ground, walls and roofs seen at an angle stay sharp instead of blurring with distance. It works together with Texture detail and happens before DLSS, so DLSS gets the sharper picture. Shadows and screen effects are never changed. Applies at the next game start; remembered for this game.", S(220));
+        const uint32_t cur = ss.aniso16.load();
+        int idx = 0;
+        for (int i = 0; i < 4; ++i) if (kAnisoLevel[i] == cur) idx = i;
+        BeginRow("Anisotropic filtering", "Makes the game's surface textures anisotropic (4x, 8x or 16x), so ground, walls and roofs seen at an angle stay sharp instead of blurring with distance. Higher is sharper at steep angles. It works together with Texture detail and happens before DLSS, so DLSS gets the sharper picture. Shadows and screen effects are never changed, and a texture the game already filters higher is left alone. Applies at the next game start; remembered for this game.", S(220));
         ImGui::SetNextItemWidth(S(220));
-        if (ImGui::Combo("##aniso16", &idx, kAniso, 2)) {
-            ss.aniso16.store(idx ? 1u : 0u);
+        if (ImGui::Combo("##aniso", &idx, kAniso, 4)) {
+            ss.aniso16.store(kAnisoLevel[idx]);
             na::settings::Save();
         }
         EndRow();
         const auto as = na::observe::GetAnisoStats();
         char tb[240];
-        std::snprintf(tb, sizeof tb, "This session: %s (%llu samplers and %llu built-in samplers made 16x, %llu were 16x already).",
-                      as.on ? "on" : "off", static_cast<unsigned long long>(as.samplers), static_cast<unsigned long long>(as.static_samplers),
-                      static_cast<unsigned long long>(as.already));
+        if (as.level)
+            std::snprintf(tb, sizeof tb, "This session: %ux (%llu samplers and %llu built-in samplers raised, %llu already at or above it).", as.level,
+                          static_cast<unsigned long long>(as.samplers), static_cast<unsigned long long>(as.static_samplers), static_cast<unsigned long long>(as.already));
+        else
+            std::snprintf(tb, sizeof tb, "This session: off (the game's own filtering).");
         StatusLine(0, tb);
-        if (as.on != (idx == 1)) StatusLine(2, "Restart the game to apply this change.");
+        if (as.level != kAnisoLevel[idx]) StatusLine(2, "Restart the game to apply this change.");
     }
     {
         // Jitter sequence (Cort 2026-11-05): where inside each pixel DLAA/DLSS samples, frame

@@ -1407,22 +1407,24 @@ bool sampler_wants_bias(const SD& d)
     return surface && d.MaxLOD > 0.0f;
 }
 float clamp_lod(float v) { return v < -16.0f ? -16.0f : (v > 15.99f ? 15.99f : v); }
-// 16x anisotropic filtering (Cort 2026-11-05, menu switch, next game start): the game's
-// surface-texture samplers (the same ones the mip bias treats) are made anisotropic 16x.
+// Anisotropic filtering 4x/8x/16x (Cort 2026-11-05, menu selector, next game start): the game's
+// surface-texture samplers (the same ones the mip bias treats) are made anisotropic at that level.
 // It is applied where the game samples its textures, before DLSS, so DLSS gets the sharper
 // oblique detail. Comparison / min-max / point / screen-pass samplers are untouched.
-std::atomic<bool> g_aniso16{false};
+std::atomic<uint32_t> g_aniso_level{0}; // 0 off, else 4 / 8 / 16 (menu)
 std::atomic<uint64_t> g_aniso_samplers{0}, g_aniso_static{0}, g_aniso_already{0};
 template <typename SD>
 bool apply_aniso(SD& d)
 {
-    if (!g_aniso16.load(std::memory_order_relaxed) || !sampler_wants_bias(d)) return false;
-    if (D3D12_DECODE_IS_ANISOTROPIC_FILTER(d.Filter) && d.MaxAnisotropy >= 16) {
+    const uint32_t level = g_aniso_level.load(std::memory_order_relaxed);
+    if (!level || !sampler_wants_bias(d)) return false;
+    // Never lowers the game's own: an anisotropic sampler at or above the chosen level stays.
+    if (D3D12_DECODE_IS_ANISOTROPIC_FILTER(d.Filter) && d.MaxAnisotropy >= level) {
         g_aniso_already.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
     d.Filter = D3D12_FILTER_ANISOTROPIC;
-    d.MaxAnisotropy = 16;
+    d.MaxAnisotropy = level;
     return true;
 }
 // Target-based bias (Cort, aiming for a total of `target`, e.g. -1): a sampler
@@ -6184,11 +6186,14 @@ void MipBiasCounts(uint64_t* samplers, uint64_t* static_samplers)
     if (samplers) *samplers = g_biased_samplers.load(std::memory_order_relaxed);
     if (static_samplers) *static_samplers = g_biased_static.load(std::memory_order_relaxed);
 }
-void SetSamplerAnisotropy16(bool on) { g_aniso16.store(on, std::memory_order_relaxed); }
+void SetSamplerAnisotropy(uint32_t level)
+{
+    g_aniso_level.store(level >= 16 ? 16u : level >= 8 ? 8u : level >= 4 ? 4u : level ? 4u : 0u, std::memory_order_relaxed);
+}
 AnisoStats GetAnisoStats()
 {
     AnisoStats a;
-    a.on = g_aniso16.load(std::memory_order_relaxed);
+    a.level = g_aniso_level.load(std::memory_order_relaxed);
     a.samplers = g_aniso_samplers.load(std::memory_order_relaxed);
     a.static_samplers = g_aniso_static.load(std::memory_order_relaxed);
     a.already = g_aniso_already.load(std::memory_order_relaxed);
