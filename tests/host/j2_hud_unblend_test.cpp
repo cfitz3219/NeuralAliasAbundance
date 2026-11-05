@@ -389,6 +389,37 @@ int end_to_end(test::Device& d)
         CHECK(nh::TakeFrame(proxy.Get(), RW, RH, OW, OH, &fourth));
         CHECK(fourth.unblend && fourth.l0 && fourth.l1);
     }
+    // Retarget (SE5 p12312): after the UI went into the canvas, a post-processing pass rewrites
+    // the picture into another target (opaque, full-screen) and the UI is laid on THERE: the
+    // layers move to that target and hold only what was drawn on it after that pass. The white
+    // pass on `other` before that (no full-screen pass there yet) is still forwarded.
+    {
+        const ub::Stats before = ub::GetStats();
+        REQUIRE(SUCCEEDED(game.alloc->Reset()) && SUCCEEDED(l->Reset(game.alloc.Get(), nullptr)));
+        frame(false);
+        const float veil[4] = {0.1f, 0.1f, 0.1f, 0.3f};
+        l->OMSetRenderTargets(1, &rtv[2], FALSE, nullptr);
+        l->RSSetViewports(1, &full);
+        l->RSSetScissorRects(1, &all);
+        l->SetPipelineState(pso[0].Get());
+        l->SetGraphicsRoot32BitConstants(0, 4, kScene, 0);
+        l->DrawInstanced(3, 1, 0, 0); // post-processing: the picture is in `other` now
+        l->SetPipelineState(pso[int(Blend::Over)].Get());
+        l->SetGraphicsRoot32BitConstants(0, 4, veil, 0);
+        l->DrawInstanced(3, 1, 0, 0); // the canvas laid on: UI, on the new target
+        REQUIRE(SUCCEEDED(l->Close()));
+        d.queue->ExecuteCommandLists(1, lists);
+        d.WaitIdle();
+        CHECK(dev->GetDeviceRemovedReason() == S_OK);
+        const ub::Stats after = ub::GetStats();
+        CHECK(after.retargeted == before.retargeted + 1);
+        CHECK(after.other_target == before.other_target + 1);
+        CHECK(after.replayed == before.replayed + 4); // 3 UI draws on the canvas + the veil
+        nh::Layer fifth;
+        CHECK(nh::TakeFrame(proxy.Get(), RW, RH, OW, OH, &fifth));
+        CHECK(ub::GetStats().last_draws == 1);
+        CHECK(fifth.unblend && fifth.l0 && fifth.l1);
+    }
     // Off: nothing is replayed.
     ub::SetEnabled(false);
     REQUIRE(SUCCEEDED(game.alloc->Reset()) && SUCCEEDED(l->Reset(game.alloc.Get(), nullptr)));
@@ -396,7 +427,7 @@ int end_to_end(test::Device& d)
     REQUIRE(SUCCEEDED(l->Close()));
     d.queue->ExecuteCommandLists(1, lists);
     d.WaitIdle();
-    CHECK(ub::GetStats().replayed == 13);
+    CHECK(ub::GetStats().replayed == 17);
     ub::SetEnabled(true);
     return 0;
 }
