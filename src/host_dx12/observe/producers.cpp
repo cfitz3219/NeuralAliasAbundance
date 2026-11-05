@@ -1007,20 +1007,13 @@ DescHeap* heap_for_cpu_locked(uint64_t ptr, uint32_t* slot)
 }
 
 void note_descriptor_write(D3D12_CPU_DESCRIPTOR_HANDLE dst, uint32_t kind, IUnknown* resource, uint32_t format,
-                           uint32_t first_sub, uint32_t sub_count)
+                           uint32_t first_sub, uint32_t sub_count, std::shared_ptr<DescriptorDetails> view = {})
 {
     na_ev_descriptor_write e;
     init_header(e, NA_EV_DESCRIPTOR_WRITE, 0);
-    // Identity of the viewed resource looked up first under the SHARED lock, so the
-    // exclusive section (which freezes every recording thread) is only the slot update.
-    na_object_id rid = 0;
-    if (resource) {
-        std::shared_lock<std::shared_mutex> lock(g_m);
-        rid = id_locked(resource);
-    }
     {
         const CostScope cost(kCostDescWrite);
-        std::unique_lock<std::shared_mutex> lock(g_m, std::defer_lock);
+        std::shared_lock<std::shared_mutex> lock(g_m, std::defer_lock);
         { const CostScope wait(kCostDescWriteWait); lock.lock(); }
         uint32_t slot = 0;
         DescHeap* h = heap_for_cpu_locked(dst.ptr, &slot);
@@ -1028,6 +1021,11 @@ void note_descriptor_write(D3D12_CPU_DESCRIPTOR_HANDLE dst, uint32_t kind, IUnkn
             g_c.unresolved.fetch_add(1);
             return;
         }
+        const na_object_id rid=resource?id_locked(resource):0;
+        // The registry lock retains the heap/resource identity; only this slot's
+        // stripe is exclusive. Publish compact metadata and replay details together.
+        std::unique_lock<std::shared_mutex> stripe(h->stripes[slot >> kStripeShift], std::defer_lock);
+        { const CostScope wait(kCostDescWriteWait); stripe.lock(); }
         e.heap = h->id;
         e.slot = slot;
         e.slot_version = ++h->versions[slot];
@@ -1038,6 +1036,10 @@ void note_descriptor_write(D3D12_CPU_DESCRIPTOR_HANDLE dst, uint32_t kind, IUnkn
             e.hdr.flags |= NA_EVF_METHOD_UNOBSERVED;
         }
         h->info[slot] = DescHeap::SlotInfo{kind, e.resource, format, first_sub, 0, 0};
+        if (view) {
+            view->kind=kind;view->resource=e.resource;
+            h->info[slot].details=std::move(view);
+        }
     }
     e.descriptor_kind = kind;
     e.format = format;
@@ -1351,48 +1353,39 @@ void ensure_heap_registered(ID3D12DescriptorHeap* h)
     dev->Release();
 }
 
-void remember_view(D3D12_CPU_DESCRIPTOR_HANDLE handle, std::shared_ptr<DescriptorDetails> view)
-{
-    if (!view || t_host_work) return;
-    std::unique_lock<std::shared_mutex> lock(g_m);
-    uint32_t slot = 0;
-    if (auto* heap = heap_for_cpu_locked(handle.ptr, &slot)) {
-        view->kind = heap->info[slot].kind;
-        view->resource = heap->info[slot].resource;
-        heap->info[slot].details = std::move(view);
-        ++g_operation_revision;
-    }
-}
 void STDMETHODCALLTYPE D_CreateConstantBufferView(ID3D12Device* dev, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE h)
 {
     o_CreateConstantBufferView(dev, desc, h);
+    std::shared_ptr<DescriptorDetails> view;
+    if(g_operation_snapshots.load()&&!t_host_work&&desc){view=std::make_shared<DescriptorDetails>();view->explicit_view=true;view->cbv=*desc;}
     na_object_id res = 0;
     uint64_t off = 0;
     bool known = false;
-    if (desc && desc->BufferLocation) {
-        std::shared_lock<std::shared_mutex> lock(g_m);
-        known = resolve_va_locked(desc->BufferLocation, &res, &off);
-    }
     // ABI 0.1 DESCRIPTOR_WRITE carries no byte offset; the resource identity is
     // what H1 promises. Unresolved / ambiguous ranges are UNKNOWN, never guessed.
     na_ev_descriptor_write e;
-    init_header(e, NA_EV_DESCRIPTOR_WRITE, known ? 0u : NA_EVF_METHOD_UNOBSERVED);
+    init_header(e, NA_EV_DESCRIPTOR_WRITE, 0);
     {
         const CostScope cost(kCostDescWrite);
-        std::unique_lock<std::shared_mutex> lock(g_m, std::defer_lock);
+        std::shared_lock<std::shared_mutex> lock(g_m, std::defer_lock);
         { const CostScope wait(kCostDescWriteWait); lock.lock(); }
+        if(desc&&desc->BufferLocation)known=resolve_va_locked(desc->BufferLocation,&res,&off);
+        if(!known)e.hdr.flags|=NA_EVF_METHOD_UNOBSERVED;
         uint32_t slot = 0;
         DescHeap* dh = heap_for_cpu_locked(h.ptr, &slot);
         if (!dh) {
             g_c.unresolved.fetch_add(1);
             return;
         }
+        std::unique_lock<std::shared_mutex> stripe(dh->stripes[slot >> kStripeShift], std::defer_lock);
+        { const CostScope wait(kCostDescWriteWait); stripe.lock(); }
         e.heap = dh->id;
         e.slot = slot;
         e.slot_version = ++dh->versions[slot];
         ++g_operation_revision;
         dh->info[slot] = DescHeap::SlotInfo{NA_DESC_CBV, desc && desc->BufferLocation ? (known ? res : NA_UNKNOWN_U64) : 0, NA_UNKNOWN_U32, 0,
                                             known ? off : 0, desc ? desc->SizeInBytes : 0};
+        if(view){view->kind=NA_DESC_CBV;view->resource=dh->info[slot].resource;dh->info[slot].details=std::move(view);}
     }
     e.descriptor_kind = NA_DESC_CBV;
     e.resource = desc && desc->BufferLocation ? (known ? res : NA_UNKNOWN_U64) : 0;
@@ -1401,10 +1394,6 @@ void STDMETHODCALLTYPE D_CreateConstantBufferView(ID3D12Device* dev, const D3D12
     e.subresource_count = 1;
     g_c.writes.fetch_add(1);
     emit(e, NA_GROUP_DESCRIPTOR);
-    if (g_operation_snapshots.load() && !t_host_work && desc) {
-        auto view = std::make_shared<DescriptorDetails>(); view->explicit_view = true; view->cbv = *desc;
-        remember_view(h, std::move(view));
-    }
 }
 
 void STDMETHODCALLTYPE D_CreateShaderResourceView(ID3D12Device* dev, ID3D12Resource* r, const D3D12_SHADER_RESOURCE_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
@@ -1412,11 +1401,11 @@ void STDMETHODCALLTYPE D_CreateShaderResourceView(ID3D12Device* dev, ID3D12Resou
     o_CreateShaderResourceView(dev, r, d, h);
     uint32_t first = NA_UNKNOWN_U32, count = NA_UNKNOWN_U32;
     if (d && d->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) { first = d->Texture2D.MostDetailedMip; count = d->Texture2D.MipLevels; }
-    note_descriptor_write(h, NA_DESC_SRV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count);
+    std::shared_ptr<DescriptorDetails> view;
     if (g_operation_snapshots.load() && !t_host_work) {
-        auto view = std::make_shared<DescriptorDetails>(); view->explicit_view = d != nullptr; if (d) view->srv = *d;
-        remember_view(h, std::move(view));
+        view = std::make_shared<DescriptorDetails>(); view->explicit_view = d != nullptr; if (d) view->srv = *d;
     }
+    note_descriptor_write(h, NA_DESC_SRV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count,std::move(view));
 }
 
 void STDMETHODCALLTYPE D_CreateUnorderedAccessView(ID3D12Device* dev, ID3D12Resource* r, ID3D12Resource* counter,
@@ -1425,12 +1414,12 @@ void STDMETHODCALLTYPE D_CreateUnorderedAccessView(ID3D12Device* dev, ID3D12Reso
     o_CreateUnorderedAccessView(dev, r, counter, d, h);
     uint32_t first = NA_UNKNOWN_U32, count = NA_UNKNOWN_U32;
     if (d && d->ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D) { first = d->Texture2D.MipSlice; count = 1; }
-    note_descriptor_write(h, NA_DESC_UAV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count);
+    std::shared_ptr<DescriptorDetails> view;
     if (g_operation_snapshots.load() && !t_host_work) {
-        auto view = std::make_shared<DescriptorDetails>(); view->explicit_view = d != nullptr; if (d) view->uav = *d;
+        view = std::make_shared<DescriptorDetails>(); view->explicit_view = d != nullptr; if (d) view->uav = *d;
         bool created = false; view->counter = counter ? ensure_registered(counter, NA_OBJ_RESOURCE, &created) : 0;
-        remember_view(h, std::move(view));
     }
+    note_descriptor_write(h, NA_DESC_UAV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count,std::move(view));
 }
 
 void STDMETHODCALLTYPE D_CreateRenderTargetView(ID3D12Device* dev, ID3D12Resource* r, const D3D12_RENDER_TARGET_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
@@ -1448,11 +1437,11 @@ void STDMETHODCALLTYPE D_CreateRenderTargetView(ID3D12Device* dev, ID3D12Resourc
     else if (d->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY && d->Texture2DMSArray.ArraySize == 1) {
         first = d->Texture2DMSArray.FirstArraySlice; count = 1; // MSAA textures have exactly one mip
     }
-    note_descriptor_write(h, NA_DESC_RTV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count);
+    std::shared_ptr<DescriptorDetails> view;
     if (g_operation_snapshots.load() && !t_host_work) {
-        auto view = std::make_shared<DescriptorDetails>(); view->explicit_view = d != nullptr; if (d) view->rtv = *d;
-        remember_view(h, std::move(view));
+        view = std::make_shared<DescriptorDetails>(); view->explicit_view = d != nullptr; if (d) view->rtv = *d;
     }
+    note_descriptor_write(h, NA_DESC_RTV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count,std::move(view));
 }
 
 void STDMETHODCALLTYPE D_CreateDepthStencilView(ID3D12Device* dev, ID3D12Resource* r, const D3D12_DEPTH_STENCIL_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
@@ -1469,11 +1458,11 @@ void STDMETHODCALLTYPE D_CreateDepthStencilView(ID3D12Device* dev, ID3D12Resourc
     else if (d->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY && d->Texture2DMSArray.ArraySize == 1) {
         first = d->Texture2DMSArray.FirstArraySlice; count = 1;
     }
-    note_descriptor_write(h, NA_DESC_DSV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count);
+    std::shared_ptr<DescriptorDetails> view;
     if (g_operation_snapshots.load() && !t_host_work) {
-        auto view = std::make_shared<DescriptorDetails>(); view->explicit_view = d != nullptr; if (d) view->dsv = *d;
-        remember_view(h, std::move(view));
+        view = std::make_shared<DescriptorDetails>(); view->explicit_view = d != nullptr; if (d) view->dsv = *d;
     }
+    note_descriptor_write(h, NA_DESC_DSV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count,std::move(view));
 }
 
 // Texture LOD (mip) bias for temporal reconstruction (J2 DLAA): with jitter and
