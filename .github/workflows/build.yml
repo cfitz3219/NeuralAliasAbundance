@@ -47,14 +47,23 @@ jobs:
               if ($l -match 'Failed|Timeout|\*\*\*|Not Run|tests failed') { Write-Output "::error::$l" }
             }
           exit $code
-      - name: DX9 D3D9On12 probe (D0), 64-bit and 32-bit
+      - name: 32-bit game side (D1) + DX9 D3D9On12 probe (D0), 64-bit and 32-bit
         if: always()
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
-          cmake -S tests/dx9 -B build32 -A Win32 2>&1 | Out-Null
-          cmake --build build32 --config Release 2>&1 | Tee-Object -FilePath build32-log.txt | Out-Null
-          if ($LASTEXITCODE -ne 0) { Get-Content build32-log.txt | Select-String 'error' | Select-Object -First 10 | ForEach-Object { Write-Output "::error::[32-bit] $($_.Line.Trim())" } }
+          # D1: the 32-bit game side (win32/) builds and its tests pass.
+          cmake -S win32 -B build32 -A Win32 2>&1 | Out-Null
+          cmake --build build32 --config Release --parallel 2>&1 | Tee-Object -FilePath build32-log.txt | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content build32-log.txt | Select-String ': (fatal )?error [A-Z]+[0-9]+|error MSB|LINK : fatal|: warning C[0-9]+' | Select-Object -First 10 | ForEach-Object { Write-Output "::error::[32-bit] $($_.Line.Trim())" }
+            exit 1
+          }
+          ctest --test-dir build32 -C Release --output-on-failure -LE gpu -E dx9_d3d9on12_probe 2>&1 | Tee-Object -FilePath ctest32-log.txt
+          if ($LASTEXITCODE -ne 0) {
+            Select-String -Path ctest32-log.txt -Pattern 'FAIL|Failed|\*\*\*' | Select-Object -First 10 | ForEach-Object { Write-Output "::error::[32-bit] $($_.Line.Trim())" }
+            $worst32 = 1
+          }
           "## DX9 D3D9On12 probe" | Out-File -Append $env:GITHUB_STEP_SUMMARY
           $worst = 0
           foreach ($exe in @('build/Release/d3d9on12_probe.exe', 'build32/Release/d3d9on12_probe.exe')) {
@@ -69,6 +78,7 @@ jobs:
             Write-Output "::notice::$exe exit $code : $verdict"
             if ($code -eq 1) { $worst = 1 }
           }
+          if ($worst32) { $worst = 1 }
           exit $worst
       - name: Deployment script tests (C5)
         shell: pwsh
