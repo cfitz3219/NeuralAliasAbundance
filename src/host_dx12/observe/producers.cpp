@@ -254,7 +254,37 @@ void ReleaseParkedTwins()
     dead.clear(); // plain Release calls from the game's own call stack
 }
 std::vector<std::unique_ptr<DescHeap>> g_heaps;
+// CPU-handle index of g_heaps, sorted by cpu_start (rebuilt under the exclusive g_m whenever
+// g_heaps changes): every descriptor write/copy and many binds looked their heap up by
+// walking all heaps under the lock.
+std::vector<std::pair<uint64_t, DescHeap*>> g_heap_cpu_index;
+void heap_index_rebuild()
+{
+    g_heap_cpu_index.clear();
+    g_heap_cpu_index.reserve(g_heaps.size());
+    for (auto& h : g_heaps) g_heap_cpu_index.emplace_back(h->cpu_start, h.get());
+    // Stable: for an equal start the later (newer) heap stays last and is found first.
+    std::stable_sort(g_heap_cpu_index.begin(), g_heap_cpu_index.end(),
+                     [](const auto& a, const auto& b) { return a.first < b.first; });
+}
 std::vector<VaRange> g_va; // sorted by begin
+// g_va_maxend[i] = the largest end among g_va[0..i]: a backwards walk stops as soon as no
+// earlier range can reach va. Exact (overlapping placed buffers are still all found), where
+// the old 64 GB window crossed nearly every buffer on each root CBV/SRV bind.
+std::vector<uint64_t> g_va_maxend;
+void va_reindex(size_t from)
+{
+    g_va_maxend.resize(g_va.size());
+    for (size_t i = from; i < g_va.size(); ++i)
+        g_va_maxend[i] = i ? (std::max)(g_va_maxend[i - 1], g_va[i].end) : g_va[i].end;
+}
+void va_insert(const VaRange& r)
+{
+    const auto it = std::upper_bound(g_va.begin(), g_va.end(), r, [](const VaRange& a, const VaRange& b) { return a.begin < b.begin; });
+    const size_t at = static_cast<size_t>(it - g_va.begin());
+    g_va.insert(it, r);
+    va_reindex(at);
+}
 // Protected by the existing g_m. No additional hot-path setter lock. Identity
 // reuse, descriptor writes/copies and heap retirement invalidate borrowed data.
 uint64_t g_operation_revision=1,g_heap_registry_revision=1;
@@ -558,7 +588,15 @@ void RetireSentinel::retire(const void* key, na_object_id id, uint32_t kind)
         if (it != g_objs.end() && it->second.id == id) { drop = std::move(it->second.twins); g_objs.erase(it); }
         g_heaps.erase(std::remove_if(g_heaps.begin(), g_heaps.end(), [&](const std::unique_ptr<DescHeap>& h) { return h->id == id; }),
                       g_heaps.end());
-        g_va.erase(std::remove_if(g_va.begin(), g_va.end(), [&](const VaRange& r) { return r.resource == id; }), g_va.end());
+        heap_index_rebuild();
+        {
+            const auto first = std::find_if(g_va.begin(), g_va.end(), [&](const VaRange& r) { return r.resource == id; });
+            if (first != g_va.end()) {
+                const size_t at = static_cast<size_t>(first - g_va.begin());
+                g_va.erase(std::remove_if(first, g_va.end(), [&](const VaRange& r) { return r.resource == id; }), g_va.end());
+                va_reindex(at);
+            }
+        }
         g_buffers.erase(id);
         g_res_keys.erase(id);
     }
@@ -773,8 +811,7 @@ void note_resource(ID3D12Device* dev, IUnknown* obj, uint32_t creation_kind, ID3
         known_created(id, static_cast<uint32_t>(initial));
     if (va) {
         std::unique_lock<std::shared_mutex> lock(g_m);
-        VaRange r{va, va + d.Width, id, obj};
-        g_va.insert(std::upper_bound(g_va.begin(), g_va.end(), r, [](const VaRange& a, const VaRange& b) { return a.begin < b.begin; }), r);
+        va_insert(VaRange{va, va + d.Width, id, obj});
         ++g_operation_revision;
     }
     emit(e, NA_GROUP_RESOURCE);
@@ -833,8 +870,7 @@ na_object_id ensure_resource_registered(ID3D12Resource* res)
             bi.ever_mapped = bi.cpu_visible; // it may have been mapped before we could see it
         }
         if (va) {
-            VaRange r{va, va + d.Width, id, res};
-            g_va.insert(std::upper_bound(g_va.begin(), g_va.end(), r, [](const VaRange& a, const VaRange& b) { return a.begin < b.begin; }), r);
+            va_insert(VaRange{va, va + d.Width, id, res});
             ++g_operation_revision;
         }
     }
@@ -864,7 +900,9 @@ bool resolve_va_locked(uint64_t va, na_object_id* resource, uint64_t* offset)
             found = it->resource;
             base = it->begin;
         }
-        if (it->end + (1ull << 36) < va) break; // ranges far below cannot contain it
+        // No range at or before the previous one ends above va: none can contain it.
+        const size_t i = static_cast<size_t>(it - g_va.begin());
+        if (i == 0 || g_va_maxend[i - 1] <= va) break;
     }
     if (hits != 1) return false;
     *resource = found;
@@ -875,6 +913,20 @@ bool resolve_va_locked(uint64_t va, na_object_id* resource, uint64_t* offset)
 // ------------------------------------------------------------ descriptors
 DescHeap* heap_for_cpu_locked(uint64_t ptr, uint32_t* slot)
 {
+    // Fast path: the heap with the greatest start at or below ptr.
+    auto it = std::upper_bound(g_heap_cpu_index.begin(), g_heap_cpu_index.end(), ptr,
+                               [](uint64_t v, const std::pair<uint64_t, DescHeap*>& e) { return v < e.first; });
+    if (it != g_heap_cpu_index.begin()) {
+        DescHeap* h = std::prev(it)->second;
+        if (h->increment && ptr >= h->cpu_start) {
+            const uint64_t off = ptr - h->cpu_start;
+            if (off % h->increment == 0 && off / h->increment < h->count) {
+                *slot = static_cast<uint32_t>(off / h->increment);
+                return h;
+            }
+        }
+    }
+    // Overlapping or unindexed heaps (not expected): the original full walk.
     for (auto& h : g_heaps) {
         if (!h->increment || ptr < h->cpu_start) continue;
         const uint64_t off = ptr - h->cpu_start;
@@ -893,6 +945,13 @@ void note_descriptor_write(D3D12_CPU_DESCRIPTOR_HANDLE dst, uint32_t kind, IUnkn
 {
     na_ev_descriptor_write e;
     init_header(e, NA_EV_DESCRIPTOR_WRITE, 0);
+    // Identity of the viewed resource looked up first under the SHARED lock, so the
+    // exclusive section (which freezes every recording thread) is only the slot update.
+    na_object_id rid = 0;
+    if (resource) {
+        std::shared_lock<std::shared_mutex> lock(g_m);
+        rid = id_locked(resource);
+    }
     {
         std::unique_lock<std::shared_mutex> lock(g_m);
         uint32_t slot = 0;
@@ -905,7 +964,7 @@ void note_descriptor_write(D3D12_CPU_DESCRIPTOR_HANDLE dst, uint32_t kind, IUnkn
         e.slot = slot;
         e.slot_version = ++h->versions[slot];
         ++g_operation_revision;
-        e.resource = resource ? id_locked(resource) : 0;
+        e.resource = rid;
         if (resource && !e.resource) {
             e.resource = NA_UNKNOWN_U64; // resource-backed, but created before observation
             e.hdr.flags |= NA_EVF_METHOD_UNOBSERVED;
@@ -1135,6 +1194,7 @@ void register_heap(ID3D12Device* dev, IUnknown* obj, ID3D12DescriptorHeap* h, co
         g_heaps.erase(std::remove_if(g_heaps.begin(), g_heaps.end(), [&](const std::unique_ptr<DescHeap>& x) { return x->key == obj; }),
                       g_heaps.end());
         g_heaps.push_back(std::move(dh));
+        heap_index_rebuild();
         ++g_operation_revision;++g_heap_registry_revision;
     }
     remember_creation(obj, e);
