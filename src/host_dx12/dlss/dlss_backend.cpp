@@ -1,5 +1,6 @@
 // C6: generic DLSS Super Resolution / DLAA backend. See dlss_backend.hpp.
 #include "host_dx12/dlss/dlss_backend.hpp"
+#include "host_dx12/diag/dred.hpp"
 #include "host_dx12/dlss/call_origin.hpp"
 
 #include "core/frame_contract.hpp"
@@ -748,6 +749,7 @@ bool ReleaseIfDeviceRemoved()
     {
         std::lock_guard<std::mutex> lock(g.m);
         if (!g.attached || !g.device || g.device->GetDeviceRemovedReason() == S_OK) return false;
+        na::diag::ReportIfRemoved(g.device.Get());
     }
     Shutdown(); // see OnExecuted: a removed device must not stay pinned
     return true;
@@ -763,6 +765,7 @@ void OnExecuted(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* co
             on_executed_locked(queue, count, lists);
             return;
         }
+        na::diag::ReportIfRemoved(g.device.Get());
     }
     // Hardware session (G2-004): the bound device was removed. D3D12 devices
     // are per-adapter singletons, so while we (or NGX) hold it the game's

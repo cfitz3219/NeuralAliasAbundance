@@ -1,4 +1,5 @@
 #include "host_dx12/host_boot/process_log.hpp"
+#include "host_dx12/diag/dred.hpp"
 #include "host_dx12/native_present/size_spoof.hpp"
 #include "host_dx12/native_present/size_probe.hpp"
 #include "host_dx12/native_present/size_controller.hpp"
@@ -1618,6 +1619,7 @@ void write_menu_progress(HANDLE log)
     if(pn>0)WriteFile(log,p_line,static_cast<DWORD>(pn),&pw,nullptr);
     std::unique_lock<std::mutex> lock(g_state.mutex, std::try_to_lock);
     if (!lock.owns_lock() || !g_state.device) return;
+    na::diag::ReportIfRemoved(g_state.device.Get());
     char line[400];
     int n = snprintf(line, sizeof(line), "menu_gpu draws=%llu submitted=%llu completed=%llu device_hr=0x%08lX observed_queue=0x%llX present_queue=0x%llX swapchain_queues=%u hits=%u buffer_queue=%u misses=%u\r\n",
                      static_cast<unsigned long long>(g_frames.load()),

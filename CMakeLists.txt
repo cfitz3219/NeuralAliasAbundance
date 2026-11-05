@@ -278,8 +278,12 @@ set(NA_HAVE_NGX_LIB OFF)
 if(NA_HAVE_NGX_SDK AND NA_NGX_LIB AND EXISTS "${NA_NGX_LIB}")
   set(NA_HAVE_NGX_LIB ON)
 endif()
+# DRED report (Windows' device-removed diagnostics; diag/dred.hpp). Its own library: the
+# DLSS backend and the host both report a removal.
+add_library(host_diag STATIC src/host_dx12/diag/dred.cpp)
+target_link_libraries(host_diag PUBLIC abundance_options d3d12)
 add_library(host_dlss STATIC src/host_dx12/dlss/dlss_backend.cpp)
-target_link_libraries(host_dlss PUBLIC abundance_options abundance_core d3d12)
+target_link_libraries(host_dlss PUBLIC abundance_options abundance_core d3d12 host_diag)
 if(NA_HAVE_NGX_SDK)
   target_compile_definitions(host_dlss PUBLIC NA_HAVE_NGX_SDK)
   target_include_directories(host_dlss SYSTEM PUBLIC "${NA_NGX_SDK_INCLUDE}")
