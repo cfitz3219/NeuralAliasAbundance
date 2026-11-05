@@ -49,6 +49,10 @@ struct FireInfo {
     uint32_t width = 0, height = 0, format = 0; // format: the colour's D3DFORMAT
     uint64_t frame = 0;
     float jitter_x = 0, jitter_y = 0; // the jitter this frame's scene was drawn with (render pixels)
+    // D6: the camera the scene was drawn with (unjittered: the jitter is added in
+    // the shader, never to the game's matrices), column-vector ViewProjection.
+    bool camera = false, depth_reversed = false;
+    double vp[16]{};
 };
 
 // What runs at the DLSS point (D4 sets it to the transport). Called on the

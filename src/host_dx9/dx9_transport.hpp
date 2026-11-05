@@ -19,6 +19,7 @@ struct TransportConfig {
 struct TransportStats {
     uint32_t ok = 0, repeated = 0, not_ready = 0, failed = 0, skipped = 0, restarts = 0;
     uint32_t at_read = 0, at_hud = 0, at_present = 0;
+    uint32_t camera_motion = 0; // frames sent with camera motion (D6)
     double wait_ms = 0;
 };
 

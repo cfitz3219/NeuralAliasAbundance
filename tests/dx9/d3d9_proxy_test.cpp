@@ -192,6 +192,7 @@ bool RunGame(IDirect3DDevice9* dev, PFN_Status status, bool post, UINT w, UINT h
     // Frames until the transport delivers (the helper takes a moment to start), at least 8 (16 when measuring).
     const ULONGLONG t0 = GetTickCount64();
     DWORD corner = 0, hud_px = 0;
+    decltype(Status(status).hooks) learned{}; // as of the last frame, before the test's own read-back (itself a read of the scene)
     for (int frame = 0;; ++frame) {
         const auto now = Status(status).transport;
         const bool last = frame >= (measure ? 16 : 8) && (!g_copy || now.ok >= 3 || GetTickCount64() - t0 > 20000);
@@ -267,6 +268,7 @@ bool RunGame(IDirect3DDevice9* dev, PFN_Status status, bool post, UINT w, UINT h
             }
         }
         if (last) {
+            learned = Status(status).hooks;
             PixelAt(dev, w, h, 4, h - 4, &corner);
             PixelAt(dev, w, h, 30, 15, &hud_px);
         }
@@ -299,16 +301,17 @@ bool RunGame(IDirect3DDevice9* dev, PFN_Status status, bool post, UINT w, UINT h
     } else {
         Check(k.jitter_on == 0 && k.jittered_draws == 0, "no DLSS delivering here: no jitter");
     }
-    if (post) Check(k.point_kind == 1 && k.fired_read >= 1, "post game: DLSS point before the tonemap's read of the scene");
-    else Check(k.point_kind == 2 && k.fired_hud >= 1, "back-buffer game: DLSS point before the HUD (HUD rule)");
+    if (post) Check(learned.point_kind == 1 && k.fired_read >= 1, "post game: DLSS point before the tonemap's read of the scene");
+    else Check(learned.point_kind == 2 && k.fired_hud >= 1, "back-buffer game: DLSS point before the HUD (HUD rule)");
     const auto& t = st.transport;
-    std::printf("     transport: ok %u late %u not ready %u failed %u skipped %u, at read %u hud %u present %u, wait %.2f ms; corner 0x%06lx hud 0x%06lx\n",
-                t.ok, t.repeated, t.not_ready, t.failed, t.skipped, t.at_read, t.at_hud, t.at_present, t.wait_ms,
+    std::printf("     transport: ok %u late %u not ready %u failed %u skipped %u, at read %u hud %u present %u, camera motion %u, wait %.2f ms; corner 0x%06lx hud 0x%06lx\n",
+                t.ok, t.repeated, t.not_ready, t.failed, t.skipped, t.at_read, t.at_hud, t.at_present, t.camera_motion, t.wait_ms,
                 static_cast<unsigned long>(corner), static_cast<unsigned long>(hud_px));
-    const DWORD bg = 0x14283C, bg_swapped = 0x3C2814; // (20,30,60) and red/blue swapped
+    const DWORD bg = 0x141E3C, bg_swapped = 0x3C1E14; // (20,30,60) and red/blue swapped
     Check(Near(hud_px, 0x00C864), "the HUD is drawn after DLSS (its colour is untouched)");
     if (g_copy) {
         Check(t.ok >= 1, "copy test: the helper's results came back");
+        Check(t.camera_motion >= 1, "copy test: frames went with camera motion from the found camera (D6)");
         Check(Near(corner, bg_swapped), post ? "copy test: the result reached the tonemap (scene red/blue swapped)"
                                             : "copy test: the result is in the back buffer under the HUD (red/blue swapped)");
     } else {

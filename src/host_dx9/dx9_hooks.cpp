@@ -110,6 +110,12 @@ FireInfo InfoLocked()
     i.height = sel.color_info.height;
     i.format = sel.color_info.format;
     i.frame = g_ears.Stats().frames;
+    Camera cam;
+    if (g_ears.CameraNow(&cam) && cam.found) {
+        i.camera = true;
+        i.depth_reversed = cam.pick.reversed;
+        for (int k = 0; k < 16; ++k) i.vp[k] = cam.pick.vp[k];
+    }
     // The jitter DLSS is told: this frame's, when most scene draws so far carried it.
     if (g_jitter_on && g_frame_jittered > g_frame_unjittered) {
         i.jitter_x = g_jx;

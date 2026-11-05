@@ -12,6 +12,7 @@
 #include "bridge/dx12_game_bridge.hpp"
 #include "host_dx9/dx9_hooks.hpp"
 #include "host_dx9/vtable_hook.hpp"
+#include "providers/camera/camera_tracker.hpp"
 
 #if __has_include(<d3d9on12.h>)
 #include <d3d9on12.h>
@@ -36,6 +37,7 @@ TransportStats g_stats;
 bool g_failed_logged = false;
 uint32_t g_logged = 0;
 uint64_t g_last_frame = 0;
+na::camera::CameraTracker g_tracker; // D6: camera motion from the found camera
 
 #ifdef NA_HAVE_9ON12
 bool EnsureQueue(IDirect3DDevice9On12* on12)
@@ -97,6 +99,7 @@ void FireLocked(IDirect3DDevice9* dev, int where, const FireInfo& info)
         Log("DLSS transport started for %ux%u%s", info.width, info.height, g_cfg.copy_test ? " (COPY TEST: no DLSS, red/blue swapped)" : "");
         g_stats.restarts++;
         g_last_frame = 0;
+        g_tracker.Reset();
     }
 
     ComPtr<ID3D12Resource> color, depth;
@@ -123,6 +126,28 @@ void FireLocked(IDirect3DDevice9* dev, int where, const FireInfo& info)
     if (info.format >= static_cast<uint32_t>(D3DFMT_R16F) && info.format <= static_cast<uint32_t>(D3DFMT_A32B32G32R32F)) f.flags |= na::bridge::kHdr;
     if (!g_last_frame || info.frame != g_last_frame + 1) f.flags |= na::bridge::kReset; // first frame, or frames skipped
     g_last_frame = info.frame;
+    // D6: motion for the whole picture from the camera (the helper reprojects the
+    // depth with it). Without a camera the motion stays zero.
+    if (info.camera) {
+        na::camera::Matrix vp{};
+        for (int k = 0; k < 16; ++k) vp[k] = info.vp[k];
+        // Our jitter is added in the shader, never to the game's matrix: the matrix is unjittered as it is.
+        const double none[2] = {0, 0};
+        const na::camera::CameraFrame cf = g_tracker.Update(vp, info.frame, info.width, info.height, none);
+        if (cf.valid) {
+            f.flags |= na::bridge::kCameraMotion;
+            if (cf.camera_cut) f.flags |= na::bridge::kReset;
+            if (info.depth_reversed) f.flags |= na::bridge::kDepthInverted;
+            f.depth_clear = info.depth_reversed ? 0.f : 1.f;
+            const auto rp = na::camera::ComposeReprojectionRow(cf.inv_view_proj_current_row, cf.view_proj_previous_row);
+            for (int k = 0; k < 16; ++k) f.reproject[k] = static_cast<float>(rp[k]);
+            ++g_stats.camera_motion;
+        } else {
+            g_tracker.Reset();
+        }
+    } else {
+        g_tracker.Reset();
+    }
 
     ID3D12Fence* fence = nullptr;
     uint64_t value = 0;
