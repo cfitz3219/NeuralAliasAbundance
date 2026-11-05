@@ -1227,7 +1227,7 @@ void DrawLiveDlaaEnhancements()
         const uint32_t cur = ss.aniso16.load();
         int idx = 0;
         for (int i = 0; i < 4; ++i) if (kAnisoLevel[i] == cur) idx = i;
-        BeginRow("Anisotropic filtering", "Makes the game's surface textures anisotropic (4x, 8x or 16x), so ground, walls and roofs seen at an angle stay sharp instead of blurring with distance. Higher is sharper at steep angles. It works together with Texture detail and happens before DLSS, so DLSS gets the sharper picture. Shadows and screen effects are never changed, and a texture the game already filters higher is left alone. Switches live (a level not prepared at load takes a few seconds in the background); remembered for this game.", S(220));
+        BeginRow("Anisotropic filtering", "Raises eligible linear texture filtering to 4x, 8x or 16x, improving detail at steep angles before DLSS, including textures that use clamp addressing. Off restores the game's own filtering, which may already be 16x. Point, comparison and min/max samplers keep their filtering. A new level prepares in the background; the status below shows which level is active. Remembered for this game.", S(220));
         ImGui::SetNextItemWidth(S(220));
         if (ImGui::Combo("##aniso", &idx, kAniso, 4)) {
             ss.aniso16.store(kAnisoLevel[idx]);
@@ -1242,11 +1242,13 @@ void DrawLiveDlaaEnhancements()
             std::snprintf(tb, sizeof tb, "Preparing %ux in the background (%llu of %llu objects); the current filtering stays until it is complete.", ml2.want_aniso,
                           static_cast<unsigned long long>(ml2.prepare_done), static_cast<unsigned long long>(ml2.prepare_total));
         else if (as.level)
-            std::snprintf(tb, sizeof tb, "In use: %ux (%llu built-in samplers and %llu sampler descriptors raised).", as.level,
+            std::snprintf(tb, sizeof tb, "In use: %ux. Built %llu static sampler overrides; raised %llu sampler descriptors.", as.level,
                           static_cast<unsigned long long>(as.static_samplers), static_cast<unsigned long long>(as.samplers));
         else
             std::snprintf(tb, sizeof tb, "In use: off (the game's own filtering).");
         StatusLine(0, tb);
+        if(as.native_surface&&as.native_16==as.native_surface)
+            Hint("The game already requested 16x for all observed surface samplers.");
     }
     {
         // Jitter sequence (Cort 2026-11-05): where inside each pixel DLAA/DLSS samples, frame
