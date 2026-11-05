@@ -37,7 +37,7 @@ if(WIN32 AND TARGET NeuralAliasD3D9)
   add_executable(d3d9_proxy_test d3d9_proxy_test.cpp)
   target_compile_definitions(d3d9_proxy_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
   target_include_directories(d3d9_proxy_test PRIVATE "${NA_ROOT}/src")
-  target_link_libraries(d3d9_proxy_test PRIVATE user32)
+  target_link_libraries(d3d9_proxy_test PRIVATE user32 d3dcompiler)
   add_dependencies(d3d9_proxy_test NeuralAliasD3D9)
   foreach(mode off on)
     add_test(NAME dx9_proxy_${mode}

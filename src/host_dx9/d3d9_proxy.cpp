@@ -31,6 +31,8 @@
 #include <string>
 
 #include "host_dx9/d3d9_proxy.hpp"
+#include "host_dx9/dx9_hooks.hpp"
+#include "host_dx9/vtable_hook.hpp"
 
 using Microsoft::WRL::ComPtr;
 
@@ -69,7 +71,9 @@ na::dx9::ProxyStatus g_status{};
 std::atomic<uint32_t> g_creates{0}, g_fallbacks{0}, g_devices{0}, g_borderless{0}, g_resets{0};
 std::atomic<uint32_t> g_on12{0}, g_our_device{0};
 
-void Log(const char* fmt, ...)
+} // namespace
+
+void na::dx9::Log(const char* fmt, ...)
 {
     std::lock_guard<std::mutex> l(g_log_mu);
     if (!g_log) return;
@@ -83,6 +87,9 @@ void Log(const char* fmt, ...)
     std::fputc('\n', g_log);
     std::fflush(g_log);
 }
+
+namespace {
+using na::dx9::Log;
 
 void OpenLog()
 {
@@ -172,54 +179,8 @@ bool MakeBorderless(D3DPRESENT_PARAMETERS* pp, HWND focus)
 }
 
 // ------------------------------------------------------------------ vtable hooks
-// Every IDirect3D9 (and device) of one implementation shares one vtable, so a
-// method is hooked once per implementation (9On12, and system d3d9 on fallback).
-// The detour finds its original by the object's own vtable entry.
-struct HookSlot {
-    std::atomic<void*> target{nullptr};
-    std::atomic<void*> original{nullptr};
-};
-constexpr int kMaxImpl = 4;
-std::mutex g_hook_mu;
-
-struct Method {
-    Method(int i, void* d) : index(i), detour(d) {}
-    int index;
-    void* detour;
-    HookSlot slots[kMaxImpl];
-};
-
-void* OriginalFor(Method& m, void* self)
-{
-    void* target = (*reinterpret_cast<void***>(self))[m.index];
-    for (auto& s : m.slots)
-        if (s.target.load(std::memory_order_acquire) == target) return s.original.load(std::memory_order_relaxed);
-    return nullptr;
-}
-
-void HookMethod(Method& m, void* object)
-{
-    if (!object) return;
-    void* target = (*reinterpret_cast<void***>(object))[m.index];
-    std::lock_guard<std::mutex> l(g_hook_mu);
-    static bool mh = MH_Initialize() == MH_OK;
-    if (!mh) return;
-    for (auto& s : m.slots)
-        if (s.target.load() == target) return; // already hooked
-    for (auto& s : m.slots) {
-        if (s.target.load()) continue;
-        void* orig = nullptr;
-        if (MH_CreateHook(target, m.detour, &orig) != MH_OK) {
-            Log("hook of vtable slot %d failed", m.index);
-            return;
-        }
-        // Published before the hook goes live, so the detour always finds its original.
-        s.original.store(orig, std::memory_order_relaxed);
-        s.target.store(target, std::memory_order_release);
-        if (MH_EnableHook(target) != MH_OK) Log("enabling the hook of vtable slot %d failed", m.index);
-        return;
-    }
-}
+using na::dx9::HookMethod;
+using na::dx9::Method;
 
 // IDirect3D9 slot 16, IDirect3D9Ex slot 20, IDirect3DDevice9 slot 16, IDirect3DDevice9Ex slot 132.
 HRESULT WINAPI CreateDevice_h(IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS*, IDirect3DDevice9**);
@@ -234,9 +195,9 @@ Method g_reset_ex{132, reinterpret_cast<void*>(&ResetEx_h)};
 
 void HookDevice(IDirect3DDevice9* dev)
 {
-    HookMethod(g_reset, dev);
+    if (!HookMethod(g_reset, dev)) Log("hooking Reset failed");
     ComPtr<IDirect3DDevice9Ex> ex;
-    if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&ex))) && ex) HookMethod(g_reset_ex, ex.Get());
+    if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&ex))) && ex && !HookMethod(g_reset_ex, ex.Get())) Log("hooking ResetEx failed");
 }
 
 void Created(IDirect3DDevice9* dev, const D3DPRESENT_PARAMETERS* pp, DWORD flags)
@@ -246,13 +207,14 @@ void Created(IDirect3DDevice9* dev, const D3DPRESENT_PARAMETERS* pp, DWORD flags
         pp ? pp->BackBufferHeight : 0, pp ? static_cast<int>(pp->BackBufferFormat) : 0, pp ? static_cast<int>(pp->AutoDepthStencilFormat) : 0,
         pp ? pp->EnableAutoDepthStencil : 0, pp ? static_cast<int>(pp->MultiSampleType) : 0, pp ? pp->Windowed : 0, static_cast<unsigned long>(flags));
     HookDevice(dev);
+    na::dx9::AttachDevice(dev, pp);
 }
 
 HRESULT WINAPI CreateDevice_h(IDirect3D9* self, UINT adapter, D3DDEVTYPE type, HWND focus, DWORD flags, D3DPRESENT_PARAMETERS* pp,
                               IDirect3DDevice9** out)
 {
     using F = HRESULT(WINAPI*)(IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS*, IDirect3DDevice9**);
-    const auto orig = reinterpret_cast<F>(OriginalFor(g_create_device, self));
+    const auto orig = g_create_device.Original<F>(self);
     if (!orig) return D3DERR_INVALIDCALL;
     MakeBorderless(pp, focus);
     const HRESULT hr = orig(self, adapter, type, focus, flags, pp, out);
@@ -265,7 +227,7 @@ HRESULT WINAPI CreateDeviceEx_h(IDirect3D9Ex* self, UINT adapter, D3DDEVTYPE typ
                                 D3DDISPLAYMODEEX* mode, IDirect3DDevice9Ex** out)
 {
     using F = HRESULT(WINAPI*)(IDirect3D9Ex*, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS*, D3DDISPLAYMODEEX*, IDirect3DDevice9Ex**);
-    const auto orig = reinterpret_cast<F>(OriginalFor(g_create_device_ex, self));
+    const auto orig = g_create_device_ex.Original<F>(self);
     if (!orig) return D3DERR_INVALIDCALL;
     if (MakeBorderless(pp, focus)) mode = nullptr; // windowed: no display mode
     const HRESULT hr = orig(self, adapter, type, focus, flags, pp, mode, out);
@@ -277,13 +239,15 @@ HRESULT WINAPI CreateDeviceEx_h(IDirect3D9Ex* self, UINT adapter, D3DDEVTYPE typ
 HRESULT WINAPI Reset_h(IDirect3DDevice9* self, D3DPRESENT_PARAMETERS* pp)
 {
     using F = HRESULT(WINAPI*)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
-    const auto orig = reinterpret_cast<F>(OriginalFor(g_reset, self));
+    const auto orig = g_reset.Original<F>(self);
     if (!orig) return D3DERR_INVALIDCALL;
     g_resets.fetch_add(1, std::memory_order_relaxed);
     D3DDEVICE_CREATION_PARAMETERS cp{};
     self->GetCreationParameters(&cp);
     MakeBorderless(pp, cp.hFocusWindow);
+    na::dx9::BeforeReset(self);
     const HRESULT hr = orig(self, pp);
+    na::dx9::AfterReset(self, pp, hr);
     Log("Reset %ux%u: 0x%08lx", pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0, static_cast<unsigned long>(hr));
     return hr;
 }
@@ -291,13 +255,15 @@ HRESULT WINAPI Reset_h(IDirect3DDevice9* self, D3DPRESENT_PARAMETERS* pp)
 HRESULT WINAPI ResetEx_h(IDirect3DDevice9Ex* self, D3DPRESENT_PARAMETERS* pp, D3DDISPLAYMODEEX* mode)
 {
     using F = HRESULT(WINAPI*)(IDirect3DDevice9Ex*, D3DPRESENT_PARAMETERS*, D3DDISPLAYMODEEX*);
-    const auto orig = reinterpret_cast<F>(OriginalFor(g_reset_ex, self));
+    const auto orig = g_reset_ex.Original<F>(self);
     if (!orig) return D3DERR_INVALIDCALL;
     g_resets.fetch_add(1, std::memory_order_relaxed);
     D3DDEVICE_CREATION_PARAMETERS cp{};
     self->GetCreationParameters(&cp);
     if (MakeBorderless(pp, cp.hFocusWindow)) mode = nullptr;
+    na::dx9::BeforeReset(self);
     const HRESULT hr = orig(self, pp, mode);
+    na::dx9::AfterReset(self, pp, hr);
     Log("ResetEx %ux%u: 0x%08lx", pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0, static_cast<unsigned long>(hr));
     return hr;
 }
@@ -392,7 +358,7 @@ extern "C" IDirect3D9* WINAPI Direct3DCreate9(UINT sdk)
     Fallback("built without d3d9on12.h");
 #endif
     if (!d3d && sys) d3d = sys(sdk);
-    if (d3d) HookMethod(g_create_device, d3d);
+    if (d3d && !HookMethod(g_create_device, d3d)) Log("hooking CreateDevice failed");
     return d3d;
 }
 
@@ -430,8 +396,7 @@ extern "C" HRESULT WINAPI Direct3DCreate9Ex(UINT sdk, IDirect3D9Ex** out)
 #endif
     if (!*out) hr = sys ? sys(sdk, out) : D3DERR_NOTAVAILABLE;
     if (SUCCEEDED(hr) && *out) {
-        HookMethod(g_create_device, *out);
-        HookMethod(g_create_device_ex, *out);
+        if (!HookMethod(g_create_device, *out) || !HookMethod(g_create_device_ex, *out)) Log("hooking CreateDevice(Ex) failed");
     }
     return hr;
 }
@@ -542,6 +507,7 @@ extern "C" int __cdecl NA_D3D9_QueryStatus(na::dx9::ProxyStatus* s)
     out.devices = g_devices.load();
     out.borderless = g_borderless.load();
     out.resets = g_resets.load();
+    out.hooks = na::dx9::GetHookStats();
     *s = out;
     return 1;
 }

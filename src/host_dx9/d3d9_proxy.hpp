@@ -4,6 +4,8 @@
 
 #include <cstdint>
 
+#include "host_dx9/dx9_hooks.hpp"
+
 namespace na::dx9 {
 
 struct ProxyStatus {
@@ -16,6 +18,7 @@ struct ProxyStatus {
     uint32_t devices;       // IDirect3D9(Ex)::CreateDevice(Ex) calls that succeeded
     uint32_t borderless;    // fullscreen requests turned into borderless windowed
     uint32_t resets;        // IDirect3DDevice9::Reset(Ex) calls seen
+    HookStats hooks;        // what the device hooks found (D3)
     char log_path[260];     // UTF-8, empty when there is no log
 };
 

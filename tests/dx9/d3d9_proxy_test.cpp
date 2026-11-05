@@ -17,7 +17,10 @@
 #include <d3d9on12.h>
 #define NA_HAVE_9ON12 1
 #endif
+#include <d3dcompiler.h>
 #include <wrl/client.h>
+
+#include <cmath>
 
 #include <cstdio>
 #include <cstring>
@@ -27,6 +30,7 @@
 #include <string>
 
 #include "host_dx9/d3d9_proxy.hpp"
+#include "providers/camera/matrix_candidates.hpp"
 
 using Microsoft::WRL::ComPtr;
 namespace fs = std::filesystem;
@@ -63,6 +67,138 @@ bool CentrePixel(IDirect3DDevice9* dev, UINT w, UINT h, DWORD* out)
     if (FAILED(sys->LockRect(&lr, nullptr, D3DLOCK_READONLY))) return false;
     *out = static_cast<const DWORD*>(lr.pBits)[(h / 2) * (lr.Pitch / 4) + w / 2] & 0x00FFFFFF;
     sys->UnlockRect();
+    return true;
+}
+
+
+// ---- D3: a small DX9 game the hooks must understand.
+// Scene: a vertex shader with per-object World x ViewProj in c0..c3 and the
+// camera's ViewProj + inverse in c8 / c12, 40 objects with depth test, into
+// its own colour texture ("post") or straight into the back buffer. Then (post)
+// a tonemap that samples the scene texture into the back buffer, then a HUD
+// with depth test off.
+using M = na::camera::Matrix;
+M Mul(const M& a, const M& b)
+{
+    M r{};
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j)
+            for (int k = 0; k < 4; ++k) r[i * 4 + j] += a[i * 4 + k] * b[k * 4 + j];
+    return r;
+}
+void Regs(const M& m, float* out)
+{
+    for (int c = 0; c < 4; ++c)
+        for (int r = 0; r < 4; ++r) out[c * 4 + r] = static_cast<float>(m[r * 4 + c]);
+}
+
+struct V3 { float x, y, z; DWORD c; };
+struct VT { float x, y, z, rhw, u, v; };
+
+ComPtr<IDirect3DVertexShader9> SceneShader(IDirect3DDevice9* dev)
+{
+    const char* src =
+        "float4x4 wvp : register(c0);\n"
+        "struct O { float4 p : POSITION; float4 c : COLOR0; };\n"
+        "O main(float3 p : POSITION, float4 c : COLOR0) { O o; o.p = mul(float4(p, 1), wvp); o.c = c; return o; }\n";
+    ComPtr<ID3DBlob> code, err;
+    if (FAILED(D3DCompile(src, std::strlen(src), "scene_vs", nullptr, nullptr, "main", "vs_2_0", 0, 0, &code, &err))) {
+        std::printf("     vs compile: %s\n", err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
+        return nullptr;
+    }
+    ComPtr<IDirect3DVertexShader9> vs;
+    dev->CreateVertexShader(static_cast<const DWORD*>(code->GetBufferPointer()), &vs);
+    return vs;
+}
+
+bool RunGame(IDirect3DDevice9* dev, PFN_Status status, bool post, UINT w, UINT h)
+{
+    ComPtr<IDirect3DVertexShader9> vs = SceneShader(dev);
+    ComPtr<IDirect3DVertexDeclaration9> decl;
+    const D3DVERTEXELEMENT9 el[] = {{0, 0, D3DDECLTYPE_FLOAT3, 0, D3DDECLUSAGE_POSITION, 0},
+                                    {0, 12, D3DDECLTYPE_D3DCOLOR, 0, D3DDECLUSAGE_COLOR, 0},
+                                    D3DDECL_END()};
+    dev->CreateVertexDeclaration(el, &decl);
+    if (!vs || !decl) { Check(false, "game: shader + declaration"); return false; }
+    ComPtr<IDirect3DTexture9> scene;
+    ComPtr<IDirect3DSurface9> scene_rt, depth, back, auto_depth;
+    if (post) {
+        dev->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &scene, nullptr);
+        if (!scene) dev->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &scene, nullptr);
+        if (scene) scene->GetSurfaceLevel(0, &scene_rt);
+        dev->CreateDepthStencilSurface(w, h, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, 0, TRUE, &depth, nullptr);
+        if (!scene_rt || !depth) { Check(false, "game: scene target + depth"); return false; }
+    }
+    dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back);
+    dev->GetDepthStencilSurface(&auto_depth);
+    if (!post) depth = auto_depth;
+
+    const V3 tri[] = {{-1, -1, 0, 0xff8040ff}, {0, 1, 0, 0xff40ff80}, {1, -1, 0, 0xffff4080}};
+    const float sw = static_cast<float>(w), sh = static_cast<float>(h);
+    const VT quad[] = {{0, 0, 0, 1, 0, 0}, {sw, 0, 0, 1, 1, 0}, {0, sh, 0, 1, 0, 1}, {sw, sh, 0, 1, 1, 1}};
+    const VT hud[] = {{8, 8, 0, 1, 0, 0}, {64, 8, 0, 1, 1, 0}, {8, 24, 0, 1, 0, 1}, {64, 24, 0, 1, 1, 1}};
+
+    for (int frame = 0; frame < 8; ++frame) {
+        const double ys = 1.0 / std::tan(0.5), xs = ys * sh / sw, q = 1000.0 / (1000.0 - 0.1);
+        const M proj{xs, 0, 0, 0, 0, ys, 0, 0, 0, 0, q, 1, 0, 0, -0.1 * q, 0};
+        const double a = 0.02 * frame, c = std::cos(a), s = std::sin(a);
+        M world_cam = Mul(M{c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0, 0, 0, 0, 1}, M{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0.1 * frame, 2, -20, 1});
+        M view{}, inv{};
+        na::camera::Invert(world_cam, view);
+        const M vp = Mul(view, proj);
+        na::camera::Invert(vp, inv);
+
+        dev->BeginScene();
+        dev->SetRenderTarget(0, post ? scene_rt.Get() : back.Get());
+        dev->SetDepthStencilSurface(depth.Get());
+        dev->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+        dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+        dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, D3DCOLOR_XRGB(20, 30, 60), 1.f, 0);
+        dev->SetVertexShader(vs.Get());
+        dev->SetVertexDeclaration(decl.Get());
+        dev->SetTexture(0, nullptr);
+        float r[16];
+        Regs(vp, r);
+        dev->SetVertexShaderConstantF(8, r, 4);
+        Regs(inv, r);
+        dev->SetVertexShaderConstantF(12, r, 4);
+        for (int i = 0; i < 40; ++i) {
+            const M world{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, (i % 8) * 2.5 - 9, (i / 8) * 2.0 - 4, (i % 5) * 1.0, 1};
+            Regs(Mul(world, vp), r);
+            dev->SetVertexShaderConstantF(0, r, 4);
+            dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, tri, sizeof(V3));
+        }
+        dev->SetVertexShader(nullptr);
+        dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+        if (post) {
+            // Tonemap: sample the scene into the back buffer.
+            dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+            dev->SetRenderTarget(0, back.Get());
+            dev->SetDepthStencilSurface(nullptr);
+            dev->SetTexture(0, scene.Get());
+            dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(VT));
+            dev->SetTexture(0, nullptr);
+        }
+        // HUD: depth test off.
+        dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+        dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, hud, sizeof(VT));
+        dev->EndScene();
+        dev->Present(nullptr, nullptr, nullptr, nullptr);
+    }
+    dev->SetDepthStencilSurface(auto_depth.Get());
+    dev->SetRenderTarget(0, back.Get());
+
+    const auto st = Status(status);
+    const auto& k = st.hooks;
+    std::printf("     %s game: frames %u selected %u colour %ux%u fmt %u depth fmt %u, point %u, fired read %u hud %u present %u, camera %u (source %u, c%u), scene draws %u of %u\n",
+                post ? "post" : "back-buffer", k.frames, k.selected, k.color_w, k.color_h, k.color_format, k.depth_format, k.point_kind,
+                k.fired_read, k.fired_hud, k.fired_present, k.camera_found, k.camera_source, k.camera_register, k.scene_draws, k.draws);
+    Check(k.selected && k.color_w == w && k.color_h == h, post ? "post game: scene colour + depth picked" : "back-buffer game: back buffer + depth picked");
+    Check(k.camera_found && k.camera_source == 1 && k.camera_register == 8, "camera found in the shader constants at c8");
+    Check(k.scene_draws == 40, "the 40 objects are the scene draws (HUD and tonemap are not)");
+    if (post) Check(k.point_kind == 1 && k.fired_read >= 1, "post game: DLSS point before the tonemap's read of the scene");
+    else Check(k.point_kind == 2 && k.fired_hud >= 1, "back-buffer game: DLSS point before the HUD (HUD rule)");
     return true;
 }
 
@@ -200,8 +336,16 @@ int main(int argc, char** argv)
     const HRESULT rr = dev->Reset(&pp);
     Check(SUCCEEDED(rr), "Reset succeeds");
     if (SUCCEEDED(rr)) frame(D3DCOLOR_XRGB(200, 20, 90), "a frame after Reset reads back");
+    if (on && SUCCEEDED(rr)) {
+        // Two games on the same device: post-processing, then scene-in-back-buffer
+        // (a Reset in between, as a game does on a settings change).
+        RunGame(dev.Get(), status, true, pp.BackBufferWidth, pp.BackBufferHeight);
+        pp = asked;
+        Check(SUCCEEDED(dev->Reset(&pp)), "second Reset");
+        RunGame(dev.Get(), status, false, pp.BackBufferWidth, pp.BackBufferHeight);
+    }
     const auto s2 = Status(status);
-    if (on) Check(s2.resets == 1 && s2.borderless == 2, "Reset seen and kept borderless");
+    if (on) Check(s2.resets == 2 && s2.borderless == 3, "Resets seen and kept borderless");
     else Check(s2.resets == 0, "proxy is off: Reset not hooked");
 
     dev.Reset();
