@@ -1069,7 +1069,7 @@ void note_descriptor_copy(uint64_t dst, uint64_t src, uint32_t count, uint32_t i
 {
     while (count) {
         na_ev_descriptor_copy e;
-        const bool want = init_header_wanted(e, NA_EV_DESCRIPTOR_COPY, 0);
+        const bool emit_it = init_header_wanted(e, NA_EV_DESCRIPTOR_COPY, 0);
         uint32_t run = 0;
         bool resolved = false, striped = false;
         {
@@ -1151,7 +1151,7 @@ void note_descriptor_copy(uint64_t dst, uint64_t src, uint32_t count, uint32_t i
             e.slot_count = run;
         }
         g_c.copies.fetch_add(1);
-        if (want) emit(e, NA_GROUP_DESCRIPTOR);
+        if (emit_it) emit(e, NA_GROUP_DESCRIPTOR);
         count -= run;
         dst += static_cast<uint64_t>(run) * increment;
         src += static_cast<uint64_t>(run) * increment;
