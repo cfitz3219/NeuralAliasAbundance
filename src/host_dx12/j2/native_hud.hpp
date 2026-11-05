@@ -74,6 +74,7 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
                ID3D12CommandQueue* queue = nullptr);
 
 struct Stats {
+    uint32_t last_present_native=0;
     uint64_t proof_tested=0,proof_matched=0,native_partial=0;
     float proof_maximum_error=0;
     uint64_t frames = 0, hud_frames = 0;    // frames presented while learned / with a HUD layer

@@ -1394,6 +1394,7 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
     struct FinishLayers {~FinishLayers(){if(g_layer_owner&&std::none_of(std::begin(g_proxy),std::end(g_proxy),[](const auto& p){return p.preserve&&p.picture;})){
         g_layer_owner->layers=std::move(g_l);g_layer_owner.reset();g_layers_cleared=false;
     }}} finish_layers;
+    g_stats.last_present_native=0;
     ++g_frame;
     if (g_tracing.load(std::memory_order_relaxed)) { // the traced frame is complete
         g_tracing.store(false);
@@ -1448,12 +1449,14 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
         const bool ready=g_on.load()&&queue&&layers.n[0]&&layers.n[1]&&layers.w==ow&&layers.h==oh&&
             std::all_of(capture->uses.begin(),capture->uses.end(),ready_use)&&std::all_of(capture->owner->uses.begin(),capture->owner->uses.end(),ready_use);
         if(ready&&out){
+            g_stats.last_present_native=capture->clean?1u:0u;
             out->n0=layers.n[0].Get();out->n1=layers.n[1].Get();out->view=capture->view;
             out->grey=GreyFor(capture->view);out->srgb=is_srgb(capture->view);out->owner=capture->owner;
             out->picture=capture->picture;out->clean_allowed=capture->clean;
             ++g_stats.hud_frames;++g_stats.upstream_frames;
             if(capture->clean)++g_stats.draw_transfer_frames;else++g_stats.draw_protect_frames;
             if(capture->replay&&capture->replay->submitted&&capture->replay->queue.Get()==queue){
+                g_stats.last_present_native=1;
                 out->picture=capture->replay->picture;out->native_picture=capture->replay->tail?capture->replay->tail_native.Get():capture->replay->native.Get();
                 out->native_check=capture->replay->tail?capture->replay->tail_check.Get():capture->replay->check.Get();out->native_owner=capture;out->owner=capture;
                 if(capture->replay->world_source)out->reconstruction=capture->replay->world_picture;
@@ -1553,6 +1556,7 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
         u->depth_draws = u->blended = u->covered = u->world = u->masks = 0;
     }
     if (hud && out) {
+        if(!observational)g_stats.last_present_native=1;
         out->n0 = g_l.n[0].Get();
         out->n1 = g_l.n[1].Get();
         out->view = p->view;
@@ -1667,9 +1671,10 @@ void AfterSubmission(ID3D12CommandQueue* queue,uint32_t count,ID3D12CommandList*
 }
 void ReportNativePictureResult(bool identity,uint32_t tested,uint32_t matched,float error){
     std::lock_guard<std::mutex> lock(g_m);
-    if(tested){g_stats.proof_tested=tested;g_stats.proof_matched=matched;g_stats.proof_maximum_error=error;if(matched&&!identity)++g_stats.native_partial;}
-    if(identity)++g_stats.native_verified;else++g_stats.native_rejected;
-    g_stats.last_draw_method=identity?4u:5u;
+    if(tested){g_stats.proof_tested=tested;g_stats.proof_matched=matched;g_stats.proof_maximum_error=error;}
+    const bool partial=!identity&&tested&&matched;
+    if(identity)++g_stats.native_verified;else if(partial)++g_stats.native_partial;else++g_stats.native_rejected;
+    g_stats.last_draw_method=identity?4u:partial?6u:5u;
 }
 void ReportCanvasProbe(uint64_t source,uint64_t generation,bool identity,uint32_t tested,uint32_t matched,float error)
 {
