@@ -335,6 +335,8 @@ add_subdirectory(tests/bridge)  # Claude: DX11 bridge (portable record test + DX
 add_subdirectory(tests/host_dx11) # Claude: DX11 hooks (portable frame model + a synthetic DX11 game)
 include(src/host_vk/host_vk.cmake) # Claude: Vulkan layer (NeuralAliasVulkan.dll + manifest)
 add_subdirectory(tests/host_vk)    # Claude: Vulkan layer on a synthetic Vulkan game (where a loader exists)
+set(NA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
+include(src/host_dx9/host_dx9.cmake)  # Claude: DX9 d3d9.dll proxy (D3D9On12); 32-bit copy in win32/
 add_subdirectory(tests/dx9)        # Claude: DX9 via D3D9On12 (D0 probe; 32-bit copy built separately in CI)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/CMakeLists.txt")
   add_subdirectory(tools)       # Claude (C5): nr_replay (local-only, needs SDK lib)

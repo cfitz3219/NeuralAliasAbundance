@@ -68,4 +68,5 @@ if(WIN32)
   add_test(NAME minhook_hooks_32 COMMAND minhook32_test)
 endif()
 
+include("${NA_ROOT}/src/host_dx9/host_dx9.cmake")
 add_subdirectory("${NA_ROOT}/tests/dx9" tests_dx9)
