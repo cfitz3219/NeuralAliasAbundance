@@ -12,9 +12,46 @@
 #include <d3d12sdklayers.h>
 #include <cmath>
 #include <algorithm>
+#include <atomic>
+#include <array>
+#include <thread>
 namespace {
 using namespace na::scale;
 void __cdecl sink(const na_event_batch*, void*) {}
+int ConcurrentDescriptors(ID3D12Device* dev){
+    constexpr unsigned workers=4,rounds=2000;
+    auto a=test::CreateTexture(dev,8,8,DXGI_FORMAT_R32_TYPELESS,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_FLAG_NONE);
+    auto b=test::CreateTexture(dev,8,8,DXGI_FORMAT_R32_TYPELESS,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_FLAG_NONE);
+    REQUIRE(a&&b);const uint64_t ids[]{na::observe::IdOf(a.Get()),na::observe::IdOf(b.Get())};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,workers*64,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
+    test::ComPtr<ID3D12DescriptorHeap> src,dst;REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&src))));
+    REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&dst))));
+    const auto inc=dev->GetDescriptorHandleIncrementSize(hd.Type);const auto sh=src->GetCPUDescriptorHandleForHeapStart(),dh=dst->GetCPUDescriptorHandleForHeapStart();
+    const auto write=[&](unsigned worker,unsigned which){D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Format=which?DXGI_FORMAT_R32_UINT:DXGI_FORMAT_R32_FLOAT;view.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;view.Texture2D.MipLevels=1;
+        dev->CreateShaderResourceView(which?b.Get():a.Get(),&view,{sh.ptr+SIZE_T(worker*64)*inc});
+        dev->CopyDescriptorsSimple(1,{dh.ptr+SIZE_T(worker*64)*inc},{sh.ptr+SIZE_T(worker*64)*inc},hd.Type);};
+    for(unsigned t=0;t<workers;++t)write(t,0);
+    std::atomic<bool> start{false};std::atomic<unsigned> remaining{workers};std::array<std::thread,workers> threads;
+    for(unsigned t=0;t<workers;++t)threads[t]=std::thread([&,t]{while(!start.load())std::this_thread::yield();
+        for(unsigned n=0;n<rounds;++n)write(t,n&1u);--remaining;});
+    unsigned errors=0,observed=0;uint64_t last[2][workers]{};start=true;
+    do{for(unsigned h=0;h<2;++h)for(unsigned t=0;t<workers;++t){na::observe::OperationDescriptor op;
+        const bool ok=na::observe::NativeDescriptor({(h?dh:sh).ptr+SIZE_T(t*64)*inc},op);
+        if(!ok){++errors;continue;}++observed;
+        const bool first=op.view.resource==ids[0];
+        if((!first&&op.view.resource!=ids[1])||op.resource.Get()!=(first?a.Get():b.Get())||
+            op.view.kind!=NA_DESC_SRV||op.view.srv.Format!=(first?DXGI_FORMAT_R32_FLOAT:DXGI_FORMAT_R32_UINT)||op.version<last[h][t])++errors;
+        last[h][t]=op.version;
+    }}while(remaining.load());
+    for(auto& thread:threads)thread.join();
+    std::printf("concurrent descriptor snapshots=%u errors=%u\n",observed,errors);CHECK(observed>0&&errors==0);
+    for(unsigned t=0;t<workers;++t)for(auto handle:{sh,dh}){na::observe::OperationDescriptor op;
+        CHECK(na::observe::NativeDescriptor({handle.ptr+SIZE_T(t*64)*inc},op));
+        CHECK(op.view.resource==ids[1]&&op.view.srv.Format==DXGI_FORMAT_R32_UINT&&op.version==rounds+1);}
+    return 0;
+}
 class HeapLifetime final:public IUnknown {
     ULONG refs_=1;unsigned& destroyed_;
 public:
@@ -373,7 +410,7 @@ RWTexture2D<float4> target:register(u0);Texture2D<float> image:register(t0);Samp
     REQUIRE(SUCCEEDED(list->Reset(fresh.Get(),nullptr)));REQUIRE(SUCCEEDED(list->Close()));na::nr::native::Maintain();CHECK(!lifetime.expired());
     gate->Signal(1);d.WaitIdle();na::nr::native::Maintain();CHECK(lifetime.expired());
     reduced_rb.Check(rw,rh,rw,rh);native_rb.Check(w,h,w,h);
-    REQUIRE(ArenaRetirement(dev)==0);REQUIRE(Raster(d)==0);
+    REQUIRE(ArenaRetirement(dev)==0);REQUIRE(ConcurrentDescriptors(dev)==0);REQUIRE(Raster(d)==0);
     for(int mode=1;mode<=3;++mode)REQUIRE(Raster(d,mode)==0);
     for(int mode=1;mode<=3;++mode)REQUIRE(Raster(d,mode,true)==0);
     na::observe::SetShaderOperationHook(na::observe::ShaderLane::Bindings,{});na_observe_stop();
