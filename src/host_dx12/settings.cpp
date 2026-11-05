@@ -354,7 +354,7 @@ bool SaveFromWorker()
         {L"tone",g_settings.donut_tone.load()},
         {L"bloom",g_settings.donut_bloom.load()},
         {L"amount",g_settings.donut_amount.load()},
-        {L"exposure",g_settings.donut_bias.load()} // was "bias" (absolute exposure, default -0.5 stops) until 2026-11-05,
+        {L"exposure",g_settings.donut_bias.load()}, /* was "bias" (absolute exposure, default -0.5 stops) until 2026-11-05 */
         {L"white",g_settings.donut_white.load()},
         {L"speed_up",g_settings.donut_speed_up.load()},
         {L"speed_down",g_settings.donut_speed_down.load()},
