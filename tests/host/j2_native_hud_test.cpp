@@ -572,12 +572,12 @@ int canvas_probe(test::Device& d)
     return 0;
 }
 
-int draw_handoff(test::Device& d,bool unresolved=false,bool native=false,bool dxil=false,bool split=false)
+int draw_handoff(test::Device& d,bool unresolved=false,bool native=false,bool dxil=false,bool split=false,bool typeless=false)
 {
     auto* dev=d.device.Get();
     const auto initial_stats=nh::GetStats();constexpr UINT W=64,H=32,OW=128,OH=64;constexpr auto F=DXGI_FORMAT_R8G8B8A8_UNORM;
     constexpr auto R=D3D12_RESOURCE_STATE_RENDER_TARGET,S=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,U=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    auto upstream=test::CreateTexture(dev,W,H,F,R,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    auto upstream=test::CreateTexture(dev,W,H,typeless?DXGI_FORMAT_R8G8B8A8_TYPELESS:F,R,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     auto target=test::CreateTexture(dev,W,H,F,R,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     auto stale=test::CreateTexture(dev,W,H,F,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_FLAG_NONE);
     auto target2=test::CreateTexture(dev,W,H,F,R,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
@@ -586,7 +586,8 @@ int draw_handoff(test::Device& d,bool unresolved=false,bool native=false,bool dx
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,3,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};ComPtr<ID3D12DescriptorHeap> rtvs,heap;
     REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&rtvs))));
     const UINT ri=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);auto a=rtvs->GetCPUDescriptorHandleForHeapStart(),b=a;b.ptr+=ri;
-    dev->CreateRenderTargetView(upstream.Get(),nullptr,a);dev->CreateRenderTargetView(target.Get(),nullptr,b);
+    D3D12_RENDER_TARGET_VIEW_DESC actualView{};actualView.Format=F;actualView.ViewDimension=D3D12_RTV_DIMENSION_TEXTURE2D;
+    dev->CreateRenderTargetView(upstream.Get(),&actualView,a);dev->CreateRenderTargetView(target.Get(),nullptr,b);
     auto b2=b;b2.ptr+=ri;dev->CreateRenderTargetView(target2.Get(),nullptr,b2);
     hd={D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,32,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&heap))));
     auto cpu=heap->GetCPUDescriptorHandleForHeapStart();const UINT inc=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -1105,7 +1106,7 @@ int end_to_end(test::Device& d)
         CHECK(std::abs(at(px, RW, 24, 12, 0) - 51) <= 1);   // the back buffer got the scene only
     }
     if(source_lineage(d)||draw_handoff(d)||draw_handoff(d,true))return 1;
-    if(draw_handoff(d,true,true,false,true))return 1;
+    if(draw_handoff(d,true,true,false,true)||draw_handoff(d,true,true,false,true,true))return 1;
     for(int resize=0;resize<5;++resize)if(draw_handoff(d,true,true))return 1;
 #ifdef NA_HUD_DXIL_FIXTURE
     if(draw_handoff(d,true,true,true))return 1;

@@ -128,7 +128,7 @@ struct Picture::Impl {
  UINT descriptor_page=0; // pre-HUD work and final Present may both be in flight
  struct K {UINT w,h,ow,oh,flags;float grey,tolerance;UINT pad;} constants{};
  bool snapshot(ID3D12GraphicsCommandList* l,ID3D12Resource* src,D3D12_RESOURCE_STATES state,ComPtr<ID3D12Resource>& dst,bool& ready){
-  if(!l||!src)return false;auto d=src->GetDesc();if(d.Width!=w||d.Height!=h||d.Format!=source_format||d.MipLevels!=1||d.DepthOrArraySize!=1||d.SampleDesc.Count!=1)return false;
+  if(!l||!src)return false;auto d=src->GetDesc();if(d.Width!=w||d.Height!=h||(TypelessOf(d.Format)==DXGI_FORMAT_UNKNOWN||TypelessOf(d.Format)!=TypelessOf(source_format))||d.MipLevels!=1||d.DepthOrArraySize!=1||d.SampleDesc.Count!=1)return false;
   move(l,src,state,CS);if(ready)move(l,dst.Get(),S,CD);l->CopyResource(dst.Get(),src);move(l,src,CS,state);move(l,dst.Get(),CD,S);ready=true;return true;
  }
  void bind(ID3D12GraphicsCommandList* l,UINT pass,ID3D12Resource* pic,DXGI_FORMAT pf){

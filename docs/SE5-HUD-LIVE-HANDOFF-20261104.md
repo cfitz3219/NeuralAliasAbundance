@@ -29,3 +29,11 @@ Microsoft primary references consulted:
 - https://learn.microsoft.com/en-us/windows/win32/api/dxcapi/nf-dxcapi-idxcutils-createreflection (standard reflection API considered; no runtime DXC added)
 
 Full combined-suite/package receipt follows in COMMS/WORKLOG after integration. No game launch, installation or visual success is claimed by this document.
+
+## Final live-format and validation receipt
+
+The saved game's HUD draw trace uses canvas13565 at1720x706, allocation format27 (R8G8B8A8_TYPELESS), typed RTV28, depth target0 and depth disabled, with ordinary blended6/12/54vertex draws. Those IDs describe this captured run only and are not code/profile constants. The source/final allocation equality check would have rejected a compatible typed final snapshot in the new finishing path. Snapshot copies now use the actual DXGI type family, as permitted by Microsoft's CopyResource contract, while retaining exact dimensions/mips/array/sample constraints. Added a typeless-source/typed-final two-list native replay case, including changed finishing processing and original query counts. It passes with zero debug-layer errors.
+
+Full combined Release build and200-case CTest at f257ffc:195passed,5skipped,0failed,376.95s. Skips: optional NR runtime probe, three unsupported16xMSAA cases, optional upscaler jitter. After the final compatible-format change: full Release rebuild and7/7 affected regressions pass17.08s (viewport raster jitter, AMD flow, GPU camera fit, scoped bindings, production deferred pre-HUD callback, expanded native HUD, hidden fullscreen/resize). This is not a claim that a second full200-case suite ran after the format change. Logs: local/se5-hud-live-20261104/{combined-release-build,combined-release-tests,final-release-build,final-affected-tests}.log. Existing user-confirmed jitter math/flow changes remain byte-identical to the installed baseline; host observer also includes Opus's c1b3ed2 performance increments. No game launch/control/install occurred.
+
+CopyResource primary contract: https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist-copyresource
