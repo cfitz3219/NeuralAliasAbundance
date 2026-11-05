@@ -1167,8 +1167,8 @@ void write_status_line()
                 (unsigned long long)j2.labelled_frames, (unsigned long long)j2.unlabelled_frames, (unsigned long long)j2.expired_inline,
                 (unsigned long long)j2.between_observed, (unsigned long long)j2.between_predicted, j2.class_note);
             if (na2 > 0) WriteFile(f, al, static_cast<DWORD>((std::min)(na2, static_cast<int>(sizeof al - 1))), &written, nullptr);
-            const int en=snprintf(al,sizeof al,"j2_entry keys=%u matched=%llu source=actual_operation rejected{new=%llu learning=%llu middle=%llu}\r\n",j2.entry_keys,(unsigned long long)j2.entry_matched,
-                (unsigned long long)j2.entry_unknown,(unsigned long long)j2.entry_learning,(unsigned long long)j2.entry_middle);
+            const int en=snprintf(al,sizeof al,"j2_entry keys=%u matched=%llu source=actual_operation rejected{new=%llu learning=%llu middle=%llu} rescued_by_boundary=%llu\r\n",j2.entry_keys,(unsigned long long)j2.entry_matched,
+                (unsigned long long)j2.entry_unknown,(unsigned long long)j2.entry_learning,(unsigned long long)j2.entry_middle,(unsigned long long)j2.entry_rescued);
             if(en>0)WriteFile(f,al,static_cast<DWORD>(en),&written,nullptr);
             {
                 // Burst diagnosis (2026-11-05): every distinct reason given, with counts, and

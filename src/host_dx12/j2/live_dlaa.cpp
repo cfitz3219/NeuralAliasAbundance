@@ -2766,7 +2766,20 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
                     (unsigned long long)entry->destination,static_cast<unsigned>(entry->op),
                     (unsigned long long)entry->recording,(unsigned long long)entry->operation,entry->barrier);
             ++g.frame_rejects;
-            return;
+            // Rescue (SE5 2026-11-05: every ~40 s the game merges its last two command lists for
+            // a few seconds; the terminal entry is then an operation the profile has seen
+            // mid-scene, so every entry is refused and ~40% of frames lose DLAA). The learned
+            // scene boundary (same final writer, same occurrence, destination and pipeline) is
+            // the same in both shapes: when it matches HERE, the scene is complete at this
+            // operation, so the boundary matcher below places DLAA as it did before entries.
+            const bool boundary=learned.decision.final_candidate && learned.color==color_id && learned.depth==depth_id &&
+                (learned.decision.final_transition && learned.decision.boundary_writer
+                     ? current.boundary_writer==learned.decision.boundary_writer && current.writer_occurrence==learned.decision.writer_occurrence
+                     : learned.decision.final_transition ? current.final_transition==learned.decision.final_transition
+                                                         : current.candidates==learned.decision.final_candidate) &&
+                current.destination==learned.decision.destination && current.pipeline==learned.decision.pipeline;
+            if(!boundary || g.inl.valid)return;
+            ++g.stats.entry_rescued;
         }
     } else {
         const auto live = na::observe::ListLiveConsumer(l, color_id);
