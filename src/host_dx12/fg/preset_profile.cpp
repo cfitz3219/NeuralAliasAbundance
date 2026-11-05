@@ -275,7 +275,7 @@ bool aniso_backup_path(wchar_t (&out)[MAX_PATH]) {
 }
 // One DRS session: read the effective selector/level for this executable and optionally
 // write (job 1: selector APP, saving the previous values first; job 2: put them back).
-int32_t aniso_session(int job, AnisoOverride& out) {
+int32_t aniso_session(int job, AnisoOverride& out, const wchar_t* exe_override = nullptr, const wchar_t* backup_override = nullptr) {
     out.available = false;
     if (!load_api()) return NVAPI_ERROR;
     using GetGlobal = NvAPI_Status(__cdecl*)(NvDRSSessionHandle, NvDRSProfileHandle*);
@@ -287,7 +287,8 @@ int32_t aniso_session(int job, AnisoOverride& out) {
     if (r != NVAPI_OK) return r;
     r = load(session);
     if (r == NVAPI_OK) {
-        NvAPI_UnicodeString exe{}; exe_name(exe);
+        NvAPI_UnicodeString exe{};
+        if (exe_override) wcscpy_s(reinterpret_cast<wchar_t*>(exe), NVAPI_UNICODE_STRING_MAX, exe_override); else exe_name(exe);
         NvDRSProfileHandle app_profile = nullptr, global = nullptr;
         NVDRS_APPLICATION app{}; app.version = NVDRS_APPLICATION_VER;
         if (find(session, exe, &app_profile, &app) != NVAPI_OK) app_profile = nullptr;
@@ -303,7 +304,8 @@ int32_t aniso_session(int job, AnisoOverride& out) {
             out.selector = has_sel ? sel.u32CurrentValue : ANISO_MODE_SELECTOR_DEFAULT;
             out.level = has_lvl ? lvl.u32CurrentValue : ANISO_MODE_LEVEL_DEFAULT;
             wchar_t backup[MAX_PATH]{};
-            if (job && app_profile && aniso_backup_path(backup)) {
+            if (backup_override) wcsncpy_s(backup, backup_override, _TRUNCATE);
+            if (job && app_profile && (backup_override || aniso_backup_path(backup))) {
                 if (job == 1) {
                     // Save once what the profile held itself (user value), so restore is exact.
                     if (GetFileAttributesW(backup) == INVALID_FILE_ATTRIBUTES) {
@@ -390,8 +392,18 @@ void RequestRestoreAniso() { aniso_queue(2); }
 #ifdef NA_PROFILE_CLI
 int wmain(int argc, wchar_t** argv) {
     // Read-only status; installer apply/rollback share the runtime's exact DRS path.
-    if (argc < 3 || argc > 5) { fwprintf(stderr, L"Usage: NAProfile status|apply|restore exe [backup.ini] [1|2|3]\n"); return 2; }
+    if (argc < 3 || argc > 5) { fwprintf(stderr, L"Usage: NAProfile status|apply|restore exe [backup.ini] [1|2|3]\n       NAProfile af-status|af-app|af-restore exe [backup.ini]\n"); return 2; }
     using namespace na::fg::preset;
+    // Anisotropic-filtering override (driver AF forced over the game): installer path, so the
+    // profile is application-controlled before the game starts (no restart needed).
+    if (!_wcsnicmp(argv[1], L"af-", 3)) {
+        const int job = !_wcsicmp(argv[1], L"af-app") ? 1 : !_wcsicmp(argv[1], L"af-restore") ? 2 : !_wcsicmp(argv[1], L"af-status") ? 0 : -1;
+        if (job < 0 || (job && argc < 4) || wcslen(argv[2]) >= MAX_PATH || wcschr(argv[2], L'\\') || wcschr(argv[2], L'/')) return 2;
+        AnisoOverride a{};
+        const int32_t r = aniso_session(job, a, argv[2], job ? argv[3] : nullptr);
+        wprintf(L"exe=%s result=%d available=%u app_profile=%u selector=%u level=%u\n", argv[2], r, a.available ? 1u : 0u, a.app_profile ? 1u : 0u, a.selector, a.level);
+        return r == NVAPI_OK ? 0 : 1;
+    }
     const bool read = !_wcsicmp(argv[1], L"status");
     const bool restore = !_wcsicmp(argv[1], L"restore");
     if (!read && !restore && _wcsicmp(argv[1], L"apply")) return 2;
