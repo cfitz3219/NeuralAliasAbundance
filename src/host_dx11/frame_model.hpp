@@ -402,7 +402,7 @@ private:
     }
 
     struct PairHash {
-        size_t operator()(const std::pair<Id, Id>& p) const { return std::hash<Id>()(p.first) ^ (std::hash<Id>()(p.second) * 1099511628211ull); }
+        size_t operator()(const std::pair<Id, Id>& p) const { return std::hash<Id>()(p.first) ^ static_cast<size_t>(std::hash<Id>()(p.second) * 1099511628211ull); }
     };
     struct CbHash {
         size_t operator()(const std::pair<Id, int>& p) const { return std::hash<Id>()(p.first) ^ (size_t(p.second) * 2654435761u); }
