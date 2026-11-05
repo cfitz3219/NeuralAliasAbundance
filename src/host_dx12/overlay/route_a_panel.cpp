@@ -1262,11 +1262,11 @@ void DrawLiveDlaaEnhancements()
             ImGui::PopTextWrapPos();
         };
         if (driver_forces && drv.ForcedNow())
-            warn("Set Anisotropic filtering to \"Application-controlled\" in your graphics driver's settings (NVIDIA Control Panel > Manage 3D settings, for this game or globally). The driver is replacing the texture filtering, so this choice has no effect and is unavailable.");
+            warn("Set Anisotropic filtering to \"Application-controlled\" in your graphics driver controls. The driver is replacing the texture filtering, so this choice has no effect and is unavailable.");
         else if (driver_forces)
             warn("The graphics driver is now set to application-controlled filtering. It reads that setting when the game starts: start the game once more and this choice becomes available.");
         else if (!drv.available)
-            Hint("The graphics driver's own filtering override can't be read on this GPU. If this choice makes no difference, set Anisotropic filtering to application-controlled in your graphics driver's settings (for example AMD Software: Adrenalin Edition or Intel Graphics Software).");
+            Hint("If this choice makes no difference, set Anisotropic filtering to \"Application-controlled\" in your graphics driver controls.");
         const auto as = na::observe::GetAnisoStats();
         char tb[240];
         const auto ml2 = na::observe::GetMipLiveStats();
