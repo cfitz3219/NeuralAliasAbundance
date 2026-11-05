@@ -283,6 +283,7 @@ struct MipLiveStats {
     uint64_t prepare_done = 0, prepare_total = 0; // objects of the last background preparation
     uint64_t live_static_changed = 0;   // static samplers changed in the twins of the variant in use
     uint64_t twin_root_signatures = 0, twin_pipelines = 0, untwinned_pipelines = 0, fallbacks = 0, twin_failures = 0;
+    uint64_t shared_skips = 0; // twins D3D12 returned as one of the game's own root signatures (identical bytes): not kept
 };
 MipLiveStats GetMipLiveStats();
 float SamplerMipBias();

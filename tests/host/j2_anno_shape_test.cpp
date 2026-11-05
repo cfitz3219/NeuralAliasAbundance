@@ -394,8 +394,14 @@ int main(int argc, char** argv)
             const auto m1 = na::observe::GetMipLiveStats();
             std::printf("mip live: root twins %llu pipeline twins %llu failures %llu\n", (unsigned long long)(m1.twin_root_signatures - m0.twin_root_signatures),
                         (unsigned long long)(m1.twin_pipelines - m0.twin_pipelines), (unsigned long long)m1.twin_failures);
-            CHECK(m1.twin_root_signatures == m0.twin_root_signatures + 2); // levels 0 and -0.5 (the game's is -1)
-            CHECK(m1.twin_pipelines == m0.twin_pipelines + 2);
+            // Levels -0.5 and -1 (the game's own objects are never changed now). The -1 twin has the
+            // same bytes as `rs` above (created with live switching off, so biased to -1 in place):
+            // D3D12 returns that object, which is the game's, so it is not kept (a shared skip) and
+            // its pipeline twin is not built either.
+            const uint64_t skips = m1.shared_skips - m0.shared_skips;
+            CHECK(m1.twin_root_signatures + skips == m0.twin_root_signatures + 2);
+            CHECK(m1.twin_pipelines + skips == m0.twin_pipelines + 2);
+            CHECK(skips == 1);
             CHECK(m1.twin_failures == 0);
             na::observe::SetSamplerMipBiasLive(-0.5f);
             CHECK(na::observe::SamplerMipBias() == -0.5f);

@@ -6727,6 +6727,7 @@ MipLiveStats GetMipLiveStats()
     m.untwinned_pipelines = g_mip_untwinned.load(std::memory_order_relaxed);
     m.fallbacks = g_mip_fallbacks.load(std::memory_order_relaxed);
     m.twin_failures = g_mip_twin_fail.load(std::memory_order_relaxed);
+    m.shared_skips = g_mip_shared_skips.load(std::memory_order_relaxed);
     return m;
 }
 void NativeMipBiases(NativeBiasStats* s)
