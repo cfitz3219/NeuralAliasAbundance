@@ -1242,17 +1242,37 @@ void DrawLiveDlaaEnhancements()
         int idx = 0;
         for (int i = 0; i < 4; ++i) if (kAnisoLevel[i] == cur) idx = i;
         BeginRow("Anisotropic filtering", "Raises eligible linear texture filtering to 4x, 8x or 16x, improving detail at steep angles before DLSS, including textures that use clamp addressing. Off restores the game's own filtering, which may already be 16x. Point, comparison and min/max samplers keep their filtering. A new level prepares in the background; the status below shows which level is active. Remembered for this game.", S(220));
+        // Graphics driver check (Cort 2026-11-05): a driver-level texture-filtering override
+        // replaces every sampler the game or we choose, so the choice is greyed out while it
+        // is in force and enabled when the driver leaves filtering to the application.
+        const auto drv = na::fg::preset::GetAnisoOverride();
+        const bool driver_forces = drv.ForcedThisRun();
         ImGui::SetNextItemWidth(S(220));
+        ImGui::BeginDisabled(driver_forces);
         if (ImGui::Combo("##aniso", &idx, kAniso, 4)) {
             ss.aniso16.store(kAnisoLevel[idx]);
             na::observe::SetSamplerAnisotropy(kAnisoLevel[idx]);
             na::settings::Save();
         }
+        ImGui::EndDisabled();
         EndRow();
+        const auto warn = [](const char* text) {
+            ImGui::PushTextWrapPos(0.f);
+            StatusLine(2, text);
+            ImGui::PopTextWrapPos();
+        };
+        if (driver_forces && drv.ForcedNow())
+            warn("Set Anisotropic filtering to \"Application-controlled\" in your graphics driver's settings (NVIDIA Control Panel > Manage 3D settings, for this game or globally). The driver is replacing the texture filtering, so this choice has no effect and is unavailable.");
+        else if (driver_forces)
+            warn("The graphics driver is now set to application-controlled filtering. It reads that setting when the game starts: start the game once more and this choice becomes available.");
+        else if (!drv.available)
+            Hint("The graphics driver's own filtering override can't be read on this GPU. If this choice makes no difference, set Anisotropic filtering to application-controlled in your graphics driver's settings (for example AMD Software: Adrenalin Edition or Intel Graphics Software).");
         const auto as = na::observe::GetAnisoStats();
         char tb[240];
         const auto ml2 = na::observe::GetMipLiveStats();
-        if (ml2.preparing && ml2.want_aniso != ml2.live_aniso)
+        if (driver_forces)
+            std::snprintf(tb, sizeof tb, "In use: the graphics driver's own filtering.");
+        else if (ml2.preparing && ml2.want_aniso != ml2.live_aniso)
             std::snprintf(tb, sizeof tb, "Preparing %ux in the background (%llu of %llu objects); the current filtering stays until it is complete.", ml2.want_aniso,
                           static_cast<unsigned long long>(ml2.prepare_done), static_cast<unsigned long long>(ml2.prepare_total));
         else if (as.level)
@@ -1270,35 +1290,6 @@ void DrawLiveDlaaEnhancements()
         }
         if(as.native_surface&&as.native_16==as.native_surface)
             Hint("The game already requested 16x for all observed surface samplers.");
-        // The NVIDIA driver can force its own filtering over every sampler (Control Panel
-        // "Anisotropic filtering" set to Off or a level instead of Application-controlled).
-        // Cort's PC, 2026-11-05 (Astra's read of the profiles): Off = forced linear, which is
-        // why 16x showed no difference. Only the user's click changes the driver profile, and
-        // only this game's own profile.
-        const auto drv = na::fg::preset::GetAnisoOverride();
-        const uint32_t wanted = cur ? cur : 16u;
-        if (drv.Limits(wanted) && !drv.written) {
-            std::snprintf(tb, sizeof tb, "The NVIDIA driver is overriding texture filtering for this game (%s), so the level chosen here cannot show.",
-                          drv.level <= 1 ? "Anisotropic filtering: Off" : drv.level < 16 ? "a lower fixed level" : "a fixed level");
-            StatusLine(2, tb);
-            if (drv.app_profile) {
-                ImGui::BeginDisabled(drv.write_pending);
-                if (Button("Let this game control filtering (NVIDIA profile)")) na::fg::preset::RequestAppControlledAniso();
-                ImGui::EndDisabled();
-                Hint("Sets Anisotropic filtering to Application-controlled in this game's NVIDIA profile only (your other games keep theirs). The driver reads it when the game starts, so it applies from the next launch. The previous value is saved and can be put back here.");
-            } else {
-                Hint("This game has no NVIDIA profile of its own. In NVIDIA Control Panel > Manage 3D settings, set Anisotropic filtering to Application-controlled.");
-            }
-        } else if (drv.written) {
-            StatusLine(1, "NVIDIA profile set to Application-controlled filtering for this game. It applies from the next launch.");
-            ImGui::BeginDisabled(drv.write_pending);
-            if (Button("Put the NVIDIA setting back")) na::fg::preset::RequestRestoreAniso();
-            ImGui::EndDisabled();
-        }
-        if (drv.write_result && !drv.write_pending) {
-            std::snprintf(tb, sizeof tb, "The NVIDIA profile could not be changed (NVAPI %d). Set Anisotropic filtering to Application-controlled in NVIDIA Control Panel.", drv.write_result);
-            Hint(tb);
-        }
     }
     {
         // Jitter sequence (Cort 2026-11-05): where inside each pixel DLAA/DLSS samples, frame

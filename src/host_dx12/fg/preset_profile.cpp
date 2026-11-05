@@ -354,7 +354,9 @@ DWORD WINAPI aniso_worker(void*) {
         const int32_t r = aniso_session(job, now);
         std::lock_guard<std::mutex> lock(aniso_mutex);
         const bool written = aniso_state.written;
+        const AnisoOverride old = aniso_state;
         aniso_state = now;
+        aniso_state.start_known = old.start_known; aniso_state.start_selector = old.start_selector; aniso_state.start_level = old.start_level;
         aniso_state.write_pending = false;
         aniso_state.written = written || (job == 1 && r == NVAPI_OK);
         if (job == 2 && r == NVAPI_OK) aniso_state.written = false;
@@ -381,8 +383,10 @@ void ReadAnisoOverride() {
     AnisoOverride now{};
     aniso_session(0, now);
     std::lock_guard<std::mutex> lock(aniso_mutex);
-    const bool written = aniso_state.written; const int32_t wr = aniso_state.write_result;
-    aniso_state = now; aniso_state.written = written; aniso_state.write_result = wr;
+    const AnisoOverride old = aniso_state;
+    aniso_state = now; aniso_state.written = old.written; aniso_state.write_result = old.write_result;
+    if (old.start_known) { aniso_state.start_known = true; aniso_state.start_selector = old.start_selector; aniso_state.start_level = old.start_level; }
+    else if (now.available) { aniso_state.start_known = true; aniso_state.start_selector = now.selector; aniso_state.start_level = now.level; }
 }
 AnisoOverride GetAnisoOverride() { std::lock_guard<std::mutex> lock(aniso_mutex); return aniso_state; }
 void RequestAppControlledAniso() { aniso_queue(1); }
