@@ -20,7 +20,7 @@ namespace {
 // was), with readers that spend most of their time outside the lock like the hooks do.
 // Printed for comparison on real machines; only progress is checked (CI timing is noisy).
 template <class L>
-void writer_latency(const char* name, int readers)
+void writer_latency(const char* name, int readers, bool must_progress)
 {
     static L m;
     std::atomic<bool> stop{false};
@@ -53,7 +53,7 @@ void writer_latency(const char* name, int readers)
     const auto q = [&](double f) { return waits.empty() ? 0.0 : waits[std::min(waits.size() - 1, static_cast<size_t>(f * waits.size()))]; };
     std::printf("%-13s readers %2d: reads %.1fM, writer wait p50 %.1f us p99 %.1f us max %.1f us (%zu writes)\n", name, readers,
                 reads.load() / 1e6, q(0.5), q(0.99), waits.empty() ? 0.0 : waits.back(), waits.size());
-    CHECK(!waits.empty());
+    if (must_progress) CHECK(!waits.empty()); // the SRW baseline may starve its writer (CI: 0 writes at 30 readers)
 }
 } // namespace
 
@@ -122,8 +122,8 @@ int main() {
         {"writer wait vs std::shared_mutex (printed)", [] {
             const int hw = static_cast<int>(std::max(2u, std::thread::hardware_concurrency()));
             for (int r : {hw - 1, hw, 8, 30}) {
-                writer_latency<std::shared_mutex>("shared_mutex", r);
-                writer_latency<ReaderSlotsLock>("reader slots", r);
+                writer_latency<std::shared_mutex>("shared_mutex", r, false);
+                writer_latency<ReaderSlotsLock>("reader slots", r, true);
             }
         }},
     });
