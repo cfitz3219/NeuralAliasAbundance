@@ -138,6 +138,11 @@ References:
 
 ## Qualification
 
-The complete Release build passed. Both standalone AF hardware modes passed
-after the final runtime edits. Full200case CTest results follow after completion;
-do not treat the tests as a live SE5 visual or performance confirmation.
+Runtime commit9531811: complete Release build passed; full200case CTest finished
+with195passed,5skipped,0failed in300.47seconds. Skips were the NR runtime probe,
+three16xMSAA cases and optional external-upscaler jitter test. Both standalone
+AF hardware modes also passed after the final runtime edits. Logs are
+`af-suite-build.log`, `af-suite-test.log`, `af-wrap-final.log` and
+`af-clamp-final.log` in the ignored evidence directory above. No runtime edits
+followed these checks. These are automated results, not live SE5 visual or
+performance confirmation; Opus still owns integration and the updated CMD.
