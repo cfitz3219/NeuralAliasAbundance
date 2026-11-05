@@ -422,10 +422,17 @@ std::unordered_map<uint64_t, PipelineInfo> g_pipes;
 // own lock, and a bind or update locks only the one shard its set is in. Layouts
 // and templates (rarely created) have their own lock; pool lists theirs.
 // Lock order: a set shard, then g_obj_mu (shared) for a buffer's size. Never the other way.
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324) // padded on purpose: one cache line per shard
+#endif
 struct alignas(64) SetShard {
     std::shared_mutex mu;
     std::unordered_map<uint64_t, SetInfo> sets;
 };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 constexpr uint32_t kSetShards = 64;
 SetShard g_set_shards[kSetShards];
 inline uint32_t SetShardIndex(uint64_t h) { return static_cast<uint32_t>((h * 0x9E3779B97F4A7C15ull) >> 58); }
