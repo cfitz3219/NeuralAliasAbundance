@@ -19,6 +19,7 @@
 #include "host_dx12/overlay/boundary_fallback.hpp"
 #include "host_dx12/overlay/submission_tracking.hpp"
 #include "host_dx12/overlay/usage_sampler.hpp"
+#include "host_dx12/overlay/dlss_debug.hpp"
 
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -471,21 +472,28 @@ BOOL WINAPI DetourGetClipCursor(LPRECT r)
     if (ok && r) na::native_present::MapClipRead(r, caller);
     return ok;
 }
+// A hotkey the menu sends on the user's behalf (dlss_debug: CTRL+ALT+Fn for NVIDIA's
+// development DLSS DLL) passes through the lock, so the DLL's own polling sees it.
 SHORT WINAPI DetourGetAsyncKeyState(int vk)
 {
-    if (lock_input_for_this_thread()) return 0;
+    if (lock_input_for_this_thread() && !na::dlss_debug::SyntheticKeyAllowed(vk)) return 0;
     return g_orig_get_async_key_state(vk);
 }
 BOOL WINAPI DetourGetKeyboardState(PBYTE state)
 {
     BOOL r = g_orig_get_keyboard_state(state);
-    if (r && state && lock_input_for_this_thread()) memset(state, 0, 256);
+    if (r && state && lock_input_for_this_thread()) {
+        BYTE keep[256];
+        memcpy(keep, state, 256);
+        memset(state, 0, 256);
+        for (int vk = 0; vk < 256; ++vk) if (na::dlss_debug::SyntheticKeyAllowed(vk)) state[vk] = keep[vk];
+    }
     return r;
 }
 SHORT WINAPI DetourGetKeyState(int vk)
 {
     // Mouse buttons and keys read through GetKeyState (VK_LBUTTON is common for "fire").
-    if (lock_input_for_this_thread()) return 0;
+    if (lock_input_for_this_thread() && !na::dlss_debug::SyntheticKeyAllowed(vk)) return 0;
     return g_orig_get_key_state(vk);
 }
 // DirectInput 8 (keyboard/mouse through IDirectInputDevice8::GetDeviceState /
@@ -2821,6 +2829,7 @@ bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue,ComPtr<ID3D1
 // Menu step (both paths): cursor show/restore messages, then the draw.
 void menu_step(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool open, ID3D12Resource* frame = nullptr)
 {
+    na::dlss_debug::Tick(); // releases a held debug hotkey, menu open or not
     if (!g_menu_enabled.load(std::memory_order_acquire) || !g_state.imgui_ready || !g_menu_frame_ready) return;
     bool just_opened = open && !g_state.was_open;
     bool just_closed = !open && g_state.was_open;
@@ -3870,6 +3879,7 @@ void SetStatusLogPath(const wchar_t* path)
 {
     na::host::ProcessLogPath(g_status_log, MAX_PATH, path);
     g_status_last_tick = 0;
+    na::dlss_debug::SetStatusLogPath(g_status_log);
 }
 
 void SetMenuDiagnostics(bool enabled) { g_menu_diagnostics = enabled; }

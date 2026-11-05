@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -117,6 +118,43 @@ bool record_plane(ID3D12GraphicsCommandList* list, ID3D12Resource* res,
     return true;
 }
 
+// A viewable copy of an 8-bit or 10-bit colour plane: 24-bit BMP, bottom-up. Other formats
+// (float, depth, motion) have only their .raw.
+void write_bmp(const wchar_t* path, const void* data, const Plane& p)
+{
+    const DXGI_FORMAT f = p.desc.Format;
+    const bool rgba8 = f == DXGI_FORMAT_R8G8B8A8_UNORM || f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || f == DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    const bool bgra8 = f == DXGI_FORMAT_B8G8R8A8_UNORM || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || f == DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    const bool rgb10 = f == DXGI_FORMAT_R10G10B10A2_UNORM || f == DXGI_FORMAT_R10G10B10A2_TYPELESS;
+    if (!rgba8 && !bgra8 && !rgb10) return;
+    const uint32_t w = static_cast<uint32_t>(p.desc.Width), h = p.desc.Height, pitch = p.footprint.Footprint.RowPitch;
+    if (!w || !h || uint64_t(pitch) * h > p.bytes) return;
+    const uint32_t out_pitch = (w * 3 + 3) & ~3u;
+    std::vector<uint8_t> row(out_pitch);
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, path, L"wb") != 0 || !fp) return;
+    const uint32_t size = 54 + out_pitch * h;
+    uint8_t hdr[54] = {'B', 'M'};
+    auto put32 = [&](int at, uint32_t v) { memcpy(hdr + at, &v, 4); };
+    auto put16 = [&](int at, uint16_t v) { memcpy(hdr + at, &v, 2); };
+    put32(2, size); put32(10, 54); put32(14, 40); put32(18, w); put32(22, h); put16(26, 1); put16(28, 24); put32(34, out_pitch * h);
+    fwrite(hdr, 1, 54, fp);
+    const uint8_t* src = static_cast<const uint8_t*>(data);
+    for (uint32_t y = h; y-- > 0;) {
+        const uint8_t* s = src + size_t(y) * pitch;
+        for (uint32_t x = 0; x < w; ++x) {
+            uint8_t r, gch, b;
+            if (rgb10) {
+                uint32_t v; memcpy(&v, s + x * 4, 4);
+                r = uint8_t((v & 0x3FF) >> 2); gch = uint8_t(((v >> 10) & 0x3FF) >> 2); b = uint8_t(((v >> 20) & 0x3FF) >> 2);
+            } else if (rgba8) { r = s[x * 4]; gch = s[x * 4 + 1]; b = s[x * 4 + 2]; }
+            else { b = s[x * 4]; gch = s[x * 4 + 1]; r = s[x * 4 + 2]; }
+            row[x * 3] = b; row[x * 3 + 1] = gch; row[x * 3 + 2] = r;
+        }
+        fwrite(row.data(), 1, out_pitch, fp);
+    }
+    fclose(fp);
+}
 void write_frame(const Frame& f)
 {
     wchar_t path[MAX_PATH];
@@ -130,6 +168,10 @@ void write_frame(const Frame& f)
         if (_wfopen_s(&fp, path, L"wb") == 0 && fp) {
             fwrite(mapped, 1, static_cast<size_t>(p.bytes), fp);
             fclose(fp);
+        }
+        if (strcmp(p.name, "backbuffer") == 0) { // the picture as seen: viewable copy
+            swprintf_s(path, L"%s\\frame%u-%S.bmp", g.dir, f.index, p.name);
+            write_bmp(path, mapped, p);
         }
         D3D12_RANGE none{0, 0};
         p.readback->Unmap(0, &none);

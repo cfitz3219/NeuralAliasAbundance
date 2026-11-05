@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cstdio>
 #include <ctime>
+#include <string>
 
 #include <imgui.h>
 
@@ -37,6 +38,7 @@
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 #include "host_dx12/nr/nr_pass.hpp"
 #include "host_dx12/overlay/menu.hpp"
+#include "host_dx12/overlay/dlss_debug.hpp"
 #include "host_dx12/overlay/na_style.hpp"
 #include "host_dx12/overlay/overlay.hpp"
 #include "host_dx12/settings.hpp"
@@ -1263,12 +1265,71 @@ void DrawLiveDlaaEnhancements()
     EndGroupBox();
 }
 
+// NVIDIA's development DLSS DLL: its debug views and hotkeys, and one button that records
+// what they show (Cort 2026-11-05: "a section of the overlay where I can use it, and a button
+// to record images, data, logs from the debugged view").
+void DrawDlssDebug()
+{
+    const auto i = na::dlss_debug::Query();
+    char line[400];
+    if (!i.loaded) StatusLine(2, "DLSS DLL: not loaded yet (DLSS has not been created in this session).");
+    else {
+        std::snprintf(line, sizeof line, "DLSS DLL: %s%s%s (%llu bytes, SHA-256 %s...)",
+                      i.build == 2 ? "NVIDIA development build" : i.build == 1 ? "release build" : i.sha256_16[0] ? "unknown build" : "checking...",
+                      i.version[0] ? " " : "", i.version[0] ? i.version : "", static_cast<unsigned long long>(i.bytes), i.sha256_16[0] ? i.sha256_16 : "-");
+        StatusLine(i.build == 2 ? 1 : 0, line);
+        char narrow[260];
+        std::snprintf(narrow, sizeof narrow, "%ls", i.path);
+        Hint(narrow);
+    }
+    std::snprintf(line, sizeof line, "NVIDIA on-screen indicator (registry ShowDlssIndicator): %s%s",
+                  !i.indicator_known ? "unknown" : i.indicator ? "on, value " : "off", (i.indicator_known && i.indicator) ? std::to_string(i.indicator).c_str() : "");
+    StatusLine(i.indicator_known && i.indicator ? 1 : 0, line);
+    BeginRow("Indicator", "NVIDIA's own DLSS indicator and, with the development DLL, its debug text. Changing it asks for administrator rights (a Windows prompt appears; the game may minimise). Takes effect when DLSS is next created, usually after a restart of the game.",
+             ButtonWidth("Turn off"));
+    if (i.indicator_known && i.indicator) { if (Button("Turn off")) na::dlss_debug::SetIndicator(false); }
+    else if (Button("Turn on")) na::dlss_debug::SetIndicator(true);
+    EndRow();
+    SectionTitle("Development DLL hotkeys (sent to the game, menu open)");
+    Hint("Only NVIDIA's development DLL reacts. The combination is held for a few frames; its on-screen text names the current view or jitter configuration.");
+    struct Key { const char* label; const char* help; int vk; const char* btn; };
+    const Key keys[] = {
+        {"Debug view", "CTRL+ALT+F12: cycles the development DLL's overlays (jitter, motion vectors, depth, exposure, ...).", VK_F12, "Next view"},
+        {"Jitter configuration", "CTRL+ALT+F9: the DLL halves, doubles or flips the jitter it was told about. If the picture reacts, DLSS receives our jitter; if nothing changes, it does not.", VK_F9, "Next config"},
+        {"Jitter negate / swap", "CTRL+ALT+F10: negates and swaps the declared jitter axes.", VK_F10, "Press"},
+        {"Accumulation", "CTRL+ALT+F6: toggles temporal accumulation (a single-frame picture shows what one frame alone contains).", VK_F6, "Toggle"},
+    };
+    for (const Key& k : keys) {
+        BeginRow(k.label, k.help, ButtonWidth(k.btn));
+        if (Button(k.btn)) na::dlss_debug::PressHotkey(k.vk);
+        EndRow();
+    }
+    SectionTitle("Record");
+    const na::capture::Stats pc = na::capture::GetStats();
+    const auto cs = na::capture::j2::GetStats();
+    const bool busy = (pc.frames_requested != 0 && pc.frames_written < pc.frames_requested) || na::capture::j2::Armed();
+    BeginRow("Record the debugged view", "Saves the next 3 presented pictures exactly as shown (NVIDIA's overlay included; .bmp and .raw), what DLSS was given and produced on the next 3 evaluations, a copy of the status log and a note with the DLSS/HUD status lines, into one folder under LocalAppData\\NeuralAlias\\captures. The results CMD collects it.",
+             ButtonWidth("Record now"));
+    ImGui::BeginDisabled(busy);
+    if (Button("Record now")) {
+        wchar_t dir[MAX_PATH];
+        na::dlss_debug::Record(3, dir, MAX_PATH);
+    }
+    ImGui::EndDisabled();
+    EndRow();
+    if (na::dlss_debug::LastRecordDir()[0]) {
+        std::snprintf(line, sizeof line, "%s: %ls (pictures %u/%u, DLSS planes %u/%u)", busy ? "Recording" : "Last recording", na::dlss_debug::LastRecordDir(),
+                      pc.frames_written, pc.frames_requested, cs.written, cs.requested);
+        StatusLine(busy ? 2 : 1, line);
+    }
+}
 
 } // namespace
 
 void RegisterLiveDlaaMenu()
 {
     na::menu::Register({"Live DLAA", na::menu::Availability::Available, nullptr, &DrawLiveDlaa, na::menu::Page::Picture});
+    na::menu::Register({"DLSS debug", na::menu::Availability::Available, nullptr, &DrawDlssDebug, na::menu::Page::Details});
     na::menu::Register({"DLAA enhancements", na::menu::Availability::Available, nullptr, &DrawLiveDlaaEnhancements, na::menu::Page::Enhancements});
 }
 
