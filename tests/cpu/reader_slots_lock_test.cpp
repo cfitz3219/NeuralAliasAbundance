@@ -26,6 +26,17 @@ void writer_latency(const char* name, int readers, bool must_progress)
     std::atomic<bool> stop{false};
     std::atomic<uint64_t> reads{0};
     std::vector<double> waits;
+    std::thread w([&] {
+        while (!stop.load()) {
+            const auto t0 = std::chrono::steady_clock::now();
+            { std::unique_lock<L> x(m); }
+            waits.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+    // The writer starts first: on a 2-core CI runner 30 busy readers can keep a thread that
+    // starts after them from being scheduled at all within the measured second.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
     std::vector<std::thread> ts;
     for (int t = 0; t < readers; ++t)
         ts.emplace_back([&] {
@@ -37,14 +48,6 @@ void writer_latency(const char* name, int readers, bool must_progress)
             }
             reads.fetch_add(n);
         });
-    std::thread w([&] {
-        while (!stop.load()) {
-            const auto t0 = std::chrono::steady_clock::now();
-            { std::unique_lock<L> x(m); }
-            waits.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-    });
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     stop.store(true);
     for (auto& t : ts) t.join();
