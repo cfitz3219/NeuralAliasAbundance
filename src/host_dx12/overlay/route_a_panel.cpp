@@ -1,3 +1,5 @@
+#include "host_dx12/background/work.hpp"
+#include "host_dx12/gpu/mem_alloc.hpp"
 #include "host_dx12/gpu/services.hpp"
 #include "host_dx12/diag/gpu_breadcrumbs.hpp"
 #include "host_dx12/effects/donut.hpp"
@@ -1382,6 +1384,10 @@ static void DrawExperimentalGpu()
     ImGui::BeginDisabled(!stats.built);
     if(ImGui::Checkbox("##experimental_gpu",&enabled)){settings.experimental_nvrhi=enabled;na::settings::Save();}
     ImGui::EndDisabled();EndRow();
+    const auto memory=na::gpu::mem::GetStats();const auto preparation=na::background::GetStats();char details[192];
+    std::snprintf(details,sizeof details,"GPU scratch memory: %.1f MB used in %.1f MB of reusable heaps.",memory.allocation_bytes/1048576.0,memory.block_bytes/1048576.0);Hint(details);
+    std::snprintf(details,sizeof details,"Background preparation: %u working, %u waiting; %llu jobs completed.",preparation.active,
+        preparation.pending>=preparation.active?preparation.pending-preparation.active:0,static_cast<unsigned long long>(preparation.completed));Hint(details);
     if(!stats.built)Hint("Unavailable in this build.");
     else if(enabled){char status[192];std::snprintf(status,sizeof status,"Shared GPU work: %llu submissions, %llu effect dispatches, %llu managed textures.",
         static_cast<unsigned long long>(stats.submits),static_cast<unsigned long long>(stats.dispatches),static_cast<unsigned long long>(stats.textures));Hint(status);}

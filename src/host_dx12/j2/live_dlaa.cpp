@@ -1,3 +1,4 @@
+#include "host_dx12/gpu/mem_alloc.hpp"
 #include "host_dx12/gpu/services.hpp"
 #include "host_dx12/diag/gpu_breadcrumbs.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
@@ -379,8 +380,6 @@ void flush(ID3D12GraphicsCommandList* l, std::vector<D3D12_RESOURCE_BARRIER>& v)
 
 bool texture(UINT w, UINT h, DXGI_FORMAT fmt, bool uav, D3D12_RESOURCE_STATES state, ComPtr<ID3D12Resource>& out)
 {
-    D3D12_HEAP_PROPERTIES hp{};
-    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC d{};
     d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     d.Width = w;
@@ -391,7 +390,7 @@ bool texture(UINT w, UINT h, DXGI_FORMAT fmt, bool uav, D3D12_RESOURCE_STATES st
     d.SampleDesc.Count = 1;
     d.Flags = uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
     out.Reset();
-    return SUCCEEDED(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, state, nullptr, IID_PPV_ARGS(&out)));
+    return SUCCEEDED(na::gpu::mem::CreateResource(g.device.Get(),D3D12_HEAP_TYPE_DEFAULT,d,state,nullptr,out.GetAddressOf()));
 }
 // A typed format for our own copies of a (possibly typeless) game texture.
 DXGI_FORMAT typed(DXGI_FORMAT f)

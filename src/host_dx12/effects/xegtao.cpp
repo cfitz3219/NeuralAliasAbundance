@@ -1,5 +1,7 @@
+#include "host_dx12/background/work.hpp"
 #include "xegtao.hpp"
 #include "host_dx12/gpu/services.hpp"
+#include "host_dx12/gpu/mem_alloc.hpp"
 #include "host_dx12/settings.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include "providers/camera/camera_tracker.hpp"
@@ -178,12 +180,11 @@ std::shared_ptr<Frame> Pass::Prepare(ID3D12Device* dev,ID3D12CommandQueue* queue
     if(!s.programs||s.programs->device.Get()!=dev){
         s.programs=std::make_shared<Programs>();s.programs->device=dev;s.scratch.reset();s.frames.clear();
         const auto programs=s.programs;
-        std::thread([programs]{
-            SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_BELOW_NORMAL);
+        if(!na::background::Submit([programs]{
             const bool ok=build_programs(*programs);
             {std::lock_guard<std::mutex> lock(programs->mutex);programs->ready.store(ok?1:-1,std::memory_order_release);}
             programs->cv.notify_all();
-        }).detach();
+        })){s.programs.reset();s.reason="Waiting for background preparation.";return {};}
     }
     const int ready=s.programs->ready.load(std::memory_order_acquire);
     if(ready<=0){s.reason=ready<0?s.programs->error:"Preparing XeGTAO in the background.";return {};}
@@ -208,8 +209,7 @@ std::shared_ptr<Frame> Pass::Prepare(ID3D12Device* dev,ID3D12CommandQueue* queue
            !texture(dev,queue,ow,oh,format,1,scratch->color)){s.reason="XeGTAO working textures could not be allocated.";return {};}
         if(in.srgb){
             auto desc=scratch->color->GetDesc();desc.Format=in.color_format;desc.Flags=D3D12_RESOURCE_FLAG_NONE;
-            D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;
-            if(FAILED(dev->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&desc,Read,nullptr,IID_PPV_ARGS(&scratch->encoded)))){
+            if(FAILED(na::gpu::mem::CreateResource(dev,D3D12_HEAP_TYPE_DEFAULT,desc,Read,nullptr,scratch->encoded.GetAddressOf()))){
                 s.reason="XeGTAO sRGB output could not be allocated.";return {};
             }
         }

@@ -1,3 +1,4 @@
+#include "host_dx12/background/work.hpp"
 #include "host_dx12/host_boot/process_log.hpp"
 #include "host_dx12/gpu/mem_alloc.hpp"
 #include "host_dx12/diag/gpu_breadcrumbs.hpp"
@@ -1004,6 +1005,11 @@ void write_status_line()
             if (na::j2::hud_unblend::Configured()) {
                 const std::string ub = na::j2::hud_unblend::StatusLine() + " composited=" + std::to_string(j2.small_hud_layer) + "\r\n" +
                                        na::diag::crumbs::StatusLine() + "\r\n" + na::gpu::mem::StatusLine() + "\r\n";
+        const auto background=na::background::GetStats();char background_line[240];
+        const int background_bytes=std::snprintf(background_line,sizeof background_line,"background workers=%u active=%u pending=%u accepted=%llu completed=%llu failed=%llu rejected=%llu\r\n",
+            background.workers,background.active,background.pending,(unsigned long long)background.accepted,(unsigned long long)background.completed,
+            (unsigned long long)background.failed,(unsigned long long)background.rejected);
+        if(background_bytes>0)WriteFile(f,background_line,DWORD((std::min)(background_bytes,int(sizeof background_line-1))),&written,nullptr);
                 WriteFile(f, ub.data(), DWORD(ub.size()), &written, nullptr);
             }
             {
@@ -3784,6 +3790,9 @@ bool Stop()
     if (!na::present::Shutdown(5000)) { // A59: the present thread must be gone before resources go
         g_stop_incomplete.store(1, std::memory_order_release);
         return false;
+    }
+    if(!na::background::Stop(5000)){
+        g_stop_incomplete.store(1,std::memory_order_release);return false;
     }
     g_stop_incomplete.store(0, std::memory_order_release);
     // Restore before removing the subclass; queued messages cannot perform

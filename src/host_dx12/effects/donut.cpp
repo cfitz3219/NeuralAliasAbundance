@@ -1,5 +1,7 @@
+#include "host_dx12/background/work.hpp"
 #include "donut.hpp"
 #include "host_dx12/gpu/services.hpp"
+#include "host_dx12/gpu/mem_alloc.hpp"
 #include "host_dx12/settings.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include <wrl/client.h>
@@ -78,9 +80,9 @@ bool texture(ID3D12Device* d,ID3D12CommandQueue* queue,uint32_t w,uint32_t h,DXG
     return na::gpu::CreateTexture(d,queue,td,Read,r);
 }
 bool buffer(ID3D12Device* d,unsigned count,ComPtr<ID3D12Resource>& r) {
-    D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;D3D12_RESOURCE_DESC td{};td.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;
+    D3D12_RESOURCE_DESC td{};td.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;
     td.Width=count*4;td.Height=td.DepthOrArraySize=td.MipLevels=1;td.SampleDesc.Count=1;td.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;td.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    return SUCCEEDED(d->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&td,Write,nullptr,IID_PPV_ARGS(&r)));
+    return SUCCEEDED(na::gpu::mem::CreateResource(d,D3D12_HEAP_TYPE_DEFAULT,td,Write,nullptr,r.GetAddressOf()));
 }
 bool shape(const Scratch& s,ID3D12CommandQueue* q,const Inputs& in,DXGI_FORMAT f,uint32_t ow,uint32_t oh) {
     return s.queue.Get()==q&&s.stream==in.stream&&s.w==in.width&&s.h==in.height&&s.ow==ow&&s.oh==oh&&s.format==f&&s.nvrhi==na::gpu::Enabled();
@@ -116,8 +118,10 @@ std::shared_ptr<Frame> Pass::Prepare(ID3D12Device* device,ID3D12CommandQueue* qu
     if(o.white<=0||o.min_luminance<=0||o.max_luminance<o.min_luminance||o.high<=o.low||o.low<0||o.high>1)return {};
     if(!s.programs||s.programs->device.Get()!=device){
         s.programs=std::make_shared<Programs>();s.programs->device=device;s.scratch.clear();s.frames.clear();auto p=s.programs;
-        std::thread([p]{SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_BELOW_NORMAL);const bool ok=build(*p);
-            {std::lock_guard<std::mutex> guard(p->mutex);p->ready.store(ok?1:-1,std::memory_order_release);}p->cv.notify_all();}).detach();
+        if(!na::background::Submit([p]{const bool ok=build(*p);
+            {std::lock_guard<std::mutex> guard(p->mutex);p->ready.store(ok?1:-1,std::memory_order_release);}p->cv.notify_all();})){
+            s.programs.reset();s.reason="Waiting for background preparation.";return {};
+        }
     }
     if(s.programs->ready.load(std::memory_order_acquire)!=1){s.reason="Preparing Donut effects in the background.";return {};}
     na::observe::HostWorkScope own;
@@ -134,8 +138,8 @@ std::shared_ptr<Frame> Pass::Prepare(ID3D12Device* device,ID3D12CommandQueue* qu
         if(!texture(device,queue,ow,oh,format,scratch->color)||!buffer(device,256,scratch->histogram)||!buffer(device,1,scratch->exposure)){s.reason="Effect resources could not be allocated.";return {};}
         if(in.format==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB){
             // sRGB UAVs are unsupported; create a compatible copy destination without UAV flags.
-            D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;auto ed=scratch->color->GetDesc();ed.Format=in.format;ed.Flags=D3D12_RESOURCE_FLAG_NONE;
-            if(FAILED(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&ed,Read,nullptr,IID_PPV_ARGS(&scratch->encoded))))return {};
+            auto ed=scratch->color->GetDesc();ed.Format=in.format;ed.Flags=D3D12_RESOURCE_FLAG_NONE;
+            if(FAILED(na::gpu::mem::CreateResource(device,D3D12_HEAP_TYPE_DEFAULT,ed,Read,nullptr,scratch->encoded.GetAddressOf())))return {};
         }
         ++s.allocations;
         if(queue){if(s.scratch.size()>=8)s.scratch.erase(s.scratch.begin());s.scratch.push_back(scratch);}

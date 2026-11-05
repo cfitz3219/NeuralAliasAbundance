@@ -1,6 +1,7 @@
 // Offline NVRHI/native interoperability. All GPU waits/readback are test-only.
 #include "test_support.hpp"
 #include "host_dx12/gpu/services.hpp"
+#include "host_dx12/gpu/mem_alloc.hpp"
 #include "host_dx12/settings.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include <d3dcompiler.h>
@@ -22,9 +23,11 @@ int main(){
     constexpr unsigned W=16,H=16;constexpr auto Read=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     D3D12_RESOURCE_DESC td{};td.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;td.Width=W;td.Height=H;td.DepthOrArraySize=td.MipLevels=1;
     td.Format=DXGI_FORMAT_R32G32B32A32_FLOAT;td.SampleDesc.Count=1;td.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    const auto allocation_base=na::gpu::mem::GetStats();
     na::gpu::Texture source,destination;REQUIRE(na::gpu::CreateTexture(d.device.Get(),d.queue.Get(),td,Read,source));
     REQUIRE(na::gpu::CreateTexture(d.device.Get(),d.queue.Get(),td,Read,destination));
     CHECK(source.owner_&&destination.owner_);CHECK(na::gpu::GetStats().textures==2);
+    CHECK(na::gpu::mem::GetStats().placed==allocation_base.placed+2);
     CHECK(na::observe::GetProducerStats().objects_created==before.objects_created);
     const char* shader="Texture2D<float4> src:register(t0); RWTexture2D<float4> dst:register(u0); cbuffer B:register(b0){float factor;uint3 padding;} [numthreads(8,8,1)] void main(uint2 p:SV_DispatchThreadID){dst[p]=src[p]*factor;}";
     test::ComPtr<ID3DBlob> code,error;REQUIRE(SUCCEEDED(D3DCompile(shader,std::strlen(shader),nullptr,nullptr,nullptr,"main","cs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&error)));
@@ -52,7 +55,12 @@ int main(){
     // Recording leases retain external allocations; NVRHI retains imported bindings too.
     std::weak_ptr<void> lifetime=destination.owner_;own.Retain(destination.owner_);packet.reset();destination.Reset();
     ID3D12CommandList* lists[]={prefix.list.Get(),own.Native(),suffix.list.Get()};
-    REQUIRE(na::gpu::SubmitMixed(d.queue.Get(),3,lists,&own,forward));CHECK(forwards==2);d.WaitIdle();na::gpu::Collect();
+    test::ComPtr<ID3D12Fence> gate;REQUIRE(SUCCEEDED(d.device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&gate))));
+    REQUIRE(SUCCEEDED(d.queue->Wait(gate.Get(),1))); // hold GPU consumption; never done by the production service
+    REQUIRE(na::gpu::SubmitMixed(d.queue.Get(),3,lists,&own,forward));CHECK(forwards==2);
+    CHECK(na::gpu::mem::GetStats().live==allocation_base.live+2);CHECK(!lifetime.expired());
+    REQUIRE(SUCCEEDED(gate->Signal(1)));d.WaitIdle();na::gpu::Collect();
+    CHECK(na::gpu::mem::GetStats().live==allocation_base.live+1);
     REQUIRE(SUCCEEDED(readback->Map(0,nullptr,reinterpret_cast<void**>(&map))));
     for(unsigned y=0;y<H;++y)for(unsigned x=0;x<W*4;++x)CHECK(reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(map)+y*fp.Footprint.RowPitch)[x]==.5f);
     readback->Unmap(0,nullptr);CHECK(lifetime.expired());CHECK(na::gpu::GetStats().retained==0);
