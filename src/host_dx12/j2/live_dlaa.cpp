@@ -3,6 +3,7 @@
 #include "host_dx12/j2/nis_sharpen.hpp"
 #include "host_dx12/j2/nis_scaler.hpp"
 #include "host_dx12/j2/native_hud.hpp"
+#include "host_dx12/j2/hud_unblend.hpp"
 #include "host_dx12/j2/hud_picture.hpp"
 #include "core/jitter_domain.hpp"
 #include "host_dx12/j2/route_selector.hpp"
