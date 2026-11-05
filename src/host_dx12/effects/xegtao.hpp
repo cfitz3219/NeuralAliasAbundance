@@ -48,7 +48,7 @@ private:
     std::unique_ptr<Work> work_;
     Frame();
 };
-struct Stats { uint64_t recorded=0, allocations=0, busy=0; bool compiling=false; char reason[160]{}; };
+struct Stats { uint64_t recorded=0, allocations=0, busy=0, bindings=0; bool compiling=false; char reason[160]{}; };
 class Pass {
 public:
     Pass();

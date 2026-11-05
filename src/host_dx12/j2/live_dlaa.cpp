@@ -27,6 +27,7 @@
 #include "host_dx12/observe/texture_operation.hpp"
 #include "host_dx12/settings.hpp"
 #include "host_dx12/effects/xegtao.hpp"
+#include "host_dx12/effects/donut.hpp"
 #include "host_dx12/overlay/presenter.hpp"
 #include "host_dx12/scale/settings_read_hook.hpp"
 #include "providers/camera/camera_tracker.hpp"
@@ -63,6 +64,7 @@ struct Slot {
     ComPtr<ID3D12CommandAllocator> alloc;
     ComPtr<ID3D12GraphicsCommandList> list;
     UINT64 fence_value = 0;
+    std::shared_ptr<na::donut::Frame> grade;
     std::shared_ptr<na::xegtao::Frame> ambient; // existing slot fence owns AO descriptors/resources
     std::shared_ptr<const PhysicalInput> physical; // Layer2 payload used by this slot's list: kept
                                                    // until the slot is reused (its fence completed)
@@ -2589,6 +2591,14 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         static uint64_t small_seen = 0;
         if (g.stats.small_dlss != small_seen) { small_seen = g.stats.small_dlss; na::dlss::ReleaseView(kViewId); ++g.stats.dlaa_fresh_features; }
     }
+    const auto grade_options=na::donut::CurrentOptions();
+    if(grade_options.tone||grade_options.bloom){
+        na::donut::Inputs di;di.color=e.color;di.format=typed(e.color->GetDesc().Format);di.width=rw;di.height=rh;
+        di.srgb=di.format==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB||di.format==DXGI_FORMAT_R8G8B8A8_UNORM;di.reset=e.reset;di.stream=kViewId;
+        auto grade=na::donut::ScenePass().Prepare(g.device.Get(),g.queue.Get(),di,grade_options);
+        if(grade){if(inl){if(!na::nr::native::RetainRecording(l,grade))grade.reset();}else s.grade=grade;
+            if(grade&&grade->Record(l))e.color=grade->Color();}
+    }
     const bool evaluated = na::dlss::Evaluate(l, e);
     if (!evaluated) ++g.stats.dlss_failed;
     if (shifted) { add(b, g.jshift.Get(), NPSR, UAV); flush(l, b); }
@@ -3041,6 +3051,7 @@ struct SmallRing {
     ComPtr<ID3D12Fence> fence;
     UINT64 next = 1;
     uint32_t slot = 0;
+    std::shared_ptr<na::donut::Frame> grade[kRing];
     std::shared_ptr<void> hud_owner[kRing];
     std::shared_ptr<na::j2::native_hud::Picture> hud_picture[kRing];
     bool native_hud_result[kRing]{};
@@ -4118,6 +4129,13 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
         // HUD protection: DLSS trusts this frame's colour where the learned mask says HUD.
         e.bias_current_color = draw_picture&&!separate_scene?layer.picture->Mask():hud_mask?g_small.mask.Get():nullptr;
         evaluation_reset = e.reset;
+        const auto grade_options=na::donut::CurrentOptions();
+        if(grade_options.tone||grade_options.bloom){
+            na::donut::Inputs di;di.color=e.color;di.format=typed(e.color->GetDesc().Format);di.width=rw;di.height=rh;
+            di.srgb=di.format==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB||di.format==DXGI_FORMAT_R8G8B8A8_UNORM;di.reset=e.reset;di.stream=kSmallViewId;
+            auto grade=na::donut::ScenePass().Prepare(g_small.device.Get(),queue,di,grade_options);
+            if(grade&&grade->Record(l)){g_small.grade[si]=grade;e.color=grade->Color();}
+        }
         dlss = na::dlss::Evaluate(l, e);
         if (small_shifted) { add(b, g_small.jshift.Get(), NPSR, UAV); flush(l, b); }
         // Debug view (Cort 2026-11-04: the views showed nothing in render-small, where DLSS runs

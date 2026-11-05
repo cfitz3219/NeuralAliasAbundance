@@ -1,0 +1,16 @@
+set(NA_HAVE_DONUT OFF)
+if(NA_DXC AND EXISTS "${NA_DXC}")
+  set(NA_HAVE_DONUT ON)
+  set(_donut_src "${CMAKE_SOURCE_DIR}/src/host_dx12/effects/donut.hlsl")
+  set(_donut_out "${CMAKE_BINARY_DIR}/generated/donut")
+  file(MAKE_DIRECTORY "${_donut_out}")
+  set(_donut_generated "")
+  foreach(_entry Clear Histogram Exposure Downsample Blur Compose)
+    set(_out "${_donut_out}/Donut${_entry}.h")
+    add_custom_command(OUTPUT "${_out}"
+      COMMAND "${NA_DXC}" -nologo -T cs_6_0 -E "${_entry}" -O3 -Vn "na_donut_${_entry}" -Fh "${_out}" "${_donut_src}"
+      DEPENDS "${_donut_src}" "${CMAKE_SOURCE_DIR}/third_party/falcor/filmic.hlsli" COMMENT "DXC: Donut ${_entry}" VERBATIM)
+    list(APPEND _donut_generated "${_out}")
+  endforeach()
+  add_custom_target(donut_shaders DEPENDS ${_donut_generated})
+endif()

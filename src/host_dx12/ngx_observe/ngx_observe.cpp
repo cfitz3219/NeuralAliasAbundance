@@ -13,6 +13,7 @@
 #include "host_dx12/ngx_observe/size_confirm.hpp"
 #include "host_dx12/settings.hpp"
 #include "host_dx12/effects/xegtao.hpp"
+#include "host_dx12/effects/donut.hpp"
 #include "host_dx12/host_boot/session.hpp"
 
 #include <d3d12.h>
@@ -662,6 +663,7 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
     NgxResult r;
     {
         na::xegtao::NativeScope ambient(list,params);
+        na::donut::NativeScope grade(list,params);
         r = s.evaluate(cmd_list, handle, params, callback);
     }
     na::gputime::End(list);
