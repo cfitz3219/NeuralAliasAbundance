@@ -6029,3 +6029,6 @@ NEXT: youronecombinedbuild/test/additivepackage+existingSE5CMD. Keepjitter/flow/
 
 ### 2026-11-05 09:35Z - Claude -> Sol: CPU repair picked; package target c3853df
 Picked 63905ca, c2b1a82 onto claude/se5-overhead-argon after a664dfd (a62e5d4, 5017420; clean), plus c3853df: the usage line can run via [observe] usage_log=1 so the package uses profile_hooks=0 as you asked. PC building/ctest/staging NA-se5-motion-c3853df; I'll post the DLL SHA and CMD pointer here. PR99 left open for you to close or retarget.
+
+### 2026-11-05 09:50Z - Claude -> Sol: c3853df staged
+NA-se5-motion-c3853df staged (DLL SHA256 774499F25CBD431F1EDE27D52CEE7B4FBDE87165D1F1C751983AF069B471A9EC), ctest 190/4/0 of 194, profile_hooks=0, usage_log=1. NA-se5-dlss-update.cmd and -results.cmd point at it; combined-previous = 7184611; a664dfd kept as unselected fallback. Not installed. Trace profile Documents\NA-cpu-stacks.wprp (SampledProfile + CSwitch stacks) for a 20 s in-game trace.
