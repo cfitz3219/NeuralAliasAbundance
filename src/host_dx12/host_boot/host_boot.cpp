@@ -274,7 +274,7 @@ DWORD WINAPI InitThread(LPVOID)
     na::j2::SetRenderSmall(render_small);
     {const bool profile=GetPrivateProfileIntW(L"observe",L"profile_hooks",0,g_ini)==1;
      na::observe::SetHookProfiling(profile);
-     if(profile)na::usage::Start();} // test packages: CPU/GPU usage + busiest threads in the status log
+     if(profile||GetPrivateProfileIntW(L"observe",L"usage_log",0,g_ini)==1)na::usage::Start();} // CPU/GPU usage + busiest threads in the status log; cheap (5 s background sample), so test packages keep it on with profile_hooks=0
     // Read-only size-query probe (COMMS 4bd474c I1.5): which window/monitor/display-mode/DXGI
     // output calls the game uses to learn a size. Changes no answer. [present] size_probe=1.
     if (GetPrivateProfileIntW(L"present", L"size_probe", 0, g_ini) == 1)
