@@ -1095,7 +1095,7 @@ public:
         for(auto& c:g_canvases)if(c.writer==l&&c.recording==na::observe::ListRecording(l)){c.last_write=++g_draw_order;c.snapshot.reset();}
     }
     void After(ID3D12GraphicsCommandList* l, const na::observe::ShaderCall& call, na::observe::ShaderScope&) noexcept override {
-        if(call.kind==na::observe::ShaderKind::Dispatch||!g_on.load())return;
+        if(call.kind==na::observe::ShaderKind::Dispatch||!g_on.load()||t_bind.list!=l||!t_bind.proxy)return;
         na::observe::DrawInfo state;if(!na::observe::ListDrawState(l,state))return;
         std::lock_guard<std::mutex> lock(g_m);auto* output=find_locked(state.rt);
         if(!output||!output->output||!output->output->replay)return;

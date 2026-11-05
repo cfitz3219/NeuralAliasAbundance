@@ -18,8 +18,13 @@ na_host_test(ffx_flow_test SOURCES ffx_flow_test.cpp LIBS host_ffx_flow dxgi LAB
 na_host_test(jitter_probe_test SOURCES jitter_probe_test.cpp LIBS core_gpu dxgi LABELS gpu)
 na_host_test(viewport_jitter_test SOURCES viewport_jitter_test.cpp LIBS host_observe_producers dxgi d3dcompiler LABELS gpu)
 if(NA_HAVE_NGX_SDK)
-  # Opus's optional CPU recording benchmark; uses a fake model and real DX12.
-  # It is deliberately not a CTest or part of the default/CI build.
+  # Optional real-DX12 CPU command-tracking benchmark; no model evaluation.
+  # These benchmarks are not CTests or part of the default/CI build.
+  add_executable(observe_hotpath_bench EXCLUDE_FROM_ALL observe_hotpath_bench.cpp)
+  target_compile_features(observe_hotpath_bench PRIVATE cxx_std_20)
+  target_link_libraries(observe_hotpath_bench PRIVATE abundance_options host_dx12 d3dcompiler)
+  target_include_directories(observe_hotpath_bench PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+  # Opus's automatic-scene benchmark uses a fake model and real DX12.
   add_executable(auto_scene_bench EXCLUDE_FROM_ALL auto_scene_bench.cpp)
   target_link_libraries(auto_scene_bench PRIVATE abundance_options host_dx12)
   target_include_directories(auto_scene_bench PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

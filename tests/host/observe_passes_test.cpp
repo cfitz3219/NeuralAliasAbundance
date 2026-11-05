@@ -19,11 +19,14 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <vector>
 
 namespace {
+std::atomic<unsigned> selected_reads{0};
+void selected_read(ID3D12GraphicsCommandList*,const na_object_id*,uint32_t,bool){++selected_reads;}
 std::mutex g_m;
 std::vector<std::vector<uint8_t>> g_events;
 
@@ -215,7 +218,7 @@ int main()
     const na_object_id copy_id = na::observe::IdOf(copy_dst.Get()), srvh_id = na::observe::IdOf(srvh.Get());
     CHECK(list_id && rs_id && gpso_id && color_id && depth_id && cbuf_id && copy_id && srvh_id);
 
-    std::lock_guard<std::mutex> lock(g_m);
+    std::unique_lock<std::mutex> lock(g_m);
     // Root signature parameters.
     bool rs_ok = false;
     for (const auto& e : g_events) {
@@ -315,6 +318,47 @@ int main()
         CHECK(ops[11]->a[0] == 3 && ops[11]->a[1] == 1);
         CHECK(ops[13]->a[0] == copy_id && ops[13]->a[1] == color_id);
     }
+    lock.unlock(); // the next session's asynchronous sink needs this mutex
+    // Second session: changing per-object CBVs does not change the texture
+    // read set. Table contents, table handle and selected source still do.
+    REQUIRE(na_observe_start(&cfg,Sink,nullptr)==NA_OK);
+    na::observe::SetTableBindCallback(&selected_read);na::observe::SetLiveSelection(depth_id,na::observe::IdOf(tex.Get()));
+    D3D12_DEPTH_STENCIL_VIEW_DESC typed_depth{};typed_depth.Format=DXGI_FORMAT_D32_FLOAT;typed_depth.ViewDimension=D3D12_DSV_DIMENSION_TEXTURE2D;
+    dev->CreateDepthStencilView(depth.Get(),&typed_depth,dsv); // explicit mip/slice evidence, unlike the original null-view test
+    auto other_tex=test::CreateTexture(dev,4,4,DXGI_FORMAT_R8G8B8A8_UNORM,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_FLAG_NONE);REQUIRE(other_tex);
+    D3D12_DESCRIPTOR_HEAP_DESC read_hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,2,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
+    test::ComPtr<ID3D12DescriptorHeap> read_heap;REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&read_hd,IID_PPV_ARGS(&read_heap))));
+    D3D12_SHADER_RESOURCE_VIEW_DESC read_sv{};read_sv.Format=DXGI_FORMAT_R8G8B8A8_UNORM;read_sv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;read_sv.Texture2D.MipLevels=1;read_sv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    const UINT read_inc=dev->GetDescriptorHandleIncrementSize(read_hd.Type);auto read_cpu=read_heap->GetCPUDescriptorHandleForHeapStart();
+    dev->CreateShaderResourceView(tex.Get(),&read_sv,read_cpu);read_cpu.ptr+=read_inc;dev->CreateShaderResourceView(other_tex.Get(),&read_sv,read_cpu);
+    test::List cached;REQUIRE(cached.Create(dev));auto* cl=cached.list.Get();
+    REQUIRE(SUCCEEDED(cl->Close()));cached.Reset(); // fully observed recording, as in the original wire-stream test
+    cl->SetGraphicsRootSignature(rs.Get());cl->SetPipelineState(gpso.Get());
+    auto color_ready=test::Transition(color.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_RENDER_TARGET);cl->ResourceBarrier(1,&color_ready);
+    cl->OMSetRenderTargets(1,&rtv,FALSE,&dsv);const D3D12_VIEWPORT read_vp{0,0,float(W),float(H),0,1};const D3D12_RECT read_sc{0,0,LONG(W),LONG(H)};
+    cl->RSSetViewports(1,&read_vp);cl->RSSetScissorRects(1,&read_sc);cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const float tint[4]={0,0,0,1};cl->SetGraphicsRoot32BitConstants(0,4,tint,0);
+    ID3D12DescriptorHeap* cached_heaps[]={read_heap.Get()};cl->SetDescriptorHeaps(1,cached_heaps);cl->SetGraphicsRootDescriptorTable(1,read_heap->GetGPUDescriptorHandleForHeapStart());
+    // Recording-only assertions about the source observed at each call, not a
+    // claim of GPU pixels after a later descriptor rewrite.
+    for(unsigned i=0;i<100;++i){cl->SetGraphicsRootConstantBufferView(2,cbuf->GetGPUVirtualAddress()+256*(i%8));cl->DrawInstanced(3,1,0,0);}
+    CHECK(selected_reads.load()==100);
+    auto next_table=read_heap->GetGPUDescriptorHandleForHeapStart();next_table.ptr+=read_inc;cl->SetGraphicsRootDescriptorTable(1,next_table);
+    for(unsigned i=0;i<100;++i)cl->DrawInstanced(3,1,0,0);CHECK(selected_reads.load()==100);
+    na::observe::SetLiveSelection(depth_id,na::observe::IdOf(other_tex.Get()));
+    for(unsigned i=0;i<100;++i)cl->DrawInstanced(3,1,0,0);CHECK(selected_reads.load()==200);
+    dev->CreateShaderResourceView(tex.Get(),&read_sv,read_cpu);
+    for(unsigned i=0;i<100;++i)cl->DrawInstanced(3,1,0,0);CHECK(selected_reads.load()==200);
+    // Thousands of identical depth-write facts must leave room for a REAL new
+    // depth target, whose state the acquisition path then needs.
+    for(unsigned i=0;i<5000;++i)cl->DrawInstanced(3,1,0,0);
+    auto next_depth=test::CreateTexture(dev,W,H,DXGI_FORMAT_D32_FLOAT,D3D12_RESOURCE_STATE_DEPTH_WRITE,D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);REQUIRE(next_depth);
+    test::ComPtr<ID3D12DescriptorHeap> next_dsv;D3D12_DESCRIPTOR_HEAP_DESC next_hd{D3D12_DESCRIPTOR_HEAP_TYPE_DSV,1,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
+    REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&next_hd,IID_PPV_ARGS(&next_dsv))));const auto next_handle=next_dsv->GetCPUDescriptorHandleForHeapStart();dev->CreateDepthStencilView(next_depth.Get(),&typed_depth,next_handle);
+    cl->OMSetRenderTargets(1,&rtv,FALSE,&next_handle);cl->DrawInstanced(3,1,0,0);uint32_t depth_state=0;
+    CHECK(na::observe::ListStateSub(cl,na::observe::IdOf(next_depth.Get()),0,&depth_state)==na::observe::StateLookup::Known&&depth_state==D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    REQUIRE(SUCCEEDED(cl->Close()));na::observe::SetTableBindCallback(nullptr);na::observe::SetLiveSelection(0,0);REQUIRE(na_observe_stop()==NA_OK);
+
     const auto st = na::observe::GetProducerStats();
     std::printf("producers: hooks %u missing %u\n", st.hooks_installed, st.hooks_missing);
     return test::finish("observe_passes_test");

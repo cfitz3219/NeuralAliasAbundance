@@ -310,6 +310,7 @@ ViewportJitterStats GetViewportJitterStats();
 // Wall time inside each outermost command-list hook (ours + driver), ExecuteCommandLists
 // ("exec") and pipeline creation ("pso") since the previous call: one status line,
 // "hook_cost ... s<slot>{ms_per_s calls_per_s us}" (slot = ID3D12GraphicsCommandList vtable index).
+void SetHookProfiling(bool enabled); // opt-in diagnostic timers, off in normal play
 void FormatHookCost(char* out, size_t n);
 
 // Buffer GPU VA -> (resource id, offset). False when unknown or ambiguous.
