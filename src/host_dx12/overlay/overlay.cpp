@@ -2266,6 +2266,11 @@ void draw_page_intro(na::menu::Page p)
         Heading("More possibilities.");
         Lead("Availability depends on the game and the installed version.");
         break;
+    case na::menu::Page::Experimental:
+        Eyebrow("OPTIONAL EFFECTS");
+        Heading("Experimental.");
+        Lead("Try additional scene effects. Each starts off and can be adjusted live.");
+        break;
     case na::menu::Page::Preferences:
         Eyebrow("MAKE IT YOURS");
         Heading("Quiet by design.");
@@ -2460,7 +2465,7 @@ void draw_panel(bool just_opened)
     auto nav = [&](float nav_w, bool horizontal) {
         float used = 0, avail = ImGui::GetContentRegionAvail().x;
         for (int i = 0; i < na::menu::kPageCount; ++i) {
-            Page p = static_cast<Page>(i + 1);
+            Page p = na::menu::kPages[i];
             float bw = horizontal ? NavButtonWidth(na::menu::PageName(p)) : nav_w;
             if (horizontal && i) {
                 if (used + S(8) + bw <= avail) {
@@ -2531,6 +2536,9 @@ void draw_panel(bool just_opened)
             na::menu::DrawPage(Page::Enhancements, true);
             ImGui::Dummy(ImVec2(0, S(8)));
             Hint("New features appear here when they are ready. Unavailable features do not change your picture.");
+            break;
+        case Page::Experimental:
+            na::menu::DrawPage(Page::Experimental, true);
             break;
         case Page::Preferences:
             draw_preferences();

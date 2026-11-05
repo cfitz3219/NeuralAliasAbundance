@@ -1,5 +1,6 @@
-// NeuralAlias menu framework: the in-game menu is four pages (Picture,
-// Enhancements, Preferences, Details & support) whose content comes from
+// NeuralAlias menu framework: Picture, Enhancements, Experimental,
+// Preferences and Details & support contain feature-owned sections.
+// Their content comes from
 // feature sections registered by the module that owns them. Both routes use
 // this; a route registers its sections at startup and the overlay host draws
 // the chrome (title, navigation, footer) and the sections of the current page.
@@ -25,8 +26,10 @@ enum class Page {
     Enhancements,
     Preferences,
     Details,
+    Experimental, // appended to preserve the existing page identities
 };
-constexpr int kPageCount = 4; // Picture..Details
+inline constexpr Page kPages[] = {Page::Picture, Page::Enhancements, Page::Experimental, Page::Preferences, Page::Details};
+constexpr int kPageCount = sizeof(kPages) / sizeof(kPages[0]);
 const char* PageName(Page p); // "Picture", "Enhancements", "Preferences", "Details & support"
 
 struct Section {

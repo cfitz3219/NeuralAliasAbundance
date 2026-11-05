@@ -12,6 +12,7 @@ int main() {
     CHECK(na::mode::BuildSavedRequest(0,13,3440,1440,saved) && saved.render_w==3440 && saved.render_h==1440);
     CHECK(!na::mode::BuildSavedRequest(99,13,3440,1440,saved));
     auto& st=na::settings::Get();
+    CHECK(!st.donut_tone && !st.donut_bloom && !st.xegtao_enabled);
     st.motion_enabled=0; st.nr_paper_white=200; st.dlss_mode=4; st.fg_preset=3;
     auto ms=na::motion::GetStats();
     std::printf("motion requested=0 observed=%u\n",ms.enabled);
@@ -23,10 +24,21 @@ int main() {
     io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
     na::ui::ApplyStyle();
     na::overlay::RegisterRouteAMenu();
-    for(int page=1;page<=4;++page) {
-        std::printf("drawing page %d\n",page); std::fflush(stdout);
+    CHECK(na::menu::kPageCount==5);
+    CHECK(!strcmp(na::menu::PageName(na::menu::Page::Experimental),"Experimental"));
+    int experimental=0;
+    for(int i=0;i<na::menu::Count();++i){
+        const auto* section=na::menu::At(i);
+        if(!strcmp(section->title,"XeGTAO") || !strcmp(section->title,"Lighting")){
+            CHECK(na::menu::ResolvePage(*section)==(!strcmp(section->title,"XeGTAO")?na::menu::Page::Enhancements:na::menu::Page::Experimental));++experimental;
+        }
+    }
+    CHECK(experimental==2);
+    for(auto page:na::menu::kPages) {
+        na::menu::SetCurrentPage(page);CHECK(na::menu::CurrentPage()==page);
+        std::printf("drawing page %s\n",na::menu::PageName(page)); std::fflush(stdout);
         ImGui::NewFrame(); ImGui::SetNextWindowSize({1400,800}); ImGui::Begin("NeuralAlias");
-        na::menu::DrawPage(static_cast<na::menu::Page>(page),true);
+        na::menu::DrawPage(page,true);
         ImGui::End(); ImGui::Render();
     }
     ImGui::DestroyContext();

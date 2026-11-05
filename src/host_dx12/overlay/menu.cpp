@@ -21,6 +21,7 @@ const char* PageName(Page p)
     switch (p) {
     case Page::Picture: return "Picture";
     case Page::Enhancements: return "Enhancements";
+    case Page::Experimental: return "Experimental";
     case Page::Preferences: return "Preferences";
     case Page::Details: return "Details & support";
     default: return "";

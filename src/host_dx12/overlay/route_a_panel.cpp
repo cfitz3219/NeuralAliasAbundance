@@ -1442,7 +1442,7 @@ void RegisterRouteAMenu()
     na::menu::Register({"DLSS in use", Availability::Available, nullptr, &DrawDlssInUseRow, Page::Enhancements});
     na::menu::Register({"Motion analysis", Availability::Available, nullptr, &DrawMotionRow, Page::Enhancements});
     na::menu::Register({"XeGTAO", Availability::Available, nullptr, &DrawAmbientOcclusion, Page::Enhancements});
-    na::menu::Register({"Lighting", Availability::Available, nullptr, &DrawDonutLighting, Page::Enhancements});
+    na::menu::Register({"Lighting", Availability::Available, nullptr, &DrawDonutLighting, Page::Experimental});
     na::menu::Register({"Connection", Availability::Available, nullptr, &DrawConnectionRow, Page::Details});
     na::menu::Register({"Save pictures for analysis", Availability::Available, nullptr, &DrawCaptureRow,
                         Page::Details});
