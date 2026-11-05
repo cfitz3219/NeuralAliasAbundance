@@ -1173,14 +1173,14 @@ void write_status_line()
             {
                 // Burst diagnosis (2026-11-05): every distinct reason given, with counts, and
                 // inline placements that fired but could not record DLAA.
-                char rl[1200];
-                int rn = snprintf(rl, sizeof rl, "j2_reasons inline_record_failed=%llu kinds=%u", (unsigned long long)j2.inline_record_failed, j2.reason_kinds);
-                for (uint32_t i = 0; i < j2.reason_kinds && rn > 0 && rn < static_cast<int>(sizeof rl) - 90; ++i) {
-                    const int m = snprintf(rl + rn, sizeof rl - static_cast<size_t>(rn), " | %llu:%s", (unsigned long long)j2.reason_counts[i].n, j2.reason_counts[i].text);
+                char reasons_line[1200];
+                int rn = snprintf(reasons_line, sizeof reasons_line, "j2_reasons inline_record_failed=%llu kinds=%u", (unsigned long long)j2.inline_record_failed, j2.reason_kinds);
+                for (uint32_t i = 0; i < j2.reason_kinds && rn > 0 && rn < static_cast<int>(sizeof reasons_line) - 90; ++i) {
+                    const int m = snprintf(reasons_line + rn, sizeof reasons_line - static_cast<size_t>(rn), " | %llu:%s", (unsigned long long)j2.reason_counts[i].n, j2.reason_counts[i].text);
                     if (m < 0) break;
                     rn += m;
                 }
-                if (rn > 0 && rn < static_cast<int>(sizeof rl) - 2) { rl[rn++] = '\r'; rl[rn++] = '\n'; WriteFile(f, rl, static_cast<DWORD>(rn), &written, nullptr); }
+                if (rn > 0 && rn < static_cast<int>(sizeof reasons_line) - 2) { reasons_line[rn++] = '\r'; reasons_line[rn++] = '\n'; WriteFile(f, reasons_line, static_cast<DWORD>(rn), &written, nullptr); }
             }
             const auto cs = na::capture::j2::GetStats();
             {
