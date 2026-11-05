@@ -54,14 +54,24 @@ groupshared uint bins[256];
     }
     ExposureData[0]=asuint(target);
 }
+// Our wrapper (Cort 2026-11-05, "Bloom does nothing"): the threshold is relative to the
+// scene's own average brightness, measured by the histogram pass, not an absolute scene value.
+// Games hand us scene colour in very different units (SE5's pre-exposed HDR sits far below
+// 1.0, an sRGB scene can never exceed it), so an absolute 1.0 let nothing through. 1.0 means
+// "5.5x the average" (photographic middle grey 0.18 = the average).
+float sceneAverage() { float a=asfloat(ExposureData[0]); return isfinite(a)&&a>0 ? max(a,minLuma) : minLuma; }
+float bloomThreshold() {
+    float t=threshold*sceneAverage()/.18;
+    return srgb ? min(t,.8) : t; // display-encoded input tops out at 1.0
+}
 [numthreads(8,8,1)] void Downsample(uint2 p:SV_DispatchThreadID) {
     if(any(p>=blurSize))return;
-    float3 c=0;uint n=0;
+    float3 c=0;uint n=0;const float t=bloomThreshold();
     for(uint y=0;y<4;++y)for(uint x=0;x<4;++x) {
         uint2 q=p*4+uint2(x,y);if(any(q>=size))continue;
         float3 v=max(clean(decode(Source[q+origin].rgb)),0);
         // Bright extraction is our optional wrapper, before the original Donut blur.
-        float l=luminance(v);c+=v*(max(l-threshold,0)/max(l,1e-6));++n;
+        float l=luminance(v);c+=v*(max(l-t,0)/max(l,1e-6));++n;
     }
     Destination[p]=float4(c/max(n,1),1);
 }
@@ -87,13 +97,28 @@ groupshared uint bins[256];
     float4 original=Source[p+origin];float3 c=clean(decode(original.rgb));
     if(bloom)c+=BlurSource.SampleLevel(LinearClamp,(p+.5)/size,0).rgb*bloomAmount;
     if(tone) {
-        float l=luminance(c), adapted=max(asfloat(ExposureData[0]),minLuma);
-        float scale=exp2(exposureBias)/adapted;
+        // Relative tone curve (Cort 2026-11-05: the main menu lit up and flickered). Donut's
+        // operator sets an absolute exposure; here the game's own exposure and final colour
+        // processing still follow, so an absolute exposure overrode the game's brightness
+        // (a dark menu was raised ~35x), and every frame DLSS did not deliver showed the
+        // ungraded picture next to it. The curve is now applied around the scene's own average
+        // and normalised so the average keeps its brightness: only highlight contrast changes,
+        // and Exposure is a plain gain on top (0 stops = the game's brightness).
+        const float key=.18;
+        float l=luminance(c), adapted=sceneAverage();
+        float scale=key/adapted, gain=exp2(exposureBias);
         float sl=l*scale;
-        float mapped=(sl*(1+sl/(white*white)))/(1+sl);
-        float3 mappedColor=curve?toneMapAces(max(c,0)*scale):max(c,0)*(l>0?mapped/l:0);
+        float3 mappedColor;
+        if(curve) {
+            float keyOut=luminance(toneMapAces(float3(key,key,key)));
+            mappedColor=toneMapAces(max(c,0)*scale)*(key/max(keyOut,1e-6))/scale;
+        } else {
+            float ratio=(1+sl/(white*white))/(1+sl), keyRatio=(1+key/(white*white))/(1+key);
+            mappedColor=max(c,0)*(ratio/keyRatio);
+        }
         // Keep signed HDR components and alpha; no SDR clamp/output transfer is introduced.
-        c=lerp(c,mappedColor+min(c,0),amount);
+        c=lerp(c,mappedColor*gain+min(c,0),amount);
+        if(srgb) c=min(c,1);
     }
     Destination[p+outputOrigin]=float4(encode(c),original.a);
 }

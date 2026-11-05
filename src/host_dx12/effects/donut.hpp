@@ -5,8 +5,9 @@
 namespace na::donut {
 struct Options {
     bool tone=false,bloom=false;
-    float amount=1,exposure_bias=-.5f,white=3,speed_up=1,speed_down=.5f;
-    float low=.8f,high=.95f,min_luminance=.02f,max_luminance=.5f;
+    float amount=1,exposure_bias=0,white=3,speed_up=1,speed_down=.5f; // exposure: gain in stops on top of the game's brightness
+    // Scene-average range the histogram covers (log2 -10..4); relative curves need no tighter clamp.
+    float low=.8f,high=.95f,min_luminance=1.f/1024,max_luminance=16;
     float bloom_amount=.1f,bloom_sigma=16,bloom_threshold=1;
     uint32_t curve=0; // Donut luminance Reinhard / Falcor fitted filmic
 };

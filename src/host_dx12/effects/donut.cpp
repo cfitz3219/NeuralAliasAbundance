@@ -190,7 +190,7 @@ bool Frame::Record(ID3D12GraphicsCommandList* l) {
     Constants c=w.constants;c.reset|=s.first||!s.queue;
     const auto now=std::chrono::steady_clock::now();
     if(c.seconds==0)c.seconds=s.first?1.f/60:std::clamp(std::chrono::duration<float>(now-s.last).count(),0.f,1.f);
-    if(c.tone){s.first=false;s.last=now;}
+    if(c.tone||c.bloom){s.first=false;s.last=now;}
     l->SetComputeRootSignature(w.programs->root.Get());auto* heap=w.heap.Get();l->SetDescriptorHeaps(1,&heap);
     auto dispatch=[&](unsigned program,unsigned table,unsigned x,unsigned y){
         const auto& packet=w.gpu[program==4&&table==3?6:table];
@@ -201,7 +201,8 @@ bool Frame::Record(ID3D12GraphicsCommandList* l) {
         l->SetPipelineState(w.programs->pso[program].Get());
         l->SetComputeRoot32BitConstants(0,sizeof(c)/4,&c,0);auto h=heap->GetGPUDescriptorHandleForHeapStart();h.ptr+=UINT64(table*5)*w.stride;
         l->SetComputeRootDescriptorTable(1,h);l->Dispatch(x,y,1);};
-    if(c.tone){dispatch(0,0,1,1);uav(l,s.histogram.Get());dispatch(1,1,(s.w+63)/64,(s.h+63)/64);uav(l,s.histogram.Get());
+    // The scene average drives both effects (tone curve centre, bloom threshold).
+    if(c.tone||c.bloom){dispatch(0,0,1,1);uav(l,s.histogram.Get());dispatch(1,1,(s.w+63)/64,(s.h+63)/64);uav(l,s.histogram.Get());
         dispatch(2,2,1,1);uav(l,s.exposure.Get());}
     if(c.bloom){transition(l,s.blurA.Get(),Read,Write);dispatch(3,3,(s.bw+7)/8,(s.bh+7)/8);transition(l,s.blurA.Get(),Write,Read);
         c.horizontal=1;transition(l,s.blurB.Get(),Read,Write);dispatch(4,4,(s.bw+7)/8,(s.bh+7)/8);transition(l,s.blurB.Get(),Write,Read);

@@ -102,7 +102,7 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
     target.donut_tone.store((std::clamp)(GetPrivateProfileIntW(L"donut",L"tone",0,ini),0u,1u));
     target.donut_bloom.store((std::clamp)(GetPrivateProfileIntW(L"donut",L"bloom",0,ini),0u,1u));
     target.donut_amount.store((std::clamp)(GetPrivateProfileIntW(L"donut",L"amount",100,ini),0u,100u));
-    target.donut_bias.store((std::clamp)(GetPrivateProfileIntW(L"donut",L"bias",750,ini),0u,1600u));
+    target.donut_bias.store((std::clamp)(GetPrivateProfileIntW(L"donut",L"exposure",800,ini),0u,1600u));
     target.donut_white.store((std::clamp)(GetPrivateProfileIntW(L"donut",L"white",3000,ini),100u,20000u));
     target.donut_speed_up.store((std::clamp)(GetPrivateProfileIntW(L"donut",L"speed_up",1000,ini),0u,20000u));
     target.donut_speed_down.store((std::clamp)(GetPrivateProfileIntW(L"donut",L"speed_down",500,ini),0u,20000u));
@@ -354,7 +354,7 @@ bool SaveFromWorker()
         {L"tone",g_settings.donut_tone.load()},
         {L"bloom",g_settings.donut_bloom.load()},
         {L"amount",g_settings.donut_amount.load()},
-        {L"bias",g_settings.donut_bias.load()},
+        {L"exposure",g_settings.donut_bias.load()} // was "bias" (absolute exposure, default -0.5 stops) until 2026-11-05,
         {L"white",g_settings.donut_white.load()},
         {L"speed_up",g_settings.donut_speed_up.load()},
         {L"speed_down",g_settings.donut_speed_down.load()},

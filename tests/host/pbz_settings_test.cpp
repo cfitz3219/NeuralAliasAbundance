@@ -12,7 +12,7 @@ int main() {
     WritePrivateProfileStringW(L"fg",L"profile_override",L"1",ini);
     na::settings::SetIniPath(ini); na::settings::Load();
     auto& s=na::settings::Get();
-    CHECK(s.donut_tone==0&&s.donut_bloom==0&&s.donut_bias==750&&s.donut_white==3000);
+    CHECK(s.donut_tone==0&&s.donut_bloom==0&&s.donut_bias==800&&s.donut_white==3000);
     CHECK(s.experimental_nvrhi==0);s.experimental_nvrhi=1;
     s.donut_tone=1;s.donut_bloom=1;s.donut_bias=625;s.donut_curve=1;s.donut_bloom_sigma=24000;
     CHECK(na::settings::Save());s.experimental_nvrhi=0;s.donut_tone=0;s.donut_bloom=0;s.donut_bias=0;s.donut_curve=0;s.donut_bloom_sigma=4000;

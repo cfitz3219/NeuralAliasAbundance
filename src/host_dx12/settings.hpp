@@ -67,7 +67,7 @@ struct Settings {
     std::atomic<uint32_t> nr_enabled{0};
     std::atomic<uint32_t> experimental_nvrhi{0}; // optional shared GPU infrastructure, [experimental]
     // Optional Donut scene grade/Bloom; disabled by default, [donut].
-    std::atomic<uint32_t> donut_tone{0},donut_bloom{0},donut_amount{100},donut_bias{750},donut_white{3000};
+    std::atomic<uint32_t> donut_tone{0},donut_bloom{0},donut_amount{100},donut_bias{800},donut_white{3000};
     std::atomic<uint32_t> donut_speed_up{1000},donut_speed_down{500},donut_curve{0};
     std::atomic<uint32_t> donut_bloom_amount{100},donut_bloom_sigma{16000},donut_bloom_threshold{1000};
     // Optional Intel XeGTAO contact shading; [xegtao], remembered per game.

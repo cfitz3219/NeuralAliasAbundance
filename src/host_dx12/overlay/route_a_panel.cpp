@@ -1369,7 +1369,7 @@ void RegisterLiveDlaaMenu()
         return false;
     };
     if (!registered(&DrawAmbientOcclusion))
-        na::menu::Register({"XeGTAO", na::menu::Availability::Available, nullptr, &DrawAmbientOcclusion, na::menu::Page::Enhancements});
+        na::menu::Register({"XeGTAO (Ambient Occlusion)", na::menu::Availability::Available, nullptr, &DrawAmbientOcclusion, na::menu::Page::Enhancements});
     if (!registered(&DrawDonutLighting))
         na::menu::Register({"Lighting", na::menu::Availability::Available, nullptr, &DrawDonutLighting, na::menu::Page::Experimental});
     if (!registered(&DrawExperimentalGpu))
@@ -1380,7 +1380,7 @@ static void DrawExperimentalGpu()
 {
     using namespace na::ui;
     auto& settings=na::settings::Get();const auto stats=na::gpu::GetStats();bool enabled=settings.experimental_nvrhi.load()!=0;
-    BeginRow("Shared GPU infrastructure (NVRHI)","Changes how supported GPU work is managed; the picture algorithms stay the same.",SwitchWidth());
+    BeginRow("Run effects through NVIDIA NVRHI","Behind-the-scenes test switch: our own extra effects (XeGTAO, Lighting) are submitted through NVIDIA's NVRHI library instead of our own Direct3D 12 code. The picture does not change; leave it off unless testing stability or speed.",SwitchWidth());
     ImGui::BeginDisabled(!stats.built);
     if(ImGui::Checkbox("##experimental_gpu",&enabled)){settings.experimental_nvrhi=enabled;na::settings::Save();}
     ImGui::EndDisabled();EndRow();
@@ -1388,7 +1388,7 @@ static void DrawExperimentalGpu()
     std::snprintf(details,sizeof details,"GPU scratch memory: %.1f MB used in %.1f MB of reusable heaps.",memory.allocation_bytes/1048576.0,memory.block_bytes/1048576.0);Hint(details);
     std::snprintf(details,sizeof details,"Background preparation: %u working, %u waiting; %llu jobs completed.",preparation.active,
         preparation.pending>=preparation.active?preparation.pending-preparation.active:0,static_cast<unsigned long long>(preparation.completed));Hint(details);
-    if(!stats.built)Hint("Unavailable in this build.");
+    if(!stats.built)Hint("This package was built without NVRHI, so the switch is greyed out.");
     else if(enabled){char status[192];std::snprintf(status,sizeof status,"Shared GPU work: %llu submissions, %llu effect dispatches, %llu managed textures.",
         static_cast<unsigned long long>(stats.submits),static_cast<unsigned long long>(stats.dispatches),static_cast<unsigned long long>(stats.textures));Hint(status);}
 }
@@ -1397,9 +1397,13 @@ static void DrawDonutLighting()
 {
     using namespace na::ui;
     auto& s=na::settings::Get();bool tone=s.donut_tone.load()!=0,bloom=s.donut_bloom.load()!=0;
+    // BeginRow pushes the row label as an ID, so the popup ID is taken outside the row: an
+    // OpenPopup("...") inside it named a different popup than BeginPopupModal below, and the
+    // button did nothing (Cort 2026-11-05).
+    const ImGuiID lighting_popup=ImGui::GetID("Lighting settings");
     BeginRow("Adaptive tone mapping","Adjusts scene brightness and highlight contrast before the game's final colour processing.",S(220));
     if(ImGui::Checkbox("##donuttone",&tone)){s.donut_tone=tone;na::settings::Save();}
-    ImGui::SameLine();if(Button("Lighting settings..."))ImGui::OpenPopup("Lighting settings");EndRow();
+    ImGui::SameLine();if(Button("Lighting settings..."))ImGui::OpenPopup(lighting_popup);EndRow();
     BeginRow("Bloom","Adds an adjustable soft glow around bright scene details.",SwitchWidth());
     if(ImGui::Checkbox("##donutbloom",&bloom)){s.donut_bloom=bloom;na::settings::Save();}EndRow();
     if(tone||bloom){const auto status=na::donut::ScenePass().GetStats();char activity[224];
@@ -1413,7 +1417,7 @@ static void DrawDonutLighting()
         title(name,tip);float v=field.load()*.001f;if(ImGui::SliderFloat(id,&v,lo,hi,"%.2f")){field=uint32_t(v*1000+.5f);changed=true;}};
     title("Amount","Blends between the original scene and the adjusted tone curve.");int amount=int(s.donut_amount.load());
     if(ImGui::SliderInt("##toneamount",&amount,0,100,"%d%%")){s.donut_amount=amount;changed=true;}
-    title("Exposure","Brightens or darkens the scene in photographic stops.");float bias=(int(s.donut_bias.load())-800)*.01f;
+    title("Exposure","Brightens or darkens the scene in photographic stops; 0 keeps the game's own brightness.");float bias=(int(s.donut_bias.load())-800)*.01f;
     if(ImGui::SliderFloat("##tonebias",&bias,-8,8,"%.2f stops")){s.donut_bias=uint32_t((bias+8)*100+.5f);changed=true;}
     title("Highlight curve","Donut preserves luminance ratios; Filmic uses Falcor's fitted highlight curve.");
     int curve=int(s.donut_curve.load());const char* curves[]={"Donut","Filmic (Falcor)"};
@@ -1424,8 +1428,8 @@ static void DrawDonutLighting()
     ImGui::Separator();if(ImGui::Checkbox("Bloom",&bloom)){s.donut_bloom=bloom;changed=true;}
     scalar("Glow amount","Sets the added glow; zero leaves scene colour unchanged.","##bloomamount",s.donut_bloom_amount,0,1);
     scalar("Glow radius","Spreads light over a wider or narrower area, in scene pixels.","##bloomsigma",s.donut_bloom_sigma,4,64);
-    scalar("Glow threshold","Only scene values brighter than this contribute to the glow.","##bloomthreshold",s.donut_bloom_threshold,0,20);
-    if(Button("Reset lighting defaults")){s.donut_amount=100;s.donut_bias=750;s.donut_white=3000;s.donut_speed_up=1000;s.donut_speed_down=500;
+    scalar("Glow threshold","How much brighter than the scene's average a spot must be to glow (1 = about 5x the average).","##bloomthreshold",s.donut_bloom_threshold,0,20);
+    if(Button("Reset lighting defaults")){s.donut_amount=100;s.donut_bias=800;s.donut_white=3000;s.donut_speed_up=1000;s.donut_speed_down=500;
         s.donut_curve=0;s.donut_bloom_amount=100;s.donut_bloom_sigma=16000;s.donut_bloom_threshold=1000;changed=true;}
     if(changed)na::settings::Save();
     const auto stats=na::donut::ScenePass().GetStats();
@@ -1438,9 +1442,10 @@ static void DrawAmbientOcclusion()
 {
     using namespace na::ui;
     auto& s=na::settings::Get();bool enabled=s.xegtao_enabled.load()!=0;
-    BeginRow("XeGTAO contact shading", "Adds soft shading around corners and where objects meet. Turn the game's ambient occlusion off where possible to avoid doubling its shading.", S(220));
+    const ImGuiID xegtao_popup=ImGui::GetID("XeGTAO settings"); // outside the row: see DrawDonutLighting
+    BeginRow("XeGTAO (Ambient Occlusion)", "Adds soft shading around corners and where objects meet. Turn the game's ambient occlusion off where possible to avoid doubling its shading.", S(220));
     if(ImGui::Checkbox("##xegtao",&enabled)){s.xegtao_enabled.store(enabled?1u:0u);na::settings::Save();}
-    ImGui::SameLine();if(Button("Settings..."))ImGui::OpenPopup("XeGTAO settings");EndRow();
+    ImGui::SameLine();if(Button("Settings..."))ImGui::OpenPopup(xegtao_popup);EndRow();
     ImGui::SetNextWindowSize(ImVec2(S(580),0),ImGuiCond_Appearing);
     // The modal stays open on outside clicks; its own X dismisses it.
     bool open=true;
@@ -1496,7 +1501,7 @@ void RegisterRouteAMenu()
     na::menu::Register({"Latency and display", Availability::Available, nullptr, &DrawLatencyDetails, Page::Details});
     na::menu::Register({"DLSS in use", Availability::Available, nullptr, &DrawDlssInUseRow, Page::Enhancements});
     na::menu::Register({"Motion analysis", Availability::Available, nullptr, &DrawMotionRow, Page::Enhancements});
-    na::menu::Register({"XeGTAO", Availability::Available, nullptr, &DrawAmbientOcclusion, Page::Enhancements});
+    na::menu::Register({"XeGTAO (Ambient Occlusion)", Availability::Available, nullptr, &DrawAmbientOcclusion, Page::Enhancements});
     na::menu::Register({"GPU infrastructure", Availability::Available, nullptr, &DrawExperimentalGpu, Page::Experimental});
     na::menu::Register({"Lighting", Availability::Available, nullptr, &DrawDonutLighting, Page::Experimental});
     na::menu::Register({"Connection", Availability::Available, nullptr, &DrawConnectionRow, Page::Details});

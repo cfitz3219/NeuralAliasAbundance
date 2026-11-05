@@ -96,18 +96,23 @@ int main(int argc,char** argv){
     options.bloom_amount=0;CHECK(!pass.Prepare(d.device.Get(),d.queue.Get(),in,options));
     options.bloom_amount=.5f;options.bloom_threshold=100;auto noGlow=render(options,in);CHECK(noGlow==data);
     options.bloom=false;options.tone=true;in.reset=true;
-    auto tone=render(options,in);REQUIRE(tone.size()==data.size());CHECK(tone[(20*W+32)*4]!=data[(20*W+32)*4]);
+    auto tone=render(options,in);REQUIRE(tone.size()==data.size());CHECK(tone[(20*W+32)*4]<data[(20*W+32)*4]); // highlights compressed
+    // The scene average keeps the game's brightness (a dark menu must not be lit up).
+    CHECK(std::abs(tone[(3*W+3)*4]-.1f)<.002f);
     for(size_t i=0;i<tone.size();++i)CHECK(std::isfinite(tone[i]));
     options.curve=1;auto filmic=render(options,in);CHECK(filmic!=tone);
     for(size_t i=0;i<filmic.size();i+=4){CHECK(filmic[i]>=0&&filmic[i]<=1);CHECK(filmic[i+3]==.37f);}
-    // Exposure follows a changed scene gradually on the same ordered queue; reset is immediate.
+    // Adaptation follows a changed scene gradually on the same ordered queue; reset is immediate.
+    // While it lags behind a brighter scene, highlights are compressed more; once adapted (or
+    // on reset) a uniform scene keeps its own brightness.
     options.curve=0;in.reset=true;render(options,in);
     test::List brightUpload;REQUIRE(brightUpload.Create(d.device.Get()));std::vector<float> brightData(W*H*4,2);
     auto brightImage=input(d,brightUpload,W,H,DXGI_FORMAT_R32G32B32A32_FLOAT,brightData,4);
     REQUIRE(SUCCEEDED(brightUpload.list->Close()));ID3D12CommandList* bl[]={brightUpload.list.Get()};d.queue->ExecuteCommandLists(1,bl);d.WaitIdle();
     auto brighter=in;brighter.color=brightImage.texture.Get();brighter.reset=false;
     auto transition1=render(options,brighter),transition2=render(options,brighter);
-    CHECK(transition1[0]>transition2[0]);brighter.reset=true;auto cut=render(options,brighter);CHECK(cut[0]<transition2[0]);
+    CHECK(transition1[0]<transition2[0]);brighter.reset=true;auto cut=render(options,brighter);CHECK(cut[0]>transition2[0]);
+    CHECK(std::abs(cut[0]-2.f)<.02f);
     options.amount=0;options.bloom=true;options.bloom_amount=0;
     CHECK(!pass.Prepare(d.device.Get(),d.queue.Get(),in,options));
     options.bloom_amount=.1f;options.bloom_threshold=100;
