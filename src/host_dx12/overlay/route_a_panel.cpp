@@ -1270,6 +1270,7 @@ void DrawLiveDlaaEnhancements()
 // to record images, data, logs from the debugged view").
 void DrawDlssDebug()
 {
+    using namespace na::ui;
     const auto i = na::dlss_debug::Query();
     char line[400];
     if (!i.loaded) StatusLine(2, "DLSS DLL: not loaded yet (DLSS has not been created in this session).");
