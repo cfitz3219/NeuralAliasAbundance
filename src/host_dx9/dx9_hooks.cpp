@@ -67,6 +67,7 @@ constexpr DWORD kSamplers = 16;
 float g_samp_game[kSamplers]{};
 float g_bias_now = 0;
 uint32_t g_frame_jittered = 0, g_frame_unjittered = 0;
+uint32_t g_vp_w = 0, g_vp_h = 0; // the viewport (the jitter is in its pixels); SetRenderTarget(0) resets it to the target
 uint32_t g_patch_logs = 0;
 
 bool Watched(const void* dev) { return dev && dev == static_cast<const void*>(g_dev.load(std::memory_order_acquire)) && !t_in_fire; }
@@ -151,6 +152,8 @@ void Resync(IDirect3DDevice9* dev)
     D3DMATRIX v{}, p{};
     const bool have_view = SUCCEEDED(dev->GetTransform(D3DTS_VIEW, &v));
     const bool have_proj = SUCCEEDED(dev->GetTransform(D3DTS_PROJECTION, &p));
+    D3DVIEWPORT9 vp{};
+    const bool have_vp = SUCCEEDED(dev->GetViewport(&vp));
     float bias[kSamplers]{};
     for (DWORD i = 0; i < kSamplers; ++i) {
         DWORD b = 0;
@@ -171,6 +174,7 @@ void Resync(IDirect3DDevice9* dev)
             if (std::fabs(bias[i] - (g_samp_game[i] + g_bias_now)) > 1e-6f) g_samp_game[i] = bias[i];
         g_vs_bound = vs != nullptr;
         g_vs_patched = vs && g_patched.count(vs.Get()) != 0;
+        if (have_vp) { g_vp_w = vp.Width; g_vp_h = vp.Height; }
     }
     WriteBias(dev);
     std::lock_guard<std::mutex> l(g_mu);
@@ -208,6 +212,7 @@ HRESULT WINAPI SwapChainPresent_h(IDirect3DSwapChain9*, const RECT*, const RECT*
 HRESULT WINAPI StateBlockApply_h(IDirect3DStateBlock9*);
 HRESULT WINAPI CreateVertexShader_h(IDirect3DDevice9*, const DWORD*, IDirect3DVertexShader9**);
 HRESULT WINAPI SetSamplerState_h(IDirect3DDevice9*, DWORD, D3DSAMPLERSTATETYPE, DWORD);
+HRESULT WINAPI SetViewport_h(IDirect3DDevice9*, const D3DVIEWPORT9*);
 
 // IDirect3DDevice9 vtable slots (d3d9.h order).
 Method m_set_rt{37, reinterpret_cast<void*>(&SetRenderTarget_h)};
@@ -230,6 +235,7 @@ Method m_sc_present{3, reinterpret_cast<void*>(&SwapChainPresent_h)};
 Method m_sb_apply{5, reinterpret_cast<void*>(&StateBlockApply_h)};
 Method m_create_vs{91, reinterpret_cast<void*>(&CreateVertexShader_h)};
 Method m_set_sampler{69, reinterpret_cast<void*>(&SetSamplerState_h)};
+Method m_set_viewport{47, reinterpret_cast<void*>(&SetViewport_h)};
 
 using SetVscFn = HRESULT(WINAPI*)(IDirect3DDevice9*, UINT, const float*, UINT);
 using SetTransformFn = HRESULT(WINAPI*)(IDirect3DDevice9*, D3DTRANSFORMSTATETYPE, const D3DMATRIX*);
@@ -267,8 +273,9 @@ DrawFix PlanDrawLocked()
     const bool scene = g_ears.NextDrawIsScene();
     const bool jit = scene && g_jitter_on;
     const auto& ci = g_ears.Model().Current().color_info;
-    const float dx = ci.width ? 2.f * g_jx / static_cast<float>(ci.width) : 0.f;
-    const float dy = ci.height ? -2.f * g_jy / static_cast<float>(ci.height) : 0.f;
+    const uint32_t vw = g_vp_w ? g_vp_w : ci.width, vh = g_vp_h ? g_vp_h : ci.height;
+    const float dx = vw ? 2.f * g_jx / static_cast<float>(vw) : 0.f;
+    const float dy = vh ? -2.f * g_jy / static_cast<float>(vh) : 0.f;
     if (g_vs_bound) {
         if (!g_cj) {
             if (jit) ++g_frame_unjittered;
@@ -327,6 +334,8 @@ HRESULT WINAPI SetRenderTarget_h(IDirect3DDevice9* self, DWORD index, IDirect3DS
         std::lock_guard<std::mutex> l(g_mu);
         const SurfaceInfo& r = Describe(s);
         g_ears.SetRenderTarget0(r.id, r.info);
+        g_vp_w = r.info.width; // D3D9: setting render target 0 resets the viewport to its size
+        g_vp_h = r.info.height;
     }
     return hr;
 }
@@ -558,6 +567,19 @@ HRESULT WINAPI CreateVertexShader_h(IDirect3DDevice9* self, const DWORD* fn, IDi
     return hr;
 }
 
+HRESULT WINAPI SetViewport_h(IDirect3DDevice9* self, const D3DVIEWPORT9* vp)
+{
+    using F = HRESULT(WINAPI*)(IDirect3DDevice9*, const D3DVIEWPORT9*);
+    NA_ORIG(m_set_viewport, F);
+    const HRESULT hr = orig(self, vp);
+    if (vp && SUCCEEDED(hr) && Watched(self)) {
+        std::lock_guard<std::mutex> l(g_mu);
+        g_vp_w = vp->Width;
+        g_vp_h = vp->Height;
+    }
+    return hr;
+}
+
 HRESULT WINAPI SetSamplerState_h(IDirect3DDevice9* self, DWORD sampler, D3DSAMPLERSTATETYPE type, DWORD value)
 {
     using F = HRESULT(WINAPI*)(IDirect3DDevice9*, DWORD, D3DSAMPLERSTATETYPE, DWORD);
@@ -724,7 +746,7 @@ void AttachDevice(IDirect3DDevice9* dev, const D3DPRESENT_PARAMETERS* pp)
     if (!dev) return;
     int failed = 0;
     for (Method* m : {&m_set_rt, &m_set_ds, &m_clear, &m_set_transform, &m_set_rs, &m_set_texture, &m_stretch, &m_get_rtdata, &m_draw,
-                      &m_draw_indexed, &m_draw_up, &m_draw_indexed_up, &m_set_vs, &m_set_vsc, &m_present, &m_create_vs, &m_set_sampler})
+                      &m_draw_indexed, &m_draw_up, &m_draw_indexed_up, &m_set_vs, &m_set_vsc, &m_present, &m_create_vs, &m_set_sampler, &m_set_viewport})
         if (!HookMethod(*m, dev)) ++failed;
     ComPtr<IDirect3DDevice9Ex> ex;
     if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&ex))) && ex && !HookMethod(m_present_ex, ex.Get())) ++failed;

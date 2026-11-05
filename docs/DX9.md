@@ -81,6 +81,4 @@ Settings are read at start-up for now. There is no in-game overlay for DX9 yet.
   moving objects and camera pans. Camera motion covers games that upload a
   ViewProjection, which the scan finds.
 - No overlay / live settings for DX9 (start-up ini only).
-- The jitter scale uses the scene target's size; a game that renders the scene
-  into a smaller viewport of a bigger target would get slightly wrong jitter.
 - Not run on a real game yet.
