@@ -29,8 +29,8 @@ int main() {
     int experimental=0;
     for(int i=0;i<na::menu::Count();++i){
         const auto* section=na::menu::At(i);
-        if(!strcmp(section->title,"XeGTAO") || !strcmp(section->title,"Lighting")){
-            CHECK(na::menu::ResolvePage(*section)==(!strcmp(section->title,"XeGTAO")?na::menu::Page::Enhancements:na::menu::Page::Experimental));++experimental;
+        if(!strcmp(section->title,"XeGTAO (Ambient Occlusion)") || !strcmp(section->title,"Lighting")){
+            CHECK(na::menu::ResolvePage(*section)==(!strcmp(section->title,"XeGTAO (Ambient Occlusion)")?na::menu::Page::Enhancements:na::menu::Page::Experimental));++experimental;
         }
     }
     CHECK(experimental==2);
@@ -44,7 +44,7 @@ int main() {
     // Live-DLAA-only games must expose the same pages without Route A registration.
     na::menu::Clear();na::overlay::RegisterLiveDlaaMenu();int effects=0;
     for(int i=0;i<na::menu::Count();++i){const auto* section=na::menu::At(i);
-        if(!strcmp(section->title,"XeGTAO")){CHECK(section->page==na::menu::Page::Enhancements);++effects;}
+        if(!strcmp(section->title,"XeGTAO (Ambient Occlusion)")){CHECK(section->page==na::menu::Page::Enhancements);++effects;}
         if(!strcmp(section->title,"Lighting")||!strcmp(section->title,"GPU infrastructure")){CHECK(section->page==na::menu::Page::Experimental);++effects;}
     }
     CHECK(effects==3);
