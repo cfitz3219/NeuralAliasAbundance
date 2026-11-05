@@ -40,7 +40,7 @@ struct Section {
     Page page = Page::Auto; // A30, additive
 };
 
-// Up to 16 sections; later registrations are ignored (returns false).
+// Up to 24 sections; later registrations are ignored (returns false).
 bool Register(const Section& s);
 void Clear();
 int Count();

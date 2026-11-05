@@ -18,6 +18,7 @@ na_host_test(ffx_flow_test SOURCES ffx_flow_test.cpp LIBS host_ffx_flow dxgi LAB
 na_host_test(jitter_probe_test SOURCES jitter_probe_test.cpp LIBS core_gpu dxgi LABELS gpu)
 na_host_test(gpu_services_test SOURCES gpu_services_test.cpp LIBS host_gpu_services dxgi d3dcompiler LABELS gpu)
 na_host_test(donut_test SOURCES donut_test.cpp LIBS host_dx12 dxgi LABELS gpu)
+na_host_test(dred_test SOURCES dred_test.cpp LIBS host_diag dxgi LABELS gpu)
 na_host_test(xegtao_test SOURCES xegtao_test.cpp LIBS host_dx12 dxgi LABELS gpu)
 na_host_test(viewport_jitter_test SOURCES viewport_jitter_test.cpp LIBS host_observe_producers dxgi d3dcompiler LABELS gpu)
 if(NA_HAVE_NGX_SDK)

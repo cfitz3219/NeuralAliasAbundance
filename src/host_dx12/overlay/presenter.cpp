@@ -1,4 +1,5 @@
 #include "host_dx12/overlay/presenter.hpp"
+#include "host_dx12/diag/dred.hpp"
 
 #include <windows.h>
 #include <timeapi.h>
@@ -1178,6 +1179,7 @@ Stats GetStats()
         s.queried_latency_handle = reinterpret_cast<uintptr_t>(c.queried_latency_handle);
         s.independent_queue=c.queues_bound;
         s.device_hr = c.device ? c.device->GetDeviceRemovedReason() : S_OK;
+        if (s.device_hr != S_OK) na::diag::ReportIfRemoved(c.device.Get());
         for (Slot& slot : c.slots) if (slot.owned.load()) ++s.slots_owned;
         break;
     }

@@ -37,6 +37,7 @@ constexpr uint32_t CreateHeap1 = 54;               // ID3D12Device4
 constexpr uint32_t CreateReservedResource1 = 55;   // ID3D12Device4
 constexpr uint32_t CreateCommittedResource2 = 69;  // ID3D12Device8
 constexpr uint32_t CreatePlacedResource1 = 70;     // ID3D12Device8
+constexpr uint32_t CreateSampler2 = 79;            // ID3D12Device11 (Agility SDK / newer Windows SDK)
 } // namespace device
 
 namespace queue {

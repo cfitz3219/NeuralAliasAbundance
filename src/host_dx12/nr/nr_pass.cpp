@@ -1,5 +1,6 @@
 #include "host_dx12/nr/sl_consumer.hpp"
 #include "host_dx12/gpu/services.hpp"
+#include "host_dx12/diag/dred.hpp"
 #include "host_dx12/nr/nr_pass.hpp"
 #include "host_dx12/nr/nr_shaders.hpp"
 #include "host_dx12/nr/fg_composition.hpp"
@@ -281,6 +282,7 @@ bool ensure_device_locked(ID3D12Device* dev)
     if(g.device && g.device_ready && g.device.Get()!=dev) {
         discard_invalid_recordings_locked();
         const bool removed=FAILED(g.device->GetDeviceRemovedReason());
+        if(removed)na::diag::ReportIfRemoved(g.device.Get());
         if(!removed) {
             if(g.signal_failed || (g.fence && g.fence->GetCompletedValue()<g.fence_next-1))return false;
             for(const auto& p:g.pending)if(p.list || (p.fence && p.fence->GetCompletedValue()<p.submitted))return false;

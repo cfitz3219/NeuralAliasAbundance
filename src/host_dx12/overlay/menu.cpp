@@ -8,7 +8,7 @@
 
 namespace na::menu {
 namespace {
-constexpr int kMax = 16;
+constexpr int kMax = 24;
 Section g_sections[kMax];
 int g_count = 0;
 Page g_current = Page::Picture;

@@ -1,4 +1,5 @@
 #include "host_dx12/host_boot/process_log.hpp"
+#include "host_dx12/diag/dred.hpp"
 #include "host_dx12/native_present/size_spoof.hpp"
 #include "host_dx12/native_present/size_probe.hpp"
 #include "host_dx12/native_present/size_controller.hpp"
@@ -954,11 +955,12 @@ void write_status_line()
         }
         { // anisotropic filtering ([j2] anisotropic): level = in use; static = changed in the twins in use
             const auto as = na::observe::GetAnisoStats();
-            char al[200];
-            const int an = snprintf(al, sizeof al, "anisotropic level=%u setting=%u samplers=%llu static=%llu already=%llu native_surface=%llu native_16=%llu\r\n",
+            char al[260];
+            const int an = snprintf(al, sizeof al, "anisotropic level=%u setting=%u samplers=%llu static=%llu already=%llu native_surface=%llu native_16=%llu create_sampler=%llu create_sampler2=%llu\r\n",
                 as.level, na::settings::Get().aniso16.load(), (unsigned long long)as.samplers,
                   (unsigned long long)as.static_samplers, (unsigned long long)as.already,
-                  (unsigned long long)as.native_surface,(unsigned long long)as.native_16);
+                  (unsigned long long)as.native_surface,(unsigned long long)as.native_16,
+                  (unsigned long long)as.sampler_calls,(unsigned long long)as.sampler2_calls);
             if (an > 0) WriteFile(f, al, DWORD((std::min)(an, int(sizeof al - 1))), &written, nullptr);
         }
         if (na::j2::RenderSmall()) { // P4-4 render-small: one line per status write
@@ -1237,15 +1239,16 @@ void write_status_line()
         if (nn > 0) WriteFile(f, nl, static_cast<DWORD>((std::min)(nn, static_cast<int>(sizeof(nl)-1))), &written, nullptr);
         // Live texture detail: were twins built, and do recordings use them or fall back?
         const auto ml = na::observe::GetMipLiveStats();
-        char ml_line[420];
+        char ml_line[520];
         // chosen = menu/saved; in_use = what recordings bind (differs while preparing);
         // changed_static = the game's static samplers changed in the twins in use (the proof).
-        const int mn = snprintf(ml_line, sizeof ml_line, "mip_live enabled=%u chosen=%.2f/af%u in_use=%.2f/af%u preparing=%u (%llu/%llu) changed_static=%llu game=%.2f twin_rs=%llu twin_pso=%llu untwinned_pso=%llu fallbacks=%llu twin_failures=%llu\r\n",
+        const int mn = snprintf(ml_line, sizeof ml_line, "mip_live enabled=%u chosen=%.2f/af%u in_use=%.2f/af%u preparing=%u (%llu/%llu) changed_static=%llu game=%.2f twin_rs=%llu twin_pso=%llu untwinned_pso=%llu fallbacks=%llu twin_failures=%llu bound{pso_twin=%llu pso_game=%llu rs_twin=%llu rs_game=%llu}\r\n",
                                 ml.enabled ? 1u : 0u, ml.want_bias, ml.want_aniso, ml.live_bias, ml.live_aniso, ml.preparing ? 1u : 0u,
                                 (unsigned long long)ml.prepare_done, (unsigned long long)ml.prepare_total, (unsigned long long)ml.live_static_changed,
                                 ml.game_bias, (unsigned long long)ml.twin_root_signatures,
                                 (unsigned long long)ml.twin_pipelines, (unsigned long long)ml.untwinned_pipelines, (unsigned long long)ml.fallbacks,
-                                (unsigned long long)ml.twin_failures);
+                                (unsigned long long)ml.twin_failures, (unsigned long long)ml.bound_pso_twin, (unsigned long long)ml.bound_pso_game,
+                                (unsigned long long)ml.bound_rs_twin, (unsigned long long)ml.bound_rs_game);
         if (mn > 0) WriteFile(f, ml_line, static_cast<DWORD>((std::min)(mn, static_cast<int>(sizeof(ml_line)-1))), &written, nullptr);
     }
     const auto latency = na::latency::GetStats();
@@ -1618,6 +1621,7 @@ void write_menu_progress(HANDLE log)
     if(pn>0)WriteFile(log,p_line,static_cast<DWORD>(pn),&pw,nullptr);
     std::unique_lock<std::mutex> lock(g_state.mutex, std::try_to_lock);
     if (!lock.owns_lock() || !g_state.device) return;
+    na::diag::ReportIfRemoved(g_state.device.Get());
     char line[400];
     int n = snprintf(line, sizeof(line), "menu_gpu draws=%llu submitted=%llu completed=%llu device_hr=0x%08lX observed_queue=0x%llX present_queue=0x%llX swapchain_queues=%u hits=%u buffer_queue=%u misses=%u\r\n",
                      static_cast<unsigned long long>(g_frames.load()),

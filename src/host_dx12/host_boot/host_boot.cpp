@@ -1,4 +1,5 @@
 #include "host_dx12/j2/hud_unblend.hpp"
+#include "host_dx12/diag/dred.hpp"
 #include "host_dx12/overlay/usage_sampler.hpp"
 #include "host_dx12/host_boot/process_log.hpp"
 #include "host_dx12/nr/sl_consumer.hpp"
@@ -95,6 +96,19 @@ DWORD WINAPI InitThread(LPVOID)
     na::settings::SetIniPath(g_ini);
     na::settings::Load();
     na::host::StartSession();
+    // DRED (Windows' own device-removed diagnostics): must be on before the game creates its
+    // D3D12 device, which waits for this thread. Report beside the status log.
+    {
+        wchar_t dir[MAX_PATH];
+        lstrcpynW(dir, g_ini, MAX_PATH);
+        wchar_t custom[MAX_PATH] = {};
+        if (GetPrivateProfileStringW(L"host", L"status_log", L"", custom, MAX_PATH, g_ini) > 0) lstrcpynW(dir, custom, MAX_PATH);
+        for (int i = lstrlenW(dir) - 1; i >= 0; --i)
+            if (dir[i] == L'\\' || dir[i] == L'/') { dir[i] = 0; break; }
+        const bool page_faults = GetPrivateProfileIntW(L"diagnostics", L"dred", 1, g_ini) != 0;
+        const bool breadcrumbs = GetPrivateProfileIntW(L"diagnostics", L"dred_breadcrumbs", 0, g_ini) == 1;
+        boot_log(na::diag::EnableDred(page_faults, breadcrumbs, dir).c_str());
+    }
     // P4-4 slider route (step 1): our menu's mode sets the game's render scale. The read hook
     // must be in before the game reads its settings file, so it goes in first. Opt-in per game
     // ([j2] read_hook=1, with J2 on); never in safe start. Its log beside the status log.

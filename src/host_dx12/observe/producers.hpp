@@ -284,6 +284,9 @@ struct MipLiveStats {
     uint64_t live_static_changed = 0;   // static samplers changed in the twins of the variant in use
     uint64_t twin_root_signatures = 0, twin_pipelines = 0, untwinned_pipelines = 0, fallbacks = 0, twin_failures = 0;
     uint64_t shared_skips = 0; // twins D3D12 returned as one of the game's own root signatures (identical bytes): not kept
+    // Binds at record time (summed per recording at its next Reset): a twin went to the driver,
+    // or the game's own object was kept (sampler-independent, or the twin is identical).
+    uint64_t bound_pso_twin = 0, bound_pso_game = 0, bound_rs_twin = 0, bound_rs_game = 0;
 };
 MipLiveStats GetMipLiveStats();
 float SamplerMipBias();
@@ -297,6 +300,7 @@ struct AnisoStats {
     uint32_t level = 0;
     uint64_t samplers = 0, static_samplers = 0, already = 0;
     uint64_t native_surface=0,native_16=0; // original observed surface samplers, before our override
+    uint64_t sampler_calls = 0, sampler2_calls = 0; // the game's CreateSampler / CreateSampler2 calls (all, eligible or not)
 };
 AnisoStats GetAnisoStats();
 // The game's own MipLODBias on surface-texture samplers (recorded whether or

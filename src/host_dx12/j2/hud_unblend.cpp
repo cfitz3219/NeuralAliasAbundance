@@ -34,12 +34,17 @@ struct Set {
     UINT inc = 0;
     // The frame being recorded into it:
     uint64_t frame = ~0ull;
-    na_object_id target = 0; // the one target the frame's UI goes into (the first replayed into)
+    na_object_id target = 0; // the one target the frame's UI goes into (see "retarget" in OnDraw)
+    uint64_t lock_seq = 0;   // g_scene_seq when the layers started on `target`
     bool cleared = false;
     DXGI_FORMAT view = DXGI_FORMAT_UNKNOWN;
     uint32_t draws = 0, covered = 0;
 };
 Set g_set[kSets];
+// The latest opaque full-screen pass on a picture-shaped target (tonemap, post-processing):
+// the target the picture is in from then on.
+uint64_t g_scene_seq = 0;
+struct LastScene { uint64_t frame = ~0ull; na_object_id rt = 0; uint64_t seq = 0; } g_last_scene;
 
 struct Bind { ID3D12GraphicsCommandList* list = nullptr; uint64_t recording = 0; na_object_id rt = 0; bool candidate = false; };
 thread_local Bind t_bind;
@@ -221,6 +226,7 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
     // destination is linear, which is all the un-blend formula needs.
     if (verts <= 6 && inst == 1 && native_hud::CoversTarget(vp0, sc0, d.rw, d.rh)) {
         if (!blended) {
+            g_last_scene = LastScene{g_frame, t_bind.rt, ++g_scene_seq};
             if (mine && s.draws) {
                 clear_background_locked(l, s);
                 s.draws = 0;
@@ -246,7 +252,16 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
     const char* why = nullptr;
     // One target per frame: the first one UI was replayed into. Draws of the same shape into
     // another target (a later pass that happens to be picture-shaped) are not part of this UI.
-    if (s.frame == g_frame && s.cleared && s.target != t_bind.rt) { ++g_stats.other_target; why = "another picture-shaped target"; }
+    // Retarget (SE5, Cort's run of 2026-11-05, p12312): the UI sprites go into a canvas first;
+    // a later post-processing pass writes the picture into another picture-shaped target
+    // (opaque, full-screen) and the canvas is laid on THERE with a few blended passes; that
+    // target is what reaches the back buffer. So UI drawn into a target whose picture was
+    // (re)written by an opaque full-screen pass after the layers started takes the layers
+    // over: what was drawn before is inside that picture now. A target that never got such a
+    // pass after the lock (a side buffer drawn later) stays forwarded, as before.
+    const bool other = s.frame == g_frame && s.cleared && s.target != t_bind.rt;
+    const bool retarget = other && g_last_scene.frame == g_frame && g_last_scene.rt == t_bind.rt && g_last_scene.seq > s.lock_seq;
+    if (other && !retarget) { ++g_stats.other_target; why = "another picture-shaped target"; }
     else if (!st.restorable) why = "targets cannot be handed back";
     else if (!st.pipeline_known) why = "unknown pipeline";
     else if (st.rt_count != 1 || st.pso_rt_count != 1) why = "more than one target";
@@ -260,8 +275,16 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
     if (FAILED(l->GetDevice(IID_PPV_ARGS(&dev))) || !set_ready_locked(dev.Get(), s, d)) { forward_locked("could not make the layers"); return {}; }
     D3D12_CPU_DESCRIPTOR_HANDLE rtv[4];
     if (s.frame != g_frame) { s.frame = g_frame; s.cleared = false; s.draws = 0; s.covered = 0; s.view = DXGI_FORMAT_UNKNOWN; s.target = 0; }
+    if (retarget) {
+        s.cleared = false;
+        s.draws = 0;
+        s.covered = 0;
+        s.view = DXGI_FORMAT_UNKNOWN;
+        ++g_stats.retargeted;
+    }
     if (!s.cleared) {
         s.target = t_bind.rt;
+        s.lock_seq = g_scene_seq;
         if (!rtvs_locked(s, view, rtv)) { forward_locked("too many view formats"); return {}; }
         clear_background_locked(l, s);
         s.cleared = true;
@@ -374,11 +397,11 @@ std::string StatusLine()
     char b[1024];
     std::snprintf(b, sizeof b,
         "hud_unblend on=%u frames=%llu hud_frames=%llu composed=%llu held=%llu replayed=%llu blended=%llu forwarded=%llu world=%llu scene=%llu covered=%llu "
-        "cover_blend=%llu other_target=%llu cleared_after=%llu view_changed=%llu restore_failed=%llu last{draws=%u covered=%u view=%u} last_forward=\"%s\" "
+        "cover_blend=%llu other_target=%llu retargeted=%llu cleared_after=%llu view_changed=%llu restore_failed=%llu last{draws=%u covered=%u view=%u} last_forward=\"%s\" "
         "check{frames=%llu window{ui_px=%llu opaque=%llu id=%llu dec=%llu enc=%llu} permille{id=%u dec=%u enc=%u} verdict=%s}",
         Enabled() ? 1u : 0u, (unsigned long long)s.frames, (unsigned long long)s.hud_frames, (unsigned long long)s.composed, (unsigned long long)s.held,
         (unsigned long long)s.replayed, (unsigned long long)s.blended, (unsigned long long)s.forwarded, (unsigned long long)s.world, (unsigned long long)s.scene,
-        (unsigned long long)s.covered, (unsigned long long)s.cover_blend, (unsigned long long)s.other_target, (unsigned long long)s.cleared_after, (unsigned long long)s.view_changed,
+        (unsigned long long)s.covered, (unsigned long long)s.cover_blend, (unsigned long long)s.other_target, (unsigned long long)s.retargeted, (unsigned long long)s.cleared_after, (unsigned long long)s.view_changed,
         (unsigned long long)s.restore_failed, s.last_draws, s.last_covered, s.last_view, s.last_forward,
         (unsigned long long)s.check_frames, (unsigned long long)s.ui_px, (unsigned long long)s.opaque_px, (unsigned long long)s.match_id,
         (unsigned long long)s.match_dec, (unsigned long long)s.match_enc, s.rate_id, s.rate_dec, s.rate_enc,

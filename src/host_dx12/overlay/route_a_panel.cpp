@@ -1250,6 +1250,13 @@ void DrawLiveDlaaEnhancements()
         else
             std::snprintf(tb, sizeof tb, "In use: off (the game's own filtering).");
         StatusLine(0, tb);
+        if (as.level) {
+            // Draw-time proof: how often the game's draws really went to the GPU with our
+            // changed pipelines, against with its own (which never carry the change).
+            std::snprintf(tb, sizeof tb, "Drawn with the changed pipelines: %llu binds; with the game's own: %llu.",
+                          static_cast<unsigned long long>(ml2.bound_pso_twin), static_cast<unsigned long long>(ml2.bound_pso_game));
+            Hint(tb);
+        }
         if(as.native_surface&&as.native_16==as.native_surface)
             Hint("The game already requested 16x for all observed surface samplers.");
     }
@@ -1332,11 +1339,26 @@ void DrawDlssDebug()
 
 } // namespace
 
+static void DrawDonutLighting();
+static void DrawAmbientOcclusion();
+
 void RegisterLiveDlaaMenu()
 {
     na::menu::Register({"Live DLAA", na::menu::Availability::Available, nullptr, &DrawLiveDlaa, na::menu::Page::Picture});
     na::menu::Register({"DLSS debug", na::menu::Availability::Available, nullptr, &DrawDlssDebug, na::menu::Page::Details});
     na::menu::Register({"DLAA enhancements", na::menu::Availability::Available, nullptr, &DrawLiveDlaaEnhancements, na::menu::Page::Enhancements});
+    // XeGTAO and Lighting run inside live DLAA too, but their rows were only registered with
+    // the Route A menu, so a live-DLAA-only game (Sniper Elite 5, Cort 2026-11-05) never showed
+    // them. Register them here unless the Route A menu already did.
+    const auto registered = [](void (*draw)()) {
+        for (int i = 0; i < na::menu::Count(); ++i)
+            if (const na::menu::Section* s = na::menu::At(i); s && s->draw == draw) return true;
+        return false;
+    };
+    if (!registered(&DrawAmbientOcclusion))
+        na::menu::Register({"XeGTAO", na::menu::Availability::Available, nullptr, &DrawAmbientOcclusion, na::menu::Page::Enhancements});
+    if (!registered(&DrawDonutLighting))
+        na::menu::Register({"Lighting", na::menu::Availability::Available, nullptr, &DrawDonutLighting, na::menu::Page::Enhancements});
 }
 
 static void DrawExperimentalGpu()
