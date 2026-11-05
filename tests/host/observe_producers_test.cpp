@@ -321,7 +321,7 @@ int main()
         session.running = true;
         test::ComPtr<ID3D12Fence> fa, fb;
         REQUIRE(SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fa))));
-        dev->CreateShaderResourceView(placed.Get(), nullptr, D3D12_CPU_DESCRIPTOR_HANDLE{s0.ptr + 6 * inc});
+        dev->CreateShaderResourceView(rt.Get(), nullptr, D3D12_CPU_DESCRIPTOR_HANDLE{s0.ptr + 6 * inc}); // placed was released above
         dev->CreateConstantBufferView(&cbv, D3D12_CPU_DESCRIPTOR_HANDLE{s0.ptr + 7 * inc});
         dev->CopyDescriptorsSimple(1, D3D12_CPU_DESCRIPTOR_HANDLE{srv_heap->GetCPUDescriptorHandleForHeapStart().ptr + 6 * inc},
                                    D3D12_CPU_DESCRIPTOR_HANDLE{s0.ptr + 6 * inc}, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
