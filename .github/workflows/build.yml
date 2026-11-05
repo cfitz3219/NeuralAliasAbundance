@@ -152,6 +152,13 @@ jobs:
             build/Release/*.exe
             build/Release/*.dll
           if-no-files-found: warn
+      - name: Keep the 32-bit DX9 proxy (DX9 package, deploy-dx9.ps1)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release-x86
+          path: build32/Release/NeuralAliasD3D9.dll
+          if-no-files-found: warn
 
   windows-sdk:
     name: Windows x64 (MSVC) with public NVIDIA SDK headers
