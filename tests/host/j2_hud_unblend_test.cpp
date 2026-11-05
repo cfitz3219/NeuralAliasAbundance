@@ -225,7 +225,7 @@ int end_to_end(test::Device& d)
     CHECK(st.replayed == 3);
     CHECK(st.blended == 2);
     CHECK(st.scene == 1);
-    CHECK(st.forwarded == 0);
+    CHECK(st.forwarded == 1 && st.other_target == 1); // the white pass on `other`: same shape, not this frame's UI target
     CHECK(st.world == 0);
     CHECK(st.restore_failed == 0);
     const bool got = nh::TakeFrame(proxy.Get(), RW, RH, OW, OH, &layer);
@@ -238,7 +238,7 @@ int end_to_end(test::Device& d)
     REQUIRE(readback(d, proxy.Get(), RTS, 4, px));
     // The game's own picture is complete: the UI is in it.
     CHECK(std::abs(at(px, RW, 20, 10, 0) - int(std::lround((0.6f * 1.f + 0.4f * 0.2f) * 255))) <= 1);
-    CHECK(at(px, RW, 5, 28, 0) == 230);
+    CHECK(std::abs(at(px, RW, 5, 28, 0) - 230) <= 1); // 0.9 * 255 = 229.5: the tie rounds either way per GPU
     REQUIRE(readback(d, other.Get(), RTS, 4, px));
     CHECK(at(px, RW, 5, 28, 0) == 255); // the game's scissor came back (not our native-size one)
     CHECK(at(px, RW, 12, 28, 0) == 0);

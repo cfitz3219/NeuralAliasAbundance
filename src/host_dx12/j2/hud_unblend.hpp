@@ -45,6 +45,7 @@ void ReportCheck(uint32_t ui_px, uint32_t opaque, uint32_t match_id, uint32_t ma
 struct Stats {
     uint64_t frames = 0, hud_frames = 0, composed = 0, held = 0;
     uint64_t replayed = 0, blended = 0, forwarded = 0, world = 0, scene = 0, covered = 0, cover_blend = 0, restore_failed = 0;
+    uint64_t other_target = 0; // forwarded: picture-shaped draws into a second target in the same frame
     uint64_t cleared_after = 0, view_changed = 0, sets_missed = 0;
     uint32_t last_draws = 0, last_view = 0, last_covered = 0;
     char last_forward[64] = {};

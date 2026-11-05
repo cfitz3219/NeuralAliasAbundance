@@ -34,6 +34,7 @@ struct Set {
     UINT inc = 0;
     // The frame being recorded into it:
     uint64_t frame = ~0ull;
+    na_object_id target = 0; // the one target the frame's UI goes into (the first replayed into)
     bool cleared = false;
     DXGI_FORMAT view = DXGI_FORMAT_UNKNOWN;
     uint32_t draws = 0, covered = 0;
@@ -206,7 +207,7 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
     const Dims d = g_dims;
     if (!d.ow) return {};
     Set& s = g_set[g_frame % kSets];
-    const bool mine = s.frame == g_frame && s.cleared;
+    const bool mine = s.frame == g_frame && s.cleared && s.target == t_bind.rt;
     const float* vp0 = st.viewport_count ? st.viewports[0] : nullptr;
     const int32_t* sc0 = st.scissor_count ? st.scissors[0] : nullptr;
     // Full-screen passes (tonemap, colour grading, fades, vignettes) are image processing:
@@ -237,7 +238,10 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
     }
     const DXGI_FORMAT view = static_cast<DXGI_FORMAT>(st.rtv_format);
     const char* why = nullptr;
-    if (!st.restorable) why = "targets cannot be handed back";
+    // One target per frame: the first one UI was replayed into. Draws of the same shape into
+    // another target (a later pass that happens to be picture-shaped) are not part of this UI.
+    if (s.frame == g_frame && s.cleared && s.target != t_bind.rt) { ++g_stats.other_target; why = "another picture-shaped target"; }
+    else if (!st.restorable) why = "targets cannot be handed back";
     else if (!st.pipeline_known) why = "unknown pipeline";
     else if (st.rt_count != 1 || st.pso_rt_count != 1) why = "more than one target";
     else if (st.samples != 1) why = "multisampled";
@@ -249,8 +253,9 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
     ComPtr<ID3D12Device> dev;
     if (FAILED(l->GetDevice(IID_PPV_ARGS(&dev))) || !set_ready_locked(dev.Get(), s, d)) { forward_locked("could not make the layers"); return {}; }
     D3D12_CPU_DESCRIPTOR_HANDLE rtv[4];
-    if (s.frame != g_frame) { s.frame = g_frame; s.cleared = false; s.draws = 0; s.covered = 0; s.view = DXGI_FORMAT_UNKNOWN; }
+    if (s.frame != g_frame) { s.frame = g_frame; s.cleared = false; s.draws = 0; s.covered = 0; s.view = DXGI_FORMAT_UNKNOWN; s.target = 0; }
     if (!s.cleared) {
+        s.target = t_bind.rt;
         if (!rtvs_locked(s, view, rtv)) { forward_locked("too many view formats"); return {}; }
         clear_background_locked(l, s);
         s.cleared = true;
@@ -295,7 +300,7 @@ void OnClear(ID3D12GraphicsCommandList* l, uint64_t target, const float color[4]
     if (t_bind.list != l || !t_bind.candidate || t_bind.rt != target) return;
     std::lock_guard<std::mutex> lock(g_m);
     Set& s = g_set[g_frame % kSets];
-    if (s.frame != g_frame || !s.cleared || !s.draws) return;
+    if (s.frame != g_frame || !s.cleared || !s.draws || s.target != target) return;
     // A clear after the UI started replaces everything under it: both layers take the colour,
     // so the composite shows exactly that colour there.
     D3D12_CPU_DESCRIPTOR_HANDLE rtv[4];
@@ -335,7 +340,7 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
     // was submitted before anything recorded from now on).
     ++g_frame;
     Set& next = g_set[g_frame % kSets];
-    if (next.frame != g_frame) { next.frame = ~0ull; next.cleared = false; next.draws = 0; next.covered = 0; }
+    if (next.frame != g_frame) { next.frame = ~0ull; next.cleared = false; next.draws = 0; next.covered = 0; next.target = 0; }
     return hud;
 }
 
@@ -363,11 +368,11 @@ std::string StatusLine()
     char b[1024];
     std::snprintf(b, sizeof b,
         "hud_unblend on=%u frames=%llu hud_frames=%llu composed=%llu held=%llu replayed=%llu blended=%llu forwarded=%llu world=%llu scene=%llu covered=%llu "
-        "cover_blend=%llu cleared_after=%llu view_changed=%llu restore_failed=%llu last{draws=%u covered=%u view=%u} last_forward=\"%s\" "
+        "cover_blend=%llu other_target=%llu cleared_after=%llu view_changed=%llu restore_failed=%llu last{draws=%u covered=%u view=%u} last_forward=\"%s\" "
         "check{frames=%llu window{ui_px=%llu opaque=%llu id=%llu dec=%llu enc=%llu} permille{id=%u dec=%u enc=%u} verdict=%s}",
         Enabled() ? 1u : 0u, (unsigned long long)s.frames, (unsigned long long)s.hud_frames, (unsigned long long)s.composed, (unsigned long long)s.held,
         (unsigned long long)s.replayed, (unsigned long long)s.blended, (unsigned long long)s.forwarded, (unsigned long long)s.world, (unsigned long long)s.scene,
-        (unsigned long long)s.covered, (unsigned long long)s.cover_blend, (unsigned long long)s.cleared_after, (unsigned long long)s.view_changed,
+        (unsigned long long)s.covered, (unsigned long long)s.cover_blend, (unsigned long long)s.other_target, (unsigned long long)s.cleared_after, (unsigned long long)s.view_changed,
         (unsigned long long)s.restore_failed, s.last_draws, s.last_covered, s.last_view, s.last_forward,
         (unsigned long long)s.check_frames, (unsigned long long)s.ui_px, (unsigned long long)s.opaque_px, (unsigned long long)s.match_id,
         (unsigned long long)s.match_dec, (unsigned long long)s.match_enc, s.rate_id, s.rate_dec, s.rate_enc,
