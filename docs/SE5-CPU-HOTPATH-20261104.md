@@ -1,5 +1,10 @@
 # Sniper CPU-overhead investigation and repair
 
+The 8bbd661 package receipt below is historical and superseded. CI subsequently
+reproduced a HUD writer-identity defect, now corrected in d4145c1; the final receipt
+at the end of this document governs the next package. The update CMD was returned
+to the preceding 55fcd11 package during that correction.
+
 Cort reports 165 fps and 85% GPU use without NeuralAlias, versus roughly 35 fps,
 25-30% GPU use and 80% CPU use with it. Astra owns this independent investigation;
 Opus has held overlapping observer/HUD edits. Game testing remains Cort's.
@@ -197,3 +202,65 @@ can build on this head while preserving early binding state and promoting a list
 before its first relevant scene/HUD operation; classifying a pooled list solely
 at Reset from its previous frame would lose required state. No new review cycle
 or game-specific addresses are introduced.
+
+## CI reproduction and writer-identity correction
+
+Public-header Windows CI run 41979107842 reproduced the HUD missing-layer failure;
+Linux and ordinary Windows jobs passed. The repaired local full pass therefore
+did not justify dismissing that HUD failure as a transient. It was reproduced on
+this PC's software GPU using `NA_TEST_FORCE_WARP=1` in the test helper.
+
+Temporary source/Closing diagnostics proved that old canvas 216, last used at
+frame 28, and the actual current canvas 357, used at frame 38, matched the same
+reused command-list address and local recording number 10. The old canvas won the
+probe-order comparison. Its state was absent from the new command list, so Closing
+returned without snapshotting canvas 357. The finishing list then correctly
+declined an unowned source picture. Pool exhaustion was ruled out: five of eight
+slots were occupied. No capacity increase or state guess was the remedy.
+
+Runtime d4145c1 matches the writer's existing unique object ID, pointer and recording
+number in both Closing and NativeBoundary. DrawInfo carries the ID already found
+under its existing lock; actual canvas draws do not acquire another identity lock.
+The inactive/non-HUD fast paths remain. No jitter/flow math, acceptance threshold,
+GPU lease or fallback-pixel assertion changed. Temporary capture instrumentation
+is removed. Ten repaired WARP runs passed. The only new test-control option forces
+the existing software-GPU fallback for reproduction; normal hardware preference
+is unchanged when the option is absent.
+
+The final runtime's four-thread recording check was 3.9769 ms wall / 17.9843 ms
+process CPU with HUD, versus the three original controls' median 6.9341 / 29.2653.
+This single final-source check is consistent with the main cleanup's paired
+measurements; it is not presented as another three-pair median or game FPS.
+Frozen final Release/full-200 confirmation and final package follow.
+
+## Current final receipt: d4145c1
+
+This supersedes the 8bbd661 package and provisional receipts above.
+Runtime `d4145c1d2e9933363854934dda81fec41f20f155`: complete Release build,
+complete 200-case run **195 passed / five skipped / zero failures, 372.60 s**,
+and ten forced-WARP native-HUD runs passed. Skips remain the same optional NR,
+unsupported 16x MSAA and optional upscaler-jitter cases. All three GitHub jobs
+also passed on this runtime, including the previously failing public-header
+software-GPU job: [run 41980899607](https://github.com/cfitz3219/NeuralAliasAbundance/actions/runs/41980899607).
+No runtime source changed after these checks.
+
+Final independent package: `C:\Users\Cort\Documents\NA-se5-motion-d4145c1`.
+DLL SHA256: `FE0298D8A7E7C2F636ADCFB16328CCC1850C36E0239A022D72470D0BA45642BC`.
+The isolated additive-install fixture passed again for this exact package:
+corrupt-package preservation, upgrade, saved choices, diagnostic defaults,
+results export, rollback and native-file refusal. All payload hashes verified.
+The existing SE5 DLSS update/results CMDs now select this package; the prior
+55fcd11 pointer and original receipt rollback remain available. The game itself
+remains installed with c1b3ed2 / `03A63FBF...C401FE`; Astra did not deploy or launch.
+
+Opus's independent lean-overhead version remains separate for comparison at
+Cort's direction. Comparing versions should keep functional settings and HUD
+processing equivalent; passing the benchmark alone does not establish game FPS.
+
+On Cort's HUD-scanner question: removing its checkbox has negligible cost.
+Removing the functional scanner/replay would save work but lose native HUD
+separation. The final benchmark's inactive HUD-hook difference is 0.2789 ms wall
+per 6,000 draws (3.9769 minus 3.6980); it does not measure active HUD detection,
+replay or GPU work. Detailed periodic draw tracing is a separate diagnostic path
+and can be made opt-in independently. It is not silently removed from this
+already-qualified runtime in response to a feasibility question.
