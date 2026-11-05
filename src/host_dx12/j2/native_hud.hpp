@@ -49,6 +49,9 @@ struct Layer {
     bool srgb = false;             // `view` is an sRGB format (the picture itself is stored encoded)
     std::shared_ptr<void> owner;     // layers retained through source recordings and Present GPU completion
     std::shared_ptr<Picture> picture; // draw transfer: complete original was preserved, GPU chooses clean/protect
+    std::shared_ptr<Picture> reconstruction; // UI-only input: independent world snapshot for DLSS
+    ID3D12Resource* ui_output=nullptr; // native UI seeded separately, then actual glyph draws
+    DXGI_FORMAT ui_view=DXGI_FORMAT_UNKNOWN;
     bool clean_allowed = false;
     // Independent discovery probe; valid even when no HUD layer was produced.
     std::shared_ptr<Picture> probe;
@@ -60,7 +63,7 @@ struct Layer {
     std::shared_ptr<na::capture::j2::Identity> recording_identity;
 };
 // Runs after the original batch, before its application completion fence.
-// Only replays draws whose EVERY source recording belongs to this exact batch.
+// Source leases may precede this batch on the same ordered queue.
 void AfterSubmission(ID3D12CommandQueue*,uint32_t count,ID3D12CommandList* const*);
 using PreHudRenderer=bool(*)(ID3D12CommandQueue*,ID3D12Resource*,uint32_t,uint32_t,ID3D12Resource*,uint32_t,uint32_t,const Layer&,ID3D12CommandList*);
 void SetPreHudRendererForTests(PreHudRenderer); // null restores the production DLSS renderer
@@ -71,6 +74,9 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
                ID3D12CommandQueue* queue = nullptr);
 
 struct Stats {
+    uint32_t last_present_native=0;
+    uint64_t proof_tested=0,proof_matched=0,native_partial=0;
+    float proof_maximum_error=0;
     uint64_t frames = 0, hud_frames = 0;    // frames presented while learned / with a HUD layer
     uint64_t scene_draws = 0, redirected = 0, forwarded = 0, restore_failed = 0;
     uint64_t covered = 0; // opaque full-screen draws after the HUD started: sent to the proxy, layers restarted
@@ -103,9 +109,9 @@ struct Stats {
     uint64_t native_resource_changed=0,native_finishing_draws=0;
 };
 Stats GetStats();
-void ReportPictureResult(bool identity,bool clean); // completed GPU receipt, status only
-void ReportCanvasProbe(uint64_t source,uint64_t generation,bool identity);
-void ReportNativePictureResult(bool identity);
+void ReportPictureResult(bool identity,bool clean,uint32_t tested=0,uint32_t matched=0,float error=0); // completed GPU receipt, status only
+void ReportCanvasProbe(uint64_t source,uint64_t generation,bool identity,uint32_t tested=0,uint32_t matched=0,float error=0);
+void ReportNativePictureResult(bool identity,uint32_t tested=0,uint32_t matched=0,float error=0);
 std::string StatusLine();
 // Finished frame-structure traces (hud_trace JSON lines, CRLF), taken once; empty when none.
 std::string TakeTrace();

@@ -177,18 +177,18 @@ int picture_paths(test::Device& d)
         uint16_t v=0;std::memcpy(&v,input.data()+inside*8,2);const float input_red=half_value(v);
         std::memcpy(&v,mask.data()+inside*2,2);const float protection=half_value(v);
         float mx=0;std::memcpy(&mx,motion_bytes.data()+inside*8,4);
-        const float expected=(clean&&!changed)?51.f/255.f:float(full[inside]&255)/255.f;
+        const float expected=clean?51.f/255.f:float(full[inside]&255)/255.f;
         CHECK(std::abs(input_red-expected)<.002f);
-        CHECK((!clean&&!changed)?protection>.5f:protection==0.f);
-        CHECK(mx==((!clean&&!changed)?0.f:4.f));
+        CHECK(!clean?protection>.5f:protection==0.f);
+        CHECK(mx==(!clean?0.f:4.f));
         std::memcpy(&v,mask.data()+outside*2,2);CHECK(half_value(v)==0.f);
-        const UINT native_inside=6*OW+12,native_outside=OW+2;
-        if(changed)CHECK(result==std::vector<uint8_t>(reinterpret_cast<uint8_t*>(base.data()),reinterpret_cast<uint8_t*>(base.data())+base.size()*4));
-        else CHECK(result[native_inside*4]>(clean?150:160)); // native alpha-over or protected original UI
+        const UINT native_inside=6*OW+12,native_outside=(OH-2)*OW+OW-2;
+        CHECK(result[native_inside*4]>(clean?150:160)); // a changed corner does not disable the distant native glyph
         CHECK(std::abs(int(result[native_outside*4])-26)<=1);
         std::printf("HUD GPU path clean=%d changed=%d input=%.3f mask=%.3f motion=%.1f\n",clean,changed,input_red,protection,mx);
         CHECK(d.device->GetDeviceRemovedReason()==S_OK);
-        bool identity=false,used_clean=false;CHECK(picture->ProofAfterCompletion(identity,used_clean));
+        bool identity=false,used_clean=false;nh::Picture::ProofReceipt receipt;CHECK(picture->ProofAfterCompletion(identity,used_clean,&receipt));
+        CHECK(receipt.tested==W*H&&receipt.matched==W*H-(changed?1u:0u));
         CHECK(identity==!changed&&used_clean==(clean&&!changed));CHECK(!picture->ProofAfterCompletion(identity,used_clean));
         if(clean&&!changed){
             picture->BeginCycle();test::List reuse;REQUIRE(reuse.Create(d.device.Get()));
@@ -234,10 +234,12 @@ int native_picture_phases(test::Device& d)
     auto make=[&](UINT w,UINT h,const std::vector<uint16_t>& data,D3D12_RESOURCE_STATES state,D3D12_RESOURCE_FLAGS flags){
         auto r=test::CreateTexture(d.device.Get(),w,h,F,D3D12_RESOURCE_STATE_COPY_DEST,flags);
         if(r&&!upload(d,r.Get(),data.data(),8,state))r.Reset();return r;};
-    for(bool bad_alpha:{false,true}){
+    for(int defect:{0,1,2}){
+        const bool bad_alpha=defect==1;
         const auto scene=rgba(W*H,{0x4000,0x3c00,0x3800,0x3a00}); // 2,1,.5,.75
         auto source=make(W,H,scene,S,D3D12_RESOURCE_FLAG_NONE);
-        auto check=make(W,H,rgba(W*H,{0x4000,0x3c00,0x3800,uint16_t(bad_alpha?0:0x3a00)}),S,D3D12_RESOURCE_FLAG_NONE);
+        auto check_pixels=rgba(W*H,{0x4000,0x3c00,0x3800,uint16_t(bad_alpha?0:0x3a00)});if(defect==2)check_pixels[3]=0;
+        auto check=make(W,H,check_pixels,S,D3D12_RESOURCE_FLAG_NONE);
         auto native=make(OW,OH,rgba(OW*OH,{0x4400,0x4000,0x3c00,0}),U,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         auto out=make(OW,OH,rgba(OW*OH,{0,0,0,0}),U,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         auto n0=make(OW,OH,rgba(OW*OH,{0,0,0,0}),R,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
@@ -255,8 +257,11 @@ int native_picture_phases(test::Device& d)
         REQUIRE(SUCCEEDED(finish.list->Close()));
         ID3D12CommandList* lists[]={seed.list.Get(),finish.list.Get()};d.queue->ExecuteCommandLists(2,lists);d.WaitIdle();
         std::vector<uint8_t> pixels;REQUIRE(readback(d,out.Get(),U,8,pixels));uint16_t value[4]{};std::memcpy(value,pixels.data(),8);
-        CHECK(half_value(value[0])==(bad_alpha?2.f:4.f));CHECK(half_value(value[3])==.75f);
-        bool identity=false,clean=false;CHECK(p->ProofAfterCompletion(identity,clean)&&identity==!bad_alpha&&clean==!bad_alpha);
+        CHECK(half_value(value[0])==(defect?2.f:4.f));CHECK(half_value(value[3])==.75f);
+        std::memcpy(value,pixels.data()+(OW*OH-1)*8,8);CHECK(half_value(value[0])==(bad_alpha?2.f:4.f));
+        bool identity=false,clean=false;nh::Picture::ProofReceipt receipt;
+        CHECK(p->ProofAfterCompletion(identity,clean,&receipt)&&identity==(defect==0)&&clean==(defect==0));
+        CHECK(receipt.matched==(bad_alpha?0u:W*H-(defect==2?1u:0u)));
     }
     // Stripping optional RDEF must not hide executable UAV writes from replay admission.
     ComPtr<ID3DBlob> code,stripped,error;
@@ -464,12 +469,18 @@ const Hud kHud[3] = {{Blend::Over, {1.f, 0.2f, 0.1f, 0.6f}, {8, 4, 40, 20}},
 test::Device* native_fixture=nullptr;
 unsigned native_fixture_calls=0;
 bool native_fixture_renderer(ID3D12CommandQueue* queue,ID3D12Resource*,uint32_t,uint32_t,
-                             ID3D12Resource* out,uint32_t,uint32_t,const nh::Layer&,ID3D12CommandList* replay)
+                             ID3D12Resource* out,uint32_t,uint32_t,const nh::Layer& layer,ID3D12CommandList* replay)
 {
     // Explicit fake reconstruction, real native HUD draws and actual DX12.
     // Waiting is test-only. This does not qualify DLSS model/image quality.
     if(!native_fixture)return false;
     na::observe::HostWorkScope host;
+    if(layer.reconstruction){
+        test::List seed;if(!seed.Create(native_fixture->device.Get()))return false;
+        if(!layer.reconstruction->SeedNativeScene(seed.list.Get(),out,layer.reconstruction->Scene()->GetDesc().Format)||
+           !layer.picture->SeedNativeScene(seed.list.Get(),layer.ui_output,layer.ui_view)||FAILED(seed.list->Close()))return false;
+        ID3D12CommandList* work[]={seed.list.Get(),replay};queue->ExecuteCommandLists(2,work);native_fixture->WaitIdle();++native_fixture_calls;return true;
+    }
     ComPtr<ID3D12DescriptorHeap> heap;D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,1,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
     if(FAILED(native_fixture->device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&heap))))return false;
     auto rtv=heap->GetCPUDescriptorHandleForHeapStart();native_fixture->device->CreateRenderTargetView(out,nullptr,rtv);
@@ -572,7 +583,7 @@ int canvas_probe(test::Device& d)
     return 0;
 }
 
-int draw_handoff(test::Device& d,bool unresolved=false,bool native=false,bool dxil=false,bool split=false,bool typeless=false)
+int draw_handoff(test::Device& d,bool unresolved=false,bool native=false,bool dxil=false,bool split=false,bool typeless=false,bool separate=false,bool ahead=false,bool ui_only=false)
 {
     auto* dev=d.device.Get();
     const auto initial_stats=nh::GetStats();constexpr UINT W=64,H=32,OW=128,OH=64;constexpr auto F=DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -582,6 +593,9 @@ int draw_handoff(test::Device& d,bool unresolved=false,bool native=false,bool dx
     auto stale=test::CreateTexture(dev,W,H,F,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_FLAG_NONE);
     auto target2=test::CreateTexture(dev,W,H,F,R,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     REQUIRE(upstream&&target&&stale);nh::Layer learned;CHECK(!nh::TakeFrame(target.Get(),W,H,OW,OH,&learned,d.queue.Get()));
+    auto world=test::CreateTexture(dev,W,H,DXGI_FORMAT_R16G16B16A16_FLOAT,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_NONE);REQUIRE(world);
+    if(ui_only){std::vector<uint16_t> world_pixels;for(UINT i=0;i<W*H;++i)world_pixels.insert(world_pixels.end(),{0x4000,0x3c00,0x3800,0x3c00});
+        REQUIRE(upload(d,world.Get(),world_pixels.data(),8,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));}
     REQUIRE(target2);CHECK(!nh::TakeFrame(target2.Get(),W,H,OW,OH,&learned,d.queue.Get()));
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,3,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};ComPtr<ID3D12DescriptorHeap> rtvs,heap;
     REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&rtvs))));
@@ -592,7 +606,8 @@ int draw_handoff(test::Device& d,bool unresolved=false,bool native=false,bool dx
     hd={D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,32,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&heap))));
     auto cpu=heap->GetCPUDescriptorHandleForHeapStart();const UINT inc=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     D3D12_SHADER_RESOURCE_VIEW_DESC sv{};sv.Format=F;sv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;sv.Texture2D.MipLevels=1;sv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    for(UINT i=0;i<32;++i){dev->CreateShaderResourceView(i==17?upstream.Get():stale.Get(),&sv,cpu);cpu.ptr+=inc;}
+    for(UINT i=0;i<32;++i){auto view=sv;if(ui_only&&i==18)view.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;
+        dev->CreateShaderResourceView(i==17?upstream.Get():(ui_only&&i==18?world.Get():stale.Get()),&view,cpu);cpu.ptr+=inc;}
     D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV,32,0,0,0};D3D12_ROOT_PARAMETER param{};param.ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;param.DescriptorTable={1,&range};
     D3D12_ROOT_SIGNATURE_DESC rd{1,&param,0,nullptr,D3D12_ROOT_SIGNATURE_FLAG_NONE};ComPtr<ID3DBlob> sig,err,vs,ps,processed;
     ComPtr<ID3D12RootSignature> transfer_root,hud_root;REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rd,D3D_ROOT_SIGNATURE_VERSION_1,&sig,&err)));
@@ -603,9 +618,16 @@ float4 vs(uint id:SV_VertexID):SV_Position{float2 uv=float2((id<<1)&2,id&2);retu
 float4 ps(float4 p:SV_Position):SV_Target{return image.Load(int3(p.xy,0));}
 float4 altered(float4 p:SV_Position):SV_Target{return image.Load(int3(p.xy,0))*.8;}
 )";
-    REQUIRE(SUCCEEDED(D3DCompile(code,sizeof code-1,nullptr,nullptr,nullptr,"vs","vs_5_0",0,0,&vs,&err)));
-    REQUIRE(SUCCEEDED(D3DCompile(code,sizeof code-1,nullptr,nullptr,nullptr,"ps","ps_5_0",0,0,&ps,&err)));
-    REQUIRE(SUCCEEDED(D3DCompile(code,sizeof code-1,nullptr,nullptr,nullptr,"altered","ps_5_0",0,0,&processed,&err)));
+    constexpr char ui_compositor[]=R"(
+Texture2D<float4> image:register(t17),world:register(t18);
+float4 vs(uint id:SV_VertexID):SV_Position{float2 uv=float2((id<<1)&2,id&2);return float4(uv*float2(2,-2)+float2(-1,1),.5,1);}
+float4 ps(float4 p:SV_Position):SV_Target{float4 ui=image.Load(int3(p.xy,0));return float4(ui.rgb+world.Load(int3(p.xy,0)).rgb*.25*(1-ui.a),1);}
+float4 altered(float4 p:SV_Position):SV_Target{return ps(p)*.8;}
+)";
+    const char* shader=ui_only?ui_compositor:code;const size_t shader_bytes=ui_only?sizeof(ui_compositor)-1:sizeof(code)-1;
+    REQUIRE(SUCCEEDED(D3DCompile(shader,shader_bytes,nullptr,nullptr,nullptr,"vs","vs_5_0",0,0,&vs,&err)));
+    REQUIRE(SUCCEEDED(D3DCompile(shader,shader_bytes,nullptr,nullptr,nullptr,"ps","ps_5_0",0,0,&ps,&err)));
+    REQUIRE(SUCCEEDED(D3DCompile(shader,shader_bytes,nullptr,nullptr,nullptr,"altered","ps_5_0",0,0,&processed,&err)));
 #ifdef NA_HUD_DXIL_FIXTURE
     const auto blob=[](const auto& bytes){ComPtr<ID3DBlob> b;if(SUCCEEDED(D3DCreateBlob(sizeof(bytes),&b)))std::memcpy(b->GetBufferPointer(),bytes,sizeof(bytes));return b;};
     if(dxil){vs=blob(na_hud_dxil_vs);ps=blob(na_hud_dxil_copy);processed=blob(na_hud_dxil_altered);REQUIRE(vs&&ps&&processed);}
@@ -661,7 +683,7 @@ float4 altered(float4 p:SV_Position):SV_Target{return image.Load(int3(p.xy,0))*.
             bool identity=false,clean=false;REQUIRE(layer.probe->ProofAfterCompletion(identity,clean));CHECK(identity);
             nh::ReportCanvasProbe(layer.probe_source,layer.probe_generation,identity);
         }
-        if(frame<(unresolved&&!dxil?2u:3u)){CHECK(!found);return 0;}
+        if(frame<(ui_only?1u:unresolved&&!dxil?2u:3u)){CHECK(!found);return 0;}
         if(frame==6&&!native){CHECK(found&&layer.picture&&!layer.clean_allowed&&!layer.native_picture);return 0;}REQUIRE(found&&layer.picture&&layer.owner);CHECK(layer.clean_allowed==(frame!=5&&frame!=6));
         if(native&&frame!=7){
             REQUIRE(layer.native_picture&&layer.native_check);
@@ -674,6 +696,14 @@ float4 altered(float4 p:SV_Position):SV_Target{return image.Load(int3(p.xy,0))*.
             std::vector<uint8_t> pixels,original;REQUIRE(readback(d,out.Get(),U,4,pixels));
             REQUIRE(readback(d,shown,D3D12_RESOURCE_STATE_PRESENT,4,original));
             const float final_gain=frame==4?.8f:1.f;
+            if(ui_only){
+                CHECK(std::abs(int(pixels[(20*OW+40)*4])-int(std::lround((frame==5?1.f:.8f)*final_gain*255)))<=1);
+                CHECK(std::abs(int(pixels[(OH-2)*OW*4])-int(std::lround(.5f*final_gain*255)))<=1);
+                // The glyph boundary is natively rasterized, not bilinearly
+                // enlarged: the immediately outside pixel is pure world.
+                CHECK(std::abs(int(pixels[(12*OW+15)*4])-int(std::lround(.5f*final_gain*255)))<=1);
+                nh::ReportNativePictureResult(identity);return 0;
+            }
             if(frame==4)CHECK(std::abs(int(pixels[(20*OW+40)*4])-int(std::lround((.2f*.4f+.6f)*final_gain*255)))<=1);
             else CHECK(pixels[(20*OW+40)*4]>=170);
             CHECK(std::abs(int(pixels[(OH-2)*OW*4])-int(std::lround(.2f*final_gain*255)))<=1);
@@ -682,6 +712,7 @@ float4 altered(float4 p:SV_Position):SV_Target{return image.Load(int3(p.xy,0))*.
         if(native&&frame==7)CHECK(!layer.native_picture&&nh::GetStats().native_resource_changed>0);
         const auto shown_state=native?D3D12_RESOURCE_STATE_PRESENT:R;
         std::vector<uint8_t> pixels;REQUIRE(readback(d,shown,shown_state,4,pixels));CHECK(pixels[(10*W+20)*4]>(frame==4?125:160));
+        if(ui_only&&frame==7){CHECK(!layer.native_picture);CHECK(std::abs(int(pixels[(10*W+20)*4])-204)<=1);return 0;}
         std::vector<float> mv(W*H*2,0);auto motion=test::CreateTexture(dev,W,H,DXGI_FORMAT_R32G32_FLOAT,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         REQUIRE(motion&&upload(d,motion.Get(),mv.data(),8,S));
         auto out=test::CreateTexture(dev,OW,OH,F,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);REQUIRE(out);
@@ -705,7 +736,8 @@ float4 altered(float4 p:SV_Position):SV_Target{return image.Load(int3(p.xy,0))*.
         if(native){l->IASetVertexBuffers(0,1,&vb);l->IASetIndexBuffer(&ib);}
         const float different[4]={.4f,.1f,.2f,1.f};
         l->SetGraphicsRoot32BitConstants(0,4,frame==4?different:kScene,0);
-        if(native)l->DrawIndexedInstanced(3,1,0,0,0);else l->DrawInstanced(3,1,0,0);
+        if(ui_only){const float transparent[4]={0,0,0,0};l->ClearRenderTargetView(a,transparent,0,nullptr);}
+        else if(native)l->DrawIndexedInstanced(3,1,0,0,0);else l->DrawInstanced(3,1,0,0);
         if(frame==6)l->BeginQuery(query.Get(),D3D12_QUERY_TYPE_PIPELINE_STATISTICS,0);
         l->SetPipelineState(frame==5?add_pso.Get():hud_pso.Get());l->RSSetScissorRects(1,&hud);l->SetGraphicsRoot32BitConstants(0,4,hc,0);
         if(frame==6){na::observe::DrawInfo info;REQUIRE(na::observe::ListDrawState(l,info));CHECK(info.query_active&&info.shader_readonly);}
@@ -718,13 +750,34 @@ float4 altered(float4 p:SV_Position):SV_Target{return image.Load(int3(p.xy,0))*.
         }
         if(native&&presented[frame==4?1:0]){t=test::Transition(frame==4?target2.Get():target.Get(),D3D12_RESOURCE_STATE_PRESENT,R);l->ResourceBarrier(1,&t);}
         l->OMSetRenderTargets(1,frame==4?&b2:&b,FALSE,nullptr);l->SetGraphicsRootSignature(transfer_root.Get());l->SetPipelineState(frame==4?process_pso.Get():copy_pso.Get());
+        if(ui_only){t=test::Transition(world.Get(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE|D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);l->ResourceBarrier(1,&t);}
         ID3D12DescriptorHeap* heaps[]={heap.Get()};l->SetDescriptorHeaps(1,heaps);l->SetGraphicsRootDescriptorTable(0,heap->GetGPUDescriptorHandleForHeapStart());
         l->RSSetViewports(1,&vp);l->RSSetScissorRects(1,&all);l->DrawInstanced(3,1,0,0);
+        if(ui_only){t=test::Transition(world.Get(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE|D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);l->ResourceBarrier(1,&t);}
         t=test::Transition(upstream.Get(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,R);l->ResourceBarrier(1,&t);
         if(native){t=test::Transition(frame==4?target2.Get():target.Get(),R,D3D12_RESOURCE_STATE_PRESENT);l->ResourceBarrier(1,&t);presented[frame==4?1:0]=true;}
         if(native&&frame==7){t=test::Transition(vertices.Get(),D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,D3D12_RESOURCE_STATE_COPY_DEST);l->ResourceBarrier(1,&t);}
         REQUIRE(SUCCEEDED(l->Close()));ID3D12CommandList* lists[]={game.list.Get(),post.list.Get()};const UINT list_count=split?2:1;
-        {na::nr::native::Submission submitted(d.queue.Get(),list_count,lists);d.queue->ExecuteCommandLists(list_count,lists);}d.WaitIdle();
+        test::List future;
+        if(ahead&&frame==3){
+            // CPU preparation of an unsubmitted future recording on the same
+            // output is not permission to erase this frame's completed packet.
+            REQUIRE(future.Create(dev));auto* next=future.list.Get();
+            auto transition=test::Transition(target.Get(),D3D12_RESOURCE_STATE_PRESENT,R);next->ResourceBarrier(1,&transition);
+            next->OMSetRenderTargets(1,&b,FALSE,nullptr);next->SetGraphicsRootSignature(transfer_root.Get());next->SetPipelineState(copy_pso.Get());
+            next->SetDescriptorHeaps(1,heaps);next->SetGraphicsRootDescriptorTable(0,heap->GetGPUDescriptorHandleForHeapStart());
+            next->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);next->RSSetViewports(1,&vp);next->RSSetScissorRects(1,&all);next->DrawInstanced(3,1,0,0);
+            REQUIRE(SUCCEEDED(next->Close()));
+        }
+        if(separate){
+            REQUIRE(split);
+            // Legal queue order is the dependency, not membership in one Execute call.
+            for(UINT i=0;i<list_count;++i){
+                {na::nr::native::Submission submitted(d.queue.Get(),1,lists+i);d.queue->ExecuteCommandLists(1,lists+i);}
+                nh::AfterSubmission(d.queue.Get(),1,lists+i);
+            }
+        }else{na::nr::native::Submission submitted(d.queue.Get(),list_count,lists);d.queue->ExecuteCommandLists(list_count,lists);}
+        d.WaitIdle();
         if(frame==6){void* queryMapped=nullptr;REQUIRE(SUCCEEDED(query_result->Map(0,nullptr,&queryMapped)));
             const auto stats=*static_cast<const D3D12_QUERY_DATA_PIPELINE_STATISTICS*>(queryMapped);query_result->Unmap(0,nullptr);
             CHECK(stats.IAVertices==3&&stats.IAPrimitives==1);}
@@ -733,13 +786,14 @@ float4 altered(float4 p:SV_Position):SV_Target{return image.Load(int3(p.xy,0))*.
             test::List unrelated;REQUIRE(unrelated.Create(dev));REQUIRE(SUCCEEDED(unrelated.list->Close()));
             ID3D12CommandList* other[]={unrelated.list.Get()};const auto before=native_fixture_calls;
             nh::AfterSubmission(d.queue.Get(),1,other);CHECK(native_fixture_calls==before);
-            nh::AfterSubmission(d.queue.Get(),list_count,lists);
+            // Do not invent a combined batch after the separate real submissions.
+            if(!separate)nh::AfterSubmission(d.queue.Get(),list_count,lists);
         }
         if(frame==3)continue; // render-ahead: the next source reuses its resource before this Present
         if(frame==4){if(validate(target.Get(),3)||validate(target2.Get(),4))return 1;}
         else if(validate(target.Get(),frame))return 1;
     }
-    if(split)CHECK(nh::GetStats().canvas_source_probes>initial_stats.canvas_source_probes);
+    if(split&&!ui_only)CHECK(nh::GetStats().canvas_source_probes>initial_stats.canvas_source_probes);
     if(native){CHECK(nh::GetStats().native_finishing_draws>initial_stats.native_finishing_draws);CHECK(native_fixture_calls>=4);CHECK(nh::GetStats().native_reused>0);native_fixture=nullptr;nh::SetPreHudRendererForTests(nullptr);}
     return 0;
 }
@@ -1107,6 +1161,9 @@ int end_to_end(test::Device& d)
     }
     if(source_lineage(d)||draw_handoff(d)||draw_handoff(d,true))return 1;
     if(draw_handoff(d,true,true,false,true)||draw_handoff(d,true,true,false,true,true))return 1;
+    if(draw_handoff(d,true,true,false,true,false,true))return 1;
+    if(draw_handoff(d,false,true,false,true,false,true,true))return 1;
+    if(draw_handoff(d,false,true,false,true,false,true,false,true))return 1;
     for(int resize=0;resize<5;++resize)if(draw_handoff(d,true,true))return 1;
 #ifdef NA_HUD_DXIL_FIXTURE
     if(draw_handoff(d,true,true,true))return 1;
