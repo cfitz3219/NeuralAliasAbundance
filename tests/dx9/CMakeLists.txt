@@ -20,6 +20,11 @@ else()
 endif()
 add_test(NAME dx9_ears COMMAND dx9_ears_test)
 
+# D5: the vertex-shader jitter patch, run on a small shader VM (portable).
+add_executable(dx9_vs_patch_test vs_patch_test.cpp)
+target_include_directories(dx9_vs_patch_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../src")
+add_test(NAME dx9_vs_patch COMMAND dx9_vs_patch_test)
+
 if(WIN32)
   add_executable(d3d9on12_probe d3d9on12_probe.cpp)
   target_compile_definitions(d3d9on12_probe PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)

@@ -11,6 +11,7 @@
 #include <cstring>
 #include <filesystem>
 #include <map>
+#include <memory>
 
 using Microsoft::WRL::ComPtr;
 
@@ -211,7 +212,7 @@ struct Dx12GameBridge::Impl {
         for (auto& a : alloc)
             if (FAILED(hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a))))
                 return hr_reason("The bridge could not make its command allocators", hr);
-        for (auto* l : {&list_in, &list_out}) {
+        for (ComPtr<ID3D12GraphicsCommandList>* l : {std::addressof(list_in), std::addressof(list_out)}) {
             hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc[0].Get(), nullptr, IID_PPV_ARGS(l->ReleaseAndGetAddressOf()));
             if (SUCCEEDED(hr)) hr = (*l)->Close();
             if (FAILED(hr)) return hr_reason("The bridge could not make its command lists", hr);
