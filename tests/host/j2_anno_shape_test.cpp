@@ -1,4 +1,5 @@
 #include "host_dx12/settings.hpp"
+#include "host_dx12/effects/xegtao.hpp"
 // J2 on Anno's shape (the run that crashed, 2026-10-26): the path the game takes,
 // not the convenient one.
 //   - submissions go through ExecuteBegin/End around J2, as the overlay does;
@@ -279,6 +280,20 @@ int main(int argc, char** argv)
         if (desc.VendorId != 0x10DE) { printf("SKIP: real DLAA needs NVIDIA hardware\n"); return test::kSkip; }
     }
     ID3D12Device* dev = d.device.Get();
+    bool test_ao=false;for(int i=3;i<argc;++i)test_ao|=std::strcmp(argv[i],"--xegtao")==0;
+    if(test_ao){
+#if !defined(NA_HAVE_XEGTAO)
+        return test::kSkip;
+#else
+        auto warm_color=test::CreateTexture(dev,64,32,DXGI_FORMAT_R16G16B16A16_FLOAT,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_FLAG_NONE);
+        auto warm_depth=test::CreateTexture(dev,64,32,DXGI_FORMAT_R32_FLOAT,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_FLAG_NONE);
+        na::xegtao::Inputs in;in.color=warm_color.Get();in.depth=warm_depth.Get();in.width=64;in.height=32;
+        in.color_format=DXGI_FORMAT_R16G16B16A16_FLOAT;in.projection={1,2,0,0,0,.1f};
+        na::xegtao::Options options;options.enabled=true;
+        na::xegtao::ScenePass().Prepare(dev,d.queue.Get(),in,options);
+        REQUIRE(na::xegtao::ScenePass().WaitPrepared(30000));na::settings::Get().xegtao_enabled=1;
+#endif
+    }
     ID3D12CommandQueue* q = d.queue.Get();
     REQUIRE(na::observe::InstallProducers(dev, q, /*hook_queue_execute=*/false));
     if(inline_flow)REQUIRE(na::observe::InstallListResetTracking(dev,na::nr::OnCommandListReset));
@@ -1262,6 +1277,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         } else CHECK(s1[0] == 0 && s1[1] == 0 && s1[2] == 0);      // the scene's clear (0.2,0.3,0.4) was replaced by the DLAA result
     }
     CHECK(dev->GetDeviceRemovedReason() == S_OK);
+    if(test_ao)CHECK(na::xegtao::ScenePass().GetStats().recorded>0);
     na::j2::SetEnabled(false);
     d.WaitIdle();
     na::j2::Shutdown();

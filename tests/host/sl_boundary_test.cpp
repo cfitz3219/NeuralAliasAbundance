@@ -95,6 +95,13 @@ extern "C" __declspec(dllexport) __declspec(noinline) int32_t slSetConstants(con
     return 0;
 }
 
+static uint64_t g_evaluation_frame=0;static uint32_t g_evaluation_view=0;
+extern "C" __declspec(dllexport) __declspec(noinline) int32_t slEvaluateFeature(uint32_t,const void*,const void* const*,uint32_t,void*)
+{
+    g_evaluation_frame=na::fg::EvaluationFrame();g_evaluation_view=na::fg::EvaluationViewport();
+    g_sink=g_sink+31;return 0;
+}
+
 // ---- the "Streamline" DLSS-G plugin functions ----
 namespace {
 const void* g_fg_seen_options = nullptr;
@@ -442,6 +449,13 @@ int main(int argc,char** argv)
         CHECK(r.camera_valid);
         CHECK(!na::slb::FindConstants(4242, 8, &r)); // another viewport: nothing
         CHECK(na::slb::GetStats().constants_decoded == 1);
+        na::fg::Camera matched;CHECK(na::fg::FindCamera(4243,7,matched));
+        const void* arguments[]={&viewport};
+        using EvaluateFn=int32_t(__cdecl*)(uint32_t,const void*,const void* const*,uint32_t,void*);
+        auto evaluate=reinterpret_cast<EvaluateFn>(GetProcAddress(self,"slEvaluateFeature"));REQUIRE(evaluate);
+        CHECK(evaluate(0,&frame,arguments,1,cmd)==0);
+        CHECK(g_evaluation_frame==4243&&g_evaluation_view==7);
+        CHECK(na::fg::EvaluationFrame()==0); // synchronous scope restored
     }
 
     // ---- 3. unrecognised layout: undecoded, still forwarded ----

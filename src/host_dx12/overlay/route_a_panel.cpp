@@ -30,6 +30,7 @@
 #include "host_dx12/j2/hud_unblend.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
+#include "host_dx12/effects/xegtao.hpp"
 #include "host_dx12/j2/compute_flow.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/fg/preset_profile.hpp"
@@ -1272,6 +1273,7 @@ void DrawLiveDlaaEnhancements()
 // to record images, data, logs from the debugged view").
 void DrawDlssDebug()
 {
+    using namespace na::ui;
     const auto i = na::dlss_debug::Query();
     char line[400];
     if (!i.loaded) StatusLine(2, "DLSS DLL: not loaded yet (DLSS has not been created in this session).");
@@ -1335,6 +1337,53 @@ void RegisterLiveDlaaMenu()
     na::menu::Register({"DLAA enhancements", na::menu::Availability::Available, nullptr, &DrawLiveDlaaEnhancements, na::menu::Page::Enhancements});
 }
 
+static void DrawAmbientOcclusion()
+{
+    using namespace na::ui;
+    auto& s=na::settings::Get();bool enabled=s.xegtao_enabled.load()!=0;
+    BeginRow("XeGTAO contact shading", "Adds soft shading around corners and where objects meet. Turn the game's ambient occlusion off where possible to avoid doubling its shading.", S(220));
+    if(ImGui::Checkbox("##xegtao",&enabled)){s.xegtao_enabled.store(enabled?1u:0u);na::settings::Save();}
+    ImGui::SameLine();if(Button("Settings..."))ImGui::OpenPopup("XeGTAO settings");EndRow();
+    ImGui::SetNextWindowSize(ImVec2(S(580),0),ImGuiCond_Appearing);
+    // The modal stays open on outside clicks; its own X dismisses it.
+    bool open=true;
+    if(!ImGui::BeginPopupModal("XeGTAO settings",&open,ImGuiWindowFlags_AlwaysAutoResize))return;
+    bool changed=false;
+    if(ImGui::Checkbox("Enable XeGTAO",&enabled)){s.xegtao_enabled.store(enabled?1u:0u);changed=true;}
+    const auto title=[&](const char* label,const char* tip){
+        ImGui::TextUnformatted(label);if(ImGui::IsItemHovered())ImGui::SetTooltip("%s",tip);
+        ImGui::SameLine(S(220));ImGui::SetNextItemWidth(S(310));
+    };
+    const auto scalar=[&](const char* name,const char* tip,const char* id,std::atomic<uint32_t>& field,float lo,float hi,bool logarithmic=false){
+        title(name,tip);float value=field.load()*.001f;
+        if(ImGui::SliderFloat(id,&value,lo,hi,"%.3f",logarithmic?ImGuiSliderFlags_Logarithmic:0)){
+            field.store(uint32_t(value*1000+.5f));changed=true;
+        }
+    };
+    title("Quality","More samples improve contact detail at a higher GPU cost.");
+    int quality=int(s.xegtao_quality.load());const char* quality_names[]={"Low","Medium","High","Ultra"};
+    if(ImGui::SliderInt("##aoquality",&quality,0,3,quality_names[quality])){s.xegtao_quality.store(quality);changed=true;}
+    title("Denoising","Smooths sampling noise; higher settings soften more detail.");
+    int denoise=int(s.xegtao_denoise.load());const char* denoise_names[]={"Off","Sharp","Medium","Soft"};
+    if(ImGui::SliderInt("##aodenoise",&denoise,0,3,denoise_names[denoise])){s.xegtao_denoise.store(denoise);changed=true;}
+    scalar("Radius","How far nearby surfaces cast contact shading.","##aoradius",s.xegtao_radius_x1000,.01f,100.f,true);
+    scalar("Radius multiplier","Fine-tunes the reach of the contact shading.","##aomult",s.xegtao_radius_multiplier,.3f,3.f);
+    scalar("Falloff","How gradually shading fades with distance.","##aofalloff",s.xegtao_falloff,.001f,1.f);
+    scalar("Sample distribution","Concentrates samples near small details or spreads them farther out.","##aodist",s.xegtao_sample_distribution,.1f,3.f);
+    scalar("Thin-object compensation","Reduces excessive shading from thin foreground objects.","##aothin",s.xegtao_thin_occluder,0.f,1.f);
+    scalar("Shadow strength","Adjusts the contrast of the computed contact shading.","##aopower",s.xegtao_final_power,0.f,5.f);
+    scalar("Depth mip offset","Trades distant depth detail against speed and stability.","##aomip",s.xegtao_depth_mip_offset,0.f,30.f);
+    if(Button("Reset to Intel defaults")){
+        s.xegtao_amount.store(100);s.xegtao_quality.store(2);s.xegtao_denoise.store(1);s.xegtao_radius_x1000.store(500);
+        s.xegtao_radius_multiplier.store(1457);s.xegtao_falloff.store(615);s.xegtao_sample_distribution.store(2000);
+        s.xegtao_thin_occluder.store(0);s.xegtao_final_power.store(2200);s.xegtao_depth_mip_offset.store(3300);changed=true;
+    }
+    if(changed)na::settings::Save();
+    if(enabled){const auto status=na::xegtao::ScenePass().GetStats();StatusLine(0,status.reason);}
+    else Hint("Off. Settings are remembered; enable XeGTAO to see changes while playing.");
+    ImGui::EndPopup();
+}
+
 void RegisterRouteAMenu()
 {
     using na::menu::Availability;
@@ -1350,6 +1399,7 @@ void RegisterRouteAMenu()
     na::menu::Register({"Latency and display", Availability::Available, nullptr, &DrawLatencyDetails, Page::Details});
     na::menu::Register({"DLSS in use", Availability::Available, nullptr, &DrawDlssInUseRow, Page::Enhancements});
     na::menu::Register({"Motion analysis", Availability::Available, nullptr, &DrawMotionRow, Page::Enhancements});
+    na::menu::Register({"XeGTAO", Availability::Available, nullptr, &DrawAmbientOcclusion, Page::Enhancements});
     na::menu::Register({"Connection", Availability::Available, nullptr, &DrawConnectionRow, Page::Details});
     na::menu::Register({"Save pictures for analysis", Availability::Available, nullptr, &DrawCaptureRow,
                         Page::Details});

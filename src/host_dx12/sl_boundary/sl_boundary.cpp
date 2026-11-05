@@ -60,6 +60,7 @@ using PfnSetTagForFrame = SlResult(__cdecl*)(const void* frame, const void* view
 using PfnSetTag = SlResult(__cdecl*)(const void* viewport, const void* tags, uint32_t n, void* cmd);
 using PfnUpgradeInterface = SlResult(__cdecl*)(void** base);
 using PfnSetConstants = SlResult(__cdecl*)(const void* constants, const void* frame, const void* viewport);
+using PfnEvaluate = SlResult(__cdecl*)(uint32_t,const void*,const void* const*,uint32_t,void*);
 using PfnRelease = ULONG(STDMETHODCALLTYPE*)(IUnknown*);
 using PfnCreateFactory = HRESULT(WINAPI*)(REFIID, void**);
 using PfnCreateFactory2 = HRESULT(WINAPI*)(UINT, REFIID, void**);
@@ -106,7 +107,7 @@ std::atomic<bool> g_retry_needed{false},g_fail_acquire{false};
 bool g_exports_done=false,g_fallback_done=false,g_hooking_initialized=false;
 std::atomic<bool> g_attach_terminal{false};
 HMODULE g_attach_module=nullptr;
-uint8_t g_export_state[4]{},g_fallback_state[4]{}; // 0 unfinished,1 attached,2 unavailable/terminal target
+uint8_t g_export_state[5]{},g_fallback_state[4]{}; // 0 unfinished,1 attached,2 unavailable/terminal target
 std::atomic<bool> g_fail_proxy_commit{false};
 void prepare_optional(void* target,void* detour,void** original,uint8_t& state,std::vector<uint8_t*>& batch){
     if(state)return;
@@ -130,6 +131,7 @@ PfnSetTagForFrame g_orig_tag_frame = nullptr;
 PfnSetTag g_orig_tag = nullptr;
 PfnUpgradeInterface g_orig_upgrade = nullptr;
 PfnSetConstants g_orig_constants = nullptr;
+PfnEvaluate g_orig_evaluate = nullptr;
 PfnRelease g_orig_release = nullptr;
 PfnCreateFactory g_orig_cf = nullptr, g_orig_cf1 = nullptr;
 PfnCreateFactory2 g_orig_cf2 = nullptr;
@@ -423,6 +425,7 @@ SlResult __cdecl DetourSetConstants(const void* constants, const void* frame, co
         rec.camera_valid = na::fg::ValidCamera(rec.camera);
         if (rec.camera_valid) g_const_valid.fetch_add(1, std::memory_order_relaxed);
         if (r == 0) {
+            if(rec.camera_valid)na::fg::RecordCamera(uint64_t(rec.frame_token)+1,rec.viewport,rec.camera);
             std::lock_guard<std::mutex> lock(g_m);
             g_const_ring[g_const_count % kConstRing] = rec;
             ++g_const_count;
@@ -431,6 +434,23 @@ SlResult __cdecl DetourSetConstants(const void* constants, const void* frame, co
     }
     release_sub(sub);
     return r;
+}
+
+// Carry the exact SL2 evaluation identity through its synchronous native NGX
+// call. Reuse the existing camera cache/scope instead of a latest-frame guess.
+SlResult __cdecl DetourEvaluate(uint32_t feature,const void* frame,const void* const* inputs,uint32_t n,void* cmd)
+{
+    uint32_t token=0,view=0;bool found=false,ambiguous=false;
+    if(frame_token_value(frame,&token)&&inputs&&n<=32){
+        const void* values[32]{};
+        if(guarded_copy(values,inputs,SIZE_T(n)*sizeof(void*))==SIZE_T(n)*sizeof(void*)){
+            for(uint32_t i=0;i<n;++i){uint32_t candidate=0;if(!viewport_value(values[i],&candidate))continue;
+                if(found&&view!=candidate)ambiguous=true;view=candidate;found=true;
+            }
+        }
+    }
+    if(found&&!ambiguous){na::fg::EvaluationScope scope(token,view);return g_orig_evaluate(feature,frame,inputs,n,cmd);}
+    return g_orig_evaluate(feature,frame,inputs,n,cmd);
 }
 
 // ------------------------------------------------------------- proxy presents
@@ -1113,6 +1133,7 @@ bool install_for_module(HMODULE m)
         prepare_optional(tag_frame,reinterpret_cast<void*>(&DetourSetTagForFrame),reinterpret_cast<void**>(&g_orig_tag_frame),g_export_state[1],batch);
         prepare_optional(tag,reinterpret_cast<void*>(&DetourSetTag),reinterpret_cast<void**>(&g_orig_tag),g_export_state[2],batch);
         prepare_optional(constants,reinterpret_cast<void*>(&DetourSetConstants),reinterpret_cast<void**>(&g_orig_constants),g_export_state[3],batch);
+        prepare_optional(reinterpret_cast<void*>(GetProcAddress(m,"slEvaluateFeature")),reinterpret_cast<void*>(&DetourEvaluate),reinterpret_cast<void**>(&g_orig_evaluate),g_export_state[4],batch);
         commit_optional(batch);
         g_exports_done=std::all_of(std::begin(g_export_state),std::end(g_export_state),[](uint8_t state){return state!=0;});
         g_gff_export=g_export_state[0]==1?gff:nullptr;
