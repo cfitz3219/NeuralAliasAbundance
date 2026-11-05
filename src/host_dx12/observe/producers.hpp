@@ -300,6 +300,7 @@ struct AnisoStats {
     uint32_t level = 0;
     uint64_t samplers = 0, static_samplers = 0, already = 0;
     uint64_t native_surface=0,native_16=0; // original observed surface samplers, before our override
+    uint64_t sampler_calls = 0, sampler2_calls = 0; // the game's CreateSampler / CreateSampler2 calls (all, eligible or not)
 };
 AnisoStats GetAnisoStats();
 // The game's own MipLODBias on surface-texture samplers (recorded whether or

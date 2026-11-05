@@ -40,6 +40,9 @@ NA_SLOT(ID3D12Device4Vtbl, CreateHeap1, s::device::CreateHeap1);
 NA_SLOT(ID3D12Device4Vtbl, CreateReservedResource1, s::device::CreateReservedResource1);
 NA_SLOT(ID3D12Device8Vtbl, CreateCommittedResource2, s::device::CreateCommittedResource2);
 NA_SLOT(ID3D12Device8Vtbl, CreatePlacedResource1, s::device::CreatePlacedResource1);
+#if defined(__ID3D12Device11_INTERFACE_DEFINED__)
+NA_SLOT(ID3D12Device11Vtbl, CreateSampler2, s::device::CreateSampler2);
+#endif
 
 NA_SLOT(ID3D12ResourceVtbl, Map, s::resource::Map);
 NA_SLOT(ID3D12ResourceVtbl, Unmap, s::resource::Unmap);

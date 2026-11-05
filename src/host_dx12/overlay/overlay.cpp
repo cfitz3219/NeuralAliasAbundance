@@ -955,11 +955,12 @@ void write_status_line()
         }
         { // anisotropic filtering ([j2] anisotropic): level = in use; static = changed in the twins in use
             const auto as = na::observe::GetAnisoStats();
-            char al[200];
-            const int an = snprintf(al, sizeof al, "anisotropic level=%u setting=%u samplers=%llu static=%llu already=%llu native_surface=%llu native_16=%llu\r\n",
+            char al[260];
+            const int an = snprintf(al, sizeof al, "anisotropic level=%u setting=%u samplers=%llu static=%llu already=%llu native_surface=%llu native_16=%llu create_sampler=%llu create_sampler2=%llu\r\n",
                 as.level, na::settings::Get().aniso16.load(), (unsigned long long)as.samplers,
                   (unsigned long long)as.static_samplers, (unsigned long long)as.already,
-                  (unsigned long long)as.native_surface,(unsigned long long)as.native_16);
+                  (unsigned long long)as.native_surface,(unsigned long long)as.native_16,
+                  (unsigned long long)as.sampler_calls,(unsigned long long)as.sampler2_calls);
             if (an > 0) WriteFile(f, al, DWORD((std::min)(an, int(sizeof al - 1))), &written, nullptr);
         }
         if (na::j2::RenderSmall()) { // P4-4 render-small: one line per status write

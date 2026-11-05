@@ -1196,6 +1196,9 @@ NA_ORIG(CreateUnorderedAccessView, void, ID3D12Device*, ID3D12Resource*, ID3D12R
 NA_ORIG(CreateRenderTargetView, void, ID3D12Device*, ID3D12Resource*, const D3D12_RENDER_TARGET_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
 NA_ORIG(CreateDepthStencilView, void, ID3D12Device*, ID3D12Resource*, const D3D12_DEPTH_STENCIL_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
 NA_ORIG(CreateSampler, void, ID3D12Device*, const D3D12_SAMPLER_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+#if defined(__ID3D12Device11_INTERFACE_DEFINED__)
+NA_ORIG(CreateSampler2, void, ID3D12Device11*, const D3D12_SAMPLER_DESC2*, D3D12_CPU_DESCRIPTOR_HANDLE);
+#endif
 NA_ORIG(CopyDescriptors, void, ID3D12Device*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, const UINT*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, const UINT*, D3D12_DESCRIPTOR_HEAP_TYPE);
 NA_ORIG(CopyDescriptorsSimple, void, ID3D12Device*, UINT, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_DESCRIPTOR_HEAP_TYPE);
 NA_ORIG(CreateCommittedResource, HRESULT, ID3D12Device*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
@@ -1578,6 +1581,7 @@ float clamp_lod(float v) { return v < -16.0f ? -16.0f : (v > 15.99f ? 15.99f : v
 // an isotropic screen-space footprint needs no addressing-based exclusion.
 std::atomic<uint32_t> g_aniso_level{0}; // 0 off, else 4 / 8 / 16 (menu)
 std::atomic<uint64_t> g_aniso_samplers{0}, g_aniso_static{0}, g_aniso_already{0};
+std::atomic<uint64_t> g_sampler_calls{0}, g_sampler2_calls{0}; // the game's CreateSampler / CreateSampler2 calls
 template <typename SD>
 bool apply_aniso(SD& d)
 {
@@ -1645,6 +1649,7 @@ void note_native(float b,uint32_t anisotropy,bool bias_eligible)
 
 void STDMETHODCALLTYPE D_CreateSampler(ID3D12Device* dev, const D3D12_SAMPLER_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
 {
+    if (!t_host_work) g_sampler_calls.fetch_add(1, std::memory_order_relaxed);
     const float bias = g_mip_bias.load(std::memory_order_relaxed);
     const bool surface = d && !t_host_work && sampler_wants_bias(*d);
     const bool aniso_surface = d && !t_host_work && sampler_wants_aniso(*d);
@@ -1662,6 +1667,32 @@ void STDMETHODCALLTYPE D_CreateSampler(ID3D12Device* dev, const D3D12_SAMPLER_DE
     }
     note_descriptor_write(h, NA_DESC_SAMPLER, nullptr, NA_UNKNOWN_U32, NA_UNKNOWN_U32, NA_UNKNOWN_U32);
 }
+#if defined(__ID3D12Device11_INTERFACE_DEFINED__)
+// ID3D12Device11::CreateSampler2 (Agility SDK games): the same sampler as CreateSampler with
+// integer border colours / flags. It was never hooked, so a game that creates its material
+// samplers this way got neither the mip bias nor anisotropic filtering (Cort 2026-11-05:
+// "x16 shows no difference", raised=0). Same rules as D_CreateSampler.
+void STDMETHODCALLTYPE D_CreateSampler2(ID3D12Device11* dev, const D3D12_SAMPLER_DESC2* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
+{
+    if (!t_host_work) g_sampler2_calls.fetch_add(1, std::memory_order_relaxed);
+    const float bias = g_mip_bias.load(std::memory_order_relaxed);
+    const bool surface = d && !t_host_work && sampler_wants_bias(*d);
+    const bool aniso_surface = d && !t_host_work && sampler_wants_aniso(*d);
+    if (aniso_surface) note_native(d->MipLODBias,D3D12_DECODE_IS_ANISOTROPIC_FILTER(d->Filter)?d->MaxAnisotropy:0,surface);
+    D3D12_SAMPLER_DESC2 m = d ? *d : D3D12_SAMPLER_DESC2{};
+    const bool bias_it = surface && bias != 0.0f && biased(d->MipLODBias, bias) != d->MipLODBias;
+    if (bias_it) m.MipLODBias = biased(m.MipLODBias, bias);
+    const bool aniso_it = aniso_surface && apply_aniso(m);
+    if (bias_it || aniso_it) {
+        o_CreateSampler2(dev, &m, h);
+        if (bias_it) g_biased_samplers.fetch_add(1, std::memory_order_relaxed);
+        if (aniso_it) g_aniso_samplers.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        o_CreateSampler2(dev, d, h);
+    }
+    note_descriptor_write(h, NA_DESC_SAMPLER, nullptr, NA_UNKNOWN_U32, NA_UNKNOWN_U32, NA_UNKNOWN_U32);
+}
+#endif
 
 void STDMETHODCALLTYPE D_CopyDescriptors(ID3D12Device* dev, UINT nd, const D3D12_CPU_DESCRIPTOR_HANDLE* ds, const UINT* dsz, UINT ns,
                                          const D3D12_CPU_DESCRIPTOR_HANDLE* ss, const UINT* ssz, D3D12_DESCRIPTOR_HEAP_TYPE type)
@@ -5706,6 +5737,10 @@ bool InstallProducers(ID3D12Device* device, ID3D12CommandQueue* queue, bool hook
         ID3D12Device8* d8 = nullptr;
         device->QueryInterface(__uuidof(ID3D12Device4), reinterpret_cast<void**>(&d4));
         device->QueryInterface(__uuidof(ID3D12Device8), reinterpret_cast<void**>(&d8));
+#if defined(__ID3D12Device11_INTERFACE_DEFINED__)
+        ID3D12Device11* d11 = nullptr;
+        device->QueryInterface(__uuidof(ID3D12Device11), reinterpret_cast<void**>(&d11));
+#endif
 #define NA_HOOK(obj, ns, name, req) hook(obj, sl::ns::name, fn(&D_##name), reinterpret_cast<void**>(&o_##name), req)
         bool ok = NA_HOOK(device, device, CreateCommandQueue, true) &&
                   NA_HOOK(device, device, CreateCommandList, true) && NA_HOOK(device, device, CreateDescriptorHeap, true) &&
@@ -5722,6 +5757,10 @@ bool InstallProducers(ID3D12Device* device, ID3D12CommandQueue* queue, bool hook
                   NA_HOOK(d4, device, CreateHeap1, false) && NA_HOOK(d4, device, CreateReservedResource1, false) &&
                   NA_HOOK(d8, device, CreateCommittedResource2, false) && NA_HOOK(d8, device, CreatePlacedResource1, false) &&
                   NA_HOOK(queue, queue, Signal, true) && NA_HOOK(queue, queue, Wait, true);
+#if defined(__ID3D12Device11_INTERFACE_DEFINED__)
+        if (ok) ok = NA_HOOK(d11, device, CreateSampler2, false);
+        if (d11) d11->Release();
+#endif
         if (ok && hook_queue_execute) ok = NA_HOOK(queue, queue, ExecuteCommandLists, true);
 #undef NA_HOOK
         if (!ok) rollback_patches();
@@ -6807,7 +6846,14 @@ void SetSamplerAnisotropy(uint32_t level)
     g_aniso_level.store(kAfLevels[af], std::memory_order_relaxed); // sampler descriptors created from now on
     request_variant([af](uint32_t w) { return var_pack(var_level(w), af); });
 }
-void SetSamplerAnisotropyPrebuild(uint32_t level) { g_pre_af.store(af_index(level), std::memory_order_relaxed); }
+void SetSamplerAnisotropyPrebuild(uint32_t level)
+{
+    g_pre_af.store(af_index(level), std::memory_order_relaxed);
+    // Descriptor-heap samplers are created once, at load, long before the saved settings are
+    // activated: give them the saved level from the start (as the static twins get it), or
+    // a game whose materials use heap samplers never gets the filtering at all.
+    g_aniso_level.store(kAfLevels[af_index(level)], std::memory_order_relaxed);
+}
 AnisoStats GetAnisoStats()
 {
     AnisoStats a;
@@ -6818,6 +6864,8 @@ AnisoStats GetAnisoStats()
                         (var_af(live) ? g_var_aniso_changed[var_level(live) * 4 + var_af(live)].load(std::memory_order_relaxed) : 0);
     a.already = g_aniso_already.load(std::memory_order_relaxed);
     {std::lock_guard<std::mutex> lock(g_native_m);a.native_surface=g_native_surface;a.native_16=g_native_af16;}
+    a.sampler_calls = g_sampler_calls.load(std::memory_order_relaxed);
+    a.sampler2_calls = g_sampler2_calls.load(std::memory_order_relaxed);
     return a;
 }
 HostWorkScope::HostWorkScope() : prev_(t_host_work) { t_host_work = true; }
