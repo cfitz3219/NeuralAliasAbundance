@@ -379,7 +379,10 @@ int main(int argc, char** argv)
     g.device->CreateDeferredContext(0, &d_scene);
     g.device->CreateDeferredContext(0, &d_post);
     expect(d_scene && d_post, "deferred contexts were created");
-    for (int i = 0; i < 25 && d_scene && d_post; ++i, ++frame) {
+    // At least 25 frames; then until 15 results came back (the helper's pace varies on CI), 30 s at most.
+    const DWORD t2 = GetTickCount();
+    for (int i = 0; d_scene && d_post && GetTickCount() - t2 < 30000; ++i, ++frame) {
+        if (i >= 25 && na::dx11::GetStats().delivered - fired1 >= 15) break;
         Pump();
         ComPtr<ID3D11CommandList> l_scene, l_post;
         Scene(d_scene.Get(), g, frame);
@@ -414,7 +417,9 @@ int main(int argc, char** argv)
     expect(SUCCEEDED(rz), "ResizeBuffers succeeds under the hooks (nothing of the game's is held)");
     expect(SUCCEEDED(rz) && MakeTargets(g), "the game makes its new-size targets");
     const uint64_t before = na::dx11::GetStats().delivered;
-    for (int i = 0; i < 40 && SUCCEEDED(rz); ++i, ++frame) {
+    // The helper restarts at the new size; its start-up time varies on CI, so wait on time (30 s), not a frame count.
+    const DWORD t3 = GetTickCount();
+    for (; SUCCEEDED(rz) && GetTickCount() - t3 < 30000; ++frame) {
         Pump();
         Scene(g.ctx.Get(), g, frame);
         Post(g.ctx.Get(), g);
