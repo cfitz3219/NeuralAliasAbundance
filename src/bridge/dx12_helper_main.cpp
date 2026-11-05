@@ -205,6 +205,11 @@ int Run(const Session& s)
     }
     const bool camera_motion_ok = arbiter_ok && cam_motion && cam_provenance;
     Report(HelperState::Ready, "");
+    // The game's render thread waits each frame until this loop has queued its
+    // work, so wake up promptly: the helper sleeps between frames and only runs
+    // for a moment each frame, so a higher priority costs the game nothing.
+    SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 
     uint32_t expected = 0;
     uint64_t own_value = 0;

@@ -61,6 +61,23 @@ log=             ; default %LOCALAPPDATA%\NeuralAlias\vulkan\NeuralAliasVulkan-<
 | Jitter (optional) | Written into the game's camera block in mapped memory at submit, before the GPU can see it. Only the camera whose aspect matches the screen gets it. Mip bias goes on new mip-mapped samplers. | `InjectJitter` |
 | Secondary command buffers | Draws inside them take the primary's targets at `vkCmdExecuteCommands`. DLSS is never placed inside a secondary. | `Replay` |
 
+## Threads and locks
+
+Games record command buffers and update descriptors from many threads at once,
+so the hooks on those paths are kept off shared locks:
+
+- Recording state is per command buffer, found through a per-thread cache.
+- The device lookup on every call uses a per-thread cache too (no lock unless a
+  device or instance was just created or destroyed).
+- Descriptor sets live in 64 separately locked shards. An update or a bind locks
+  only its set's shard. Updates that write no uniform buffer (images, samplers,
+  storage buffers: most of them) take no lock at all.
+- A bind reuses per-thread scratch space, so it allocates no memory.
+- The frame model itself is only touched at `vkQueueSubmit`.
+
+The layer's added cost per call fell by about a third with this (local bench on
+lavapipe, 1 and 4 threads, about 300 ns down to about 200 ns per call).
+
 ## The log
 
 One file per run. It records the device, the swap chain, the selection, where the

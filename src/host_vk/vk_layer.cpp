@@ -338,21 +338,37 @@ struct DeviceData {
     std::unique_ptr<Host> host;
 };
 
-std::mutex g_tables_mu;
+// Looked up on every device call, from every thread: a per-thread one-entry
+// cache (checked against an epoch that changes whenever a table changes) so the
+// common case takes no lock at all; a shared lock otherwise.
+std::shared_mutex g_tables_mu;
+std::atomic<uint64_t> g_tables_epoch{1};
 std::unordered_map<void*, std::unique_ptr<InstanceData>> g_instances;
 std::unordered_map<void*, std::unique_ptr<DeviceData>> g_devices;
 
 InstanceData* InstanceOf(const void* dispatchable)
 {
-    std::lock_guard<std::mutex> l(g_tables_mu);
-    auto it = g_instances.find(Key(dispatchable));
-    return it == g_instances.end() ? nullptr : it->second.get();
+    thread_local struct { void* key; InstanceData* v; uint64_t epoch; } c{nullptr, nullptr, 0};
+    void* const key = Key(dispatchable);
+    const uint64_t epoch = g_tables_epoch.load(std::memory_order_acquire);
+    if (c.key == key && c.epoch == epoch) return c.v;
+    std::shared_lock<std::shared_mutex> l(g_tables_mu);
+    auto it = g_instances.find(key);
+    InstanceData* v = it == g_instances.end() ? nullptr : it->second.get();
+    c = {key, v, epoch};
+    return v;
 }
 DeviceData* DeviceOf(const void* dispatchable)
 {
-    std::lock_guard<std::mutex> l(g_tables_mu);
-    auto it = g_devices.find(Key(dispatchable));
-    return it == g_devices.end() ? nullptr : it->second.get();
+    thread_local struct { void* key; DeviceData* v; uint64_t epoch; } c{nullptr, nullptr, 0};
+    void* const key = Key(dispatchable);
+    const uint64_t epoch = g_tables_epoch.load(std::memory_order_acquire);
+    if (c.key == key && c.epoch == epoch) return c.v;
+    std::shared_lock<std::shared_mutex> l(g_tables_mu);
+    auto it = g_devices.find(key);
+    DeviceData* v = it == g_devices.end() ? nullptr : it->second.get();
+    c = {key, v, epoch};
+    return v;
 }
 
 // ================================================================ object registries (per process)
@@ -377,15 +393,19 @@ struct PipelineInfo { bool dynamic_viewport = false; float viewport_h = 1.f; };
 struct SetLayoutInfo {
     struct B { uint32_t binding, count; VkDescriptorType type; VkShaderStageFlags stages; };
     std::vector<B> bindings;
+    std::vector<B> dynamic; // dynamic-offset bindings only, in binding order (worked out once, not per bind)
+    bool vertex_ubo = false; // has a vertex-visible uniform buffer binding
 };
 struct SetInfo {
     std::vector<SetLayoutInfo::B> bindings;
+    std::vector<SetLayoutInfo::B> dynamic;
     struct Ubo { VkBuffer buffer = VK_NULL_HANDLE; VkDeviceSize offset = 0, range = 0; bool dynamic = false; };
     std::map<uint64_t, Ubo> ubos; // (binding << 32 | element) -> buffer range (vertex-visible uniform buffers only)
 };
 struct TemplateInfo {
     std::vector<VkDescriptorUpdateTemplateEntry> entries;
     bool for_sets = true;
+    bool has_ubo = false; // writes a uniform buffer (the only kind we note)
 };
 struct MemoryInfo { VkDeviceSize size = 0; bool coherent = false; uint8_t* mapped = nullptr; VkDeviceSize map_offset = 0, map_size = 0; };
 struct BufferInfo { VkDeviceSize size = 0; VkDeviceMemory mem = VK_NULL_HANDLE; VkDeviceSize mem_offset = 0; };
@@ -397,10 +417,24 @@ std::unordered_map<uint64_t, ViewInfo> g_views;
 std::unordered_map<uint64_t, RenderPassInfo> g_passes;
 std::unordered_map<uint64_t, FramebufferInfo> g_fbs;
 std::unordered_map<uint64_t, PipelineInfo> g_pipes;
+// Descriptor sets are updated and bound thousands of times a frame from many
+// threads, so they do not share g_obj_mu: they live in 64 shards, each with its
+// own lock, and a bind or update locks only the one shard its set is in. Layouts
+// and templates (rarely created) have their own lock; pool lists theirs.
+// Lock order: a set shard, then g_obj_mu (shared) for a buffer's size. Never the other way.
+struct alignas(64) SetShard {
+    std::shared_mutex mu;
+    std::unordered_map<uint64_t, SetInfo> sets;
+};
+constexpr uint32_t kSetShards = 64;
+SetShard g_set_shards[kSetShards];
+inline uint32_t SetShardIndex(uint64_t h) { return static_cast<uint32_t>((h * 0x9E3779B97F4A7C15ull) >> 58); }
+inline SetShard& SetShardOf(uint64_t h) { return g_set_shards[SetShardIndex(h)]; }
+std::shared_mutex g_layout_mu; // g_set_layouts, g_templates
 std::unordered_map<uint64_t, SetLayoutInfo> g_set_layouts;
-std::unordered_map<uint64_t, SetInfo> g_sets;
-std::unordered_map<uint64_t, std::vector<uint64_t>> g_pool_sets;
 std::unordered_map<uint64_t, TemplateInfo> g_templates;
+std::mutex g_pool_mu;
+std::unordered_map<uint64_t, std::vector<uint64_t>> g_pool_sets;
 std::unordered_map<uint64_t, MemoryInfo> g_mems;
 std::unordered_map<uint64_t, BufferInfo> g_buffers;
 std::unordered_map<Id, UboRef> g_ubo_ids;                 // camera candidate id -> buffer range
@@ -1890,9 +1924,15 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDescriptorSetLayout_h(VkDevice device, cons
     const VkResult r = dd->d.CreateDescriptorSetLayout(device, ci, a, out);
     if (r == VK_SUCCESS) {
         SetLayoutInfo s;
-        for (uint32_t i = 0; i < ci->bindingCount; ++i)
-            s.bindings.push_back({ci->pBindings[i].binding, ci->pBindings[i].descriptorCount, ci->pBindings[i].descriptorType, ci->pBindings[i].stageFlags});
-        std::unique_lock<std::shared_mutex> l(g_obj_mu);
+        for (uint32_t i = 0; i < ci->bindingCount; ++i) {
+            const SetLayoutInfo::B b{ci->pBindings[i].binding, ci->pBindings[i].descriptorCount, ci->pBindings[i].descriptorType, ci->pBindings[i].stageFlags};
+            s.bindings.push_back(b);
+            if (b.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || b.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) s.dynamic.push_back(b);
+            if ((b.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || b.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) && (b.stages & kVertexStages))
+                s.vertex_ubo = true;
+        }
+        std::sort(s.dynamic.begin(), s.dynamic.end(), [](const auto& x, const auto& y) { return x.binding < y.binding; });
+        std::unique_lock<std::shared_mutex> l(g_layout_mu);
         g_set_layouts[H(*out)] = std::move(s);
     }
     return r;
@@ -1901,65 +1941,78 @@ VKAPI_ATTR void VKAPI_CALL DestroyDescriptorSetLayout_h(VkDevice device, VkDescr
 {
     NA_DEV(device);
     {
-        std::unique_lock<std::shared_mutex> l(g_obj_mu);
+        std::unique_lock<std::shared_mutex> l(g_layout_mu);
         g_set_layouts.erase(H(s));
     }
     dd->d.DestroyDescriptorSetLayout(device, s, a);
+}
+// The pool's sets are gone (pool reset or destroyed). The pool is externally synchronised by the game.
+void ForgetPoolSets(uint64_t pool)
+{
+    std::vector<uint64_t> sets;
+    {
+        std::lock_guard<std::mutex> l(g_pool_mu);
+        auto it = g_pool_sets.find(pool);
+        if (it == g_pool_sets.end()) return;
+        sets.swap(it->second);
+        g_pool_sets.erase(it);
+    }
+    for (uint64_t h : sets) {
+        SetShard& sh = SetShardOf(h);
+        std::unique_lock<std::shared_mutex> l(sh.mu);
+        sh.sets.erase(h);
+    }
 }
 VKAPI_ATTR VkResult VKAPI_CALL AllocateDescriptorSets_h(VkDevice device, const VkDescriptorSetAllocateInfo* ai, VkDescriptorSet* out)
 {
     NA_DEV(device);
     const VkResult r = dd->d.AllocateDescriptorSets(device, ai, out);
     if (r == VK_SUCCESS) {
-        std::unique_lock<std::shared_mutex> l(g_obj_mu);
-        auto& pool = g_pool_sets[H(ai->descriptorPool)];
         for (uint32_t i = 0; i < ai->descriptorSetCount; ++i) {
             SetInfo s;
-            auto lt = g_set_layouts.find(H(ai->pSetLayouts[i]));
-            if (lt != g_set_layouts.end()) s.bindings = lt->second.bindings;
-            g_sets[H(out[i])] = std::move(s);
-            pool.push_back(H(out[i]));
+            {
+                std::shared_lock<std::shared_mutex> l(g_layout_mu);
+                auto lt = g_set_layouts.find(H(ai->pSetLayouts[i]));
+                if (lt != g_set_layouts.end()) {
+                    s.bindings = lt->second.bindings;
+                    s.dynamic = lt->second.dynamic;
+                }
+            }
+            SetShard& sh = SetShardOf(H(out[i]));
+            std::unique_lock<std::shared_mutex> l(sh.mu);
+            sh.sets[H(out[i])] = std::move(s);
         }
+        std::lock_guard<std::mutex> l(g_pool_mu);
+        auto& pool = g_pool_sets[H(ai->descriptorPool)];
+        for (uint32_t i = 0; i < ai->descriptorSetCount; ++i) pool.push_back(H(out[i]));
     }
     return r;
 }
 VKAPI_ATTR VkResult VKAPI_CALL FreeDescriptorSets_h(VkDevice device, VkDescriptorPool pool, uint32_t n, const VkDescriptorSet* sets)
 {
     NA_DEV(device);
-    {
-        std::unique_lock<std::shared_mutex> l(g_obj_mu);
-        for (uint32_t i = 0; i < n; ++i) g_sets.erase(H(sets[i]));
+    for (uint32_t i = 0; i < n; ++i) {
+        if (!sets[i]) continue;
+        SetShard& sh = SetShardOf(H(sets[i]));
+        std::unique_lock<std::shared_mutex> l(sh.mu);
+        sh.sets.erase(H(sets[i]));
     }
     return dd->d.FreeDescriptorSets(device, pool, n, sets);
 }
 VKAPI_ATTR VkResult VKAPI_CALL ResetDescriptorPool_h(VkDevice device, VkDescriptorPool pool, VkDescriptorPoolResetFlags f)
 {
     NA_DEV(device);
-    {
-        std::unique_lock<std::shared_mutex> l(g_obj_mu);
-        auto it = g_pool_sets.find(H(pool));
-        if (it != g_pool_sets.end()) {
-            for (uint64_t s : it->second) g_sets.erase(s);
-            g_pool_sets.erase(it);
-        }
-    }
+    ForgetPoolSets(H(pool));
     return dd->d.ResetDescriptorPool(device, pool, f);
 }
 VKAPI_ATTR void VKAPI_CALL DestroyDescriptorPool_h(VkDevice device, VkDescriptorPool pool, const VkAllocationCallbacks* a)
 {
     NA_DEV(device);
-    {
-        std::unique_lock<std::shared_mutex> l(g_obj_mu);
-        auto it = g_pool_sets.find(H(pool));
-        if (it != g_pool_sets.end()) {
-            for (uint64_t s : it->second) g_sets.erase(s);
-            g_pool_sets.erase(it);
-        }
-    }
+    ForgetPoolSets(H(pool));
     dd->d.DestroyDescriptorPool(device, pool, a);
 }
 
-// Notes one uniform-buffer descriptor (vertex-visible only). Under g_obj_mu (unique).
+// Notes one uniform-buffer descriptor (vertex-visible only). Under the set's shard lock (unique).
 void NoteUbo(SetInfo& s, uint32_t binding, uint32_t element, VkDescriptorType type, const VkDescriptorBufferInfo& bi)
 {
     if (type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) return;
@@ -1972,6 +2025,7 @@ void NoteUbo(SetInfo& s, uint32_t binding, uint32_t element, VkDescriptorType ty
     u.offset = bi.offset;
     u.range = bi.range;
     if (u.range == VK_WHOLE_SIZE) {
+        std::shared_lock<std::shared_mutex> l(g_obj_mu);
         auto bt = g_buffers.find(H(bi.buffer));
         u.range = bt != g_buffers.end() && bt->second.size > bi.offset ? bt->second.size - bi.offset : 0;
     }
@@ -1983,23 +2037,33 @@ void NoteUbo(SetInfo& s, uint32_t binding, uint32_t element, VkDescriptorType ty
 VKAPI_ATTR void VKAPI_CALL UpdateDescriptorSets_h(VkDevice device, uint32_t nw, const VkWriteDescriptorSet* w, uint32_t nc, const VkCopyDescriptorSet* c)
 {
     NA_DEV(device);
-    {
-        std::unique_lock<std::shared_mutex> l(g_obj_mu);
-        for (uint32_t i = 0; i < nw; ++i) {
-            if (!w[i].pBufferInfo) continue;
-            auto it = g_sets.find(H(w[i].dstSet));
-            if (it == g_sets.end()) continue;
-            for (uint32_t k = 0; k < w[i].descriptorCount; ++k)
-                NoteUbo(it->second, w[i].dstBinding, w[i].dstArrayElement + k, w[i].descriptorType, w[i].pBufferInfo[k]);
-        }
-        for (uint32_t i = 0; i < nc; ++i) {
-            auto st = g_sets.find(H(c[i].srcSet));
-            auto dt = g_sets.find(H(c[i].dstSet));
-            if (st == g_sets.end() || dt == g_sets.end()) continue;
-            for (uint32_t k = 0; k < c[i].descriptorCount; ++k) {
-                auto u = st->second.ubos.find((uint64_t(c[i].srcBinding) << 32) | (c[i].srcArrayElement + k));
-                if (u != st->second.ubos.end()) dt->second.ubos[(uint64_t(c[i].dstBinding) << 32) | (c[i].dstArrayElement + k)] = u->second;
-            }
+    // Only uniform-buffer writes matter to us; images, samplers and storage
+    // buffers (most of a game's updates) pass straight through, with no lock.
+    for (uint32_t i = 0; i < nw; ++i) {
+        if (!w[i].pBufferInfo) continue;
+        if (w[i].descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && w[i].descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) continue;
+        SetShard& sh = SetShardOf(H(w[i].dstSet));
+        std::unique_lock<std::shared_mutex> l(sh.mu);
+        auto it = sh.sets.find(H(w[i].dstSet));
+        if (it == sh.sets.end()) continue;
+        for (uint32_t k = 0; k < w[i].descriptorCount; ++k)
+            NoteUbo(it->second, w[i].dstBinding, w[i].dstArrayElement + k, w[i].descriptorType, w[i].pBufferInfo[k]);
+    }
+    for (uint32_t i = 0; i < nc; ++i) {
+        const uint64_t sh_src = H(c[i].srcSet), sh_dst = H(c[i].dstSet);
+        const uint32_t a = SetShardIndex(sh_src), b = SetShardIndex(sh_dst);
+        // Both shards, always lower index first (no deadlock with another copy).
+        std::unique_lock<std::shared_mutex> l1(g_set_shards[a < b ? a : b].mu);
+        std::unique_lock<std::shared_mutex> l2;
+        if (a != b) l2 = std::unique_lock<std::shared_mutex>(g_set_shards[a < b ? b : a].mu);
+        auto& src_sets = g_set_shards[a].sets;
+        auto& dst_sets = g_set_shards[b].sets;
+        auto st = src_sets.find(sh_src);
+        auto dt = dst_sets.find(sh_dst);
+        if (st == src_sets.end() || dt == dst_sets.end() || st->second.ubos.empty()) continue;
+        for (uint32_t k = 0; k < c[i].descriptorCount; ++k) {
+            auto u = st->second.ubos.find((uint64_t(c[i].srcBinding) << 32) | (c[i].srcArrayElement + k));
+            if (u != st->second.ubos.end()) dt->second.ubos[(uint64_t(c[i].dstBinding) << 32) | (c[i].dstArrayElement + k)] = u->second;
         }
     }
     dd->d.UpdateDescriptorSets(device, nw, w, nc, c);
@@ -2013,7 +2077,9 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDescriptorUpdateTemplate_h(VkDevice device,
         TemplateInfo t;
         t.entries.assign(ci->pDescriptorUpdateEntries, ci->pDescriptorUpdateEntries + ci->descriptorUpdateEntryCount);
         t.for_sets = ci->templateType == VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET;
-        std::unique_lock<std::shared_mutex> l(g_obj_mu);
+        for (const auto& e : t.entries)
+            if (e.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || e.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) t.has_ubo = true;
+        std::unique_lock<std::shared_mutex> l(g_layout_mu);
         g_templates[H(*out)] = std::move(t);
     }
     return r;
@@ -2022,7 +2088,7 @@ VKAPI_ATTR void VKAPI_CALL DestroyDescriptorUpdateTemplate_h(VkDevice device, Vk
 {
     NA_DEV(device);
     {
-        std::unique_lock<std::shared_mutex> l(g_obj_mu);
+        std::unique_lock<std::shared_mutex> l(g_layout_mu);
         g_templates.erase(H(t));
     }
     dd->d.DestroyDescriptorUpdateTemplate(device, t, a);
@@ -2030,16 +2096,22 @@ VKAPI_ATTR void VKAPI_CALL DestroyDescriptorUpdateTemplate_h(VkDevice device, Vk
 VKAPI_ATTR void VKAPI_CALL UpdateDescriptorSetWithTemplate_h(VkDevice device, VkDescriptorSet set, VkDescriptorUpdateTemplate t, const void* data)
 {
     NA_DEV(device);
-    {
-        std::unique_lock<std::shared_mutex> l(g_obj_mu);
+    if (data) {
+        std::shared_lock<std::shared_mutex> lt(g_layout_mu); // the template stays alive while we read it
         auto tt = g_templates.find(H(t));
-        auto st = g_sets.find(H(set));
-        if (tt != g_templates.end() && st != g_sets.end() && tt->second.for_sets && data)
-            for (const auto& e : tt->second.entries)
-                for (uint32_t k = 0; k < e.descriptorCount; ++k) {
-                    const auto* bi = reinterpret_cast<const VkDescriptorBufferInfo*>(static_cast<const uint8_t*>(data) + e.offset + k * e.stride);
-                    NoteUbo(st->second, e.dstBinding, e.dstArrayElement + k, e.descriptorType, *bi);
+        if (tt != g_templates.end() && tt->second.for_sets && tt->second.has_ubo) {
+            SetShard& sh = SetShardOf(H(set));
+            std::unique_lock<std::shared_mutex> l(sh.mu);
+            auto st = sh.sets.find(H(set));
+            if (st != sh.sets.end())
+                for (const auto& e : tt->second.entries) {
+                    if (e.descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && e.descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) continue;
+                    for (uint32_t k = 0; k < e.descriptorCount; ++k) {
+                        const auto* bi = reinterpret_cast<const VkDescriptorBufferInfo*>(static_cast<const uint8_t*>(data) + e.offset + k * e.stride);
+                        NoteUbo(st->second, e.dstBinding, e.dstArrayElement + k, e.descriptorType, *bi);
+                    }
                 }
+        }
     }
     dd->d.UpdateDescriptorSetWithTemplate(device, set, t, data);
 }
@@ -2050,7 +2122,7 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR_h(VkDevice device, const VkSwa
     const VkResult r = dd->d.CreateSwapchainKHR(device, ci, a, out);
     if (r != VK_SUCCESS) return r;
     {
-        std::lock_guard<std::mutex> l(g_tables_mu);
+        std::unique_lock<std::shared_mutex> l(g_tables_mu);
         if (!dd->host) {
             // The first device that presents is the game's.
             bool taken = false;
@@ -2297,53 +2369,60 @@ VKAPI_ATTR void VKAPI_CALL CmdBindDescriptorSets_h(VkCommandBuffer cb, VkPipelin
 {
     CbState* cs = Cb(cb);
     if (cs) {
-        std::vector<std::pair<Id, UboRef>> fresh; // candidate ids not registered yet
-        {
-            std::shared_lock<std::shared_mutex> l(g_obj_mu);
-            uint32_t di = 0;
-            for (uint32_t i = 0; i < n; ++i) {
-                const uint32_t slot = first + i;
-                auto st = g_sets.find(H(sets[i]));
-                // This set's dynamic offsets, in binding order (Vulkan's rule).
-                std::map<uint64_t, uint32_t> dyn_of;
-                std::vector<uint32_t> mine;
-                if (st != g_sets.end()) {
-                    std::vector<SetLayoutInfo::B> bs = st->second.bindings;
-                    std::sort(bs.begin(), bs.end(), [](const auto& x, const auto& y) { return x.binding < y.binding; });
-                    for (const auto& bd : bs)
-                        if (bd.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || bd.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
-                            for (uint32_t e = 0; e < bd.count && di < ndyn; ++e) {
-                                const uint32_t v = dyn[di++];
-                                mine.push_back(v);
-                                if (bd.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) dyn_of[(uint64_t(bd.binding) << 32) | e] = v;
-                            }
+        // Reused per thread: no heap allocation per bind once warmed up.
+        thread_local std::vector<std::pair<Id, UboRef>> fresh; // candidate ids this bind produced
+        thread_local std::vector<std::pair<uint64_t, uint32_t>> dyn_of; // (binding << 32 | element) -> dynamic offset
+        fresh.clear();
+        uint32_t di = 0;
+        for (uint32_t i = 0; i < n; ++i) {
+            const uint32_t slot = first + i;
+            SetBind* b = nullptr;
+            if (slot < kMaxSets) {
+                b = bp == VK_PIPELINE_BIND_POINT_COMPUTE ? &cs->comp_sets[slot] : &cs->gfx_sets[slot];
+                b->layout = layout;
+                b->set = sets[i];
+                b->dyn.clear();
+            }
+            const bool gfx = b && bp == VK_PIPELINE_BIND_POINT_GRAPHICS;
+            if (gfx) cs->gfx_ubo_ids[slot].clear();
+            if (!sets[i]) continue;
+            SetShard& sh = SetShardOf(H(sets[i]));
+            std::shared_lock<std::shared_mutex> l(sh.mu);
+            auto st = sh.sets.find(H(sets[i]));
+            if (st == sh.sets.end()) continue;
+            // This set's dynamic offsets, in binding order (Vulkan's rule; the order is worked out at layout creation).
+            dyn_of.clear();
+            for (const auto& bd : st->second.dynamic)
+                for (uint32_t e = 0; e < bd.count && di < ndyn; ++e) {
+                    const uint32_t v = dyn[di++];
+                    if (b) b->dyn.push_back(v);
+                    if (bd.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) dyn_of.push_back({(uint64_t(bd.binding) << 32) | e, v});
                 }
-                if (slot >= kMaxSets) continue;
-                SetBind& b = bp == VK_PIPELINE_BIND_POINT_COMPUTE ? cs->comp_sets[slot] : cs->gfx_sets[slot];
-                b.layout = layout;
-                b.set = sets[i];
-                b.dyn = std::move(mine);
-                if (bp != VK_PIPELINE_BIND_POINT_GRAPHICS) continue;
-                auto& ids = cs->gfx_ubo_ids[slot];
-                ids.clear();
-                if (st == g_sets.end()) continue;
-                for (const auto& kv : st->second.ubos) {
-                    if (ids.size() >= 4) break;
-                    UboRef ref{kv.second.buffer, kv.second.offset, kv.second.range};
-                    if (kv.second.dynamic) {
-                        auto d = dyn_of.find(kv.first);
-                        if (d != dyn_of.end()) ref.offset += d->second;
-                    }
-                    const Id id = NonZero(Mix(Mix(0x0b0, H(ref.buffer)), Mix(ref.offset, ref.range)) & ~kSecondaryTag);
-                    ids.push_back(id);
-                    if (!g_ubo_ids.count(id)) fresh.push_back({id, ref});
-                }
+            if (!gfx) continue;
+            auto& ids = cs->gfx_ubo_ids[slot];
+            for (const auto& kv : st->second.ubos) {
+                if (ids.size() >= 4) break;
+                UboRef ref{kv.second.buffer, kv.second.offset, kv.second.range};
+                if (kv.second.dynamic)
+                    for (const auto& d : dyn_of)
+                        if (d.first == kv.first) { ref.offset += d.second; break; }
+                const Id id = NonZero(Mix(Mix(0x0b0, H(ref.buffer)), Mix(ref.offset, ref.range)) & ~kSecondaryTag);
+                ids.push_back(id);
+                fresh.push_back({id, ref});
             }
         }
         if (!fresh.empty()) {
-            std::unique_lock<std::shared_mutex> l(g_obj_mu);
-            if (g_ubo_ids.size() > 200000) g_ubo_ids.clear(); // bounded: re-learned from the next binds
-            for (const auto& f : fresh) g_ubo_ids[f.first] = f.second;
+            bool missing = false;
+            {
+                std::shared_lock<std::shared_mutex> l(g_obj_mu);
+                for (const auto& f : fresh)
+                    if (!g_ubo_ids.count(f.first)) { missing = true; break; }
+            }
+            if (missing) {
+                std::unique_lock<std::shared_mutex> l(g_obj_mu);
+                if (g_ubo_ids.size() > 200000) g_ubo_ids.clear(); // bounded: re-learned from the next binds
+                for (const auto& f : fresh) g_ubo_ids.emplace(f.first, f.second);
+            }
         }
     }
     (cs ? cs->dev : DeviceOf(cb))->d.CmdBindDescriptorSets(cb, bp, layout, first, n, sets, ndyn, dyn);
@@ -2658,8 +2737,9 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateInstance_h(const VkInstanceCreateInfo* ci, 
             Cfg().jitter ? 1 : 0, Cfg().mip_bias, Cfg().preset, Cfg().copy_test, na::vk::VkDlss::BuiltWithDlss() ? "built in" : "not in this build");
         if (!keep.empty()) Log("instance: added %zu extension(s) DLSS needs", keep.size());
     }
-    std::lock_guard<std::mutex> l(g_tables_mu);
+    std::unique_lock<std::shared_mutex> l(g_tables_mu);
     g_instances[Key(*out)] = std::move(inst);
+    g_tables_epoch.fetch_add(1, std::memory_order_release);
     return r;
 }
 
@@ -2667,11 +2747,12 @@ VKAPI_ATTR void VKAPI_CALL DestroyInstance_h(VkInstance instance, const VkAlloca
 {
     std::unique_ptr<InstanceData> inst;
     {
-        std::lock_guard<std::mutex> l(g_tables_mu);
+        std::unique_lock<std::shared_mutex> l(g_tables_mu);
         auto it = g_instances.find(Key(instance));
         if (it == g_instances.end()) return;
         inst = std::move(it->second);
         g_instances.erase(it);
+        g_tables_epoch.fetch_add(1, std::memory_order_release);
     }
     inst->DestroyInstance(instance, a);
 }
@@ -2737,8 +2818,9 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDevice_h(VkPhysicalDevice phys, const VkDev
     if (inst->active) {
         Log("device: %s created%s", dd->props.deviceName, keep.empty() ? "" : " (with the extensions DLSS needs)");
     }
-    std::lock_guard<std::mutex> l(g_tables_mu);
+    std::unique_lock<std::shared_mutex> l(g_tables_mu);
     g_devices[Key(*out)] = std::move(dd);
+    g_tables_epoch.fetch_add(1, std::memory_order_release);
     return r;
 }
 
@@ -2746,11 +2828,12 @@ VKAPI_ATTR void VKAPI_CALL DestroyDevice_h(VkDevice device, const VkAllocationCa
 {
     std::unique_ptr<DeviceData> dd;
     {
-        std::lock_guard<std::mutex> l(g_tables_mu);
+        std::unique_lock<std::shared_mutex> l(g_tables_mu);
         auto it = g_devices.find(Key(device));
         if (it == g_devices.end()) return;
         dd = std::move(it->second);
         g_devices.erase(it);
+        g_tables_epoch.fetch_add(1, std::memory_order_release);
     }
     if (Host* h = dd->host.get()) {
         dd->d.DeviceWaitIdle(device);
@@ -2887,7 +2970,7 @@ NA_VK_EXPORT int NeuralAliasVk_GetStats(NaVkStats* out)
     std::memset(out, 0, sizeof(*out));
     out->size = size;
     out->dlss_built = na::vk::VkDlss::BuiltWithDlss();
-    std::lock_guard<std::mutex> l(g_tables_mu);
+    std::unique_lock<std::shared_mutex> l(g_tables_mu);
     for (auto& kv : g_devices) {
         Host* h = kv.second->host.get();
         if (!h) continue;

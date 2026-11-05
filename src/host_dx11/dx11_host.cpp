@@ -324,9 +324,11 @@ void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, const void* cb_bytes =
     }
     const uint32_t v = g_model.Feed(e);
     if (e.kind == Kind::CbUpdate && cb_bytes) {
-        std::vector<uint8_t> b(static_cast<const uint8_t*>(cb_bytes), static_cast<const uint8_t*>(cb_bytes) + cb_size);
-        if (g_model.Current().camera_cb == e.resource) g_cb_versions[{e.resource, v}] = b;
-        g_cb_latest[e.resource] = std::move(b);
+        // Into the existing buffers (no new allocation per upload once warmed up).
+        const auto* p = static_cast<const uint8_t*>(cb_bytes);
+        std::vector<uint8_t>& latest = g_cb_latest[e.resource];
+        latest.assign(p, p + cb_size);
+        if (g_model.Current().camera_cb == e.resource) g_cb_versions[{e.resource, v}].assign(p, p + cb_size);
     }
 }
 
