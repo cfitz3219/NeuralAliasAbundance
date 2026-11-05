@@ -399,6 +399,8 @@ int main(int argc, char** argv)
             CHECK(m1.twin_failures == 0);
             na::observe::SetSamplerMipBiasLive(-0.5f);
             CHECK(na::observe::SamplerMipBias() == -0.5f);
+            REQUIRE(na::observe::WaitSamplerVariant(5000)); // prepared at creation: in use at once
+            CHECK(na::observe::GetMipLiveStats().live_bias == -0.5f);
             test::ComPtr<ID3D12CommandAllocator> la;
             test::ComPtr<ID3D12GraphicsCommandList> ll;
             REQUIRE(SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&la))));
@@ -415,12 +417,13 @@ int main(int argc, char** argv)
             d.WaitIdle();
             CHECK(dev->GetDeviceRemovedReason() == S_OK); // twin root signature + twin pipeline matched
             CHECK(na::observe::GetMipLiveStats().fallbacks == 0);
-            na::observe::SetSamplerMipBiasLive(-1.0f); // back to the game's own objects
+            na::observe::SetSamplerMipBiasLive(-1.0f);
+            REQUIRE(na::observe::WaitSamplerVariant(5000));
             na::observe::SetSamplerMipBiasLiveEnabled(false);
         }
         {
-            // Render-small levels per DLSS mode (Q -1.585, B -2, P -2.25 since Cort 2026-11-04); only the wanted
-            // levels are chosen (Light -0.5 is not wanted, so -0.6 picks -1).
+            // Render-small levels per DLSS mode (Q -1.585, B -2, P -2.25 since Cort 2026-11-04). Every level can
+            // be chosen since live variants are built on demand (Cort 2026-11-05), so -0.6 picks Light (-0.5).
             const float wanted[4] = {-1.0f, na::j2::SmallMipBias(-1.0f, 1.0f / 1.5f), na::j2::SmallMipBias(-1.0f, 1.0f / 1.72f),
                                      na::j2::SmallMipBias(-1.0f, 0.5f)};
             na::observe::SetSamplerMipLevelsWanted(wanted, 4);
@@ -440,7 +443,7 @@ int main(int argc, char** argv)
             CHECK(na::j2::PresetFor(11u, 3440, 3440) == 11u);
             CHECK(na::j2::PresetFor(0u, 1720, 3440) == 0u);
             na::observe::SetSamplerMipBiasLive(-0.6f);
-            CHECK(na::observe::SamplerMipBias() == -1.0f);
+            CHECK(na::observe::SamplerMipBias() == -0.5f);
             const float classic[3] = {0.0f, -0.5f, -1.0f};
             na::observe::SetSamplerMipLevelsWanted(classic, 3);
             na::observe::SetSamplerMipBiasLive(-1.0f);
@@ -487,6 +490,67 @@ int main(int argc, char** argv)
             sd.MaxAnisotropy = 1;
             dev->CreateSampler(&sd, h2);
             CHECK(na::observe::GetAnisoStats().samplers == a4.samplers); // off: untouched
+        }
+        // Live anisotropic filtering (Cort 2026-11-05: no restarts). Nothing is prepared at
+        // creation (saved choice: no bias, off); choosing 16x builds the twins in the background
+        // from the creation copies, and a recording reset afterwards binds and runs them.
+        {
+            na::observe::SetSamplerMipBias(0.0f);
+            na::observe::SetSamplerAnisotropy(0);
+            REQUIRE(na::observe::WaitSamplerVariant(5000));
+            const float none[1] = {0.0f};
+            na::observe::SetSamplerMipLevelsWanted(none, 1);
+            na::observe::SetSamplerAnisotropyPrebuild(0);
+            na::observe::SetSamplerMipBiasLiveEnabled(true);
+            const auto m0 = na::observe::GetMipLiveStats();
+            test::ComPtr<ID3D12RootSignature> ars;
+            REQUIRE(SUCCEEDED(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&ars))));
+            const char* cs = "[numthreads(1,1,1)] void CS() {}";
+            test::ComPtr<ID3DBlob> csb, cse;
+            REQUIRE(SUCCEEDED(D3DCompile(cs, std::strlen(cs), nullptr, nullptr, nullptr, "CS", "cs_5_0", 0, 0, &csb, &cse)));
+            D3D12_COMPUTE_PIPELINE_STATE_DESC cd{};
+            cd.pRootSignature = ars.Get();
+            cd.CS = {csb->GetBufferPointer(), csb->GetBufferSize()};
+            test::ComPtr<ID3D12PipelineState> apso;
+            REQUIRE(SUCCEEDED(dev->CreateComputePipelineState(&cd, IID_PPV_ARGS(&apso))));
+            csb.Reset(); // the creation copy owns its bytecode
+            const auto m1 = na::observe::GetMipLiveStats();
+            CHECK(m1.twin_root_signatures == m0.twin_root_signatures); // nothing chosen yet
+            CHECK(m1.twin_pipelines == m0.twin_pipelines);
+            na::observe::SetSamplerAnisotropy(16);
+            REQUIRE(na::observe::WaitSamplerVariant(10000));
+            const auto m2 = na::observe::GetMipLiveStats();
+            std::printf("live AF: root twins %llu pipeline twins %llu changed static %llu failures %llu\n",
+                        (unsigned long long)(m2.twin_root_signatures - m1.twin_root_signatures), (unsigned long long)(m2.twin_pipelines - m1.twin_pipelines),
+                        (unsigned long long)m2.live_static_changed, (unsigned long long)m2.twin_failures);
+            CHECK(m2.live_aniso == 16);
+            CHECK(m2.twin_root_signatures >= m1.twin_root_signatures + 1);
+            CHECK(m2.twin_pipelines >= m1.twin_pipelines + 1);
+            CHECK(m2.live_static_changed >= 1);
+            CHECK(m2.twin_failures == m1.twin_failures);
+            CHECK(na::observe::GetAnisoStats().level == 16);
+            test::ComPtr<ID3D12CommandAllocator> la;
+            test::ComPtr<ID3D12GraphicsCommandList> ll;
+            REQUIRE(SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&la))));
+            REQUIRE(SUCCEEDED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, la.Get(), nullptr, IID_PPV_ARGS(&ll))));
+            REQUIRE(SUCCEEDED(ll->Close()));
+            REQUIRE(SUCCEEDED(la->Reset()));
+            REQUIRE(SUCCEEDED(ll->Reset(la.Get(), nullptr))); // latches 16x
+            ll->SetComputeRootSignature(ars.Get());
+            ll->SetPipelineState(apso.Get());
+            ll->Dispatch(1, 1, 1);
+            REQUIRE(SUCCEEDED(ll->Close()));
+            ID3D12CommandList* one[] = {ll.Get()};
+            q->ExecuteCommandLists(1, one);
+            d.WaitIdle();
+            CHECK(dev->GetDeviceRemovedReason() == S_OK); // background-built root signature + pipeline matched
+            CHECK(na::observe::GetMipLiveStats().fallbacks == m2.fallbacks);
+            na::observe::SetSamplerAnisotropy(0);
+            REQUIRE(na::observe::WaitSamplerVariant(5000));
+            CHECK(na::observe::GetMipLiveStats().live_aniso == 0);
+            na::observe::SetSamplerMipBiasLiveEnabled(false);
+            const float classic[3] = {0.0f, -0.5f, -1.0f};
+            na::observe::SetSamplerMipLevelsWanted(classic, 3);
         }
     }
     test::ComPtr<ID3D12RootSignature> rs_pre; // the pre-pass's own root signature: one root CBV

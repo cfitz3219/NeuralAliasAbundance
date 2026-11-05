@@ -256,28 +256,42 @@ void DescribeStateEvidence(ID3D12CommandList* list, na_object_id id, uint32_t su
 bool ListLastStateSub(ID3D12CommandList* list, na_object_id id, uint32_t sub, uint32_t* state);
 enum class StateLookup { Absent, Known, Unavailable };
 StateLookup ListStateSub(ID3D12CommandList* list, na_object_id id, uint32_t sub, uint32_t* state);
-// Texture LOD bias added to the game's mip-mapped samplers (sampler descriptors
-// and root-signature static samplers) created from now on; 0 = off. For J2 DLAA
-// with jitter (temporal reconstruction needs sharper per-frame texture samples).
-void SetSamplerMipBias(float bias);
-// Live mip bias (no restart): the game's root signatures and pipelines get twins at
-// creation for the other menu levels (0, -0.5, -1); each command-list recording binds the
-// twins of the level selected when it was Reset. SamplerMipBias() reports that level.
-void SetSamplerMipBiasLive(float bias);
+// Texture LOD bias for the game's mip-mapped surface samplers (sampler descriptors and
+// root-signature static samplers); 0 = off. For J2 DLAA with jitter (temporal
+// reconstruction needs sharper per-frame texture samples).
+// Live sampler variants (Cort 2026-11-05: no restarts, and the saved choice must work from
+// the first frame): with live switching on, the game's own root signatures and pipelines
+// stay exactly as the game made them, and twins with the chosen mip bias and anisotropic
+// filtering are bound instead. Twins for the saved choice are built when the game creates
+// its objects; any other choice is built in the background from copies of the creation
+// descriptions and switches over (all at once) when complete. With live switching off,
+// objects created from now on are changed directly (the old behaviour).
+void SetSamplerMipBias(float bias);     // the effective choice (saved-setting activation)
+void SetSamplerMipBiasLive(float bias); // a menu change; same as SetSamplerMipBias
 void SetSamplerMipBiasLiveEnabled(bool on); // before the game creates its pipelines
-// The biases live switching may ask for (nearest levels get twins); before SetSamplerMipBias.
+// The biases most likely to be chosen (the saved choice and the DLSS modes' automatic
+// levels): their twins are built at creation, so switching to them is immediate.
 void SetSamplerMipLevelsWanted(const float* biases, int n);
+// Waits until the chosen variant is in use (tests); false on timeout.
+bool WaitSamplerVariant(uint32_t timeout_ms);
 struct MipLiveStats {
     bool enabled = false;
-    float game_bias = 0, live_bias = 0;
+    float game_bias = 0, live_bias = 0;  // game_bias: the game's own objects (always unbiased now)
+    float want_bias = 0;                 // chosen; live_bias is the one in use (differs while preparing)
+    uint32_t want_aniso = 0, live_aniso = 0;
+    bool preparing = false;
+    uint64_t prepare_done = 0, prepare_total = 0; // objects of the last background preparation
+    uint64_t live_static_changed = 0;   // static samplers changed in the twins of the variant in use
     uint64_t twin_root_signatures = 0, twin_pipelines = 0, untwinned_pipelines = 0, fallbacks = 0, twin_failures = 0;
 };
 MipLiveStats GetMipLiveStats();
 float SamplerMipBias();
 void MipBiasCounts(uint64_t* samplers, uint64_t* static_samplers);
-// 16x anisotropic filtering on the same surface-texture samplers the mip bias treats
-// (sampler descriptors and static samplers created from now on; set before the game loads).
-void SetSamplerAnisotropy(uint32_t level); // 0 off, 4 / 8 / 16
+// Anisotropic filtering (0 off, 4 / 8 / 16) on the same surface-texture samplers the mip
+// bias treats. Live like the mip bias (same twins); sampler descriptors created from now on.
+void SetSamplerAnisotropy(uint32_t level);
+// The saved anisotropic level: twins for it are built at creation (before activation).
+void SetSamplerAnisotropyPrebuild(uint32_t level);
 struct AnisoStats { uint32_t level = 0; uint64_t samplers = 0, static_samplers = 0, already = 0; };
 AnisoStats GetAnisoStats();
 // The game's own MipLODBias on surface-texture samplers (recorded whether or

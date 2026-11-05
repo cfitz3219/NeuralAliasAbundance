@@ -12,6 +12,8 @@
 #include "host_dx12/observe/operation_snapshot.hpp"
 #include "host_dx12/observe/shader_dimensions.hpp"
 #include <tuple>
+#include <deque>
+#include <string>
 #include <algorithm>
 #include <system_error>
 #include <chrono>
@@ -158,7 +160,8 @@ struct ListState {
     std::vector<std::shared_ptr<const DescriptorDetails>> native_colors;
     uint64_t target_serial=0,viewport_serial=0,scissor_serial=0;
     std::shared_ptr<const DescriptorDetails> native_depth;
-    int8_t mip_level = -1;               // live mip bias: twin level latched at Reset (-1 = the game's own objects)
+    int8_t mip_level = -1;               // live sampler variant latched at Reset: mip level (-1 = the game's own objects)
+    int8_t af_latched = 0;               // ...and its anisotropic index (0 off, 1 4x, 2 8x, 3 16x)
     // Viewport jitter: our offset copies of the game's viewports are bound now (vpj_value),
     // and the value the last scene draw of this recording was drawn with (vpj_scene, 0 = none).
     bool vpj_applied = false;
@@ -166,6 +169,7 @@ struct ListState {
     ~ListState() { if (vpj_scene) g_vpj_recordings.fetch_sub(1, std::memory_order_release); }
 };
 
+struct VariantRecipe; // live sampler variants: see the definition
 struct Obj {
     na_object_id id = 0;
     uint32_t kind = 0;
@@ -187,8 +191,22 @@ struct Obj {
     // Immutable once published; owns a reference on every twin. A twin is never one of
     // the game's own objects (see D_CreateRootSignature), so twins cannot form cycles.
     // Never destroyed inside another D3D12 object's destruction: see ReleaseTwinsLater.
-    struct Twins { IUnknown* obj[6] = {}; bool same[6] = {}; ~Twins() { for (auto* o : obj) if (o) o->Release(); } };
-    std::shared_ptr<Twins> twins;
+    // built[i]: level i was prepared (same or obj, or it failed: then neither and lookups fall back).
+    struct Twins {
+        IUnknown* obj[6] = {}; bool same[6] = {}; bool built[6] = {};
+        Twins() = default;
+        Twins(const Twins& o) { for (int i = 0; i < 6; ++i) { obj[i] = o.obj[i]; same[i] = o.same[i]; built[i] = o.built[i]; if (obj[i]) obj[i]->AddRef(); } }
+        Twins& operator=(const Twins&) = delete;
+        ~Twins() { for (auto* o : obj) if (o) o->Release(); }
+    };
+    std::shared_ptr<Twins> twins;          // raster storage on command lists (not sampler variants)
+    // Live sampler variants (mip bias x anisotropic filtering): af_sets[a] holds the twins at
+    // anisotropic index a, per mip level. variant_kind: 0 = sampler-independent (the game's
+    // object is right for every variant), 1 = has variants, 2 = cannot be twinned (a pipeline
+    // with an embedded root signature): recordings fall back to the game's objects.
+    std::shared_ptr<Twins> af_sets[4];
+    std::shared_ptr<const VariantRecipe> recipe; // creation copy for background builds
+    uint8_t variant_kind = 0;
     bool retirement_unobservable = false;   // the sentinel could not be attached
     uint64_t present_ordinal = 0;
 };
@@ -236,16 +254,33 @@ std::atomic<uint64_t> g_mip_shared_skips{0}; // twin levels dropped: D3D12 retur
 // creation hook or ExecuteCommandLists, which run in the game's call, not inside the
 // runtime's teardown of an object). Twins still parked at process exit are leaked.
 std::mutex g_twin_grave_m;
-std::vector<std::shared_ptr<Obj::Twins>>& g_twin_grave = *new std::vector<std::shared_ptr<Obj::Twins>>();
+std::vector<std::shared_ptr<void>>& g_twin_grave = *new std::vector<std::shared_ptr<void>>();
 void ReleaseTwinsLater(std::shared_ptr<Obj::Twins>&& t)
 {
     if (!t) return;
     std::lock_guard<std::mutex> lk(g_twin_grave_m);
     g_twin_grave.push_back(std::move(t));
 }
+// An entry's twins, variant sets and creation copy (which holds a device reference).
+struct ObjParcel { std::shared_ptr<Obj::Twins> twins, sets[4]; std::shared_ptr<const VariantRecipe> recipe; };
+ObjParcel take_parcel(Obj& o)
+{
+    ObjParcel p;
+    p.twins = std::move(o.twins);
+    for (int a = 0; a < 4; ++a) p.sets[a] = std::move(o.af_sets[a]);
+    p.recipe = std::move(o.recipe);
+    return p;
+}
+void ReleaseLater(ObjParcel&& p)
+{
+    std::lock_guard<std::mutex> lk(g_twin_grave_m);
+    if (p.twins) g_twin_grave.push_back(std::move(p.twins));
+    for (auto& t : p.sets) if (t) g_twin_grave.push_back(std::move(t));
+    if (p.recipe) g_twin_grave.push_back(std::const_pointer_cast<VariantRecipe>(std::move(p.recipe)));
+}
 void ReleaseParkedTwins()
 {
-    std::vector<std::shared_ptr<Obj::Twins>> dead;
+    std::vector<std::shared_ptr<void>> dead;
     {
         std::lock_guard<std::mutex> lk(g_twin_grave_m);
         if (g_twin_grave.empty()) return;
@@ -581,12 +616,12 @@ void RetireSentinel::retire(const void* key, na_object_id id, uint32_t kind)
     // other statics released D3D12 objects after the CRT had destroyed g_m / g_heaps / g_va.
     if (g_process_exiting.load(std::memory_order_acquire)) return;
     g_retire_gen.fetch_add(1, std::memory_order_acq_rel);
-    std::shared_ptr<Obj::Twins> drop; // parked, never released here (we are inside the owner's destruction)
+    ObjParcel drop; // parked, never released here (we are inside the owner's destruction)
     {
         std::unique_lock<std::shared_mutex> lock(g_m);
         ++g_operation_revision;++g_heap_registry_revision;
         auto it = g_objs.find(key);
-        if (it != g_objs.end() && it->second.id == id) { drop = std::move(it->second.twins); g_objs.erase(it); }
+        if (it != g_objs.end() && it->second.id == id) { drop = take_parcel(it->second); g_objs.erase(it); }
         g_heaps.erase(std::remove_if(g_heaps.begin(), g_heaps.end(), [&](const std::unique_ptr<DescHeap>& h) { return h->id == id; }),
                       g_heaps.end());
         heap_index_rebuild();
@@ -601,7 +636,7 @@ void RetireSentinel::retire(const void* key, na_object_id id, uint32_t kind)
         g_buffers.erase(id);
         g_res_keys.erase(id);
     }
-    ReleaseTwinsLater(std::move(drop));
+    ReleaseLater(std::move(drop));
     if (kind == NA_OBJ_RESOURCE) known_forget(id);
     g_c.live.fetch_sub(1);
     g_c.retired.fetch_add(1);
@@ -657,16 +692,16 @@ na_object_id register_object(IUnknown* object, uint32_t kind)
     if (!object) return 0;
     const void* key = canon(object);
     const na_object_id id = g_next_id.fetch_add(1);
-    std::shared_ptr<Obj::Twins> drop; // stale entry's twins, released after g_m
+    ObjParcel drop; // stale entry's twins, released after g_m
     {
         std::unique_lock<std::shared_mutex> lock(g_m);
         Obj& o = g_objs[key];
         ++g_operation_revision;
         if (o.id) g_c.live.fetch_sub(1); // address reused without a retirement we saw
-        drop = std::move(o.twins);
+        drop = take_parcel(o);
         o = fresh_obj(id, kind);
     }
-    ReleaseTwinsLater(std::move(drop));
+    ReleaseLater(std::move(drop));
     g_c.live.fetch_add(1);
     g_c.created.fetch_add(1);
     attach_sentinel(object, key, id, kind);
@@ -682,17 +717,17 @@ na_object_id ensure_registered(IUnknown* object, uint32_t kind, bool* created)
     if (!object) return 0;
     const void* key = canon(object);
     na_object_id id = 0;
-    std::shared_ptr<Obj::Twins> drop; // stale entry's twins, released after g_m
+    ObjParcel drop; // stale entry's twins, released after g_m
     {
         std::unique_lock<std::shared_mutex> lock(g_m);
         auto it = g_objs.find(key);
         if (it != g_objs.end() && it->second.kind == kind) return it->second.id;
         id = g_next_id.fetch_add(1);
         ++g_operation_revision;
-        if (it != g_objs.end()) { g_c.live.fetch_sub(1); drop = std::move(it->second.twins); }
+        if (it != g_objs.end()) { g_c.live.fetch_sub(1); drop = take_parcel(it->second); }
         g_objs[key] = fresh_obj(id, kind);
     }
-    ReleaseTwinsLater(std::move(drop));
+    ReleaseLater(std::move(drop));
     *created = true;
     g_c.live.fetch_add(1);
     g_c.created.fetch_add(1);
@@ -1360,27 +1395,44 @@ void STDMETHODCALLTYPE D_CreateDepthStencilView(ID3D12Device* dev, ID3D12Resourc
 // use mips (linear / anisotropic mip filtering, MaxLOD > 0); never to
 // comparison (shadow) samplers or point-mip lookups. 0 = off.
 std::atomic<float> g_mip_bias{0.0f};
-// Live mip bias (Cort: compare without restarting). The game's static samplers are baked
-// into its root signatures and pipelines at load, so every root signature and pipeline
-// gets twins built at creation for the other menu levels; command lists are switched to
-// the twins of the level latched at their Reset. Levels = the menu's choices.
+// Live sampler variants (Cort 2026-11-03: compare without restarting; 2026-11-05: no
+// restarts at all, and the saved choice must work from the first frame). The game's static
+// samplers are baked into its root signatures and pipelines at load. Saved effects are only
+// activated once renderer recovery is known (971a7b3), which is AFTER the game builds them,
+// so the game's own objects are left exactly as the game made them and every choice is a
+// twin: variant (mip level, anisotropic index). Command lists bind the twins of the variant
+// latched at their Reset. The saved choice (and the DLSS modes' automatic levels) get twins
+// at creation; any other choice is built by a background worker from copies of the creation
+// descriptions and goes live, for all lists at once, when complete.
 // Render-small's DLSS modes (Cort, 2026-11-03): Quality -1.585 (NVIDIA's -1 + log2(1/1.5)),
-// Balanced -2, Performance -2.25 (Cort 2026-11-04; was -2.5). Only the levels that can be reached get twins
-// (g_mip_level_mask), so other games build two as before.
+// Balanced -2, Performance -2.25 (Cort 2026-11-04; was -2.5).
 constexpr int kMipCount = 6;
 constexpr float kMipLevels[kMipCount] = {0.0f, -0.5f, -1.0f, -1.5849625f, -2.0f, -2.25f};
-std::atomic<uint32_t> g_mip_level_mask{0x7u}; // levels twins are built for (bit i = kMipLevels[i])
-std::atomic<int> g_mip_game_level{0};      // level the game's own objects are built with (0 = no bias unless J2 sets it)
-std::atomic<int> g_mip_live_level{0};      // level selected in the menu
-std::atomic<bool> g_mip_switched{false};   // a level other than the game's has been selected (enables lookups)
+constexpr uint32_t kAfLevels[4] = {0, 4, 8, 16};
+std::atomic<uint32_t> g_mip_level_mask{0x7u}; // levels built at creation (bit i = kMipLevels[i])
+std::atomic<int> g_pre_af{0};              // anisotropic index built at creation (the saved one)
+// Variants packed as level | af << 4; 0 = the game's own objects.
+std::atomic<uint32_t> g_var_want{0};       // chosen (menu / saved activation)
+std::atomic<uint32_t> g_var_live{0};       // in use: what recordings latch at Reset
+std::atomic<bool> g_var_missing{false};    // a lookup met an object without the live variant: refill
+std::atomic<uint64_t> g_var_done{0}, g_var_total{0};
+// Never destroyed (the worker is detached and may still wait at process exit).
+std::mutex& g_var_m = *new std::mutex();   // the worker's wake-up and the want/live hand-over
+std::condition_variable& g_var_cv = *new std::condition_variable();
+bool g_var_started = false;
+std::atomic<uint64_t> g_var_static_changed[kMipCount * 4]; // static samplers changed, per variant
+std::atomic<bool> g_mip_switched{false};   // a variant other than the game's has been in use (enables lookups)
 std::atomic<bool> g_mip_live_enabled{false}; // twins are built only when J2 enables live switching
 std::atomic<uint64_t> g_mip_twin_rs{0}, g_mip_twin_pso{0}, g_mip_untwinned{0}, g_mip_fallbacks{0}, g_mip_twin_fail{0};
+int var_level(uint32_t v) { return static_cast<int>(v & 15u) < kMipCount ? static_cast<int>(v & 15u) : 0; }
+int var_af(uint32_t v) { return static_cast<int>(v >> 4 & 3u); }
+uint32_t var_pack(int level, int af) { return static_cast<uint32_t>(level) | static_cast<uint32_t>(af) << 4; }
+int af_index(uint32_t level) { return level >= 16 ? 3 : level >= 8 ? 2 : level ? 1 : 0; }
 int nearest_mip_level(float b)
 {
-    const uint32_t mask = g_mip_level_mask.load(std::memory_order_relaxed) | 1u;
     int best = 0;
     for (int i = 1; i < kMipCount; ++i)
-        if ((mask >> i & 1u) && std::fabs(b - kMipLevels[i]) < std::fabs(b - kMipLevels[best])) best = i;
+        if (std::fabs(b - kMipLevels[i]) < std::fabs(b - kMipLevels[best])) best = i;
     return best;
 }
 std::atomic<uint64_t> g_biased_samplers{0}, g_biased_static{0};
@@ -1436,6 +1488,29 @@ float biased(float native, float target)
     if (target == 0.0f) return native;
     if (native >= 0.0f) return clamp_lod(native + target);
     return native < target ? native : target;
+}
+// The anisotropic part of a variant (no counters): as apply_aniso, at an explicit level.
+template <typename SD>
+bool aniso_to(SD& d, uint32_t level)
+{
+    if (!level || (D3D12_DECODE_IS_ANISOTROPIC_FILTER(d.Filter) && d.MaxAnisotropy >= level)) return false;
+    d.Filter = D3D12_FILTER_ANISOTROPIC;
+    d.MaxAnisotropy = level;
+    return true;
+}
+// The game's static samplers as variant (level, af) wants them; returns how many changed.
+uint32_t variant_samplers(std::vector<D3D12_STATIC_SAMPLER_DESC>& ss, int level, int af)
+{
+    uint32_t changed = 0;
+    for (auto& x : ss) {
+        if (!sampler_wants_bias(x)) continue;
+        bool c = false;
+        const float nb = biased(x.MipLODBias, kMipLevels[level]);
+        if (nb != x.MipLODBias) { x.MipLODBias = nb; c = true; }
+        if (aniso_to(x, kAfLevels[af])) c = true;
+        if (c) ++changed;
+    }
+    return changed;
 }
 // The game's own biases on surface samplers, observed whether or not we bias.
 std::mutex g_native_m;
@@ -1869,18 +1944,333 @@ NA_ORIG(CreateGraphicsPipelineState, HRESULT, ID3D12Device*, const D3D12_GRAPHIC
 NA_ORIG(CreateComputePipelineState, HRESULT, ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
 NA_ORIG(CreatePipelineState, HRESULT, ID3D12Device2*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
 
+// Pipeline state stream: subobjects are pointer-aligned {type; payload}.
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324) // padding to pointer alignment IS the stream layout
+#endif
+template <typename T>
+struct alignas(void*) Sub {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
+    T inner;
+};
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+template <typename T>
+const T& inner_of(const uint8_t* p) { return reinterpret_cast<const Sub<T>*>(p)->inner; }
+
+size_t sub_size(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t)
+{
+    switch (t) {
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: return sizeof(Sub<ID3D12RootSignature*>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS:
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS:
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS:
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS:
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: return sizeof(Sub<D3D12_SHADER_BYTECODE>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: return sizeof(Sub<D3D12_STREAM_OUTPUT_DESC>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: return sizeof(Sub<D3D12_BLEND_DESC>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK: return sizeof(Sub<UINT>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER: return sizeof(Sub<D3D12_RASTERIZER_DESC>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL: return sizeof(Sub<D3D12_DEPTH_STENCIL_DESC>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT: return sizeof(Sub<D3D12_INPUT_LAYOUT_DESC>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE: return sizeof(Sub<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY: return sizeof(Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS: return sizeof(Sub<D3D12_RT_FORMAT_ARRAY>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT: return sizeof(Sub<DXGI_FORMAT>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC: return sizeof(Sub<DXGI_SAMPLE_DESC>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK: return sizeof(Sub<UINT>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO: return sizeof(Sub<D3D12_CACHED_PIPELINE_STATE>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS: return sizeof(Sub<D3D12_PIPELINE_STATE_FLAGS>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: return sizeof(Sub<D3D12_DEPTH_STENCIL_DESC1>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: return sizeof(Sub<D3D12_VIEW_INSTANCING_DESC>);
+    default: return 0; // newer subobject: stop here, the rest is reported unobserved
+    }
+}
+
+// ---- Live sampler variants: creation copies and twin building.
+// A creation copy owns everything its description pointed at (shader bytecode, shared
+// between pipelines that use the same shader; input layouts; stream-output declarations;
+// view-instancing locations), so the background worker can build more twins long after
+// the game's call returned. The cached-PSO blob is never copied: it belongs to the game's
+// variant. A device reference is held for as long as the entry exists.
+struct VariantRecipe {
+    enum Kind : uint8_t { RootSignature, Graphics, Compute, Stream } kind = RootSignature;
+    Microsoft::WRL::ComPtr<ID3D12Device> dev;
+    UINT node_mask = 0;               // root signatures
+    std::vector<uint8_t> blob;
+    const void* rs_key = nullptr;     // pipelines: the root signature they were built with
+    na_object_id rs_id = 0;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC g{};
+    D3D12_COMPUTE_PIPELINE_STATE_DESC c{};
+    std::vector<uint8_t> stream;
+    size_t rs_offset = SIZE_MAX;
+    std::vector<std::shared_ptr<const std::vector<uint8_t>>> code;
+    std::vector<D3D12_INPUT_ELEMENT_DESC> elems;
+    std::vector<D3D12_SO_DECLARATION_ENTRY> so;
+    std::vector<UINT> strides;
+    std::vector<D3D12_VIEW_INSTANCE_LOCATION> vil;
+    std::deque<std::string> names;    // stable addresses for semantic names
+    VariantRecipe() = default;
+    VariantRecipe(const VariantRecipe&) = delete;
+    VariantRecipe& operator=(const VariantRecipe&) = delete;
+    IUnknown* make(ID3D12RootSignature* rs) const;
+};
+std::mutex g_code_m;
+std::unordered_map<uint64_t, std::vector<std::weak_ptr<const std::vector<uint8_t>>>>& g_code =
+    *new std::unordered_map<uint64_t, std::vector<std::weak_ptr<const std::vector<uint8_t>>>>();
+D3D12_SHADER_BYTECODE own_code(VariantRecipe& r, const D3D12_SHADER_BYTECODE& b)
+{
+    if (!b.pShaderBytecode || !b.BytecodeLength) return {};
+    const auto* bytes = static_cast<const uint8_t*>(b.pShaderBytecode);
+    // DXBC/DXIL containers carry their content digest right after the magic; the size and
+    // the first bytes key the cache, and a hit is compared in full before it is shared.
+    const uint64_t k = fnv1a(bytes, b.BytecodeLength < 64 ? b.BytecodeLength : 64) ^ (static_cast<uint64_t>(b.BytecodeLength) * 0x9E3779B97F4A7C15ull);
+    std::shared_ptr<const std::vector<uint8_t>> sp;
+    {
+        std::lock_guard<std::mutex> lk(g_code_m);
+        auto& bucket = g_code[k];
+        bucket.erase(std::remove_if(bucket.begin(), bucket.end(), [](const auto& w) { return w.expired(); }), bucket.end());
+        for (const auto& w : bucket)
+            if (auto hit = w.lock())
+                if (hit->size() == b.BytecodeLength && std::memcmp(hit->data(), bytes, b.BytecodeLength) == 0) { sp = hit; break; }
+        if (!sp) {
+            sp = std::make_shared<const std::vector<uint8_t>>(bytes, bytes + b.BytecodeLength);
+            bucket.push_back(sp);
+        }
+    }
+    r.code.push_back(sp);
+    return {sp->data(), sp->size()};
+}
+D3D12_INPUT_LAYOUT_DESC own_layout(VariantRecipe& r, const D3D12_INPUT_LAYOUT_DESC& d)
+{
+    if (!d.NumElements || !d.pInputElementDescs) return {nullptr, 0};
+    r.elems.assign(d.pInputElementDescs, d.pInputElementDescs + d.NumElements);
+    for (auto& e : r.elems)
+        if (e.SemanticName) { r.names.emplace_back(e.SemanticName); e.SemanticName = r.names.back().c_str(); }
+    return {r.elems.data(), d.NumElements};
+}
+D3D12_STREAM_OUTPUT_DESC own_so(VariantRecipe& r, const D3D12_STREAM_OUTPUT_DESC& d)
+{
+    D3D12_STREAM_OUTPUT_DESC o = d;
+    if (d.NumEntries && d.pSODeclaration) {
+        r.so.assign(d.pSODeclaration, d.pSODeclaration + d.NumEntries);
+        for (auto& e : r.so)
+            if (e.SemanticName) { r.names.emplace_back(e.SemanticName); e.SemanticName = r.names.back().c_str(); }
+        o.pSODeclaration = r.so.data();
+    } else { o.pSODeclaration = nullptr; o.NumEntries = 0; }
+    if (d.NumStrides && d.pBufferStrides) { r.strides.assign(d.pBufferStrides, d.pBufferStrides + d.NumStrides); o.pBufferStrides = r.strides.data(); }
+    else { o.pBufferStrides = nullptr; o.NumStrides = 0; }
+    return o;
+}
+std::shared_ptr<const VariantRecipe> recipe_of(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d)
+{
+    auto r = std::make_shared<VariantRecipe>();
+    r->kind = VariantRecipe::Graphics;
+    r->dev = dev;
+    r->g = d;
+    r->g.VS = own_code(*r, d.VS); r->g.PS = own_code(*r, d.PS); r->g.DS = own_code(*r, d.DS);
+    r->g.HS = own_code(*r, d.HS); r->g.GS = own_code(*r, d.GS);
+    r->g.StreamOutput = own_so(*r, d.StreamOutput);
+    r->g.InputLayout = own_layout(*r, d.InputLayout);
+    r->g.CachedPSO = {};
+    r->g.pRootSignature = nullptr;
+    return r;
+}
+std::shared_ptr<const VariantRecipe> recipe_of(ID3D12Device* dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC& d)
+{
+    auto r = std::make_shared<VariantRecipe>();
+    r->kind = VariantRecipe::Compute;
+    r->dev = dev;
+    r->c = d;
+    r->c.CS = own_code(*r, d.CS);
+    r->c.CachedPSO = {};
+    r->c.pRootSignature = nullptr;
+    return r;
+}
+// A stream with a subobject this build does not know cannot be copied safely: no recipe
+// (its twins at creation still work; a background build falls back for it).
+std::shared_ptr<const VariantRecipe> recipe_of(ID3D12Device* dev, const D3D12_PIPELINE_STATE_STREAM_DESC& d)
+{
+    if (!d.pPipelineStateSubobjectStream || !d.SizeInBytes) return nullptr;
+    auto r = std::make_shared<VariantRecipe>();
+    r->kind = VariantRecipe::Stream;
+    r->dev = dev;
+    const auto* p = static_cast<const uint8_t*>(d.pPipelineStateSubobjectStream);
+    r->stream.assign(p, p + d.SizeInBytes);
+    uint8_t* q = r->stream.data();
+    size_t at = 0;
+    while (at + sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) <= d.SizeInBytes) {
+        const auto type = *reinterpret_cast<const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE*>(q + at);
+        const size_t n = sub_size(type);
+        if (!n || at + n > d.SizeInBytes) return nullptr;
+        uint8_t* s = q + at;
+        switch (type) {
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: r->rs_offset = at; break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: {
+            auto& b = reinterpret_cast<Sub<D3D12_SHADER_BYTECODE>*>(s)->inner;
+            b = own_code(*r, b);
+            break;
+        }
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: {
+            auto& so = reinterpret_cast<Sub<D3D12_STREAM_OUTPUT_DESC>*>(s)->inner;
+            so = own_so(*r, so);
+            break;
+        }
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT: {
+            auto& il = reinterpret_cast<Sub<D3D12_INPUT_LAYOUT_DESC>*>(s)->inner;
+            il = own_layout(*r, il);
+            break;
+        }
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO:
+            reinterpret_cast<Sub<D3D12_CACHED_PIPELINE_STATE>*>(s)->inner = {};
+            break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: {
+            auto& vi = reinterpret_cast<Sub<D3D12_VIEW_INSTANCING_DESC>*>(s)->inner;
+            if (vi.ViewInstanceCount && vi.pViewInstanceLocations) {
+                r->vil.assign(vi.pViewInstanceLocations, vi.pViewInstanceLocations + vi.ViewInstanceCount);
+                vi.pViewInstanceLocations = r->vil.data();
+            } else vi.pViewInstanceLocations = nullptr;
+            break;
+        }
+        default: break;
+        }
+        at += n;
+    }
+    if (r->rs_offset == SIZE_MAX) return nullptr; // no root-signature subobject: nothing to swap
+    return r;
+}
+IUnknown* VariantRecipe::make(ID3D12RootSignature* trs) const
+{
+    const HostWorkScope host;
+    ID3D12PipelineState* t = nullptr;
+    switch (kind) {
+    case Graphics: {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC d = g;
+        d.pRootSignature = trs;
+        return SUCCEEDED(o_CreateGraphicsPipelineState(dev.Get(), &d, IID_PPV_ARGS(&t))) ? t : nullptr;
+    }
+    case Compute: {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC d = c;
+        d.pRootSignature = trs;
+        return SUCCEEDED(o_CreateComputePipelineState(dev.Get(), &d, IID_PPV_ARGS(&t))) ? t : nullptr;
+    }
+    case Stream: {
+        Microsoft::WRL::ComPtr<ID3D12Device2> d2;
+        if (FAILED(dev.As(&d2))) return nullptr;
+        std::vector<uint8_t> copy(stream);
+        std::memcpy(copy.data() + rs_offset + offsetof(Sub<ID3D12RootSignature*>, inner), &trs, sizeof(trs));
+        D3D12_PIPELINE_STATE_STREAM_DESC sd{copy.size(), copy.data()};
+        return SUCCEEDED(o_CreatePipelineState(d2.Get(), &sd, IID_PPV_ARGS(&t))) ? t : nullptr;
+    }
+    default: return nullptr;
+    }
+}
+// Root-signature twins for anisotropic index `af` at the mip levels in `levels` that `base`
+// (the current set, may be null) has not prepared yet. Level 0 at index 0 is the game's own.
+// Returns null when nothing new was prepared.
+std::shared_ptr<Obj::Twins> build_rs_set(const VariantRecipe& r, int af, uint32_t levels, const Obj::Twins* base)
+{
+    ID3D12VersionedRootSignatureDeserializer* rd = nullptr;
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* u = nullptr;
+    if (FAILED(D3D12CreateVersionedRootSignatureDeserializer(r.blob.data(), r.blob.size(), IID_PPV_ARGS(&rd))) || !rd ||
+        !(u = rd->GetUnconvertedRootSignatureDesc()) ||
+        (u->Version != D3D_ROOT_SIGNATURE_VERSION_1_0 && u->Version != D3D_ROOT_SIGNATURE_VERSION_1_1)) {
+        if (rd) rd->Release();
+        return nullptr;
+    }
+    const UINT ns = u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 ? u->Desc_1_0.NumStaticSamplers : u->Desc_1_1.NumStaticSamplers;
+    const D3D12_STATIC_SAMPLER_DESC* src = u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 ? u->Desc_1_0.pStaticSamplers : u->Desc_1_1.pStaticSamplers;
+    auto set = base ? std::make_shared<Obj::Twins>(*base) : std::make_shared<Obj::Twins>();
+    bool added = false;
+    for (int level = 0; level < kMipCount; ++level) {
+        if (!(levels >> level & 1u) || set->built[level]) continue;
+        set->built[level] = true;
+        added = true;
+        std::vector<D3D12_STATIC_SAMPLER_DESC> ss(src, src + ns);
+        const uint32_t changed = (level == 0 && af == 0) ? 0u : variant_samplers(ss, level, af);
+        if (!changed) { set->same[level] = true; continue; }
+        D3D12_VERSIONED_ROOT_SIGNATURE_DESC copy = *u;
+        if (u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0) copy.Desc_1_0.pStaticSamplers = ss.data();
+        else copy.Desc_1_1.pStaticSamplers = ss.data();
+        ID3DBlob* b = nullptr;
+        ID3DBlob* err = nullptr;
+        ID3D12RootSignature* twin = nullptr;
+        if (SUCCEEDED(D3D12SerializeVersionedRootSignature(&copy, &b, &err)) && b) {
+            const HostWorkScope host;
+            if (FAILED(o_CreateRootSignature(r.dev.Get(), r.node_mask, b->GetBufferPointer(), b->GetBufferSize(), IID_PPV_ARGS(&twin)))) twin = nullptr;
+        }
+        if (b) b->Release();
+        if (err) err->Release();
+        if (!twin) { g_mip_twin_fail.fetch_add(1, std::memory_order_relaxed); continue; }
+        // D3D12 returns the same object for identical bytes: a twin that is one of the game's
+        // own root signatures is not kept (holding it could make two game root signatures own
+        // each other). That level has no twin: recordings at it fall back to the game's objects.
+        bool game_obj = false;
+        {
+            std::shared_lock<std::shared_mutex> lock(g_m);
+            game_obj = g_objs.find(canon(twin)) != g_objs.end();
+        }
+        if (game_obj) {
+            twin->Release();
+            g_mip_shared_skips.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        set->obj[level] = twin;
+        g_mip_twin_rs.fetch_add(1, std::memory_order_relaxed);
+        g_var_static_changed[level * 4 + af].fetch_add(changed, std::memory_order_relaxed);
+    }
+    rd->Release();
+    return added ? set : nullptr;
+}
+// Pipeline twins matching a root-signature set: one per level that set prepared and `base`
+// has not. Same root signature -> the game's pipeline is right; no root twin -> none.
+template <typename Make>
+std::shared_ptr<Obj::Twins> build_pso_set(Make&& make, const Obj::Twins& rs_set, const Obj::Twins* base)
+{
+    auto set = base ? std::make_shared<Obj::Twins>(*base) : std::make_shared<Obj::Twins>();
+    bool added = false;
+    for (int level = 0; level < kMipCount; ++level) {
+        if (!rs_set.built[level] || set->built[level]) continue;
+        set->built[level] = true;
+        added = true;
+        if (rs_set.same[level]) { set->same[level] = true; continue; }
+        if (!rs_set.obj[level]) continue; // the root twin failed: recordings at this level fall back
+        IUnknown* t = make(static_cast<ID3D12RootSignature*>(rs_set.obj[level]));
+        if (t) { set->obj[level] = t; g_mip_twin_pso.fetch_add(1, std::memory_order_relaxed); }
+        else g_mip_twin_fail.fetch_add(1, std::memory_order_relaxed);
+    }
+    return added ? set : nullptr;
+}
+// Levels to prepare at creation for anisotropic index `af`: the saved choice's levels
+// (g_mip_level_mask at g_pre_af) plus the chosen and the in-use variants.
+uint32_t creation_levels(int af)
+{
+    uint32_t m = 0;
+    if (af == g_pre_af.load(std::memory_order_relaxed)) m |= g_mip_level_mask.load(std::memory_order_relaxed);
+    for (const uint32_t v : {g_var_want.load(std::memory_order_relaxed), g_var_live.load(std::memory_order_relaxed)})
+        if (var_af(v) == af) m |= 1u << var_level(v);
+    if (af == 0) m &= ~1u; // the game's own
+    return m;
+}
+
 HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, const void* blob, SIZE_T size, REFIID riid, void** out)
 {
     Depth depth("CreateRootSignature");
-    // Mip bias for static samplers: re-serialise the root signature with biased
-    // samplers (versions 1.0 / 1.1; anything else is passed through unchanged). The game
-    // gets the startup level; twins for the other menu levels are built right after.
+    // Static samplers. Live variants on (the default): the game's root signature is created
+    // exactly as the game asked, and twins carry the mip bias / anisotropic filtering (see
+    // the live sampler variants above). Off ([j2] mip_bias_live=0): it is re-serialised with
+    // the chosen variant (versions 1.0 / 1.1; objects created from then on only).
     ID3DBlob* rebuilt = nullptr;
-    const int game_level = g_mip_game_level.load(std::memory_order_relaxed);
-    ID3DBlob* level_blob[kMipCount] = {};
-    bool level_same[kMipCount] = {true, true, true, true, true, true};
-    const uint32_t level_mask = g_mip_level_mask.load(std::memory_order_relaxed);
-    bool decodable = false;
+    bool decodable = false, has_surface = false;
+    const bool live = g_mip_live_enabled.load(std::memory_order_relaxed);
     if (blob && size && !t_host_work && depth.outermost()) { // also when off: native biases are recorded
         ID3D12VersionedRootSignatureDeserializer* rd = nullptr;
         const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* u = nullptr;
@@ -1890,76 +2280,49 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
             decodable = true;
             const UINT ns = u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 ? u->Desc_1_0.NumStaticSamplers : u->Desc_1_1.NumStaticSamplers;
             const D3D12_STATIC_SAMPLER_DESC* src = u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 ? u->Desc_1_0.pStaticSamplers : u->Desc_1_1.pStaticSamplers;
-            for (UINT i = 0; i < ns; ++i) if (sampler_wants_bias(src[i])) note_native(src[i].MipLODBias);
-            const bool live = g_mip_live_enabled.load(std::memory_order_relaxed);
-            for (int level = 0; level < kMipCount; ++level) {
-                if (level != game_level && (!live || !(level_mask >> level & 1u))) continue;
-                D3D12_VERSIONED_ROOT_SIGNATURE_DESC copy = *u;
+            for (UINT i = 0; i < ns; ++i) if (sampler_wants_bias(src[i])) { has_surface = true; note_native(src[i].MipLODBias); }
+            const uint32_t want = g_var_want.load(std::memory_order_relaxed);
+            if (!live && has_surface && want) {
                 std::vector<D3D12_STATIC_SAMPLER_DESC> ss(src, src + ns);
-                uint32_t changed = 0, aniso = 0;
-                for (auto& x : ss)
-                    if (sampler_wants_bias(x)) {
-                        const float nb = biased(x.MipLODBias, kMipLevels[level]);
-                        if (nb != x.MipLODBias) { x.MipLODBias = nb; ++changed; }
-                        if (apply_aniso(x)) ++aniso;
+                uint32_t biased_n = 0, aniso_n = 0;
+                for (auto& x : ss) {
+                    if (!sampler_wants_bias(x)) continue;
+                    const float nb = biased(x.MipLODBias, kMipLevels[var_level(want)]);
+                    if (nb != x.MipLODBias) { x.MipLODBias = nb; ++biased_n; }
+                    if (aniso_to(x, kAfLevels[var_af(want)])) ++aniso_n;
+                }
+                if (biased_n || aniso_n) {
+                    D3D12_VERSIONED_ROOT_SIGNATURE_DESC copy = *u;
+                    if (u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0) copy.Desc_1_0.pStaticSamplers = ss.data();
+                    else copy.Desc_1_1.pStaticSamplers = ss.data();
+                    ID3DBlob* err = nullptr;
+                    if (FAILED(D3D12SerializeVersionedRootSignature(&copy, &rebuilt, &err))) rebuilt = nullptr;
+                    if (err) err->Release();
+                    if (rebuilt) {
+                        g_biased_static.fetch_add(biased_n, std::memory_order_relaxed);
+                        g_aniso_static.fetch_add(aniso_n, std::memory_order_relaxed);
                     }
-                if (level == game_level && aniso) g_aniso_static.fetch_add(aniso, std::memory_order_relaxed);
-                changed += aniso;
-                if (!changed) continue; // the original blob is right for this level
-                if (u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0) copy.Desc_1_0.pStaticSamplers = ss.data();
-                else copy.Desc_1_1.pStaticSamplers = ss.data();
-                ID3DBlob* b = nullptr;
-                ID3DBlob* err = nullptr;
-                if (SUCCEEDED(D3D12SerializeVersionedRootSignature(&copy, &b, &err)) && b) {
-                    level_blob[level] = b;
-                    level_same[level] = false;
-                    if (level == game_level) g_biased_static.fetch_add(changed, std::memory_order_relaxed);
-                } else if (b) b->Release();
-                if (err) err->Release();
+                }
             }
-            if (level_blob[game_level]) { rebuilt = level_blob[game_level]; rebuilt->AddRef(); }
         }
         if (rd) rd->Release();
     }
     const HRESULT hr = rebuilt ? o_CreateRootSignature(dev, mask, rebuilt->GetBufferPointer(), rebuilt->GetBufferSize(), riid, out)
                                : o_CreateRootSignature(dev, mask, blob, size, riid, out);
     if (rebuilt) rebuilt->Release();
-    std::shared_ptr<Obj::Twins> rs_twins;
-    if (decodable && SUCCEEDED(hr) && out && *out) {
-        // Twins for the other levels: same as the game's blob -> nothing to swap.
-        for (int level = 0; level < kMipCount; ++level) {
-            if (level == game_level || !(level_mask >> level & 1u)) continue;
-            const bool same_as_game = level_same[level] && level_same[game_level];
-            if (same_as_game) continue; // marked below if any other level needs twins
-            if (!rs_twins) rs_twins = std::make_shared<Obj::Twins>();
-            const void* bytes = level_blob[level] ? level_blob[level]->GetBufferPointer() : blob;
-            const SIZE_T n = level_blob[level] ? level_blob[level]->GetBufferSize() : size;
-            ID3D12RootSignature* twin = nullptr;
-            if (SUCCEEDED(o_CreateRootSignature(dev, mask, bytes, n, IID_PPV_ARGS(&twin))) && twin) {
-                // D3D12 returns the same object for identical bytes: a twin that is one of
-                // the game's own root signatures is not kept (holding it could make two game
-                // root signatures own each other). That level has no twin: recordings at it
-                // fall back to the game's objects.
-                const void* tkey = canon(twin);
-                bool game_obj = false;
-                {
-                    std::shared_lock<std::shared_mutex> lock(g_m);
-                    game_obj = g_objs.find(tkey) != g_objs.end();
-                }
-                if (game_obj) {
-                    twin->Release();
-                    g_mip_shared_skips.fetch_add(1, std::memory_order_relaxed);
-                    continue;
-                }
-                rs_twins->obj[level] = twin;
-                g_mip_twin_rs.fetch_add(1, std::memory_order_relaxed);
-            } else g_mip_twin_fail.fetch_add(1, std::memory_order_relaxed);
-        }
-        if (rs_twins)
-            for (int level = 0; level < kMipCount; ++level)
-                rs_twins->same[level] = level == game_level || (level_same[level] && level_same[game_level]);
+    std::shared_ptr<const VariantRecipe> recipe;
+    std::shared_ptr<Obj::Twins> sets[4];
+    if (live && decodable && has_surface && SUCCEEDED(hr) && out && *out) {
+        ReleaseParkedTwins();
+        auto r = std::make_shared<VariantRecipe>();
+        r->kind = VariantRecipe::RootSignature;
+        r->dev = dev;
+        r->node_mask = mask;
+        r->blob.assign(static_cast<const uint8_t*>(blob), static_cast<const uint8_t*>(blob) + size);
+        for (int af = 0; af < 4; ++af)
+            if (const uint32_t lv = creation_levels(af)) sets[af] = build_rs_set(*r, af, lv, nullptr);
+        recipe = std::move(r);
     }
-    for (auto* b : level_blob) if (b) b->Release();
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj) return hr;
     constexpr uint32_t kMaxParams = 64, kMaxRanges = 256;
@@ -2058,7 +2421,9 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
             it->second.created.assign(raw, raw + ev.e.hdr.size_bytes);
             it->second.root_params.assign(params, params + ev.e.param_count);
             it->second.root_ranges.assign(ranges, ranges + nranges);
-            rs_twins.swap(it->second.twins); // any previous set is released after g_m (end of scope)
+            for (int af = 0; af < 4; ++af) sets[af].swap(it->second.af_sets[af]); // previous sets released after g_m
+            recipe.swap(it->second.recipe);
+            it->second.variant_kind = it->second.recipe ? 1 : 0;
             // Structural hash of the layout (parameter and range records), not the object:
             // identical layouts created in another session hash the same.
             uint64_t layout_hash = 1469598103934665603ull;
@@ -2074,45 +2439,53 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
     return hr;
 }
 
-// Live mip bias: the root signature's twins (null when it needs none).
-std::shared_ptr<Obj::Twins> rs_twins_of(const void* rs)
-{
-    if (!rs) return nullptr;
-    std::shared_lock<std::shared_mutex> lock(g_m);
-    const auto it = g_objs.find(canon(rs));
-    return it == g_objs.end() ? nullptr : it->second.twins;
-}
-// Builds pipeline twins with `make(level, twin_rs)` for every level whose root-signature
-// twin differs; levels whose root signature is unchanged need no twin (same[]).
-// A pipeline without a known root signature gets an empty twin set (never swapped:
-// a list using it falls back to the game's objects).
-template <typename Make>
-void make_pso_twins(IUnknown* pso, const void* rs, Make make)
+// Live sampler variants: a pipeline's twins follow its root signature's. A pipeline on a
+// sampler-dependent root signature keeps a creation copy (`recipe`, null when its stream
+// cannot be copied) and gets twins for every set its root signature has now; later sets
+// are built by the background worker. A pipeline with an embedded root signature cannot
+// be twinned: recordings that bind it fall back to the game's objects.
+template <typename Make, typename RecipeFn>
+void make_pso_twins(IUnknown* pso, const void* rs, Make make, RecipeFn&& recipe_fn)
 {
     if (!pso || !g_mip_live_enabled.load(std::memory_order_relaxed)) return;
     ReleaseParkedTwins();
-    const auto rt = rs_twins_of(rs);
-    std::shared_ptr<Obj::Twins> pt;
+    uint8_t kind = 0;
+    na_object_id rs_id = 0;
+    std::shared_ptr<Obj::Twins> rs_sets[4], sets[4];
     if (!rs) {
-        pt = std::make_shared<Obj::Twins>(); // embedded root signature: not swappable
-        pt->same[g_mip_game_level.load()] = true;
+        kind = 2;
         g_mip_untwinned.fetch_add(1, std::memory_order_relaxed);
-    } else if (rt) {
-        pt = std::make_shared<Obj::Twins>();
-        for (int level = 0; level < kMipCount; ++level) {
-            if (rt->same[level]) { pt->same[level] = true; continue; }
-            if (!rt->obj[level]) continue; // twin root signature failed: no swap for this level
-            IUnknown* twin = make(level, static_cast<ID3D12RootSignature*>(rt->obj[level]));
-            if (twin) { pt->obj[level] = twin; g_mip_twin_pso.fetch_add(1, std::memory_order_relaxed); }
-            else g_mip_twin_fail.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        std::shared_lock<std::shared_mutex> lock(g_m);
+        const auto it = g_objs.find(canon(rs));
+        if (it != g_objs.end() && it->second.variant_kind == 1) {
+            kind = 1;
+            rs_id = it->second.id;
+            for (int af = 0; af < 4; ++af) rs_sets[af] = it->second.af_sets[af];
         }
-    } else return; // root signature needs no twins: the pipeline needs none either
+    }
+    if (!kind) return; // root signature needs no twins: the pipeline needs none either
+    std::shared_ptr<const VariantRecipe> recipe;
+    if (kind == 1) {
+        recipe = recipe_fn();
+        for (int af = 0; af < 4; ++af)
+            if (rs_sets[af]) sets[af] = build_pso_set([&](ID3D12RootSignature* trs) { return make(0, trs); }, *rs_sets[af], nullptr);
+        if (recipe) {
+            auto r = std::const_pointer_cast<VariantRecipe>(recipe);
+            r->rs_key = canon(rs);
+            r->rs_id = rs_id;
+        }
+    }
     {
         std::unique_lock<std::shared_mutex> lock(g_m);
         const auto it = g_objs.find(canon(pso));
-        if (it != g_objs.end()) pt.swap(it->second.twins);
+        if (it != g_objs.end()) {
+            it->second.variant_kind = kind;
+            for (int af = 0; af < 4; ++af) sets[af].swap(it->second.af_sets[af]);
+            recipe.swap(it->second.recipe);
+        }
     }
-    pt.reset(); // a replaced set (if any) is released outside g_m
+    // replaced sets (if any) are released outside g_m
 }
 
 HRESULT STDMETHODCALLTYPE D_CreateGraphicsPipelineState(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, REFIID riid, void** out)
@@ -2146,7 +2519,7 @@ HRESULT STDMETHODCALLTYPE D_CreateGraphicsPipelineState(ID3D12Device* dev, const
         c.CachedPSO = {}; // the cache belongs to the game's variant
         ID3D12PipelineState* t = nullptr;
         return SUCCEEDED(o_CreateGraphicsPipelineState(dev, &c, IID_PPV_ARGS(&t))) ? t : nullptr;
-    });
+    }, [&] { return recipe_of(dev, *d); });
     return hr;
 }
 
@@ -2173,57 +2546,10 @@ HRESULT STDMETHODCALLTYPE D_CreateComputePipelineState(ID3D12Device* dev, const 
         c.CachedPSO = {};
         ID3D12PipelineState* t = nullptr;
         return SUCCEEDED(o_CreateComputePipelineState(dev, &c, IID_PPV_ARGS(&t))) ? t : nullptr;
-    });
+    }, [&] { return recipe_of(dev, *d); });
     return hr;
 }
 
-// Pipeline state stream: subobjects are pointer-aligned {type; payload}.
-#if defined(_MSC_VER)
-#pragma warning(push)
-#pragma warning(disable : 4324) // padding to pointer alignment IS the stream layout
-#endif
-template <typename T>
-struct alignas(void*) Sub {
-    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
-    T inner;
-};
-#if defined(_MSC_VER)
-#pragma warning(pop)
-#endif
-template <typename T>
-const T& inner_of(const uint8_t* p) { return reinterpret_cast<const Sub<T>*>(p)->inner; }
-
-size_t sub_size(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t)
-{
-    switch (t) {
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: return sizeof(Sub<ID3D12RootSignature*>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS:
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS:
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS:
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS:
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: return sizeof(Sub<D3D12_SHADER_BYTECODE>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: return sizeof(Sub<D3D12_STREAM_OUTPUT_DESC>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: return sizeof(Sub<D3D12_BLEND_DESC>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK: return sizeof(Sub<UINT>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER: return sizeof(Sub<D3D12_RASTERIZER_DESC>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL: return sizeof(Sub<D3D12_DEPTH_STENCIL_DESC>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT: return sizeof(Sub<D3D12_INPUT_LAYOUT_DESC>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE: return sizeof(Sub<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY: return sizeof(Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS: return sizeof(Sub<D3D12_RT_FORMAT_ARRAY>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT: return sizeof(Sub<DXGI_FORMAT>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC: return sizeof(Sub<DXGI_SAMPLE_DESC>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK: return sizeof(Sub<UINT>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO: return sizeof(Sub<D3D12_CACHED_PIPELINE_STATE>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS: return sizeof(Sub<D3D12_PIPELINE_STATE_FLAGS>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: return sizeof(Sub<D3D12_DEPTH_STENCIL_DESC1>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: return sizeof(Sub<D3D12_VIEW_INSTANCING_DESC>);
-    default: return 0; // newer subobject: stop here, the rest is reported unobserved
-    }
-}
 
 HRESULT STDMETHODCALLTYPE D_CreatePipelineState(ID3D12Device2* dev, const D3D12_PIPELINE_STATE_STREAM_DESC* d, REFIID riid, void** out)
 {
@@ -2301,8 +2627,9 @@ HRESULT STDMETHODCALLTYPE D_CreatePipelineState(ID3D12Device2* dev, const D3D12_
             D3D12_PIPELINE_STATE_STREAM_DESC c{d->SizeInBytes, copy.data()};
             ID3D12PipelineState* t = nullptr;
             return SUCCEEDED(o_CreatePipelineState(dev, &c, IID_PPV_ARGS(&t))) ? t : nullptr;
-        });
-    else make_pso_twins(obj, nullptr, [](int, ID3D12RootSignature*) -> IUnknown* { return nullptr; });
+        }, [&] { return recipe_of(dev, *d); });
+    else make_pso_twins(obj, nullptr, [](int, ID3D12RootSignature*) -> IUnknown* { return nullptr; },
+                        [] { return std::shared_ptr<const VariantRecipe>(); });
     return hr;
 }
 
@@ -3602,7 +3929,7 @@ void before_shader_use(GL* l, bool compute, bool indirect=false)
 // re-binds the game's root signatures and arguments first, so pipeline and root
 // signature always match.
 template <typename T>
-T* mip_swap_locked(int level, T* obj, bool pso, bool* untwinned)
+T* mip_swap_locked(int level, int af, T* obj, bool pso, bool* untwinned)
 {
     if (level < 0 || !obj) return obj;
     const auto it = g_objs.find(canon(obj));
@@ -3612,10 +3939,19 @@ T* mip_swap_locked(int level, T* obj, bool pso, bool* untwinned)
         if (pso && !t_host_work) *untwinned = true;
         return obj;
     }
-    if (!it->second.twins) return obj; // its root signature needs no twins
-    const auto& t = *it->second.twins;
-    if (t.same[level]) return obj;
-    if (t.obj[level]) return static_cast<T*>(t.obj[level]);
+    const Obj& o = it->second;
+    if (o.variant_kind == 0) return obj; // sampler-independent: the game's object is right
+    if (o.variant_kind == 2) { *untwinned = true; return obj; }
+    const auto& t = o.af_sets[af & 3];
+    if (!t || !t->built[level]) {
+        // Created while the variant was being prepared: the worker fills it in (it also
+        // re-checks every second, so a wake-up lost here only delays it).
+        *untwinned = true;
+        if (o.recipe && !g_var_missing.exchange(true, std::memory_order_relaxed)) g_var_cv.notify_one();
+        return obj;
+    }
+    if (t->same[level]) return obj;
+    if (t->obj[level]) return static_cast<T*>(t->obj[level]);
     *untwinned = true;
     return obj;
 }
@@ -3631,7 +3967,7 @@ void mip_on_pso(GL* l, ID3D12PipelineState*& p)
         std::lock_guard<std::mutex> bl(ls->bind_m);
         if (ls->mip_level < 0) return;
         bool untwinned = false;
-        ID3D12PipelineState* t = mip_swap_locked(ls->mip_level, p, true, &untwinned);
+        ID3D12PipelineState* t = mip_swap_locked(ls->mip_level, ls->af_latched, p, true, &untwinned);
         if (untwinned) { ls->mip_level = -1; fallback = true; }
         else p = t;
     }
@@ -3653,7 +3989,7 @@ void mip_on_rs(GL* l, ID3D12RootSignature*& r)
         std::lock_guard<std::mutex> bl(ls->bind_m);
         if (ls->mip_level < 0) return;
         bool untwinned = false;
-        ID3D12RootSignature* t = mip_swap_locked(ls->mip_level, r, false, &untwinned);
+        ID3D12RootSignature* t = mip_swap_locked(ls->mip_level, ls->af_latched, r, false, &untwinned);
         if (untwinned) { ls->mip_level = -1; fallback = true; } // r (the game's) is bound as is
         else r = t;
     }
@@ -3668,16 +4004,17 @@ void mip_on_rs(GL* l, ID3D12RootSignature*& r)
 void mip_on_reset(GL* l, ID3D12PipelineState*& p)
 {
     if (!g_mip_switched.load(std::memory_order_relaxed)) return;
-    const int live = g_mip_live_level.load(std::memory_order_relaxed), game = g_mip_game_level.load(std::memory_order_relaxed);
+    const uint32_t v = g_var_live.load(std::memory_order_acquire);
     std::shared_lock<std::shared_mutex> lock(g_m);
     na_object_id lid = 0;
     ListState* ls = list_state_locked(l, &lid);
     if (!ls) return;
     std::lock_guard<std::mutex> bl(ls->bind_m);
-    ls->mip_level = static_cast<int8_t>(live != game ? live : -1);
+    ls->mip_level = static_cast<int8_t>(v ? var_level(v) : -1); // 0 = the game's own objects
+    ls->af_latched = static_cast<int8_t>(var_af(v));
     if (ls->mip_level >= 0 && p) {
         bool untwinned = false;
-        ID3D12PipelineState* t = mip_swap_locked(ls->mip_level, p, true, &untwinned);
+        ID3D12PipelineState* t = mip_swap_locked(ls->mip_level, ls->af_latched, p, true, &untwinned);
         if (untwinned) ls->mip_level = -1; // nothing bound yet: simply record with the game's objects
         else p = t;
     }
@@ -6134,39 +6471,153 @@ bool KnownStateInCurrentSubmission(na_object_id id, uint32_t* state)
     *state = v;
     return true;
 }
+namespace {
+// ---- Live sampler variants: the background worker. A chosen variant that some objects
+// lack is built here (root signatures first, then the pipelines on them), outside g_m,
+// and published per object; recordings switch to it (g_var_live, latched at Reset) only
+// once every object that can have it has it, so a frame never mixes old and new.
+struct FillItem {
+    const void* key = nullptr;
+    na_object_id id = 0;
+    std::shared_ptr<const VariantRecipe> recipe;
+    std::shared_ptr<Obj::Twins> base;
+};
+// One pass for variant (level, af). Returns how many objects lacked it, or SIZE_MAX when
+// the choice changed meanwhile (the caller starts over with the new one).
+size_t fill_pass(int level, int af, uint32_t v)
+{
+    std::vector<FillItem> rs_items, pso_items;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_m);
+        for (const auto& kv : g_objs) {
+            const Obj& o = kv.second;
+            if (o.variant_kind != 1 || !o.recipe) continue;
+            const auto& set = o.af_sets[af];
+            if (set && set->built[level]) continue;
+            auto& to = o.recipe->kind == VariantRecipe::RootSignature ? rs_items : pso_items;
+            to.push_back({kv.first, o.id, o.recipe, set});
+        }
+    }
+    const size_t found = rs_items.size() + pso_items.size();
+    g_var_total.store(found, std::memory_order_relaxed);
+    g_var_done.store(0, std::memory_order_relaxed);
+    const auto publish = [&](const FillItem& it, std::shared_ptr<Obj::Twins> built) {
+        if (built) {
+            std::unique_lock<std::shared_mutex> lock(g_m);
+            const auto f = g_objs.find(it.key);
+            if (f != g_objs.end() && f->second.id == it.id && f->second.af_sets[af] == it.base) f->second.af_sets[af].swap(built);
+        }
+        // `built` now holds the replaced set (or an unused new one): released here, outside g_m
+        built.reset();
+        g_var_done.fetch_add(1, std::memory_order_relaxed);
+    };
+    for (const auto& it : rs_items) {
+        if (g_var_want.load(std::memory_order_relaxed) != v) return SIZE_MAX;
+        publish(it, build_rs_set(*it.recipe, af, 1u << level, it.base.get()));
+    }
+    for (const auto& it : pso_items) {
+        if (g_var_want.load(std::memory_order_relaxed) != v) return SIZE_MAX;
+        std::shared_ptr<Obj::Twins> rs_set;
+        {
+            std::shared_lock<std::shared_mutex> lock(g_m);
+            const auto f = g_objs.find(it.recipe->rs_key);
+            if (f != g_objs.end() && f->second.id == it.recipe->rs_id) rs_set = f->second.af_sets[af];
+        }
+        if (!rs_set || !rs_set->built[level]) { g_var_done.fetch_add(1, std::memory_order_relaxed); continue; } // next pass
+        const VariantRecipe& r = *it.recipe;
+        publish(it, build_pso_set([&r](ID3D12RootSignature* trs) { return r.make(trs); }, *rs_set, it.base.get()));
+    }
+    return found;
+}
+void variant_worker()
+{
+    for (;;) {
+        uint32_t v = 0;
+        bool refill = false;
+        {
+            std::unique_lock<std::mutex> lk(g_var_m);
+            while (!g_var_cv.wait_for(lk, std::chrono::seconds(1), [] {
+                return g_var_want.load(std::memory_order_relaxed) != g_var_live.load(std::memory_order_relaxed) ||
+                       g_var_missing.load(std::memory_order_relaxed);
+            })) {
+                if (g_process_exiting.load(std::memory_order_acquire)) return;
+            }
+            if (g_process_exiting.load(std::memory_order_acquire)) return;
+            v = g_var_want.load(std::memory_order_relaxed);
+            refill = v == g_var_live.load(std::memory_order_relaxed);
+            g_var_missing.store(false, std::memory_order_relaxed);
+        }
+        bool aborted = false;
+        if (v && g_mip_live_enabled.load(std::memory_order_relaxed)) {
+            for (int pass = 0; pass < 6; ++pass) { // objects created during a pass are caught by the next
+                const size_t found = fill_pass(var_level(v), var_af(v), v);
+                if (found == SIZE_MAX) { aborted = true; break; }
+                if (!found) break;
+            }
+        }
+        if (aborted) continue;
+        if (refill) { std::this_thread::sleep_for(std::chrono::seconds(1)); continue; } // never spin on stragglers
+        {
+            std::lock_guard<std::mutex> lk(g_var_m);
+            if (g_var_want.load(std::memory_order_relaxed) == v) {
+                if (v && g_mip_live_enabled.load(std::memory_order_relaxed)) g_mip_switched.store(true, std::memory_order_release);
+                g_var_live.store(v, std::memory_order_release);
+            }
+        }
+        g_var_cv.notify_all();
+    }
+}
+template <typename F>
+void request_variant(F&& change)
+{
+    {
+        std::lock_guard<std::mutex> lk(g_var_m);
+        const uint32_t w = g_var_want.load(std::memory_order_relaxed);
+        g_var_want.store(change(w), std::memory_order_relaxed);
+        if (!g_var_started) {
+            g_var_started = true;
+            std::thread(variant_worker).detach();
+        }
+    }
+    g_var_cv.notify_all();
+}
+} // namespace
 void SetSamplerMipBias(float bias)
 {
-    // Startup value: the game's own objects are built at the nearest menu level.
     const int level = nearest_mip_level(bias);
-    g_mip_bias.store(kMipLevels[level], std::memory_order_relaxed);
-    g_mip_game_level.store(level, std::memory_order_relaxed);
-    g_mip_live_level.store(level, std::memory_order_relaxed);
+    g_mip_bias.store(kMipLevels[level], std::memory_order_relaxed); // sampler descriptors created from now on
+    request_variant([level](uint32_t w) { return var_pack(level, var_af(w)); });
 }
-float SamplerMipBias() { return kMipLevels[g_mip_live_level.load(std::memory_order_relaxed)]; }
-void SetSamplerMipBiasLive(float bias)
-{
-    const int level = nearest_mip_level(bias);
-    g_mip_live_level.store(level, std::memory_order_relaxed);
-    if (level != g_mip_game_level.load(std::memory_order_relaxed)) g_mip_switched.store(true, std::memory_order_release);
-}
+float SamplerMipBias() { return kMipLevels[var_level(g_var_want.load(std::memory_order_relaxed))]; }
+void SetSamplerMipBiasLive(float bias) { SetSamplerMipBias(bias); }
 void SetSamplerMipBiasLiveEnabled(bool on) { g_mip_live_enabled.store(on, std::memory_order_relaxed); }
 void SetSamplerMipLevelsWanted(const float* biases, int n)
 {
-    uint32_t mask = 1u; // level 0 (the game's own) is always available
-    for (int i = 0; i < n; ++i) {
-        int best = 0;
-        for (int l = 1; l < kMipCount; ++l)
-            if (std::fabs(biases[i] - kMipLevels[l]) < std::fabs(biases[i] - kMipLevels[best])) best = l;
-        mask |= 1u << best;
-    }
+    uint32_t mask = 0;
+    for (int i = 0; i < n; ++i) mask |= 1u << nearest_mip_level(biases[i]);
     g_mip_level_mask.store(mask, std::memory_order_relaxed);
+}
+bool WaitSamplerVariant(uint32_t timeout_ms)
+{
+    std::unique_lock<std::mutex> lk(g_var_m);
+    return g_var_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), [] {
+        return g_var_want.load(std::memory_order_relaxed) == g_var_live.load(std::memory_order_relaxed);
+    });
 }
 MipLiveStats GetMipLiveStats()
 {
     MipLiveStats m;
+    const uint32_t want = g_var_want.load(std::memory_order_relaxed), live = g_var_live.load(std::memory_order_relaxed);
     m.enabled = g_mip_live_enabled.load(std::memory_order_relaxed);
-    m.game_bias = kMipLevels[g_mip_game_level.load(std::memory_order_relaxed)];
-    m.live_bias = kMipLevels[g_mip_live_level.load(std::memory_order_relaxed)];
+    m.game_bias = 0.0f;
+    m.live_bias = kMipLevels[var_level(live)];
+    m.want_bias = kMipLevels[var_level(want)];
+    m.want_aniso = kAfLevels[var_af(want)];
+    m.live_aniso = kAfLevels[var_af(live)];
+    m.preparing = want != live;
+    m.prepare_done = g_var_done.load(std::memory_order_relaxed);
+    m.prepare_total = g_var_total.load(std::memory_order_relaxed);
+    m.live_static_changed = g_var_static_changed[var_level(live) * 4 + var_af(live)].load(std::memory_order_relaxed);
     m.twin_root_signatures = g_mip_twin_rs.load(std::memory_order_relaxed);
     m.twin_pipelines = g_mip_twin_pso.load(std::memory_order_relaxed);
     m.untwinned_pipelines = g_mip_untwinned.load(std::memory_order_relaxed);
@@ -6184,18 +6635,28 @@ void NativeMipBiases(NativeBiasStats* s)
 void MipBiasCounts(uint64_t* samplers, uint64_t* static_samplers)
 {
     if (samplers) *samplers = g_biased_samplers.load(std::memory_order_relaxed);
-    if (static_samplers) *static_samplers = g_biased_static.load(std::memory_order_relaxed);
+    // Static samplers: changed in the game's objects (live switching off), or in the twins
+    // of the variant in use (live switching on: the game's own objects are never changed).
+    const uint32_t live = g_var_live.load(std::memory_order_relaxed);
+    if (static_samplers)
+        *static_samplers = g_biased_static.load(std::memory_order_relaxed) +
+                           (var_level(live) ? g_var_static_changed[var_level(live) * 4 + var_af(live)].load(std::memory_order_relaxed) : 0);
 }
 void SetSamplerAnisotropy(uint32_t level)
 {
-    g_aniso_level.store(level >= 16 ? 16u : level >= 8 ? 8u : level >= 4 ? 4u : level ? 4u : 0u, std::memory_order_relaxed);
+    const int af = af_index(level);
+    g_aniso_level.store(kAfLevels[af], std::memory_order_relaxed); // sampler descriptors created from now on
+    request_variant([af](uint32_t w) { return var_pack(var_level(w), af); });
 }
+void SetSamplerAnisotropyPrebuild(uint32_t level) { g_pre_af.store(af_index(level), std::memory_order_relaxed); }
 AnisoStats GetAnisoStats()
 {
     AnisoStats a;
-    a.level = g_aniso_level.load(std::memory_order_relaxed);
+    const uint32_t live = g_var_live.load(std::memory_order_relaxed);
+    a.level = g_mip_live_enabled.load(std::memory_order_relaxed) ? kAfLevels[var_af(live)] : g_aniso_level.load(std::memory_order_relaxed);
     a.samplers = g_aniso_samplers.load(std::memory_order_relaxed);
-    a.static_samplers = g_aniso_static.load(std::memory_order_relaxed);
+    a.static_samplers = g_aniso_static.load(std::memory_order_relaxed) +
+                        (var_af(live) ? g_var_static_changed[var_level(live) * 4 + var_af(live)].load(std::memory_order_relaxed) : 0);
     a.already = g_aniso_already.load(std::memory_order_relaxed);
     return a;
 }

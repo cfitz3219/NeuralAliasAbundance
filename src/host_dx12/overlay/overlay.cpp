@@ -940,7 +940,7 @@ void write_status_line()
                 (unsigned long long)vps.draws, (unsigned long long)vps.sets, (unsigned long long)vps.restores, (unsigned long long)vps.unknown);
             if (vn > 0) WriteFile(f, vl, DWORD((std::min)(vn, int(sizeof vl - 1))), &written, nullptr);
         }
-        { // 16x anisotropic filtering ([j2] anisotropic)
+        { // anisotropic filtering ([j2] anisotropic): level = in use; static = changed in the twins in use
             const auto as = na::observe::GetAnisoStats();
             char al[200];
             const int an = snprintf(al, sizeof al, "anisotropic level=%u setting=%u samplers=%llu static=%llu already=%llu\r\n",
@@ -1208,9 +1208,13 @@ void write_status_line()
         if (nn > 0) WriteFile(f, nl, static_cast<DWORD>((std::min)(nn, static_cast<int>(sizeof(nl)-1))), &written, nullptr);
         // Live texture detail: were twins built, and do recordings use them or fall back?
         const auto ml = na::observe::GetMipLiveStats();
-        char ml_line[300];
-        const int mn = snprintf(ml_line, sizeof ml_line, "mip_live enabled=%u now=%.2f game=%.2f twin_rs=%llu twin_pso=%llu untwinned_pso=%llu fallbacks=%llu twin_failures=%llu\r\n",
-                                ml.enabled ? 1u : 0u, na::observe::SamplerMipBias(), ml.game_bias, (unsigned long long)ml.twin_root_signatures,
+        char ml_line[420];
+        // chosen = menu/saved; in_use = what recordings bind (differs while preparing);
+        // changed_static = the game's static samplers changed in the twins in use (the proof).
+        const int mn = snprintf(ml_line, sizeof ml_line, "mip_live enabled=%u chosen=%.2f/af%u in_use=%.2f/af%u preparing=%u (%llu/%llu) changed_static=%llu game=%.2f twin_rs=%llu twin_pso=%llu untwinned_pso=%llu fallbacks=%llu twin_failures=%llu\r\n",
+                                ml.enabled ? 1u : 0u, ml.want_bias, ml.want_aniso, ml.live_bias, ml.live_aniso, ml.preparing ? 1u : 0u,
+                                (unsigned long long)ml.prepare_done, (unsigned long long)ml.prepare_total, (unsigned long long)ml.live_static_changed,
+                                ml.game_bias, (unsigned long long)ml.twin_root_signatures,
                                 (unsigned long long)ml.twin_pipelines, (unsigned long long)ml.untwinned_pipelines, (unsigned long long)ml.fallbacks,
                                 (unsigned long long)ml.twin_failures);
         if (mn > 0) WriteFile(f, ml_line, static_cast<DWORD>((std::min)(mn, static_cast<int>(sizeof(ml_line)-1))), &written, nullptr);

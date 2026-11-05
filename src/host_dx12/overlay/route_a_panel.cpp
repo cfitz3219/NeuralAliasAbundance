@@ -1156,8 +1156,8 @@ void DrawLiveDlaaEnhancements()
     }
     {
         // Texture detail (negative mip bias, NVIDIA DLSS guide 3.5: -1 at native).
-        // Games build their samplers at load, so a change applies at the next start;
-        // the setting lives in this game's own NeuralAliasHost.ini (per game).
+        // Live (no restarts): twins of the game's samplers; a choice not prepared at load is
+        // built in the background and switches over when ready. Stored per game.
         static const char* kDetail[] = {"Off (game's own)", "Light (-0.5)", "Standard (-1, NVIDIA)"};
         static const int kDetailX100[] = {0, -50, -100};
         na::settings::Settings& ss = na::settings::Get();
@@ -1165,7 +1165,7 @@ void DrawLiveDlaaEnhancements()
         int idx = 2;
         for (int i = 0; i < 3; ++i) if (kDetailX100[i] == cur) idx = i;
         const auto ml = na::observe::GetMipLiveStats();
-        const bool live = ml.enabled && (ml.twin_pipelines > 0 || ml.twin_root_signatures > 0);
+        const bool live = ml.enabled;
         BeginRow("Texture detail", "Samples surface textures sharper so DLAA can rebuild their full detail (NVIDIA's DLSS guide recommends -1 at native resolution). Very fine patterns such as fabric weaves can shimmer at -1; Light is gentler. Screen effects are never changed. Switches live (from the next frame); remembered for this game.", S(220));
         ImGui::SetNextItemWidth(S(220));
         // Render-small DLSS modes set it automatically (NVIDIA: -1 + log2(render/output)):
@@ -1193,40 +1193,47 @@ void DrawLiveDlaaEnhancements()
         na::observe::NativeMipBiases(&nb);
         char tb[400];
         const float active = na::observe::SamplerMipBias();
-        std::snprintf(tb, sizeof tb, "Now: %.1f (game loaded at %.1f; %llu root signatures and %llu pipelines prepared for switching, %llu fixed, %llu fall-backs). Game's own bias on its surface textures: %llu below 0, %llu at 0, %llu above.",
-                      active, ml.game_bias, static_cast<unsigned long long>(ml.twin_root_signatures), static_cast<unsigned long long>(ml.twin_pipelines),
-                      static_cast<unsigned long long>(ml.untwinned_pipelines), static_cast<unsigned long long>(ml.fallbacks),
-                      static_cast<unsigned long long>(nb.negative), static_cast<unsigned long long>(nb.zero), static_cast<unsigned long long>(nb.positive));
+        (void)active;
+        if (ml.preparing)
+            std::snprintf(tb, sizeof tb, "Preparing %.2f with %ux filtering in the background (%llu of %llu objects); the current picture stays until it is complete.",
+                          ml.want_bias, ml.want_aniso, static_cast<unsigned long long>(ml.prepare_done), static_cast<unsigned long long>(ml.prepare_total));
+        else
+            std::snprintf(tb, sizeof tb, "In use: %.2f (%llu of the game's built-in samplers changed; %llu fall-backs). Game's own bias on its surface textures: %llu below 0, %llu at 0, %llu above.",
+                          ml.live_bias, static_cast<unsigned long long>(live ? ml.live_static_changed : nst), static_cast<unsigned long long>(ml.fallbacks),
+                          static_cast<unsigned long long>(nb.negative), static_cast<unsigned long long>(nb.zero), static_cast<unsigned long long>(nb.positive));
         StatusLine(0, tb);
-        (void)ns; (void)nst;
-        if (!live && static_cast<int>(ml.game_bias * -100.0f + 0.5f) != -cur)
-            StatusLine(2, "Live switching is not available in this session (no prepared pipelines): restart the game to see this change.");
+        (void)ns;
+        if (!live) StatusLine(2, "Live switching is off for this game ([j2] mip_bias_live=0): the change applies to what the game loads next.");
     }
     {
-        // 16x anisotropic filtering on the game's surface textures (before DLSS, where the game
-        // samples them). Samplers are built when the game loads: a change applies at the next start.
+        // Anisotropic filtering on the game's surface textures (before DLSS, where the game
+        // samples them). Live, through the same twins as Texture detail (no restarts).
         static const char* kAniso[] = {"Off (game's own)", "4x", "8x", "16x"};
         static const uint32_t kAnisoLevel[] = {0, 4, 8, 16};
         na::settings::Settings& ss = na::settings::Get();
         const uint32_t cur = ss.aniso16.load();
         int idx = 0;
         for (int i = 0; i < 4; ++i) if (kAnisoLevel[i] == cur) idx = i;
-        BeginRow("Anisotropic filtering", "Makes the game's surface textures anisotropic (4x, 8x or 16x), so ground, walls and roofs seen at an angle stay sharp instead of blurring with distance. Higher is sharper at steep angles. It works together with Texture detail and happens before DLSS, so DLSS gets the sharper picture. Shadows and screen effects are never changed, and a texture the game already filters higher is left alone. Applies at the next game start; remembered for this game.", S(220));
+        BeginRow("Anisotropic filtering", "Makes the game's surface textures anisotropic (4x, 8x or 16x), so ground, walls and roofs seen at an angle stay sharp instead of blurring with distance. Higher is sharper at steep angles. It works together with Texture detail and happens before DLSS, so DLSS gets the sharper picture. Shadows and screen effects are never changed, and a texture the game already filters higher is left alone. Switches live (a level not prepared at load takes a few seconds in the background); remembered for this game.", S(220));
         ImGui::SetNextItemWidth(S(220));
         if (ImGui::Combo("##aniso", &idx, kAniso, 4)) {
             ss.aniso16.store(kAnisoLevel[idx]);
+            na::observe::SetSamplerAnisotropy(kAnisoLevel[idx]);
             na::settings::Save();
         }
         EndRow();
         const auto as = na::observe::GetAnisoStats();
         char tb[240];
-        if (as.level)
-            std::snprintf(tb, sizeof tb, "This session: %ux (%llu samplers and %llu built-in samplers raised, %llu already at or above it).", as.level,
-                          static_cast<unsigned long long>(as.samplers), static_cast<unsigned long long>(as.static_samplers), static_cast<unsigned long long>(as.already));
+        const auto ml2 = na::observe::GetMipLiveStats();
+        if (ml2.preparing && ml2.want_aniso != ml2.live_aniso)
+            std::snprintf(tb, sizeof tb, "Preparing %ux in the background (%llu of %llu objects); the current filtering stays until it is complete.", ml2.want_aniso,
+                          static_cast<unsigned long long>(ml2.prepare_done), static_cast<unsigned long long>(ml2.prepare_total));
+        else if (as.level)
+            std::snprintf(tb, sizeof tb, "In use: %ux (%llu built-in samplers and %llu sampler descriptors raised).", as.level,
+                          static_cast<unsigned long long>(as.static_samplers), static_cast<unsigned long long>(as.samplers));
         else
-            std::snprintf(tb, sizeof tb, "This session: off (the game's own filtering).");
+            std::snprintf(tb, sizeof tb, "In use: off (the game's own filtering).");
         StatusLine(0, tb);
-        if (as.level != kAnisoLevel[idx]) StatusLine(2, "Restart the game to apply this change.");
     }
     {
         // Jitter sequence (Cort 2026-11-05): where inside each pixel DLAA/DLSS samples, frame

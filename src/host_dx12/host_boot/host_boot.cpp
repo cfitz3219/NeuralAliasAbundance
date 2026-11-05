@@ -122,9 +122,25 @@ DWORD WINAPI InitThread(LPVOID)
         wchar_t mb[32] = {};
         GetPrivateProfileStringW(L"j2", L"mip_bias", L"-1.0", mb, 32, g_ini);
         na::observe::SetSamplerMipBias(0.f); // defer the saved effect until renderer recovery is known
-        // Live switching from the menu (no restart): twin root signatures/pipelines are
-        // built at creation for the other levels. [j2] mip_bias_live=0 turns it off.
-        na::observe::SetSamplerMipBiasLiveEnabled(GetPrivateProfileIntW(L"j2", L"mip_bias_live", 1, g_ini) != 0);
+        // Live switching (no restarts, Cort 2026-11-05): the game's own root signatures and
+        // pipelines are left as the game made them; twins carry the mip bias and anisotropic
+        // filtering. [j2] mip_bias_live=0 turns it off. The saved choice's twins (and, for
+        // render-small, the DLSS modes' automatic levels) are built as the game creates its
+        // objects, before activation, so the saved choice works from the first frame it is
+        // activated; any other choice is prepared in the background when picked.
+        na::observe::SetSamplerMipBiasLiveEnabled(!na::settings::SafeStart() && GetPrivateProfileIntW(L"j2", L"mip_bias_live", 1, g_ini) != 0);
+        if (!na::settings::SafeStart()) {
+            const auto& st = na::settings::Get();
+            const float user = static_cast<float>(st.j2_mip_bias_x100.load()) / 100.f;
+            float wanted[4] = {user, user, user, user};
+            int n = 1;
+            if (GetPrivateProfileIntW(L"present", L"render_small", 0, g_ini) == 1) {
+                for (int m = 1; m <= 3; ++m) wanted[m] = na::j2::SmallMipBias(user, static_cast<float>(na::scale::FractionForMode(m)));
+                n = 4;
+            }
+            na::observe::SetSamplerMipLevelsWanted(wanted, n);
+            na::observe::SetSamplerAnisotropyPrebuild(st.aniso16.load());
+        }
     }
 
     if (GetPrivateProfileIntW(L"overlay", L"enabled", 1, g_ini) == 1) {
