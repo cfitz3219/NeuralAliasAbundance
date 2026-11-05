@@ -1,6 +1,7 @@
 // C8a: H1 observation producers. See producers.hpp.
 #include "host_dx12/observe/producers.hpp"
 
+#include <utility>
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -164,6 +165,9 @@ struct ListState {
     std::shared_ptr<const DescriptorDetails> native_depth;
     int8_t mip_level = -1;               // live sampler variant latched at Reset: mip level (-1 = the game's own objects)
     int8_t af_latched = 0;               // ...and its anisotropic index (0 off, 1 4x, 2 8x, 3 16x)
+    // Binds of this recording (under bind_m; added to the totals at the next Reset): twin
+    // passed to the driver / the game's own object kept (sampler-independent or identical twin).
+    uint32_t mip_pso_twin = 0, mip_pso_game = 0, mip_rs_twin = 0, mip_rs_game = 0;
     // Viewport jitter: our offset copies of the game's viewports are bound now (vpj_value),
     // and the value the last scene draw of this recording was drawn with (vpj_scene, 0 = none).
     bool vpj_applied = false;
@@ -1520,6 +1524,9 @@ std::atomic<uint64_t> g_var_aniso_changed[kMipCount * 4]; // AF changes only, no
 std::atomic<bool> g_mip_switched{false};   // a variant other than the game's has been in use (enables lookups)
 std::atomic<bool> g_mip_live_enabled{false}; // twins are built only when J2 enables live switching
 std::atomic<uint64_t> g_mip_twin_rs{0}, g_mip_twin_pso{0}, g_mip_untwinned{0}, g_mip_fallbacks{0}, g_mip_twin_fail{0};
+// Draw-time proof (Cort 2026-11-05: "x16 shows no difference"): binds that really went to the
+// driver as twins vs kept the game's object, summed once per recording at its next Reset.
+std::atomic<uint64_t> g_mip_bound_pso_twin{0}, g_mip_bound_pso_game{0}, g_mip_bound_rs_twin{0}, g_mip_bound_rs_game{0};
 int var_level(uint32_t v) { return static_cast<int>(v & 15u) < kMipCount ? static_cast<int>(v & 15u) : 0; }
 int var_af(uint32_t v) { return static_cast<int>(v >> 4 & 3u); }
 uint32_t var_pack(int level, int af) { return static_cast<uint32_t>(level) | static_cast<uint32_t>(af) << 4; }
@@ -4101,7 +4108,7 @@ void mip_on_pso(GL* l, ID3D12PipelineState*& p)
         bool untwinned = false;
         ID3D12PipelineState* t = mip_swap_locked(ls->mip_level, ls->af_latched, p, true, &untwinned);
         if (untwinned) { ls->mip_level = -1; fallback = true; }
-        else p = t;
+        else { if (t != p) ++ls->mip_pso_twin; else ++ls->mip_pso_game; p = t; }
     }
     if (fallback) {
         g_mip_fallbacks.fetch_add(1, std::memory_order_relaxed);
@@ -4123,7 +4130,7 @@ void mip_on_rs(GL* l, ID3D12RootSignature*& r)
         bool untwinned = false;
         ID3D12RootSignature* t = mip_swap_locked(ls->mip_level, ls->af_latched, r, false, &untwinned);
         if (untwinned) { ls->mip_level = -1; fallback = true; } // r (the game's) is bound as is
-        else r = t;
+        else { if (t != r) ++ls->mip_rs_twin; else ++ls->mip_rs_game; r = t; }
     }
     if (fallback) {
         // A pipeline twin may be bound: switch the whole recording to the game's objects
@@ -4142,13 +4149,18 @@ void mip_on_reset(GL* l, ID3D12PipelineState*& p)
     ListState* ls = list_state_locked(l, &lid);
     if (!ls) return;
     std::lock_guard<std::mutex> bl(ls->bind_m);
+    // The previous recording's binds into the totals (one add per counter per recording).
+    if (ls->mip_pso_twin) g_mip_bound_pso_twin.fetch_add(std::exchange(ls->mip_pso_twin, 0u), std::memory_order_relaxed);
+    if (ls->mip_pso_game) g_mip_bound_pso_game.fetch_add(std::exchange(ls->mip_pso_game, 0u), std::memory_order_relaxed);
+    if (ls->mip_rs_twin) g_mip_bound_rs_twin.fetch_add(std::exchange(ls->mip_rs_twin, 0u), std::memory_order_relaxed);
+    if (ls->mip_rs_game) g_mip_bound_rs_game.fetch_add(std::exchange(ls->mip_rs_game, 0u), std::memory_order_relaxed);
     ls->mip_level = static_cast<int8_t>(v ? var_level(v) : -1); // 0 = the game's own objects
     ls->af_latched = static_cast<int8_t>(var_af(v));
     if (ls->mip_level >= 0 && p) {
         bool untwinned = false;
         ID3D12PipelineState* t = mip_swap_locked(ls->mip_level, ls->af_latched, p, true, &untwinned);
         if (untwinned) ls->mip_level = -1; // nothing bound yet: simply record with the game's objects
-        else p = t;
+        else { if (t != p) ++ls->mip_pso_twin; else ++ls->mip_pso_game; p = t; }
     }
 }
 
@@ -6764,6 +6776,10 @@ MipLiveStats GetMipLiveStats()
     m.twin_pipelines = g_mip_twin_pso.load(std::memory_order_relaxed);
     m.untwinned_pipelines = g_mip_untwinned.load(std::memory_order_relaxed);
     m.fallbacks = g_mip_fallbacks.load(std::memory_order_relaxed);
+    m.bound_pso_twin = g_mip_bound_pso_twin.load(std::memory_order_relaxed);
+    m.bound_pso_game = g_mip_bound_pso_game.load(std::memory_order_relaxed);
+    m.bound_rs_twin = g_mip_bound_rs_twin.load(std::memory_order_relaxed);
+    m.bound_rs_game = g_mip_bound_rs_game.load(std::memory_order_relaxed);
     m.twin_failures = g_mip_twin_fail.load(std::memory_order_relaxed);
     m.shared_skips = g_mip_shared_skips.load(std::memory_order_relaxed);
     return m;

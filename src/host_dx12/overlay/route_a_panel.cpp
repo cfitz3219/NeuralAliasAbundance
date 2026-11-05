@@ -1249,6 +1249,13 @@ void DrawLiveDlaaEnhancements()
         else
             std::snprintf(tb, sizeof tb, "In use: off (the game's own filtering).");
         StatusLine(0, tb);
+        if (as.level) {
+            // Draw-time proof: how often the game's draws really went to the GPU with our
+            // changed pipelines, against with its own (which never carry the change).
+            std::snprintf(tb, sizeof tb, "Drawn with the changed pipelines: %llu binds; with the game's own: %llu.",
+                          static_cast<unsigned long long>(ml2.bound_pso_twin), static_cast<unsigned long long>(ml2.bound_pso_game));
+            Hint(tb);
+        }
         if(as.native_surface&&as.native_16==as.native_surface)
             Hint("The game already requested 16x for all observed surface samplers.");
     }
