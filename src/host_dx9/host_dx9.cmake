@@ -6,6 +6,8 @@ if(WIN32)
   add_library(NeuralAliasD3D9 SHARED
     "${NA_ROOT}/src/host_dx9/d3d9_proxy.cpp"
     "${NA_ROOT}/src/host_dx9/dx9_hooks.cpp"
+    "${NA_ROOT}/src/host_dx9/dx9_transport.cpp"
+    "${NA_ROOT}/src/bridge/dx12_game_bridge.cpp"
     "${NA_ROOT}/src/host_dx9/d3d9_proxy.def")
-  target_link_libraries(NeuralAliasD3D9 PRIVATE abundance_options minhook d3d12 dxgi user32)
+  target_link_libraries(NeuralAliasD3D9 PRIVATE abundance_options bridge_record minhook d3d12 dxgi d3dcompiler user32)
 endif()

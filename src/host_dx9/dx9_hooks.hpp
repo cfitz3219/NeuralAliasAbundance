@@ -24,10 +24,19 @@ void BeforeReset(IDirect3DDevice9* dev);
 void AfterReset(IDirect3DDevice9* dev, const D3DPRESENT_PARAMETERS* pp, HRESULT hr);
 HookStats GetHookStats();
 
+// What the DLSS point hands over: the scene colour and depth (a texture or a
+// surface each; alive at this moment, not AddRef'd) and their size.
+struct FireInfo {
+    IDirect3DResource9* color = nullptr;
+    IDirect3DResource9* depth = nullptr;
+    uint32_t width = 0, height = 0;
+    uint64_t frame = 0;
+};
+
 // What runs at the DLSS point (D4 sets it to the transport). Called on the
 // game's render thread with the device, before the call it precedes.
 // where: 1 before a read, 2 before the HUD, 3 at Present.
-using FireFn = void (*)(IDirect3DDevice9* dev, int where);
+using FireFn = void (*)(IDirect3DDevice9* dev, int where, const FireInfo& info);
 void SetFire(FireFn fn);
 
 } // namespace na::dx9

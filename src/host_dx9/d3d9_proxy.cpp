@@ -32,6 +32,7 @@
 
 #include "host_dx9/d3d9_proxy.hpp"
 #include "host_dx9/dx9_hooks.hpp"
+#include "host_dx9/dx9_transport.hpp"
 #include "host_dx9/vtable_hook.hpp"
 
 using Microsoft::WRL::ComPtr;
@@ -43,6 +44,9 @@ struct Config {
     bool enabled = false;
     bool borderless = true;
     bool own_device = true; // try 9On12 on our D3D12 device first
+    bool dlss = true;       // run the DLSS transport at the point the hooks find
+    bool copy_test = false; // transport test: the helper copies, the way back swaps red/blue
+    uint32_t preset = 0;
     std::wstring log_path;
 };
 
@@ -118,6 +122,9 @@ const Config& Cfg()
         if (!g_cfg.enabled) return;
         g_cfg.borderless = GetPrivateProfileIntW(L"dx9", L"borderless", 1, ini.c_str()) == 1;
         g_cfg.own_device = GetPrivateProfileIntW(L"dx9", L"own_device", 1, ini.c_str()) == 1;
+        g_cfg.dlss = GetPrivateProfileIntW(L"dx9", L"dlss", 1, ini.c_str()) == 1;
+        g_cfg.copy_test = GetPrivateProfileIntW(L"dx9", L"copy_test", 0, ini.c_str()) == 1;
+        g_cfg.preset = static_cast<uint32_t>(GetPrivateProfileIntW(L"dx9", L"preset", 0, ini.c_str()));
         wchar_t b[MAX_PATH]{};
         GetPrivateProfileStringW(L"dx9", L"log", L"", b, MAX_PATH, ini.c_str());
         g_cfg.log_path = b;
@@ -126,8 +133,8 @@ const Config& Cfg()
         GetModuleFileNameW(nullptr, exe, MAX_PATH);
         char exe8[MAX_PATH * 3]{};
         WideCharToMultiByte(CP_UTF8, 0, exe, -1, exe8, sizeof(exe8), nullptr, nullptr);
-        Log("NeuralAlias DX9 proxy (%d-bit) in %s: borderless=%d own_device=%d", static_cast<int>(sizeof(void*) * 8), exe8,
-            g_cfg.borderless ? 1 : 0, g_cfg.own_device ? 1 : 0);
+        Log("NeuralAlias DX9 proxy (%d-bit) in %s: borderless=%d own_device=%d dlss=%d preset=%u%s", static_cast<int>(sizeof(void*) * 8), exe8,
+            g_cfg.borderless ? 1 : 0, g_cfg.own_device ? 1 : 0, g_cfg.dlss ? 1 : 0, g_cfg.preset, g_cfg.copy_test ? " COPY TEST (no DLSS)" : "");
     });
     return g_cfg;
 }
@@ -178,6 +185,15 @@ bool MakeBorderless(D3DPRESENT_PARAMETERS* pp, HWND focus)
     return true;
 }
 
+// One D3D12 device + queue for the process: 9On12 runs on it, and the
+// transport (D4) uses the same queue to copy the picture out.
+struct Our12 {
+    ComPtr<ID3D12Device> device;
+    ComPtr<ID3D12CommandQueue> queue;
+};
+std::mutex g_d12_mu;
+Our12 g_d12;
+
 // ------------------------------------------------------------------ vtable hooks
 using na::dx9::HookMethod;
 using na::dx9::Method;
@@ -208,6 +224,14 @@ void Created(IDirect3DDevice9* dev, const D3DPRESENT_PARAMETERS* pp, DWORD flags
         pp ? pp->EnableAutoDepthStencil : 0, pp ? static_cast<int>(pp->MultiSampleType) : 0, pp ? pp->Windowed : 0, static_cast<unsigned long>(flags));
     HookDevice(dev);
     na::dx9::AttachDevice(dev, pp);
+    na::dx9::TransportConfig tc;
+    tc.enabled = Cfg().dlss;
+    tc.copy_test = Cfg().copy_test;
+    tc.preset = Cfg().preset;
+    tc.helper_path = SelfDir() + L"\\na_bridge_helper64.exe";
+    std::lock_guard<std::mutex> l(g_d12_mu);
+    const bool ours = g_our_device.load() != 0;
+    na::dx9::StartTransport(tc, ours ? g_d12.device.Get() : nullptr, ours ? g_d12.queue.Get() : nullptr);
 }
 
 HRESULT WINAPI CreateDevice_h(IDirect3D9* self, UINT adapter, D3DDEVTYPE type, HWND focus, DWORD flags, D3DPRESENT_PARAMETERS* pp,
@@ -269,14 +293,6 @@ HRESULT WINAPI ResetEx_h(IDirect3DDevice9Ex* self, D3DPRESENT_PARAMETERS* pp, D3
 }
 
 // ------------------------------------------------------------------ D3D12 side
-// One D3D12 device + queue for the process: 9On12 runs on it, and the
-// transport (D4) uses the same queue to copy the picture out.
-struct Our12 {
-    ComPtr<ID3D12Device> device;
-    ComPtr<ID3D12CommandQueue> queue;
-};
-std::mutex g_d12_mu;
-Our12 g_d12;
 
 bool MakeOur12()
 {
@@ -508,6 +524,7 @@ extern "C" int __cdecl NA_D3D9_QueryStatus(na::dx9::ProxyStatus* s)
     out.borderless = g_borderless.load();
     out.resets = g_resets.load();
     out.hooks = na::dx9::GetHookStats();
+    out.transport = na::dx9::GetTransportStats();
     *s = out;
     return 1;
 }

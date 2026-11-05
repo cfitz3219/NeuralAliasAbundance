@@ -53,7 +53,9 @@ jobs:
         run: |
           $ErrorActionPreference = 'Continue'
           # D1: the 32-bit game side (win32/) builds and its tests pass.
-          cmake -S win32 -B build32 -A Win32 2>&1 | Out-Null
+          # The 64-bit helper from the main build serves the 32-bit game side too.
+          $helper = Get-ChildItem build -Recurse -Filter na_bridge_helper64.exe | Select-Object -First 1 -ExpandProperty FullName
+          cmake -S win32 -B build32 -A Win32 "-DNA_HELPER64=$helper" 2>&1 | Out-Null
           cmake --build build32 --config Release --parallel 2>&1 | Tee-Object -FilePath build32-log.txt | Out-Null
           if ($LASTEXITCODE -ne 0) {
             Get-Content build32-log.txt | Select-String ': (fatal )?error [A-Z]+[0-9]+|error MSB|LINK : fatal|: warning C[0-9]+' | Select-Object -First 10 | ForEach-Object { Write-Output "::error::[32-bit] $($_.Line.Trim())" }

@@ -94,6 +94,33 @@ void Regs(const M& m, float* out)
 
 struct V3 { float x, y, z; DWORD c; };
 struct VT { float x, y, z, rhw, u, v; };
+struct VD { float x, y, z, rhw; DWORD c; };
+
+bool g_copy = false; // copy-test mode: the transport runs, the helper copies, the way back swaps red/blue
+
+// Reads one back-buffer pixel (X8R8G8B8) as 0xRRGGBB.
+bool PixelAt(IDirect3DDevice9* dev, UINT w, UINT h, UINT x, UINT y, DWORD* out)
+{
+    ComPtr<IDirect3DSurface9> bb, sys;
+    if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) return false;
+    D3DSURFACE_DESC d{};
+    bb->GetDesc(&d);
+    if (FAILED(dev->CreateOffscreenPlainSurface(w, h, d.Format, D3DPOOL_SYSTEMMEM, &sys, nullptr))) return false;
+    if (FAILED(dev->GetRenderTargetData(bb.Get(), sys.Get()))) return false;
+    D3DLOCKED_RECT lr{};
+    if (FAILED(sys->LockRect(&lr, nullptr, D3DLOCK_READONLY))) return false;
+    *out = static_cast<const DWORD*>(lr.pBits)[y * (lr.Pitch / 4) + x] & 0x00FFFFFF;
+    sys->UnlockRect();
+    return true;
+}
+bool Near(DWORD a, DWORD b)
+{
+    for (int sh = 0; sh < 24; sh += 8) {
+        const int x = int((a >> sh) & 255), y = int((b >> sh) & 255);
+        if (x - y > 2 || y - x > 2) return false;
+    }
+    return true;
+}
 
 ComPtr<IDirect3DVertexShader9> SceneShader(IDirect3DDevice9* dev)
 {
@@ -136,9 +163,15 @@ bool RunGame(IDirect3DDevice9* dev, PFN_Status status, bool post, UINT w, UINT h
     const V3 tri[] = {{-1, -1, 0, 0xff8040ff}, {0, 1, 0, 0xff40ff80}, {1, -1, 0, 0xffff4080}};
     const float sw = static_cast<float>(w), sh = static_cast<float>(h);
     const VT quad[] = {{0, 0, 0, 1, 0, 0}, {sw, 0, 0, 1, 1, 0}, {0, sh, 0, 1, 0, 1}, {sw, sh, 0, 1, 1, 1}};
-    const VT hud[] = {{8, 8, 0, 1, 0, 0}, {64, 8, 0, 1, 1, 0}, {8, 24, 0, 1, 0, 1}, {64, 24, 0, 1, 1, 1}};
+    const DWORD hud_c = D3DCOLOR_XRGB(0, 200, 100);
+    const VD hud[] = {{8, 8, 0, 1, hud_c}, {64, 8, 0, 1, hud_c}, {8, 24, 0, 1, hud_c}, {64, 24, 0, 1, hud_c}};
 
-    for (int frame = 0; frame < 8; ++frame) {
+    // Frames until the transport delivers (the helper takes a moment to start), at least 8.
+    const ULONGLONG t0 = GetTickCount64();
+    DWORD corner = 0, hud_px = 0;
+    for (int frame = 0;; ++frame) {
+        const auto now = Status(status).transport;
+        const bool last = frame >= 8 && (!g_copy || now.ok >= 3 || GetTickCount64() - t0 > 20000);
         const double ys = 1.0 / std::tan(0.5), xs = ys * sh / sw, q = 1000.0 / (1000.0 - 0.1);
         const M proj{xs, 0, 0, 0, 0, ys, 0, 0, 0, 0, q, 1, 0, 0, -0.1 * q, 0};
         const double a = 0.02 * frame, c = std::cos(a), s = std::sin(a);
@@ -180,11 +213,17 @@ bool RunGame(IDirect3DDevice9* dev, PFN_Status status, bool post, UINT w, UINT h
             dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(VT));
             dev->SetTexture(0, nullptr);
         }
-        // HUD: depth test off.
+        // HUD: depth test off, its own colour.
         dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
-        dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, hud, sizeof(VT));
+        dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+        dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, hud, sizeof(VD));
         dev->EndScene();
+        if (last) {
+            PixelAt(dev, w, h, 4, h - 4, &corner);
+            PixelAt(dev, w, h, 30, 15, &hud_px);
+        }
         dev->Present(nullptr, nullptr, nullptr, nullptr);
+        if (last) break;
     }
     dev->SetDepthStencilSurface(auto_depth.Get());
     dev->SetRenderTarget(0, back.Get());
@@ -199,6 +238,19 @@ bool RunGame(IDirect3DDevice9* dev, PFN_Status status, bool post, UINT w, UINT h
     Check(k.scene_draws == 40, "the 40 objects are the scene draws (HUD and tonemap are not)");
     if (post) Check(k.point_kind == 1 && k.fired_read >= 1, "post game: DLSS point before the tonemap's read of the scene");
     else Check(k.point_kind == 2 && k.fired_hud >= 1, "back-buffer game: DLSS point before the HUD (HUD rule)");
+    const auto& t = st.transport;
+    std::printf("     transport: ok %u late %u not ready %u failed %u skipped %u, at read %u hud %u present %u, wait %.2f ms; corner 0x%06lx hud 0x%06lx\n",
+                t.ok, t.repeated, t.not_ready, t.failed, t.skipped, t.at_read, t.at_hud, t.at_present, t.wait_ms,
+                static_cast<unsigned long>(corner), static_cast<unsigned long>(hud_px));
+    const DWORD bg = 0x14283C, bg_swapped = 0x3C2814; // (20,30,60) and red/blue swapped
+    Check(Near(hud_px, 0x00C864), "the HUD is drawn after DLSS (its colour is untouched)");
+    if (g_copy) {
+        Check(t.ok >= 1, "copy test: the helper's results came back");
+        Check(Near(corner, bg_swapped), post ? "copy test: the result reached the tonemap (scene red/blue swapped)"
+                                            : "copy test: the result is in the back buffer under the HUD (red/blue swapped)");
+    } else {
+        Check(Near(corner, bg), "no transport (no helper here): the picture is untouched");
+    }
     return true;
 }
 
@@ -207,14 +259,15 @@ bool RunGame(IDirect3DDevice9* dev, PFN_Status status, bool post, UINT w, UINT h
 int main(int argc, char** argv)
 {
     if (argc < 4) {
-        std::printf("usage: d3d9_proxy_test <proxy dll> <work dir> on|off\n");
+        std::printf("usage: d3d9_proxy_test <proxy dll> <work dir> on|off|copy [na_bridge_helper64.exe]\n");
         return 1;
     }
-    const bool on = std::strcmp(argv[3], "on") == 0;
-    std::printf("d3d9 proxy test (%s), %d-bit\n", on ? "on" : "off", static_cast<int>(sizeof(void*) * 8));
+    g_copy = std::strcmp(argv[3], "copy") == 0;
+    const bool on = g_copy || std::strcmp(argv[3], "on") == 0;
+    std::printf("d3d9 proxy test (%s), %d-bit\n", argv[3], static_cast<int>(sizeof(void*) * 8));
 
-    // The proxy beside its own ini, as deploy-dx9.ps1 will lay it out.
-    const fs::path dir = fs::path(argv[2]) / (on ? "on" : "off");
+    // The proxy beside its own ini (and the helper), as deploy-dx9.ps1 will lay it out.
+    const fs::path dir = fs::path(argv[2]) / argv[3];
     std::error_code ec;
     fs::create_directories(dir, ec);
     const fs::path dll = dir / "NeuralAliasD3D9.dll";
@@ -223,7 +276,15 @@ int main(int argc, char** argv)
     const fs::path log = dir / "dx9.log";
     {
         std::ofstream ini(dir / "NeuralAliasHost.ini");
-        ini << "[dx9]\nenabled=" << (on ? 1 : 0) << "\nlog=" << log.string() << "\n";
+        ini << "[dx9]\nenabled=" << (on ? 1 : 0) << "\ncopy_test=" << (g_copy ? 1 : 0) << "\nlog=" << log.string() << "\n";
+    }
+    if (g_copy) {
+        if (argc < 5 || !fs::exists(argv[4])) {
+            std::printf("SKIP: copy test needs na_bridge_helper64.exe\n");
+            return 77;
+        }
+        fs::copy_file(argv[4], dir / "na_bridge_helper64.exe", fs::copy_options::overwrite_existing, ec);
+        Check(!ec, "helper copied beside the proxy");
     }
 
     HMODULE proxy = LoadLibraryW(dll.wstring().c_str());
@@ -360,6 +421,6 @@ int main(int argc, char** argv)
     }
 
     DestroyWindow(hwnd);
-    std::printf("%s: d3d9 proxy (%s, %d-bit)\n", g_fail ? "FAIL" : "PASS", on ? "on" : "off", static_cast<int>(sizeof(void*) * 8));
+    std::printf("%s: d3d9 proxy (%s, %d-bit)\n", g_fail ? "FAIL" : "PASS", argv[3], static_cast<int>(sizeof(void*) * 8));
     return g_fail ? 1 : 0;
 }

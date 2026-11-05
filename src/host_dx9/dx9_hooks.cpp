@@ -69,13 +69,27 @@ const SurfaceInfo& Describe(IDirect3DSurface9* s)
     return e;
 }
 
+// What the fire function gets, taken under the lock when the point is reached.
+FireInfo InfoLocked()
+{
+    FireInfo i;
+    const auto& sel = g_ears.Model().Current();
+    // Ids are the game's own texture/surface pointers (single inheritance from IDirect3DResource9).
+    i.color = reinterpret_cast<IDirect3DResource9*>(static_cast<uintptr_t>(sel.color));
+    i.depth = reinterpret_cast<IDirect3DResource9*>(static_cast<uintptr_t>(sel.depth));
+    i.width = sel.color_info.width;
+    i.height = sel.color_info.height;
+    i.frame = g_ears.Stats().frames;
+    return i;
+}
+
 // Runs the fire function outside the lock. Call with the lock released.
-void Fire(IDirect3DDevice9* dev, int where)
+void Fire(IDirect3DDevice9* dev, int where, const FireInfo& info)
 {
     const FireFn f = g_fire.load(std::memory_order_acquire);
-    if (!f) return;
+    if (!f || !info.color || !info.depth) return;
     t_in_fire = true;
-    f(dev, where);
+    f(dev, where, info);
     t_in_fire = false;
 }
 
@@ -211,15 +225,17 @@ HRESULT WINAPI SetRenderState_h(IDirect3DDevice9* self, D3DRENDERSTATETYPE state
 void ReadOf(IDirect3DDevice9* dev, Id id)
 {
     bool fire = false;
+    FireInfo info;
     {
         std::lock_guard<std::mutex> l(g_mu);
         if (g_ears.BeforeRead(id)) {
             g_ears.MarkFired(FirePoint::BeforeRead);
+            info = InfoLocked();
             fire = true;
         }
         g_ears.Read(id);
     }
-    if (fire) Fire(dev, 1);
+    if (fire) Fire(dev, 1, info);
 }
 
 HRESULT WINAPI SetTexture_h(IDirect3DDevice9* self, DWORD stage, IDirect3DBaseTexture9* tex)
@@ -265,15 +281,17 @@ HRESULT WINAPI GetRenderTargetData_h(IDirect3DDevice9* self, IDirect3DSurface9* 
 void DrawOf(IDirect3DDevice9* dev, uint64_t vertices)
 {
     bool fire = false;
+    FireInfo info;
     {
         std::lock_guard<std::mutex> l(g_mu);
         if (g_ears.BeforeDraw(vertices)) {
             g_ears.MarkFired(FirePoint::BeforeHudDraw);
+            info = InfoLocked();
             fire = true;
         }
         g_ears.Draw(vertices);
     }
-    if (fire) Fire(dev, 2);
+    if (fire) Fire(dev, 2, info);
 }
 
 HRESULT WINAPI DrawPrimitive_h(IDirect3DDevice9* self, D3DPRIMITIVETYPE type, UINT start, UINT count)
@@ -359,14 +377,16 @@ void PublishLocked()
 void FrameEnd(IDirect3DDevice9* dev)
 {
     bool fire = false;
+    FireInfo info;
     {
         std::lock_guard<std::mutex> l(g_mu);
         if (g_ears.PresentShouldFire()) {
             g_ears.MarkFired(FirePoint::AtPresent);
+            info = InfoLocked();
             fire = true;
         }
     }
-    if (fire) Fire(dev, 3);
+    if (fire) Fire(dev, 3, info);
     std::lock_guard<std::mutex> l(g_mu);
     g_ears.Present();
     PublishLocked();
