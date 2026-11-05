@@ -6630,6 +6630,7 @@ size_t fill_pass(int level, int af, uint32_t v)
 }
 void variant_worker()
 {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL); // compiles yield to the game's threads
     for (;;) {
         uint32_t v = 0;
         bool refill = false;
