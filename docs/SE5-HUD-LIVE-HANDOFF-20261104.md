@@ -1,0 +1,31 @@
+# Live HUD handoff repair - 2026-11-04
+
+This follows Cort's failed 00e6d1b/p15000 test. Jitter no longer shakes, by Cort's report and the captured stable DLSS output; its runtime/math/settings are unchanged here. Cort also reports only a small quality benefit from jitter. Jitter supplies subpixel samples, not a sharpness filter; the current final-picture feed still includes game processing and low-resolution HUD. Do not claim the early handoff solves every remaining world-image quality issue without Cort's pictures.
+
+## What the game actually showed
+
+Correct installed package, native_hud enabled initially. Five canvases and thousands of comparisons, then two matching proofs at20:48:12 and one learned canvas. Next81815 draws were forwarded with the old combined reason `draw has unqualified repeatable shader state`. No native replay was recorded/submitted. That reason conflated unsupported executable inspection with an active query. The saved evidence does NOT identify which of those conditions applied to the actual game's shaders. Older statements that zero comparisons ever passed are superseded by this timeline. Enabling the checkbox or a passing fixture was not successful game HUD separation.
+
+## Changes
+
+* Cache shader inspection by full compiled bytes, bounded32MiB/16384entries. Equal hashes alone are insufficient. A concurrent PSO miss is inspected once. Report actual unique/hit/disassembly/DXIL/time counters; do not attribute the entire slow startup to disassembly without live timings.
+* Read standard Microsoft DXIL container/PSV0 resource bindings and ISG1 input signatures, including stripped SM6 shaders. No DXC runtime DLL, LLVM parser, shader rewrite, per-game address/hash or new dependency. UAV writes, direct resource heap indexing and stream output remain specifically identified. DXBC executable inspection is retained: signature-only D3DReflect success cannot establish empty resource bindings after RDEF stripping.
+* Distinguish query and shader rejection. Original game queries are preserved: no extra inline black/grey draws inside them. The existing independent native/original-size replay list can draw outside those queries. Actual GPU pipeline-statistics regression requires the game query to count exactly3vertices/1primitive.
+* At producer-list Close, snapshot a terminal blended canvas in its own actually known state. Retain its source recording; consume the immutable snapshot in the final handoff even when that final list has no local source transition. Bounded8probe packets, no guessed state, readback/wait or new queue. Both ordinary picture and native-check Full snapshots support that handoff. Existing actual source recording/batch and final-readable-state qualification stays intact.
+* Follow the handoff's actual source instead of the first old same-sized learned canvas. An older profile cannot prevent promotion of a replacement. A structurally identified source may attempt native replay immediately; its original-size redraw and final GPU comparison still determine presentation. The original full game draw always executes once.
+* Preserve the actual final full-screen draw. Existing scoped typed bindings replace only the actual canvas SRV, retaining all other resource/sampler tables, shader/root/IA/predicate/blend state and exact draw arguments. Replay the finishing draw at native and original size; compare that processed original-size result with the actual original final picture. Keep sRGB RTV/SRV views and alpha. Named size fields use the existing GPU constant-copy/patch machinery; unknown meanings are not searched by coincidental values. This extends the existing native-replay path, not a fifth separator.
+* Additional draws/clears/copies into the destination discard the earlier completed handoff so it cannot hide later game UI. Complete original-picture fallback remains available when equivalence fails. Native/check/tail textures and binding plans belong to the same retired replay packet, source recording leases and Present owner. No packet or descriptor pages are reused while executable/in flight.
+* F8 now includes failed `hud_probe_candidate` pixels and source/generation metadata alongside the exact evaluation/final picture. Completed native captures retain original evaluation identity and existing missing-guide honesty.
+
+## Automated evidence and limits
+
+Expanded actual-DX12 native HUD regression covers stripped DXBC and DXIL, read-only/UAV/direct-heap classification,1000cache hits without a new inspection, replacement profiles, a producer/final split over two command lists in the actual submitted batch, preserved original query counts, render-ahead, an altered finishing shader (.8 gain) with independent expected native pixels, alpha/HDR picture tests, unsafe final VB state decline, missing guides and debug-layer errors. The pre-HUD renderer in this regression is a fake model; the source/graphics/state/submission/pixel comparisons are real DX12. It is not a real-game text-quality pass.
+
+The final-pass replay handles finite, restorable graphics bindings. Unbounded/direct-heap, compute/indirect finishing paths, arbitrary unrecognized dimension semantics, different source/final format families and separate submissions with independently changing replay inputs are not newly advertised as supported. Every declined occurrence retains the original complete picture. Source snapshots can cross submitted-list boundaries; delayed native replay still requires its sources in the qualified original batch. Do not relax that lifetime/state rule on a guess.
+
+Microsoft primary references consulted:
+- https://github.com/microsoft/DirectXShaderCompiler/blob/main/include/dxc/DxilContainer/DxilPipelineStateValidation.h (PSV runtime/resource layout)
+- https://github.com/microsoft/DirectXShaderCompiler/blob/main/include/dxc/DxilContainer/DxilContainer.h (container/input-signature layout)
+- https://learn.microsoft.com/en-us/windows/win32/api/dxcapi/nf-dxcapi-idxcutils-createreflection (standard reflection API considered; no runtime DXC added)
+
+Full combined-suite/package receipt follows in COMMS/WORKLOG after integration. No game launch, installation or visual success is claimed by this document.

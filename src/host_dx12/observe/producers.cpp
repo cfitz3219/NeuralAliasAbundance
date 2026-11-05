@@ -176,6 +176,7 @@ struct Obj {
     bool reflection_complete=false;
     bool native_hud_affine=false;
     bool shader_readonly=false;
+    uint32_t shader_rejection=ShaderUnknown;
     bool pixel_position=false;
     // Live mip bias: per-level twins of a root signature / pipeline state (index = level).
     // same[i]: the game's own object is already correct for level i (nothing to swap).
@@ -1640,6 +1641,7 @@ thread_local std::vector<ShaderDimension> g_next_dimensions;
 thread_local std::vector<ShaderResource> g_next_shader_resources;
 thread_local bool g_next_reflection_complete=true;
 thread_local bool g_next_shader_readonly=true;
+thread_local uint32_t g_next_shader_rejection=0;
 thread_local bool g_next_pixel_position=false;
 void bytecode(na_ev_pipeline_created& e, uint32_t stage, const D3D12_SHADER_BYTECODE& b)
 {
@@ -1652,7 +1654,9 @@ void bytecode(na_ev_pipeline_created& e, uint32_t stage, const D3D12_SHADER_BYTE
         const bool reflected=ReflectDimensions(b,g_next_dimensions,stage<5?visibility[stage]:D3D12_SHADER_VISIBILITY_ALL,&g_next_shader_resources,
             stage==NA_STAGE_PS?&pixel_position:nullptr);
         g_next_reflection_complete &= reflected;
-        if(!reflected)g_next_shader_readonly &= ExecutableReadOnly(b,stage==NA_STAGE_PS?&pixel_position:nullptr);
+        uint32_t rejection=0;
+        g_next_shader_readonly &= ExecutableReadOnly(b,stage==NA_STAGE_PS?&pixel_position:nullptr,&rejection);
+        g_next_shader_rejection|=rejection;
         if(stage==NA_STAGE_PS)g_next_pixel_position=pixel_position;
     }
 }
@@ -1710,7 +1714,8 @@ void emit_pipeline(ID3D12Device* dev, IUnknown* obj, na_ev_pipeline_created& e, 
         std::unique_lock<std::shared_mutex> lock(g_m);
         const auto found=g_objs.find(canon(obj));if(found!=g_objs.end()){
             found->second.dimensions=g_next_dimensions;found->second.shader_resources=g_next_shader_resources;
-            found->second.reflection_complete=g_next_reflection_complete;}
+            found->second.reflection_complete=g_next_reflection_complete;
+            found->second.shader_rejection=g_next_shader_rejection|(g_next_stream_output?ShaderStreamOutput:0u);}
         if(found!=g_objs.end())found->second.shader_readonly=g_next_shader_readonly&&!g_next_stream_output&&
             std::none_of(g_next_shader_resources.begin(),g_next_shader_resources.end(),[](const auto& r){return r.type==D3D12_DESCRIPTOR_RANGE_TYPE_UAV;});
     }
@@ -1973,7 +1978,7 @@ HRESULT STDMETHODCALLTYPE D_CreateGraphicsPipelineState(ID3D12Device* dev, const
     const HRESULT hr = o_CreateGraphicsPipelineState(dev, d, riid, out);
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj || !d) return hr;
-    g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;g_next_shader_readonly=true;g_next_pixel_position=false;
+    g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;g_next_shader_readonly=true;g_next_shader_rejection=0;g_next_pixel_position=false;
     na_ev_pipeline_created e;
     init_header(e, NA_EV_PIPELINE_CREATED, NA_EVF_FOUNDATIONAL);
     e.pipeline_kind = NA_PIPELINE_GRAPHICS;
@@ -2007,7 +2012,7 @@ HRESULT STDMETHODCALLTYPE D_CreateComputePipelineState(ID3D12Device* dev, const 
     const HRESULT hr = o_CreateComputePipelineState(dev, d, riid, out);
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj || !d) return hr;
-    g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;g_next_shader_readonly=true;g_next_pixel_position=false;
+    g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;g_next_shader_readonly=true;g_next_shader_rejection=0;g_next_pixel_position=false;
     na_ev_pipeline_created e;
     init_header(e, NA_EV_PIPELINE_CREATED, NA_EVF_FOUNDATIONAL);
     e.pipeline_kind = NA_PIPELINE_COMPUTE;
@@ -2081,7 +2086,7 @@ HRESULT STDMETHODCALLTYPE D_CreatePipelineState(ID3D12Device2* dev, const D3D12_
     const HRESULT hr = o_CreatePipelineState(dev, d, riid, out);
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj || !d || !d->pPipelineStateSubobjectStream) return hr;
-    g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;g_next_shader_readonly=true;g_next_pixel_position=false;
+    g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;g_next_shader_readonly=true;g_next_shader_rejection=0;g_next_pixel_position=false;
     na_ev_pipeline_created e;
     init_header(e, NA_EV_PIPELINE_CREATED, NA_EVF_FOUNDATIONAL);
     e.pipeline_kind = NA_PIPELINE_STREAM;
@@ -5479,6 +5484,7 @@ bool ListDrawState(ID3D12CommandList* list, DrawInfo& out)
             r.samples = p->sample_count; r.blend_mask = p->blend_enable_mask;
             r.native_hud_affine=pipeline->second.native_hud_affine;
             r.shader_readonly=pipeline->second.shader_readonly;
+            r.shader_rejection=pipeline->second.shader_rejection;
             r.pixel_position=pipeline->second.pixel_position;
             r.depth_enable = p->depth_enable; r.depth_func = p->depth_func;
         }

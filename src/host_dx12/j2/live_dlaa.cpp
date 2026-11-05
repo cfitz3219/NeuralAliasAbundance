@@ -4123,6 +4123,8 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
             extra("hud_n1", layer.n1, D3D12_RESOURCE_STATE_RENDER_TARGET);
             if(draw_picture){extra("hud_scene",layer.picture->Scene(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);extra("hud_full",layer.picture->Full(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);extra("hud_draw_mask",layer.picture->Mask(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);}
         }
+        if(layer.probe){extra("hud_probe_candidate",layer.probe->Full(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            ci.hud_probe_source=layer.probe_source;ci.hud_probe_generation=layer.probe_generation;}
         ci.evaluation_succeeded=dlss;
         if(replay&&layer.recording_identity)*layer.recording_identity=ci;
         if(!replay)capture = na::capture::j2::RecordEvaluation(l, cp, ci);
