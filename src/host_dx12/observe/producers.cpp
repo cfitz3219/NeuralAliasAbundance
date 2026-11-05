@@ -2545,8 +2545,14 @@ void make_pso_twins(IUnknown* pso, const void* rs, Make make, RecipeFn&& recipe_
     std::shared_ptr<const VariantRecipe> recipe;
     if (kind == 1) {
         recipe = recipe_fn();
-        for (int af = 0; af < 4; ++af)
-            if (rs_sets[af]) sets[af] = build_pso_set([&](ID3D12RootSignature* trs) { return make(0, trs); }, *rs_sets[af], nullptr);
+        // No pipeline twin is compiled here: this is the game's own creation call, often on the
+        // thread that pumps its window, and compiling a twin per level doubled or tripled the
+        // load (c3853df hung SE5's start-up for 40 s+ with AF 16x saved). The background worker
+        // builds the chosen variant; until then lookups use the game's pipeline and wake it.
+        (void)make;
+        for (int af = 0; af < 4; ++af) (void)rs_sets[af];
+        if (recipe && g_var_want.load(std::memory_order_relaxed) && !g_var_missing.exchange(true, std::memory_order_relaxed))
+            g_var_cv.notify_one();
         if (recipe) {
             auto r = std::const_pointer_cast<VariantRecipe>(recipe);
             r->rs_key = canon(rs);

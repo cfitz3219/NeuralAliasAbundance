@@ -400,12 +400,16 @@ int main(int argc, char** argv)
             // its pipeline twin is not built either.
             const uint64_t skips = m1.shared_skips - m0.shared_skips;
             CHECK(m1.twin_root_signatures + skips == m0.twin_root_signatures + 2);
-            CHECK(m1.twin_pipelines + skips == m0.twin_pipelines + 2);
+            // Pipeline twins are never compiled inside the game's creation call (c3853df start-up
+            // hang): the background worker builds the chosen level afterwards.
+            CHECK(m1.twin_pipelines == m0.twin_pipelines);
             CHECK(skips == 1);
             CHECK(m1.twin_failures == 0);
             na::observe::SetSamplerMipBiasLive(-0.5f);
             CHECK(na::observe::SamplerMipBias() == -0.5f);
-            REQUIRE(na::observe::WaitSamplerVariant(5000)); // prepared at creation: in use at once
+            REQUIRE(na::observe::WaitSamplerVariant(5000));
+            for (int i = 0; i < 500 && na::observe::GetMipLiveStats().twin_pipelines == m0.twin_pipelines; ++i) Sleep(10);
+            CHECK(na::observe::GetMipLiveStats().twin_pipelines == m0.twin_pipelines + 1); // -0.5 only
             CHECK(na::observe::GetMipLiveStats().live_bias == -0.5f);
             test::ComPtr<ID3D12CommandAllocator> la;
             test::ComPtr<ID3D12GraphicsCommandList> ll;
