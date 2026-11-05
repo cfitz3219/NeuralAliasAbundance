@@ -1339,6 +1339,7 @@ void DrawDlssDebug()
 
 } // namespace
 
+static void DrawExperimentalGpu();
 static void DrawDonutLighting();
 static void DrawAmbientOcclusion();
 
@@ -1358,7 +1359,9 @@ void RegisterLiveDlaaMenu()
     if (!registered(&DrawAmbientOcclusion))
         na::menu::Register({"XeGTAO", na::menu::Availability::Available, nullptr, &DrawAmbientOcclusion, na::menu::Page::Enhancements});
     if (!registered(&DrawDonutLighting))
-        na::menu::Register({"Lighting", na::menu::Availability::Available, nullptr, &DrawDonutLighting, na::menu::Page::Enhancements});
+        na::menu::Register({"Lighting", na::menu::Availability::Available, nullptr, &DrawDonutLighting, na::menu::Page::Experimental});
+    if (!registered(&DrawExperimentalGpu))
+        na::menu::Register({"GPU infrastructure", na::menu::Availability::Available, nullptr, &DrawExperimentalGpu, na::menu::Page::Experimental});
 }
 
 static void DrawExperimentalGpu()

@@ -41,6 +41,13 @@ int main() {
         na::menu::DrawPage(page,true);
         ImGui::End(); ImGui::Render();
     }
+    // Live-DLAA-only games must expose the same pages without Route A registration.
+    na::menu::Clear();na::overlay::RegisterLiveDlaaMenu();int effects=0;
+    for(int i=0;i<na::menu::Count();++i){const auto* section=na::menu::At(i);
+        if(!strcmp(section->title,"XeGTAO")){CHECK(section->page==na::menu::Page::Enhancements);++effects;}
+        if(!strcmp(section->title,"Lighting")||!strcmp(section->title,"GPU infrastructure")){CHECK(section->page==na::menu::Page::Experimental);++effects;}
+    }
+    CHECK(effects==3);
     ImGui::DestroyContext();
     return test::finish("route_a_menu_test");
 }
