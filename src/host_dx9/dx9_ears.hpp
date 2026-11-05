@@ -116,6 +116,8 @@ public:
     }
 
     // ---- events. Each Should*/fire answer means "run DLSS now, before forwarding the call".
+    // Whether a draw made now would be a scene draw (into the picked colour + depth).
+    bool NextDrawIsScene() const { return model_.IsSceneDraw(DrawEvent(0)); }
     bool BeforeDraw(uint64_t vertices)
     {
         const na::dx11::Event e = DrawEvent(vertices);

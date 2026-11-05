@@ -73,11 +73,13 @@ void FireLocked(IDirect3DDevice9* dev, int where, const FireInfo& info)
     if (FAILED(dev->QueryInterface(IID_PPV_ARGS(&on12))) || !on12) {
         if (!g_failed_logged) { Log("DLSS transport: this device is not on D3D9On12 (fallback d3d9), no DLSS"); g_failed_logged = true; }
         ++g_stats.skipped;
+        SetDlssLive(false);
         return;
     }
     if (!EnsureQueue(on12.Get())) {
         if (!g_failed_logged) { Log("DLSS transport: no D3D12 queue on 9On12's device"); g_failed_logged = true; }
         ++g_stats.skipped;
+        SetDlssLive(false);
         return;
     }
     // (Re)start the bridge for this size (resize, resolution change).
@@ -104,6 +106,7 @@ void FireLocked(IDirect3DDevice9* dev, int where, const FireInfo& info)
         if (SUCCEEDED(hc)) Hand(on12.Get(), info.color, nullptr, 0);
         if (g_logged < 5) { Log("DLSS transport: unwrap failed (colour 0x%08lx, depth 0x%08lx)", static_cast<unsigned long>(hc), static_cast<unsigned long>(hd)); ++g_logged; }
         ++g_stats.skipped;
+        SetDlssLive(false);
         return;
     }
 
@@ -114,6 +117,10 @@ void FireLocked(IDirect3DDevice9* dev, int where, const FireInfo& info)
     f.mode = static_cast<uint32_t>(na::bridge::Mode::DLAA);
     f.preset = g_cfg.preset;
     f.flags = na::bridge::kAutoExposure;
+    f.jitter_x = info.jitter_x;
+    f.jitter_y = info.jitter_y;
+    // Float scene colour (A16B16G16R16F, A32B32G32R32F, R16F..G32R32F) is HDR.
+    if (info.format >= static_cast<uint32_t>(D3DFMT_R16F) && info.format <= static_cast<uint32_t>(D3DFMT_A32B32G32R32F)) f.flags |= na::bridge::kHdr;
     if (!g_last_frame || info.frame != g_last_frame + 1) f.flags |= na::bridge::kReset; // first frame, or frames skipped
     g_last_frame = info.frame;
 
@@ -123,6 +130,9 @@ void FireLocked(IDirect3DDevice9* dev, int where, const FireInfo& info)
     Hand(on12.Get(), info.color, fence, value);
     Hand(on12.Get(), info.depth, fence, value);
 
+    // Jitter (mode 1) runs only while DLSS delivers; the copy test has no DLSS.
+    if (r == na::bridge::Result::Ok) SetDlssLive(!g_cfg.copy_test);
+    else if (r == na::bridge::Result::Failed) SetDlssLive(false);
     switch (r) {
     case na::bridge::Result::Ok: ++g_stats.ok; break;
     case na::bridge::Result::Repeated: ++g_stats.repeated; break;
@@ -163,6 +173,7 @@ void StartTransport(const TransportConfig& cfg, ID3D12Device* device, ID3D12Comm
     g_device = device;
     g_queue = queue;
     g_bridge.Stop();
+    SetDlssLive(false);
     g_failed_logged = false;
     g_logged = 0;
     SetFire(cfg.enabled ? &Fire : nullptr);

@@ -11,14 +11,19 @@
 // the fire function pass straight through.
 #include "host_dx9/dx9_hooks.hpp"
 
+#include "core/temporal_jitter.hpp"
 #include "host_dx9/dx9_ears.hpp"
+#include "host_dx9/vs_patch.hpp"
 #include "host_dx9/vtable_hook.hpp"
 
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 using Microsoft::WRL::ComPtr;
 
@@ -39,6 +44,30 @@ struct SurfaceInfo {
     D3DSURFACE_DESC desc{};
 };
 std::unordered_map<IDirect3DSurface9*, SurfaceInfo> g_surfaces; // under g_mu
+
+// ---- D5 jitter, all under g_mu.
+// Patched vertex shaders read the jitter from constant register g_cj (see
+// vs_patch.hpp); before each draw the device's cJ is set to the jitter (scene
+// draw), zero (other draws) or the game's own value (unpatched shader), only
+// when it changes. Fixed-function scene draws get a jittered projection the
+// same way. The mip bias is added to the game's own on all 16 samplers.
+JitterConfig g_jcfg;
+std::atomic<bool> g_dlss_live{false};
+uint32_t g_cj = 0;                       // 0 = no patching
+std::unordered_set<const void*> g_patched;
+bool g_vs_bound = false, g_vs_patched = false;
+bool g_jitter_on = false;                // this frame
+float g_jx = 0, g_jy = 0;                // this frame
+uint32_t g_jitter_index = 0;
+float g_game_cj[4]{}, g_dev_cj[4]{};
+bool g_dev_cj_known = false;
+D3DMATRIX g_game_proj{}, g_dev_proj{};
+bool g_have_game_proj = false, g_dev_proj_known = false;
+constexpr DWORD kSamplers = 16;
+float g_samp_game[kSamplers]{};
+float g_bias_now = 0;
+uint32_t g_frame_jittered = 0, g_frame_unjittered = 0;
+uint32_t g_patch_logs = 0;
 
 bool Watched(const void* dev) { return dev && dev == static_cast<const void*>(g_dev.load(std::memory_order_acquire)) && !t_in_fire; }
 
@@ -79,7 +108,13 @@ FireInfo InfoLocked()
     i.depth = reinterpret_cast<IDirect3DResource9*>(static_cast<uintptr_t>(sel.depth));
     i.width = sel.color_info.width;
     i.height = sel.color_info.height;
+    i.format = sel.color_info.format;
     i.frame = g_ears.Stats().frames;
+    // The jitter DLSS is told: this frame's, when most scene draws so far carried it.
+    if (g_jitter_on && g_frame_jittered > g_frame_unjittered) {
+        i.jitter_x = g_jx;
+        i.jitter_y = g_jy;
+    }
     return i;
 }
 
@@ -92,6 +127,8 @@ void Fire(IDirect3DDevice9* dev, int where, const FireInfo& info)
     f(dev, where, info);
     t_in_fire = false;
 }
+
+void WriteBias(IDirect3DDevice9* dev);
 
 // Re-reads the state a state block or Reset may have changed behind our back.
 void Resync(IDirect3DDevice9* dev)
@@ -108,6 +145,28 @@ void Resync(IDirect3DDevice9* dev)
     D3DMATRIX v{}, p{};
     const bool have_view = SUCCEEDED(dev->GetTransform(D3DTS_VIEW, &v));
     const bool have_proj = SUCCEEDED(dev->GetTransform(D3DTS_PROJECTION, &p));
+    float bias[kSamplers]{};
+    for (DWORD i = 0; i < kSamplers; ++i) {
+        DWORD b = 0;
+        dev->GetSamplerState(i, D3DSAMP_MIPMAPLODBIAS, &b);
+        std::memcpy(&bias[i], &b, 4);
+    }
+    {
+        std::lock_guard<std::mutex> l(g_mu);
+        // What differs from what we last wrote is the game's own (a state block, or Reset's defaults).
+        if (have_regs && g_cj && (!g_dev_cj_known || std::memcmp(&regs[g_cj * 4], g_dev_cj, 16) != 0))
+            std::memcpy(g_game_cj, &regs[g_cj * 4], 16);
+        if (have_proj && (!g_dev_proj_known || std::memcmp(&p, &g_dev_proj, sizeof(p)) != 0)) {
+            g_game_proj = p;
+            g_have_game_proj = true;
+        }
+        g_dev_cj_known = g_dev_proj_known = false;
+        for (DWORD i = 0; i < kSamplers; ++i)
+            if (std::fabs(bias[i] - (g_samp_game[i] + g_bias_now)) > 1e-6f) g_samp_game[i] = bias[i];
+        g_vs_bound = vs != nullptr;
+        g_vs_patched = vs && g_patched.count(vs.Get()) != 0;
+    }
+    WriteBias(dev);
     std::lock_guard<std::mutex> l(g_mu);
     const SurfaceInfo& r = Describe(rt.Get());
     g_ears.SetRenderTarget0(r.id, r.info);
@@ -141,6 +200,8 @@ HRESULT WINAPI Present_h(IDirect3DDevice9*, const RECT*, const RECT*, HWND, cons
 HRESULT WINAPI PresentEx_h(IDirect3DDevice9Ex*, const RECT*, const RECT*, HWND, const RGNDATA*, DWORD);
 HRESULT WINAPI SwapChainPresent_h(IDirect3DSwapChain9*, const RECT*, const RECT*, HWND, const RGNDATA*, DWORD);
 HRESULT WINAPI StateBlockApply_h(IDirect3DStateBlock9*);
+HRESULT WINAPI CreateVertexShader_h(IDirect3DDevice9*, const DWORD*, IDirect3DVertexShader9**);
+HRESULT WINAPI SetSamplerState_h(IDirect3DDevice9*, DWORD, D3DSAMPLERSTATETYPE, DWORD);
 
 // IDirect3DDevice9 vtable slots (d3d9.h order).
 Method m_set_rt{37, reinterpret_cast<void*>(&SetRenderTarget_h)};
@@ -161,6 +222,95 @@ Method m_present{17, reinterpret_cast<void*>(&Present_h)};
 Method m_present_ex{121, reinterpret_cast<void*>(&PresentEx_h)};
 Method m_sc_present{3, reinterpret_cast<void*>(&SwapChainPresent_h)};
 Method m_sb_apply{5, reinterpret_cast<void*>(&StateBlockApply_h)};
+Method m_create_vs{91, reinterpret_cast<void*>(&CreateVertexShader_h)};
+Method m_set_sampler{69, reinterpret_cast<void*>(&SetSamplerState_h)};
+
+using SetVscFn = HRESULT(WINAPI*)(IDirect3DDevice9*, UINT, const float*, UINT);
+using SetTransformFn = HRESULT(WINAPI*)(IDirect3DDevice9*, D3DTRANSFORMSTATETYPE, const D3DMATRIX*);
+using SetSamplerFn = HRESULT(WINAPI*)(IDirect3DDevice9*, DWORD, D3DSAMPLERSTATETYPE, DWORD);
+
+// The game's mip bias plus ours on every sampler (through the original: the game never sees it).
+void WriteBias(IDirect3DDevice9* dev)
+{
+    float v[kSamplers];
+    {
+        std::lock_guard<std::mutex> l(g_mu);
+        for (DWORD i = 0; i < kSamplers; ++i) v[i] = g_samp_game[i] + g_bias_now;
+    }
+    const auto orig = m_set_sampler.Original<SetSamplerFn>(dev);
+    if (!orig) return;
+    for (DWORD i = 0; i < kSamplers; ++i) {
+        DWORD b;
+        std::memcpy(&b, &v[i], 4);
+        orig(dev, i, D3DSAMP_MIPMAPLODBIAS, b);
+    }
+}
+
+// What a draw needs set first: cJ, or the fixed-function projection.
+struct DrawFix {
+    bool cj = false, proj = false;
+    uint32_t reg = 0;
+    float v[4]{};
+    D3DMATRIX m{};
+};
+
+DrawFix PlanDrawLocked()
+{
+    DrawFix f;
+    if (!g_jcfg.mode) return f;
+    const bool scene = g_ears.NextDrawIsScene();
+    const bool jit = scene && g_jitter_on;
+    const auto& ci = g_ears.Model().Current().color_info;
+    const float dx = ci.width ? 2.f * g_jx / static_cast<float>(ci.width) : 0.f;
+    const float dy = ci.height ? -2.f * g_jy / static_cast<float>(ci.height) : 0.f;
+    if (g_vs_bound) {
+        if (!g_cj) {
+            if (jit) ++g_frame_unjittered;
+            return f;
+        }
+        float want[4] = {0, 0, 0, 0};
+        if (g_vs_patched) {
+            if (jit) { want[0] = dx; want[1] = dy; ++g_frame_jittered; }
+        } else {
+            std::memcpy(want, g_game_cj, 16);
+            if (jit) ++g_frame_unjittered;
+        }
+        if (!g_dev_cj_known || std::memcmp(want, g_dev_cj, 16) != 0) {
+            std::memcpy(g_dev_cj, want, 16);
+            g_dev_cj_known = true;
+            f.cj = true;
+            f.reg = g_cj;
+            std::memcpy(f.v, want, 16);
+        }
+    } else if (g_have_game_proj) {
+        // Row vectors: clip = v * P, so clip.x += dx * clip.w is column 0 += dx * column 3.
+        D3DMATRIX want = g_game_proj;
+        if (jit) {
+            for (int r = 0; r < 4; ++r) {
+                want.m[r][0] += dx * g_game_proj.m[r][3];
+                want.m[r][1] += dy * g_game_proj.m[r][3];
+            }
+            ++g_frame_jittered;
+        }
+        if (!g_dev_proj_known || std::memcmp(&want, &g_dev_proj, sizeof(want)) != 0) {
+            g_dev_proj = want;
+            g_dev_proj_known = true;
+            f.proj = true;
+            f.m = want;
+        }
+    } else if (jit) {
+        ++g_frame_unjittered;
+    }
+    return f;
+}
+
+void ApplyDrawFix(IDirect3DDevice9* dev, const DrawFix& f)
+{
+    if (f.cj)
+        if (const auto o = m_set_vsc.Original<SetVscFn>(dev)) o(dev, f.reg, f.v, 1);
+    if (f.proj)
+        if (const auto o = m_set_transform.Original<SetTransformFn>(dev)) o(dev, D3DTS_PROJECTION, &f.m);
+}
 
 HRESULT WINAPI SetRenderTarget_h(IDirect3DDevice9* self, DWORD index, IDirect3DSurface9* s)
 {
@@ -206,6 +356,10 @@ HRESULT WINAPI SetTransform_h(IDirect3DDevice9* self, D3DTRANSFORMSTATETYPE stat
     if ((state == D3DTS_VIEW || state == D3DTS_PROJECTION) && m && Watched(self)) {
         std::lock_guard<std::mutex> l(g_mu);
         g_ears.SetTransform(static_cast<uint32_t>(state), &m->_11);
+        if (state == D3DTS_PROJECTION) {
+            g_game_proj = g_dev_proj = *m;
+            g_have_game_proj = g_dev_proj_known = true;
+        }
     }
     return orig(self, state, m);
 }
@@ -282,6 +436,7 @@ void DrawOf(IDirect3DDevice9* dev, uint64_t vertices)
 {
     bool fire = false;
     FireInfo info;
+    DrawFix f;
     {
         std::lock_guard<std::mutex> l(g_mu);
         if (g_ears.BeforeDraw(vertices)) {
@@ -290,8 +445,10 @@ void DrawOf(IDirect3DDevice9* dev, uint64_t vertices)
             fire = true;
         }
         g_ears.Draw(vertices);
+        f = PlanDrawLocked();
     }
     if (fire) Fire(dev, 2, info);
+    ApplyDrawFix(dev, f);
 }
 
 HRESULT WINAPI DrawPrimitive_h(IDirect3DDevice9* self, D3DPRIMITIVETYPE type, UINT start, UINT count)
@@ -335,6 +492,8 @@ HRESULT WINAPI SetVertexShader_h(IDirect3DDevice9* self, IDirect3DVertexShader9*
     if (Watched(self)) {
         std::lock_guard<std::mutex> l(g_mu);
         g_ears.SetVertexShader(vs != nullptr);
+        g_vs_bound = vs != nullptr;
+        g_vs_patched = vs && g_patched.count(vs) != 0;
     }
     return orig(self, vs);
 }
@@ -346,8 +505,66 @@ HRESULT WINAPI SetVertexShaderConstantF_h(IDirect3DDevice9* self, UINT start, co
     if (data && Watched(self)) {
         std::lock_guard<std::mutex> l(g_mu);
         g_ears.SetVsConstants(start, data, count);
+        if (g_cj && g_cj >= start && g_cj - start < count) { // the game's own value of cJ (for its unpatched shaders)
+            std::memcpy(g_game_cj, data + (g_cj - start) * 4, 16);
+            std::memcpy(g_dev_cj, g_game_cj, 16);
+            g_dev_cj_known = true;
+        }
     }
     return orig(self, start, data, count);
+}
+
+HRESULT WINAPI CreateVertexShader_h(IDirect3DDevice9* self, const DWORD* fn, IDirect3DVertexShader9** out)
+{
+    using F = HRESULT(WINAPI*)(IDirect3DDevice9*, const DWORD*, IDirect3DVertexShader9**);
+    NA_ORIG(m_create_vs, F);
+    uint32_t cj = 0;
+    if (fn && out && Watched(self)) {
+        std::lock_guard<std::mutex> l(g_mu);
+        cj = g_cj;
+    }
+    if (!cj) return orig(self, fn, out);
+    const VsPatch p = PatchVertexShader(reinterpret_cast<const uint32_t*>(fn), size_t(1) << 20, cj);
+    if (p.ok) {
+        const HRESULT hr = orig(self, reinterpret_cast<const DWORD*>(p.code.data()), out);
+        if (SUCCEEDED(hr) && *out) {
+            std::lock_guard<std::mutex> l(g_mu);
+            g_patched.insert(*out);
+            ++g_stats.shaders_patched;
+            if (p.relative_constants && g_patch_logs < 8) {
+                ++g_patch_logs;
+                Log("vs_%u_%u patched (r%u); it indexes constants with a0, c%u assumed out of its range", p.major, p.minor, p.temp, cj);
+            }
+            return hr;
+        }
+        std::lock_guard<std::mutex> l(g_mu);
+        if (g_patch_logs < 8) { ++g_patch_logs; Log("vs_%u_%u: the runtime refused the patched shader (0x%08lx), original kept", p.major, p.minor, static_cast<unsigned long>(hr)); }
+    } else {
+        std::lock_guard<std::mutex> l(g_mu);
+        if (g_patch_logs < 8) { ++g_patch_logs; Log("vertex shader not patched (no jitter on its draws): %s", p.why); }
+    }
+    const HRESULT hr = orig(self, fn, out);
+    if (SUCCEEDED(hr) && *out) {
+        std::lock_guard<std::mutex> l(g_mu);
+        g_patched.erase(*out); // a freed patched shader's address can come back
+        ++g_stats.shaders_unpatched;
+    }
+    return hr;
+}
+
+HRESULT WINAPI SetSamplerState_h(IDirect3DDevice9* self, DWORD sampler, D3DSAMPLERSTATETYPE type, DWORD value)
+{
+    using F = HRESULT(WINAPI*)(IDirect3DDevice9*, DWORD, D3DSAMPLERSTATETYPE, DWORD);
+    NA_ORIG(m_set_sampler, F);
+    if (type == D3DSAMP_MIPMAPLODBIAS && sampler < kSamplers && Watched(self)) {
+        float v = 0;
+        std::memcpy(&v, &value, 4);
+        std::lock_guard<std::mutex> l(g_mu);
+        g_samp_game[sampler] = v;
+        v += g_bias_now;
+        std::memcpy(&value, &v, 4);
+    }
+    return orig(self, sampler, type, value);
 }
 
 void PublishLocked()
@@ -371,6 +588,35 @@ void PublishLocked()
     g_stats.color_h = sel.color_info.height;
     g_stats.color_format = sel.color_info.format;
     g_stats.depth_format = sel.depth_info.format;
+    g_stats.jitter_on = g_jitter_on ? 1u : 0u;
+    g_stats.jitter_register = g_cj;
+    g_stats.jitter_x = g_jx;
+    g_stats.jitter_y = g_jy;
+    g_stats.mip_bias = g_bias_now;
+}
+
+// The start of the next frame: is it jittered, and by how much. Returns
+// whether the mip bias changed (the samplers are then rewritten).
+bool NextFrameLocked()
+{
+    g_stats.jittered_draws = g_frame_jittered;
+    g_stats.unjittered_scene_draws = g_frame_unjittered;
+    g_frame_jittered = g_frame_unjittered = 0;
+    const bool was = g_jitter_on;
+    g_jitter_on = g_jcfg.mode == 2 || (g_jcfg.mode == 1 && g_dlss_live.load(std::memory_order_acquire));
+    if (g_jitter_on) {
+        const auto js = neural_alias::temporal_jitter(g_jitter_index++, std::clamp<uint32_t>(g_jcfg.phases, 2u, 64u));
+        g_jx = static_cast<float>(js.x_pixels);
+        g_jy = static_cast<float>(js.y_pixels);
+    } else {
+        g_jx = g_jy = 0;
+    }
+    if (was != g_jitter_on)
+        Log("frame %u: jitter %s", g_stats.frames, g_jitter_on ? "on" : "off (DLSS is not delivering)");
+    const float bias = g_jitter_on ? g_jcfg.mip_bias : 0.f;
+    if (bias == g_bias_now) return false;
+    g_bias_now = bias;
+    return true;
 }
 
 // End of a frame: the Present fallback point, then the ears learn.
@@ -387,8 +633,9 @@ void FrameEnd(IDirect3DDevice9* dev)
         }
     }
     if (fire) Fire(dev, 3, info);
-    std::lock_guard<std::mutex> l(g_mu);
+    std::unique_lock<std::mutex> l(g_mu);
     g_ears.Present();
+    const bool bias_changed = NextFrameLocked();
     PublishLocked();
     const auto& sel = g_ears.Model().Current();
     if (sel.color != g_last_color || sel.depth != g_last_depth) {
@@ -405,7 +652,13 @@ void FrameEnd(IDirect3DDevice9* dev)
             static_cast<unsigned long long>(ms.contradictions),
             g_stats.camera_source == 1 ? "shader constants" : g_stats.camera_source == 2 ? "fixed function" : "none", g_stats.camera_register,
             g_stats.scene_draws, g_stats.draws);
+        if (g_cj)
+            Log("frame %u: jitter %s (%.3f, %.3f) via c%u, mip bias %.2f; shaders patched %u, unpatched %u; last frame %u draws jittered, %u scene draws not",
+                g_stats.frames, g_jitter_on ? "on" : "off", g_jx, g_jy, g_cj, g_bias_now, g_stats.shaders_patched, g_stats.shaders_unpatched,
+                g_stats.jittered_draws, g_stats.unjittered_scene_draws);
     }
+    l.unlock();
+    if (bias_changed) WriteBias(dev);
 }
 
 HRESULT WINAPI Present_h(IDirect3DDevice9* self, const RECT* sr, const RECT* dr, HWND w, const RGNDATA* dirty)
@@ -465,7 +718,7 @@ void AttachDevice(IDirect3DDevice9* dev, const D3DPRESENT_PARAMETERS* pp)
     if (!dev) return;
     int failed = 0;
     for (Method* m : {&m_set_rt, &m_set_ds, &m_clear, &m_set_transform, &m_set_rs, &m_set_texture, &m_stretch, &m_get_rtdata, &m_draw,
-                      &m_draw_indexed, &m_draw_up, &m_draw_indexed_up, &m_set_vs, &m_set_vsc, &m_present})
+                      &m_draw_indexed, &m_draw_up, &m_draw_indexed_up, &m_set_vs, &m_set_vsc, &m_present, &m_create_vs, &m_set_sampler})
         if (!HookMethod(*m, dev)) ++failed;
     ComPtr<IDirect3DDevice9Ex> ex;
     if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&ex))) && ex && !HookMethod(m_present_ex, ex.Get())) ++failed;
@@ -479,11 +732,27 @@ void AttachDevice(IDirect3DDevice9* dev, const D3DPRESENT_PARAMETERS* pp)
         g_ears.Reset();
         g_surfaces.clear();
         g_last_color = g_last_depth = 0;
+        // D5: the jitter register is the last constant the device has (a shader that reads it is left unpatched).
+        D3DCAPS9 caps{};
+        const DWORD consts = SUCCEEDED(dev->GetDeviceCaps(&caps)) ? std::min<DWORD>(caps.MaxVertexShaderConst, 256) : 0;
+        g_cj = g_jcfg.mode && consts >= 16 ? consts - 1 : 0;
+        g_patched.clear();
+        g_vs_bound = g_vs_patched = false;
+        g_jitter_on = false;
+        g_jx = g_jy = 0;
+        g_dev_cj_known = g_dev_proj_known = g_have_game_proj = false;
+        std::memset(g_game_cj, 0, sizeof(g_game_cj));
+        std::memset(g_samp_game, 0, sizeof(g_samp_game));
+        g_bias_now = 0;
+        g_frame_jittered = g_frame_unjittered = 0;
+        g_stats.shaders_patched = g_stats.shaders_unpatched = 0;
+        g_patch_logs = 0;
     }
     g_dev.store(dev, std::memory_order_release);
     SetSwapSize(pp);
     Resync(dev);
-    Log("watching device %p (%ux%u)", static_cast<void*>(dev), pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0);
+    Log("watching device %p (%ux%u); jitter mode %u, %u phases, mip bias %.2f, register c%u", static_cast<void*>(dev),
+        pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0, g_jcfg.mode, g_jcfg.phases, g_jcfg.mip_bias, g_cj);
 }
 
 void BeforeReset(IDirect3DDevice9* dev)
@@ -509,5 +778,13 @@ HookStats GetHookStats()
 }
 
 void SetFire(FireFn fn) { g_fire.store(fn, std::memory_order_release); }
+
+void SetJitterConfig(const JitterConfig& c)
+{
+    std::lock_guard<std::mutex> l(g_mu);
+    g_jcfg = c;
+}
+
+void SetDlssLive(bool live) { g_dlss_live.store(live, std::memory_order_release); }
 
 } // namespace na::dx9

@@ -22,8 +22,10 @@
 #include <MinHook.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -47,6 +49,9 @@ struct Config {
     bool dlss = true;       // run the DLSS transport at the point the hooks find
     bool copy_test = false; // transport test: the helper copies, the way back swaps red/blue
     uint32_t preset = 0;
+    uint32_t jitter = 1;        // 0 off, 1 while DLSS delivers, 2 always (test)
+    uint32_t jitter_phases = 8;
+    float mip_bias = -1.f;      // while jittering
     std::wstring log_path;
 };
 
@@ -125,7 +130,12 @@ const Config& Cfg()
         g_cfg.dlss = GetPrivateProfileIntW(L"dx9", L"dlss", 1, ini.c_str()) == 1;
         g_cfg.copy_test = GetPrivateProfileIntW(L"dx9", L"copy_test", 0, ini.c_str()) == 1;
         g_cfg.preset = static_cast<uint32_t>(GetPrivateProfileIntW(L"dx9", L"preset", 0, ini.c_str()));
+        g_cfg.jitter = static_cast<uint32_t>(GetPrivateProfileIntW(L"dx9", L"jitter", 1, ini.c_str()));
+        g_cfg.jitter_phases = static_cast<uint32_t>(GetPrivateProfileIntW(L"dx9", L"jitter_phases", 8, ini.c_str()));
         wchar_t b[MAX_PATH]{};
+        GetPrivateProfileStringW(L"dx9", L"mip_bias", L"-1", b, MAX_PATH, ini.c_str());
+        g_cfg.mip_bias = std::clamp(static_cast<float>(_wtof(b)), -3.f, 0.f);
+        b[0] = 0;
         GetPrivateProfileStringW(L"dx9", L"log", L"", b, MAX_PATH, ini.c_str());
         g_cfg.log_path = b;
         OpenLog();
@@ -133,8 +143,9 @@ const Config& Cfg()
         GetModuleFileNameW(nullptr, exe, MAX_PATH);
         char exe8[MAX_PATH * 3]{};
         WideCharToMultiByte(CP_UTF8, 0, exe, -1, exe8, sizeof(exe8), nullptr, nullptr);
-        Log("NeuralAlias DX9 proxy (%d-bit) in %s: borderless=%d own_device=%d dlss=%d preset=%u%s", static_cast<int>(sizeof(void*) * 8), exe8,
-            g_cfg.borderless ? 1 : 0, g_cfg.own_device ? 1 : 0, g_cfg.dlss ? 1 : 0, g_cfg.preset, g_cfg.copy_test ? " COPY TEST (no DLSS)" : "");
+        Log("NeuralAlias DX9 proxy (%d-bit) in %s: borderless=%d own_device=%d dlss=%d preset=%u jitter=%u phases=%u mip_bias=%.2f%s",
+            static_cast<int>(sizeof(void*) * 8), exe8, g_cfg.borderless ? 1 : 0, g_cfg.own_device ? 1 : 0, g_cfg.dlss ? 1 : 0, g_cfg.preset,
+            g_cfg.jitter, g_cfg.jitter_phases, g_cfg.mip_bias, g_cfg.copy_test ? " COPY TEST (no DLSS)" : "");
     });
     return g_cfg;
 }
@@ -223,6 +234,11 @@ void Created(IDirect3DDevice9* dev, const D3DPRESENT_PARAMETERS* pp, DWORD flags
         pp ? pp->BackBufferHeight : 0, pp ? static_cast<int>(pp->BackBufferFormat) : 0, pp ? static_cast<int>(pp->AutoDepthStencilFormat) : 0,
         pp ? pp->EnableAutoDepthStencil : 0, pp ? static_cast<int>(pp->MultiSampleType) : 0, pp ? pp->Windowed : 0, static_cast<unsigned long>(flags));
     HookDevice(dev);
+    na::dx9::JitterConfig jc;
+    jc.mode = Cfg().jitter;
+    jc.phases = Cfg().jitter_phases;
+    jc.mip_bias = Cfg().mip_bias;
+    na::dx9::SetJitterConfig(jc);
     na::dx9::AttachDevice(dev, pp);
     na::dx9::TransportConfig tc;
     tc.enabled = Cfg().dlss;

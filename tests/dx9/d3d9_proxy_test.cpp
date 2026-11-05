@@ -20,6 +20,7 @@
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <cmath>
 
 #include <cstdio>
@@ -96,7 +97,8 @@ struct V3 { float x, y, z; DWORD c; };
 struct VT { float x, y, z, rhw, u, v; };
 struct VD { float x, y, z, rhw; DWORD c; };
 
-bool g_copy = false; // copy-test mode: the transport runs, the helper copies, the way back swaps red/blue
+bool g_copy = false;   // copy-test mode: the transport runs, the helper copies, the way back swaps red/blue
+bool g_jitter = false; // jitter mode (D5): jitter always on, no DLSS; the picture's shift is measured
 
 // Reads one back-buffer pixel (X8R8G8B8) as 0xRRGGBB.
 bool PixelAt(IDirect3DDevice9* dev, UINT w, UINT h, UINT x, UINT y, DWORD* out)
@@ -150,7 +152,8 @@ bool RunGame(IDirect3DDevice9* dev, PFN_Status status, bool post, UINT w, UINT h
     ComPtr<IDirect3DTexture9> scene;
     ComPtr<IDirect3DSurface9> scene_rt, depth, back, auto_depth;
     if (post) {
-        dev->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &scene, nullptr);
+        if (g_jitter) dev->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A32B32G32R32F, D3DPOOL_DEFAULT, &scene, nullptr);
+        if (!scene) dev->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &scene, nullptr);
         if (!scene) dev->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &scene, nullptr);
         if (scene) scene->GetSurfaceLevel(0, &scene_rt);
         dev->CreateDepthStencilSurface(w, h, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, 0, TRUE, &depth, nullptr);
@@ -166,12 +169,32 @@ bool RunGame(IDirect3DDevice9* dev, PFN_Status status, bool post, UINT w, UINT h
     const DWORD hud_c = D3DCOLOR_XRGB(0, 200, 100);
     const VD hud[] = {{8, 8, 0, 1, hud_c}, {64, 8, 0, 1, hud_c}, {8, 24, 0, 1, hud_c}, {64, 24, 0, 1, hud_c}};
 
-    // Frames until the transport delivers (the helper takes a moment to start), at least 8.
+    // Jitter mode: a 16 x 16 pixel scene quad near the top-right corner whose
+    // colour is red = x, green = y across it (0..1), drawn in clip space (c0 =
+    // identity). The jitter moves it by (jx, jy) pixels, so at its middle pixel
+    // 16 r + jx and 16 g + jy must stay the same from frame to frame.
+    const float qx0 = sw - 24, qy0 = 8, qx1 = qx0 + 16, qy1 = qy0 + 16;
+    auto ndc_x = [&](float px) { return 2.f * px / sw - 1.f; };
+    auto ndc_y = [&](float py) { return 1.f - 2.f * py / sh; };
+    const V3 probe[] = {{ndc_x(qx0), ndc_y(qy0), 0, D3DCOLOR_ARGB(255, 0, 0, 0)}, {ndc_x(qx1), ndc_y(qy0), 0, D3DCOLOR_ARGB(255, 255, 0, 0)},
+                        {ndc_x(qx0), ndc_y(qy1), 0, D3DCOLOR_ARGB(255, 0, 255, 0)}, {ndc_x(qx1), ndc_y(qy1), 0, D3DCOLOR_ARGB(255, 255, 255, 0)}};
+    const bool measure = g_jitter && post;
+    ComPtr<IDirect3DSurface9> sys;
+    if (measure) {
+        D3DSURFACE_DESC sd{};
+        scene_rt->GetDesc(&sd);
+        dev->CreateOffscreenPlainSurface(w, h, sd.Format, D3DPOOL_SYSTEMMEM, &sys, nullptr);
+        Check(sd.Format == D3DFMT_A32B32G32R32F && sys, "jitter test: a 32-bit float scene target to measure in");
+    }
+    double lo_x = 1e9, hi_x = -1e9, lo_y = 1e9, hi_y = -1e9, jx_lo = 1e9, jx_hi = -1e9;
+    int samples = 0;
+
+    // Frames until the transport delivers (the helper takes a moment to start), at least 8 (16 when measuring).
     const ULONGLONG t0 = GetTickCount64();
     DWORD corner = 0, hud_px = 0;
     for (int frame = 0;; ++frame) {
         const auto now = Status(status).transport;
-        const bool last = frame >= 8 && (!g_copy || now.ok >= 3 || GetTickCount64() - t0 > 20000);
+        const bool last = frame >= (measure ? 16 : 8) && (!g_copy || now.ok >= 3 || GetTickCount64() - t0 > 20000);
         const double ys = 1.0 / std::tan(0.5), xs = ys * sh / sw, q = 1000.0 / (1000.0 - 0.1);
         const M proj{xs, 0, 0, 0, 0, ys, 0, 0, 0, 0, q, 1, 0, 0, -0.1 * q, 0};
         const double a = 0.02 * frame, c = std::cos(a), s = std::sin(a);
@@ -202,6 +225,15 @@ bool RunGame(IDirect3DDevice9* dev, PFN_Status status, bool post, UINT w, UINT h
             dev->SetVertexShaderConstantF(0, r, 4);
             dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, tri, sizeof(V3));
         }
+        if (g_jitter) {
+            const float id[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+            dev->SetVertexShaderConstantF(0, id, 4);
+            dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+            dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+            dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, probe, sizeof(V3));
+            dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+            dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+        }
         dev->SetVertexShader(nullptr);
         dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
         if (post) {
@@ -218,6 +250,22 @@ bool RunGame(IDirect3DDevice9* dev, PFN_Status status, bool post, UINT w, UINT h
         dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
         dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, hud, sizeof(VD));
         dev->EndScene();
+        if (measure && frame >= 4 && sys && SUCCEEDED(dev->GetRenderTargetData(scene_rt.Get(), sys.Get()))) {
+            const auto k = Status(status).hooks; // this frame's jitter (published at its start)
+            D3DLOCKED_RECT lr{};
+            if (k.jitter_on && SUCCEEDED(sys->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
+                const float* px = reinterpret_cast<const float*>(static_cast<const BYTE*>(lr.pBits) + static_cast<size_t>(qy0 + 8) * lr.Pitch) +
+                                  static_cast<size_t>(qx0 + 8) * 4;
+                // D3DFMT_A32B32G32R32F is stored R, G, B, A.
+                const double ux = 16.0 * px[0] + k.jitter_x, uy = 16.0 * px[1] + k.jitter_y;
+                lo_x = std::min(lo_x, ux); hi_x = std::max(hi_x, ux);
+                lo_y = std::min(lo_y, uy); hi_y = std::max(hi_y, uy);
+                jx_lo = std::min<double>(jx_lo, k.jitter_x); jx_hi = std::max<double>(jx_hi, k.jitter_x);
+                if (samples < 4) std::printf("     frame %d: jitter (%.4f, %.4f), probe (%.5f, %.5f) -> 16r+jx %.4f, 16g+jy %.4f\n", frame, k.jitter_x, k.jitter_y, px[0], px[1], ux, uy);
+                ++samples;
+                sys->UnlockRect();
+            }
+        }
         if (last) {
             PixelAt(dev, w, h, 4, h - 4, &corner);
             PixelAt(dev, w, h, 30, 15, &hud_px);
@@ -235,7 +283,22 @@ bool RunGame(IDirect3DDevice9* dev, PFN_Status status, bool post, UINT w, UINT h
                 k.fired_read, k.fired_hud, k.fired_present, k.camera_found, k.camera_source, k.camera_register, k.scene_draws, k.draws);
     Check(k.selected && k.color_w == w && k.color_h == h, post ? "post game: scene colour + depth picked" : "back-buffer game: back buffer + depth picked");
     Check(k.camera_found && k.camera_source == 1 && k.camera_register == 8, "camera found in the shader constants at c8");
-    Check(k.scene_draws == 40, "the 40 objects are the scene draws (HUD and tonemap are not)");
+    Check(k.scene_draws == (g_jitter ? 41u : 40u), "the 40 objects are the scene draws (HUD and tonemap are not)");
+    std::printf("     jitter: on %u (%.4f, %.4f) c%u, mip bias %.2f, shaders patched %u unpatched %u, last frame %u jittered, %u scene draws not\n",
+                k.jitter_on, k.jitter_x, k.jitter_y, k.jitter_register, k.mip_bias, k.shaders_patched, k.shaders_unpatched, k.jittered_draws,
+                k.unjittered_scene_draws);
+    Check(k.shaders_patched >= 1 && k.jitter_register >= 15, "the game's vertex shader was patched for jitter");
+    if (g_jitter) {
+        Check(k.jitter_on == 1 && k.jittered_draws == k.scene_draws && k.unjittered_scene_draws == 0, "jitter mode: every scene draw jittered");
+        if (measure) {
+            std::printf("     measured over %d frames: 16r+jx in [%.4f, %.4f], 16g+jy in [%.4f, %.4f], jitter x in [%.3f, %.3f]\n", samples, lo_x, hi_x,
+                        lo_y, hi_y, jx_lo, jx_hi);
+            Check(samples >= 8 && jx_hi - jx_lo > 0.3, "jitter test: the jitter moves from frame to frame");
+            Check(hi_x - lo_x < 0.02 && hi_y - lo_y < 0.02, "jitter test: the picture moves by exactly the jitter told (within 0.02 px)");
+        }
+    } else {
+        Check(k.jitter_on == 0 && k.jittered_draws == 0, "no DLSS delivering here: no jitter");
+    }
     if (post) Check(k.point_kind == 1 && k.fired_read >= 1, "post game: DLSS point before the tonemap's read of the scene");
     else Check(k.point_kind == 2 && k.fired_hud >= 1, "back-buffer game: DLSS point before the HUD (HUD rule)");
     const auto& t = st.transport;
@@ -259,11 +322,12 @@ bool RunGame(IDirect3DDevice9* dev, PFN_Status status, bool post, UINT w, UINT h
 int main(int argc, char** argv)
 {
     if (argc < 4) {
-        std::printf("usage: d3d9_proxy_test <proxy dll> <work dir> on|off|copy [na_bridge_helper64.exe]\n");
+        std::printf("usage: d3d9_proxy_test <proxy dll> <work dir> on|off|copy|jitter [na_bridge_helper64.exe]\n");
         return 1;
     }
     g_copy = std::strcmp(argv[3], "copy") == 0;
-    const bool on = g_copy || std::strcmp(argv[3], "on") == 0;
+    g_jitter = std::strcmp(argv[3], "jitter") == 0;
+    const bool on = g_copy || g_jitter || std::strcmp(argv[3], "on") == 0;
     std::printf("d3d9 proxy test (%s), %d-bit\n", argv[3], static_cast<int>(sizeof(void*) * 8));
 
     // The proxy beside its own ini (and the helper), as deploy-dx9.ps1 will lay it out.
@@ -276,7 +340,8 @@ int main(int argc, char** argv)
     const fs::path log = dir / "dx9.log";
     {
         std::ofstream ini(dir / "NeuralAliasHost.ini");
-        ini << "[dx9]\nenabled=" << (on ? 1 : 0) << "\ncopy_test=" << (g_copy ? 1 : 0) << "\nlog=" << log.string() << "\n";
+        ini << "[dx9]\nenabled=" << (on ? 1 : 0) << "\ncopy_test=" << (g_copy ? 1 : 0)
+            << (g_jitter ? "\njitter=2\ndlss=0" : "") << "\nlog=" << log.string() << "\n";
     }
     if (g_copy) {
         if (argc < 5 || !fs::exists(argv[4])) {

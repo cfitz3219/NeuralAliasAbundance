@@ -55,7 +55,7 @@ if(WIN32 AND TARGET NeuralAliasD3D9)
   else()
     set(NA_DX9_HELPER "")
   endif()
-  foreach(mode off on copy)
+  foreach(mode off on copy jitter)
     add_test(NAME dx9_proxy_${mode}
              COMMAND d3d9_proxy_test "$<TARGET_FILE:NeuralAliasD3D9>" "${CMAKE_CURRENT_BINARY_DIR}/proxy-data" ${mode} "${NA_DX9_HELPER}")
     set_tests_properties(dx9_proxy_${mode} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host")
