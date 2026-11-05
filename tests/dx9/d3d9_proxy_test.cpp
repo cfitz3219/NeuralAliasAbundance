@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -39,11 +40,25 @@ namespace fs = std::filesystem;
 namespace {
 
 int g_fail = 0;
+std::string g_summary; // failed checks + key measurements, repeated at the end (CI shows the last lines)
 void Check(bool ok, const char* what)
 {
     std::printf("%s: %s\n", ok ? "ok  " : "FAIL", what);
     std::fflush(stdout);
-    if (!ok) ++g_fail;
+    if (!ok) {
+        ++g_fail;
+        g_summary += std::string("  failed: ") + what + "\n";
+    }
+}
+void Note(const char* fmt, ...)
+{
+    char b[512];
+    va_list a;
+    va_start(a, fmt);
+    std::vsnprintf(b, sizeof(b), fmt, a);
+    va_end(a);
+    std::printf("     %s\n", b);
+    g_summary += std::string("  ") + b + "\n";
 }
 
 using PFN_Create9 = IDirect3D9*(WINAPI*)(UINT);
@@ -286,15 +301,15 @@ bool RunGame(IDirect3DDevice9* dev, PFN_Status status, bool post, UINT w, UINT h
     Check(k.selected && k.color_w == w && k.color_h == h, post ? "post game: scene colour + depth picked" : "back-buffer game: back buffer + depth picked");
     Check(k.camera_found && k.camera_source == 1 && k.camera_register == 8, "camera found in the shader constants at c8");
     Check(k.scene_draws == (g_jitter ? 41u : 40u), "the 40 objects are the scene draws (HUD and tonemap are not)");
-    std::printf("     jitter: on %u (%.4f, %.4f) c%u, mip bias %.2f, shaders patched %u unpatched %u, last frame %u jittered, %u scene draws not\n",
-                k.jitter_on, k.jitter_x, k.jitter_y, k.jitter_register, k.mip_bias, k.shaders_patched, k.shaders_unpatched, k.jittered_draws,
+    Note("%s jitter: on %u (%.4f, %.4f) c%u, mip bias %.2f, shaders patched %u unpatched %u, last frame %u jittered, %u scene draws not",
+                post ? "post" : "back-buffer", k.jitter_on, k.jitter_x, k.jitter_y, k.jitter_register, k.mip_bias, k.shaders_patched, k.shaders_unpatched, k.jittered_draws,
                 k.unjittered_scene_draws);
     Check(k.shaders_patched >= 1 && k.jitter_register >= 15, "the game's vertex shader was patched for jitter");
     if (g_jitter) {
         Check(k.jitter_on == 1 && k.jittered_draws == k.scene_draws && k.unjittered_scene_draws == 0, "jitter mode: every scene draw jittered");
         if (measure) {
-            std::printf("     measured over %d frames: 16r+jx in [%.4f, %.4f], 16g+jy in [%.4f, %.4f], jitter x in [%.3f, %.3f]\n", samples, lo_x, hi_x,
-                        lo_y, hi_y, jx_lo, jx_hi);
+            Note("measured over %d frames: 16r+jx in [%.4f, %.4f], 16g+jy in [%.4f, %.4f], jitter x in [%.3f, %.3f]", samples, lo_x, hi_x,
+                 lo_y, hi_y, jx_lo, jx_hi);
             Check(samples >= 8 && jx_hi - jx_lo > 0.3, "jitter test: the jitter moves from frame to frame");
             Check(hi_x - lo_x < 0.02 && hi_y - lo_y < 0.02, "jitter test: the picture moves by exactly the jitter told (within 0.02 px)");
         }
@@ -489,6 +504,7 @@ int main(int argc, char** argv)
     }
 
     DestroyWindow(hwnd);
+    if (!g_summary.empty()) std::printf("---- summary\n%s", g_summary.c_str());
     std::printf("%s: d3d9 proxy (%s, %d-bit)\n", g_fail ? "FAIL" : "PASS", argv[3], static_cast<int>(sizeof(void*) * 8));
     return g_fail ? 1 : 0;
 }
