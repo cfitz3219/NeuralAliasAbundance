@@ -113,6 +113,8 @@ struct Frame::Work {
     bool copy_depth=false;
     unsigned denoise=1;
     Constants constants;
+    ID3D12Resource* bound_color=nullptr;ID3D12Resource* bound_depth=nullptr;Scratch* bound_scratch=nullptr;
+    DXGI_FORMAT bound_color_format=DXGI_FORMAT_UNKNOWN,bound_depth_format=DXGI_FORMAT_UNKNOWN;unsigned bound_denoise=0;
     unsigned stride=0;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu(unsigned table,unsigned descriptor)const {
         auto h=heap->GetCPUDescriptorHandleForHeapStart();h.ptr+=SIZE_T(table*TableSize+descriptor)*stride;return h;
@@ -133,7 +135,7 @@ struct Pass::State {
     std::shared_ptr<Scratch> scratch;
     std::vector<std::shared_ptr<Frame>> frames;
     std::shared_ptr<Counters> counters=std::make_shared<Counters>();
-    uint64_t allocations=0,busy=0;std::string reason="Waiting for the first scene.";
+    uint64_t allocations=0,busy=0,bindings=0;std::string reason="Waiting for the first scene.";
 };
 Frame::Frame():work_(std::make_unique<Work>()){}
 Frame::~Frame()=default;
@@ -250,6 +252,11 @@ std::shared_ptr<Frame> Pass::Prepare(ID3D12Device* dev,ID3D12CommandQueue* queue
     c.color_base[0]=in.color_x;c.color_base[1]=in.color_y;c.depth_base[0]=in.depth_x;c.depth_base[1]=in.depth_y;
     c.amount=std::min(options.amount,100u)*.01f;c.clear=in.clear_depth;c.quality=std::min(options.quality,3u);c.srgb=in.srgb?1u:0u;
     c.output_base[0]=in.preserve_color_extent?in.color_x:0;c.output_base[1]=in.preserve_color_extent?in.color_y:0;
+    // Immutable binding-set cache (NVRHI pattern). This packet is exclusively
+    // reusable only after its existing recording/fence owners release it.
+    auto* depth_input=in.copy_depth?w.copied_depth.Get():in.depth;
+    if(w.bound_color!=in.color||w.bound_depth!=depth_input||w.bound_scratch!=scratch.get()||
+       w.bound_color_format!=in.color_format||w.bound_depth_format!=in.depth_format||w.bound_denoise!=w.denoise){
     for(unsigned t=0;t<Tables;++t){for(unsigned i=0;i<Srvs;++i)w.srv(t,i,nullptr,DXGI_FORMAT_R32_FLOAT);
         for(unsigned i=0;i<Uavs;++i)w.uav(t,i,nullptr,DXGI_FORMAT_R32_FLOAT);}
     w.srv(0,0,in.copy_depth?w.copied_depth.Get():in.depth,in.depth_format);w.uav(0,0,scratch->raw.Get(),DXGI_FORMAT_R32_FLOAT);
@@ -266,6 +273,9 @@ std::shared_ptr<Frame> Pass::Prepare(ID3D12Device* dev,ID3D12CommandQueue* queue
     w.uav(6,0,scratch->filtered.Get(),DXGI_FORMAT_R8_UINT);
     w.srv(7,0,in.color,in.color_format);w.srv(7,1,w.denoise==2?scratch->ao.Get():scratch->filtered.Get(),DXGI_FORMAT_R8_UINT);
     w.srv(7,2,scratch->raw.Get(),DXGI_FORMAT_R32_FLOAT);w.uav(7,0,scratch->color.Get(),format);
+    w.bound_color=in.color;w.bound_depth=depth_input;w.bound_scratch=scratch.get();
+    w.bound_color_format=in.color_format;w.bound_depth_format=in.depth_format;w.bound_denoise=w.denoise;++s.bindings;
+    }
     s.reason="Ready";return frame;
 }
 bool Frame::Record(ID3D12GraphicsCommandList* l) {
@@ -305,7 +315,7 @@ bool Frame::Record(ID3D12GraphicsCommandList* l) {
 }
 Stats Pass::GetStats()const {
     auto& s=*state_;std::lock_guard<std::mutex> lock(s.mutex);Stats stats;
-    stats.recorded=s.counters->recorded.load();stats.allocations=s.allocations;stats.busy=s.busy;
+    stats.recorded=s.counters->recorded.load();stats.allocations=s.allocations;stats.busy=s.busy;stats.bindings=s.bindings;
     stats.compiling=s.programs&&s.programs->ready.load(std::memory_order_acquire)==0;
     const bool failed=s.programs&&s.programs->ready.load(std::memory_order_acquire)<0;
     std::snprintf(stats.reason,sizeof(stats.reason),"%s",failed?s.programs->error.c_str():s.reason.c_str());return stats;
