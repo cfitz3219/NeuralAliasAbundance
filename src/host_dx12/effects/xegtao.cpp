@@ -1,4 +1,5 @@
 #include "xegtao.hpp"
+#include "host_dx12/gpu/services.hpp"
 #include "host_dx12/settings.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include "providers/camera/camera_tracker.hpp"
@@ -84,16 +85,17 @@ bool build_programs(Programs& p) {
 #endif
 }
 struct Scratch {
-    ComPtr<ID3D12Resource> raw,pyramid,normals,ao,edges,filtered,color,encoded;
+    na::gpu::Texture raw,pyramid,normals,ao,edges,filtered,color,encoded;
+    bool nvrhi=false;
     ComPtr<ID3D12CommandQueue> queue; // absent => this scratch belongs to only one recording
     uint32_t w=0,h=0;DXGI_FORMAT format=DXGI_FORMAT_UNKNOWN;
     uint32_t ow=0,oh=0;
 };
-bool texture(ID3D12Device* dev,uint32_t w,uint32_t h,DXGI_FORMAT format,unsigned mips,ComPtr<ID3D12Resource>& out) {
-    D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;D3D12_RESOURCE_DESC d{};
+bool texture(ID3D12Device* dev,ID3D12CommandQueue* queue,uint32_t w,uint32_t h,DXGI_FORMAT format,unsigned mips,na::gpu::Texture& out) {
+    D3D12_RESOURCE_DESC d{};
     d.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;d.Width=w;d.Height=h;d.DepthOrArraySize=1;
     d.MipLevels=static_cast<UINT16>(mips);d.Format=format;d.SampleDesc.Count=1;d.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    return SUCCEEDED(dev->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&d,Read,nullptr,IID_PPV_ARGS(&out)));
+    return na::gpu::CreateTexture(dev,queue,d,Read,out);
 }
 bool covered(ID3D12Resource* r,uint32_t x,uint32_t y,uint32_t w,uint32_t h) {
     if(!r)return false;const auto d=r->GetDesc();
@@ -196,14 +198,14 @@ std::shared_ptr<Frame> Pass::Prepare(ID3D12Device* dev,ID3D12CommandQueue* queue
     auto scratch=shared?s.scratch:w.scratch;
     const auto cd=in.color->GetDesc();
     const auto ow=in.preserve_color_extent?uint32_t(cd.Width):in.width,oh=in.preserve_color_extent?cd.Height:in.height;
-    if(!scratch||scratch->w!=in.width||scratch->h!=in.height||scratch->ow!=ow||scratch->oh!=oh||scratch->format!=format||scratch->queue.Get()!=queue||bool(scratch->encoded)!=in.srgb){
+    if(!scratch||scratch->w!=in.width||scratch->h!=in.height||scratch->ow!=ow||scratch->oh!=oh||scratch->format!=format||scratch->queue.Get()!=queue||bool(scratch->encoded)!=in.srgb||scratch->nvrhi!=na::gpu::Enabled()){
         scratch=std::make_shared<Scratch>();scratch->w=in.width;scratch->h=in.height;scratch->format=format;scratch->queue=queue;
-        scratch->ow=ow;scratch->oh=oh;
-        const auto make=[&](DXGI_FORMAT f,unsigned mips,ComPtr<ID3D12Resource>& r){return texture(dev,in.width,in.height,f,mips,r);};
+        scratch->ow=ow;scratch->oh=oh;scratch->nvrhi=na::gpu::Enabled();
+        const auto make=[&](DXGI_FORMAT f,unsigned mips,na::gpu::Texture& r){return texture(dev,queue,in.width,in.height,f,mips,r);};
         if(!make(DXGI_FORMAT_R32_FLOAT,1,scratch->raw)||!make(DXGI_FORMAT_R32_FLOAT,5,scratch->pyramid)||
            !make(DXGI_FORMAT_R32_UINT,1,scratch->normals)||!make(DXGI_FORMAT_R8_UINT,1,scratch->ao)||
            !make(DXGI_FORMAT_R8_UNORM,1,scratch->edges)||!make(DXGI_FORMAT_R8_UINT,1,scratch->filtered)||
-           !texture(dev,ow,oh,format,1,scratch->color)){s.reason="XeGTAO working textures could not be allocated.";return {};}
+           !texture(dev,queue,ow,oh,format,1,scratch->color)){s.reason="XeGTAO working textures could not be allocated.";return {};}
         if(in.srgb){
             auto desc=scratch->color->GetDesc();desc.Format=in.color_format;desc.Flags=D3D12_RESOURCE_FLAG_NONE;
             D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;

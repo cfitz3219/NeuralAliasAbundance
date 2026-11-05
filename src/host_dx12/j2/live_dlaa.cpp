@@ -1,3 +1,4 @@
+#include "host_dx12/gpu/services.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/msaa_resolve.hpp"
 #include "host_dx12/j2/nis_sharpen.hpp"
@@ -3048,6 +3049,8 @@ struct SmallRing {
     ComPtr<ID3D12CommandAllocator> alloc[kRing];
     UINT64 value[kRing] = {};
     ComPtr<ID3D12GraphicsCommandList> list;
+    std::shared_ptr<na::gpu::Recording> owned;
+    bool owned_recording = false;
     ComPtr<ID3D12Fence> fence;
     UINT64 next = 1;
     uint32_t slot = 0;
@@ -3909,8 +3912,15 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
     }
     g_small.hud_owner[si]=layer.owner;
     g_small.hud_picture[si]=layer_frame&&!replay?layer.picture:nullptr;
-    ID3D12GraphicsCommandList* l = g_small.list.Get();
-    if (FAILED(g_small.alloc[si]->Reset()) || FAILED(l->Reset(g_small.alloc[si].Get(), nullptr))) {
+    if (g_small.owned) na::gpu::Collect();
+    g_small.owned_recording=false;
+    if(na::gpu::Enabled()){
+        if(!g_small.owned)g_small.owned=std::make_shared<na::gpu::Recording>();
+        g_small.owned_recording=g_small.owned->Open(g_small.device.Get(),queue);
+    }
+    ID3D12GraphicsCommandList* l = g_small.owned_recording ? g_small.owned->Native() : g_small.list.Get();
+    const auto close_list=[&]{return g_small.owned_recording ? g_small.owned->Close() : SUCCEEDED(l->Close());};
+    if (!g_small.owned_recording && (FAILED(g_small.alloc[si]->Reset()) || FAILED(l->Reset(g_small.alloc[si].Get(), nullptr)))) {
         ++g.stats.small_failed; small_note("Render-small: could not reset its list."); return false;
     }
     hud_read(si);
@@ -3943,8 +3953,9 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
             hud_capture=na::capture::j2::RecordEvaluation(l,planes,id);
         }
         add(b,frame,NPSR,PRESENT);add(b,out,UAV,PRESENT);flush(l,b);
-        if(FAILED(l->Close())){na::capture::j2::Discard(hud_capture,false);return false;}
-        ID3D12CommandList* work[]={l};forward(queue,1,work);
+        if(!close_list()){na::capture::j2::Discard(hud_capture,false);return false;}
+        ID3D12CommandList* work[]={l};
+        if(!na::gpu::SubmitMixed(queue,1,work,g_small.owned_recording?g_small.owned.get():nullptr,forward)){na::capture::j2::Discard(hud_capture,false);return false;}
         if(hud_capture)na::capture::j2::Submitted(hud_capture,queue,g.stats.submissions);
         g_small.value[si]=g_small.next++;queue->Signal(g_small.fence.Get(),g_small.value[si]);g_small.slot=(si+1)%kRing;
         if(native)++g.stats.small_hud_layer;
@@ -4008,7 +4019,7 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
             draw_picture=separate_scene||layer.picture->Prepare(l,frame,ff,g.motion.Get(),layer.n0,layer.n1,layer.view,layer.grey,layer.srgb,layer.clean_allowed,of,g_hud_view.load(std::memory_order_relaxed));
         }
         if(replay&&!draw_picture){
-            l->Close();g_small.hud_picture[si].reset();g_small.hud_owner[si].reset();
+            close_list();g_small.hud_picture[si].reset();g_small.hud_owner[si].reset();
             return false; // no NGX creation/evaluation has been recorded
         }
         if (witness) {
@@ -4251,7 +4262,7 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
     if(dlss&&draw_picture&&!replay){flush(l,b);layer.picture->Composite(l,out);}
     if(replay&&draw_picture){flush(l,b);(separate_scene?layer.reconstruction:layer.picture)->SeedNativeAlpha(l,out);}
     if(separate_scene&&layer.ui_output&&!layer.picture->SeedNativeScene(l,layer.ui_output,layer.ui_view)){
-        l->Close();++g.stats.small_failed;small_note("Native HUD background could not be seeded.");return false;
+        close_list();++g.stats.small_failed;small_note("Native HUD background could not be seeded.");return false;
     }
     // The jitter witness compares the next frame with this one.
     if (dlss && g.jitter_on && !g.jitter_unseen && witness_targets(frame, rw, rh)) {
@@ -4354,7 +4365,7 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
     add(b, frame, NPSR, PRESENT);
     add(b, out, UAV, PRESENT);
     flush(l, b);
-    if (FAILED(l->Close())) {
+    if (!close_list()) {
         na::capture::j2::Discard(capture, false);
         // The list may hold transitions already recorded: never submit it. The presenter
         // keeps its old picture; the frame/out states are unchanged because nothing ran.
@@ -4365,7 +4376,9 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
     }
     ID3D12CommandList* lists[] = {l,replay};const UINT count=replay?2u:1u;
     if (dlss) na::dlss::BeforeExecute(queue, count, lists);
-    forward(queue, count, lists); // original entry point; native HUD stays before this frame's completion fence
+    if(!na::gpu::SubmitMixed(queue,count,lists,g_small.owned_recording?g_small.owned.get():nullptr,forward)){
+        na::capture::j2::Discard(capture,false);++g.stats.small_failed;return false;
+    } // native HUD stays before this frame's completion fence
     if (dlss) na::dlss::OnExecuted(queue, count, lists);
     if (capture) na::capture::j2::Submitted(capture, queue, g.stats.submissions);
     g_small.value[si] = g_small.next++;

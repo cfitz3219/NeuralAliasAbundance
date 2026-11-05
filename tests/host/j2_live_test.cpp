@@ -1,4 +1,5 @@
 #include "host_dx12/settings.hpp"
+#include "host_dx12/gpu/services.hpp"
 // J2 live DLAA end to end against a fake NGX runtime on a real D3D12 device
 // (WARP-capable): discovery picks -> scene list detection -> camera from the
 // scene list's root constant buffer (ViewProjection at +80, inverse at +144,
@@ -123,8 +124,11 @@ std::array<float, 4> ReadTexel(test::Device& d, ID3D12Resource* tex, uint32_t x,
 }
 } // namespace
 
-int main()
+int main(int argc,char** argv)
 {
+    const bool nvrhi=argc>1&&std::strcmp(argv[1],"--nvrhi")==0;
+    if(nvrhi&&!na::gpu::GetStats().built)return test::kSkip;
+    na::settings::Get().experimental_nvrhi=nvrhi;
     setvbuf(stdout, nullptr, _IONBF, 0); // progress survives a timeout kill
     test::Device d;
     if (!test::CreateDevice(d)) return test::SkipNoDevice("j2_live_test");
@@ -606,6 +610,7 @@ int main()
         const auto ui_pixel=ReadTexel(d,ui_native.Get(),W,H);CHECK(ui_pixel[0]==.25f&&ui_pixel[1]==.5f&&ui_pixel[2]==.75f&&ui_pixel[3]==1);
         na::j2::SetRenderSmall(false);proxy.Reset();d.WaitIdle();REQUIRE(presenter::Shutdown());presenter::SetEnabled(false);presenter::SetRenderScale(1,nullptr,nullptr);na::native_present::Detach(window);chain.Reset();DestroyWindow(window);
     }
+    if(nvrhi){na::gpu::Collect();CHECK(na::gpu::GetStats().submits>=2);CHECK(na::gpu::GetStats().errors==0);}
     CHECK(dev->GetDeviceRemovedReason() == S_OK);
     na::j2::SetEnabled(false);
     d.WaitIdle();

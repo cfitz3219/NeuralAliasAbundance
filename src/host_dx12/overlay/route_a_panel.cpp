@@ -1,3 +1,4 @@
+#include "host_dx12/gpu/services.hpp"
 #include "host_dx12/effects/donut.hpp"
 #include "host_dx12/adapters/tlou1/apply.hpp"
 #include "host_dx12/adapters/tsushima/apply.hpp"
@@ -1338,6 +1339,19 @@ void RegisterLiveDlaaMenu()
     na::menu::Register({"DLAA enhancements", na::menu::Availability::Available, nullptr, &DrawLiveDlaaEnhancements, na::menu::Page::Enhancements});
 }
 
+static void DrawExperimentalGpu()
+{
+    using namespace na::ui;
+    auto& settings=na::settings::Get();const auto stats=na::gpu::GetStats();bool enabled=settings.experimental_nvrhi.load()!=0;
+    BeginRow("Shared GPU infrastructure (NVRHI)","Changes how supported GPU work is managed; the picture algorithms stay the same.",SwitchWidth());
+    ImGui::BeginDisabled(!stats.built);
+    if(ImGui::Checkbox("##experimental_gpu",&enabled)){settings.experimental_nvrhi=enabled;na::settings::Save();}
+    ImGui::EndDisabled();EndRow();
+    if(!stats.built)Hint("Unavailable in this build.");
+    else if(enabled){char status[192];std::snprintf(status,sizeof status,"Shared GPU work: %llu submissions, %llu effect dispatches, %llu managed textures.",
+        static_cast<unsigned long long>(stats.submits),static_cast<unsigned long long>(stats.dispatches),static_cast<unsigned long long>(stats.textures));Hint(status);}
+}
+
 static void DrawDonutLighting()
 {
     using namespace na::ui;
@@ -1442,6 +1456,7 @@ void RegisterRouteAMenu()
     na::menu::Register({"DLSS in use", Availability::Available, nullptr, &DrawDlssInUseRow, Page::Enhancements});
     na::menu::Register({"Motion analysis", Availability::Available, nullptr, &DrawMotionRow, Page::Enhancements});
     na::menu::Register({"XeGTAO", Availability::Available, nullptr, &DrawAmbientOcclusion, Page::Enhancements});
+    na::menu::Register({"GPU infrastructure", Availability::Available, nullptr, &DrawExperimentalGpu, Page::Experimental});
     na::menu::Register({"Lighting", Availability::Available, nullptr, &DrawDonutLighting, Page::Experimental});
     na::menu::Register({"Connection", Availability::Available, nullptr, &DrawConnectionRow, Page::Details});
     na::menu::Register({"Save pictures for analysis", Availability::Available, nullptr, &DrawCaptureRow,

@@ -1,6 +1,7 @@
 // Actual DX12 component tests. GPU waits/readback are confined to this executable.
 #include "test_support.hpp"
 #include "host_dx12/effects/donut.hpp"
+#include "host_dx12/gpu/services.hpp"
 #include "host_dx12/settings.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/nr/native_fg.hpp"
@@ -55,7 +56,10 @@ std::vector<float> pixels(const Readback& rb) {
 
 void sink(const na_event_batch*,void*){}
 }
-int main(){
+int main(int argc,char** argv){
+    const bool nvrhi=argc>1&&std::strcmp(argv[1],"--nvrhi")==0;
+    if(nvrhi&&!na::gpu::GetStats().built)return test::kSkip;
+    na::settings::Get().experimental_nvrhi=nvrhi;
 #if !defined(NA_HAVE_DONUT)
     return test::kSkip;
 #else
@@ -73,10 +77,14 @@ int main(){
     options.bloom=true;options.bloom_amount=.5f;options.bloom_sigma=8;
     CHECK(!pass.Prepare(d.device.Get(),d.queue.Get(),in,options));REQUIRE(pass.WaitPrepared(30000));
     auto render=[&](const na::donut::Options& o,const na::donut::Inputs& inputs){
-        test::List l;if(!l.Create(d.device.Get())){CHECK(false);return std::vector<float>{};}
+        test::List l;na::gpu::Recording recording;
+        if(nvrhi){if(!recording.Open(d.device.Get(),d.queue.Get())){CHECK(false);return std::vector<float>{};}l.list=recording.Native();}
+        else if(!l.Create(d.device.Get())){CHECK(false);return std::vector<float>{};}
         auto frame=pass.Prepare(d.device.Get(),d.queue.Get(),inputs,o);if(!frame){CHECK(false);return std::vector<float>{};}
         CHECK(frame->Record(l.list.Get()));auto rb=capture(d,l,frame->Color());auto original=capture(d,l,image.texture.Get());
-        CHECK(SUCCEEDED(l.list->Close()));ID3D12CommandList* lists[]={l.list.Get()};d.queue->ExecuteCommandLists(1,lists);d.WaitIdle();
+        if(nvrhi){CHECK(recording.Close());recording.Retain(frame);CHECK(recording.Submit());}
+        else {CHECK(SUCCEEDED(l.list->Close()));ID3D12CommandList* lists[]={l.list.Get()};d.queue->ExecuteCommandLists(1,lists);}
+        d.WaitIdle();na::gpu::Collect();
         CHECK(pixels(original)==data);return pixels(rb);
     };
     auto bloom=render(options,in);REQUIRE(bloom.size()==data.size());
@@ -138,6 +146,7 @@ int main(){
     auto nv=pixels(nativePixels);CHECK(nv[0]==data[0]);CHECK(nv[(20*W+32)*4]!=data[(20*W+32)*4]);
     settings.donut_tone=0;REQUIRE(na_observe_stop()==NA_OK);na::observe::SetProcessExiting();
 #endif
+    if(nvrhi){const auto gpu=na::gpu::GetStats();CHECK(gpu.submits>0&&gpu.dispatches>0&&gpu.textures>0&&gpu.errors==0);}
     CHECK(d.device->GetDeviceRemovedReason()==S_OK);
     if(info){unsigned errors=0;for(UINT64 i=0;i<info->GetNumStoredMessagesAllowedByRetrievalFilter();++i){SIZE_T bytes=0;info->GetMessage(i,nullptr,&bytes);
         std::vector<uint8_t> storage(bytes);auto* m=reinterpret_cast<D3D12_MESSAGE*>(storage.data());if(SUCCEEDED(info->GetMessage(i,m,&bytes))&&m->Severity<=D3D12_MESSAGE_SEVERITY_ERROR){++errors;std::printf("D3D12: %s\n",m->pDescription);}}

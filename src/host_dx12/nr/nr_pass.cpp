@@ -1,4 +1,5 @@
 #include "host_dx12/nr/sl_consumer.hpp"
+#include "host_dx12/gpu/services.hpp"
 #include "host_dx12/nr/nr_pass.hpp"
 #include "host_dx12/nr/nr_shaders.hpp"
 #include "host_dx12/nr/fg_composition.hpp"
@@ -85,7 +86,9 @@ struct State {
     // Device objects (game device).
     ComPtr<ID3D12Device> device;
     bool device_ready = false;
-    ComPtr<ID3D12GraphicsCommandList> list;
+    ComPtr<ID3D12GraphicsCommandList> list, native_list;
+    std::shared_ptr<na::gpu::Recording> owned;
+    bool owned_recording = false;
     Frame frames[kRing];
     uint32_t frame_index = 0;
     ComPtr<ID3D12Fence> fence;
@@ -176,13 +179,14 @@ void discard_invalid_recordings_locked()
     }
 }
 
-void submit_locked(ID3D12CommandQueue* queue, UINT n, ID3D12CommandList* const* lists)
+bool submit_locked(ID3D12CommandQueue* queue, UINT n, ID3D12CommandList* const* lists)
 {
     // Our list can re-enter the host's Execute hook while g.m is held.
     const bool previous = internal_submit;
     internal_submit = true;
-    queue->ExecuteCommandLists(n, lists);
+    const bool ok = g.owned_recording ? g.owned->Submit() : (queue->ExecuteCommandLists(n, lists), true);
     internal_submit = previous;
+    return ok;
 }
 
 void set_reason(const char* text)
@@ -203,7 +207,7 @@ bool submit_frame_locked(ID3D12CommandQueue* queue, Frame& f)
     // OnPresent admits only completed cross-queue inputs/output work. Never
     // queue a dependency behind the original Present that must release it.
     ID3D12CommandList* lists[] = {g.list.Get()};
-    submit_locked(queue, 1, lists);
+    if (!submit_locked(queue, 1, lists)) { latch("Neural Rendering could not submit its command buffer."); return false; }
     g.output_queue = queue;
     f.fence_value = g.fence_next++;
     if (g.ready) g.ready->consumed = f.fence_value;
@@ -288,7 +292,7 @@ bool ensure_device_locked(ID3D12Device* dev)
         // Drop only the partial bootstrap objects, then let the existing
         // ResetLatch/re-enable path retry on this device instead of remaining
         // permanently stuck with g.device != nullptr and ready == false.
-        g.list.Reset();
+        g.list.Reset(); g.native_list.Reset(); g.owned.reset(); g.owned_recording=false;
         for (auto& frame:g.frames) frame.alloc.Reset();
         g.fence.Reset(); g.root.Reset(); g.heap.Reset();
         g.queries.Reset(); g.query_readback.Reset();
@@ -304,6 +308,7 @@ bool ensure_device_locked(ID3D12Device* dev)
     if (FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g.frames[0].alloc.Get(), nullptr, IID_PPV_ARGS(&g.list))))
         return false;
     g.list->Close();
+    g.native_list = g.list;
     if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g.fence)))) return false;
     if (fail_device_init_for_tests.exchange(false)) return false;
 
@@ -999,12 +1004,20 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer, DXGI_COLOR
 
     f.depth = g.depth_copy;
     f.motion = g.motion_copy;
-    if (FAILED(f.alloc->Reset()) || FAILED(g.list->Reset(f.alloc.Get(), nullptr))) {
+    // Only this standalone host-owned list is eligible. Inline game NR stays native.
+    if (g.owned) na::gpu::Collect();
+    g.owned_recording = false;
+    if (na::gpu::Enabled()) {
+        if (!g.owned) g.owned = std::make_shared<na::gpu::Recording>();
+        g.owned_recording = g.owned->Open(g.device.Get(), queue);
+    }
+    g.list = g.owned_recording ? g.owned->Native() : g.native_list.Get();
+    if (!g.owned_recording && (FAILED(f.alloc->Reset()) || FAILED(g.list->Reset(f.alloc.Get(), nullptr)))) {
         latch("Neural Rendering could not prepare its command buffer.");
         return;
     }
     if (!ensure_feature_locked(w, h, hdr, bb.Format)) {
-        g.list->Close();
+        if (g.owned_recording) g.owned->Discard(); else g.list->Close();
         return;
     }
     bool run = g.feature_pending == 0; // the create recorded this frame executes first
@@ -1082,7 +1095,7 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer, DXGI_COLOR
             }
             D3D12_RESOURCE_BARRIER back = transition(backbuffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT);
             g.list->ResourceBarrier(1, &back);
-            if (FAILED(g.list->Close())) { latch("Neural Rendering could not restore its command buffer."); return; }
+            if (!(g.owned_recording ? g.owned->Close() : SUCCEEDED(g.list->Close()))) { latch("Neural Rendering could not restore its command buffer."); return; }
             submit_frame_locked(queue, f);
             return;
         }
@@ -1135,7 +1148,7 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer, DXGI_COLOR
     g.list->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, qbase + 1);
     g.list->ResolveQueryData(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, qbase, 2, g.query_readback.Get(),
                              static_cast<UINT64>(g.frame_index) * 16);
-    if (FAILED(g.list->Close())) {
+    if (!(g.owned_recording ? g.owned->Close() : SUCCEEDED(g.list->Close()))) {
         latch("Neural Rendering could not finish its command buffer.");
         return;
     }
@@ -1257,7 +1270,7 @@ void clear_device_locked()
     g.heap.Reset();
     g.queries.Reset();
     g.query_readback.Reset();
-    g.list.Reset();
+    g.list.Reset(); g.native_list.Reset(); g.owned.reset(); g.owned_recording=false;
     for (Frame& f : g.frames) { f.alloc.Reset(); f.depth.Reset(); f.motion.Reset(); f.fence_value = 0; }
     g.fence.Reset();
     g.device.Reset();

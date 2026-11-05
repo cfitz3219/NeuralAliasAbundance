@@ -13,9 +13,10 @@ int main() {
     na::settings::SetIniPath(ini); na::settings::Load();
     auto& s=na::settings::Get();
     CHECK(s.donut_tone==0&&s.donut_bloom==0&&s.donut_bias==750&&s.donut_white==3000);
+    CHECK(s.experimental_nvrhi==0);s.experimental_nvrhi=1;
     s.donut_tone=1;s.donut_bloom=1;s.donut_bias=625;s.donut_curve=1;s.donut_bloom_sigma=24000;
-    CHECK(na::settings::Save());s.donut_tone=0;s.donut_bloom=0;s.donut_bias=0;s.donut_curve=0;s.donut_bloom_sigma=4000;
-    na::settings::Load();CHECK(s.donut_tone==1&&s.donut_bloom==1&&s.donut_bias==625&&s.donut_curve==1&&s.donut_bloom_sigma==24000);
+    CHECK(na::settings::Save());s.experimental_nvrhi=0;s.donut_tone=0;s.donut_bloom=0;s.donut_bias=0;s.donut_curve=0;s.donut_bloom_sigma=4000;
+    na::settings::Load();CHECK(s.experimental_nvrhi==1);s.experimental_nvrhi=0;CHECK(s.donut_tone==1&&s.donut_bloom==1&&s.donut_bias==625&&s.donut_curve==1&&s.donut_bloom_sigma==24000);
     s.donut_tone=0;s.donut_bloom=0;CHECK(na::settings::Save());
     CHECK(s.xegtao_enabled==0&&s.xegtao_quality==2&&s.xegtao_denoise==1);
     CHECK(s.xegtao_radius_x1000==500&&s.xegtao_radius_multiplier==1457&&s.xegtao_falloff==615);

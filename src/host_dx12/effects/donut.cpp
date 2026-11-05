@@ -1,4 +1,5 @@
 #include "donut.hpp"
+#include "host_dx12/gpu/services.hpp"
 #include "host_dx12/settings.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include <wrl/client.h>
@@ -67,13 +68,14 @@ bool build(Programs& p) {
 struct Scratch {
     ComPtr<ID3D12CommandQueue> queue;uint64_t stream=0;
     uint32_t w=0,h=0,ow=0,oh=0,bw=0,bh=0;DXGI_FORMAT format=DXGI_FORMAT_UNKNOWN;bool first=true;std::chrono::steady_clock::time_point last{};
-    ComPtr<ID3D12Resource> color,encoded,blurA,blurB,histogram,exposure;
+    na::gpu::Texture color,encoded,blurA,blurB;ComPtr<ID3D12Resource> histogram,exposure;
+    bool nvrhi=false;
 };
-bool texture(ID3D12Device* d,uint32_t w,uint32_t h,DXGI_FORMAT f,ComPtr<ID3D12Resource>& r) {
-    D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;D3D12_RESOURCE_DESC td{};
+bool texture(ID3D12Device* d,ID3D12CommandQueue* queue,uint32_t w,uint32_t h,DXGI_FORMAT f,na::gpu::Texture& r) {
+    D3D12_RESOURCE_DESC td{};
     td.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;td.Width=w;td.Height=h;td.DepthOrArraySize=td.MipLevels=1;
     td.Format=f;td.SampleDesc.Count=1;td.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    return SUCCEEDED(d->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&td,Read,nullptr,IID_PPV_ARGS(&r)));
+    return na::gpu::CreateTexture(d,queue,td,Read,r);
 }
 bool buffer(ID3D12Device* d,unsigned count,ComPtr<ID3D12Resource>& r) {
     D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;D3D12_RESOURCE_DESC td{};td.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -81,7 +83,7 @@ bool buffer(ID3D12Device* d,unsigned count,ComPtr<ID3D12Resource>& r) {
     return SUCCEEDED(d->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&td,Write,nullptr,IID_PPV_ARGS(&r)));
 }
 bool shape(const Scratch& s,ID3D12CommandQueue* q,const Inputs& in,DXGI_FORMAT f,uint32_t ow,uint32_t oh) {
-    return s.queue.Get()==q&&s.stream==in.stream&&s.w==in.width&&s.h==in.height&&s.ow==ow&&s.oh==oh&&s.format==f;
+    return s.queue.Get()==q&&s.stream==in.stream&&s.w==in.width&&s.h==in.height&&s.ow==ow&&s.oh==oh&&s.format==f&&s.nvrhi==na::gpu::Enabled();
 }
 struct Counters {std::atomic<uint64_t> recorded{0};};
 }
@@ -89,6 +91,7 @@ struct Frame::Work {
     std::shared_ptr<Programs> programs;std::shared_ptr<Scratch> scratch;std::shared_ptr<Counters> counters;
     ComPtr<ID3D12Resource> input;ComPtr<ID3D12DescriptorHeap> heap;
     Constants constants{};uint32_t stride=0;
+    std::shared_ptr<na::gpu::ComputePacket> gpu[7];
     D3D12_CPU_DESCRIPTOR_HANDLE cpu(unsigned table,unsigned slot)const {auto h=heap->GetCPUDescriptorHandleForHeapStart();h.ptr+=SIZE_T(table*5+slot)*stride;return h;}
 };
 struct Pass::State {
@@ -127,8 +130,8 @@ std::shared_ptr<Frame> Pass::Prepare(ID3D12Device* device,ID3D12CommandQueue* qu
     if(!queue&&w.scratch&&!w.scratch->queue&&shape(*w.scratch,nullptr,in,format,ow,oh))scratch=w.scratch;
     if(!scratch){
         scratch=std::make_shared<Scratch>();scratch->queue=queue;scratch->stream=in.stream;scratch->w=in.width;scratch->h=in.height;
-        scratch->ow=ow;scratch->oh=oh;scratch->bw=(in.width+3)/4;scratch->bh=(in.height+3)/4;scratch->format=format;
-        if(!texture(device,ow,oh,format,scratch->color)||!buffer(device,256,scratch->histogram)||!buffer(device,1,scratch->exposure)){s.reason="Effect resources could not be allocated.";return {};}
+        scratch->ow=ow;scratch->oh=oh;scratch->nvrhi=na::gpu::Enabled();scratch->bw=(in.width+3)/4;scratch->bh=(in.height+3)/4;scratch->format=format;
+        if(!texture(device,queue,ow,oh,format,scratch->color)||!buffer(device,256,scratch->histogram)||!buffer(device,1,scratch->exposure)){s.reason="Effect resources could not be allocated.";return {};}
         if(in.format==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB){
             // sRGB UAVs are unsupported; create a compatible copy destination without UAV flags.
             D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;auto ed=scratch->color->GetDesc();ed.Format=in.format;ed.Flags=D3D12_RESOURCE_FLAG_NONE;
@@ -137,8 +140,8 @@ std::shared_ptr<Frame> Pass::Prepare(ID3D12Device* device,ID3D12CommandQueue* qu
         ++s.allocations;
         if(queue){if(s.scratch.size()>=8)s.scratch.erase(s.scratch.begin());s.scratch.push_back(scratch);}
     }
-    if(o.bloom&&!scratch->blurA){if(!texture(device,scratch->bw,scratch->bh,DXGI_FORMAT_R16G16B16A16_FLOAT,scratch->blurA)||
-        !texture(device,scratch->bw,scratch->bh,DXGI_FORMAT_R16G16B16A16_FLOAT,scratch->blurB))return {};}
+    if(o.bloom&&!scratch->blurA){if(!texture(device,queue,scratch->bw,scratch->bh,DXGI_FORMAT_R16G16B16A16_FLOAT,scratch->blurA)||
+        !texture(device,queue,scratch->bw,scratch->bh,DXGI_FORMAT_R16G16B16A16_FLOAT,scratch->blurB))return {};}
     const bool rebind=!w.heap||w.input.Get()!=in.color||w.scratch!=scratch||(!w.constants.bloom&&o.bloom);
     w.programs=s.programs;w.counters=s.counters;w.input=in.color;w.scratch=scratch;
     w.constants={{in.width,in.height},{in.x,in.y},{scratch->bw,scratch->bh},{in.preserve_extent?in.x:0,in.preserve_extent?in.y:0},
@@ -158,6 +161,22 @@ std::shared_ptr<Frame> Pass::Prepare(ID3D12Device* device,ID3D12CommandQueue* qu
             ud={};ud.Format=DXGI_FORMAT_R32_UINT;ud.ViewDimension=D3D12_UAV_DIMENSION_BUFFER;ud.Buffer.NumElements=256;
             device->CreateUnorderedAccessView(scratch->histogram.Get(),nullptr,&ud,w.cpu(t,3));ud.Buffer.NumElements=1;device->CreateUnorderedAccessView(scratch->exposure.Get(),nullptr,&ud,w.cpu(t,4));
         }
+        for(auto& packet:w.gpu)packet.reset();
+#if defined(NA_HAVE_DONUT)
+        if(na::gpu::Enabled()&&queue){
+            const D3D12_SHADER_BYTECODE shaders[]={
+                {na_donut_Clear,sizeof(na_donut_Clear)},{na_donut_Histogram,sizeof(na_donut_Histogram)},
+                {na_donut_Exposure,sizeof(na_donut_Exposure)},{na_donut_Downsample,sizeof(na_donut_Downsample)},
+                {na_donut_Blur,sizeof(na_donut_Blur)},{na_donut_Compose,sizeof(na_donut_Compose)}};
+            for(unsigned packet=0;packet<7;++packet){const unsigned t=packet==6?3:packet;const unsigned program=packet==6?4:packet;na::gpu::ComputeBindings cb;cb.source[0]=in.color;cb.source_format[0]=format;
+                cb.source[1]=(t==4||t==5)?scratch->blurA.Get():scratch->blurB.Get();cb.source_format[1]=DXGI_FORMAT_R16G16B16A16_FLOAT;
+                cb.destination=t==3?scratch->blurA.Get():t==4?scratch->blurB.Get():scratch->color.Get();
+                cb.destination_format=t==3||t==4?DXGI_FORMAT_R16G16B16A16_FLOAT:format;
+                cb.uint_buffers[0]=scratch->histogram.Get();cb.uint_buffers[1]=scratch->exposure.Get();
+                w.gpu[packet]=na::gpu::PrepareCompute(device,queue,shaders[program].pShaderBytecode,shaders[program].BytecodeLength,sizeof(Constants),cb);
+            }
+        }
+#endif
         ++s.bindings;
     }
     s.reason=queue?"Donut scene effects ready.":"Scene effects ready. Exposure adjusts immediately on this route.";return frame;
@@ -169,7 +188,13 @@ bool Frame::Record(ID3D12GraphicsCommandList* l) {
     if(c.seconds==0)c.seconds=s.first?1.f/60:std::clamp(std::chrono::duration<float>(now-s.last).count(),0.f,1.f);
     if(c.tone){s.first=false;s.last=now;}
     l->SetComputeRootSignature(w.programs->root.Get());auto* heap=w.heap.Get();l->SetDescriptorHeaps(1,&heap);
-    auto dispatch=[&](unsigned program,unsigned table,unsigned x,unsigned y){l->SetPipelineState(w.programs->pso[program].Get());
+    auto dispatch=[&](unsigned program,unsigned table,unsigned x,unsigned y){
+        const auto& packet=w.gpu[program==4&&table==3?6:table];
+        if(packet&&na::gpu::Dispatch(l,packet,&c,sizeof(c),x,y))return;
+        // Native inline lists never enter NVRHI. Restore native bindings as an
+        // entire set when a backend packet is unavailable for this dispatch.
+        l->SetComputeRootSignature(w.programs->root.Get());l->SetDescriptorHeaps(1,&heap);
+        l->SetPipelineState(w.programs->pso[program].Get());
         l->SetComputeRoot32BitConstants(0,sizeof(c)/4,&c,0);auto h=heap->GetGPUDescriptorHandleForHeapStart();h.ptr+=UINT64(table*5)*w.stride;
         l->SetComputeRootDescriptorTable(1,h);l->Dispatch(x,y,1);};
     if(c.tone){dispatch(0,0,1,1);uav(l,s.histogram.Get());dispatch(1,1,(s.w+63)/64,(s.h+63)/64);uav(l,s.histogram.Get());

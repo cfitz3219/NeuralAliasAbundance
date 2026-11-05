@@ -3,6 +3,7 @@
 #include "test_support.hpp"
 #include "fake_ngx_params.hpp"
 #include "host_dx12/nr/nr_pass.hpp"
+#include "host_dx12/gpu/services.hpp"
 #include "host_dx12/settings.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include <d3d12sdklayers.h>
@@ -116,6 +117,9 @@ void CheckWitness(size_t index, float value) {
 }
 
 int main(int argc, char** argv) {
+    const bool nvrhi=argc>1&&std::strcmp(argv[1],"--nvrhi")==0;
+    if(nvrhi&&!na::gpu::GetStats().built)return test::kSkip;
+    na::settings::Get().experimental_nvrhi=nvrhi;
     test::ComPtr<ID3D12Debug> debug;
     if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) debug->EnableDebugLayer();
     if (!test::CreateDevice(d)) return test::SkipNoDevice("nr_queue_test");
@@ -376,5 +380,6 @@ int main(int argc, char** argv) {
         auto* message = reinterpret_cast<D3D12_MESSAGE*>(bytes.data()); info->GetMessage(i, message, &size);
         if (message->Severity <= D3D12_MESSAGE_SEVERITY_ERROR) { std::printf("D3D12: %s\n", message->pDescription); CHECK(false); }
     }
+    if(nvrhi){na::gpu::Collect();CHECK(na::gpu::GetStats().submits==s.gpu_submitted);CHECK(na::gpu::GetStats().errors==0);}
     return test::finish("nr_queue_test");
 }
