@@ -9,9 +9,53 @@
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
+#include <algorithm>
+#include <cstdio>
 #include <vector>
 
 using na::observe::ReaderSlotsLock;
+
+namespace {
+// Writer wait and reader throughput against std::shared_mutex (SRW on Windows, the lock g_m
+// was), with readers that spend most of their time outside the lock like the hooks do.
+// Printed for comparison on real machines; only progress is checked (CI timing is noisy).
+template <class L>
+void writer_latency(const char* name, int readers)
+{
+    static L m;
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> reads{0};
+    std::vector<double> waits;
+    std::vector<std::thread> ts;
+    for (int t = 0; t < readers; ++t)
+        ts.emplace_back([&] {
+            uint64_t n = 0;
+            volatile uint32_t sink = 0;
+            while (!stop.load(std::memory_order_relaxed)) {
+                { std::shared_lock<L> r(m); sink = sink + 1; ++n; }
+                for (int i = 0; i < 400; ++i) sink = sink + static_cast<uint32_t>(i); // hook work outside g_m
+            }
+            reads.fetch_add(n);
+        });
+    std::thread w([&] {
+        while (!stop.load()) {
+            const auto t0 = std::chrono::steady_clock::now();
+            { std::unique_lock<L> x(m); }
+            waits.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    stop.store(true);
+    for (auto& t : ts) t.join();
+    w.join();
+    std::sort(waits.begin(), waits.end());
+    const auto q = [&](double f) { return waits.empty() ? 0.0 : waits[std::min(waits.size() - 1, static_cast<size_t>(f * waits.size()))]; };
+    std::printf("%-13s readers %2d: reads %.1fM, writer wait p50 %.1f us p99 %.1f us max %.1f us (%zu writes)\n", name, readers,
+                reads.load() / 1e6, q(0.5), q(0.99), waits.empty() ? 0.0 : waits.back(), waits.size());
+    CHECK(!waits.empty());
+}
+} // namespace
 
 int main() {
     return test::run({
@@ -74,6 +118,13 @@ int main() {
             CHECK(writes.load() >= 2000); // writers are not starved by 70 readers
             CHECK(a == b && a == writes.load());
             CHECK(m.readers() == 0);
+        }},
+        {"writer wait vs std::shared_mutex (printed)", [] {
+            const int hw = static_cast<int>(std::max(2u, std::thread::hardware_concurrency()));
+            for (int r : {hw - 1, hw, 8, 30}) {
+                writer_latency<std::shared_mutex>("shared_mutex", r);
+                writer_latency<ReaderSlotsLock>("reader slots", r);
+            }
         }},
     });
 }

@@ -9,7 +9,8 @@
 //
 // Here each reader increments a counter on its own cache line (threads are spread over
 // kSlots slots), then checks the writer flag. A writer takes `gate` exclusively (writers stay
-// serialised), raises the flag, and waits until every slot is zero. Seq_cst on both sides
+// serialised), raises the flag, and waits until every slot is zero (spin, then park until
+// the reader that empties the slot wakes it). Seq_cst on both sides
 // (reader: increment then load flag; writer: store flag then load slots) means either the
 // reader sees the flag and backs off, or the writer sees the reader's count and waits.
 // A reader that backs off parks on `gate` (shared) until the writer is done, then retries.
@@ -18,7 +19,10 @@
 // try_lock. Constant-initialised and trivially destructible apart from the std::shared_mutex
 // (the same type g_m was), so it stays usable during process exit exactly as before.
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <shared_mutex>
 #include <thread>
 
@@ -34,24 +38,35 @@ public:
         for (;;) {
             c.fetch_add(1, std::memory_order_seq_cst);
             if (!writer_.load(std::memory_order_seq_cst)) return;
-            c.fetch_sub(1, std::memory_order_release);
+            if (c.fetch_sub(1, std::memory_order_seq_cst) == 1) wake_writer();
             gate_.lock_shared(); // blocks while a writer holds the gate
             gate_.unlock_shared();
         }
     }
-    void unlock_shared() { slots_[my_slot()].count.fetch_sub(1, std::memory_order_release); }
+    void unlock_shared()
+    {
+        // Seq_cst decrement then flag load, against the writer's flag store then count load:
+        // either this reader sees the waiting writer and wakes it, or the writer sees zero.
+        if (slots_[my_slot()].count.fetch_sub(1, std::memory_order_seq_cst) == 1 && writer_.load(std::memory_order_seq_cst))
+            wake_writer();
+    }
 
     void lock()
     {
         gate_.lock();
         writer_.store(true, std::memory_order_seq_cst);
         for (uint32_t i = 0; i < kSlots; ++i) {
-            for (uint32_t spins = 0; slots_[i].count.load(std::memory_order_seq_cst) != 0; ++spins) {
-                // Readers hold g_m for microseconds; a non-zero slot after a short spin is a
-                // reader that was preempted inside. Yield (no sleep: a Windows sleep rounds up
-                // to the timer tick, which would be a hitch) so it can run and leave.
-                if (spins >= 64) std::this_thread::yield();
-            }
+            std::atomic<uint32_t>& c = slots_[i].count;
+            for (uint32_t spins = 0; spins < 128 && c.load(std::memory_order_seq_cst) != 0; ++spins) {}
+            if (c.load(std::memory_order_seq_cst) == 0) continue;
+            // A reader still inside after the spin was most likely preempted there: park (as
+            // an SRW writer does), so its core is free for it to run and leave. The reader
+            // that drains the slot wakes us; it decrements before taking the waiter mutex,
+            // so checking the count under that mutex cannot miss the wake-up. The timeout is
+            // only a safety net.
+            Waiter& w = waiter();
+            std::unique_lock<std::mutex> g(w.m);
+            while (c.load(std::memory_order_seq_cst) != 0) w.cv.wait_for(g, std::chrono::milliseconds(1));
         }
     }
     void unlock()
@@ -83,6 +98,22 @@ private:
         static std::atomic<uint32_t> next{0};
         thread_local uint32_t slot = next.fetch_add(1, std::memory_order_relaxed) % kSlots;
         return slot;
+    }
+
+    struct Waiter {
+        std::mutex m;
+        std::condition_variable cv;
+    };
+    static Waiter& waiter()
+    {
+        static Waiter& w = *new Waiter(); // never destroyed: g_m is used during process exit
+        return w;
+    }
+    static void wake_writer()
+    {
+        Waiter& w = waiter();
+        { std::lock_guard<std::mutex> g(w.m); }
+        w.cv.notify_all();
     }
 
     Slot slots_[kSlots];
