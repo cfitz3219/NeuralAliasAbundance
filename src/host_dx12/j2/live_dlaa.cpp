@@ -931,12 +931,20 @@ bool state_after(ID3D12CommandList* const* lists, UINT last, na_object_id id, ui
 // known sample to the camera tracker (which removes it exactly) and to DLSS.
 // Runs only while DLAA is producing frames, so the shake is never left
 // unresolved on screen.
-constexpr uint32_t kJitterPhases = 8; // DLAA; upscaling uses JitterPhasesFor (8 x ratio^2)
+constexpr uint32_t kJitterPhases = 8;      // upscaling base: JitterPhasesFor = 8 x ratio^2
+constexpr uint32_t kDlaaJitterPhases = 16; // DLAA (Cort 2026-11-05: 16, was NVIDIA's minimum 8)
+// The sample for a phase: Halton 2,3 (default) or Martin Roberts' R2 ([j2] jitter_sequence,
+// menu, live). Both jitter routes and the value declared to DLSS come from this one function.
+neural_alias::JitterSample jitter_sample(uint32_t phase, uint32_t period)
+{
+    return na::settings::Get().j2_jitter_r2.load(std::memory_order_relaxed)
+        ? neural_alias::temporal_jitter_r2(phase, period) : neural_alias::temporal_jitter(phase, period);
+}
 uint32_t jitter_phases()
 {
     // Render-small: the output is the window, known once PresentUpscale has run.
     if (g_render_small.load(std::memory_order_relaxed) && g.rw && g.stats.small_ow) return JitterPhasesFor(g.rw, g.stats.small_ow);
-    return g.ow && g.rw ? JitterPhasesFor(g.rw, g.ow) : kJitterPhases;
+    return g.ow && g.rw ? JitterPhasesFor(g.rw, g.ow) : kDlaaJitterPhases;
 }
 // Viewport jitter ([j2] viewport_jitter): real samples through the game's own viewports.
 bool vpj_mode() { return na::settings::Get().j2_viewport_jitter.load(std::memory_order_relaxed) != 0; }
@@ -946,7 +954,7 @@ void vpj_advance()
 {
     const bool running = g.submitted_frame && g.frame <= g.submitted_frame + 2;
     if (!vpj_mode() || !g.jitter_on || !running || !g.w) { na::observe::SetSceneViewportJitter(0, 0.f, 0.f); return; }
-    const neural_alias::JitterSample js = neural_alias::temporal_jitter(++g.vpj_phase, jitter_phases());
+    const neural_alias::JitterSample js = jitter_sample(++g.vpj_phase, jitter_phases());
     auto& e = g.vpj[g.frame % 8];
     e.frame = g.frame; e.x = static_cast<float>(js.x_pixels); e.y = static_cast<float>(js.y_pixels);
     na::observe::SetSceneViewportJitter(g.frame, e.x, e.y);
@@ -1151,7 +1159,7 @@ bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& in_byt
         }
         remember_main_camera(m);
         const uint32_t phases = windowed ? JitterPhasesFor(jw, g.win.w) : jitter_phases();
-        const neural_alias::JitterSample js = neural_alias::temporal_jitter(++g.jit.phase, phases);
+        const neural_alias::JitterSample js = jitter_sample(++g.jit.phase, phases);
         std::array<double, 16> src{};
         for (int i = 0; i < 16; ++i) src[i] = m[i];
         const auto jm = neural_alias::jitter_projection(src, js, jw, jh);
@@ -4209,7 +4217,7 @@ void SetUpscaleTarget(const UpscaleTarget& t) { std::lock_guard<std::mutex> lk(g
 UpscaleTarget GetUpscaleTarget() { std::lock_guard<std::mutex> lk(g_up_m); return g_up; }
 uint32_t JitterPhasesFor(uint32_t render_w, uint32_t out_w)
 {
-    if (!render_w || out_w <= render_w) return kJitterPhases;
+    if (!render_w || out_w <= render_w) return kDlaaJitterPhases;
     const double r = static_cast<double>(out_w) / render_w;
     return static_cast<uint32_t>((std::min)(64.0, std::ceil(kJitterPhases * r * r)));
 }

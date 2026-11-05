@@ -17,6 +17,16 @@ inline JitterSample temporal_jitter(uint32_t phase, uint32_t period) {
     const uint32_t index=phase%period+1;
     return {radical_inverse(index,2)-0.5,radical_inverse(index,3)-0.5};
 }
+// Martin Roberts' R2 low-discrepancy sequence (plastic constant), on the same cycle as
+// temporal_jitter (index wraps at period, so every consumer that assumes a repeating
+// pattern keeps working): x = frac(0.5 + n*a1) - 0.5, y = frac(0.5 + n*a2) - 0.5.
+inline JitterSample temporal_jitter_r2(uint32_t phase, uint32_t period) {
+    if(period<2 || period>4096) throw std::invalid_argument("jitter period must be 2..4096");
+    const double a1=0.7548776662466927, a2=0.5698402909980532;
+    const double n=double(phase%period+1);
+    const auto frac=[](double v){ return v-double(static_cast<int64_t>(v)); };
+    return {frac(0.5+n*a1)-0.5,frac(0.5+n*a2)-0.5};
+}
 // Explicit convention: row-major storage, column-vector multiplication, D3D viewport.
 // Pixel X points right and pixel Y down. Translate clip X/Y by W so displacement
 // is constant after perspective division. Preserve clip Z/W, including reverse-Z.

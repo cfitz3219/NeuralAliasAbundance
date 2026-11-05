@@ -1223,6 +1223,20 @@ void DrawLiveDlaaEnhancements()
         StatusLine(0, tb);
         if (as.on != (idx == 1)) StatusLine(2, "Restart the game to apply this change.");
     }
+    {
+        // Jitter sequence (Cort 2026-11-05): where inside each pixel DLAA/DLSS samples, frame
+        // by frame. Same number of positions either way (16 for DLAA); switches live.
+        static const char* kSeq[] = {"Halton (NVIDIA's recommendation)", "R2 (Roberts)"};
+        na::settings::Settings& ss = na::settings::Get();
+        int idx = ss.j2_jitter_r2.load() ? 1 : 0;
+        BeginRow("Jitter pattern", "The order of tiny sub-pixel shifts DLAA/DLSS uses to rebuild detail over frames. Halton is NVIDIA's recommendation; R2 (Martin Roberts) spaces the positions a little more evenly. Compare them standing still on fine detail (wires, fences, grass). Switches live; remembered for this game.", S(220));
+        ImGui::SetNextItemWidth(S(220));
+        if (ImGui::Combo("##jitterseq", &idx, kSeq, 2)) {
+            ss.j2_jitter_r2.store(idx ? 1u : 0u);
+            na::settings::Save();
+        }
+        EndRow();
+    }
     EndGroupBox();
 }
 

@@ -1,6 +1,7 @@
 // reconstructed 2026-10 — independent sample values and projected displacement.
 #include "test_support.hpp"
 #include "core/temporal_jitter.hpp"
+#include <cmath>
 using namespace neural_alias;
 int main() { return test::run({
     {"known Halton samples and wrapping", [] {
@@ -15,6 +16,19 @@ int main() { return test::run({
             auto s = temporal_jitter(i, 4096);
             CHECK(s.x_pixels >= -.5 && s.x_pixels < .5 && s.y_pixels >= -.5 && s.y_pixels < .5);
         }
+    }},
+    {"R2 samples: known values, range, mean near zero, wrapping", [] {
+        const auto a = temporal_jitter_r2(0, 16); // n = 1
+        NEAR(a.x_pixels, -0.2451223337533073, 1e-12); NEAR(a.y_pixels, -0.4301597090019468, 1e-12);
+        double mx = 0, my = 0;
+        for (uint32_t i = 0; i < 16; ++i) {
+            const auto s = temporal_jitter_r2(i, 16), w = temporal_jitter_r2(i + 16, 16);
+            CHECK(s.x_pixels >= -.5 && s.x_pixels < .5 && s.y_pixels >= -.5 && s.y_pixels < .5);
+            NEAR(s.x_pixels, w.x_pixels, 0); NEAR(s.y_pixels, w.y_pixels, 0);
+            mx += s.x_pixels; my += s.y_pixels;
+        }
+        CHECK(std::fabs(mx / 16) < 0.1 && std::fabs(my / 16) < 0.1);
+        for (uint32_t period : {0u, 1u, 4097u}) test::invalid_argument([=] { temporal_jitter_r2(0, period); });
     }},
     {"invalid period and dimensions", [] {
         for (uint32_t period : {0u, 1u, 4097u}) test::invalid_argument([=] { temporal_jitter(0, period); });

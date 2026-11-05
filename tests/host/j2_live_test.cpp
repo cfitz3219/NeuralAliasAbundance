@@ -538,7 +538,7 @@ int main()
             d.WaitIdle();
         }
         na::j2::SetDebugView(0);
-        CHECK(na::j2::JitterPhasesFor(64, 64) == 8 && na::j2::JitterPhasesFor(10, 100) == 64);
+        CHECK(na::j2::JitterPhasesFor(64, 64) == 16 && na::j2::JitterPhasesFor(10, 100) == 64);
         CHECK(std::fabs(na::j2::UpscaleMipBias(64, 64) + 1.0f) < 1e-6f && std::fabs(na::j2::UpscaleMipBias(50, 100) + 2.0f) < 1e-6f);
         d.WaitIdle();
     }
