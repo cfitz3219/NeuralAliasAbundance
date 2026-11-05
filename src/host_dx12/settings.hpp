@@ -71,6 +71,7 @@ struct Settings {
     // kept out of DLSS and upscaled by NIS at this sharpness. [j2] hud_nis.
     std::atomic<uint32_t> j2_hud_nis{50};
     std::atomic<uint32_t> j2_flow_loosen{50}; // J2 moving-object flow: 0 = the original acceptance rules, 100 = loosest (Cort 2026-11-03)
+    std::atomic<uint32_t> aniso16{0}; // 16x anisotropic filtering on the game's surface textures: [j2] anisotropic 0/1; read at game start
     std::atomic<int32_t> j2_mip_bias_x100{-100}; // J2 texture detail: [j2] mip_bias x 100 (0, -50, -100); read at game start
     std::atomic<bool> j2_inline{false}; // legacy [j2] inline=1: same as route=inline (diagnostic override)
     std::atomic<uint32_t> j2_route{0};  // [j2] route: 0 auto (default), 1 between, 2 inline (diagnostic overrides)

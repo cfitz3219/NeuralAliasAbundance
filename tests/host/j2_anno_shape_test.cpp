@@ -446,6 +446,48 @@ int main(int argc, char** argv)
             na::observe::SetSamplerMipBiasLive(-1.0f);
         }
         na::observe::SetSamplerMipBias(0.0f);
+        // 16x anisotropic filtering (menu switch, no mip bias): a tiling linear sampler and an
+        // 8x static sampler become 16x (the root signature is rebuilt even with no bias change);
+        // shadow comparison and clamped screen-pass samplers are untouched; a 16x one is left.
+        {
+            na::observe::SetSamplerAnisotropy16(true);
+            const auto a0 = na::observe::GetAnisoStats();
+            CHECK(a0.on);
+            test::ComPtr<ID3D12RootSignature> rs_af;
+            D3D12_ROOT_SIGNATURE_DESC rd2{1, &p, 1, &ss, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+            test::ComPtr<ID3DBlob> blob2, err2;
+            REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rd2, D3D_ROOT_SIGNATURE_VERSION_1, &blob2, &err2)));
+            REQUIRE(SUCCEEDED(dev->CreateRootSignature(0, blob2->GetBufferPointer(), blob2->GetBufferSize(), IID_PPV_ARGS(&rs_af))));
+            const auto a1 = na::observe::GetAnisoStats();
+            CHECK(a1.static_samplers == a0.static_samplers + 1);
+            sd.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+            sd.MaxAnisotropy = 1;
+            sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+            dev->CreateSampler(&sd, h2);
+            const auto a2 = na::observe::GetAnisoStats();
+            CHECK(a2.samplers == a1.samplers + 1);
+            sd.Filter = D3D12_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR;
+            sd.ComparisonFunc = D3D12_COMPARISON_FUNC_LESS;
+            dev->CreateSampler(&sd, h2);
+            sd.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+            sd.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+            sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            dev->CreateSampler(&sd, h2);
+            const auto a3 = na::observe::GetAnisoStats();
+            CHECK(a3.samplers == a2.samplers);
+            sd.Filter = D3D12_FILTER_ANISOTROPIC;
+            sd.MaxAnisotropy = 16;
+            sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+            dev->CreateSampler(&sd, h2);
+            const auto a4 = na::observe::GetAnisoStats();
+            CHECK(a4.samplers == a3.samplers);
+            CHECK(a4.already == a3.already + 1);
+            na::observe::SetSamplerAnisotropy16(false);
+            sd.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+            sd.MaxAnisotropy = 1;
+            dev->CreateSampler(&sd, h2);
+            CHECK(na::observe::GetAnisoStats().samplers == a4.samplers); // off: untouched
+        }
     }
     test::ComPtr<ID3D12RootSignature> rs_pre; // the pre-pass's own root signature: one root CBV
     {

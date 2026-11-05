@@ -275,6 +275,11 @@ struct MipLiveStats {
 MipLiveStats GetMipLiveStats();
 float SamplerMipBias();
 void MipBiasCounts(uint64_t* samplers, uint64_t* static_samplers);
+// 16x anisotropic filtering on the same surface-texture samplers the mip bias treats
+// (sampler descriptors and static samplers created from now on; set before the game loads).
+void SetSamplerAnisotropy16(bool on);
+struct AnisoStats { bool on = false; uint64_t samplers = 0, static_samplers = 0, already = 0; };
+AnisoStats GetAnisoStats();
 // The game's own MipLODBias on surface-texture samplers (recorded whether or
 // not NeuralAlias biases): how many are negative / zero / positive, and range.
 struct NativeBiasStats { uint64_t negative = 0, zero = 0, positive = 0; float min = 0.0f, max = 0.0f; };

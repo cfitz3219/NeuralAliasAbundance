@@ -112,6 +112,7 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
         target.j2_hud_nis.store(static_cast<uint32_t>(hud < 0 ? 0 : (hud > 100 ? 100 : hud)));
         const int fl = static_cast<int>(GetPrivateProfileIntW(L"j2", L"flow_loosen", 50, ini));
         target.j2_flow_loosen.store(static_cast<uint32_t>(fl < 0 ? 0 : (fl > 100 ? 100 : fl)));
+        target.aniso16.store(GetPrivateProfileIntW(L"j2", L"anisotropic", 0, ini) == 1 ? 1u : 0u);
         wchar_t mb[32] = {};
         GetPrivateProfileStringW(L"j2", L"mip_bias", L"-1.0", mb, 32, ini);
         double mbv = _wtof(mb);
@@ -330,6 +331,7 @@ bool SaveFromWorker()
     ok &= WritePrivateProfileStringW(L"j2", L"hud_nis", v, ini) != 0;
     swprintf_s(v, L"%u", g_settings.j2_flow_loosen.load() > 100 ? 100u : g_settings.j2_flow_loosen.load());
     ok &= WritePrivateProfileStringW(L"j2", L"flow_loosen", v, ini) != 0;
+    ok &= WritePrivateProfileStringW(L"j2", L"anisotropic", g_settings.aniso16.load() ? L"1" : L"0", ini) != 0;
     {
         const uint32_t pv = g_settings.j2_preset.load();
         if (pv == 255) swprintf_s(v, L"auto");

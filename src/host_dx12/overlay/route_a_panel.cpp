@@ -1202,6 +1202,27 @@ void DrawLiveDlaaEnhancements()
         if (!live && static_cast<int>(ml.game_bias * -100.0f + 0.5f) != -cur)
             StatusLine(2, "Live switching is not available in this session (no prepared pipelines): restart the game to see this change.");
     }
+    {
+        // 16x anisotropic filtering on the game's surface textures (before DLSS, where the game
+        // samples them). Samplers are built when the game loads: a change applies at the next start.
+        static const char* kAniso[] = {"Off (game's own)", "On (16x)"};
+        na::settings::Settings& ss = na::settings::Get();
+        int idx = ss.aniso16.load() ? 1 : 0;
+        BeginRow("Anisotropic filtering", "Makes the game's surface textures 16x anisotropic, so ground, walls and roofs seen at an angle stay sharp instead of blurring with distance. It works together with Texture detail and happens before DLSS, so DLSS gets the sharper picture. Shadows and screen effects are never changed. Applies at the next game start; remembered for this game.", S(220));
+        ImGui::SetNextItemWidth(S(220));
+        if (ImGui::Combo("##aniso16", &idx, kAniso, 2)) {
+            ss.aniso16.store(idx ? 1u : 0u);
+            na::settings::Save();
+        }
+        EndRow();
+        const auto as = na::observe::GetAnisoStats();
+        char tb[240];
+        std::snprintf(tb, sizeof tb, "This session: %s (%llu samplers and %llu built-in samplers made 16x, %llu were 16x already).",
+                      as.on ? "on" : "off", static_cast<unsigned long long>(as.samplers), static_cast<unsigned long long>(as.static_samplers),
+                      static_cast<unsigned long long>(as.already));
+        StatusLine(0, tb);
+        if (as.on != (idx == 1)) StatusLine(2, "Restart the game to apply this change.");
+    }
     EndGroupBox();
 }
 
