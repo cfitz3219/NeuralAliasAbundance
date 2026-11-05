@@ -1,3 +1,4 @@
+#include "host_dx12/overlay/usage_sampler.hpp"
 #include "host_dx12/host_boot/process_log.hpp"
 #include "host_dx12/nr/sl_consumer.hpp"
 #include "host_dx12/adapters/tlou1/apply.hpp"
@@ -271,7 +272,9 @@ DWORD WINAPI InitThread(LPVOID)
         boot_log(!na::j2::Configured() ? "render-small: requested but OFF ([j2] enabled=1 and [observe] producers=1 needed)"
                                        : "render-small: requested but OFF ([present] proxy=0)");
     na::j2::SetRenderSmall(render_small);
-    na::observe::SetHookProfiling(GetPrivateProfileIntW(L"observe",L"profile_hooks",0,g_ini)==1);
+    {const bool profile=GetPrivateProfileIntW(L"observe",L"profile_hooks",0,g_ini)==1;
+     na::observe::SetHookProfiling(profile);
+     if(profile)na::usage::Start();} // test packages: CPU/GPU usage + busiest threads in the status log
     // Read-only size-query probe (COMMS 4bd474c I1.5): which window/monitor/display-mode/DXGI
     // output calls the game uses to learn a size. Changes no answer. [present] size_probe=1.
     if (GetPrivateProfileIntW(L"present", L"size_probe", 0, g_ini) == 1)
