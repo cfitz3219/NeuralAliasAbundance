@@ -1,4 +1,5 @@
 #include "host_dx12/host_boot/process_log.hpp"
+#include "host_dx12/gpu/mem_alloc.hpp"
 #include "host_dx12/diag/gpu_breadcrumbs.hpp"
 #include "host_dx12/diag/dred.hpp"
 #include "host_dx12/native_present/size_spoof.hpp"
@@ -1002,7 +1003,7 @@ void write_status_line()
             WriteFile(f, hud.data(), DWORD(hud.size()), &written, nullptr);
             if (na::j2::hud_unblend::Configured()) {
                 const std::string ub = na::j2::hud_unblend::StatusLine() + " composited=" + std::to_string(j2.small_hud_layer) + "\r\n" +
-                                       na::diag::crumbs::StatusLine() + "\r\n";
+                                       na::diag::crumbs::StatusLine() + "\r\n" + na::gpu::mem::StatusLine() + "\r\n";
                 WriteFile(f, ub.data(), DWORD(ub.size()), &written, nullptr);
             }
             {

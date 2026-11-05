@@ -185,6 +185,7 @@ add_library(host_dx12 STATIC
   src/host_dx12/overlay/overlay.cpp
   src/host_dx12/overlay/usage_sampler.cpp
   src/host_dx12/overlay/dlss_debug.cpp
+  src/host_dx12/gpu/mem_alloc.cpp
   src/host_dx12/overlay/menu.cpp
   src/host_dx12/overlay/route_a_panel.cpp
   src/host_dx12/overlay/presenter.cpp
@@ -257,7 +258,7 @@ endif()
 target_link_libraries(host_dx12 PUBLIC host_gpu_services)
 target_include_directories(host_dx12 SYSTEM PRIVATE third_party/nis)
 target_link_libraries(host_dx12
-  PUBLIC abundance_options host_hooking host_native_present host_scale host_settings host_capture host_nvof host_ffx_flow core_gpu imgui nvapi_headers host_dlss host_upscalers host_observe_producers host_scene_scale
+  PUBLIC abundance_options d3d12ma host_hooking host_native_present host_scale host_settings host_capture host_nvof host_ffx_flow core_gpu imgui nvapi_headers host_dlss host_upscalers host_observe_producers host_scene_scale
          d3d12 dxgi d3dcompiler user32 gdi32 shell32 ole32 bcrypt dbghelp winmm)
 if(NA_HAVE_NGX_SDK)
   target_compile_definitions(host_dx12 PUBLIC NA_HAVE_NGX_SDK)
@@ -288,6 +289,11 @@ if(NA_HAVE_NGX_SDK AND NA_NGX_LIB AND EXISTS "${NA_NGX_LIB}")
 endif()
 # DRED report (Windows' device-removed diagnostics; diag/dred.hpp). Its own library: the
 # DLSS backend and the host both report a removal.
+# AMD D3D12 Memory Allocator (MIT, v3.0.1, unmodified; third_party/d3d12ma): vendor code,
+# built without our /W4 /WX. Used through gpu/mem_alloc.hpp.
+add_library(d3d12ma STATIC third_party/d3d12ma/src/D3D12MemAlloc.cpp)
+target_include_directories(d3d12ma SYSTEM PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/third_party/d3d12ma/include")
+target_link_libraries(d3d12ma PUBLIC d3d12 dxgi)
 # AMD FidelityFX Breadcrumbs (MIT, FidelityFX SDK v1.1.4, unmodified; third_party/ffx-breadcrumbs):
 # vendor code, built without our /W4 /WX. Our own DX12 backend is in diag/gpu_breadcrumbs.cpp.
 add_library(ffx_breadcrumbs STATIC

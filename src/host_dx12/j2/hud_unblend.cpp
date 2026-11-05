@@ -1,4 +1,5 @@
 #include "host_dx12/j2/hud_unblend.hpp"
+#include "host_dx12/gpu/mem_alloc.hpp"
 #include "host_dx12/j2/native_hud.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/observe/producers.hpp"
@@ -78,14 +79,16 @@ DXGI_FORMAT clear_view_of(DXGI_FORMAT typeless)
 
 bool committed(ID3D12Device* dev, uint32_t w, uint32_t h, DXGI_FORMAT typeless, ComPtr<ID3D12Resource>& out, const wchar_t* name)
 {
-    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
     D3D12_RESOURCE_DESC d{};
     d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     d.Width = w; d.Height = h; d.DepthOrArraySize = 1; d.MipLevels = 1;
     d.Format = typeless;
     d.SampleDesc.Count = 1;
     d.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&out)))) return false;
+    // D3D12 Memory Allocator (placed): safe here because every layer's first GPU operation in
+    // a frame is clear_background_locked's full ClearRenderTargetView (see OnDraw/TakeFrame:
+    // layers are only read in frames that cleared them).
+    if (FAILED(na::gpu::mem::CreateResource(dev, D3D12_HEAP_TYPE_DEFAULT, d, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, out.ReleaseAndGetAddressOf()))) return false;
     out->SetName(name);
     return true;
 }
