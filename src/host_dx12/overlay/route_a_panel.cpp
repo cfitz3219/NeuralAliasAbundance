@@ -989,7 +989,15 @@ void DrawLiveDlaa()
         bool native_on = unblend ? na::j2::hud_unblend::Enabled() : na::j2::native_hud::Enabled();
         BeginRow("Native-resolution HUD", unblend ? "The game's UI draws are replayed at your screen's full resolution and taken out of DLSS's input; the UI is then laid over the upscaled picture exactly as the game blended it. A per-frame check holds the layers back if the game's final pass changed the picture. Off leaves the HUD in the game's image. Not saved."
                  : "Draws compatible HUD and text at your screen's full resolution after DLSS. When clean separation is unavailable, protects recognised HUD pixels from temporal movement. The original game picture stays available. Off leaves HUD in the game's image. Not saved.", SwitchWidth());
-        if (Switch("j2nativehud", &native_on)) { if (unblend) na::j2::hud_unblend::SetEnabled(native_on); else na::j2::native_hud::SetEnabled(native_on); }
+        // With the un-blend route configured, Off must leave the HUD in the game's image. Before
+        // (Cort's p23896 run, 2026-11-05 05:38) Off only stopped un-blending, so the older native
+        // HUD routes took over, kept learning and dropping the hand-off (upstream now=0/1 every
+        // few seconds) and the picture flipped between our output and the game's own picture
+        // (DLSS indicator on/off) until the game closed. Both routes now follow the one switch.
+        if (Switch("j2nativehud", &native_on)) {
+            if (unblend) { na::j2::hud_unblend::SetEnabled(native_on); na::j2::native_hud::SetEnabled(native_on); }
+            else na::j2::native_hud::SetEnabled(native_on);
+        }
         EndRow();
         if(native_on&&unblend){
             const auto ub=na::j2::hud_unblend::GetStats();

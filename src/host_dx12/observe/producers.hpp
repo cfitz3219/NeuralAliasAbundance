@@ -212,6 +212,10 @@ struct DrawInfo {
     uint32_t rt_count = 0;
     bool restorable = false, pipeline_known = false;
     bool native_hud_affine = false; // RT0 RGB representable by the black/grey HUD replay
+    // RT0 colour blend for the HUD un-blend: 0 unknown, 1 blending off, 2 linear in the
+    // destination (reversible), 3 blending on but the destination is replaced (DestBlend ZERO),
+    // 4 not reversible (MIN/MAX, logic op, destination-alpha factors).
+    uint8_t blend_class = 0;
     bool shader_readonly = false, query_active = false; // replay metadata, independent of table-prefix guesses
     bool pixel_position=false;
     uint32_t shader_rejection=0;

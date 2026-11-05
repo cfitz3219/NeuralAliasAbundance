@@ -189,6 +189,7 @@ struct Obj {
     std::vector<ShaderResource> shader_resources;
     bool reflection_complete=false;
     bool native_hud_affine=false;
+    uint8_t blend_class=0; // BlendClass (producers.hpp)
     bool shader_readonly=false;
     uint32_t shader_rejection=ShaderUnknown;
     bool pixel_position=false;
@@ -2047,6 +2048,25 @@ void blend_mask(na_ev_pipeline_created& e, const D3D12_BLEND_DESC& b)
 // MIN/MAX/logic/additive-clipping and destination-alpha coupling instead keep
 // the original full picture and use the draw-derived protection method.
 thread_local bool g_next_hud_affine=false;
+thread_local uint8_t g_next_blend_class=0;
+// RT0 colour blend as the HUD un-blend replay sees it (BlendClass in producers.hpp): the result
+// must be A + M * destination per channel with A, M independent of the destination, which
+// rules out MIN/MAX, logic ops and any factor reading the destination's ALPHA (the replay
+// targets carry alpha 1, the game's do not). A destination COLOUR factor on the source side is
+// still linear in the destination. DestBlend ZERO with no destination factor: the draw replaces
+// what is there, exactly like an opaque draw, although blending is switched on.
+uint8_t blend_class(const D3D12_BLEND_DESC& blend)
+{
+    const auto& b=blend.RenderTarget[0];
+    if(b.LogicOpEnable)return 4;
+    if(!b.BlendEnable)return 1;
+    if(b.BlendOp==D3D12_BLEND_OP_MIN||b.BlendOp==D3D12_BLEND_OP_MAX)return 4;
+    const auto dest_alpha=[](D3D12_BLEND f){return f==D3D12_BLEND_DEST_ALPHA||f==D3D12_BLEND_INV_DEST_ALPHA||f==D3D12_BLEND_SRC_ALPHA_SAT;};
+    const auto dest_colour=[](D3D12_BLEND f){return f==D3D12_BLEND_DEST_COLOR||f==D3D12_BLEND_INV_DEST_COLOR;};
+    if(dest_alpha(b.SrcBlend)||dest_alpha(b.DestBlend)||dest_colour(b.DestBlend))return 4;
+    if(b.DestBlend==D3D12_BLEND_ZERO&&!dest_colour(b.SrcBlend))return 3;
+    return 2;
+}
 thread_local bool g_next_stream_output=false;
 bool hud_affine(const D3D12_BLEND_DESC& blend)
 {
@@ -2061,6 +2081,7 @@ bool hud_affine(const D3D12_BLEND_DESC& blend)
 void pipeline_unknowns(na_ev_pipeline_created& e)
 {
     g_next_hud_affine=false;
+    g_next_blend_class=0;
     g_next_stream_output=false;
     for (auto& f : e.rtv_formats) f = 0;
     e.dsv_format = 0;
@@ -2085,7 +2106,7 @@ void emit_pipeline(ID3D12Device* dev, IUnknown* obj, na_ev_pipeline_created& e, 
             std::none_of(g_next_shader_resources.begin(),g_next_shader_resources.end(),[](const auto& r){return r.type==D3D12_DESCRIPTOR_RANGE_TYPE_UAV;});
     }
     {std::unique_lock<RegistryLock> lock(g_m);const auto found=g_objs.find(canon(obj));if(found!=g_objs.end()){
-        found->second.native_hud_affine=g_next_hud_affine;found->second.pixel_position=g_next_pixel_position;}}
+        found->second.native_hud_affine=g_next_hud_affine;found->second.blend_class=g_next_blend_class;found->second.pixel_position=g_next_pixel_position;}}
     emit(e, NA_GROUP_PIPELINE);
 }
 
@@ -2672,6 +2693,7 @@ HRESULT STDMETHODCALLTYPE D_CreateGraphicsPipelineState(ID3D12Device* dev, const
     depth_blend(e, d->DepthStencilState.DepthEnable, d->DepthStencilState.DepthWriteMask, d->DepthStencilState.DepthFunc);
     blend_mask(e, d->BlendState);
     g_next_hud_affine=hud_affine(d->BlendState);
+    g_next_blend_class=blend_class(d->BlendState);
     g_next_stream_output=d->StreamOutput.NumEntries!=0;
     emit_pipeline(dev, obj, e, d->pRootSignature);
     make_pso_twins(obj, d->pRootSignature, [&](int, ID3D12RootSignature* trs) -> IUnknown* {
@@ -2749,7 +2771,7 @@ HRESULT STDMETHODCALLTYPE D_CreatePipelineState(ID3D12Device2* dev, const D3D12_
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS: bytecode(e, NA_STAGE_CS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: bytecode(e, NA_STAGE_AS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: bytecode(e, NA_STAGE_MS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: blend_mask(e, inner_of<D3D12_BLEND_DESC>(s)); g_next_hud_affine=hud_affine(inner_of<D3D12_BLEND_DESC>(s)); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: blend_mask(e, inner_of<D3D12_BLEND_DESC>(s)); g_next_hud_affine=hud_affine(inner_of<D3D12_BLEND_DESC>(s)); g_next_blend_class=blend_class(inner_of<D3D12_BLEND_DESC>(s)); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: g_next_stream_output=inner_of<D3D12_STREAM_OUTPUT_DESC>(s).NumEntries!=0;break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL: {
             const auto& ds = inner_of<D3D12_DEPTH_STENCIL_DESC>(s);
@@ -6188,6 +6210,7 @@ bool ListDrawState(ID3D12CommandList* list, DrawInfo& out)
             r.pso_rt_count = p->rt_count; r.rtv_format = p->rtv_formats[0]; r.dsv_format = p->dsv_format;
             r.samples = p->sample_count; r.blend_mask = p->blend_enable_mask;
             r.native_hud_affine=pipeline->second.native_hud_affine;
+            r.blend_class=pipeline->second.blend_class;
             r.shader_readonly=pipeline->second.shader_readonly;
             r.shader_rejection=pipeline->second.shader_rejection;
             r.pixel_position=pipeline->second.pixel_position;

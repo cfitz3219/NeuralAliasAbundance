@@ -210,7 +210,11 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
     if (!na::observe::ListDrawState(l, st) || st.recording != t_bind.recording || st.rt != t_bind.rt) return {};
     const uint64_t verts = uint64_t(call.args[0]), inst = uint64_t(call.args[1]);
     const bool blend_known = st.pipeline_known && st.blend_mask != NA_UNKNOWN_U32;
-    const bool blended = blend_known && (st.blend_mask & 1u) != 0;
+    // Blending switched on but the destination replaced (DestBlend ZERO) is an opaque draw.
+    // Cort's p23896 run (2026-11-05): every replayed pixel came out independent of the
+    // background (ui_px == opaque, 1.3M px a frame) and differed from the final picture, which
+    // is what a full-screen post pass with blending "on" but ONE/ZERO factors looks like.
+    const bool blended = blend_known && (st.blend_mask & 1u) != 0 && st.blend_class != 3;
     std::lock_guard<std::mutex> lock(g_m);
     const Dims d = g_dims;
     if (!d.ow) return {};
@@ -229,6 +233,7 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
     // destination is linear, which is all the un-blend formula needs.
     if (verts <= 6 && inst == 1 && native_hud::CoversTarget(vp0, sc0, d.rw, d.rh)) {
         if (!blended) {
+            if (blend_known && (st.blend_mask & 1u) != 0) ++g_stats.opaque_blend;
             g_last_scene = LastScene{g_frame, t_bind.rt, ++g_scene_seq};
             if (mine && s.draws) {
                 clear_background_locked(l, s);
@@ -273,6 +278,7 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
     else if (st.ds && st.dsv_format != DXGI_FORMAT_UNKNOWN) why = "uses a depth/stencil target";
     else if (native_hud::TypelessOf(view) != native_hud::TypelessOf(d.proxy)) why = "view format differs from the picture";
     else if (!blend_known) why = "blend state unknown";
+    else if (st.blend_class == 4) { ++g_stats.irreversible; why = "blend reads the destination's alpha or uses min/max"; }
     if (why) { forward_locked(why); return {}; }
     ComPtr<ID3D12Device> dev;
     if (FAILED(l->GetDevice(IID_PPV_ARGS(&dev))) || !set_ready_locked(dev.Get(), s, d)) { forward_locked("could not make the layers"); return {}; }
@@ -400,11 +406,11 @@ std::string StatusLine()
     char b[1024];
     std::snprintf(b, sizeof b,
         "hud_unblend on=%u frames=%llu hud_frames=%llu composed=%llu held=%llu replayed=%llu blended=%llu forwarded=%llu world=%llu scene=%llu covered=%llu "
-        "cover_blend=%llu other_target=%llu retargeted=%llu cleared_after=%llu view_changed=%llu restore_failed=%llu last{draws=%u covered=%u view=%u} last_forward=\"%s\" "
+        "cover_blend=%llu opaque_blend=%llu irreversible=%llu other_target=%llu retargeted=%llu cleared_after=%llu view_changed=%llu restore_failed=%llu last{draws=%u covered=%u view=%u} last_forward=\"%s\" "
         "check{frames=%llu window{ui_px=%llu opaque=%llu id=%llu dec=%llu enc=%llu} permille{id=%u dec=%u enc=%u} verdict=%s}",
         Enabled() ? 1u : 0u, (unsigned long long)s.frames, (unsigned long long)s.hud_frames, (unsigned long long)s.composed, (unsigned long long)s.held,
         (unsigned long long)s.replayed, (unsigned long long)s.blended, (unsigned long long)s.forwarded, (unsigned long long)s.world, (unsigned long long)s.scene,
-        (unsigned long long)s.covered, (unsigned long long)s.cover_blend, (unsigned long long)s.other_target, (unsigned long long)s.retargeted, (unsigned long long)s.cleared_after, (unsigned long long)s.view_changed,
+        (unsigned long long)s.covered, (unsigned long long)s.cover_blend, (unsigned long long)s.opaque_blend, (unsigned long long)s.irreversible, (unsigned long long)s.other_target, (unsigned long long)s.retargeted, (unsigned long long)s.cleared_after, (unsigned long long)s.view_changed,
         (unsigned long long)s.restore_failed, s.last_draws, s.last_covered, s.last_view, s.last_forward,
         (unsigned long long)s.check_frames, (unsigned long long)s.ui_px, (unsigned long long)s.opaque_px, (unsigned long long)s.match_id,
         (unsigned long long)s.match_dec, (unsigned long long)s.match_enc, s.rate_id, s.rate_dec, s.rate_enc,
