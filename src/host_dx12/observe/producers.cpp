@@ -11,6 +11,7 @@
 #include "host_dx12/observe/texture_operation.hpp"
 #include "host_dx12/observe/operation_snapshot.hpp"
 #include "host_dx12/observe/shader_dimensions.hpp"
+#include "host_dx12/observe/reader_slots_lock.hpp"
 #include <tuple>
 #include <deque>
 #include <functional>
@@ -264,7 +265,10 @@ struct VaRange {
     const void* key = nullptr;
 };
 
-std::shared_mutex g_m; // registry, heaps, VA table. Never held across a D3D12 call.
+// registry, heaps, VA table. Never held across a D3D12 call. Readers take per-thread slots
+// instead of one shared lock word (reader_slots_lock.hpp: SE5 spun ~3.7 s/s on that word).
+using RegistryLock = na::observe::ReaderSlotsLock;
+RegistryLock g_m;
 // Never destroyed: at process exit an entry's twins must not be Released (a twin's last
 // Release can retire an object through its sentinel, which takes g_m and walks this map).
 std::unordered_map<const void*, Obj>& g_objs = *new std::unordered_map<const void*, Obj>();
@@ -662,7 +666,7 @@ void RetireSentinel::retire(const void* key, na_object_id id, uint32_t kind)
     g_retire_gen.fetch_add(1, std::memory_order_acq_rel);
     ObjParcel drop; // parked, never released here (we are inside the owner's destruction)
     {
-        std::unique_lock<std::shared_mutex> lock(g_m);
+        std::unique_lock<RegistryLock> lock(g_m);
         ++g_operation_revision;++g_heap_registry_revision;
         auto it = g_objs.find(key);
         if (it != g_objs.end() && it->second.id == id) { drop = take_parcel(it->second); g_objs.erase(it); }
@@ -715,7 +719,7 @@ void attach_sentinel(IUnknown* object, const void* key, na_object_id id, uint32_
     // Review: no retirement will ever be observed for this identity. Its
     // creation event carries METHOD_UNOBSERVED (see remember_creation).
     g_c.sentinel_fail.fetch_add(1);
-    std::unique_lock<std::shared_mutex> lock(g_m);
+    std::unique_lock<RegistryLock> lock(g_m);
     auto it = g_objs.find(key);
     if (it != g_objs.end() && it->second.id == id) it->second.retirement_unobservable = true;
 }
@@ -738,7 +742,7 @@ na_object_id register_object(IUnknown* object, uint32_t kind)
     const na_object_id id = g_next_id.fetch_add(1);
     ObjParcel drop; // stale entry's twins, released after g_m
     {
-        std::unique_lock<std::shared_mutex> lock(g_m);
+        std::unique_lock<RegistryLock> lock(g_m);
         Obj& o = g_objs[key];
         ++g_operation_revision;
         if (o.id) g_c.live.fetch_sub(1); // address reused without a retirement we saw
@@ -763,7 +767,7 @@ na_object_id ensure_registered(IUnknown* object, uint32_t kind, bool* created)
     na_object_id id = 0;
     ObjParcel drop; // stale entry's twins, released after g_m
     {
-        std::unique_lock<std::shared_mutex> lock(g_m);
+        std::unique_lock<RegistryLock> lock(g_m);
         auto it = g_objs.find(key);
         if (it != g_objs.end() && it->second.kind == kind) return it->second.id;
         id = g_next_id.fetch_add(1);
@@ -783,7 +787,7 @@ template <typename E>
 void remember_creation(const void* object, E& e)
 {
     const void* key = canon(object);
-    std::unique_lock<std::shared_mutex> lock(g_m);
+    std::unique_lock<RegistryLock> lock(g_m);
     auto it = g_objs.find(key);
     if (it == g_objs.end()) return;
     if (it->second.retirement_unobservable) e.hdr.flags |= NA_EVF_METHOD_UNOBSERVED;
@@ -801,7 +805,7 @@ na_object_id id_locked(const void* object)
 na_object_id lookup(const void* key)
 {
     if (!key) return 0;
-    std::shared_lock<std::shared_mutex> lock(g_m);
+    std::shared_lock<RegistryLock> lock(g_m);
     return id_locked(key);
 }
 
@@ -872,11 +876,11 @@ void note_resource(ID3D12Device* dev, IUnknown* obj, uint32_t creation_kind, ID3
     e.heap_type = heap_type;
     remember_creation(obj, e);
     {
-        std::unique_lock<std::shared_mutex> lock(g_m);
+        std::unique_lock<RegistryLock> lock(g_m);
         g_res_keys[id] = canon(obj);
     }
     if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-        std::unique_lock<std::shared_mutex> lock(g_m);
+        std::unique_lock<RegistryLock> lock(g_m);
         BufferInfo& bi = g_buffers[id];
         bi.heap_type = heap_type;
         bi.width = d.Width;
@@ -890,7 +894,7 @@ void note_resource(ID3D12Device* dev, IUnknown* obj, uint32_t creation_kind, ID3
         !(d.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS))
         known_created(id, static_cast<uint32_t>(initial));
     if (va) {
-        std::unique_lock<std::shared_mutex> lock(g_m);
+        std::unique_lock<RegistryLock> lock(g_m);
         va_insert(VaRange{va, va + d.Width, id, obj});
         ++g_operation_revision;
     }
@@ -940,7 +944,7 @@ na_object_id ensure_resource_registered(ID3D12Resource* res)
     e.heap_type = has_heap ? static_cast<uint32_t>(hp.Type) : NA_UNKNOWN_U32;
     remember_creation(res, e);
     {
-        std::unique_lock<std::shared_mutex> lock(g_m);
+        std::unique_lock<RegistryLock> lock(g_m);
         g_res_keys[id] = canon(res);
         if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             BufferInfo& bi = g_buffers[id];
@@ -1027,7 +1031,7 @@ void note_descriptor_write(D3D12_CPU_DESCRIPTOR_HANDLE dst, uint32_t kind, IUnkn
     const bool want = init_header_wanted(e, NA_EV_DESCRIPTOR_WRITE, 0);
     {
         const CostScope cost(kCostDescWrite);
-        std::shared_lock<std::shared_mutex> lock(g_m, std::defer_lock);
+        std::shared_lock<RegistryLock> lock(g_m, std::defer_lock);
         { const CostScope wait(kCostDescWriteWait); lock.lock(); }
         uint32_t slot = 0;
         DescHeap* h = heap_for_cpu_locked(dst.ptr, &slot);
@@ -1076,7 +1080,7 @@ void note_descriptor_copy(uint64_t dst, uint64_t src, uint32_t count, uint32_t i
             // Shared g_m + the slots' stripes (exact same result as the exclusive section,
             // which remains the path for a copy spanning more than kMaxStripes stripes).
             const CostScope cost(kCostDescCopy);
-            std::shared_lock<std::shared_mutex> lock(g_m, std::defer_lock);
+            std::shared_lock<RegistryLock> lock(g_m, std::defer_lock);
             { const CostScope wait(kCostDescCopyWait); lock.lock(); }
             uint32_t ds = 0, ss = 0;
             DescHeap* dh = heap_for_cpu_locked(dst, &ds);
@@ -1129,7 +1133,7 @@ void note_descriptor_copy(uint64_t dst, uint64_t src, uint32_t count, uint32_t i
         if (!striped) {
             // Rare (a copy over more than 32 stripes, 2048+ slots): the exclusive section.
             const CostScope cost(kCostDescCopy);
-            std::unique_lock<std::shared_mutex> lock(g_m, std::defer_lock);
+            std::unique_lock<RegistryLock> lock(g_m, std::defer_lock);
             { const CostScope wait(kCostDescCopyWait); lock.lock(); }
             uint32_t ds = 0, ss = 0;
             DescHeap* dh = heap_for_cpu_locked(dst, &ds);
@@ -1263,7 +1267,7 @@ void list_created(ID3D12Device* dev, IUnknown* obj, D3D12_COMMAND_LIST_TYPE type
     e.is_bundle = type == D3D12_COMMAND_LIST_TYPE_BUNDLE ? 1u : 0u;
     e.initially_open = open ? 1u : 0u;
     {
-        std::unique_lock<std::shared_mutex> lock(g_m);
+        std::unique_lock<RegistryLock> lock(g_m);
         auto it = g_objs.find(canon(obj));
         if (it != g_objs.end() && it->second.list) {
             it->second.list->generation.store(open ? 1 : 0);
@@ -1333,7 +1337,7 @@ void register_heap(ID3D12Device* dev, IUnknown* obj, ID3D12DescriptorHeap* h, co
     e.shader_visible = visible ? 1u : 0u;
     dh->id = e.heap;
     {
-        std::unique_lock<std::shared_mutex> lock(g_m);
+        std::unique_lock<RegistryLock> lock(g_m);
         // A heap at the same CPU address replaces a destroyed one we never saw retire.
         g_heaps.erase(std::remove_if(g_heaps.begin(), g_heaps.end(), [&](const std::unique_ptr<DescHeap>& x) { return x->key == obj; }),
                       g_heaps.end());
@@ -1353,7 +1357,7 @@ void ensure_heap_registered(ID3D12DescriptorHeap* h)
 {
     if (!h || t_host_work) return;
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         for (auto& dh : g_heaps)
             if (dh->key == h) return;
     }
@@ -1381,7 +1385,7 @@ void STDMETHODCALLTYPE D_CreateConstantBufferView(ID3D12Device* dev, const D3D12
     const bool want = init_header_wanted(e, NA_EV_DESCRIPTOR_WRITE, 0);
     {
         const CostScope cost(kCostDescWrite);
-        std::shared_lock<std::shared_mutex> lock(g_m, std::defer_lock);
+        std::shared_lock<RegistryLock> lock(g_m, std::defer_lock);
         { const CostScope wait(kCostDescWriteWait); lock.lock(); }
         if(desc&&desc->BufferLocation)known=resolve_va_locked(desc->BufferLocation,&res,&off);
         if(!known)e.hdr.flags|=NA_EVF_METHOD_UNOBSERVED;
@@ -1790,7 +1794,7 @@ std::shared_ptr<QueueState> queue_state(ID3D12CommandQueue* q, na_object_id* id)
     static std::mutex registration;
     std::lock_guard<std::mutex> first_use(registration);
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         auto it = g_objs.find(canon(q));
         if (it != g_objs.end() && it->second.queue) {
             *id = it->second.id;
@@ -1816,7 +1820,7 @@ std::shared_ptr<QueueState> queue_state(ID3D12CommandQueue* q, na_object_id* id)
     e.queue_flags = d.Flags;
     remember_creation(q, e);
     emit(e, NA_GROUP_QUEUE);
-    std::shared_lock<std::shared_mutex> lock(g_m);
+    std::shared_lock<RegistryLock> lock(g_m);
     auto it = g_objs.find(canon(q));
     *id = qid;
     return (it != g_objs.end() && it->second.queue) ? it->second.queue : nullptr;
@@ -1924,7 +1928,7 @@ bool snapshot()
     // Live inventory: creation events in id (= creation) order.
     std::vector<std::pair<na_object_id, std::vector<uint8_t>>> events;
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         events.reserve(g_objs.size());
         for (const auto& kv : g_objs)
             if (!kv.second.created.empty()) events.emplace_back(kv.second.id, kv.second.created);
@@ -2034,7 +2038,7 @@ void emit_pipeline(ID3D12Device* dev, IUnknown* obj, na_ev_pipeline_created& e, 
     e.root_signature = rs ? lookup(rs) : 0;
     remember_creation(obj, e);
     if(g_operation_snapshots.load()&&!t_host_work){
-        std::unique_lock<std::shared_mutex> lock(g_m);
+        std::unique_lock<RegistryLock> lock(g_m);
         const auto found=g_objs.find(canon(obj));if(found!=g_objs.end()){
             found->second.dimensions=g_next_dimensions;found->second.shader_resources=g_next_shader_resources;
             found->second.reflection_complete=g_next_reflection_complete;
@@ -2042,7 +2046,7 @@ void emit_pipeline(ID3D12Device* dev, IUnknown* obj, na_ev_pipeline_created& e, 
         if(found!=g_objs.end())found->second.shader_readonly=g_next_shader_readonly&&!g_next_stream_output&&
             std::none_of(g_next_shader_resources.begin(),g_next_shader_resources.end(),[](const auto& r){return r.type==D3D12_DESCRIPTOR_RANGE_TYPE_UAV;});
     }
-    {std::unique_lock<std::shared_mutex> lock(g_m);const auto found=g_objs.find(canon(obj));if(found!=g_objs.end()){
+    {std::unique_lock<RegistryLock> lock(g_m);const auto found=g_objs.find(canon(obj));if(found!=g_objs.end()){
         found->second.native_hud_affine=g_next_hud_affine;found->second.pixel_position=g_next_pixel_position;}}
     emit(e, NA_GROUP_PIPELINE);
 }
@@ -2324,7 +2328,7 @@ std::shared_ptr<Obj::Twins> build_rs_set(const VariantRecipe& r, int af, uint32_
         // each other). That level has no twin: recordings at it fall back to the game's objects.
         bool game_obj = false;
         {
-            std::shared_lock<std::shared_mutex> lock(g_m);
+            std::shared_lock<RegistryLock> lock(g_m);
             game_obj = g_objs.find(canon(twin)) != g_objs.end();
         }
         if (game_obj) {
@@ -2527,7 +2531,7 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
     ev.e.device = device_id(dev);
     ev.e.root_signature = register_object(obj, NA_OBJ_PIPELINE_HOST);
     {
-        std::unique_lock<std::shared_mutex> lock(g_m);
+        std::unique_lock<RegistryLock> lock(g_m);
         auto it = g_objs.find(canon(obj));
         if (it != g_objs.end()) {
             if (it->second.retirement_unobservable) ev.e.hdr.flags |= NA_EVF_METHOD_UNOBSERVED;
@@ -2569,7 +2573,7 @@ void make_pso_twins(IUnknown* pso, const void* rs, Make make, RecipeFn&& recipe_
         kind = 2;
         g_mip_untwinned.fetch_add(1, std::memory_order_relaxed);
     } else {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         const auto it = g_objs.find(canon(rs));
         if (it != g_objs.end() && it->second.variant_kind == 1) {
             kind = 1;
@@ -2596,7 +2600,7 @@ void make_pso_twins(IUnknown* pso, const void* rs, Make make, RecipeFn&& recipe_
         }
     }
     {
-        std::unique_lock<std::shared_mutex> lock(g_m);
+        std::unique_lock<RegistryLock> lock(g_m);
         const auto it = g_objs.find(canon(pso));
         if (it != g_objs.end()) {
             it->second.variant_kind = kind;
@@ -2771,7 +2775,7 @@ ListState* list_state_locked(const void* l, na_object_id* id)
 template <typename F>
 void with_list_state(const void* l, F&& f)
 {
-    std::shared_lock<std::shared_mutex> lock(g_m);
+    std::shared_lock<RegistryLock> lock(g_m);
     na_object_id id = 0;
     if (ListState* ls = list_state_locked(l, &id)) f(*ls);
 }
@@ -2829,7 +2833,7 @@ bool begin_op(ID3D12GraphicsCommandList* l, Rec* r)
     if (t_host_work || !na::observe_internal::Started() || !l) return false;
     for (int attempt = 0; attempt < 2; ++attempt) {
         {
-            std::shared_lock<std::shared_mutex> lock(g_m);
+            std::shared_lock<RegistryLock> lock(g_m);
             na_object_id id = 0;
             if (ListState* ls = list_state_locked(l, &id)) {
                 r->list = id;
@@ -2849,7 +2853,7 @@ template<class Fn>
 bool recorded_locked(ID3D12GraphicsCommandList* l,Rec& r,Fn&& fn){
     if(t_host_work||!na::observe_internal::Started()||!l)return false;
     for(int attempt=0;attempt<2;++attempt){
-        {std::shared_lock<std::shared_mutex> lock(g_m);na_object_id id=0;
+        {std::shared_lock<RegistryLock> lock(g_m);na_object_id id=0;
             if(auto* ls=list_state_locked(l,&id)){
                 r.list=id;r.gen=ls->generation_known.load()?ls->generation.load():NA_UNKNOWN_U64;r.op_index=ls->op_index.fetch_add(1)+1;
                 if(!ls->recording_observed.load()||!ls->coverage_complete.load()||r.gen==NA_UNKNOWN_U64)r.flags|=NA_EVF_METHOD_UNOBSERVED;
@@ -2961,7 +2965,7 @@ na_view_ref view_ref_locked(DescHeap* h, uint32_t slot)
 
 na_view_ref cpu_ref(D3D12_CPU_DESCRIPTOR_HANDLE h)
 {
-    std::shared_lock<std::shared_mutex> lock(g_m);
+    std::shared_lock<RegistryLock> lock(g_m);
     uint32_t slot = 0;
     DescHeap* dh = heap_for_cpu_locked(h.ptr, &slot);
     return view_ref_locked(dh, slot);
@@ -2991,13 +2995,13 @@ struct On<sl::list::Reset> {
         uint64_t gen = 0;
         bool bundle = false;
         {
-            std::shared_lock<std::shared_mutex> lock(g_m);
+            std::shared_lock<RegistryLock> lock(g_m);
             known = list_state_locked(l, &id) != nullptr;
         }
         if (!known) preexisting_list(l);
         const auto cov = na::hooking::variants::CoverageOf(na::hooking::variants::Kind::CommandList, l);
         {
-            std::shared_lock<std::shared_mutex> lock(g_m);
+            std::shared_lock<RegistryLock> lock(g_m);
             ListState* ls = list_state_locked(l, &id);
             if (!ls) return;
             if (SUCCEEDED(hr)) {
@@ -3426,7 +3430,7 @@ struct On<sl::list::SetDescriptorHeaps> {
         na_object_id res = 0, smp = 0;
         for (UINT i = 0; h && i < n; ++i) {
             if (!h[i]) continue;
-            std::shared_lock<std::shared_mutex> lock(g_m);
+            std::shared_lock<RegistryLock> lock(g_m);
             for (auto& dh : g_heaps)
                 if (dh->key == h[i]) (dh->type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? smp : res) = dh->id;
         }
@@ -3594,7 +3598,7 @@ void root_view(GL* l, UINT param, D3D12_GPU_VIRTUAL_ADDRESS va)
     uint64_t off = 0;
     bool known = false;
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         known = resolve_va_locked(va, &res, &off);
     }
     if (Kind == NA_DESC_CBV) {
@@ -3653,7 +3657,7 @@ struct On<sl::list::OMSetRenderTargets> {
         na_view_ref refs[9];
         uint32_t m = 0;
         {
-            std::shared_lock<std::shared_mutex> lock(g_m);
+            std::shared_lock<RegistryLock> lock(g_m);
             for (UINT i = 0; rts && i < n && i < 8; ++i) {
                 // Single range: consecutive descriptors from rts[0].
                 const D3D12_CPU_DESCRIPTOR_HANDLE h = single ? D3D12_CPU_DESCRIPTOR_HANDLE{rts[0].ptr + static_cast<SIZE_T>(i) * descriptor_increment_cached(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)} : rts[i];
@@ -3720,7 +3724,7 @@ struct On<sl::list::ExecuteIndirect> {
         if (begin_op(l, &r)) emit_op(r, NA_OP_EXECUTE_INDIRECT, {max}, nullptr, 0, 0, NA_EVF_METHOD_UNOBSERVED);
         bool graphics=false;
         {
-            std::shared_lock<std::shared_mutex> lock(g_m);
+            std::shared_lock<RegistryLock> lock(g_m);
             na_object_id id=0;auto* ls=list_state_locked(l,&id);
             if(ls) {
                 std::lock_guard<std::mutex> bl(ls->bind_m);
@@ -3749,7 +3753,7 @@ struct On<sl::list::BeginRenderPass> {
         na_view_ref refs[9];
         uint32_t m = 0;
         {
-            std::shared_lock<std::shared_mutex> lock(g_m);
+            std::shared_lock<RegistryLock> lock(g_m);
             for (UINT i = 0; rts && i < n && i < 8; ++i) {
                 uint32_t slot = 0;
                 refs[m++] = view_ref_locked(heap_for_cpu_locked(rts[i].cpuDescriptor.ptr, &slot), slot);
@@ -3887,7 +3891,7 @@ void before_read_transition(GL* l, UINT count, const D3D12_RESOURCE_BARRIER* bar
             }
         }
         {
-            std::shared_lock<std::shared_mutex> lock(g_m);
+            std::shared_lock<RegistryLock> lock(g_m);
             na_object_id lid = 0;
             auto* ls = list_state_locked(l, &lid);
             if (!ls) return;
@@ -3923,7 +3927,7 @@ void before_texture_copy(GL* l, ID3D12Resource* dst, ID3D12Resource* src)
     if (!from_color && !is_derived(source)) return;
     add_derived(destination); // lineage: the copy carries the scene on
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         na_object_id lid = 0;
         auto* ls = list_state_locked(l, &lid);
         if (!ls) return;
@@ -3940,7 +3944,7 @@ void after_texture_copy(GL* l, ID3D12Resource* dst)
 {
     if (t_host_work || !na::observe_internal::Started() || !dst) return;
     const auto destination = resource_id(dst);
-    std::shared_lock<std::shared_mutex> lock(g_m);
+    std::shared_lock<RegistryLock> lock(g_m);
     na_object_id lid = 0;
     auto* ls = list_state_locked(l, &lid);
     if (!ls) return;
@@ -3957,7 +3961,7 @@ void before_shader_use(GL* l, bool compute, bool indirect=false)
     bool reads_color = false;
     na::j2::InsertionEvent entry;
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         na_object_id lid = 0;
         auto* ls = list_state_locked(l, &lid);
         if (!ls) return;
@@ -4088,7 +4092,7 @@ void mip_on_pso(GL* l, ID3D12PipelineState*& p)
     if (!g_mip_switched.load(std::memory_order_relaxed) || !p) return;
     bool fallback = false;
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         na_object_id lid = 0;
         ListState* ls = list_state_locked(l, &lid);
         if (!ls) return;
@@ -4110,7 +4114,7 @@ void mip_on_rs(GL* l, ID3D12RootSignature*& r)
     if (!g_mip_switched.load(std::memory_order_relaxed) || !r) return;
     bool fallback = false;
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         na_object_id lid = 0;
         ListState* ls = list_state_locked(l, &lid);
         if (!ls) return;
@@ -4133,7 +4137,7 @@ void mip_on_reset(GL* l, ID3D12PipelineState*& p)
 {
     if (!g_mip_switched.load(std::memory_order_relaxed)) return;
     const uint32_t v = g_var_live.load(std::memory_order_acquire);
-    std::shared_lock<std::shared_mutex> lock(g_m);
+    std::shared_lock<RegistryLock> lock(g_m);
     na_object_id lid = 0;
     ListState* ls = list_state_locked(l, &lid);
     if (!ls) return;
@@ -4175,7 +4179,7 @@ void capture_raster_targets(GL* list, UINT count, const D3D12_CPU_DESCRIPTOR_HAN
     if (!enabled) return;
     if (count > 8 || (count && !targets)) return;
     if (g_operation_snapshots.load()) {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         na_object_id id = 0; auto* ls = list_state_locked(list, &id);
         if (ls) {
             std::lock_guard<std::mutex> bl(ls->bind_m);
@@ -4195,7 +4199,7 @@ void capture_raster_targets(GL* list, UINT count, const D3D12_CPU_DESCRIPTOR_HAN
     }
     std::shared_ptr<Obj::Twins> storage;
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         const auto found = g_objs.find(canon(list));
         if (found == g_objs.end() || !found->second.list) return;
         storage = found->second.twins;
@@ -4215,7 +4219,7 @@ void capture_raster_targets(GL* list, UINT count, const D3D12_CPU_DESCRIPTOR_HAN
         if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&ds)))) return;
         candidate->obj[0] = rt.Detach(); candidate->obj[1] = ds.Detach();
         {
-            std::unique_lock<std::shared_mutex> lock(g_m);
+            std::unique_lock<RegistryLock> lock(g_m);
             const auto found = g_objs.find(canon(list));
             if (found == g_objs.end() || !found->second.list) return;
             if (!found->second.twins) found->second.twins = candidate;
@@ -4256,7 +4260,7 @@ float vpj_axis(uint64_t v, unsigned shift) { return static_cast<float>(static_ca
 void vpj_viewports_replaced(GL* l, bool reset)
 {
     if (!g_vpj_ever.load(std::memory_order_relaxed) || t_vpj_self) return;
-    std::shared_lock<std::shared_mutex> lock(g_m);
+    std::shared_lock<RegistryLock> lock(g_m);
     na_object_id id = 0;
     auto* ls = list_state_locked(l, &id);
     if (!ls) return;
@@ -4277,7 +4281,7 @@ void vpj_before_draw(GL* l)
     {
         uint64_t sel_depth = 0, sel_color = 0;
         GetLiveSelection(&sel_depth, &sel_color);
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         na_object_id id = 0;
         auto* ls = list_state_locked(l, &id);
         if (!ls) return;
@@ -4602,7 +4606,7 @@ void note_map(ID3D12Resource* r, void* cpu)
 {
     const na_object_id id = lookup(r);
     if (!id) return;
-    std::unique_lock<std::shared_mutex> lock(g_m);
+    std::unique_lock<RegistryLock> lock(g_m);
     auto it = g_buffers.find(id);
     if (it == g_buffers.end()) return;
     it->second.cpu = static_cast<uint8_t*>(cpu);
@@ -4616,7 +4620,7 @@ void note_unmap(ID3D12Resource* r)
     const na_object_id id = lookup(r);
     if (!id) return;
     if (auto probe = g_unmap_probe.load(std::memory_order_acquire)) probe(g_unmap_probe_user.load());
-    std::unique_lock<std::shared_mutex> lock(g_m);
+    std::unique_lock<RegistryLock> lock(g_m);
     auto it = g_buffers.find(id);
     if (it == g_buffers.end() || !it->second.maps) return;
     if (--it->second.maps == 0) it->second.cpu = nullptr;
@@ -4678,7 +4682,7 @@ void snapshot_submission(na_object_id qid, uint64_t ticket, uint32_t count, ID3D
         na_object_id lid = 0;
         uint64_t gen = NA_UNKNOWN_U64;
         {
-            std::shared_lock<std::shared_mutex> lock(g_m);
+            std::shared_lock<RegistryLock> lock(g_m);
             ListState* ls = lists[li] ? list_state_locked(lists[li], &lid) : nullptr;
             if (!ls) continue;
             gen = ls->generation_known.load() ? ls->generation.load() : NA_UNKNOWN_U64;
@@ -4717,7 +4721,7 @@ void snapshot_submission(na_object_id qid, uint64_t ticket, uint32_t count, ID3D
             } else {
                 ID3D12Resource* reread = nullptr; // G3-02: host read of an app-unmapped buffer
                 {
-                    std::shared_lock<std::shared_mutex> lock(g_m); // Unmap waits for the copy
+                    std::shared_lock<RegistryLock> lock(g_m); // Unmap waits for the copy
                     auto it = g_buffers.find(b.resource);
                     if (it == g_buffers.end()) o.e.status = NA_SNAP_UNRESOLVED;
                     else if (!it->second.cpu_visible) o.e.status = NA_SNAP_GPU_WRITTEN;
@@ -5327,7 +5331,7 @@ void capture_submission(uint32_t count, ID3D12CommandList* const* lists, Submiss
         if (notes_ok) c.reject = why;
         notes_ok = uses_ok = false;
     };
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     for (uint32_t i = 0; i < count; ++i) {
         na_object_id lid = 0;
         ListState* ls = lists[i] ? list_state_locked(lists[i], &lid) : nullptr;
@@ -5515,7 +5519,7 @@ void acquire_sample_sources(ID3D12CommandQueue* q, na_object_id qid, D3D12_COMMA
         recount_armed_locked();
     }
     if (want.empty()) return;
-    std::shared_lock<std::shared_mutex> lock(g_m);
+    std::shared_lock<RegistryLock> lock(g_m);
     for (const auto& w : want) {
         auto it = g_res_keys.find(w.second);
         ID3D12Resource* res = nullptr;
@@ -5841,7 +5845,7 @@ void ExecuteEnd(const ExecuteToken& t, ID3D12CommandQueue* queue, uint32_t count
     ex.e.refs_offset = offsetof(Exec, refs);
     ex.e.ref_stride = sizeof(na_list_ref);
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         for (uint32_t i = 0; i < n; ++i) {
             auto it = g_objs.find(canon(lists[i]));
             if (it == g_objs.end()) {
@@ -5897,7 +5901,7 @@ PresentToken PresentBegin(IDXGISwapChain* chain)
     }
     const void* key=canon(chain);
     {
-        std::unique_lock<std::shared_mutex> lock(g_m);
+        std::unique_lock<RegistryLock> lock(g_m);
         auto it=g_objs.find(key);
         if(it!=g_objs.end() && it->second.id==token.swapchain) token.ordinal=++it->second.present_ordinal;
     }
@@ -5922,7 +5926,7 @@ na_object_id IdOf(const void* object) { return lookup(object); }
 std::vector<LiveBinding> ListRootConstantBuffers(ID3D12CommandList* list)
 {
     std::vector<LiveBinding> out;
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return out;
@@ -5936,7 +5940,7 @@ std::vector<LiveBinding> ListRootConstantBuffers(ID3D12CommandList* list)
 uint32_t ListCurrentGraphicsCbvs(ID3D12CommandList* list, LiveBinding* out, uint32_t max)
 {
     if (!out || !max) return 0;
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return 0;
@@ -5959,7 +5963,7 @@ uint32_t ListCurrentGraphicsSrvs(ID3D12CommandList* list, na_object_id* out, uin
     bool cut = false;
     struct Report { bool* to; bool* cut; ~Report() { if (to) *to = *cut; } } report{incomplete, &cut};
     if (!out || !max) { cut = true; return 0; }
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) { cut = true; return 0; }
@@ -6007,7 +6011,7 @@ uint32_t ListCurrentGraphicsSrvs(ID3D12CommandList* list, na_object_id* out, uin
 bool ListReferences(ID3D12CommandList* list, na_object_id id)
 {
     if (!id) return false;
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return false;
@@ -6017,7 +6021,7 @@ bool ListReferences(ID3D12CommandList* list, na_object_id id)
 bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id depth)
 {
     if (!color || !depth) return false;
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return false;
@@ -6026,7 +6030,7 @@ bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id dep
 }
 na::j2::InsertionDecision ListInsertionDecision(ID3D12CommandList* list, na_object_id color)
 {
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return {};
@@ -6035,7 +6039,7 @@ na::j2::InsertionDecision ListInsertionDecision(ID3D12CommandList* list, na_obje
 }
 na::j2::ConsumerSignature ListConsumerSignature(ID3D12CommandList* list, na_object_id color)
 {
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return {};
@@ -6044,7 +6048,7 @@ na::j2::ConsumerSignature ListConsumerSignature(ID3D12CommandList* list, na_obje
 }
 bool ListColorEvents(ID3D12CommandList* list, na_object_id color, std::vector<na::j2::ColorEvent>& out)
 {
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return false;
@@ -6058,7 +6062,7 @@ void ResetDerived()
 }
 na::j2::LiveConsumer ListLiveConsumer(ID3D12CommandList* list, na_object_id color)
 {
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return {};
@@ -6069,7 +6073,7 @@ void SetTableBindCallback(TableBindCallback cb) { g_table_cb.store(cb, std::memo
 void SetEntryCallback(EntryCallback cb) { g_entry_cb.store(cb, std::memory_order_release); }
 bool ListCurrentTargets(ID3D12CommandList* list, na_object_id* rt, na_object_id* ds)
 {
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return false;
@@ -6081,7 +6085,7 @@ bool ListCurrentTargets(ID3D12CommandList* list, na_object_id* rt, na_object_id*
 void SetRasterStateListener(RasterStateListener listener) { g_raster_listener.store(listener, std::memory_order_release); }
 bool ListRasterScissors(ID3D12CommandList* list, RasterScissors& out)
 {
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load() || !ls->generation_known.load()) return false;
@@ -6098,7 +6102,7 @@ bool ListRasterScissors(ID3D12CommandList* list, RasterScissors& out)
 bool ListDrawState(ID3D12CommandList* list, DrawInfo& out)
 {
     DrawInfo r;
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load() || !ls->generation_known.load()) return false;
@@ -6144,7 +6148,7 @@ bool ListDrawState(ID3D12CommandList* list, DrawInfo& out)
 }
 uint64_t ListRecording(ID3D12CommandList* list)
 {
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load() || !ls->generation_known.load()) return 0;
@@ -6152,7 +6156,7 @@ uint64_t ListRecording(ID3D12CommandList* list)
 }
 bool ListStateRestorable(ID3D12CommandList* l)
 {
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = l ? list_state_locked(l, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
@@ -6162,7 +6166,7 @@ bool ListStateRestorable(ID3D12CommandList* l)
 bool ListShaderState(ID3D12CommandList* l, bool compute, ShaderState& out)
 {
     ShaderState result;
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = l ? list_state_locked(l, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
@@ -6218,7 +6222,7 @@ void SetTextureOperationHook(std::shared_ptr<TextureOperationHook> hook)
 void SetRasterStateTracking(bool enabled) { g_raster_tracking.store(enabled, std::memory_order_release); }
 bool ListRasterStateRestorable(ID3D12CommandList* list)
 {
-    std::shared_lock<std::shared_mutex> lock(g_m);
+    std::shared_lock<RegistryLock> lock(g_m);
     na_object_id id = 0;
     ListState* ls = list ? list_state_locked(list, &id) : nullptr;
     if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
@@ -6246,7 +6250,7 @@ bool RestoreListState(ID3D12GraphicsCommandList* l,ID3D12GraphicsCommandList* de
     FLOAT blend[4]={1,1,1,1};UINT stencil=0;
     ID3D12Resource* predicate=nullptr;UINT64 predicate_offset=0;D3D12_PREDICATION_OP predicate_op=D3D12_PREDICATION_OP_EQUAL_ZERO;
     {
-        std::shared_lock<std::shared_mutex> rl(g_m);
+        std::shared_lock<RegistryLock> rl(g_m);
         na_object_id lid = 0;
         ListState* ls = l ? list_state_locked(l, &lid) : nullptr;
         if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
@@ -6350,7 +6354,7 @@ bool RestoreBindingState(ID3D12GraphicsCommandList* l,bool compute,bool restore_
     uint64_t addresses[64]{};D3D12_VIEWPORT viewports[16]{};D3D12_RECT scissors[16]{};
     UINT viewport_count=0,scissor_count=0,rt_count=0;bool depth=false;
     std::shared_ptr<Obj::Twins> storage;
-    {std::shared_lock<std::shared_mutex> lock(g_m);na_object_id id=0;auto* ls=l?list_state_locked(l,&id):nullptr;
+    {std::shared_lock<RegistryLock> lock(g_m);na_object_id id=0;auto* ls=l?list_state_locked(l,&id):nullptr;
         if(!ls||!ls->recording_observed.load()||!ls->coverage_complete.load())return false;
         std::lock_guard<std::mutex> bind(ls->bind_m);if(!ls->restorable||ls->in_render_pass)return false;
         if(expected_root&&ls->root_sig[compute]!=expected_root)cbvs=0;
@@ -6381,7 +6385,7 @@ bool RestoreBindingState(ID3D12GraphicsCommandList* l,bool compute,bool restore_
 }
 bool ListClearsTarget(ID3D12CommandList* list, na_object_id target)
 {
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return false;
@@ -6390,7 +6394,7 @@ bool ListClearsTarget(ID3D12CommandList* list, na_object_id target)
 }
 bool ListSamplesTexture(ID3D12CommandList* list, na_object_id texture)
 {
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return false;
@@ -6400,7 +6404,7 @@ bool ListSamplesTexture(ID3D12CommandList* list, na_object_id texture)
 bool ListSceneSubresource(ID3D12CommandList* list, na_object_id color, na_object_id depth, uint32_t* sub, uint32_t* depth_sub)
 {
     if (!sub || !depth_sub) return false;
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return false;
@@ -6413,7 +6417,7 @@ bool ListSceneSubresource(ID3D12CommandList* list, na_object_id color, na_object
 }
 uint32_t ListTargetsAfter(ID3D12CommandList* list, na_object_id color, na_object_id depth)
 {
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return 0;
@@ -6430,7 +6434,7 @@ uint32_t ListTargetsAfter(ID3D12CommandList* list, na_object_id color, na_object
 // array slices) separately; the whole-resource query refuses those.
 StateLookup ListStateSub(ID3D12CommandList* list, na_object_id id, uint32_t sub, uint32_t* state)
 {
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return StateLookup::Unavailable;
@@ -6451,7 +6455,7 @@ bool ListLastStateSub(ID3D12CommandList* list, na_object_id id, uint32_t sub, ui
 }
 bool ListLastState(ID3D12CommandList* list, na_object_id id, uint32_t* state)
 {
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
@@ -6471,7 +6475,7 @@ uint32_t WriteBuffer(na_object_id res, uint64_t offset, const void* src, uint32_
     if (!res || !src || !n) return 0;
     ID3D12Resource* rewrite = nullptr;
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         auto it = g_buffers.find(res);
         if (it == g_buffers.end() || !it->second.cpu_visible || offset >= it->second.width || it->second.width - offset < n) return 0;
         if (it->second.cpu) return guarded_copy(it->second.cpu + offset, src, n) ? n : 0;
@@ -6499,7 +6503,7 @@ uint32_t ReadBuffer(na_object_id res, uint64_t offset, void* dst, uint32_t n)
     if (!res || !dst || !n) return 0;
     ID3D12Resource* reread = nullptr;
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         auto it = g_buffers.find(res);
         if (it == g_buffers.end() || !it->second.cpu_visible || offset >= it->second.width) return 0;
         n = static_cast<uint32_t>(std::min<uint64_t>(n, it->second.width - offset));
@@ -6546,7 +6550,7 @@ void DescribeStateEvidence(ID3D12CommandList* list, na_object_id id, uint32_t su
     uint32_t kind = NA_UNKNOWN_U32;
     bool covered = false, complete = false;
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         const auto key = g_res_keys.find(id);
         if (key != g_res_keys.end()) {
             const auto obj = g_objs.find(key->second);
@@ -6623,7 +6627,7 @@ size_t fill_pass(int level, int af, uint32_t v)
 {
     std::vector<FillItem> rs_items, pso_items;
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         for (const auto& kv : g_objs) {
             const Obj& o = kv.second;
             if (o.variant_kind != 1 || !o.recipe) continue;
@@ -6638,7 +6642,7 @@ size_t fill_pass(int level, int af, uint32_t v)
     g_var_done.store(0, std::memory_order_relaxed);
     const auto publish = [&](const FillItem& it, std::shared_ptr<Obj::Twins> built) {
         if (built) {
-            std::unique_lock<std::shared_mutex> lock(g_m);
+            std::unique_lock<RegistryLock> lock(g_m);
             const auto f = g_objs.find(it.key);
             if (f != g_objs.end() && f->second.id == it.id && f->second.af_sets[af] == it.base) f->second.af_sets[af].swap(built);
         }
@@ -6654,7 +6658,7 @@ size_t fill_pass(int level, int af, uint32_t v)
         if (g_var_want.load(std::memory_order_relaxed) != v) return SIZE_MAX;
         std::shared_ptr<Obj::Twins> rs_set;
         {
-            std::shared_lock<std::shared_mutex> lock(g_m);
+            std::shared_lock<RegistryLock> lock(g_m);
             const auto f = g_objs.find(it.recipe->rs_key);
             if (f != g_objs.end() && f->second.id == it.recipe->rs_id) rs_set = f->second.af_sets[af];
         }
@@ -6816,7 +6820,7 @@ bool shader_uses(const Obj& pipeline,const na_root_param& param,const na_root_ra
 bool NativeDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle,OperationDescriptor& out) {
     out={};DescriptorDetails details;uint64_t version=0;
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);uint32_t slot=0;
+        std::shared_lock<RegistryLock> lock(g_m);uint32_t slot=0;
         const auto* heap=heap_for_cpu_locked(handle.ptr,&slot);if(!heap)return false;
         const SlotShared stripe(heap,slot);
         if(!heap->info[slot].details)return false;
@@ -6829,7 +6833,7 @@ bool NativeDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle,OperationDescriptor& ou
 }
 bool ListNativeOperationKey(ID3D12GraphicsCommandList* list,bool compute,const uint64_t* members,size_t count,NativeOperationKey& out){
     out={};OperationKey key;
-    std::shared_lock<std::shared_mutex> lock(g_m);
+    std::shared_lock<RegistryLock> lock(g_m);
     auto* ls=list?list_state_locked(list,&out.list):nullptr;
     if(!ls||!ls->recording_observed.load()||!ls->coverage_complete.load()||!ls->generation_known.load())return false;
     std::lock_guard<std::mutex> bl(ls->bind_m);
@@ -6907,7 +6911,7 @@ bool ListNativeOperation(ID3D12GraphicsCommandList* list, bool compute, NativeOp
     out = {};
     NativeOperation next; next.compute = compute;
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         auto* ls = list ? list_state_locked(list, &next.list) : nullptr;
         if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load() || !ls->generation_known.load()) return false;
         std::lock_guard<std::mutex> bl(ls->bind_m);
@@ -6997,7 +7001,7 @@ bool ListNativeOperation(ID3D12GraphicsCommandList* list, bool compute, NativeOp
 }
 ID3D12Resource* AcquireResource(na_object_id id)
 {
-    std::shared_lock<std::shared_mutex> lock(g_m);
+    std::shared_lock<RegistryLock> lock(g_m);
     auto key = g_res_keys.find(id);
     if (key == g_res_keys.end()) return nullptr;
     ID3D12Resource* r = nullptr;
@@ -7054,7 +7058,7 @@ bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float
 }
 uint64_t ListSceneViewportJitter(ID3D12CommandList* list,uint64_t scene_depth)
 {
-    std::shared_lock<std::shared_mutex> lock(g_m);
+    std::shared_lock<RegistryLock> lock(g_m);
     na_object_id id = 0;
     auto* ls = list ? list_state_locked(list, &id) : nullptr;
     if (!ls) return 0;
@@ -7130,7 +7134,7 @@ void SetSnapshotCopyProbeForTests(void (*probe)(void* user), void* user)
 bool ResolveGpuVa(uint64_t va, na_object_id* resource, uint64_t* offset)
 {
     if (!resource || !offset) return false;
-    std::shared_lock<std::shared_mutex> lock(g_m);
+    std::shared_lock<RegistryLock> lock(g_m);
     return resolve_va_locked(va, resource, offset);
 }
 
@@ -7201,7 +7205,7 @@ extern "C" int __cdecl na_observe_sample_request(const na_sample_request* r, uin
     if (!session) return NA_E_STATE; // leases are scoped to a running session
     bool buffer = false;
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         auto key = g_res_keys.find(r->resource);
         if (key == g_res_keys.end()) return NA_E_ARG; // not an observed resource
         // The creation record (no object dereference) says whether it is a buffer.
