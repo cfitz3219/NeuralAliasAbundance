@@ -16,6 +16,7 @@ endfunction()
 na_host_test(fg_profile_test SOURCES fg_profile_test.cpp LIBS host_settings nvapi_headers)
 na_host_test(ffx_flow_test SOURCES ffx_flow_test.cpp LIBS host_ffx_flow dxgi LABELS gpu)
 na_host_test(jitter_probe_test SOURCES jitter_probe_test.cpp LIBS core_gpu dxgi LABELS gpu)
+na_host_test(donut_test SOURCES donut_test.cpp LIBS host_dx12 dxgi LABELS gpu)
 na_host_test(xegtao_test SOURCES xegtao_test.cpp LIBS host_dx12 dxgi LABELS gpu)
 na_host_test(viewport_jitter_test SOURCES viewport_jitter_test.cpp LIBS host_observe_producers dxgi d3dcompiler LABELS gpu)
 if(NA_HAVE_NGX_SDK)
@@ -396,3 +397,10 @@ na_host_test(session_ownership_test SOURCES session_ownership_test.cpp LIBS host
 
 add_test(NAME host_overlay_cursor_cleanup_test COMMAND overlay_bootstrap_test --cursor-cleanup)
 set_tests_properties(host_overlay_cursor_cleanup_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+
+if(NA_HAVE_DONUT)
+  add_test(NAME host_donut_between_integration COMMAND j2_anno_shape_test 1 1 --planes --donut)
+  add_test(NAME host_donut_inline_integration COMMAND j2_anno_shape_test 1 1 --inline --donut)
+  add_test(NAME host_donut_msaa_integration COMMAND j2_anno_shape_test 4 4 --planes --donut)
+  set_tests_properties(host_donut_between_integration host_donut_inline_integration host_donut_msaa_integration PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+endif()

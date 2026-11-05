@@ -190,6 +190,20 @@ int main() {
         else if(reverse){float difference=0;for(size_t i=0;i<output.size();++i)difference=std::max(difference,std::abs(output[i]-reference[i]));
             std::printf("forward/reverse max difference %.6f\n",difference);CHECK(difference<.04f);}
     }
+    // A warm, retired packet reuses every immutable descriptor binding.
+    {na::xegtao::Pass cached;test::List l;REQUIRE(l.Create(d.device.Get()));
+        std::vector<float> c(64*32*4,1),z(64*32,1);auto color=input(d,l,64,32,DXGI_FORMAT_R32G32B32A32_FLOAT,c,4);
+        auto depth=input(d,l,64,32,DXGI_FORMAT_R32_FLOAT,z,1);na::xegtao::Inputs ci;ci.color=color.texture.Get();ci.depth=depth.texture.Get();
+        ci.width=64;ci.height=32;ci.color_format=DXGI_FORMAT_R32G32B32A32_FLOAT;ci.projection=projection(false);ci.clear_depth=1;
+        cached.Prepare(d.device.Get(),d.queue.Get(),ci,options);REQUIRE(cached.WaitPrepared(30000));
+        auto first=cached.Prepare(d.device.Get(),d.queue.Get(),ci,options);REQUIRE(first&&first->Record(l.list.Get()));
+        REQUIRE(SUCCEEDED(l.list->Close()));ID3D12CommandList* lists[]={l.list.Get()};d.queue->ExecuteCommandLists(1,lists);d.WaitIdle();
+        first.reset();const auto before=cached.GetStats();auto next=cached.Prepare(d.device.Get(),d.queue.Get(),ci,options);REQUIRE(next);
+        CHECK(cached.GetStats().bindings==before.bindings);CHECK(cached.GetStats().allocations==before.allocations);
+        // Changing the denoiser output binding still invalidates the cache.
+        next.reset();options.denoise=2;
+        REQUIRE(cached.Prepare(d.device.Get(),d.queue.Get(),ci,options));CHECK(cached.GetStats().bindings==before.bindings+1);options.denoise=1;
+    }
     CHECK(pass.GetStats().recorded==3);
     options.amount=0;CHECK(!pass.Prepare(d.device.Get(),d.queue.Get(),{},options));
     CHECK(pass.GetStats().recorded==3);CHECK(d.device->GetDeviceRemovedReason()==S_OK);
