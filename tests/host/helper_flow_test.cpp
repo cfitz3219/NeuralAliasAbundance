@@ -188,11 +188,11 @@ int main()
             for (uint32_t x = 0; x < kW; ++x) {
                 const float* v = reinterpret_cast<const float*>(p + fp.Offset + size_t(y) * fp.Footprint.RowPitch) + 2 * x;
                 const bool inside = int(x) >= bx + 16 && int(x) < bx + kBoxW - 16 && int(y) >= kBoxY + 16 && int(y) < kBoxY + kBoxH - 16;
-                const bool far = int(x) < bx - 32 || int(x) >= bx + kBoxW + 32 || int(y) < kBoxY - 32 || int(y) >= kBoxY + kBoxH + 32;
+                const bool distant = int(x) < bx - 32 || int(x) >= bx + kBoxW + 32 || int(y) < kBoxY - 32 || int(y) >= kBoxY + kBoxH + 32;
                 if (inside) {
                     ++in_n;
                     if (std::fabs(v[0] + float(kStep)) <= 1.f && std::fabs(v[1]) <= 1.f) ++in_good;
-                } else if (far) {
+                } else if (distant) {
                     ++bg_n;
                     if (std::fabs(v[0]) <= .25f && std::fabs(v[1]) <= .25f) ++bg_still;
                 }
