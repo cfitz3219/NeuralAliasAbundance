@@ -71,6 +71,8 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
                ID3D12CommandQueue* queue = nullptr);
 
 struct Stats {
+    uint64_t proof_tested=0,proof_matched=0,native_partial=0;
+    float proof_maximum_error=0;
     uint64_t frames = 0, hud_frames = 0;    // frames presented while learned / with a HUD layer
     uint64_t scene_draws = 0, redirected = 0, forwarded = 0, restore_failed = 0;
     uint64_t covered = 0; // opaque full-screen draws after the HUD started: sent to the proxy, layers restarted
@@ -103,9 +105,9 @@ struct Stats {
     uint64_t native_resource_changed=0,native_finishing_draws=0;
 };
 Stats GetStats();
-void ReportPictureResult(bool identity,bool clean); // completed GPU receipt, status only
-void ReportCanvasProbe(uint64_t source,uint64_t generation,bool identity);
-void ReportNativePictureResult(bool identity);
+void ReportPictureResult(bool identity,bool clean,uint32_t tested=0,uint32_t matched=0,float error=0); // completed GPU receipt, status only
+void ReportCanvasProbe(uint64_t source,uint64_t generation,bool identity,uint32_t tested=0,uint32_t matched=0,float error=0);
+void ReportNativePictureResult(bool identity,uint32_t tested=0,uint32_t matched=0,float error=0);
 std::string StatusLine();
 // Finished frame-structure traces (hud_trace JSON lines, CRLF), taken once; empty when none.
 std::string TakeTrace();

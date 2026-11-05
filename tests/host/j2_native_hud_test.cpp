@@ -177,18 +177,18 @@ int picture_paths(test::Device& d)
         uint16_t v=0;std::memcpy(&v,input.data()+inside*8,2);const float input_red=half_value(v);
         std::memcpy(&v,mask.data()+inside*2,2);const float protection=half_value(v);
         float mx=0;std::memcpy(&mx,motion_bytes.data()+inside*8,4);
-        const float expected=(clean&&!changed)?51.f/255.f:float(full[inside]&255)/255.f;
+        const float expected=clean?51.f/255.f:float(full[inside]&255)/255.f;
         CHECK(std::abs(input_red-expected)<.002f);
-        CHECK((!clean&&!changed)?protection>.5f:protection==0.f);
-        CHECK(mx==((!clean&&!changed)?0.f:4.f));
+        CHECK(!clean?protection>.5f:protection==0.f);
+        CHECK(mx==(!clean?0.f:4.f));
         std::memcpy(&v,mask.data()+outside*2,2);CHECK(half_value(v)==0.f);
-        const UINT native_inside=6*OW+12,native_outside=OW+2;
-        if(changed)CHECK(result==std::vector<uint8_t>(reinterpret_cast<uint8_t*>(base.data()),reinterpret_cast<uint8_t*>(base.data())+base.size()*4));
-        else CHECK(result[native_inside*4]>(clean?150:160)); // native alpha-over or protected original UI
+        const UINT native_inside=6*OW+12,native_outside=(OH-2)*OW+OW-2;
+        CHECK(result[native_inside*4]>(clean?150:160)); // a changed corner does not disable the distant native glyph
         CHECK(std::abs(int(result[native_outside*4])-26)<=1);
         std::printf("HUD GPU path clean=%d changed=%d input=%.3f mask=%.3f motion=%.1f\n",clean,changed,input_red,protection,mx);
         CHECK(d.device->GetDeviceRemovedReason()==S_OK);
-        bool identity=false,used_clean=false;CHECK(picture->ProofAfterCompletion(identity,used_clean));
+        bool identity=false,used_clean=false;nh::Picture::ProofReceipt receipt;CHECK(picture->ProofAfterCompletion(identity,used_clean,&receipt));
+        CHECK(receipt.tested==W*H&&receipt.matched==W*H-(changed?1u:0u));
         CHECK(identity==!changed&&used_clean==(clean&&!changed));CHECK(!picture->ProofAfterCompletion(identity,used_clean));
         if(clean&&!changed){
             picture->BeginCycle();test::List reuse;REQUIRE(reuse.Create(d.device.Get()));
@@ -572,7 +572,7 @@ int canvas_probe(test::Device& d)
     return 0;
 }
 
-int draw_handoff(test::Device& d,bool unresolved=false,bool native=false,bool dxil=false,bool split=false,bool typeless=false)
+int draw_handoff(test::Device& d,bool unresolved=false,bool native=false,bool dxil=false,bool split=false,bool typeless=false,bool separate=false,bool ahead=false)
 {
     auto* dev=d.device.Get();
     const auto initial_stats=nh::GetStats();constexpr UINT W=64,H=32,OW=128,OH=64;constexpr auto F=DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -724,7 +724,26 @@ float4 altered(float4 p:SV_Position):SV_Target{return image.Load(int3(p.xy,0))*.
         if(native){t=test::Transition(frame==4?target2.Get():target.Get(),R,D3D12_RESOURCE_STATE_PRESENT);l->ResourceBarrier(1,&t);presented[frame==4?1:0]=true;}
         if(native&&frame==7){t=test::Transition(vertices.Get(),D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,D3D12_RESOURCE_STATE_COPY_DEST);l->ResourceBarrier(1,&t);}
         REQUIRE(SUCCEEDED(l->Close()));ID3D12CommandList* lists[]={game.list.Get(),post.list.Get()};const UINT list_count=split?2:1;
-        {na::nr::native::Submission submitted(d.queue.Get(),list_count,lists);d.queue->ExecuteCommandLists(list_count,lists);}d.WaitIdle();
+        test::List future;
+        if(ahead&&frame==3){
+            // CPU preparation of an unsubmitted future recording on the same
+            // output is not permission to erase this frame's completed packet.
+            REQUIRE(future.Create(dev));auto* next=future.list.Get();
+            auto transition=test::Transition(target.Get(),D3D12_RESOURCE_STATE_PRESENT,R);next->ResourceBarrier(1,&transition);
+            next->OMSetRenderTargets(1,&b,FALSE,nullptr);next->SetGraphicsRootSignature(transfer_root.Get());next->SetPipelineState(copy_pso.Get());
+            next->SetDescriptorHeaps(1,heaps);next->SetGraphicsRootDescriptorTable(0,heap->GetGPUDescriptorHandleForHeapStart());
+            next->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);next->RSSetViewports(1,&vp);next->RSSetScissorRects(1,&all);next->DrawInstanced(3,1,0,0);
+            REQUIRE(SUCCEEDED(next->Close()));
+        }
+        if(separate){
+            REQUIRE(split);
+            // Legal queue order is the dependency, not membership in one Execute call.
+            for(UINT i=0;i<list_count;++i){
+                {na::nr::native::Submission submitted(d.queue.Get(),1,lists+i);d.queue->ExecuteCommandLists(1,lists+i);}
+                nh::AfterSubmission(d.queue.Get(),1,lists+i);
+            }
+        }else{na::nr::native::Submission submitted(d.queue.Get(),list_count,lists);d.queue->ExecuteCommandLists(list_count,lists);}
+        d.WaitIdle();
         if(frame==6){void* queryMapped=nullptr;REQUIRE(SUCCEEDED(query_result->Map(0,nullptr,&queryMapped)));
             const auto stats=*static_cast<const D3D12_QUERY_DATA_PIPELINE_STATISTICS*>(queryMapped);query_result->Unmap(0,nullptr);
             CHECK(stats.IAVertices==3&&stats.IAPrimitives==1);}
@@ -733,7 +752,8 @@ float4 altered(float4 p:SV_Position):SV_Target{return image.Load(int3(p.xy,0))*.
             test::List unrelated;REQUIRE(unrelated.Create(dev));REQUIRE(SUCCEEDED(unrelated.list->Close()));
             ID3D12CommandList* other[]={unrelated.list.Get()};const auto before=native_fixture_calls;
             nh::AfterSubmission(d.queue.Get(),1,other);CHECK(native_fixture_calls==before);
-            nh::AfterSubmission(d.queue.Get(),list_count,lists);
+            // Do not invent a combined batch after the separate real submissions.
+            if(!separate)nh::AfterSubmission(d.queue.Get(),list_count,lists);
         }
         if(frame==3)continue; // render-ahead: the next source reuses its resource before this Present
         if(frame==4){if(validate(target.Get(),3)||validate(target2.Get(),4))return 1;}
@@ -1107,6 +1127,8 @@ int end_to_end(test::Device& d)
     }
     if(source_lineage(d)||draw_handoff(d)||draw_handoff(d,true))return 1;
     if(draw_handoff(d,true,true,false,true)||draw_handoff(d,true,true,false,true,true))return 1;
+    if(draw_handoff(d,true,true,false,true,false,true))return 1;
+    if(draw_handoff(d,false,true,false,true,false,true,true))return 1;
     for(int resize=0;resize<5;++resize)if(draw_handoff(d,true,true))return 1;
 #ifdef NA_HUD_DXIL_FIXTURE
     if(draw_handoff(d,true,true,true))return 1;

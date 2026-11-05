@@ -3704,15 +3704,15 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
     // The ring fence proves this slot's previous GPU consumption is finished.
     const auto hud_completed=g_small.fence->GetCompletedValue();
     if(hud_completed!=UINT64_MAX)for(uint32_t j=0;j<kRing;++j)if(g_small.value[j]&&hud_completed>=g_small.value[j]){
-        bool identity=false,clean=false;
-        if(g_small.hud_picture[j]&&g_small.hud_picture[j]->ProofAfterCompletion(identity,clean)){
-            if(g_small.native_hud_result[j])na::j2::native_hud::ReportNativePictureResult(identity);
-            else na::j2::native_hud::ReportPictureResult(identity,clean);
+        bool identity=false,clean=false;na::j2::native_hud::Picture::ProofReceipt receipt;
+        if(g_small.hud_picture[j]&&g_small.hud_picture[j]->ProofAfterCompletion(identity,clean,&receipt)){
+            if(g_small.native_hud_result[j])na::j2::native_hud::ReportNativePictureResult(identity,receipt.tested,receipt.matched,receipt.maximum_error);
+            else na::j2::native_hud::ReportPictureResult(identity,clean,receipt.tested,receipt.matched,receipt.maximum_error);
         }
         g_small.native_hud_result[j]=false;
         auto& probe=g_small.canvas_probe[j];
-        if(probe.picture&&probe.picture->ProofAfterCompletion(identity,clean))
-            na::j2::native_hud::ReportCanvasProbe(probe.source,probe.generation,identity);
+        if(probe.picture&&probe.picture->ProofAfterCompletion(identity,clean,&receipt))
+            na::j2::native_hud::ReportCanvasProbe(probe.source,probe.generation,identity,receipt.tested,receipt.matched,receipt.maximum_error);
         probe={};
         g_small.hud_owner[j].reset();g_small.hud_picture[j].reset();
     }
