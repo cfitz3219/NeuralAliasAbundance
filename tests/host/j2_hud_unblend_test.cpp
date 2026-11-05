@@ -177,7 +177,7 @@ int end_to_end(test::Device& d)
     const D3D12_VIEWPORT full{0, 0, float(RW), float(RH), 0, 1};
     const D3D12_RECT all{0, 0, LONG(RW), LONG(RH)};
     const float black[4] = {0, 0, 0, 1};
-    auto frame = [&](bool cover_after_ui) {
+    auto frame = [&](bool cover_after_ui, bool canvas_overlay = false) {
         l->ClearRenderTargetView(rtv[2], black, 0, nullptr);
         l->SetGraphicsRootSignature(root.Get());
         l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -200,6 +200,13 @@ int end_to_end(test::Device& d)
                 l->SetGraphicsRoot32BitConstants(0, 4, kScene, 0);
                 l->DrawInstanced(3, 1, 0, 0);
             }
+        }
+        if (canvas_overlay) { // a blended full-screen triangle (how a UI canvas is laid on): UI, replayed
+            const float veil[4] = {0.1f, 0.1f, 0.1f, 0.3f};
+            l->RSSetScissorRects(1, &all);
+            l->SetPipelineState(pso[int(Blend::Over)].Get());
+            l->SetGraphicsRoot32BitConstants(0, 4, veil, 0);
+            l->DrawInstanced(3, 1, 0, 0);
         }
         D3D12_RESOURCE_BARRIER b[2] = {test::Transition(canvas.Get(), RTS, D3D12_RESOURCE_STATE_COPY_SOURCE),
                                        test::Transition(proxy.Get(), RTS, D3D12_RESOURCE_STATE_COPY_DEST)};
@@ -366,6 +373,22 @@ int end_to_end(test::Device& d)
     CHECK(third.unblend && !third.compose);
     CHECK(ub::GetStats().held == 1);
     std::printf("%s\n", ub::StatusLine().c_str());
+    // A blended full-screen draw after the UI (a canvas laid on with one triangle) is replayed
+    // with the UI, not left out as image processing (SE5 2026-11-05: menus were missing).
+    {
+        const uint64_t replayed0 = ub::GetStats().replayed, cover0 = ub::GetStats().cover_blend;
+        REQUIRE(SUCCEEDED(game.alloc->Reset()) && SUCCEEDED(l->Reset(game.alloc.Get(), nullptr)));
+        frame(false, true);
+        REQUIRE(SUCCEEDED(l->Close()));
+        d.queue->ExecuteCommandLists(1, lists);
+        d.WaitIdle();
+        CHECK(dev->GetDeviceRemovedReason() == S_OK);
+        CHECK(ub::GetStats().replayed == replayed0 + 4);
+        CHECK(ub::GetStats().cover_blend == cover0 + 1);
+        nh::Layer fourth;
+        CHECK(nh::TakeFrame(proxy.Get(), RW, RH, OW, OH, &fourth));
+        CHECK(fourth.unblend && fourth.l0 && fourth.l1);
+    }
     // Off: nothing is replayed.
     ub::SetEnabled(false);
     REQUIRE(SUCCEEDED(game.alloc->Reset()) && SUCCEEDED(l->Reset(game.alloc.Get(), nullptr)));
@@ -373,7 +396,7 @@ int end_to_end(test::Device& d)
     REQUIRE(SUCCEEDED(l->Close()));
     d.queue->ExecuteCommandLists(1, lists);
     d.WaitIdle();
-    CHECK(ub::GetStats().replayed == 9);
+    CHECK(ub::GetStats().replayed == 13);
     ub::SetEnabled(true);
     return 0;
 }

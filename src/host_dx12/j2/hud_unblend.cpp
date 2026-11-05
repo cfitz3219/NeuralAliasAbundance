@@ -210,10 +210,15 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
     const bool mine = s.frame == g_frame && s.cleared && s.target == t_bind.rt;
     const float* vp0 = st.viewport_count ? st.viewports[0] : nullptr;
     const int32_t* sc0 = st.scissor_count ? st.scissors[0] : nullptr;
-    // Full-screen passes (tonemap, colour grading, fades, vignettes) are image processing:
-    // they stay in the picture. An opaque one hides everything drawn before it, so the
-    // layers start again; a blended one leaves the earlier UI on top (the un-blend formula
-    // is linear, so the composite still comes out as the game's).
+    // Draws with a viewport covering the whole target and at most 6 vertices. An opaque one
+    // (tonemap, colour grading) replaces everything drawn before it: it stays in the picture
+    // and the layers start again. A BLENDED one is replayed like any other UI draw: UI sprites
+    // are drawn with a full-target viewport too (only their vertices are small), and a game
+    // that renders its UI into a canvas lays that canvas on with one blended full-screen
+    // triangle whose input we cannot see (SE5, Cort's run of 2026-11-05: ~29 such draws per
+    // frame were skipped, so most menus were missing from the layers and the self-check never
+    // matched). Replaying a blended draw is exact whatever it reads: its effect on the
+    // destination is linear, which is all the un-blend formula needs.
     if (verts <= 6 && inst == 1 && native_hud::CoversTarget(vp0, sc0, d.rw, d.rh)) {
         if (!blended) {
             if (mine && s.draws) {
@@ -223,8 +228,9 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
                 ++g_stats.covered;
             }
             ++g_stats.scene;
-        } else ++g_stats.cover_blend;
-        return {};
+            return {};
+        }
+        ++g_stats.cover_blend; // replayed below (unless forwarded for another reason)
     }
     {   // Drawn with the scene camera, or depth-tested on the scene depth: part of the picture.
         na::observe::LiveBinding cb[16];
