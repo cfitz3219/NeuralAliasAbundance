@@ -1,4 +1,5 @@
 #include "host_dx12/gpu/services.hpp"
+#include "host_dx12/diag/gpu_breadcrumbs.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/msaa_resolve.hpp"
 #include "host_dx12/j2/nis_sharpen.hpp"
@@ -3406,6 +3407,7 @@ bool hud_targets(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, u
 void hud_pass(ID3D12GraphicsCommandList* l, int pass, uint32_t slot, ID3D12Resource* const srv[3], const DXGI_FORMAT sf[3],
               ID3D12Resource* const uav[3], const DXGI_FORMAT uf[3], const uint32_t k[8], uint32_t gx, uint32_t gy)
 {
+    const na::diag::crumbs::Scope crumb(l, "NeuralAlias HUD pass");
     ID3D12Device* dev = g_small.device.Get();
     const UINT base = (slot * 9 + static_cast<UINT>(pass)) * 7;
     D3D12_CPU_DESCRIPTOR_HANDLE c = g_small.hud_heap->GetCPUDescriptorHandleForHeapStart();

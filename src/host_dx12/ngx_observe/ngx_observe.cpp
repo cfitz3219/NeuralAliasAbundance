@@ -1,4 +1,5 @@
 #include "host_dx12/dlss/call_origin.hpp"
+#include "host_dx12/diag/gpu_breadcrumbs.hpp"
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 
 #include "host_dx12/nr/nr_pass.hpp"
@@ -662,6 +663,7 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
     na::gputime::Begin(list);
     NgxResult r;
     {
+        const na::diag::crumbs::Scope crumb(list, "game DLSS evaluate (with NeuralAlias effects)");
         na::xegtao::NativeScope ambient(list,params);
         na::donut::NativeScope grade(list,params);
         r = s.evaluate(cmd_list, handle, params, callback);

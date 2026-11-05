@@ -1,4 +1,5 @@
 #include "host_dx12/gpu/services.hpp"
+#include "host_dx12/diag/gpu_breadcrumbs.hpp"
 #include "host_dx12/effects/donut.hpp"
 #include "host_dx12/adapters/tlou1/apply.hpp"
 #include "host_dx12/adapters/tsushima/apply.hpp"
@@ -1298,6 +1299,15 @@ void DrawDlssDebug()
     std::snprintf(line, sizeof line, "NVIDIA on-screen indicator (registry ShowDlssIndicator): %s%s",
                   !i.indicator_known ? "unknown" : i.indicator ? "on, value " : "off", (i.indicator_known && i.indicator) ? std::to_string(i.indicator).c_str() : "");
     StatusLine(i.indicator_known && i.indicator ? 1 : 0, line);
+    {
+        // GPU breadcrumbs (AMD FidelityFX Breadcrumbs): markers around our passes so a freeze or
+        // crash report shows which one the GPU was in. Live; not remembered (diagnostics only).
+        bool crumbs = na::diag::crumbs::Enabled();
+        BeginRow("GPU breadcrumbs", "Records which NeuralAlias pass the GPU was running, for the crash report written if the game's device is lost. Costs two tiny GPU writes per pass. Turn on while chasing a freeze or crash.", S(220));
+        if (ImGui::Checkbox("##crumbs", &crumbs)) na::diag::crumbs::SetEnabled(crumbs);
+        EndRow();
+        Hint(na::diag::crumbs::StatusLine().c_str());
+    }
     BeginRow("Indicator", "NVIDIA's own DLSS indicator and, with the development DLL, its debug text. Changing it asks for administrator rights (a Windows prompt appears; the game may minimise). Takes effect when DLSS is next created, usually after a restart of the game.",
              ButtonWidth("Turn off"));
     if (i.indicator_known && i.indicator) { if (Button("Turn off")) na::dlss_debug::SetIndicator(false); }
