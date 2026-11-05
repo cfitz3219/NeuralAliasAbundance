@@ -159,9 +159,83 @@ int ProjectionShift(test::Device& d, ID3D12Resource* lens, UINT w, UINT h, bool 
 }
 } // namespace
 
+// Actual sampler pixels, not a no-op Dispatch or a count of created twins.
+// All waits/readbacks in this standalone diagnostic are test-only.
+int AnisoPixels(bool clamp)
+{
+    test::Device d;if(!test::CreateDevice(d))return test::SkipNoDevice("AF pixels");auto* dev=d.device.Get();
+    REQUIRE(na::observe::InstallProducers(dev,d.queue.Get(),false));
+    na_observe_config cfg{};cfg.size_bytes=sizeof(cfg);REQUIRE(na_observe_start(&cfg,Sink,nullptr)==NA_OK);
+    na::observe::SetSamplerMipBiasLiveEnabled(true);na::observe::SetSamplerMipBiasLive(0);na::observe::SetSamplerAnisotropy(0);
+    const float levels[]={0,-1,-2};na::observe::SetSamplerMipLevelsWanted(levels,3);na::observe::SetSamplerAnisotropyPrebuild(16);
+    REQUIRE(na::observe::WaitSamplerVariant(10000));
+    constexpr UINT TW=1024,TH=64,MIPS=11,W=64,H=64;
+    D3D12_RESOURCE_DESC td{};td.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;td.Width=TW;td.Height=TH;td.DepthOrArraySize=1;
+    td.MipLevels=MIPS;td.SampleDesc.Count=1;td.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
+    D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;test::ComPtr<ID3D12Resource> tex;
+    REQUIRE(SUCCEEDED(dev->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&td,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&tex))));
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[MIPS]{};UINT64 bytes=0;dev->GetCopyableFootprints(&td,0,MIPS,0,fp,nullptr,nullptr,&bytes);
+    auto up=test::CreateBuffer(dev,bytes,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);REQUIRE(up);void* mapped=nullptr;REQUIRE(SUCCEEDED(up->Map(0,nullptr,&mapped)));
+    for(UINT m=0;m<MIPS;++m)for(UINT y=0;y<fp[m].Footprint.Height;++y)for(UINT x=0;x<fp[m].Footprint.Width;++x){
+        auto* p=static_cast<uint8_t*>(mapped)+fp[m].Offset+SIZE_T(y)*fp[m].Footprint.RowPitch+x*4;
+        p[0]=p[1]=p[2]=m>=2?128:uint8_t(((y<<m)/2)%2?255:0);p[3]=255;}
+    up->Unmap(0,nullptr);test::List init;REQUIRE(init.Create(dev));
+    for(UINT m=0;m<MIPS;++m){D3D12_TEXTURE_COPY_LOCATION to{};to.pResource=tex.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;to.SubresourceIndex=m;
+        D3D12_TEXTURE_COPY_LOCATION from{};from.pResource=up.Get();from.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;from.PlacedFootprint=fp[m];init.list->CopyTextureRegion(&to,0,0,0,&from,nullptr);}
+    auto b=test::Transition(tex.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);init.list->ResourceBarrier(1,&b);
+    REQUIRE(SUCCEEDED(init.list->Close()));ID3D12CommandList* initialize[]={init.list.Get()};d.queue->ExecuteCommandLists(1,initialize);d.WaitIdle();
+    auto out=test::CreateTexture(dev,W,H,DXGI_FORMAT_R32_FLOAT,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);REQUIRE(out);
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,2,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};test::ComPtr<ID3D12DescriptorHeap> heap;
+    REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&heap))));auto cpu=heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};sv.Format=td.Format;sv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;sv.Texture2D.MipLevels=MIPS;sv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;dev->CreateShaderResourceView(tex.Get(),&sv,cpu);
+    cpu.ptr+=dev->GetDescriptorHandleIncrementSize(hd.Type);D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};uv.Format=DXGI_FORMAT_R32_FLOAT;uv.ViewDimension=D3D12_UAV_DIMENSION_TEXTURE2D;dev->CreateUnorderedAccessView(out.Get(),nullptr,&uv,cpu);
+    D3D12_DESCRIPTOR_RANGE ranges[]={{D3D12_DESCRIPTOR_RANGE_TYPE_SRV,1,0,0,0},{D3D12_DESCRIPTOR_RANGE_TYPE_UAV,1,0,0,1}};
+    D3D12_ROOT_PARAMETER param{};param.ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;param.DescriptorTable={2,ranges};
+    D3D12_STATIC_SAMPLER_DESC ss{};ss.Filter=D3D12_FILTER_MIN_MAG_MIP_LINEAR;ss.AddressU=ss.AddressV=ss.AddressW=clamp?D3D12_TEXTURE_ADDRESS_MODE_CLAMP:D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    ss.MaxAnisotropy=1;ss.MaxLOD=D3D12_FLOAT32_MAX;ss.ComparisonFunc=D3D12_COMPARISON_FUNC_ALWAYS;
+    D3D12_ROOT_SIGNATURE_DESC rd{1,&param,1,&ss,D3D12_ROOT_SIGNATURE_FLAG_NONE};test::ComPtr<ID3DBlob> blob,error,cs;test::ComPtr<ID3D12RootSignature> root;
+    REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rd,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&error)));REQUIRE(SUCCEEDED(dev->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&root))));
+    // Left: oblique 16:1 footprint. Right: isotropic 1:1 postprocess control;
+    // changing AF must not alter those control pixels even with CLAMP addressing.
+    const char code[]="Texture2D<float4> image:register(t0);SamplerState samp:register(s0);RWTexture2D<float> target:register(u0);[numthreads(8,8,1)]void main(uint3 p:SV_DispatchThreadID){float du=(p.x<32?16.0:1.0)/1024;target[p.xy]=image.SampleGrad(samp,(float2(p.xy)+.5)/64,float2(du,0),float2(0,1.0/64)).r;}";
+    REQUIRE(SUCCEEDED(D3DCompile(code,sizeof(code),nullptr,nullptr,nullptr,"main","cs_5_0",0,0,&cs,&error)));
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};pd.pRootSignature=root.Get();pd.CS={cs->GetBufferPointer(),cs->GetBufferSize()};test::ComPtr<ID3D12PipelineState> pso;
+    REQUIRE(SUCCEEDED(dev->CreateComputePipelineState(&pd,IID_PPV_ARGS(&pso))));
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT of{};const auto od=out->GetDesc();dev->GetCopyableFootprints(&od,0,1,0,&of,nullptr,nullptr,&bytes);
+    auto rb=test::CreateBuffer(dev,bytes,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);REQUIRE(rb);test::List list;REQUIRE(list.Create(dev));REQUIRE(SUCCEEDED(list.list->Close()));
+    std::vector<float> original;unsigned pass=0;
+    for(UINT af:{0u,16u,0u,4u,8u,16u,0u}){
+        const auto before=na::observe::GetMipLiveStats();
+        na::observe::SetSamplerAnisotropy(af);REQUIRE(na::observe::WaitSamplerVariant(10000));
+        const auto after=na::observe::GetMipLiveStats();
+        // Three root levels exist, but switching AF must compile only the one
+        // requested PSO level before becoming active.
+        if(pass==1&&!clamp)CHECK(after.twin_pipelines-before.twin_pipelines==1);
+        REQUIRE(SUCCEEDED(list.alloc->Reset()));REQUIRE(SUCCEEDED(list.list->Reset(list.alloc.Get(),pso.Get())));
+        list.list->SetComputeRootSignature(root.Get());ID3D12DescriptorHeap* heaps[]={heap.Get()};list.list->SetDescriptorHeaps(1,heaps);list.list->SetComputeRootDescriptorTable(0,heap->GetGPUDescriptorHandleForHeapStart());list.list->Dispatch(W/8,H/8,1);
+        b=test::Transition(out.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE);list.list->ResourceBarrier(1,&b);
+        D3D12_TEXTURE_COPY_LOCATION from{};from.pResource=out.Get();from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        D3D12_TEXTURE_COPY_LOCATION to{};to.pResource=rb.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=of;list.list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
+        std::swap(b.Transition.StateBefore,b.Transition.StateAfter);list.list->ResourceBarrier(1,&b);REQUIRE(SUCCEEDED(list.list->Close()));ID3D12CommandList* lists[]={list.list.Get()};d.queue->ExecuteCommandLists(1,lists);d.WaitIdle();
+        REQUIRE(SUCCEEDED(rb->Map(0,nullptr,&mapped)));std::vector<float> values;for(UINT y=0;y<H;++y){const auto* row=reinterpret_cast<const float*>(static_cast<const uint8_t*>(mapped)+y*of.Footprint.RowPitch);values.insert(values.end(),row,row+W);}rb->Unmap(0,nullptr);
+        if(!pass++)original=values;
+        double change=0,contrast=0,control=0;
+        for(size_t i=0;i<values.size();++i){
+            if(i%W<W/2){change+=std::abs(values[i]-original[i]);contrast+=std::abs(values[i]-.5f);}
+            else control+=std::abs(values[i]-original[i]);
+        }
+        change/=W*H/2;contrast/=W*H/2;control/=W*H/2;
+        std::printf("AF pixels %s %ux: oblique change %.6f contrast %.6f isotropic change %.6f effective%u\n",clamp?"clamp":"wrap",af,change,contrast,control,na::observe::GetMipLiveStats().live_aniso);
+        if(af==0)CHECK(change<.01);if(af==16)CHECK(change>.15);
+        CHECK(control<.01);CHECK(dev->GetDeviceRemovedReason()==S_OK);
+    }
+    REQUIRE(na_observe_stop()==NA_OK);na::observe::SetProcessExiting();return test::finish("AF pixels");
+}
+
 int main(int argc, char** argv)
 {
     setvbuf(stdout, nullptr, _IONBF, 0);
+    if(argc>1&&std::strcmp(argv[1],"--af-pixels")==0)return AnisoPixels(argc>2&&std::strcmp(argv[2],"clamp")==0);
     const UINT samples = argc > 1 ? UINT(std::atoi(argv[1])) : 1;
     const UINT depth_samples = argc > 2 ? UINT(std::atoi(argv[2])) : samples;
     const bool msaa = samples > 1;
@@ -461,7 +535,8 @@ int main(int argc, char** argv)
         na::observe::SetSamplerMipBias(0.0f);
         // 16x anisotropic filtering (menu switch, no mip bias): a tiling linear sampler and an
         // 8x static sampler become 16x (the root signature is rebuilt even with no bias change);
-        // shadow comparison and clamped screen-pass samplers are untouched; a 16x one is left.
+        // clamped linear materials are included; shadow comparisons stay unchanged;
+        // a native 16x sampler is left at the game's own setting.
         {
             na::observe::SetSamplerAnisotropy(16);
             const auto a0 = na::observe::GetAnisoStats();
@@ -482,12 +557,13 @@ int main(int argc, char** argv)
             sd.Filter = D3D12_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR;
             sd.ComparisonFunc = D3D12_COMPARISON_FUNC_LESS;
             dev->CreateSampler(&sd, h2);
+            CHECK(na::observe::GetAnisoStats().samplers == a2.samplers);
             sd.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
             sd.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
             sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
             dev->CreateSampler(&sd, h2);
             const auto a3 = na::observe::GetAnisoStats();
-            CHECK(a3.samplers == a2.samplers);
+            CHECK(a3.samplers == a2.samplers + 1);
             sd.Filter = D3D12_FILTER_ANISOTROPIC;
             sd.MaxAnisotropy = 16;
             sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
