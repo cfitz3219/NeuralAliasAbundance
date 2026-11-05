@@ -275,7 +275,10 @@ int end_to_end(test::Device& d)
             }
         std::printf("un-blended scene vs the scene: worst %d/255 at %u,%u (under over %d,%d,%d; under add+over %d,%d,%d)\n", worst, wx, wy,
                     at(px, RW, 20, 10, 0), at(px, RW, 20, 10, 1), at(px, RW, 20, 10, 2), at(px, RW, 30, 15, 0), at(px, RW, 30, 15, 1), at(px, RW, 30, 15, 2));
-        CHECK(worst <= 3); // 8-bit quantisation divided by 1 - alpha (0.4) at worst
+        // Bound: P, L0 and L1 are each stored to 8 bits (+-0.5), (P - L0) / m with m = 0.4 scales
+        // that to +-2.5, and m itself carries +-1/128 of grey (~2 % of a value near 150, ~3):
+        // about 5.5 in the add+over corner. NVIDIA gives 2, WARP 4.
+        CHECK(worst <= 6);
         uint32_t v[5] = {};
         void* ptr = nullptr;
         REQUIRE(SUCCEEDED(counts->Map(0, nullptr, &ptr)) && ptr);
