@@ -234,6 +234,7 @@ DWORD WINAPI refresh_worker(void*) {
         HANDLE e = refresh_event.load();
         if (!e || WaitForSingleObject(e, INFINITE) != WAIT_OBJECT_0) return 0;
         ReadUpscalerOverrides();
+        ReadAnisoOverride();
     }
 }
 }
@@ -250,6 +251,140 @@ void RequestUpscalerOverridesRefresh() {
     });
     if (HANDLE e = refresh_event.load()) SetEvent(e);
 }
+}
+
+namespace na::fg::preset {
+namespace {
+std::mutex aniso_mutex;
+AnisoOverride aniso_state;
+std::atomic<int> aniso_job{0}; // 1 write APP, 2 restore
+std::once_flag aniso_once;
+HANDLE aniso_event = nullptr;
+bool exe_name(NvAPI_UnicodeString& exe) {
+    wchar_t path[MAX_PATH]{}; GetModuleFileNameW(nullptr, path, MAX_PATH);
+    auto name = wcsrchr(path, L'\\'); name = name ? name + 1 : path;
+    wcscpy_s(reinterpret_cast<wchar_t*>(exe), NVAPI_UNICODE_STRING_MAX, name);
+    return name[0] != 0;
+}
+bool aniso_backup_path(wchar_t (&out)[MAX_PATH]) {
+    wcsncpy_s(out, settings::UserIniPath(), _TRUNCATE);
+    auto slash = wcsrchr(out, L'\\');
+    if (!slash) return false;
+    wcscpy_s(slash + 1, MAX_PATH - static_cast<size_t>(slash + 1 - out), L"AF-profile-before.ini");
+    return true;
+}
+// One DRS session: read the effective selector/level for this executable and optionally
+// write (job 1: selector APP, saving the previous values first; job 2: put them back).
+int32_t aniso_session(int job, AnisoOverride& out) {
+    out.available = false;
+    if (!load_api()) return NVAPI_ERROR;
+    using GetGlobal = NvAPI_Status(__cdecl*)(NvDRSSessionHandle, NvDRSProfileHandle*);
+    auto module = GetModuleHandleW(L"nvapi64.dll");
+    auto query = module ? reinterpret_cast<Query>(reinterpret_cast<void*>(GetProcAddress(module, "nvapi_QueryInterface"))) : nullptr;
+    auto get_global = query ? reinterpret_cast<GetGlobal>(query(0x617bff9f)) : nullptr; // NvAPI_DRS_GetCurrentGlobalProfile
+    NvDRSSessionHandle session = nullptr;
+    NvAPI_Status r = create(&session);
+    if (r != NVAPI_OK) return r;
+    r = load(session);
+    if (r == NVAPI_OK) {
+        NvAPI_UnicodeString exe{}; exe_name(exe);
+        NvDRSProfileHandle app_profile = nullptr, global = nullptr;
+        NVDRS_APPLICATION app{}; app.version = NVDRS_APPLICATION_VER;
+        if (find(session, exe, &app_profile, &app) != NVAPI_OK) app_profile = nullptr;
+        if (get_global && get_global(session, &global) != NVAPI_OK) global = nullptr;
+        NvDRSProfileHandle profile = app_profile ? app_profile : global;
+        out.app_profile = app_profile != nullptr;
+        if (profile) {
+            out.available = true;
+            NVDRS_SETTING sel{}; sel.version = NVDRS_SETTING_VER;
+            NVDRS_SETTING lvl{}; lvl.version = NVDRS_SETTING_VER;
+            const bool has_sel = get(session, profile, ANISO_MODE_SELECTOR_ID, &sel) == NVAPI_OK;
+            const bool has_lvl = get(session, profile, ANISO_MODE_LEVEL_ID, &lvl) == NVAPI_OK;
+            out.selector = has_sel ? sel.u32CurrentValue : ANISO_MODE_SELECTOR_DEFAULT;
+            out.level = has_lvl ? lvl.u32CurrentValue : ANISO_MODE_LEVEL_DEFAULT;
+            wchar_t backup[MAX_PATH]{};
+            if (job && app_profile && aniso_backup_path(backup)) {
+                if (job == 1) {
+                    // Save once what the profile held itself (user value), so restore is exact.
+                    if (GetFileAttributesW(backup) == INVALID_FILE_ATTRIBUTES) {
+                        const bool own = has_sel && sel.settingLocation == NVDRS_CURRENT_PROFILE_LOCATION && !sel.isCurrentPredefined;
+                        wchar_t v[32];
+                        swprintf_s(v, L"%u", own ? 1u : 0u); WritePrivateProfileStringW(L"selector", L"user_value", v, backup);
+                        swprintf_s(v, L"%u", out.selector); WritePrivateProfileStringW(L"selector", L"value", v, backup);
+                        WritePrivateProfileStringW(L"backup", L"exe", reinterpret_cast<const wchar_t*>(exe), backup);
+                        WritePrivateProfileStringW(L"backup", L"complete", L"1", backup);
+                    }
+                    if (GetPrivateProfileIntW(L"backup", L"complete", 0, backup) != 1) r = NVAPI_ERROR;
+                    if (r == NVAPI_OK) {
+                        NVDRS_SETTING w{}; w.version = NVDRS_SETTING_VER; w.settingId = ANISO_MODE_SELECTOR_ID;
+                        w.settingType = NVDRS_DWORD_TYPE; w.u32CurrentValue = ANISO_MODE_SELECTOR_APP;
+                        r = set(session, app_profile, &w);
+                        if (r == NVAPI_OK) r = save(session);
+                    }
+                } else if (GetPrivateProfileIntW(L"backup", L"complete", 0, backup) == 1) {
+                    if (GetPrivateProfileIntW(L"selector", L"user_value", 0, backup)) {
+                        NVDRS_SETTING w{}; w.version = NVDRS_SETTING_VER; w.settingId = ANISO_MODE_SELECTOR_ID;
+                        w.settingType = NVDRS_DWORD_TYPE; w.u32CurrentValue = GetPrivateProfileIntW(L"selector", L"value", 0, backup);
+                        r = set(session, app_profile, &w);
+                    } else {
+                        r = erase(session, app_profile, ANISO_MODE_SELECTOR_ID);
+                        if (r == NVAPI_SETTING_NOT_FOUND) r = NVAPI_OK;
+                    }
+                    if (r == NVAPI_OK) r = save(session);
+                    if (r == NVAPI_OK) DeleteFileW(backup);
+                } else r = NVAPI_ERROR;
+                if (r == NVAPI_OK) { // read back what the profile now says
+                    NVDRS_SETTING again{}; again.version = NVDRS_SETTING_VER;
+                    if (get(session, app_profile, ANISO_MODE_SELECTOR_ID, &again) == NVAPI_OK) out.selector = again.u32CurrentValue;
+                    else out.selector = ANISO_MODE_SELECTOR_DEFAULT;
+                }
+            } else if (job) r = NVAPI_EXECUTABLE_NOT_FOUND; // no own profile: we never write the global one
+        }
+    }
+    destroy(session);
+    return r;
+}
+DWORD WINAPI aniso_worker(void*) {
+    for (;;) {
+        if (WaitForSingleObject(aniso_event, INFINITE) != WAIT_OBJECT_0) return 0;
+        const int job = aniso_job.exchange(0);
+        AnisoOverride now{};
+        const int32_t r = aniso_session(job, now);
+        std::lock_guard<std::mutex> lock(aniso_mutex);
+        const bool written = aniso_state.written;
+        aniso_state = now;
+        aniso_state.write_pending = false;
+        aniso_state.written = written || (job == 1 && r == NVAPI_OK);
+        if (job == 2 && r == NVAPI_OK) aniso_state.written = false;
+        if (job) aniso_state.write_result = r;
+    }
+}
+void aniso_start() {
+    std::call_once(aniso_once, [] {
+        aniso_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!aniso_event) return;
+        HANDLE t = CreateThread(nullptr, 0, aniso_worker, nullptr, 0, nullptr);
+        if (t) CloseHandle(t); else { CloseHandle(aniso_event); aniso_event = nullptr; }
+    });
+}
+void aniso_queue(int job) {
+    aniso_start();
+    if (!aniso_event) return;
+    { std::lock_guard<std::mutex> lock(aniso_mutex); aniso_state.write_pending = true; }
+    aniso_job.store(job);
+    SetEvent(aniso_event);
+}
+}
+void ReadAnisoOverride() {
+    AnisoOverride now{};
+    aniso_session(0, now);
+    std::lock_guard<std::mutex> lock(aniso_mutex);
+    const bool written = aniso_state.written; const int32_t wr = aniso_state.write_result;
+    aniso_state = now; aniso_state.written = written; aniso_state.write_result = wr;
+}
+AnisoOverride GetAnisoOverride() { std::lock_guard<std::mutex> lock(aniso_mutex); return aniso_state; }
+void RequestAppControlledAniso() { aniso_queue(1); }
+void RequestRestoreAniso() { aniso_queue(2); }
 }
 
 #ifdef NA_PROFILE_CLI

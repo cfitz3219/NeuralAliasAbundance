@@ -31,4 +31,27 @@ void ReadUpscalerOverrides(); // init thread only (DRS session); never writes
 // reflected when the menu is opened. Never blocks; never writes.
 void RequestUpscalerOverridesRefresh();
 UpscalerOverrides GetUpscalerOverrides();
+
+// NVIDIA driver anisotropic-filtering override (Control Panel "Anisotropic filtering"). Astra,
+// COMMS 2026-11-05 14:38Z: Cort's global AND sniper5_dx12.exe profile resolve to selector USER
+// with level NONE_LINEAR (Control Panel "Off"), which forces linear filtering over whatever
+// the game or we ask for, so 16x had no visible effect. Selector APP = application-controlled.
+struct AnisoOverride {
+    bool available = false;    // the driver settings could be read
+    bool app_profile = false;  // this executable has its own NVIDIA profile (writable target)
+    uint32_t selector = 0, level = 0; // effective values for this executable
+    bool write_pending = false, written = false;
+    int32_t write_result = 0;
+    // The driver forces a level below `wanted` (4 / 8 / 16) over the application's samplers.
+    bool Limits(uint32_t wanted) const { return available && selector == 1u && level < wanted; }
+};
+void ReadAnisoOverride();     // init thread / background worker only (DRS session)
+AnisoOverride GetAnisoOverride();
+// Menu thread, on the user's click: set THIS game's NVIDIA profile to application-controlled
+// anisotropic filtering (the previous value is saved for RestoreAnisoOverride). Never touches
+// the global profile. The driver reads the profile when the game starts: takes effect on the
+// next launch.
+void RequestAppControlledAniso();
+void RequestRestoreAniso();
 }
+

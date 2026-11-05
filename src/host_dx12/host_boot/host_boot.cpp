@@ -189,6 +189,8 @@ DWORD WINAPI InitThread(LPVOID)
     // NGX core before the game reaches it, watch for the core module, wire
     // the runtimes for Neural Rendering and Frame Generation, register the
     // Route A pages, enable the presenter. Off unless [route_a] enabled=1.
+    // Read-only: does the NVIDIA driver force texture filtering over the game (and our 16x)?
+    na::fg::preset::ReadAnisoOverride();
     bool route_a = GetPrivateProfileIntW(L"route_a", L"enabled", 0, g_ini) == 1;
     bool route_a_started = false;
     if (route_a) {

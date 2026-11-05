@@ -965,6 +965,10 @@ void write_status_line()
                   (unsigned long long)as.native_surface,(unsigned long long)as.native_16,
                   (unsigned long long)as.sampler_calls,(unsigned long long)as.sampler2_calls);
             if (an > 0) WriteFile(f, al, DWORD((std::min)(an, int(sizeof al - 1))), &written, nullptr);
+            const auto drv = na::fg::preset::GetAnisoOverride();
+            const int dn = snprintf(al, sizeof al, "driver_af available=%u app_profile=%u selector=%u level=%u limits16=%u written=%u write_result=%d\r\n",
+                drv.available ? 1u : 0u, drv.app_profile ? 1u : 0u, drv.selector, drv.level, drv.Limits(16) ? 1u : 0u, drv.written ? 1u : 0u, drv.write_result);
+            if (dn > 0) WriteFile(f, al, DWORD((std::min)(dn, int(sizeof al - 1))), &written, nullptr);
         }
         if (na::j2::RenderSmall()) { // P4-4 render-small: one line per status write
             const auto ps = na::present::GetStats();
