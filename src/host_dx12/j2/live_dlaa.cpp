@@ -4353,6 +4353,9 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
         if (layer_frame) {
             extra("hud_n0", layer.n0, D3D12_RESOURCE_STATE_RENDER_TARGET);
             extra("hud_n1", layer.n1, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            // Un-blend evidence: the UI replayed over black / grey at render size (with the
+            // back buffer, P = L0 + m*S can be checked offline pixel by pixel).
+            if (layer.unblend) { extra("hud_l0", layer.l0, D3D12_RESOURCE_STATE_RENDER_TARGET); extra("hud_l1", layer.l1, D3D12_RESOURCE_STATE_RENDER_TARGET); }
             if(draw_picture){extra("hud_scene",layer.picture->Scene(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);extra("hud_full",layer.picture->Full(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 if(!separate_scene)extra("hud_draw_mask",layer.picture->Mask(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);}
         }
