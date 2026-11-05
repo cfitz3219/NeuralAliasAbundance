@@ -1549,6 +1549,7 @@ HRESULT STDMETHODCALLTYPE D_Wait(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v
 
 void STDMETHODCALLTYPE D_ExecuteCommandLists(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists)
 {
+    const CostScope cost(kCostExec, !t_host_work);
     ReleaseParkedTwins();
     const ExecuteToken t = ExecuteBegin(q, n, lists);
     o_ExecuteCommandLists(q, n, lists);
@@ -1969,6 +1970,7 @@ void make_pso_twins(IUnknown* pso, const void* rs, Make make)
 
 HRESULT STDMETHODCALLTYPE D_CreateGraphicsPipelineState(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, REFIID riid, void** out)
 {
+    const CostScope cost(kCostPso, !t_host_work);
     Depth depth("CreateGraphicsPipelineState");
     const HRESULT hr = o_CreateGraphicsPipelineState(dev, d, riid, out);
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
@@ -2003,6 +2005,7 @@ HRESULT STDMETHODCALLTYPE D_CreateGraphicsPipelineState(ID3D12Device* dev, const
 
 HRESULT STDMETHODCALLTYPE D_CreateComputePipelineState(ID3D12Device* dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC* d, REFIID riid, void** out)
 {
+    const CostScope cost(kCostPso, !t_host_work);
     Depth depth("CreateComputePipelineState");
     const HRESULT hr = o_CreateComputePipelineState(dev, d, riid, out);
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
@@ -2077,6 +2080,7 @@ size_t sub_size(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t)
 
 HRESULT STDMETHODCALLTYPE D_CreatePipelineState(ID3D12Device2* dev, const D3D12_PIPELINE_STATE_STREAM_DESC* d, REFIID riid, void** out)
 {
+    const CostScope cost(kCostPso, !t_host_work);
     Depth depth("CreatePipelineState");
     const HRESULT hr = o_CreatePipelineState(dev, d, riid, out);
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
@@ -3666,6 +3670,37 @@ void vpj_before_draw(GL* l)
     l->RSSetViewports(n, n ? v : nullptr);
     t_vpj_self = false;
 }
+// ---- Hook cost (2026-11-05: with us loaded SE5 ran 35 fps CPU-bound vs 165 without) ----------
+// Wall time spent inside each outermost command-list hook (ours + the driver's call), per
+// slot, plus ExecuteCommandLists and pipeline creation. Thread-local sums are folded into the
+// shared totals every 512 calls, so the measurement itself adds no shared write per call.
+constexpr uint32_t kCostSlots = 128, kCostExec = 125, kCostPso = 126;
+std::atomic<uint64_t> g_cost_ticks[kCostSlots]{}, g_cost_calls[kCostSlots]{};
+thread_local uint64_t t_cost_ticks[kCostSlots]{}, t_cost_calls[kCostSlots]{};
+thread_local uint32_t t_cost_n = 0;
+inline uint64_t cost_now() { LARGE_INTEGER c; QueryPerformanceCounter(&c); return static_cast<uint64_t>(c.QuadPart); }
+void cost_flush()
+{
+    for (uint32_t i = 0; i < kCostSlots; ++i)
+        if (t_cost_calls[i]) {
+            g_cost_ticks[i].fetch_add(t_cost_ticks[i], std::memory_order_relaxed);
+            g_cost_calls[i].fetch_add(t_cost_calls[i], std::memory_order_relaxed);
+            t_cost_ticks[i] = t_cost_calls[i] = 0;
+        }
+    t_cost_n = 0;
+}
+struct CostScope {
+    uint32_t slot; uint64_t t0;
+    explicit CostScope(uint32_t s, bool on = true) : slot(on && s < kCostSlots ? s : kCostSlots), t0(slot < kCostSlots ? cost_now() : 0) {}
+    ~CostScope()
+    {
+        if (slot >= kCostSlots) return;
+        t_cost_ticks[slot] += cost_now() - t0; ++t_cost_calls[slot];
+        if (++t_cost_n >= 512 || slot >= kCostExec) cost_flush();
+    }
+    CostScope(const CostScope&) = delete;
+    CostScope& operator=(const CostScope&) = delete;
+};
 template <uint32_t Slot, typename Sig>
 struct ListHook;
 template <uint32_t Slot, typename R, typename... A>
@@ -3676,6 +3711,7 @@ struct ListHook<Slot, R(A...)> {
     static R STDMETHODCALLTYPE thunk(GL* l, A... a)
     {
         na::hooking::variants::CallScope scope(l, Slot);
+        const CostScope cost(Slot, scope.outermost && !t_host_work);
         auto fn = reinterpret_cast<Pfn>(orig[I]);
         if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced ||
                       Slot == sl::list::ExecuteIndirect || Slot == sl::list::ExecuteBundle)
@@ -6250,6 +6286,37 @@ uint64_t ListSceneViewportJitter(ID3D12CommandList* list,uint64_t scene_depth)
     if (!ls) return 0;
     std::lock_guard<std::mutex> bl(ls->bind_m);
     return !scene_depth||scene_depth==ls->vpj_depth?ls->vpj_scene:0;
+}
+void FormatHookCost(char* out, size_t n)
+{
+    if (!out || !n) return;
+    out[0] = 0;
+    cost_flush(); // this thread's share
+    static uint64_t prev_ticks[kCostSlots]{}, prev_calls[kCostSlots]{}, prev_at = 0;
+    static std::mutex m;
+    std::lock_guard<std::mutex> lock(m);
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+    const uint64_t now = cost_now();
+    const double secs = prev_at ? double(now - prev_at) / double(f.QuadPart) : 0.0;
+    struct Row { uint32_t slot; double ms_per_s, calls_per_s, us_per_call; };
+    Row rows[kCostSlots]; uint32_t nr = 0; double list_total = 0;
+    for (uint32_t i = 0; i < kCostSlots; ++i) {
+        const uint64_t t = g_cost_ticks[i].load(std::memory_order_relaxed), c = g_cost_calls[i].load(std::memory_order_relaxed);
+        const uint64_t dt = t - prev_ticks[i], dc = c - prev_calls[i];
+        prev_ticks[i] = t; prev_calls[i] = c;
+        if (!dc || secs <= 0) continue;
+        const double ms = double(dt) * 1000.0 / double(f.QuadPart);
+        rows[nr++] = {i, ms / secs, double(dc) / secs, ms * 1000.0 / double(dc)};
+        if (i < kCostExec) list_total += ms / secs;
+    }
+    prev_at = now;
+    std::sort(rows, rows + nr, [](const Row& a, const Row& b) { return a.ms_per_s > b.ms_per_s; });
+    int w = std::snprintf(out, n, "hook_cost window_s=%.1f list_ms_per_s=%.1f", secs, list_total);
+    for (uint32_t i = 0; i < nr && i < 14 && w > 0 && size_t(w) < n; ++i) {
+        const char* tag = rows[i].slot == kCostExec ? "exec" : rows[i].slot == kCostPso ? "pso" : nullptr;
+        if (tag) w += std::snprintf(out + w, n - w, " %s{ms_per_s=%.1f calls_per_s=%.0f us=%.2f}", tag, rows[i].ms_per_s, rows[i].calls_per_s, rows[i].us_per_call);
+        else w += std::snprintf(out + w, n - w, " s%u{ms_per_s=%.1f calls_per_s=%.0f us=%.2f}", rows[i].slot, rows[i].ms_per_s, rows[i].calls_per_s, rows[i].us_per_call);
+    }
 }
 ViewportJitterStats GetViewportJitterStats()
 {

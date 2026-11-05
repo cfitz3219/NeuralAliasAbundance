@@ -306,6 +306,10 @@ bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float
 uint64_t ListSceneViewportJitter(ID3D12CommandList* list,uint64_t scene_depth=0);
 struct ViewportJitterStats { uint64_t draws, sets, restores, unknown; };
 ViewportJitterStats GetViewportJitterStats();
+// Wall time inside each outermost command-list hook (ours + driver), ExecuteCommandLists
+// ("exec") and pipeline creation ("pso") since the previous call: one status line,
+// "hook_cost ... s<slot>{ms_per_s calls_per_s us}" (slot = ID3D12GraphicsCommandList vtable index).
+void FormatHookCost(char* out, size_t n);
 
 // Buffer GPU VA -> (resource id, offset). False when unknown or ambiguous.
 bool ResolveGpuVa(uint64_t va, na_object_id* resource, uint64_t* offset);

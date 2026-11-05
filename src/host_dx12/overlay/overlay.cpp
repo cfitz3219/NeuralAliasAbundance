@@ -924,6 +924,12 @@ void write_status_line()
             const size_t probe_n = std::strlen(probe);
             if (probe_n) { probe[probe_n] = '\r'; probe[probe_n + 1] = '\n'; WriteFile(f, probe, DWORD(probe_n + 2), &written, nullptr); }
         }
+        { // Hook cost (2026-11-05): where the CPU time inside our hooks goes
+            char hl[1400];
+            na::observe::FormatHookCost(hl, sizeof hl - 2);
+            const size_t hn = std::strlen(hl);
+            if (hn) { hl[hn] = '\r'; hl[hn + 1] = '\n'; WriteFile(f, hl, DWORD(hn + 2), &written, nullptr); }
+        }
         { // Viewport jitter ([j2] viewport_jitter): real samples through the game's viewports
             const auto vps = na::observe::GetViewportJitterStats();
             char vl[400];
