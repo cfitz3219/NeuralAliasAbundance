@@ -272,6 +272,40 @@ int native_picture_phases(test::Device& d)
     return 0;
 }
 
+// The UI-only path seeds its own original background without calling Prepare.
+// After one Present the picture has used page1. Recycling it must put pre-HUD
+// descriptors back on page0, even if final presentation uses another view.
+int reused_ui_picture_phases(test::Device& d)
+{
+    constexpr UINT W=4,H=2,OW=8,OH=4;
+    constexpr auto F=DXGI_FORMAT_R8G8B8A8_UNORM;
+    constexpr auto S=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    constexpr auto U=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    std::vector<uint8_t> color;for(UINT i=0;i<W*H;++i)color.insert(color.end(),{128,64,32,192});
+    auto source=test::CreateTexture(d.device.Get(),W,H,DXGI_FORMAT_R8G8B8A8_TYPELESS,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_NONE);
+    auto check=test::CreateTexture(d.device.Get(),W,H,DXGI_FORMAT_R8G8B8A8_TYPELESS,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_NONE);
+    auto native=test::CreateTexture(d.device.Get(),OW,OH,F,S,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto out=test::CreateTexture(d.device.Get(),OW,OH,F,U,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    REQUIRE(source&&check&&native&&out&&upload(d,source.Get(),color.data(),4,S)&&upload(d,check.Get(),color.data(),4,S));
+    auto p=nh::Picture::Create(d.device.Get(),source->GetDesc(),OW,OH);REQUIRE(p);
+    for(unsigned cycle=0;cycle<3;++cycle){
+        if(cycle)p->BeginCycle();test::List seed,finish;REQUIRE(seed.Create(d.device.Get())&&finish.Create(d.device.Get()));
+        REQUIRE(p->SnapshotScene(seed.list.Get(),source.Get(),S)&&p->SnapshotFull(seed.list.Get(),source.Get(),S));
+        REQUIRE(p->SeedNativeScene(seed.list.Get(),native.Get(),DXGI_FORMAT_R8G8B8A8_UNORM_SRGB));
+        auto b=test::Transition(native.Get(),D3D12_RESOURCE_STATE_PRESENT,S);seed.list->ResourceBarrier(1,&b);
+        REQUIRE(SUCCEEDED(seed.list->Close()));
+        // Record before seed executes: its storage-encoded SRV must not be
+        // replaced with the sRGB view used by the final comparison.
+        REQUIRE(p->PresentNative(finish.list.Get(),source.Get(),DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,native.Get(),check.Get(),out.Get()));
+        REQUIRE(SUCCEEDED(finish.list->Close()));
+        ID3D12CommandList* lists[]={seed.list.Get(),finish.list.Get()};d.queue->ExecuteCommandLists(2,lists);d.WaitIdle();
+        std::vector<uint8_t> pixels;REQUIRE(readback(d,native.Get(),S,4,pixels));
+        std::printf("reused UI seed cycle%u rgb=%u/%u/%u alpha=%u\n",cycle,pixels[0],pixels[1],pixels[2],pixels[3]);
+        CHECK(pixels[0]==128&&pixels[1]==64&&pixels[2]==32&&pixels[3]==192);
+    }
+    return 0;
+}
+
 int jitter_evidence(test::Device& d)
 {
     constexpr uint32_t W=256,H=128;
@@ -1214,6 +1248,7 @@ int main()
     if (classify(d)) return 1;
     if (picture_paths(d)) return 1;
     if (native_picture_phases(d)) return 1;
+    if (reused_ui_picture_phases(d)) return 1;
     if (canvas_probe(d)) return 1;
     if (end_to_end(d)) return 1;
     if (native_capture(d)) return 1;
