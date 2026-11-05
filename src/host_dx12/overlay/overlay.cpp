@@ -1170,6 +1170,18 @@ void write_status_line()
             const int en=snprintf(al,sizeof al,"j2_entry keys=%u matched=%llu source=actual_operation rejected{new=%llu learning=%llu middle=%llu}\r\n",j2.entry_keys,(unsigned long long)j2.entry_matched,
                 (unsigned long long)j2.entry_unknown,(unsigned long long)j2.entry_learning,(unsigned long long)j2.entry_middle);
             if(en>0)WriteFile(f,al,static_cast<DWORD>(en),&written,nullptr);
+            {
+                // Burst diagnosis (2026-11-05): every distinct reason given, with counts, and
+                // inline placements that fired but could not record DLAA.
+                char rl[1200];
+                int rn = snprintf(rl, sizeof rl, "j2_reasons inline_record_failed=%llu kinds=%u", (unsigned long long)j2.inline_record_failed, j2.reason_kinds);
+                for (uint32_t i = 0; i < j2.reason_kinds && rn > 0 && rn < static_cast<int>(sizeof rl) - 90; ++i) {
+                    const int m = snprintf(rl + rn, sizeof rl - static_cast<size_t>(rn), " | %llu:%s", (unsigned long long)j2.reason_counts[i].n, j2.reason_counts[i].text);
+                    if (m < 0) break;
+                    rn += m;
+                }
+                if (rn > 0 && rn < static_cast<int>(sizeof rl) - 2) { rl[rn++] = '\r'; rl[rn++] = '\n'; WriteFile(f, rl, static_cast<DWORD>(rn), &written, nullptr); }
+            }
             const auto cs = na::capture::j2::GetStats();
             {
                 // Four separate outcomes (Astra): frames without DLAA, DLAA placed before more

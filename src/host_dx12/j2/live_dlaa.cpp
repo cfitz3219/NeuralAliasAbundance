@@ -314,7 +314,18 @@ struct PhysicalReport {
     ~PhysicalReport();
 };
 
-void reason(const char* r) { std::snprintf(g.stats.reason, sizeof(g.stats.reason), "%s", r); }
+void reason(const char* r)
+{
+    std::snprintf(g.stats.reason, sizeof(g.stats.reason), "%s", r);
+    auto& rc = g.stats.reason_counts;
+    for (uint32_t i = 0; i < g.stats.reason_kinds; ++i)
+        if (std::strncmp(rc[i].text, r, sizeof rc[i].text - 1) == 0) { ++rc[i].n; return; }
+    if (g.stats.reason_kinds < sizeof rc / sizeof rc[0]) {
+        auto& n = rc[g.stats.reason_kinds++];
+        std::snprintf(n.text, sizeof n.text, "%s", r);
+        n.n = 1;
+    }
+}
 void committed_sources(const PendingHistory& p) {
     if(p.depth_source>=1 && p.depth_source<=4)++g.stats.depth_sources[p.depth_source-1];
     if(p.camera_source>=1 && p.camera_source<=6)++g.stats.camera_sources[p.camera_source-1];
@@ -2885,7 +2896,7 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
         reason("Stopped: the game's list state could not be restored after inline DLAA.");
         return;
     }
-    if (!ok) { na::capture::j2::Discard(pending.capture, true); return; } // the game's list still runs our copies
+    if (!ok) { ++g.stats.inline_record_failed; na::capture::j2::Discard(pending.capture, true); return; } // the game's list still runs our copies
     g.slot = (g.slot + 1) % kRing;
     g.inl.list = l;
     g.inl.rec = rec;

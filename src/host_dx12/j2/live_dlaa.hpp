@@ -377,6 +377,12 @@ struct Stats {
     uint32_t color_sub = 0, color_mips = 0, color_slices = 0, color_samples = 0, depth_slices = 0, depth_samples = 0;
     bool active = false;          // the last batch with the scene was processed
     char reason[160] = {};
+    // Why frames went without DLAA (cumulative): each distinct reason() text and how often it
+    // was given (burst diagnosis, 2026-11-05: frames with no reason recorded were invisible).
+    struct ReasonCount { char text[64] = {}; uint64_t n = 0; };
+    ReasonCount reason_counts[12];
+    uint32_t reason_kinds = 0;
+    uint64_t inline_record_failed = 0; // an inline placement fired but recording DLAA failed (reason in the tally)
 };
 Stats GetStats();
 
