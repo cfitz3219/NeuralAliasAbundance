@@ -1334,6 +1334,24 @@ bool sampler_wants_bias(const SD& d)
     return surface && d.MaxLOD > 0.0f;
 }
 float clamp_lod(float v) { return v < -16.0f ? -16.0f : (v > 15.99f ? 15.99f : v); }
+// 16x anisotropic filtering (Cort 2026-11-05, menu switch, next game start): the game's
+// surface-texture samplers (the same ones the mip bias treats) are made anisotropic 16x.
+// It is applied where the game samples its textures, before DLSS, so DLSS gets the sharper
+// oblique detail. Comparison / min-max / point / screen-pass samplers are untouched.
+std::atomic<bool> g_aniso16{false};
+std::atomic<uint64_t> g_aniso_samplers{0}, g_aniso_static{0}, g_aniso_already{0};
+template <typename SD>
+bool apply_aniso(SD& d)
+{
+    if (!g_aniso16.load(std::memory_order_relaxed) || !sampler_wants_bias(d)) return false;
+    if (D3D12_DECODE_IS_ANISOTROPIC_FILTER(d.Filter) && d.MaxAnisotropy >= 16) {
+        g_aniso_already.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    d.Filter = D3D12_FILTER_ANISOTROPIC;
+    d.MaxAnisotropy = 16;
+    return true;
+}
 // Target-based bias (Cort, aiming for a total of `target`, e.g. -1): a sampler
 // with a neutral or positive native bias gets NVIDIA's NativeBias + target; one
 // the game already biases negative is brought to `target` at most and never
@@ -1362,11 +1380,14 @@ void STDMETHODCALLTYPE D_CreateSampler(ID3D12Device* dev, const D3D12_SAMPLER_DE
     const float bias = g_mip_bias.load(std::memory_order_relaxed);
     const bool surface = d && !t_host_work && sampler_wants_bias(*d);
     if (surface) note_native(d->MipLODBias);
-    if (surface && bias != 0.0f && biased(d->MipLODBias, bias) != d->MipLODBias) {
-        D3D12_SAMPLER_DESC m = *d;
-        m.MipLODBias = biased(m.MipLODBias, bias);
+    D3D12_SAMPLER_DESC m = d ? *d : D3D12_SAMPLER_DESC{};
+    const bool bias_it = surface && bias != 0.0f && biased(d->MipLODBias, bias) != d->MipLODBias;
+    if (bias_it) m.MipLODBias = biased(m.MipLODBias, bias);
+    const bool aniso_it = surface && apply_aniso(m);
+    if (bias_it || aniso_it) {
         o_CreateSampler(dev, &m, h);
-        g_biased_samplers.fetch_add(1, std::memory_order_relaxed);
+        if (bias_it) g_biased_samplers.fetch_add(1, std::memory_order_relaxed);
+        if (aniso_it) g_aniso_samplers.fetch_add(1, std::memory_order_relaxed);
     } else {
         o_CreateSampler(dev, d, h);
     }
@@ -1796,12 +1817,15 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
                 if (level != game_level && (!live || !(level_mask >> level & 1u))) continue;
                 D3D12_VERSIONED_ROOT_SIGNATURE_DESC copy = *u;
                 std::vector<D3D12_STATIC_SAMPLER_DESC> ss(src, src + ns);
-                uint32_t changed = 0;
+                uint32_t changed = 0, aniso = 0;
                 for (auto& x : ss)
                     if (sampler_wants_bias(x)) {
                         const float nb = biased(x.MipLODBias, kMipLevels[level]);
                         if (nb != x.MipLODBias) { x.MipLODBias = nb; ++changed; }
+                        if (apply_aniso(x)) ++aniso;
                     }
+                if (level == game_level && aniso) g_aniso_static.fetch_add(aniso, std::memory_order_relaxed);
+                changed += aniso;
                 if (!changed) continue; // the original blob is right for this level
                 if (u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0) copy.Desc_1_0.pStaticSamplers = ss.data();
                 else copy.Desc_1_1.pStaticSamplers = ss.data();
@@ -6051,6 +6075,16 @@ void MipBiasCounts(uint64_t* samplers, uint64_t* static_samplers)
 {
     if (samplers) *samplers = g_biased_samplers.load(std::memory_order_relaxed);
     if (static_samplers) *static_samplers = g_biased_static.load(std::memory_order_relaxed);
+}
+void SetSamplerAnisotropy16(bool on) { g_aniso16.store(on, std::memory_order_relaxed); }
+AnisoStats GetAnisoStats()
+{
+    AnisoStats a;
+    a.on = g_aniso16.load(std::memory_order_relaxed);
+    a.samplers = g_aniso_samplers.load(std::memory_order_relaxed);
+    a.static_samplers = g_aniso_static.load(std::memory_order_relaxed);
+    a.already = g_aniso_already.load(std::memory_order_relaxed);
+    return a;
 }
 HostWorkScope::HostWorkScope() : prev_(t_host_work) { t_host_work = true; }
 HostWorkScope::~HostWorkScope() { t_host_work = prev_; }

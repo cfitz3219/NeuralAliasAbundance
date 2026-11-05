@@ -110,6 +110,8 @@ void ActivateSavedRequests(const wchar_t* ini){
         }
         observe::SetSamplerMipBias(bias);
     }
+    // 16x anisotropic filtering (menu switch): the game's samplers are built at load.
+    observe::SetSamplerAnisotropy16(!safe && st.aniso16.load()!=0);
     if(GetPrivateProfileIntW(L"fsr",L"enabled",1,ini)==1)
         ffx::SetMode(!safe && GetPrivateProfileIntW(L"fsr",L"replace",0,ini)==1?ffx::Mode::ReplaceWithDlss:ffx::Mode::Observe);
     if(GetPrivateProfileIntW(L"xess",L"enabled",1,ini)==1)
