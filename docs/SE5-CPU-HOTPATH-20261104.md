@@ -148,3 +148,52 @@ has hook profiling disabled. Capture saving and F8 are unnecessary for the first
 fps comparison and add separate diagnostic work. The user-reported 165-to-35 fps
 loss remains an open live result until that comparison, even though redundant CPU
 work has been reproduced and reduced automatically.
+
+## Final engineering and package receipt
+
+Tested runtime: `8bbd66194680ac6067b76d89b4df9cf6bcbab290`,
+`astra/se5-cpu-hotpath`, [PR 97](https://github.com/cfitz3219/NeuralAliasAbundance/pull/97).
+Complete Release build passed. Complete final confirmation suite: **195 passed,
+five skipped, zero failed, 326.20 seconds**. Skips are the optional NR runtime
+probe, three unsupported 16x-MSAA cases and the optional upscaler-jitter runtime.
+No rendering edits followed that run.
+
+An earlier same-source complete run had three intermittent failures: a tuple
+index TypeError in the unchanged Python reference checker, a temporary-DLL
+CopyFile failure in the Streamline forwarding test, and the native-HUD fixture's
+missing expected fallback layer at its deliberately unsafe-VB frame (followed by
+exit failure). All three passed an immediate unchanged rerun and ten executions
+each on the same binaries. The complete confirmation then passed. Their causes
+are **not established or claimed fixed**; the original failure and repeated-run
+logs remain in the evidence directory. There was no relaxed pixel comparison,
+disabled test or runtime validator change to produce the passing confirmation.
+
+Prepared package: `C:\Users\Cort\Documents\NA-se5-motion-8bbd661`.
+DLL SHA256: `E24C38751A8C159CCA102B1FC4B2FB352EE761C02CEA00DE5D3DA0D89D4E58D3`.
+It includes the previous 55fcd11 HUD work and the existing jitter repair. Opus's
+separate optional anisotropic-filtering change is not silently added to this
+measured package. The production PR is cleanly mergeable with that separate work.
+
+The established additive deployment/rollback logic is reused. A temporary-folder
+Windows PowerShell fixture passed install, corrupt-candidate preservation,
+upgrade, saved menu options, new diagnostic defaults, results export, rollback
+and native-file refusal. Payload hashes were verified. Ordinary-play defaults
+are `profile_hooks=0`, `size_probe=0`, `capture_auto=0`; explicit F8/menu capture
+and functional resolution/fullscreen handling remain. The latter two diagnostic
+defaults are installer changes, not credited with the measured benchmark gain.
+
+The existing `NA-se5-dlss-update.cmd` and results CMD select this package.
+`NA-se5-cpu-previous.cmd` selects the preceding prepared 55fcd11 HUD package;
+the existing `NA-se5-hud-previous.cmd` selects c1b3ed2, the actually installed
+previous version. Original-installation rollback remains available through the
+existing receipt. Old command pointers are backed up in the evidence directory.
+Astra did not launch, control or deploy to the game. Its installed c1b3ed2 DLL
+remained `03A63FBFB017726BE156A0793DF6C3118FA4A29294E5203E44D92524BFC401FE`.
+
+Next performance acquisition, coordinated with Opus, is a function-level game CPU
+sample to account for work outside the existing hook envelopes. That is distinct
+from the proven redundant tracking removed here. A lean path for irrelevant work
+can build on this head while preserving early binding state and promoting a list
+before its first relevant scene/HUD operation; classifying a pooled list solely
+at Reset from its previous frame would lose required state. No new review cycle
+or game-specific addresses are introduced.
