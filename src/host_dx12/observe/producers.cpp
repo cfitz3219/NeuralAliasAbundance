@@ -6197,19 +6197,33 @@ ID3D12Resource* AcquireResource(na_object_id id)
 namespace {
 // Depth and colour are one role: published and read together (two separate atomics let a
 // reader see a new depth with the old colour, Astra 20cddb8).
+// Readers are per draw on every recording thread, so they never take a lock: a sequence
+// counter (odd while a writer is mid-update) lets them retry instead (seqlock). Writers stay
+// serialised by g_live_m.
 std::mutex g_live_m;
-uint64_t g_live_depth = 0, g_live_color = 0, g_live_version = 0;
+std::atomic<uint64_t> g_live_depth{0}, g_live_color{0}, g_live_seq{0};
+uint64_t g_live_version = 0;
 }
 void SetLiveSelection(uint64_t depth, uint64_t color)
 {
     std::lock_guard<std::mutex> lock(g_live_m);
-    if (depth != g_live_depth || color != g_live_color) ++g_live_version;
-    g_live_depth = depth; g_live_color = color;
+    const uint64_t d0 = g_live_depth.load(std::memory_order_relaxed), c0 = g_live_color.load(std::memory_order_relaxed);
+    if (depth == d0 && color == c0) return;
+    ++g_live_version;
+    g_live_seq.fetch_add(1, std::memory_order_acq_rel); // odd: update in progress
+    g_live_depth.store(depth, std::memory_order_relaxed);
+    g_live_color.store(color, std::memory_order_relaxed);
+    g_live_seq.fetch_add(1, std::memory_order_release); // even: consistent
 }
 void GetLiveSelection(uint64_t* depth, uint64_t* color)
 {
-    std::lock_guard<std::mutex> lock(g_live_m);
-    *depth = g_live_depth; *color = g_live_color;
+    for (;;) {
+        const uint64_t s0 = g_live_seq.load(std::memory_order_acquire);
+        if (s0 & 1) continue;
+        const uint64_t d = g_live_depth.load(std::memory_order_acquire), c = g_live_color.load(std::memory_order_acquire);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (g_live_seq.load(std::memory_order_relaxed) == s0) { *depth = d; *color = c; return; }
+    }
 }
 void SetSceneViewportJitter(uint64_t frame, float x, float y)
 {
