@@ -11,6 +11,15 @@ if(NOT DEFINED PROJECT_NAME)
   set(NA_DX9_STANDALONE ON)
 endif()
 
+# D3: the DX9 ears on synthetic frames (portable: Linux too, and 32-bit).
+add_executable(dx9_ears_test dx9_ears_test.cpp)
+if(TARGET abundance_options)
+  target_link_libraries(dx9_ears_test PRIVATE abundance_options)
+else()
+  target_include_directories(dx9_ears_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../src")
+endif()
+add_test(NAME dx9_ears COMMAND dx9_ears_test)
+
 if(WIN32)
   add_executable(d3d9on12_probe d3d9on12_probe.cpp)
   target_compile_definitions(d3d9on12_probe PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
