@@ -37,6 +37,9 @@ public:
     // native HUD composition; partial replay => current-picture protection.
     bool Composite(ID3D12GraphicsCommandList*,ID3D12Resource* out);
     bool SeedNativeAlpha(ID3D12GraphicsCommandList*,ID3D12Resource* out);
+    // A UI-only canvas starts from its own transparent/background pixels,
+    // independently of the reconstructed world. out: NPSR -> PRESENT.
+    bool SeedNativeScene(ID3D12GraphicsCommandList*,ID3D12Resource* out,DXGI_FORMAT source_view);
     // Both the final handoff AND original-size replay must match. Native and
     // check are NPSR; out is UAV. Otherwise show the untouched final picture.
     bool PresentNative(ID3D12GraphicsCommandList*,ID3D12Resource* frame,DXGI_FORMAT view,

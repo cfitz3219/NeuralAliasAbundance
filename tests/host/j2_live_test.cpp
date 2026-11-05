@@ -581,6 +581,29 @@ int main()
         test::List handback;REQUIRE(handback.Create(dev));barrier=test::Transition(native.Get(),S,D3D12_RESOURCE_STATE_COMMON);handback.list->ResourceBarrier(1,&barrier);
         REQUIRE(SUCCEEDED(handback.list->Close()));ID3D12CommandList* finish[]={handback.list.Get()};d.queue->ExecuteCommandLists(1,finish);d.WaitIdle();
         const auto pixel=ReadTexel(d,native.Get(),W,H);CHECK(pixel[0]==.25f&&pixel[1]==.5f&&pixel[2]==.75f&&pixel[3]==1);
+        // Actual production branch for a UI-only texture: NGX consumes the
+        // independent world snapshot, and glyph replay gets a separate seed.
+        na::j2::OnPresent(d.queue.Get());const int world_before=fake::evals;REQUIRE(frame(505.1)==0);CHECK(fake::evals==world_before);
+        auto ui_source=test::CreateTexture(dev,W,H,DXGI_FORMAT_R16G16B16A16_FLOAT,R,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        auto ui_native=test::CreateTexture(dev,W*2,H*2,DXGI_FORMAT_R16G16B16A16_FLOAT,S,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET|D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);REQUIRE(ui_source&&ui_native);
+        auto ui_picture=hud::Picture::Create(dev,ui_source->GetDesc(),W*2,H*2),world_picture=hud::Picture::Create(dev,color->GetDesc(),W*2,H*2);REQUIRE(ui_picture&&world_picture);
+        test::List ui_seed,ui_replay;REQUIRE(ui_seed.Create(dev)&&ui_replay.Create(dev));
+        dev->CreateRenderTargetView(ui_source.Get(),nullptr,handle);ui_seed.list->ClearRenderTargetView(handle,black,0,nullptr);
+        REQUIRE(ui_picture->SnapshotScene(ui_seed.list.Get(),ui_source.Get(),R)&&ui_picture->SnapshotFull(ui_seed.list.Get(),ui_source.Get(),R));
+        REQUIRE(world_picture->SnapshotScene(ui_seed.list.Get(),color.Get(),D3D12_RESOURCE_STATE_COMMON));
+        barrier=test::Transition(native.Get(),D3D12_RESOURCE_STATE_COMMON,S);ui_seed.list->ResourceBarrier(1,&barrier);
+        REQUIRE(SUCCEEDED(ui_seed.list->Close()));ID3D12CommandList* initial[]={ui_seed.list.Get()};d.queue->ExecuteCommandLists(1,initial);d.WaitIdle();
+        dev->CreateRenderTargetView(ui_native.Get(),nullptr,handle);barrier=test::Transition(ui_native.Get(),D3D12_RESOURCE_STATE_PRESENT,R);ui_replay.list->ResourceBarrier(1,&barrier);
+        ui_replay.list->ClearRenderTargetView(handle,marker,0,nullptr);barrier=test::Transition(ui_native.Get(),R,S);ui_replay.list->ResourceBarrier(1,&barrier);
+        barrier=test::Transition(native.Get(),D3D12_RESOURCE_STATE_PRESENT,S);ui_replay.list->ResourceBarrier(1,&barrier);REQUIRE(SUCCEEDED(ui_replay.list->Close()));
+        hud::Layer separate=layer;separate.picture=ui_picture;separate.reconstruction=world_picture;separate.ui_output=ui_native.Get();separate.ui_view=DXGI_FORMAT_R16G16B16A16_FLOAT;
+        const auto old_shift=na::settings::Get().j2_jitter_shift.exchange(0);
+        REQUIRE(na::j2::PreHudUpscale(d.queue.Get(),color.Get(),W,H,native.Get(),W*2,H*2,separate,ui_replay.list.Get()));d.WaitIdle();
+        CHECK(fake::evals==world_before+1&&fake::P(fake::last_eval,NVSDK_NGX_Parameter_Color)==world_picture->Scene());
+        na::settings::Get().j2_jitter_shift.store(old_shift);
+        test::List ui_handback;REQUIRE(ui_handback.Create(dev));D3D12_RESOURCE_BARRIER returned[]={test::Transition(native.Get(),S,D3D12_RESOURCE_STATE_COMMON),test::Transition(ui_native.Get(),S,D3D12_RESOURCE_STATE_COMMON)};
+        ui_handback.list->ResourceBarrier(2,returned);REQUIRE(SUCCEEDED(ui_handback.list->Close()));ID3D12CommandList* returned_lists[]={ui_handback.list.Get()};d.queue->ExecuteCommandLists(1,returned_lists);d.WaitIdle();
+        const auto ui_pixel=ReadTexel(d,ui_native.Get(),W,H);CHECK(ui_pixel[0]==.25f&&ui_pixel[1]==.5f&&ui_pixel[2]==.75f&&ui_pixel[3]==1);
         na::j2::SetRenderSmall(false);proxy.Reset();d.WaitIdle();REQUIRE(presenter::Shutdown());presenter::SetEnabled(false);presenter::SetRenderScale(1,nullptr,nullptr);na::native_present::Detach(window);chain.Reset();DestroyWindow(window);
     }
     CHECK(dev->GetDeviceRemovedReason() == S_OK);

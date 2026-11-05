@@ -49,6 +49,9 @@ struct Layer {
     bool srgb = false;             // `view` is an sRGB format (the picture itself is stored encoded)
     std::shared_ptr<void> owner;     // layers retained through source recordings and Present GPU completion
     std::shared_ptr<Picture> picture; // draw transfer: complete original was preserved, GPU chooses clean/protect
+    std::shared_ptr<Picture> reconstruction; // UI-only input: independent world snapshot for DLSS
+    ID3D12Resource* ui_output=nullptr; // native UI seeded separately, then actual glyph draws
+    DXGI_FORMAT ui_view=DXGI_FORMAT_UNKNOWN;
     bool clean_allowed = false;
     // Independent discovery probe; valid even when no HUD layer was produced.
     std::shared_ptr<Picture> probe;
@@ -60,7 +63,7 @@ struct Layer {
     std::shared_ptr<na::capture::j2::Identity> recording_identity;
 };
 // Runs after the original batch, before its application completion fence.
-// Only replays draws whose EVERY source recording belongs to this exact batch.
+// Source leases may precede this batch on the same ordered queue.
 void AfterSubmission(ID3D12CommandQueue*,uint32_t count,ID3D12CommandList* const*);
 using PreHudRenderer=bool(*)(ID3D12CommandQueue*,ID3D12Resource*,uint32_t,uint32_t,ID3D12Resource*,uint32_t,uint32_t,const Layer&,ID3D12CommandList*);
 void SetPreHudRendererForTests(PreHudRenderer); // null restores the production DLSS renderer
