@@ -26,6 +26,7 @@
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/observe/texture_operation.hpp"
 #include "host_dx12/settings.hpp"
+#include "host_dx12/effects/xegtao.hpp"
 #include "host_dx12/overlay/presenter.hpp"
 #include "host_dx12/scale/settings_read_hook.hpp"
 #include "providers/camera/camera_tracker.hpp"
@@ -62,6 +63,7 @@ struct Slot {
     ComPtr<ID3D12CommandAllocator> alloc;
     ComPtr<ID3D12GraphicsCommandList> list;
     UINT64 fence_value = 0;
+    std::shared_ptr<na::xegtao::Frame> ambient; // existing slot fence owns AO descriptors/resources
     std::shared_ptr<const PhysicalInput> physical; // Layer2 payload used by this slot's list: kept
                                                    // until the slot is reused (its fence completed)
 };
@@ -2483,7 +2485,34 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     b.push_back(uav_barrier(g.motion.Get()));
     add(b, g.motion.Get(), UAV, NPSR);
     flush(l, b);
-    if (deferred) { // render-small: keep depth + motion for Present; the scene colour stays as drawn
+    std::shared_ptr<na::xegtao::Frame> ambient;
+    if (na::settings::Get().xegtao_enabled.load(std::memory_order_relaxed) && !skip_color) {
+        na::xegtao::Inputs ai;ai.color=g.color_in.Get();ai.depth=g.depth32.Get();ai.width=rw;ai.height=rh;
+        ai.color_format=typed(cf);ai.clear_depth=reversed?0.f:1.f;
+        ai.jitter_x=static_cast<float>(cam.jitter_px_x);ai.jitter_y=static_cast<float>(cam.jitter_px_y);
+        const auto column=na::camera::TransposeMatrix(cam.view_proj_current_row);
+        if(na::xegtao::FromViewProjection(column.data(),ai.projection))
+            ambient=na::xegtao::ScenePass().Prepare(g.device.Get(),g.queue.Get(),ai,na::xegtao::CurrentOptions());
+        if(ambient){
+            // Register ownership BEFORE recording work, using existing machinery.
+            if(inl){if(!na::nr::native::RetainRecording(l,ambient))ambient.reset();}
+            else s.ambient=ambient;
+            if(ambient&&!ambient->Record(l))ambient.reset();
+        }
+    }
+    if (deferred) { // render-small: depth/motion retained for Present, optional AO goes into the pre-HUD scene
+        if(ambient){
+            const UINT from=color_msaa?D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE:SRC;
+            const UINT into=color_msaa?D3D12_RESOURCE_STATE_RENDER_TARGET:DST;
+            add(b,ambient->Color(),NPSR,from);addsub(b,color.Get(),csub,color_source,into);flush(l,b);
+            if(color_msaa)g.msaa.WriteColor(l,ambient->Color(),color.Get(),csub/g.stats.color_mips,w,h,g.slot);
+            else{
+                D3D12_TEXTURE_COPY_LOCATION ao_source{},ao_target{};ao_source.Type=ao_target.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                ao_source.pResource=ambient->Color();ao_target.pResource=color.Get();ao_target.SubresourceIndex=csub;
+                const D3D12_BOX box{0,0,0,rw,rh,1};l->CopyTextureRegion(&ao_target,0,0,0,&ao_source,&box);
+            }
+            add(b,ambient->Color(),from,NPSR);addsub(b,color.Get(),csub,into,color_source);flush(l,b);
+        }
         if (!skip_color) addsub(b, color.Get(), csub, color_source, sc);
         add(b, g.motion.Get(), NPSR, UAV);
         flush(l, b);
@@ -2517,13 +2546,13 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     }
     // 4. DLSS at native resolution
     na::dlss::EvalDesc e{};
-    e.color = g.color_in.Get();
+    e.color = ambient?ambient->Color():g.color_in.Get();
     // Jitter shift: the declared offset moved into the colour, so the picture does not shake.
     bool shifted = false;
     flush(l, b); // colour is readable (NON_PIXEL_SHADER_RESOURCE) before the shift reads it
     if (!vpj_mode() && (cam.jitter_px_x != 0 || cam.jitter_px_y != 0) && na::settings::Get().j2_jitter_shift.load(std::memory_order_relaxed) != 0 &&
         jshift_target(g.jshift, rw, rh, typed(cf))) {
-        shifted = jshift_dispatch(l, g.color_in.Get(), g.jshift.Get(), rw, rh, typed(cf), static_cast<float>(cam.jitter_px_x), static_cast<float>(cam.jitter_px_y), g.slot);
+        shifted = jshift_dispatch(l, e.color, g.jshift.Get(), rw, rh, typed(cf), static_cast<float>(cam.jitter_px_x), static_cast<float>(cam.jitter_px_y), g.slot);
         if (shifted) {
             b.push_back(uav_barrier(g.jshift.Get()));
             add(b, g.jshift.Get(), UAV, NPSR);
