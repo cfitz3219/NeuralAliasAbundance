@@ -12,6 +12,7 @@
 #include "host_dx12/ngx_observe/gpu_timing.hpp"
 #include "host_dx12/ngx_observe/size_confirm.hpp"
 #include "host_dx12/settings.hpp"
+#include "host_dx12/effects/xegtao.hpp"
 #include "host_dx12/host_boot/session.hpp"
 
 #include <d3d12.h>
@@ -658,7 +659,11 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
         }
     }
     na::gputime::Begin(list);
-    NgxResult r = s.evaluate(cmd_list, handle, params, callback);
+    NgxResult r;
+    {
+        na::xegtao::NativeScope ambient(list,params);
+        r = s.evaluate(cmd_list, handle, params, callback);
+    }
     na::gputime::End(list);
     if(active_call)active_call->fetch_sub(1);
     g_evaluates.fetch_add(1, std::memory_order_relaxed);

@@ -1,0 +1,79 @@
+// NeuralAlias binding/composition glue for pinned MIT Intel XeGTAO.
+
+#define VA_PI 3.14159265358979323846
+#define VA_SATURATE saturate
+#define XE_GTAO_USE_HALF_FLOAT_PRECISION 0
+#define XE_GTAO_FP32_DEPTHS 1
+#define XE_GTAO_USE_DEFAULT_CONSTANTS 0
+#include "XeGTAO.h"
+cbuffer Constants:register(b0) {
+    GTAOConstants c;
+    uint2 colorBase; uint2 depthBase;
+    float amount; float clearDepth; uint quality; uint srgb;
+    uint2 outputBase; uint finalApply; uint padding;
+};
+#include "XeGTAO.hlsli"
+SamplerState pointClamp:register(s0);
+#if defined(PASS_EXTRACT)
+Texture2D<float> inputDepth:register(t0);
+RWTexture2D<float> rawDepth:register(u0);
+[numthreads(8,8,1)] void Extract(uint2 p:SV_DispatchThreadID) {
+    if(any(p>=uint2(c.ViewportSize)))return;
+    rawDepth[p]=inputDepth.Load(int3(p+depthBase,0));
+}
+#elif defined(PASS_PREFILTER)
+Texture2D<float> rawDepth:register(t0);
+RWTexture2D<float> mip0:register(u0); RWTexture2D<float> mip1:register(u1);
+RWTexture2D<float> mip2:register(u2); RWTexture2D<float> mip3:register(u3);
+RWTexture2D<float> mip4:register(u4);
+[numthreads(8,8,1)] void Prefilter(uint2 p:SV_DispatchThreadID,uint2 t:SV_GroupThreadID) {
+    XeGTAO_PrefilterDepths16x16(p,t,c,rawDepth,pointClamp,mip0,mip1,mip2,mip3,mip4);
+}
+#elif defined(PASS_NORMALS)
+Texture2D<float> rawDepth:register(t0);
+RWTexture2D<uint> normals:register(u0);
+[numthreads(8,8,1)] void Normals(uint2 p:SV_DispatchThreadID) {
+    if(any(p>=uint2(c.ViewportSize)))return;
+    // A clamped edge neighbour coincides with the centre and has no direction.
+    // Use the nearest interior normal at the outermost pixel instead of NaNs.
+    uint2 q=clamp(p,1,uint2(c.ViewportSize)-2);
+    float3 n=XeGTAO_ComputeViewspaceNormal(q,c,rawDepth,pointClamp);
+    normals[p]=XeGTAO_FLOAT3_to_R11G11B10_UNORM(n*.5+.5);
+}
+#elif defined(PASS_MAIN)
+Texture2D<float> viewDepth:register(t0); Texture2D<uint> normals:register(t1);
+RWTexture2D<uint> ao:register(u0); RWTexture2D<unorm float> edges:register(u1);
+[numthreads(8,8,1)] void Main(uint2 p:SV_DispatchThreadID) {
+    if(any(p>=uint2(c.ViewportSize)))return;
+    uint index=HilbertIndex(p.x,p.y); // fixed spatial samples: no new temporal noise
+    float2 noise=frac(.5+index*float2(.7548776662466927,.5698402909980532));
+    float3 n=normalize(XeGTAO_R11G11B10_UNORM_to_FLOAT3(normals[p])*2-1);
+    XeGTAO_MainPass(p,quality==0?1:quality==1?2:quality==2?3:9,quality<2?2:3,noise,n,c,viewDepth,pointClamp,ao,edges);
+}
+#elif defined(PASS_DENOISE)
+Texture2D<uint> ao:register(t0); Texture2D<float> edges:register(t1);
+RWTexture2D<uint> filtered:register(u0);
+[numthreads(8,8,1)] void Denoise(uint2 p:SV_DispatchThreadID) {
+    // Intel's denoiser writes two horizontally adjacent pixels per thread.
+    if(p.x*2>=uint(c.ViewportSize.x)||p.y>=uint(c.ViewportSize.y))return;
+    XeGTAO_Denoise(uint2(p.x*2,p.y),c,ao,edges,pointClamp,filtered,finalApply!=0);
+}
+#elif defined(PASS_COMPOSE)
+Texture2D<float4> image:register(t0); Texture2D<uint> ao:register(t1);
+Texture2D<float> rawDepth:register(t2); RWTexture2D<float4> outputColor:register(u0);
+float3 LinearToSrgb(float3 v) {
+    return float3(v.x<=.0031308?12.92*v.x:1.055*pow(max(v.x,0),1/2.4)-.055,
+                  v.y<=.0031308?12.92*v.y:1.055*pow(max(v.y,0),1/2.4)-.055,
+                  v.z<=.0031308?12.92*v.z:1.055*pow(max(v.z,0),1/2.4)-.055);
+}
+[numthreads(8,8,1)] void Compose(uint2 p:SV_DispatchThreadID) {
+    if(any(p>=uint2(c.ViewportSize)))return;
+    float4 color=image.Load(int3(p+colorBase,0));
+    float visibility=saturate(float(ao[p])/255.0);
+    // Clear sky contains no occluder: retain colour and alpha, including HDR.
+    float weight=abs(rawDepth[p]-clearDepth)<1e-7?0:amount;
+    color.rgb*=lerp(1.0,visibility,weight);
+    if(srgb!=0)color.rgb=LinearToSrgb(color.rgb);
+    outputColor[p+outputBase]=color;
+}
+#endif

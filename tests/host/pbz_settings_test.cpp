@@ -12,6 +12,10 @@ int main() {
     WritePrivateProfileStringW(L"fg",L"profile_override",L"1",ini);
     na::settings::SetIniPath(ini); na::settings::Load();
     auto& s=na::settings::Get();
+    CHECK(s.xegtao_enabled==0&&s.xegtao_quality==2&&s.xegtao_denoise==1);
+    CHECK(s.xegtao_radius_x1000==500&&s.xegtao_radius_multiplier==1457&&s.xegtao_falloff==615);
+    CHECK(s.xegtao_sample_distribution==2000&&s.xegtao_thin_occluder==0&&s.xegtao_final_power==2200&&s.xegtao_depth_mip_offset==3300);
+    s.xegtao_enabled=1;s.xegtao_radius_x1000=1250;s.xegtao_denoise=3;s.xegtao_falloff=450;
     CHECK(s.dlss_mode==4 && s.fg_preset==3 && s.fg_profile_override==1);
     CHECK(s.follow_game_resolution==1);
     CHECK(wcsstr(na::settings::UserIniPath(),scope)!=nullptr);
@@ -19,6 +23,7 @@ int main() {
     s.fg_preset=1; s.dlss_mode=0; s.follow_game_resolution=0; na::settings::Load();
     CHECK(s.follow_game_resolution==1);
     CHECK(s.fg_preset==3 && s.dlss_mode==4);
+    CHECK(s.xegtao_enabled==1&&s.xegtao_radius_x1000==1250&&s.xegtao_denoise==3&&s.xegtao_falloff==450);
     WritePrivateProfileStringW(L"fg",L"preset",L"99",na::settings::UserIniPath());
     na::settings::Load(); CHECK(s.fg_preset==1);
     wchar_t marker[MAX_PATH]{};swprintf_s(marker,L"%s.session",ini);
