@@ -28,6 +28,11 @@ struct HostConfig {
     uint32_t preset = 12;         // DLSS preset L for DLAA (Cort, 2026-11-04)
     bool gpu_wait = true;         // bridge WaitMode::Gpu (false: CpuDeadline)
     bool copy_test = false;       // tests: helper copies colour instead of DLSS
+    // Optical-flow object motion in the helper (bridge v4) on top of the camera
+    // motion. With `ini` set, both are read again about once a second (live).
+    bool flow = true;
+    uint32_t flow_loosen = 50;    // 0..100 acceptance looseness (50 = the DX12 host's default)
+    std::wstring ini;
     std::wstring helper_path;     // default: na_bridge_helper64.exe beside our DLL
     std::wstring data_path;       // default: %LOCALAPPDATA%\NeuralAlias\bridge
     std::wstring log_path;        // default: %LOCALAPPDATA%\NeuralAlias\dx11\NeuralAliasDX11.log (pid added)
@@ -50,6 +55,8 @@ struct HostStats {
     uint64_t camera_offset = 0;
     bool depth_reversed = false;
     uint32_t helper_motion_frames = 0;
+    // The helper's optical flow: engine (0 none, 1 AMD), frames with flow, frames it could not run, last accepted share.
+    uint32_t flow_engine = 0, flow_frames = 0, flow_unavailable = 0, flow_accepted_ppm = 0;
     char reason[192] = {};
     char log_path[MAX_PATH] = {};
 };

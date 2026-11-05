@@ -74,6 +74,10 @@ const char* Validate(const FrameRecord& f, const SessionLimits& l, uint32_t expe
         if (!std::isfinite(f.depth_clear) || f.depth_clear < 0.f || f.depth_clear > 1.f)
             return "The frame's empty-depth value is outside 0-1.";
     }
+    if (f.flags & kFlowMotion) {
+        if (!(f.flags & kCameraMotion)) return "Optical-flow motion was asked for without camera motion.";
+        if (f.flow_loosen > 100) return "The frame's flow looseness is outside 0-100.";
+    }
     const bool same_size = f.render_w == f.output_w && f.render_h == f.output_h;
     if (static_cast<Mode>(f.mode) == Mode::DLAA && !same_size)
         return "DLAA was asked for, but the render size is smaller than the output.";

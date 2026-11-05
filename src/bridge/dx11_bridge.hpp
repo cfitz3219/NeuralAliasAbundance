@@ -119,6 +119,7 @@ public:
     uint64_t Frames() const;        // results delivered (Ok)
     uint64_t Repeats() const;       // late frames shown as the last good result
     uint32_t HelperMotionFrames() const; // frames whose camera motion the helper built (kCameraMotion)
+    FlowStatus HelperFlow() const;       // the helper's optical-flow counters (kFlowMotion)
 
 private:
     struct Impl;

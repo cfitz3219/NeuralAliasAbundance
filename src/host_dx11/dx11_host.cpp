@@ -100,6 +100,23 @@ struct ListRecord {
 };
 
 HostConfig g_cfg;
+uint64_t g_ini_tick = 0;
+void Log(const char* fmt, ...);
+
+// [dx11] flow keys, read again about once a second (live, no restart).
+void RereadFlowSettings()
+{
+    if (g_cfg.ini.empty()) return;
+    const uint64_t now = GetTickCount64();
+    if (g_ini_tick && now - g_ini_tick < 1000) return;
+    g_ini_tick = now;
+    const bool flow = GetPrivateProfileIntW(L"dx11", L"flow", 1, g_cfg.ini.c_str()) == 1;
+    const uint32_t loosen = std::min<uint32_t>(100u, static_cast<uint32_t>(GetPrivateProfileIntW(L"dx11", L"flow_loosen", 50, g_cfg.ini.c_str())));
+    if (flow != g_cfg.flow || loosen != g_cfg.flow_loosen)
+        Log("optical-flow motion: %s, looseness %u (changed live)", flow ? "on" : "off", loosen);
+    g_cfg.flow = flow;
+    g_cfg.flow_loosen = loosen;
+}
 std::atomic<bool> g_installed{false};
 std::mutex g_install_mu;
 
@@ -595,6 +612,11 @@ void FireBeforeRead(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>
     if (cam.reversed) rec.flags |= na::bridge::kDepthInverted;
     if (reset) rec.flags |= na::bridge::kReset;
     rec.depth_clear = cam.reversed ? 0.f : 1.f;
+    RereadFlowSettings();
+    if (g_cfg.flow) {
+        rec.flags |= na::bridge::kFlowMotion;
+        rec.flow_loosen = g_cfg.flow_loosen;
+    }
     const auto reproject = na::camera::ComposeReprojectionRow(f.inv_view_proj_current_row, f.view_proj_previous_row);
     for (int i = 0; i < 16; ++i) rec.reproject[i] = static_cast<float>(reproject[i]);
 
@@ -618,6 +640,11 @@ void FireBeforeRead(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>
     }
     if (r == na::bridge::Result::NotReady && g_bridge.Reason()[0]) SetReason(g_bridge.Reason());
     g_stats.helper_motion_frames = g_bridge.HelperMotionFrames();
+    const na::bridge::FlowStatus fs = g_bridge.HelperFlow();
+    g_stats.flow_engine = fs.engine;
+    g_stats.flow_frames = fs.frames;
+    g_stats.flow_unavailable = fs.unavailable;
+    g_stats.flow_accepted_ppm = fs.accepted_ppm;
 }
 
 // ---------------------------------------------------------------- detours
@@ -916,7 +943,7 @@ void LogFrame()
     if (!periodic) return;
     Log("frame: draws=%u scene=%u reads=%u point=read#%u fired=%llu delivered=%llu repeated=%llu not_ready=%llu failed=%llu "
         "no_camera=%llu refused=%llu missed=%llu unplaceable=%llu contradictions=%llu camera_share=%.2f lists=%llu/%llu "
-        "jitter_writes=%llu helper_motion=%u%s%s",
+        "jitter_writes=%llu helper_motion=%u flow=%s flow_frames=%u flow_unavailable=%u flow_accepted=%.2f%%%s%s",
         st.last_draws, st.last_scene_draws, st.last_reads, st.learned_read, static_cast<unsigned long long>(g_stats.fired),
         static_cast<unsigned long long>(g_stats.delivered), static_cast<unsigned long long>(g_stats.repeated),
         static_cast<unsigned long long>(g_stats.not_ready), static_cast<unsigned long long>(g_stats.failed),
@@ -924,7 +951,8 @@ void LogFrame()
         static_cast<unsigned long long>(st.missed), static_cast<unsigned long long>(st.unplaceable),
         static_cast<unsigned long long>(st.contradictions), st.camera_share, static_cast<unsigned long long>(g_stats.lists_executed),
         static_cast<unsigned long long>(g_stats.lists_recorded), static_cast<unsigned long long>(g_stats.jitter_writes),
-        g_stats.helper_motion_frames, st.last_miss[0] ? " miss: " : "", st.last_miss);
+        g_stats.helper_motion_frames, g_stats.flow_engine == 1 ? "AMD" : (g_cfg.flow ? "unavailable" : "off"), g_stats.flow_frames,
+        g_stats.flow_unavailable, g_stats.flow_accepted_ppm / 10000.0, st.last_miss[0] ? " miss: " : "", st.last_miss);
 }
 
 void OnPresent(IDXGISwapChain* swap)
@@ -1230,6 +1258,9 @@ DWORD WINAPI InitThread(LPVOID p)
     c.preset = GetPrivateProfileIntW(L"dx11", L"preset", 12, ini);
     c.gpu_wait = GetPrivateProfileIntW(L"dx11", L"cpu_wait", 0, ini) == 0;
     c.copy_test = GetPrivateProfileIntW(L"dx11", L"copy_test", 0, ini) == 1;
+    c.flow = GetPrivateProfileIntW(L"dx11", L"flow", 1, ini) == 1;
+    c.flow_loosen = std::min<uint32_t>(100u, static_cast<uint32_t>(GetPrivateProfileIntW(L"dx11", L"flow_loosen", 50, ini)));
+    c.ini = a->ini;
     wchar_t b[MAX_PATH]{};
     GetPrivateProfileStringW(L"dx11", L"log", L"", b, MAX_PATH, ini);
     c.log_path = b;

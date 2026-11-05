@@ -14,6 +14,9 @@ function(na_host_test name)
 endfunction()
 
 na_host_test(fg_profile_test SOURCES fg_profile_test.cpp LIBS host_settings nvapi_headers)
+na_host_test(ffx_flow_test SOURCES ffx_flow_test.cpp LIBS host_ffx_flow dxgi LABELS gpu)
+# AMD optical-flow passes (DXC at build time): blobs, embedded root signatures, PSOs.
+na_host_test(ffx_flow_shaders_test SOURCES ffx_flow_shaders_test.cpp LIBS host_ffx_flow d3d12 dxgi)
 na_host_test(pbz_settings_test SOURCES pbz_settings_test.cpp LIBS host_settings)
 na_host_test(session_exit_test SOURCES session_exit_test.cpp LIBS host_dx12)
 na_host_test(nr_settings_trace_test SOURCES nr_settings_trace_test.cpp LIBS host_settings)

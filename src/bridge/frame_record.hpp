@@ -1,4 +1,4 @@
-// Bridge frame record (v3): what the game side tells the DLSS side about one
+// Bridge frame record (v4): what the game side tells the DLSS side about one
 // frame. Rebuilt from the recovered Alien bridge (recovered/dx11-enhancement,
 // bridge_protocol.hpp v1) and widened for real upscaling.
 //
@@ -16,7 +16,7 @@
 
 namespace na::bridge {
 
-constexpr uint32_t kRecordVersion = 3; // v3: camera motion built in the helper
+constexpr uint32_t kRecordVersion = 4; // v3: camera motion built in the helper; v4: optical-flow object motion
 constexpr uint32_t kMaxExtent = 8192; // per side, render or output
 
 // Same numeric values as NVSDK_NGX_PerfQuality_Value (and na::dlss::Quality).
@@ -45,7 +45,13 @@ enum Flags : uint32_t {
     // v3: no motion texture from the game; the helper builds camera motion from
     // depth and `reproject` with our motion arbiter (as J2 does in DX12).
     kCameraMotion = 1u << 6,
-    kKnownFlags = (1u << 7) - 1,
+    // v4: on top of the camera motion, the helper measures object motion with
+    // optical flow (AMD FidelityFX, the same engine and acceptance gates as the
+    // DX12 host) and adds it as the arbiter's tier 3. Needs kCameraMotion; a game
+    // with no camera sends the identity `reproject` (camera motion zero), so the
+    // flow is the whole motion. `flow_loosen` sets the acceptance looseness.
+    kFlowMotion = 1u << 7,
+    kKnownFlags = (1u << 8) - 1,
 };
 
 struct FrameRecord {
@@ -70,7 +76,9 @@ struct FrameRecord {
     // side (na::camera::ComposeReprojectionRow), and the depth of an empty pixel.
     float reproject[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     float depth_clear = 1.f;
-    uint32_t reserved = 0;
+    // kFlowMotion only: acceptance looseness 0..100 (0 = the original Anno-run
+    // gates; 50 = the DX12 host's default), read every frame.
+    uint32_t flow_loosen = 50;
 };
 static_assert(std::is_standard_layout<FrameRecord>::value && std::is_trivially_copyable<FrameRecord>::value,
               "FrameRecord crosses processes as raw bytes");
@@ -94,11 +102,35 @@ struct HelperStatus {
     uint64_t last_submitted = 0;  // highest sequence+1 whose GPU work was queued
     int32_t ngx_result = 0;
     uint32_t motion_frames = 0;   // frames whose camera motion the helper built (kCameraMotion)
-    char reason[128] = {};
+    // kFlowMotion: engine running (0 none, 1 AMD FidelityFX), frames whose flow
+    // motion reached DLSS, frames flow was asked for but could not run, and the
+    // share of moving pixels accepted in the last completed frame (per million).
+    uint32_t flow_engine = 0;
+    uint32_t flow_frames = 0;
+    uint32_t flow_unavailable = 0;
+    uint32_t flow_accepted_ppm = 0;
+    char reason[112] = {};
 };
 static_assert(std::is_standard_layout<HelperStatus>::value && std::is_trivially_copyable<HelperStatus>::value,
               "HelperStatus crosses processes as raw bytes");
 static_assert(sizeof(HelperStatus) == 152, "HelperStatus layout must match in 32-bit and 64-bit builds");
+
+// The helper's optical-flow counters, as the game side reads them (kFlowMotion).
+struct FlowStatus {
+    uint32_t engine = 0;        // 0 none, 1 AMD FidelityFX
+    uint32_t frames = 0;        // frames whose flow motion reached DLSS
+    uint32_t unavailable = 0;   // frames flow was asked for but could not run
+    uint32_t accepted_ppm = 0;  // moving pixels accepted in the last completed frame, per million
+};
+inline FlowStatus ReadFlowStatus(const volatile HelperStatus& s)
+{
+    FlowStatus f;
+    f.engine = s.flow_engine;
+    f.frames = s.flow_frames;
+    f.unavailable = s.flow_unavailable;
+    f.accepted_ppm = s.flow_accepted_ppm;
+    return f;
+}
 
 // The whole shared-memory block for one bridge session.
 struct SharedBlock {

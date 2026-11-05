@@ -67,6 +67,7 @@ public:
     uint64_t Frames() const;
     uint64_t Repeats() const;
     uint32_t HelperMotionFrames() const;
+    FlowStatus HelperFlow() const; // the helper's optical-flow counters (kFlowMotion)
 
 private:
     struct Impl;

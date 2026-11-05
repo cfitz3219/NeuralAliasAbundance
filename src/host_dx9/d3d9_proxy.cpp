@@ -52,6 +52,9 @@ struct Config {
     uint32_t jitter = 1;        // 0 off, 1 while DLSS delivers, 2 always (test)
     uint32_t jitter_phases = 8;
     float mip_bias = -1.f;      // while jittering
+    bool flow = true;           // optical-flow motion in the helper (also changed live by the transport)
+    uint32_t flow_loosen = 50;
+    std::wstring ini;
     std::wstring log_path;
 };
 
@@ -125,6 +128,9 @@ const Config& Cfg()
         const std::wstring ini = SelfDir() + L"\\NeuralAliasHost.ini";
         g_cfg.enabled = GetPrivateProfileIntW(L"dx9", L"enabled", 0, ini.c_str()) == 1;
         if (!g_cfg.enabled) return;
+        g_cfg.ini = ini;
+        g_cfg.flow = GetPrivateProfileIntW(L"dx9", L"flow", 1, ini.c_str()) == 1;
+        g_cfg.flow_loosen = std::min<uint32_t>(100u, static_cast<uint32_t>(GetPrivateProfileIntW(L"dx9", L"flow_loosen", 50, ini.c_str())));
         g_cfg.borderless = GetPrivateProfileIntW(L"dx9", L"borderless", 1, ini.c_str()) == 1;
         g_cfg.own_device = GetPrivateProfileIntW(L"dx9", L"own_device", 1, ini.c_str()) == 1;
         g_cfg.dlss = GetPrivateProfileIntW(L"dx9", L"dlss", 1, ini.c_str()) == 1;
@@ -143,9 +149,9 @@ const Config& Cfg()
         GetModuleFileNameW(nullptr, exe, MAX_PATH);
         char exe8[MAX_PATH * 3]{};
         WideCharToMultiByte(CP_UTF8, 0, exe, -1, exe8, sizeof(exe8), nullptr, nullptr);
-        Log("NeuralAlias DX9 proxy (%d-bit) in %s: borderless=%d own_device=%d dlss=%d preset=%u jitter=%u phases=%u mip_bias=%.2f%s",
+        Log("NeuralAlias DX9 proxy (%d-bit) in %s: borderless=%d own_device=%d dlss=%d preset=%u jitter=%u phases=%u mip_bias=%.2f flow=%d loosen=%u%s",
             static_cast<int>(sizeof(void*) * 8), exe8, g_cfg.borderless ? 1 : 0, g_cfg.own_device ? 1 : 0, g_cfg.dlss ? 1 : 0, g_cfg.preset,
-            g_cfg.jitter, g_cfg.jitter_phases, g_cfg.mip_bias, g_cfg.copy_test ? " COPY TEST (no DLSS)" : "");
+            g_cfg.jitter, g_cfg.jitter_phases, g_cfg.mip_bias, g_cfg.flow ? 1 : 0, g_cfg.flow_loosen, g_cfg.copy_test ? " COPY TEST (no DLSS)" : "");
     });
     return g_cfg;
 }
@@ -244,6 +250,9 @@ void Created(IDirect3DDevice9* dev, const D3DPRESENT_PARAMETERS* pp, DWORD flags
     tc.enabled = Cfg().dlss;
     tc.copy_test = Cfg().copy_test;
     tc.preset = Cfg().preset;
+    tc.flow = Cfg().flow;
+    tc.flow_loosen = Cfg().flow_loosen;
+    tc.ini = Cfg().ini;
     tc.helper_path = SelfDir() + L"\\na_bridge_helper64.exe";
     std::lock_guard<std::mutex> l(g_d12_mu);
     const bool ours = g_our_device.load() != 0;

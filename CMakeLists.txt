@@ -158,6 +158,17 @@ else()
 endif()
 target_link_libraries(host_nvof PUBLIC abundance_options d3d12 d3dcompiler)
 
+# AMD FidelityFX optical flow (third_party/ffx-opticalflow, MIT; taken unchanged from the DX12
+# host's branch). Compiled by DXC at build time (cmake/ffx_flow_shaders.cmake); without DXC it is a stub.
+include(cmake/ffx_flow_shaders.cmake)
+add_library(host_ffx_flow STATIC src/host_dx12/ffx_flow/ffx_flow_shaders.cpp src/host_dx12/ffx_flow/ffx_flow.cpp)
+target_link_libraries(host_ffx_flow PUBLIC abundance_options d3d12)
+if(NA_HAVE_FFX_FLOW)
+  target_compile_definitions(host_ffx_flow PUBLIC NA_HAVE_FFX_FLOW)
+  target_include_directories(host_ffx_flow PRIVATE "${CMAKE_BINARY_DIR}/generated/ffx_flow")
+  add_dependencies(host_ffx_flow ffx_flow_shaders)
+endif()
+
 # ---------------------------------------------------------------- host_dx12
 # The in-game host. These modules reference each other freely (overlay <->
 # ngx_observe <-> nr/fg/motion <-> latency <-> tlou1), so they form one library.
@@ -283,8 +294,8 @@ elseif(NA_HAVE_NGX_SDK)
 endif()
 
 # The DX12 end of the bridge (started hidden by the DX11 side).
-add_executable(na_bridge_helper64 WIN32 src/bridge/dx12_helper_main.cpp)
-target_link_libraries(na_bridge_helper64 PRIVATE bridge_record host_dlss core_gpu d3d12 dxgi shell32)
+add_executable(na_bridge_helper64 WIN32 src/bridge/dx12_helper_main.cpp src/bridge/helper_flow.cpp)
+target_link_libraries(na_bridge_helper64 PRIVATE bridge_record host_dlss core_gpu host_ffx_flow host_nvof d3d12 dxgi d3dcompiler shell32)
 if(NA_DLSS_DLL AND EXISTS "${NA_DLSS_DLL}")
   add_custom_command(TARGET na_bridge_helper64 POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:na_bridge_helper64>")

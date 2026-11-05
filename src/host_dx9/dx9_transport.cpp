@@ -38,6 +38,23 @@ bool g_failed_logged = false;
 uint32_t g_logged = 0;
 uint64_t g_last_frame = 0;
 na::camera::CameraTracker g_tracker; // D6: camera motion from the found camera
+uint64_t g_ini_tick = 0;
+
+// [dx9] flow keys, read again about once a second (live, no restart).
+void RereadFlowSettings()
+{
+    if (g_cfg.ini.empty()) return;
+    const uint64_t now = GetTickCount64();
+    if (g_ini_tick && now - g_ini_tick < 1000) return;
+    g_ini_tick = now;
+    const bool flow = GetPrivateProfileIntW(L"dx9", L"flow", 1, g_cfg.ini.c_str()) == 1;
+    const uint32_t loosen = static_cast<uint32_t>(GetPrivateProfileIntW(L"dx9", L"flow_loosen", 50, g_cfg.ini.c_str()));
+    const uint32_t clamped = loosen > 100 ? 100 : loosen;
+    if (flow != g_cfg.flow || clamped != g_cfg.flow_loosen)
+        Log("optical-flow motion: %s, looseness %u (changed live)", flow ? "on" : "off", clamped);
+    g_cfg.flow = flow;
+    g_cfg.flow_loosen = clamped;
+}
 
 #ifdef NA_HAVE_9ON12
 bool EnsureQueue(IDirect3DDevice9On12* on12)
@@ -127,7 +144,9 @@ void FireLocked(IDirect3DDevice9* dev, int where, const FireInfo& info)
     if (!g_last_frame || info.frame != g_last_frame + 1) f.flags |= na::bridge::kReset; // first frame, or frames skipped
     g_last_frame = info.frame;
     // D6: motion for the whole picture from the camera (the helper reprojects the
-    // depth with it). Without a camera the motion stays zero.
+    // depth with it). Without a camera the motion stays zero unless optical flow runs.
+    RereadFlowSettings();
+    bool camera_sent = false;
     if (info.camera) {
         na::camera::Matrix vp{};
         for (int k = 0; k < 16; ++k) vp[k] = info.vp[k];
@@ -142,11 +161,25 @@ void FireLocked(IDirect3DDevice9* dev, int where, const FireInfo& info)
             const auto rp = na::camera::ComposeReprojectionRow(cf.inv_view_proj_current_row, cf.view_proj_previous_row);
             for (int k = 0; k < 16; ++k) f.reproject[k] = static_cast<float>(rp[k]);
             ++g_stats.camera_motion;
+            camera_sent = true;
         } else {
             g_tracker.Reset();
         }
     } else {
         g_tracker.Reset();
+    }
+    // Optical flow (bridge v4): object motion on top of the camera, or, with no
+    // camera, the whole motion (identity reprojection = camera motion zero).
+    if (g_cfg.flow) {
+        if (!camera_sent) {
+            f.flags |= na::bridge::kCameraMotion;
+            if (info.depth_reversed) f.flags |= na::bridge::kDepthInverted;
+            f.depth_clear = info.depth_reversed ? 0.f : 1.f;
+            ++g_stats.no_camera; // f.reproject stays the identity
+        }
+        f.flags |= na::bridge::kFlowMotion;
+        f.flow_loosen = g_cfg.flow_loosen;
+        ++g_stats.flow_asked;
     }
 
     ID3D12Fence* fence = nullptr;
@@ -168,6 +201,13 @@ void FireLocked(IDirect3DDevice9* dev, int where, const FireInfo& info)
     if (where == 2) ++g_stats.at_hud;
     if (where == 3) ++g_stats.at_present;
     g_stats.wait_ms = g_bridge.LastWaitMs();
+    {
+        const na::bridge::FlowStatus fs = g_bridge.HelperFlow();
+        g_stats.flow_engine = fs.engine;
+        g_stats.flow_frames = fs.frames;
+        g_stats.flow_unavailable = fs.unavailable;
+        g_stats.flow_accepted_ppm = fs.accepted_ppm;
+    }
     if (r == na::bridge::Result::Failed && !g_failed_logged) {
         Log("DLSS transport stopped: %s", g_bridge.Reason());
         g_failed_logged = true;
@@ -179,7 +219,10 @@ void FireLocked(IDirect3DDevice9* dev, int where, const FireInfo& info)
     if (g_stats.ok == 1 && r == na::bridge::Result::Ok)
         Log("DLSS transport: first result delivered (%s)", where == 1 ? "before the scene read" : where == 2 ? "before the HUD" : "at Present");
     if ((g_stats.ok + g_stats.repeated) % 600 == 0 && r == na::bridge::Result::Ok)
-        Log("DLSS transport: %u results, %u late, %u not ready, wait %.2f ms", g_stats.ok, g_stats.repeated, g_stats.not_ready, g_stats.wait_ms);
+        Log("DLSS transport: %u results, %u late, %u not ready, wait %.2f ms; camera motion %u; flow asked %u (no camera %u), "
+            "helper flow %s: %u frames, %u unavailable, last accepted %.2f%%",
+            g_stats.ok, g_stats.repeated, g_stats.not_ready, g_stats.wait_ms, g_stats.camera_motion, g_stats.flow_asked, g_stats.no_camera,
+            g_stats.flow_engine == 1 ? "AMD" : "off", g_stats.flow_frames, g_stats.flow_unavailable, g_stats.flow_accepted_ppm / 10000.0);
 #endif
 }
 

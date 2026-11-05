@@ -707,5 +707,10 @@ uint32_t Dx12GameBridge::HelperMotionFrames() const
     if (!impl_ || !impl_->memory.block()) return 0;
     return *reinterpret_cast<volatile uint32_t*>(&impl_->memory.block()->status.motion_frames);
 }
+FlowStatus Dx12GameBridge::HelperFlow() const
+{
+    if (!impl_ || !impl_->memory.block()) return {};
+    return ReadFlowStatus(impl_->memory.block()->status);
+}
 
 } // namespace na::bridge

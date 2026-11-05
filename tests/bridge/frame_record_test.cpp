@@ -1,4 +1,4 @@
-// Bridge frame record v3: validation and mode choice (portable, CPU only).
+// Bridge frame record v4: validation and mode choice (portable, CPU only).
 #include "bridge/frame_record.hpp"
 
 #include <cmath>
@@ -83,6 +83,14 @@ int main()
     f.flags = kCameraMotion;
     f.depth_clear = 2.f;
     expect(Validate(f, up, 0) != nullptr, "an empty-depth value above 1 is refused");
+    f = good(1280, 720, 1920, 1080, 0);
+    f.flags = kCameraMotion | kFlowMotion;
+    expect(Validate(f, up, 0) == nullptr, "flow motion on top of camera motion is accepted");
+    f.flow_loosen = 101;
+    expect(Validate(f, up, 0) != nullptr, "a flow looseness above 100 is refused");
+    f = good(1280, 720, 1920, 1080, 0);
+    f.flags = kFlowMotion;
+    expect(Validate(f, up, 0) != nullptr, "flow motion without camera motion is refused");
 
     expect(ModeForScale(1920, 1080, 1920, 1080) == Mode::DLAA, "equal sizes pick DLAA");
     expect(ModeForScale(1280, 720, 1920, 1080) == Mode::Quality, "1.5x picks Quality");

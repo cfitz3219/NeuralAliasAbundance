@@ -810,5 +810,11 @@ uint32_t Dx11Bridge::HelperMotionFrames() const
     if (!impl_ || impl_->active != Backend::Helper || !impl_->memory.block()) return 0;
     return *reinterpret_cast<volatile uint32_t*>(&impl_->memory.block()->status.motion_frames);
 }
+FlowStatus Dx11Bridge::HelperFlow() const
+{
+    std::lock_guard<std::mutex> g(lock_);
+    if (!impl_ || impl_->active != Backend::Helper || !impl_->memory.block()) return {};
+    return ReadFlowStatus(impl_->memory.block()->status);
+}
 
 } // namespace na::bridge

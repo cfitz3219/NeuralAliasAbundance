@@ -17,7 +17,15 @@
 // our existing motion arbiter (na::motion::gpu, tier 2), exactly as J2 does in
 // the DX12 host, and hands that to DLSS. In --copy-test the arbiter still runs
 // (so CI checks it), and the colour copy stays the output.
+//
+// v4 (kFlowMotion): on top, optical flow measures object motion (bridge/
+// helper_flow: the AMD FidelityFX engine with the DX12 host's acceptance gates)
+// and the arbiter adds it as tier 3. A game with no camera sends the identity
+// reprojection, so its whole motion comes from the flow. When the GPU cannot
+// run the flow the helper keeps camera motion and counts the frame in
+// status.flow_unavailable; it never fails a frame for it.
 #include "bridge/frame_record.hpp"
+#include "bridge/helper_flow.hpp"
 #include "bridge/win_shared.hpp"
 #include "core/motion_arbiter_gpu.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
@@ -204,6 +212,10 @@ int Run(const Session& s)
         if (!made) { cam_motion.Reset(); cam_provenance.Reset(); }
     }
     const bool camera_motion_ok = arbiter_ok && cam_motion && cam_provenance;
+    // Optical flow (v4): built once; unavailable on GPUs without 32/64-lane waves (WARP).
+    na::bridge::flow::HelperFlow flow;
+    const bool flow_ok = camera_motion_ok && flow.Init(device.Get(), kRing);
+    g_memory.block()->status.flow_engine = flow_ok ? flow.GetStats().engine : 0;
     Report(HelperState::Ready, "");
     // The game's render thread waits each frame until this loop has queued its
     // work, so wake up promptly: the helper sleeps between frames and only runs
@@ -257,6 +269,15 @@ int Run(const Session& s)
         }
         alloc[slot]->Reset();
         list->Reset(alloc[slot].Get(), nullptr);
+        if (flow_ok) {
+            flow.Collect(static_cast<uint32_t>(slot)); // this slot's last counters are complete now
+            const auto& fs = flow.GetStats();
+            uint64_t total = 0;
+            for (uint64_t v : fs.last) total += v;
+            if (total) g_memory.block()->status.flow_accepted_ppm = static_cast<uint32_t>(fs.last[0] * 1000000ull / total);
+        }
+        const bool want_flow = (f.flags & kFlowMotion) != 0;
+        bool flow_built = false;
 
         // Camera motion into cam_motion (UAV). Depth must be readable (NPSR) here.
         const auto dispatch_motion = [&]() {
@@ -269,6 +290,28 @@ int Run(const Session& s)
             std::memcpy(in.view_proj_previous.m, identity, sizeof(identity));
             in.jitter_current_px[0] = f.jitter_x;
             in.jitter_current_px[1] = f.jitter_y;
+            if (want_flow && flow_ok) {
+                // Object motion from optical flow, derived against exactly this camera input.
+                na::bridge::flow::Frame ff;
+                ff.color = color.Get();
+                ff.depth = depth.Get();
+                ff.w = f.render_w;
+                ff.h = f.render_h;
+                ff.frame = f.sequence;
+                ff.jitter[0] = f.jitter_x;
+                ff.jitter[1] = f.jitter_y;
+                ff.hdr = (f.flags & kHdr) != 0;
+                ff.reset = (f.flags & kReset) != 0;
+                ff.loosen = f.flow_loosen;
+                na::bridge::flow::Tier3 t3;
+                if (flow.Record(list.Get(), static_cast<uint32_t>(slot), ff, in, t3)) {
+                    in.tier3_valid_flag = true;
+                    in.tier3_residual = t3.residual;
+                    in.tier3_valid = t3.valid;
+                    in.tier3_mask = t3.mask;
+                    flow_built = true;
+                }
+            }
             na::motion::gpu::Outputs o{};
             o.xy = cam_motion.Get();
             o.provenance = cam_provenance.Get();
@@ -295,13 +338,17 @@ int Run(const Session& s)
             src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
             const D3D12_BOX box{0, 0, 0, f.render_w, f.render_h, 1};
             list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
-            Barrier(list.Get(), in, 1, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
             Barrier(list.Get(), outr, 1, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
             if (want_motion) {
+                // The flow reads the colour too: shader-readable while the motion is built.
+                Barrier(list.Get(), in, 1, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 ID3D12Resource* dr[1] = {depth.Get()};
                 Barrier(list.Get(), dr, 1, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 motion_built = dispatch_motion();
                 Barrier(list.Get(), dr, 1, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                Barrier(list.Get(), in, 1, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            } else {
+                Barrier(list.Get(), in, 1, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
             }
         } else {
             ID3D12Resource* in[3] = {color.Get(), depth.Get(), motion.Get()};
@@ -367,10 +414,13 @@ int Run(const Session& s)
         queue->Signal(output_fence.Get(), value);
         queue->Signal(own.Get(), ++own_value);
         alloc_value[slot] = own_value;
+        if (flow_ok && want_flow && motion_built) flow.Submitted(static_cast<uint32_t>(slot));
         slot = (slot + 1) % kRing;
         ++expected;
 
         if (motion_built) ++g_memory.block()->status.motion_frames;
+        if (flow_built) ++g_memory.block()->status.flow_frames;
+        if (want_flow && !flow_ok) ++g_memory.block()->status.flow_unavailable;
         InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_memory.block()->status.last_submitted), static_cast<LONG64>(value));
         SetEvent(submitted.get());
     }
