@@ -11,6 +11,7 @@ Re-vendored 2026-10-23 after the crash, at the same pins the original project re
 | FidelityFX SDK (ffx-api) | main 2026-06-24 | 60f4ea81909200d8542eca14dccb2628b763a9a3 | MIT | 3 headers only (`ffx_api.h`, `ffx_api_types.h`, `ffx_upscale.h`), SDK layout kept so relative includes work; the runtime is the game's own `amd_fidelityfx_*_dx12.dll` (C7) |
 | NVIDIA Image Scaling (NIS) | v1.0.3 | 35e13ba316c98eeecf16f37eae70ce88019911f6 | MIT | `NIS_Scaler.h`, `NIS_Config.h`, `NIS_Main.hlsl` (reference), `licence.txt`; `nis_scaler_embed.hpp` is generated from `NIS_Scaler.h` by `make_embed.py` (J2 Sharpness 101–200 %: sharpen-only, compiled at run time) |
 | AMD FidelityFX optical flow (FSR3 SDK) | release-FSR3-3.0.3 | a0632abf1350bb64c098573d84c42f053f053a6e | MIT | `ffx-opticalflow/`: optical-flow + SPD + core GPU headers and the 7 DX12 pass `.hlsl` files, unmodified; compiled by DXC at build time (P4-0c), no AMD runtime |
+| AMD FidelityFX Breadcrumbs (FidelityFX SDK) | v1.1.4 | c6efa6bf7f2027b3ec94f28578bb5965eabb9e55 | MIT | `ffx-breadcrumbs/`: Breadcrumbs component + the host headers and shared files it needs, unmodified; our own DX12 callbacks in `diag/gpu_breadcrumbs.cpp` (no AMD runtime) |
 
 Streamline rule (unchanged): TLOU ships interposer 1.4.7; no public 1.4.7 tag exists. Wrappers may forward
 without interpreting SL structs; interpreting any field requires runtime validation evidence first.

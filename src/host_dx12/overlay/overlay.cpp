@@ -1,4 +1,5 @@
 #include "host_dx12/host_boot/process_log.hpp"
+#include "host_dx12/diag/gpu_breadcrumbs.hpp"
 #include "host_dx12/diag/dred.hpp"
 #include "host_dx12/native_present/size_spoof.hpp"
 #include "host_dx12/native_present/size_probe.hpp"
@@ -1000,7 +1001,8 @@ void write_status_line()
                 " color_space=" + std::to_string(g_color_space.load(std::memory_order_acquire)) + "\r\n";
             WriteFile(f, hud.data(), DWORD(hud.size()), &written, nullptr);
             if (na::j2::hud_unblend::Configured()) {
-                const std::string ub = na::j2::hud_unblend::StatusLine() + " composited=" + std::to_string(j2.small_hud_layer) + "\r\n";
+                const std::string ub = na::j2::hud_unblend::StatusLine() + " composited=" + std::to_string(j2.small_hud_layer) + "\r\n" +
+                                       na::diag::crumbs::StatusLine() + "\r\n";
                 WriteFile(f, ub.data(), DWORD(ub.size()), &written, nullptr);
             }
             {
@@ -2653,7 +2655,10 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     g_state.list->OMSetRenderTargets(1, &f.rtv, FALSE, nullptr);
     ID3D12DescriptorHeap* heaps[] = {g_state.srv_heap.Get()};
     g_state.list->SetDescriptorHeaps(1, heaps);
-    ImGui_ImplDX12_RenderDrawData(draw, g_state.list.Get());
+    {
+        const na::diag::crumbs::Scope crumb(g_state.list.Get(), "NeuralAlias overlay menu");
+        ImGui_ImplDX12_RenderDrawData(draw, g_state.list.Get());
+    }
     ++g_state.imgui_draws; // backend advances once per RenderDrawData, even if submission fails
     if (just_opened) menu_note("menu_open: GPU draw recorded\r\n");
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -2798,6 +2803,7 @@ bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue,ComPtr<ID3D1
     }
     g_state.last_present = now;
     na::gputime::Poll(queue);
+    na::diag::crumbs::OnPresent(g_state.device.Get());
     // A63/A64 picture-rebuild nudge: started on the window thread; restored by
     // its timer. A post that cannot be delivered is a checked failure.
     na::present::RetryOrphans(); // A75: chains whose teardown timed out earlier

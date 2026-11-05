@@ -1,5 +1,6 @@
 #include "host_dx12/j2/hud_unblend.hpp"
 #include "host_dx12/diag/dred.hpp"
+#include "host_dx12/diag/gpu_breadcrumbs.hpp"
 #include "host_dx12/overlay/usage_sampler.hpp"
 #include "host_dx12/host_boot/process_log.hpp"
 #include "host_dx12/nr/sl_consumer.hpp"
@@ -108,6 +109,7 @@ DWORD WINAPI InitThread(LPVOID)
         const bool page_faults = GetPrivateProfileIntW(L"diagnostics", L"dred", 1, g_ini) != 0;
         const bool breadcrumbs = GetPrivateProfileIntW(L"diagnostics", L"dred_breadcrumbs", 0, g_ini) == 1;
         boot_log(na::diag::EnableDred(page_faults, breadcrumbs, dir).c_str());
+        na::diag::crumbs::SetEnabled(GetPrivateProfileIntW(L"diagnostics", L"gpu_breadcrumbs", 0, g_ini) == 1);
     }
     // P4-4 slider route (step 1): our menu's mode sets the game's render scale. The read hook
     // must be in before the game reads its settings file, so it goes in first. Opt-in per game

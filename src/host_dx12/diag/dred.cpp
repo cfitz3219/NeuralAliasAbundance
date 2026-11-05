@@ -1,4 +1,5 @@
 #include "host_dx12/diag/dred.hpp"
+#include "host_dx12/diag/gpu_breadcrumbs.hpp"
 
 #include <windows.h>
 #include <d3d12.h>
@@ -156,6 +157,8 @@ void ReportIfRemoved(ID3D12Device* device)
     std::string text;
     try {
         text = DescribeRemoval(device);
+        const std::string trail = na::diag::crumbs::Status();
+        if (!trail.empty()) text += "\r\n---- AMD FidelityFX Breadcrumbs (NeuralAlias passes) ----\r\n" + trail;
     } catch (...) {
         text = "device removed: report failed (out of memory)\r\n";
     }

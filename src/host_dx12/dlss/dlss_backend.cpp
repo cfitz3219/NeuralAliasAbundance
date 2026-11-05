@@ -1,5 +1,6 @@
 // C6: generic DLSS Super Resolution / DLAA backend. See dlss_backend.hpp.
 #include "host_dx12/dlss/dlss_backend.hpp"
+#include "host_dx12/diag/gpu_breadcrumbs.hpp"
 #include "host_dx12/diag/dred.hpp"
 #include "host_dx12/dlss/call_origin.hpp"
 
@@ -524,6 +525,7 @@ bool QueryOptimal(uint32_t out_w, uint32_t out_h, Quality q, OptimalSettings* ou
 
 bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
 {
+    const na::diag::crumbs::Scope crumb(list, "NeuralAlias DLSS evaluate");
     const InjectorCallScope origin;
     std::lock_guard<std::mutex> lock(g.m);
     if (!list) return false;

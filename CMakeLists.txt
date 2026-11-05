@@ -288,8 +288,19 @@ if(NA_HAVE_NGX_SDK AND NA_NGX_LIB AND EXISTS "${NA_NGX_LIB}")
 endif()
 # DRED report (Windows' device-removed diagnostics; diag/dred.hpp). Its own library: the
 # DLSS backend and the host both report a removal.
-add_library(host_diag STATIC src/host_dx12/diag/dred.cpp)
-target_link_libraries(host_diag PUBLIC abundance_options d3d12)
+# AMD FidelityFX Breadcrumbs (MIT, FidelityFX SDK v1.1.4, unmodified; third_party/ffx-breadcrumbs):
+# vendor code, built without our /W4 /WX. Our own DX12 backend is in diag/gpu_breadcrumbs.cpp.
+add_library(ffx_breadcrumbs STATIC
+  third_party/ffx-breadcrumbs/src/components/breadcrumbs/ffx_breadcrumbs.cpp
+  third_party/ffx-breadcrumbs/src/shared/ffx_breadcrumbs_list.cpp
+  third_party/ffx-breadcrumbs/src/shared/ffx_object_management.cpp
+  third_party/ffx-breadcrumbs/src/shared/ffx_assert.cpp
+  third_party/ffx-breadcrumbs/src/shared/ffx_message.cpp)
+target_include_directories(ffx_breadcrumbs SYSTEM PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ffx-breadcrumbs/include"
+                           PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ffx-breadcrumbs/src/shared")
+target_compile_definitions(ffx_breadcrumbs PRIVATE UNICODE _UNICODE)
+add_library(host_diag STATIC src/host_dx12/diag/dred.cpp src/host_dx12/diag/gpu_breadcrumbs.cpp)
+target_link_libraries(host_diag PUBLIC abundance_options d3d12 PRIVATE ffx_breadcrumbs)
 add_library(host_dlss STATIC src/host_dx12/dlss/dlss_backend.cpp)
 target_link_libraries(host_dlss PUBLIC abundance_options abundance_core d3d12 host_diag)
 if(NA_HAVE_NGX_SDK)
