@@ -154,7 +154,7 @@ struct Canvas {
     uint64_t id=0,generation=0,last_write=0,last_2d=0,used=0,probed=0;
     uint32_t rw=0,rh=0,ow=0,oh=0,blended=0,proofs=0;
     DXGI_FORMAT format=DXGI_FORMAT_UNKNOWN;
-    ID3D12GraphicsCommandList* writer=nullptr;uint64_t recording=0;
+    ID3D12GraphicsCommandList* writer=nullptr;uint64_t writer_id=0,recording=0;
     std::shared_ptr<ProbeCapture> snapshot;
 };
 std::vector<Canvas> g_canvases;
@@ -1044,7 +1044,7 @@ public:
             if(na::observe::ListDrawState(l,info)&&info.recording==t_bind.recording&&info.rt==t_bind.canvas){
                 std::lock_guard<std::mutex> lock(g_m);
                 for(auto& c:g_canvases)if(c.id==info.rt){
-                    c.last_write=++g_draw_order;c.used=g_frame;c.writer=l;c.recording=info.recording;c.snapshot.reset();
+                    c.last_write=++g_draw_order;c.used=g_frame;c.writer=l;c.writer_id=info.list;c.recording=info.recording;c.snapshot.reset();
                     if(info.pipeline_known&&info.rt_count==1&&info.pso_rt_count==1&&info.samples==1&&
                         info.blend_mask!=NA_UNKNOWN_U32&&(info.blend_mask&1u)&&info.depth_enable==0){
                         c.last_2d=c.last_write;++c.blended;
@@ -1063,8 +1063,10 @@ public:
     void Closing(ID3D12GraphicsCommandList* l) noexcept override {
         if(!g_on.load())return;
         std::lock_guard<std::mutex> lock(g_m);
-        Canvas* best=nullptr;const auto recording=na::observe::ListRecording(l);
-        for(auto& c:g_canvases)if(c.writer==l&&c.recording==recording&&c.blended&&c.last_2d==c.last_write&&
+        Canvas* best=nullptr;const auto recording=na::observe::ListRecording(l),writer_id=na::observe::IdOf(l);
+        // A driver may reuse a destroyed list's address AND its local Reset
+        // count. That must not select an old canvas from a different object.
+        for(auto& c:g_canvases)if(writer_id&&c.writer==l&&c.writer_id==writer_id&&c.recording==recording&&c.blended&&c.last_2d==c.last_write&&
             (!best||c.probed<best->probed||(c.probed==best->probed&&c.last_write>best->last_write)))best=&c;
         if(!best||!best->ow||!best->oh||best->probed>best->last_write)return;
         // Only an actually known source state is used. No guessed cross-list
@@ -1092,7 +1094,8 @@ public:
     }
     void NativeBoundary(ID3D12GraphicsCommandList* l) noexcept override {
         std::lock_guard<std::mutex> lock(g_m);
-        for(auto& c:g_canvases)if(c.writer==l&&c.recording==na::observe::ListRecording(l)){c.last_write=++g_draw_order;c.snapshot.reset();}
+        const auto recording=na::observe::ListRecording(l),writer_id=na::observe::IdOf(l);
+        for(auto& c:g_canvases)if(writer_id&&c.writer==l&&c.writer_id==writer_id&&c.recording==recording){c.last_write=++g_draw_order;c.snapshot.reset();}
     }
     void After(ID3D12GraphicsCommandList* l, const na::observe::ShaderCall& call, na::observe::ShaderScope&) noexcept override {
         if(call.kind==na::observe::ShaderKind::Dispatch||!g_on.load()||t_bind.list!=l||!t_bind.proxy)return;

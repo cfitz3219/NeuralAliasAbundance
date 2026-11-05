@@ -206,6 +206,7 @@ void SetRasterStateListener(RasterStateListener listener);
 // recording is unknown. `restorable` = RestoreBindingState can hand back targets, viewports
 // and scissors (raster tracking was on at this recording's Reset).
 struct DrawInfo {
+    na_object_id list = 0; // object identity, independent of reused COM addresses/recording counts
     uint64_t recording = 0;
     na_object_id rt = 0, ds = 0;
     uint32_t rt_count = 0;

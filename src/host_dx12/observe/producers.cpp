@@ -5540,6 +5540,7 @@ bool ListDrawState(ID3D12CommandList* list, DrawInfo& out)
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load() || !ls->generation_known.load()) return false;
+    r.list = lid;
     r.recording = ls->generation.load() + 1;
     const bool complete = ls->coverage_complete.load();
     std::lock_guard<std::mutex> bl(ls->bind_m);
