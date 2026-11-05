@@ -2222,7 +2222,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         injected = rescaled;
         ++g.stats.jitter_extent_rescaled;
     }
-    if (!saved && !held && !from_j1 && !g_injected && g.jitter_on) { // a DLAA frame without J1's jitter: why
+    if (!vpj_mode() && !saved && !held && !from_j1 && !g_injected && g.jitter_on) { // a DLAA frame without J1's jitter: why (viewport jitter reports its own coverage)
         if (!g.jit.valid) ++g.stats.unjit_no_sample;
         else if (!g.jit.applied) ++g.stats.unjit_not_applied;
         else ++g.stats.unjit_not_held;
