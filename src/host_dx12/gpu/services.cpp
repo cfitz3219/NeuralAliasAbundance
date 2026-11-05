@@ -143,9 +143,9 @@ bool Recording::Submit(){
 #if defined(NA_HAVE_NVRHI)
     if(!state_->closed||state_->submitted)return false;
     na::observe::HostWorkScope own;auto c=state_->context;std::lock_guard<std::mutex> lock(c->submit);
-    auto query=c->device->createEventQuery();
     const auto instance=c->device->executeCommandList(state_->list);state_->submitted=true;
     if(!state_->owners.empty()){
+        auto query=c->device->createEventQuery();
         retained+=state_->owners.size();c->device->setEventQuery(query,nvrhi::CommandQueue::Graphics);
         c->pending.push_back({query,std::move(state_->owners)});
     }
