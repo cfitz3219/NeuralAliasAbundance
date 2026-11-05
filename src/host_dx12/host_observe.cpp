@@ -44,11 +44,14 @@ constexpr size_t kMinRingBytes = 2 * kMaxBatchBytes; // one max event must fit
 // One ring per recording thread. Each ring sits on its own cache lines (the producer
 // writes head/in_emit, the worker writes tail): neighbouring rings no longer share a line,
 // so game threads recording in parallel do not bounce each other's caches on every event.
-struct alignas(64) Ring {
+// (Explicit padding, not alignas: MSVC /W4 /WX rejects padding added by alignment, C4324.)
+struct Ring {
+    char lead_pad[64];                // keeps the previous ring's tail/buf off this ring's head line
     std::atomic<DWORD> owner{0};
     std::atomic<uint32_t> in_emit{0}; // R2 quiescence, per ring (owner thread only increments)
     std::atomic<uint64_t> head{0};
-    alignas(64) std::atomic<uint64_t> tail{0};
+    char mid_pad[64 - sizeof(std::atomic<DWORD>) - sizeof(std::atomic<uint32_t>) - sizeof(std::atomic<uint64_t>)];
+    std::atomic<uint64_t> tail{0};
     std::vector<uint8_t> buf;
 };
 
