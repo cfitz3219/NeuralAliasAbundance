@@ -89,6 +89,7 @@ groupshared uint mismatch,matched,error_bits;
 [numthreads(8,8,1)]void compose(uint3 id:SV_DispatchThreadID){
  if(id.x>=ow||id.y>=oh)return;
  float2 uv=(float2(id.xy)+.5)/float2(ow,oh);
+ if(flags&32u){result[id.xy]=scene.SampleLevel(lin,uv,0);return;}
  if(flags&8u){bool valid=agrees_at(uv);float4 c=valid?n0[id.xy]:frame.SampleLevel(lin,uv,0);
   if((flags&4u)&&valid){float3 d=abs(full.SampleLevel(lin,uv,0).rgb-scene.SampleLevel(lin,uv,0).rgb);
    c.rgb=lerp(c.rgb,float3(1,0,1),.5*saturate(max(d.r,max(d.g,d.b))*16));}result[id.xy]=c;return;}
@@ -142,12 +143,13 @@ struct Picture::Impl {
  UINT descriptor_page=0; // pre-HUD work and final Present may both be in flight
  struct K {UINT w,h,ow,oh,flags;float grey,tolerance;UINT pad;} constants{};
  bool snapshot(ID3D12GraphicsCommandList* l,ID3D12Resource* src,D3D12_RESOURCE_STATES state,ComPtr<ID3D12Resource>& dst,bool& ready){
-  if(!l||!src)return false;auto d=src->GetDesc();if(d.Width!=w||d.Height!=h||(TypelessOf(d.Format)==DXGI_FORMAT_UNKNOWN||TypelessOf(d.Format)!=TypelessOf(source_format))||d.MipLevels!=1||d.DepthOrArraySize!=1||d.SampleDesc.Count!=1)return false;
+  if(!l||!src)return false;auto d=src->GetDesc();if(d.Width!=w||d.Height!=h||
+    (d.Format!=source_format&&(TypelessOf(d.Format)==DXGI_FORMAT_UNKNOWN||TypelessOf(d.Format)!=TypelessOf(source_format)))||d.MipLevels!=1||d.DepthOrArraySize!=1||d.SampleDesc.Count!=1)return false;
   move(l,src,state,CS);if(ready)move(l,dst.Get(),S,CD);l->CopyResource(dst.Get(),src);move(l,src,CS,state);move(l,dst.Get(),CD,S);ready=true;return true;
  }
  void bind(ID3D12GraphicsCommandList* l,UINT pass,ID3D12Resource* pic,DXGI_FORMAT pf){
   auto cpu=heap->GetCPUDescriptorHandleForHeapStart();cpu.ptr+=SIZE_T(descriptor_page*33+pass*11)*program->inc;
-  ID3D12Resource* srvs[]={frame.Get(),full.Get(),scene.Get(),n[0].Get(),n[1].Get(),pic};
+  ID3D12Resource* srvs[]={frame.Get(),full_current?full.Get():nullptr,scene_current?scene.Get():nullptr,n[0].Get(),n[1].Get(),pic};
   DXGI_FORMAT formats[]={frame_view,frame_view,frame_view,layer_view,layer_view,pf};
   for(UINT i=0;i<6;++i){D3D12_SHADER_RESOURCE_VIEW_DESC v{};v.Format=srvs[i]?formats[i]:DXGI_FORMAT_R8G8B8A8_UNORM;
    v.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;v.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;v.Texture2D.MipLevels=1;
@@ -231,8 +233,32 @@ bool Picture::Composite(ID3D12GraphicsCommandList* l,ID3D12Resource* out){
  move(l,p.n[0].Get(),S,R);move(l,p.n[1].Get(),S,R);return true;
 }
 bool Picture::SeedNativeAlpha(ID3D12GraphicsCommandList* l,ID3D12Resource* out){
- const UINT flags=p_->constants.flags;p_->constants.flags=16;
- const bool ok=Composite(l,out);p_->constants.flags=flags;return ok;
+ auto& p=*p_;if(!l||!out||!p.scene_current)return false;
+ const auto d=out->GetDesc();if(d.Width!=p.ow||d.Height!=p.oh)return false;
+ if(p.result&&p.result_format!=d.Format)return false;
+ if(!p.result&&!texture(p.program->dev.Get(),p.ow,p.oh,d.Format,true,U,p.result))return false;
+ p.result_format=d.Format;
+ const auto saved=p.constants;const auto saved_view=p.frame_view;auto saved_n0=p.n[0],saved_n1=p.n[1];p.n[0].Reset();p.n[1].Reset();
+ if(p.frame_view==DXGI_FORMAT_UNKNOWN)p.frame_view=p.source_format;
+ p.constants={p.w,p.h,p.ow,p.oh,16,1,0,0};
+ move(l,out,U,S);p.bind(l,2,out,d.Format);l->Dispatch((p.ow+7)/8,(p.oh+7)/8,1);order(l);
+ move(l,out,S,CD);move(l,p.result.Get(),U,CS);l->CopyResource(out,p.result.Get());move(l,p.result.Get(),CS,U);move(l,out,CD,U);
+ p.constants=saved;p.frame_view=saved_view;p.n[0]=std::move(saved_n0);p.n[1]=std::move(saved_n1);return true;
+}
+bool Picture::SeedNativeScene(ID3D12GraphicsCommandList* l,ID3D12Resource* out,DXGI_FORMAT source_view){
+ auto& p=*p_;if(!l||!out||!p.scene_current)return false;
+ const auto d=out->GetDesc();if(d.Width!=p.ow||d.Height!=p.oh)return false;
+ if(p.result&&p.result_format!=d.Format)return false;
+ if(!p.result&&!texture(p.program->dev.Get(),p.ow,p.oh,d.Format,true,U,p.result))return false;
+ p.result_format=d.Format;const auto saved=p.constants;const auto saved_view=p.frame_view;auto saved_n0=p.n[0],saved_n1=p.n[1];p.n[0].Reset();p.n[1].Reset();
+ // Both buffers are storage encoded: use the corresponding UNORM view, not
+ // an sRGB decode, when merely seeding the transparent UI canvas.
+ p.frame_view=source_view==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB?DXGI_FORMAT_R8G8B8A8_UNORM:
+              source_view==DXGI_FORMAT_B8G8R8A8_UNORM_SRGB?DXGI_FORMAT_B8G8R8A8_UNORM:source_view;
+ p.constants={p.w,p.h,p.ow,p.oh,32,1,0,0};
+ p.bind(l,2,nullptr,DXGI_FORMAT_UNKNOWN);l->Dispatch((p.ow+7)/8,(p.oh+7)/8,1);order(l);
+ move(l,out,S,CD);move(l,p.result.Get(),U,CS);l->CopyResource(out,p.result.Get());move(l,p.result.Get(),CS,U);
+ move(l,out,CD,D3D12_RESOURCE_STATE_PRESENT);p.constants=saved;p.frame_view=saved_view;p.n[0]=std::move(saved_n0);p.n[1]=std::move(saved_n1);return true;
 }
 bool Picture::PresentNative(ID3D12GraphicsCommandList* l,ID3D12Resource* frame,DXGI_FORMAT view,
                             ID3D12Resource* native,ID3D12Resource* check,ID3D12Resource* out,bool tint){
