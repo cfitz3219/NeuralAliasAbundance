@@ -93,7 +93,18 @@ DWORD WINAPI InitThread(LPVOID)
     HMODULE pinned = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
                        reinterpret_cast<LPCWSTR>(&InitThread), &pinned);
+    {   // Hooking engine: MinHook unless the ini asks for Microsoft Detours (opt-in).
+        wchar_t engine[32] = {};
+        GetPrivateProfileStringW(L"hooking", L"engine", L"minhook", engine, 32, g_ini);
+        if (lstrcmpiW(engine, L"detours") == 0 && !na::hooking::SetEngine(na::hooking::Engine::Detours))
+            boot_log("hooking: Detours requested but not available; using MinHook");
+    }
     if (!na::hooking::Initialize()) { set_error("hooking core failed to initialise"); return 0; }
+    {
+        char line[96];
+        std::snprintf(line, sizeof line, "hooking: engine %s", na::hooking::EngineName());
+        boot_log(line);
+    }
     na::settings::SetIniPath(g_ini);
     na::settings::Load();
     na::host::StartSession();

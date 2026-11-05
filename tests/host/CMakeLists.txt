@@ -74,6 +74,9 @@ set_target_properties(nvngx_stub PROPERTIES PREFIX "")
 target_link_libraries(nvngx_stub PRIVATE abundance_options)
 
 na_host_test(hooking_test SOURCES hooking_test.cpp LIBS host_hooking d3d12 dxgi)
+if(MSVC)
+  na_host_test(hooking_detours_test SOURCES hooking_detours_test.cpp LIBS host_hooking d3d12 dxgi)
+endif()
 # Game-facing Streamline boundary: this exe plays sl.interposer (exports + RTTI proxy class).
 na_host_test(sl_boundary_test SOURCES sl_boundary_test.cpp LIBS host_dx12)
 na_host_test(sl_dlss_mode_test SOURCES sl_dlss_mode_test.cpp LIBS host_dx12)

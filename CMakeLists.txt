@@ -118,6 +118,19 @@ add_library(host_hooking STATIC
   src/host_dx12/hooking/vtable_hook.cpp
   src/host_dx12/hooking/variant_registry.cpp)
 target_link_libraries(host_hooking PUBLIC abundance_options d3d12 PRIVATE minhook)
+# Microsoft Detours (MIT, v4.0.1, unmodified; third_party/detours): opt-in hooking engine
+# ([hooking] engine=detours). Vendor code, built without our /W4 /WX. MSVC only.
+if(MSVC)
+  add_library(detours STATIC
+    third_party/detours/src/detours.cpp third_party/detours/src/modules.cpp third_party/detours/src/disasm.cpp
+    third_party/detours/src/image.cpp third_party/detours/src/creatwth.cpp third_party/detours/src/disolx86.cpp
+    third_party/detours/src/disolx64.cpp third_party/detours/src/disolia64.cpp third_party/detours/src/disolarm.cpp
+    third_party/detours/src/disolarm64.cpp)
+  target_include_directories(detours SYSTEM PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/third_party/detours/src")
+  target_compile_definitions(detours PRIVATE WIN32_LEAN_AND_MEAN)
+  target_link_libraries(host_hooking PRIVATE detours)
+  target_compile_definitions(host_hooking PRIVATE NA_HAVE_DETOURS)
+endif()
 # P4-4 render-small S1/S2 (Astra): game-facing window size and input mapping.
 add_subdirectory(src/host_dx12/native_present)
 # P4-4 slider route: read-time render-scale substitution (Fable; installed by host_boot on request).

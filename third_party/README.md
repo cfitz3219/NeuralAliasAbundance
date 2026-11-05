@@ -13,6 +13,7 @@ Re-vendored 2026-10-23 after the crash, at the same pins the original project re
 | AMD FidelityFX optical flow (FSR3 SDK) | release-FSR3-3.0.3 | a0632abf1350bb64c098573d84c42f053f053a6e | MIT | `ffx-opticalflow/`: optical-flow + SPD + core GPU headers and the 7 DX12 pass `.hlsl` files, unmodified; compiled by DXC at build time (P4-0c), no AMD runtime |
 | AMD FidelityFX Breadcrumbs (FidelityFX SDK) | v1.1.4 | c6efa6bf7f2027b3ec94f28578bb5965eabb9e55 | MIT | `ffx-breadcrumbs/`: Breadcrumbs component + the host headers and shared files it needs, unmodified; our own DX12 callbacks in `diag/gpu_breadcrumbs.cpp` (no AMD runtime) |
 | AMD D3D12 Memory Allocator | v3.0.1 | 9ef66bc14edd10dee0de3a545b98578363552f66 | MIT | `d3d12ma/`: `D3D12MemAlloc.h` + `.cpp`, unmodified; used via `gpu/mem_alloc.hpp` for our own resources |
+| Microsoft Detours | v4.0.1 | e4bfd6b03e50de46b47abfbd1e46b384f0c5f833 | MIT | `detours/src/` library sources, unmodified; opt-in hooking engine (`[hooking] engine=detours`), MinHook stays the default |
 
 Streamline rule (unchanged): TLOU ships interposer 1.4.7; no public 1.4.7 tag exists. Wrappers may forward
 without interpreting SL structs; interpreting any field requires runtime validation evidence first.
