@@ -58,7 +58,7 @@ log=             ; default %LOCALAPPDATA%\NeuralAlias\vulkan\NeuralAliasVulkan-<
 | Recording DLSS | Copy the colour out. Build camera motion from depth (`shaders/camera_motion.comp`, the Vulkan twin of the arbiter's tier 2). Run DLSS. Write the result back. Put the colour and depth back in the layouts they were in, and rebind the game's compute pipeline, sets and push constants. | `RecordInsert` |
 | At submit | Command buffers are replayed into the model in GPU order, the same way as DX11 deferred lists. The camera-motion matrix is composed in double, exactly as for DX11, and written into this frame's slot before the GPU runs it. | `Replay` |
 | Clip space | Both kinds are handled: Vulkan's own (+Y down, positive viewport) and D3D-style (negative viewport height). Motion vectors and jitter are checked in both. | `y_down` |
-| Jitter (optional) | Written into the game's camera block in mapped memory at submit, before the GPU can see it. Only the camera whose aspect matches the screen gets it. Mip bias goes on new mip-mapped samplers. | `InjectJitter` |
+| Jitter (optional) | Written into the game's camera block in mapped memory at submit, before the GPU can see it. Only the camera whose aspect matches the screen gets it. Mip bias goes on new mip-mapped samplers. DLSS is told a jitter only when the camera block can really be rewritten. If the scene is submitted before the post-processing is recorded, the scene gets the sample the next DLSS insertion will use. Any frame where the two still differ is counted as "jitter mismatch" in the log. | `InjectJitter` |
 | Secondary command buffers | Draws inside them take the primary's targets at `vkCmdExecuteCommands`. DLSS is never placed inside a secondary. | `Replay` |
 
 ## Threads and locks
@@ -73,7 +73,12 @@ so the hooks on those paths are kept off shared locks:
   only its set's shard. Updates that write no uniform buffer (images, samplers,
   storage buffers: most of them) take no lock at all.
 - A bind reuses per-thread scratch space, so it allocates no memory.
-- The frame model itself is only touched at `vkQueueSubmit`.
+- The frame model itself is only touched at `vkQueueSubmit`. `vkBeginCommandBuffer`
+  reads the current selection without a lock (it is published at each present).
+- The layer never calls `vkDeviceWaitIdle` during play. On a resize, the old
+  images are kept and freed 8 frames later, because command buffers made with them
+  may still be waiting to run. NGX is started when the swap chain is made, not
+  in the middle of a frame.
 
 The layer's added cost per call fell by about a third with this (local bench on
 lavapipe, 1 and 4 threads, about 300 ns down to about 200 ns per call).
@@ -85,7 +90,8 @@ camera was found, the layer's own resources, every skip reason (logged once each
 time it changes), and a summary line every 60 frames for the first 600 frames,
 then every 600 frames. The summary has: draws, scene draws, colour reads, whether
 a point is learned, then inserted, delivered, refused, no-camera, failed, missed,
-contradictions, not-unique, camera share and jitter writes.
+contradictions, not-unique, camera share, jitter writes and jitter mismatch (should
+stay 0).
 
 ## Tests
 

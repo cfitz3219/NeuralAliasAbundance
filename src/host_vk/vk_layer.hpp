@@ -36,6 +36,7 @@ struct NaVkStats {
     uint64_t frames, recorded_inserts, delivered, refused, no_camera, failed;
     uint64_t motion_dispatches, jitter_writes, samplers_biased, submits;
     uint64_t missed, contradictions, tag_not_unique;
+    uint64_t jitter_mismatch;      // insertions whose told jitter the scene did not get (should stay 0)
     uint32_t last_draws, last_scene_draws;
     uint32_t color_w, color_h, color_format, depth_format;
     uint64_t camera_offset;        // byte offset of the ViewProjection in its block

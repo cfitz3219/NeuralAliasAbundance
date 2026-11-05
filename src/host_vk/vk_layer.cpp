@@ -544,7 +544,7 @@ CbState* Cb(VkCommandBuffer cb)
     std::lock_guard<std::mutex> l(g_cb_mu);
     auto it = g_cbs.find(H(cb));
     CbState* st = it == g_cbs.end() ? nullptr : it->second.get();
-    t_cb = {cb, st, epoch};
+    if (st) t_cb = {cb, st, epoch}; // only hits are cached, so allocating command buffers never invalidates the caches
     return st;
 }
 
@@ -614,7 +614,11 @@ struct Host {
     uint32_t next_slot = 0;
     uint64_t insert_counter = 0;
     std::deque<uint32_t> pending; // recorded insertions not yet submitted (oldest first)
+    double inj_jx = 0, inj_jy = 0; // the jitter actually written into the game's camera this frame
     std::atomic<VkImage> last_scene_color{VK_NULL_HANDLE}, last_scene_depth{VK_NULL_HANDLE};
+    // The selection, readable without h.mu (vkBeginCommandBuffer runs on every recording thread).
+    std::atomic<Id> pub_color{0}, pub_depth{0};
+    std::atomic<uint64_t> pub_tag{0};
     // resources
     bool init_tried = false, init_ok = false;
     VkShaderModule motion_sm = VK_NULL_HANDLE, copy_sm = VK_NULL_HANDLE;
@@ -635,6 +639,10 @@ struct Host {
     struct DepthSet { VkImageView view = VK_NULL_HANDLE; VkDescriptorSet set = VK_NULL_HANDLE; };
     std::unordered_map<uint64_t, DepthSet> depth_sets;
     bool resources_ok = false;
+    // Resources of an old size: command buffers recorded (or still running) with
+    // them may exist, so they are freed some frames later, never in place.
+    struct Retired { OwnImage input, motion, output; VkDescriptorSet copy_set = VK_NULL_HANDLE; std::vector<DepthSet> depth; uint64_t free_at = 0; };
+    std::vector<Retired> retired;
     // DLSS
     na::vk::VkDlss dlss;
     bool dlss_tried = false, dlss_ok = false;
@@ -654,6 +662,15 @@ struct Host {
 };
 
 Host* HostOf(DeviceData* dd) { return dd ? dd->host.get() : nullptr; }
+
+// Under h.mu: makes the current selection visible to vkBeginCommandBuffer.
+void Publish(Host& h)
+{
+    const Selection& s = h.model.Current();
+    h.pub_color.store(s.color, std::memory_order_relaxed);
+    h.pub_depth.store(s.depth, std::memory_order_relaxed);
+    h.pub_tag.store(h.model.LearnedTag(), std::memory_order_release);
+}
 
 // ---------------------------------------------------------------- memory helpers
 uint32_t FindMemoryType(const DeviceData& dd, uint32_t bits, VkMemoryPropertyFlags want)
@@ -804,20 +821,48 @@ bool InitResources(Host& h)
     return true;
 }
 
-void FreeSizedResources(Host& h)
+constexpr uint64_t kRetireFrames = 8; // far more frames than any game keeps in flight
+
+void FreeRetired(Host& h, Host::Retired& r)
 {
     DeviceData& dd = *h.dev;
-    if (h.resources_ok || h.input.image || h.motion.image || h.output.image) dd.d.DeviceWaitIdle(dd.device);
-    for (auto& kv : h.depth_sets) {
-        if (kv.second.set) dd.d.FreeDescriptorSets(dd.device, h.pool, 1, &kv.second.set);
-        if (kv.second.view) dd.d.DestroyImageView(dd.device, kv.second.view, nullptr);
+    for (auto& ds : r.depth) {
+        if (ds.set) dd.d.FreeDescriptorSets(dd.device, h.pool, 1, &ds.set);
+        if (ds.view) dd.d.DestroyImageView(dd.device, ds.view, nullptr);
     }
+    if (r.copy_set) dd.d.FreeDescriptorSets(dd.device, h.pool, 1, &r.copy_set);
+    FreeImage(dd, &r.input);
+    FreeImage(dd, &r.motion);
+    FreeImage(dd, &r.output);
+}
+
+// Frees retired resources whose time has come (all of them when `all`, only once the device is idle).
+void ReleaseRetired(Host& h, bool all)
+{
+    for (auto it = h.retired.begin(); it != h.retired.end();) {
+        if (all || h.frame >= it->free_at) {
+            FreeRetired(h, *it);
+            it = h.retired.erase(it);
+        } else ++it;
+    }
+}
+
+// Retires the per-size resources. No device wait here: this runs inside the
+// game's command recording, and vkDeviceWaitIdle is not allowed while another
+// game thread may be submitting (and would stall the game).
+void FreeSizedResources(Host& h)
+{
+    Host::Retired r;
+    r.input = h.input;
+    r.motion = h.motion;
+    r.output = h.output;
+    r.copy_set = h.copy_set;
+    for (auto& kv : h.depth_sets) r.depth.push_back(kv.second);
+    r.free_at = h.frame + kRetireFrames;
+    if (r.input.image || r.motion.image || r.output.image || r.copy_set || !r.depth.empty()) h.retired.push_back(std::move(r));
     h.depth_sets.clear();
-    if (h.copy_set) dd.d.FreeDescriptorSets(dd.device, h.pool, 1, &h.copy_set);
     h.copy_set = VK_NULL_HANDLE;
-    FreeImage(dd, &h.input);
-    FreeImage(dd, &h.motion);
-    FreeImage(dd, &h.output);
+    h.input = h.motion = h.output = OwnImage{};
     h.resources_ok = false;
     h.res_w = h.res_h = 0;
     h.res_color_format = VK_FORMAT_UNDEFINED;
@@ -986,12 +1031,41 @@ bool CameraNow(Host& h, CameraPick* out)
     return false;
 }
 
+// Can the learned camera block be rewritten from the CPU (mapped, or copied from mapped memory)? Under h.mu.
+bool CameraWritable(Host& h)
+{
+    const Selection& s = h.model.Current();
+    if (!s.camera_cb || !h.camera.found) return false;
+    std::shared_lock<std::shared_mutex> l(g_obj_mu);
+    auto it = g_ubo_ids.find(s.camera_cb);
+    if (it == g_ubo_ids.end()) return false; // push constants / inline updates: not rewritten (see docs)
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkDeviceSize mo = 0;
+    return HostBytes(h, it->second.buffer, it->second.offset, std::min<VkDeviceSize>(it->second.range, kMaxCamBytes), &mem, &mo) != nullptr;
+}
+
+// The jitter the next DLSS insertion will be recorded with (used when the scene
+// is submitted before that insertion is recorded). Under h.mu.
+Slot NextSlot(Host& h, bool y_down)
+{
+    Slot s;
+    const Selection& sel = h.model.Current();
+    s.w = sel.color_info.width;
+    s.h = sel.color_info.height;
+    s.y_down = y_down;
+    const auto js = neural_alias::temporal_jitter(static_cast<uint32_t>(h.insert_counter), Cfg().jitter_phases);
+    s.jx = js.x_pixels;
+    s.jy = js.y_pixels;
+    s.jittered = true;
+    return s;
+}
+
 // Jitter: rewrites the main camera's ViewProjection (and inverse) in the game's
 // mapped memory at submit, before the GPU can read it. Under h.mu.
 void InjectJitter(Host& h, const Slot& slot)
 {
     const Selection& s = h.model.Current();
-    if (!s.camera_cb || !h.camera.found || !slot.jittered) return;
+    if (!s.camera_cb || !h.camera.found || !slot.jittered || !slot.w || !slot.h) return;
     std::shared_lock<std::shared_mutex> l(g_obj_mu);
     auto it = g_ubo_ids.find(s.camera_cb);
     if (it == g_ubo_ids.end()) return; // push constants / inline updates: not rewritten (see docs)
@@ -1033,6 +1107,8 @@ void InjectJitter(Host& h, const Slot& slot)
     h.unjittered[s.camera_cb] = std::move(now);
     h.written[s.camera_cb] = std::move(out);
     h.jitter_written_this_frame = true;
+    h.inj_jx = slot.jx;
+    h.inj_jy = slot.jy;
     ++h.stats.jitter_writes;
 }
 
@@ -1058,6 +1134,26 @@ void Flush(const DeviceDispatch& d, VkCommandBuffer cb, std::vector<VkImageMemor
     d.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
                          static_cast<uint32_t>(bs->size()), bs->data());
     bs->clear();
+}
+
+// NGX Vulkan, once per device. Under h.mu. Tried when the swap chain is made
+// (outside any frame), so the first DLSS frame does not pay for it.
+void TryInitDlss(Host& h)
+{
+    if (h.dlss_tried || Cfg().copy_test) return;
+    h.dlss_tried = true;
+    DeviceData& dd = *h.dev;
+    const std::filesystem::path data = StateDir() / "ngx";
+    std::error_code ec;
+    std::filesystem::create_directories(data, ec);
+    const std::wstring data_w = data.wstring(), dll_w = ModuleDir().wstring();
+    if (const char* why = h.dlss.Init(dd.inst->instance, dd.phys, dd.device, dd.inst->gipa, dd.gdpa, data_w.c_str(), dll_w.c_str())) {
+        Log("dlss: %s", why);
+        h.SetReason(why);
+    } else {
+        h.dlss_ok = true;
+        Log("dlss: NGX Vulkan ready");
+    }
 }
 
 // Records DLSS (or the copy test) right before the game's read of `color`.
@@ -1107,20 +1203,7 @@ bool RecordInsert(CbState& cs, VkImage color, VkImageLayout color_layout)
     if (!dset) { ++h.stats.refused; h.SetReason("Could not bind the scene depth for camera motion."); return false; }
     const bool copy_test = Cfg().copy_test != 0;
     if (!copy_test && !h.dlss_ok) {
-        if (!h.dlss_tried) {
-            h.dlss_tried = true;
-            const std::filesystem::path data = StateDir() / "ngx";
-            std::error_code ec;
-            std::filesystem::create_directories(data, ec);
-            const std::wstring data_w = data.wstring(), dll_w = ModuleDir().wstring();
-            if (const char* why = h.dlss.Init(dd.inst->instance, dd.phys, dd.device, dd.inst->gipa, dd.gdpa, data_w.c_str(), dll_w.c_str())) {
-                Log("dlss: %s", why);
-                h.SetReason(why);
-            } else {
-                h.dlss_ok = true;
-                Log("dlss: NGX Vulkan ready");
-            }
-        }
+        TryInitDlss(h); // normally done already when the swap chain was made
         if (!h.dlss_ok) { ++h.stats.failed; return false; }
     }
 
@@ -1132,7 +1215,9 @@ bool RecordInsert(CbState& cs, VkImage color, VkImageLayout color_layout)
     slot.w = w;
     slot.h = hh;
     slot.y_down = h.scene_y_down;
-    const bool jitter = Cfg().jitter && h.camera_known;
+    // Jitter only when it can really be written into the scene's camera: DLSS must
+    // never be told a jitter the picture does not have.
+    const bool jitter = Cfg().jitter && h.camera_known && CameraWritable(h);
     if (jitter) {
         const auto js = neural_alias::temporal_jitter(static_cast<uint32_t>(h.insert_counter), Cfg().jitter_phases);
         slot.jx = js.x_pixels;
@@ -1438,9 +1523,11 @@ void Replay(Host& h, CbState& cs, Id inherit_rt, Id inherit_depth, int depth_gua
             if (scene) {
                 h.scene_y_down = r.y_down;
                 // Jitter goes in before the first scene draw the GPU will run this frame.
-                if (!h.jitter_tried_this_frame && Cfg().jitter && !h.pending.empty() && h.camera.found) {
+                if (!h.jitter_tried_this_frame && Cfg().jitter && h.camera.found) {
                     h.jitter_tried_this_frame = true; // once per frame, even if it could not be written
-                    InjectJitter(h, h.slots[h.pending.front()]);
+                    // The insertion already recorded for this frame, or (scene submitted
+                    // before the post-processing is recorded) the one that will be next.
+                    InjectJitter(h, h.pending.empty() ? NextSlot(h, r.y_down) : h.slots[h.pending.front()]);
                 }
             }
             const uint32_t v = h.model.Feed(e);
@@ -1506,8 +1593,15 @@ void Replay(Host& h, CbState& cs, Id inherit_rt, Id inherit_depth, int depth_gua
                 h.stats.camera_offset = cam.offset;
                 h.stats.depth_reversed = cam.reversed;
                 if (h.tracker_reset) h.tracker.Reset();
-                const double injected[2] = {slot.jx, slot.y_down ? -slot.jy : slot.jy};
-                const na::camera::CameraFrame f = h.tracker.Update(cam.vp, h.frame, slot.w, slot.h, h.jitter_written_this_frame && slot.jittered ? injected : nullptr);
+                // What the scene really got (the tracker removes exactly that from the camera).
+                const double injected[2] = {h.inj_jx, slot.y_down ? -h.inj_jy : h.inj_jy};
+                const na::camera::CameraFrame f = h.tracker.Update(cam.vp, h.frame, slot.w, slot.h, h.jitter_written_this_frame ? injected : nullptr);
+                if (slot.jittered && !(h.jitter_written_this_frame && h.inj_jx == slot.jx && h.inj_jy == slot.jy)) {
+                    ++h.stats.jitter_mismatch;
+                    if (h.stats.jitter_mismatch <= 5 || h.stats.jitter_mismatch % 600 == 0)
+                        Log("jitter: DLSS was told a jitter the scene did not get (%llu times; %s)", static_cast<unsigned long long>(h.stats.jitter_mismatch),
+                            h.jitter_written_this_frame ? "a different sample was written" : "nothing was written this frame");
+                }
                 if (f.valid) {
                     const auto m = na::camera::ComposeReprojectionRow(f.inv_view_proj_current_row, f.view_proj_previous_row);
                     for (int i = 0; i < 16; ++i) p.reproject[i] = static_cast<float>(m[i]);
@@ -1562,13 +1656,13 @@ void LogFrame(Host& h)
     if (!(f <= 600 ? f % 60 == 0 : f % 600 == 0)) return;
     const auto& s = h.model.GetStats();
     Log("frame %llu: draws %u, scene draws %u, colour reads %u, learned tag %s; inserted %llu, delivered %llu, refused %llu, "
-        "no camera %llu, failed %llu, missed %llu, contradictions %llu, not unique %llu, camera share %.2f, jitter writes %llu",
+        "no camera %llu, failed %llu, missed %llu, contradictions %llu, not unique %llu, camera share %.2f, jitter writes %llu, jitter mismatch %llu",
         static_cast<unsigned long long>(f), s.last_draws, s.last_scene_draws, s.last_reads, h.model.LearnedTag() ? "yes" : "no",
         static_cast<unsigned long long>(h.stats.recorded_inserts), static_cast<unsigned long long>(h.stats.delivered),
         static_cast<unsigned long long>(h.stats.refused), static_cast<unsigned long long>(h.stats.no_camera),
         static_cast<unsigned long long>(h.stats.failed), static_cast<unsigned long long>(s.missed),
         static_cast<unsigned long long>(s.contradictions), static_cast<unsigned long long>(s.tag_not_unique), s.camera_share,
-        static_cast<unsigned long long>(h.stats.jitter_writes));
+        static_cast<unsigned long long>(h.stats.jitter_writes), static_cast<unsigned long long>(h.stats.jitter_mismatch));
 }
 
 void OnPresent(DeviceData& dd)
@@ -1602,6 +1696,8 @@ void OnPresent(DeviceData& dd)
     }
     h.update_bytes.clear();
     h.jitter_tried_this_frame = h.jitter_written_this_frame = false;
+    ReleaseRetired(h, false);
+    Publish(h);
     h.stats.frames = h.frame;
     h.stats.selected = s.valid();
     h.stats.camera = h.camera.found;
@@ -1689,12 +1785,17 @@ VKAPI_ATTR void VKAPI_CALL DestroyImage_h(VkDevice device, VkImage image, const 
     }
     if (Host* h = HostOf(dd)) {
         std::lock_guard<std::mutex> l(h->mu);
-        if (forget) h->model.Forget(forget);
+        if (forget) {
+            h->model.Forget(forget);
+            Publish(*h);
+        }
         if (h->last_scene_color.load() == image) h->last_scene_color.store(VK_NULL_HANDLE);
         if (h->last_scene_depth.load() == image) h->last_scene_depth.store(VK_NULL_HANDLE);
         auto ds = h->depth_sets.find(H(image));
         if (ds != h->depth_sets.end()) {
-            dd->d.DeviceWaitIdle(device); // the game destroys it only when the GPU is done with it; our view must go first
+            // No device wait: our view is only used inside the game's own command
+            // buffers next to the image itself, and the game destroys the image only
+            // once the GPU is done with those.
             if (ds->second.set) dd->d.FreeDescriptorSets(device, h->pool, 1, &ds->second.set);
             dd->d.DestroyImageView(device, ds->second.view, nullptr);
             h->depth_sets.erase(ds);
@@ -2162,6 +2263,7 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR_h(VkDevice device, const VkSwa
         h->swap_h = ci->imageExtent.height;
         h->model.SetSwapChainSize(h->swap_w, h->swap_h);
         Log("swapchain: %ux%u format %d", h->swap_w, h->swap_h, static_cast<int>(ci->imageFormat));
+        TryInitDlss(*h);
     }
     return r;
 }
@@ -2183,7 +2285,6 @@ VKAPI_ATTR VkResult VKAPI_CALL AllocateCommandBuffers_h(VkDevice device, const V
         g_cbs[H(out[i])] = std::move(st);
         pool.push_back(H(out[i]));
     }
-    g_cb_epoch.fetch_add(1, std::memory_order_release);
     return r;
 }
 VKAPI_ATTR void VKAPI_CALL FreeCommandBuffers_h(VkDevice device, VkCommandPool pool, uint32_t n, const VkCommandBuffer* cbs)
@@ -2241,11 +2342,10 @@ VKAPI_ATTR VkResult VKAPI_CALL BeginCommandBuffer_h(VkCommandBuffer cb, const Vk
     if (!cs) return DeviceOf(cb)->d.BeginCommandBuffer(cb, bi);
     cs->Reset();
     if (Host* h = HostOf(cs->dev)) {
-        std::lock_guard<std::mutex> l(h->mu);
-        const Selection& s = h->model.Current();
-        cs->sel_color = s.color;
-        cs->sel_depth = s.depth;
-        cs->learned_tag = h->model.LearnedTag();
+        // No h.mu here: a submit replay can hold it for a while, and every recording thread begins command buffers.
+        cs->learned_tag = h->pub_tag.load(std::memory_order_acquire);
+        cs->sel_color = h->pub_color.load(std::memory_order_relaxed);
+        cs->sel_depth = h->pub_depth.load(std::memory_order_relaxed);
     } else {
         cs->sel_color = cs->sel_depth = 0;
         cs->learned_tag = 0;
@@ -2847,6 +2947,7 @@ VKAPI_ATTR void VKAPI_CALL DestroyDevice_h(VkDevice device, const VkAllocationCa
         std::lock_guard<std::mutex> l(h->mu);
         h->dlss.Shutdown();
         FreeSizedResources(*h);
+        ReleaseRetired(*h, true); // the device is idle
         const DeviceDispatch& d = dd->d;
         if (h->ring_mem) d.FreeMemory(device, h->ring_mem, nullptr);
         if (h->ring) d.DestroyBuffer(device, h->ring, nullptr);

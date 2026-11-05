@@ -961,6 +961,7 @@ int main(int argc, char** argv)
         expect(s.samplers_biased == 1, "the mip-mapped sampler got the mip bias");
         std::printf("jitter: picture moved by the told jitter in %u frames, wrong in %u\n", jitter_sign_ok, jitter_sign_bad);
         expect(jitter_sign_ok >= 25 && jitter_sign_bad == 0, "the picture moves by exactly the jitter DLSS is given (direction and size)");
+        expect(s.jitter_mismatch == 0, "DLSS is never told a jitter the scene did not get");
     } else {
         expect(s.jitter_writes == 0 && s.samplers_biased == 0, "no jitter and no mip bias when jitter=0");
     }

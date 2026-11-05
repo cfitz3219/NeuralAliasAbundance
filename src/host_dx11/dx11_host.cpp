@@ -304,7 +304,7 @@ inline const Originals& O(ID3D11DeviceContext* c, Ctx* x)
 }
 
 // ---------------------------------------------------------------- events
-void FireBeforeRead(ID3D11DeviceContext* immediate); // below
+void FireBeforeRead(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk); // below
 
 // Feeds one event for a context: live for the immediate one, recorded for deferred ones.
 void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, const void* cb_bytes = nullptr, size_t cb_size = 0)
@@ -317,10 +317,10 @@ void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, const void* cb_bytes =
                                                                                 static_cast<const uint8_t*>(cb_bytes) + cb_size));
         return;
     }
-    std::lock_guard<std::mutex> l(g_mu);
+    std::unique_lock<std::mutex> l(g_mu);
     if (e.kind == Kind::Read && g_model.ShouldFireBeforeRead(e.resource)) {
         g_model.MarkFired();
-        FireBeforeRead(c);
+        FireBeforeRead(c, l);
     }
     const uint32_t v = g_model.Feed(e);
     if (e.kind == Kind::CbUpdate && cb_bytes) {
@@ -509,8 +509,10 @@ bool CameraNow(CameraPick* out)
 }
 
 // Runs DLSS on the scene colour, in place, before the game's first read of it.
-// Called under g_mu, on the immediate context's thread, before the read is forwarded.
-void FireBeforeRead(ID3D11DeviceContext* immediate)
+// Called under g_mu (`lk`), on the immediate context's thread, before the read is
+// forwarded. g_mu is let go while the bridge waits for the helper, so the game's
+// other threads (deferred contexts, uploads) never wait behind DLSS.
+void FireBeforeRead(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk)
 {
     ++g_stats.fired;
     const Selection sel = g_model.Current();
@@ -596,10 +598,15 @@ void FireBeforeRead(ID3D11DeviceContext* immediate)
     const auto reproject = na::camera::ComposeReprojectionRow(f.inv_view_proj_current_row, f.view_proj_previous_row);
     for (int i = 0; i < 16; ++i) rec.reproject[i] = static_cast<float>(reproject[i]);
 
+    // Our own references, so nothing another thread changes meanwhile can free them.
+    const ComPtr<ID3D11Resource> color = g_color_ref, depth = g_depth_ref;
+    const ComPtr<ID3D11RenderTargetView> target = g_target_rtv;
     na::bridge::Inputs in;
-    in.color_texture = g_color_ref.Get();
-    in.depth_texture = g_depth_ref.Get();
-    const na::bridge::Result r = g_bridge.Process(immediate, in, g_target_rtv.Get(), rec);
+    in.color_texture = color.Get();
+    in.depth_texture = depth.Get();
+    lk.unlock();
+    const na::bridge::Result r = g_bridge.Process(immediate, in, target.Get(), rec);
+    lk.lock();
     switch (r) {
     case na::bridge::Result::Ok: ++g_stats.delivered; g_stats.reason[0] = 0; g_last_logged_reason[0] = 0; break;
     case na::bridge::Result::Repeated: ++g_stats.repeated; break;
@@ -858,14 +865,17 @@ void STDMETHODCALLTYPE ExecuteCommandList_d(ID3D11DeviceContext* c, ID3D11Comman
 {
     CTX_PRE(c);
     if (x && !x->deferred && list) {
-        std::lock_guard<std::mutex> l(g_mu);
+        std::unique_lock<std::mutex> l(g_mu);
         auto it = g_lists.find(list);
         if (it != g_lists.end()) {
             ++g_stats.lists_executed;
             if (g_model.ShouldFireBeforeList(g_model.Summarize(it->second.events))) {
                 g_model.MarkFired();
-                FireBeforeRead(c);
+                FireBeforeRead(c, l);
+                it = g_lists.find(list); // g_mu was let go during DLSS: look the record up again
             }
+        }
+        if (it != g_lists.end()) {
             size_t next_bytes = 0;
             const auto& events = it->second.events;
             const auto& bytes = it->second.cb_bytes;
