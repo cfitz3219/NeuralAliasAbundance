@@ -56,6 +56,9 @@ struct QueueState {
 };
 
 struct DescHeap;
+// Recordings with a pinned viewport sample may still need it after the global
+// request goes away. Only an entirely idle jitter path can skip the list locks.
+std::atomic<uint64_t> g_vpj_recordings{0};
 struct ListState {
     uint32_t list_type=NA_UNKNOWN_U32; // immutable creation metadata
     std::atomic<uint64_t> generation{0};
@@ -123,7 +126,7 @@ struct ListState {
         std::vector<uint64_t> members;
         bool valid=false,rebase=false;
     } operation_key[2];
-    uint64_t key_revision[2]{};
+    uint64_t key_revision[2]{},read_revision[2]{};
     struct ShaderReads {
         uint64_t state_revision=0,registry_revision=0,color=0;
         na_object_id srvs[16]{},uav=0;
@@ -160,6 +163,7 @@ struct ListState {
     // and the value the last scene draw of this recording was drawn with (vpj_scene, 0 = none).
     bool vpj_applied = false;
     uint64_t vpj_value = 0, vpj_scene = 0, vpj_depth = 0;
+    ~ListState() { if (vpj_scene) g_vpj_recordings.fetch_sub(1, std::memory_order_release); }
 };
 
 struct Obj {
@@ -176,6 +180,7 @@ struct Obj {
     bool reflection_complete=false;
     bool native_hud_affine=false;
     bool shader_readonly=false;
+    uint32_t shader_rejection=ShaderUnknown;
     bool pixel_position=false;
     // Live mip bias: per-level twins of a root signature / pipeline state (index = level).
     // same[i]: the game's own object is already correct for level i (nothing to swap).
@@ -442,6 +447,7 @@ constexpr uint32_t kCostSlots = 128, kCostExec = 125, kCostPso = 126;
 constexpr uint32_t kCostPseudo = 100, kCostVpj = 100, kCostShaderUse = 101, kCostLaneBefore = 102, kCostLaneAfter = 103,
                    kCostDriver = 104, kCostRun = 105, kCostRootTable = 106, kCostSampled = 107, kCostEmit = 108,
                    kCostNoteDraw = 109, kCostCanonMiss = 110;
+std::atomic<bool> g_cost_enabled{false};
 std::atomic<uint64_t> g_cost_ticks[kCostSlots]{}, g_cost_calls[kCostSlots]{};
 thread_local uint64_t t_cost_ticks[kCostSlots]{}, t_cost_calls[kCostSlots]{};
 thread_local uint32_t t_cost_n = 0;
@@ -458,7 +464,7 @@ void cost_flush()
 }
 struct CostScope {
     uint32_t slot; uint64_t t0;
-    explicit CostScope(uint32_t s, bool on = true) : slot(on && s < kCostSlots ? s : kCostSlots), t0(slot < kCostSlots ? cost_now() : 0) {}
+    explicit CostScope(uint32_t s, bool on = true) : slot(on && s < kCostSlots && g_cost_enabled.load(std::memory_order_relaxed) ? s : kCostSlots), t0(slot < kCostSlots ? cost_now() : 0) {}
     ~CostScope()
     {
         if (slot >= kCostSlots) return;
@@ -1706,6 +1712,7 @@ thread_local std::vector<ShaderDimension> g_next_dimensions;
 thread_local std::vector<ShaderResource> g_next_shader_resources;
 thread_local bool g_next_reflection_complete=true;
 thread_local bool g_next_shader_readonly=true;
+thread_local uint32_t g_next_shader_rejection=0;
 thread_local bool g_next_pixel_position=false;
 void bytecode(na_ev_pipeline_created& e, uint32_t stage, const D3D12_SHADER_BYTECODE& b)
 {
@@ -1718,7 +1725,9 @@ void bytecode(na_ev_pipeline_created& e, uint32_t stage, const D3D12_SHADER_BYTE
         const bool reflected=ReflectDimensions(b,g_next_dimensions,stage<5?visibility[stage]:D3D12_SHADER_VISIBILITY_ALL,&g_next_shader_resources,
             stage==NA_STAGE_PS?&pixel_position:nullptr);
         g_next_reflection_complete &= reflected;
-        if(!reflected)g_next_shader_readonly &= ExecutableReadOnly(b,stage==NA_STAGE_PS?&pixel_position:nullptr);
+        uint32_t rejection=0;
+        g_next_shader_readonly &= ExecutableReadOnly(b,stage==NA_STAGE_PS?&pixel_position:nullptr,&rejection);
+        g_next_shader_rejection|=rejection;
         if(stage==NA_STAGE_PS)g_next_pixel_position=pixel_position;
     }
 }
@@ -1776,7 +1785,8 @@ void emit_pipeline(ID3D12Device* dev, IUnknown* obj, na_ev_pipeline_created& e, 
         std::unique_lock<std::shared_mutex> lock(g_m);
         const auto found=g_objs.find(canon(obj));if(found!=g_objs.end()){
             found->second.dimensions=g_next_dimensions;found->second.shader_resources=g_next_shader_resources;
-            found->second.reflection_complete=g_next_reflection_complete;}
+            found->second.reflection_complete=g_next_reflection_complete;
+            found->second.shader_rejection=g_next_shader_rejection|(g_next_stream_output?ShaderStreamOutput:0u);}
         if(found!=g_objs.end())found->second.shader_readonly=g_next_shader_readonly&&!g_next_stream_output&&
             std::none_of(g_next_shader_resources.begin(),g_next_shader_resources.end(),[](const auto& r){return r.type==D3D12_DESCRIPTOR_RANGE_TYPE_UAV;});
     }
@@ -2043,7 +2053,7 @@ HRESULT STDMETHODCALLTYPE D_CreateGraphicsPipelineState(ID3D12Device* dev, const
     const HRESULT hr = o_CreateGraphicsPipelineState(dev, d, riid, out);
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj || !d) return hr;
-    g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;g_next_shader_readonly=true;g_next_pixel_position=false;
+    g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;g_next_shader_readonly=true;g_next_shader_rejection=0;g_next_pixel_position=false;
     na_ev_pipeline_created e;
     init_header(e, NA_EV_PIPELINE_CREATED, NA_EVF_FOUNDATIONAL);
     e.pipeline_kind = NA_PIPELINE_GRAPHICS;
@@ -2078,7 +2088,7 @@ HRESULT STDMETHODCALLTYPE D_CreateComputePipelineState(ID3D12Device* dev, const 
     const HRESULT hr = o_CreateComputePipelineState(dev, d, riid, out);
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj || !d) return hr;
-    g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;g_next_shader_readonly=true;g_next_pixel_position=false;
+    g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;g_next_shader_readonly=true;g_next_shader_rejection=0;g_next_pixel_position=false;
     na_ev_pipeline_created e;
     init_header(e, NA_EV_PIPELINE_CREATED, NA_EVF_FOUNDATIONAL);
     e.pipeline_kind = NA_PIPELINE_COMPUTE;
@@ -2153,7 +2163,7 @@ HRESULT STDMETHODCALLTYPE D_CreatePipelineState(ID3D12Device2* dev, const D3D12_
     const HRESULT hr = o_CreatePipelineState(dev, d, riid, out);
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj || !d || !d->pPipelineStateSubobjectStream) return hr;
-    g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;g_next_shader_readonly=true;g_next_pixel_position=false;
+    g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;g_next_shader_readonly=true;g_next_shader_rejection=0;g_next_pixel_position=false;
     na_ev_pipeline_created e;
     init_header(e, NA_EV_PIPELINE_CREATED, NA_EVF_FOUNDATIONAL);
     e.pipeline_kind = NA_PIPELINE_STREAM;
@@ -2313,6 +2323,22 @@ bool begin_op(ID3D12GraphicsCommandList* l, Rec* r)
                 if (!ls->recording_observed.load() || !ls->coverage_complete.load() || r->gen == NA_UNKNOWN_U64)
                     r->flags |= NA_EVF_METHOD_UNOBSERVED;
                 return true;
+            }
+        }
+        preexisting_list(l);
+    }
+    return false;
+}
+
+template<class Fn>
+bool recorded_locked(ID3D12GraphicsCommandList* l,Rec& r,Fn&& fn){
+    if(t_host_work||!na::observe_internal::Started()||!l)return false;
+    for(int attempt=0;attempt<2;++attempt){
+        {std::shared_lock<std::shared_mutex> lock(g_m);na_object_id id=0;
+            if(auto* ls=list_state_locked(l,&id)){
+                r.list=id;r.gen=ls->generation_known.load()?ls->generation.load():NA_UNKNOWN_U64;r.op_index=ls->op_index.fetch_add(1)+1;
+                if(!ls->recording_observed.load()||!ls->coverage_complete.load()||r.gen==NA_UNKNOWN_U64)r.flags|=NA_EVF_METHOD_UNOBSERVED;
+                std::lock_guard<std::mutex> bind(ls->bind_m);fn(*ls);return true;
             }
         }
         preexisting_list(l);
@@ -2482,7 +2508,7 @@ struct On<sl::list::Reset> {
                     ls->nheaps = 0;
                     ls->heap_metadata_revision=0;
                     ls->operation_key[0].valid=ls->operation_key[1].valid=false;
-                    ++ls->key_revision[0];++ls->key_revision[1];
+                    ++ls->key_revision[0];++ls->key_revision[1];++ls->read_revision[0];++ls->read_revision[1];
                     ls->args[0].clear();
                     ls->args[1].clear();
                     ls->cur_rt = ls->cur_ds = 0;
@@ -2534,13 +2560,8 @@ struct On<sl::list::Close> {
         emit(e, NA_GROUP_LIST);
     }
 };
-void note_draw(GL* l) {
+void note_draw_locked(ListState* ls){
     const CostScope cost(kCostNoteDraw);
-    std::shared_lock<std::shared_mutex> lock(g_m);
-    na_object_id id = 0;
-    auto* ls = list_state_locked(l, &id);
-    if (!ls) return;
-    std::lock_guard<std::mutex> bl(ls->bind_m);
     uint64_t sel_depth = 0, sel_color = 0;
     GetLiveSelection(&sel_depth, &sel_color);
     for (uint32_t i = 0; i < ls->cur_nrt; ++i)
@@ -2553,17 +2574,22 @@ void note_draw(GL* l) {
     if (ls->cur_ds && ls->cur_ds_sub != NA_UNKNOWN_U32 && pipeline != g_objs.end() &&
         pipeline->second.created.size() >= sizeof(na_ev_pipeline_created)) {
         const auto* p = reinterpret_cast<const na_ev_pipeline_created*>(pipeline->second.created.data());
-        if (p->depth_enable == 1 && p->depth_write == 1 && ls->states.size() < 4096)
-            ls->states.push_back({ls->cur_ds, ls->cur_ds_sub, D3D12_RESOURCE_STATE_DEPTH_WRITE});
+        if(p->depth_enable==1&&p->depth_write==1&&ls->states.size()<4096){
+            const bool same=!ls->states.empty()&&ls->states.back().resource==ls->cur_ds&&ls->states.back().subresource==ls->cur_ds_sub&&ls->states.back().state_after==D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            if(!same)ls->states.push_back({ls->cur_ds,ls->cur_ds_sub,D3D12_RESOURCE_STATE_DEPTH_WRITE});
+        }
     }
 }
+void note_draw(GL* l){with_list_state(l,[&](ListState& ls){std::lock_guard<std::mutex> lock(ls.bind_m);note_draw_locked(&ls);});}
+void draw_operation(GL* l,uint32_t op,uint64_t count,uint64_t instances){
+    Rec r;if(recorded_locked(l,r,[&](ListState& ls){note_draw_locked(&ls);}))emit_op(r,op,{count,instances});
+}
+
 template <>
 struct On<sl::list::DrawInstanced> {
     static void run(GL* l, UINT v, UINT i, UINT, UINT)
     {
-        Rec r;
-        if (begin_op(l, &r)) emit_op(r, NA_OP_DRAW, {v, i});
-        if (r.list) note_draw(l);
+        draw_operation(l,NA_OP_DRAW,v,i);
     }
 };
 template<> struct On<sl::list::BeginQuery>{static void run(GL* l,ID3D12QueryHeap*,D3D12_QUERY_TYPE type,UINT){
@@ -2576,9 +2602,7 @@ template <>
 struct On<sl::list::DrawIndexedInstanced> {
     static void run(GL* l, UINT n, UINT i, UINT, INT, UINT)
     {
-        Rec r;
-        if (begin_op(l, &r)) emit_op(r, NA_OP_DRAW_INDEXED, {n, i});
-        if (r.list) note_draw(l);
+        draw_operation(l,NA_OP_DRAW_INDEXED,n,i);
     }
 };
 template <>
@@ -2743,7 +2767,7 @@ struct On<sl::list::ClearState> {
         s.raster_targets_known=s.raster_viewports_known=s.raster_scissors_known=s.raster_topology_known=true;
         s.raster_topology=D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;s.restorable=true;
         s.vertex_mask=0;s.index_known=false;s.index_buffer={};s.stencil_ref=0;std::fill_n(s.blend_factor,4,0.f);
-        s.predicate=nullptr;s.predicate_offset=0;++s.key_revision[0];++s.key_revision[1];
+        s.predicate=nullptr;s.predicate_offset=0;++s.key_revision[0];++s.key_revision[1];++s.read_revision[0];++s.read_revision[1];
     });}
 };
 template <>
@@ -2894,7 +2918,7 @@ struct On<sl::list::SetDescriptorHeaps> {
         with_list_state(l, [&](ListState& ls) {
             std::lock_guard<std::mutex> bl(ls.bind_m);
             ls.nheaps = 0;
-            ls.heap_metadata_revision=0;++ls.key_revision[0];++ls.key_revision[1];
+            ls.heap_metadata_revision=0;++ls.key_revision[0];++ls.key_revision[1];++ls.read_revision[0];++ls.read_revision[1];
             for (UINT i = 0; h && i < n && i < 2; ++i) ls.heaps[ls.nheaps++] = h[i];
         });
     }
@@ -2908,7 +2932,7 @@ void root_sig(GL* l, ID3D12RootSignature* rs)
     with_list_state(l, [&](ListState& ls) {
         std::lock_guard<std::mutex> bl(ls.bind_m);
         const bool changed = ls.root_sig[Compute] != rs;ls.root_sig[Compute] = rs;++ls.root_serial[Compute];
-        if(changed){++ls.key_revision[Compute];ls.operation_key[Compute].valid=false;}
+        if(changed){++ls.key_revision[Compute];++ls.read_revision[Compute];ls.operation_key[Compute].valid=false;}
         if (changed) ls.args[Compute].clear(); // a different root signature invalidates every root argument
     });
 }
@@ -2916,15 +2940,25 @@ template <>
 struct On<sl::list::SetComputeRootSignature> { static void run(GL* l, ID3D12RootSignature* rs) { root_sig<1>(l, rs); } };
 template <>
 struct On<sl::list::SetGraphicsRootSignature> { static void run(GL* l, ID3D12RootSignature* rs) { root_sig<0>(l, rs); } };
-void shadow_arg(GL* l, uint32_t compute, UINT param, uint8_t type, uint64_t value, const void* consts = nullptr, UINT count = 0, UINT dest = 0)
-{
-    if (param >= 64) return;
-    with_list_state(l, [&](ListState& ls) {
-        std::lock_guard<std::mutex> bl(ls.bind_m);
+void shadow_arg_locked(ListState& ls,uint32_t compute,UINT param,uint8_t type,uint64_t value,const void* consts=nullptr,UINT count=0,UINT dest=0){
+    if(param>=64)return;
         auto& v = ls.args[compute];
         if (v.size() <= param) v.resize(param + 1);
         ListState::RootArg& a = v[param];
         if(a.type!=type||a.value!=value||type==5){
+            if(type==1||a.type==1){
+                bool texture_table=true;
+                const auto root=g_objs.find(canon(ls.root_sig[compute]));
+                if(type==1&&a.type==1&&root!=g_objs.end()&&param<root->second.root_params.size()){
+                    const auto& p=root->second.root_params[param];
+                    if(p.param_type==NA_ROOT_TABLE&&p.first_range<=root->second.root_ranges.size()&&p.count<=root->second.root_ranges.size()-p.first_range){
+                        texture_table=false;
+                        for(UINT i=0;i<p.count;++i){const auto& range=root->second.root_ranges[p.first_range+i];
+                            texture_table|=range.range_type==D3D12_DESCRIPTOR_RANGE_TYPE_SRV||range.range_type==D3D12_DESCRIPTOR_RANGE_TYPE_UAV;}
+                    }
+                }
+                if(texture_table)++ls.read_revision[compute];
+            }
             const auto& cached=ls.operation_key[compute];
             if(type!=2||(a.type!=2&&a.type!=0)||!cached.valid||(cached.dimension_cbvs&(uint64_t(1)<<param)))++ls.key_revision[compute];
         }
@@ -2939,31 +2973,31 @@ void shadow_arg(GL* l, uint32_t compute, UINT param, uint8_t type, uint64_t valu
         }
         a.type = type;
         a.value = value;
-    });
+}
+void shadow_arg(GL* l,uint32_t compute,UINT param,uint8_t type,uint64_t value,const void* consts=nullptr,UINT count=0,UINT dest=0){
+    if(param>=64)return;
+    with_list_state(l,[&](ListState& ls){std::lock_guard<std::mutex> lock(ls.bind_m);shadow_arg_locked(ls,compute,param,type,value,consts,count,dest);});
 }
 std::atomic<TableBindCallback> g_table_cb{nullptr};
 std::atomic<EntryCallback> g_entry_cb{nullptr};
 template <uint32_t Compute>
-void root_table(GL* l, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE h)
-{
+void root_table(GL* l,UINT param,D3D12_GPU_DESCRIPTOR_HANDLE h){
     const CostScope cost(kCostRootTable);
-    Rec r;
-    if (!begin_op(l, &r)) return;
-    na_object_id heap = 0;
-    uint32_t slot = 0;
-    uint64_t version = 0;
-    shadow_arg(l, Compute, param, 1, h.ptr);
-    {
-        std::shared_lock<std::shared_mutex> lock(g_m);
-        DescHeap* dh = heap_for_gpu_locked(h.ptr, &slot);
+    Rec r;na_object_id heap=0;uint32_t slot=0;uint64_t version=0;
+    if(!recorded_locked(l,r,[&](ListState& state){auto* ls=&state;
+        shadow_arg_locked(state,Compute,param,1,h.ptr);
+        // Legal shader tables live in one of the recording's two bound heaps.
+        // Reuse their generation-checked metadata before searching every heap
+        // in a large game. Keep the original fallback for out-of-order evidence.
+        DescHeap* dh = bound_heap_for_gpu_locked(state,h.ptr,&slot);
+        if (!dh) dh = heap_for_gpu_locked(h.ptr, &slot);
         if (dh) {
             heap = dh->id;
             version = dh->versions[slot];
         }
         // C9: CBV ranges of this table (first range, per the bound root signature).
-        na_object_id lid = 0;
-        ListState* ls = list_state_locked(l, &lid);
-        if (dh && ls && ls->root_sig[Compute]) {
+
+        if (dh && ls->root_sig[Compute]) {
             auto it = g_objs.find(canon(ls->root_sig[Compute]));
             if (it != g_objs.end() && param < it->second.root_params.size()) {
                 const na_root_param& rp = it->second.root_params[param];
@@ -2971,10 +3005,10 @@ void root_table(GL* l, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE h)
                     const auto& rr = it->second.root_ranges;
                     for (uint32_t q = 0; q < rp.count && rp.first_range + q < rr.size(); ++q) {
                         const na_root_range& range = rr[rp.first_range + q];
-                        if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && range.table_offset != NA_UNKNOWN_U32) {
+                        if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && range.table_offset != NA_UNKNOWN_U32 && ls->sampled_textures.size()<256) {
                             const CostScope sampled(kCostSampled);
-                            std::lock_guard<std::mutex> bl(ls->bind_m);
-                            for (uint32_t k = 0; k < std::min<uint32_t>(range.num_descriptors, 64); ++k) {
+
+                            for (uint32_t k = 0; k < std::min<uint32_t>(range.num_descriptors, 64) && ls->sampled_textures.size()<256; ++k) {
                                 const uint64_t index = uint64_t(slot) + range.table_offset + k;
                                 if (index >= dh->count) break;
                                 const auto& si = dh->info[static_cast<size_t>(index)];
@@ -2999,16 +3033,16 @@ void root_table(GL* l, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE h)
                             b.offset = si.cbv_offset;
                             b.resource = si.resource == NA_UNKNOWN_U64 ? 0 : si.resource;
                             b.range_truncated = cut;
-                            add_binding(*ls, b);
+                            if(ls->bindings.size()<4096)ls->bindings.push_back(b);
                         }
                     }
                 }
             }
         }
-    }
-    emit_op(r, NA_OP_SET_ROOT_TABLE, {heap, heap ? slot : uint64_t{NA_UNKNOWN_U32}, heap ? version : NA_UNKNOWN_U64, param, Compute}, nullptr, 0, 0,
-            heap ? 0u : NA_EVF_METHOD_UNOBSERVED);
+    }))return;
+    emit_op(r,NA_OP_SET_ROOT_TABLE,{heap,heap?slot:uint64_t{NA_UNKNOWN_U32},heap?version:NA_UNKNOWN_U64,param,Compute},nullptr,0,0,heap?0u:NA_EVF_METHOD_UNOBSERVED);
 }
+
 template <>
 struct On<sl::list::SetComputeRootDescriptorTable> { static void run(GL* l, UINT p, D3D12_GPU_DESCRIPTOR_HANDLE h) { root_table<1>(l, p, h); } };
 template <>
@@ -3430,7 +3464,7 @@ void before_shader_use(GL* l, bool compute, bool indirect=false)
         uint32_t nsrv = 0;
         bool reads_derived = false;
         auto& cached=ls->shader_reads[compute];
-        if(cached.valid&&cached.state_revision==ls->key_revision[compute]&&cached.registry_revision==g_operation_revision&&cached.color==color){
+        if(cached.valid&&cached.state_revision==ls->read_revision[compute]&&cached.registry_revision==g_operation_revision&&cached.color==color){
             color_srvs=cached.color_srvs;reads_color=color_srvs!=0;nsrv=cached.count;
             std::copy_n(cached.srvs,nsrv,srv_ids);if(compute)destination=cached.uav;
         }else{
@@ -3465,7 +3499,7 @@ void before_shader_use(GL* l, bool compute, bool indirect=false)
                 }
             }
         }
-        cached.state_revision=ls->key_revision[compute];cached.registry_revision=g_operation_revision;cached.color=color;
+        cached.state_revision=ls->read_revision[compute];cached.registry_revision=g_operation_revision;cached.color=color;
         cached.color_srvs=color_srvs;cached.count=nsrv;cached.uav=compute?destination:0;
         std::copy_n(srv_ids,nsrv,cached.srvs);cached.valid=true;
         }
@@ -3692,12 +3726,16 @@ void vpj_viewports_replaced(GL* l, bool reset)
     if (!ls) return;
     std::lock_guard<std::mutex> bl(ls->bind_m);
     ls->vpj_applied = false;
-    if (reset) {ls->vpj_scene = 0;ls->vpj_depth=0;}
+    if (reset) {
+        if (ls->vpj_scene) g_vpj_recordings.fetch_sub(1, std::memory_order_release);
+        ls->vpj_scene = 0; ls->vpj_depth = 0;
+    }
 }
 void vpj_before_draw(GL* l)
 {
     if (!g_vpj_ever.load(std::memory_order_relaxed)) return;
     const uint64_t cur = g_vpj.load(std::memory_order_acquire);
+    if (!cur && !g_vpj_recordings.load(std::memory_order_acquire)) return;
     D3D12_VIEWPORT v[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
     UINT n = 0;
     {
@@ -3719,6 +3757,7 @@ void vpj_before_draw(GL* l)
         }
         if (want && !(ls->raster_viewports_known && ls->raster_viewport_count)) { g_vpj_unknown.fetch_add(1, std::memory_order_relaxed); want = false; }
         if (want) {
+            if (!ls->vpj_scene) g_vpj_recordings.fetch_add(1, std::memory_order_release);
             ls->vpj_scene = sample;
             ls->vpj_depth=sel_depth;
             g_vpj_draws.fetch_add(1, std::memory_order_relaxed);
@@ -5525,6 +5564,7 @@ bool ListDrawState(ID3D12CommandList* list, DrawInfo& out)
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load() || !ls->generation_known.load()) return false;
+    r.list = lid;
     r.recording = ls->generation.load() + 1;
     const bool complete = ls->coverage_complete.load();
     std::lock_guard<std::mutex> bl(ls->bind_m);
@@ -5556,6 +5596,7 @@ bool ListDrawState(ID3D12CommandList* list, DrawInfo& out)
             r.samples = p->sample_count; r.blend_mask = p->blend_enable_mask;
             r.native_hud_affine=pipeline->second.native_hud_affine;
             r.shader_readonly=pipeline->second.shader_readonly;
+            r.shader_rejection=pipeline->second.shader_rejection;
             r.pixel_position=pipeline->second.pixel_position;
             r.depth_enable = p->depth_enable; r.depth_func = p->depth_func;
         }
@@ -6338,10 +6379,12 @@ uint64_t ListSceneViewportJitter(ID3D12CommandList* list,uint64_t scene_depth)
     std::lock_guard<std::mutex> bl(ls->bind_m);
     return !scene_depth||scene_depth==ls->vpj_depth?ls->vpj_scene:0;
 }
+void SetHookProfiling(bool enabled){g_cost_enabled.store(enabled,std::memory_order_relaxed);}
 void FormatHookCost(char* out, size_t n)
 {
     if (!out || !n) return;
     out[0] = 0;
+    if(!g_cost_enabled.load(std::memory_order_relaxed)){std::snprintf(out,n,"hook_cost disabled");return;}
     cost_flush(); // this thread's share
     static uint64_t prev_ticks[kCostSlots]{}, prev_calls[kCostSlots]{}, prev_at = 0;
     static std::mutex m;

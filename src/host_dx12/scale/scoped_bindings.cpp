@@ -50,7 +50,7 @@ std::shared_ptr<const PreparedBindings> PreparedBindings::Create(ID3D12Device* d
 {
     error.clear();
     const auto fail = [&](const char* why) -> std::shared_ptr<const PreparedBindings> { error = why; return {}; };
-    if (!device || !spec.group || !spec.root || spec.views.size() > 4096 || spec.colors.size() > 8 ||
+    if (!device || (!spec.group&&(!spec.uses.empty()||!spec.colors.empty()||spec.depth.member)) || !spec.root || spec.views.size() > 4096 || spec.colors.size() > 8 ||
         spec.viewports.size() > 16 || spec.scissors.size() > 16) return fail("incomplete operation bindings");
     if (spec.compute && (!spec.colors.empty() || spec.depth.member || !spec.viewports.empty() || !spec.scissors.empty()))
         return fail("compute operation contains raster bindings");

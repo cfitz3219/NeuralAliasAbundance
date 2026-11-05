@@ -145,9 +145,10 @@ struct Device {
     void WaitIdle() { SignalAndWait(queue.Get(), fence.Get(), fence_value, event, device.Get(), "WaitIdle"); }
 };
 // Returns false when no D3D12 device (hardware or WARP) can be created.
+// NA_TEST_FORCE_WARP=1 reproduces software-runner failures on a hardware PC.
 inline bool CreateDevice(Device& d, bool allow_warp = true) {
     if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&d.factory)))) return false;
-    for (UINT i = 0;; ++i) {
+    for (UINT i = 0; !GetEnvironmentVariableW(L"NA_TEST_FORCE_WARP",nullptr,0); ++i) {
         ComPtr<IDXGIAdapter1> a;
         if (d.factory->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&a)) == DXGI_ERROR_NOT_FOUND) break;
         DXGI_ADAPTER_DESC1 desc{}; a->GetDesc1(&desc);

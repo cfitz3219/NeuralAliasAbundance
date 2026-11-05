@@ -96,10 +96,11 @@ struct Stats {
     uint64_t transfer_verified=0,transfer_changed=0,clean_verified=0,protection_verified=0;
     uint32_t last_draw_method=0; // completed GPU receipt: 1 native, 2 current-picture protection, 3 changed transfer
     uint64_t canvas_candidates=0,canvas_probes=0,canvas_verified=0,canvas_changed=0,canvas_no_state=0;
+    uint64_t canvas_source_snapshots=0,canvas_source_probes=0;
     uint64_t handoff_snapshot_missing=0,handoff_no_source=0,handoff_inferred=0;
     uint64_t native_recorded=0,native_submitted=0,native_verified=0,native_rejected=0;
     uint64_t native_allocated=0,native_reused=0;
-    uint64_t native_resource_changed=0;
+    uint64_t native_resource_changed=0,native_finishing_draws=0;
 };
 Stats GetStats();
 void ReportPictureResult(bool identity,bool clean); // completed GPU receipt, status only

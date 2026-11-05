@@ -206,6 +206,7 @@ void SetRasterStateListener(RasterStateListener listener);
 // recording is unknown. `restorable` = RestoreBindingState can hand back targets, viewports
 // and scissors (raster tracking was on at this recording's Reset).
 struct DrawInfo {
+    na_object_id list = 0; // object identity, independent of reused COM addresses/recording counts
     uint64_t recording = 0;
     na_object_id rt = 0, ds = 0;
     uint32_t rt_count = 0;
@@ -213,6 +214,7 @@ struct DrawInfo {
     bool native_hud_affine = false; // RT0 RGB representable by the black/grey HUD replay
     bool shader_readonly = false, query_active = false; // replay metadata, independent of table-prefix guesses
     bool pixel_position=false;
+    uint32_t shader_rejection=0;
     uint32_t pso_rt_count = 0, rtv_format = 0, dsv_format = 0, samples = 0;
     uint32_t blend_mask = NA_UNKNOWN_U32, depth_enable = NA_UNKNOWN_U32, depth_func = NA_UNKNOWN_U32;
     uint32_t viewport_count = 0, scissor_count = 0;
@@ -314,6 +316,7 @@ ViewportJitterStats GetViewportJitterStats();
 // Wall time inside each outermost command-list hook (ours + driver), ExecuteCommandLists
 // ("exec") and pipeline creation ("pso") since the previous call: one status line,
 // "hook_cost ... s<slot>{ms_per_s calls_per_s us}" (slot = ID3D12GraphicsCommandList vtable index).
+void SetHookProfiling(bool enabled); // opt-in diagnostic timers, off in normal play
 void FormatHookCost(char* out, size_t n);
 
 // Buffer GPU VA -> (resource id, offset). False when unknown or ambiguous.

@@ -4,6 +4,7 @@
 #include "host_dx12/observe/producers.hpp"
 #include <d3dcompiler.h>
 #include <cmath>
+#include <thread>
 void __cdecl sink(const na_event_batch*,void*){}
 int main(){
     test::Device d;if(!test::CreateDevice(d))return test::kSkip;auto* dev=d.device.Get();
@@ -39,8 +40,19 @@ float4 PS(V v):SV_Target{return float4(v.uv,0,1);})";
         const float jx=round?-.375f:.25f,jy=round?.125f:-.375f;
         l.list->SetGraphicsRootSignature(root.Get());l.list->SetPipelineState(scene.Get());l.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         l.list->OMSetRenderTargets(1,&rtv,FALSE,&dsv);D3D12_VIEWPORT vp{0,0,float(W),float(H),0,1};l.list->RSSetViewports(1,&vp);
-        D3D12_RECT sc{0,0,32,32};l.list->RSSetScissorRects(1,&sc);l.list->DrawInstanced(3,1,0,0);
-        na::observe::SetSceneViewportJitter(99,-.125f,.4375f); // another thread's later frame
+        D3D12_RECT sc{0,0,32,32};l.list->RSSetScissorRects(1,&sc);
+        if (!round) {
+            // An entirely inactive call can skip the jitter registry. A later
+            // recording thread must still pin a real sample, and turning the
+            // request off must not drop it from this unfinished recording.
+            na::observe::SetSceneViewportJitter(0,0,0);l.list->DrawInstanced(3,0,0,0);
+            na::observe::SetSceneViewportJitter(round+1,jx,jy);
+            std::thread recorder([&]{l.list->DrawInstanced(3,1,0,0);});recorder.join();
+            na::observe::SetSceneViewportJitter(0,0,0);
+        } else {
+            l.list->DrawInstanced(3,1,0,0);
+            na::observe::SetSceneViewportJitter(99,-.125f,.4375f); // another thread's later frame
+        }
         sc={32,0,64,32};l.list->RSSetScissorRects(1,&sc);l.list->DrawInstanced(3,1,0,0);
         sc={0,8,64,16};l.list->RSSetScissorRects(1,&sc);l.list->SetPipelineState(post.Get());l.list->DrawInstanced(3,1,0,0);
         uint32_t frame=0;float x=0,y=0;REQUIRE(na::observe::DecodeSceneViewportJitter(na::observe::ListSceneViewportJitter(l.list.Get()),&frame,&x,&y));

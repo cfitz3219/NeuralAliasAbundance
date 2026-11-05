@@ -18,8 +18,13 @@ na_host_test(ffx_flow_test SOURCES ffx_flow_test.cpp LIBS host_ffx_flow dxgi LAB
 na_host_test(jitter_probe_test SOURCES jitter_probe_test.cpp LIBS core_gpu dxgi LABELS gpu)
 na_host_test(viewport_jitter_test SOURCES viewport_jitter_test.cpp LIBS host_observe_producers dxgi d3dcompiler LABELS gpu)
 if(NA_HAVE_NGX_SDK)
-  # Opus's optional CPU recording benchmark; uses a fake model and real DX12.
-  # It is deliberately not a CTest or part of the default/CI build.
+  # Optional real-DX12 CPU command-tracking benchmark; no model evaluation.
+  # These benchmarks are not CTests or part of the default/CI build.
+  add_executable(observe_hotpath_bench EXCLUDE_FROM_ALL observe_hotpath_bench.cpp)
+  target_compile_features(observe_hotpath_bench PRIVATE cxx_std_20)
+  target_link_libraries(observe_hotpath_bench PRIVATE abundance_options host_dx12 d3dcompiler)
+  target_include_directories(observe_hotpath_bench PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+  # Opus's automatic-scene benchmark uses a fake model and real DX12.
   add_executable(auto_scene_bench EXCLUDE_FROM_ALL auto_scene_bench.cpp)
   target_link_libraries(auto_scene_bench PRIVATE abundance_options host_dx12)
   target_include_directories(auto_scene_bench PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -181,6 +186,29 @@ if(NA_HAVE_NGX_SDK)
   na_host_test(j2_nis_test SOURCES j2_nis_test.cpp LIBS host_dx12 dxgi)
   na_host_test(j2_hud_nis_test SOURCES j2_hud_nis_test.cpp LIBS host_dx12 dxgi)
   na_host_test(j2_native_hud_test SOURCES j2_native_hud_test.cpp LIBS host_dx12 dxgi d3dcompiler)
+  if(NA_DXC)
+    set(_hud_dxil_headers "")
+    foreach(_entry vs indexed ps copy altered uav heap)
+      set(_hud_extra "")
+      if(_entry STREQUAL "vs" OR _entry STREQUAL "indexed")
+        set(_profile vs_6_0)
+      elseif(_entry STREQUAL "heap")
+        set(_profile ps_6_6)
+        set(_hud_extra -DHUD_DIRECT_HEAP=1)
+      else()
+        set(_profile ps_6_0)
+      endif()
+      set(_header "${CMAKE_CURRENT_BINARY_DIR}/hud_dxil_${_entry}.h")
+      add_custom_command(OUTPUT "${_header}"
+        COMMAND "${NA_DXC}" -T ${_profile} -E ${_entry} ${_hud_extra} -Qstrip_reflect -Qstrip_debug
+          -Fh "${_header}" -Vn na_hud_dxil_${_entry} "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hud_dxil.hlsl"
+        DEPENDS fixtures/hud_dxil.hlsl VERBATIM)
+      list(APPEND _hud_dxil_headers "${_header}")
+    endforeach()
+    target_sources(j2_native_hud_test PRIVATE ${_hud_dxil_headers})
+    target_include_directories(j2_native_hud_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+    target_compile_definitions(j2_native_hud_test PRIVATE NA_HUD_DXIL_FIXTURE=1)
+  endif()
   na_host_test(j2_anno_shape_test SOURCES j2_anno_shape_test.cpp LIBS host_dx12 dxgi d3dcompiler)
   add_test(NAME host_j2_standalone_jitter_test COMMAND j2_anno_shape_test 1 1 --jitter-component)
   add_test(NAME host_j2_camera_view_alias_test COMMAND j2_anno_shape_test 1 1 --camera-alias)
