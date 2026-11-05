@@ -104,7 +104,15 @@ struct CapturedPicture {
     bool clean=false;uint32_t draws=0,forwarded=0;
     std::shared_ptr<NativeReplay> replay;
     ComPtr<ID3D12Resource> final;
+    ID3D12GraphicsCommandList* writer=nullptr;
+    uint64_t writer_id=0,recording=0,order=0;
+    na::nr::native::RecordingLease final_use;
+    bool published=false,needs_full=false;
 };
+// CPU recording is not submission order. A later recording must not erase the
+// immutable packet whose final write is about to execute/present.
+std::vector<std::shared_ptr<CapturedPicture>> g_pending_outputs;
+std::unordered_map<uint64_t,std::shared_ptr<CapturedPicture>> g_submitted_outputs;
 struct NativeReplay {
     ID3D12Device* device=nullptr; // native/check textures retain it
     ComPtr<ID3D12Resource> native;
@@ -118,6 +126,10 @@ struct NativeReplay {
     ComPtr<ID3D12CommandAllocator> alloc;
     ComPtr<ID3D12GraphicsCommandList> list;
     std::shared_ptr<Picture> picture;
+    bool ui_only=false;
+    uint64_t world_source=0;
+    std::shared_ptr<Picture> world_picture;
+    ComPtr<ID3D12Resource> world_native;
     struct Source {ID3D12GraphicsCommandList* list=nullptr;uint64_t recording=0,id=0;};
     std::shared_ptr<na::capture::j2::Identity> identity=std::make_shared<na::capture::j2::Identity>();
     std::vector<Source> sources;
@@ -226,6 +238,18 @@ Proxy* find_locked(na_object_id id)
     for (auto& p : g_proxy)
         if (p.id == id) return &p;
     return nullptr;
+}
+Proxy* observe_canvas_locked(Canvas& c){
+    if(auto* p=find_locked(c.id))return p;
+    Proxy* slot=nullptr;
+    for(auto& p:g_proxy)if(!p.id){slot=&p;break;}
+    if(!slot)for(auto& p:g_proxy)if(!p.upstream&&p.used+8<g_frame&&(!slot||p.used<slot->used))slot=&p;
+    if(!slot)for(auto& p:g_proxy)if(p.upstream&&!p.picture&&!p.replay&&!p.hud&&p.used+2<g_frame&&(!slot||p.used<slot->used))slot=&p;
+    if(!slot)return nullptr;
+    if(slot->upstream)++g_stats.upstream_dropped;
+    *slot={};slot->id=c.id;slot->rw=c.rw;slot->rh=c.rh;slot->ow=c.ow;slot->oh=c.oh;slot->format=c.format;
+    slot->upstream=slot->preserve=true;slot->used=g_frame;++g_stats.upstream_learned;
+    return slot; // observational: original game draw is always forwarded
 }
 
 bool is_srgb(DXGI_FORMAT f) { return f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB; }
@@ -406,8 +430,8 @@ bool dims(na_object_id id, uint32_t* w, uint32_t* h, DXGI_FORMAT* f)
     *w = static_cast<uint32_t>(d.Width); *h = d.Height; *f = d.Format;
     return true;
 }
-bool track_reads(NativeReplay& r,ID3D12GraphicsCommandList* game,const std::vector<uint64_t>& reads,uint64_t replaced=0){
-    for(const auto id:reads){if(id==replaced)continue;
+bool track_reads(NativeReplay& r,ID3D12GraphicsCommandList* game,const std::vector<uint64_t>& reads,uint64_t replaced=0,uint64_t replaced_world=0){
+    for(const auto id:reads){if(id==replaced||id==replaced_world)continue;
         const auto old=std::find_if(r.reads.begin(),r.reads.end(),[&](const auto& value){return value.id==id;});
         UINT subs=0;
         if(old!=r.reads.end()){for(const auto& value:r.reads)if(value.id==id)++subs;}
@@ -456,6 +480,7 @@ void record_native_hud_locked(Proxy& p,ID3D12GraphicsCommandList* game,
             r=std::make_shared<NativeReplay>();r->device=device.Get();r->rw=p.rw;r->rh=p.rh;r->ow=p.ow;r->oh=p.oh;
         }
         r->identity->evaluation_succeeded=false;
+        r->ui_only=p.scene==0;r->world_source=0;
         r->view=static_cast<DXGI_FORMAT>(state.rtv_format);
         D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;
         auto desc=source->GetDesc();desc.Width=p.ow;desc.Height=p.oh;desc.Format=clear_view_of(TypelessOf(p.format));
@@ -521,6 +546,35 @@ bool record_finishing_draw(NativeReplay& r,ID3D12GraphicsCommandList* game,uint6
            d.view.srv.Texture2D.MostDetailedMip||d.view.srv.Texture2D.MipLevels!=1)return false;found=true;
     }
     if(!found||op.colors.size()!=1)return false;
+    if(r.ui_only){
+        // The transparent UI image is not the world image. Find the actual
+        // separately sampled HDR scene in this same compositor and snapshot
+        // it at consumption, before the game can reuse it.
+        const na::observe::OperationDescriptor* world=nullptr;
+        for(const auto& d:op.descriptors)if(d.used&&d.view.kind==NA_DESC_SRV&&d.view.resource!=source&&d.resource){
+            const auto desc=d.resource->GetDesc();
+            const auto f=d.view.explicit_view?d.view.srv.Format:desc.Format;
+            if(d.view.explicit_view&&(d.view.srv.ViewDimension!=D3D12_SRV_DIMENSION_TEXTURE2D||d.view.srv.Texture2D.MostDetailedMip||
+               d.view.srv.Texture2D.PlaneSlice||d.view.srv.Texture2D.ResourceMinLODClamp||
+               d.view.srv.Shader4ComponentMapping!=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING))continue;
+            if(desc.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||desc.Width!=r.rw||desc.Height!=r.rh||desc.DepthOrArraySize!=1||desc.SampleDesc.Count!=1||
+               (f!=DXGI_FORMAT_R16G16B16A16_FLOAT&&f!=DXGI_FORMAT_R32G32B32A32_FLOAT&&f!=DXGI_FORMAT_R11G11B10_FLOAT))continue;
+            if(world&&world->view.resource!=d.view.resource){r.complete=false;return false;}world=&d;
+        }
+        uint32_t world_state=0;
+        if(!world||na::observe::ListStateSub(game,world->view.resource,0,&world_state)!=na::observe::StateLookup::Known){r.complete=false;return false;}
+        const auto desc=world->resource->GetDesc();
+        if(!r.world_picture||!r.world_picture->Matches(r.device,desc,r.ow,r.oh))r.world_picture=picture_locked(r.device,desc,r.ow,r.oh);
+        else r.world_picture->BeginCycle();
+        if(!r.world_picture||!r.world_picture->SnapshotScene(game,world->resource.Get(),static_cast<D3D12_RESOURCE_STATES>(world_state))){r.complete=false;return false;}
+        r.world_source=world->view.resource;
+        if(!r.world_native){
+            D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;auto native_desc=desc;
+            native_desc.Width=r.ow;native_desc.Height=r.oh;native_desc.MipLevels=1;native_desc.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;
+            native_desc.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            if(FAILED(r.device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&native_desc,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&r.world_native)))){r.complete=false;return false;}
+        }
+    }
     auto target_view=op.colors[0].view.rtv;
     if(!op.colors[0].view.explicit_view){target_view.Format=static_cast<DXGI_FORMAT>(state.rtv_format);target_view.ViewDimension=D3D12_RTV_DIMENSION_TEXTURE2D;}
     if(target_view.ViewDimension!=D3D12_RTV_DIMENSION_TEXTURE2D)return false;
@@ -545,10 +599,14 @@ bool record_finishing_draw(NativeReplay& r,ID3D12GraphicsCommandList* game,uint6
         for(const auto& d:op.descriptors){na::scale::ShaderView v;
             if(!d.used){v.srv.Format=DXGI_FORMAT_R8_UNORM;v.srv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
                 v.srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;v.srv.Texture2D.MipLevels=1;}
-            else {v.resource=d.view.resource==source?(pass?r.check:r.native):d.resource;v.counter=d.counter;v.default_view=!d.view.explicit_view;
+            else {const bool world=r.world_source&&d.view.resource==r.world_source;
+                v.resource=d.view.resource==source?(pass?r.check.Get():r.native.Get()):world?(pass?r.world_picture->Scene():r.world_native.Get()):d.resource.Get();v.counter=d.counter;v.default_view=!d.view.explicit_view;
                 if(d.view.kind==NA_DESC_SRV)v.srv=d.view.srv;
                 else if(d.view.kind==NA_DESC_CBV){v.kind=na::scale::ShaderView::Kind::NativeCbv;v.cbv=d.view.cbv;}
-                else return false;}
+                else return false;
+                if(world){v.default_view=false;v.srv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;v.srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                    v.srv.Format=pass?r.world_picture->Scene()->GetDesc().Format:DXGI_FORMAT_R16G16B16A16_FLOAT;
+                    v.srv.Texture2D={0,1,0,0};}}
             spec.views.push_back(std::move(v));
         }
         if(!pass)for(const auto& c:op.constants)if(!c.dimensions.empty()){
@@ -580,7 +638,12 @@ bool record_finishing_draw(NativeReplay& r,ID3D12GraphicsCommandList* game,uint6
         }
         plans[pass]=na::scale::PreparedBindings::Create(r.device,std::move(spec),error);if(!plans[pass])return false;
     }
-    std::vector<uint64_t> reads;if(!na::observe::RestoreListState(game,r.list.Get(),true,&reads)||!track_reads(r,game,reads,source))return false;
+    std::vector<uint64_t> reads;if(!na::observe::RestoreListState(game,r.list.Get(),true,&reads)||!track_reads(r,game,reads,source,r.world_source))return false;
+    if(r.world_source){D3D12_RESOURCE_BARRIER world_barriers[2]{};
+        for(auto& barrier:world_barriers)barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        world_barriers[0].Transition={r.world_native.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
+        world_barriers[1].Transition={r.world_picture->Scene(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
+        r.list->ResourceBarrier(2,world_barriers);}
     D3D12_RESOURCE_BARRIER barriers[4]{};ID3D12Resource* resources[]={r.native.Get(),r.check.Get(),r.tail_native.Get(),r.tail_check.Get()};
     for(UINT i=0;i<4;++i){barriers[i].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         barriers[i].Transition={resources[i],D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
@@ -607,7 +670,13 @@ bool record_finishing_draw(NativeReplay& r,ID3D12GraphicsCommandList* game,uint6
     }
     for(UINT i=0;i<4;++i){barriers[i].Transition.StateBefore=i<2?D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE:D3D12_RESOURCE_STATE_RENDER_TARGET;
         barriers[i].Transition.StateAfter=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;}
-    r.list->ResourceBarrier(4,barriers);r.tail_bindings[0]=plans[0];r.tail_bindings[1]=plans[1];r.tail=true;return true;
+    r.list->ResourceBarrier(4,barriers);
+    if(r.world_source){D3D12_RESOURCE_BARRIER world_barriers[2]{};
+        for(auto& barrier:world_barriers)barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        world_barriers[0].Transition={r.world_native.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+        world_barriers[1].Transition={r.world_picture->Scene(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+        r.list->ResourceBarrier(2,world_barriers);}
+    r.tail_bindings[0]=plans[0];r.tail_bindings[1]=plans[1];r.tail=true;return true;
 }
 void probe_canvas_locked(Proxy& output,ID3D12GraphicsCommandList* list)
 {
@@ -646,7 +715,19 @@ void note_source_locked(Proxy& p, ID3D12GraphicsCommandList* list,const na::obse
     na::observe::NativeOperation op;
     uint64_t one = 0;
     const bool snapshot=na::observe::ListNativeOperation(list,false,op);
-    const bool identified=snapshot&&PictureSource(op,p.id,p.rw,p.rh,one)&&one;
+    bool identified=snapshot&&PictureSource(op,p.id,p.rw,p.rh,one)&&one;
+    if(!identified&&snapshot&&op.reflection_complete){
+        // A compositor may read BOTH the world and a separate UI canvas. The
+        // UI texture can never equal the finished scene; follow its actual
+        // dependency and redraw its glyphs before applying this compositor.
+        Canvas* ui=nullptr;
+        for(const auto& d:op.descriptors)if(d.used&&d.view.kind==NA_DESC_SRV&&d.view.resource!=p.id){
+            auto c=std::find_if(g_canvases.begin(),g_canvases.end(),[&](const auto& x){return x.id==d.view.resource;});
+            if(c!=g_canvases.end()&&c->blended&&c->rw==p.rw&&c->rh==p.rh&&
+               (!ui||c->blended>ui->blended))ui=&*c;
+        }
+        if(ui&&observe_canvas_locked(*ui)){one=ui->id;identified=true;}
+    }
     // This opaque full-target write replaces earlier output contents. A failed
     // earlier draw must not permanently poison a later valid handoff.
     p.source=identified?one:0;p.source_ambiguous=!identified;p.source_copy=false;p.output.reset();p.probe.reset();
@@ -677,34 +758,43 @@ void note_source_locked(Proxy& p, ID3D12GraphicsCommandList* list,const na::obse
             u->full_snapshot->write==canvas->last_write;
         const bool full=source_owned||(source&&known==na::observe::StateLookup::Known&&u->picture&&
             u->picture->SnapshotFull(list,source.Get(),static_cast<D3D12_RESOURCE_STATES>(state)));
-        if (source&&lease&&full&&g_layer_owner) {
+        const bool native_candidate=u->replay&&u->replay->complete&&u->replay->draws&&call;
+        if (source&&lease&&(full||native_candidate)&&g_layer_owner) {
             auto capture=std::make_shared<CapturedPicture>();capture->picture=u->picture;capture->owner=g_layer_owner;
             capture->uses=u->picture_uses;capture->uses.push_back(lease);if(source_owned)capture->uses.push_back(u->full_snapshot->use);capture->view=u->view;
-            capture->clean=u->clean&&u->forwarded==0;capture->draws=u->redirected;capture->forwarded=u->forwarded;
+            capture->final.Attach(na::observe::AcquireResource(p.id));capture->writer=list;
+            capture->writer_id=na::observe::IdOf(list);capture->recording=na::observe::ListRecording(list);
+            capture->order=++g_draw_order;capture->final_use=lease;
+            capture->clean=full&&u->clean&&u->forwarded==0;capture->draws=u->redirected;capture->forwarded=u->forwarded;capture->needs_full=!full;
             if(auto replay=u->replay;replay&&replay->complete&&replay->draws&&!replay->closed&&!replay->restart){
                 auto retained=na::nr::native::RetainRecording(list,replay);
-                if(retained&&(source_owned||(known==na::observe::StateLookup::Known&&replay->picture->SnapshotFull(list,source.Get(),static_cast<D3D12_RESOURCE_STATES>(state))))){
+                if(retained){
                     if(source_owned)replay->uses.push_back(u->full_snapshot->use);
                     const bool tail=call&&(call->args[0]==3||call->args[0]==6)&&call->args[1]==1&&
                         record_finishing_draw(*replay,list,u->id,*call);
+                    const bool native_full=tail||source_owned||(known==na::observe::StateLookup::Known&&replay->picture->SnapshotFull(list,source.Get(),static_cast<D3D12_RESOURCE_STATES>(state)));
                     if(!tail){
                     D3D12_RESOURCE_BARRIER end{};end.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
                     end.Transition={replay->native.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
                     replay->list->ResourceBarrier(1,&end);
                     end.Transition.pResource=replay->check.Get();replay->list->ResourceBarrier(1,&end);
                     }
-                    if(SUCCEEDED(replay->list->Close())){
+                    if(native_full&&replay->complete&&SUCCEEDED(replay->list->Close())){
                         replay->closed=true;replay->uses.push_back(retained);
                         const auto recording=na::observe::ListRecording(list);
                         if(std::none_of(replay->sources.begin(),replay->sources.end(),[&](const auto& s){return s.list==list&&s.recording==recording;}))
                             replay->sources.push_back({list,recording,na::observe::IdOf(list)});
-                        capture->replay=replay;capture->final.Attach(na::observe::AcquireResource(p.id));
+                        capture->replay=replay;
                         ++g_stats.native_recorded;
                     }
                 }
             }
             capture->owner->layers=std::move(g_l);g_layer_owner.reset();g_layers_cleared=false;
-            p.output=std::move(capture);
+            if(full||capture->replay)p.output=std::move(capture);
+            g_pending_outputs.erase(std::remove_if(g_pending_outputs.begin(),g_pending_outputs.end(),[](const auto& q){
+                return q->published||q->final_use.Retired();
+            }),g_pending_outputs.end());
+            if(p.output)g_pending_outputs.push_back(p.output);
             // End the source occurrence at the handoff, not at a later CPU
             // Present. Render-ahead can already record the NEXT scene/HUD by
             // the time this back buffer is presented.
@@ -1074,7 +1164,9 @@ public:
         uint32_t state=0;
         if(na::observe::ListStateSub(l,best->id,0,&state)!=na::observe::StateLookup::Known)return;
         if(best->snapshot&&best->snapshot->write==best->last_write)return;
-        g_probe_pool.erase(std::remove_if(g_probe_pool.begin(),g_probe_pool.end(),[](const auto& p){return p.use_count()==1&&p->use.Retired();}),g_probe_pool.end());
+        // Other immutable owners can retain a retired snapshot. They do not
+        // consume a live recording slot, nor permit its Picture to be reused.
+        g_probe_pool.erase(std::remove_if(g_probe_pool.begin(),g_probe_pool.end(),[](const auto& p){return p->use.Retired();}),g_probe_pool.end());
         if(g_probe_pool.size()>=8)return;
         ComPtr<ID3D12Resource> source;source.Attach(na::observe::AcquireResource(best->id));
         ComPtr<ID3D12Device> device;if(!source||FAILED(source->GetDevice(IID_PPV_ARGS(&device))))return;
@@ -1104,6 +1196,8 @@ public:
         if(!output||!output->output||!output->output->replay)return;
         auto& r=*output->output->replay;if(!r.tail||r.tail_snapshot)return;
         r.tail_snapshot=r.picture->SnapshotFull(l,output->output->final.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET);
+        if(r.tail_snapshot&&output->output->needs_full)
+            r.tail_snapshot=output->output->picture->SnapshotFull(l,output->output->final.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET);
         if(r.tail_snapshot)++g_stats.native_finishing_draws;
     }
 };
@@ -1300,6 +1394,7 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
     struct FinishLayers {~FinishLayers(){if(g_layer_owner&&std::none_of(std::begin(g_proxy),std::end(g_proxy),[](const auto& p){return p.preserve&&p.picture;})){
         g_layer_owner->layers=std::move(g_l);g_layer_owner.reset();g_layers_cleared=false;
     }}} finish_layers;
+    g_stats.last_present_native=0;
     ++g_frame;
     if (g_tracing.load(std::memory_order_relaxed)) { // the traced frame is complete
         g_tracing.store(false);
@@ -1343,27 +1438,35 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
     if(auto probe=std::move(p->probe);probe&&out&&g_on.load()&&queue&&probe->use.Ready(queue)){
         out->probe=probe->picture;out->probe_owner=probe;out->probe_source=probe->source;out->probe_generation=probe->generation;
     }
-    if(p->output){
-        auto capture=std::move(p->output);auto& layers=capture->owner->layers;
+    auto executed=g_submitted_outputs.find(id);
+    auto completed=executed==g_submitted_outputs.end()?std::shared_ptr<CapturedPicture>{}:std::move(executed->second);
+    if(executed!=g_submitted_outputs.end())g_submitted_outputs.erase(executed);
+    if(completed||p->output){
+        auto capture=completed?std::move(completed):std::move(p->output);auto& layers=capture->owner->layers;
+        const bool same_recording=p->output==capture||!p->output;
+        if(p->output==capture)p->output.reset();
         const auto ready_use=[&](const auto& use){return use.Ready(queue);};
         const bool ready=g_on.load()&&queue&&layers.n[0]&&layers.n[1]&&layers.w==ow&&layers.h==oh&&
             std::all_of(capture->uses.begin(),capture->uses.end(),ready_use)&&std::all_of(capture->owner->uses.begin(),capture->owner->uses.end(),ready_use);
         if(ready&&out){
+            g_stats.last_present_native=capture->clean?1u:0u;
             out->n0=layers.n[0].Get();out->n1=layers.n[1].Get();out->view=capture->view;
             out->grey=GreyFor(capture->view);out->srgb=is_srgb(capture->view);out->owner=capture->owner;
             out->picture=capture->picture;out->clean_allowed=capture->clean;
             ++g_stats.hud_frames;++g_stats.upstream_frames;
             if(capture->clean)++g_stats.draw_transfer_frames;else++g_stats.draw_protect_frames;
             if(capture->replay&&capture->replay->submitted&&capture->replay->queue.Get()==queue){
+                g_stats.last_present_native=1;
                 out->picture=capture->replay->picture;out->native_picture=capture->replay->tail?capture->replay->tail_native.Get():capture->replay->native.Get();
                 out->native_check=capture->replay->tail?capture->replay->tail_check.Get():capture->replay->check.Get();out->native_owner=capture;out->owner=capture;
+                if(capture->replay->world_source)out->reconstruction=capture->replay->world_picture;
                 out->recording_identity=capture->replay->identity;
             }
         }
         ++g_stats.frames;g_stats.upstream_now=1;g_stats.last_source=1;
         g_stats.last_redirected=capture->draws;g_stats.last_forwarded=capture->forwarded;
         g_stats.proxy_format=p->format;g_stats.view_format=capture->view;g_stats.grey=GreyFor(capture->view);
-        p->source=0;p->source_ambiguous=p->source_copy=false;p->hud=p->cleared=false;p->scene=p->redirected=p->forwarded=0;
+        if(same_recording){p->source=0;p->source_ambiguous=p->source_copy=false;p->hud=p->cleared=false;p->scene=p->redirected=p->forwarded=0;}
         return ready;
     }
     // H1b: the upstream picture for this output (handled like the back buffer), and learning.
@@ -1453,6 +1556,7 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
         u->depth_draws = u->blended = u->covered = u->world = u->masks = 0;
     }
     if (hud && out) {
+        if(!observational)g_stats.last_present_native=1;
         out->n0 = g_l.n[0].Get();
         out->n1 = g_l.n[1].Get();
         out->view = p->view;
@@ -1495,9 +1599,10 @@ Stats GetStats()
     std::lock_guard<std::mutex> lock(g_m);
     return g_stats;
 }
-void ReportPictureResult(bool identity,bool clean)
+void ReportPictureResult(bool identity,bool clean,uint32_t tested,uint32_t matched,float error)
 {
     std::lock_guard<std::mutex> lock(g_m);
+    if(tested){g_stats.proof_tested=tested;g_stats.proof_matched=matched;g_stats.proof_maximum_error=error;}
     if(!identity)++g_stats.transfer_changed;
     else {++g_stats.transfer_verified;if(clean)++g_stats.clean_verified;else++g_stats.protection_verified;}
     g_stats.last_draw_method=!identity?3u:clean?1u:2u;
@@ -1509,32 +1614,45 @@ void AfterSubmission(ID3D12CommandQueue* queue,uint32_t count,ID3D12CommandList*
     std::vector<std::shared_ptr<CapturedPicture>> ready;
     {
         std::lock_guard<std::mutex> lock(g_m);
-        for(const auto& p:g_proxy)if(auto capture=p.output;capture&&capture->replay&&capture->final){
-            auto& r=*capture->replay;if(!r.complete||!r.closed||r.attempted||(r.tail&&!r.tail_snapshot))continue;
-            const bool all=std::all_of(r.sources.begin(),r.sources.end(),[&](const auto& source){
-                for(UINT i=0;i<count;++i)if(lists[i]==source.list&&na::observe::IdOf(lists[i])==source.id&&na::observe::ListRecording(lists[i])==source.recording)return true;
-                return false;
-            });
-            if(!all||!std::all_of(r.uses.begin(),r.uses.end(),[&](const auto& use){return use.Ready(queue);}))continue;
+        // Publish only on actual queue submission. All earlier source leases
+        // may be ready from separate Execute calls on this queue.
+        std::stable_sort(g_pending_outputs.begin(),g_pending_outputs.end(),[&](const auto& a,const auto& b){
+            const auto rank=[&](const auto& c){UINT rank=0;for(UINT i=0;i<count;++i)
+                if(lists[i]==c->writer&&na::observe::IdOf(lists[i])==c->writer_id&&na::observe::ListRecording(lists[i])==c->recording)rank=i+1;return rank;};
+            const auto ar=rank(a),br=rank(b);return ar!=br?ar<br:a->order<b->order;
+        });
+        for(const auto& capture:g_pending_outputs)if(capture&&!capture->published&&capture->final){
+            if(!capture->final_use.Ready(queue)||!std::all_of(capture->uses.begin(),capture->uses.end(),[&](const auto& use){return use.Ready(queue);}))continue;
+            const auto final_id=na::observe::IdOf(capture->final.Get());
             uint32_t final_state=UINT_MAX;
             for(UINT i=0;i<count;++i){uint32_t state=0;
-                if(na::observe::ListStateSub(lists[i],p.id,0,&state)==na::observe::StateLookup::Known)final_state=state;
+                if(na::observe::ListStateSub(lists[i],final_id,0,&state)==na::observe::StateLookup::Known)final_state=state;
             }
             if(final_state!=D3D12_RESOURCE_STATE_PRESENT)continue;
+            capture->published=true;g_submitted_outputs[final_id]=capture;
+            if(!capture->replay)continue;
+            auto& r=*capture->replay;if(!r.complete||!r.closed||r.attempted||(r.tail&&!r.tail_snapshot))continue;
+            if(!std::all_of(r.uses.begin(),r.uses.end(),[&](const auto& use){return use.Ready(queue);}))continue;
             // The application fence remains behind this callback (the existing
             // producer queue lock also serialises Signal/Wait). Bindings must
             // additionally remain readable at this delayed replay point.
             bool readable=!r.restart;
             for(const auto& read:r.reads){auto lookup=read.lookup;uint32_t state=read.state;
+                uint32_t carried=0;if(na::observe::KnownSubStateOnQueueNow(queue,read.id,read.sub,&carried)){
+                    lookup=na::observe::StateLookup::Known;state=carried;
+                }
                 for(UINT i=0;i<count;++i){uint32_t next=0;const auto found=na::observe::ListStateSub(lists[i],read.id,read.sub,&next);
                     if(found!=na::observe::StateLookup::Absent){lookup=found;state=next;}}
                 constexpr UINT writes=D3D12_RESOURCE_STATE_RENDER_TARGET|D3D12_RESOURCE_STATE_UNORDERED_ACCESS|D3D12_RESOURCE_STATE_DEPTH_WRITE|
                     D3D12_RESOURCE_STATE_COPY_DEST|D3D12_RESOURCE_STATE_RESOLVE_DEST|D3D12_RESOURCE_STATE_STREAM_OUT;
-                if(lookup!=read.lookup||(lookup==na::observe::StateLookup::Known&&(state!=read.state||(state&writes)))){readable=false;break;}
+                if(lookup==na::observe::StateLookup::Unavailable||
+                   (lookup==na::observe::StateLookup::Known&&((state&writes)||
+                    (read.lookup==na::observe::StateLookup::Known&&(state&read.state)!=read.state)))){readable=false;break;}
             }
             if(!readable){r.attempted=true;++g_stats.native_resource_changed;continue;}
             r.attempted=true;ready.push_back(std::move(capture));
         }
+        g_pending_outputs.erase(std::remove_if(g_pending_outputs.begin(),g_pending_outputs.end(),[](const auto& q){return q->published;}),g_pending_outputs.end());
     }
     // The original batch still owns its resources; no application fence can
     // be inserted between the original Execute and this callback's return.
@@ -1544,20 +1662,24 @@ void AfterSubmission(ID3D12CommandQueue* queue,uint32_t count,ID3D12CommandList*
         Layer layer;layer.n0=bg.n[0].Get();layer.n1=bg.n[1].Get();layer.view=capture->view;
         layer.grey=GreyFor(capture->view);layer.srgb=is_srgb(capture->view);layer.owner=capture;
         layer.picture=r->picture;layer.clean_allowed=true;
+        if(r->world_source){layer.reconstruction=r->world_picture;layer.ui_output=r->native.Get();layer.ui_view=r->view;}
         layer.recording_identity=r->identity;
         auto render=g_test_renderer.load();if(!render)render=&na::j2::PreHudUpscale;
-        const bool submitted=render(queue,capture->final.Get(),r->rw,r->rh,r->native.Get(),r->ow,r->oh,layer,r->list.Get());
+        const bool submitted=render(queue,capture->final.Get(),r->rw,r->rh,r->world_source?r->world_native.Get():r->native.Get(),r->ow,r->oh,layer,r->list.Get());
         std::lock_guard<std::mutex> lock(g_m);r->submitted=submitted;if(submitted){r->queue=queue;++g_stats.native_submitted;}
     }
 }
-void ReportNativePictureResult(bool identity){
+void ReportNativePictureResult(bool identity,uint32_t tested,uint32_t matched,float error){
     std::lock_guard<std::mutex> lock(g_m);
-    if(identity)++g_stats.native_verified;else++g_stats.native_rejected;
-    g_stats.last_draw_method=identity?4u:5u;
+    if(tested){g_stats.proof_tested=tested;g_stats.proof_matched=matched;g_stats.proof_maximum_error=error;}
+    const bool partial=!identity&&tested&&matched;
+    if(identity)++g_stats.native_verified;else if(partial)++g_stats.native_partial;else++g_stats.native_rejected;
+    g_stats.last_draw_method=identity?4u:partial?6u:5u;
 }
-void ReportCanvasProbe(uint64_t source,uint64_t generation,bool identity)
+void ReportCanvasProbe(uint64_t source,uint64_t generation,bool identity,uint32_t tested,uint32_t matched,float error)
 {
     std::lock_guard<std::mutex> lock(g_m);
+    if(tested){g_stats.proof_tested=tested;g_stats.proof_matched=matched;g_stats.proof_maximum_error=error;}
     auto c=std::find_if(g_canvases.begin(),g_canvases.end(),[&](const auto& q){return q.id==source&&q.generation==generation;});
     if(c==g_canvases.end())return;
     if(!identity){++g_stats.canvas_changed;c->proofs=0;return;}
@@ -1606,6 +1728,9 @@ std::string StatusLine()
         (unsigned long long)s.native_recorded,(unsigned long long)s.native_submitted,
         (unsigned long long)s.native_verified,(unsigned long long)s.native_rejected,
         (unsigned long long)s.native_allocated,(unsigned long long)s.native_reused,(unsigned long long)s.native_resource_changed);
+    result+=b;
+    std::snprintf(b,sizeof b," agreement{matched=%llu tested=%llu max_error=%.6f native_partial=%llu}",
+        (unsigned long long)s.proof_matched,(unsigned long long)s.proof_tested,double(s.proof_maximum_error),(unsigned long long)s.native_partial);
     result+=b;
     std::snprintf(b,sizeof b," source_probe{snapshots=%llu consumed=%llu finishing=%llu}",(unsigned long long)s.canvas_source_snapshots,(unsigned long long)s.canvas_source_probes,(unsigned long long)s.native_finishing_draws);result+=b;
     const auto shaders=na::observe::GetShaderInspectionStats();

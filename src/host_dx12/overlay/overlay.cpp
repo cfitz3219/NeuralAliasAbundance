@@ -18,6 +18,7 @@
 #include "host_dx12/overlay/present_queues.hpp"
 #include "host_dx12/overlay/boundary_fallback.hpp"
 #include "host_dx12/overlay/submission_tracking.hpp"
+#include "host_dx12/overlay/usage_sampler.hpp"
 
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -782,6 +783,8 @@ void write_status_line()
     char mode_line[1536]{};
     const int mode_bytes=na::mode::FormatStatus(mode_line,sizeof(mode_line));
     if(mode_bytes>0){WriteFile(f,mode_line,DWORD((std::min)(mode_bytes,int(sizeof(mode_line)-1))),&written,nullptr);WriteFile(f,"\r\n",2,&written,nullptr);}
+    {char usage_line[512];const int usage_bytes=na::usage::FormatLine(usage_line,sizeof(usage_line));
+     if(usage_bytes>0)WriteFile(f,usage_line,DWORD((std::min)(usage_bytes,int(sizeof(usage_line)-1))),&written,nullptr);}
     {
         char source_line[256];
         const int source_bytes=snprintf(source_line,sizeof(source_line),"overlay_source=%s native_presents=%llu presents=%llu pid=%lu queue_hits=%u buffer_queue=%u queue_misses=%u\r\n",

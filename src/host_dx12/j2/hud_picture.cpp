@@ -26,9 +26,9 @@ bool texture(ID3D12Device* dev,UINT w,UINT h,DXGI_FORMAT f,bool uav,D3D12_RESOUR
  d.SampleDesc.Count=1;d.Format=f;if(uav)d.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
  return SUCCEEDED(dev->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&d,state,nullptr,IID_PPV_ARGS(&out)));
 }
-bool buffer(ID3D12Device* dev,D3D12_HEAP_TYPE type,D3D12_RESOURCE_STATES state,ComPtr<ID3D12Resource>& out){
+bool buffer(ID3D12Device* dev,D3D12_HEAP_TYPE type,D3D12_RESOURCE_STATES state,ComPtr<ID3D12Resource>& out,UINT64 bytes=16){
  D3D12_HEAP_PROPERTIES hp{};hp.Type=type;D3D12_RESOURCE_DESC d{};d.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;
- d.Width=16;d.Height=d.DepthOrArraySize=d.MipLevels=1;d.SampleDesc.Count=1;d.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+ d.Width=bytes;d.Height=d.DepthOrArraySize=d.MipLevels=1;d.SampleDesc.Count=1;d.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
  if(type==D3D12_HEAP_TYPE_DEFAULT)d.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
  return SUCCEEDED(dev->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&d,state,nullptr,IID_PPV_ARGS(&out)));
 }
@@ -44,19 +44,33 @@ cbuffer K:register(b0){uint w,h,ow,oh,flags;float grey,tolerance;uint pad;};
 float coverage(float3 a,float3 b){float3 d=abs(1-b);return saturate(max(max(d.r,max(d.g,d.b)),max(abs(a.r),max(abs(a.g),abs(a.b)))*8));}
 float3 to_linear(float3 c){return c<=.04045?c/12.92:pow((c+.055)/1.055,2.4);}
 float3 to_srgb(float3 c){c=saturate(c);return c<=.0031308?c*12.92:1.055*pow(c,1/2.4)-.055;}
-groupshared uint mismatch;
+// The existing proof allocation also owns a pixel-local agreement map. A
+// cursor/late overlay can retain its original pixels without disabling native
+// HUD everywhere else. No new image pass or relaxed colour tolerance.
+bool agrees(uint2 p){return proof.Load(16+4*(p.y*w+p.x))==0;}
+bool agrees_at(float2 uv){
+ int2 q=int2(floor(uv*float2(w,h)-.5));
+ [unroll]for(int y=0;y<2;++y)[unroll]for(int x=0;x<2;++x)
+  if(!agrees(uint2(clamp(q+int2(x,y),int2(0,0),int2(w-1,h-1)))))return false;
+ return true;
+}
+groupshared uint mismatch,matched,error_bits;
 [numthreads(8,8,1)]void verify(uint3 id:SV_DispatchThreadID,uint gi:SV_GroupIndex){
- if(gi==0)mismatch=0;GroupMemoryBarrierWithGroupSync();
+ if(gi==0){mismatch=0;matched=0;error_bits=0;}GroupMemoryBarrierWithGroupSync();
  if(id.x<w&&id.y<h){float3 a=frame[id.xy].rgb,b=full[id.xy].rgb;
-  if(any(!isfinite(a))||any(!isfinite(b))||any(abs(a-b)>tolerance*max(1,max(abs(a),abs(b)))))InterlockedOr(mismatch,1);
+  bool bad=any(!isfinite(a))||any(!isfinite(b))||any(abs(a-b)>tolerance*max(1,max(abs(a),abs(b))));
+  float error=max(abs(a.r-b.r),max(abs(a.g-b.g),abs(a.b-b.b)));
   if(flags&8u){float4 c=n1[id.xy],d=full[id.xy];
    if(any(!isfinite(c))||any(!isfinite(d))||any(abs(c-d)>tolerance*max(1,max(abs(c),abs(d))))||
-      abs(frame[id.xy].a-d.a)>tolerance*max(1,max(abs(frame[id.xy].a),abs(d.a))))InterlockedOr(mismatch,2);}}
- GroupMemoryBarrierWithGroupSync();if(gi==0&&mismatch)proof.InterlockedOr(0,1);
+      abs(frame[id.xy].a-d.a)>tolerance*max(1,max(abs(frame[id.xy].a),abs(d.a))))bad=true;}
+  proof.Store(16+4*(id.y*w+id.x),bad?1u:0u);
+  if(bad)InterlockedOr(mismatch,1);else InterlockedAdd(matched,1);
+  if(isfinite(error))InterlockedMax(error_bits,asuint(error));}
+ GroupMemoryBarrierWithGroupSync();if(gi==0){if(mismatch)proof.InterlockedOr(0,1);proof.InterlockedAdd(4,matched);proof.InterlockedMax(8,error_bits);}
 }
 [numthreads(8,8,1)]void prepare(uint3 id:SV_DispatchThreadID){
  if(id.x>=w||id.y>=h)return;
- bool transfer=proof.Load(0)==0;
+ bool transfer=agrees(id.xy);
  bool clean=transfer&&(flags&1u)!=0;
  float m=0;
  if(transfer&&!clean){
@@ -75,12 +89,13 @@ groupshared uint mismatch;
 [numthreads(8,8,1)]void compose(uint3 id:SV_DispatchThreadID){
  if(id.x>=ow||id.y>=oh)return;
  float2 uv=(float2(id.xy)+.5)/float2(ow,oh);
- if(flags&8u){float4 c=proof.Load(0)==0?n0[id.xy]:frame.SampleLevel(lin,uv,0);
-  if((flags&4u)&&proof.Load(0)==0){float3 d=abs(full.SampleLevel(lin,uv,0).rgb-scene.SampleLevel(lin,uv,0).rgb);
+ if(flags&32u){result[id.xy]=scene.SampleLevel(lin,uv,0);return;}
+ if(flags&8u){bool valid=agrees_at(uv);float4 c=valid?n0[id.xy]:frame.SampleLevel(lin,uv,0);
+  if((flags&4u)&&valid){float3 d=abs(full.SampleLevel(lin,uv,0).rgb-scene.SampleLevel(lin,uv,0).rgb);
    c.rgb=lerp(c.rgb,float3(1,0,1),.5*saturate(max(d.r,max(d.g,d.b))*16));}result[id.xy]=c;return;}
  if(flags&16u){result[id.xy]=float4(picture[id.xy].rgb,scene.SampleLevel(lin,uv,0).a);return;}
  float4 s=picture[id.xy];float3 outc=s.rgb;
- if(proof.Load(0)==0){
+ if(agrees_at(uv)){
   float2 uv=(float2(id.xy)+.5)/float2(ow,oh);
   float3 a=n0[id.xy].rgb,b=(n1[id.xy].rgb-a)/grey;
   if(flags&1u){
@@ -128,12 +143,13 @@ struct Picture::Impl {
  UINT descriptor_page=0; // pre-HUD work and final Present may both be in flight
  struct K {UINT w,h,ow,oh,flags;float grey,tolerance;UINT pad;} constants{};
  bool snapshot(ID3D12GraphicsCommandList* l,ID3D12Resource* src,D3D12_RESOURCE_STATES state,ComPtr<ID3D12Resource>& dst,bool& ready){
-  if(!l||!src)return false;auto d=src->GetDesc();if(d.Width!=w||d.Height!=h||(TypelessOf(d.Format)==DXGI_FORMAT_UNKNOWN||TypelessOf(d.Format)!=TypelessOf(source_format))||d.MipLevels!=1||d.DepthOrArraySize!=1||d.SampleDesc.Count!=1)return false;
+  if(!l||!src)return false;auto d=src->GetDesc();if(d.Width!=w||d.Height!=h||
+    (d.Format!=source_format&&(TypelessOf(d.Format)==DXGI_FORMAT_UNKNOWN||TypelessOf(d.Format)!=TypelessOf(source_format)))||d.MipLevels!=1||d.DepthOrArraySize!=1||d.SampleDesc.Count!=1)return false;
   move(l,src,state,CS);if(ready)move(l,dst.Get(),S,CD);l->CopyResource(dst.Get(),src);move(l,src,CS,state);move(l,dst.Get(),CD,S);ready=true;return true;
  }
  void bind(ID3D12GraphicsCommandList* l,UINT pass,ID3D12Resource* pic,DXGI_FORMAT pf){
   auto cpu=heap->GetCPUDescriptorHandleForHeapStart();cpu.ptr+=SIZE_T(descriptor_page*33+pass*11)*program->inc;
-  ID3D12Resource* srvs[]={frame.Get(),full.Get(),scene.Get(),n[0].Get(),n[1].Get(),pic};
+  ID3D12Resource* srvs[]={frame.Get(),full_current?full.Get():nullptr,scene_current?scene.Get():nullptr,n[0].Get(),n[1].Get(),pic};
   DXGI_FORMAT formats[]={frame_view,frame_view,frame_view,layer_view,layer_view,pf};
   for(UINT i=0;i<6;++i){D3D12_SHADER_RESOURCE_VIEW_DESC v{};v.Format=srvs[i]?formats[i]:DXGI_FORMAT_R8G8B8A8_UNORM;
    v.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;v.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;v.Texture2D.MipLevels=1;
@@ -143,7 +159,7 @@ struct Picture::Impl {
   for(UINT i=0;i<4;++i){D3D12_UNORDERED_ACCESS_VIEW_DESC v{};v.Format=uavs[i]?uf[i]:DXGI_FORMAT_R16G16B16A16_FLOAT;v.ViewDimension=D3D12_UAV_DIMENSION_TEXTURE2D;
    program->dev->CreateUnorderedAccessView(uavs[i],nullptr,&v,cpu);cpu.ptr+=program->inc;}
   D3D12_UNORDERED_ACCESS_VIEW_DESC v{};v.Format=DXGI_FORMAT_R32_TYPELESS;v.ViewDimension=D3D12_UAV_DIMENSION_BUFFER;v.Buffer.NumElements=4;v.Buffer.Flags=D3D12_BUFFER_UAV_FLAG_RAW;
-  program->dev->CreateUnorderedAccessView(proof.Get(),nullptr,&v,cpu);
+  v.Buffer.NumElements=UINT(proof->GetDesc().Width/4);program->dev->CreateUnorderedAccessView(proof.Get(),nullptr,&v,cpu);
   ID3D12DescriptorHeap* heaps[]={heap.Get()};l->SetDescriptorHeaps(1,heaps);l->SetComputeRootSignature(program->root.Get());l->SetPipelineState(program->pso[pass].Get());
   auto gpu=heap->GetGPUDescriptorHandleForHeapStart();gpu.ptr+=UINT64(descriptor_page*33+pass*11)*program->inc;
   l->SetComputeRootDescriptorTable(0,gpu);l->SetComputeRoot32BitConstants(1,8,&constants,0);
@@ -157,7 +173,7 @@ std::shared_ptr<Picture> Picture::Create(ID3D12Device* dev,const D3D12_RESOURCE_
  p.w=UINT(d.Width);p.h=d.Height;p.ow=ow;p.oh=oh;p.source_format=d.Format;
  if(!texture(dev,p.w,p.h,d.Format,false,CD,p.scene)||!texture(dev,p.w,p.h,d.Format,false,CD,p.full)||
     !texture(dev,p.w,p.h,DXGI_FORMAT_R16G16B16A16_FLOAT,true,U,p.input)||!texture(dev,p.w,p.h,DXGI_FORMAT_R16_FLOAT,true,U,p.mask)||
-    !buffer(dev,D3D12_HEAP_TYPE_DEFAULT,U,p.proof)||!buffer(dev,D3D12_HEAP_TYPE_READBACK,CD,p.readback))return {};
+    !buffer(dev,D3D12_HEAP_TYPE_DEFAULT,U,p.proof,16+UINT64(p.w)*p.h*4)||!buffer(dev,D3D12_HEAP_TYPE_READBACK,CD,p.readback))return {};
  D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,66,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
  if(FAILED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&p.heap))))return {};return result;
 }
@@ -201,9 +217,11 @@ ID3D12Resource* Picture::Input()const{return p_->input.Get();}
 ID3D12Resource* Picture::Mask()const{return p_->mask.Get();}
 ID3D12Resource* Picture::Scene()const{return p_->scene.Get();}
 ID3D12Resource* Picture::Full()const{return p_->full.Get();}
-bool Picture::ProofAfterCompletion(bool& identity,bool& clean){
- auto& p=*p_;if(!p.prepared||p.proof_read)return false;void* data=nullptr;D3D12_RANGE range{0,4};
- if(FAILED(p.readback->Map(0,&range,&data)))return false;UINT flags=0;std::memcpy(&flags,data,4);D3D12_RANGE none{};p.readback->Unmap(0,&none);
+bool Picture::ProofAfterCompletion(bool& identity,bool& clean,ProofReceipt* receipt){
+ auto& p=*p_;if(!p.prepared||p.proof_read)return false;void* data=nullptr;D3D12_RANGE range{0,16};
+ if(FAILED(p.readback->Map(0,&range,&data)))return false;UINT values[4]{};std::memcpy(values,data,16);const UINT flags=values[0];
+ if(receipt){receipt->tested=p.w*p.h;receipt->matched=values[1];std::memcpy(&receipt->maximum_error,values+2,4);}
+ D3D12_RANGE none{};p.readback->Unmap(0,&none);
  identity=flags==0;clean=identity&&(p.constants.flags&9u)!=0;p.proof_read=true;return true;
 }
 bool Picture::Composite(ID3D12GraphicsCommandList* l,ID3D12Resource* out){
@@ -215,8 +233,32 @@ bool Picture::Composite(ID3D12GraphicsCommandList* l,ID3D12Resource* out){
  move(l,p.n[0].Get(),S,R);move(l,p.n[1].Get(),S,R);return true;
 }
 bool Picture::SeedNativeAlpha(ID3D12GraphicsCommandList* l,ID3D12Resource* out){
- const UINT flags=p_->constants.flags;p_->constants.flags=16;
- const bool ok=Composite(l,out);p_->constants.flags=flags;return ok;
+ auto& p=*p_;if(!l||!out||!p.scene_current)return false;
+ const auto d=out->GetDesc();if(d.Width!=p.ow||d.Height!=p.oh)return false;
+ if(p.result&&p.result_format!=d.Format)return false;
+ if(!p.result&&!texture(p.program->dev.Get(),p.ow,p.oh,d.Format,true,U,p.result))return false;
+ p.result_format=d.Format;
+ const auto saved=p.constants;const auto saved_view=p.frame_view;auto saved_n0=p.n[0],saved_n1=p.n[1];p.n[0].Reset();p.n[1].Reset();
+ if(p.frame_view==DXGI_FORMAT_UNKNOWN)p.frame_view=p.source_format;
+ p.constants={p.w,p.h,p.ow,p.oh,16,1,0,0};
+ move(l,out,U,S);p.bind(l,2,out,d.Format);l->Dispatch((p.ow+7)/8,(p.oh+7)/8,1);order(l);
+ move(l,out,S,CD);move(l,p.result.Get(),U,CS);l->CopyResource(out,p.result.Get());move(l,p.result.Get(),CS,U);move(l,out,CD,U);
+ p.constants=saved;p.frame_view=saved_view;p.n[0]=std::move(saved_n0);p.n[1]=std::move(saved_n1);return true;
+}
+bool Picture::SeedNativeScene(ID3D12GraphicsCommandList* l,ID3D12Resource* out,DXGI_FORMAT source_view){
+ auto& p=*p_;if(!l||!out||!p.scene_current)return false;
+ const auto d=out->GetDesc();if(d.Width!=p.ow||d.Height!=p.oh)return false;
+ if(p.result&&p.result_format!=d.Format)return false;
+ if(!p.result&&!texture(p.program->dev.Get(),p.ow,p.oh,d.Format,true,U,p.result))return false;
+ p.result_format=d.Format;const auto saved=p.constants;const auto saved_view=p.frame_view;auto saved_n0=p.n[0],saved_n1=p.n[1];p.n[0].Reset();p.n[1].Reset();
+ // Both buffers are storage encoded: use the corresponding UNORM view, not
+ // an sRGB decode, when merely seeding the transparent UI canvas.
+ p.frame_view=source_view==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB?DXGI_FORMAT_R8G8B8A8_UNORM:
+              source_view==DXGI_FORMAT_B8G8R8A8_UNORM_SRGB?DXGI_FORMAT_B8G8R8A8_UNORM:source_view;
+ p.constants={p.w,p.h,p.ow,p.oh,32,1,0,0};
+ p.bind(l,2,nullptr,DXGI_FORMAT_UNKNOWN);l->Dispatch((p.ow+7)/8,(p.oh+7)/8,1);order(l);
+ move(l,out,S,CD);move(l,p.result.Get(),U,CS);l->CopyResource(out,p.result.Get());move(l,p.result.Get(),CS,U);
+ move(l,out,CD,D3D12_RESOURCE_STATE_PRESENT);p.constants=saved;p.frame_view=saved_view;p.n[0]=std::move(saved_n0);p.n[1]=std::move(saved_n1);return true;
 }
 bool Picture::PresentNative(ID3D12GraphicsCommandList* l,ID3D12Resource* frame,DXGI_FORMAT view,
                             ID3D12Resource* native,ID3D12Resource* check,ID3D12Resource* out,bool tint){

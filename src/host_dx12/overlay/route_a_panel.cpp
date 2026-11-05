@@ -967,7 +967,7 @@ void DrawLiveDlaa()
     {
         na::settings::Settings& ss = na::settings::Get();
         int sharp = static_cast<int>(ss.j2_sharpness.load());
-        BeginRow("Sharpness", "Sharpening after DLSS: RCAS with soft halo control, easing off at depth edges so silhouettes keep clean outlines. 0 = off. The strength doubles every 25 points: 50% is standard RCAS at full strength, 75% is twice it and 100% four times. Before the HUD, so text is unchanged.", S(220));
+        BeginRow("Sharpness", "Sharpening after DLSS: RCAS with soft halo control, easing off at depth edges so silhouettes keep clean outlines. 0 = off. The strength doubles every 25 points: 50% is standard RCAS at full strength, 75% is twice it and 100% four times. Native HUD is composed afterward. If separation is unavailable, HUD in the game image can also be sharpened.", S(220));
         ImGui::SetNextItemWidth(S(220));
         if (ImGui::SliderInt("##j2sharp", &sharp, 0, 100, sharp ? "%d%%" : "Off", ImGuiSliderFlags_AlwaysClamp)) {
             ss.j2_sharpness.store(static_cast<uint32_t>(sharp));
@@ -982,12 +982,14 @@ void DrawLiveDlaa()
         EndRow();
         if(native_on){
             const auto hud=na::j2::native_hud::GetStats();
-            Hint(hud.last_draw_method==1?"Last checked frame: native HUD."
+            Hint(!hud.last_present_native?"Native HUD is not active this frame; text remains in the upscaled game image."
+                 :hud.last_draw_method==1?"Last checked frame: native HUD."
                  :hud.last_draw_method==2?"Last checked frame: HUD protected from the current game image."
                  :hud.last_draw_method==3?"Last checked frame: HUD kept in the game image; the final draw changes the picture."
                  :hud.last_draw_method==4?"Last checked frame: final HUD drawn at native resolution after DLSS."
                  :hud.last_draw_method==5?"Last checked frame: kept the game picture; the HUD redraw did not match."
-                 :hud.hud_frames?"HUD uses a separate native layer.":"Locating the game's HUD draws.");
+                 :hud.last_draw_method==6?"Native HUD active; changed regions kept from the game image."
+                 :"Native HUD replay active; awaiting the completed image check.");
         }
         if (!na::j2::HudMaskEnabled()) {
             bool view = na::j2::HudMaskView();

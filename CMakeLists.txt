@@ -180,6 +180,7 @@ add_library(host_dx12 STATIC
   src/host_dx12/ngx_observe/ngx_observe.cpp
   src/host_dx12/ngx_observe/gpu_timing.cpp
   src/host_dx12/overlay/overlay.cpp
+  src/host_dx12/overlay/usage_sampler.cpp
   src/host_dx12/overlay/menu.cpp
   src/host_dx12/overlay/route_a_panel.cpp
   src/host_dx12/overlay/presenter.cpp
