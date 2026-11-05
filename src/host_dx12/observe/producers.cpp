@@ -13,6 +13,7 @@
 #include "host_dx12/observe/shader_dimensions.hpp"
 #include <tuple>
 #include <deque>
+#include <functional>
 #include <string>
 #include <algorithm>
 #include <system_error>
@@ -227,6 +228,34 @@ struct DescHeap {
         std::shared_ptr<const DescriptorDetails> details;
     };
     std::vector<SlotInfo> info; // last observed write per slot (record-time CPU view)
+    // Slot stripes (64 slots each): descriptor copies, the game's most frequent call (10-20k
+    // per frame in SE5), update versions/info under the SHARED g_m plus these, exclusive for
+    // the destination slots and shared for the source slots. Every other reader of
+    // versions/info under the shared g_m takes the covering stripe shared, one stripe at a
+    // time. Writers under the exclusive g_m need none (no copy can be running then).
+    std::unique_ptr<std::shared_mutex[]> stripes;
+    uint32_t nstripes = 0;
+};
+constexpr uint32_t kStripeShift = 6;
+// Shared lock of the stripe holding a slot. Holds at most one stripe: lock() moves to
+// another stripe by releasing the current one first (never two at once, so readers cannot
+// form a cycle with a copy, which takes its stripes in one global order).
+struct SlotShared {
+    std::shared_mutex* m = nullptr;
+    SlotShared() = default;
+    SlotShared(const DescHeap* h, uint64_t slot) { lock(h, slot); }
+    SlotShared(const SlotShared&) = delete;
+    SlotShared& operator=(const SlotShared&) = delete;
+    void lock(const DescHeap* h, uint64_t slot)
+    {
+        std::shared_mutex* n = h && h->stripes && (slot >> kStripeShift) < h->nstripes ? &h->stripes[static_cast<size_t>(slot >> kStripeShift)] : nullptr;
+        if (n == m) return;
+        unlock();
+        m = n;
+        if (m) m->lock_shared();
+    }
+    void unlock() { if (m) { m->unlock_shared(); m = nullptr; } }
+    ~SlotShared() { unlock(); }
 };
 
 struct VaRange {
@@ -322,7 +351,8 @@ void va_insert(const VaRange& r)
 }
 // Protected by the existing g_m. No additional hot-path setter lock. Identity
 // reuse, descriptor writes/copies and heap retirement invalidate borrowed data.
-uint64_t g_operation_revision=1,g_heap_registry_revision=1;
+std::atomic<uint64_t> g_operation_revision{1}; // atomic: descriptor copies advance it under the shared g_m
+uint64_t g_heap_registry_revision=1;
 struct BufferInfo {
     uint32_t heap_type = NA_UNKNOWN_U32;
     uint64_t width = 0;
@@ -1025,7 +1055,63 @@ void note_descriptor_copy(uint64_t dst, uint64_t src, uint32_t count, uint32_t i
         na_ev_descriptor_copy e;
         init_header(e, NA_EV_DESCRIPTOR_COPY, 0);
         uint32_t run = 0;
+        bool resolved = false, striped = false;
         {
+            // Shared g_m + the slots' stripes (exact same result as the exclusive section,
+            // which remains the path for a copy spanning more than kMaxStripes stripes).
+            const CostScope cost(kCostDescCopy);
+            std::shared_lock<std::shared_mutex> lock(g_m, std::defer_lock);
+            { const CostScope wait(kCostDescCopyWait); lock.lock(); }
+            uint32_t ds = 0, ss = 0;
+            DescHeap* dh = heap_for_cpu_locked(dst, &ds);
+            DescHeap* sh = heap_for_cpu_locked(src, &ss);
+            if (dh && sh) {
+                resolved = true;
+                run = std::min({count, dh->count - ds, sh->count - ss});
+                constexpr uint32_t kMaxStripes = 32;
+                struct Want { std::shared_mutex* m; bool ex; };
+                Want want[kMaxStripes];
+                uint32_t nw = 0;
+                const auto add = [&](DescHeap* h, uint32_t first, bool ex) {
+                    if (!run || !h->stripes) return false;
+                    for (uint32_t st = first >> kStripeShift; st <= (first + run - 1) >> kStripeShift; ++st) {
+                        if (st >= h->nstripes) return false;
+                        std::shared_mutex* m = &h->stripes[st];
+                        bool merged = false;
+                        for (uint32_t i = 0; i < nw; ++i) if (want[i].m == m) { want[i].ex |= ex; merged = true; }
+                        if (merged) continue;
+                        if (nw == kMaxStripes) return false;
+                        want[nw++] = {m, ex};
+                    }
+                    return true;
+                };
+                if (run && add(dh, ds, true) && add(sh, ss, false)) {
+                    std::sort(want, want + nw, [](const Want& a, const Want& b) { return std::less<std::shared_mutex*>()(a.m, b.m); });
+                    {
+                        const CostScope wait(kCostDescCopyWait);
+                        for (uint32_t i = 0; i < nw; ++i) { if (want[i].ex) want[i].m->lock(); else want[i].m->lock_shared(); }
+                    }
+                    ++g_operation_revision;
+                    for (uint32_t i = 0; i < run; ++i) {
+                        ++dh->versions[ds + i];
+                        dh->info[ds + i] = sh->info[ss + i]; // contents follow the source's record-time view
+                    }
+                    for (uint32_t i = nw; i-- > 0;) { if (want[i].ex) want[i].m->unlock(); else want[i].m->unlock_shared(); }
+                    striped = true;
+                } else if (!run) striped = true; // nothing to copy
+                e.src_heap = sh->id;
+                e.dst_heap = dh->id;
+                e.src_slot = ss;
+                e.dst_slot = ds;
+                e.slot_count = run;
+            }
+        }
+        if (!resolved) {
+            g_c.unresolved.fetch_add(1);
+            return;
+        }
+        if (!striped) {
+            // Rare (a copy over more than 32 stripes, 2048+ slots): the exclusive section.
             const CostScope cost(kCostDescCopy);
             std::unique_lock<std::shared_mutex> lock(g_m, std::defer_lock);
             { const CostScope wait(kCostDescCopyWait); lock.lock(); }
@@ -1040,7 +1126,7 @@ void note_descriptor_copy(uint64_t dst, uint64_t src, uint32_t count, uint32_t i
             ++g_operation_revision;
             for (uint32_t i = 0; i < run; ++i) {
                 ++dh->versions[ds + i];
-                dh->info[ds + i] = sh->info[ss + i]; // contents follow the source's record-time view
+                dh->info[ds + i] = sh->info[ss + i];
             }
             e.src_heap = sh->id;
             e.dst_heap = dh->id;
@@ -1219,6 +1305,8 @@ void register_heap(ID3D12Device* dev, IUnknown* obj, ID3D12DescriptorHeap* h, co
     dh->type = desc->Type;
     dh->versions.assign(desc->NumDescriptors, 0);
     dh->info.assign(desc->NumDescriptors, DescHeap::SlotInfo{});
+    dh->nstripes = (desc->NumDescriptors + (1u << kStripeShift) - 1) >> kStripeShift;
+    dh->stripes.reset(new std::shared_mutex[dh->nstripes ? dh->nstripes : 1]);
     const na_object_id dev_id = device_id(dev);
     na_ev_descriptor_heap_created e;
     init_header(e, NA_EV_DESCRIPTOR_HEAP_CREATED, flags);
@@ -2828,6 +2916,7 @@ na_view_ref view_ref_locked(DescHeap* h, uint32_t slot)
         v.format = v.first_subresource = NA_UNKNOWN_U32;
         return v;
     }
+    const SlotShared stripe(h, slot);
     const DescHeap::SlotInfo& si = h->info[slot];
     v.heap = h->id;
     v.slot = slot;
@@ -3389,6 +3478,7 @@ void root_table(GL* l,UINT param,D3D12_GPU_DESCRIPTOR_HANDLE h){
         if (!dh) dh = heap_for_gpu_locked(h.ptr, &slot);
         if (dh) {
             heap = dh->id;
+            const SlotShared stripe(dh, slot);
             version = dh->versions[slot];
         }
         // C9: CBV ranges of this table (first range, per the bound root signature).
@@ -3404,9 +3494,11 @@ void root_table(GL* l,UINT param,D3D12_GPU_DESCRIPTOR_HANDLE h){
                         if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && range.table_offset != NA_UNKNOWN_U32 && ls->sampled_textures.size()<256) {
                             const CostScope sampled(kCostSampled);
 
+                            SlotShared stripe;
                             for (uint32_t k = 0; k < std::min<uint32_t>(range.num_descriptors, 64) && ls->sampled_textures.size()<256; ++k) {
                                 const uint64_t index = uint64_t(slot) + range.table_offset + k;
                                 if (index >= dh->count) break;
+                                stripe.lock(dh, index);
                                 const auto& si = dh->info[static_cast<size_t>(index)];
                                 if (si.kind == NA_DESC_SRV && si.resource && si.resource != NA_UNKNOWN_U64 &&
                                     ls->sampled_textures.size() < 256 &&
@@ -3417,7 +3509,9 @@ void root_table(GL* l,UINT param,D3D12_GPU_DESCRIPTOR_HANDLE h){
                         if (range.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_CBV || range.table_offset == NA_UNKNOWN_U32) continue;
                         const uint32_t n = std::min<uint32_t>(range.num_descriptors, 8);
                         const bool cut = range.num_descriptors > 8; // incl. unbounded: coverage flagged
+                        SlotShared stripe;
                         for (uint32_t k = 0; k < n && slot + range.table_offset + k < dh->count; ++k) {
+                            stripe.lock(dh, uint64_t(slot) + range.table_offset + k);
                             const DescHeap::SlotInfo& si = dh->info[slot + range.table_offset + k];
                             if (si.kind != NA_DESC_CBV) continue;
                             ListState::Binding b;
@@ -3860,7 +3954,8 @@ void before_shader_use(GL* l, bool compute, bool indirect=false)
         uint32_t nsrv = 0;
         bool reads_derived = false;
         auto& cached=ls->shader_reads[compute];
-        if(cached.valid&&cached.state_revision==ls->read_revision[compute]&&cached.registry_revision==g_operation_revision&&cached.color==color){
+        const uint64_t revision_now=g_operation_revision.load(); // before reading: a concurrent copy then invalidates
+        if(cached.valid&&cached.state_revision==ls->read_revision[compute]&&cached.registry_revision==revision_now&&cached.color==color){
             color_srvs=cached.color_srvs;reads_color=color_srvs!=0;nsrv=cached.count;
             std::copy_n(cached.srvs,nsrv,srv_ids);if(compute)destination=cached.uav;
         }else{
@@ -3878,9 +3973,11 @@ void before_shader_use(GL* l, bool compute, bool indirect=false)
             for (uint32_t r = 0; r < params[p].count && params[p].first_range + r < ranges.size(); ++r) {
                 const auto& range = ranges[params[p].first_range + r];
                 if (range.table_offset == NA_UNKNOWN_U32) continue;
+                SlotShared stripe;
                 for (uint32_t k = 0; k < std::min<uint32_t>(range.num_descriptors, 64); ++k) {
                     const uint64_t index = uint64_t(slot) + range.table_offset + k;
                     if (index >= heap->count) break;
+                    stripe.lock(heap, index);
                     const auto& info = heap->info[static_cast<size_t>(index)];
                     if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && info.kind == NA_DESC_SRV) {
                         if (info.resource == color) {
@@ -3895,7 +3992,7 @@ void before_shader_use(GL* l, bool compute, bool indirect=false)
                 }
             }
         }
-        cached.state_revision=ls->read_revision[compute];cached.registry_revision=g_operation_revision;cached.color=color;
+        cached.state_revision=ls->read_revision[compute];cached.registry_revision=revision_now;cached.color=color;
         cached.color_srvs=color_srvs;cached.count=nsrv;cached.uav=compute?destination:0;
         std::copy_n(srv_ids,nsrv,cached.srvs);cached.valid=true;
         }
@@ -4058,9 +4155,11 @@ void capture_raster_targets(GL* list, UINT count, const D3D12_CPU_DESCRIPTOR_HAN
                 uint32_t slot = 0;
                 const auto handle = contiguous ? targets[0].ptr + SIZE_T(i) * stride : targets[i].ptr;
                 const auto* heap = heap_for_cpu_locked(handle, &slot);
-                ls->native_colors.push_back(heap ? heap->info[slot].details : nullptr);
+                std::shared_ptr<const DescriptorDetails> det;
+                if (heap) { const SlotShared stripe(heap, slot); det = heap->info[slot].details; }
+                ls->native_colors.push_back(std::move(det));
             }
-            if (depth) { uint32_t slot = 0; if (const auto* heap = heap_for_cpu_locked(depth->ptr, &slot)) ls->native_depth = heap->info[slot].details; }
+            if (depth) { uint32_t slot = 0; if (const auto* heap = heap_for_cpu_locked(depth->ptr, &slot)) { const SlotShared stripe(heap, slot); ls->native_depth = heap->info[slot].details; } }
         }
     }
     std::shared_ptr<Obj::Twins> storage;
@@ -5857,9 +5956,11 @@ uint32_t ListCurrentGraphicsSrvs(ID3D12CommandList* list, na_object_id* out, uin
             constexpr uint32_t kWide = 1024;
             if (range.table_offset == NA_UNKNOWN_U32 || range.num_descriptors > kWide) cut = true;
             if (range.table_offset == NA_UNKNOWN_U32) continue;
+            SlotShared stripe;
             for (uint32_t k = 0; k < std::min<uint32_t>(range.num_descriptors, kWide); ++k) {
                 const uint64_t index = uint64_t(slot) + range.table_offset + k;
                 if (index >= heap->count) break;
+                stripe.lock(heap, index);
                 const auto& info = heap->info[static_cast<size_t>(index)];
                 if (info.kind != NA_DESC_SRV || !info.resource) continue;
                 bool seen = false;
@@ -6143,9 +6244,12 @@ bool RestoreListState(ID3D12GraphicsCommandList* l,ID3D12GraphicsCommandList* de
                         if(range.range_type==D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER)continue;
                         if(range.range_type==D3D12_DESCRIPTOR_RANGE_TYPE_UAV||range.num_descriptors==UINT_MAX||range.table_offset==UINT_MAX||
                             range.table_offset>4096||range.num_descriptors>4096-range.table_offset||slot+range.table_offset>heap->count||range.num_descriptors>heap->count-slot-range.table_offset)return false;
-                        for(UINT j2=0;j2<range.num_descriptors;++j2){const auto& info=heap->info[slot+range.table_offset+j2];if(!info.details)return false;
-                            if(info.details->kind==NA_DESC_CBV){if(!address(info.details->cbv.BufferLocation))return false;}
-                            else keep(info.details->resource);
+                        for(UINT j2=0;j2<range.num_descriptors;++j2){
+                            std::shared_ptr<const DescriptorDetails> det;
+                            {const SlotShared stripe(heap,uint64_t(slot)+range.table_offset+j2);det=heap->info[slot+range.table_offset+j2].details;}
+                            if(!det)return false;
+                            if(det->kind==NA_DESC_CBV){if(!address(det->cbv.BufferLocation))return false;}
+                            else keep(det->resource);
                         }
                     }
                 }
@@ -6677,7 +6781,9 @@ bool NativeDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle,OperationDescriptor& ou
     out={};DescriptorDetails details;uint64_t version=0;
     {
         std::shared_lock<std::shared_mutex> lock(g_m);uint32_t slot=0;
-        const auto* heap=heap_for_cpu_locked(handle.ptr,&slot);if(!heap||!heap->info[slot].details)return false;
+        const auto* heap=heap_for_cpu_locked(handle.ptr,&slot);if(!heap)return false;
+        const SlotShared stripe(heap,slot);
+        if(!heap->info[slot].details)return false;
         details=*heap->info[slot].details;version=heap->versions[slot];
     }
     OperationDescriptor next;next.view=details;next.version=version;
@@ -6694,7 +6800,8 @@ bool ListNativeOperationKey(ID3D12GraphicsCommandList* list,bool compute,const u
     if(!ls->restorable||ls->in_render_pass)return false;
     out.recording=ls->generation.load()+1;
     auto& cached=ls->operation_key[compute];bool rebase=false;
-    if(cached.valid&&cached.state_revision==ls->key_revision[compute]&&cached.registry_revision==g_operation_revision&&
+    const uint64_t revision_now=g_operation_revision.load(); // before reading: a concurrent copy then invalidates
+    if(cached.valid&&cached.state_revision==ls->key_revision[compute]&&cached.registry_revision==revision_now&&
        count==cached.members.size()&&std::equal(cached.members.begin(),cached.members.end(),members)){
         key=cached.prefix;rebase=cached.rebase;
     }else{
@@ -6719,7 +6826,9 @@ bool ListNativeOperationKey(ID3D12GraphicsCommandList* list,bool compute,const u
         for(uint32_t i=0;i<span;++i){bool used=!pipeline->second.reflection_complete;
             if(!used)for(uint32_t r=0;r<p.count;++r){const auto& range=rs->second.root_ranges[p.first_range+r];
                 if(i>=range.table_offset&&i-range.table_offset<range.num_descriptors)used|=shader_uses(pipeline->second,p,range,range.base_register+i-range.table_offset);}
-            const auto& details=heap->info[slot+i].details;if(used&&!details)return false;
+            std::shared_ptr<const DescriptorDetails> details;
+            {const SlotShared stripe(heap,uint64_t(slot)+i);details=heap->info[slot+i].details;}
+            if(used&&!details)return false;
             if(details){key.descriptor(*details,used);rebase|=used&&(member(details->resource)||member(details->counter));}
             else key.descriptor({},false);
         }
@@ -6739,11 +6848,13 @@ bool ListNativeOperationKey(ID3D12GraphicsCommandList* list,bool compute,const u
             for(uint32_t r=0;r<p.count;++r){const auto& range=rs->second.root_ranges[p.first_range+r];
                 if(range.range_type!=D3D12_DESCRIPTOR_RANGE_TYPE_CBV||range.register_space!=field.space||field.shader_register<range.base_register||field.shader_register-range.base_register>=range.num_descriptors)continue;
                 const auto offset=range.table_offset+field.shader_register-range.base_register;
-                const auto& details=heap->info[slot+offset].details;if(!details)return false;address=details->cbv.BufferLocation;descriptor=table_first[param]+offset;}
+                std::shared_ptr<const DescriptorDetails> details;
+                {const SlotShared stripe(heap,uint64_t(slot)+offset);details=heap->info[slot+offset].details;}
+                if(!details)return false;address=details->cbv.BufferLocation;descriptor=table_first[param]+offset;}
         }
         uint64_t resource=0,offset=0;if(address&&resolve_va_locked(address,&resource,&offset)){key.constant(param,descriptor,resource,offset,field);rebase|=descriptor!=UINT_MAX;}
     }
-    cached.prefix=key;cached.rebase=rebase;cached.state_revision=ls->key_revision[compute];cached.registry_revision=g_operation_revision;
+    cached.prefix=key;cached.rebase=rebase;cached.state_revision=ls->key_revision[compute];cached.registry_revision=revision_now;
     cached.members.clear();if(count)cached.members.assign(members,members+count);cached.valid=true;
     }
     if(!compute){if(!ls->raster_tracking||!ls->raster_targets_known||!ls->raster_viewports_known||!ls->raster_scissors_known)return false;
@@ -6790,7 +6901,9 @@ bool ListNativeOperation(ID3D12GraphicsCommandList* list, bool compute, NativeOp
             uint32_t slot = 0; const auto* heap = heap_for_gpu_locked(args[param].value, &slot);
             if (!heap || span > heap->count - slot || span > 4096 - next.descriptors.size()) return false;
             next.tables.push_back({param, static_cast<uint32_t>(next.descriptors.size()), span});
+            SlotShared stripe;
             for (uint32_t i = 0; i < span; ++i) {
+                stripe.lock(heap, uint64_t(slot) + i);
                 const auto& info = heap->info[slot + i];
                 OperationDescriptor d;d.used=!next.reflection_complete;
                 if(next.reflection_complete)for(uint32_t r=0;r<p.count;++r){const auto& range=rs->second.root_ranges[p.first_range+r];
