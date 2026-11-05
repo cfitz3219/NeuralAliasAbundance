@@ -436,17 +436,23 @@ void emit(const E& e, uint32_t group)
 
 // Canonical COM identity (review: interface pointers of one object may differ
 // under wrapping layers): the registry is keyed by the object's IUnknown.
-// A one-entry per-thread cache keeps the hot recording path cheap; any
-// retirement invalidates every cache (an address may be reused afterwards).
+// A small per-thread cache keeps the hot recording path cheap; any retirement invalidates
+// every cache (an address may be reused afterwards). 2026-11-05: one entry thrashed, since a
+// draw canonicalises its list AND its pipeline (note_draw, viewport jitter), so every call fell
+// through to QueryInterface + Release: two COM calls, and interlocked refcount traffic on the
+// game's shared PSOs from every recording thread. Eight entries, round-robin replacement.
 std::atomic<uint64_t> g_retire_gen{1};
 const void* canon(const void* p)
 {
     if (!p) return nullptr;
-    thread_local const void* c_in = nullptr;
-    thread_local const void* c_out = nullptr;
+    constexpr unsigned kWays = 8;
+    thread_local const void* c_in[kWays] = {};
+    thread_local const void* c_out[kWays] = {};
     thread_local uint64_t c_gen = 0;
+    thread_local unsigned c_next = 0;
     const uint64_t gen = g_retire_gen.load(std::memory_order_acquire);
-    if (p == c_in && gen == c_gen) return c_out;
+    if (gen != c_gen) { for (unsigned i = 0; i < kWays; ++i) c_in[i] = nullptr; c_gen = gen; }
+    for (unsigned i = 0; i < kWays; ++i) if (c_in[i] == p) return c_out[i];
     IUnknown* u = nullptr;
     auto* obj = static_cast<IUnknown*>(const_cast<void*>(p));
     const void* out = p;
@@ -454,11 +460,43 @@ const void* canon(const void* p)
         out = u;
         u->Release(); // the caller still holds the object
     }
-    c_in = p;
-    c_out = out;
-    c_gen = gen;
+    const unsigned w = c_next++ % kWays;
+    c_in[w] = p;
+    c_out[w] = out;
     return out;
 }
+
+// ---- Hook cost (2026-11-05: with us loaded SE5 ran 35 fps CPU-bound vs 165 without) ----------
+// Wall time spent inside each outermost command-list hook (ours + the driver's call), per
+// slot, plus ExecuteCommandLists and pipeline creation. Thread-local sums are folded into the
+// shared totals every 512 calls, so the measurement itself adds no shared write per call.
+constexpr uint32_t kCostSlots = 128, kCostExec = 125, kCostPso = 126;
+std::atomic<uint64_t> g_cost_ticks[kCostSlots]{}, g_cost_calls[kCostSlots]{};
+thread_local uint64_t t_cost_ticks[kCostSlots]{}, t_cost_calls[kCostSlots]{};
+thread_local uint32_t t_cost_n = 0;
+inline uint64_t cost_now() { LARGE_INTEGER c; QueryPerformanceCounter(&c); return static_cast<uint64_t>(c.QuadPart); }
+void cost_flush()
+{
+    for (uint32_t i = 0; i < kCostSlots; ++i)
+        if (t_cost_calls[i]) {
+            g_cost_ticks[i].fetch_add(t_cost_ticks[i], std::memory_order_relaxed);
+            g_cost_calls[i].fetch_add(t_cost_calls[i], std::memory_order_relaxed);
+            t_cost_ticks[i] = t_cost_calls[i] = 0;
+        }
+    t_cost_n = 0;
+}
+struct CostScope {
+    uint32_t slot; uint64_t t0;
+    explicit CostScope(uint32_t s, bool on = true) : slot(on && s < kCostSlots ? s : kCostSlots), t0(slot < kCostSlots ? cost_now() : 0) {}
+    ~CostScope()
+    {
+        if (slot >= kCostSlots) return;
+        t_cost_ticks[slot] += cost_now() - t0; ++t_cost_calls[slot];
+        if (++t_cost_n >= 512 || slot >= kCostExec) cost_flush();
+    }
+    CostScope(const CostScope&) = delete;
+    CostScope& operator=(const CostScope&) = delete;
+};
 
 // Sentinel attached as private data: its last Release is the object's destruction.
 class RetireSentinel final : public IUnknown {
@@ -1550,6 +1588,7 @@ HRESULT STDMETHODCALLTYPE D_Wait(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v
 
 void STDMETHODCALLTYPE D_ExecuteCommandLists(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists)
 {
+    const CostScope cost(kCostExec, !t_host_work);
     ReleaseParkedTwins();
     const ExecuteToken t = ExecuteBegin(q, n, lists);
     o_ExecuteCommandLists(q, n, lists);
@@ -1974,6 +2013,7 @@ void make_pso_twins(IUnknown* pso, const void* rs, Make make)
 
 HRESULT STDMETHODCALLTYPE D_CreateGraphicsPipelineState(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, REFIID riid, void** out)
 {
+    const CostScope cost(kCostPso, !t_host_work);
     Depth depth("CreateGraphicsPipelineState");
     const HRESULT hr = o_CreateGraphicsPipelineState(dev, d, riid, out);
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
@@ -2008,6 +2048,7 @@ HRESULT STDMETHODCALLTYPE D_CreateGraphicsPipelineState(ID3D12Device* dev, const
 
 HRESULT STDMETHODCALLTYPE D_CreateComputePipelineState(ID3D12Device* dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC* d, REFIID riid, void** out)
 {
+    const CostScope cost(kCostPso, !t_host_work);
     Depth depth("CreateComputePipelineState");
     const HRESULT hr = o_CreateComputePipelineState(dev, d, riid, out);
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
@@ -2082,6 +2123,7 @@ size_t sub_size(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t)
 
 HRESULT STDMETHODCALLTYPE D_CreatePipelineState(ID3D12Device2* dev, const D3D12_PIPELINE_STATE_STREAM_DESC* d, REFIID riid, void** out)
 {
+    const CostScope cost(kCostPso, !t_host_work);
     Depth depth("CreatePipelineState");
     const HRESULT hr = o_CreatePipelineState(dev, d, riid, out);
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
@@ -3681,6 +3723,7 @@ struct ListHook<Slot, R(A...)> {
     static R STDMETHODCALLTYPE thunk(GL* l, A... a)
     {
         na::hooking::variants::CallScope scope(l, Slot);
+        const CostScope cost(Slot, scope.outermost && !t_host_work);
         auto fn = reinterpret_cast<Pfn>(orig[I]);
         if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced ||
                       Slot == sl::list::ExecuteIndirect || Slot == sl::list::ExecuteBundle)
@@ -6203,19 +6246,33 @@ ID3D12Resource* AcquireResource(na_object_id id)
 namespace {
 // Depth and colour are one role: published and read together (two separate atomics let a
 // reader see a new depth with the old colour, Astra 20cddb8).
+// Readers are per draw on every recording thread, so they never take a lock: a sequence
+// counter (odd while a writer is mid-update) lets them retry instead (seqlock). Writers stay
+// serialised by g_live_m.
 std::mutex g_live_m;
-uint64_t g_live_depth = 0, g_live_color = 0, g_live_version = 0;
+std::atomic<uint64_t> g_live_depth{0}, g_live_color{0}, g_live_seq{0};
+uint64_t g_live_version = 0;
 }
 void SetLiveSelection(uint64_t depth, uint64_t color)
 {
     std::lock_guard<std::mutex> lock(g_live_m);
-    if (depth != g_live_depth || color != g_live_color) ++g_live_version;
-    g_live_depth = depth; g_live_color = color;
+    const uint64_t d0 = g_live_depth.load(std::memory_order_relaxed), c0 = g_live_color.load(std::memory_order_relaxed);
+    if (depth == d0 && color == c0) return;
+    ++g_live_version;
+    g_live_seq.fetch_add(1, std::memory_order_acq_rel); // odd: update in progress
+    g_live_depth.store(depth, std::memory_order_relaxed);
+    g_live_color.store(color, std::memory_order_relaxed);
+    g_live_seq.fetch_add(1, std::memory_order_release); // even: consistent
 }
 void GetLiveSelection(uint64_t* depth, uint64_t* color)
 {
-    std::lock_guard<std::mutex> lock(g_live_m);
-    *depth = g_live_depth; *color = g_live_color;
+    for (;;) {
+        const uint64_t s0 = g_live_seq.load(std::memory_order_acquire);
+        if (s0 & 1) continue;
+        const uint64_t d = g_live_depth.load(std::memory_order_acquire), c = g_live_color.load(std::memory_order_acquire);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (g_live_seq.load(std::memory_order_relaxed) == s0) { *depth = d; *color = c; return; }
+    }
 }
 void SetSceneViewportJitter(uint64_t frame, float x, float y)
 {
@@ -6242,6 +6299,37 @@ uint64_t ListSceneViewportJitter(ID3D12CommandList* list,uint64_t scene_depth)
     if (!ls) return 0;
     std::lock_guard<std::mutex> bl(ls->bind_m);
     return !scene_depth||scene_depth==ls->vpj_depth?ls->vpj_scene:0;
+}
+void FormatHookCost(char* out, size_t n)
+{
+    if (!out || !n) return;
+    out[0] = 0;
+    cost_flush(); // this thread's share
+    static uint64_t prev_ticks[kCostSlots]{}, prev_calls[kCostSlots]{}, prev_at = 0;
+    static std::mutex m;
+    std::lock_guard<std::mutex> lock(m);
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+    const uint64_t now = cost_now();
+    const double secs = prev_at ? double(now - prev_at) / double(f.QuadPart) : 0.0;
+    struct Row { uint32_t slot; double ms_per_s, calls_per_s, us_per_call; };
+    Row rows[kCostSlots]; uint32_t nr = 0; double list_total = 0;
+    for (uint32_t i = 0; i < kCostSlots; ++i) {
+        const uint64_t t = g_cost_ticks[i].load(std::memory_order_relaxed), c = g_cost_calls[i].load(std::memory_order_relaxed);
+        const uint64_t dt = t - prev_ticks[i], dc = c - prev_calls[i];
+        prev_ticks[i] = t; prev_calls[i] = c;
+        if (!dc || secs <= 0) continue;
+        const double ms = double(dt) * 1000.0 / double(f.QuadPart);
+        rows[nr++] = {i, ms / secs, double(dc) / secs, ms * 1000.0 / double(dc)};
+        if (i < kCostExec) list_total += ms / secs;
+    }
+    prev_at = now;
+    std::sort(rows, rows + nr, [](const Row& a, const Row& b) { return a.ms_per_s > b.ms_per_s; });
+    int w = std::snprintf(out, n, "hook_cost window_s=%.1f list_ms_per_s=%.1f", secs, list_total);
+    for (uint32_t i = 0; i < nr && i < 14 && w > 0 && size_t(w) < n; ++i) {
+        const char* tag = rows[i].slot == kCostExec ? "exec" : rows[i].slot == kCostPso ? "pso" : nullptr;
+        if (tag) w += std::snprintf(out + w, n - w, " %s{ms_per_s=%.1f calls_per_s=%.0f us=%.2f}", tag, rows[i].ms_per_s, rows[i].calls_per_s, rows[i].us_per_call);
+        else w += std::snprintf(out + w, n - w, " s%u{ms_per_s=%.1f calls_per_s=%.0f us=%.2f}", rows[i].slot, rows[i].ms_per_s, rows[i].calls_per_s, rows[i].us_per_call);
+    }
 }
 ViewportJitterStats GetViewportJitterStats()
 {
