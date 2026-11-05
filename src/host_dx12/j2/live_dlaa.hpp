@@ -51,6 +51,11 @@ bool CompileHudShadersForTests(char* why, size_t why_size);
 // Tests: the native-HUD composite (pass "layer") from `picture` and the two layers (all in
 // NON_PIXEL_SHADER_RESOURCE) into `out` (UNORDERED_ACCESS), and one HUD-mask classify pass
 // (cur/prev/motion readable, evidence R32_FLOAT in UNORDERED_ACCESS). Set up on `queue`'s device.
+// hud_unblend's pass (tests): picture (NON_PIXEL_SHADER_RESOURCE) with l0/l1 (likewise) -> out (UNORDERED_ACCESS,
+// the un-blended scene); counts (COPY_DEST, >= 32 bytes) receives the self-check: ui, opaque, match id/dec/enc.
+bool RecordHudUnblendForTests(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list, ID3D12Resource* picture, DXGI_FORMAT picture_format,
+                              ID3D12Resource* l0, ID3D12Resource* l1, DXGI_FORMAT view, float grey, bool srgb, ID3D12Resource* out,
+                              uint32_t w, uint32_t h, ID3D12Resource* counts);
 bool RecordHudLayerForTests(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list, ID3D12Resource* picture, DXGI_FORMAT picture_format,
                             ID3D12Resource* n0, ID3D12Resource* n1, DXGI_FORMAT view, float grey, bool srgb, ID3D12Resource* out,
                             uint32_t w, uint32_t h);

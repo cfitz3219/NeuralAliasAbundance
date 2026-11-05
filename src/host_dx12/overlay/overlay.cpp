@@ -52,6 +52,7 @@
 #include "host_dx12/nr/nr_pass.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/native_hud.hpp"
+#include "host_dx12/j2/hud_unblend.hpp"
 #include "host_dx12/j2/projection_window.hpp"
 #include "host_dx12/scale/live_driver.hpp"
 #include "host_dx12/scale/auto_scene.hpp"
@@ -987,6 +988,10 @@ void write_status_line()
                 " chain_fmt=" + std::to_string(g_presented_format.load(std::memory_order_relaxed)) +
                 " color_space=" + std::to_string(g_color_space.load(std::memory_order_acquire)) + "\r\n";
             WriteFile(f, hud.data(), DWORD(hud.size()), &written, nullptr);
+            if (na::j2::hud_unblend::Configured()) {
+                const std::string ub = na::j2::hud_unblend::StatusLine() + " composited=" + std::to_string(j2.small_hud_layer) + "\r\n";
+                WriteFile(f, ub.data(), DWORD(ub.size()), &written, nullptr);
+            }
             {
                 const std::string trace = na::j2::native_hud::TakeTrace();
                 if (!trace.empty()) WriteFile(f, trace.data(), DWORD(trace.size()), &written, nullptr);

@@ -3033,7 +3033,7 @@ struct SmallRing {
     // uses), hudup = NIS-upscaled frame at output size (RGBA16F, UAV between uses).
     bool hud_tried = false, hud_ok = false;
     ComPtr<ID3D12RootSignature> hud_root;
-    ComPtr<ID3D12PipelineState> hud_pso[7]; // classify, dilate, composite, clear, layer (native HUD), witness, wclear
+    ComPtr<ID3D12PipelineState> hud_pso[9]; // classify, dilate, composite, clear, layer (native HUD), witness, wclear, unblend, uclear
     // Jitter witness: the last DLSS frame (render size), its declared jitter and J2 frame, and
     // a readback of the counts per ring slot (read when the slot comes round again).
     ComPtr<ID3D12Resource> wprev, wread[kRing];
@@ -3061,6 +3061,12 @@ struct SmallRing {
     bool hud_fresh = true; // a new picture size: start the evidence over at the next classify
     ComPtr<ID3D12Resource> hread[kRing]; // HUD fallback counts per ring slot (read when the slot comes round)
     bool hread_valid[kRing] = {};
+    // hud_unblend: the scene with the UI's contribution removed (render size, UNORDERED_ACCESS
+    // between uses) and the self-check counts per ring slot.
+    ComPtr<ID3D12Resource> ublend, uread[kRing];
+    bool uread_valid[kRing] = {};
+    uint32_t ublend_w = 0, ublend_h = 0;
+    DXGI_FORMAT ublend_f = DXGI_FORMAT_UNKNOWN;
     bool hud_protect_off = false;        // last completed mask covered too much: learn, do not apply
 } g_small;
 na::j2::NisScaler g_hud_nis;
@@ -3215,7 +3221,47 @@ void layer(uint3 id : SV_DispatchThreadID) {
     }
     if (flags & 4u) o = linear_to_srgb(o);
     u0[id.xy] = float4(o, s.a);
-})";
+}
+// HUD by un-blending (hud_unblend.hpp): t0 the game's final picture, t1 the UI replayed over
+// black and t2 over grey, all at the game's own size; u0 the scene with the UI removed:
+// P = L0 + m * S, m = (L1 - L0) / grey, so S = (P - L0) / m where the UI left anything of the
+// destination (m > 0.04); a fully covered pixel keeps P (the native layer covers it anyway).
+// flags 4 = the UI was drawn through an sRGB view (blend in linear; the picture is encoded).
+// Self-check (stats bytes 64..): UI pixels, fully covered pixels, and of those how many equal
+// L0 as stored / sRGB-decoded / sRGB-encoded within 2.5/255 (which transform the game's final
+// pass applied, if any). Group-summed, one atomic per counter per group.
+groupshared uint gs_ub[5];
+float maxdiff3(float3 a, float3 b) { const float3 d = abs(a - b); return max(d.r, max(d.g, d.b)); }
+[numthreads(8, 8, 1)]
+void unblend(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+    if (gi < 5) gs_ub[gi] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    if (id.x < w && id.y < h) {
+        const float4 s = t0[id.xy];
+        const bool lin = (flags & 4u) != 0;
+        const float3 p = lin ? srgb_to_linear(s.rgb) : s.rgb;
+        const float3 a = t1[id.xy].rgb;
+        const float3 m = saturate((t2[id.xy].rgb - a) / asfloat(p1));
+        const float3 rec = saturate((p - a) / max(m, 0.04));
+        const float3 o = (m > 0.04) ? rec : p;
+        u0[id.xy] = float4(lin ? linear_to_srgb(o) : o, s.a);
+        const float mmax = max(m.r, max(m.g, m.b));
+        uint dummy;
+        if (mmax < 0.996) InterlockedAdd(gs_ub[0], 1u, dummy);
+        if (mmax < 0.008) {
+            InterlockedAdd(gs_ub[1], 1u, dummy);
+            const float tol = 2.5 / 255.0;
+            if (maxdiff3(p, a) <= tol) InterlockedAdd(gs_ub[2], 1u, dummy);
+            if (maxdiff3(srgb_to_linear(p), a) <= tol) InterlockedAdd(gs_ub[3], 1u, dummy);
+            if (maxdiff3(linear_to_srgb(p), a) <= tol) InterlockedAdd(gs_ub[4], 1u, dummy);
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (gi < 5 && gs_ub[gi]) { uint dummy; stats.InterlockedAdd(64u + gi * 4u, gs_ub[gi], dummy); }
+}
+[numthreads(1, 1, 1)]
+void uclear(uint3 id : SV_DispatchThreadID) { stats.Store4(64u, uint4(0, 0, 0, 0)); stats.Store(80u, 0u); }
+)";
 bool hud_init()
 {
     if (g_small.hud_tried) return g_small.hud_ok;
@@ -3243,8 +3289,8 @@ bool hud_init()
     if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
         FAILED(dev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&g_small.hud_root))))
         return false;
-    const char* entries[7] = {"classify", "dilate", "composite", "clear", "layer", "witness", "wclear"};
-    for (int i = 0; i < 7; ++i) {
+    const char* entries[9] = {"classify", "dilate", "composite", "clear", "layer", "witness", "wclear", "unblend", "uclear"};
+    for (int i = 0; i < 9; ++i) {
         ComPtr<ID3DBlob> code, cerr;
         if (FAILED(D3DCompile(kHudHlsl, sizeof(kHudHlsl) - 1, "j2_small_hud.hlsl", nullptr, nullptr, entries[i], "cs_5_0",
                               D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &cerr)))
@@ -3254,7 +3300,7 @@ bool hud_init()
         pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
         if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_small.hud_pso[i])))) return false;
     }
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRing * 49, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRing * 63, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_small.hud_heap)))) return false;
     D3D12_HEAP_PROPERTIES bhp{D3D12_HEAP_TYPE_DEFAULT};
     D3D12_RESOURCE_DESC bd{};
@@ -3317,7 +3363,7 @@ void hud_pass(ID3D12GraphicsCommandList* l, int pass, uint32_t slot, ID3D12Resou
               ID3D12Resource* const uav[3], const DXGI_FORMAT uf[3], const uint32_t k[8], uint32_t gx, uint32_t gy)
 {
     ID3D12Device* dev = g_small.device.Get();
-    const UINT base = (slot * 7 + static_cast<UINT>(pass)) * 7;
+    const UINT base = (slot * 9 + static_cast<UINT>(pass)) * 7;
     D3D12_CPU_DESCRIPTOR_HANDLE c = g_small.hud_heap->GetCPUDescriptorHandleForHeapStart();
     c.ptr += static_cast<SIZE_T>(base) * g_small.inc;
     for (int i = 0; i < 3; ++i, c.ptr += g_small.inc) {
@@ -3645,6 +3691,85 @@ bool witness_targets(ID3D12Resource* frame, uint32_t rw, uint32_t rh)
 }
 // Completed counts qualify the same colour source for FUTURE frames. Raster
 // injection stays on, and evidence continues after a convention is learned.
+// hud_unblend: the un-blended scene at render size (the picture's format) and the readbacks.
+bool unblend_target(uint32_t w, uint32_t h, DXGI_FORMAT f)
+{
+    if (!g_small.ublend || g_small.ublend_w != w || g_small.ublend_h != h || g_small.ublend_f != f) {
+        g_small.ublend.Reset();
+        if (!texture(w, h, f, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g_small.ublend)) return false;
+        g_small.ublend->SetName(L"NeuralAlias HUD un-blended scene");
+        g_small.ublend_w = w; g_small.ublend_h = h; g_small.ublend_f = f;
+    }
+    if (!g_small.uread[0]) {
+        D3D12_HEAP_PROPERTIES rp{D3D12_HEAP_TYPE_READBACK};
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = 256; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        for (uint32_t i = 0; i < kRing; ++i)
+            if (FAILED(g_small.device->CreateCommittedResource(&rp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_small.uread[i])))) {
+                for (auto& r : g_small.uread) r.Reset();
+                return false;
+            }
+    }
+    return true;
+}
+void unblend_read(uint32_t si)
+{
+    if (!g_small.uread_valid[si]) return;
+    g_small.uread_valid[si] = false;
+    uint32_t v[5] = {};
+    void* ptr = nullptr;
+    const D3D12_RANGE r{0, 20};
+    if (FAILED(g_small.uread[si]->Map(0, &r, &ptr)) || !ptr) return;
+    std::memcpy(v, ptr, sizeof v);
+    const D3D12_RANGE none{0, 0};
+    g_small.uread[si]->Unmap(0, &none);
+    na::j2::hud_unblend::ReportCheck(v[0], v[1], v[2], v[3], v[4]);
+}
+// Records the un-blend pass (L0/L1 RENDER_TARGET -> back to RENDER_TARGET; `frame` NON_PIXEL_SHADER_RESOURCE):
+// g_small.ublend ends NON_PIXEL_SHADER_RESOURCE, the counts copied to uread[si].
+bool unblend_record(ID3D12GraphicsCommandList* l, uint32_t si, ID3D12Resource* frame, DXGI_FORMAT ff, uint32_t rw, uint32_t rh,
+                    const na::j2::native_hud::Layer& layer, std::vector<D3D12_RESOURCE_BARRIER>& b)
+{
+    constexpr UINT RT = D3D12_RESOURCE_STATE_RENDER_TARGET, NPSR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                   UAV = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    if (!hud_init() || !unblend_target(rw, rh, ff)) return false;
+    add(b, layer.l0, RT, NPSR);
+    add(b, layer.l1, RT, NPSR);
+    flush(l, b);
+    uint32_t grey_bits = 0;
+    std::memcpy(&grey_bits, &layer.grey, 4);
+    const uint32_t k[8] = {rw, rh, rw, rh, layer.srgb ? 4u : 0u, 0, grey_bits, 0};
+    {
+        ID3D12Resource* const srv[3] = {nullptr, nullptr, nullptr};
+        const DXGI_FORMAT sf[3] = {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
+        ID3D12Resource* const uav[3] = {nullptr, nullptr, nullptr};
+        const DXGI_FORMAT uf[3] = {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
+        hud_pass(l, 8, si, srv, sf, uav, uf, k, 1, 1);
+    }
+    b.push_back(uav_barrier(g_small.hud_stats.Get()));
+    flush(l, b);
+    {
+        ID3D12Resource* const srv[3] = {frame, layer.l0, layer.l1};
+        const DXGI_FORMAT sf[3] = {ff, layer.view, layer.view};
+        ID3D12Resource* const uav[3] = {g_small.ublend.Get(), nullptr, nullptr};
+        const DXGI_FORMAT uf[3] = {ff, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
+        hud_pass(l, 7, si, srv, sf, uav, uf, k, (rw + 7) / 8, (rh + 7) / 8);
+    }
+    b.push_back(uav_barrier(g_small.ublend.Get()));
+    b.push_back(uav_barrier(g_small.hud_stats.Get()));
+    add(b, g_small.ublend.Get(), UAV, NPSR);
+    add(b, g_small.hud_stats.Get(), UAV, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    add(b, layer.l0, NPSR, RT);
+    add(b, layer.l1, NPSR, RT);
+    flush(l, b);
+    l->CopyBufferRegion(g_small.uread[si].Get(), 0, g_small.hud_stats.Get(), 64, 32);
+    add(b, g_small.hud_stats.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, UAV);
+    flush(l, b);
+    g_small.uread_valid[si] = true;
+    return true;
+}
 void witness_read(uint32_t si)
 {
     if (!g_small.wread_valid[si]) return;
@@ -3748,6 +3873,7 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
         ++g.stats.small_failed; small_note("Render-small: could not reset its list."); return false;
     }
     hud_read(si);
+    unblend_read(si);
     constexpr UINT PRESENT = D3D12_RESOURCE_STATE_PRESENT, NPSR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                    UAV = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     std::vector<D3D12_RESOURCE_BARRIER> b;
@@ -3814,7 +3940,15 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
     const bool hud_want = !layer_frame && g_hud_mask_on.load(std::memory_order_relaxed) && hud_nis > 0 && !hdr && can_dlss &&
                           hud_init() && hud_targets(frame, rw, rh, ow, oh);
     const DXGI_FORMAT of = typed(out->GetDesc().Format);
-    const bool hud_layer = layer_frame && !layer.picture && hud_init() && small_sharp_target(ow, oh, of);
+    // hud_unblend: the UI's effect is removed from DLSS's input first; the layers are laid on only
+    // while the self-check agrees (else the picture is exactly the game's).
+    ID3D12Resource* unblended = nullptr;
+    bool unblend_ran = false;
+    if (layer_frame && layer.unblend && layer.l0 && layer.l1 && !layer.picture) {
+        unblend_ran = unblend_record(l, si, frame, typed(frame->GetDesc().Format), rw, rh, layer, b);
+        if (unblend_ran && layer.compose) unblended = g_small.ublend.Get();
+    }
+    const bool hud_layer = layer_frame && !layer.picture && (!layer.unblend || (layer.compose && unblended)) && hud_init() && small_sharp_target(ow, oh, of);
     if (layer_frame && !layer.picture && !hud_layer) small_note("Render-small: the native HUD could not be laid on (no composite pass); HUD missing this frame.");
     bool draw_picture=false;
     bool hud_mask = false; // mask holds this frame's HUD and is applied
@@ -3919,7 +4053,7 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
             if (hud_mask) ++g.stats.hud_fb_applied; else ++g.stats.hud_fb_learn_only;
         }
         na::dlss::EvalDesc e{};
-        e.color = separate_scene?layer.reconstruction->Scene():draw_picture?layer.picture->Input():frame;
+        e.color = separate_scene?layer.reconstruction->Scene():draw_picture?layer.picture->Input():unblended?unblended:frame;
         const DXGI_FORMAT input_format=typed(e.color->GetDesc().Format);
         // Jitter shift: the declared offset moved into the colour, so the picture does not shake.
         if (!vpj_mode() && (colour_jitter.x != 0 || colour_jitter.y != 0) && na::settings::Get().j2_jitter_shift.load(std::memory_order_relaxed) != 0 &&
@@ -4047,9 +4181,10 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
                    : "Render-small: DLSS is not ready; stretched.");
     }
     if (hud_ran) add(b, g_small.mask.Get(), NPSR, UAV);
+    if (unblend_ran) add(b, g_small.ublend.Get(), NPSR, UAV);
     if (!dlss) {
         flush(l, b);
-        small_stretch(l, separate_scene?layer.reconstruction->Scene():replay&&draw_picture?layer.picture->Input():frame, out, ow, oh, si);
+        small_stretch(l, separate_scene?layer.reconstruction->Scene():replay&&draw_picture?layer.picture->Input():unblended?unblended:frame, out, ow, oh, si);
         g.small_last = 0; // DLSS history is no longer the previous picture
         if (hud_layer) { // the native HUD over the stretched scene, then back into `out`
             UINT out_state = UAV;
@@ -4273,7 +4408,7 @@ bool RecordRcasForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, I
 }
 bool CompileHudShadersForTests(char* why, size_t why_size)
 {
-    for (const char* entry : {"classify", "dilate", "composite", "clear", "layer", "witness", "wclear"}) {
+    for (const char* entry : {"classify", "dilate", "composite", "clear", "layer", "witness", "wclear", "unblend", "uclear"}) {
         ComPtr<ID3DBlob> code, err;
         if (FAILED(D3DCompile(kHudHlsl, sizeof(kHudHlsl) - 1, "j2_small_hud.hlsl", nullptr, nullptr, entry, "cs_5_0",
                               D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err))) {
@@ -4291,6 +4426,42 @@ bool RecordNisForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID
     const bool ok = g_nis.Dispatch(device, list, in, out, w, h, fmt, hdr, percent, 0);
     if (!ok && percent > 100) std::printf("NIS dispatch refused: %s\n", g_nis.Error());
     return ok;
+}
+bool RecordHudUnblendForTests(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list, ID3D12Resource* picture, DXGI_FORMAT picture_format,
+                              ID3D12Resource* l0, ID3D12Resource* l1, DXGI_FORMAT view, float grey, bool srgb, ID3D12Resource* out,
+                              uint32_t w, uint32_t h, ID3D12Resource* counts)
+{
+    std::lock_guard<std::mutex> lock(g.m);
+    if (!small_init(queue) || !hud_init()) return false;
+    uint32_t grey_bits = 0;
+    std::memcpy(&grey_bits, &grey, 4);
+    const uint32_t k[8] = {w, h, w, h, srgb ? 4u : 0u, 0, grey_bits, 0};
+    {
+        ID3D12Resource* const srv[3] = {nullptr, nullptr, nullptr};
+        const DXGI_FORMAT sf[3] = {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
+        ID3D12Resource* const uav[3] = {nullptr, nullptr, nullptr};
+        const DXGI_FORMAT uf[3] = {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
+        hud_pass(list, 8, 0, srv, sf, uav, uf, k, 1, 1);
+    }
+    std::vector<D3D12_RESOURCE_BARRIER> b;
+    b.push_back(uav_barrier(g_small.hud_stats.Get()));
+    flush(list, b);
+    {
+        ID3D12Resource* const srv[3] = {picture, l0, l1};
+        const DXGI_FORMAT sf[3] = {picture_format, view, view};
+        ID3D12Resource* const uav[3] = {out, nullptr, nullptr};
+        const DXGI_FORMAT uf[3] = {picture_format, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
+        hud_pass(list, 7, 0, srv, sf, uav, uf, k, (w + 7) / 8, (h + 7) / 8);
+    }
+    if (counts) {
+        b.push_back(uav_barrier(g_small.hud_stats.Get()));
+        add(b, g_small.hud_stats.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        flush(list, b);
+        list->CopyBufferRegion(counts, 0, g_small.hud_stats.Get(), 64, 32);
+        add(b, g_small.hud_stats.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        flush(list, b);
+    }
+    return true;
 }
 bool RecordHudLayerForTests(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list, ID3D12Resource* picture, DXGI_FORMAT picture_format,
                             ID3D12Resource* n0, ID3D12Resource* n1, DXGI_FORMAT view, float grey, bool srgb, ID3D12Resource* out,

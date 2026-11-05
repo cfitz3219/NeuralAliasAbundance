@@ -1,3 +1,4 @@
+#include "host_dx12/j2/hud_unblend.hpp"
 #include "host_dx12/overlay/usage_sampler.hpp"
 #include "host_dx12/host_boot/process_log.hpp"
 #include "host_dx12/nr/sl_consumer.hpp"
@@ -285,6 +286,10 @@ DWORD WINAPI InitThread(LPVOID)
         // DLSS gets the scene only. [present] native_hud=0 keeps the HUD in the proxy as before.
         if (GetPrivateProfileIntW(L"present", L"native_hud", 1, g_ini) == 1) {
             na::j2::native_hud::Install();
+            // HUD by un-blending ([present] hud_unblend=1, default): the UI is replayed into layers and
+            // un-blended out of the final picture; no hand-off tracking. 0 = native_hud's routes.
+            na::j2::hud_unblend::SetConfigured(GetPrivateProfileIntW(L"present", L"hud_unblend", 1, g_ini) == 1);
+            boot_log(na::j2::hud_unblend::Configured() ? "render-small: HUD by un-blending" : "render-small: HUD by un-blending off ([present] hud_unblend=0)");
             na::j2::native_hud::SetCoverRule(GetPrivateProfileIntW(L"present", L"hud_cover", 0, g_ini) == 1);
             boot_log("render-small: native-resolution HUD on");
         } else boot_log("render-small: native-resolution HUD off ([present] native_hud=0)");

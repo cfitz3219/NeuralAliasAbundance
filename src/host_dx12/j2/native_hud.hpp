@@ -53,6 +53,12 @@ struct Layer {
     ID3D12Resource* ui_output=nullptr; // native UI seeded separately, then actual glyph draws
     DXGI_FORMAT ui_view=DXGI_FORMAT_UNKNOWN;
     bool clean_allowed = false;
+    // hud_unblend: the same UI replayed at the game's own size over black / grey (RENDER_TARGET
+    // between uses); PresentUpscale un-blends the UI out of the picture with them before DLSS.
+    ID3D12Resource* l0 = nullptr;
+    ID3D12Resource* l1 = nullptr;
+    bool unblend = false;  // l0/l1 valid: run the un-blend pass and its self-check
+    bool compose = false;  // and lay n0/n1 on (false while the self-check reports a mismatch)
     // Independent discovery probe; valid even when no HUD layer was produced.
     std::shared_ptr<Picture> probe;
     std::shared_ptr<void> probe_owner;

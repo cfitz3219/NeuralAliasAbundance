@@ -1,6 +1,7 @@
 #include "host_dx12/j2/native_hud.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/hud_picture.hpp"
+#include "host_dx12/j2/hud_unblend.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/nr/native_fg.hpp"
 
@@ -1129,6 +1130,7 @@ public:
     na::observe::ShaderScope Before(ID3D12GraphicsCommandList* l, na::observe::ShaderCall& call) noexcept override
     {
         if (g_tracing.load(std::memory_order_relaxed)) trace_draw(l, call);
+        if (hud_unblend::Enabled()) return hud_unblend::OnDraw(l, call); // the un-blend route owns the draws
         if(call.kind!=na::observe::ShaderKind::Dispatch&&t_bind.canvas&&t_bind.list==l&&g_on.load()){
             na::observe::DrawInfo info;
             if(na::observe::ListDrawState(l,info)&&info.recording==t_bind.recording&&info.rt==t_bind.canvas){
@@ -1234,6 +1236,10 @@ public:
             return {};
         }
         if (!c.target_id || (c.kind != na::observe::TextureKind::ClearDepth && c.kind != na::observe::TextureKind::ClearColor)) return {};
+        if (hud_unblend::Enabled()) {
+            if (c.kind == na::observe::TextureKind::ClearColor && !c.rect_count) hud_unblend::OnClear(l, c.target_id, c.color);
+            return {};
+        }
         std::lock_guard<std::mutex> lock(g_m);
         if (c.kind == na::observe::TextureKind::ClearDepth) {
             Clear& k = g_clears[c.target_id];
@@ -1267,6 +1273,7 @@ void on_bind(ID3D12GraphicsCommandList* l, const na::observe::RasterScissors& s)
 {
     na_object_id rt = 0, ds = 0;
     Bind b{l, s.recording, 0};
+    if (hud_unblend::Enabled()) { hud_unblend::OnBind(l, s.recording); t_bind = b; return; }
     if (g_on.load(std::memory_order_relaxed) && na::observe::ListCurrentTargets(l, &rt, &ds) && (rt || ds)) {
         std::lock_guard<std::mutex> lock(g_m);
         if (rt) {
@@ -1422,6 +1429,7 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
     }
     g_grave.erase(std::remove_if(g_grave.begin(), g_grave.end(), [](const Grave& g) { return g.frame + kGraveFrames < g_frame; }), g_grave.end());
     if (!id) return false;
+    if (hud_unblend::Enabled()) return hud_unblend::TakeFrame(frame, rw, rh, ow, oh, out);
     Proxy* p = find_locked(id);
     if (!p || p->rw != rw || p->rh != rh || p->ow != ow || p->oh != oh) {
         if (!p) { // learn it, replacing the proxy presented longest ago (never the upstream)

@@ -26,6 +26,7 @@
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/fg/frame_gen.hpp"
 #include "host_dx12/j2/native_hud.hpp"
+#include "host_dx12/j2/hud_unblend.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
 #include "host_dx12/j2/compute_flow.hpp"
@@ -976,11 +977,19 @@ void DrawLiveDlaa()
         EndRow();
     }
     if (na::j2::RenderSmall() && na::j2::native_hud::Installed()) {
-        bool native_on = na::j2::native_hud::Enabled();
-        BeginRow("Native-resolution HUD", "Draws compatible HUD and text at your screen's full resolution after DLSS. When clean separation is unavailable, protects recognised HUD pixels from temporal movement. The original game picture stays available. Off leaves HUD in the game's image. Not saved.", SwitchWidth());
-        if (Switch("j2nativehud", &native_on)) na::j2::native_hud::SetEnabled(native_on);
+        const bool unblend = na::j2::hud_unblend::Configured();
+        bool native_on = unblend ? na::j2::hud_unblend::Enabled() : na::j2::native_hud::Enabled();
+        BeginRow("Native-resolution HUD", unblend ? "The game's UI draws are replayed at your screen's full resolution and taken out of DLSS's input; the UI is then laid over the upscaled picture exactly as the game blended it. A per-frame check holds the layers back if the game's final pass changed the picture. Off leaves the HUD in the game's image. Not saved."
+                 : "Draws compatible HUD and text at your screen's full resolution after DLSS. When clean separation is unavailable, protects recognised HUD pixels from temporal movement. The original game picture stays available. Off leaves HUD in the game's image. Not saved.", SwitchWidth());
+        if (Switch("j2nativehud", &native_on)) { if (unblend) na::j2::hud_unblend::SetEnabled(native_on); else na::j2::native_hud::SetEnabled(native_on); }
         EndRow();
-        if(native_on){
+        if(native_on&&unblend){
+            const auto ub=na::j2::hud_unblend::GetStats();
+            char line[160];
+            std::snprintf(line,sizeof line,"Last frame: %u UI draws replayed; check %s (%u/1000 of covered pixels match).",ub.last_draws,
+                          ub.verdict==1?"agrees":ub.verdict==2?"disagrees, HUD left in the game image":"pending",ub.rate_id);
+            Hint(line);
+        } else if(native_on){
             const auto hud=na::j2::native_hud::GetStats();
             Hint(!hud.last_present_native?"Native HUD is not active this frame; text remains in the upscaled game image."
                  :hud.last_draw_method==1?"Last checked frame: native HUD."
