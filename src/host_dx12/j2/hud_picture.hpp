@@ -10,6 +10,7 @@ class Picture {
     struct Impl;
     std::unique_ptr<Impl> p_;
 public:
+    struct ProofReceipt {uint32_t tested=0,matched=0;float maximum_error=0;};
     Picture();
     ~Picture();
     static std::shared_ptr<Picture> Create(ID3D12Device*,const D3D12_RESOURCE_DESC& source,uint32_t ow,uint32_t oh);
@@ -31,7 +32,7 @@ public:
     ID3D12Resource* Mask() const;  // NPSR, R16F; exact draw-derived protection
     ID3D12Resource* Scene() const;
     ID3D12Resource* Full() const;
-    bool ProofAfterCompletion(bool& identity,bool& clean); // caller MUST prove GPU completion; consumed once
+    bool ProofAfterCompletion(bool& identity,bool& clean,ProofReceipt* receipt=nullptr); // caller MUST prove GPU completion; consumed once
     // out is UAV and returned UAV. Identity transfer + complete replay =>
     // native HUD composition; partial replay => current-picture protection.
     bool Composite(ID3D12GraphicsCommandList*,ID3D12Resource* out);
