@@ -69,9 +69,13 @@ public:
     }
 
 private:
-    struct alignas(64) Slot {
+    // 64 bytes per slot: whatever the array's start, each counter sits on its own cache line
+    // (explicit padding rather than alignas, which MSVC /WX reports as C4324).
+    struct Slot {
         std::atomic<uint32_t> count{0};
+        char pad[64 - sizeof(std::atomic<uint32_t>)]{};
     };
+    static_assert(sizeof(Slot) == 64, "one cache line per reader slot");
     static uint32_t my_slot()
     {
         // Threads are numbered on first use; the slot is fixed for the thread's lifetime, so
