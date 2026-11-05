@@ -433,43 +433,15 @@ void emit(const E& e, uint32_t group)
     na::observe_internal::Emit(&e, group);
 }
 
-// Canonical COM identity (review: interface pointers of one object may differ
-// under wrapping layers): the registry is keyed by the object's IUnknown.
-// A small per-thread cache keeps the hot recording path cheap; any retirement invalidates
-// every cache (an address may be reused afterwards). 2026-11-05: one entry thrashed, since a
-// draw canonicalises its list AND its pipeline (note_draw, viewport jitter), so every call fell
-// through to QueryInterface + Release: two COM calls, and interlocked refcount traffic on the
-// game's shared PSOs from every recording thread. Eight entries, round-robin replacement.
-std::atomic<uint64_t> g_retire_gen{1};
-const void* canon(const void* p)
-{
-    if (!p) return nullptr;
-    constexpr unsigned kWays = 8;
-    thread_local const void* c_in[kWays] = {};
-    thread_local const void* c_out[kWays] = {};
-    thread_local uint64_t c_gen = 0;
-    thread_local unsigned c_next = 0;
-    const uint64_t gen = g_retire_gen.load(std::memory_order_acquire);
-    if (gen != c_gen) { for (unsigned i = 0; i < kWays; ++i) c_in[i] = nullptr; c_gen = gen; }
-    for (unsigned i = 0; i < kWays; ++i) if (c_in[i] == p) return c_out[i];
-    IUnknown* u = nullptr;
-    auto* obj = static_cast<IUnknown*>(const_cast<void*>(p));
-    const void* out = p;
-    if (SUCCEEDED(obj->QueryInterface(__uuidof(IUnknown), reinterpret_cast<void**>(&u))) && u) {
-        out = u;
-        u->Release(); // the caller still holds the object
-    }
-    const unsigned w = c_next++ % kWays;
-    c_in[w] = p;
-    c_out[w] = out;
-    return out;
-}
-
 // ---- Hook cost (2026-11-05: with us loaded SE5 ran 35 fps CPU-bound vs 165 without) ----------
 // Wall time spent inside each outermost command-list hook (ours + the driver's call), per
 // slot, plus ExecuteCommandLists and pipeline creation. Thread-local sums are folded into the
 // shared totals every 512 calls, so the measurement itself adds no shared write per call.
 constexpr uint32_t kCostSlots = 128, kCostExec = 125, kCostPso = 126;
+// Pseudo slots (inside the hooks, inclusive, nested in the slot above): 100.. (printed by name).
+constexpr uint32_t kCostPseudo = 100, kCostVpj = 100, kCostShaderUse = 101, kCostLaneBefore = 102, kCostLaneAfter = 103,
+                   kCostDriver = 104, kCostRun = 105, kCostRootTable = 106, kCostSampled = 107, kCostEmit = 108,
+                   kCostNoteDraw = 109, kCostCanonMiss = 110;
 std::atomic<uint64_t> g_cost_ticks[kCostSlots]{}, g_cost_calls[kCostSlots]{};
 thread_local uint64_t t_cost_ticks[kCostSlots]{}, t_cost_calls[kCostSlots]{};
 thread_local uint32_t t_cost_n = 0;
@@ -496,6 +468,40 @@ struct CostScope {
     CostScope(const CostScope&) = delete;
     CostScope& operator=(const CostScope&) = delete;
 };
+
+
+// Canonical COM identity (review: interface pointers of one object may differ
+// under wrapping layers): the registry is keyed by the object's IUnknown.
+// A small per-thread cache keeps the hot recording path cheap; any retirement invalidates
+// every cache (an address may be reused afterwards). 2026-11-05: one entry thrashed, since a
+// draw canonicalises its list AND its pipeline (note_draw, viewport jitter), so every call fell
+// through to QueryInterface + Release: two COM calls, and interlocked refcount traffic on the
+// game's shared PSOs from every recording thread. Eight entries, round-robin replacement.
+std::atomic<uint64_t> g_retire_gen{1};
+const void* canon(const void* p)
+{
+    if (!p) return nullptr;
+    constexpr unsigned kWays = 8;
+    thread_local const void* c_in[kWays] = {};
+    thread_local const void* c_out[kWays] = {};
+    thread_local uint64_t c_gen = 0;
+    thread_local unsigned c_next = 0;
+    const uint64_t gen = g_retire_gen.load(std::memory_order_acquire);
+    if (gen != c_gen) { for (unsigned i = 0; i < kWays; ++i) c_in[i] = nullptr; c_gen = gen; }
+    for (unsigned i = 0; i < kWays; ++i) if (c_in[i] == p) return c_out[i];
+    const CostScope miss(kCostCanonMiss);
+    IUnknown* u = nullptr;
+    auto* obj = static_cast<IUnknown*>(const_cast<void*>(p));
+    const void* out = p;
+    if (SUCCEEDED(obj->QueryInterface(__uuidof(IUnknown), reinterpret_cast<void**>(&u))) && u) {
+        out = u;
+        u->Release(); // the caller still holds the object
+    }
+    const unsigned w = c_next++ % kWays;
+    c_in[w] = p;
+    c_out[w] = out;
+    return out;
+}
 
 // Sentinel attached as private data: its last Release is the object's destruction.
 class RetireSentinel final : public IUnknown {
@@ -2293,6 +2299,7 @@ bool begin_op(ID3D12GraphicsCommandList* l, Rec* r)
 void emit_op(const Rec& r, uint32_t op, std::initializer_list<uint64_t> a, const void* payload = nullptr, uint32_t bytes = 0,
              uint32_t stride = 0, uint32_t extra_flags = 0, uint32_t group = NA_GROUP_PASS)
 {
+    const CostScope cost(kCostEmit);
     constexpr uint32_t kMaxPayload = 64 * sizeof(na_barrier);
     struct Ev {
         na_ev_list_op e;
@@ -2504,6 +2511,7 @@ struct On<sl::list::Close> {
     }
 };
 void note_draw(GL* l) {
+    const CostScope cost(kCostNoteDraw);
     std::shared_lock<std::shared_mutex> lock(g_m);
     na_object_id id = 0;
     auto* ls = list_state_locked(l, &id);
@@ -2914,6 +2922,7 @@ std::atomic<EntryCallback> g_entry_cb{nullptr};
 template <uint32_t Compute>
 void root_table(GL* l, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE h)
 {
+    const CostScope cost(kCostRootTable);
     Rec r;
     if (!begin_op(l, &r)) return;
     na_object_id heap = 0;
@@ -2939,6 +2948,7 @@ void root_table(GL* l, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE h)
                     for (uint32_t q = 0; q < rp.count && rp.first_range + q < rr.size(); ++q) {
                         const na_root_range& range = rr[rp.first_range + q];
                         if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && range.table_offset != NA_UNKNOWN_U32) {
+                            const CostScope sampled(kCostSampled);
                             std::lock_guard<std::mutex> bl(ls->bind_m);
                             for (uint32_t k = 0; k < std::min<uint32_t>(range.num_descriptors, 64); ++k) {
                                 const uint64_t index = uint64_t(slot) + range.table_offset + k;
@@ -3722,7 +3732,7 @@ struct ListHook<Slot, R(A...)> {
         auto fn = reinterpret_cast<Pfn>(orig[I]);
         if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced ||
                       Slot == sl::list::ExecuteIndirect || Slot == sl::list::ExecuteBundle)
-            if (!t_host_work && scope.outermost && !scope.ambiguous) vpj_before_draw(l);
+            if (!t_host_work && scope.outermost && !scope.ambiguous) { const CostScope c(kCostVpj); vpj_before_draw(l); }
         if constexpr (Slot == sl::list::RSSetViewports || Slot == sl::list::Reset)
             if (scope.outermost && !scope.ambiguous) vpj_viewports_replaced(l, Slot == sl::list::Reset);
         if constexpr (Slot == sl::list::ResourceBarrier) {
@@ -3794,9 +3804,9 @@ struct ListHook<Slot, R(A...)> {
                 }
             }
             if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced || Slot == sl::list::Dispatch)
-                if (scope.outermost && !scope.ambiguous) before_shader_use(l, Slot == sl::list::Dispatch);
+                if (scope.outermost && !scope.ambiguous) { const CostScope c(kCostShaderUse); before_shader_use(l, Slot == sl::list::Dispatch); }
             if constexpr(Slot==sl::list::ExecuteIndirect)
-                if(scope.outermost && !scope.ambiguous)before_shader_use(l,false,true);
+                if(scope.outermost && !scope.ambiguous){ const CostScope c(kCostShaderUse); before_shader_use(l,false,true); }
             if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced || Slot == sl::list::Dispatch) {
                 if (!t_host_work && scope.outermost && !scope.ambiguous && g_shader_hooks_enabled.load(std::memory_order_acquire)) {
                     const auto hooks = std::atomic_load_explicit(&g_shader_hooks, std::memory_order_acquire);
@@ -3813,23 +3823,23 @@ struct ListHook<Slot, R(A...)> {
                         for (unsigned i = 0; i < 2; ++i) {
                             entered = i + 1;
                             if (!hooks->lane[i]) continue;
-                            { HostWorkScope own; saved[i] = hooks->lane[i]->Before(l, call); }
+                            { const CostScope c(kCostLaneBefore); HostWorkScope own; saved[i] = hooks->lane[i]->Before(l, call); }
                             if (saved[i].action == ShaderAction::Replaced) { replaced = true; break; }
                         }
                         if (!replaced) {
                             if constexpr (Slot == sl::list::Dispatch) {
-                                fn(l, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]));
-                                On<Slot>::run(l, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]));
+                                { const CostScope c(kCostDriver); fn(l, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2])); }
+                                { const CostScope c(kCostRun); On<Slot>::run(l, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2])); }
                             } else if constexpr (Slot == sl::list::DrawInstanced) {
-                                fn(l, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), UINT(call.args[3]));
-                                On<Slot>::run(l, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), UINT(call.args[3]));
+                                { const CostScope c(kCostDriver); fn(l, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), UINT(call.args[3])); }
+                                { const CostScope c(kCostRun); On<Slot>::run(l, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), UINT(call.args[3])); }
                             } else {
-                                fn(l, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), INT(call.args[3]), UINT(call.args[4]));
-                                On<Slot>::run(l, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), INT(call.args[3]), UINT(call.args[4]));
+                                { const CostScope c(kCostDriver); fn(l, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), INT(call.args[3]), UINT(call.args[4])); }
+                                { const CostScope c(kCostRun); On<Slot>::run(l, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), INT(call.args[3]), UINT(call.args[4])); }
                             }
                         } // A skipped native command is NOT emitted as an executed game draw/write.
                         for (unsigned i = entered; i > 0; --i) if (hooks->lane[i - 1]) {
-                            HostWorkScope own; hooks->lane[i - 1]->After(l, call, saved[i - 1]);
+                            const CostScope c(kCostLaneAfter); HostWorkScope own; hooks->lane[i - 1]->After(l, call, saved[i - 1]);
                         }
                         return;
                     }
@@ -3885,7 +3895,7 @@ struct ListHook<Slot, R(A...)> {
                     }
                 }
             }
-            fn(l, a...);
+            { const CostScope c(kCostDriver); fn(l, a...); }
             if constexpr (Slot == sl::list::CopyResource || Slot == sl::list::ResolveSubresource || Slot == sl::list::CopyTextureRegion) {
                 if (scope.outermost && !scope.ambiguous) {
                     auto args = std::forward_as_tuple(a...);
@@ -6314,13 +6324,17 @@ void FormatHookCost(char* out, size_t n)
         if (!dc || secs <= 0) continue;
         const double ms = double(dt) * 1000.0 / double(f.QuadPart);
         rows[nr++] = {i, ms / secs, double(dc) / secs, ms * 1000.0 / double(dc)};
-        if (i < kCostExec) list_total += ms / secs;
+        if (i < kCostPseudo) list_total += ms / secs;
     }
     prev_at = now;
     std::sort(rows, rows + nr, [](const Row& a, const Row& b) { return a.ms_per_s > b.ms_per_s; });
     int w = std::snprintf(out, n, "hook_cost window_s=%.1f list_ms_per_s=%.1f", secs, list_total);
-    for (uint32_t i = 0; i < nr && i < 14 && w > 0 && size_t(w) < n; ++i) {
-        const char* tag = rows[i].slot == kCostExec ? "exec" : rows[i].slot == kCostPso ? "pso" : nullptr;
+    static const char* const kPseudo[] = {"vpj", "shader_use", "lane_before", "lane_after", "driver", "run", "root_table",
+                                           "sampled", "emit", "note_draw", "canon_miss"};
+    for (uint32_t i = 0; i < nr && i < 24 && w > 0 && size_t(w) < n; ++i) {
+        const uint32_t sl = rows[i].slot;
+        const char* tag = sl == kCostExec ? "exec" : sl == kCostPso ? "pso" :
+                          (sl >= kCostPseudo && sl <= kCostCanonMiss) ? kPseudo[sl - kCostPseudo] : nullptr;
         if (tag) w += std::snprintf(out + w, n - w, " %s{ms_per_s=%.1f calls_per_s=%.0f us=%.2f}", tag, rows[i].ms_per_s, rows[i].calls_per_s, rows[i].us_per_call);
         else w += std::snprintf(out + w, n - w, " s%u{ms_per_s=%.1f calls_per_s=%.0f us=%.2f}", rows[i].slot, rows[i].ms_per_s, rows[i].calls_per_s, rows[i].us_per_call);
     }
