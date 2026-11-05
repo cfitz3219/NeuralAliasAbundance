@@ -257,10 +257,14 @@ Opus's independent lean-overhead version remains separate for comparison at
 Cort's direction. Comparing versions should keep functional settings and HUD
 processing equivalent; passing the benchmark alone does not establish game FPS.
 
-On Cort's HUD-scanner question: removing its checkbox has negligible cost.
-Removing the functional scanner/replay would save work but lose native HUD
-separation. The final benchmark's inactive HUD-hook difference is 0.2789 ms wall
-per 6,000 draws (3.9769 minus 3.6980); it does not measure active HUD detection,
-replay or GPU work. Detailed periodic draw tracing is a separate diagnostic path
-and can be made opt-in independently. It is not silently removed from this
-already-qualified runtime in response to a feasibility question.
+Cort clarified that his question means only the pink Show HUD layer/mask toggle.
+`SetHudMaskView` sets a tint flag passed into existing HUD processing/composition
+passes. It starts no separate scanner or extra dispatch. When off, pink-blending
+math is skipped; deleting that checkbox/code has negligible ordinary-play CPU
+benefit. The discussion about removing functional separation does not apply to
+his clarified request. No functional HUD code was removed.
+
+The final benchmark's inactive HUD-hook difference is 0.2789 ms wall per 6,000
+draws (3.9769 minus 3.6980); this is the whole hook path, not the pink toggle's
+cost, and excludes active HUD detection, replay and GPU work. Detailed periodic
+draw tracing is another diagnostic path and can be made opt-in independently.
