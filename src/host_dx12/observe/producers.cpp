@@ -476,7 +476,8 @@ constexpr uint32_t kCostSlots = 128, kCostExec = 125, kCostPso = 126;
 // Pseudo slots (inside the hooks, inclusive, nested in the slot above): 100.. (printed by name).
 constexpr uint32_t kCostPseudo = 100, kCostVpj = 100, kCostShaderUse = 101, kCostLaneBefore = 102, kCostLaneAfter = 103,
                    kCostDriver = 104, kCostRun = 105, kCostRootTable = 106, kCostSampled = 107, kCostEmit = 108,
-                   kCostNoteDraw = 109, kCostCanonMiss = 110;
+                   kCostNoteDraw = 109, kCostCanonMiss = 110,
+                   kCostDescCopy = 111, kCostDescCopyWait = 112, kCostDescWrite = 113, kCostDescWriteWait = 114; // descriptor copies/writes and their wait for the exclusive g_m
 std::atomic<bool> g_cost_enabled{false};
 std::atomic<uint64_t> g_cost_ticks[kCostSlots]{}, g_cost_calls[kCostSlots]{};
 thread_local uint64_t t_cost_ticks[kCostSlots]{}, t_cost_calls[kCostSlots]{};
@@ -953,7 +954,9 @@ void note_descriptor_write(D3D12_CPU_DESCRIPTOR_HANDLE dst, uint32_t kind, IUnkn
         rid = id_locked(resource);
     }
     {
-        std::unique_lock<std::shared_mutex> lock(g_m);
+        const CostScope cost(kCostDescWrite);
+        std::unique_lock<std::shared_mutex> lock(g_m, std::defer_lock);
+        { const CostScope wait(kCostDescWriteWait); lock.lock(); }
         uint32_t slot = 0;
         DescHeap* h = heap_for_cpu_locked(dst.ptr, &slot);
         if (!h) {
@@ -988,7 +991,9 @@ void note_descriptor_copy(uint64_t dst, uint64_t src, uint32_t count, uint32_t i
         init_header(e, NA_EV_DESCRIPTOR_COPY, 0);
         uint32_t run = 0;
         {
-            std::unique_lock<std::shared_mutex> lock(g_m);
+            const CostScope cost(kCostDescCopy);
+            std::unique_lock<std::shared_mutex> lock(g_m, std::defer_lock);
+            { const CostScope wait(kCostDescCopyWait); lock.lock(); }
             uint32_t ds = 0, ss = 0;
             DescHeap* dh = heap_for_cpu_locked(dst, &ds);
             DescHeap* sh = heap_for_cpu_locked(src, &ss);
@@ -1250,7 +1255,9 @@ void STDMETHODCALLTYPE D_CreateConstantBufferView(ID3D12Device* dev, const D3D12
     na_ev_descriptor_write e;
     init_header(e, NA_EV_DESCRIPTOR_WRITE, known ? 0u : NA_EVF_METHOD_UNOBSERVED);
     {
-        std::unique_lock<std::shared_mutex> lock(g_m);
+        const CostScope cost(kCostDescWrite);
+        std::unique_lock<std::shared_mutex> lock(g_m, std::defer_lock);
+        { const CostScope wait(kCostDescWriteWait); lock.lock(); }
         uint32_t slot = 0;
         DescHeap* dh = heap_for_cpu_locked(h.ptr, &slot);
         if (!dh) {
@@ -6467,11 +6474,12 @@ void FormatHookCost(char* out, size_t n)
     std::sort(rows, rows + nr, [](const Row& a, const Row& b) { return a.ms_per_s > b.ms_per_s; });
     int w = std::snprintf(out, n, "hook_cost window_s=%.1f list_ms_per_s=%.1f", secs, list_total);
     static const char* const kPseudo[] = {"vpj", "shader_use", "lane_before", "lane_after", "driver", "run", "root_table",
-                                           "sampled", "emit", "note_draw", "canon_miss"};
+                                           "sampled", "emit", "note_draw", "canon_miss", "desc_copy", "desc_copy_wait",
+                                           "desc_write", "desc_write_wait"};
     for (uint32_t i = 0; i < nr && i < 24 && w > 0 && size_t(w) < n; ++i) {
         const uint32_t sl = rows[i].slot;
         const char* tag = sl == kCostExec ? "exec" : sl == kCostPso ? "pso" :
-                          (sl >= kCostPseudo && sl <= kCostCanonMiss) ? kPseudo[sl - kCostPseudo] : nullptr;
+                          (sl >= kCostPseudo && sl <= kCostDescWriteWait) ? kPseudo[sl - kCostPseudo] : nullptr;
         if (tag) w += std::snprintf(out + w, n - w, " %s{ms_per_s=%.1f calls_per_s=%.0f us=%.2f}", tag, rows[i].ms_per_s, rows[i].calls_per_s, rows[i].us_per_call);
         else w += std::snprintf(out + w, n - w, " s%u{ms_per_s=%.1f calls_per_s=%.0f us=%.2f}", rows[i].slot, rows[i].ms_per_s, rows[i].calls_per_s, rows[i].us_per_call);
     }
