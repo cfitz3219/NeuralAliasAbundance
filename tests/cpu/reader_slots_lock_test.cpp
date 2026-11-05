@@ -40,6 +40,11 @@ int main() {
                         if (x != y) torn.fetch_add(1);
                         reads.fetch_add(1);
                         inside_readers.fetch_sub(1);
+                        r.unlock();
+                        // Real readers (descriptor hooks) spend most of their time outside g_m;
+                        // a 100% in-lock loop on an oversubscribed CI runner only measures how
+                        // long the scheduler takes to run every preempted reader once.
+                        std::this_thread::yield();
                     }
                 });
             for (int t = 0; t < 3; ++t)
@@ -56,7 +61,9 @@ int main() {
                         std::this_thread::sleep_for(std::chrono::microseconds(50));
                     }
                 });
-            std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+            const auto t0 = std::chrono::steady_clock::now();
+            while (writes.load() < 2000 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(10))
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
             stop.store(true);
             for (auto& t : ts) t.join();
             std::printf("reads %llu writes %llu torn %llu overlap %llu\n", (unsigned long long)reads.load(),
@@ -64,7 +71,7 @@ int main() {
             CHECK(torn.load() == 0);
             CHECK(overlap.load() == 0);
             CHECK(reads.load() > 1000);
-            CHECK(writes.load() > 10); // writers are not starved by 70 readers
+            CHECK(writes.load() >= 2000); // writers are not starved by 70 readers
             CHECK(a == b && a == writes.load());
             CHECK(m.readers() == 0);
         }},
