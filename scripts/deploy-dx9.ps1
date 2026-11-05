@@ -7,7 +7,9 @@ param(
     # Jitter is on by default (it runs only while DLSS delivers); -NoJitter turns it off.
     [switch]$NoJitter,
     [int]$Preset = 0,
-    [switch]$CopyTest
+    [switch]$CopyTest,
+    # Optical-flow motion in the helper is on by default; -NoFlow turns it off.
+    [switch]$NoFlow
 )
 # Generic DX9 test install (docs/DX9.md). Adds files next to the game's exe and
 # never changes a game file: an existing d3d9.dll (ReShade, dgVoodoo, DXVK, another
@@ -114,6 +116,8 @@ jitter=$jitter
 jitter_phases=8
 mip_bias=-1
 copy_test=$([int][bool]$CopyTest)
+flow=$([int](-not $NoFlow))
+flow_loosen=50
 "@ | Set-Content -LiteralPath $ini -Encoding ASCII
 $records += [PSCustomObject]@{ destination = $ini; hash = (Hash $ini) }
 $commit = if (Test-Path (Join-Path $PackageRoot 'commit.txt')) { (Get-Content -Raw (Join-Path $PackageRoot 'commit.txt')).Trim() } else { 'unknown' }

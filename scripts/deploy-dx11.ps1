@@ -5,7 +5,9 @@ param(
     [string]$GameExe,
     [string]$PackageRoot,
     [switch]$Jitter,
-    [switch]$CopyTest
+    [switch]$CopyTest,
+    # Optical-flow object motion in the helper is on by default; -NoFlow turns it off.
+    [switch]$NoFlow
 )
 # Generic DX11 test install (docs/DX11-HOOKS.md). Adds files next to the game's
 # exe, never changes a game file: an existing dxgi.dll (ReShade, another mod) is
@@ -86,6 +88,8 @@ mip_bias=-1.0
 preset=12
 cpu_wait=0
 copy_test=$([int][bool]$CopyTest)
+flow=$([int](-not $NoFlow))
+flow_loosen=50
 "@ | Set-Content -LiteralPath $ini -Encoding ASCII
 $records += [PSCustomObject]@{ destination = $ini; hash = (Hash $ini) }
 $commit = if (Test-Path (Join-Path $PackageRoot 'commit.txt')) { (Get-Content -Raw (Join-Path $PackageRoot 'commit.txt')).Trim() } else { 'unknown' }

@@ -22,6 +22,8 @@ mip_bias=-1.0    ; applied to new mip-mapped samplers when jitter=1
 preset=12        ; DLSS preset (12 = L, Cort's choice for DLAA)
 cpu_wait=0       ; 1 = the CPU waits for the helper (slower, can never stall the GPU)
 copy_test=0      ; 1 = no DLSS, the helper copies the picture (checks the plumbing only)
+flow=1           ; optical-flow object motion in the helper (AMD FidelityFX); changes live
+flow_loosen=50   ; flow acceptance looseness 0..100 (0 = the strict Anno-run gates); changes live
 log=             ; log file; default %LOCALAPPDATA%\NeuralAlias\dx11\NeuralAliasDX11-<pid>.log
 ```
 

@@ -19,7 +19,8 @@ unwrap colour + depth (D3D12 resources) → copy into shared textures
   │                                                src/host_dx9/dx9_transport.cpp, src/bridge/dx12_game_bridge.cpp
   ▼
 na_bridge_helper64.exe (unchanged, the same helper DX11 and Vulkan use)
-  │  camera motion from depth + reprojection, DLSS
+  │  camera motion from depth + reprojection,
+  │  + optical-flow object motion (AMD FidelityFX, src/bridge/helper_flow.cpp), DLSS
   ▼
 result copied back into the scene colour → handed back to DX9 with our fence
   → the game's tonemap / HUD carries on as normal
@@ -31,7 +32,8 @@ result copied back into the scene colour → handed back to DX9 with our fence
 | Ears | Scene colour = the target that gets the most depth-tested draws; depth only counts with `ZENABLE` on. Camera: the ViewProjection (+ its inverse) in the vertex-shader constants, found by the same matrix scan as DX11, ignoring registers that change for most draws (per-object matrices); fixed-function games use View × Projection. |
 | DLSS point | Before the first read of the finished scene colour (the tonemap); for games that draw the scene straight into the back buffer, before the first HUD draw after the last scene draw; else at Present. |
 | Jitter | Every vertex shader is rewritten at creation: its position output goes through a spare temp, then `oPos.xy += cJ.xy × oPos.w`, with `cJ` the device's last constant register (a shader that already reads it is left alone). Before each draw `cJ` is set to the jitter (scene draws) or zero (everything else), only when it changes. Fixed-function scene draws get a jittered projection the same way. The game's matrices are never touched, so the camera stays exact. Jitter only runs while DLSS is delivering, so the picture never shakes without it. Mip bias −1 is added to the game's own on all samplers while jittering. |
-| Motion | Camera motion: the helper reprojects the depth with current → previous ViewProjection. Games where no camera is found get no motion (see "Not yet"). |
+| Motion | Camera motion: the helper reprojects the depth with current → previous ViewProjection. On top, optical flow (below) adds what moves by itself. Games where no camera is found send "no camera motion" and get their whole motion from the flow. |
+| Optical flow | The helper runs the same AMD FidelityFX optical flow and the same acceptance gates as the DX12 host (jitter-stabilised images, depth-aware expansion, flow minus camera, image check, texture check, temporal agreement, AMD scene change), on any DX12 GPU with 32/64-lane waves (every RTX card). Accepted pixels become the motion arbiter's tier 3. If the GPU cannot run it, the helper keeps camera motion and counts the frames as "unavailable". The log line every 600 results shows engine, frames and the accepted share. |
 
 ## Install (test)
 
@@ -61,24 +63,29 @@ or `NeuralAliasHost.ini`, and never changes a game file.
 | `jitter_phases` | 8 | Halton sequence length. |
 | `mip_bias` | −1 | Added while jittering (−3…0). |
 | `copy_test` | 0 | 1 = no DLSS; the helper copies and the way back swaps red/blue (pipeline test). |
+| `flow` | 1 | Optical-flow motion in the helper. **Changes live** (re-read about once a second). |
+| `flow_loosen` | 50 | Flow acceptance looseness 0–100 (0 = the strict Anno-run gates, 50 = the DX12 host's default). **Changes live.** |
 | `log` | | Log path; default `%LOCALAPPDATA%\NeuralAlias\dx9\NeuralAliasDX9-<pid>.log`. |
 
-Settings are read at start-up for now. There is no in-game overlay for DX9 yet.
+`flow` and `flow_loosen` change live while the game runs; the others are read at start-up for now. There is no in-game overlay for DX9 yet.
 
 ## Tests (CI, Windows x64 and Win32)
 
 - `dx9_d3d9on12_probe`: colour and D24S8 depth readable through D3D9On12, 32 and 64-bit.
 - `dx9_ears` (portable): scene, depth, camera register, read point, HUD rule, fixed function, loading screens.
 - `dx9_vs_patch` (portable): vs_1_1 / vs_2_0 / vs_3_0 shaders run in a small VM before and after the patch: position moves by exactly jitter × w, every other output unchanged, refusals.
+- `helper_flow_test` (real GPU; skips on CI's software GPU): a block moving 4 px per frame with no camera goes through the helper's flow and the arbiter; the final motion inside it must be (−4, 0) px and the still background must stay still.
+- `ffx_flow_test`, `ffx_flow_shaders_test` (from the DX12 host): the AMD engine itself.
 - `dx9_proxy_off/on/copy/jitter`: a small DX9 game (post-processed, then back-buffer) through the real proxy.
   - `copy`: the helper's result reaches the tonemap with red/blue swapped, the HUD is untouched, camera motion frames are sent.
   - `jitter`: a colour-gradient quad is drawn as part of the scene in a 32-bit float target; over 12 frames `16 r + jx` must stay constant, i.e. the picture moves by exactly the jitter DLSS is told (within 0.02 px).
 
 ## Not yet
 
-- **Optical-flow motion** for games where no camera matrix is found (only
-  per-object matrices): those get zero motion today, so DLSS can ghost on
-  moving objects and camera pans. Camera motion covers games that upload a
-  ViewProjection, which the scan finds.
+- **NVIDIA's hardware optical flow (NVOFA)** in the helper. The helper runs
+  AMD's engine (it runs on NVIDIA cards too). NVIDIA's needs the Optical Flow
+  SDK headers, which are not public, so CI-built packages cannot contain it.
+- Optical flow is not yet checked on a real card for the helper (CI has no GPU
+  that can run it): `helper_flow_test` is the first thing to run on one.
 - No overlay / live settings for DX9 (start-up ini only).
 - Not run on a real game yet.
