@@ -178,7 +178,12 @@ std::shared_ptr<Picture> Picture::Create(ID3D12Device* dev,const D3D12_RESOURCE_
  if(FAILED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&p.heap))))return {};return result;
 }
 bool Picture::Matches(ID3D12Device* d,const D3D12_RESOURCE_DESC& s,uint32_t ow,uint32_t oh)const{return p_->program->dev.Get()==d&&p_->w==s.Width&&p_->h==s.Height&&p_->source_format==s.Format&&p_->ow==ow&&p_->oh==oh;}
-void Picture::BeginCycle(){p_->prepared=p_->scene_current=p_->full_current=p_->proof_read=false;p_->frame.Reset();p_->motion.Reset();p_->n[0].Reset();p_->n[1].Reset();}
+void Picture::BeginCycle(){
+ // Present uses page1. The UI-only path deliberately skips Prepare, so it
+ // cannot rely on Prepare selecting page0 for the next pre-HUD recording.
+ p_->descriptor_page=0;
+ p_->prepared=p_->scene_current=p_->full_current=p_->proof_read=false;p_->frame.Reset();p_->motion.Reset();p_->n[0].Reset();p_->n[1].Reset();
+}
 bool Picture::SnapshotScene(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES s){return p_->scene_current=p_->snapshot(l,r,s,p_->scene,p_->scene_ready);}
 bool Picture::SnapshotFull(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES s){return p_->full_current=p_->snapshot(l,r,s,p_->full,p_->full_ready);}
 bool Picture::Probe(ID3D12GraphicsCommandList* l,ID3D12Resource* frame,DXGI_FORMAT view){
