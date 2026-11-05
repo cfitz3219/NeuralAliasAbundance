@@ -435,17 +435,23 @@ void emit(const E& e, uint32_t group)
 
 // Canonical COM identity (review: interface pointers of one object may differ
 // under wrapping layers): the registry is keyed by the object's IUnknown.
-// A one-entry per-thread cache keeps the hot recording path cheap; any
-// retirement invalidates every cache (an address may be reused afterwards).
+// A small per-thread cache keeps the hot recording path cheap; any retirement invalidates
+// every cache (an address may be reused afterwards). 2026-11-05: one entry thrashed, since a
+// draw canonicalises its list AND its pipeline (note_draw, viewport jitter), so every call fell
+// through to QueryInterface + Release: two COM calls, and interlocked refcount traffic on the
+// game's shared PSOs from every recording thread. Eight entries, round-robin replacement.
 std::atomic<uint64_t> g_retire_gen{1};
 const void* canon(const void* p)
 {
     if (!p) return nullptr;
-    thread_local const void* c_in = nullptr;
-    thread_local const void* c_out = nullptr;
+    constexpr unsigned kWays = 8;
+    thread_local const void* c_in[kWays] = {};
+    thread_local const void* c_out[kWays] = {};
     thread_local uint64_t c_gen = 0;
+    thread_local unsigned c_next = 0;
     const uint64_t gen = g_retire_gen.load(std::memory_order_acquire);
-    if (p == c_in && gen == c_gen) return c_out;
+    if (gen != c_gen) { for (unsigned i = 0; i < kWays; ++i) c_in[i] = nullptr; c_gen = gen; }
+    for (unsigned i = 0; i < kWays; ++i) if (c_in[i] == p) return c_out[i];
     IUnknown* u = nullptr;
     auto* obj = static_cast<IUnknown*>(const_cast<void*>(p));
     const void* out = p;
@@ -453,9 +459,9 @@ const void* canon(const void* p)
         out = u;
         u->Release(); // the caller still holds the object
     }
-    c_in = p;
-    c_out = out;
-    c_gen = gen;
+    const unsigned w = c_next++ % kWays;
+    c_in[w] = p;
+    c_out[w] = out;
     return out;
 }
 
