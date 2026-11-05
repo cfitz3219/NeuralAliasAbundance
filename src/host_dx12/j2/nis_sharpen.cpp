@@ -1,3 +1,4 @@
+#include "host_dx12/background/work.hpp"
 #include "host_dx12/j2/nis_sharpen.hpp"
 
 #include <d3dcompiler.h>
@@ -80,7 +81,7 @@ bool NisSharpen::start_compile()
     c->bh = opt.GetOptimalBlockHeight();
     const uint32_t tg = opt.GetOptimalThreadGroupSize();
     try {
-        std::thread([c, tg] {
+        if(!na::background::Submit([c, tg] {
             for (int hdr = 0; hdr < 2; ++hdr) {
                 bool patched = false;
                 const std::string src = build_source(hdr == 1, c->bw, c->bh, tg, &patched);
@@ -101,7 +102,7 @@ bool NisSharpen::start_compile()
                 release(code);
             }
             c->state.store(1);
-        }).detach();
+        }))return false;
     } catch (...) {
         return false;
     }

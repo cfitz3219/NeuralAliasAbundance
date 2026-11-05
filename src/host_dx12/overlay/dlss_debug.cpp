@@ -1,3 +1,4 @@
+#include "host_dx12/background/work.hpp"
 #include "host_dx12/overlay/dlss_debug.hpp"
 #include "host_dx12/capture/capture_session.hpp"
 #include "host_dx12/capture/frame_capture.hpp"
@@ -69,6 +70,8 @@ void hash_worker(std::wstring path)
     char hex[65] = {};
     const bool ok = sha256_file(path.c_str(), hex);
     std::lock_guard<std::mutex> lock(g_m);
+    // A queued job may finish after a different model DLL/path became current.
+    if(wcscmp(path.c_str(),g_info.path)!=0){g_hashing=false;return;}
     g_hashed = true;
     wcsncpy_s(g_hashed_path, path.c_str(), _TRUNCATE);
     if (ok) {
@@ -106,7 +109,7 @@ void refresh_locked()
             }
         }
         if (!g_hashed && !g_hashing.exchange(true)) {
-            std::thread(hash_worker, std::wstring(path)).detach();
+            if(!na::background::Submit([file=std::wstring(path)]{hash_worker(file);}))g_hashing=false;
         }
     } else {
         g_info.loaded = false;

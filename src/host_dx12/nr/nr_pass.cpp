@@ -1,3 +1,4 @@
+#include "host_dx12/gpu/mem_alloc.hpp"
 #include "host_dx12/nr/sl_consumer.hpp"
 #include "host_dx12/gpu/services.hpp"
 #include "host_dx12/diag/dred.hpp"
@@ -239,8 +240,6 @@ D3D12_RESOURCE_BARRIER uav_barrier(ID3D12Resource* r)
 
 bool create_texture(UINT w, UINT h, DXGI_FORMAT fmt, bool uav, D3D12_RESOURCE_STATES state, ComPtr<ID3D12Resource>& out)
 {
-    D3D12_HEAP_PROPERTIES hp{};
-    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC d{};
     d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     d.Width = w;
@@ -251,7 +250,7 @@ bool create_texture(UINT w, UINT h, DXGI_FORMAT fmt, bool uav, D3D12_RESOURCE_ST
     d.SampleDesc.Count = 1;
     d.Flags = uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
     out.Reset();
-    return SUCCEEDED(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, state, nullptr, IID_PPV_ARGS(&out)));
+    return SUCCEEDED(na::gpu::mem::CreateResource(g.device.Get(),D3D12_HEAP_TYPE_DEFAULT,d,state,nullptr,out.GetAddressOf()));
 }
 
 bool uav_store_supported(DXGI_FORMAT fmt)

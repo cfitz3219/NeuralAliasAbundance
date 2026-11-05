@@ -198,7 +198,6 @@ add_library(host_dx12 STATIC
   src/host_dx12/overlay/overlay.cpp
   src/host_dx12/overlay/usage_sampler.cpp
   src/host_dx12/overlay/dlss_debug.cpp
-  src/host_dx12/gpu/mem_alloc.cpp
   src/host_dx12/overlay/menu.cpp
   src/host_dx12/overlay/route_a_panel.cpp
   src/host_dx12/overlay/presenter.cpp
@@ -262,13 +261,20 @@ if(NA_HAVE_DONUT)
   add_dependencies(host_dx12 donut_shaders)
 endif()
 
+include(cmake/taskflow.cmake)
+add_library(host_background STATIC src/host_dx12/background/work.cpp)
+set_target_properties(host_background PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+target_link_libraries(host_background PUBLIC abundance_options host_observe_producers PRIVATE na_taskflow_headers)
+
+add_library(host_gpu_memory STATIC src/host_dx12/gpu/mem_alloc.cpp)
+target_link_libraries(host_gpu_memory PUBLIC abundance_options host_observe_producers d3d12ma d3d12 dxgi)
 add_library(host_gpu_services STATIC src/host_dx12/gpu/services.cpp)
-target_link_libraries(host_gpu_services PUBLIC abundance_options host_settings host_observe_producers d3d12)
+target_link_libraries(host_gpu_services PUBLIC abundance_options host_settings host_observe_producers host_gpu_memory d3d12)
 if(NA_HAVE_NVRHI)
   target_compile_definitions(host_gpu_services PUBLIC NA_HAVE_NVRHI)
   target_link_libraries(host_gpu_services PRIVATE nvrhi nvrhi_d3d12)
 endif()
-target_link_libraries(host_dx12 PUBLIC host_gpu_services)
+target_link_libraries(host_dx12 PUBLIC host_gpu_services host_background)
 target_include_directories(host_dx12 SYSTEM PRIVATE third_party/nis)
 target_link_libraries(host_dx12
   PUBLIC abundance_options d3d12ma host_hooking host_native_present host_scale host_settings host_capture host_nvof host_ffx_flow core_gpu imgui nvapi_headers host_dlss host_upscalers host_observe_producers host_scene_scale

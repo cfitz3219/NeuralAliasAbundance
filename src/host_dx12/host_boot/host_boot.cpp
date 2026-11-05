@@ -1,3 +1,4 @@
+#include "host_dx12/background/work.hpp"
 #include "host_dx12/j2/hud_unblend.hpp"
 #include "host_dx12/diag/dred.hpp"
 #include "host_dx12/diag/gpu_breadcrumbs.hpp"
@@ -347,6 +348,7 @@ DWORD WINAPI InitThread(LPVOID)
     if (na::j2::Configured()) na::overlay::RegisterLiveDlaaMenu();
     na::j2::flow::SetEnabled(GetPrivateProfileIntW(L"j2",L"flow",0,g_ini)==1);
     if(na::settings::SafeStart())na::j2::SetPaused(true);
+    na::background::Start(); // two below-normal workers, never hardware_concurrency
     bool started = na::overlay::StartCore(tag, nullptr);
     signal_install_attempted(); // producers were installed (or could not be) inside Start
     boot_log(started ? "core attached" : "core attachment failed");
@@ -402,7 +404,7 @@ DWORD WINAPI InitThread(LPVOID)
 
 } // namespace
 
-void NotifyProcessExit() { na::observe::SetProcessExiting(); }
+void NotifyProcessExit() { na::background::RequestStop();na::observe::SetProcessExiting(); }
 
 bool StartFromIni(HMODULE self, const wchar_t* ini_name, const char* default_tag)
 {

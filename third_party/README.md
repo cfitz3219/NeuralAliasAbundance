@@ -31,3 +31,7 @@ SDK compiles that feature out and the build stays green:
 | NVIDIA Optical Flow SDK 5 | `<root>/optical-flow/nvOpticalFlowD3D12.h` | `NA_HAVE_NVOF` | `nvof_flow_stub.cpp`: QueryCaps reports unavailable |
 | Reflex PCL stats | `<root>/pclstats/pclstats.h` | `NA_HAVE_PCL_STATS` | PCL stats inert |
 | DLSS runtime `nvngx_dlss.dll` | `<root>/nvidia-dlss-sdk/lib/Windows_x86_64/rel/` | (tests only) | DLSS GPU tests skipped |
+
+### Optional NVRHI backend
+
+Pinned MIT NVRHI and Microsoft DirectX-Headers are fetched at configure time by cmake/nvrhi.cmake. Pins and redistribution licences are preserved in third_party/nvrhi. Runtime off by default; no restricted NVIDIA SDK/model content is vendored.

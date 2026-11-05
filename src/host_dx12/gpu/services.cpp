@@ -1,4 +1,5 @@
 #include "services.hpp"
+#include "mem_alloc.hpp"
 #include "host_dx12/settings.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include <atomic>
@@ -82,6 +83,9 @@ struct Allocation {std::shared_ptr<Context> context;nvrhi::TextureHandle texture
 bool Enabled(){return na::settings::Get().experimental_nvrhi.load(std::memory_order_relaxed)!=0;}
 bool CreateTexture(ID3D12Device* dev,ID3D12CommandQueue* queue,const D3D12_RESOURCE_DESC& td,D3D12_RESOURCE_STATES initial,Texture& out){
     na::observe::HostWorkScope own;out.Reset();
+    // One physical allocator for native and NVRHI use. Private-data allocation
+    // ownership follows the native resource through imported binding/fence refs.
+    if(FAILED(mem::CreateResource(dev,D3D12_HEAP_TYPE_DEFAULT,td,initial,nullptr,out.GetAddressOf())))return false;
 #if defined(NA_HAVE_NVRHI)
     if(Enabled()&&td.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D&&td.Width<=UINT32_MAX&&td.DepthOrArraySize==1&&
        format(td.Format)!=nvrhi::Format::UNKNOWN&&state(initial)!=nvrhi::ResourceStates::Unknown){
@@ -90,16 +94,15 @@ bool CreateTexture(ID3D12Device* dev,ID3D12CommandQueue* queue,const D3D12_RESOU
             d.width=uint32_t(td.Width);d.height=td.Height;d.mipLevels=td.MipLevels;d.sampleCount=td.SampleDesc.Count;d.sampleQuality=td.SampleDesc.Quality;
             d.format=format(td.Format);d.isUAV=(td.Flags&D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)!=0;
             d.isRenderTarget=(td.Flags&D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)!=0;
-            d.isShaderResource=(td.Flags&D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)==0;d.initialState=state(initial);d.keepInitialState=false;
-            a->texture=ctx->device->createTexture(d);
-            if(a->texture){out=Texture(static_cast<ID3D12Resource*>(a->texture->getNativeObject(nvrhi::ObjectTypes::D3D12_Resource)));out.owner_=a;++textures;return true;}
+            d.isShaderResource=(td.Flags&D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)==0;d.initialState=nvrhi::ResourceStates::Unknown;d.keepInitialState=false;
+            a->texture=ctx->device->createHandleForNativeTexture(nvrhi::ObjectTypes::D3D12_Resource,out.Get(),d);
+            if(a->texture){out.owner_=a;++textures;}
         }
     }
 #else
     (void)queue;
 #endif
-    D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;
-    return SUCCEEDED(dev->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&td,initial,nullptr,IID_PPV_ARGS(&out)));
+    return true;
 }
 struct Recording::State {
 #if defined(NA_HAVE_NVRHI)
@@ -143,9 +146,9 @@ bool Recording::Submit(){
 #if defined(NA_HAVE_NVRHI)
     if(!state_->closed||state_->submitted)return false;
     na::observe::HostWorkScope own;auto c=state_->context;std::lock_guard<std::mutex> lock(c->submit);
-    auto query=c->device->createEventQuery();
     const auto instance=c->device->executeCommandList(state_->list);state_->submitted=true;
     if(!state_->owners.empty()){
+        auto query=c->device->createEventQuery();
         retained+=state_->owners.size();c->device->setEventQuery(query,nvrhi::CommandQueue::Graphics);
         c->pending.push_back({query,std::move(state_->owners)});
     }
