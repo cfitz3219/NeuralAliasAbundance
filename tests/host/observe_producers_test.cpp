@@ -310,6 +310,44 @@ int main()
         CHECK(retired);
         CHECK(na::observe::IdOf(placed.Get()) == 0);
     }
+    {
+        // A consumer that does not read descriptor events (na_observe_skip_kinds): the
+        // producers keep their bookkeeping but emit nothing, and skipped events are not
+        // numbered, so the thread's sequence stays gap-free (a gap would read as lost events).
+        { std::lock_guard<std::mutex> lock(g_m); g_events.clear(); }
+        const auto before = na::observe::GetProducerStats();
+        REQUIRE(na_observe_skip_kinds((1ull << NA_EV_DESCRIPTOR_WRITE) | (1ull << NA_EV_DESCRIPTOR_COPY)) == NA_OK);
+        REQUIRE(na_observe_start(&cfg, &Sink, nullptr) == NA_OK);
+        session.running = true;
+        test::ComPtr<ID3D12Fence> fa, fb;
+        REQUIRE(SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fa))));
+        dev->CreateShaderResourceView(placed.Get(), nullptr, D3D12_CPU_DESCRIPTOR_HANDLE{s0.ptr + 6 * inc});
+        dev->CreateConstantBufferView(&cbv, D3D12_CPU_DESCRIPTOR_HANDLE{s0.ptr + 7 * inc});
+        dev->CopyDescriptorsSimple(1, D3D12_CPU_DESCRIPTOR_HANDLE{srv_heap->GetCPUDescriptorHandleForHeapStart().ptr + 6 * inc},
+                                   D3D12_CPU_DESCRIPTOR_HANDLE{s0.ptr + 6 * inc}, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        REQUIRE(SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fb))));
+        na_observe_status status{};
+        status.size_bytes = sizeof(status);
+        REQUIRE(na_observe_query_status(&status) == NA_OK);
+        REQUIRE(na_observe_stop() == NA_OK);
+        session.running = false;
+        const auto after = na::observe::GetProducerStats();
+        CHECK(CountKind(NA_EV_DESCRIPTOR_WRITE) == 0);
+        CHECK(CountKind(NA_EV_DESCRIPTOR_COPY) == 0);
+        CHECK(after.descriptor_writes == before.descriptor_writes + 2); // bookkeeping still runs
+        CHECK(after.descriptor_copies == before.descriptor_copies + 1);
+        uint32_t seq_a = 0, seq_b = 0;
+        const na_object_id fa_id = na::observe::IdOf(fa.Get()), fb_id = na::observe::IdOf(fb.Get());
+        for (const auto& f : All<na_ev_fence_created>(NA_EV_FENCE_CREATED)) {
+            if (f.fence == fa_id) seq_a = static_cast<uint32_t>(f.hdr.thread_seq);
+            if (f.fence == fb_id) seq_b = static_cast<uint32_t>(f.hdr.thread_seq);
+        }
+        CHECK(seq_a != 0 && seq_b == seq_a + 1);
+        CHECK(status.foundational_dropped == 0 && status.detail_dropped == 0);
+        std::printf("skip kinds: fence seq %u -> %u, writes +%llu copies +%llu\n", seq_a, seq_b,
+                    static_cast<unsigned long long>(after.descriptor_writes - before.descriptor_writes),
+                    static_cast<unsigned long long>(after.descriptor_copies - before.descriptor_copies));
+    }
     const auto st = na::observe::GetProducerStats();
     std::printf("producers: live %llu created %llu retired %llu writes %llu copies %llu unresolved %llu sentinel-fail %llu executes %llu\n",
                 static_cast<unsigned long long>(st.objects_live), static_cast<unsigned long long>(st.objects_created),

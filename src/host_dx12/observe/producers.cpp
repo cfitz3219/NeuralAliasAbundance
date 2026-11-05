@@ -526,6 +526,20 @@ void init_header(E& e, uint32_t kind, uint32_t flags)
     e.hdr.flags = flags;
 }
 
+// Like init_header, but for a kind the session's consumer does not read
+// (na_observe_skip_kinds): the event is zeroed and NOT numbered, so skipping it leaves
+// no thread_seq gap (a gap would read as lost events). Returns whether to emit it.
+template <typename E>
+bool init_header_wanted(E& e, uint32_t kind, uint32_t flags)
+{
+    if (!na::observe_internal::KindSkipped(kind)) {
+        init_header(e, kind, flags);
+        return true;
+    }
+    std::memset(&e, 0, sizeof(e));
+    return false;
+}
+
 template <typename E>
 void emit(const E& e, uint32_t group)
 {
@@ -1010,7 +1024,7 @@ void note_descriptor_write(D3D12_CPU_DESCRIPTOR_HANDLE dst, uint32_t kind, IUnkn
                            uint32_t first_sub, uint32_t sub_count, std::shared_ptr<DescriptorDetails> view = {})
 {
     na_ev_descriptor_write e;
-    init_header(e, NA_EV_DESCRIPTOR_WRITE, 0);
+    const bool want = init_header_wanted(e, NA_EV_DESCRIPTOR_WRITE, 0);
     {
         const CostScope cost(kCostDescWrite);
         std::shared_lock<std::shared_mutex> lock(g_m, std::defer_lock);
@@ -1046,7 +1060,7 @@ void note_descriptor_write(D3D12_CPU_DESCRIPTOR_HANDLE dst, uint32_t kind, IUnkn
     e.first_subresource = first_sub;
     e.subresource_count = sub_count;
     g_c.writes.fetch_add(1);
-    emit(e, NA_GROUP_DESCRIPTOR);
+    if (want) emit(e, NA_GROUP_DESCRIPTOR);
 }
 
 // Copies of `count` descriptors from src to dst, split wherever either side
@@ -1055,7 +1069,7 @@ void note_descriptor_copy(uint64_t dst, uint64_t src, uint32_t count, uint32_t i
 {
     while (count) {
         na_ev_descriptor_copy e;
-        init_header(e, NA_EV_DESCRIPTOR_COPY, 0);
+        const bool want = init_header_wanted(e, NA_EV_DESCRIPTOR_COPY, 0);
         uint32_t run = 0;
         bool resolved = false, striped = false;
         {
@@ -1137,7 +1151,7 @@ void note_descriptor_copy(uint64_t dst, uint64_t src, uint32_t count, uint32_t i
             e.slot_count = run;
         }
         g_c.copies.fetch_add(1);
-        emit(e, NA_GROUP_DESCRIPTOR);
+        if (want) emit(e, NA_GROUP_DESCRIPTOR);
         count -= run;
         dst += static_cast<uint64_t>(run) * increment;
         src += static_cast<uint64_t>(run) * increment;
@@ -1364,7 +1378,7 @@ void STDMETHODCALLTYPE D_CreateConstantBufferView(ID3D12Device* dev, const D3D12
     // ABI 0.1 DESCRIPTOR_WRITE carries no byte offset; the resource identity is
     // what H1 promises. Unresolved / ambiguous ranges are UNKNOWN, never guessed.
     na_ev_descriptor_write e;
-    init_header(e, NA_EV_DESCRIPTOR_WRITE, 0);
+    const bool want = init_header_wanted(e, NA_EV_DESCRIPTOR_WRITE, 0);
     {
         const CostScope cost(kCostDescWrite);
         std::shared_lock<std::shared_mutex> lock(g_m, std::defer_lock);
@@ -1393,7 +1407,7 @@ void STDMETHODCALLTYPE D_CreateConstantBufferView(ID3D12Device* dev, const D3D12
     e.first_subresource = 0;
     e.subresource_count = 1;
     g_c.writes.fetch_add(1);
-    emit(e, NA_GROUP_DESCRIPTOR);
+    if (want) emit(e, NA_GROUP_DESCRIPTOR);
 }
 
 void STDMETHODCALLTYPE D_CreateShaderResourceView(ID3D12Device* dev, ID3D12Resource* r, const D3D12_SHADER_RESOURCE_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)

@@ -17,6 +17,7 @@
 #include <set>
 #include <string>
 
+constexpr uint64_t kDescriptorKinds=(1ull<<NA_EV_DESCRIPTOR_WRITE)|(1ull<<NA_EV_DESCRIPTOR_COPY);
 namespace {
 struct Resource { na_ev_resource_created info{};uint64_t depth_writes{},color_writes{}; };
 struct Record {
@@ -266,7 +267,7 @@ void __cdecl Sink(const na_event_batch* batch,void* user) {
                         std::fprintf(c.map_log,"=== frame map %u (present %llu) ===\n%s\n",c.maps_written+1,c.presents,report.c_str());
                         std::fflush(c.map_log);
                         if(++c.maps_written<c.maps_wanted) c.pass_map.Arm(c.map_interval);
-                        else {std::fputs("stage_m: done\n",c.map_log);std::fclose(c.map_log);c.map_log=nullptr;}
+                        else {std::fputs("stage_m: done\n",c.map_log);std::fclose(c.map_log);c.map_log=nullptr;na_observe_skip_kinds(kDescriptorKinds);}
                     }
                 }
                 break;
@@ -466,7 +467,11 @@ extern "C" int na_adapter_start() {
     for(unsigned n=0;n<200 && !na::observe::ProducersActive();++n) Sleep(10); // host init thread only
     if(!na::observe::ProducersActive()) {std::fputs("{\"type\":\"error\",\"reason\":\"producers unavailable\"}\n",c->log);std::fclose(c->log);delete c;return 0;}
     na_observe_config cfg{};cfg.size_bytes=sizeof(cfg);
-    if(na_observe_start(&cfg,Sink,c)!=NA_OK) {std::fclose(c->log);delete c;return 0;}
+    // Descriptor writes/copies are read only by the Stage M frame maps. Without them the
+    // producers keep their slot bookkeeping but emit nothing (SE5 trace 2026-11-05: these
+    // events were most of the ring traffic, the worker's memcpy and the ring drops).
+    na_observe_skip_kinds(c->map_log ? 0 : kDescriptorKinds);
+    if(na_observe_start(&cfg,Sink,c)!=NA_OK) {na_observe_skip_kinds(0);std::fclose(c->log);delete c;return 0;}
     consumer()=c;return 1;
 }
 extern "C" void na_adapter_stop() {

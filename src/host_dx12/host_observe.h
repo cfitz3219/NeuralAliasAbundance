@@ -689,7 +689,7 @@ typedef struct na_observe_config {
     uint32_t size_bytes;       /* caller sets to sizeof its compiled struct;
                                   unknown larger sizes rejected by older hosts,
                                   reserved fields must be 0 */
-    uint32_t metadata_budget_mib;      /* 0 = default 32 */
+    uint32_t metadata_budget_mib;      /* 0 = default 64 */
     uint32_t detail_event_budget;      /* 0 = default 100000 (H2) */
     uint32_t constant_bytes_budget;    /* 0 = default 4 MiB (H2) */
     uint32_t presentation_boundaries;  /* 0 = default 8 (H2) */
@@ -718,6 +718,10 @@ int  __cdecl na_observe_start(const na_observe_config* cfg, na_event_sink sink,
 int  __cdecl na_observe_stop(void);
 int  __cdecl na_observe_query_status(na_observe_status* inout);
 int  __cdecl na_observe_resync(void);
+/* Kinds (bit = 1 << na_event_kind, kinds < 64) the consumer does not read: the host neither
+   emits nor numbers them (no sequence gap, no loss accounting). 0 = everything (default).
+   Takes effect for events produced after the call; cleared by na_observe_stop. */
+int  __cdecl na_observe_skip_kinds(uint64_t mask);
 
 #ifdef __cplusplus
 } /* extern "C" */

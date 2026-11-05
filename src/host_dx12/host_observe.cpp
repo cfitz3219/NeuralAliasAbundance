@@ -36,9 +36,11 @@ namespace {
 
 using na::observe_internal::SnapshotFn;
 
-constexpr uint32_t kDefaultBudgetMiB = 32;
+// 64 rings x 1 MiB (2026-11-05: SE5 records on ~35 threads; with 32 rings every event from
+// the remaining threads was dropped, each drop a burst of shared atomics plus a loss mark).
+constexpr uint32_t kDefaultBudgetMiB = 64;
 constexpr uint32_t kMaxBatchBytes = 64 * 1024;
-constexpr uint32_t kRings = 32;               // claimed thread ids per session
+constexpr uint32_t kRings = 64;               // claimed thread ids per session
 constexpr size_t kMinRingBytes = 2 * kMaxBatchBytes; // one max event must fit
 
 // One ring per recording thread. Each ring sits on its own cache lines (the producer
@@ -347,8 +349,13 @@ Ring* thread_ring()
 {
     thread_local Ring* ring = nullptr;
     thread_local uint64_t ring_session = 0;
+    thread_local uint64_t no_ring_session = 0; // every ring was owned when this thread asked
     uint64_t session = g_host.session.load(std::memory_order_acquire);
     if (ring && ring_session == session) return ring;
+    // Owners are released only when a session starts (new session id), so a thread that found
+    // all rings taken stays without one for the rest of the session: do not scan and CAS all
+    // of them again on every event.
+    if (!ring && session && no_ring_session == session) return nullptr;
     ring = nullptr;
     DWORD tid = GetCurrentThreadId();
     for (Ring& r : g_host.rings) {
@@ -360,6 +367,7 @@ Ring* thread_ring()
             break;
         }
     }
+    if (!ring) no_ring_session = session;
     return ring;
 }
 
@@ -523,6 +531,8 @@ bool run_snapshot()
 namespace na::observe_internal {
 
 bool Emit(const void* event_bytes, uint32_t group) { return emit_ring(event_bytes, group); }
+std::atomic<uint64_t> g_skip_kinds{0};
+bool KindSkipped(uint32_t kind) { return kind < 64 && (g_skip_kinds.load(std::memory_order_relaxed) >> kind) & 1u; }
 void CurrentScope(na_session_id* session, na_epoch* epoch)
 {
     const bool on = Started();
@@ -569,7 +579,7 @@ int __cdecl na_observe_start(const na_observe_config* cfg, na_event_sink sink, v
         g_host.user = user;
         size_t budget = static_cast<size_t>(budget_mib) * 1024 * 1024;
         // Budget floor: every ring must hold one maximum event; the effective
-        // minimum total is kRings * kMinRingBytes (4 MiB), documented.
+        // minimum total is kRings * kMinRingBytes (8 MiB), documented.
         g_host.ring_bytes = std::max(kMinRingBytes, budget / kRings);
         for (Ring& r : g_host.rings) {
             r.owner.store(0);
@@ -605,8 +615,15 @@ int __cdecl na_observe_start(const na_observe_config* cfg, na_event_sink sink, v
     return NA_OK;
 }
 
+int __cdecl na_observe_skip_kinds(uint64_t mask)
+{
+    na::observe_internal::g_skip_kinds.store(mask, std::memory_order_relaxed);
+    return NA_OK;
+}
+
 int __cdecl na_observe_stop(void)
 {
+    na::observe_internal::g_skip_kinds.store(0, std::memory_order_relaxed);
     if (GetCurrentThreadId() == g_host.worker_tid) return NA_E_STATE;
     std::thread joiner;
     {
