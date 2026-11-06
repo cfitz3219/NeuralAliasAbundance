@@ -1385,39 +1385,7 @@ void DrawDlssDebug()
 } // namespace
 
 static void DrawExperimentalGpu();
-static void DrawDonutLighting()
-{
-    using namespace na::ui;
-    // Adaptive tone mapping was removed on Cort's order (2026-11-06: "not helpful or useful to
-    // our core purpose"). Only Bloom remains here; the tone setting is no longer shown, read or saved.
-    auto& s=na::settings::Get();bool bloom=s.donut_bloom.load()!=0;
-    // BeginRow pushes the row label as an ID, so the popup ID is taken outside the row: an
-    // OpenPopup("...") inside it named a different popup than BeginPopupModal below, and the
-    // button did nothing (Cort 2026-11-05).
-    const ImGuiID bloom_popup=ImGui::GetID("Bloom settings");
-    BeginRow("Bloom","Adds an adjustable soft glow around bright scene details.",S(220));
-    if(ImGui::Checkbox("##donutbloom",&bloom)){s.donut_bloom=bloom;na::settings::Save();}
-    ImGui::SameLine();if(Button("Bloom settings..."))ImGui::OpenPopup(bloom_popup);EndRow();
-    if(bloom){const auto status=na::donut::ScenePass().GetStats();char activity[224];
-        std::snprintf(activity,sizeof activity,"%s Processed %llu scenes.",status.reason,static_cast<unsigned long long>(status.recorded));Hint(activity);}
-    bool open=true;ImGui::SetNextWindowSize(ImVec2(S(580),0),ImGuiCond_Appearing);
-    if(!ImGui::BeginPopupModal("Bloom settings",&open,ImGuiWindowFlags_AlwaysAutoResize))return;
-    bool changed=false;
-    const auto title=[&](const char* name,const char* tip){ImGui::TextUnformatted(name);if(ImGui::IsItemHovered())ImGui::SetTooltip("%s",tip);ImGui::SameLine(S(220));ImGui::SetNextItemWidth(S(310));};
-    const auto scalar=[&](const char* name,const char* tip,const char* id,std::atomic<uint32_t>& field,float lo,float hi){
-        title(name,tip);float v=field.load()*.001f;if(ImGui::SliderFloat(id,&v,lo,hi,"%.2f")){field=uint32_t(v*1000+.5f);changed=true;}};
-    if(ImGui::Checkbox("Bloom",&bloom)){s.donut_bloom=bloom;changed=true;}
-    scalar("Glow amount","Sets the added glow; zero leaves scene colour unchanged.","##bloomamount",s.donut_bloom_amount,0,1);
-    scalar("Glow radius","Spreads light over a wider or narrower area, in scene pixels.","##bloomsigma",s.donut_bloom_sigma,4,64);
-    scalar("Glow threshold","How much brighter than the scene's average a spot must be to glow (1 = about 5x the average).","##bloomthreshold",s.donut_bloom_threshold,0,20);
-    if(Button("Reset bloom defaults")){s.donut_bloom_amount=100;s.donut_bloom_sigma=16000;s.donut_bloom_threshold=1000;changed=true;}
-    if(changed)na::settings::Save();
-    const auto stats=na::donut::ScenePass().GetStats();
-    if(bloom)Hint(stats.reason);else Hint("Bloom is off. No effect work is submitted.");
-    Hint("Settings apply live. The game's own final colour processing remains active.");
-    ImGui::EndPopup();
-}
-
+static void DrawDonutLighting();
 static void DrawAmbientOcclusion();
 
 void RegisterLiveDlaaMenu()
