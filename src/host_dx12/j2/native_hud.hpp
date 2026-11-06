@@ -63,6 +63,7 @@ struct Layer {
     std::shared_ptr<Picture> probe;
     std::shared_ptr<void> probe_owner;
     uint64_t probe_source=0,probe_generation=0;
+    uint64_t association_source=0,association_generation=0; // current picture receipt, separate from independent discovery
     ID3D12Resource* native_picture=nullptr; // NPSR: DLSS scene followed by the actual native HUD draws
     ID3D12Resource* native_check=nullptr; // original-resolution replay, independently compared with actual full colour
     std::shared_ptr<void> native_owner;

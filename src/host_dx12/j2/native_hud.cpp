@@ -1153,6 +1153,7 @@ public:
         return redirect(l, call);
     }
     void Closing(ID3D12GraphicsCommandList* l) noexcept override {
+        if (hud_unblend::Enabled()) { hud_unblend::OnClosing(l); return; }
         if(!g_on.load())return;
         std::lock_guard<std::mutex> lock(g_m);
         Canvas* best=nullptr;const auto recording=na::observe::ListRecording(l),writer_id=na::observe::IdOf(l);
@@ -1210,6 +1211,7 @@ class ClearHook final : public na::observe::TextureOperationHook {
 public:
     na::observe::ShaderScope Before(ID3D12GraphicsCommandList* l, const na::observe::TextureCall& c) noexcept override
     {
+        if (hud_unblend::Enabled()) hud_unblend::OnTexture(l, c);
         if ((c.kind == na::observe::TextureKind::Copy || c.kind == na::observe::TextureKind::CopyRegion) && c.destination && c.source) {
             // H1b: a whole-picture copy into a back buffer is a hand-off from its source.
             const na_object_id dst = na::observe::IdOf(c.destination), src = na::observe::IdOf(c.source);
@@ -1429,7 +1431,7 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
     }
     g_grave.erase(std::remove_if(g_grave.begin(), g_grave.end(), [](const Grave& g) { return g.frame + kGraveFrames < g_frame; }), g_grave.end());
     if (!id) return false;
-    if (hud_unblend::Enabled()) return hud_unblend::TakeFrame(frame, rw, rh, ow, oh, out);
+    if (hud_unblend::Enabled()) return hud_unblend::TakeFrame(frame, rw, rh, ow, oh, out, queue);
     Proxy* p = find_locked(id);
     if (!p || p->rw != rw || p->rh != rh || p->ow != ow || p->oh != oh) {
         if (!p) { // learn it, replacing the proxy presented longest ago (never the upstream)
@@ -1618,6 +1620,7 @@ void ReportPictureResult(bool identity,bool clean,uint32_t tested,uint32_t match
 void SetPreHudRendererForTests(PreHudRenderer renderer){g_test_renderer.store(renderer);}
 void AfterSubmission(ID3D12CommandQueue* queue,uint32_t count,ID3D12CommandList* const* lists)
 {
+    if(hud_unblend::Enabled()){hud_unblend::AfterSubmission(queue,count,lists);return;}
     if(!queue||!count||!lists||!Enabled())return;
     std::vector<std::shared_ptr<CapturedPicture>> ready;
     {
@@ -1686,6 +1689,7 @@ void ReportNativePictureResult(bool identity,uint32_t tested,uint32_t matched,fl
 }
 void ReportCanvasProbe(uint64_t source,uint64_t generation,bool identity,uint32_t tested,uint32_t matched,float error)
 {
+    if(hud_unblend::Enabled()&&hud_unblend::ReportProbe(source,generation,identity,tested,matched))return;
     std::lock_guard<std::mutex> lock(g_m);
     if(tested){g_stats.proof_tested=tested;g_stats.proof_matched=matched;g_stats.proof_maximum_error=error;}
     auto c=std::find_if(g_canvases.begin(),g_canvases.end(),[&](const auto& q){return q.id==source&&q.generation==generation;});

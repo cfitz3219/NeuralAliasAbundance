@@ -10,14 +10,21 @@ class Picture {
     struct Impl;
     std::unique_ptr<Impl> p_;
 public:
-    struct ProofReceipt {uint32_t tested=0,matched=0;float maximum_error=0;};
+    struct ProofReceipt {uint32_t tested=0,matched=0,picture_matched=0;float maximum_error=0;};
     Picture();
     ~Picture();
     static std::shared_ptr<Picture> Create(ID3D12Device*,const D3D12_RESOURCE_DESC& source,uint32_t ow,uint32_t oh);
     bool Matches(ID3D12Device*,const D3D12_RESOURCE_DESC&,uint32_t ow,uint32_t oh)const;
     void BeginCycle(); // only after ALL source-recording and Present owners release it
+    bool Prepared() const;
+    // Another Present of the same submitted picture gets independent mutable
+    // descriptors/output resources, while reusing the immutable source images.
+    std::shared_ptr<Picture> ForkSnapshot(ID3D12GraphicsCommandList*);
     bool SnapshotScene(ID3D12GraphicsCommandList*,ID3D12Resource*,D3D12_RESOURCE_STATES);
     bool SnapshotFull(ID3D12GraphicsCommandList*,ID3D12Resource*,D3D12_RESOURCE_STATES);
+    // Optional original-size counterfactuals: verify the actual blend model
+    // against the captured pre-HUD scene, including opaque pixels and clipping.
+    void SetValidationLayers(ID3D12Resource* low,ID3D12Resource* high,bool source_srgb=false);
     // Discovery only: compare an immutable canvas with this exact final frame.
     // Neither image is altered. Caller supplies its existing completion fence.
     bool Probe(ID3D12GraphicsCommandList*,ID3D12Resource* frame,DXGI_FORMAT frame_view);
