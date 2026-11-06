@@ -3934,6 +3934,11 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
     constexpr UINT PRESENT = D3D12_RESOURCE_STATE_PRESENT, NPSR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                    UAV = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     std::vector<D3D12_RESOURCE_BARRIER> b;
+    if(layer.unblend&&layer.picture&&layer.picture->Prepared()){
+        auto copy=layer.picture->ForkSnapshot(l);
+        if(!copy){close_list();g_small.hud_picture[si].reset();g_small.hud_owner[si].reset();return false;}
+        layer.picture=std::move(copy);g_small.hud_picture[si]=layer.picture;
+    }
     add(b, frame, PRESENT, NPSR);
     add(b, out, NPSR, UAV);
     if(layer.probe){

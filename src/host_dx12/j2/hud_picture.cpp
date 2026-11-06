@@ -155,14 +155,18 @@ std::shared_ptr<Program> program(ID3D12Device* dev){
 struct Picture::Impl {
  std::shared_ptr<Program> program;UINT w=0,h=0,ow=0,oh=0;DXGI_FORMAT source_format{};
  ComPtr<ID3D12Resource> scene,full,input,mask,proof,readback,result,frame,motion,n[2],low[2];ComPtr<ID3D12DescriptorHeap> heap;
- bool scene_ready=false,full_ready=false,scene_current=false,full_current=false,prepared=false,outputs_read=false;DXGI_FORMAT frame_view{},layer_view{},result_format{};
+ bool scene_current=false,full_current=false,prepared=false,outputs_read=false;DXGI_FORMAT frame_view{},layer_view{},result_format{};
  bool proof_read=false,source_srgb=false;
+ std::vector<std::shared_ptr<Picture>> readers;
  UINT descriptor_page=0; // pre-HUD work and final Present may both be in flight
  struct K {UINT w,h,ow,oh,flags;float grey,tolerance;UINT pad;} constants{};
- bool snapshot(ID3D12GraphicsCommandList* l,ID3D12Resource* src,D3D12_RESOURCE_STATES state,ComPtr<ID3D12Resource>& dst,bool& ready){
+ bool snapshot(ID3D12GraphicsCommandList* l,ID3D12Resource* src,D3D12_RESOURCE_STATES state,ComPtr<ID3D12Resource>& dst){
   if(!l||!src)return false;auto d=src->GetDesc();if(d.Width!=w||d.Height!=h||
     (d.Format!=source_format&&(TypelessOf(d.Format)==DXGI_FORMAT_UNKNOWN||TypelessOf(d.Format)!=TypelessOf(source_format)))||d.MipLevels!=1||d.DepthOrArraySize!=1||d.SampleDesc.Count!=1)return false;
-  move(l,src,state,CS);if(ready)move(l,dst.Get(),S,CD);l->CopyResource(dst.Get(),src);move(l,src,CS,state);move(l,dst.Get(),CD,S);ready=true;return true;
+  // Executable game recordings may run more than once. The snapshot always
+  // enters/leaves in S, including its first use; no one-shot initial-state
+  // shortcut may be baked into a reusable command list.
+  move(l,src,state,CS);move(l,dst.Get(),S,CD);l->CopyResource(dst.Get(),src);move(l,src,CS,state);move(l,dst.Get(),CD,S);return true;
  }
  void bind(ID3D12GraphicsCommandList* l,UINT pass,ID3D12Resource* pic,DXGI_FORMAT pf){
   auto cpu=heap->GetCPUDescriptorHandleForHeapStart();cpu.ptr+=SIZE_T(descriptor_page*39+pass*13)*program->inc;
@@ -188,7 +192,7 @@ std::shared_ptr<Picture> Picture::Create(ID3D12Device* dev,const D3D12_RESOURCE_
  if(!dev||d.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||d.SampleDesc.Count!=1||d.DepthOrArraySize!=1||d.MipLevels!=1||!ow||!oh)return {};
  auto result=std::make_shared<Picture>();auto& p=*result->p_;p.program=program(dev);if(!p.program)return {};
  p.w=UINT(d.Width);p.h=d.Height;p.ow=ow;p.oh=oh;p.source_format=d.Format;
- if(!texture(dev,p.w,p.h,d.Format,false,CD,p.scene)||!texture(dev,p.w,p.h,d.Format,false,CD,p.full)||
+ if(!texture(dev,p.w,p.h,d.Format,false,S,p.scene)||!texture(dev,p.w,p.h,d.Format,false,S,p.full)||
     !texture(dev,p.w,p.h,DXGI_FORMAT_R16G16B16A16_FLOAT,true,U,p.input)||!texture(dev,p.w,p.h,DXGI_FORMAT_R16_FLOAT,true,U,p.mask)||
     !buffer(dev,D3D12_HEAP_TYPE_DEFAULT,U,p.proof,16+UINT64(p.w)*p.h*4)||!buffer(dev,D3D12_HEAP_TYPE_READBACK,CD,p.readback))return {};
  D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,78,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
@@ -201,8 +205,17 @@ void Picture::BeginCycle(){
  p_->descriptor_page=0;
  p_->prepared=p_->scene_current=p_->full_current=p_->proof_read=false;p_->frame.Reset();p_->motion.Reset();p_->n[0].Reset();p_->n[1].Reset();p_->low[0].Reset();p_->low[1].Reset();
 }
-bool Picture::SnapshotScene(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES s){return p_->scene_current=p_->snapshot(l,r,s,p_->scene,p_->scene_ready);}
-bool Picture::SnapshotFull(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES s){return p_->full_current=p_->snapshot(l,r,s,p_->full,p_->full_ready);}
+bool Picture::Prepared()const{return p_->prepared;}
+std::shared_ptr<Picture> Picture::ForkSnapshot(ID3D12GraphicsCommandList* l){
+ auto& p=*p_;if(!l||!p.scene_current||!p.full_current)return {};
+ std::shared_ptr<Picture> result;
+ for(const auto& r:p.readers)if(r.use_count()==1){result=r;result->BeginCycle();break;}
+ if(!result){if(p.readers.size()>=8)return {};result=Create(p.program->dev.Get(),p.scene->GetDesc(),p.ow,p.oh);if(!result)return {};p.readers.push_back(result);}
+ if(!result->SnapshotScene(l,p.scene.Get(),S)||!result->SnapshotFull(l,p.full.Get(),S))return {};
+ result->SetValidationLayers(p.low[0].Get(),p.low[1].Get(),p.source_srgb);return result;
+}
+bool Picture::SnapshotScene(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES s){return p_->scene_current=p_->snapshot(l,r,s,p_->scene);}
+bool Picture::SnapshotFull(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES s){return p_->full_current=p_->snapshot(l,r,s,p_->full);}
 void Picture::SetValidationLayers(ID3D12Resource* low,ID3D12Resource* high,bool source_srgb){p_->low[0]=low;p_->low[1]=high;p_->source_srgb=source_srgb;}
 bool Picture::Probe(ID3D12GraphicsCommandList* l,ID3D12Resource* frame,DXGI_FORMAT view){
  auto& p=*p_;if(!l||!frame||!p.full_current)return false;

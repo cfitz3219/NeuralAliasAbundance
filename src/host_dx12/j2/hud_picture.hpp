@@ -16,6 +16,10 @@ public:
     static std::shared_ptr<Picture> Create(ID3D12Device*,const D3D12_RESOURCE_DESC& source,uint32_t ow,uint32_t oh);
     bool Matches(ID3D12Device*,const D3D12_RESOURCE_DESC&,uint32_t ow,uint32_t oh)const;
     void BeginCycle(); // only after ALL source-recording and Present owners release it
+    bool Prepared() const;
+    // Another Present of the same submitted picture gets independent mutable
+    // descriptors/output resources, while reusing the immutable source images.
+    std::shared_ptr<Picture> ForkSnapshot(ID3D12GraphicsCommandList*);
     bool SnapshotScene(ID3D12GraphicsCommandList*,ID3D12Resource*,D3D12_RESOURCE_STATES);
     bool SnapshotFull(ID3D12GraphicsCommandList*,ID3D12Resource*,D3D12_RESOURCE_STATES);
     // Optional original-size counterfactuals: verify the actual blend model

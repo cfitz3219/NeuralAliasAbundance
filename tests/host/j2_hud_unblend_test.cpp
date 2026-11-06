@@ -35,8 +35,8 @@ namespace {
 void __cdecl sink(const na_event_batch*, void*) {}
 void submit(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists)
 {
-    na::nr::native::Submission submitted(queue, count, lists);
-    queue->ExecuteCommandLists(count, lists);
+    {na::nr::native::Submission submitted(queue, count, lists);queue->ExecuteCommandLists(count, lists);}
+    nh::AfterSubmission(queue,count,lists);
 }
 
 bool readback(test::Device& d, ID3D12Resource* tex, D3D12_RESOURCE_STATES state, uint32_t bpp, std::vector<uint8_t>& out)
@@ -119,6 +119,19 @@ float half_value(uint16_t value)
     const int exponent = (value >> 10) & 31, fraction = value & 1023;
     const float magnitude = exponent ? std::ldexp(1.f + float(fraction) / 1024.f, exponent - 15) : std::ldexp(float(fraction), -24);
     return value & 0x8000 ? -magnitude : magnitude;
+}
+ComPtr<ID3D12Resource> zero_motion(test::Device& d)
+{
+    const na::observe::HostWorkScope host;
+    auto* dev=d.device.Get();auto texture=test::CreateTexture(dev,RW,RH,DXGI_FORMAT_R32G32_FLOAT,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    if(!texture)return {};
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};UINT64 bytes=0;const auto desc=texture->GetDesc();dev->GetCopyableFootprints(&desc,0,1,0,&fp,nullptr,nullptr,&bytes);
+    auto upload=test::CreateBuffer(dev,bytes,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);void* data=nullptr;
+    if(!upload||FAILED(upload->Map(0,nullptr,&data)))return {};std::memset(data,0,size_t(bytes));upload->Unmap(0,nullptr);
+    test::List copy;if(!copy.Create(dev))return {};
+    D3D12_TEXTURE_COPY_LOCATION to{texture.Get(),D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,{}},from{upload.Get(),D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,{}};
+    from.PlacedFootprint=fp;copy.list->CopyTextureRegion(&to,0,0,0,&from,nullptr);auto b=test::Transition(texture.Get(),D3D12_RESOURCE_STATE_COPY_DEST,NPSR);copy.list->ResourceBarrier(1,&b);
+    if(FAILED(copy.list->Close()))return {};ID3D12CommandList* lists[]={copy.list.Get()};submit(d.queue.Get(),1,lists);d.WaitIdle();return texture;
 }
 
 int verdict_logic()
@@ -401,6 +414,14 @@ int end_to_end(test::Device& d)
         std::vector<uint8_t> reference, actual; REQUIRE(readback(d, ref.Get(), RTS, 4, reference) && readback(d, out.Get(), UAV, 4, actual));
         int error = 0; for (size_t i = 0; i < reference.size(); ++i) if (i % 4 != 3) error = std::max(error, std::abs(int(reference[i]) - int(actual[i])));
         std::printf("current-picture composition vs native reference: %d/255\n", error); CHECK(error <= 4);
+        test::List repeat;REQUIRE(repeat.Create(dev));
+        auto repeated=layer.picture->ForkSnapshot(repeat.list.Get());REQUIRE(repeated&&!repeated->Prepared());
+        transition=test::Transition(proxy.Get(),RTS,NPSR);repeat.list->ResourceBarrier(1,&transition);
+        REQUIRE(repeated->Prepare(repeat.list.Get(),proxy.Get(),F,motion.Get(),layer.n0,layer.n1,layer.view,layer.grey,layer.srgb,layer.clean_allowed,F));
+        std::swap(transition.Transition.StateBefore,transition.Transition.StateAfter);repeat.list->ResourceBarrier(1,&transition);
+        REQUIRE(SUCCEEDED(repeat.list->Close()));ID3D12CommandList* repeated_work[]={repeat.list.Get()};submit(d.queue.Get(),1,repeated_work);d.WaitIdle();
+        std::vector<uint8_t> repeated_input;REQUIRE(readback(d,repeated->Input(),NPSR,8,repeated_input));
+        CHECK(repeated_input==clean_input&&repeated->Input()!=layer.picture->Input());
     }
     // Second frame: an opaque full-screen draw after the first UI draw restarts the layers;
     // the two UI draws after it are what the frame ends with.
@@ -542,16 +563,68 @@ int end_to_end(test::Device& d)
     d.WaitIdle();
     CHECK(ub::GetStats().replayed == before_off);
     ub::SetEnabled(true);
+    {
+        // UNORM clipping makes two-point coefficients non-affine. Reject only
+        // the affected pixels; preserve the correctly separated rest of frame.
+        REQUIRE(SUCCEEDED(game.alloc->Reset())&&SUCCEEDED(l->Reset(game.alloc.Get(),nullptr)));
+        frame(false);const float add[4]={.7f,.7f,.7f,1};const D3D12_RECT clip{0,0,4,4};
+        l->OMSetRenderTargets(1,&rtv[0],FALSE,nullptr);l->RSSetScissorRects(1,&clip);l->SetPipelineState(pso[int(Blend::Add)].Get());
+        l->SetGraphicsRoot32BitConstants(0,4,add,0);l->DrawInstanced(3,1,0,0);
+        REQUIRE(SUCCEEDED(l->Close()));submit(d.queue.Get(),1,lists);d.WaitIdle();nh::Layer clipped;
+        REQUIRE(nh::TakeFrame(proxy.Get(),RW,RH,OW,OH,&clipped,d.queue.Get())&&clipped.picture);
+        auto motion=zero_motion(d);REQUIRE(motion);test::List calc;REQUIRE(calc.Create(dev));const na::observe::HostWorkScope host;
+        auto b=test::Transition(proxy.Get(),RTS,NPSR);calc.list->ResourceBarrier(1,&b);
+        REQUIRE(clipped.picture->Prepare(calc.list.Get(),proxy.Get(),F,motion.Get(),clipped.n0,clipped.n1,clipped.view,clipped.grey,clipped.srgb,clipped.clean_allowed,F));
+        std::swap(b.Transition.StateBefore,b.Transition.StateAfter);calc.list->ResourceBarrier(1,&b);
+        REQUIRE(SUCCEEDED(calc.list->Close()));ID3D12CommandList* check[]={calc.list.Get()};submit(d.queue.Get(),1,check);d.WaitIdle();
+        bool identity=false,clean=false;nh::Picture::ProofReceipt proof;REQUIRE(clipped.picture->ProofAfterCompletion(identity,clean,&proof));
+        CHECK(!identity&&!clean&&proof.matched<RW*RH&&proof.matched>RW*RH/2&&proof.picture_matched==RW*RH);
+        std::vector<uint8_t> mask;REQUIRE(readback(d,clipped.picture->Mask(),NPSR,2,mask));uint16_t protected_value=0,scene_value=0;
+        std::memcpy(&protected_value,mask.data(),2);std::memcpy(&scene_value,mask.data()+((RH-1)*RW+RW-1)*2,2);
+        CHECK(half_value(protected_value)>.9f&&half_value(scene_value)==0);
+    }
+    // Record a future frame into the same game resources before submitting
+    // the current one. Actual queue order, not the last CPU recording, owns
+    // the presented scene and HUD. Repeat the closed lists in reverse order.
+    REQUIRE(SUCCEEDED(game.alloc->Reset())&&SUCCEEDED(l->Reset(game.alloc.Get(),nullptr)));
+    frame(false);REQUIRE(SUCCEEDED(l->Close()));
+    test::List future;REQUIRE(future.Create(dev));
+    REQUIRE(SUCCEEDED(future.list->Close())&&SUCCEEDED(future.list->Reset(future.alloc.Get(),nullptr)));
+    auto* next=future.list.Get();const float next_scene[4]={.7f,.3f,.1f,1.f};
+    next->ClearRenderTargetView(rtv[1],next_scene,0,nullptr);next->SetGraphicsRootSignature(root.Get());
+    next->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);next->OMSetRenderTargets(1,&rtv[1],FALSE,nullptr);
+    next->RSSetViewports(1,&full);next->RSSetScissorRects(1,&all);next->SetPipelineState(pso[int(Blend::Over)].Get());
+    next->SetGraphicsRoot32BitConstants(0,4,kHud[0].color,0);next->DrawInstanced(3,1,0,0);
+    constexpr char small_vertex[]=R"(
+float4 vs(uint id:SV_VertexID):SV_Position{float2 v=float2((id<<1)&2,id&2)*.125+.25;return float4(v*float2(2,-2)+float2(-1,1),.5,1);})";
+    ComPtr<ID3DBlob> small_code;REQUIRE(SUCCEEDED(D3DCompile(small_vertex,sizeof small_vertex-1,nullptr,nullptr,nullptr,"vs","vs_5_0",0,0,&small_code,&err)));
+    auto quad_pso=pipeline(dev,root.Get(),small_code.Get(),ps.Get(),Blend::Opaque);REQUIRE(quad_pso);
+    next->SetPipelineState(quad_pso.Get());next->SetGraphicsRoot32BitConstants(0,4,kHud[2].color,0);next->DrawInstanced(3,1,0,0);
+    D3D12_RESOURCE_BARRIER handoff[]={test::Transition(canvas.Get(),RTS,D3D12_RESOURCE_STATE_COPY_SOURCE),test::Transition(proxy.Get(),RTS,D3D12_RESOURCE_STATE_COPY_DEST)};
+    next->ResourceBarrier(2,handoff);next->CopyResource(proxy.Get(),canvas.Get());
+    for(auto& t:handoff)std::swap(t.Transition.StateBefore,t.Transition.StateAfter);next->ResourceBarrier(2,handoff);
+    REQUIRE(SUCCEEDED(next->Close()));
+    const auto validate=[&](const float* expected){
+        nh::Layer chosen;if(!nh::TakeFrame(proxy.Get(),RW,RH,OW,OH,&chosen,d.queue.Get())||!chosen.picture)return false;
+        std::vector<uint8_t> scene_pixels;if(!readback(d,chosen.picture->Scene(),NPSR,4,scene_pixels))return false;
+        for(size_t i=0;i<scene_pixels.size();++i)if(i%4!=3&&std::abs(int(scene_pixels[i])-int(std::lround(expected[i%4]*255)))>1)return false;
+        return true;
+    };
+    submit(d.queue.Get(),1,lists);d.WaitIdle();CHECK(validate(kScene));
+    ID3D12CommandList* later[]={next};submit(d.queue.Get(),1,later);d.WaitIdle();CHECK(validate(next_scene));
+    CHECK(ub::GetStats().last_draws==2); // small opaque geometry did not erase the earlier veil
+    ID3D12CommandList* reversed[]={next,l};submit(d.queue.Get(),2,reversed);d.WaitIdle();CHECK(validate(kScene));
+    std::printf("render-ahead and repeated reverse queue order: exact submitted scene retained\n");
     return 0;
 }
 
-int mixed_canvas(test::Device& d)
+int mixed_canvas(test::Device& d,bool srgb_source=false)
 {
     // One batch copies the world and writes opaque HUD at the same time.
     // Output alpha is always1 with SRC_ALPHA/INV_SRC_ALPHA enabled: the old
     // two-background replays both contained the world (L0 == L1 everywhere).
     auto* dev=d.device.Get();
-    auto world=test::CreateTexture(dev,RW,RH,F,RTS,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    auto world=test::CreateTexture(dev,RW,RH,srgb_source?DXGI_FORMAT_R8G8B8A8_TYPELESS:F,RTS,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     auto canvas=test::CreateTexture(dev,RW,RH,F,RTS,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     auto output=test::CreateTexture(dev,RW,RH,F,RTS,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     REQUIRE(world&&canvas&&output);
@@ -560,10 +633,14 @@ int mixed_canvas(test::Device& d)
     REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&rtvs))));
     auto w=rtvs->GetCPUDescriptorHandleForHeapStart(),c=w,o=w;
     c.ptr+=dev->GetDescriptorHandleIncrementSize(hd.Type);o.ptr+=2*dev->GetDescriptorHandleIncrementSize(hd.Type);
-    dev->CreateRenderTargetView(world.Get(),nullptr,w);dev->CreateRenderTargetView(canvas.Get(),nullptr,c);dev->CreateRenderTargetView(output.Get(),nullptr,o);
+    D3D12_RENDER_TARGET_VIEW_DESC world_rtv{};world_rtv.Format=F;world_rtv.ViewDimension=D3D12_RTV_DIMENSION_TEXTURE2D;
+    dev->CreateRenderTargetView(world.Get(),&world_rtv,w);dev->CreateRenderTargetView(canvas.Get(),nullptr,c);dev->CreateRenderTargetView(output.Get(),nullptr,o);
     hd={D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,2,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
     REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&views))));
-    auto handle=views->GetCPUDescriptorHandleForHeapStart();dev->CreateShaderResourceView(world.Get(),nullptr,handle);
+    auto handle=views->GetCPUDescriptorHandleForHeapStart();
+    D3D12_SHADER_RESOURCE_VIEW_DESC world_srv{};world_srv.Format=srgb_source?DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:F;world_srv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
+    world_srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;world_srv.Texture2D.MipLevels=1;
+    dev->CreateShaderResourceView(world.Get(),&world_srv,handle);
     handle.ptr+=dev->GetDescriptorHandleIncrementSize(hd.Type);dev->CreateShaderResourceView(canvas.Get(),nullptr,handle);
     constexpr char shader[]=R"(
 Texture2D<float4> image:register(t0);SamplerState s:register(s0);
@@ -611,13 +688,16 @@ float4 copy(V v):SV_Target{return image.SampleLevel(s,v.uv,0);})";
     int maximum=0;
     for(UINT y=0;y<RH;++y)for(UINT x=0;x<RW;++x)for(int ch=0;ch<3;++ch){
         CHECK(std::abs(at(source,RW,x,y,ch)-int(std::lround(kScene[ch]*255)))<=1);
-        const float prediction=at(low,RW,x,y,ch)+(at(high,RW,x,y,ch)-at(low,RW,x,y,ch))*kScene[ch]/nh::GreyFor(F);
+        const float source_value=srgb_source?std::pow((kScene[ch]+.055f)/1.055f,2.4f):kScene[ch];
+        const float prediction=at(low,RW,x,y,ch)+(at(high,RW,x,y,ch)-at(low,RW,x,y,ch))*source_value/nh::GreyFor(F);
         maximum=std::max(maximum,int(std::lround(std::abs(prediction-at(actual,RW,x,y,ch)))));
     }
     CHECK(maximum<=2);
     CHECK(at(high,RW,0,0,0)-at(low,RW,0,0,0)>120); // world is destination-dependent now
     CHECK(at(high,RW,20,16,0)==at(low,RW,20,16,0)); // actual opaque HUD remains independent
-    std::printf("mixed world/HUD batch and opaque final draw: prediction %d/255; substitutions=%llu\n",maximum,(unsigned long long)ub::GetStats().world_substitutions);
+    std::printf("mixed world/HUD batch and opaque final draw: prediction %d/255; source_srgb=%d substitutions=%llu\n",maximum,srgb_source,(unsigned long long)ub::GetStats().world_substitutions);
+    ComPtr<ID3D12QueryHeap> queries;D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION,1,0};
+    REQUIRE(SUCCEEDED(dev->CreateQueryHeap(&query_desc,IID_PPV_ARGS(&queries))));
     for(unsigned frame=0;frame<3;++frame){
         REQUIRE(SUCCEEDED(game.alloc->Reset())&&SUCCEEDED(l->Reset(game.alloc.Get(),nullptr)));
         b=test::Transition(world.Get(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE|NPSR);l->ResourceBarrier(1,&b);
@@ -628,15 +708,12 @@ float4 copy(V v):SV_Target{return image.SampleLevel(s,v.uv,0);})";
         l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);l->OMSetRenderTargets(1,&c,FALSE,nullptr);
         l->RSSetViewports(1,&viewport);l->RSSetScissorRects(1,&scissor);l->SetPipelineState(ui.Get());l->DrawInstanced(18,1,0,0);
         b=test::Transition(canvas.Get(),RTS,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);l->ResourceBarrier(1,&b);
-        { // Simulate an opaque final dependency unavailable to SRV reflection.
-            // The test's own exact copy is deliberately unobserved. Discovery
-            // must use GPU pixels, never its hidden recording order.
-            const na::observe::HostWorkScope host;
-            D3D12_RESOURCE_BARRIER copy_barriers[]={test::Transition(canvas.Get(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_SOURCE),
-                                                  test::Transition(output.Get(),RTS,D3D12_RESOURCE_STATE_COPY_DEST)};
-            l->ResourceBarrier(2,copy_barriers);l->CopyResource(output.Get(),canvas.Get());
-            for(auto& t:copy_barriers)std::swap(t.Transition.StateBefore,t.Transition.StateAfter);l->ResourceBarrier(2,copy_barriers);
-        }
+        // Query-protected final draw cannot be privately replayed. It still
+        // invalidates the output's older association. Discover its actual
+        // source from pixels, just as for a hidden final shader dependency.
+        table=views->GetGPUDescriptorHandleForHeapStart();table.ptr+=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        l->SetGraphicsRootDescriptorTable(0,table);l->SetPipelineState(tail.Get());l->OMSetRenderTargets(1,&o,FALSE,nullptr);
+        l->BeginQuery(queries.Get(),D3D12_QUERY_TYPE_OCCLUSION,0);l->DrawInstanced(3,1,0,0);l->EndQuery(queries.Get(),D3D12_QUERY_TYPE_OCCLUSION,0);
         const auto closed=l->Close();
         if(FAILED(closed)){
             ComPtr<ID3D12InfoQueue> messages;dev->QueryInterface(IID_PPV_ARGS(&messages));
@@ -660,6 +737,18 @@ float4 copy(V v):SV_Target{return image.SampleLevel(s,v.uv,0);})";
         }else{
             REQUIRE(selected&&learned.picture&&learned.clean_allowed);
             CHECK(learned.association_source==na::observe::IdOf(canvas.Get()));
+            auto motion=zero_motion(d);REQUIRE(motion);test::List calc;REQUIRE(calc.Create(dev));const na::observe::HostWorkScope host;
+            b=test::Transition(output.Get(),RTS,NPSR);calc.list->ResourceBarrier(1,&b);
+            REQUIRE(learned.picture->Prepare(calc.list.Get(),output.Get(),F,motion.Get(),learned.n0,learned.n1,learned.view,learned.grey,learned.srgb,learned.clean_allowed,F));
+            std::swap(b.Transition.StateBefore,b.Transition.StateAfter);calc.list->ResourceBarrier(1,&b);
+            REQUIRE(SUCCEEDED(calc.list->Close()));ID3D12CommandList* validation[]={calc.list.Get()};submit(d.queue.Get(),1,validation);d.WaitIdle();
+            bool identity=false,clean=false;nh::Picture::ProofReceipt proof;REQUIRE(learned.picture->ProofAfterCompletion(identity,clean,&proof));
+            CHECK(identity&&clean&&proof.matched==RW*RH&&proof.picture_matched==RW*RH);
+            std::vector<uint8_t> input;REQUIRE(readback(d,learned.picture->Input(),NPSR,8,input));
+            float worst=0;
+            for(size_t pixel=0;pixel<RW*RH;++pixel)for(int ch=0;ch<3;++ch){uint16_t value=0;std::memcpy(&value,input.data()+pixel*8+ch*2,2);
+                const float expected=srgb_source?std::pow((kScene[ch]+.055f)/1.055f,2.4f):kScene[ch];worst=std::max(worst,std::abs(half_value(value)-expected));}
+            CHECK(worst<.002f);std::printf("mixed-canvas actual DLSS input: source_srgb=%d error %.6f\n",srgb_source,worst);
         }
     }
     CHECK(ub::GetStats().learned_frames>0);
@@ -683,7 +772,11 @@ int main()
     struct ExitObserver {~ExitObserver(){na::observe::SetProcessExiting();}} exit_observer;
     ComPtr<ID3D12InfoQueue> info;
     d.device->QueryInterface(IID_PPV_ARGS(&info));
-    if (end_to_end(d)||mixed_canvas(d)) return 1;
+    ComPtr<ID3D12InfoQueue1> immediate;d.device->QueryInterface(IID_PPV_ARGS(&immediate));DWORD callback=0;
+    if(immediate)immediate->RegisterMessageCallback([](D3D12_MESSAGE_CATEGORY,D3D12_MESSAGE_SEVERITY severity,D3D12_MESSAGE_ID,const char* text,void*){
+        if(severity<=D3D12_MESSAGE_SEVERITY_ERROR)std::printf("DX12 ERROR: %s\n",text);
+    },D3D12_MESSAGE_CALLBACK_FLAG_NONE,nullptr,&callback);
+    if (end_to_end(d)||mixed_canvas(d)||mixed_canvas(d,true)) return 1;
     if (info) {
         UINT errors = 0;
         for (UINT64 i = 0; i < info->GetNumStoredMessagesAllowedByRetrievalFilter(); ++i) {
@@ -699,5 +792,6 @@ int main()
         CHECK(errors == 0);
     }
     na::observe::SetProcessExiting();
+    if(immediate)immediate->UnregisterMessageCallback(callback);
     return test::finish("j2_hud_unblend_test");
 }

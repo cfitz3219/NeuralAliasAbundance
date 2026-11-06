@@ -39,6 +39,7 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
 void OnClear(ID3D12GraphicsCommandList* l, uint64_t target, const float color[4]);
 void OnTexture(ID3D12GraphicsCommandList* l, const na::observe::TextureCall&);
 void OnClosing(ID3D12GraphicsCommandList* l);
+void AfterSubmission(ID3D12CommandQueue*,uint32_t count,ID3D12CommandList* const*);
 // Present (render-small): the layers for the frame that ends now. True when UI draws were
 // replayed this frame; out->compose says whether the self-check allows laying them on.
 bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, native_hud::Layer* out,

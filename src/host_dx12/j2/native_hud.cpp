@@ -1620,6 +1620,7 @@ void ReportPictureResult(bool identity,bool clean,uint32_t tested,uint32_t match
 void SetPreHudRendererForTests(PreHudRenderer renderer){g_test_renderer.store(renderer);}
 void AfterSubmission(ID3D12CommandQueue* queue,uint32_t count,ID3D12CommandList* const* lists)
 {
+    if(hud_unblend::Enabled()){hud_unblend::AfterSubmission(queue,count,lists);return;}
     if(!queue||!count||!lists||!Enabled())return;
     std::vector<std::shared_ptr<CapturedPicture>> ready;
     {

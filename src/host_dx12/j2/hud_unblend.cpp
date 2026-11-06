@@ -17,6 +17,7 @@
 #include <cmath>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <array>
 
@@ -54,12 +55,28 @@ struct Set {
     uint64_t writer_id = 0, recording = 0;
     uint64_t scene_source = 0;
     bool source_srgb = false;
+    bool closed = false;
+    uint64_t submitted = 0;
     std::shared_ptr<na::scale::ShaderDescriptorArena> descriptors = std::make_shared<na::scale::ShaderDescriptorArena>();
     std::unordered_map<uint64_t, std::array<std::shared_ptr<const na::scale::PreparedBindings>,4>> bindings;
 };
 struct FrameSet {
     std::unordered_map<na_object_id, std::shared_ptr<Set>> active, transferred;
+    std::unordered_set<na_object_id> scene;
 };
+struct Packet {
+    std::shared_ptr<Set> owner;
+    ID3D12CommandList* list=nullptr;
+    uint64_t list_id=0,recording=0,target=0,order=0;
+    na::nr::native::RecordingLease use;
+};
+std::vector<std::shared_ptr<Packet>> g_packets;
+std::unordered_map<uint64_t,std::shared_ptr<Set>> g_submitted;
+struct Writes {uint64_t recording=0;std::unordered_set<uint64_t> targets;};
+std::unordered_map<uint64_t,Writes> g_writes;
+uint64_t g_order=0;
+uint64_t g_submission=0;
+std::unordered_map<uint64_t,uint64_t> g_presented;
 struct Association {uint64_t output=0,source=0,seen=0;uint32_t confirmations=0,matched=0,tested=0;};
 struct Probe {uint64_t output=0,source=0,frame=0;};
 std::vector<Association> g_associations;
@@ -151,7 +168,7 @@ std::shared_ptr<Set> acquire_set_locked(ID3D12Device* dev, const Dims& d)
         p->view = DXGI_FORMAT_UNKNOWN;
         p->scene_captured = p->full_captured = false; p->clean = true;
         p->writer = nullptr; p->writer_id = p->recording = 0;
-        p->scene_source = 0; p->source_srgb = false; p->bindings.clear();
+        p->scene_source = 0; p->source_srgb = false; p->closed=false;p->submitted=0; p->bindings.clear();
         if (p->picture) p->picture->BeginCycle();
         return p;
     }
@@ -166,6 +183,20 @@ bool retain_locked(ID3D12GraphicsCommandList* l, const std::shared_ptr<Set>& p)
     if (!use) return false;
     if (std::none_of(p->uses.begin(), p->uses.end(), [&](const auto& u) { return u.SameRecording(use); })) p->uses.push_back(use);
     return true;
+}
+void packet_locked(ID3D12GraphicsCommandList* l,uint64_t target,std::shared_ptr<Set> owner={})
+{
+    const auto id=na::observe::IdOf(l),recording=na::observe::ListRecording(l);
+    if(!id||!recording)return;
+    auto p=std::make_shared<Packet>();p->owner=std::move(owner);p->list=l;p->list_id=id;p->recording=recording;p->target=target;p->order=++g_order;
+    p->use=na::nr::native::RetainRecording(l,p);if(!p->use)return;
+    g_packets.push_back(std::move(p));
+    if(g_packets.back()->owner)g_writes[id].targets.erase(target); // next write must supersede this frozen handoff
+}
+void mutation_locked(ID3D12GraphicsCommandList* l,uint64_t target,uint64_t id,uint64_t recording)
+{
+    auto& w=g_writes[id];if(w.recording!=recording){w.recording=recording;w.targets.clear();}
+    if(w.targets.insert(target).second)packet_locked(l,target);
 }
 void copy_layers(ID3D12GraphicsCommandList* l, Set& dst, const Set& src)
 {
@@ -241,7 +272,9 @@ world_bindings(ID3D12GraphicsCommandList* l, Set& dst, Set& world,
                uint64_t source, const na::observe::NativeOperation& op)
 {
     uint64_t key=op.pipeline_id;
+    na::observe::OperationKey::add(key,op.root.Get());
     na::observe::OperationKey::add(key,source);
+    for(const auto& t:op.tables){na::observe::OperationKey::add(key,t.param);na::observe::OperationKey::add(key,t.first);na::observe::OperationKey::add(key,t.count);}
     for(const auto& d:op.descriptors){
         na::observe::OperationKey::add(key,d.used);
         if(!d.used)continue;
@@ -365,7 +398,8 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
     const Dims d = g_dims;
     if (!d.ow) return {};
     FrameSet& sets = g_set[g_frame % kSets];
-    const auto previous = sets.active.find(t_bind.rt);
+    if(g_writes.size()>512)g_writes.clear();
+    mutation_locked(l,st.rt,st.list,st.recording);
     const float* vp0 = st.viewport_count ? st.viewports[0] : nullptr;
     const int32_t* sc0 = st.scissor_count ? st.scissors[0] : nullptr;
     const bool full_pass=verts<=6&&inst==1&&native_hud::CoversTarget(vp0,sc0,d.rw,d.rh);
@@ -376,14 +410,6 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
     std::shared_ptr<Set> sampled_layers;
     // A reflected source with already recorded HUD is an actual dependency,
     // even when its final compositor is opaque. No target-order promotion.
-    if(!full_pass||blended||!sets.active.empty()||!sets.transferred.empty()){
-        op_known=na::observe::ListNativeOperation(l,false,op)&&op.reflection_complete;
-        if(op_known&&native_hud::PictureSource(op,st.rt,d.rw,d.rh,sampled_source))
-            for(const auto& input:op.descriptors)if(input.used&&input.view.resource==sampled_source){sampled=&input;break;}
-        const auto a=sets.active.find(sampled_source),b=sets.transferred.find(sampled_source);
-        if(a!=sets.active.end())sampled_layers=a->second;
-        else if(b!=sets.transferred.end())sampled_layers=b->second;
-    }
     // Viewport/scissor bounds are not geometry coverage. A six-vertex opaque
     // glyph may occupy a tiny rectangle with both set to the full target. It
     // must not erase earlier HUD or become the scene snapshot. Let the actual
@@ -395,11 +421,19 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
         na::observe::LiveBinding cb[16];
         const uint32_t n = na::observe::ListCurrentGraphicsCbvs(l, cb, 16);
         for (uint32_t i = 0; i < n; ++i)
-            if (na::j2::CameraBinding(cb[i].resource, cb[i].offset, cb[i].param, cb[i].table)) { ++g_stats.world; return {}; }
+            if (na::j2::CameraBinding(cb[i].resource, cb[i].offset, cb[i].param, cb[i].table)) {
+                sets.scene.insert(st.rt);
+                const auto old=sets.active.find(st.rt);if(old!=sets.active.end()&&old->second->closed)sets.active.erase(old);
+                sets.transferred.erase(st.rt);++g_stats.world;return {};
+            }
         uint64_t scene_depth = 0, scene_color = 0;
         na::observe::GetLiveSelection(&scene_depth, &scene_color);
         if (scene_depth && st.ds == scene_depth && st.pipeline_known && st.depth_enable != NA_UNKNOWN_U32 && st.depth_enable != 0u &&
-            st.dsv_format != DXGI_FORMAT_UNKNOWN) { ++g_stats.world; return {}; }
+            st.dsv_format != DXGI_FORMAT_UNKNOWN) {
+            sets.scene.insert(st.rt);
+            const auto old=sets.active.find(st.rt);if(old!=sets.active.end()&&old->second->closed)sets.active.erase(old);
+            sets.transferred.erase(st.rt);++g_stats.world;return {};
+        }
     }
     const DXGI_FORMAT view = static_cast<DXGI_FORMAT>(st.rtv_format);
     const char* why = nullptr;
@@ -418,6 +452,22 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
     if (why) { forward_locked(why); return {}; }
     ComPtr<ID3D12Device> dev;
     if (FAILED(l->GetDevice(IID_PPV_ARGS(&dev)))) { forward_locked("no device"); return {}; }
+    // Expensive descriptor snapshots happen only AFTER camera/depth rejects
+    // scene geometry. Normal world draws keep their original inexpensive path.
+    op_known=na::observe::ListNativeOperation(l,false,op)&&op.reflection_complete;
+    if(op_known&&native_hud::PictureSource(op,st.rt,d.rw,d.rh,sampled_source))
+        for(const auto& input:op.descriptors)if(input.used&&input.view.resource==sampled_source){sampled=&input;break;}
+    const auto source_active=sets.active.find(sampled_source),source_transfer=sets.transferred.find(sampled_source);
+    if(source_active!=sets.active.end())sampled_layers=source_active->second;
+    else if(source_transfer!=sets.transferred.end())sampled_layers=source_transfer->second;
+    const auto previous=sets.active.find(st.rt);
+    if(full_pass&&!blended&&sampled_source&&sets.scene.count(sampled_source)&&
+       (!sampled_layers||!sampled_layers->draws)&&(previous==sets.active.end()||!previous->second->draws)){
+        // A terminal HUD has not begun on either image, and the sampled input
+        // descends from actual camera/depth scene work. Keep normal scene
+        // postprocessing native; do not four-times replay the entire PP chain.
+        sets.scene.insert(st.rt);++g_stats.scene;return {};
+    }
     if(full_pass&&!blended&&sampled_layers&&sampled_layers->draws&&sampled_layers->scene_captured){
         // A full-image draw can be an identity handoff even with different
         // source/target sRGB views. Preserve the source's coefficient domain;
@@ -427,6 +477,7 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
         // including coverage/discard, colour transformations and late writes.
         uint32_t source_state=0;
         auto frozen=acquire_set_locked(dev.Get(),d);
+        if(frozen)frozen->uses=sampled_layers->uses;
         if(frozen&&retain_locked(l,sampled_layers)&&retain_locked(l,frozen)&&
            na::observe::ListStateSub(l,sampled_source,0,&source_state)==na::observe::StateLookup::Known){
             copy_layers(l,*frozen,*sampled_layers);
@@ -434,6 +485,7 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
                 frozen->scene_captured=frozen->picture->SnapshotScene(l,sampled_layers->picture->Scene(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 frozen->full_captured=frozen->picture->SnapshotFull(l,sampled->resource.Get(),static_cast<D3D12_RESOURCE_STATES>(source_state));
                 frozen->target=st.rt;
+                frozen->closed=true;packet_locked(l,st.rt,frozen);
                 sets.active.erase(st.rt);sets.transferred[st.rt]=std::move(frozen);
                 ++g_stats.draw_handoffs;return {};
             }
@@ -441,19 +493,21 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
         forward_locked("picture handoff snapshot unavailable");return {};
     }
     std::shared_ptr<Set> owner;
-    if (previous != sets.active.end()) owner = previous->second;
+    if (previous != sets.active.end()&&!previous->second->closed) owner = previous->second;
     else {
         if (sets.active.size() >= kMaxTargets) { forward_locked("candidate pool busy"); return {}; }
         owner = acquire_set_locked(dev.Get(), d);
         if (!owner) { forward_locked("could not make the layers"); return {}; }
-        sets.active.emplace(t_bind.rt, owner);
-        const auto inherited = sets.transferred.find(t_bind.rt);
-        if (inherited != sets.transferred.end()) {
-            const auto& base = *inherited->second;
+        const auto transferred=sets.transferred.find(st.rt);
+        auto inherited=previous!=sets.active.end()?previous->second:transferred!=sets.transferred.end()?transferred->second:std::shared_ptr<Set>{};
+        if(inherited){
+            const auto& base = *inherited;
             copy_layers(l, *owner, base);
+            owner->uses=base.uses;
             if (base.picture && base.scene_captured && picture_locked(*owner, base.picture->Scene()->GetDesc()))
                 owner->scene_captured = owner->picture->SnapshotScene(l, base.picture->Scene(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         }
+        sets.active[st.rt]=owner;
     }
     if (!retain_locked(l, owner)) { forward_locked("could not retain recording"); return {}; }
     Set& s = *owner;
@@ -566,6 +620,8 @@ void OnClear(ID3D12GraphicsCommandList* l, uint64_t target, const float color[4]
     (void)l; (void)color;
     std::lock_guard<std::mutex> lock(g_m);
     auto& sets = g_set[g_frame % kSets];
+    mutation_locked(l,target,na::observe::IdOf(l),na::observe::ListRecording(l));
+    sets.scene.erase(target);
     const auto erased = sets.active.erase(target) + sets.transferred.erase(target);
     if (erased) ++g_stats.cleared_after;
 }
@@ -593,6 +649,7 @@ void OnTexture(ID3D12GraphicsCommandList* l, const na::observe::TextureCall& c)
                       c.box->bottom == sd.Height && c.box->back == 1))));
     std::lock_guard<std::mutex> lock(g_m);
     auto& sets = g_set[g_frame % kSets];
+    mutation_locked(l,dst_id,na::observe::IdOf(l),na::observe::ListRecording(l));
     ++g_stats.copies;
     std::shared_ptr<Set> source;
     const auto active = sets.active.find(src_id), transferred = sets.transferred.find(src_id);
@@ -604,6 +661,7 @@ void OnTexture(ID3D12GraphicsCommandList* l, const na::observe::TextureCall& c)
     // Freeze at the actual handoff, before a later source draw can replace the
     // layers. Keep both snapshots alive through the submitted copy recording.
     auto frozen = acquire_set_locked(source->device.Get(), g_dims);
+    if(frozen)frozen->uses=source->uses;
     if (!frozen || !retain_locked(l, source) || !retain_locked(l, frozen)) return;
     copy_layers(l, *frozen, *source);
     if (source->picture && source->scene_captured && picture_locked(*frozen, source->picture->Scene()->GetDesc())) {
@@ -613,6 +671,7 @@ void OnTexture(ID3D12GraphicsCommandList* l, const na::observe::TextureCall& c)
             frozen->full_captured = frozen->picture->SnapshotFull(l, c.source, static_cast<D3D12_RESOURCE_STATES>(source_state));
     }
     frozen->target = dst_id;
+    frozen->closed=true;packet_locked(l,dst_id,frozen);
     sets.transferred.emplace(dst_id, std::move(frozen));
     ++g_stats.copied_layers;
 }
@@ -624,12 +683,31 @@ void OnClosing(ID3D12GraphicsCommandList* l)
     std::lock_guard<std::mutex> lock(g_m);
     for (const auto& item : g_set[g_frame % kSets].active) {
         auto& s = *item.second;
-        if (s.writer_id != id || s.recording != recording || !s.draws || !s.picture || !s.scene_captured) continue;
+        if (s.writer_id != id || s.recording != recording || s.closed || !s.draws || !s.picture || !s.scene_captured) continue;
         uint32_t state = 0;
         if (na::observe::ListStateSub(l, s.target, 0, &state) != na::observe::StateLookup::Known) continue;
         ComPtr<ID3D12Resource> original; original.Attach(na::observe::AcquireResource(s.target));
         if (original) s.full_captured = s.picture->SnapshotFull(l, original.Get(), static_cast<D3D12_RESOURCE_STATES>(state));
+        s.closed=true;
+        if(s.full_captured)packet_locked(l,s.target,item.second);
     }
+}
+
+void AfterSubmission(ID3D12CommandQueue* queue,uint32_t count,ID3D12CommandList* const* lists)
+{
+    if(!queue||!count||!lists)return;
+    std::lock_guard<std::mutex> lock(g_m);
+    const auto submission=++g_submission;
+    const auto rank=[&](const auto& p){for(UINT i=0;i<count;++i)if(lists[i]==p->list&&na::observe::IdOf(lists[i])==p->list_id&&
+        na::observe::ListRecording(lists[i])==p->recording)return i+1;return 0u;};
+    std::vector<std::shared_ptr<Packet>> executing;
+    for(const auto& p:g_packets)if(rank(p)&&p->use.Ready(queue))executing.push_back(p);
+    std::stable_sort(executing.begin(),executing.end(),[&](const auto& a,const auto& b){const auto ar=rank(a),br=rank(b);return ar!=br?ar<br:a->order<b->order;});
+    for(const auto& p:executing){
+        if(!p->owner)g_submitted.erase(p->target);
+        else if(std::all_of(p->owner->uses.begin(),p->owner->uses.end(),[&](const auto& u){return u.Ready(queue);})){p->owner->submitted=submission;g_submitted[p->target]=p->owner;}
+    }
+    g_packets.erase(std::remove_if(g_packets.begin(),g_packets.end(),[](const auto& p){return p->use.Retired();}),g_packets.end());
 }
 
 bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, native_hud::Layer* out,
@@ -641,15 +719,15 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
     if (g_dims.rw != rw || g_dims.rh != rh || g_dims.ow != ow || g_dims.oh != oh || g_dims.proxy != pf) {
         g_dims = Dims{rw, rh, ow, oh, pf};
         g_shapes.clear();
-        for (auto& old : g_set) { old.active.clear(); old.transferred.clear(); }
+        for (auto& old : g_set) { old.active.clear(); old.transferred.clear();old.scene.clear(); }
+        g_submitted.clear();
+        g_presented.clear();
         g_associations.clear();g_probes.clear();
     }
-    auto& sets = g_set[g_frame % kSets];
     const auto id = na::observe::IdOf(frame);
     std::shared_ptr<Set> owner;
-    const auto active = sets.active.find(id), transferred = sets.transferred.find(id);
-    if (active != sets.active.end()) owner = active->second;
-    else if (transferred != sets.transferred.end()) owner = transferred->second;
+    const auto executed=g_submitted.find(id);
+    if(executed!=g_submitted.end())owner=executed->second;
     const auto ready=[&](const auto& p){return p&&p->cleared&&p->draws&&p->picture&&p->scene_captured&&p->full_captured&&queue&&
         !p->uses.empty()&&std::all_of(p->uses.begin(),p->uses.end(),[&](const auto& use){return use.Ready(queue);});};
     // Reuse the existing asynchronous GPU picture probe when final shader
@@ -658,15 +736,16 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
     if(!owner){
         const Association* best=nullptr;
         for(const auto& a:g_associations)if(a.output==id&&a.confirmations>=2&&a.seen+120>=g_frame){
-            const auto found=sets.active.find(a.source);
-            if(found==sets.active.end()||!ready(found->second))continue;
+            const auto found=g_submitted.find(a.source);
+            if(found==g_submitted.end()||!ready(found->second))continue;
             if(!best||uint64_t(a.matched)*best->tested>uint64_t(best->matched)*a.tested)best=&a;
         }
-        if(best){owner=sets.active.find(best->source)->second;++g_stats.learned_frames;}
+        if(best){owner=g_submitted.find(best->source)->second;++g_stats.learned_frames;}
     }
     if(out){
         std::vector<std::shared_ptr<Set>> probes;
-        for(const auto& entry:sets.active)if(entry.first!=id&&entry.second!=owner&&ready(entry.second))probes.push_back(entry.second);
+        const auto since=g_presented[id];
+        for(const auto& entry:g_submitted)if(entry.first!=id&&entry.second!=owner&&entry.second->submitted>since&&ready(entry.second))probes.push_back(entry.second);
         std::sort(probes.begin(),probes.end(),[](const auto& a,const auto& b){return a->target<b->target;});
         if(!probes.empty()){
             auto p=probes[g_probe_cursor++%probes.size()];
@@ -677,6 +756,7 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
             out->association_source=owner->target;out->association_generation=serial;}
     }
     for(auto it=g_probes.begin();it!=g_probes.end();)if(it->second.frame+120<g_frame)it=g_probes.erase(it);else++it;
+    g_presented[id]=g_submission;
     g_stats.requested_target = id;
     g_stats.matched_target = owner ? owner->target : 0;
     g_stats.pending_recordings = 0;
@@ -714,7 +794,7 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
     // was submitted before anything recorded from now on).
     ++g_frame;
     auto& next = g_set[g_frame % kSets];
-    next.active.clear(); next.transferred.clear();
+    next.active.clear(); next.transferred.clear();next.scene.clear();
     return hud;
 }
 
