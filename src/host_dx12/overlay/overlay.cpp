@@ -1199,6 +1199,11 @@ void write_status_line()
                 (unsigned long long)j2.velocity_candidates, (unsigned long long)j2.velocity_captured, (unsigned long long)j2.velocity_capture_unknown_state,
                 (unsigned long long)(GetTickCount64() / 100 % 100000000), j2.recent_cuts);
             if (cn2 > 0) WriteFile(f, cl2, static_cast<DWORD>((std::min)(cn2, static_cast<int>(sizeof(cl2) - 1))), &written, nullptr);
+            if (j2.game_motion[0]) {
+                WriteFile(f, "j2_", 3, &written, nullptr);
+                WriteFile(f, j2.game_motion, static_cast<DWORD>(std::strlen(j2.game_motion)), &written, nullptr);
+                WriteFile(f, "\r\n", 2, &written, nullptr);
+            }
             {
                 const char* eff = na::settings::EffectiveSummary();
                 if (eff && eff[0]) { WriteFile(f, eff, static_cast<DWORD>(std::strlen(eff)), &written, nullptr); WriteFile(f, "\r\n", 2, &written, nullptr); }

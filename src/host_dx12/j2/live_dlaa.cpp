@@ -4,6 +4,7 @@
 #include "host_dx12/diag/gpu_breadcrumbs.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/camera_interloper.hpp"
+#include "host_dx12/j2/game_motion.hpp"
 #include "host_dx12/j2/msaa_resolve.hpp"
 #include "host_dx12/j2/nis_sharpen.hpp"
 #include "host_dx12/j2/nis_scaler.hpp"
@@ -135,6 +136,11 @@ struct State {
     DXGI_FORMAT color_format = DXGI_FORMAT_UNKNOWN;
     na::motion::gpu::Arbiter arbiter;
     bool arbiter_ok = false;
+    // The game's own motion texture, when one is proven against the picture (game_motion_decide.hpp).
+    na::j2::game_motion::Feed game_motion;
+    bool game_motion_ok = false;
+    bool game_motion_logged = false;
+    int game_motion_used = -2;
     na::camera::CameraTracker tracker;
     // A second camera that flips into the main camera's slot for 1-3 frames (SE5 menu, p25748).
     na::j2::InterloperFilter interlopers;
@@ -893,6 +899,7 @@ bool ensure_device(ID3D12CommandQueue* q)
         s.list->Close();
     }
     g.arbiter_ok = g.arbiter.Init(dev.Get(), kRing);
+    g.game_motion_ok = g.game_motion.Init(dev.Get(), kRing);
     return true;
 }
 
@@ -2528,6 +2535,49 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             in.tier3_mask = t3.mask;
             in.tier3_valid = t3.valid;
             in.tier3_valid_flag = true;
+        }
+        // Tier 1: the game's own motion texture, used only once it predicts the picture (moving
+        // characters in a still menu get ~0 from the camera and smear; Cort 2026-11-06).
+        if (g.game_motion_ok && !(saved && saved->at_present)) {
+            static const uint32_t kMotionFormats[] = {
+                DXGI_FORMAT_R16G16_TYPELESS, DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R16G16_UNORM, DXGI_FORMAT_R16G16_SNORM};
+            na_object_id ids[6] = {};
+            const uint32_t found_n = na::observe::FindTextures(kMotionFormats, 4, w, h, ids, 6);
+            ComPtr<ID3D12Resource> hold[na::j2::game_motion::kCandidates];
+            na::j2::game_motion::Candidate cands[na::j2::game_motion::kCandidates];
+            uint32_t nc = 0;
+            for (uint32_t i = 0; i < found_n && nc < na::j2::game_motion::kCandidates; ++i) {
+                uint32_t st = 0;
+                const auto lookup = inl ? na::observe::ListStateSub(inl, ids[i], 0, &st) : na::observe::StateLookup::Absent;
+                const bool known = lookup == na::observe::StateLookup::Known ||
+                    (lookup == na::observe::StateLookup::Absent && na::observe::KnownSubStateOnQueueNow(g.queue.Get(), ids[i], 0, &st));
+                if (!known) continue;
+                ID3D12Resource* r = na::observe::AcquireResource(ids[i]);
+                if (!r) continue;
+                hold[nc].Attach(r);
+                const auto rd = r->GetDesc();
+                if (rd.SampleDesc.Count != 1 || rd.DepthOrArraySize != 1 || r == g.motion.Get()) { hold[nc].Reset(); continue; }
+                cands[nc].resource = r;
+                cands[nc].state = static_cast<D3D12_RESOURCE_STATES>(st);
+                cands[nc].id = ids[i];
+                ++nc;
+            }
+            const auto gm = g.game_motion.Record(l, g.slot, cands, nc, g.color_in.Get(), rw, rh,
+                                                 cam.camera_cut || resize || g.resume_reset);
+            if (gm.motion) {
+                in.tier1_motion = gm.motion;
+                in.tier1_valid = gm.valid;
+                in.tier1_valid_flag = true;
+            }
+            const auto gs = g.game_motion.GetStats();
+            const int used = gs.used_candidate < 0 ? -1 : gs.used_candidate * 16 + gs.used_encoding;
+            if (used != g.game_motion_used || (!g.game_motion_logged && gs.measured >= 64)) {
+                char text[sizeof g.stats.game_motion];
+                g.game_motion.Describe(text, sizeof text);
+                na::eventlog::Emit("game_motion", "%s %s", used != g.game_motion_used ? (used >= 0 ? "use" : "none") : "first", text);
+                g.game_motion_used = used;
+                if (gs.measured >= 64) g.game_motion_logged = true;
+            }
         }
         na::motion::gpu::Outputs o{};
         o.xy = g.motion.Get();
@@ -5391,6 +5441,7 @@ Stats GetStats()
 {
     std::lock_guard<std::mutex> lock(g.m);
     g.stats.frame_now = g.frame;
+    if (g.game_motion_ok) g.game_motion.Describe(g.stats.game_motion, sizeof g.stats.game_motion);
     return g.stats;
 }
 
@@ -5404,6 +5455,7 @@ void Shutdown()
     na::j2::compute_flow::Reset();
     g.fence.Reset(); g.queue.Reset(); g.device.Reset();
     g.arbiter = na::motion::gpu::Arbiter{};
+    g.game_motion = na::j2::game_motion::Feed{}; g.game_motion_ok = false; g.game_motion_logged = false; g.game_motion_used = -2;
     g_dbg = DebugPass{};
     g_rcas = RcasPass{};
     g_jshift = JitterShift{}; // released here, not in static destruction after D3D12 has gone

@@ -193,6 +193,7 @@ if(NA_HAVE_NGX_SDK)
   # J2 live DLAA end to end (discovery picks -> inserted DLAA list) on the fake runtime.
   na_host_test(j2_live_test SOURCES j2_live_test.cpp LIBS host_dx12 dxgi)
   na_host_test(j2_rcas_test SOURCES j2_rcas_test.cpp LIBS host_dx12 dxgi)
+  na_host_test(game_motion_test SOURCES game_motion_test.cpp LIBS host_dx12 dxgi)
   na_host_test(j2_nis_test SOURCES j2_nis_test.cpp LIBS host_dx12 dxgi)
   na_host_test(j2_hud_nis_test SOURCES j2_hud_nis_test.cpp LIBS host_dx12 dxgi)
   na_host_test(j2_native_hud_test SOURCES j2_native_hud_test.cpp LIBS host_dx12 dxgi d3dcompiler)
