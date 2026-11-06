@@ -4049,6 +4049,7 @@ void before_shader_use(GL* l, bool compute, bool indirect=false)
                          (compute?na::j2::Op::ComputeEntry:na::j2::Op::GraphicsEntry),signature->second.root_hash};
             resource_dims_locked(entry.destination,&entry.dst_w,&entry.dst_h,&entry.dst_fmt);
             entry.recording=ls->generation.load();entry.operation=ls->op_index.load()+1;entry.barrier=ls->entry_barrier;
+            ls->insertion.SetEntryContext(entry);
             ls->insertion.Add(entry);
         }
         na_object_id destination = compute ? 0 : ls->cur_rt;

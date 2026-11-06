@@ -28,7 +28,18 @@ struct InsertionEvent {
     bool with_depth = false; // write: the selected scene depth was bound (scene content, not reuse)
     uint64_t recording=0,operation=0;
     uint32_t barrier=0;
+    // Entry context (2026-11-06, SE5 40 s bursts): where this entry sits in its own recording.
+    // Bit 4 = the colour was written earlier in this recording; bits 0-3 = which entry of the
+    // colour since that write (or since the recording began), this one included, capped at 15.
+    // The same consumer PSO can be an intermediate entry in one shape and the terminal one in
+    // another (lists merged vs split); the context keeps the two occurrences apart.
+    uint32_t context=0;
+    uint64_t producer=0;   // entry: pipeline of the colour's last write in this recording (0 = none)
 };
+inline uint32_t EntryContext(bool written_in_recording, uint32_t ordinal)
+{
+    return (written_in_recording ? 16u : 0u) | (ordinal > 15u ? 15u : ordinal);
+}
 inline Op ClassifyOp(const InsertionEvent& e)
 {
     if (e.op != Op::Unknown) return e.op;
@@ -112,6 +123,19 @@ struct ColorEvent {
 class InsertionTrace {
 public:
     void Reset() { events_.clear(); complete_ = true; }
+    // Context of an entry about to be added (see InsertionEvent::context / producer).
+    void SetEntryContext(InsertionEvent& entry) const {
+        uint32_t ordinal = 1;
+        bool written = false;
+        entry.producer = 0;
+        for (size_t i = events_.size(); i-- > 0;) {
+            const auto& p = events_[i];
+            if (p.resource != entry.resource) continue;
+            if (p.write) { written = true; entry.producer = p.pipeline; break; }
+            if (IsEntry(p.op)) ++ordinal;
+        }
+        entry.context = EntryContext(written, ordinal);
+    }
     void Add(InsertionEvent event) {
         if (events_.size() == 8192) { complete_ = false; return; }
         events_.push_back(event);

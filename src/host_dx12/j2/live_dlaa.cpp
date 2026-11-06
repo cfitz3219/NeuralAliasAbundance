@@ -2792,7 +2792,7 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
     if(entry) {
         using V=na::j2::PostEntryProfile::Verdict;
         const auto verdict=g.entries.Judge(*entry);
-        if(verdict==V::Accepted){by_class=true;matched_mode=kByEntry;}
+        if(verdict==V::Accepted){by_class=true;matched_mode=kByEntry;if(g.entries.AcceptedByContext(*entry))++g.stats.entry_ctx_matched;}
         else {
             const char* why=verdict==V::Unknown?"new_or_unidentified":verdict==V::Learning?"learning":"seen_mid_scene";
             if(verdict==V::Unknown)++g.stats.entry_unknown;
@@ -4793,7 +4793,7 @@ void OnPresent(ID3D12CommandQueue* queue)
             // writes and reads (facts once the frame is closed) and learn their classes.
             if (g.frame_seq_complete && !g.frame_seq.empty() && g.scene_w) {
                 g.entries.Observe(g.frame_seq,true,g.frame);
-                g.stats.entry_keys=static_cast<uint32_t>(g.entries.Size());
+                g.stats.entry_keys=static_cast<uint32_t>(g.entries.Size());g.stats.entry_ctx_keys=static_cast<uint32_t>(g.entries.ContextSize());
                 std::vector<na::j2::Labelled> labels;
                 na::j2::LabelFrame(g.frame_seq, g.scene_w, g.scene_h, labels);
                 for (const auto& lab : labels) g.profile.Observe(lab, g.frame);

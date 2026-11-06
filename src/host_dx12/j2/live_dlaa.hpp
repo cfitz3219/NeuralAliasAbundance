@@ -318,6 +318,8 @@ struct Stats {
     // burst): no_learned, resource, writer, occurrence, transition, candidate, destination,
     // pipeline, pending (an earlier insertion not yet submitted); plus the last one in full.
     uint64_t rescue_fail[9]={};
+    uint64_t entry_ctx_matched=0; // entries accepted only by their recording context (merged-list frames)
+    uint32_t entry_ctx_keys=0;
     char rescue_note[240]={};
     uint64_t entry_rescued=0; // refused entries placed by the learned scene boundary instead (list-merge frames)
     uint32_t entry_keys=0;
