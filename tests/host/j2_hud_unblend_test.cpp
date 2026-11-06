@@ -13,7 +13,9 @@
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/native_hud.hpp"
 #include "host_dx12/j2/hud_unblend.hpp"
+#include "host_dx12/j2/hud_picture.hpp"
 #include "host_dx12/observe/producers.hpp"
+#include "host_dx12/nr/native_fg.hpp"
 
 #include <d3dcompiler.h>
 #include <d3d12sdklayers.h>
@@ -30,6 +32,11 @@ using test::ComPtr;
 
 namespace {
 void __cdecl sink(const na_event_batch*, void*) {}
+void submit(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists)
+{
+    na::nr::native::Submission submitted(queue, count, lists);
+    queue->ExecuteCommandLists(count, lists);
+}
 
 bool readback(test::Device& d, ID3D12Resource* tex, D3D12_RESOURCE_STATES state, uint32_t bpp, std::vector<uint8_t>& out)
 {
@@ -50,7 +57,7 @@ bool readback(test::Device& d, ID3D12Resource* tex, D3D12_RESOURCE_STATES state,
     l.list->ResourceBarrier(1, &b);
     if (FAILED(l.list->Close())) return false;
     ID3D12CommandList* lists[] = {l.list.Get()};
-    d.queue->ExecuteCommandLists(1, lists);
+    submit(d.queue.Get(), 1, lists);
     d.WaitIdle();
     uint8_t* p = nullptr;
     if (FAILED(rb->Map(0, nullptr, reinterpret_cast<void**>(&p)))) return false;
@@ -106,6 +113,12 @@ constexpr DXGI_FORMAT F = DXGI_FORMAT_R8G8B8A8_UNORM;
 constexpr auto RTS = D3D12_RESOURCE_STATE_RENDER_TARGET, NPSR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                UAV = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 int at(const std::vector<uint8_t>& v, uint32_t w, uint32_t x, uint32_t y, int c) { return int(v[(size_t(y) * w + x) * 4 + c]); }
+float half_value(uint16_t value)
+{
+    const int exponent = (value >> 10) & 31, fraction = value & 1023;
+    const float magnitude = exponent ? std::ldexp(1.f + float(fraction) / 1024.f, exponent - 15) : std::ldexp(float(fraction), -24);
+    return value & 0x8000 ? -magnitude : magnitude;
+}
 
 int verdict_logic()
 {
@@ -128,6 +141,7 @@ int end_to_end(test::Device& d)
     ub::SetConfigured(true);
     REQUIRE(ub::Enabled());
     REQUIRE(na::observe::InstallProducers(dev, d.queue.Get(), true));
+    REQUIRE(na::observe::InstallListResetTracking(dev, na::nr::native::Reset));
     na_observe_config cfg{};
     cfg.size_bytes = sizeof cfg;
     REQUIRE(na_observe_start(&cfg, sink, nullptr) == NA_OK);
@@ -141,7 +155,7 @@ int end_to_end(test::Device& d)
     auto counts = test::CreateBuffer(dev, 256, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     REQUIRE(proxy && canvas && other && ref && picture && out && scene && counts);
     nh::Layer layer;
-    CHECK(!nh::TakeFrame(proxy.Get(), RW, RH, OW, OH, &layer)); // learns the picture's size and format
+    CHECK(!nh::TakeFrame(proxy.Get(), RW, RH, OW, OH, &layer, d.queue.Get())); // learns the picture's size and format
 
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 5, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     ComPtr<ID3D12DescriptorHeap> rtvs;
@@ -223,25 +237,27 @@ int end_to_end(test::Device& d)
     frame(false);
     REQUIRE(SUCCEEDED(l->Close()));
     ID3D12CommandList* lists[] = {l};
-    d.queue->ExecuteCommandLists(1, lists);
+    submit(d.queue.Get(), 1, lists);
     d.WaitIdle();
     CHECK(dev->GetDeviceRemovedReason() == S_OK);
 
     ub::Stats st = ub::GetStats();
     std::printf("%s\n", ub::StatusLine().c_str());
-    CHECK(st.replayed == 3);
+    CHECK(st.replayed == 4);
     CHECK(st.blended == 2);
     CHECK(st.scene == 1);
-    CHECK(st.forwarded == 1 && st.other_target == 1); // the white pass on `other`: same shape, not this frame's UI target
+    CHECK(st.forwarded == 0 && st.other_target == 0); // unrelated target has independent layers
     CHECK(st.world == 0);
     CHECK(st.restore_failed == 0);
-    const bool got = nh::TakeFrame(proxy.Get(), RW, RH, OW, OH, &layer);
+    const bool got = nh::TakeFrame(proxy.Get(), RW, RH, OW, OH, &layer, d.queue.Get());
+    std::printf("after selection: %s\n", ub::StatusLine().c_str());
     CHECK(got);
     REQUIRE(got && layer.unblend && layer.compose && layer.n0 && layer.n1 && layer.l0 && layer.l1);
     CHECK(layer.view == F);
     CHECK(!layer.srgb);
 
-    std::vector<uint8_t> px;
+    std::vector<uint8_t> px, first_l0;
+    REQUIRE(readback(d, layer.l0, RTS, 4, first_l0));
     REQUIRE(readback(d, proxy.Get(), RTS, 4, px));
     // The game's own picture is complete: the UI is in it.
     CHECK(std::abs(at(px, RW, 20, 10, 0) - int(std::lround((0.6f * 1.f + 0.4f * 0.2f) * 255))) <= 1);
@@ -328,7 +344,7 @@ int end_to_end(test::Device& d)
         r->ResourceBarrier(3, b);
         REQUIRE(SUCCEEDED(r->Close()));
         ID3D12CommandList* rls[] = {r};
-        d.queue->ExecuteCommandLists(1, rls);
+        submit(d.queue.Get(), 1, rls);
         d.WaitIdle();
         CHECK(dev->GetDeviceRemovedReason() == S_OK);
         std::vector<uint8_t> want, have;
@@ -344,20 +360,66 @@ int end_to_end(test::Device& d)
         std::printf("native composite vs direct native draw: worst %d/255 at %u,%u\n", worst, wx, wy);
         CHECK(worst <= 4);
     }
+    // The production current-picture path supplies the real PRE-HUD scene to
+    // DLSS, including behind opaque text. It does not divide a zero coefficient
+    // and accidentally leave opaque HUD pixels in DLSS's input.
+    {
+        const na::observe::HostWorkScope owned;
+        REQUIRE(layer.picture && layer.clean_allowed);
+        auto motion = test::CreateTexture(dev, RW, RH, DXGI_FORMAT_R32G32_FLOAT, D3D12_RESOURCE_STATE_COPY_DEST,
+                                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        REQUIRE(motion);
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{}; UINT64 bytes = 0;
+        const auto md = motion->GetDesc(); dev->GetCopyableFootprints(&md, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
+        auto upload = test::CreateBuffer(dev, bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        REQUIRE(upload); void* zero = nullptr; REQUIRE(SUCCEEDED(upload->Map(0, nullptr, &zero)));
+        std::memset(zero, 0, size_t(bytes)); upload->Unmap(0, nullptr);
+        test::List calc; REQUIRE(calc.Create(dev)); auto* c = calc.list.Get();
+        D3D12_TEXTURE_COPY_LOCATION dest{motion.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}},
+                                    src{upload.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+        src.PlacedFootprint = footprint; c->CopyTextureRegion(&dest, 0, 0, 0, &src, nullptr);
+        auto transition = test::Transition(motion.Get(), D3D12_RESOURCE_STATE_COPY_DEST, NPSR); c->ResourceBarrier(1, &transition);
+        transition = test::Transition(proxy.Get(), RTS, NPSR); c->ResourceBarrier(1, &transition);
+        REQUIRE(layer.picture->Prepare(c, proxy.Get(), F, motion.Get(), layer.n0, layer.n1, layer.view, layer.grey,
+                                        layer.srgb, layer.clean_allowed, F));
+        transition = test::Transition(picture.Get(), RTS, D3D12_RESOURCE_STATE_COPY_SOURCE); c->ResourceBarrier(1, &transition);
+        transition = test::Transition(out.Get(), UAV, D3D12_RESOURCE_STATE_COPY_DEST); c->ResourceBarrier(1, &transition);
+        c->CopyResource(out.Get(), picture.Get());
+        transition = test::Transition(picture.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, RTS); c->ResourceBarrier(1, &transition);
+        transition = test::Transition(out.Get(), D3D12_RESOURCE_STATE_COPY_DEST, UAV); c->ResourceBarrier(1, &transition);
+        REQUIRE(layer.picture->Composite(c, out.Get()));
+        transition = test::Transition(proxy.Get(), NPSR, RTS); c->ResourceBarrier(1, &transition);
+        REQUIRE(SUCCEEDED(c->Close())); ID3D12CommandList* calculations[] = {c}; submit(d.queue.Get(), 1, calculations); d.WaitIdle();
+        bool identity = false, clean = false; nh::Picture::ProofReceipt receipt;
+        REQUIRE(layer.picture->ProofAfterCompletion(identity, clean, &receipt));
+        CHECK(identity && clean && receipt.matched == RW * RH);
+        std::vector<uint8_t> clean_input; REQUIRE(readback(d, layer.picture->Input(), NPSR, 8, clean_input));
+        float maximum = 0;
+        for (uint32_t y = 0; y < RH; ++y) for (uint32_t x = 0; x < RW; ++x) for (int channel = 0; channel < 3; ++channel) {
+            uint16_t encoded = 0; std::memcpy(&encoded, clean_input.data() + (size_t(y) * RW + x) * 8 + channel * 2, 2);
+            const float value = half_value(encoded); CHECK(std::isfinite(value));
+            maximum = std::max(maximum, std::abs(value - kScene[channel]));
+        }
+        std::printf("actual DLSS input, including opaque HUD pixels: scene error %.6f\n", maximum);
+        CHECK(maximum < .002f);
+        std::vector<uint8_t> reference, actual; REQUIRE(readback(d, ref.Get(), RTS, 4, reference) && readback(d, out.Get(), UAV, 4, actual));
+        int error = 0; for (size_t i = 0; i < reference.size(); ++i) if (i % 4 != 3) error = std::max(error, std::abs(int(reference[i]) - int(actual[i])));
+        std::printf("current-picture composition vs native reference: %d/255\n", error); CHECK(error <= 4);
+    }
     // Second frame: an opaque full-screen draw after the first UI draw restarts the layers;
     // the two UI draws after it are what the frame ends with.
     REQUIRE(SUCCEEDED(game.alloc->Reset()) && SUCCEEDED(l->Reset(game.alloc.Get(), nullptr)));
     frame(true);
     REQUIRE(SUCCEEDED(l->Close()));
-    d.queue->ExecuteCommandLists(1, lists);
+    submit(d.queue.Get(), 1, lists);
     d.WaitIdle();
     CHECK(dev->GetDeviceRemovedReason() == S_OK);
     st = ub::GetStats();
-    CHECK(st.replayed == 6);
+    CHECK(st.replayed == 8);
     CHECK(st.covered == 1);
     CHECK(st.scene == 3);
     nh::Layer second;
-    CHECK(nh::TakeFrame(proxy.Get(), RW, RH, OW, OH, &second));
+    CHECK(nh::TakeFrame(proxy.Get(), RW, RH, OW, OH, &second, d.queue.Get()));
     st = ub::GetStats();
     CHECK(st.last_draws == 2 && st.last_covered == 1);
     CHECK(st.hud_frames == 2 && st.composed == 2);
@@ -366,12 +428,12 @@ int end_to_end(test::Device& d)
     REQUIRE(SUCCEEDED(game.alloc->Reset()) && SUCCEEDED(l->Reset(game.alloc.Get(), nullptr)));
     frame(false);
     REQUIRE(SUCCEEDED(l->Close()));
-    d.queue->ExecuteCommandLists(1, lists);
+    submit(d.queue.Get(), 1, lists);
     d.WaitIdle();
     nh::Layer third;
-    CHECK(nh::TakeFrame(proxy.Get(), RW, RH, OW, OH, &third));
-    CHECK(third.unblend && !third.compose);
-    CHECK(ub::GetStats().held == 1);
+    CHECK(nh::TakeFrame(proxy.Get(), RW, RH, OW, OH, &third, d.queue.Get()));
+    CHECK(third.unblend && third.compose && third.picture); // current GPU proof supersedes a stale window verdict
+    CHECK(ub::GetStats().held == 0);
     std::printf("%s\n", ub::StatusLine().c_str());
     // A blended full-screen draw after the UI (a canvas laid on with one triangle) is replayed
     // with the UI, not left out as image processing (SE5 2026-11-05: menus were missing).
@@ -380,19 +442,17 @@ int end_to_end(test::Device& d)
         REQUIRE(SUCCEEDED(game.alloc->Reset()) && SUCCEEDED(l->Reset(game.alloc.Get(), nullptr)));
         frame(false, true);
         REQUIRE(SUCCEEDED(l->Close()));
-        d.queue->ExecuteCommandLists(1, lists);
+        submit(d.queue.Get(), 1, lists);
         d.WaitIdle();
         CHECK(dev->GetDeviceRemovedReason() == S_OK);
         CHECK(ub::GetStats().replayed == replayed0 + 4);
         CHECK(ub::GetStats().cover_blend == cover0 + 1);
         nh::Layer fourth;
-        CHECK(nh::TakeFrame(proxy.Get(), RW, RH, OW, OH, &fourth));
+        CHECK(nh::TakeFrame(proxy.Get(), RW, RH, OW, OH, &fourth, d.queue.Get()));
         CHECK(fourth.unblend && fourth.l0 && fourth.l1);
     }
-    // Retarget (SE5 p12312): after the UI went into the canvas, a post-processing pass rewrites
-    // the picture into another target (opaque, full-screen) and the UI is laid on THERE: the
-    // layers move to that target and hold only what was drawn on it after that pass. The white
-    // pass on `other` before that (no full-screen pass there yet) is still forwarded.
+    // A later opaque pass and veil on an unrelated target must not steal the
+    // layers of the canvas actually copied to proxy. Verify the recovered pixels.
     {
         const ub::Stats before = ub::GetStats();
         REQUIRE(SUCCEEDED(game.alloc->Reset()) && SUCCEEDED(l->Reset(game.alloc.Get(), nullptr)));
@@ -408,26 +468,83 @@ int end_to_end(test::Device& d)
         l->SetGraphicsRoot32BitConstants(0, 4, veil, 0);
         l->DrawInstanced(3, 1, 0, 0); // the canvas laid on: UI, on the new target
         REQUIRE(SUCCEEDED(l->Close()));
-        d.queue->ExecuteCommandLists(1, lists);
+        submit(d.queue.Get(), 1, lists);
         d.WaitIdle();
         CHECK(dev->GetDeviceRemovedReason() == S_OK);
         const ub::Stats after = ub::GetStats();
-        CHECK(after.retargeted == before.retargeted + 1);
-        CHECK(after.other_target == before.other_target + 1);
-        CHECK(after.replayed == before.replayed + 4); // 3 UI draws on the canvas + the veil
+        CHECK(after.retargeted == before.retargeted);
+        CHECK(after.other_target == before.other_target);
+        CHECK(after.replayed == before.replayed + 5);
         nh::Layer fifth;
-        CHECK(nh::TakeFrame(proxy.Get(), RW, RH, OW, OH, &fifth));
-        CHECK(ub::GetStats().last_draws == 1);
+        CHECK(nh::TakeFrame(proxy.Get(), RW, RH, OW, OH, &fifth, d.queue.Get()));
+        CHECK(ub::GetStats().last_draws == 3);
         CHECK(fifth.unblend && fifth.l0 && fifth.l1);
+        std::vector<uint8_t> actual, low_pixels, high_pixels;
+        REQUIRE(readback(d, proxy.Get(), RTS, 4, actual) && readback(d, fifth.l0, RTS, 4, low_pixels) && readback(d, fifth.l1, RTS, 4, high_pixels));
+        const float m = float(at(high_pixels, RW, 0, 0, 0) - at(low_pixels, RW, 0, 0, 0)) / 128.f;
+        const float recovered = float(at(actual, RW, 0, 0, 0) - at(low_pixels, RW, 0, 0, 0)) / (255.f * m);
+        std::printf("unrelated target isolation: recovered %.6f expected %.6f\n", recovered, kScene[0]);
+        CHECK(std::abs(recovered - kScene[0]) < .02f);
+    }
+    // Source writes AFTER the handoff cannot change that handoff's layers.
+    // Two subsequent whole-picture copies preserve it, and HUD drawn directly
+    // on the last destination composes with the transferred contribution.
+    {
+        REQUIRE(SUCCEEDED(game.alloc->Reset()) && SUCCEEDED(l->Reset(game.alloc.Get(), nullptr)));
+        frame(false);
+        const float erased_source[4] = {0.9f, 0.1f, 0.5f, 1.f};
+        l->ClearRenderTargetView(rtv[1], erased_source, 0, nullptr); // canvas is NOT bound
+        D3D12_RESOURCE_BARRIER chain[2] = {test::Transition(proxy.Get(), RTS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                                          test::Transition(other.Get(), RTS, D3D12_RESOURCE_STATE_COPY_DEST)};
+        l->ResourceBarrier(2, chain); l->CopyResource(other.Get(), proxy.Get());
+        for (auto& v : chain) std::swap(v.Transition.StateBefore, v.Transition.StateAfter);
+        l->ResourceBarrier(2, chain);
+        chain[0] = test::Transition(other.Get(), RTS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        chain[1] = test::Transition(proxy.Get(), RTS, D3D12_RESOURCE_STATE_COPY_DEST);
+        l->ResourceBarrier(2, chain); l->CopyResource(proxy.Get(), other.Get());
+        for (auto& v : chain) std::swap(v.Transition.StateBefore, v.Transition.StateAfter);
+        l->ResourceBarrier(2, chain);
+        const float veil[4] = {0.1f, 0.1f, 0.1f, 0.3f};
+        l->OMSetRenderTargets(1, &rtv[0], FALSE, nullptr);
+        l->RSSetViewports(1, &full); l->RSSetScissorRects(1, &all);
+        l->SetPipelineState(pso[int(Blend::Over)].Get());
+        l->SetGraphicsRoot32BitConstants(0, 4, veil, 0); l->DrawInstanced(3, 1, 0, 0);
+        REQUIRE(SUCCEEDED(l->Close())); submit(d.queue.Get(), 1, lists); d.WaitIdle();
+        nh::Layer final_layer;
+        REQUIRE(nh::TakeFrame(proxy.Get(), RW, RH, OW, OH, &final_layer, d.queue.Get()));
+        CHECK(ub::GetStats().last_draws == 4);
+        std::vector<uint8_t> actual, low_pixels, high_pixels;
+        REQUIRE(readback(d, proxy.Get(), RTS, 4, actual) && readback(d, final_layer.l0, RTS, 4, low_pixels) &&
+                readback(d, final_layer.l1, RTS, 4, high_pixels));
+        float worst = 0;
+        for (int c = 0; c < 3; ++c) {
+            const float m = float(at(high_pixels, RW, 0, 0, c) - at(low_pixels, RW, 0, 0, c)) / 128.f;
+            REQUIRE(m > .1f);
+            const float recovered = float(at(actual, RW, 0, 0, c) - at(low_pixels, RW, 0, 0, c)) / (255.f * m);
+            worst = std::max(worst, std::abs(recovered - kScene[c]));
+        }
+        std::printf("frozen source, copy chain and late HUD: scene error %.6f\n", worst);
+        CHECK(worst < .02f);
+        REQUIRE(final_layer.picture && final_layer.clean_allowed);
+        std::vector<uint8_t> original_scene;
+        REQUIRE(readback(d, final_layer.picture->Scene(), NPSR, 4, original_scene));
+        int scene_error = 0;
+        for (size_t p = 0; p < original_scene.size(); ++p) if (p % 4 != 3)
+            scene_error = std::max(scene_error, std::abs(int(original_scene[p]) - int(std::lround(kScene[p % 4] * 255))));
+        CHECK(scene_error <= 1); // late HUD must inherit the PRE-HUD scene, not snapshot earlier text
+        std::vector<uint8_t> preserved;
+        REQUIRE(readback(d, layer.l0, RTS, 4, preserved));
+        CHECK(preserved == first_l0); // owner retained beyond the three-Present ring
     }
     // Off: nothing is replayed.
+    const auto before_off = ub::GetStats().replayed;
     ub::SetEnabled(false);
     REQUIRE(SUCCEEDED(game.alloc->Reset()) && SUCCEEDED(l->Reset(game.alloc.Get(), nullptr)));
     frame(false);
     REQUIRE(SUCCEEDED(l->Close()));
-    d.queue->ExecuteCommandLists(1, lists);
+    submit(d.queue.Get(), 1, lists);
     d.WaitIdle();
-    CHECK(ub::GetStats().replayed == 17);
+    CHECK(ub::GetStats().replayed == before_off);
     ub::SetEnabled(true);
     return 0;
 }

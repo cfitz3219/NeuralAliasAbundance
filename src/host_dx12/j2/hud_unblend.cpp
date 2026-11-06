@@ -1,8 +1,12 @@
 #include "host_dx12/j2/hud_unblend.hpp"
 #include "host_dx12/gpu/mem_alloc.hpp"
 #include "host_dx12/j2/native_hud.hpp"
+#include "host_dx12/j2/hud_picture.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/observe/producers.hpp"
+#include "host_dx12/observe/texture_operation.hpp"
+#include "host_dx12/observe/operation_snapshot.hpp"
+#include "host_dx12/nr/native_fg.hpp"
 
 #include <wrl/client.h>
 #include <algorithm>
@@ -11,6 +15,7 @@
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 namespace na::j2::hud_unblend {
 namespace {
@@ -35,17 +40,22 @@ struct Set {
     UINT inc = 0;
     // The frame being recorded into it:
     uint64_t frame = ~0ull;
-    na_object_id target = 0; // the one target the frame's UI goes into (see "retarget" in OnDraw)
-    uint64_t lock_seq = 0;   // g_scene_seq when the layers started on `target`
+    na_object_id target = 0; // exact destination identity, not the most recently recorded candidate
     bool cleared = false;
     DXGI_FORMAT view = DXGI_FORMAT_UNKNOWN;
     uint32_t draws = 0, covered = 0;
+    std::vector<na::nr::native::RecordingLease> uses;
+    std::shared_ptr<native_hud::Picture> picture;
+    bool scene_captured = false, full_captured = false, clean = true;
+    ID3D12GraphicsCommandList* writer = nullptr;
+    uint64_t writer_id = 0, recording = 0;
 };
-Set g_set[kSets];
-// The latest opaque full-screen pass on a picture-shaped target (tonemap, post-processing):
-// the target the picture is in from then on.
-uint64_t g_scene_seq = 0;
-struct LastScene { uint64_t frame = ~0ull; na_object_id rt = 0; uint64_t seq = 0; } g_last_scene;
+struct FrameSet {
+    std::unordered_map<na_object_id, std::shared_ptr<Set>> active, transferred;
+};
+FrameSet g_set[kSets];
+std::vector<std::shared_ptr<Set>> g_pool;
+constexpr size_t kMaxTargets = 8, kMaxPool = 48;
 
 struct Bind { ID3D12GraphicsCommandList* list = nullptr; uint64_t recording = 0; na_object_id rt = 0; bool candidate = false; };
 thread_local Bind t_bind;
@@ -120,6 +130,53 @@ bool set_ready_locked(ID3D12Device* dev, Set& s, const Dims& d)
     s.rw = d.rw; s.rh = d.rh; s.ow = d.ow; s.oh = d.oh; s.typeless = typeless;
     return true;
 }
+std::shared_ptr<Set> acquire_set_locked(ID3D12Device* dev, const Dims& d)
+{
+    for (const auto& p : g_pool) {
+        if (p.use_count() != 1 || !std::all_of(p->uses.begin(), p->uses.end(), [](const auto& u) { return u.Retired(); })) continue;
+        if (!set_ready_locked(dev, *p, d)) return {};
+        p->uses.clear(); p->frame = g_frame; p->cleared = false; p->draws = p->covered = 0; p->target = 0;
+        p->view = DXGI_FORMAT_UNKNOWN;
+        p->scene_captured = p->full_captured = false; p->clean = true;
+        p->writer = nullptr; p->writer_id = p->recording = 0;
+        if (p->picture) p->picture->BeginCycle();
+        return p;
+    }
+    if (g_pool.size() >= kMaxPool) return {};
+    auto p = std::make_shared<Set>();
+    if (!set_ready_locked(dev, *p, d)) return {};
+    p->frame = g_frame; g_pool.push_back(p); return p;
+}
+bool retain_locked(ID3D12GraphicsCommandList* l, const std::shared_ptr<Set>& p)
+{
+    auto use = na::nr::native::RetainRecording(l, p);
+    if (!use) return false;
+    if (std::none_of(p->uses.begin(), p->uses.end(), [&](const auto& u) { return u.SameRecording(use); })) p->uses.push_back(use);
+    return true;
+}
+void copy_layers(ID3D12GraphicsCommandList* l, Set& dst, const Set& src)
+{
+    ID3D12Resource* to[] = {dst.l[0].Get(), dst.l[1].Get(), dst.n[0].Get(), dst.n[1].Get()};
+    ID3D12Resource* from[] = {src.l[0].Get(), src.l[1].Get(), src.n[0].Get(), src.n[1].Get()};
+    D3D12_RESOURCE_BARRIER b[8]{};
+    for (UINT i = 0; i < 8; ++i) {
+        b[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b[i].Transition = {i < 4 ? from[i] : to[i - 4], D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                           D3D12_RESOURCE_STATE_RENDER_TARGET, i < 4 ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_COPY_DEST};
+    }
+    l->ResourceBarrier(8, b);
+    for (UINT i = 0; i < 4; ++i) l->CopyResource(to[i], from[i]);
+    for (auto& v : b) std::swap(v.Transition.StateBefore, v.Transition.StateAfter);
+    l->ResourceBarrier(8, b);
+    dst.draws = src.draws; dst.covered = src.covered; dst.view = src.view; dst.cleared = true;
+    dst.clean = src.clean;
+}
+bool picture_locked(Set& s, const D3D12_RESOURCE_DESC& desc)
+{
+    if (!s.picture || !s.picture->Matches(s.device.Get(), desc, s.ow, s.oh))
+        s.picture = native_hud::Picture::Create(s.device.Get(), desc, s.ow, s.oh);
+    return !!s.picture;
+}
 // RTVs of the four targets through `view` (made on first use; at most kViews formats per set).
 bool rtvs_locked(Set& s, DXGI_FORMAT view, D3D12_CPU_DESCRIPTOR_HANDLE out[4])
 {
@@ -155,11 +212,6 @@ void clear_background_locked(ID3D12GraphicsCommandList* l, Set& s)
         h.ptr += SIZE_T(kViews * 4 + k) * s.inc;
         l->ClearRenderTargetView(h, (k & 1) ? back : black, 0, nullptr);
     }
-}
-// The game's own clear colour, through the game's view (stored as the game's clear stores it).
-void clear_colour_locked(ID3D12GraphicsCommandList* l, const D3D12_CPU_DESCRIPTOR_HANDLE rtv[4], const float* colour)
-{
-    for (int k = 0; k < 4; ++k) l->ClearRenderTargetView(rtv[k], colour, 0, nullptr);
 }
 void forward_locked(const char* why) { ++g_stats.forwarded; std::snprintf(g_stats.last_forward, sizeof g_stats.last_forward, "%s", why); }
 void draw(ID3D12GraphicsCommandList* l, const na::observe::ShaderCall& c)
@@ -218,8 +270,10 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
     std::lock_guard<std::mutex> lock(g_m);
     const Dims d = g_dims;
     if (!d.ow) return {};
-    Set& s = g_set[g_frame % kSets];
-    const bool mine = s.frame == g_frame && s.cleared && s.target == t_bind.rt;
+    FrameSet& sets = g_set[g_frame % kSets];
+    const auto previous = sets.active.find(t_bind.rt);
+    Set* current = previous == sets.active.end() ? nullptr : previous->second.get();
+    const bool mine = current && current->cleared;
     const float* vp0 = st.viewport_count ? st.viewports[0] : nullptr;
     const int32_t* sc0 = st.scissor_count ? st.scissors[0] : nullptr;
     // Draws with a viewport covering the whole target and at most 6 vertices. An opaque one
@@ -234,13 +288,16 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
     if (verts <= 6 && inst == 1 && native_hud::CoversTarget(vp0, sc0, d.rw, d.rh)) {
         if (!blended) {
             if (blend_known && (st.blend_mask & 1u) != 0) ++g_stats.opaque_blend;
-            g_last_scene = LastScene{g_frame, t_bind.rt, ++g_scene_seq};
-            if (mine && s.draws) {
-                clear_background_locked(l, s);
-                s.draws = 0;
-                ++s.covered;
+            if (mine && current->draws) {
+                clear_background_locked(l, *current);
+                current->draws = 0;
+                current->scene_captured = current->full_captured = false;
+                current->clean = true;
+                if (current->picture) current->picture->BeginCycle();
+                ++current->covered;
                 ++g_stats.covered;
             }
+            sets.transferred.erase(t_bind.rt);
             ++g_stats.scene;
             return {};
         }
@@ -258,19 +315,9 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
     }
     const DXGI_FORMAT view = static_cast<DXGI_FORMAT>(st.rtv_format);
     const char* why = nullptr;
-    // One target per frame: the first one UI was replayed into. Draws of the same shape into
-    // another target (a later pass that happens to be picture-shaped) are not part of this UI.
-    // Retarget (SE5, Cort's run of 2026-11-05, p12312): the UI sprites go into a canvas first;
-    // a later post-processing pass writes the picture into another picture-shaped target
-    // (opaque, full-screen) and the canvas is laid on THERE with a few blended passes; that
-    // target is what reaches the back buffer. So UI drawn into a target whose picture was
-    // (re)written by an opaque full-screen pass after the layers started takes the layers
-    // over: what was drawn before is inside that picture now. A target that never got such a
-    // pass after the lock (a side buffer drawn later) stays forwarded, as before.
-    const bool other = s.frame == g_frame && s.cleared && s.target != t_bind.rt;
-    const bool retarget = other && g_last_scene.frame == g_frame && g_last_scene.rt == t_bind.rt && g_last_scene.seq > s.lock_seq;
-    if (other && !retarget) { ++g_stats.other_target; why = "another picture-shaped target"; }
-    else if (!st.restorable) why = "targets cannot be handed back";
+    // Target identity is independent of recording order. Each candidate owns its own
+    // layers; only an observed transfer can associate it with the presented resource.
+    if (!st.restorable) why = "targets cannot be handed back";
     else if (!st.pipeline_known) why = "unknown pipeline";
     else if (st.rt_count != 1 || st.pso_rt_count != 1) why = "more than one target";
     else if (st.samples != 1) why = "multisampled";
@@ -279,21 +326,50 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
     else if (native_hud::TypelessOf(view) != native_hud::TypelessOf(d.proxy)) why = "view format differs from the picture";
     else if (!blend_known) why = "blend state unknown";
     else if (st.blend_class == 4) { ++g_stats.irreversible; why = "blend reads the destination's alpha or uses min/max"; }
+    else if (!st.shader_readonly || st.query_active) why = "draw has side effects";
     if (why) { forward_locked(why); return {}; }
     ComPtr<ID3D12Device> dev;
-    if (FAILED(l->GetDevice(IID_PPV_ARGS(&dev))) || !set_ready_locked(dev.Get(), s, d)) { forward_locked("could not make the layers"); return {}; }
+    if (FAILED(l->GetDevice(IID_PPV_ARGS(&dev)))) { forward_locked("no device"); return {}; }
+    std::shared_ptr<Set> owner;
+    if (previous != sets.active.end()) owner = previous->second;
+    else {
+        if (sets.active.size() >= kMaxTargets) { forward_locked("candidate pool busy"); return {}; }
+        owner = acquire_set_locked(dev.Get(), d);
+        if (!owner) { forward_locked("could not make the layers"); return {}; }
+        sets.active.emplace(t_bind.rt, owner);
+        const auto inherited = sets.transferred.find(t_bind.rt);
+        if (inherited != sets.transferred.end()) {
+            const auto& base = *inherited->second;
+            copy_layers(l, *owner, base);
+            if (base.picture && base.scene_captured && picture_locked(*owner, base.picture->Scene()->GetDesc()))
+                owner->scene_captured = owner->picture->SnapshotScene(l, base.picture->Scene(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+    }
+    if (!retain_locked(l, owner)) { forward_locked("could not retain recording"); return {}; }
+    Set& s = *owner;
+    s.target = t_bind.rt;
+    s.writer = l; s.writer_id = st.list; s.recording = st.recording;
+    s.full_captured = false;
+    s.clean &= st.blend_class >= 1 && st.blend_class <= 3;
+    na::observe::NativeOperation op;
+    if (!na::observe::ListNativeOperation(l, false, op) || !op.reflection_complete) s.clean = false;
+    else for (const auto& input : op.descriptors) if (input.used && input.view.kind == NA_DESC_SRV && input.resource && input.view.resource != st.rt) {
+        const auto desc = input.resource->GetDesc();
+        // A batch can carry the world through a sampled image as well as draw
+        // text. Such a source needs substitution in the native replay; an
+        // empty UI canvas is not a reconstruction input for that world.
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.Width == d.rw && desc.Height == d.rh &&
+            native_hud::TypelessOf(desc.Format) != DXGI_FORMAT_UNKNOWN) s.clean = false;
+    }
+    if (!s.scene_captured) {
+        ComPtr<ID3D12Resource> original; original.Attach(na::observe::AcquireResource(t_bind.rt));
+        if (original && picture_locked(s, original->GetDesc()))
+            s.scene_captured = s.picture->SnapshotScene(l, original.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET);
+    }
     D3D12_CPU_DESCRIPTOR_HANDLE rtv[4];
     if (s.frame != g_frame) { s.frame = g_frame; s.cleared = false; s.draws = 0; s.covered = 0; s.view = DXGI_FORMAT_UNKNOWN; s.target = 0; }
-    if (retarget) {
-        s.cleared = false;
-        s.draws = 0;
-        s.covered = 0;
-        s.view = DXGI_FORMAT_UNKNOWN;
-        ++g_stats.retargeted;
-    }
     if (!s.cleared) {
         s.target = t_bind.rt;
-        s.lock_seq = g_scene_seq;
         if (!rtvs_locked(s, view, rtv)) { forward_locked("too many view formats"); return {}; }
         clear_background_locked(l, s);
         s.cleared = true;
@@ -335,17 +411,78 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
 
 void OnClear(ID3D12GraphicsCommandList* l, uint64_t target, const float color[4])
 {
-    if (t_bind.list != l || !t_bind.candidate || t_bind.rt != target) return;
+    if (!target) return;
+    (void)l; (void)color;
     std::lock_guard<std::mutex> lock(g_m);
-    Set& s = g_set[g_frame % kSets];
-    if (s.frame != g_frame || !s.cleared || !s.draws || s.target != target) return;
-    // A clear after the UI started replaces everything under it: both layers take the colour,
-    // so the composite shows exactly that colour there.
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv[4];
-    if (rtvs_locked(s, s.view, rtv)) { clear_colour_locked(l, rtv, color); ++g_stats.cleared_after; }
+    auto& sets = g_set[g_frame % kSets];
+    const auto erased = sets.active.erase(target) + sets.transferred.erase(target);
+    if (erased) ++g_stats.cleared_after;
 }
 
-bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, native_hud::Layer* out)
+void OnTexture(ID3D12GraphicsCommandList* l, const na::observe::TextureCall& c)
+{
+    // Runtime wrappers may implement a CopyResource through an internal
+    // CopyTextureRegion on another list interface. Only the observed game's
+    // recording owns this handoff; the implementation detail is not another
+    // submitted game recording and must not replace its frozen layers.
+    if (!na::observe::ListRecording(l)) return;
+    if (!c.source || !c.destination ||
+        (c.kind != na::observe::TextureKind::Copy && c.kind != na::observe::TextureKind::CopyRegion)) return;
+    const auto dst_id = na::observe::IdOf(c.destination), src_id = na::observe::IdOf(c.source);
+    if (!dst_id || !src_id || dst_id == src_id) return;
+    const auto sd = c.source->GetDesc(), dd = c.destination->GetDesc();
+    const bool whole = sd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && dd.Dimension == sd.Dimension &&
+        sd.Width == dd.Width && sd.Height == dd.Height && sd.DepthOrArraySize == 1 && dd.DepthOrArraySize == 1 &&
+        sd.MipLevels == 1 && dd.MipLevels == 1 && sd.SampleDesc.Count == 1 && dd.SampleDesc.Count == 1 &&
+        native_hud::TypelessOf(sd.Format) == native_hud::TypelessOf(dd.Format) &&
+        (c.kind == na::observe::TextureKind::Copy || (!c.x && !c.y && !c.z &&
+          c.source_location.Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && c.source_location.SubresourceIndex == 0 &&
+          c.destination_location.Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && c.destination_location.SubresourceIndex == 0 &&
+          (!c.box || (!c.box->left && !c.box->top && !c.box->front && c.box->right == sd.Width &&
+                      c.box->bottom == sd.Height && c.box->back == 1))));
+    std::lock_guard<std::mutex> lock(g_m);
+    auto& sets = g_set[g_frame % kSets];
+    ++g_stats.copies;
+    std::shared_ptr<Set> source;
+    const auto active = sets.active.find(src_id), transferred = sets.transferred.find(src_id);
+    if (active != sets.active.end() && active->second->draws) source = active->second;
+    else if (transferred != sets.transferred.end()) source = transferred->second;
+    sets.active.erase(dst_id); sets.transferred.erase(dst_id);
+    if (!whole) ++g_stats.unsupported_copies;
+    if (!whole || !source || sets.transferred.size() >= kMaxTargets) return;
+    // Freeze at the actual handoff, before a later source draw can replace the
+    // layers. Keep both snapshots alive through the submitted copy recording.
+    auto frozen = acquire_set_locked(source->device.Get(), g_dims);
+    if (!frozen || !retain_locked(l, source) || !retain_locked(l, frozen)) return;
+    copy_layers(l, *frozen, *source);
+    if (source->picture && source->scene_captured && picture_locked(*frozen, source->picture->Scene()->GetDesc())) {
+        frozen->scene_captured = frozen->picture->SnapshotScene(l, source->picture->Scene(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        uint32_t source_state = 0;
+        if (na::observe::ListStateSub(l, src_id, 0, &source_state) == na::observe::StateLookup::Known)
+            frozen->full_captured = frozen->picture->SnapshotFull(l, c.source, static_cast<D3D12_RESOURCE_STATES>(source_state));
+    }
+    frozen->target = dst_id;
+    sets.transferred.emplace(dst_id, std::move(frozen));
+    ++g_stats.copied_layers;
+}
+
+void OnClosing(ID3D12GraphicsCommandList* l)
+{
+    const auto id = na::observe::IdOf(l), recording = na::observe::ListRecording(l);
+    if (!id || !recording) return;
+    std::lock_guard<std::mutex> lock(g_m);
+    for (const auto& item : g_set[g_frame % kSets].active) {
+        auto& s = *item.second;
+        if (s.writer_id != id || s.recording != recording || !s.draws || !s.picture || !s.scene_captured) continue;
+        uint32_t state = 0;
+        if (na::observe::ListStateSub(l, s.target, 0, &state) != na::observe::StateLookup::Known) continue;
+        ComPtr<ID3D12Resource> original; original.Attach(na::observe::AcquireResource(s.target));
+        if (original) s.full_captured = s.picture->SnapshotFull(l, original.Get(), static_cast<D3D12_RESOURCE_STATES>(state));
+    }
+}
+
+bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, native_hud::Layer* out,
+               ID3D12CommandQueue* queue)
 {
     if (!frame || !rw || !rh || !ow || !oh) return false;
     std::lock_guard<std::mutex> lock(g_m);
@@ -353,18 +490,33 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
     if (g_dims.rw != rw || g_dims.rh != rh || g_dims.ow != ow || g_dims.oh != oh || g_dims.proxy != pf) {
         g_dims = Dims{rw, rh, ow, oh, pf};
         g_shapes.clear();
+        for (auto& old : g_set) { old.active.clear(); old.transferred.clear(); }
     }
-    Set& s = g_set[g_frame % kSets];
-    const bool hud = s.frame == g_frame && s.cleared && s.draws > 0 && s.rw == rw && s.rh == rh && s.ow == ow && s.oh == oh;
+    auto& sets = g_set[g_frame % kSets];
+    const auto id = na::observe::IdOf(frame);
+    std::shared_ptr<Set> owner;
+    const auto active = sets.active.find(id), transferred = sets.transferred.find(id);
+    if (active != sets.active.end()) owner = active->second;
+    else if (transferred != sets.transferred.end()) owner = transferred->second;
+    g_stats.requested_target = id;
+    g_stats.matched_target = owner ? owner->target : 0;
+    g_stats.pending_recordings = 0;
+    if (owner) for (const auto& use : owner->uses) if (!use.Ready(queue)) ++g_stats.pending_recordings;
+    const bool hud = owner && owner->cleared && owner->draws > 0 && owner->rw == rw && owner->rh == rh &&
+        owner->ow == ow && owner->oh == oh && queue && !owner->uses.empty() &&
+        std::all_of(owner->uses.begin(), owner->uses.end(), [&](const auto& u) { return u.Ready(queue); });
     ++g_stats.frames;
-    g_stats.last_draws = hud ? s.draws : 0;
-    g_stats.last_covered = hud ? s.covered : 0;
-    g_stats.last_view = hud ? uint32_t(s.view) : 0u;
-    const bool compose = g_verdict.load(std::memory_order_relaxed) != 2u;
+    g_stats.last_draws = hud ? owner->draws : 0;
+    g_stats.last_covered = hud ? owner->covered : 0;
+    g_stats.last_view = hud ? uint32_t(owner->view) : 0u;
+    const bool current_proof = hud && owner->picture && owner->scene_captured && owner->full_captured;
+    g_stats.current_picture = current_proof;
+    const bool compose = current_proof || g_verdict.load(std::memory_order_relaxed) != 2u;
     if (hud) {
         ++g_stats.hud_frames;
         if (compose) ++g_stats.composed; else ++g_stats.held;
         if (out) {
+            Set& s = *owner;
             out->n0 = s.n[0].Get(); out->n1 = s.n[1].Get();
             out->l0 = s.l[0].Get(); out->l1 = s.l[1].Get();
             out->view = s.view;
@@ -372,13 +524,18 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
             out->srgb = is_srgb(s.view);
             out->unblend = true;
             out->compose = compose;
+            out->owner = owner;
+            if (current_proof) {
+                s.picture->SetValidationLayers(s.l[0].Get(), s.l[1].Get());
+                out->picture = s.picture; out->clean_allowed = s.clean;
+            }
         }
     }
     // The set of the frame that is kSets presents back is free again (its Present's GPU work
     // was submitted before anything recorded from now on).
     ++g_frame;
-    Set& next = g_set[g_frame % kSets];
-    if (next.frame != g_frame) { next.frame = ~0ull; next.cleared = false; next.draws = 0; next.covered = 0; next.target = 0; }
+    auto& next = g_set[g_frame % kSets];
+    next.active.clear(); next.transferred.clear();
     return hud;
 }
 
@@ -407,7 +564,7 @@ std::string StatusLine()
     std::snprintf(b, sizeof b,
         "hud_unblend on=%u frames=%llu hud_frames=%llu composed=%llu held=%llu replayed=%llu blended=%llu forwarded=%llu world=%llu scene=%llu covered=%llu "
         "cover_blend=%llu opaque_blend=%llu irreversible=%llu other_target=%llu retargeted=%llu cleared_after=%llu view_changed=%llu restore_failed=%llu last{draws=%u covered=%u view=%u} last_forward=\"%s\" "
-        "check{frames=%llu window{ui_px=%llu opaque=%llu id=%llu dec=%llu enc=%llu} permille{id=%u dec=%u enc=%u} verdict=%s}",
+        "check{frames=%llu window{ui_px=%llu opaque=%llu id=%llu dec=%llu enc=%llu} permille{id=%u dec=%u enc=%u} diagnostic_verdict=%s}",
         Enabled() ? 1u : 0u, (unsigned long long)s.frames, (unsigned long long)s.hud_frames, (unsigned long long)s.composed, (unsigned long long)s.held,
         (unsigned long long)s.replayed, (unsigned long long)s.blended, (unsigned long long)s.forwarded, (unsigned long long)s.world, (unsigned long long)s.scene,
         (unsigned long long)s.covered, (unsigned long long)s.cover_blend, (unsigned long long)s.opaque_blend, (unsigned long long)s.irreversible, (unsigned long long)s.other_target, (unsigned long long)s.retargeted, (unsigned long long)s.cleared_after, (unsigned long long)s.view_changed,
@@ -415,6 +572,11 @@ std::string StatusLine()
         (unsigned long long)s.check_frames, (unsigned long long)s.ui_px, (unsigned long long)s.opaque_px, (unsigned long long)s.match_id,
         (unsigned long long)s.match_dec, (unsigned long long)s.match_enc, s.rate_id, s.rate_dec, s.rate_enc,
         s.verdict == 1 ? "identity" : s.verdict == 2 ? "mismatch_holding" : "undecided");
-    return b;
+    char routing[256];
+    std::snprintf(routing, sizeof routing, " routing{copies=%llu linked=%llu unsupported=%llu requested=%llu matched=%llu pending=%u method=%s}",
+                  (unsigned long long)s.copies, (unsigned long long)s.copied_layers, (unsigned long long)s.unsupported_copies,
+                  (unsigned long long)s.requested_target, (unsigned long long)s.matched_target, s.pending_recordings,
+                  s.current_picture ? "current_picture" : s.last_draws ? "legacy_unblend" : "none");
+    return std::string(b) + routing;
 }
 } // namespace na::j2::hud_unblend

@@ -18,6 +18,9 @@ public:
     void BeginCycle(); // only after ALL source-recording and Present owners release it
     bool SnapshotScene(ID3D12GraphicsCommandList*,ID3D12Resource*,D3D12_RESOURCE_STATES);
     bool SnapshotFull(ID3D12GraphicsCommandList*,ID3D12Resource*,D3D12_RESOURCE_STATES);
+    // Optional original-size counterfactuals: verify the actual blend model
+    // against the captured pre-HUD scene, including opaque pixels and clipping.
+    void SetValidationLayers(ID3D12Resource* low,ID3D12Resource* high);
     // Discovery only: compare an immutable canvas with this exact final frame.
     // Neither image is altered. Caller supplies its existing completion fence.
     bool Probe(ID3D12GraphicsCommandList*,ID3D12Resource* frame,DXGI_FORMAT frame_view);

@@ -34,6 +34,7 @@ bool buffer(ID3D12Device* dev,D3D12_HEAP_TYPE type,D3D12_RESOURCE_STATES state,C
 }
 constexpr char shader[]=R"(
 Texture2D<float4> frame:register(t0),full:register(t1),scene:register(t2),n0:register(t3),n1:register(t4),picture:register(t5);
+Texture2D<float4> low0:register(t6),low1:register(t7);
 RWTexture2D<float4> selected:register(u0);
 RWTexture2D<float> mask:register(u1);
 RWTexture2D<float2> motion:register(u2);
@@ -60,6 +61,15 @@ groupshared uint mismatch,matched,error_bits;
  if(id.x<w&&id.y<h){float3 a=frame[id.xy].rgb,b=full[id.xy].rgb;
   bool bad=any(!isfinite(a))||any(!isfinite(b))||any(abs(a-b)>tolerance*max(1,max(abs(a),abs(b))));
   float error=max(abs(a.r-b.r),max(abs(a.g-b.g),abs(a.b-b.b)));
+  if(flags&64u){
+   float3 base=scene[id.xy].rgb,lo=low0[id.xy].rgb,scale=(low1[id.xy].rgb-lo)/grey;
+   if(flags&2u)base=to_linear(base);
+   float3 prediction=lo+scale*base;
+   if(flags&2u)prediction=to_srgb(prediction);else if(!(flags&128u))prediction=saturate(prediction);
+   float3 delta=abs(prediction-a);
+   if(any(!isfinite(prediction))||any(delta>tolerance*max(1,max(abs(prediction),abs(a)))))bad=true;
+   error=max(error,max(delta.r,max(delta.g,delta.b)));
+  }
   if(flags&8u){float4 c=n1[id.xy],d=full[id.xy];
    if(any(!isfinite(c))||any(!isfinite(d))||any(abs(c-d)>tolerance*max(1,max(abs(c),abs(d))))||
       abs(frame[id.xy].a-d.a)>tolerance*max(1,max(abs(frame[id.xy].a),abs(d.a))))bad=true;}
@@ -73,7 +83,7 @@ groupshared uint mismatch,matched,error_bits;
  bool transfer=agrees(id.xy);
  bool clean=transfer&&(flags&1u)!=0;
  float m=0;
- if(transfer&&!clean){
+ if(!clean&&(transfer||(flags&64u))){
   // Cover every actual native raster pixel belonging to this input pixel.
   // Centre-only downsampling can miss thin native glyphs between centres.
   uint2 lo=uint2(floor(float2(id.xy)*float2(ow,oh)/float2(w,h)));
@@ -95,6 +105,7 @@ groupshared uint mismatch,matched,error_bits;
    c.rgb=lerp(c.rgb,float3(1,0,1),.5*saturate(max(d.r,max(d.g,d.b))*16));}result[id.xy]=c;return;}
  if(flags&16u){result[id.xy]=float4(picture[id.xy].rgb,scene.SampleLevel(lin,uv,0).a);return;}
  float4 s=picture[id.xy];float3 outc=s.rgb;
+ if((flags&64u)&&!agrees_at(uv)){result[id.xy]=frame.SampleLevel(lin,uv,0);return;}
  if(agrees_at(uv)){
   float2 uv=(float2(id.xy)+.5)/float2(ow,oh);
   float3 a=n0[id.xy].rgb,b=(n1[id.xy].rgb-a)/grey;
@@ -112,7 +123,7 @@ groupshared uint mismatch,matched,error_bits;
 struct Program {
  ComPtr<ID3D12Device> dev;ComPtr<ID3D12RootSignature> root;ComPtr<ID3D12PipelineState> pso[3];ComPtr<ID3D12Resource> zero;UINT inc=0;
  bool Init(ID3D12Device* d){
-  dev=d;D3D12_DESCRIPTOR_RANGE ranges[2]={{D3D12_DESCRIPTOR_RANGE_TYPE_SRV,6,0,0,0},{D3D12_DESCRIPTOR_RANGE_TYPE_UAV,5,0,0,6}};
+  dev=d;D3D12_DESCRIPTOR_RANGE ranges[2]={{D3D12_DESCRIPTOR_RANGE_TYPE_SRV,8,0,0,0},{D3D12_DESCRIPTOR_RANGE_TYPE_UAV,5,0,0,8}};
   D3D12_ROOT_PARAMETER p[2]{};p[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;p[0].DescriptorTable={2,ranges};
   p[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;p[1].Constants={0,0,8};
   D3D12_STATIC_SAMPLER_DESC sampler{};sampler.Filter=D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -137,7 +148,7 @@ std::shared_ptr<Program> program(ID3D12Device* dev){
 }
 struct Picture::Impl {
  std::shared_ptr<Program> program;UINT w=0,h=0,ow=0,oh=0;DXGI_FORMAT source_format{};
- ComPtr<ID3D12Resource> scene,full,input,mask,proof,readback,result,frame,motion,n[2];ComPtr<ID3D12DescriptorHeap> heap;
+ ComPtr<ID3D12Resource> scene,full,input,mask,proof,readback,result,frame,motion,n[2],low[2];ComPtr<ID3D12DescriptorHeap> heap;
  bool scene_ready=false,full_ready=false,scene_current=false,full_current=false,prepared=false,outputs_read=false;DXGI_FORMAT frame_view{},layer_view{},result_format{};
  bool proof_read=false;
  UINT descriptor_page=0; // pre-HUD work and final Present may both be in flight
@@ -148,10 +159,10 @@ struct Picture::Impl {
   move(l,src,state,CS);if(ready)move(l,dst.Get(),S,CD);l->CopyResource(dst.Get(),src);move(l,src,CS,state);move(l,dst.Get(),CD,S);ready=true;return true;
  }
  void bind(ID3D12GraphicsCommandList* l,UINT pass,ID3D12Resource* pic,DXGI_FORMAT pf){
-  auto cpu=heap->GetCPUDescriptorHandleForHeapStart();cpu.ptr+=SIZE_T(descriptor_page*33+pass*11)*program->inc;
-  ID3D12Resource* srvs[]={frame.Get(),full_current?full.Get():nullptr,scene_current?scene.Get():nullptr,n[0].Get(),n[1].Get(),pic};
-  DXGI_FORMAT formats[]={frame_view,frame_view,frame_view,layer_view,layer_view,pf};
-  for(UINT i=0;i<6;++i){D3D12_SHADER_RESOURCE_VIEW_DESC v{};v.Format=srvs[i]?formats[i]:DXGI_FORMAT_R8G8B8A8_UNORM;
+  auto cpu=heap->GetCPUDescriptorHandleForHeapStart();cpu.ptr+=SIZE_T(descriptor_page*39+pass*13)*program->inc;
+  ID3D12Resource* srvs[]={frame.Get(),full_current?full.Get():nullptr,scene_current?scene.Get():nullptr,n[0].Get(),n[1].Get(),pic,low[0].Get(),low[1].Get()};
+  DXGI_FORMAT formats[]={frame_view,frame_view,frame_view,layer_view,layer_view,pf,layer_view,layer_view};
+  for(UINT i=0;i<8;++i){D3D12_SHADER_RESOURCE_VIEW_DESC v{};v.Format=srvs[i]?formats[i]:DXGI_FORMAT_R8G8B8A8_UNORM;
    v.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;v.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;v.Texture2D.MipLevels=1;
    program->dev->CreateShaderResourceView(srvs[i],&v,cpu);cpu.ptr+=program->inc;}
   ID3D12Resource* uavs[]={input.Get(),mask.Get(),motion.Get(),result.Get()};
@@ -161,7 +172,7 @@ struct Picture::Impl {
   D3D12_UNORDERED_ACCESS_VIEW_DESC v{};v.Format=DXGI_FORMAT_R32_TYPELESS;v.ViewDimension=D3D12_UAV_DIMENSION_BUFFER;v.Buffer.NumElements=4;v.Buffer.Flags=D3D12_BUFFER_UAV_FLAG_RAW;
   v.Buffer.NumElements=UINT(proof->GetDesc().Width/4);program->dev->CreateUnorderedAccessView(proof.Get(),nullptr,&v,cpu);
   ID3D12DescriptorHeap* heaps[]={heap.Get()};l->SetDescriptorHeaps(1,heaps);l->SetComputeRootSignature(program->root.Get());l->SetPipelineState(program->pso[pass].Get());
-  auto gpu=heap->GetGPUDescriptorHandleForHeapStart();gpu.ptr+=UINT64(descriptor_page*33+pass*11)*program->inc;
+  auto gpu=heap->GetGPUDescriptorHandleForHeapStart();gpu.ptr+=UINT64(descriptor_page*39+pass*13)*program->inc;
   l->SetComputeRootDescriptorTable(0,gpu);l->SetComputeRoot32BitConstants(1,8,&constants,0);
  }
 };
@@ -174,7 +185,7 @@ std::shared_ptr<Picture> Picture::Create(ID3D12Device* dev,const D3D12_RESOURCE_
  if(!texture(dev,p.w,p.h,d.Format,false,CD,p.scene)||!texture(dev,p.w,p.h,d.Format,false,CD,p.full)||
     !texture(dev,p.w,p.h,DXGI_FORMAT_R16G16B16A16_FLOAT,true,U,p.input)||!texture(dev,p.w,p.h,DXGI_FORMAT_R16_FLOAT,true,U,p.mask)||
     !buffer(dev,D3D12_HEAP_TYPE_DEFAULT,U,p.proof,16+UINT64(p.w)*p.h*4)||!buffer(dev,D3D12_HEAP_TYPE_READBACK,CD,p.readback))return {};
- D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,66,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
+ D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,78,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
  if(FAILED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&p.heap))))return {};return result;
 }
 bool Picture::Matches(ID3D12Device* d,const D3D12_RESOURCE_DESC& s,uint32_t ow,uint32_t oh)const{return p_->program->dev.Get()==d&&p_->w==s.Width&&p_->h==s.Height&&p_->source_format==s.Format&&p_->ow==ow&&p_->oh==oh;}
@@ -182,10 +193,11 @@ void Picture::BeginCycle(){
  // Present uses page1. The UI-only path deliberately skips Prepare, so it
  // cannot rely on Prepare selecting page0 for the next pre-HUD recording.
  p_->descriptor_page=0;
- p_->prepared=p_->scene_current=p_->full_current=p_->proof_read=false;p_->frame.Reset();p_->motion.Reset();p_->n[0].Reset();p_->n[1].Reset();
+ p_->prepared=p_->scene_current=p_->full_current=p_->proof_read=false;p_->frame.Reset();p_->motion.Reset();p_->n[0].Reset();p_->n[1].Reset();p_->low[0].Reset();p_->low[1].Reset();
 }
 bool Picture::SnapshotScene(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES s){return p_->scene_current=p_->snapshot(l,r,s,p_->scene,p_->scene_ready);}
 bool Picture::SnapshotFull(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES s){return p_->full_current=p_->snapshot(l,r,s,p_->full,p_->full_ready);}
+void Picture::SetValidationLayers(ID3D12Resource* low,ID3D12Resource* high){p_->low[0]=low;p_->low[1]=high;}
 bool Picture::Probe(ID3D12GraphicsCommandList* l,ID3D12Resource* frame,DXGI_FORMAT view){
  auto& p=*p_;if(!l||!frame||!p.full_current)return false;
  const auto d=frame->GetDesc();if(d.Width!=p.w||d.Height!=p.h||
@@ -207,15 +219,22 @@ bool Picture::Prepare(ID3D12GraphicsCommandList* l,ID3D12Resource* frame,DXGI_FO
  if((!p.result||p.result_format!=output_format)&&!texture(p.program->dev.Get(),p.ow,p.oh,output_format,true,U,p.result))return false;
  p.result_format=output_format;p.frame=frame;p.motion=motion;p.n[0]=n0;p.n[1]=n1;p.frame_view=fv;p.layer_view=lv;p.descriptor_page=0;
  const float tolerance=fv==DXGI_FORMAT_R16G16B16A16_FLOAT?.0005f:fv==DXGI_FORMAT_R10G10B10A2_UNORM?2.f/1023.f:2.f/255.f;
- p.constants={p.w,p.h,p.ow,p.oh,(clean?1u:0u)|(srgb?2u:0u)|(tint?4u:0u),grey,tolerance,0};
+ const bool model=p.low[0]&&p.low[1];
+ if(model)for(const auto& low:p.low){const auto ld=low->GetDesc();
+  if(ld.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||ld.Width!=p.w||ld.Height!=p.h||ld.DepthOrArraySize!=1||ld.MipLevels!=1||
+     ld.SampleDesc.Count!=1||TypelessOf(ld.Format)!=TypelessOf(lv))return false;}
+ const bool floating=fv==DXGI_FORMAT_R16G16B16A16_FLOAT||fv==DXGI_FORMAT_R32G32B32A32_FLOAT;
+ p.constants={p.w,p.h,p.ow,p.oh,(clean?1u:0u)|(srgb?2u:0u)|(tint?4u:0u)|(model?64u:0u)|(floating?128u:0u),grey,tolerance,0};
  if(p.outputs_read){move(l,p.input.Get(),S,U);move(l,p.mask.Get(),S,U);}
  move(l,n0,R,S);move(l,n1,R,S);
+ if(model){move(l,p.low[0].Get(),R,S);move(l,p.low[1].Get(),R,S);}
  move(l,p.proof.Get(),U,CD);l->CopyBufferRegion(p.proof.Get(),0,p.program->zero.Get(),0,16);move(l,p.proof.Get(),CD,U);
  p.bind(l,0,nullptr,DXGI_FORMAT_UNKNOWN);l->Dispatch((p.w+7)/8,(p.h+7)/8,1);order(l);
  move(l,motion,S,U);
  p.bind(l,1,nullptr,DXGI_FORMAT_UNKNOWN);l->Dispatch((p.w+7)/8,(p.h+7)/8,1);order(l);
  move(l,p.proof.Get(),U,CS);l->CopyBufferRegion(p.readback.Get(),0,p.proof.Get(),0,16);move(l,p.proof.Get(),CS,U);
  move(l,n0,S,R);move(l,n1,S,R);move(l,motion,U,S);move(l,p.input.Get(),U,S);move(l,p.mask.Get(),U,S);
+ if(model){move(l,p.low[0].Get(),S,R);move(l,p.low[1].Get(),S,R);}
  p.prepared=p.outputs_read=true;return true;
 }
 ID3D12Resource* Picture::Input()const{return p_->input.Get();}
