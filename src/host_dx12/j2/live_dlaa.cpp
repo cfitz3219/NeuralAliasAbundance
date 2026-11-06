@@ -2814,13 +2814,24 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
             // scene boundary (same final writer, same occurrence, destination and pipeline) is
             // the same in both shapes: when it matches HERE, the scene is complete at this
             // operation, so the boundary matcher below places DLAA as it did before entries.
-            const bool boundary=learned.decision.final_candidate && learned.color==color_id && learned.depth==depth_id &&
+            const bool same_target=learned.decision.final_candidate && learned.color==color_id && learned.depth==depth_id &&
+                current.destination==learned.decision.destination && current.pipeline==learned.decision.pipeline;
+            const bool boundary=same_target &&
                 (learned.decision.final_transition && learned.decision.boundary_writer
                      ? current.boundary_writer==learned.decision.boundary_writer && current.writer_occurrence==learned.decision.writer_occurrence
                      : learned.decision.final_transition ? current.final_transition==learned.decision.final_transition
-                                                         : current.candidates==learned.decision.final_candidate) &&
-                current.destination==learned.decision.destination && current.pipeline==learned.decision.pipeline;
-            if(!boundary || g.inl.valid){
+                                                         : current.candidates==learned.decision.final_candidate);
+            // SE5 p41768 (2026-11-06): in the merged-list bursts every rescue failed on the
+            // writer alone (33,661 of 33,661): the scene colour's last writer is another
+            // pipeline there, while occurrence, transition, destination and the consumer's
+            // pipeline all match the learned boundary. That is the same scene end reached by
+            // a different final pass, so it is accepted and counted (entry_rescued_writer).
+            const bool writer_only=!boundary && same_target && learned.decision.final_transition && learned.decision.boundary_writer &&
+                current.boundary_writer && current.boundary_writer!=learned.decision.boundary_writer &&
+                current.writer_occurrence==learned.decision.writer_occurrence &&
+                current.final_transition==learned.decision.final_transition && current.writes>0;
+            if(writer_only)++g.stats.entry_rescued_writer;
+            if(!(boundary||writer_only) || g.inl.valid){
                 // Name the first failing check (same order as the boundary matcher below).
                 uint32_t f=8;
                 if(!learned.decision.final_candidate||!learned.color)f=0;

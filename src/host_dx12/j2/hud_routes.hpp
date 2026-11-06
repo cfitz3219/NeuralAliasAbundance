@@ -21,7 +21,7 @@ class Policy {
     Key key_{};
     Method method_=Method::NativeReplay;
     uint64_t epoch_=0,trial_=0;
-    uint32_t consecutive_=0,failed_=0,no_receipt_=0;
+    uint32_t consecutive_=0,failed_=0,no_receipt_=0,whole_frame_=0;
     bool verified_=false;
     std::array<Attempt,4> attempts_{};
     void next(){method_=static_cast<Method>(static_cast<uint32_t>(method_)+1);++trial_;consecutive_=failed_=no_receipt_=0;verified_=false;}
@@ -42,13 +42,20 @@ public:
     Ticket Current()const{return {epoch_,trial_,method_};}
     Method Selected()const{return method_;}
     bool Verified()const{return verified_;}
+    uint32_t WholeFrameReceipts()const{return whole_frame_;}
     const std::array<Attempt,4>& Attempts()const{return attempts_;}
     bool Receipt(Ticket t,uint32_t hud,uint32_t separated){
         // A late GPU receipt cannot approve/reject a different route, device
         // or resolution. A matching whole image with ZERO HUD is not success.
         if(t.epoch!=epoch_||t.trial!=trial_||t.method!=method_||method_==Method::Off)return false;
         auto& a=attempts_[static_cast<uint32_t>(method_)];++a.receipts;a.hud_pixels=hud;a.separated_pixels=separated;
-        if(hud&&uint64_t(separated)*1000>=uint64_t(hud)*980){
+        // A "HUD" that covers (almost) the whole frame is the picture itself, not a HUD
+        // (SE5 2026-11-06: direct_or_copy verified itself with hud = every pixel and then
+        // composited the raw frame over the DLSS result). Such a receipt is a failure.
+        const uint64_t frame_px=uint64_t(key_.rw)*key_.rh;
+        const bool whole=frame_px&&uint64_t(hud)*100>=frame_px*90;
+        if(whole)++whole_frame_;
+        if(hud&&!whole&&uint64_t(separated)*1000>=uint64_t(hud)*980){
             ++a.passes;failed_=no_receipt_=0;if(++consecutive_>=3)verified_=true;
         }else{
             ++a.failures;consecutive_=0;

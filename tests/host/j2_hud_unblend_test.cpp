@@ -867,6 +867,13 @@ int automatic_policy()
     CHECK(p.Selected()==Method::NativeReplay); // one bad frame cannot flap a verified method
     CHECK(p.Receipt(t,100,0));CHECK(p.Selected()==Method::DirectOrCopy);
     CHECK(!p.Receipt(t,100,100)&&!p.Verified()); // old method's delayed receipt
+    { // SE5 p41768: a "HUD" that is the whole frame is the picture; it never verifies and counts as failure
+        const auto t2=p.Current();const uint32_t whole=resized.rw*resized.rh;
+        for(int i=0;i<7;++i){p.Frame(resized,true);CHECK(p.Receipt(t2,whole,whole));CHECK(!p.Verified()&&p.Selected()==Method::DirectOrCopy);}
+        CHECK(p.Receipt(t2,whole,whole));CHECK(p.Selected()==Method::ShaderHandoff&&p.WholeFrameReceipts()==8);
+        const auto t3=p.Current();for(int i=0;i<3;++i){p.Frame(resized,true);CHECK(p.Receipt(t3,whole/4,whole/4));}
+        CHECK(p.Verified()&&p.Selected()==Method::ShaderHandoff); // a quarter of the frame can be a HUD
+    }
     std::printf("HUD auto policy: four finite methods, real HUD evidence, pause, resize, stale receipts, stable failure\n");
     return 0;
 }

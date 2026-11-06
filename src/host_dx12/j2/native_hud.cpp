@@ -1413,8 +1413,8 @@ static void note_auto_policy_locked(const char* why){
         if(k<0||k>=int(sizeof b)-n)break;n+=k;
     }
     b[n<int(sizeof b)?n:int(sizeof b)-1]=0;
-    na::eventlog::Emit("hud_auto","method=%s verified=%u epoch=%llu trial=%llu by=%s%s",hud_routes::Name(t.method),v?1u:0u,
-                       (unsigned long long)t.epoch,(unsigned long long)t.trial,why,b);
+    na::eventlog::Emit("hud_auto","method=%s verified=%u epoch=%llu trial=%llu by=%s whole_frame_receipts=%u%s",hud_routes::Name(t.method),v?1u:0u,
+                       (unsigned long long)t.epoch,(unsigned long long)t.trial,why,g_auto_policy.WholeFrameReceipts(),b);
 }
 hud_routes::Ticket AutomaticTicket(){std::lock_guard<std::mutex> lock(g_auto_mutex);return g_auto_policy.Current();}
 bool AutomaticVerified(){std::lock_guard<std::mutex> lock(g_auto_mutex);return g_auto_policy.Verified();}
@@ -1441,7 +1441,8 @@ std::string AutomaticStatus(){
     if(!Automatic())return "hud_auto enabled=0";
     std::lock_guard<std::mutex> lock(g_auto_mutex);std::string out="hud_auto method=";out+=hud_routes::Name(g_auto_policy.Selected());
     out+=g_auto_policy.Selected()==hud_routes::Method::Off?" state=exhausted fallback=ordinary_dlss":g_auto_policy.Verified()?" state=verified":" state=trying";
-    char b[192];uint32_t i=0;for(const auto& a:g_auto_policy.Attempts()){
+    char b[192];
+    std::snprintf(b,sizeof b," whole_frame_receipts=%u",g_auto_policy.WholeFrameReceipts());out+=b;uint32_t i=0;for(const auto& a:g_auto_policy.Attempts()){
         std::snprintf(b,sizeof b," attempt%u{frames=%u receipts=%u pass=%u fail=%u hud=%u separated=%u}",++i,a.frames,a.receipts,a.passes,a.failures,a.hud_pixels,a.separated_pixels);out+=b;
     }return out;
 }
