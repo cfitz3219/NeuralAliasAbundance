@@ -4429,6 +4429,53 @@ void vpj_before_draw(GL* l)
     l->RSSetViewports(n, n ? v : nullptr);
     t_vpj_self = false;
 }
+// Draw-replay probe (2026-11-06, SE5 smear): can the scene's draws be matched to the same draws
+// last frame, and are they posed in the vertex shader (no tessellation/geometry stages)? Every
+// draw on the live scene depth with a depth-testing pipeline adds a signature: pipeline, vertex
+// shader, counts, vertex buffer layout. The vertex buffer addresses are kept apart, so a match
+// whose buffers moved (double-buffered or compute-posed meshes) is counted separately.
+struct ReplayDraw { uint64_t sig = 0, vb = 0; bool tracked = false, stages = false; uint32_t instances = 0; };
+std::atomic<bool> g_rp_on{false};
+std::mutex g_rp_m;
+std::vector<ReplayDraw> g_rp_cur, g_rp_prev;
+uint64_t rp_mix(uint64_t h, uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); return h; }
+void replay_probe_draw(GL* l, UINT count, UINT instances, bool indexed)
+{
+    if (!g_rp_on.load(std::memory_order_relaxed) || t_vpj_self) return;
+    uint64_t sel_depth = 0, sel_color = 0;
+    GetLiveSelection(&sel_depth, &sel_color);
+    if (!sel_depth) return;
+    ReplayDraw d;
+    {
+        std::shared_lock<RegistryLock> lock(g_m);
+        na_object_id id = 0;
+        auto* ls = list_state_locked(l, &id);
+        if (!ls) return;
+        std::lock_guard<std::mutex> bl(ls->bind_m);
+        if (ls->cur_ds != sel_depth) return;
+        const auto pipeline = g_objs.find(canon(ls->pso));
+        if (pipeline == g_objs.end() || pipeline->second.created.size() < sizeof(na_ev_pipeline_created)) return;
+        const auto* pc = reinterpret_cast<const na_ev_pipeline_created*>(pipeline->second.created.data());
+        if (pc->depth_enable != 1) return;
+        uint64_t h = rp_mix(0, reinterpret_cast<uintptr_t>(ls->pso));
+        h = rp_mix(h, pc->stage_hash[NA_STAGE_VS]); h = rp_mix(h, count); h = rp_mix(h, instances); h = rp_mix(h, indexed);
+        d.stages = pc->stage_hash[NA_STAGE_GS] || pc->stage_hash[NA_STAGE_HS] || pc->stage_hash[NA_STAGE_DS] || pc->stage_hash[NA_STAGE_MS];
+        d.tracked = ls->raster_tracking;
+        if (d.tracked) {
+            h = rp_mix(h, ls->vertex_mask);
+            uint64_t vb = 0;
+            for (UINT i = 0; i < 32; ++i) if (ls->vertex_mask & (1u << i)) {
+                h = rp_mix(h, ls->vertex_buffers[i].StrideInBytes); h = rp_mix(h, ls->vertex_buffers[i].SizeInBytes);
+                vb = rp_mix(vb, ls->vertex_buffers[i].BufferLocation);
+            }
+            if (ls->index_known) { h = rp_mix(h, ls->index_buffer.Format); vb = rp_mix(vb, ls->index_buffer.BufferLocation); }
+            d.vb = vb;
+        }
+        d.sig = h; d.instances = instances;
+    }
+    std::lock_guard<std::mutex> g(g_rp_m);
+    if (g_rp_cur.size() < 65536) g_rp_cur.push_back(d);
+}
 template <uint32_t Slot, typename Sig>
 struct ListHook;
 template <uint32_t Slot, typename R, typename... A>
@@ -4444,6 +4491,11 @@ struct ListHook<Slot, R(A...)> {
         if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced ||
                       Slot == sl::list::ExecuteIndirect || Slot == sl::list::ExecuteBundle)
             if (!t_host_work && scope.outermost && !scope.ambiguous) { const CostScope c(kCostVpj); vpj_before_draw(l); }
+        if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced)
+            if (!t_host_work && scope.outermost && !scope.ambiguous) {
+                const auto args = std::forward_as_tuple(a...);
+                replay_probe_draw(l, std::get<0>(args), std::get<1>(args), Slot == sl::list::DrawIndexedInstanced);
+            }
         if constexpr (Slot == sl::list::RSSetViewports || Slot == sl::list::Reset)
             if (scope.outermost && !scope.ambiguous) vpj_viewports_replaced(l, Slot == sl::list::Reset);
         if constexpr (Slot == sl::list::ResourceBarrier) {
@@ -7330,6 +7382,33 @@ void SetSceneViewportJitter(uint64_t frame, float x, float y)
     if (!f32) f32 = 1;
     g_vpj_ever.store(true, std::memory_order_relaxed);
     g_vpj.store(uint64_t(f32) << 32 | uint64_t(q(x)) << 16 | q(y), std::memory_order_release);
+}
+void SetReplayProbe(bool on) { g_rp_on.store(on, std::memory_order_relaxed); }
+bool ReplayProbeFrame(ReplayProbeStats* out)
+{
+    std::vector<ReplayDraw> cur;
+    { std::lock_guard<std::mutex> g(g_rp_m); cur.swap(g_rp_cur); }
+    ReplayProbeStats st{};
+    st.draws = static_cast<uint32_t>(cur.size());
+    std::unordered_map<uint64_t, std::vector<uint64_t>> prev; // signature -> buffer hashes, in order
+    for (const auto& d : g_rp_prev) prev[d.sig].push_back(d.vb);
+    std::unordered_map<uint64_t, uint32_t> used, seen;
+    for (const auto& d : cur) {
+        if (!d.tracked) ++st.untracked;
+        if (d.stages) ++st.extra_stages;
+        if (d.instances > 1) ++st.instanced;
+        if (++seen[d.sig] == 1) ++st.unique;
+        auto it = prev.find(d.sig);
+        uint32_t& u = used[d.sig];
+        if (it == prev.end() || u >= it->second.size()) continue;
+        ++st.matched;
+        if (it->second[u] == d.vb) ++st.same_buffers; else ++st.moved_buffers;
+        ++u;
+    }
+    st.prev_draws = static_cast<uint32_t>(g_rp_prev.size());
+    g_rp_prev.swap(cur);
+    *out = st;
+    return st.draws || st.prev_draws;
 }
 bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float* y)
 {

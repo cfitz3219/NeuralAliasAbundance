@@ -348,6 +348,12 @@ uint64_t LiveSelectionVersion();
 // is the live scene depth and whose pipeline tests depth is drawn with the game's viewports moved
 // by (x, y) render pixels (+x right, +y down). Other draws get the game's viewports back.
 void SetSceneViewportJitter(uint64_t frame, float x, float y);
+// Draw-replay probe: per frame, the scene-depth draws and how many match a draw of the frame
+// before (same pipeline, vertex shader, counts, vertex layout); of those, how many kept the same
+// vertex/index buffers. untracked: vertex buffers unknown ([observe] raster tracking off).
+struct ReplayProbeStats { uint32_t draws, prev_draws, unique, matched, same_buffers, moved_buffers, untracked, extra_stages, instanced; };
+void SetReplayProbe(bool on);
+bool ReplayProbeFrame(ReplayProbeStats* out); // call once per frame (Present); swaps frames
 bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float* y);
 // Packed value the last scene draw of this recording used (0 = none since Reset).
 uint64_t ListSceneViewportJitter(ID3D12CommandList* list,uint64_t scene_depth=0);

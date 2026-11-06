@@ -990,6 +990,30 @@ uint32_t jitter_phases()
 }
 // Viewport jitter ([j2] viewport_jitter): real samples through the game's own viewports.
 bool vpj_mode() { return na::settings::Get().j2_viewport_jitter.load(std::memory_order_relaxed) != 0; }
+// Draw-replay probe (SE5 smear, 2026-11-06): while DLAA/upscaling runs, count the scene draws that
+// match a draw of the previous frame, and whether their vertex buffers stayed put. One
+// replay_probe event at the first frame, then every 600 frames, with sums since the last one.
+struct ReplayProbeSums { uint64_t frames = 0, draws = 0, matched = 0, same = 0, moved = 0, untracked = 0, stages = 0, instanced = 0, unique = 0; };
+ReplayProbeSums g_rp_sum;
+uint64_t g_rp_events = 0;
+void replay_probe_frame()
+{
+    const bool running = g.submitted_frame && g.frame <= g.submitted_frame + 2;
+    static bool on = false;
+    if (running != on) { on = running; na::observe::SetReplayProbe(on); if (on) na::observe::SetRasterStateTracking(true); }
+    na::observe::ReplayProbeStats st{};
+    if (!na::observe::ReplayProbeFrame(&st) || !on) return;
+    auto& m = g_rp_sum;
+    ++m.frames; m.draws += st.draws; m.matched += st.matched; m.same += st.same_buffers; m.moved += st.moved_buffers;
+    m.untracked += st.untracked; m.stages += st.extra_stages; m.instanced += st.instanced; m.unique += st.unique;
+    if (g_rp_events && m.frames < 600) return;
+    ++g_rp_events;
+    na::eventlog::Emit("replay_probe", "frames=%llu draws=%llu matched=%llu same_buffers=%llu moved_buffers=%llu untracked=%llu extra_stages=%llu instanced=%llu unique=%llu last_draws=%u last_prev=%u last_matched=%u",
+        (unsigned long long)m.frames, (unsigned long long)m.draws, (unsigned long long)m.matched, (unsigned long long)m.same,
+        (unsigned long long)m.moved, (unsigned long long)m.untracked, (unsigned long long)m.stages, (unsigned long long)m.instanced,
+        (unsigned long long)m.unique, st.draws, st.prev_draws, st.matched);
+    m = ReplayProbeSums{};
+}
 // Frame start: the sample this frame's scene draws get, only while DLAA (or upscaling) is
 // producing frames, so a stopped DLAA never leaves the game's picture moving.
 void vpj_advance()
@@ -5253,6 +5277,7 @@ void OnPresent(ID3D12CommandQueue* queue)
         g.stats.depth_clears_last = g.depth_clears_closed;
         ++g.frame;
         vpj_advance();
+        replay_probe_frame();
         g.jit.valid = false; // J1: the next camera block starts a new jitter sample
         g.inline_sample_locked = false;
         g.inline_camera_submitted = false;

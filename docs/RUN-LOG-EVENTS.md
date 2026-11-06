@@ -25,6 +25,7 @@ The 5 s status samples stay. These additions sit next to them in the same per-pr
 | `camera_interloper` | a second camera that flipped into the main camera's slot and came back is learned; later sightings are skipped (first + every 256th logged) | learned known= pos fov; rejected n= pos fov. Status: `j2_cuts ... interlopers{kept_main= skipped=}` |
 | `game_motion` | the game's own motion texture: first summary after 64 measured frames, then every change of the used candidate/encoding | `use`/`none`/`first` + game_motion{cands scored measured good used=c/encoding locked dropped fed last{c best ratio second px moving nonfinite max}}. Status: `j2_game_motion{...}` |
 | `smear_test` | the smear test (menu button or Shift + capture key): start, each variant's capture, done | start/done dir=; mode= recorded= written= dropped_busy= evals=. Folders: captures\\smear-*\\<n-variant>, meta `smear_mode`, `dlss{}` and `game_motion_fed` |
+| `replay_probe` | while DLAA/upscaling runs: first frame, then every 600 frames (sums since the last) | frames= draws= (scene-depth, depth-testing) matched= (same pipeline, vertex shader, counts, layout as a draw of the frame before) same_buffers= moved_buffers= (of the matched) untracked= (vertex buffers unknown) extra_stages= (tessellation/geometry/mesh) instanced= unique= last_draws= last_prev= last_matched= |
 | `device_removed` | device removal detected | hr (the DRED file also starts with time and frame) |
 
 ## Periodic blocks
