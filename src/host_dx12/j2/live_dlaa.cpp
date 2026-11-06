@@ -8,7 +8,6 @@
 #include <unordered_map>
 #include "host_dx12/capture/capture_session.hpp"
 #include "host_dx12/j2/msaa_resolve.hpp"
-#include "host_dx12/j2/nis_sharpen.hpp"
 #include "host_dx12/j2/nis_scaler.hpp"
 #include "host_dx12/j2/native_hud.hpp"
 #include "host_dx12/j2/hud_unblend.hpp"
@@ -887,7 +886,6 @@ bool jshift_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Res
     return true;
 }
 // Retained for the standalone NIS test helper; the live slider uses RCAS only.
-na::j2::NisSharpen g_nis;
 bool rcas_record(ID3D12GraphicsCommandList* l, uint32_t percent, DXGI_FORMAT fmt)
 {
     return g.sharp && rcas_dispatch(l, g.output.Get(), g.sharp.Get(), g.ow, g.oh, percent, fmt, g.slot, g.depth32.Get(), g.rw, g.rh, g.stats.depth_reversed);
@@ -5020,15 +5018,6 @@ bool CompileHudShadersForTests(char* why, size_t why_size)
     }
     return true;
 }
-bool RecordNisForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* in, ID3D12Resource* out,
-                       uint32_t w, uint32_t h, uint32_t percent, DXGI_FORMAT fmt, bool hdr)
-{
-    std::lock_guard<std::mutex> lock(g.m);
-    if (percent > 100 && !g_nis.WaitCompiled()) { std::printf("%s\n", g_nis.Error()); return false; }
-    const bool ok = g_nis.Dispatch(device, list, in, out, w, h, fmt, hdr, percent, 0);
-    if (!ok && percent > 100) std::printf("NIS dispatch refused: %s\n", g_nis.Error());
-    return ok;
-}
 bool RecordHudUnblendForTests(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list, ID3D12Resource* picture, DXGI_FORMAT picture_format,
                               ID3D12Resource* l0, ID3D12Resource* l1, DXGI_FORMAT view, float grey, bool srgb, ID3D12Resource* out,
                               uint32_t w, uint32_t h, ID3D12Resource* counts)
@@ -5793,7 +5782,6 @@ void Shutdown()
     g_rcas = RcasPass{};
     g_jshift = JitterShift{}; // released here, not in static destruction after D3D12 has gone
     g_small.jshift.Reset();
-    g_nis.Reset();
     g.arbiter_ok = false;
     g.tracker.Reset();
     g.interlopers.Reset();

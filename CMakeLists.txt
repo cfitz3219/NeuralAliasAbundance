@@ -221,7 +221,6 @@ add_library(host_dx12 STATIC
   src/host_dx12/j2/j2_flow.cpp
   src/host_dx12/j2/compute_flow.cpp
   src/host_dx12/j2/game_motion.cpp
-  src/host_dx12/j2/nis_sharpen.cpp
   src/host_dx12/j2/nis_scaler.cpp
   src/host_dx12/j2/native_hud.cpp
   src/host_dx12/j2/hud_unblend.cpp
@@ -251,7 +250,7 @@ else()
   target_sources(host_dx12 PRIVATE src/host_dx12/host_boot/adapter_stub.cpp)
   message(STATUS "Game adapter: none (host stub)")
 endif()
-# NVIDIA Image Scaling (MIT, vendored): sharpen-only stage of J2's Sharpness slider.
+# NVIDIA Image Scaling (MIT, vendored): spatial scaler for native picture/HUD paths.
 if(NA_HAVE_XEGTAO)
   target_compile_definitions(host_dx12 PUBLIC NA_HAVE_XEGTAO)
   target_include_directories(host_dx12 PRIVATE "${CMAKE_BINARY_DIR}/generated/xegtao")

@@ -68,7 +68,6 @@ struct HostState {
     std::vector<uint8_t> queue;       // worker-private staging
     Ring rings[kRings];
     size_t ring_bytes = 0;
-    std::atomic<uint64_t> pending_bytes{0};
     std::mutex control_m;             // snapshot lane (lifecycle threads only)
     std::deque<ControlEntry> control;
     std::atomic<uint32_t> control_count{0};
@@ -156,7 +155,7 @@ void append_loss_mark(std::vector<uint8_t>& out, uint32_t group, uint32_t founda
     out.insert(out.end(), p, p + sizeof(ev));
 }
 
-void deliver_batch(std::vector<uint8_t>& payload, uint32_t flags, na_epoch batch_epoch)
+void deliver_batch(std::vector<uint8_t>& payload, uint32_t flags, na_epoch batch_epoch, std::vector<uint8_t>& batch)
 {
     na_event_batch hdr{};
     hdr.header_bytes = sizeof(na_event_batch);
@@ -174,7 +173,7 @@ void deliver_batch(std::vector<uint8_t>& payload, uint32_t flags, na_epoch batch
     hdr.event_count = count;
     hdr.batch_flags = flags;
 
-    std::vector<uint8_t> batch(sizeof(hdr) + payload.size());
+    batch.resize(sizeof(hdr) + payload.size());
     std::memcpy(batch.data(), &hdr, sizeof(hdr));
     if (!payload.empty()) std::memcpy(batch.data() + sizeof(hdr), payload.data(), payload.size());
     g_host.sink(reinterpret_cast<const na_event_batch*>(batch.data()), g_host.user);
@@ -289,6 +288,12 @@ bool producers_inside()
 void worker_main()
 {
     g_host.worker_tid = GetCurrentThreadId();
+    // Worker-private buffers retain capacity across deliveries. Walk each
+    // gathered backlog once: erasing its first 64 KiB after every callback
+    // repeatedly moved all remaining bytes (quadratic work under load).
+    std::vector<uint8_t> payload, batch;
+    payload.reserve(kMaxBatchBytes + 16 * sizeof(na_ev_loss_mark));
+    batch.reserve(sizeof(na_event_batch) + payload.capacity());
     std::unique_lock<std::mutex> lock(g_host.mutex);
     for (;;) {
         g_host.cv.wait_for(lock, std::chrono::milliseconds(50), [] {
@@ -305,13 +310,14 @@ void worker_main()
             while (producers_inside()) YieldProcessor();
         }
         gather();
+        size_t consumed = 0;
         do {
-            std::vector<uint8_t> payload;
+            payload.clear();
             na_epoch batch_epoch = g_host.epoch.load(std::memory_order_acquire);
             size_t take = 0;
             bool first = true;
-            while (take < g_host.queue.size()) {
-                const auto* eh = reinterpret_cast<const na_event_header*>(g_host.queue.data() + take);
+            while (consumed + take < g_host.queue.size()) {
+                const auto* eh = reinterpret_cast<const na_event_header*>(g_host.queue.data() + consumed + take);
                 if (first) {
                     batch_epoch = eh->epoch;
                     first = false;
@@ -324,19 +330,21 @@ void worker_main()
             if (batch_epoch == g_host.epoch.load(std::memory_order_acquire)) {
                 uint32_t marks = g_host.pending_loss_mark.exchange(0, std::memory_order_acq_rel);
                 uint32_t fmarks = g_host.pending_loss_foundational.exchange(0, std::memory_order_acq_rel);
-                std::vector<uint8_t> mark_bytes;
                 for (uint32_t g = 0; g < 16; ++g)
-                    if (marks & (1u << g)) append_loss_mark(mark_bytes, g, (fmarks >> g) & 1u);
-                payload.insert(payload.end(), mark_bytes.begin(), mark_bytes.end());
+                    if (marks & (1u << g)) append_loss_mark(payload, g, (fmarks >> g) & 1u);
             }
-            payload.insert(payload.end(), g_host.queue.begin(), g_host.queue.begin() + take);
-            g_host.queue.erase(g_host.queue.begin(), g_host.queue.begin() + take);
+            payload.insert(payload.end(), g_host.queue.begin() + consumed, g_host.queue.begin() + consumed + take);
+            consumed += take;
+            if (consumed == g_host.queue.size()) {
+                g_host.queue.clear();
+                consumed = 0;
+            }
             if (final_pass) gather();
-            bool more = !g_host.queue.empty();
+            bool more = consumed < g_host.queue.size();
             uint32_t flags = (final_pass && !more) ? NA_BATCHF_FINAL : 0;
             if (!payload.empty() || flags) {
                 lock.unlock();
-                deliver_batch(payload, flags, batch_epoch);
+                deliver_batch(payload, flags, batch_epoch, batch);
                 lock.lock();
             }
             if (!more) break;
@@ -587,7 +595,6 @@ int __cdecl na_observe_start(const na_observe_config* cfg, na_event_sink sink, v
             r.tail.store(0);
             r.buf.assign(g_host.ring_bytes, 0);
         }
-        g_host.pending_bytes.store(0);
         g_host.queue.clear();
         {
             std::lock_guard<std::mutex> cl(g_host.control_m);

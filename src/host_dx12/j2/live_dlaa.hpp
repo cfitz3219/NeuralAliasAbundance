@@ -65,10 +65,6 @@ bool RecordHudClassifyForTests(ID3D12CommandQueue* queue, ID3D12GraphicsCommandL
 // tested, unjittered, raster, opposite. `counts` is a COPY_DEST readback buffer.
 bool RecordJitterWitnessForTests(ID3D12CommandQueue*, ID3D12GraphicsCommandList*, ID3D12Resource* cur,
     ID3D12Resource* prev, ID3D12Resource* motion, uint32_t w, uint32_t h, float dx, float dy, ID3D12Resource* counts);
-// Test hook: the 101..200 % stage (NVIDIA Image Scaling sharpen-only) from `in`
-// (NON_PIXEL_SHADER_RESOURCE) into `out` (UNORDERED_ACCESS). <= 100 % records nothing.
-bool RecordNisForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* in, ID3D12Resource* out,
-                       uint32_t w, uint32_t h, uint32_t percent, DXGI_FORMAT fmt, bool hdr);
 int DebugView();
 void SetJitter(bool on);     // the overlay's camera-jitter switch (J1), on by default
 bool Jitter();
