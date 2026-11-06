@@ -77,6 +77,10 @@ struct Slot {
 
 struct PendingHistory {
     na::camera::CameraTracker tracker;
+    // The interloper rule after this frame's camera, committed with the tracker: an attempt that
+    // never submits (failed DLSS, failed recording) must not teach it a jump or a return.
+    na::j2::InterloperFilter interlopers;
+    bool has_interlopers = false;
     bool cut = false;
     uint32_t capture = 0; // J2 evidence capture token for this evaluation (0 = none)
     na::j2::compute_flow::Ticket compute_flow;
@@ -93,6 +97,8 @@ struct SceneInput {
     uint32_t color_sub = 0, depth_sub = 0;
     na::camera::Matrix vp{};
     bool reversed = false;
+    na::j2::InterloperFilter interlopers; // the rule after judging vp (when judged)
+    bool judged = false;
     double jitter[2] = {};
     bool injected = false; // the scene's camera block held J1's (windowed) camera
     // I1.4 (COMMS a066d76): the Present-time source. vp/jitter are only a camera when
@@ -1727,19 +1733,23 @@ bool is_interloper(const na::camera::Matrix& m)
 bool find_camera_scan(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, na::camera::Matrix* vp, bool* reversed);
 // The scan, then the interloper rule: a known second camera is never the main camera (the frame
 // then keeps the last main camera, no history reset); every chosen camera updates the rule.
-bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, na::camera::Matrix* vp, bool* reversed)
+// `judged` receives the committed rule updated by this camera; the caller commits it only when
+// the frame enters history (with the tracker), so a failed attempt teaches it nothing.
+bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, na::camera::Matrix* vp, bool* reversed,
+                 na::j2::InterloperFilter* judged)
 {
+    *judged = g.interlopers;
     if (!find_camera_scan(lists, scene, depth_id, vp, reversed)) return false;
     na::j2::CameraPose p;
     if (!pose_of(*vp, &p)) return true;
-    const uint64_t learned_before = g.interlopers.Learned();
-    const auto verdict = g.interlopers.Judge(p, g.frame);
-    if (g.interlopers.Learned() != learned_before)
-        na::eventlog::Emit("camera_interloper", "learned known=%u pos=%.4g,%.4g,%.4g fov=%.4g", g.interlopers.KnownCount(),
+    const uint64_t learned_before = judged->Learned();
+    const auto verdict = judged->Judge(p, g.frame);
+    if (judged->Learned() != learned_before)
+        na::eventlog::Emit("camera_interloper", "learned known=%u pos=%.4g,%.4g,%.4g fov=%.4g", judged->KnownCount(),
                            p.position[0], p.position[1], p.position[2], p.fov);
     if (verdict != na::j2::InterloperFilter::Verdict::Interloper) return true;
     ++g.stats.camera_interlopers;
-    const uint64_t r = g.interlopers.Rejected();
+    const uint64_t r = judged->Rejected();
     if (r == 1 || r % 256 == 0) // one line per 256: the menu flips several times a second
         na::eventlog::Emit("camera_interloper", "rejected n=%llu pos=%.4g,%.4g,%.4g fov=%.4g", static_cast<unsigned long long>(r),
                            p.position[0], p.position[1], p.position[2], p.fov);
@@ -2165,7 +2175,9 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     bool held = false, from_j1 = false, held_still=false, extrapolated=false;
     if (saved && saved->has_camera) { vp = saved->vp; reversed = saved->reversed; }
     if (repeat_only) { vp = g.cam_u1; reversed = g.cam_rev; held = true; } // no camera search: the last one is only a placeholder
-    const bool found = repeat_only || (saved ? saved->has_camera : find_camera(lists, scene, depth_id, &vp, &reversed));
+    na::j2::InterloperFilter judged = g.interlopers;
+    const bool found = repeat_only || (saved ? saved->has_camera : find_camera(lists, scene, depth_id, &vp, &reversed, &judged));
+    if (saved && saved->judged && !repeat_only) judged = saved->interlopers;
     if (!found && g.jit.valid && g.jit.applied && g.cam_f1) {
         // Astra (COMMS 2026-11-02): the scene list's own blocks may not hold the camera, but
         // J1 found this frame's camera in an earlier batch and rewrote it with this sample:
@@ -2299,6 +2311,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     const bool repeat = unpacked || repeat_only;
     if (repeat && g.win.last_eval && g.frame > g.win.last_eval + 4) ++g.stats.window_repeat_stale; // an old picture, still better than a clipped one
     pending.tracker = g.tracker;
+    pending.interlopers = judged;
+    pending.has_interlopers = true;
     // DLSS's history is the last frame it evaluated, and the tracker's previous
     // camera is that same frame, so motion stays correct across a few skipped game
     // frames (a frame whose scene submissions differed): no reset, no visible
@@ -2401,6 +2415,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         flush(l, b);
         if (!inl && FAILED(l->Close())) { reason("Could not close the repeat list."); return false; }
         pending.tracker = g.tracker; // the tracker's previous camera stays the last evaluated frame
+        pending.interlopers = g.interlopers;
         pending.cut = false;
         pending.keep_reset = true;
         ++g.stats.window_repeated;
@@ -3155,7 +3170,8 @@ int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
             // already been consumed within that recording.
             if (!consumed && na::observe::ListRendersTo(lists[i], color, depth) &&
                 na::observe::ListSceneSubresource(lists[i], color, depth, &saved.color_sub, &saved.depth_sub) &&
-                find_camera(lists, i, depth, &saved.vp, &saved.reversed)) {
+                find_camera(lists, i, depth, &saved.vp, &saved.reversed, &saved.interlopers)) {
+                saved.judged = true;
                 saved.frame = g.frame; saved.color = color; saved.depth = depth; saved.producer = producer;
                 saved.jitter[0] = g_injected ? g.jit.px[0] : 0;
                 saved.jitter[1] = g_injected ? g.jit.px[1] : 0;
@@ -3825,6 +3841,7 @@ bool present_source(ID3D12CommandQueue* queue, ExecuteFn forward)
     g.slots[slot].fence_value = g.fence_next++;
     queue->Signal(g.fence.Get(), g.slots[slot].fence_value);
     g.tracker = pending.tracker;
+    if (pending.has_interlopers) g.interlopers = pending.interlopers;
     g.eval_selection_version = pending.selection_version;
     committed_sources(pending);
     g.submitted_frame = closed;
@@ -5179,6 +5196,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
                 forward(queue, static_cast<UINT>(batch.size()), batch.data());
                 na::dlss::OnExecuted(queue, static_cast<UINT>(batch.size()), batch.data());
                 g.tracker = pending.tracker;
+                if (pending.has_interlopers) g.interlopers = pending.interlopers;
                 g.eval_selection_version = pending.selection_version;
                 committed_sources(pending);
                 g.submitted_frame = g.frame;
@@ -5203,6 +5221,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         if (!has) return;
         lock.lock();
         g.tracker = g.inl.history.tracker;
+        if (g.inl.history.has_interlopers) g.interlopers = g.inl.history.interlopers;
         g.eval_selection_version = g.inl.history.selection_version;
         committed_sources(g.inl.history);
         g.submitted_frame = g.frame;
@@ -5344,6 +5363,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     // The void D3D12 forward has now submitted our list. Failed recording/NGX
     // attempts above must never replace the previous submitted camera.
     g.tracker = pending.tracker;
+    if (pending.has_interlopers) g.interlopers = pending.interlopers;
     g.eval_selection_version = pending.selection_version;
     committed_sources(pending);
     g.submitted_frame = g.frame;
