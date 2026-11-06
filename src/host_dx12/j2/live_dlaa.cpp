@@ -194,6 +194,12 @@ struct State {
     bool inline_camera_submitted = false; // an earlier depth/camera batch may already be executing
     struct LearnedInsertion { uint64_t color = 0, depth = 0; na::j2::InsertionDecision decision; };
     LearnedInsertion insertion_frame, insertion_learned;
+    // Scene-end shapes of recent frames that DID get DLAA (SE5 p31032, 2026-11-06: the game
+    // alternates between two frame shapes; with only the previous frame's shape learned,
+    // every shape change missed, so DLSS flipped on/off frame by frame). Most recent first.
+    static constexpr int kShapes = 8;
+    LearnedInsertion delivered_shapes[kShapes];
+    int delivered_shape_count = 0;
     char insertion_trace[2048] = {};
     size_t insertion_trace_used = 0;
     uint64_t inl_frame = 0; // last frame an inline DLAA was recorded
@@ -2814,23 +2820,34 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
             // scene boundary (same final writer, same occurrence, destination and pipeline) is
             // the same in both shapes: when it matches HERE, the scene is complete at this
             // operation, so the boundary matcher below places DLAA as it did before entries.
-            const bool same_target=learned.decision.final_candidate && learned.color==color_id && learned.depth==depth_id &&
-                current.destination==learned.decision.destination && current.pipeline==learned.decision.pipeline;
-            const bool boundary=same_target &&
-                (learned.decision.final_transition && learned.decision.boundary_writer
-                     ? current.boundary_writer==learned.decision.boundary_writer && current.writer_occurrence==learned.decision.writer_occurrence
-                     : learned.decision.final_transition ? current.final_transition==learned.decision.final_transition
-                                                         : current.candidates==learned.decision.final_candidate);
-            // SE5 p41768 (2026-11-06): in the merged-list bursts every rescue failed on the
-            // writer alone (33,661 of 33,661): the scene colour's last writer is another
-            // pipeline there, while occurrence, transition, destination and the consumer's
-            // pipeline all match the learned boundary. That is the same scene end reached by
-            // a different final pass, so it is accepted and counted (entry_rescued_writer).
-            const bool writer_only=!boundary && same_target && learned.decision.final_transition && learned.decision.boundary_writer &&
-                current.boundary_writer && current.boundary_writer!=learned.decision.boundary_writer &&
-                current.writer_occurrence==learned.decision.writer_occurrence &&
-                current.final_transition==learned.decision.final_transition && current.writes>0;
+            // The learned scene boundary: the previous frame's shape, and every recent shape
+            // that got DLAA (the game alternates shapes; see delivered_shapes).
+            auto judge_shape=[&](const LearnedInsertion& L,bool& writer_only){
+                writer_only=false;
+                const bool same_target=L.decision.final_candidate && L.color==color_id && L.depth==depth_id &&
+                    current.destination==L.decision.destination && current.pipeline==L.decision.pipeline;
+                const bool exact=same_target &&
+                    (L.decision.final_transition && L.decision.boundary_writer
+                         ? current.boundary_writer==L.decision.boundary_writer && current.writer_occurrence==L.decision.writer_occurrence
+                         : L.decision.final_transition ? current.final_transition==L.decision.final_transition
+                                                       : current.candidates==L.decision.final_candidate);
+                // SE5 p41768: the same scene end reached by a different final pass (only the
+                // writer differs; occurrence, transition, destination and pipeline match).
+                writer_only=!exact && same_target && L.decision.final_transition && L.decision.boundary_writer &&
+                    current.boundary_writer && current.boundary_writer!=L.decision.boundary_writer &&
+                    current.writer_occurrence==L.decision.writer_occurrence &&
+                    current.final_transition==L.decision.final_transition && current.writes>0;
+                return exact;
+            };
+            bool writer_only=false,by_memory=false;
+            bool boundary=judge_shape(learned,writer_only);
+            for(int k=0;k<g.delivered_shape_count&&!boundary&&!writer_only;++k){
+                bool w=false;
+                if(judge_shape(g.delivered_shapes[k],w)){boundary=true;by_memory=true;}
+                else if(w){writer_only=true;by_memory=true;}
+            }
             if(writer_only)++g.stats.entry_rescued_writer;
+            if(by_memory&&(boundary||writer_only))++g.stats.entry_rescued_memory;
             if(!(boundary||writer_only) || g.inl.valid){
                 // Name the first failing check (same order as the boundary matcher below).
                 uint32_t f=8;
@@ -4762,9 +4779,15 @@ void OnPresent(ID3D12CommandQueue* queue)
                                     : o.camera_missed ? "no_camera"
                                     : o.depth_state_missed ? "no_depth_state"
                                     : (g.inline_mode && g.inl_frame != g.frame) ? "no_candidate" : "other";
-                    na::eventlog::Emit("dlss", "delivered=%u why=%s inline=%u rejects=%u reject=\"%s\" later_scene_write=%u",
+                    const auto& fs = g.insertion_frame.decision;
+                    const auto& ls = g.insertion_learned.decision;
+                    na::eventlog::Emit("dlss", "delivered=%u why=%s inline=%u rejects=%u reject=\"%s\" later_scene_write=%u "
+                                       "shape{writer=%llu occ=%u tr=%u cand=%u writes=%u dst=%llu} prev_shape{writer=%llu occ=%u tr=%u cand=%u} remembered=%d",
                                        o.executed ? 1u : 0u, why, g.inline_mode ? 1u : 0u, unsigned(g.frame_rejects),
-                                       g.frame_reject_text, o.later_scene_write ? 1u : 0u);
+                                       g.frame_reject_text, o.later_scene_write ? 1u : 0u,
+                                       (unsigned long long)fs.boundary_writer, fs.writer_occurrence, fs.final_transition, fs.final_candidate, fs.writes,
+                                       (unsigned long long)fs.destination, (unsigned long long)ls.boundary_writer, ls.writer_occurrence,
+                                       ls.final_transition, ls.final_candidate, g.delivered_shape_count);
                 }
             }
             {
@@ -4830,7 +4853,23 @@ void OnPresent(ID3D12CommandQueue* queue)
             }
             g.stats.active = g.submitted_frame == g.frame;
         }
-        if (g.insertion_frame.color) g.insertion_learned = g.insertion_frame;
+        if (g.insertion_frame.color) {
+            g.insertion_learned = g.insertion_frame;
+            if (g.submitted_frame == g.frame) { // a shape that got DLAA: remember it (most recent first, no duplicates)
+                const auto same = [](const LearnedInsertion& a, const LearnedInsertion& b) {
+                    return a.color == b.color && a.depth == b.depth && a.decision.final_candidate == b.decision.final_candidate &&
+                           a.decision.final_transition == b.decision.final_transition && a.decision.boundary_writer == b.decision.boundary_writer &&
+                           a.decision.writer_occurrence == b.decision.writer_occurrence && a.decision.destination == b.decision.destination &&
+                           a.decision.pipeline == b.decision.pipeline;
+                };
+                int at = g.delivered_shape_count < State::kShapes ? g.delivered_shape_count : State::kShapes - 1;
+                for (int k = 0; k < g.delivered_shape_count; ++k) if (same(g.delivered_shapes[k], g.insertion_frame)) { at = k; break; }
+                for (int k = at; k > 0; --k) g.delivered_shapes[k] = g.delivered_shapes[k - 1];
+                g.delivered_shapes[0] = g.insertion_frame;
+                if (at == g.delivered_shape_count && g.delivered_shape_count < State::kShapes) ++g.delivered_shape_count;
+                g.stats.entry_shapes = static_cast<uint32_t>(g.delivered_shape_count);
+            }
+        }
         {
             // Placement profile: label this frame's consumers from the submission-ordered
             // writes and reads (facts once the frame is closed) and learn their classes.
@@ -5310,6 +5349,7 @@ void Shutdown()
     g.class_fired = false;
     g.route_prev_late_class = 0;
     g.insertion_frame = g.insertion_learned = {};
+    g.delivered_shape_count = 0;
     g.inl = State::InlinePending{};
     g.inl_frame = 0;
     g.inline_sample_locked = false;
