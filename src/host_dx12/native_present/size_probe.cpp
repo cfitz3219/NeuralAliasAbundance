@@ -57,6 +57,13 @@ bool counted(const void* caller) { return !t_inside && GameCaller(caller); }
 uint32_t rect_w(const RECT& r) { return r.right > r.left ? static_cast<uint32_t>(r.right - r.left) : 0; }
 uint32_t rect_h(const RECT& r) { return r.bottom > r.top ? static_cast<uint32_t>(r.bottom - r.top) : 0; }
 
+// The monitor an output belongs to, read with the original GetDesc (no rewrite, not counted).
+HMONITOR output_monitor(IDXGIOutput* o) {
+    DXGI_OUTPUT_DESC d{};
+    Inside in; NativeScope native;
+    const HRESULT hr = o_desc ? o_desc(o, &d) : o->GetDesc(&d);
+    return SUCCEEDED(hr) ? d.Monitor : nullptr;
+}
 HMONITOR WINAPI mfw_detour(HWND w, DWORD f) {
     const void* c = _ReturnAddress();
     HMONITOR m; { Inside in; m = o_mfw(w, f); }
@@ -66,40 +73,44 @@ HMONITOR WINAPI mfw_detour(HWND w, DWORD f) {
 BOOL WINAPI gmiw_detour(HMONITOR m, LPMONITORINFO i) {
     const void* c = _ReturnAddress();
     BOOL ok; { Inside in; ok = o_gmiw(m, i); }
-    if (ok && i && counted(c)) NoteSizeQuery(SizeApi::MonitorInfo, c, rect_w(i->rcMonitor), rect_h(i->rcMonitor));
+    if (ok && i && counted(c)) { RewriteMonitorInfo(m, i); NoteSizeQuery(SizeApi::MonitorInfo, c, rect_w(i->rcMonitor), rect_h(i->rcMonitor)); }
     return ok;
 }
 BOOL WINAPI gmia_detour(HMONITOR m, LPMONITORINFO i) {
     const void* c = _ReturnAddress();
     BOOL ok; { Inside in; ok = o_gmia(m, i); }
-    if (ok && i && counted(c)) NoteSizeQuery(SizeApi::MonitorInfo, c, rect_w(i->rcMonitor), rect_h(i->rcMonitor));
+    if (ok && i && counted(c)) { RewriteMonitorInfo(m, i); NoteSizeQuery(SizeApi::MonitorInfo, c, rect_w(i->rcMonitor), rect_h(i->rcMonitor)); }
     return ok;
 }
 BOOL WINAPI edsw_detour(LPCWSTR d, DWORD n, DEVMODEW* dm) {
     const void* c = _ReturnAddress();
     BOOL ok; { Inside in; ok = o_edsw(d, n, dm); }
+    if (ok && dm && counted(c)) RewriteDisplayModeW(d, &dm->dmPelsWidth, &dm->dmPelsHeight);
     if (ok && dm && counted(c)) NoteSizeQuery(SizeApi::DisplaySettings, c, dm->dmPelsWidth, dm->dmPelsHeight);
     return ok;
 }
 BOOL WINAPI edsa_detour(LPCSTR d, DWORD n, DEVMODEA* dm) {
     const void* c = _ReturnAddress();
     BOOL ok; { Inside in; ok = o_edsa(d, n, dm); }
+    if (ok && dm && counted(c)) RewriteDisplayModeA(d, &dm->dmPelsWidth, &dm->dmPelsHeight);
     if (ok && dm && counted(c)) NoteSizeQuery(SizeApi::DisplaySettings, c, dm->dmPelsWidth, dm->dmPelsHeight);
     return ok;
 }
 BOOL WINAPI edsexw_detour(LPCWSTR d, DWORD n, DEVMODEW* dm, DWORD f) {
     const void* c = _ReturnAddress();
     BOOL ok; { Inside in; ok = o_edsexw(d, n, dm, f); }
+    if (ok && dm && counted(c)) RewriteDisplayModeW(d, &dm->dmPelsWidth, &dm->dmPelsHeight);
     if (ok && dm && counted(c)) NoteSizeQuery(SizeApi::DisplaySettings, c, dm->dmPelsWidth, dm->dmPelsHeight);
     return ok;
 }
 int WINAPI gsm_detour(int index) {
     const void* c = _ReturnAddress();
-    const int v = o_gsm(index);
+    int v = o_gsm(index);
     // Only the screen-size metrics; every other index passes straight through.
     if (index == SM_CXSCREEN || index == SM_CYSCREEN || index == SM_CXFULLSCREEN || index == SM_CYFULLSCREEN ||
         index == SM_CXVIRTUALSCREEN || index == SM_CYVIRTUALSCREEN) {
         if (counted(c)) {
+            RewriteScreenMetric(index, &v);
             const bool x = index == SM_CXSCREEN || index == SM_CXFULLSCREEN || index == SM_CXVIRTUALSCREEN;
             NoteSizeQuery(SizeApi::SystemMetrics, c, x ? static_cast<uint32_t>(v) : 0, x ? 0 : static_cast<uint32_t>(v));
         }
@@ -109,12 +120,14 @@ int WINAPI gsm_detour(int index) {
 HRESULT STDMETHODCALLTYPE desc_detour(IDXGIOutput* o, DXGI_OUTPUT_DESC* d) {
     const void* c = _ReturnAddress();
     HRESULT hr; { Inside in; hr = o_desc(o, d); }
+    if (SUCCEEDED(hr) && d && counted(c)) RewriteOutputRect(d->Monitor, &d->DesktopCoordinates);
     if (SUCCEEDED(hr) && d && counted(c)) NoteSizeQuery(SizeApi::OutputGetDesc, c, rect_w(d->DesktopCoordinates), rect_h(d->DesktopCoordinates));
     return hr;
 }
 HRESULT STDMETHODCALLTYPE desc1_detour(IDXGIOutput6* o, DXGI_OUTPUT_DESC1* d) {
     const void* c = _ReturnAddress();
     HRESULT hr; { Inside in; hr = o_desc1(o, d); }
+    if (SUCCEEDED(hr) && d && counted(c)) RewriteOutputRect(d->Monitor, &d->DesktopCoordinates);
     if (SUCCEEDED(hr) && d && counted(c)) NoteSizeQuery(SizeApi::OutputGetDesc1, c, rect_w(d->DesktopCoordinates), rect_h(d->DesktopCoordinates));
     return hr;
 }
@@ -123,6 +136,7 @@ HRESULT STDMETHODCALLTYPE modes_detour(IDXGIOutput* o, DXGI_FORMAT f, UINT fl, U
     const void* c = _ReturnAddress();
     HRESULT hr; { Inside in; hr = o_modes(o, f, fl, n, m); }
     if (SUCCEEDED(hr) && n && counted(c)) {
+        if (m && *n) { const HMONITOR mon = output_monitor(o); for (UINT i = 0; i < *n; ++i) RewriteOutputMode(mon, &m[i].Width, &m[i].Height); }
         uint32_t w = 0, h = 0;
         if (m) for (UINT i = 0; i < *n; ++i) if (m[i].Width * m[i].Height > w * h) { w = m[i].Width; h = m[i].Height; }
         NoteSizeQuery(SizeApi::OutputModeList, c, w, h);
@@ -133,6 +147,7 @@ HRESULT STDMETHODCALLTYPE modes1_detour(IDXGIOutput1* o, DXGI_FORMAT f, UINT fl,
     const void* c = _ReturnAddress();
     HRESULT hr; { Inside in; hr = o_modes1(o, f, fl, n, m); }
     if (SUCCEEDED(hr) && n && counted(c)) {
+        if (m && *n) { const HMONITOR mon = output_monitor(o); for (UINT i = 0; i < *n; ++i) RewriteOutputMode(mon, &m[i].Width, &m[i].Height); }
         uint32_t w = 0, h = 0;
         if (m) for (UINT i = 0; i < *n; ++i) if (m[i].Width * m[i].Height > w * h) { w = m[i].Width; h = m[i].Height; }
         NoteSizeQuery(SizeApi::OutputModeList1, c, w, h);
@@ -155,8 +170,8 @@ void NoteSizeQuery(SizeApi api, const void* caller, uint32_t w, uint32_t h)
 {
     const uint32_t a = static_cast<uint32_t>(api);
     if (a >= kApis) return;
-    uintptr_t base = 0;
-    {
+    uintptr_t base = GameModuleBase(caller); // registered game modules: no loader lock per call
+    if (!base) {
         HMODULE m = nullptr;
         if (caller && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                          static_cast<LPCWSTR>(caller), &m)) base = reinterpret_cast<uintptr_t>(m);

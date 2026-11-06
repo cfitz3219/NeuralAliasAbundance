@@ -61,7 +61,7 @@ struct Settings {
     std::atomic<int32_t> rr_preset{0};  // Ray Reconstruction: 0 = let NVIDIA choose; 4 D, 5 E, 6 F (its only usable presets)
     std::atomic<uint32_t> overlay_open{0};
     std::atomic<uint32_t> text_bold{0}; // A44: 0 standard weight, 1 bold (replaces text_size)
-    std::atomic<uint32_t> fill_screen{1}; // render-small: keep the game windowed but borderless over the whole monitor (Cort 2026-11-06)
+    std::atomic<uint32_t> fill_screen{0}; // render-small: keep the game windowed but borderless over the whole monitor (opt-in since the virtual screen makes borderless and fullscreen work directly)
     // A44: remembered menu window placement in client pixels (0 = default).
     std::atomic<int32_t> win_x{0}, win_y{0}, win_w{0}, win_h{0};
     // Neural Rendering (A30, [nr] section). Off by default; percentages 0..100.

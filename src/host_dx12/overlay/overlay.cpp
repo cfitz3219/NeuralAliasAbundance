@@ -89,6 +89,7 @@ constexpr uint32_t kSwapPresentSlot = 8;
 constexpr uint32_t kSwapGetBufferSlot = 9;        // IDXGISwapChain::GetBuffer (A59 presenter)
 constexpr uint32_t kSwapResizeBuffersSlot = 13;
 constexpr uint32_t kSwapResizeTargetSlot = 14;
+constexpr uint32_t kSwapSetFullscreenStateSlot = 10; // IDXGISwapChain::SetFullscreenState
 constexpr uint32_t kSwap1Present1Slot = 22;
 constexpr uint32_t kSwapGetDescSlot = 12;   // IDXGISwapChain::GetDesc (render-small size spoof)
 constexpr uint32_t kSwap1GetDesc1Slot = 18; // IDXGISwapChain1::GetDesc1
@@ -987,10 +988,11 @@ void write_status_line()
             if (wn > 0) WriteFile(f, wl, DWORD((std::min)(wn, int(sizeof wl - 1))), &written, nullptr);
         }
         if (na::j2::RenderSmall()) { // render-small S1/S2 counters (Astra's formatters)
-            char size_text[512] = {}, input_text[512] = {}, size_line[1100];
+            char size_text[512] = {}, input_text[512] = {}, screen_text[512] = {}, size_line[1600];
             na::native_present::FormatSizeStatus(size_text, sizeof size_text);
             na::native_present::FormatInputStatus(input_text, sizeof input_text);
-            const int size_n = snprintf(size_line, sizeof size_line, "%s\r\n%s\r\n", size_text, input_text);
+            na::native_present::FormatScreenStatus(screen_text, sizeof screen_text);
+            const int size_n = snprintf(size_line, sizeof size_line, "%s\r\n%s\r\n%s\r\n", size_text, input_text, screen_text);
             if (size_n > 0) WriteFile(f, size_line, DWORD((std::min)(size_n, int(sizeof size_line - 1))), &written, nullptr);
         }
         if (na::native_present::SizeProbeInstalled()) { // read-only size-query probe ([present] size_probe=1)
@@ -3437,6 +3439,21 @@ void retire_nr_backbuffers(IDXGISwapChain* sc) {
     for(UINT i=0;i<desc.BufferCount;++i){ComPtr<ID3D12Resource> buffer;
         if(SUCCEEDED(real_get_buffer(sc,i,IID_PPV_ARGS(&buffer))))na::nr::native::RetireBackbuffer(buffer.Get());}
 }
+// Render-small: every fullscreen switch the game asks for is logged (one mechanism for all
+// window modes; the event shows whether exclusive fullscreen ever needs its own handling).
+using SetFullscreenStateFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, BOOL, IDXGIOutput*);
+SetFullscreenStateFn g_orig_set_fullscreen = nullptr;
+HRESULT STDMETHODCALLTYPE DetourSetFullscreenState(IDXGISwapChain* sc, BOOL fullscreen, IDXGIOutput* target)
+{
+    const bool game = na::native_present::GameCaller(_ReturnAddress());
+    const HRESULT hr = g_orig_set_fullscreen(sc, fullscreen, target);
+    BOOL now = FALSE;
+    { const na::native_present::NativeScope native; ComPtr<IDXGIOutput> o; sc->GetFullscreenState(&now, &o); }
+    na::eventlog::Emit("swapchain", "set_fullscreen want=%d target=%p hr=0x%08lx now=%d caller=%s advertised=%ux%u",
+        fullscreen ? 1 : 0, static_cast<void*>(target), static_cast<unsigned long>(hr), now ? 1 : 0, game ? "game" : "other",
+        na::native_present::AdvertisedSize().w, na::native_present::AdvertisedSize().h);
+    return hr;
+}
 HRESULT STDMETHODCALLTYPE DetourResizeTarget(IDXGISwapChain* sc, const DXGI_MODE_DESC* requested)
 {
     if (requested && na::native_present::GameCaller(_ReturnAddress())) {
@@ -3445,8 +3462,11 @@ HRESULT STDMETHODCALLTYPE DetourResizeTarget(IDXGISwapChain* sc, const DXGI_MODE
         { const na::native_present::NativeScope native;
           hr = sc->GetDesc(&desc); }
         DXGI_MODE_DESC physical = *requested;
-        if (SUCCEEDED(hr) && na::native_present::RewriteResizeTarget(desc.OutputWindow, &physical))
+        if (SUCCEEDED(hr) && na::native_present::RewriteResizeTarget(desc.OutputWindow, &physical)) {
+            na::eventlog::Emit("virtual_screen", "resize_target game=%ux%u physical=%ux%u", requested->Width, requested->Height,
+                               physical.Width, physical.Height);
             return g_orig_resize_target(sc, &physical);
+        }
     }
     return g_orig_resize_target(sc, requested);
 }
@@ -3816,6 +3836,11 @@ bool StartCore(const char* route_tag, PanelFn controls)
                 ok = prepare_start_hook(sc.Get(), kSwapResizeTargetSlot,
                                         reinterpret_cast<void*>(&DetourResizeTarget),
                                         reinterpret_cast<void**>(&g_orig_resize_target));
+            // Log-only fullscreen-switch observer; optional, never blocks the core hooks.
+            if (ok && na::j2::RenderSmall())
+                prepare_start_hook(sc.Get(), kSwapSetFullscreenStateSlot,
+                                   reinterpret_cast<void*>(&DetourSetFullscreenState),
+                                   reinterpret_cast<void**>(&g_orig_set_fullscreen));
             // A59 presenter: GetBuffer / GetCurrentBackBufferIndex / ResizeBuffers1.
             // The full observer owns these slots when requested. This narrow
             // trace is for Route A freezes with that observer disabled.

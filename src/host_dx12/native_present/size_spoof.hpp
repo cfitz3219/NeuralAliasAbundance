@@ -95,6 +95,44 @@ bool ExpireResize(uint32_t timeout_ms = 5000, uint64_t now_ms = 0);
 // Initial allocation or a natural game resize, with no pending live request.
 bool CommitBuffers(HWND hwnd, Size output, Size actual_render);
 
+// ONE virtual screen for every window mode (Cort 2026-11-06: windowed, borderless and the
+// game's own fullscreen use the same mechanism, no per-mode paths). In render-small the game is
+// told the whole display is smaller by the render scale. Client and window rects, WM_SIZE,
+// monitor rect and work area, display modes, screen metrics, DXGI output desktop and mode
+// lists, WM_DISPLAYCHANGE and the cursor all go through one map, fixed at the game window's
+// real client origin: virtual = origin + (physical - origin) * scale. The game's own window
+// moves/resizes and ResizeTarget map back, so it can never shrink the real window or display
+// to the virtual size. Off (identity) while the advertised size equals the output.
+struct ScreenMap {
+    HWND hwnd = nullptr;
+    HMONITOR monitor = nullptr;
+    bool primary = false;
+    POINT origin{};          // real client origin, SCREEN coordinates
+    double sx = 1, sy = 1;   // advertised / output
+    RECT monitor_rect{}, work_rect{}; // real
+    wchar_t device[32] = {};
+    Size advertised{}, output{};
+};
+bool GetScreenMap(ScreenMap* out);
+RECT MapScreenRect(const ScreenMap& m, RECT physical);
+// Caller-filter BEFORE these (the probe detours do). Each returns true when it changed a value.
+bool RewriteMonitorInfo(HMONITOR monitor, MONITORINFO* info);
+bool RewriteDisplayModeW(const wchar_t* device, DWORD* w, DWORD* h);
+bool RewriteDisplayModeA(const char* device, DWORD* w, DWORD* h);
+bool RewriteScreenMetric(int index, int* value);
+bool RewriteOutputRect(HMONITOR monitor, RECT* desktop);
+bool RewriteOutputMode(HMONITOR monitor, UINT* w, UINT* h);
+// The game's SetWindowPos/MoveWindow on its own window: virtual -> physical (size and origin).
+bool RewriteGameWindowPos(HWND hwnd, int* x, int* y, int* cx, int* cy, UINT flags);
+// Base of the registered game module containing `caller` (0 when none); no loader lock.
+uintptr_t GameModuleBase(const void* caller);
+struct ScreenStats {
+    uint64_t monitor = 0, display_modes = 0, metrics = 0, outputs = 0, output_modes = 0;
+    uint64_t window_moves = 0, clamped = 0, display_change = 0, resize_target = 0;
+};
+ScreenStats GetScreenStats();
+void FormatScreenStatus(char* out, uint32_t capacity);
+
 struct SizeStats {
     uint64_t client_queries = 0, window_queries = 0, desc_queries = 0;
     uint64_t size_messages = 0, position_messages = 0;

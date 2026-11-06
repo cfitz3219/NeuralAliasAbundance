@@ -135,3 +135,27 @@ Primary coordinate/resize contracts:
 - https://learn.microsoft.com/en-us/windows/win32/api/dxgi/nf-dxgi-idxgiswapchain-resizebuffers
 
 No game installation, CMD or native file has been changed for this increment.
+
+## One virtual screen for every window mode (2026-11-06)
+
+Cort: render-small must work in windowed, borderless and the game's own fullscreen, with one
+mechanism. Evidence: in fullscreen (e519a79 probe) and borderless (p36120) SE5 answers each
+virtual WM_SIZE by reading GetWindowRect, GetMonitorInfo and EnumDisplaySettings, gets the real
+monitor size, and never resizes. In a window it follows every request.
+
+So the game is told the whole display is smaller, not only its window. One map, fixed at the
+game window's real client origin, `virtual = origin + (physical - origin) * advertised/output`,
+answers every size question from a game caller while render-small advertises a smaller size:
+
+- client and window rect, WM_SIZE, WM_WINDOWPOSCHANGED, swap-chain descs (as before);
+- monitor rect and work area (GetMonitorInfoA/W), display modes (EnumDisplaySettingsA/W/ExW, every
+  mode of that display), screen metrics (SM_CX/CYSCREEN, FULLSCREEN, MAXIMIZED; virtual screen when
+  it is the only display), DXGI output DesktopCoordinates and mode lists, WM_DISPLAYCHANGE;
+- the cursor, clip rect and mouse messages already use the same origin and scale (input_map).
+
+Back the other way, so the game cannot shrink anything real: its own SetWindowPos/MoveWindow on its
+window map size (client part only, frame stays real) and origin back to physical, clamped to the
+monitor; a ResizeTarget at the advertised size keeps the physical output. The real window, swap
+chain and display mode stay native in all three modes. Other modules and our own calls always see
+real values. Exclusive fullscreen has no separate path: SetFullscreenState is only logged
+(`swapchain set_fullscreen`), so a run shows whether it ever needs one.

@@ -20,6 +20,8 @@ The 5 s status samples stay. These additions sit next to them in the same per-pr
 | `identity` | first frame | API, exe, pid, ms from process start to first frame, adapter, vendor/device id, VRAM |
 | `xegtao`, `bloom`, `gpu_services` | reason text or error count changes | reason / errors |
 | `camera_cut` | the camera history is reset | why (no_history/gap/translation/rotation/fov/origin/restart_*), value, held, from_j1; `fov` = a zoom such as a scope |
+| `virtual_screen` | the screen the game is told about changes (scale, monitor or window origin); every game move/resize of its own window; every ResizeTarget mapped back | game and physical size, scale, monitor real->virtual, origin, primary, device; `window_pos game=... physical=... clamped=`; `resize_target game= physical=` |
+| `swapchain set_fullscreen` | the game (or anyone) switches DXGI fullscreen | want, target, hr, state after, caller game/other, advertised size |
 | `device_removed` | device removal detected | hr (the DRED file also starts with time and frame) |
 
 ## Periodic blocks
@@ -27,6 +29,8 @@ The 5 s status samples stay. These additions sit next to them in the same per-pr
 - `event_log frame= total= dropped=` every 5 s (dropped > 0 means the queue overflowed).
 - `effects xegtao{...} bloom{...} gpu_services{...}` every 5 s.
 - `sampler_table` and `sampler_row` lines, at most once a minute and only when the game created new samplers. Each distinct sampler is listed (heap, heap2, root-signature static) with filter, anisotropy, address modes, bias, LOD range, comparison and count.
+- `virtual_screen on= scale= monitor=WxH->WxH primary= rewrites{monitor display_modes metrics outputs output_modes window_moves clamped display_change resize_target}` every 5 s in render-small: how many of the game's screen-size answers were scaled (one mechanism for windowed, borderless and fullscreen).
+- `size_probe` every 5 s in render-small (and with `[present] size_probe=1`): every window/monitor/display/DXGI-output size call the game made, its callers and the last value it was given.
 - `driver_texture` when it changes: read-only. For both the app and the global profile it lists value@location for selector, level, LOD bias (auto/manual), negative LOD clamp, the three filtering optimisations and quality.
 
 Not yet captured: which samplers are bound most by draws (needs per-draw descriptor tracking).

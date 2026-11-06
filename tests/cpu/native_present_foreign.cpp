@@ -13,3 +13,16 @@ extern "C" __declspec(dllexport) __declspec(noinline) HRESULT WINAPI FixtureResi
     InterlockedIncrement(&g_fixture_queries);
     return result;
 }
+// A borderless/fullscreen engine: sizes from the monitor of its window, and fits its window to it.
+extern "C" __declspec(dllexport) __declspec(noinline) BOOL WINAPI FixtureMonitorRect(HWND hwnd, RECT* r) {
+    MONITORINFO mi{}; mi.cbSize = sizeof mi;
+    const BOOL ok = GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+    if (ok && r) *r = mi.rcMonitor;
+    InterlockedIncrement(&g_fixture_queries);
+    return ok;
+}
+extern "C" __declspec(dllexport) __declspec(noinline) BOOL WINAPI FixtureSetWindowPos(HWND hwnd, int x, int y, int cx, int cy) {
+    const BOOL ok = SetWindowPos(hwnd, nullptr, x, y, cx, cy, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    InterlockedIncrement(&g_fixture_queries);
+    return ok;
+}

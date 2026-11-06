@@ -1,6 +1,9 @@
 #include "host_dx12/native_present/size_spoof.hpp"
 #include "host_dx12/native_present/size_probe.hpp"
 #include "host_dx12/hooking/vtable_hook.hpp"
+#include "host_dx12/diag/event_log.hpp"
+#include <cmath>
+#include <cwchar>
 #include <intrin.h>
 #include <atomic>
 #include <array>
@@ -27,6 +30,12 @@ LONG_PTR g_window_style = 0;
 HMONITOR g_monitor = nullptr;
 using RectFn = BOOL(WINAPI*)(HWND, LPRECT);
 RectFn g_client = nullptr, g_window = nullptr;
+using SetWindowPosFn = BOOL(WINAPI*)(HWND, HWND, int, int, int, int, UINT);
+using MoveWindowFn = BOOL(WINAPI*)(HWND, int, int, int, int, BOOL);
+SetWindowPosFn g_setpos = nullptr;
+MoveWindowFn g_move = nullptr;
+std::atomic<uint64_t> g_s_monitor{0}, g_s_modes{0}, g_s_metrics{0}, g_s_outputs{0}, g_s_output_modes{0};
+std::atomic<uint64_t> g_s_moves{0}, g_s_clamped{0}, g_s_display_change{0}, g_s_resize_target{0};
 std::atomic<uint64_t> g_client_queries{0}, g_window_queries{0}, g_desc_queries{0};
 std::atomic<uint64_t> g_size_messages{0}, g_position_messages{0};
 std::atomic<uint64_t> g_requests{0}, g_completed{0}, g_failed{0};
@@ -46,6 +55,20 @@ BOOL WINAPI client_detour(HWND hwnd, LPRECT r) {
         if (r) NoteSizeQuery(SizeApi::ClientRect, _ReturnAddress(), static_cast<uint32_t>(r->right - r->left), static_cast<uint32_t>(r->bottom - r->top));
     }
     return ok;
+}
+BOOL WINAPI setpos_detour(HWND hwnd, HWND after, int x, int y, int cx, int cy, UINT flags) {
+    if (GameCaller(_ReturnAddress())) RewriteGameWindowPos(hwnd, &x, &y, &cx, &cy, flags);
+    return g_setpos(hwnd, after, x, y, cx, cy, flags);
+}
+BOOL WINAPI move_detour(HWND hwnd, int x, int y, int cx, int cy, BOOL repaint) {
+    if (GameCaller(_ReturnAddress())) RewriteGameWindowPos(hwnd, &x, &y, &cx, &cy, 0);
+    return g_move(hwnd, x, y, cx, cy, repaint);
+}
+LONG scaled(LONG v, double s) { return bounded(std::llround(double(v) * s)); }
+LONG to_virtual(LONG p, LONG o, double s) { return bounded(int64_t(o) + std::llround((double(p) - o) * s)); }
+LONG to_physical(LONG v, LONG o, double s) { return bounded(int64_t(o) + std::llround((double(v) - o) / s)); }
+bool same_device(const ScreenMap& m, const wchar_t* device) {
+    return device ? std::wcscmp(device, m.device) == 0 : m.primary; // null = the primary display
 }
 BOOL WINAPI window_detour(HWND hwnd, LPRECT r) {
     const BOOL ok = g_window(hwnd, r);
@@ -68,6 +91,12 @@ bool GameCaller(const void* caller) {
     const unsigned n = g_game_module_count.load(std::memory_order_acquire);
     for (unsigned i=0;i<n;++i) if(p>=g_game_modules[i].begin && p<g_game_modules[i].end) return true;
     return false;
+}
+uintptr_t GameModuleBase(const void* caller) {
+    const auto p = reinterpret_cast<uintptr_t>(caller);
+    const unsigned n = g_game_module_count.load(std::memory_order_acquire);
+    for (unsigned i=0;i<n;++i) if(p>=g_game_modules[i].begin && p<g_game_modules[i].end) return g_game_modules[i].begin;
+    return 0;
 }
 bool RegisterGameModule(const void* address) {
     if (!address) return false;
@@ -105,7 +134,11 @@ bool InstallSizeHooks() {
     const auto w = reinterpret_cast<void*>(GetProcAddress(u, "GetWindowRect"));
     const bool ok = c && w && na::hooking::PrepareHook(c, reinterpret_cast<void*>(&client_detour), reinterpret_cast<void**>(&g_client)) &&
         na::hooking::PrepareHook(w, reinterpret_cast<void*>(&window_detour), reinterpret_cast<void**>(&g_window));
-    if (!ok) { na::hooking::AbandonInstall(); na::hooking::Shutdown(); return false; }
+    const auto sp = reinterpret_cast<void*>(GetProcAddress(u, "SetWindowPos"));
+    const auto mv = reinterpret_cast<void*>(GetProcAddress(u, "MoveWindow"));
+    const bool moves = ok && sp && mv && na::hooking::PrepareHook(sp, reinterpret_cast<void*>(&setpos_detour), reinterpret_cast<void**>(&g_setpos)) &&
+        na::hooking::PrepareHook(mv, reinterpret_cast<void*>(&move_detour), reinterpret_cast<void**>(&g_move));
+    if (!ok || !moves) { na::hooking::AbandonInstall(); na::hooking::Shutdown(); return false; }
     if (!na::hooking::CommitInstall()) { na::hooking::Shutdown(); return false; }
     g_installed = true;
     return true;
@@ -188,9 +221,17 @@ UINT ResizeMessage() {
 bool RewriteResizeTarget(HWND hwnd, DXGI_MODE_DESC* mode) {
     if (!mode) return false;
     const auto s = GetSizeState();
-    if (!for_window(s, hwnd) || !s.request || !s.request_delivered || s.request_window ||
-        mode->Width != s.requested.w || mode->Height != s.requested.h) return false;
+    if (!for_window(s, hwnd)) return false;
+    // A delivered render-only request, or (virtual screen) any mode the size of the screen the
+    // game is told about: the real target stays the physical output in every window mode.
+    const Size a = advertised(s);
+    const bool ours = s.request && s.request_delivered && !s.request_window &&
+        mode->Width == s.requested.w && mode->Height == s.requested.h;
+    // Committed render size only: during a real window resize the physical output is changing.
+    const bool virtual_screen = !s.request && !same(a, s.output) && mode->Width == a.w && mode->Height == a.h;
+    if (!ours && !virtual_screen) return false;
     mode->Width = s.output.w; mode->Height = s.output.h;
+    ++g_s_resize_target;
     return true;
 }
 uint64_t RequestRenderSize(Size render, bool force) {
@@ -249,6 +290,13 @@ MessageAction PrepareSizeMessage(HWND hwnd, UINT& msg, WPARAM& wp, LPARAM& lp, W
         scratch.cy = bounded(int64_t(scratch.cy) - (r.bottom - r.top) + size.h);
         lp = reinterpret_cast<LPARAM>(&scratch); ++g_position_messages;
         return MessageAction::Changed;
+    } else if (msg == WM_DISPLAYCHANGE) {
+        // lParam = primary display resolution: the virtual screen's, like every other screen size.
+        ScreenMap m;
+        if (!GetScreenMap(&m) || !m.primary) return MessageAction::Forward;
+        lp = MAKELPARAM(static_cast<WORD>(scaled(LOWORD(lp), m.sx)), static_cast<WORD>(scaled(HIWORD(lp), m.sy)));
+        ++g_s_display_change;
+        return MessageAction::Changed;
     } else return MessageAction::Forward;
     const auto size = advertised(s);
     lp = MAKELPARAM(size.w, size.h); ++g_size_messages;
@@ -297,5 +345,139 @@ void FormatSizeStatus(char* out, uint32_t capacity) {
         static_cast<unsigned long long>(c.position_messages),static_cast<unsigned long long>(c.requests),
         static_cast<unsigned long long>(c.completed),static_cast<unsigned long long>(c.failed),
         static_cast<unsigned long long>(s.mode_generation));
+}
+bool GetScreenMap(ScreenMap* out) {
+    if (!out) return false;
+    const auto s = GetSizeState();
+    if (!s.enabled || !s.hwnd) return false;
+    const Size a = advertised(s);
+    if (!valid(a) || !valid(s.output) || same(a, s.output)) return false;
+    ScreenMap m;
+    m.hwnd = s.hwnd; m.advertised = a; m.output = s.output;
+    m.sx = double(a.w) / s.output.w; m.sy = double(a.h) / s.output.h;
+    {
+        const NativeScope native;
+        if (!ClientToScreen(s.hwnd, &m.origin)) return false;
+        m.monitor = MonitorFromWindow(s.hwnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFOEXW mi{}; mi.cbSize = sizeof mi;
+        if (!m.monitor || !GetMonitorInfoW(m.monitor, &mi)) return false;
+        m.primary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+        m.monitor_rect = mi.rcMonitor; m.work_rect = mi.rcWork;
+        wcsncpy_s(m.device, _countof(m.device), mi.szDevice, _TRUNCATE);
+    }
+    // One event per change of the virtual screen (scale, monitor or origin).
+    static na::eventlog::Edge edge;
+    const int64_t key = (int64_t(a.w) << 48) ^ (int64_t(a.h) << 32) ^ (int64_t(s.output.w) << 16) ^ int64_t(s.output.h) ^
+        (int64_t(reinterpret_cast<uintptr_t>(m.monitor)) << 7) ^ (int64_t(m.origin.x) << 20) ^ (int64_t(m.origin.y) << 40);
+    if (edge.Changed(key)) {
+        const RECT v = MapScreenRect(m, m.monitor_rect);
+        na::eventlog::Emit("virtual_screen", "game=%ux%u physical=%ux%u scale=%.4fx%.4f monitor=%ldx%ld->%ldx%ld origin=%ld,%ld primary=%d device=%ls",
+            a.w, a.h, s.output.w, s.output.h, m.sx, m.sy, m.monitor_rect.right - m.monitor_rect.left, m.monitor_rect.bottom - m.monitor_rect.top,
+            v.right - v.left, v.bottom - v.top, m.origin.x, m.origin.y, m.primary ? 1 : 0, m.device);
+    }
+    *out = m;
+    return true;
+}
+RECT MapScreenRect(const ScreenMap& m, RECT r) {
+    return {to_virtual(r.left, m.origin.x, m.sx), to_virtual(r.top, m.origin.y, m.sy),
+            to_virtual(r.right, m.origin.x, m.sx), to_virtual(r.bottom, m.origin.y, m.sy)};
+}
+bool RewriteMonitorInfo(HMONITOR monitor, MONITORINFO* info) {
+    ScreenMap m;
+    if (!info || !monitor || !GetScreenMap(&m) || monitor != m.monitor) return false;
+    info->rcMonitor = MapScreenRect(m, info->rcMonitor);
+    info->rcWork = MapScreenRect(m, info->rcWork);
+    ++g_s_monitor; return true;
+}
+bool RewriteDisplayModeW(const wchar_t* device, DWORD* w, DWORD* h) {
+    ScreenMap m;
+    if (!w || !h || !GetScreenMap(&m) || !same_device(m, device)) return false;
+    *w = static_cast<DWORD>(scaled(static_cast<LONG>(*w), m.sx)); *h = static_cast<DWORD>(scaled(static_cast<LONG>(*h), m.sy));
+    ++g_s_modes; return true;
+}
+bool RewriteDisplayModeA(const char* device, DWORD* w, DWORD* h) {
+    if (!device) return RewriteDisplayModeW(nullptr, w, h);
+    wchar_t wide[64] = {};
+    if (!MultiByteToWideChar(CP_ACP, 0, device, -1, wide, 63)) return false;
+    return RewriteDisplayModeW(wide, w, h);
+}
+bool RewriteScreenMetric(int index, int* value) {
+    ScreenMap m;
+    if (!value || !GetScreenMap(&m)) return false;
+    const bool x = index == SM_CXSCREEN || index == SM_CXFULLSCREEN || index == SM_CXMAXIMIZED || index == SM_CXVIRTUALSCREEN;
+    const bool y = index == SM_CYSCREEN || index == SM_CYFULLSCREEN || index == SM_CYMAXIMIZED || index == SM_CYVIRTUALSCREEN;
+    if (!x && !y) return false;
+    // Primary-display metrics; the virtual-desktop size only when this is the only display.
+    if (!m.primary) return false;
+    if (index == SM_CXVIRTUALSCREEN || index == SM_CYVIRTUALSCREEN) {
+        const NativeScope native;
+        if (GetSystemMetrics(SM_CMONITORS) != 1) return false;
+    }
+    *value = scaled(*value, x ? m.sx : m.sy);
+    ++g_s_metrics; return true;
+}
+bool RewriteOutputRect(HMONITOR monitor, RECT* desktop) {
+    ScreenMap m;
+    if (!desktop || !monitor || !GetScreenMap(&m) || monitor != m.monitor) return false;
+    *desktop = MapScreenRect(m, *desktop);
+    ++g_s_outputs; return true;
+}
+bool RewriteOutputMode(HMONITOR monitor, UINT* w, UINT* h) {
+    ScreenMap m;
+    if (!w || !h || !monitor || !GetScreenMap(&m) || monitor != m.monitor) return false;
+    *w = static_cast<UINT>(scaled(static_cast<LONG>(*w), m.sx)); *h = static_cast<UINT>(scaled(static_cast<LONG>(*h), m.sy));
+    ++g_s_output_modes; return true;
+}
+bool RewriteGameWindowPos(HWND hwnd, int* x, int* y, int* cx, int* cy, UINT flags) {
+    ScreenMap m;
+    if (!hwnd || !x || !y || !cx || !cy || !GetScreenMap(&m) || hwnd != m.hwnd) return false;
+    RECT wr{}, cr{};
+    {
+        const NativeScope native;
+        const BOOL got_window = g_window ? g_window(hwnd, &wr) : GetWindowRect(hwnd, &wr);
+        if (!got_window || !real_client(hwnd, &cr)) return false;
+    }
+    const LONG frame_w = (wr.right - wr.left) - (cr.right - cr.left), frame_h = (wr.bottom - wr.top) - (cr.bottom - cr.top);
+    const LONG off_x = m.origin.x - wr.left, off_y = m.origin.y - wr.top;
+    const int was_x = *x, was_y = *y, was_cx = *cx, was_cy = *cy;
+    bool clamped = false;
+    if (!(flags & SWP_NOSIZE)) {
+        // The window frame is real in the game's view too; only the client is scaled.
+        LONG w = bounded(std::llround(double(*cx - frame_w) / m.sx)), h = bounded(std::llround(double(*cy - frame_h) / m.sy));
+        const LONG mw = m.monitor_rect.right - m.monitor_rect.left, mh = m.monitor_rect.bottom - m.monitor_rect.top;
+        if (w > mw) { w = mw; clamped = true; }
+        if (h > mh) { h = mh; clamped = true; }
+        if (w < 1) w = 1;
+        if (h < 1) h = 1;
+        *cx = frame_w + w; *cy = frame_h + h;
+    }
+    if (!(flags & SWP_NOMOVE)) {
+        *x = to_physical(*x + off_x, m.origin.x, m.sx) - off_x;
+        *y = to_physical(*y + off_y, m.origin.y, m.sy) - off_y;
+    }
+    ++g_s_moves; if (clamped) ++g_s_clamped;
+    na::eventlog::Emit("virtual_screen", "window_pos game=%d,%d %dx%d physical=%d,%d %dx%d flags=0x%x clamped=%d",
+        was_x, was_y, was_cx, was_cy, *x, *y, *cx, *cy, flags, clamped ? 1 : 0);
+    return true;
+}
+ScreenStats GetScreenStats() {
+    return {g_s_monitor.load(), g_s_modes.load(), g_s_metrics.load(), g_s_outputs.load(), g_s_output_modes.load(),
+            g_s_moves.load(), g_s_clamped.load(), g_s_display_change.load(), g_s_resize_target.load()};
+}
+void FormatScreenStatus(char* out, uint32_t capacity) {
+    if (!out || !capacity) return;
+    const auto c = GetScreenStats();
+    ScreenMap m; const bool on = GetScreenMap(&m);
+    const RECT v = on ? MapScreenRect(m, m.monitor_rect) : RECT{};
+    std::snprintf(out, capacity,
+        "virtual_screen on=%u scale=%.4fx%.4f monitor=%ldx%ld->%ldx%ld primary=%u rewrites{monitor=%llu display_modes=%llu metrics=%llu outputs=%llu output_modes=%llu window_moves=%llu clamped=%llu display_change=%llu resize_target=%llu}",
+        on ? 1u : 0u, on ? m.sx : 1.0, on ? m.sy : 1.0,
+        on ? m.monitor_rect.right - m.monitor_rect.left : 0L, on ? m.monitor_rect.bottom - m.monitor_rect.top : 0L,
+        on ? v.right - v.left : 0L, on ? v.bottom - v.top : 0L, on && m.primary ? 1u : 0u,
+        static_cast<unsigned long long>(c.monitor), static_cast<unsigned long long>(c.display_modes),
+        static_cast<unsigned long long>(c.metrics), static_cast<unsigned long long>(c.outputs),
+        static_cast<unsigned long long>(c.output_modes), static_cast<unsigned long long>(c.window_moves),
+        static_cast<unsigned long long>(c.clamped), static_cast<unsigned long long>(c.display_change),
+        static_cast<unsigned long long>(c.resize_target));
 }
 } // namespace na::native_present

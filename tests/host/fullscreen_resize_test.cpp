@@ -5,11 +5,14 @@
 #include "host_dx12/overlay/presenter.hpp"
 #include "host_dx12/native_present/size_spoof.hpp"
 #include "host_dx12/native_present/size_controller.hpp"
+#include "host_dx12/native_present/size_probe.hpp"
 #include "host_dx12/hooking/vtable_hook.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include <cmath>
 namespace na::overlay { long ReadNativeBufferForTests(IDXGISwapChain*,unsigned,REFIID,void**); }
 extern "C" __declspec(dllimport) HRESULT WINAPI FixtureResizeTarget(IDXGISwapChain*,const DXGI_MODE_DESC*);
+extern "C" __declspec(dllimport) BOOL WINAPI FixtureMonitorRect(HWND,RECT*);
+extern "C" __declspec(dllimport) BOOL WINAPI FixtureSetWindowPos(HWND,int,int,int,int);
 namespace np=na::native_present;
 namespace ctl=na::native_present::ctl;
 namespace {
@@ -23,6 +26,7 @@ struct Game {
     UINT w=0,h=0,calls=0;
     HRESULT hr=E_FAIL;
     bool rebuilding=false;
+    bool monitor_engine=false; // sizes from the monitor and fits its window to it (SE5 borderless/fullscreen)
 };
 LRESULT CALLBACK proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
     if(msg==WM_NCCREATE) SetWindowLongPtrW(hwnd,GWLP_USERDATA,
@@ -39,7 +43,13 @@ LRESULT CALLBACK proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
         if(wp==SIZE_MAXIMIZED || wp==SIZE_MINIMIZED)return 0;
         struct Rebuilding { bool& active; Rebuilding(bool& b):active(b){active=true;} ~Rebuilding(){active=false;} } guard(game->rebuilding);
         RECT rect{};
-        { const np::GameScopeForTest scope; if(!GetClientRect(hwnd,&rect))return 0; }
+        if(game->monitor_engine) {
+            // Ignores the client extent: reads the monitor, fits the window over it, renders at its size.
+            RECT mon{};
+            if(!FixtureMonitorRect(hwnd,&mon))return 0;
+            FixtureSetWindowPos(hwnd,mon.left,mon.top,mon.right-mon.left,mon.bottom-mon.top);
+            rect={0,0,mon.right-mon.left,mon.bottom-mon.top};
+        } else { const np::GameScopeForTest scope; if(!GetClientRect(hwnd,&rect))return 0; }
         // Some engines resize their physical target as part of a logical
         // rebuild. Exercise the actual vtable hook from a registered engine
         // DLL, so DXGI/system callers still receive physical geometry.
@@ -57,12 +67,18 @@ LRESULT CALLBACK proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
     }
     return DefWindowProcW(hwnd,msg,wp,lp);
 }
-int run(test::Device& device,bool maximized) {
-    Game game;
+int run(test::Device& device,bool maximized,bool monitor_engine=false) {
+    Game game; game.monitor_engine=monitor_engine;
+    MONITORINFO mi{}; mi.cbSize=sizeof mi;
+    REQUIRE(GetMonitorInfoW(MonitorFromPoint({0,0},MONITOR_DEFAULTTOPRIMARY),&mi));
+    const RECT mon=mi.rcMonitor;
     WNDCLASSW wc{};wc.lpfnWndProc=proc;wc.hInstance=GetModuleHandleW(nullptr);wc.lpszClassName=L"NA.FullscreenResize.GPU";
     REQUIRE(RegisterClassW(&wc) || GetLastError()==ERROR_CLASS_ALREADY_EXISTS);
-    HWND hwnd=CreateWindowExW(0,wc.lpszClassName,L"Hidden render-size fixture",WS_POPUP|(maximized?WS_MAXIMIZE:0),
-        0,0,320,180,nullptr,nullptr,wc.hInstance,&game);
+    HWND hwnd=monitor_engine
+        ? CreateWindowExW(0,wc.lpszClassName,L"Hidden render-size fixture",WS_POPUP,
+            mon.left,mon.top,mon.right-mon.left,mon.bottom-mon.top,nullptr,nullptr,wc.hInstance,&game)
+        : CreateWindowExW(0,wc.lpszClassName,L"Hidden render-size fixture",WS_POPUP|(maximized?WS_MAXIMIZE:0),
+            0,0,320,180,nullptr,nullptr,wc.hInstance,&game);
     REQUIRE(hwnd && !IsWindowVisible(hwnd));
     RECT physical{};{np::NativeScope native;REQUIRE(GetClientRect(hwnd,&physical));}
     const UINT W=physical.right,H=physical.bottom;
@@ -98,7 +114,7 @@ int run(test::Device& device,bool maximized) {
         CHECK(GetWindowLongPtrW(hwnd,GWL_STYLE)==style);
         RECT after{};{np::NativeScope scope;REQUIRE(GetWindowRect(hwnd,&after));}
         CHECK(std::memcmp(&after,&bounds,sizeof after)==0);
-        std::printf("%s: game=%ux%u physical=%ux%u\n",maximized?"maximized borderless":"popup",game.w,game.h,W,H);
+        std::printf("%s: game=%ux%u physical=%ux%u\n",monitor_engine?"monitor-sized borderless engine":maximized?"maximized borderless":"popup",game.w,game.h,W,H);
     }
     CHECK(game.calls==3);
     game.buffer.Reset();game.chain.Reset();chain.Reset();np::Detach(hwnd);DestroyWindow(hwnd);
@@ -112,8 +128,9 @@ int main() {
     na::j2::SetRenderSmall(true);
     REQUIRE(na::hooking::Initialize() && na::overlay::StartCore("SIZING",nullptr) && np::InstallSizeHooks());
     REQUIRE(np::RegisterGameModule(reinterpret_cast<const void*>(&FixtureResizeTarget)));
+    REQUIRE(np::InstallSizeProbe()); // the virtual screen's monitor/display answers (render-small installs it)
     na::present::SetEnabled(true);
-    REQUIRE(run(d,false)==0);REQUIRE(run(d,true)==0);
+    REQUIRE(run(d,false)==0);REQUIRE(run(d,true)==0);REQUIRE(run(d,false,true)==0);
     na::present::SetRenderScale(1.f,nullptr,nullptr);
     REQUIRE(na::overlay::Stop());
     return test::finish("fullscreen_resize_test");

@@ -313,6 +313,10 @@ DWORD WINAPI InitThread(LPVOID)
         boot_log(na::native_present::InstallSizeProbe() ? "size probe: installed" : "size probe: FAILED to install");
     if (render_small) {
         boot_log(na::native_present::InstallSizeHooks() ? "render-small: size hooks installed" : "render-small: size hooks FAILED");
+        // One virtual screen in every window mode: the monitor/display/DXGI-output answers
+        // the game uses in borderless and fullscreen are scaled with its client size.
+        if (!na::native_present::SizeProbeInstalled())
+            boot_log(na::native_present::InstallSizeProbe() ? "render-small: virtual screen hooks installed" : "render-small: virtual screen hooks FAILED");
         // Four finite, GPU-checked methods. Old manual HUD preferences do not
         // choose the renderer or disable DLSS. Exhaustion leaves ordinary DLSS.
         if(GetPrivateProfileIntW(L"present",L"hud_separation",1,g_ini)!=0){

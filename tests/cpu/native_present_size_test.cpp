@@ -4,6 +4,7 @@
 #include "host_dx12/native_present/size_probe.hpp"
 #include <windowsx.h>
 #include <cstring>
+#include <cmath>
 #include <thread>
 #include <atomic>
 using namespace na::native_present;
@@ -306,6 +307,75 @@ int main() {
             FormatInputStatus(large,sizeof large); CHECK(std::strstr(large,"raw_absolute="));
             CHECK(GetSizeStats().client_queries>0 && GetSizeStats().completed>0 && GetSizeStats().failed>0);
             InputGeometry g{}; CHECK(!GetInputGeometry(&g));
+        }},
+        {"virtual screen: one map for monitor, display modes, metrics, outputs and the game's window moves", [] {
+            CHECK(InstallSizeProbe());
+            Window w; const RECT c=native_client(w.hwnd);
+            const UINT cw=UINT(c.right-c.left), ch=UINT(c.bottom-c.top);
+            CHECK(Attach(w.hwnd,{cw,ch},{cw,ch}));
+            ScreenMap m{}; CHECK(!GetScreenMap(&m)); // same size: identity, nothing rewritten
+            Detach(w.hwnd);
+            const UINT rw=cw/2, rh=ch/2;
+            CHECK(Attach(w.hwnd,{cw,ch},{rw,rh}));
+            CHECK(GetScreenMap(&m) && m.hwnd==w.hwnd && m.monitor);
+            CHECK(std::fabs(m.sx-double(rw)/cw)<1e-9 && std::fabs(m.sy-double(rh)/ch)<1e-9);
+            auto close1=[](LONG a,LONG b){ return a-b<=1 && b-a<=1; };
+            MONITORINFOEXW real{}; real.cbSize=sizeof real;
+            { NativeScope n; CHECK(GetMonitorInfoW(m.monitor,&real)); }
+            const LONG mw=real.rcMonitor.right-real.rcMonitor.left, mh=real.rcMonitor.bottom-real.rcMonitor.top;
+            MONITORINFOEXW seen{}; seen.cbSize=sizeof seen;
+            int seen_cx=0, other_cx=0; DEVMODEW dm{}; dm.dmSize=sizeof dm; DEVMODEW dm_dev{}; dm_dev.dmSize=sizeof dm_dev;
+            { GameScopeForTest game;
+                CHECK(GetMonitorInfoW(MonitorFromWindow(w.hwnd,MONITOR_DEFAULTTONEAREST),&seen));
+                seen_cx=GetSystemMetrics(SM_CXSCREEN);
+                CHECK(EnumDisplaySettingsW(nullptr,ENUM_CURRENT_SETTINGS,&dm));
+                CHECK(EnumDisplaySettingsW(real.szDevice,ENUM_CURRENT_SETTINGS,&dm_dev));
+            }
+            other_cx=GetSystemMetrics(SM_CXSCREEN); // not the game: real
+            CHECK(std::wcscmp(seen.szDevice,real.szDevice)==0); // non-size fields untouched
+            CHECK(close1(seen.rcMonitor.right-seen.rcMonitor.left,LONG(std::llround(mw*m.sx))));
+            CHECK(close1(seen.rcMonitor.bottom-seen.rcMonitor.top,LONG(std::llround(mh*m.sy))));
+            // The map is fixed at the client origin, the same point the cursor map uses.
+            const RECT v=MapScreenRect(m,real.rcMonitor);
+            CHECK(std::memcmp(&v,&seen.rcMonitor,sizeof v)==0);
+            InputGeometry g{}; CHECK(GetInputGeometry(&g));
+            const POINT corner=ToGameScreen(g,{real.rcMonitor.right,real.rcMonitor.bottom});
+            CHECK(close1(corner.x,seen.rcMonitor.right) && close1(corner.y,seen.rcMonitor.bottom));
+            DEVMODEW physical{}; physical.dmSize=sizeof physical;
+            { NativeScope n; CHECK(EnumDisplaySettingsW(real.szDevice,ENUM_CURRENT_SETTINGS,&physical)); }
+            CHECK(close1(LONG(dm_dev.dmPelsWidth),LONG(std::llround(physical.dmPelsWidth*m.sx))));
+            if (m.primary) {
+                CHECK(close1(seen_cx,LONG(std::llround(other_cx*m.sx))));
+                CHECK(close1(LONG(dm.dmPelsWidth),LONG(std::llround(physical.dmPelsWidth*m.sx))));
+            }
+            CHECK(other_cx==[]{NativeScope n; return GetSystemMetrics(SM_CXSCREEN);}());
+            // WM_DISPLAYCHANGE carries the primary resolution: the virtual one.
+            { UINT msg=WM_DISPLAYCHANGE; WPARAM wp=32; LPARAM lp=MAKELPARAM(physical.dmPelsWidth,physical.dmPelsHeight); WINDOWPOS scratch{};
+              const auto act=PrepareSizeMessage(w.hwnd,msg,wp,lp,scratch);
+              CHECK(act==(m.primary?MessageAction::Changed:MessageAction::Forward));
+              if (m.primary) CHECK(close1(LOWORD(lp),LONG(std::llround(physical.dmPelsWidth*m.sx)))); }
+            // The game's own window resize: what it already sees changes nothing physically...
+            RECT wr{},wv{}; { NativeScope n; CHECK(GetWindowRect(w.hwnd,&wr)); }
+            { GameScopeForTest game; CHECK(GetWindowRect(w.hwnd,&wv));
+              CHECK(SetWindowPos(w.hwnd,nullptr,wv.left,wv.top,wv.right-wv.left,wv.bottom-wv.top,SWP_NOZORDER|SWP_NOACTIVATE)); }
+            RECT after{}; { NativeScope n; CHECK(GetWindowRect(w.hwnd,&after)); }
+            CHECK(std::memcmp(&after,&wr,sizeof after)==0);
+            // ...and a larger virtual client grows the real one by 1/scale, never to the virtual size.
+            { GameScopeForTest game; CHECK(SetWindowPos(w.hwnd,nullptr,0,0,(wv.right-wv.left)+4,(wv.bottom-wv.top)+2,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE)); }
+            const RECT grown=native_client(w.hwnd);
+            CHECK(close1(grown.right-grown.left,LONG(cw)+8) || grown.right-grown.left==mw);
+            CHECK(close1(grown.bottom-grown.top,LONG(ch)+4) || grown.bottom-grown.top==mh);
+            // Our own (non-game) calls stay physical.
+            CHECK(SetWindowPos(w.hwnd,nullptr,0,0,wr.right-wr.left,wr.bottom-wr.top,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE));
+            { NativeScope n; CHECK(GetWindowRect(w.hwnd,&after)); }
+            CHECK(after.right-after.left==wr.right-wr.left && after.bottom-after.top==wr.bottom-wr.top);
+            CHECK(GetScreenStats().monitor>0 && GetScreenStats().window_moves>=2);
+            char line[512]; FormatScreenStatus(line,sizeof line); std::printf("%s\n",line);
+            CHECK(std::strstr(line,"virtual_screen on=1"));
+            Detach(w.hwnd); CHECK(!GetScreenMap(&m));
+            MONITORINFO plain{}; plain.cbSize=sizeof plain;
+            { GameScopeForTest game; CHECK(GetMonitorInfoW(MonitorFromWindow(w.hwnd,MONITOR_DEFAULTTONEAREST),&plain)); }
+            CHECK(std::memcmp(&plain.rcMonitor,&real.rcMonitor,sizeof plain.rcMonitor)==0); // detached: real
         }},
         {"size probe records game size queries without changing answers", [] {
             CHECK(InstallSizeProbe());

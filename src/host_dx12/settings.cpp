@@ -88,7 +88,7 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
     target.rr_preset.store(rr_preset >= 4 && rr_preset <= 6 ? rr_preset : 0);
     target.text_bold.store(
         GetPrivateProfileIntW(L"overlay", L"text_bold", 0, ini) ? 1u : 0u);
-    target.fill_screen.store(GetPrivateProfileIntW(L"present", L"fill_screen", 1, ini) ? 1u : 0u);
+    target.fill_screen.store(GetPrivateProfileIntW(L"present", L"fill_screen", 0, ini) ? 1u : 0u);
     target.win_x.store(static_cast<int32_t>(GetPrivateProfileIntW(L"overlay", L"win_x", 0, ini)));
     target.win_y.store(static_cast<int32_t>(GetPrivateProfileIntW(L"overlay", L"win_y", 0, ini)));
     target.win_w.store(static_cast<int32_t>(GetPrivateProfileIntW(L"overlay", L"win_w", 0, ini)));

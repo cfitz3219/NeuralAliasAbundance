@@ -4,6 +4,11 @@
 // real value unchanged; the probe only records which call, which caller (module + RVA,
 // top 8 per API), the last size returned and how many calls came within 3 s after one
 // of our resize requests. No stack walks, no per-call file I/O.
+// 2026-11-06: the same detours carry render-small's virtual screen (size_spoof.hpp
+// ScreenMap): while a game window is attached at a smaller advertised size, the game's
+// monitor/display/metric/DXGI-output answers are scaled with it. With nothing attached, or
+// for any non-game caller, every answer is still the real value. Installed by render-small
+// itself, and by [present] size_probe=1 for read-only runs.
 #pragma once
 #include <cstdint>
 
