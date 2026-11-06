@@ -402,6 +402,7 @@ set_tests_properties(host_overlay_bootstrap_recovery_test PROPERTIES TIMEOUT 30 
 add_test(NAME host_overlay_menu_failure_test COMMAND overlay_bootstrap_test --menu-failure)
 set_tests_properties(host_overlay_menu_failure_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "host;gpu")
 na_host_test(presenter_ownership_test SOURCES presenter_ownership_test.cpp LIBS host_dx12 user32)
+na_host_test(display_independent_present_test SOURCES display_independent_present_test.cpp LIBS host_dx12 user32)
 na_host_test(fullscreen_resize_test SOURCES fullscreen_resize_test.cpp LIBS host_dx12 user32 na_native_present_foreign)
 add_custom_command(TARGET fullscreen_resize_test POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:na_native_present_foreign>
