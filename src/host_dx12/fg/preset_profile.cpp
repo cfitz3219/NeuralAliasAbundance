@@ -370,7 +370,7 @@ std::string read_texture_driver_settings() {
         if (find(session, exe, &app_profile, &app) != NVAPI_OK) app_profile = nullptr;
         if (get_global && get_global(session, &global) != NVAPI_OK) global = nullptr;
         struct Id { const char* name; NvU32 id; };
-        static const Id ids[] = {
+        static const Id texture_ids[] = {
             {"aniso_selector", ANISO_MODE_SELECTOR_ID}, {"aniso_level", ANISO_MODE_LEVEL_ID},
             {"lod_bias_auto", AUTO_LODBIASADJUST_ID}, {"lod_bias", LODBIASADJUST_ID},
             {"no_negative_lod", PS_TEXFILTER_NO_NEG_LODBIAS_ID}, {"aniso_sample_opt", PS_TEXFILTER_ANISO_OPTS2_ID},
@@ -382,7 +382,7 @@ std::string read_texture_driver_settings() {
             snprintf(b, sizeof b, " %s{present=%u", p.name, p.h ? 1u : 0u);
             out += b;
             if (p.h)
-                for (const Id& i : ids) {
+                for (const Id& i : texture_ids) {
                     NVDRS_SETTING st{}; st.version = NVDRS_SETTING_VER;
                     if (get(session, p.h, i.id, &st) == NVAPI_OK)
                         snprintf(b, sizeof b, " %s=%u@loc%u%s", i.name, unsigned(st.u32CurrentValue), unsigned(st.settingLocation),
