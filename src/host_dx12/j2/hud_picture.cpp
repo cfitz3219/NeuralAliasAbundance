@@ -49,15 +49,19 @@ float3 to_srgb(float3 c){c=saturate(c);return c<=.0031308?c*12.92:1.055*pow(c,1/
 // cursor/late overlay can retain its original pixels without disabling native
 // HUD everywhere else. No new image pass or relaxed colour tolerance.
 bool agrees(uint2 p){return proof.Load(32+4*(p.y*w+p.x))==0;}
+// A zero-slope model reproduces a complete game picture for ANY background.
+// It proves image identity, not HUD separation. Use this frame's GPU receipt
+// before selecting inputs, motion protection OR native composition.
+bool scene_transmits(){return (flags&1024u)==0 || proof.Load(24)!=0;}
 bool agrees_at(float2 uv){
  int2 q=int2(floor(uv*float2(w,h)-.5));
  [unroll]for(int y=0;y<2;++y)[unroll]for(int x=0;x<2;++x)
   if(!agrees(uint2(clamp(q+int2(x,y),int2(0,0),int2(w-1,h-1)))))return false;
  return true;
 }
-groupshared uint mismatch,matched,error_bits,picture_matched;
+groupshared uint mismatch,matched,error_bits,picture_matched,transmitted;
 [numthreads(8,8,1)]void verify(uint3 id:SV_DispatchThreadID,uint gi:SV_GroupIndex){
- if(gi==0){mismatch=0;matched=0;error_bits=0;picture_matched=0;}GroupMemoryBarrierWithGroupSync();
+ if(gi==0){mismatch=0;matched=0;error_bits=0;picture_matched=0;transmitted=0;}GroupMemoryBarrierWithGroupSync();
  if(id.x<w&&id.y<h){float3 a=frame[id.xy].rgb,b=full[id.xy].rgb;
   bool bad=any(!isfinite(a))||any(!isfinite(b))||any(abs(a-b)>tolerance*max(1,max(abs(a),abs(b))));
   if(!bad)InterlockedAdd(picture_matched,1);
@@ -76,17 +80,23 @@ groupshared uint mismatch,matched,error_bits,picture_matched;
       abs(frame[id.xy].a-d.a)>tolerance*max(1,max(abs(frame[id.xy].a),abs(d.a))))bad=true;}
   if(flags&512u){float4 c=low0[id.xy],d=full[id.xy];
    if(any(!isfinite(c))||any(abs(c-d)>tolerance*max(1,max(abs(c),abs(d)))))bad=true;}
+  if(flags&1024u){
+   uint2 q=min(uint2((float2(id.xy)+.5)*float2(ow,oh)/float2(w,h)),uint2(ow-1,oh-1));
+   float3 a=n0[q].rgb,b=n1[q].rgb;
+   if(all(isfinite(a))&&all(isfinite(b))&&any(a!=b))InterlockedAdd(transmitted,1);
+  }
   proof.Store(32+4*(id.y*w+id.x),bad?1u:0u);
   if(bad)InterlockedOr(mismatch,1);else InterlockedAdd(matched,1);
   if(isfinite(error))InterlockedMax(error_bits,asuint(error));}
- GroupMemoryBarrierWithGroupSync();if(gi==0){if(mismatch)proof.InterlockedOr(0,1);proof.InterlockedAdd(4,matched);proof.InterlockedMax(8,error_bits);proof.InterlockedAdd(12,picture_matched);}
+ GroupMemoryBarrierWithGroupSync();if(gi==0){if(mismatch)proof.InterlockedOr(0,1);proof.InterlockedAdd(4,matched);proof.InterlockedMax(8,error_bits);proof.InterlockedAdd(12,picture_matched);proof.InterlockedAdd(24,transmitted);}
 }
 [numthreads(8,8,1)]void prepare(uint3 id:SV_DispatchThreadID){
  if(id.x>=w||id.y>=h)return;
- bool transfer=agrees(id.xy);
+ bool transmitted=scene_transmits();
+ bool transfer=transmitted&&agrees(id.xy);
  bool clean=transfer&&(flags&1u)!=0;
  float m=0;
- if(transfer||(flags&64u)||(flags&512u)){
+ if(transfer||(flags&64u)||(flags&512u)||(flags&1024u)){
   // Cover every actual native raster pixel belonging to this input pixel.
   // Centre-only downsampling can miss thin native glyphs between centres.
   uint2 lo=uint2(floor(float2(id.xy)*float2(ow,oh)/float2(w,h)));
@@ -102,8 +112,8 @@ groupshared uint mismatch,matched,error_bits,picture_matched;
   if(flags&2u)input_scene.rgb=to_srgb(input_scene.rgb);
  }
  selected[id.xy]=clean?input_scene:frame[id.xy];
- mask[id.xy]=clean?0:m;
- if(!clean&&m>.01)motion[id.xy]=0;
+ mask[id.xy]=transmitted&&!clean?m:0;
+ if(transmitted&&!clean&&m>.01)motion[id.xy]=0;
 }
 [numthreads(8,8,1)]void compose(uint3 id:SV_DispatchThreadID){
  if(id.x>=ow||id.y>=oh)return;
@@ -114,6 +124,7 @@ groupshared uint mismatch,matched,error_bits,picture_matched;
    c.rgb=lerp(c.rgb,float3(1,0,1),.5*saturate(max(d.r,max(d.g,d.b))*16));}result[id.xy]=c;return;}
  if(flags&16u){result[id.xy]=float4(picture[id.xy].rgb,scene.SampleLevel(lin,uv,0).a);return;}
  float4 s=picture[id.xy];float3 outc=s.rgb;
+ if(!scene_transmits()){result[id.xy]=s;return;}
  // Input was already selected before DLSS: a rejected HUD model keeps
  // that enhanced result, never the unenhanced game image.
  if(!agrees_at(uv)){result[id.xy]=s;return;}
@@ -182,12 +193,13 @@ struct Picture::Impl {
   // Keeping a resource alive does not make its view/state valid in every pass.
   const bool verify=pass==0,prepare=pass==1,compose=pass==2;
   const bool model=(constants.flags&64u)!=0,native=(constants.flags&8u)!=0,seed=(constants.flags&48u)!=0;
+  const bool transmission=verify&&(constants.flags&1024u)!=0;
   ID3D12Resource* srvs[]={
    !seed?frame.Get():nullptr,
    (verify||(compose&&native))&&full_current?full.Get():nullptr,
    (prepare||(verify&&model)||(compose&&(seed||native)))&&scene_current?scene.Get():nullptr,
-   (prepare||(compose&&!seed))?n[0].Get():nullptr,
-   (prepare||(verify&&native)||(compose&&!seed&&!native))?n[1].Get():nullptr,
+   (prepare||transmission||(compose&&!seed))?n[0].Get():nullptr,
+   (prepare||transmission||(verify&&native)||(compose&&!seed&&!native))?n[1].Get():nullptr,
    compose&&!native&&(constants.flags&32u)==0?pic:nullptr,
    verify&&(model||(constants.flags&512u))?low[0].Get():nullptr,verify&&model?low[1].Get():nullptr};
   DXGI_FORMAT formats[]={frame_view,frame_view,frame_view,layer_view,layer_view,pf,(constants.flags&512u)?frame_view:layer_view,layer_view};
@@ -272,7 +284,7 @@ bool Picture::Prepare(ID3D12GraphicsCommandList* l,ID3D12Resource* frame,DXGI_FO
   if(ld.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||ld.Width!=p.w||ld.Height!=p.h||ld.DepthOrArraySize!=1||ld.MipLevels!=1||
      ld.SampleDesc.Count!=1||TypelessOf(ld.Format)!=TypelessOf(lv))return false;}
  const bool floating=fv==DXGI_FORMAT_R16G16B16A16_FLOAT||fv==DXGI_FORMAT_R32G32B32A32_FLOAT;
- p.constants={p.w,p.h,p.ow,p.oh,(clean?1u:0u)|(srgb?2u:0u)|(tint?4u:0u)|(model?64u:0u)|(floating?128u:0u)|(p.source_srgb?256u:0u)|(!model&&p.low[0]?512u:0u),grey,tolerance,0};
+ p.constants={p.w,p.h,p.ow,p.oh,1024u|(clean?1u:0u)|(srgb?2u:0u)|(tint?4u:0u)|(model?64u:0u)|(floating?128u:0u)|(p.source_srgb?256u:0u)|(!model&&p.low[0]?512u:0u),grey,tolerance,0};
  if(p.outputs_read){move(l,p.input.Get(),S,U);move(l,p.mask.Get(),S,U);}
  move(l,n0,R,S);move(l,n1,R,S);
  if(model){move(l,p.low[0].Get(),R,S);move(l,p.low[1].Get(),R,S);}
@@ -294,7 +306,7 @@ bool Picture::ProofAfterCompletion(bool& identity,bool& clean,ProofReceipt* rece
  if(FAILED(p.readback->Map(0,&range,&data)))return false;UINT values[8]{};std::memcpy(values,data,32);const UINT flags=values[0];
  if(receipt){receipt->tested=p.w*p.h;receipt->matched=values[1];receipt->picture_matched=values[3];receipt->hud_pixels=values[4];receipt->separated_pixels=values[5];std::memcpy(&receipt->maximum_error,values+2,4);}
  D3D12_RANGE none{};p.readback->Unmap(0,&none);
- identity=flags==0;clean=identity&&(p.constants.flags&9u)!=0;p.proof_read=true;return true;
+ identity=flags==0;clean=identity&&(p.constants.flags&9u)!=0&&(!(p.constants.flags&1024u)||values[6]!=0);p.proof_read=true;return true;
 }
 bool Picture::Composite(ID3D12GraphicsCommandList* l,ID3D12Resource* out){
  auto& p=*p_;if(!p.prepared||!l||!out)return false;const auto d=out->GetDesc();
