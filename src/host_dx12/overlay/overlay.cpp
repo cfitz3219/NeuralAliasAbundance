@@ -3095,17 +3095,24 @@ void note_identity(IDXGISwapChain* sc, ID3D12CommandQueue* queue)
     na::eventlog::Emit("identity", "api=d3d12 exe=\"%s\" pid=%lu first_frame_after_ms=%llu adapter=\"%s\" vendor=0x%04X device=0x%04X rev=%u vram_mb=%llu",
                        exe8, GetCurrentProcessId(), since_start_ms, adapter, vendor, device_id, revision, vram_mb);
 }
+// Every real game-frame entry shares the source notification, independently
+// of whether presentation uses owned proxies or the physical backbuffer.
+// TEST/generated presents do not enter either caller.
+void game_frame_boundary(ID3D12CommandQueue* queue)
+{
+    na::j2::OnPresent(queue);
+    na::settings::WatchChanges("code");
+    na::scale::AutomaticScenePresent();
+}
 void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue_hint = nullptr)
 {
     std::lock_guard<std::mutex> lock(g_state.mutex);
     ID3D12CommandQueue* queue = nullptr;
     ComPtr<ID3D12CommandQueue> retained_queue;
     if (!present_prelude(sc, queue,retained_queue,queue_hint)) return;
-    na::j2::OnPresent(queue); // one game-frame boundary, never a TEST Present
+    game_frame_boundary(queue);
     note_identity(sc, queue);
     fill_screen_tick(sc);
-    na::settings::WatchChanges("code"); // changes made outside the panel (mode commit, ini, safe start)
-    na::scale::AutomaticScenePresent();
     if (na::scale::SliderRouteActive()) na::scale::TickLive(na::j2::GetStats().width); // P4-4: confirm a live render-scale change
     UINT idx = real_index(sc);
     { // frame processing uses the actual buffer, independently of menu allocation
@@ -3255,8 +3262,7 @@ HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_
     const HRESULT picture_desc_hr = sc->GetDesc(&picture_desc);
     if (na::j2::RenderSmall() && SUCCEEDED(picture_desc_hr))
         na::native_present::ObserveWindowMode(picture_desc.OutputWindow, picture_desc.Windowed != FALSE);
-    na::j2::OnPresent(queue); // game call only; the presenter's generated frames bypass this
-    na::settings::WatchChanges("code");
+    game_frame_boundary(queue); // generated frames bypass this game-facing entry
     note_identity(sc, queue);
     fill_screen_tick(sc);
     if (na::j2::RenderSmall()) small_follow_mode();

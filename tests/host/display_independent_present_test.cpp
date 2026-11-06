@@ -18,6 +18,7 @@
 #include "host_dx12/hooking/vtable_hook.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/settings.hpp"
+#include "host_dx12/scale/auto_scene.hpp"
 #include <cstring>
 #include <vector>
 namespace na::overlay { long ReadNativeBufferForTests(IDXGISwapChain*,unsigned,REFIID,void**); }
@@ -143,7 +144,14 @@ int run(test::Device& d, bool borderless, DXGI_FORMAT first, DXGI_FORMAT second)
             const Image expected = pattern(W, H, format, seed++);
             REQUIRE(upload(d, back.Get(), expected));
             back.Reset();
-            REQUIRE(SUCCEEDED(sc->Present(0, 0)));
+            const auto source_present=na::scale::GetAutomaticSceneStats().presents;
+            // These are the actual game-facing entry points. No manual source
+            // tick: the production presenter path must deliver exactly one.
+            REQUIRE(SUCCEEDED(sc->Present(0, DXGI_PRESENT_TEST)));
+            CHECK(na::scale::GetAutomaticSceneStats().presents==source_present);
+            if(seed%2){DXGI_PRESENT_PARAMETERS pp{};REQUIRE(SUCCEEDED(sc->Present1(0,0,&pp)));}
+            else REQUIRE(SUCCEEDED(sc->Present(0, 0)));
+            CHECK(na::scale::GetAutomaticSceneStats().presents==source_present+1);
             d.WaitIdle();
             // Test-only drain, then read every real buffer: the one just presented must hold
             // exactly the reconstructed full-size picture.
@@ -187,6 +195,7 @@ int main() {
     na::j2::SetRenderSmall(false);
     REQUIRE(na::hooking::Initialize()); REQUIRE(na::overlay::StartCore("DISPLAYINDEP", nullptr));
     na::settings::Get().nr_enabled.store(0); na::present::SetEnabled(true);
+    na::scale::ConfigureAutomaticScene(true);
     REQUIRE(run(d, false, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT) == 0);
     REQUIRE(run(d, true, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R10G10B10A2_UNORM) == 0);
     REQUIRE(d.device->GetDeviceRemovedReason() == S_OK);

@@ -9,6 +9,8 @@
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/settings.hpp"
 #include "host_dx12/nr/native_fg.hpp"
+#include "host_dx12/overlay/overlay.hpp"
+#include "host_dx12/overlay/presenter.hpp"
 #include <d3dcompiler.h>
 #include <d3d12sdklayers.h>
 #include <array>
@@ -87,7 +89,9 @@ int main(int argc,char** argv){
     const bool repeat=argc>1&&std::strcmp(argv[1],"--repeat")==0;
     const bool indirect=argc>1&&std::strcmp(argv[1],"--indirect")==0;
     const bool render_ahead=argc>1&&std::strcmp(argv[1],"--render-ahead")==0;
-    const bool post_native=render_ahead||(argc>1&&std::strcmp(argv[1],"--post-native")==0);
+    const bool proxy_present=argc>1&&std::strcmp(argv[1],"--proxy-present")==0;
+    const bool post_native=proxy_present||render_ahead||(argc>1&&std::strcmp(argv[1],"--post-native")==0);
+    if(proxy_present){SetEnvironmentVariableW(L"NA_TEST_FORCE_WARP",L"1");SetEnvironmentVariableW(L"NEURALALIAS_TEST_WARP",L"1");}
     setvbuf(stdout,nullptr,_IONBF,0);test::ComPtr<ID3D12Debug> debug;
     if(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))debug->EnableDebugLayer();
     test::Device d;if(!test::CreateDevice(d))return test::SkipNoDevice("auto_scene_test");auto* dev=d.device.Get();
@@ -175,11 +179,23 @@ float4 water(float4 position:SV_Position):SV_Target{uint2 p=uint2(position.xy);f
     test::List scene;REQUIRE(scene.Create(dev));REQUIRE(SUCCEEDED(scene.list->Close()));
     test::List tail;REQUIRE(tail.Create(dev));REQUIRE(SUCCEEDED(tail.list->Close()));
     test::List hud;REQUIRE(hud.Create(dev));REQUIRE(SUCCEEDED(hud.list->Close()));
+    HWND window=nullptr;test::ComPtr<IDXGISwapChain1> chain;
+    if(proxy_present){
+        REQUIRE(na::overlay::StartCore("AUTOSOURCE",nullptr));na::present::SetEnabled(true);
+        na::j2::SetRenderSmall(false);na::present::SetRenderScale(1.f,nullptr,nullptr);
+        window=test::CreateTestWindow(L"Automatic source production presenter");REQUIRE(window);
+        DXGI_SWAP_CHAIN_DESC1 desc{};desc.Width=w;desc.Height=h;desc.BufferCount=2;desc.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;
+        desc.SampleDesc.Count=1;desc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;desc.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        REQUIRE(SUCCEEDED(d.factory->CreateSwapChainForHwnd(d.queue.Get(),window,&desc,nullptr,nullptr,&chain)));
+    }
+    unsigned actual_presents=0;
+    const auto game_present=[&]{CHECK(SUCCEEDED(chain->Present(0,0)));d.WaitIdle();++actual_presents;
+        CHECK(na::scale::GetAutomaticSceneStats().presents==actual_presents);};
     unsigned frame_number=0;float material_value=0;bool replayed=false;
     const auto frame=[&](bool reconstruct,bool advance=true){
         d.WaitIdle();if(materials){const auto index=frame_number++%2;material_value=index?.75f:.25f;dev->CreateShaderResourceView(material_textures[index].Get(),&srv,material_slot);}
         if(repeat){const float before_submit=7;std::memcpy(mapped+8,&before_submit,4);}
-        if(advance){na::scale::AutomaticScenePresent();na::j2::OnPresent(d.queue.Get());}scene.Reset();auto* list=scene.list.Get();
+        if(advance&&!proxy_present){na::scale::AutomaticScenePresent();na::j2::OnPresent(d.queue.Get());}scene.Reset();auto* list=scene.list.Get();
         D3D12_RESOURCE_BARRIER start[]={test::Transition(color.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_RENDER_TARGET),test::Transition(depth.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_DEPTH_WRITE)};list->ResourceBarrier(2,start);
         list->SetGraphicsRootSignature(root.Get());list->SetPipelineState(pso.Get());list->SetGraphicsRootConstantBufferView(0,cb->GetGPUVirtualAddress());
         ID3D12DescriptorHeap* heap=texture_heap.Get();list->SetDescriptorHeaps(1,&heap);list->SetGraphicsRootDescriptorTable(1,texture_heap->GetGPUDescriptorHandleForHeapStart());
@@ -215,10 +231,12 @@ float4 water(float4 position:SV_Position):SV_Target{uint2 p=uint2(position.xy);f
         // Render-ahead: the next scene was recorded before the previous
         // picture's Present, but is submitted only after that boundary.
         if(!advance){na::scale::AutomaticScenePresent();na::j2::OnPresent(d.queue.Get());}
-        na::scale::AutomaticSceneSubmission receipt(d.queue.Get(),count,lists);
+        std::unique_ptr<na::scale::AutomaticSceneSubmission> receipt;
+        if(!proxy_present)receipt=std::make_unique<na::scale::AutomaticSceneSubmission>(d.queue.Get(),count,lists);
         if(repeat){CHECK(na::scale::GetAutomaticSceneStats().constant_copies==copies_before);
             const float late_upload=9;std::memcpy(mapped+8,&late_upload,4);}
-        if(reconstruct)na::j2::Execute(d.queue.Get(),count,lists,&forward);else forward(d.queue.Get(),count,lists);
+        if(proxy_present)d.queue->ExecuteCommandLists(count,lists); // real overlay submission/NGX path
+        else if(reconstruct)na::j2::Execute(d.queue.Get(),count,lists,&forward);else forward(d.queue.Get(),count,lists);
         if(post_native){
             // The engine records a later native-resolution UI pass only after
             // its scene submission returned. It ignores all window requests,
@@ -229,8 +247,24 @@ float4 water(float4 position:SV_Position):SV_Target{uint2 p=uint2(position.xy);f
             ui->SetDescriptorHeaps(1,&heap);ui->SetGraphicsRootDescriptorTable(1,texture_heap->GetGPUDescriptorHandleForHeapStart());
             ui->OMSetRenderTargets(1,&rtv,FALSE,nullptr);ui->RSSetViewports(1,&viewport);const D3D12_RECT clip{w-2,h-2,w,h};ui->RSSetScissorRects(1,&clip);ui->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);ui->DrawInstanced(3,1,0,0);
             std::swap(transition.Transition.StateBefore,transition.Transition.StateAfter);ui->ResourceBarrier(1,&transition);CHECK(SUCCEEDED(ui->Close()));
-            ID3D12CommandList* ui_lists[]={ui};na::scale::AutomaticSceneSubmission ui_receipt(d.queue.Get(),1,ui_lists);forward(d.queue.Get(),1,ui_lists);
+            ID3D12CommandList* ui_lists[]={ui};
+            if(proxy_present)d.queue->ExecuteCommandLists(1,ui_lists);
+            else{na::scale::AutomaticSceneSubmission ui_receipt(d.queue.Get(),1,ui_lists);forward(d.queue.Get(),1,ui_lists);}
         }
+        if(proxy_present){
+            // The game's finishing copy delivers J2's full native scene to its
+            // game-facing backbuffer. No manual OnPresent/source tick occurs.
+            d.WaitIdle();const na::observe::HostWorkScope host;
+            test::ComPtr<IDXGISwapChain3> sc3;CHECK(SUCCEEDED(chain.As(&sc3)));test::ComPtr<ID3D12Resource> back;
+            CHECK(SUCCEEDED(chain->GetBuffer(sc3->GetCurrentBackBufferIndex(),IID_PPV_ARGS(&back))));
+            test::List copy;CHECK(copy.Create(dev));
+            D3D12_RESOURCE_BARRIER transitions[]={test::Transition(color.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_SOURCE),
+                test::Transition(back.Get(),D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_STATE_COPY_DEST)};
+            copy.list->ResourceBarrier(2,transitions);copy.list->CopyResource(back.Get(),color.Get());
+            for(auto& t:transitions)std::swap(t.Transition.StateBefore,t.Transition.StateAfter);copy.list->ResourceBarrier(2,transitions);CHECK(SUCCEEDED(copy.list->Close()));
+            ID3D12CommandList* copied[]={copy.list.Get()};d.queue->ExecuteCommandLists(1,copied);d.WaitIdle();
+        }
+        if(proxy_present)game_present();
         d.WaitIdle();na::scale::PollAutomaticScene();const auto status=na::scale::GetAutomaticSceneStats();
         if(first_witness->before){CHECK(first_witness->before==1&&first_witness->after==1);
             na::observe::SetTextureOperationHook(witness);}
@@ -264,8 +298,9 @@ float4 water(float4 position:SV_Position):SV_Target{uint2 p=uint2(position.xy);f
         REQUIRE(pixels(d,color.Get(),55,66,9,true)==0);
         // The Present boundary retains the last completed frame's evidence;
         // a subsequent empty Present clears it instead of reporting stale work.
-        na::scale::AutomaticScenePresent();CHECK(na::scale::GetAutomaticSceneStats().reconstructed);
-        na::scale::AutomaticScenePresent();CHECK(!na::scale::GetAutomaticSceneStats().active&&!na::scale::GetAutomaticSceneStats().reconstructed);
+        if(!proxy_present){na::scale::AutomaticScenePresent();CHECK(na::scale::GetAutomaticSceneStats().reconstructed);}
+        if(proxy_present)game_present();else na::scale::AutomaticScenePresent();
+        CHECK(!na::scale::GetAutomaticSceneStats().active&&!na::scale::GetAutomaticSceneStats().reconstructed);
         na::settings::Get().j2_scale_mode.store(0);frame(true);CHECK(!na::scale::GetAutomaticSceneStats().active);
         REQUIRE(pixels(d,color.Get(),55,66,9,true)==0);
     }else if(unsupported){
@@ -336,6 +371,7 @@ float4 water(float4 position:SV_Position):SV_Target{uint2 p=uint2(position.xy);f
     }
     CHECK(first_witness->before==1&&first_witness->after==1);
     CHECK(witness->before>0&&witness->before==witness->after);
+    if(proxy_present){CHECK(na::present::GetStats().upscaled==0);chain.Reset();CHECK(na::overlay::Stop());DestroyWindow(window);}
     cb->Unmap(0,nullptr);na::j2::Shutdown();na::dlss::Shutdown();na::dlss::SetInitOwnOverrideForTests(nullptr);
     na::observe::SetShaderOperationHook(na::observe::ShaderLane::Bindings,{});na::observe::SetTextureOperationHook({});
     na::observe::SetTextureOperationHook(na::observe::TextureLane::Bindings,{});na::j2::SetPhysicalInputProvider({});na_observe_stop();
