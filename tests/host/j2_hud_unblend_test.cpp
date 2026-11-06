@@ -134,6 +134,59 @@ ComPtr<ID3D12Resource> zero_motion(test::Device& d)
     if(FAILED(copy.list->Close()))return {};ID3D12CommandList* lists[]={copy.list.Get()};submit(d.queue.Get(),1,lists);d.WaitIdle();return texture;
 }
 
+int menu_probe_without_reconstruction(test::Device& d,bool typeless_frame=false)
+{
+    // Production main-menu order: TakeFrame attaches typeless coefficient
+    // layers, but depth/motion are absent so Prepare never runs. This picture
+    // can subsequently be used for independent source discovery.
+    const na::observe::HostWorkScope host;auto* dev=d.device.Get();
+    auto frame=test::CreateTexture(dev,RW,RH,typeless_frame?DXGI_FORMAT_R8G8B8A8_TYPELESS:F,RTS,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    auto low=test::CreateTexture(dev,RW,RH,DXGI_FORMAT_R8G8B8A8_TYPELESS,RTS,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    auto high=test::CreateTexture(dev,RW,RH,DXGI_FORMAT_R8G8B8A8_TYPELESS,RTS,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    REQUIRE(frame&&low&&high);auto picture=nh::Picture::Create(dev,frame->GetDesc(),OW,OH);REQUIRE(picture);
+    ComPtr<ID3D12DescriptorHeap> rtvs;D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,3,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
+    REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&rtvs))));
+    D3D12_RENDER_TARGET_VIEW_DESC view{};view.Format=F;view.ViewDimension=D3D12_RTV_DIMENSION_TEXTURE2D;
+    auto rtv=rtvs->GetCPUDescriptorHandleForHeapStart();const UINT inc=dev->GetDescriptorHandleIncrementSize(hd.Type);
+    const float black[4]={0,0,0,1},grey[4]={.5f,.5f,.5f,1};
+    test::List work;REQUIRE(work.Create(dev));
+    ID3D12Resource* resources[]={frame.Get(),low.Get(),high.Get()};const float* colors[]={kScene,black,grey};
+    for(UINT i=0;i<3;++i){dev->CreateRenderTargetView(resources[i],&view,rtv);work.list->ClearRenderTargetView(rtv,colors[i],0,nullptr);rtv.ptr+=inc;}
+    REQUIRE(picture->SnapshotScene(work.list.Get(),frame.Get(),RTS)&&picture->SnapshotFull(work.list.Get(),frame.Get(),RTS));
+    picture->SetValidationLayers(low.Get(),high.Get());
+    auto b=test::Transition(frame.Get(),RTS,NPSR);work.list->ResourceBarrier(1,&b);
+    REQUIRE(picture->Probe(work.list.Get(),frame.Get(),frame->GetDesc().Format));
+    std::swap(b.Transition.StateBefore,b.Transition.StateAfter);work.list->ResourceBarrier(1,&b);
+    const auto closed=work.list->Close();
+    ComPtr<ID3D12InfoQueue> messages;dev->QueryInterface(IID_PPV_ARGS(&messages));UINT errors=0;
+    if(messages)for(UINT64 i=0;i<messages->GetNumStoredMessagesAllowedByRetrievalFilter();++i){
+        SIZE_T count=0;messages->GetMessage(i,nullptr,&count);std::vector<uint8_t> memory(count);auto* message=reinterpret_cast<D3D12_MESSAGE*>(memory.data());
+        if(SUCCEEDED(messages->GetMessage(i,message,&count))&&message->Severity<=D3D12_MESSAGE_SEVERITY_ERROR){++errors;std::printf("main-menu probe: %s\n",message->pDescription);}
+    }
+    CHECK(errors==0);CHECK(SUCCEEDED(closed));
+    if(errors||FAILED(closed)){std::printf("main-menu order generated invalid commands; not submitting this recording\n");return 1;}
+    ID3D12CommandList* lists[]={work.list.Get()};submit(d.queue.Get(),1,lists);d.WaitIdle();
+    bool identity=false,clean=false;nh::Picture::ProofReceipt receipt;REQUIRE(picture->ProofAfterCompletion(identity,clean,&receipt));
+    CHECK(identity&&!clean&&receipt.matched==RW*RH&&receipt.picture_matched==RW*RH);
+    CHECK(dev->GetDeviceRemovedReason()==S_OK);
+    std::printf("main-menu probe without depth/motion/Prepare: typeless_frame=%d %u/%u pixels match, device healthy\n",typeless_frame,receipt.matched,receipt.tested);
+    // A completed probe can be sampled again through an independent consumer
+    // while the old receipt remains consumed. The second GPU result is fresh.
+    test::List repeat;REQUIRE(repeat.Create(dev));auto independent=picture->ForkSnapshot(repeat.list.Get());REQUIRE(independent);
+    b=test::Transition(frame.Get(),RTS,NPSR);repeat.list->ResourceBarrier(1,&b);
+    REQUIRE(independent->Probe(repeat.list.Get(),frame.Get(),frame->GetDesc().Format));
+    std::swap(b.Transition.StateBefore,b.Transition.StateAfter);repeat.list->ResourceBarrier(1,&b);
+    REQUIRE(SUCCEEDED(repeat.list->Close()));ID3D12CommandList* repeated[]={repeat.list.Get()};submit(d.queue.Get(),1,repeated);d.WaitIdle();
+    REQUIRE(independent->ProofAfterCompletion(identity,clean,&receipt));CHECK(identity&&receipt.matched==RW*RH);
+    test::List completed_again;REQUIRE(completed_again.Create(dev));
+    b=test::Transition(frame.Get(),RTS,NPSR);completed_again.list->ResourceBarrier(1,&b);
+    REQUIRE(picture->Probe(completed_again.list.Get(),frame.Get(),frame->GetDesc().Format));
+    std::swap(b.Transition.StateBefore,b.Transition.StateAfter);completed_again.list->ResourceBarrier(1,&b);
+    REQUIRE(SUCCEEDED(completed_again.list->Close()));ID3D12CommandList* fresh_receipt[]={completed_again.list.Get()};submit(d.queue.Get(),1,fresh_receipt);d.WaitIdle();
+    REQUIRE(picture->ProofAfterCompletion(identity,clean,&receipt));CHECK(identity&&receipt.matched==RW*RH);
+    return 0;
+}
+
 int verdict_logic()
 {
     // 30 agreeing frames: identity; 30 mismatching: holding; 30 agreeing: identity again.
@@ -757,7 +810,7 @@ float4 copy(V v):SV_Target{return image.SampleLevel(s,v.uv,0);})";
 }
 } // namespace
 
-int main()
+int main(int argc,char** argv)
 {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     ComPtr<ID3D12Debug> debug;
@@ -776,7 +829,9 @@ int main()
     if(immediate)immediate->RegisterMessageCallback([](D3D12_MESSAGE_CATEGORY,D3D12_MESSAGE_SEVERITY severity,D3D12_MESSAGE_ID,const char* text,void*){
         if(severity<=D3D12_MESSAGE_SEVERITY_ERROR)std::printf("DX12 ERROR: %s\n",text);
     },D3D12_MESSAGE_CALLBACK_FLAG_NONE,nullptr,&callback);
-    if (end_to_end(d)||mixed_canvas(d)||mixed_canvas(d,true)) return 1;
+    if(menu_probe_without_reconstruction(d)||menu_probe_without_reconstruction(d,true))return 1;
+    if(!(argc>1&&std::strcmp(argv[1],"--menu-probe")==0))
+        if (end_to_end(d)||mixed_canvas(d)||mixed_canvas(d,true)) return 1;
     if (info) {
         UINT errors = 0;
         for (UINT64 i = 0; i < info->GetNumStoredMessagesAllowedByRetrievalFilter(); ++i) {
