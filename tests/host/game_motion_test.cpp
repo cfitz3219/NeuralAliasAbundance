@@ -17,7 +17,7 @@
 using Microsoft::WRL::ComPtr;
 using namespace na::j2::game_motion;
 namespace {
-constexpr uint32_t W = 128, H = 80, kSlotsInFlight = 4;
+constexpr uint32_t W = 256, H = 160, kSlotsInFlight = 4;
 constexpr float DX = 3.5f, DY = -1.0f;
 uint16_t half(float f)
 {
@@ -31,7 +31,7 @@ uint16_t half(float f)
     return static_cast<uint16_t>(sign | (exp << 10) | (mant >> 13));
 }
 float pattern(float x, float y) { return 0.5f + 0.25f * std::sin(x * 0.37f) * std::cos(y * 0.29f) + 0.2f * std::sin((x + 2 * y) * 0.11f); }
-bool on_block(float x, float y, float t) { const float ox = x - t * DX, oy = y - t * DY; return ox >= 30 && ox < 80 && oy >= 25 && oy < 60; }
+bool on_block(float x, float y, float t) { const float ox = x - t * DX, oy = y - t * DY; return ox >= 40 && ox < 180 && oy >= 30 && oy < 120; // ~600 samples on the GPU's stride-4 grid (decider needs 256) }
 float picture(uint32_t x, uint32_t y, float t)
 {
     const float fx = static_cast<float>(x) + 0.5f, fy = static_cast<float>(y) + 0.5f;
@@ -159,7 +159,7 @@ int main()
             REQUIRE(SUCCEEDED(rig.rb->Map(0, nullptr, reinterpret_cast<void**>(&p))));
             auto at = [&](uint32_t x, uint32_t y, int k) { float v; std::memcpy(&v, p + rig.mfp.Offset + y * rig.mfp.Footprint.RowPitch + x * 8 + k * 4, 4); return v; };
             const float t = rig.last_t;
-            const uint32_t bx = static_cast<uint32_t>(55 + t * DX), by = static_cast<uint32_t>(42 + t * DY);
+            const uint32_t bx = static_cast<uint32_t>(110 + t * DX), by = static_cast<uint32_t>(75 + t * DY);
             std::printf("block pixel (%u,%u): %.3f %.3f; wall (5,5): %.3f %.3f\n", bx, by, at(bx, by, 0), at(bx, by, 1), at(5, 5, 0), at(5, 5, 1));
             CHECK(std::fabs(at(bx, by, 0) + DX) < 0.02f && std::fabs(at(bx, by, 1) + DY) < 0.02f); // previous - current
             CHECK(at(5, 5, 0) == 0.f && at(5, 5, 1) == 0.f);
