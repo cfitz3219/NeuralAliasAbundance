@@ -82,8 +82,6 @@ bool FromFrame(const abundance::Frame& f, const FrameResources& r, Quality q, Ev
         std::snprintf(buf, sizeof(buf), "%s", v.reason.c_str());
         return fail(buf);
     }
-    if (f.color_space == abundance::ColorSpace::srgb_sdr)
-        return fail("DLSS needs linear colour; this frame's colour is display-encoded (sRGB).");
     EvalDesc d;
     d.color = r.color;
     d.depth = r.depth;
@@ -104,7 +102,10 @@ bool FromFrame(const abundance::Frame& f, const FrameResources& r, Quality q, Ev
         d.mv_scale_y = static_cast<float>(f.motion.extent.height);
     }
     d.mv_jittered = !f.motion_excludes_jitter; // validate_inputs requires excludes_jitter today
-    d.hdr = f.color_space == abundance::ColorSpace::linear_hdr;
+    // NGX's HDR flag selects linear-light processing, not whether the monitor
+    // is HDR. The NVIDIA guide accepts sRGB/gamma LDR with IsHDR clear, and
+    // requires IsHDR for linear input (including linear SDR values <= 1).
+    d.hdr = f.color_space != abundance::ColorSpace::srgb_sdr;
     d.auto_exposure = r.exposure == nullptr;
     d.depth_inverted = r.depth_inverted;
     d.reset = v.reset;

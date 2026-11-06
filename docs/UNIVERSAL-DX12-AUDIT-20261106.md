@@ -70,8 +70,8 @@ of a pre-existing game/runtime crash and is not counted as a product fix.
 Removed `nis_sharpen.cpp/.hpp`, the `RecordNisForTests` wrapper/global/shutdown
 code, and its test/target. The header already described this as reference/test
 code. No live slider called it: RCAS replaced the old stacked sharpening stage.
-This removes 501 lines in those three deleted files plus their wiring, compiled
-shader text and obsolete test surface. This is a size/maintenance cleanup, not
+This removes 501 lines in those three deleted files plus their wiring, shader
+source text and obsolete test surface. This is a source/maintenance cleanup, not
 a claimed live GPU performance gain from a pass that was already unused.
 
 The separate NIS spatial scaler and its upstream notices remain: native-picture
@@ -129,6 +129,19 @@ implementation forwards to system DXGI only when the application calls it;
 older systems return a missing-function HRESULT. NeuralAlias does not call it
 to change refresh behavior. Existing proxy loading/factory/present/resize tests
 also check the export. See [Microsoft's function contract](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_6/nf-dxgi1_6-dxgidisablevblankvirtualization).
+
+### Correct the generic frame converter's colour contract
+
+The `FromFrame` helper rejected all sRGB SDR inputs as unsupported, while sending
+linear SDR through NGX's LDR mode. NVIDIA's guide explicitly accepts gamma/sRGB
+LDR, and warns against linear colour in LDR processing. The converter now accepts
+sRGB SDR with IsHDR clear, and selects linear processing for both linear HDR and
+linear SDR. Unknown encoding remains unknown. Regressions cover all three known
+encodings and unknown encoding, without changing the frozen FrameContract.
+See [NVIDIA's DLSS programming guide, colour input requirements](https://raw.githubusercontent.com/NVIDIA/DLSS/main/doc/DLSS_Programming_Guide_Release.pdf).
+There are currently no shipping call sites of this helper outside its tests;
+J2/interceptors build EvalDesc directly. This fixes the reusable conversion API,
+not a claimed explanation for the current game's softness or a live quality win.
 
 ## What still prevents an arbitrary-game promise
 
