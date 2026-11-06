@@ -2708,6 +2708,7 @@ void make_pso_twins(IUnknown* pso, const void* rs, Make make, RecipeFn&& recipe_
     // replaced sets (if any) are released outside g_m
 }
 
+void replay_note_pipeline(ID3D12Device* dev, IUnknown* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d); // Draw replay (below)
 HRESULT STDMETHODCALLTYPE D_CreateGraphicsPipelineState(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, REFIID riid, void** out)
 {
     const CostScope cost(kCostPso, !t_host_work);
