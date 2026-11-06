@@ -18,7 +18,7 @@
 // from %LOCALAPPDATA%\NeuralAlias\NeuralAliasSL.ini.
 namespace na::settings {
 namespace {
-#define NA_PERSISTED_FIELDS(F) F(experimental_nvrhi) F(donut_tone) F(donut_bloom) F(donut_amount) F(donut_bias) F(donut_white) F(donut_speed_up) F(donut_speed_down) F(donut_curve) F(donut_bloom_amount) F(donut_bloom_sigma) F(donut_bloom_threshold) F(xegtao_enabled) F(xegtao_amount) F(xegtao_quality) F(xegtao_radius_x1000) F(xegtao_denoise) F(xegtao_radius_multiplier) F(xegtao_falloff) F(xegtao_sample_distribution) F(xegtao_thin_occluder) F(xegtao_final_power) F(xegtao_depth_mip_offset) F(enabled) F(dlss_mode) F(follow_game_resolution) F(preset) F(rr_preset) F(text_bold) F(win_x) F(win_y) F(win_w) F(win_h) F(nr_enabled) F(nr_intensity) F(nr_structure) F(nr_tone) F(nr_skin) F(nr_paper_white) F(nr_hdr_mode) F(nr_model) F(motion_enabled) F(motion_grid) F(motion_perf) F(motion_downscale) F(j2_sharpness) F(j2_hud_nis) F(j2_scale_mode) F(j2_preset) F(j2_mip_bias_x100) F(reflex_mode) F(fg_enabled) F(fg_mode) F(fg_preset) F(fg_multiplier) F(fg_target_fps) F(fg_frozen_at) F(fg_profile_override) F(native_fg_mode) F(native_fg_frames)
+#define NA_PERSISTED_FIELDS(F) F(experimental_nvrhi) F(donut_bloom) F(donut_amount) F(donut_bias) F(donut_white) F(donut_speed_up) F(donut_speed_down) F(donut_curve) F(donut_bloom_amount) F(donut_bloom_sigma) F(donut_bloom_threshold) F(xegtao_enabled) F(xegtao_amount) F(xegtao_quality) F(xegtao_radius_x1000) F(xegtao_denoise) F(xegtao_radius_multiplier) F(xegtao_falloff) F(xegtao_sample_distribution) F(xegtao_thin_occluder) F(xegtao_final_power) F(xegtao_depth_mip_offset) F(enabled) F(dlss_mode) F(follow_game_resolution) F(preset) F(rr_preset) F(text_bold) F(win_x) F(win_y) F(win_w) F(win_h) F(nr_enabled) F(nr_intensity) F(nr_structure) F(nr_tone) F(nr_skin) F(nr_paper_white) F(nr_hdr_mode) F(nr_model) F(motion_enabled) F(motion_grid) F(motion_perf) F(motion_downscale) F(j2_sharpness) F(j2_hud_nis) F(j2_scale_mode) F(j2_preset) F(j2_mip_bias_x100) F(reflex_mode) F(fg_enabled) F(fg_mode) F(fg_preset) F(fg_multiplier) F(fg_target_fps) F(fg_frozen_at) F(fg_profile_override) F(native_fg_mode) F(native_fg_frames)
 Settings g_settings;
 Settings g_loaded_values;
 std::atomic<bool> g_nr_user_touched{false};
@@ -99,7 +99,7 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
     if(&target==&g_settings)SetNrEnabled(nr,only_if_present?NrWriteSource::UserIni:NrWriteSource::DefaultIni);
     else target.nr_enabled.store(nr?1u:0u);
     target.experimental_nvrhi.store(GetPrivateProfileIntW(L"experimental",L"nvrhi",0,ini)?1u:0u);
-    target.donut_tone.store((std::clamp)(GetPrivateProfileIntW(L"donut",L"tone",0,ini),0u,1u));
+    target.donut_tone.store(0); /* adaptive tone mapping removed 2026-11-06 (Cort); an old tone=1 is ignored */
     target.donut_bloom.store((std::clamp)(GetPrivateProfileIntW(L"donut",L"bloom",0,ini),0u,1u));
     target.donut_amount.store((std::clamp)(GetPrivateProfileIntW(L"donut",L"amount",100,ini),0u,100u));
     target.donut_bias.store((std::clamp)(GetPrivateProfileIntW(L"donut",L"exposure",800,ini),0u,1600u));
@@ -351,7 +351,6 @@ bool SaveFromWorker()
     swprintf_s(v,L"%u",g_settings.experimental_nvrhi.load());
     ok &= WritePrivateProfileStringW(L"experimental",L"nvrhi",v,ini)!=0;
     const struct { const wchar_t* key; uint32_t value; } donut[] = {
-        {L"tone",g_settings.donut_tone.load()},
         {L"bloom",g_settings.donut_bloom.load()},
         {L"amount",g_settings.donut_amount.load()},
         {L"exposure",g_settings.donut_bias.load()}, /* was "bias" (absolute exposure, default -0.5 stops) until 2026-11-05 */

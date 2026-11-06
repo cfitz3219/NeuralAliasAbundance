@@ -1198,7 +1198,7 @@ void DrawLiveDlaaEnhancements()
         for (int i = 0; i < 3; ++i) if (kDetailX100[i] == cur) idx = i;
         const auto ml = na::observe::GetMipLiveStats();
         const bool live = ml.enabled;
-        BeginRow("Texture detail", "Samples surface textures sharper so DLAA can rebuild their full detail (NVIDIA's DLSS guide recommends -1 at native resolution). Very fine patterns such as fabric weaves can shimmer at -1; Light is gentler. Screen effects are never changed. Switches live (from the next frame); remembered for this game.", S(220));
+        BeginRow("Texture detail", "Samples surface textures sharper so DLAA can rebuild their full detail (NVIDIA's DLSS guide recommends -1 at native resolution). The value is the total, the game's own bias included: if the game already uses -1, nothing more is added. Very fine patterns such as fabric weaves can shimmer at -1; Light is gentler. Screen effects are never changed. Switches live; every level is prepared in the background shortly after loading, so later switches are immediate. Remembered for this game.", S(220));
         ImGui::SetNextItemWidth(S(220));
         // Render-small DLSS modes set it automatically (NVIDIA: -1 + log2(render/output)):
         // greyed out, showing the value for the current mode. DLAA keeps the menu's choice.
@@ -1385,7 +1385,39 @@ void DrawDlssDebug()
 } // namespace
 
 static void DrawExperimentalGpu();
-static void DrawDonutLighting();
+static void DrawDonutLighting()
+{
+    using namespace na::ui;
+    // Adaptive tone mapping was removed on Cort's order (2026-11-06: "not helpful or useful to
+    // our core purpose"). Only Bloom remains here; the tone setting is no longer shown, read or saved.
+    auto& s=na::settings::Get();bool bloom=s.donut_bloom.load()!=0;
+    // BeginRow pushes the row label as an ID, so the popup ID is taken outside the row: an
+    // OpenPopup("...") inside it named a different popup than BeginPopupModal below, and the
+    // button did nothing (Cort 2026-11-05).
+    const ImGuiID bloom_popup=ImGui::GetID("Bloom settings");
+    BeginRow("Bloom","Adds an adjustable soft glow around bright scene details.",S(220));
+    if(ImGui::Checkbox("##donutbloom",&bloom)){s.donut_bloom=bloom;na::settings::Save();}
+    ImGui::SameLine();if(Button("Bloom settings..."))ImGui::OpenPopup(bloom_popup);EndRow();
+    if(bloom){const auto status=na::donut::ScenePass().GetStats();char activity[224];
+        std::snprintf(activity,sizeof activity,"%s Processed %llu scenes.",status.reason,static_cast<unsigned long long>(status.recorded));Hint(activity);}
+    bool open=true;ImGui::SetNextWindowSize(ImVec2(S(580),0),ImGuiCond_Appearing);
+    if(!ImGui::BeginPopupModal("Bloom settings",&open,ImGuiWindowFlags_AlwaysAutoResize))return;
+    bool changed=false;
+    const auto title=[&](const char* name,const char* tip){ImGui::TextUnformatted(name);if(ImGui::IsItemHovered())ImGui::SetTooltip("%s",tip);ImGui::SameLine(S(220));ImGui::SetNextItemWidth(S(310));};
+    const auto scalar=[&](const char* name,const char* tip,const char* id,std::atomic<uint32_t>& field,float lo,float hi){
+        title(name,tip);float v=field.load()*.001f;if(ImGui::SliderFloat(id,&v,lo,hi,"%.2f")){field=uint32_t(v*1000+.5f);changed=true;}};
+    if(ImGui::Checkbox("Bloom",&bloom)){s.donut_bloom=bloom;changed=true;}
+    scalar("Glow amount","Sets the added glow; zero leaves scene colour unchanged.","##bloomamount",s.donut_bloom_amount,0,1);
+    scalar("Glow radius","Spreads light over a wider or narrower area, in scene pixels.","##bloomsigma",s.donut_bloom_sigma,4,64);
+    scalar("Glow threshold","How much brighter than the scene's average a spot must be to glow (1 = about 5x the average).","##bloomthreshold",s.donut_bloom_threshold,0,20);
+    if(Button("Reset bloom defaults")){s.donut_bloom_amount=100;s.donut_bloom_sigma=16000;s.donut_bloom_threshold=1000;changed=true;}
+    if(changed)na::settings::Save();
+    const auto stats=na::donut::ScenePass().GetStats();
+    if(bloom)Hint(stats.reason);else Hint("Bloom is off. No effect work is submitted.");
+    Hint("Settings apply live. The game's own final colour processing remains active.");
+    ImGui::EndPopup();
+}
+
 static void DrawAmbientOcclusion();
 
 void RegisterLiveDlaaMenu()
@@ -1429,45 +1461,33 @@ static void DrawExperimentalGpu()
 static void DrawDonutLighting()
 {
     using namespace na::ui;
-    auto& s=na::settings::Get();bool tone=s.donut_tone.load()!=0,bloom=s.donut_bloom.load()!=0;
+    // Adaptive tone mapping was removed on Cort's order (2026-11-06: "not helpful or useful to
+    // our core purpose"). Only Bloom remains here; the tone setting is no longer shown, read or saved.
+    auto& s=na::settings::Get();bool bloom=s.donut_bloom.load()!=0;
     // BeginRow pushes the row label as an ID, so the popup ID is taken outside the row: an
     // OpenPopup("...") inside it named a different popup than BeginPopupModal below, and the
     // button did nothing (Cort 2026-11-05).
-    const ImGuiID lighting_popup=ImGui::GetID("Lighting settings");
-    BeginRow("Adaptive tone mapping","Adjusts scene brightness and highlight contrast before the game's final colour processing.",S(220));
-    if(ImGui::Checkbox("##donuttone",&tone)){s.donut_tone=tone;na::settings::Save();}
-    ImGui::SameLine();if(Button("Lighting settings..."))ImGui::OpenPopup(lighting_popup);EndRow();
-    BeginRow("Bloom","Adds an adjustable soft glow around bright scene details.",SwitchWidth());
-    if(ImGui::Checkbox("##donutbloom",&bloom)){s.donut_bloom=bloom;na::settings::Save();}EndRow();
-    if(tone||bloom){const auto status=na::donut::ScenePass().GetStats();char activity[224];
+    const ImGuiID bloom_popup=ImGui::GetID("Bloom settings");
+    BeginRow("Bloom","Adds an adjustable soft glow around bright scene details.",S(220));
+    if(ImGui::Checkbox("##donutbloom",&bloom)){s.donut_bloom=bloom;na::settings::Save();}
+    ImGui::SameLine();if(Button("Bloom settings..."))ImGui::OpenPopup(bloom_popup);EndRow();
+    if(bloom){const auto status=na::donut::ScenePass().GetStats();char activity[224];
         std::snprintf(activity,sizeof activity,"%s Processed %llu scenes.",status.reason,static_cast<unsigned long long>(status.recorded));Hint(activity);}
     bool open=true;ImGui::SetNextWindowSize(ImVec2(S(580),0),ImGuiCond_Appearing);
-    if(!ImGui::BeginPopupModal("Lighting settings",&open,ImGuiWindowFlags_AlwaysAutoResize))return;
+    if(!ImGui::BeginPopupModal("Bloom settings",&open,ImGuiWindowFlags_AlwaysAutoResize))return;
     bool changed=false;
-    if(ImGui::Checkbox("Adaptive tone mapping",&tone)){s.donut_tone=tone;changed=true;}
     const auto title=[&](const char* name,const char* tip){ImGui::TextUnformatted(name);if(ImGui::IsItemHovered())ImGui::SetTooltip("%s",tip);ImGui::SameLine(S(220));ImGui::SetNextItemWidth(S(310));};
     const auto scalar=[&](const char* name,const char* tip,const char* id,std::atomic<uint32_t>& field,float lo,float hi){
         title(name,tip);float v=field.load()*.001f;if(ImGui::SliderFloat(id,&v,lo,hi,"%.2f")){field=uint32_t(v*1000+.5f);changed=true;}};
-    title("Amount","Blends between the original scene and the adjusted tone curve.");int amount=int(s.donut_amount.load());
-    if(ImGui::SliderInt("##toneamount",&amount,0,100,"%d%%")){s.donut_amount=amount;changed=true;}
-    title("Exposure","Brightens or darkens the scene in photographic stops; 0 keeps the game's own brightness.");float bias=(int(s.donut_bias.load())-800)*.01f;
-    if(ImGui::SliderFloat("##tonebias",&bias,-8,8,"%.2f stops")){s.donut_bias=uint32_t((bias+8)*100+.5f);changed=true;}
-    title("Highlight curve","Donut preserves luminance ratios; Filmic uses Falcor's fitted highlight curve.");
-    int curve=int(s.donut_curve.load());const char* curves[]={"Donut","Filmic (Falcor)"};
-    if(ImGui::Combo("##tonecurve",&curve,curves,2)){s.donut_curve=curve;changed=true;}
-    scalar("White point","Controls the highlight shoulder of the Donut curve.","##tonewhite",s.donut_white,.1f,20);
-    scalar("Adaptation up","Controls reaction speed when gradual eye adaptation is available.","##toneup",s.donut_speed_up,0,20);
-    scalar("Adaptation down","Controls settling speed when gradual eye adaptation is available.","##tonedown",s.donut_speed_down,0,20);
-    ImGui::Separator();if(ImGui::Checkbox("Bloom",&bloom)){s.donut_bloom=bloom;changed=true;}
+    if(ImGui::Checkbox("Bloom",&bloom)){s.donut_bloom=bloom;changed=true;}
     scalar("Glow amount","Sets the added glow; zero leaves scene colour unchanged.","##bloomamount",s.donut_bloom_amount,0,1);
     scalar("Glow radius","Spreads light over a wider or narrower area, in scene pixels.","##bloomsigma",s.donut_bloom_sigma,4,64);
     scalar("Glow threshold","How much brighter than the scene's average a spot must be to glow (1 = about 5x the average).","##bloomthreshold",s.donut_bloom_threshold,0,20);
-    if(Button("Reset lighting defaults")){s.donut_amount=100;s.donut_bias=800;s.donut_white=3000;s.donut_speed_up=1000;s.donut_speed_down=500;
-        s.donut_curve=0;s.donut_bloom_amount=100;s.donut_bloom_sigma=16000;s.donut_bloom_threshold=1000;changed=true;}
+    if(Button("Reset bloom defaults")){s.donut_bloom_amount=100;s.donut_bloom_sigma=16000;s.donut_bloom_threshold=1000;changed=true;}
     if(changed)na::settings::Save();
     const auto stats=na::donut::ScenePass().GetStats();
-    if(tone||bloom)Hint(stats.reason);else Hint("Both effects are off. No effect work is submitted.");
-    Hint("Settings apply live. These are additional scene adjustments; the game's own final colour processing remains active.");
+    if(bloom)Hint(stats.reason);else Hint("Bloom is off. No effect work is submitted.");
+    Hint("Settings apply live. The game's own final colour processing remains active.");
     ImGui::EndPopup();
 }
 

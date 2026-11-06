@@ -1199,8 +1199,11 @@ void write_status_line()
                 (unsigned long long)j2.labelled_frames, (unsigned long long)j2.unlabelled_frames, (unsigned long long)j2.expired_inline,
                 (unsigned long long)j2.between_observed, (unsigned long long)j2.between_predicted, j2.class_note);
             if (na2 > 0) WriteFile(f, al, static_cast<DWORD>((std::min)(na2, static_cast<int>(sizeof al - 1))), &written, nullptr);
-            const int en=snprintf(al,sizeof al,"j2_entry keys=%u matched=%llu source=actual_operation rejected{new=%llu learning=%llu middle=%llu} rescued_by_boundary=%llu\r\n",j2.entry_keys,(unsigned long long)j2.entry_matched,
-                (unsigned long long)j2.entry_unknown,(unsigned long long)j2.entry_learning,(unsigned long long)j2.entry_middle,(unsigned long long)j2.entry_rescued);
+            const int en=snprintf(al,sizeof al,"j2_entry keys=%u matched=%llu source=actual_operation rejected{new=%llu learning=%llu middle=%llu} rescued_by_boundary=%llu rescue_fail{learned=%llu res=%llu writer=%llu occ=%llu tr=%llu cand=%llu dst=%llu pso=%llu pending=%llu} last{%s}\r\n",j2.entry_keys,(unsigned long long)j2.entry_matched,
+                (unsigned long long)j2.entry_unknown,(unsigned long long)j2.entry_learning,(unsigned long long)j2.entry_middle,(unsigned long long)j2.entry_rescued,
+                (unsigned long long)j2.rescue_fail[0],(unsigned long long)j2.rescue_fail[1],(unsigned long long)j2.rescue_fail[2],(unsigned long long)j2.rescue_fail[3],
+                (unsigned long long)j2.rescue_fail[4],(unsigned long long)j2.rescue_fail[5],(unsigned long long)j2.rescue_fail[6],(unsigned long long)j2.rescue_fail[7],
+                (unsigned long long)j2.rescue_fail[8],j2.rescue_note);
             if(en>0)WriteFile(f,al,static_cast<DWORD>(en),&written,nullptr);
             {
                 // Burst diagnosis (2026-11-05): every distinct reason given, with counts, and
@@ -1255,13 +1258,13 @@ void write_status_line()
         char ml_line[520];
         // chosen = menu/saved; in_use = what recordings bind (differs while preparing);
         // changed_static = the game's static samplers changed in the twins in use (the proof).
-        const int mn = snprintf(ml_line, sizeof ml_line, "mip_live enabled=%u chosen=%.2f/af%u in_use=%.2f/af%u preparing=%u (%llu/%llu) changed_static=%llu game=%.2f twin_rs=%llu twin_pso=%llu untwinned_pso=%llu fallbacks=%llu twin_failures=%llu bound{pso_twin=%llu pso_game=%llu rs_twin=%llu rs_game=%llu}\r\n",
+        const int mn = snprintf(ml_line, sizeof ml_line, "mip_live enabled=%u chosen=%.2f/af%u in_use=%.2f/af%u preparing=%u (%llu/%llu) changed_static=%llu game=%.2f twin_rs=%llu twin_pso=%llu untwinned_pso=%llu fallbacks=%llu twin_failures=%llu bound{pso_twin=%llu pso_game=%llu rs_twin=%llu rs_game=%llu} warmed=%llu\r\n",
                                 ml.enabled ? 1u : 0u, ml.want_bias, ml.want_aniso, ml.live_bias, ml.live_aniso, ml.preparing ? 1u : 0u,
                                 (unsigned long long)ml.prepare_done, (unsigned long long)ml.prepare_total, (unsigned long long)ml.live_static_changed,
                                 ml.game_bias, (unsigned long long)ml.twin_root_signatures,
                                 (unsigned long long)ml.twin_pipelines, (unsigned long long)ml.untwinned_pipelines, (unsigned long long)ml.fallbacks,
                                 (unsigned long long)ml.twin_failures, (unsigned long long)ml.bound_pso_twin, (unsigned long long)ml.bound_pso_game,
-                                (unsigned long long)ml.bound_rs_twin, (unsigned long long)ml.bound_rs_game);
+                                (unsigned long long)ml.bound_rs_twin, (unsigned long long)ml.bound_rs_game, (unsigned long long)ml.warmed_levels);
         if (mn > 0) WriteFile(f, ml_line, static_cast<DWORD>((std::min)(mn, static_cast<int>(sizeof(ml_line)-1))), &written, nullptr);
     }
     const auto latency = na::latency::GetStats();

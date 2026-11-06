@@ -159,6 +159,7 @@ DWORD WINAPI InitThread(LPVOID)
         // objects, before activation, so the saved choice works from the first frame it is
         // activated; any other choice is prepared in the background when picked.
         na::observe::SetSamplerMipBiasLiveEnabled(!na::settings::SafeStart() && GetPrivateProfileIntW(L"j2", L"mip_bias_live", 1, g_ini) != 0);
+        na::observe::SetSamplerMipPrewarm(GetPrivateProfileIntW(L"j2", L"mip_prewarm", 1, g_ini) != 0);
         if (!na::settings::SafeStart()) {
             const auto& st = na::settings::Get();
             const float user = static_cast<float>(st.j2_mip_bias_x100.load()) / 100.f;

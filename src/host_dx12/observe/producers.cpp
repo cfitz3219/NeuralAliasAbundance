@@ -1513,6 +1513,12 @@ constexpr int kMipCount = 6;
 constexpr float kMipLevels[kMipCount] = {0.0f, -0.5f, -1.0f, -1.5849625f, -2.0f, -2.25f};
 constexpr uint32_t kAfLevels[4] = {0, 4, 8, 16};
 std::atomic<uint32_t> g_mip_level_mask{0x7u}; // levels built at creation (bit i = kMipLevels[i])
+// Background warm-up (Cort 2026-11-06: "mip does nothing"; a choice not built at load took
+// 25-30 s, so a quick A/B never switched). After the chosen level is live, the worker builds the
+// menu's levels (0, -0.5, -1) and the DLSS modes' automatic levels at the in-use filtering, one
+// at a time at below-normal priority, so a later switch is immediate. [j2] mip_prewarm=0 = off.
+std::atomic<bool> g_mip_prewarm{true};
+std::atomic<uint64_t> g_mip_warmed{0}; // levels completed by warm-up (statistics)
 std::atomic<int> g_pre_af{0};              // anisotropic index built at creation (the saved one)
 // Variants packed as level | af << 4; 0 = the game's own objects.
 std::atomic<uint32_t> g_var_want{0};       // chosen (menu / saved activation)
@@ -1601,11 +1607,13 @@ bool apply_aniso(SD& d)
 // with a neutral or positive native bias gets NVIDIA's NativeBias + target; one
 // the game already biases negative is brought to `target` at most and never
 // past it (no stacking -1 on top of the game's own sharpening).
+// Total-bias rule (Cort 2026-11-06): our choice is the TOTAL bias the texture ends up with, the
+// game's own included: game 0 -> -1, game -1 -> -1 (ours adds 0), game +0.5 -> -1. A sampler the
+// game already biases further than the target keeps its own (never made blurrier).
 float biased(float native, float target)
 {
     if (target == 0.0f) return native;
-    if (native >= 0.0f) return clamp_lod(native + target);
-    return native < target ? native : target;
+    return native < target ? native : clamp_lod(target);
 }
 // The anisotropic part of a variant (no counters): as apply_aniso, at an explicit level.
 template <typename SD>
@@ -6772,7 +6780,31 @@ void variant_worker()
             }
         }
         if (aborted) continue;
-        if (refill) { std::this_thread::sleep_for(std::chrono::seconds(1)); continue; } // never spin on stragglers
+        if (refill) {
+            // Idle: warm the other selectable levels (see g_mip_prewarm) so a switch is immediate.
+            // fill_pass gives up as soon as a new choice arrives; the loop above then serves it.
+            if (v && g_mip_live_enabled.load(std::memory_order_relaxed) && g_mip_prewarm.load(std::memory_order_relaxed)) {
+                const int af = var_af(v);
+                const uint32_t levels = (0x7u | g_mip_level_mask.load(std::memory_order_relaxed)) & ~(af == 0 ? 1u : 0u);
+                for (int level = 0; level < kMipCount; ++level) {
+                    if (!(levels >> level & 1u) || level == var_level(v)) continue;
+                    bool built_any = false, stop = false;
+                    for (int pass = 0; pass < 6; ++pass) {
+                        const size_t found = fill_pass(level, af, v);
+                        if (found == SIZE_MAX || g_process_exiting.load(std::memory_order_acquire)) { stop = true; break; }
+                        if (!found) break;
+                        built_any = true;
+                    }
+                    if (stop) break;
+                    if (built_any) g_mip_warmed.fetch_add(1, std::memory_order_relaxed);
+                }
+                // the in-use level's own counters for the menu/status line
+                g_var_total.store(0, std::memory_order_relaxed);
+                g_var_done.store(0, std::memory_order_relaxed);
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            continue;
+        } // never spin on stragglers
         {
             std::lock_guard<std::mutex> lk(g_var_m);
             if (g_var_want.load(std::memory_order_relaxed) == v) {
@@ -6807,6 +6839,7 @@ void SetSamplerMipBias(float bias)
 float SamplerMipBias() { return kMipLevels[var_level(g_var_want.load(std::memory_order_relaxed))]; }
 void SetSamplerMipBiasLive(float bias) { SetSamplerMipBias(bias); }
 void SetSamplerMipBiasLiveEnabled(bool on) { g_mip_live_enabled.store(on, std::memory_order_relaxed); }
+void SetSamplerMipPrewarm(bool on) { g_mip_prewarm.store(on, std::memory_order_relaxed); }
 void SetSamplerMipLevelsWanted(const float* biases, int n)
 {
     uint32_t mask = 0;
@@ -6844,6 +6877,7 @@ MipLiveStats GetMipLiveStats()
     m.bound_rs_game = g_mip_bound_rs_game.load(std::memory_order_relaxed);
     m.twin_failures = g_mip_twin_fail.load(std::memory_order_relaxed);
     m.shared_skips = g_mip_shared_skips.load(std::memory_order_relaxed);
+    m.warmed_levels = g_mip_warmed.load(std::memory_order_relaxed);
     return m;
 }
 void NativeMipBiases(NativeBiasStats* s)

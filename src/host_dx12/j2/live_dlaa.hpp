@@ -314,6 +314,11 @@ struct Stats {
     char class_note[200] = {};            // latest consumer class not accepted (explains a missed frame)
     uint64_t entry_matched=0;
     uint64_t entry_unknown=0,entry_learning=0,entry_middle=0;
+    // Why a refused entry was NOT rescued (2026-11-06: rescued stayed at 2 through every 40 s
+    // burst): no_learned, resource, writer, occurrence, transition, candidate, destination,
+    // pipeline, pending (an earlier insertion not yet submitted); plus the last one in full.
+    uint64_t rescue_fail[9]={};
+    char rescue_note[240]={};
     uint64_t entry_rescued=0; // refused entries placed by the learned scene boundary instead (list-merge frames)
     uint32_t entry_keys=0;
     // SE5 2026-11-02 (Cort: flicker only while panning): every frame whose DLAA ran and was then

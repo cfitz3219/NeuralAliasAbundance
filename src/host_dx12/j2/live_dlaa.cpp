@@ -2819,7 +2819,27 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
                      : learned.decision.final_transition ? current.final_transition==learned.decision.final_transition
                                                          : current.candidates==learned.decision.final_candidate) &&
                 current.destination==learned.decision.destination && current.pipeline==learned.decision.pipeline;
-            if(!boundary || g.inl.valid)return;
+            if(!boundary || g.inl.valid){
+                // Name the first failing check (same order as the boundary matcher below).
+                uint32_t f=8;
+                if(!learned.decision.final_candidate||!learned.color)f=0;
+                else if(learned.color!=color_id||learned.depth!=depth_id)f=1;
+                else if(learned.decision.final_transition&&learned.decision.boundary_writer){
+                    if(current.boundary_writer!=learned.decision.boundary_writer)f=2;
+                    else if(current.writer_occurrence!=learned.decision.writer_occurrence)f=3;}
+                else if(learned.decision.final_transition){if(current.final_transition!=learned.decision.final_transition)f=4;}
+                else if(current.candidates!=learned.decision.final_candidate)f=5;
+                if(f==8&&current.destination!=learned.decision.destination)f=6;
+                if(f==8&&current.pipeline!=learned.decision.pipeline)f=7;
+                ++g.stats.rescue_fail[f];
+                std::snprintf(g.stats.rescue_note,sizeof g.stats.rescue_note,
+                    "fail=%u learned{writer=%llu occ=%u tr=%u cand=%u dst=%llu pso=%llu} actual{writer=%llu occ=%u tr=%u cand=%u writes=%u dst=%llu pso=%llu} entry{pso=%llu op=%u}",
+                    f,(unsigned long long)learned.decision.boundary_writer,learned.decision.writer_occurrence,learned.decision.final_transition,
+                    learned.decision.final_candidate,(unsigned long long)learned.decision.destination,(unsigned long long)learned.decision.pipeline,
+                    (unsigned long long)current.boundary_writer,current.writer_occurrence,current.final_transition,current.candidates,current.writes,
+                    (unsigned long long)current.destination,(unsigned long long)current.pipeline,(unsigned long long)entry->pipeline,static_cast<unsigned>(entry->op));
+                return;
+            }
             ++g.stats.entry_rescued;
         }
     } else {

@@ -273,6 +273,8 @@ StateLookup ListStateSub(ID3D12CommandList* list, na_object_id id, uint32_t sub,
 void SetSamplerMipBias(float bias);     // the effective choice (saved-setting activation)
 void SetSamplerMipBiasLive(float bias); // a menu change; same as SetSamplerMipBias
 void SetSamplerMipBiasLiveEnabled(bool on); // before the game creates its pipelines
+// Background warm-up of the other selectable levels once the chosen one is live ([j2] mip_prewarm).
+void SetSamplerMipPrewarm(bool on);
 // The biases most likely to be chosen (the saved choice and the DLSS modes' automatic
 // levels): their twins are built at creation, so switching to them is immediate.
 void SetSamplerMipLevelsWanted(const float* biases, int n);
@@ -287,6 +289,7 @@ struct MipLiveStats {
     uint64_t prepare_done = 0, prepare_total = 0; // objects of the last background preparation
     uint64_t live_static_changed = 0;   // static samplers changed in the twins of the variant in use
     uint64_t twin_root_signatures = 0, twin_pipelines = 0, untwinned_pipelines = 0, fallbacks = 0, twin_failures = 0;
+    uint64_t warmed_levels = 0; // levels the background warm-up completed (switches to them are immediate)
     uint64_t shared_skips = 0; // twins D3D12 returned as one of the game's own root signatures (identical bytes): not kept
     // Binds at record time (summed per recording at its next Reset): a twin went to the driver,
     // or the game's own object was kept (sampler-independent, or the twin is identical).
