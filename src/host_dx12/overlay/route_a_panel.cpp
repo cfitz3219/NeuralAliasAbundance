@@ -1048,6 +1048,13 @@ void DrawLiveDlaa()
         if (Button(lbl)) na::capture::j2::RequestTimestamped(n);
         ImGui::EndDisabled();
         EndRow();
+        {   // Draw-replay motion on/off (Cort 2026-11-06): live, remembered.
+            na::settings::Settings& rs = na::settings::Get();
+            bool replay = rs.j2_draw_replay.load() != 0;
+            BeginRow("Object motion (draw replay)", "Gives DLSS exact motion for moving characters and objects by replaying the game's own draws, the way a game with DLSS built in does. Fixes smearing on things that move while the camera stands still. Costs some GPU time. Applies at once.", S(220));
+            if (ImGui::Checkbox("##drawreplay", &replay)) { rs.j2_draw_replay.store(replay ? 1u : 0u); na::settings::Save(); }
+            EndRow();
+        }
         {   // Smear test: DLAA variants back to back, 8 captured frames each (Cort 2026-11-06).
             const bool running = na::j2::SmearTestRunning();
             BeginRow("Smear test", "About 20 seconds: DLAA runs in 7 variants one after another (normal, no motion, current frame only, no sharpening, DLSS preset L, the game's own motion, normal) and saves 8 frames of each. The picture changes while it runs; keep the view still. Shift + the capture key starts it too.", ButtonWidth("Start smear test"));

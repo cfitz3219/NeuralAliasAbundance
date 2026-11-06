@@ -395,6 +395,7 @@ bool SaveFromWorker()
     swprintf_s(v, L"%u", g_settings.aniso16.load());
     ok &= WritePrivateProfileStringW(L"j2", L"anisotropic", v, ini) != 0;
     ok &= WritePrivateProfileStringW(L"j2", L"jitter_sequence", g_settings.j2_jitter_r2.load() ? L"r2" : L"halton", ini) != 0;
+    ok &= WritePrivateProfileStringW(L"j2", L"draw_replay", g_settings.j2_draw_replay.load() ? L"1" : L"0", ini) != 0;
     {
         const uint32_t pv = g_settings.j2_preset.load();
         if (pv == 255) swprintf_s(v, L"auto");
