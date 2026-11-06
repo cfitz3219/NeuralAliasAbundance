@@ -5,6 +5,7 @@
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/camera_interloper.hpp"
 #include "host_dx12/j2/game_motion.hpp"
+#include "host_dx12/j2/replay_motion.hpp"
 #include <unordered_map>
 #include "host_dx12/capture/capture_session.hpp"
 #include "host_dx12/j2/msaa_resolve.hpp"
@@ -141,6 +142,9 @@ struct State {
     // The game's own motion texture, when one is proven against the picture (game_motion_decide.hpp).
     na::j2::game_motion::Feed game_motion;
     bool game_motion_ok = false;
+    na::j2::replay_motion::Pass replay;
+    bool replay_ok = false;
+    uint64_t replay_fed_frame = 0;
     bool game_motion_logged = false;
     int game_motion_used = -2;
     na::camera::CameraTracker tracker;
@@ -902,6 +906,7 @@ bool ensure_device(ID3D12CommandQueue* q)
     }
     g.arbiter_ok = g.arbiter.Init(dev.Get(), kRing);
     g.game_motion_ok = g.game_motion.Init(dev.Get(), kRing);
+    g.replay_ok = g.replay.Init(dev.Get());
     return true;
 }
 
@@ -1001,6 +1006,28 @@ void replay_probe_frame()
     const bool running = g.submitted_frame && g.frame <= g.submitted_frame + 2;
     static bool on = false;
     if (running != on) { on = running; na::observe::SetReplayProbe(on); if (on) na::observe::SetRasterStateTracking(true); }
+    // Draw replay capture: only while DLAA/upscaling runs (J2 takes and prepares a slot every frame)
+    // and [j2] draw_replay is on, so a stopped DLAA never costs the game a second vertex pass.
+    const bool replay = running && g.replay_ok && na::settings::Get().j2_draw_replay.load(std::memory_order_relaxed) != 0 && vpj_mode(); // matrix jitter would sit inside the clip positions (not removed yet)
+    na::observe::SetDrawReplay(replay);
+    {
+        static uint64_t next_log = 0, logs = 0;
+        if (replay && g.frame >= next_log) {
+            next_log = g.frame + (logs ? 600 : 120);
+            ++logs;
+            na::observe::DrawReplayStats d{};
+            na::observe::GetDrawReplayStats(&d);
+            const auto p = g.replay.GetStats();
+            na::eventlog::Emit("draw_replay", "noted=%llu built=%llu build_failed=%llu replayed=%llu verts=%llu not_ready=%llu twin_queued=%llu building=%llu twin_failed=%llu no_recipe=%llu hash_mismatch=%llu untwinned=%llu topology=%llu stages=%llu overflow=%llu | frames=%llu fed=%llu draws=%llu prev_draws=%llu exact=%llu loose=%llu unmatched=%llu raster_verts=%llu last_draws=%u last_pairs=%u fed_now=%d",
+                (unsigned long long)d.noted, (unsigned long long)d.built, (unsigned long long)d.build_failed, (unsigned long long)d.replayed,
+                (unsigned long long)d.vertices, (unsigned long long)d.not_ready, (unsigned long long)d.twin_queued, (unsigned long long)d.twin_building,
+                (unsigned long long)d.twin_failed, (unsigned long long)d.no_recipe, (unsigned long long)d.hash_mismatch, (unsigned long long)d.untwinned,
+                (unsigned long long)d.topology, (unsigned long long)d.stages, (unsigned long long)d.overflow,
+                (unsigned long long)p.frames, (unsigned long long)p.fed, (unsigned long long)p.draws, (unsigned long long)p.prev_draws,
+                (unsigned long long)p.matched_exact, (unsigned long long)p.matched_loose, (unsigned long long)p.unmatched, (unsigned long long)p.verts,
+                p.last_draws, p.last_pairs, g.replay_fed_frame + 2 >= g.frame ? 1 : 0);
+        }
+    }
     na::observe::ReplayProbeStats st{};
     if (!na::observe::ReplayProbeFrame(&st) || !on) return;
     auto& m = g_rp_sum;
@@ -2710,6 +2737,20 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
                 na::eventlog::Emit("game_motion", "%s %s", used != g.game_motion_used ? (used >= 0 ? "use" : "none") : "first", text);
                 g.game_motion_used = used;
                 if (gs.measured >= 64) g.game_motion_logged = true;
+            }
+        }
+        // Tier 1 from the game's own draws replayed with stream output (producers.cpp "Draw replay"):
+        // exact per-object motion where the game's motion texture is not in use. Taken every frame
+        // (it also prepares the next frame's slot), fed only when it matched draws.
+        if (g.replay_ok && !(saved && saved->at_present)) {
+            const float no_jitter[2] = {0.f, 0.f}; // viewport jitter: the clip positions carry none
+            const auto rm = g.replay.Record(l, g.depth32.Get(), rw, rh, reversed, cam.camera_cut || resize || g.resume_reset, no_jitter);
+            if (rm.motion && !in_tier1_fed && na::settings::Get().j2_draw_replay.load(std::memory_order_relaxed)) {
+                in_tier1_fed = true;
+                g.replay_fed_frame = g.frame;
+                in.tier1_motion = rm.motion;
+                in.tier1_valid = rm.valid;
+                in.tier1_valid_flag = true;
             }
         }
         if (smear_mode() == 1) { // smear test: no motion at all (identity reprojection, no other tier)
@@ -5672,6 +5713,7 @@ void Shutdown()
     na::j2::compute_flow::Reset();
     g.fence.Reset(); g.queue.Reset(); g.device.Reset();
     g.arbiter = na::motion::gpu::Arbiter{};
+    g.replay = na::j2::replay_motion::Pass{}; g.replay_ok = false;
     g.game_motion = na::j2::game_motion::Feed{}; g.game_motion_ok = false; g.game_motion_logged = false; g.game_motion_used = -2;
     g_dbg = DebugPass{};
     g_rcas = RcasPass{};
