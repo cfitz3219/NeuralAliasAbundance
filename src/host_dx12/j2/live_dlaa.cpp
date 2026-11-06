@@ -3473,7 +3473,8 @@ public:
             if(!na::observe::ListSceneSubresource(l,color,depth,&saved.color_sub,&saved.depth_sub))return;
             saved.native_states=na::observe::ListStateSub(l,color,saved.color_sub,&saved.color_state)==na::observe::StateLookup::Known&&
                 na::observe::ListStateSub(l,depth,saved.depth_sub,&saved.depth_state)==na::observe::StateLookup::Known;
-            saved.has_camera=find_camera(one,0,depth,&saved.vp,&saved.reversed);
+            saved.has_camera=find_camera(one,0,depth,&saved.vp,&saved.reversed,&saved.interlopers);
+            saved.judged=saved.has_camera;
             saved.injected=g_injected;saved.jitter[0]=g_injected?g.jit.px[0]:0;saved.jitter[1]=g_injected?g.jit.px[1]:0;
             g.native_scene=saved;
         }catch(...){}

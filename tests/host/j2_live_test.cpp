@@ -14,6 +14,7 @@
 #include "host_dx12/dlss/dlss_backend.hpp"
 #include "host_dx12/host_observe.h"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/nr/nr_pass.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/overlay/presenter.hpp"
 #include "host_dx12/j2/native_hud.hpp"
@@ -32,10 +33,13 @@ void __cdecl Sink(const na_event_batch*, void*) {}
 
 std::vector<ID3D12CommandList*> g_forwarded;
 ID3D12CommandQueue* g_queue = nullptr;
+void __stdcall RawForward(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists){q->ExecuteCommandLists(n,lists);}
 void __stdcall Forward(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists)
 {
     g_forwarded.assign(lists, lists + n);
-    q->ExecuteCommandLists(n, lists);
+    // Same mandatory forward seam as overlay::ForwardThroughNr, including when
+    // NR is disabled. It publishes real GPU completion for recording leases.
+    na::nr::Execute(q,n,lists,&RawForward);
 }
 
 using M = std::array<double, 16>;

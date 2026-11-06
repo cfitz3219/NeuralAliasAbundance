@@ -110,7 +110,8 @@ bool Start(int mode,const wchar_t* log_path){
             bool(found),found.setting,found.cache,found.active,found.context,found.tick,found.apply,found.full_w,found.full_h,found.scene_w,found.scene_h,found.upscale_setting,found.upscale_cache,found.reason);std::fclose(file);}}
     if(!found){note(found.reason);return false;}
     g.base=base;g.found=found;g.mode.store(mode>=0&&mode<=4?uint32_t(mode):0);
-    if(!na::hooking::BeginInstallWait("native render-scale control"))return false;
+    if(!na::hooking::Initialize()){note("Native settings hook could not initialize.");return false;}
+    if(!na::hooking::BeginInstallWait("native render-scale control")){na::hooking::Shutdown();return false;}
     if(!na::hooking::PrepareHook(base+found.apply,reinterpret_cast<void*>(&apply_hook),reinterpret_cast<void**>(&g.apply))||
        !na::hooking::PrepareHook(base+found.tick,reinterpret_cast<void*>(&tick_hook),reinterpret_cast<void**>(&g.tick))){na::hooking::AbandonInstall();return false;}
     if(!na::hooking::CommitInstall())return false;
