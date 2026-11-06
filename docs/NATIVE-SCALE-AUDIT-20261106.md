@@ -140,6 +140,16 @@ The fix is a new temporal pass:
 There is a new slider, "Temporal stability" (default 0.85; 0 = old behaviour). A
 test checks that edge flicker drops by more than half.
 
+Measured on Cort's captures (AO term before DLSS, /255):
+
+- Pan capture: edge flicker falls from 8.23 to 4.57, and swings of 32 or more fall
+  from 6.62% to 1.76%.
+- Still camera: edge flicker falls from 3.40 to 2.28.
+
+The 3x3 clamp is widened by half its range; that was variant C of the five tested.
+Removing the clamp entirely would gain a little more, but makes moving shadows lag
+32% more.
+
 A separate finding: the pan capture also shows two DLSS history resets mid-pan, and
 a few near-zero-motion frames. Either can cause edge shimmer without AO. Comparing
 with XeGTAO off during a pan would separate the two.
