@@ -1142,12 +1142,15 @@ void DrawLiveDlaaEnhancements()
         // Texture detail (negative mip bias, NVIDIA DLSS guide 3.5: -1 at native).
         // Live (no restarts): twins of the game's samplers; a choice not prepared at load is
         // built in the background and switches over when ready. Stored per game.
-        static const char* kDetail[] = {"Off (game's own)", "Light (-0.5)", "Standard (-1, NVIDIA)"};
-        static const int kDetailX100[] = {0, -50, -100};
+        static const char* kDetail[] = {"Off (game's own)", "Light (-0.5)", "Standard (-1, NVIDIA)", "Check: very blurry (+4)"};
+        static const int kDetailX100[] = {0, -50, -100, 400};
+        // The check level is never saved: while it is shown, the saved choice stays as it was.
+        static bool checking = false;
         na::settings::Settings& ss = na::settings::Get();
         const int cur = ss.j2_mip_bias_x100.load();
         int idx = 2;
         for (int i = 0; i < 3; ++i) if (kDetailX100[i] == cur) idx = i;
+        if (checking) idx = 3;
         const auto ml = na::observe::GetMipLiveStats();
         const bool live = ml.enabled;
         BeginRow("Texture detail", "Samples surface textures sharper so DLAA can rebuild their full detail (NVIDIA's DLSS guide recommends -1 at native resolution). The value is the total, the game's own bias included: if the game already uses -1, nothing more is added. Very fine patterns such as fabric weaves can shimmer at -1; Light is gentler. Screen effects are never changed. Switches live; every level is prepared in the background shortly after loading, so later switches are immediate. Remembered for this game.", S(220));
@@ -1165,10 +1168,13 @@ void DrawLiveDlaaEnhancements()
             ImGui::BeginDisabled();
             ImGui::Combo("##j2detail", &zero, one, 1);
             ImGui::EndDisabled();
-        } else if (ImGui::Combo("##j2detail", &idx, kDetail, 3)) {
-            ss.j2_mip_bias_x100.store(kDetailX100[idx]);
+        } else if (ImGui::Combo("##j2detail", &idx, kDetail, 4)) {
+            checking = idx == 3;
+            if (!checking) {
+                ss.j2_mip_bias_x100.store(kDetailX100[idx]);
+                na::settings::Save();
+            }
             na::observe::SetSamplerMipBiasLive(kDetailX100[idx] / 100.0f);
-            na::settings::Save();
         }
         EndRow();
         uint64_t ns = 0, nst = 0;

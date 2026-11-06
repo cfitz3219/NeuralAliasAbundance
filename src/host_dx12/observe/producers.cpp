@@ -200,9 +200,9 @@ struct Obj {
     // Never destroyed inside another D3D12 object's destruction: see ReleaseTwinsLater.
     // built[i]: level i was prepared (same or obj, or it failed: then neither and lookups fall back).
     struct Twins {
-        IUnknown* obj[6] = {}; bool same[6] = {}; bool built[6] = {};
+        IUnknown* obj[7] = {}; bool same[7] = {}; bool built[7] = {}; // = kMipCount
         Twins() = default;
-        Twins(const Twins& o) { for (int i = 0; i < 6; ++i) { obj[i] = o.obj[i]; same[i] = o.same[i]; built[i] = o.built[i]; if (obj[i]) obj[i]->AddRef(); } }
+        Twins(const Twins& o) { for (int i = 0; i < 7; ++i) { obj[i] = o.obj[i]; same[i] = o.same[i]; built[i] = o.built[i]; if (obj[i]) obj[i]->AddRef(); } }
         Twins& operator=(const Twins&) = delete;
         ~Twins() { for (auto* o : obj) if (o) o->Release(); }
     };
@@ -1509,8 +1509,12 @@ std::atomic<float> g_mip_bias{0.0f};
 // descriptions and goes live, for all lists at once, when complete.
 // Render-small's DLSS modes (Cort, 2026-11-03): Quality -1.585 (NVIDIA's -1 + log2(1/1.5)),
 // Balanced -2, Performance -2.25 (Cort 2026-11-04; was -2.5).
-constexpr int kMipCount = 6;
-constexpr float kMipLevels[kMipCount] = {0.0f, -0.5f, -1.0f, -1.5849625f, -2.0f, -2.25f};
+// Level 6 (+4) is the menu's visible check (Cort 2026-11-06: "0 and -1 look the same"): if the
+// surfaces do not turn obviously blurry at +4, the samplers we change are not the ones the
+// game's materials use, whatever the counters say. Never saved.
+constexpr int kMipCount = 7;
+constexpr float kMipLevels[kMipCount] = {0.0f, -0.5f, -1.0f, -1.5849625f, -2.0f, -2.25f, 4.0f};
+static_assert(kMipCount <= 7, "Obj::Twins holds 7 levels");
 constexpr uint32_t kAfLevels[4] = {0, 4, 8, 16};
 std::atomic<uint32_t> g_mip_level_mask{0x7u}; // levels built at creation (bit i = kMipLevels[i])
 // Background warm-up (Cort 2026-11-06: "mip does nothing"; a choice not built at load took
@@ -1613,6 +1617,7 @@ bool apply_aniso(SD& d)
 float biased(float native, float target)
 {
     if (target == 0.0f) return native;
+    if (target > 0.0f) return clamp_lod(target); // the visible check level: forced, whatever the game's own
     return native < target ? native : clamp_lod(target);
 }
 // The anisotropic part of a variant (no counters): as apply_aniso, at an explicit level.
