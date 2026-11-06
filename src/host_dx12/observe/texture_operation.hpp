@@ -30,6 +30,12 @@ public:
     virtual void After(ID3D12GraphicsCommandList*, const TextureCall&, ShaderScope&) noexcept = 0;
 };
 void SetTextureOperationHook(std::shared_ptr<TextureOperationHook>);
+// Independent owners must not replace each other's clear/copy handling. The
+// compatibility overload above owns Effects; scene bindings use Bindings.
+// Enter in lane order and unwind in reverse, retaining the exact snapshot
+// throughout the native call, just like ShaderLane.
+enum class TextureLane { Bindings = 0, Effects = 1 };
+void SetTextureOperationHook(TextureLane, std::shared_ptr<TextureOperationHook>);
 // Observation only: called on the recording thread for each game ClearDepthStencilView that
 // clears depth, before it is forwarded, with the view's resource id. Records nothing.
 using DepthClearListener = void (*)(ID3D12GraphicsCommandList*, uint64_t target_id);

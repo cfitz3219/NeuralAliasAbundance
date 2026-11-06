@@ -4273,7 +4273,9 @@ struct ShaderHooks { std::shared_ptr<ShaderOperationHook> lane[2]; };
 auto& g_shader_hooks = *new std::shared_ptr<const ShaderHooks>();
 std::mutex g_shader_hooks_m;
 std::atomic<bool> g_shader_hooks_enabled{false};
-auto& g_texture_hook = *new std::shared_ptr<TextureOperationHook>();
+struct TextureHooks { std::shared_ptr<TextureOperationHook> lane[2]; };
+auto& g_texture_hooks = *new std::shared_ptr<const TextureHooks>();
+std::mutex g_texture_hooks_m;
 std::atomic<DepthClearListener> g_depth_clear_listener{nullptr};
 
 void capture_raster_targets(GL* list, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets,
@@ -4566,8 +4568,8 @@ struct ListHook<Slot, R(A...)> {
                     }
                 }
                 if (!t_host_work && scope.outermost && !scope.ambiguous) {
-                    const auto hook = std::atomic_load_explicit(&g_texture_hook, std::memory_order_acquire);
-                    if (hook) {
+                    const auto hooks = std::atomic_load_explicit(&g_texture_hooks, std::memory_order_acquire);
+                    if (hooks && (hooks->lane[0] || hooks->lane[1])) {
                         TextureCall call;
                         const auto args = std::forward_as_tuple(a...);
                         if constexpr (Slot == sl::list::ClearRenderTargetView) {
@@ -4592,16 +4594,24 @@ struct ListHook<Slot, R(A...)> {
                             call.kind = TextureKind::Resolve; call.destination = std::get<0>(args); call.destination_sub = std::get<1>(args);
                             call.source = std::get<2>(args); call.source_sub = std::get<3>(args); call.format = std::get<4>(args);
                         }
-                        ShaderScope saved;
-                        { HostWorkScope own; saved = hook->Before(l, call); }
-                        if (saved.action == ShaderAction::Replaced) {
-                            HostWorkScope own; hook->After(l, call, saved); return;
+                        ShaderScope saved[2];
+                        unsigned entered = 0;
+                        bool replaced = false;
+                        for (unsigned i = 0; i < 2; ++i) {
+                            entered = i + 1;
+                            if (!hooks->lane[i]) continue;
+                            { HostWorkScope own; saved[i] = hooks->lane[i]->Before(l, call); }
+                            if (saved[i].action == ShaderAction::Replaced) { replaced = true; break; }
                         }
-                        fn(l, a...);
-                        if constexpr (Slot == sl::list::CopyResource || Slot == sl::list::CopyTextureRegion || Slot == sl::list::ResolveSubresource)
-                            after_texture_copy(l, call.destination);
-                        On<Slot>::run(l, a...);
-                        { HostWorkScope own; hook->After(l, call, saved); }
+                        if (!replaced) {
+                            fn(l, a...);
+                            if constexpr (Slot == sl::list::CopyResource || Slot == sl::list::CopyTextureRegion || Slot == sl::list::ResolveSubresource)
+                                after_texture_copy(l, call.destination);
+                            On<Slot>::run(l, a...);
+                        }
+                        for (unsigned i = entered; i > 0; --i) if (hooks->lane[i - 1]) {
+                            HostWorkScope own; hooks->lane[i - 1]->After(l, call, saved[i - 1]);
+                        }
                         return;
                     }
                 }
@@ -6334,7 +6344,21 @@ void SetShaderOperationHook(ShaderLane lane, std::shared_ptr<ShaderOperationHook
 void SetDepthClearListener(DepthClearListener listener) { g_depth_clear_listener.store(listener, std::memory_order_release); }
 void SetTextureOperationHook(std::shared_ptr<TextureOperationHook> hook)
 {
-    auto prior = std::atomic_exchange_explicit(&g_texture_hook, std::move(hook), std::memory_order_acq_rel);
+    SetTextureOperationHook(TextureLane::Effects, std::move(hook));
+}
+void SetTextureOperationHook(TextureLane lane, std::shared_ptr<TextureOperationHook> hook)
+{
+    const auto index = static_cast<unsigned>(lane);
+    if (index >= 2) return;
+    std::shared_ptr<const TextureHooks> prior;
+    {
+        std::lock_guard<std::mutex> lock(g_texture_hooks_m);
+        prior = std::atomic_load_explicit(&g_texture_hooks, std::memory_order_acquire);
+        auto next = std::make_shared<TextureHooks>();
+        if (prior) *next = *prior;
+        next->lane[index] = std::move(hook);
+        std::atomic_store_explicit(&g_texture_hooks, std::shared_ptr<const TextureHooks>(next), std::memory_order_release);
+    } // callbacks and GPU-owning objects are released outside the registry lock
 }
 void SetRasterStateTracking(bool enabled) { g_raster_tracking.store(enabled, std::memory_order_release); }
 bool ListRasterStateRestorable(ID3D12CommandList* list)

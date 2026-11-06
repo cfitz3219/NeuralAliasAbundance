@@ -509,7 +509,7 @@ void ConfigureAutomaticScene(bool enabled){
     auto a=std::make_shared<Automatic>();a->enabled=true;a->stats.enabled=true;a->note("Waiting for the game's scene selection.");automatic()=a;
     na::observe::SetOperationSnapshots(true);na::observe::SetRasterStateTracking(true);
     na::observe::SetShaderOperationHook(na::observe::ShaderLane::Bindings,std::make_shared<BindingHook>(a));
-    na::observe::SetTextureOperationHook(a);na::j2::SetPhysicalInputProvider({&lookup,&outcome,nullptr,true});
+    na::observe::SetTextureOperationHook(na::observe::TextureLane::Bindings,a);na::j2::SetPhysicalInputProvider({&lookup,&outcome,nullptr,true});
     na::nr::native::SetSubmissionPrepareCallback(&submit_constants);
 }
 void PollAutomaticScene(){

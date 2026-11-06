@@ -17,6 +17,17 @@
 #include <string>
 namespace {
 void __cdecl sink(const na_event_batch*,void*){}
+class TextureWitness final : public na::observe::TextureOperationHook {
+public:
+    unsigned before=0,after=0;
+    bool unregister=false;
+    na::observe::ShaderScope Before(ID3D12GraphicsCommandList*,const na::observe::TextureCall&) noexcept override {
+        ++before;
+        if(unregister)na::observe::SetTextureOperationHook({});
+        return {};
+    }
+    void After(ID3D12GraphicsCommandList*,const na::observe::TextureCall&,na::observe::ShaderScope&) noexcept override {++after;}
+};
 using M=std::array<double,16>;
 // Same reverse-Z perspective convention as the existing J2 end-to-end fixture.
 M camera(){const double n=.5,f=5000,sy=1/std::tan(.45),sx=sy/2;
@@ -81,7 +92,12 @@ int main(int argc,char** argv){
     REQUIRE(na::observe::InstallListResetTracking(dev,&na::nr::native::Reset));
     na_observe_config cfg{};cfg.size_bytes=sizeof cfg;REQUIRE(na_observe_start(&cfg,sink,nullptr)==NA_OK);
     na::j2::SetEnabled(true);na::j2::SetJitter(false);na::settings::Get().j2_route.store(1);na::settings::Get().j2_scale_mode.store(1);na::settings::Get().j2_sharpness.store(0);
+    // HUD's clear/copy listener must survive the scene provider registering,
+    // and registering HUD later must not silently remove that provider either.
+    auto first_witness=std::make_shared<TextureWitness>();first_witness->unregister=true;
+    na::observe::SetTextureOperationHook(first_witness);
     na::scale::ConfigureAutomaticScene(true);
+    auto witness=std::make_shared<TextureWitness>();
     na::dlss::SetInitOwnOverrideForTests([](ID3D12Device* device,const wchar_t*){auto api=fake::MakeApi();api.evaluate_feature=reinterpret_cast<void*>(&model);return na::dlss::Attach(device,api);});
     constexpr UINT w=64,h=32;
     auto color=test::CreateTexture(dev,w,h,DXGI_FORMAT_R16G16B16A16_FLOAT,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
@@ -186,6 +202,8 @@ float4 water(float4 position:SV_Position):SV_Target{uint2 p=uint2(position.xy);f
             const float late_upload=9;std::memcpy(mapped+8,&late_upload,4);}
         if(reconstruct)na::j2::Execute(d.queue.Get(),count,lists,&forward);else forward(d.queue.Get(),count,lists);
         d.WaitIdle();na::scale::PollAutomaticScene();const auto status=na::scale::GetAutomaticSceneStats();
+        if(first_witness->before){CHECK(first_witness->before==1&&first_witness->after==1);
+            na::observe::SetTextureOperationHook(witness);}
         std::printf("automatic: %u plans %u members %ux%u, redirected %llu misses %llu: %s | J2: %s\n",status.plans,status.members,status.render_w,status.render_h,(unsigned long long)status.redirected,(unsigned long long)status.misses,status.reason,na::j2::GetStats().reason);
         if(repeat&&!reconstruct&&status.active&&!replayed){
             // Execute the SAME closed recording with fresh upload bytes. Its
@@ -264,8 +282,11 @@ float4 water(float4 position:SV_Position):SV_Target{uint2 p=uint2(position.xy);f
     na::settings::Get().j2_scale_mode.store(0);frame(false);CHECK(!na::scale::GetAutomaticSceneStats().active);
     REQUIRE(pixels(d,color.Get(),w+.5f,h)==0);
     }
+    CHECK(first_witness->before==1&&first_witness->after==1);
+    CHECK(witness->before>0&&witness->before==witness->after);
     cb->Unmap(0,nullptr);na::j2::Shutdown();na::dlss::Shutdown();na::dlss::SetInitOwnOverrideForTests(nullptr);
-    na::observe::SetShaderOperationHook(na::observe::ShaderLane::Bindings,{});na::observe::SetTextureOperationHook({});na::j2::SetPhysicalInputProvider({});na_observe_stop();
+    na::observe::SetShaderOperationHook(na::observe::ShaderLane::Bindings,{});na::observe::SetTextureOperationHook({});
+    na::observe::SetTextureOperationHook(na::observe::TextureLane::Bindings,{});na::j2::SetPhysicalInputProvider({});na_observe_stop();
     if(info)for(UINT64 i=0;i<info->GetNumStoredMessages();++i){SIZE_T size=0;info->GetMessage(i,nullptr,&size);std::vector<unsigned char> bytes(size);
         auto* message=reinterpret_cast<D3D12_MESSAGE*>(bytes.data());if(SUCCEEDED(info->GetMessage(i,message,&size))&&message->Severity<=D3D12_MESSAGE_SEVERITY_ERROR){std::printf("D3D12 error: %s\n",message->pDescription);CHECK(false);}}
     return test::finish("auto_scene_test");
