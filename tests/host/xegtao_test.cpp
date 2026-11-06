@@ -210,7 +210,8 @@ int main() {
     // less from frame to frame with temporal stability than without.
     {
         constexpr unsigned TW=96,TH=64;
-        const auto flicker=[&](float keep){
+        const auto flicker=[&](float keep)->double{
+#define NEED(cond) do { if (!(cond)) { std::printf("FATAL %s:%d: %s\n", __FILE__, __LINE__, #cond); ++test::g_failures; return -1.0; } } while (0)
             na::xegtao::Pass temporal;auto o=options;o.temporal=keep;
             std::vector<float> previous;double change=0;unsigned samples=0;bool first_box=true;
             for(unsigned frame=0;frame<12;++frame){
@@ -218,17 +219,17 @@ int main() {
                 std::vector<float> c(size_t(TW)*TH*4,4.f),z(size_t(TW)*TH),mv(size_t(TW)*TH*2,0.f);
                 for(unsigned y=0;y<TH;++y)for(unsigned x=0;x<TW;++x){
                     const bool inside=x>30+shift&&x<53+shift&&y>20&&y<45;z[size_t(y)*TW+x]=1-.1f/(inside?1.8f:2.f);}
-                test::List l;REQUIRE(l.Create(d.device.Get()));
+                test::List l;NEED(l.Create(d.device.Get()));
                 auto color=input(d,l,TW,TH,DXGI_FORMAT_R32G32B32A32_FLOAT,c,4);
                 auto depth=input(d,l,TW,TH,DXGI_FORMAT_R32_FLOAT,z,1);
                 auto motion=input(d,l,TW,TH,DXGI_FORMAT_R32G32_FLOAT,mv,2);
                 na::xegtao::Inputs in;in.color=color.texture.Get();in.depth=depth.texture.Get();in.width=TW;in.height=TH;
                 in.color_format=DXGI_FORMAT_R32G32B32A32_FLOAT;in.projection=projection(false);in.clear_depth=1;in.motion=motion.texture.Get();
                 auto f=temporal.Prepare(d.device.Get(),d.queue.Get(),in,o);
-                if(!f&&first_box){REQUIRE(temporal.WaitPrepared(30000));f=temporal.Prepare(d.device.Get(),d.queue.Get(),in,o);}
-                first_box=false;REQUIRE(f);REQUIRE(f->Record(l.list.Get()));auto rb=capture(d,l,f->Color());
-                REQUIRE(SUCCEEDED(l.list->Close()));ID3D12CommandList* lists[]={l.list.Get()};d.queue->ExecuteCommandLists(1,lists);d.WaitIdle();
-                auto out=pixels(rb);REQUIRE(out.size()==size_t(TW)*TH*4);
+                if(!f&&first_box){NEED(temporal.WaitPrepared(30000));f=temporal.Prepare(d.device.Get(),d.queue.Get(),in,o);}
+                first_box=false;NEED(f);NEED(f->Record(l.list.Get()));auto rb=capture(d,l,f->Color());
+                NEED(SUCCEEDED(l.list->Close()));ID3D12CommandList* lists[]={l.list.Get()};d.queue->ExecuteCommandLists(1,lists);d.WaitIdle();
+                auto out=pixels(rb);NEED(out.size()==size_t(TW)*TH*4);
                 if(frame>=6&&!previous.empty())for(unsigned y=16;y<50;++y)for(unsigned x=24;x<60;++x){
                     const bool a=x>30&&x<53&&y>20&&y<45,b=x>31&&x<54&&y>20&&y<45;
                     if(a!=b)continue; // the silhouette pixel itself changes surface (DLSS resolves that)
@@ -238,6 +239,7 @@ int main() {
             }
             return samples?change/samples:0.0;
         };
+#undef NEED
         const double without=flicker(0.f),with=flicker(.85f);
         std::printf("XeGTAO edge flicker (mean change, HDR 4): without history %.5f, with %.5f\n",without,with);
         CHECK(without>.002);CHECK(with<without*.5);
