@@ -33,6 +33,7 @@ NA_SLOT(ID3D12DeviceVtbl, CreateHeap, s::device::CreateHeap);
 NA_SLOT(ID3D12DeviceVtbl, CreatePlacedResource, s::device::CreatePlacedResource);
 NA_SLOT(ID3D12DeviceVtbl, CreateReservedResource, s::device::CreateReservedResource);
 NA_SLOT(ID3D12DeviceVtbl, CreateFence, s::device::CreateFence);
+NA_SLOT(ID3D12DeviceVtbl, CreateCommandSignature, s::device::CreateCommandSignature);
 NA_SLOT(ID3D12Device2Vtbl, CreatePipelineState, s::device::CreatePipelineState);
 NA_SLOT(ID3D12Device4Vtbl, CreateCommandList1, s::device::CreateCommandList1);
 NA_SLOT(ID3D12Device4Vtbl, CreateCommittedResource1, s::device::CreateCommittedResource1);

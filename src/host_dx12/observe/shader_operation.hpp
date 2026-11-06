@@ -6,6 +6,10 @@ namespace na::observe {
 enum class ShaderKind { Draw, DrawIndexed, Dispatch };
 struct ShaderCall {
     ShaderKind kind = ShaderKind::Dispatch;
+    // A draw-only ExecuteIndirect uses the same immutable graphics bindings.
+    // Its GPU argument/count buffers remain the native API's responsibility;
+    // args[] must not be interpreted as editable draw counts in this case.
+    bool indirect = false;
     // Native arguments in API order (BaseVertexLocation remains signed).
     int64_t args[5]{};
 };

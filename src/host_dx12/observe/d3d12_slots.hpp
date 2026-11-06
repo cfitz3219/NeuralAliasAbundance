@@ -30,6 +30,7 @@ constexpr uint32_t CreateHeap = 28;
 constexpr uint32_t CreatePlacedResource = 29;
 constexpr uint32_t CreateReservedResource = 30;
 constexpr uint32_t CreateFence = 36;
+constexpr uint32_t CreateCommandSignature = 41;
 constexpr uint32_t CreatePipelineState = 47;       // ID3D12Device2
 constexpr uint32_t CreateCommandList1 = 51;        // ID3D12Device4
 constexpr uint32_t CreateCommittedResource1 = 53;  // ID3D12Device4

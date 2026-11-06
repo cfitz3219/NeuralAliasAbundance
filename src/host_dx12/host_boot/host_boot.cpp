@@ -293,10 +293,14 @@ DWORD WINAPI InitThread(LPVOID)
     // P4-4 render-small ([present] render_small=1, plan COMMS 4e30a94): the game renders its whole
     // frame at render size into the presenter's proxies; J2 upscales it at Present. Needs the
     // presenter and J2; the projection window and Layer2 stay off with it.
-    const bool small_asked = GetPrivateProfileIntW(L"present", L"render_small", 0, g_ini) == 1;
+    // Scene-resource provision does not virtualize window/display geometry.
+    // Retain full-size presentation proxies; J2 receives reduced companions
+    // from its physical-input provider and writes back a native-size scene.
+    const bool scene_asked = GetPrivateProfileIntW(L"present", L"scene_resources", 0, g_ini) == 1;
+    const bool small_asked = !scene_asked && GetPrivateProfileIntW(L"present", L"render_small", 0, g_ini) == 1;
     // Render-small needs the presenter, which Route A normally switches on. A game with
     // [route_a] enabled=0 (Anno) still gets it here; [present] proxy=0 keeps it off.
-    if (small_asked && !route_a && na::j2::Configured() &&
+    if ((small_asked || scene_asked) && !route_a && na::j2::Configured() &&
         GetPrivateProfileIntW(L"present", L"proxy", 1, g_ini) == 1)
         na::present::SetEnabled(true);
     const bool render_small = small_asked && na::j2::Configured() && na::present::Enabled();
@@ -341,11 +345,18 @@ DWORD WINAPI InitThread(LPVOID)
         std::snprintf(small_line, sizeof small_line, "render-small: enabled (mode %d, scale %.3f requested after start; native DLAA until the game follows)", small_mode, small_f);
         boot_log(small_line);
     }
-    const bool projection_window = !render_small && na::j2::Configured() && GetPrivateProfileIntW(L"j2", L"window", 0, g_ini) == 1;
+    const bool projection_window = !render_small && !scene_asked && na::j2::Configured() && GetPrivateProfileIntW(L"j2", L"window", 0, g_ini) == 1;
     na::j2::SetProjectionWindow(projection_window);
     na::j2::SetProjectionWindowScissor(GetPrivateProfileIntW(L"j2", L"window_scissor", 1, g_ini) != 0);
     if (projection_window) { na::j2::InstallProjectionWindowScissor(); boot_log("projection window: enabled"); }
-    na::scale::ConfigureAutomaticScene(!render_small&&!projection_window&&na::j2::Configured()&&GetPrivateProfileIntW(L"layer2",L"enabled",0,g_ini)==1);
+    const bool scene_resources=!render_small&&!projection_window&&na::j2::Configured()&&
+        (scene_asked||GetPrivateProfileIntW(L"layer2",L"enabled",0,g_ini)==1);
+    na::scale::ConfigureAutomaticScene(scene_resources);
+    if(scene_resources){
+        na::present::SetPresentDlaa(false);
+        na::present::SetRenderScale(1.f,nullptr,nullptr);
+        boot_log("scene-resources: reduced scene companions; native presentation; no virtual window resize or second Present DLAA");
+    }
     if (na::j2::Configured()) na::overlay::RegisterLiveDlaaMenu();
     na::j2::flow::SetEnabled(GetPrivateProfileIntW(L"j2",L"flow",0,g_ini)==1);
     if(na::settings::SafeStart())na::j2::SetPaused(true);

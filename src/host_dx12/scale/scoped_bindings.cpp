@@ -211,7 +211,19 @@ na::observe::ShaderScope BindingHook::Before(ID3D12GraphicsCommandList* list, na
         if (ds.ptr) ds.ptr += SIZE_T(p->dsv_first_) * p->dsv_increment_;
         list->OMSetRenderTargets(static_cast<UINT>(s.colors.size()), rt.ptr ? &rt : nullptr, TRUE, ds.ptr ? &ds : nullptr);
     }
-    if (changes.viewports&&!p->viewports_.empty()) list->RSSetViewports(static_cast<UINT>(p->viewports_.size()), p->viewports_.data());
+    if (changes.viewports&&!p->viewports_.empty()) {
+        float x=0,y=0;
+        if(!s.compute&&na::observe::DecodeSceneViewportJitter(native.viewport_jitter,nullptr,&x,&y)) {
+            // Jitter is expressed in the render pixels DLSS consumes. Carry
+            // the actual recording's sample to the smaller viewport unchanged;
+            // scaling the offset by the native/reduced ratio is a mismatch.
+            D3D12_VIEWPORT shifted[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+            std::copy(p->viewports_.begin(),p->viewports_.end(),shifted);
+            for(size_t i=0;i<p->viewports_.size();++i){shifted[i].TopLeftX+=x;shifted[i].TopLeftY+=y;}
+            list->RSSetViewports(static_cast<UINT>(p->viewports_.size()),shifted);
+            na::observe::PreserveAppliedViewportJitter(list,native.viewport_jitter);
+        }else list->RSSetViewports(static_cast<UINT>(p->viewports_.size()),p->viewports_.data());
+    }
     if (changes.scissors&&!p->scissors_.empty()) list->RSSetScissorRects(static_cast<UINT>(p->scissors_.size()), p->scissors_.data());
     if (p->dispatch_x_) { call.args[0] = p->dispatch_x_; call.args[1] = p->dispatch_y_; }
     return scope;

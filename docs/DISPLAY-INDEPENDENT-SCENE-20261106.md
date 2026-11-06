@@ -61,3 +61,72 @@ Remaining: finish source-route selection and presentation integration, including
 indirect/state semantics and actual frame/extent delivery, then qualify and
 prepare one reversible production package. Do not describe this increment as
 the completed fullscreen fix.
+
+## Increment 2: draw ownership, jitter and the reconstruction boundary
+
+Implemented on the shared1aa2bee base, retaining the existing core/backend.
+A command-signature creation observer recognizes draw-only indirect signatures
+which inherit their root/resource/IA bindings. GPU argument/count buffers remain
+native, with no diagnostic readback. Unknown or binding-changing signatures,
+bundles and render passes keep the existing native fallback. The new creation
+hook is optional; its absence does not disable ordinary observation.
+
+The new raster-pixel test exposed a real forwarding issue: the DX12 wrapping
+layer entered the draw path again through a DIFFERENT command-list object with
+no game root bindings. Its jitter handler could reapply the original full-size
+viewport over the private reduced viewport. Native draw/dispatch/indirect/bundle
+forwarding now uses the existing thread-local HostWorkScope, while the outer
+game command is observed once after forwarding. No new lock, allocation, GPU
+pass or wait is added by this guard.
+
+Reduced viewport bindings carry the exact recording's applied jitter in render
+pixels. They preserve that applied sample so a repeated draw does not overwrite
+the private viewport or re-jitter it. Actual viewport changes update the binding
+serial. The real raster witness checks positive and negative offsets, a cached
+second draw, a later frame's competing requested sample, an intervening native
+pass, return to the smaller scene and live jitter Off. Final measured coordinates
+match the smaller raster exactly; native-pass coordinates remain unchanged.
+Initial fixture compilation hit Windows' small macro and a missing snapshot
+header/setup; those fixture errors were corrected. The subsequent valid raster
+failure was traced to the second command-list entry above. A fixture cache also
+needed the same native-boundary/recording invalidation as the production owner.
+
+A second actual-DX12 regression reproduced an output-loss defect. An engine keeps
+all original buffers at64x32, renders through the private provider, submits J2,
+then records a four-pixel native UI draw. Previously that later draw could stay
+in the smaller-scene group and cause its raw image to be promoted over the
+reconstruction:2048/2048 final pixels failed for Quality and Performance. A
+provided source is now sealed at its J2 outcome, so later native shader and
+texture operations cannot re-enter the old source. Native dependencies are
+published before those consumers. The same test now has0wrong pixels through
+Quality, Performance and native DLAA; original resources remain64x32 throughout.
+This uses a fake model with real DX12 allocations, commands and pixel readbacks.
+
+The completed-frame active/reconstructed evidence now survives its Present
+boundary, and an empty subsequent Present clears it. Admission failures report
+which recording, root/table, typed view or retired resource prevented the
+snapshot. A native compute writer invalidates reduced provenance instead of
+allowing J2 to consume an older private scene. Coupled raster targets use the
+identified dependency group.
+
+Startup seam: [present] scene_resources=1 selects this source provider; use
+render_small=0, [j2] window=0. It keeps native presentation, disables a second
+Present DLAA and does not install virtual window/display resizing. Existing
+[layer2] enabled=1 remains supported. The overlay reports actual J2 input/output
+sizes when they match the reconstructed source, rather than treating preparation
+or allocation as applied Quality.
+
+Before the final diagnostic additions: complete Release build and24affected
+CTest cases PASS,0skips/failures,84.74s. This includes the new raster/source tests,
+existing split/indirect/real NGX entry, HUD, scoped bindings and presentation.
+A fresh full build/suite is running on the final increment; do not call it passed
+until its receipt is appended. No game launch/control, deployment or installed
+settings/native DLL changes. Opus accepted the independent presenter/output test
+and reversible package lane in main COMMS; his presenter trace found the
+full-size output path already suitable, and his output test is separate from
+our provider test. Final combined source/package is still pending.
+
+Reference: Microsoft's Indirect Drawing contract distinguishes inherited state
+from command signatures that alter bindings:
+https://learn.microsoft.com/en-us/windows/win32/direct3d12/indirect-drawing .
+No upstream implementation was copied and no new dependency was introduced.

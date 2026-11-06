@@ -949,7 +949,9 @@ void DrawLiveDlaa()
         if (mode < 0 || mode >= modes) mode = mode >= modes ? modes - 1 : 0;
         BeginRow("Render mode", na::j2::RenderSmall()
             ? "DLAA uses full resolution. Quality, Balanced and Performance draw the whole game smaller for more FPS (67%, 58%, 50%) and DLSS brings it back to full size. The game's own HUD is drawn smaller too, so text is a little softer. Changes apply while you play."
-            : na::scale::GetAutomaticSceneStats().enabled||na::j2::ProjectionWindow()
+            : na::scale::GetAutomaticSceneStats().enabled
+            ? "DLAA uses full resolution. The other modes draw the prepared scene into smaller textures and reconstruct it at full display size, independently of window mode. Changes apply while you play; the status reports the actual DLSS input and output."
+            : na::j2::ProjectionWindow()
             ? "DLAA uses full resolution. Quality, Balanced, Performance and Ultra Performance render the scene smaller for more FPS. Menus and the HUD keep their normal size. Changes apply while you play."
             : "DLAA draws the game at full resolution. Quality, Balanced, Performance and Ultra Performance draw it smaller for more FPS (67%, 58%, 50%, 33%). NeuralAlias sets the game's Render Scale for you; leave the game's own slider at 100%.", S(220));
         ImGui::SetNextItemWidth(S(220));
@@ -970,7 +972,14 @@ void DrawLiveDlaa()
               else std::snprintf(note,sizeof note,"%s",j2.window_note[0]?j2.window_note:(mode?"Starting once DLAA is running steadily.":"Rendering at full resolution."));
               StatusLine(j2.window_engaged?1:0,note);}
           else if(na::scale::GetAutomaticSceneStats().enabled){const auto automatic=na::scale::GetAutomaticSceneStats();
-              StatusLine(automatic.active?1:0,automatic.reason);}
+              char note[240];
+              const bool actual=automatic.reconstructed&&st.active&&st.render_w==automatic.render_w&&st.render_h==automatic.render_h&&
+                  st.out_w==automatic.out_w&&st.out_h==automatic.out_h;
+              if(mode==0&&st.active&&st.render_w==st.out_w&&st.render_h==st.out_h)
+                  std::snprintf(note,sizeof note,"DLAA at %u x %u.",st.render_w,st.render_h);
+              else if(actual)std::snprintf(note,sizeof note,"Scene renders at %u x %u; DLSS output %u x %u.",st.render_w,st.render_h,st.out_w,st.out_h);
+              else std::snprintf(note,sizeof note,"%s",automatic.reason);
+              StatusLine((actual||(mode==0&&st.active&&st.render_w==st.out_w))?1:0,note);}
           else StatusLine(0, na::scale::GetDriverStats().state);
         if (na::j2::RenderSmall()) {
             // Borderless/full screen make the game ignore the smaller size; a window that covers
