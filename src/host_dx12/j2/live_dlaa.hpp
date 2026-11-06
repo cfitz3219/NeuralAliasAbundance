@@ -154,6 +154,18 @@ UpscaleTarget GetUpscaleTarget();
 // geometry or run a second Present upscaler.
 void EnableNativeScaleBridge(bool enabled);
 void SetNativeRenderExtent(uint32_t rw,uint32_t rh,uint32_t ow,uint32_t oh);
+// Audit 2026-11-06: what the native-scale bridge saw. One run with the game at
+// Quality must say why DLSS did or did not reconstruct (status + run log).
+struct NativeBridgeStats {
+    bool enabled=false,reduced=false;
+    uint32_t rw=0,rh=0,ow=0,oh=0;            // the game's reported scene and output size
+    uint64_t hints=0,examined=0,not_reading=0,snapshot=0,source_size=0,draw_state=0,viewport=0,
+        no_destination=0,ambiguous=0,candidates=0,recorded=0,record_failed=0,after_skipped=0;
+    uint32_t src_w=0,src_h=0,src_fmt=0;       // last scene colour examined
+    uint32_t seen_w=0,seen_h=0,seen_fmt=0;    // last full-size target written by a scene reader
+    char reason[200]{};
+};
+NativeBridgeStats GetNativeBridgeStats();
 // P4-4 no-slider route (Astra's Layer2, contract agreed on COMMS 2026-11-01): an optional
 // immutable logical -> physical snapshot. Discovery, the camera and every identity stay on the
 // LOGICAL scene colour/depth ids; J2 evaluates the provider's PHYSICAL (reduced) companions and

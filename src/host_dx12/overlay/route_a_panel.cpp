@@ -965,7 +965,14 @@ void DrawLiveDlaa()
             if(na::scale::native::Available())na::scale::native::Request(mode);
         }
         EndRow();
-          if(na::scale::native::Available()){const auto native=na::scale::native::GetStats();StatusLine(native.confirmed?1:0,native.reason);}
+          if(na::scale::native::Available()){const auto native=na::scale::native::GetStats();
+              // Audit 2026-11-06: when the game is smaller but DLSS is not
+              // reconstructing, say why (the bridge's reason), not only "checking".
+              const auto bridge=na::j2::GetNativeBridgeStats();char note[260];
+              if(!native.confirmed&&bridge.reduced&&!bridge.recorded&&bridge.reason[0])
+                  std::snprintf(note,sizeof note,"Scene %u x %u, DLSS not reconstructing yet: %s",bridge.rw,bridge.rh,bridge.reason);
+              else std::snprintf(note,sizeof note,"%s",native.reason);
+              StatusLine(native.confirmed?1:0,note);}
           else if(na::j2::RenderSmall()){const auto j2=na::j2::GetStats();const auto ps=na::present::GetStats();
               char note[200];
               if(ps.scaled_w)std::snprintf(note,sizeof note,"Rendering the game at %ux%u, DLSS to %ux%u.",ps.scaled_w,ps.scaled_h,ps.native_w,ps.native_h);

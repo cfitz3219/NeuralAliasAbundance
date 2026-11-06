@@ -1118,6 +1118,13 @@ void write_status_line()
                 native.mode,native.controlled,native.confirmed,native.fraction,native.thread,(unsigned long long)native.ticks,(unsigned long long)native.applies,
                 (unsigned long long)native.requests,native.render_w,native.render_h,native.out_w,native.out_h,(unsigned long long)native.evaluation,native.reason);
             if(native_n>0)WriteFile(f,native_line,DWORD((std::min)(native_n,int(sizeof native_line-1))),&written,nullptr);
+            const auto b=na::j2::GetNativeBridgeStats();char bridge_line[768];
+            const int bridge_n=std::snprintf(bridge_line,sizeof bridge_line,"native_bridge reduced=%d hints=%llu examined=%llu candidates=%llu recorded=%llu record_failed=%llu source_size=%llu no_destination=%llu ambiguous=%llu draw_state=%llu viewport=%llu src=%ux%u/%u full_target=%ux%u/%u game_applies=%llu refusals=%llu thread_changes=%llu reason=\"%s\"\r\n",
+                b.reduced?1:0,(unsigned long long)b.hints,(unsigned long long)b.examined,(unsigned long long)b.candidates,(unsigned long long)b.recorded,
+                (unsigned long long)b.record_failed,(unsigned long long)b.source_size,(unsigned long long)b.no_destination,(unsigned long long)b.ambiguous,
+                (unsigned long long)b.draw_state,(unsigned long long)b.viewport,b.src_w,b.src_h,b.src_fmt,b.seen_w,b.seen_h,b.seen_fmt,
+                (unsigned long long)native.game_applies,(unsigned long long)native.refusals,(unsigned long long)native.thread_changes,b.reason);
+            if(bridge_n>0)WriteFile(f,bridge_line,DWORD((std::min)(bridge_n,int(sizeof bridge_line-1))),&written,nullptr);
         }
         if (na::scale::SliderRouteActive()) {
             // P4-4 slider route: what our mode did to the game's render scale (start-up and live).
@@ -3124,7 +3131,28 @@ void game_frame_boundary(ID3D12CommandQueue* queue)
             scene.render_h?scene.render_h:scene.height,scene.out_w,scene.out_h,scene.frames,scene.active);
         const auto native=na::scale::native::GetStats();
         na::j2::SetNativeRenderExtent(native.controlled?native.render_w:0,native.controlled?native.render_h:0,native.out_w,native.out_h);
-        na::observe::SetSamplerMipBiasLive(native.controlled&&!na::j2::Paused()?na::j2::SmallMipBias(-1.f,native.fraction):0.f);
+        // Audit 2026-11-06: only on a change, and never 0 for DLAA. Setting it
+        // every frame overrode the menu's mip bias (DLAA total -1, the +4
+        // check) and re-queued the sampler-variant worker each frame.
+        const float user=static_cast<float>(na::settings::Get().j2_mip_bias_x100.load())/100.f;
+        const bool reduced=native.controlled&&!na::j2::Paused()&&native.fraction<1.f;
+        const float fraction=reduced?native.fraction:1.f;
+        static float applied_fraction=1.f;
+        if(fraction!=applied_fraction){
+            applied_fraction=fraction;
+            na::observe::SetSamplerMipBiasLive(reduced?na::j2::SmallMipBias(user,fraction):user);
+        }
+        static uint64_t bridge_frames=0;
+        if(++bridge_frames%300==0){
+            const auto b=na::j2::GetNativeBridgeStats();
+            na::eventlog::Emit("native_bridge","reduced=%d scene=%ux%u output=%ux%u hints=%llu examined=%llu not_reading=%llu snapshot=%llu source_size=%llu draw_state=%llu viewport=%llu no_destination=%llu ambiguous=%llu candidates=%llu recorded=%llu record_failed=%llu after_skipped=%llu src=%ux%u/%u full_target=%ux%u/%u | ticks=%llu applies=%llu game_applies=%llu refusals=%llu thread_changes=%llu controlled=%d confirmed=%d reason=\"%s\" native=\"%s\"",
+                b.reduced?1:0,b.rw,b.rh,b.ow,b.oh,(unsigned long long)b.hints,(unsigned long long)b.examined,(unsigned long long)b.not_reading,
+                (unsigned long long)b.snapshot,(unsigned long long)b.source_size,(unsigned long long)b.draw_state,(unsigned long long)b.viewport,
+                (unsigned long long)b.no_destination,(unsigned long long)b.ambiguous,(unsigned long long)b.candidates,(unsigned long long)b.recorded,
+                (unsigned long long)b.record_failed,(unsigned long long)b.after_skipped,b.src_w,b.src_h,b.src_fmt,b.seen_w,b.seen_h,b.seen_fmt,
+                (unsigned long long)native.ticks,(unsigned long long)native.applies,(unsigned long long)native.game_applies,(unsigned long long)native.refusals,
+                (unsigned long long)native.thread_changes,native.controlled?1:0,native.confirmed?1:0,b.reason,native.reason);
+        }
     }
     na::settings::WatchChanges("code");
     na::scale::AutomaticScenePresent();

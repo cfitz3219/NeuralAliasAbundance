@@ -345,6 +345,23 @@ std::atomic<bool> g_native_bridge{false},g_native_reduced{false};
 struct NativeExtent{uint32_t rw=0,rh=0,ow=0,oh=0;} g_native_extent; // under g_up_m
 thread_local ID3D12GraphicsCommandList* t_native_hint=nullptr;
 thread_local uint64_t t_native_color=0,t_native_depth=0;
+// Audit 2026-11-06: the hint survives non-qualifying operations (bloom,
+// luminance, SSR reading the same colour) for a bounded number of operations
+// in the SAME recording, instead of being spent on the first draw after the
+// bind. Each examined operation must itself read the scene colour.
+thread_local uint64_t t_native_recording=0;thread_local uint32_t t_native_budget=0;
+constexpr uint32_t kNativeHintOps=24;
+// Why the bridge did or did not find the game's upscale pass (status + log).
+struct NativeBridgeCounters {
+    std::atomic<uint64_t> hints{0},examined{0},not_reading{0},snapshot{0},source_size{0},draw_state{0},viewport{0},
+        no_destination{0},ambiguous{0},candidates{0},recorded{0},record_failed{0},after_skipped{0};
+    std::mutex m;char reason[200]{};uint32_t src_w=0,src_h=0,src_fmt=0,seen_w=0,seen_h=0,seen_fmt=0;
+};
+NativeBridgeCounters& g_nb=*new NativeBridgeCounters;
+void native_reject(std::atomic<uint64_t>& counter,const char* why){
+    counter.fetch_add(1,std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(g_nb.m);std::snprintf(g_nb.reason,sizeof g_nb.reason,"%s",why);
+}
 PhysicalInputProvider g_phys; // under g_up_m
 
 // Exactly one outcome per Provided / Unavailable lookup, on every exit of record().
@@ -3173,7 +3190,9 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
     if(g_native_reduced.load(std::memory_order_relaxed)) {
         // The observer already proved this actual operation reads the selected
         // scene. The reconstruction lane will inspect its exact destination.
-        t_native_hint=l;t_native_color=color_id;t_native_depth=depth_id;return;
+        t_native_hint=l;t_native_color=color_id;t_native_depth=depth_id;
+        t_native_recording=na::observe::ListRecording(l);t_native_budget=kNativeHintOps;
+        g_nb.hints.fetch_add(1,std::memory_order_relaxed);return;
     }
     const na::observe::HostWorkScope host; // our commands in the game's list are not the game's
     std::lock_guard<std::mutex> lock(g.m);
@@ -3456,36 +3475,60 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
     };
 public:
     na::observe::ShaderScope Before(ID3D12GraphicsCommandList* l,na::observe::ShaderCall& call) noexcept override {
-        const bool hinted=t_native_hint==l;t_native_hint=nullptr;
-        if(!hinted||!g_native_reduced.load(std::memory_order_relaxed))return {};
+        if(t_native_hint!=l||!t_native_budget)return {};
+        if(!g_native_reduced.load(std::memory_order_relaxed)){t_native_hint=nullptr;return {};}
         try {
+            if(na::observe::ListRecording(l)!=t_native_recording){t_native_hint=nullptr;return {};} // a reused list: stale hint
+            --t_native_budget;g_nb.examined.fetch_add(1,std::memory_order_relaxed);
             const bool compute=call.kind==na::observe::ShaderKind::Dispatch;
-            na::observe::NativeOperation op;
-            if(!na::observe::ListNativeOperation(l,compute,op))return {};
+            na::observe::NativeOperation op;const char* why=nullptr;
+            if(!na::observe::ListNativeOperation(l,compute,op,&why)){native_reject(g_nb.snapshot,why?why:"The operation's bindings could not be read.");return {};}
+            // This exact operation must read the scene colour (a later draw
+            // that merely inherits the bind but samples something else is not
+            // the upscale pass, and must not consume the hint either).
+            bool reads=false;
+            for(const auto& d:op.descriptors)reads|=d.used&&d.view.kind==NA_DESC_SRV&&d.view.resource==t_native_color;
+            if(!reads){native_reject(g_nb.not_reading,"An operation after the scene bind does not read the scene colour.");return {};}
             NativeExtent extent;{std::lock_guard<std::mutex> lock(g_up_m);extent=g_native_extent;}
             auto c=std::make_shared<Candidate>();c->color=t_native_color;c->depth=t_native_depth;c->recording=op.recording;
             c->source.Attach(na::observe::AcquireResource(c->color));c->guide.Attach(na::observe::AcquireResource(c->depth));
-            if(!c->source||!c->guide)return {};
+            if(!c->source||!c->guide){native_reject(g_nb.snapshot,"The scene colour or depth has retired.");return {};}
             const auto source=c->source->GetDesc();
-            if(source.Width!=extent.rw||source.Height!=extent.rh||source.DepthOrArraySize!=1||source.MipLevels!=1||source.SampleDesc.Count!=1)return {};
+            {std::lock_guard<std::mutex> lock(g_nb.m);g_nb.src_w=uint32_t(source.Width);g_nb.src_h=source.Height;g_nb.src_fmt=uint32_t(source.Format);}
+            if(source.Width!=extent.rw||source.Height!=extent.rh||source.DepthOrArraySize!=1||source.MipLevels!=1||source.SampleDesc.Count!=1){
+                // Logged with the sizes: an engine that renders a sub-rectangle
+                // of a full allocation shows up here (see the audit document).
+                native_reject(g_nb.source_size,"The scene colour is not exactly the game's reported scene size.");return {};
+            }
+            uint32_t full_seen=0;
             const auto match=[&](const na::observe::OperationDescriptor& d){
                 if(!d.resource||d.view.resource==c->color||!d.used)return;
                 const auto target=d.resource->GetDesc();
-                if(target.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||target.SampleDesc.Count!=1||target.DepthOrArraySize!=1||target.MipLevels!=1||
-                   target.Width!=extent.ow||target.Height!=extent.oh||typed(target.Format)!=typed(source.Format))return;
+                if(target.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||target.Width!=extent.ow||target.Height!=extent.oh)return;
+                ++full_seen;{std::lock_guard<std::mutex> lock(g_nb.m);g_nb.seen_w=uint32_t(target.Width);g_nb.seen_h=target.Height;g_nb.seen_fmt=uint32_t(target.Format);}
+                if(target.SampleDesc.Count!=1||target.DepthOrArraySize!=1||target.MipLevels!=1||typed(target.Format)!=typed(source.Format))return;
                 if(c->dest&&c->dest!=d.view.resource){c->dest=~0ull;return;}
                 c->dest=d.view.resource;c->target=d.resource;
             };
             if(compute){for(const auto& d:op.descriptors)if(d.view.kind==NA_DESC_UAV)match(d);}
             else {
                 na::observe::DrawInfo draw;
-                if(!na::observe::ListDrawState(l,draw)||!draw.pipeline_known||draw.depth_enable!=0||draw.rt_count!=1||draw.blend_mask!=0)return {};
-                if(op.viewports.size()!=1||op.viewports[0].TopLeftX!=0||op.viewports[0].TopLeftY!=0||
-                   op.viewports[0].Width!=float(extent.ow)||op.viewports[0].Height!=float(extent.oh))return {};
-                for(const auto& sc:op.scissors)if(sc.left>0||sc.top>0||sc.right<LONG(extent.ow)||sc.bottom<LONG(extent.oh))return {};
+                // Several render targets are allowed (an upscale pass that also
+                // writes history/luminance): exactly one full-output target of
+                // the scene's format must exist, and nothing may be blended.
+                if(!na::observe::ListDrawState(l,draw)||!draw.pipeline_known||draw.depth_enable!=0||draw.rt_count<1||draw.blend_mask!=0){
+                    native_reject(g_nb.draw_state,"The pass reading the scene uses depth, blending or unknown pipeline state.");return {};}
+                if(op.viewports.empty()||op.viewports[0].TopLeftX!=0||op.viewports[0].TopLeftY!=0||
+                   op.viewports[0].Width!=float(extent.ow)||op.viewports[0].Height!=float(extent.oh)){
+                    native_reject(g_nb.viewport,"The pass reading the scene does not cover the full output.");return {};}
+                for(const auto& sc:op.scissors)if(sc.left>0||sc.top>0||sc.right<LONG(extent.ow)||sc.bottom<LONG(extent.oh)){
+                    native_reject(g_nb.viewport,"The pass reading the scene is clipped to part of the output.");return {};}
                 for(const auto& d:op.colors)match(d);
             }
-            if(!c->dest||c->dest==~0ull)return {};
+            if(c->dest==~0ull){native_reject(g_nb.ambiguous,"The pass writes several full-size targets of the scene format.");return {};}
+            if(!c->dest){native_reject(g_nb.no_destination,full_seen?"The full-size output of the pass has another format than the scene (for example after tone mapping).":
+                "The pass reading the scene writes nothing at full output size.");return {};}
+            t_native_hint=nullptr;g_nb.candidates.fetch_add(1,std::memory_order_relaxed);
             return {na::observe::ShaderAction::Forward,c};
         }catch(...){return {};}
     }
@@ -3493,13 +3536,15 @@ public:
         auto c=std::static_pointer_cast<Candidate>(scope.state);if(!c)return;
         try {
             std::lock_guard<std::mutex> lock(g.m);
-            if(g.latched||g.paused.load()||!g.device||!g.dlss_ready||g.inl.valid||g.submitted_frame==g.frame||
-               na::observe::ListRecording(l)!=c->recording||!na::observe::ListStateRestorable(l))return;
+            const auto skip=[](const char* why){native_reject(g_nb.after_skipped,why);};
+            if(g.latched||g.paused.load()||!g.device||!g.dlss_ready){skip("DLSS is not ready (paused, stopped or still starting).");return;}
+            if(g.inl.valid||g.submitted_frame==g.frame)return; // this frame already has its DLSS
+            if(na::observe::ListRecording(l)!=c->recording||!na::observe::ListStateRestorable(l)){skip("The game's state at the upscale pass cannot be restored.");return;}
             uint64_t depth=0,color=0;na::observe::GetLiveSelection(&depth,&color);
-            if(color!=c->color||depth!=c->depth)return;
+            if(color!=c->color||depth!=c->depth){skip("The scene selection changed during the frame.");return;}
             ID3D12CommandList* one[]{l};SceneInput saved;
             const bool local=na::observe::ListRendersTo(l,color,depth);
-            if(!local){saved=g.native_scene;if(saved.frame!=g.frame||saved.color!=color||saved.depth!=depth)return;}
+            if(!local){saved=g.native_scene;if(saved.frame!=g.frame||saved.color!=color||saved.depth!=depth){skip("The scene list's camera was not kept for this upscale pass.");return;}}
             if(local&&(!g.inline_camera_submitted||(g.jit.valid&&g.jit.applied)))jitter_batch(one,1);
             g.inline_sample_locked=true;
             const uint32_t slot=g.slot;PendingHistory pending;ID3D12GraphicsCommandList* out=nullptr;bool touched=false;
@@ -3518,7 +3563,12 @@ public:
                 g.slots[slot].native_scale_use=lease;
             }
             if(touched&&!na::observe::RestoreListState(l)){g.latched=true;reason("Stopped: native-scale pass could not restore game state.");return;}
-            if(!ok){na::capture::j2::Discard(pending.capture,true);++g.stats.inline_record_failed;return;}
+            if(!ok){na::capture::j2::Discard(pending.capture,true);++g.stats.inline_record_failed;
+                g_nb.record_failed.fetch_add(1,std::memory_order_relaxed);
+                {std::lock_guard<std::mutex> nb(g_nb.m);std::snprintf(g_nb.reason,sizeof g_nb.reason,"DLSS recording at the upscale pass failed: %s",g.stats.reason);}
+                return;}
+            g_nb.recorded.fetch_add(1,std::memory_order_relaxed);
+            {std::lock_guard<std::mutex> nb(g_nb.m);std::snprintf(g_nb.reason,sizeof g_nb.reason,"%s","DLSS reconstructs at the game's own upscale pass.");}
             g.slot=(slot+1)%kRing;g.inl.list=l;g.inl.rec=c->recording;g.inl.frame=g.frame;g.inl.slot=slot;
             g.inl.writes=na::observe::ListInsertionDecision(l,color).writes;g.inl.color=color;g.inl.history=pending;g.inl.valid=true;g.inl_frame=g.frame;
             ++g.stats.inline_recorded;g.inline_mode=true;
@@ -5042,6 +5092,18 @@ void EnableNativeScaleBridge(bool enabled) {
     g_native_bridge.store(enabled);g_native_reduced.store(false);
     if(enabled){na::observe::SetOperationSnapshots(true);na::observe::SetRasterStateTracking(true);
         na::observe::SetShaderOperationHook(na::observe::ShaderLane::Reconstruction,std::make_shared<NativeScaleHook>());}
+}
+NativeBridgeStats GetNativeBridgeStats() {
+    NativeBridgeStats r;auto& n=g_nb;
+    r.enabled=g_native_bridge.load();r.reduced=g_native_reduced.load();
+    r.hints=n.hints.load();r.examined=n.examined.load();r.not_reading=n.not_reading.load();r.snapshot=n.snapshot.load();
+    r.source_size=n.source_size.load();r.draw_state=n.draw_state.load();r.viewport=n.viewport.load();r.no_destination=n.no_destination.load();
+    r.ambiguous=n.ambiguous.load();r.candidates=n.candidates.load();r.recorded=n.recorded.load();r.record_failed=n.record_failed.load();
+    r.after_skipped=n.after_skipped.load();
+    {std::lock_guard<std::mutex> lock(g_up_m);r.rw=g_native_extent.rw;r.rh=g_native_extent.rh;r.ow=g_native_extent.ow;r.oh=g_native_extent.oh;}
+    std::lock_guard<std::mutex> lock(n.m);std::snprintf(r.reason,sizeof r.reason,"%s",n.reason);
+    r.src_w=n.src_w;r.src_h=n.src_h;r.src_fmt=n.src_fmt;r.seen_w=n.seen_w;r.seen_h=n.seen_h;r.seen_fmt=n.seen_fmt;
+    return r;
 }
 void SetNativeRenderExtent(uint32_t rw,uint32_t rh,uint32_t ow,uint32_t oh) {
     {std::lock_guard<std::mutex> lock(g_up_m);g_native_extent={rw,rh,ow,oh};}
