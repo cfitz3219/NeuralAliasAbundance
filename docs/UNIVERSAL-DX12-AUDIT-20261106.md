@@ -208,8 +208,72 @@ runtime probe, three unsupported 16x-MSAA cases, and the external upscaler jitte
 runtime test. Final combined qualification and handoff are appended below after
 completion; earlier receipts are not promoted to final-source evidence.
 
-The changes make the program smaller and remove specific wasted work and
+The changes make the source slimmer and remove specific wasted work and
 ordering defects. They do not prove that no further optimization exists, restore
 130 game FPS by assertion, or qualify all engines/window modes without Cort's
 tests. The remaining compatibility work is concrete acquisition/adapter/state
 coverage, not a reason to discard the core or build another framework.
+
+## Final qualification and integration handoff
+
+Runtime source: **`12eb534cd1e070d5e0f596e76dbf140256eb040e`**.
+Integration: [PR116](https://github.com/cfitz3219/NeuralAliasAbundance/pull/116)
+into `claude/se5-overhead-argon`; no extra broad review cycle requested.
+
+- Complete production discovery-adapter Release build passed with SDKs/NVRHI.
+- Fresh final full suite: **227 passed, 5 skipped, 0 failed, 232 cases,
+  376.25 seconds**, `qualified-final-tests.log`.
+- Forced WARP: **8/8 passed, 0 skipped/failed, 15.34 seconds**, including all
+  four native graphics/compute/merged/separate variants, backend, allocation,
+  GPU services and NVRHI Donut.
+- Final focused checks: **9/9 passed, 14.33 seconds**. These include corrected
+  colour conversion, native controller, native bridge, proxy and AMD flow.
+- Isolated additive install, update preserving settings, tamper refusal, exact
+  rollback and foreign-DLL preservation: **5/5 passed**. First reused harness
+  attempt compared against the previous DLL's hardcoded hash; corrected the
+  harness expectation to this candidate and reran all five. Actual game touched:
+  **false**; production running-game guard retained.
+- Final AMD CPU recording benchmark: **524.53 us mean, 597.10 us p95**, 100 warm
+  samples. Before was 617.51 us mean. The final mean is about 15% lower; timings
+  are local component measurements, not an FPS estimate.
+- Final unprofiled 6,000-draw/4-thread synthetic recording benchmark (one
+  descriptor copy and one write per draw, 64-entry ranges): bypass 0.8763 ms mean,
+  full observer 1.8422 ms, observer plus HUD listener 1.9487 ms. No model or GPU
+  submission is timed. The older baseline run had profiling enabled, so it is
+  **not** a valid percentage comparison with these unprofiled numbers. This
+  remaining roughly 1.07 ms wall-time difference is why reducing unnecessary
+  observation/route activation matters; it is not proof of a game's FPS limit.
+
+Negative-control build qualification correction: after intentionally putting the
+old Present guard back, restoring the source with Copy-Item also restored its
+older timestamp. MSBuild reused that deliberately broken object. The intervening
+combined suite therefore failed exactly the two negative-control cases. The
+source was verified, its timestamp advanced, and the corrected implementation
+explicitly rebuilt. The final 9 focused and 232-case results above are after
+that rebuild. `combined-final-tests.log` preserves the failed artifact run;
+`qualified-final-tests.log` is the final-source receipt. No installer was
+published or game modified with the negative-control artifact.
+
+Core DLL SHA256:
+`52EE928CB722B3C9A4F472897A75F5A16DD7D8F280E33CA46F19FED371E442B3`.
+The combined DLL is 4,066,304 bytes versus the baseline's 4,020,224 bytes: new
+production functionality outweighs the dead-code removal. No binary-size
+reduction is claimed. Staged locally as
+`local/universal-dx12-audit-20261106/NA-SE5-audit-12eb534`, with **17 verified
+payloads** and the existing additive rollback. User CMD aliases were not changed.
+
+Opus concurrently published `d4ed2b7`, including new XeGTAO temporal work from
+`bdd0fbd`. That later feature is outside this frozen runtime qualification. I
+read it and posted three concrete findings to main COMMS (`62be385`): Prepare
+advances history/parity before recording/submission, disabled/unavailable history
+still allocates four textures and runs the temporal pass, and the public motion
+input must not blindly create an R32G32 SRV for a different actual format. Opus
+owns those active AO edits; this audit does not count them as repaired or tested.
+The findings specify discard, never-recorded and multiple-in-flight regressions
+and reuse of existing Frame/lease/commit machinery. The temporal method itself
+is useful; these are implementation corrections, not a request to remove it.
+
+Merge PR116 normally into Opus's current line to preserve that newer work.
+Read-only merge-tree against `d4ed2b7` succeeds cleanly (tree
+`6434fdab6b525f2eae2a64107fdf0460864c546d`). Do not replace his current branch or
+CMD with this earlier feature snapshot. Cort still owns all actual game testing.
