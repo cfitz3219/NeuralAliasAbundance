@@ -22,6 +22,9 @@ The 5 s status samples stay. These additions sit next to them in the same per-pr
 | `camera_cut` | the camera history is reset | why (no_history/gap/translation/rotation/fov/origin/restart_*), value, held, from_j1; `fov` = a zoom such as a scope |
 | `virtual_screen` | the screen the game is told about changes (scale, monitor or window origin); every game move/resize of its own window; every ResizeTarget mapped back | game and physical size, scale, monitor real->virtual, origin, primary, device; `window_pos game=... physical=... clamped=`; `resize_target game= physical=` |
 | `swapchain set_fullscreen` | the game (or anyone) switches DXGI fullscreen | want, target, hr, state after, caller game/other, advertised size |
+| `camera_interloper` | a second camera that flipped into the main camera's slot and came back is learned; later sightings are skipped (first + every 256th logged) | learned known= pos fov; rejected n= pos fov. Status: `j2_cuts ... interlopers{kept_main= skipped=}` |
+| `game_motion` | the game's own motion texture: first summary after 64 measured frames, then every change of the used candidate/encoding | `use`/`none`/`first` + game_motion{cands scored measured good used=c/encoding locked dropped fed last{c best ratio second px moving nonfinite max}}. Status: `j2_game_motion{...}` |
+| `smear_test` | the smear test (menu button or Shift + capture key): start, each variant's capture, done | start/done dir=; mode= recorded= written= dropped_busy= evals=. Folders: captures\\smear-*\\<n-variant>, meta `smear_mode`, `dlss{}` and `game_motion_fed` |
 | `device_removed` | device removal detected | hr (the DRED file also starts with time and frame) |
 
 ## Periodic blocks

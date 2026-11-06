@@ -7362,6 +7362,25 @@ bool ListNativeOperation(ID3D12GraphicsCommandList* list, bool compute, NativeOp
     for(auto& c:next.constants){c.resource.Attach(AcquireResource(c.resource_id));if(!c.resource)return fail("A scene dimension buffer has retired.");}
     out = std::move(next); return true;
 }
+// Read-only: 2D textures whose recorded creation has one of `formats` and exactly w x h
+// (Claude 2026-11-06, Cort's OK: J2 captures a game velocity candidate). Walks every known
+// resource under the shared lock; call rarely (capture time), never per draw.
+uint32_t FindTextures(const uint32_t* formats, uint32_t format_count, uint32_t w, uint32_t h, na_object_id* out, uint32_t max)
+{
+    if (!formats || !format_count || !out || !max) return 0;
+    std::shared_lock<RegistryLock> lock(g_m);
+    uint32_t n = 0;
+    for (const auto& kv : g_res_keys) {
+        uint32_t rw = 0, rh = 0, rf = 0;
+        if (!resource_dims_locked(kv.first, &rw, &rh, &rf) || rw != w || rh != h) continue;
+        bool match = false;
+        for (uint32_t i = 0; i < format_count && !match; ++i) match = formats[i] == rf;
+        if (!match) continue;
+        out[n++] = kv.first;
+        if (n == max) break;
+    }
+    return n;
+}
 ID3D12Resource* AcquireResource(na_object_id id)
 {
     std::shared_lock<RegistryLock> lock(g_m);

@@ -1062,6 +1062,17 @@ void DrawLiveDlaa()
         if (Button(lbl)) na::capture::j2::RequestTimestamped(n);
         ImGui::EndDisabled();
         EndRow();
+        {   // Smear test: DLAA variants back to back, 8 captured frames each (Cort 2026-11-06).
+            const bool running = na::j2::SmearTestRunning();
+            BeginRow("Smear test", "About 20 seconds: DLAA runs in 7 variants one after another (normal, no motion, current frame only, no sharpening, DLSS preset L, the game's own motion, normal) and saves 8 frames of each. The picture changes while it runs; keep the view still. Shift + the capture key starts it too.", ButtonWidth("Start smear test"));
+            ImGui::BeginDisabled(!on || running || na::capture::j2::Armed());
+            if (Button("Start smear test")) na::j2::StartSmearTest();
+            ImGui::EndDisabled();
+            EndRow();
+            char smear_text[200] = {};
+            na::j2::SmearTestStatus(smear_text, sizeof smear_text);
+            if (smear_text[0]) StatusLine(0, smear_text);
+        }
         if (cs.requested) {
             char cl[200];
             std::snprintf(cl, sizeof cl, "Capture: %u of %u recorded, %u saved, %u skipped (busy), %u without the presented picture, %u errors.",

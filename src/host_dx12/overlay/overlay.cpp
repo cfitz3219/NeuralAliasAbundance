@@ -1200,11 +1200,18 @@ void write_status_line()
             WriteFile(f, "\r\n", 2, &written, nullptr);
         }
         {   // Why DLSS history restarted (Cort: a blink every ~30 s while standing still).
-            char cl2[400];
-            const int cn2 = snprintf(cl2, sizeof cl2, "j2_cuts restarts=%llu gap=%llu motion=%llu bridged=%llu now=%llu recent=%s\r\n",
+            char cl2[600];
+            const int cn2 = snprintf(cl2, sizeof cl2, "j2_cuts restarts=%llu gap=%llu motion=%llu bridged=%llu interlopers{kept_main=%llu skipped=%llu} velocity_capture{candidates=%llu captured=%llu unknown_state=%llu} now=%llu recent=%s\r\n",
                 (unsigned long long)j2.cut_restarts, (unsigned long long)j2.cut_gap, (unsigned long long)j2.cut_motion, (unsigned long long)j2.gap_bridged,
+                (unsigned long long)j2.camera_interlopers, (unsigned long long)j2.camera_interloper_picks,
+                (unsigned long long)j2.velocity_candidates, (unsigned long long)j2.velocity_captured, (unsigned long long)j2.velocity_capture_unknown_state,
                 (unsigned long long)(GetTickCount64() / 100 % 100000000), j2.recent_cuts);
             if (cn2 > 0) WriteFile(f, cl2, static_cast<DWORD>((std::min)(cn2, static_cast<int>(sizeof(cl2) - 1))), &written, nullptr);
+            if (j2.game_motion[0]) {
+                WriteFile(f, "j2_", 3, &written, nullptr);
+                WriteFile(f, j2.game_motion, static_cast<DWORD>(std::strlen(j2.game_motion)), &written, nullptr);
+                WriteFile(f, "\r\n", 2, &written, nullptr);
+            }
             {
                 const char* eff = na::settings::EffectiveSummary();
                 if (eff && eff[0]) { WriteFile(f, eff, static_cast<DWORD>(std::strlen(eff)), &written, nullptr); WriteFile(f, "\r\n", 2, &written, nullptr); }
@@ -2030,8 +2037,10 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     if (msg == WM_KEYDOWN && !(lp & (1 << 30)) && na::j2::Enabled()) {
         const uint32_t key = na::settings::Get().j2_capture_key.load(std::memory_order_relaxed);
-        if (key && wp == key && !na::capture::j2::Armed()) // J2 evidence capture, N consecutive frames
-            na::capture::j2::RequestTimestamped(na::settings::Get().j2_capture_frames.load());
+        if (key && wp == key && !na::capture::j2::Armed()) { // J2 evidence capture, N consecutive frames
+            if (GetKeyState(VK_SHIFT) & 0x8000) { if (!na::j2::SmearTestRunning()) na::j2::StartSmearTest(); } // Shift: the smear test
+            else na::capture::j2::RequestTimestamped(na::settings::Get().j2_capture_frames.load());
+        }
     }
     if (msg == kMsgCursorShow || msg == kMsgCursorRestore) {
         g_cursor_message_pending.store(false);

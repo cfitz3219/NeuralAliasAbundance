@@ -244,6 +244,8 @@ struct Stats {
     uint64_t sharpened_frames = 0; // RCAS applied to the DLAA result
     uint64_t nis_frames = 0;       // Legacy log field; live sharpening is RCAS-only.
     uint64_t jitter_writes = 0;   // J1: camera matrices replaced by jittered copies
+    uint64_t velocity_candidates = 0, velocity_captured = 0, velocity_capture_unknown_state = 0; // game motion-buffer candidates at scene extent (captures)
+    uint64_t camera_interlopers = 0, camera_interloper_picks = 0; // frames kept on the main camera / candidates skipped (a second camera in the slot)
     uint64_t camera_learned_hits = 0, camera_scans = 0; // camera found at the learned slot / by a full search
     // Several valid cameras in one frame (reflection, sky, light): frames where more than one
     // candidate was seen / where the chosen one was not the first-ranked. Lost-camera reasons:
@@ -267,6 +269,7 @@ struct Stats {
     uint64_t jitter_p_scan_cached = 0, jitter_p_scan_solved = 0; // standalone-P search: skipped blocks / solver calls
     uint64_t gap_bridged = 0; // same-epoch acquisition gaps longer than 4 frames kept without a restart
     char recent_cuts[240] = {};
+    char game_motion[400] = {}; // game_motion.cpp Describe(): candidate scoring and the tier 1 feed
     uint64_t camera_from_j1 = 0;
     uint64_t jitter_extent_rescaled = 0; // the render extent changed after J1 jittered this frame: sample rescaled // the scene list held no camera; J1's camera of this same frame (with its jitter) was used
     // Historical field retained for Results compatibility; learned depth guesses
@@ -408,6 +411,11 @@ struct Stats {
     uint64_t inline_record_failed = 0; // an inline placement fired but recording DLAA failed (reason in the tally)
 };
 Stats GetStats();
+// Smear test (live_dlaa.cpp): a fixed sequence of DLAA variants, 8 captured frames each, into
+// captures\smear-<time>-<exe>-p<pid>\<n-variant>. Starts with the next native DLAA frame.
+void StartSmearTest();
+bool SmearTestRunning();
+void SmearTestStatus(char* text, size_t capacity);
 
 // Releases GPU objects (test hosts; the caller guarantees GPU idle).
 void Shutdown();

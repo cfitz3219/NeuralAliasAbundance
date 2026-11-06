@@ -68,6 +68,12 @@ struct Identity {
     uint64_t jitter_epoch = 0;
     uint64_t hud_probe_source=0,hud_probe_generation=0;
     float flow_jitter_x=0,flow_jitter_y=0;uint32_t flow_jitter_convention=0;uint64_t flow_jitter_epoch=0;
+    // What DLSS was actually given (RC 2026-11-06: flags were only inferable from source).
+    bool dlss_hdr = false, dlss_depth_inverted = false, dlss_auto_exposure = false, dlss_mv_lowres = true, dlss_mv_jittered = false;
+    bool dlss_bias_mask = false, jitter_shifted = false, game_motion_fed = false;
+    float dlss_pre_exposure = 1.f, dlss_exposure_scale = 1.f;
+    uint32_t dlss_quality = 0;
+    int smear_mode = -1; // smear test variant (live_dlaa.cpp kSmearModes), -1 = not running
 };
 
 // Extra named planes (provenance, camera-only motion, flow residual/valid/mask, HUD layers...).
