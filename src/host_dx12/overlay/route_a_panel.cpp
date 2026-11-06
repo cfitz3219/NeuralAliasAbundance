@@ -972,6 +972,14 @@ void DrawLiveDlaa()
           else if(na::scale::GetAutomaticSceneStats().enabled){const auto automatic=na::scale::GetAutomaticSceneStats();
               StatusLine(automatic.active?1:0,automatic.reason);}
           else StatusLine(0, na::scale::GetDriverStats().state);
+        if (na::j2::RenderSmall()) {
+            // Borderless/full screen make the game ignore the smaller size; a window that covers
+            // the screen keeps Quality/Balanced/Performance working and looks the same.
+            bool fill = ss.fill_screen.load() != 0;
+            BeginRow("Fill the screen", "Keeps the game in its Windowed mode and removes the window's frame so it covers the whole screen, like borderless. Set the game's own display mode to Windowed: in borderless or full screen the game ignores the smaller size, so Quality, Balanced and Performance cannot work there. Applies at once.", S(220));
+            if (ImGui::Checkbox("##fillscreen", &fill)) { ss.fill_screen.store(fill ? 1u : 0u); na::settings::Save(); }
+            EndRow();
+        }
     }
     {
         na::settings::Settings& ss = na::settings::Get();

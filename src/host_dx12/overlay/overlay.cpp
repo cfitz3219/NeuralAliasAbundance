@@ -1797,6 +1797,8 @@ void record_raw_input(HRAWINPUT h)
 constexpr UINT kMsgCursorShow = WM_APP + 31;
 constexpr UINT kMsgCursorRestore = WM_APP + 32;
 constexpr UINT kMsgNudge = WM_APP + 33;        // A63: shrink the game window by one pixel
+constexpr UINT kMsgFill = WM_APP + 34;         // render-small: make the windowed game cover its monitor, borderless
+constexpr UINT kMsgUnfill = WM_APP + 35;       // put the window's own frame, style and place back
 constexpr UINT_PTR kNudgeTimer = 0x4E41;       // A64: restore timer id on the game's window ("NA")
 constexpr UINT kNudgeRestoreMs = 120;          // A64: restore after this, by timer, not by frames
 constexpr uint32_t kNudgeRestoreRetries = 8;   // A64: restore attempts before giving up
@@ -1915,6 +1917,99 @@ LRESULT call_game_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     return CallWindowProcW(g_state.orig_wndproc, hwnd, msg, wp, lp);
 }
+// ---- Fill screen (render-small, Cort 2026-11-06) ----
+// In borderless or exclusive full screen the game sizes itself from the monitor and ignores
+// our smaller-size request (p36120: resize asked 3, ok 1, failed 2, stayed DLAA). In a window
+// it follows every request. So the game stays in its windowed mode and we make that window
+// borderless and the size of its monitor: it looks like borderless full screen, while the
+// game still believes it is a window. All window changes happen on the window's own thread
+// (posted messages), never from Present. If the game keeps putting its frame back, we stop.
+struct FillState {
+    bool saved = false, filled = false, gave_up = false;
+    LONG_PTR style = 0, ex_style = 0;
+    RECT rect{};
+    uint32_t fills = 0;
+    ULONGLONG window_start = 0;
+};
+FillState g_fill; // window thread only
+std::atomic<bool> g_fill_pending{false};
+std::atomic<bool> g_fill_active{false};
+std::atomic<bool> g_fill_gave_up{false};
+constexpr LONG_PTR kFrameStyles = WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_BORDER | WS_DLGFRAME;
+constexpr LONG_PTR kFrameExStyles = WS_EX_DLGMODALFRAME | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE | WS_EX_WINDOWEDGE;
+bool window_fills_monitor(HWND hwnd, RECT* monitor_rect)
+{
+    MONITORINFO mi{sizeof mi};
+    if (!GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi)) return true; // unknown: leave it alone
+    if (monitor_rect) *monitor_rect = mi.rcMonitor;
+    RECT r{};
+    if (!GetWindowRect(hwnd, &r)) return true;
+    const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    return !(style & (WS_CAPTION | WS_THICKFRAME)) && EqualRect(&r, &mi.rcMonitor);
+}
+void handle_fill_message(HWND hwnd, bool fill)
+{
+    g_fill_pending.store(false, std::memory_order_release);
+    if (fill) {
+        if (g_fill.gave_up || IsIconic(hwnd)) return;
+        RECT mon{};
+        if (window_fills_monitor(hwnd, &mon)) { g_fill.filled = true; g_fill_active.store(true); return; }
+        const ULONGLONG now = GetTickCount64();
+        if (now - g_fill.window_start > 30000) { g_fill.window_start = now; g_fill.fills = 0; }
+        if (++g_fill.fills > 5) { // the game restores its frame every time: stop fighting it
+            g_fill.gave_up = true;
+            g_fill_gave_up.store(true);
+            na::eventlog::Emit("fill_screen", "gave_up=1 reason=\"the game keeps restoring its window frame\"");
+            return;
+        }
+        if (!g_fill.saved) {
+            g_fill.style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            g_fill.ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            GetWindowRect(hwnd, &g_fill.rect);
+            g_fill.saved = true;
+        }
+        const LONG_PTR style = (GetWindowLongPtrW(hwnd, GWL_STYLE) & ~kFrameStyles) | WS_POPUP;
+        const LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & ~kFrameExStyles;
+        SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
+        const BOOL ok = SetWindowPos(hwnd, nullptr, mon.left, mon.top, mon.right - mon.left, mon.bottom - mon.top,
+                                     SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
+        g_fill.filled = ok != FALSE;
+        g_fill_active.store(g_fill.filled);
+        na::eventlog::Emit("fill_screen", "filled=%u monitor=%ldx%ld at=%ld,%ld was{%ldx%ld style=0x%llX} attempt=%u error=%lu",
+                           ok ? 1u : 0u, long(mon.right - mon.left), long(mon.bottom - mon.top), long(mon.left), long(mon.top),
+                           long(g_fill.rect.right - g_fill.rect.left), long(g_fill.rect.bottom - g_fill.rect.top),
+                           (unsigned long long)g_fill.style, g_fill.fills, ok ? 0ul : GetLastError());
+    } else {
+        if (!g_fill.saved) return;
+        SetWindowLongPtrW(hwnd, GWL_STYLE, g_fill.style);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, g_fill.ex_style);
+        const RECT& r = g_fill.rect;
+        SetWindowPos(hwnd, nullptr, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                     SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
+        na::eventlog::Emit("fill_screen", "restored=1 size=%ldx%ld", long(r.right - r.left), long(r.bottom - r.top));
+        g_fill = FillState{};
+        g_fill_active.store(false);
+        g_fill_gave_up.store(false);
+    }
+}
+// Present thread, cheap: every 30 game frames, ask the window thread to fill or restore.
+void fill_screen_tick(IDXGISwapChain* sc)
+{
+    static uint32_t n = 0;
+    if (++n % 30 || !sc || !na::j2::RenderSmall()) return;
+    DXGI_SWAP_CHAIN_DESC d{};
+    if (FAILED(sc->GetDesc(&d)) || !d.OutputWindow || !IsWindow(d.OutputWindow)) return;
+    const bool want = na::settings::Get().fill_screen.load(std::memory_order_relaxed) != 0;
+    if (g_fill_pending.load(std::memory_order_acquire)) return;
+    if (want && d.Windowed && !g_fill_gave_up.load() && !IsIconic(d.OutputWindow) && !window_fills_monitor(d.OutputWindow, nullptr)) {
+        g_fill_pending.store(true, std::memory_order_release);
+        if (!PostMessageW(d.OutputWindow, kMsgFill, 0, 0)) g_fill_pending.store(false);
+    } else if (!want && g_fill_active.load()) {
+        g_fill_pending.store(true, std::memory_order_release);
+        if (!PostMessageW(d.OutputWindow, kMsgUnfill, 0, 0)) g_fill_pending.store(false);
+    }
+}
 LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     na::latency::pcl::Message(msg, wp);
@@ -1933,6 +2028,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         sync_cursor();
         return 0;
     }
+    if (msg == kMsgFill || msg == kMsgUnfill) { handle_fill_message(hwnd, msg == kMsgFill); return 0; }
     if (msg == kMsgNudge) { // A63/A64: one pixel smaller; the game sees WM_SIZE and (hopefully) rebuilds
         g_nudge_attempts.fetch_add(1, std::memory_order_relaxed);
         g_nudge_restore_tries = 0;
@@ -3005,6 +3101,7 @@ void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue_hint = nullptr)
     if (!present_prelude(sc, queue,retained_queue,queue_hint)) return;
     na::j2::OnPresent(queue); // one game-frame boundary, never a TEST Present
     note_identity(sc, queue);
+    fill_screen_tick(sc);
     na::settings::WatchChanges("code"); // changes made outside the panel (mode commit, ini, safe start)
     na::scale::AutomaticScenePresent();
     if (na::scale::SliderRouteActive()) na::scale::TickLive(na::j2::GetStats().width); // P4-4: confirm a live render-scale change
@@ -3159,6 +3256,7 @@ HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_
     na::j2::OnPresent(queue); // game call only; the presenter's generated frames bypass this
     na::settings::WatchChanges("code");
     note_identity(sc, queue);
+    fill_screen_tick(sc);
     if (na::j2::RenderSmall()) small_follow_mode();
     if (na::scale::SliderRouteActive()) na::scale::TickLive(na::j2::GetStats().width); // P4-4: confirm a live render-scale change
     g_present_caller.store(GetCurrentThreadId());
