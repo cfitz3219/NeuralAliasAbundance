@@ -19,7 +19,7 @@ int main(){
     CHECK(!na::gpu::Enabled());na::gpu::Recording disabled;CHECK(!disabled.Open(d.device.Get(),d.queue.Get()));
     REQUIRE(na::observe::InstallProducers(d.device.Get(),d.queue.Get(),false));
     const auto before=na::observe::GetProducerStats();
-    na::settings::Get().experimental_nvrhi=1;
+    na::gpu::SetBackendForTests(na::gpu::TestBackend::Nvrhi);
     constexpr unsigned W=16,H=16;constexpr auto Read=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     D3D12_RESOURCE_DESC td{};td.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;td.Width=W;td.Height=H;td.DepthOrArraySize=td.MipLevels=1;
     td.Format=DXGI_FORMAT_R32G32B32A32_FLOAT;td.SampleDesc.Count=1;td.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;

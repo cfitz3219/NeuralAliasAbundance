@@ -147,10 +147,9 @@ DWORD WINAPI InitThread(LPVOID)
     // J2 DLAA reconstructs texture detail over frames: the game's mip-mapped
     // samplers sample one mip sharper (temporal-upscaler rule log2(render/display) - 1
     // = -1 at native). Configure before installing producer hooks, after the
-    // previous-session marker is read. [j2] mip_bias overrides; 0 turns it off.
+    // previous-session marker is read. Normal DLAA always targets total -1;
+    // old persisted comparison choices do not override it.
     if (GetPrivateProfileIntW(L"j2", L"enabled", 0, g_ini) == 1 && GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1) {
-        wchar_t mb[32] = {};
-        GetPrivateProfileStringW(L"j2", L"mip_bias", L"-1.0", mb, 32, g_ini);
         na::observe::SetSamplerMipBias(0.f); // defer the saved effect until renderer recovery is known
         // Live switching (no restarts, Cort 2026-11-05): the game's own root signatures and
         // pipelines are left as the game made them; twins carry the mip bias and anisotropic
@@ -161,8 +160,9 @@ DWORD WINAPI InitThread(LPVOID)
         na::observe::SetSamplerMipBiasLiveEnabled(!na::settings::SafeStart() && GetPrivateProfileIntW(L"j2", L"mip_bias_live", 1, g_ini) != 0);
         na::observe::SetSamplerMipPrewarm(GetPrivateProfileIntW(L"j2", L"mip_prewarm", 1, g_ini) != 0);
         if (!na::settings::SafeStart()) {
-            const auto& st = na::settings::Get();
-            const float user = static_cast<float>(st.j2_mip_bias_x100.load()) / 100.f;
+            auto& st = na::settings::Get();
+            st.j2_mip_bias_x100.store(-100);
+            const float user = -1.f;
             float wanted[4] = {user, user, user, user};
             int n = 1;
             if (GetPrivateProfileIntW(L"present", L"render_small", 0, g_ini) == 1) {
@@ -315,10 +315,12 @@ DWORD WINAPI InitThread(LPVOID)
         boot_log(na::native_present::InstallSizeHooks() ? "render-small: size hooks installed" : "render-small: size hooks FAILED");
         // Four finite, GPU-checked methods. Old manual HUD preferences do not
         // choose the renderer or disable DLSS. Exhaustion leaves ordinary DLSS.
-        na::j2::native_hud::Install();
-        na::j2::native_hud::SetAutomatic(true);
+        if(GetPrivateProfileIntW(L"present",L"hud_separation",1,g_ini)!=0){
+            na::j2::native_hud::Install();
+            na::j2::native_hud::SetAutomatic(true);
+        }
         na::j2::SetHudMaskEnabled(false); // temporal protection is not verified separation
-        boot_log("render-small: automatic HUD methods; ordinary DLSS on exhaustion");
+        boot_log(na::j2::native_hud::Automatic()?"render-small: automatic HUD methods; ordinary DLSS on exhaustion":"render-small: HUD separation disabled by ini; ordinary DLSS unchanged");
         // Ultra Performance is not offered with render-small (the HUD would be drawn at 33%).
         if (na::settings::Get().j2_scale_mode.load() > 3) na::settings::Get().j2_scale_mode.store(3);
         const int small_mode = static_cast<int>(na::settings::Get().j2_scale_mode.load());

@@ -1,6 +1,5 @@
 #include "services.hpp"
 #include "mem_alloc.hpp"
-#include "host_dx12/settings.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include <atomic>
 #include <mutex>
@@ -18,6 +17,7 @@
 namespace na::gpu {
 namespace {
 std::atomic<uint64_t> textures{0},opens{0},submits{0},collections{0},errors{0},dispatches{0},bindings{0},retained{0};
+std::atomic<TestBackend> testBackend{TestBackend::Automatic};
 #if defined(NA_HAVE_NVRHI)
 struct Messages final:nvrhi::IMessageCallback {
     void message(nvrhi::MessageSeverity severity,const char* text)override {
@@ -80,7 +80,18 @@ nvrhi::ResourceStates state(D3D12_RESOURCE_STATES s){using S=nvrhi::ResourceStat
 struct Allocation {std::shared_ptr<Context> context;nvrhi::TextureHandle texture;~Allocation(){na::observe::HostWorkScope own;texture=nullptr;}};
 #endif
 }
-bool Enabled(){return na::settings::Get().experimental_nvrhi.load(std::memory_order_relaxed)!=0;}
+bool Enabled(){
+#if defined(NA_HAVE_NVRHI)
+    // Existing native recording already pools allocators/descriptors and uses
+    // the same D3D12MA backing. NVRHI adds imports, state tracking and another
+    // queue fence without removing that work. Paired production-Bloom CPU
+    // measurements favour native; do not enable extra overhead by default.
+    return testBackend.load(std::memory_order_relaxed)==TestBackend::Nvrhi;
+#else
+    return false;
+#endif
+}
+void SetBackendForTests(TestBackend backend){testBackend.store(backend,std::memory_order_relaxed);}
 bool CreateTexture(ID3D12Device* dev,ID3D12CommandQueue* queue,const D3D12_RESOURCE_DESC& td,D3D12_RESOURCE_STATES initial,Texture& out){
     na::observe::HostWorkScope own;out.Reset();
     // One physical allocator for native and NVRHI use. Private-data allocation

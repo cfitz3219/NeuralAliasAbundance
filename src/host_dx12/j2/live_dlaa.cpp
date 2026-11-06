@@ -3022,15 +3022,25 @@ int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
         uint64_t producer = 0;
         for (const auto& e : events) {
             if (e.write) { writes = true; consumed = false; producer = e.producer; continue; }
-            if (!na::j2::IsConsumer(e.op)) continue; // a barrier alone is not a consumer
+            const bool entry = na::j2::IsEntry(e.op);
+            // Inline needs a scene draw in its own recording. A learned entry
+            // in a pure post list instead uses this submitted-scene handoff.
+            // Unqualified entries are not evidence of a colour read.
+            if (entry ? !g.entries.Accepts(e.raw) : !na::j2::IsConsumer(e.op)) continue;
             if (!writes && !consumed && saved.frame == g.frame) {
                 const auto cls = na::j2::MakeClass(e.raw, g.scene_w, g.scene_h);
                 const auto verdict = g.profile.Judge(cls, saved.producer);
                 using V = na::j2::ConsumerProfile::Verdict;
-                if ((verdict == V::Accepted || verdict == V::AcceptedWithProducer) &&
-                    record(lists, 0, depth, color, ours, pending, nullptr, nullptr, &saved, i)) {
-                    g.class_fired = true;
-                    g.fired_mode = 5;
+                bool recorded = false;
+                if(entry || verdict == V::Accepted || verdict == V::AcceptedWithProducer){
+                    g.capture_entry=entry?e.raw:na::j2::InsertionEvent{};
+                    recorded=record(lists, 0, depth, color, ours, pending, nullptr, nullptr, &saved, i);
+                    g.capture_entry={};
+                }
+                if (recorded) {
+                    g.class_fired = !entry;
+                    g.fired_mode = entry ? 6 : 5;
+                    if(entry){++g.stats.entry_matched;if(g.entries.AcceptedByContext(e.raw))++g.stats.entry_ctx_matched;}
                     g.fired_barrier_event = false;
                     g.fired_class = cls;
                     g.fired_producer = saved.producer;

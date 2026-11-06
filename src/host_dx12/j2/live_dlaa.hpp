@@ -101,10 +101,11 @@ bool HudMaskEnabled();
 bool HudMaskView();
 // Render-small texture bias per DLSS mode (Cort, 2026-11-03; the menu is greyed out there):
 // Quality (67%) -1.585, Balanced (58%) -2, Performance (50%) -2.25 (Cort 2026-11-04: -2.5 was
-// a little too strong). DLAA (scale 1) uses the menu's choice.
-inline float SmallMipBias(float user, float scale)
+// a little too strong). DLAA (scale 1) always defaults to total -1; legacy
+// saved user bias is ignored. The overlay displays the total for each mode.
+inline float SmallMipBias(float /*legacy_user*/, float scale)
 {
-    if (!(scale > 0.f && scale < 1.f)) return user;
+    if (!(scale > 0.f && scale < 1.f)) return -1.f;
     return scale >= 0.62f ? -1.5849625f : (scale >= 0.54f ? -2.0f : -2.25f);
 }
 // DLSS preset setting "Automatic" (Cort 2026-11-04): L for DLAA and Quality, M for Balanced and

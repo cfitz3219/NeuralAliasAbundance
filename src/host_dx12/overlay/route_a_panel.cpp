@@ -1139,61 +1139,15 @@ void DrawLiveDlaaEnhancements()
         }
     }
     {
-        // Texture detail (negative mip bias, NVIDIA DLSS guide 3.5: -1 at native).
-        // Live (no restarts): twins of the game's samplers; a choice not prepared at load is
-        // built in the background and switches over when ready. Stored per game.
-        static const char* kDetail[] = {"Off (game's own)", "Light (-0.5)", "Standard (-1, NVIDIA)", "Check: very blurry (+4)"};
-        static const int kDetailX100[] = {0, -50, -100, 400};
-        // The check level is never saved: while it is shown, the saved choice stays as it was.
-        static bool checking = false;
-        na::settings::Settings& ss = na::settings::Get();
-        const int cur = ss.j2_mip_bias_x100.load();
-        int idx = 2;
-        for (int i = 0; i < 3; ++i) if (kDetailX100[i] == cur) idx = i;
-        if (checking) idx = 3;
+        // The automatic number is the TOTAL, including the native sampler's
+        // value. Display the selected target plainly, not as a disabled control.
         const auto ml = na::observe::GetMipLiveStats();
-        const bool live = ml.enabled;
-        BeginRow("Texture detail", "Samples surface textures sharper so DLAA can rebuild their full detail (NVIDIA's DLSS guide recommends -1 at native resolution). The value is the total, the game's own bias included: if the game already uses -1, nothing more is added. Very fine patterns such as fabric weaves can shimmer at -1; Light is gentler. Screen effects are never changed. Switches live; every level is prepared in the background shortly after loading, so later switches are immediate. Remembered for this game.", S(220));
-        ImGui::SetNextItemWidth(S(220));
-        // Render-small DLSS modes set it automatically (NVIDIA: -1 + log2(render/output)):
-        // greyed out, showing the value for the current mode. DLAA keeps the menu's choice.
-        const float small_scale = na::j2::RenderSmall() ? na::present::RenderScale() : 1.f;
-        if (small_scale > 0.f && small_scale < 1.f) {
-            const int detail_mode = static_cast<int>(ss.j2_scale_mode.load());
-            char autod[64];
-            std::snprintf(autod, sizeof autod, "Automatic (%.2f, %s)", na::j2::SmallMipBias(0.f, small_scale),
-                          detail_mode >= 1 && detail_mode <= 4 ? kModes[detail_mode] : "DLSS");
-            const char* one[] = {autod};
-            int zero = 0;
-            ImGui::BeginDisabled();
-            ImGui::Combo("##j2detail", &zero, one, 1);
-            ImGui::EndDisabled();
-        } else if (ImGui::Combo("##j2detail", &idx, kDetail, 4)) {
-            checking = idx == 3;
-            if (!checking) {
-                ss.j2_mip_bias_x100.store(kDetailX100[idx]);
-                na::settings::Save();
-            }
-            na::observe::SetSamplerMipBiasLive(kDetailX100[idx] / 100.0f);
-        }
+        BeginRow("Texture mip bias", "Automatic total for the current mode, including the game's own bias. DLAA: -1.00; Quality: -1.58; Balanced: -2.00; Performance: -2.25. If the game already uses -1, Quality adjusts it by only another -0.58. Updates live with the quality mode.", S(120));
+        PushTitle();ImGui::TextColored(kText,"%.2f",ml.want_bias);PopFont();
         EndRow();
-        uint64_t ns = 0, nst = 0;
-        na::observe::MipBiasCounts(&ns, &nst);
-        na::observe::NativeBiasStats nb;
-        na::observe::NativeMipBiases(&nb);
-        char tb[400];
-        const float active = na::observe::SamplerMipBias();
-        (void)active;
-        if (ml.preparing)
-            std::snprintf(tb, sizeof tb, "Preparing %.2f with %ux filtering in the background (%llu of %llu objects); the current picture stays until it is complete.",
-                          ml.want_bias, ml.want_aniso, static_cast<unsigned long long>(ml.prepare_done), static_cast<unsigned long long>(ml.prepare_total));
-        else
-            std::snprintf(tb, sizeof tb, "In use: %.2f (%llu of the game's built-in samplers changed; %llu fall-backs). Game's own bias on its surface textures: %llu below 0, %llu at 0, %llu above.",
-                          ml.live_bias, static_cast<unsigned long long>(live ? ml.live_static_changed : nst), static_cast<unsigned long long>(ml.fallbacks),
-                          static_cast<unsigned long long>(nb.negative), static_cast<unsigned long long>(nb.zero), static_cast<unsigned long long>(nb.positive));
-        StatusLine(0, tb);
-        (void)ns;
-        if (!live) StatusLine(2, "Live switching is off for this game ([j2] mip_bias_live=0): the change applies to what the game loads next.");
+        if(ml.preparing){char text[128];std::snprintf(text,sizeof text,"Applying %.2f; the current total is %.2f until preparation finishes.",ml.want_bias,ml.live_bias);Hint(text);}
+        else Hint("Automatic total, including the game's own bias.");
+        if (!ml.enabled) StatusLine(2, "Live texture adjustments are disabled for this session.");
     }
     {
         // Anisotropic filtering on the game's surface textures (before DLSS, where the game
@@ -1210,11 +1164,13 @@ void DrawLiveDlaaEnhancements()
         // selector after the profile changes or a read becomes unavailable.
         const auto drv = na::fg::preset::GetAnisoOverride();
         ImGui::SetNextItemWidth(S(220));
+        ImGui::BeginDisabled(drv.ForcedNow());
         if (ImGui::Combo("##aniso", &idx, kAniso, 4)) {
             ss.aniso16.store(kAnisoLevel[idx]);
             na::observe::SetSamplerAnisotropy(kAnisoLevel[idx]);
             na::settings::Save();
         }
+        ImGui::EndDisabled();
         EndRow();
         const auto warn = [](const char* text) {
             ImGui::PushTextWrapPos(0.f);
@@ -1222,13 +1178,11 @@ void DrawLiveDlaaEnhancements()
             ImGui::PopTextWrapPos();
         };
         if (drv.ForcedNow()) {
-            warn("Your graphics driver profile reports its own texture filtering. It may override this choice; use Application-controlled filtering for this game.");
-            if(drv.app_profile&&!drv.write_pending&&ImGui::SmallButton("Use application filtering"))na::fg::preset::RequestAppControlledAniso();
+            warn("Set Anisotropic filtering to \"Application-controlled\" in your graphics driver controls");
         } else if(drv.ForcedThisRun())
             Hint("The current driver profile leaves filtering to the application. If its old override is still active, it clears on the next game launch.");
         else if (!drv.available)
             Hint("If this choice makes no difference, set Anisotropic filtering to \"Application-controlled\" in your graphics driver controls.");
-        if(drv.written&&!drv.write_pending&&ImGui::SmallButton("Restore previous filtering profile"))na::fg::preset::RequestRestoreAniso();
         const auto as = na::observe::GetAnisoStats();
         char tb[240];
         const auto ml2 = na::observe::GetMipLiveStats();
@@ -1367,18 +1321,10 @@ void RegisterLiveDlaaMenu()
 static void DrawExperimentalGpu()
 {
     using namespace na::ui;
-    auto& settings=na::settings::Get();const auto stats=na::gpu::GetStats();bool enabled=settings.experimental_nvrhi.load()!=0;
-    BeginRow("Run effects through NVIDIA NVRHI","Behind-the-scenes test switch: our own extra effects (XeGTAO, Lighting) are submitted through NVIDIA's NVRHI library instead of our own Direct3D 12 code. The picture does not change; leave it off unless testing stability or speed.",SwitchWidth());
-    ImGui::BeginDisabled(!stats.built);
-    if(ImGui::Checkbox("##experimental_gpu",&enabled)){settings.experimental_nvrhi=enabled;na::settings::Save();}
-    ImGui::EndDisabled();EndRow();
     const auto memory=na::gpu::mem::GetStats();const auto preparation=na::background::GetStats();char details[192];
     std::snprintf(details,sizeof details,"GPU scratch memory: %.1f MB used in %.1f MB of reusable heaps.",memory.allocation_bytes/1048576.0,memory.block_bytes/1048576.0);Hint(details);
     std::snprintf(details,sizeof details,"Background preparation: %u working, %u waiting; %llu jobs completed.",preparation.active,
         preparation.pending>=preparation.active?preparation.pending-preparation.active:0,static_cast<unsigned long long>(preparation.completed));Hint(details);
-    if(!stats.built)Hint("This package was built without NVRHI, so the switch is greyed out.");
-    else if(enabled){char status[192];std::snprintf(status,sizeof status,"Shared GPU work: %llu submissions, %llu effect dispatches, %llu managed textures.",
-        static_cast<unsigned long long>(stats.submits),static_cast<unsigned long long>(stats.dispatches),static_cast<unsigned long long>(stats.textures));Hint(status);}
 }
 
 static void DrawDonutLighting()

@@ -128,7 +128,7 @@ int main(int argc,char** argv)
 {
     const bool nvrhi=argc>1&&std::strcmp(argv[1],"--nvrhi")==0;
     if(nvrhi&&!na::gpu::GetStats().built)return test::kSkip;
-    na::settings::Get().experimental_nvrhi=nvrhi;
+    na::gpu::SetBackendForTests(nvrhi?na::gpu::TestBackend::Nvrhi:na::gpu::TestBackend::Native);
     setvbuf(stdout, nullptr, _IONBF, 0); // progress survives a timeout kill
     test::Device d;
     if (!test::CreateDevice(d)) return test::SkipNoDevice("j2_live_test");
