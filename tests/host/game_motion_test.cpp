@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+using Microsoft::WRL::ComPtr;
 using namespace na::j2::game_motion;
 namespace {
 constexpr uint32_t W = 128, H = 80, kSlotsInFlight = 4;
@@ -33,7 +34,7 @@ float pattern(float x, float y) { return 0.5f + 0.25f * std::sin(x * 0.37f) * st
 bool on_block(float x, float y, float t) { const float ox = x - t * DX, oy = y - t * DY; return ox >= 30 && ox < 80 && oy >= 25 && oy < 60; }
 float picture(uint32_t x, uint32_t y, float t)
 {
-    const float fx = x + 0.5f, fy = y + 0.5f;
+    const float fx = static_cast<float>(x) + 0.5f, fy = static_cast<float>(y) + 0.5f;
     if (on_block(fx, fy, t)) { const float ox = fx - t * DX, oy = fy - t * DY; return 1.0f - 0.8f * pattern(ox * 1.7f, oy * 1.3f); }
     return 0.6f * pattern(fx, fy);
 }
@@ -72,7 +73,7 @@ struct Rig {
         up_cand->Map(0, nullptr, reinterpret_cast<void**>(&p));
         for (uint32_t y = 0; y < H; ++y)
             for (uint32_t x = 0; x < W; ++x) {
-                const bool m = motion && on_block(x + 0.5f, y + 0.5f, t);
+                const bool m = motion && on_block(static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f, t);
                 const uint16_t v[2] = {half(m ? DX / W : 0.f), half(m ? DY / H : 0.f)};
                 std::memcpy(p + fv.Offset + y * fv.Footprint.RowPitch + x * 4, v, 4);
             }

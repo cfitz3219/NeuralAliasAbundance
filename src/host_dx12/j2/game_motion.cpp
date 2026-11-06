@@ -34,7 +34,7 @@ cbuffer C : register(b0) {
 };
 
 #define NH 12u
-#define SLOTS 19u
+#define SLOTS 18u
 #define S_ZERO 12u
 #define S_SCORED 13u
 #define S_MOVING 14u
@@ -115,7 +115,7 @@ struct Constants { uint32_t w, h, sw, sh, gw, gh, step, count, unorm0, unorm1, u
 constexpr uint32_t kTable = 7; // t0..t3, u0..u2
 constexpr uint32_t kCounterBytes = kCandidates * kSlots * 4;
 constexpr uint32_t kStep = 4;
-static_assert(kSlots == 19, "shader SLOTS");
+static_assert(kSlots == 18 && kErrZero == 12 && kMaxY == 17, "shader SLOTS and S_* defines");
 
 std::mutex g_stats_m;
 

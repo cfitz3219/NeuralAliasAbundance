@@ -16,7 +16,7 @@ struct Scene {
         prev.assign(W * H, 0); cur.assign(W * H, 0);
         for (uint32_t y = 0; y < H; ++y)
             for (uint32_t x = 0; x < W; ++x) {
-                const float fx = x + 0.5f, fy = y + 0.5f;
+                const float fx = static_cast<float>(x) + 0.5f, fy = static_cast<float>(y) + 0.5f;
                 auto img = [&](float s) { // the object at offset s*(dx,dy)
                     const float ox = fx - s * dx, oy = fy - s * dy;
                     const bool in = ox >= 40 && ox < 100 && oy >= 30 && oy < 70;
@@ -26,7 +26,7 @@ struct Scene {
             }
     }
     bool on_object(uint32_t x, uint32_t y, float t, float dx, float dy) const {
-        const float ox = x + 0.5f - (t + 1) * dx, oy = y + 0.5f - (t + 1) * dy;
+        const float ox = static_cast<float>(x) + 0.5f - (t + 1) * dx, oy = static_cast<float>(y) + 0.5f - (t + 1) * dy;
         return ox >= 40 && ox < 100 && oy >= 30 && oy < 70;
     }
 };
@@ -47,7 +47,7 @@ int main() {
     return test::run({
         {"true motion in UV locks the right encoding; the scale maps it to pixels", [] {
             Decider d; Scene s;
-            for (int f = 0; f < 40; ++f) { s.make(static_cast<float>(f % 5), 3.5f, -1.0f); d.Add(0, measure(uv_candidate(s, f % 5, 3.5f, -1.0f), s)); }
+            for (int f = 0; f < 40; ++f) { s.make(static_cast<float>(f % 5), 3.5f, -1.0f); d.Add(0, measure(uv_candidate(s, static_cast<float>(f % 5), 3.5f, -1.0f), s)); }
             CHECK(d.UsedCandidate() == 0);
             CHECK(d.UsedEncoding() == 7);
             float sx, sy; Scale(7, W, H, &sx, &sy);
@@ -64,9 +64,9 @@ int main() {
             Decider d; Scene s;
             for (int f = 0; f < 80; ++f) {
                 s.make(static_cast<float>(f), 3.5f, 0);
-                d.Add(0, measure(uv_candidate(s, f, 0.0f, 6.0f), s)); // wrong direction (and a different region)
+                d.Add(0, measure(uv_candidate(s, static_cast<float>(f), 0.0f, 6.0f), s)); // wrong direction (and a different region)
                 std::vector<float> noise(W * H * 2);
-                for (size_t i = 0; i < noise.size(); ++i) noise[i] = std::sin(i * 12.9898f) * 0.05f;
+                for (size_t i = 0; i < noise.size(); ++i) noise[i] = std::sin(static_cast<float>(i) * 12.9898f) * 0.05f;
                 d.Add(1, measure(noise, s));
             }
             CHECK(d.UsedCandidate() == -1);
@@ -80,7 +80,7 @@ int main() {
             Decider d; Scene s;
             for (int f = 0; f < 40; ++f) {
                 s.make(static_cast<float>(f % 3), -2.0f, 2.5f);
-                auto c = uv_candidate(s, f % 3, -2.0f, 2.5f);
+                auto c = uv_candidate(s, static_cast<float>(f % 3), -2.0f, 2.5f);
                 for (auto& v : c) v = v * 0.5f + 0.5f;
                 d.Add(0, measure(c, s, true));
             }
@@ -88,11 +88,11 @@ int main() {
         }},
         {"a used encoding is dropped when the texture stops predicting, and when the candidate changes", [] {
             Decider d; Scene s;
-            for (int f = 0; f < 40; ++f) { s.make(static_cast<float>(f % 5), 3.5f, -1.0f); d.Add(0, measure(uv_candidate(s, f % 5, 3.5f, -1.0f), s)); }
+            for (int f = 0; f < 40; ++f) { s.make(static_cast<float>(f % 5), 3.5f, -1.0f); d.Add(0, measure(uv_candidate(s, static_cast<float>(f % 5), 3.5f, -1.0f), s)); }
             CHECK(d.UsedCandidate() == 0);
-            for (int f = 0; f < 40; ++f) { s.make(static_cast<float>(f % 5), 3.5f, -1.0f); d.Add(0, measure(uv_candidate(s, f % 5, 0.0f, 6.0f), s)); } // no longer this picture's motion
+            for (int f = 0; f < 40; ++f) { s.make(static_cast<float>(f % 5), 3.5f, -1.0f); d.Add(0, measure(uv_candidate(s, static_cast<float>(f % 5), 0.0f, 6.0f), s)); } // no longer this picture's motion
             CHECK(d.UsedCandidate() == -1 && d.Dropped() == 1);
-            for (int f = 0; f < 40; ++f) { s.make(static_cast<float>(f % 5), 3.5f, -1.0f); d.Add(0, measure(uv_candidate(s, f % 5, 3.5f, -1.0f), s)); }
+            for (int f = 0; f < 40; ++f) { s.make(static_cast<float>(f % 5), 3.5f, -1.0f); d.Add(0, measure(uv_candidate(s, static_cast<float>(f % 5), 3.5f, -1.0f), s)); }
             CHECK(d.UsedCandidate() == 0);
             d.ResetCandidate(0);
             CHECK(d.UsedCandidate() == -1 && d.Dropped() == 2);
