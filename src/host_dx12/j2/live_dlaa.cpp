@@ -2548,9 +2548,10 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             uint32_t nc = 0;
             for (uint32_t i = 0; i < found_n && nc < na::j2::game_motion::kCandidates; ++i) {
                 uint32_t st = 0;
-                const auto lookup = inl ? na::observe::ListStateSub(inl, ids[i], 0, &st) : na::observe::StateLookup::Absent;
-                const bool known = lookup == na::observe::StateLookup::Known ||
-                    (lookup == na::observe::StateLookup::Absent && na::observe::KnownSubStateOnQueueNow(g.queue.Get(), ids[i], 0, &st));
+                // The same state rule as the scene colour/depth (inline: this list so far; otherwise the
+                // batch up to the scene list, then the state carried in). p43052: the queue-only lookup
+                // never knew it (the game writes it earlier in the same batch).
+                const bool known = state_of(ids[i], 0, &st);
                 if (!known) continue;
                 ID3D12Resource* r = na::observe::AcquireResource(ids[i]);
                 if (!r) continue;
@@ -2767,9 +2768,10 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             uint32_t used = 0;
             for (uint32_t i = 0; i < found_n && used < 2 && cp.extra_count < na::capture::j2::kMaxExtra; ++i) {
                 uint32_t st = 0;
-                const auto lookup = inl ? na::observe::ListStateSub(inl, ids[i], 0, &st) : na::observe::StateLookup::Absent;
-                const bool known = lookup == na::observe::StateLookup::Known ||
-                    (lookup == na::observe::StateLookup::Absent && na::observe::KnownSubStateOnQueueNow(g.queue.Get(), ids[i], 0, &st));
+                // The same state rule as the scene colour/depth (inline: this list so far; otherwise the
+                // batch up to the scene list, then the state carried in). p43052: the queue-only lookup
+                // never knew it (the game writes it earlier in the same batch).
+                const bool known = state_of(ids[i], 0, &st);
                 if (!known) { ++g.stats.velocity_capture_unknown_state; continue; }
                 ID3D12Resource* r = na::observe::AcquireResource(ids[i]);
                 if (!r) continue;
