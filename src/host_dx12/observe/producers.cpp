@@ -4792,6 +4792,12 @@ struct ListHook<Slot, R(A...)> {
                                 { const CostScope c(kCostRun); On<Slot>::run(l, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), INT(call.args[3]), UINT(call.args[4])); }
                             }
                         } // A skipped native command is NOT emitted as an executed game draw/write.
+                        // Draw replay on this path too (shader hooks on: the HUD separator). eebeeec missed
+                        // every draw here: replayed=0 in Cort's run.
+                        if constexpr (Slot == sl::list::DrawInstanced)
+                            if (!replaced) replay_after_draw(l, false, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), 0, UINT(call.args[3]));
+                        if constexpr (Slot == sl::list::DrawIndexedInstanced)
+                            if (!replaced) replay_after_draw(l, true, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), INT(call.args[3]), UINT(call.args[4]));
                         for (unsigned i = entered; i > 0; --i) if (hooks->lane[i - 1]) {
                             const CostScope c(kCostLaneAfter); HostWorkScope own; hooks->lane[i - 1]->After(l, call, saved[i - 1]);
                         }
