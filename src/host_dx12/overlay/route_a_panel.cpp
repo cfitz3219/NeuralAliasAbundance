@@ -1055,9 +1055,9 @@ void DrawLiveDlaa()
             if (Button("Start smear test")) na::j2::StartSmearTest();
             ImGui::EndDisabled();
             EndRow();
-            char st[200] = {};
-            na::j2::SmearTestStatus(st, sizeof st);
-            if (st[0]) StatusLine(0, st);
+            char smear_text[200] = {};
+            na::j2::SmearTestStatus(smear_text, sizeof smear_text);
+            if (smear_text[0]) StatusLine(0, smear_text);
         }
         if (cs.requested) {
             char cl[200];

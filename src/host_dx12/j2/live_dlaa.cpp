@@ -2688,9 +2688,9 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             }
         }
         if (smear_mode() == 1) { // smear test: no motion at all (identity reprojection, no other tier)
-            na::camera::Matrix id{};
-            id[0] = id[5] = id[10] = id[15] = 1.0;
-            in.inv_view_proj_current = to_mat4(id);
+            na::camera::Matrix unit{};
+            unit[0] = unit[5] = unit[10] = unit[15] = 1.0;
+            in.inv_view_proj_current = to_mat4(unit);
             in.tier1_valid_flag = in.tier3_valid_flag = false;
             in.fix = nullptr;
             in.jitter_current_px[0] = in.jitter_current_px[1] = 0.f;
