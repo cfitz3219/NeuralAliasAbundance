@@ -119,10 +119,16 @@ int run(test::Device& d, bool borderless, DXGI_FORMAT first, DXGI_FORMAT second)
     test::ComPtr<IDXGISwapChain3> sc; REQUIRE(SUCCEEDED(chain.As(&sc)));
     const auto before = na::present::GetStats();
     uint32_t seed = borderless ? 100 : 1;
+    test::ComPtr<ID3D12Resource> retained_game_buffer;
     for (DXGI_FORMAT format : {first, second}) {
         if (format != first) {
             // The game recreates its swap-chain resources (e.g. an HDR toggle). Same extent.
             REQUIRE(SUCCEEDED(sc->ResizeBuffers(0, W, H, format, 0)));
+            // Scene groups retain game-facing resources through submitted
+            // work. Holding that OLD full-size proxy must not pin a physical
+            // DXGI backbuffer and prevent mode/format recreation.
+            REQUIRE(retained_game_buffer);
+            CHECK(retained_game_buffer->GetDesc().Format == first);
         }
         // FAKE model: the three pictures stand in for DLSS output at Quality, Performance and
         // native DLAA. The game's buffers are full size for all three; nothing resizes.
@@ -132,6 +138,8 @@ int run(test::Device& d, bool borderless, DXGI_FORMAT first, DXGI_FORMAT second)
             CHECK(na::present::Proxied(sc.Get()));
             const auto bd = back->GetDesc();
             CHECK(bd.Width == W && bd.Height == H && bd.Format == format);
+            if(format == first)retained_game_buffer=back;
+            else CHECK(retained_game_buffer.Get()!=back.Get());
             const Image expected = pattern(W, H, format, seed++);
             REQUIRE(upload(d, back.Get(), expected));
             back.Reset();
