@@ -7,4 +7,5 @@ EXPORTS
     CreateDXGIFactory2=AbundanceCreateDXGIFactory2
     DXGIGetDebugInterface1=AbundanceDXGIGetDebugInterface1
     DXGIDeclareAdapterRemovalSupport=AbundanceDXGIDeclareAdapterRemovalSupport
+    DXGIDisableVBlankVirtualization=AbundanceDXGIDisableVBlankVirtualization
     AbundanceQueryProxyStatus

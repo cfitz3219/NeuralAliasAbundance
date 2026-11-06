@@ -6,10 +6,14 @@
 #include <chrono>
 #include <cstring>
 #include <algorithm>
+#include <d3d12sdklayers.h>
 int main(int argc,char** argv){
     std::setvbuf(stdout,nullptr,_IONBF,0);
     if(!na::ffx_flow::Built())return test::kSkip;
+    test::ComPtr<ID3D12Debug> debug;
+    if(argc==1&&SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))debug->EnableDebugLayer();
     test::Device d;if(!test::CreateDevice(d))return test::kSkip;
+    test::ComPtr<ID3D12InfoQueue> info;d.device.As(&info);
     if(!na::ffx_flow::DeviceSupported(d.device.Get())){std::puts("SKIP: AMD search needs 32/64-lane hardware waves");return test::kSkip;}
     constexpr unsigned w=512,h=256;na::ffx_flow::PairFlow flow;
     if(!flow.Init(d.device.Get(),w,h)){std::printf("%s\n",flow.Error());return 1;}
@@ -67,5 +71,7 @@ int main(int argc,char** argv){
         double mean=0;for(double t:times)mean+=t;mean/=times.size();std::sort(times.begin(),times.end());
         std::printf("flow_record_cpu samples=%zu mean_us=%.2f p95_us=%.2f (discarded commands, no GPU wait)\n",times.size(),mean,times[95]);
     }
+    if(info)for(UINT64 i=0;i<info->GetNumStoredMessages();++i){SIZE_T bytes=0;info->GetMessage(i,nullptr,&bytes);std::vector<uint8_t> data(bytes);auto* message=reinterpret_cast<D3D12_MESSAGE*>(data.data());
+        if(SUCCEEDED(info->GetMessage(i,message,&bytes))&&message->Severity<=D3D12_MESSAGE_SEVERITY_ERROR){std::printf("D3D12: %s\n",message->pDescription);CHECK(false);}}
     return test::finish("ffx_flow_test");
 }

@@ -356,7 +356,15 @@ int main(int argc,char** argv)
             D3D12_RESOURCE_BARRIER finish_native[2]{test::Transition(color.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,source_read),test::Transition(depth.Get(),D3D12_RESOURCE_STATE_DEPTH_WRITE,D3D12_RESOURCE_STATE_COMMON)};
             scene.list->ResourceBarrier(2,finish_native);
             ID3D12GraphicsCommandList* target_list=scene.list.Get();
-            if(!native_merged){REQUIRE(SUCCEEDED(scene.list->Close()));post.Reset();target_list=post.list.Get();}
+            if(!native_merged){
+                REQUIRE(SUCCEEDED(scene.list->Close()));
+                // Render ahead: this producer closes before the preceding
+                // picture's Present; its separate post list records afterward.
+                // Cover both not-yet-submitted and already-submitted producer.
+                if(iteration==2){ID3D12CommandList* producer[]{scene.list.Get()};na::j2::Execute(d.queue.Get(),1,producer,&Forward);}
+                if(iteration)na::j2::OnPresent(d.queue.Get());
+                post.Reset();target_list=post.list.Get();
+            }
             const auto game_write=native_graphics?D3D12_RESOURCE_STATE_RENDER_TARGET:D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
             auto into_uav=test::Transition(native.Get(),D3D12_RESOURCE_STATE_COMMON,game_write);target_list->ResourceBarrier(1,&into_uav);
             target_list->SetPipelineState(native_pipeline.Get());ID3D12DescriptorHeap* game_heap[]{heap.Get()};target_list->SetDescriptorHeaps(1,game_heap);
@@ -373,7 +381,9 @@ int main(int argc,char** argv)
             D3D12_RESOURCE_BARRIER end_native[2]{test::Transition(native.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON),test::Transition(color.Get(),source_read,D3D12_RESOURCE_STATE_COMMON)};
             target_list->ResourceBarrier(2,end_native);REQUIRE(SUCCEEDED(target_list->Close()));
             ID3D12CommandList* native_lists[]{scene.list.Get(),post.list.Get()};
-            na::j2::Execute(d.queue.Get(),native_merged?1u:2u,native_lists,&Forward);d.WaitIdle();
+            if(!native_merged&&iteration==2)na::j2::Execute(d.queue.Get(),1,native_lists+1,&Forward);
+            else na::j2::Execute(d.queue.Get(),native_merged?1u:2u,native_lists,&Forward);
+            d.WaitIdle();
             st=na::j2::GetStats();
             std::printf("native scale %s iteration%u: evaluations=%d %ux%u->%ux%u active=%u reason=%s\n",native_merged?"merged":"separate",iteration,fake::evals-before_native,st.render_w,st.render_h,st.out_w,st.out_h,st.active,st.reason);
             CHECK(st.active&&st.render_w==W&&st.render_h==H&&st.out_w==OW&&st.out_h==OH);
