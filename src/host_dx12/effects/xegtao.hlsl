@@ -11,6 +11,7 @@ cbuffer Constants:register(b0) {
     uint2 colorBase; uint2 depthBase;
     float amount; float clearDepth; uint quality; uint srgb;
     uint2 outputBase; uint finalApply; uint padding;
+    float temporalBlend; float2 jitterDelta; float depthTolerance;
 };
 #include "XeGTAO.hlsli"
 SamplerState pointClamp:register(s0);
@@ -58,8 +59,53 @@ RWTexture2D<uint> filtered:register(u0);
     if(p.x*2>=uint(c.ViewportSize.x)||p.y>=uint(c.ViewportSize.y))return;
     XeGTAO_Denoise(uint2(p.x*2,p.y),c,ao,edges,pointClamp,filtered,finalApply!=0);
 }
+#elif defined(PASS_TEMPORAL)
+// Audit 2026-11-06 (Cort: AO shimmers along edges while panning). The AO
+// sample pattern is fixed in screen space and the depth is jittered, so a
+// world point sees a different AO each frame. Keep a reprojected history:
+// previous = current + motion, corrected by the jitter change; history taps
+// whose view depth differs are rejected (disocclusion); the result is
+// clamped to this frame's 3x3 range so moving shadows do not ghost.
+Texture2D<uint> ao:register(t0); Texture2D<float> history:register(t1);
+Texture2D<float> historyDepth:register(t2); Texture2D<float> viewDepth:register(t3);
+Texture2D<float2> motion:register(t4);
+RWTexture2D<float> visibilityOut:register(u0); RWTexture2D<float> depthOut:register(u1);
+[numthreads(8,8,1)] void Temporal(uint2 p:SV_DispatchThreadID) {
+    if(any(p>=uint2(c.ViewportSize)))return;
+    const int2 size=int2(c.ViewportSize);
+    float current=float(ao[p])/255.0;
+    float z=viewDepth.Load(int3(p,0));
+    depthOut[p]=z;
+    float result=current;
+    if(temporalBlend<1.0) {
+        // Texel-centre space of the previous frame: its sample at t+0.5-jp
+        // equals this pixel's p+0.5-jc+mv.
+        float2 q=float2(p)+motion.Load(int3(p,0))+jitterDelta;
+        // Same-surface history within one pixel of the reprojected point:
+        // jitter moves a silhouette by up to a pixel, so the matching surface
+        // can sit next to it. Taps with another view depth are rejected.
+        int2 centre=int2(floor(q+.5));
+        float sum=0,total=0;
+        [unroll] for(int dy=-1;dy<=1;++dy)[unroll] for(int dx=-1;dx<=1;++dx) {
+            int2 t=centre+int2(dx,dy);
+            if(any(t<0)||any(t>=size))continue;
+            float hz=historyDepth.Load(int3(t,0));
+            if(!(abs(hz-z)<=depthTolerance*max(abs(z),1e-4)))continue;
+            float wgt=max(0.,1.5-length(float2(t)-q));
+            sum+=wgt*history.Load(int3(t,0));total+=wgt;
+        }
+        if(total>1e-3) {
+            float lo=current,hi=current;
+            [unroll] for(int y=-1;y<=1;++y)[unroll] for(int x=-1;x<=1;++x) {
+                float v=float(ao[clamp(int2(p)+int2(x,y),0,size-1)])/255.0;lo=min(lo,v);hi=max(hi,v);
+            }
+            result=lerp(clamp(sum/total,lo,hi),current,temporalBlend);
+        }
+    }
+    visibilityOut[p]=result;
+}
 #elif defined(PASS_COMPOSE)
-Texture2D<float4> image:register(t0); Texture2D<uint> ao:register(t1);
+Texture2D<float4> image:register(t0); Texture2D<float> visibilityIn:register(t1);
 Texture2D<float> rawDepth:register(t2); RWTexture2D<float4> outputColor:register(u0);
 float3 LinearToSrgb(float3 v) {
     return float3(v.x<=.0031308?12.92*v.x:1.055*pow(max(v.x,0),1/2.4)-.055,
@@ -69,7 +115,7 @@ float3 LinearToSrgb(float3 v) {
 [numthreads(8,8,1)] void Compose(uint2 p:SV_DispatchThreadID) {
     if(any(p>=uint2(c.ViewportSize)))return;
     float4 color=image.Load(int3(p+colorBase,0));
-    float visibility=saturate(float(ao[p])/255.0);
+    float visibility=saturate(visibilityIn[p]);
     // Clear sky contains no occluder: retain colour and alpha, including HDR.
     float weight=abs(rawDepth[p]-clearDepth)<1e-7?0:amount;
     color.rgb*=lerp(1.0,visibility,weight);

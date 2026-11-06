@@ -19,7 +19,7 @@
 // from %LOCALAPPDATA%\NeuralAlias\NeuralAliasSL.ini.
 namespace na::settings {
 namespace {
-#define NA_PERSISTED_FIELDS(F) F(donut_bloom) F(donut_amount) F(donut_bias) F(donut_white) F(donut_speed_up) F(donut_speed_down) F(donut_curve) F(donut_bloom_amount) F(donut_bloom_sigma) F(donut_bloom_threshold) F(xegtao_enabled) F(xegtao_amount) F(xegtao_quality) F(xegtao_radius_x1000) F(xegtao_denoise) F(xegtao_radius_multiplier) F(xegtao_falloff) F(xegtao_sample_distribution) F(xegtao_thin_occluder) F(xegtao_final_power) F(xegtao_depth_mip_offset) F(enabled) F(dlss_mode) F(follow_game_resolution) F(preset) F(rr_preset) F(text_bold) F(fill_screen) F(win_x) F(win_y) F(win_w) F(win_h) F(nr_enabled) F(nr_intensity) F(nr_structure) F(nr_tone) F(nr_skin) F(nr_paper_white) F(nr_hdr_mode) F(nr_model) F(motion_enabled) F(motion_grid) F(motion_perf) F(motion_downscale) F(j2_sharpness) F(j2_hud_nis) F(j2_scale_mode) F(j2_preset) F(j2_mip_bias_x100) F(reflex_mode) F(fg_enabled) F(fg_mode) F(fg_preset) F(fg_multiplier) F(fg_target_fps) F(fg_frozen_at) F(fg_profile_override) F(native_fg_mode) F(native_fg_frames)
+#define NA_PERSISTED_FIELDS(F) F(donut_bloom) F(donut_amount) F(donut_bias) F(donut_white) F(donut_speed_up) F(donut_speed_down) F(donut_curve) F(donut_bloom_amount) F(donut_bloom_sigma) F(donut_bloom_threshold) F(xegtao_enabled) F(xegtao_amount) F(xegtao_quality) F(xegtao_radius_x1000) F(xegtao_denoise) F(xegtao_radius_multiplier) F(xegtao_falloff) F(xegtao_sample_distribution) F(xegtao_thin_occluder) F(xegtao_final_power) F(xegtao_depth_mip_offset) F(xegtao_temporal) F(enabled) F(dlss_mode) F(follow_game_resolution) F(preset) F(rr_preset) F(text_bold) F(fill_screen) F(win_x) F(win_y) F(win_w) F(win_h) F(nr_enabled) F(nr_intensity) F(nr_structure) F(nr_tone) F(nr_skin) F(nr_paper_white) F(nr_hdr_mode) F(nr_model) F(motion_enabled) F(motion_grid) F(motion_perf) F(motion_downscale) F(j2_sharpness) F(j2_hud_nis) F(j2_scale_mode) F(j2_preset) F(j2_mip_bias_x100) F(reflex_mode) F(fg_enabled) F(fg_mode) F(fg_preset) F(fg_multiplier) F(fg_target_fps) F(fg_frozen_at) F(fg_profile_override) F(native_fg_mode) F(native_fg_frames)
 Settings g_settings;
 Settings g_loaded_values;
 std::atomic<bool> g_nr_user_touched{false};
@@ -122,6 +122,7 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
     target.xegtao_thin_occluder.store((std::min)(GetPrivateProfileIntW(L"xegtao",L"thin_occluder",0,ini),1000u));
     target.xegtao_final_power.store((std::min)(GetPrivateProfileIntW(L"xegtao",L"final_power",2200,ini),5000u));
     target.xegtao_depth_mip_offset.store((std::min)(GetPrivateProfileIntW(L"xegtao",L"depth_mip_offset",3300,ini),30000u));
+    target.xegtao_temporal.store((std::min)(GetPrivateProfileIntW(L"xegtao",L"temporal",850,ini),950u));
     target.nr_intensity.store(pct(L"intensity", 100));
     {
         // [j2] sharpen: the menu's 0..100 (= RCAS 0..200). Older files only have [j2] sharpness
@@ -372,7 +373,7 @@ bool SaveFromWorker()
         {L"denoise",g_settings.xegtao_denoise.load()}, {L"radius_multiplier",g_settings.xegtao_radius_multiplier.load()},
         {L"falloff",g_settings.xegtao_falloff.load()}, {L"sample_distribution",g_settings.xegtao_sample_distribution.load()},
         {L"thin_occluder",g_settings.xegtao_thin_occluder.load()}, {L"final_power",g_settings.xegtao_final_power.load()},
-        {L"depth_mip_offset",g_settings.xegtao_depth_mip_offset.load()}};
+        {L"depth_mip_offset",g_settings.xegtao_depth_mip_offset.load()}, {L"temporal",g_settings.xegtao_temporal.load()}};
     for (const auto& kv : ao) {
         swprintf_s(v,L"%u",kv.value);
         ok &= WritePrivateProfileStringW(L"xegtao",kv.key,v,ini)!=0;

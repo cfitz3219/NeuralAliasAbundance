@@ -74,6 +74,7 @@ struct Settings {
     std::atomic<uint32_t> xegtao_enabled{0}, xegtao_amount{100}, xegtao_quality{2}, xegtao_radius_x1000{500};
     std::atomic<uint32_t> xegtao_denoise{1}, xegtao_radius_multiplier{1457}, xegtao_falloff{615}, xegtao_sample_distribution{2000};
     std::atomic<uint32_t> xegtao_thin_occluder{0}, xegtao_final_power{2200}, xegtao_depth_mip_offset{3300};
+    std::atomic<uint32_t> xegtao_temporal{850}; // x1000: share of earlier frames kept (0 = off); stops edge shimmer while panning
     std::atomic<uint32_t> nr_intensity{100};
     std::atomic<uint32_t> j2_sharpness{50}; // J2 sharpening, menu scale 0..100 = RCAS 0..200 (0 = off; 50 = standard RCAS full strength)
     // Render-small HUD: 0 = the HUD goes through DLSS with the scene; 1..100 = HUD pixels are

@@ -13,6 +13,10 @@ struct Options {
     float radius=.5f;             // view/world units, adjustable per game
     uint32_t denoise=1;
     float radius_multiplier=1.457f,falloff=.615f,sample_distribution=2.f,thin_occluder=0.f,final_power=2.2f,depth_mip_offset=3.3f;
+    // Share of the previous frames' shading kept per frame (0 = off). Needs
+    // Inputs::motion; reprojects with the motion vectors and jitter change,
+    // rejects history where the depth differs, clamps to the current 3x3.
+    float temporal=.85f;
 };
 struct Inputs {
     ID3D12Resource* color=nullptr;
@@ -22,6 +26,11 @@ struct Inputs {
     Projection projection;
     float jitter_x=0,jitter_y=0,clear_depth=0;
     bool srgb=false;
+    // Optional temporal input (render pixels, previous = current + motion,
+    // NON_PIXEL_SHADER_RESOURCE, same extent as width x height). Without it
+    // the shading is computed from this frame alone, as before.
+    ID3D12Resource* motion=nullptr;
+    bool reset=false; // camera cut / resize: start the history again
     bool preserve_color_extent=false; // native NGX keeps its original subrect origins
     // Native depth may forbid SRVs. Copy its compatible single-mip surface,
     // preserving the caller-declared state, before extracting the subrect.

@@ -204,6 +204,44 @@ int main() {
         next.reset();options.denoise=2;
         REQUIRE(cached.Prepare(d.device.Get(),d.queue.Get(),ci,options));CHECK(cached.GetStats().bindings==before.bindings+1);options.denoise=1;
     }
+    // Cort 2026-11-06: contact shadows shimmer along edges while the camera
+    // moves (jitter moves the silhouette by a pixel every frame). Visible
+    // check: on surfaces that keep their depth, the shading must change much
+    // less from frame to frame with temporal stability than without.
+    {
+        constexpr unsigned TW=96,TH=64;
+        const auto flicker=[&](float keep){
+            na::xegtao::Pass temporal;auto o=options;o.temporal=keep;
+            std::vector<float> previous;double change=0;unsigned samples=0;bool first_box=true;
+            for(unsigned frame=0;frame<12;++frame){
+                const unsigned shift=frame&1u; // jitter: the box edge moves one pixel back and forth
+                std::vector<float> c(size_t(TW)*TH*4,4.f),z(size_t(TW)*TH),mv(size_t(TW)*TH*2,0.f);
+                for(unsigned y=0;y<TH;++y)for(unsigned x=0;x<TW;++x){
+                    const bool inside=x>30+shift&&x<53+shift&&y>20&&y<45;z[size_t(y)*TW+x]=1-.1f/(inside?1.8f:2.f);}
+                test::List l;REQUIRE(l.Create(d.device.Get()));
+                auto color=input(d,l,TW,TH,DXGI_FORMAT_R32G32B32A32_FLOAT,c,4);
+                auto depth=input(d,l,TW,TH,DXGI_FORMAT_R32_FLOAT,z,1);
+                auto motion=input(d,l,TW,TH,DXGI_FORMAT_R32G32_FLOAT,mv,2);
+                na::xegtao::Inputs in;in.color=color.texture.Get();in.depth=depth.texture.Get();in.width=TW;in.height=TH;
+                in.color_format=DXGI_FORMAT_R32G32B32A32_FLOAT;in.projection=projection(false);in.clear_depth=1;in.motion=motion.texture.Get();
+                auto f=temporal.Prepare(d.device.Get(),d.queue.Get(),in,o);
+                if(!f&&first_box){REQUIRE(temporal.WaitPrepared(30000));f=temporal.Prepare(d.device.Get(),d.queue.Get(),in,o);}
+                first_box=false;REQUIRE(f);REQUIRE(f->Record(l.list.Get()));auto rb=capture(d,l,f->Color());
+                REQUIRE(SUCCEEDED(l.list->Close()));ID3D12CommandList* lists[]={l.list.Get()};d.queue->ExecuteCommandLists(1,lists);d.WaitIdle();
+                auto out=pixels(rb);REQUIRE(out.size()==size_t(TW)*TH*4);
+                if(frame>=6&&!previous.empty())for(unsigned y=16;y<50;++y)for(unsigned x=24;x<60;++x){
+                    const bool a=x>30&&x<53&&y>20&&y<45,b=x>31&&x<54&&y>20&&y<45;
+                    if(a!=b)continue; // the silhouette pixel itself changes surface (DLSS resolves that)
+                    change+=std::abs(out[(size_t(y)*TW+x)*4]-previous[(size_t(y)*TW+x)*4]);++samples;
+                }
+                previous=out;
+            }
+            return samples?change/samples:0.0;
+        };
+        const double without=flicker(0.f),with=flicker(.85f);
+        std::printf("XeGTAO edge flicker (mean change, HDR 4): without history %.5f, with %.5f\n",without,with);
+        CHECK(without>.002);CHECK(with<without*.5);
+    }
     CHECK(pass.GetStats().recorded==3);
     options.amount=0;CHECK(!pass.Prepare(d.device.Get(),d.queue.Get(),{},options));
     CHECK(pass.GetStats().recorded==3);CHECK(d.device->GetDeviceRemovedReason()==S_OK);

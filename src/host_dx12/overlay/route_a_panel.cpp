@@ -1444,10 +1444,11 @@ static void DrawAmbientOcclusion()
     scalar("Thin-object compensation","Reduces excessive shading from thin foreground objects.","##aothin",s.xegtao_thin_occluder,0.f,1.f);
     scalar("Shadow strength","Adjusts the contrast of the computed contact shading.","##aopower",s.xegtao_final_power,0.f,5.f);
     scalar("Depth mip offset","Trades distant depth detail against speed and stability.","##aomip",s.xegtao_depth_mip_offset,0.f,30.f);
+    scalar("Temporal stability","Carries the shading over from earlier frames along the motion, so it does not shimmer along edges while the camera moves. 0 turns it off; higher is steadier but follows moving shadows more slowly.","##aotemporal",s.xegtao_temporal,0.f,.95f);
     if(Button("Reset to Intel defaults")){
         s.xegtao_amount.store(100);s.xegtao_quality.store(2);s.xegtao_denoise.store(1);s.xegtao_radius_x1000.store(500);
         s.xegtao_radius_multiplier.store(1457);s.xegtao_falloff.store(615);s.xegtao_sample_distribution.store(2000);
-        s.xegtao_thin_occluder.store(0);s.xegtao_final_power.store(2200);s.xegtao_depth_mip_offset.store(3300);changed=true;
+        s.xegtao_thin_occluder.store(0);s.xegtao_final_power.store(2200);s.xegtao_depth_mip_offset.store(3300);s.xegtao_temporal.store(850);changed=true;
     }
     if(changed)na::settings::Save();
     if(enabled){const auto status=na::xegtao::ScenePass().GetStats();StatusLine(0,status.reason);}
