@@ -86,7 +86,8 @@ int main(int argc,char** argv){
     const bool materials=argc>1&&std::strcmp(argv[1],"--materials")==0;
     const bool repeat=argc>1&&std::strcmp(argv[1],"--repeat")==0;
     const bool indirect=argc>1&&std::strcmp(argv[1],"--indirect")==0;
-    const bool post_native=argc>1&&std::strcmp(argv[1],"--post-native")==0;
+    const bool render_ahead=argc>1&&std::strcmp(argv[1],"--render-ahead")==0;
+    const bool post_native=render_ahead||(argc>1&&std::strcmp(argv[1],"--post-native")==0);
     setvbuf(stdout,nullptr,_IONBF,0);test::ComPtr<ID3D12Debug> debug;
     if(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))debug->EnableDebugLayer();
     test::Device d;if(!test::CreateDevice(d))return test::SkipNoDevice("auto_scene_test");auto* dev=d.device.Get();
@@ -175,10 +176,10 @@ float4 water(float4 position:SV_Position):SV_Target{uint2 p=uint2(position.xy);f
     test::List tail;REQUIRE(tail.Create(dev));REQUIRE(SUCCEEDED(tail.list->Close()));
     test::List hud;REQUIRE(hud.Create(dev));REQUIRE(SUCCEEDED(hud.list->Close()));
     unsigned frame_number=0;float material_value=0;bool replayed=false;
-    const auto frame=[&](bool reconstruct){
+    const auto frame=[&](bool reconstruct,bool advance=true){
         d.WaitIdle();if(materials){const auto index=frame_number++%2;material_value=index?.75f:.25f;dev->CreateShaderResourceView(material_textures[index].Get(),&srv,material_slot);}
         if(repeat){const float before_submit=7;std::memcpy(mapped+8,&before_submit,4);}
-        na::scale::AutomaticScenePresent();na::j2::OnPresent(d.queue.Get());scene.Reset();auto* list=scene.list.Get();
+        if(advance){na::scale::AutomaticScenePresent();na::j2::OnPresent(d.queue.Get());}scene.Reset();auto* list=scene.list.Get();
         D3D12_RESOURCE_BARRIER start[]={test::Transition(color.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_RENDER_TARGET),test::Transition(depth.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_DEPTH_WRITE)};list->ResourceBarrier(2,start);
         list->SetGraphicsRootSignature(root.Get());list->SetPipelineState(pso.Get());list->SetGraphicsRootConstantBufferView(0,cb->GetGPUVirtualAddress());
         ID3D12DescriptorHeap* heap=texture_heap.Get();list->SetDescriptorHeaps(1,&heap);list->SetGraphicsRootDescriptorTable(1,texture_heap->GetGPUDescriptorHandleForHeapStart());
@@ -211,6 +212,9 @@ float4 water(float4 position:SV_Position):SV_Target{uint2 p=uint2(position.xy);f
         D3D12_RESOURCE_BARRIER finish[]={test::Transition(color.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COMMON),test::Transition(depth.Get(),D3D12_RESOURCE_STATE_DEPTH_WRITE,D3D12_RESOURCE_STATE_COMMON)};list->ResourceBarrier(2,finish);CHECK(SUCCEEDED(list->Close()));
         ID3D12CommandList* lists[]={scene.list.Get(),tail.list.Get()};const UINT count=split?2:1;
         const auto copies_before=na::scale::GetAutomaticSceneStats().constant_copies;
+        // Render-ahead: the next scene was recorded before the previous
+        // picture's Present, but is submitted only after that boundary.
+        if(!advance){na::scale::AutomaticScenePresent();na::j2::OnPresent(d.queue.Get());}
         na::scale::AutomaticSceneSubmission receipt(d.queue.Get(),count,lists);
         if(repeat){CHECK(na::scale::GetAutomaticSceneStats().constant_copies==copies_before);
             const float late_upload=9;std::memcpy(mapped+8,&late_upload,4);}
@@ -247,6 +251,14 @@ float4 water(float4 position:SV_Position):SV_Target{uint2 p=uint2(position.xy);f
         frame(true);auto js=na::j2::GetStats();CHECK(js.physical_evaluated>0&&js.render_w<w&&js.out_w==w);
         REQUIRE(pixels(d,color.Get(),55,66,9,true)==0);
         CHECK(na::scale::GetAutomaticSceneStats().reconstructed);
+        if(render_ahead){
+            const auto evaluated=js.physical_evaluated;
+            for(unsigned i=0;i<4;++i){
+                frame(true,false);js=na::j2::GetStats();
+                CHECK(js.render_w<w&&js.out_w==w&&js.physical_evaluated==evaluated+i+1);
+                REQUIRE(pixels(d,color.Get(),55,66,9,true)==0);
+            }
+        }
         na::settings::Get().j2_scale_mode.store(3);na::scale::PollAutomaticScene();frame(true);frame(true);
         js=na::j2::GetStats();CHECK(js.render_w==w/2&&js.render_h==h/2&&js.out_w==w);
         REQUIRE(pixels(d,color.Get(),55,66,9,true)==0);
