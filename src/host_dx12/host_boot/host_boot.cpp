@@ -313,20 +313,12 @@ DWORD WINAPI InitThread(LPVOID)
         boot_log(na::native_present::InstallSizeProbe() ? "size probe: installed" : "size probe: FAILED to install");
     if (render_small) {
         boot_log(na::native_present::InstallSizeHooks() ? "render-small: size hooks installed" : "render-small: size hooks FAILED");
-        // Native-resolution HUD (Sol's plan): the game's HUD draws go to native-size layers and
-        // DLSS gets the scene only. [present] native_hud=0 keeps the HUD in the proxy as before.
-        if (GetPrivateProfileIntW(L"present", L"native_hud", 1, g_ini) == 1) {
-            na::j2::native_hud::Install();
-            // HUD by un-blending ([present] hud_unblend=1, default): the UI is replayed into layers and
-            // un-blended out of the final picture; no hand-off tracking. 0 = native_hud's routes.
-            na::j2::hud_unblend::SetConfigured(GetPrivateProfileIntW(L"present", L"hud_unblend", 1, g_ini) == 1);
-            boot_log(na::j2::hud_unblend::Configured() ? "render-small: HUD by un-blending" : "render-small: HUD by un-blending off ([present] hud_unblend=0)");
-            na::j2::native_hud::SetCoverRule(GetPrivateProfileIntW(L"present", L"hud_cover", 0, g_ini) == 1);
-            boot_log("render-small: native-resolution HUD on");
-        } else boot_log("render-small: native-resolution HUD off ([present] native_hud=0)");
-        // HUD protection fallback (2026-11-04): on by default; it acts only on frames where the
-        // native HUD layer did not engage, and only on what it learned during real movement.
-        na::j2::SetHudMaskEnabled(GetPrivateProfileIntW(L"present", L"hud_mask", 1, g_ini) == 1);
+        // Four finite, GPU-checked methods. Old manual HUD preferences do not
+        // choose the renderer or disable DLSS. Exhaustion leaves ordinary DLSS.
+        na::j2::native_hud::Install();
+        na::j2::native_hud::SetAutomatic(true);
+        na::j2::SetHudMaskEnabled(false); // temporal protection is not verified separation
+        boot_log("render-small: automatic HUD methods; ordinary DLSS on exhaustion");
         // Ultra Performance is not offered with render-small (the HUD would be drawn at 33%).
         if (na::settings::Get().j2_scale_mode.load() > 3) na::settings::Get().j2_scale_mode.store(3);
         const int small_mode = static_cast<int>(na::settings::Get().j2_scale_mode.load());

@@ -5,7 +5,14 @@
 #include "host_dx12/overlay/route_a_panel.hpp"
 #include "host_dx12/overlay/menu.hpp"
 #include "host_dx12/overlay/na_style.hpp"
+#include "host_dx12/fg/preset_profile.hpp"
 int main() {
+    na::fg::preset::AnisoOverride af;
+    af.available=true;af.start_known=true;af.start_selector=1;af.selector=0;af.level=1;
+    CHECK(af.ForcedThisRun()&&!af.ForcedNow()&&!af.Limits(16));
+    af.selector=1;CHECK(af.ForcedNow()&&af.Limits(16));
+    af.selector=2;af.start_selector=2;CHECK(!af.ForcedNow()&&!af.ForcedThisRun());
+    af.selector=1;af.available=false;CHECK(!af.ForcedNow()&&!af.Limits(16));
     na::mode::Request saved;
     CHECK(na::mode::BuildSavedRequest(2,13,3440,1440,saved));
     CHECK(saved.render_w==2000 && saved.render_h==840 && saved.unreal_percent==58.f);

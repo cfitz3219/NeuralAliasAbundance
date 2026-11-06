@@ -966,8 +966,8 @@ void write_status_line()
                   (unsigned long long)as.sampler_calls,(unsigned long long)as.sampler2_calls);
             if (an > 0) WriteFile(f, al, DWORD((std::min)(an, int(sizeof al - 1))), &written, nullptr);
             const auto drv = na::fg::preset::GetAnisoOverride();
-            const int dn = snprintf(al, sizeof al, "driver_af available=%u app_profile=%u selector=%u level=%u start{known=%u selector=%u level=%u} forced_this_run=%u limits16=%u written=%u write_result=%d\r\n",
-                drv.available ? 1u : 0u, drv.app_profile ? 1u : 0u, drv.selector, drv.level, drv.start_known ? 1u : 0u, drv.start_selector, drv.start_level, drv.ForcedThisRun() ? 1u : 0u, drv.Limits(16) ? 1u : 0u, drv.written ? 1u : 0u, drv.write_result);
+            const int dn = snprintf(al, sizeof al, "driver_af available=%u app_profile=%u selector=%u level=%u start{known=%u selector=%u level=%u} forced_this_run=%u limits16=%u written=%u write_result=%d source{selector=%u level=%u}\r\n",
+                drv.available ? 1u : 0u, drv.app_profile ? 1u : 0u, drv.selector, drv.level, drv.start_known ? 1u : 0u, drv.start_selector, drv.start_level, drv.ForcedThisRun() ? 1u : 0u, drv.Limits(16) ? 1u : 0u, drv.written ? 1u : 0u, drv.write_result,drv.selector_location,drv.level_location);
             if (dn > 0) WriteFile(f, al, DWORD((std::min)(dn, int(sizeof al - 1))), &written, nullptr);
         }
         if (na::j2::RenderSmall()) { // P4-4 render-small: one line per status write

@@ -984,62 +984,14 @@ void DrawLiveDlaa()
         if (ImGui::IsItemDeactivatedAfterEdit()) na::settings::Save();
         EndRow();
     }
-    if (na::j2::RenderSmall() && na::j2::native_hud::Installed()) {
-        const bool unblend = na::j2::hud_unblend::Configured();
-        bool native_on = unblend ? na::j2::hud_unblend::Enabled() : na::j2::native_hud::Enabled();
-        BeginRow("Native-resolution HUD", unblend ? "Finds the game's HUD image, gives DLSS the scene without it, then redraws compatible UI at your screen's full resolution. Each image is checked; changed regions keep the game's original pixels. Source discovery continues automatically. Off leaves the HUD in the game's image. Not saved."
-                 : "Draws compatible HUD and text at your screen's full resolution after DLSS. When clean separation is unavailable, protects recognised HUD pixels from temporal movement. The original game picture stays available. Off leaves HUD in the game's image. Not saved.", SwitchWidth());
-        // With the un-blend route configured, Off must leave the HUD in the game's image. Before
-        // (Cort's p23896 run, 2026-11-05 05:38) Off only stopped un-blending, so the older native
-        // HUD routes took over, kept learning and dropping the hand-off (upstream now=0/1 every
-        // few seconds) and the picture flipped between our output and the game's own picture
-        // (DLSS indicator on/off) until the game closed. Both routes now follow the one switch.
-        if (Switch("j2nativehud", &native_on)) {
-            if (unblend) { na::j2::hud_unblend::SetEnabled(native_on); na::j2::native_hud::SetEnabled(native_on); }
-            else na::j2::native_hud::SetEnabled(native_on);
-        }
-        EndRow();
-        if(native_on&&unblend){
-            const auto ub=na::j2::hud_unblend::GetStats();
-            const auto hud=na::j2::native_hud::GetStats();
-            if(!ub.current_picture)Hint("Finding the HUD source; it remains in the game image while discovery runs.");
-            else if(!hud.proof_tested)Hint("HUD separation active; waiting for the completed image check.");
-            else if(hud.last_draw_method==1)Hint("Last checked image: HUD separated and drawn at native resolution.");
-            else if(hud.last_draw_method==2)Hint("Last checked image: HUD protected; this draw needs the original game pixels.");
-            else {
-                char line[176];const unsigned percent=unsigned(hud.proof_matched*100/hud.proof_tested);
-                std::snprintf(line,sizeof line,"Last image check: %u%% match; changed regions keep the game's original pixels.",percent);Hint(line);
-            }
-        } else if(native_on){
-            const auto hud=na::j2::native_hud::GetStats();
-            Hint(!hud.last_present_native?"Native HUD is not active this frame; text remains in the upscaled game image."
-                 :hud.last_draw_method==1?"Last checked frame: native HUD."
-                 :hud.last_draw_method==2?"Last checked frame: HUD protected from the current game image."
-                 :hud.last_draw_method==3?"Last checked frame: HUD kept in the game image; the final draw changes the picture."
-                 :hud.last_draw_method==4?"Last checked frame: final HUD drawn at native resolution after DLSS."
-                 :hud.last_draw_method==5?"Last checked frame: kept the game picture; the HUD redraw did not match."
-                 :hud.last_draw_method==6?"Native HUD active; changed regions kept from the game image."
-                 :"Native HUD replay active; awaiting the completed image check.");
-        }
-        if (!na::j2::HudMaskEnabled()) {
-            bool view = na::j2::HudMaskView();
-            BeginRow("Show HUD layer", "Tints in pink what is drawn as native-resolution HUD, to check it. Not saved.", SwitchWidth());
-            if (Switch("j2hudview", &view)) na::j2::SetHudMaskView(view);
-            EndRow();
-        }
-    }
-    if (na::j2::RenderSmall() && na::j2::HudMaskEnabled()) {
-        na::settings::Settings& ss = na::settings::Get();
-        int hud = static_cast<int>(ss.j2_hud_nis.load());
-        BeginRow("HUD sharpness (NIS)", "HUD protection fallback (on by default; [present] hud_mask=0 turns it off). While the camera moves, it learns which pixels stay fixed on screen when the world behind them moves. There DLSS gets no motion and trusts the current frame, and the HUD pixels are shown from an NVIDIA Image Scaling copy at this sharpness. The HUD is still part of what DLSS gets; this protects it rather than separating it. Not used on frames where the native-resolution HUD works.", S(220));
-        ImGui::SetNextItemWidth(S(220));
-        if (ImGui::SliderInt("##j2hudnis", &hud, 0, 100, hud ? "%d%%" : "Off", ImGuiSliderFlags_AlwaysClamp)) ss.j2_hud_nis.store(static_cast<uint32_t>(hud));
-        if (ImGui::IsItemDeactivatedAfterEdit()) na::settings::Save();
-        EndRow();
-        bool view = na::j2::HudMaskView();
-        BeginRow("Show HUD mask", "Tints in pink what is being treated as HUD, to check it. Not saved.", SwitchWidth());
-        if (Switch("j2hudview", &view)) na::j2::SetHudMaskView(view);
-        EndRow();
+    if (na::j2::RenderSmall() && na::j2::native_hud::Automatic()) {
+        const auto method=na::j2::native_hud::AutomaticMethod();
+        if(method==na::j2::hud_routes::Method::Off)
+            Hint("HUD separation unavailable after four methods; DLSS keeps running with the HUD in the image.");
+        else if(na::j2::native_hud::AutomaticVerified())
+            Hint("HUD separation verified; compatible HUD pixels are drawn at native resolution.");
+        else
+            Hint("Checking automatic HUD separation; DLSS keeps running during the checks.");
     }
     {
         // DLSS render preset. NGX values: J 10, K 11, L 12, M 13; 0 = NVIDIA's default;
@@ -1247,41 +1199,38 @@ void DrawLiveDlaaEnhancements()
         int idx = 0;
         for (int i = 0; i < 4; ++i) if (kAnisoLevel[i] == cur) idx = i;
         BeginRow("Anisotropic filtering", "Raises eligible linear texture filtering to 4x, 8x or 16x, improving detail at steep angles before DLSS, including textures that use clamp addressing. Off restores the game's own filtering, which may already be 16x. Point, comparison and min/max samplers keep their filtering. A new level prepares in the background; the status below shows which level is active. Remembered for this game.", S(220));
-        // Graphics driver check (Cort 2026-11-05): a driver-level texture-filtering override
-        // replaces every sampler the game or we choose, so the choice is greyed out while it
-        // is in force and enabled when the driver leaves filtering to the application.
+        // A profile read is diagnostic evidence, not a GPU sampling result.
+        // In particular a cached startup value must not disable the live
+        // selector after the profile changes or a read becomes unavailable.
         const auto drv = na::fg::preset::GetAnisoOverride();
-        const bool driver_forces = drv.ForcedThisRun();
         ImGui::SetNextItemWidth(S(220));
-        ImGui::BeginDisabled(driver_forces);
         if (ImGui::Combo("##aniso", &idx, kAniso, 4)) {
             ss.aniso16.store(kAnisoLevel[idx]);
             na::observe::SetSamplerAnisotropy(kAnisoLevel[idx]);
             na::settings::Save();
         }
-        ImGui::EndDisabled();
         EndRow();
         const auto warn = [](const char* text) {
             ImGui::PushTextWrapPos(0.f);
             StatusLine(2, text);
             ImGui::PopTextWrapPos();
         };
-        if (driver_forces && drv.ForcedNow())
-            warn("Set Anisotropic filtering to \"Application-controlled\" in your graphics driver controls. The driver is replacing the texture filtering, so this choice has no effect and is unavailable.");
-        else if (driver_forces)
-            warn("The graphics driver is now set to application-controlled filtering. It reads that setting when the game starts: start the game once more and this choice becomes available.");
+        if (drv.ForcedNow()) {
+            warn("Your graphics driver profile reports its own texture filtering. It may override this choice; use Application-controlled filtering for this game.");
+            if(drv.app_profile&&!drv.write_pending&&ImGui::SmallButton("Use application filtering"))na::fg::preset::RequestAppControlledAniso();
+        } else if(drv.ForcedThisRun())
+            Hint("The current driver profile leaves filtering to the application. If its old override is still active, it clears on the next game launch.");
         else if (!drv.available)
             Hint("If this choice makes no difference, set Anisotropic filtering to \"Application-controlled\" in your graphics driver controls.");
+        if(drv.written&&!drv.write_pending&&ImGui::SmallButton("Restore previous filtering profile"))na::fg::preset::RequestRestoreAniso();
         const auto as = na::observe::GetAnisoStats();
         char tb[240];
         const auto ml2 = na::observe::GetMipLiveStats();
-        if (driver_forces)
-            std::snprintf(tb, sizeof tb, "In use: the graphics driver's own filtering.");
-        else if (ml2.preparing && ml2.want_aniso != ml2.live_aniso)
+        if (ml2.preparing && ml2.want_aniso != ml2.live_aniso)
             std::snprintf(tb, sizeof tb, "Preparing %ux in the background (%llu of %llu objects); the current filtering stays until it is complete.", ml2.want_aniso,
                           static_cast<unsigned long long>(ml2.prepare_done), static_cast<unsigned long long>(ml2.prepare_total));
         else if (as.level)
-            std::snprintf(tb, sizeof tb, "In use: %ux. Built %llu static sampler overrides; raised %llu sampler descriptors.", as.level,
+            std::snprintf(tb, sizeof tb, "Application samplers: %ux. Built %llu static sampler overrides; raised %llu sampler descriptors.", as.level,
                           static_cast<unsigned long long>(as.static_samplers), static_cast<unsigned long long>(as.samplers));
         else
             std::snprintf(tb, sizeof tb, "In use: off (the game's own filtering).");
@@ -1289,7 +1238,7 @@ void DrawLiveDlaaEnhancements()
         if (as.level) {
             // Draw-time proof: how often the game's draws really went to the GPU with our
             // changed pipelines, against with its own (which never carry the change).
-            std::snprintf(tb, sizeof tb, "Drawn with the changed pipelines: %llu binds; with the game's own: %llu.",
+            std::snprintf(tb, sizeof tb, "Changed pipeline bindings recorded: %llu; original pipeline bindings: %llu.",
                           static_cast<unsigned long long>(ml2.bound_pso_twin), static_cast<unsigned long long>(ml2.bound_pso_game));
             Hint(tb);
         }

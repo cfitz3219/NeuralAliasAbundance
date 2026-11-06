@@ -10,6 +10,7 @@
 #include "test_support.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/native_hud.hpp"
+#include "host_dx12/j2/hud_unblend.hpp"
 #include "host_dx12/j2/hud_picture.hpp"
 #include "core/jitter_domain.hpp"
 #include "host_dx12/observe/producers.hpp"
@@ -262,6 +263,18 @@ int native_picture_phases(test::Device& d)
         bool identity=false,clean=false;nh::Picture::ProofReceipt receipt;
         CHECK(p->ProofAfterCompletion(identity,clean,&receipt)&&identity==(defect==0)&&clean==(defect==0));
         CHECK(receipt.matched==(bad_alpha?0u:W*H-(defect==2?1u:0u)));
+        // The automatic native method uses the independent original-size
+        // replay as an input check, before ordinary Present reconstruction.
+        // Matching colour alone cannot hide an incorrect alpha channel, and
+        // a valid image without any HUD cannot qualify a HUD method.
+        auto automatic=nh::Picture::Create(d.device.Get(),source->GetDesc(),OW,OH);REQUIRE(automatic);
+        test::List verify;REQUIRE(verify.Create(d.device.Get()));
+        REQUIRE(automatic->SnapshotScene(verify.list.Get(),source.Get(),S)&&automatic->SnapshotFull(verify.list.Get(),source.Get(),S));
+        automatic->SetReplayValidation(check.Get());
+        REQUIRE(automatic->Prepare(verify.list.Get(),source.Get(),F,mv.Get(),n0.Get(),n1.Get(),F,1.f,false,true,F));
+        REQUIRE(SUCCEEDED(verify.list->Close()));ID3D12CommandList* verification[]={verify.list.Get()};d.queue->ExecuteCommandLists(1,verification);d.WaitIdle();
+        REQUIRE(automatic->ProofAfterCompletion(identity,clean,&receipt));
+        CHECK(identity==(defect==0)&&clean==(defect==0)&&receipt.hud_pixels==0&&receipt.separated_pixels==0);
     }
     // Stripping optional RDEF must not hide executable UAV writes from replay admission.
     ComPtr<ID3DBlob> code,stripped,error;
@@ -617,7 +630,7 @@ int canvas_probe(test::Device& d)
     return 0;
 }
 
-int draw_handoff(test::Device& d,bool unresolved=false,bool native=false,bool dxil=false,bool split=false,bool typeless=false,bool separate=false,bool ahead=false,bool ui_only=false)
+int draw_handoff(test::Device& d,bool unresolved=false,bool native=false,bool dxil=false,bool split=false,bool typeless=false,bool separate=false,bool ahead=false,bool ui_only=false,bool automatic=false)
 {
     auto* dev=d.device.Get();
     const auto initial_stats=nh::GetStats();constexpr UINT W=64,H=32,OW=128,OH=64;constexpr auto F=DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -626,7 +639,9 @@ int draw_handoff(test::Device& d,bool unresolved=false,bool native=false,bool dx
     auto target=test::CreateTexture(dev,W,H,F,R,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     auto stale=test::CreateTexture(dev,W,H,F,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_FLAG_NONE);
     auto target2=test::CreateTexture(dev,W,H,F,R,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
-    REQUIRE(upstream&&target&&stale);nh::Layer learned;CHECK(!nh::TakeFrame(target.Get(),W,H,OW,OH,&learned,d.queue.Get()));
+    REQUIRE(upstream&&target&&stale);
+    if(automatic){nh::SetAutomatic(true);nh::AutomaticFrame(target.Get(),d.queue.Get(),W,H,OW,OH,false);}
+    nh::Layer learned;CHECK(!nh::TakeFrame(target.Get(),W,H,OW,OH,&learned,d.queue.Get()));
     auto world=test::CreateTexture(dev,W,H,DXGI_FORMAT_R16G16B16A16_FLOAT,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_NONE);REQUIRE(world);
     if(ui_only){std::vector<uint16_t> world_pixels;for(UINT i=0;i<W*H;++i)world_pixels.insert(world_pixels.end(),{0x4000,0x3c00,0x3800,0x3c00});
         REQUIRE(upload(d,world.Get(),world_pixels.data(),8,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));}
@@ -718,6 +733,20 @@ float4 altered(float4 p:SV_Position):SV_Target{return ps(p)*.8;}
             nh::ReportCanvasProbe(layer.probe_source,layer.probe_generation,identity);
         }
         if(frame<(ui_only?1u:unresolved&&!dxil?2u:3u)){CHECK(!found);return 0;}
+        if(automatic){
+            REQUIRE(found&&layer.picture&&layer.owner&&layer.clean_allowed&&!layer.native_picture);
+            CHECK(layer.route_ticket.method==na::j2::hud_routes::Method::NativeReplay);
+            std::vector<float> zeros(W*H*2);auto mv=test::CreateTexture(dev,W,H,DXGI_FORMAT_R32G32_FLOAT,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+            REQUIRE(mv&&upload(d,mv.Get(),zeros.data(),8,S));test::List calc;REQUIRE(calc.Create(dev));
+            auto barrier=test::Transition(shown,D3D12_RESOURCE_STATE_PRESENT,S);calc.list->ResourceBarrier(1,&barrier);
+            REQUIRE(layer.picture->Prepare(calc.list.Get(),shown,F,mv.Get(),layer.n0,layer.n1,layer.view,layer.grey,layer.srgb,layer.clean_allowed,F));
+            std::swap(barrier.Transition.StateBefore,barrier.Transition.StateAfter);calc.list->ResourceBarrier(1,&barrier);
+            REQUIRE(SUCCEEDED(calc.list->Close()));ID3D12CommandList* checks[]={calc.list.Get()};d.queue->ExecuteCommandLists(1,checks);d.WaitIdle();
+            bool identity=false,clean=false;nh::Picture::ProofReceipt receipt;REQUIRE(layer.picture->ProofAfterCompletion(identity,clean,&receipt));
+            CHECK(identity&&clean&&receipt.hud_pixels>0&&receipt.hud_pixels==receipt.separated_pixels);
+            std::printf("automatic native draw route: current image + independent replay agree, HUD=%u separated=%u\n",receipt.hud_pixels,receipt.separated_pixels);
+            return 0;
+        }
         if(frame==6&&!native){CHECK(found&&layer.picture&&!layer.clean_allowed&&!layer.native_picture);return 0;}REQUIRE(found&&layer.picture&&layer.owner);CHECK(layer.clean_allowed==(frame!=5&&frame!=6));
         if(native&&frame!=7){
             REQUIRE(layer.native_picture&&layer.native_check);
@@ -763,7 +792,7 @@ float4 altered(float4 p:SV_Position):SV_Target{return ps(p)*.8;}
         return 0;
     };
     bool presented[2]{};
-    for(UINT frame=0;frame<8;++frame){
+    for(UINT frame=0;frame<(automatic?4u:8u);++frame){
         na::nr::native::Reset(game.list.Get());REQUIRE(SUCCEEDED(game.alloc->Reset()));REQUIRE(SUCCEEDED(game.list->Reset(game.alloc.Get(),nullptr)));
         auto* l=game.list.Get();l->OMSetRenderTargets(1,&a,FALSE,nullptr);l->SetGraphicsRootSignature(hud_root.Get());l->SetPipelineState(scene_pso.Get());
         l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);l->RSSetViewports(1,&vp);l->RSSetScissorRects(1,&all);
@@ -823,12 +852,14 @@ float4 altered(float4 p:SV_Position):SV_Target{return ps(p)*.8;}
             // Do not invent a combined batch after the separate real submissions.
             if(!separate)nh::AfterSubmission(d.queue.Get(),list_count,lists);
         }
-        if(frame==3)continue; // render-ahead: the next source reuses its resource before this Present
+        if(frame==3&&!automatic)continue; // render-ahead case; automatic route validates its first actual capture now
         if(frame==4){if(validate(target.Get(),3)||validate(target2.Get(),4))return 1;}
         else if(validate(target.Get(),frame))return 1;
     }
-    if(split&&!ui_only)CHECK(nh::GetStats().canvas_source_probes>initial_stats.canvas_source_probes);
+    if(split&&!ui_only&&!automatic)CHECK(nh::GetStats().canvas_source_probes>initial_stats.canvas_source_probes);
+    if(automatic)CHECK(nh::GetStats().native_submitted>initial_stats.native_submitted);
     if(native){CHECK(nh::GetStats().native_finishing_draws>initial_stats.native_finishing_draws);CHECK(native_fixture_calls>=4);CHECK(nh::GetStats().native_reused>0);native_fixture=nullptr;nh::SetPreHudRendererForTests(nullptr);}
+    if(automatic){nh::SetAutomatic(false);na::j2::hud_unblend::SetConfigured(false);}
     return 0;
 }
 
@@ -1203,6 +1234,7 @@ int end_to_end(test::Device& d)
     if(draw_handoff(d,true,true,true))return 1;
 #endif
     CHECK(nh::GetStats().upstream_dropped>0); // obsolete canvas profiles cannot fill all eight discovery slots
+    if(draw_handoff(d,false,true,false,true,false,false,false,false,true))return 1;
     na_observe_stop();
     return 0;
 }

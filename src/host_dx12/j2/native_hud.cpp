@@ -35,6 +35,10 @@ constexpr uint32_t kViews = 4;       // render-target view formats per layer (ty
 constexpr uint64_t kGraveFrames = 8; // presents before a replaced layer is released
 
 std::atomic<bool> g_installed{false}, g_on{true}, g_cover{false};
+std::atomic<bool> g_automatic{false};
+std::atomic<hud_routes::Method> g_auto_method{hud_routes::Method::NativeReplay};
+std::mutex g_auto_mutex;
+hud_routes::Policy g_auto_policy;
 std::atomic<PreHudRenderer> g_test_renderer{nullptr};
 struct CapturedPicture;
 struct ProbeCapture;
@@ -887,6 +891,7 @@ void mirror_depth_only(ID3D12GraphicsCommandList* l, const na::observe::ShaderCa
     for (auto& q : g_proxy)
         if (q.id && q.ow && (q.mirrored == st.ds || (!q.mirrored && q.hud_ds == st.ds))) { p = &q; break; }
     if (!p || !g_on.load()) return;
+    if(Automatic()&&!p->preserve)return; // automatic trials cannot replay unverified legacy draws/queries
     if(p->preserve&&(!st.shader_readonly||st.query_active)){p->clean=false;return;}
     // Before the HUD's first draw the target may still hold the picture's depth passes: only a few.
     if (!p->hud && p->masks >= kEarlyMasks) return;
@@ -946,6 +951,16 @@ na::observe::ShaderScope redirect(ID3D12GraphicsCommandList* l, na::observe::Sha
     std::lock_guard<std::mutex> lock(g_m);
     Proxy* p = find_locked(st.rt);
     if (!p || !p->ow) return {};
+    if(Automatic()&&!p->preserve){
+        // Observe the actual final handoff to learn an independent canvas,
+        // but never run the old redirect/replay heuristic speculatively.
+        // Unsupported direct HUDs go to the next automatic method intact.
+        if(SceneShaped(st.pipeline_known&&st.blend_mask!=NA_UNKNOWN_U32,st.blend_mask,uint64_t(call.args[0]),uint64_t(call.args[1]))&&
+           CoversTarget(st.viewport_count?st.viewports[0]:nullptr,st.scissor_count?st.scissors[0]:nullptr,p->rw,p->rh)){
+            note_source_locked(*p,l,&call);p->source_copy=false;++p->scene;++g_stats.scene_draws;
+        }
+        return {};
+    }
     if (p->upstream && p->paused) return {}; // lineage not current: the original picture keeps its HUD
     const bool shaped = SceneShaped(st.pipeline_known && st.blend_mask != NA_UNKNOWN_U32, st.blend_mask, uint64_t(call.args[0]), uint64_t(call.args[1]));
     bool observed_output=false;
@@ -1122,7 +1137,7 @@ na::observe::ShaderScope redirect(ID3D12GraphicsCommandList* l, na::observe::Sha
     // original complete game picture remains until the same-frame GPU choice.
     bool preserve=p->preserve;
     for (const auto& q:g_proxy) preserve|=q.id&&q.upstream&&q.preserve&&q.rw==p->rw&&q.rh==p->rh&&q.ow==p->ow&&q.oh==p->oh;
-    return {preserve?na::observe::ShaderAction::Forward:na::observe::ShaderAction::Replaced, nullptr};
+    return {(preserve||g_automatic.load())?na::observe::ShaderAction::Forward:na::observe::ShaderAction::Replaced, nullptr};
 }
 
 class DrawHook final : public na::observe::ShaderOperationHook {
@@ -1130,6 +1145,7 @@ public:
     na::observe::ShaderScope Before(ID3D12GraphicsCommandList* l, na::observe::ShaderCall& call) noexcept override
     {
         if (g_tracing.load(std::memory_order_relaxed)) trace_draw(l, call);
+        if(Automatic()&&AutomaticMethod()==hud_routes::Method::Off)return {};
         if (hud_unblend::Enabled()) return hud_unblend::OnDraw(l, call); // the un-blend route owns the draws
         if(call.kind!=na::observe::ShaderKind::Dispatch&&t_bind.canvas&&t_bind.list==l&&g_on.load()){
             na::observe::DrawInfo info;
@@ -1153,6 +1169,7 @@ public:
         return redirect(l, call);
     }
     void Closing(ID3D12GraphicsCommandList* l) noexcept override {
+        if(Automatic()&&AutomaticMethod()==hud_routes::Method::Off)return;
         if (hud_unblend::Enabled()) { hud_unblend::OnClosing(l); return; }
         if(!g_on.load())return;
         std::lock_guard<std::mutex> lock(g_m);
@@ -1211,6 +1228,7 @@ class ClearHook final : public na::observe::TextureOperationHook {
 public:
     na::observe::ShaderScope Before(ID3D12GraphicsCommandList* l, const na::observe::TextureCall& c) noexcept override
     {
+        if(Automatic()&&AutomaticMethod()==hud_routes::Method::Off)return {};
         if (hud_unblend::Enabled()) hud_unblend::OnTexture(l, c);
         if ((c.kind == na::observe::TextureKind::Copy || c.kind == na::observe::TextureKind::CopyRegion) && c.destination && c.source) {
             // H1b: a whole-picture copy into a back buffer is a hand-off from its source.
@@ -1275,6 +1293,7 @@ void on_bind(ID3D12GraphicsCommandList* l, const na::observe::RasterScissors& s)
 {
     na_object_id rt = 0, ds = 0;
     Bind b{l, s.recording, 0};
+    if(Automatic()&&AutomaticMethod()==hud_routes::Method::Off){t_bind=b;return;}
     if (hud_unblend::Enabled()) { hud_unblend::OnBind(l, s.recording); t_bind = b; return; }
     if (g_on.load(std::memory_order_relaxed) && na::observe::ListCurrentTargets(l, &rt, &ds) && (rt || ds)) {
         std::lock_guard<std::mutex> lock(g_m);
@@ -1369,7 +1388,38 @@ void Install()
 bool Installed() { return g_installed.load(); }
 void SetEnabled(bool on) { g_on.store(on); }
 void SetCoverRule(bool on) { g_cover.store(on); }
-bool Enabled() { return g_installed.load() && g_on.load(); }
+bool Enabled() { return g_installed.load() && g_on.load()&&(!Automatic()||AutomaticMethod()!=hud_routes::Method::Off); }
+void SetAutomatic(bool on){
+    const bool old=g_automatic.exchange(on);
+    if(on){
+        if(!old){std::lock_guard<std::mutex> lock(g_auto_mutex);g_auto_policy.Restart();g_auto_method.store(hud_routes::Method::NativeReplay);}
+        g_on.store(true);hud_unblend::SetConfigured(true);hud_unblend::SetEnabled(true);
+    }
+}
+bool Automatic(){return g_automatic.load(std::memory_order_relaxed);}
+hud_routes::Method AutomaticMethod(){return g_auto_method.load(std::memory_order_relaxed);}
+hud_routes::Ticket AutomaticTicket(){std::lock_guard<std::mutex> lock(g_auto_mutex);return g_auto_policy.Current();}
+bool AutomaticVerified(){std::lock_guard<std::mutex> lock(g_auto_mutex);return g_auto_policy.Verified();}
+void AutomaticFrame(ID3D12Resource* frame,ID3D12CommandQueue* queue,uint32_t rw,uint32_t rh,uint32_t ow,uint32_t oh,bool eligible){
+    if(!Automatic()||!frame||!queue)return;
+    ComPtr<ID3D12Device> device;if(FAILED(frame->GetDevice(IID_PPV_ARGS(&device))))return;
+    const hud_routes::Key key{reinterpret_cast<uintptr_t>(device.Get()),reinterpret_cast<uintptr_t>(queue),rw,rh,ow,oh,uint32_t(frame->GetDesc().Format)};
+    std::lock_guard<std::mutex> lock(g_auto_mutex);g_auto_policy.Frame(key,eligible);g_auto_method.store(g_auto_policy.Selected());
+}
+void ReportAutomatic(hud_routes::Ticket ticket,uint32_t hud,uint32_t separated){
+    if(!Automatic())return;
+    std::lock_guard<std::mutex> lock(g_auto_mutex);g_auto_policy.Receipt(ticket,hud,separated);
+    // Activate route changes only at the next Present boundary, never midway
+    // through consuming a completed packet on the current recording.
+}
+std::string AutomaticStatus(){
+    if(!Automatic())return "hud_auto enabled=0";
+    std::lock_guard<std::mutex> lock(g_auto_mutex);std::string out="hud_auto method=";out+=hud_routes::Name(g_auto_policy.Selected());
+    out+=g_auto_policy.Selected()==hud_routes::Method::Off?" state=exhausted fallback=ordinary_dlss":g_auto_policy.Verified()?" state=verified":" state=trying";
+    char b[192];uint32_t i=0;for(const auto& a:g_auto_policy.Attempts()){
+        std::snprintf(b,sizeof b," attempt%u{frames=%u receipts=%u pass=%u fail=%u hud=%u separated=%u}",++i,a.frames,a.receipts,a.passes,a.failures,a.hud_pixels,a.separated_pixels);out+=b;
+    }return out;
+}
 
 bool PictureSource(const na::observe::NativeOperation& op, uint64_t destination,
                    uint32_t width, uint32_t height, uint64_t& source)
@@ -1398,6 +1448,7 @@ bool PictureSource(const na::observe::NativeOperation& op, uint64_t destination,
 bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, Layer* out,ID3D12CommandQueue* queue)
 {
     if (!g_installed.load() || !frame) return false;
+    if(Automatic()&&AutomaticMethod()==hud_routes::Method::Off)return false;
     const na_object_id id = na::observe::IdOf(frame);
     std::lock_guard<std::mutex> lock(g_m);
     struct FinishLayers {~FinishLayers(){if(g_layer_owner&&std::none_of(std::begin(g_proxy),std::end(g_proxy),[](const auto& p){return p.preserve&&p.picture;})){
@@ -1477,6 +1528,19 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
         g_stats.last_redirected=capture->draws;g_stats.last_forwarded=capture->forwarded;
         g_stats.proxy_format=p->format;g_stats.view_format=capture->view;g_stats.grey=GreyFor(capture->view);
         if(same_recording){p->source=0;p->source_ambiguous=p->source_copy=false;p->hud=p->cleared=false;p->scene=p->redirected=p->forwarded=0;}
+        if(Automatic()){
+            // Automatic trials keep the original game draws. Native replay
+            // supplies a clean scene + independent original-size replay, not
+            // permission to bypass ordinary DLSS when its final check fails.
+            if(!ready||!out||!capture->picture||!out->native_check||out->reconstruction){if(out)*out={};return false;}
+            // Keep the BEFORE-handoff full snapshot for the identity test.
+            // Using replay->picture (captured after the finishing shader)
+            // would hide a colour transform that these layers do not contain.
+            out->picture=capture->picture;
+            out->picture->SetReplayValidation(out->native_check);
+            out->native_picture=nullptr;out->native_check=nullptr;
+            out->reconstruction.reset();out->route_ticket=AutomaticTicket();
+        }
         return ready;
     }
     // H1b: the upstream picture for this output (handled like the back buffer), and learning.
@@ -1531,7 +1595,7 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
                 else {
                     *slot = Proxy{};
                     slot->id = g_cand.id; slot->upstream = true;
-                    slot->preserve=!p->source_copy; // draws are observed, never blindly treated as copies
+                    slot->preserve=Automatic()||!p->source_copy; // automatic trials never remove game HUD draws
                     slot->rw = rw; slot->rh = rh; slot->ow = ow; slot->oh = oh; slot->format = f; slot->used = g_frame;
                     ++g_stats.upstream_learned;
                     g_stats.upstream_why[0] = 0;
@@ -1594,6 +1658,7 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
     p->scene = p->redirected = p->forwarded = 0;
     p->depth_draws = p->blended = p->covered = p->world = p->masks = 0;
     if(u&&!u->preserve){u->picture.reset();u->picture_uses.clear();u->clean=true;}
+    if(Automatic()){if(out)*out={};return false;} // unverified legacy redirects never authorise separation
     return hud;
 }
 
@@ -1749,7 +1814,7 @@ std::string StatusLine()
     std::snprintf(b,sizeof b," shader_inspection{unique=%llu hits=%llu disassembled=%llu dxil=%llu us=%llu bytes=%llu evictions=%llu}",
         (unsigned long long)shaders.misses,(unsigned long long)shaders.hits,(unsigned long long)shaders.disassemblies,
         (unsigned long long)shaders.dxil,(unsigned long long)shaders.microseconds,(unsigned long long)shaders.bytes,(unsigned long long)shaders.evictions);
-    result+=b;return result;
+    result+=b;result+=" ";result+=AutomaticStatus();return result;
 }
 
 } // namespace na::j2::native_hud

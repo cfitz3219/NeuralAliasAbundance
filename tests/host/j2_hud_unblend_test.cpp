@@ -455,6 +455,7 @@ int end_to_end(test::Device& d)
         bool identity = false, clean = false; nh::Picture::ProofReceipt receipt;
         REQUIRE(layer.picture->ProofAfterCompletion(identity, clean, &receipt));
         CHECK(identity && clean && receipt.matched == RW * RH);
+        CHECK(receipt.hud_pixels>0&&receipt.separated_pixels==receipt.hud_pixels);
         std::vector<uint8_t> clean_input; REQUIRE(readback(d, layer.picture->Input(), NPSR, 8, clean_input));
         float maximum = 0;
         for (uint32_t y = 0; y < RH; ++y) for (uint32_t x = 0; x < RW; ++x) for (int channel = 0; channel < 3; ++channel) {
@@ -635,6 +636,23 @@ int end_to_end(test::Device& d)
         std::vector<uint8_t> mask;REQUIRE(readback(d,clipped.picture->Mask(),NPSR,2,mask));uint16_t protected_value=0,scene_value=0;
         std::memcpy(&protected_value,mask.data(),2);std::memcpy(&scene_value,mask.data()+((RH-1)*RW+RW-1)*2,2);
         CHECK(half_value(protected_value)>.9f&&half_value(scene_value)==0);
+        CHECK(proof.hud_pixels>0&&proof.separated_pixels<proof.hud_pixels);
+        // A deliberately rejected (clipped) HUD model must retain the
+        // enhanced scene pixels, not switch the whole output to the original
+        // unenhanced full game picture. Use a visibly different known output.
+        test::List compose;REQUIRE(compose.Create(dev));auto* c=compose.list.Get();
+        b=test::Transition(picture.Get(),RTS,D3D12_RESOURCE_STATE_COPY_SOURCE);c->ResourceBarrier(1,&b);
+        b=test::Transition(out.Get(),UAV,D3D12_RESOURCE_STATE_COPY_DEST);c->ResourceBarrier(1,&b);
+        c->CopyResource(out.Get(),picture.Get());
+        b=test::Transition(picture.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,RTS);c->ResourceBarrier(1,&b);
+        b=test::Transition(out.Get(),D3D12_RESOURCE_STATE_COPY_DEST,UAV);c->ResourceBarrier(1,&b);
+        b=test::Transition(proxy.Get(),RTS,NPSR);c->ResourceBarrier(1,&b);
+        REQUIRE(clipped.picture->Composite(c,out.Get()));
+        std::swap(b.Transition.StateBefore,b.Transition.StateAfter);c->ResourceBarrier(1,&b);
+        REQUIRE(SUCCEEDED(c->Close()));ID3D12CommandList* compose_work[]={c};submit(d.queue.Get(),1,compose_work);d.WaitIdle();
+        std::vector<uint8_t> enhanced;REQUIRE(readback(d,out.Get(),UAV,4,enhanced));
+        for(int ch=0;ch<3;++ch)CHECK(std::abs(int(enhanced[ch])-int(std::lround(kScene[ch]*255)))<=1);
+        std::printf("rejected HUD model keeps enhanced output; hud=%u separated=%u\n",proof.hud_pixels,proof.separated_pixels);
     }
     // Record a future frame into the same game resources before submitting
     // the current one. Actual queue order, not the last CPU recording, owns
@@ -668,6 +686,13 @@ float4 vs(uint id:SV_VertexID):SV_Position{float2 v=float2((id<<1)&2,id&2)*.125+
     CHECK(ub::GetStats().last_draws==2); // small opaque geometry did not erase the earlier veil
     ID3D12CommandList* reversed[]={next,l};submit(d.queue.Get(),2,reversed);d.WaitIdle();CHECK(validate(kScene));
     std::printf("render-ahead and repeated reverse queue order: exact submitted scene retained\n");
+    nh::SetAutomatic(true);nh::AutomaticFrame(proxy.Get(),d.queue.Get(),RW,RH,OW,OH,false);
+    for(int i=0;i<91;++i)nh::AutomaticFrame(proxy.Get(),d.queue.Get(),RW,RH,OW,OH,true);
+    CHECK(nh::AutomaticMethod()==na::j2::hud_routes::Method::DirectOrCopy);
+    submit(d.queue.Get(),1,lists);d.WaitIdle();nh::Layer automatic;
+    REQUIRE(nh::TakeFrame(proxy.Get(),RW,RH,OW,OH,&automatic,d.queue.Get()));
+    CHECK(automatic.picture&&automatic.clean_allowed&&automatic.route_ticket.method==na::j2::hud_routes::Method::DirectOrCopy);
+    nh::SetAutomatic(false);
     return 0;
 }
 
@@ -681,6 +706,10 @@ int mixed_canvas(test::Device& d,bool srgb_source=false)
     auto canvas=test::CreateTexture(dev,RW,RH,F,RTS,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     auto output=test::CreateTexture(dev,RW,RH,F,RTS,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     REQUIRE(world&&canvas&&output);
+    nh::SetAutomatic(true);nh::AutomaticFrame(output.Get(),d.queue.Get(),RW,RH,OW,OH,false);
+    for(int i=0;i<182&&nh::AutomaticMethod()!=na::j2::hud_routes::Method::ShaderHandoff;++i)
+        nh::AutomaticFrame(output.Get(),d.queue.Get(),RW,RH,OW,OH,true);
+    CHECK(nh::AutomaticMethod()==na::j2::hud_routes::Method::ShaderHandoff);
     ComPtr<ID3D12DescriptorHeap> rtvs,views;
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,3,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
     REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&rtvs))));
@@ -750,6 +779,8 @@ float4 copy(V v):SV_Target{return image.SampleLevel(s,v.uv,0);})";
     CHECK(at(high,RW,20,16,0)==at(low,RW,20,16,0)); // actual opaque HUD remains independent
     std::printf("mixed world/HUD batch and opaque final draw: prediction %d/255; source_srgb=%d substitutions=%llu\n",maximum,srgb_source,(unsigned long long)ub::GetStats().world_substitutions);
     ComPtr<ID3D12QueryHeap> queries;D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION,1,0};
+    for(int i=0;i<91;++i)nh::AutomaticFrame(output.Get(),d.queue.Get(),RW,RH,OW,OH,true);
+    CHECK(nh::AutomaticMethod()==na::j2::hud_routes::Method::PixelDiscovery);
     REQUIRE(SUCCEEDED(dev->CreateQueryHeap(&query_desc,IID_PPV_ARGS(&queries))));
     for(unsigned frame=0;frame<3;++frame){
         REQUIRE(SUCCEEDED(game.alloc->Reset())&&SUCCEEDED(l->Reset(game.alloc.Get(),nullptr)));
@@ -806,9 +837,37 @@ float4 copy(V v):SV_Target{return image.SampleLevel(s,v.uv,0);})";
     }
     CHECK(ub::GetStats().learned_frames>0);
     std::printf("hidden final dependency: discovered from completed GPU pixels, selected after two matching frames\n");
+    nh::SetAutomatic(false);
     return 0;
 }
 } // namespace
+
+int automatic_policy()
+{
+    using namespace na::j2::hud_routes;
+    const Key key{1,2,64,32,128,64,28};Policy p;p.Frame(key,false);
+    const auto stale=p.Current();
+    for(int i=0;i<500;++i)p.Frame(key,false);
+    CHECK(p.Selected()==Method::NativeReplay&&p.Attempts()[0].frames==0);
+    for(int method=0;method<4;++method){
+        CHECK(uint32_t(p.Selected())==uint32_t(method));const auto t=p.Current();
+        // A whole picture that matches but has no HUD proves nothing.
+        for(int i=0;i<91;++i){p.Frame(key,true);p.Receipt(t,0,0);}
+    }
+    CHECK(p.Selected()==Method::Off&&!p.Verified());
+    for(int i=0;i<500;++i)p.Frame(key,true);
+    CHECK(p.Selected()==Method::Off); // exhausted means off, not retry forever
+    Key resized=key;resized.rw=80;p.Frame(resized,true);
+    CHECK(p.Selected()==Method::NativeReplay&&!p.Receipt(stale,100,100));
+    const auto t=p.Current();for(int i=0;i<3;++i){p.Frame(resized,true);CHECK(p.Receipt(t,100,100));}
+    CHECK(p.Verified());
+    for(int i=0;i<7;++i)CHECK(p.Receipt(t,100,0));
+    CHECK(p.Selected()==Method::NativeReplay); // one bad frame cannot flap a verified method
+    CHECK(p.Receipt(t,100,0));CHECK(p.Selected()==Method::DirectOrCopy);
+    CHECK(!p.Receipt(t,100,100)&&!p.Verified()); // old method's delayed receipt
+    std::printf("HUD auto policy: four finite methods, real HUD evidence, pause, resize, stale receipts, stable failure\n");
+    return 0;
+}
 
 int main(int argc,char** argv)
 {
@@ -819,7 +878,7 @@ int main(int argc,char** argv)
     const bool compiled = na::j2::CompileHudShadersForTests(why, sizeof why);
     if (!compiled) std::printf("HUD shaders: %s\n", why);
     CHECK(compiled);
-    if (verdict_logic()) return 1;
+    if (verdict_logic()||automatic_policy()) return 1;
     test::Device d;
     if (!test::CreateDevice(d)) return test::SkipNoDevice("j2_hud_unblend_test");
     struct ExitObserver {~ExitObserver(){na::observe::SetProcessExiting();}} exit_observer;

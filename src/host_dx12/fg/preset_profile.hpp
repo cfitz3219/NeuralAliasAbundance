@@ -40,6 +40,7 @@ struct AnisoOverride {
     bool available = false;    // the driver settings could be read
     bool app_profile = false;  // this executable has its own NVIDIA profile (writable target)
     uint32_t selector = 0, level = 0; // effective values for this executable
+    uint32_t selector_location=~0u,level_location=~0u; // driver profile provenance, for diagnostics
     // What the driver had when the game started: it reads its profile then, so a change made
     // while the game runs applies from the next start.
     bool start_known = false;
@@ -50,8 +51,8 @@ struct AnisoOverride {
     bool Limits(uint32_t wanted) const { return available && selector == 1u && level < wanted; }
     // The driver replaces the application's texture filtering (anything but application-
     // controlled) in this run / in its current profile.
-    bool ForcedThisRun() const { return start_known && start_selector != 0u; }
-    bool ForcedNow() const { return available && selector != 0u; }
+    bool ForcedThisRun() const { return start_known && start_selector == 1u; }
+    bool ForcedNow() const { return available && selector == 1u; }
 };
 void ReadAnisoOverride();     // init thread / background worker only (DRS session)
 AnisoOverride GetAnisoOverride();

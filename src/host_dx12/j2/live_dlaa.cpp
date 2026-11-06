@@ -3079,6 +3079,7 @@ struct SmallRing {
     std::shared_ptr<na::j2::native_hud::Picture> hud_picture[kRing];
     struct HudAssociation{uint64_t source=0,generation=0;} hud_association[kRing];
     bool native_hud_result[kRing]{};
+    hud_routes::Ticket hud_ticket[kRing];
     struct CanvasProbe {
         std::shared_ptr<na::j2::native_hud::Picture> picture;
         std::shared_ptr<void> owner;
@@ -3897,6 +3898,8 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
                     const native_hud::Layer* supplied,ID3D12CommandList* replay)
 {
     if (!queue || !frame || !out || !rw || !rh || !ow || !oh) return false;
+    const bool probe_replay=replay&&native_hud::Automatic();
+    if(!supplied)native_hud::AutomaticFrame(frame,queue,rw,rh,ow,oh,false);
     // Native HUD: whether this frame's HUD was drawn into the native layers (then the proxy
     // holds the scene only, which is what DLSS gets).
     na::j2::native_hud::Layer layer;
@@ -3922,12 +3925,14 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
     if(hud_completed!=UINT64_MAX)for(uint32_t j=0;j<kRing;++j)if(g_small.value[j]&&hud_completed>=g_small.value[j]){
         bool identity=false,clean=false;na::j2::native_hud::Picture::ProofReceipt receipt;
         if(g_small.hud_picture[j]&&g_small.hud_picture[j]->ProofAfterCompletion(identity,clean,&receipt)){
+            na::j2::native_hud::ReportAutomatic(g_small.hud_ticket[j],receipt.hud_pixels,receipt.separated_pixels);
             if(g_small.native_hud_result[j])na::j2::native_hud::ReportNativePictureResult(identity,receipt.tested,receipt.matched,receipt.maximum_error);
             else na::j2::native_hud::ReportPictureResult(identity,clean,receipt.tested,receipt.matched,receipt.maximum_error);
             const auto& association=g_small.hud_association[j];
             if(association.source)na::j2::hud_unblend::ReportProbe(association.source,association.generation,identity,receipt.tested,receipt.picture_matched);
         }
         g_small.native_hud_result[j]=false;
+        g_small.hud_ticket[j]={};
         g_small.hud_association[j]={};
         auto& probe=g_small.canvas_probe[j];
         if(probe.picture&&probe.picture->ProofAfterCompletion(identity,clean,&receipt))
@@ -3938,6 +3943,7 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
     g_small.hud_owner[si]=layer.owner;
     g_small.hud_picture[si]=layer_frame&&!replay?layer.picture:nullptr;
     g_small.hud_association[si]={layer.association_source,layer.association_generation};
+    g_small.hud_ticket[si]=layer.route_ticket;
     if (g_small.owned) na::gpu::Collect();
     g_small.owned_recording=false;
     if(na::gpu::Enabled()){
@@ -3954,10 +3960,10 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
     constexpr UINT PRESENT = D3D12_RESOURCE_STATE_PRESENT, NPSR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                    UAV = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     std::vector<D3D12_RESOURCE_BARRIER> b;
-    if(layer.unblend&&layer.picture&&layer.picture->Prepared()){
+    if(layer.picture&&layer.picture->Prepared()&&(layer.unblend||native_hud::Automatic())){
         auto copy=layer.picture->ForkSnapshot(l);
-        if(!copy){close_list();g_small.hud_picture[si].reset();g_small.hud_owner[si].reset();return false;}
-        layer.picture=std::move(copy);g_small.hud_picture[si]=layer.picture;
+        if(!copy){layer={};g_small.hud_picture[si].reset();g_small.hud_owner[si].reset();g_small.hud_ticket[si]={};}
+        else {layer.picture=std::move(copy);g_small.hud_picture[si]=layer.picture;}
     }
     add(b, frame, PRESENT, NPSR);
     add(b, out, NPSR, UAV);
@@ -3998,8 +4004,9 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
     if (!replay&&!(g.def.valid && g.def.frame + 1 == g.frame)) present_source(queue, forward);
     const auto& d = g.def;
     const bool fresh = d.valid && d.frame + (replay?0u:1u) == g.frame && d.w == rw && d.h == rh;
-    const bool can_dlss = fresh && forward && g.dlss_ready && g.device && g.device.Get() == g_small.device.Get() &&
+    const bool can_dlss = !probe_replay && fresh && forward && g.dlss_ready && g.device && g.device.Get() == g_small.device.Get() &&
                           g.queue.Get() == queue && g.depth32 && g.motion && g.paused.load() == false;
+    if(!supplied)native_hud::AutomaticFrame(frame,queue,rw,rh,ow,oh,can_dlss);
     if (can_dlss) {
         const na::jitter::Source source{d.selection_version,rw,rh,static_cast<uint32_t>(frame->GetDesc().Format)};
         if (!(source == g_small.final_jitter.Key())) {
@@ -4021,7 +4028,7 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
     bool small_shifted = false; // DLSS got the jitter-shifted colour (g_small.jshift, back to UAV after)
     // HUD separation: on when [j2] hud_nis > 0, for SDR pictures, once the last frame is held.
     const uint32_t hud_nis = na::settings::Get().j2_hud_nis.load(std::memory_order_relaxed);
-    const bool hud_want = !layer_frame && g_hud_mask_on.load(std::memory_order_relaxed) && hud_nis > 0 && !hdr && can_dlss &&
+    const bool hud_want = !native_hud::Automatic()&&!layer_frame && g_hud_mask_on.load(std::memory_order_relaxed) && hud_nis > 0 && !hdr && can_dlss &&
                           hud_init() && hud_targets(frame, rw, rh, ow, oh);
     const DXGI_FORMAT of = typed(out->GetDesc().Format);
     // hud_unblend: the UI's effect is removed from DLSS's input first; the layers are laid on only
@@ -4034,7 +4041,7 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
     }
     const bool hud_layer = layer_frame && !layer.picture && (!layer.unblend || (layer.compose && unblended)) && hud_init() && small_sharp_target(ow, oh, of);
     if (layer_frame && !layer.picture && !hud_layer) small_note("Render-small: the native HUD could not be laid on (no composite pass); HUD missing this frame.");
-    bool draw_picture=false;
+    bool draw_picture=probe_replay; // native/check discovery replay, without a second DLSS evaluation
     bool hud_mask = false; // mask holds this frame's HUD and is applied
     bool hud_ran = false;  // the fallback passes ran (mask in NON_PIXEL_SHADER_RESOURCE until the end)
     const DXGI_FORMAT ff = typed(frame->GetDesc().Format);
@@ -4264,7 +4271,7 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
             small_note(why);
         }
         g.def.valid = false; // used (or refused) once
-    } else {
+    } else if(!probe_replay) {
         small_note(!d.valid ? "Render-small: no depth and motion yet for this frame; stretched."
                    : d.frame + 1 != g.frame ? "Render-small: this frame's scene was not captured; stretched."
                    : (d.w != rw || d.h != rh) ? "Render-small: the scene is not the picture's size; stretched."
@@ -4275,8 +4282,8 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
     if (unblend_ran) add(b, g_small.ublend.Get(), NPSR, UAV);
     if (!dlss) {
         flush(l, b);
-        small_stretch(l, separate_scene?layer.reconstruction->Scene():replay&&draw_picture?layer.picture->Input():unblended?unblended:frame, out, ow, oh, si);
-        g.small_last = 0; // DLSS history is no longer the previous picture
+        small_stretch(l, separate_scene?layer.reconstruction->Scene():probe_replay?layer.picture->Scene():replay&&draw_picture?layer.picture->Input():unblended?unblended:frame, out, ow, oh, si);
+        if(!probe_replay)g.small_last = 0; // discovery never changes reconstruction history
         if (hud_layer) { // the native HUD over the stretched scene, then back into `out`
             UINT out_state = UAV;
             layer_composite(l, si, out, out, &out_state, of, ow, oh, layer, b);
@@ -4291,7 +4298,8 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
             ++g.stats.small_hud_layer;
         }
     }
-    if(dlss&&draw_picture&&!replay){flush(l,b);layer.picture->Composite(l,out);}
+    if(dlss&&draw_picture&&!replay){flush(l,b);if(layer.picture->Composite(l,out))++g.stats.small_hud_layer;else g_small.hud_ticket[si]={};}
+    if(!dlss)g_small.hud_ticket[si]={};
     if(replay&&draw_picture){flush(l,b);(separate_scene?layer.reconstruction:layer.picture)->SeedNativeAlpha(l,out);}
     if(separate_scene&&layer.ui_output&&!layer.picture->SeedNativeScene(l,layer.ui_output,layer.ui_view)){
         close_list();++g.stats.small_failed;small_note("Native HUD background could not be seeded.");return false;
@@ -4327,7 +4335,7 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
     // picture could not be measured (Cort's e7acb94 capture came out empty). Colour = DLSS's
     // input (the proxy, scene only), output = the final picture with the native HUD on it.
     uint32_t capture = 0;
-    if ((dlss||replay) && (na::capture::j2::Armed()||replay)) {
+    if (!probe_replay&&(dlss||replay) && (na::capture::j2::Armed()||replay)) {
         b.push_back(uav_barrier(out));
         flush(l, b);
         na::capture::j2::Planes cp;
@@ -4419,6 +4427,7 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
     g_small.value[si] = g_small.next++;
     queue->Signal(g_small.fence.Get(), g_small.value[si]);
     g_small.slot = (si + 1) % kRing;
+    if(probe_replay)return true; // not a presented scene, capture gap, camera cut or history event
     {   // Every frame, cheap (CPU): the capture's frames.csv shows the frames around a stretch/reset.
         na::capture::j2::FrameNote fnote;
         fnote.frame = g.frame;

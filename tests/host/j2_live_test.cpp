@@ -608,6 +608,29 @@ int main(int argc,char** argv)
         test::List ui_handback;REQUIRE(ui_handback.Create(dev));D3D12_RESOURCE_BARRIER returned[]={test::Transition(native.Get(),S,D3D12_RESOURCE_STATE_COMMON),test::Transition(ui_native.Get(),S,D3D12_RESOURCE_STATE_COMMON)};
         ui_handback.list->ResourceBarrier(2,returned);REQUIRE(SUCCEEDED(ui_handback.list->Close()));ID3D12CommandList* returned_lists[]={ui_handback.list.Get()};d.queue->ExecuteCommandLists(1,returned_lists);d.WaitIdle();
         const auto ui_pixel=ReadTexel(d,ui_native.Get(),W,H);CHECK(ui_pixel[0]==.25f&&ui_pixel[1]==.5f&&ui_pixel[2]==.75f&&ui_pixel[3]==1);
+        // Production automatic route: a shadow native/check replay MUST NOT
+        // evaluate NGX or consume this frame's guides. Exhausting all four HUD
+        // methods MUST still permit an ordinary Present DLSS evaluation.
+        hud::Install();hud::SetAutomatic(true);na::j2::OnPresent(d.queue.Get());REQUIRE(frame(505.2)==0);
+        const int automatic_before=fake::evals;
+        auto auto_picture=hud::Picture::Create(dev,color->GetDesc(),W*2,H*2);REQUIRE(auto_picture);
+        test::List auto_seed;REQUIRE(auto_seed.Create(dev));
+        REQUIRE(auto_picture->SnapshotScene(auto_seed.list.Get(),color.Get(),D3D12_RESOURCE_STATE_COMMON)&&auto_picture->SnapshotFull(auto_seed.list.Get(),color.Get(),D3D12_RESOURCE_STATE_COMMON));
+        barrier=test::Transition(native.Get(),D3D12_RESOURCE_STATE_COMMON,S);auto_seed.list->ResourceBarrier(1,&barrier);
+        REQUIRE(SUCCEEDED(auto_seed.list->Close()));ID3D12CommandList* auto_seeds[]={auto_seed.list.Get()};d.queue->ExecuteCommandLists(1,auto_seeds);d.WaitIdle();
+        hud::Layer auto_layer=layer;auto_layer.picture=auto_picture;auto_layer.owner=auto_picture;
+        REQUIRE(na::j2::PreHudUpscale(d.queue.Get(),color.Get(),W,H,native.Get(),W*2,H*2,auto_layer,replay.list.Get()));d.WaitIdle();
+        CHECK(fake::evals==automatic_before&&na::j2::Enabled());
+        hud::AutomaticFrame(proxy.Get(),d.queue.Get(),W,H,W*2,H*2,false);
+        for(int i=0;i<364;++i)hud::AutomaticFrame(proxy.Get(),d.queue.Get(),W,H,W*2,H*2,true);
+        CHECK(hud::AutomaticMethod()==na::j2::hud_routes::Method::Off);
+        auto ordinary=test::CreateTexture(dev,W*2,H*2,DXGI_FORMAT_R8G8B8A8_UNORM,S,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);REQUIRE(ordinary);
+        na::j2::OnPresent(d.queue.Get());
+        REQUIRE(na::j2::PresentUpscale(d.queue.Get(),proxy.Get(),W,H,ordinary.Get(),W*2,H*2,false,nullptr));d.WaitIdle();
+        CHECK(fake::evals==automatic_before+1&&na::j2::Enabled());
+        CHECK(hud::AutomaticMethod()==na::j2::hud_routes::Method::Off);
+        std::printf("automatic HUD exhaustion: ordinary DLSS evaluated once; shadow replay evaluated zero times\n");
+        hud::SetAutomatic(false);
         na::j2::SetRenderSmall(false);proxy.Reset();d.WaitIdle();REQUIRE(presenter::Shutdown());presenter::SetEnabled(false);presenter::SetRenderScale(1,nullptr,nullptr);na::native_present::Detach(window);chain.Reset();DestroyWindow(window);
     }
     if(nvrhi){na::gpu::Collect();CHECK(na::gpu::GetStats().submits>=2);CHECK(na::gpu::GetStats().errors==0);}

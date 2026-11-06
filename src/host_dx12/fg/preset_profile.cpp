@@ -296,11 +296,13 @@ int32_t aniso_session(int job, AnisoOverride& out, const wchar_t* exe_override =
         NvDRSProfileHandle profile = app_profile ? app_profile : global;
         out.app_profile = app_profile != nullptr;
         if (profile) {
-            out.available = true;
             NVDRS_SETTING sel{}; sel.version = NVDRS_SETTING_VER;
             NVDRS_SETTING lvl{}; lvl.version = NVDRS_SETTING_VER;
             const bool has_sel = get(session, profile, ANISO_MODE_SELECTOR_ID, &sel) == NVAPI_OK;
             const bool has_lvl = get(session, profile, ANISO_MODE_LEVEL_ID, &lvl) == NVAPI_OK;
+            out.available=has_sel&&has_lvl;
+            if(has_sel)out.selector_location=uint32_t(sel.settingLocation);
+            if(has_lvl)out.level_location=uint32_t(lvl.settingLocation);
             out.selector = has_sel ? sel.u32CurrentValue : ANISO_MODE_SELECTOR_DEFAULT;
             out.level = has_lvl ? lvl.u32CurrentValue : ANISO_MODE_LEVEL_DEFAULT;
             wchar_t backup[MAX_PATH]{};
@@ -337,8 +339,8 @@ int32_t aniso_session(int job, AnisoOverride& out, const wchar_t* exe_override =
                 } else r = NVAPI_ERROR;
                 if (r == NVAPI_OK) { // read back what the profile now says
                     NVDRS_SETTING again{}; again.version = NVDRS_SETTING_VER;
-                    if (get(session, app_profile, ANISO_MODE_SELECTOR_ID, &again) == NVAPI_OK) out.selector = again.u32CurrentValue;
-                    else out.selector = ANISO_MODE_SELECTOR_DEFAULT;
+                    if (get(session, app_profile, ANISO_MODE_SELECTOR_ID, &again) == NVAPI_OK){out.selector = again.u32CurrentValue;out.selector_location=uint32_t(again.settingLocation);}
+                    else {out.available=false;out.selector = ANISO_MODE_SELECTOR_DEFAULT;out.selector_location=~0u;}
                 }
             } else if (job) r = NVAPI_EXECUTABLE_NOT_FOUND; // no own profile: we never write the global one
         }
@@ -405,7 +407,7 @@ int wmain(int argc, wchar_t** argv) {
         if (job < 0 || (job && argc < 4) || wcslen(argv[2]) >= MAX_PATH || wcschr(argv[2], L'\\') || wcschr(argv[2], L'/')) return 2;
         AnisoOverride a{};
         const int32_t r = aniso_session(job, a, argv[2], job ? argv[3] : nullptr);
-        wprintf(L"exe=%s result=%d available=%u app_profile=%u selector=%u level=%u\n", argv[2], r, a.available ? 1u : 0u, a.app_profile ? 1u : 0u, a.selector, a.level);
+        wprintf(L"exe=%s result=%d available=%u app_profile=%u selector=%u level=%u selector_location=%u level_location=%u\n", argv[2], r, a.available ? 1u : 0u, a.app_profile ? 1u : 0u, a.selector, a.level,a.selector_location,a.level_location);
         return r == NVAPI_OK ? 0 : 1;
     }
     const bool read = !_wcsicmp(argv[1], L"status");

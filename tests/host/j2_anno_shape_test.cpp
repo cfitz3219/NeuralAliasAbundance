@@ -30,6 +30,7 @@
 #include "host_dx12/overlay/submission_tracking.hpp"
 
 #include <d3dcompiler.h>
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -220,6 +221,16 @@ int AnisoPixels(bool clamp)
         D3D12_TEXTURE_COPY_LOCATION to{};to.pResource=rb.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=of;list.list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
         std::swap(b.Transition.StateBefore,b.Transition.StateAfter);list.list->ResourceBarrier(1,&b);REQUIRE(SUCCEEDED(list.list->Close()));ID3D12CommandList* lists[]={list.list.Get()};d.queue->ExecuteCommandLists(1,lists);d.WaitIdle();
         REQUIRE(SUCCEEDED(rb->Map(0,nullptr,&mapped)));std::vector<float> values;for(UINT y=0;y<H;++y){const auto* row=reinterpret_cast<const float*>(static_cast<const uint8_t*>(mapped)+y*of.Footprint.RowPitch);values.insert(values.end(),row,row+W);}rb->Unmap(0,nullptr);
+        // Optional standalone regression evidence only: actual GPU pixels,
+        // never an extra readback or capture in the game's live hooks.
+        char directory[MAX_PATH]{};
+        if(GetEnvironmentVariableA("NA_TEST_AF_CAPTURE",directory,MAX_PATH)>0){
+            char name[MAX_PATH]{};sprintf_s(name,"%s/%s-%02u-%ux.pgm",directory,clamp?"clamp":"wrap",pass,af);
+            FILE* image=nullptr;REQUIRE(fopen_s(&image,name,"wb")==0&&image);
+            std::fprintf(image,"P5\n%u %u\n255\n",W,H);
+            for(float value:values)std::fputc(int(std::lround(std::clamp(value,0.f,1.f)*255)),image);
+            CHECK(std::fclose(image)==0);
+        }
         if(!pass++)original=values;
         double change=0,contrast=0,control=0;
         for(size_t i=0;i<values.size();++i){

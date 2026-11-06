@@ -26,7 +26,7 @@ bool texture(ID3D12Device* dev,UINT w,UINT h,DXGI_FORMAT f,bool uav,D3D12_RESOUR
  d.SampleDesc.Count=1;d.Format=f;if(uav)d.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
  return SUCCEEDED(dev->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&d,state,nullptr,IID_PPV_ARGS(&out)));
 }
-bool buffer(ID3D12Device* dev,D3D12_HEAP_TYPE type,D3D12_RESOURCE_STATES state,ComPtr<ID3D12Resource>& out,UINT64 bytes=16){
+bool buffer(ID3D12Device* dev,D3D12_HEAP_TYPE type,D3D12_RESOURCE_STATES state,ComPtr<ID3D12Resource>& out,UINT64 bytes=32){
  D3D12_HEAP_PROPERTIES hp{};hp.Type=type;D3D12_RESOURCE_DESC d{};d.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;
  d.Width=bytes;d.Height=d.DepthOrArraySize=d.MipLevels=1;d.SampleDesc.Count=1;d.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
  if(type==D3D12_HEAP_TYPE_DEFAULT)d.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
@@ -48,7 +48,7 @@ float3 to_srgb(float3 c){c=saturate(c);return c<=.0031308?c*12.92:1.055*pow(c,1/
 // The existing proof allocation also owns a pixel-local agreement map. A
 // cursor/late overlay can retain its original pixels without disabling native
 // HUD everywhere else. No new image pass or relaxed colour tolerance.
-bool agrees(uint2 p){return proof.Load(16+4*(p.y*w+p.x))==0;}
+bool agrees(uint2 p){return proof.Load(32+4*(p.y*w+p.x))==0;}
 bool agrees_at(float2 uv){
  int2 q=int2(floor(uv*float2(w,h)-.5));
  [unroll]for(int y=0;y<2;++y)[unroll]for(int x=0;x<2;++x)
@@ -74,7 +74,9 @@ groupshared uint mismatch,matched,error_bits,picture_matched;
   if(flags&8u){float4 c=n1[id.xy],d=full[id.xy];
    if(any(!isfinite(c))||any(!isfinite(d))||any(abs(c-d)>tolerance*max(1,max(abs(c),abs(d))))||
       abs(frame[id.xy].a-d.a)>tolerance*max(1,max(abs(frame[id.xy].a),abs(d.a))))bad=true;}
-  proof.Store(16+4*(id.y*w+id.x),bad?1u:0u);
+  if(flags&512u){float4 c=low0[id.xy],d=full[id.xy];
+   if(any(!isfinite(c))||any(abs(c-d)>tolerance*max(1,max(abs(c),abs(d)))))bad=true;}
+  proof.Store(32+4*(id.y*w+id.x),bad?1u:0u);
   if(bad)InterlockedOr(mismatch,1);else InterlockedAdd(matched,1);
   if(isfinite(error))InterlockedMax(error_bits,asuint(error));}
  GroupMemoryBarrierWithGroupSync();if(gi==0){if(mismatch)proof.InterlockedOr(0,1);proof.InterlockedAdd(4,matched);proof.InterlockedMax(8,error_bits);proof.InterlockedAdd(12,picture_matched);}
@@ -84,7 +86,7 @@ groupshared uint mismatch,matched,error_bits,picture_matched;
  bool transfer=agrees(id.xy);
  bool clean=transfer&&(flags&1u)!=0;
  float m=0;
- if(!clean&&(transfer||(flags&64u))){
+ if(transfer||(flags&64u)||(flags&512u)){
   // Cover every actual native raster pixel belonging to this input pixel.
   // Centre-only downsampling can miss thin native glyphs between centres.
   uint2 lo=uint2(floor(float2(id.xy)*float2(ow,oh)/float2(w,h)));
@@ -93,6 +95,7 @@ groupshared uint mismatch,matched,error_bits,picture_matched;
    float3 a=n0[uint2(x,y)].rgb,b=(n1[uint2(x,y)].rgb-a)/grey;m=max(m,coverage(a,b));
   }
  }
+ if(m>.01){proof.InterlockedAdd(16,1);if(clean)proof.InterlockedAdd(20,1);}
  float4 input_scene=scene[id.xy];
  if((flags&64u)&&clean){
   if(flags&256u)input_scene.rgb=to_linear(input_scene.rgb);
@@ -111,7 +114,9 @@ groupshared uint mismatch,matched,error_bits,picture_matched;
    c.rgb=lerp(c.rgb,float3(1,0,1),.5*saturate(max(d.r,max(d.g,d.b))*16));}result[id.xy]=c;return;}
  if(flags&16u){result[id.xy]=float4(picture[id.xy].rgb,scene.SampleLevel(lin,uv,0).a);return;}
  float4 s=picture[id.xy];float3 outc=s.rgb;
- if((flags&64u)&&!agrees_at(uv)){result[id.xy]=frame.SampleLevel(lin,uv,0);return;}
+ // Input was already selected before DLSS: a rejected HUD model keeps
+ // that enhanced result, never the unenhanced game image.
+ if(!agrees_at(uv)){result[id.xy]=s;return;}
  if(agrees_at(uv)){
   float2 uv=(float2(id.xy)+.5)/float2(ow,oh);
   float3 a=n0[id.xy].rgb,b=(n1[id.xy].rgb-a)/grey;
@@ -142,7 +147,7 @@ struct Program {
    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};pd.pRootSignature=root.Get();pd.CS={code->GetBufferPointer(),code->GetBufferSize()};
    if(FAILED(d->CreateComputePipelineState(&pd,IID_PPV_ARGS(&pso[i]))))return false;}
   if(!buffer(d,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ,zero))return false;
-  void* data=nullptr;if(FAILED(zero->Map(0,nullptr,&data)))return false;std::memset(data,0,16);zero->Unmap(0,nullptr);
+  void* data=nullptr;if(FAILED(zero->Map(0,nullptr,&data)))return false;std::memset(data,0,32);zero->Unmap(0,nullptr);
   inc=d->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);return true;
  }
 };
@@ -184,8 +189,8 @@ struct Picture::Impl {
    (prepare||(compose&&!seed))?n[0].Get():nullptr,
    (prepare||(verify&&native)||(compose&&!seed&&!native))?n[1].Get():nullptr,
    compose&&!native&&(constants.flags&32u)==0?pic:nullptr,
-   verify&&model?low[0].Get():nullptr,verify&&model?low[1].Get():nullptr};
-  DXGI_FORMAT formats[]={frame_view,frame_view,frame_view,layer_view,layer_view,pf,layer_view,layer_view};
+   verify&&(model||(constants.flags&512u))?low[0].Get():nullptr,verify&&model?low[1].Get():nullptr};
+  DXGI_FORMAT formats[]={frame_view,frame_view,frame_view,layer_view,layer_view,pf,(constants.flags&512u)?frame_view:layer_view,layer_view};
   for(UINT i=0;i<8;++i){D3D12_SHADER_RESOURCE_VIEW_DESC v{};v.Format=srvs[i]?formats[i]:DXGI_FORMAT_R8G8B8A8_UNORM;
    v.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;v.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;v.Texture2D.MipLevels=1;
    program->dev->CreateShaderResourceView(srvs[i],&v,cpu);cpu.ptr+=program->inc;}
@@ -208,7 +213,7 @@ std::shared_ptr<Picture> Picture::Create(ID3D12Device* dev,const D3D12_RESOURCE_
  p.w=UINT(d.Width);p.h=d.Height;p.ow=ow;p.oh=oh;p.source_format=d.Format;
  if(!texture(dev,p.w,p.h,d.Format,false,S,p.scene)||!texture(dev,p.w,p.h,d.Format,false,S,p.full)||
     !texture(dev,p.w,p.h,DXGI_FORMAT_R16G16B16A16_FLOAT,true,U,p.input)||!texture(dev,p.w,p.h,DXGI_FORMAT_R16_FLOAT,true,U,p.mask)||
-    !buffer(dev,D3D12_HEAP_TYPE_DEFAULT,U,p.proof,16+UINT64(p.w)*p.h*4)||!buffer(dev,D3D12_HEAP_TYPE_READBACK,CD,p.readback))return {};
+    !buffer(dev,D3D12_HEAP_TYPE_DEFAULT,U,p.proof,32+UINT64(p.w)*p.h*4)||!buffer(dev,D3D12_HEAP_TYPE_READBACK,CD,p.readback))return {};
  D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,78,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
  if(FAILED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&p.heap))))return {};return result;
 }
@@ -231,6 +236,7 @@ std::shared_ptr<Picture> Picture::ForkSnapshot(ID3D12GraphicsCommandList* l){
 bool Picture::SnapshotScene(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES s){return p_->scene_current=p_->snapshot(l,r,s,p_->scene);}
 bool Picture::SnapshotFull(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES s){return p_->full_current=p_->snapshot(l,r,s,p_->full);}
 void Picture::SetValidationLayers(ID3D12Resource* low,ID3D12Resource* high,bool source_srgb){p_->low[0]=low;p_->low[1]=high;p_->source_srgb=source_srgb;}
+void Picture::SetReplayValidation(ID3D12Resource* check){p_->low[0]=check;p_->low[1].Reset();}
 bool Picture::Probe(ID3D12GraphicsCommandList* l,ID3D12Resource* frame,DXGI_FORMAT view){
  auto& p=*p_;if(!l||!frame||!p.full_current)return false;
  const auto d=frame->GetDesc();if(d.Width!=p.w||d.Height!=p.h||
@@ -248,9 +254,9 @@ bool Picture::Probe(ID3D12GraphicsCommandList* l,ID3D12Resource* frame,DXGI_FORM
  if(!p.result)p.result_format=DXGI_FORMAT_R16G16B16A16_FLOAT; // typed null UAV; retained real outputs keep their actual format
  const float tolerance=view==DXGI_FORMAT_R16G16B16A16_FLOAT?.0005f:view==DXGI_FORMAT_R10G10B10A2_UNORM?2.f/1023.f:2.f/255.f;
  p.constants={p.w,p.h,p.ow,p.oh,0,1.f,tolerance,0};
- move(l,p.proof.Get(),U,CD);l->CopyBufferRegion(p.proof.Get(),0,p.program->zero.Get(),0,16);move(l,p.proof.Get(),CD,U);
+ move(l,p.proof.Get(),U,CD);l->CopyBufferRegion(p.proof.Get(),0,p.program->zero.Get(),0,32);move(l,p.proof.Get(),CD,U);
  p.bind(l,0,nullptr,DXGI_FORMAT_UNKNOWN);l->Dispatch((p.w+7)/8,(p.h+7)/8,1);order(l);
- move(l,p.proof.Get(),U,CS);l->CopyBufferRegion(p.readback.Get(),0,p.proof.Get(),0,16);move(l,p.proof.Get(),CS,U);
+ move(l,p.proof.Get(),U,CS);l->CopyBufferRegion(p.readback.Get(),0,p.proof.Get(),0,32);move(l,p.proof.Get(),CS,U);
  p.prepared=true;return true;
 }
 bool Picture::Prepare(ID3D12GraphicsCommandList* l,ID3D12Resource* frame,DXGI_FORMAT fv,ID3D12Resource* motion,
@@ -266,15 +272,15 @@ bool Picture::Prepare(ID3D12GraphicsCommandList* l,ID3D12Resource* frame,DXGI_FO
   if(ld.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||ld.Width!=p.w||ld.Height!=p.h||ld.DepthOrArraySize!=1||ld.MipLevels!=1||
      ld.SampleDesc.Count!=1||TypelessOf(ld.Format)!=TypelessOf(lv))return false;}
  const bool floating=fv==DXGI_FORMAT_R16G16B16A16_FLOAT||fv==DXGI_FORMAT_R32G32B32A32_FLOAT;
- p.constants={p.w,p.h,p.ow,p.oh,(clean?1u:0u)|(srgb?2u:0u)|(tint?4u:0u)|(model?64u:0u)|(floating?128u:0u)|(p.source_srgb?256u:0u),grey,tolerance,0};
+ p.constants={p.w,p.h,p.ow,p.oh,(clean?1u:0u)|(srgb?2u:0u)|(tint?4u:0u)|(model?64u:0u)|(floating?128u:0u)|(p.source_srgb?256u:0u)|(!model&&p.low[0]?512u:0u),grey,tolerance,0};
  if(p.outputs_read){move(l,p.input.Get(),S,U);move(l,p.mask.Get(),S,U);}
  move(l,n0,R,S);move(l,n1,R,S);
  if(model){move(l,p.low[0].Get(),R,S);move(l,p.low[1].Get(),R,S);}
- move(l,p.proof.Get(),U,CD);l->CopyBufferRegion(p.proof.Get(),0,p.program->zero.Get(),0,16);move(l,p.proof.Get(),CD,U);
+ move(l,p.proof.Get(),U,CD);l->CopyBufferRegion(p.proof.Get(),0,p.program->zero.Get(),0,32);move(l,p.proof.Get(),CD,U);
  p.bind(l,0,nullptr,DXGI_FORMAT_UNKNOWN);l->Dispatch((p.w+7)/8,(p.h+7)/8,1);order(l);
  move(l,motion,S,U);
  p.bind(l,1,nullptr,DXGI_FORMAT_UNKNOWN);l->Dispatch((p.w+7)/8,(p.h+7)/8,1);order(l);
- move(l,p.proof.Get(),U,CS);l->CopyBufferRegion(p.readback.Get(),0,p.proof.Get(),0,16);move(l,p.proof.Get(),CS,U);
+ move(l,p.proof.Get(),U,CS);l->CopyBufferRegion(p.readback.Get(),0,p.proof.Get(),0,32);move(l,p.proof.Get(),CS,U);
  move(l,n0,S,R);move(l,n1,S,R);move(l,motion,U,S);move(l,p.input.Get(),U,S);move(l,p.mask.Get(),U,S);
  if(model){move(l,p.low[0].Get(),S,R);move(l,p.low[1].Get(),S,R);}
  p.prepared=p.outputs_read=true;return true;
@@ -284,9 +290,9 @@ ID3D12Resource* Picture::Mask()const{return p_->mask.Get();}
 ID3D12Resource* Picture::Scene()const{return p_->scene.Get();}
 ID3D12Resource* Picture::Full()const{return p_->full.Get();}
 bool Picture::ProofAfterCompletion(bool& identity,bool& clean,ProofReceipt* receipt){
- auto& p=*p_;if(!p.prepared||p.proof_read)return false;void* data=nullptr;D3D12_RANGE range{0,16};
- if(FAILED(p.readback->Map(0,&range,&data)))return false;UINT values[4]{};std::memcpy(values,data,16);const UINT flags=values[0];
- if(receipt){receipt->tested=p.w*p.h;receipt->matched=values[1];receipt->picture_matched=values[3];std::memcpy(&receipt->maximum_error,values+2,4);}
+ auto& p=*p_;if(!p.prepared||p.proof_read)return false;void* data=nullptr;D3D12_RANGE range{0,32};
+ if(FAILED(p.readback->Map(0,&range,&data)))return false;UINT values[8]{};std::memcpy(values,data,32);const UINT flags=values[0];
+ if(receipt){receipt->tested=p.w*p.h;receipt->matched=values[1];receipt->picture_matched=values[3];receipt->hud_pixels=values[4];receipt->separated_pixels=values[5];std::memcpy(&receipt->maximum_error,values+2,4);}
  D3D12_RANGE none{};p.readback->Unmap(0,&none);
  identity=flags==0;clean=identity&&(p.constants.flags&9u)!=0;p.proof_read=true;return true;
 }
@@ -338,11 +344,11 @@ bool Picture::PresentNative(ID3D12GraphicsCommandList* l,ID3D12Resource* frame,D
  p.result_format=od.Format;p.frame=frame;p.frame_view=p.layer_view=view;p.n[0]=native;p.n[1]=check;p.motion.Reset();
  const float tolerance=view==DXGI_FORMAT_R16G16B16A16_FLOAT?.0005f:view==DXGI_FORMAT_R10G10B10A2_UNORM?2.f/1023.f:2.f/255.f;
  p.constants={p.w,p.h,p.ow,p.oh,8u|(tint?4u:0u),1,tolerance,0};p.proof_read=false;p.descriptor_page=1;
- move(l,p.proof.Get(),U,CD);l->CopyBufferRegion(p.proof.Get(),0,p.program->zero.Get(),0,16);move(l,p.proof.Get(),CD,U);
+ move(l,p.proof.Get(),U,CD);l->CopyBufferRegion(p.proof.Get(),0,p.program->zero.Get(),0,32);move(l,p.proof.Get(),CD,U);
  p.bind(l,0,nullptr,DXGI_FORMAT_UNKNOWN);l->Dispatch((p.w+7)/8,(p.h+7)/8,1);order(l);
  p.bind(l,2,nullptr,DXGI_FORMAT_UNKNOWN);l->Dispatch((p.ow+7)/8,(p.oh+7)/8,1);order(l);
  move(l,out,U,CD);move(l,p.result.Get(),U,CS);l->CopyResource(out,p.result.Get());move(l,p.result.Get(),CS,U);move(l,out,CD,U);
- move(l,p.proof.Get(),U,CS);l->CopyBufferRegion(p.readback.Get(),0,p.proof.Get(),0,16);move(l,p.proof.Get(),CS,U);
+ move(l,p.proof.Get(),U,CS);l->CopyBufferRegion(p.readback.Get(),0,p.proof.Get(),0,32);move(l,p.proof.Get(),CS,U);
  p.prepared=true;return true;
 }
 }

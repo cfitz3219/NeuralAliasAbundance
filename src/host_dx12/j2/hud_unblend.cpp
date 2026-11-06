@@ -55,6 +55,7 @@ struct Set {
     uint64_t writer_id = 0, recording = 0;
     uint64_t scene_source = 0;
     bool source_srgb = false;
+    bool shader_handoff=false;
     bool closed = false;
     uint64_t submitted = 0;
     std::shared_ptr<na::scale::ShaderDescriptorArena> descriptors = std::make_shared<na::scale::ShaderDescriptorArena>();
@@ -166,7 +167,7 @@ std::shared_ptr<Set> acquire_set_locked(ID3D12Device* dev, const Dims& d)
         if (!set_ready_locked(dev, *p, d)) return {};
         p->uses.clear(); p->frame = g_frame; p->cleared = false; p->draws = p->covered = 0; p->target = 0;
         p->view = DXGI_FORMAT_UNKNOWN;
-        p->scene_captured = p->full_captured = false; p->clean = true;
+        p->scene_captured = p->full_captured = false; p->clean = true;p->shader_handoff=false;
         p->writer = nullptr; p->writer_id = p->recording = 0;
         p->scene_source = 0; p->source_srgb = false; p->closed=false;p->submitted=0; p->bindings.clear();
         if (p->picture) p->picture->BeginCycle();
@@ -215,6 +216,7 @@ void copy_layers(ID3D12GraphicsCommandList* l, Set& dst, const Set& src)
     dst.draws = src.draws; dst.covered = src.covered; dst.view = src.view; dst.cleared = true;
     dst.clean = src.clean;
     dst.scene_source = src.scene_source; dst.source_srgb = src.source_srgb;
+    dst.shader_handoff=src.shader_handoff;
 }
 bool picture_locked(Set& s, const D3D12_RESOURCE_DESC& desc)
 {
@@ -351,7 +353,10 @@ void bind_world(ID3D12GraphicsCommandList* l, const na::scale::PreparedBindings&
 void SetConfigured(bool on) { g_configured.store(on); }
 bool Configured() { return g_configured.load(); }
 void SetEnabled(bool on) { g_on.store(on); }
-bool Enabled() { return g_configured.load(std::memory_order_relaxed) && g_on.load(std::memory_order_relaxed); }
+bool Enabled() {
+    if(native_hud::Automatic())return g_configured.load()&&native_hud::AutomaticMethod()!=hud_routes::Method::NativeReplay&&native_hud::AutomaticMethod()!=hud_routes::Method::Off;
+    return g_configured.load(std::memory_order_relaxed) && g_on.load(std::memory_order_relaxed);
+}
 
 void OnBind(ID3D12GraphicsCommandList* l, uint64_t recording)
 {
@@ -484,7 +489,7 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
             if(picture_locked(*frozen,sampled_layers->picture->Scene()->GetDesc())){
                 frozen->scene_captured=frozen->picture->SnapshotScene(l,sampled_layers->picture->Scene(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 frozen->full_captured=frozen->picture->SnapshotFull(l,sampled->resource.Get(),static_cast<D3D12_RESOURCE_STATES>(source_state));
-                frozen->target=st.rt;
+                frozen->target=st.rt;frozen->shader_handoff=true;
                 frozen->closed=true;packet_locked(l,st.rt,frozen);
                 sets.active.erase(st.rt);sets.transferred[st.rt]=std::move(frozen);
                 ++g_stats.draw_handoffs;return {};
@@ -607,7 +612,7 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
         }
     }
     if (!na::observe::RestoreBindingState(l, false, plans!=nullptr, restore_cbvs, true, true, true)) ++g_stats.restore_failed;
-    if(plans)++g_stats.world_substitutions;
+    if(plans){++g_stats.world_substitutions;s.shader_handoff=true;}
     ++s.draws;
     ++g_stats.replayed;
     if (blended) ++g_stats.blended;
@@ -729,13 +734,18 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
     std::shared_ptr<Set> owner;
     const auto executed=g_submitted.find(id);
     if(executed!=g_submitted.end())owner=executed->second;
+    const auto method=native_hud::Automatic()?native_hud::AutomaticMethod():hud_routes::Method::PixelDiscovery;
+    if(native_hud::Automatic()&&owner){
+        if(method==hud_routes::Method::DirectOrCopy&&owner->shader_handoff)owner.reset();
+        else if(method==hud_routes::Method::ShaderHandoff&&!owner->shader_handoff)owner.reset();
+    }
     const auto ready=[&](const auto& p){return p&&p->device.Get()==device.Get()&&p->rw==rw&&p->rh==rh&&p->ow==ow&&p->oh==oh&&
         p->typeless==native_hud::TypelessOf(pf)&&p->cleared&&p->draws&&p->picture&&p->scene_captured&&p->full_captured&&queue&&
         !p->uses.empty()&&std::all_of(p->uses.begin(),p->uses.end(),[&](const auto& use){return use.Ready(queue);});};
     // Reuse the existing asynchronous GPU picture probe when final shader
     // lineage is hidden. A learned source is still compared with THIS final
     // picture, pixel by pixel, before affecting reconstruction/composition.
-    if(!owner){
+    if(!owner&&method==hud_routes::Method::PixelDiscovery){
         const Association* best=nullptr;
         for(const auto& a:g_associations)if(a.output==id&&a.confirmations>=2&&a.seen+120>=g_frame){
             const auto found=g_submitted.find(a.source);
@@ -747,7 +757,7 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
     if(out){
         std::vector<std::shared_ptr<Set>> probes;
         const auto since=g_presented[id];
-        for(const auto& entry:g_submitted)if(entry.first!=id&&entry.second!=owner&&entry.second->submitted>since&&ready(entry.second))probes.push_back(entry.second);
+        if(method==hud_routes::Method::PixelDiscovery)for(const auto& entry:g_submitted)if(entry.first!=id&&entry.second!=owner&&entry.second->submitted>since&&ready(entry.second))probes.push_back(entry.second);
         std::sort(probes.begin(),probes.end(),[](const auto& a,const auto& b){return a->target<b->target;});
         if(!probes.empty()){
             auto p=probes[g_probe_cursor++%probes.size()];
@@ -776,6 +786,7 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
         if (compose) ++g_stats.composed; else ++g_stats.held;
         if (out) {
             Set& s = *owner;
+            out->route_ticket=native_hud::AutomaticTicket();
             out->n0 = s.n[0].Get(); out->n1 = s.n[1].Get();
             out->l0 = s.l[0].Get(); out->l1 = s.l[1].Get();
             out->view = s.view;

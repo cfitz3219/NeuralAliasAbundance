@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <string>
 #include <memory>
+#include "host_dx12/j2/hud_routes.hpp"
 
 namespace na::observe { struct NativeOperation; }
 namespace na::capture::j2 {struct Identity;}
@@ -40,8 +41,17 @@ void SetEnabled(bool on); // live switch; off = every draw goes to the proxy as 
 // Off by default: Anno draws ordinary UI quads with a full-screen viewport (2b13ab2 lost most of the UI).
 void SetCoverRule(bool on);
 bool Enabled();
+void SetAutomatic(bool on); // production uses finite automatic methods; no HUD UI switches
+bool Automatic();
+hud_routes::Method AutomaticMethod();
+hud_routes::Ticket AutomaticTicket();
+bool AutomaticVerified();
+void AutomaticFrame(ID3D12Resource*,ID3D12CommandQueue*,uint32_t rw,uint32_t rh,uint32_t ow,uint32_t oh,bool eligible);
+void ReportAutomatic(hud_routes::Ticket,uint32_t hud_pixels,uint32_t separated_pixels);
+std::string AutomaticStatus();
 
 struct Layer {
+    hud_routes::Ticket route_ticket;
     ID3D12Resource* n0 = nullptr;  // HUD over black (RENDER_TARGET; return it in that state)
     ID3D12Resource* n1 = nullptr;  // HUD over grey (RENDER_TARGET; likewise)
     DXGI_FORMAT view = DXGI_FORMAT_UNKNOWN; // the format the game drew with (read with it)
