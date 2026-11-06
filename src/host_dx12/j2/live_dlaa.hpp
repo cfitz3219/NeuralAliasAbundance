@@ -238,6 +238,7 @@ struct Stats {
     uint64_t sharpened_frames = 0; // RCAS applied to the DLAA result
     uint64_t nis_frames = 0;       // Legacy log field; live sharpening is RCAS-only.
     uint64_t jitter_writes = 0;   // J1: camera matrices replaced by jittered copies
+    uint64_t camera_interlopers = 0, camera_interloper_picks = 0; // frames kept on the main camera / candidates skipped (a second camera in the slot)
     uint64_t camera_learned_hits = 0, camera_scans = 0; // camera found at the learned slot / by a full search
     // Several valid cameras in one frame (reflection, sky, light): frames where more than one
     // candidate was seen / where the chosen one was not the first-ranked. Lost-camera reasons:

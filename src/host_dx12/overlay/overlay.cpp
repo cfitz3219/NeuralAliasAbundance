@@ -1192,9 +1192,10 @@ void write_status_line()
             WriteFile(f, "\r\n", 2, &written, nullptr);
         }
         {   // Why DLSS history restarted (Cort: a blink every ~30 s while standing still).
-            char cl2[400];
-            const int cn2 = snprintf(cl2, sizeof cl2, "j2_cuts restarts=%llu gap=%llu motion=%llu bridged=%llu now=%llu recent=%s\r\n",
+            char cl2[480];
+            const int cn2 = snprintf(cl2, sizeof cl2, "j2_cuts restarts=%llu gap=%llu motion=%llu bridged=%llu interlopers{kept_main=%llu skipped=%llu} now=%llu recent=%s\r\n",
                 (unsigned long long)j2.cut_restarts, (unsigned long long)j2.cut_gap, (unsigned long long)j2.cut_motion, (unsigned long long)j2.gap_bridged,
+                (unsigned long long)j2.camera_interlopers, (unsigned long long)j2.camera_interloper_picks,
                 (unsigned long long)(GetTickCount64() / 100 % 100000000), j2.recent_cuts);
             if (cn2 > 0) WriteFile(f, cl2, static_cast<DWORD>((std::min)(cn2, static_cast<int>(sizeof(cl2) - 1))), &written, nullptr);
             {

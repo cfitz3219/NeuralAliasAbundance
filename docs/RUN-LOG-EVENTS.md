@@ -22,6 +22,7 @@ The 5 s status samples stay. These additions sit next to them in the same per-pr
 | `camera_cut` | the camera history is reset | why (no_history/gap/translation/rotation/fov/origin/restart_*), value, held, from_j1; `fov` = a zoom such as a scope |
 | `virtual_screen` | the screen the game is told about changes (scale, monitor or window origin); every game move/resize of its own window; every ResizeTarget mapped back | game and physical size, scale, monitor real->virtual, origin, primary, device; `window_pos game=... physical=... clamped=`; `resize_target game= physical=` |
 | `swapchain set_fullscreen` | the game (or anyone) switches DXGI fullscreen | want, target, hr, state after, caller game/other, advertised size |
+| `camera_interloper` | a second camera that flipped into the main camera's slot and came back is learned; later sightings are skipped (first + every 256th logged) | learned known= pos fov; rejected n= pos fov. Status: `j2_cuts ... interlopers{kept_main= skipped=}` |
 | `device_removed` | device removal detected | hr (the DRED file also starts with time and frame) |
 
 ## Periodic blocks

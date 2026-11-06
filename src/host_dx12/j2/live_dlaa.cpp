@@ -3,6 +3,7 @@
 #include "host_dx12/gpu/services.hpp"
 #include "host_dx12/diag/gpu_breadcrumbs.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/j2/camera_interloper.hpp"
 #include "host_dx12/j2/msaa_resolve.hpp"
 #include "host_dx12/j2/nis_sharpen.hpp"
 #include "host_dx12/j2/nis_scaler.hpp"
@@ -76,6 +77,8 @@ struct Slot {
 
 struct PendingHistory {
     na::camera::CameraTracker tracker;
+    // A second camera that flips into the main camera's slot for 1-3 frames (SE5 menu, p25748).
+    na::j2::InterloperFilter interlopers;
     bool cut = false;
     uint32_t capture = 0; // J2 evidence capture token for this evaluation (0 = none)
     na::j2::compute_flow::Ticket compute_flow;
@@ -1709,7 +1712,40 @@ const CamPick* best_pick(const std::vector<CamPick>& v)
     return best;
 }
 
+bool pose_of(const na::camera::Matrix& m, na::j2::CameraPose* p)
+{
+    na::camera::VpGeometry geo{};
+    if (!na::camera::DecomposeViewProjection(m, geo) || !(geo.sy > 0)) return false;
+    p->position = geo.position; p->forward = geo.forward; p->fov = 2.0 * std::atan(1.0 / geo.sy);
+    return true;
+}
+bool is_interloper(const na::camera::Matrix& m)
+{
+    na::j2::CameraPose p;
+    return pose_of(m, &p) && g.interlopers.IsInterloper(p);
+}
+bool find_camera_scan(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, na::camera::Matrix* vp, bool* reversed);
+// The scan, then the interloper rule: a known second camera is never the main camera (the frame
+// then keeps the last main camera, no history reset); every chosen camera updates the rule.
 bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, na::camera::Matrix* vp, bool* reversed)
+{
+    if (!find_camera_scan(lists, scene, depth_id, vp, reversed)) return false;
+    na::j2::CameraPose p;
+    if (!pose_of(*vp, &p)) return true;
+    const uint64_t learned_before = g.interlopers.Learned();
+    const auto verdict = g.interlopers.Judge(p, g.frame);
+    if (g.interlopers.Learned() != learned_before)
+        na::eventlog::Emit("camera_interloper", "learned known=%u pos=%.4g,%.4g,%.4g fov=%.4g", g.interlopers.KnownCount(),
+                           p.position[0], p.position[1], p.position[2], p.fov);
+    if (verdict != na::j2::InterloperFilter::Verdict::Interloper) return true;
+    ++g.stats.camera_interlopers;
+    const uint64_t r = g.interlopers.Rejected();
+    if (r == 1 || r % 256 == 0) // one line per 256: the menu flips several times a second
+        na::eventlog::Emit("camera_interloper", "rejected n=%llu pos=%.4g,%.4g,%.4g fov=%.4g", static_cast<unsigned long long>(r),
+                           p.position[0], p.position[1], p.position[2], p.fov);
+    return false;
+}
+bool find_camera_scan(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, na::camera::Matrix* vp, bool* reversed)
 {
     g_cd = {};
     g_injected = false;
@@ -1781,6 +1817,7 @@ bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth
         c.injected = holds_jittered(s.bytes, static_cast<size_t>(g.camera_offset));
         c.score = continuity(c.vp, c.injected);
         c.block = o;
+        if (is_interloper(c.vp)) { ++g.stats.camera_interloper_picks; continue; } // the main camera may be among the others
         picks.push_back(c);
     }
     if (const CamPick* p = picks.empty() ? nullptr : best_pick(picks)) {
@@ -1812,7 +1849,7 @@ bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth
                 else ++bn.view;
             }
             if (c.kind == na::camera::Kind::ViewProjection) ++g_cd.vp;
-            if (c.kind == na::camera::Kind::ViewProjection && !c.has_inverse_pair && !have_loose && same_camera(c.matrix)) {
+            if (c.kind == na::camera::Kind::ViewProjection && !c.has_inverse_pair && !have_loose && same_camera(c.matrix) && !is_interloper(c.matrix)) {
                 loose.vp = c.matrix;
                 loose.reversed = c.reversed;
                 loose.injected = holds_jittered(s.bytes, c.byte_offset);
@@ -1820,6 +1857,7 @@ bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth
                 have_loose = true;
             }
             if (c.kind != na::camera::Kind::ViewProjection || !c.has_inverse_pair) continue;
+            if (is_interloper(c.matrix)) { ++g.stats.camera_interloper_picks; continue; } // never relearn the slot from it
             CamPick k;
             k.vp = c.matrix;
             k.reversed = c.reversed;
@@ -5325,6 +5363,7 @@ void Shutdown()
     g_nis.Reset();
     g.arbiter_ok = false;
     g.tracker.Reset();
+    g.interlopers.Reset();
     g.cam_f0 = g.cam_f1 = 0;
     g.frame = 1;
     g.submitted_frame = 0;
