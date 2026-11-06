@@ -170,12 +170,26 @@ struct Picture::Impl {
  }
  void bind(ID3D12GraphicsCommandList* l,UINT pass,ID3D12Resource* pic,DXGI_FORMAT pf){
   auto cpu=heap->GetCPUDescriptorHandleForHeapStart();cpu.ptr+=SIZE_T(descriptor_page*39+pass*13)*program->inc;
-  ID3D12Resource* srvs[]={frame.Get(),full_current?full.Get():nullptr,scene_current?scene.Get():nullptr,n[0].Get(),n[1].Get(),pic,low[0].Get(),low[1].Get()};
+  // A discovery probe can precede Prepare (menus have no depth/motion).
+  // Retained counterfactuals then have no layer_view and remain RT, while a
+  // previously prepared picture's input/mask are NPSR. Bind only this entry
+  // point's actual inputs/outputs; unused table slots get typed null views.
+  // Keeping a resource alive does not make its view/state valid in every pass.
+  const bool verify=pass==0,prepare=pass==1,compose=pass==2;
+  const bool model=(constants.flags&64u)!=0,native=(constants.flags&8u)!=0,seed=(constants.flags&48u)!=0;
+  ID3D12Resource* srvs[]={
+   !seed?frame.Get():nullptr,
+   (verify||(compose&&native))&&full_current?full.Get():nullptr,
+   (prepare||(verify&&model)||(compose&&(seed||native)))&&scene_current?scene.Get():nullptr,
+   (prepare||(compose&&!seed))?n[0].Get():nullptr,
+   (prepare||(verify&&native)||(compose&&!seed&&!native))?n[1].Get():nullptr,
+   compose&&!native&&(constants.flags&32u)==0?pic:nullptr,
+   verify&&model?low[0].Get():nullptr,verify&&model?low[1].Get():nullptr};
   DXGI_FORMAT formats[]={frame_view,frame_view,frame_view,layer_view,layer_view,pf,layer_view,layer_view};
   for(UINT i=0;i<8;++i){D3D12_SHADER_RESOURCE_VIEW_DESC v{};v.Format=srvs[i]?formats[i]:DXGI_FORMAT_R8G8B8A8_UNORM;
    v.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;v.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;v.Texture2D.MipLevels=1;
    program->dev->CreateShaderResourceView(srvs[i],&v,cpu);cpu.ptr+=program->inc;}
-  ID3D12Resource* uavs[]={input.Get(),mask.Get(),motion.Get(),result.Get()};
+  ID3D12Resource* uavs[]={prepare?input.Get():nullptr,prepare?mask.Get():nullptr,prepare?motion.Get():nullptr,compose?result.Get():nullptr};
   DXGI_FORMAT uf[]={DXGI_FORMAT_R16G16B16A16_FLOAT,DXGI_FORMAT_R16_FLOAT,DXGI_FORMAT_R32G32_FLOAT,result_format};
   for(UINT i=0;i<4;++i){D3D12_UNORDERED_ACCESS_VIEW_DESC v{};v.Format=uavs[i]?uf[i]:DXGI_FORMAT_R16G16B16A16_FLOAT;v.ViewDimension=D3D12_UAV_DIMENSION_TEXTURE2D;
    program->dev->CreateUnorderedAccessView(uavs[i],nullptr,&v,cpu);cpu.ptr+=program->inc;}
@@ -221,7 +235,16 @@ bool Picture::Probe(ID3D12GraphicsCommandList* l,ID3D12Resource* frame,DXGI_FORM
  auto& p=*p_;if(!l||!frame||!p.full_current)return false;
  const auto d=frame->GetDesc();if(d.Width!=p.w||d.Height!=p.h||
   TypelessOf(d.Format)!=TypelessOf(p.source_format)||TypelessOf(view)!=TypelessOf(p.source_format))return false;
- p.frame=frame;p.frame_view=view;p.descriptor_page=0;
+ // GetDesc may supply a typeless allocation format. The comparison reads its
+ // stored colour through the corresponding typed view, never TYPELESS/UNKNOWN.
+ switch(view){
+ case DXGI_FORMAT_R8G8B8A8_TYPELESS:view=DXGI_FORMAT_R8G8B8A8_UNORM;break;
+ case DXGI_FORMAT_B8G8R8A8_TYPELESS:view=DXGI_FORMAT_B8G8R8A8_UNORM;break;
+ case DXGI_FORMAT_R10G10B10A2_TYPELESS:view=DXGI_FORMAT_R10G10B10A2_UNORM;break;
+ case DXGI_FORMAT_R16G16B16A16_TYPELESS:view=DXGI_FORMAT_R16G16B16A16_FLOAT;break;
+ default:break;
+ }
+ p.frame=frame;p.frame_view=view;p.descriptor_page=0;p.proof_read=false;
  if(!p.result)p.result_format=DXGI_FORMAT_R16G16B16A16_FLOAT; // typed null UAV; retained real outputs keep their actual format
  const float tolerance=view==DXGI_FORMAT_R16G16B16A16_FLOAT?.0005f:view==DXGI_FORMAT_R10G10B10A2_UNORM?2.f/1023.f:2.f/255.f;
  p.constants={p.w,p.h,p.ow,p.oh,0,1.f,tolerance,0};

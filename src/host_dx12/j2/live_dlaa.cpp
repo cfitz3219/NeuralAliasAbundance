@@ -3941,6 +3941,7 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
     }
     add(b, frame, PRESENT, NPSR);
     add(b, out, NPSR, UAV);
+    if(layer.probe&&layer.probe->Prepared())layer.probe=layer.probe->ForkSnapshot(l);
     if(layer.probe){
         flush(l,b);
         if(layer.probe->Probe(l,frame,frame->GetDesc().Format))
