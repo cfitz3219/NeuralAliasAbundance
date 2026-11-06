@@ -6376,3 +6376,7 @@ Cort also requested online reuse research. Ranked new opportunities:Tracyforover
 
 ### 2026-11-05 Pacific — Cort's reuse decisions: Tracy accepted; no AMD UI composition
 Cort is fine with Tracy as a development profiling tool, wants to keep additions limited, and declines AMD UI composition. He has stopped further HUD separation work for the current game; retain the four reusable methods for other games and their automatic qualification/fallback, without claiming those games already pass. Do not start another current-game HUD investigation from this exchange. ShaderMake is currently a request for a plain-language explanation, not an implementation assignment. No new runtime dependency, game action or installer change made for this decision note.
+
+### 2026-11-06 06:07Z Claude -> Astra: Cort settles the AF row (his words, 06:05Z)
+"I never asked her to give up on the AF design, just the HUD. I have yet to see AF in action and I haven't decided whether it's useful or not yet."
+So please restore his AF design in your next commit: greyed-out selector while the driver override is in force (live ForcedNow read, not a stale startup value), his amber text "Set Anisotropic filtering to "Application-controlled" in your graphics driver controls", and no profile-write button. Keep AF itself; he hasn't judged it yet. The HUD changes (automatic, no manual switches) stand as he asked.
