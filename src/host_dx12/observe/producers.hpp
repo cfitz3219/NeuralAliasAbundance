@@ -353,6 +353,34 @@ uint64_t LiveSelectionVersion();
 // is the live scene depth and whose pipeline tests depth is drawn with the game's viewports moved
 // by (x, y) render pixels (+x right, +y down). Other draws get the game's viewports back.
 void SetSceneViewportJitter(uint64_t frame, float x, float y);
+// Draw-replay probe: per frame, the scene-depth draws and how many match a draw of the frame
+// before (same pipeline, vertex shader, counts, vertex layout); of those, how many kept the same
+// vertex/index buffers. untracked: vertex buffers unknown ([observe] raster tracking off).
+struct ReplayProbeStats { uint32_t draws, prev_draws, unique, matched, same_buffers, moved_buffers, untracked, extra_stages, instanced; };
+void SetReplayProbe(bool on);
+// Draw replay (per-object motion): every qualifying scene draw is drawn again with a stream-output
+// twin of its pipeline, writing each expanded vertex's clip position (float4) into this frame's
+// slot buffer. J2 takes the frame once per frame in its own list; it must zero `next`'s first
+// counter_bytes there (they are the stream-output filled sizes) and then call ReplaySlotZeroed.
+// Slot buffers are left in COMMON / promoted to STREAM_OUT by the game's lists.
+struct ReplayRecord { uint64_t sig = 0, vb = 0; uint32_t first = 0, verts = 0; };
+struct ReplayFrame {
+    ID3D12Resource* cur = nullptr;  // this frame's positions (draws in cur_draws)
+    ID3D12Resource* prev = nullptr; // the frame before (null when not continuous)
+    ID3D12Resource* next = nullptr; // to zero for the next frame
+    uint32_t next_slot = 0;
+    uint64_t data_offset = 0, counter_bytes = 0; // positions start at data_offset (16 bytes each)
+    std::vector<ReplayRecord> cur_draws, prev_draws;
+};
+struct DrawReplayStats {
+    uint64_t replayed = 0, vertices = 0, twin_queued = 0, twin_building = 0, twin_failed = 0, overflow = 0, topology = 0, stages = 0;
+    uint64_t untwinned = 0, no_recipe = 0, not_ready = 0, built = 0, build_failed = 0, noted = 0, hash_mismatch = 0;
+};
+void SetDrawReplay(bool on);
+bool ReplayTakeFrame(ReplayFrame* f);
+void ReplaySlotZeroed(uint32_t slot);
+void GetDrawReplayStats(DrawReplayStats* out);
+bool ReplayProbeFrame(ReplayProbeStats* out); // call once per frame (Present); swaps frames
 bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float* y);
 // Packed value the last scene draw of this recording used (0 = none since Reset).
 uint64_t ListSceneViewportJitter(ID3D12CommandList* list,uint64_t scene_depth=0);

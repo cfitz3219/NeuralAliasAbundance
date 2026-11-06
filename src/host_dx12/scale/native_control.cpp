@@ -16,9 +16,19 @@ struct State {
     std::mutex mutex;Stats stats;uint64_t consumed=0;
     std::atomic<uint64_t> armed_evaluation{0};
     std::atomic<bool> controlled{false};std::atomic<uint32_t> owner{0};
+    // Audit 2026-11-06: one tick at a time instead of a fixed first thread
+    // (an engine job system may run the registered tick on varying workers;
+    // a fixed owner would let the game's own apply on another worker resize
+    // back to the user's scale, then ours again: a resize flip-flop).
+    std::atomic<bool> busy{false};
+    // Bounded retries: the engine may clamp or refuse a scale (for example
+    // below its own 50% parser minimum). Never re-run the native resize on
+    // every tick forever; retry slowly and report the refusal instead.
+    uint64_t retry_revision=0;uint32_t misses=0,backoff=0;
 };
 State& g=*new State;
 thread_local bool inside=false;
+constexpr uint32_t kMaxMisses=30,kRetryTicks=300;
 template<class T>T read(uint32_t r){T v{};std::memcpy(&v,g.base+r,sizeof v);return v;}
 template<class T>void put(uint32_t r,T v){std::memcpy(g.base+r,&v,sizeof v);}
 void note(const char* text){std::lock_guard<std::mutex> lock(g.mutex);std::snprintf(g.stats.reason,sizeof g.stats.reason,"%s",text);}
@@ -46,8 +56,12 @@ void apply_native(void* context,bool override_scale){
     ++g.stats.applies;g.stats.controlled=true;g.stats.confirmed=false;g.stats.fraction=fraction;
 }
 void apply_hook(void* context){
+    // Every caller of this hooked function is the game itself (its tick, its
+    // own menu Apply), so it is the game's thread by definition; override on
+    // any of them. A thread restriction here caused the flip-flop above.
     const bool ours=!inside&&g.controlled&&g.enabled.load(std::memory_order_acquire)&&
-        GetCurrentThreadId()==g.owner&&context==g.base+g.found.context;
+        context==g.base+g.found.context;
+    if(!inside){std::lock_guard<std::mutex> lock(g.mutex);++g.stats.game_applies;}
     apply_native(context,ours);
 }
 void tick_hook(){
@@ -56,8 +70,10 @@ void tick_hook(){
     g.tick();
     if(inside||!g.seen.load(std::memory_order_acquire))return;
     const auto thread=GetCurrentThreadId();
-    uint32_t no_owner=0;g.owner.compare_exchange_strong(no_owner,thread);
-    if(g.owner!=thread)return;
+    if(g.busy.exchange(true,std::memory_order_acq_rel))return; // another worker is inside this block
+    struct Release{~Release(){g.busy.store(false,std::memory_order_release);}} release;
+    const auto previous_owner=g.owner.exchange(thread,std::memory_order_acq_rel);
+    if(previous_owner&&previous_owner!=thread){std::lock_guard<std::mutex> lock(g.mutex);++g.stats.thread_changes;}
     const auto revision=g.revision.load(std::memory_order_acquire);
     const bool enabled=g.enabled.load(std::memory_order_acquire);
     const auto& f=g.found;
@@ -66,12 +82,24 @@ void tick_hook(){
     const float active=read<float>(f.active);
     const uint32_t fw=read<uint32_t>(f.full_w),fh=read<uint32_t>(f.full_h);
     if(!fw||!fh||fw>32768||fh>32768)return; // renderer has not initialized
-    if(enabled&&(revision!=g.consumed||!g.controlled||active!=wanted)){
+    if(g.retry_revision!=revision){g.retry_revision=revision;g.misses=0;g.backoff=0;}
+    const bool fresh=revision!=g.consumed||!g.controlled;
+    if(enabled&&!fresh&&active!=wanted&&g.backoff){--g.backoff;} // refused earlier: wait before one more try
+    else if(enabled&&(fresh||active!=wanted)){
         // Directly reuses the game's complete settings apply, including SER's
         // inlined size update, AFTER the tick's 5% pending-setting normalizer.
         apply_native(g.base+f.context,true);g.controlled=true;g.consumed=revision;
         g.armed_evaluation=g.evaluation.load(std::memory_order_acquire);
-        note("Native scene size applied; checking DLSS input and full-size output.");
+        const float now=read<float>(f.active);
+        if(now==wanted){g.misses=0;note("Native scene size applied; checking DLSS input and full-size output.");}
+        else if(++g.misses>=kMaxMisses){
+            // A deferred commit (loading screen, inhibit flag) is normal for a
+            // few ticks. After that, stop resizing every tick: one retry per
+            // kRetryTicks, and say what the game did instead.
+            g.backoff=kRetryTicks;
+            std::lock_guard<std::mutex> lock(g.mutex);++g.stats.refusals;
+            std::snprintf(g.stats.reason,sizeof g.stats.reason,"The game kept its scene scale at %.3f instead of %.3f; retrying slowly.",now,wanted);
+        }else note("Native scene size requested; waiting for the game to commit it.");
     }else if(!enabled&&g.controlled){
         // The preserved pending settings are the game's own requested values.
         apply_native(g.base+f.context,false);g.controlled=false;g.consumed=revision;
@@ -146,7 +174,7 @@ Stats GetStats(){std::lock_guard<std::mutex> lock(g.mutex);return g.stats;}
 #ifdef NA_NATIVE_SCALE_TEST
 void ConfigureForTest(uint8_t* base,const locator::Result& found,Tick tick,Apply apply){
     g.base=base;g.found=found;g.tick=tick;g.apply=apply;g.available=true;g.enabled=false;g.seen=false;g.mode=0;g.revision=1;g.evaluation=0;
-    g.consumed=g.armed_evaluation=0;g.controlled=false;g.owner=0;g.stats={};g.stats.available=true;inside=false;
+    g.consumed=g.armed_evaluation=0;g.controlled=false;g.owner=0;g.busy=false;g.retry_revision=0;g.misses=g.backoff=0;g.stats={};g.stats.available=true;inside=false;
 }
 void TickForTest(){tick_hook();}
 void ApplyForTest(void* context){apply_hook(context);}

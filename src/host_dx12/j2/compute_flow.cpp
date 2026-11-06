@@ -23,8 +23,8 @@ D3D12_RESOURCE_BARRIER tr(ID3D12Resource* r,D3D12_RESOURCE_STATES a,D3D12_RESOUR
 void move(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b){auto x=tr(r,a,b);l->ResourceBarrier(1,&x);}
 void order(ID3D12GraphicsCommandList* l){D3D12_RESOURCE_BARRIER x{};x.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;l->ResourceBarrier(1,&x);}
 // Same layout and gate values as j2_flow.cpp's Constants/k* (the Anno-run tuning):
-// snap 0.5 px, image ratio 0.5, temporal agreement (one previous pair, 60 deg, 3 px).
-struct Constants {unsigned w,h,ew,eh,mode,block,cost,cost_max,offset,gw,gh;float ratio=.5f;float snap=.5f,margin=.02f,absolute=.08f,texture=.03f;
+// snap 0.26 px (Cort 2026-11-06: 0.5 -> 0.375 fixed the sweatshirt blur, then 30% more; the slider does not move it), image ratio 0.5, temporal agreement (one previous pair, 60 deg, 3 px).
+struct Constants {unsigned w,h,ew,eh,mode,block,cost,cost_max,offset,gw,gh;float ratio=.5f;float snap=.26f,margin=.02f,absolute=.08f,texture=.03f;
     unsigned have_hist=0,agree_min=1;float dj_x=0,dj_y=0;float agree_px=3.f,agree_cos=.5f,jitter_x=0,jitter_y=0;
     float history_dx=0,history_dy=0,pad0=0,pad1=0;};
 static_assert(sizeof(Constants)==28*4,"root constants");

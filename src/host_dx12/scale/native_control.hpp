@@ -6,6 +6,10 @@ struct Stats {
     bool available=false,controlled=false,confirmed=false;
     uint32_t mode=0,thread=0,render_w=0,render_h=0,out_w=0,out_h=0;
     uint64_t ticks=0,applies=0,requests=0,evaluation=0;
+    // Audit 2026-11-06: game_applies = the game's own calls into its settings apply
+    // (a high rate means apply runs every tick); refusals = the engine kept another
+    // scale after kMaxMisses tries; thread_changes = the tick moved between workers.
+    uint64_t game_applies=0,refusals=0,thread_changes=0;
     float fraction=1;
     char reason[192]{};
 };

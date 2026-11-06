@@ -2734,6 +2734,7 @@ void make_pso_twins(IUnknown* pso, const void* rs, Make make, RecipeFn&& recipe_
     // replaced sets (if any) are released outside g_m
 }
 
+void replay_note_pipeline(ID3D12Device* dev, IUnknown* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d); // Draw replay (below)
 HRESULT STDMETHODCALLTYPE D_CreateGraphicsPipelineState(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, REFIID riid, void** out)
 {
     const CostScope cost(kCostPso, !t_host_work);
@@ -2760,6 +2761,7 @@ HRESULT STDMETHODCALLTYPE D_CreateGraphicsPipelineState(ID3D12Device* dev, const
     g_next_blend_class=blend_class(d->BlendState);
     g_next_stream_output=d->StreamOutput.NumEntries!=0;
     emit_pipeline(dev, obj, e, d->pRootSignature);
+    replay_note_pipeline(dev, obj, *d);
     make_pso_twins(obj, d->pRootSignature, [&](int, ID3D12RootSignature* trs) -> IUnknown* {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC c = *d;
         c.pRootSignature = trs;
@@ -4459,6 +4461,242 @@ void vpj_before_draw(GL* l)
     l->RSSetViewports(n, n ? v : nullptr);
     t_vpj_self = false;
 }
+// Draw-replay probe (2026-11-06, SE5 smear): can the scene's draws be matched to the same draws
+// last frame, and are they posed in the vertex shader (no tessellation/geometry stages)? Every
+// draw on the live scene depth with a depth-testing pipeline adds a signature: pipeline, vertex
+// shader, counts, vertex buffer layout. The vertex buffer addresses are kept apart, so a match
+// whose buffers moved (double-buffered or compute-posed meshes) is counted separately.
+struct ReplayDraw { uint64_t sig = 0, vb = 0; bool tracked = false, stages = false; uint32_t instances = 0; };
+std::atomic<bool> g_rp_on{false};
+std::mutex g_rp_m;
+std::vector<ReplayDraw> g_rp_cur, g_rp_prev;
+uint64_t rp_mix(uint64_t h, uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); return h; }
+void replay_probe_draw(GL* l, UINT count, UINT instances, bool indexed)
+{
+    if (!g_rp_on.load(std::memory_order_relaxed) || t_vpj_self) return;
+    uint64_t sel_depth = 0, sel_color = 0;
+    GetLiveSelection(&sel_depth, &sel_color);
+    if (!sel_depth) return;
+    ReplayDraw d;
+    {
+        std::shared_lock<RegistryLock> lock(g_m);
+        na_object_id id = 0;
+        auto* ls = list_state_locked(l, &id);
+        if (!ls) return;
+        std::lock_guard<std::mutex> bl(ls->bind_m);
+        if (ls->cur_ds != sel_depth) return;
+        const auto pipeline = g_objs.find(canon(ls->pso));
+        if (pipeline == g_objs.end() || pipeline->second.created.size() < sizeof(na_ev_pipeline_created)) return;
+        const auto* pc = reinterpret_cast<const na_ev_pipeline_created*>(pipeline->second.created.data());
+        if (pc->depth_enable != 1) return;
+        uint64_t h = rp_mix(0, reinterpret_cast<uintptr_t>(ls->pso));
+        h = rp_mix(h, pc->stage_hash[NA_STAGE_VS]); h = rp_mix(h, count); h = rp_mix(h, instances); h = rp_mix(h, indexed);
+        d.stages = pc->stage_hash[NA_STAGE_GS] || pc->stage_hash[NA_STAGE_HS] || pc->stage_hash[NA_STAGE_DS] || pc->stage_hash[NA_STAGE_MS];
+        d.tracked = ls->raster_tracking;
+        if (d.tracked) {
+            h = rp_mix(h, ls->vertex_mask);
+            uint64_t vb = 0;
+            for (UINT i = 0; i < 32; ++i) if (ls->vertex_mask & (1u << i)) {
+                h = rp_mix(h, ls->vertex_buffers[i].StrideInBytes); h = rp_mix(h, ls->vertex_buffers[i].SizeInBytes);
+                vb = rp_mix(vb, ls->vertex_buffers[i].BufferLocation);
+            }
+            if (ls->index_known) { h = rp_mix(h, ls->index_buffer.Format); vb = rp_mix(vb, ls->index_buffer.BufferLocation); }
+            d.vb = vb;
+        }
+        d.sig = h; d.instances = instances;
+    }
+    std::lock_guard<std::mutex> g(g_rp_m);
+    if (g_rp_cur.size() < 65536) g_rp_cur.push_back(d);
+}
+// ---- Draw replay (2026-11-06, SE5 sweatshirt smear; the TOX2-recomp idea in DX12): right after a
+// scene draw (live scene depth, depth test and write, triangle list, vertex shader only), the same
+// draw runs again with a stream-output twin of its pipeline (no pixel shader, nothing rasterised)
+// that writes every expanded vertex's clip position (SV_Position) into this frame's slot. J2 matches
+// each draw to its twin of the frame before and rasterises the difference: exact per-object motion
+// (skinned characters too), the data a game with DLSS built in hands NVIDIA. Generic: no game data.
+// Slot layout: kRpCounters filled-size counters (16 bytes each), then float4 positions.
+constexpr uint32_t kRpSlots = 3, kRpCounters = 8192;
+constexpr uint64_t kRpCounterBytes = uint64_t(kRpCounters) * 16, kRpBytes = 48ull << 20;
+struct SoTwin { Microsoft::WRL::ComPtr<ID3D12RootSignature> rs; Microsoft::WRL::ComPtr<ID3D12PipelineState> pso; uint8_t state = 0; }; // 0 queued, 1 built, 2 failed
+struct SoEntry {
+    std::shared_ptr<const VariantRecipe> recipe;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> rs; // the game's root signature of the pipeline
+    uint64_t vs_hash = 0;
+    std::vector<SoTwin> twins; // by the root signature bound with it (the game's or a sampler twin)
+};
+std::mutex g_so_m;
+std::condition_variable g_so_cv;
+std::unordered_map<const void*, std::shared_ptr<SoEntry>>& g_so = *new std::unordered_map<const void*, std::shared_ptr<SoEntry>>();
+std::deque<std::pair<std::shared_ptr<SoEntry>, ID3D12RootSignature*>>& g_so_queue = *new std::deque<std::pair<std::shared_ptr<SoEntry>, ID3D12RootSignature*>>();
+bool g_so_worker = false;
+Microsoft::WRL::ComPtr<ID3D12Device>& g_rp_device = *new Microsoft::WRL::ComPtr<ID3D12Device>();
+std::atomic<bool> g_rp_capture{false}, g_rp_bufs_ok{false};
+std::atomic<uint32_t> g_rp_cur_slot{0};
+std::atomic<bool> g_rp_ready[kRpSlots];
+struct RpSlot {
+    Microsoft::WRL::ComPtr<ID3D12Resource> buf;
+    std::atomic<uint64_t> verts{0};
+    std::atomic<uint32_t> counters{0};
+    std::mutex m;
+    std::vector<ReplayRecord> draws;
+};
+RpSlot& rp_slot(uint32_t i) { static RpSlot* s = new RpSlot[kRpSlots]; return s[i]; }
+std::atomic<uint64_t> g_rp_stat[16]; // see DrawReplayStats
+enum : uint32_t { kRpReplayed, kRpVerts, kRpNoTwin, kRpBuilding, kRpFailedTwin, kRpOverflow, kRpTopology, kRpStages, kRpUntwinned,
+                  kRpNoRecipe, kRpNotReady, kRpBuilt, kRpBuildFailed, kRpNoted, kRpHashMismatch, kRpStatCount };
+void rp_count(uint32_t k, uint64_t n = 1) { g_rp_stat[k].fetch_add(n, std::memory_order_relaxed); }
+
+void so_worker()
+{
+    for (;;) {
+        std::pair<std::shared_ptr<SoEntry>, ID3D12RootSignature*> job;
+        {
+            std::unique_lock<std::mutex> lk(g_so_m);
+            g_so_cv.wait(lk, [] { return !g_so_queue.empty(); });
+            job = std::move(g_so_queue.front());
+            g_so_queue.pop_front();
+        }
+        const HostWorkScope host;
+        const VariantRecipe& r = *job.first->recipe;
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC d = r.g;
+        d.pRootSignature = job.second;
+        d.PS = {};
+        static const D3D12_SO_DECLARATION_ENTRY decl{0, "SV_Position", 0, 0, 4, 0};
+        static const UINT stride = 16;
+        d.StreamOutput = {&decl, 1, &stride, 1, D3D12_SO_NO_RASTERIZED_STREAM};
+        d.CachedPSO = {};
+        ID3D12PipelineState* t = nullptr;
+        const bool ok = SUCCEEDED(o_CreateGraphicsPipelineState(r.dev.Get(), &d, IID_PPV_ARGS(&t)));
+        rp_count(ok ? kRpBuilt : kRpBuildFailed);
+        std::lock_guard<std::mutex> lk(g_so_m);
+        for (auto& tw : job.first->twins)
+            if (tw.rs.Get() == job.second) { tw.state = ok ? 1 : 2; if (ok) tw.pso.Attach(t); break; }
+    }
+}
+// Called from the pipeline-creation hook for every graphics pipeline: keeps a creation copy of the
+// ones a scene draw could replay (no hull/domain/geometry stage, no stream output of its own).
+void replay_note_pipeline(ID3D12Device* dev, IUnknown* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d)
+{
+    if (t_host_work || !pso || !d.pRootSignature || !d.VS.pShaderBytecode || d.HS.pShaderBytecode || d.DS.pShaderBytecode ||
+        d.GS.pShaderBytecode || d.StreamOutput.NumEntries || !d.DepthStencilState.DepthEnable ||
+        d.DepthStencilState.DepthWriteMask != D3D12_DEPTH_WRITE_MASK_ALL ||
+        d.PrimitiveTopologyType != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) return;
+    auto e = std::make_shared<SoEntry>();
+    e->recipe = recipe_of(dev, d);
+    e->rs = d.pRootSignature;
+    e->vs_hash = fnv1a(static_cast<const uint8_t*>(d.VS.pShaderBytecode), d.VS.BytecodeLength);
+    rp_count(kRpNoted);
+    std::lock_guard<std::mutex> lk(g_so_m);
+    g_so[canon(pso)] = std::move(e); // a new pipeline at a reused address replaces the old copy
+    if (!g_rp_device) g_rp_device = dev;
+}
+bool rp_ensure_buffers()
+{
+    if (g_rp_bufs_ok.load(std::memory_order_acquire)) return true;
+    static std::atomic<bool> tried{false};
+    if (tried.exchange(true)) return false;
+    Microsoft::WRL::ComPtr<ID3D12Device> dev;
+    { std::lock_guard<std::mutex> lk(g_so_m); dev = g_rp_device; if (!g_so_worker) { g_so_worker = true; std::thread(so_worker).detach(); } }
+    if (!dev) { tried = false; return false; }
+    const HostWorkScope host;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = kRpBytes; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    for (uint32_t i = 0; i < kRpSlots; ++i)
+        if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&rp_slot(i).buf)))) return false;
+    g_rp_bufs_ok.store(true, std::memory_order_release);
+    return true;
+}
+// After a game draw (outermost, not host work): replay it into this frame's slot when it qualifies.
+void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2, INT a3, UINT a4)
+{
+    if (!g_rp_capture.load(std::memory_order_relaxed) || !rp_ensure_buffers()) return;
+    if (l->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return; // bundles cannot set stream-output targets
+    const uint32_t s = g_rp_cur_slot.load(std::memory_order_acquire);
+    if (!g_rp_ready[s].load(std::memory_order_acquire)) { rp_count(kRpNotReady); return; }
+    uint64_t sel_depth = 0, sel_color = 0;
+    GetLiveSelection(&sel_depth, &sel_color);
+    if (!sel_depth) return;
+    ID3D12PipelineState* game_pso = nullptr;
+    ID3D12RootSignature* bound_rs = nullptr;
+    std::shared_ptr<SoEntry> entry;
+    ReplayRecord rec{};
+    {
+        std::shared_lock<RegistryLock> lock(g_m);
+        na_object_id id = 0;
+        auto* ls = list_state_locked(l, &id);
+        if (!ls) return;
+        std::lock_guard<std::mutex> bl(ls->bind_m);
+        if (ls->cur_ds != sel_depth || !ls->pso || ls->in_render_pass) return;
+        const auto pipeline = g_objs.find(canon(ls->pso));
+        if (pipeline == g_objs.end() || pipeline->second.created.size() < sizeof(na_ev_pipeline_created)) return;
+        const auto* pc = reinterpret_cast<const na_ev_pipeline_created*>(pipeline->second.created.data());
+        if (pc->depth_enable != 1 || pc->depth_write != 1) return;
+        if (pc->stage_hash[NA_STAGE_GS] || pc->stage_hash[NA_STAGE_HS] || pc->stage_hash[NA_STAGE_DS] || pc->stage_hash[NA_STAGE_MS]) { rp_count(kRpStages); return; }
+        if (!ls->raster_topology_known || ls->raster_topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST) { rp_count(kRpTopology); return; }
+        {
+            std::lock_guard<std::mutex> lk(g_so_m);
+            const auto it = g_so.find(canon(ls->pso));
+            if (it == g_so.end()) { rp_count(kRpNoRecipe); return; }
+            entry = it->second;
+        }
+        if (entry->vs_hash != pc->stage_hash[NA_STAGE_VS]) { rp_count(kRpHashMismatch); return; } // a pipeline we never saw created
+        bound_rs = entry->rs.Get();
+        if (g_mip_switched.load(std::memory_order_relaxed) && ls->mip_level >= 0) {
+            bool untwinned = false;
+            bound_rs = mip_swap_locked(ls->mip_level, ls->af_latched, bound_rs, false, &untwinned);
+            if (untwinned) { rp_count(kRpUntwinned); return; }
+        }
+        game_pso = ls->pso;
+        uint64_t h = rp_mix(0, reinterpret_cast<uintptr_t>(ls->pso));
+        h = rp_mix(h, pc->stage_hash[NA_STAGE_VS]); h = rp_mix(h, count); h = rp_mix(h, instances); h = rp_mix(h, indexed);
+        h = rp_mix(h, a2); h = rp_mix(h, static_cast<uint32_t>(a3));
+        uint64_t vb = 0;
+        if (ls->raster_tracking) {
+            for (UINT i = 0; i < 32; ++i) if (ls->vertex_mask & (1u << i)) vb = rp_mix(vb, ls->vertex_buffers[i].BufferLocation);
+            if (ls->index_known) vb = rp_mix(vb, ls->index_buffer.BufferLocation);
+        }
+        rec.sig = h; rec.vb = vb;
+    }
+    ID3D12PipelineState* so = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_so_m);
+        SoTwin* tw = nullptr;
+        for (auto& t : entry->twins) if (t.rs.Get() == bound_rs) { tw = &t; break; }
+        if (!tw) {
+            entry->twins.push_back(SoTwin{bound_rs, nullptr, 0});
+            g_so_queue.emplace_back(entry, bound_rs);
+            g_so_cv.notify_one();
+            rp_count(kRpNoTwin);
+            return;
+        }
+        if (tw->state == 0) { rp_count(kRpBuilding); return; }
+        if (tw->state == 2) { rp_count(kRpFailedTwin); return; }
+        so = tw->pso.Get();
+    }
+    const uint64_t verts = uint64_t(count / 3) * 3 * instances;
+    if (!verts) return;
+    RpSlot& slot = rp_slot(s);
+    const uint64_t first = slot.verts.fetch_add(verts, std::memory_order_relaxed);
+    const uint32_t ci = slot.counters.fetch_add(1, std::memory_order_relaxed);
+    if (kRpCounterBytes + (first + verts) * 16 > kRpBytes || ci >= kRpCounters) { rp_count(kRpOverflow); return; }
+    const D3D12_GPU_VIRTUAL_ADDRESS base = slot.buf->GetGPUVirtualAddress();
+    D3D12_STREAM_OUTPUT_BUFFER_VIEW view{base + kRpCounterBytes + first * 16, verts * 16, base + uint64_t(ci) * 16};
+    {
+        HostWorkScope own;
+        l->SetPipelineState(so);
+        l->SOSetTargets(0, 1, &view);
+        if (indexed) l->DrawIndexedInstanced(count, instances, a2, a3, a4);
+        else l->DrawInstanced(count, instances, a2, a4);
+        l->SOSetTargets(0, 1, nullptr);
+        l->SetPipelineState(game_pso); // the sampler twin is put back by the live mip swap
+    }
+    rec.first = static_cast<uint32_t>(first); rec.verts = static_cast<uint32_t>(verts);
+    rp_count(kRpReplayed); rp_count(kRpVerts, verts);
+    std::lock_guard<std::mutex> lk(slot.m);
+    slot.draws.push_back(rec);
+}
 template <uint32_t Slot, typename Sig>
 struct ListHook;
 template <uint32_t Slot, typename R, typename... A>
@@ -4485,6 +4723,11 @@ struct ListHook<Slot, R(A...)> {
         if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced ||
                       Slot == sl::list::ExecuteIndirect || Slot == sl::list::ExecuteBundle)
             if (!t_host_work && scope.outermost && !scope.ambiguous) { const CostScope c(kCostVpj); vpj_before_draw(l); }
+        if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced)
+            if (!t_host_work && scope.outermost && !scope.ambiguous) {
+                const auto args = std::forward_as_tuple(a...);
+                replay_probe_draw(l, std::get<0>(args), std::get<1>(args), Slot == sl::list::DrawIndexedInstanced);
+            }
         if constexpr (Slot == sl::list::RSSetViewports || Slot == sl::list::Reset)
             if (scope.outermost && !scope.ambiguous) vpj_viewports_replaced(l, Slot == sl::list::Reset);
         if constexpr (Slot == sl::list::ResourceBarrier) {
@@ -4614,6 +4857,12 @@ struct ListHook<Slot, R(A...)> {
                                 { const CostScope c(kCostRun); On<Slot>::run(l, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), INT(call.args[3]), UINT(call.args[4])); }
                             }
                         } // A skipped native command is NOT emitted as an executed game draw/write.
+                        // Draw replay on this path too (shader hooks on: the HUD separator). eebeeec missed
+                        // every draw here: replayed=0 in Cort's run.
+                        if constexpr (Slot == sl::list::DrawInstanced)
+                            if (!replaced) replay_after_draw(l, false, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), 0, UINT(call.args[3]));
+                        if constexpr (Slot == sl::list::DrawIndexedInstanced)
+                            if (!replaced) replay_after_draw(l, true, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), INT(call.args[3]), UINT(call.args[4]));
                         for (unsigned i = entered; i > 0; --i) if (hooks->lane[i - 1]) {
                             const CostScope c(kCostLaneAfter); HostWorkScope own; hooks->lane[i - 1]->After(l, call, saved[i - 1]);
                         }
@@ -4680,6 +4929,14 @@ struct ListHook<Slot, R(A...)> {
                 }
             }
             { const CostScope c(kCostDriver); fn(l, a...); }
+            if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced)
+                if (!t_host_work && scope.outermost && !scope.ambiguous) {
+                    const auto args = std::forward_as_tuple(a...);
+                    if constexpr (Slot == sl::list::DrawIndexedInstanced)
+                        replay_after_draw(l, true, std::get<0>(args), std::get<1>(args), std::get<2>(args), std::get<3>(args), std::get<4>(args));
+                    else
+                        replay_after_draw(l, false, std::get<0>(args), std::get<1>(args), std::get<2>(args), 0, std::get<3>(args));
+                }
             if constexpr (Slot == sl::list::CopyResource || Slot == sl::list::ResolveSubresource || Slot == sl::list::CopyTextureRegion) {
                 if (scope.outermost && !scope.ambiguous) {
                     auto args = std::forward_as_tuple(a...);
@@ -7429,6 +7686,77 @@ void SetSceneViewportJitter(uint64_t frame, float x, float y)
     if (!f32) f32 = 1;
     g_vpj_ever.store(true, std::memory_order_relaxed);
     g_vpj.store(uint64_t(f32) << 32 | uint64_t(q(x)) << 16 | q(y), std::memory_order_release);
+}
+void SetReplayProbe(bool on) { g_rp_on.store(on, std::memory_order_relaxed); }
+bool ReplayProbeFrame(ReplayProbeStats* out)
+{
+    std::vector<ReplayDraw> cur;
+    { std::lock_guard<std::mutex> g(g_rp_m); cur.swap(g_rp_cur); }
+    ReplayProbeStats st{};
+    st.draws = static_cast<uint32_t>(cur.size());
+    std::unordered_map<uint64_t, std::vector<uint64_t>> prev; // signature -> buffer hashes, in order
+    for (const auto& d : g_rp_prev) prev[d.sig].push_back(d.vb);
+    std::unordered_map<uint64_t, uint32_t> used, seen;
+    for (const auto& d : cur) {
+        if (!d.tracked) ++st.untracked;
+        if (d.stages) ++st.extra_stages;
+        if (d.instances > 1) ++st.instanced;
+        if (++seen[d.sig] == 1) ++st.unique;
+        auto it = prev.find(d.sig);
+        uint32_t& u = used[d.sig];
+        if (it == prev.end() || u >= it->second.size()) continue;
+        ++st.matched;
+        if (it->second[u] == d.vb) ++st.same_buffers; else ++st.moved_buffers;
+        ++u;
+    }
+    st.prev_draws = static_cast<uint32_t>(g_rp_prev.size());
+    g_rp_prev.swap(cur);
+    *out = st;
+    return st.draws || st.prev_draws;
+}
+void SetDrawReplay(bool on)
+{
+    if (g_rp_capture.exchange(on) == on) return;
+    if (!on) for (auto& r : g_rp_ready) r.store(false, std::memory_order_release);
+}
+bool ReplayTakeFrame(ReplayFrame* f)
+{
+    static std::vector<ReplayRecord>& last = *new std::vector<ReplayRecord>();
+    static int last_slot = -1;
+    *f = ReplayFrame{};
+    if (!g_rp_capture.load(std::memory_order_relaxed) || !g_rp_bufs_ok.load(std::memory_order_acquire)) { last.clear(); last_slot = -1; return false; }
+    const uint32_t s = g_rp_cur_slot.load(std::memory_order_acquire), next = (s + 1) % kRpSlots;
+    RpSlot& cur = rp_slot(s);
+    const bool cur_valid = g_rp_ready[s].load(std::memory_order_acquire);
+    {
+        std::lock_guard<std::mutex> lk(cur.m);
+        f->cur_draws.swap(cur.draws);
+    }
+    if (!cur_valid) f->cur_draws.clear();
+    RpSlot& n = rp_slot(next);
+    g_rp_ready[next].store(false, std::memory_order_release);
+    { std::lock_guard<std::mutex> lk(n.m); n.draws.clear(); }
+    n.verts.store(0, std::memory_order_relaxed);
+    n.counters.store(0, std::memory_order_relaxed);
+    g_rp_cur_slot.store(next, std::memory_order_release);
+    f->cur = cur.buf.Get();
+    f->next = n.buf.Get();
+    f->next_slot = next;
+    f->data_offset = kRpCounterBytes;
+    f->counter_bytes = kRpCounterBytes;
+    if (last_slot >= 0 && uint32_t(last_slot) == (s + kRpSlots - 1) % kRpSlots) { f->prev = rp_slot(uint32_t(last_slot)).buf.Get(); f->prev_draws = last; }
+    last = f->cur_draws;
+    last_slot = cur_valid ? int(s) : -1;
+    return true;
+}
+void ReplaySlotZeroed(uint32_t slot) { if (slot < kRpSlots) g_rp_ready[slot].store(true, std::memory_order_release); }
+void GetDrawReplayStats(DrawReplayStats* out)
+{
+    const auto v = [](uint32_t k) { return g_rp_stat[k].load(std::memory_order_relaxed); };
+    out->replayed = v(kRpReplayed); out->vertices = v(kRpVerts); out->twin_queued = v(kRpNoTwin); out->twin_building = v(kRpBuilding);
+    out->twin_failed = v(kRpFailedTwin); out->overflow = v(kRpOverflow); out->topology = v(kRpTopology); out->stages = v(kRpStages);
+    out->untwinned = v(kRpUntwinned); out->no_recipe = v(kRpNoRecipe); out->not_ready = v(kRpNotReady); out->built = v(kRpBuilt);
+    out->build_failed = v(kRpBuildFailed); out->noted = v(kRpNoted); out->hash_mismatch = v(kRpHashMismatch);
 }
 bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float* y)
 {

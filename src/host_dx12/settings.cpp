@@ -176,6 +176,7 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
         target.j2_jitter_shift.store(js < 0 ? -1 : (js > 0 ? 1 : 0));
         const int vj = static_cast<int>(GetPrivateProfileIntW(L"j2", L"viewport_jitter", 1, ini));
         target.j2_viewport_jitter.store(vj < 0 ? -1 : (vj > 0 ? 1 : 0));
+        target.j2_draw_replay.store(GetPrivateProfileIntW(L"j2", L"draw_replay", 0, ini) ? 1u : 0u);
     }
     target.nr_structure.store(pct(L"structure", 100));
     target.nr_tone.store(pct(L"tone", 0));
@@ -394,6 +395,7 @@ bool SaveFromWorker()
     swprintf_s(v, L"%u", g_settings.aniso16.load());
     ok &= WritePrivateProfileStringW(L"j2", L"anisotropic", v, ini) != 0;
     ok &= WritePrivateProfileStringW(L"j2", L"jitter_sequence", g_settings.j2_jitter_r2.load() ? L"r2" : L"halton", ini) != 0;
+    ok &= WritePrivateProfileStringW(L"j2", L"draw_replay", g_settings.j2_draw_replay.load() ? L"1" : L"0", ini) != 0;
     {
         const uint32_t pv = g_settings.j2_preset.load();
         if (pv == 255) swprintf_s(v, L"auto");

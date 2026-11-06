@@ -51,11 +51,12 @@ struct Fixture {
         put(setting,1.f);put(cache,1.f);put(active,1.f);put(fw,3440u);put(fh,1440u);put(sw,3440u);put(sh,1440u);put(up,3u);put(upcache,3u);
     }
 };
-Fixture* game=nullptr;bool dirty=false,inhibited=false;uint32_t native_calls=0,native_thread=0;float saved=0;
+Fixture* game=nullptr;bool dirty=false,inhibited=false,clamp_half=false;uint32_t native_calls=0,native_thread=0;float saved=0;
 void native_apply(void*){
     ++native_calls;native_thread=GetCurrentThreadId();
     const float scale=game->get<float>(game->setting);game->put(game->cache,scale);game->put(game->upcache,game->get<uint32_t>(game->up));
     if(inhibited)return;
+    if(clamp_half&&scale<.5f){game->put(game->active,.5f);return;} // an engine that refuses below 50%
     game->put(game->active,scale);game->put(game->sw,uint32_t(float(game->get<uint32_t>(game->fw))*scale));game->put(game->sh,uint32_t(float(game->get<uint32_t>(game->fh))*scale));
 }
 void native_tick(){
@@ -106,5 +107,21 @@ int main(int argc,char** argv){
     Request(4);TickForTest();CHECK(GetStats().render_w==1146);CHECK(GetStats().render_h==480);
     Request(0);TickForTest();CHECK(GetStats().render_w==3440);CHECK(GetStats().render_h==1440);
     Observe(false,3440,1440,3440,1440,4,true);TickForTest();CHECK(!GetStats().controlled);CHECK(f.get<uint32_t>(f.upcache)==3);CHECK(f.get<float>(f.cache)==1.f);
+    // Audit 2026-11-06: an engine that keeps another scale must not be resized
+    // on every tick forever (visible as a constant hitch): bounded retries.
+    ConfigureForTest(f.bytes.data(),r,&native_tick,&native_apply);Observe(true,3440,1440,3440,1440,5,true);
+    clamp_half=true;Request(4);
+    for(int i=0;i<200;++i)TickForTest();
+    CHECK(GetStats().applies<=31);CHECK(GetStats().refusals==1);
+    for(int i=0;i<300;++i)TickForTest();
+    CHECK(GetStats().applies<=33);
+    clamp_half=false;Request(1);TickForTest();CHECK(std::abs(f.get<float>(f.active)-2.f/3.f)<1e-6f); // a new request tries at once
+    // The game's own apply from a different worker thread keeps our scale
+    // (no resize back to the user's 100% and forward again: a flip-flop).
+    std::thread other([]{dirty=true;TickForTest();});other.join();
+    CHECK(std::abs(f.get<float>(f.active)-2.f/3.f)<1e-6f);CHECK(f.get<float>(f.setting)==1.f);
+    const auto settled=GetStats().applies;
+    TickForTest();CHECK(GetStats().applies==settled); // nothing to redo on the next tick
+    CHECK(GetStats().game_applies>=1);
     return test::finish("native_scale_test");
 }
