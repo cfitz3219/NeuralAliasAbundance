@@ -227,6 +227,58 @@ int picture_paths(test::Device& d)
 // The pre-HUD compute list and final Present list can be recorded before either
 // executes. Their shader descriptors must not overwrite one another. Also keep
 // HDR highlights and the game's destination alpha through the native redraw.
+int zero_transmission_picture(test::Device& d)
+{
+    // p41768: the two native counterfactuals were the SAME complete game
+    // picture, and the final "DLSS" output equalled that picture at every
+    // pixel. An affine model with b=0 fits any scene, but separates none.
+    // Both clean and protected paths must keep the enhanced picture instead.
+    constexpr UINT W=16,H=8,OW=32,OH=16;
+    constexpr auto F=DXGI_FORMAT_R8G8B8A8_UNORM;
+    constexpr auto S=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,U=D3D12_RESOURCE_STATE_UNORDERED_ACCESS,R=D3D12_RESOURCE_STATE_RENDER_TARGET;
+    for(bool model:{false,true})for(bool clean:{false,true}){
+        std::vector<UINT> scene(W*H,0xff996633u),full(W*H,0xff663399u);
+        std::vector<UINT> layers(OW*OH,full[0]),enhanced(OW*OH,0xff33cc1au);
+        std::vector<float> motion(W*H*2,0.f);for(UINT i=0;i<W*H;++i)motion[2*i]=4.f;
+        auto make=[&](UINT w,UINT h,const void* data,DXGI_FORMAT f,UINT bpp,D3D12_RESOURCE_STATES after,D3D12_RESOURCE_FLAGS flags){
+            auto r=test::CreateTexture(d.device.Get(),w,h,f,D3D12_RESOURCE_STATE_COPY_DEST,flags);
+            if(r&&!upload(d,r.Get(),data,bpp,after))r.Reset();return r;
+        };
+        auto s=make(W,H,scene.data(),F,4,S,D3D12_RESOURCE_FLAG_NONE);
+        auto frame=make(W,H,full.data(),F,4,S,D3D12_RESOURCE_FLAG_NONE);
+        auto low=make(W,H,full.data(),F,4,R,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        auto high=make(W,H,full.data(),F,4,R,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        auto n0=make(OW,OH,layers.data(),F,4,R,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        auto n1=make(OW,OH,layers.data(),F,4,R,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        auto mv=make(W,H,motion.data(),DXGI_FORMAT_R32G32_FLOAT,8,S,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        auto out=make(OW,OH,enhanced.data(),F,4,U,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        REQUIRE(s&&frame&&low&&high&&n0&&n1&&mv&&out);
+        auto p=nh::Picture::Create(d.device.Get(),s->GetDesc(),OW,OH);REQUIRE(p);
+        test::List l;REQUIRE(l.Create(d.device.Get()));
+        REQUIRE(p->SnapshotScene(l.list.Get(),s.Get(),S)&&p->SnapshotFull(l.list.Get(),frame.Get(),S));
+        if(model)p->SetValidationLayers(low.Get(),high.Get());
+        REQUIRE(p->Prepare(l.list.Get(),frame.Get(),F,mv.Get(),n0.Get(),n1.Get(),F,1.f,false,clean,F));
+        REQUIRE(p->Composite(l.list.Get(),out.Get()));REQUIRE(SUCCEEDED(l.list->Close()));
+        ID3D12CommandList* lists[]={l.list.Get()};d.queue->ExecuteCommandLists(1,lists);d.WaitIdle();
+        std::vector<uint8_t> pixels,input,mask,motion_bytes;
+        REQUIRE(readback(d,out.Get(),U,4,pixels)&&readback(d,p->Input(),S,8,input)&&
+                readback(d,p->Mask(),S,2,mask)&&readback(d,mv.Get(),S,8,motion_bytes));
+        UINT retained=0,unmasked=0,complete_input=0,moving=0;
+        for(UINT i=0;i<OW*OH;++i)if(std::memcmp(pixels.data()+i*4,&enhanced[i],4)==0)++retained;
+        for(UINT i=0;i<W*H;++i){
+            uint16_t m=0,r=0;std::memcpy(&m,mask.data()+i*2,2);std::memcpy(&r,input.data()+i*8,2);
+            float mx=0;std::memcpy(&mx,motion_bytes.data()+i*8,4);
+            unmasked+=half_value(m)==0.f;complete_input+=std::abs(half_value(r)-153.f/255.f)<.002f;moving+=mx==4.f;
+        }
+        CHECK(retained==OW*OH);CHECK(unmasked==W*H);CHECK(complete_input==W*H);CHECK(moving==W*H);
+        bool identity=false,used_clean=false;nh::Picture::ProofReceipt receipt;
+        REQUIRE(p->ProofAfterCompletion(identity,used_clean,&receipt));
+        CHECK(identity&&!used_clean&&receipt.hud_pixels==W*H&&receipt.separated_pixels==0);
+        std::printf("zero-scene-transmission model=%d clean=%d enhanced=%u/%u unmasked=%u/%u separated=%u\n",model,clean,retained,OW*OH,unmasked,W*H,receipt.separated_pixels);
+    }
+    return 0;
+}
+
 int native_picture_phases(test::Device& d)
 {
     constexpr UINT W=4,H=2,OW=8,OH=4;constexpr auto F=DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -1279,6 +1331,7 @@ int main()
     if (jitter_evidence(d)) return 1;
     if (classify(d)) return 1;
     if (picture_paths(d)) return 1;
+    if (zero_transmission_picture(d)) return 1;
     if (native_picture_phases(d)) return 1;
     if (reused_ui_picture_phases(d)) return 1;
     if (canvas_probe(d)) return 1;
