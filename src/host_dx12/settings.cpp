@@ -1,3 +1,4 @@
+#include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/settings.hpp"
 #include "core/jitter_domain.hpp"
 
@@ -439,6 +440,31 @@ void DeferForRenderer(SaveDispatcher dispatcher){
 }
 void PublishRendererReady(){g_renderer_ready.store(true,std::memory_order_release);}
 uint32_t LastSaveResult() { return g_last_save.load(); }
+
+// Event log: every persisted setting change, with old and new value and who made it
+// (the caller's source tag; the panel, ini reload and mode commit set one).
+void WatchChanges(const char* source)
+{
+    static std::mutex m;
+    static bool primed = false;
+    static int64_t last[256];
+    std::lock_guard<std::mutex> lk(m);
+    na::eventlog::ScopedSource tag(source ? source : na::eventlog::Source());
+    int i = 0;
+#define WATCH(member) { const int64_t v = static_cast<int64_t>(g_settings.member.load()); \
+        if (i < 256) { if (primed && last[i] != v) na::eventlog::Emit("setting", "%s=%lld was=%lld", #member, (long long)v, (long long)last[i]); last[i] = v; } ++i; }
+    NA_PERSISTED_FIELDS(WATCH)
+#undef WATCH
+    if (!primed) { // the whole persisted table once, in chunks, so every run starts with all values
+        std::string chunk;
+#define DUMP(member) { char kv[64]; snprintf(kv, sizeof kv, " %s=%lld", #member, static_cast<long long>(g_settings.member.load())); \
+        if (chunk.size() + strlen(kv) > 400) { na::eventlog::Emit("settings_all", "%s", chunk.c_str()); chunk.clear(); } chunk += kv; }
+        NA_PERSISTED_FIELDS(DUMP)
+#undef DUMP
+        if (!chunk.empty()) na::eventlog::Emit("settings_all", "%s", chunk.c_str());
+    }
+    primed = true;
+}
 
 namespace {
 void apply_recovery(bool unclean,uint32_t reason){

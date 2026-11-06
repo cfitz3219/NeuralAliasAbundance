@@ -1,3 +1,7 @@
+#include "host_dx12/diag/event_log.hpp"
+#include "host_dx12/effects/donut.hpp"
+#include "host_dx12/effects/xegtao.hpp"
+#include "host_dx12/gpu/services.hpp"
 #include "host_dx12/background/work.hpp"
 #include "host_dx12/host_boot/process_log.hpp"
 #include "host_dx12/gpu/mem_alloc.hpp"
@@ -758,12 +762,30 @@ int menu_fault(EXCEPTION_POINTERS* exception) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 ULONGLONG g_status_last_tick = 0;
+void append_status_text(const char* text, int n); // below
+void flush_events()
+{
+    std::vector<std::string> events = na::eventlog::Drain();
+    if (events.empty()) return;
+    std::string all;
+    for (const std::string& e : events) all += e;
+    append_status_text(all.data(), static_cast<int>(all.size()));
+}
 void write_status_line()
 {
     if (!g_status_log[0]) return;
     ULONGLONG now = GetTickCount64();
+    flush_events(); // timed transitions, written as soon as the discovery thread runs
     if (now - g_status_last_tick < 5000) return;
     g_status_last_tick = now;
+    {
+        char el[160];
+        const int en = snprintf(el, sizeof el, "event_log frame=%llu total=%llu dropped=%llu\r\n",
+                                (unsigned long long)na::eventlog::Frame(),
+                                (unsigned long long)na::eventlog::g_total.load(std::memory_order_relaxed),
+                                (unsigned long long)na::eventlog::g_dropped.load(std::memory_order_relaxed));
+        if (en > 0) append_status_text(el, (std::min)(en, int(sizeof el) - 1));
+    }
     na::ngx::Stats ngx = na::ngx::GetStats();
     na::nr::Stats nr = na::nr::GetStats();
     na::motion::Stats mo = na::motion::GetStats();
@@ -798,6 +820,43 @@ void write_status_line()
     if(mode_bytes>0){WriteFile(f,mode_line,DWORD((std::min)(mode_bytes,int(sizeof(mode_line)-1))),&written,nullptr);WriteFile(f,"\r\n",2,&written,nullptr);}
     {char usage_line[512];const int usage_bytes=na::usage::FormatLine(usage_line,sizeof(usage_line));
      if(usage_bytes>0)WriteFile(f,usage_line,DWORD((std::min)(usage_bytes,int(sizeof(usage_line)-1))),&written,nullptr);}
+    { // Effects and shared GPU services: enabled state, work done, errors and the last reason.
+        const auto& st = na::settings::Get();
+        const auto xs = na::xegtao::ScenePass().GetStats();
+        const auto bs = na::donut::ScenePass().GetStats();
+        const auto gs = na::gpu::GetStats();
+        char fx[1024];
+        const int fn = snprintf(fx, sizeof fx,
+            "effects xegtao{enabled=%u amount=%u quality=%u recorded=%llu allocations=%llu busy=%llu bindings=%llu compiling=%u reason=\"%s\"} "
+            "bloom{enabled=%u amount=%u recorded=%llu allocations=%llu busy=%llu bindings=%llu compiling=%u reason=\"%s\"} "
+            "gpu_services{built=%u textures=%llu opens=%llu submits=%llu collections=%llu errors=%llu dispatches=%llu bindings=%llu retained=%llu}\r\n",
+            st.xegtao_enabled.load(), st.xegtao_amount.load(), st.xegtao_quality.load(),
+            (unsigned long long)xs.recorded, (unsigned long long)xs.allocations, (unsigned long long)xs.busy, (unsigned long long)xs.bindings,
+            xs.compiling ? 1u : 0u, xs.reason,
+            unsigned(st.donut_bloom.load()), unsigned(st.donut_bloom_amount.load()),
+            (unsigned long long)bs.recorded, (unsigned long long)bs.allocations, (unsigned long long)bs.busy, (unsigned long long)bs.bindings,
+            bs.compiling ? 1u : 0u, bs.reason,
+            gs.built ? 1u : 0u, (unsigned long long)gs.textures, (unsigned long long)gs.opens, (unsigned long long)gs.submits,
+            (unsigned long long)gs.collections, (unsigned long long)gs.errors, (unsigned long long)gs.dispatches,
+            (unsigned long long)gs.bindings, (unsigned long long)gs.retained);
+        if (fn > 0) WriteFile(f, fx, DWORD((std::min)(fn, int(sizeof fx) - 1)), &written, nullptr);
+        static std::string last_x, last_b;
+        static uint64_t last_errors = 0;
+        if (last_x != xs.reason) { last_x = xs.reason; na::eventlog::Emit("xegtao", "reason=\"%s\"", xs.reason); }
+        if (last_b != bs.reason) { last_b = bs.reason; na::eventlog::Emit("bloom", "reason=\"%s\"", bs.reason); }
+        static ULONGLONG last_table_tick = 0;
+        static uint64_t last_table_total = ~0ull;
+        if (now - last_table_tick >= 60000) { // the game's sampler table, when it grew
+            last_table_tick = now;
+            uint64_t total = 0;
+            const std::string table = na::observe::FormatSamplerTable(&total);
+            if (total != last_table_total) {
+                last_table_total = total;
+                WriteFile(f, table.data(), DWORD(table.size()), &written, nullptr);
+            }
+        }
+        if (gs.errors != last_errors) { na::eventlog::Emit("gpu_services", "errors=%llu was=%llu", (unsigned long long)gs.errors, (unsigned long long)last_errors); last_errors = gs.errors; }
+    }
     {
         char source_line[256];
         const int source_bytes=snprintf(source_line,sizeof(source_line),"overlay_source=%s native_presents=%llu presents=%llu pid=%lu queue_hits=%u buffer_queue=%u queue_misses=%u\r\n",
@@ -969,6 +1028,13 @@ void write_status_line()
             const int dn = snprintf(al, sizeof al, "driver_af available=%u app_profile=%u selector=%u level=%u start{known=%u selector=%u level=%u} forced_this_run=%u limits16=%u written=%u write_result=%d source{selector=%u level=%u}\r\n",
                 drv.available ? 1u : 0u, drv.app_profile ? 1u : 0u, drv.selector, drv.level, drv.start_known ? 1u : 0u, drv.start_selector, drv.start_level, drv.ForcedThisRun() ? 1u : 0u, drv.Limits(16) ? 1u : 0u, drv.written ? 1u : 0u, drv.write_result,drv.selector_location,drv.level_location);
             if (dn > 0) WriteFile(f, al, DWORD((std::min)(dn, int(sizeof al - 1))), &written, nullptr);
+            static std::string last_texture; // every driver texture setting, when it changes
+            std::string texture = na::fg::preset::DriverTextureLine();
+            if (!texture.empty() && texture != last_texture) {
+                last_texture = texture;
+                texture += "\r\n";
+                WriteFile(f, texture.data(), DWORD(texture.size()), &written, nullptr);
+            }
         }
         if (na::j2::RenderSmall()) { // P4-4 render-small: one line per status write
             const auto ps = na::present::GetStats();
@@ -2641,7 +2707,11 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     ImGui_ImplDX12_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
-    draw_panel(just_opened);
+    {
+        na::eventlog::ScopedSource source("panel"); // settings changed while the panel draws are the user's
+        draw_panel(just_opened);
+        na::settings::WatchChanges();
+    }
     ImGui::Render();
     if (just_opened) menu_note("menu_open: draw data built\r\n");
 
@@ -2874,6 +2944,59 @@ void menu_step(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool open, ID3D12R
 
 // Old path (no presenter): everything on the real back buffer, then the
 // original Present by the caller.
+// Event log: process/engine identity once, and the swap chain every time it changes
+// (size, format, flags, buffers), so every run's log says what it ran on.
+void note_identity(IDXGISwapChain* sc, ID3D12CommandQueue* queue)
+{
+    if (!sc) return;
+    DXGI_SWAP_CHAIN_DESC d{};
+    if (FAILED(sc->GetDesc(&d))) return;
+    static na::eventlog::Edge chain_edge;
+    const int64_t key = int64_t(d.BufferDesc.Width) << 40 ^ int64_t(d.BufferDesc.Height) << 24 ^ int64_t(d.BufferDesc.Format) << 12 ^
+                        int64_t(d.Flags) << 4 ^ int64_t(d.BufferCount) ^ int64_t(d.Windowed) << 62;
+    if (chain_edge.Changed(key)) {
+        RECT client{};
+        if (d.OutputWindow) GetClientRect(d.OutputWindow, &client);
+        na::eventlog::Emit("swapchain", "chain=%p width=%u height=%u format=%u buffers=%u swap_effect=%u flags=0x%X windowed=%u window=%p client=%ldx%ld refresh=%u/%u",
+                           static_cast<void*>(sc), d.BufferDesc.Width, d.BufferDesc.Height, unsigned(d.BufferDesc.Format), d.BufferCount,
+                           unsigned(d.SwapEffect), d.Flags, d.Windowed ? 1u : 0u, static_cast<void*>(d.OutputWindow),
+                           long(client.right - client.left), long(client.bottom - client.top),
+                           d.BufferDesc.RefreshRate.Numerator, d.BufferDesc.RefreshRate.Denominator);
+    }
+    static std::atomic<bool> once{false};
+    if (once.exchange(true)) return;
+    wchar_t exe[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    FILETIME created{}, ignored{};
+    unsigned long long since_start_ms = 0;
+    if (GetProcessTimes(GetCurrentProcess(), &created, &ignored, &ignored, &ignored)) {
+        FILETIME now{};
+        GetSystemTimeAsFileTime(&now);
+        const ULARGE_INTEGER a{{created.dwLowDateTime, created.dwHighDateTime}}, b{{now.dwLowDateTime, now.dwHighDateTime}};
+        since_start_ms = (b.QuadPart - a.QuadPart) / 10000ull;
+    }
+    char adapter[128] = "?";
+    unsigned vendor = 0, device_id = 0, revision = 0;
+    unsigned long long vram_mb = 0;
+    ComPtr<ID3D12Device> dev;
+    if (queue && SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&dev)))) {
+        const LUID luid = dev->GetAdapterLuid();
+        ComPtr<IDXGIFactory4> f;
+        ComPtr<IDXGIAdapter1> a;
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&f))) && SUCCEEDED(f->EnumAdapterByLuid(luid, IID_PPV_ARGS(&a)))) {
+            DXGI_ADAPTER_DESC1 ad{};
+            if (SUCCEEDED(a->GetDesc1(&ad))) {
+                WideCharToMultiByte(CP_UTF8, 0, ad.Description, -1, adapter, sizeof adapter, nullptr, nullptr);
+                vendor = ad.VendorId; device_id = ad.DeviceId; revision = ad.Revision;
+                vram_mb = ad.DedicatedVideoMemory >> 20;
+            }
+        }
+    }
+    char exe8[MAX_PATH * 2] = {};
+    WideCharToMultiByte(CP_UTF8, 0, exe, -1, exe8, sizeof exe8, nullptr, nullptr);
+    na::eventlog::Emit("identity", "api=d3d12 exe=\"%s\" pid=%lu first_frame_after_ms=%llu adapter=\"%s\" vendor=0x%04X device=0x%04X rev=%u vram_mb=%llu",
+                       exe8, GetCurrentProcessId(), since_start_ms, adapter, vendor, device_id, revision, vram_mb);
+}
 void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue_hint = nullptr)
 {
     std::lock_guard<std::mutex> lock(g_state.mutex);
@@ -2881,6 +3004,8 @@ void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue_hint = nullptr)
     ComPtr<ID3D12CommandQueue> retained_queue;
     if (!present_prelude(sc, queue,retained_queue,queue_hint)) return;
     na::j2::OnPresent(queue); // one game-frame boundary, never a TEST Present
+    note_identity(sc, queue);
+    na::settings::WatchChanges("code"); // changes made outside the panel (mode commit, ini, safe start)
     na::scale::AutomaticScenePresent();
     if (na::scale::SliderRouteActive()) na::scale::TickLive(na::j2::GetStats().width); // P4-4: confirm a live render-scale change
     UINT idx = real_index(sc);
@@ -3032,6 +3157,8 @@ HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_
     if (na::j2::RenderSmall() && SUCCEEDED(picture_desc_hr))
         na::native_present::ObserveWindowMode(picture_desc.OutputWindow, picture_desc.Windowed != FALSE);
     na::j2::OnPresent(queue); // game call only; the presenter's generated frames bypass this
+    na::settings::WatchChanges("code");
+    note_identity(sc, queue);
     if (na::j2::RenderSmall()) small_follow_mode();
     if (na::scale::SliderRouteActive()) na::scale::TickLive(na::j2::GetStats().width); // P4-4: confirm a live render-scale change
     g_present_caller.store(GetCurrentThreadId());

@@ -1,3 +1,4 @@
+#include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/diag/dred.hpp"
 #include "host_dx12/diag/gpu_breadcrumbs.hpp"
 
@@ -154,9 +155,18 @@ void ReportIfRemoved(ID3D12Device* device)
     if (!device || g_reported.load(std::memory_order_relaxed)) return;
     if (device->GetDeviceRemovedReason() == S_OK) return;
     if (g_reported.exchange(true)) return;
+    const HRESULT removed = device->GetDeviceRemovedReason();
+    na::eventlog::Emit("device_removed", "hr=0x%08lX", static_cast<unsigned long>(removed));
     std::string text;
     try {
-        text = DescribeRemoval(device);
+        char head[200];
+        SYSTEMTIME t;
+        GetLocalTime(&t);
+        snprintf(head, sizeof head, "device removed at %02u:%02u:%02u.%03u tick=%llu frame=%llu hr=0x%08lX\r\n",
+                 t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, static_cast<unsigned long long>(GetTickCount64()),
+                 static_cast<unsigned long long>(na::eventlog::Frame()), static_cast<unsigned long>(removed));
+        text = head;
+        text += DescribeRemoval(device);
         const std::string trail = na::diag::crumbs::Status();
         if (!trail.empty()) text += "\r\n---- AMD FidelityFX Breadcrumbs (NeuralAlias passes) ----\r\n" + trail;
     } catch (...) {

@@ -24,6 +24,7 @@
 // VA table; overlapping (aliased) ranges resolve to UNKNOWN, never a guess.
 #pragma once
 #include <functional>
+#include <string>
 #include <vector>
 
 #include <cstdint>
@@ -303,6 +304,8 @@ struct MipLiveStats {
 MipLiveStats GetMipLiveStats();
 float SamplerMipBias();
 void MipBiasCounts(uint64_t* samplers, uint64_t* static_samplers);
+// Every distinct sampler the game created (heap, heap v2, root-signature static), most used first.
+std::string FormatSamplerTable(uint64_t* total = nullptr);
 // Anisotropic filtering (0 off, 4 / 8 / 16) on eligible standard linear samplers,
 // including clamp-addressed materials. Live static variants; newly created sampler descriptors.
 void SetSamplerAnisotropy(uint32_t level);

@@ -1,4 +1,5 @@
 // C8a: H1 observation producers. See producers.hpp.
+#include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/observe/producers.hpp"
 
 #include <utility>
@@ -1528,6 +1529,7 @@ std::atomic<int> g_pre_af{0};              // anisotropic index built at creatio
 // Variants packed as level | af << 4; 0 = the game's own objects.
 std::atomic<uint32_t> g_var_want{0};       // chosen (menu / saved activation)
 std::atomic<uint32_t> g_var_live{0};       // in use: what recordings latch at Reset
+std::atomic<uint64_t> g_var_request_tick{0}; // event log: when the current choice was asked for
 std::atomic<bool> g_var_missing{false};    // a lookup met an object without the live variant: refill
 std::atomic<uint64_t> g_var_done{0}, g_var_total{0};
 // Never destroyed (the worker is detached and may still wait at process exit).
@@ -1657,9 +1659,31 @@ void note_native(float b,uint32_t anisotropy,bool bias_eligible)
     ++g_native_surface;if(anisotropy>=16)++g_native_af16;
 }
 
+// The game's own sampler table (event log, Cort 2026-11-06): every distinct sampler the game
+// creates (heap, heap v2, static in a root signature) with how many times, so a log answers
+// "are the materials already 16x / already biased?" without a capture.
+struct SamplerRow { uint32_t kind, filter, aniso, u, v, w, cmp; float bias, min_lod, max_lod; uint64_t count; };
+std::mutex g_sampler_table_m;
+std::vector<SamplerRow> g_sampler_table;
+std::atomic<uint64_t> g_sampler_table_total{0}, g_sampler_table_overflow{0};
+template <typename D>
+void note_sampler_desc(uint32_t kind, const D& d)
+{
+    g_sampler_table_total.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(g_sampler_table_m);
+    for (SamplerRow& r : g_sampler_table)
+        if (r.kind == kind && r.filter == uint32_t(d.Filter) && r.aniso == d.MaxAnisotropy && r.u == uint32_t(d.AddressU) &&
+            r.v == uint32_t(d.AddressV) && r.w == uint32_t(d.AddressW) && r.cmp == uint32_t(d.ComparisonFunc) &&
+            r.bias == d.MipLODBias && r.min_lod == d.MinLOD && r.max_lod == d.MaxLOD) { ++r.count; return; }
+    if (g_sampler_table.size() >= 256) { g_sampler_table_overflow.fetch_add(1, std::memory_order_relaxed); return; }
+    g_sampler_table.push_back({kind, uint32_t(d.Filter), d.MaxAnisotropy, uint32_t(d.AddressU), uint32_t(d.AddressV), uint32_t(d.AddressW),
+                               uint32_t(d.ComparisonFunc), d.MipLODBias, d.MinLOD, d.MaxLOD, 1});
+}
+
 void STDMETHODCALLTYPE D_CreateSampler(ID3D12Device* dev, const D3D12_SAMPLER_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
 {
     if (!t_host_work) g_sampler_calls.fetch_add(1, std::memory_order_relaxed);
+    if (d && !t_host_work) note_sampler_desc(0, *d);
     const float bias = g_mip_bias.load(std::memory_order_relaxed);
     const bool surface = d && !t_host_work && sampler_wants_bias(*d);
     const bool aniso_surface = d && !t_host_work && sampler_wants_aniso(*d);
@@ -1685,6 +1709,7 @@ void STDMETHODCALLTYPE D_CreateSampler(ID3D12Device* dev, const D3D12_SAMPLER_DE
 void STDMETHODCALLTYPE D_CreateSampler2(ID3D12Device11* dev, const D3D12_SAMPLER_DESC2* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
 {
     if (!t_host_work) g_sampler2_calls.fetch_add(1, std::memory_order_relaxed);
+    if (d && !t_host_work) note_sampler_desc(1, *d);
     const float bias = g_mip_bias.load(std::memory_order_relaxed);
     const bool surface = d && !t_host_work && sampler_wants_bias(*d);
     const bool aniso_surface = d && !t_host_work && sampler_wants_aniso(*d);
@@ -2462,6 +2487,7 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
             decodable = true;
             const UINT ns = u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 ? u->Desc_1_0.NumStaticSamplers : u->Desc_1_1.NumStaticSamplers;
             const D3D12_STATIC_SAMPLER_DESC* src = u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 ? u->Desc_1_0.pStaticSamplers : u->Desc_1_1.pStaticSamplers;
+            for (UINT i = 0; i < ns; ++i) note_sampler_desc(2, src[i]);
             for (UINT i = 0; i < ns; ++i) if (sampler_wants_aniso(src[i])) {
                 has_surface=true;note_native(src[i].MipLODBias,D3D12_DECODE_IS_ANISOTROPIC_FILTER(src[i].Filter)?src[i].MaxAnisotropy:0,sampler_wants_bias(src[i]));
             }
@@ -6872,7 +6898,14 @@ void variant_worker()
             std::lock_guard<std::mutex> lk(g_var_m);
             if (g_var_want.load(std::memory_order_relaxed) == v) {
                 if (v && g_mip_live_enabled.load(std::memory_order_relaxed)) g_mip_switched.store(true, std::memory_order_release);
+                const uint32_t was_live = g_var_live.load(std::memory_order_relaxed);
                 g_var_live.store(v, std::memory_order_release);
+                if (was_live != v)
+                    na::eventlog::Emit("mip_af", "live bias=%.3f af=%u was{bias=%.3f af=%u} took_ms=%llu objects=%llu/%llu static_changed=%llu",
+                                       kMipLevels[var_level(v)], kAfLevels[var_af(v)], kMipLevels[var_level(was_live)], kAfLevels[var_af(was_live)],
+                                       (unsigned long long)(GetTickCount64() - g_var_request_tick.load(std::memory_order_relaxed)),
+                                       (unsigned long long)g_var_done.load(std::memory_order_relaxed), (unsigned long long)g_var_total.load(std::memory_order_relaxed),
+                                       (unsigned long long)g_var_static_changed[var_level(v) * 4 + var_af(v)].load(std::memory_order_relaxed));
                 // Activation is itself an idle-work request. No subsequent game draw or
                 // missing-object lookup is required to start warming the other choices.
                 if (g_mip_prewarm.load(std::memory_order_relaxed)) g_var_missing.store(true, std::memory_order_relaxed);
@@ -6888,6 +6921,7 @@ void request_variant(F&& change)
         std::lock_guard<std::mutex> lk(g_var_m);
         const uint32_t w = g_var_want.load(std::memory_order_relaxed);
         g_var_want.store(change(w), std::memory_order_relaxed);
+        g_var_request_tick.store(GetTickCount64(), std::memory_order_relaxed);
         if (!g_var_started) {
             g_var_started = true;
             g_var_missing.store(true, std::memory_order_relaxed); // original/Off can warm alternatives too
@@ -6900,6 +6934,12 @@ void request_variant(F&& change)
 void SetSamplerMipBias(float bias)
 {
     const int level = nearest_mip_level(bias);
+    {
+        static na::eventlog::Edge e;
+        int64_t was = 0;
+        if (e.Changed(level, &was))
+            na::eventlog::Emit("mip", "requested bias=%.3f level=%d asked=%.3f was_level=%lld", kMipLevels[level], level, bias, (long long)was);
+    }
     g_mip_bias.store(kMipLevels[level], std::memory_order_relaxed); // sampler descriptors created from now on
     request_variant([level](uint32_t w) { return var_pack(level, var_af(w)); });
 }
@@ -6960,6 +7000,30 @@ void NativeMipBiases(NativeBiasStats* s)
     s->negative = g_native_neg; s->zero = g_native_zero; s->positive = g_native_pos;
     s->min = g_native_min; s->max = g_native_max;
 }
+std::string FormatSamplerTable(uint64_t* total)
+{
+    if (total) *total = g_sampler_table_total.load(std::memory_order_relaxed);
+    std::vector<SamplerRow> rows;
+    {
+        std::lock_guard<std::mutex> lk(g_sampler_table_m);
+        rows = g_sampler_table;
+    }
+    std::sort(rows.begin(), rows.end(), [](const SamplerRow& a, const SamplerRow& b) { return a.count > b.count; });
+    static const char* kinds[] = {"heap", "heap2", "static"};
+    std::string out;
+    char line[320];
+    snprintf(line, sizeof line, "sampler_table distinct=%zu created=%llu overflow=%llu (kind filter aniso address bias lod cmp count)\r\n", rows.size(),
+             (unsigned long long)g_sampler_table_total.load(std::memory_order_relaxed),
+             (unsigned long long)g_sampler_table_overflow.load(std::memory_order_relaxed));
+    out += line;
+    for (const SamplerRow& r : rows) {
+        snprintf(line, sizeof line, "sampler_row kind=%s filter=0x%X anisotropic=%u max_aniso=%u address=%u/%u/%u bias=%.3f lod=%.2f..%.2f cmp=%u count=%llu\r\n",
+                 kinds[r.kind < 3 ? r.kind : 0], r.filter, D3D12_DECODE_IS_ANISOTROPIC_FILTER(D3D12_FILTER(r.filter)) ? 1u : 0u, r.aniso,
+                 r.u, r.v, r.w, r.bias, r.min_lod, r.max_lod, r.cmp, (unsigned long long)r.count);
+        out += line;
+    }
+    return out;
+}
 void MipBiasCounts(uint64_t* samplers, uint64_t* static_samplers)
 {
     if (samplers) *samplers = g_biased_samplers.load(std::memory_order_relaxed);
@@ -6973,6 +7037,12 @@ void MipBiasCounts(uint64_t* samplers, uint64_t* static_samplers)
 void SetSamplerAnisotropy(uint32_t level)
 {
     const int af = af_index(level);
+    {
+        static na::eventlog::Edge e;
+        int64_t was = 0;
+        if (e.Changed(af, &was))
+            na::eventlog::Emit("af", "requested level=%u asked=%u was_index=%lld", kAfLevels[af], level, (long long)was);
+    }
     g_aniso_level.store(kAfLevels[af], std::memory_order_relaxed); // sampler descriptors created from now on
     request_variant([af](uint32_t w) { return var_pack(var_level(w), af); });
 }

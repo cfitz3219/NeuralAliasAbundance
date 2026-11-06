@@ -1,3 +1,4 @@
+#include <string>
 #include "host_dx12/fg/preset_profile.hpp"
 #include "host_dx12/settings.hpp"
 #include <windows.h>
@@ -348,16 +349,65 @@ int32_t aniso_session(int job, AnisoOverride& out, const wchar_t* exe_override =
     destroy(session);
     return r;
 }
+// Read-only: every driver texture-filtering setting for this executable's profile and the
+// global profile, with value, where it comes from (location) and whether it is predefined.
+// For the run log only (Cort 2026-11-06: gather all data); never writes.
+std::string g_driver_texture_line;
+std::string read_texture_driver_settings() {
+    if (!load_api()) return "driver_texture available=0";
+    using GetGlobal = NvAPI_Status(__cdecl*)(NvDRSSessionHandle, NvDRSProfileHandle*);
+    auto module = GetModuleHandleW(L"nvapi64.dll");
+    auto query = module ? reinterpret_cast<Query>(reinterpret_cast<void*>(GetProcAddress(module, "nvapi_QueryInterface"))) : nullptr;
+    auto get_global = query ? reinterpret_cast<GetGlobal>(query(0x617bff9f)) : nullptr;
+    NvDRSSessionHandle session = nullptr;
+    if (create(&session) != NVAPI_OK) return "driver_texture available=0 session=0";
+    std::string out = "driver_texture available=1";
+    if (load(session) == NVAPI_OK) {
+        NvAPI_UnicodeString exe{};
+        exe_name(exe);
+        NvDRSProfileHandle app_profile = nullptr, global = nullptr;
+        NVDRS_APPLICATION app{}; app.version = NVDRS_APPLICATION_VER;
+        if (find(session, exe, &app_profile, &app) != NVAPI_OK) app_profile = nullptr;
+        if (get_global && get_global(session, &global) != NVAPI_OK) global = nullptr;
+        struct Id { const char* name; NvU32 id; };
+        static const Id ids[] = {
+            {"aniso_selector", ANISO_MODE_SELECTOR_ID}, {"aniso_level", ANISO_MODE_LEVEL_ID},
+            {"lod_bias_auto", AUTO_LODBIASADJUST_ID}, {"lod_bias", LODBIASADJUST_ID},
+            {"no_negative_lod", PS_TEXFILTER_NO_NEG_LODBIAS_ID}, {"aniso_sample_opt", PS_TEXFILTER_ANISO_OPTS2_ID},
+            {"bilinear_in_aniso", PS_TEXFILTER_BILINEAR_IN_ANISO_ID}, {"trilinear_opt", PS_TEXFILTER_DISABLE_TRILIN_SLOPE_ID},
+            {"quality", QUALITY_ENHANCEMENTS_ID}};
+        const struct { const char* name; NvDRSProfileHandle h; } profiles[] = {{"app", app_profile}, {"global", global}};
+        char b[160];
+        for (const auto& p : profiles) {
+            snprintf(b, sizeof b, " %s{present=%u", p.name, p.h ? 1u : 0u);
+            out += b;
+            if (p.h)
+                for (const Id& i : ids) {
+                    NVDRS_SETTING st{}; st.version = NVDRS_SETTING_VER;
+                    if (get(session, p.h, i.id, &st) == NVAPI_OK)
+                        snprintf(b, sizeof b, " %s=%u@loc%u%s", i.name, unsigned(st.u32CurrentValue), unsigned(st.settingLocation),
+                                 st.isCurrentPredefined ? "(predefined)" : "");
+                    else snprintf(b, sizeof b, " %s=unset", i.name);
+                    out += b;
+                }
+            out += "}";
+        }
+    } else out += " load=0";
+    destroy(session);
+    return out;
+}
 DWORD WINAPI aniso_worker(void*) {
     for (;;) {
         if (WaitForSingleObject(aniso_event, INFINITE) != WAIT_OBJECT_0) return 0;
         const int job = aniso_job.exchange(0);
         AnisoOverride now{};
         const int32_t r = aniso_session(job, now);
+        std::string texture_line = read_texture_driver_settings();
         std::lock_guard<std::mutex> lock(aniso_mutex);
         const bool written = aniso_state.written;
         const AnisoOverride old = aniso_state;
         aniso_state = now;
+        g_driver_texture_line = std::move(texture_line);
         aniso_state.start_known = old.start_known; aniso_state.start_selector = old.start_selector; aniso_state.start_level = old.start_level;
         aniso_state.write_pending = false;
         aniso_state.written = written || (job == 1 && r == NVAPI_OK);
@@ -391,6 +441,7 @@ void ReadAnisoOverride() {
     else if (now.available) { aniso_state.start_known = true; aniso_state.start_selector = now.selector; aniso_state.start_level = now.level; }
 }
 AnisoOverride GetAnisoOverride() { std::lock_guard<std::mutex> lock(aniso_mutex); return aniso_state; }
+std::string DriverTextureLine() { std::lock_guard<std::mutex> lock(aniso_mutex); return g_driver_texture_line; }
 void RequestAppControlledAniso() { aniso_queue(1); }
 void RequestRestoreAniso() { aniso_queue(2); }
 }

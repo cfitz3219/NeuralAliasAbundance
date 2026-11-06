@@ -1,3 +1,4 @@
+#include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/gpu/mem_alloc.hpp"
 #include "host_dx12/gpu/services.hpp"
 #include "host_dx12/diag/gpu_breadcrumbs.hpp"
@@ -4725,6 +4726,7 @@ void update_window(bool executed)
 
 void OnPresent(ID3D12CommandQueue* queue)
 {
+    na::eventlog::TickFrame(); // every game Present: the event log's frame number
     std::lock_guard<std::mutex> lock(g.m);
     if (queue && g.queue.Get() == queue) {
         {
@@ -4741,6 +4743,18 @@ void OnPresent(ID3D12CommandQueue* queue)
                 else if (o.depth_state_missed) ++g.stats.miss_no_state;
                 else if (g.inline_mode && g.inl_frame != g.frame) ++g.stats.miss_no_candidate;
                 else ++g.stats.miss_other;
+            }
+            if (g.stats.frames) { // every delivered/not-delivered edge, timed to the frame (sub-5 s flicker)
+                static na::eventlog::Edge exec_edge;
+                if (exec_edge.Changed(o.executed ? 1 : 0)) {
+                    const char* why = o.executed ? "delivered"
+                                    : o.camera_missed ? "no_camera"
+                                    : o.depth_state_missed ? "no_depth_state"
+                                    : (g.inline_mode && g.inl_frame != g.frame) ? "no_candidate" : "other";
+                    na::eventlog::Emit("dlss", "delivered=%u why=%s inline=%u rejects=%u reject=\"%s\" later_scene_write=%u",
+                                       o.executed ? 1u : 0u, why, g.inline_mode ? 1u : 0u, unsigned(g.frame_rejects),
+                                       g.frame_reject_text, o.later_scene_write ? 1u : 0u);
+                }
             }
             {
                 // Current-frame ownership by a supported upscaler: the GAME's own evaluations
@@ -4774,6 +4788,14 @@ void OnPresent(ID3D12CommandQueue* queue)
             std::snprintf(r.reason, sizeof r.reason, "%s", d.reason);
             std::snprintf(r.missing, sizeof r.missing, "%s", d.missing);
             std::snprintf(r.change, sizeof r.change, "%s", d.change);
+            {
+                static na::eventlog::Edge route_edge;
+                int64_t was = 0;
+                if (route_edge.Changed(int64_t(r.route) << 16 | int64_t(r.state) << 8 | int64_t(r.mode), &was))
+                    na::eventlog::Emit("route", "route=%u state=%u mode=%u was{route=%lld state=%lld mode=%lld} changes=%u reason=\"%s\" change=\"%s\" missing=\"%s\"",
+                                       r.route, r.state, r.mode, was < 0 ? -1ll : (long long)(was >> 16), was < 0 ? -1ll : (long long)(was >> 8 & 0xFF),
+                                       was < 0 ? -1ll : (long long)(was & 0xFF), unsigned(r.changes), r.reason, r.change, r.missing);
+            }
             apply_route_locked(nullptr);
         }
         std::memcpy(g.stats.insertion_frame_trace, g.insertion_trace, sizeof g.insertion_trace);

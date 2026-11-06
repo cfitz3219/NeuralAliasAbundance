@@ -1,4 +1,5 @@
 #pragma once
+#include <string>
 #include <cstdint>
 namespace na::fg::preset {
 struct Status {
@@ -56,6 +57,8 @@ struct AnisoOverride {
 };
 void ReadAnisoOverride();     // init thread / background worker only (DRS session)
 AnisoOverride GetAnisoOverride();
+// Read-only log line: every driver texture-filtering setting (app + global profile, value@location).
+std::string DriverTextureLine();
 // Menu thread, on the user's click: set THIS game's NVIDIA profile to application-controlled
 // anisotropic filtering (the previous value is saved for RestoreAnisoOverride). Never touches
 // the global profile. The driver reads the profile when the game starts: takes effect on the

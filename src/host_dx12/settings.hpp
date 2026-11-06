@@ -158,6 +158,8 @@ void SetIniPath(const wchar_t* path);
 // Where user changes are saved: %LOCALAPPDATA%\NeuralAlias\NeuralAliasSL.ini
 const wchar_t* UserIniPath();
 void Load();  // defaults ini, then user ini overrides when present
+// Event log: emits one "setting" event per changed persisted field since the last call.
+void WatchChanges(const char* source = nullptr);
 // One line with every effective J2/DLSS value and where it came from (user / game / builtin).
 const char* EffectiveSummary();
 // Settings -> user ini (only our keys). Returns false when any write failed;

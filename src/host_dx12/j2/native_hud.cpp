@@ -1,3 +1,4 @@
+#include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/j2/native_hud.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/hud_picture.hpp"
@@ -1399,6 +1400,22 @@ void SetAutomatic(bool on){
 }
 bool Automatic(){return g_automatic.load(std::memory_order_relaxed);}
 hud_routes::Method AutomaticMethod(){return g_auto_method.load(std::memory_order_relaxed);}
+// Event log: every method/verification/epoch change, with each method's verdict so far.
+static void note_auto_policy_locked(const char* why){
+    struct Seen{uint64_t epoch=~0ull,trial=~0ull;bool verified=false;};static Seen seen;
+    const auto t=g_auto_policy.Current();const bool v=g_auto_policy.Verified();
+    if(t.epoch==seen.epoch&&t.trial==seen.trial&&v==seen.verified)return;
+    seen={t.epoch,t.trial,v};
+    char b[400];int n=0;uint32_t i=0;
+    for(const auto& a:g_auto_policy.Attempts()){
+        const int k=snprintf(b+n,sizeof b-n," %s{frames=%u receipts=%u passes=%u failures=%u hud=%u separated=%u}",
+                             hud_routes::Name(static_cast<hud_routes::Method>(i++)),a.frames,a.receipts,a.passes,a.failures,a.hud_pixels,a.separated_pixels);
+        if(k<0||k>=int(sizeof b)-n)break;n+=k;
+    }
+    b[n<int(sizeof b)?n:int(sizeof b)-1]=0;
+    na::eventlog::Emit("hud_auto","method=%s verified=%u epoch=%llu trial=%llu by=%s%s",hud_routes::Name(t.method),v?1u:0u,
+                       (unsigned long long)t.epoch,(unsigned long long)t.trial,why,b);
+}
 hud_routes::Ticket AutomaticTicket(){std::lock_guard<std::mutex> lock(g_auto_mutex);return g_auto_policy.Current();}
 bool AutomaticVerified(){std::lock_guard<std::mutex> lock(g_auto_mutex);return g_auto_policy.Verified();}
 void AutomaticFrame(ID3D12Resource* frame,ID3D12CommandQueue* queue,uint32_t rw,uint32_t rh,uint32_t ow,uint32_t oh,bool eligible){
@@ -1412,11 +1429,11 @@ void AutomaticFrame(ID3D12Resource* frame,ID3D12CommandQueue* queue,uint32_t rw,
     }
     std::lock_guard<std::mutex> lock(g_auto_mutex);bool present=false;
     if(eligible&&method!=hud_routes::Method::Off){auto& previous=g_auto_draws[static_cast<uint32_t>(method)];present=observed!=previous;previous=observed;}
-    g_auto_policy.Frame(key,eligible,present);g_auto_method.store(g_auto_policy.Selected());
+    g_auto_policy.Frame(key,eligible,present);g_auto_method.store(g_auto_policy.Selected());note_auto_policy_locked("frame");
 }
 void ReportAutomatic(hud_routes::Ticket ticket,uint32_t hud,uint32_t separated){
     if(!Automatic())return;
-    std::lock_guard<std::mutex> lock(g_auto_mutex);g_auto_policy.Receipt(ticket,hud,separated);
+    std::lock_guard<std::mutex> lock(g_auto_mutex);g_auto_policy.Receipt(ticket,hud,separated);note_auto_policy_locked("receipt");
     // Activate route changes only at the next Present boundary, never midway
     // through consuming a completed packet on the current recording.
 }
