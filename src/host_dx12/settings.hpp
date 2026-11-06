@@ -106,7 +106,7 @@ struct Settings {
     // turns it on unless the ini says otherwise; without a Load (tests) the camera-matrix route stays.
     std::atomic<int32_t> j2_viewport_jitter{0};
     // Draw replay ([j2] draw_replay, 1 = on): per-object motion from the game's own draws replayed with
-    // stream output, fed as engine motion (Cort 2026-11-06, SE5 sweatshirt smear). Off without a Load.
+    // stream output, fed as engine motion (Cort 2026-11-06, SE5 sweatshirt smear). Off by default (Cort).
     std::atomic<uint32_t> j2_draw_replay{0};
     std::atomic<uint32_t> j2_preset{255};    // J2 DLSS render preset ([j2] preset_v2; 255 = Automatic: L for DLAA/Quality, M for Balanced/Performance; 12 = L, 0 = NVIDIA default)
     std::atomic<uint32_t> nr_structure{100};

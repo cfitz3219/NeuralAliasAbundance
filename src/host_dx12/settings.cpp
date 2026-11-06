@@ -176,7 +176,7 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
         target.j2_jitter_shift.store(js < 0 ? -1 : (js > 0 ? 1 : 0));
         const int vj = static_cast<int>(GetPrivateProfileIntW(L"j2", L"viewport_jitter", 1, ini));
         target.j2_viewport_jitter.store(vj < 0 ? -1 : (vj > 0 ? 1 : 0));
-        target.j2_draw_replay.store(GetPrivateProfileIntW(L"j2", L"draw_replay", 1, ini) ? 1u : 0u);
+        target.j2_draw_replay.store(GetPrivateProfileIntW(L"j2", L"draw_replay", 0, ini) ? 1u : 0u);
     }
     target.nr_structure.store(pct(L"structure", 100));
     target.nr_tone.store(pct(L"tone", 0));
