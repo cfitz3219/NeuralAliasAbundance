@@ -344,6 +344,7 @@ DWORD WINAPI InitThread(LPVOID)
     na::j2::flow::SetEnabled(GetPrivateProfileIntW(L"j2",L"flow",0,g_ini)==1);
     if(na::settings::SafeStart())na::j2::SetPaused(true);
     na::background::Start(); // two below-normal workers, never hardware_concurrency
+    na::observe::SetBackgroundSubmitter(&na::background::Submit); // mip/AF variant compiles share the pool
     bool started = na::overlay::StartCore(tag, nullptr);
     signal_install_attempted(); // producers were installed (or could not be) inside Start
     boot_log(started ? "core attached" : "core attachment failed");

@@ -23,6 +23,7 @@
 // Constant-buffer views resolve their GPU virtual address through the buffer
 // VA table; overlapping (aliased) ranges resolve to UNKNOWN, never a guess.
 #pragma once
+#include <functional>
 #include <vector>
 
 #include <cstdint>
@@ -275,6 +276,9 @@ void SetSamplerMipBiasLive(float bias); // a menu change; same as SetSamplerMipB
 void SetSamplerMipBiasLiveEnabled(bool on); // before the game creates its pipelines
 // Background warm-up of the other selectable levels once the chosen one is live ([j2] mip_prewarm).
 void SetSamplerMipPrewarm(bool on);
+// Pool for the variant pipelines' compiles (the host passes na::background::Submit). Unset: one thread.
+using BackgroundSubmit = bool (*)(std::function<void()>);
+void SetBackgroundSubmitter(BackgroundSubmit submit);
 // The biases most likely to be chosen (the saved choice and the DLSS modes' automatic
 // levels): their twins are built at creation, so switching to them is immediate.
 void SetSamplerMipLevelsWanted(const float* biases, int n);
@@ -289,6 +293,7 @@ struct MipLiveStats {
     uint64_t prepare_done = 0, prepare_total = 0; // objects of the last background preparation
     uint64_t live_static_changed = 0;   // static samplers changed in the twins of the variant in use
     uint64_t twin_root_signatures = 0, twin_pipelines = 0, untwinned_pipelines = 0, fallbacks = 0, twin_failures = 0;
+    uint64_t parallel_passes = 0; // passes that shared their pipeline compiles with the background pool
     uint64_t warmed_levels = 0; // levels the background warm-up completed (switches to them are immediate)
     uint64_t shared_skips = 0; // twins D3D12 returned as one of the game's own root signatures (identical bytes): not kept
     // Binds at record time (summed per recording at its next Reset): a twin went to the driver,

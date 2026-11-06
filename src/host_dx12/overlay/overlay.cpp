@@ -1258,13 +1258,13 @@ void write_status_line()
         char ml_line[520];
         // chosen = menu/saved; in_use = what recordings bind (differs while preparing);
         // changed_static = the game's static samplers changed in the twins in use (the proof).
-        const int mn = snprintf(ml_line, sizeof ml_line, "mip_live enabled=%u chosen=%.2f/af%u in_use=%.2f/af%u preparing=%u (%llu/%llu) changed_static=%llu game=%.2f twin_rs=%llu twin_pso=%llu untwinned_pso=%llu fallbacks=%llu twin_failures=%llu bound{pso_twin=%llu pso_game=%llu rs_twin=%llu rs_game=%llu} warmed=%llu\r\n",
+        const int mn = snprintf(ml_line, sizeof ml_line, "mip_live enabled=%u chosen=%.2f/af%u in_use=%.2f/af%u preparing=%u (%llu/%llu) changed_static=%llu game=%.2f twin_rs=%llu twin_pso=%llu untwinned_pso=%llu fallbacks=%llu twin_failures=%llu bound{pso_twin=%llu pso_game=%llu rs_twin=%llu rs_game=%llu} warmed=%llu parallel=%llu\r\n",
                                 ml.enabled ? 1u : 0u, ml.want_bias, ml.want_aniso, ml.live_bias, ml.live_aniso, ml.preparing ? 1u : 0u,
                                 (unsigned long long)ml.prepare_done, (unsigned long long)ml.prepare_total, (unsigned long long)ml.live_static_changed,
                                 ml.game_bias, (unsigned long long)ml.twin_root_signatures,
                                 (unsigned long long)ml.twin_pipelines, (unsigned long long)ml.untwinned_pipelines, (unsigned long long)ml.fallbacks,
                                 (unsigned long long)ml.twin_failures, (unsigned long long)ml.bound_pso_twin, (unsigned long long)ml.bound_pso_game,
-                                (unsigned long long)ml.bound_rs_twin, (unsigned long long)ml.bound_rs_game, (unsigned long long)ml.warmed_levels);
+                                (unsigned long long)ml.bound_rs_twin, (unsigned long long)ml.bound_rs_game, (unsigned long long)ml.warmed_levels, (unsigned long long)ml.parallel_passes);
         if (mn > 0) WriteFile(f, ml_line, static_cast<DWORD>((std::min)(mn, static_cast<int>(sizeof(ml_line)-1))), &written, nullptr);
     }
     const auto latency = na::latency::GetStats();

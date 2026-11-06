@@ -1523,6 +1523,7 @@ std::atomic<uint32_t> g_mip_level_mask{0x7u}; // levels built at creation (bit i
 // at a time at below-normal priority, so a later switch is immediate. [j2] mip_prewarm=0 = off.
 std::atomic<bool> g_mip_prewarm{true};
 std::atomic<uint64_t> g_mip_warmed{0}; // levels completed by warm-up (statistics)
+std::atomic<uint64_t> g_mip_parallel_passes{0}; // passes whose pipelines were shared with the background pool
 std::atomic<int> g_pre_af{0};              // anisotropic index built at creation (the saved one)
 // Variants packed as level | af << 4; 0 = the game's own objects.
 std::atomic<uint32_t> g_var_want{0};       // chosen (menu / saved activation)
@@ -6711,6 +6712,56 @@ struct FillItem {
 };
 // One pass for variant (level, af). Returns how many objects lacked it, or SIZE_MAX when
 // the choice changed meanwhile (the caller starts over with the new one).
+// Background pool for pipeline compiles (Cort 2026-11-06: use the Taskflow workers). Set by the
+// host after it starts na::background; unset (tests, early boot) = everything on this thread.
+std::atomic<BackgroundSubmit> g_bg_submit{nullptr};
+void publish_variant(const FillItem& it, int af, std::shared_ptr<Obj::Twins> built)
+{
+    if (built) {
+        std::unique_lock<RegistryLock> lock(g_m);
+        const auto f = g_objs.find(it.key);
+        if (f != g_objs.end() && f->second.id == it.id && f->second.af_sets[af] == it.base) f->second.af_sets[af].swap(built);
+    }
+    // `built` now holds the replaced set (or an unused new one): released here, outside g_m
+    built.reset();
+    g_var_done.fetch_add(1, std::memory_order_relaxed);
+}
+void fill_pso_item(const FillItem& it, int level, int af)
+{
+    std::shared_ptr<Obj::Twins> rs_set;
+    {
+        std::shared_lock<RegistryLock> lock(g_m);
+        const auto f = g_objs.find(it.recipe->rs_key);
+        if (f != g_objs.end() && f->second.id == it.recipe->rs_id) rs_set = f->second.af_sets[af];
+    }
+    if (!rs_set || !rs_set->built[level]) { g_var_done.fetch_add(1, std::memory_order_relaxed); return; } // next pass
+    const VariantRecipe& r = *it.recipe;
+    // Static root variants are cheap and may already cover several levels.
+    // Compile only the requested PSO level before making this choice live.
+    publish_variant(it, af, build_pso_set([&r](ID3D12RootSignature* trs) { return r.make(trs); }, *rs_set, it.base.get(), 1u << level));
+}
+// Pipelines of one pass, shared out item by item between this thread and up to two pool jobs
+// (D3D12 pipeline creation is free-threaded). Owned by a shared_ptr so a job that starts late,
+// or one still running when this thread gives up at process exit, never touches a dead frame.
+struct PsoBatch {
+    std::vector<FillItem> items;
+    std::atomic<size_t> next{0};
+    std::atomic<bool> stopped{false};
+    std::mutex m;
+    std::condition_variable cv;
+    int running = 0;
+    int level = 0, af = 0;
+    uint32_t v = 0;
+    void run()
+    {
+        for (;;) {
+            if (g_var_want.load(std::memory_order_relaxed) != v || g_process_exiting.load(std::memory_order_acquire)) { stopped = true; return; }
+            const size_t i = next.fetch_add(1, std::memory_order_relaxed);
+            if (i >= items.size()) return;
+            fill_pso_item(items[i], level, af);
+        }
+    }
+};
 size_t fill_pass(int level, int af, uint32_t v)
 {
     std::vector<FillItem> rs_items, pso_items;
@@ -6728,35 +6779,35 @@ size_t fill_pass(int level, int af, uint32_t v)
     const size_t found = rs_items.size() + pso_items.size();
     g_var_total.store(found, std::memory_order_relaxed);
     g_var_done.store(0, std::memory_order_relaxed);
-    const auto publish = [&](const FillItem& it, std::shared_ptr<Obj::Twins> built) {
-        if (built) {
-            std::unique_lock<RegistryLock> lock(g_m);
-            const auto f = g_objs.find(it.key);
-            if (f != g_objs.end() && f->second.id == it.id && f->second.af_sets[af] == it.base) f->second.af_sets[af].swap(built);
-        }
-        // `built` now holds the replaced set (or an unused new one): released here, outside g_m
-        built.reset();
-        g_var_done.fetch_add(1, std::memory_order_relaxed);
-    };
-    for (const auto& it : rs_items) {
+    for (const auto& it : rs_items) { // root signatures: cheap, kept in order on this thread
         if (g_var_want.load(std::memory_order_relaxed) != v) return SIZE_MAX;
-        publish(it, build_rs_set(*it.recipe, af, 1u << level, it.base.get()));
+        publish_variant(it, af, build_rs_set(*it.recipe, af, 1u << level, it.base.get()));
     }
-    for (const auto& it : pso_items) {
-        if (g_var_want.load(std::memory_order_relaxed) != v) return SIZE_MAX;
-        std::shared_ptr<Obj::Twins> rs_set;
-        {
-            std::shared_lock<RegistryLock> lock(g_m);
-            const auto f = g_objs.find(it.recipe->rs_key);
-            if (f != g_objs.end() && f->second.id == it.recipe->rs_id) rs_set = f->second.af_sets[af];
+    if (pso_items.empty()) return found;
+    auto batch = std::make_shared<PsoBatch>();
+    batch->items = std::move(pso_items);
+    batch->level = level; batch->af = af; batch->v = v;
+    if (const BackgroundSubmit submit = g_bg_submit.load(std::memory_order_acquire); submit && batch->items.size() >= 16) {
+        for (int k = 0; k < 2; ++k) {
+            { std::lock_guard<std::mutex> l(batch->m); ++batch->running; }
+            const bool queued = submit([batch] {
+                batch->run();
+                { std::lock_guard<std::mutex> l(batch->m); --batch->running; }
+                batch->cv.notify_all();
+            });
+            if (!queued) { std::lock_guard<std::mutex> l(batch->m); --batch->running; }
         }
-        if (!rs_set || !rs_set->built[level]) { g_var_done.fetch_add(1, std::memory_order_relaxed); continue; } // next pass
-        const VariantRecipe& r = *it.recipe;
-        // Static root variants are cheap and may already cover several levels.
-        // Compile only the requested PSO level before making this choice live.
-        publish(it, build_pso_set([&r](ID3D12RootSignature* trs) { return r.make(trs); }, *rs_set, it.base.get(),1u<<level));
     }
-    return found;
+    batch->run(); // this thread takes items too
+    {
+        std::unique_lock<std::mutex> l(batch->m);
+        while (batch->running > 0) {
+            batch->cv.wait_for(l, std::chrono::seconds(1));
+            if (g_process_exiting.load(std::memory_order_acquire)) return SIZE_MAX;
+        }
+    }
+    g_mip_parallel_passes.fetch_add(batch->items.size() >= 16 && g_bg_submit.load(std::memory_order_relaxed) ? 1 : 0, std::memory_order_relaxed);
+    return batch->stopped.load() ? SIZE_MAX : found;
 }
 void variant_worker()
 {
@@ -6846,6 +6897,7 @@ float SamplerMipBias() { return kMipLevels[var_level(g_var_want.load(std::memory
 void SetSamplerMipBiasLive(float bias) { SetSamplerMipBias(bias); }
 void SetSamplerMipBiasLiveEnabled(bool on) { g_mip_live_enabled.store(on, std::memory_order_relaxed); }
 void SetSamplerMipPrewarm(bool on) { g_mip_prewarm.store(on, std::memory_order_relaxed); }
+void SetBackgroundSubmitter(BackgroundSubmit submit) { g_bg_submit.store(submit, std::memory_order_release); }
 void SetSamplerMipLevelsWanted(const float* biases, int n)
 {
     uint32_t mask = 0;
@@ -6884,6 +6936,7 @@ MipLiveStats GetMipLiveStats()
     m.twin_failures = g_mip_twin_fail.load(std::memory_order_relaxed);
     m.shared_skips = g_mip_shared_skips.load(std::memory_order_relaxed);
     m.warmed_levels = g_mip_warmed.load(std::memory_order_relaxed);
+    m.parallel_passes = g_mip_parallel_passes.load(std::memory_order_relaxed);
     return m;
 }
 void NativeMipBiases(NativeBiasStats* s)
