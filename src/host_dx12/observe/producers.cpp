@@ -49,7 +49,7 @@ namespace sl = na::observe::slots;
 // {6E2B39A4-1C0D-4C55-9A3F-2F6B8E1D7A10}: our retirement sentinel's private-data key.
 constexpr GUID kSentinelGuid = {0x6e2b39a4, 0x1c0d, 0x4c55, {0x9a, 0x3f, 0x2f, 0x6b, 0x8e, 0x1d, 0x7a, 0x10}};
 
-// Pipelines and root signatures have no na_object_kind in ABI 0.1; their
+// Pipelines, root and command signatures have no na_object_kind in ABI 0.1; their
 // retirement reports this value (documented in the C8 proposal).
 constexpr uint32_t NA_OBJ_PIPELINE_HOST = 10;
 
@@ -194,6 +194,7 @@ struct Obj {
     bool shader_readonly=false;
     uint32_t shader_rejection=ShaderUnknown;
     bool pixel_position=false;
+    uint8_t indirect_draw_kind=0; // 1 DRAW, 2 DRAW_INDEXED; no root/IA state arguments
     // Live mip bias: per-level twins of a root signature / pipeline state (index = level).
     // same[i]: the game's own object is already correct for level i (nothing to swap).
     // Immutable once published; owns a reference on every twin. A twin is never one of
@@ -2145,6 +2146,31 @@ void emit_pipeline(ID3D12Device* dev, IUnknown* obj, na_ev_pipeline_created& e, 
 }
 
 NA_ORIG(CreateRootSignature, HRESULT, ID3D12Device*, UINT, const void*, SIZE_T, REFIID, void**);
+NA_ORIG(CreateCommandSignature, HRESULT, ID3D12Device*, const D3D12_COMMAND_SIGNATURE_DESC*, ID3D12RootSignature*, REFIID, void**);
+HRESULT STDMETHODCALLTYPE D_CreateCommandSignature(ID3D12Device* dev, const D3D12_COMMAND_SIGNATURE_DESC* desc,
+    ID3D12RootSignature* root, REFIID iid, void** out)
+{
+    Depth depth("CreateCommandSignature");
+    const HRESULT hr=o_CreateCommandSignature(dev,desc,root,iid,out);
+    if(SUCCEEDED(hr)&&out&&*out&&desc&&depth.outermost()&&!t_host_work) {
+        auto* object=static_cast<IUnknown*>(*out);
+        register_object(object,NA_OBJ_PIPELINE_HOST);
+        uint8_t kind=0;
+        if(desc->NumArgumentDescs==1&&desc->pArgumentDescs&&!root) {
+            const auto type=desc->pArgumentDescs[0].Type;
+            if(type==D3D12_INDIRECT_ARGUMENT_TYPE_DRAW&&desc->ByteStride>=sizeof(D3D12_DRAW_ARGUMENTS))kind=1;
+            if(type==D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED&&desc->ByteStride>=sizeof(D3D12_DRAW_INDEXED_ARGUMENTS))kind=2;
+        }
+        std::unique_lock<RegistryLock> lock(g_m);
+        const auto found=g_objs.find(canon(object));if(found!=g_objs.end())found->second.indirect_draw_kind=kind;
+    }
+    return hr;
+}
+uint8_t indirect_draw_kind(ID3D12CommandSignature* signature)
+{
+    std::shared_lock<RegistryLock> lock(g_m);
+    const auto found=g_objs.find(canon(signature));return found==g_objs.end()?0:found->second.indirect_draw_kind;
+}
 NA_ORIG(CreateGraphicsPipelineState, HRESULT, ID3D12Device*, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*, REFIID, void**);
 NA_ORIG(CreateComputePipelineState, HRESULT, ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
 NA_ORIG(CreatePipelineState, HRESULT, ID3D12Device2*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
@@ -4275,7 +4301,9 @@ struct ShaderHooks { std::shared_ptr<ShaderOperationHook> lane[2]; };
 auto& g_shader_hooks = *new std::shared_ptr<const ShaderHooks>();
 std::mutex g_shader_hooks_m;
 std::atomic<bool> g_shader_hooks_enabled{false};
-auto& g_texture_hook = *new std::shared_ptr<TextureOperationHook>();
+struct TextureHooks { std::shared_ptr<TextureOperationHook> lane[2]; };
+auto& g_texture_hooks = *new std::shared_ptr<const TextureHooks>();
+std::mutex g_texture_hooks_m;
 std::atomic<DepthClearListener> g_depth_clear_listener{nullptr};
 
 void capture_raster_targets(GL* list, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets,
@@ -4416,11 +4444,13 @@ void vpj_before_draw(GL* l)
             n = ls->raster_viewport_count;
             for (UINT i = 0; i < n; ++i) { v[i] = ls->raster_viewports[i]; v[i].TopLeftX += dx; v[i].TopLeftY += dy; }
             ls->vpj_applied = true; ls->vpj_value = sample;
+            ++ls->viewport_serial; // actual driver viewport changed outside the game shadow
             g_vpj_sets.fetch_add(1, std::memory_order_relaxed);
         } else {
             if (!ls->vpj_applied) return;
             ls->vpj_applied = false;
             if (!ls->raster_viewports_known) return; // nothing known to hand back (the game sets its own before relying on them)
+            ++ls->viewport_serial;
             n = ls->raster_viewport_count;
             std::copy_n(ls->raster_viewports, n, v);
             g_vpj_restores.fetch_add(1, std::memory_order_relaxed);
@@ -4678,7 +4708,18 @@ struct ListHook<Slot, R(A...)> {
     {
         na::hooking::variants::CallScope scope(l, Slot);
         const CostScope cost(Slot, scope.outermost && !t_host_work);
-        auto fn = reinterpret_cast<Pfn>(orig[I]);
+        const auto native_fn = reinterpret_cast<Pfn>(orig[I]);
+        const auto fn = [native_fn](GL* forwarded_list,auto... arguments)->R {
+            if constexpr(Slot==sl::list::DrawInstanced||Slot==sl::list::DrawIndexedInstanced||
+                         Slot==sl::list::Dispatch||Slot==sl::list::ExecuteIndirect||Slot==sl::list::ExecuteBundle) {
+                // Runtime/debug/wrapping layers can forward this call through
+                // another command-list identity. It is still ONE game command.
+                // Do not jitter/rebind/reconstruct that internal forwarding a
+                // second time; observe the outer call after it returns.
+                const HostWorkScope runtime;
+                return native_fn(forwarded_list,arguments...);
+            }else return native_fn(forwarded_list,arguments...);
+        };
         if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced ||
                       Slot == sl::list::ExecuteIndirect || Slot == sl::list::ExecuteBundle)
             if (!t_host_work && scope.outermost && !scope.ambiguous) { const CostScope c(kCostVpj); vpj_before_draw(l); }
@@ -4707,11 +4748,22 @@ struct ListHook<Slot, R(A...)> {
         // pipelines and the learned profile at every level except the game's own.
         constexpr bool kMipSlot = Slot == sl::list::SetPipelineState || Slot == sl::list::SetGraphicsRootSignature ||
                                   Slot == sl::list::SetComputeRootSignature || Slot == sl::list::Reset;
+        uint8_t pure_indirect=0;
+        if constexpr (Slot == sl::list::ExecuteIndirect) {
+            if (!t_host_work && scope.outermost && !scope.ambiguous && g_shader_hooks_enabled.load(std::memory_order_acquire)) {
+                const auto hooks=std::atomic_load_explicit(&g_shader_hooks,std::memory_order_acquire);
+                if(hooks&&hooks->lane[1])pure_indirect=indirect_draw_kind(std::get<0>(std::forward_as_tuple(a...)));
+            }
+        }
         if constexpr (Slot == sl::list::ExecuteBundle || Slot == sl::list::ExecuteIndirect || Slot == sl::list::BeginRenderPass) {
             if (!t_host_work && scope.outermost && !scope.ambiguous && g_shader_hooks_enabled.load(std::memory_order_acquire)) {
                 const auto hooks = std::atomic_load_explicit(&g_shader_hooks, std::memory_order_acquire);
-                if (hooks) for (const auto& hook : hooks->lane) if (hook) {
-                    HostWorkScope own; hook->NativeBoundary(l);
+                if (hooks) for (unsigned i=0;i<2;++i) if (hooks->lane[i]) {
+                    // A draw-only signature inherits all resource/root/IA
+                    // bindings. Other indirect signatures retain the existing
+                    // native boundary, as do reconstruction/replay owners.
+                    if constexpr (Slot == sl::list::ExecuteIndirect) if(i==1&&pure_indirect)continue;
+                    HostWorkScope own; hooks->lane[i]->NativeBoundary(l);
                 }
             }
         }
@@ -4761,6 +4813,19 @@ struct ListHook<Slot, R(A...)> {
                 if (scope.outermost && !scope.ambiguous) { const CostScope c(kCostShaderUse); before_shader_use(l, Slot == sl::list::Dispatch); }
             if constexpr(Slot==sl::list::ExecuteIndirect)
                 if(scope.outermost && !scope.ambiguous){ const CostScope c(kCostShaderUse); before_shader_use(l,false,true); }
+            if constexpr(Slot==sl::list::ExecuteIndirect) {
+                if(pure_indirect) {
+                    const auto hooks=std::atomic_load_explicit(&g_shader_hooks,std::memory_order_acquire);
+                    if(hooks&&hooks->lane[1]) {
+                        ShaderCall call;call.kind=pure_indirect==1?ShaderKind::Draw:ShaderKind::DrawIndexed;call.indirect=true;
+                        ShaderScope saved;
+                        {HostWorkScope own;saved=hooks->lane[1]->Before(l,call);}
+                        if(saved.action!=ShaderAction::Replaced){fn(l,a...);On<Slot>::run(l,a...);}
+                        {HostWorkScope own;hooks->lane[1]->After(l,call,saved);}
+                        return;
+                    }
+                }
+            }
             if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced || Slot == sl::list::Dispatch) {
                 if (!t_host_work && scope.outermost && !scope.ambiguous && g_shader_hooks_enabled.load(std::memory_order_acquire)) {
                     const auto hooks = std::atomic_load_explicit(&g_shader_hooks, std::memory_order_acquire);
@@ -4815,8 +4880,8 @@ struct ListHook<Slot, R(A...)> {
                     }
                 }
                 if (!t_host_work && scope.outermost && !scope.ambiguous) {
-                    const auto hook = std::atomic_load_explicit(&g_texture_hook, std::memory_order_acquire);
-                    if (hook) {
+                    const auto hooks = std::atomic_load_explicit(&g_texture_hooks, std::memory_order_acquire);
+                    if (hooks && (hooks->lane[0] || hooks->lane[1])) {
                         TextureCall call;
                         const auto args = std::forward_as_tuple(a...);
                         if constexpr (Slot == sl::list::ClearRenderTargetView) {
@@ -4841,16 +4906,24 @@ struct ListHook<Slot, R(A...)> {
                             call.kind = TextureKind::Resolve; call.destination = std::get<0>(args); call.destination_sub = std::get<1>(args);
                             call.source = std::get<2>(args); call.source_sub = std::get<3>(args); call.format = std::get<4>(args);
                         }
-                        ShaderScope saved;
-                        { HostWorkScope own; saved = hook->Before(l, call); }
-                        if (saved.action == ShaderAction::Replaced) {
-                            HostWorkScope own; hook->After(l, call, saved); return;
+                        ShaderScope saved[2];
+                        unsigned entered = 0;
+                        bool replaced = false;
+                        for (unsigned i = 0; i < 2; ++i) {
+                            entered = i + 1;
+                            if (!hooks->lane[i]) continue;
+                            { HostWorkScope own; saved[i] = hooks->lane[i]->Before(l, call); }
+                            if (saved[i].action == ShaderAction::Replaced) { replaced = true; break; }
                         }
-                        fn(l, a...);
-                        if constexpr (Slot == sl::list::CopyResource || Slot == sl::list::CopyTextureRegion || Slot == sl::list::ResolveSubresource)
-                            after_texture_copy(l, call.destination);
-                        On<Slot>::run(l, a...);
-                        { HostWorkScope own; hook->After(l, call, saved); }
+                        if (!replaced) {
+                            fn(l, a...);
+                            if constexpr (Slot == sl::list::CopyResource || Slot == sl::list::CopyTextureRegion || Slot == sl::list::ResolveSubresource)
+                                after_texture_copy(l, call.destination);
+                            On<Slot>::run(l, a...);
+                        }
+                        for (unsigned i = entered; i > 0; --i) if (hooks->lane[i - 1]) {
+                            HostWorkScope own; hooks->lane[i - 1]->After(l, call, saved[i - 1]);
+                        }
                         return;
                     }
                 }
@@ -6072,7 +6145,7 @@ bool InstallProducers(ID3D12Device* device, ID3D12CommandQueue* queue, bool hook
                   NA_HOOK(device, device, CopyDescriptors, true) && NA_HOOK(device, device, CopyDescriptorsSimple, true) &&
                   NA_HOOK(device, device, CreateCommittedResource, true) && NA_HOOK(device, device, CreateHeap, true) &&
                   NA_HOOK(device, device, CreatePlacedResource, true) && NA_HOOK(device, device, CreateReservedResource, true) &&
-                  NA_HOOK(device, device, CreateFence, true) &&
+                  NA_HOOK(device, device, CreateFence, true) && NA_HOOK(device, device, CreateCommandSignature, false) &&
                   NA_HOOK(device, device, CreateRootSignature, true) && NA_HOOK(device, device, CreateGraphicsPipelineState, true) &&
                   NA_HOOK(device, device, CreateComputePipelineState, true) && NA_HOOK(d2, device, CreatePipelineState, false) &&
                   NA_HOOK(d4, device, CreateCommandList1, false) && NA_HOOK(d4, device, CreateCommittedResource1, false) &&
@@ -6550,6 +6623,7 @@ bool ListShaderState(ID3D12CommandList* l, bool compute, ShaderState& out)
     result.list_type=ls->list_type;
     result.raster_restorable=ls->raster_tracking&&ls->raster_targets_known&&ls->raster_viewports_known&&ls->raster_scissors_known;
     result.target_serial=ls->target_serial;result.viewport_serial=ls->viewport_serial;result.scissor_serial=ls->scissor_serial;
+    result.viewport_jitter=ls->vpj_applied?ls->vpj_value:0;
     result.root_serial=ls->root_serial[compute];result.restore_serial=ls->host_restore_serial;
     bound_heaps_locked(*ls);
     for (uint32_t i = 0; i < ls->nheaps; ++i) {
@@ -6572,6 +6646,15 @@ bool ListShaderState(ID3D12CommandList* l, bool compute, ShaderState& out)
     out = result;
     return result.root != nullptr;
 }
+void PreserveAppliedViewportJitter(ID3D12CommandList* list,uint64_t sample)
+{
+    if(!sample)return;
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id=0;auto* ls=list?list_state_locked(list,&id):nullptr;
+    if(!ls)return;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    if(ls->vpj_scene==sample&&ls->vpj_value==sample)ls->vpj_applied=true;
+}
 void SetShaderOperationHook(ShaderLane lane, std::shared_ptr<ShaderOperationHook> hook)
 {
     const auto index = static_cast<unsigned>(lane);
@@ -6591,7 +6674,21 @@ void SetShaderOperationHook(ShaderLane lane, std::shared_ptr<ShaderOperationHook
 void SetDepthClearListener(DepthClearListener listener) { g_depth_clear_listener.store(listener, std::memory_order_release); }
 void SetTextureOperationHook(std::shared_ptr<TextureOperationHook> hook)
 {
-    auto prior = std::atomic_exchange_explicit(&g_texture_hook, std::move(hook), std::memory_order_acq_rel);
+    SetTextureOperationHook(TextureLane::Effects, std::move(hook));
+}
+void SetTextureOperationHook(TextureLane lane, std::shared_ptr<TextureOperationHook> hook)
+{
+    const auto index = static_cast<unsigned>(lane);
+    if (index >= 2) return;
+    std::shared_ptr<const TextureHooks> prior;
+    {
+        std::lock_guard<std::mutex> lock(g_texture_hooks_m);
+        prior = std::atomic_load_explicit(&g_texture_hooks, std::memory_order_acquire);
+        auto next = std::make_shared<TextureHooks>();
+        if (prior) *next = *prior;
+        next->lane[index] = std::move(hook);
+        std::atomic_store_explicit(&g_texture_hooks, std::shared_ptr<const TextureHooks>(next), std::memory_order_release);
+    } // callbacks and GPU-owning objects are released outside the registry lock
 }
 void SetRasterStateTracking(bool enabled) { g_raster_tracking.store(enabled, std::memory_order_release); }
 bool ListRasterStateRestorable(ID3D12CommandList* list)
@@ -7427,19 +7524,21 @@ bool ListNativeOperationKey(ID3D12GraphicsCommandList* list,bool compute,const u
         for(UINT i=0;i<ls->raster_scissor_count;++i)OperationKey::add(key.state,ls->raster_scissors[i]);}
     out.key=key.finish(rebase);return true;
 }
-bool ListNativeOperation(ID3D12GraphicsCommandList* list, bool compute, NativeOperation& out)
+bool ListNativeOperation(ID3D12GraphicsCommandList* list, bool compute, NativeOperation& out,const char** reason)
 {
     out = {};
+    if(reason)*reason=nullptr;
+    const auto fail=[&](const char* why){if(reason)*reason=why;return false;};
     NativeOperation next; next.compute = compute;
     {
         std::shared_lock<RegistryLock> lock(g_m);
         auto* ls = list ? list_state_locked(list, &next.list) : nullptr;
-        if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load() || !ls->generation_known.load()) return false;
+        if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load() || !ls->generation_known.load()) return fail("Scene recording metadata is incomplete.");
         std::lock_guard<std::mutex> bl(ls->bind_m);
-        if (!ls->restorable || ls->in_render_pass) return false;
+        if (!ls->restorable || ls->in_render_pass) return fail("Scene state cannot be restored here (including an active render pass).");
         next.recording = ls->generation.load() + 1; // same public identity as ListRecording
         auto rs = g_objs.find(canon(ls->root_sig[compute]));
-        if (rs == g_objs.end() || !ls->pso || rs->second.root_params.size() > 64) return false;
+        if (rs == g_objs.end() || !ls->pso || rs->second.root_params.size() > 64) return fail("Scene root signature or pipeline bindings are unavailable.");
         next.root = static_cast<ID3D12RootSignature*>(const_cast<void*>(ls->root_sig[compute]));
         next.pipeline = ls->pso;
         const auto pipeline = g_objs.find(canon(ls->pso));
@@ -7449,18 +7548,18 @@ bool ListNativeOperation(ID3D12GraphicsCommandList* list, bool compute, NativeOp
         for (uint32_t param = 0; param < rs->second.root_params.size(); ++param) {
             const auto& p = rs->second.root_params[param];
             if (p.param_type != NA_ROOT_TABLE || param >= args.size() || args[param].type != 1) continue;
-            if (p.first_range > rs->second.root_ranges.size() || p.count > rs->second.root_ranges.size() - p.first_range) return false;
+            if (p.first_range > rs->second.root_ranges.size() || p.count > rs->second.root_ranges.size() - p.first_range) return fail("Scene descriptor table layout is incomplete.");
             uint32_t span = 0; bool sampler = false;
             for (uint32_t r = 0; r < p.count; ++r) {
                 const auto& range = rs->second.root_ranges[p.first_range + r];
                 if (range.num_descriptors == UINT_MAX || range.table_offset == UINT_MAX ||
-                    range.num_descriptors > 4096 || range.table_offset > 4096 - range.num_descriptors) return false;
+                    range.num_descriptors > 4096 || range.table_offset > 4096 - range.num_descriptors) return fail("Scene uses an unbounded or oversized descriptor table.");
                 sampler |= range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
                 span = std::max(span, range.table_offset + range.num_descriptors);
             }
             if (sampler) continue;
             uint32_t slot = 0; const auto* heap = heap_for_gpu_locked(args[param].value, &slot);
-            if (!heap || span > heap->count - slot || span > 4096 - next.descriptors.size()) return false;
+            if (!heap || span > heap->count - slot || span > 4096 - next.descriptors.size()) return fail("Scene resource table is outside the tracked descriptor heap.");
             next.tables.push_back({param, static_cast<uint32_t>(next.descriptors.size()), span});
             SlotShared stripe;
             for (uint32_t i = 0; i < span; ++i) {
@@ -7470,19 +7569,19 @@ bool ListNativeOperation(ID3D12GraphicsCommandList* list, bool compute, NativeOp
                 if(next.reflection_complete)for(uint32_t r=0;r<p.count;++r){const auto& range=rs->second.root_ranges[p.first_range+r];
                     if(i>=range.table_offset&&i-range.table_offset<range.num_descriptors)
                         d.used|=shader_uses(pipeline->second,p,range,range.base_register+i-range.table_offset);}
-                if (!info.details&&d.used) return false;
+                if (!info.details&&d.used) return fail("A used scene descriptor lacks its typed creation data.");
                 if(info.details)d.view = *info.details; d.version = heap->versions[slot + i];
                 next.descriptors.push_back(std::move(d));
             }
         }
         if (!compute) {
-            if (!ls->raster_tracking || !ls->raster_targets_known || !ls->raster_viewports_known || !ls->raster_scissors_known) return false;
+            if (!ls->raster_tracking || !ls->raster_targets_known || !ls->raster_viewports_known || !ls->raster_scissors_known) return fail("Scene targets, viewport or clipping metadata is incomplete.");
             for (const auto& c : ls->native_colors) {
-                if (!c) return false;
+                if (!c) return fail("A scene render target lacks its typed creation data.");
                 OperationDescriptor d; d.view = *c; next.colors.push_back(std::move(d));
             }
             if (ls->native_depth) next.depth.view = *ls->native_depth;
-            else if (ls->raster_has_depth) return false;
+            else if (ls->raster_has_depth) return fail("The scene depth view lacks its typed creation data.");
             next.viewports.assign(ls->raster_viewports, ls->raster_viewports + ls->raster_viewport_count);
             next.scissors.assign(ls->raster_scissors, ls->raster_scissors + ls->raster_scissor_count);
         }
@@ -7514,10 +7613,10 @@ bool ListNativeOperation(ID3D12GraphicsCommandList* list, bool compute, NativeOp
         if (d.view.counter) { d.counter.Attach(AcquireResource(d.view.counter)); if (!d.counter) return false; }
         return true;
     };
-    for (auto& d : next.descriptors) if (d.used&&!acquire(d)) return false;
-    for (auto& d : next.colors) if (!acquire(d)) return false;
-    if (next.depth.view.resource && !acquire(next.depth)) return false;
-    for(auto& c:next.constants){c.resource.Attach(AcquireResource(c.resource_id));if(!c.resource)return false;}
+    for (auto& d : next.descriptors) if (d.used&&!acquire(d)) return fail("A scene descriptor's resource has retired.");
+    for (auto& d : next.colors) if (!acquire(d)) return fail("A scene colour target has retired.");
+    if (next.depth.view.resource && !acquire(next.depth)) return fail("The scene depth target has retired.");
+    for(auto& c:next.constants){c.resource.Attach(AcquireResource(c.resource_id));if(!c.resource)return fail("A scene dimension buffer has retired.");}
     out = std::move(next); return true;
 }
 // Read-only: 2D textures whose recorded creation has one of `formats` and exactly w x h

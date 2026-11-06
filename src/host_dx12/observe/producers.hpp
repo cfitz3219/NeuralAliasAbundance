@@ -180,11 +180,16 @@ struct ShaderState {
     uint64_t cbv_params = 0;
     bool raster_restorable=false;
     uint64_t target_serial=0,viewport_serial=0,scissor_serial=0,cbv_serial[64]{};
+    uint64_t viewport_jitter=0; // exact sample actually bound before this operation
     uint64_t root_serial=0,restore_serial=0;
     struct Table { uint32_t param; uint64_t handle; bool sampler; } tables[64]{};
     uint32_t count = 0;
 };
 bool ListShaderState(ID3D12CommandList* list, bool compute, ShaderState& out);
+// After a private viewport has been bound with this exact recording's sample,
+// keep the jitter owner aware of it. Otherwise the next draw replaces the
+// private viewport with the game's full-size one. No sample may be invented.
+void PreserveAppliedViewportJitter(ID3D12CommandList*,uint64_t sample);
 // First render target and depth currently bound in the recording.
 bool ListCurrentTargets(ID3D12CommandList* list, na_object_id* rt, na_object_id* ds);
 // The game's own scissor rectangles and depth target as last set in this recording

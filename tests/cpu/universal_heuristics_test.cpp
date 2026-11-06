@@ -214,6 +214,14 @@ int main() {
              }
              CHECK(shadow_filtered && quarter_filtered);
          }},
+        {"native Ultra Performance: one-third scene remains eligible while shadow and quarter-size are rejected", [] {
+             Feed f;f.h.AllowRenderScale(1.0/3.0);f.Swapchain(1920,1080);
+             f.Resource(3,640,360,40);f.Resource(4,2048,2048,40);f.Resource(5,480,270,40);
+             f.Resource(6,640,360,10);f.Resource(7,1920,1080,28);f.Pipeline(10,1,1,0);f.Pipeline(11,0,0,1);
+             f.Frame();f.Frame();f.Frame();const auto ranked=f.h.RankDepth(4);
+             CHECK(!ranked.empty());CHECK(ranked[0].resource==3&&ranked[0].score>0&&ranked[0].aspect_match);
+             for(const auto& candidate:ranked)if(candidate.resource==4||candidate.resource==5)CHECK(candidate.score==0&&!candidate.aspect_match);
+         }},
         {"a loading-screen frame does not replace the last real frame", [] {
              Feed f;
              f.Swapchain(1920, 1080);

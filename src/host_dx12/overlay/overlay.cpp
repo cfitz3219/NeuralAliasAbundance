@@ -64,6 +64,7 @@
 #include "host_dx12/j2/hud_unblend.hpp"
 #include "host_dx12/j2/projection_window.hpp"
 #include "host_dx12/scale/live_driver.hpp"
+#include "host_dx12/scale/native_control.hpp"
 #include "host_dx12/scale/auto_scene.hpp"
 #include "host_dx12/scale/settings_read_hook.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
@@ -1091,14 +1092,14 @@ void write_status_line()
         }
         {
             const auto automatic=na::scale::GetAutomaticSceneStats();
-            if(automatic.enabled){char automatic_line[1400];const int automatic_bytes=snprintf(automatic_line,sizeof automatic_line,
-                "layer2 mode=%u active=%u generation=%llu render=%ux%u output=%ux%u members=%u plans=%u operations=%llu redirected=%llu checkpoints=%llu misses=%llu frames=%llu presents=%llu reduced_frames=%llu reduced_pct=%.2f fast_hits=%llu snapshots=%llu failed_plans=%llu poll_builds=%llu group_builds=%llu unknown_ops=%llu binding_failures=%llu native_boundaries=%llu transfer_failures=%llu control_wait_us=%llu control_hold_us=%llu control_max_us=%llu worker_us=%llu reason=\"%s\"\r\n",
-                na::settings::Get().j2_scale_mode.load(),automatic.active?1u:0u,(unsigned long long)automatic.generation,
+            if(automatic.enabled){char automatic_line[1536];const int automatic_bytes=snprintf(automatic_line,sizeof automatic_line,
+                "layer2 mode=%u active=%u reconstructed=%u reconstructed_frames=%llu generation=%llu render=%ux%u output=%ux%u members=%u plans=%u operations=%llu redirected=%llu checkpoints=%llu misses=%llu frames=%llu presents=%llu reduced_frames=%llu reduced_pct=%.2f fast_hits=%llu snapshots=%llu snapshot_failures=%llu failed_plans=%llu poll_builds=%llu group_builds=%llu unknown_ops=%llu binding_failures=%llu native_boundaries=%llu transfer_failures=%llu control_wait_us=%llu control_hold_us=%llu control_max_us=%llu worker_us=%llu reason=\"%s\"\r\n",
+                na::settings::Get().j2_scale_mode.load(),automatic.active?1u:0u,automatic.reconstructed?1u:0u,(unsigned long long)automatic.reconstructed_frames,(unsigned long long)automatic.generation,
                 automatic.render_w,automatic.render_h,automatic.out_w,automatic.out_h,automatic.members,automatic.plans,
                 (unsigned long long)automatic.operations,(unsigned long long)automatic.redirected,(unsigned long long)automatic.checkpoints,
                 (unsigned long long)automatic.misses,(unsigned long long)automatic.frames,(unsigned long long)automatic.presents,
                 (unsigned long long)automatic.redirected_frames,automatic.presents?100.0*automatic.redirected_frames/automatic.presents:0.0,
-                (unsigned long long)automatic.fast_hits,(unsigned long long)automatic.snapshots,(unsigned long long)automatic.failed_plans,
+                (unsigned long long)automatic.fast_hits,(unsigned long long)automatic.snapshots,(unsigned long long)automatic.snapshot_failures,(unsigned long long)automatic.failed_plans,
                 (unsigned long long)automatic.poll_builds,(unsigned long long)automatic.group_builds,(unsigned long long)automatic.unknown_operations,
                 (unsigned long long)automatic.binding_failures,(unsigned long long)automatic.native_boundaries,(unsigned long long)automatic.transfer_failures,
                 (unsigned long long)automatic.control_wait_us,(unsigned long long)automatic.control_hold_us,(unsigned long long)automatic.control_max_us,
@@ -1110,6 +1111,13 @@ void write_status_line()
                     (unsigned long long)automatic.rtv_heaps,(unsigned long long)automatic.dsv_heaps,(unsigned long long)automatic.heap_failures,automatic.heap_hr,automatic.failure_kinds);
                 if(heap_bytes>0)WriteFile(f,automatic_line,DWORD((std::min)(heap_bytes,int(sizeof automatic_line-1))),&written,nullptr);
             }
+        }
+        if(na::scale::native::Available()) {
+            const auto native=na::scale::native::GetStats();char native_line[640];
+            const int native_n=std::snprintf(native_line,sizeof native_line,"native_scale mode=%u controlled=%u confirmed=%u fraction=%.7f thread=%u ticks=%llu applies=%llu requests=%llu scene=%ux%u output=%ux%u evaluations=%llu reason=\"%s\"\r\n",
+                native.mode,native.controlled,native.confirmed,native.fraction,native.thread,(unsigned long long)native.ticks,(unsigned long long)native.applies,
+                (unsigned long long)native.requests,native.render_w,native.render_h,native.out_w,native.out_h,(unsigned long long)native.evaluation,native.reason);
+            if(native_n>0)WriteFile(f,native_line,DWORD((std::min)(native_n,int(sizeof native_line-1))),&written,nullptr);
         }
         if (na::scale::SliderRouteActive()) {
             // P4-4 slider route: what our mode did to the game's render scale (start-up and live).
@@ -3104,17 +3112,32 @@ void note_identity(IDXGISwapChain* sc, ID3D12CommandQueue* queue)
     na::eventlog::Emit("identity", "api=d3d12 exe=\"%s\" pid=%lu first_frame_after_ms=%llu adapter=\"%s\" vendor=0x%04X device=0x%04X rev=%u vram_mb=%llu",
                        exe8, GetCurrentProcessId(), since_start_ms, adapter, vendor, device_id, revision, vram_mb);
 }
+// Every real game-frame entry shares the source notification, independently
+// of whether presentation uses owned proxies or the physical backbuffer.
+// TEST/generated presents do not enter either caller.
+void game_frame_boundary(ID3D12CommandQueue* queue)
+{
+    na::j2::OnPresent(queue);
+    if(na::scale::native::Available()){
+        const auto scene=na::j2::GetStats();
+        na::scale::native::Observe(!na::j2::Paused()&&na::settings::EffectsReady(),scene.render_w?scene.render_w:scene.width,
+            scene.render_h?scene.render_h:scene.height,scene.out_w,scene.out_h,scene.frames,scene.active);
+        const auto native=na::scale::native::GetStats();
+        na::j2::SetNativeRenderExtent(native.controlled?native.render_w:0,native.controlled?native.render_h:0,native.out_w,native.out_h);
+        na::observe::SetSamplerMipBiasLive(native.controlled&&!na::j2::Paused()?na::j2::SmallMipBias(-1.f,native.fraction):0.f);
+    }
+    na::settings::WatchChanges("code");
+    na::scale::AutomaticScenePresent();
+}
 void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue_hint = nullptr)
 {
     std::lock_guard<std::mutex> lock(g_state.mutex);
     ID3D12CommandQueue* queue = nullptr;
     ComPtr<ID3D12CommandQueue> retained_queue;
     if (!present_prelude(sc, queue,retained_queue,queue_hint)) return;
-    na::j2::OnPresent(queue); // one game-frame boundary, never a TEST Present
+    game_frame_boundary(queue);
     note_identity(sc, queue);
     fill_screen_tick(sc);
-    na::settings::WatchChanges("code"); // changes made outside the panel (mode commit, ini, safe start)
-    na::scale::AutomaticScenePresent();
     if (na::scale::SliderRouteActive()) na::scale::TickLive(na::j2::GetStats().width); // P4-4: confirm a live render-scale change
     UINT idx = real_index(sc);
     { // frame processing uses the actual buffer, independently of menu allocation
@@ -3264,8 +3287,7 @@ HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_
     const HRESULT picture_desc_hr = sc->GetDesc(&picture_desc);
     if (na::j2::RenderSmall() && SUCCEEDED(picture_desc_hr))
         na::native_present::ObserveWindowMode(picture_desc.OutputWindow, picture_desc.Windowed != FALSE);
-    na::j2::OnPresent(queue); // game call only; the presenter's generated frames bypass this
-    na::settings::WatchChanges("code");
+    game_frame_boundary(queue); // generated frames bypass this game-facing entry
     note_identity(sc, queue);
     fill_screen_tick(sc);
     if (na::j2::RenderSmall()) small_follow_mode();

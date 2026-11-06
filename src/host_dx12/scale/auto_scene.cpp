@@ -101,7 +101,8 @@ bool prepare_constants(ID3D12Device* device,Built& built,std::string& error){
 }
 struct Run {
     std::shared_ptr<Built> built;std::shared_ptr<SceneFrame> frame;
-    uint64_t epoch=0,color=0,depth=0;std::atomic<bool> aborted{false},seeded{false},redirected{false};
+    uint64_t epoch=0,color=0,depth=0;std::atomic<bool> aborted{false},seeded{false},redirected{false},sealed{false},submitted{false};
+    std::atomic<na::j2::PhysicalOutcome> outcome{na::j2::PhysicalOutcome::Unavailable};
 };
 struct Bound {std::shared_ptr<Run> run;na::nr::native::RecordingLease lease;
     std::vector<FrameMemberState> checkpoint_states;
@@ -153,6 +154,11 @@ public:
     std::deque<SelectionContext> selections,retired_selections;
     uint64_t candidate_color=0,candidate_depth=0,candidate_since=0;
     std::map<std::pair<uint64_t,uint64_t>,Bound> bound;
+    // A complete colour+depth reset in a NEW recording is actual evidence of
+    // another scene, even when its CPU recording precedes the previous Present.
+    // Store only whole-view clear values, never borrowed rectangles/resources.
+    struct Start {uint64_t recording=0;TextureCall color{},depth{};bool have_color=false,have_depth=false;};
+    std::map<uint64_t,Start> starts;
     std::deque<Bound> retired_recordings;
     std::deque<std::shared_ptr<Run>> retired_runs;
     std::deque<std::shared_ptr<Built>> retired_profiles;
@@ -294,7 +300,8 @@ public:
     }
     std::shared_ptr<Run> run_for(ID3D12GraphicsCommandList* list){
         const auto key=std::make_pair(na::observe::IdOf(list),na::observe::ListRecording(list));
-        const auto found=bound.find(key);if(found!=bound.end())return found->second.run;
+        const auto found=bound.find(key);if(found!=bound.end())return found->second.run->sealed?std::shared_ptr<Run>{}:found->second.run;
+        if(current&&current->epoch==epoch&&current->sealed)return {};
         if(unsupported||work_pending.load()||!built||!built->ready||built->model!=model||epoch-last_novel_epoch<3||!built->failed.empty()||!built->failed_transfers.empty()||built->bindings.empty()||!na::j2::Enabled()||na::j2::Paused())return {};
         const auto q=list_queues.find(key.first);
         if(!execution_queue||q==list_queues.end()||q->second!=na::observe::IdOf(execution_queue.Get()))return {};
@@ -305,6 +312,34 @@ public:
             char text[192];std::snprintf(text,sizeof text,"Scene rendering at %u x %u; DLSS status is shown below.",built->group->Render().width,built->group->Render().height);note(text);
         }
         if(!bind(list,current))return {};return current;
+    }
+    std::shared_ptr<Run> sealed_for(ID3D12GraphicsCommandList* list){
+        const auto found=bound.find({na::observe::IdOf(list),na::observe::ListRecording(list)});
+        const auto run=found!=bound.end()?found->second.run:current;
+        return run&&run->sealed?run:nullptr;
+    }
+    bool begin_after_seal(ID3D12GraphicsCommandList* list,const TextureCall& call){
+        const auto id=na::observe::IdOf(list),recording=na::observe::ListRecording(list);
+        if(!id||!recording||bound.count({id,recording})||call.rect_count)return false;
+        const bool c=call.kind==TextureKind::ClearColor&&call.target_id==color;
+        const bool d=call.kind==TextureKind::ClearDepth&&call.target_id==depth&&(call.flags&D3D12_CLEAR_FLAG_DEPTH);
+        if(!c&&!d)return false;
+        if(!starts.count(id)&&starts.size()>=256)starts.erase(starts.begin());
+        auto& start=starts[id];if(start.recording!=recording){start={};start.recording=recording;}
+        if(c){start.color=call;start.have_color=true;}else{start.depth=call;start.have_depth=true;}
+        if(!start.have_color||!start.have_depth)return false;
+        const auto first=c?start.depth:start.color;starts.erase(id);
+        if(current)retired_runs.push_back(std::move(current));
+        auto run=run_for(list);if(!run)return false;
+        const auto transfer=run->built->transfers.find(transfer_key(first));const char* why=nullptr;
+        if(transfer==run->built->transfers.end()||!transfer->second->Record(list,first,&why)){
+            abort(list,run,why?why:"The next scene's initial clear is not prepared yet.");return false;
+        }
+        // The original first clear already ran. Mirror its exact values now,
+        // before the first scene draw; neither original call is suppressed.
+        run->frame->Written(first.target_id,list);run->frame->NativeCurrent(first.target_id,list);
+        if(first.kind==TextureKind::ClearDepth&&(first.flags&D3D12_CLEAR_FLAG_STENCIL))run->frame->StencilCleared(first.target_id);
+        return true;
     }
     const std::vector<FrameMemberState>& states(ID3D12GraphicsCommandList* list,const std::shared_ptr<Run>& run,bool seed=false){
         const auto found=bound.find({na::observe::IdOf(list),na::observe::ListRecording(list)});
@@ -340,6 +375,14 @@ public:
         na::observe::NativeOperationKey stamp;bool known=false;
         {
             std::shared_lock<std::shared_mutex> lock(mutex);if(!enabled||!selected(c,d)){lock.unlock();requested_native(list);return {};}
+            if(const auto run=sealed_for(list)){
+                // The reconstruction boundary ends this source. Later native
+                // finishing/UI work is not another scene to learn or redirect.
+                // Publish remaining depth/dependencies before forwarding it.
+                lock.unlock();ControlLock finish(mutex,cost);
+                if(!checkpoint(list,run))abort(list,run,"The reconstructed scene's native dependencies could not be restored.");
+                return {};
+            }
             known=na::observe::ListNativeOperationKey(list,compute,key_members.data(),key_members.size(),stamp);
             if(!known&&(!stamp.list||(!stamp.recording&&!na::observe::ListRecording(list))))return {}; // no observed executable recording
             if(known){const auto binding=bound.find({stamp.list,stamp.recording});
@@ -372,18 +415,24 @@ public:
             }
         }
         ++snapshots;
-        NativeOperation op;const bool have=na::observe::ListNativeOperation(list,call.kind==na::observe::ShaderKind::Dispatch,op);
+        NativeOperation op;const char* snapshot_reason=nullptr;
+        const bool have=na::observe::ListNativeOperation(list,call.kind==na::observe::ShaderKind::Dispatch,op,&snapshot_reason);
         ControlLock lock(mutex,cost);if(!enabled||!selected(c,d))return {};++operations;
         auto run=run_for(list);
-        if(!have){if(run)abort(list,run,"An operation's native bindings are not yet available.");return {};}
+        if(!have){++stats.snapshot_failures;const char* why=snapshot_reason?snapshot_reason:"An operation's native bindings are not yet available.";
+            if(run)abort(list,run,why);else note(why);return {};}
         bool scene=!op.compute&&op.depth.view.resource==d;
-        if(!scene&&!op.compute)for(const auto& rt:op.colors)scene|=rt.view.resource==c;
+        if(!scene&&!op.compute)for(const auto& rt:op.colors)scene|=rt.view.resource==c||members.count(rt.view.resource)!=0;
         bool reads_depth=false,buffer_outputs=true,has_buffer_output=false;
         for(const auto& v:op.descriptors)if(v.used){reads_depth|=v.view.kind==NA_DESC_SRV&&v.view.resource==d;
             if(v.view.kind==NA_DESC_UAV&&v.resource){const bool buffer=v.resource->GetDesc().Dimension==D3D12_RESOURCE_DIMENSION_BUFFER;buffer_outputs&=buffer;has_buffer_output|=buffer;}}
         scene|=op.compute&&reads_depth&&buffer_outputs&&has_buffer_output;
-        if(!scene){if(known&&native_ops.size()<4096)native_ops.insert(stamp.key);
-            if(run&&!checkpoint(list,run))abort(list,run,"A native consumer could not restore its current scene.");return {};}
+        if(!scene){bool native_scene_write=false;for(const auto& v:op.descriptors)native_scene_write|=v.used&&v.view.kind==NA_DESC_UAV&&members.count(v.view.resource)!=0;
+            // A native writer must keep invalidating reduced provenance on
+            // subsequent frames, not become a cached read-only consumer.
+            if(known&&!native_scene_write&&native_ops.size()<4096)native_ops.insert(stamp.key);
+            if(run&&!checkpoint(list,run))abort(list,run,"A native consumer could not restore its current scene.");
+            if(run&&native_scene_write)abort(list,run,"A native compute pass changes the scene; using its complete native picture.");return {};}
         ComPtr<ID3D12Resource> native_color,native_depth;
         if(members.count(c))native_color=members.at(c).resource;else native_color.Attach(na::observe::AcquireResource(c));
         if(members.count(d))native_depth=members.at(d).resource;else native_depth.Attach(na::observe::AcquireResource(d));
@@ -429,6 +478,8 @@ public:
     }
     void NativeBoundary(ID3D12GraphicsCommandList* list)noexcept override{
         ControlLock lock(mutex,cost);const auto found=bound.find({na::observe::IdOf(list),na::observe::ListRecording(list)});
+        if(found!=bound.end()&&found->second.run->sealed){
+            if(!checkpoint(list,found->second.run))abort(list,found->second.run,"The reconstructed scene's native dependencies could not be restored.");return;}
         if(found!=bound.end()){unsupported=true;++stats.native_boundaries;abort(list,found->second.run,"The scene uses an indirect, bundle or render-pass operation; using its current native picture.");}
     }
     na::observe::ShaderScope Before(ID3D12GraphicsCommandList* list,const TextureCall& call)noexcept override{
@@ -437,6 +488,12 @@ public:
         const auto key=transfer_key(call);na::observe::OperationDescriptor descriptor;
         if(call.target.ptr)na::observe::NativeDescriptor(call.target,descriptor);
         ControlLock lock(mutex,cost);if(!enabled||!selected(c,d))return {};
+        if(const auto run=sealed_for(list)){
+            if(!begin_after_seal(list,call)){
+                if(!checkpoint(list,run))abort(list,run,"The reconstructed scene's native transfer input could not be restored.");
+                return {};
+            }
+        }
         if((call.kind==TextureKind::Copy||call.kind==TextureKind::CopyRegion||call.kind==TextureKind::Resolve)&&(members.count(key.source)||copied_from.count(key.source))&&call.destination){
             const auto a=call.source->GetDesc(),b=call.destination->GetDesc();
             if(a.Width==b.Width&&a.Height==b.Height&&(copied_from.size()<256||copied_from.count(key.destination)))copied_from[key.destination]={key.source,call.destination};
@@ -488,6 +545,7 @@ na::j2::PhysicalLookup lookup(void*,uint64_t color,uint64_t depth,ID3D12Graphics
             a->flush_resources(list,found->second);run=found->second.run;}}
         else if(submission)run=submission->run;
         if(!run||run->aborted||run->color!=color||run->depth!=depth)return na::j2::PhysicalLookup::None;
+        if(run->sealed)return na::j2::PhysicalLookup::Unavailable; // one source owner, no second evaluation
         if(submission)reporting=submission;else{reporting=std::make_shared<Submission>();reporting->run=run;}
     }
     if(list){std::vector<FrameMemberState> current;
@@ -501,7 +559,9 @@ na::j2::PhysicalLookup lookup(void*,uint64_t color,uint64_t depth,ID3D12Graphics
     return run->frame->Input(out);
 }
 void outcome(void*,uint64_t generation,na::j2::PhysicalOutcome result,const char*){
-    auto report=std::move(reporting);if(report&&report->run&&report->run->built->group->Generation()==generation)report->run->frame->Outcome(result);
+    auto report=std::move(reporting);if(report&&report->run&&report->run->built->group->Generation()==generation){
+        report->run->frame->Outcome(result);report->run->outcome=result;report->run->sealed=true;
+    }
 }
 }
 void ConfigureAutomaticScene(bool enabled){
@@ -509,7 +569,7 @@ void ConfigureAutomaticScene(bool enabled){
     auto a=std::make_shared<Automatic>();a->enabled=true;a->stats.enabled=true;a->note("Waiting for the game's scene selection.");automatic()=a;
     na::observe::SetOperationSnapshots(true);na::observe::SetRasterStateTracking(true);
     na::observe::SetShaderOperationHook(na::observe::ShaderLane::Bindings,std::make_shared<BindingHook>(a));
-    na::observe::SetTextureOperationHook(a);na::j2::SetPhysicalInputProvider({&lookup,&outcome,nullptr,true});
+    na::observe::SetTextureOperationHook(na::observe::TextureLane::Bindings,a);na::j2::SetPhysicalInputProvider({&lookup,&outcome,nullptr,true});
     na::nr::native::SetSubmissionPrepareCallback(&submit_constants);
 }
 void PollAutomaticScene(){
@@ -643,14 +703,23 @@ void PollAutomaticScene(){
 }
 bool AutomaticSceneWorkPending(){auto a=automatic();return a&&a->work_pending.load();}
 void AutomaticScenePresent(){auto a=automatic();if(!a)return;uint64_t depth=0,color=0;na::observe::GetLiveSelection(&depth,&color);
-    ControlLock lock(a->mutex,a->cost);if(a->current&&a->current->redirected&&!a->current->aborted)++a->redirected_frames;
-    ++a->epoch;a->current_recording=false;if(a->current)a->retired_runs.push_back(std::move(a->current));if(color&&depth)a->select(color,depth);
-    if(na::settings::Get().j2_scale_mode.load()==0){if(a->built)a->retired_profiles.push_back(std::move(a->built));a->stats.active=false;a->note("Rendering at native resolution.");}
+    ControlLock lock(a->mutex,a->cost);
+    a->stats.active=a->current&&a->current->submitted&&a->current->redirected&&!a->current->aborted;
+    a->stats.reconstructed=a->stats.active&&a->current->outcome==na::j2::PhysicalOutcome::Evaluated;
+    if(a->stats.active)++a->redirected_frames;if(a->stats.reconstructed)++a->stats.reconstructed_frames;
+    ++a->epoch;
+    // A CPU-recorded next scene is not the picture being presented. Its exact
+    // recording leases survive this boundary and remain the submission owner.
+    if(a->current&&!a->current->submitted){a->current->epoch=a->epoch;a->current_recording=true;}
+    else{a->current_recording=false;if(a->current)a->retired_runs.push_back(std::move(a->current));}
+    if(color&&depth)a->select(color,depth);
+    if(na::settings::Get().j2_scale_mode.load()==0){if(a->built)a->retired_profiles.push_back(std::move(a->built));a->stats.active=false;a->stats.reconstructed=false;a->note("Rendering at native resolution.");}
     else if(a->prepared&&a->prepared->ready&&a->built!=a->prepared){if(a->built)a->retired_profiles.push_back(std::move(a->built));a->built=a->prepared;}}
 AutomaticSceneStats GetAutomaticSceneStats(){auto a=automatic();if(!a)return {};std::shared_lock<std::shared_mutex> lock(a->mutex);auto result=a->stats;
     result.operations=a->operations.load();result.redirected=a->redirected.load();result.fast_hits=a->fast_hits.load();result.snapshots=a->snapshots.load();
     result.constant_copies=a->constant_copies.load();result.constant_reuses=a->constant_reuses.load();
-    result.presents=a->epoch-1;result.redirected_frames=a->redirected_frames.load();result.active=a->current&&a->current->redirected&&!a->current->aborted;
+    result.presents=a->epoch-1;result.redirected_frames=a->redirected_frames.load();
+    if(a->current){result.active=a->current->submitted&&a->current->redirected&&!a->current->aborted;result.reconstructed=result.active&&a->current->outcome==na::j2::PhysicalOutcome::Evaluated;}
     result.control_wait_us=a->cost.wait_ns.load()/1000;result.control_hold_us=a->cost.hold_ns.load()/1000;result.control_max_us=a->cost.max_hold_ns.load()/1000;result.worker_us=a->cost.worker_ns.load()/1000;return result;}
 AutomaticSceneSubmission::AutomaticSceneSubmission(ID3D12CommandQueue* queue,UINT count,ID3D12CommandList* const* lists){
     prior_=submission;auto a=automatic();if(!a){submission.reset();return;}
@@ -661,7 +730,7 @@ AutomaticSceneSubmission::AutomaticSceneSubmission(ID3D12CommandQueue* queue,UIN
         if(old!=a->list_queues.end()&&old->second!=queue_id)old->second=0;else if(old==a->list_queues.end())a->list_queues.emplace(key.first,queue_id);
         if(!a->execution_queue&&queue->GetDesc().Type==D3D12_COMMAND_LIST_TYPE_DIRECT&&a->color&&a->depth&&na::observe::ListRendersTo(lists[i],a->color,a->depth))a->execution_queue=queue;
         const auto found=a->bound.find(key);
-        if(found==a->bound.end())continue;value->parts.push_back({lists[i],found->second.run});
+        if(found==a->bound.end())continue;found->second.run->submitted=true;value->parts.push_back({lists[i],found->second.run});
         if(value->run&&value->run!=found->second.run)mixed=true;else if(!value->run)value->run=found->second.run;}
     if(mixed)value->run.reset();
     if(value->run){if(a->execution_queue&&a->execution_queue.Get()!=queue)value->run->aborted=true;else a->execution_queue=queue;}

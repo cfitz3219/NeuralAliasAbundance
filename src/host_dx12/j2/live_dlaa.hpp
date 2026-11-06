@@ -148,6 +148,12 @@ struct UpscaleTarget {
 };
 void SetUpscaleTarget(const UpscaleTarget& t);
 UpscaleTarget GetUpscaleTarget();
+// Native engine scaling: use the existing operation shadow to find the pass
+// reading the reduced scene into a full-output target. Reconstruct after that
+// exact operation, before subsequent post effects/HUD. Does not change window
+// geometry or run a second Present upscaler.
+void EnableNativeScaleBridge(bool enabled);
+void SetNativeRenderExtent(uint32_t rw,uint32_t rh,uint32_t ow,uint32_t oh);
 // P4-4 no-slider route (Astra's Layer2, contract agreed on COMMS 2026-11-01): an optional
 // immutable logical -> physical snapshot. Discovery, the camera and every identity stay on the
 // LOGICAL scene colour/depth ids; J2 evaluates the provider's PHYSICAL (reduced) companions and

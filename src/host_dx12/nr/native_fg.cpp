@@ -429,6 +429,16 @@ bool RecordingLease::Ready(ID3D12CommandQueue* consumer) const {
 bool RecordingLease::Retired() const {
     return retired_ && retired_->load(std::memory_order_acquire);
 }
+bool RecordingLease::Completed() const {
+    if(Retired())return true; // discarded recordings have no remaining GPU use
+    auto record=record_.lock();
+    if(!record)return completed_&&completed_->load(std::memory_order_acquire);
+    const auto& r=*static_cast<const Recording*>(record.get());
+    if(r.forwarding.load(std::memory_order_acquire)||r.failed.load(std::memory_order_acquire))return false;
+    const auto value=r.value.load(std::memory_order_acquire);if(!value)return false;
+    const auto done=r.fence->GetCompletedValue();
+    return done!=UINT64_MAX&&done>=value&&!r.forwarding.load(std::memory_order_acquire)&&r.value.load(std::memory_order_acquire)==value;
+}
 bool RecordingLease::SameRecording(const RecordingLease& other) const {
     return retired_ && retired_==other.retired_;
 }
@@ -651,6 +661,7 @@ std::shared_ptr<const std::atomic<bool>> TrackUse(ID3D12GraphicsCommandList*){re
 RecordingLease RetainRecording(ID3D12GraphicsCommandList*,std::shared_ptr<void>){return {};}
 bool RecordingLease::Ready(ID3D12CommandQueue*)const{return false;}
 bool RecordingLease::Retired()const{return false;}
+bool RecordingLease::Completed()const{return false;}
 bool RecordingLease::SameRecording(const RecordingLease&)const{return false;}
 void TraceGpuProgress(){}
 void PrepareDevice(ID3D12Device*){}

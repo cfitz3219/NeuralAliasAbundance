@@ -24,6 +24,7 @@ na_host_test(gpu_breadcrumbs_test SOURCES gpu_breadcrumbs_test.cpp LIBS host_dia
 na_host_test(mem_alloc_test SOURCES mem_alloc_test.cpp LIBS host_dx12 dxgi LABELS gpu)
 na_host_test(xegtao_test SOURCES xegtao_test.cpp LIBS host_dx12 dxgi LABELS gpu)
 na_host_test(viewport_jitter_test SOURCES viewport_jitter_test.cpp LIBS host_observe_producers dxgi d3dcompiler LABELS gpu)
+na_host_test(scene_viewport_jitter_test SOURCES scene_viewport_jitter_test.cpp LIBS host_dx12 dxgi d3dcompiler LABELS gpu)
 if(NA_HAVE_NGX_SDK)
   # Optional real-DX12 CPU command-tracking benchmark; no model evaluation.
   # These benchmarks are not CTests or part of the default/CI build.
@@ -50,6 +51,14 @@ if(NA_HAVE_NGX_SDK)
   set_tests_properties(host_auto_scene_material_passthrough_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   add_test(NAME host_auto_scene_replay_test COMMAND auto_scene_test --repeat)
   set_tests_properties(host_auto_scene_replay_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+  add_test(NAME host_auto_scene_indirect_test COMMAND auto_scene_test --indirect)
+  set_tests_properties(host_auto_scene_indirect_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+  add_test(NAME host_auto_scene_post_native_test COMMAND auto_scene_test --post-native)
+  set_tests_properties(host_auto_scene_post_native_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+  add_test(NAME host_auto_scene_render_ahead_test COMMAND auto_scene_test --render-ahead)
+  set_tests_properties(host_auto_scene_render_ahead_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+  add_test(NAME host_auto_scene_proxy_present_test COMMAND auto_scene_test --proxy-present)
+  set_tests_properties(host_auto_scene_proxy_present_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   na_host_test(j2_compute_flow_test SOURCES j2_compute_flow_test.cpp LIBS host_dx12 LABELS gpu)
   na_host_test(j2_flow_retention_test SOURCES j2_flow_retention_test.cpp LIBS host_dx12 LABELS gpu)
 endif()
@@ -192,6 +201,11 @@ if(NA_HAVE_NGX_SDK)
   na_host_test(dlss_backend_test SOURCES dlss_backend_test.cpp LIBS host_dlss dxgi)
   # J2 live DLAA end to end (discovery picks -> inserted DLAA list) on the fake runtime.
   na_host_test(j2_live_test SOURCES j2_live_test.cpp LIBS host_dx12 dxgi)
+  add_test(NAME host_j2_native_scale_test COMMAND j2_live_test --native-scale)
+  add_test(NAME host_j2_native_scale_merged_test COMMAND j2_live_test --native-scale-merged)
+  add_test(NAME host_j2_native_scale_graphics_test COMMAND j2_live_test --native-scale-graphics)
+  add_test(NAME host_j2_native_scale_graphics_merged_test COMMAND j2_live_test --native-scale-graphics-merged)
+  set_tests_properties(host_j2_native_scale_test host_j2_native_scale_merged_test host_j2_native_scale_graphics_test host_j2_native_scale_graphics_merged_test PROPERTIES TIMEOUT 120 LABELS "host;gpu")
   na_host_test(j2_rcas_test SOURCES j2_rcas_test.cpp LIBS host_dx12 dxgi)
   na_host_test(game_motion_test SOURCES game_motion_test.cpp LIBS host_dx12 dxgi)
   na_host_test(j2_nis_test SOURCES j2_nis_test.cpp LIBS host_dx12 dxgi)
@@ -374,6 +388,9 @@ na_host_test(tsushima_apply_test SOURCES tsushima_apply_test.cpp
   ${PROJECT_SOURCE_DIR}/src/host_dx12/adapters/tsushima/apply.cpp LIBS host_dx12)
 target_compile_definitions(tsushima_apply_test PRIVATE NA_TSUSHIMA_APPLY_TEST=1)
 na_host_test(tsushima_locator_test SOURCES tsushima_locator_test.cpp LIBS minhook)
+na_host_test(native_scale_test SOURCES native_scale_test.cpp
+  ${PROJECT_SOURCE_DIR}/src/host_dx12/scale/native_control.cpp LIBS host_scale)
+target_compile_definitions(native_scale_test PRIVATE NA_NATIVE_SCALE_TEST=1)
 na_host_test(unreal_apply_test SOURCES unreal_apply_test.cpp
   ${PROJECT_SOURCE_DIR}/src/host_dx12/adapters/unreal/screen_percentage.cpp LIBS host_dx12)
 target_compile_definitions(unreal_apply_test PRIVATE NA_UNREAL_APPLY_TEST=1)
@@ -398,6 +415,7 @@ set_tests_properties(host_overlay_bootstrap_recovery_test PROPERTIES TIMEOUT 30 
 add_test(NAME host_overlay_menu_failure_test COMMAND overlay_bootstrap_test --menu-failure)
 set_tests_properties(host_overlay_menu_failure_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "host;gpu")
 na_host_test(presenter_ownership_test SOURCES presenter_ownership_test.cpp LIBS host_dx12 user32)
+na_host_test(display_independent_present_test SOURCES display_independent_present_test.cpp LIBS host_dx12 user32)
 na_host_test(fullscreen_resize_test SOURCES fullscreen_resize_test.cpp LIBS host_dx12 user32 na_native_present_foreign)
 add_custom_command(TARGET fullscreen_resize_test POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:na_native_present_foreign>

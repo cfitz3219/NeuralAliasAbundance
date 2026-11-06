@@ -134,7 +134,8 @@ endif()
 # P4-4 render-small S1/S2 (Astra): game-facing window size and input mapping.
 add_subdirectory(src/host_dx12/native_present)
 # P4-4 slider route: read-time render-scale substitution (Fable; installed by host_boot on request).
-add_library(host_scale STATIC src/host_dx12/scale/settings_read_hook.cpp src/host_dx12/scale/live_driver.cpp)
+add_library(host_scale STATIC src/host_dx12/scale/settings_read_hook.cpp src/host_dx12/scale/live_driver.cpp
+  src/host_dx12/scale/native_control.cpp)
 target_link_libraries(host_scale PUBLIC abundance_options host_hooking)
 
 add_library(host_observe STATIC src/host_dx12/host_observe.cpp)
