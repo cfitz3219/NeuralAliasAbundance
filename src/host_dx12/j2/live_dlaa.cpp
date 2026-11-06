@@ -77,8 +77,6 @@ struct Slot {
 
 struct PendingHistory {
     na::camera::CameraTracker tracker;
-    // A second camera that flips into the main camera's slot for 1-3 frames (SE5 menu, p25748).
-    na::j2::InterloperFilter interlopers;
     bool cut = false;
     uint32_t capture = 0; // J2 evidence capture token for this evaluation (0 = none)
     na::j2::compute_flow::Ticket compute_flow;
@@ -132,6 +130,8 @@ struct State {
     na::motion::gpu::Arbiter arbiter;
     bool arbiter_ok = false;
     na::camera::CameraTracker tracker;
+    // A second camera that flips into the main camera's slot for 1-3 frames (SE5 menu, p25748).
+    na::j2::InterloperFilter interlopers;
     // SE5 flashing (Cort 2026-11-02): ~10 % of frames had no readable camera, so they kept
     // the game's raw (aliased, mip-biased, unsharpened) colour between DLAA'd neighbours:
     // a flash on detailed texture. The last two unjittered cameras let such a frame run
