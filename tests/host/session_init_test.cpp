@@ -8,6 +8,8 @@
 #include "host_dx12/settings.hpp"
 #include "host_dx12/adapters/mode_control.hpp"
 #include "host_dx12/dlss/call_origin.hpp"
+#include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/observe/producers.hpp"
 #include <filesystem>
 #include <thread>
 #if defined(NA_HAVE_NGX_SDK)
@@ -65,7 +67,14 @@ int wmain(int argc,wchar_t** argv){
 #endif
     // With observed size deliberately different, startup still cannot enqueue
     // the engine Apply path. The old ActivateSavedRequests did so here.
-    na::mode::Start();na::host::ActivateSavedRequests(ini.c_str());
+    na::mode::Start();
+    // A legacy saved Off must not disable automatic DLAA's total -1. Recovery
+    // still leaves all effects untouched; temporary menu comparisons are unsaved.
+    na::j2::SetEnabled(true);na::settings::Get().j2_mip_bias_x100=0;
+    na::host::ActivateSavedRequests(ini.c_str());
+    CHECK(na::observe::SamplerMipBias()==(recovery?0.f:-1.f));
+    CHECK(na::settings::Get().j2_mip_bias_x100==(recovery?0:-100));
+    na::j2::SetEnabled(false);na::observe::SetSamplerMipBias(0.f);
     CHECK(na::mode::GetStatus().request_id==0);
     std::thread worker([]{na::host::RunSessionWorker([]{++activations;});});
     for(unsigned i=0;i<1000 && !activations.load();++i)Sleep(5);

@@ -98,11 +98,12 @@ void ActivateSavedRequests(const wchar_t* ini){
     j2::SetPaused(safe);
     if(safe)j2::flow::SetEnabled(false);
     if(j2::Configured()){
-        const float user=static_cast<float>(st.j2_mip_bias_x100.load())/100.f;
-        float bias=user;
-        if(j2::RenderSmall()){
-            // Render-small: textures are sampled at render size; DLSS guidance adds
-            // log2(render/output), per mode, live (overlay small_follow_mode).
+        const float user=-1.f;
+        if(!safe)st.j2_mip_bias_x100.store(-100);
+        float bias=safe?0.f:user;
+        if(!safe&&j2::RenderSmall()){
+            // Render-small: apply the mode's existing total live, including the
+            // native sampler bias exactly once (overlay small_follow_mode).
             float wanted[4]={user,user,user,user};
             for(int m=1;m<=3;++m)wanted[m]=j2::SmallMipBias(user,static_cast<float>(scale::FractionForMode(m)));
             observe::SetSamplerMipLevelsWanted(wanted,4);

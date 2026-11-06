@@ -6,6 +6,8 @@
 #include "host_dx12/overlay/menu.hpp"
 #include "host_dx12/overlay/na_style.hpp"
 #include "host_dx12/fg/preset_profile.hpp"
+#include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/observe/producers.hpp"
 int main() {
     na::fg::preset::AnisoOverride af;
     af.available=true;af.start_known=true;af.start_selector=1;af.selector=0;af.level=1;
@@ -41,6 +43,8 @@ int main() {
         }
     }
     CHECK(experimental==2);
+    // Draw the real DLAA enhancements too, including the large automatic total.
+    na::j2::SetEnabled(true);na::observe::SetSamplerMipBiasLive(-1.f);
     for(auto page:na::menu::kPages) {
         na::menu::SetCurrentPage(page);CHECK(na::menu::CurrentPage()==page);
         std::printf("drawing page %s\n",na::menu::PageName(page)); std::fflush(stdout);
@@ -55,6 +59,7 @@ int main() {
         if(!strcmp(section->title,"Lighting")||!strcmp(section->title,"GPU infrastructure")){CHECK(section->page==na::menu::Page::Experimental);++effects;}
     }
     CHECK(effects==3);
+    na::j2::SetEnabled(false);na::observe::SetProcessExiting();
     ImGui::DestroyContext();
     return test::finish("route_a_menu_test");
 }

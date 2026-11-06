@@ -164,7 +164,7 @@ int ProjectionShift(test::Device& d, ID3D12Resource* lens, UINT w, UINT h, bool 
 
 // Actual sampler pixels, not a no-op Dispatch or a count of created twins.
 // All waits/readbacks in this standalone diagnostic are test-only.
-int AnisoPixels(bool clamp,bool prewarm_only=false)
+int AnisoPixels(bool clamp,bool prewarm_only=false,bool mip_pixels=false,float native_bias=0.f)
 {
     test::Device d;if(!test::CreateDevice(d))return test::SkipNoDevice("AF pixels");auto* dev=d.device.Get();
     REQUIRE(na::observe::InstallProducers(dev,d.queue.Get(),false));
@@ -182,7 +182,7 @@ int AnisoPixels(bool clamp,bool prewarm_only=false)
     auto up=test::CreateBuffer(dev,bytes,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);REQUIRE(up);void* mapped=nullptr;REQUIRE(SUCCEEDED(up->Map(0,nullptr,&mapped)));
     for(UINT m=0;m<MIPS;++m)for(UINT y=0;y<fp[m].Footprint.Height;++y)for(UINT x=0;x<fp[m].Footprint.Width;++x){
         auto* p=static_cast<uint8_t*>(mapped)+fp[m].Offset+SIZE_T(y)*fp[m].Footprint.RowPitch+x*4;
-        p[0]=p[1]=p[2]=m>=2?128:uint8_t(((y<<m)/2)%2?255:0);p[3]=255;}
+        p[0]=p[1]=p[2]=mip_pixels?uint8_t(16+20*m):(m>=2?128:uint8_t(((y<<m)/2)%2?255:0));p[3]=255;}
     up->Unmap(0,nullptr);test::List init;REQUIRE(init.Create(dev));
     for(UINT m=0;m<MIPS;++m){D3D12_TEXTURE_COPY_LOCATION to{};to.pResource=tex.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;to.SubresourceIndex=m;
         D3D12_TEXTURE_COPY_LOCATION from{};from.pResource=up.Get();from.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;from.PlacedFootprint=fp[m];init.list->CopyTextureRegion(&to,0,0,0,&from,nullptr);}
@@ -197,12 +197,15 @@ int AnisoPixels(bool clamp,bool prewarm_only=false)
     D3D12_ROOT_PARAMETER param{};param.ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;param.DescriptorTable={2,ranges};
     D3D12_STATIC_SAMPLER_DESC ss{};ss.Filter=D3D12_FILTER_MIN_MAG_MIP_LINEAR;ss.AddressU=ss.AddressV=ss.AddressW=clamp?D3D12_TEXTURE_ADDRESS_MODE_CLAMP:D3D12_TEXTURE_ADDRESS_MODE_WRAP;
     ss.MaxAnisotropy=1;ss.MaxLOD=D3D12_FLOAT32_MAX;ss.ComparisonFunc=D3D12_COMPARISON_FUNC_ALWAYS;
+    ss.MipLODBias=native_bias;
     D3D12_ROOT_SIGNATURE_DESC rd{1,&param,1,&ss,D3D12_ROOT_SIGNATURE_FLAG_NONE};test::ComPtr<ID3DBlob> blob,error,cs;test::ComPtr<ID3D12RootSignature> root;
     REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rd,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&error)));REQUIRE(SUCCEEDED(dev->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&root))));
     // Left: oblique 16:1 footprint. Right: isotropic 1:1 postprocess control;
     // changing AF must not alter those control pixels even with CLAMP addressing.
-    const char code[]="Texture2D<float4> image:register(t0);SamplerState samp:register(s0);RWTexture2D<float> target:register(u0);[numthreads(8,8,1)]void main(uint3 p:SV_DispatchThreadID){float du=(p.x<32?16.0:1.0)/1024;target[p.xy]=image.SampleGrad(samp,(float2(p.xy)+.5)/64,float2(du,0),float2(0,1.0/64)).r;}";
-    REQUIRE(SUCCEEDED(D3DCompile(code,sizeof(code),nullptr,nullptr,nullptr,"main","cs_5_0",0,0,&cs,&error)));
+    const char* code=mip_pixels?
+        "Texture2D<float4> image:register(t0);SamplerState samp:register(s0);RWTexture2D<float> target:register(u0);[numthreads(8,8,1)]void main(uint3 p:SV_DispatchThreadID){float2 uv=(float2(p.xy)+.5)/64;target[p.xy]=p.x<32?image.SampleGrad(samp,uv,float2(4.0/1024,0),float2(0,4.0/64)).r:image.Load(int3(0,0,2)).r;}":
+        "Texture2D<float4> image:register(t0);SamplerState samp:register(s0);RWTexture2D<float> target:register(u0);[numthreads(8,8,1)]void main(uint3 p:SV_DispatchThreadID){float du=(p.x<32?16.0:1.0)/1024;target[p.xy]=image.SampleGrad(samp,(float2(p.xy)+.5)/64,float2(du,0),float2(0,1.0/64)).r;}";
+    REQUIRE(SUCCEEDED(D3DCompile(code,std::strlen(code),nullptr,nullptr,nullptr,"main","cs_5_0",0,0,&cs,&error)));
     D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};pd.pRootSignature=root.Get();pd.CS={cs->GetBufferPointer(),cs->GetBufferSize()};test::ComPtr<ID3D12PipelineState> pso;
     REQUIRE(SUCCEEDED(dev->CreateComputePipelineState(&pd,IID_PPV_ARGS(&pso))));
     if(prewarm_only){
@@ -220,13 +223,16 @@ int AnisoPixels(bool clamp,bool prewarm_only=false)
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT of{};const auto od=out->GetDesc();dev->GetCopyableFootprints(&od,0,1,0,&of,nullptr,nullptr,&bytes);
     auto rb=test::CreateBuffer(dev,bytes,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);REQUIRE(rb);test::List list;REQUIRE(list.Create(dev));REQUIRE(SUCCEEDED(list.list->Close()));
     std::vector<float> original;unsigned pass=0;
-    for(UINT af:{0u,16u,0u,4u,8u,16u,0u}){
+    const std::vector<float> choices=mip_pixels?std::vector<float>{0,-1,-.5f,-1.5849625f,-2,-2.25f,4,0}:std::vector<float>{0,16,0,4,8,16,0};
+    for(float choice:choices){
+        const UINT af=mip_pixels?0u:UINT(choice);
         const auto before=na::observe::GetMipLiveStats();
-        na::observe::SetSamplerAnisotropy(af);REQUIRE(na::observe::WaitSamplerVariant(10000));
+        if(mip_pixels)na::observe::SetSamplerMipBiasLive(choice);else na::observe::SetSamplerAnisotropy(af);
+        REQUIRE(na::observe::WaitSamplerVariant(10000));
         const auto after=na::observe::GetMipLiveStats();
         // Three root levels exist, but switching AF must compile only the one
         // requested PSO level before becoming active.
-        if(pass==1&&!clamp)CHECK(after.twin_pipelines-before.twin_pipelines==1);
+        if(pass==1&&!clamp&&!mip_pixels)CHECK(after.twin_pipelines-before.twin_pipelines==1);
         REQUIRE(SUCCEEDED(list.alloc->Reset()));REQUIRE(SUCCEEDED(list.list->Reset(list.alloc.Get(),pso.Get())));
         list.list->SetComputeRootSignature(root.Get());ID3D12DescriptorHeap* heaps[]={heap.Get()};list.list->SetDescriptorHeaps(1,heaps);list.list->SetComputeRootDescriptorTable(0,heap->GetGPUDescriptorHandleForHeapStart());list.list->Dispatch(W/8,H/8,1);
         b=test::Transition(out.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE);list.list->ResourceBarrier(1,&b);
@@ -251,24 +257,40 @@ int AnisoPixels(bool clamp,bool prewarm_only=false)
             else control+=std::abs(values[i]-original[i]);
         }
         change/=W*H/2;contrast/=W*H/2;control/=W*H/2;
-        std::printf("AF pixels %s %ux: oblique change %.6f contrast %.6f isotropic change %.6f effective%u\n",clamp?"clamp":"wrap",af,change,contrast,control,na::observe::GetMipLiveStats().live_aniso);
-        if(af==0)CHECK(change<.01);if(af==16)CHECK(change>.15);
+        if(!mip_pixels)std::printf("AF pixels %s %ux: oblique change %.6f contrast %.6f isotropic change %.6f effective%u\n",clamp?"clamp":"wrap",af,change,contrast,control,na::observe::GetMipLiveStats().live_aniso);
+        if(mip_pixels){
+            double mean=0;for(size_t i=0;i<values.size();++i)if(i%W<W/2)mean+=values[i];mean/=W*H/2;
+            // The same pre-existing root/PSO/texture are rebound after each live request.
+            // LOD2 at bias0, LOD1 at -1, LOD1.5 at -0.5, LOD6 at +4.
+            const double expected=(16+20*(std::max)(0.f,2+(choice==0?native_bias:choice)))/255.0;
+            std::printf("mip live pixels requested %.2f active %.2f: mean %.6f expected %.6f, change %.6f direct-load control %.6f\n",choice,after.live_bias,mean,expected,change,control);
+            CHECK(std::abs(mean-expected)<.006);CHECK(after.live_bias==choice);
+            if(choice==0||choice==native_bias)CHECK(change<.00001);else CHECK(change>.001);
+        }else {if(af==0)CHECK(change<.01);if(af==16)CHECK(change>.15);}
         CHECK(control<.01);CHECK(dev->GetDeviceRemovedReason()==S_OK);
     }
-    REQUIRE(na_observe_stop()==NA_OK);na::observe::SetProcessExiting();return test::finish("AF pixels");
+    REQUIRE(na_observe_stop()==NA_OK);na::observe::SetProcessExiting();return test::finish(mip_pixels?"live mip pixels":"AF pixels");
 }
 
 int main(int argc, char** argv)
 {
     setvbuf(stdout, nullptr, _IONBF, 0);
+    // Counter-delta tests below measure demand compilation only. The separate
+    // --mip-prewarm case enables and verifies background compilation explicitly.
+    na::observe::SetSamplerMipPrewarm(false);
     if(argc>1&&std::strcmp(argv[1],"--af-pixels")==0)return AnisoPixels(argc>2&&std::strcmp(argv[2],"clamp")==0);
     if(argc>1&&std::strcmp(argv[1],"--mip-prewarm")==0)return AnisoPixels(false,true);
+    if(argc>1&&std::strcmp(argv[1],"--mip-pixels")==0)return AnisoPixels(false,false,true);
+    if(argc>1&&std::strcmp(argv[1],"--mip-pixels-native-negative")==0)return AnisoPixels(false,false,true,-1.5f);
+    if(argc>1&&std::strcmp(argv[1],"--mip-pixels-native-already")==0)return AnisoPixels(false,false,true,-1.f);
     const UINT samples = argc > 1 ? UINT(std::atoi(argv[1])) : 1;
     const UINT depth_samples = argc > 2 ? UINT(std::atoi(argv[2])) : samples;
     const bool msaa = samples > 1;
     const bool entry_real=argc>3 && std::strcmp(argv[3],"--entry-real")==0;
-    const bool entry_indirect=argc>3 && std::strcmp(argv[3],"--entry-indirect")==0;
-    const bool entry_test=entry_real || entry_indirect || (argc>3 && std::strcmp(argv[3],"--entry")==0);
+    const bool entry_split_indirect=argc>3 && std::strcmp(argv[3],"--entry-split-indirect")==0;
+    const bool entry_indirect=entry_split_indirect || (argc>3 && std::strcmp(argv[3],"--entry-indirect")==0);
+    const bool entry_split=entry_split_indirect || (argc>3 && std::strcmp(argv[3],"--entry-split")==0);
+    const bool entry_test=entry_real || entry_indirect || entry_split || (argc>3 && std::strcmp(argv[3],"--entry")==0);
     const bool real_ngx = entry_real || argc > 3 && std::strcmp(argv[3], "--real") == 0;
     // --planes: depth's two planes (depth, stencil) are transitioned by separate
     // per-subresource barriers, as Sniper Elite Resistance does.
@@ -474,8 +496,8 @@ int main(int argc, char** argv)
         uint64_t after4 = 0;
         na::observe::MipBiasCounts(&after4, nullptr);
         CHECK(after4 == after3 + 1);
-        // Aim for a total: a game's own -1.5 is already past -1 (left alone); its -0.5
-        // is brought to -1 (biased); the native values are recorded either way.
+        // Exact total -1: both native -1.5 and -0.5 are brought to -1,
+        // rather than accumulating our offset or retaining a different total.
         na::observe::NativeBiasStats n0;
         na::observe::NativeMipBiases(&n0);
         sd.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -485,7 +507,7 @@ int main(int argc, char** argv)
         dev->CreateSampler(&sd, h2);
         uint64_t after5 = 0;
         na::observe::MipBiasCounts(&after5, nullptr);
-        CHECK(after5 == after4);
+        CHECK(after5 == after4 + 1);
         sd.MipLODBias = -0.5f;
         dev->CreateSampler(&sd, h2);
         uint64_t after6 = 0;
@@ -558,6 +580,9 @@ int main(int argc, char** argv)
             // be chosen since live variants are built on demand (Cort 2026-11-05), so -0.6 picks Light (-0.5).
             const float wanted[4] = {-1.0f, na::j2::SmallMipBias(-1.0f, 1.0f / 1.5f), na::j2::SmallMipBias(-1.0f, 1.0f / 1.72f),
                                      na::j2::SmallMipBias(-1.0f, 0.5f)};
+            CHECK(na::j2::SmallMipBias(0.f,1.f)==-1.f);
+            CHECK(na::j2::SmallMipBias(-.5f,1.f)==-1.f);
+            CHECK(na::j2::SmallMipBias(-2.f,1.f)==-1.f);
             na::observe::SetSamplerMipLevelsWanted(wanted, 4);
             na::observe::SetSamplerMipBiasLive(wanted[1]);
             CHECK(std::fabs(na::observe::SamplerMipBias() + 1.585f) < 0.001f);
@@ -807,7 +832,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         d.WaitIdle();
     }
     REQUIRE(SUCCEEDED(scene.list->Close()) && SUCCEEDED(consumer.list->Close()) && SUCCEEDED(prepass.list->Close()));
-    na::settings::Get().j2_inline.store(inline_list && !auto_inline);
+    na::settings::Get().j2_inline.store(inline_list && !auto_inline && !entry_split);
     // Fixed-route tests force between-list insertion so their frame-1 expectations hold;
     // the auto modes exercise the selector.
     na::settings::Get().j2_route.store((auto_inline || auto_between || inline_list) ? 0u : 1u);
@@ -946,13 +971,23 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             if(entry_test){
                 scene.list->SetGraphicsRootSignature(rs.Get());scene.list->SetDescriptorHeaps(1,heaps);
                 scene.list->SetGraphicsRootDescriptorTable(0,cbvh->GetGPUDescriptorHandleForHeapStart());
-                scene.list->SetPipelineState(entry_writers.at(entry_frame-1).Get());scene.list->DrawInstanced(3,1,0,0);
+                scene.list->SetPipelineState(entry_writers.at(entry_split?0:entry_frame-1).Get());scene.list->DrawInstanced(3,1,0,0);
                 scene.list->SetDescriptorHeaps(1,ph);scene.list->SetGraphicsRootSignature(post_root.Get());
             }
             if (other_writer) { // the final scene write is a draw with another pipeline
                 scene.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
                 scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart());
                 scene.list->DrawInstanced(3, 1, 0, 0);
+            }
+            if(entry_split && entry_frame>3 && entry_frame%2==0){
+                // The same terminal pass is now recorded in a separate list with no
+                // scene/depth draw of its own. Descriptor96 is GPU-indexed, not resolved.
+                REQUIRE(SUCCEEDED(scene.list->Close()));ID3D12CommandList* complete[]={scene.list.Get()};
+                Submit(q,1,complete,true);d.WaitIdle();
+                std::swap(scene,scene2);scene.Reset();
+                scene.list->SetDescriptorHeaps(1,ph);scene.list->SetGraphicsRootSignature(post_root.Get());
+                scene.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                scene.list->RSSetViewports(1,&viewport);scene.list->RSSetScissorRects(1,&scissor);
             }
             std::swap(rd2.Transition.StateBefore, rd2.Transition.StateAfter);
             scene.list->ResourceBarrier(1, &rd2);
@@ -1059,6 +1094,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         if (capture) na::capture::j2::OnPresent(q, presented.Get(), &PlainExecute);
         d.WaitIdle();
         if(entry_test && entry_frame>=8){
+            if(entry_split)CHECK(fake::evals==frame_evals+1); // one evaluation in every warmed merged OR split frame
             const auto desc=post_rt->GetDesc();D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};UINT64 bytes=0;
             dev->GetCopyableFootprints(&desc,0,1,0,&fp,nullptr,nullptr,&bytes);
             auto rb=test::CreateBuffer(dev,bytes,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);REQUIRE(rb);
@@ -1132,7 +1168,8 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         printf("POST ENTRY %u/%u downstream; matches %llu frames %llu late %llu real %u\n",entry_delivered,entry_checks,(unsigned long long)st.entry_matched,(unsigned long long)st.frames,(unsigned long long)st.inline_late_writes,real_ngx);
         CHECK(entry_checks==17 && entry_delivered==17 && st.entry_matched>=17);
         CHECK(st.no_camera==0 && st.no_state==0 && st.inline_late_writes==0);
-        CHECK(st.depth_sources[1]>=17 && st.depth_state_assumed==0); // inherited, never guessed
+        CHECK(st.depth_sources[1]+(entry_split?st.depth_sources[3]:0)>=17 && st.depth_state_assumed==0); // inherited or exact submitted-prefix state, never guessed
+        if(entry_split)CHECK(st.between_observed>=9 && st.depth_sources[2]==0); // saved handoff exercised; no supplied substitute
         uint64_t depth_total=0,camera_total=0;
         for(const auto value:st.depth_sources)depth_total+=value;
         for(const auto value:st.camera_sources)camera_total+=value;

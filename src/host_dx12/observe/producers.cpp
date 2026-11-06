@@ -1607,18 +1607,13 @@ bool apply_aniso(SD& d)
     d.MaxAnisotropy = level;
     return true;
 }
-// Target-based bias (Cort, aiming for a total of `target`, e.g. -1): a sampler
-// with a neutral or positive native bias gets NVIDIA's NativeBias + target; one
-// the game already biases negative is brought to `target` at most and never
-// past it (no stacking -1 on top of the game's own sharpening).
-// Total-bias rule (Cort 2026-11-06): our choice is the TOTAL bias the texture ends up with, the
-// game's own included: game 0 -> -1, game -1 -> -1 (ours adds 0), game +0.5 -> -1. A sampler the
-// game already biases further than the target keeps its own (never made blurrier).
+// Cort's total-bias rule: DLAA automatically targets exactly -1, including the
+// native value. Native -1 needs no change; native 0 -> -1, native -0.5 -> -1,
+// native -1.5 -> -1. Zero is the temporary comparison with the original sampler.
 float biased(float native, float target)
 {
     if (target == 0.0f) return native;
-    if (target > 0.0f) return clamp_lod(target); // the visible check level: forced, whatever the game's own
-    return native < target ? native : clamp_lod(target);
+    return clamp_lod(target);
 }
 // The anisotropic part of a variant (no counters): as apply_aniso, at an explicit level.
 template <typename SD>
@@ -3946,14 +3941,18 @@ void before_read_transition(GL* l, UINT count, const D3D12_RESOURCE_BARRIER* bar
             !(b.Transition.StateBefore & D3D12_RESOURCE_STATE_RENDER_TARGET) || !(b.Transition.StateAfter & reads) ||
             resource_id(b.Transition.pResource) != color) continue;
         uint32_t cs = 0, ds = 0;
-        if (!ListSceneSubresource(l, color, depth, &cs, &ds) ||
-            (b.Transition.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && b.Transition.Subresource != cs)) continue;
+        const bool scene_here = ListSceneSubresource(l, color, depth, &cs, &ds);
+        // Whole-resource handoff is exact evidence even in a pure post list.
+        // Keep that entry for submitted-scene placement; it cannot insert inline
+        // without this recording's scene metadata. No subresource is guessed.
+        if ((!scene_here && b.Transition.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) ||
+            (scene_here && b.Transition.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && b.Transition.Subresource != cs)) continue;
         std::vector<ListState::StateNote> entry_states;
         // The callback runs BEFORE this entire barrier batch. Its first
         // transition for each selected subresource supplies the exact entry
         // state, even when depth was only read and prior GPU work is in flight.
         // Never use StateAfter here, nor the before-state of an END_ONLY half.
-        for (const auto selected : {std::pair<na_object_id, uint32_t>{color, cs}, {depth, ds}}) {
+        if(scene_here)for (const auto selected : {std::pair<na_object_id, uint32_t>{color, cs}, {depth, ds}}) {
             for (UINT j = 0; j < count; ++j) {
                 const auto& entry = barriers[j];
                 if (entry.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) break;

@@ -2974,7 +2974,8 @@ void small_follow_mode()
             if (g_small_token) np::CompleteResize(g_small_token, true, {a.size.w, a.size.h});
             g_small_token = 0;
             na::present::SetRenderScale(a.scale, &na::j2::PresentUpscale, nullptr);
-            // Texture detail follows the applied mode: the menu bias plus log2(render scale).
+            // Texture detail follows the applied mode's total, including the
+            // native sampler bias once. DLAA restores automatic total -1.
             na::observe::SetSamplerMipBiasLive(na::j2::SmallMipBias(static_cast<float>(na::settings::Get().j2_mip_bias_x100.load()) / 100.f, a.scale));
             small_note_line(a.scale < 1.f ? "applied" : "applied_native_dlaa", c);
             break;
