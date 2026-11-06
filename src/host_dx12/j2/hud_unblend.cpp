@@ -31,7 +31,7 @@ std::atomic<bool> g_configured{false}, g_on{true};
 std::mutex g_m;
 Stats g_stats;
 uint64_t g_frame = 0;
-struct Dims { uint32_t rw = 0, rh = 0, ow = 0, oh = 0; DXGI_FORMAT proxy = DXGI_FORMAT_UNKNOWN; } g_dims;
+struct Dims { uint32_t rw = 0, rh = 0, ow = 0, oh = 0; DXGI_FORMAT proxy = DXGI_FORMAT_UNKNOWN;ID3D12Device* device=nullptr; } g_dims;
 
 struct Set {
     ComPtr<ID3D12Device> device;
@@ -423,7 +423,7 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
         for (uint32_t i = 0; i < n; ++i)
             if (na::j2::CameraBinding(cb[i].resource, cb[i].offset, cb[i].param, cb[i].table)) {
                 sets.scene.insert(st.rt);
-                const auto old=sets.active.find(st.rt);if(old!=sets.active.end()&&old->second->closed)sets.active.erase(old);
+                const auto old=sets.active.find(st.rt);if(old!=sets.active.end()&&(old->second->closed||!old->second->draws))sets.active.erase(old);
                 sets.transferred.erase(st.rt);++g_stats.world;return {};
             }
         uint64_t scene_depth = 0, scene_color = 0;
@@ -431,7 +431,7 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
         if (scene_depth && st.ds == scene_depth && st.pipeline_known && st.depth_enable != NA_UNKNOWN_U32 && st.depth_enable != 0u &&
             st.dsv_format != DXGI_FORMAT_UNKNOWN) {
             sets.scene.insert(st.rt);
-            const auto old=sets.active.find(st.rt);if(old!=sets.active.end()&&old->second->closed)sets.active.erase(old);
+            const auto old=sets.active.find(st.rt);if(old!=sets.active.end()&&(old->second->closed||!old->second->draws))sets.active.erase(old);
             sets.transferred.erase(st.rt);++g_stats.world;return {};
         }
     }
@@ -462,11 +462,11 @@ na::observe::ShaderScope OnDraw(ID3D12GraphicsCommandList* l, const na::observe:
     else if(source_transfer!=sets.transferred.end())sampled_layers=source_transfer->second;
     const auto previous=sets.active.find(st.rt);
     if(full_pass&&!blended&&sampled_source&&sets.scene.count(sampled_source)&&
-       (!sampled_layers||!sampled_layers->draws)&&(previous==sets.active.end()||!previous->second->draws)){
+       (!sampled_layers||!sampled_layers->draws)&&(previous==sets.active.end()||previous->second->closed||!previous->second->draws)){
         // A terminal HUD has not begun on either image, and the sampled input
         // descends from actual camera/depth scene work. Keep normal scene
         // postprocessing native; do not four-times replay the entire PP chain.
-        sets.scene.insert(st.rt);++g_stats.scene;return {};
+        sets.active.erase(st.rt);sets.transferred.erase(st.rt);sets.scene.insert(st.rt);++g_stats.scene;return {};
     }
     if(full_pass&&!blended&&sampled_layers&&sampled_layers->draws&&sampled_layers->scene_captured){
         // A full-image draw can be an identity handoff even with different
@@ -714,10 +714,11 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
                ID3D12CommandQueue* queue)
 {
     if (!frame || !rw || !rh || !ow || !oh) return false;
+    ComPtr<ID3D12Device> device;if(FAILED(frame->GetDevice(IID_PPV_ARGS(&device))))return false;
     std::lock_guard<std::mutex> lock(g_m);
     const DXGI_FORMAT pf = frame->GetDesc().Format;
-    if (g_dims.rw != rw || g_dims.rh != rh || g_dims.ow != ow || g_dims.oh != oh || g_dims.proxy != pf) {
-        g_dims = Dims{rw, rh, ow, oh, pf};
+    if (g_dims.rw != rw || g_dims.rh != rh || g_dims.ow != ow || g_dims.oh != oh || g_dims.proxy != pf||g_dims.device!=device.Get()) {
+        g_dims = Dims{rw, rh, ow, oh, pf,device.Get()};
         g_shapes.clear();
         for (auto& old : g_set) { old.active.clear(); old.transferred.clear();old.scene.clear(); }
         g_submitted.clear();
@@ -728,7 +729,8 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
     std::shared_ptr<Set> owner;
     const auto executed=g_submitted.find(id);
     if(executed!=g_submitted.end())owner=executed->second;
-    const auto ready=[&](const auto& p){return p&&p->cleared&&p->draws&&p->picture&&p->scene_captured&&p->full_captured&&queue&&
+    const auto ready=[&](const auto& p){return p&&p->device.Get()==device.Get()&&p->rw==rw&&p->rh==rh&&p->ow==ow&&p->oh==oh&&
+        p->typeless==native_hud::TypelessOf(pf)&&p->cleared&&p->draws&&p->picture&&p->scene_captured&&p->full_captured&&queue&&
         !p->uses.empty()&&std::all_of(p->uses.begin(),p->uses.end(),[&](const auto& use){return use.Ready(queue);});};
     // Reuse the existing asynchronous GPU picture probe when final shader
     // lineage is hidden. A learned source is still compared with THIS final
@@ -761,16 +763,14 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
     g_stats.matched_target = owner ? owner->target : 0;
     g_stats.pending_recordings = 0;
     if (owner) for (const auto& use : owner->uses) if (!use.Ready(queue)) ++g_stats.pending_recordings;
-    const bool hud = owner && owner->cleared && owner->draws > 0 && owner->rw == rw && owner->rh == rh &&
-        owner->ow == ow && owner->oh == oh && queue && !owner->uses.empty() &&
-        std::all_of(owner->uses.begin(), owner->uses.end(), [&](const auto& u) { return u.Ready(queue); });
+    const bool hud = ready(owner);
     ++g_stats.frames;
     g_stats.last_draws = hud ? owner->draws : 0;
     g_stats.last_covered = hud ? owner->covered : 0;
     g_stats.last_view = hud ? uint32_t(owner->view) : 0u;
     const bool current_proof = hud && owner->picture && owner->scene_captured && owner->full_captured;
     g_stats.current_picture = current_proof;
-    const bool compose = current_proof || g_verdict.load(std::memory_order_relaxed) != 2u;
+    const bool compose = current_proof;
     if (hud) {
         ++g_stats.hud_frames;
         if (compose) ++g_stats.composed; else ++g_stats.held;

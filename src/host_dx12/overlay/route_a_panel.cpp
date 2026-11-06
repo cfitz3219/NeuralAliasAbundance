@@ -987,7 +987,7 @@ void DrawLiveDlaa()
     if (na::j2::RenderSmall() && na::j2::native_hud::Installed()) {
         const bool unblend = na::j2::hud_unblend::Configured();
         bool native_on = unblend ? na::j2::hud_unblend::Enabled() : na::j2::native_hud::Enabled();
-        BeginRow("Native-resolution HUD", unblend ? "The game's UI draws are replayed at your screen's full resolution and taken out of DLSS's input; the UI is then laid over the upscaled picture exactly as the game blended it. A per-frame check holds the layers back if the game's final pass changed the picture. Off leaves the HUD in the game's image. Not saved."
+        BeginRow("Native-resolution HUD", unblend ? "Finds the game's HUD image, gives DLSS the scene without it, then redraws compatible UI at your screen's full resolution. Each image is checked; changed regions keep the game's original pixels. Source discovery continues automatically. Off leaves the HUD in the game's image. Not saved."
                  : "Draws compatible HUD and text at your screen's full resolution after DLSS. When clean separation is unavailable, protects recognised HUD pixels from temporal movement. The original game picture stays available. Off leaves HUD in the game's image. Not saved.", SwitchWidth());
         // With the un-blend route configured, Off must leave the HUD in the game's image. Before
         // (Cort's p23896 run, 2026-11-05 05:38) Off only stopped un-blending, so the older native
@@ -1001,10 +1001,15 @@ void DrawLiveDlaa()
         EndRow();
         if(native_on&&unblend){
             const auto ub=na::j2::hud_unblend::GetStats();
-            char line[160];
-            std::snprintf(line,sizeof line,"Last frame: %u UI draws replayed; check %s (%u/1000 of covered pixels match).",ub.last_draws,
-                          ub.verdict==1?"agrees":ub.verdict==2?"disagrees, HUD left in the game image":"pending",ub.rate_id);
-            Hint(line);
+            const auto hud=na::j2::native_hud::GetStats();
+            if(!ub.current_picture)Hint("Finding the HUD source; it remains in the game image while discovery runs.");
+            else if(!hud.proof_tested)Hint("HUD separation active; waiting for the completed image check.");
+            else if(hud.last_draw_method==1)Hint("Last checked image: HUD separated and drawn at native resolution.");
+            else if(hud.last_draw_method==2)Hint("Last checked image: HUD protected; this draw needs the original game pixels.");
+            else {
+                char line[176];const unsigned percent=unsigned(hud.proof_matched*100/hud.proof_tested);
+                std::snprintf(line,sizeof line,"Last image check: %u%% match; changed regions keep the game's original pixels.",percent);Hint(line);
+            }
         } else if(native_on){
             const auto hud=na::j2::native_hud::GetStats();
             Hint(!hud.last_present_native?"Native HUD is not active this frame; text remains in the upscaled game image."
