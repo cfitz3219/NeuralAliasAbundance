@@ -19,6 +19,7 @@ The 5 s status samples stay. These additions sit next to them in the same per-pr
 | `swapchain` | every swap chain change | size, format, buffers, swap effect, flags, windowed, client size, refresh |
 | `identity` | first frame | API, exe, pid, ms from process start to first frame, adapter, vendor/device id, VRAM |
 | `xegtao`, `bloom`, `gpu_services` | reason text or error count changes | reason / errors |
+| `camera_cut` | the camera history is reset | why (no_history/gap/translation/rotation/fov/origin/restart_*), value, held, from_j1; `fov` = a zoom such as a scope |
 | `device_removed` | device removal detected | hr (the DRED file also starts with time and frame) |
 
 ## Periodic blocks

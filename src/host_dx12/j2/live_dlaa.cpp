@@ -2306,6 +2306,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         char merged[sizeof g.stats.recent_cuts];
         std::snprintf(merged, sizeof merged, "%s%s", one, g.stats.recent_cuts);
         std::memcpy(g.stats.recent_cuts, merged, sizeof merged);
+        // Event log: every camera cut, timed to the frame (a "fov" cut is a zoom, e.g. a scope).
+        na::eventlog::Emit("camera_cut", "why=%s value=%.4g held=%u from_j1=%u", why, cam.cut_value, held ? 1u : 0u, from_j1 ? 1u : 0u);
         if (tracker_restart) ++g.stats.cut_restarts;
         else if (cam.cut_reason == 2) ++g.stats.cut_gap;
         else if (cam.cut_reason >= 3 && cam.cut_reason <= 5) ++g.stats.cut_motion;
