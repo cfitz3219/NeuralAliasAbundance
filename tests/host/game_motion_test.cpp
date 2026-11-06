@@ -31,7 +31,7 @@ uint16_t half(float f)
     return static_cast<uint16_t>(sign | (exp << 10) | (mant >> 13));
 }
 float pattern(float x, float y) { return 0.5f + 0.25f * std::sin(x * 0.37f) * std::cos(y * 0.29f) + 0.2f * std::sin((x + 2 * y) * 0.11f); }
-bool on_block(float x, float y, float t) { const float ox = x - t * DX, oy = y - t * DY; return ox >= 40 && ox < 180 && oy >= 30 && oy < 120; // ~600 samples on the GPU's stride-4 grid (decider needs 256) }
+bool on_block(float x, float y, float t) { const float ox = x - t * DX, oy = y - t * DY; return ox >= 40 && ox < 180 && oy >= 30 && oy < 120; } // ~600 samples on the GPU's stride-4 grid (the decider needs 256)
 float picture(uint32_t x, uint32_t y, float t)
 {
     const float fx = static_cast<float>(x) + 0.5f, fy = static_cast<float>(y) + 0.5f;
