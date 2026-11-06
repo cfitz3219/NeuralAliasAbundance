@@ -64,6 +64,7 @@
 #include "host_dx12/j2/hud_unblend.hpp"
 #include "host_dx12/j2/projection_window.hpp"
 #include "host_dx12/scale/live_driver.hpp"
+#include "host_dx12/scale/native_control.hpp"
 #include "host_dx12/scale/auto_scene.hpp"
 #include "host_dx12/scale/settings_read_hook.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
@@ -1110,6 +1111,13 @@ void write_status_line()
                     (unsigned long long)automatic.rtv_heaps,(unsigned long long)automatic.dsv_heaps,(unsigned long long)automatic.heap_failures,automatic.heap_hr,automatic.failure_kinds);
                 if(heap_bytes>0)WriteFile(f,automatic_line,DWORD((std::min)(heap_bytes,int(sizeof automatic_line-1))),&written,nullptr);
             }
+        }
+        if(na::scale::native::Available()) {
+            const auto native=na::scale::native::GetStats();char native_line[640];
+            const int native_n=std::snprintf(native_line,sizeof native_line,"native_scale mode=%u controlled=%u confirmed=%u fraction=%.7f thread=%u ticks=%llu applies=%llu requests=%llu scene=%ux%u output=%ux%u evaluations=%llu reason=\"%s\"\r\n",
+                native.mode,native.controlled,native.confirmed,native.fraction,native.thread,(unsigned long long)native.ticks,(unsigned long long)native.applies,
+                (unsigned long long)native.requests,native.render_w,native.render_h,native.out_w,native.out_h,(unsigned long long)native.evaluation,native.reason);
+            if(native_n>0)WriteFile(f,native_line,DWORD((std::min)(native_n,int(sizeof native_line-1))),&written,nullptr);
         }
         if (na::scale::SliderRouteActive()) {
             // P4-4 slider route: what our mode did to the game's render scale (start-up and live).
@@ -3101,6 +3109,14 @@ void note_identity(IDXGISwapChain* sc, ID3D12CommandQueue* queue)
 void game_frame_boundary(ID3D12CommandQueue* queue)
 {
     na::j2::OnPresent(queue);
+    if(na::scale::native::Available()){
+        const auto scene=na::j2::GetStats();
+        na::scale::native::Observe(!na::j2::Paused()&&na::settings::EffectsReady(),scene.render_w?scene.render_w:scene.width,
+            scene.render_h?scene.render_h:scene.height,scene.out_w,scene.out_h,scene.frames,scene.active);
+        const auto native=na::scale::native::GetStats();
+        na::j2::SetNativeRenderExtent(native.controlled?native.render_w:0,native.controlled?native.render_h:0,native.out_w,native.out_h);
+        na::observe::SetSamplerMipBiasLive(native.controlled&&!na::j2::Paused()?na::j2::SmallMipBias(-1.f,native.fraction):0.f);
+    }
     na::settings::WatchChanges("code");
     na::scale::AutomaticScenePresent();
 }

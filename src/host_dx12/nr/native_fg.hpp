@@ -16,6 +16,7 @@ class RecordingLease {
 public:
     bool Ready(ID3D12CommandQueue* consumer) const;
     bool Retired() const;
+    bool Completed() const; // GPU finished its latest submission; Reset is not required
     bool SameRecording(const RecordingLease& other) const;
     explicit operator bool() const { return !!retired_; }
 private:

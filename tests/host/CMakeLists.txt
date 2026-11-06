@@ -201,6 +201,11 @@ if(NA_HAVE_NGX_SDK)
   na_host_test(dlss_backend_test SOURCES dlss_backend_test.cpp LIBS host_dlss dxgi)
   # J2 live DLAA end to end (discovery picks -> inserted DLAA list) on the fake runtime.
   na_host_test(j2_live_test SOURCES j2_live_test.cpp LIBS host_dx12 dxgi)
+  add_test(NAME host_j2_native_scale_test COMMAND j2_live_test --native-scale)
+  add_test(NAME host_j2_native_scale_merged_test COMMAND j2_live_test --native-scale-merged)
+  add_test(NAME host_j2_native_scale_graphics_test COMMAND j2_live_test --native-scale-graphics)
+  add_test(NAME host_j2_native_scale_graphics_merged_test COMMAND j2_live_test --native-scale-graphics-merged)
+  set_tests_properties(host_j2_native_scale_test host_j2_native_scale_merged_test host_j2_native_scale_graphics_test host_j2_native_scale_graphics_merged_test PROPERTIES TIMEOUT 120 LABELS "host;gpu")
   na_host_test(j2_rcas_test SOURCES j2_rcas_test.cpp LIBS host_dx12 dxgi)
   na_host_test(j2_nis_test SOURCES j2_nis_test.cpp LIBS host_dx12 dxgi)
   na_host_test(j2_hud_nis_test SOURCES j2_hud_nis_test.cpp LIBS host_dx12 dxgi)
@@ -382,6 +387,9 @@ na_host_test(tsushima_apply_test SOURCES tsushima_apply_test.cpp
   ${PROJECT_SOURCE_DIR}/src/host_dx12/adapters/tsushima/apply.cpp LIBS host_dx12)
 target_compile_definitions(tsushima_apply_test PRIVATE NA_TSUSHIMA_APPLY_TEST=1)
 na_host_test(tsushima_locator_test SOURCES tsushima_locator_test.cpp LIBS minhook)
+na_host_test(native_scale_test SOURCES native_scale_test.cpp
+  ${PROJECT_SOURCE_DIR}/src/host_dx12/scale/native_control.cpp LIBS host_scale)
+target_compile_definitions(native_scale_test PRIVATE NA_NATIVE_SCALE_TEST=1)
 na_host_test(unreal_apply_test SOURCES unreal_apply_test.cpp
   ${PROJECT_SOURCE_DIR}/src/host_dx12/adapters/unreal/screen_percentage.cpp LIBS host_dx12)
 target_compile_definitions(unreal_apply_test PRIVATE NA_UNREAL_APPLY_TEST=1)
