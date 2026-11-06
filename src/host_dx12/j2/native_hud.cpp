@@ -1688,6 +1688,7 @@ void ReportNativePictureResult(bool identity,uint32_t tested,uint32_t matched,fl
 }
 void ReportCanvasProbe(uint64_t source,uint64_t generation,bool identity,uint32_t tested,uint32_t matched,float error)
 {
+    if(hud_unblend::Enabled()&&hud_unblend::ReportProbe(source,generation,identity,tested,matched))return;
     std::lock_guard<std::mutex> lock(g_m);
     if(tested){g_stats.proof_tested=tested;g_stats.proof_matched=matched;g_stats.proof_maximum_error=error;}
     auto c=std::find_if(g_canvases.begin(),g_canvases.end(),[&](const auto& q){return q.id==source&&q.generation==generation;});

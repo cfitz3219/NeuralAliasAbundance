@@ -3057,6 +3057,7 @@ struct SmallRing {
     std::shared_ptr<na::donut::Frame> grade[kRing];
     std::shared_ptr<void> hud_owner[kRing];
     std::shared_ptr<na::j2::native_hud::Picture> hud_picture[kRing];
+    struct HudAssociation{uint64_t source=0,generation=0;} hud_association[kRing];
     bool native_hud_result[kRing]{};
     struct CanvasProbe {
         std::shared_ptr<na::j2::native_hud::Picture> picture;
@@ -3903,8 +3904,11 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
         if(g_small.hud_picture[j]&&g_small.hud_picture[j]->ProofAfterCompletion(identity,clean,&receipt)){
             if(g_small.native_hud_result[j])na::j2::native_hud::ReportNativePictureResult(identity,receipt.tested,receipt.matched,receipt.maximum_error);
             else na::j2::native_hud::ReportPictureResult(identity,clean,receipt.tested,receipt.matched,receipt.maximum_error);
+            const auto& association=g_small.hud_association[j];
+            if(association.source)na::j2::hud_unblend::ReportProbe(association.source,association.generation,identity,receipt.tested,receipt.picture_matched);
         }
         g_small.native_hud_result[j]=false;
+        g_small.hud_association[j]={};
         auto& probe=g_small.canvas_probe[j];
         if(probe.picture&&probe.picture->ProofAfterCompletion(identity,clean,&receipt))
             na::j2::native_hud::ReportCanvasProbe(probe.source,probe.generation,identity,receipt.tested,receipt.matched,receipt.maximum_error);
@@ -3913,6 +3917,7 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
     }
     g_small.hud_owner[si]=layer.owner;
     g_small.hud_picture[si]=layer_frame&&!replay?layer.picture:nullptr;
+    g_small.hud_association[si]={layer.association_source,layer.association_generation};
     if (g_small.owned) na::gpu::Collect();
     g_small.owned_recording=false;
     if(na::gpu::Enabled()){

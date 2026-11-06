@@ -55,15 +55,16 @@ bool agrees_at(float2 uv){
   if(!agrees(uint2(clamp(q+int2(x,y),int2(0,0),int2(w-1,h-1)))))return false;
  return true;
 }
-groupshared uint mismatch,matched,error_bits;
+groupshared uint mismatch,matched,error_bits,picture_matched;
 [numthreads(8,8,1)]void verify(uint3 id:SV_DispatchThreadID,uint gi:SV_GroupIndex){
- if(gi==0){mismatch=0;matched=0;error_bits=0;}GroupMemoryBarrierWithGroupSync();
+ if(gi==0){mismatch=0;matched=0;error_bits=0;picture_matched=0;}GroupMemoryBarrierWithGroupSync();
  if(id.x<w&&id.y<h){float3 a=frame[id.xy].rgb,b=full[id.xy].rgb;
   bool bad=any(!isfinite(a))||any(!isfinite(b))||any(abs(a-b)>tolerance*max(1,max(abs(a),abs(b))));
+  if(!bad)InterlockedAdd(picture_matched,1);
   float error=max(abs(a.r-b.r),max(abs(a.g-b.g),abs(a.b-b.b)));
   if(flags&64u){
    float3 base=scene[id.xy].rgb,lo=low0[id.xy].rgb,scale=(low1[id.xy].rgb-lo)/grey;
-   if(flags&2u)base=to_linear(base);
+   if(flags&256u)base=to_linear(base);
    float3 prediction=lo+scale*base;
    if(flags&2u)prediction=to_srgb(prediction);else if(!(flags&128u))prediction=saturate(prediction);
    float3 delta=abs(prediction-a);
@@ -76,7 +77,7 @@ groupshared uint mismatch,matched,error_bits;
   proof.Store(16+4*(id.y*w+id.x),bad?1u:0u);
   if(bad)InterlockedOr(mismatch,1);else InterlockedAdd(matched,1);
   if(isfinite(error))InterlockedMax(error_bits,asuint(error));}
- GroupMemoryBarrierWithGroupSync();if(gi==0){if(mismatch)proof.InterlockedOr(0,1);proof.InterlockedAdd(4,matched);proof.InterlockedMax(8,error_bits);}
+ GroupMemoryBarrierWithGroupSync();if(gi==0){if(mismatch)proof.InterlockedOr(0,1);proof.InterlockedAdd(4,matched);proof.InterlockedMax(8,error_bits);proof.InterlockedAdd(12,picture_matched);}
 }
 [numthreads(8,8,1)]void prepare(uint3 id:SV_DispatchThreadID){
  if(id.x>=w||id.y>=h)return;
@@ -92,7 +93,12 @@ groupshared uint mismatch,matched,error_bits;
    float3 a=n0[uint2(x,y)].rgb,b=(n1[uint2(x,y)].rgb-a)/grey;m=max(m,coverage(a,b));
   }
  }
- selected[id.xy]=clean?scene[id.xy]:frame[id.xy];
+ float4 input_scene=scene[id.xy];
+ if((flags&64u)&&clean){
+  if(flags&256u)input_scene.rgb=to_linear(input_scene.rgb);
+  if(flags&2u)input_scene.rgb=to_srgb(input_scene.rgb);
+ }
+ selected[id.xy]=clean?input_scene:frame[id.xy];
  mask[id.xy]=clean?0:m;
  if(!clean&&m>.01)motion[id.xy]=0;
 }
@@ -118,7 +124,7 @@ groupshared uint mismatch,matched,error_bits;
   }
   if(flags&4u)outc=lerp(outc,float3(1,0,1),.5*coverage(a,b));
  }
- result[id.xy]=float4(outc,s.a);
+ result[id.xy]=float4(outc,(flags&64u)?frame.SampleLevel(lin,uv,0).a:s.a);
 })";
 struct Program {
  ComPtr<ID3D12Device> dev;ComPtr<ID3D12RootSignature> root;ComPtr<ID3D12PipelineState> pso[3];ComPtr<ID3D12Resource> zero;UINT inc=0;
@@ -150,7 +156,7 @@ struct Picture::Impl {
  std::shared_ptr<Program> program;UINT w=0,h=0,ow=0,oh=0;DXGI_FORMAT source_format{};
  ComPtr<ID3D12Resource> scene,full,input,mask,proof,readback,result,frame,motion,n[2],low[2];ComPtr<ID3D12DescriptorHeap> heap;
  bool scene_ready=false,full_ready=false,scene_current=false,full_current=false,prepared=false,outputs_read=false;DXGI_FORMAT frame_view{},layer_view{},result_format{};
- bool proof_read=false;
+ bool proof_read=false,source_srgb=false;
  UINT descriptor_page=0; // pre-HUD work and final Present may both be in flight
  struct K {UINT w,h,ow,oh,flags;float grey,tolerance;UINT pad;} constants{};
  bool snapshot(ID3D12GraphicsCommandList* l,ID3D12Resource* src,D3D12_RESOURCE_STATES state,ComPtr<ID3D12Resource>& dst,bool& ready){
@@ -197,7 +203,7 @@ void Picture::BeginCycle(){
 }
 bool Picture::SnapshotScene(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES s){return p_->scene_current=p_->snapshot(l,r,s,p_->scene,p_->scene_ready);}
 bool Picture::SnapshotFull(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES s){return p_->full_current=p_->snapshot(l,r,s,p_->full,p_->full_ready);}
-void Picture::SetValidationLayers(ID3D12Resource* low,ID3D12Resource* high){p_->low[0]=low;p_->low[1]=high;}
+void Picture::SetValidationLayers(ID3D12Resource* low,ID3D12Resource* high,bool source_srgb){p_->low[0]=low;p_->low[1]=high;p_->source_srgb=source_srgb;}
 bool Picture::Probe(ID3D12GraphicsCommandList* l,ID3D12Resource* frame,DXGI_FORMAT view){
  auto& p=*p_;if(!l||!frame||!p.full_current)return false;
  const auto d=frame->GetDesc();if(d.Width!=p.w||d.Height!=p.h||
@@ -224,7 +230,7 @@ bool Picture::Prepare(ID3D12GraphicsCommandList* l,ID3D12Resource* frame,DXGI_FO
   if(ld.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||ld.Width!=p.w||ld.Height!=p.h||ld.DepthOrArraySize!=1||ld.MipLevels!=1||
      ld.SampleDesc.Count!=1||TypelessOf(ld.Format)!=TypelessOf(lv))return false;}
  const bool floating=fv==DXGI_FORMAT_R16G16B16A16_FLOAT||fv==DXGI_FORMAT_R32G32B32A32_FLOAT;
- p.constants={p.w,p.h,p.ow,p.oh,(clean?1u:0u)|(srgb?2u:0u)|(tint?4u:0u)|(model?64u:0u)|(floating?128u:0u),grey,tolerance,0};
+ p.constants={p.w,p.h,p.ow,p.oh,(clean?1u:0u)|(srgb?2u:0u)|(tint?4u:0u)|(model?64u:0u)|(floating?128u:0u)|(p.source_srgb?256u:0u),grey,tolerance,0};
  if(p.outputs_read){move(l,p.input.Get(),S,U);move(l,p.mask.Get(),S,U);}
  move(l,n0,R,S);move(l,n1,R,S);
  if(model){move(l,p.low[0].Get(),R,S);move(l,p.low[1].Get(),R,S);}
@@ -244,7 +250,7 @@ ID3D12Resource* Picture::Full()const{return p_->full.Get();}
 bool Picture::ProofAfterCompletion(bool& identity,bool& clean,ProofReceipt* receipt){
  auto& p=*p_;if(!p.prepared||p.proof_read)return false;void* data=nullptr;D3D12_RANGE range{0,16};
  if(FAILED(p.readback->Map(0,&range,&data)))return false;UINT values[4]{};std::memcpy(values,data,16);const UINT flags=values[0];
- if(receipt){receipt->tested=p.w*p.h;receipt->matched=values[1];std::memcpy(&receipt->maximum_error,values+2,4);}
+ if(receipt){receipt->tested=p.w*p.h;receipt->matched=values[1];receipt->picture_matched=values[3];std::memcpy(&receipt->maximum_error,values+2,4);}
  D3D12_RANGE none{};p.readback->Unmap(0,&none);
  identity=flags==0;clean=identity&&(p.constants.flags&9u)!=0;p.proof_read=true;return true;
 }

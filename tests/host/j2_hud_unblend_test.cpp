@@ -4,11 +4,12 @@
 //  1. The UI draws are left in the canvas (the game's picture is complete) AND replayed into
 //     the render-size layers L0/L1 and the native layers N0/N1; the game's targets, viewport
 //     and scissor come back for its own draw.
-//  2. The un-blend pass recovers the scene under the semi-transparent UI from the final
-//     picture alone; a fully covered pixel keeps the picture. The self-check counts agree.
+//  2. The original pre-HUD scene is captured, including behind opaque text, and the GPU
+//     verifies both final-picture identity and the actual per-pixel blend model.
 //  3. The native composite over the scene matches the same UI drawn directly at native size.
-//  4. An opaque full-screen draw after the UI restarts the layers; the verdict logic holds
-//     the layers back after a mismatching window and re-engages after a matching one.
+//  4. Actual full clears invalidate previous contributions; a viewport is not pixel coverage.
+//  5. Mixed world/HUD batches rebind their real world input. Hidden final dependencies are
+//     learned from completed GPU pixels and checked again on every enhanced frame.
 #include "test_support.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/native_hud.hpp"
@@ -198,9 +199,7 @@ int end_to_end(test::Device& d)
         l->OMSetRenderTargets(1, &rtv[1], FALSE, nullptr);
         l->RSSetViewports(1, &full);
         l->RSSetScissorRects(1, &all);
-        l->SetPipelineState(pso[0].Get());
-        l->SetGraphicsRoot32BitConstants(0, 4, kScene, 0);
-        l->DrawInstanced(3, 1, 0, 0); // the scene: a full-screen opaque pass
+        l->ClearRenderTargetView(rtv[1],kScene,0,nullptr); // known complete scene, not guessed vertex coverage
         for (int i = 0; i < 3; ++i) {
             const Hud& h = kHud[i];
             const D3D12_RECT r{h.rect[0], h.rect[1], h.rect[2], h.rect[3]};
@@ -209,10 +208,7 @@ int end_to_end(test::Device& d)
             l->SetGraphicsRoot32BitConstants(0, 4, h.color, 0);
             l->DrawInstanced(3, 1, 0, 0);
             if (cover_after_ui && i == 0) { // a pause backdrop: covers everything drawn so far
-                l->RSSetScissorRects(1, &all);
-                l->SetPipelineState(pso[0].Get());
-                l->SetGraphicsRoot32BitConstants(0, 4, kScene, 0);
-                l->DrawInstanced(3, 1, 0, 0);
+                l->ClearRenderTargetView(rtv[1],kScene,0,nullptr);
             }
         }
         if (canvas_overlay) { // a blended full-screen triangle (how a UI canvas is laid on): UI, replayed
@@ -245,7 +241,7 @@ int end_to_end(test::Device& d)
     std::printf("%s\n", ub::StatusLine().c_str());
     CHECK(st.replayed == 4);
     CHECK(st.blended == 2);
-    CHECK(st.scene == 1);
+    CHECK(st.scene == 0);
     CHECK(st.forwarded == 0 && st.other_target == 0); // unrelated target has independent layers
     CHECK(st.world == 0);
     CHECK(st.restore_failed == 0);
@@ -416,12 +412,12 @@ int end_to_end(test::Device& d)
     CHECK(dev->GetDeviceRemovedReason() == S_OK);
     st = ub::GetStats();
     CHECK(st.replayed == 8);
-    CHECK(st.covered == 1);
-    CHECK(st.scene == 3);
+    CHECK(st.cleared_after == 1);
+    CHECK(st.scene == 0);
     nh::Layer second;
     CHECK(nh::TakeFrame(proxy.Get(), RW, RH, OW, OH, &second, d.queue.Get()));
     st = ub::GetStats();
-    CHECK(st.last_draws == 2 && st.last_covered == 1);
+    CHECK(st.last_draws == 2 && st.last_covered == 0);
     CHECK(st.hud_frames == 2 && st.composed == 2);
     // The verdict holds the layers back (compose=false) while the self-check reports a mismatch.
     for (int i = 0; i < 30; ++i) ub::ReportCheck(1000, 100, 0, 100, 0);
@@ -445,7 +441,7 @@ int end_to_end(test::Device& d)
         submit(d.queue.Get(), 1, lists);
         d.WaitIdle();
         CHECK(dev->GetDeviceRemovedReason() == S_OK);
-        CHECK(ub::GetStats().replayed == replayed0 + 4);
+        CHECK(ub::GetStats().replayed == replayed0 + 5);
         CHECK(ub::GetStats().cover_blend == cover0 + 1);
         nh::Layer fourth;
         CHECK(nh::TakeFrame(proxy.Get(), RW, RH, OW, OH, &fourth, d.queue.Get()));
@@ -474,7 +470,7 @@ int end_to_end(test::Device& d)
         const ub::Stats after = ub::GetStats();
         CHECK(after.retargeted == before.retargeted);
         CHECK(after.other_target == before.other_target);
-        CHECK(after.replayed == before.replayed + 5);
+        CHECK(after.replayed == before.replayed + 6);
         nh::Layer fifth;
         CHECK(nh::TakeFrame(proxy.Get(), RW, RH, OW, OH, &fifth, d.queue.Get()));
         CHECK(ub::GetStats().last_draws == 3);
@@ -548,6 +544,128 @@ int end_to_end(test::Device& d)
     ub::SetEnabled(true);
     return 0;
 }
+
+int mixed_canvas(test::Device& d)
+{
+    // One batch copies the world and writes opaque HUD at the same time.
+    // Output alpha is always1 with SRC_ALPHA/INV_SRC_ALPHA enabled: the old
+    // two-background replays both contained the world (L0 == L1 everywhere).
+    auto* dev=d.device.Get();
+    auto world=test::CreateTexture(dev,RW,RH,F,RTS,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    auto canvas=test::CreateTexture(dev,RW,RH,F,RTS,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    auto output=test::CreateTexture(dev,RW,RH,F,RTS,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    REQUIRE(world&&canvas&&output);
+    ComPtr<ID3D12DescriptorHeap> rtvs,views;
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,3,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
+    REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&rtvs))));
+    auto w=rtvs->GetCPUDescriptorHandleForHeapStart(),c=w,o=w;
+    c.ptr+=dev->GetDescriptorHandleIncrementSize(hd.Type);o.ptr+=2*dev->GetDescriptorHandleIncrementSize(hd.Type);
+    dev->CreateRenderTargetView(world.Get(),nullptr,w);dev->CreateRenderTargetView(canvas.Get(),nullptr,c);dev->CreateRenderTargetView(output.Get(),nullptr,o);
+    hd={D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,2,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
+    REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&views))));
+    auto handle=views->GetCPUDescriptorHandleForHeapStart();dev->CreateShaderResourceView(world.Get(),nullptr,handle);
+    handle.ptr+=dev->GetDescriptorHandleIncrementSize(hd.Type);dev->CreateShaderResourceView(canvas.Get(),nullptr,handle);
+    constexpr char shader[]=R"(
+Texture2D<float4> image:register(t0);SamplerState s:register(s0);
+struct V{float4 p:SV_Position;float2 uv:TEXCOORD;};
+V vs(uint id:SV_VertexID){V v;v.uv=float2(((id%3)<<1)&2,(id%3)&2);v.p=float4(v.uv*float2(2,-2)+float2(-1,1),.5,1);return v;}
+float4 ps(V v):SV_Target{float3 a=image.SampleLevel(s,v.uv,0).rgb;
+ if(v.uv.x>.25&&v.uv.x<.5&&v.uv.y>.25&&v.uv.y<.75)a=float3(.9,.1,.2);return float4(a,1);}
+float4 copy(V v):SV_Target{return image.SampleLevel(s,v.uv,0);})";
+    ComPtr<ID3DBlob> vs,ps,copy,code,error;
+    REQUIRE(SUCCEEDED(D3DCompile(shader,sizeof shader-1,nullptr,nullptr,nullptr,"vs","vs_5_0",0,0,&vs,&error)));
+    REQUIRE(SUCCEEDED(D3DCompile(shader,sizeof shader-1,nullptr,nullptr,nullptr,"ps","ps_5_0",0,0,&ps,&error)));
+    REQUIRE(SUCCEEDED(D3DCompile(shader,sizeof shader-1,nullptr,nullptr,nullptr,"copy","ps_5_0",0,0,&copy,&error)));
+    D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV,1,0,0,0};
+    D3D12_ROOT_PARAMETER param{};param.ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;param.DescriptorTable={1,&range};
+    D3D12_STATIC_SAMPLER_DESC sampler{};sampler.Filter=D3D12_FILTER_MIN_MAG_MIP_POINT;
+    sampler.AddressU=sampler.AddressV=sampler.AddressW=D3D12_TEXTURE_ADDRESS_MODE_CLAMP;sampler.MaxLOD=D3D12_FLOAT32_MAX;
+    D3D12_ROOT_SIGNATURE_DESC desc{1,&param,1,&sampler,D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&desc,D3D_ROOT_SIGNATURE_VERSION_1,&code,&error)));
+    ComPtr<ID3D12RootSignature> root;REQUIRE(SUCCEEDED(dev->CreateRootSignature(0,code->GetBufferPointer(),code->GetBufferSize(),IID_PPV_ARGS(&root))));
+    auto ui=pipeline(dev,root.Get(),vs.Get(),ps.Get(),Blend::Over),tail=pipeline(dev,root.Get(),vs.Get(),copy.Get(),Blend::Opaque);
+    REQUIRE(ui&&tail);
+    nh::Layer unused;nh::TakeFrame(output.Get(),RW,RH,OW,OH,&unused,d.queue.Get());
+    test::List game;REQUIRE(game.Create(dev));
+    REQUIRE(SUCCEEDED(game.list->Close())&&SUCCEEDED(game.list->Reset(game.alloc.Get(),nullptr)));
+    auto* l=game.list.Get();const float black[4]={0,0,0,0};
+    l->ClearRenderTargetView(w,kScene,0,nullptr);l->ClearRenderTargetView(c,black,0,nullptr);
+    auto b=test::Transition(world.Get(),RTS,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);l->ResourceBarrier(1,&b);
+    l->SetGraphicsRootSignature(root.Get());ID3D12DescriptorHeap* heaps[]={views.Get()};l->SetDescriptorHeaps(1,heaps);
+    auto table=views->GetGPUDescriptorHandleForHeapStart();l->SetGraphicsRootDescriptorTable(0,table);
+    l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);l->OMSetRenderTargets(1,&c,FALSE,nullptr);
+    const D3D12_VIEWPORT viewport{0,0,float(RW),float(RH),0,1};const D3D12_RECT scissor{0,0,LONG(RW),LONG(RH)};
+    l->RSSetViewports(1,&viewport);l->RSSetScissorRects(1,&scissor);l->SetPipelineState(ui.Get());
+    l->DrawInstanced(18,1,0,0); // batched world + HUD, not a six-vertex heuristic
+    b=test::Transition(canvas.Get(),RTS,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);l->ResourceBarrier(1,&b);
+    table.ptr+=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);l->SetGraphicsRootDescriptorTable(0,table);
+    l->OMSetRenderTargets(1,&o,FALSE,nullptr);l->SetPipelineState(tail.Get());l->DrawInstanced(3,1,0,0);
+    REQUIRE(SUCCEEDED(l->Close()));ID3D12CommandList* lists[]={l};submit(d.queue.Get(),1,lists);d.WaitIdle();
+    nh::Layer separated;const bool found=nh::TakeFrame(output.Get(),RW,RH,OW,OH,&separated,d.queue.Get());
+    std::printf("mixed selection: %s removed=%08lx\n",ub::StatusLine().c_str(),dev->GetDeviceRemovedReason());
+    REQUIRE(found);
+    REQUIRE(separated.picture&&separated.clean_allowed);
+    std::vector<uint8_t> actual,low,high,source;
+    REQUIRE(readback(d,output.Get(),RTS,4,actual)&&readback(d,separated.l0,RTS,4,low)&&readback(d,separated.l1,RTS,4,high)&&
+            readback(d,separated.picture->Scene(),NPSR,4,source));
+    int maximum=0;
+    for(UINT y=0;y<RH;++y)for(UINT x=0;x<RW;++x)for(int ch=0;ch<3;++ch){
+        CHECK(std::abs(at(source,RW,x,y,ch)-int(std::lround(kScene[ch]*255)))<=1);
+        const float prediction=at(low,RW,x,y,ch)+(at(high,RW,x,y,ch)-at(low,RW,x,y,ch))*kScene[ch]/nh::GreyFor(F);
+        maximum=std::max(maximum,int(std::lround(std::abs(prediction-at(actual,RW,x,y,ch)))));
+    }
+    CHECK(maximum<=2);
+    CHECK(at(high,RW,0,0,0)-at(low,RW,0,0,0)>120); // world is destination-dependent now
+    CHECK(at(high,RW,20,16,0)==at(low,RW,20,16,0)); // actual opaque HUD remains independent
+    std::printf("mixed world/HUD batch and opaque final draw: prediction %d/255; substitutions=%llu\n",maximum,(unsigned long long)ub::GetStats().world_substitutions);
+    for(unsigned frame=0;frame<3;++frame){
+        REQUIRE(SUCCEEDED(game.alloc->Reset())&&SUCCEEDED(l->Reset(game.alloc.Get(),nullptr)));
+        b=test::Transition(world.Get(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE|NPSR);l->ResourceBarrier(1,&b);
+        std::swap(b.Transition.StateBefore,b.Transition.StateAfter);l->ResourceBarrier(1,&b);
+        b=test::Transition(canvas.Get(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,RTS);l->ResourceBarrier(1,&b);
+        l->ClearRenderTargetView(c,black,0,nullptr);
+        l->SetGraphicsRootSignature(root.Get());l->SetDescriptorHeaps(1,heaps);l->SetGraphicsRootDescriptorTable(0,views->GetGPUDescriptorHandleForHeapStart());
+        l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);l->OMSetRenderTargets(1,&c,FALSE,nullptr);
+        l->RSSetViewports(1,&viewport);l->RSSetScissorRects(1,&scissor);l->SetPipelineState(ui.Get());l->DrawInstanced(18,1,0,0);
+        b=test::Transition(canvas.Get(),RTS,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);l->ResourceBarrier(1,&b);
+        { // Simulate an opaque final dependency unavailable to SRV reflection.
+            // The test's own exact copy is deliberately unobserved. Discovery
+            // must use GPU pixels, never its hidden recording order.
+            const na::observe::HostWorkScope host;
+            D3D12_RESOURCE_BARRIER copy_barriers[]={test::Transition(canvas.Get(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_SOURCE),
+                                                  test::Transition(output.Get(),RTS,D3D12_RESOURCE_STATE_COPY_DEST)};
+            l->ResourceBarrier(2,copy_barriers);l->CopyResource(output.Get(),canvas.Get());
+            for(auto& t:copy_barriers)std::swap(t.Transition.StateBefore,t.Transition.StateAfter);l->ResourceBarrier(2,copy_barriers);
+        }
+        const auto closed=l->Close();
+        if(FAILED(closed)){
+            ComPtr<ID3D12InfoQueue> messages;dev->QueryInterface(IID_PPV_ARGS(&messages));
+            if(messages)for(UINT64 m=0;m<messages->GetNumStoredMessagesAllowedByRetrievalFilter();++m){
+                SIZE_T count=0;messages->GetMessage(m,nullptr,&count);std::vector<uint8_t> memory(count);auto* message=reinterpret_cast<D3D12_MESSAGE*>(memory.data());
+                if(SUCCEEDED(messages->GetMessage(m,message,&count))&&message->Severity<=D3D12_MESSAGE_SEVERITY_ERROR)std::printf("mixed DX12 error: %s\n",message->pDescription);
+            }
+        }
+        REQUIRE(SUCCEEDED(closed));submit(d.queue.Get(),1,lists);d.WaitIdle();
+        nh::Layer learned;const bool selected=nh::TakeFrame(output.Get(),RW,RH,OW,OH,&learned,d.queue.Get());
+        if(frame<2){
+            CHECK(!selected);REQUIRE(learned.probe);
+            test::List verify;REQUIRE(verify.Create(dev));const na::observe::HostWorkScope host;
+            b=test::Transition(output.Get(),RTS,NPSR);verify.list->ResourceBarrier(1,&b);
+            REQUIRE(learned.probe->Probe(verify.list.Get(),output.Get(),F));
+            std::swap(b.Transition.StateBefore,b.Transition.StateAfter);verify.list->ResourceBarrier(1,&b);
+            REQUIRE(SUCCEEDED(verify.list->Close()));ID3D12CommandList* verification[]={verify.list.Get()};submit(d.queue.Get(),1,verification);d.WaitIdle();
+            bool same=false,clean=false;nh::Picture::ProofReceipt receipt;REQUIRE(learned.probe->ProofAfterCompletion(same,clean,&receipt));
+            CHECK(same&&receipt.matched==RW*RH);
+            nh::ReportCanvasProbe(learned.probe_source,learned.probe_generation,same,receipt.tested,receipt.matched,receipt.maximum_error);
+        }else{
+            REQUIRE(selected&&learned.picture&&learned.clean_allowed);
+            CHECK(learned.association_source==na::observe::IdOf(canvas.Get()));
+        }
+    }
+    CHECK(ub::GetStats().learned_frames>0);
+    std::printf("hidden final dependency: discovered from completed GPU pixels, selected after two matching frames\n");
+    return 0;
+}
 } // namespace
 
 int main()
@@ -562,9 +680,10 @@ int main()
     if (verdict_logic()) return 1;
     test::Device d;
     if (!test::CreateDevice(d)) return test::SkipNoDevice("j2_hud_unblend_test");
+    struct ExitObserver {~ExitObserver(){na::observe::SetProcessExiting();}} exit_observer;
     ComPtr<ID3D12InfoQueue> info;
     d.device->QueryInterface(IID_PPV_ARGS(&info));
-    if (end_to_end(d)) return 1;
+    if (end_to_end(d)||mixed_canvas(d)) return 1;
     if (info) {
         UINT errors = 0;
         for (UINT64 i = 0; i < info->GetNumStoredMessagesAllowedByRetrievalFilter(); ++i) {

@@ -46,6 +46,7 @@ bool TakeFrame(ID3D12Resource* frame, uint32_t rw, uint32_t rh, uint32_t ow, uin
 // Completed GPU self-check of one frame (PresentUpscale, after its fence): UI pixels, pixels
 // the UI covers fully, and of those how many equal L0 as stored / sRGB-decoded / sRGB-encoded.
 void ReportCheck(uint32_t ui_px, uint32_t opaque, uint32_t match_id, uint32_t match_dec, uint32_t match_enc);
+bool ReportProbe(uint64_t source,uint64_t generation,bool identity,uint32_t tested,uint32_t matched);
 
 struct Stats {
     uint64_t frames = 0, hud_frames = 0, composed = 0, held = 0;
@@ -53,6 +54,9 @@ struct Stats {
     uint64_t opaque_blend = 0, irreversible = 0; // full-screen draws with blending on but DestBlend ZERO; draws whose blend cannot be undone
     uint64_t other_target = 0, retargeted = 0; // historical counters; association no longer uses this heuristic
     uint64_t copies = 0, copied_layers = 0, unsupported_copies = 0;
+    uint64_t world_substitutions = 0;
+    uint64_t draw_handoffs = 0;
+    uint64_t probes = 0, proved = 0, probe_mismatch = 0, learned_frames = 0;
     uint64_t requested_target = 0, matched_target = 0;
     uint32_t pending_recordings = 0;
     bool current_picture = false;
