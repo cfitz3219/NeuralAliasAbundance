@@ -336,6 +336,8 @@ private:
 // Writes into a CPU-visible (upload) buffer of the game, e.g. J1 jittering the
 // camera constants of a submission before it is forwarded. Returns bytes written.
 uint32_t WriteBuffer(na_object_id res, uint64_t offset, const void* src, uint32_t n);
+// Read-only lookup over recorded creations: 2D textures with one of `formats` and exactly w x h.
+uint32_t FindTextures(const uint32_t* formats, uint32_t format_count, uint32_t w, uint32_t h, na_object_id* out, uint32_t max);
 ID3D12Resource* AcquireResource(na_object_id id);                         // AddRef'd, or null
 // Current discovery picks (written by the discovery adapter, read by J2).
 void SetLiveSelection(uint64_t depth, uint64_t color);

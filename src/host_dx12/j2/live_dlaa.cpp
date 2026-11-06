@@ -2688,6 +2688,34 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         ci.entry_pipeline=g.capture_entry.pipeline;ci.entry_root=g.capture_entry.root;
         ci.entry_destination=g.capture_entry.destination;ci.entry_operation=g.capture_entry.operation;
         ci.entry_barrier=g.capture_entry.barrier;ci.entry_kind=static_cast<uint32_t>(g.capture_entry.op);
+        // Game velocity candidates (Cort 2026-11-06, menu smear): two-channel float/norm
+        // textures with exactly the scene's extent, copied in their known state so a capture
+        // shows whether the game writes per-pixel motion (vectors on movers, ~0 on walls).
+        ComPtr<ID3D12Resource> velocity_hold[2];
+        {
+            static const uint32_t kVelocityFormats[] = {
+                DXGI_FORMAT_R16G16_TYPELESS, DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R16G16_UNORM,
+                DXGI_FORMAT_R16G16_SNORM}; // not RG32: J2's own motion and flow planes use it
+            static const char* const kVelocityNames[2] = {"velocity_candidate_0", "velocity_candidate_1"};
+            na_object_id ids[6] = {};
+            const uint32_t found_n = na::observe::FindTextures(kVelocityFormats, 4, w, h, ids, 6);
+            uint32_t used = 0;
+            for (uint32_t i = 0; i < found_n && used < 2 && cp.extra_count < na::capture::j2::kMaxExtra; ++i) {
+                uint32_t st = 0;
+                const auto lookup = inl ? na::observe::ListStateSub(inl, ids[i], 0, &st) : na::observe::StateLookup::Absent;
+                const bool known = lookup == na::observe::StateLookup::Known ||
+                    (lookup == na::observe::StateLookup::Absent && na::observe::KnownSubStateOnQueueNow(g.queue.Get(), ids[i], 0, &st));
+                if (!known) { ++g.stats.velocity_capture_unknown_state; continue; }
+                ID3D12Resource* r = na::observe::AcquireResource(ids[i]);
+                if (!r) continue;
+                velocity_hold[used].Attach(r);
+                if (r->GetDesc().SampleDesc.Count != 1 || r == g.motion.Get()) continue;
+                cp.extra[cp.extra_count++] = {kVelocityNames[used], r, static_cast<D3D12_RESOURCE_STATES>(st)};
+                ++used;
+                ++g.stats.velocity_captured;
+            }
+            g.stats.velocity_candidates = found_n;
+        }
         pending.capture = na::capture::j2::RecordEvaluation(l, cp, ci);
     }
     if (evaluated) {
