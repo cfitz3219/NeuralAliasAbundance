@@ -2822,7 +2822,7 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
             // operation, so the boundary matcher below places DLAA as it did before entries.
             // The learned scene boundary: the previous frame's shape, and every recent shape
             // that got DLAA (the game alternates shapes; see delivered_shapes).
-            auto judge_shape=[&](const LearnedInsertion& L,bool& writer_only){
+            auto judge_shape=[&](const State::LearnedInsertion& L,bool& writer_only){
                 writer_only=false;
                 const bool same_target=L.decision.final_candidate && L.color==color_id && L.depth==depth_id &&
                     current.destination==L.decision.destination && current.pipeline==L.decision.pipeline;
@@ -4856,7 +4856,7 @@ void OnPresent(ID3D12CommandQueue* queue)
         if (g.insertion_frame.color) {
             g.insertion_learned = g.insertion_frame;
             if (g.submitted_frame == g.frame) { // a shape that got DLAA: remember it (most recent first, no duplicates)
-                const auto same = [](const LearnedInsertion& a, const LearnedInsertion& b) {
+                const auto same = [](const State::LearnedInsertion& a, const State::LearnedInsertion& b) {
                     return a.color == b.color && a.depth == b.depth && a.decision.final_candidate == b.decision.final_candidate &&
                            a.decision.final_transition == b.decision.final_transition && a.decision.boundary_writer == b.decision.boundary_writer &&
                            a.decision.writer_occurrence == b.decision.writer_occurrence && a.decision.destination == b.decision.destination &&
