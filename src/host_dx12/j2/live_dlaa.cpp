@@ -5,6 +5,7 @@
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/camera_interloper.hpp"
 #include "host_dx12/j2/game_motion.hpp"
+#include <unordered_map>
 #include "host_dx12/capture/capture_session.hpp"
 #include "host_dx12/j2/msaa_resolve.hpp"
 #include "host_dx12/j2/nis_sharpen.hpp"
@@ -2914,7 +2915,27 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
                 // batch up to the scene list, then the state carried in). p43052: the queue-only lookup
                 // never knew it (the game writes it earlier in the same batch).
                 const bool known = state_of(ids[i], 0, &st);
-                if (!known) { ++g.stats.velocity_capture_unknown_state; continue; }
+                if (!known) {
+                    ++g.stats.velocity_capture_unknown_state;
+                    // p19692: still never known. Say why, once per texture (every 600th after that).
+                    static std::unordered_map<uint64_t, uint32_t> told;
+                    if (told[ids[i]]++ % 600 == 0) {
+                        char why[400] = {};
+                        na::observe::DescribeStateEvidence(inl ? static_cast<ID3D12CommandList*>(inl) : lists[scene], ids[i], 0, why, sizeof why);
+                        uint32_t qs = 0, ss = 0;
+                        const bool on_queue = na::observe::KnownSubStateOnQueueNow(g.queue.Get(), ids[i], 0, &qs);
+                        const bool in_sub = na::observe::KnownSubStateInCurrentSubmission(ids[i], 0, &ss);
+                        char per_list[48] = {}; // batch lists 0..scene: K known, A absent, U unavailable
+                        for (UINT k = 0; k <= scene && k < sizeof per_list - 1; ++k) {
+                            uint32_t ks = 0;
+                            const auto ev = na::observe::ListStateSub(lists[k], ids[i], 0, &ks);
+                            per_list[k] = ev == na::observe::StateLookup::Known ? 'K' : ev == na::observe::StateLookup::Absent ? 'A' : 'U';
+                        }
+                        na::eventlog::Emit("velocity_state", "id=%llu inline=%d scene=%u lists=%s queue_known=%d(0x%x) submission_known=%d(0x%x) evidence=%s",
+                                           static_cast<unsigned long long>(ids[i]), inl ? 1 : 0, scene, per_list, on_queue ? 1 : 0, qs, in_sub ? 1 : 0, ss, why);
+                    }
+                    continue;
+                }
                 ID3D12Resource* r = na::observe::AcquireResource(ids[i]);
                 if (!r) continue;
                 velocity_hold[used].Attach(r);
