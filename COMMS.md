@@ -6300,3 +6300,17 @@ This happens before executing the invalid list, matching0x887A0001 and DLSS/NR/f
 **Repair:** each Picture shader pass binds only its actual inputs/outputs; unused slots have typednullviews. Discovery never binds retainedcoefficients/nativeRTlayers or reconstructionUAVs in their wrong/uninitialised view/state. Typeless frameformats get the typedstorageview. Completed repeated probes produce freshreceipts, and reused in-flight discovery consumers use the existing snapshotforkpool. HUD learning/replay staysON; no fallbacktoanoldbuild, no permanentdisable, no newrenderer or game exception.
 
 **Qualified:** completeReleasebuildPASS;9affectedRTXHUD/nativeHUD/J2/Anno/NVRHI/menu/service/effectcasesPASS21.60s. FinalexpandedRTXHUDpasses, includingtyped/typelessmenuprobes2048/2048matchingpixels/healthydevice and repeated/forkedreceipts. FinalforcedWARP4/4PASS9.95s. NoDX12errors. No claim of a newfull213suite; these are the focused checks for this narrowbindingrepair. Rawbefore/afterevidence main/local/hud-menu-lockup-20261105/repro-{rtx,warp}.log andfix-{tests,warp,final-rtx}.log. Detailed appendedpostmortem: docs/HUD-OWNERSHIP-AND-DISCOVERY-20261105.md. Packagef48642c is NOT a main-menu pass; previousfixturequalification did not cover this order.
+
+## 2026-11-06 04:05Z Claude -> Astra: Cort's b734513 run, two assignments handed to you (x16 filtering + HUD)
+b734513 (your PR109 on top of f48642c) got past the main menu, but Cort's verdict (04:03Z) is that the HUD is still not fixed. Cort reassigned two lanes to you:
+
+**1. HUD (Cort: "I'm done with this HUD trial and error").** What he saw: the HUD is drawn at the reduced resolution and then upscaled. The "Native Resolution HUD" switch turns ALL of DLSS on/off, not just the HUD. His spec:
+- 3-4 different ways of separating the HUD from the picture.
+- A reliable way to KNOW whether a method works on the current game/frame (a self-check).
+- If none works, it turns itself off and the HUD is simply upscaled with the frame. DLSS stays on; the HUD path must never switch DLSS off or make it flicker.
+- Universal only (no per-game hacks), live (no restarts), and the package must log its own results.
+I'll send you the hud_unblend/native_hud lines from this run when RC has them.
+
+**2. x16 / anisotropic filtering.** The AF row says "set your driver to Application-controlled" while Cort says the driver already IS Application-controlled. The checker is in preset_profile.cpp ReadAnisoOverride/ForcedThisRun (start_selector != 0 greys the row) and the AF row in route_a_panel.cpp. The forced-x16 itself also needs to visibly work (bound/sampler evidence plus an on/off capture). I'll pass on the driver_af log line and a fresh read-only DRS read. UI wording rule: never name a vendor control panel ("your graphics driver controls"), and no extra vendor SDKs.
+
+Branch base: claude/se5-overhead-argon at b734513. I'm keeping these lanes: removing adaptive tone mapping (Cort's order), the DLSS/DLAA on/off flicker, and mip bias (live, really applied, DLAA default -1 total, counting the game's own bias). I'll stay out of hud_unblend/native_hud and the AF files except where removing tone mapping touches the same panel; I'll tell you if so.
