@@ -18,8 +18,14 @@
 #include "host_dx12/dlss/dlss_backend.hpp"
 #include "host_dx12/host_observe.h"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/j2/j2_flow.hpp"
+#include "host_dx12/j2/compute_flow.hpp"
+#include "host_dx12/ffx_flow/ffx_flow_shaders.hpp"
+#include "host_dx12/nr/nr_pass.hpp"
+#include "host_dx12/nr/native_fg.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/observe/producers.hpp"
+#include "host_dx12/overlay/submission_tracking.hpp"
 
 #include <d3dcompiler.h>
 #include <array>
@@ -58,16 +64,17 @@ std::string ReadText(const std::wstring& path)
 void __stdcall Forward(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists)
 {
     g_forwarded.assign(lists, lists + n);
+    na::nr::native::Submission recording(q,n,lists); // same lifetime wrapper as production ForwardThroughNr
     q->ExecuteCommandLists(n, lists); // queue not hooked in this test: the plain runtime call
 }
 // The overlay's sequence around a game submission.
 void Submit(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists, bool j2)
 {
     const na::observe::ExecuteToken t = na::observe::ExecuteBegin(q, n, lists);
-    na::dlss::BeforeExecute(q, n, lists); // as the overlay: DLSS completion tracking of inline recordings
+    na::overlay::BeforeGameSubmission(q,n,lists);
     if (j2) na::j2::Execute(q, n, lists, &Forward);
     else q->ExecuteCommandLists(n, lists);
-    na::dlss::OnExecuted(q, n, lists);
+    na::overlay::AfterGameSubmission(q,n,lists);
     na::observe::ExecuteEnd(t, q, n, lists);
 }
 using M = std::array<double, 16>;
@@ -113,6 +120,43 @@ void Store(uint8_t* dst, const M& m)
 {
     for (int i = 0; i < 16; ++i) { const float f = static_cast<float>(m[i]); std::memcpy(dst + i * 4, &f, 4); }
 }
+// Test-only GPU consumer/readback. It observes the lens at this submission,
+// before a later camera upload could repair it and conceal the mismatch.
+int ProjectionShift(test::Device& d, ID3D12Resource* lens, UINT w, UINT h, bool column, float shift[2])
+{
+    const na::observe::HostWorkScope host;
+    auto* dev = d.device.Get();
+    D3D12_ROOT_PARAMETER params[2]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    D3D12_ROOT_SIGNATURE_DESC rd{2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    test::ComPtr<ID3DBlob> blob, err, cs;
+    REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err)));
+    test::ComPtr<ID3D12RootSignature> root;
+    REQUIRE(SUCCEEDED(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root))));
+    const std::string source = std::string("cbuffer Lens:register(b0){float4 pad;") +
+        (column ? "column_major" : "row_major") + " float4x4 P;}"
+        "RWByteAddressBuffer result:register(u0);[numthreads(1,1,1)]void CS(){"
+        "float4 p=mul(P,float4(0,0,1,1));result.Store2(0,asuint(p.xy/p.w*float2(" +
+        std::to_string(float(w) / 2.f) + "," + std::to_string(-float(h) / 2.f) + ")));}";
+    REQUIRE(SUCCEEDED(D3DCompile(source.data(), source.size(), nullptr, nullptr, nullptr, "CS", "cs_5_0", 0, 0, &cs, &err)));
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{}; pd.pRootSignature = root.Get();
+    pd.CS = {cs->GetBufferPointer(), cs->GetBufferSize()}; test::ComPtr<ID3D12PipelineState> pipeline;
+    REQUIRE(SUCCEEDED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pipeline))));
+    auto result = test::CreateBuffer(dev, 8, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto rb = test::CreateBuffer(dev, 8, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    REQUIRE(result && rb); test::List check; REQUIRE(check.Create(dev));
+    check.list->SetComputeRootSignature(root.Get()); check.list->SetPipelineState(pipeline.Get());
+    check.list->SetComputeRootConstantBufferView(0, lens->GetGPUVirtualAddress());
+    check.list->SetComputeRootUnorderedAccessView(1, result->GetGPUVirtualAddress()); check.list->Dispatch(1, 1, 1);
+    auto barrier = test::Transition(result.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    check.list->ResourceBarrier(1, &barrier); check.list->CopyBufferRegion(rb.Get(), 0, result.Get(), 0, 8);
+    REQUIRE(SUCCEEDED(check.list->Close())); ID3D12CommandList* lists[] = {check.list.Get()};
+    d.queue->ExecuteCommandLists(1, lists); d.WaitIdle();
+    void* p = nullptr; REQUIRE(SUCCEEDED(rb->Map(0, nullptr, &p)));
+    std::memcpy(shift, p, 8); rb->Unmap(0, nullptr);
+    return 0;
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -121,13 +165,20 @@ int main(int argc, char** argv)
     const UINT samples = argc > 1 ? UINT(std::atoi(argv[1])) : 1;
     const UINT depth_samples = argc > 2 ? UINT(std::atoi(argv[2])) : samples;
     const bool msaa = samples > 1;
-    const bool real_ngx = argc > 3 && std::strcmp(argv[3], "--real") == 0;
+    const bool entry_real=argc>3 && std::strcmp(argv[3],"--entry-real")==0;
+    const bool entry_indirect=argc>3 && std::strcmp(argv[3],"--entry-indirect")==0;
+    const bool entry_test=entry_real || entry_indirect || (argc>3 && std::strcmp(argv[3],"--entry")==0);
+    const bool real_ngx = entry_real || argc > 3 && std::strcmp(argv[3], "--real") == 0;
     // --planes: depth's two planes (depth, stencil) are transitioned by separate
     // per-subresource barriers, as Sniper Elite Resistance does.
     const bool planes = argc > 3 && std::strcmp(argv[3], "--planes") == 0;
     // --split: the scene is drawn across two submissions per frame (Sniper Elite
     // Resistance); DLAA must follow the second one, before the post pass.
     const bool split = argc > 3 && std::strcmp(argv[3], "--split") == 0;
+    const bool early_component = argc > 3 && std::strcmp(argv[3], "--jitter-early-component") == 0;
+    const bool column_component = argc > 3 && std::strcmp(argv[3], "--jitter-column-component") == 0;
+    const bool component_test = early_component || column_component || (argc > 3 && std::strcmp(argv[3], "--jitter-component") == 0);
+    const bool alias_test = argc > 3 && std::strcmp(argv[3], "--camera-alias") == 0;
     // --inline: the scene and its post-processing are recorded in ONE command list
     // (Sniper Elite Resistance); DLAA must be recorded inside it, before the post
     // pass binds the colour for reading, and the game's state handed back.
@@ -138,7 +189,9 @@ int main(int argc, char** argv)
     // the Anno shape) after its learning frames.
     const bool auto_inline = argc > 3 && std::strcmp(argv[3], "--auto-inline") == 0;
     const bool auto_between = argc > 3 && std::strcmp(argv[3], "--auto-between") == 0;
-    const bool inline_list = auto_inline || inline_record_first || inline_copy || (argc > 3 && std::strcmp(argv[3], "--inline") == 0);
+    const bool inline_flow=argc>3 && std::strcmp(argv[3],"--inline-flow")==0;
+    if(inline_flow && !na::ffx_flow::Built())return test::kSkip;
+    const bool inline_list = entry_test || inline_flow || auto_inline || inline_record_first || inline_copy || (argc > 3 && std::strcmp(argv[3], "--inline") == 0);
     // auto-between needs an OBSERVABLE consumer (a copy of the colour): a barrier-only
     // hand-back is not evidence of a list boundary (Astra R3).
     const bool post_reader = argc > 3 && !real_ngx && !planes && !split && !inline_list;
@@ -154,12 +207,17 @@ int main(int argc, char** argv)
     ID3D12Device* dev = d.device.Get();
     ID3D12CommandQueue* q = d.queue.Get();
     REQUIRE(na::observe::InstallProducers(dev, q, /*hook_queue_execute=*/false));
+    if(inline_flow)REQUIRE(na::observe::InstallListResetTracking(dev,na::nr::OnCommandListReset));
     na_observe_config cfg{};
     cfg.size_bytes = sizeof(cfg);
     REQUIRE(na_observe_start(&cfg, &Sink, nullptr) == NA_OK);
     if (!real_ngx) na::dlss::SetInitOwnOverrideForTests([](ID3D12Device* device, const wchar_t*) { return na::dlss::Attach(device, fake::MakeApi()); });
 
+#if defined(NA_J2_TEST_COMPUTE)
+    constexpr uint32_t W=512,H=256;
+#else
     constexpr uint32_t W = 64, H = 32;
+#endif
     for (auto pair : {std::make_pair(DXGI_FORMAT_R16G16B16A16_FLOAT,samples), std::make_pair(DXGI_FORMAT_D32_FLOAT_S8X24_UINT,depth_samples)}) {
         D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels{pair.first,pair.second,D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE,0};
         REQUIRE(SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,&levels,sizeof levels)));
@@ -197,7 +255,7 @@ int main(int argc, char** argv)
     REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvh))));
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
     REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dsvh))));
-    D3D12_DESCRIPTOR_HEAP_DESC chd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    D3D12_DESCRIPTOR_HEAP_DESC chd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&chd, IID_PPV_ARGS(&cbvh))));
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvh->GetCPUDescriptorHandleForHeapStart(), dsv = dsvh->GetCPUDescriptorHandleForHeapStart();
     D3D12_RENDER_TARGET_VIEW_DESC rvd{};
@@ -228,6 +286,14 @@ int main(int argc, char** argv)
     constexpr uint32_t kBlock = 1024, kVp = 336;
     D3D12_CONSTANT_BUFFER_VIEW_DESC cv{cb->GetGPUVirtualAddress() + kBlock, 768};
     dev->CreateConstantBufferView(&cv, cbvh->GetCPUDescriptorHandleForHeapStart());
+    auto short_cpu = cbvh->GetCPUDescriptorHandleForHeapStart();
+    auto short_gpu = cbvh->GetGPUDescriptorHandleForHeapStart();
+    const UINT cbv_step = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    short_cpu.ptr += cbv_step; short_gpu.ptr += cbv_step;
+    auto short_cv = cv; short_cv.SizeInBytes = 256; dev->CreateConstantBufferView(&short_cv, short_cpu);
+    auto lens = test::CreateBuffer(dev, 256, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    REQUIRE(lens); uint8_t* lens_cpu = nullptr;
+    REQUIRE(SUCCEEDED(lens->Map(0, nullptr, reinterpret_cast<void**>(&lens_cpu))));
     test::ComPtr<ID3D12RootSignature> rs;
     {
         D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0, 0, 0};
@@ -352,6 +418,24 @@ int main(int argc, char** argv)
             na::observe::SetSamplerMipBiasLive(-1.0f); // back to the game's own objects
             na::observe::SetSamplerMipBiasLiveEnabled(false);
         }
+        {
+            // Render-small levels per DLSS mode (Q -1.585, B -2, P -2.5); only the wanted
+            // levels are chosen (Light -0.5 is not wanted, so -0.6 picks -1).
+            const float wanted[4] = {-1.0f, na::j2::SmallMipBias(-1.0f, 1.0f / 1.5f), na::j2::SmallMipBias(-1.0f, 1.0f / 1.72f),
+                                     na::j2::SmallMipBias(-1.0f, 0.5f)};
+            na::observe::SetSamplerMipLevelsWanted(wanted, 4);
+            na::observe::SetSamplerMipBiasLive(wanted[1]);
+            CHECK(std::fabs(na::observe::SamplerMipBias() + 1.585f) < 0.001f);
+            na::observe::SetSamplerMipBiasLive(wanted[2]);
+            CHECK(na::observe::SamplerMipBias() == -2.0f);
+            na::observe::SetSamplerMipBiasLive(wanted[3]);
+            CHECK(na::observe::SamplerMipBias() == -2.5f);
+            na::observe::SetSamplerMipBiasLive(-0.6f);
+            CHECK(na::observe::SamplerMipBias() == -1.0f);
+            const float classic[3] = {0.0f, -0.5f, -1.0f};
+            na::observe::SetSamplerMipLevelsWanted(classic, 3);
+            na::observe::SetSamplerMipBiasLive(-1.0f);
+        }
         na::observe::SetSamplerMipBias(0.0f);
     }
     test::ComPtr<ID3D12RootSignature> rs_pre; // the pre-pass's own root signature: one root CBV
@@ -375,14 +459,21 @@ int main(int argc, char** argv)
     test::ComPtr<ID3D12RootSignature> post_root;
     if (post_reader || inline_list) {
         REQUIRE(!msaa);
-        REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&chd, IID_PPV_ARGS(&post_heap))));
+        auto post_desc=chd;if(entry_test)post_desc.NumDescriptors=96;
+        REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&post_desc, IID_PPV_ARGS(&post_heap))));
         D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
         srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srv.Texture2DArray.MipLevels = 1; srv.Texture2DArray.FirstArraySlice = 1; srv.Texture2DArray.ArraySize = 1;
-        dev->CreateShaderResourceView(color.Get(), &srv, post_heap->GetCPUDescriptorHandleForHeapStart());
-        D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+        auto handle=post_heap->GetCPUDescriptorHandleForHeapStart();
+        if(entry_test) {
+            const auto stride=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            for(UINT i=0;i<96;++i){dev->CreateShaderResourceView(nullptr,&srv,handle);handle.ptr+=stride;}
+            handle=post_heap->GetCPUDescriptorHandleForHeapStart();handle.ptr+=72u*stride;
+        }
+        dev->CreateShaderResourceView(color.Get(), &srv, handle);
+        D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, entry_test?96u:1u, 0, 0, 0};
         D3D12_ROOT_PARAMETER p{}; p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         p.DescriptorTable = {1, &range};
         D3D12_ROOT_SIGNATURE_DESC rd{1, &p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
@@ -391,7 +482,8 @@ int main(int argc, char** argv)
         REQUIRE(SUCCEEDED(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&post_root))));
     }
     // Inline mode: the post pass draws into its own target (another resource).
-    test::ComPtr<ID3D12PipelineState> post_pso;
+    test::ComPtr<ID3D12PipelineState> post_pso,final_post_pso;
+    std::vector<test::ComPtr<ID3D12PipelineState>> entry_writers;
     test::ComPtr<ID3D12Resource> post_rt;
     test::ComPtr<ID3D12DescriptorHeap> post_rtvh;
     D3D12_CPU_DESCRIPTOR_HANDLE post_rtv{};
@@ -402,14 +494,18 @@ int main(int argc, char** argv)
         REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&phd, IID_PPV_ARGS(&post_rtvh))));
         post_rtv = post_rtvh->GetCPUDescriptorHandleForHeapStart();
         dev->CreateRenderTargetView(post_rt.Get(), nullptr, post_rtv);
-        const char* shader = R"(
+        const char* shader = entry_test ? R"(
+Texture2DArray<float4> images[96] : register(t0);
+float4 VS(uint id:SV_VertexID):SV_Position {float2 p=float2((id<<1)&2,id&2);return float4(p*2-1,0,1);}
+float4 PS(float4 p:SV_Position):SV_Target {return images[72].Load(int4(int2(p.xy),0,0));}
+)" : R"(
 Texture2DArray<float4> image : register(t0);
 float4 VS(uint id : SV_VertexID) : SV_Position { float2 p=float2((id<<1)&2,id&2); return float4(p*2-1,0,1); }
 float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(pos.xy),0,0)); }
 )";
         test::ComPtr<ID3DBlob> vs, ps, err;
         REQUIRE(SUCCEEDED(D3DCompile(shader, std::strlen(shader), nullptr, nullptr, nullptr, "VS", "vs_5_0", 0, 0, &vs, &err)));
-        REQUIRE(SUCCEEDED(D3DCompile(shader, std::strlen(shader), nullptr, nullptr, nullptr, "PS", "ps_5_0", 0, 0, &ps, &err)));
+        REQUIRE(SUCCEEDED(D3DCompile(shader, std::strlen(shader), nullptr, nullptr, nullptr, "PS", entry_test?"ps_5_1":"ps_5_0", 0, 0, &ps, &err)));
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
         pd.pRootSignature = post_root.Get();
         pd.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
@@ -421,13 +517,25 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         pd.NumRenderTargets = 1; pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
         REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&post_pso))));
+        if(entry_test){
+            pd.RasterizerState.FrontCounterClockwise=TRUE;
+            REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&pd,IID_PPV_ARGS(&final_post_pso))));
+            const char* geometry="float4 VS(uint i:SV_VertexID):SV_Position{float2 p=float2((i<<1)&2,i&2);return float4(p*2-1,.5,1);} float4 PS():SV_Target{return float4(.2,.3,.4,1);}";
+            REQUIRE(SUCCEEDED(D3DCompile(geometry,std::strlen(geometry),nullptr,nullptr,nullptr,"VS","vs_5_0",0,0,&vs,&err)));
+            REQUIRE(SUCCEEDED(D3DCompile(geometry,std::strlen(geometry),nullptr,nullptr,nullptr,"PS","ps_5_0",0,0,&ps,&err)));
+            pd.pRootSignature=rs.Get();pd.VS={vs->GetBufferPointer(),vs->GetBufferSize()};pd.PS={ps->GetBufferPointer(),ps->GetBufferSize()};
+            pd.DSVFormat=DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+            for(int i=0;i<24;++i){pd.RasterizerState.DepthBias=i;test::ComPtr<ID3D12PipelineState> pso;
+                REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&pd,IID_PPV_ARGS(&pso))));entry_writers.push_back(pso);}
+        }
     }
     uint8_t* cpu = nullptr;
     REQUIRE(SUCCEEDED(cb->Map(0, nullptr, reinterpret_cast<void**>(&cpu))) && cpu);
 
     // An earlier submission leaves colour in RENDER_TARGET and depth in DEPTH_WRITE.
-    test::List setup, scene, consumer, prepass, scene2;
-    REQUIRE(setup.Create(dev) && scene.Create(dev) && consumer.Create(dev) && prepass.Create(dev) && scene2.Create(dev));
+    test::List setup, scene, consumer, prepass, scene2, lens_prepass;
+    REQUIRE(setup.Create(dev) && scene.Create(dev) && consumer.Create(dev) && prepass.Create(dev) && scene2.Create(dev) && lens_prepass.Create(dev));
+    REQUIRE(SUCCEEDED(lens_prepass.list->Close()));
     REQUIRE(SUCCEEDED(scene2.list->Close()));
     REQUIRE(SUCCEEDED(setup.list->Close()));
     {
@@ -455,11 +563,12 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
     // the auto modes exercise the selector.
     na::settings::Get().j2_route.store((auto_inline || auto_between || inline_list) ? 0u : 1u);
     na::j2::SetEnabled(true);
+    na::j2::flow::SetEnabled(inline_flow);
     na::j2::SetJitter(true); // J1 is off by default in the game; the tests exercise it
     na::observe::SetLiveSelection(na::observe::IdOf(depth.Get()), na::observe::IdOf(color.Get()));
     // Auto modes also exercise the J2 evidence capture: 3 consecutive evaluations, each
     // with its own slot, joined by the presented image (a stand-in in PRESENT state).
-    const bool capture = auto_inline || auto_between;
+    const bool capture = auto_inline || auto_between || entry_test;
     test::ComPtr<ID3D12Resource> presented;
     std::wstring cap_dir;
     if (capture) {
@@ -473,16 +582,30 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         REQUIRE(SUCCEEDED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &pd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&presented))));
         wchar_t tmp[MAX_PATH];
         REQUIRE(GetTempPathW(MAX_PATH, tmp) > 0);
-        cap_dir = std::wstring(tmp) + L"na_j2_capture_" + std::to_wstring(GetCurrentProcessId()) + (auto_inline ? L"_inline" : L"_between");
+        cap_dir = std::wstring(tmp) + L"na_j2_capture_" + std::to_wstring(GetCurrentProcessId()) + (entry_test ? L"_entry" : auto_inline ? L"_inline" : L"_between");
         na::capture::j2::Request(3, cap_dir.c_str(), 0);
     }
+    test::ComPtr<ID3D12CommandSignature> indirect_signature;
+    test::ComPtr<ID3D12Resource> indirect_args;
+    if(entry_indirect){
+        D3D12_INDIRECT_ARGUMENT_DESC arg{};arg.Type=D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+        D3D12_COMMAND_SIGNATURE_DESC desc{sizeof(D3D12_DRAW_ARGUMENTS),1,&arg,0};
+        REQUIRE(SUCCEEDED(dev->CreateCommandSignature(&desc,nullptr,IID_PPV_ARGS(&indirect_signature))));
+        indirect_args=test::CreateBuffer(dev,sizeof(D3D12_DRAW_ARGUMENTS),D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+        void* ptr=nullptr;REQUIRE(indirect_args && SUCCEEDED(indirect_args->Map(0,nullptr,&ptr)));
+        D3D12_DRAW_ARGUMENTS draw{3,1,0,0};std::memcpy(ptr,&draw,sizeof draw);indirect_args->Unmap(0,nullptr);
+    }
+    if(entry_test)na::j2::SetDebugView(3); // Native NGX is real; known post-NGX depth picture witnesses state handoff.
     int frame_no = 0;
+    float early_shift[2]{};
+    unsigned entry_delivered=0,entry_checks=0;
     const auto frame = [&](double cam_x, bool unpatched_prepass = false) {
         // Copy case: every 4th frame the LAST scene write comes from a different pipeline
         // (another object drawn last). The boundary matcher keys on the final writer, so it
         // rejects that frame and the next (safely: no early insertion); the learned consumer
         // class (the copy) must cover both.
         const bool other_writer = inline_copy && (frame_no++ % 4 == 3);
+        const int entry_frame=entry_test?++frame_no:0;
         d.WaitIdle();
         const int frame_evals = fake::evals;
         if (inline_list) {
@@ -507,6 +630,10 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         Store(cpu + kBlock + kVp + 192, Proj()); // the camera's own projection, in the same block
         Store(cpu + kPre + kVp, vp); // the pre-pass's own copy of the camera
         Store(cpu + kPre + kVp + 128, inv);
+        std::memset(lens_cpu, 0, 256);
+        M lens_p = Proj();
+        if (column_component) for (int r = 0; r < 4; ++r) for (int c = r + 1; c < 4; ++c) std::swap(lens_p[r * 4 + c], lens_p[c * 4 + r]);
+        Store(lens_cpu + 16, lens_p);
         prepass.Reset(); // earlier batch: depth only, its own root signature
         prepass.list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
         prepass.list->SetGraphicsRootSignature(rs_pre.Get());
@@ -521,14 +648,29 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                 Store(cpu + kPre + kVp, vp);
             }
         }
+        if (early_component) {
+            lens_prepass.Reset();
+            lens_prepass.list->SetGraphicsRootSignature(rs_pre.Get());
+            lens_prepass.list->SetGraphicsRootConstantBufferView(0, lens->GetGPUVirtualAddress());
+            REQUIRE(SUCCEEDED(lens_prepass.list->Close()));
+            ID3D12CommandList* work[] = {lens_prepass.list.Get()};
+            Submit(q, 1, work, true);
+            REQUIRE(ProjectionShift(d, lens.Get(), W, H, false, early_shift) == 0);
+        }
         scene.Reset(); // no colour/depth transitions in the scene list: carried state
         scene.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
         const float clear[4] = {0.2f, 0.3f, 0.4f, 1};
         scene.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
-        scene.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
+        if(!entry_test)scene.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
         ID3D12DescriptorHeap* heaps[] = {cbvh.Get()};
         scene.list->SetDescriptorHeaps(1, heaps);
+        if (component_test) {
+            // A separate root/layout consumes the exact same lens, without a VP beside it.
+            scene.list->SetGraphicsRootSignature(rs_pre.Get());
+            scene.list->SetGraphicsRootConstantBufferView(0, lens->GetGPUVirtualAddress());
+        }
         scene.list->SetGraphicsRootSignature(rs.Get());
+        if (alias_test) scene.list->SetGraphicsRootDescriptorTable(0, short_gpu);
         for (int i = 0; i < 3; ++i) scene.list->SetGraphicsRootDescriptorTable(0, cbvh->GetGPUDescriptorHandleForHeapStart());
         if (inline_list) { // ...then, in the SAME list, post-processing reads the colour
             D3D12_RESOURCE_BARRIER rd2 = test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -552,6 +694,12 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             scene.list->ResourceBarrier(1, &rd2);
             scene.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
             scene.list->ClearRenderTargetView(rtv, clear, 0, nullptr); // actual later scene write
+            if(entry_test){
+                scene.list->SetGraphicsRootSignature(rs.Get());scene.list->SetDescriptorHeaps(1,heaps);
+                scene.list->SetGraphicsRootDescriptorTable(0,cbvh->GetGPUDescriptorHandleForHeapStart());
+                scene.list->SetPipelineState(entry_writers.at(entry_frame-1).Get());scene.list->DrawInstanced(3,1,0,0);
+                scene.list->SetDescriptorHeaps(1,ph);scene.list->SetGraphicsRootSignature(post_root.Get());
+            }
             if (other_writer) { // the final scene write is a draw with another pipeline
                 scene.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
                 scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart());
@@ -561,6 +709,10 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             scene.list->ResourceBarrier(1, &rd2);
             scene.list->OMSetRenderTargets(1, &post_rtv, FALSE, nullptr);
             scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart()); // final scene binding
+            if(entry_test){
+                const float sentinel[4]={.7f,.2f,.1f,1};scene.list->ClearRenderTargetView(post_rtv,sentinel,0,nullptr);
+                scene.list->SetPipelineState(final_post_pso.Get()); // final PSO chosen AFTER its table; no stale binding key
+            }
             // Legacy boundary matcher: injected at the final read transition. Consumer anchor
             // (P4-0D): injected just before the final actual consumer (below). Never twice.
             REQUIRE(fake::evals <= evals_before_read + 1);
@@ -576,8 +728,9 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                 scene.list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
                 for (auto& b : cbars) std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
                 scene.list->ResourceBarrier(2, cbars);
-            } else scene.list->DrawInstanced(3, 1, 0, 0); // final actual read
-            if (fake::evals != evals_before_read + (na::j2::GetStats().inline_mode ? 1 : 0)) {
+            } else if(entry_indirect)scene.list->ExecuteIndirect(indirect_signature.Get(),1,indirect_args.Get(),0,nullptr,0);
+            else scene.list->DrawInstanced(3, 1, 0, 0); // final actual read
+            if (!entry_test && fake::evals != evals_before_read + (na::j2::GetStats().inline_mode ? 1 : 0)) {
                 const auto ds = na::j2::GetStats();
                 std::printf("MISS evals=%d before=%d accepted=%u rejected_skips=%llu cands=%llu waited=%llu refused=%llu rec=%llu no_camera=%llu no_state=%llu busy=%llu pending=%llu reason=\"%s\"\n",
                             fake::evals, evals_before_read, ds.profile_accepted, (unsigned long long)ds.class_rejected_skips,
@@ -585,7 +738,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                             (unsigned long long)ds.inline_recorded, (unsigned long long)ds.no_camera, (unsigned long long)ds.no_state,
                             (unsigned long long)ds.busy, (unsigned long long)ds.inline_rejects[8], ds.reason);
             }
-            REQUIRE(fake::evals == evals_before_read + (na::j2::GetStats().inline_mode ? 1 : 0)); // exactly one, before the final consumer ran
+            if(!entry_test) REQUIRE(fake::evals == evals_before_read + (na::j2::GetStats().inline_mode ? 1 : 0)); // exactly one, before the final consumer ran
             std::swap(rd2.Transition.StateBefore, rd2.Transition.StateAfter);
             scene.list->ResourceBarrier(1, &rd2);
         }
@@ -656,6 +809,20 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         na::j2::OnPresent(q);
         if (capture) na::capture::j2::OnPresent(q, presented.Get(), &PlainExecute);
         d.WaitIdle();
+        if(entry_test && entry_frame>=8){
+            const auto desc=post_rt->GetDesc();D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};UINT64 bytes=0;
+            dev->GetCopyableFootprints(&desc,0,1,0,&fp,nullptr,nullptr,&bytes);
+            auto rb=test::CreateBuffer(dev,bytes,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);REQUIRE(rb);
+            test::List copy;REQUIRE(copy.Create(dev));auto b=test::Transition(post_rt.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_SOURCE);
+            copy.list->ResourceBarrier(1,&b);D3D12_TEXTURE_COPY_LOCATION from{},to{};from.pResource=post_rt.Get();from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            to.pResource=rb.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=fp;
+            copy.list->CopyTextureRegion(&to,0,0,0,&from,nullptr);std::swap(b.Transition.StateBefore,b.Transition.StateAfter);copy.list->ResourceBarrier(1,&b);
+            REQUIRE(SUCCEEDED(copy.list->Close()));ID3D12CommandList* work[]={copy.list.Get()};PlainExecute(q,1,work);d.WaitIdle();
+            void* ptr=nullptr;REQUIRE(SUCCEEDED(rb->Map(0,nullptr,&ptr)));uint16_t rgb[3]{};
+            std::memcpy(rgb,static_cast<uint8_t*>(ptr)+fp.Offset+fp.Footprint.RowPitch*(H/2)+8*(W/2),sizeof rgb);rb->Unmap(0,nullptr);
+            ++entry_checks;const bool delivered=rgb[0]==0 && rgb[1]==0 && rgb[2]==0;if(delivered)++entry_delivered;
+            CHECK(delivered);printf("entry frame %d: downstream %04x/%04x/%04x\n",entry_frame,rgb[0],rgb[1],rgb[2]);
+        }
         const auto ps = na::observe::GetProducerStats();
         std::printf("producers: known disabled %u unknown_inflight %u entries %llu unhooked_queues %llu clears %llu sample_known %llu\n",
                     ps.known_store_disabled, ps.known_unknown_inflight, (unsigned long long)ps.known_entries, (unsigned long long)ps.unhooked_queues,
@@ -710,11 +877,41 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         CHECK(FileSize(cap_dir + L"\\00003-meta.json") < 0); // bounded: exactly the requested frames
         return test::finish(auto_inline ? "j2_anno_shape_test (auto-inline)" : "j2_anno_shape_test (auto-between)");
     }
+    if(entry_test){
+        for(int f=0;f<24;++f)REQUIRE(frame(.25*(f%4))==0);
+        const auto st=na::j2::GetStats();
+        printf("POST ENTRY %u/%u downstream; matches %llu frames %llu late %llu real %u\n",entry_delivered,entry_checks,(unsigned long long)st.entry_matched,(unsigned long long)st.frames,(unsigned long long)st.inline_late_writes,real_ngx);
+        CHECK(entry_checks==17 && entry_delivered==17 && st.entry_matched>=17);
+        CHECK(st.no_camera==0 && st.no_state==0 && st.inline_late_writes==0);
+        CHECK(st.depth_sources[1]>=17 && st.depth_state_assumed==0); // inherited, never guessed
+        uint64_t depth_total=0,camera_total=0;
+        for(const auto value:st.depth_sources)depth_total+=value;
+        for(const auto value:st.camera_sources)camera_total+=value;
+        CHECK(depth_total==st.frames && camera_total==st.frames); // count submissions, not attempts
+        CHECK(evaluations()-evals0>=17 && evaluations()-evals0<=24);
+        CHECK(dev->GetDeviceRemovedReason()==S_OK);
+        na::capture::j2::Shutdown();
+        const auto cs=na::capture::j2::GetStats();
+        CHECK(cs.written==3 && cs.errors==0 && cs.without_present==0);
+        for(int i=0;i<3;++i){
+            wchar_t file[32];swprintf_s(file,L"\\%05d-meta.json",i);
+            const auto meta=ReadText(cap_dir+file);
+            const std::string pipeline="\"pipeline\": "+std::to_string(na::observe::IdOf(final_post_pso.Get()));
+            CHECK(meta.find(pipeline)!=std::string::npos);
+            CHECK(meta.find("\"operation\": 0")==std::string::npos);
+            CHECK(meta.find("\"barrier\": 0")==std::string::npos);
+        }
+        return test::finish("j2 post entry delivery");
+    }
     if (inline_list) {
         // The copy case runs long enough for the consumer anchor's stability gate (16
         // identical signatures) to hand over from the boundary matcher.
         const int frames = inline_copy ? 22 : 4;
         for (int f = 0; f < frames; ++f) REQUIRE(frame(0.25 * (f % 4)) == 0);
+        if(inline_flow){const auto flow=na::j2::compute_flow::GetStats();
+            printf("inline AMD: recorded=%llu submitted=%llu pairs=%llu %s\n",(unsigned long long)flow.recorded,(unsigned long long)flow.submitted,(unsigned long long)flow.pairs,flow.reason);
+            CHECK(flow.submitted>=2 && flow.pairs>=1);
+        }
         if (inline_record_first) REQUIRE(frame(1.0, true) == 0);
         const auto is = na::j2::GetStats();
         std::printf("inline: mode %u, candidates %llu, recorded %llu, frames %llu (inline %llu), refused %llu, evals %llu, forwarded %zu, \"%s\"\n",
@@ -784,6 +981,16 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
     CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
     const double jx = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_X), jy = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_Y);
     CHECK((jx != 0.0 || jy != 0.0) && std::fabs(jx) < 0.5 && std::fabs(jy) < 0.5);
+    if (component_test) {
+        float shift[2]{};
+        REQUIRE(ProjectionShift(d, lens.Get(), W, H, column_component, shift) == 0);
+        std::printf("standalone GPU projection shift=(%.6f,%.6f), NGX jitter=(%.6f,%.6f)\n", shift[0], shift[1], jx, jy);
+        CHECK(std::fabs(shift[0] - jx) < 1e-5 && std::fabs(shift[1] - jy) < 1e-5);
+        if (early_component) {
+            std::printf("earlier GPU projection shift=(%.6f,%.6f)\n", early_shift[0], early_shift[1]);
+            CHECK(std::fabs(early_shift[0] - jx) < 1e-5 && std::fabs(early_shift[1] - jy) < 1e-5);
+        }
+    }
     }
     {
         uint8_t orig[64];

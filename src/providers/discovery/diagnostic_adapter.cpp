@@ -8,6 +8,7 @@
 #include "resource_formats.hpp"
 #include "submission_evidence.hpp"
 #include "universal_heuristics.hpp"
+#include "pass_map.hpp"
 #include "providers/classifier/signal_candidates.hpp"
 #include "providers/camera/matrix_candidates.hpp"
 #include <cstdio>
@@ -41,8 +42,13 @@ struct Consumer {
     uint64_t saved_bytes{};
     uint64_t session{},epoch{},batches{},events{},malformed{},submissions{},presents{},snapshots{},matrices{},samples{},last_log{},last_sample{},last_pick{};
     uint64_t live_depth{},live_color{},pick_challenger{}; unsigned pick_streak{}; // J2 pick hysteresis
+    na::discovery::DepthPick pick; uint64_t pick_events{}; // depth role from accumulated frames
     bool overflow{}; unsigned reports{};
     uint64_t draws{}, binds{}, unresolved_views{}, captured_snapshots{}, truncated_snapshots{}, unmapped_snapshots{}, gpu_snapshots{}, matrix_scans{};
+    // P4-4 Stage M ([stage_m] map=1): read-only pass maps of single frames, own log file.
+    na::discovery::PassMap pass_map;
+    FILE* map_log{};
+    unsigned maps_written{}, maps_wanted{}, map_interval{};
 };
 // The host owns process lifetime. No destructors race its callback at exit.
 Consumer*& consumer() { static auto* slot=new Consumer*(nullptr);return *slot; }
@@ -88,11 +94,20 @@ void PublishLivePicks(Consumer& c) {
     // colour target, only those compete (a lit scene is HDR; albedo is not);
     // equal tickets are decided by the stronger pairing; and a published pick
     // is kept until a different answer has persisted for 2 s (8 publications).
+    // 2026-11-04: the depth role comes from every completed frame's top depth in a recent
+    // window (scene_pick.hpp), not from this one snapshot. SE5 lost the scene pass from one
+    // frame in ~9, which cleared the pick for a whole publication (~11 stretched frames).
     const auto d=c.heuristics.RankDepth(1);
-    const uint64_t depth=!d.empty() && d[0].score>0 ? d[0].resource : 0;
+    const uint64_t raw=!d.empty() && d[0].score>0 ? d[0].resource : 0;
+    const uint64_t before=c.pick.depth;
+    const auto why=c.pick.Publish(c.heuristics.RecentTopDepths(),!c.pick.depth || !c.heuristics.Retired(c.pick.depth));
+    const uint64_t depth=c.pick.depth;
     uint64_t color=0;
-    if(depth) {
-        const auto ks=c.heuristics.RankSceneColor(8);
+    // Colour is ranked against the published depth, and only from a snapshot that drew with it
+    // (a snapshot without the scene pass says nothing about the scene colour).
+    const bool colour_evidence=depth && c.heuristics.ScoredUses(depth);
+    if(colour_evidence) {
+        const auto ks=c.heuristics.RankSceneColor(8,depth);
         const auto is_float=[](uint32_t f){return f==2||f==10||f==26;}; // RGBA32F, RGBA16F, R11G11B10F
         uint64_t strongest=0;
         bool any_float=false;
@@ -108,15 +123,34 @@ void PublishLivePicks(Consumer& c) {
         }
     }
     constexpr unsigned kSwitchAfter=8; // publications (250 ms each)
-    if(depth!=c.live_depth || !c.live_color) {
-        c.live_depth=depth;c.live_color=color;c.pick_streak=0;c.pick_challenger=0; // first pick or new depth: immediate
-    } else if(color!=c.live_color) {
+    if(!depth) {
+        c.live_depth=0;c.live_color=0;c.pick_streak=0;c.pick_challenger=0;
+    } else if(depth!=c.live_depth || !c.live_color) {
+        // new depth role (or no colour yet): take this snapshot's colour; without colour evidence wait
+        if(depth!=c.live_depth) {c.live_color=0;}
+        c.live_depth=depth;
+        if(colour_evidence && color) c.live_color=color;
+        c.pick_streak=0;c.pick_challenger=0;
+    } else if(colour_evidence && color!=c.live_color) {
         // A different answer (including the current pick no longer qualifying) must persist.
         const uint64_t challenger=color;
         if(challenger==c.pick_challenger) ++c.pick_streak; else {c.pick_challenger=challenger;c.pick_streak=1;}
         if(c.pick_streak>=kSwitchAfter) {c.live_color=color;c.pick_streak=0;c.pick_challenger=0;}
-    } else {
+    } else if(colour_evidence) {
         c.pick_streak=0;c.pick_challenger=0;
+    }
+    // Raw vs published, at the publication boundary only (no per-draw log). A snapshot whose
+    // ranking disagrees with the published pick is the event that used to stretch frames.
+    if(c.log && (raw!=depth || depth!=before || why!=na::discovery::PickReason::kept)) {
+        ++c.pick_events;
+        if(c.pick_events<=2000) {
+            const auto& p=c.pick;
+            std::fprintf(c.log,"{\"type\":\"scene_pick\",\"raw_depth\":%llu,\"raw_score\":%.6g,\"published_depth\":%llu,\"previous_depth\":%llu,\"published_color\":%llu,\"reason\":\"%s\",\"window_frames\":%zu,\"leader\":%llu,\"leader_frames\":%zu,\"published_frames\":%zu,\"challenger_streak\":%u,\"absent_streak\":%u,\"snapshot_draws\":%llu,\"snapshot_depths\":%zu,\"snapshot_has_published\":%s,\"frames_without_depth\":%llu}\n",
+                (unsigned long long)raw,d.empty()?0.0:d[0].score,(unsigned long long)depth,(unsigned long long)before,(unsigned long long)c.live_color,
+                na::discovery::PickReasonName(why),p.frames,(unsigned long long)p.leader,p.leader_n,p.current_n,p.challenger_streak,p.absent_streak,
+                (unsigned long long)c.heuristics.ScoredDraws(),c.heuristics.ScoredDepthCount(),colour_evidence?"true":"false",
+                (unsigned long long)c.heuristics.FramesWithoutDepth());
+        }
     }
     na::observe::SetLiveSelection(c.live_depth,c.live_depth?c.live_color:0);
 }
@@ -209,22 +243,51 @@ void __cdecl Sink(const na_event_batch* batch,void* user) {
             switch(item.header.kind) {
             case NA_EV_RESOURCE_CREATED: {
                 const auto e=Read<na_ev_resource_created>(p);
+                if(c.map_log) c.pass_map.OnResource(e);
                 if(c.resources.size()<32768 || c.resources.count(e.resource)) c.resources[e.resource].info=e;
                 else c.overflow=true;
                 break;
             }
             case NA_EV_OBJECT_RETIRED: {
                 const auto e=Read<na_ev_object_retired>(p);c.resources.erase(e.object);c.records.erase(e.object);
+                if(c.map_log) c.pass_map.OnRetire(e.object);
                 c.acquisition.Retire(e.object);
                 for(auto it=c.retry.begin();it!=c.retry.end();) it=it->first.first==e.object?c.retry.erase(it):std::next(it);
                 for(auto it=c.scanned.begin();it!=c.scanned.end();) it=it->first.first==e.object?c.scanned.erase(it):std::next(it);
                 for(auto it=c.camera_plans.begin();it!=c.camera_plans.end();) it=it->first.first==e.object?c.camera_plans.erase(it):std::next(it);
                 break;
             }
-            case NA_EV_PRESENT: ++c.presents;break;
-            case NA_EV_QUEUE_EXECUTE: ++c.submissions;break;
+            case NA_EV_PRESENT: {
+                ++c.presents;
+                if(c.map_log) {
+                    c.pass_map.OnPresent();
+                    if(c.pass_map.Done()) {
+                        const auto report=c.pass_map.Report();
+                        std::fprintf(c.map_log,"=== frame map %u (present %llu) ===\n%s\n",c.maps_written+1,c.presents,report.c_str());
+                        std::fflush(c.map_log);
+                        if(++c.maps_written<c.maps_wanted) c.pass_map.Arm(c.map_interval);
+                        else {std::fputs("stage_m: done\n",c.map_log);std::fclose(c.map_log);c.map_log=nullptr;}
+                    }
+                }
+                break;
+            }
+            case NA_EV_SWAPCHAIN_CREATED: if(c.map_log) {const auto e=Read<na_ev_swapchain_created>(p);c.pass_map.OnSwapchain(e.width,e.height);} break;
+            case NA_EV_SWAPCHAIN_RESIZED: if(c.map_log) {const auto e=Read<na_ev_swapchain_resized>(p);if(e.hresult>=0) c.pass_map.OnSwapchain(e.width,e.height);} break;
+            case NA_EV_DESCRIPTOR_WRITE: if(c.map_log) {const auto e=Read<na_ev_descriptor_write>(p);c.pass_map.OnDescriptor(e.heap,e.slot,e.descriptor_kind,e.resource);} break;
+            case NA_EV_DESCRIPTOR_COPY: if(c.map_log) {const auto e=Read<na_ev_descriptor_copy>(p);c.pass_map.OnDescriptorCopy(e.src_heap,e.src_slot,e.dst_heap,e.dst_slot,e.slot_count);} break;
+            case NA_EV_QUEUE_EXECUTE: {
+                ++c.submissions;
+                if(c.map_log && c.pass_map.Armed()) {
+                    const auto e=Read<na_ev_queue_execute>(p);
+                    std::vector<na_list_ref> refs;
+                    for(uint32_t k=0;k<e.list_count && k<4096;++k) refs.push_back(Read<na_list_ref>(p+e.refs_offset+size_t(k)*e.ref_stride));
+                    if(!refs.empty()) c.pass_map.OnExecute(refs.data(),static_cast<uint32_t>(refs.size()));
+                }
+                break;
+            }
             case NA_EV_LIST_OP: {
                 const auto e=Read<na_ev_list_op>(p);
+                if(c.map_log) c.pass_map.OnOp(e,p);
                 if(c.records.size()>=4096 && !c.records.count(e.list)) {c.overflow=true;break;}
                 auto& rec=c.records[e.list];
                 if(rec.generation!=e.recording_generation) {rec={};rec.generation=e.recording_generation;}
@@ -384,10 +447,22 @@ extern "C" int na_adapter_start() {
     wchar_t path[MAX_PATH]{};GetPrivateProfileStringW(L"discovery",L"log",L"",path,MAX_PATH,ini_path);
     if(!path[0]) return 0;
     auto* c=new Consumer;
+    // Render-small: Performance draws the scene at exactly half the swapchain, which generic_depth's
+    // half-res rule rejected (Cort's 2026-11-03 run: every Performance frame stretched).
+    if(GetPrivateProfileIntW(L"present",L"render_small",0,ini_path)==1) c->heuristics.AllowRenderScale(0.5);
     wchar_t evidence_dir[MAX_PATH]{};GetPrivateProfileStringW(L"discovery",L"evidence_dir",L"",evidence_dir,MAX_PATH,ini_path);
     c->evidence_dir=evidence_dir; // optional pre-created local directory; at most 128 MiB per session
     c->log=_wfsopen(path,L"w",_SH_DENYWR); // Permit live readers; refuse a second writer.
     if(!c->log) {delete c;return 0;}
+    // Stage M: frame maps written to their own log (Cort: test packages save their own results).
+    if(GetPrivateProfileIntW(L"stage_m",L"map",0,ini_path)==1) {
+        wchar_t map_path[MAX_PATH]{};GetPrivateProfileStringW(L"stage_m",L"log",L"",map_path,MAX_PATH,ini_path);
+        if(map_path[0]) c->map_log=_wfsopen(map_path,L"w",_SH_DENYWR);
+        c->maps_wanted=std::min(8u,std::max(1u,static_cast<unsigned>(GetPrivateProfileIntW(L"stage_m",L"frames",4,ini_path))));
+        c->map_interval=std::min(36000u,static_cast<unsigned>(GetPrivateProfileIntW(L"stage_m",L"every_presents",1800,ini_path)));
+        const unsigned first=std::min(36000u,static_cast<unsigned>(GetPrivateProfileIntW(L"stage_m",L"first_after_presents",1800,ini_path)));
+        if(c->map_log) {std::fprintf(c->map_log,"stage_m: read-only frame maps: %u frame(s), first after %u presents, then every %u\n",c->maps_wanted,first,c->map_interval);c->pass_map.Arm(first);}
+    }
     for(unsigned n=0;n<200 && !na::observe::ProducersActive();++n) Sleep(10); // host init thread only
     if(!na::observe::ProducersActive()) {std::fputs("{\"type\":\"error\",\"reason\":\"producers unavailable\"}\n",c->log);std::fclose(c->log);delete c;return 0;}
     na_observe_config cfg{};cfg.size_bytes=sizeof(cfg);
@@ -396,7 +471,9 @@ extern "C" int na_adapter_start() {
 }
 extern "C" void na_adapter_stop() {
     if(auto* c=consumer()) {
-        na_observe_stop();c->acquisition.Clear();std::fclose(c->log);delete c;consumer()=nullptr;
+        na_observe_stop();c->acquisition.Clear();std::fclose(c->log);
+        if(c->map_log) {std::fprintf(c->map_log,"stage_m: stopped after %u map(s)\n",c->maps_written);std::fclose(c->map_log);}
+        delete c;consumer()=nullptr;
     }
 }
 extern "C" const char* na_adapter_name() {return "Discovery diagnostics (read-only)";}

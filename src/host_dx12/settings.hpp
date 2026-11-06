@@ -66,7 +66,11 @@ struct Settings {
     // Neural Rendering (A30, [nr] section). Off by default; percentages 0..100.
     std::atomic<uint32_t> nr_enabled{0};
     std::atomic<uint32_t> nr_intensity{100};
-    std::atomic<uint32_t> j2_sharpness{100}; // J2 DLAA sharpening 0..200: RCAS 0..100, + NIS 101..200 (0 = off; Cort's default 100)
+    std::atomic<uint32_t> j2_sharpness{50}; // J2 sharpening, menu scale 0..100 = RCAS 0..200 (0 = off; 50 = standard RCAS full strength)
+    // Render-small HUD: 0 = the HUD goes through DLSS with the scene; 1..100 = HUD pixels are
+    // kept out of DLSS and upscaled by NIS at this sharpness. [j2] hud_nis.
+    std::atomic<uint32_t> j2_hud_nis{50};
+    std::atomic<uint32_t> j2_flow_loosen{50}; // J2 moving-object flow: 0 = the original acceptance rules, 100 = loosest (Cort 2026-11-03)
     std::atomic<int32_t> j2_mip_bias_x100{-100}; // J2 texture detail: [j2] mip_bias x 100 (0, -50, -100); read at game start
     std::atomic<bool> j2_inline{false}; // legacy [j2] inline=1: same as route=inline (diagnostic override)
     std::atomic<uint32_t> j2_route{0};  // [j2] route: 0 auto (default), 1 between, 2 inline (diagnostic overrides)
@@ -75,6 +79,9 @@ struct Settings {
     std::atomic<uint32_t> j2_capture_frames{30};
     std::atomic<uint32_t> j2_capture_key{0x77}; // F8
     std::atomic<uint32_t> j2_capture_after_s{0};
+    std::atomic<uint32_t> j2_capture_auto{0};        // automatic capture sessions per run (0 = off)
+    std::atomic<uint32_t> j2_capture_cooldown_s{20}; // seconds between automatic captures
+    std::atomic<uint32_t> j2_scale_mode{0}; // P4-4 slider route: DlssMode the game renders at ([j2] scale_mode; 0 = DLAA)
     std::atomic<uint32_t> j2_preset{12};     // J2 DLAA: DLSS render preset ([j2] preset=L; 12 = L, 0 = NVIDIA default)
     std::atomic<uint32_t> nr_structure{100};
     std::atomic<uint32_t> nr_tone{0};
@@ -129,6 +136,8 @@ void SetIniPath(const wchar_t* path);
 // Where user changes are saved: %LOCALAPPDATA%\NeuralAlias\NeuralAliasSL.ini
 const wchar_t* UserIniPath();
 void Load();  // defaults ini, then user ini overrides when present
+// One line with every effective J2/DLSS value and where it came from (user / game / builtin).
+const char* EffectiveSummary();
 // Settings -> user ini (only our keys). Returns false when any write failed;
 // the menu then says the choice is active for this session but not saved.
 bool Save();

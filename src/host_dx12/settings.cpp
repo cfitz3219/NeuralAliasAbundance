@@ -17,7 +17,7 @@
 // from %LOCALAPPDATA%\NeuralAlias\NeuralAliasSL.ini.
 namespace na::settings {
 namespace {
-#define NA_PERSISTED_FIELDS(F) F(enabled) F(dlss_mode) F(follow_game_resolution) F(preset) F(rr_preset) F(text_bold) F(win_x) F(win_y) F(win_w) F(win_h) F(nr_enabled) F(nr_intensity) F(nr_structure) F(nr_tone) F(nr_skin) F(nr_paper_white) F(nr_hdr_mode) F(nr_model) F(motion_enabled) F(motion_grid) F(motion_perf) F(motion_downscale) F(j2_sharpness) F(j2_preset) F(j2_mip_bias_x100) F(reflex_mode) F(fg_enabled) F(fg_mode) F(fg_preset) F(fg_multiplier) F(fg_target_fps) F(fg_frozen_at) F(fg_profile_override) F(native_fg_mode) F(native_fg_frames)
+#define NA_PERSISTED_FIELDS(F) F(enabled) F(dlss_mode) F(follow_game_resolution) F(preset) F(rr_preset) F(text_bold) F(win_x) F(win_y) F(win_w) F(win_h) F(nr_enabled) F(nr_intensity) F(nr_structure) F(nr_tone) F(nr_skin) F(nr_paper_white) F(nr_hdr_mode) F(nr_model) F(motion_enabled) F(motion_grid) F(motion_perf) F(motion_downscale) F(j2_sharpness) F(j2_hud_nis) F(j2_scale_mode) F(j2_preset) F(j2_mip_bias_x100) F(reflex_mode) F(fg_enabled) F(fg_mode) F(fg_preset) F(fg_multiplier) F(fg_target_fps) F(fg_frozen_at) F(fg_profile_override) F(native_fg_mode) F(native_fg_frames)
 Settings g_settings;
 Settings g_loaded_values;
 std::atomic<bool> g_nr_user_touched{false};
@@ -99,8 +99,18 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
     else target.nr_enabled.store(nr?1u:0u);
     target.nr_intensity.store(pct(L"intensity", 100));
     {
-        const int v = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpness", 100, ini));
-        target.j2_sharpness.store(static_cast<uint32_t>(v < 0 ? 0 : (v > 200 ? 200 : v))); // 101..200 adds NIS
+        // [j2] sharpen: the menu's 0..100 (= RCAS 0..200). Older files only have [j2] sharpness
+        // on the RCAS scale (0..150): halved, rounded up, so 150 -> 75 and 100 -> 50.
+        int v = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpen", -1, ini));
+        if (v < 0) {
+            const int old = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpness", 100, ini));
+            v = old <= 0 ? 0 : (old + 1) / 2;
+        }
+        target.j2_sharpness.store(static_cast<uint32_t>(v > 100 ? 100 : v));
+        const int hud = static_cast<int>(GetPrivateProfileIntW(L"j2", L"hud_nis", 50, ini));
+        target.j2_hud_nis.store(static_cast<uint32_t>(hud < 0 ? 0 : (hud > 100 ? 100 : hud)));
+        const int fl = static_cast<int>(GetPrivateProfileIntW(L"j2", L"flow_loosen", 50, ini));
+        target.j2_flow_loosen.store(static_cast<uint32_t>(fl < 0 ? 0 : (fl > 100 ? 100 : fl)));
         wchar_t mb[32] = {};
         GetPrivateProfileStringW(L"j2", L"mip_bias", L"-1.0", mb, 32, ini);
         double mbv = _wtof(mb);
@@ -114,6 +124,8 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
         else if (!_wcsicmp(pz, L"default")) pv = 0;
         else if (pz[0] && !pz[1]) { const wchar_t c = towupper(pz[0]); pv = (c >= L'A' && c <= L'Z') ? static_cast<uint32_t>(c - L'A' + 1) : 12; }
         target.j2_preset.store(pv > 26 ? 12 : pv);
+        const uint32_t sm = GetPrivateProfileIntW(L"j2", L"scale_mode", 0, ini);
+        target.j2_scale_mode.store(sm > 4 ? 0 : sm);
     }
     target.nr_structure.store(pct(L"structure", 100));
     target.nr_tone.store(pct(L"tone", 0));
@@ -170,6 +182,37 @@ void SetIniPath(const wchar_t* path)
     if (path) wcsncpy_s(g_ini_defaults, path, _TRUNCATE);
 }
 
+namespace {
+char g_effective[1024] = {};
+// Where a key's effective value came from: the user ini wins when it holds the key
+// (load order above), else the game's deployed ini, else the built-in default.
+const char* source_of(const wchar_t* section, const wchar_t* key)
+{
+    wchar_t v[8] = {};
+    if (g_ini_user[0] && GetPrivateProfileStringW(section, key, L"\x01", v, 8, g_ini_user) && v[0] != 1) return "user";
+    if (g_ini_defaults[0] && GetPrivateProfileStringW(section, key, L"\x01", v, 8, g_ini_defaults) && v[0] != 1) return "game";
+    return "builtin";
+}
+void describe_effective()
+{
+    // Astra 20cddb8 point 5: the 05dc62b deploy log printed flow_loosen=50/preset L while the
+    // game ran 0/M from the saved user choices. Log every effective value with its source.
+    std::snprintf(g_effective, sizeof g_effective,
+        "settings_effective game_ini=\"%ls\" user_ini=\"%ls\" j2.flow_loosen=%u(%s) j2.preset=%u(%s) j2.sharpen=%u(%s) "
+        "j2.hud_nis=%u(%s) j2.scale_mode=%u(%s) j2.mip_bias_x100=%d(%s) dlss.mode=%u(%s) dlss.preset=%d(%s)",
+        g_ini_defaults, g_ini_user,
+        g_settings.j2_flow_loosen.load(), source_of(L"j2", L"flow_loosen"),
+        g_settings.j2_preset.load(), source_of(L"j2", L"preset"),
+        g_settings.j2_sharpness.load(), source_of(L"j2", L"sharpen"),
+        g_settings.j2_hud_nis.load(), source_of(L"j2", L"hud_nis"),
+        g_settings.j2_scale_mode.load(), source_of(L"j2", L"scale_mode"),
+        g_settings.j2_mip_bias_x100.load(), source_of(L"j2", L"mip_bias"),
+        g_settings.dlss_mode.load(), source_of(L"dlss", L"mode"),
+        g_settings.preset.load(), source_of(L"dlss", L"preset"));
+}
+} // namespace
+const char* EffectiveSummary() { return g_effective; }
+
 const wchar_t* UserIniPath()
 {
     resolve_user_ini();
@@ -196,10 +239,14 @@ void Load()
         g_settings.j2_capture_frames.store(f < 1 ? 1u : (f > 240 ? 240u : f));
         g_settings.j2_capture_key.store(GetPrivateProfileIntW(L"j2", L"capture_key", 0x77, g_ini_defaults) & 0xFFu);
         g_settings.j2_capture_after_s.store(GetPrivateProfileIntW(L"j2", L"capture_after_seconds", 0, g_ini_defaults));
+        // Automatic evidence captures (test packages): sessions per run, cooldown between them.
+        g_settings.j2_capture_auto.store(GetPrivateProfileIntW(L"j2", L"capture_auto", 0, g_ini_defaults));
+        g_settings.j2_capture_cooldown_s.store(GetPrivateProfileIntW(L"j2", L"capture_cooldown_seconds", 20, g_ini_defaults));
     }
 #define REMEMBER(member) g_loaded_values.member.store(g_settings.member.load());
     NA_PERSISTED_FIELDS(REMEMBER)
 #undef REMEMBER
+    describe_effective();
 
 }
 
@@ -249,13 +296,21 @@ bool SaveFromWorker()
         swprintf_s(v, L"%u", kv.value);
         ok &= WritePrivateProfileStringW(L"motion", kv.key, v, ini) != 0;
     }
-    swprintf_s(v, L"%u", g_settings.j2_sharpness.load());
-    ok &= WritePrivateProfileStringW(L"j2", L"sharpness", v, ini) != 0;
+    const auto sharpness = g_settings.j2_sharpness.load();
+    swprintf_s(v, L"%u", sharpness > 100 ? 100 : sharpness);
+    ok &= WritePrivateProfileStringW(L"j2", L"sharpen", v, ini) != 0;
+    WritePrivateProfileStringW(L"j2", L"sharpness", nullptr, ini); // the old RCAS-scale key
+    swprintf_s(v, L"%u", (std::min)(g_settings.j2_hud_nis.load(), 100u));
+    ok &= WritePrivateProfileStringW(L"j2", L"hud_nis", v, ini) != 0;
+    swprintf_s(v, L"%u", g_settings.j2_flow_loosen.load() > 100 ? 100u : g_settings.j2_flow_loosen.load());
+    ok &= WritePrivateProfileStringW(L"j2", L"flow_loosen", v, ini) != 0;
     {
         const uint32_t pv = g_settings.j2_preset.load();
         if (pv >= 1 && pv <= 26) swprintf_s(v, L"%c", static_cast<wchar_t>(L'A' + pv - 1));
         else swprintf_s(v, L"default");
         ok &= WritePrivateProfileStringW(L"j2", L"preset", v, ini) != 0;
+        swprintf_s(v, L"%u", g_settings.j2_scale_mode.load());
+        ok &= WritePrivateProfileStringW(L"j2", L"scale_mode", v, ini) != 0;
         swprintf_s(v, L"%.2f", static_cast<int32_t>(PersistedSwitch(5,static_cast<uint32_t>(g_settings.j2_mip_bias_x100.load()))) / 100.0);
         ok &= WritePrivateProfileStringW(L"j2", L"mip_bias", v, ini) != 0;
     }

@@ -1,4 +1,5 @@
 #include "host_dx12/capture/j2_capture.hpp"
+#include "host_dx12/capture/capture_session.hpp"
 
 #include <windows.h>
 #include <shlobj.h>
@@ -32,6 +33,9 @@ enum class SlotState : uint8_t { Free, Recorded, Submitted, Ready, Writing, Reti
 struct Slot {
     SlotState state = SlotState::Free;
     Plane planes[kPlaneCount];
+    Plane extra[kMaxExtra];
+    const char* extra_name[kMaxExtra] = {};
+    uint64_t present_closed = 0; // J2's last closed frame when the overlay's Present copy was taken
     ComPtr<ID3D12CommandAllocator> alloc; // the presented-image copy: this slot's own
     ComPtr<ID3D12GraphicsCommandList> list;
     Identity id{};
@@ -61,8 +65,22 @@ struct State {
     std::atomic<bool> writer_running{false};
     std::atomic<bool> stop{false};
     HANDLE wake = nullptr;
+    uint64_t last_closed = 0;
+    // Per-frame notes (every frame, CPU only) and their flush into the capture directory.
+    static constexpr size_t kNotes = 4096;
+    FrameNote notes[kNotes];
+    uint64_t notes_written = 0;      // total notes ever added
+    uint64_t notes_flushed = 0;      // first note not yet in frames.csv
+    ULONGLONG flush_until = 0;       // keep appending to frames.csv until then
+    wchar_t notes_dir[MAX_PATH] = {};
+    // Automatic triggers.
+    bool auto_on = false;
+    uint32_t auto_max = 0, auto_cooldown = 0, auto_sessions = 0;
+    ULONGLONG auto_next = 0;
 };
-State g;
+// Never destroyed (as frame_capture.cpp): its Slots' D3D12 copies would be released by the
+// CRT at exit, after observe's tables are gone (c0000005, SE5 2026-11-02).
+State& g = *new State;
 
 bool ensure_device(ID3D12Device* dev)
 {
@@ -158,10 +176,11 @@ void release_unpresented(uint64_t newer_than)
 void write_slot(const Slot& s)
 {
     wchar_t path[MAX_PATH + 64];
-    for (int i = 0; i < kPlaneCount; ++i) {
-        const Plane& p = s.planes[i];
-        if (!p.valid || !p.readback) continue;
-        swprintf_s(path, L"%s\\%05u-%S.raw", s.dir, s.index, kPlaneNames[i]);
+    for (int i = 0; i < kPlaneCount + static_cast<int>(kMaxExtra); ++i) {
+        const Plane& p = i < kPlaneCount ? s.planes[i] : s.extra[i - kPlaneCount];
+        const char* name = i < kPlaneCount ? kPlaneNames[i] : s.extra_name[i - kPlaneCount];
+        if (!p.valid || !p.readback || !name) continue;
+        swprintf_s(path, L"%s\\%05u-%S.raw", s.dir, s.index, name);
         void* mapped = nullptr;
         D3D12_RANGE range{0, static_cast<SIZE_T>(p.bytes)};
         if (FAILED(p.readback->Map(0, &range, &mapped)) || !mapped) continue;
@@ -178,26 +197,47 @@ void write_slot(const Slot& s)
     FILE* fp = nullptr;
     if (_wfopen_s(&fp, path, L"wb") == 0 && fp) {
         std::fprintf(fp,
-            "{\n  \"format\": \"na-j2-capture-1\",\n  \"index\": %u,\n  \"present_ordinal\": %llu,\n"
+            "{\n  \"format\": \"na-j2-capture-1\",\n  \"exe\": \"%ls\",\n  \"pid\": %u,\n  \"index\": %u,\n  \"present_ordinal\": %llu,\n"
             "  \"submission\": %llu,\n  \"queue_submission\": %llu,\n  \"recording\": %llu,\n"
             "  \"view\": {\"color\": %llu, \"depth\": %llu, \"dlss_view_id\": %u, \"color_sub\": %u},\n"
             "  \"route\": %u,\n  \"route_mode\": %u,\n  \"history_generation\": %u,\n  \"insertion_signature\": %llu,\n"
             "  \"size\": [%u, %u],\n  \"color_format\": %u,\n  \"jitter_px\": [%.6f, %.6f],\n  \"mv_scale\": [%.4f, %.4f],\n"
             "  \"reset\": %u,\n  \"camera_cut\": %u,\n  \"preset\": %u,\n  \"sharpness\": %u,\n  \"debug_view\": %u,\n"
-            "  \"late_writes\": %llu,\n  \"frame_closed\": %s,\n  \"planes\": [\n",
-            s.index, (unsigned long long)id.present_ordinal, (unsigned long long)id.submission,
+            "  \"late_writes\": %llu,\n  \"frame_closed\": %s,\n",
+            ThisProcess().exe, ThisProcess().pid, s.index, (unsigned long long)id.present_ordinal, (unsigned long long)id.submission,
             (unsigned long long)s.submit_ordinal, (unsigned long long)id.recording,
             (unsigned long long)id.view_color, (unsigned long long)id.view_depth, id.view_id, id.color_sub,
             id.route, id.route_mode, id.history_generation, (unsigned long long)id.insertion_signature,
             id.width, id.height, id.color_format, id.jitter_x, id.jitter_y, id.mv_scale_x, id.mv_scale_y,
             id.reset, id.camera_cut, id.preset, id.sharpness, id.debug_view,
             (unsigned long long)s.late_writes, s.closed ? "true" : "false");
+        // Pairing and the camera actually passed to the motion shader (2026-11-04).
+        std::fprintf(fp, "  \"present_pairing\": \"%s\",\n  \"present_closed_frame\": %llu,\n  \"inputs_frame\": %llu,\n",
+            id.owns_present ? "own_output" : (s.planes[kPresent].valid ? "overlay_present" : "none"),
+            (unsigned long long)s.present_closed, (unsigned long long)id.inputs_frame);
+        std::fprintf(fp, "  \"camera\": {\"valid\": %s, \"source\": %u, \"age\": %llu, \"offset\": %lld, \"param\": %lld, \"eye\": [%.9g, %.9g, %.9g],\n",
+            id.camera_valid ? "true" : "false", id.camera_source, (unsigned long long)id.camera_age, (long long)id.camera_offset, (long long)id.camera_param,
+            id.eye[0], id.eye[1], id.eye[2]);
+        const auto mat = [&](const char* name, const double* m, const char* tail) {
+            std::fprintf(fp, "    \"%s\": [", name);
+            for (int i = 0; i < 16; ++i) std::fprintf(fp, "%s%.17g", i ? ", " : "", m[i]);
+            std::fprintf(fp, "]%s\n", tail);
+        };
+        mat("vp_current_row", id.vp_cur, ",");
+        mat("vp_previous_row", id.vp_prev, ",");
+        mat("inv_vp_current_row", id.inv_vp_cur, "");
+        std::fprintf(fp, "  },\n  \"selection_version\": %llu,\n  \"tracker_restart\": %u,\n  \"cut_reason\": %u,\n  \"depth_reversed\": %u,\n  \"flow\": {\"ran\": %u, \"loosen\": %u},\n",
+            (unsigned long long)id.selection_version, id.tracker_restart, id.cut_reason, id.depth_reversed, id.flow_ran, id.flow_loosen);
+        std::fprintf(fp,"  \"entry_identity\": {\"pipeline\": %llu, \"root\": %llu, \"destination\": %llu, \"operation\": %llu, \"barrier\": %u, \"kind\": %u}, \"process_id\": %lu,\n  \"planes\": [\n",
+            (unsigned long long)id.entry_pipeline,(unsigned long long)id.entry_root,(unsigned long long)id.entry_destination,
+            (unsigned long long)id.entry_operation,id.entry_barrier,id.entry_kind,GetCurrentProcessId());
         bool first = true;
-        for (int i = 0; i < kPlaneCount; ++i) {
-            const Plane& p = s.planes[i];
-            if (!p.valid) continue;
+        for (int i = 0; i < kPlaneCount + static_cast<int>(kMaxExtra); ++i) {
+            const Plane& p = i < kPlaneCount ? s.planes[i] : s.extra[i - kPlaneCount];
+            const char* name = i < kPlaneCount ? kPlaneNames[i] : s.extra_name[i - kPlaneCount];
+            if (!p.valid || !name) continue;
             std::fprintf(fp, "%s    {\"name\": \"%s\", \"width\": %llu, \"height\": %u, \"dxgi_format\": %u, \"row_pitch\": %u, \"bytes\": %llu}",
-                         first ? "" : ",\n", kPlaneNames[i], (unsigned long long)p.desc.Width, p.desc.Height,
+                         first ? "" : ",\n", name, (unsigned long long)p.desc.Width, p.desc.Height,
                          static_cast<unsigned>(p.desc.Format), p.footprint.Footprint.RowPitch, (unsigned long long)p.bytes);
             first = false;
         }
@@ -217,10 +257,41 @@ void write_slot(const Slot& s)
     }
 }
 
+// Appends notes not yet written to <notes_dir>\\frames.csv (writer thread only).
+void flush_notes()
+{
+    FrameNote copy[256];
+    size_t n = 0;
+    wchar_t dir[MAX_PATH];
+    {
+        std::lock_guard<std::mutex> lock(g.m);
+        if (!g.notes_dir[0] || GetTickCount64() > g.flush_until) return;
+        if (g.notes_written > g.notes_flushed + State::kNotes) g.notes_flushed = g.notes_written - State::kNotes; // overwritten
+        while (g.notes_flushed < g.notes_written && n < 256) copy[n++] = g.notes[g.notes_flushed++ % State::kNotes];
+        wcsncpy_s(dir, g.notes_dir, _TRUNCATE);
+    }
+    if (!n) return;
+    wchar_t path[MAX_PATH + 32];
+    swprintf_s(path, L"%s\\frames.csv", dir);
+    const bool header = GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES;
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, path, L"ab") != 0 || !fp) return;
+    if (header) std::fprintf(fp, "frame,tick_ms,dlss,reset,jitter_x,jitter_y,sel_depth,sel_color,sel_version,camera_source,camera_age,eye_x,eye_y,eye_z,why\n");
+    for (size_t i = 0; i < n; ++i) {
+        const FrameNote& f = copy[i];
+        std::fprintf(fp, "%llu,%llu,%u,%u,%.6f,%.6f,%llu,%llu,%llu,%u,%llu,%.9g,%.9g,%.9g,\"%s\"\n", (unsigned long long)f.frame,
+                     (unsigned long long)f.tick_ms, f.dlss, f.reset, f.jitter_x, f.jitter_y, (unsigned long long)f.selection_depth,
+                     (unsigned long long)f.selection_color, (unsigned long long)f.selection_version, f.camera_source,
+                     (unsigned long long)f.camera_age, f.eye[0], f.eye[1], f.eye[2], f.why);
+    }
+    std::fclose(fp);
+}
+
 void writer_main()
 {
     while (!g.stop.load()) {
         WaitForSingleObject(g.wake, 100);
+        flush_notes();
         for (;;) {
             Slot* next = nullptr;
             {
@@ -253,6 +324,7 @@ void Request(uint32_t frames, const wchar_t* dir, uint32_t delay_ms)
     std::lock_guard<std::mutex> lock(g.m);
     wcsncpy_s(g.dir, dir, _TRUNCATE);
     CreateDirectoryW(g.dir, nullptr);
+    TagDir(g.dir, "j2");
     ++g.session;
     g.requested = (std::min)(frames, kMaxFrames);
     const Stats keep = g.stats;
@@ -260,6 +332,10 @@ void Request(uint32_t frames, const wchar_t* dir, uint32_t delay_ms)
     g.stats.requested = g.requested;
     g.stats.retired = keep.retired; // retired slots stay retired for the process
     g.start_at = GetTickCount64() + delay_ms;
+    // Per-frame notes: the 512 frames before the request too, then everything until 30 s after.
+    wcsncpy_s(g.notes_dir, g.dir, _TRUNCATE);
+    g.notes_flushed = g.notes_written > 512 ? g.notes_written - 512 : 0;
+    g.flush_until = g.start_at + 30000;
     if (!g.wake) g.wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!g.writer_running.load()) {
         g.stop.store(false);
@@ -271,18 +347,8 @@ void Request(uint32_t frames, const wchar_t* dir, uint32_t delay_ms)
 
 bool RequestTimestamped(uint32_t frames, uint32_t delay_ms)
 {
-    wchar_t* local = nullptr;
-    if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local)) || !local) return false;
     wchar_t dir[MAX_PATH];
-    swprintf_s(dir, L"%s\\NeuralAlias", local);
-    CreateDirectoryW(dir, nullptr);
-    swprintf_s(dir, L"%s\\NeuralAlias\\captures", local);
-    CreateDirectoryW(dir, nullptr);
-    SYSTEMTIME t{};
-    GetLocalTime(&t);
-    swprintf_s(dir, L"%s\\NeuralAlias\\captures\\j2-%04u%02u%02u-%02u%02u%02u", local, t.wYear, t.wMonth, t.wDay, t.wHour,
-               t.wMinute, t.wSecond);
-    CoTaskMemFree(local);
+    if (!MakeDir(L"j2", dir, MAX_PATH)) return false;
     Request(frames, dir, delay_ms);
     return true;
 }
@@ -308,6 +374,20 @@ uint32_t RecordEvaluation(ID3D12GraphicsCommandList* list, const Planes& p, cons
         if (!ensure_readback(s->planes[i], res[i])) { ++g.stats.errors; return 0; } // nothing recorded yet
     for (int i = 0; i < 4; ++i) record_copy(list, res[i], st[i], s->planes[i]);
     s->planes[kPresent].valid = false;
+    // Extra planes within a per-slot byte budget (Astra 20cddb8: bounded, never GB of GPU copies).
+    constexpr UINT64 kSlotBudget = 256ull << 20;
+    UINT64 used = 0;
+    for (int i = 0; i < 4; ++i) used += s->planes[i].bytes;
+    for (uint32_t i = 0; i < kMaxExtra; ++i) { s->extra[i].valid = false; s->extra_name[i] = nullptr; }
+    for (uint32_t i = 0; i < p.extra_count && i < kMaxExtra; ++i) {
+        const ExtraPlane& x = p.extra[i];
+        if (!x.res || !x.name) continue;
+        if (!ensure_readback(s->extra[i], x.res)) { ++g.stats.extra_skipped; continue; }
+        if (used + s->extra[i].bytes > kSlotBudget) { s->extra[i].valid = false; ++g.stats.extra_skipped; continue; }
+        used += s->extra[i].bytes;
+        record_copy(list, x.res, x.state, s->extra[i]);
+        s->extra_name[i] = x.name;
+    }
     s->state = SlotState::Recorded;
     s->id = id;
     s->index = g.stats.recorded++;
@@ -316,6 +396,7 @@ uint32_t RecordEvaluation(ID3D12GraphicsCommandList* list, const Planes& p, cons
     s->submit_ordinal = 0;
     s->late_writes = 0;
     s->closed = false;
+    s->present_closed = 0;
     wcsncpy_s(s->dir, g.dir, _TRUNCATE);
     if (g.stats.recorded >= g.requested) g.armed.store(false, std::memory_order_release);
     return static_cast<uint32_t>(s - g.slots) + 1;
@@ -329,8 +410,9 @@ void Submitted(uint32_t token, ID3D12CommandQueue* queue, uint64_t submission)
     s->eval_fence = g.fence_next++;
     queue->Signal(g.fence.Get(), s->eval_fence);
     s->submit_ordinal = submission;
-    s->state = SlotState::Submitted;
+    s->state = s->id.owns_present ? SlotState::Ready : SlotState::Submitted; // its output IS the presented picture
     ++g.stats.submitted;
+    if (s->id.owns_present && g.wake) SetEvent(g.wake);
 }
 
 void Discard(uint32_t token, bool may_still_run)
@@ -351,6 +433,7 @@ void Discard(uint32_t token, bool may_still_run)
 void OnFrameClosed(uint64_t present_ordinal, uint64_t late_writes)
 {
     std::lock_guard<std::mutex> lock(g.m);
+    g.last_closed = present_ordinal;
     release_unpresented(present_ordinal);
     for (auto& s : g.slots)
         if (s.state == SlotState::Submitted && !s.closed && s.id.present_ordinal == present_ordinal) {
@@ -394,9 +477,43 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn e
         }
     }
     if (!s->planes[kPresent].valid) ++g.stats.without_present;
+    s->present_closed = g.last_closed;
     s->state = SlotState::Ready;
     release_unpresented(s->id.present_ordinal + 1);
     if (g.wake) SetEvent(g.wake);
+}
+
+void NoteFrame(const FrameNote& n)
+{
+    std::lock_guard<std::mutex> lock(g.m);
+    FrameNote& d = g.notes[g.notes_written++ % State::kNotes];
+    d = n;
+    d.tick_ms = GetTickCount64();
+}
+
+void SetAutoTrigger(bool on, uint32_t max_sessions, uint32_t cooldown_ms)
+{
+    std::lock_guard<std::mutex> lock(g.m);
+    g.auto_on = on; g.auto_max = max_sessions; g.auto_cooldown = cooldown_ms;
+}
+
+void Trigger(const char* why, uint32_t frames)
+{
+    {
+        std::lock_guard<std::mutex> lock(g.m);
+        const ULONGLONG now = GetTickCount64();
+        if (!g.auto_on || g.auto_sessions >= g.auto_max || now < g.auto_next || g.armed.load()) return;
+        ++g.auto_sessions;
+        g.auto_next = now + g.auto_cooldown;
+        ++g.stats.triggers;
+    }
+    wchar_t dir[MAX_PATH];
+    if (!MakeDir(L"j2", dir, MAX_PATH)) return;
+    Request(frames, dir, 0);
+    wchar_t path[MAX_PATH + 32];
+    swprintf_s(path, L"%s\\trigger.txt", dir);
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, path, L"wb") == 0 && fp) { std::fprintf(fp, "%s\n", why ? why : ""); std::fclose(fp); }
 }
 
 Stats GetStats()

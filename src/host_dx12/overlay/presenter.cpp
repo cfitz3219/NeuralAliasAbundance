@@ -9,11 +9,15 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
+#include <cmath>
 #include <mutex>
 #include <vector>
 
 #include "host_dx12/fg/frame_gen.hpp"
 #include "host_dx12/settings.hpp"
+#include "host_dx12/native_present/size_spoof.hpp"
+#include "host_dx12/native_present/size_controller.hpp"
 #include "host_dx12/latency/nvidia_latency.hpp"
 #include "host_dx12/adapters/tlou1/timing.hpp"
 
@@ -50,6 +54,16 @@ std::mutex g_metrics_m;
 na::latency::Samples g_intervals, g_present_calls, g_ready_ages, g_real_ages;
 na::latency::Samples g_gpu_first_copy, g_gpu_copy_interval;
 std::atomic<uint32_t> g_requested_sync{0}, g_requested_flags{0};
+// Render-small (SetRenderScale).
+std::atomic<float> g_render_scale{1.f};
+std::atomic<UpscaleFn> g_upscale{nullptr};
+// [present] present_dlaa=1: at full size (DLAA) the presenter still takes the game's frame and
+// J2 runs DLAA at Present, exactly like the render-small path but with render == output. For
+// comparing Present-time DLAA with in-frame DLAA on the same game (Astra, COMMS cc47232).
+std::atomic<bool> g_present_dlaa{false};
+std::atomic<void*> g_upscale_user{nullptr};
+std::atomic<uint64_t> g_upscaled{0}, g_upscale_failed{0};
+std::atomic<uint32_t> g_scaled_w{0}, g_scaled_h{0}, g_native_w{0}, g_native_h{0};
 
 void set_reason(const char* t)
 {
@@ -111,6 +125,7 @@ struct Chain {
     std::mutex buffers_m; // never held across callbacks or while acquiring m
     std::vector<ComPtr<ID3D12Resource>> resize_proxies;
     UINT resize_index=0;
+    bool resize_scaled=false; UINT resize_pw=0, resize_ph=0; // the saved proxies' size (a failed resize restores them)
     std::atomic<UINT> virtual_index{0},proxy_count{0};
     ComPtr<ID3D12GraphicsCommandList> list_gen, list_present;
     Slot slots[kSlots];
@@ -125,6 +140,8 @@ struct Chain {
     bool worker_owner = false; // once FG starts, real presentation stays on this worker
     HANDLE queried_latency_handle = nullptr; // diagnostics: query only, never wait/signal
     bool uav_ok = false;
+    bool scaled = false;  // render-small: proxies are pw x ph, the real chain desc size
+    UINT pw = 0, ph = 0;  // proxy size (== desc size when not scaled)
     uint64_t frame_id = 0;
     LARGE_INTEGER last_arrival{}, last_shown{}, qpc{};
     float frame_ms = 0.f, shown_ms = 0.f;
@@ -204,9 +221,31 @@ bool ensure_proxies_locked(Chain& c)
     if (!c.device && FAILED(c.sc->GetDevice(IID_PPV_ARGS(&c.device)))) return false;
     UINT n = c.desc.BufferCount ? c.desc.BufferCount : 2;
     c.uav_ok = uav_supported(c, c.desc.BufferDesc.Format);
+    {
+        const UINT W = c.desc.BufferDesc.Width, H = c.desc.BufferDesc.Height;
+        // Render-small: the proxies are the size the game is TOLD (size_spoof's advertisement:
+        // the delivered request while one is pending, else the committed size), never a size
+        // derived from the applied mode, so a game that has not rebuilt keeps buffers that fit
+        // what it draws (COMMS a066d76 point 1). Native boot advertises native.
+        UINT aw = W, ah = H;
+        if (g_upscale.load(std::memory_order_acquire)) {
+            const na::native_present::Size adv = na::native_present::AdvertisedSize();
+            if (adv.w && adv.h && adv.w <= W && adv.h <= H) { aw = adv.w; ah = adv.h; }
+        }
+        const bool reduced = aw < W || ah < H;
+        const bool full = !reduced && g_present_dlaa.load(std::memory_order_acquire); // DLAA at Present
+        c.scaled = (reduced || full) && c.uav_ok && g_upscale.load(std::memory_order_acquire) && W > 1 && H > 1;
+        c.pw = c.scaled && reduced ? aw : W;
+        c.ph = c.scaled && reduced ? ah : H;
+        g_scaled_w.store(c.scaled ? c.pw : 0); g_scaled_h.store(c.scaled ? c.ph : 0);
+        g_native_w.store(W); g_native_h.store(H);
+        if (reduced && !c.scaled)
+            set_reason(!c.uav_ok ? "Render-small is off for this picture format (no shader writes): full size."
+                                 : "Render-small is off: no upscaler is attached.");
+    }
     c.proxies.resize(n);
     for (UINT i = 0; i < n; ++i) {
-        if (!create_texture(c, c.desc.BufferDesc.Width, c.desc.BufferDesc.Height, c.desc.BufferDesc.Format, c.uav_ok, true,
+        if (!create_texture(c, c.pw, c.ph, c.desc.BufferDesc.Format, c.uav_ok, true,
                             D3D12_RESOURCE_STATE_PRESENT, c.proxies[i])) {
             c.proxy_count.store(0,std::memory_order_release);
             c.proxies.clear();
@@ -217,6 +256,20 @@ bool ensure_proxies_locked(Chain& c)
         c.proxies[i]->SetName(name);
     }
     c.virtual_index = 0;
+    if (g_upscale.load(std::memory_order_acquire)) { // render-small: what the game is told follows the proxies it got
+        namespace np = na::native_present;
+        const np::Size out{c.desc.BufferDesc.Width, c.desc.BufferDesc.Height}, act{c.pw, c.ph};
+        const np::SizeState st = np::GetSizeState();
+        // A delivered live request completes only when the controller has seen the scene follow
+        // (overlay small_follow_mode); here the controller only learns the real allocation.
+        // A REAL window resize (the user or the OS changed the window) is the new output itself: it
+        // completes here, at the allocation, as before the controller existed.
+        const bool ours = st.enabled && st.hwnd == c.desc.OutputWindow && st.request && st.request_delivered;
+        if (ours && st.request_window) {
+            if (!np::CompleteResize(st.request, true, act)) np::CommitBuffers(c.desc.OutputWindow, out, act);
+        } else if (!ours) np::CommitBuffers(c.desc.OutputWindow, out, act);
+        np::ctl::Allocated({act.w, act.h}, GetTickCount64());
+    }
     c.display_hz = refresh_hz_for(c.desc.OutputWindow);
     g_display_hz.store(c.display_hz);
     c.proxy_count.store(n,std::memory_order_release);
@@ -338,7 +391,8 @@ bool ensure_ready_locked(Chain& c)
         QueryPerformanceFrequency(&c.qpc);
     }
     for (Slot& s : c.slots) {
-        if (!create_texture(c, c.desc.BufferDesc.Width, c.desc.BufferDesc.Height, c.desc.BufferDesc.Format, c.uav_ok, false,
+        // Render-small: the upscaler writes it (UAV) and the menu draws on it (render target).
+        if (!create_texture(c, c.desc.BufferDesc.Width, c.desc.BufferDesc.Height, c.desc.BufferDesc.Format, c.uav_ok, c.scaled,
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, s.real_copy))
             return false;
         if (!s.veto) { // A62: the runtime's "do not show generated pictures" flag, plus its readback
@@ -399,6 +453,7 @@ bool release_size_dependent_locked(Chain& c)
         c.proxy_count.store(0,std::memory_order_release);
         c.proxies.clear();
     }
+    if (c.scaled) { g_scaled_w.store(0); g_scaled_h.store(0); c.scaled = false; }
     for (Slot& s : c.slots) {
         s.real_copy.Reset();
         for (auto& t : s.interp) t.Reset();
@@ -673,6 +728,40 @@ bool OwnsQueue(ID3D12CommandQueue* q) {
     return false;
 }
 void SetEnabled(bool enabled) { g_enabled.store(enabled, std::memory_order_release); }
+void SetRenderScale(float scale, UpscaleFn upscale, void* user)
+{
+    g_upscale_user.store(user, std::memory_order_release);
+    g_upscale.store(upscale, std::memory_order_release);
+    g_render_scale.store(scale > 0.f && scale < 1.f ? scale : 1.f, std::memory_order_release);
+}
+void SetPresentDlaa(bool on) { g_present_dlaa.store(on, std::memory_order_release); }
+bool PresentDlaa() { return g_present_dlaa.load(std::memory_order_acquire); }
+float RenderScale() { return g_render_scale.load(std::memory_order_acquire); }
+bool Scaling() { return g_scaled_w.load(std::memory_order_acquire) != 0; }
+bool GameBufferSize(IDXGISwapChain* sc, UINT* w, UINT* h)
+{
+    if (!Enabled() || !sc) return false;
+    std::lock_guard<std::mutex> lock(g_chains_m);
+    Chain* c = find_chain(sc);
+    if (!c || !c->proxy_count.load(std::memory_order_acquire)) return false;
+    if (w) *w = c->pw;
+    if (h) *h = c->ph;
+    return true;
+}
+void TranslateResize(IDXGISwapChain* sc, UINT* w, UINT* h)
+{
+    if (!Enabled() || !sc || !w || !h) return;
+    // Render-small: the real chain always keeps the window's physical size, whatever size the
+    // game believes (also on the way back to native, where the game may pass a stale small size).
+    if (!g_upscale.load(std::memory_order_acquire)) return;
+    {
+        std::lock_guard<std::mutex> lock(g_chains_m);
+        Chain* c = find_chain(sc);
+        if (c && c->external_owner.load(std::memory_order_acquire)) return;
+    }
+    *w = 0; // DXGI: the window's client size, whatever size the game believes it has
+    *h = 0;
+}
 void NoteGameLatency(IDXGISwapChain* sc, UINT n)
 {
     if (!sc) return;
@@ -739,9 +828,15 @@ bool NoteExternalOwner(IDXGISwapChain* sc) {
 void AfterResize(IDXGISwapChain* sc,HRESULT result) {
     Chain* c=nullptr;{std::lock_guard<std::mutex> lock(g_chains_m);c=find_chain(sc);}
     if(!c)return;std::lock_guard<std::mutex> lock(c->m);
+    if(FAILED(result) && g_upscale.load(std::memory_order_acquire)){ // render-small: a pending live size did not happen
+        const auto st=na::native_present::GetSizeState();
+        if(st.request && st.request_delivered)na::native_present::CompleteResize(st.request,false,{});
+    }
     if(FAILED(result) && c->proxies.empty() && !c->resize_proxies.empty()){
         std::lock_guard<std::mutex> buffers_lock(c->buffers_m);
         c->proxies=std::move(c->resize_proxies);c->virtual_index=c->resize_index;c->proxy_count.store(static_cast<UINT>(c->proxies.size()),std::memory_order_release);
+        c->scaled=c->resize_scaled;c->pw=c->resize_pw;c->ph=c->resize_ph;
+        if(c->scaled){g_scaled_w.store(c->pw);g_scaled_h.store(c->ph);}
         g_proxied.fetch_add(1,std::memory_order_relaxed);
     }
     c->resize_proxies.clear();
@@ -806,8 +901,10 @@ bool BeforeResize(IDXGISwapChain* sc)
     // Preserve only our own textures while DXGI decides. Native buffers and
     // pending GPU work still use the existing drain/retirement path.
     auto saved=c->proxies;const auto index=c->virtual_index.load();
+    const bool was_scaled=c->scaled;const UINT spw=c->pw,sph=c->ph;
     if (release_size_dependent_locked(*c)) {
-        c->resize_proxies=std::move(saved);c->resize_index=index;fg::Shutdown();return true;
+        c->resize_proxies=std::move(saved);c->resize_index=index;fg::Shutdown();
+        c->resize_scaled=was_scaled;c->resize_pw=spw;c->resize_ph=sph;return true;
     }
     return false; // DXGI must not resize underneath submitted presenter work
 }
@@ -870,7 +967,8 @@ HRESULT Present(const PresentArgs& a)
     if (a.frame) a.frame(a.queue, src, a.user); // NR / motion / capture on the finished frame
     // The menu belongs to this game's frame. Composite before copying to the
     // owned presentation slot; the worker never touches ImGui or its lifetime.
-    if (a.menu) a.menu(a.sc, a.queue, src, a.user);
+    // Render-small: the menu draws on the native picture after the upscale instead.
+    if (a.menu && !c->scaled) a.menu(a.sc, a.queue, src, a.user);
 
     // Slot for this frame: wait (back-pressure) until the thread finished
     // showing the frame that used it kSlots frames ago.
@@ -913,7 +1011,7 @@ HRESULT Present(const PresentArgs& a)
         std::lock_guard<std::mutex> jl(c->jm);
         backlog_now = c->backlog;
     }
-    if (!c->worker_owner && !want_fg && backlog_now == 0) {
+    if (!c->worker_owner && !want_fg && backlog_now == 0 && !c->scaled) {
         // A62 fast path (nothing to generate, thread idle): present straight
         // from the game's proxy, one copy, no intermediate texture: the old
         // path's cost plus that single copy.
@@ -931,17 +1029,38 @@ HRESULT Present(const PresentArgs& a)
         return hr;
     }
 
+    // Render-small: the upscaler turns the render-size picture into the native slot texture on
+    // the game's queue (its own list, executed before ours), then the menu draws on it.
+    bool upscaled = false;
+    if (c->scaled) {
+        const UpscaleFn fn = g_upscale.load(std::memory_order_acquire);
+        upscaled = fn && fn(a.queue, src, c->pw, c->ph, s.real_copy.Get(), c->desc.BufferDesc.Width, c->desc.BufferDesc.Height,
+                            a.hdr, g_upscale_user.load(std::memory_order_acquire));
+        if (upscaled) {
+            g_upscaled.fetch_add(1, std::memory_order_relaxed);
+            if (a.menu) a.menu(a.sc, a.queue, s.real_copy.Get(), a.user);
+        } else {
+            g_upscale_failed.fetch_add(1, std::memory_order_relaxed); // the slot shows its previous picture
+        }
+    }
     // Copy the finished frame into our texture; then generate.
     s.alloc_gen->Reset();
     c->list_gen->Reset(s.alloc_gen.Get(), nullptr);
     c->list_gen->EndQuery(c->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, si * kQueriesPerSlot);
-    D3D12_RESOURCE_BARRIER pre[2] = {transition(src, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                                     transition(s.real_copy.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)};
-    c->list_gen->ResourceBarrier(2, pre);
-    c->list_gen->CopyResource(s.real_copy.Get(), src);
-    D3D12_RESOURCE_BARRIER post[2] = {transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT),
-                                      transition(s.real_copy.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
-    c->list_gen->ResourceBarrier(2, post);
+    if (c->scaled) {
+        if (upscaled) {
+            D3D12_RESOURCE_BARRIER back = transition(s.real_copy.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            c->list_gen->ResourceBarrier(1, &back);
+        }
+    } else {
+        D3D12_RESOURCE_BARRIER pre[2] = {transition(src, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                                         transition(s.real_copy.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)};
+        c->list_gen->ResourceBarrier(2, pre);
+        c->list_gen->CopyResource(s.real_copy.Get(), src);
+        D3D12_RESOURCE_BARRIER post[2] = {transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT),
+                                          transition(s.real_copy.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
+        c->list_gen->ResourceBarrier(2, post);
+    }
     uint32_t count = 0;
     if (want_fg) {
         fg::FrameInfo fi;
@@ -1072,6 +1191,9 @@ Stats GetStats()
     s.display_hz = g_display_hz.load();
     s.fg_ms = g_fg_ms.load();
     s.fg_avg_ms = g_fg_avg_ms.load();
+    s.scaled_w = g_scaled_w.load(); s.scaled_h = g_scaled_h.load();
+    s.native_w = g_native_w.load(); s.native_h = g_native_h.load();
+    s.upscaled = g_upscaled.load(); s.upscale_failed = g_upscale_failed.load();
     {
         std::lock_guard<std::mutex> lock(g_reason_m);
         strncpy_s(s.reason, g_reason, _TRUNCATE);
@@ -1093,6 +1215,7 @@ bool teardown_chain_locked(Chain& c, uint32_t timeout_ms)
         c.proxy_count.store(0,std::memory_order_release);
         c.proxies.clear();
     }
+    if (c.scaled) { g_scaled_w.store(0); g_scaled_h.store(0); c.scaled = false; }
     c.resize_proxies.clear();c.external_owner=false;
     c.uav_ok = false;
     for (Slot& s : c.slots) {

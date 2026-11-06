@@ -20,6 +20,7 @@
 // diagnostics, never proof; qualification stays with the classifier checks.
 #pragma once
 #include "capture_decoder.hpp"
+#include "scene_pick.hpp"
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -70,7 +71,9 @@ public:
 
     void Consume(const DecodedBatch& b, const na_observe_status& status) {
         if (session_ != status.session || epoch_ != status.epoch) {
+            const double max_ratio = max_ratio_;
             *this = UniversalHeuristics{};
+            max_ratio_ = max_ratio;
             session_ = status.session;
             epoch_ = status.epoch;
         }
@@ -109,6 +112,10 @@ public:
             }
             case NA_EV_OBJECT_RETIRED: {
                 const auto id = Load<na_ev_object_retired>(p).object;
+                if (resources_.count(id)) {
+                    retired_.push_back(id);
+                    if (retired_.size() > 256) retired_.erase(retired_.begin());
+                }
                 resources_.erase(id);
                 pipelines_.erase(id);
                 frame_.depth.erase(id);
@@ -197,11 +204,13 @@ public:
     // buffer is the 3D scene (generic rule; in Anno it separates the HDR scene
     // target from earlier passes and from the UI target). Pre-HUD and HUD
     // composite hints refine it.
-    std::vector<ColorCandidate> RankSceneColor(size_t n) const {
+    // `depth_for` (nonzero): rank against that depth (the published scene depth) instead of
+    // this snapshot's top depth.
+    std::vector<ColorCandidate> RankSceneColor(size_t n, uint64_t depth_for = 0) const {
         const Frame& f = Scored();
         std::vector<ColorCandidate> out;
-        uint64_t top_depth = 0;
-        {
+        uint64_t top_depth = depth_for;
+        if (!top_depth) {
             const auto d = RankDepth(1);
             if (!d.empty() && d[0].score > 0) top_depth = d[0].resource;
         }
@@ -272,6 +281,22 @@ public:
         return 0;
     }
 
+    // Render-small (P4-4): the game's whole scene is drawn at `min_scale` of the swapchain or more
+    // (Performance = 0.5, exactly half), so a buffer that small is not a half-res side buffer there.
+    // generic_depth's 1.85 limit stays for every other game.
+    void AllowRenderScale(double min_scale) {
+        if (min_scale > 0.0 && min_scale < 1.0) max_ratio_ = std::max(kGenericMaxRatio, 1.0 / min_scale + 0.01);
+    }
+    // Scene-pick evidence (scene_pick.hpp): the top eligible depth of every completed frame.
+    const DepthWindow& RecentTopDepths() const { return recent_top_; }
+    bool Known(uint64_t id) const { return resources_.count(id) != 0; }
+    // Observed retirement (a missed creation event never counts as retired).
+    bool Retired(uint64_t id) const { return std::find(retired_.begin(), retired_.end(), id) != retired_.end(); }
+    // The scored snapshot used this depth (drew with it), for colour ranking against it.
+    bool ScoredUses(uint64_t id) const { const Frame& f = Scored(); const auto it = f.depth.find(id); return it != f.depth.end() && it->second.draws; }
+    uint64_t ScoredDraws() const { return Scored().draws; }
+    size_t ScoredDepthCount() const { return Scored().depth.size(); }
+    uint64_t FramesWithoutDepth() const { return frames_without_depth_; }
     uint32_t SwapchainWidth() const { return swap_w_; }
     uint32_t SwapchainHeight() const { return swap_h_; }
     const Metrics& Stats() const { return metrics_; }
@@ -317,11 +342,16 @@ private:
 
     uint64_t session_{}, epoch_{};
     uint32_t swap_w_{}, swap_h_{};
+    static constexpr double kGenericMaxRatio = 1.85;
+    double max_ratio_ = kGenericMaxRatio; // swapchain / buffer size; see AllowRenderScale
     std::map<uint64_t, na_ev_resource_created> resources_;
     std::map<uint64_t, Pipe> pipelines_;
     std::map<uint64_t, Recording> recordings_; // by list: the recording in progress or last closed
     Frame frame_, last_;
     bool have_last_{};
+    DepthWindow recent_top_;
+    std::vector<uint64_t> retired_; // last 256 retired resources
+    uint64_t frames_without_depth_{};
     uint64_t frame_index_{};
     std::map<uint64_t, uint64_t> first_used_; // depth-stencil -> frame index first used (generic_depth)
     Metrics metrics_;
@@ -340,7 +370,7 @@ private:
         if (!swap_w_ || !swap_h_ || !w || !h) return false;
         const double delta = static_cast<double>(swap_w_) / swap_h_ - static_cast<double>(w) / h;
         const double w_ratio = static_cast<double>(swap_w_) / w, h_ratio = static_cast<double>(swap_h_) / h;
-        return std::abs(delta) <= 0.1 && w_ratio <= 1.85 && w_ratio >= 0.5 && h_ratio <= 1.85 && h_ratio >= 0.5;
+        return std::abs(delta) <= 0.1 && w_ratio <= max_ratio_ && w_ratio >= 0.5 && h_ratio <= max_ratio_ && h_ratio >= 0.5;
     }
     // Evicts the lowest list IDs over the cap, never `keep` (the recording the
     // caller is holding a reference to).
@@ -541,6 +571,10 @@ private:
                 if (!first_used_.count(kv.first) && first_used_.size() < kMaxResources) first_used_[kv.first] = frame_index_;
             last_ = std::move(frame_);
             have_last_ = true;
+            const auto d = RankDepth(1);
+            const uint64_t top = !d.empty() && d[0].score > 0 ? d[0].resource : 0;
+            recent_top_.Push(top);
+            if (!top) ++frames_without_depth_;
         }
         frame_ = Frame{};
     }

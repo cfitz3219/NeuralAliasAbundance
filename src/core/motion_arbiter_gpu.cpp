@@ -17,6 +17,7 @@ Texture2D<float>  t_depth    : register(t2);
 Texture2D<float2> t_residual : register(t3);
 Texture2D<float>  t_mask     : register(t4);
 Texture2D<float>  t_rvalid   : register(t5);
+ByteAddressBuffer t_fix      : register(t6);   // M3 correction G (16 floats) + valid word (F_FIX)
 RWTexture2D<float2> u_xy     : register(u0);
 RWTexture2D<uint>   u_prov   : register(u1);
 RWByteAddressBuffer u_stats  : register(u2);
@@ -42,6 +43,7 @@ cbuffer C : register(b0) {
 #define F_T3MASK  16u
 #define F_T3VALID 32u
 #define F_STATS   64u
+#define F_FIX     128u
 
 #define PROV_INVALID 0u
 #define PROV_ENGINE 1u
@@ -70,6 +72,18 @@ float4 mulrow(float4 p, float4x4 m) {
         p.x * m._14 + p.y * m._24 + p.z * m._34 + p.w * m._44);
 }
 
+// M3: ndc * (C + G) when a valid fitted correction is supplied (camera_fit_gpu.cpp).
+float4x4 current_matrix() {
+    float4x4 m = inv_vp_cur;
+    if ((flags & F_FIX) && t_fix.Load(64) != 0u) {
+        [unroll] for (uint r = 0; r < 4; ++r) {
+            const float4 g = asfloat(t_fix.Load4(r * 16));
+            m[r] += g;
+        }
+    }
+    return m;
+}
+
 // ReprojectPixel (motion_arbiter.cpp:69-97)
 bool reproject(uint x, uint y, float depth, out float2 v, out bool offscreen) {
     v = 0; offscreen = false;
@@ -80,7 +94,7 @@ bool reproject(uint x, uint y, float depth, out float2 v, out bool offscreen) {
     float px = (float)x + 0.5 - jitter_cur.x;
     float py = (float)y + 0.5 - jitter_cur.y;
     float4 ndc = float4(px / width * 2.0 - 1.0, 1.0 - py / height * 2.0, depth, 1.0);
-    float4 world = mulrow(ndc, inv_vp_cur);
+    float4 world = mulrow(ndc, current_matrix());
     if (!finite1(world.w) || abs(world.w) < 1e-20) return false;
     world /= world.w;
     world.w = 1.0;
@@ -233,13 +247,13 @@ bool Arbiter::Init(ID3D12Device* device, uint32_t max_frames_in_flight)
 
     D3D12_DESCRIPTOR_RANGE ranges[2]{};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    ranges[0].NumDescriptors = 6;
+    ranges[0].NumDescriptors = 7;
     ranges[0].BaseShaderRegister = 0;
     ranges[0].OffsetInDescriptorsFromTableStart = 0;
     ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
     ranges[1].NumDescriptors = 4;
     ranges[1].BaseShaderRegister = 0;
-    ranges[1].OffsetInDescriptorsFromTableStart = 6;
+    ranges[1].OffsetInDescriptorsFromTableStart = 7;
     D3D12_ROOT_PARAMETER params[2]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[0].DescriptorTable.NumDescriptorRanges = 2;
@@ -278,7 +292,7 @@ bool Arbiter::Init(ID3D12Device* device, uint32_t max_frames_in_flight)
 
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = 10 * slots_;
+    hd.NumDescriptors = kDescriptors * slots_;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap_)))) return false;
     stride_ = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -306,8 +320,24 @@ bool Arbiter::Init(ID3D12Device* device, uint32_t max_frames_in_flight)
     bd.SampleDesc.Count = 1;
     bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    return SUCCEEDED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                                                     nullptr, IID_PPV_ARGS(&dummy_stats_)));
+    if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                               nullptr, IID_PPV_ARGS(&dummy_stats_))))
+        return false;
+    bd.Width = 256;
+    bd.Flags = D3D12_RESOURCE_FLAG_NONE;
+    return SUCCEEDED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                                     nullptr, IID_PPV_ARGS(&dummy_fix_)));
+}
+
+void Arbiter::fix_srv(D3D12_CPU_DESCRIPTOR_HANDLE h, ID3D12Resource* fix)
+{
+    D3D12_SHADER_RESOURCE_VIEW_DESC d{};
+    d.Format = DXGI_FORMAT_R32_TYPELESS;
+    d.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    d.Buffer.NumElements = 64;
+    d.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    device_->CreateShaderResourceView(fix ? fix : dummy_fix_.Get(), &d, h);
 }
 
 bool Arbiter::Dispatch(ID3D12GraphicsCommandList* list, const Inputs& in, const Outputs& out, uint32_t frame_slot)
@@ -333,6 +363,7 @@ bool Arbiter::Dispatch(ID3D12GraphicsCommandList* list, const Inputs& in, const 
     if (use3 && in.tier3_mask) flags |= 16u;
     if (use3 && in.tier3_valid) flags |= 32u;
     if (out.stats) flags |= 64u;
+    if (use2 && in.fix) flags |= 128u;
     // Whole-tier rejections are counted by the caller-visible stats exactly
     // like the CPU (motion_arbiter.cpp:138-140): add width*height per rejected tier.
     uint32_t whole_rejects = 0;
@@ -340,7 +371,7 @@ bool Arbiter::Dispatch(ID3D12GraphicsCommandList* list, const Inputs& in, const 
     if (in.tier2_valid_flag && !use2) ++whole_rejects;
     if (in.tier3_valid_flag && !use3) ++whole_rejects;
 
-    uint32_t base = frame_slot * 10;
+    uint32_t base = frame_slot * kDescriptors;
     auto cpu = [&](uint32_t i) {
         D3D12_CPU_DESCRIPTOR_HANDLE h = heap_->GetCPUDescriptorHandleForHeapStart();
         h.ptr += static_cast<SIZE_T>(base + i) * stride_;
@@ -360,21 +391,22 @@ bool Arbiter::Dispatch(ID3D12GraphicsCommandList* list, const Inputs& in, const 
     srv(3, use3 ? in.tier3_residual : nullptr, DXGI_FORMAT_R32G32_FLOAT, dummy2_.Get());
     srv(4, use3 ? in.tier3_mask : nullptr, DXGI_FORMAT_R32_FLOAT, dummy_.Get());
     srv(5, use3 ? in.tier3_valid : nullptr, DXGI_FORMAT_R32_FLOAT, dummy_.Get());
+    fix_srv(cpu(6), (flags & 128u) ? in.fix : nullptr);
     {
         D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
         d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
         d.Format = DXGI_FORMAT_R32G32_FLOAT;
-        device_->CreateUnorderedAccessView(out.xy, nullptr, &d, cpu(6));
+        device_->CreateUnorderedAccessView(out.xy, nullptr, &d, cpu(7));
         d.Format = DXGI_FORMAT_R8_UINT;
-        device_->CreateUnorderedAccessView(out.provenance, nullptr, &d, cpu(7));
+        device_->CreateUnorderedAccessView(out.provenance, nullptr, &d, cpu(8));
         D3D12_UNORDERED_ACCESS_VIEW_DESC b{};
         b.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
         b.Format = DXGI_FORMAT_R32_TYPELESS;
         b.Buffer.NumElements = 8;
         b.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-        device_->CreateUnorderedAccessView(out.stats ? out.stats : dummy_stats_.Get(), nullptr, &b, cpu(8));
+        device_->CreateUnorderedAccessView(out.stats ? out.stats : dummy_stats_.Get(), nullptr, &b, cpu(9));
         d.Format = DXGI_FORMAT_R32_FLOAT;
-        device_->CreateUnorderedAccessView(dummy_uav_.Get(), nullptr, &d, cpu(9)); // u3 unused by main
+        device_->CreateUnorderedAccessView(dummy_uav_.Get(), nullptr, &d, cpu(10)); // u3 unused by main
     }
 
     Constants c{};
@@ -407,7 +439,8 @@ bool Arbiter::Dispatch(ID3D12GraphicsCommandList* list, const Inputs& in, const 
 bool Arbiter::DispatchDeriveResidual(ID3D12GraphicsCommandList* list, ID3D12Resource* raw_flow, ID3D12Resource* depth,
                                      const Inputs& camera, const float jitter_previous_px[2], ID3D12Resource* residual_out,
                                      ID3D12Resource* valid_out, uint32_t width, uint32_t height, uint32_t frame_slot,
-                                     ID3D12Resource* raw_valid)
+                                     ID3D12Resource* raw_valid,
+                                     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>* recording_heap)
 {
     if (!list || !pso_derive_ || !raw_flow || !depth || !residual_out || !valid_out || !jitter_previous_px ||
         width == 0 || height == 0 || frame_slot >= slots_ || !camera.tier2_valid_flag)
@@ -419,9 +452,14 @@ bool Arbiter::DispatchDeriveResidual(ID3D12GraphicsCommandList* list, ID3D12Reso
     if (!extent_ok(raw_flow) || !extent_ok(depth) || !extent_ok(residual_out) || !extent_ok(valid_out)) return false;
     if (raw_valid && !extent_ok(raw_valid)) return false;
 
-    uint32_t base = frame_slot * 10;
+    // Optional recording-owned storage: old executable lists retain their
+    // descriptors; the caller reuses this heap only after that lease retires.
+    if(recording_heap && !*recording_heap){const auto hd=heap_->GetDesc();
+        if(FAILED(device_->CreateDescriptorHeap(&hd,IID_PPV_ARGS(recording_heap->ReleaseAndGetAddressOf()))))return false;}
+    auto* selected_heap=recording_heap?recording_heap->Get():heap_.Get();
+    uint32_t base = frame_slot * kDescriptors;
     auto cpu = [&](uint32_t i) {
-        D3D12_CPU_DESCRIPTOR_HANDLE h = heap_->GetCPUDescriptorHandleForHeapStart();
+        D3D12_CPU_DESCRIPTOR_HANDLE h = selected_heap->GetCPUDescriptorHandleForHeapStart();
         h.ptr += static_cast<SIZE_T>(base + i) * stride_;
         return h;
     };
@@ -439,22 +477,23 @@ bool Arbiter::DispatchDeriveResidual(ID3D12GraphicsCommandList* list, ID3D12Reso
     srv(3, raw_flow, DXGI_FORMAT_R32G32_FLOAT);
     srv(4, dummy_.Get(), DXGI_FORMAT_R32_FLOAT);
     srv(5, raw_valid ? raw_valid : dummy_.Get(), DXGI_FORMAT_R32_FLOAT);
+    fix_srv(cpu(6), camera.fix);
     D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
     d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     d.Format = DXGI_FORMAT_R32G32_FLOAT;
-    device_->CreateUnorderedAccessView(residual_out, nullptr, &d, cpu(6));
+    device_->CreateUnorderedAccessView(residual_out, nullptr, &d, cpu(7));
     d.Format = DXGI_FORMAT_R8_UINT;
     // u1 (provenance) is unused by derive_residual; bind a dummy typed UAV.
     d.Format = DXGI_FORMAT_R32_FLOAT;
-    device_->CreateUnorderedAccessView(dummy_uav_.Get(), nullptr, &d, cpu(7));
+    device_->CreateUnorderedAccessView(dummy_uav_.Get(), nullptr, &d, cpu(8));
     D3D12_UNORDERED_ACCESS_VIEW_DESC b{};
     b.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
     b.Format = DXGI_FORMAT_R32_TYPELESS;
     b.Buffer.NumElements = 8;
     b.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-    device_->CreateUnorderedAccessView(dummy_stats_.Get(), nullptr, &b, cpu(8));
+    device_->CreateUnorderedAccessView(dummy_stats_.Get(), nullptr, &b, cpu(9));
     d.Format = DXGI_FORMAT_R32_FLOAT;
-    device_->CreateUnorderedAccessView(valid_out, nullptr, &d, cpu(9));
+    device_->CreateUnorderedAccessView(valid_out, nullptr, &d, cpu(10));
 
     Constants c{};
     std::memcpy(c.inv_vp_cur, camera.inv_view_proj_current.m, sizeof(c.inv_vp_cur));
@@ -468,12 +507,12 @@ bool Arbiter::DispatchDeriveResidual(ID3D12GraphicsCommandList* list, ID3D12Reso
     c.max_px = 0.f;
     c.width = width;
     c.height = height;
-    c.flags = 4u | (raw_valid ? 32u : 0u); // tier 2 (+ raw validity supplied)
-    ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
+    c.flags = 4u | (raw_valid ? 32u : 0u) | (camera.fix ? 128u : 0u); // tier 2 (+ raw validity, + M3 correction)
+    ID3D12DescriptorHeap* heaps[] = {selected_heap};
     list->SetDescriptorHeaps(1, heaps);
     list->SetComputeRootSignature(root_.Get());
     list->SetPipelineState(pso_derive_.Get());
-    D3D12_GPU_DESCRIPTOR_HANDLE g = heap_->GetGPUDescriptorHandleForHeapStart();
+    D3D12_GPU_DESCRIPTOR_HANDLE g = selected_heap->GetGPUDescriptorHandleForHeapStart();
     g.ptr += static_cast<UINT64>(base) * stride_;
     list->SetComputeRootDescriptorTable(0, g);
     list->SetComputeRoot32BitConstants(1, sizeof(Constants) / 4, &c, 0);

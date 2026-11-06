@@ -118,23 +118,35 @@ add_library(host_hooking STATIC
   src/host_dx12/hooking/vtable_hook.cpp
   src/host_dx12/hooking/variant_registry.cpp)
 target_link_libraries(host_hooking PUBLIC abundance_options d3d12 PRIVATE minhook)
+# P4-4 render-small S1/S2 (Astra): game-facing window size and input mapping.
+add_subdirectory(src/host_dx12/native_present)
+# P4-4 slider route: read-time render-scale substitution (Fable; installed by host_boot on request).
+add_library(host_scale STATIC src/host_dx12/scale/settings_read_hook.cpp src/host_dx12/scale/live_driver.cpp)
+target_link_libraries(host_scale PUBLIC abundance_options host_hooking)
 
 add_library(host_observe STATIC src/host_dx12/host_observe.cpp)
 target_link_libraries(host_observe PUBLIC abundance_options)
+
+# Layer 2 owns independent reduced scene allocations; the game's native
+# resources remain the bypass. Recognition/binding integration is separate.
+add_library(host_scene_scale STATIC src/host_dx12/scale/scene_group.cpp src/host_dx12/scale/depth_restore.cpp
+  src/host_dx12/scale/gpu_constants.cpp)
+target_link_libraries(host_scene_scale PUBLIC abundance_options d3d12 d3dcompiler)
 
 # C8a: H1 observation producers (device/queue hooks emitting ABI events).
 add_library(host_observe_producers STATIC
   src/host_dx12/observe/producers.cpp
   src/host_dx12/observe/d3d12_slots_check.cpp)
-target_link_libraries(host_observe_producers PUBLIC abundance_options host_observe host_hooking d3d12)
+target_sources(host_observe_producers PRIVATE src/host_dx12/observe/shader_dimensions.cpp)
+target_link_libraries(host_observe_producers PUBLIC abundance_options host_observe host_hooking d3d12 d3dcompiler)
 
 add_library(host_settings STATIC src/host_dx12/settings.cpp)
 target_link_libraries(host_settings PUBLIC abundance_options PRIVATE shell32 ole32)
 
-add_library(host_capture STATIC src/host_dx12/capture/frame_capture.cpp src/host_dx12/capture/j2_capture.cpp)
+add_library(host_capture STATIC src/host_dx12/capture/frame_capture.cpp src/host_dx12/capture/j2_capture.cpp src/host_dx12/capture/capture_session.cpp)
 target_link_libraries(host_capture PUBLIC abundance_options d3d12 dxgi PRIVATE shell32 ole32)
 
-add_library(core_gpu STATIC src/core/motion_arbiter_gpu.cpp)
+add_library(core_gpu STATIC src/core/motion_arbiter_gpu.cpp src/core/camera_fit_gpu.cpp)
 target_link_libraries(core_gpu PUBLIC abundance_core d3d12 d3dcompiler)
 
 # Optical flow: real wrapper when the SDK headers exist, otherwise a stub that
@@ -147,6 +159,17 @@ else()
   add_library(host_nvof STATIC src/host_dx12/nvof/flow_expand.cpp src/host_dx12/nvof/nvof_flow_stub.cpp)
 endif()
 target_link_libraries(host_nvof PUBLIC abundance_options d3d12 d3dcompiler)
+
+# P4-0c: AMD FidelityFX optical flow (compute; inline route and NVOFA fallback). Shaders are
+# compiled by DXC at build time (cmake/ffx_flow_shaders.cmake); without DXC it is a stub.
+include(cmake/ffx_flow_shaders.cmake)
+add_library(host_ffx_flow STATIC src/host_dx12/ffx_flow/ffx_flow_shaders.cpp src/host_dx12/ffx_flow/ffx_flow.cpp)
+target_link_libraries(host_ffx_flow PUBLIC abundance_options d3d12)
+if(NA_HAVE_FFX_FLOW)
+  target_compile_definitions(host_ffx_flow PUBLIC NA_HAVE_FFX_FLOW)
+  target_include_directories(host_ffx_flow PRIVATE "${CMAKE_BINARY_DIR}/generated/ffx_flow")
+  add_dependencies(host_ffx_flow ffx_flow_shaders)
+endif()
 
 # ---------------------------------------------------------------- host_dx12
 # The in-game host. These modules reference each other freely (overlay <->
@@ -171,7 +194,17 @@ add_library(host_dx12 STATIC
   src/host_dx12/nr/native_fg.cpp
   src/host_dx12/nr/fg_states.cpp
   src/host_dx12/j2/live_dlaa.cpp
+  src/host_dx12/j2/projection_window.cpp
+  src/host_dx12/j2/j2_flow.cpp
+  src/host_dx12/j2/compute_flow.cpp
   src/host_dx12/j2/nis_sharpen.cpp
+  src/host_dx12/j2/nis_scaler.cpp
+  src/host_dx12/j2/native_hud.cpp
+  src/host_dx12/scale/scoped_bindings.cpp
+  src/host_dx12/scale/native_bindings.cpp
+  src/host_dx12/scale/auto_scene.cpp
+    src/host_dx12/scale/scoped_transfers.cpp
+    src/host_dx12/scale/scene_frame.cpp
   src/host_dx12/motion/live_flow.cpp
   src/host_dx12/latency/nvidia_latency.cpp
   src/host_dx12/latency/pcl_stats.cpp
@@ -195,7 +228,7 @@ endif()
 # NVIDIA Image Scaling (MIT, vendored): sharpen-only stage of J2's Sharpness slider.
 target_include_directories(host_dx12 SYSTEM PRIVATE third_party/nis)
 target_link_libraries(host_dx12
-  PUBLIC abundance_options host_hooking host_settings host_capture host_nvof core_gpu imgui nvapi_headers host_dlss host_upscalers host_observe_producers
+  PUBLIC abundance_options host_hooking host_native_present host_scale host_settings host_capture host_nvof host_ffx_flow core_gpu imgui nvapi_headers host_dlss host_upscalers host_observe_producers host_scene_scale
          d3d12 dxgi d3dcompiler user32 gdi32 shell32 ole32 bcrypt dbghelp winmm)
 if(NA_HAVE_NGX_SDK)
   target_compile_definitions(host_dx12 PUBLIC NA_HAVE_NGX_SDK)
