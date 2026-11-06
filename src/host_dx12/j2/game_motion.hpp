@@ -46,6 +46,9 @@ public:
     Stats GetStats() const;
     void Describe(char* text, size_t capacity) const;
     bool Ready() const { return pso_score_ != nullptr; }
+    // Smear test: convert with the best encoding of the latest measured frame even before it is
+    // proven (nothing is fed when no frame has a best encoding yet).
+    void SetForce(bool on) { force_ = on; }
 
 private:
     struct SlotState {
@@ -65,6 +68,7 @@ private:
     SlotState slot_[8];
     uint64_t current_id_[kCandidates]{};
     bool prev_valid_ = false;
+    bool force_ = false;
     DXGI_FORMAT prev_format_ = DXGI_FORMAT_UNKNOWN;
     uint32_t tw_ = 0, th_ = 0;
     Decider decider_;

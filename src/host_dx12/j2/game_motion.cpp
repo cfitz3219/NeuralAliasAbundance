@@ -364,6 +364,9 @@ Output Feed::Record(ID3D12GraphicsCommandList* list, uint32_t slot, const Candid
     {
         std::lock_guard<std::mutex> lock(g_stats_m);
         used_c = decider_.UsedCandidate(); used_h = decider_.UsedEncoding();
+        if (force_ && used_c < 0 && decider_.LastBest() >= 0) {
+            used_c = static_cast<int>(decider_.LastCandidate()); used_h = decider_.LastBest();
+        }
     }
     if (used_c >= 0 && !seat[used_c]) used_c = -1;
     k.use_c = used_c >= 0 ? static_cast<uint32_t>(used_c) : 0; k.use_h = used_h >= 0 ? static_cast<uint32_t>(used_h) : 0;

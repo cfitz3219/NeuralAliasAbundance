@@ -232,6 +232,13 @@ void write_slot(const Slot& s)
         std::fprintf(fp, "  },\n  \"selection_version\": %llu,\n  \"tracker_restart\": %u,\n  \"cut_reason\": %u,\n  \"depth_reversed\": %u,\n  \"flow\": {\"ran\": %u, \"loosen\": %u, \"colour_jitter\": [%.6f, %.6f], \"convention\": %u, \"epoch\": %llu},\n",
             (unsigned long long)id.selection_version, id.tracker_restart, id.cut_reason, id.depth_reversed, id.flow_ran, id.flow_loosen,
             id.flow_jitter_x,id.flow_jitter_y,id.flow_jitter_convention,(unsigned long long)id.flow_jitter_epoch);
+        std::fprintf(fp, "  \"dlss\": {\"hdr\": %s, \"depth_inverted\": %s, \"auto_exposure\": %s, \"mv_lowres\": %s, \"mv_jittered\": %s, "
+            "\"pre_exposure\": %.6g, \"exposure_scale\": %.6g, \"quality\": %u, \"bias_current_color\": %s, \"jitter_shifted\": %s},\n"
+            "  \"game_motion_fed\": %s,\n  \"smear_mode\": %d,\n",
+            id.dlss_hdr ? "true" : "false", id.dlss_depth_inverted ? "true" : "false", id.dlss_auto_exposure ? "true" : "false",
+            id.dlss_mv_lowres ? "true" : "false", id.dlss_mv_jittered ? "true" : "false", id.dlss_pre_exposure, id.dlss_exposure_scale,
+            id.dlss_quality, id.dlss_bias_mask ? "true" : "false", id.jitter_shifted ? "true" : "false",
+            id.game_motion_fed ? "true" : "false", id.smear_mode);
         std::fprintf(fp,"  \"hud_probe\": {\"source\": %llu, \"generation\": %llu},\n",(unsigned long long)id.hud_probe_source,(unsigned long long)id.hud_probe_generation);
         std::fprintf(fp,"  \"entry_identity\": {\"pipeline\": %llu, \"root\": %llu, \"destination\": %llu, \"operation\": %llu, \"barrier\": %u, \"kind\": %u}, \"process_id\": %lu,\n  \"planes\": [\n",
             (unsigned long long)id.entry_pipeline,(unsigned long long)id.entry_root,(unsigned long long)id.entry_destination,

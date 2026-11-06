@@ -2029,8 +2029,10 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     if (msg == WM_KEYDOWN && !(lp & (1 << 30)) && na::j2::Enabled()) {
         const uint32_t key = na::settings::Get().j2_capture_key.load(std::memory_order_relaxed);
-        if (key && wp == key && !na::capture::j2::Armed()) // J2 evidence capture, N consecutive frames
-            na::capture::j2::RequestTimestamped(na::settings::Get().j2_capture_frames.load());
+        if (key && wp == key && !na::capture::j2::Armed()) { // J2 evidence capture, N consecutive frames
+            if (GetKeyState(VK_SHIFT) & 0x8000) { if (!na::j2::SmearTestRunning()) na::j2::StartSmearTest(); } // Shift: the smear test
+            else na::capture::j2::RequestTimestamped(na::settings::Get().j2_capture_frames.load());
+        }
     }
     if (msg == kMsgCursorShow || msg == kMsgCursorRestore) {
         g_cursor_message_pending.store(false);

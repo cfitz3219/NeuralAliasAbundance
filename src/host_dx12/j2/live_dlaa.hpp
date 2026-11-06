@@ -405,6 +405,11 @@ struct Stats {
     uint64_t inline_record_failed = 0; // an inline placement fired but recording DLAA failed (reason in the tally)
 };
 Stats GetStats();
+// Smear test (live_dlaa.cpp): a fixed sequence of DLAA variants, 8 captured frames each, into
+// captures\smear-<time>-<exe>-p<pid>\<n-variant>. Starts with the next native DLAA frame.
+void StartSmearTest();
+bool SmearTestRunning();
+void SmearTestStatus(char* text, size_t capacity);
 
 // Releases GPU objects (test hosts; the caller guarantees GPU idle).
 void Shutdown();

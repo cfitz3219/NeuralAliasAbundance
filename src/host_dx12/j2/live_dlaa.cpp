@@ -5,6 +5,7 @@
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/camera_interloper.hpp"
 #include "host_dx12/j2/game_motion.hpp"
+#include "host_dx12/capture/capture_session.hpp"
 #include "host_dx12/j2/msaa_resolve.hpp"
 #include "host_dx12/j2/nis_sharpen.hpp"
 #include "host_dx12/j2/nis_scaler.hpp"
@@ -1738,6 +1739,108 @@ bool is_interloper(const na::camera::Matrix& m)
     return pose_of(m, &p) && g.interlopers.IsInterloper(p);
 }
 bool find_camera_scan(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, na::camera::Matrix* vp, bool* reversed);
+
+// ---- Smear test (Cort 2026-11-06: "establish the ability to gather all the data you need") ----
+// One button press runs a fixed sequence of DLAA variants on whatever is on screen, each for
+// ~2.5 s, and captures 8 consecutive frames at the end of each into its own folder:
+//   0 normal, 1 no motion, 2 current frame only (DLSS told to trust this frame everywhere),
+//   3 no sharpening, 4 DLSS preset L (a fresh feature; the run's preset otherwise), 5 the game's
+//   motion texture forced (best encoding so far, even before it is proven), 6 normal again.
+// Comparing a moving surface across them separates history blending (2 sharp, others not),
+// wrong motion (1 vs 0 vs 5), the preset (4) and sharpening (3) from the input itself
+// (each capture's colour plane = the game's own frame). Only the DLAA (native) path applies
+// the variants; the picture visibly changes while it runs.
+struct SmearTest {
+    std::atomic<bool> requested{false};
+    bool running = false;
+    int mode = 0;
+    uint64_t evals = 0;
+    bool capturing = false;
+    wchar_t base[MAX_PATH]{};
+    char status[200]{};
+    ComPtr<ID3D12Resource> ones; // R16_FLOAT rw x rh, all 1 (NPSR): bias-current-colour everywhere
+    ComPtr<ID3D12DescriptorHeap> rtv;
+    uint32_t ones_w = 0, ones_h = 0;
+    bool ones_ready = false;
+};
+SmearTest g_smear;
+constexpr const char* kSmearModes[] = {"0-normal", "1-no-motion", "2-current-frame-only", "3-no-sharpening",
+                                       "4-preset-L", "5-game-motion-forced", "6-normal-again"};
+constexpr int kSmearModeCount = 7;
+constexpr uint64_t kSmearSettle = 150, kSmearBurst = 8, kSmearTimeout = 600;
+int smear_mode() { return g_smear.running ? g_smear.mode : -1; }
+void smear_status(const char* what)
+{
+    std::snprintf(g_smear.status, sizeof g_smear.status, "%s", what);
+}
+// Once per native DLAA evaluation, before it is recorded (g.m held).
+void smear_step()
+{
+    if (g_smear.requested.exchange(false) && !g_smear.running) {
+        if (na::capture::MakeDir(L"smear", g_smear.base, MAX_PATH)) {
+            na::capture::TagDir(g_smear.base, "smear");
+            g_smear.running = true; g_smear.mode = 0; g_smear.evals = 0; g_smear.capturing = false;
+            na::eventlog::Emit("smear_test", "start dir=%ls", g_smear.base);
+        } else smear_status("Smear test: the captures folder could not be created.");
+    }
+    if (!g_smear.running) return;
+    ++g_smear.evals;
+    char st[200];
+    const auto prev = na::capture::j2::GetStats();
+    const bool writer_idle = prev.written + prev.discarded + prev.errors >= prev.recorded; // the last burst is on disk: 8 free slots
+    if (!g_smear.capturing && g_smear.evals >= kSmearSettle && !na::capture::j2::Armed() && (writer_idle || g_smear.evals >= kSmearSettle + kSmearTimeout)) {
+        wchar_t dir[MAX_PATH];
+        swprintf_s(dir, L"%s\\%hs", g_smear.base, kSmearModes[g_smear.mode]);
+        CreateDirectoryW(dir, nullptr);
+        na::capture::j2::Request(static_cast<uint32_t>(kSmearBurst), dir);
+        g_smear.capturing = true;
+    } else if (g_smear.capturing && (!na::capture::j2::Armed() || g_smear.evals >= kSmearSettle + kSmearTimeout)) {
+        const auto cs = na::capture::j2::GetStats();
+        na::eventlog::Emit("smear_test", "mode=%s recorded=%u written=%u dropped_busy=%u evals=%llu", kSmearModes[g_smear.mode],
+                           cs.recorded, cs.written, cs.dropped_busy, static_cast<unsigned long long>(g_smear.evals));
+        ++g_smear.mode; g_smear.evals = 0; g_smear.capturing = false;
+        if (g_smear.mode >= kSmearModeCount) {
+            g_smear.running = false;
+            na::eventlog::Emit("smear_test", "done dir=%ls", g_smear.base);
+            smear_status("Smear test finished. Exit the game and run Results.");
+            return;
+        }
+    }
+    std::snprintf(st, sizeof st, "Smear test running: step %d of %d (%s). Keep the view still.", g_smear.mode + 1, kSmearModeCount,
+                  kSmearModes[g_smear.mode] + 2);
+    smear_status(st);
+}
+// The all-ones bias mask, created and cleared once per size in `l`; NPSR when it returns true.
+bool smear_ones(ID3D12GraphicsCommandList* l, uint32_t rw, uint32_t rh)
+{
+    if (g_smear.ones_ready && g_smear.ones_w == rw && g_smear.ones_h == rh) return true;
+    g_smear.ones.Reset(); g_smear.ones_ready = false;
+    if (!g_smear.rtv) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors = 1;
+        if (FAILED(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_smear.rtv)))) return false;
+    }
+    D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = rw; rd.Height = rh; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_R16_FLOAT; rd.SampleDesc.Count = 1;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    if (FAILED(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                 IID_PPV_ARGS(&g_smear.ones))))
+        return false;
+    const auto h = g_smear.rtv->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateRenderTargetView(g_smear.ones.Get(), nullptr, h);
+    const float one[4] = {1.f, 1.f, 1.f, 1.f};
+    l->ClearRenderTargetView(h, one, 0, nullptr);
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition = {g_smear.ones.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+    l->ResourceBarrier(1, &b);
+    g_smear.ones_w = rw; g_smear.ones_h = rh; g_smear.ones_ready = true;
+    return true;
+}
 // The scan, then the interloper rule: a known second camera is never the main camera (the frame
 // then keeps the last main camera, no history reset); every chosen camera updates the rule.
 // `judged` receives the committed rule updated by this camera; the caller commits it only when
@@ -2470,7 +2573,9 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     } else add(b, g.depth32.Get(), DST, NPSR);
     flush(l, b);
     // 2/3. camera motion vectors
+    if (!deferred && !(saved && saved->at_present)) smear_step(); // smear test variants: native DLAA only
     bool have_motion = false;
+    bool in_tier1_fed = false;
     na::j2::compute_flow::Tier3 flow_tier{}; // evidence capture
     if (g.arbiter_ok) {
         na::motion::gpu::Inputs in{};
@@ -2563,9 +2668,11 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
                 cands[nc].id = ids[i];
                 ++nc;
             }
+            g.game_motion.SetForce(smear_mode() == 5);
             const auto gm = g.game_motion.Record(l, g.slot, cands, nc, g.color_in.Get(), rw, rh,
                                                  cam.camera_cut || resize || g.resume_reset);
             if (gm.motion) {
+                in_tier1_fed = true;
                 in.tier1_motion = gm.motion;
                 in.tier1_valid = gm.valid;
                 in.tier1_valid_flag = true;
@@ -2579,6 +2686,14 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
                 g.game_motion_used = used;
                 if (gs.measured >= 64) g.game_motion_logged = true;
             }
+        }
+        if (smear_mode() == 1) { // smear test: no motion at all (identity reprojection, no other tier)
+            na::camera::Matrix id{};
+            id[0] = id[5] = id[10] = id[15] = 1.0;
+            in.inv_view_proj_current = to_mat4(id);
+            in.tier1_valid_flag = in.tier3_valid_flag = false;
+            in.fix = nullptr;
+            in.jitter_current_px[0] = in.jitter_current_px[1] = 0.f;
         }
         na::motion::gpu::Outputs o{};
         o.xy = g.motion.Get();
@@ -2662,6 +2777,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     }
     // 4. DLSS at native resolution
     na::dlss::EvalDesc e{};
+    const int smear = smear_mode();
     e.color = ambient?ambient->Color():g.color_in.Get();
     // Jitter shift: the declared offset moved into the colour, so the picture does not shake.
     bool shifted = false;
@@ -2713,6 +2829,12 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         if(grade){if(inl){if(!na::nr::native::RetainRecording(l,grade))grade.reset();}else s.grade=grade;
             if(grade&&grade->Record(l))e.color=grade->Color();}
     }
+    if (smear == 2 && smear_ones(l, rw, rh)) e.bias_current_color = g_smear.ones.Get();
+    {   // smear test 4: preset L on a fresh feature, and a fresh one again afterwards (presets apply at creation)
+        static bool preset_test = false;
+        if ((smear == 4) != preset_test) { preset_test = smear == 4; na::dlss::ReleaseView(kViewId); e.reset = true; }
+        if (smear == 4) e.preset = 12; // NVSDK_NGX_DLSS_Hint_Render_Preset_L
+    }
     const bool evaluated = na::dlss::Evaluate(l, e);
     if (!evaluated) ++g.stats.dlss_failed;
     if (shifted) { add(b, g.jshift.Get(), NPSR, UAV); flush(l, b); }
@@ -2749,11 +2871,31 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         ci.reset = e.reset ? 1u : 0u;
         ci.camera_cut = cam.camera_cut ? 1u : 0u;
         ci.preset = static_cast<uint32_t>(e.preset);
-        ci.sharpness = na::settings::Get().j2_sharpness.load(std::memory_order_relaxed);
+        ci.sharpness = smear == 3 ? 0u : na::settings::Get().j2_sharpness.load(std::memory_order_relaxed);
         ci.debug_view = static_cast<uint32_t>(g_debug_view.load(std::memory_order_relaxed));
         ci.entry_pipeline=g.capture_entry.pipeline;ci.entry_root=g.capture_entry.root;
         ci.entry_destination=g.capture_entry.destination;ci.entry_operation=g.capture_entry.operation;
         ci.entry_barrier=g.capture_entry.barrier;ci.entry_kind=static_cast<uint32_t>(g.capture_entry.op);
+        // The native path's own camera and DLSS facts (were blank here; RC 2026-11-06).
+        ci.inputs_frame = g.frame;
+        ci.camera_valid = true;
+        for (int i = 0; i < 16; ++i) { ci.vp_cur[i] = cam.view_proj_current_row[i]; ci.vp_prev[i] = cam.view_proj_previous_row[i]; ci.inv_vp_cur[i] = cam.inv_view_proj_current_row[i]; }
+        for (int i = 0; i < 3; ++i) ci.eye[i] = cam.position[i];
+        ci.camera_source = pending.camera_source; ci.camera_age = pending.camera_age;
+        ci.selection_version = pending.selection_version;
+        ci.tracker_restart = tracker_restart ? 1u : 0u; ci.cut_reason = static_cast<uint32_t>(cam.cut_reason);
+        ci.depth_reversed = reversed ? 1u : 0u;
+        ci.flow_ran = (flow_tier.residual != nullptr || flow_tier.fix != nullptr) ? 1u : 0u;
+        ci.flow_loosen = na::settings::Get().j2_flow_loosen.load(std::memory_order_relaxed);
+        ci.raster_jitter_x = static_cast<float>(cam.jitter_px_x); ci.raster_jitter_y = static_cast<float>(cam.jitter_px_y);
+        ci.flow_jitter_x=pending.compute_flow.frame.jitter[0];ci.flow_jitter_y=pending.compute_flow.frame.jitter[1];
+        ci.flow_jitter_convention=pending.compute_flow.colour_convention;ci.flow_jitter_epoch=pending.compute_flow.colour_epoch;
+        ci.dlss_hdr = e.hdr; ci.dlss_depth_inverted = e.depth_inverted; ci.dlss_auto_exposure = e.auto_exposure && !e.exposure;
+        ci.dlss_mv_lowres = !e.mv_display_res; ci.dlss_mv_jittered = e.mv_jittered;
+        ci.dlss_pre_exposure = e.pre_exposure; ci.dlss_exposure_scale = e.exposure_scale;
+        ci.dlss_quality = static_cast<uint32_t>(e.quality); ci.dlss_bias_mask = e.bias_current_color != nullptr;
+        ci.jitter_shifted = shifted; ci.smear_mode = smear;
+        ci.game_motion_fed = in_tier1_fed;
         // Game velocity candidates (Cort 2026-11-06, menu smear): two-channel float/norm
         // textures with exactly the scene's extent, copied in their known state so a capture
         // shows whether the game writes per-pixel motion (vectors on movers, ~0 on walls).
@@ -2776,14 +2918,32 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
                 ID3D12Resource* r = na::observe::AcquireResource(ids[i]);
                 if (!r) continue;
                 velocity_hold[used].Attach(r);
-                if (r->GetDesc().SampleDesc.Count != 1 || r == g.motion.Get()) continue;
+                if (r->GetDesc().SampleDesc.Count != 1 || r == g.motion.Get()) { velocity_hold[used].Reset(); continue; }
                 cp.extra[cp.extra_count++] = {kVelocityNames[used], r, static_cast<D3D12_RESOURCE_STATES>(st)};
                 ++used;
                 ++g.stats.velocity_captured;
             }
             g.stats.velocity_candidates = found_n;
+            // The half-size companions (p25748: R16G16_FLOAT at half render size too).
+            static const char* const kHalfNames[2] = {"velocity_half_0", "velocity_half_1"};
+            ComPtr<ID3D12Resource> half_hold[2];
+            na_object_id hids[6] = {};
+            const uint32_t half_n = na::observe::FindTextures(kVelocityFormats, 4, (w + 1) / 2, (h + 1) / 2, hids, 6);
+            const uint32_t half_n2 = half_n ? half_n : na::observe::FindTextures(kVelocityFormats, 4, w / 2, h / 2, hids, 6);
+            uint32_t hused = 0;
+            for (uint32_t i = 0; i < half_n2 && hused < 2 && cp.extra_count < na::capture::j2::kMaxExtra; ++i) {
+                uint32_t st = 0;
+                if (!state_of(hids[i], 0, &st)) { ++g.stats.velocity_capture_unknown_state; continue; }
+                ID3D12Resource* r = na::observe::AcquireResource(hids[i]);
+                if (!r) continue;
+                half_hold[hused].Attach(r);
+                if (r->GetDesc().SampleDesc.Count != 1) { half_hold[hused].Reset(); continue; }
+                cp.extra[cp.extra_count++] = {kHalfNames[hused], r, static_cast<D3D12_RESOURCE_STATES>(st)};
+                ++hused;
+                ++g.stats.velocity_captured;
+            }
+            pending.capture = na::capture::j2::RecordEvaluation(l, cp, ci);
         }
-        pending.capture = na::capture::j2::RecordEvaluation(l, cp, ci);
     }
     if (evaluated) {
         const int dv = g_debug_view.load(std::memory_order_relaxed);
@@ -2791,7 +2951,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             b.push_back(uav_barrier(g.output.Get()));
             flush(l, b);
             debug_record(l, dv, g.output.Get(), cf, g.ow, g.oh, g.rw, g.rh, g.slot); // replaces the DLAA result with the debug picture
-        } else if (const uint32_t pct = 2u * na::settings::Get().j2_sharpness.load(std::memory_order_relaxed)) {
+        } else if (const uint32_t pct = smear == 3 ? 0u : 2u * na::settings::Get().j2_sharpness.load(std::memory_order_relaxed)) {
             // RCAS: output -> sharp, then back into output so the write-back path is unchanged.
             b.push_back(uav_barrier(g.output.Get()));
             add(b, g.output.Get(), UAV, NPSR);
@@ -5437,6 +5597,15 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     na::j2::flow::Committed(flow_ticket, g.fence.Get(), s.fence_value);
     na::j2::compute_flow::Committed(pending.compute_flow);
     na::capture::j2::Submitted(pending.capture, queue, g.stats.submissions);
+}
+
+void StartSmearTest() { g_smear.requested.store(true); }
+bool SmearTestRunning() { std::lock_guard<std::mutex> lock(g.m); return g_smear.running || g_smear.requested.load(); }
+void SmearTestStatus(char* text, size_t capacity)
+{
+    if (!text || !capacity) return;
+    std::lock_guard<std::mutex> lock(g.m);
+    std::snprintf(text, capacity, "%s", g_smear.requested.load() && !g_smear.running ? "Smear test starts with the next DLAA frame." : g_smear.status);
 }
 
 Stats GetStats()
