@@ -39,6 +39,7 @@ std::atomic<bool> g_automatic{false};
 std::atomic<hud_routes::Method> g_auto_method{hud_routes::Method::NativeReplay};
 std::mutex g_auto_mutex;
 hud_routes::Policy g_auto_policy;
+uint64_t g_auto_draws[4]{};
 std::atomic<PreHudRenderer> g_test_renderer{nullptr};
 struct CapturedPicture;
 struct ProbeCapture;
@@ -1404,7 +1405,14 @@ void AutomaticFrame(ID3D12Resource* frame,ID3D12CommandQueue* queue,uint32_t rw,
     if(!Automatic()||!frame||!queue)return;
     ComPtr<ID3D12Device> device;if(FAILED(frame->GetDevice(IID_PPV_ARGS(&device))))return;
     const hud_routes::Key key{reinterpret_cast<uintptr_t>(device.Get()),reinterpret_cast<uintptr_t>(queue),rw,rh,ow,oh,uint32_t(frame->GetDesc().Format)};
-    std::lock_guard<std::mutex> lock(g_auto_mutex);g_auto_policy.Frame(key,eligible);g_auto_method.store(g_auto_policy.Selected());
+    const auto method=AutomaticMethod();uint64_t observed=0;
+    if(eligible&&method!=hud_routes::Method::Off){
+        if(method==hud_routes::Method::NativeReplay){const auto s=GetStats();observed=s.native_recorded+s.forwarded;}
+        else {const auto s=hud_unblend::GetStats();observed=s.replayed+s.forwarded;}
+    }
+    std::lock_guard<std::mutex> lock(g_auto_mutex);bool present=false;
+    if(eligible&&method!=hud_routes::Method::Off){auto& previous=g_auto_draws[static_cast<uint32_t>(method)];present=observed!=previous;previous=observed;}
+    g_auto_policy.Frame(key,eligible,present);g_auto_method.store(g_auto_policy.Selected());
 }
 void ReportAutomatic(hud_routes::Ticket ticket,uint32_t hud,uint32_t separated){
     if(!Automatic())return;

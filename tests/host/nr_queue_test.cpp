@@ -119,7 +119,7 @@ void CheckWitness(size_t index, float value) {
 int main(int argc, char** argv) {
     const bool nvrhi=argc>1&&std::strcmp(argv[1],"--nvrhi")==0;
     if(nvrhi&&!na::gpu::GetStats().built)return test::kSkip;
-    na::settings::Get().experimental_nvrhi=nvrhi;
+    na::gpu::SetBackendForTests(nvrhi?na::gpu::TestBackend::Nvrhi:na::gpu::TestBackend::Native);
     test::ComPtr<ID3D12Debug> debug;
     if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) debug->EnableDebugLayer();
     if (!test::CreateDevice(d)) return test::SkipNoDevice("nr_queue_test");

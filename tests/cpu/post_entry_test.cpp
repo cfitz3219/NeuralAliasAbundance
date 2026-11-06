@@ -59,17 +59,23 @@ int main(){
         // merged: one list, X right after F is terminal; optional late water pass W before it
         const std::vector<ColorEvent> merged={start(write(S)),X,write(F),X};
         const std::vector<ColorEvent> water={start(write(S)),X,write(F),write(W),X};
-        // Live judgement in submission order, the context built as InsertionTrace does.
+        // Use the actual live context and submission export, not a second hand-written
+        // implementation. Interleave another resource and reset between recordings.
+        std::vector<ColorEvent> submitted;
         auto place=[&](const std::vector<ColorEvent>& ev,size_t* at){
-            bool written=false;uint32_t ord=0;uint64_t prod=0;
+            InsertionTrace trace;submitted.clear();bool placed=false;
             for(size_t n=0;n<ev.size();++n){const auto& e=ev[n];
-                if(e.list_start){written=false;ord=0;prod=0;}
-                if(e.write){written=true;ord=0;prod=e.raw.pipeline;continue;}
-                if(!IsEntry(e.op))continue;
-                ++ord;
-                auto r=e.raw;r.context=EntryContext(written,ord);r.producer=written?prod:0;
-                if(q.Accepts(r)){*at=n;return true;}}
-            return false;};
+                if(e.list_start){check(trace.ColorEvents(1,submitted),"complete recording export");trace.Reset();}
+                auto unrelated=write(999).raw;unrelated.resource=99;trace.Add(unrelated);
+                auto r=e.raw;
+                if(IsEntry(e.op)){
+                    trace.SetEntryContext(r);
+                    if(!placed&&q.Accepts(r)){*at=n;placed=true;}
+                }
+                trace.Add(r);
+            }
+            check(trace.ColorEvents(1,submitted),"final recording export");
+            return placed;};
         auto last_write=[](const std::vector<ColorEvent>& ev){size_t l=0;for(size_t n=0;n<ev.size();++n)if(ev[n].write)l=n;return l;};
         int early=0,placed_merged=0,placed_water=0,placed_split=0,evals=0;
         for(uint64_t f=1;f<=60;++f){
@@ -77,7 +83,7 @@ int main(){
             size_t at=0;
             if(place(ev,&at)){++evals;if(at<last_write(ev))++early;
                 if(&ev==&merged)++placed_merged;else if(&ev==&water)++placed_water;else ++placed_split;}
-            q.Observe(ev,true,f);
+            q.Observe(submitted,true,f);
         }
         check(early==0,"never placed before the last scene write (split/merged/water)");
         check(placed_split>=38,"split frames keep their terminal entry (41 split frames, 3 to learn)");

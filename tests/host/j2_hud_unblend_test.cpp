@@ -861,6 +861,8 @@ int automatic_policy()
     CHECK(p.Selected()==Method::NativeReplay&&!p.Receipt(stale,100,100));
     const auto t=p.Current();for(int i=0;i<3;++i){p.Frame(resized,true);CHECK(p.Receipt(t,100,100));}
     CHECK(p.Verified());
+    for(int i=0;i<1000;++i){p.Frame(resized,true,false);p.Receipt(t,0,0);}
+    CHECK(p.Verified()&&p.Selected()==Method::NativeReplay);
     for(int i=0;i<7;++i)CHECK(p.Receipt(t,100,0));
     CHECK(p.Selected()==Method::NativeReplay); // one bad frame cannot flap a verified method
     CHECK(p.Receipt(t,100,0));CHECK(p.Selected()==Method::DirectOrCopy);

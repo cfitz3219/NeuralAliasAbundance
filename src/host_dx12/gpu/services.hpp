@@ -46,4 +46,8 @@ struct Stats {uint64_t textures=0,opens=0,submits=0,collections=0,errors=0,dispa
 Stats GetStats();
 void Collect();
 bool Enabled();
+// No product preference: automatic selection follows measured backend cost.
+// Offline regressions can still exercise both implementations explicitly.
+enum class TestBackend {Automatic, Native, Nvrhi};
+void SetBackendForTests(TestBackend);
 }

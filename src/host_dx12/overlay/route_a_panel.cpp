@@ -1210,11 +1210,13 @@ void DrawLiveDlaaEnhancements()
         // selector after the profile changes or a read becomes unavailable.
         const auto drv = na::fg::preset::GetAnisoOverride();
         ImGui::SetNextItemWidth(S(220));
+        ImGui::BeginDisabled(drv.ForcedNow());
         if (ImGui::Combo("##aniso", &idx, kAniso, 4)) {
             ss.aniso16.store(kAnisoLevel[idx]);
             na::observe::SetSamplerAnisotropy(kAnisoLevel[idx]);
             na::settings::Save();
         }
+        ImGui::EndDisabled();
         EndRow();
         const auto warn = [](const char* text) {
             ImGui::PushTextWrapPos(0.f);
@@ -1223,12 +1225,10 @@ void DrawLiveDlaaEnhancements()
         };
         if (drv.ForcedNow()) {
             warn("Your graphics driver profile reports its own texture filtering. It may override this choice; use Application-controlled filtering for this game.");
-            if(drv.app_profile&&!drv.write_pending&&ImGui::SmallButton("Use application filtering"))na::fg::preset::RequestAppControlledAniso();
         } else if(drv.ForcedThisRun())
             Hint("The current driver profile leaves filtering to the application. If its old override is still active, it clears on the next game launch.");
         else if (!drv.available)
             Hint("If this choice makes no difference, set Anisotropic filtering to \"Application-controlled\" in your graphics driver controls.");
-        if(drv.written&&!drv.write_pending&&ImGui::SmallButton("Restore previous filtering profile"))na::fg::preset::RequestRestoreAniso();
         const auto as = na::observe::GetAnisoStats();
         char tb[240];
         const auto ml2 = na::observe::GetMipLiveStats();
@@ -1367,18 +1367,10 @@ void RegisterLiveDlaaMenu()
 static void DrawExperimentalGpu()
 {
     using namespace na::ui;
-    auto& settings=na::settings::Get();const auto stats=na::gpu::GetStats();bool enabled=settings.experimental_nvrhi.load()!=0;
-    BeginRow("Run effects through NVIDIA NVRHI","Behind-the-scenes test switch: our own extra effects (XeGTAO, Lighting) are submitted through NVIDIA's NVRHI library instead of our own Direct3D 12 code. The picture does not change; leave it off unless testing stability or speed.",SwitchWidth());
-    ImGui::BeginDisabled(!stats.built);
-    if(ImGui::Checkbox("##experimental_gpu",&enabled)){settings.experimental_nvrhi=enabled;na::settings::Save();}
-    ImGui::EndDisabled();EndRow();
     const auto memory=na::gpu::mem::GetStats();const auto preparation=na::background::GetStats();char details[192];
     std::snprintf(details,sizeof details,"GPU scratch memory: %.1f MB used in %.1f MB of reusable heaps.",memory.allocation_bytes/1048576.0,memory.block_bytes/1048576.0);Hint(details);
     std::snprintf(details,sizeof details,"Background preparation: %u working, %u waiting; %llu jobs completed.",preparation.active,
         preparation.pending>=preparation.active?preparation.pending-preparation.active:0,static_cast<unsigned long long>(preparation.completed));Hint(details);
-    if(!stats.built)Hint("This package was built without NVRHI, so the switch is greyed out.");
-    else if(enabled){char status[192];std::snprintf(status,sizeof status,"Shared GPU work: %llu submissions, %llu effect dispatches, %llu managed textures.",
-        static_cast<unsigned long long>(stats.submits),static_cast<unsigned long long>(stats.dispatches),static_cast<unsigned long long>(stats.textures));Hint(status);}
 }
 
 static void DrawDonutLighting()

@@ -2663,14 +2663,13 @@ void make_pso_twins(IUnknown* pso, const void* rs, Make make, RecipeFn&& recipe_
         // builds the chosen variant; until then lookups use the game's pipeline and wake it.
         (void)make;
         for (int af = 0; af < 4; ++af) (void)rs_sets[af];
-        if (recipe && g_var_want.load(std::memory_order_relaxed) && !g_var_missing.exchange(true, std::memory_order_relaxed))
-            g_var_cv.notify_one();
         if (recipe) {
             auto r = std::const_pointer_cast<VariantRecipe>(recipe);
             r->rs_key = canon(rs);
             r->rs_id = rs_id;
         }
     }
+    bool published_recipe = false;
     {
         std::unique_lock<RegistryLock> lock(g_m);
         const auto it = g_objs.find(canon(pso));
@@ -2678,8 +2677,12 @@ void make_pso_twins(IUnknown* pso, const void* rs, Make make, RecipeFn&& recipe_
             it->second.variant_kind = kind;
             for (int af = 0; af < 4; ++af) sets[af].swap(it->second.af_sets[af]);
             recipe.swap(it->second.recipe);
+            published_recipe = it->second.recipe != nullptr;
         }
     }
+    // Wake only after publication: a worker woken before the swap could miss this recipe.
+    if (published_recipe && (g_var_want.load(std::memory_order_relaxed) || g_mip_prewarm.load(std::memory_order_relaxed)) &&
+        !g_var_missing.exchange(true, std::memory_order_relaxed)) g_var_cv.notify_one();
     // replaced sets (if any) are released outside g_m
 }
 
@@ -6789,7 +6792,7 @@ void variant_worker()
         if (refill) {
             // Idle: warm the other selectable levels (see g_mip_prewarm) so a switch is immediate.
             // fill_pass gives up as soon as a new choice arrives; the loop above then serves it.
-            if (v && g_mip_live_enabled.load(std::memory_order_relaxed) && g_mip_prewarm.load(std::memory_order_relaxed)) {
+            if (g_mip_live_enabled.load(std::memory_order_relaxed) && g_mip_prewarm.load(std::memory_order_relaxed)) {
                 const int af = var_af(v);
                 const uint32_t levels = (0x7u | g_mip_level_mask.load(std::memory_order_relaxed)) & ~(af == 0 ? 1u : 0u);
                 for (int level = 0; level < kMipCount; ++level) {
@@ -6808,7 +6811,11 @@ void variant_worker()
                 g_var_total.store(0, std::memory_order_relaxed);
                 g_var_done.store(0, std::memory_order_relaxed);
             }
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            // Rate-limit refill notifications, but let a user's new choice preempt immediately.
+            std::unique_lock<std::mutex> lk(g_var_m);
+            g_var_cv.wait_for(lk, std::chrono::seconds(1), [v] {
+                return g_var_want.load(std::memory_order_relaxed) != v || g_process_exiting.load(std::memory_order_acquire);
+            });
             continue;
         } // never spin on stragglers
         {
@@ -6816,6 +6823,9 @@ void variant_worker()
             if (g_var_want.load(std::memory_order_relaxed) == v) {
                 if (v && g_mip_live_enabled.load(std::memory_order_relaxed)) g_mip_switched.store(true, std::memory_order_release);
                 g_var_live.store(v, std::memory_order_release);
+                // Activation is itself an idle-work request. No subsequent game draw or
+                // missing-object lookup is required to start warming the other choices.
+                if (g_mip_prewarm.load(std::memory_order_relaxed)) g_var_missing.store(true, std::memory_order_relaxed);
             }
         }
         g_var_cv.notify_all();
@@ -6830,6 +6840,7 @@ void request_variant(F&& change)
         g_var_want.store(change(w), std::memory_order_relaxed);
         if (!g_var_started) {
             g_var_started = true;
+            g_var_missing.store(true, std::memory_order_relaxed); // original/Off can warm alternatives too
             std::thread(variant_worker).detach();
         }
     }
@@ -6845,7 +6856,11 @@ void SetSamplerMipBias(float bias)
 float SamplerMipBias() { return kMipLevels[var_level(g_var_want.load(std::memory_order_relaxed))]; }
 void SetSamplerMipBiasLive(float bias) { SetSamplerMipBias(bias); }
 void SetSamplerMipBiasLiveEnabled(bool on) { g_mip_live_enabled.store(on, std::memory_order_relaxed); }
-void SetSamplerMipPrewarm(bool on) { g_mip_prewarm.store(on, std::memory_order_relaxed); }
+void SetSamplerMipPrewarm(bool on) {
+    if (g_mip_prewarm.exchange(on, std::memory_order_relaxed) || !on) return;
+    g_var_missing.store(true, std::memory_order_relaxed);
+    g_var_cv.notify_one();
+}
 void SetSamplerMipLevelsWanted(const float* biases, int n)
 {
     uint32_t mask = 0;

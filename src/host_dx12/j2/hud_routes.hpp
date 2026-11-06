@@ -29,10 +29,14 @@ public:
     void Restart(){key_={};method_=Method::NativeReplay;++epoch_;++trial_;attempts_={};consecutive_=failed_=no_receipt_=0;verified_=false;}
     // Only actual, reconstructable scene frames consume a trial. Menus,
     // generated/repeated presents and missing scene inputs do not exhaust it.
-    void Frame(const Key& key,bool eligible){
+    void Frame(const Key& key,bool eligible,bool hud_present=true){
         if(!epoch_||!(key==key_)){key_=key;method_=Method::NativeReplay;++epoch_;++trial_;attempts_={};consecutive_=failed_=no_receipt_=0;verified_=false;}
         if(!eligible||method_==Method::Off)return;
         auto& a=attempts_[static_cast<uint32_t>(method_)];++a.frames;
+        // Scopes/cutscenes can legitimately remove the HUD. A verified method
+        // is not failed merely because there is nothing to separate. Missing
+        // packets with observed HUD draws still have a finite timeout.
+        if(verified_&&!hud_present){no_receipt_=0;return;}
         if(++no_receipt_>90)next();
     }
     Ticket Current()const{return {epoch_,trial_,method_};}
@@ -48,8 +52,8 @@ public:
             ++a.passes;failed_=no_receipt_=0;if(++consecutive_>=3)verified_=true;
         }else{
             ++a.failures;consecutive_=0;
-            // No-HUD frames use the ordinary reconstruction, without revoking
-            // a verified route. They still count toward its finite absence timeout.
+            // Empty receipts cannot approve a route. Frame's draw-presence
+            // evidence distinguishes a missing HUD from a missing receipt.
             if(hud&&++failed_>=8)next();
         }
         return true;

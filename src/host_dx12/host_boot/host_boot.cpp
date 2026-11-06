@@ -315,10 +315,12 @@ DWORD WINAPI InitThread(LPVOID)
         boot_log(na::native_present::InstallSizeHooks() ? "render-small: size hooks installed" : "render-small: size hooks FAILED");
         // Four finite, GPU-checked methods. Old manual HUD preferences do not
         // choose the renderer or disable DLSS. Exhaustion leaves ordinary DLSS.
-        na::j2::native_hud::Install();
-        na::j2::native_hud::SetAutomatic(true);
+        if(GetPrivateProfileIntW(L"present",L"hud_separation",1,g_ini)!=0){
+            na::j2::native_hud::Install();
+            na::j2::native_hud::SetAutomatic(true);
+        }
         na::j2::SetHudMaskEnabled(false); // temporal protection is not verified separation
-        boot_log("render-small: automatic HUD methods; ordinary DLSS on exhaustion");
+        boot_log(na::j2::native_hud::Automatic()?"render-small: automatic HUD methods; ordinary DLSS on exhaustion":"render-small: HUD separation disabled by ini; ordinary DLSS unchanged");
         // Ultra Performance is not offered with render-small (the HUD would be drawn at 33%).
         if (na::settings::Get().j2_scale_mode.load() > 3) na::settings::Get().j2_scale_mode.store(3);
         const int small_mode = static_cast<int>(na::settings::Get().j2_scale_mode.load());

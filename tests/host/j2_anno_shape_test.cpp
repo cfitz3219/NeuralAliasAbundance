@@ -164,12 +164,13 @@ int ProjectionShift(test::Device& d, ID3D12Resource* lens, UINT w, UINT h, bool 
 
 // Actual sampler pixels, not a no-op Dispatch or a count of created twins.
 // All waits/readbacks in this standalone diagnostic are test-only.
-int AnisoPixels(bool clamp)
+int AnisoPixels(bool clamp,bool prewarm_only=false)
 {
     test::Device d;if(!test::CreateDevice(d))return test::SkipNoDevice("AF pixels");auto* dev=d.device.Get();
     REQUIRE(na::observe::InstallProducers(dev,d.queue.Get(),false));
     na_observe_config cfg{};cfg.size_bytes=sizeof(cfg);REQUIRE(na_observe_start(&cfg,Sink,nullptr)==NA_OK);
     na::observe::SetSamplerMipBiasLiveEnabled(true);na::observe::SetSamplerMipBiasLive(0);na::observe::SetSamplerAnisotropy(0);
+    na::observe::SetSamplerMipPrewarm(false); // pixel comparisons do not measure unrelated compilation
     const float levels[]={0,-1,-2};na::observe::SetSamplerMipLevelsWanted(levels,3);na::observe::SetSamplerAnisotropyPrebuild(16);
     REQUIRE(na::observe::WaitSamplerVariant(10000));
     constexpr UINT TW=1024,TH=64,MIPS=11,W=64,H=64;
@@ -204,6 +205,18 @@ int AnisoPixels(bool clamp)
     REQUIRE(SUCCEEDED(D3DCompile(code,sizeof(code),nullptr,nullptr,nullptr,"main","cs_5_0",0,0,&cs,&error)));
     D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};pd.pRootSignature=root.Get();pd.CS={cs->GetBufferPointer(),cs->GetBufferSize()};test::ComPtr<ID3D12PipelineState> pso;
     REQUIRE(SUCCEEDED(dev->CreateComputePipelineState(&pd,IID_PPV_ARGS(&pso))));
+    if(prewarm_only){
+        const auto before=na::observe::GetMipLiveStats().warmed_levels;
+        na::observe::SetSamplerMipPrewarm(true);
+        na::observe::SetSamplerMipBiasLive(-.5f);REQUIRE(na::observe::WaitSamplerVariant(10000));
+        // No recording, PSO bind, or deliberate miss wakes the worker here.
+        // A completed choice must itself schedule the remaining menu levels.
+        for(unsigned i=0;i<300&&na::observe::GetMipLiveStats().warmed_levels==before;++i)Sleep(10);
+        const auto after=na::observe::GetMipLiveStats();
+        std::printf("idle mip warm-up: before=%llu after=%llu, want=%.2f live=%.2f, no draw/miss trigger\n",(unsigned long long)before,(unsigned long long)after.warmed_levels,after.want_bias,after.live_bias);
+        CHECK(after.warmed_levels>before&&after.want_bias==after.live_bias);
+        REQUIRE(na_observe_stop()==NA_OK);na::observe::SetProcessExiting();return test::finish("idle mip prewarm");
+    }
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT of{};const auto od=out->GetDesc();dev->GetCopyableFootprints(&od,0,1,0,&of,nullptr,nullptr,&bytes);
     auto rb=test::CreateBuffer(dev,bytes,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);REQUIRE(rb);test::List list;REQUIRE(list.Create(dev));REQUIRE(SUCCEEDED(list.list->Close()));
     std::vector<float> original;unsigned pass=0;
@@ -249,6 +262,7 @@ int main(int argc, char** argv)
 {
     setvbuf(stdout, nullptr, _IONBF, 0);
     if(argc>1&&std::strcmp(argv[1],"--af-pixels")==0)return AnisoPixels(argc>2&&std::strcmp(argv[2],"clamp")==0);
+    if(argc>1&&std::strcmp(argv[1],"--mip-prewarm")==0)return AnisoPixels(false,true);
     const UINT samples = argc > 1 ? UINT(std::atoi(argv[1])) : 1;
     const UINT depth_samples = argc > 2 ? UINT(std::atoi(argv[2])) : samples;
     const bool msaa = samples > 1;

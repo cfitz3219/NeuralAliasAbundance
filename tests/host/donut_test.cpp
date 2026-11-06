@@ -9,6 +9,8 @@
 #include "fake_ngx_params.hpp"
 #endif
 #include <array>
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <vector>
 #include <d3d12sdklayers.h>
@@ -56,10 +58,80 @@ std::vector<float> pixels(const Readback& rb) {
 
 void sink(const na_event_batch*,void*){}
 }
+int backend_benchmark(){
+#if !defined(NA_HAVE_DONUT) || !defined(NA_HAVE_NVRHI)
+    return test::kSkip;
+#else
+    // Standalone comparison: GPU waits/readbacks are outside CPU timing.
+    test::Device d;if(!test::CreateDevice(d))return test::kSkip;
+    constexpr unsigned W=640,H=360;
+    std::vector<float> data(W*H*4,.1f);for(unsigned i=0;i<W*H;++i)data[i*4+3]=.37f;
+    for(unsigned y=H/3;y<H/3+16;++y)for(unsigned x=W/3;x<W/3+16;++x)for(unsigned c=0;c<3;++c)data[(y*W+x)*4+c]=12;
+    test::List upload;REQUIRE(upload.Create(d.device.Get()));auto image=input(d,upload,W,H,DXGI_FORMAT_R32G32B32A32_FLOAT,data,4);
+    REQUIRE(SUCCEEDED(upload.list->Close()));ID3D12CommandList* up[]={upload.list.Get()};d.queue->ExecuteCommandLists(1,up);d.WaitIdle();
+    na::donut::Inputs in;in.color=image.texture.Get();in.format=DXGI_FORMAT_R32G32B32A32_FLOAT;in.width=W;in.height=H;in.seconds=1.f/60;
+    na::donut::Options options;options.bloom=true;options.bloom_sigma=8;options.bloom_amount=.5f;
+    na::donut::Pass nativePass,nvrhiPass;
+    test::List native;REQUIRE(native.Create(d.device.Get()));REQUIRE(SUCCEEDED(native.list->Close()));
+    na::gpu::Recording nvrhi;
+    std::shared_ptr<na::donut::Frame> last[2];std::vector<double> samples[2];
+    for(unsigned round=0;round<9;++round)for(unsigned step=0;step<2;++step){
+        const unsigned backend=(step+round)%2;na::gpu::SetBackendForTests(backend?na::gpu::TestBackend::Nvrhi:na::gpu::TestBackend::Native);
+        auto& pass=backend?nvrhiPass:nativePass;
+        pass.Prepare(d.device.Get(),d.queue.Get(),in,options);REQUIRE(pass.WaitPrepared(30000));
+        double elapsed=0;
+        for(unsigned frame=0;frame<40;++frame){
+            last[backend].reset();const auto begin=std::chrono::steady_clock::now();
+            auto work=pass.Prepare(d.device.Get(),d.queue.Get(),in,options);REQUIRE(work);
+            ID3D12GraphicsCommandList* list=nullptr;
+            if(backend){REQUIRE(nvrhi.Open(d.device.Get(),d.queue.Get()));list=nvrhi.Native();}
+            else {REQUIRE(SUCCEEDED(native.alloc->Reset())&&SUCCEEDED(native.list->Reset(native.alloc.Get(),nullptr)));list=native.list.Get();}
+            REQUIRE(work->Record(list));
+            if(backend){REQUIRE(nvrhi.Close());nvrhi.Retain(work);REQUIRE(nvrhi.Submit());}
+            else {REQUIRE(SUCCEEDED(list->Close()));ID3D12CommandList* lists[]={list};d.queue->ExecuteCommandLists(1,lists);}
+            const auto end=std::chrono::steady_clock::now();
+            if(frame>=8)elapsed+=std::chrono::duration<double,std::micro>(end-begin).count();
+            d.WaitIdle();na::gpu::Collect();last[backend]=std::move(work);
+        }
+        samples[backend].push_back(elapsed/32);
+    }
+    for(unsigned backend=0;backend<2;++backend){std::sort(samples[backend].begin(),samples[backend].end());
+        std::printf("backend benchmark actual Bloom: %s median CPU prepare+record+submit %.3f us, 9 alternating batches, 32 warm frames/batch\n",backend?"NVRHI":"native",samples[backend][4]);}
+    // J2/NR export a list and record their existing native commands into it.
+    // Compare that wrapper separately from the effect compute abstraction.
+    std::vector<double> recordOnly[2];
+    for(unsigned round=0;round<9;++round)for(unsigned step=0;step<2;++step){
+        const unsigned backend=(step+round)%2;na::gpu::SetBackendForTests(backend?na::gpu::TestBackend::Nvrhi:na::gpu::TestBackend::Native);
+        double elapsed=0;
+        for(unsigned frame=0;frame<40;++frame){
+            const auto begin=std::chrono::steady_clock::now();ID3D12GraphicsCommandList* list=nullptr;
+            if(backend){REQUIRE(nvrhi.Open(d.device.Get(),d.queue.Get()));list=nvrhi.Native();}
+            else {REQUIRE(SUCCEEDED(native.alloc->Reset())&&SUCCEEDED(native.list->Reset(native.alloc.Get(),nullptr)));list=native.list.Get();}
+            auto barrier=test::Transition(image.texture.Get(),Read,D3D12_RESOURCE_STATE_COPY_SOURCE);list->ResourceBarrier(1,&barrier);
+            std::swap(barrier.Transition.StateBefore,barrier.Transition.StateAfter);list->ResourceBarrier(1,&barrier);
+            if(backend){REQUIRE(nvrhi.Close());nvrhi.Retain(last[backend]);REQUIRE(nvrhi.Submit());}
+            else {REQUIRE(SUCCEEDED(list->Close()));ID3D12CommandList* lists[]={list};d.queue->ExecuteCommandLists(1,lists);}
+            const auto end=std::chrono::steady_clock::now();if(frame>=8)elapsed+=std::chrono::duration<double,std::micro>(end-begin).count();
+            d.WaitIdle();na::gpu::Collect();
+        }
+        recordOnly[backend].push_back(elapsed/32);
+    }
+    for(unsigned backend=0;backend<2;++backend){std::sort(recordOnly[backend].begin(),recordOnly[backend].end());
+        std::printf("backend benchmark native-command wrapper: %s median CPU record+submit %.3f us\n",backend?"NVRHI":"native",recordOnly[backend][4]);}
+    std::vector<float> result[2];
+    for(unsigned backend=0;backend<2;++backend){test::List read;REQUIRE(read.Create(d.device.Get()));auto rb=capture(d,read,last[backend]->Color());
+        REQUIRE(SUCCEEDED(read.list->Close()));ID3D12CommandList* lists[]={read.list.Get()};d.queue->ExecuteCommandLists(1,lists);d.WaitIdle();result[backend]=pixels(rb);}
+    REQUIRE(result[0].size()==result[1].size());double error=0;for(size_t i=0;i<result[0].size();++i)error=(std::max)(error,double(std::abs(result[0][i]-result[1][i])));
+    std::printf("backend benchmark output maximum error %.9f; GPU errors=%llu\n",error,static_cast<unsigned long long>(na::gpu::GetStats().errors));
+    CHECK(error<.0001&&na::gpu::GetStats().errors==0);CHECK(d.device->GetDeviceRemovedReason()==S_OK);
+    na::observe::SetProcessExiting();return test::finish("NVRHI/native backend benchmark");
+#endif
+}
 int main(int argc,char** argv){
+    if(argc>1&&std::strcmp(argv[1],"--benchmark")==0)return backend_benchmark();
     const bool nvrhi=argc>1&&std::strcmp(argv[1],"--nvrhi")==0;
     if(nvrhi&&!na::gpu::GetStats().built)return test::kSkip;
-    na::settings::Get().experimental_nvrhi=nvrhi;
+    na::gpu::SetBackendForTests(nvrhi?na::gpu::TestBackend::Nvrhi:na::gpu::TestBackend::Native);
 #if !defined(NA_HAVE_DONUT)
     return test::kSkip;
 #else
