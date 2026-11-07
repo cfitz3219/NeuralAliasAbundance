@@ -1,0 +1,432 @@
+--- a/src/adapters/alien_isolation.cpp
++++ b/src/adapters/alien_isolation.cpp
+@@ -48,3 +48,11 @@
+     return code && size>=20 && std::memcmp(code,"DXBC",4)==0 &&
+         std::memcmp(static_cast<const char*>(code)+4,hash,sizeof(hash))==0;
+ }
++
++// Installed Alias Isolation sharpen shader; converts scene color to sRGB.
++// Exact bytecode identity, not a generic fullscreen/UI heuristic.
++bool alien_isolation::is_alias_sharpen_shader(const void* code,std::size_t size){
++    constexpr uint32_t hash[]={0x3fff4594,0x525c9cd1,0x1b3ed405,0x5945c269};
++    return code && size>=20 && std::memcmp(code,"DXBC",4)==0 &&
++        std::memcmp(static_cast<const char*>(code)+4,hash,sizeof(hash))==0;
++}
+--- a/src/adapters/alien_isolation.hpp
++++ b/src/adapters/alien_isolation.hpp
+@@ -4,6 +4,7 @@
+ namespace alien_isolation {
+ // This identifies the host name only; it does not verify shader compatibility.
+ bool is_host();
++bool is_alias_sharpen_shader(const void* code, std::size_t size);
+ bool is_camera_motion_shader(const void* code, std::size_t size);
+ bool is_temporal_consumer_shader(const void* code, std::size_t size);
+ bool is_rgbm_pixel_shader(const void* code, std::size_t size);
+--- a/src/adapters/alien_neural.cpp
++++ b/src/adapters/alien_neural.cpp
+@@ -8,7 +8,7 @@
+ using Microsoft::WRL::ComPtr;
+ static void check(HRESULT result,const char* message){if(FAILED(result))throw std::runtime_error(message);}
+ void NeuralTrial::reset(){
+-    bridge_.stop();view_.Reset();color_.Reset();last_frame_=UINT64_MAX;last_time_=0;frames_=0;waits_=0;
++    cuts_.clear();bridge_.stop();view_.Reset();color_.Reset();last_frame_=UINT64_MAX;last_time_=0;frames_=0;waits_=0;
+     if(!failed_)status_=requested_?"Neural rendering: waiting for DLAA gameplay.":"Neural rendering: off.";
+ }
+ void NeuralTrial::request(bool enabled,dx11_enhancement::NeuralSettings settings){
+@@ -18,9 +18,11 @@
+     reshade::log::message(reshade::log::level::info,status_.c_str());
+ }
+ void NeuralTrial::render(ID3D11DeviceContext* context,ID3D11RenderTargetView* target,
+-    ID3D11ShaderResourceView* depth,ID3D11ShaderResourceView* motion,uint64_t frame,bool current_dlaa){
++    ID3D11ShaderResourceView* depth,ID3D11ShaderResourceView* motion,uint64_t frame,bool current_dlaa,
++    const std::array<float,16>& view_projection,bool camera_valid){
+     if(!requested_ || failed_)return;
+     if(!current_dlaa){status_="Neural rendering: waiting for DLAA gameplay.";return;}
++    if(!camera_valid){cuts_.clear();status_="Neural rendering: waiting for current camera transform.";return;}
+     try{
+         if(!target || !depth || !motion)throw std::runtime_error("missing current-frame inputs");
+         D3D11_RENDER_TARGET_VIEW_DESC vd{};target->GetDesc(&vd);
+@@ -59,14 +61,20 @@
+         metadata.width=desc.Width;metadata.height=desc.Height;metadata.source_frame=frame;
+         metadata.motion_scale_x=-float(desc.Width);metadata.motion_scale_y=-float(desc.Height);
+         const auto now=GetTickCount64(),elapsed=last_time_?now-last_time_:0;
+-        metadata.reset=last_frame_==UINT64_MAX || frame!=last_frame_+1 || elapsed>250;
++        const auto cut=cuts_.observe(view_projection,frame,now);
++        metadata.reset=last_frame_==UINT64_MAX || frame!=last_frame_+1 || elapsed>250 || cut.reset;
++        if(cut.reason==CameraCutDetector::Reason::jump || cut.reason==CameraCutDetector::Reason::invalid_matrix){
++            char line[192]{};std::snprintf(line,sizeof(line),"[DX11NeuralCut] frame=%llu reset=1 reason=%s normalized displacement=%.4f (heuristic).",
++                frame,cut.reason==CameraCutDetector::Reason::jump?"camera jump":"invalid matrix",cut.displacement);
++            reshade::log::message(reshade::log::level::info,line);
++        }
+         metadata.frame_ms=elapsed && elapsed<=250?float(elapsed):16.6667f;
+         bridge_.process(context,view_.Get(),depth,motion,target,metadata);
+         last_frame_=frame;last_time_=now;++frames_;waits_+=bridge_.last_wait_ms();
+-        status_="Neural rendering: active (experimental; includes game HUD).";
++        status_="Neural rendering: active at post-sharpen scene boundary (HUD ordering awaits validation).";
+         if(frames_==1){
+             char line[256]{};std::snprintf(line,sizeof(line),
+-                "[DX11Neural] First result: final SDR %ux%u format=%u; before ReShade effects; HUD included; controls recorded in helper session settings.txt.",
++                "[DX11Neural] First result: post-sharpen SDR %ux%u format=%u; before next game draw; candidate pre-HUD stage; controls recorded in helper session settings.txt.",
+                 desc.Width,desc.Height,static_cast<unsigned>(vd.Format));
+             reshade::log::message(reshade::log::level::info,line);
+         }
+--- a/src/adapters/alien_neural.hpp
++++ b/src/adapters/alien_neural.hpp
+@@ -1,19 +1,24 @@
+ #pragma once
+ #include "core/neural_bridge.hpp"
++#include "camera_cut.hpp"
+ #include <wrl/client.h>
+ #include <string>
+ 
+ namespace alien_isolation {
+-// Experimental final SDR stage: game HUD pixels are included, without a UI mask.
++// Candidate post-sharpen SDR stage. Never falls back to the HUD-composited backbuffer.
+ class NeuralTrial {
+ public:
+     void request(bool enabled,dx11_enhancement::NeuralSettings settings);
+     void reset();
+     void render(ID3D11DeviceContext*,ID3D11RenderTargetView*,ID3D11ShaderResourceView* depth,
+-        ID3D11ShaderResourceView* motion,uint64_t frame,bool current_dlaa);
++        ID3D11ShaderResourceView* motion,uint64_t frame,bool current_dlaa,
++        const std::array<float,16>& view_projection,bool camera_valid);
++    bool needs_camera()const{return requested_ && !failed_;}
++    void missing_stage(){if(needs_camera())status_="Neural rendering: waiting for identified post-sharpen scene boundary.";}
+     const std::string& status()const{return status_;}
+ private:
+     dx11_enhancement::NeuralBridge bridge_;
++    CameraCutDetector cuts_;
+     Microsoft::WRL::ComPtr<ID3D11Texture2D> color_;
+     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> view_;
+     dx11_enhancement::NeuralSettings settings_;
+--- /dev/null
++++ b/src/adapters/camera_cut.hpp
+@@ -0,0 +1,58 @@
++#pragma once
++#include <array>
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++namespace alien_isolation {
++// Heuristic, not an engine cut flag. Matrix layout follows the pinned motion PS dp4 rows.
++// Compare frustum points in normalized screen space so world-coordinate scale is irrelevant.
++class CameraCutDetector {
++public:
++    enum class Reason { none, first_or_gap, invalid_matrix, jump };
++    struct Result { bool reset; Reason reason; double displacement; };
++    void clear(){valid_=false;previous_motion_=0;}
++    Result observe(const std::array<float,16>& current,uint64_t frame,uint64_t time){
++        std::array<double,16> inverse{};
++        if(!invert(current,inverse)){clear();return {true,Reason::invalid_matrix,0};}
++        if(!valid_ || frame!=frame_+1 || time<time_ || time-time_>250){
++            save(current,frame,time,0);return {true,Reason::first_or_gap,0};
++        }
++        std::array<double,27> distances{};unsigned n=0,behind=0;
++        for(double z:{.1,.5,.9})for(double y:{-.7,0.,.7})for(double x:{-.7,0.,.7}){
++            const std::array<double,4> p{x,y,z,1};auto world=multiply(inverse,p);
++            if(std::abs(world[3])<1e-10){++behind;continue;}
++            const double w=world[3];for(auto& v:world)v/=w;
++            auto old=multiply(previous_,world);
++            if(old[3]<=1e-10){++behind;continue;}
++            const double dx=old[0]/old[3]-x,dy=old[1]/old[3]-y;
++            distances[n++]=.5*std::hypot(dx,dy);
++        }
++        if(n)std::sort(distances.begin(),distances.begin()+n);
++        const double movement=n?distances[n/2]:1;
++        const double dt=std::clamp(double(time-time_)/16.6667,.5,3.);
++        const bool jump=behind>=14 || movement>.75*dt ||
++            (movement>.20*dt && movement>4*previous_motion_+.02);
++        save(current,frame,time,jump?0:movement);
++        return {jump,jump?Reason::jump:Reason::none,movement};
++    }
++private:
++    template<class T>static std::array<double,4> multiply(const std::array<T,16>& m,const std::array<double,4>& p){
++        std::array<double,4> r{};for(unsigned y=0;y<4;++y)for(unsigned x=0;x<4;++x)r[y]+=m[y*4+x]*p[x];return r;
++    }
++    static bool invert(const std::array<float,16>& m,std::array<double,16>& out){
++        double a[4][8]{};
++        for(unsigned y=0;y<4;++y){for(unsigned x=0;x<4;++x){if(!std::isfinite(m[y*4+x]))return false;a[y][x]=m[y*4+x];}a[y][y+4]=1;}
++        for(unsigned col=0;col<4;++col){
++            unsigned pivot=col;for(unsigned y=col+1;y<4;++y)if(std::abs(a[y][col])>std::abs(a[pivot][col]))pivot=y;
++            if(std::abs(a[pivot][col])<1e-12)return false;
++            for(unsigned x=0;x<8;++x)std::swap(a[col][x],a[pivot][x]);
++            const double scale=a[col][col];for(auto& v:a[col])v/=scale;
++            for(unsigned y=0;y<4;++y)if(y!=col){const double f=a[y][col];for(unsigned x=0;x<8;++x)a[y][x]-=f*a[col][x];}
++        }
++        for(unsigned y=0;y<4;++y)for(unsigned x=0;x<4;++x){out[y*4+x]=a[y][x+4];if(!std::isfinite(out[y*4+x]))return false;}
++        return true;
++    }
++    void save(const std::array<float,16>& m,uint64_t f,uint64_t t,double motion){previous_=m;frame_=f;time_=t;previous_motion_=motion;valid_=true;}
++    std::array<float,16> previous_{};uint64_t frame_=0,time_=0;double previous_motion_=0;bool valid_=false;
++};
++}
+--- a/src/core/depth_addon.cpp
++++ b/src/core/depth_addon.cpp
+@@ -31,6 +31,12 @@
+     dx11_enhancement::LiveBridge live;
+     alien_isolation::NeuralTrial neural;
+     uint64_t live_displayed_frame=UINT64_MAX;
++    diagnostics::ProjectionSnapshot neural_camera_snapshot,neural_sharpen_constants;
++    std::array<float,16> neural_view_projection{};
++    bool neural_camera_captured=false;
++    uint64_t neural_camera_frame=UINT64_MAX,neural_boundary_frame=UINT64_MAX;
++    ComPtr<ID3D11RenderTargetView> neural_scene_pending;
++    uint64_t neural_scene_frame=UINT64_MAX;
+     diagnostics::TexturePreview live_depth,live_motion;
+     diagnostics::ProjectionSnapshot live_projection;
+     diagnostics::ProjectionVerifier live_verifier;
+@@ -188,6 +194,9 @@
+                 if(!trusted && state.live_verifier.trusted())log::message(log::level::info,"[DX11DLAACamera] Eight CPU uploads match GPU projection including changing jitter; cached upload path qualified.");
+             }else state.live_verifier.reset();
+         }
++        if(state.neural.needs_camera() && state.neural_camera_captured &&
++            SUCCEEDED(state.neural_camera_snapshot.inspect(context,state.neural_view_projection)))
++            state.neural_camera_frame=state.frame;
+         state.live_projection_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-projection_begin).count();
+         const auto motion_begin=std::chrono::steady_clock::now();
+         if(FAILED(state.live_motion.capture_motion(context,state.live_motion_source.Get())) ||
+@@ -269,6 +278,12 @@
+         }
+         if (objects[i].type != api::pipeline_subobject_type::pixel_shader || objects[i].count != 1) continue;
+         const auto& shader = *static_cast<const api::shader_desc*>(objects[i].data);
++        if(alien_isolation::is_alias_sharpen_shader(shader.code,shader.code_size)){
++            const UINT tag=6;
++            reinterpret_cast<ID3D11PixelShader*>(pipeline.handle)->SetPrivateData(camera_tag,sizeof(tag),&tag);
++            log::message(log::level::info,"[DX11Neural] Pinned Alias sharpen shader identified; candidate post-sharpen/pre-HUD boundary.");
++            continue;
++        }
+         const bool camera = alien_isolation::is_camera_motion_shader(shader.code, shader.code_size);
+         const bool consumer = alien_isolation::is_temporal_consumer_shader(shader.code, shader.code_size);
+         if (!camera && !consumer) continue;
+@@ -285,6 +300,55 @@
+     UINT size = sizeof(UINT), tag = 0;
+     return shader && SUCCEEDED(shader->GetPrivateData(camera_tag, &size, &tag)) ? tag : 0;
+ }
++// Called before the following draw/command-list submission. The identified scene
++// draw has completed by this boundary. Never use begin_effects as an image fallback.
++void flush_neural_scene(DepthState& state,ID3D11DeviceContext* context){
++    if(!state.neural_scene_pending)return;
++    auto target=std::move(state.neural_scene_pending);
++    if(state.neural_scene_frame!=state.frame)return;
++    state.neural_boundary_frame=state.frame;
++    state.neural.render(context,target.Get(),state.live_depth.raw_view(),state.live_motion.raw_view(),
++        state.frame,state.live_enabled && state.live_displayed_frame==state.frame,
++        state.neural_view_projection,state.neural_camera_frame==state.frame);
++}
++void neural_command_boundary(api::command_list* commands){
++    auto* state=commands->get_device()->get_private_data<DepthState>();if(!state)return;
++    auto* context=reinterpret_cast<ID3D11DeviceContext*>(commands->get_native());
++    if(context->GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE)return;
++    std::lock_guard lock(state->mutex);flush_neural_scene(*state,context);
++}
++// Copies, clears and indirect work can occur between the scene and UI draws too.
++bool neural_indirect(api::command_list* c,api::indirect_command,api::resource,uint64_t,uint32_t,uint32_t){
++    neural_command_boundary(c);return false;
++}
++bool neural_clear(api::command_list* c,api::resource_view,const float[4],uint32_t,const api::rect*){
++    neural_command_boundary(c);return false;
++}
++bool neural_copy_region(api::command_list* c,api::resource,uint32_t,const api::subresource_box*,
++    api::resource,uint32_t,const api::subresource_box*,api::filter_mode){
++    neural_command_boundary(c);return false;
++}
++void neural_draw_boundary(api::command_list* commands){
++    auto* state=commands->get_device()->get_private_data<DepthState>();if(!state)return;
++    auto* context=reinterpret_cast<ID3D11DeviceContext*>(commands->get_native());
++    if(context->GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE)return;
++    std::lock_guard lock(state->mutex);
++    flush_neural_scene(*state,context);
++    if(!state->neural.needs_camera() || state->live_displayed_frame!=state->frame ||
++        state->neural_boundary_frame==state->frame)return;
++    ComPtr<ID3D11PixelShader> shader;context->PSGetShader(&shader,nullptr,nullptr);
++    if(shader_role(shader.Get())!=6)return;
++    // The pinned shader also draws Alias Isolation's startup logo. Wait until it fades.
++    UINT first=0;std::array<float,16> constants{};
++    if(FAILED(snapshot_pixel_constants(context,10,0,1,state->neural_sharpen_constants,first)) ||
++        FAILED(state->neural_sharpen_constants.inspect(context,constants)) ||
++        !std::isfinite(constants[0]) || constants[0]>0)return;
++    D3D11_VIEWPORT viewport{};UINT count=1;context->RSGetViewports(&count,&viewport);
++    if(count!=1 || viewport.TopLeftX!=0 || viewport.TopLeftY!=0 ||
++        viewport.Width!=float(state->live_depth.width()) || viewport.Height!=float(state->live_depth.height()))return;
++    context->OMGetRenderTargets(1,state->neural_scene_pending.ReleaseAndGetAddressOf(),nullptr);
++    state->neural_scene_frame=state->frame;
++}
+ void bind_pipeline(api::command_list* commands, api::pipeline_stage stages, api::pipeline pipeline) {
+     auto* state = commands->get_private_data<CommandState>();
+     if (state && (stages & api::pipeline_stage::pixel_shader) != static_cast<api::pipeline_stage>(0))
+@@ -294,11 +358,13 @@
+ }
+ 
+ bool trace_dispatch(api::command_list* commands,uint32_t,uint32_t,uint32_t) {
++    neural_command_boundary(commands);
+     auto* state=commands->get_private_data<CommandState>();
+     if (state && state->taa_bound) state->taa_dispatched=true;
+     return false;
+ }
+ bool trace_copy(api::command_list* commands,api::resource,api::resource destination) {
++    neural_command_boundary(commands);
+     auto* state=commands->get_private_data<CommandState>();
+     if (state && state->taa_dispatched) {
+         state->taa_output=reinterpret_cast<ID3D11Resource*>(destination.handle);
+@@ -322,6 +388,10 @@
+     }
+     ComPtr<ID3D11DeviceContext> context;
+     if (FAILED(native->QueryInterface(IID_PPV_ARGS(&context))) || context->GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE) return;
++    {
++        std::lock_guard lock(device_state->mutex);
++        flush_neural_scene(*device_state,context.Get());
++    }
+     ComPtr<ID3D11CommandList> list;
+     if (FAILED(reinterpret_cast<IUnknown*>(secondary->get_native())->QueryInterface(IID_PPV_ARGS(&list)))) return;
+     ComPtr<ID3D11Resource> output;
+@@ -370,6 +440,7 @@
+     const UINT role = shader_role(shader.Get());
+     if (!role) return;
+     std::lock_guard lock(state->mutex);
++    if (role == 6) return; // Scene-boundary bookkeeping is separate from depth capture.
+     if (role == 3) {
+         ComPtr<ID3D11VertexShader> vertex;
+         context->VSGetShader(&vertex,nullptr,nullptr);
+@@ -456,6 +527,13 @@
+     ++state->draws_this_frame;
+     if(state->live_enabled) {
+         state->live_camera=false;state->live_cpu_fresh=false;
++        state->neural_camera_captured=false;state->neural_camera_frame=UINT64_MAX;
++        if(state->neural.needs_camera()){
++            // Pinned camera PS cb0[0..3]: main ViewProj, maintained by Alias XSC hook.
++            // Do NOT use cb2[12..15]: Alias replaces it with current-to-previous reprojection.
++            UINT first=0;
++            state->neural_camera_captured=SUCCEEDED(snapshot_pixel_constants(context,0,0,4,state->neural_camera_snapshot,first));
++        }
+         if(state->draws_this_frame!=1)live_failure(*state,"multiple camera-motion passes");
+         else {
+             ComPtr<ID3D11ShaderResourceView> depth;context->PSGetShaderResources(8,1,&depth);
+@@ -533,8 +611,8 @@
+         state->first_capture_logged = true;
+     }
+ }
+-bool draw(api::command_list* c, uint32_t, uint32_t, uint32_t, uint32_t) { capture(c); return false; }
+-bool draw_indexed(api::command_list* c, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) { capture(c); return false; }
++bool draw(api::command_list* c, uint32_t, uint32_t, uint32_t, uint32_t) { neural_draw_boundary(c); capture(c); return false; }
++bool draw_indexed(api::command_list* c, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) { neural_draw_boundary(c); capture(c); return false; }
+ 
+ void finish_pair(DepthState& state, ID3D11DeviceContext* context) {
+     if (!state.pair_armed || !state.pair_trigger.ready()) return;
+@@ -654,16 +732,16 @@
+     }
+     state.neural.request(valid && runtime->get_effects_state() && runtime->get_technique_state(t),s);
+ }
+-void begin_effects(api::effect_runtime* runtime, api::command_list* commands, api::resource_view target, api::resource_view) {
++void begin_effects(api::effect_runtime* runtime, api::command_list* commands, api::resource_view, api::resource_view) {
+     auto* state = runtime->get_device()->get_private_data<DepthState>();
+     if (!state) return;
+     std::lock_guard lock(state->mutex);
+     state->rendered = false;
+     auto* context = reinterpret_cast<ID3D11DeviceContext*>(commands->get_native());
+     sync_neural_controls(runtime,*state);
+-    state->neural.render(context,reinterpret_cast<ID3D11RenderTargetView*>(target.handle),
+-        state->live_depth.raw_view(),state->live_motion.raw_view(),state->frame,
+-        state->live_enabled && state->live_displayed_frame==state->frame);
++    // Too late to guarantee a clean image here: discard an unconsumed boundary.
++    state->neural_scene_pending.Reset();
++    if(state->neural_boundary_frame!=state->frame)state->neural.missing_stage();
+     finish_pair(*state,context);
+     if (state->trace_remaining && !state->pair_armed && state->trace_matrix_fresh) {
+         D3D11_MAPPED_SUBRESOURCE mapped{};
+@@ -795,6 +873,8 @@
+     std::lock_guard lock(state->mutex);
+     state->live.stop();state->live_target.Reset();state->live_camera=state->live_submitted=false;
+     state->neural.reset();state->live_displayed_frame=UINT64_MAX;
++    state->neural_scene_pending.Reset();state->neural_camera_captured=false;
++    state->neural_camera_frame=state->neural_scene_frame=state->neural_boundary_frame=UINT64_MAX;
+     state->live_last_frame=UINT64_MAX;state->live_status="Display reset; DLAA helper will restart if enabled.";
+     state->history.invalidate(diagnostics::ResetReason::display_reset);
+     state->trace_remaining=0;state->trace_matrix.Reset();state->trace_output.Reset();
+@@ -942,6 +1022,9 @@
+     register_event<addon_event::bind_pipeline>(bind_pipeline);
+     register_event<addon_event::dispatch>(trace_dispatch);
+     register_event<addon_event::copy_resource>(trace_copy);
++    register_event<addon_event::copy_texture_region>(neural_copy_region);
++    register_event<addon_event::clear_render_target_view>(neural_clear);
++    register_event<addon_event::draw_or_dispatch_indirect>(neural_indirect);
+     register_event<addon_event::execute_secondary_command_list>(trace_secondary);
+     register_event<addon_event::draw>(draw);
+     register_event<addon_event::draw_indexed>(draw_indexed);
+--- a/src/core/neural_helper.cpp
++++ b/src/core/neural_helper.cpp
+@@ -59,10 +59,8 @@
+     ngx(NVSDK_NGX_D3D12_Init_with_ProjectID("211347f0-e644-4da9-bbe8-5d7630b1f7c8",NVSDK_NGX_ENGINE_TYPE_CUSTOM,"0.11.1",cache.c_str(),b.device.Get(),&common),"initialize NR");b.initialized=true;
+     ngx(NVSDK_NGX_D3D12_GetCapabilityParameters(&b.parameters),"NR capabilities");auto* p=b.parameters;
+     int available=0;ngx(p->Get("DLSSNR.Available",&available),"NR availability");if(!available)throw std::runtime_error("NR unavailable");
++    // D3D12 node selection is infrastructure; image/quality options below are NR-specific.
+     p->Set("CreationNodeMask",1u);p->Set("VisibilityNodeMask",1u);
+-    p->Set("Width",w);p->Set("Height",h);p->Set("OutWidth",w);p->Set("OutHeight",h);
+-    p->Set("PerfQualityValue",int(NVSDK_NGX_PerfQuality_Value_DLAA));
+-    p->Set("DLSS.Feature.Create.Flags",int(NVSDK_NGX_DLSS_Feature_Flags_IsHDR|NVSDK_NGX_DLSS_Feature_Flags_MVLowRes));
+     p->Set("DLSSNR.Enabled",1u);p->Set("DLSSNR.Width",w);p->Set("DLSSNR.Height",h);
+     p->Set("DLSSNR.Hint.Render.Preset",static_cast<int>(settings.model));p->Set("DLSSNR.Intensity",settings.intensity);p->Set("DLSSNR.Style",settings.style);
+     p->Set("DLSSNR.LocalStructureStrength",settings.structure);p->Set("DLSSNR.LocalToneStrength",settings.tone);p->Set("DLSSNR.SkinStructureStrength",settings.skin);
+--- /dev/null
++++ b/tests/camera_cut_test.cpp
+@@ -0,0 +1,25 @@
++#include "adapters/camera_cut.hpp"
++#include <cstdio>
++#include <limits>
++#include <stdexcept>
++using alien_isolation::CameraCutDetector;
++static std::array<float,16> identity(){return {1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};}
++static void expect(bool ok,const char* name){if(!ok)throw std::runtime_error(name);}
++int main(){try{
++    CameraCutDetector c;auto m=identity();expect(c.observe(m,0,0).reset,"first");
++    for(unsigned i=1;i<40;++i){m[3]=float(i)*.01f;m[7]=(i%2?1.f:-1.f)/1200;
++        expect(!c.observe(m,i,i*17).reset,"continuous motion and subpixel jitter");}
++    m[3]+=2;auto cut=c.observe(m,40,680);expect(cut.reset && cut.reason==CameraCutDetector::Reason::jump,"consecutive-frame teleport");
++    expect(!c.observe(m,41,697).reset,"history resumes after cut");
++    m[0]=4;expect(c.observe(m,42,714).reset,"abrupt FOV change");
++    c.clear();m=identity();c.observe(m,0,0);m[0]=0;m[2]=1;m[8]=-1;m[10]=0;
++    expect(c.observe(m,1,17).reset,"90 degree rotation");
++    expect(c.observe(m,3,34).reset,"missing frame");expect(c.observe(m,4,400).reset,"time gap");
++    m[0]=std::numeric_limits<float>::quiet_NaN();expect(c.observe(m,5,417).reset,"nonfinite");
++    m={};expect(c.observe(m,6,434).reset,"singular");
++    c.clear();m=identity();c.observe(m,0,0);
++    // Equivalent homogeneous matrix scaling must not be interpreted as movement.
++    for(auto& f:m)f*=2;expect(!c.observe(m,1,17).reset,"homogeneous scale invariance");
++    std::puts("PASS: cut heuristic: continuous motion/jitter, teleport, rotation, FOV, gaps, invalid data, homogeneous scaling.");
++    return 0;
++}catch(const std::exception& e){std::printf("FAIL: %s\n",e.what());return 1;}}
+--- a/shaders/DX11_Neural.fx
++++ b/shaders/DX11_Neural.fx
+@@ -26,7 +26,7 @@
+ void Neural_ControlCS(uint3 id : SV_DispatchThreadID) {}
+ technique NeuralRendering <
+     ui_label = "Neural rendering (experimental)";
+-    ui_tooltip = "Requires DLAA. Global definitions: DX11_NR_MODEL 0=runtime choice, 1/2/3=requested hints (no difference observed in this runtime); STYLE 0/1/2=experimental profiles; INTENSITY=overall strength; STRUCTURE=fine detail; TONE=broad lighting/color (0 preserves original tone); SKIN=skin detail (-1 follows structure); AUTO_SKIN=skin detection 0/1 (not HUD protection). Strength range 0..2, start at 1. Reload after edits; only neural helper restarts. Game HUD is included and NOT protected by a UI mask. Status in DLAA status. Uncheck to compare with DLAA alone.";
++    ui_tooltip = "Requires DLAA. Global definitions: DX11_NR_MODEL 0=runtime choice, 1/2/3=requested hints (no difference observed in this runtime); STYLE 0/1/2=experimental profiles; INTENSITY=overall strength; STRUCTURE=fine detail; TONE=broad lighting/color (0 preserves original tone); SKIN=skin detail (-1 follows structure); AUTO_SKIN=skin detection 0/1 (not HUD protection). Strength range 0..2, start at 1. Reload after edits; only neural helper restarts. Requires the pinned Alias post-sharpen scene boundary; no final-backbuffer fallback. HUD ordering remains experimental. Status in DLAA status. Uncheck to compare with DLAA alone.";
+     dx11_nr_model = DX11_NR_MODEL;
+     dx11_nr_style = DX11_NR_STYLE;
+     dx11_nr_intensity = 1.0 * DX11_NR_INTENSITY;
+--- a/scripts/test-smoke.ps1
++++ b/scripts/test-smoke.ps1
+@@ -1,7 +1,7 @@
+-param([Parameter(Mandatory)][string]$ReShadeDll, [ValidateSet(0,10,11,12,13)][int]$Preset=0)
++param([Parameter(Mandatory)][string]$ReShadeDll, [ValidateSet(0,10,11,12,13)][int]$Preset=0, [string]$BuildDirectory)
+ $ErrorActionPreference = 'Stop'
+ $projectRoot = Split-Path $PSScriptRoot -Parent
+-$buildDir = Join-Path $projectRoot 'build/Win32/RelWithDebInfo'
++$buildDir = if($BuildDirectory){(Resolve-Path -LiteralPath $BuildDirectory).Path}else{Join-Path $projectRoot 'build/Win32/RelWithDebInfo'}
+ $testDir = Join-Path $projectRoot ('local/smoke-' + [guid]::NewGuid().ToString('N'))
+ foreach ($name in @('dx11_smoke_host.exe', 'dx11_diagnostic.addon32')) {
+     if (!(Test-Path -LiteralPath (Join-Path $buildDir $name))) { throw 'Run scripts/build.ps1 first.' }
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -59,6 +59,10 @@
+ endif()
+ if(BUILD_SMOKE_HOST)
+   enable_testing()
++  add_executable(camera_cut_test tests/camera_cut_test.cpp)
++  target_include_directories(camera_cut_test PRIVATE src)
++  target_compile_options(camera_cut_test PRIVATE /W4 /WX /permissive-)
++  add_test(NAME camera_cut COMMAND camera_cut_test)
+   add_executable(neural_settings_test tests/neural_settings_test.cpp)
+   target_include_directories(neural_settings_test PRIVATE src)
+   target_compile_options(neural_settings_test PRIVATE /W4 /WX /permissive-)

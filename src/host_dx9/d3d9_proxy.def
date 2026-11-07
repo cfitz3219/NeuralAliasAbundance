@@ -1,0 +1,21 @@
+; d3d9.dll proxy (DX9 plan D2). Built as NeuralAliasD3D9.dll and deployed as
+; d3d9.dll beside the game exe by deploy-dx9.ps1. Undecorated names: the linker
+; maps them to the __stdcall symbols at 32 bits.
+LIBRARY
+EXPORTS
+  Direct3DCreate9
+  Direct3DCreate9Ex
+  Direct3DCreate9On12
+  Direct3DCreate9On12Ex
+  Direct3DShaderValidatorCreate9
+  Direct3D9EnableMaximizedWindowedModeShim
+  D3DPERF_BeginEvent
+  D3DPERF_EndEvent
+  D3DPERF_GetStatus
+  D3DPERF_QueryRepeatFrame
+  D3DPERF_SetMarker
+  D3DPERF_SetOptions
+  D3DPERF_SetRegion
+  DebugSetMute
+  DebugSetLevel
+  NA_D3D9_QueryStatus

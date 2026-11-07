@@ -1,0 +1,23 @@
+// Copy test for the Vulkan layer ([vulkan] copy_test=1): stands in for DLSS so
+// the plumbing can be checked without an RTX GPU. mode 1 copies the scene
+// colour; mode 2 (tests only) swaps red and blue, so a test can see exactly
+// which reads got the processed picture; mode 3 (tests only) writes the camera
+// motion vectors (x, y in render pixels) so a test can check their values.
+// Regenerate the header: scripts/gen-vk-shaders.sh
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_in;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D u_out;
+layout(set = 0, binding = 2) uniform sampler2D u_motion;
+layout(push_constant) uniform PC { uvec2 size; uint mode; } pc;
+
+void main()
+{
+    const uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x >= pc.size.x || id.y >= pc.size.y) return;
+    vec4 c = texelFetch(u_in, ivec2(id), 0);
+    if (pc.mode == 2u) c = c.bgra;
+    if (pc.mode == 3u) c = vec4(texelFetch(u_motion, ivec2(id), 0).xy, 0.0, 1.0);
+    imageStore(u_out, ivec2(id), c);
+}
