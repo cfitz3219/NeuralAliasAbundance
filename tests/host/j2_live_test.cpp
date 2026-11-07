@@ -430,6 +430,7 @@ int main(int argc,char** argv)
                 float4 vs(uint id:SV_VertexID):SV_Position{float2 p=float2((id<<1)&2,id&2);return float4(p*float2(2,-2)+float2(-1,1),0,1);}
                 float4 ps(float4 p:SV_Position):SV_Target{float4 c=image.Load(int3(uint2(p.xy),0));
                 #ifdef SE5
+                if(p.x<4 && p.y<4)return float4(0,1,0,1);
                 return float4(pow(c.rgb,2.2),c.a);
                 #else
                 return c;
@@ -464,19 +465,20 @@ int main(int argc,char** argv)
             }
         }
         // SE5 upscale step with a second, smaller input bound on alternating frames:
-        // tables at 7 (late, aux, native) and 10 (late, null, native); 13 = decoy SRV.
+        // Tables at 7 (native, late, aux) and 10 (native, late, null). The
+        // unbounded SRV range uses two statically declared registers.
         test::ComPtr<ID3D12RootSignature> se5_root;test::ComPtr<ID3D12PipelineState> se5_upscale;
         if(native_se5){
             const auto base=heap->GetCPUDescriptorHandleForHeapStart().ptr;
             D3D12_SHADER_RESOURCE_VIEW_DESC fp=sv;fp.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;
-            dev->CreateShaderResourceView(late.Get(),&sv,{base+7*increment});
-            dev->CreateShaderResourceView(aux.Get(),&fp,{base+8*increment});
-            dev->CreateUnorderedAccessView(native.Get(),nullptr,&uv,{base+9*increment});
-            dev->CreateShaderResourceView(late.Get(),&sv,{base+10*increment});
-            dev->CreateShaderResourceView(nullptr,&fp,{base+11*increment});
-            dev->CreateUnorderedAccessView(native.Get(),nullptr,&uv,{base+12*increment});
+            dev->CreateUnorderedAccessView(native.Get(),nullptr,&uv,{base+7*increment});
+            dev->CreateShaderResourceView(late.Get(),&sv,{base+8*increment});
+            dev->CreateShaderResourceView(aux.Get(),&fp,{base+9*increment});
+            dev->CreateUnorderedAccessView(native.Get(),nullptr,&uv,{base+10*increment});
+            dev->CreateShaderResourceView(late.Get(),&sv,{base+11*increment});
+            dev->CreateShaderResourceView(nullptr,&fp,{base+12*increment});
             dev->CreateShaderResourceView(decoy.Get(),&sv,{base+13*increment});
-            D3D12_DESCRIPTOR_RANGE r2[2]{{D3D12_DESCRIPTOR_RANGE_TYPE_SRV,2,0,0,0},{D3D12_DESCRIPTOR_RANGE_TYPE_UAV,1,0,0,2}};
+            D3D12_DESCRIPTOR_RANGE r2[2]{{D3D12_DESCRIPTOR_RANGE_TYPE_UAV,1,0,0,0},{D3D12_DESCRIPTOR_RANGE_TYPE_SRV,UINT_MAX,0,0,1}};
             D3D12_ROOT_PARAMETER p2{};p2.ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;p2.DescriptorTable={2,r2};
             D3D12_ROOT_SIGNATURE_DESC d2{1,&p2,0,nullptr,D3D12_ROOT_SIGNATURE_FLAG_NONE};
             serialized.Reset();
@@ -490,6 +492,8 @@ int main(int argc,char** argv)
             REQUIRE(SUCCEEDED(dev->CreateComputePipelineState(&c,IID_PPV_ARGS(&se5_upscale))));
         }
         const bool native_overwrite=native_se5&&argc>1&&std::strstr(argv[1],"overwrite")!=nullptr;
+        const bool native_reverse=native_se5&&argc>1&&std::strstr(argv[1],"reverse")!=nullptr;
+        const bool native_tail=native_se5&&argc>1&&std::strstr(argv[1],"tail")!=nullptr;
         // SE5: the presenting list is recorded ONCE (before any trace window) and
         // executed every frame; it writes the presented image twice: first from
         // the decoy, then from the game's upscaled image (the write that counts).
@@ -512,7 +516,7 @@ int main(int argc,char** argv)
             scene.list->SetGraphicsRootSignature(rs.Get());ID3D12DescriptorHeap* camera_heap[]{cbvh.Get()};scene.list->SetDescriptorHeaps(1,camera_heap);
             scene.list->SetGraphicsRootConstantBufferView(0,va+1024);scene.list->SetGraphicsRootDescriptorTable(1,cbvh->GetGPUDescriptorHandleForHeapStart());
             const auto source_read=native_graphics?D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE:D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-            D3D12_RESOURCE_BARRIER finish_native[2]{test::Transition(color.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,source_read),test::Transition(depth.Get(),D3D12_RESOURCE_STATE_DEPTH_WRITE,D3D12_RESOURCE_STATE_COMMON)};
+            D3D12_RESOURCE_BARRIER finish_native[2]{test::Transition(color.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,native_se5?D3D12_RESOURCE_STATE_COMMON:source_read),test::Transition(depth.Get(),D3D12_RESOURCE_STATE_DEPTH_WRITE,D3D12_RESOURCE_STATE_COMMON)};
             scene.list->ResourceBarrier(2,finish_native);
             ID3D12GraphicsCommandList* target_list=scene.list.Get();
             if(!native_merged){
@@ -520,12 +524,18 @@ int main(int argc,char** argv)
                 // Render ahead: this producer closes before the preceding
                 // picture's Present; its separate post list records afterward.
                 // Cover both not-yet-submitted and already-submitted producer.
-                if(native_late || iteration==2){ID3D12CommandList* producer[]{scene.list.Get()};na::j2::Execute(d.queue.Get(),1,producer,&Forward);}
+                if(!native_se5&&(native_late || iteration==2)){ID3D12CommandList* producer[]{scene.list.Get()};na::j2::Execute(d.queue.Get(),1,producer,&Forward);}
                 if(!native_late && iteration)na::j2::OnPresent(d.queue.Get());
                 post.Reset();target_list=post.list.Get();
             }
             const auto game_write=native_graphics?D3D12_RESOURCE_STATE_RENDER_TARGET:D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
             auto into_uav=test::Transition(native.Get(),D3D12_RESOURCE_STATE_COMMON,game_write);target_list->ResourceBarrier(1,&into_uav);
+            if(native_se5){
+                // The game's native work is legal even with a stale scene. The
+                // reversed case must detect our dependency without invalid barriers.
+                auto read=test::Transition(color.Get(),D3D12_RESOURCE_STATE_COMMON,source_read);
+                target_list->ResourceBarrier(1,&read);
+            }
             target_list->SetPipelineState(native_pipeline.Get());ID3D12DescriptorHeap* game_heap[]{heap.Get()};target_list->SetDescriptorHeaps(1,game_heap);
             if(native_graphics){
                 target_list->SetGraphicsRootSignature(native_root.Get());target_list->SetGraphicsRootDescriptorTable(0,heap->GetGPUDescriptorHandleForHeapStart());
@@ -562,7 +572,8 @@ int main(int argc,char** argv)
             // Later native HUD draw: green corner must survive reconstruction.
             D3D12_RESOURCE_BARRIER order{};order.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;order.UAV.pResource=native.Get();target_list->ResourceBarrier(1,&order);
             const float green[]{0,1,0,1};const D3D12_RECT hud_rect{0,0,4,4};
-            target_list->ClearUnorderedAccessViewFloat(gpu_uav,cpu_heap->GetCPUDescriptorHandleForHeapStart(),native.Get(),green,1,&hud_rect);
+            if(!native_se5 || native_tail)
+                target_list->ClearUnorderedAccessViewFloat(gpu_uav,cpu_heap->GetCPUDescriptorHandleForHeapStart(),native.Get(),green,1,&hud_rect);
             if(native_overwrite){
                 // Negative: the game overwrites its upscaled image before the final write reads it.
                 auto to_rt=test::Transition(native.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -612,7 +623,17 @@ int main(int argc,char** argv)
             }else target_list->ResourceBarrier(2,end_native);
             REQUIRE(SUCCEEDED(target_list->Close()));
             ID3D12CommandList* native_lists[]{scene.list.Get(),post.list.Get()};
-            if(!native_merged&&(native_late||iteration==2))na::j2::Execute(d.queue.Get(),1,native_lists+1,&Forward);
+            if(native_se5){
+                if(native_reverse && iteration>=2){
+                    na::j2::Execute(d.queue.Get(),1,native_lists+1,&Forward);
+                    na::j2::Execute(d.queue.Get(),1,native_lists,&Forward);
+                }else if(iteration%2){
+                    na::j2::Execute(d.queue.Get(),2,native_lists,&Forward);
+                }else{
+                    na::j2::Execute(d.queue.Get(),1,native_lists,&Forward);
+                    na::j2::Execute(d.queue.Get(),1,native_lists+1,&Forward);
+                }
+            }else if(!native_merged&&(native_late||iteration==2))na::j2::Execute(d.queue.Get(),1,native_lists+1,&Forward);
             else na::j2::Execute(d.queue.Get(),native_merged?1u:2u,native_lists,&Forward);
             d.WaitIdle();
             if(native_se5&&iteration>=1){
@@ -645,7 +666,7 @@ int main(int argc,char** argv)
             if(native_se5){
                 na::j2::NativeTracePresent(d.queue.Get(),presented.Get(),false);
                 if(st.native_deliveries){
-                    CHECK(!native_overwrite);
+                    CHECK(!native_overwrite && !native_reverse && !native_tail);
                     CHECK(st.native_deliveries==++late_deliveries);
                     // The evaluation's own pixels, through J2's normal write-back, the game's HUD,
                     // and the game's explicit UNORM -> FP16 conversion into the presented image.
@@ -662,6 +683,15 @@ int main(int argc,char** argv)
                     CHECK(hud[0]==0&&hud[1]==1&&hud[2]==0);
                 }else{
                     CHECK(fake::evals==before_native);
+                    if((native_reverse || native_tail) && final_recorded){
+                        const auto world=ReadTexel(d,presented.Get(),OW-1,OH-1);
+                        const auto game=ReadTexel(d,native.Get(),OW-1,OH-1);
+                        CHECK(!st.active && st.frames==1);
+                        for(int c=0;c<3;++c){
+                            CHECK(std::fabs(game[c]-std::sqrt(.3f))<.005f);
+                            CHECK(std::fabs(world[c]-std::pow(game[c],2.2f))<.003f);
+                        }
+                    }
                     if(native_overwrite&&final_recorded){
                         const auto world=ReadTexel(d,presented.Get(),OW-1,OH-1);
                         CHECK(world[0]==0&&world[1]==0&&world[2]==1);
@@ -691,6 +721,11 @@ int main(int argc,char** argv)
             if(native_overwrite){
                 // No false confirmation: nothing learned, nothing evaluated or delivered.
                 CHECK(late_deliveries==0 && fake::evals==before_native && std::strstr(trace,"learned=0")!=nullptr);
+            }else if(native_reverse || native_tail){
+                CHECK(late_deliveries==0 && fake::evals==before_native && std::strstr(trace,"handoff=[")!=nullptr);
+                const auto nb=na::j2::GetNativeBridgeStats();
+                CHECK(nb.after_skipped>0);
+                CHECK(std::strstr(nb.reason,native_reverse?"not submitted before":"no list boundary")!=nullptr);
             }else{
                 if(native_se5){
                     // Learned through the once-recorded presenting list (cached, last write),

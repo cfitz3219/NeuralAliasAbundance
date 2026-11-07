@@ -236,6 +236,8 @@ bool ListDrawState(ID3D12CommandList* list, DrawInfo& out);
 na_object_id ListPipelineId(ID3D12CommandList* list);
 // Identity of the list's current recording (changes on every Reset); 0 if unknown.
 uint64_t ListRecording(ID3D12CommandList* list);
+// Track whether this recording adds commands other than resource barriers or Close.
+bool ListWorkTailUnchanged(ID3D12CommandList* list, bool arm = false);
 // True when this recording cleared `target` with ClearRenderTargetView.
 bool ListClearsTarget(ID3D12CommandList* list, na_object_id target);
 // An explicit SRV-table binding referenced the texture. Positive ordering hint

@@ -8,6 +8,7 @@
 #include "host_dx12/j2/replay_motion.hpp"
 #include <unordered_map>
 #include <map>
+#include <utility>
 #include "host_dx12/capture/capture_session.hpp"
 #include "host_dx12/j2/msaa_resolve.hpp"
 #include "host_dx12/j2/nis_scaler.hpp"
@@ -76,6 +77,7 @@ struct Slot {
     ComPtr<ID3D12GraphicsCommandList> list;
     UINT64 fence_value = 0;
     na::nr::native::RecordingLease native_scale_use;
+    std::array<ComPtr<ID3D12Resource>, 4> native_scale_resources;
     std::shared_ptr<na::donut::Frame> grade;
     std::shared_ptr<na::xegtao::Frame> ambient; // existing slot fence owns AO descriptors/resources
     std::shared_ptr<const PhysicalInput> physical; // Layer2 payload used by this slot's list: kept
@@ -109,6 +111,7 @@ struct SceneInput {
     bool require_current_states=false;
     uint64_t native_viewport_sample=0;
     ComPtr<ID3D12Resource> native_depth_snapshot;
+    std::shared_ptr<uint64_t> native_depth_reader_fence;
     na::camera::Matrix vp{};
     bool reversed = false;
     na::j2::InterloperFilter interlopers; // the rule after judging vp (when judged)
@@ -123,11 +126,18 @@ struct SceneInput {
     // Native producer identity survives a preceding picture's Present and a
     // command-list Reset after submission. A discarded/unsubmitted recording
     // cannot become a usable producer. Frame remains diagnostic for this path.
-    uint64_t native_serial=0,native_recording=0;
+    uint64_t native_serial=0,native_recording=0,native_list=0;
     na::nr::native::RecordingLease native_origin;
     // Between fallback: a not-yet-accepted entry already read this finished image in an
     // earlier submission, so a DLSS placed now lands after the picture moved on.
     bool read_before = false;
+};
+
+struct DeferredNativeScale {
+    SceneInput source;
+    ComPtr<ID3D12Resource> input, depth, output;
+    uint64_t list = 0, recording = 0, frame = 0;
+    uint64_t input_id = 0, output_id = 0, pso = 0;
 };
 
 struct State {
@@ -210,6 +220,7 @@ struct State {
     na::j2::InsertionEvent capture_entry;
     SceneInput waiting_scene;
     SceneInput native_scene;
+    DeferredNativeScale native_deferred;
     uint64_t next_native_source=0,consumed_native_source=0;
     JitterWrites jitter_writes;
     std::vector<na::j2::ColorEvent> frame_seq; // this frame's writes/consumers of the colour, submission order
@@ -401,10 +412,11 @@ struct NativeCrossing {
     uint64_t pso = 0, input = 0, output = 0, scene = 0;
     uint32_t rw = 0, rh = 0, ow = 0, oh = 0;
     uint32_t in_view = 0, out_view = 0, gx = 0, gy = 0, gz = 0;
+    bool separate_reader = false;
     bool operator==(const NativeCrossing& b) const {
         return pso==b.pso&&input==b.input&&output==b.output&&scene==b.scene&&
             rw==b.rw&&rh==b.rh&&ow==b.ow&&oh==b.oh&&in_view==b.in_view&&out_view==b.out_view&&
-            gx==b.gx&&gy==b.gy&&gz==b.gz;
+            gx==b.gx&&gy==b.gy&&gz==b.gz&&separate_reader==b.separate_reader;
     }
 };
 struct TraceOp {
@@ -460,6 +472,7 @@ void trace_append(ID3D12GraphicsCommandList* l, TraceOp&& op)
     std::lock_guard<std::mutex> lock(g_trace.m);
     if (!g_trace.armed.load(std::memory_order_relaxed) || g_trace.ops >= kTraceOps) return;
     ++g_trace.ops;
+    op.list=key.first; op.recording=key.second;
     // Whole output-size images: the candidates an inferred op can be shown to sample.
     if (!op.inferred) for (const auto& o : op.out)
         if (o.id && o.whole && o.w==e.ow && o.h==e.oh &&
@@ -778,7 +791,7 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
 
     // read_vfmt/reader: the view format and pipeline through which the nearest
     // resolved downstream shader op read this image (0 = presented itself).
-    struct Edge { uint64_t id; size_t before; bool srgb; uint32_t read_vfmt=0; uint64_t reader=0; uint32_t written_vfmt=0; };
+    struct Edge { uint64_t id; size_t before; bool srgb; uint32_t read_vfmt=0; uint64_t reader=0; uint32_t written_vfmt=0; uint64_t reader_list=0, reader_recording=0; };
     std::vector<Edge> pending{{presented,ops.size(),false}};
     std::vector<std::pair<uint64_t,size_t>> visited;
     NativeCrossing candidate;
@@ -801,7 +814,8 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
         if (output==op.out.end() || !output->whole || output->w!=e.ow || output->h!=e.oh) continue;
         if (output->binding=='r' && op.preserves) {
             ++overlays;
-            pending.push_back({edge.id,index,edge.srgb,edge.read_vfmt,edge.reader,edge.written_vfmt});
+            pending.push_back({edge.id,index,edge.srgb,edge.read_vfmt,edge.reader,edge.written_vfmt,
+                               edge.reader_list,edge.reader_recording});
             continue;
         }
         // Exactly one whole render-size input; any other input must be smaller than
@@ -838,7 +852,9 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
                     in.vfmt==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || edge.srgb || sdr_present || unorm_handoff;
                 if (encoded && trace_same_color(in.vfmt,output->vfmt) && traces_scene(in.id,index)) {
                     const NativeCrossing next{op.pso,in.id,output->id,scene,e.rw,e.rh,e.ow,e.oh,
-                                              in.vfmt,output->vfmt,op.gx,op.gy,op.gz};
+                                              in.vfmt,output->vfmt,op.gx,op.gy,op.gz,
+                                              edge.reader_list && edge.reader_recording &&
+                                              (edge.reader_list!=op.list || edge.reader_recording!=op.recording)};
                     if (candidate.pso && !(candidate==next)) ambiguous=true;
                     else candidate=next;
                 } else add(" rejected=colour_or_scene_lineage");
@@ -873,7 +889,7 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
             if (in.whole && in.w==e.ow && in.h==e.oh)
                 pending.push_back({in.id,index,edge.srgb || in.vfmt==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
                                    op.transfer?edge.read_vfmt:in.vfmt,op.transfer?edge.reader:op.pso,
-                                   op.transfer?edge.written_vfmt:output->vfmt});
+                                   op.transfer?edge.written_vfmt:output->vfmt,op.list,op.recording});
     }
     if (ambiguous || unresolved || !pending.empty()) {
         // An unresolved writer on any branch means the crossing may not reach the
@@ -885,7 +901,11 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
     } else if (candidate.pso) {
         if (candidate==g_trace.previous) g_trace.learned=candidate;
         else if (!(candidate==g_trace.learned)) g_trace.learned={};
-    }    g_trace.previous=candidate;
+    } else if (!g_trace.untraced) {
+        // Complete evidence that this presentation no longer uses an eligible crossing.
+        g_trace.learned={};
+    }
+    g_trace.previous=candidate;
     g_trace.learned_pso.store(g_trace.learned.pso,std::memory_order_release);
     add(" overlays=%u learned=%llu",overlays,static_cast<unsigned long long>(g_trace.learned.pso));
     add(" inferred=%llu inferred_present=%llu cached=%llu unresolved_stops=%llu aux=%llu other_queue=%llu inferred_reason=\"%s\"",
@@ -4106,6 +4126,7 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
     struct DepthSnapshot {
         ComPtr<ID3D12Resource> texture;
         na::nr::native::RecordingLease writer, reader;
+        std::shared_ptr<uint64_t> owned_reader_fence;
     };
     DepthSnapshot snapshots_[kRing+2];
 
@@ -4120,14 +4141,18 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
         const uint32_t mip=saved.depth_sub%(std::max)(1u,uint32_t(desc.MipLevels));
         const auto w=uint32_t((std::max)(uint64_t{1},desc.Width>>mip));
         const auto h=(std::max)(1u,desc.Height>>mip);
-        auto* slot=std::find_if(std::begin(snapshots_),std::end(snapshots_),[](const auto& s){
-            return (!s.writer || s.writer.Retired()) && (!s.reader || s.reader.Retired());
+        const uint64_t done=g.fence->GetCompletedValue();
+        if (done==UINT64_MAX) return;
+        auto* slot=std::find_if(std::begin(snapshots_),std::end(snapshots_),[done](const auto& s){
+            return (!s.writer || s.writer.Retired()) && (!s.reader || s.reader.Retired()) &&
+                (!s.owned_reader_fence || *s.owned_reader_fence<=done);
         });
         if (slot==std::end(snapshots_)) return;
         if (!slot->texture || slot->texture->GetDesc().Width!=w || slot->texture->GetDesc().Height!=h) {
             slot->texture.Reset();
             if (!texture(w,h,DXGI_FORMAT_R32_FLOAT,false,D3D12_RESOURCE_STATE_COPY_DEST,slot->texture)) return;
         }
+        if (!slot->owned_reader_fence) slot->owned_reader_fence=std::make_shared<uint64_t>(0);
         // Same depth-plane copy J2 already performs. This version runs inside
         // the owner list, where the game's exact state is established.
         std::vector<D3D12_RESOURCE_BARRIER> barriers;
@@ -4141,6 +4166,7 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
         addsub(barriers,depth,saved.depth_sub,D3D12_RESOURCE_STATE_COPY_SOURCE,state);
         flush(list,barriers);
         saved.native_depth_snapshot=slot->texture;
+        saved.native_depth_reader_fence=slot->owned_reader_fence;
         owned.push_back(slot->texture);
         slot->writer=saved.native_origin;
         slot->reader={};
@@ -4155,6 +4181,7 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
         uint64_t other=0;ComPtr<ID3D12Resource> other_target;
         bool rebound=false;
         uint64_t input=0; // stretch finder: DLSS reads this render-size image (0 = the scene colour)
+        bool separate_reader=false;
     };
     // Private full-size HDR image for the F10 route (recreated on size/format change).
     struct Full { ComPtr<ID3D12Resource> tex; uint32_t w=0,h=0; DXGI_FORMAT f=DXGI_FORMAT_UNKNOWN; };
@@ -4269,7 +4296,9 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
         }
         na::observe::NativeOperation op;
         const char* why=nullptr;
-        if (!na::observe::ListNativeOperation(l,true,op,&why) || !op.reflection_complete ||
+        // Only read the bindings. Use the same reflection-bounded view as the
+        // learner, including a statically used register in an unbounded table.
+        if (!na::observe::ListNativeOperation(l,true,op,&why,true) || !op.reflection_complete ||
             op.pipeline_id!=learned.pso) {
             native_reject(g_nb.snapshot,why?why:"The learned upscale step's bindings could not be read.");
             return {};
@@ -4327,6 +4356,7 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
         c->source=input->resource;
         c->guide.Attach(na::observe::AcquireResource(depth));
         c->input=in.id;
+        c->separate_reader=learned.separate_reader;
         c->dest=out.id;
         c->target=output->resource;
         if (!c->guide) return {};
@@ -4463,7 +4493,17 @@ public:
                     staged.injected=g_injected;staged.jitter[0]=g_injected?g.jit.px[0]:0;staged.jitter[1]=g_injected?g.jit.px[1]:0;
                 }else {
                     if (!saved.native_origin.Ready(g.queue.Get())) {
-                        skip("Waiting for the scene producer to submit before the learned upscale pass.");
+                        const auto writer=na::observe::IdOf(l);
+                        if (c->separate_reader && saved.native_depth_snapshot && saved.native_depth_reader_fence &&
+                            saved.native_list && writer && !g.native_deferred.list &&
+                            na::observe::ListWorkTailUnchanged(l,true)) {
+                            // CPU metadata only. A reversed or discarded submission
+                            // leaves the original game recording untouched.
+                            g.native_deferred={saved,c->source,c->guide,c->target,writer,c->recording,
+                                               g.frame,c->input,c->dest,na::observe::ListPipelineId(l)};
+                            return false;
+                        }
+                        skip("Quality needs its scene submitted before an inline upscale pass.");
                         return false;
                     }
                     staged=saved;
@@ -4557,6 +4597,7 @@ public:
             if(!g.inline_camera_submitted||(g.jit.valid&&g.jit.applied))jitter_batch(one,1);
             SceneInput saved;saved.frame=g.frame;saved.color=color;saved.depth=depth;
             saved.native_recording=na::observe::ListRecording(l);
+            saved.native_list=na::observe::IdOf(l);
             saved.native_viewport_sample=na::observe::ListSceneViewportJitter(l,depth);
             if(!saved.native_recording)return;
             if(!na::observe::ListSceneSubresource(l,color,depth,&saved.color_sub,&saved.depth_sub))return;
@@ -4577,6 +4618,77 @@ public:
         }catch(...){}
     }
 };
+
+// An upscale recorded ahead of the scene submission can be repaired only at
+// an actual list boundary. The game's lists are never modified by this path.
+int record_deferred_native(ID3D12CommandQueue* queue, ID3D12CommandList* const* lists, UINT count,
+                           ID3D12GraphicsCommandList** ours, PendingHistory& pending)
+{
+    auto& waiting=g.native_deferred;
+    if (!waiting.list) return -1;
+    for (UINT i=0; i<count; ++i) {
+        if (!lists[i] || na::observe::IdOf(lists[i])!=waiting.list ||
+            na::observe::ListRecording(lists[i])!=waiting.recording) continue;
+        const auto work=std::exchange(waiting,{});
+        const auto skip=[](const char* why) {
+            native_reject(g_nb.after_skipped,why);
+            return -1;
+        };
+        if (work.frame!=g.frame || g.inl.valid || g.submitted_frame==g.frame ||
+            !g_native_reduced.load(std::memory_order_relaxed) || queue!=g.queue.Get() || !g.dlss_ready)
+            return skip("Quality's deferred upscale no longer owns this frame or queue.");
+        if (!na::observe::ListWorkTailUnchanged(lists[i]))
+            return skip("Game work follows the upscale inside its recording; there is no list boundary for Quality.");
+        const auto& source=work.source;
+        const auto is_producer=[&](ID3D12CommandList* list) {
+            return list && na::observe::IdOf(list)==source.native_list &&
+                na::observe::ListRecording(list)==source.native_recording;
+        };
+        if (std::any_of(lists+i+1,lists+count,is_producer) ||
+            (!source.native_origin.Ready(queue) && !std::any_of(lists,lists+i,is_producer)))
+            return skip("The scene producer was not submitted before the upscale recording.");
+        uint64_t depth=0,color=0;
+        na::observe::GetLiveSelection(&depth,&color);
+        if (depth!=source.depth || color!=source.color || source.native_serial<=g.consumed_native_source ||
+            source.native_serial!=g.native_scene.native_serial)
+            return skip("The scene selection or producer changed before the upscale recording was submitted.");
+        {
+            std::lock_guard<std::mutex> lock(g_trace.m);
+            const auto& learned=g_trace.learned;
+            if (!learned.separate_reader || learned.pso!=work.pso || learned.input!=work.input_id ||
+                learned.output!=work.output_id || learned.scene!=source.color)
+                return skip("The screen handoff changed before the upscale recording was submitted.");
+        }
+        SceneInput staged=source;
+        staged.color=work.input_id;
+        staged.color_sub=0;
+        staged.depth_sub=0;
+        UpscaleTarget previous;
+        {
+            std::lock_guard<std::mutex> lock(g_up_m);
+            previous=g_up;
+            g_up={work.output_id,0,0,0};
+            g_up.require_delivery=true;
+        }
+        struct RestoreTarget {
+            UpscaleTarget previous;
+            ~RestoreTarget(){std::lock_guard<std::mutex> lock(g_up_m);g_up=previous;}
+        } restore{previous};
+        if (!record(lists,i,source.depth,work.input_id,ours,pending,nullptr,nullptr,&staged,i+1)) {
+            na::capture::j2::Discard(pending.capture,false);
+            return skip(g.stats.reason);
+        }
+        auto& slot=g.slots[g.slot];
+        slot.native_scale_resources={work.input,work.depth,work.output,source.native_depth_snapshot};
+        // The caller signals this fence after submitting our owned list.
+        *source.native_depth_reader_fence=g.fence_next;
+        pending.native_source=source.native_serial;
+        pending.native_delivery=true;
+        g_nb.st_recorded.fetch_add(1,std::memory_order_relaxed);
+        return static_cast<int>(i+1);
+    }
+    return -1;
+}
 
 // Inline and between-list are complementary opportunities in the SAME frame.
 // Only an actual, learned post-entry consumer can trigger this fallback. No
@@ -6552,6 +6664,7 @@ void OnPresent(ID3D12CommandQueue* queue)
         }
         g.stats.depth_clears_last = g.depth_clears_closed;
         ++g.frame;
+        g.native_deferred = {};
         vpj_advance();
         replay_probe_frame();
         g.jit.valid = false; // J1: the next camera block starts a new jitter sample
@@ -6717,12 +6830,14 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
             if (lists[i] && na::observe::ListReferences(lists[i], selected_depth) &&
                 !na::observe::ListRootConstantBuffers(lists[i]).empty())
                 g.inline_camera_submitted = true;
-        if (!g_native_reduced.load(std::memory_order_relaxed) && !g.inl.valid && g.submitted_frame != g.frame && g.queue.Get() == queue && g.dlss_ready &&
-            selected_color && selected_depth && g.router.Mode() == na::j2::RouteMode::Auto) {
-            ID3D12GraphicsCommandList* ours = nullptr;
-            PendingHistory pending;
-            const int before = record_between_consumer(lists, count, selected_color, selected_depth, &ours, pending);
-            if (before >= 0) {
+        ID3D12GraphicsCommandList* ours = nullptr;
+        PendingHistory pending;
+        int before=record_deferred_native(queue,lists,count,&ours,pending);
+        if (before<0 && !g_native_reduced.load(std::memory_order_relaxed) && !g.inl.valid &&
+            g.submitted_frame != g.frame && g.queue.Get() == queue && g.dlss_ready &&
+            selected_color && selected_depth && g.router.Mode() == na::j2::RouteMode::Auto)
+            before=record_between_consumer(lists,count,selected_color,selected_depth,&ours,pending);
+        if (before >= 0) {
                 std::vector<ID3D12CommandList*> batch(lists, lists + count);
                 batch.insert(batch.begin() + before, ours);
                 Slot& slot = g.slots[g.slot];
@@ -6738,7 +6853,8 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
                 if (!pending.keep_reset) g.resume_reset = false;
                 g.stats.active = true;
                 ++g.stats.frames;
-                ++g.stats.between_observed;
+                if (pending.native_delivery) ++g.stats.native_deliveries;
+                else ++g.stats.between_observed;
                 if (pending.cut) ++g.stats.cuts;
                 for (UINT i = static_cast<UINT>(before); i < count; ++i)
                     if (lists[i]) g.stats.inline_late_writes += na::observe::ListInsertionDecision(lists[i], selected_color).writes;
@@ -6746,11 +6862,11 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
                 queue->Signal(g.fence.Get(), slot.fence_value);
                 na::capture::j2::Submitted(pending.capture, queue, g.stats.submissions);
                 na::j2::compute_flow::Committed(pending.compute_flow);
-                reason("Live DLAA is running before a learned post-processing consumer in a separate list.");
+                reason(pending.native_delivery ? "Native scene DLSS reconstructed between the upscale and the game's next list." :
+                    "Live DLAA is running before a learned post-processing consumer in a separate list.");
                 return;
-            }
-            na::capture::j2::Discard(pending.capture, false);
         }
+        na::capture::j2::Discard(pending.capture, false);
         lock.unlock();
         forward(queue, count, lists);
         if (!has) return;
@@ -6959,7 +7075,7 @@ void Shutdown()
     std::lock_guard<std::mutex> lock(g.m);
     g.depth32.Reset(); g.motion.Reset(); g.provenance.Reset(); g.output.Reset(); g.color_in.Reset(); g.sharp.Reset(); g.jshift.Reset();
     g.msaa = MsaaResolve{};
-    for (auto& s : g.slots) { s.list.Reset(); s.alloc.Reset(); s.fence_value = 0; }
+    for (auto& s : g.slots) { s.list.Reset(); s.alloc.Reset(); s.fence_value = 0; s.native_scale_resources={}; }
     na::j2::flow::Shutdown(); // before the device and J2's fence go
     na::j2::compute_flow::Reset();
     g.fence.Reset(); g.queue.Reset(); g.device.Reset();
@@ -6993,6 +7109,7 @@ void Shutdown()
     g.entries.Clear();
     g.waiting_scene = {};
     g.native_scene = {};
+    g.native_deferred = {};
     g_native_reduced.store(false);g_native_bridge.store(false);
     g.jitter_writes.Clear();
     g.frame_seq.clear();

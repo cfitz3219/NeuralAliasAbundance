@@ -83,6 +83,9 @@ NA_SLOT(ID3D12GraphicsCommandListVtbl, SetGraphicsRootUnorderedAccessView, s::li
 NA_SLOT(ID3D12GraphicsCommandListVtbl, OMSetRenderTargets, s::list::OMSetRenderTargets);
 NA_SLOT(ID3D12GraphicsCommandListVtbl, ClearDepthStencilView, s::list::ClearDepthStencilView);
 NA_SLOT(ID3D12GraphicsCommandListVtbl, ClearRenderTargetView, s::list::ClearRenderTargetView);
+NA_SLOT(ID3D12GraphicsCommandListVtbl, ClearUnorderedAccessViewUint, s::list::ClearUnorderedAccessViewUint);
+NA_SLOT(ID3D12GraphicsCommandListVtbl, ClearUnorderedAccessViewFloat, s::list::ClearUnorderedAccessViewFloat);
+NA_SLOT(ID3D12GraphicsCommandListVtbl, DiscardResource, s::list::DiscardResource);
 NA_SLOT(ID3D12GraphicsCommandListVtbl, ExecuteIndirect, s::list::ExecuteIndirect);
 NA_SLOT(ID3D12GraphicsCommandList4Vtbl, BeginRenderPass, s::list::BeginRenderPass);
 NA_SLOT(ID3D12GraphicsCommandList4Vtbl, EndRenderPass, s::list::EndRenderPass);
