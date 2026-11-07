@@ -63,6 +63,10 @@ measured motion directly and has no strength slider.
 
 The final replay fixture measured +0.999578 px horizontally and
 +0.000476 px vertically on the RTX 5070 Ti, against +1 and 0 expected.
-The mask passed on the object and rejected the background and scissor
-exterior. WARP produced +0.999578 and +0.000475. The DX12 debug layer
+The mask passed on the object and rejected the background, an occluded pixel and the scissor exterior. WARP produced +0.999578 and +0.000475. The DX12 debug layer
 was enabled in both cases and reported no errors.
+
+The full local suite ran 233 cases with 228 passing, 5 explicit skips and
+0 failures before the final inline-only and single-sample guard changes.
+The final production DLL rebuilt successfully, and the fixture with the
+additional occluded-pixel check passed on both hardware and WARP.

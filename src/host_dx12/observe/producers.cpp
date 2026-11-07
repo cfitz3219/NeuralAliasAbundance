@@ -4725,6 +4725,7 @@ void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2,
         if (pc->depth_enable != 1 || pc->depth_write != 1) return;
         if (pc->stage_hash[NA_STAGE_GS] || pc->stage_hash[NA_STAGE_HS] || pc->stage_hash[NA_STAGE_DS] || pc->stage_hash[NA_STAGE_MS]) { rp_count(kRpStages); return; }
         if (!ls->raster_topology_known || ls->raster_topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST) { rp_count(kRpTopology); return; }
+        if (pc->sample_count != 1) return;
         if (!ls->raster_viewports_known || ls->raster_viewport_count != 1 ||
             !ls->raster_scissors_known || ls->raster_scissor_count != 1) return;
         const auto& viewport = ls->raster_viewports[0];

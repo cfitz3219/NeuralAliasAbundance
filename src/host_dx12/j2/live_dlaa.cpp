@@ -2815,7 +2815,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             const float viewport_jitter[2] = {static_cast<float>(cam.jitter_px_x), static_cast<float>(cam.jitter_px_y)};
             const auto rm = g.replay.Record(l, g.queue.Get(), g.depth32.Get(), rw, rh, reversed,
                                             cam.camera_cut || resize || g.resume_reset || in_tier1_fed ||
-                                            !vpj_mode() || (g.jitter_on && !viewport_sample_known), viewport_jitter);
+                                            depth_msaa || !vpj_mode() || (g.jitter_on && !viewport_sample_known), viewport_jitter);
             if (rm.motion && !in_tier1_fed && na::settings::Get().j2_draw_replay.load(std::memory_order_relaxed)) {
                 in_tier1_fed = true;
                 use_replay_motion = true;

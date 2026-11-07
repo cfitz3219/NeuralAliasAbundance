@@ -127,6 +127,8 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
         list.list->RSSetViewports(1, &vp);
         list.list->RSSetScissorRects(1, &sc);
         list.list->DrawInstanced(3, 1, 0, 0);
+        const D3D12_RECT occluded{13, 7, 14, 8};
+        list.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, .25f, 0, 1, &occluded);
         auto to_read = test::Transition(depth.Get(), depth_write, npsr);
         list.list->ResourceBarrier(1, &to_read);
         na::observe::ReplayFrame wrong;
@@ -175,7 +177,7 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
             REQUIRE(SUCCEEDED(rb->Map(0, nullptr, reinterpret_cast<void**>(&mapped))));
             const auto* motion = reinterpret_cast<const float*>(mapped + 7 * pitch);
             const auto* valid = reinterpret_cast<const float*>(mapped + (h + 7) * pitch);
-            CHECK(valid[12] == 1.f && valid[0] == 0.f && valid[15] == 0.f);
+            CHECK(valid[12] == 1.f && valid[0] == 0.f && valid[13] == 0.f && valid[15] == 0.f);
             CHECK(std::abs(motion[24] - (frame % 2 ? -1.f : 1.f)) < 1e-3f);
             CHECK(std::abs(motion[25]) < 1e-3f);
             std::printf("motion at (12,7): %.6f %.6f valid %.0f, outside %.0f\n",
