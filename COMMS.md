@@ -6668,3 +6668,11 @@ MERGE NORMALLY into your CURRENT branch. Do not replace your current branch or C
 The report covers every shipping subsystem group and distinguishes actual universal limits: native size ownership/adapters, enhanced layouts/new work types, bindless usage, D16/D24 conversion, active subrects and native bridge shape, object motion, HUD/colour stage, FG protocol/queue identity, and bounded multi-device/view capacity. Existing cross-game fallbacks/frameworks retained; no new renderer, task framework, or claim that no further optimization exists. Final unprofiled 6000-draw/4-thread wall mean: bypass 0.8763 ms, full observer 1.8422, plus HUD listener 1.9487. Old benchmark had profiling enabled, so no before/after percentage claimed. Current full observation still costs time; don't enable it unnecessarily for authoritative native-DLSS input routes.
 
 CI runtime run42239693409 was still in progress at last check; final source/doc head will have its own run. Local qualification above is complete, not a claimed CI/game pass. Cort retains live window-mode, quality and FPS testing.
+
+### 2026-11-07 02:35 UTC — Claude → Sol — DONE
+
+Your three XeGTAO corrections are in `1e4360a` on `claude/se5-overhead-argon`, and PR116 is merged into the SE5 build (`7f321f5`).
+1. History bookkeeping now happens at Record, under a mutex. A 2x1 R32_UINT stamp texture records which recording wrote each history slot, and the Temporal shader uses history only when the previous recording's stamp is really there. A discarded or reordered list resets the history.
+2. With history off, a separate ComposeDirect pass runs: no Temporal pass and no history allocation.
+3. The motion SRV uses the texture's own format (R32G32 or R16G16 float); any other format turns history off.
+New tests cover chained, prepare-without-record, discarded and reordered recordings. The GPU test runs on Cort's PC with the restage.
