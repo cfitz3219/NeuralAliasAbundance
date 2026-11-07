@@ -4578,9 +4578,11 @@ struct RpSlot {
     std::vector<ReplayRecord> draws;
 };
 RpSlot& rp_slot(uint32_t i) { static RpSlot* s = new RpSlot[kRpSlots]; return s[i]; }
-std::atomic<uint64_t> g_rp_stat[16]; // see DrawReplayStats
+std::atomic<uint64_t> g_rp_stat[24]; // see DrawReplayStats
 enum : uint32_t { kRpReplayed, kRpVerts, kRpNoTwin, kRpBuilding, kRpFailedTwin, kRpOverflow, kRpTopology, kRpStages, kRpUntwinned,
-                  kRpNoRecipe, kRpNotReady, kRpBuilt, kRpBuildFailed, kRpNoted, kRpHashMismatch, kRpStatCount };
+                  kRpNoRecipe, kRpNotReady, kRpBuilt, kRpBuildFailed, kRpNoted, kRpHashMismatch, kRpOtherList,
+                  kRpTakeUnclaimed, kRpTakeOtherList, kRpTakeSealed, kRpTaken, kRpStatCount };
+static_assert(kRpStatCount <= 24, "g_rp_stat size");
 void rp_count(uint32_t k, uint64_t n = 1) { g_rp_stat[k].fetch_add(n, std::memory_order_relaxed); }
 
 HRESULT make_replay_root(ID3D12Device* dev, UINT node, ID3D12RootSignature* game,
@@ -4833,7 +4835,10 @@ void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2,
     RpSlot& slot = rp_slot(static_cast<uint32_t>(frame % kRpSlots));
     const HostWorkScope own;
     if (slot.frame != frame) {
-        if ((slot.writer && !slot.writer->Retired()) || (slot.reader && !slot.reader->Retired())) {
+        // Reuse once the GPU is done with the old positions (writer) and the
+        // frame that read them (reader). Waiting for the game to RESET its
+        // list blocked almost every frame in SE5 (lists live > 3 frames).
+        if ((slot.writer && !slot.writer->Completed()) || (slot.reader && !slot.reader->Completed())) {
             rp_count(kRpNotReady);
             return;
         }
@@ -4854,7 +4859,7 @@ void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2,
                               D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_STREAM_OUT};
         l->ResourceBarrier(1, &barrier);
     }
-    if (slot.list_id != list_id || slot.recording != recording || slot.sealed) return;
+    if (slot.list_id != list_id || slot.recording != recording || slot.sealed) { rp_count(kRpOtherList); return; }
     const uint64_t first = slot.verts;
     const uint32_t ci = static_cast<uint32_t>(slot.draws.size());
     if (verts > (kRpBytes - kRpCounterBytes) / 16 - first || ci >= kRpCounters) {
@@ -7912,8 +7917,11 @@ bool ReplayTakeFrame(GL* list, ID3D12CommandQueue* queue, ReplayFrame* f)
     const uint64_t frame = g_rp_frame.load(std::memory_order_acquire);
     if (frame < 2 || !recording) return false;
     auto& cur = rp_slot(static_cast<uint32_t>(frame % kRpSlots));
-    if (cur.frame != frame || cur.list_id != list_id || cur.recording != recording || cur.sealed) return false;
+    if (cur.frame != frame) { rp_count(kRpTakeUnclaimed); return false; }
+    if (cur.list_id != list_id || cur.recording != recording) { rp_count(kRpTakeOtherList); return false; }
+    if (cur.sealed) { rp_count(kRpTakeSealed); return false; }
     cur.sealed = true;
+    rp_count(kRpTaken);
     f->cur = cur.buf.Get();
     f->data_offset = kRpCounterBytes;
     f->cur_draws = cur.draws;
@@ -7933,6 +7941,8 @@ void GetDrawReplayStats(DrawReplayStats* out)
     out->twin_failed = v(kRpFailedTwin); out->overflow = v(kRpOverflow); out->topology = v(kRpTopology); out->stages = v(kRpStages);
     out->untwinned = v(kRpUntwinned); out->no_recipe = v(kRpNoRecipe); out->not_ready = v(kRpNotReady); out->built = v(kRpBuilt);
     out->build_failed = v(kRpBuildFailed); out->noted = v(kRpNoted); out->hash_mismatch = v(kRpHashMismatch);
+    out->other_list = v(kRpOtherList); out->take_unclaimed = v(kRpTakeUnclaimed); out->take_other_list = v(kRpTakeOtherList);
+    out->take_sealed = v(kRpTakeSealed); out->taken = v(kRpTaken);
 }
 bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float* y)
 {

@@ -366,6 +366,9 @@ struct ReplayUse {
     virtual ~ReplayUse() = default;
     virtual bool Ready(ID3D12CommandQueue*) const = 0;
     virtual bool Retired() const = 0;
+    // The GPU finished every submission of this recording (or it was discarded).
+    // The game's list need not be reset: SE5 keeps lists for several frames.
+    virtual bool Completed() const = 0;
 };
 using ReplayRetain = std::shared_ptr<ReplayUse> (*)(ID3D12GraphicsCommandList*);
 struct ReplayRecord {
@@ -382,6 +385,8 @@ struct ReplayFrame {
 struct DrawReplayStats {
     uint64_t replayed = 0, vertices = 0, twin_queued = 0, twin_building = 0, twin_failed = 0, overflow = 0, topology = 0, stages = 0;
     uint64_t untwinned = 0, no_recipe = 0, not_ready = 0, built = 0, build_failed = 0, noted = 0, hash_mismatch = 0;
+    // Why J2 could not use a frame: slot never claimed this frame, claimed by another list/recording, or already taken.
+    uint64_t other_list = 0, take_unclaimed = 0, take_other_list = 0, take_sealed = 0, taken = 0;
 };
 void SetDrawReplay(uint64_t frame, ReplayRetain retain);
 bool ReplayTakeFrame(ID3D12GraphicsCommandList* list, ID3D12CommandQueue* queue, ReplayFrame* f);

@@ -12,6 +12,7 @@ struct Use final : ReplayUse {
     na::nr::native::RecordingLease lease;
     bool Ready(ID3D12CommandQueue* queue) const override { return lease.Ready(queue); }
     bool Retired() const override { return lease.Retired(); }
+    bool Completed() const override { return lease.Completed(); }
 };
 std::shared_ptr<ReplayUse> retain(ID3D12GraphicsCommandList* list)
 {
@@ -188,6 +189,71 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
     CHECK(discarded_frame != 0 && verified);
+
+    // SE5 keeps each command list for several frames before resetting it.
+    // A slot must be reusable once the GPU is done, not once the game resets
+    // the list that wrote it (that blocked almost every frame: not_ready=39.6M).
+    {
+        constexpr uint32_t kRing = 4;
+        test::List ring[kRing];
+        for (auto& r : ring) { // observed from a Reset onwards, like a game list
+            REQUIRE(r.Create(dev) && SUCCEEDED(r.list->Close()));
+            na::nr::native::Reset(r.list.Get());
+            r.Reset();
+        }
+        na::observe::DrawReplayStats before{};
+        na::observe::GetDrawReplayStats(&before);
+        const uint64_t fed_before = pass.GetStats().fed;
+        uint32_t fed_frames = 0;
+        for (uint32_t frame = 100; frame < 116; ++frame) {
+            auto& r = ring[frame % kRing];
+            if (frame >= 100 + kRing) { // reused only after kRing frames
+                na::nr::native::Reset(r.list.Get());
+                r.Reset();
+            }
+            const float jitter[2] = { frame % 2 ? .375f : -.25f, frame % 2 ? -.375f : .25f };
+            na::observe::SetSceneViewportJitter(frame, jitter[0], jitter[1]);
+            na::observe::SetDrawReplay(frame, retain);
+            const D3D12_VIEWPORT vp{0, 0, float(w), float(h), 0, 1};
+            const D3D12_RECT sc{0, 0, 14, h};
+            r.list->SetGraphicsRootSignature(root.Get());
+            const float shift = float(frame % 2) / (w / 2.f);
+            r.list->SetGraphicsRoot32BitConstants(0, 1, &shift, 0);
+            r.list->SetPipelineState(pso.Get());
+            r.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            r.list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+            r.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1, 0, 0, nullptr);
+            r.list->RSSetViewports(1, &vp);
+            r.list->RSSetScissorRects(1, &sc);
+            r.list->DrawInstanced(3, 1, 0, 0);
+            auto to_read = test::Transition(depth.Get(), depth_write, npsr);
+            r.list->ResourceBarrier(1, &to_read);
+            const na::j2::replay_motion::Output output = [&] {
+                const na::observe::HostWorkScope host;
+                return pass.Record(r.list.Get(), d.queue.Get(), depth.Get(), w, h, false, false, jitter);
+            }();
+            if (output.motion) ++fed_frames;
+            std::swap(to_read.Transition.StateBefore, to_read.Transition.StateAfter);
+            r.list->ResourceBarrier(1, &to_read);
+            REQUIRE(SUCCEEDED(r.list->Close()));
+            ID3D12CommandList* commands[] = {r.list.Get()};
+            {
+                na::nr::native::Submission submitted(d.queue.Get(), 1, commands);
+                d.queue->ExecuteCommandLists(1, commands);
+            }
+            d.WaitIdle();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        na::observe::DrawReplayStats after{};
+        na::observe::GetDrawReplayStats(&after);
+        std::printf("ring of %u lists: motion on %u of 16 frames, fed %llu, not_ready %llu, taken %llu, unclaimed %llu\n",
+                    kRing, fed_frames, (unsigned long long)(pass.GetStats().fed - fed_before),
+                    (unsigned long long)(after.not_ready - before.not_ready), (unsigned long long)(after.taken - before.taken),
+                    (unsigned long long)(after.take_unclaimed - before.take_unclaimed));
+        // First frame has no previous; every later frame must feed motion.
+        CHECK(fed_frames >= 14);
+        CHECK(after.not_ready == before.not_ready);
+    }
     test::ComPtr<ID3D12InfoQueue> messages;
     if (debug && SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&messages)))) {
         std::puts("D3D12 debug layer enabled.");
