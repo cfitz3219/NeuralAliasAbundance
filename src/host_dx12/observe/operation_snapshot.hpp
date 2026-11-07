@@ -43,7 +43,9 @@ struct NativeOperation {
     // A stage indexes ResourceDescriptorHeap/SamplerDescriptorHeap directly (SM 6.6):
     // it can read images that no root table shows.
     bool heap_indexing = false;
-    struct Table { uint32_t param, first, count; };
+    // heap/slot: where the table's descriptors live (observer heap id, first slot), so the
+    // snapshot can be re-read at submission (RefreshNativeOperation). 0 = unknown.
+    struct Table { uint32_t param, first, count; uint64_t heap = 0; uint32_t slot = 0; };
     std::vector<Table> tables;
     std::vector<OperationDescriptor> descriptors;
     std::vector<OperationDescriptor> colors;
@@ -87,4 +89,11 @@ void SetOperationSnapshots(bool enabled);
 bool ListNativeOperation(ID3D12GraphicsCommandList*, bool compute, NativeOperation& out,const char** reason=nullptr,
                          bool read_only=false);
 bool NativeDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE, OperationDescriptor& out);
+// Submission time (ExecuteCommandLists), the last CPU point before the GPU reads the
+// game's descriptors: re-reads every table descriptor of a snapshot from the heap mirror
+// and replaces the ones whose slot was written after the snapshot (SE5 p11148: the
+// upscale dispatch's table holds stale ring content when the Dispatch is recorded and is
+// filled before submission). Returns how many descriptors changed; `used` flags are kept.
+// Takes the registry lock shared; never called from inside another observer lock.
+uint32_t RefreshNativeOperation(NativeOperation& op);
 } // namespace na::observe

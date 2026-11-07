@@ -138,6 +138,10 @@ struct DeferredNativeScale {
     ComPtr<ID3D12Resource> input, depth, output;
     uint64_t list = 0, recording = 0, frame = 0;
     uint64_t input_id = 0, output_id = 0, pso = 0;
+    // Late-bound step: the dispatch's table snapshot, resolved at submission (the game
+    // writes those descriptors after recording). input/output are filled then.
+    std::shared_ptr<na::observe::NativeOperation> op;
+    bool late = false;
 };
 
 struct State {
@@ -389,11 +393,15 @@ struct NativeBridgeCounters {
     std::atomic<uint64_t> hints{0},examined{0},not_reading{0},snapshot{0},source_size{0},draw_state{0},viewport{0},
         no_destination{0},ambiguous{0},candidates{0},recorded{0},record_failed{0},after_skipped{0},redirected{0},redirect_failed{0},redirect_submitted{0},depth_state_refused{0},
         st_gated{0},st_full{0},st_examined{0},st_no_input{0},st_ambiguous{0},st_draw_state{0},st_candidates{0},st_recorded{0},st_failed{0},
-        st_ungated_full{0},st_budget{0},st_aux{0};
+        st_ungated_full{0},st_budget{0},st_aux{0},
+        // Late-bound route: learned dispatches staged for resolution at submission, how many
+        // had descriptors rewritten after recording (changed) or not (same), and how many
+        // resolved to the learned images and went to the list-boundary DLSS.
+        st_late_staged{0},st_late_changed{0},st_late_same{0},st_late_resolved{0};
     std::mutex m;char reason[200]{};
     // Sol bafa40a (5c/5d), under m: every refusal reason with its count, and first
     // vs sustained delivery (by submitted frame).
-    struct Refusal{char why[100];uint64_t n;};Refusal refusals[12]{};uint32_t refusal_kinds=0;
+    struct Refusal{char why[100];uint64_t n;};Refusal refusals[24]{};uint32_t refusal_kinds=0;
     uint64_t delivered=0,first_delivery_frame=0,last_delivery_frame=0,streak=0,best_streak=0,order_refused=0,later_written=0;
     // Quality route only (Sol 480af25): reconstructions entered at the learned step,
     // and DLSS recordings there that failed (NGX or J2 refusal inside record()).
@@ -445,6 +453,13 @@ struct TraceOp {
     uint32_t vw = 0, vh = 0, gx = 0, gy = 0, gz = 0, uavs = 0, descriptor_slots = 0;
     ID3D12CommandQueue* queue = nullptr;
     std::vector<TraceIo> in, out;
+    // Table snapshot kept until the list is submitted: the game may write the table's
+    // descriptors AFTER recording the operation (SE5 p11148: pso 556's table held stale
+    // ring content at record time). At submission the mirror is re-read; when it changed,
+    // in/out are rebuilt from it and the record-time view is kept in in_rec/out_rec.
+    std::shared_ptr<na::observe::NativeOperation> snap;
+    uint32_t late = 0; // descriptors that changed between recording and submission
+    std::vector<TraceIo> in_rec, out_rec;
 };
 struct NativeTrace{
     std::mutex m;std::atomic<bool> armed{false};
@@ -464,6 +479,9 @@ struct NativeTrace{
     std::atomic<uint64_t> presented_ids[3]{};        // the last distinct presented buffers
     std::deque<std::pair<std::pair<uint64_t,uint64_t>,TraceOp>> present_cache; // ops writing a presented buffer, by list recording, in order (cap 64)
     uint64_t cached_used=0,crossing_aux=0,other_queue=0,via_inferred=0,invalidated=0,variant_changes=0;
+    // Late-bound tables in this trace: ops whose descriptors changed between recording and
+    // submission, ops that had a table at all, and the run total of changed ops.
+    uint32_t late_ops=0,late_tabled=0;uint64_t late_total=0;
     // The presenting pass could not be read (p51016: SE5's final pass uses runtime-
     // indexed bindless arrays): the frame's render->full crossings are offered one at
     // a time as PROVISIONAL and learned only after the screen probe confirms them.
@@ -578,6 +596,36 @@ void trace_texture(ID3D12GraphicsCommandList* l, const na::observe::TextureCall&
 }
 // cache=true: outside a trace window, an op that writes a presented buffer is kept
 // by list recording, so a list recorded once and executed every frame is still known.
+// The op's inputs/outputs from a snapshot's used table descriptors and bound render targets.
+void trace_fill_io(const na::observe::NativeOperation& op, TraceOp& t){
+    t.in.clear();t.out.clear();t.uavs=0;
+    for (const auto& d : op.descriptors) {
+        if (!d.used || !d.resource) continue;
+        const auto desc = d.resource->GetDesc();
+        if (d.view.kind==NA_DESC_UAV) ++t.uavs;
+        if (desc.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D) continue;
+        if (d.view.kind==NA_DESC_SRV) {
+            const auto& srv = d.view.srv;
+            const bool whole = !d.view.explicit_view || (srv.ViewDimension==D3D12_SRV_DIMENSION_TEXTURE2D &&
+                !srv.Texture2D.MostDetailedMip && !srv.Texture2D.PlaneSlice);
+            t.in.push_back(trace_view(d.resource.Get(), d.view.resource,
+                d.view.explicit_view ? uint32_t(srv.Format) : uint32_t(desc.Format), whole,'s'));
+        } else if (d.view.kind==NA_DESC_UAV) {
+            const auto& uav = d.view.uav;
+            const bool whole = !d.view.explicit_view || (uav.ViewDimension==D3D12_UAV_DIMENSION_TEXTURE2D &&
+                !uav.Texture2D.MipSlice && !uav.Texture2D.PlaneSlice);
+            t.out.push_back(trace_view(d.resource.Get(), d.view.resource,
+                d.view.explicit_view ? uint32_t(uav.Format) : uint32_t(desc.Format), whole,'u'));
+        }
+    }
+    for (const auto& d : op.colors) if (d.resource) {
+        const auto& rtv = d.view.rtv;
+        t.out.push_back(trace_view(d.resource.Get(), d.view.resource,
+            d.view.explicit_view ? uint32_t(rtv.Format) : uint32_t(d.resource->GetDesc().Format),
+            !d.view.explicit_view || (rtv.ViewDimension==D3D12_RTV_DIMENSION_TEXTURE2D &&
+                !rtv.Texture2D.MipSlice && !rtv.Texture2D.PlaneSlice),'r'));
+    }
+}
 void trace_op(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall& call,bool cache=false){
     const bool compute=call.kind==na::observe::ShaderKind::Dispatch;
     const auto key=std::make_pair(uint64_t(na::observe::IdOf(l)),na::observe::ListRecording(l));
@@ -625,34 +673,26 @@ void trace_op(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall& call,b
             op.scissors[0].left!=0 || op.scissors[0].top!=0 ||
             op.scissors[0].right<LONG(t.vw) || op.scissors[0].bottom<LONG(t.vh);
     }
-    for (const auto& d : op.descriptors) {
-        if (!d.used || !d.resource) continue;
-        const auto desc = d.resource->GetDesc();
-        if (d.view.kind==NA_DESC_UAV) ++t.uavs;
-        if (desc.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D) continue;
-        if (d.view.kind==NA_DESC_SRV) {
-            const auto& srv = d.view.srv;
-            const bool whole = !d.view.explicit_view || (srv.ViewDimension==D3D12_SRV_DIMENSION_TEXTURE2D &&
-                !srv.Texture2D.MostDetailedMip && !srv.Texture2D.PlaneSlice);
-            t.in.push_back(trace_view(d.resource.Get(), d.view.resource,
-                d.view.explicit_view ? uint32_t(srv.Format) : uint32_t(desc.Format), whole,'s'));
-        } else if (d.view.kind==NA_DESC_UAV) {
-            const auto& uav = d.view.uav;
-            const bool whole = !d.view.explicit_view || (uav.ViewDimension==D3D12_UAV_DIMENSION_TEXTURE2D &&
-                !uav.Texture2D.MipSlice && !uav.Texture2D.PlaneSlice);
-            t.out.push_back(trace_view(d.resource.Get(), d.view.resource,
-                d.view.explicit_view ? uint32_t(uav.Format) : uint32_t(desc.Format), whole,'u'));
-        }
-    }
-    for (const auto& d : op.colors) if (d.resource) {
-        const auto& rtv = d.view.rtv;
-        t.out.push_back(trace_view(d.resource.Get(), d.view.resource,
-            d.view.explicit_view ? uint32_t(rtv.Format) : uint32_t(d.resource->GetDesc().Format),
-            !d.view.explicit_view || (rtv.ViewDimension==D3D12_RTV_DIMENSION_TEXTURE2D &&
-                !rtv.Texture2D.MipSlice && !rtv.Texture2D.PlaneSlice),'r'));
-    }
+    trace_fill_io(op,t);
+    // Kept only inside the trace window (released at submission): a cached presenting op
+    // lives for the whole run and must not retain the game's images (swap-chain resizes).
+    if(!cache&&!op.tables.empty())t.snap=std::make_shared<na::observe::NativeOperation>(std::move(op));
     if(cache&&!std::any_of(t.out.begin(),t.out.end(),[](const TraceIo& o){return trace_is_presented(o.id);}))return;
     keep(std::move(t));
+}
+// Submission: the table descriptors are final now (the game must have written them before
+// ExecuteCommandLists). A changed slot replaces the record-time binding; the record-time
+// view is kept for the frame dump.
+void trace_refresh(TraceOp& t){
+    if(!t.snap)return;
+    ++g_trace.late_tabled;
+    const uint32_t changed=na::observe::RefreshNativeOperation(*t.snap);
+    if(changed){
+        t.in_rec=t.in;t.out_rec=t.out;
+        trace_fill_io(*t.snap,t);
+        t.late=changed;++g_trace.late_ops;++g_trace.late_total;
+    }
+    t.snap.reset();
 }
 // Outside a trace window: snapshot only draws whose bound target is a presented buffer.
 void trace_present_writer(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall& call){
@@ -678,6 +718,7 @@ void trace_submit(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* cons
                 if (c.first!=key || g_trace.frame.size()>=kTraceOps) continue;
                 g_trace.frame.push_back(c.second);
                 g_trace.frame.back().queue=queue;
+                trace_refresh(g_trace.frame.back());
                 cached=true;
             }
             if (cached) { ++g_trace.cached_used; ++g_trace.traced_lists; continue; }
@@ -691,8 +732,9 @@ void trace_submit(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* cons
             continue;
         }
         ++g_trace.traced_lists;
-        for (const auto& t : it->second) {
+        for (auto& t : it->second) {
             if (g_trace.frame.size() >= kTraceOps) return;
+            trace_refresh(t); // in place: the snapshot is released here, a second submission reuses the result
             g_trace.frame.push_back(t);
             g_trace.frame.back().queue=queue;
         }
@@ -768,8 +810,9 @@ void trace_dump_frame(ID3D12CommandQueue* queue,uint64_t presented,const NativeE
     wchar_t path[MAX_PATH]{};swprintf_s(path,L"%s\\frame-%llu.txt",dir,(unsigned long long)frame_no);
     FILE* fp=nullptr;if(_wfopen_s(&fp,path,L"wb")||!fp)return;
     const auto& ops=g_trace.frame;
-    std::fprintf(fp,"frame=%llu presented=#%llu queue=%p scene=%ux%u output=%ux%u ops=%zu traced_lists=%u untraced=%u\r\n",
-        (unsigned long long)frame_no,(unsigned long long)presented,(void*)queue,e.rw,e.rh,e.ow,e.oh,ops.size(),g_trace.traced_lists,g_trace.untraced);
+    std::fprintf(fp,"frame=%llu presented=#%llu queue=%p scene=%ux%u output=%ux%u ops=%zu traced_lists=%u untraced=%u late_ops=%u tabled_ops=%u\r\n",
+        (unsigned long long)frame_no,(unsigned long long)presented,(void*)queue,e.rw,e.rh,e.ow,e.oh,ops.size(),g_trace.traced_lists,g_trace.untraced,
+        g_trace.late_ops,g_trace.late_tabled);
     for(const auto& u:g_trace.untraced_lists)
         std::fprintf(fp,"untraced_list list=%llu rec=%llu type=%d queue_type=%d at=%zu\r\n",(unsigned long long)u.id,(unsigned long long)u.recording,u.type,u.queue_type,u.at);
     const auto io=[&](const char* tag,const std::vector<TraceIo>& v){
@@ -785,6 +828,9 @@ void trace_dump_frame(ID3D12CommandQueue* queue,uint64_t presented,const NativeE
         if(op.why)std::fprintf(fp," why=\"%s\"",op.why);
         io("out",op.out);io("in",op.in);
         std::fprintf(fp,"%s",op.out.end()!=std::find_if(op.out.begin(),op.out.end(),[&](const TraceIo& x){return x.id==presented;})?" <PRESENTED>":"");
+        // Descriptors written by the game after this op was recorded: what the record-time
+        // snapshot showed (the bindings above are the submission-time ones).
+        if(op.late){std::fprintf(fp," late=%u record_time:[",op.late);io("out",op.out_rec);io("in",op.in_rec);std::fprintf(fp," ]");}
         std::fprintf(fp,"\r\n");
     }
     std::fclose(fp);
@@ -812,9 +858,10 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
         const int n=std::snprintf(result+used,capacity-used,format,args...);
         if (n>0) used=(std::min)(capacity-1,used+size_t(n));
     };
-    add("ops=%zu lists=%u untraced=%u scene=%ux%u output=%ux%u presented=%llu",
+    add("ops=%zu lists=%u untraced=%u scene=%ux%u output=%ux%u presented=%llu late=%u/%u late_total=%llu",
         ops.size(),g_trace.traced_lists,g_trace.untraced,e.rw,e.rh,e.ow,e.oh,
-        static_cast<unsigned long long>(presented));
+        static_cast<unsigned long long>(presented),g_trace.late_ops,g_trace.late_tabled,
+        static_cast<unsigned long long>(g_trace.late_total));
     // type 0 direct, 2 compute, 3 copy; at = ops of the frame submitted before it.
     if (!g_trace.untraced_lists.empty()) {
         add(" untraced_lists=[");
@@ -1125,7 +1172,7 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
 void native_refusal_locked(const char* why){
     if(!why||!*why)return;
     for(uint32_t i=0;i<g_nb.refusal_kinds;++i)if(std::strncmp(g_nb.refusals[i].why,why,sizeof g_nb.refusals[i].why-1)==0){++g_nb.refusals[i].n;return;}
-    if(g_nb.refusal_kinds<12){auto& r=g_nb.refusals[g_nb.refusal_kinds++];std::snprintf(r.why,sizeof r.why,"%s",why);r.n=1;}
+    if(g_nb.refusal_kinds<24){auto& r=g_nb.refusals[g_nb.refusal_kinds++];std::snprintf(r.why,sizeof r.why,"%s",why);r.n=1;}
 }
 void native_reject(std::atomic<uint64_t>& counter,const char* why){
     counter.fetch_add(1,std::memory_order_relaxed);
@@ -4664,7 +4711,9 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
         bool rebound=false;
         uint64_t input=0; // stretch finder: DLSS reads this render-size image (0 = the scene colour)
         bool verify=false, verify_rt=false; NativeCrossing crossing; // provisional: mark the game's own image, no DLSS
-        bool separate_reader=false;    };
+        bool separate_reader=false;
+        bool late=false; // staged for submission-time resolution (stage_late); After() arms the boundary watch
+    };
     // Private full-size HDR image for the F10 route (recreated on size/format change).
     struct Full { ComPtr<ID3D12Resource> tex; uint32_t w=0,h=0; DXGI_FORMAT f=DXGI_FORMAT_UNKNOWN; };
     Full full_;
@@ -4755,6 +4804,40 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
         for(uint32_t k=0;k<st.count;++k)if(st.tables[k].sampler)bind(st.tables[k].param,st.tables[k].handle);
         UINT at=0;for(const auto& t:op.tables){bind(t.param,p.gpu.ptr+UINT64(at)*ring_.inc);at+=t.count;}
     }
+    // Late-bound learned dispatch: nothing is recorded into the game's list. The scene
+    // producer (g.native_scene, published at its Close with a depth snapshot) and the
+    // dispatch's table snapshot are staged; record_deferred_native resolves the table at
+    // ExecuteCommandLists and records DLSS into our own list spliced right after this one.
+    na::observe::ShaderScope stage_late(ID3D12GraphicsCommandList* l,na::observe::NativeOperation&& snapshot,
+                                        const NativeCrossing& learned,uint64_t scene,uint64_t depth)
+    {
+        if (snapshot.tables.empty()) { native_reject(g_nb.st_no_input,"The learned upscale step binds no descriptor table."); return {}; }
+        std::lock_guard<std::mutex> lock(g.m);
+        const auto refuse=[&](const char* why){ native_reject(g_nb.after_skipped,why); return na::observe::ShaderScope{}; };
+        if (g.latched || g.paused.load() || !g.device || !g.dlss_ready) return refuse("DLSS is not ready (paused, stopped or still starting).");
+        if (g.inl.valid || g.submitted_frame==g.frame) return refuse("This frame already has its DLSS.");
+        if (g.native_deferred.list) return refuse("Another upscale step of this frame is already staged.");
+        const SceneInput& saved=g.native_scene;
+        if (saved.color!=scene || saved.depth!=depth || !saved.native_origin || !saved.native_recording ||
+            saved.native_serial<=g.consumed_native_source)
+            return refuse("No unused scene producer matches this upscale step.");
+        if (!saved.native_depth_snapshot || !saved.native_depth_reader_fence || !saved.native_list)
+            return refuse("The scene producer has no depth snapshot for a separate-list upscale.");
+        const auto writer=na::observe::IdOf(l);
+        if (!writer) return refuse("The upscale step's recording is unknown.");
+        DeferredNativeScale staged;
+        staged.source=saved;staged.list=writer;staged.recording=na::observe::ListRecording(l);staged.frame=g.frame;staged.pso=learned.pso;
+        staged.depth.Attach(na::observe::AcquireResource(depth));
+        staged.op=std::make_shared<na::observe::NativeOperation>(std::move(snapshot));staged.late=true;
+        if (!staged.depth) return refuse("The scene depth has retired.");
+        g.native_deferred=std::move(staged);
+        g_nb.st_candidates.fetch_add(1,std::memory_order_relaxed);
+        g_nb.st_late_staged.fetch_add(1,std::memory_order_relaxed);
+        // After() arms the list-boundary watch once the dispatch itself is recorded.
+        auto c=std::make_shared<Candidate>();c->late=true;c->recording=staged_recording(l);
+        return {na::observe::ShaderAction::Forward,c};
+    }
+    static uint64_t staged_recording(ID3D12GraphicsCommandList* l){ return na::observe::ListRecording(l); }
     na::observe::ShaderScope stretch(ID3D12GraphicsCommandList* l, const na::observe::ShaderCall& call)
     {
         // A learned dispatch (groups recorded) or a learned draw (gx==0, f1d0594 run: SE5's
@@ -4787,6 +4870,15 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
             native_reject(g_nb.snapshot,why?why:"The learned upscale step's bindings could not be read.");
             return {};
         }
+        // A dispatch in a list other than the scene's (SE5: the upscale list follows the scene
+        // list): its table descriptors are not trusted now. p11148 frame dumps show the game
+        // fills pso 556's table after the Dispatch is recorded (stale ring content at record
+        // time: 1x1 dummies, another frame's images), so an inline rebind here would copy
+        // stale descriptors. The step is staged and resolved at submission; DLSS then goes
+        // into the list boundary after this list (record_deferred_native).
+        // Taken only when the record-time table does NOT show the learned images (fresh
+        // tables keep the inline route and its fixtures unchanged).
+        const bool late_eligible=dispatch && !na::observe::ListRendersTo(l,scene,depth);
 
         const na::observe::OperationDescriptor* input=nullptr;
         const na::observe::OperationDescriptor* output=nullptr;
@@ -4808,13 +4900,17 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
             }
         }
         const auto pick=pick_scene_input(srvs,extent.rw,extent.rh,extent.ow,extent.oh);
-        if (!pick.ok) { native_reject(g_nb.st_ambiguous,pick.why); return {}; }
+        if (!pick.ok) {
+            if (late_eligible) return stage_late(l,std::move(op),learned,scene,depth);
+            native_reject(g_nb.st_ambiguous,pick.why); return {};
+        }
         input=srv_of[pick.at];
-        if (pick.aux) g_nb.st_aux.fetch_add(1,std::memory_order_relaxed);
         if (!input || !output || input->view.resource!=learned.input || output->view.resource!=learned.output) {
+            if (late_eligible) return stage_late(l,std::move(op),learned,scene,depth);
             native_reject(g_nb.st_no_input,"The learned upscale step reads or writes other images than learned.");
             return {};
         }
+        if (pick.aux) g_nb.st_aux.fetch_add(1,std::memory_order_relaxed);
         const auto& srv=input->view.srv;
         const auto& uav=output->view.uav;
         const auto in_desc=input->resource->GetDesc(), out_desc=output->resource->GetDesc();
@@ -4961,6 +5057,19 @@ public:
         return {na::observe::ShaderAction::Forward,c};
     }    void After(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall&,na::observe::ShaderScope& scope) noexcept override {
         auto c=std::static_pointer_cast<Candidate>(scope.state);if(!c)return;
+        if(c->late){
+            // The dispatch is recorded now: from here on any further work in this recording
+            // removes the list boundary DLSS needs (checked again at submission).
+            try{
+                std::lock_guard<std::mutex> lock(g.m);
+                auto& w=g.native_deferred;
+                if(w.late&&w.list==na::observe::IdOf(l)&&w.recording==c->recording&&w.frame==g.frame&&!na::observe::ListWorkTailUnchanged(l,true)){
+                    native_reject(g_nb.after_skipped,"The upscale step's recording cannot be watched for a list boundary.");
+                    w={};
+                }
+            }catch(...){}
+            return;
+        }
         if(c->verify){
             try{
                 if(probe_verify_mark(l,c->target.Get(),c->crossing.out_view,g.frame,c->crossing,c->verify_rt)&&!na::observe::RestoreListState(l)){
@@ -5162,7 +5271,7 @@ int record_deferred_native(ID3D12CommandQueue* queue, ID3D12CommandList* const* 
     for (UINT i=0; i<count; ++i) {
         if (!lists[i] || na::observe::IdOf(lists[i])!=waiting.list ||
             na::observe::ListRecording(lists[i])!=waiting.recording) continue;
-        const auto work=std::exchange(waiting,{});
+        auto work=std::exchange(waiting,{});
         const auto skip=[](const char* why) {
             native_reject(g_nb.after_skipped,why);
             return -1;
@@ -5185,13 +5294,60 @@ int record_deferred_native(ID3D12CommandQueue* queue, ID3D12CommandList* const* 
         if (depth!=source.depth || color!=source.color || source.native_serial<=g.consumed_native_source ||
             source.native_serial!=g.native_scene.native_serial)
             return skip("The scene selection or producer changed before the upscale recording was submitted.");
+        NativeCrossing learned;
         {
             std::lock_guard<std::mutex> lock(g_trace.m);
-            const auto& learned=g_trace.learned;
-            if (!learned.separate_reader || learned.pso!=work.pso || learned.input!=work.input_id ||
-                learned.output!=work.output_id || learned.scene!=source.color)
-                return skip("The screen handoff changed before the upscale recording was submitted.");
+            learned=g_trace.learned;
         }
+        if (work.late) {
+            // The dispatch's table, as the GPU will read it: re-read from the heap mirror now.
+            if (!work.op) return skip("The late-bound upscale step has no table snapshot.");
+            const uint32_t changed=na::observe::RefreshNativeOperation(*work.op);
+            (changed?g_nb.st_late_changed:g_nb.st_late_same).fetch_add(1,std::memory_order_relaxed);
+            NativeExtent extent;
+            { std::lock_guard<std::mutex> lock(g_up_m); extent=g_native_extent; }
+            const na::observe::OperationDescriptor* input=nullptr;
+            const na::observe::OperationDescriptor* output=nullptr;
+            std::vector<TraceIo> srvs; std::vector<const na::observe::OperationDescriptor*> srv_of;
+            for (const auto& d:work.op->descriptors) {
+                if (!d.used || !d.resource) continue;
+                const auto desc=d.resource->GetDesc();
+                if (d.view.kind==NA_DESC_SRV && desc.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+                    const auto& s=d.view.srv;
+                    srvs.push_back(trace_view(d.resource.Get(),d.view.resource,d.view.explicit_view?uint32_t(s.Format):uint32_t(desc.Format),
+                        !d.view.explicit_view || (s.ViewDimension==D3D12_SRV_DIMENSION_TEXTURE2D && !s.Texture2D.MostDetailedMip &&
+                            !s.Texture2D.PlaneSlice && s.Shader4ComponentMapping==D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING),'s'));
+                    srv_of.push_back(&d);
+                } else if (d.view.kind==NA_DESC_UAV) {
+                    if (output) return skip("The late-bound upscale step writes two images at submission.");
+                    output=&d;
+                }
+            }
+            const auto pick=pick_scene_input(srvs,extent.rw,extent.rh,extent.ow,extent.oh);
+            if (!pick.ok) { g_nb.st_no_input.fetch_add(1,std::memory_order_relaxed); return skip(pick.why); }
+            if (pick.aux) g_nb.st_aux.fetch_add(1,std::memory_order_relaxed);
+            input=srv_of[pick.at];
+            if (!output || !output->resource) return skip("The late-bound upscale step writes no image at submission.");
+            const auto& uav=output->view.uav;
+            const auto out_desc=output->resource->GetDesc();
+            const TraceIo in=srvs[pick.at];
+            const TraceIo out=trace_view(output->resource.Get(),output->view.resource,
+                output->view.explicit_view?uint32_t(uav.Format):uint32_t(out_desc.Format),
+                !output->view.explicit_view || (uav.ViewDimension==D3D12_UAV_DIMENSION_TEXTURE2D &&
+                    !uav.Texture2D.MipSlice && !uav.Texture2D.PlaneSlice));
+            if (!in.whole || !out.whole || in.w!=extent.rw || in.h!=extent.rh || out.w!=extent.ow || out.h!=extent.oh)
+                return skip("The late-bound upscale step's images at submission have other sizes than learned.");
+            if (in.vfmt!=learned.in_view || out.vfmt!=learned.out_view || typed(DXGI_FORMAT(in.fmt))!=typed(DXGI_FORMAT(out.fmt)))
+                return skip("The late-bound upscale step's images at submission have other formats than learned.");
+            if (in.id!=learned.input || out.id!=learned.output)
+                return skip("The late-bound upscale step's images at submission are not the learned ones.");
+            work.input=input->resource;work.output=output->resource;work.input_id=in.id;work.output_id=out.id;
+            work.op.reset();
+            g_nb.st_late_resolved.fetch_add(1,std::memory_order_relaxed);
+        }
+        if (!learned.separate_reader || learned.pso!=work.pso || learned.input!=work.input_id ||
+            learned.output!=work.output_id || learned.scene!=source.color)
+            return skip("The screen handoff changed before the upscale recording was submitted.");
         SceneInput staged=source;
         staged.color=work.input_id;
         staged.color_sub=0;
@@ -6748,6 +6904,7 @@ NativeBridgeStats GetNativeBridgeStats() {
     r.st_gated=n.st_gated.load();r.st_full=n.st_full.load();r.st_examined=n.st_examined.load();r.st_no_input=n.st_no_input.load();
     r.st_ambiguous=n.st_ambiguous.load();r.st_draw_state=n.st_draw_state.load();r.st_candidates=n.st_candidates.load();
     r.st_recorded=n.st_recorded.load();r.st_failed=n.st_failed.load();r.st_ungated_full=n.st_ungated_full.load();r.st_budget=n.st_budget.load();r.st_aux=n.st_aux.load();
+    r.st_late_staged=n.st_late_staged.load();r.st_late_changed=n.st_late_changed.load();r.st_late_same=n.st_late_same.load();r.st_late_resolved=n.st_late_resolved.load();
     size_t used=0;
     for(uint32_t i=0;i<n.step_count&&used+100<sizeof r.steps;++i){
         const auto& e=n.steps[i];
@@ -6795,12 +6952,13 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
             // First trace ~2 s after the scene is reduced, then every ~15 s.
             if(g_trace.presents-g_trace.armed_at>=(g_trace.learned_pso.load()?g_trace.learned_interval:30u)){
                 g_trace.recs.clear();g_trace.frame.clear();g_trace.frames=0;g_trace.untraced=g_trace.traced_lists=0;g_trace.ops=0;g_trace.untraced_lists.clear();
+                g_trace.late_ops=g_trace.late_tabled=0;
                 g_trace.armed_at=g_trace.presents;g_trace.armed.store(true);
             }
             return;
         }
         // The first frame after arming holds lists recorded before it: start over.
-        if(++g_trace.frames==1){g_trace.frame.clear();g_trace.untraced=g_trace.traced_lists=0;g_trace.untraced_lists.clear();return;}
+        if(++g_trace.frames==1){g_trace.frame.clear();g_trace.untraced=g_trace.traced_lists=0;g_trace.untraced_lists.clear();g_trace.late_ops=g_trace.late_tabled=0;return;}
         g_trace.result[0]=0;
         trace_analyze(queue,frame?uint64_t(na::observe::IdOf(frame)):0,sdr_present);
         ++g_trace.traces;g_trace.armed.store(false);g_trace.recs.clear();g_trace.frame.clear();

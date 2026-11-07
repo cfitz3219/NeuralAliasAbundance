@@ -171,6 +171,9 @@ struct NativeBridgeStats {
     // full-output writers seen (pipeline, kind, output, render-size inputs, verdict).
     uint64_t st_gated=0,st_full=0,st_examined=0,st_no_input=0,st_ambiguous=0,st_draw_state=0,st_candidates=0,st_recorded=0,st_failed=0,
         st_ungated_full=0,st_budget=0,st_aux=0;
+    // Late-bound upscale steps: staged at the dispatch, resolved at submission (descriptors
+    // changed after recording / unchanged), and resolved to the learned images.
+    uint64_t st_late_staged=0,st_late_changed=0,st_late_same=0,st_late_resolved=0;
     char steps[720]{};
     // Sol bafa40a: deliveries confirmed at submission (first frame, current and
     // best consecutive run), producer-order refusals, deliveries whose target was

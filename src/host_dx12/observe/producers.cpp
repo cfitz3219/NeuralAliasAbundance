@@ -7859,6 +7859,40 @@ bool NativeDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle,OperationDescriptor& ou
     if(details.counter){next.counter.Attach(AcquireResource(details.counter));if(!next.counter)return false;}
     out=std::move(next);return true;
 }
+uint32_t RefreshNativeOperation(NativeOperation& op)
+{
+    struct Fresh { size_t at; DescriptorDetails view; uint64_t version; bool has_view; };
+    std::vector<Fresh> fresh;
+    {
+        std::shared_lock<RegistryLock> lock(g_m);
+        for (const auto& t : op.tables) {
+            if (!t.heap) continue;
+            const DescHeap* heap = nullptr;
+            for (const auto& h : g_heaps) if (h->id == t.heap) { heap = h.get(); break; }
+            if (!heap || uint64_t(t.slot) + t.count > heap->count || size_t(t.first) + t.count > op.descriptors.size()) continue;
+            SlotShared stripe;
+            for (uint32_t i = 0; i < t.count; ++i) {
+                stripe.lock(heap, uint64_t(t.slot) + i);
+                const uint64_t version = heap->versions[t.slot + i];
+                auto& d = op.descriptors[t.first + i];
+                if (version == d.version) continue;
+                const auto& info = heap->info[t.slot + i];
+                fresh.push_back({size_t(t.first) + i, info.details ? *info.details : DescriptorDetails{}, version, info.details != nullptr});
+            }
+        }
+    }
+    uint32_t changed = 0;
+    for (auto& f : fresh) {
+        auto& d = op.descriptors[f.at];
+        OperationDescriptor next; next.used = d.used; next.version = f.version;
+        if (f.has_view) next.view = f.view;
+        if (next.view.resource) next.resource.Attach(AcquireResource(next.view.resource));
+        if (next.view.counter) next.counter.Attach(AcquireResource(next.view.counter));
+        d = std::move(next);
+        ++changed;
+    }
+    return changed;
+}
 bool ListNativeOperationKey(ID3D12GraphicsCommandList* list,bool compute,const uint64_t* members,size_t count,NativeOperationKey& out){
     out={};OperationKey key;
     std::shared_lock<RegistryLock> lock(g_m);
@@ -7985,7 +8019,7 @@ bool ListNativeOperation(ID3D12GraphicsCommandList* list, bool compute, NativeOp
             if (sampler) continue;
             uint32_t slot = 0; const auto* heap = heap_for_gpu_locked(args[param].value, &slot);
             if (!heap || span > heap->count - slot || span > 4096 - next.descriptors.size()) return fail("Scene resource table is outside the tracked descriptor heap.");
-            next.tables.push_back({param, static_cast<uint32_t>(next.descriptors.size()), span});
+            next.tables.push_back({param, static_cast<uint32_t>(next.descriptors.size()), span, heap->id, slot});
             SlotShared stripe;
             for (uint32_t i = 0; i < span; ++i) {
                 stripe.lock(heap, uint64_t(slot) + i);

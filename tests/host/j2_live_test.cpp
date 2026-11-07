@@ -194,6 +194,12 @@ int main(int argc,char** argv)
     // back buffer (only one reads the 3440x1440 canvas), and the canvas base is written by a
     // DRAW into a UAV from the render-size image (SE5 pso 660/799). Plus the compute decoy.
     const bool native_session=native_se5&&argc>1&&std::strstr(argv[1],"session")!=nullptr;
+    // p11148 frame dumps: the game fills the upscale dispatch's descriptor table AFTER the
+    // Dispatch is recorded (stale ring content at record time). Emulated: the table holds a
+    // decoy UAV and 1x1 dummies while the list records; the real views are copied in after
+    // Close, before ExecuteCommandLists. The trace and the delivery must resolve the table
+    // at submission (late=1/N in the trace line), and DLSS still reaches the screen.
+    const bool native_latebind=native_se5&&argc>1&&std::strstr(argv[1],"latebind")!=nullptr;
     const bool nvrhi=argc>1&&std::strcmp(argv[1],"--nvrhi")==0;
     if(nvrhi&&!na::gpu::GetStats().built)return test::kSkip;
     na::gpu::SetBackendForTests(nvrhi?na::gpu::TestBackend::Nvrhi:na::gpu::TestBackend::Native);
@@ -504,6 +510,7 @@ int main(int argc,char** argv)
         // Tables at 7 (native, late, aux) and 10 (native, late, null). The
         // unbounded SRV range uses two statically declared registers.
         test::ComPtr<ID3D12RootSignature> se5_root;test::ComPtr<ID3D12PipelineState> se5_upscale;
+        test::ComPtr<ID3D12DescriptorHeap> stage_heap;test::ComPtr<ID3D12Resource> dummy;
         if(native_se5){
             const auto base=heap->GetCPUDescriptorHandleForHeapStart().ptr;
             D3D12_SHADER_RESOURCE_VIEW_DESC fp=sv;fp.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -514,6 +521,24 @@ int main(int argc,char** argv)
             dev->CreateShaderResourceView(late.Get(),&sv,{base+11*increment});
             dev->CreateShaderResourceView(nullptr,&fp,{base+12*increment});
             dev->CreateShaderResourceView(decoy.Get(),&sv,{base+13*increment});
+            if(native_latebind){
+                // Staging (CPU) heap: 0..2 the record-time dummies (decoy UAV, 1x1 SRVs),
+                // 7..12 the real tables, copied into the shader-visible heap before submission.
+                D3D12_DESCRIPTOR_HEAP_DESC sd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,16u,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
+                REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&sd,IID_PPV_ARGS(&stage_heap))));
+                dummy=test::CreateTexture(dev,1,1,DXGI_FORMAT_R8G8B8A8_UNORM,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_FLAG_NONE);REQUIRE(dummy);
+                const auto sbase=stage_heap->GetCPUDescriptorHandleForHeapStart().ptr;
+                D3D12_SHADER_RESOURCE_VIEW_DESC dv=sv;dv.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
+                dev->CreateUnorderedAccessView(decoy.Get(),nullptr,&uv,{sbase});
+                dev->CreateShaderResourceView(dummy.Get(),&dv,{sbase+1*increment});
+                dev->CreateShaderResourceView(dummy.Get(),&dv,{sbase+2*increment});
+                dev->CreateUnorderedAccessView(native.Get(),nullptr,&uv,{sbase+7*increment});
+                dev->CreateShaderResourceView(late.Get(),&sv,{sbase+8*increment});
+                dev->CreateShaderResourceView(aux.Get(),&fp,{sbase+9*increment});
+                dev->CreateUnorderedAccessView(native.Get(),nullptr,&uv,{sbase+10*increment});
+                dev->CreateShaderResourceView(late.Get(),&sv,{sbase+11*increment});
+                dev->CreateShaderResourceView(nullptr,&fp,{sbase+12*increment});
+            }
             D3D12_DESCRIPTOR_RANGE r2[2]{{D3D12_DESCRIPTOR_RANGE_TYPE_UAV,1,0,0,0},{D3D12_DESCRIPTOR_RANGE_TYPE_SRV,UINT_MAX,0,0,1}};
             D3D12_ROOT_PARAMETER p2{};p2.ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;p2.DescriptorTable={2,r2};
             D3D12_ROOT_SIGNATURE_DESC d2{1,&p2,0,nullptr,D3D12_ROOT_SIGNATURE_FLAG_NONE};
@@ -686,6 +711,11 @@ int main(int argc,char** argv)
                     target_list->DrawInstanced(3,1,0,0);
                 }else if(native_se5){
                     // The real upscale step, with the auxiliary input on even frames.
+                    if(native_latebind){
+                        // Record-time content of this frame's table: dummies (the game has not written it yet).
+                        const auto cbase=heap->GetCPUDescriptorHandleForHeapStart().ptr;
+                        dev->CopyDescriptorsSimple(3,{cbase+(iteration%2?10u:7u)*increment},stage_heap->GetCPUDescriptorHandleForHeapStart(),D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                    }
                     target_list->SetComputeRootSignature(se5_root.Get());
                     target_list->SetPipelineState(se5_upscale.Get());
                     target_list->SetComputeRootDescriptorTable(0,{base+(iteration%2?10u:7u)*increment});
@@ -746,6 +776,13 @@ int main(int argc,char** argv)
                 target_list->ResourceBarrier(1,&end_native[1]);
             }else target_list->ResourceBarrier(2,end_native);
             REQUIRE(SUCCEEDED(target_list->Close()));
+            if(native_latebind){
+                // After Close, before submission: the game writes the real table.
+                const auto cbase=heap->GetCPUDescriptorHandleForHeapStart().ptr;
+                const auto sbase=stage_heap->GetCPUDescriptorHandleForHeapStart().ptr;
+                const unsigned at=iteration%2?10u:7u;
+                dev->CopyDescriptorsSimple(3,{cbase+at*increment},{sbase+at*increment},D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            }
             ID3D12CommandList* native_lists[]{scene.list.Get(),post.list.Get()};
             if(native_se5){
                 if(native_reverse && iteration>=2){
@@ -942,6 +979,16 @@ static uint64_t seen=0;char tr[2048];uint64_t n=0;na::j2::NativeTraceResult(tr,s
                     // (stale: the last trace is the invalidating one, without a crossing)
                     if(!native_stale&&!native_bindless&&!native_unseen&&!native_session)CHECK(std::strstr(trace,"handoff=[")!=nullptr && std::strstr(trace,"transfer=shader_defined")!=nullptr);
                     if(!native_bindless&&!native_unseen)CHECK(std::strstr(trace,"cached=0 ")==nullptr);
+                    // Late-bound table: exactly the upscale dispatch changed between recording
+                    // and submission; with tables written up front nothing changes.
+                    std::printf("se5 late tables: %s\n",std::strstr(trace," late=")?std::strstr(trace," late="):"(absent)");
+                    CHECK(std::strstr(trace,native_latebind?" late=1/":" late=0/")!=nullptr);
+                    if(native_latebind){
+                        const auto nl=na::j2::GetNativeBridgeStats();
+                        std::printf("se5 latebind: staged %llu changed %llu same %llu resolved %llu\n",(unsigned long long)nl.st_late_staged,
+                            (unsigned long long)nl.st_late_changed,(unsigned long long)nl.st_late_same,(unsigned long long)nl.st_late_resolved);
+                        CHECK(nl.st_late_staged>=late_deliveries && nl.st_late_changed>=late_deliveries && nl.st_late_same==0 && nl.st_late_resolved>=late_deliveries);
+                    }
                     CHECK(g_pattern_writes>=int(late_deliveries));
                     // Deliveries on frames with the auxiliary input were counted.
                     const auto nb=na::j2::GetNativeBridgeStats();
