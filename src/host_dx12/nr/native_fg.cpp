@@ -3,6 +3,10 @@
 #include "host_dx12/nr/queue_trace.hpp"
 #include <atomic>
 namespace na::nr::native {
+struct SubmissionPosition {
+    std::atomic<uintptr_t> queue{0};
+    std::atomic<uint64_t> order{0};
+};
 namespace {std::atomic<SubmissionPrepareCallback> submission_prepare{nullptr};}
 void SetSubmissionPrepareCallback(SubmissionPrepareCallback callback){submission_prepare.store(callback,std::memory_order_release);}
 }
@@ -39,6 +43,7 @@ Status status;
 std::mutex published_status_mutex;
 Status published_status;
 std::atomic<uint64_t> submissions{0};
+std::atomic<uint64_t> submission_sequence{0};
 const GUID swapchain_key={0xc3f25562,0xe301,0x46c8,{0xb8,0x2d,0xa7,0x9e,0x0d,0x83,0xfe,0xf1}};
 bool IsSwapchain(ID3D12Resource* r){UINT value=0,size=sizeof(value);return r && SUCCEEDED(r->GetPrivateData(swapchain_key,&size,&value)) && value==1;}
 void Reason(const char* text) { strncpy_s(status.reason,text,_TRUNCATE); }
@@ -145,6 +150,7 @@ struct Context {
 };
 std::vector<std::unique_ptr<Context>> contexts;
 struct Recording {
+    std::shared_ptr<SubmissionPosition> position=std::make_shared<SubmissionPosition>();
     std::shared_ptr<std::atomic<bool>> retired=std::make_shared<std::atomic<bool>>(false);
     std::shared_ptr<std::atomic<bool>> completed=std::make_shared<std::atomic<bool>>(false);
     ID3D12CommandList* list=nullptr;
@@ -411,7 +417,7 @@ RecordingLease RetainRecording(ID3D12GraphicsCommandList* list,std::shared_ptr<v
     std::lock_guard<std::mutex> lock(mutex);Collect();
     auto* r=Track(list,device.Get());if(!r)return lease;
     if(std::find(r->retained.begin(),r->retained.end(),payload)==r->retained.end())r->retained.push_back(std::move(payload));
-    for(const auto& entry:recordings)if(entry.get()==r){lease.record_=entry;lease.retired_=r->retired;lease.completed_=r->completed;break;}
+    for(const auto& entry:recordings)if(entry.get()==r){lease.record_=entry;lease.retired_=r->retired;lease.completed_=r->completed;lease.position_=r->position;break;}
     return lease;
 }
 bool RecordingLease::Ready(ID3D12CommandQueue* consumer) const {
@@ -441,6 +447,12 @@ bool RecordingLease::Completed() const {
 }
 bool RecordingLease::SameRecording(const RecordingLease& other) const {
     return retired_ && retired_==other.retired_;
+}
+uint64_t RecordingLease::SubmissionOrder(ID3D12CommandQueue* consumer) const {
+    if(!position_ || !Ready(consumer))return 0;
+    const auto order=position_->order.load(std::memory_order_acquire);
+    if(position_->queue.load(std::memory_order_acquire)!=reinterpret_cast<uintptr_t>(consumer) || !Ready(consumer))return 0;
+    return order;
 }
 void TraceGpuProgress(){
     std::unique_lock<std::mutex> lock(mutex,std::try_to_lock);
@@ -621,15 +633,24 @@ bool RecordFrame(ID3D12GraphicsCommandList* list,const void* core,const void* st
 }
 Submission::Submission(ID3D12CommandQueue* q,UINT n,ID3D12CommandList* const* lists) {
     if(internal || !records_count.load())return;
-    for(UINT i=0;i<n && count_<64;++i) {
+    for(UINT i=0;i<n;++i) {
         IUnknown* raw=nullptr;UINT bytes=sizeof(raw);
         if(lists[i] && SUCCEEDED(lists[i]->GetPrivateData(token_id,&bytes,&raw)) && raw) {
             auto r=static_cast<Token*>(raw)->recording.lock();raw->Release();
-            if(r && r->valid->load() && std::find(records_,records_+count_,r)==records_+count_)records_[count_++]=r;
+            if(r && r->valid->load()) {
+                auto at=std::find(records_,records_+count_,r);
+                if(at!=records_+count_)std::rotate(at,at+1,records_+count_); // last execution wins
+                else if(count_<64)records_[count_++]=r;
+            }
         }
     }
     if(!count_)return; // ordinary game/helper submissions never enter an NR lock
+    // Lock in pointer order to avoid deadlock, but preserve the game's actual
+    // batch order for consumers selecting the last scene writer.
+    std::shared_ptr<void> original[64];
+    std::copy(records_,records_+count_,original);
     std::sort(records_,records_+count_,[](const auto& a,const auto& b){return std::less<const void*>{}(a.get(),b.get());});
+    for(uint32_t i=0;i<count_;++i)ordinals_[i]=uint32_t(std::find(original,original+count_,records_[i])-original);
     ++internal;entered_=true;queue_=q;
     for(uint32_t i=0;i<count_;++i){auto& r=*static_cast<Recording*>(records_[i].get());
         r.forwarding.fetch_add(1);locks_[i]=std::unique_lock<std::mutex>(r.submission_mutex);}
@@ -637,11 +658,18 @@ Submission::Submission(ID3D12CommandQueue* q,UINT n,ID3D12CommandList* const* li
 }
 Submission::~Submission() {
     if(!queue_)return;
+    // J2's observed Execute scope serializes forwards on this queue. These
+    // numbers compare same-queue submissions only, never different queues.
+    const auto base=submission_sequence.fetch_add(count_,std::memory_order_relaxed)+1;
     for(uint32_t i=0;i<count_;++i){auto& r=*static_cast<Recording*>(records_[i].get());
         r.last_queue.store(reinterpret_cast<uintptr_t>(queue_));
         uint64_t frequency=0;queue_->GetTimestampFrequency(&frequency);r.frequency.store(frequency);
         if(FAILED(queue_->Signal(r.fence.Get(),++r.value)))r.failed.store(true);
-        else if(!r.packets.empty())submissions.fetch_add(1);
+        else {
+            r.position->queue.store(reinterpret_cast<uintptr_t>(queue_),std::memory_order_relaxed);
+            r.position->order.store(base+ordinals_[i],std::memory_order_release);
+            if(!r.packets.empty())submissions.fetch_add(1);
+        }
         trace::Record("nr_receipt",queue_,r.fence.Get(),r.value.load(),r.fence->GetCompletedValue());
         r.forwarding.fetch_sub(1);
         locks_[i].unlock(); // before the shared Recording owner can be destroyed
@@ -663,6 +691,7 @@ bool RecordingLease::Ready(ID3D12CommandQueue*)const{return false;}
 bool RecordingLease::Retired()const{return false;}
 bool RecordingLease::Completed()const{return false;}
 bool RecordingLease::SameRecording(const RecordingLease&)const{return false;}
+uint64_t RecordingLease::SubmissionOrder(ID3D12CommandQueue*)const{return 0;}
 void TraceGpuProgress(){}
 void PrepareDevice(ID3D12Device*){}
 void MarkSwapchainBuffer(ID3D12Resource*){}

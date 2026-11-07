@@ -4081,7 +4081,14 @@ bool StartCore(const char* route_tag, PanelFn controls)
                 na::observe::InstallProducers(dev.Get(), queue.Get(), /*hook_queue_execute=*/false);
                 na::observe::SetExecuteForwarder(g_orig_execute); // C9b: host sample copies bypass this detour
             }
-            if (ok && na::nr::states::InstallEnhancedInvalidation()) na::observe::InstallListResetTracking(dev.Get(), na::nr::OnCommandListReset,na::nr::states::Observe);
+            if (ok) {
+                const bool enhanced=na::nr::states::InstallEnhancedInvalidation();
+                // Resource/recording retirement is mandatory even if optional
+                // enhanced-barrier registration failed. Do not keep an old
+                // submission receipt when the game reuses a command list.
+                na::observe::InstallListResetTracking(dev.Get(),na::nr::OnCommandListReset,
+                    enhanced?na::nr::states::Observe:nullptr);
+            }
             if (ok) {
                 na::present::Originals o;
                 o.present = g_orig_present;

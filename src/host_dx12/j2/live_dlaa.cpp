@@ -96,7 +96,8 @@ struct Slot {
 };
 
 struct PendingHistory {
-    uint64_t native_source=0;
+    na::nr::native::RecordingLease native_source;
+    uint64_t native_source_serial=0;
     bool native_delivery=false;
     na::camera::CameraTracker tracker;
     // The interloper rule after this frame's camera, committed with the tracker: an attempt that
@@ -250,7 +251,8 @@ struct State {
     std::atomic<uint64_t> q_attempt_frame{0}, q_ok_frame{0};
     uint64_t q_run = 0;
     std::atomic<bool> q_dry_hit{false};
-    uint64_t next_native_source=0,consumed_native_source=0;
+    uint64_t next_native_source=0,consumed_native_order=0;
+    uint64_t consumed_foreign_native_source=0;
     JitterWrites jitter_writes;
     std::vector<na::j2::ColorEvent> frame_seq; // this frame's writes/consumers of the colour, submission order
     bool frame_seq_complete = true;
@@ -532,7 +534,13 @@ struct NativeTrace{
     NativeCrossing previous, learned;
     std::vector<uint64_t> learned_inputs; // every render-size input the learned step was seen reading (cap 4)
     std::atomic<uint64_t> learned_pso{0};
-    void note_input(uint64_t id){ if(id&&std::find(learned_inputs.begin(),learned_inputs.end(),id)==learned_inputs.end()&&learned_inputs.size()<4)learned_inputs.push_back(id); }
+    void note_input(uint64_t id){
+        if(!id)return;
+        const auto found=std::find(learned_inputs.begin(),learned_inputs.end(),id);
+        if(found!=learned_inputs.end())learned_inputs.erase(found);
+        else if(learned_inputs.size()==4)learned_inputs.erase(learned_inputs.begin());
+        learned_inputs.push_back(id); // retain recent variants after level/input replacement
+    }
 };
 NativeTrace& g_trace=*new NativeTrace;
 constexpr uint64_t kTraceOps=60000;
@@ -1555,7 +1563,11 @@ void reason(const char* r)
     }
 }
 void committed_sources(const PendingHistory& p) {
-    if(p.native_source)g.consumed_native_source=(std::max)(g.consumed_native_source,p.native_source);
+    if(p.native_source) {
+        const auto order=p.native_source.SubmissionOrder(g.queue.Get());
+        if(order)g.consumed_native_order=(std::max)(g.consumed_native_order,order);
+        else g.consumed_foreign_native_source=(std::max)(g.consumed_foreign_native_source,p.native_source_serial);
+    }
     if(p.depth_source>=1 && p.depth_source<=4)++g.stats.depth_sources[p.depth_source-1];
     if(p.camera_source>=1 && p.camera_source<=6)++g.stats.camera_sources[p.camera_source-1];
     g.stats.depth_source_last=p.depth_source;g.stats.camera_source_last=p.camera_source;
@@ -4701,20 +4713,32 @@ void on_entry(ID3D12GraphicsCommandList* l,const na::j2::InsertionEvent& entry) 
 const SceneInput* pick_producer_locked(uint64_t color,uint64_t depth,ID3D12CommandQueue* queue,
                                        ID3D12CommandList* const* lists,UINT count,UINT at,bool allow_unsubmitted=false)
 {
-    for (auto it=g.native_producers.rbegin();it!=g.native_producers.rend();++it) {
-        const auto& p=*it;
-        if (p.color!=color || p.depth!=depth || !p.native_origin || !p.native_recording || !p.native_list ||
-            p.native_serial<=g.consumed_native_source) continue;
-        // The newest unused recording of this scene IS the producer; an older one is superseded
-        // (reverse-order fixture: a previous frame's submitted scene must not stand in). Only
-        // its qualification is decided here.
-        if (p.native_origin.Ready(queue)) return &p;
-        if (lists) for (UINT j=0;j<=at && j<count;++j)
-            if (lists[j] && uint64_t(na::observe::IdOf(lists[j]))==p.native_list && na::observe::ListRecording(lists[j])==p.native_recording) return &p;
-        if (allow_unsubmitted && !p.native_origin.Retired()) return &p;
-        return nullptr;
+    const SceneInput *submitted=nullptr,*prefix=nullptr,*closed=nullptr,*latest=nullptr;
+    uint64_t order=g.consumed_native_order,newest_frame=0;
+    UINT prefix_at=0;
+    for(const auto& p:g.native_producers) {
+        if(p.color!=color || p.depth!=depth || !p.native_origin || !p.native_recording || !p.native_list)continue;
+        if(p.native_origin.Retired() && !p.native_origin.Ready(queue))continue; // discarded, never executed
+        latest=&p;
+        newest_frame=(std::max)(newest_frame,p.frame);
+        if(!p.native_origin.Retired() && !p.native_origin.Ready(queue))closed=&p;
+        if(lists)for(UINT j=0;j<=at && j<count;++j)
+            if(lists[j] && uint64_t(na::observe::IdOf(lists[j]))==p.native_list && na::observe::ListRecording(lists[j])==p.native_recording && (!prefix || j>=prefix_at)) {
+                prefix=&p;prefix_at=j;
+            }
+        const auto executed=p.native_origin.SubmissionOrder(queue);
+        if(executed>order){submitted=&p;order=executed;}
     }
-    return nullptr;
+    // An exact prefix is later than any previously submitted writer. A future
+    // CPU Close cannot hide it. Without a prefix, never substitute last frame's
+    // scene for this frame's as-yet-unsubmitted producer.
+    if(prefix)return prefix;
+    if(submitted && submitted->frame>=newest_frame)return submitted;
+    // Keep the existing completed-foreign-queue route. Same-queue receipt
+    // numbers deliberately do not manufacture an order across queues.
+    if(latest && latest->native_serial>g.consumed_foreign_native_source &&
+       !latest->native_origin.SubmissionOrder(queue) && latest->native_origin.Ready(queue))return latest;
+    return allow_unsubmitted?closed:nullptr;
 }
 // Native engine control owns sizing; J2 only supplies reconstruction at the
 // observed source->native-destination pass. Reuse record(), its state restore,
@@ -5266,8 +5290,11 @@ public:
                 // such a frame goes to the list-boundary route from stretch() instead.
                 const auto* p=c->input ? &c->producer :
                     pick_producer_locked(color,depth,g.queue.Get(),nullptr,0,0,/*allow_unsubmitted=*/true);
-                if (c->input && (!p->native_origin || p->color!=color || p->depth!=depth ||
-                    p->native_serial<=g.consumed_native_source || !p->native_origin.Ready(g.queue.Get()))) p=nullptr;
+                if(c->input) {
+                    const auto order=p->native_origin.SubmissionOrder(g.queue.Get());
+                    if(!p->native_origin || p->color!=color || p->depth!=depth || !p->native_origin.Ready(g.queue.Get()) ||
+                       (order?order<=g.consumed_native_order:p->native_serial<=g.consumed_foreign_native_source))p=nullptr;
+                }
                 if(!p){skip(c->input?"No submitted scene producer matches this upscale step.":"No unused executable or submitted scene producer matches this upscale pass.");return false;}
                 saved=*p;
             }
@@ -5327,7 +5354,7 @@ public:
             {std::lock_guard<std::mutex> up(g_up_m);previous=g_up;g_up=target;}
             struct RestoreTarget{UpscaleTarget old;~RestoreTarget(){std::lock_guard<std::mutex> up(g_up_m);g_up=old;}} restore_target{previous};
             const bool ok=record(one,0,depth,in_id,&out,pending,l,&touched,c->input?&staged:local?nullptr:&saved);
-            if(!local)pending.native_source=saved.native_serial;
+            if(!local){pending.native_source=saved.native_origin;pending.native_source_serial=saved.native_serial;}
             pending.native_delivery=ok;
             // The same existing recording lease handles submit, Reset/discard,
             // pooled-list reuse and completion. Include resources allocated by
@@ -5548,7 +5575,8 @@ int record_deferred_native(ID3D12CommandQueue* queue, ID3D12CommandList* const* 
         slot.native_scale_resources={work.input,work.depth,work.output,source.native_depth_snapshot};
         // The caller signals this fence after submitting our owned list.
         if (source.native_depth_reader_fence) *source.native_depth_reader_fence=g.fence_next;
-        pending.native_source=source.native_serial;
+        pending.native_source=source.native_origin;
+        pending.native_source_serial=source.native_serial;
         pending.native_delivery=true;
         g_nb.st_recorded.fetch_add(1,std::memory_order_relaxed);
         return static_cast<int>(i+1);

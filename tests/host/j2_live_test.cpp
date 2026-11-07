@@ -226,6 +226,7 @@ int main(int argc,char** argv)
     const bool native_layout_change=native_latebind&&std::strstr(argv[1],"layout-change")!=nullptr;
     const bool native_inherited=native_latebind&&std::strstr(argv[1],"inherited")!=nullptr;
     const bool native_close_race=native_latebind&&std::strstr(argv[1],"close-race")!=nullptr;
+    const bool native_close_before=native_close_race&&std::strstr(argv[1],"close-before")!=nullptr;
     const bool nvrhi=argc>1&&std::strcmp(argv[1],"--nvrhi")==0;
     if(nvrhi&&!na::gpu::GetStats().built)return test::kSkip;
     na::gpu::SetBackendForTests(nvrhi?na::gpu::TestBackend::Nvrhi:na::gpu::TestBackend::Native);
@@ -239,7 +240,9 @@ int main(int argc,char** argv)
     std::printf("step: install producers\n");
     REQUIRE(na::observe::InstallProducers(dev, d.queue.Get(), /*hook_queue_execute=*/true));
     if(native_scale)na::j2::EnableNativeScaleBridge(true);
-    if(native_late) REQUIRE(na::observe::InstallListResetTracking(dev,na::nr::OnCommandListReset));
+    // Every native-scale variant uses recording leases, as does production.
+    // A Reset must create a new receipt, including the short direct-pass tests.
+    if(native_scale) REQUIRE(na::observe::InstallListResetTracking(dev,na::nr::OnCommandListReset));
     na_observe_config cfg{};
     cfg.size_bytes = sizeof(cfg);
     REQUIRE(na_observe_start(&cfg, &Sink, nullptr) == NA_OK);
@@ -749,8 +752,11 @@ int main(int argc,char** argv)
                         future.list->SetGraphicsRootConstantBufferView(0,va+1024);
                         future.list->SetGraphicsRootDescriptorTable(1,cbvh->GetGPUDescriptorHandleForHeapStart());
                         future.list->ResourceBarrier(2,finish_native);
-                        close_race->target=post.list.Get();
-                        close_race->close=[&]{CHECK(SUCCEEDED(future.list->Close()));};
+                        if(native_close_before){REQUIRE(SUCCEEDED(future.list->Close()));++close_race->closed;}
+                        else {
+                            close_race->target=post.list.Get();
+                            close_race->close=[&]{CHECK(SUCCEEDED(future.list->Close()));};
+                        }
                     }else REQUIRE(SUCCEEDED(future.list->Close()));
                 }
                 // Render ahead: this producer closes before the preceding
