@@ -272,8 +272,8 @@ int main() {
         const auto difference=[](const std::vector<float>& a,const std::vector<float>& b){
             float m=0;if(a.size()!=b.size()||a.empty())return 1e9f;for(size_t i=0;i<a.size();i+=4)m=std::max(m,std::abs(a[i]-b[i]));return m;};
         auto keep=options;keep.temporal=.85f;auto off=options;off.temporal=0;
-        na::xegtao::Pass reference;
-        auto r1=scene(reference,off,1,true);REQUIRE(r1->ok);const auto plain=execute(*r1);
+        na::xegtao::Pass plain_pass;
+        auto r1=scene(plain_pass,off,1,true);REQUIRE(r1->ok);const auto plain=execute(*r1);
         na::xegtao::Pass history;
         // Chained: an executed frame feeds the next (so the checks below are not vacuous).
         {auto a=scene(history,keep,0,true);REQUIRE(a->ok);execute(*a);

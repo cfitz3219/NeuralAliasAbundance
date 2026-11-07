@@ -378,11 +378,11 @@ bool Frame::Record(ID3D12GraphicsCommandList* l) {
         unsigned parity;
         {   std::lock_guard<std::mutex> lock(s.history_m);
             auto& c=w.constants;parity=s.next;s.next^=1u;
-            const uint32_t own=++s.serial?s.serial:++s.serial; // 0 = never written
-            c.expected_stamp=w.reset?0u:s.last_stamp;c.own_stamp=own;c.stamp_read=parity^1u;c.stamp_write=parity;
+            const uint32_t stamp=++s.serial?s.serial:++s.serial; // 0 = never written
+            c.expected_stamp=w.reset?0u:s.last_stamp;c.own_stamp=stamp;c.stamp_read=parity^1u;c.stamp_write=parity;
             c.temporal_blend=w.reset||!s.last_stamp?1.f:1.f-w.keep;
             c.jitter_delta[0]=s.last_jitter[0]-w.jitter[0];c.jitter_delta[1]=s.last_jitter[1]-w.jitter[1];
-            s.last_stamp=own;s.last_jitter[0]=w.jitter[0];s.last_jitter[1]=w.jitter[1];
+            s.last_stamp=stamp;s.last_jitter[0]=w.jitter[0];s.last_jitter[1]=w.jitter[1];
         }
         l->SetComputeRoot32BitConstants(0,sizeof(Constants)/4,&w.constants,0);
         auto* h=s.history[parity].Get();auto* hd=s.history_depth[parity].Get();
