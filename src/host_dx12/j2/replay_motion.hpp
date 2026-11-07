@@ -13,14 +13,15 @@
 #include <cstddef>
 #include <vector>
 #include "host_dx12/observe/producers.hpp"
+#include "host_dx12/nr/native_fg.hpp"
 
 namespace na::j2::replay_motion {
 
-struct Pair { uint32_t cur_first = 0, prev_first = 0, verts = 0; };
-// Matches this frame's draws to the frame before. Exact (signature and buffers) first, then by
-// signature alone where it is unique in both frames. Unmatched draws are left out.
+struct Pair { uint32_t cur_first = 0, prev_first = 0, verts = 0; D3D12_RECT scissor{}; };
+// Draws need a unique signature and buffer match in both frames. Otherwise
+// two objects sharing a mesh can swap identities when draw order changes.
 std::vector<Pair> Match(const std::vector<na::observe::ReplayRecord>& cur, const std::vector<na::observe::ReplayRecord>& prev,
-                        uint32_t* exact, uint32_t* loose);
+                        uint32_t width, uint32_t height);
 
 struct Output { ID3D12Resource* motion = nullptr; ID3D12Resource* valid = nullptr; };
 struct Stats {
@@ -33,10 +34,10 @@ public:
     bool Init(ID3D12Device* device);
     bool Ready() const { return pso_[0] != nullptr; }
     // In J2's evaluation list. depth: R32 scene depth copy (NPSR). reset: no continuity with the
-    // frame before (cut, resize, gap): nothing is fed. jitter_delta: (previous - current) raster
-    // jitter already inside the game's clip positions, in render pixels, removed from v.
-    Output Record(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, uint32_t rw, uint32_t rh, bool reversed, bool reset,
-                  const float jitter_delta[2]);
+    // frame before (cut, resize, gap): nothing is fed. Viewport jitter is the
+    // current raster offset in render pixels, absent from both sets of clip positions.
+    Output Record(ID3D12GraphicsCommandList* list, ID3D12CommandQueue* queue, ID3D12Resource* depth, uint32_t rw, uint32_t rh, bool reversed, bool reset,
+                  const float viewport_jitter[2]);
     Stats GetStats() const { return stats_; }
 private:
     bool ensure(uint32_t rw, uint32_t rh);
@@ -44,7 +45,9 @@ private:
     Microsoft::WRL::ComPtr<ID3D12RootSignature> root_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_[2]; // [reversed]
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> srv_, rtv_, dsv_;
-    Microsoft::WRL::ComPtr<ID3D12Resource> motion_, valid_, zdepth_, zeros_;
+    Microsoft::WRL::ComPtr<ID3D12Resource> motion_, valid_, zdepth_;
+    static constexpr uint32_t kSets = 8;
+    na::nr::native::RecordingLease descriptor_use_[kSets];
     UINT srv_stride_ = 0, rtv_stride_ = 0;
     uint32_t tw_ = 0, th_ = 0;
     Stats stats_;

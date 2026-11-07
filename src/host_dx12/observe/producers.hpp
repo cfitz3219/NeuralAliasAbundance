@@ -360,25 +360,31 @@ struct ReplayProbeStats { uint32_t draws, prev_draws, unique, matched, same_buff
 void SetReplayProbe(bool on);
 // Draw replay (per-object motion): every qualifying scene draw is drawn again with a stream-output
 // twin of its pipeline, writing each expanded vertex's clip position (float4) into this frame's
-// slot buffer. J2 takes the frame once per frame in its own list; it must zero `next`'s first
-// counter_bytes there (they are the stream-output filled sizes) and then call ReplaySlotZeroed.
-// Slot buffers are left in COMMON / promoted to STREAM_OUT by the game's lists.
-struct ReplayRecord { uint64_t sig = 0, vb = 0; uint32_t first = 0, verts = 0; };
+// slot buffer. Capture and current-frame consumption must share one recording.
+// A submitted previous recording can supply history while a retired slot can be reused.
+struct ReplayUse {
+    virtual ~ReplayUse() = default;
+    virtual bool Ready(ID3D12CommandQueue*) const = 0;
+    virtual bool Retired() const = 0;
+};
+using ReplayRetain = std::shared_ptr<ReplayUse> (*)(ID3D12GraphicsCommandList*);
+struct ReplayRecord {
+    uint64_t sig = 0, vb = 0;
+    uint32_t first = 0, verts = 0, width = 0, height = 0;
+    int32_t scissor[4]{};
+};
 struct ReplayFrame {
     ID3D12Resource* cur = nullptr;  // this frame's positions (draws in cur_draws)
     ID3D12Resource* prev = nullptr; // the frame before (null when not continuous)
-    ID3D12Resource* next = nullptr; // to zero for the next frame
-    uint32_t next_slot = 0;
-    uint64_t data_offset = 0, counter_bytes = 0; // positions start at data_offset (16 bytes each)
+    uint64_t data_offset = 0; // positions start at data_offset (16 bytes each)
     std::vector<ReplayRecord> cur_draws, prev_draws;
 };
 struct DrawReplayStats {
     uint64_t replayed = 0, vertices = 0, twin_queued = 0, twin_building = 0, twin_failed = 0, overflow = 0, topology = 0, stages = 0;
     uint64_t untwinned = 0, no_recipe = 0, not_ready = 0, built = 0, build_failed = 0, noted = 0, hash_mismatch = 0;
 };
-void SetDrawReplay(bool on);
-bool ReplayTakeFrame(ReplayFrame* f);
-void ReplaySlotZeroed(uint32_t slot);
+void SetDrawReplay(uint64_t frame, ReplayRetain retain);
+bool ReplayTakeFrame(ID3D12GraphicsCommandList* list, ID3D12CommandQueue* queue, ReplayFrame* f);
 void GetDrawReplayStats(DrawReplayStats* out);
 bool ReplayProbeFrame(ReplayProbeStats* out); // call once per frame (Present); swaps frames
 bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float* y);
