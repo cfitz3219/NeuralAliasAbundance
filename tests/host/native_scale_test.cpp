@@ -98,7 +98,11 @@ int main(int argc,char** argv){
     Observe(true,2293,960,2293,960,2,true);CHECK(!GetStats().confirmed); // reduced DLAA is not full-output DLSS
     Observe(true,2293,959,3440,1440,2,true);CHECK(!GetStats().confirmed); // both dimensions
     Observe(true,2293,960,3440,1440,1,true);CHECK(!GetStats().confirmed); // old evaluation
-    Observe(true,2293,960,3440,1440,2,true);CHECK(GetStats().confirmed);
+    Observe(true,2293,960,3440,1440,3,true);CHECK(GetStats().confirmed);
+    Observe(true,2293,960,3440,1440,3,false);CHECK(!GetStats().confirmed);
+    Observe(true,2293,960,3440,1440,3,true);CHECK(!GetStats().confirmed); // no new submission
+    Observe(true,2293,960,3440,1440,4,true);CHECK(GetStats().confirmed);
+    Observe(true,2293,959,3440,1440,5,true);CHECK(!GetStats().confirmed);
     // Subsequent updates execute on the same simulated engine thread. Configure
     // resets ownership only between isolated fixtures, never in production.
     ConfigureForTest(f.bytes.data(),r,&native_tick,&native_apply);Observe(true,3440,1440,3440,1440,3,true);Request(2);
@@ -123,5 +127,15 @@ int main(int argc,char** argv){
     const auto settled=GetStats().applies;
     TickForTest();CHECK(GetStats().applies==settled); // nothing to redo on the next tick
     CHECK(GetStats().game_applies>=1);
+    // Pause during an inhibited update must retain restoration ownership and
+    // retry after the native cache has staged the original value already.
+    for(uint32_t restore_up:{0u,3u}){
+        f.put(f.up,restore_up);f.put(f.upcache,restore_up);f.put(f.active,1.f);f.put(f.cache,1.f);f.put(f.sw,3440u);f.put(f.sh,1440u);
+        ConfigureForTest(f.bytes.data(),r,&native_tick,&native_apply);Observe(true,3440,1440,3440,1440,6,true);Request(1);TickForTest();
+        inhibited=true;Observe(false,2293,960,3440,1440,6,false);TickForTest();
+        CHECK(GetStats().controlled);CHECK(f.get<float>(f.cache)==1.f);CHECK(f.get<float>(f.active)!=1.f);
+        inhibited=false;TickForTest();CHECK(!GetStats().controlled);CHECK(f.get<float>(f.active)==1.f);
+        CHECK(f.get<uint32_t>(f.upcache)==restore_up);CHECK(GetStats().render_w==3440&&GetStats().render_h==1440);
+    }
     return test::finish("native_scale_test");
 }

@@ -4,12 +4,18 @@
 #include <vector>
 #include <algorithm>
 #include <cstring>
+#include <atomic>
 
 namespace na::ffx_flow {
 using Microsoft::WRL::ComPtr;
 namespace {
 constexpr auto U=D3D12_RESOURCE_STATE_UNORDERED_ACCESS,S=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 constexpr unsigned tables=32,desc=64,per_slot=tables*desc,permanent=64;
+// Data lives on OUR descriptor heap, so destruction/address reuse cannot
+// accidentally validate a new heap. A new PairFlow has a new scratch identity.
+const GUID binding_stamp_guid={0xc05725f3,0x399b,0x4f15,{0x8a,0x29,0xd3,0x6e,0xc1,0xd1,0x30,0x91}};
+std::atomic<uint64_t> next_binding_owner{1};
+struct BindingStamp {uint64_t owner=0;uint32_t slots=0;};
 struct Tex {ComPtr<ID3D12Resource> r;DXGI_FORMAT f=DXGI_FORMAT_UNKNOWN;};
 D3D12_RESOURCE_BARRIER transition(ID3D12Resource* r,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b){
     D3D12_RESOURCE_BARRIER t{};t.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -21,13 +27,21 @@ struct PairFlow::Impl {
     ID3D12DescriptorHeap* active_heap=nullptr; // selected only within serialized Record/Init
     ComPtr<ID3D12RootSignature> root[7];ComPtr<ID3D12PipelineState> pso[7];
     std::vector<Tex> tex;unsigned w=0,h=0,slots=0,stride=0,table=0;
+    // The explicit-pair graph below has fixed scratch bindings at each pass.
+    // Cache those descriptors in CPU-only storage; each executable recording
+    // still gets its own immutable shader-visible copies and input views.
+    std::array<bool,tables> template_ready{};
+    const uint64_t binding_owner=next_binding_owner.fetch_add(1,std::memory_order_relaxed);
+    bool bind_tables=true;
     unsigned luma[2][7]{},flow[2][7]{},hist=0,previous_hist=0,temp=0,scd=0;
     bool initialized=false;const char* error="Not initialized";
     D3D12_CPU_DESCRIPTOR_HANDLE cpu(unsigned i){auto a=active_heap->GetCPUDescriptorHandleForHeapStart();a.ptr+=SIZE_T(i)*stride;return a;}
     D3D12_GPU_DESCRIPTOR_HANDLE gpu(unsigned i){auto a=active_heap->GetGPUDescriptorHandleForHeapStart();a.ptr+=UINT64(i)*stride;return a;}
-    void view(unsigned i,ID3D12Resource* r,DXGI_FORMAT f,bool uav){
-        if(uav){D3D12_UNORDERED_ACCESS_VIEW_DESC d{};d.Format=f;d.ViewDimension=D3D12_UAV_DIMENSION_TEXTURE2D;device->CreateUnorderedAccessView(r,nullptr,&d,cpu(i));}
-        else{D3D12_SHADER_RESOURCE_VIEW_DESC d{};d.Format=f;d.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;d.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;d.Texture2D.MipLevels=1;device->CreateShaderResourceView(r,&d,cpu(i));}
+    D3D12_CPU_DESCRIPTOR_HANDLE template_cpu(unsigned i){auto a=clear_heap->GetCPUDescriptorHandleForHeapStart();a.ptr+=SIZE_T(i)*stride;return a;}
+    void view(unsigned i,ID3D12Resource* r,DXGI_FORMAT f,bool uav,bool in_template=false){
+        const auto at=in_template?template_cpu(i):cpu(i);
+        if(uav){D3D12_UNORDERED_ACCESS_VIEW_DESC d{};d.Format=f;d.ViewDimension=D3D12_UAV_DIMENSION_TEXTURE2D;device->CreateUnorderedAccessView(r,nullptr,&d,at);}
+        else{D3D12_SHADER_RESOURCE_VIEW_DESC d{};d.Format=f;d.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;d.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;d.Texture2D.MipLevels=1;device->CreateShaderResourceView(r,&d,at);}
     }
     bool add(unsigned width,unsigned height,DXGI_FORMAT format,unsigned& index){
         Tex t;t.f=format;D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;
@@ -52,10 +66,19 @@ struct PairFlow::Impl {
     void run(ID3D12GraphicsCommandList* l,Pass pass,std::initializer_list<Binding> srvs,std::initializer_list<Binding> uavs,
              unsigned level,unsigned x,unsigned y,unsigned z=1,ID3D12Resource* color=nullptr){
         const unsigned base=table;table+=desc;
-        for(unsigned j=0;j<32;++j){view(base+j,nullptr,DXGI_FORMAT_R32_UINT,true);view(base+32+j,nullptr,DXGI_FORMAT_R32_UINT,false);}
-        for(auto b:srvs){auto& t=tex[b.index];auto tr=transition(t.r.Get(),U,S);l->ResourceBarrier(1,&tr);view(base+32+b.reg,t.r.Get(),t.f,false);}
+        const unsigned ordinal=(base-permanent)%per_slot/desc;
+        const unsigned source=permanent+ordinal*desc;
+        if(!template_ready[ordinal]){
+            for(unsigned j=0;j<32;++j){view(source+j,nullptr,DXGI_FORMAT_R32_UINT,true,true);view(source+32+j,nullptr,DXGI_FORMAT_R32_UINT,false,true);}
+            for(auto b:srvs){auto& t=tex[b.index];view(source+32+b.reg,t.r.Get(),t.f,false,true);}
+            for(auto b:uavs){auto& t=tex[b.index];view(source+b.reg,t.r.Get(),t.f,true,true);}
+            template_ready[ordinal]=true;
+        }
+        // CopyDescriptors sources MUST be non-shader-visible. Do not copy
+        // from the old frame slot or modify it while the GPU may reference it.
+        if(bind_tables)device->CopyDescriptorsSimple(desc,cpu(base),template_cpu(source),D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        for(auto b:srvs){auto& t=tex[b.index];auto tr=transition(t.r.Get(),U,S);l->ResourceBarrier(1,&tr);}
         if(color)view(base+32,color,color->GetDesc().Format,false);
-        for(auto b:uavs){auto& t=tex[b.index];view(base+b.reg,t.r.Get(),t.f,true);}
         // Pair inputs/pyramids are fully initialized. AMD's six-frame startup
         // warmup for its implicit stream history does not apply to explicit pairs.
         const unsigned cb[8]={w,h,level,7,6,0,0,0x3f800000};
@@ -81,7 +104,7 @@ bool PairFlow::Init(ID3D12Device* dev,unsigned w,unsigned h,unsigned slots){
     D3D12_DESCRIPTOR_HEAP_DESC hd{};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;hd.NumDescriptors=permanent+slots*per_slot;
     if(FAILED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&p->heap))))return false;
     p->active_heap=p->heap.Get();
-    hd.NumDescriptors=permanent;hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    hd.NumDescriptors=permanent+per_slot;hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     if(FAILED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&p->clear_heap))))return false;
     for(unsigned i=0;i<7;++i){const auto b=Shader(static_cast<Pass>(i),false);
         if(FAILED(dev->CreateRootSignature(0,b.data,b.size,IID_PPV_ARGS(&p->root[i]))))return false;
@@ -104,7 +127,11 @@ bool PairFlow::Record(ID3D12GraphicsCommandList* l,ID3D12Resource* cur,ID3D12Res
     if(recording_heap && !*recording_heap){auto hd=p->heap->GetDesc();
         if(FAILED(p->device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(recording_heap->ReleaseAndGetAddressOf()))))return false;}
     p->active_heap=recording_heap?recording_heap->Get():p->heap.Get();
-    if(recording_heap)for(unsigned i=0;i<p->tex.size();++i)p->view(i,p->tex[i].r.Get(),p->tex[i].f,true);
+    BindingStamp stamp{};UINT stamp_bytes=sizeof stamp;
+    if(FAILED(p->active_heap->GetPrivateData(binding_stamp_guid,&stamp_bytes,&stamp))||stamp_bytes!=sizeof stamp||stamp.owner!=p->binding_owner)
+        stamp={p->binding_owner,0};
+    p->bind_tables=(stamp.slots&(1u<<slot))==0;
+    if(recording_heap&&p->bind_tables)p->device->CopyDescriptorsSimple(static_cast<UINT>(p->tex.size()),p->cpu(0),p->template_cpu(0),D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     ID3D12DescriptorHeap* heap=p->active_heap;l->SetDescriptorHeaps(1,&heap);
     p->table=permanent+slot*per_slot;
     for(unsigned i=0;i<p->tex.size();++i)p->clear(l,i);p->barrier(l);
@@ -128,6 +155,7 @@ bool PairFlow::Record(ID3D12GraphicsCommandList* l,ID3D12Resource* cur,ID3D12Res
                 ((p->w+next-1)/next+3)/4,((p->h+next-1)/next+3)/4);
         }
     }
+    if(p->bind_tables){stamp.slots|=1u<<slot;p->active_heap->SetPrivateData(binding_stamp_guid,sizeof stamp,&stamp);}
     auto a=transition(Grid(),U,S),b=transition(SceneChange(),U,S);l->ResourceBarrier(1,&a);l->ResourceBarrier(1,&b);return true;
 }
 ID3D12Resource* PairFlow::Grid()const{return p->tex.empty()?nullptr:p->tex[p->flow[1][0]].r.Get();}

@@ -3,9 +3,17 @@
 #include "host_dx12/ffx_flow/ffx_flow_shaders.hpp"
 #include <vector>
 #include <cmath>
-int main(){
+#include <chrono>
+#include <cstring>
+#include <algorithm>
+#include <d3d12sdklayers.h>
+int main(int argc,char** argv){
+    std::setvbuf(stdout,nullptr,_IONBF,0);
     if(!na::ffx_flow::Built())return test::kSkip;
+    test::ComPtr<ID3D12Debug> debug;
+    if(argc==1&&SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))debug->EnableDebugLayer();
     test::Device d;if(!test::CreateDevice(d))return test::kSkip;
+    test::ComPtr<ID3D12InfoQueue> info;d.device.As(&info);
     if(!na::ffx_flow::DeviceSupported(d.device.Get())){std::puts("SKIP: AMD search needs 32/64-lane hardware waves");return test::kSkip;}
     constexpr unsigned w=512,h=256;na::ffx_flow::PairFlow flow;
     if(!flow.Init(d.device.Get(),w,h)){std::printf("%s\n",flow.Error());return 1;}
@@ -24,22 +32,46 @@ int main(){
     };
     auto previous=image(0),current=image(4);
     auto execute=[&](){l.list->Close();ID3D12CommandList* lists[]={l.list.Get()};d.queue->ExecuteCommandLists(1,lists);d.WaitIdle();l.Reset();};execute();
-    auto measure=[&](ID3D12Resource* a,ID3D12Resource* b,float expected){
-        CHECK(flow.Record(l.list.Get(),a,b,0));auto gd=flow.Grid()->GetDesc();
+    test::ComPtr<ID3D12DescriptorHeap> private_heap;
+    auto* active=&flow;
+    auto measure=[&](ID3D12Resource* a,ID3D12Resource* b,float expected,bool private_storage=false){
+        CHECK(active->Record(l.list.Get(),a,b,0,private_storage?std::addressof(private_heap):nullptr));auto gd=active->Grid()->GetDesc();
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};UINT64 bytes=0;d.device->GetCopyableFootprints(&gd,0,1,0,&fp,nullptr,nullptr,&bytes);
         auto rb=test::CreateBuffer(d.device.Get(),bytes,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
-        auto tr=test::Transition(flow.Grid(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_SOURCE);l.list->ResourceBarrier(1,&tr);
-        D3D12_TEXTURE_COPY_LOCATION src{},dst{};src.pResource=flow.Grid();src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        auto tr=test::Transition(active->Grid(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_SOURCE);l.list->ResourceBarrier(1,&tr);
+        D3D12_TEXTURE_COPY_LOCATION src{},dst{};src.pResource=active->Grid();src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         dst.pResource=rb.Get();dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;dst.PlacedFootprint=fp;l.list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
-        tr=test::Transition(flow.Grid(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);l.list->ResourceBarrier(1,&tr);flow.Finish(l.list.Get());execute();
+        tr=test::Transition(active->Grid(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);l.list->ResourceBarrier(1,&tr);active->Finish(l.list.Get());execute();
         unsigned char* p=nullptr;rb->Map(0,nullptr,reinterpret_cast<void**>(&p));unsigned good=0,n=0;double error=0;
         for(unsigned y=4;y<h/8-4;++y)for(unsigned x=4;x<w/8-4;++x){auto v=reinterpret_cast<const int16_t*>(p+fp.Offset+y*fp.Footprint.RowPitch)+2*x;
             const float e=std::abs(v[0]-expected)+std::abs(static_cast<float>(v[1]));error+=e;++n;if(e<=1)++good;
         }rb->Unmap(0,nullptr);std::printf("pair expected %.1f px: %u/%u within1px, mean L1 %.3f\n",expected,good,n,error/n);CHECK(good>n*9/10);
     };
     measure(current.Get(),previous.Get(),-4);measure(previous.Get(),current.Get(),4);measure(current.Get(),current.Get(),0);
+    // Production uses recording-owned heaps; exercise a fresh heap, reuse only
+    // after completion, and changed image pairs (including reverse direction).
+    measure(current.Get(),previous.Get(),-4,true);measure(previous.Get(),current.Get(),4,true);
+    private_heap.Reset();measure(current.Get(),current.Get(),0,true);
+    na::ffx_flow::PairFlow other;REQUIRE(other.Init(d.device.Get(),w,h));
+    active=&other;measure(current.Get(),previous.Get(),-4,true);
+    active=&flow;measure(previous.Get(),current.Get(),4,true);
     // A discarded recording must not advance temporal state or invalidate subsequent barriers.
     CHECK(flow.Record(l.list.Get(),current.Get(),previous.Get(),1));flow.Finish(l.list.Get());l.list->Close();l.Reset();
     measure(current.Get(),previous.Get(),-4);CHECK(d.device->GetDeviceRemovedReason()==S_OK);execute();
+    if(argc>1&&!std::strcmp(argv[1],"--bench-record")) {
+        // CPU recording only, deliberately discarded. No GPU/model work in
+        // the timed region and no claim about game FPS from this measurement.
+        std::vector<double> times;
+        for(unsigned i=0;i<110;++i) {
+            const auto start=std::chrono::steady_clock::now();
+            CHECK(flow.Record(l.list.Get(),current.Get(),previous.Get(),0,&private_heap));flow.Finish(l.list.Get());
+            l.list->Close();l.Reset();
+            if(i>=10)times.push_back(std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-start).count());
+        }
+        double mean=0;for(double t:times)mean+=t;mean/=times.size();std::sort(times.begin(),times.end());
+        std::printf("flow_record_cpu samples=%zu mean_us=%.2f p95_us=%.2f (discarded commands, no GPU wait)\n",times.size(),mean,times[95]);
+    }
+    if(info)for(UINT64 i=0;i<info->GetNumStoredMessages();++i){SIZE_T bytes=0;info->GetMessage(i,nullptr,&bytes);std::vector<uint8_t> data(bytes);auto* message=reinterpret_cast<D3D12_MESSAGE*>(data.data());
+        if(SUCCEEDED(info->GetMessage(i,message,&bytes))&&message->Severity<=D3D12_MESSAGE_SEVERITY_ERROR){std::printf("D3D12: %s\n",message->pDescription);CHECK(false);}}
     return test::finish("ffx_flow_test");
 }

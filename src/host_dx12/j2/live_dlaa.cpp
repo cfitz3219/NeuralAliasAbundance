@@ -9,7 +9,6 @@
 #include <unordered_map>
 #include "host_dx12/capture/capture_session.hpp"
 #include "host_dx12/j2/msaa_resolve.hpp"
-#include "host_dx12/j2/nis_sharpen.hpp"
 #include "host_dx12/j2/nis_scaler.hpp"
 #include "host_dx12/j2/native_hud.hpp"
 #include "host_dx12/j2/hud_unblend.hpp"
@@ -82,6 +81,7 @@ struct Slot {
 };
 
 struct PendingHistory {
+    uint64_t native_source=0;
     na::camera::CameraTracker tracker;
     // The interloper rule after this frame's camera, committed with the tracker: an attempt that
     // never submits (failed DLSS, failed recording) must not teach it a jump or a return.
@@ -114,6 +114,11 @@ struct SceneInput {
     // recent reads. at_present: states are what all submitted work left on J2's queue.
     bool has_camera = true;
     bool at_present = false;
+    // Native producer identity survives a preceding picture's Present and a
+    // command-list Reset after submission. A discarded/unsubmitted recording
+    // cannot become a usable producer. Frame remains diagnostic for this path.
+    uint64_t native_serial=0,native_recording=0;
+    na::nr::native::RecordingLease native_origin;
 };
 
 struct State {
@@ -195,6 +200,7 @@ struct State {
     na::j2::InsertionEvent capture_entry;
     SceneInput waiting_scene;
     SceneInput native_scene;
+    uint64_t next_native_source=0,consumed_native_source=0;
     JitterWrites jitter_writes;
     std::vector<na::j2::ColorEvent> frame_seq; // this frame's writes/consumers of the colour, submission order
     bool frame_seq_complete = true;
@@ -389,6 +395,7 @@ void reason(const char* r)
     }
 }
 void committed_sources(const PendingHistory& p) {
+    if(p.native_source)g.consumed_native_source=(std::max)(g.consumed_native_source,p.native_source);
     if(p.depth_source>=1 && p.depth_source<=4)++g.stats.depth_sources[p.depth_source-1];
     if(p.camera_source>=1 && p.camera_source<=6)++g.stats.camera_sources[p.camera_source-1];
     g.stats.depth_source_last=p.depth_source;g.stats.camera_source_last=p.camera_source;
@@ -908,7 +915,6 @@ bool jshift_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Res
     return true;
 }
 // Retained for the standalone NIS test helper; the live slider uses RCAS only.
-na::j2::NisSharpen g_nis;
 bool rcas_record(ID3D12GraphicsCommandList* l, uint32_t percent, DXGI_FORMAT fmt)
 {
     return g.sharp && rcas_dispatch(l, g.output.Get(), g.sharp.Get(), g.ow, g.oh, percent, fmt, g.slot, g.depth32.Get(), g.rw, g.rh, g.stats.depth_reversed);
@@ -2258,7 +2264,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             if (id == depth_id) pending.depth_source = 2;
             return true;
         }
-        if(inl&&saved&&saved->native_states&&saved->frame==g.frame&&saved->color==color_id&&saved->depth==depth_id){
+        if(inl&&saved&&saved->native_states&&saved->native_serial&&saved->color==color_id&&saved->depth==depth_id){
             const auto current=na::observe::ListStateSub(inl,id,sub,st);
             if(current==na::observe::StateLookup::Known)return true;
             if(current==na::observe::StateLookup::Unavailable)return false;
@@ -3546,7 +3552,14 @@ public:
             if(color!=c->color||depth!=c->depth){skip("The scene selection changed during the frame.");return;}
             ID3D12CommandList* one[]{l};SceneInput saved;
             const bool local=na::observe::ListRendersTo(l,color,depth);
-            if(!local){saved=g.native_scene;if(saved.frame!=g.frame||saved.color!=color||saved.depth!=depth){skip("The scene list's camera was not kept for this upscale pass.");return;}}
+            if(!local){
+                saved=g.native_scene;
+                if(saved.color!=color||saved.depth!=depth||!saved.native_origin||!saved.native_recording||
+                   saved.native_serial<=g.consumed_native_source||
+                   (saved.native_origin.Retired()&&!saved.native_origin.Ready(g.queue.Get()))){
+                    skip("No unused executable or submitted scene producer matches this upscale pass.");return;
+                }
+            }
             if(local&&(!g.inline_camera_submitted||(g.jit.valid&&g.jit.applied)))jitter_batch(one,1);
             g.inline_sample_locked=true;
             const uint32_t slot=g.slot;PendingHistory pending;ID3D12GraphicsCommandList* out=nullptr;bool touched=false;
@@ -3557,6 +3570,7 @@ public:
             {std::lock_guard<std::mutex> up(g_up_m);previous=g_up;g_up={c->dest,c->sub,0,0};}
             struct RestoreTarget{UpscaleTarget old;~RestoreTarget(){std::lock_guard<std::mutex> up(g_up_m);g_up=old;}} restore_target{previous};
             const bool ok=record(one,0,depth,color,&out,pending,l,&touched,local?nullptr:&saved);
+            if(!local)pending.native_source=saved.native_serial;
             // The same existing recording lease handles submit, Reset/discard,
             // pooled-list reuse and completion. Include resources allocated by
             // record() even when it only recorded a partial failed attempt.
@@ -3583,17 +3597,28 @@ public:
             if(!color||!depth||!na::observe::ListRendersTo(l,color,depth))return;
             std::lock_guard<std::mutex> lock(g.m);ID3D12CommandList* one[]{l};
             if(g.latched||!g.device)return;
+            // A merged recording already owns its reconstruction/history and
+            // inputs. Publishing it again as an unused producer would permit
+            // an unrelated later list to consume the same scene a second time.
+            if(g.inl.valid&&g.inl.list==l&&g.inl.rec==na::observe::ListRecording(l))return;
             // No rendering or GPU readback at Close. Preserve the actual scene
             // camera/sample for a separate post-processing recording, using J1.
             if(!g.inline_camera_submitted||(g.jit.valid&&g.jit.applied))jitter_batch(one,1);
             SceneInput saved;saved.frame=g.frame;saved.color=color;saved.depth=depth;
+            saved.native_recording=na::observe::ListRecording(l);
+            if(!saved.native_recording)return;
             if(!na::observe::ListSceneSubresource(l,color,depth,&saved.color_sub,&saved.depth_sub))return;
             saved.native_states=na::observe::ListStateSub(l,color,saved.color_sub,&saved.color_state)==na::observe::StateLookup::Known&&
                 na::observe::ListStateSub(l,depth,saved.depth_sub,&saved.depth_state)==na::observe::StateLookup::Known;
             saved.has_camera=find_camera(one,0,depth,&saved.vp,&saved.reversed,&saved.interlopers);
             saved.judged=saved.has_camera;
             saved.injected=g_injected;saved.jitter[0]=g_injected?g.jit.px[0]:0;saved.jitter[1]=g_injected?g.jit.px[1]:0;
-            g.native_scene=saved;
+            auto owner=std::make_shared<std::vector<ComPtr<ID3D12Resource>>>();
+            ComPtr<ID3D12Resource> image,guide;image.Attach(na::observe::AcquireResource(color));guide.Attach(na::observe::AcquireResource(depth));
+            if(!image||!guide)return;*owner={image,guide};
+            saved.native_origin=na::nr::native::RetainRecording(l,owner);if(!saved.native_origin)return;
+            saved.native_serial=++g.next_native_source;
+            g.native_scene=std::move(saved);
         }catch(...){}
     }
 };
@@ -5149,15 +5174,6 @@ bool CompileHudShadersForTests(char* why, size_t why_size)
     }
     return true;
 }
-bool RecordNisForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* in, ID3D12Resource* out,
-                       uint32_t w, uint32_t h, uint32_t percent, DXGI_FORMAT fmt, bool hdr)
-{
-    std::lock_guard<std::mutex> lock(g.m);
-    if (percent > 100 && !g_nis.WaitCompiled()) { std::printf("%s\n", g_nis.Error()); return false; }
-    const bool ok = g_nis.Dispatch(device, list, in, out, w, h, fmt, hdr, percent, 0);
-    if (!ok && percent > 100) std::printf("NIS dispatch refused: %s\n", g_nis.Error());
-    return ok;
-}
 bool RecordHudUnblendForTests(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list, ID3D12Resource* picture, DXGI_FORMAT picture_format,
                               ID3D12Resource* l0, ID3D12Resource* l1, DXGI_FORMAT view, float grey, bool srgb, ID3D12Resource* out,
                               uint32_t w, uint32_t h, ID3D12Resource* counts)
@@ -5924,7 +5940,6 @@ void Shutdown()
     g_rcas = RcasPass{};
     g_jshift = JitterShift{}; // released here, not in static destruction after D3D12 has gone
     g_small.jshift.Reset();
-    g_nis.Reset();
     g.arbiter_ok = false;
     g.tracker.Reset();
     g.interlopers.Reset();

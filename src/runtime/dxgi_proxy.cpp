@@ -59,6 +59,13 @@ extern "C" HRESULT WINAPI AbundanceDXGIDeclareAdapterRemovalSupport() {
     const auto function=resolve<Function>("DXGIDeclareAdapterRemovalSupport");
     return function?function():HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
 }
+extern "C" HRESULT WINAPI AbundanceDXGIDisableVBlankVirtualization() {
+    // Optional Windows 11 DXGI entry point. Forward only when the game asks;
+    // NeuralAlias never changes the game's refresh policy on its own.
+    using Function=HRESULT(WINAPI*)();
+    const auto function=resolve<Function>("DXGIDisableVBlankVirtualization");
+    return function?function():HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
+}
 extern "C" int __cdecl AbundanceQueryProxyStatus(abundance::ProxyStatus* status) {
     if(!status || status->size!=sizeof(*status)) return 0;
     // A54: `reserved` reports the host bootstrap: bit0 host enabled by ini, bit1 host

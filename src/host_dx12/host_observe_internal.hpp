@@ -4,7 +4,7 @@
 //
 // Transport (A24): per-producer-thread SPSC byte rings, claimed once per
 // thread by CAS, drained by the single worker. Producers never lock, allocate
-// or wait. Up to 32 producer threads; further threads drop with loss
+// or wait. Up to 64 producer threads; further threads drop with loss
 // accounting. Semantics (framing, loss, epochs, status) are unchanged from
 // the frozen contract and covered by the same tests.
 #pragma once

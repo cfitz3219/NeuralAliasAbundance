@@ -25,6 +25,7 @@ struct State {
     // below its own 50% parser minimum). Never re-run the native resize on
     // every tick forever; retry slowly and report the refusal instead.
     uint64_t retry_revision=0;uint32_t misses=0,backoff=0;
+    float original_pending=1,original_active=1;uint32_t original_upscale=0;
 };
 State& g=*new State;
 thread_local bool inside=false;
@@ -86,6 +87,8 @@ void tick_hook(){
     const bool fresh=revision!=g.consumed||!g.controlled;
     if(enabled&&!fresh&&active!=wanted&&g.backoff){--g.backoff;} // refused earlier: wait before one more try
     else if(enabled&&(fresh||active!=wanted)){
+        if(!g.controlled){g.original_pending=read<float>(f.setting);g.original_active=active;
+            g.original_upscale=f.upscale_setting?read<uint32_t>(f.upscale_setting):0;}
         // Directly reuses the game's complete settings apply, including SER's
         // inlined size update, AFTER the tick's 5% pending-setting normalizer.
         apply_native(g.base+f.context,true);g.controlled=true;g.consumed=revision;
@@ -102,8 +105,30 @@ void tick_hook(){
         }else note("Native scene size requested; waiting for the game to commit it.");
     }else if(!enabled&&g.controlled){
         // The preserved pending settings are the game's own requested values.
-        apply_native(g.base+f.context,false);g.controlled=false;g.consumed=revision;
-        note("Game render scale restored; NeuralAlias is paused.");
+        // A native apply may stage its cache while a loading/resize inhibit
+        // prevents committing the renderer. Reconcile that staging and retry
+        // on the native thread; a cached value alone is not restoration.
+        const float pending=read<float>(f.setting);
+        const uint32_t upscale=f.upscale_setting?read<uint32_t>(f.upscale_setting):0;
+        const bool known_target=!upscale||(upscale==g.original_upscale&&pending==g.original_pending);
+        const float target=!upscale?pending:g.original_active;
+        if(g.backoff){--g.backoff;}
+        else {
+            if(read<float>(f.cache)==pending&&(!known_target||active!=target))put(f.cache,active);
+            apply_native(g.base+f.context,false);
+            const float now=read<float>(f.active);
+            const bool caches=read<float>(f.cache)==pending&&(!f.upscale_cache||read<uint32_t>(f.upscale_cache)==upscale);
+            const bool committed=std::isfinite(now)&&now>0&&
+                std::abs(double(read<uint32_t>(f.scene_w))-double(fw)*now)<=1.01&&
+                std::abs(double(read<uint32_t>(f.scene_h))-double(fh)*now)<=1.01;
+            if(caches&&committed&&(known_target?now==target:now!=wanted)){
+                g.controlled=false;g.consumed=revision;g.misses=0;
+                note("Game render scale restored; NeuralAlias is paused.");
+            }else{
+                if(++g.misses>=kMaxMisses)g.backoff=kRetryTicks;
+                note("NeuralAlias is paused; waiting for the game to commit its restored scene size.");
+            }
+        }
     }
     std::lock_guard<std::mutex> lock(g.mutex);
     ++g.stats.ticks;g.stats.thread=thread;g.stats.mode=mode;g.stats.controlled=g.controlled;
@@ -159,16 +184,19 @@ void Observe(bool enabled,uint32_t rw,uint32_t rh,uint32_t ow,uint32_t oh,uint64
     if(rw&&rh)g.seen.store(true,std::memory_order_release);
     const bool changed=g.enabled.exchange(enabled,std::memory_order_acq_rel)!=enabled;
     if(changed)g.revision.fetch_add(1,std::memory_order_acq_rel);
-    std::lock_guard<std::mutex> lock(g.mutex);auto& s=g.stats;s.evaluation=evaluation;
-    if(changed)s.confirmed=false;
+    std::lock_guard<std::mutex> lock(g.mutex);auto& s=g.stats;
+    const auto previous_evaluation=s.evaluation;
+    s.evaluation=evaluation;
+    s.confirmed=false;
     const float f=static_cast<float>(FractionForMode(static_cast<int>(g.mode.load())));
     // Native SSE conversion and compiler float contraction can differ at an
     // integer boundary by one pixel. Confirm the EXACT committed dimensions,
     // and independently require them to match the requested scale within that
     // rounding allowance; never accept a width-only percentage tolerance.
     const bool ratio=std::abs(double(s.render_w)-double(s.out_w)*f)<=1.01&&std::abs(double(s.render_h)-double(s.out_h)*f)<=1.01;
-    if(enabled&&s.controlled&&ratio&&evaluated&&evaluation>g.armed_evaluation&&ow==s.out_w&&oh==s.out_h&&s.render_w==rw&&s.render_h==rh){
+    if(enabled&&s.controlled&&ratio&&evaluated&&evaluation>previous_evaluation&&evaluation>g.armed_evaluation&&ow==s.out_w&&oh==s.out_h&&s.render_w==rw&&s.render_h==rh){
         s.confirmed=true;std::snprintf(s.reason,sizeof s.reason,"Native scene %u x %u; DLSS output %u x %u.",rw,rh,ow,oh);}
+    else if(enabled&&s.controlled&&ratio)std::snprintf(s.reason,sizeof s.reason,"Native scene size is applied; waiting for a fresh full-output DLSS submission.");
 }
 Stats GetStats(){std::lock_guard<std::mutex> lock(g.mutex);return g.stats;}
 #ifdef NA_NATIVE_SCALE_TEST
