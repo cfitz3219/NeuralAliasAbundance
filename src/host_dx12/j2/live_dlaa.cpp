@@ -4113,6 +4113,13 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         cp.depth = g.depth32.Get();
         cp.motion = g.motion.Get();
         cp.output = g.output.Get();
+        if (ambient) {
+            auto* spatial = ambient->Occlusion();
+            cp.extra[cp.extra_count++] = {"ao_spatial", spatial};
+            auto* resolved = ambient->CompositedVisibility();
+            if (resolved && resolved != spatial)
+                cp.extra[cp.extra_count++] = {"ao_temporal", resolved};
+        }
         na::capture::j2::Identity ci;
         ci.present_ordinal = g.frame;
         ci.submission = g.stats.submissions;
