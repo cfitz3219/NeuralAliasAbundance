@@ -28,9 +28,30 @@
 #include <cmath>
 #include <cstring>
 #include <vector>
+#include <functional>
+#include <thread>
 
 namespace {
 void __cdecl Sink(const na_event_batch*, void*) {}
+
+// Exercise a concurrent game Close between reconstruction's Before and After.
+// Test-only CPU synchronization; no GPU wait or runtime scheduling seam added.
+class CloseDuringDispatch final : public na::observe::ShaderOperationHook {
+public:
+    ID3D12GraphicsCommandList* target=nullptr;
+    uint64_t pipeline=0;
+    std::function<void()> close;
+    unsigned closed=0;
+    na::observe::ShaderScope Before(ID3D12GraphicsCommandList* l,na::observe::ShaderCall& call) noexcept override {
+        if(l==target && call.kind==na::observe::ShaderKind::Dispatch &&
+           na::observe::ListPipelineId(l)==pipeline && close){
+            auto fn=std::exchange(close,{});
+            std::thread worker(std::move(fn));worker.join();++closed;
+        }
+        return {};
+    }
+    void After(ID3D12GraphicsCommandList*,const na::observe::ShaderCall&,na::observe::ShaderScope&) noexcept override {}
+};
 
 std::vector<ID3D12CommandList*> g_forwarded;
 ID3D12CommandQueue* g_queue = nullptr;
@@ -203,6 +224,7 @@ int main(int argc,char** argv)
     const bool native_latebind=native_se5&&argc>1&&std::strstr(argv[1],"latebind")!=nullptr;
     const bool native_rotate=native_latebind&&std::strstr(argv[1],"rotate")!=nullptr;
     const bool native_inherited=native_latebind&&std::strstr(argv[1],"inherited")!=nullptr;
+    const bool native_close_race=native_latebind&&std::strstr(argv[1],"close-race")!=nullptr;
     const bool nvrhi=argc>1&&std::strcmp(argv[1],"--nvrhi")==0;
     if(nvrhi&&!na::gpu::GetStats().built)return test::kSkip;
     na::gpu::SetBackendForTests(nvrhi?na::gpu::TestBackend::Nvrhi:na::gpu::TestBackend::Native);
@@ -657,6 +679,14 @@ int main(int argc,char** argv)
             ID3D12CommandList* ls[]{state_list.list.Get()};d.queue->ExecuteCommandLists(1,ls);d.WaitIdle();
         };
         if(native_inherited)inherited_depth_state(true);
+        test::List future;
+        std::shared_ptr<CloseDuringDispatch> close_race;
+        if(native_close_race){
+            REQUIRE(future.Create(dev));REQUIRE(SUCCEEDED(future.list->Close()));
+            close_race=std::make_shared<CloseDuringDispatch>();
+            close_race->pipeline=na::observe::IdOf(se5_upscale.Get());
+            na::observe::SetShaderOperationHook(na::observe::ShaderLane::Bindings,close_race);
+        }
         const auto native_execute=[&](UINT count,ID3D12CommandList* const* ls){
             // The production overlay opens the observation scope BEFORE J2;
             // carried queue state is not available outside that scope.
@@ -694,6 +724,25 @@ int main(int argc,char** argv)
             ID3D12GraphicsCommandList* target_list=scene.list.Get();
             if(!native_merged){
                 REQUIRE(SUCCEEDED(scene.list->Close()));
+                if(native_close_race){
+                    ID3D12CommandList* producer[]{scene.list.Get()};native_execute(1,producer);
+                    // A future recording of the SAME scene closes while the
+                    // current dispatch is forwarded, but is never submitted.
+                    // Its CPU Close must not replace the established producer.
+                    future.Reset();
+                    if(iteration>=80){
+                        future.list->ResourceBarrier(2,begin_native);
+                        future.list->OMSetRenderTargets(1,&rtv,FALSE,&dsv);
+                        future.list->ClearRenderTargetView(rtv,grey_native,0,nullptr);
+                        future.list->ClearDepthStencilView(dsv,D3D12_CLEAR_FLAG_DEPTH,0,0,0,nullptr);
+                        future.list->SetGraphicsRootSignature(rs.Get());future.list->SetDescriptorHeaps(1,camera_heap);
+                        future.list->SetGraphicsRootConstantBufferView(0,va+1024);
+                        future.list->SetGraphicsRootDescriptorTable(1,cbvh->GetGPUDescriptorHandleForHeapStart());
+                        future.list->ResourceBarrier(2,finish_native);
+                        close_race->target=post.list.Get();
+                        close_race->close=[&]{CHECK(SUCCEEDED(future.list->Close()));};
+                    }else REQUIRE(SUCCEEDED(future.list->Close()));
+                }
                 // Render ahead: this producer closes before the preceding
                 // picture's Present; its separate post list records afterward.
                 // Cover both not-yet-submitted and already-submitted producer.
@@ -818,7 +867,9 @@ int main(int argc,char** argv)
             }
             ID3D12CommandList* native_lists[]{scene.list.Get(),post.list.Get()};
             if(native_se5){
-                if(native_reverse && iteration>=2){
+                if(native_close_race){
+                    native_execute(1,native_lists+1);
+                }else if(native_reverse && iteration>=2){
                     native_execute(1,native_lists+1);
                     native_execute(1,native_lists);
                 }else if(iteration%2){
@@ -1037,6 +1088,10 @@ static uint64_t seen=0;char tr[2048];uint64_t n=0;na::j2::NativeTraceResult(tr,s
             }
         }else CHECK(fake::evals==before_native+3);
         CHECK(dev->GetDeviceRemovedReason()==S_OK);
+        if(native_close_race){
+            CHECK(close_race->closed==iterations-80);
+            na::observe::SetShaderOperationHook(na::observe::ShaderLane::Bindings,{});
+        }
         if(witness_window){final_list.list.Reset();presented.Reset();witness_chain.Reset();DestroyWindow(witness_window);}
         fake::eval_output=nullptr;
         if(native_inherited){

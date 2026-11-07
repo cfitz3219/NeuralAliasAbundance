@@ -4741,9 +4741,12 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
         const auto h=(std::max)(1u,desc.Height>>mip);
         const uint64_t done=g.fence->GetCompletedValue();
         if (done==UINT64_MAX) return;
+        // A retained SceneInput/Candidate reserves these pixels even after its
+        // writer retires. Completion alone would allow a later Close to replace
+        // the selected depth between the consumer's Before/After callbacks.
         auto* slot=std::find_if(std::begin(snapshots_),std::end(snapshots_),[done](const auto& s){
             return (!s.writer || s.writer.Retired()) && (!s.reader || s.reader.Retired()) &&
-                (!s.owned_reader_fence || *s.owned_reader_fence<=done);
+                (!s.owned_reader_fence || (s.owned_reader_fence.use_count()==1 && *s.owned_reader_fence<=done));
         });
         if (slot==std::end(snapshots_)) { g_nb.snap_no_slot.fetch_add(1,std::memory_order_relaxed); return; }
         if (!slot->texture || slot->texture->GetDesc().Width!=w || slot->texture->GetDesc().Height!=h) {
@@ -4773,6 +4776,10 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
     struct Candidate {
         uint64_t color=0,depth=0,dest=0,recording=0;uint32_t sub=0;
         ComPtr<ID3D12Resource> source,guide,target;
+        // The producer qualified BEFORE the dispatch belongs to this operation.
+        // Another recording can Close while the original dispatch is forwarded;
+        // it must not replace this dependency in After().
+        SceneInput producer;
         // Audit F10 (f905099 run: src fmt 10, full_target fmt 27): the pass that
         // reads the small HDR scene ALSO tone-maps into a full-size target of
         // another format. DLSS then runs BEFORE that draw into a private
@@ -4970,13 +4977,20 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
             // submitted recording, and the input's state is known here or on the queue. Else
             // the list-boundary route, decided before the operation so After() arms the watch.
             bool inline_ok=false;
+            SceneInput producer;
             if (chosen) {
                 const bool local=na::observe::ListRendersTo(l,scene,depth);
                 bool producer_ok=local;
-                if (!producer_ok) { std::lock_guard<std::mutex> lock(g.m); producer_ok=pick_producer_locked(scene,depth,g.queue.Get(),nullptr,0,0)!=nullptr; }
+                if (!producer_ok) {
+                    std::lock_guard<std::mutex> lock(g.m);
+                    if (const auto* p=pick_producer_locked(scene,depth,g.queue.Get(),nullptr,0,0)) {
+                        producer=*p;producer_ok=true;
+                    }
+                }
                 uint32_t st=0;
-                const bool state_ok=na::observe::ListStateSub(l,chosen,0,&st)==na::observe::StateLookup::Known ||
-                    (g.queue && na::observe::KnownSubStateOnQueueNow(g.queue.Get(),chosen,0,&st));
+                const auto evidence=na::observe::ListStateSub(l,chosen,0,&st);
+                const bool state_ok=evidence==na::observe::StateLookup::Known ||
+                    (evidence==na::observe::StateLookup::Absent && g.queue && na::observe::KnownSubStateOnQueueNow(g.queue.Get(),chosen,0,&st));
                 if (!producer_ok) g_nb.st_late_no_producer.fetch_add(1,std::memory_order_relaxed);
                 if (!state_ok) g_nb.st_late_no_state.fetch_add(1,std::memory_order_relaxed);
                 inline_ok=producer_ok&&state_ok;
@@ -4984,6 +4998,7 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
             if (inline_ok) {
                 auto c=std::make_shared<Candidate>();
                 c->color=scene;c->depth=depth;c->recording=op.recording;
+                c->producer=std::move(producer);
                 c->source.Attach(na::observe::AcquireResource(chosen));
                 c->guide.Attach(na::observe::AcquireResource(depth));
                 c->target.Attach(na::observe::AcquireResource(learned.output));
@@ -5054,12 +5069,19 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
         // Inline needs an established producer (this list, or a submitted recording) before the
         // dispatch is appended; otherwise the list-boundary route, decided here before the
         // operation (Astra audit items 1, 5).
+        SceneInput producer;
         if (!na::observe::ListRendersTo(l,scene,depth)) {
             bool producer_ok=false;
-            { std::lock_guard<std::mutex> lock(g.m); producer_ok=pick_producer_locked(scene,depth,g.queue.Get(),nullptr,0,0)!=nullptr; }
+            {
+                std::lock_guard<std::mutex> lock(g.m);
+                if (const auto* p=pick_producer_locked(scene,depth,g.queue.Get(),nullptr,0,0)) {
+                    producer=*p;producer_ok=true;
+                }
+            }
             if (!producer_ok) { g_nb.st_late_no_producer.fetch_add(1,std::memory_order_relaxed); return stage_late(l,std::move(op),learned,scene,depth,pick.aux!=0); }
         }
         auto c=std::make_shared<Candidate>();
+        c->producer=std::move(producer);
         c->color=scene;
         c->depth=depth;
         c->recording=op.recording;
@@ -5240,7 +5262,10 @@ public:
                 // be ordered before this list: submitted. A closed, unsubmitted one is not
                 // accepted here (recorded commands cannot be cancelled by a later order check);
                 // such a frame goes to the list-boundary route from stretch() instead.
-                const auto* p=pick_producer_locked(color,depth,g.queue.Get(),nullptr,0,0,/*allow_unsubmitted=*/!c->input);
+                const auto* p=c->input ? &c->producer :
+                    pick_producer_locked(color,depth,g.queue.Get(),nullptr,0,0,/*allow_unsubmitted=*/true);
+                if (c->input && (!p->native_origin || p->color!=color || p->depth!=depth ||
+                    p->native_serial<=g.consumed_native_source || !p->native_origin.Ready(g.queue.Get()))) p=nullptr;
                 if(!p){skip(c->input?"No submitted scene producer matches this upscale step.":"No unused executable or submitted scene producer matches this upscale pass.");return false;}
                 saved=*p;
             }
