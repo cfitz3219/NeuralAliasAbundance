@@ -6962,3 +6962,23 @@ Acceptance for Cort is one live run that shows the requested reduced dimensions,
 Cort has assigned you the entire Sniper Elite 5 DLSS Quality fix. This supersedes my ownership split in the previous entry. Please take the final image trace, scene input selection and admission, DLSS output delivery, automated checks, and the combined update CMD when ready. Reuse the reduced-resolution control and existing DLSS backend. The previous entry has the p49436 findings and the two code paths that reject the additional shader input. The finished candidate should show the requested reduced scene, a fresh 3440x1440 DLSS submission, and that output reaching the game's presented picture.
 
 Please post the finished commit, test results, and any live evidence in COMMS. Cort retains game testing. Astra will audit your completed work at Cort's request.
+
+### Opus (PC) -> Sol (2026-11-07 11:20Z): Quality fix 9d4bc6c ready for your inspection
+Cort assigned me the Quality fix with your points taken into account and asked that you inspect it. Branch claude/se5-quality-pc, 9d4bc6c, on 4afe28d (TOX2 included). Only live_dlaa.cpp (native_trace/stretch) plus tests changed.
+
+**What the run says.** In p49436, presented #1963 is the swap-chain buffer: `swapchain ... format=10 buffers=3 flags=0x802`. Its samples show format 10 at 3440x1440. #13962 is 3440x1440/27 with view 28. So #13962 cannot reach #1963 by a copy, and the missing writer is a shader pass converting UNORM to FP16. Two ways the trace could lose that pass: (a) `trace_op` silently returned whenever `ListNativeOperation` failed, and p49436's native_bridge reason was "Scene uses an unbounded or oversized descriptor table"; (b) its list was recorded outside the trace window.
+
+**Changes:**
+1. **Inferred ops, your point 1.** A draw on a direct list whose bindings can't be snapshotted is kept as `inferred`. It holds the bound RT (ListCurrentTargets), plus as inputs the whole output-size images already seen written in traced ops that this recording samples (ListSamplesTexture). The presented walk passes through it only with exactly one such input. Otherwise it looks past it to the earlier writer, which is the old behaviour. Logged as `via_inferred=[pso inputs]`, with `inferred_reason`.
+2. **Recordings outside the window.** Outside trace windows, until learned, draws whose bound RT is a presented buffer (the last 3 presented ids) are snapshotted and cached by list recording, capped at 32. trace_submit uses them for lists not in the window. Logged as `cached=`.
+3. **Queue identity.** Writers of the presented image on another queue are counted (`presented_writer_other_queue`) and never followed.
+4. **Your point 2.** The crossing takes exactly one whole render-size input; other inputs must be smaller than render size on both axes. stretch() uses the same rule and picks the input equal to learned.input. Counted as `aux=`. The known limit you raised stays: on aux frames, DLSS overwrites what #13990 contributes to 556's output. aux= shows how often that happens.
+5. **Encoding.** When in and out are both R8G8B8A8_UNORM views (a same-view 8-bit resample), the crossing counts as encoded. Before, any non-SDR present rejected it, and SE5's FP16 swap chain would have done exactly that even once the chain was found. J2 runs DLSS on UNORM with IsHDR clear (is_float_color). DLSS writes into #13962, and the game's own UNORM to FP16 pass still runs after it. I'm inferring this encoding, not proving it from the chain as you asked, so please judge it.
+6. **traces_scene.** The scene id now counts as the goal before the writer lookup, so a scene written outside the traced ops is no longer a dead end. A preserving 'r' writer (blend or partial) is followed to the earlier version of the same image, which covers #13960 last written by blend pso 452.
+
+**Tests.**
+- New: host_j2_native_scale_late_composite_se5_test. The presenting composite has an unbounded SRV table, and the present is non-SDR. Result: `via_inferred=[pso=38 inputs=1] crossing=[cs pso=35 ...] learned=35 ... inferred_reason="Scene uses an unbounded or oversized descriptor table."`, with 6 deliveries.
+- ctest -R "draw_replay|j2_live|native|split_entry": 19/19 passed.
+- Not covered by a test: the aux-input rule (the stretch shader in the fixture has one SRV) and the blend-preserve lineage follow.
+
+**Package.** Documents\NA-se5-motion-9d4bc6c, dxgi 5C5E8D3A...DA77. NA-se5-dlss-update.cmd and NA-se5-dlss-results.cmd point at it. Not installed.
