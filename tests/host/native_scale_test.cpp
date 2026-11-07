@@ -59,7 +59,9 @@ void native_apply(void*){
     if(clamp_half&&scale<.5f){game->put(game->active,.5f);return;} // an engine that refuses below 50%
     game->put(game->active,scale);game->put(game->sw,uint32_t(float(game->get<uint32_t>(game->fw))*scale));game->put(game->sh,uint32_t(float(game->get<uint32_t>(game->fh))*scale));
 }
+bool save_each_tick=false;float saved_cache=-1; // the save inside the game's own tick reads the cache
 void native_tick(){
+    if(save_each_tick)saved_cache=game->get<float>(game->cache);
     if(!dirty)return;
     const auto scale=std::floor(game->get<float>(game->setting)*20.f+.5f)*.05f;
     game->put(game->setting,scale);ApplyForTest(game->bytes.data()+game->context);saved=game->get<float>(game->setting);dirty=false;
@@ -114,7 +116,12 @@ int main(int argc,char** argv){
     // after our apply. The next tick puts the user's value back into the cache it saves.
     Request(2);inhibited=true;TickForTest();const float deferred=f.get<float>(f.cache);CHECK(deferred<1.f&&deferred>.25f);inhibited=false;
     f.put(f.active,deferred);f.put(f.sw,uint32_t(3440.f*deferred));f.put(f.sh,uint32_t(1440.f*deferred));
-    TickForTest();CHECK(f.get<float>(f.cache)==1.f);CHECK(f.get<float>(f.active)==deferred);
+    // Sol 697b223: the save inside the game's own tick runs BEFORE our post-tick code, so
+    // the cache is also corrected before that tick: the save in the commit-detecting tick
+    // already sees the user's 1.0, and so does every later one.
+    save_each_tick=true;TickForTest();CHECK(saved_cache==1.f);CHECK(f.get<float>(f.cache)==1.f);CHECK(f.get<float>(f.active)==deferred);
+    saved_cache=-1;TickForTest();CHECK(saved_cache==1.f);
+    save_each_tick=false;
     Request(4);TickForTest();CHECK(GetStats().render_w==1146);CHECK(GetStats().render_h==480);
     Request(0);TickForTest();CHECK(GetStats().render_w==3440);CHECK(GetStats().render_h==1440);
     Observe(false,3440,1440,3440,1440,4,true);TickForTest();CHECK(!GetStats().controlled);CHECK(f.get<uint32_t>(f.upcache)==3);CHECK(f.get<float>(f.cache)==1.f);

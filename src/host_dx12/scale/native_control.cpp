@@ -71,9 +71,20 @@ void apply_hook(void* context){
     if(!inside){std::lock_guard<std::mutex> lock(g.mutex);++g.stats.game_applies;}
     apply_native(context,ours);
 }
+// Sol 697b223: the game's own tick (which can save) runs before our correction
+// below, so the user's value is also put back BEFORE it, whenever our committed
+// scale is sitting in the cache the save writes.
+void restore_user_cache(){
+    if(!g.controlled||!g.enabled.load(std::memory_order_acquire))return;
+    const auto& f=g.found;
+    const float wanted=static_cast<float>(FractionForMode(static_cast<int>(g.mode.load(std::memory_order_acquire))));
+    const float pending=read<float>(f.setting);
+    if(read<float>(f.active)==wanted&&read<float>(f.cache)==wanted&&pending!=wanted&&std::isfinite(pending)&&pending>=.25f&&pending<=2.f)put(f.cache,pending);
+}
 void tick_hook(){
     // Preserve the original tick/save/update ordering. Native menu changes are
     // still handled normally; their apply call observes the current override.
+    if(!inside&&g.seen.load(std::memory_order_acquire)&&g.owner.load(std::memory_order_acquire)==GetCurrentThreadId())restore_user_cache();
     g.tick();
     if(inside||!g.seen.load(std::memory_order_acquire))return;
     const auto thread=GetCurrentThreadId();
