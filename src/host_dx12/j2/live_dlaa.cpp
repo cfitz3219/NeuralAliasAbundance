@@ -829,6 +829,7 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
     std::vector<std::pair<uint64_t,size_t>> visited;
     NativeCrossing candidate;
     bool ambiguous=false, unresolved=false;
+    uint32_t partial_lookpast=0;
     uint32_t overlays=0;
     while (!pending.empty() && visited.size()<4096) {
         const Edge edge=pending.back();
@@ -857,10 +858,13 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
         // the DLSS image on those frames; counted as aux so a run can judge it.
         const auto pick=pick_scene_input(op.in,e.rw,e.rh,e.ow,e.oh);
         const size_t aux_inputs=pick.aux;
-        if (op.compute && op.direct && op.reflected && op.uavs==1 && op.out.size()==1 &&
-            !pick.ok && pick.found) add(" crossing_rejected=\"%s\"",pick.why);
-        if (op.compute && op.direct && op.reflected && op.uavs==1 && op.out.size()==1 &&
-            pick.ok && op.gx && op.gy && op.gz==1) {
+        // Render-size -> output-size step: a dispatch (one UAV), or a draw whose single
+        // output is an output-size UAV, or a render target it overwrites (no blend).
+        // f1d0594 run: SE5's canvas base is written by draws (pso 660/799, UAV).
+        const bool crossing_shape=op.direct && op.reflected && op.out.size()==1 &&
+            (op.compute ? (op.uavs==1 && op.gx && op.gy && op.gz==1) : (output->binding=='u' || (output->binding=='r' && !op.blend)));
+        if (crossing_shape && !pick.ok && pick.found) add(" crossing_rejected=\"%s\"",pick.why);
+        if (crossing_shape && pick.ok) {
             const auto& in=op.in[pick.at];
             {
                 char detail[380]{};
@@ -909,17 +913,25 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
         }
         // A composite can read the scene and a separate full-size HUD. Follow
         // both branches and require one unambiguous crossing from the scene.
-        // The pass writing the presented image overwrites it whole but reads no image of
-        // output size through any root table (0cfeff9 run: pso 785 reads only a 128x128
-        // texture), or it indexes the descriptor heap directly (SM 6.6): its real picture
-        // input is unseen. The frame is unresolved, so the screen-marker fallback runs.
-        if (edge.id==presented && edge.before==ops.size() && !op.transfer && op.pso && op.reflected && !op.preserves &&
+        // A no-blend draw onto an output-size image that reads no output-size image.
+        // f1d0594/de8f0b3 runs: SE5's pso 785 draws many full-viewport, no-blend quads onto
+        // the back buffer per frame (1x1, 128x128 ... inputs); only one of them reads the
+        // 3440x1440 canvas. Its geometry may not cover the image, so it is looked past to
+        // the earlier writer. A shader that indexes the descriptor heap directly (SM 6.6)
+        // can read anything: its input is unseen and the frame is unresolved.
+        if (!op.transfer && op.pso && op.reflected && !op.compute && !op.preserves && output->binding=='r' &&
             (op.heap_indexing || std::none_of(op.in.begin(),op.in.end(),[&](const TraceIo& v){return v.whole && v.w==e.ow && v.h==e.oh;}))) {
-            unresolved=true;
-            add(" presented_input_unseen=[list=%llu rec=%llu pso=%llu why=\"%s\"]",(unsigned long long)op.list,(unsigned long long)op.recording,
-                (unsigned long long)op.pso,op.heap_indexing?"descriptor-heap indexing":"no output-size input in its tables");
+            if (op.heap_indexing) {
+                unresolved=true;
+                add(" presented_input_unseen=[list=%llu rec=%llu pso=%llu why=\"descriptor-heap indexing\"]",(unsigned long long)op.list,
+                    (unsigned long long)op.recording,(unsigned long long)op.pso);
+                continue;
+            }
+            ++partial_lookpast;
+            pending.push_back({edge.id,index,edge.srgb,edge.read_vfmt,edge.reader,edge.written_vfmt,edge.reader_list,edge.reader_recording});
             continue;
-        }        // A full clear: a known overwrite with no inputs, so this branch ends here.
+        }
+        // A full clear: a known overwrite with no inputs, so this branch ends here.
         if (!op.transfer && !op.pso && !op.compute && op.in.empty()) continue;
         if (!op.transfer && (!op.pso || !op.reflected)) {
             // Its used inputs are not known (no complete reflection): name it.
@@ -933,6 +945,13 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
                 pending.push_back({in.id,index,edge.srgb || in.vfmt==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
                                    op.transfer?edge.read_vfmt:in.vfmt,op.transfer?edge.reader:op.pso,
                                    op.transfer?edge.written_vfmt:output->vfmt,op.list,op.recording});
+    }
+    if (partial_lookpast) add(" partial_lookpast=%u",partial_lookpast);
+    if (!candidate.pso && !ambiguous && partial_lookpast) {
+        // Only quads that read no full-size picture were found on the presented image:
+        // its real picture input is unseen, so the screen-marker fallback runs.
+        unresolved=true;
+        add(" presented_input_unseen=[why=\"the screen draws read no full-size picture\"]");
     }
     if (ambiguous || unresolved || !pending.empty()) {
         // An unresolved writer on any branch means the crossing may not reach the
@@ -955,9 +974,9 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
             std::vector<NativeCrossing> cands;
             for (size_t i=0;i<ops.size();++i) {
                 const auto& op=ops[i];
-                if (op.queue!=queue || !op.compute || !op.direct || !op.reflected || op.inferred || op.uavs!=1 || op.out.size()!=1 ||
-                    !op.gx || !op.gy || op.gz!=1) continue;
+                if (op.queue!=queue || !op.direct || !op.reflected || op.inferred || op.out.size()!=1) continue;
                 const auto& o=op.out[0];
+                if (op.compute ? (op.uavs!=1 || !op.gx || !op.gy || op.gz!=1) : !(o.binding=='u' || (o.binding=='r' && !op.blend))) continue;
                 if (!o.whole || o.w!=e.ow || o.h!=e.oh) continue;
                 const auto pk=pick_scene_input(op.in,e.rw,e.rh,e.ow,e.oh);
                 if (!pk.ok) continue;
@@ -979,6 +998,8 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
                 cands.push_back(c);
             }
             add(" provisional_candidates=%zu refuted=%zu",cands.size(),g_trace.refuted.size());
+            for (size_t k=0;k<cands.size()&&k<4;++k)
+                add(" cand=[%s pso=%llu in#%llu out#%llu]",cands[k].gx?"cs":"draw",(unsigned long long)cands[k].pso,(unsigned long long)cands[k].input,(unsigned long long)cands[k].output);
             if (cands.empty()) { g_trace.provisional={}; }
             else if (std::find(cands.begin(),cands.end(),g_trace.provisional)==cands.end()) { g_trace.provisional=cands[0]; ++g_trace.provisionals; }
             if (g_trace.provisional.pso)
@@ -4673,8 +4694,10 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
     }
     na::observe::ShaderScope stretch(ID3D12GraphicsCommandList* l, const na::observe::ShaderCall& call)
     {
-        if (call.kind!=na::observe::ShaderKind::Dispatch || call.indirect ||
-            l->GetType()!=D3D12_COMMAND_LIST_TYPE_DIRECT) return {};
+        // A learned dispatch (groups recorded) or a learned draw (gx==0, f1d0594 run: SE5's
+        // canvas base is a draw writing an output-size UAV).
+        const bool dispatch=call.kind==na::observe::ShaderKind::Dispatch;
+        if (call.indirect || l->GetType()!=D3D12_COMMAND_LIST_TYPE_DIRECT) return {};
         const uint64_t pso=g_trace.learned_pso.load(std::memory_order_acquire);
         if (!pso || na::observe::ListPipelineId(l)!=pso) return {};
         NativeCrossing learned;
@@ -4687,8 +4710,8 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
         uint64_t depth=0,scene=0;
         na::observe::GetLiveSelection(&depth,&scene);
         if (!depth || scene!=learned.scene || extent.rw!=learned.rw || extent.rh!=learned.rh ||
-            extent.ow!=learned.ow || extent.oh!=learned.oh || call.args[0]!=learned.gx ||
-            call.args[1]!=learned.gy || call.args[2]!=learned.gz) {
+            extent.ow!=learned.ow || extent.oh!=learned.oh || dispatch!=(learned.gx!=0) ||
+            (dispatch && (call.args[0]!=learned.gx || call.args[1]!=learned.gy || call.args[2]!=learned.gz))) {
             native_reject(g_nb.st_gated,"The learned upscale step ran with another scene, size or dispatch than learned.");
             return {};
         }
@@ -4696,7 +4719,7 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
         const char* why=nullptr;
         // Only read the bindings. Use the same reflection-bounded view as the
         // learner, including a statically used register in an unbounded table.
-        if (!na::observe::ListNativeOperation(l,true,op,&why,true) || !op.reflection_complete ||
+        if (!na::observe::ListNativeOperation(l,dispatch,op,&why,true) || !op.reflection_complete ||
             op.pipeline_id!=learned.pso) {
             native_reject(g_nb.snapshot,why?why:"The learned upscale step's bindings could not be read.");
             return {};
@@ -4847,14 +4870,15 @@ public:
     // The provisional crossing's dispatch (exact pipeline, groups, input and output):
     // after it runs, the screen probe marks the game's own image (no DLSS).
     na::observe::ShaderScope verify_step(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall& call){
-        if (call.kind!=na::observe::ShaderKind::Dispatch || call.indirect || l->GetType()!=D3D12_COMMAND_LIST_TYPE_DIRECT) return {};
+        const bool dispatch=call.kind==na::observe::ShaderKind::Dispatch;
+        if (call.indirect || l->GetType()!=D3D12_COMMAND_LIST_TYPE_DIRECT) return {};
         const uint64_t pso=g_trace.provisional_pso.load(std::memory_order_acquire);
         if (!pso || na::observe::ListPipelineId(l)!=pso) return {};
         NativeCrossing p;{std::lock_guard<std::mutex> lock(g_trace.m);p=g_trace.provisional;}
         const auto refuse=[&](const char* why){native_reject(g_nb.st_gated,why);return na::observe::ShaderScope{};};
-        if (p.pso!=pso || call.args[0]!=p.gx || call.args[1]!=p.gy || call.args[2]!=p.gz) return refuse("Screen check: the provisional step ran with other groups than traced.");
+        if (p.pso!=pso || dispatch!=(p.gx!=0) || (dispatch && (call.args[0]!=p.gx || call.args[1]!=p.gy || call.args[2]!=p.gz))) return refuse("Screen check: the provisional step ran with other groups than traced.");
         na::observe::NativeOperation op;const char* why=nullptr;
-        if (!na::observe::ListNativeOperation(l,true,op,&why,true) || !op.reflection_complete) return refuse(why?why:"Screen check: the provisional step's bindings could not be read.");
+        if (!na::observe::ListNativeOperation(l,dispatch,op,&why,true) || !op.reflection_complete) return refuse(why?why:"Screen check: the provisional step's bindings could not be read.");
         std::vector<TraceIo> srvs;const na::observe::OperationDescriptor* output=nullptr;
         for (const auto& d:op.descriptors) {
             if (!d.used || !d.resource) continue;

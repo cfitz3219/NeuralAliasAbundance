@@ -190,6 +190,10 @@ int main(int argc,char** argv)
     // (SE5 pso 785 shows only a 128x128 input). Emulated: the game's image through a
     // Texture2DArray view, which the trace does not count as a whole output-size input.
     const bool native_unseen=native_se5&&argc>1&&std::strstr(argv[1],"unseen")!=nullptr;
+    // f1d0594/de8f0b3 runs: one pipeline draws several full-viewport, no-blend quads onto the
+    // back buffer (only one reads the 3440x1440 canvas), and the canvas base is written by a
+    // DRAW into a UAV from the render-size image (SE5 pso 660/799). Plus the compute decoy.
+    const bool native_session=native_se5&&argc>1&&std::strstr(argv[1],"session")!=nullptr;
     const bool nvrhi=argc>1&&std::strcmp(argv[1],"--nvrhi")==0;
     if(nvrhi&&!na::gpu::GetStats().built)return test::kSkip;
     na::gpu::SetBackendForTests(nvrhi?na::gpu::TestBackend::Nvrhi:na::gpu::TestBackend::Native);
@@ -564,7 +568,33 @@ int main(int argc,char** argv)
         // executed every frame; it writes the presented image twice: first from
         // the decoy, then from the game's upscaled image (the write that counts).
         test::List final_list;bool final_recorded=false;
-        test::ComPtr<ID3D12PipelineState> unseen_composite;
+        test::ComPtr<ID3D12PipelineState> unseen_composite,session_upscale,session_composite;test::ComPtr<ID3D12Resource> dot;
+        if(native_session){
+            const auto base=heap->GetCPUDescriptorHandleForHeapStart().ptr;
+            dot=test::CreateTexture(dev,1,1,DXGI_FORMAT_R8G8B8A8_UNORM,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_FLAG_NONE);REQUIRE(dot);
+            D3D12_SHADER_RESOURCE_VIEW_DESC dv=sv;dv.Format=DXGI_FORMAT_R8G8B8A8_UNORM;dev->CreateShaderResourceView(dot.Get(),&dv,{base+14*increment});
+            const char up[]=R"(Texture2D<float4> image:register(t0);Texture2D<float4> aux:register(t1);RWTexture2D<float4> o:register(u0);
+                float4 vs(uint id:SV_VertexID):SV_Position{float2 p=float2((id<<1)&2,id&2);return float4(p*float2(2,-2)+float2(-1,1),0,1);}
+                void ps(float4 p:SV_Position){uint2 q=uint2(p.xy);if(q.x<96&&q.y<48)o[q]=image.Load(int3(q*uint2(64,32)/uint2(96,48),0))+min(aux.Load(int3(0,0,0)),0);})";
+            test::ComPtr<ID3DBlob> v,px,err;
+            REQUIRE(SUCCEEDED(D3DCompile(up,sizeof up,"session_up",nullptr,nullptr,"vs","vs_5_0",0,0,&v,&err)));
+            REQUIRE(SUCCEEDED(D3DCompile(up,sizeof up,"session_up",nullptr,nullptr,"ps","ps_5_0",0,0,&px,&err)));
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC gd{};gd.pRootSignature=se5_root.Get();gd.VS={v->GetBufferPointer(),v->GetBufferSize()};gd.PS={px->GetBufferPointer(),px->GetBufferSize()};
+            gd.SampleMask=UINT_MAX;gd.SampleDesc.Count=1;gd.RasterizerState.FillMode=D3D12_FILL_MODE_SOLID;gd.RasterizerState.CullMode=D3D12_CULL_MODE_NONE;gd.RasterizerState.DepthClipEnable=TRUE;
+            gd.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;gd.NumRenderTargets=0;
+            REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&gd,IID_PPV_ARGS(&session_upscale))));
+            const char cp[]=R"(Texture2D<float4> image:register(t0);
+                float4 vs(uint id:SV_VertexID):SV_Position{uint k=id%3;float2 p=float2((k<<1)&2,k&2);if(id>=3)p*=0.04;return float4(p*float2(2,-2)+float2(-1,1),0,1);}
+                float4 ps(float4 p:SV_Position):SV_Target{float4 c=image.Load(int3(uint2(p.xy),0));return float4(pow(c.rgb,2.2),c.a);})";
+            v.Reset();px.Reset();
+            REQUIRE(SUCCEEDED(D3DCompile(cp,sizeof cp,"session_cp",nullptr,nullptr,"vs","vs_5_0",0,0,&v,&err)));
+            REQUIRE(SUCCEEDED(D3DCompile(cp,sizeof cp,"session_cp",nullptr,nullptr,"ps","ps_5_0",0,0,&px,&err)));
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC cd{};cd.pRootSignature=composite_root.Get();cd.VS={v->GetBufferPointer(),v->GetBufferSize()};cd.PS={px->GetBufferPointer(),px->GetBufferSize()};
+            cd.SampleMask=UINT_MAX;cd.SampleDesc.Count=1;cd.RasterizerState.FillMode=D3D12_FILL_MODE_SOLID;cd.RasterizerState.CullMode=D3D12_CULL_MODE_NONE;cd.RasterizerState.DepthClipEnable=TRUE;
+            cd.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;cd.NumRenderTargets=1;cd.RTVFormats[0]=DXGI_FORMAT_R16G16B16A16_FLOAT;
+            cd.BlendState.RenderTarget[0].RenderTargetWriteMask=D3D12_COLOR_WRITE_ENABLE_ALL;
+            REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&cd,IID_PPV_ARGS(&session_composite))));
+        }
         if(native_unseen){
             const auto base=heap->GetCPUDescriptorHandleForHeapStart().ptr;
             D3D12_SHADER_RESOURCE_VIEW_DESC av{};av.Format=view_format;av.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
@@ -645,13 +675,22 @@ int main(int argc,char** argv)
                     std::swap(decoy_write.Transition.StateBefore,decoy_write.Transition.StateAfter);
                     target_list->ResourceBarrier(1,&decoy_write);
                 }
-                if(native_se5){
+                if(native_session){
+                    // The canvas base: a draw writing the output-size UAV from the render-size image.
+                    target_list->SetGraphicsRootSignature(se5_root.Get());
+                    target_list->SetPipelineState(session_upscale.Get());
+                    target_list->SetGraphicsRootDescriptorTable(0,{base+(iteration%2?10u:7u)*increment});
+                    target_list->OMSetRenderTargets(0,nullptr,FALSE,nullptr);
+                    const D3D12_VIEWPORT vp{0,0,float(OW),float(OH),0,1};const D3D12_RECT sc{0,0,LONG(OW),LONG(OH)};
+                    target_list->RSSetViewports(1,&vp);target_list->RSSetScissorRects(1,&sc);target_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    target_list->DrawInstanced(3,1,0,0);
+                }else if(native_se5){
                     // The real upscale step, with the auxiliary input on even frames.
                     target_list->SetComputeRootSignature(se5_root.Get());
                     target_list->SetPipelineState(se5_upscale.Get());
                     target_list->SetComputeRootDescriptorTable(0,{base+(iteration%2?10u:7u)*increment});
                 }else target_list->SetComputeRootDescriptorTable(0,{base});
-                target_list->Dispatch(12,6,1);
+                if(!native_session)target_list->Dispatch(12,6,1);
             }
             // Later native HUD draw: green corner must survive reconstruction.
             D3D12_RESOURCE_BARRIER order{};order.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;order.UAV.pResource=native.Get();target_list->ResourceBarrier(1,&order);
@@ -771,6 +810,13 @@ int main(int argc,char** argv)
                     fl->RSSetViewports(1,&vp);fl->RSSetScissorRects(1,&sc);fl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                     const auto gbase=heap->GetGPUDescriptorHandleForHeapStart().ptr;
                     if(native_unseen){fl->SetPipelineState(unseen_composite.Get());fl->SetGraphicsRootDescriptorTable(0,{gbase+14*increment});fl->DrawInstanced(3,1,0,0);}
+                    else if(native_session){
+                        // One pipeline: the full-screen composite of the canvas, then two small quads
+                        // (full viewport, no blend) reading a 1x1 texture.
+                        fl->SetPipelineState(session_composite.Get());
+                        fl->SetGraphicsRootDescriptorTable(0,{gbase+6*increment});fl->DrawInstanced(3,1,0,0);
+                        fl->SetGraphicsRootDescriptorTable(0,{gbase+14*increment});fl->DrawInstanced(3,1,3,0);fl->DrawInstanced(3,1,3,0);
+                    }
                     else{
                     fl->SetGraphicsRootDescriptorTable(0,{gbase+13*increment});fl->DrawInstanced(3,1,0,0); // first write: the decoy
                     fl->SetGraphicsRootDescriptorTable(0,{gbase+6*increment});fl->DrawInstanced(3,1,0,0);  // last write: the game's image
@@ -854,7 +900,11 @@ static uint64_t seen=0;char tr[2048];uint64_t n=0;na::j2::NativeTraceResult(tr,s
             if(native_se5)std::printf("se5 delivery: delivered %llu first %llu best_streak %llu order_refused %llu later_written %llu probe{%s} refusals{%s}\n",
                 (unsigned long long)nbs.delivered,(unsigned long long)nbs.first_delivery_frame,(unsigned long long)nbs.best_streak,
                 (unsigned long long)nbs.order_refused,(unsigned long long)nbs.later_written,nbs.probe,nbs.refusals);
-            if(native_unseen){
+            if(native_session){
+                std::printf("se5 session: deliveries %u trace{%.600s}\n",late_deliveries,trace);
+                CHECK(std::strstr(trace,"partial_lookpast=")!=nullptr && std::strstr(trace,"crossing=[draw")!=nullptr && std::strstr(trace,"learned=0")==nullptr);
+                CHECK(late_deliveries>=2);
+            }else if(native_unseen){
                 std::printf("se5 unseen: deliveries %u probe{%s} trace{%.400s}\n",late_deliveries,nbs.probe,trace);
                 CHECK(std::strstr(nbs.probe,"verified=1")!=nullptr && std::strstr(nbs.probe,"refuted=1")!=nullptr);
                 CHECK(late_deliveries>=2);
@@ -890,7 +940,7 @@ static uint64_t seen=0;char tr[2048];uint64_t n=0;na::j2::NativeTraceResult(tr,s
                     // Learned through the once-recorded presenting list (cached, last write),
                     // with the typed UNORM -> FP16 handoff named.
                     // (stale: the last trace is the invalidating one, without a crossing)
-                    if(!native_stale&&!native_bindless&&!native_unseen)CHECK(std::strstr(trace,"handoff=[")!=nullptr && std::strstr(trace,"transfer=shader_defined")!=nullptr);
+                    if(!native_stale&&!native_bindless&&!native_unseen&&!native_session)CHECK(std::strstr(trace,"handoff=[")!=nullptr && std::strstr(trace,"transfer=shader_defined")!=nullptr);
                     if(!native_bindless&&!native_unseen)CHECK(std::strstr(trace,"cached=0 ")==nullptr);
                     CHECK(g_pattern_writes>=int(late_deliveries));
                     // Deliveries on frames with the auxiliary input were counted.
