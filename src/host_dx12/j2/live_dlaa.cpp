@@ -469,25 +469,39 @@ void trace_analyze(uint64_t presented){
     if(at<0){how="last_full_output";for(int i=int(f.size())-1;i>=0&&at<0;--i)for(const auto& o:f[size_t(i)].out)if(o.w==e.ow&&o.h==e.oh){at=i;break;}}
     if(at<0){add(" chain{none: no traced op writes a full-output target}");return;}
     add(" from=%s chain{",how);
-    for(int step=0;step<12&&at>=0;++step){
+    uint64_t last_pso=0;uint32_t repeats=0;
+    for(int step=0;step<1500&&at>=0;++step){
         const auto& t=f[size_t(at)];
-        if(used+8<n){used+=size_t(trace_describe(r+used,n-used,t));}
+        // Runs of the same pipeline (UI elements) are summarised, not listed.
+        if(step&&t.pso==last_pso){++repeats;}
+        else{
+            if(repeats){add(" (x%u more)",repeats);repeats=0;}
+            if(used+8<n){used+=size_t(trace_describe(r+used,n-used,t));}
+        }
+        last_pso=t.pso;
         bool full_out=false,small_in=false;
         for(const auto& o:t.out)full_out|=o.w==e.ow&&o.h==e.oh;
         for(const auto& i:t.in)small_in|=i.w==e.rw&&i.h==e.rh;
         if(full_out&&small_in){add(" <CROSSING op=%d>",at);break;}
         // Next: the most relevant input written earlier in the frame (same size as this
         // op's output first, then render size, then any).
+        // 98d13f1 run: the walk started at a blended HUD draw and stopped (its inputs are
+        // icons). A blended or partial draw keeps what was already in its target, so the
+        // previous writer of its own output is followed first; that also walks past UI.
         int next=-1;
+        const auto writer_of=[&](uint64_t id){for(int j=at-1;j>=0;--j)for(const auto& o:f[size_t(j)].out)if(o.id==id)return j;return -1;};
+        const bool keeps_target=!t.compute&&(t.blend||t.vw!=e.ow||t.vh!=e.oh);
+        if(keeps_target)for(const auto& o:t.out){next=writer_of(o.id);if(next>=0)break;}
         for(int pass=0;pass<3&&next<0;++pass)for(const auto& i:t.in){
             const uint32_t ow=t.out.empty()?0:t.out[0].w,oh=t.out.empty()?0:t.out[0].h;
             const bool pick=pass==0?(i.w==ow&&i.h==oh):pass==1?(i.w==e.rw&&i.h==e.rh):true;
             if(!pick)continue;
-            for(int j=at-1;j>=0&&next<0;--j)for(const auto& o:f[size_t(j)].out)if(o.id==i.id){next=j;break;}
+            next=writer_of(i.id);
             if(next>=0)break;
         }
+        if(next<0)for(const auto& o:t.out){next=writer_of(o.id);if(next>=0)break;} // no traced input: the target's earlier writer
         if(next<0){add(" <inputs not written by a traced op>");break;}
-        add(" <-");at=next;
+        if(f[size_t(next)].pso!=t.pso)add(" <-");at=next;
     }
     add("}");
 }
