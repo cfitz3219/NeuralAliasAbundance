@@ -93,8 +93,10 @@ int main(int argc,char** argv){
     Observe(true,3440,1440,3440,1440,1,true);
     std::thread engine([]{TickForTest();});engine.join();
     auto st=GetStats();CHECK(st.controlled);CHECK(!st.confirmed);CHECK(st.thread==native_thread);CHECK(st.render_w==2293);CHECK(st.render_h==960);
-    CHECK(f.get<float>(f.setting)==1.f);CHECK(f.get<uint32_t>(f.up)==3);CHECK(f.get<uint32_t>(f.upcache)==0); // pending/user settings intact
-    CHECK(std::abs(f.get<float>(f.cache)-2.f/3.f)<1e-6f);
+    CHECK(f.get<float>(f.setting)==1.f);CHECK(f.get<uint32_t>(f.up)==3);CHECK(f.get<uint32_t>(f.upcache)==3); // pending/user settings intact
+    // 2026-11-07: SE5 saved our 0.333 to its ini at exit. After a committed
+    // apply the native cache (what the game saves) holds the USER's values again.
+    CHECK(f.get<float>(f.cache)==1.f);CHECK(std::abs(f.get<float>(f.active)-2.f/3.f)<1e-6f);
     Observe(true,2293,960,2293,960,2,true);CHECK(!GetStats().confirmed); // reduced DLAA is not full-output DLSS
     Observe(true,2293,959,3440,1440,2,true);CHECK(!GetStats().confirmed); // both dimensions
     Observe(true,2293,960,3440,1440,1,true);CHECK(!GetStats().confirmed); // old evaluation

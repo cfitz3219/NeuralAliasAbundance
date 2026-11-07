@@ -53,6 +53,12 @@ void apply_native(void* context,bool override_scale){
     const float active=read<float>(f.active),cached=read<float>(f.cache);
     if(cached==fraction&&active!=fraction&&std::isfinite(active)&&active>=.25f&&active<=2.f)put(f.cache,active);
     inside=true;g.apply(context);inside=false;
+    // 2026-11-07 run: SE5 saved RenderScale=0.333 to its ini at exit. The
+    // apply copies our scale into the native CACHE, which the save writes.
+    // Once the renderer has committed it, put the user's value back in the
+    // cache too: the scene keeps our committed size, and the game's own state
+    // (menu, saved file, "changed?" check) only ever holds the user's value.
+    if(read<float>(f.active)==fraction){put(f.cache,pending);if(f.upscale_cache)put(f.upscale_cache,upscale);}
     std::lock_guard<std::mutex> lock(g.mutex);
     ++g.stats.applies;g.stats.controlled=true;g.stats.confirmed=false;g.stats.fraction=fraction;
 }
