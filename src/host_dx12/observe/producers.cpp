@@ -7954,6 +7954,7 @@ bool ListNativeOperation(ID3D12GraphicsCommandList* list, bool compute, NativeOp
         const auto pipeline = g_objs.find(canon(ls->pso));
         if (pipeline != g_objs.end()) next.pipeline_id = pipeline->second.id;
         next.reflection_complete=pipeline!=g_objs.end()&&pipeline->second.reflection_complete;
+        next.heap_indexing=pipeline!=g_objs.end()&&(pipeline->second.shader_rejection&ShaderDirectHeap)!=0;
         const auto& args = ls->args[compute];
         for (uint32_t param = 0; param < rs->second.root_params.size(); ++param) {
             const auto& p = rs->second.root_params[param];

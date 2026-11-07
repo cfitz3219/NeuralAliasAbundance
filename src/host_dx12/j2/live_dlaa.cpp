@@ -439,6 +439,7 @@ struct TraceOp {
     // only the bound render target and the full-size images the list samples are known.
     bool inferred = false;
     const char* why = nullptr; // inferred: the snapshot's failure (a static string)
+    bool heap_indexing = false; // reads ResourceDescriptorHeap[] directly (inputs no table shows)
     uint64_t list = 0, recording = 0; // the recording this op belongs to
     uint64_t pso = 0;
     uint32_t vw = 0, vh = 0, gx = 0, gy = 0, gz = 0, uavs = 0, descriptor_slots = 0;
@@ -612,7 +613,7 @@ void trace_op(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall& call,b
         keep(std::move(t));
         return;
     }
-    TraceOp t;t.compute=compute;t.pso=op.pipeline_id;t.reflected=op.reflection_complete;
+    TraceOp t;t.compute=compute;t.pso=op.pipeline_id;t.reflected=op.reflection_complete;t.heap_indexing=op.heap_indexing;
     t.direct=l->GetType()==D3D12_COMMAND_LIST_TYPE_DIRECT;
     t.descriptor_slots=static_cast<uint32_t>(op.descriptors.size());
     if(compute){t.gx=uint32_t(call.args[0]);t.gy=uint32_t(call.args[1]);t.gz=uint32_t(call.args[2]);}
@@ -908,7 +909,17 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
         }
         // A composite can read the scene and a separate full-size HUD. Follow
         // both branches and require one unambiguous crossing from the scene.
-        // A full clear: a known overwrite with no inputs, so this branch ends here.
+        // The pass writing the presented image overwrites it whole but reads no image of
+        // output size through any root table (0cfeff9 run: pso 785 reads only a 128x128
+        // texture), or it indexes the descriptor heap directly (SM 6.6): its real picture
+        // input is unseen. The frame is unresolved, so the screen-marker fallback runs.
+        if (edge.id==presented && edge.before==ops.size() && !op.transfer && op.pso && op.reflected && !op.preserves &&
+            (op.heap_indexing || std::none_of(op.in.begin(),op.in.end(),[&](const TraceIo& v){return v.whole && v.w==e.ow && v.h==e.oh;}))) {
+            unresolved=true;
+            add(" presented_input_unseen=[list=%llu rec=%llu pso=%llu why=\"%s\"]",(unsigned long long)op.list,(unsigned long long)op.recording,
+                (unsigned long long)op.pso,op.heap_indexing?"descriptor-heap indexing":"no output-size input in its tables");
+            continue;
+        }        // A full clear: a known overwrite with no inputs, so this branch ends here.
         if (!op.transfer && !op.pso && !op.compute && op.in.empty()) continue;
         if (!op.transfer && (!op.pso || !op.reflected)) {
             // Its used inputs are not known (no complete reflection): name it.

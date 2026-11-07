@@ -40,6 +40,9 @@ struct NativeOperation {
     Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline;
     bool compute = false;
     bool reflection_complete = false;
+    // A stage indexes ResourceDescriptorHeap/SamplerDescriptorHeap directly (SM 6.6):
+    // it can read images that no root table shows.
+    bool heap_indexing = false;
     struct Table { uint32_t param, first, count; };
     std::vector<Table> tables;
     std::vector<OperationDescriptor> descriptors;

@@ -186,6 +186,10 @@ int main(int argc,char** argv)
     // Sol 7fec1c4: the presented image is a real DXGI swap-chain buffer, created by DXGI
     // (never through our creation hooks) and first met through CreateRenderTargetView.
     const bool native_dxgi=native_se5&&argc>1&&std::strstr(argv[1],"dxgi")!=nullptr;
+    // 0cfeff9 run: the presenting draw reads its picture where no root table shows it
+    // (SE5 pso 785 shows only a 128x128 input). Emulated: the game's image through a
+    // Texture2DArray view, which the trace does not count as a whole output-size input.
+    const bool native_unseen=native_se5&&argc>1&&std::strstr(argv[1],"unseen")!=nullptr;
     const bool nvrhi=argc>1&&std::strcmp(argv[1],"--nvrhi")==0;
     if(nvrhi&&!na::gpu::GetStats().built)return test::kSkip;
     na::gpu::SetBackendForTests(nvrhi?na::gpu::TestBackend::Nvrhi:na::gpu::TestBackend::Native);
@@ -560,12 +564,30 @@ int main(int argc,char** argv)
         // executed every frame; it writes the presented image twice: first from
         // the decoy, then from the game's upscaled image (the write that counts).
         test::List final_list;bool final_recorded=false;
+        test::ComPtr<ID3D12PipelineState> unseen_composite;
+        if(native_unseen){
+            const auto base=heap->GetCPUDescriptorHandleForHeapStart().ptr;
+            D3D12_SHADER_RESOURCE_VIEW_DESC av{};av.Format=view_format;av.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            av.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;av.Texture2DArray.MipLevels=1;av.Texture2DArray.ArraySize=1;
+            dev->CreateShaderResourceView(native.Get(),&av,{base+14*increment});
+            const char us[]=R"(Texture2DArray<float4> image:register(t0);
+                float4 vs(uint id:SV_VertexID):SV_Position{float2 p=float2((id<<1)&2,id&2);return float4(p*float2(2,-2)+float2(-1,1),0,1);}
+                float4 ps(float4 p:SV_Position):SV_Target{float4 c=image.Load(int4(uint2(p.xy),0,0));return float4(pow(c.rgb,2.2),c.a);})";
+            test::ComPtr<ID3DBlob> v,px,err;
+            REQUIRE(SUCCEEDED(D3DCompile(us,sizeof us,"unseen",nullptr,nullptr,"vs","vs_5_0",0,0,&v,&err)));
+            REQUIRE(SUCCEEDED(D3DCompile(us,sizeof us,"unseen",nullptr,nullptr,"ps","ps_5_0",0,0,&px,&err)));
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC gd{};gd.pRootSignature=composite_root.Get();gd.VS={v->GetBufferPointer(),v->GetBufferSize()};gd.PS={px->GetBufferPointer(),px->GetBufferSize()};
+            gd.SampleMask=UINT_MAX;gd.SampleDesc.Count=1;gd.RasterizerState.FillMode=D3D12_FILL_MODE_SOLID;gd.RasterizerState.CullMode=D3D12_CULL_MODE_NONE;gd.RasterizerState.DepthClipEnable=TRUE;
+            gd.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;gd.NumRenderTargets=1;gd.RTVFormats[0]=DXGI_FORMAT_R16G16B16A16_FLOAT;
+            gd.BlendState.RenderTarget[0].RenderTargetWriteMask=D3D12_COLOR_WRITE_ENABLE_ALL;
+            REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&gd,IID_PPV_ARGS(&unseen_composite))));
+        }
         if(native_se5){REQUIRE(final_list.Create(dev));REQUIRE(SUCCEEDED(final_list.list->Close()));}
         test::List post;REQUIRE(post.Create(dev));REQUIRE(SUCCEEDED(post.list->Close()));
         na::j2::SetNativeRenderExtent(W,H,OW,OH);na::j2::SetDebugView(native_se5?0:3); // 3: known black depth output, alpha1; SE5: the normal output
         const int before_native=fake::evals;
         const unsigned iterations=native_se5?100u:native_late?68u:3u;
-        if(native_se5&&!native_bindless)na::j2::RequestDeliveryProbe();
+        if(native_se5&&!native_bindless&&!native_unseen)na::j2::RequestDeliveryProbe();
         unsigned late_deliveries=0;
         for(unsigned iteration=0;iteration<iterations;++iteration){
             d.WaitIdle();na::j2::OnPresent(d.queue.Get());
@@ -716,6 +738,7 @@ int main(int argc,char** argv)
                     final_list.Reset();
                     auto* fl=final_list.list.Get();
                     if(native_bindless){
+
                         D3D12_RESOURCE_BARRIER bb[2]{test::Transition(native.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
                             test::Transition(presented.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS)};
                         fl->ResourceBarrier(2,bb);
@@ -747,8 +770,11 @@ int main(int argc,char** argv)
                     const D3D12_VIEWPORT vp{0,0,float(OW),float(OH),0,1};const D3D12_RECT sc{0,0,LONG(OW),LONG(OH)};
                     fl->RSSetViewports(1,&vp);fl->RSSetScissorRects(1,&sc);fl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                     const auto gbase=heap->GetGPUDescriptorHandleForHeapStart().ptr;
+                    if(native_unseen){fl->SetPipelineState(unseen_composite.Get());fl->SetGraphicsRootDescriptorTable(0,{gbase+14*increment});fl->DrawInstanced(3,1,0,0);}
+                    else{
                     fl->SetGraphicsRootDescriptorTable(0,{gbase+13*increment});fl->DrawInstanced(3,1,0,0); // first write: the decoy
                     fl->SetGraphicsRootDescriptorTable(0,{gbase+6*increment});fl->DrawInstanced(3,1,0,0);  // last write: the game's image
+                    }
                     for(auto& x:b)std::swap(x.Transition.StateBefore,x.Transition.StateAfter);
                     fl->ResourceBarrier(3,b);
                     REQUIRE(SUCCEEDED(fl->Close()));final_recorded=true;
@@ -761,7 +787,8 @@ int main(int argc,char** argv)
             if(native_se5){
                 na::j2::NativeTracePresent(d.queue.Get(),presented.Get(),false);
                 na::j2::NativeProbePresent(d.queue.Get(),presented.Get(),nullptr);
-                if(native_bindless){static uint64_t seen=0;char tr[2048];uint64_t n=0;na::j2::NativeTraceResult(tr,sizeof tr,&n);if(n!=seen){seen=n;const char* pv=std::strstr(tr,"provisional");std::printf("bindless iteration %u trace %llu: %.160s | probe %.200s\n",iteration,(unsigned long long)n,pv?pv:"(none)",na::j2::GetNativeBridgeStats().probe);}}
+                if(native_bindless){
+static uint64_t seen=0;char tr[2048];uint64_t n=0;na::j2::NativeTraceResult(tr,sizeof tr,&n);if(n!=seen){seen=n;const char* pv=std::strstr(tr,"provisional");std::printf("bindless iteration %u trace %llu: %.160s | probe %.200s\n",iteration,(unsigned long long)n,pv?pv:"(none)",na::j2::GetNativeBridgeStats().probe);}}
                 d.WaitIdle();
                 if(native_stale&&stale_from){
                     // Within 60 presents a re-verifying trace must have dropped the route.
@@ -827,7 +854,11 @@ int main(int argc,char** argv)
             if(native_se5)std::printf("se5 delivery: delivered %llu first %llu best_streak %llu order_refused %llu later_written %llu probe{%s} refusals{%s}\n",
                 (unsigned long long)nbs.delivered,(unsigned long long)nbs.first_delivery_frame,(unsigned long long)nbs.best_streak,
                 (unsigned long long)nbs.order_refused,(unsigned long long)nbs.later_written,nbs.probe,nbs.refusals);
-            if(native_bindless){
+            if(native_unseen){
+                std::printf("se5 unseen: deliveries %u probe{%s} trace{%.400s}\n",late_deliveries,nbs.probe,trace);
+                CHECK(std::strstr(nbs.probe,"verified=1")!=nullptr && std::strstr(nbs.probe,"refuted=1")!=nullptr);
+                CHECK(late_deliveries>=2);
+            }else if(native_bindless){
                 // Unreadable presenting dispatch: the decoy crossing was refuted by the
                 // screen probe, the game's upscale step confirmed, then delivered.
                 std::printf("se5 bindless: deliveries %u probe{%s} trace{%s}\n",late_deliveries,nbs.probe,trace);
@@ -859,8 +890,8 @@ int main(int argc,char** argv)
                     // Learned through the once-recorded presenting list (cached, last write),
                     // with the typed UNORM -> FP16 handoff named.
                     // (stale: the last trace is the invalidating one, without a crossing)
-                    if(!native_stale&&!native_bindless)CHECK(std::strstr(trace,"handoff=[")!=nullptr && std::strstr(trace,"transfer=shader_defined")!=nullptr);
-                    if(!native_bindless)CHECK(std::strstr(trace,"cached=0 ")==nullptr);
+                    if(!native_stale&&!native_bindless&&!native_unseen)CHECK(std::strstr(trace,"handoff=[")!=nullptr && std::strstr(trace,"transfer=shader_defined")!=nullptr);
+                    if(!native_bindless&&!native_unseen)CHECK(std::strstr(trace,"cached=0 ")==nullptr);
                     CHECK(g_pattern_writes>=int(late_deliveries));
                     // Deliveries on frames with the auxiliary input were counted.
                     const auto nb=na::j2::GetNativeBridgeStats();
