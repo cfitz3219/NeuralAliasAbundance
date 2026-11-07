@@ -285,6 +285,41 @@ int main(int argc, char** argv)
     CHECK(na::overlay::GetStats().frames_rendered==before_backlog+9);
     REQUIRE(d.device->GetDeviceRemovedReason()==S_OK);
 
+    // Real menu pixels must fill the same relative client area even when the
+    // backbuffer is larger than the HWND. Test readback waits are test-only.
+    {
+        RECT client{};REQUIRE(GetClientRect(hwnd,&client));
+        const UINT w=UINT(client.right)*2,h=UINT(client.bottom)*2;
+        auto big=test::CreateTexture(d.device.Get(),w,h,DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);REQUIRE(big);
+        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,1};
+        test::ComPtr<ID3D12DescriptorHeap> rh;REQUIRE(SUCCEEDED(d.device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&rh))));
+        const auto rtv=rh->GetCPUDescriptorHandleForHeapStart();d.device->CreateRenderTargetView(big.Get(),nullptr,rtv);
+        test::List copy;REQUIRE(copy.Create(d.device.Get()));
+        auto barrier=test::Transition(big.Get(),D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_STATE_RENDER_TARGET);
+        copy.list->ResourceBarrier(1,&barrier);const float black[4]{};copy.list->ClearRenderTargetView(rtv,black,0,nullptr);
+        std::swap(barrier.Transition.StateBefore,barrier.Transition.StateAfter);copy.list->ResourceBarrier(1,&barrier);
+        REQUIRE(SUCCEEDED(copy.list->Close()));ID3D12CommandList* ls[]{copy.list.Get()};d.queue->ExecuteCommandLists(1,ls);d.WaitIdle();
+        const auto scaled_before=na::overlay::GetStats().frames_rendered;
+        na::overlay::DrawMenuForTests(d.queue.Get(),big.Get());d.WaitIdle();
+        CHECK(na::overlay::GetStats().frames_rendered==scaled_before+1);
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};UINT64 bytes=0;const auto td=big->GetDesc();
+        d.device->GetCopyableFootprints(&td,0,1,0,&fp,nullptr,nullptr,&bytes);
+        auto rb=test::CreateBuffer(d.device.Get(),bytes,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);REQUIRE(rb);
+        copy.Reset();barrier=test::Transition(big.Get(),D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_STATE_COPY_SOURCE);copy.list->ResourceBarrier(1,&barrier);
+        D3D12_TEXTURE_COPY_LOCATION src{},dst{};src.pResource=big.Get();src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.pResource=rb.Get();dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;dst.PlacedFootprint=fp;
+        copy.list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);REQUIRE(SUCCEEDED(copy.list->Close()));d.queue->ExecuteCommandLists(1,ls);d.WaitIdle();
+        uint8_t* pixels=nullptr;REQUIRE(SUCCEEDED(rb->Map(0,nullptr,reinterpret_cast<void**>(&pixels))));
+        const auto* p=pixels+fp.Offset+(h/2)*fp.Footprint.RowPitch+(w*2/3)*4;
+        UINT last_x=0,last_y=0;uint64_t visible_pixels=0;
+        for(UINT y=0;y<h;++y)for(UINT x=0;x<w;++x){const auto* q=pixels+fp.Offset+y*fp.Footprint.RowPitch+x*4;
+            if(q[0]>8||q[1]>8||q[2]>8){++visible_pixels;last_x=(std::max)(last_x,x);last_y=(std::max)(last_y,y);}}
+        std::printf("scaled overlay %ux%u visible=%llu bounds=%u,%u sample=%u,%u,%u\n",w,h,(unsigned long long)visible_pixels,last_x,last_y,p[0],p[1],p[2]);
+        CHECK(p[0]>8 || p[1]>8 || p[2]>8); // old unscaled viewport leaves this pixel black
+        rb->Unmap(0,nullptr);
+    }
+
     // A later independent queue must not retire an older blocked draw.
     {
         test::ComPtr<ID3D12CommandQueue> fast;

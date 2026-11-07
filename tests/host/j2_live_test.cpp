@@ -103,6 +103,7 @@ float Half(uint16_t h)
 // RGBA16F or RGBA8 texel (x, y) of `tex` (in COMMON); the GPU is idle afterwards.
 std::array<float, 4> ReadTexel(test::Device& d, ID3D12Resource* tex, uint32_t x, uint32_t y)
 {
+    const na::observe::HostWorkScope diagnostic; // private test copy restores COMMON; not game state loss
     ID3D12Device* dev = d.device.Get();
     const D3D12_RESOURCE_DESC td = tex->GetDesc();
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
@@ -200,6 +201,8 @@ int main(int argc,char** argv)
     // Close, before ExecuteCommandLists. The trace and the delivery must resolve the table
     // at submission (late=1/N in the trace line), and DLSS still reaches the screen.
     const bool native_latebind=native_se5&&argc>1&&std::strstr(argv[1],"latebind")!=nullptr;
+    const bool native_rotate=native_latebind&&std::strstr(argv[1],"rotate")!=nullptr;
+    const bool native_inherited=native_latebind&&std::strstr(argv[1],"inherited")!=nullptr;
     const bool nvrhi=argc>1&&std::strcmp(argv[1],"--nvrhi")==0;
     if(nvrhi&&!na::gpu::GetStats().built)return test::kSkip;
     na::gpu::SetBackendForTests(nvrhi?na::gpu::TestBackend::Nvrhi:na::gpu::TestBackend::Native);
@@ -645,20 +648,49 @@ int main(int argc,char** argv)
         const unsigned iterations=native_se5?100u:native_late?68u:3u;
         if(native_se5&&!native_bindless&&!native_unseen)na::j2::RequestDeliveryProbe();
         unsigned late_deliveries=0;
+        const auto inherited_depth_state=[&](bool enter){
+            test::List state_list;CHECK(state_list.Create(dev));
+            CHECK(SUCCEEDED(state_list.list->Close()));state_list.Reset();
+            auto b=test::Transition(depth.Get(),enter?D3D12_RESOURCE_STATE_COMMON:D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                enter?D3D12_RESOURCE_STATE_DEPTH_WRITE:D3D12_RESOURCE_STATE_COMMON);
+            state_list.list->ResourceBarrier(1,&b);CHECK(SUCCEEDED(state_list.list->Close()));
+            ID3D12CommandList* ls[]{state_list.list.Get()};d.queue->ExecuteCommandLists(1,ls);d.WaitIdle();
+        };
+        if(native_inherited)inherited_depth_state(true);
+        const auto native_execute=[&](UINT count,ID3D12CommandList* const* ls){
+            // The production overlay opens the observation scope BEFORE J2;
+            // carried queue state is not available outside that scope.
+            auto token=native_inherited?na::observe::ExecuteBegin(d.queue.Get(),count,ls):na::observe::ExecuteToken{};
+            na::j2::Execute(d.queue.Get(),count,ls,&Forward);
+            if(native_inherited)na::observe::ExecuteEnd(token,d.queue.Get(),count,ls);
+        };
         for(unsigned iteration=0;iteration<iterations;++iteration){
             d.WaitIdle();na::j2::OnPresent(d.queue.Get());
+            if(native_rotate && iteration==80){
+                CHECK(late_deliveries>0);
+                // A post-process input is replaced AFTER the route is learned,
+                // between periodic traces. Same shader, destination and extent;
+                // the late descriptor now names the current image, not its old id.
+                late=test::CreateTexture(dev,W,H,format,D3D12_RESOURCE_STATE_COMMON,flags);REQUIRE(late);
+                const auto descriptor_base=heap->GetCPUDescriptorHandleForHeapStart().ptr;
+                dev->CreateUnorderedAccessView(late.Get(),nullptr,&uv,{descriptor_base+3*increment});
+                for(unsigned at:{0u,4u,8u,11u})dev->CreateShaderResourceView(late.Get(),&sv,{descriptor_base+at*increment});
+                const auto sb=stage_heap->GetCPUDescriptorHandleForHeapStart().ptr;
+                for(unsigned at:{8u,11u})dev->CreateShaderResourceView(late.Get(),&sv,{sb+at*increment});
+            }
             g_pattern[0]=.2f+.1f*float(iteration%4);g_pattern[1]=.6f;g_pattern[2]=.4f;g_pattern[3]=1.f;
             const M vp_native=Camera(.1+iteration*.01);M inv_native{};Inverse(vp_native,inv_native);
             Store(cpu+512+80,vp_native);Store(cpu+512+144,inv_native);
             scene.Reset();
             D3D12_RESOURCE_BARRIER begin_native[2]{test::Transition(color.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_RENDER_TARGET),test::Transition(depth.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_DEPTH_WRITE)};
-            scene.list->ResourceBarrier(2,begin_native);scene.list->OMSetRenderTargets(1,&rtv,FALSE,&dsv);
-            const float grey_native[]{.3f,.3f,.3f,1};scene.list->ClearRenderTargetView(rtv,grey_native,0,nullptr);scene.list->ClearDepthStencilView(dsv,D3D12_CLEAR_FLAG_DEPTH,0,0,0,nullptr);
+            scene.list->ResourceBarrier(native_inherited?1u:2u,begin_native);scene.list->OMSetRenderTargets(1,&rtv,FALSE,&dsv);
+            const float grey_native[]{.3f,.3f,.3f,1};scene.list->ClearRenderTargetView(rtv,grey_native,0,nullptr);
+            if(!native_inherited)scene.list->ClearDepthStencilView(dsv,D3D12_CLEAR_FLAG_DEPTH,0,0,0,nullptr);
             scene.list->SetGraphicsRootSignature(rs.Get());ID3D12DescriptorHeap* camera_heap[]{cbvh.Get()};scene.list->SetDescriptorHeaps(1,camera_heap);
             scene.list->SetGraphicsRootConstantBufferView(0,va+1024);scene.list->SetGraphicsRootDescriptorTable(1,cbvh->GetGPUDescriptorHandleForHeapStart());
             const auto source_read=native_graphics?D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE:D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             D3D12_RESOURCE_BARRIER finish_native[2]{test::Transition(color.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,native_se5?D3D12_RESOURCE_STATE_COMMON:source_read),test::Transition(depth.Get(),D3D12_RESOURCE_STATE_DEPTH_WRITE,D3D12_RESOURCE_STATE_COMMON)};
-            scene.list->ResourceBarrier(2,finish_native);
+            scene.list->ResourceBarrier(native_inherited?1u:2u,finish_native);
             ID3D12GraphicsCommandList* target_list=scene.list.Get();
             if(!native_merged){
                 REQUIRE(SUCCEEDED(scene.list->Close()));
@@ -787,13 +819,13 @@ int main(int argc,char** argv)
             ID3D12CommandList* native_lists[]{scene.list.Get(),post.list.Get()};
             if(native_se5){
                 if(native_reverse && iteration>=2){
-                    na::j2::Execute(d.queue.Get(),1,native_lists+1,&Forward);
-                    na::j2::Execute(d.queue.Get(),1,native_lists,&Forward);
+                    native_execute(1,native_lists+1);
+                    native_execute(1,native_lists);
                 }else if(iteration%2){
-                    na::j2::Execute(d.queue.Get(),2,native_lists,&Forward);
+                    native_execute(2,native_lists);
                 }else{
-                    na::j2::Execute(d.queue.Get(),1,native_lists,&Forward);
-                    na::j2::Execute(d.queue.Get(),1,native_lists+1,&Forward);
+                    native_execute(1,native_lists);
+                    native_execute(1,native_lists+1);
                 }
                 if((native_replace&&late_deliveries>0)||(native_stale&&stale_from)){
                     // The game overwrites its upscaled image in a list of its own, before the presenting list.
@@ -1007,6 +1039,15 @@ static uint64_t seen=0;char tr[2048];uint64_t n=0;na::j2::NativeTraceResult(tr,s
         CHECK(dev->GetDeviceRemovedReason()==S_OK);
         if(witness_window){final_list.list.Reset();presented.Reset();witness_chain.Reset();DestroyWindow(witness_window);}
         fake::eval_output=nullptr;
+        if(native_inherited){
+            CHECK(na::j2::GetNativeBridgeStats().snap_depth_unknown>0);
+            inherited_depth_state(false);
+        }
+        if(native_se5 && std::strstr(na::j2::GetNativeBridgeStats().stages,"learned=1")){
+            na::j2::SetNativeRenderExtent(W-1,H,OW,OH);
+            na::j2::NativeTracePresent(d.queue.Get(),presented.Get(),false);
+            CHECK(std::strstr(na::j2::GetNativeBridgeStats().stages,"learned=0")!=nullptr);
+        }
         // Restore DLAA while the last post list remains closed/replayable. GPU
         // completion, rather than requiring its future Reset, permits resizing.
         na::j2::SetNativeRenderExtent(W,H,W,H);na::j2::OnPresent(d.queue.Get());frame(.5);

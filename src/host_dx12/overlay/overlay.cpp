@@ -2892,6 +2892,13 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
         g_menu_skips.empty.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    // ImGui's Win32 coordinates follow the client, while this texture can be
+    // larger (borderless scaling, a presenter, or a resized game window).
+    // Scale BOTH the viewport and scissors through the backend's supported
+    // framebuffer transform; keep layout and mouse coordinates in client units.
+    const auto menu_target = back_buffer->GetDesc();
+    draw->FramebufferScale = ImVec2(float(menu_target.Width) / draw->DisplaySize.x,
+                                   float(menu_target.Height) / draw->DisplaySize.y);
     // New glyphs can update an EXISTING font atlas. The private upload queue
     // must not write it while an older game-queue menu draw is sampling it.
     // A completion check (not a wait) protects all atlas updates/destruction.

@@ -71,7 +71,9 @@ constexpr uint32_t kRing = 6;            // frames in flight before a slot is re
 // its R32_FLOAT snapshot are the same single-sample 32-bit plane-0 representation after the
 // existing conversion. Switching between them must not rebuild the temporal working textures
 // (and reset history); only genuinely different depth formats key the working set.
-inline DXGI_FORMAT depth_working_key(DXGI_FORMAT f) { return na::depth::PlaneZeroCopiesToR32F(f) ? DXGI_FORMAT_R32_FLOAT : f; }
+inline DXGI_FORMAT depth_working_key(DXGI_FORMAT f, uint32_t samples) {
+    return samples == 1 && na::depth::PlaneZeroCopiesToR32F(f) ? DXGI_FORMAT_R32_FLOAT : f;
+}
 // Quality stability gate: consecutive deliverable frames required before DLSS is written.
 // 0 (Cort: no fail-safes, every frame): DLSS is written whenever the route can; the gate then
 // only counts misses (gate{drops}) so a drop-out is visible in the log.
@@ -3656,7 +3658,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
                         g.rw != rw || g.rh != rh || g.ow != ow || g.oh != oh ||
                         g.samples != cd.SampleDesc.Count || g.sample_quality != cd.SampleDesc.Quality ||
                         g.depth_samples != dd.SampleDesc.Count || g.depth_quality != dd.SampleDesc.Quality ||
-                        depth_working_key(g.depth_format) != depth_working_key(dd.Format);
+                        depth_working_key(g.depth_format, g.depth_samples) != depth_working_key(dd.Format, dd.SampleDesc.Count);
     if (resize) {
         for(const auto& old:g.slots)if(old.native_scale_use&&!old.native_scale_use.Completed()) {
             ++g.stats.busy;reason("Waiting for the previous native scene size to finish.");return false;
@@ -5414,8 +5416,11 @@ int record_deferred_native(ID3D12CommandQueue* queue, ID3D12CommandList* const* 
             if (!p) return skip("The scene producer was not submitted before the upscale recording.");
             work.source=*p;
         }
-        if (!work.source.native_depth_snapshot || !work.source.native_depth_reader_fence)
-            return skip("The scene producer has no depth snapshot for the late-bound upscale step.");
+        // At a real submission boundary record() can acquire the original
+        // depth's exact state from the executed prefix. A private Close-time
+        // copy is useful when present, but lack of one is not missing depth.
+        // Never import a guessed state: record() still refuses unavailable
+        // prefix/queue provenance and restores the state it actually acquired.
         const auto& source=work.source;
         NativeCrossing learned;
         std::vector<uint64_t> learned_inputs;
@@ -5467,8 +5472,17 @@ int record_deferred_native(ID3D12CommandQueue* queue, ID3D12CommandList* const* 
                 return skip("The late-bound upscale step's images at submission have other sizes than learned.");
             if (in.vfmt!=learned.in_view || out.vfmt!=learned.out_view || typed(DXGI_FORMAT(in.fmt))!=typed(DXGI_FORMAT(out.fmt)))
                 return skip("The late-bound upscale step's images at submission have other formats than learned.");
-            if (!learned_input(in.id) || out.id!=learned.output)
-                return skip("The late-bound upscale step's images at submission are not the learned ones.");
+            if (out.id!=learned.output)
+                return skip("The late-bound upscale step's output at submission is not the learned one.");
+            // This is the already identified shader/dispatch/output boundary.
+            // Its unique, correctly sized SRV at submission is authoritative;
+            // alternating post-process inputs need not appear in a periodic
+            // trace first. Retain the variant for the existing inline path.
+            if (!learned_input(in.id)) {
+                learned_inputs.push_back(in.id);
+                std::lock_guard<std::mutex> lock(g_trace.m);
+                if (g_trace.learned.same_step(learned)) g_trace.note_input(in.id);
+            }
             work.input=input->resource;work.output=output->resource;work.input_id=in.id;work.output_id=out.id;
             work.op.reset();
             g_nb.st_late_resolved.fetch_add(1,std::memory_order_relaxed);
@@ -5482,7 +5496,7 @@ int record_deferred_native(ID3D12CommandQueue* queue, ID3D12CommandList* const* 
         SceneInput staged=source;
         staged.color=work.input_id;
         staged.color_sub=0;
-        staged.depth_sub=0;
+        if (source.native_depth_snapshot) staged.depth_sub=0;
         UpscaleTarget previous;
         {
             std::lock_guard<std::mutex> lock(g_up_m);
@@ -5501,7 +5515,7 @@ int record_deferred_native(ID3D12CommandQueue* queue, ID3D12CommandList* const* 
         auto& slot=g.slots[g.slot];
         slot.native_scale_resources={work.input,work.depth,work.output,source.native_depth_snapshot};
         // The caller signals this fence after submitting our owned list.
-        *source.native_depth_reader_fence=g.fence_next;
+        if (source.native_depth_reader_fence) *source.native_depth_reader_fence=g.fence_next;
         pending.native_source=source.native_serial;
         pending.native_delivery=true;
         g_nb.st_recorded.fetch_add(1,std::memory_order_relaxed);
@@ -7079,6 +7093,16 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
             return;
         }
         ++g_trace.presents;
+        NativeExtent extent;
+        { std::lock_guard<std::mutex> size_lock(g_up_m); extent=g_native_extent; }
+        if (g_trace.learned.pso && (g_trace.learned.rw!=extent.rw || g_trace.learned.rh!=extent.rh ||
+                                   g_trace.learned.ow!=extent.ow || g_trace.learned.oh!=extent.oh)) {
+            // A live mode change invalidates image identities immediately. Do
+            // not wait the 900-present maintenance interval with the old size.
+            g_trace.previous={};g_trace.learned={};g_trace.learned_inputs.clear();g_trace.learned_pso.store(0);
+            g_trace.provisional={};g_trace.provisional_pso.store(0);g_trace.refuted.clear();
+            g_trace.armed.store(false);g_trace.armed_at=g_trace.presents>30?g_trace.presents-30:0;
+        }
         if(const uint64_t id=frame?uint64_t(na::observe::IdOf(frame)):0;id&&!trace_is_presented(id)){
             g_trace.presented_ids[2].store(g_trace.presented_ids[1].load());
             g_trace.presented_ids[1].store(g_trace.presented_ids[0].load());
