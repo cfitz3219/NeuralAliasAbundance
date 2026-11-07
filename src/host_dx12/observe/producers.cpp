@@ -7926,10 +7926,24 @@ bool ListNativeOperation(ID3D12GraphicsCommandList* list, bool compute, NativeOp
             uint32_t span = 0; bool sampler = false;
             for (uint32_t r = 0; r < p.count; ++r) {
                 const auto& range = rs->second.root_ranges[p.first_range + r];
-                if (range.num_descriptors == UINT_MAX || range.table_offset == UINT_MAX ||
-                    range.num_descriptors > 4096 || range.table_offset > 4096 - range.num_descriptors) return fail("Scene uses an unbounded or oversized descriptor table.");
+                uint32_t count = range.num_descriptors;
+                // Read-only (trace): an unbounded range is bounded by the registers
+                // the reflected shader declares in it. A runtime-indexed array
+                // (unbounded or zero BindCount) stays unresolvable.
+                if (count == UINT_MAX && read_only && next.reflection_complete && pipeline != g_objs.end()) {
+                    count = 0;
+                    for (const auto& used : pipeline->second.shader_resources) {
+                        if (p.visibility!=D3D12_SHADER_VISIBILITY_ALL&&used.visibility!=D3D12_SHADER_VISIBILITY_ALL&&p.visibility!=used.visibility) continue;
+                        if (used.type != range.range_type || used.space != range.register_space || used.first < range.base_register) continue;
+                        if (used.count == 0 || used.count == UINT_MAX) return fail("Scene samples a runtime-indexed unbounded descriptor array.");
+                        if (uint64_t(used.first - range.base_register) + used.count > 4096) return fail("Scene uses an unbounded or oversized descriptor table.");
+                        count = std::max(count, used.first - range.base_register + used.count);
+                    }
+                }
+                if (count == UINT_MAX || range.table_offset == UINT_MAX ||
+                    count > 4096 || range.table_offset > 4096 - count) return fail("Scene uses an unbounded or oversized descriptor table.");
                 sampler |= range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
-                span = std::max(span, range.table_offset + range.num_descriptors);
+                span = std::max(span, range.table_offset + count);
             }
             if (sampler) continue;
             uint32_t slot = 0; const auto* heap = heap_for_gpu_locked(args[param].value, &slot);

@@ -132,6 +132,34 @@ std::array<float, 4> ReadTexel(test::Device& d, ID3D12Resource* tex, uint32_t x,
     rb->Unmap(0, nullptr);
     return out;
 }
+// Sol 6a48746: the fake evaluation writes a recognisable, frame-varying colour
+// into its actual NGX output (in UNORDERED_ACCESS during evaluation), so J2's
+// normal write-back has to carry it to the game's image.
+ID3D12Device* g_pattern_dev = nullptr;
+test::ComPtr<ID3D12DescriptorHeap> g_pattern_gpu, g_pattern_cpu;
+float g_pattern[4] = {0, 0, 0, 1};
+int g_pattern_writes = 0;
+void WritePattern(ID3D12GraphicsCommandList* l, const std::map<std::string, test::FakeParams::Value>& params)
+{
+    auto* out = static_cast<ID3D12Resource*>(fake::P(params, NVSDK_NGX_Parameter_Output));
+    if (!out || !g_pattern_dev) return;
+    if (!g_pattern_gpu) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        if (FAILED(g_pattern_dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_pattern_gpu)))) return;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+        if (FAILED(g_pattern_dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_pattern_cpu)))) return;
+    }
+    auto f = out->GetDesc().Format;
+    if (f == DXGI_FORMAT_R8G8B8A8_TYPELESS) f = DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (f == DXGI_FORMAT_R16G16B16A16_TYPELESS) f = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC u{}; u.Format = f; u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    g_pattern_dev->CreateUnorderedAccessView(out, nullptr, &u, g_pattern_gpu->GetCPUDescriptorHandleForHeapStart());
+    g_pattern_dev->CreateUnorderedAccessView(out, nullptr, &u, g_pattern_cpu->GetCPUDescriptorHandleForHeapStart());
+    ID3D12DescriptorHeap* heaps[] = {g_pattern_gpu.Get()};
+    l->SetDescriptorHeaps(1, heaps);
+    l->ClearUnorderedAccessViewFloat(g_pattern_gpu->GetGPUDescriptorHandleForHeapStart(), g_pattern_cpu->GetCPUDescriptorHandleForHeapStart(), out, g_pattern, 0, nullptr);
+    ++g_pattern_writes;
+}
 } // namespace
 
 int main(int argc,char** argv)
@@ -315,16 +343,25 @@ int main(int argc,char** argv)
         const auto flags=D3D12_RESOURCE_FLAGS(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS|D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
         auto native=test::CreateTexture(dev,OW,OH,format,D3D12_RESOURCE_STATE_COMMON,flags);
         REQUIRE(native);
-        test::ComPtr<ID3D12Resource> late, decoy, presented;
+        test::ComPtr<ID3D12Resource> late, decoy, presented, aux;
         if (native_late) {
             late=test::CreateTexture(dev,W,H,format,D3D12_RESOURCE_STATE_COMMON,flags);
             decoy=test::CreateTexture(dev,OW,OH,format,D3D12_RESOURCE_STATE_COMMON,flags);
-            presented=test::CreateTexture(dev,OW,OH,format,D3D12_RESOURCE_STATE_COMMON,
+            // SE5: the presented image is FP16 (p49436 swap chain format 10).
+            presented=test::CreateTexture(dev,OW,OH,native_se5?DXGI_FORMAT_R16G16B16A16_FLOAT:format,D3D12_RESOURCE_STATE_COMMON,
                 native_composite?D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET:D3D12_RESOURCE_FLAG_NONE);
             REQUIRE(late&&decoy&&presented);
+            // SE5: a smaller auxiliary input of the upscale step (#13990 1146x480/10).
+            if(native_se5){aux=test::CreateTexture(dev,W/2,H/2,DXGI_FORMAT_R16G16B16A16_FLOAT,D3D12_RESOURCE_STATE_COMMON,flags);REQUIRE(aux);}
+        }
+        if(native_se5){
+            // Normal output path: no debug picture, no sharpening; the fake
+            // evaluation writes the pattern into its real output.
+            g_pattern_dev=dev;fake::eval_output=&WritePattern;
+            na::settings::Get().j2_sharpness.store(0);
         }
         test::ComPtr<ID3D12DescriptorHeap> heap,cpu_heap;
-        D3D12_DESCRIPTOR_HEAP_DESC hd_native{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,native_composite?7u:native_late?6u:2u,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
+        D3D12_DESCRIPTOR_HEAP_DESC hd_native{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,native_se5?16u:native_composite?7u:native_late?6u:2u,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
         REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd_native,IID_PPV_ARGS(&heap))));
         hd_native.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_NONE;REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd_native,IID_PPV_ARGS(&cpu_heap))));
         const auto increment=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -388,12 +425,20 @@ int main(int argc,char** argv)
             serialized.Reset();
             REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&root_desc,D3D_ROOT_SIGNATURE_VERSION_1,&serialized,&error)));
             REQUIRE(SUCCEEDED(dev->CreateRootSignature(0,serialized->GetBufferPointer(),serialized->GetBufferSize(),IID_PPV_ARGS(&composite_root))));
+            // SE5: an explicit 8-bit UNORM -> FP16 conversion (gamma 2.2 decode).
             const char pass[]=R"(Texture2D<float4> image:register(t0);
                 float4 vs(uint id:SV_VertexID):SV_Position{float2 p=float2((id<<1)&2,id&2);return float4(p*float2(2,-2)+float2(-1,1),0,1);}
-                float4 ps(float4 p:SV_Position):SV_Target{return image.Load(int3(uint2(p.xy),0));})";
+                float4 ps(float4 p:SV_Position):SV_Target{float4 c=image.Load(int3(uint2(p.xy),0));
+                #ifdef SE5
+                return float4(pow(c.rgb,2.2),c.a);
+                #else
+                return c;
+                #endif
+                })";
+            const D3D_SHADER_MACRO se5_macro[]{{"SE5","1"},{nullptr,nullptr}};
             test::ComPtr<ID3DBlob> vertex,pixel;
-            REQUIRE(SUCCEEDED(D3DCompile(pass,sizeof pass,"test_composite",nullptr,nullptr,"vs","vs_5_0",0,0,&vertex,&error)));
-            REQUIRE(SUCCEEDED(D3DCompile(pass,sizeof pass,"test_composite",nullptr,nullptr,"ps","ps_5_0",0,0,&pixel,&error)));
+            REQUIRE(SUCCEEDED(D3DCompile(pass,sizeof pass,"test_composite",native_se5?se5_macro:nullptr,nullptr,"vs","vs_5_0",0,0,&vertex,&error)));
+            REQUIRE(SUCCEEDED(D3DCompile(pass,sizeof pass,"test_composite",native_se5?se5_macro:nullptr,nullptr,"ps","ps_5_0",0,0,&pixel,&error)));
             D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
             desc.pRootSignature=composite_root.Get();
             desc.VS={vertex->GetBufferPointer(),vertex->GetBufferSize()};
@@ -402,22 +447,62 @@ int main(int argc,char** argv)
             desc.RasterizerState.FillMode=D3D12_FILL_MODE_SOLID;desc.RasterizerState.CullMode=D3D12_CULL_MODE_NONE;
             desc.RasterizerState.DepthClipEnable=TRUE;
             desc.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-            desc.NumRenderTargets=1;desc.RTVFormats[0]=view_format;
+            const auto present_format=native_se5?DXGI_FORMAT_R16G16B16A16_FLOAT:view_format;
+            desc.NumRenderTargets=1;desc.RTVFormats[0]=present_format;
             desc.BlendState.RenderTarget[0].RenderTargetWriteMask=D3D12_COLOR_WRITE_ENABLE_ALL;
             REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&desc,IID_PPV_ARGS(&composite))));
-            D3D12_DESCRIPTOR_HEAP_DESC rt_heap{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,1};
+            D3D12_DESCRIPTOR_HEAP_DESC rt_heap{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,2};
             REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&rt_heap,IID_PPV_ARGS(&composite_rtv))));
             D3D12_RENDER_TARGET_VIEW_DESC rtv_desc{};
-            rtv_desc.Format=view_format;rtv_desc.ViewDimension=D3D12_RTV_DIMENSION_TEXTURE2D;
+            rtv_desc.Format=present_format;rtv_desc.ViewDimension=D3D12_RTV_DIMENSION_TEXTURE2D;
             dev->CreateRenderTargetView(presented.Get(),&rtv_desc,composite_rtv->GetCPUDescriptorHandleForHeapStart());
+            if(native_se5){
+                // [1] RTV of the game's upscaled image (the overwrite case clears it).
+                rtv_desc.Format=view_format;
+                auto h=composite_rtv->GetCPUDescriptorHandleForHeapStart();h.ptr+=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+                dev->CreateRenderTargetView(native.Get(),&rtv_desc,h);
+            }
         }
+        // SE5 upscale step with a second, smaller input bound on alternating frames:
+        // tables at 7 (late, aux, native) and 10 (late, null, native); 13 = decoy SRV.
+        test::ComPtr<ID3D12RootSignature> se5_root;test::ComPtr<ID3D12PipelineState> se5_upscale;
+        if(native_se5){
+            const auto base=heap->GetCPUDescriptorHandleForHeapStart().ptr;
+            D3D12_SHADER_RESOURCE_VIEW_DESC fp=sv;fp.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;
+            dev->CreateShaderResourceView(late.Get(),&sv,{base+7*increment});
+            dev->CreateShaderResourceView(aux.Get(),&fp,{base+8*increment});
+            dev->CreateUnorderedAccessView(native.Get(),nullptr,&uv,{base+9*increment});
+            dev->CreateShaderResourceView(late.Get(),&sv,{base+10*increment});
+            dev->CreateShaderResourceView(nullptr,&fp,{base+11*increment});
+            dev->CreateUnorderedAccessView(native.Get(),nullptr,&uv,{base+12*increment});
+            dev->CreateShaderResourceView(decoy.Get(),&sv,{base+13*increment});
+            D3D12_DESCRIPTOR_RANGE r2[2]{{D3D12_DESCRIPTOR_RANGE_TYPE_SRV,2,0,0,0},{D3D12_DESCRIPTOR_RANGE_TYPE_UAV,1,0,0,2}};
+            D3D12_ROOT_PARAMETER p2{};p2.ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;p2.DescriptorTable={2,r2};
+            D3D12_ROOT_SIGNATURE_DESC d2{1,&p2,0,nullptr,D3D12_ROOT_SIGNATURE_FLAG_NONE};
+            serialized.Reset();
+            REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&d2,D3D_ROOT_SIGNATURE_VERSION_1,&serialized,&error)));
+            REQUIRE(SUCCEEDED(dev->CreateRootSignature(0,serialized->GetBufferPointer(),serialized->GetBufferSize(),IID_PPV_ARGS(&se5_root))));
+            const char up[]=R"(Texture2D<float4> image:register(t0);Texture2D<float4> aux:register(t1);RWTexture2D<float4> output:register(u0);
+                [numthreads(8,8,1)]void main(uint3 p:SV_DispatchThreadID){if(p.x<96&&p.y<48)output[p.xy]=image.Load(int3(p.xy*uint2(64,32)/uint2(96,48),0))+min(aux.Load(int3(0,0,0)),0);})";
+            test::ComPtr<ID3DBlob> cs;
+            REQUIRE(SUCCEEDED(D3DCompile(up,sizeof up,"se5_upscale",nullptr,nullptr,"main","cs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&cs,&error)));
+            D3D12_COMPUTE_PIPELINE_STATE_DESC c{};c.pRootSignature=se5_root.Get();c.CS={cs->GetBufferPointer(),cs->GetBufferSize()};
+            REQUIRE(SUCCEEDED(dev->CreateComputePipelineState(&c,IID_PPV_ARGS(&se5_upscale))));
+        }
+        const bool native_overwrite=native_se5&&argc>1&&std::strstr(argv[1],"overwrite")!=nullptr;
+        // SE5: the presenting list is recorded ONCE (before any trace window) and
+        // executed every frame; it writes the presented image twice: first from
+        // the decoy, then from the game's upscaled image (the write that counts).
+        test::List final_list;bool final_recorded=false;
+        if(native_se5){REQUIRE(final_list.Create(dev));REQUIRE(SUCCEEDED(final_list.list->Close()));}
         test::List post;REQUIRE(post.Create(dev));REQUIRE(SUCCEEDED(post.list->Close()));
-        na::j2::SetNativeRenderExtent(W,H,OW,OH);na::j2::SetDebugView(3); // known black depth output, alpha1
+        na::j2::SetNativeRenderExtent(W,H,OW,OH);na::j2::SetDebugView(native_se5?0:3); // 3: known black depth output, alpha1; SE5: the normal output
         const int before_native=fake::evals;
         const unsigned iterations=native_late?68u:3u;
         unsigned late_deliveries=0;
         for(unsigned iteration=0;iteration<iterations;++iteration){
             d.WaitIdle();na::j2::OnPresent(d.queue.Get());
+            g_pattern[0]=.2f+.1f*float(iteration%4);g_pattern[1]=.6f;g_pattern[2]=.4f;g_pattern[3]=1.f;
             const M vp_native=Camera(.1+iteration*.01);M inv_native{};Inverse(vp_native,inv_native);
             Store(cpu+512+80,vp_native);Store(cpu+512+144,inv_native);
             scene.Reset();
@@ -466,15 +551,33 @@ int main(int argc,char** argv)
                     std::swap(decoy_write.Transition.StateBefore,decoy_write.Transition.StateAfter);
                     target_list->ResourceBarrier(1,&decoy_write);
                 }
-                target_list->SetComputeRootDescriptorTable(0,{base});
+                if(native_se5){
+                    // The real upscale step, with the auxiliary input on even frames.
+                    target_list->SetComputeRootSignature(se5_root.Get());
+                    target_list->SetPipelineState(se5_upscale.Get());
+                    target_list->SetComputeRootDescriptorTable(0,{base+(iteration%2?10u:7u)*increment});
+                }else target_list->SetComputeRootDescriptorTable(0,{base});
                 target_list->Dispatch(12,6,1);
             }
             // Later native HUD draw: green corner must survive reconstruction.
             D3D12_RESOURCE_BARRIER order{};order.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;order.UAV.pResource=native.Get();target_list->ResourceBarrier(1,&order);
             const float green[]{0,1,0,1};const D3D12_RECT hud_rect{0,0,4,4};
             target_list->ClearUnorderedAccessViewFloat(gpu_uav,cpu_heap->GetCPUDescriptorHandleForHeapStart(),native.Get(),green,1,&hud_rect);
+            if(native_overwrite){
+                // Negative: the game overwrites its upscaled image before the final write reads it.
+                auto to_rt=test::Transition(native.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_RENDER_TARGET);
+                target_list->ResourceBarrier(1,&to_rt);
+                auto h=composite_rtv->GetCPUDescriptorHandleForHeapStart();h.ptr+=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+                const float blue[]{0,0,1,1};target_list->ClearRenderTargetView(h,blue,0,nullptr);
+                std::swap(to_rt.Transition.StateBefore,to_rt.Transition.StateAfter);target_list->ResourceBarrier(1,&to_rt);
+            }
             D3D12_RESOURCE_BARRIER end_native[2]{test::Transition(native.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON),test::Transition(color.Get(),source_read,D3D12_RESOURCE_STATE_COMMON)};
-            if(native_late){
+            if(native_se5){
+                // The presenting list is separate (final_list, below).
+                auto end_late=test::Transition(late.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+                target_list->ResourceBarrier(1,&end_late);
+                target_list->ResourceBarrier(2,end_native);
+            }else if(native_late){
                 const auto native_read=native_composite?D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE:D3D12_RESOURCE_STATE_COPY_SOURCE;
                 const auto present_write=native_composite?D3D12_RESOURCE_STATE_RENDER_TARGET:D3D12_RESOURCE_STATE_COPY_DEST;
                 D3D12_RESOURCE_BARRIER copy[]{
@@ -512,7 +615,60 @@ int main(int argc,char** argv)
             if(!native_merged&&(native_late||iteration==2))na::j2::Execute(d.queue.Get(),1,native_lists+1,&Forward);
             else na::j2::Execute(d.queue.Get(),native_merged?1u:2u,native_lists,&Forward);
             d.WaitIdle();
+            if(native_se5&&iteration>=1){
+                if(!final_recorded){
+                    // Recorded once, after the first Present (the presented buffer is
+                    // known) and long before any trace window; executed every frame.
+                    final_list.Reset();
+                    auto* fl=final_list.list.Get();
+                    D3D12_RESOURCE_BARRIER b[3]{test::Transition(native.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+                        test::Transition(decoy.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+                        test::Transition(presented.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_RENDER_TARGET)};
+                    fl->ResourceBarrier(3,b);
+                    ID3D12DescriptorHeap* hh[]{heap.Get()};fl->SetDescriptorHeaps(1,hh);
+                    fl->SetGraphicsRootSignature(composite_root.Get());fl->SetPipelineState(composite.Get());
+                    auto rt=composite_rtv->GetCPUDescriptorHandleForHeapStart();fl->OMSetRenderTargets(1,&rt,FALSE,nullptr);
+                    const D3D12_VIEWPORT vp{0,0,float(OW),float(OH),0,1};const D3D12_RECT sc{0,0,LONG(OW),LONG(OH)};
+                    fl->RSSetViewports(1,&vp);fl->RSSetScissorRects(1,&sc);fl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    const auto gbase=heap->GetGPUDescriptorHandleForHeapStart().ptr;
+                    fl->SetGraphicsRootDescriptorTable(0,{gbase+13*increment});fl->DrawInstanced(3,1,0,0); // first write: the decoy
+                    fl->SetGraphicsRootDescriptorTable(0,{gbase+6*increment});fl->DrawInstanced(3,1,0,0);  // last write: the game's image
+                    for(auto& x:b)std::swap(x.Transition.StateBefore,x.Transition.StateAfter);
+                    fl->ResourceBarrier(3,b);
+                    REQUIRE(SUCCEEDED(fl->Close()));final_recorded=true;
+                }
+                ID3D12CommandList* fls[]{final_list.list.Get()};
+                na::j2::Execute(d.queue.Get(),1,fls,&Forward);
+                d.WaitIdle();
+            }
             st=na::j2::GetStats();
+            if(native_se5){
+                na::j2::NativeTracePresent(d.queue.Get(),presented.Get(),false);
+                if(st.native_deliveries){
+                    CHECK(!native_overwrite);
+                    CHECK(st.native_deliveries==++late_deliveries);
+                    // The evaluation's own pixels, through J2's normal write-back, the game's HUD,
+                    // and the game's explicit UNORM -> FP16 conversion into the presented image.
+                    const auto q=[](float v){return std::round(v*255.f)/255.f;};
+                    const auto world=ReadTexel(d,presented.Get(),OW-1,OH-1),hud=ReadTexel(d,presented.Get(),1,1);
+                    const auto game=ReadTexel(d,native.Get(),OW-1,OH-1);
+                    std::printf("se5 iteration %u: pattern %.3f %.3f %.3f native %.3f %.3f %.3f presented %.4f %.4f %.4f hud %.2f %.2f %.2f aux %s\n",iteration,
+                        g_pattern[0],g_pattern[1],g_pattern[2],game[0],game[1],game[2],world[0],world[1],world[2],hud[0],hud[1],hud[2],iteration%2?"no":"yes");
+                    (void)q;
+                    for(int c=0;c<3;++c){
+                        CHECK(std::fabs(game[c]-g_pattern[c])<1.f/255.f+.001f);          // 8-bit store of the pattern
+                        CHECK(std::fabs(world[c]-std::pow(game[c],2.2f))<.003f);           // the game's conversion of it
+                    }
+                    CHECK(hud[0]==0&&hud[1]==1&&hud[2]==0);
+                }else{
+                    CHECK(fake::evals==before_native);
+                    if(native_overwrite&&final_recorded){
+                        const auto world=ReadTexel(d,presented.Get(),OW-1,OH-1);
+                        CHECK(world[0]==0&&world[1]==0&&world[2]==1);
+                    }
+                }
+                continue;
+            }
             if(native_late){
                 na::j2::NativeTracePresent(d.queue.Get(),presented.Get(),!native_se5);
                 if(st.native_deliveries){
@@ -532,10 +688,26 @@ int main(int argc,char** argv)
         if(native_late){
             char trace[2048];uint64_t traces=0;na::j2::NativeTraceResult(trace,sizeof trace,&traces);
             std::printf("learned native Quality deliveries %u, traces %llu: %s\n",late_deliveries,(unsigned long long)traces,trace);
-            if(native_se5)CHECK(std::strstr(trace,"via_inferred=")!=nullptr);
-            CHECK(late_deliveries>=2 && fake::evals==before_native+int(late_deliveries));
+            if(native_overwrite){
+                // No false confirmation: nothing learned, nothing evaluated or delivered.
+                CHECK(late_deliveries==0 && fake::evals==before_native && std::strstr(trace,"learned=0")!=nullptr);
+            }else{
+                if(native_se5){
+                    // Learned through the once-recorded presenting list (cached, last write),
+                    // with the typed UNORM -> FP16 handoff named.
+                    CHECK(std::strstr(trace,"handoff=[")!=nullptr && std::strstr(trace,"transfer=shader_defined")!=nullptr);
+                    CHECK(std::strstr(trace,"cached=0 ")==nullptr);
+                    CHECK(g_pattern_writes>=int(late_deliveries));
+                    // Deliveries on frames with the auxiliary input were counted.
+                    const auto nb=na::j2::GetNativeBridgeStats();
+                    std::printf("se5 stretch: candidates %llu recorded %llu aux %llu\n",(unsigned long long)nb.st_candidates,(unsigned long long)nb.st_recorded,(unsigned long long)nb.st_aux);
+                    CHECK(nb.st_aux>0 && nb.st_aux<nb.st_candidates);
+                }
+                CHECK(late_deliveries>=2 && fake::evals==before_native+int(late_deliveries));
+            }
         }else CHECK(fake::evals==before_native+3);
         CHECK(dev->GetDeviceRemovedReason()==S_OK);
+        fake::eval_output=nullptr;
         // Restore DLAA while the last post list remains closed/replayable. GPU
         // completion, rather than requiring its future Reset, permits resizing.
         na::j2::SetNativeRenderExtent(W,H,W,H);na::j2::OnPresent(d.queue.Get());frame(.5);

@@ -372,7 +372,7 @@ struct NativeBridgeCounters {
     std::atomic<uint64_t> hints{0},examined{0},not_reading{0},snapshot{0},source_size{0},draw_state{0},viewport{0},
         no_destination{0},ambiguous{0},candidates{0},recorded{0},record_failed{0},after_skipped{0},redirected{0},redirect_failed{0},redirect_submitted{0},depth_state_refused{0},
         st_gated{0},st_full{0},st_examined{0},st_no_input{0},st_ambiguous{0},st_draw_state{0},st_candidates{0},st_recorded{0},st_failed{0},
-        st_ungated_full{0},st_budget{0};
+        st_ungated_full{0},st_budget{0},st_aux{0};
     std::mutex m;char reason[200]{};uint32_t src_w=0,src_h=0,src_fmt=0,seen_w=0,seen_h=0,seen_fmt=0;
     // Every distinct full-output writer seen while waiting (pipeline + kind), with its
     // render-size inputs: the log names the game's upscale step instead of guessing.
@@ -413,6 +413,8 @@ struct TraceOp {
     // The bindings could not be snapshotted (unbounded table, missing typed view...):
     // only the bound render target and the full-size images the list samples are known.
     bool inferred = false;
+    const char* why = nullptr; // inferred: the snapshot's failure (a static string)
+    uint64_t list = 0, recording = 0; // the recording this op belongs to
     uint64_t pso = 0;
     uint32_t vw = 0, vh = 0, gx = 0, gy = 0, gz = 0, uavs = 0, descriptor_slots = 0;
     ID3D12CommandQueue* queue = nullptr;
@@ -434,7 +436,7 @@ struct NativeTrace{
     uint64_t inferred=0,inferred_present=0;char inferred_reason[96]{};
     std::vector<uint64_t> full_ids;                  // whole output-size images written in traced ops (cap 64)
     std::atomic<uint64_t> presented_ids[3]{};        // the last distinct presented buffers
-    std::deque<std::pair<std::pair<uint64_t,uint64_t>,TraceOp>> present_cache; // ops writing a presented buffer, by list recording (cap 32)
+    std::deque<std::pair<std::pair<uint64_t,uint64_t>,TraceOp>> present_cache; // ops writing a presented buffer, by list recording, in order (cap 64)
     uint64_t cached_used=0,crossing_aux=0,other_queue=0,via_inferred=0;
     char result[4096]{};
     NativeCrossing previous, learned;
@@ -473,10 +475,12 @@ bool trace_is_presented(uint64_t id)
     for (const auto& p : g_trace.presented_ids) if (p.load(std::memory_order_relaxed)==id) return true;
     return false;
 }
-// An op whose bindings cannot be snapshotted. Only a draw on a direct list is
-// described: its bound render target, and as inputs the whole output-size images
-// already seen written that this recording samples. trace_analyze passes through
-// such an op only when exactly one such input is known.
+// An op whose bindings cannot be snapshotted even with the reflected registers
+// (a runtime-indexed unbounded array, a missing typed view ...). Only a draw on a
+// direct list is described: its bound render target, and as LEADS (binding 'l')
+// the whole output-size images already seen written that this recording sampled
+// somewhere. A lead is not proof the draw read it (Sol, 6a48746): trace_analyze
+// stops at such a writer and names it instead of walking through it.
 bool trace_inferred(ID3D12GraphicsCommandList* l, TraceOp& t)
 {
     if (l->GetType()!=D3D12_COMMAND_LIST_TYPE_DIRECT) return false;
@@ -496,7 +500,7 @@ bool trace_inferred(ID3D12GraphicsCommandList* l, TraceOp& t)
         if (id==rt || !na::observe::ListSamplesTexture(l,id)) continue;
         ComPtr<ID3D12Resource> r;
         r.Attach(na::observe::AcquireResource(id));
-        if (r) t.in.push_back(trace_view(r.Get(),id,uint32_t(r->GetDesc().Format),true,'s'));
+        if (r) t.in.push_back(trace_view(r.Get(),id,uint32_t(r->GetDesc().Format),true,'l'));
     }
     return true;
 }
@@ -542,19 +546,21 @@ void trace_texture(ID3D12GraphicsCommandList* l, const na::observe::TextureCall&
 // by list recording, so a list recorded once and executed every frame is still known.
 void trace_op(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall& call,bool cache=false){
     const bool compute=call.kind==na::observe::ShaderKind::Dispatch;
+    const auto key=std::make_pair(uint64_t(na::observe::IdOf(l)),na::observe::ListRecording(l));
     const auto keep=[&](TraceOp&& t){
+        t.list=key.first;t.recording=key.second;
         if(!cache){trace_append(l,std::move(t));return;}
-        const auto key=std::make_pair(uint64_t(na::observe::IdOf(l)),na::observe::ListRecording(l));
         if(!key.first||!key.second)return;
         std::lock_guard<std::mutex> lock(g_trace.m);
+        // Every write to a presented buffer, in recording order (a later write to
+        // the same target must not be dropped: it is the one that reaches the screen).
         auto& c=g_trace.present_cache;
-        for(auto& x:c)if(x.first==key&&x.second.out.size()==t.out.size()&&!t.out.empty()&&x.second.out[0].id==t.out[0].id)return;
-        if(c.size()>=32)c.pop_front();
+        if(c.size()>=64)c.pop_front();
         c.emplace_back(key,std::move(t));
     };
     na::observe::NativeOperation op;const char* why=nullptr;
     if(!na::observe::ListNativeOperation(l,compute,op,&why,true)){
-        TraceOp t;
+        TraceOp t;t.why=why;
         if(compute||!trace_inferred(l,t))return;
         const bool present=trace_is_presented(t.out[0].id);
         if(cache&&!present)return;
@@ -665,6 +671,31 @@ int trace_describe(char* out,size_t n,const TraceOp& t){
     if(used+2<n){out[used++]=']';out[used]=0;}
     return int(used);
 }
+// One rule for discovery (trace_analyze) and delivery (stretch), Sol 6a48746:
+// the unique whole render-size colour input, bound through one view format;
+// every other 2D input smaller than the render size on both axes (auxiliary).
+struct SceneInputPick { bool ok=false, found=false; size_t at=0, aux=0; const char* why=""; };
+SceneInputPick pick_scene_input(const std::vector<TraceIo>& in, uint32_t rw, uint32_t rh)
+{
+    SceneInputPick r;
+    for (size_t k=0;k<in.size();++k) {
+        const auto& v=in[k];
+        if (v.w==rw && v.h==rh) {
+            if (!v.whole) { r.found=true; r.why="a partial render-size view"; return r; }
+            if (r.found) {
+                const auto& f=in[r.at];
+                if (f.id!=v.id) { r.why="two render-size inputs"; return r; }
+                if (f.vfmt!=v.vfmt) { r.why="one render-size input through two view formats"; return r; }
+                continue;
+            }
+            r.found=true; r.at=k;
+        } else if (v.w<rw && v.h<rh) ++r.aux;
+        else { r.why="an input at least as large as the render size"; r.found=r.found||false; return r; }
+    }
+    if (!r.found) { r.why="no render-size input"; return r; }
+    r.ok=true; r.why="";
+    return r;
+}
 bool trace_same_color(uint32_t input, uint32_t output)
 {
     return (output==DXGI_FORMAT_R8G8B8A8_UNORM &&
@@ -745,17 +776,24 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
         return false;
     };
 
-    struct Edge { uint64_t id; size_t before; bool srgb; };
+    // read_vfmt/reader: the view format and pipeline through which the nearest
+    // resolved downstream shader op read this image (0 = presented itself).
+    struct Edge { uint64_t id; size_t before; bool srgb; uint32_t read_vfmt=0; uint64_t reader=0; uint32_t written_vfmt=0; };
     std::vector<Edge> pending{{presented,ops.size(),false}};
     std::vector<std::pair<uint64_t,size_t>> visited;
     NativeCrossing candidate;
-    bool ambiguous=false;
+    bool ambiguous=false, unresolved=false;
     uint32_t overlays=0;
     while (!pending.empty() && visited.size()<4096) {
         const Edge edge=pending.back();
         pending.pop_back();
         const size_t index=writer(edge.id,edge.before);
         const auto version=std::make_pair(edge.id,index);
+        if (index>=ops.size() && edge.id==presented && edge.before==ops.size()) {
+            unresolved=true;
+            add(" presented_writer=none");
+            continue;
+        }
         if (index>=ops.size() || std::find(visited.begin(),visited.end(),version)!=visited.end()) continue;
         visited.push_back(version);
         const auto& op=ops[index];
@@ -763,35 +801,41 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
         if (output==op.out.end() || !output->whole || output->w!=e.ow || output->h!=e.oh) continue;
         if (output->binding=='r' && op.preserves) {
             ++overlays;
-            pending.push_back({edge.id,index,edge.srgb});
+            pending.push_back({edge.id,index,edge.srgb,edge.read_vfmt,edge.reader,edge.written_vfmt});
             continue;
         }
         // Exactly one whole render-size input; any other input must be smaller than
         // the render size on both axes (p49436 frame 13888: pso 556 also reads
         // #13990 1146x480/10 on some frames). Its contribution is overwritten by
         // the DLSS image on those frames; counted as aux so a run can judge it.
-        size_t render_inputs=0, aux_inputs=0, render_at=0;
-        for (size_t k=0;k<op.in.size();++k) {
-            const auto& v=op.in[k];
-            if (v.whole && v.w==e.rw && v.h==e.rh) { ++render_inputs; render_at=k; }
-            else if (v.w<e.rw && v.h<e.rh) ++aux_inputs;
-            else { render_inputs=2; break; }
-        }
+        const auto pick=pick_scene_input(op.in,e.rw,e.rh);
+        const size_t aux_inputs=pick.aux;
         if (op.compute && op.direct && op.reflected && op.uavs==1 && op.out.size()==1 &&
-            render_inputs==1 && op.gx && op.gy && op.gz==1) {
-            const auto& in=op.in[render_at];
+            !pick.ok && pick.found) add(" crossing_rejected=\"%s\"",pick.why);
+        if (op.compute && op.direct && op.reflected && op.uavs==1 && op.out.size()==1 &&
+            pick.ok && op.gx && op.gy && op.gz==1) {
+            const auto& in=op.in[pick.at];
             {
                 char detail[380]{};
                 trace_describe(detail,sizeof detail,op);
                 add(" crossing=%s",detail);
                 if (aux_inputs) { ++g_trace.crossing_aux; add(" crossing_aux=%zu",aux_inputs); }
-                // A same-view 8-bit UNORM resample keeps the encoding its input
-                // has; an 8-bit final image is display-encoded (DLSS runs with
-                // IsHDR clear for UNORM, see is_float_color), and the game's own
-                // conversion to the FP16 swap chain still runs after it.
+                // Handoff typing (Sol 6a48746: equal UNORM views alone only give the
+                // storage format). Accepted for an 8-bit UNORM resample only when the
+                // traced shader op that consumes this output reads it as 8-bit UNORM
+                // (or _SRGB) and itself writes a non-8-bit image (the conversion to
+                // the FP16 swap chain): the 8-bit image is then the game's display
+                // picture, decoded by that op. The transfer function is proven only
+                // for an _SRGB read; otherwise it is shader-defined, logged as such,
+                // and settled by the run's presented-pixel check.
+                const bool unorm_handoff=in.vfmt==DXGI_FORMAT_R8G8B8A8_UNORM && output->vfmt==DXGI_FORMAT_R8G8B8A8_UNORM &&
+                    edge.reader && (edge.read_vfmt==DXGI_FORMAT_R8G8B8A8_UNORM || edge.read_vfmt==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) &&
+                    edge.written_vfmt && edge.written_vfmt!=DXGI_FORMAT_R8G8B8A8_UNORM && edge.written_vfmt!=DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+                if (edge.reader)
+                    add(" handoff=[reader=%llu read=%u writes=%u transfer=%s]",(unsigned long long)edge.reader,edge.read_vfmt,edge.written_vfmt,
+                        edge.read_vfmt==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB?"srgb_view":"shader_defined");
                 const bool encoded=output->vfmt==DXGI_FORMAT_R16G16B16A16_FLOAT ||
-                    in.vfmt==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || edge.srgb || sdr_present ||
-                    (in.vfmt==DXGI_FORMAT_R8G8B8A8_UNORM && output->vfmt==DXGI_FORMAT_R8G8B8A8_UNORM);
+                    in.vfmt==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || edge.srgb || sdr_present || unorm_handoff;
                 if (encoded && trace_same_color(in.vfmt,output->vfmt) && traces_scene(in.id,index)) {
                     const NativeCrossing next{op.pso,in.id,output->id,scene,e.rw,e.rh,e.ow,e.oh,
                                               in.vfmt,output->vfmt,op.gx,op.gy,op.gz};
@@ -801,38 +845,50 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
                 continue;
             }
         }
-        // An op with unreadable bindings (inferred): passed through only when the
-        // recording samples exactly one full-size image already seen written.
+        // A writer whose inputs could not be resolved (Sol, 6a48746): never walk
+        // through it, nor past it to an earlier writer (it overwrote that one).
+        // Name it with its unresolved binding and its leads, and stop this branch.
         if (op.inferred) {
-            uint32_t full=0;
-            for (const auto& in:op.in) if (in.whole && in.w==e.ow && in.h==e.oh) ++full;
-            add(" via_inferred=[pso=%llu inputs=%u]",(unsigned long long)op.pso,full);
-            // Not provable: behave as before this op was recorded at all (look
-            // past it to the earlier writer of the same image).
-            if (full!=1) { pending.push_back({edge.id,index,edge.srgb}); continue; }
             ++g_trace.via_inferred;
-            for (const auto& in:op.in)
-                if (in.whole && in.w==e.ow && in.h==e.oh) pending.push_back({in.id,index,edge.srgb});
+            unresolved=true;
+            add(" unresolved_writer=[list=%llu rec=%llu pso=%llu out#%llu why=\"%s\" leads=",
+                (unsigned long long)op.list,(unsigned long long)op.recording,(unsigned long long)op.pso,
+                (unsigned long long)edge.id,op.why?op.why:"unknown");
+            for (size_t k=0;k<op.in.size()&&k<4;++k) add("%s#%llu",k?",":"",(unsigned long long)op.in[k].id);
+            add("]");
             continue;
         }
         // A composite can read the scene and a separate full-size HUD. Follow
         // both branches and require one unambiguous crossing from the scene.
-        if (!op.transfer && (!op.pso || !op.reflected)) continue;
+        // A full clear: a known overwrite with no inputs, so this branch ends here.
+        if (!op.transfer && !op.pso && !op.compute && op.in.empty()) continue;
+        if (!op.transfer && (!op.pso || !op.reflected)) {
+            // Its used inputs are not known (no complete reflection): name it.
+            unresolved=true;
+            add(" unresolved_writer=[list=%llu rec=%llu pso=%llu out#%llu why=\"shader reflection incomplete\"]",
+                (unsigned long long)op.list,(unsigned long long)op.recording,(unsigned long long)op.pso,(unsigned long long)edge.id);
+            continue;
+        }
         for (const auto& in:op.in)
             if (in.whole && in.w==e.ow && in.h==e.oh)
-                pending.push_back({in.id,index,edge.srgb || in.vfmt==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB});
+                pending.push_back({in.id,index,edge.srgb || in.vfmt==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                                   op.transfer?edge.read_vfmt:in.vfmt,op.transfer?edge.reader:op.pso,
+                                   op.transfer?edge.written_vfmt:output->vfmt});
     }
-    if (ambiguous || !pending.empty()) {
+    if (ambiguous || unresolved || !pending.empty()) {
+        // An unresolved writer on any branch means the crossing may not reach the
+        // screen: no candidate from this trace (a learned crossing is kept until
+        // a complete trace contradicts it).
+        if (ambiguous || !pending.empty()) g_trace.learned={};
         candidate={};
-        g_trace.learned={};
-        add(" rejected=ambiguous_or_incomplete");
+        add(" rejected=%s",ambiguous?"ambiguous":unresolved?"unresolved_writer":"incomplete");
     } else if (candidate.pso) {
         if (candidate==g_trace.previous) g_trace.learned=candidate;
         else if (!(candidate==g_trace.learned)) g_trace.learned={};
     }    g_trace.previous=candidate;
     g_trace.learned_pso.store(g_trace.learned.pso,std::memory_order_release);
     add(" overlays=%u learned=%llu",overlays,static_cast<unsigned long long>(g_trace.learned.pso));
-    add(" inferred=%llu inferred_present=%llu cached=%llu via_inferred=%llu aux=%llu other_queue=%llu inferred_reason=\"%s\"",
+    add(" inferred=%llu inferred_present=%llu cached=%llu unresolved_stops=%llu aux=%llu other_queue=%llu inferred_reason=\"%s\"",
         (unsigned long long)g_trace.inferred,(unsigned long long)g_trace.inferred_present,(unsigned long long)g_trace.cached_used,
         (unsigned long long)g_trace.via_inferred,(unsigned long long)g_trace.crossing_aux,(unsigned long long)g_trace.other_queue,
         g_trace.inferred_reason);
@@ -4221,21 +4277,27 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
 
         const na::observe::OperationDescriptor* input=nullptr;
         const na::observe::OperationDescriptor* output=nullptr;
-        // Same rule as trace_analyze: the learned render-size input once, any other
-        // 2D input smaller than the render size on both axes (auxiliary).
+        // Same rule as trace_analyze (pick_scene_input): the unique render-size
+        // input through one view, any other 2D input smaller (auxiliary).
+        std::vector<TraceIo> srvs; std::vector<const na::observe::OperationDescriptor*> srv_of;
         for (const auto& d:op.descriptors) {
             if (!d.used || !d.resource) continue;
             const auto desc=d.resource->GetDesc();
             if (d.view.kind==NA_DESC_SRV && desc.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
-                if (d.view.resource==learned.input) {
-                    if (input && input->view.resource!=d.view.resource) return {};
-                    input=&d;
-                } else if (!(desc.Width<extent.rw && desc.Height<extent.rh)) return {};
+                const auto& s=d.view.srv;
+                srvs.push_back(trace_view(d.resource.Get(),d.view.resource,d.view.explicit_view?uint32_t(s.Format):uint32_t(desc.Format),
+                    !d.view.explicit_view || (s.ViewDimension==D3D12_SRV_DIMENSION_TEXTURE2D && !s.Texture2D.MostDetailedMip &&
+                        !s.Texture2D.PlaneSlice && s.Shader4ComponentMapping==D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING),'s'));
+                srv_of.push_back(&d);
             } else if (d.view.kind==NA_DESC_UAV) {
                 if (output) return {};
                 output=&d;
             }
         }
+        const auto pick=pick_scene_input(srvs,extent.rw,extent.rh);
+        if (!pick.ok) { native_reject(g_nb.st_ambiguous,pick.why); return {}; }
+        input=srv_of[pick.at];
+        if (pick.aux) g_nb.st_aux.fetch_add(1,std::memory_order_relaxed);
         if (!input || !output || input->view.resource!=learned.input || output->view.resource!=learned.output) {
             native_reject(g_nb.st_no_input,"The learned upscale step reads or writes other images than learned.");
             return {};
@@ -6040,7 +6102,7 @@ NativeBridgeStats GetNativeBridgeStats() {
     r.src_w=n.src_w;r.src_h=n.src_h;r.src_fmt=n.src_fmt;r.seen_w=n.seen_w;r.seen_h=n.seen_h;r.seen_fmt=n.seen_fmt;
     r.st_gated=n.st_gated.load();r.st_full=n.st_full.load();r.st_examined=n.st_examined.load();r.st_no_input=n.st_no_input.load();
     r.st_ambiguous=n.st_ambiguous.load();r.st_draw_state=n.st_draw_state.load();r.st_candidates=n.st_candidates.load();
-    r.st_recorded=n.st_recorded.load();r.st_failed=n.st_failed.load();r.st_ungated_full=n.st_ungated_full.load();r.st_budget=n.st_budget.load();
+    r.st_recorded=n.st_recorded.load();r.st_failed=n.st_failed.load();r.st_ungated_full=n.st_ungated_full.load();r.st_budget=n.st_budget.load();r.st_aux=n.st_aux.load();
     size_t used=0;
     for(uint32_t i=0;i<n.step_count&&used+100<sizeof r.steps;++i){
         const auto& e=n.steps[i];

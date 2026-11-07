@@ -1126,10 +1126,10 @@ void write_status_line()
                 (unsigned long long)native.game_applies,(unsigned long long)native.refusals,(unsigned long long)native.thread_changes,b.reason);
             if(bridge_n>0)WriteFile(f,bridge_line,DWORD((std::min)(bridge_n,int(sizeof bridge_line-1))),&written,nullptr);
             char steps_line[1024];
-            const int steps_n=std::snprintf(steps_line,sizeof steps_line,"native_steps gated=%llu full=%llu examined=%llu no_input=%llu ambiguous=%llu partial=%llu candidates=%llu recorded=%llu failed=%llu ungated_full=%llu budget=%llu steps{%s}\r\n",
+            const int steps_n=std::snprintf(steps_line,sizeof steps_line,"native_steps gated=%llu full=%llu examined=%llu no_input=%llu ambiguous=%llu partial=%llu candidates=%llu recorded=%llu failed=%llu ungated_full=%llu budget=%llu aux=%llu steps{%s}\r\n",
                 (unsigned long long)b.st_gated,(unsigned long long)b.st_full,(unsigned long long)b.st_examined,(unsigned long long)b.st_no_input,
                 (unsigned long long)b.st_ambiguous,(unsigned long long)b.st_draw_state,(unsigned long long)b.st_candidates,(unsigned long long)b.st_recorded,
-                (unsigned long long)b.st_failed,(unsigned long long)b.st_ungated_full,(unsigned long long)b.st_budget,b.steps);
+                (unsigned long long)b.st_failed,(unsigned long long)b.st_ungated_full,(unsigned long long)b.st_budget,(unsigned long long)b.st_aux,b.steps);
             if(steps_n>0)WriteFile(f,steps_line,DWORD((std::min)(steps_n,int(sizeof steps_line-1))),&written,nullptr);
             char trace_text[4096];uint64_t traces=0;na::j2::NativeTraceResult(trace_text,sizeof trace_text,&traces);
             char trace_line[4400];
@@ -3172,10 +3172,10 @@ void game_frame_boundary(ID3D12CommandQueue* queue)
                 (unsigned long long)b.record_failed,(unsigned long long)b.after_skipped,(unsigned long long)b.redirected,(unsigned long long)b.redirect_failed,b.src_w,b.src_h,b.src_fmt,b.seen_w,b.seen_h,b.seen_fmt,
                 (unsigned long long)native.ticks,(unsigned long long)native.applies,(unsigned long long)native.game_applies,(unsigned long long)native.refusals,
                 (unsigned long long)native.thread_changes,native.controlled?1:0,native.confirmed?1:0,b.reason,native.reason);
-            na::eventlog::Emit("native_steps","gated=%llu full=%llu examined=%llu no_input=%llu ambiguous=%llu partial=%llu candidates=%llu recorded=%llu failed=%llu ungated_full=%llu budget=%llu steps{%s}",
+            na::eventlog::Emit("native_steps","gated=%llu full=%llu examined=%llu no_input=%llu ambiguous=%llu partial=%llu candidates=%llu recorded=%llu failed=%llu ungated_full=%llu budget=%llu aux=%llu steps{%s}",
                 (unsigned long long)b.st_gated,(unsigned long long)b.st_full,(unsigned long long)b.st_examined,(unsigned long long)b.st_no_input,
                 (unsigned long long)b.st_ambiguous,(unsigned long long)b.st_draw_state,(unsigned long long)b.st_candidates,(unsigned long long)b.st_recorded,
-                (unsigned long long)b.st_failed,(unsigned long long)b.st_ungated_full,(unsigned long long)b.st_budget,b.steps);
+                (unsigned long long)b.st_failed,(unsigned long long)b.st_ungated_full,(unsigned long long)b.st_budget,(unsigned long long)b.st_aux,b.steps);
         }
     }
     na::settings::WatchChanges("code");

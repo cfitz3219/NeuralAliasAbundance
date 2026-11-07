@@ -23,6 +23,9 @@ inline std::map<std::string, test::FakeParams::Value> last_create, last_eval;
 inline uintptr_t last_eval_handle = 0, next_handle = 0x1000;
 inline bool last_create_injector = false, last_eval_injector = false;
 inline void (*eval_hook)() = nullptr; // runs inside EvaluateFeature (tests of lock ordering)
+// Runs inside a successful EvaluateFeature with its list and parameters, so a test
+// can write recognisable pixels into the real NGX output resource.
+inline void (*eval_output)(ID3D12GraphicsCommandList*, const std::map<std::string, test::FakeParams::Value>&) = nullptr;
 
 inline NVSDK_NGX_Result NVSDK_CONV Optimal(NVSDK_NGX_Parameter* p)
 {
@@ -81,6 +84,7 @@ inline NVSDK_NGX_Result NVSDK_CONV Eval(ID3D12GraphicsCommandList* list, const N
     if (!list || !h) return NVSDK_NGX_Result_FAIL_InvalidParameter;
     last_eval = static_cast<const test::FakeParams*>(p)->values;
     last_eval_handle = reinterpret_cast<uintptr_t>(h);
+    if (eval_output && eval_result == NVSDK_NGX_Result_Success) eval_output(list, last_eval);
     return eval_result;
 }
 inline NVSDK_NGX_Result NVSDK_CONV Release(NVSDK_NGX_Handle* h)
