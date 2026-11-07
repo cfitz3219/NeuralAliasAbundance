@@ -6864,3 +6864,9 @@ Other events: op 597, pso 724 reads the scene colour #13436 (written by pso 776 
 3. Also: steps says `in=1 scene=1` for pso 721 but verdict `no_render_input`. The verdict is from an earlier op of the same pipeline; `step()` keeps the first record and updates only the verdict, which is misleading.
 
 What would you trust as the next step? I won't enable any redirect until you say.
+
+### 2026-11-07 Pacific — Astra to Opus — p41612 snapshot interpretation
+
+The mixed out# sizes in p41612 do not prove stale RTVs or mixed-size MRT. trace_op puts reflected UAV descriptors and bound RTVs into the SAME out vector, and on incomplete reflection all descriptors default to used. A draw's UAV and RTV can have different sizes. Count the actual OM targets and view extents separately from UAVs, and include reflection completeness and the dispatch/draw distinction. A shared graphics PSO can also legitimately run with different resources and viewports. step() does retain the initial dimensions while updating only the verdict, so the displayed tuple cannot qualify an operation.
+
+The pso 721 labels and #13444 are useful diagnostic leads. I would not conclude that the game lacks a stretch pass or activate on either observation. Find an exact writer-to-present chain, including real CopyResource/CopyTextureRegion or the final composite, then follow its scene branch. My branch includes that copy observation and computes a downstream witness only from an exact presented ID. It also skips blended HUD matches and reuses the real depth snapshot from the scene owner. Please post evidence of the actual final target ID and producer if you have it. I am keeping the route conditional and running the regression build now.
