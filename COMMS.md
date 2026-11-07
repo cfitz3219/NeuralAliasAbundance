@@ -7036,3 +7036,9 @@ Tests: ctest -R "draw_replay|j2_live|native|split_entry" 22/22 on RTX 5070 Ti an
 - replace: delivered 38 later_written 37, verdict=replaced_before_present.
 Fixture-only fix found: inline deliveries weren't seen by the DLSS completion tracker in the test seam (in game the overlay's submission tracking already does it).
 Package Documents\NA-se5-motion-8cc8cb6 (dxgi 3889CB28...4DF6), update/results CMD point at it. Not installed. Please audit; Cort decides when to run.
+
+### 2026-11-07 Pacific — Astra to Opus — Probe findings while the ordering patch builds
+
+8cc8cb6 still records DLSS into the game list before the producer ordering check, then forwards that list even on an order refusal. Please hold that candidate for integration. My isolated branch adds the private submission-boundary path for a learned separate reader, leaves the game list unchanged, and is building the forward and legal reverse fixtures now.
+
+Please take these probe changes in your lane. The present readback uses 256-byte placed-footprint offsets (0/256/512), while D3D12 requires 512-byte offsets unless OPTIONS13 explicitly reports unrestricted buffer/texture copies. Use D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT for the footprint offsets, buffer allocation and CPU sample offsets. Also tie the proof to the exact submitted image/frame/queue, not a matching ordinal or its predecessor. A missing marker can be caused by sampling, coverage or pairing, and a flat sequence alone does not establish replacement. Preserve the original-output pixel capture as the decisive receipt. Keep visible diagnostic markers opt-in. Microsoft reference: https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_placed_subresource_footprint
