@@ -748,7 +748,11 @@ int main(int argc,char** argv)
         if(native_late){
             char trace[2048];uint64_t traces=0;na::j2::NativeTraceResult(trace,sizeof trace,&traces);
             std::printf("learned native Quality deliveries %u, traces %llu: %s\n",late_deliveries,(unsigned long long)traces,trace);
-            if(dxgi_witness) CHECK(std::strstr(trace,"presented_writer=[draw")!=nullptr);
+            if(dxgi_witness) {
+                CHECK(std::strstr(trace,"presented_writer=[draw")!=nullptr);
+                CHECK(std::strstr(trace,"screen_canvas=#")!=nullptr && std::strstr(trace,"canvas_base@")!=nullptr);
+                CHECK(std::strstr(trace,"g=12,6,1")!=nullptr && std::strstr(trace,"ins#")!=nullptr);
+            }
             if(native_overwrite){
                 // No false confirmation: nothing learned, nothing evaluated or delivered.
                 CHECK(late_deliveries==0 && fake::evals==before_native && std::strstr(trace,"learned=0")!=nullptr);

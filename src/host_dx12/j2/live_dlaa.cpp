@@ -448,6 +448,7 @@ struct NativeTrace{
     uint64_t inferred=0,inferred_present=0;char inferred_reason[96]{};
     std::vector<uint64_t> full_ids;                  // whole output-size images written in traced ops (cap 64)
     std::atomic<uint64_t> presented_ids[3]{};        // the last distinct presented buffers
+    std::array<uint64_t, 2> last_screen_inputs{};     // diagnostic only, most recently observed first
     std::deque<std::pair<std::pair<uint64_t,uint64_t>,TraceOp>> present_cache; // ops writing a presented buffer, by list recording, in order (cap 64)
     uint64_t cached_used=0,crossing_aux=0,other_queue=0,via_inferred=0;
     char result[4096]{};
@@ -765,6 +766,46 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
         const auto at=std::lower_bound(history.begin(),history.end(),before);
         return at==history.begin() ? ops.size() : *std::prev(at);
     };
+    const auto report_canvas=[&](uint64_t id, size_t before, bool sampled) {
+        // Follow versions of this exact resource, immediately before the read.
+        // An already-observed canvas with no read this frame is a search lead.
+        size_t index=writer(id,before), preserving=0;
+        while (index<ops.size() && ops[index].preserves &&
+            std::any_of(ops[index].out.begin(),ops[index].out.end(),[&](const TraceIo& out) {
+                return out.id==id && out.binding=='r';
+            })) {
+            ++preserving;
+            index=writer(id,index);
+        }
+        add(" %s=#%llu before=%zu preserving=%zu",sampled?"screen_canvas":"prior_canvas",
+            (unsigned long long)id,before,preserving);
+        if (index==ops.size()) {
+            add(" canvas_base=unseen");
+            return;
+        }
+        const auto& base=ops[index];
+        char detail[640]{};
+        trace_describe(detail,sizeof detail,base);
+        add(" canvas_base@%zu=%s base_list=%llu/%llu%s",index,detail,
+            (unsigned long long)base.list,(unsigned long long)base.recording,
+            base.inferred?" base_bindings=unresolved":"");
+    };
+    const size_t screen_index=writer(presented,ops.size());
+    if (screen_index<ops.size()) {
+        const auto& screen=ops[screen_index];
+        std::array<uint64_t, 2> sampled{};
+        size_t count=0;
+        if (screen.reflected || screen.transfer) for (const auto& input : screen.in) {
+            if (count==sampled.size()) break;
+            if (!input.whole || input.id==presented || input.w!=e.ow || input.h!=e.oh ||
+                std::find(sampled.begin(),sampled.end(),input.id)!=sampled.end()) continue;
+            sampled[count++]=input.id;
+            report_canvas(input.id,screen_index,true);
+        }
+        if (count) g_trace.last_screen_inputs=sampled;
+        else for (const auto id : g_trace.last_screen_inputs)
+            if (id && id!=presented) report_canvas(id,screen_index,false);
+    }
     const auto traces_scene=[&](uint64_t id,size_t before) {
         std::vector<std::pair<uint64_t,size_t>> pending{{id,before}};
         std::vector<size_t> visited;
@@ -6238,6 +6279,7 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
             if(g_trace.armed.load()){g_trace.armed.store(false);g_trace.recs.clear();g_trace.frame.clear();}
             g_trace.previous={};g_trace.learned={};g_trace.learned_pso.store(0);
             g_trace.presents=g_trace.armed_at=0;
+            g_trace.last_screen_inputs={};
             return;
         }
         ++g_trace.presents;
@@ -6247,8 +6289,9 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
             g_trace.presented_ids[0].store(id);
         }
         if(!g_trace.armed.load()){
-            // First trace ~2 s after the scene is reduced, then every ~15 s.
-            if(g_trace.presents-g_trace.armed_at>=(g_trace.learned_pso.load()?900u:30u)){
+            // A multiple of two or three locks the trace onto one swapchain
+            // image and can miss alternating passes. Walk the buffer rotation.
+            if(g_trace.presents-g_trace.armed_at>=(g_trace.learned_pso.load()?901u:31u)){
                 g_trace.recs.clear();g_trace.frame.clear();g_trace.frames=0;g_trace.untraced=g_trace.traced_lists=0;g_trace.ops=0;g_trace.untraced_lists.clear();
                 g_trace.armed_at=g_trace.presents;g_trace.armed.store(true);
             }
