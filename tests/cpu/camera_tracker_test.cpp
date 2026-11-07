@@ -195,6 +195,24 @@ int main()
              const CameraFrame wf = z.Update(Mul(wide, View(0, 0, 0, 0)), 4, W, H);
              CHECK(wf.camera_cut && wf.cut_reason == 5);
          }},
+        {"confirm_cuts: a one-frame camera jump is held without a reset; a lasting one resets a frame later", [] {
+             CameraTracker t;
+             const Matrix p = Perspective(true, 1.0);
+             CameraTracker::Limits lim{};lim.confirm_cuts = true;
+             CHECK(t.Update(Mul(p, View(0, 0, 0, 0)), 1, W, H, nullptr, lim).camera_cut);
+             CHECK(!t.Update(Mul(p, View(0.01, 0.2, 0, 0)), 2, W, H, nullptr, lim).camera_cut);
+             // blip: another camera for one frame, then back
+             const auto blip = t.Update(Mul(p, View(0.01, 200, 0, 0)), 3, W, H, nullptr, lim);
+             CHECK(blip.valid && !blip.camera_cut && blip.cut_deferred && blip.cut_reason == 3);
+             const auto back = t.Update(Mul(p, View(0.01, 0.4, 0, 0)), 4, W, H, nullptr, lim);
+             CHECK(back.valid && !back.camera_cut && !back.cut_deferred);
+             // real teleport: held one frame, reset on the next
+             const auto first = t.Update(Mul(p, View(0.01, 300, 0, 0)), 5, W, H, nullptr, lim);
+             CHECK(!first.camera_cut && first.cut_deferred);
+             const auto confirmed = t.Update(Mul(p, View(0.01, 300.2, 0, 0)), 6, W, H, nullptr, lim);
+             CHECK(confirmed.camera_cut && !confirmed.cut_deferred);
+             CHECK(!t.Update(Mul(p, View(0.01, 300.4, 0, 0)), 7, W, H, nullptr, lim).camera_cut);
+         }},
         {"previous-frame matrix for motion is the last unjittered camera, or the current one on a cut", [] {
              const Matrix p = Perspective(true, 1.0);
              CameraTracker t;

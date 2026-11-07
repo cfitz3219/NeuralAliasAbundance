@@ -2563,6 +2563,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (tracker_restart) pending.tracker.Reset();
     na::camera::CameraTracker::Limits lim{};
     lim.max_frame_gap = max_gap;
+    lim.confirm_cuts = true; // a one-frame camera jump is held, not reset (f905099: 418 motion cuts)
     if (g.submitted_frame && g.frame > g.submitted_frame + 1) { // per-frame motion limits over the whole step
         const double steps = static_cast<double>((std::min)(g.frame - g.submitted_frame, max_gap));
         lim.max_translation *= steps;
@@ -2582,6 +2583,10 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         g.cam_u1 = cam.unjittered; g.cam_f1 = g.frame; g.cam_rev = reversed;
     }
     pending.cut = cam.camera_cut;
+    if (cam.cut_deferred) {
+        static const char* const kHeld[] = {"none", "no_history", "gap", "translation", "rotation", "fov", "origin"};
+        na::eventlog::Emit("camera_cut_held", "why=%s value=%.4g", kHeld[cam.cut_reason < 7 ? cam.cut_reason : 0], cam.cut_value);
+    }
     if (cam.camera_cut) { // Cort 2026-11-02: an on/off blink every ~30 s matched cuts while standing still: record why
         static const char* const kWhy[] = {"none", "no_history", "gap", "translation", "rotation", "fov", "origin"};
         const char* why = tracker_restart ? (g.resume_reset ? "restart_resume" : "restart_gap") : kWhy[cam.cut_reason < 7 ? cam.cut_reason : 0];
