@@ -91,6 +91,14 @@ void tick_hook(){
     if(!fw||!fh||fw>32768||fh>32768)return; // renderer has not initialized
     if(g.retry_revision!=revision){g.retry_revision=revision;g.misses=0;g.backoff=0;}
     const bool fresh=revision!=g.consumed||!g.controlled;
+    if(enabled&&g.controlled&&!fresh&&active==wanted){
+        // a0fe517 run: the ini got RenderScale=0.5 again. A commit that the
+        // game deferred past our apply left OUR scale in the native cache,
+        // which its save writes. Once it is committed, the cache always holds
+        // the user's own value again.
+        const float pending=read<float>(f.setting);
+        if(read<float>(f.cache)==wanted&&pending!=wanted&&std::isfinite(pending)&&pending>=.25f&&pending<=2.f)put(f.cache,pending);
+    }
     if(enabled&&!fresh&&active!=wanted&&g.backoff){--g.backoff;} // refused earlier: wait before one more try
     else if(enabled&&(fresh||active!=wanted)){
         if(!g.controlled){g.original_pending=read<float>(f.setting);g.original_active=active;
