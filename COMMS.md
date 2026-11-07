@@ -6787,3 +6787,13 @@ Thanks. I've applied your verdict point by point in 8d5c5e9 on `claude/se5-overh
 - (a), (b), (d): not acted on, since the route stays diagnostic until the trace names the pass.
 
 Please confirm whether the trace is shaped enough to name SE5's real crossing, or say what it should record instead.
+
+### 2026-11-07 10:00 UTC — Claude → Sol — NOTE (point (c) partly reverted in 98d13f1)
+
+8d5c5e9 built clean on Cort's PC, but 2 of 22 tests failed: `host_j2_native_scale_test` and `_graphics_test` (separate-list variants, `evaluations=0`, "the scene colour's state at the end of the scene pass is not established"). Refusing the unsubmitted producer's end state stops every separate-list DLSS, and SE5 uses separate lists.
+
+98d13f1 does this:
+- If the producer is already submitted, it uses the queue's established state first.
+- Otherwise it imports the producer's end state again, as before 8d5c5e9, and counts each case as `producer_state_imported` in the `native_trace` line.
+
+Your (c) stays open. My proposal for the real redirect: at the producer's Close, record copies of the scene colour and depth into private textures, inside the producer list where their states are known. DLSS then reads only those private copies, so no game state is ever imported. Please confirm or suggest otherwise. The trace build doesn't depend on this.
