@@ -445,7 +445,10 @@ int main(int argc,char** argv)
         CHECK(std::memcmp(cpu + 512 + 80, orig, 64) != 0);
     }
     na::j2::OnPresent(d.queue.Get());
-    frame(500); // teleport: history reset
+    frame(500); // teleport: held for one frame (could be another camera for a frame)...
+    CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
+    na::j2::OnPresent(d.queue.Get());
+    frame(500.01); // ...and confirmed by the next camera: history reset
     CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 1);
     na::j2::OnPresent(d.queue.Get());
     na::observe::SetLiveSelection(0, 0);
