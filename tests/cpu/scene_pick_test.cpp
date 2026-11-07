@@ -81,6 +81,20 @@ int main() {
             CHECK(q.Publish(w2, false) == PickReason::retired);
             CHECK(q.depth == 0);
         }},
+        {"retired votes neither win nor block a current replacement", [] {
+            DepthWindow w; DepthPick p;
+            frames(w, kScene, 16); p.Publish(w, true);
+            frames(w, 0, 2);
+            frames(w, kOther, 7);
+            CHECK(p.Publish(w, false) == PickReason::retired);
+            CHECK(p.depth == kOther);
+
+            DepthWindow w2; DepthPick q;
+            frames(w2, kScene, 16); q.Publish(w2, true);
+            frames(w2, kOther, 1);
+            CHECK(q.Publish(w2, false) == PickReason::retired);
+            CHECK(q.depth == 0);
+        }},
         {"a long absence clears after eight publications", [] {
             DepthWindow w; DepthPick p;
             frames(w, kScene, 16); p.Publish(w, true);
