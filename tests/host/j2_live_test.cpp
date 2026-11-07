@@ -178,6 +178,10 @@ int main(int argc,char** argv)
     // SE5 shape (p49436): the pass writing the presented image has bindings the
     // trace cannot snapshot (here an unbounded table), and the picture is not SDR.
     const bool native_se5=argc>1&&std::strstr(argv[1],"se5")!=nullptr;
+    // p51016: the presenting pass is a compute dispatch reading a runtime-indexed bindless
+    // array (unreadable): the crossing is learned only through the screen probe, and the
+    // decoy upscale earlier in the frame must be refuted first.
+    const bool native_bindless=native_se5&&argc>1&&std::strstr(argv[1],"bindless")!=nullptr;
     const bool nvrhi=argc>1&&std::strcmp(argv[1],"--nvrhi")==0;
     if(nvrhi&&!na::gpu::GetStats().built)return test::kSkip;
     na::gpu::SetBackendForTests(nvrhi?na::gpu::TestBackend::Nvrhi:na::gpu::TestBackend::Native);
@@ -355,7 +359,7 @@ int main(int argc,char** argv)
             decoy=test::CreateTexture(dev,OW,OH,format,D3D12_RESOURCE_STATE_COMMON,flags);
             // SE5: the presented image is FP16 (p49436 swap chain format 10).
             presented=test::CreateTexture(dev,OW,OH,native_se5?DXGI_FORMAT_R16G16B16A16_FLOAT:format,D3D12_RESOURCE_STATE_COMMON,
-                native_composite?D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET:D3D12_RESOURCE_FLAG_NONE);
+                native_composite?D3D12_RESOURCE_FLAGS(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET|(native_se5?D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS:D3D12_RESOURCE_FLAG_NONE)):D3D12_RESOURCE_FLAG_NONE);
             REQUIRE(late&&decoy&&presented);
             // SE5: a smaller auxiliary input of the upscale step (#13990 1146x480/10).
             if(native_se5){aux=test::CreateTexture(dev,W/2,H/2,DXGI_FORMAT_R16G16B16A16_FLOAT,D3D12_RESOURCE_STATE_COMMON,flags);REQUIRE(aux);}
@@ -495,6 +499,31 @@ int main(int argc,char** argv)
             D3D12_COMPUTE_PIPELINE_STATE_DESC c{};c.pRootSignature=se5_root.Get();c.CS={cs->GetBufferPointer(),cs->GetBufferSize()};
             REQUIRE(SUCCEEDED(dev->CreateComputePipelineState(&c,IID_PPV_ARGS(&se5_upscale))));
         }
+        // Bindless presenting dispatch: t0[] unbounded (runtime index from a root
+        // constant) starting at descriptor 6 (the game's image; 13 = decoy), u0 at 15.
+        test::ComPtr<ID3D12RootSignature> bindless_root;test::ComPtr<ID3D12PipelineState> bindless_present;
+        if(native_bindless){
+            const auto base=heap->GetCPUDescriptorHandleForHeapStart().ptr;
+            D3D12_UNORDERED_ACCESS_VIEW_DESC pu{};pu.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;pu.ViewDimension=D3D12_UAV_DIMENSION_TEXTURE2D;
+            dev->CreateUnorderedAccessView(presented.Get(),nullptr,&pu,{base+15*increment});
+            D3D12_DESCRIPTOR_RANGE brs[2]{{D3D12_DESCRIPTOR_RANGE_TYPE_SRV,UINT_MAX,0,0,0},{D3D12_DESCRIPTOR_RANGE_TYPE_UAV,1,0,0,0}};
+            D3D12_ROOT_PARAMETER ps[3]{};
+            ps[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;ps[0].DescriptorTable={1,&brs[0]};
+            ps[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;ps[1].DescriptorTable={1,&brs[1]};
+            ps[2].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;ps[2].Constants={0,0,1};
+            D3D12_ROOT_SIGNATURE_DESC rd{3,ps,0,nullptr,D3D12_ROOT_SIGNATURE_FLAG_NONE};
+            serialized.Reset();
+            REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rd,D3D_ROOT_SIGNATURE_VERSION_1,&serialized,&error)));
+            REQUIRE(SUCCEEDED(dev->CreateRootSignature(0,serialized->GetBufferPointer(),serialized->GetBufferSize(),IID_PPV_ARGS(&bindless_root))));
+            const char bl[]=R"(Texture2D<float4> imgs[]:register(t0);RWTexture2D<float4> o:register(u0);cbuffer C:register(b0){uint idx;};
+                [numthreads(8,8,1)]void main(uint3 p:SV_DispatchThreadID){if(p.x<96&&p.y<48){float4 c=imgs[NonUniformResourceIndex(idx)].Load(int3(p.xy,0));o[p.xy]=float4(pow(c.rgb,2.2),c.a);}})";
+            test::ComPtr<ID3DBlob> cs;
+            const HRESULT hr=D3DCompile(bl,sizeof bl,"bindless_present",nullptr,nullptr,"main","cs_5_1",D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES,0,&cs,&error);
+            if(FAILED(hr)&&error)std::printf("%s\n",static_cast<const char*>(error->GetBufferPointer()));
+            REQUIRE(SUCCEEDED(hr));
+            D3D12_COMPUTE_PIPELINE_STATE_DESC c{};c.pRootSignature=bindless_root.Get();c.CS={cs->GetBufferPointer(),cs->GetBufferSize()};
+            REQUIRE(SUCCEEDED(dev->CreateComputePipelineState(&c,IID_PPV_ARGS(&bindless_present))));
+        }
         const bool native_overwrite=native_se5&&argc>1&&std::strstr(argv[1],"overwrite")!=nullptr;
         // Negative: the upscale list is submitted BEFORE its scene producer.
         const bool native_reverse=native_se5&&argc>1&&std::strstr(argv[1],"reverse")!=nullptr;
@@ -514,7 +543,7 @@ int main(int argc,char** argv)
         na::j2::SetNativeRenderExtent(W,H,OW,OH);na::j2::SetDebugView(native_se5?0:3); // 3: known black depth output, alpha1; SE5: the normal output
         const int before_native=fake::evals;
         const unsigned iterations=native_se5?100u:native_late?68u:3u;
-        if(native_se5)na::j2::RequestDeliveryProbe();
+        if(native_se5&&!native_bindless)na::j2::RequestDeliveryProbe();
         unsigned late_deliveries=0;
         for(unsigned iteration=0;iteration<iterations;++iteration){
             d.WaitIdle();na::j2::OnPresent(d.queue.Get());
@@ -646,6 +675,23 @@ int main(int argc,char** argv)
                     // known) and long before any trace window; executed every frame.
                     final_list.Reset();
                     auto* fl=final_list.list.Get();
+                    if(native_bindless){
+                        D3D12_RESOURCE_BARRIER bb[2]{test::Transition(native.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                            test::Transition(presented.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS)};
+                        fl->ResourceBarrier(2,bb);
+                        ID3D12DescriptorHeap* hh[]{heap.Get()};fl->SetDescriptorHeaps(1,hh);
+                        fl->SetComputeRootSignature(bindless_root.Get());fl->SetPipelineState(bindless_present.Get());
+                        const auto gbase=heap->GetGPUDescriptorHandleForHeapStart().ptr;
+                        fl->SetComputeRootDescriptorTable(0,{gbase+6*increment});fl->SetComputeRootDescriptorTable(1,{gbase+15*increment});
+                        fl->SetComputeRoot32BitConstant(2,0,0); // runtime index 0: the game's image
+                        fl->Dispatch(12,6,1);
+                        for(auto& x:bb)std::swap(x.Transition.StateBefore,x.Transition.StateAfter);
+                        fl->ResourceBarrier(2,bb);
+                        REQUIRE(SUCCEEDED(fl->Close()));final_recorded=true;
+                    }
+                }
+                if(!final_recorded){
+                    auto* fl=final_list.list.Get();
                     D3D12_RESOURCE_BARRIER b[3]{test::Transition(native.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
                         test::Transition(decoy.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
                         test::Transition(presented.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_RENDER_TARGET)};
@@ -729,7 +775,14 @@ int main(int argc,char** argv)
             if(native_se5)std::printf("se5 delivery: delivered %llu first %llu best_streak %llu order_refused %llu later_written %llu probe{%s} refusals{%s}\n",
                 (unsigned long long)nbs.delivered,(unsigned long long)nbs.first_delivery_frame,(unsigned long long)nbs.best_streak,
                 (unsigned long long)nbs.order_refused,(unsigned long long)nbs.later_written,nbs.probe,nbs.refusals);
-            if(native_stale){
+            if(native_bindless){
+                // Unreadable presenting dispatch: the decoy crossing was refuted by the
+                // screen probe, the game's upscale step confirmed, then delivered.
+                std::printf("se5 bindless: deliveries %u probe{%s} trace{%s}\n",late_deliveries,nbs.probe,trace);
+                CHECK(std::strstr(trace,"presented_writer=none")!=nullptr && std::strstr(trace,"refuted=1")!=nullptr);
+                CHECK(std::strstr(nbs.probe,"verified=1")!=nullptr && std::strstr(nbs.probe,"refuted=1")!=nullptr);
+                CHECK(late_deliveries>=2);
+            }else if(native_stale){
                 std::printf("se5 stale: overwrite from iteration %u, deliveries %u, stages{%s}\n",stale_from,late_deliveries,nbs.stages);
                 CHECK(stale_from>0 && late_deliveries>=5);
                 CHECK(std::strstr(trace,"invalidations=0 ")==nullptr && std::strstr(trace,"learned=0")!=nullptr);
@@ -755,8 +808,8 @@ int main(int argc,char** argv)
                     // Learned through the once-recorded presenting list (cached, last write),
                     // with the typed UNORM -> FP16 handoff named.
                     // (stale: the last trace is the invalidating one, without a crossing)
-                    if(!native_stale)CHECK(std::strstr(trace,"handoff=[")!=nullptr && std::strstr(trace,"transfer=shader_defined")!=nullptr);
-                    CHECK(std::strstr(trace,"cached=0 ")==nullptr);
+                    if(!native_stale&&!native_bindless)CHECK(std::strstr(trace,"handoff=[")!=nullptr && std::strstr(trace,"transfer=shader_defined")!=nullptr);
+                    if(!native_bindless)CHECK(std::strstr(trace,"cached=0 ")==nullptr);
                     CHECK(g_pattern_writes>=int(late_deliveries));
                     // Deliveries on frames with the auxiliary input were counted.
                     const auto nb=na::j2::GetNativeBridgeStats();
