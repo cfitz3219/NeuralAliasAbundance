@@ -118,6 +118,11 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
         na::observe::SetDrawReplay(frame == 2 ? 0 : frame, retain);
         const D3D12_VIEWPORT vp{0, 0, float(w), float(h), 0, 1};
         const D3D12_RECT sc{0, 0, 14, h};
+        // Nothing replayed yet this frame: no list can take it. (Once a draw is
+        // replayed, any list may take it: an unsubmitted writer is checked on
+        // the GPU by its stamp, see the cross-list case below.)
+        na::observe::ReplayFrame wrong;
+        CHECK(!na::observe::ReplayTakeFrame(other.list.Get(), d.queue.Get(), &wrong));
         list.list->SetGraphicsRootSignature(root.Get());
         const float shift = float(frame % 2) / (w / 2.f);
         list.list->SetGraphicsRoot32BitConstants(0, 1, &shift, 0);
@@ -132,8 +137,6 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
         list.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, .25f, 0, 1, &occluded);
         auto to_read = test::Transition(depth.Get(), depth_write, npsr);
         list.list->ResourceBarrier(1, &to_read);
-        na::observe::ReplayFrame wrong;
-        CHECK(!na::observe::ReplayTakeFrame(other.list.Get(), d.queue.Get(), &wrong));
         const na::j2::replay_motion::Output output = [&] {
             const na::observe::HostWorkScope host;
             return pass.Record(list.list.Get(), d.queue.Get(), depth.Get(), w, h, false, false, jitter);
@@ -284,7 +287,9 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
             g->RSSetScissorRects(1, &sc);
             g->DrawInstanced(3, 1, 0, 0);
             auto to_read = test::Transition(depth.Get(), depth_write, npsr);
-            g->ResourceBarrier(1, &to_read);
+            // 208 runs J2's list first: the depth hand-over moves into J2's list.
+            if (frame != 208) g->ResourceBarrier(1, &to_read);
+            else post.list->ResourceBarrier(1, &to_read);
             REQUIRE(SUCCEEDED(g->Close()));
             // 205: geometry submitted after J2 recorded, before J2's list runs.
             // 208: geometry submitted after J2's list ran (its positions are stale).
