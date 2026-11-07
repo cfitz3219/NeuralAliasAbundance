@@ -404,7 +404,7 @@ struct NativeTrace{
     std::mutex m;std::atomic<bool> armed{false};
     uint32_t frames=0,untraced=0,traced_lists=0;uint64_t ops=0,traces=0,presents=0,armed_at=0;
     std::map<std::pair<uint64_t,uint64_t>,std::vector<TraceOp>> recs;std::vector<TraceOp> frame;
-    char result[1800]{};
+    char result[4096]{};
 };
 NativeTrace& g_trace=*new NativeTrace;
 constexpr uint64_t kTraceOps=60000;
@@ -459,6 +459,16 @@ int trace_describe(char* out,size_t n,const TraceOp& t){
     if(used+2<n){out[used++]=']';out[used]=0;}
     return int(used);
 }
+DXGI_FORMAT typed(DXGI_FORMAT f);
+bool trace_colour(uint32_t f){
+    switch(typed(DXGI_FORMAT(f))){
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:case DXGI_FORMAT_R32G32B32A32_FLOAT:case DXGI_FORMAT_R32G32B32_FLOAT:
+    case DXGI_FORMAT_R11G11B10_FLOAT:case DXGI_FORMAT_R10G10B10A2_UNORM:case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:case DXGI_FORMAT_B8G8R8A8_UNORM:case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R9G9B9E5_SHAREDEXP:case DXGI_FORMAT_R16G16B16A16_UNORM:return true;
+    default:return false;
+    }
+}
 void trace_analyze(uint64_t presented){
     NativeExtent e;{std::lock_guard<std::mutex> lock(g_up_m);e=g_native_extent;}
     auto& f=g_trace.frame;char* r=g_trace.result;const size_t n=sizeof g_trace.result;size_t used=0;
@@ -472,17 +482,21 @@ void trace_analyze(uint64_t presented){
     uint64_t last_pso=0;uint32_t repeats=0;
     for(int step=0;step<1500&&at>=0;++step){
         const auto& t=f[size_t(at)];
-        // Runs of the same pipeline (UI elements) are summarised, not listed.
-        if(step&&t.pso==last_pso){++repeats;}
+        bool full_out=false,small_in=false;
+        for(const auto& o:t.out)full_out|=o.w==e.ow&&o.h==e.oh;
+        // 76446d2 run: a UI draw reading some render-size non-colour plane was taken as
+        // the crossing. Only a render-size COLOUR input counts.
+        for(const auto& i:t.in)small_in|=i.w==e.rw&&i.h==e.rh&&trace_colour(i.vfmt?i.vfmt:i.fmt);
+        const bool crossing=full_out&&small_in;
+        // Runs of the same pipeline (UI elements) are summarised, not listed; the
+        // crossing op is always described in full.
+        if(step&&t.pso==last_pso&&!crossing){++repeats;}
         else{
             if(repeats){add(" (x%u more)",repeats);repeats=0;}
             if(used+8<n){used+=size_t(trace_describe(r+used,n-used,t));}
         }
         last_pso=t.pso;
-        bool full_out=false,small_in=false;
-        for(const auto& o:t.out)full_out|=o.w==e.ow&&o.h==e.oh;
-        for(const auto& i:t.in)small_in|=i.w==e.rw&&i.h==e.rh;
-        if(full_out&&small_in){add(" <CROSSING op=%d>",at);break;}
+        if(crossing){add(" <CROSSING op=%d>",at);break;}
         // Next: the most relevant input written earlier in the frame (same size as this
         // op's output first, then render size, then any).
         // 98d13f1 run: the walk started at a blended HUD draw and stopped (its inputs are
@@ -503,7 +517,37 @@ void trace_analyze(uint64_t presented){
         if(next<0){add(" <inputs not written by a traced op>");break;}
         if(f[size_t(next)].pso!=t.pso)add(" <-");at=next;
     }
+    if(repeats)add(" (x%u more)",repeats);
     add("}");
+    // Sol 697b223: every render-size -> full-size colour pass of this frame, with where
+    // its output goes next (the later ops that read or overwrite it), so the step that
+    // really carries the scene to the screen can be told apart from bloom or UI.
+    uint32_t listed=0;
+    for(size_t k=0;k<f.size()&&listed<4;++k){
+        const auto& t=f[k];
+        const TraceIo* big=nullptr;const TraceIo* smallin=nullptr;
+        for(const auto& o:t.out)if(o.w==e.ow&&o.h==e.oh)big=&o;
+        for(const auto& i:t.in)if(i.w==e.rw&&i.h==e.rh&&trace_colour(i.vfmt?i.vfmt:i.fmt))smallin=&i;
+        if(!big||!smallin)continue;
+        ++listed;add(" crossing_candidate{op=%zu ",k);
+        if(used+8<n)used+=size_t(trace_describe(r+used,n-used,t));
+        // Who wrote its input (the render-size image) and who reads its output.
+        int src=-1;for(int j=int(k)-1;j>=0&&src<0;--j)for(const auto& o:f[size_t(j)].out)if(o.id==smallin->id){src=j;break;}
+        if(src>=0){add(" input_from=");if(used+8<n)used+=size_t(trace_describe(r+used,n-used,f[size_t(src)]));}
+        uint32_t readers=0;uint64_t prev=0;
+        for(size_t j=k+1;j<f.size()&&readers<4;++j){
+            bool reads=false,writes=false;
+            for(const auto& i:f[j].in)reads|=i.id==big->id;
+            for(const auto& o:f[j].out)writes|=o.id==big->id;
+            if(!reads&&!writes)continue;
+            if(f[j].pso==prev)continue;prev=f[j].pso;++readers;
+            add(" %s@%zu=",reads?"read_by":"written_by",j);
+            if(used+8<n)used+=size_t(trace_describe(r+used,n-used,f[j]));
+        }
+        if(!readers)add(" output_unused_this_frame");
+        add("}");
+    }
+    if(!listed)add(" crossing_candidates{none}");
 }
 void native_reject(std::atomic<uint64_t>& counter,const char* why){
     counter.fetch_add(1,std::memory_order_relaxed);
