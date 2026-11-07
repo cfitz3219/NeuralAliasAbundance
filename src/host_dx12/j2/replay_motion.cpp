@@ -236,8 +236,10 @@ Output Pass::Record(ID3D12GraphicsCommandList* l, ID3D12CommandQueue* q, ID3D12R
     const auto SO = D3D12_RESOURCE_STATE_STREAM_OUT;
     // cur was written by this frame's lists (STREAM_OUT); prev decayed to COMMON after the frame
     // before and is promoted to a read state here.
-    D3D12_RESOURCE_BARRIER b[4] = {tr(f.cur, SO, NPSR), tr(depth, NPSR, NPSR | PSR), tr(motion_.Get(), NPSR, RT), tr(valid_.Get(), NPSR, RT)};
-    l->ResourceBarrier(4, b);
+    // cur is in STREAM_OUT only when this list wrote positions itself; positions
+    // of other (already submitted) lists are in COMMON and promote to a read state.
+    D3D12_RESOURCE_BARRIER b[4] = {tr(depth, NPSR, NPSR | PSR), tr(motion_.Get(), NPSR, RT), tr(valid_.Get(), NPSR, RT), tr(f.cur, SO, NPSR)};
+    l->ResourceBarrier(f.cur_in_list ? 4 : 3, b);
 
     D3D12_CPU_DESCRIPTOR_HANDLE h = srv_->GetCPUDescriptorHandleForHeapStart();
     h.ptr += static_cast<SIZE_T>(set) * 3 * srv_stride_;
@@ -279,8 +281,8 @@ Output Pass::Record(ID3D12GraphicsCommandList* l, ID3D12CommandQueue* q, ID3D12R
         l->DrawInstanced(p.verts, 1, 0, 0);
         stats_.verts += p.verts;
     }
-    D3D12_RESOURCE_BARRIER a[4] = {tr(f.cur, NPSR, SO), tr(depth, NPSR | PSR, NPSR), tr(motion_.Get(), RT, NPSR), tr(valid_.Get(), RT, NPSR)};
-    l->ResourceBarrier(4, a);
+    D3D12_RESOURCE_BARRIER a[4] = {tr(depth, NPSR | PSR, NPSR), tr(motion_.Get(), RT, NPSR), tr(valid_.Get(), RT, NPSR), tr(f.cur, NPSR, SO)};
+    l->ResourceBarrier(f.cur_in_list ? 4 : 3, a);
     ++stats_.fed;
     out.motion = motion_.Get();
     out.valid = valid_.Get();

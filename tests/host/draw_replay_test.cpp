@@ -254,6 +254,57 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
         CHECK(fed_frames >= 14);
         CHECK(after.not_ready == before.not_ready);
     }
+    // f905099 run (take_other_list=12792): SE5 draws its geometry on one list
+    // and J2 records on a later one. Positions of an already submitted list
+    // must reach J2's list; an unsubmitted one must not.
+    {
+        test::List geo, post;
+        REQUIRE(geo.Create(dev) && post.Create(dev));
+        REQUIRE(SUCCEEDED(geo.list->Close()) && SUCCEEDED(post.list->Close()));
+        uint32_t fed_frames = 0, unsubmitted_fed = 0;
+        for (uint32_t frame = 200; frame < 212; ++frame) {
+            na::nr::native::Reset(geo.list.Get());geo.Reset();
+            na::nr::native::Reset(post.list.Get());post.Reset();
+            const float jitter[2] = { frame % 2 ? .375f : -.25f, frame % 2 ? -.375f : .25f };
+            na::observe::SetSceneViewportJitter(frame, jitter[0], jitter[1]);
+            na::observe::SetDrawReplay(frame, retain);
+            const D3D12_VIEWPORT vp{0, 0, float(w), float(h), 0, 1};
+            const D3D12_RECT sc{0, 0, 14, h};
+            auto* g = geo.list.Get();
+            g->SetGraphicsRootSignature(root.Get());
+            const float shift = float(frame % 2) / (w / 2.f);
+            g->SetGraphicsRoot32BitConstants(0, 1, &shift, 0);
+            g->SetPipelineState(pso.Get());
+            g->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            g->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+            g->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1, 0, 0, nullptr);
+            g->RSSetViewports(1, &vp);
+            g->RSSetScissorRects(1, &sc);
+            g->DrawInstanced(3, 1, 0, 0);
+            auto to_read = test::Transition(depth.Get(), depth_write, npsr);
+            g->ResourceBarrier(1, &to_read);
+            REQUIRE(SUCCEEDED(g->Close()));
+            const bool submit_first = frame != 205; // one frame: J2 records before the geometry list is submitted
+            ID3D12CommandList* gl[] = {g};
+            if (submit_first) { na::nr::native::Submission s1(d.queue.Get(), 1, gl); d.queue->ExecuteCommandLists(1, gl); }
+            const na::j2::replay_motion::Output output = [&] {
+                const na::observe::HostWorkScope host;
+                return pass.Record(post.list.Get(), d.queue.Get(), depth.Get(), w, h, false, false, jitter);
+            }();
+            if (output.motion) { if (submit_first) ++fed_frames; else ++unsubmitted_fed; }
+            std::swap(to_read.Transition.StateBefore, to_read.Transition.StateAfter);
+            post.list->ResourceBarrier(1, &to_read);
+            REQUIRE(SUCCEEDED(post.list->Close()));
+            if (!submit_first) { na::nr::native::Submission s1(d.queue.Get(), 1, gl); d.queue->ExecuteCommandLists(1, gl); }
+            ID3D12CommandList* pl[] = {post.list.Get()};
+            { na::nr::native::Submission s2(d.queue.Get(), 1, pl); d.queue->ExecuteCommandLists(1, pl); }
+            d.WaitIdle();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        std::printf("geometry on another list: motion on %u frames (9 expected), unsubmitted fed %u\n", fed_frames, unsubmitted_fed);
+        CHECK(fed_frames >= 9);   // 200 has no previous; 205 is unsubmitted; 206 follows it
+        CHECK(unsubmitted_fed == 0);
+    }
     test::ComPtr<ID3D12InfoQueue> messages;
     if (debug && SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&messages)))) {
         std::puts("D3D12 debug layer enabled.");

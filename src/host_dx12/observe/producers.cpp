@@ -4546,7 +4546,7 @@ void replay_probe_draw(GL* l, UINT count, UINT instances, bool indexed)
 // each draw to its twin of the frame before and rasterises the difference: exact per-object motion
 // (skinned characters too), the data a game with DLSS built in hands NVIDIA. Generic: no game data.
 // Slot layout: kRpCounters filled-size counters (16 bytes each), then float4 positions.
-constexpr uint32_t kRpSlots = 3, kRpCounters = 8192;
+constexpr uint32_t kRpSlots = 3, kRpCounters = 8192, kRpBlock = 256; // counters zeroed per list, a block at a time
 constexpr uint64_t kRpCounterBytes = uint64_t(kRpCounters) * 16, kRpBytes = 48ull << 20;
 struct SoTwin {
     Microsoft::WRL::ComPtr<ID3D12RootSignature> rs, replay_root;
@@ -4572,16 +4572,33 @@ std::atomic<ReplayRetain> g_rp_retain{nullptr};
 std::mutex g_replay_slots_m;
 struct RpSlot {
     Microsoft::WRL::ComPtr<ID3D12Resource> buf;
-    std::shared_ptr<ReplayUse> writer, reader;
-    uint64_t frame = 0, list_id = 0, recording = 0, verts = 0;
+    // 2026-11-07 (f905099 run: take_other_list=12792): SE5 draws its geometry on
+    // other command lists than the one J2 records on. A frame's slot therefore
+    // holds one segment per writing list recording, each with its own counter
+    // blocks (zeroed inside that list) and its own lease.
+    struct Seg {
+        std::shared_ptr<ReplayUse> writer;
+        uint64_t list_id = 0, recording = 0;
+        uint32_t block_end = 0, next_counter = 0;
+        bool stream_out = false; // the buffer is in STREAM_OUT in this list (leaves to COMMON at Close)
+        std::vector<ReplayRecord> draws;
+    };
+    std::shared_ptr<ReplayUse> reader;
+    uint64_t frame = 0, verts = 0;
+    uint32_t counters = 0;
     bool sealed = false;
-    std::vector<ReplayRecord> draws;
+    std::vector<Seg> segs;
+    bool Free() const {
+        if (reader && !reader->Completed()) return false;
+        for (const auto& x : segs) if (x.writer && !x.writer->Completed()) return false;
+        return true;
+    }
 };
 RpSlot& rp_slot(uint32_t i) { static RpSlot* s = new RpSlot[kRpSlots]; return s[i]; }
 std::atomic<uint64_t> g_rp_stat[24]; // see DrawReplayStats
 enum : uint32_t { kRpReplayed, kRpVerts, kRpNoTwin, kRpBuilding, kRpFailedTwin, kRpOverflow, kRpTopology, kRpStages, kRpUntwinned,
                   kRpNoRecipe, kRpNotReady, kRpBuilt, kRpBuildFailed, kRpNoted, kRpHashMismatch, kRpOtherList,
-                  kRpTakeUnclaimed, kRpTakeOtherList, kRpTakeSealed, kRpTaken, kRpStatCount };
+                  kRpTakeUnclaimed, kRpTakeOtherList, kRpTakeSealed, kRpTaken, kRpSegments, kRpPendingSegs, kRpStatCount };
 static_assert(kRpStatCount <= 24, "g_rp_stat size");
 void rp_count(uint32_t k, uint64_t n = 1) { g_rp_stat[k].fetch_add(n, std::memory_order_relaxed); }
 
@@ -4695,6 +4712,28 @@ bool rp_ensure_buffers()
             D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_rp_zeros)))) return false;
     g_rp_bufs_ok.store(true, std::memory_order_release);
     return true;
+}
+// Close of any list that wrote replay positions: leave the slot buffer in COMMON
+// so the next list (in this or a later ExecuteCommandLists) starts from a known state.
+void replay_on_close(GL* l)
+{
+    if (!g_rp_bufs_ok.load(std::memory_order_acquire)) return;
+    const uint64_t recording = ListRecording(l);
+    if (!recording) return;
+    const uint64_t list_id = IdOf(l);
+    std::lock_guard<std::mutex> lock(g_replay_slots_m);
+    for (uint32_t i = 0; i < kRpSlots; ++i) {
+        auto& slot = rp_slot(i);
+        for (auto& x : slot.segs) if (x.stream_out && x.list_id == list_id && x.recording == recording) {
+            const HostWorkScope own;
+            D3D12_RESOURCE_BARRIER barrier{};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition = {slot.buf.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                  D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COMMON};
+            l->ResourceBarrier(1, &barrier);
+            x.stream_out = false;
+        }
+    }
 }
 // After a game draw (outermost, not host work): replay it into this frame's slot when it qualifies.
 void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2, INT a3, UINT a4)
@@ -4835,34 +4874,49 @@ void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2,
     RpSlot& slot = rp_slot(static_cast<uint32_t>(frame % kRpSlots));
     const HostWorkScope own;
     if (slot.frame != frame) {
-        // Reuse once the GPU is done with the old positions (writer) and the
-        // frame that read them (reader). Waiting for the game to RESET its
-        // list blocked almost every frame in SE5 (lists live > 3 frames).
-        if ((slot.writer && !slot.writer->Completed()) || (slot.reader && !slot.reader->Completed())) {
+        if (!slot.Free()) {
             rp_count(kRpNotReady);
             return;
         }
-        auto use = retain(l);
-        if (!use) return;
-        slot.writer = std::move(use);
         slot.reader.reset();
+        slot.segs.clear();
         slot.frame = frame;
-        slot.list_id = list_id;
-        slot.recording = recording;
         slot.sealed = false;
         slot.verts = 0;
-        slot.draws.clear();
-        l->CopyBufferRegion(slot.buf.Get(), 0, g_rp_zeros.Get(), 0, kRpCounterBytes);
+        slot.counters = 0;
+    }
+    if (slot.sealed) { rp_count(kRpOtherList); return; }
+    RpSlot::Seg* seg = nullptr;
+    for (auto& x : slot.segs) if (x.list_id == list_id && x.recording == recording) { seg = &x; break; }
+    if (!seg) {
+        auto use = retain(l);
+        if (!use) return;
+        slot.segs.push_back({});
+        seg = &slot.segs.back();
+        seg->writer = std::move(use);
+        seg->list_id = list_id;
+        seg->recording = recording;
+        rp_count(kRpSegments);
+    }
+    if (seg->next_counter == seg->block_end) { // a fresh block of filled-size counters, zeroed in THIS list
+        if (slot.counters + kRpBlock > kRpCounters) { rp_count(kRpOverflow); return; }
+        const uint32_t block = slot.counters;
+        slot.counters += kRpBlock;
         D3D12_RESOURCE_BARRIER barrier{};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         barrier.Transition = {slot.buf.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                              D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_STREAM_OUT};
+                              D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_DEST};
+        if (seg->stream_out) l->ResourceBarrier(1, &barrier); // else COMMON, promoted by the copy
+        l->CopyBufferRegion(slot.buf.Get(), uint64_t(block) * 16, g_rp_zeros.Get(), 0, uint64_t(kRpBlock) * 16);
+        std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
         l->ResourceBarrier(1, &barrier);
+        seg->stream_out = true;
+        seg->next_counter = block;
+        seg->block_end = block + kRpBlock;
     }
-    if (slot.list_id != list_id || slot.recording != recording || slot.sealed) { rp_count(kRpOtherList); return; }
     const uint64_t first = slot.verts;
-    const uint32_t ci = static_cast<uint32_t>(slot.draws.size());
-    if (verts > (kRpBytes - kRpCounterBytes) / 16 - first || ci >= kRpCounters) {
+    const uint32_t ci = seg->next_counter;
+    if (verts > (kRpBytes - kRpCounterBytes) / 16 - first) {
         rp_count(kRpOverflow);
         return;
     }
@@ -4882,7 +4936,8 @@ void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2,
     rp_count(kRpReplayed);
     rp_count(kRpVerts, verts);
     slot.verts += verts;
-    slot.draws.push_back(rec);
+    ++seg->next_counter;
+    seg->draws.push_back(rec);
 }
 template <uint32_t Slot, typename Sig>
 struct ListHook;
@@ -4961,6 +5016,8 @@ struct ListHook<Slot, R(A...)> {
                     HostWorkScope own; hook->Closing(l);
                 }
             }
+            // After every Closing hook (one may still read this list's positions).
+            if (!t_host_work && scope.outermost && !scope.ambiguous) replay_on_close(l);
         }
         if constexpr (kMipSlot) {
             const std::tuple<std::decay_t<A>...> game{a...}; // what the game passed
@@ -7913,24 +7970,43 @@ bool ReplayTakeFrame(GL* list, ID3D12CommandQueue* queue, ReplayFrame* f)
     if (!list || !queue || !g_rp_bufs_ok.load(std::memory_order_acquire)) return false;
     const uint64_t recording = ListRecording(list);
     const uint64_t list_id = IdOf(list);
+    const auto retain = g_rp_retain.load(std::memory_order_acquire);
     std::lock_guard<std::mutex> lock(g_replay_slots_m);
     const uint64_t frame = g_rp_frame.load(std::memory_order_acquire);
-    if (frame < 2 || !recording) return false;
+    if (frame < 2 || !recording || !retain) return false;
     auto& cur = rp_slot(static_cast<uint32_t>(frame % kRpSlots));
-    if (cur.frame != frame) { rp_count(kRpTakeUnclaimed); return false; }
-    if (cur.list_id != list_id || cur.recording != recording) { rp_count(kRpTakeOtherList); return false; }
+    if (cur.frame != frame || cur.segs.empty()) { rp_count(kRpTakeUnclaimed); return false; }
     if (cur.sealed) { rp_count(kRpTakeSealed); return false; }
+    // Positions this list may read now: its own (recorded earlier in this same
+    // list) and those of other lists already submitted to this queue (same-queue
+    // order). A list still unsubmitted could execute after us: left out.
+    bool own = false, other = false;
+    for (auto& x : cur.segs) {
+        const bool mine = x.list_id == list_id && x.recording == recording;
+        if (!mine && !(x.writer && x.writer->Ready(queue))) { rp_count(kRpPendingSegs); continue; }
+        own |= mine; other |= !mine;
+        f->cur_draws.insert(f->cur_draws.end(), x.draws.begin(), x.draws.end());
+    }
+    if (f->cur_draws.empty()) { rp_count(kRpTakeOtherList); return false; }
+    auto reader = retain(list);
+    if (!reader) return false;
     cur.sealed = true;
+    cur.reader = reader;
     rp_count(kRpTaken);
     f->cur = cur.buf.Get();
+    f->cur_in_list = own;
     f->data_offset = kRpCounterBytes;
-    f->cur_draws = cur.draws;
     auto& prev = rp_slot(static_cast<uint32_t>((frame - 1) % kRpSlots));
-    if (prev.frame == frame - 1 && prev.sealed && prev.writer && prev.writer->Ready(queue)) {
-        prev.reader = cur.writer;
-        f->prev = prev.buf.Get();
-        f->prev_draws = std::move(prev.draws);
+    if (prev.frame == frame - 1 && prev.sealed && !prev.segs.empty()) {
+        bool ready = true;
+        for (const auto& x : prev.segs) ready &= x.writer && x.writer->Ready(queue);
+        if (ready) {
+            prev.reader = reader;
+            f->prev = prev.buf.Get();
+            for (auto& x : prev.segs) { f->prev_draws.insert(f->prev_draws.end(), x.draws.begin(), x.draws.end()); x.draws.clear(); }
+        }
     }
+    (void)other;
     return true;
 }
 
@@ -7943,6 +8019,7 @@ void GetDrawReplayStats(DrawReplayStats* out)
     out->build_failed = v(kRpBuildFailed); out->noted = v(kRpNoted); out->hash_mismatch = v(kRpHashMismatch);
     out->other_list = v(kRpOtherList); out->take_unclaimed = v(kRpTakeUnclaimed); out->take_other_list = v(kRpTakeOtherList);
     out->take_sealed = v(kRpTakeSealed); out->taken = v(kRpTaken);
+    out->segments = v(kRpSegments); out->pending_segments = v(kRpPendingSegs);
 }
 bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float* y)
 {
