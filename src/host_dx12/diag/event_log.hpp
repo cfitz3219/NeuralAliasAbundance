@@ -38,13 +38,13 @@ inline uint64_t Frame() { return g_frame.load(std::memory_order_relaxed); }
 // One line: "event t=<ms since boot> frame=<n> thread=<id> src=<who> <category> <text>".
 inline void Emit(const char* category, const char* fmt, ...)
 {
-    char body[1024];
+    char body[4096];
     va_list ap;
     va_start(ap, fmt);
     const int n = vsnprintf(body, sizeof body, fmt, ap);
     va_end(ap);
     if (n < 0) return;
-    char line[1200];
+    char line[4300];
     const int m = snprintf(line, sizeof line, "event t=%llu frame=%llu thread=%lu src=%s %s %s\r\n",
                            static_cast<unsigned long long>(GetTickCount64()),
                            static_cast<unsigned long long>(Frame()), GetCurrentThreadId(), Source(), category, body);

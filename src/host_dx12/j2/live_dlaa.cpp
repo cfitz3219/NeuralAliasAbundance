@@ -398,8 +398,8 @@ NativeBridgeCounters& g_nb=*new NativeBridgeCounters;
 // groups, blend/depth, used inputs and outputs with sizes and view formats). At Present
 // the chain is walked BACKWARD from the presented image to the first pass whose input is
 // render size and whose output is full size: the real scale crossing. Diagnostic only.
-struct TraceIo{uint64_t id=0;uint32_t w=0,h=0,fmt=0,vfmt=0;};
-struct TraceOp{bool compute=false;uint64_t pso=0;uint32_t vw=0,vh=0,gx=0,gy=0,gz=0;bool blend=false,depth=false;std::vector<TraceIo> in,out;};
+struct TraceIo{uint64_t id=0;uint32_t w=0,h=0,fmt=0,vfmt=0;char kind='s';}; // s=SRV, u=UAV, r=render target
+struct TraceOp{bool compute=false,exact=false;uint32_t table_slots=0;uint64_t pso=0;uint32_t vw=0,vh=0,gx=0,gy=0,gz=0;bool blend=false,depth=false;std::vector<TraceIo> in,out;};
 struct NativeTrace{
     std::mutex m;std::atomic<bool> armed{false};
     uint32_t frames=0,untraced=0,traced_lists=0;uint64_t ops=0,traces=0,presents=0,armed_at=0;
@@ -412,6 +412,9 @@ void trace_op(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall& call){
     const bool compute=call.kind==na::observe::ShaderKind::Dispatch;
     na::observe::NativeOperation op;if(!na::observe::ListNativeOperation(l,compute,op,nullptr))return;
     TraceOp t;t.compute=compute;t.pso=op.pipeline_id;
+    // 2f5612a run: without complete shader reflection EVERY descriptor of the bound
+    // tables counts as used, so "inputs" can be a whole bindless table. Say which.
+    t.exact=op.reflection_complete;t.table_slots=uint32_t(op.descriptors.size());
     if(compute){t.gx=uint32_t(call.args[0]);t.gy=uint32_t(call.args[1]);t.gz=uint32_t(call.args[2]);}
     else{
         if(!op.viewports.empty()){t.vw=uint32_t(op.viewports[0].Width);t.vh=uint32_t(op.viewports[0].Height);}
@@ -424,9 +427,9 @@ void trace_op(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall& call){
     for(const auto& d:op.descriptors){
         if(!d.used||!d.resource||d.resource->GetDesc().Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D)continue;
         if(d.view.kind==NA_DESC_SRV)t.in.push_back(io(d,d.view.explicit_view?uint32_t(d.view.srv.Format):0));
-        else if(d.view.kind==NA_DESC_UAV)t.out.push_back(io(d,d.view.explicit_view?uint32_t(d.view.uav.Format):0));
+        else if(d.view.kind==NA_DESC_UAV){auto x=io(d,d.view.explicit_view?uint32_t(d.view.uav.Format):0);x.kind='u';t.out.push_back(x);}
     }
-    for(const auto& d:op.colors)if(d.resource)t.out.push_back(io(d,d.view.explicit_view?uint32_t(d.view.rtv.Format):0));
+    for(const auto& d:op.colors)if(d.resource){auto x=io(d,d.view.explicit_view?uint32_t(d.view.rtv.Format):0);x.kind='r';t.out.insert(t.out.begin(),x);}
     const auto key=std::make_pair(uint64_t(na::observe::IdOf(l)),uint64_t(na::observe::ListRecording(l)));
     std::lock_guard<std::mutex> lock(g_trace.m);
     if(!g_trace.armed.load()||g_trace.ops>=kTraceOps)return;
@@ -445,12 +448,12 @@ void trace_submit(UINT count,ID3D12CommandList* const* lists){
     }
 }
 int trace_describe(char* out,size_t n,const TraceOp& t){
-    int k=t.compute?std::snprintf(out,n,"[cs pso=%llu g=%u,%u,%u",(unsigned long long)t.pso,t.gx,t.gy,t.gz)
-                   :std::snprintf(out,n,"[draw pso=%llu vp=%ux%u%s%s",(unsigned long long)t.pso,t.vw,t.vh,t.blend?" blend":"",t.depth?" depth":"");
+    int k=t.compute?std::snprintf(out,n,"[cs pso=%llu %s/%u g=%u,%u,%u",(unsigned long long)t.pso,t.exact?"exact":"table",t.table_slots,t.gx,t.gy,t.gz)
+                   :std::snprintf(out,n,"[draw pso=%llu %s/%u vp=%ux%u%s%s",(unsigned long long)t.pso,t.exact?"exact":"table",t.table_slots,t.vw,t.vh,t.blend?" blend":"",t.depth?" depth":"");
     if(k<0)return 0;size_t used=size_t(k);
     const auto list=[&](const char* tag,const std::vector<TraceIo>& v){
         for(size_t i=0;i<v.size()&&i<4&&used+48<n;++i){
-            const int m=std::snprintf(out+used,n-used," %s#%llu=%ux%u/%u(%u)",tag,(unsigned long long)(v[i].id%100000),v[i].w,v[i].h,v[i].fmt,v[i].vfmt);
+            const int m=std::snprintf(out+used,n-used," %s%c#%llu=%ux%u/%u(%u)",tag,v[i].kind,(unsigned long long)(v[i].id%100000),v[i].w,v[i].h,v[i].fmt,v[i].vfmt);
             if(m>0)used+=size_t(m);
         }
         if(v.size()>4&&used+12<n){const int m=std::snprintf(out+used,n-used," %s+%zu",tag,v.size()-4);if(m>0)used+=size_t(m);}
