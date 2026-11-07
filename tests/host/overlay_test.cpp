@@ -274,10 +274,12 @@ int main(int argc, char** argv)
     d.WaitIdle();
     REQUIRE(SUCCEEDED(d.queue->Wait(menu_gate.Get(),1)));
     const auto before_backlog=na::overlay::GetStats().frames_rendered;
+    const auto before_busy=na::overlay::GetStats().menu_busy_skips;
     for(int i=0;i<8;++i) na::overlay::DrawMenuForTests(d.queue.Get(),menu_target.Get());
     CHECK(na::overlay::GetStats().frames_rendered==before_backlog+8);
     na::overlay::DrawMenuForTests(d.queue.Get(),menu_target.Get());
     CHECK(na::overlay::GetStats().frames_rendered==before_backlog+8); // never overwrite a busy slot
+    CHECK(na::overlay::GetStats().menu_busy_skips==before_busy+1);
     REQUIRE(SUCCEEDED(menu_gate->Signal(1))); d.WaitIdle();
     na::overlay::DrawMenuForTests(d.queue.Get(),menu_target.Get()); d.WaitIdle();
     CHECK(na::overlay::GetStats().frames_rendered==before_backlog+9);

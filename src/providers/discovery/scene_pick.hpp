@@ -68,6 +68,9 @@ struct DepthPick {
     static constexpr unsigned kAbsentPublications = 8; // ~2 s with no scene evidence before clearing
     uint64_t depth = 0;
     uint64_t challenger = 0;
+    // Object ids do not revive. Keep retirement exclusions until their votes
+    // leave the bounded window, including publications with no current pick.
+    uint64_t retired[DepthWindow::kFrames]{};
     unsigned challenger_streak = 0, absent_streak = 0;
     // Diagnostics of the last decision.
     uint64_t leader = 0;
@@ -76,18 +79,35 @@ struct DepthPick {
 
     PickReason Publish(const DepthWindow& w, bool current_alive) {
         frames = w.count;
-        leader = w.Leader(&leader_n);
         current_n = depth ? w.Count(depth) : 0;
-        if (depth && !current_alive) {
+        const bool retiring = depth && !current_alive;
+        for (auto& id : retired) if (id && !w.Count(id)) id = 0;
+        if (retiring && current_n) {
+            bool known=false;
+            for (const auto id : retired) known |= id==depth;
+            if (!known) for (auto& id : retired) if (!id) {id=depth;break;}
+        }
+        auto eligible=w;
+        size_t retired_n=0;
+        for (auto& vote : eligible.top) {
+            if (!vote) continue;
+            for (const auto id : retired) if (id==vote) {vote=0;++retired_n;break;}
+        }
+        leader = eligible.Leader(&leader_n);
+        const bool majority = leader_n >= 2 && leader_n * 2 >= frames;
+        const bool recent_replacement = retired_n && leader_n >= 4 && leader_n * 2 >= frames - retired_n &&
+            w.top[(w.next + DepthWindow::kFrames - 1) % DepthWindow::kFrames] == leader;
+        if (retiring) {
             depth = 0;
             challenger = 0; challenger_streak = absent_streak = 0;
-            // The replacement (the resized scene) may already lead: adopt it now.
-            if (leader && leader_n * 2 >= frames && leader_n >= 2) depth = leader;
+            // Old votes cannot keep a destroyed texture selected or delay
+            // an established replacement. Empty observations still count.
+            if (leader && (majority || recent_replacement)) depth = leader;
             return last = PickReason::retired;
         }
         if (!depth) {
             challenger = 0; challenger_streak = absent_streak = 0;
-            if (leader && leader_n * 2 >= frames && leader_n >= 2) { depth = leader; return last = PickReason::first; }
+            if (leader && (majority || recent_replacement)) { depth = leader; return last = PickReason::first; }
             return last = PickReason::none;
         }
         if (leader && leader != depth && leader_n * 4 >= frames * 3 && current_n * 8 <= frames) {

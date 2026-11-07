@@ -6,8 +6,8 @@
 //   - resource / heap / descriptor-heap / list / fence / queue creations with
 //     their parameters, placed-resource heap linkage;
 //   - descriptor writes resolved to (heap, slot) with versions, a CBV resolved
-//     through the GPU VA table, a view of an unobserved resource marked
-//     UNKNOWN (never invented), CopyDescriptorsSimple versions;
+//     through the GPU VA table, a view discovers a preexisting resource while
+//     retaining UNKNOWN creation provenance, CopyDescriptorsSimple versions;
 //   - queue execute with list refs and tickets, signal/wait provenance;
 //   - OBJECT_RETIRED on final release (private-data sentinel).
 #include "test_support.hpp"
@@ -80,7 +80,7 @@ int main()
     if (!test::CreateDevice(d)) return test::SkipNoDevice("observe_producers_test");
     ID3D12Device* dev = d.device.Get();
 
-    // Created BEFORE installation: unknown to the producers.
+    // Created BEFORE installation: first discovered through its later view.
     auto early = test::CreateBuffer(dev, 4096, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
     REQUIRE(early);
 
@@ -153,13 +153,16 @@ int main()
     D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{cbuf->GetGPUVirtualAddress() + 256, 256};
     dev->CreateConstantBufferView(&cbv, D3D12_CPU_DESCRIPTOR_HANDLE{s0.ptr + 4 * inc});
     // Buffers have UNKNOWN resource format, so no typed default SRV exists.
-    // Keep the resource unobserved while supplying a valid buffer view.
+    // Supplying its valid view discovers the live object, without inventing
+    // its creation method or initial state.
     D3D12_SHADER_RESOURCE_VIEW_DESC early_srv{};
     early_srv.Format = DXGI_FORMAT_R32_UINT;
     early_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
     early_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     early_srv.Buffer.NumElements = 4096 / sizeof(uint32_t);
     dev->CreateShaderResourceView(early.Get(), &early_srv, D3D12_CPU_DESCRIPTOR_HANDLE{s0.ptr + 5 * inc});
+    const auto early_id = na::observe::IdOf(early.Get());
+    REQUIRE(early_id && early_id != NA_UNKNOWN_U64);
     REQUIRE(SUCCEEDED(dev->GetDeviceRemovedReason()));
     dev->CopyDescriptorsSimple(3, D3D12_CPU_DESCRIPTOR_HANDLE{srv_heap->GetCPUDescriptorHandleForHeapStart().ptr + inc},
                                s3, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -220,7 +223,7 @@ int main()
     }
     {
         auto res = All<na_ev_resource_created>(NA_EV_RESOURCE_CREATED);
-        bool placed_ok = false, rt_ok = false, buf_ok = false;
+        bool placed_ok = false, rt_ok = false, buf_ok = false, preexisting_ok = false;
         for (const auto& r : res) {
             if (r.resource == placed_id)
                 placed_ok = r.creation_kind == NA_CREATE_PLACED && r.heap == heap_id && r.heap_offset == 0 && r.width == 64 &&
@@ -229,10 +232,14 @@ int main()
                 rt_ok = r.creation_kind == NA_CREATE_COMMITTED && r.format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
                         (r.resource_flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) && r.initial_state == D3D12_RESOURCE_STATE_RENDER_TARGET;
             if (r.resource == cbuf_id) buf_ok = r.dimension == D3D12_RESOURCE_DIMENSION_BUFFER && r.heap_type == D3D12_HEAP_TYPE_UPLOAD;
+            if (r.resource == early_id) preexisting_ok = r.dimension == D3D12_RESOURCE_DIMENSION_BUFFER && r.width == 4096 &&
+                r.creation_kind == NA_CREATE_UNKNOWN && r.initial_state == NA_UNKNOWN_U32 && r.heap_offset == NA_UNKNOWN_U64 &&
+                (r.hdr.flags & NA_EVF_PREEXISTING) && (r.hdr.flags & NA_EVF_METHOD_UNOBSERVED);
         }
         CHECK(placed_ok);
         CHECK(rt_ok);
         CHECK(buf_ok);
+        CHECK(preexisting_ok);
         CHECK(!All<na_ev_resource_heap_created>(NA_EV_RESOURCE_HEAP_CREATED).empty());
     }
     const na_object_id staging_id = na::observe::IdOf(staging.Get()), srv_heap_id = na::observe::IdOf(srv_heap.Get());
@@ -246,17 +253,17 @@ int main()
         CHECK(vis && nonvis);
         auto writes = All<na_ev_descriptor_write>(NA_EV_DESCRIPTOR_WRITE);
         int srv_v = 0;
-        bool cbv_ok = false, unknown_ok = false, rtv_ok = false;
+        bool cbv_ok = false, discovered_ok = false, rtv_ok = false;
         for (const auto& w : writes) {
             if (w.heap == staging_id && w.slot == 3 && w.descriptor_kind == NA_DESC_SRV && w.resource == placed_id) srv_v = static_cast<int>(w.slot_version);
             if (w.heap == staging_id && w.slot == 4) cbv_ok = w.descriptor_kind == NA_DESC_CBV && w.resource == cbuf_id;
             if (w.heap == staging_id && w.slot == 5)
-                unknown_ok = w.resource == NA_UNKNOWN_U64 && (w.hdr.flags & NA_EVF_METHOD_UNOBSERVED);
+                discovered_ok = w.resource == early_id && w.descriptor_kind == NA_DESC_SRV;
             if (w.descriptor_kind == NA_DESC_RTV) rtv_ok = w.resource == rt_id && w.slot == 0;
         }
         CHECK(srv_v == 2);
         CHECK(cbv_ok);
-        CHECK(unknown_ok);
+        CHECK(discovered_ok);
         CHECK(rtv_ok);
         auto copies = All<na_ev_descriptor_copy>(NA_EV_DESCRIPTOR_COPY);
         bool copy_ok = false;

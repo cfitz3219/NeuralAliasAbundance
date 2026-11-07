@@ -317,6 +317,11 @@ std::atomic<ID3D12CommandQueue*> g_texture_queue{nullptr};
 std::atomic<bool> g_open{false};
 std::atomic<uint64_t> g_frames{0}, g_presents{0};
 std::atomic<uint64_t> g_menu_draw_marker{0};
+struct MenuDrawSkips {
+    std::atomic<uint64_t> not_ready{0},buffer{0},busy{0},atlas{0},empty{0},command{0};
+    std::atomic<uint64_t> present_rejected{0};
+    std::atomic<HRESULT> last_present_rejection{S_OK};
+} g_menu_skips;
 void write_menu_progress(HANDLE log);
 std::atomic<uint32_t> g_retargets{0}; // swap chain re-targets (A31)
 std::atomic<uint32_t> g_initialized{0};
@@ -1759,6 +1764,17 @@ void write_menu_progress(HANDLE log)
     if (n >= static_cast<int>(sizeof(line))) n = static_cast<int>(sizeof(line)) - 1; // never write past a truncated line
     DWORD written = 0;
     if (n > 0) WriteFile(log, line, static_cast<DWORD>(n), &written, nullptr);
+    n = snprintf(line, sizeof(line),
+        "menu_skips not_ready=%llu buffer=%llu busy=%llu atlas=%llu empty=%llu command=%llu present_rejected=%llu last_present_hr=0x%08lX\r\n",
+        static_cast<unsigned long long>(g_menu_skips.not_ready.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_menu_skips.buffer.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_menu_skips.busy.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_menu_skips.atlas.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_menu_skips.empty.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_menu_skips.command.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_menu_skips.present_rejected.load(std::memory_order_relaxed)),
+        static_cast<unsigned long>(g_menu_skips.last_present_rejection.load(std::memory_order_relaxed)));
+    if (n > 0) WriteFile(log, line, static_cast<DWORD>(n), &written, nullptr);
     auto nr_progress = na::nr::GetStats();
     n = snprintf(line, sizeof(line), "frame_progress nr_submitted=%llu nr_completed=%llu direct_queues=%u present_thread=%u\r\n",
         static_cast<unsigned long long>(nr_progress.gpu_submitted), static_cast<unsigned long long>(nr_progress.gpu_completed),
@@ -2057,7 +2073,9 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     na::latency::pcl::Message(msg, wp);
     if (msg == WM_KEYDOWN && wp == VK_HOME && !(lp & (1 << 30))) {
-        g_open.store(!g_open.load(std::memory_order_relaxed), std::memory_order_release);
+        const bool open = !g_open.load(std::memory_order_relaxed);
+        g_open.store(open, std::memory_order_release);
+        na::eventlog::Emit("menu_home", "open=%u", open ? 1u : 0u);
         sync_cursor(); // close restores even if the game stops presenting
         return 0;
     }
@@ -2813,14 +2831,23 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
         ~OverlayInputScope() { t_overlay_input = prev; }
     } overlay_input_scope;
     UINT idx = frame ? 0 : real_index(sc);
-    if (!frame && idx >= g_state.backbuffer_count) return;
-    if (g_state.imgui_slot_fences.empty()) return;
+    if (!frame && idx >= g_state.backbuffer_count) {
+        g_menu_skips.buffer.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (g_state.imgui_slot_fences.empty()) {
+        g_menu_skips.not_ready.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     const size_t imgui_slot = g_state.imgui_draws % g_state.imgui_slot_fences.size();
     FrameCtx& f = g_state.frames[imgui_slot];
     // Never wait for game-queue work from inside its Present callback. A
     // driver/engine may release that work only after the callback returns.
     // If this allocator is still in use, skip this overlay draw and retry.
-    if (!f.Complete()) return;
+    if (!f.Complete()) {
+        g_menu_skips.busy.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     ComPtr<ID3D12Resource> back_buffer; // A71: this frame only
     if (frame) {
         back_buffer = frame;
@@ -2828,7 +2855,10 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
         rtv.Format = g_state.format;
         rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
         g_state.device->CreateRenderTargetView(frame, &rtv, f.rtv);
-    } else if (!acquire_back_buffer_locked(sc, idx, f.rtv, back_buffer)) return;
+    } else if (!acquire_back_buffer_locked(sc, idx, f.rtv, back_buffer)) {
+        g_menu_skips.buffer.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
 
     apply_input(just_opened);
     if (just_opened) menu_note("menu_open: input applied\r\n");
@@ -2857,18 +2887,26 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     if (just_opened) menu_note("menu_open: draw data built\r\n");
 
     ImDrawData* draw = ImGui::GetDrawData();
-    if (draw->DisplaySize.x <= 0 || draw->DisplaySize.y <= 0) return;
+    if (draw->DisplaySize.x <= 0 || draw->DisplaySize.y <= 0) {
+        g_menu_skips.empty.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     // New glyphs can update an EXISTING font atlas. The private upload queue
     // must not write it while an older game-queue menu draw is sampling it.
     // A completion check (not a wait) protects all atlas updates/destruction.
     // Leave the texture request pending when busy; the next frame retries.
     if (draw->Textures) {
         for (ImTextureData* texture : *draw->Textures) {
-            if (texture->Status != ImTextureStatus_OK &&
-                !menu_draws_complete()) return;
+            if (texture->Status != ImTextureStatus_OK && !menu_draws_complete()) {
+                g_menu_skips.atlas.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
         }
     }
-    if (FAILED(f.allocator->Reset()) || FAILED(g_state.list->Reset(f.allocator.Get(), nullptr))) return;
+    if (FAILED(f.allocator->Reset()) || FAILED(g_state.list->Reset(f.allocator.Get(), nullptr))) {
+        g_menu_skips.command.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
 
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -2889,7 +2927,10 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     g_state.list->ResourceBarrier(1, &b);
-    if (FAILED(g_state.list->Close())) return;
+    if (FAILED(g_state.list->Close())) {
+        g_menu_skips.command.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     ID3D12CommandList* lists[] = {g_state.list.Get()};
     g_orig_execute(queue, 1, lists);
     f.fence_value = g_state.fence_next++;
@@ -2905,6 +2946,26 @@ void render_with_fault_receipt(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bo
     __except (menu_fault(GetExceptionInformation())) {} // filter always continues the original exception
 }
 
+void capture_present_picture(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool open, bool drawn, bool after_menu)
+{
+    if (!frame) return;
+    if (na::capture::Pending()) {
+        // What J2 did on this present (SE5 flashing, 2026-11-02): DLAA frames since the last
+        // present, its jitter, and the misses, so a flashing present can be matched to a cause.
+        static uint64_t pf = 0, pnc = 0, pns = 0, pcut = 0, pmc = 0, pheld = 0;
+        const auto js = na::j2::GetStats();
+        char note[320];
+        snprintf(note, sizeof note, "j2_frames=%llu jitter=%.3f,%.3f no_camera=%llu no_state=%llu cuts=%llu miss_no_candidate=%llu camera_held=%llu active=%u home_open=%u home_submitted=%u home_in_capture=%u",
+                 static_cast<unsigned long long>(js.frames - pf), js.inline_jitter_x, js.inline_jitter_y,
+                 static_cast<unsigned long long>(js.no_camera - pnc), static_cast<unsigned long long>(js.no_state - pns),
+                 static_cast<unsigned long long>(js.cuts - pcut), static_cast<unsigned long long>(js.miss_no_candidate - pmc),
+                 static_cast<unsigned long long>(js.camera_held - pheld), js.active ? 1u : 0u, open ? 1u : 0u, drawn ? 1u : 0u, after_menu ? 1u : 0u);
+        pf = js.frames; pnc = js.no_camera; pns = js.no_state; pcut = js.cuts; pmc = js.miss_no_candidate; pheld = js.camera_held;
+        na::capture::NotePresent(note);
+        na::capture::OnPresent(queue, frame); // phase-1 capture
+    }
+}
+
 // The finished frame (real back buffer on the old path, the game's proxy on
 // the presenter path): Neural Rendering, motion analysis, capture.
 void process_frame(ID3D12CommandQueue* queue, ID3D12Resource* frame)
@@ -2918,21 +2979,6 @@ void process_frame(ID3D12CommandQueue* queue, ID3D12Resource* frame)
     na::j2::NativeProbePresent(queue,frame,g_orig_execute);
     na::nr::OnPresent(queue, frame, cs);      // live Neural Rendering (before capture and the menu)
     na::motion::OnPresent(queue, frame, cs);  // A52: live optical flow (after NR, before capture)
-    if (na::capture::Pending()) {
-        // What J2 did on this present (SE5 flashing, 2026-11-02): DLAA frames since the last
-        // present, its jitter, and the misses, so a flashing present can be matched to a cause.
-        static uint64_t pf = 0, pnc = 0, pns = 0, pcut = 0, pmc = 0, pheld = 0;
-        const auto js = na::j2::GetStats();
-        char note[240];
-        snprintf(note, sizeof note, "j2_frames=%llu jitter=%.3f,%.3f no_camera=%llu no_state=%llu cuts=%llu miss_no_candidate=%llu camera_held=%llu active=%u",
-                 static_cast<unsigned long long>(js.frames - pf), js.inline_jitter_x, js.inline_jitter_y,
-                 static_cast<unsigned long long>(js.no_camera - pnc), static_cast<unsigned long long>(js.no_state - pns),
-                 static_cast<unsigned long long>(js.cuts - pcut), static_cast<unsigned long long>(js.miss_no_candidate - pmc),
-                 static_cast<unsigned long long>(js.camera_held - pheld), js.active ? 1u : 0u);
-        pf = js.frames; pnc = js.no_camera; pns = js.no_state; pcut = js.cuts; pmc = js.miss_no_candidate; pheld = js.camera_held;
-        na::capture::NotePresent(note);
-        na::capture::OnPresent(queue, frame); // phase-1 capture
-    }
     {
         // J2 evidence capture: the presented image joins this frame's evaluation (if one
         // was captured). Executed unhooked so J2 never observes our copy as game work.
@@ -3079,7 +3125,10 @@ bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue,ComPtr<ID3D1
 void menu_step(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool open, ID3D12Resource* frame = nullptr)
 {
     na::dlss_debug::Tick(); // releases a held debug hotkey, menu open or not
-    if (!g_menu_enabled.load(std::memory_order_acquire) || !g_state.imgui_ready || !g_menu_frame_ready) return;
+    if (!g_menu_enabled.load(std::memory_order_acquire) || !g_state.imgui_ready || !g_menu_frame_ready) {
+        if (open) g_menu_skips.not_ready.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     bool just_opened = open && !g_state.was_open;
     bool just_closed = !open && g_state.was_open;
     g_state.was_open = open;
@@ -3205,17 +3254,24 @@ void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue_hint = nullptr)
     fill_screen_tick(sc);
     if (na::scale::SliderRouteActive()) na::scale::TickLive(na::j2::GetStats().width); // P4-4: confirm a live render-scale change
     UINT idx = real_index(sc);
-    { // frame processing uses the actual buffer, independently of menu allocation
-        ComPtr<ID3D12Resource> bb; // A71: this frame only
-        if (SUCCEEDED(real_get_buffer(sc, idx, IID_PPV_ARGS(&bb)))) process_frame(queue, bb.Get());
-    }
-    menu_step(sc, queue, g_open.load(std::memory_order_acquire));
+    ComPtr<ID3D12Resource> bb; // A71: this frame only
+    if (SUCCEEDED(real_get_buffer(sc, idx, IID_PPV_ARGS(&bb)))) process_frame(queue, bb.Get());
+    const bool open = g_open.load(std::memory_order_acquire);
+    const auto draws = g_frames.load(std::memory_order_relaxed);
+    menu_step(sc, queue, open);
+    // The game-facing Present capture must include Home. Keep the separate
+    // J2 evaluation capture before Home so its image can be compared to DLSS.
+    capture_present_picture(queue, bb.Get(), open, g_frames.load(std::memory_order_relaxed) != draws, true);
 }
 
 // A59 presenter path: the game drew into its proxy; the presenter copies,
 // generates and presents. Composite the menu on the proxy, after NR and
 // before copying to the worker's owned frame. No real-buffer access here.
-void presenter_frame_cb(ID3D12CommandQueue* queue, ID3D12Resource* frame, void*) { process_frame(queue, frame); }
+void presenter_frame_cb(ID3D12CommandQueue* queue, ID3D12Resource* frame, void* user)
+{
+    process_frame(queue, frame);
+    capture_present_picture(queue, frame, *static_cast<const bool*>(user), false, false);
+}
 void presenter_menu_cb(IDXGISwapChain* sc, ID3D12CommandQueue* queue, ID3D12Resource* frame, void* user)
 {
     menu_step(sc, queue, *static_cast<const bool*>(user), frame);
@@ -3390,6 +3446,12 @@ bool boundary_owns_native(IDXGISwapChain* chain) {
     std::lock_guard<std::mutex> lock(g_boundary_m);
     return g_boundary_policy.Suppresses(reinterpret_cast<uintptr_t>(chain));
 }
+void note_menu_present_result(bool open, UINT flags, HRESULT result) {
+    if (open && !(flags & DXGI_PRESENT_TEST) && result != S_OK) {
+        g_menu_skips.last_present_rejection.store(result, std::memory_order_relaxed);
+        g_menu_skips.present_rejected.fetch_add(1, std::memory_order_relaxed);
+    }
+}
 HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flags)
 {
     if (na::present::IsPresentThread()) return g_orig_present(sc, sync, flags); // never re-entered by design; safety
@@ -3406,8 +3468,10 @@ HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flag
     }
     const auto observed = na::observe::PresentBegin(sc);
     na::nr::trace::Record("present_begin",sc);
+    const bool menu_open = g_open.load(std::memory_order_acquire);
     if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc)) on_present(sc);
     const HRESULT result = g_orig_present(sc, sync, flags);
+    note_menu_present_result(menu_open, flags, result);
     na::nr::trace::Record("present_end",sc,nullptr,0,0,result);
     na::observe::PresentEnd(observed,sync,flags,result);
     return result;
@@ -3429,8 +3493,10 @@ HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT fl
     }
     const auto observed = na::observe::PresentBegin(sc);
     na::nr::trace::Record("present1_begin",sc);
+    const bool menu_open = g_open.load(std::memory_order_acquire);
     if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc)) on_present(sc);
     const HRESULT result = g_orig_present1(sc, sync, flags, pp);
+    note_menu_present_result(menu_open, flags, result);
     na::nr::trace::Record("present1_end",sc,nullptr,0,0,result);
     na::observe::PresentEnd(observed,sync,flags,result);
     return result;
@@ -4202,6 +4268,7 @@ Stats GetStats()
 {
     Stats s{};
     s.frames_rendered = g_frames.load();
+    s.menu_busy_skips = g_menu_skips.busy.load(std::memory_order_relaxed);
     s.presents_seen = g_presents.load();
     s.initialized = g_initialized.load();
     s.core_ready=g_core_started.load();s.menu_enabled=g_menu_enabled.load();
