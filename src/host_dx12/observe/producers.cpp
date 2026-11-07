@@ -7180,7 +7180,11 @@ bool RestoreListState(ID3D12GraphicsCommandList* l,ID3D12GraphicsCommandList* de
         for(UINT c=0;c<(graphics_only?1u:2u);++c){if(ls->args[c].size()>64)return false;nargs[c]=UINT(ls->args[c].size());
             for(UINT p=0;p<nargs[c];++p){const auto& from=ls->args[c][p];auto& to=args[c][p];
                 if(from.consts.size()>64)return false;to.type=from.type;to.value=from.value;to.count=UINT(from.consts.size());
-                if(to.count)std::copy_n(from.consts.data(),to.count,to.consts);}}
+                if(to.count)std::copy_n(from.consts.data(),to.count,to.consts);
+                // A table bound from a heap the list has since replaced (the game set other
+                // heaps after that bind) is stale: replaying it is invalid (D3D12 708) and the
+                // game cannot draw with it either, so it is left unbound.
+                if(to.type==1){UINT s=0;if(!bound_heap_for_gpu_locked(*ls,to.value,&s))to.type=0;}}}
         if (ls->raster_tracking) {
             vp_known = ls->raster_viewports_known; viewport_count = ls->raster_viewport_count;
             sc_known = ls->raster_scissors_known; scissor_count = ls->raster_scissor_count;

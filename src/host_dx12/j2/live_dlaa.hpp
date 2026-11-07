@@ -173,7 +173,8 @@ struct NativeBridgeStats {
         st_ungated_full=0,st_budget=0,st_aux=0;
     // Late-bound upscale steps: staged at the dispatch, resolved at submission (descriptors
     // changed after recording / unchanged), and resolved to the learned images.
-    uint64_t st_late_staged=0,st_late_changed=0,st_late_same=0,st_late_resolved=0;
+    uint64_t st_late_staged=0,st_late_changed=0,st_late_same=0,st_late_resolved=0,
+        st_late_inline=0; // learned dispatches delivered inline with the input chosen by this recording's writes
     char steps[720]{};
     // Sol bafa40a: deliveries confirmed at submission (first frame, current and
     // best consecutive run), producer-order refusals, deliveries whose target was

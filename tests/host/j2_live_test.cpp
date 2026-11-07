@@ -961,7 +961,7 @@ static uint64_t seen=0;char tr[2048];uint64_t n=0;na::j2::NativeTraceResult(tr,s
                 CHECK(late_deliveries>=2);
 
             }else if(false){ // the delivery probe is a fallback only now (no automatic delivery session)
-            }else if(native_se5){
+            }else if(native_se5&&!native_latebind){ // latebind: the armed probe may confirm the inline deliveries
                 CHECK(std::strstr(nbs.probe,"verdict=confirmed")==nullptr);
             }
             if(native_overwrite){
@@ -985,15 +985,18 @@ static uint64_t seen=0;char tr[2048];uint64_t n=0;na::j2::NativeTraceResult(tr,s
                     CHECK(std::strstr(trace,native_latebind?" late=1/":" late=0/")!=nullptr);
                     if(native_latebind){
                         const auto nl=na::j2::GetNativeBridgeStats();
-                        std::printf("se5 latebind: staged %llu changed %llu same %llu resolved %llu\n",(unsigned long long)nl.st_late_staged,
-                            (unsigned long long)nl.st_late_changed,(unsigned long long)nl.st_late_same,(unsigned long long)nl.st_late_resolved);
-                        CHECK(nl.st_late_staged>=late_deliveries && nl.st_late_changed>=late_deliveries && nl.st_late_same==0 && nl.st_late_resolved>=late_deliveries);
+                        std::printf("se5 latebind: staged %llu changed %llu same %llu resolved %llu inline %llu\n",(unsigned long long)nl.st_late_staged,
+                            (unsigned long long)nl.st_late_changed,(unsigned long long)nl.st_late_same,(unsigned long long)nl.st_late_resolved,(unsigned long long)nl.st_late_inline);
+                        // Every delivery came through a late-bound route: inline with the input chosen by
+                        // this recording's writes, or staged and resolved at submission (never by a stale table).
+                        CHECK(nl.st_late_inline+nl.st_late_resolved>=late_deliveries && nl.st_late_same==0 && nl.st_late_changed==nl.st_late_staged);
                     }
                     CHECK(g_pattern_writes>=int(late_deliveries));
                     // Deliveries on frames with the auxiliary input were counted.
                     const auto nb=na::j2::GetNativeBridgeStats();
                     std::printf("se5 stretch: candidates %llu recorded %llu aux %llu\n",(unsigned long long)nb.st_candidates,(unsigned long long)nb.st_recorded,(unsigned long long)nb.st_aux);
-                    CHECK(nb.st_aux>0 && nb.st_aux<nb.st_candidates);
+                    // (the inline late-bound route picks its input without the table, so it counts no aux)
+                    if(!(native_latebind&&nb.st_late_inline>0))CHECK(nb.st_aux>0 && nb.st_aux<nb.st_candidates);
                 }
                 CHECK(late_deliveries>=2 && fake::evals==before_native+int(late_deliveries));
             }

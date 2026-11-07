@@ -397,7 +397,7 @@ struct NativeBridgeCounters {
         // Late-bound route: learned dispatches staged for resolution at submission, how many
         // had descriptors rewritten after recording (changed) or not (same), and how many
         // resolved to the learned images and went to the list-boundary DLSS.
-        st_late_staged{0},st_late_changed{0},st_late_same{0},st_late_resolved{0};
+        st_late_staged{0},st_late_changed{0},st_late_same{0},st_late_resolved{0},st_late_inline{0};
     std::mutex m;char reason[200]{};
     // Sol bafa40a (5c/5d), under m: every refusal reason with its count, and first
     // vs sustained delivery (by submitted frame).
@@ -436,6 +436,13 @@ struct NativeCrossing {
     bool separate_reader = false;
     bool operator==(const NativeCrossing& b) const {
         return pso==b.pso&&input==b.input&&output==b.output&&scene==b.scene&&
+            rw==b.rw&&rh==b.rh&&ow==b.ow&&oh==b.oh&&in_view==b.in_view&&out_view==b.out_view&&
+            gx==b.gx&&gy==b.gy&&gz==b.gz&&separate_reader==b.separate_reader;
+    }
+    // The same step reading another render-size image (p27252: SE5's pso 556 alternates its
+    // input between #13433 and #13435 while the output #13437 stays).
+    bool same_step(const NativeCrossing& b) const {
+        return pso==b.pso&&output==b.output&&scene==b.scene&&
             rw==b.rw&&rh==b.rh&&ow==b.ow&&oh==b.oh&&in_view==b.in_view&&out_view==b.out_view&&
             gx==b.gx&&gy==b.gy&&gz==b.gz&&separate_reader==b.separate_reader;
     }
@@ -491,7 +498,9 @@ struct NativeTrace{
     uint32_t learned_interval=900; // presents between re-verifying traces once learned (tests shorten it)
     char result[4096]{};
     NativeCrossing previous, learned;
+    std::vector<uint64_t> learned_inputs; // every render-size input the learned step was seen reading (cap 4)
     std::atomic<uint64_t> learned_pso{0};
+    void note_input(uint64_t id){ if(id&&std::find(learned_inputs.begin(),learned_inputs.end(),id)==learned_inputs.end()&&learned_inputs.size()<4)learned_inputs.push_back(id); }
 };
 NativeTrace& g_trace=*new NativeTrace;
 constexpr uint64_t kTraceOps=60000;
@@ -1114,15 +1123,19 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
                 (unsigned long long)p.output,(unsigned long long)candidate.output,p.gx,p.gy,candidate.gx,candidate.gy,
                 p.in_view,p.out_view,candidate.in_view,candidate.out_view);
         }
-        if (candidate==g_trace.previous) g_trace.learned=candidate;
-        else if (!(candidate==g_trace.learned)) g_trace.learned={};
+        // Learned when two successive traces show the same step; an input-only variant of
+        // the learned step keeps it and is remembered as another input (p27252: dropping the
+        // route on 556's alternating input left learned=0 between traces).
+        if (candidate.same_step(g_trace.previous)) { g_trace.learned=candidate; g_trace.note_input(g_trace.previous.input); g_trace.note_input(candidate.input); }
+        else if (!candidate.same_step(g_trace.learned)) { g_trace.learned={}; g_trace.learned_inputs.clear(); }
+        else g_trace.note_input(candidate.input);
     } else if (g_trace.learned.pso && !g_trace.untraced) {
         // A complete trace (no ambiguity, no unresolved writer, every list traced)
         // with no crossing is a definitive negative for the learned route
         // (overwritten, or the picture no longer comes from it): stop delivering into it.
         ++g_trace.invalidated;
         add(" invalidated_learned=%llu",(unsigned long long)g_trace.learned.pso);
-        g_trace.learned={};
+        g_trace.learned={};g_trace.learned_inputs.clear();
     }
     g_trace.previous=candidate;    g_trace.learned_pso.store(g_trace.learned.pso,std::memory_order_release);
     add(" overlays=%u learned=%llu",overlays,static_cast<unsigned long long>(g_trace.learned.pso));
@@ -1448,7 +1461,7 @@ void apply_probe_outcome(int outcome,const NativeCrossing& c)
     std::lock_guard<std::mutex> lock(g_trace.m);
     if(!(g_trace.provisional==c))return; // the trace moved on meanwhile
     if(outcome==1){
-        g_trace.learned=c;g_trace.previous=c;++g_trace.verified;
+        g_trace.learned=c;g_trace.previous=c;g_trace.note_input(c.input);++g_trace.verified;
         g_trace.provisional={};
         na::eventlog::Emit("native_trace","provisional crossing confirmed on screen: learned pso=%llu in#%llu out#%llu",
             (unsigned long long)c.pso,(unsigned long long)c.input,(unsigned long long)c.output);
@@ -4892,7 +4905,39 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
         // the submission-time route; otherwise the inline route stays (fresh tables), with
         // the late route as the fallback when the record-time table does not match.
         const bool late_eligible=dispatch;
-        if (late_eligible && g_trace.late_total.load(std::memory_order_relaxed)) return stage_late(l,std::move(op),learned,scene,depth);
+        if (late_eligible && g_trace.late_total.load(std::memory_order_relaxed)) {
+            // p27252: the game's list layout moves (pso 556 ends list 76 in some frames, sits
+            // before the HUD blends inside list 78 in others), so a list boundary is not always
+            // there. Inline DLSS after the dispatch needs its images at record time without the
+            // table: the output is the learned one (constant), the input is the learned
+            // render-size image written in THIS recording (render-target writes are recorded
+            // correctly; the step alternates between two inputs, both drawn in its own list).
+            std::vector<uint64_t> inputs;
+            { std::lock_guard<std::mutex> lock(g_trace.m); inputs=g_trace.learned_inputs; }
+            if (std::find(inputs.begin(),inputs.end(),learned.input)==inputs.end()) inputs.push_back(learned.input);
+            uint64_t chosen=0; unsigned written=0;
+            for (const auto id:inputs) if (na::observe::ListInsertionDecision(l,id).writes>0) { chosen=id; ++written; }
+            if (written!=1) chosen=inputs.size()==1?inputs[0]:0;
+            if (chosen) {
+                auto c=std::make_shared<Candidate>();
+                c->color=scene;c->depth=depth;c->recording=op.recording;
+                c->source.Attach(na::observe::AcquireResource(chosen));
+                c->guide.Attach(na::observe::AcquireResource(depth));
+                c->target.Attach(na::observe::AcquireResource(learned.output));
+                if (c->source && c->guide && c->target) {
+                    const auto sd=c->source->GetDesc(), od=c->target->GetDesc();
+                    if (sd.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D && od.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                        sd.Width==extent.rw && sd.Height==extent.rh && od.Width==extent.ow && od.Height==extent.oh &&
+                        typed(sd.Format)==typed(od.Format)) {
+                        c->input=chosen;c->dest=learned.output;c->separate_reader=learned.separate_reader;
+                        g_nb.st_candidates.fetch_add(1,std::memory_order_relaxed);
+                        g_nb.st_late_inline.fetch_add(1,std::memory_order_relaxed);
+                        return {na::observe::ShaderAction::Forward,c};
+                    }
+                }
+            }
+            return stage_late(l,std::move(op),learned,scene,depth);
+        }
 
         const na::observe::OperationDescriptor* input=nullptr;
         const na::observe::OperationDescriptor* output=nullptr;
@@ -6926,7 +6971,7 @@ NativeBridgeStats GetNativeBridgeStats() {
     r.st_gated=n.st_gated.load();r.st_full=n.st_full.load();r.st_examined=n.st_examined.load();r.st_no_input=n.st_no_input.load();
     r.st_ambiguous=n.st_ambiguous.load();r.st_draw_state=n.st_draw_state.load();r.st_candidates=n.st_candidates.load();
     r.st_recorded=n.st_recorded.load();r.st_failed=n.st_failed.load();r.st_ungated_full=n.st_ungated_full.load();r.st_budget=n.st_budget.load();r.st_aux=n.st_aux.load();
-    r.st_late_staged=n.st_late_staged.load();r.st_late_changed=n.st_late_changed.load();r.st_late_same=n.st_late_same.load();r.st_late_resolved=n.st_late_resolved.load();
+    r.st_late_staged=n.st_late_staged.load();r.st_late_changed=n.st_late_changed.load();r.st_late_same=n.st_late_same.load();r.st_late_resolved=n.st_late_resolved.load();r.st_late_inline=n.st_late_inline.load();
     size_t used=0;
     for(uint32_t i=0;i<n.step_count&&used+100<sizeof r.steps;++i){
         const auto& e=n.steps[i];
@@ -6960,7 +7005,7 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
         std::lock_guard<std::mutex> lock(g_trace.m);
         if(!g_native_reduced.load(std::memory_order_relaxed)){
             if(g_trace.armed.load()){g_trace.armed.store(false);g_trace.recs.clear();g_trace.frame.clear();}
-            g_trace.previous={};g_trace.learned={};g_trace.learned_pso.store(0);
+            g_trace.previous={};g_trace.learned={};g_trace.learned_inputs.clear();g_trace.learned_pso.store(0);
             g_trace.presents=g_trace.armed_at=0;
             return;
         }
