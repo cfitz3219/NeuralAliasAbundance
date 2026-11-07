@@ -4576,6 +4576,13 @@ void replay_probe_draw(GL* l, UINT count, UINT instances, bool indexed)
 // (skinned characters too), the data a game with DLSS built in hands NVIDIA. Generic: no game data.
 // Slot layout: kRpCounters filled-size counters (16 bytes each), then float4 positions.
 constexpr uint32_t kRpSlots = 3, kRpCounters = 8192, kRpBlock = 256; // counters zeroed per list, a block at a time
+// Sol (COMMS 0860a3b): a writer list that is closed but not reset can execute
+// again and rewrite a reused slot's positions (any range, not only its own
+// stamp). A slot is reused only once every writer list is reset (Retired) AND
+// done on the GPU. SE5 keeps lists for several frames, so slots are added on
+// demand up to kRpMaxSlots (48 MB each) instead of waiting (3 fixed slots
+// waiting on retirement gave not_ready 39.6M on 4c5b2d9).
+constexpr uint32_t kRpMaxSlots = 8;
 constexpr uint64_t kRpCounterBytes = uint64_t(kRpCounters) * 16, kRpBytes = 48ull << 20;
 // 2026-11-07 (98d13f1 run: segments 6724, pending 6723, fed 0): J2 records its
 // list before SE5 submits the geometry lists, so "already submitted" is never
@@ -4634,13 +4641,23 @@ struct RpSlot {
         for (const auto& x : segs) if (x.writer && !x.writer->Completed()) return false;
         return true;
     }
+    bool Unretired() const {
+        for (const auto& x : segs) if (x.writer && !x.writer->Retired()) return true;
+        return false;
+    }
 };
-RpSlot& rp_slot(uint32_t i) { static RpSlot* s = new RpSlot[kRpSlots]; return s[i]; }
+RpSlot& rp_slot(uint32_t i) { static RpSlot* s = new RpSlot[kRpMaxSlots]; return s[i]; }
+uint32_t g_rp_slots = 0; // slots with a buffer (under g_replay_slots_m)
+RpSlot* rp_find(uint64_t frame)
+{
+    for (uint32_t i = 0; i < g_rp_slots; ++i) if (rp_slot(i).frame == frame && rp_slot(i).buf) return &rp_slot(i);
+    return nullptr;
+}
 std::atomic<uint64_t> g_rp_stat[32]; // see DrawReplayStats
 enum : uint32_t { kRpReplayed, kRpVerts, kRpNoTwin, kRpBuilding, kRpFailedTwin, kRpOverflow, kRpTopology, kRpStages, kRpUntwinned,
                   kRpNoRecipe, kRpNotReady, kRpBuilt, kRpBuildFailed, kRpNoted, kRpHashMismatch, kRpOtherList,
                   kRpTakeUnclaimed, kRpTakeOtherList, kRpTakeSealed, kRpTaken, kRpSegments, kRpPendingSegs,
-                  kRpPendingStamped, kRpStamps, kRpReuseUnretired, kRpStatCount };
+                  kRpPendingStamped, kRpStamps, kRpReuseUnretired, kRpSlotsMade, kRpStatCount };
 static_assert(kRpStatCount <= 32, "g_rp_stat size");
 void rp_count(uint32_t k, uint64_t n = 1) { g_rp_stat[k].fetch_add(n, std::memory_order_relaxed); }
 
@@ -4749,10 +4766,12 @@ bool rp_ensure_buffers()
     rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     for (uint32_t i = 0; i < kRpSlots; ++i)
         if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&rp_slot(i).buf)))) return false;
+    { std::lock_guard<std::mutex> lk(g_replay_slots_m); g_rp_slots = kRpSlots; }
+    rp_count(kRpSlotsMade, kRpSlots);
     rd.Width = kRpCounterBytes;
     if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
             D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_rp_zeros)))) return false;
-    rd.Width = uint64_t(kRpSlots) * kRpMaxSegs * 4;
+    rd.Width = uint64_t(kRpMaxSlots) * kRpMaxSegs * 4;
     if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
             D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_rp_stamps)))) return false;
     g_rp_bufs_ok.store(true, std::memory_order_release);
@@ -4767,7 +4786,7 @@ void replay_on_close(GL* l)
     if (!recording) return;
     const uint64_t list_id = IdOf(l);
     std::lock_guard<std::mutex> lock(g_replay_slots_m);
-    for (uint32_t i = 0; i < kRpSlots; ++i) {
+    for (uint32_t i = 0; i < g_rp_slots; ++i) {
         auto& slot = rp_slot(i);
         for (auto& x : slot.segs) {
             if (x.list_id != list_id || x.recording != recording) continue;
@@ -4935,17 +4954,35 @@ void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2,
     if (!verts) return;
     std::lock_guard<std::mutex> replay_lock(g_replay_slots_m);
     if (frame != g_rp_frame.load(std::memory_order_acquire)) return;
-    RpSlot& slot = rp_slot(static_cast<uint32_t>(frame % kRpSlots));
     const HostWorkScope own;
-    if (slot.frame != frame) {
-        if (!slot.Free()) {
+    RpSlot* found = rp_find(frame);
+    uint32_t slot_index = found ? static_cast<uint32_t>(found - &rp_slot(0)) : 0;
+    if (!found) {
+        // A free slot that is not the previous frame's (J2 reads it as history).
+        bool waited = false;
+        for (uint32_t i = 0; i < g_rp_slots && !found; ++i) {
+            RpSlot& c = rp_slot(i);
+            if (c.frame + 1 == frame || !c.Free()) continue;
+            if (c.Unretired()) { waited = true; continue; }
+            found = &c; slot_index = i;
+        }
+        if (!found && g_rp_slots < kRpMaxSlots) {
+            D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+            D3D12_RESOURCE_DESC rd{};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = kRpBytes; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+            rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            RpSlot& c = rp_slot(g_rp_slots);
+            if (SUCCEEDED(g_rp_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&c.buf)))) {
+                found = &c; slot_index = g_rp_slots++;
+                rp_count(kRpSlotsMade);
+            }
+        }
+        if (!found) {
+            if (waited) rp_count(kRpReuseUnretired);
             rp_count(kRpNotReady);
             return;
         }
-        // A writer list that is not reset yet could execute again and rewrite
-        // this storage. Its stamp then no longer matches the new segment's
-        // token, so checked draws are clipped; counted to see if SE5 does it.
-        for (const auto& x : slot.segs) if (x.writer && !x.writer->Retired()) rp_count(kRpReuseUnretired);
+        RpSlot& slot = *found;
         slot.reader.reset();
         slot.segs.clear();
         slot.frame = frame;
@@ -4953,6 +4990,7 @@ void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2,
         slot.verts = 0;
         slot.counters = 0;
     }
+    RpSlot& slot = *found;
     if (slot.sealed) { rp_count(kRpOtherList); return; }
     RpSlot::Seg* seg = nullptr;
     for (auto& x : slot.segs) if (x.list_id == list_id && x.recording == recording) { seg = &x; break; }
@@ -4962,7 +5000,7 @@ void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2,
         if (!use) return;
         Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList2> l2;
         const bool stampable = SUCCEEDED(l->QueryInterface(IID_PPV_ARGS(&l2)));
-        const uint32_t index = static_cast<uint32_t>(frame % kRpSlots) * kRpMaxSegs + static_cast<uint32_t>(slot.segs.size());
+        const uint32_t index = slot_index * kRpMaxSegs + static_cast<uint32_t>(slot.segs.size());
         uint32_t token = 0;
         while (!token) token = g_rp_token.fetch_add(1, std::memory_order_relaxed) + 1;
         slot.segs.push_back({});
@@ -8066,8 +8104,9 @@ bool ReplayTakeFrame(GL* list, ID3D12CommandQueue* queue, ReplayFrame* f)
     std::lock_guard<std::mutex> lock(g_replay_slots_m);
     const uint64_t frame = g_rp_frame.load(std::memory_order_acquire);
     if (frame < 2 || !recording || !retain) return false;
-    auto& cur = rp_slot(static_cast<uint32_t>(frame % kRpSlots));
-    if (cur.frame != frame || cur.segs.empty()) { rp_count(kRpTakeUnclaimed); return false; }
+    RpSlot* cur_slot = rp_find(frame);
+    if (!cur_slot || cur_slot->segs.empty()) { rp_count(kRpTakeUnclaimed); return false; }
+    auto& cur = *cur_slot;
     if (cur.sealed) { rp_count(kRpTakeSealed); return false; }
     // Positions this list may read now: its own (recorded earlier in this same
     // list) and those of other lists already submitted to this queue (same-queue
@@ -8100,8 +8139,9 @@ bool ReplayTakeFrame(GL* list, ID3D12CommandQueue* queue, ReplayFrame* f)
     f->cur_in_list = own;
     f->stamps = g_rp_stamps.Get();
     f->data_offset = kRpCounterBytes;
-    auto& prev = rp_slot(static_cast<uint32_t>((frame - 1) % kRpSlots));
-    if (prev.frame == frame - 1 && prev.sealed && !prev.segs.empty()) {
+    RpSlot* prev_slot = rp_find(frame - 1);
+    if (prev_slot && prev_slot->sealed && !prev_slot->segs.empty()) {
+        auto& prev = *prev_slot;
         bool ready = true;
         for (const auto& x : prev.segs) ready &= x.writer && x.writer->Ready(queue);
         if (ready) {
@@ -8132,7 +8172,7 @@ void GetDrawReplayStats(DrawReplayStats* out)
     out->other_list = v(kRpOtherList); out->take_unclaimed = v(kRpTakeUnclaimed); out->take_other_list = v(kRpTakeOtherList);
     out->take_sealed = v(kRpTakeSealed); out->taken = v(kRpTaken);
     out->segments = v(kRpSegments); out->pending_segments = v(kRpPendingSegs);
-    out->pending_stamped = v(kRpPendingStamped); out->stamps = v(kRpStamps); out->reuse_unretired = v(kRpReuseUnretired);
+    out->pending_stamped = v(kRpPendingStamped); out->stamps = v(kRpStamps); out->reuse_unretired = v(kRpReuseUnretired); out->slots = v(kRpSlotsMade);
 }
 bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float* y)
 {

@@ -395,7 +395,8 @@ struct DrawReplayStats {
     uint64_t other_list = 0, take_unclaimed = 0, take_other_list = 0, take_sealed = 0, taken = 0;
     uint64_t segments = 0, pending_segments = 0; // list segments written; other-list segments not yet submitted at J2 and unusable
     uint64_t pending_stamped = 0, stamps = 0; // unsubmitted segments used under a GPU stamp check; stamps written at Close
-    uint64_t reuse_unretired = 0; // slot reused while a writer list was not reset yet (could execute again)
+    uint64_t reuse_unretired = 0; // no slot for a frame because writer lists were not reset yet (could execute again)
+    uint64_t slots = 0; // position slots created (3 at start, more while SE5 keeps lists)
 };
 void SetDrawReplay(uint64_t frame, ReplayRetain retain);
 bool ReplayTakeFrame(ID3D12GraphicsCommandList* list, ID3D12CommandQueue* queue, ReplayFrame* f);
