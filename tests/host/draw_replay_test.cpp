@@ -261,13 +261,14 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
     // and J2 records on a later one. 98d13f1 run (pending 6723 of 6724, fed 0):
     // J2 records before SE5 submits that list. A list submitted later but
     // before J2's list runs must give correct motion (GPU stamp passes); one
-    // that runs after J2's list must leave no motion (stamp fails).
+    // that runs after J2's list must leave no motion (stamp fails). Both also
+    // with geometry and J2's list in ONE ExecuteCommandLists, in both orders.
     {
         test::List geo, post;
         REQUIRE(geo.Create(dev) && post.Create(dev));
         REQUIRE(SUCCEEDED(geo.list->Close()) && SUCCEEDED(post.list->Close()));
         uint32_t fed_frames = 0, pending_ok = 0, late_masked = 0;
-        for (uint32_t frame = 200; frame < 212; ++frame) {
+        for (uint32_t frame = 200; frame < 216; ++frame) {
             na::nr::native::Reset(geo.list.Get());geo.Reset();
             na::nr::native::Reset(post.list.Get());post.Reset();
             const float jitter[2] = { frame % 2 ? .375f : -.25f, frame % 2 ? -.375f : .25f };
@@ -287,13 +288,15 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
             g->RSSetScissorRects(1, &sc);
             g->DrawInstanced(3, 1, 0, 0);
             auto to_read = test::Transition(depth.Get(), depth_write, npsr);
-            // 208 runs J2's list first: the depth hand-over moves into J2's list.
-            if (frame != 208) g->ResourceBarrier(1, &to_read);
+            // 205/212: geometry submitted after J2 recorded (separately / in the same call, first).
+            // 208/214: J2's list runs first (separately / first in the same call): stale positions.
+            const bool pending = frame == 205 || frame == 212, late = frame == 208 || frame == 214;
+            const bool same_call = frame == 212 || frame == 214;
+            // A late frame runs J2's list first: the depth hand-over moves into J2's list.
+            if (!late) g->ResourceBarrier(1, &to_read);
             else post.list->ResourceBarrier(1, &to_read);
             REQUIRE(SUCCEEDED(g->Close()));
-            // 205: geometry submitted after J2 recorded, before J2's list runs.
-            // 208: geometry submitted after J2's list ran (its positions are stale).
-            const bool submit_first = frame != 205 && frame != 208;
+            const bool submit_first = !pending && !late;
             ID3D12CommandList* gl[] = {g};
             if (submit_first) { na::nr::native::Submission s1(d.queue.Get(), 1, gl); d.queue->ExecuteCommandLists(1, gl); }
             const na::j2::replay_motion::Output output = [&] {
@@ -318,10 +321,16 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
             std::swap(to_read.Transition.StateBefore, to_read.Transition.StateAfter);
             post.list->ResourceBarrier(1, &to_read);
             REQUIRE(SUCCEEDED(post.list->Close()));
-            if (frame == 205) { na::nr::native::Submission s1(d.queue.Get(), 1, gl); d.queue->ExecuteCommandLists(1, gl); }
             ID3D12CommandList* pl[] = {post.list.Get()};
-            { na::nr::native::Submission s2(d.queue.Get(), 1, pl); d.queue->ExecuteCommandLists(1, pl); }
-            if (frame == 208) { na::nr::native::Submission s1(d.queue.Get(), 1, gl); d.queue->ExecuteCommandLists(1, gl); }
+            if (same_call) {
+                ID3D12CommandList* both[] = {pending ? g : post.list.Get(), pending ? post.list.Get() : g};
+                na::nr::native::Submission s(d.queue.Get(), 2, both);
+                d.queue->ExecuteCommandLists(2, both);
+            } else {
+                if (pending) { na::nr::native::Submission s1(d.queue.Get(), 1, gl); d.queue->ExecuteCommandLists(1, gl); }
+                { na::nr::native::Submission s2(d.queue.Get(), 1, pl); d.queue->ExecuteCommandLists(1, pl); }
+                if (late) { na::nr::native::Submission s1(d.queue.Get(), 1, gl); d.queue->ExecuteCommandLists(1, gl); }
+            }
             d.WaitIdle();
             if (output.motion) {
                 std::byte* mapped = nullptr;
@@ -329,12 +338,12 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
                 const auto* motion = reinterpret_cast<const float*>(mapped + 7 * pitch);
                 const auto* valid = reinterpret_cast<const float*>(mapped + (h + 7) * pitch);
                 const bool right = valid[12] == 1.f && std::abs(motion[24] - (frame % 2 ? -1.f : 1.f)) < 1e-3f && std::abs(motion[25]) < 1e-3f;
-                if (frame == 208) {
+                if (late) {
                     CHECK(valid[12] == 0.f);
                     if (valid[12] == 0.f) ++late_masked;
                 } else {
                     CHECK(right);
-                    if (frame == 205 && right) ++pending_ok;
+                    if (pending && right) ++pending_ok;
                 }
                 std::printf("frame %u: motion (12,7) %.3f %.3f valid %.0f\n", frame, motion[24], motion[25], valid[12]);
                 rb->Unmap(0, nullptr);
@@ -343,11 +352,11 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
         }
         na::observe::DrawReplayStats stats{};
         na::observe::GetDrawReplayStats(&stats);
-        std::printf("geometry on another list: motion on %u frames (11 expected), pending ok %u, late masked %u, stamps %llu, pending_stamped %llu\n",
+        std::printf("geometry on another list: motion on %u frames (15 expected), pending ok %u, late masked %u, stamps %llu, pending_stamped %llu\n",
                     fed_frames, pending_ok, late_masked, (unsigned long long)stats.stamps, (unsigned long long)stats.pending_stamped);
-        CHECK(fed_frames >= 11); // 200 has no previous
-        CHECK(pending_ok == 1);
-        CHECK(late_masked == 1);
+        CHECK(fed_frames >= 15); // 200 has no previous
+        CHECK(pending_ok == 2);
+        CHECK(late_masked == 2);
     }
     test::ComPtr<ID3D12InfoQueue> messages;
     if (debug && SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&messages)))) {

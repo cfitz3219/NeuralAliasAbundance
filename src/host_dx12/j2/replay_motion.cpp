@@ -5,6 +5,8 @@
 #include <climits>
 #include <cstring>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 using Microsoft::WRL::ComPtr;
 
@@ -19,6 +21,7 @@ ByteAddressBuffer t_stamp : register(t3);
 cbuffer C : register(b0) {
     uint cur_first, prev_first; // per draw (float4 elements from the buffers' view start)
     uint check, token;          // per draw: check != 0 -> positions valid only if stamp[check-1] == token
+    uint prev_check, prev_token; // same for the previous frame's positions
     uint w, h;
     float jx, jy;               // current viewport jitter, absent from the saved clip positions
     uint pad0, pad1;
@@ -28,7 +31,8 @@ V vs(uint id : SV_VertexID) {
     V o;
     // The writer list ran after this one (or never): its positions are stale.
     // Clip the whole draw (z < 0) so it leaves no motion and no mask.
-    if (check != 0u && t_stamp.Load((check - 1u) * 4u) != token) {
+    if ((check != 0u && t_stamp.Load((check - 1u) * 4u) != token) ||
+        (prev_check != 0u && t_stamp.Load((prev_check - 1u) * 4u) != prev_token)) {
         o.pos = float4(0, 0, -1, 1);
         o.prev = float4(0, 0, 0, 0);
         return o;
@@ -127,7 +131,8 @@ std::vector<Pair> Match(const std::vector<na::observe::ReplayRecord>& cur,
         const auto p = prior.find(key);
         if (p == prior.end() || !p->second || p->second->verts != draw.verts) continue;
         out.push_back({draw.first, p->second->first, draw.verts,
-                       {draw.scissor[0], draw.scissor[1], draw.scissor[2], draw.scissor[3]}, draw.check, draw.token});
+                       {draw.scissor[0], draw.scissor[1], draw.scissor[2], draw.scissor[3]}, draw.check, draw.token,
+                       p->second->check, p->second->token});
     }
     return out;
 }
@@ -143,7 +148,7 @@ bool Pass::Init(ID3D12Device* device)
     params[0].DescriptorTable.NumDescriptorRanges = 1;
     params[0].DescriptorTable.pDescriptorRanges = &range;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[1].Constants.Num32BitValues = 4 + sizeof(Globals) / 4;
+    params[1].Constants.Num32BitValues = 6 + sizeof(Globals) / 4;
     D3D12_ROOT_SIGNATURE_DESC rs{};
     rs.NumParameters = 2; rs.pParameters = params;
     ComPtr<ID3DBlob> sig, err;
@@ -227,7 +232,7 @@ Output Pass::Record(ID3D12GraphicsCommandList* l, ID3D12CommandQueue* q, ID3D12R
     stats_.unmatched += f.cur_draws.size() - pairs.size();
     stats_.last_pairs = static_cast<uint32_t>(pairs.size());
     if (pairs.empty()) return out;
-    if (!f.stamps) for (const Pair& p : pairs) if (p.check) return out;
+    if (!f.stamps) for (const Pair& p : pairs) if (p.check || p.prev_check) return out;
     uint32_t set = 0;
     while (set < kSets && descriptor_use_[set] && !descriptor_use_[set].Retired()) ++set;
     if (set == kSets || !ensure(rw, rh)) return out;
@@ -244,18 +249,21 @@ Output Pass::Record(ID3D12GraphicsCommandList* l, ID3D12CommandQueue* q, ID3D12R
     const auto PSR = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     const auto RT = D3D12_RESOURCE_STATE_RENDER_TARGET;
     const auto SO = D3D12_RESOURCE_STATE_STREAM_OUT;
-    // cur was written by this frame's lists (STREAM_OUT); prev decayed to COMMON after the frame
-    // before and is promoted to a read state here.
+    // cur was written by this frame's lists (STREAM_OUT in this list when it wrote some itself);
+    // prev and other lists' positions are in COMMON (writers leave it there at Close).
     // cur is in STREAM_OUT only when this list wrote positions itself; positions
     // of other (already submitted) lists are in COMMON and promote to a read state.
     const auto COMMON = D3D12_RESOURCE_STATE_COMMON;
     // stamps: COMMON between uses (writers stamp at Close via COPY_DEST, even in this list later).
-    D3D12_RESOURCE_BARRIER b[5] = {tr(depth, NPSR, NPSR | PSR), tr(motion_.Get(), NPSR, RT), tr(valid_.Get(), NPSR, RT),
-                                   tr(f.stamps, COMMON, NPSR), tr(f.cur, SO, NPSR)};
-    UINT nb = 3;
-    if (f.stamps) ++nb; else b[3] = b[4];
-    if (f.cur_in_list) ++nb;
-    l->ResourceBarrier(nb, b);
+    // Positions from other lists get an explicit transition (not implicit
+    // promotion): lists in one ExecuteCommandLists may overlap, and the
+    // writer ends with an explicit STREAM_OUT -> COMMON, so the pair orders
+    // its stream-output writes before these reads (as the game's own depth
+    // hand-over between its lists does).
+    std::vector<D3D12_RESOURCE_BARRIER> b = {tr(depth, NPSR, NPSR | PSR), tr(motion_.Get(), NPSR, RT), tr(valid_.Get(), NPSR, RT),
+                                             tr(f.cur, f.cur_in_list ? SO : COMMON, NPSR), tr(f.prev, COMMON, NPSR)};
+    if (f.stamps) b.push_back(tr(f.stamps, COMMON, NPSR));
+    l->ResourceBarrier(static_cast<UINT>(b.size()), b.data());
 
     D3D12_CPU_DESCRIPTOR_HANDLE h = srv_->GetCPUDescriptorHandleForHeapStart();
     h.ptr += static_cast<SIZE_T>(set) * 4 * srv_stride_;
@@ -288,23 +296,21 @@ Output Pass::Record(ID3D12GraphicsCommandList* l, ID3D12CommandQueue* q, ID3D12R
     l->SetPipelineState(pso_[reversed ? 1 : 0].Get());
     l->SetGraphicsRootDescriptorTable(0, gh);
     const Globals g{rw, rh, viewport_jitter ? viewport_jitter[0] : 0.f, viewport_jitter ? viewport_jitter[1] : 0.f, 0, 0};
-    l->SetGraphicsRoot32BitConstants(1, sizeof(Globals) / 4, &g, 4);
+    l->SetGraphicsRoot32BitConstants(1, sizeof(Globals) / 4, &g, 6);
     const D3D12_VIEWPORT vp{g.jx, g.jy, static_cast<float>(rw), static_cast<float>(rh), 0.f, 1.f};
     l->RSSetViewports(1, &vp);
     l->OMSetRenderTargets(2, rt, FALSE, &dsv);
     l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     for (const Pair& p : pairs) {
         l->RSSetScissorRects(1, &p.scissor);
-        const uint32_t per_draw[4] = {p.cur_first, p.prev_first, p.check, p.token};
-        l->SetGraphicsRoot32BitConstants(1, 4, per_draw, 0);
+        const uint32_t per_draw[6] = {p.cur_first, p.prev_first, p.check, p.token, p.prev_check, p.prev_token};
+        l->SetGraphicsRoot32BitConstants(1, 6, per_draw, 0);
         l->DrawInstanced(p.verts, 1, 0, 0);
         stats_.verts += p.verts;
-        if (p.check) ++stats_.checked;
+        if (p.check || p.prev_check) ++stats_.checked;
     }
-    D3D12_RESOURCE_BARRIER a[5] = {tr(depth, NPSR | PSR, NPSR), tr(motion_.Get(), RT, NPSR), tr(valid_.Get(), RT, NPSR),
-                                   tr(f.stamps, NPSR, COMMON), tr(f.cur, NPSR, SO)};
-    if (!f.stamps) a[3] = a[4];
-    l->ResourceBarrier(nb, a);
+    for (auto& x : b) std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+    l->ResourceBarrier(static_cast<UINT>(b.size()), b.data());
     ++stats_.fed;
     out.motion = motion_.Get();
     out.valid = valid_.Get();

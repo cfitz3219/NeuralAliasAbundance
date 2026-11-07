@@ -17,7 +17,7 @@
 
 namespace na::j2::replay_motion {
 
-struct Pair { uint32_t cur_first = 0, prev_first = 0, verts = 0; D3D12_RECT scissor{}; uint32_t check = 0, token = 0; };
+struct Pair { uint32_t cur_first = 0, prev_first = 0, verts = 0; D3D12_RECT scissor{}; uint32_t check = 0, token = 0, prev_check = 0, prev_token = 0; };
 // Draws need a unique signature and buffer match in both frames. Otherwise
 // two objects sharing a mesh can swap identities when draw order changes.
 std::vector<Pair> Match(const std::vector<na::observe::ReplayRecord>& cur, const std::vector<na::observe::ReplayRecord>& prev,

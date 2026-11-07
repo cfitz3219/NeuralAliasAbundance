@@ -4607,12 +4607,12 @@ struct RpSlot {
     }
 };
 RpSlot& rp_slot(uint32_t i) { static RpSlot* s = new RpSlot[kRpSlots]; return s[i]; }
-std::atomic<uint64_t> g_rp_stat[24]; // see DrawReplayStats
+std::atomic<uint64_t> g_rp_stat[32]; // see DrawReplayStats
 enum : uint32_t { kRpReplayed, kRpVerts, kRpNoTwin, kRpBuilding, kRpFailedTwin, kRpOverflow, kRpTopology, kRpStages, kRpUntwinned,
                   kRpNoRecipe, kRpNotReady, kRpBuilt, kRpBuildFailed, kRpNoted, kRpHashMismatch, kRpOtherList,
                   kRpTakeUnclaimed, kRpTakeOtherList, kRpTakeSealed, kRpTaken, kRpSegments, kRpPendingSegs,
-                  kRpPendingStamped, kRpStamps, kRpStatCount };
-static_assert(kRpStatCount <= 24, "g_rp_stat size");
+                  kRpPendingStamped, kRpStamps, kRpReuseUnretired, kRpStatCount };
+static_assert(kRpStatCount <= 32, "g_rp_stat size");
 void rp_count(uint32_t k, uint64_t n = 1) { g_rp_stat[k].fetch_add(n, std::memory_order_relaxed); }
 
 HRESULT make_replay_root(ID3D12Device* dev, UINT node, ID3D12RootSignature* game,
@@ -4913,6 +4913,10 @@ void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2,
             rp_count(kRpNotReady);
             return;
         }
+        // A writer list that is not reset yet could execute again and rewrite
+        // this storage. Its stamp then no longer matches the new segment's
+        // token, so checked draws are clipped; counted to see if SE5 does it.
+        for (const auto& x : slot.segs) if (x.writer && !x.writer->Retired()) rp_count(kRpReuseUnretired);
         slot.reader.reset();
         slot.segs.clear();
         slot.frame = frame;
@@ -8026,6 +8030,8 @@ bool ReplayTakeFrame(GL* list, ID3D12CommandQueue* queue, ReplayFrame* f)
     // order). A list still unsubmitted could execute after us: left out.
     // A list not yet submitted is used too when its segment is stamped at its
     // Close: the replay shader then checks the stamp on the GPU (see kRpMaxSegs).
+    // Every other list's draws are checked too (a stale re-execution of an
+    // older writer rewrites its own token, which then no longer matches).
     bool own = false, other = false;
     for (auto& x : cur.segs) {
         const bool mine = x.list_id == list_id && x.recording == recording;
@@ -8035,7 +8041,7 @@ bool ReplayTakeFrame(GL* list, ID3D12CommandQueue* queue, ReplayFrame* f)
         own |= mine; other |= !mine;
         const size_t at = f->cur_draws.size();
         f->cur_draws.insert(f->cur_draws.end(), x.draws.begin(), x.draws.end());
-        if (!ready) for (size_t i = at; i < f->cur_draws.size(); ++i) {
+        if (!mine && (!ready || x.stamped)) for (size_t i = at; i < f->cur_draws.size(); ++i) {
             f->cur_draws[i].check = x.stamp_index + 1;
             f->cur_draws[i].token = x.token;
         }
@@ -8057,7 +8063,15 @@ bool ReplayTakeFrame(GL* list, ID3D12CommandQueue* queue, ReplayFrame* f)
         if (ready) {
             prev.reader = reader;
             f->prev = prev.buf.Get();
-            for (auto& x : prev.segs) { f->prev_draws.insert(f->prev_draws.end(), x.draws.begin(), x.draws.end()); x.draws.clear(); }
+            for (auto& x : prev.segs) {
+                const size_t at = f->prev_draws.size();
+                f->prev_draws.insert(f->prev_draws.end(), x.draws.begin(), x.draws.end());
+                x.draws.clear();
+                if (x.stamped) for (size_t i = at; i < f->prev_draws.size(); ++i) {
+                    f->prev_draws[i].check = x.stamp_index + 1;
+                    f->prev_draws[i].token = x.token;
+                }
+            }
         }
     }
     (void)other;
@@ -8074,7 +8088,7 @@ void GetDrawReplayStats(DrawReplayStats* out)
     out->other_list = v(kRpOtherList); out->take_unclaimed = v(kRpTakeUnclaimed); out->take_other_list = v(kRpTakeOtherList);
     out->take_sealed = v(kRpTakeSealed); out->taken = v(kRpTaken);
     out->segments = v(kRpSegments); out->pending_segments = v(kRpPendingSegs);
-    out->pending_stamped = v(kRpPendingStamped); out->stamps = v(kRpStamps);
+    out->pending_stamped = v(kRpPendingStamped); out->stamps = v(kRpStamps); out->reuse_unretired = v(kRpReuseUnretired);
 }
 bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float* y)
 {
