@@ -3145,11 +3145,11 @@ void game_frame_boundary(ID3D12CommandQueue* queue)
         static uint64_t bridge_frames=0;
         if(++bridge_frames%300==0){
             const auto b=na::j2::GetNativeBridgeStats();
-            na::eventlog::Emit("native_bridge","reduced=%d scene=%ux%u output=%ux%u hints=%llu examined=%llu not_reading=%llu snapshot=%llu source_size=%llu draw_state=%llu viewport=%llu no_destination=%llu ambiguous=%llu candidates=%llu recorded=%llu record_failed=%llu after_skipped=%llu src=%ux%u/%u full_target=%ux%u/%u | ticks=%llu applies=%llu game_applies=%llu refusals=%llu thread_changes=%llu controlled=%d confirmed=%d reason=\"%s\" native=\"%s\"",
+            na::eventlog::Emit("native_bridge","reduced=%d scene=%ux%u output=%ux%u hints=%llu examined=%llu not_reading=%llu snapshot=%llu source_size=%llu draw_state=%llu viewport=%llu no_destination=%llu ambiguous=%llu candidates=%llu recorded=%llu record_failed=%llu after_skipped=%llu redirected=%llu redirect_failed=%llu src=%ux%u/%u full_target=%ux%u/%u | ticks=%llu applies=%llu game_applies=%llu refusals=%llu thread_changes=%llu controlled=%d confirmed=%d reason=\"%s\" native=\"%s\"",
                 b.reduced?1:0,b.rw,b.rh,b.ow,b.oh,(unsigned long long)b.hints,(unsigned long long)b.examined,(unsigned long long)b.not_reading,
                 (unsigned long long)b.snapshot,(unsigned long long)b.source_size,(unsigned long long)b.draw_state,(unsigned long long)b.viewport,
                 (unsigned long long)b.no_destination,(unsigned long long)b.ambiguous,(unsigned long long)b.candidates,(unsigned long long)b.recorded,
-                (unsigned long long)b.record_failed,(unsigned long long)b.after_skipped,b.src_w,b.src_h,b.src_fmt,b.seen_w,b.seen_h,b.seen_fmt,
+                (unsigned long long)b.record_failed,(unsigned long long)b.after_skipped,(unsigned long long)b.redirected,(unsigned long long)b.redirect_failed,b.src_w,b.src_h,b.src_fmt,b.seen_w,b.seen_h,b.seen_fmt,
                 (unsigned long long)native.ticks,(unsigned long long)native.applies,(unsigned long long)native.game_applies,(unsigned long long)native.refusals,
                 (unsigned long long)native.thread_changes,native.controlled?1:0,native.confirmed?1:0,b.reason,native.reason);
         }

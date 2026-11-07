@@ -141,6 +141,11 @@ struct UpscaleTarget {
     uint64_t dest = 0;       // na_object_id of the destination texture; 0 = DLAA
     uint32_t dest_sub = 0;   // its subresource (mip + slice)
     uint32_t render_w = 0, render_h = 0;
+    // Optional private full-size destination (native scale, audit F10: the game
+    // tone-maps while upscaling, so DLSS writes HDR here and the game's own pass
+    // then reads it). Its state between uses is `state`.
+    ID3D12Resource* resource = nullptr;
+    uint32_t state = 0;
 };
 void SetUpscaleTarget(const UpscaleTarget& t);
 UpscaleTarget GetUpscaleTarget();
@@ -156,7 +161,7 @@ struct NativeBridgeStats {
     bool enabled=false,reduced=false;
     uint32_t rw=0,rh=0,ow=0,oh=0;            // the game's reported scene and output size
     uint64_t hints=0,examined=0,not_reading=0,snapshot=0,source_size=0,draw_state=0,viewport=0,
-        no_destination=0,ambiguous=0,candidates=0,recorded=0,record_failed=0,after_skipped=0;
+        no_destination=0,ambiguous=0,candidates=0,recorded=0,record_failed=0,after_skipped=0,redirected=0,redirect_failed=0;
     uint32_t src_w=0,src_h=0,src_fmt=0;       // last scene colour examined
     uint32_t seen_w=0,seen_h=0,seen_fmt=0;    // last full-size target written by a scene reader
     char reason[200]{};

@@ -54,6 +54,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <deque>
 #include <mutex>
 #include <vector>
 #include <string>
@@ -360,7 +361,7 @@ constexpr uint32_t kNativeHintOps=24;
 // Why the bridge did or did not find the game's upscale pass (status + log).
 struct NativeBridgeCounters {
     std::atomic<uint64_t> hints{0},examined{0},not_reading{0},snapshot{0},source_size{0},draw_state{0},viewport{0},
-        no_destination{0},ambiguous{0},candidates{0},recorded{0},record_failed{0},after_skipped{0};
+        no_destination{0},ambiguous{0},candidates{0},recorded{0},record_failed{0},after_skipped{0},redirected{0},redirect_failed{0};
     std::mutex m;char reason[200]{};uint32_t src_w=0,src_h=0,src_fmt=0,seen_w=0,seen_h=0,seen_fmt=0;
 };
 NativeBridgeCounters& g_nb=*new NativeBridgeCounters;
@@ -2348,8 +2349,9 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         up.render_w = phys->render_w;
         up.render_h = phys->render_h;
     }
-    if (phys || up.dest) {
+    if (phys || up.dest || up.resource) {
         if (phys) dest = phys->output;
+        else if (up.resource) dest = up.resource;
         else dest.Attach(na::observe::AcquireResource(up.dest));
         const uint32_t erw = up.render_w ? up.render_w : w, erh = up.render_h ? up.render_h : h;
         if (!dest) refuse_upscale("Upscale destination is not available.");
@@ -2377,10 +2379,13 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         if (!dest) return phys_fail(g.stats.upscale_note[0] ? g.stats.upscale_note : "Layer2: the physical output cannot be used.");
         sdest = phys->output_state;
     } else {
+        if (dest && up.resource) sdest = up.state; // private: its state is ours
+        else {
         if (dest && up.dest == color_id) refuse_upscale("The upscale destination is the scene colour itself.");
         // The destination may be untouched by the game until after J2's insertion: then the
         // state all submitted work left it in.
         if (dest && !state_of(up.dest, dsub_out, &sdest) && !na::observe::KnownSubStateOnQueueNow(g.queue.Get(),up.dest, dsub_out, &sdest)) refuse_upscale("Waiting: the upscale destination's state is not established.");
+        }
     }
     const bool upscaling = dest != nullptr;
     // Projection window: this frame's scene was drawn into the top-left corner of the
@@ -3512,7 +3517,93 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
     struct Candidate {
         uint64_t color=0,depth=0,dest=0,recording=0;uint32_t sub=0;
         ComPtr<ID3D12Resource> source,guide,target;
+        // Audit F10 (f905099 run: src fmt 10, full_target fmt 27): the pass that
+        // reads the small HDR scene ALSO tone-maps into a full-size target of
+        // another format. DLSS then runs BEFORE that draw into a private
+        // full-size HDR texture, and the draw reads it instead of the scene.
+        uint64_t other=0;ComPtr<ID3D12Resource> other_target;
+        bool rebound=false;
     };
+    // Private full-size HDR image for the F10 route (recreated on size/format change).
+    struct Full { ComPtr<ID3D12Resource> tex; uint32_t w=0,h=0; DXGI_FORMAT f=DXGI_FORMAT_UNKNOWN; };
+    Full full_;
+    // Shader-visible ring for the rebound draw's resource tables; a range is
+    // reused only once the recording that bound it has completed.
+    struct Ring {
+        ComPtr<ID3D12DescriptorHeap> heap; UINT size=0,next=0,inc=0;
+        struct Use { na::nr::native::RecordingLease lease; UINT start=0,count=0; };
+        std::deque<Use> uses;
+    };
+    Ring ring_;
+    std::mutex ring_m_;
+    bool alloc_ring(UINT n, UINT& start) {
+        auto& r=ring_;
+        if(!r.heap){
+            D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,1u<<16,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
+            if(FAILED(g.device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&r.heap))))return false;
+            r.size=hd.NumDescriptors;r.inc=g.device->GetDescriptorHandleIncrementSize(hd.Type);
+        }
+        while(!r.uses.empty()&&r.uses.front().lease.Completed())r.uses.pop_front();
+        if(n==0||n>r.size/2)return false;
+        if(r.uses.empty()){start=r.next+n<=r.size?r.next:0;r.next=start+n;return true;}
+        const UINT tail=r.uses.front().start;
+        if(r.next>=tail){
+            if(r.next+n<=r.size)start=r.next;else if(n<tail)start=0;else return false;
+        }else if(r.next+n<tail)start=r.next;else return false;
+        r.next=start+n;return true;
+    }
+    bool ensure_full(uint32_t w,uint32_t h,DXGI_FORMAT f){
+        if(full_.tex&&full_.w==w&&full_.h==h&&full_.f==f)return true;
+        full_={};
+        D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd{};rd.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;rd.Width=w;rd.Height=h;rd.DepthOrArraySize=1;rd.MipLevels=1;
+        rd.Format=f;rd.SampleDesc.Count=1;rd.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if(FAILED(g.device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&rd,D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&full_.tex))))return false;
+        full_.w=w;full_.h=h;full_.f=f;return true;
+    }
+    // Copy the draw's resource tables into the ring with the scene colour's SRV
+    // pointing at the DLSS image, and bind them (sampler heap/tables kept).
+    bool rebind(ID3D12GraphicsCommandList* l,const na::observe::NativeOperation& op,uint64_t scene_color,ID3D12Resource* replacement,DXGI_FORMAT format,
+                const std::shared_ptr<std::vector<ComPtr<ID3D12Resource>>>& owned,const char** why){
+        na::observe::ShaderState st;
+        if(!na::observe::ListShaderState(l,false,st)||!st.root){*why="The pass's binding state could not be read.";return false;}
+        UINT total=0;for(const auto& t:op.tables)total+=t.count;
+        std::lock_guard<std::mutex> lock(ring_m_);
+        UINT start=0;if(!alloc_ring(total,start)){*why="No free descriptor range for the redirected pass.";return false;}
+        auto lease=na::nr::native::RetainRecording(l,owned);if(!lease){*why="The recording could not be retained.";return false;}
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu=ring_.heap->GetCPUDescriptorHandleForHeapStart();cpu.ptr+=SIZE_T(start)*ring_.inc;
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu=ring_.heap->GetGPUDescriptorHandleForHeapStart();gpu.ptr+=UINT64(start)*ring_.inc;
+        bool replaced=false;UINT at=0;
+        for(const auto& t:op.tables)for(uint32_t i=0;i<t.count;++i,++at){
+            const auto& d=op.descriptors[t.first+i];
+            D3D12_CPU_DESCRIPTOR_HANDLE h{cpu.ptr+SIZE_T(at)*ring_.inc};
+            const auto& v=d.view;
+            if(v.kind==NA_DESC_SRV&&v.resource==scene_color){
+                D3D12_SHADER_RESOURCE_VIEW_DESC sd{};sd.Format=format;sd.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
+                sd.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;sd.Texture2D.MipLevels=1;
+                g.device->CreateShaderResourceView(replacement,&sd,h);replaced=true;
+            }else if(v.kind==NA_DESC_CBV)g.device->CreateConstantBufferView(&v.cbv,h);
+            else if(v.kind==NA_DESC_SRV&&(d.resource||v.explicit_view))g.device->CreateShaderResourceView(d.resource.Get(),v.explicit_view?&v.srv:nullptr,h);
+            else if(v.kind==NA_DESC_UAV&&(d.resource||v.explicit_view))g.device->CreateUnorderedAccessView(d.resource.Get(),d.counter.Get(),v.explicit_view?&v.uav:nullptr,h);
+            else{ // unused/empty slot: a null 2D SRV
+                D3D12_SHADER_RESOURCE_VIEW_DESC sd{};sd.Format=DXGI_FORMAT_R8G8B8A8_UNORM;sd.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
+                sd.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;sd.Texture2D.MipLevels=1;
+                g.device->CreateShaderResourceView(nullptr,&sd,h);
+            }
+            if(d.resource)owned->push_back(d.resource);
+        }
+        if(!replaced){*why="The scene colour is not in the pass's descriptor tables.";return false;}
+        ring_.uses.push_back({lease,start,total});
+        ID3D12DescriptorHeap* heaps[2]{ring_.heap.Get(),st.samplers};
+        {const na::observe::HostWorkScope own;
+        l->SetDescriptorHeaps(st.samplers?2:1,heaps);
+        // Changing the heap invalidates every table: rebind resource tables into
+        // the ring, sampler tables to their own (unchanged) handles.
+        for(uint32_t k=0;k<st.count;++k)if(st.tables[k].sampler)l->SetGraphicsRootDescriptorTable(st.tables[k].param,{st.tables[k].handle});
+        at=0;for(const auto& t:op.tables){l->SetGraphicsRootDescriptorTable(t.param,{gpu.ptr+UINT64(at)*ring_.inc});at+=t.count;}}
+        return true;
+    }
+
 public:
     na::observe::ShaderScope Before(ID3D12GraphicsCommandList* l,na::observe::ShaderCall& call) noexcept override {
         if(t_native_hint!=l||!t_native_budget)return {};
@@ -3546,7 +3637,11 @@ public:
                 const auto target=d.resource->GetDesc();
                 if(target.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||target.Width!=extent.ow||target.Height!=extent.oh)return;
                 ++full_seen;{std::lock_guard<std::mutex> lock(g_nb.m);g_nb.seen_w=uint32_t(target.Width);g_nb.seen_h=target.Height;g_nb.seen_fmt=uint32_t(target.Format);}
-                if(target.SampleDesc.Count!=1||target.DepthOrArraySize!=1||target.MipLevels!=1||typed(target.Format)!=typed(source.Format))return;
+                if(target.SampleDesc.Count!=1||target.DepthOrArraySize!=1||target.MipLevels!=1)return;
+                if(typed(target.Format)!=typed(source.Format)){
+                    if(c->other&&c->other!=d.view.resource)c->other=~0ull;else{c->other=d.view.resource;c->other_target=d.resource;}
+                    return;
+                }
                 if(c->dest&&c->dest!=d.view.resource){c->dest=~0ull;return;}
                 c->dest=d.view.resource;c->target=d.resource;
             };
@@ -3566,6 +3661,16 @@ public:
                 for(const auto& d:op.colors)match(d);
             }
             if(c->dest==~0ull){native_reject(g_nb.ambiguous,"The pass writes several full-size targets of the scene format.");return {};}
+            if(!c->dest&&!compute&&c->other&&c->other!=~0ull){
+                // F10: DLSS first, into a private full-size HDR image; the game's
+                // own tone-map/upscale draw then reads that image (normalized UVs).
+                const char* why=nullptr;
+                if(reconstruct(l,c,&op,&why)){
+                    t_native_hint=nullptr;g_nb.candidates.fetch_add(1,std::memory_order_relaxed);g_nb.redirected.fetch_add(1,std::memory_order_relaxed);
+                    c->rebound=true;return {na::observe::ShaderAction::Forward,c};
+                }
+                native_reject(g_nb.redirect_failed,why?why:"The tone-mapping upscale pass could not be redirected to the DLSS image.");return {};
+            }
             if(!c->dest){native_reject(g_nb.no_destination,full_seen?"The full-size output of the pass has another format than the scene (for example after tone mapping).":
                 "The pass reading the scene writes nothing at full output size.");return {};}
             t_native_hint=nullptr;g_nb.candidates.fetch_add(1,std::memory_order_relaxed);
@@ -3574,14 +3679,24 @@ public:
     }
     void After(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall&,na::observe::ShaderScope& scope) noexcept override {
         auto c=std::static_pointer_cast<Candidate>(scope.state);if(!c)return;
+        if(c->rebound){ // the redirected draw ran: give the game its own heaps and tables back
+            if(!na::observe::RestoreListState(l)){std::lock_guard<std::mutex> lock(g.m);g.latched=true;reason("Stopped: the redirected upscale pass could not restore game state.");}
+            return;
+        }
+        reconstruct(l,c,nullptr,nullptr);
+    }
+    // Records DLSS for this frame at the native upscale pass. op==nullptr: into
+    // the pass's own same-format destination, after it. op!=nullptr (F10): into
+    // the private full-size image, before the pass, which is then rebound.
+    bool reconstruct(ID3D12GraphicsCommandList* l,const std::shared_ptr<Candidate>& c,const na::observe::NativeOperation* op,const char** out_why) noexcept {
         try {
             std::lock_guard<std::mutex> lock(g.m);
-            const auto skip=[](const char* why){native_reject(g_nb.after_skipped,why);};
-            if(g.latched||g.paused.load()||!g.device||!g.dlss_ready){skip("DLSS is not ready (paused, stopped or still starting).");return;}
-            if(g.inl.valid||g.submitted_frame==g.frame)return; // this frame already has its DLSS
-            if(na::observe::ListRecording(l)!=c->recording||!na::observe::ListStateRestorable(l)){skip("The game's state at the upscale pass cannot be restored.");return;}
+            const auto skip=[&](const char* why){native_reject(g_nb.after_skipped,why);if(out_why)*out_why=why;};
+            if(g.latched||g.paused.load()||!g.device||!g.dlss_ready){skip("DLSS is not ready (paused, stopped or still starting).");return false;}
+            if(g.inl.valid||g.submitted_frame==g.frame){if(out_why)*out_why="This frame already has its DLSS.";return false;}
+            if(na::observe::ListRecording(l)!=c->recording||!na::observe::ListStateRestorable(l)){skip("The game's state at the upscale pass cannot be restored.");return false;}
             uint64_t depth=0,color=0;na::observe::GetLiveSelection(&depth,&color);
-            if(color!=c->color||depth!=c->depth){skip("The scene selection changed during the frame.");return;}
+            if(color!=c->color||depth!=c->depth){skip("The scene selection changed during the frame.");return false;}
             ID3D12CommandList* one[]{l};SceneInput saved;
             const bool local=na::observe::ListRendersTo(l,color,depth);
             if(!local){
@@ -3589,7 +3704,7 @@ public:
                 if(saved.color!=color||saved.depth!=depth||!saved.native_origin||!saved.native_recording||
                    saved.native_serial<=g.consumed_native_source||
                    (saved.native_origin.Retired()&&!saved.native_origin.Ready(g.queue.Get()))){
-                    skip("No unused executable or submitted scene producer matches this upscale pass.");return;
+                    skip("No unused executable or submitted scene producer matches this upscale pass.");return false;
                 }
             }
             if(local&&(!g.inline_camera_submitted||(g.jit.valid&&g.jit.applied)))jitter_batch(one,1);
@@ -3597,9 +3712,17 @@ public:
             const uint32_t slot=g.slot;PendingHistory pending;ID3D12GraphicsCommandList* out=nullptr;bool touched=false;
             auto owned=std::make_shared<std::vector<ComPtr<ID3D12Resource>>>();owned->reserve(16);
             *owned={c->source,c->guide,c->target};
-            auto lease=na::nr::native::RetainRecording(l,owned);if(!lease)return;
+            auto lease=na::nr::native::RetainRecording(l,owned);if(!lease)return false;
             UpscaleTarget previous;
-            {std::lock_guard<std::mutex> up(g_up_m);previous=g_up;g_up={c->dest,c->sub,0,0};}
+            UpscaleTarget target{c->dest,c->sub,0,0};
+            if(op){
+                const auto sd=c->source->GetDesc();const auto od=c->other_target->GetDesc();
+                const DXGI_FORMAT f=typed(sd.Format);
+                if(!ensure_full(uint32_t(od.Width),od.Height,f)){skip("The private full-size DLSS image could not be created.");return false;}
+                owned->push_back(full_.tex);
+                target={0,0,0,0,full_.tex.Get(),uint32_t(D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE)};
+            }
+            {std::lock_guard<std::mutex> up(g_up_m);previous=g_up;g_up=target;}
             struct RestoreTarget{UpscaleTarget old;~RestoreTarget(){std::lock_guard<std::mutex> up(g_up_m);g_up=old;}} restore_target{previous};
             const bool ok=record(one,0,depth,color,&out,pending,l,&touched,local?nullptr:&saved);
             if(!local)pending.native_source=saved.native_serial;
@@ -3610,17 +3733,32 @@ public:
                 *owned={c->source,c->guide,c->target,g.color_in,g.depth32,g.motion,g.output,g.sharp,g.provenance,g.jshift};
                 g.slots[slot].native_scale_use=lease;
             }
-            if(touched&&!na::observe::RestoreListState(l)){g.latched=true;reason("Stopped: native-scale pass could not restore game state.");return;}
+            if(touched&&!na::observe::RestoreListState(l)){g.latched=true;reason("Stopped: native-scale pass could not restore game state.");return false;}
             if(!ok){na::capture::j2::Discard(pending.capture,true);++g.stats.inline_record_failed;
                 g_nb.record_failed.fetch_add(1,std::memory_order_relaxed);
                 {std::lock_guard<std::mutex> nb(g_nb.m);std::snprintf(g_nb.reason,sizeof g_nb.reason,"DLSS recording at the upscale pass failed: %s",g.stats.reason);}
-                return;}
+                if(out_why)*out_why="DLSS recording at the upscale pass failed.";
+                return false;}
+            if(op){
+                // DLSS wrote the private image (left in ALL_SHADER_RESOURCE); the
+                // game's own tone-map/upscale draw now reads it.
+                const char* why=nullptr;
+                if(!rebind(l,*op,c->color,full_.tex.Get(),full_.f,owned,&why)){
+                    // DLSS is recorded but unused this frame: history still advances
+                    // correctly; the game's draw reads its own small scene.
+                    na::observe::RestoreListState(l);
+                    {std::lock_guard<std::mutex> nb(g_nb.m);std::snprintf(g_nb.reason,sizeof g_nb.reason,"Redirect failed after DLSS: %s",why?why:"");}
+                    if(out_why)*out_why=why;
+                }
+            }
             g_nb.recorded.fetch_add(1,std::memory_order_relaxed);
             {std::lock_guard<std::mutex> nb(g_nb.m);std::snprintf(g_nb.reason,sizeof g_nb.reason,"%s","DLSS reconstructs at the game's own upscale pass.");}
             g.slot=(slot+1)%kRing;g.inl.list=l;g.inl.rec=c->recording;g.inl.frame=g.frame;g.inl.slot=slot;
             g.inl.writes=na::observe::ListInsertionDecision(l,color).writes;g.inl.color=color;g.inl.history=pending;g.inl.valid=true;g.inl_frame=g.frame;
             ++g.stats.inline_recorded;g.inline_mode=true;
+            return true;
         }catch(...){na::observe::RestoreListState(l);std::lock_guard<std::mutex> lock(g.m);g.latched=true;reason("Stopped: native-scale recording failed.");}
+        return false;
     }
     void Closing(ID3D12GraphicsCommandList* l) noexcept override {
         if(!g_native_reduced.load(std::memory_order_relaxed)||g.paused.load())return;
@@ -5158,7 +5296,7 @@ NativeBridgeStats GetNativeBridgeStats() {
     r.hints=n.hints.load();r.examined=n.examined.load();r.not_reading=n.not_reading.load();r.snapshot=n.snapshot.load();
     r.source_size=n.source_size.load();r.draw_state=n.draw_state.load();r.viewport=n.viewport.load();r.no_destination=n.no_destination.load();
     r.ambiguous=n.ambiguous.load();r.candidates=n.candidates.load();r.recorded=n.recorded.load();r.record_failed=n.record_failed.load();
-    r.after_skipped=n.after_skipped.load();
+    r.after_skipped=n.after_skipped.load();r.redirected=n.redirected.load();r.redirect_failed=n.redirect_failed.load();
     {std::lock_guard<std::mutex> lock(g_up_m);r.rw=g_native_extent.rw;r.rh=g_native_extent.rh;r.ow=g_native_extent.ow;r.oh=g_native_extent.oh;}
     std::lock_guard<std::mutex> lock(n.m);std::snprintf(r.reason,sizeof r.reason,"%s",n.reason);
     r.src_w=n.src_w;r.src_h=n.src_h;r.src_fmt=n.src_fmt;r.seen_w=n.seen_w;r.seen_h=n.seen_h;r.seen_fmt=n.seen_fmt;
