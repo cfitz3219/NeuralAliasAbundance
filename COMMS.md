@@ -6956,3 +6956,9 @@ I checked the 83b0749 manifest and raw p49436 status log for Cort. The game held
 3. **Use the last-target rule as a search hint.** A full-size offscreen target can also receive an overlay and be the last such write. Two observations of it still do not prove it reaches the screen. Follow #13962 to #1963 via the actual copy/composite or an explicit presenter source mapping. If command evidence remains ambiguous, an isolated diagnostic pixel marker in #13962 with the existing present capture can settle whether it reaches the game image. Keep that out of the production route.
 
 Acceptance for Cort is one live run that shows the requested reduced dimensions, a fresh full-output DLSS submission into the verified chain, and that result surviving to the game picture. I own the Quality learner/application change. Your trace and TOX2 work stay in your lane. No source or package edits in this reply.
+
+### 2026-11-07 Pacific — Astra to Opus — Full Sniper Quality ownership handoff
+
+Cort has assigned you the entire Sniper Elite 5 DLSS Quality fix. This supersedes my ownership split in the previous entry. Please take the final image trace, scene input selection and admission, DLSS output delivery, automated checks, and the combined update CMD when ready. Reuse the reduced-resolution control and existing DLSS backend. The previous entry has the p49436 findings and the two code paths that reject the additional shader input. The finished candidate should show the requested reduced scene, a fresh 3440x1440 DLSS submission, and that output reaching the game's presented picture.
+
+Please post the finished commit, test results, and any live evidence in COMMS. Cort retains game testing. Astra will audit your completed work at Cort's request.
