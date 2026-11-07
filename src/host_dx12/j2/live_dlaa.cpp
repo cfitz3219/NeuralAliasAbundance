@@ -749,10 +749,58 @@ bool trace_same_color(uint32_t input, uint32_t output)
         (input==DXGI_FORMAT_R16G16B16A16_FLOAT && output==input);
 }
 
+// One complete traced frame, written once when the scene is first reduced and again
+// whenever the J2 capture is armed (F8): every op in submission order with its list,
+// recording, queue, type, pipeline, viewport/groups, blend/depth/preserves, reflection
+// state and every input/output (id, size, format, view, binding), plus the lists that
+// had no traced op. %LOCALAPPDATA%\NeuralAlias\captures\framedump-p<pid>\frame-<n>.txt
+// (copied by the package's Results action). Read-only diagnostic.
+uint32_t g_frame_dumps=0;bool g_dump_armed_seen=false;
+void trace_dump_frame(ID3D12CommandQueue* queue,uint64_t presented,const NativeExtent& e,uint64_t frame_no)
+{
+    wchar_t base[MAX_PATH]{};
+    if(!GetEnvironmentVariableW(L"LOCALAPPDATA",base,MAX_PATH))return;
+    wchar_t dir[MAX_PATH]{};
+    swprintf_s(dir,L"%s\\NeuralAlias\\captures\\framedump-p%lu",base,GetCurrentProcessId());
+    wchar_t mid[MAX_PATH]{};swprintf_s(mid,L"%s\\NeuralAlias",base);CreateDirectoryW(mid,nullptr);
+    swprintf_s(mid,L"%s\\NeuralAlias\\captures",base);CreateDirectoryW(mid,nullptr);
+    CreateDirectoryW(dir,nullptr);
+    wchar_t path[MAX_PATH]{};swprintf_s(path,L"%s\\frame-%llu.txt",dir,(unsigned long long)frame_no);
+    FILE* fp=nullptr;if(_wfopen_s(&fp,path,L"wb")||!fp)return;
+    const auto& ops=g_trace.frame;
+    std::fprintf(fp,"frame=%llu presented=#%llu queue=%p scene=%ux%u output=%ux%u ops=%zu traced_lists=%u untraced=%u\r\n",
+        (unsigned long long)frame_no,(unsigned long long)presented,(void*)queue,e.rw,e.rh,e.ow,e.oh,ops.size(),g_trace.traced_lists,g_trace.untraced);
+    for(const auto& u:g_trace.untraced_lists)
+        std::fprintf(fp,"untraced_list list=%llu rec=%llu type=%d queue_type=%d at=%zu\r\n",(unsigned long long)u.id,(unsigned long long)u.recording,u.type,u.queue_type,u.at);
+    const auto io=[&](const char* tag,const std::vector<TraceIo>& v){
+        for(const auto& x:v)std::fprintf(fp," %s%c#%llu=%ux%u/%u(%u)%s",tag,x.binding?x.binding:'-',(unsigned long long)x.id,x.w,x.h,x.fmt,x.vfmt,x.whole?"":"[part]");
+    };
+    for(size_t i=0;i<ops.size();++i){
+        const auto& op=ops[i];
+        std::fprintf(fp,"%zu list=%llu rec=%llu q=%s %s pso=%llu",i,(unsigned long long)op.list,(unsigned long long)op.recording,op.queue==queue?"present":"other",
+            op.transfer?"copy":op.compute?"cs":op.pso?"draw":"clear",(unsigned long long)op.pso);
+        if(op.compute)std::fprintf(fp," g=%u,%u,%u",op.gx,op.gy,op.gz);else if(op.pso)std::fprintf(fp," vp=%ux%u",op.vw,op.vh);
+        std::fprintf(fp,"%s%s%s%s%s%s",op.blend?" blend":"",op.depth?" depth":"",op.preserves?" preserves":"",op.reflected?" reflected":" table",
+            op.inferred?" inferred":"",op.heap_indexing?" heap_indexing":"");
+        if(op.why)std::fprintf(fp," why=\"%s\"",op.why);
+        io("out",op.out);io("in",op.in);
+        std::fprintf(fp,"%s",op.out.end()!=std::find_if(op.out.begin(),op.out.end(),[&](const TraceIo& x){return x.id==presented;})?" <PRESENTED>":"");
+        std::fprintf(fp,"\r\n");
+    }
+    std::fclose(fp);
+    ++g_frame_dumps;
+    na::eventlog::Emit("native_trace","frame dump written: frame=%llu ops=%zu (captures\\framedump-p%lu\\frame-%llu.txt)",
+        (unsigned long long)frame_no,ops.size(),GetCurrentProcessId(),(unsigned long long)frame_no);
+}
 void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_present)
 {
     NativeExtent e;
     { std::lock_guard<std::mutex> lock(g_up_m); e=g_native_extent; }
+    {   // Frame dump: the first trace of the session, and once per armed J2 capture (F8).
+        const bool armed=na::capture::j2::Armed();
+        if(!g_frame_dumps||(armed&&!g_dump_armed_seen))trace_dump_frame(queue,presented,e,g_trace.presents);
+        g_dump_armed_seen=armed;
+    }
     uint64_t depth=0, scene=0;
     na::observe::GetLiveSelection(&depth,&scene);
     const auto& ops=g_trace.frame;
