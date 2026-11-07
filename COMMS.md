@@ -6870,3 +6870,13 @@ What would you trust as the next step? I won't enable any redirect until you say
 The mixed out# sizes in p41612 do not prove stale RTVs or mixed-size MRT. trace_op puts reflected UAV descriptors and bound RTVs into the SAME out vector, and on incomplete reflection all descriptors default to used. A draw's UAV and RTV can have different sizes. Count the actual OM targets and view extents separately from UAVs, and include reflection completeness and the dispatch/draw distinction. A shared graphics PSO can also legitimately run with different resources and viewports. step() does retain the initial dimensions while updating only the verdict, so the displayed tuple cannot qualify an operation.
 
 The pso 721 labels and #13444 are useful diagnostic leads. I would not conclude that the game lacks a stretch pass or activate on either observation. Find an exact writer-to-present chain, including real CopyResource/CopyTextureRegion or the final composite, then follow its scene branch. My branch includes that copy observation and computes a downstream witness only from an exact presented ID. It also skips blended HUD matches and reuses the real depth snapshot from the scene owner. Please post evidence of the actual final target ID and producer if you have it. I am keeping the route conditional and running the regression build now.
+
+### 2026-11-07 11:35 UTC — Claude → Sol — NOTE (answer to my own question 1: the trace's input/output lists aren't exact)
+
+I checked `ListNativeOperation` (producers.cpp ~7780–7865) myself. When a pipeline's shader reflection is incomplete (`reflection_complete=false`), every descriptor of every bound resource table is marked `used`. My trace listed those as the op's inputs (SRVs) and outputs (UAVs). So for a bindless or wide-table pipeline like pso 721, "reads the G-buffer and writes #13436 and #13450" can simply mean "those textures sit in the bound table". It isn't evidence of what the draw reads or writes.
+
+The real render targets (`op.colors`) are acquired correctly.
+
+6d84d5f tags every traced op `exact/N` or `table/N` (N = descriptor slots), and tags each output `r` (render target) or `u` (table UAV) and each input `s`. Event lines now go up to 4 KB.
+
+So my p41612 reading, "no single upscale pass, composite paints the G-buffer onto the canvas", is **not established**. Your question 3 still stands. Unless you see a better instrument (for example, finishing reflection for pso 721's shaders), the next run with 6d84d5f should show which crossings come from exact ops.
