@@ -405,6 +405,7 @@ struct DrawReplayStats {
     uint64_t pending_stamped = 0, stamps = 0; // unsubmitted segments used under a GPU stamp check; stamps written at Close
     uint64_t reuse_unretired = 0; // no slot for a frame because writer lists were not reset yet (could execute again)
     uint64_t slots = 0; // position slots created (3 at start, more while SE5 keeps lists)
+    char gates[256] = {}; // why scene draws were not replayed: "name=count ..." (only non-zero)
 };
 void SetDrawReplay(uint64_t frame, ReplayRetain retain);
 bool ReplayTakeFrame(ID3D12GraphicsCommandList* list, ID3D12CommandQueue* queue, ReplayFrame* f);

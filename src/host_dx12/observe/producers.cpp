@@ -4685,6 +4685,13 @@ enum : uint32_t { kRpReplayed, kRpVerts, kRpNoTwin, kRpBuilding, kRpFailedTwin, 
                   kRpPendingStamped, kRpStamps, kRpReuseUnretired, kRpSlotsMade, kRpStatCount };
 static_assert(kRpStatCount <= 32, "g_rp_stat size");
 void rp_count(uint32_t k, uint64_t n = 1) { g_rp_stat[k].fetch_add(n, std::memory_order_relaxed); }
+// 83b0749/8cc8cb6 runs: noted=240 built=0 twin_queued=0 no_recipe=0, so every draw
+// stopped at a gate before the recipe lookup without a count. Each gate is counted.
+enum : uint32_t { kGateNotDirect, kGateNoRetain, kGateNoDepth, kGateNoList, kGateOtherDepth, kGateRenderPass, kGateState,
+                  kGateRecording, kGateNoPipeline, kGateNoDepthWrite, kGateMsaa, kGateViewport, kGateRootMismatch,
+                  kGateRootUnknown, kGateDirectHeap, kGateVsUav, kGateNoVertexBuffer, kGateCount };
+std::atomic<uint64_t> g_rp_gate[kGateCount];
+void rp_gate(uint32_t k) { g_rp_gate[k].fetch_add(1, std::memory_order_relaxed); }
 
 HRESULT make_replay_root(ID3D12Device* dev, UINT node, ID3D12RootSignature* game,
                          ID3D12RootSignature** result)
@@ -4847,12 +4854,13 @@ void replay_on_close(GL* l)
 void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2, INT a3, UINT a4)
 {
     const uint64_t frame = g_rp_frame.load(std::memory_order_acquire);
-    if (!frame || l->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return;
+    if (!frame) return;
+    if (l->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) { rp_gate(kGateNotDirect); return; }
     const auto retain = g_rp_retain.load(std::memory_order_acquire);
-    if (!retain) return;
+    if (!retain) { rp_gate(kGateNoRetain); return; }
     uint64_t sel_depth = 0, sel_color = 0;
     GetLiveSelection(&sel_depth, &sel_color);
-    if (!sel_depth) return;
+    if (!sel_depth) { rp_gate(kGateNoDepth); return; }
     ID3D12PipelineState* game_pso = nullptr;
     ID3D12RootSignature* bound_rs = nullptr;
     std::shared_ptr<SoEntry> entry;
@@ -4863,27 +4871,29 @@ void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2,
     {
         std::shared_lock<RegistryLock> lock(g_m);
         auto* ls = list_state_locked(l, &list_id);
-        if (!ls) return;
+        if (!ls) { rp_gate(kGateNoList); return; }
         std::lock_guard<std::mutex> bl(ls->bind_m);
-        if (ls->cur_ds != sel_depth || !ls->pso || ls->in_render_pass || !ls->restorable || ls->predicate || ls->game_stream_output) return;
-        if (!ls->recording_observed.load() || !ls->generation_known.load() || !ls->coverage_complete.load()) return;
+        if (ls->cur_ds != sel_depth) { rp_gate(kGateOtherDepth); return; }
+        if (ls->in_render_pass) { rp_gate(kGateRenderPass); return; }
+        if (!ls->pso || !ls->restorable || ls->predicate || ls->game_stream_output) { rp_gate(kGateState); return; }
+        if (!ls->recording_observed.load() || !ls->generation_known.load() || !ls->coverage_complete.load()) { rp_gate(kGateRecording); return; }
         recording = ls->generation.load() + 1;
         const auto pipeline = g_objs.find(canon(ls->pso));
-        if (pipeline == g_objs.end() || pipeline->second.created.size() < sizeof(na_ev_pipeline_created)) return;
+        if (pipeline == g_objs.end() || pipeline->second.created.size() < sizeof(na_ev_pipeline_created)) { rp_gate(kGateNoPipeline); return; }
         const auto* pc = reinterpret_cast<const na_ev_pipeline_created*>(pipeline->second.created.data());
-        if (pc->depth_enable != 1 || pc->depth_write != 1) return;
+        if (pc->depth_enable != 1 || pc->depth_write != 1) { rp_gate(kGateNoDepthWrite); return; }
         if (pc->stage_hash[NA_STAGE_GS] || pc->stage_hash[NA_STAGE_HS] || pc->stage_hash[NA_STAGE_DS] || pc->stage_hash[NA_STAGE_MS]) { rp_count(kRpStages); return; }
         if (!ls->raster_topology_known || ls->raster_topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST) { rp_count(kRpTopology); return; }
-        if (pc->sample_count != 1) return;
+        if (pc->sample_count != 1) { rp_gate(kGateMsaa); return; }
         if (!ls->raster_viewports_known || ls->raster_viewport_count != 1 ||
-            !ls->raster_scissors_known || ls->raster_scissor_count != 1) return;
+            !ls->raster_scissors_known || ls->raster_scissor_count != 1) { rp_gate(kGateViewport); return; }
         const auto& viewport = ls->raster_viewports[0];
         if (viewport.TopLeftX != 0.f || viewport.TopLeftY != 0.f || viewport.MinDepth != 0.f ||
             viewport.MaxDepth != 1.f || !(viewport.Width > 0.f && viewport.Width <= 16384.f &&
-                                         viewport.Height > 0.f && viewport.Height <= 16384.f)) return;
+                                         viewport.Height > 0.f && viewport.Height <= 16384.f)) { rp_gate(kGateViewport); return; }
         rec.width = static_cast<uint32_t>(viewport.Width);
         rec.height = static_cast<uint32_t>(viewport.Height);
-        if (static_cast<float>(rec.width) != viewport.Width || static_cast<float>(rec.height) != viewport.Height) return;
+        if (static_cast<float>(rec.width) != viewport.Width || static_cast<float>(rec.height) != viewport.Height) { rp_gate(kGateViewport); return; }
         const auto& scissor = ls->raster_scissors[0];
         rec.scissor[0] = scissor.left; rec.scissor[1] = scissor.top;
         rec.scissor[2] = scissor.right; rec.scissor[3] = scissor.bottom;
@@ -4895,22 +4905,22 @@ void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2,
         }
         if (entry->vs_hash != pc->stage_hash[NA_STAGE_VS]) { rp_count(kRpHashMismatch); return; } // a pipeline we never saw created
         const void* root_key = canon(entry->rs.Get());
-        if (canon(ls->root_sig[0]) != root_key) return;
+        if (canon(ls->root_sig[0]) != root_key) { rp_gate(kGateRootMismatch); return; }
         const auto root = g_objs.find(root_key);
-        if (root == g_objs.end() || root->second.created.size() < sizeof(na_ev_root_signature_created)) return;
+        if (root == g_objs.end() || root->second.created.size() < sizeof(na_ev_root_signature_created)) { rp_gate(kGateRootUnknown); return; }
         const auto* metadata = reinterpret_cast<const na_ev_root_signature_created*>(root->second.created.data());
         // Executing a shader twice must not duplicate writes through a vertex-visible
         // UAV or through a directly indexed descriptor heap.
-        if (metadata->hdr.flags & (NA_EVF_TRUNCATED | NA_EVF_METHOD_UNOBSERVED) ||
-            metadata->flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) return;
+        if (metadata->hdr.flags & (NA_EVF_TRUNCATED | NA_EVF_METHOD_UNOBSERVED)) { rp_gate(kGateRootUnknown); return; }
+        if (metadata->flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) { rp_gate(kGateDirectHeap); return; }
         for (const auto& param : root->second.root_params) {
             if (param.visibility != D3D12_SHADER_VISIBILITY_ALL && param.visibility != D3D12_SHADER_VISIBILITY_VERTEX) continue;
-            if (param.param_type == NA_ROOT_UAV) return;
+            if (param.param_type == NA_ROOT_UAV) { rp_gate(kGateVsUav); return; }
             if (param.param_type != NA_ROOT_TABLE) continue;
             const auto& ranges = root->second.root_ranges;
-            if (param.first_range > ranges.size() || param.count > ranges.size() - param.first_range) return;
+            if (param.first_range > ranges.size() || param.count > ranges.size() - param.first_range) { rp_gate(kGateRootUnknown); return; }
             for (uint32_t i = 0; i < param.count; ++i)
-                if (ranges[param.first_range + i].range_type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV) return;
+                if (ranges[param.first_range + i].range_type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV) { rp_gate(kGateVsUav); return; }
         }
         bound_rs = entry->rs.Get();
         game_pso = ls->pso;
@@ -4928,7 +4938,7 @@ void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2,
             for (UINT i = 0; i < 32; ++i) if (ls->vertex_mask & (1u << i)) vb = rp_mix(vb, ls->vertex_buffers[i].BufferLocation);
             if (ls->index_known) vb = rp_mix(vb, ls->index_buffer.BufferLocation);
         }
-        if (!vb && (indexed || ls->vertex_mask)) return;
+        if (!vb && (indexed || ls->vertex_mask)) { rp_gate(kGateNoVertexBuffer); return; }
         rec.sig = h; rec.vb = vb;
     }
     if (!rp_ensure_buffers() || g_rp_device.Get() != entry->recipe->dev.Get()) return;
@@ -8304,6 +8314,16 @@ void GetDrawReplayStats(DrawReplayStats* out)
     out->take_sealed = v(kRpTakeSealed); out->taken = v(kRpTaken);
     out->segments = v(kRpSegments); out->pending_segments = v(kRpPendingSegs);
     out->pending_stamped = v(kRpPendingStamped); out->stamps = v(kRpStamps); out->reuse_unretired = v(kRpReuseUnretired); out->slots = v(kRpSlotsMade);
+    static const char* const names[kGateCount] = {"not_direct", "no_retain", "no_depth", "no_list", "other_depth", "render_pass", "state",
+        "recording", "no_pipeline", "no_depth_write", "msaa", "viewport", "root_mismatch", "root_unknown", "direct_heap", "vs_uav", "no_vb"};
+    int used = 0;
+    out->gates[0] = 0;
+    for (uint32_t k = 0; k < kGateCount; ++k) {
+        const uint64_t n = g_rp_gate[k].load(std::memory_order_relaxed);
+        if (!n || used >= int(sizeof out->gates) - 1) continue;
+        const int w = std::snprintf(out->gates + used, sizeof out->gates - used, "%s%s=%llu", used ? " " : "", names[k], (unsigned long long)n);
+        if (w > 0) used = (std::min)(int(sizeof out->gates) - 1, used + w);
+    }
 }
 bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float* y)
 {
