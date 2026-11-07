@@ -41,6 +41,7 @@ V vs(uint id : SV_VertexID) {
     o.prev = asfloat(t_prev.Load4((prev_first + id) * 16u));
     return o;
 }
+RWByteAddressBuffer u_count : register(u2);
 struct O { float2 v : SV_Target0; float m : SV_Target1; };
 O ps(V i) {
     const uint2 p = uint2(i.pos.xy);
@@ -56,6 +57,7 @@ O ps(V i) {
     O o;
     o.v = v;
     o.m = 1.0;
+    if (((p.x | p.y) & 7u) == 0u) u_count.InterlockedAdd(0, 1u);
     return o;
 }
 )";
@@ -143,14 +145,17 @@ bool Pass::Init(ID3D12Device* device)
     device_ = device;
     D3D12_DESCRIPTOR_RANGE range{};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; range.NumDescriptors = 4;
-    D3D12_ROOT_PARAMETER params[2]{};
+    D3D12_ROOT_PARAMETER params[3]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[0].DescriptorTable.NumDescriptorRanges = 1;
     params[0].DescriptorTable.pDescriptorRanges = &range;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[1].Constants.Num32BitValues = 6 + sizeof(Globals) / 4;
+    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[2].Descriptor.ShaderRegister = 2;
+    params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_ROOT_SIGNATURE_DESC rs{};
-    rs.NumParameters = 2; rs.pParameters = params;
+    rs.NumParameters = 3; rs.pParameters = params;
     ComPtr<ID3DBlob> sig, err;
     if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err))) return false;
     if (FAILED(device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&root_)))) return false;
@@ -187,6 +192,23 @@ bool Pass::Init(ID3D12Device* device)
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV; hd.NumDescriptors = 1;
     if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dsv_)))) { pso_[0].Reset(); return false; }
     srv_stride_ = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    {
+        D3D12_HEAP_PROPERTIES hp{}; D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = 256; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&zeros_)))) { pso_[0].Reset(); return false; }
+        void* z = nullptr;
+        if (FAILED(zeros_->Map(0, nullptr, &z))) { pso_[0].Reset(); return false; }
+        std::memset(z, 0, 256);
+        zeros_->Unmap(0, nullptr);
+        for (uint32_t i = 0; i < kSets; ++i) {
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT; bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&count_[i])))) { pso_[0].Reset(); return false; }
+            hp.Type = D3D12_HEAP_TYPE_READBACK; bd.Flags = D3D12_RESOURCE_FLAG_NONE;
+            if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback_[i])))) { pso_[0].Reset(); return false; }
+        }
+    }
     rtv_stride_ = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     return true;
 }
@@ -214,11 +236,31 @@ bool Pass::ensure(uint32_t rw, uint32_t rh)
     return true;
 }
 
+void Pass::harvest()
+{
+    for (uint32_t i = 0; i < kSets; ++i) {
+        if (!pending_read_[i] || !descriptor_use_[i] || !descriptor_use_[i].Completed()) continue;
+        pending_read_[i] = false;
+        const D3D12_RANGE range{0, 4};
+        void* m = nullptr;
+        if (FAILED(readback_[i]->Map(0, &range, &m)) || !m) continue;
+        uint32_t v = 0;
+        std::memcpy(&v, m, 4);
+        const D3D12_RANGE none{0, 0};
+        readback_[i]->Unmap(0, &none);
+        ++stats_.gpu_read;
+        if (v) ++stats_.gpu_nonzero;
+        stats_.gpu_samples += v;
+        stats_.gpu_last = v;
+    }
+}
+
 Output Pass::Record(ID3D12GraphicsCommandList* l, ID3D12CommandQueue* q, ID3D12Resource* depth, uint32_t rw, uint32_t rh, bool reversed, bool reset,
                     const float viewport_jitter[2])
 {
     Output out;
     if (!Ready() || !l || !depth || !rw || !rh) return out;
+    harvest();
     na::observe::ReplayFrame f;
     if (!na::observe::ReplayTakeFrame(l, q, &f)) return out;
     ++stats_.frames;
@@ -240,7 +282,8 @@ Output Pass::Record(ID3D12GraphicsCommandList* l, ID3D12CommandQueue* q, ID3D12R
     // every resource it names live through retirement, including Reset/discard.
     auto resources = std::make_shared<std::vector<ComPtr<IUnknown>>>();
     resources->assign({srv_, rtv_, dsv_, motion_, valid_, zdepth_, root_,
-                       pso_[reversed ? 1 : 0], ComPtr<IUnknown>(depth)});
+                       pso_[reversed ? 1 : 0], ComPtr<IUnknown>(depth), count_[set], readback_[set], zeros_});
+    pending_read_[set] = false; // an unread result of a retired, never-completed use is lost
     auto lease = na::nr::native::RetainRecording(l, resources);
     if (!lease) return out;
     descriptor_use_[set] = std::move(lease);
@@ -264,6 +307,11 @@ Output Pass::Record(ID3D12GraphicsCommandList* l, ID3D12CommandQueue* q, ID3D12R
                                              tr(f.cur, f.cur_in_list ? SO : COMMON, NPSR), tr(f.prev, COMMON, NPSR)};
     if (f.stamps) b.push_back(tr(f.stamps, COMMON, NPSR));
     l->ResourceBarrier(static_cast<UINT>(b.size()), b.data());
+    l->CopyBufferRegion(count_[set].Get(), 0, zeros_.Get(), 0, 4);
+    {
+        const D3D12_RESOURCE_BARRIER c = tr(count_[set].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        l->ResourceBarrier(1, &c);
+    }
 
     D3D12_CPU_DESCRIPTOR_HANDLE h = srv_->GetCPUDescriptorHandleForHeapStart();
     h.ptr += static_cast<SIZE_T>(set) * 4 * srv_stride_;
@@ -295,6 +343,7 @@ Output Pass::Record(ID3D12GraphicsCommandList* l, ID3D12CommandQueue* q, ID3D12R
     l->SetGraphicsRootSignature(root_.Get());
     l->SetPipelineState(pso_[reversed ? 1 : 0].Get());
     l->SetGraphicsRootDescriptorTable(0, gh);
+    l->SetGraphicsRootUnorderedAccessView(2, count_[set]->GetGPUVirtualAddress());
     const Globals g{rw, rh, viewport_jitter ? viewport_jitter[0] : 0.f, viewport_jitter ? viewport_jitter[1] : 0.f, 0, 0};
     l->SetGraphicsRoot32BitConstants(1, sizeof(Globals) / 4, &g, 6);
     const D3D12_VIEWPORT vp{g.jx, g.jy, static_cast<float>(rw), static_cast<float>(rh), 0.f, 1.f};
@@ -310,7 +359,14 @@ Output Pass::Record(ID3D12GraphicsCommandList* l, ID3D12CommandQueue* q, ID3D12R
         if (p.check || p.prev_check) ++stats_.checked;
     }
     for (auto& x : b) std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+    b.push_back(tr(count_[set].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE));
     l->ResourceBarrier(static_cast<UINT>(b.size()), b.data());
+    l->CopyBufferRegion(readback_[set].Get(), 0, count_[set].Get(), 0, 4);
+    {
+        const D3D12_RESOURCE_BARRIER c = tr(count_[set].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+        l->ResourceBarrier(1, &c);
+    }
+    pending_read_[set] = true;
     ++stats_.fed;
     out.motion = motion_.Get();
     out.valid = valid_.Get();

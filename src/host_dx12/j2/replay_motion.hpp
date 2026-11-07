@@ -27,6 +27,9 @@ struct Output { ID3D12Resource* motion = nullptr; ID3D12Resource* valid = nullpt
 struct Stats {
     uint64_t frames = 0, fed = 0, draws = 0, prev_draws = 0, matched_exact = 0, matched_loose = 0, unmatched = 0, verts = 0;
     uint64_t checked = 0; // draws from a list not yet submitted at record time, kept only if its GPU stamp matches
+    // Read back from the GPU (Sol: CPU counts can rise with an empty mask): pixels on a
+    // 1-in-64 grid (x%8==0, y%8==0) that got replay motion, per recorded pass.
+    uint64_t gpu_read = 0, gpu_nonzero = 0, gpu_samples = 0; uint32_t gpu_last = 0;
     uint32_t last_draws = 0, last_pairs = 0;
 };
 
@@ -49,6 +52,9 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> motion_, valid_, zdepth_;
     static constexpr uint32_t kSets = 8;
     na::nr::native::RecordingLease descriptor_use_[kSets];
+    Microsoft::WRL::ComPtr<ID3D12Resource> count_[kSets], readback_[kSets], zeros_;
+    bool pending_read_[kSets] = {};
+    void harvest();
     UINT srv_stride_ = 0, rtv_stride_ = 0;
     uint32_t tw_ = 0, th_ = 0;
     Stats stats_;

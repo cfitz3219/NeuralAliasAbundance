@@ -418,6 +418,10 @@ struct TraceOp {
 struct NativeTrace{
     std::mutex m;std::atomic<bool> armed{false};
     uint32_t frames=0,untraced=0,traced_lists=0;uint64_t ops=0,traces=0,presents=0,armed_at=0;
+    // 83b0749 run: presented=1963 never connected, untraced=1 every trace.
+    // Which list that is: id/recording, list type, queue type, position among the frame's ops.
+    struct Untraced{uint64_t id=0,recording=0;int type=-1,queue_type=-1;size_t at=0;};
+    std::vector<Untraced> untraced_lists;
     std::map<std::pair<uint64_t,uint64_t>,std::vector<TraceOp>> recs;std::vector<TraceOp> frame;
     char result[4096]{};
     NativeCrossing previous, learned;
@@ -525,7 +529,16 @@ void trace_submit(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* cons
         if (!lists[i]) continue;
         const auto key=std::make_pair(uint64_t(na::observe::IdOf(lists[i])), na::observe::ListRecording(lists[i]));
         const auto it=g_trace.recs.find(key);
-        if (it==g_trace.recs.end()) { ++g_trace.untraced; continue; }
+        if (it==g_trace.recs.end()) {
+            ++g_trace.untraced;
+            if (g_trace.untraced_lists.size()<6) {
+                NativeTrace::Untraced u;u.id=key.first;u.recording=key.second;u.at=g_trace.frame.size();
+                u.type=int(lists[i]->GetType());
+                u.queue_type=queue?int(queue->GetDesc().Type):-1;
+                g_trace.untraced_lists.push_back(u);
+            }
+            continue;
+        }
         ++g_trace.traced_lists;
         for (const auto& t : it->second) {
             if (g_trace.frame.size() >= kTraceOps) return;
@@ -577,6 +590,14 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
     add("ops=%zu lists=%u untraced=%u scene=%ux%u output=%ux%u presented=%llu",
         ops.size(),g_trace.traced_lists,g_trace.untraced,e.rw,e.rh,e.ow,e.oh,
         static_cast<unsigned long long>(presented));
+    // type 0 direct, 2 compute, 3 copy; at = ops of the frame submitted before it.
+    if (!g_trace.untraced_lists.empty()) {
+        add(" untraced_lists=[");
+        for (const auto& u : g_trace.untraced_lists)
+            add(" list=%llu rec=%llu type=%d queue=%d at=%zu", (unsigned long long)u.id, (unsigned long long)u.recording,
+                u.type, u.queue_type, u.at);
+        add(" ]");
+    }
 
     // Index writers in actual submission order. Every lookup asks for the
     // resource contents that existed immediately before the consuming op.
@@ -1412,7 +1433,7 @@ void replay_probe_frame()
             na::observe::DrawReplayStats d{};
             na::observe::GetDrawReplayStats(&d);
             const auto p = g.replay.GetStats();
-            na::eventlog::Emit("draw_replay", "noted=%llu built=%llu build_failed=%llu replayed=%llu verts=%llu not_ready=%llu twin_queued=%llu building=%llu twin_failed=%llu no_recipe=%llu hash_mismatch=%llu untwinned=%llu topology=%llu stages=%llu overflow=%llu other_list=%llu taken=%llu take_unclaimed=%llu take_other_list=%llu take_sealed=%llu segments=%llu pending_segments=%llu pending_stamped=%llu stamps=%llu reuse_unretired=%llu slots=%llu | frames=%llu fed=%llu draws=%llu prev_draws=%llu exact=%llu loose=%llu unmatched=%llu raster_verts=%llu checked=%llu last_draws=%u last_pairs=%u fed_now=%d",
+            na::eventlog::Emit("draw_replay", "noted=%llu built=%llu build_failed=%llu replayed=%llu verts=%llu not_ready=%llu twin_queued=%llu building=%llu twin_failed=%llu no_recipe=%llu hash_mismatch=%llu untwinned=%llu topology=%llu stages=%llu overflow=%llu other_list=%llu taken=%llu take_unclaimed=%llu take_other_list=%llu take_sealed=%llu segments=%llu pending_segments=%llu pending_stamped=%llu stamps=%llu reuse_unretired=%llu slots=%llu | frames=%llu fed=%llu draws=%llu prev_draws=%llu exact=%llu loose=%llu unmatched=%llu raster_verts=%llu checked=%llu gpu_read=%llu gpu_nonzero=%llu gpu_samples=%llu gpu_last=%u last_draws=%u last_pairs=%u fed_now=%d",
                 (unsigned long long)d.noted, (unsigned long long)d.built, (unsigned long long)d.build_failed, (unsigned long long)d.replayed,
                 (unsigned long long)d.vertices, (unsigned long long)d.not_ready, (unsigned long long)d.twin_queued, (unsigned long long)d.twin_building,
                 (unsigned long long)d.twin_failed, (unsigned long long)d.no_recipe, (unsigned long long)d.hash_mismatch, (unsigned long long)d.untwinned,
@@ -1423,6 +1444,7 @@ void replay_probe_frame()
                 (unsigned long long)d.pending_stamped, (unsigned long long)d.stamps, (unsigned long long)d.reuse_unretired, (unsigned long long)d.slots,
                 (unsigned long long)p.frames, (unsigned long long)p.fed, (unsigned long long)p.draws, (unsigned long long)p.prev_draws,
                 (unsigned long long)p.matched_exact, (unsigned long long)p.matched_loose, (unsigned long long)p.unmatched, (unsigned long long)p.verts, (unsigned long long)p.checked,
+                (unsigned long long)p.gpu_read, (unsigned long long)p.gpu_nonzero, (unsigned long long)p.gpu_samples, p.gpu_last,
                 p.last_draws, p.last_pairs, g.replay_fed_frame && g.replay_fed_frame + 2 >= g.frame ? 1 : 0);
         }
     }
@@ -5874,13 +5896,13 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
         if(!g_trace.armed.load()){
             // First trace ~2 s after the scene is reduced, then every ~15 s.
             if(g_trace.presents-g_trace.armed_at>=(g_trace.learned_pso.load()?900u:30u)){
-                g_trace.recs.clear();g_trace.frame.clear();g_trace.frames=0;g_trace.untraced=g_trace.traced_lists=0;g_trace.ops=0;
+                g_trace.recs.clear();g_trace.frame.clear();g_trace.frames=0;g_trace.untraced=g_trace.traced_lists=0;g_trace.ops=0;g_trace.untraced_lists.clear();
                 g_trace.armed_at=g_trace.presents;g_trace.armed.store(true);
             }
             return;
         }
         // The first frame after arming holds lists recorded before it: start over.
-        if(++g_trace.frames==1){g_trace.frame.clear();g_trace.untraced=g_trace.traced_lists=0;return;}
+        if(++g_trace.frames==1){g_trace.frame.clear();g_trace.untraced=g_trace.traced_lists=0;g_trace.untraced_lists.clear();return;}
         g_trace.result[0]=0;
         trace_analyze(queue,frame?uint64_t(na::observe::IdOf(frame)):0,sdr_present);
         ++g_trace.traces;g_trace.armed.store(false);g_trace.recs.clear();g_trace.frame.clear();

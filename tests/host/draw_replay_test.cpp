@@ -354,6 +354,10 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
         na::observe::GetDrawReplayStats(&stats);
         std::printf("geometry on another list: motion on %u frames (15 expected), pending ok %u, late masked %u, stamps %llu, pending_stamped %llu\n",
                     fed_frames, pending_ok, late_masked, (unsigned long long)stats.stamps, (unsigned long long)stats.pending_stamped);
+        const auto ps = pass.GetStats();
+        std::printf("gpu readback: read %llu nonzero %llu samples %llu last %u\n", (unsigned long long)ps.gpu_read,
+                    (unsigned long long)ps.gpu_nonzero, (unsigned long long)ps.gpu_samples, ps.gpu_last);
+        CHECK(ps.gpu_nonzero >= 10); // the GPU itself reports motion pixels (late frames report 0)
         CHECK(fed_frames >= 15); // 200 has no previous
         CHECK(pending_ok == 2);
         CHECK(late_masked == 2);
