@@ -2418,16 +2418,21 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             const auto current=na::observe::ListStateSub(inl,id,sub,st);
             if(current==na::observe::StateLookup::Known)return true;
             if(current==na::observe::StateLookup::Unavailable)return false;
-            // Sol 697b223 (c): never import the producer's Close-time state when this
-            // recording has no evidence. Another list may have transitioned it since.
-            // Only a producer already submitted on this queue makes the queue's
-            // established state current; otherwise refuse and count it.
+            // Sol 697b223 (c): the producer's Close-time state can be stale if another
+            // list transitioned it since. A producer already submitted on this queue
+            // makes the queue's established state current, so that comes first.
             if(saved->native_origin.Ready(g.queue.Get())&&na::observe::KnownSubStateOnQueueNow(g.queue.Get(),id,sub,st)){
                 if(id==depth_id)pending.depth_source=2;
                 return true;
             }
+            // Producer not submitted yet (scene and upscale in one ExecuteCommandLists):
+            // its end state is still imported, as before, and counted. OPEN (Sol c):
+            // replace with a private colour/depth snapshot recorded at the producer's
+            // Close before the redirect is enabled; refusing here stopped every
+            // separate-list DLSS (host_j2_native_scale_test, 8d5c5e9).
             g_nb.depth_state_refused.fetch_add(1,std::memory_order_relaxed);
-            return false;
+            if(id==color_id&&sub==saved->color_sub){*st=saved->color_state;return true;}
+            if(id==depth_id&&sub==saved->depth_sub){*st=saved->depth_state;pending.depth_source=3;return true;}
         }
         return inl ? state_now(id, sub, st) : saved ? entry_state(id, sub, st) : state_after(lists, scene, id, sub, st);
     };
