@@ -1131,11 +1131,11 @@ void write_status_line()
                 (unsigned long long)b.order_refused,(unsigned long long)b.later_written,b.stages,b.probe,b.refusals);
             if(delivery_n>0)WriteFile(f,delivery_line,DWORD((std::min)(delivery_n,int(sizeof delivery_line-1))),&written,nullptr);
             char steps_line[1024];
-            const int steps_n=std::snprintf(steps_line,sizeof steps_line,"native_steps gated=%llu full=%llu examined=%llu no_input=%llu ambiguous=%llu partial=%llu candidates=%llu recorded=%llu failed=%llu ungated_full=%llu budget=%llu aux=%llu late{staged=%llu changed=%llu same=%llu resolved=%llu} steps{%s}\r\n",
+            const int steps_n=std::snprintf(steps_line,sizeof steps_line,"native_steps gated=%llu full=%llu examined=%llu no_input=%llu ambiguous=%llu partial=%llu candidates=%llu recorded=%llu failed=%llu ungated_full=%llu budget=%llu aux=%llu late{staged=%llu changed=%llu same=%llu resolved=%llu inline=%llu} steps{%s}\r\n",
                 (unsigned long long)b.st_gated,(unsigned long long)b.st_full,(unsigned long long)b.st_examined,(unsigned long long)b.st_no_input,
                 (unsigned long long)b.st_ambiguous,(unsigned long long)b.st_draw_state,(unsigned long long)b.st_candidates,(unsigned long long)b.st_recorded,
                 (unsigned long long)b.st_failed,(unsigned long long)b.st_ungated_full,(unsigned long long)b.st_budget,(unsigned long long)b.st_aux,
-                (unsigned long long)b.st_late_staged,(unsigned long long)b.st_late_changed,(unsigned long long)b.st_late_same,(unsigned long long)b.st_late_resolved,b.steps);
+                (unsigned long long)b.st_late_staged,(unsigned long long)b.st_late_changed,(unsigned long long)b.st_late_same,(unsigned long long)b.st_late_resolved,(unsigned long long)b.st_late_inline,b.steps);
             if(steps_n>0)WriteFile(f,steps_line,DWORD((std::min)(steps_n,int(sizeof steps_line-1))),&written,nullptr);
             char trace_text[4096];uint64_t traces=0;na::j2::NativeTraceResult(trace_text,sizeof trace_text,&traces);
             char trace_line[4400];
@@ -3179,11 +3179,11 @@ void game_frame_boundary(ID3D12CommandQueue* queue)
                 (unsigned long long)b.record_failed,(unsigned long long)b.after_skipped,(unsigned long long)b.redirected,(unsigned long long)b.redirect_failed,b.src_w,b.src_h,b.src_fmt,b.seen_w,b.seen_h,b.seen_fmt,
                 (unsigned long long)native.ticks,(unsigned long long)native.applies,(unsigned long long)native.game_applies,(unsigned long long)native.refusals,
                 (unsigned long long)native.thread_changes,native.controlled?1:0,native.confirmed?1:0,b.reason,native.reason);
-            na::eventlog::Emit("native_steps","gated=%llu full=%llu examined=%llu no_input=%llu ambiguous=%llu partial=%llu candidates=%llu recorded=%llu failed=%llu ungated_full=%llu budget=%llu aux=%llu late{staged=%llu changed=%llu same=%llu resolved=%llu} steps{%s}",
+            na::eventlog::Emit("native_steps","gated=%llu full=%llu examined=%llu no_input=%llu ambiguous=%llu partial=%llu candidates=%llu recorded=%llu failed=%llu ungated_full=%llu budget=%llu aux=%llu late{staged=%llu changed=%llu same=%llu resolved=%llu inline=%llu} steps{%s}",
                 (unsigned long long)b.st_gated,(unsigned long long)b.st_full,(unsigned long long)b.st_examined,(unsigned long long)b.st_no_input,
                 (unsigned long long)b.st_ambiguous,(unsigned long long)b.st_draw_state,(unsigned long long)b.st_candidates,(unsigned long long)b.st_recorded,
                 (unsigned long long)b.st_failed,(unsigned long long)b.st_ungated_full,(unsigned long long)b.st_budget,(unsigned long long)b.st_aux,
-                (unsigned long long)b.st_late_staged,(unsigned long long)b.st_late_changed,(unsigned long long)b.st_late_same,(unsigned long long)b.st_late_resolved,b.steps);
+                (unsigned long long)b.st_late_staged,(unsigned long long)b.st_late_changed,(unsigned long long)b.st_late_same,(unsigned long long)b.st_late_resolved,(unsigned long long)b.st_late_inline,b.steps);
             na::eventlog::Emit("native_delivery","delivered=%llu first_frame=%llu streak=%llu best_streak=%llu order_refused=%llu later_written=%llu stages{%s} probe{%s} refusals{%s}",
                 (unsigned long long)b.delivered,(unsigned long long)b.first_delivery_frame,(unsigned long long)b.streak,(unsigned long long)b.best_streak,
                 (unsigned long long)b.order_refused,(unsigned long long)b.later_written,b.stages,b.probe,b.refusals);
