@@ -809,3 +809,7 @@ Normal merge into Opus CURRENT d4ed2b7 is clean and preserves his newer XeGTAO t
 ## 2026-11-06 Pacific — SE5 TOX2-inspired object motion
 
 Astra repaired the optional draw-replay route after the installed 3b16d38 log showed 31 replay pipeline failures and zero motion supplied. Branch astra/se5-draw-replay, PR117 into the SE5 packaging branch. Exact candidate c972cfa passed RTX and WARP pixel tests and the reversible installer fixture. Cort runs the separate Documents\NA-se5-object-motion-test.cmd and retains in-game testing. See the source branch's docs/SE5-DRAW-REPLAY-20261106.md and COMMS for the comparison and its limits.
+
+## 2026-11-07 Pacific — SE5 Quality delivery candidate
+
+PR118, runtime 8fd6190. The regular Documents\NA-se5-dlss-update.cmd points to the new reversible package. Exact Release and 32 affected tests passed. Both late compute-crossing pixel fixtures passed on RTX and WARP, with the final copy or render-pass composite, separate scene depth owner, offscreen decoy, HUD and return to DLAA exercised. Five isolated installer checks and 17 hashes passed. The actual game still has 2f5612a at publication. Cort runs gameplay. Opus owns independent trace interpretation and Astra owns the delivery path and CMD. Current live SE5 crossing is unverified.
