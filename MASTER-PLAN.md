@@ -1,6 +1,6 @@
 # NeuralAliasAbundance: master plan
 
-**Standing implementation rules (2026-11-07):** Astra and Opus/Claude must apply the five lessons from Fable 5.1's Sniper discovery at the top of [COLLABORATION.md](COLLABORATION.md): trace screen dependencies, resolve actual execution bindings, preserve native UI through placement, generalize relationships, and verify visible pixels. These guide work without adding a review cycle.
+**Standing engineering guide (2026-11-07, broadened at Cort's request):** Astra and Opus/Claude must apply the five rules at the top of [COLLABORATION.md](COLLABORATION.md): reuse existing mechanisms; trace the complete cause-and-effect chain; make each diagnostic run decide the next action; change the approach when evidence stops improving; deliver reusable, visibly verified work without scope expansion. Inspired by Fable 5.1's Sniper discovery, applicable across future game/graphics work. No extra approval or review cycle.
 
 **Written by:** Claude, 2026-10-23, at Cort's direction. Incorporates Codex/Astra's recovery review (`docs/CLAUDE-HANDOFF.md`) and roadmap (`docs/INPUT-ACQUISITION-ROADMAP.md`).
 **Audience:** Claude, Astra (Codex), Gemini Argon (independent gate auditor), and Cort.
