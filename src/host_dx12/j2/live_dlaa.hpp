@@ -175,6 +175,8 @@ struct NativeBridgeStats {
     // changed after recording / unchanged), and resolved to the learned images.
     uint64_t st_late_staged=0,st_late_changed=0,st_late_same=0,st_late_resolved=0,
         st_late_inline=0; // learned dispatches delivered inline with the input chosen by this recording's writes
+    // Depth snapshots at scene-list Close (the late-bound and deferred routes need one).
+    uint64_t snap_closes=0,snap_depth_unknown=0,snap_format=0,snap_no_slot=0,snap_taken=0;
     char steps[720]{};
     // Sol bafa40a: deliveries confirmed at submission (first frame, current and
     // best consecutive run), producer-order refusals, deliveries whose target was
