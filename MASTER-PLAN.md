@@ -1,6 +1,6 @@
 # NeuralAliasAbundance: master plan
 
-**Standing engineering guide (2026-11-07, broadened at Cort's request):** Astra and Opus/Claude must apply the five rules at the top of [COLLABORATION.md](COLLABORATION.md): reuse existing mechanisms; trace the complete cause-and-effect chain; make each diagnostic run decide the next action; change the approach when evidence stops improving; deliver reusable, visibly verified work without scope expansion. Inspired by Fable 5.1's Sniper discovery, applicable across future game/graphics work. No extra approval or review cycle.
+**Required guide for ALL future project work (2026-11-07, Cort's instruction):** Every contributor/agent must read and apply the five rules at the top of [COLLABORATION.md](COLLABORATION.md) when starting or resuming any NeuralAliasAbundance task: reuse existing mechanisms; trace the complete cause-and-effect chain; make each diagnostic run decide the next action; change the approach when evidence stops improving; deliver reusable, visibly verified work without scope expansion. This covers planning, research, architecture, implementation, performance, UI, installers, testing and handoffs across games and phases. Carry this requirement into future handoffs. Inspired by Fable 5.1's discovery; no extra approval or review cycle.
 
 **Written by:** Claude, 2026-10-23, at Cort's direction. Incorporates Codex/Astra's recovery review (`docs/CLAUDE-HANDOFF.md`) and roadmap (`docs/INPUT-ACQUISITION-ROADMAP.md`).
 **Audience:** Claude, Astra (Codex), Gemini Argon (independent gate auditor), and Cort.
