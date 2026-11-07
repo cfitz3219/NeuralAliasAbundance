@@ -70,6 +70,7 @@ struct ListState {
     std::atomic<uint64_t> generation{0};
     std::atomic<bool> generation_known{false};
     std::atomic<uint64_t> op_index{0};
+    std::atomic<uint8_t> work_tail{0}; // 0 unarmed, 1 watched, 2 followed by more work
     std::atomic<bool> recording_observed{false}; // this recording began under observation
     std::atomic<bool> coverage_complete{false};  // the list's current table is fully hooked
     // C9: constant-data bindings of the current recording, snapshotted at submission.
@@ -1037,6 +1038,12 @@ void note_descriptor_write(D3D12_CPU_DESCRIPTOR_HANDLE dst, uint32_t kind, IUnkn
 {
     na_ev_descriptor_write e;
     const bool want = init_header_wanted(e, NA_EV_DESCRIPTOR_WRITE, 0);
+    // Sol 7fec1c4: a resource first met through a view (DXGI swap-chain buffers are
+    // created by DXGI, never through our creation hooks) is registered BEFORE the
+    // descriptor metadata is published, outside the registry lock. Otherwise the view
+    // keeps NA_UNKNOWN_U64 forever and the presenting draw's target is invisible.
+    // Host-owned work stays unregistered (ensure_resource_registered checks t_host_work).
+    if (resource && kind != NA_DESC_SAMPLER) ensure_resource_registered(static_cast<ID3D12Resource*>(resource));
     {
         const CostScope cost(kCostDescWrite);
         std::shared_lock<RegistryLock> lock(g_m, std::defer_lock);
@@ -2971,7 +2978,7 @@ void preexisting_list(ID3D12GraphicsCommandList* l)
     emit(e, NA_GROUP_LIST);
 }
 
-bool begin_op(ID3D12GraphicsCommandList* l, Rec* r)
+bool begin_op(ID3D12GraphicsCommandList* l, Rec* r, bool work = true)
 {
     if (t_host_work || !na::observe_internal::Started() || !l) return false;
     for (int attempt = 0; attempt < 2; ++attempt) {
@@ -2982,6 +2989,8 @@ bool begin_op(ID3D12GraphicsCommandList* l, Rec* r)
                 r->list = id;
                 r->gen = ls->generation_known.load() ? ls->generation.load() : NA_UNKNOWN_U64;
                 r->op_index = ls->op_index.fetch_add(1) + 1;
+                if (work && ls->work_tail.load(std::memory_order_relaxed)==1)
+                    ls->work_tail.store(2,std::memory_order_relaxed);
                 if (!ls->recording_observed.load() || !ls->coverage_complete.load() || r->gen == NA_UNKNOWN_U64)
                     r->flags |= NA_EVF_METHOD_UNOBSERVED;
                 return true;
@@ -2999,6 +3008,8 @@ bool recorded_locked(ID3D12GraphicsCommandList* l,Rec& r,Fn&& fn){
         {std::shared_lock<RegistryLock> lock(g_m);na_object_id id=0;
             if(auto* ls=list_state_locked(l,&id)){
                 r.list=id;r.gen=ls->generation_known.load()?ls->generation.load():NA_UNKNOWN_U64;r.op_index=ls->op_index.fetch_add(1)+1;
+                if (ls->work_tail.load(std::memory_order_relaxed)==1)
+                    ls->work_tail.store(2,std::memory_order_relaxed);
                 if(!ls->recording_observed.load()||!ls->coverage_complete.load()||r.gen==NA_UNKNOWN_U64)r.flags|=NA_EVF_METHOD_UNOBSERVED;
                 std::lock_guard<std::mutex> bind(ls->bind_m);fn(*ls);return true;
             }
@@ -3152,6 +3163,7 @@ struct On<sl::list::Reset> {
                 // unknown generation stays unknown (we never invent a count).
                 if (ls->generation_known.load()) ls->generation.fetch_add(1);
                 ls->op_index.store(0);
+                ls->work_tail.store(0);
                 ls->recording_observed.store(true);
                 {
                     std::lock_guard<std::mutex> bl(ls->bind_m);
@@ -3217,7 +3229,7 @@ struct On<sl::list::Close> {
     static void run(GL* l, HRESULT hr)
     {
         Rec r;
-        if (!begin_op(l, &r)) return;
+        if (!begin_op(l, &r, false)) return;
         na_ev_list_reset_close e;
         init_header(e, NA_EV_LIST_CLOSE, 0);
         e.list = r.list;
@@ -3493,7 +3505,7 @@ struct On<sl::list::ResourceBarrier> {
     static void run(GL* l, UINT n, const D3D12_RESOURCE_BARRIER* b)
     {
         Rec r;
-        if (!begin_op(l, &r) || !n || !b) return;
+        if (!begin_op(l, &r, false) || !n || !b) return;
         constexpr uint32_t kMax = 64;
         na_barrier out[kMax];
         const uint32_t m = std::min<uint32_t>(n, kMax);
@@ -3875,6 +3887,16 @@ struct On<sl::list::ClearRenderTargetView> {
         });
     }
 };
+struct TailWork {
+    template<typename... Args> static void run(GL* list, Args...) {
+        Rec r;
+        begin_op(list, &r);
+    }
+};
+template<> struct On<sl::list::ClearUnorderedAccessViewUint> : TailWork {};
+template<> struct On<sl::list::ClearUnorderedAccessViewFloat> : TailWork {};
+template<> struct On<sl::list::DiscardResource> : TailWork {};
+
 template <>
 struct On<sl::list::ExecuteIndirect> {
     static void run(GL* l, ID3D12CommandSignature*, UINT max, ID3D12Resource*, UINT64, ID3D12Resource*, UINT64)
@@ -5363,6 +5385,9 @@ bool register_list_slots()
         ListHook<L::OMSetRenderTargets, void(UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*)>::spec(),
         ListHook<L::ClearDepthStencilView, void(D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CLEAR_FLAGS, FLOAT, UINT8, UINT, const D3D12_RECT*)>::spec(),
         ListHook<L::ClearRenderTargetView, void(D3D12_CPU_DESCRIPTOR_HANDLE, const FLOAT*, UINT, const D3D12_RECT*)>::spec(),
+        ListHook<L::ClearUnorderedAccessViewUint, void(D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource*, const UINT*, UINT, const D3D12_RECT*)>::spec(),
+        ListHook<L::ClearUnorderedAccessViewFloat, void(D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource*, const FLOAT*, UINT, const D3D12_RECT*)>::spec(),
+        ListHook<L::DiscardResource, void(ID3D12Resource*, const D3D12_DISCARD_REGION*)>::spec(),
         ListHook<L::ExecuteIndirect, void(ID3D12CommandSignature*, UINT, ID3D12Resource*, UINT64, ID3D12Resource*, UINT64)>::spec(),
     };
     std::vector<na::hooking::variants::SlotSpec> remaining;
@@ -6973,6 +6998,17 @@ uint64_t ListRecording(ID3D12CommandList* list)
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load() || !ls->generation_known.load()) return 0;
     return ls->generation.load() + 1; // never 0
+}
+bool ListWorkTailUnchanged(ID3D12CommandList* list, bool arm)
+{
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id = 0;
+    auto* state = list ? list_state_locked(list, &id) : nullptr;
+    if (!state || !state->recording_observed.load() || !state->coverage_complete.load()) return false;
+    std::lock_guard<std::mutex> bindings(state->bind_m);
+    if (!state->restorable || !state->evidence_complete || state->in_render_pass) return false;
+    if (arm) state->work_tail.store(1,std::memory_order_relaxed);
+    return state->work_tail.load(std::memory_order_relaxed)==1;
 }
 bool ListStateRestorable(ID3D12CommandList* l)
 {
