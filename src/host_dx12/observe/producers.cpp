@@ -6751,6 +6751,36 @@ void PresentEnd(const PresentToken& token,uint32_t sync,uint32_t flags,int32_t r
     e.sync_interval=sync;e.present_flags=flags;e.backbuffer_index=token.index;
     emit(e,NA_GROUP_SWAPCHAIN);
 }
+void SwapchainResized(IDXGISwapChain* chain,int32_t result)
+{
+    if(!chain || !ProducersActive())return;
+    const auto id=lookup(chain);
+    if(!id)return; // First Present will discover the current size if not yet observed.
+    na_ev_swapchain_resized e;
+    init_header(e,NA_EV_SWAPCHAIN_RESIZED,NA_EVF_FOUNDATIONAL);
+    e.swapchain=id;e.hresult=result;
+    e.width=e.height=e.format=e.buffer_count=e.buffer_generation=NA_UNKNOWN_U32;
+    DXGI_SWAP_CHAIN_DESC desc{};
+    const bool known=SUCCEEDED(result) && SUCCEEDED(chain->GetDesc(&desc));
+    if(known){
+        e.width=desc.BufferDesc.Width;e.height=desc.BufferDesc.Height;
+        e.format=desc.BufferDesc.Format;e.buffer_count=desc.BufferCount;
+        // Snapshot/restart consumers also need the latest description. Preserve
+        // original creation provenance; an unobserved generation stays unknown.
+        std::unique_lock<RegistryLock> lock(g_m);
+        const auto it=g_objs.find(canon(chain));
+        if(it!=g_objs.end() && it->second.id==id && it->second.created.size()==sizeof(na_ev_swapchain_created)){
+            na_ev_swapchain_created creation{};
+            std::memcpy(&creation,it->second.created.data(),sizeof creation);
+            creation.width=e.width;creation.height=e.height;creation.format=e.format;creation.buffer_count=e.buffer_count;
+            if(creation.buffer_generation!=NA_UNKNOWN_U32)++creation.buffer_generation;
+            e.buffer_generation=creation.buffer_generation;
+            std::memcpy(it->second.created.data(),&creation,sizeof creation);
+        }
+    }
+    if(SUCCEEDED(result) && !known)e.hdr.flags|=NA_EVF_METHOD_UNOBSERVED;
+    emit(e,NA_GROUP_SWAPCHAIN);
+}
 bool InstallRequested() { return g_requested.load(); }
 bool ProducersActive() { return g_active.load(std::memory_order_acquire); }
 

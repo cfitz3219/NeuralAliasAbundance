@@ -159,6 +159,31 @@ struct Feed {
 
 int main() {
     return test::run({
+        {"successful resize updates depth aspect; rejected resize leaves it unchanged", [] {
+             Feed f;
+             f.Swapchain(1024,768);
+             f.Resource(3,853,480,40);
+             f.Resource(4,2048,2048,40);
+             f.Resource(6,853,480,10);
+             f.Resource(7,1280,720,28);
+             f.Pipeline(10,1,1,0);f.Pipeline(11,0,0,1);
+             for(int i=0;i<3;++i)f.Frame();
+             auto rank=f.h.RankDepth(4);
+             CHECK(!rank.empty() && rank[0].score==0);
+             na_ev_swapchain_resized resize{};
+             resize.swapchain=99;resize.width=1280;resize.height=720;
+             resize.hresult=static_cast<int32_t>(0x80004005u);
+             f.Event(resize,NA_EV_SWAPCHAIN_RESIZED);
+             CHECK(f.h.SwapchainWidth()==1024 && f.h.SwapchainHeight()==768);
+             resize.hresult=0;f.Event(resize,NA_EV_SWAPCHAIN_RESIZED);
+             for(int i=0;i<3;++i)f.Frame();
+             rank=f.h.RankDepth(4);
+             CHECK(!rank.empty() && rank[0].resource==3 && rank[0].score>0);
+             CHECK(f.h.RecentTopDepths().Count(3)>=2);
+             resize.width=1024;resize.height=768;resize.hresult=static_cast<int32_t>(0x80004005u);
+             f.Event(resize,NA_EV_SWAPCHAIN_RESIZED);
+             CHECK(f.h.SwapchainWidth()==1280 && f.h.SwapchainHeight()==720);
+         }},
         {"generic_depth picks the swapchain-aspect main depth over shadow and half-res buffers", [] {
              Feed f;
              f.Swapchain(1920, 1080);

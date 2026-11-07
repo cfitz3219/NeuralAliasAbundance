@@ -15,6 +15,7 @@
 #include "host_dx12/overlay/route_a_panel.hpp"
 #include "host_dx12/settings.hpp"
 #include "host_dx12/nr/fg_states.hpp"
+#include "host_dx12/observe/producers.hpp"
 #include <filesystem>
 
 #include <atomic>
@@ -55,6 +56,19 @@ struct ChainWrapper {
     IDXGISwapChain* chain(){return reinterpret_cast<IDXGISwapChain*>(this);}
 };
 std::atomic<uint32_t> g_game_mouse{0}, g_game_keys{0};
+std::atomic<unsigned> g_resized_events{0},g_resized_wrong{0};
+void __cdecl resize_sink(const na_event_batch* batch,void*) {
+    const auto* bytes=reinterpret_cast<const uint8_t*>(batch)+batch->header_bytes;
+    for(uint32_t at=0;at<batch->payload_bytes;){
+        const auto* head=reinterpret_cast<const na_event_header*>(bytes+at);
+        if(head->size_bytes<sizeof(*head)||head->size_bytes>batch->payload_bytes-at)break;
+        if(head->kind==NA_EV_SWAPCHAIN_RESIZED && head->size_bytes>=sizeof(na_ev_swapchain_resized)){
+            const auto* e=reinterpret_cast<const na_ev_swapchain_resized*>(head);
+            ++g_resized_events;if(e->hresult<0 || e->width!=800 || e->height!=450)++g_resized_wrong;
+        }
+        at+=head->size_bytes;
+    }
+}
 LRESULT CALLBACK GameWndProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     if (m == WM_MOUSEMOVE || m == WM_LBUTTONDOWN) g_game_mouse.fetch_add(1);
@@ -126,6 +140,12 @@ int main(int argc, char** argv)
     REQUIRE(SUCCEEDED(sc1.As(&sc)));
 
     if(late_queue) REQUIRE(na::overlay::Start("TEST", nullptr));
+    const bool observe_resize=!boundary&&!late_queue&&!busy_install&&!cursor_state;
+    if(observe_resize){
+        REQUIRE(na::observe::InstallProducers(d.device.Get(),d.queue.Get(),false));
+        na_observe_config config{};config.size_bytes=sizeof(config);
+        REQUIRE(na_observe_start(&config,&resize_sink,nullptr)==NA_OK);
+    }
     test::ComPtr<ID3D12CommandQueue> unrelated;
     test::List unrelated_list;
     if(late_queue || boundary){
@@ -392,6 +412,10 @@ int main(int argc, char** argv)
     d.queue=replacement; // test render work uses the queue we just assigned
     na::overlay::SetOpen(true);
     for(int i=0;i<3;++i){CHECK(SUCCEEDED(frame()));CHECK(na::overlay::GetStats().present_queue==reinterpret_cast<uintptr_t>(replacement.Get()));}
+    if(observe_resize){
+        REQUIRE(na_observe_stop()==NA_OK);
+        CHECK(g_resized_events==2 && g_resized_wrong==0); // both real detours, no manual notification
+    }
 
     d.WaitIdle();
     if(boundary){
@@ -412,6 +436,9 @@ int main(int argc, char** argv)
     nativeChain.Reset();if(nativeWindow)DestroyWindow(nativeWindow);
     sc.Reset(); sc1.Reset();
     DestroyWindow(hwnd);
+    // This combined fixture now owns observer retirement sentinels too.
+    // Mirror host_boot::NotifyProcessExit before CRT destroys shared registries.
+    if(observe_resize)na::observe::SetProcessExiting();
     na::hooking::Shutdown();
     DeleteFileW(na::settings::UserIniPath());
     std::filesystem::remove(std::filesystem::path(na::settings::UserIniPath()).parent_path());

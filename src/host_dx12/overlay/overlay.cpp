@@ -3655,7 +3655,8 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT count, UI
     if(!na::present::BeforeResize(sc))return DXGI_ERROR_INVALID_CALL; // outstanding buffer use; size unchanged
     na::present::TranslateResize(sc,&w,&h); // render-small: the real chain follows the window
     const auto result=g_orig_resize(sc,count,w,h,fmt,flags);
-    na::present::AfterResize(sc,result);return result;
+    na::present::AfterResize(sc,result);
+    na::observe::SwapchainResized(sc,result);return result;
 }
 HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags,
                                                const UINT* node_masks, IUnknown* const* queues)
@@ -3670,6 +3671,7 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT count, 
     na::present::TranslateResize(sc,&w,&h); // render-small: the real chain follows the window
     const auto result=g_orig_resize1(sc, count, w, h, fmt, flags, node_masks, queues);
     na::present::AfterResize(sc,result);
+    na::observe::SwapchainResized(sc,result);
     if(SUCCEEDED(result) && queues){
         UINT actual=count;
         if(!actual){DXGI_SWAP_CHAIN_DESC1 desc{};if(SUCCEEDED(sc->GetDesc1(&desc)))actual=desc.BufferCount;}
@@ -3905,6 +3907,7 @@ na::slb::OverlayHooks make_boundary_hooks()
     h.chain_seen=&boundary_seen;
     h.present = &boundary_present;
     h.before_resize = &boundary_before_resize;
+    h.after_resize = &na::observe::SwapchainResized;
     h.released = &boundary_released;
     return h;
 }

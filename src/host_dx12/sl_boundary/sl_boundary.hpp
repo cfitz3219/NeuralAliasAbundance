@@ -165,13 +165,15 @@ bool SetCallbacks(const Callbacks& callbacks);
 // Overlay frame source for games whose Present into SL's proxy never reaches
 // the native DXGI Present detour (Ghost of Tsushima, 2026-10-31). Independent
 // of SetCallbacks; the storage must outlive the registration (static), and
-// nullptr detaches. All three run outside any boundary lock:
+// nullptr detaches. All callbacks run outside any boundary lock:
 //  - present: every real game Present into the proxy, after the consumer's
 //    before_present and before the original. game_facing is SL's proxy, base
 //    the chain beneath it (may be null), queue the exact creation/
 //    ResizeBuffers1 queue (borrowed; null if unknown).
 //  - before_resize: before the original ResizeBuffers/ResizeBuffers1 on the
 //    proxy, so retained back-buffer references can be dropped first.
+//  - after_resize: actual result, after the original and epoch update; observers
+//    can read the resolved size without adding any per-Present query.
 //  - released: after the proxy's final Release (pointer identity only).
 struct OverlayHooks {
     // Creation observation before the game can call GetBuffer. No SL locks.
@@ -179,6 +181,7 @@ struct OverlayHooks {
     void (*present)(IDXGISwapChain* game_facing, IDXGISwapChain* base, ID3D12CommandQueue* queue) = nullptr;
     void (*before_resize)(IDXGISwapChain* game_facing) = nullptr;
     void (*released)(IDXGISwapChain* game_facing) = nullptr;
+    void (*after_resize)(IDXGISwapChain* game_facing, int32_t result) = nullptr;
 };
 void SetOverlayHooks(const OverlayHooks* hooks);
 

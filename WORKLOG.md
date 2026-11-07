@@ -1147,3 +1147,9 @@ Own5c2e470/p35928 failed game qualification: actual input_bound_rtv=0 throughout
 Unbind-aware layout fixturePASS2.17s. Prior5c2e470runtime fails30actual-input texel assertions, independently of final fake output. Restored exact repaired source/fullRelease;96affected regressions underway. Retained target Reset/unbind behavior asserted; fixture source state updated for its actual pixel-shader read.
 
 Final retained-draw affected96cases:93PASS3unsupportedMSAA16SKIP0FAIL263.93s. Additional4observer regressionsALLPASS12.17s. CompleteRelease rebuilt after negativecontrol. No live acceptance yet; publishing source/package for own next test.
+
+## 2026-11-07 — Live aspect change reveals a missing producer notification
+
+Own e3/p36772 held6677Quality/Performance deliveries and4464nativeDLAA; one quality-transitiontaildrop, zero actualNGX/state/camera/ordererrors.96/96screenprobe, Home1620/1620. Resizingfullscreenfrom1024x768to1280x720 thenstoppeddiscovery: reported swapchainsize remained1024x768, rawdepth0, valid853x480scene rejected byaspect. No runtime emitter for existingNA_EV_SWAPCHAIN_RESIZED existed. Repair native/proxyresizecallback notification andinventorydescription, consumerfailed-resizeignore. No perframecost/ABIchange/validationrelaxation. FocusedactualDXGI/observer/nativehooks/proxycallbacks/CPUaspecttests5/5PASS7.95s; initialfixtureenumcompilewarning andmissingproductionexitnotificationcorrected, failuresretained. CompleteReleasebuilt; fullsuiteinprogress. Reportdocumentsactualrunlimits. PublicCMDstill6e pendingnewlive qualification.
+
+Final resize-repair release receipt: complete Release build; broad 253 cases, 249 PASS, four optional/unsupported SKIP, zero FAIL (454.30 seconds). Skips: optional NR runtime probe and three unsupported MSAA16 cases. Focused resize regression five/five PASS7.95s. Actual live aspect-change validation follows; fixtures do not establish game-image acceptance.

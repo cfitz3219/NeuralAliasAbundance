@@ -49,9 +49,10 @@ uint32_t g_orig_seen_n = 0;
 void* g_orig_seen_cmd = nullptr;
 HRESULT g_next_present_hr = S_OK;
 // Overlay boundary frame source (Ghost of Tsushima): what the overlay hooks saw.
-struct OverlaySeen { int presents = 0, resizes = 0, releases = 0; IDXGISwapChain* last = nullptr; } g_overlay_seen;
+struct OverlaySeen { int presents = 0, resizes = 0, resized = 0, releases = 0; IDXGISwapChain* last = nullptr; } g_overlay_seen;
 void overlay_present(IDXGISwapChain* sc, IDXGISwapChain*, ID3D12CommandQueue*) { ++g_overlay_seen.presents; g_overlay_seen.last = sc; }
 void overlay_resize(IDXGISwapChain* sc) { ++g_overlay_seen.resizes; g_overlay_seen.last = sc; }
+void overlay_resized(IDXGISwapChain* sc,int32_t result) { CHECK(result==S_OK);CHECK(g_overlay_seen.resizes>g_overlay_seen.resized);++g_overlay_seen.resized;g_overlay_seen.last=sc; }
 void overlay_released(IDXGISwapChain* sc) { ++g_overlay_seen.releases; g_overlay_seen.last = sc; }
 int g_present_calls = 0, g_present1_calls = 0, g_resize_calls = 0, g_constants_calls = 0;
 HANDLE g_block = nullptr, g_entered = nullptr; // test 7: hold a Present inside the original
@@ -604,6 +605,7 @@ int main(int argc,char** argv)
         static na::slb::OverlayHooks hooks;
         hooks.present = &overlay_present;
         hooks.before_resize = &overlay_resize;
+        hooks.after_resize = &overlay_resized;
         hooks.released = &overlay_released;
         na::slb::SetOverlayHooks(&hooks);
         const int presents_before = g_present_calls;
@@ -622,6 +624,9 @@ int main(int argc,char** argv)
         CHECK(g_overlay_seen.presents == 3);
         CHECK(chain->ResizeBuffers(3, 1920, 1080, DXGI_FORMAT_R8G8B8A8_UNORM, 0) == S_OK);
         CHECK(g_overlay_seen.resizes == 1 && g_overlay_seen.last == chain);
+        CHECK(g_overlay_seen.resized==1);
+        CHECK(reinterpret_cast<IDXGISwapChain3*>(chain)->ResizeBuffers1(3,1280,720,DXGI_FORMAT_R8G8B8A8_UNORM,0,nullptr,nullptr)==S_OK);
+        CHECK(g_overlay_seen.resizes==2 && g_overlay_seen.resized==2 && g_overlay_seen.last==chain);
         na::slb::SetOverlayHooks(nullptr);
         CHECK(chain->Present(1, 0) == S_OK);
         CHECK(g_overlay_seen.presents == 3 && g_overlay_seen.releases == 0);

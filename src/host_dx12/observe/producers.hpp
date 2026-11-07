@@ -98,6 +98,9 @@ void ExecuteEnd(const ExecuteToken& token, ID3D12CommandQueue* queue, uint32_t c
 struct PresentToken { na_object_id swapchain{}; uint64_t ordinal{}; uint32_t index{NA_UNKNOWN_U32}; };
 PresentToken PresentBegin(IDXGISwapChain* chain);
 void PresentEnd(const PresentToken& token, uint32_t sync, uint32_t flags, int32_t result);
+// Called after the actual native/proxy ResizeBuffers*. Query resolved dimensions
+// only on this infrequent boundary; zero request dimensions mean client size.
+void SwapchainResized(IDXGISwapChain* chain, int32_t result);
 
 // Tests: `probe` runs inside each snapshot copy while the copy holds the
 // buffer's mapping (C9-H3-REVIEW-1 race regression). nullptr removes it.

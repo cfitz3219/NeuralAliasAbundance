@@ -101,6 +101,7 @@ public:
                     h = e.height;
                 } else {
                     const auto e = Load<na_ev_swapchain_resized>(p);
+                    if(e.hresult<0)break; // Failed resize retains the old buffers and aspect.
                     w = e.width;
                     h = e.height;
                 }
