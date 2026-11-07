@@ -16,6 +16,7 @@
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/nr/nr_pass.hpp"
 #include "host_dx12/observe/producers.hpp"
+#include "host_dx12/observe/operation_snapshot.hpp"
 #include "host_dx12/overlay/presenter.hpp"
 #include "host_dx12/j2/native_hud.hpp"
 #include "host_dx12/j2/hud_picture.hpp"
@@ -344,11 +345,27 @@ int main(int argc,char** argv)
         auto native=test::CreateTexture(dev,OW,OH,format,D3D12_RESOURCE_STATE_COMMON,flags);
         REQUIRE(native);
         test::ComPtr<ID3D12Resource> late, decoy, presented, aux;
+        test::ComPtr<IDXGISwapChain1> witness_chain;
+        HWND witness_window = nullptr;
+        const bool dxgi_witness = native_se5 && std::strstr(argv[1], "dxgi");
         if (native_late) {
             late=test::CreateTexture(dev,W,H,format,D3D12_RESOURCE_STATE_COMMON,flags);
             decoy=test::CreateTexture(dev,OW,OH,format,D3D12_RESOURCE_STATE_COMMON,flags);
             // SE5: the presented image is FP16 (p49436 swap chain format 10).
-            presented=test::CreateTexture(dev,OW,OH,native_se5?DXGI_FORMAT_R16G16B16A16_FLOAT:format,D3D12_RESOURCE_STATE_COMMON,
+            if (dxgi_witness) {
+                witness_window = test::CreateTestWindow(L"Backbuffer provenance witness", OW, OH);
+                DXGI_SWAP_CHAIN_DESC1 desc{};
+                desc.Width = OW;
+                desc.Height = OH;
+                desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+                desc.SampleDesc.Count = 1;
+                desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+                desc.BufferCount = 2;
+                desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+                REQUIRE(witness_window && SUCCEEDED(d.factory->CreateSwapChainForHwnd(d.queue.Get(), witness_window, &desc, nullptr, nullptr, &witness_chain)));
+                REQUIRE(SUCCEEDED(witness_chain->GetBuffer(0, IID_PPV_ARGS(&presented))));
+                CHECK(!na::observe::IdOf(presented.Get()));
+            } else presented=test::CreateTexture(dev,OW,OH,native_se5?DXGI_FORMAT_R16G16B16A16_FLOAT:format,D3D12_RESOURCE_STATE_COMMON,
                 native_composite?D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET:D3D12_RESOURCE_FLAG_NONE);
             REQUIRE(late&&decoy&&presented);
             // SE5: a smaller auxiliary input of the upscale step (#13990 1146x480/10).
@@ -457,6 +474,12 @@ int main(int argc,char** argv)
             D3D12_RENDER_TARGET_VIEW_DESC rtv_desc{};
             rtv_desc.Format=present_format;rtv_desc.ViewDimension=D3D12_RTV_DIMENSION_TEXTURE2D;
             dev->CreateRenderTargetView(presented.Get(),&rtv_desc,composite_rtv->GetCPUDescriptorHandleForHeapStart());
+            if (dxgi_witness) {
+                na::observe::OperationDescriptor observed;
+                const bool resolved = na::observe::NativeDescriptor(composite_rtv->GetCPUDescriptorHandleForHeapStart(), observed);
+                std::printf("dxgi RTV at creation: buffer=%llu resolved=%d\n", (unsigned long long)na::observe::IdOf(presented.Get()), resolved);
+                CHECK(resolved && observed.resource.Get() == presented.Get());
+            }
             if(native_se5){
                 // [1] RTV of the game's upscaled image (the overwrite case clears it).
                 rtv_desc.Format=view_format;
@@ -649,6 +672,13 @@ int main(int argc,char** argv)
                     ID3D12DescriptorHeap* hh[]{heap.Get()};fl->SetDescriptorHeaps(1,hh);
                     fl->SetGraphicsRootSignature(composite_root.Get());fl->SetPipelineState(composite.Get());
                     auto rt=composite_rtv->GetCPUDescriptorHandleForHeapStart();fl->OMSetRenderTargets(1,&rt,FALSE,nullptr);
+                    if (dxgi_witness) {
+                        na_object_id observed = 0;
+                        na::observe::ListCurrentTargets(fl, &observed, nullptr);
+                        const auto actual = na::observe::IdOf(presented.Get());
+                        std::printf("dxgi after barrier: actual buffer=%llu bound target=%llu\n", (unsigned long long)actual, (unsigned long long)observed);
+                        CHECK(actual && observed == actual);
+                    }
                     const D3D12_VIEWPORT vp{0,0,float(OW),float(OH),0,1};const D3D12_RECT sc{0,0,LONG(OW),LONG(OH)};
                     fl->RSSetViewports(1,&vp);fl->RSSetScissorRects(1,&sc);fl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                     const auto gbase=heap->GetGPUDescriptorHandleForHeapStart().ptr;
@@ -718,6 +748,7 @@ int main(int argc,char** argv)
         if(native_late){
             char trace[2048];uint64_t traces=0;na::j2::NativeTraceResult(trace,sizeof trace,&traces);
             std::printf("learned native Quality deliveries %u, traces %llu: %s\n",late_deliveries,(unsigned long long)traces,trace);
+            if(dxgi_witness) CHECK(std::strstr(trace,"presented_writer=[draw")!=nullptr);
             if(native_overwrite){
                 // No false confirmation: nothing learned, nothing evaluated or delivered.
                 CHECK(late_deliveries==0 && fake::evals==before_native && std::strstr(trace,"learned=0")!=nullptr);
@@ -742,6 +773,12 @@ int main(int argc,char** argv)
             }
         }else CHECK(fake::evals==before_native+3);
         CHECK(dev->GetDeviceRemovedReason()==S_OK);
+        if (witness_window) {
+            final_list.list.Reset();
+            presented.Reset();
+            witness_chain.Reset();
+            DestroyWindow(witness_window);
+        }
         fake::eval_output=nullptr;
         // Restore DLAA while the last post list remains closed/replayable. GPU
         // completion, rather than requiring its future Reset, permits resizing.

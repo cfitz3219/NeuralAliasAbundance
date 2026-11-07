@@ -810,6 +810,13 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
         if (index>=ops.size() || std::find(visited.begin(),visited.end(),version)!=visited.end()) continue;
         visited.push_back(version);
         const auto& op=ops[index];
+        if (edge.id==presented && edge.before==ops.size()) {
+            char detail[640]{};
+            trace_describe(detail,sizeof detail,op);
+            add(" presented_writer=%s writer_list=%llu/%llu%s",detail,
+                (unsigned long long)op.list,(unsigned long long)op.recording,
+                op.inferred?" writer_bindings=unresolved":"");
+        }
         const auto output=std::find_if(op.out.begin(),op.out.end(),[&](const TraceIo& v){return v.id==edge.id;});
         if (output==op.out.end() || !output->whole || output->w!=e.ow || output->h!=e.oh) continue;
         if (output->binding=='r' && op.preserves) {

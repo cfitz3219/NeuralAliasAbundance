@@ -1455,6 +1455,9 @@ void STDMETHODCALLTYPE D_CreateUnorderedAccessView(ID3D12Device* dev, ID3D12Reso
 void STDMETHODCALLTYPE D_CreateRenderTargetView(ID3D12Device* dev, ID3D12Resource* r, const D3D12_RENDER_TARGET_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
 {
     o_CreateRenderTargetView(dev, r, d, h);
+    // DXGI backbuffers may first reach the observer here. A later barrier cannot
+    // repair the resource identity already stored in this descriptor.
+    if (r && !t_host_work) ensure_resource_registered(r);
     uint32_t first = NA_UNKNOWN_U32, count = NA_UNKNOWN_U32;
     if (!d || d->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) { first = d ? d->Texture2D.MipSlice : 0; count = 1; }
     else if (r && d->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY && d->Texture2DArray.ArraySize == 1) {
