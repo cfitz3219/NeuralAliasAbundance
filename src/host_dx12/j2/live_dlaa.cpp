@@ -3664,12 +3664,12 @@ public:
             if(!c->dest&&!compute&&c->other&&c->other!=~0ull){
                 // F10: DLSS first, into a private full-size HDR image; the game's
                 // own tone-map/upscale draw then reads that image (normalized UVs).
-                const char* why=nullptr;
-                if(reconstruct(l,c,&op,&why)){
+                const char* redirect_why=nullptr;
+                if(reconstruct(l,c,&op,&redirect_why)){
                     t_native_hint=nullptr;g_nb.candidates.fetch_add(1,std::memory_order_relaxed);g_nb.redirected.fetch_add(1,std::memory_order_relaxed);
                     c->rebound=true;return {na::observe::ShaderAction::Forward,c};
                 }
-                native_reject(g_nb.redirect_failed,why?why:"The tone-mapping upscale pass could not be redirected to the DLSS image.");return {};
+                native_reject(g_nb.redirect_failed,redirect_why?redirect_why:"The tone-mapping upscale pass could not be redirected to the DLSS image.");return {};
             }
             if(!c->dest){native_reject(g_nb.no_destination,full_seen?"The full-size output of the pass has another format than the scene (for example after tone mapping).":
                 "The pass reading the scene writes nothing at full output size.");return {};}
