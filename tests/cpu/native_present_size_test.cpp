@@ -310,7 +310,16 @@ int main() {
         }},
         {"virtual screen: one map for monitor, display modes, metrics, outputs and the game's window moves", [] {
             CHECK(InstallSizeProbe());
-            Window w; const RECT c=native_client(w.hwnd);
+            Window w;
+            // The round-trip assertion assumes the starting client fits its
+            // monitor. On a 1024-pixel, 125%-DPI desktop the old 1000-pixel
+            // fixture produced an 823-logical-pixel client on an 819-wide
+            // monitor, correctly triggering the production monitor clamp.
+            { NativeScope n; MONITORINFO bounds{};bounds.cbSize=sizeof bounds;
+              CHECK(GetMonitorInfoW(MonitorFromWindow(w.hwnd,MONITOR_DEFAULTTONEAREST),&bounds));
+              CHECK(SetWindowPos(w.hwnd,nullptr,0,0,(bounds.rcMonitor.right-bounds.rcMonitor.left)/2,
+                  (bounds.rcMonitor.bottom-bounds.rcMonitor.top)/2,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE)); }
+            const RECT c=native_client(w.hwnd);
             const UINT cw=UINT(c.right-c.left), ch=UINT(c.bottom-c.top);
             CHECK(Attach(w.hwnd,{cw,ch},{cw,ch}));
             ScreenMap m{}; CHECK(!GetScreenMap(&m)); // same size: identity, nothing rewritten
@@ -359,6 +368,10 @@ int main() {
             { GameScopeForTest game; CHECK(GetWindowRect(w.hwnd,&wv));
               CHECK(SetWindowPos(w.hwnd,nullptr,wv.left,wv.top,wv.right-wv.left,wv.bottom-wv.top,SWP_NOZORDER|SWP_NOACTIVATE)); }
             RECT after{}; { NativeScope n; CHECK(GetWindowRect(w.hwnd,&after)); }
+            if(std::memcmp(&after,&wr,sizeof after)!=0)
+                std::printf("window roundtrip: before=%ld,%ld,%ld,%ld virtual=%ld,%ld,%ld,%ld after=%ld,%ld,%ld,%ld scale=%.9f,%.9f\n",
+                    wr.left,wr.top,wr.right,wr.bottom,wv.left,wv.top,wv.right,wv.bottom,
+                    after.left,after.top,after.right,after.bottom,m.sx,m.sy);
             CHECK(std::memcmp(&after,&wr,sizeof after)==0);
             // ...and a larger virtual client grows the real one by 1/scale, never to the virtual size.
             { GameScopeForTest game; CHECK(SetWindowPos(w.hwnd,nullptr,0,0,(wv.right-wv.left)+4,(wv.bottom-wv.top)+2,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE)); }

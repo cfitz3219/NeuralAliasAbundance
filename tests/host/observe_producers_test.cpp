@@ -195,12 +195,40 @@ int main()
     std::printf("checkpoint 4.8\n"); std::fflush(stdout);
 
     std::printf("checkpoint 5\n"); std::fflush(stdout);
+    // The creation inventory must not keep its old aspect after a real resize.
+    // Zero width/height are resolved by DXGI, not published as zero/requested size.
+    HWND resize_window=test::CreateTestWindow(L"Observer resize",480,300);
+    REQUIRE(resize_window);
+    DXGI_SWAP_CHAIN_DESC1 sd{};sd.Width=1024;sd.Height=768;
+    sd.Format=DXGI_FORMAT_R8G8B8A8_UNORM;sd.SampleDesc.Count=1;
+    sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;sd.BufferCount=2;sd.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    test::ComPtr<IDXGISwapChain1> chain;
+    REQUIRE(SUCCEEDED(d.factory->CreateSwapChainForHwnd(d.queue.Get(),resize_window,&sd,nullptr,nullptr,&chain)));
+    const auto present=na::observe::PresentBegin(chain.Get());
+    REQUIRE(present.swapchain);
+    const auto resized=chain->ResizeBuffers(0,0,0,DXGI_FORMAT_UNKNOWN,0);
+    REQUIRE(SUCCEEDED(resized));na::observe::SwapchainResized(chain.Get(),resized);
+    DXGI_SWAP_CHAIN_DESC actual{};REQUIRE(SUCCEEDED(chain->GetDesc(&actual)));
+    test::ComPtr<ID3D12Resource> retained;
+    REQUIRE(SUCCEEDED(chain->GetBuffer(0,IID_PPV_ARGS(&retained))));
+    const auto failed=chain->ResizeBuffers(0,1280,720,DXGI_FORMAT_UNKNOWN,0);
+    REQUIRE(FAILED(failed));na::observe::SwapchainResized(chain.Get(),failed);retained.Reset();
     // Retirement: the last reference goes away.
     placed.Reset();
     REQUIRE(na_observe_resync() == NA_OK);
     REQUIRE(na_observe_stop() == NA_OK);
     session.running = false;
     CHECK(g_invalid_reports.load() == 0);
+    const auto resized_events=All<na_ev_swapchain_resized>(NA_EV_SWAPCHAIN_RESIZED);
+    REQUIRE(resized_events.size()==2);
+    CHECK(resized_events[0].swapchain==present.swapchain && resized_events[0].hresult>=0);
+    CHECK(resized_events[0].width==actual.BufferDesc.Width && resized_events[0].height==actual.BufferDesc.Height);
+    CHECK(resized_events[0].format==static_cast<uint32_t>(sd.Format) && resized_events[0].buffer_count==2);
+    CHECK(resized_events[1].hresult==failed && resized_events[1].width==NA_UNKNOWN_U32);
+    const auto replayed=All<na_ev_swapchain_created>(NA_EV_SWAPCHAIN_CREATED);
+    REQUIRE(!replayed.empty());
+    CHECK(replayed.back().swapchain==present.swapchain && replayed.back().width==actual.BufferDesc.Width && replayed.back().height==actual.BufferDesc.Height);
+    chain.Reset();DestroyWindow(resize_window);
 
     std::printf("checkpoint 6\n"); std::fflush(stdout);
     // ---- decode ----

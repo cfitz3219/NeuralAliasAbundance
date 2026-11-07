@@ -2892,6 +2892,13 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
         g_menu_skips.empty.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    // ImGui's Win32 coordinates follow the client, while this texture can be
+    // larger (borderless scaling, a presenter, or a resized game window).
+    // Scale BOTH the viewport and scissors through the backend's supported
+    // framebuffer transform; keep layout and mouse coordinates in client units.
+    const auto menu_target = back_buffer->GetDesc();
+    draw->FramebufferScale = ImVec2(float(menu_target.Width) / draw->DisplaySize.x,
+                                   float(menu_target.Height) / draw->DisplaySize.y);
     // New glyphs can update an EXISTING font atlas. The private upload queue
     // must not write it while an older game-queue menu draw is sampling it.
     // A completion check (not a wait) protects all atlas updates/destruction.
@@ -3648,7 +3655,8 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT count, UI
     if(!na::present::BeforeResize(sc))return DXGI_ERROR_INVALID_CALL; // outstanding buffer use; size unchanged
     na::present::TranslateResize(sc,&w,&h); // render-small: the real chain follows the window
     const auto result=g_orig_resize(sc,count,w,h,fmt,flags);
-    na::present::AfterResize(sc,result);return result;
+    na::present::AfterResize(sc,result);
+    na::observe::SwapchainResized(sc,result);return result;
 }
 HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags,
                                                const UINT* node_masks, IUnknown* const* queues)
@@ -3663,6 +3671,7 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT count, 
     na::present::TranslateResize(sc,&w,&h); // render-small: the real chain follows the window
     const auto result=g_orig_resize1(sc, count, w, h, fmt, flags, node_masks, queues);
     na::present::AfterResize(sc,result);
+    na::observe::SwapchainResized(sc,result);
     if(SUCCEEDED(result) && queues){
         UINT actual=count;
         if(!actual){DXGI_SWAP_CHAIN_DESC1 desc{};if(SUCCEEDED(sc->GetDesc1(&desc)))actual=desc.BufferCount;}
@@ -3898,6 +3907,7 @@ na::slb::OverlayHooks make_boundary_hooks()
     h.chain_seen=&boundary_seen;
     h.present = &boundary_present;
     h.before_resize = &boundary_before_resize;
+    h.after_resize = &na::observe::SwapchainResized;
     h.released = &boundary_released;
     return h;
 }
@@ -4074,7 +4084,14 @@ bool StartCore(const char* route_tag, PanelFn controls)
                 na::observe::InstallProducers(dev.Get(), queue.Get(), /*hook_queue_execute=*/false);
                 na::observe::SetExecuteForwarder(g_orig_execute); // C9b: host sample copies bypass this detour
             }
-            if (ok && na::nr::states::InstallEnhancedInvalidation()) na::observe::InstallListResetTracking(dev.Get(), na::nr::OnCommandListReset,na::nr::states::Observe);
+            if (ok) {
+                const bool enhanced=na::nr::states::InstallEnhancedInvalidation();
+                // Resource/recording retirement is mandatory even if optional
+                // enhanced-barrier registration failed. Do not keep an old
+                // submission receipt when the game reuses a command list.
+                na::observe::InstallListResetTracking(dev.Get(),na::nr::OnCommandListReset,
+                    enhanced?na::nr::states::Observe:nullptr);
+            }
             if (ok) {
                 na::present::Originals o;
                 o.present = g_orig_present;

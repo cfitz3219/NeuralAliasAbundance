@@ -348,6 +348,7 @@ int SnapshotLeaseAudit(){
     auto payload=std::make_shared<int>(7);std::weak_ptr<int> lifetime=payload;
     auto lease=na::nr::native::RetainRecording(list.list.Get(),payload);REQUIRE(!!lease);
     payload.reset();CHECK(!lifetime.expired());CHECK(!lease.Ready(d.queue.Get()));
+    CHECK(lease.SubmissionOrder(d.queue.Get())==0);
     ComPtr<ID3D12CommandQueue> other;D3D12_COMMAND_QUEUE_DESC qd{};
     REQUIRE(SUCCEEDED(d.device->CreateCommandQueue(&qd,IID_PPV_ARGS(&other))));
     ComPtr<ID3D12Fence> gate;REQUIRE(SUCCEEDED(d.device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&gate))));
@@ -355,15 +356,36 @@ int SnapshotLeaseAudit(){
     REQUIRE(SUCCEEDED(list.list->Close()));ID3D12CommandList* lists[]={list.list.Get()};
     na::nr::Execute(d.queue.Get(),1,lists,Forward);
     CHECK(lease.Ready(d.queue.Get()));CHECK(!lease.Ready(other.Get()));CHECK(!lease.Retired());
+    const auto submitted_order=lease.SubmissionOrder(d.queue.Get());CHECK(submitted_order>0);
+    CHECK(lease.SubmissionOrder(other.Get())==0);
     na::nr::OnCommandListReset(list.list.Get());na::nr::native::Maintain();
     CHECK(!lease.Retired());CHECK(!lifetime.expired());
     REQUIRE(SUCCEEDED(gate->Signal(1)));d.WaitIdle();na::nr::native::Maintain();
     CHECK(lease.Ready(other.Get()));CHECK(lease.Retired());
+    CHECK(lease.SubmissionOrder(d.queue.Get())==submitted_order);
+    CHECK(lease.SubmissionOrder(other.Get())==0); // completion is not cross-queue ordering
     CHECK(lifetime.expired());lease={};
     list.Reset();auto discarded_payload=std::make_shared<int>(8);std::weak_ptr<int> discarded=discarded_payload;
     auto unused=na::nr::native::RetainRecording(list.list.Get(),discarded_payload);discarded_payload.reset();
     REQUIRE(SUCCEEDED(list.list->Close()));na::nr::OnCommandListReset(list.list.Get());na::nr::native::Maintain();
     CHECK(unused.Retired());CHECK(!unused.Ready(d.queue.Get()));unused={};CHECK(discarded.expired());
+    // CPU Close and pointer/lock order must not replace actual GPU batch order.
+    test::List a,b;REQUIRE(a.Create(d.device.Get()));REQUIRE(b.Create(d.device.Get()));
+    auto la=na::nr::native::RetainRecording(a.list.Get(),std::make_shared<int>(1));
+    auto lb=na::nr::native::RetainRecording(b.list.Get(),std::make_shared<int>(2));
+    REQUIRE(la && lb);
+    REQUIRE(SUCCEEDED(b.list->Close()));REQUIRE(SUCCEEDED(a.list->Close()));
+    ID3D12CommandList* ab[]{a.list.Get(),b.list.Get()};
+    na::nr::Execute(d.queue.Get(),2,ab,Forward);
+    CHECK(la.SubmissionOrder(d.queue.Get())<lb.SubmissionOrder(d.queue.Get()));
+    const auto first_b=lb.SubmissionOrder(d.queue.Get());
+    d.WaitIdle();
+    ID3D12CommandList* ba[]{b.list.Get(),a.list.Get()};
+    na::nr::Execute(d.queue.Get(),2,ba,Forward);
+    CHECK(lb.SubmissionOrder(d.queue.Get())>first_b);
+    CHECK(lb.SubmissionOrder(d.queue.Get())<la.SubmissionOrder(d.queue.Get()));
+    d.WaitIdle();
+    na::nr::OnCommandListReset(a.list.Get());na::nr::OnCommandListReset(b.list.Get());na::nr::native::Maintain();
     return 0;
 }
 int ResizeRetentionAudit(bool enabled){

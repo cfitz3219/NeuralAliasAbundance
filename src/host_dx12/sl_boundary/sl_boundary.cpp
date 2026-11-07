@@ -618,12 +618,18 @@ void overlay_before_resize(IDXGISwapChain* sc)
     if (const OverlayHooks* overlay = g_overlay_hooks.load(std::memory_order_acquire); overlay && overlay->before_resize)
         overlay->before_resize(sc);
 }
+void overlay_after_resize(IDXGISwapChain* sc,HRESULT result)
+{
+    if (const OverlayHooks* overlay = g_overlay_hooks.load(std::memory_order_acquire); overlay && overlay->after_resize)
+        overlay->after_resize(sc,result);
+}
 
 HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT flags)
 {
     overlay_before_resize(sc);
     const HRESULT hr = g_orig_resize(sc, n, w, h, f, flags);
     if (SUCCEEDED(hr)) bump_epoch(sc);
+    overlay_after_resize(sc,hr);
     return hr;
 }
 
@@ -644,6 +650,7 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT n, UINT
         if(entry && entry->queues.Resized(hr,queue_count,canonical.data()))entry->proxy=sc;
     }
     if (SUCCEEDED(hr)) bump_epoch(sc);
+    overlay_after_resize(sc,hr);
     return hr;
 }
 

@@ -71,7 +71,9 @@ constexpr uint32_t kRing = 6;            // frames in flight before a slot is re
 // its R32_FLOAT snapshot are the same single-sample 32-bit plane-0 representation after the
 // existing conversion. Switching between them must not rebuild the temporal working textures
 // (and reset history); only genuinely different depth formats key the working set.
-inline DXGI_FORMAT depth_working_key(DXGI_FORMAT f) { return na::depth::PlaneZeroCopiesToR32F(f) ? DXGI_FORMAT_R32_FLOAT : f; }
+inline DXGI_FORMAT depth_working_key(DXGI_FORMAT f, uint32_t samples) {
+    return samples == 1 && na::depth::PlaneZeroCopiesToR32F(f) ? DXGI_FORMAT_R32_FLOAT : f;
+}
 // Quality stability gate: consecutive deliverable frames required before DLSS is written.
 // 0 (Cort: no fail-safes, every frame): DLSS is written whenever the route can; the gate then
 // only counts misses (gate{drops}) so a drop-out is visible in the log.
@@ -94,7 +96,8 @@ struct Slot {
 };
 
 struct PendingHistory {
-    uint64_t native_source=0;
+    na::nr::native::RecordingLease native_source;
+    uint64_t native_source_serial=0;
     bool native_delivery=false;
     na::camera::CameraTracker tracker;
     // The interloper rule after this frame's camera, committed with the tracker: an attempt that
@@ -248,7 +251,8 @@ struct State {
     std::atomic<uint64_t> q_attempt_frame{0}, q_ok_frame{0};
     uint64_t q_run = 0;
     std::atomic<bool> q_dry_hit{false};
-    uint64_t next_native_source=0,consumed_native_source=0;
+    uint64_t next_native_source=0,consumed_native_order=0;
+    uint64_t consumed_foreign_native_source=0;
     JitterWrites jitter_writes;
     std::vector<na::j2::ColorEvent> frame_seq; // this frame's writes/consumers of the colour, submission order
     bool frame_seq_complete = true;
@@ -462,6 +466,9 @@ struct NativeCrossing {
     uint32_t rw = 0, rh = 0, ow = 0, oh = 0;
     uint32_t in_view = 0, out_view = 0, gx = 0, gy = 0, gz = 0;
     bool separate_reader = false;
+    // Execution-resolved input equals the last actual draw's sole target.
+    // Unlike a current binding, this survives the game's OM unbind before CS.
+    bool input_is_last_draw = false;
     bool operator==(const NativeCrossing& b) const {
         return pso==b.pso&&input==b.input&&output==b.output&&scene==b.scene&&
             rw==b.rw&&rh==b.rh&&ow==b.ow&&oh==b.oh&&in_view==b.in_view&&out_view==b.out_view&&
@@ -472,7 +479,7 @@ struct NativeCrossing {
     bool same_step(const NativeCrossing& b) const {
         return pso==b.pso&&output==b.output&&scene==b.scene&&
             rw==b.rw&&rh==b.rh&&ow==b.ow&&oh==b.oh&&in_view==b.in_view&&out_view==b.out_view&&
-            gx==b.gx&&gy==b.gy&&gz==b.gz&&separate_reader==b.separate_reader;
+            gx==b.gx&&gy==b.gy&&gz==b.gz;
     }
 };
 struct TraceOp {
@@ -485,6 +492,7 @@ struct TraceOp {
     bool heap_indexing = false; // reads ResourceDescriptorHeap[] directly (inputs no table shows)
     uint64_t list = 0, recording = 0; // the recording this op belongs to
     uint64_t pso = 0;
+    uint64_t last_draw_rt = 0;
     uint32_t vw = 0, vh = 0, gx = 0, gy = 0, gz = 0, uavs = 0, descriptor_slots = 0;
     ID3D12CommandQueue* queue = nullptr;
     std::vector<TraceIo> in, out;
@@ -498,6 +506,8 @@ struct TraceOp {
 };
 struct NativeTrace{
     std::mutex m;std::atomic<bool> armed{false};
+    std::atomic<bool> refresh_requested{false};
+    uint64_t refresh_at=0;
     uint32_t frames=0,untraced=0,traced_lists=0;uint64_t ops=0,traces=0,presents=0,armed_at=0;
     // 83b0749 run: presented=1963 never connected, untraced=1 every trace.
     // Which list that is: id/recording, list type, queue type, position among the frame's ops.
@@ -528,7 +538,13 @@ struct NativeTrace{
     NativeCrossing previous, learned;
     std::vector<uint64_t> learned_inputs; // every render-size input the learned step was seen reading (cap 4)
     std::atomic<uint64_t> learned_pso{0};
-    void note_input(uint64_t id){ if(id&&std::find(learned_inputs.begin(),learned_inputs.end(),id)==learned_inputs.end()&&learned_inputs.size()<4)learned_inputs.push_back(id); }
+    void note_input(uint64_t id){
+        if(!id)return;
+        const auto found=std::find(learned_inputs.begin(),learned_inputs.end(),id);
+        if(found!=learned_inputs.end())learned_inputs.erase(found);
+        else if(learned_inputs.size()==4)learned_inputs.erase(learned_inputs.begin());
+        learned_inputs.push_back(id); // retain recent variants after level/input replacement
+    }
 };
 NativeTrace& g_trace=*new NativeTrace;
 constexpr uint64_t kTraceOps=60000;
@@ -699,6 +715,7 @@ void trace_op(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall& call,b
         return;
     }
     TraceOp t;t.compute=compute;t.pso=op.pipeline_id;t.reflected=op.reflection_complete;t.heap_indexing=op.heap_indexing;
+    if(compute)t.last_draw_rt=na::observe::ListLastDrawTarget(l);
     t.direct=l->GetType()==D3D12_COMMAND_LIST_TYPE_DIRECT;
     t.descriptor_slots=static_cast<uint32_t>(op.descriptors.size());
     if(compute){t.gx=uint32_t(call.args[0]);t.gy=uint32_t(call.args[1]);t.gz=uint32_t(call.args[2]);}
@@ -1023,7 +1040,9 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
                     const NativeCrossing next{op.pso,in.id,output->id,scene,e.rw,e.rh,e.ow,e.oh,
                                               in.vfmt,output->vfmt,op.gx,op.gy,op.gz,
                                               edge.reader_list && edge.reader_recording &&
-                                              (edge.reader_list!=op.list || edge.reader_recording!=op.recording)};
+                                              (edge.reader_list!=op.list || edge.reader_recording!=op.recording),
+                                              op.compute && op.last_draw_rt==in.id};
+                    add(" input_last_draw=%u reader_separate=%u",unsigned(next.input_is_last_draw),unsigned(next.separate_reader));
                     if (candidate.pso && !(candidate==next)) ambiguous=true;
                     else candidate=next;
                 } else add(" rejected=colour_or_scene_lineage");
@@ -1154,7 +1173,11 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
         // Learned when two successive traces show the same step; an input-only variant of
         // the learned step keeps it and is remembered as another input (p27252: dropping the
         // route on 556's alternating input left learned=0 between traces).
-        if (candidate.same_step(g_trace.previous)) { g_trace.learned=candidate; g_trace.note_input(g_trace.previous.input); g_trace.note_input(candidate.input); }
+        if (candidate.same_step(g_trace.previous)) {
+            g_trace.learned=candidate;
+            g_trace.learned.input_is_last_draw=candidate.input_is_last_draw&&g_trace.previous.input_is_last_draw;
+            g_trace.note_input(g_trace.previous.input);g_trace.note_input(candidate.input);
+        }
         else if (!candidate.same_step(g_trace.learned)) { g_trace.learned={}; g_trace.learned_inputs.clear(); }
         else g_trace.note_input(candidate.input);
     } else if (g_trace.learned.pso && !g_trace.untraced) {
@@ -1551,7 +1574,11 @@ void reason(const char* r)
     }
 }
 void committed_sources(const PendingHistory& p) {
-    if(p.native_source)g.consumed_native_source=(std::max)(g.consumed_native_source,p.native_source);
+    if(p.native_source) {
+        const auto order=p.native_source.SubmissionOrder(g.queue.Get());
+        if(order)g.consumed_native_order=(std::max)(g.consumed_native_order,order);
+        else g.consumed_foreign_native_source=(std::max)(g.consumed_foreign_native_source,p.native_source_serial);
+    }
     if(p.depth_source>=1 && p.depth_source<=4)++g.stats.depth_sources[p.depth_source-1];
     if(p.camera_source>=1 && p.camera_source<=6)++g.stats.camera_sources[p.camera_source-1];
     g.stats.depth_source_last=p.depth_source;g.stats.camera_source_last=p.camera_source;
@@ -3656,7 +3683,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
                         g.rw != rw || g.rh != rh || g.ow != ow || g.oh != oh ||
                         g.samples != cd.SampleDesc.Count || g.sample_quality != cd.SampleDesc.Quality ||
                         g.depth_samples != dd.SampleDesc.Count || g.depth_quality != dd.SampleDesc.Quality ||
-                        depth_working_key(g.depth_format) != depth_working_key(dd.Format);
+                        depth_working_key(g.depth_format, g.depth_samples) != depth_working_key(dd.Format, dd.SampleDesc.Count);
     if (resize) {
         for(const auto& old:g.slots)if(old.native_scale_use&&!old.native_scale_use.Completed()) {
             ++g.stats.busy;reason("Waiting for the previous native scene size to finish.");return false;
@@ -4697,20 +4724,32 @@ void on_entry(ID3D12GraphicsCommandList* l,const na::j2::InsertionEvent& entry) 
 const SceneInput* pick_producer_locked(uint64_t color,uint64_t depth,ID3D12CommandQueue* queue,
                                        ID3D12CommandList* const* lists,UINT count,UINT at,bool allow_unsubmitted=false)
 {
-    for (auto it=g.native_producers.rbegin();it!=g.native_producers.rend();++it) {
-        const auto& p=*it;
-        if (p.color!=color || p.depth!=depth || !p.native_origin || !p.native_recording || !p.native_list ||
-            p.native_serial<=g.consumed_native_source) continue;
-        // The newest unused recording of this scene IS the producer; an older one is superseded
-        // (reverse-order fixture: a previous frame's submitted scene must not stand in). Only
-        // its qualification is decided here.
-        if (p.native_origin.Ready(queue)) return &p;
-        if (lists) for (UINT j=0;j<=at && j<count;++j)
-            if (lists[j] && uint64_t(na::observe::IdOf(lists[j]))==p.native_list && na::observe::ListRecording(lists[j])==p.native_recording) return &p;
-        if (allow_unsubmitted && !p.native_origin.Retired()) return &p;
-        return nullptr;
+    const SceneInput *submitted=nullptr,*prefix=nullptr,*closed=nullptr,*latest=nullptr;
+    uint64_t order=g.consumed_native_order,newest_frame=0;
+    UINT prefix_at=0;
+    for(const auto& p:g.native_producers) {
+        if(p.color!=color || p.depth!=depth || !p.native_origin || !p.native_recording || !p.native_list)continue;
+        if(p.native_origin.Retired() && !p.native_origin.Ready(queue))continue; // discarded, never executed
+        latest=&p;
+        newest_frame=(std::max)(newest_frame,p.frame);
+        if(!p.native_origin.Retired() && !p.native_origin.Ready(queue))closed=&p;
+        if(lists)for(UINT j=0;j<=at && j<count;++j)
+            if(lists[j] && uint64_t(na::observe::IdOf(lists[j]))==p.native_list && na::observe::ListRecording(lists[j])==p.native_recording && (!prefix || j>=prefix_at)) {
+                prefix=&p;prefix_at=j;
+            }
+        const auto executed=p.native_origin.SubmissionOrder(queue);
+        if(executed>order){submitted=&p;order=executed;}
     }
-    return nullptr;
+    // An exact prefix is later than any previously submitted writer. A future
+    // CPU Close cannot hide it. Without a prefix, never substitute last frame's
+    // scene for this frame's as-yet-unsubmitted producer.
+    if(prefix)return prefix;
+    if(submitted && submitted->frame>=newest_frame)return submitted;
+    // Keep the existing completed-foreign-queue route. Same-queue receipt
+    // numbers deliberately do not manufacture an order across queues.
+    if(latest && latest->native_serial>g.consumed_foreign_native_source &&
+       !latest->native_origin.SubmissionOrder(queue) && latest->native_origin.Ready(queue))return latest;
+    return allow_unsubmitted?closed:nullptr;
 }
 // Native engine control owns sizing; J2 only supplies reconstruction at the
 // observed source->native-destination pass. Reuse record(), its state restore,
@@ -4739,9 +4778,12 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
         const auto h=(std::max)(1u,desc.Height>>mip);
         const uint64_t done=g.fence->GetCompletedValue();
         if (done==UINT64_MAX) return;
+        // A retained SceneInput/Candidate reserves these pixels even after its
+        // writer retires. Completion alone would allow a later Close to replace
+        // the selected depth between the consumer's Before/After callbacks.
         auto* slot=std::find_if(std::begin(snapshots_),std::end(snapshots_),[done](const auto& s){
             return (!s.writer || s.writer.Retired()) && (!s.reader || s.reader.Retired()) &&
-                (!s.owned_reader_fence || *s.owned_reader_fence<=done);
+                (!s.owned_reader_fence || (s.owned_reader_fence.use_count()==1 && *s.owned_reader_fence<=done));
         });
         if (slot==std::end(snapshots_)) { g_nb.snap_no_slot.fetch_add(1,std::memory_order_relaxed); return; }
         if (!slot->texture || slot->texture->GetDesc().Width!=w || slot->texture->GetDesc().Height!=h) {
@@ -4771,6 +4813,10 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
     struct Candidate {
         uint64_t color=0,depth=0,dest=0,recording=0;uint32_t sub=0;
         ComPtr<ID3D12Resource> source,guide,target;
+        // The producer qualified BEFORE the dispatch belongs to this operation.
+        // Another recording can Close while the original dispatch is forwarded;
+        // it must not replace this dependency in After().
+        SceneInput producer;
         // Audit F10 (f905099 run: src fmt 10, full_target fmt 27): the pass that
         // reads the small HDR scene ALSO tone-maps into a full-size target of
         // another format. DLSS then runs BEFORE that draw into a private
@@ -4963,18 +5009,33 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
             uint64_t chosen=0; unsigned written=0;
             for (const auto id:inputs) if (na::observe::ListInsertionDecision(l,id).writes>0) { chosen=id; ++written; }
             if (written!=1) chosen=inputs.size()==1?inputs[0]:0;
+            // Two execution-resolved traces established that this consumer reads
+            // the last drawn target. Sniper unbinds its RTV before dispatching;
+            // retain the actual draw evidence rather than its current OM state.
+            // Extent, format, state and producer checks below still apply.
+            if(learned.input_is_last_draw){
+                const auto drawn=na::observe::ListLastDrawTarget(l);
+                if(drawn && na::observe::ListInsertionDecision(l,drawn).writes>0)chosen=drawn;
+            }
             // Inline only when its dependencies are established BEFORE the dispatch is appended
             // (Astra audit items 1, 4, 5): the scene producer is this list or an already
             // submitted recording, and the input's state is known here or on the queue. Else
             // the list-boundary route, decided before the operation so After() arms the watch.
             bool inline_ok=false;
+            SceneInput producer;
             if (chosen) {
                 const bool local=na::observe::ListRendersTo(l,scene,depth);
                 bool producer_ok=local;
-                if (!producer_ok) { std::lock_guard<std::mutex> lock(g.m); producer_ok=pick_producer_locked(scene,depth,g.queue.Get(),nullptr,0,0)!=nullptr; }
+                if (!producer_ok) {
+                    std::lock_guard<std::mutex> lock(g.m);
+                    if (const auto* p=pick_producer_locked(scene,depth,g.queue.Get(),nullptr,0,0)) {
+                        producer=*p;producer_ok=true;
+                    }
+                }
                 uint32_t st=0;
-                const bool state_ok=na::observe::ListStateSub(l,chosen,0,&st)==na::observe::StateLookup::Known ||
-                    (g.queue && na::observe::KnownSubStateOnQueueNow(g.queue.Get(),chosen,0,&st));
+                const auto evidence=na::observe::ListStateSub(l,chosen,0,&st);
+                const bool state_ok=evidence==na::observe::StateLookup::Known ||
+                    (evidence==na::observe::StateLookup::Absent && g.queue && na::observe::KnownSubStateOnQueueNow(g.queue.Get(),chosen,0,&st));
                 if (!producer_ok) g_nb.st_late_no_producer.fetch_add(1,std::memory_order_relaxed);
                 if (!state_ok) g_nb.st_late_no_state.fetch_add(1,std::memory_order_relaxed);
                 inline_ok=producer_ok&&state_ok;
@@ -4982,6 +5043,7 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
             if (inline_ok) {
                 auto c=std::make_shared<Candidate>();
                 c->color=scene;c->depth=depth;c->recording=op.recording;
+                c->producer=std::move(producer);
                 c->source.Attach(na::observe::AcquireResource(chosen));
                 c->guide.Attach(na::observe::AcquireResource(depth));
                 c->target.Attach(na::observe::AcquireResource(learned.output));
@@ -4990,6 +5052,10 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
                     if (sd.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D && od.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
                         sd.Width==extent.rw && sd.Height==extent.rh && od.Width==extent.ow && od.Height==extent.oh &&
                         typed(sd.Format)==typed(od.Format)) {
+                        if(learned.input_is_last_draw){
+                            std::lock_guard<std::mutex> lock(g_trace.m);
+                            if(g_trace.learned.same_step(learned))g_trace.note_input(chosen);
+                        }
                         c->input=chosen;c->dest=learned.output;c->separate_reader=learned.separate_reader;
                         g_nb.st_candidates.fetch_add(1,std::memory_order_relaxed);
                         g_nb.st_late_inline.fetch_add(1,std::memory_order_relaxed);
@@ -5052,12 +5118,19 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
         // Inline needs an established producer (this list, or a submitted recording) before the
         // dispatch is appended; otherwise the list-boundary route, decided here before the
         // operation (Astra audit items 1, 5).
+        SceneInput producer;
         if (!na::observe::ListRendersTo(l,scene,depth)) {
             bool producer_ok=false;
-            { std::lock_guard<std::mutex> lock(g.m); producer_ok=pick_producer_locked(scene,depth,g.queue.Get(),nullptr,0,0)!=nullptr; }
+            {
+                std::lock_guard<std::mutex> lock(g.m);
+                if (const auto* p=pick_producer_locked(scene,depth,g.queue.Get(),nullptr,0,0)) {
+                    producer=*p;producer_ok=true;
+                }
+            }
             if (!producer_ok) { g_nb.st_late_no_producer.fetch_add(1,std::memory_order_relaxed); return stage_late(l,std::move(op),learned,scene,depth,pick.aux!=0); }
         }
         auto c=std::make_shared<Candidate>();
+        c->producer=std::move(producer);
         c->color=scene;
         c->depth=depth;
         c->recording=op.recording;
@@ -5238,7 +5311,13 @@ public:
                 // be ordered before this list: submitted. A closed, unsubmitted one is not
                 // accepted here (recorded commands cannot be cancelled by a later order check);
                 // such a frame goes to the list-boundary route from stretch() instead.
-                const auto* p=pick_producer_locked(color,depth,g.queue.Get(),nullptr,0,0,/*allow_unsubmitted=*/!c->input);
+                const auto* p=c->input ? &c->producer :
+                    pick_producer_locked(color,depth,g.queue.Get(),nullptr,0,0,/*allow_unsubmitted=*/true);
+                if(c->input) {
+                    const auto order=p->native_origin.SubmissionOrder(g.queue.Get());
+                    if(!p->native_origin || p->color!=color || p->depth!=depth || !p->native_origin.Ready(g.queue.Get()) ||
+                       (order?order<=g.consumed_native_order:p->native_serial<=g.consumed_foreign_native_source))p=nullptr;
+                }
                 if(!p){skip(c->input?"No submitted scene producer matches this upscale step.":"No unused executable or submitted scene producer matches this upscale pass.");return false;}
                 saved=*p;
             }
@@ -5298,7 +5377,7 @@ public:
             {std::lock_guard<std::mutex> up(g_up_m);previous=g_up;g_up=target;}
             struct RestoreTarget{UpscaleTarget old;~RestoreTarget(){std::lock_guard<std::mutex> up(g_up_m);g_up=old;}} restore_target{previous};
             const bool ok=record(one,0,depth,in_id,&out,pending,l,&touched,c->input?&staged:local?nullptr:&saved);
-            if(!local)pending.native_source=saved.native_serial;
+            if(!local){pending.native_source=saved.native_origin;pending.native_source_serial=saved.native_serial;}
             pending.native_delivery=ok;
             // The same existing recording lease handles submit, Reset/discard,
             // pooled-list reuse and completion. Include resources allocated by
@@ -5402,8 +5481,13 @@ int record_deferred_native(ID3D12CommandQueue* queue, ID3D12CommandList* const* 
         if (work.frame!=g.frame || g.inl.valid || g.submitted_frame==g.frame ||
             !g_native_reduced.load(std::memory_order_relaxed) || queue!=g.queue.Get() || !g.dlss_ready)
             return skip("Quality's deferred upscale no longer owns this frame or queue.");
-        if (!na::observe::ListWorkTailUnchanged(lists[i]))
+        if (!na::observe::ListWorkTailUnchanged(lists[i])) {
+            // A formerly separate upscale can move ahead of HUD work, with a
+            // different post-process input. Refresh the existing observation
+            // now; waiting 900 presents leaves the old input list unusable.
+            g_trace.refresh_requested.store(true,std::memory_order_relaxed);
             return skip("Game work follows the upscale inside its recording; there is no list boundary for Quality.");
+        }
         uint64_t depth=0,color=0;
         na::observe::GetLiveSelection(&depth,&color);
         // The producer is chosen now, by actual order: a retained scene recording for this
@@ -5414,8 +5498,11 @@ int record_deferred_native(ID3D12CommandQueue* queue, ID3D12CommandList* const* 
             if (!p) return skip("The scene producer was not submitted before the upscale recording.");
             work.source=*p;
         }
-        if (!work.source.native_depth_snapshot || !work.source.native_depth_reader_fence)
-            return skip("The scene producer has no depth snapshot for the late-bound upscale step.");
+        // At a real submission boundary record() can acquire the original
+        // depth's exact state from the executed prefix. A private Close-time
+        // copy is useful when present, but lack of one is not missing depth.
+        // Never import a guessed state: record() still refuses unavailable
+        // prefix/queue provenance and restores the state it actually acquired.
         const auto& source=work.source;
         NativeCrossing learned;
         std::vector<uint64_t> learned_inputs;
@@ -5467,13 +5554,25 @@ int record_deferred_native(ID3D12CommandQueue* queue, ID3D12CommandList* const* 
                 return skip("The late-bound upscale step's images at submission have other sizes than learned.");
             if (in.vfmt!=learned.in_view || out.vfmt!=learned.out_view || typed(DXGI_FORMAT(in.fmt))!=typed(DXGI_FORMAT(out.fmt)))
                 return skip("The late-bound upscale step's images at submission have other formats than learned.");
-            if (!learned_input(in.id) || out.id!=learned.output)
-                return skip("The late-bound upscale step's images at submission are not the learned ones.");
+            if (out.id!=learned.output)
+                return skip("The late-bound upscale step's output at submission is not the learned one.");
+            // This is the already identified shader/dispatch/output boundary.
+            // Its unique, correctly sized SRV at submission is authoritative;
+            // alternating post-process inputs need not appear in a periodic
+            // trace first. Retain the variant for the existing inline path.
+            if (!learned_input(in.id)) {
+                learned_inputs.push_back(in.id);
+                std::lock_guard<std::mutex> lock(g_trace.m);
+                if (g_trace.learned.same_step(learned)) g_trace.note_input(in.id);
+            }
             work.input=input->resource;work.output=output->resource;work.input_id=in.id;work.output_id=out.id;
             work.op.reset();
             g_nb.st_late_resolved.fetch_add(1,std::memory_order_relaxed);
         }
-        if (!learned.separate_reader || learned.pso!=work.pso || !learned_input(work.input_id) ||
+        // A prior trace's list partition is not an input dependency. The current
+        // recording has already passed ListWorkTailUnchanged above, so a splice
+        // here cannot cross its later HUD/reader work.
+        if (learned.pso!=work.pso || !learned_input(work.input_id) ||
             learned.output!=work.output_id || learned.scene!=source.color)
             return skip("The screen handoff changed before the upscale recording was submitted.");
         // Stability gate (see State::q_run): this frame could deliver; write only when warmed up.
@@ -5482,7 +5581,7 @@ int record_deferred_native(ID3D12CommandQueue* queue, ID3D12CommandList* const* 
         SceneInput staged=source;
         staged.color=work.input_id;
         staged.color_sub=0;
-        staged.depth_sub=0;
+        if (source.native_depth_snapshot) staged.depth_sub=0;
         UpscaleTarget previous;
         {
             std::lock_guard<std::mutex> lock(g_up_m);
@@ -5501,8 +5600,9 @@ int record_deferred_native(ID3D12CommandQueue* queue, ID3D12CommandList* const* 
         auto& slot=g.slots[g.slot];
         slot.native_scale_resources={work.input,work.depth,work.output,source.native_depth_snapshot};
         // The caller signals this fence after submitting our owned list.
-        *source.native_depth_reader_fence=g.fence_next;
-        pending.native_source=source.native_serial;
+        if (source.native_depth_reader_fence) *source.native_depth_reader_fence=g.fence_next;
+        pending.native_source=source.native_origin;
+        pending.native_source_serial=source.native_serial;
         pending.native_delivery=true;
         g_nb.st_recorded.fetch_add(1,std::memory_order_relaxed);
         return static_cast<int>(i+1);
@@ -7076,9 +7176,20 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
             if(g_trace.armed.load()){g_trace.armed.store(false);g_trace.recs.clear();g_trace.frame.clear();}
             g_trace.previous={};g_trace.learned={};g_trace.learned_inputs.clear();g_trace.learned_pso.store(0);
             g_trace.presents=g_trace.armed_at=0;
+            g_trace.refresh_at=0;g_trace.refresh_requested.store(false,std::memory_order_relaxed);
             return;
         }
         ++g_trace.presents;
+        NativeExtent extent;
+        { std::lock_guard<std::mutex> size_lock(g_up_m); extent=g_native_extent; }
+        if (g_trace.learned.pso && (g_trace.learned.rw!=extent.rw || g_trace.learned.rh!=extent.rh ||
+                                   g_trace.learned.ow!=extent.ow || g_trace.learned.oh!=extent.oh)) {
+            // A live mode change invalidates image identities immediately. Do
+            // not wait the 900-present maintenance interval with the old size.
+            g_trace.previous={};g_trace.learned={};g_trace.learned_inputs.clear();g_trace.learned_pso.store(0);
+            g_trace.provisional={};g_trace.provisional_pso.store(0);g_trace.refuted.clear();
+            g_trace.armed.store(false);g_trace.armed_at=g_trace.presents>30?g_trace.presents-30:0;
+        }
         if(const uint64_t id=frame?uint64_t(na::observe::IdOf(frame)):0;id&&!trace_is_presented(id)){
             g_trace.presented_ids[2].store(g_trace.presented_ids[1].load());
             g_trace.presented_ids[1].store(g_trace.presented_ids[0].load());
@@ -7086,7 +7197,14 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
         }
         if(!g_trace.armed.load()){
             // First trace ~2 s after the scene is reduced, then every ~15 s.
-            if(g_trace.presents-g_trace.armed_at>=(g_trace.learned_pso.load()?g_trace.learned_interval:30u)){
+            // Actual layout failures request one immediate observation. A
+            // persistent unsupported layout gets at most one retry per120
+            // presents, rather than tracing every failed frame.
+            const bool refresh=g_trace.refresh_requested.load(std::memory_order_relaxed) &&
+                (!g_trace.refresh_at || g_trace.presents-g_trace.refresh_at>=120u);
+            if(refresh || g_trace.presents-g_trace.armed_at>=(g_trace.learned_pso.load()?g_trace.learned_interval:30u)){
+                if(refresh)g_trace.refresh_at=g_trace.presents;
+                g_trace.refresh_requested.store(false,std::memory_order_relaxed);
                 g_trace.recs.clear();g_trace.frame.clear();g_trace.frames=0;g_trace.untraced=g_trace.traced_lists=0;g_trace.ops=0;g_trace.untraced_lists.clear();
                 g_trace.late_ops=g_trace.late_tabled=0;
                 g_trace.armed_at=g_trace.presents;g_trace.armed.store(true);
@@ -7097,6 +7215,7 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
         if(++g_trace.frames==1){g_trace.frame.clear();g_trace.untraced=g_trace.traced_lists=0;g_trace.untraced_lists.clear();g_trace.late_ops=g_trace.late_tabled=0;return;}
         g_trace.result[0]=0;
         trace_analyze(queue,frame?uint64_t(na::observe::IdOf(frame)):0,sdr_present);
+        g_trace.refresh_requested.store(false,std::memory_order_relaxed);
         ++g_trace.traces;g_trace.armed.store(false);g_trace.recs.clear();g_trace.frame.clear();
         na::eventlog::Emit("native_trace","%s",g_trace.result);
     }catch(...){g_trace.armed.store(false);}

@@ -15,6 +15,7 @@
 #include "host_dx12/overlay/route_a_panel.hpp"
 #include "host_dx12/settings.hpp"
 #include "host_dx12/nr/fg_states.hpp"
+#include "host_dx12/observe/producers.hpp"
 #include <filesystem>
 
 #include <atomic>
@@ -55,6 +56,19 @@ struct ChainWrapper {
     IDXGISwapChain* chain(){return reinterpret_cast<IDXGISwapChain*>(this);}
 };
 std::atomic<uint32_t> g_game_mouse{0}, g_game_keys{0};
+std::atomic<unsigned> g_resized_events{0},g_resized_wrong{0};
+void __cdecl resize_sink(const na_event_batch* batch,void*) {
+    const auto* bytes=reinterpret_cast<const uint8_t*>(batch)+batch->header_bytes;
+    for(uint32_t at=0;at<batch->payload_bytes;){
+        const auto* head=reinterpret_cast<const na_event_header*>(bytes+at);
+        if(head->size_bytes<sizeof(*head)||head->size_bytes>batch->payload_bytes-at)break;
+        if(head->kind==NA_EV_SWAPCHAIN_RESIZED && head->size_bytes>=sizeof(na_ev_swapchain_resized)){
+            const auto* e=reinterpret_cast<const na_ev_swapchain_resized*>(head);
+            ++g_resized_events;if(e->hresult<0 || e->width!=800 || e->height!=450)++g_resized_wrong;
+        }
+        at+=head->size_bytes;
+    }
+}
 LRESULT CALLBACK GameWndProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     if (m == WM_MOUSEMOVE || m == WM_LBUTTONDOWN) g_game_mouse.fetch_add(1);
@@ -126,6 +140,12 @@ int main(int argc, char** argv)
     REQUIRE(SUCCEEDED(sc1.As(&sc)));
 
     if(late_queue) REQUIRE(na::overlay::Start("TEST", nullptr));
+    const bool observe_resize=!boundary&&!late_queue&&!busy_install&&!cursor_state;
+    if(observe_resize){
+        REQUIRE(na::observe::InstallProducers(d.device.Get(),d.queue.Get(),false));
+        na_observe_config config{};config.size_bytes=sizeof(config);
+        REQUIRE(na_observe_start(&config,&resize_sink,nullptr)==NA_OK);
+    }
     test::ComPtr<ID3D12CommandQueue> unrelated;
     test::List unrelated_list;
     if(late_queue || boundary){
@@ -285,6 +305,41 @@ int main(int argc, char** argv)
     CHECK(na::overlay::GetStats().frames_rendered==before_backlog+9);
     REQUIRE(d.device->GetDeviceRemovedReason()==S_OK);
 
+    // Real menu pixels must fill the same relative client area even when the
+    // backbuffer is larger than the HWND. Test readback waits are test-only.
+    {
+        RECT client{};REQUIRE(GetClientRect(hwnd,&client));
+        const UINT w=UINT(client.right)*2,h=UINT(client.bottom)*2;
+        auto big=test::CreateTexture(d.device.Get(),w,h,DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);REQUIRE(big);
+        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,1};
+        test::ComPtr<ID3D12DescriptorHeap> rh;REQUIRE(SUCCEEDED(d.device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&rh))));
+        const auto rtv=rh->GetCPUDescriptorHandleForHeapStart();d.device->CreateRenderTargetView(big.Get(),nullptr,rtv);
+        test::List copy;REQUIRE(copy.Create(d.device.Get()));
+        auto barrier=test::Transition(big.Get(),D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_STATE_RENDER_TARGET);
+        copy.list->ResourceBarrier(1,&barrier);const float black[4]{};copy.list->ClearRenderTargetView(rtv,black,0,nullptr);
+        std::swap(barrier.Transition.StateBefore,barrier.Transition.StateAfter);copy.list->ResourceBarrier(1,&barrier);
+        REQUIRE(SUCCEEDED(copy.list->Close()));ID3D12CommandList* ls[]{copy.list.Get()};d.queue->ExecuteCommandLists(1,ls);d.WaitIdle();
+        const auto scaled_before=na::overlay::GetStats().frames_rendered;
+        na::overlay::DrawMenuForTests(d.queue.Get(),big.Get());d.WaitIdle();
+        CHECK(na::overlay::GetStats().frames_rendered==scaled_before+1);
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};UINT64 bytes=0;const auto td=big->GetDesc();
+        d.device->GetCopyableFootprints(&td,0,1,0,&fp,nullptr,nullptr,&bytes);
+        auto rb=test::CreateBuffer(d.device.Get(),bytes,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);REQUIRE(rb);
+        copy.Reset();barrier=test::Transition(big.Get(),D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_STATE_COPY_SOURCE);copy.list->ResourceBarrier(1,&barrier);
+        D3D12_TEXTURE_COPY_LOCATION src{},dst{};src.pResource=big.Get();src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.pResource=rb.Get();dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;dst.PlacedFootprint=fp;
+        copy.list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);REQUIRE(SUCCEEDED(copy.list->Close()));d.queue->ExecuteCommandLists(1,ls);d.WaitIdle();
+        uint8_t* pixels=nullptr;REQUIRE(SUCCEEDED(rb->Map(0,nullptr,reinterpret_cast<void**>(&pixels))));
+        const auto* p=pixels+fp.Offset+(h/2)*fp.Footprint.RowPitch+(w*2/3)*4;
+        UINT last_x=0,last_y=0;uint64_t visible_pixels=0;
+        for(UINT y=0;y<h;++y)for(UINT x=0;x<w;++x){const auto* q=pixels+fp.Offset+y*fp.Footprint.RowPitch+x*4;
+            if(q[0]>8||q[1]>8||q[2]>8){++visible_pixels;last_x=(std::max)(last_x,x);last_y=(std::max)(last_y,y);}}
+        std::printf("scaled overlay %ux%u visible=%llu bounds=%u,%u sample=%u,%u,%u\n",w,h,(unsigned long long)visible_pixels,last_x,last_y,p[0],p[1],p[2]);
+        CHECK(p[0]>8 || p[1]>8 || p[2]>8); // old unscaled viewport leaves this pixel black
+        rb->Unmap(0,nullptr);
+    }
+
     // A later independent queue must not retire an older blocked draw.
     {
         test::ComPtr<ID3D12CommandQueue> fast;
@@ -357,6 +412,10 @@ int main(int argc, char** argv)
     d.queue=replacement; // test render work uses the queue we just assigned
     na::overlay::SetOpen(true);
     for(int i=0;i<3;++i){CHECK(SUCCEEDED(frame()));CHECK(na::overlay::GetStats().present_queue==reinterpret_cast<uintptr_t>(replacement.Get()));}
+    if(observe_resize){
+        REQUIRE(na_observe_stop()==NA_OK);
+        CHECK(g_resized_events==2 && g_resized_wrong==0); // both real detours, no manual notification
+    }
 
     d.WaitIdle();
     if(boundary){
@@ -377,6 +436,9 @@ int main(int argc, char** argv)
     nativeChain.Reset();if(nativeWindow)DestroyWindow(nativeWindow);
     sc.Reset(); sc1.Reset();
     DestroyWindow(hwnd);
+    // This combined fixture now owns observer retirement sentinels too.
+    // Mirror host_boot::NotifyProcessExit before CRT destroys shared registries.
+    if(observe_resize)na::observe::SetProcessExiting();
     na::hooking::Shutdown();
     DeleteFileW(na::settings::UserIniPath());
     std::filesystem::remove(std::filesystem::path(na::settings::UserIniPath()).parent_path());

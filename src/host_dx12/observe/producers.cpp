@@ -141,6 +141,7 @@ struct ListState {
     } shader_reads[2];
     std::vector<RootArg> args[2]; // [graphics, compute], by root parameter
     na_object_id cur_rt = 0, cur_ds = 0; // currently bound first render target / depth
+    na_object_id last_draw_rt = 0; // actual draw evidence survives OM unbinding
     na_object_id cur_rts[8] = {};
     uint32_t cur_nrt = 0;
     uint32_t cur_ds_sub = NA_UNKNOWN_U32;
@@ -3174,6 +3175,7 @@ struct On<sl::list::Reset> {
                     ls->uses_complete = true;
                     ls->targets.clear();
                     ls->insertion.Reset();
+                    ls->last_draw_rt = 0;
                     ls->pending_entry = 0;
                     ls->entry_barrier=0;
                     ls->sampled_textures.clear();
@@ -3240,6 +3242,7 @@ struct On<sl::list::Close> {
 };
 void note_draw_locked(ListState* ls){
     const CostScope cost(kCostNoteDraw);
+    ls->last_draw_rt = ls->cur_nrt == 1 ? ls->cur_rts[0] : 0;
     uint64_t sel_depth = 0, sel_color = 0;
     GetLiveSelection(&sel_depth, &sel_color);
     for (uint32_t i = 0; i < ls->cur_nrt; ++i)
@@ -6748,6 +6751,36 @@ void PresentEnd(const PresentToken& token,uint32_t sync,uint32_t flags,int32_t r
     e.sync_interval=sync;e.present_flags=flags;e.backbuffer_index=token.index;
     emit(e,NA_GROUP_SWAPCHAIN);
 }
+void SwapchainResized(IDXGISwapChain* chain,int32_t result)
+{
+    if(!chain || !ProducersActive())return;
+    const auto id=lookup(chain);
+    if(!id)return; // First Present will discover the current size if not yet observed.
+    na_ev_swapchain_resized e;
+    init_header(e,NA_EV_SWAPCHAIN_RESIZED,NA_EVF_FOUNDATIONAL);
+    e.swapchain=id;e.hresult=result;
+    e.width=e.height=e.format=e.buffer_count=e.buffer_generation=NA_UNKNOWN_U32;
+    DXGI_SWAP_CHAIN_DESC desc{};
+    const bool known=SUCCEEDED(result) && SUCCEEDED(chain->GetDesc(&desc));
+    if(known){
+        e.width=desc.BufferDesc.Width;e.height=desc.BufferDesc.Height;
+        e.format=desc.BufferDesc.Format;e.buffer_count=desc.BufferCount;
+        // Snapshot/restart consumers also need the latest description. Preserve
+        // original creation provenance; an unobserved generation stays unknown.
+        std::unique_lock<RegistryLock> lock(g_m);
+        const auto it=g_objs.find(canon(chain));
+        if(it!=g_objs.end() && it->second.id==id && it->second.created.size()==sizeof(na_ev_swapchain_created)){
+            na_ev_swapchain_created creation{};
+            std::memcpy(&creation,it->second.created.data(),sizeof creation);
+            creation.width=e.width;creation.height=e.height;creation.format=e.format;creation.buffer_count=e.buffer_count;
+            if(creation.buffer_generation!=NA_UNKNOWN_U32)++creation.buffer_generation;
+            e.buffer_generation=creation.buffer_generation;
+            std::memcpy(it->second.created.data(),&creation,sizeof creation);
+        }
+    }
+    if(SUCCEEDED(result) && !known)e.hdr.flags|=NA_EVF_METHOD_UNOBSERVED;
+    emit(e,NA_GROUP_SWAPCHAIN);
+}
 bool InstallRequested() { return g_requested.load(); }
 bool ProducersActive() { return g_active.load(std::memory_order_acquire); }
 
@@ -6914,6 +6947,15 @@ bool ListCurrentTargets(ID3D12CommandList* list, na_object_id* rt, na_object_id*
     if (rt) *rt = ls->cur_rt;
     if (ds) *ds = ls->cur_ds;
     return true;
+}
+na_object_id ListLastDrawTarget(ID3D12CommandList* list)
+{
+    std::shared_lock<RegistryLock> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return 0;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return ls->last_draw_rt;
 }
 void SetRasterStateListener(RasterStateListener listener) { g_raster_listener.store(listener, std::memory_order_release); }
 bool ListRasterScissors(ID3D12CommandList* list, RasterScissors& out)
