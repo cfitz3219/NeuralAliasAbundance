@@ -36,13 +36,13 @@ struct DepthWindow {
         return n;
     }
     // Most frequent nonzero entry; ties go to the most recent.
-    uint64_t Leader(size_t* n_out, uint64_t excluded=0) const {
+    uint64_t Leader(size_t* n_out) const {
         std::map<uint64_t, size_t> n;
-        for (size_t i = 0; i < count; ++i) if (top[i] && top[i] != excluded) ++n[top[i]];
+        for (size_t i = 0; i < count; ++i) if (top[i]) ++n[top[i]];
         uint64_t best = 0; size_t best_n = 0;
         for (size_t k = 0; k < count; ++k) {
             const size_t i = (next + kFrames - 1 - k) % kFrames; // newest first
-            if (!top[i] || top[i] == excluded) continue;
+            if (!top[i]) continue;
             const size_t c = n[top[i]];
             if (c > best_n) { best = top[i]; best_n = c; }
         }
@@ -68,6 +68,9 @@ struct DepthPick {
     static constexpr unsigned kAbsentPublications = 8; // ~2 s with no scene evidence before clearing
     uint64_t depth = 0;
     uint64_t challenger = 0;
+    // Object ids do not revive. Keep retirement exclusions until their votes
+    // leave the bounded window, including publications with no current pick.
+    uint64_t retired[DepthWindow::kFrames]{};
     unsigned challenger_streak = 0, absent_streak = 0;
     // Diagnostics of the last decision.
     uint64_t leader = 0;
@@ -76,24 +79,35 @@ struct DepthPick {
 
     PickReason Publish(const DepthWindow& w, bool current_alive) {
         frames = w.count;
-        leader = w.Leader(&leader_n);
         current_n = depth ? w.Count(depth) : 0;
-        if (depth && !current_alive) {
-            const uint64_t retired = depth;
+        const bool retiring = depth && !current_alive;
+        for (auto& id : retired) if (id && !w.Count(id)) id = 0;
+        if (retiring && current_n) {
+            bool known=false;
+            for (const auto id : retired) known |= id==depth;
+            if (!known) for (auto& id : retired) if (!id) {id=depth;break;}
+        }
+        auto eligible=w;
+        size_t retired_n=0;
+        for (auto& vote : eligible.top) {
+            if (!vote) continue;
+            for (const auto id : retired) if (id==vote) {vote=0;++retired_n;break;}
+        }
+        leader = eligible.Leader(&leader_n);
+        const bool majority = leader_n >= 2 && leader_n * 2 >= frames;
+        const bool recent_replacement = retired_n && leader_n >= 4 && leader_n * 2 >= frames - retired_n &&
+            w.top[(w.next + DepthWindow::kFrames - 1) % DepthWindow::kFrames] == leader;
+        if (retiring) {
             depth = 0;
             challenger = 0; challenger_streak = absent_streak = 0;
             // Old votes cannot keep a destroyed texture selected or delay
             // an established replacement. Empty observations still count.
-            leader = w.Leader(&leader_n, retired);
-            const bool majority = leader_n >= 2 && leader_n * 2 >= frames;
-            const bool recent_replacement = leader_n >= 4 && leader_n * 2 >= frames - current_n &&
-                w.top[(w.next + DepthWindow::kFrames - 1) % DepthWindow::kFrames] == leader;
             if (leader && (majority || recent_replacement)) depth = leader;
             return last = PickReason::retired;
         }
         if (!depth) {
             challenger = 0; challenger_streak = absent_streak = 0;
-            if (leader && leader_n * 2 >= frames && leader_n >= 2) { depth = leader; return last = PickReason::first; }
+            if (leader && (majority || recent_replacement)) { depth = leader; return last = PickReason::first; }
             return last = PickReason::none;
         }
         if (leader && leader != depth && leader_n * 4 >= frames * 3 && current_n * 8 <= frames) {

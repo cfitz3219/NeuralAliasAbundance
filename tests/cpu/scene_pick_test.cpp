@@ -94,6 +94,14 @@ int main() {
             frames(w2, kOther, 1);
             CHECK(q.Publish(w2, false) == PickReason::retired);
             CHECK(q.depth == 0);
+            q.Publish(w2, true);
+            CHECK(q.depth == 0); // another publication must not resurrect old votes
+            frames(w2, kOther, 3);
+            q.Publish(w2, true);
+            CHECK(q.depth == kOther);
+            CHECK(q.Publish(w2, false) == PickReason::retired);
+            q.Publish(w2, true);
+            CHECK(q.depth == 0); // neither retired image can return
         }},
         {"a long absence clears after eight publications", [] {
             DepthWindow w; DepthPick p;

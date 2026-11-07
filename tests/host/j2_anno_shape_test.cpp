@@ -291,7 +291,8 @@ int main(int argc, char** argv)
     const bool entry_indirect=entry_split_indirect || (argc>3 && std::strcmp(argv[3],"--entry-indirect")==0);
     const bool entry_split=entry_split_indirect || (argc>3 && std::strcmp(argv[3],"--entry-split")==0);
     const bool entry_decoy=argc>3 && std::strcmp(argv[3],"--entry-decoy")==0;
-    const bool entry_test=entry_decoy || entry_real || entry_indirect || entry_split || (argc>3 && std::strcmp(argv[3],"--entry")==0);
+    const bool entry_boundary=argc>3 && std::strcmp(argv[3],"--entry-boundary")==0;
+    const bool entry_test=entry_boundary || entry_decoy || entry_real || entry_indirect || entry_split || (argc>3 && std::strcmp(argv[3],"--entry")==0);
     const bool real_ngx = entry_real || argc > 3 && std::strcmp(argv[3], "--real") == 0;
     // --planes: depth's two planes (depth, stencil) are transitioned by separate
     // per-subresource barriers, as Sniper Elite Resistance does.
@@ -991,7 +992,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             if(entry_test){
                 scene.list->SetGraphicsRootSignature(rs.Get());scene.list->SetDescriptorHeaps(1,heaps);
                 scene.list->SetGraphicsRootDescriptorTable(0,cbvh->GetGPUDescriptorHandleForHeapStart());
-                scene.list->SetPipelineState(entry_writers.at(entry_split?0:entry_frame-1).Get());scene.list->DrawInstanced(3,1,0,0);
+                scene.list->SetPipelineState(entry_writers.at(entry_split?0:entry_boundary?entry_frame%2:entry_frame-1).Get());scene.list->DrawInstanced(3,1,0,0);
                 scene.list->SetDescriptorHeaps(1,ph);scene.list->SetGraphicsRootSignature(post_root.Get());
             }
             if (other_writer) { // the final scene write is a draw with another pipeline
@@ -1024,7 +1025,10 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                     REQUIRE(fake::evals == evals_before_read); // no insertion at a decoy
                     scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart());
                 }
-                scene.list->SetPipelineState(final_post_pso.Get()); // final PSO chosen AFTER its table; no stale binding key
+                // Boundary variant alternates two established final writers.
+                // Its final reader now shares the known-middle PSO, so only
+                // the exact remembered producer boundary can admit it.
+                scene.list->SetPipelineState(entry_boundary && entry_frame>=8 ? post_pso.Get() : final_post_pso.Get());
             }
             // Legacy boundary matcher: injected at the final read transition. Consumer anchor
             // (P4-0D): injected just before the final actual consumer (below). Never twice.
@@ -1123,7 +1127,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         if (capture) na::capture::j2::OnPresent(q, presented.Get(), &PlainExecute);
         d.WaitIdle();
         if(entry_test && entry_frame>=8){
-            if(entry_split)CHECK(fake::evals==frame_evals+1); // one evaluation in every warmed merged OR split frame
+            if(entry_split || entry_decoy || entry_boundary)CHECK(fake::evals==frame_evals+1); // exactly one evaluation in each warmed frame
             const auto desc=post_rt->GetDesc();D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};UINT64 bytes=0;
             dev->GetCopyableFootprints(&desc,0,1,0,&fp,nullptr,nullptr,&bytes);
             auto rb=test::CreateBuffer(dev,bytes,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);REQUIRE(rb);
@@ -1195,7 +1199,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         for(int f=0;f<24;++f)REQUIRE(frame(.25*(f%4))==0);
         const auto st=na::j2::GetStats();
         printf("POST ENTRY %u/%u downstream; matches %llu frames %llu late %llu real %u\n",entry_delivered,entry_checks,(unsigned long long)st.entry_matched,(unsigned long long)st.frames,(unsigned long long)st.inline_late_writes,real_ngx);
-        CHECK(entry_checks==17 && entry_delivered==17 && (entry_decoy ? st.class_matched+st.class_pair_matched>=17 : st.entry_matched>=17));
+        CHECK(entry_checks==17 && entry_delivered==17 && (entry_boundary ? st.entry_rescued_memory>=2 : entry_decoy ? st.class_matched+st.class_pair_matched>=17 : st.entry_matched>=17));
         CHECK(st.no_camera==0 && st.no_state==0 && st.inline_late_writes==0);
         CHECK(st.depth_sources[1]+(entry_split?st.depth_sources[3]:0)>=17 && st.depth_state_assumed==0); // inherited or exact submitted-prefix state, never guessed
         if(entry_split)CHECK(st.between_observed>=9 && st.depth_sources[2]==0); // saved handoff exercised; no supplied substitute
