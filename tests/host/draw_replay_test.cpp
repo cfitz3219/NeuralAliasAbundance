@@ -1,0 +1,207 @@
+#include "test_support.hpp"
+#include "host_dx12/j2/replay_motion.hpp"
+
+#include <chrono>
+#include <cmath>
+#include <d3dcompiler.h>
+#include <thread>
+
+namespace {
+using na::observe::ReplayUse;
+struct Use final : ReplayUse {
+    na::nr::native::RecordingLease lease;
+    bool Ready(ID3D12CommandQueue* queue) const override { return lease.Ready(queue); }
+    bool Retired() const override { return lease.Retired(); }
+};
+std::shared_ptr<ReplayUse> retain(ID3D12GraphicsCommandList* list)
+{
+    static auto marker = std::make_shared<int>();
+    auto use = std::make_shared<Use>();
+    use->lease = na::nr::native::RetainRecording(list, marker);
+    return use->lease ? use : nullptr;
+}
+void __cdecl sink(const na_event_batch*, void*) {}
+}
+
+int main()
+{
+    test::ComPtr<ID3D12Debug> debug;
+    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) debug->EnableDebugLayer();
+    test::Device d;
+    if (!test::CreateDevice(d)) return test::kSkip;
+    auto* dev = d.device.Get();
+    REQUIRE(na::observe::InstallProducers(dev, d.queue.Get(), false));
+    na::observe::SetRasterStateTracking(true);
+    na_observe_config config{};
+    config.size_bytes = sizeof config;
+    REQUIRE(na_observe_start(&config, &sink, nullptr) == NA_OK);
+
+    constexpr UINT w = 32, h = 24;
+    constexpr auto depth_write = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    constexpr auto npsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    constexpr auto copy_source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    const auto depth = test::CreateTexture(dev, w, h, DXGI_FORMAT_R32_TYPELESS, depth_write,
+                                           D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    REQUIRE(depth);
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1};
+    test::ComPtr<ID3D12DescriptorHeap> heap;
+    REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap))));
+    const auto dsv = heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_DEPTH_STENCIL_VIEW_DESC view{};
+    view.Format = DXGI_FORMAT_D32_FLOAT;
+    view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    dev->CreateDepthStencilView(depth.Get(), &view, dsv);
+    na::observe::SetLiveSelection(na::observe::IdOf(depth.Get()), 0);
+
+    D3D12_ROOT_PARAMETER param{};
+    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    param.Constants.Num32BitValues = 1;
+    D3D12_ROOT_SIGNATURE_DESC root_desc{};
+    root_desc.NumParameters = 1;
+    root_desc.pParameters = &param;
+    test::ComPtr<ID3DBlob> bytes, vs;
+    REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &bytes, nullptr)));
+    test::ComPtr<ID3D12RootSignature> root;
+    REQUIRE(SUCCEEDED(dev->CreateRootSignature(0, bytes->GetBufferPointer(), bytes->GetBufferSize(), IID_PPV_ARGS(&root))));
+    const char shader[] = R"(
+cbuffer C : register(b0) { float shift; }
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    const float2 verts[3] = { float2(-.5,-.65), float2(-.5,.65), float2(.6,.65) };
+    return float4(verts[id] + float2(shift,0), .5, 1);
+})";
+    REQUIRE(SUCCEEDED(D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr, "vs", "vs_5_0",
+                                 0, 0, &vs, nullptr)));
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+    desc.pRootSignature = root.Get();
+    desc.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+    desc.SampleMask = UINT_MAX;
+    desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    desc.RasterizerState.DepthClipEnable = TRUE;
+    desc.DepthStencilState.DepthEnable = TRUE;
+    desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    desc.SampleDesc.Count = 1;
+    desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    test::ComPtr<ID3D12PipelineState> pso;
+    REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso))));
+
+    na::j2::replay_motion::Pass pass;
+    {
+        const na::observe::HostWorkScope host;
+        REQUIRE(pass.Init(dev));
+    }
+    test::List list, other;
+    REQUIRE(list.Create(dev) && other.Create(dev));
+    constexpr UINT pitch = 256;
+    auto rb = test::CreateBuffer(dev, 2 * h * pitch, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    REQUIRE(rb);
+
+    using na::j2::replay_motion::Match;
+    const na::observe::ReplayRecord draw{1, 2, 0, 3, w, h, {0, 0, 14, h}};
+    CHECK(Match({draw}, {draw}, w, h).size() == 1);
+    CHECK(Match({draw, draw}, {draw}, w, h).empty());
+    CHECK(Match({draw}, {draw, draw}, w, h).empty());
+    CHECK(Match({draw}, {draw}, w - 1, h).empty());
+
+    bool verified = false;
+    uint32_t discarded_frame = 0;
+    for (uint32_t frame = 2; frame < 20 && !verified; ++frame) {
+        if (frame != 2) {
+            na::nr::native::Reset(list.list.Get());
+            list.Reset();
+        }
+        const float jitter[2] = { frame % 2 ? .375f : -.25f, frame % 2 ? -.375f : .25f };
+        na::observe::SetSceneViewportJitter(frame, jitter[0], jitter[1]);
+        na::observe::SetDrawReplay(frame == 2 ? 0 : frame, retain);
+        const D3D12_VIEWPORT vp{0, 0, float(w), float(h), 0, 1};
+        const D3D12_RECT sc{0, 0, 14, h};
+        list.list->SetGraphicsRootSignature(root.Get());
+        const float shift = float(frame % 2) / (w / 2.f);
+        list.list->SetGraphicsRoot32BitConstants(0, 1, &shift, 0);
+        list.list->SetPipelineState(pso.Get());
+        list.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        list.list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+        list.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1, 0, 0, nullptr);
+        list.list->RSSetViewports(1, &vp);
+        list.list->RSSetScissorRects(1, &sc);
+        list.list->DrawInstanced(3, 1, 0, 0);
+        auto to_read = test::Transition(depth.Get(), depth_write, npsr);
+        list.list->ResourceBarrier(1, &to_read);
+        na::observe::ReplayFrame wrong;
+        CHECK(!na::observe::ReplayTakeFrame(other.list.Get(), d.queue.Get(), &wrong));
+        const na::j2::replay_motion::Output output = [&] {
+            const na::observe::HostWorkScope host;
+            return pass.Record(list.list.Get(), d.queue.Get(), depth.Get(), w, h, false, false, jitter);
+        }();
+        if (frame == 2) {
+            na::observe::DrawReplayStats stats{};
+            na::observe::GetDrawReplayStats(&stats);
+            CHECK(!output.motion && stats.replayed == 0);
+        }
+        if (output.motion) {
+            ID3D12Resource* textures[] = {output.motion, output.valid};
+            for (UINT i = 0; i < 2; ++i) {
+                auto barrier = test::Transition(textures[i], npsr, copy_source);
+                list.list->ResourceBarrier(1, &barrier);
+                D3D12_TEXTURE_COPY_LOCATION src{textures[i], D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+                D3D12_TEXTURE_COPY_LOCATION dst{rb.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+                dst.PlacedFootprint.Offset = uint64_t(i) * h * pitch;
+                dst.PlacedFootprint.Footprint = {i ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R32G32_FLOAT, w, h, 1, pitch};
+                list.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+                list.list->ResourceBarrier(1, &barrier);
+            }
+        }
+        std::swap(to_read.Transition.StateBefore, to_read.Transition.StateAfter);
+        list.list->ResourceBarrier(1, &to_read);
+        REQUIRE(SUCCEEDED(list.list->Close()));
+        if (!discarded_frame && pass.GetStats().frames) {
+            // CPU-side capture records existed, but this list never reached the queue.
+            discarded_frame = frame;
+            CHECK(!output.motion);
+            continue;
+        }
+        if (discarded_frame && frame == discarded_frame + 1) CHECK(!output.motion);
+        ID3D12CommandList* commands[] = {list.list.Get()};
+        {
+            na::nr::native::Submission submitted(d.queue.Get(), 1, commands);
+            d.queue->ExecuteCommandLists(1, commands);
+        }
+        d.WaitIdle();
+        if (output.motion) {
+            std::byte* mapped = nullptr;
+            REQUIRE(SUCCEEDED(rb->Map(0, nullptr, reinterpret_cast<void**>(&mapped))));
+            const auto* motion = reinterpret_cast<const float*>(mapped + 7 * pitch);
+            const auto* valid = reinterpret_cast<const float*>(mapped + (h + 7) * pitch);
+            CHECK(valid[12] == 1.f && valid[0] == 0.f && valid[15] == 0.f);
+            CHECK(std::abs(motion[24] - (frame % 2 ? -1.f : 1.f)) < 1e-3f);
+            CHECK(std::abs(motion[25]) < 1e-3f);
+            std::printf("motion at (12,7): %.6f %.6f valid %.0f, outside %.0f\n",
+                        motion[24], motion[25], valid[12], valid[0]);
+            rb->Unmap(0, nullptr);
+            verified = true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    CHECK(discarded_frame != 0 && verified);
+    test::ComPtr<ID3D12InfoQueue> messages;
+    if (debug && SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&messages)))) {
+        std::puts("D3D12 debug layer enabled.");
+        for (UINT64 i = 0; i < messages->GetNumStoredMessages(); ++i) {
+            SIZE_T size = 0;
+            messages->GetMessage(i, nullptr, &size);
+            std::vector<std::byte> bytes_for_message(size);
+            auto* message = reinterpret_cast<D3D12_MESSAGE*>(bytes_for_message.data());
+            if (SUCCEEDED(messages->GetMessage(i, message, &size)) && message->Severity <= D3D12_MESSAGE_SEVERITY_ERROR) {
+                std::printf("D3D12 error %d: %s\n", message->ID, message->pDescription);
+                CHECK(false);
+            }
+        }
+    }
+    na::observe::SetDrawReplay(0, nullptr);
+    na_observe_stop();
+    na::observe::SetProcessExiting();
+    return test::finish("draw_replay_test");
+}

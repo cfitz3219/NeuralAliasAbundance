@@ -89,6 +89,7 @@ constexpr uint32_t SetComputeRootUnorderedAccessView = 41;
 constexpr uint32_t SetGraphicsRootUnorderedAccessView = 42;
 constexpr uint32_t IASetIndexBuffer = 43;
 constexpr uint32_t IASetVertexBuffers = 44;
+constexpr uint32_t SOSetTargets = 45;
 constexpr uint32_t OMSetRenderTargets = 46;
 constexpr uint32_t ClearDepthStencilView = 47;
 constexpr uint32_t ClearRenderTargetView = 48;

@@ -146,6 +146,7 @@ struct ListState {
     na_object_id pending_entry = 0; // selected colour whose handoff awaits its first actual operation
     uint32_t entry_barrier=0;
     bool restorable = true;              // false after work whose state effects we cannot replay
+    bool game_stream_output = false;
     bool in_render_pass = false;         // between BeginRenderPass and EndRenderPass (no host copy/dispatch allowed)
     D3D12_VIEWPORT raster_viewports[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
     D3D12_RECT raster_scissors[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
@@ -2229,6 +2230,14 @@ size_t sub_size(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t)
 // view-instancing locations), so the background worker can build more twins long after
 // the game's call returned. The cached-PSO blob is never copied: it belongs to the game's
 // variant. A device reference is held for as long as the entry exists.
+constexpr GUID kReplayRootBlob = {0x12adf671, 0xa84c, 0x43e0, {0xa7, 0x39, 0x11, 0x80, 0x43, 0xbc, 0xf8, 0x3e}};
+
+void remember_replay_root(ID3D12RootSignature* root, const void* blob, SIZE_T size)
+{
+    if (root && blob && size && size <= UINT_MAX)
+        root->SetPrivateData(kReplayRootBlob, static_cast<UINT>(size), blob);
+}
+
 struct VariantRecipe {
     enum Kind : uint8_t { RootSignature, Graphics, Compute, Stream } kind = RootSignature;
     Microsoft::WRL::ComPtr<ID3D12Device> dev;
@@ -2439,6 +2448,7 @@ std::shared_ptr<Obj::Twins> build_rs_set(const VariantRecipe& r, int af, uint32_
             const HostWorkScope host;
             if (FAILED(o_CreateRootSignature(r.dev.Get(), r.node_mask, b->GetBufferPointer(), b->GetBufferSize(), IID_PPV_ARGS(&twin)))) twin = nullptr;
         }
+        if (twin && b) remember_replay_root(twin, b->GetBufferPointer(), b->GetBufferSize());
         if (b) b->Release();
         if (err) err->Release();
         if (!twin) { g_mip_twin_fail.fetch_add(1, std::memory_order_relaxed); continue; }
@@ -2546,6 +2556,13 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
     }
     const HRESULT hr = rebuilt ? o_CreateRootSignature(dev, mask, rebuilt->GetBufferPointer(), rebuilt->GetBufferSize(), riid, out)
                                : o_CreateRootSignature(dev, mask, blob, size, riid, out);
+    if (depth.outermost() && !t_host_work && SUCCEEDED(hr) && out && *out) {
+        Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
+        if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&root)))) {
+            if (rebuilt) remember_replay_root(root.Get(), rebuilt->GetBufferPointer(), rebuilt->GetBufferSize());
+            else remember_replay_root(root.Get(), blob, size);
+        }
+    }
     if (rebuilt) rebuilt->Release();
     std::shared_ptr<const VariantRecipe> recipe;
     std::shared_ptr<Obj::Twins> sets[4];
@@ -3165,6 +3182,7 @@ struct On<sl::list::Reset> {
                     ls->raster_viewports_known = ls->raster_scissors_known = ls->raster_topology_known = false;
                     ls->vertex_mask=0;ls->index_known=false;ls->index_buffer={};ls->stencil_ref=0;
                     std::fill_n(ls->blend_factor,4,0.f);ls->predicate=nullptr;ls->predicate_offset=0;
+                    ls->game_stream_output = false;
                     ls->raster_targets_known = false;
                     ls->raster_tracking = g_raster_tracking.load(std::memory_order_acquire);
                 }
@@ -3413,8 +3431,21 @@ struct On<sl::list::ClearState> {
         s.raster_targets_known=s.raster_viewports_known=s.raster_scissors_known=s.raster_topology_known=true;
         s.raster_topology=D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;s.restorable=true;
         s.vertex_mask=0;s.index_known=false;s.index_buffer={};s.stencil_ref=0;std::fill_n(s.blend_factor,4,0.f);
-        s.predicate=nullptr;s.predicate_offset=0;++s.key_revision[0];++s.key_revision[1];++s.read_revision[0];++s.read_revision[1];
+        s.game_stream_output=false;s.predicate=nullptr;s.predicate_offset=0;++s.key_revision[0];++s.key_revision[1];++s.read_revision[0];++s.read_revision[1];
     });}
+};
+template <>
+struct On<sl::list::SOSetTargets> {
+    static void run(GL* list, UINT, UINT count, const D3D12_STREAM_OUTPUT_BUFFER_VIEW* views)
+    {
+        if (!views || !count) return;
+        with_list_state(list, [&](ListState& state) {
+            std::lock_guard<std::mutex> lock(state.bind_m);
+            for (UINT i = 0; i < count; ++i) {
+                if (views[i].BufferLocation) { state.game_stream_output = true; break; }
+            }
+        });
+    }
 };
 template <>
 struct On<sl::list::SetPredication> {
@@ -4517,7 +4548,11 @@ void replay_probe_draw(GL* l, UINT count, UINT instances, bool indexed)
 // Slot layout: kRpCounters filled-size counters (16 bytes each), then float4 positions.
 constexpr uint32_t kRpSlots = 3, kRpCounters = 8192;
 constexpr uint64_t kRpCounterBytes = uint64_t(kRpCounters) * 16, kRpBytes = 48ull << 20;
-struct SoTwin { Microsoft::WRL::ComPtr<ID3D12RootSignature> rs; Microsoft::WRL::ComPtr<ID3D12PipelineState> pso; uint8_t state = 0; }; // 0 queued, 1 built, 2 failed
+struct SoTwin {
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> rs, replay_root;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
+    uint8_t state = 0; // 0 queued, 1 built, 2 failed
+};
 struct SoEntry {
     std::shared_ptr<const VariantRecipe> recipe;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> rs; // the game's root signature of the pipeline
@@ -4530,14 +4565,16 @@ std::unordered_map<const void*, std::shared_ptr<SoEntry>>& g_so = *new std::unor
 std::deque<std::pair<std::shared_ptr<SoEntry>, ID3D12RootSignature*>>& g_so_queue = *new std::deque<std::pair<std::shared_ptr<SoEntry>, ID3D12RootSignature*>>();
 bool g_so_worker = false;
 Microsoft::WRL::ComPtr<ID3D12Device>& g_rp_device = *new Microsoft::WRL::ComPtr<ID3D12Device>();
-std::atomic<bool> g_rp_capture{false}, g_rp_bufs_ok{false};
-std::atomic<uint32_t> g_rp_cur_slot{0};
-std::atomic<bool> g_rp_ready[kRpSlots];
+Microsoft::WRL::ComPtr<ID3D12Resource>& g_rp_zeros = *new Microsoft::WRL::ComPtr<ID3D12Resource>();
+std::atomic<bool> g_rp_bufs_ok{false};
+std::atomic<uint64_t> g_rp_frame{0};
+std::atomic<ReplayRetain> g_rp_retain{nullptr};
+std::mutex g_replay_slots_m;
 struct RpSlot {
     Microsoft::WRL::ComPtr<ID3D12Resource> buf;
-    std::atomic<uint64_t> verts{0};
-    std::atomic<uint32_t> counters{0};
-    std::mutex m;
+    std::shared_ptr<ReplayUse> writer, reader;
+    uint64_t frame = 0, list_id = 0, recording = 0, verts = 0;
+    bool sealed = false;
     std::vector<ReplayRecord> draws;
 };
 RpSlot& rp_slot(uint32_t i) { static RpSlot* s = new RpSlot[kRpSlots]; return s[i]; }
@@ -4545,6 +4582,31 @@ std::atomic<uint64_t> g_rp_stat[16]; // see DrawReplayStats
 enum : uint32_t { kRpReplayed, kRpVerts, kRpNoTwin, kRpBuilding, kRpFailedTwin, kRpOverflow, kRpTopology, kRpStages, kRpUntwinned,
                   kRpNoRecipe, kRpNotReady, kRpBuilt, kRpBuildFailed, kRpNoted, kRpHashMismatch, kRpStatCount };
 void rp_count(uint32_t k, uint64_t n = 1) { g_rp_stat[k].fetch_add(n, std::memory_order_relaxed); }
+
+HRESULT make_replay_root(ID3D12Device* dev, UINT node, ID3D12RootSignature* game,
+                         ID3D12RootSignature** result)
+{
+    UINT size = 0;
+    if (FAILED(game->GetPrivateData(kReplayRootBlob, &size, nullptr)) || !size) return E_INVALIDARG;
+    std::vector<uint8_t> blob(size);
+    HRESULT hr = game->GetPrivateData(kReplayRootBlob, &size, blob.data());
+    if (FAILED(hr)) return hr;
+    Microsoft::WRL::ComPtr<ID3D12VersionedRootSignatureDeserializer> decoder;
+    hr = D3D12CreateVersionedRootSignatureDeserializer(blob.data(), size, IID_PPV_ARGS(&decoder));
+    if (FAILED(hr)) return hr;
+    auto desc = *decoder->GetUnconvertedRootSignatureDesc();
+    const auto allow = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_STREAM_OUTPUT;
+    switch (desc.Version) {
+    case D3D_ROOT_SIGNATURE_VERSION_1_0: desc.Desc_1_0.Flags |= allow; break;
+    case D3D_ROOT_SIGNATURE_VERSION_1_1: desc.Desc_1_1.Flags |= allow; break;
+    case D3D_ROOT_SIGNATURE_VERSION_1_2: desc.Desc_1_2.Flags |= allow; break;
+    default: return E_INVALIDARG;
+    }
+    Microsoft::WRL::ComPtr<ID3DBlob> bytes;
+    hr = D3D12SerializeVersionedRootSignature(&desc, &bytes, nullptr);
+    if (FAILED(hr)) return hr;
+    return o_CreateRootSignature(dev, node, bytes->GetBufferPointer(), bytes->GetBufferSize(), IID_PPV_ARGS(result));
+}
 
 void so_worker()
 {
@@ -4559,18 +4621,39 @@ void so_worker()
         const HostWorkScope host;
         const VariantRecipe& r = *job.first->recipe;
         D3D12_GRAPHICS_PIPELINE_STATE_DESC d = r.g;
-        d.pRootSignature = job.second;
+        Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
+        HRESULT hr = make_replay_root(r.dev.Get(), d.NodeMask, job.second, &root);
+        d.pRootSignature = root.Get();
         d.PS = {};
+        d.DepthStencilState.DepthEnable = FALSE;
+        d.DepthStencilState.StencilEnable = FALSE;
+        d.DSVFormat = DXGI_FORMAT_UNKNOWN;
+        d.NumRenderTargets = 0;
+        for (auto& format : d.RTVFormats) format = DXGI_FORMAT_UNKNOWN;
+        d.BlendState = {};
+        d.SampleDesc = {1, 0};
+        d.SampleMask = UINT_MAX;
+        d.RasterizerState.ForcedSampleCount = 0;
         static const D3D12_SO_DECLARATION_ENTRY decl{0, "SV_Position", 0, 0, 4, 0};
         static const UINT stride = 16;
         d.StreamOutput = {&decl, 1, &stride, 1, D3D12_SO_NO_RASTERIZED_STREAM};
         d.CachedPSO = {};
         ID3D12PipelineState* t = nullptr;
-        const bool ok = SUCCEEDED(o_CreateGraphicsPipelineState(r.dev.Get(), &d, IID_PPV_ARGS(&t)));
+        if (SUCCEEDED(hr)) hr = o_CreateGraphicsPipelineState(r.dev.Get(), &d, IID_PPV_ARGS(&t));
+        const bool ok = SUCCEEDED(hr);
         rp_count(ok ? kRpBuilt : kRpBuildFailed);
+        if (!ok) na::eventlog::Emit("draw_replay_pipeline_failed", "hr=0x%08x vs=0x%llx",
+            static_cast<unsigned>(hr), static_cast<unsigned long long>(job.first->vs_hash));
         std::lock_guard<std::mutex> lk(g_so_m);
-        for (auto& tw : job.first->twins)
-            if (tw.rs.Get() == job.second) { tw.state = ok ? 1 : 2; if (ok) tw.pso.Attach(t); break; }
+        for (auto& tw : job.first->twins) {
+            if (tw.rs.Get() != job.second) continue;
+            tw.state = ok ? 1 : 2;
+            if (ok) {
+                tw.replay_root = std::move(root);
+                tw.pso.Attach(t);
+            }
+            break;
+        }
     }
 }
 // Called from the pipeline-creation hook for every graphics pipeline: keeps a creation copy of the
@@ -4605,36 +4688,55 @@ bool rp_ensure_buffers()
     rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     for (uint32_t i = 0; i < kRpSlots; ++i)
         if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&rp_slot(i).buf)))) return false;
+    rd.Width = kRpCounterBytes;
+    if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_rp_zeros)))) return false;
     g_rp_bufs_ok.store(true, std::memory_order_release);
     return true;
 }
 // After a game draw (outermost, not host work): replay it into this frame's slot when it qualifies.
 void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2, INT a3, UINT a4)
 {
-    if (!g_rp_capture.load(std::memory_order_relaxed) || !rp_ensure_buffers()) return;
-    if (l->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return; // bundles cannot set stream-output targets
-    const uint32_t s = g_rp_cur_slot.load(std::memory_order_acquire);
-    if (!g_rp_ready[s].load(std::memory_order_acquire)) { rp_count(kRpNotReady); return; }
+    const uint64_t frame = g_rp_frame.load(std::memory_order_acquire);
+    if (!frame || l->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return;
+    const auto retain = g_rp_retain.load(std::memory_order_acquire);
+    if (!retain) return;
     uint64_t sel_depth = 0, sel_color = 0;
     GetLiveSelection(&sel_depth, &sel_color);
     if (!sel_depth) return;
     ID3D12PipelineState* game_pso = nullptr;
     ID3D12RootSignature* bound_rs = nullptr;
     std::shared_ptr<SoEntry> entry;
+    std::vector<ListState::RootArg> arguments;
+    uint64_t recording = 0;
+    na_object_id list_id = 0;
     ReplayRecord rec{};
     {
         std::shared_lock<RegistryLock> lock(g_m);
-        na_object_id id = 0;
-        auto* ls = list_state_locked(l, &id);
+        auto* ls = list_state_locked(l, &list_id);
         if (!ls) return;
         std::lock_guard<std::mutex> bl(ls->bind_m);
-        if (ls->cur_ds != sel_depth || !ls->pso || ls->in_render_pass) return;
+        if (ls->cur_ds != sel_depth || !ls->pso || ls->in_render_pass || !ls->restorable || ls->predicate || ls->game_stream_output) return;
+        if (!ls->recording_observed.load() || !ls->generation_known.load() || !ls->coverage_complete.load()) return;
+        recording = ls->generation.load() + 1;
         const auto pipeline = g_objs.find(canon(ls->pso));
         if (pipeline == g_objs.end() || pipeline->second.created.size() < sizeof(na_ev_pipeline_created)) return;
         const auto* pc = reinterpret_cast<const na_ev_pipeline_created*>(pipeline->second.created.data());
         if (pc->depth_enable != 1 || pc->depth_write != 1) return;
         if (pc->stage_hash[NA_STAGE_GS] || pc->stage_hash[NA_STAGE_HS] || pc->stage_hash[NA_STAGE_DS] || pc->stage_hash[NA_STAGE_MS]) { rp_count(kRpStages); return; }
         if (!ls->raster_topology_known || ls->raster_topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST) { rp_count(kRpTopology); return; }
+        if (!ls->raster_viewports_known || ls->raster_viewport_count != 1 ||
+            !ls->raster_scissors_known || ls->raster_scissor_count != 1) return;
+        const auto& viewport = ls->raster_viewports[0];
+        if (viewport.TopLeftX != 0.f || viewport.TopLeftY != 0.f || viewport.MinDepth != 0.f ||
+            viewport.MaxDepth != 1.f || !(viewport.Width > 0.f && viewport.Width <= 16384.f &&
+                                         viewport.Height > 0.f && viewport.Height <= 16384.f)) return;
+        rec.width = static_cast<uint32_t>(viewport.Width);
+        rec.height = static_cast<uint32_t>(viewport.Height);
+        if (static_cast<float>(rec.width) != viewport.Width || static_cast<float>(rec.height) != viewport.Height) return;
+        const auto& scissor = ls->raster_scissors[0];
+        rec.scissor[0] = scissor.left; rec.scissor[1] = scissor.top;
+        rec.scissor[2] = scissor.right; rec.scissor[3] = scissor.bottom;
         {
             std::lock_guard<std::mutex> lk(g_so_m);
             const auto it = g_so.find(canon(ls->pso));
@@ -4642,30 +4744,52 @@ void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2,
             entry = it->second;
         }
         if (entry->vs_hash != pc->stage_hash[NA_STAGE_VS]) { rp_count(kRpHashMismatch); return; } // a pipeline we never saw created
+        const void* root_key = canon(entry->rs.Get());
+        if (canon(ls->root_sig[0]) != root_key) return;
+        const auto root = g_objs.find(root_key);
+        if (root == g_objs.end() || root->second.created.size() < sizeof(na_ev_root_signature_created)) return;
+        const auto* metadata = reinterpret_cast<const na_ev_root_signature_created*>(root->second.created.data());
+        // Executing a shader twice must not duplicate writes through a vertex-visible
+        // UAV or through a directly indexed descriptor heap.
+        if (metadata->hdr.flags & (NA_EVF_TRUNCATED | NA_EVF_METHOD_UNOBSERVED) ||
+            metadata->flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) return;
+        for (const auto& param : root->second.root_params) {
+            if (param.visibility != D3D12_SHADER_VISIBILITY_ALL && param.visibility != D3D12_SHADER_VISIBILITY_VERTEX) continue;
+            if (param.param_type == NA_ROOT_UAV) return;
+            if (param.param_type != NA_ROOT_TABLE) continue;
+            const auto& ranges = root->second.root_ranges;
+            if (param.first_range > ranges.size() || param.count > ranges.size() - param.first_range) return;
+            for (uint32_t i = 0; i < param.count; ++i)
+                if (ranges[param.first_range + i].range_type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV) return;
+        }
         bound_rs = entry->rs.Get();
+        game_pso = ls->pso;
         if (g_mip_switched.load(std::memory_order_relaxed) && ls->mip_level >= 0) {
             bool untwinned = false;
             bound_rs = mip_swap_locked(ls->mip_level, ls->af_latched, bound_rs, false, &untwinned);
+            game_pso = mip_swap_locked(ls->mip_level, ls->af_latched, game_pso, true, &untwinned);
             if (untwinned) { rp_count(kRpUntwinned); return; }
         }
-        game_pso = ls->pso;
         uint64_t h = rp_mix(0, reinterpret_cast<uintptr_t>(ls->pso));
         h = rp_mix(h, pc->stage_hash[NA_STAGE_VS]); h = rp_mix(h, count); h = rp_mix(h, instances); h = rp_mix(h, indexed);
-        h = rp_mix(h, a2); h = rp_mix(h, static_cast<uint32_t>(a3));
+        h = rp_mix(h, a2); h = rp_mix(h, static_cast<uint32_t>(a3)); h = rp_mix(h, a4);
         uint64_t vb = 0;
         if (ls->raster_tracking) {
             for (UINT i = 0; i < 32; ++i) if (ls->vertex_mask & (1u << i)) vb = rp_mix(vb, ls->vertex_buffers[i].BufferLocation);
             if (ls->index_known) vb = rp_mix(vb, ls->index_buffer.BufferLocation);
         }
+        if (!vb && (indexed || ls->vertex_mask)) return;
         rec.sig = h; rec.vb = vb;
     }
+    if (!rp_ensure_buffers() || g_rp_device.Get() != entry->recipe->dev.Get()) return;
     ID3D12PipelineState* so = nullptr;
+    ID3D12RootSignature* replay_root = nullptr;
     {
         std::lock_guard<std::mutex> lk(g_so_m);
         SoTwin* tw = nullptr;
         for (auto& t : entry->twins) if (t.rs.Get() == bound_rs) { tw = &t; break; }
         if (!tw) {
-            entry->twins.push_back(SoTwin{bound_rs, nullptr, 0});
+            entry->twins.push_back(SoTwin{bound_rs, nullptr, nullptr, 0});
             g_so_queue.emplace_back(entry, bound_rs);
             g_so_cv.notify_one();
             rp_count(kRpNoTwin);
@@ -4674,27 +4798,84 @@ void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2,
         if (tw->state == 0) { rp_count(kRpBuilding); return; }
         if (tw->state == 2) { rp_count(kRpFailedTwin); return; }
         so = tw->pso.Get();
+        replay_root = tw->replay_root.Get();
     }
+    if (replay_root != bound_rs) {
+        std::shared_lock<RegistryLock> lock(g_m);
+        na_object_id id = 0;
+        auto* ls = list_state_locked(l, &id);
+        if (!ls) return;
+        std::lock_guard<std::mutex> bl(ls->bind_m);
+        arguments = ls->args[0];
+    }
+    const auto bind = [&](ID3D12RootSignature* root) {
+        l->SetGraphicsRootSignature(root);
+        for (UINT i = 0; i < arguments.size(); ++i) {
+            const auto& arg = arguments[i];
+            switch (arg.type) {
+            case 1: l->SetGraphicsRootDescriptorTable(i, {arg.value}); break;
+            case 2: l->SetGraphicsRootConstantBufferView(i, arg.value); break;
+            case 3: l->SetGraphicsRootShaderResourceView(i, arg.value); break;
+            case 4: l->SetGraphicsRootUnorderedAccessView(i, arg.value); break;
+            case 5:
+                if (!arg.consts.empty())
+                    l->SetGraphicsRoot32BitConstants(i, static_cast<UINT>(arg.consts.size()), arg.consts.data(), 0);
+                break;
+            default: break;
+            }
+        }
+    };
     const uint64_t verts = uint64_t(count / 3) * 3 * instances;
     if (!verts) return;
-    RpSlot& slot = rp_slot(s);
-    const uint64_t first = slot.verts.fetch_add(verts, std::memory_order_relaxed);
-    const uint32_t ci = slot.counters.fetch_add(1, std::memory_order_relaxed);
-    if (kRpCounterBytes + (first + verts) * 16 > kRpBytes || ci >= kRpCounters) { rp_count(kRpOverflow); return; }
+    std::lock_guard<std::mutex> replay_lock(g_replay_slots_m);
+    if (frame != g_rp_frame.load(std::memory_order_acquire)) return;
+    RpSlot& slot = rp_slot(static_cast<uint32_t>(frame % kRpSlots));
+    const HostWorkScope own;
+    if (slot.frame != frame) {
+        if ((slot.writer && !slot.writer->Retired()) || (slot.reader && !slot.reader->Retired())) {
+            rp_count(kRpNotReady);
+            return;
+        }
+        auto use = retain(l);
+        if (!use) return;
+        slot.writer = std::move(use);
+        slot.reader.reset();
+        slot.frame = frame;
+        slot.list_id = list_id;
+        slot.recording = recording;
+        slot.sealed = false;
+        slot.verts = 0;
+        slot.draws.clear();
+        l->CopyBufferRegion(slot.buf.Get(), 0, g_rp_zeros.Get(), 0, kRpCounterBytes);
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition = {slot.buf.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                              D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_STREAM_OUT};
+        l->ResourceBarrier(1, &barrier);
+    }
+    if (slot.list_id != list_id || slot.recording != recording || slot.sealed) return;
+    const uint64_t first = slot.verts;
+    const uint32_t ci = static_cast<uint32_t>(slot.draws.size());
+    if (verts > (kRpBytes - kRpCounterBytes) / 16 - first || ci >= kRpCounters) {
+        rp_count(kRpOverflow);
+        return;
+    }
     const D3D12_GPU_VIRTUAL_ADDRESS base = slot.buf->GetGPUVirtualAddress();
     D3D12_STREAM_OUTPUT_BUFFER_VIEW view{base + kRpCounterBytes + first * 16, verts * 16, base + uint64_t(ci) * 16};
-    {
-        HostWorkScope own;
-        l->SetPipelineState(so);
-        l->SOSetTargets(0, 1, &view);
-        if (indexed) l->DrawIndexedInstanced(count, instances, a2, a3, a4);
-        else l->DrawInstanced(count, instances, a2, a4);
-        l->SOSetTargets(0, 1, nullptr);
-        l->SetPipelineState(game_pso); // the sampler twin is put back by the live mip swap
-    }
-    rec.first = static_cast<uint32_t>(first); rec.verts = static_cast<uint32_t>(verts);
-    rp_count(kRpReplayed); rp_count(kRpVerts, verts);
-    std::lock_guard<std::mutex> lk(slot.m);
+    if (replay_root != bound_rs) bind(replay_root);
+    l->SetPipelineState(so);
+    l->SOSetTargets(0, 1, &view);
+    if (indexed) l->DrawIndexedInstanced(count, instances, a2, a3, a4);
+    else l->DrawInstanced(count, instances, a2, a4);
+    const D3D12_STREAM_OUTPUT_BUFFER_VIEW unbound{};
+    l->SOSetTargets(0, 1, &unbound);
+    if (replay_root != bound_rs) bind(bound_rs);
+    l->SetPipelineState(game_pso);
+    rec.first = static_cast<uint32_t>(first);
+    rec.verts = static_cast<uint32_t>(verts);
+    rp_count(kRpReplayed);
+    rp_count(kRpVerts, verts);
+    slot.verts += verts;
     slot.draws.push_back(rec);
 }
 template <uint32_t Slot, typename Sig>
@@ -4857,15 +5038,15 @@ struct ListHook<Slot, R(A...)> {
                                 { const CostScope c(kCostRun); On<Slot>::run(l, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), INT(call.args[3]), UINT(call.args[4])); }
                             }
                         } // A skipped native command is NOT emitted as an executed game draw/write.
-                        // Draw replay on this path too (shader hooks on: the HUD separator). eebeeec missed
-                        // every draw here: replayed=0 in Cort's run.
-                        if constexpr (Slot == sl::list::DrawInstanced)
-                            if (!replaced) replay_after_draw(l, false, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), 0, UINT(call.args[3]));
-                        if constexpr (Slot == sl::list::DrawIndexedInstanced)
-                            if (!replaced) replay_after_draw(l, true, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), INT(call.args[3]), UINT(call.args[4]));
+                        bool native_bindings = !replaced;
                         for (unsigned i = entered; i > 0; --i) if (hooks->lane[i - 1]) {
+                            native_bindings = native_bindings && !saved[i - 1].state;
                             const CostScope c(kCostLaneAfter); HostWorkScope own; hooks->lane[i - 1]->After(l, call, saved[i - 1]);
                         }
+                        if constexpr (Slot == sl::list::DrawInstanced)
+                            if (native_bindings) replay_after_draw(l, false, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), 0, UINT(call.args[3]));
+                        if constexpr (Slot == sl::list::DrawIndexedInstanced)
+                            if (native_bindings) replay_after_draw(l, true, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), INT(call.args[3]), UINT(call.args[4]));
                         return;
                     }
                 }
@@ -4973,6 +5154,7 @@ bool register_list_slots()
         ListHook<L::ResolveSubresource, void(ID3D12Resource*, UINT, ID3D12Resource*, UINT, DXGI_FORMAT)>::spec(),
         ListHook<L::IASetPrimitiveTopology, void(D3D12_PRIMITIVE_TOPOLOGY)>::spec(),
         ListHook<L::ClearState,void(ID3D12PipelineState*)>::spec(),
+        ListHook<L::SOSetTargets, void(UINT, UINT, const D3D12_STREAM_OUTPUT_BUFFER_VIEW*)>::spec(),
         ListHook<L::SetPredication,void(ID3D12Resource*,UINT64,D3D12_PREDICATION_OP)>::spec(),
         ListHook<L::IASetVertexBuffers,void(UINT,UINT,const D3D12_VERTEX_BUFFER_VIEW*)>::spec(),
         ListHook<L::IASetIndexBuffer,void(const D3D12_INDEX_BUFFER_VIEW*)>::spec(),
@@ -7714,42 +7896,35 @@ bool ReplayProbeFrame(ReplayProbeStats* out)
     *out = st;
     return st.draws || st.prev_draws;
 }
-void SetDrawReplay(bool on)
+void SetDrawReplay(uint64_t frame, ReplayRetain retain)
 {
-    if (g_rp_capture.exchange(on) == on) return;
-    if (!on) for (auto& r : g_rp_ready) r.store(false, std::memory_order_release);
+    g_rp_retain.store(retain, std::memory_order_release);
+    g_rp_frame.store(retain ? frame : 0, std::memory_order_release);
 }
-bool ReplayTakeFrame(ReplayFrame* f)
+bool ReplayTakeFrame(GL* list, ID3D12CommandQueue* queue, ReplayFrame* f)
 {
-    static std::vector<ReplayRecord>& last = *new std::vector<ReplayRecord>();
-    static int last_slot = -1;
     *f = ReplayFrame{};
-    if (!g_rp_capture.load(std::memory_order_relaxed) || !g_rp_bufs_ok.load(std::memory_order_acquire)) { last.clear(); last_slot = -1; return false; }
-    const uint32_t s = g_rp_cur_slot.load(std::memory_order_acquire), next = (s + 1) % kRpSlots;
-    RpSlot& cur = rp_slot(s);
-    const bool cur_valid = g_rp_ready[s].load(std::memory_order_acquire);
-    {
-        std::lock_guard<std::mutex> lk(cur.m);
-        f->cur_draws.swap(cur.draws);
-    }
-    if (!cur_valid) f->cur_draws.clear();
-    RpSlot& n = rp_slot(next);
-    g_rp_ready[next].store(false, std::memory_order_release);
-    { std::lock_guard<std::mutex> lk(n.m); n.draws.clear(); }
-    n.verts.store(0, std::memory_order_relaxed);
-    n.counters.store(0, std::memory_order_relaxed);
-    g_rp_cur_slot.store(next, std::memory_order_release);
+    if (!list || !queue || !g_rp_bufs_ok.load(std::memory_order_acquire)) return false;
+    const uint64_t recording = ListRecording(list);
+    const uint64_t list_id = IdOf(list);
+    std::lock_guard<std::mutex> lock(g_replay_slots_m);
+    const uint64_t frame = g_rp_frame.load(std::memory_order_acquire);
+    if (frame < 2 || !recording) return false;
+    auto& cur = rp_slot(static_cast<uint32_t>(frame % kRpSlots));
+    if (cur.frame != frame || cur.list_id != list_id || cur.recording != recording || cur.sealed) return false;
+    cur.sealed = true;
     f->cur = cur.buf.Get();
-    f->next = n.buf.Get();
-    f->next_slot = next;
     f->data_offset = kRpCounterBytes;
-    f->counter_bytes = kRpCounterBytes;
-    if (last_slot >= 0 && uint32_t(last_slot) == (s + kRpSlots - 1) % kRpSlots) { f->prev = rp_slot(uint32_t(last_slot)).buf.Get(); f->prev_draws = last; }
-    last = f->cur_draws;
-    last_slot = cur_valid ? int(s) : -1;
+    f->cur_draws = cur.draws;
+    auto& prev = rp_slot(static_cast<uint32_t>((frame - 1) % kRpSlots));
+    if (prev.frame == frame - 1 && prev.sealed && prev.writer && prev.writer->Ready(queue)) {
+        prev.reader = cur.writer;
+        f->prev = prev.buf.Get();
+        f->prev_draws = std::move(prev.draws);
+    }
     return true;
 }
-void ReplaySlotZeroed(uint32_t slot) { if (slot < kRpSlots) g_rp_ready[slot].store(true, std::memory_order_release); }
+
 void GetDrawReplayStats(DrawReplayStats* out)
 {
     const auto v = [](uint32_t k) { return g_rp_stat[k].load(std::memory_order_relaxed); };
