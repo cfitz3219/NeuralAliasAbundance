@@ -500,6 +500,11 @@ int main(int argc,char** argv)
         const bool native_reverse=native_se5&&argc>1&&std::strstr(argv[1],"reverse")!=nullptr;
         // Negative: delivery works, then the game overwrites its image in the same list.
         const bool native_replace=native_se5&&argc>1&&std::strstr(argv[1],"replace")!=nullptr;
+        // Sol 480af25: the same overwrite only after 5 successful deliveries; a later
+        // complete trace must invalidate the learned route (re-checks every 20 presents).
+        const bool native_stale=native_se5&&argc>1&&std::strstr(argv[1],"stale")!=nullptr;
+        unsigned stale_from=0;
+        if(native_stale)na::j2::SetNativeTraceIntervalForTests(20);
         // SE5: the presenting list is recorded ONCE (before any trace window) and
         // executed every frame; it writes the presented image twice: first from
         // the decoy, then from the game's upscaled image (the write that counts).
@@ -576,7 +581,8 @@ int main(int argc,char** argv)
             D3D12_RESOURCE_BARRIER order{};order.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;order.UAV.pResource=native.Get();target_list->ResourceBarrier(1,&order);
             const float green[]{0,1,0,1};const D3D12_RECT hud_rect{0,0,4,4};
             target_list->ClearUnorderedAccessViewFloat(gpu_uav,cpu_heap->GetCPUDescriptorHandleForHeapStart(),native.Get(),green,1,&hud_rect);
-            if(native_overwrite||(native_replace&&late_deliveries>0)){
+            if(native_stale&&late_deliveries>=5&&!stale_from)stale_from=iteration;
+            if(native_overwrite||(native_replace&&late_deliveries>0)||(native_stale&&stale_from)){
                 // Negative: the game overwrites its upscaled image before the final write reads it
                 // (replace: only once delivery has started, so the trace already learned).
                 auto to_rt=test::Transition(native.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -665,6 +671,12 @@ int main(int argc,char** argv)
                 na::j2::NativeTracePresent(d.queue.Get(),presented.Get(),false);
                 na::j2::NativeProbePresent(d.queue.Get(),presented.Get(),nullptr);
                 d.WaitIdle();
+                if(native_stale&&stale_from){
+                    // Within 60 presents a re-verifying trace must have dropped the route.
+                    if(iteration>stale_from+60)CHECK(st.native_deliveries==late_deliveries);
+                    else late_deliveries=unsigned(st.native_deliveries);
+                    continue;
+                }
                 if(st.native_deliveries>late_deliveries&&native_replace){late_deliveries=unsigned(st.native_deliveries);continue;}
                 if(st.native_deliveries&&st.native_deliveries==late_deliveries)
                     std::printf("se5 iteration %u: no new delivery: j2 \"%s\" bridge \"%s\"\n",iteration,st.reason,na::j2::GetNativeBridgeStats().reason);
@@ -717,7 +729,11 @@ int main(int argc,char** argv)
             if(native_se5)std::printf("se5 delivery: delivered %llu first %llu best_streak %llu order_refused %llu later_written %llu probe{%s} refusals{%s}\n",
                 (unsigned long long)nbs.delivered,(unsigned long long)nbs.first_delivery_frame,(unsigned long long)nbs.best_streak,
                 (unsigned long long)nbs.order_refused,(unsigned long long)nbs.later_written,nbs.probe,nbs.refusals);
-            if(native_replace){
+            if(native_stale){
+                std::printf("se5 stale: overwrite from iteration %u, deliveries %u, stages{%s}\n",stale_from,late_deliveries,nbs.stages);
+                CHECK(stale_from>0 && late_deliveries>=5);
+                CHECK(std::strstr(trace,"invalidations=0 ")==nullptr && std::strstr(trace,"learned=0")!=nullptr);
+            }else if(native_replace){
                 // Delivered and submitted, but the game's later write replaced it: the probe says so.
                 CHECK(late_deliveries>=2 && nbs.later_written>0);
                 CHECK(std::strstr(nbs.probe,"verdict=replaced_before_present")!=nullptr);
@@ -738,7 +754,8 @@ int main(int argc,char** argv)
                 if(native_se5){
                     // Learned through the once-recorded presenting list (cached, last write),
                     // with the typed UNORM -> FP16 handoff named.
-                    CHECK(std::strstr(trace,"handoff=[")!=nullptr && std::strstr(trace,"transfer=shader_defined")!=nullptr);
+                    // (stale: the last trace is the invalidating one, without a crossing)
+                    if(!native_stale)CHECK(std::strstr(trace,"handoff=[")!=nullptr && std::strstr(trace,"transfer=shader_defined")!=nullptr);
                     CHECK(std::strstr(trace,"cached=0 ")==nullptr);
                     CHECK(g_pattern_writes>=int(late_deliveries));
                     // Deliveries on frames with the auxiliary input were counted.

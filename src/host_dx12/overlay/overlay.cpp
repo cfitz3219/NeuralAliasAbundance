@@ -1126,9 +1126,9 @@ void write_status_line()
                 (unsigned long long)native.game_applies,(unsigned long long)native.refusals,(unsigned long long)native.thread_changes,b.reason);
             if(bridge_n>0)WriteFile(f,bridge_line,DWORD((std::min)(bridge_n,int(sizeof bridge_line-1))),&written,nullptr);
             char delivery_line[1600];
-            const int delivery_n=std::snprintf(delivery_line,sizeof delivery_line,"native_delivery delivered=%llu first_frame=%llu streak=%llu best_streak=%llu order_refused=%llu later_written=%llu probe{%s} refusals{%s}\r\n",
+            const int delivery_n=std::snprintf(delivery_line,sizeof delivery_line,"native_delivery delivered=%llu first_frame=%llu streak=%llu best_streak=%llu order_refused=%llu later_written=%llu stages{%s} probe{%s} refusals{%s}\r\n",
                 (unsigned long long)b.delivered,(unsigned long long)b.first_delivery_frame,(unsigned long long)b.streak,(unsigned long long)b.best_streak,
-                (unsigned long long)b.order_refused,(unsigned long long)b.later_written,b.probe,b.refusals);
+                (unsigned long long)b.order_refused,(unsigned long long)b.later_written,b.stages,b.probe,b.refusals);
             if(delivery_n>0)WriteFile(f,delivery_line,DWORD((std::min)(delivery_n,int(sizeof delivery_line-1))),&written,nullptr);
             char steps_line[1024];
             const int steps_n=std::snprintf(steps_line,sizeof steps_line,"native_steps gated=%llu full=%llu examined=%llu no_input=%llu ambiguous=%llu partial=%llu candidates=%llu recorded=%llu failed=%llu ungated_full=%llu budget=%llu aux=%llu steps{%s}\r\n",
@@ -3182,9 +3182,9 @@ void game_frame_boundary(ID3D12CommandQueue* queue)
                 (unsigned long long)b.st_gated,(unsigned long long)b.st_full,(unsigned long long)b.st_examined,(unsigned long long)b.st_no_input,
                 (unsigned long long)b.st_ambiguous,(unsigned long long)b.st_draw_state,(unsigned long long)b.st_candidates,(unsigned long long)b.st_recorded,
                 (unsigned long long)b.st_failed,(unsigned long long)b.st_ungated_full,(unsigned long long)b.st_budget,(unsigned long long)b.st_aux,b.steps);
-            na::eventlog::Emit("native_delivery","delivered=%llu first_frame=%llu streak=%llu best_streak=%llu order_refused=%llu later_written=%llu probe{%s} refusals{%s}",
+            na::eventlog::Emit("native_delivery","delivered=%llu first_frame=%llu streak=%llu best_streak=%llu order_refused=%llu later_written=%llu stages{%s} probe{%s} refusals{%s}",
                 (unsigned long long)b.delivered,(unsigned long long)b.first_delivery_frame,(unsigned long long)b.streak,(unsigned long long)b.best_streak,
-                (unsigned long long)b.order_refused,(unsigned long long)b.later_written,b.probe,b.refusals);
+                (unsigned long long)b.order_refused,(unsigned long long)b.later_written,b.stages,b.probe,b.refusals);
         }
     }
     na::settings::WatchChanges("code");

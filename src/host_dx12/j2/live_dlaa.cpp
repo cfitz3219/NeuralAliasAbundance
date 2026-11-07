@@ -384,7 +384,10 @@ struct NativeBridgeCounters {
     // Sol bafa40a (5c/5d), under m: every refusal reason with its count, and first
     // vs sustained delivery (by submitted frame).
     struct Refusal{char why[100];uint64_t n;};Refusal refusals[12]{};uint32_t refusal_kinds=0;
-    uint64_t delivered=0,first_delivery_frame=0,last_delivery_frame=0,streak=0,best_streak=0,order_refused=0,later_written=0;uint32_t src_w=0,src_h=0,src_fmt=0,seen_w=0,seen_h=0,seen_fmt=0;
+    uint64_t delivered=0,first_delivery_frame=0,last_delivery_frame=0,streak=0,best_streak=0,order_refused=0,later_written=0;
+    // Quality route only (Sol 480af25): reconstructions entered at the learned step,
+    // and DLSS recordings there that failed (NGX or J2 refusal inside record()).
+    std::atomic<uint64_t> q_entered{0},q_failed{0};uint32_t src_w=0,src_h=0,src_fmt=0,seen_w=0,seen_h=0,seen_fmt=0;
     // Every distinct full-output writer seen while waiting (pipeline + kind), with its
     // render-size inputs: the log names the game's upscale step instead of guessing.
     struct Step{uint64_t pso=0;bool compute=false;uint32_t dw=0,dh=0,df=0,inputs=0,iw=0,ih=0,ifmt=0,scene=0;uint64_t n=0;char verdict[24]{};};
@@ -448,7 +451,8 @@ struct NativeTrace{
     std::vector<uint64_t> full_ids;                  // whole output-size images written in traced ops (cap 64)
     std::atomic<uint64_t> presented_ids[3]{};        // the last distinct presented buffers
     std::deque<std::pair<std::pair<uint64_t,uint64_t>,TraceOp>> present_cache; // ops writing a presented buffer, by list recording, in order (cap 64)
-    uint64_t cached_used=0,crossing_aux=0,other_queue=0,via_inferred=0;
+    uint64_t cached_used=0,crossing_aux=0,other_queue=0,via_inferred=0,invalidated=0,variant_changes=0;
+    uint32_t learned_interval=900; // presents between re-verifying traces once learned (tests shorten it)
     char result[4096]{};
     NativeCrossing previous, learned;
     std::atomic<uint64_t> learned_pso{0};
@@ -894,15 +898,33 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
         candidate={};
         add(" rejected=%s",ambiguous?"ambiguous":unresolved?"unresolved_writer":"incomplete");
     } else if (candidate.pso) {
+        // Sol 480af25: learning needs two successive traces with the exact same
+        // crossing; report when they differ (and in what), so a route with
+        // alternating variants is visible instead of silently never learned.
+        if (g_trace.previous.pso && !(candidate==g_trace.previous)) {
+            ++g_trace.variant_changes;
+            const auto& p=g_trace.previous;
+            add(" variant_change=[pso %llu->%llu in %llu->%llu out %llu->%llu groups %u,%u->%u,%u views %u/%u->%u/%u]",
+                (unsigned long long)p.pso,(unsigned long long)candidate.pso,(unsigned long long)p.input,(unsigned long long)candidate.input,
+                (unsigned long long)p.output,(unsigned long long)candidate.output,p.gx,p.gy,candidate.gx,candidate.gy,
+                p.in_view,p.out_view,candidate.in_view,candidate.out_view);
+        }
         if (candidate==g_trace.previous) g_trace.learned=candidate;
         else if (!(candidate==g_trace.learned)) g_trace.learned={};
+    } else if (g_trace.learned.pso) {
+        // A complete trace (no ambiguity, no unresolved writer) with no crossing
+        // is a definitive negative for the learned route (overwritten, or the
+        // picture no longer comes from it): stop delivering into it.
+        ++g_trace.invalidated;
+        add(" invalidated_learned=%llu",(unsigned long long)g_trace.learned.pso);
+        g_trace.learned={};
     }    g_trace.previous=candidate;
     g_trace.learned_pso.store(g_trace.learned.pso,std::memory_order_release);
     add(" overlays=%u learned=%llu",overlays,static_cast<unsigned long long>(g_trace.learned.pso));
-    add(" inferred=%llu inferred_present=%llu cached=%llu unresolved_stops=%llu aux=%llu other_queue=%llu inferred_reason=\"%s\"",
+    add(" inferred=%llu inferred_present=%llu cached=%llu unresolved_stops=%llu aux=%llu other_queue=%llu invalidations=%llu variant_changes=%llu inferred_reason=\"%s\"",
         (unsigned long long)g_trace.inferred,(unsigned long long)g_trace.inferred_present,(unsigned long long)g_trace.cached_used,
         (unsigned long long)g_trace.via_inferred,(unsigned long long)g_trace.crossing_aux,(unsigned long long)g_trace.other_queue,
-        g_trace.inferred_reason);
+        (unsigned long long)g_trace.invalidated,(unsigned long long)g_trace.variant_changes,g_trace.inferred_reason);
     if (!candidate.pso) {
         add(" waiting_for_presented_scene_chain");
         // Preserve Opus's downstream diagnostic, with compute candidates first
@@ -1132,6 +1154,11 @@ void NativeProbePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, void(_
         slot->busy=true;slot->value=mark->value;slot->frame=mark->frame;slot->format=desc.Format;
         p.marks.erase(std::next(mark).base());
     }catch(...){}
+}
+void SetNativeTraceIntervalForTests(uint32_t presents)
+{
+    std::lock_guard<std::mutex> lock(g_trace.m);
+    g_trace.learned_interval=presents?presents:900u;
 }
 void RequestDeliveryProbe()
 {
@@ -4650,6 +4677,7 @@ public:
         try {
             std::lock_guard<std::mutex> lock(g.m);
             const auto skip=[&](const char* why){native_reject(g_nb.after_skipped,why);if(out_why)*out_why=why;};
+            if(c->input&&!op)g_nb.q_entered.fetch_add(1,std::memory_order_relaxed);
             if(g.latched||g.paused.load()||!g.device||!g.dlss_ready){skip("DLSS is not ready (paused, stopped or still starting).");return false;}
             if(g.inl.valid||g.submitted_frame==g.frame){if(out_why)*out_why="This frame already has its DLSS.";return false;}
             if(na::observe::ListRecording(l)!=c->recording||!na::observe::ListStateRestorable(l)){skip("The game's state at the upscale pass cannot be restored.");return false;}
@@ -4746,6 +4774,7 @@ public:
             }
             if(touched&&!na::observe::RestoreListState(l)){g.latched=true;reason("Stopped: native-scale pass could not restore game state.");return false;}
             if(!ok){na::capture::j2::Discard(pending.capture,true);++g.stats.inline_record_failed;
+                if(c->input&&!op){g_nb.q_failed.fetch_add(1,std::memory_order_relaxed);std::lock_guard<std::mutex> nb(g_nb.m);native_refusal_locked(g.stats.reason);}
                 g_nb.record_failed.fetch_add(1,std::memory_order_relaxed);
                 {std::lock_guard<std::mutex> nb(g_nb.m);std::snprintf(g_nb.reason,sizeof g_nb.reason,"DLSS recording at the upscale pass failed: %s",g.stats.reason);}
                 if(out_why)*out_why="DLSS recording at the upscale pass failed.";
@@ -6343,6 +6372,17 @@ NativeBridgeStats GetNativeBridgeStats() {
     r.delivered=n.delivered;r.first_delivery_frame=n.first_delivery_frame;r.streak=n.streak;r.best_streak=n.best_streak;
     r.order_refused=n.order_refused;r.later_written=n.later_written;
     probe_stats(r.probe,sizeof r.probe);
+    {
+        // Furthest stage the Quality route reached (Sol 480af25), in pipeline order;
+        // submission and screen confirmation are separate stages.
+        uint64_t learned=0;{std::lock_guard<std::mutex> t(g_trace.m);learned=g_trace.learned.pso?1:0;}
+        const bool screen=std::strstr(r.probe,"verdict=confirmed_in_presented")!=nullptr;
+        const char* furthest=screen?"screen_confirmed":n.delivered?"submitted":r.st_recorded?"recorded":n.q_entered.load()?"entered":
+            r.st_candidates?"matched":learned?"learned":"not_learned";
+        std::snprintf(r.stages,sizeof r.stages,"learned=%llu matched=%llu entered=%llu recorded=%llu ngx_failed=%llu submitted=%llu order_refused=%llu furthest=%s stop=\"%s\"",
+            (unsigned long long)learned,(unsigned long long)r.st_candidates,(unsigned long long)n.q_entered.load(),(unsigned long long)r.st_recorded,
+            (unsigned long long)n.q_failed.load(),(unsigned long long)n.delivered,(unsigned long long)n.order_refused,furthest,n.reason);
+    }
     used=0;
     for(uint32_t i=0;i<n.refusal_kinds&&used+120<sizeof r.refusals;++i){
         const int k=std::snprintf(r.refusals+used,sizeof r.refusals-used,"%s%llu:%s",i?" | ":"",(unsigned long long)n.refusals[i].n,n.refusals[i].why);
@@ -6367,7 +6407,7 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
         }
         if(!g_trace.armed.load()){
             // First trace ~2 s after the scene is reduced, then every ~15 s.
-            if(g_trace.presents-g_trace.armed_at>=(g_trace.learned_pso.load()?900u:30u)){
+            if(g_trace.presents-g_trace.armed_at>=(g_trace.learned_pso.load()?g_trace.learned_interval:30u)){
                 g_trace.recs.clear();g_trace.frame.clear();g_trace.frames=0;g_trace.untraced=g_trace.traced_lists=0;g_trace.ops=0;g_trace.untraced_lists.clear();
                 g_trace.armed_at=g_trace.presents;g_trace.armed.store(true);
             }

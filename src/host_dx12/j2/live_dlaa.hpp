@@ -178,6 +178,7 @@ struct NativeBridgeStats {
     uint64_t delivered=0,first_delivery_frame=0,streak=0,best_streak=0,order_refused=0,later_written=0;
     char refusals[1300]{};
     char probe[320]{}; // delivery probe: sessions, pairs, per-point follow/invert/flat, verdict
+    char stages[480]{}; // Quality route stage counts, furthest stage reached and its stop reason
 };
 NativeBridgeStats GetNativeBridgeStats();
 // Presented-frame trace while the scene is reduced (diagnostic): call at every Present with
@@ -189,6 +190,8 @@ void NativeTraceResult(char* out,size_t n,uint64_t* traces);
 void NativeProbePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, void(__stdcall* exec)(ID3D12CommandQueue*,UINT,ID3D12CommandList* const*));
 // Starts one probe session (24 marked deliveries) now, as an armed J2 capture does.
 void RequestDeliveryProbe();
+// Tests: presents between re-verifying traces once a crossing is learned (default 900).
+void SetNativeTraceIntervalForTests(uint32_t presents);
 // P4-4 no-slider route (Astra's Layer2, contract agreed on COMMS 2026-11-01): an optional
 // immutable logical -> physical snapshot. Discovery, the camera and every identity stay on the
 // LOGICAL scene colour/depth ids; J2 evaluates the provider's PHYSICAL (reduced) companions and
