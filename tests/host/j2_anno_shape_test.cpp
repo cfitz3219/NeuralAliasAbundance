@@ -290,7 +290,8 @@ int main(int argc, char** argv)
     const bool entry_split_indirect=argc>3 && std::strcmp(argv[3],"--entry-split-indirect")==0;
     const bool entry_indirect=entry_split_indirect || (argc>3 && std::strcmp(argv[3],"--entry-indirect")==0);
     const bool entry_split=entry_split_indirect || (argc>3 && std::strcmp(argv[3],"--entry-split")==0);
-    const bool entry_test=entry_real || entry_indirect || entry_split || (argc>3 && std::strcmp(argv[3],"--entry")==0);
+    const bool entry_decoy=argc>3 && std::strcmp(argv[3],"--entry-decoy")==0;
+    const bool entry_test=entry_decoy || entry_real || entry_indirect || entry_split || (argc>3 && std::strcmp(argv[3],"--entry")==0);
     const bool real_ngx = entry_real || argc > 3 && std::strcmp(argv[3], "--real") == 0;
     // --planes: depth's two planes (depth, stencil) are transitioned by separate
     // per-subresource barriers, as Sniper Elite Resistance does.
@@ -733,7 +734,7 @@ int main(int argc, char** argv)
     test::ComPtr<ID3D12RootSignature> post_root;
     if (post_reader || inline_list) {
         REQUIRE(!msaa);
-        auto post_desc=chd;if(entry_test)post_desc.NumDescriptors=96;
+        auto post_desc=chd;if(entry_test)post_desc.NumDescriptors=entry_decoy?192:96;
         REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&post_desc, IID_PPV_ARGS(&post_heap))));
         D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
         srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -743,10 +744,19 @@ int main(int argc, char** argv)
         auto handle=post_heap->GetCPUDescriptorHandleForHeapStart();
         if(entry_test) {
             const auto stride=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-            for(UINT i=0;i<96;++i){dev->CreateShaderResourceView(nullptr,&srv,handle);handle.ptr+=stride;}
+            for(UINT i=0;i<post_desc.NumDescriptors;++i){dev->CreateShaderResourceView(nullptr,&srv,handle);handle.ptr+=stride;}
             handle=post_heap->GetCPUDescriptorHandleForHeapStart();handle.ptr+=72u*stride;
         }
         dev->CreateShaderResourceView(color.Get(), &srv, handle);
+        if (entry_decoy) {
+            dev->CreateShaderResourceView(color.Get(), &srv, post_heap->GetCPUDescriptorHandleForHeapStart());
+            // The intermediate shader reads slot 72 of its own table. Keep that
+            // hidden from the bounded SRV scan, while the terminal shader reads
+            // the visible slot zero of the other table.
+            handle=post_heap->GetCPUDescriptorHandleForHeapStart();
+            handle.ptr+=168u*dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            dev->CreateShaderResourceView(color.Get(), &srv, handle);
+        }
         D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, entry_test?96u:1u, 0, 0, 0};
         D3D12_ROOT_PARAMETER p{}; p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         p.DescriptorTable = {1, &range};
@@ -792,6 +802,11 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         pd.NumRenderTargets = 1; pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
         REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&post_pso))));
         if(entry_test){
+            if (entry_decoy) {
+                const char* visible = "Texture2DArray<float4> images[96]:register(t0); float4 PS(float4 p:SV_Position):SV_Target{return images[0].Load(int4(int2(p.xy),0,0));}";
+                REQUIRE(SUCCEEDED(D3DCompile(visible,std::strlen(visible),nullptr,nullptr,nullptr,"PS","ps_5_1",0,0,&ps,&err)));
+                pd.PS={ps->GetBufferPointer(),ps->GetBufferSize()};
+            }
             pd.RasterizerState.FrontCounterClockwise=TRUE;
             REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&pd,IID_PPV_ARGS(&final_post_pso))));
             const char* geometry="float4 VS(uint i:SV_VertexID):SV_Position{float2 p=float2((i<<1)&2,i&2);return float4(p*2-1,.5,1);} float4 PS():SV_Target{return float4(.2,.3,.4,1);}";
@@ -961,6 +976,11 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             const int evals_before_read = fake::evals;
             scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart()); // binding alone is not a read
             REQUIRE(fake::evals == evals_before_read);
+            if(entry_decoy) {
+                auto mid=post_heap->GetGPUDescriptorHandleForHeapStart();
+                mid.ptr+=96u*dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                scene.list->SetGraphicsRootDescriptorTable(0,mid);
+            }
             scene.list->SetPipelineState(post_pso.Get()); // shader chosen AFTER the table
             scene.list->DrawInstanced(3, 1, 0, 0); // intermediate actual read
             REQUIRE(fake::evals == evals_before_read); // must NEVER process the incomplete scene
@@ -995,6 +1015,15 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart()); // final scene binding
             if(entry_test){
                 const float sentinel[4]={.7f,.2f,.1f,1};scene.list->ClearRenderTargetView(post_rtv,sentinel,0,nullptr);
+                if (entry_decoy && entry_frame >= 8) {
+                    auto decoy = post_heap->GetGPUDescriptorHandleForHeapStart();
+                    decoy.ptr += 96u * dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                    scene.list->SetGraphicsRootDescriptorTable(0, decoy);
+                    scene.list->SetPipelineState(post_pso.Get()); // same PSO seen mid-scene, with its scene SRV outside the bounded scan
+                    scene.list->DrawInstanced(3, 1, 0, 0);
+                    REQUIRE(fake::evals == evals_before_read); // no insertion at a decoy
+                    scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart());
+                }
                 scene.list->SetPipelineState(final_post_pso.Get()); // final PSO chosen AFTER its table; no stale binding key
             }
             // Legacy boundary matcher: injected at the final read transition. Consumer anchor
@@ -1166,7 +1195,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         for(int f=0;f<24;++f)REQUIRE(frame(.25*(f%4))==0);
         const auto st=na::j2::GetStats();
         printf("POST ENTRY %u/%u downstream; matches %llu frames %llu late %llu real %u\n",entry_delivered,entry_checks,(unsigned long long)st.entry_matched,(unsigned long long)st.frames,(unsigned long long)st.inline_late_writes,real_ngx);
-        CHECK(entry_checks==17 && entry_delivered==17 && st.entry_matched>=17);
+        CHECK(entry_checks==17 && entry_delivered==17 && (entry_decoy ? st.class_matched+st.class_pair_matched>=17 : st.entry_matched>=17));
         CHECK(st.no_camera==0 && st.no_state==0 && st.inline_late_writes==0);
         CHECK(st.depth_sources[1]+(entry_split?st.depth_sources[3]:0)>=17 && st.depth_state_assumed==0); // inherited or exact submitted-prefix state, never guessed
         if(entry_split)CHECK(st.between_observed>=9 && st.depth_sources[2]==0); // saved handoff exercised; no supplied substitute

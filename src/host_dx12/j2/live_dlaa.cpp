@@ -4395,9 +4395,6 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
     // not replay. Keep it at its original boundary, as for resolved consumers.
     if(entry && g.depth_samples>1)return;
 
-    // Match an actual operation even with unresolved SRVs; never recover at Close.
-    if(!entry && g.depth_samples<=1 && g.entries.Ready() &&
-       na::observe::ListLiveConsumer(l,color_id).op!=na::j2::Op::CopyRead)return;
     if (!na::observe::ListRendersTo(l, color_id, depth_id)) return; // the scene was not drawn in this recording
     const uint64_t rec = na::observe::ListRecording(l);
     if (!rec) return;
@@ -4477,6 +4474,11 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
         }
     } else {
         const auto live = na::observe::ListLiveConsumer(l, color_id);
+        const bool entry_ready = g.depth_samples <= 1 && g.entries.Ready() && live.op != na::j2::Op::CopyRead;
+        // Once the entry profile is ready, keep barriers out. A later real
+        // shader read can still recover the frame when a preceding operation
+        // claimed the entry, provided the actual reader was qualified.
+        if (entry_ready && (!live.valid || !live.after_write || live.since_write != 1)) return;
         // An MSAA depth resolve draws (render target, viewport, topology), which the state
         // restore does not cover: graphics consumers with MSAA depth stay on the boundary matcher.
         const bool raster_safe = live.op != na::j2::Op::GraphicsRead || g.depth_samples <= 1;
@@ -4509,6 +4511,7 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
             using V = na::j2::ConsumerProfile::Verdict;
             const V v = g.profile.Judge(live_class, live_producer);
             if (v == V::Rejected) { ++g.stats.class_rejected_skips; return; }
+            if (entry_ready && v != V::Accepted && v != V::AcceptedWithProducer) return;
             if (v == V::Accepted || v == V::AcceptedWithProducer) {
                 by_class = true;
                 matched_mode = v == V::Accepted ? kByClass : kByPair;
