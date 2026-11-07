@@ -397,7 +397,10 @@ struct NativeBridgeCounters {
         // Late-bound route: learned dispatches staged for resolution at submission, how many
         // had descriptors rewritten after recording (changed) or not (same), and how many
         // resolved to the learned images and went to the list-boundary DLSS.
-        st_late_staged{0},st_late_changed{0},st_late_same{0},st_late_resolved{0},st_late_inline{0};
+        st_late_staged{0},st_late_changed{0},st_late_same{0},st_late_resolved{0},st_late_inline{0},
+        // Depth snapshots at scene-list Close: closes seen, depth state unknown (no snapshot),
+        // unsupported depth format, no free slot, taken.
+        snap_closes{0},snap_depth_unknown{0},snap_format{0},snap_no_slot{0},snap_taken{0};
     std::mutex m;char reason[200]{};
     // Sol bafa40a (5c/5d), under m: every refusal reason with its count, and first
     // vs sustained delivery (by submitted frame).
@@ -4681,7 +4684,10 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
         na::nr::native::RecordingLease writer, reader;
         std::shared_ptr<uint64_t> owned_reader_fence;
     };
-    DepthSnapshot snapshots_[kRing+2];
+    // p34296: SE5 closes three scene-rendering lists per frame (70, 74, 76 all draw the scene
+    // colour with depth), each taking a slot, and the game keeps its lists for several frames:
+    // kRing+2 slots ran out on ~78% of frames ("no depth snapshot"). Sized for 3 closes x 8 frames.
+    DepthSnapshot snapshots_[24];
 
     void snapshot_depth(ID3D12GraphicsCommandList* list, ID3D12Resource* depth,
                         SceneInput& saved, uint32_t state,
@@ -4690,7 +4696,7 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
         if (!g_trace.learned_pso.load(std::memory_order_acquire) || list->GetType()!=D3D12_COMMAND_LIST_TYPE_DIRECT) return;
         const auto desc=depth->GetDesc();
         if (desc.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count!=1 ||
-            !na::depth::PlaneZeroCopiesToR32F(desc.Format)) return;
+            !na::depth::PlaneZeroCopiesToR32F(desc.Format)) { g_nb.snap_format.fetch_add(1,std::memory_order_relaxed); return; }
         const uint32_t mip=saved.depth_sub%(std::max)(1u,uint32_t(desc.MipLevels));
         const auto w=uint32_t((std::max)(uint64_t{1},desc.Width>>mip));
         const auto h=(std::max)(1u,desc.Height>>mip);
@@ -4700,11 +4706,12 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
             return (!s.writer || s.writer.Retired()) && (!s.reader || s.reader.Retired()) &&
                 (!s.owned_reader_fence || *s.owned_reader_fence<=done);
         });
-        if (slot==std::end(snapshots_)) return;
+        if (slot==std::end(snapshots_)) { g_nb.snap_no_slot.fetch_add(1,std::memory_order_relaxed); return; }
         if (!slot->texture || slot->texture->GetDesc().Width!=w || slot->texture->GetDesc().Height!=h) {
             slot->texture.Reset();
             if (!texture(w,h,DXGI_FORMAT_R32_FLOAT,false,D3D12_RESOURCE_STATE_COPY_DEST,slot->texture)) return;
         }
+        g_nb.snap_taken.fetch_add(1,std::memory_order_relaxed);
         if (!slot->owned_reader_fence) slot->owned_reader_fence=std::make_shared<uint64_t>(0);
         // Same depth-plane copy J2 already performs. This version runs inside
         // the owner list, where the game's exact state is established.
@@ -5312,7 +5319,9 @@ public:
             ComPtr<ID3D12Resource> image,guide;image.Attach(na::observe::AcquireResource(color));guide.Attach(na::observe::AcquireResource(depth));
             if(!image||!guide)return;*owner={image,guide};
             saved.native_origin=na::nr::native::RetainRecording(l,owner);if(!saved.native_origin)return;
+            g_nb.snap_closes.fetch_add(1,std::memory_order_relaxed);
             if (depth_known) snapshot_depth(l,guide.Get(),saved,saved.depth_state,*owner);
+            else g_nb.snap_depth_unknown.fetch_add(1,std::memory_order_relaxed);
             saved.native_serial=++g.next_native_source;
 
             g.native_scene=std::move(saved);
@@ -5343,8 +5352,9 @@ int record_deferred_native(ID3D12CommandQueue* queue, ID3D12CommandList* const* 
         if (work.late) {
             // The scene producer as published at its Close (the same list, or an earlier one).
             work.source=g.native_scene;
-            if (!work.source.native_origin || !work.source.native_recording || !work.source.native_list ||
-                !work.source.native_depth_snapshot || !work.source.native_depth_reader_fence)
+            if (!work.source.native_origin || !work.source.native_recording || !work.source.native_list)
+                return skip("No scene producer was published for the late-bound upscale step.");
+            if (!work.source.native_depth_snapshot || !work.source.native_depth_reader_fence)
                 return skip("The scene producer has no depth snapshot for the late-bound upscale step.");
         }
         const auto& source=work.source;
@@ -5362,10 +5372,15 @@ int record_deferred_native(ID3D12CommandQueue* queue, ID3D12CommandList* const* 
             source.native_serial!=g.native_scene.native_serial)
             return skip("The scene selection or producer changed before the upscale recording was submitted.");
         NativeCrossing learned;
+        std::vector<uint64_t> learned_inputs;
         {
             std::lock_guard<std::mutex> lock(g_trace.m);
             learned=g_trace.learned;
+            learned_inputs=g_trace.learned_inputs;
         }
+        // p27252/p34296: the step alternates between two render-size inputs; any input the
+        // trace has seen it read is the learned step (301 "not the learned ones" refusals).
+        const auto learned_input=[&](uint64_t id){ return id==learned.input || std::find(learned_inputs.begin(),learned_inputs.end(),id)!=learned_inputs.end(); };
         if (work.late) {
             // The dispatch's table, as the GPU will read it: re-read from the heap mirror now.
             if (!work.op) return skip("The late-bound upscale step has no table snapshot.");
@@ -5406,13 +5421,13 @@ int record_deferred_native(ID3D12CommandQueue* queue, ID3D12CommandList* const* 
                 return skip("The late-bound upscale step's images at submission have other sizes than learned.");
             if (in.vfmt!=learned.in_view || out.vfmt!=learned.out_view || typed(DXGI_FORMAT(in.fmt))!=typed(DXGI_FORMAT(out.fmt)))
                 return skip("The late-bound upscale step's images at submission have other formats than learned.");
-            if (in.id!=learned.input || out.id!=learned.output)
+            if (!learned_input(in.id) || out.id!=learned.output)
                 return skip("The late-bound upscale step's images at submission are not the learned ones.");
             work.input=input->resource;work.output=output->resource;work.input_id=in.id;work.output_id=out.id;
             work.op.reset();
             g_nb.st_late_resolved.fetch_add(1,std::memory_order_relaxed);
         }
-        if (!learned.separate_reader || learned.pso!=work.pso || learned.input!=work.input_id ||
+        if (!learned.separate_reader || learned.pso!=work.pso || !learned_input(work.input_id) ||
             learned.output!=work.output_id || learned.scene!=source.color)
             return skip("The screen handoff changed before the upscale recording was submitted.");
         SceneInput staged=source;
@@ -6972,6 +6987,7 @@ NativeBridgeStats GetNativeBridgeStats() {
     r.st_ambiguous=n.st_ambiguous.load();r.st_draw_state=n.st_draw_state.load();r.st_candidates=n.st_candidates.load();
     r.st_recorded=n.st_recorded.load();r.st_failed=n.st_failed.load();r.st_ungated_full=n.st_ungated_full.load();r.st_budget=n.st_budget.load();r.st_aux=n.st_aux.load();
     r.st_late_staged=n.st_late_staged.load();r.st_late_changed=n.st_late_changed.load();r.st_late_same=n.st_late_same.load();r.st_late_resolved=n.st_late_resolved.load();r.st_late_inline=n.st_late_inline.load();
+    r.snap_closes=n.snap_closes.load();r.snap_depth_unknown=n.snap_depth_unknown.load();r.snap_format=n.snap_format.load();r.snap_no_slot=n.snap_no_slot.load();r.snap_taken=n.snap_taken.load();
     size_t used=0;
     for(uint32_t i=0;i<n.step_count&&used+100<sizeof r.steps;++i){
         const auto& e=n.steps[i];
