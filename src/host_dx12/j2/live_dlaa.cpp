@@ -67,9 +67,10 @@ namespace na::j2 {
 namespace {
 
 constexpr uint32_t kRing = 6;            // frames in flight before a slot is reused (never waited on)
-// Quality stability gate: consecutive deliverable frames required before DLSS is written
-// (about 0.2 s at 150 fps). Tests shorten it.
-uint32_t g_quality_warmup = 30;
+// Quality stability gate: consecutive deliverable frames required before DLSS is written.
+// 0 (Cort: no fail-safes, every frame): DLSS is written whenever the route can; the gate then
+// only counts misses (gate{drops}) so a drop-out is visible in the log.
+uint32_t g_quality_warmup = 0;
 constexpr uint32_t kBlockBytes = 512;    // root CBVs have no size: read this much (the producer's own bound)
 constexpr size_t kMaxBlocks = 256;       // unique constant blocks examined per frame (until the camera slot is learned)
 constexpr uint32_t kMaxBlockRead = 1024; // bytes read from one constant buffer
@@ -5216,8 +5217,14 @@ public:
                                                g.frame,c->input,c->dest,na::observe::ListPipelineId(l)};
                             return false;
                         }
-                        skip("Quality needs its scene submitted before an inline upscale pass.");
-                        return false;
+                        // p-b66b1ea run (Cort): 659 frames lost here, each a visible drop-out. A producer
+                        // that is closed but not yet submitted is normally submitted earlier in the same
+                        // batch as this list; the submission check (producer_order in Execute) still
+                        // refuses the delivery and counts order_refused when it is not.
+                        if (saved.native_origin.Retired()) {
+                            skip("Quality needs its scene submitted before an inline upscale pass.");
+                            return false;
+                        }
                     }
                     staged=saved;
                 }
@@ -5375,6 +5382,16 @@ int record_deferred_native(ID3D12CommandQueue* queue, ID3D12CommandList* const* 
                 return skip("No scene producer was published for the late-bound upscale step.");
             if (!work.source.native_depth_snapshot || !work.source.native_depth_reader_fence)
                 return skip("The scene producer has no depth snapshot for the late-bound upscale step.");
+        }
+        if (!work.late && work.source.native_serial!=g.native_scene.native_serial) {
+            // Another list rendering the same scene closed after this step was staged (SE5 closes
+            // three scene lists per frame): the newest producer is the one to use when it is for
+            // the same scene, unused and has its depth snapshot (b66b1ea run: 1186 drop-outs here).
+            const auto& newest=g.native_scene;
+            if (newest.color==work.source.color && newest.depth==work.source.depth && newest.native_origin && newest.native_recording &&
+                newest.native_list && newest.native_depth_snapshot && newest.native_depth_reader_fence &&
+                newest.native_serial>g.consumed_native_source)
+                work.source=newest;
         }
         const auto& source=work.source;
         const auto is_producer=[&](ID3D12CommandList* list) {
