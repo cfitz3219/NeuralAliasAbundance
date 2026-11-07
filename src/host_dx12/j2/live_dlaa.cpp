@@ -67,6 +67,9 @@ namespace na::j2 {
 namespace {
 
 constexpr uint32_t kRing = 6;            // frames in flight before a slot is reused (never waited on)
+// Quality stability gate: consecutive deliverable frames required before DLSS is written
+// (about 0.2 s at 150 fps). Tests shorten it.
+uint32_t g_quality_warmup = 30;
 constexpr uint32_t kBlockBytes = 512;    // root CBVs have no size: read this much (the producer's own bound)
 constexpr size_t kMaxBlocks = 256;       // unique constant blocks examined per frame (until the camera slot is learned)
 constexpr uint32_t kMaxBlockRead = 1024; // bytes read from one constant buffer
@@ -225,6 +228,14 @@ struct State {
     SceneInput waiting_scene;
     SceneInput native_scene;
     DeferredNativeScale native_deferred;
+    // Quality stability gate (Cort, p34296: deliveries on alternating frames flicker worse than
+    // none). A frame where the learned step was seen counts as an attempt; a frame where the
+    // route passed every check before recording counts as ok. DLSS is written only once ok
+    // frames have run g_quality_warmup in a row; a miss while engaged drops the run (one switch
+    // back to the game's picture, then steady) and is counted.
+    std::atomic<uint64_t> q_attempt_frame{0}, q_ok_frame{0};
+    uint64_t q_run = 0;
+    std::atomic<bool> q_dry_hit{false};
     uint64_t next_native_source=0,consumed_native_source=0;
     JitterWrites jitter_writes;
     std::vector<na::j2::ColorEvent> frame_seq; // this frame's writes/consumers of the colour, submission order
@@ -409,6 +420,7 @@ struct NativeBridgeCounters {
     // Quality route only (Sol 480af25): reconstructions entered at the learned step,
     // and DLSS recordings there that failed (NGX or J2 refusal inside record()).
     std::atomic<uint64_t> q_entered{0},q_failed{0};uint32_t src_w=0,src_h=0,src_fmt=0,seen_w=0,seen_h=0,seen_fmt=0;
+    std::atomic<uint64_t> q_warmup{0},q_drops{0}; // stability gate: frames held back while warming up; runs dropped by a miss
     // Every distinct full-output writer seen while waiting (pipeline + kind), with its
     // render-size inputs: the log names the game's upscale step instead of guessing.
     struct Step{uint64_t pso=0;bool compute=false;uint32_t dw=0,dh=0,df=0,inputs=0,iw=0,ih=0,ifmt=0,scene=0;uint64_t n=0;char verdict[24]{};};
@@ -4890,6 +4902,7 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
             native_reject(g_nb.st_gated,"The learned upscale step ran with another scene, size or dispatch than learned.");
             return {};
         }
+        g.q_attempt_frame.store(g.frame,std::memory_order_relaxed); // the learned step ran this frame
         na::observe::NativeOperation op;
         const char* why=nullptr;
         // Only read the bindings. Use the same reflection-bounded view as the
@@ -5148,9 +5161,11 @@ public:
             if(!na::observe::RestoreListState(l)){std::lock_guard<std::mutex> lock(g.m);g.latched=true;reason("Stopped: the redirected upscale pass could not restore game state.");}
             return;
         }
+        g.q_dry_hit.store(false,std::memory_order_relaxed);
         const bool delivered=reconstruct(l,c,nullptr,nullptr);
         if(c->input) {
             if(delivered) g_nb.st_recorded.fetch_add(1,std::memory_order_relaxed);
+            else if(g.q_dry_hit.load(std::memory_order_relaxed)) g_nb.q_warmup.fetch_add(1,std::memory_order_relaxed);
             else g_nb.st_failed.fetch_add(1,std::memory_order_relaxed);
         }
     }
@@ -5210,6 +5225,10 @@ public:
                 if (staged.native_depth_snapshot) staged.depth_sub=0;
                 staged.require_current_states=true;
                 if(!uav_store(typed(c->source->GetDesc().Format))){skip("The upscale step's input format cannot be written by DLSS.");return false;}
+                // Every check before GPU work passed: this frame could deliver. Written only
+                // once that has held for g_quality_warmup consecutive frames.
+                g.q_ok_frame.store(g.frame,std::memory_order_relaxed);
+                if(g.q_run<g_quality_warmup){g.q_dry_hit.store(true,std::memory_order_relaxed);if(out_why)*out_why="Quality is warming up: waiting for consecutive frames that can deliver.";return false;}
             }
             if(local&&(!g.inline_camera_submitted||(g.jit.valid&&g.jit.applied)))jitter_batch(one,1);
             g.inline_sample_locked=true;
@@ -5430,6 +5449,9 @@ int record_deferred_native(ID3D12CommandQueue* queue, ID3D12CommandList* const* 
         if (!learned.separate_reader || learned.pso!=work.pso || !learned_input(work.input_id) ||
             learned.output!=work.output_id || learned.scene!=source.color)
             return skip("The screen handoff changed before the upscale recording was submitted.");
+        // Stability gate (see State::q_run): this frame could deliver; write only when warmed up.
+        g.q_ok_frame.store(g.frame,std::memory_order_relaxed);
+        if (g.q_run<g_quality_warmup) { g_nb.q_warmup.fetch_add(1,std::memory_order_relaxed); return -1; }
         SceneInput staged=source;
         staged.color=work.input_id;
         staged.color_sub=0;
@@ -7005,9 +7027,10 @@ NativeBridgeStats GetNativeBridgeStats() {
         const bool screen=std::strstr(r.probe,"verdict=confirmed_in_presented")!=nullptr;
         const char* furthest=screen?"screen_confirmed":n.delivered?"submitted":r.st_recorded?"recorded":n.q_entered.load()?"entered":
             r.st_candidates?"matched":learned?"learned":"not_learned";
-        std::snprintf(r.stages,sizeof r.stages,"learned=%llu matched=%llu entered=%llu recorded=%llu ngx_failed=%llu submitted=%llu order_refused=%llu furthest=%s stop=\"%s\"",
+        std::snprintf(r.stages,sizeof r.stages,"learned=%llu matched=%llu entered=%llu recorded=%llu ngx_failed=%llu submitted=%llu order_refused=%llu furthest=%s gate{run=%llu warmup=%u held=%llu drops=%llu} stop=\"%s\"",
             (unsigned long long)learned,(unsigned long long)r.st_candidates,(unsigned long long)n.q_entered.load(),(unsigned long long)r.st_recorded,
-            (unsigned long long)n.q_failed.load(),(unsigned long long)n.delivered,(unsigned long long)n.order_refused,furthest,n.reason);
+            (unsigned long long)n.q_failed.load(),(unsigned long long)n.delivered,(unsigned long long)n.order_refused,furthest,
+            (unsigned long long)g.q_run,g_quality_warmup,(unsigned long long)n.q_warmup.load(),(unsigned long long)n.q_drops.load(),n.reason);
     }
     used=0;
     for(uint32_t i=0;i<n.refusal_kinds&&used+120<sizeof r.refusals;++i){
@@ -7048,6 +7071,7 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
         na::eventlog::Emit("native_trace","%s",g_trace.result);
     }catch(...){g_trace.armed.store(false);}
 }
+void SetQualityWarmupForTests(uint32_t frames){ g_quality_warmup=frames; }
 void NativeTraceResult(char* out,size_t n,uint64_t* traces){
     std::lock_guard<std::mutex> lock(g_trace.m);
     std::snprintf(out,n,"%s",g_trace.result);if(traces)*traces=g_trace.traces;
@@ -7456,6 +7480,11 @@ void OnPresent(ID3D12CommandQueue* queue)
             g_clear_watch.store(dsel, std::memory_order_relaxed);
         }
         g.stats.depth_clears_last = g.depth_clears_closed;
+        // Stability gate: judge the frame that just ended.
+        if (g.q_attempt_frame.load(std::memory_order_relaxed)==g.frame) {
+            if (g.q_ok_frame.load(std::memory_order_relaxed)==g.frame) ++g.q_run;
+            else { if (g.q_run>=g_quality_warmup) g_nb.q_drops.fetch_add(1,std::memory_order_relaxed); g.q_run=0; }
+        }
         ++g.frame;
         g.native_deferred = {};
         vpj_advance();
