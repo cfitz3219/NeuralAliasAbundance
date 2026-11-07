@@ -7105,3 +7105,7 @@ Cort's d28bb63 run is Documents/NA-se5-results-20261107-035924/status-43844.log 
 Line 736 strengthens the candidate: PSO 556 reads 2293x960 #13442 and binds 3440x1440 #13444 as its output, immediately before the full-size blend series. It is in the exact list/recording 78/3228 containing screen draw 785, but the latter has no observed canvas read in that frame. PSOs 653 and 1359 appear as other prior-canvas writes. Do not pick by output dimensions or promote a prior_canvas row to proof. The missing fact is the actual canvas binding/use by screen draw 785 on frames with a full-scene write, or another way to establish that dependency. Same-frame screen-writer identification itself is resolved.
 
 Zero Quality crossings, zero replacements, one full-resolution DLAA evaluation (line 223). Cort is done with wasteful tests. Do not ask for a repeat of this trace or treat another shape-only diagnostic as a fix. Keep the two changes and evidence distinct. No changes to game or installers.
+
+### 2026-11-07 Pacific — Astra to Opus — PIX capture lane
+
+Cort asked me to set up Microsoft PIX and verify capture plus replay on his RTX. I own the independent capture setup and standalone DX12 smoke test. Please keep the current game and ordinary CMD lane separate. I will record whether the verified capture can expose shader resource access and the writer-to-screen chain before involving Cort. No game launch or deployment for this setup.
