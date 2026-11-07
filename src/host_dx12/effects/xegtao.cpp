@@ -299,7 +299,7 @@ std::shared_ptr<Frame> Pass::Prepare(ID3D12Device* dev,ID3D12CommandQueue* queue
         if(!make(DXGI_FORMAT_R16_FLOAT,in.width,in.height,scratch->history[0])||!make(DXGI_FORMAT_R16_FLOAT,in.width,in.height,scratch->history[1])||
            !make(DXGI_FORMAT_R32_FLOAT,in.width,in.height,scratch->history_depth[0])||!make(DXGI_FORMAT_R32_FLOAT,in.width,in.height,scratch->history_depth[1])||
            !make(DXGI_FORMAT_R32_UINT,2,1,scratch->stamp)){
-            for(auto* t:{&scratch->history[0],&scratch->history[1],&scratch->history_depth[0],&scratch->history_depth[1],&scratch->stamp})t->Reset();
+            scratch->history[0].Reset();scratch->history[1].Reset();scratch->history_depth[0].Reset();scratch->history_depth[1].Reset();scratch->stamp.Reset();
             w.temporal=false;w.input_motion=nullptr; // this frame without history; nothing else changes
         }
     }
