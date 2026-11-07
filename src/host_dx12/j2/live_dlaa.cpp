@@ -393,7 +393,7 @@ struct NativeBridgeCounters {
     std::mutex m;char reason[200]{};
     // Sol bafa40a (5c/5d), under m: every refusal reason with its count, and first
     // vs sustained delivery (by submitted frame).
-    struct Refusal{char why[100];uint64_t n;};Refusal refusals[12]{};uint32_t refusal_kinds=0;
+    struct Refusal{char why[100];uint64_t n;};Refusal refusals[24]{};uint32_t refusal_kinds=0;
     uint64_t delivered=0,first_delivery_frame=0,last_delivery_frame=0,streak=0,best_streak=0,order_refused=0,later_written=0;
     // Quality route only (Sol 480af25): reconstructions entered at the learned step,
     // and DLSS recordings there that failed (NGX or J2 refusal inside record()).
@@ -430,6 +430,12 @@ struct NativeCrossing {
         return pso==b.pso&&input==b.input&&output==b.output&&scene==b.scene&&
             rw==b.rw&&rh==b.rh&&ow==b.ow&&oh==b.oh&&in_view==b.in_view&&out_view==b.out_view&&
             gx==b.gx&&gy==b.gy&&gz==b.gz&&separate_reader==b.separate_reader;
+    }
+    // The same step regardless of which buffer it used this frame (p32200: SE5 rotates
+    // its images; exact ids refused 972 of the learned step's frames).
+    bool same_shape(const NativeCrossing& b) const {
+        return pso==b.pso&&rw==b.rw&&rh==b.rh&&ow==b.ow&&oh==b.oh&&in_view==b.in_view&&out_view==b.out_view&&
+            gx==b.gx&&gy==b.gy&&gz==b.gz;
     }
 };
 struct TraceOp {
@@ -1005,7 +1011,10 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
         // An unresolved writer on any branch means the crossing may not reach the
         // screen: no candidate from this trace (a learned crossing is kept until
         // a complete trace contradicts it).
-        if (ambiguous || !pending.empty()) g_trace.learned={};
+        // Keep a learned route through an incomplete, ambiguous or unresolved trace; only a
+        // complete negative drops it (p32200: the route was lost on an incomplete trace).
+        if (g_trace.learned.pso) add(" kept_learned=%llu reason=%s",(unsigned long long)g_trace.learned.pso,
+            ambiguous?"ambiguous":unresolved?"unresolved":"incomplete");
         candidate={};
         add(" rejected=%s",ambiguous?"ambiguous":unresolved?"unresolved_writer":"incomplete");
         if (unresolved && !ambiguous && !g_trace.learned.pso) {
@@ -1024,12 +1033,15 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
                 const auto& op=ops[i];
                 if (op.queue!=queue || !op.direct || !op.reflected || op.inferred || op.out.size()!=1) continue;
                 const auto& o=op.out[0];
-                if (op.compute ? (op.uavs!=1 || !op.gx || !op.gy || op.gz!=1) : !(o.binding=='u' || (o.binding=='r' && !op.blend))) continue;
+                // Draws: a UAV output, or a render target (also blended: f1d0594/18dc19a runs, SE5
+                // blends the render-size scene onto the full canvas with pso 721/724 or reads it in
+                // pso 785 straight onto the back buffer). The screen marker decides.
+                if (op.compute ? (op.uavs!=1 || !op.gx || !op.gy || op.gz!=1) : !(o.binding=='u' || o.binding=='r')) continue;
                 if (!o.whole || o.w!=e.ow || o.h!=e.oh) continue;
                 const auto pk=pick_scene_input(op.in,e.rw,e.rh,e.ow,e.oh);
                 if (!pk.ok) continue;
                 const auto& in=op.in[pk.at];
-                if (!trace_same_color(in.vfmt,o.vfmt)) continue;
+                if (op.compute && !trace_same_color(in.vfmt,o.vfmt)) continue; // draws: the delivery rebinds the draw's input, so any formats
                 // Last version of its output: no later full overwrite in this frame
                 // (preserving draws, such as HUD blends, are looked past).
                 size_t w=writer(o.id,ops.size());
@@ -1039,17 +1051,21 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
                     if (!keeps) break;
                     w=writer(o.id,w);
                 }
-                if (w!=i || !traces_scene(in.id,i)) continue;
+                if (w!=i) continue;
                 const NativeCrossing c{op.pso,in.id,o.id,scene,e.rw,e.rh,e.ow,e.oh,in.vfmt,o.vfmt,op.gx,op.gy,op.gz,true}; // reader unreadable: treated as a separate list (Sol's splice checks the tail)
-                if (std::find(g_trace.refuted.begin(),g_trace.refuted.end(),c)!=g_trace.refuted.end()) continue;
-                if (std::find(cands.begin(),cands.end(),c)!=cands.end()) continue;
+                if (std::any_of(g_trace.refuted.begin(),g_trace.refuted.end(),[&](const NativeCrossing& r){return r.same_shape(c);})) continue;
+                if (std::any_of(cands.begin(),cands.end(),[&](const NativeCrossing& r){return r.same_shape(c);})) continue;
                 cands.push_back(c);
             }
             add(" provisional_candidates=%zu refuted=%zu",cands.size(),g_trace.refuted.size());
             for (size_t k=0;k<cands.size()&&k<4;++k)
                 add(" cand=[%s pso=%llu in#%llu out#%llu]",cands[k].gx?"cs":"draw",(unsigned long long)cands[k].pso,(unsigned long long)cands[k].input,(unsigned long long)cands[k].output);
             if (cands.empty()) { g_trace.provisional={}; }
-            else if (std::find(cands.begin(),cands.end(),g_trace.provisional)==cands.end()) { g_trace.provisional=cands[0]; ++g_trace.provisionals; }
+            else {
+                const auto cur=std::find_if(cands.begin(),cands.end(),[&](const NativeCrossing& r){return r.same_shape(g_trace.provisional);});
+                if (cur==cands.end()) { g_trace.provisional=cands[0]; ++g_trace.provisionals; }
+                else g_trace.provisional=*cur; // this frame's buffers
+            }
             if (g_trace.provisional.pso)
                 add(" provisional=[pso=%llu in#%llu out#%llu views %u/%u]",(unsigned long long)g_trace.provisional.pso,(unsigned long long)g_trace.provisional.input,
                     (unsigned long long)g_trace.provisional.output,g_trace.provisional.in_view,g_trace.provisional.out_view);
@@ -1059,7 +1075,7 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
         // Sol 480af25: learning needs two successive traces with the exact same
         // crossing; report when they differ (and in what), so a route with
         // alternating variants is visible instead of silently never learned.
-        if (g_trace.previous.pso && !(candidate==g_trace.previous)) {
+        if (g_trace.previous.pso && !candidate.same_shape(g_trace.previous)) {
             ++g_trace.variant_changes;
             const auto& p=g_trace.previous;
             add(" variant_change=[pso %llu->%llu in %llu->%llu out %llu->%llu groups %u,%u->%u,%u views %u/%u->%u/%u]",
@@ -1067,8 +1083,11 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
                 (unsigned long long)p.output,(unsigned long long)candidate.output,p.gx,p.gy,candidate.gx,candidate.gy,
                 p.in_view,p.out_view,candidate.in_view,candidate.out_view);
         }
-        if (candidate==g_trace.previous) g_trace.learned=candidate;
-        else if (!(candidate==g_trace.learned)) g_trace.learned={};
+        if (candidate.same_shape(g_trace.previous)) { if (!g_trace.learned.same_shape(candidate)) g_trace.learned=candidate; }
+        else if (g_trace.learned.pso && !candidate.same_shape(g_trace.learned)) {
+            add(" dropped_learned=%llu reason=another_step",(unsigned long long)g_trace.learned.pso);
+            g_trace.learned={};
+        }
     } else if (g_trace.learned.pso && !g_trace.untraced) {
         // A complete trace (no ambiguity, no unresolved writer, every list traced)
         // with no crossing is a definitive negative for the learned route
@@ -1125,7 +1144,7 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
 void native_refusal_locked(const char* why){
     if(!why||!*why)return;
     for(uint32_t i=0;i<g_nb.refusal_kinds;++i)if(std::strncmp(g_nb.refusals[i].why,why,sizeof g_nb.refusals[i].why-1)==0){++g_nb.refusals[i].n;return;}
-    if(g_nb.refusal_kinds<12){auto& r=g_nb.refusals[g_nb.refusal_kinds++];std::snprintf(r.why,sizeof r.why,"%s",why);r.n=1;}
+    if(g_nb.refusal_kinds<24){auto& r=g_nb.refusals[g_nb.refusal_kinds++];std::snprintf(r.why,sizeof r.why,"%s",why);r.n=1;}
 }
 void native_reject(std::atomic<uint64_t>& counter,const char* why){
     counter.fetch_add(1,std::memory_order_relaxed);
@@ -1271,8 +1290,8 @@ bool probe_verify_mark(ID3D12GraphicsCommandList* l,ID3D12Resource* dest,uint32_
     std::lock_guard<std::mutex> lock(g_probe.m);
     auto& p=g_probe;
     if(p.outcome)return false; // last session's result not applied yet
-    if(p.verify&&p.target==c&&!p.remaining)return false; // all marks written: waiting for its readbacks and verdict
-    if(!p.remaining||!p.verify||!(p.target==c)){
+    if(p.verify&&p.target.same_shape(c)&&!p.remaining)return false; // all marks written: waiting for its readbacks and verdict
+    if(!p.remaining||!p.verify||!p.target.same_shape(c)){
         if(p.remaining&&!p.verify)return false; // a delivery session is running
         p.start(true);p.target=c;
     }
@@ -1399,7 +1418,7 @@ void NativeProbePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, void(_
 void apply_probe_outcome(int outcome,const NativeCrossing& c)
 {
     std::lock_guard<std::mutex> lock(g_trace.m);
-    if(!(g_trace.provisional==c))return; // the trace moved on meanwhile
+    if(!g_trace.provisional.same_shape(c))return; // the trace moved on meanwhile (same step by shape: buffers rotate)
     if(outcome==1){
         g_trace.learned=c;g_trace.previous=c;++g_trace.verified;
         g_trace.provisional={};
@@ -4772,7 +4791,7 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
         { std::lock_guard<std::mutex> lock(g_up_m); extent=g_native_extent; }
         uint64_t depth=0,scene=0;
         na::observe::GetLiveSelection(&depth,&scene);
-        if (!depth || scene!=learned.scene || extent.rw!=learned.rw || extent.rh!=learned.rh ||
+        if (!depth || extent.rw!=learned.rw || extent.rh!=learned.rh ||
             extent.ow!=learned.ow || extent.oh!=learned.oh || dispatch!=(learned.gx!=0) ||
             (dispatch && (call.args[0]!=learned.gx || call.args[1]!=learned.gy || call.args[2]!=learned.gz))) {
             native_reject(g_nb.st_gated,"The learned upscale step ran with another scene, size or dispatch than learned.");
@@ -4811,19 +4830,20 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
         if (!pick.ok) { native_reject(g_nb.st_ambiguous,pick.why); return {}; }
         input=srv_of[pick.at];
         if (pick.aux) g_nb.st_aux.fetch_add(1,std::memory_order_relaxed);
-        if (!input || !output || input->view.resource!=learned.input || output->view.resource!=learned.output) {
-            native_reject(g_nb.st_no_input,"The learned upscale step reads or writes other images than learned.");
+        if (!dispatch) return stretch_draw(l,op,input,output,learned,extent,scene,depth);
+        if (!input || !output) {
+            native_reject(g_nb.st_no_input,"The learned upscale step reads or writes no images of the learned shape.");
             return {};
         }
         const auto& srv=input->view.srv;
         const auto& uav=output->view.uav;
         const auto in_desc=input->resource->GetDesc(), out_desc=output->resource->GetDesc();
-        const auto in=trace_view(input->resource.Get(),learned.input,
+        const auto in=trace_view(input->resource.Get(),input->view.resource,
             input->view.explicit_view?uint32_t(srv.Format):uint32_t(in_desc.Format),
             !input->view.explicit_view || (srv.ViewDimension==D3D12_SRV_DIMENSION_TEXTURE2D &&
                 !srv.Texture2D.MostDetailedMip && !srv.Texture2D.PlaneSlice &&
                 srv.Shader4ComponentMapping==D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING));
-        const auto out=trace_view(output->resource.Get(),learned.output,
+        const auto out=trace_view(output->resource.Get(),output->view.resource,
             output->view.explicit_view?uint32_t(uav.Format):uint32_t(out_desc.Format),
             !output->view.explicit_view || (uav.ViewDimension==D3D12_UAV_DIMENSION_TEXTURE2D &&
                 !uav.Texture2D.MipSlice && !uav.Texture2D.PlaneSlice));
@@ -4846,6 +4866,38 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
         if (!c->guide) return {};
         g_nb.st_candidates.fetch_add(1,std::memory_order_relaxed);
         return {na::observe::ShaderAction::Forward,c};
+    }
+    // A learned DRAW step (18dc19a run: SE5 blends the render-size scene onto the full
+    // canvas with pso 721/724, or reads it in pso 785 straight onto the back buffer).
+    // DLSS writes a private full-size image BEFORE the draw and the draw's input is
+    // rebound to it (the existing F10 route), so the game's own blending, tone mapping
+    // and composition still apply, to the DLSS picture instead of its upscale.
+    na::observe::ShaderScope stretch_draw(ID3D12GraphicsCommandList* l,const na::observe::NativeOperation& op,
+                                          const na::observe::OperationDescriptor* input,const na::observe::OperationDescriptor* uav,
+                                          const NativeCrossing& learned,const NativeExtent& extent,uint64_t scene,uint64_t depth)
+    {
+        const na::observe::OperationDescriptor* target=uav?uav:(op.colors.size()==1?&op.colors[0]:nullptr);
+        if (!input || !target || !target->resource) { native_reject(g_nb.st_no_input,"The learned upscale draw has no render-size input or no full-size output."); return {}; }
+        const auto in_desc=input->resource->GetDesc(), out_desc=target->resource->GetDesc();
+        if (in_desc.Width!=extent.rw || in_desc.Height!=extent.rh || out_desc.Width!=extent.ow || out_desc.Height!=extent.oh) {
+            native_reject(g_nb.st_no_input,"The learned upscale draw's images changed size."); return {};
+        }
+        auto c=std::make_shared<Candidate>();
+        c->color=scene;c->depth=depth;c->recording=op.recording;c->source=input->resource;
+        c->guide.Attach(na::observe::AcquireResource(depth));
+        c->input=input->view.resource;c->other=target->view.resource;c->other_target=target->resource;
+        c->separate_reader=learned.separate_reader;
+        if (!c->guide) return {};
+        g_nb.st_candidates.fetch_add(1,std::memory_order_relaxed);
+        const char* why=nullptr;
+        if (reconstruct(l,c,&op,&why)) {
+            c->rebound=true;
+            g_nb.st_recorded.fetch_add(1,std::memory_order_relaxed);g_nb.redirected.fetch_add(1,std::memory_order_relaxed);
+            return {na::observe::ShaderAction::Forward,c};
+        }
+        native_reject(g_nb.redirect_failed,why?why:"The learned upscale draw could not be redirected to the DLSS image.");
+        g_nb.st_failed.fetch_add(1,std::memory_order_relaxed);
+        return {};
     }
 public:
     na::observe::ShaderScope Before(ID3D12GraphicsCommandList* l,na::observe::ShaderCall& call) noexcept override {
@@ -4954,8 +5006,8 @@ public:
         if (!pick.ok) return refuse(pick.why);
         // A draw may write the full-size image as its render target instead of a UAV.
         bool rt=false;
-        if (!output && !dispatch && op.colors.size()==1 && op.colors[0].resource && op.colors[0].view.resource==p.output) { output=&op.colors[0]; rt=true; }
-        if (srvs[pick.at].id!=p.input || !output || output->view.resource!=p.output) return refuse("Screen check: the provisional step reads or writes other images than traced.");
+        if (!output && !dispatch && op.colors.size()==1 && op.colors[0].resource && op.colors[0].resource->GetDesc().Width==p.ow && op.colors[0].resource->GetDesc().Height==p.oh) { output=&op.colors[0]; rt=true; }
+        if (!output) return refuse("Screen check: the provisional step writes no output-size image.");
         auto c=std::make_shared<Candidate>();
         c->verify=true;c->verify_rt=rt;c->crossing=p;c->target=output->resource;c->dest=p.output;
         return {na::observe::ShaderAction::Forward,c};
@@ -5188,8 +5240,8 @@ int record_deferred_native(ID3D12CommandQueue* queue, ID3D12CommandList* const* 
         {
             std::lock_guard<std::mutex> lock(g_trace.m);
             const auto& learned=g_trace.learned;
-            if (!learned.separate_reader || learned.pso!=work.pso || learned.input!=work.input_id ||
-                learned.output!=work.output_id || learned.scene!=source.color)
+            // Same learned step by shape (the game rotates its images between frames).
+            if (!learned.separate_reader || learned.pso!=work.pso)
                 return skip("The screen handoff changed before the upscale recording was submitted.");
         }
         SceneInput staged=source;

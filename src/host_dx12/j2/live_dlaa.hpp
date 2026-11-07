@@ -176,7 +176,7 @@ struct NativeBridgeStats {
     // best consecutive run), producer-order refusals, deliveries whose target was
     // written again later in the same list, and every refusal reason with its count.
     uint64_t delivered=0,first_delivery_frame=0,streak=0,best_streak=0,order_refused=0,later_written=0;
-    char refusals[1300]{};
+    char refusals[2800]{}; // up to 24 reasons
     char probe[320]{}; // delivery probe: sessions, pairs, per-point follow/invert/flat, verdict
     char stages[480]{}; // Quality route stage counts, furthest stage reached and its stop reason
 };
