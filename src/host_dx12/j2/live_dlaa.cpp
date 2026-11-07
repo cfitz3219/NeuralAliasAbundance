@@ -466,9 +466,9 @@ struct NativeCrossing {
     uint32_t rw = 0, rh = 0, ow = 0, oh = 0;
     uint32_t in_view = 0, out_view = 0, gx = 0, gy = 0, gz = 0;
     bool separate_reader = false;
-    // Execution-resolved input equals the render target still bound at the
-    // upscale. This survives ping-pong images without guessing from all writes.
-    bool input_is_bound_rtv = false;
+    // Execution-resolved input equals the last actual draw's sole target.
+    // Unlike a current binding, this survives the game's OM unbind before CS.
+    bool input_is_last_draw = false;
     bool operator==(const NativeCrossing& b) const {
         return pso==b.pso&&input==b.input&&output==b.output&&scene==b.scene&&
             rw==b.rw&&rh==b.rh&&ow==b.ow&&oh==b.oh&&in_view==b.in_view&&out_view==b.out_view&&
@@ -492,7 +492,7 @@ struct TraceOp {
     bool heap_indexing = false; // reads ResourceDescriptorHeap[] directly (inputs no table shows)
     uint64_t list = 0, recording = 0; // the recording this op belongs to
     uint64_t pso = 0;
-    uint64_t bound_rtv = 0;
+    uint64_t last_draw_rt = 0;
     uint32_t vw = 0, vh = 0, gx = 0, gy = 0, gz = 0, uavs = 0, descriptor_slots = 0;
     ID3D12CommandQueue* queue = nullptr;
     std::vector<TraceIo> in, out;
@@ -715,7 +715,7 @@ void trace_op(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall& call,b
         return;
     }
     TraceOp t;t.compute=compute;t.pso=op.pipeline_id;t.reflected=op.reflection_complete;t.heap_indexing=op.heap_indexing;
-    if(compute)na::observe::ListCurrentTargets(l,&t.bound_rtv,nullptr);
+    if(compute)t.last_draw_rt=na::observe::ListLastDrawTarget(l);
     t.direct=l->GetType()==D3D12_COMMAND_LIST_TYPE_DIRECT;
     t.descriptor_slots=static_cast<uint32_t>(op.descriptors.size());
     if(compute){t.gx=uint32_t(call.args[0]);t.gy=uint32_t(call.args[1]);t.gz=uint32_t(call.args[2]);}
@@ -1041,8 +1041,8 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
                                               in.vfmt,output->vfmt,op.gx,op.gy,op.gz,
                                               edge.reader_list && edge.reader_recording &&
                                               (edge.reader_list!=op.list || edge.reader_recording!=op.recording),
-                                              op.compute && op.bound_rtv==in.id};
-                    add(" input_bound_rtv=%u reader_separate=%u",unsigned(next.input_is_bound_rtv),unsigned(next.separate_reader));
+                                              op.compute && op.last_draw_rt==in.id};
+                    add(" input_last_draw=%u reader_separate=%u",unsigned(next.input_is_last_draw),unsigned(next.separate_reader));
                     if (candidate.pso && !(candidate==next)) ambiguous=true;
                     else candidate=next;
                 } else add(" rejected=colour_or_scene_lineage");
@@ -1175,7 +1175,7 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
         // route on 556's alternating input left learned=0 between traces).
         if (candidate.same_step(g_trace.previous)) {
             g_trace.learned=candidate;
-            g_trace.learned.input_is_bound_rtv=candidate.input_is_bound_rtv&&g_trace.previous.input_is_bound_rtv;
+            g_trace.learned.input_is_last_draw=candidate.input_is_last_draw&&g_trace.previous.input_is_last_draw;
             g_trace.note_input(g_trace.previous.input);g_trace.note_input(candidate.input);
         }
         else if (!candidate.same_step(g_trace.learned)) { g_trace.learned={}; g_trace.learned_inputs.clear(); }
@@ -5009,16 +5009,13 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
             uint64_t chosen=0; unsigned written=0;
             for (const auto id:inputs) if (na::observe::ListInsertionDecision(l,id).writes>0) { chosen=id; ++written; }
             if (written!=1) chosen=inputs.size()==1?inputs[0]:0;
-            // The trace resolved the consumer's real descriptors at submission
-            // and observed this handoff in two matching frames. RTV bindings
-            // are captured when recorded, unlike the game's late SRV table.
-            // Both ping-pong inputs can have writes in this list; that does not
-            // make its currently bound final target ambiguous. Existing extent,
-            // format, state and producer checks below still apply.
-            if(learned.input_is_bound_rtv){
-                uint64_t bound=0;
-                if(na::observe::ListCurrentTargets(l,&bound,nullptr) && bound &&
-                   na::observe::ListInsertionDecision(l,bound).writes>0)chosen=bound;
+            // Two execution-resolved traces established that this consumer reads
+            // the last drawn target. Sniper unbinds its RTV before dispatching;
+            // retain the actual draw evidence rather than its current OM state.
+            // Extent, format, state and producer checks below still apply.
+            if(learned.input_is_last_draw){
+                const auto drawn=na::observe::ListLastDrawTarget(l);
+                if(drawn && na::observe::ListInsertionDecision(l,drawn).writes>0)chosen=drawn;
             }
             // Inline only when its dependencies are established BEFORE the dispatch is appended
             // (Astra audit items 1, 4, 5): the scene producer is this list or an already
@@ -5055,7 +5052,7 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
                     if (sd.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D && od.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
                         sd.Width==extent.rw && sd.Height==extent.rh && od.Width==extent.ow && od.Height==extent.oh &&
                         typed(sd.Format)==typed(od.Format)) {
-                        if(learned.input_is_bound_rtv){
+                        if(learned.input_is_last_draw){
                             std::lock_guard<std::mutex> lock(g_trace.m);
                             if(g_trace.learned.same_step(learned))g_trace.note_input(chosen);
                         }

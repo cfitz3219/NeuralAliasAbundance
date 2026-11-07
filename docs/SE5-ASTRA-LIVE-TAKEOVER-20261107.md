@@ -147,3 +147,13 @@ suite and new live qualification follow separately.
 Microsoft's [non-shader-visible descriptor documentation](https://learn.microsoft.com/en-us/windows/win32/direct3d12/non-shader-visible-descriptor-heaps) confirms that RTV/DSV bindings are recorded into the command list at bind time. This supports reading our recorded RTV state despite the later SRV-table rewrite. It does not itself prove that every game's upscale reads that target; the two execution-resolved observations establish that relationship in the active route.
 
 Handoff repair automated receipt:93passed,3unsupported-MSAA16skipped,0failed across96cases (252.77s). Final native-HUD pixel assertion also passes after rebuild (layout case2.33s). This is fake-model GPU routing evidence; next actual game run is still required.
+
+### Actual unbinding correction (own p35928)
+
+5c2e470 is NOT final live acceptance. Saved result Documents/NA-se5-results-20261107-085530. Every resolved crossing logged input_bound_rtv=0: Sniper clears OM targets before dispatch. It delivered748 uninterrupted menu frames, then gameplay admission failed after both inputs were learned (775tail drops by final pause). No NVIDIA/state/order errors; removing the list-partition gate alone was insufficient. No public launcher update.
+
+Replace the current-binding relationship with the last actual single-target draw, captured by the existing draw observer and retained through OM unbinding. Reset clears it; MRT/targetless draws clear it. Two execution-resolved traces must establish that the real input is that drawn target. No new scan, per-draw allocation/lock, GPU wait or readback. Existing target extent/state/producer checks remain. The GPU fixture now draws its tone-mapped input and unbinds OM on every frame, including inline-reader/native-HUD frames; the test no longer assumes a binding survives.
+
+Updated layout casePASS2.17s, including Reset clearing and retention through OM unbinding. Negative control restoring5c2e470 runtime fails30checks of the actual NGX input texel (the final fake marker alone would hide the wrong input). Exact repaired bytes restored, fullRelease rebuilt; affected96-case run underway. Source-read state in the fixture includes PIXEL and NON_PIXEL because its new tone-map is a draw; no production state relaxation.
+
+Retained-draw release validation:93passed/3unsupportedMSAA16skipped/0failed in96affectedcases (263.93s), plus4/4observer regressions (12.17s), following fullRelease rebuild. Actual game qualification follows independently.

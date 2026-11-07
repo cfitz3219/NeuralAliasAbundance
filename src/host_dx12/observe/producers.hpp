@@ -192,6 +192,9 @@ bool ListShaderState(ID3D12CommandList* list, bool compute, ShaderState& out);
 void PreserveAppliedViewportJitter(ID3D12CommandList*,uint64_t sample);
 // First render target and depth currently bound in the recording.
 bool ListCurrentTargets(ID3D12CommandList* list, na_object_id* rt, na_object_id* ds);
+// The last observed draw's sole render target, retained after OM unbinding.
+// Zero for a multi-target/targetless draw or a fresh recording. No object ownership.
+na_object_id ListLastDrawTarget(ID3D12CommandList* list);
 // The game's own scissor rectangles and depth target as last set in this recording
 // (host work is not observed, so a host override never replaces them). False when the
 // recording or its scissors are not known (then leave the list alone).

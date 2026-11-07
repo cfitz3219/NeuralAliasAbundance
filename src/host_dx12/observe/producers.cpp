@@ -141,6 +141,7 @@ struct ListState {
     } shader_reads[2];
     std::vector<RootArg> args[2]; // [graphics, compute], by root parameter
     na_object_id cur_rt = 0, cur_ds = 0; // currently bound first render target / depth
+    na_object_id last_draw_rt = 0; // actual draw evidence survives OM unbinding
     na_object_id cur_rts[8] = {};
     uint32_t cur_nrt = 0;
     uint32_t cur_ds_sub = NA_UNKNOWN_U32;
@@ -3174,6 +3175,7 @@ struct On<sl::list::Reset> {
                     ls->uses_complete = true;
                     ls->targets.clear();
                     ls->insertion.Reset();
+                    ls->last_draw_rt = 0;
                     ls->pending_entry = 0;
                     ls->entry_barrier=0;
                     ls->sampled_textures.clear();
@@ -3240,6 +3242,7 @@ struct On<sl::list::Close> {
 };
 void note_draw_locked(ListState* ls){
     const CostScope cost(kCostNoteDraw);
+    ls->last_draw_rt = ls->cur_nrt == 1 ? ls->cur_rts[0] : 0;
     uint64_t sel_depth = 0, sel_color = 0;
     GetLiveSelection(&sel_depth, &sel_color);
     for (uint32_t i = 0; i < ls->cur_nrt; ++i)
@@ -6914,6 +6917,15 @@ bool ListCurrentTargets(ID3D12CommandList* list, na_object_id* rt, na_object_id*
     if (rt) *rt = ls->cur_rt;
     if (ds) *ds = ls->cur_ds;
     return true;
+}
+na_object_id ListLastDrawTarget(ID3D12CommandList* list)
+{
+    std::shared_lock<RegistryLock> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return 0;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return ls->last_draw_rt;
 }
 void SetRasterStateListener(RasterStateListener listener) { g_raster_listener.store(listener, std::memory_order_release); }
 bool ListRasterScissors(ID3D12CommandList* list, RasterScissors& out)
