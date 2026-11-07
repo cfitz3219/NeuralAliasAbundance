@@ -141,6 +141,9 @@ int main(int argc,char** argv)
     const bool native_late=argc>1&&std::strstr(argv[1],"late")!=nullptr;
     const bool native_composite=argc>1&&std::strstr(argv[1],"composite")!=nullptr;
     const bool native_graphics=argc>1&&std::strstr(argv[1],"graphics")!=nullptr;
+    // SE5 shape (p49436): the pass writing the presented image has bindings the
+    // trace cannot snapshot (here an unbounded table), and the picture is not SDR.
+    const bool native_se5=argc>1&&std::strstr(argv[1],"se5")!=nullptr;
     const bool nvrhi=argc>1&&std::strcmp(argv[1],"--nvrhi")==0;
     if(nvrhi&&!na::gpu::GetStats().built)return test::kSkip;
     na::gpu::SetBackendForTests(nvrhi?na::gpu::TestBackend::Nvrhi:na::gpu::TestBackend::Native);
@@ -381,6 +384,7 @@ int main(int argc,char** argv)
             const auto base=heap->GetCPUDescriptorHandleForHeapStart().ptr;
             dev->CreateShaderResourceView(native.Get(),&sv,{base+6*increment});
             root_param.DescriptorTable.NumDescriptorRanges=1;
+            if(native_se5)ranges[0].NumDescriptors=UINT_MAX;
             serialized.Reset();
             REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&root_desc,D3D_ROOT_SIGNATURE_VERSION_1,&serialized,&error)));
             REQUIRE(SUCCEEDED(dev->CreateRootSignature(0,serialized->GetBufferPointer(),serialized->GetBufferSize(),IID_PPV_ARGS(&composite_root))));
@@ -510,7 +514,7 @@ int main(int argc,char** argv)
             d.WaitIdle();
             st=na::j2::GetStats();
             if(native_late){
-                na::j2::NativeTracePresent(d.queue.Get(),presented.Get(),true);
+                na::j2::NativeTracePresent(d.queue.Get(),presented.Get(),!native_se5);
                 if(st.native_deliveries){
                     CHECK(st.native_deliveries==++late_deliveries);
                     CHECK(st.active&&st.render_w==W&&st.render_h==H&&st.out_w==OW&&st.out_h==OH);
@@ -528,6 +532,7 @@ int main(int argc,char** argv)
         if(native_late){
             char trace[2048];uint64_t traces=0;na::j2::NativeTraceResult(trace,sizeof trace,&traces);
             std::printf("learned native Quality deliveries %u, traces %llu: %s\n",late_deliveries,(unsigned long long)traces,trace);
+            if(native_se5)CHECK(std::strstr(trace,"via_inferred=")!=nullptr);
             CHECK(late_deliveries>=2 && fake::evals==before_native+int(late_deliveries));
         }else CHECK(fake::evals==before_native+3);
         CHECK(dev->GetDeviceRemovedReason()==S_OK);

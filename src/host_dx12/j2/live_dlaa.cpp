@@ -410,6 +410,9 @@ struct NativeCrossing {
 struct TraceOp {
     bool compute = false, direct = false, transfer = false, preserves = false, reflected = false;
     bool blend = false, depth = false;
+    // The bindings could not be snapshotted (unbounded table, missing typed view...):
+    // only the bound render target and the full-size images the list samples are known.
+    bool inferred = false;
     uint64_t pso = 0;
     uint32_t vw = 0, vh = 0, gx = 0, gy = 0, gz = 0, uavs = 0, descriptor_slots = 0;
     ID3D12CommandQueue* queue = nullptr;
@@ -423,6 +426,16 @@ struct NativeTrace{
     struct Untraced{uint64_t id=0,recording=0;int type=-1,queue_type=-1;size_t at=0;};
     std::vector<Untraced> untraced_lists;
     std::map<std::pair<uint64_t,uint64_t>,std::vector<TraceOp>> recs;std::vector<TraceOp> frame;
+    // p49436: presented #1963 (FP16 swap chain) never had a traced writer, while the
+    // game's upscaled image #13962 is 8-bit UNORM, so a shader pass (not a copy)
+    // converts one into the other. Two ways that pass can be missing, both handled:
+    // its bindings cannot be snapshotted (the op was silently dropped), or its list
+    // was recorded outside the trace window (recorded once, executed every frame).
+    uint64_t inferred=0,inferred_present=0;char inferred_reason[96]{};
+    std::vector<uint64_t> full_ids;                  // whole output-size images written in traced ops (cap 64)
+    std::atomic<uint64_t> presented_ids[3]{};        // the last distinct presented buffers
+    std::deque<std::pair<std::pair<uint64_t,uint64_t>,TraceOp>> present_cache; // ops writing a presented buffer, by list recording (cap 32)
+    uint64_t cached_used=0,crossing_aux=0,other_queue=0,via_inferred=0;
     char result[4096]{};
     NativeCrossing previous, learned;
     std::atomic<uint64_t> learned_pso{0};
@@ -440,10 +453,58 @@ void trace_append(ID3D12GraphicsCommandList* l, TraceOp&& op)
 {
     const auto key = std::make_pair(uint64_t(na::observe::IdOf(l)), na::observe::ListRecording(l));
     if (!key.first || !key.second) return;
+    NativeExtent e;
+    { std::lock_guard<std::mutex> lock(g_up_m); e=g_native_extent; }
     std::lock_guard<std::mutex> lock(g_trace.m);
     if (!g_trace.armed.load(std::memory_order_relaxed) || g_trace.ops >= kTraceOps) return;
     ++g_trace.ops;
+    // Whole output-size images: the candidates an inferred op can be shown to sample.
+    if (!op.inferred) for (const auto& o : op.out)
+        if (o.id && o.whole && o.w==e.ow && o.h==e.oh &&
+            std::find(g_trace.full_ids.begin(),g_trace.full_ids.end(),o.id)==g_trace.full_ids.end()) {
+            if (g_trace.full_ids.size()>=64) g_trace.full_ids.erase(g_trace.full_ids.begin());
+            g_trace.full_ids.push_back(o.id);
+        }
     g_trace.recs[key].push_back(std::move(op));
+}
+bool trace_is_presented(uint64_t id)
+{
+    if (!id) return false;
+    for (const auto& p : g_trace.presented_ids) if (p.load(std::memory_order_relaxed)==id) return true;
+    return false;
+}
+// An op whose bindings cannot be snapshotted. Only a draw on a direct list is
+// described: its bound render target, and as inputs the whole output-size images
+// already seen written that this recording samples. trace_analyze passes through
+// such an op only when exactly one such input is known.
+bool trace_inferred(ID3D12GraphicsCommandList* l, TraceOp& t)
+{
+    if (l->GetType()!=D3D12_COMMAND_LIST_TYPE_DIRECT) return false;
+    na_object_id rt=0, ds=0;
+    if (!na::observe::ListCurrentTargets(l,&rt,&ds) || !rt) return false;
+    ComPtr<ID3D12Resource> target;
+    target.Attach(na::observe::AcquireResource(rt));
+    if (!target) return false;
+    t.inferred=true; t.direct=true; t.pso=na::observe::ListPipelineId(l);
+    na::observe::DrawInfo d;
+    if (na::observe::ListDrawState(l,d)) { t.blend=d.blend_mask!=0&&d.blend_mask!=NA_UNKNOWN_U32; t.depth=d.depth_enable==1; }
+    t.preserves=t.blend||t.depth;
+    t.out.push_back(trace_view(target.Get(),rt,uint32_t(target->GetDesc().Format),true,'r'));
+    std::vector<uint64_t> ids;
+    { std::lock_guard<std::mutex> lock(g_trace.m); ids=g_trace.full_ids; }
+    for (const auto id : ids) {
+        if (id==rt || !na::observe::ListSamplesTexture(l,id)) continue;
+        ComPtr<ID3D12Resource> r;
+        r.Attach(na::observe::AcquireResource(id));
+        if (r) t.in.push_back(trace_view(r.Get(),id,uint32_t(r->GetDesc().Format),true,'s'));
+    }
+    return true;
+}
+void trace_note_inferred(const char* why, bool present)
+{
+    std::lock_guard<std::mutex> lock(g_trace.m);
+    ++g_trace.inferred; if (present) ++g_trace.inferred_present;
+    std::snprintf(g_trace.inferred_reason,sizeof g_trace.inferred_reason,"%s",why?why:"unknown");
 }
 void trace_texture(ID3D12GraphicsCommandList* l, const na::observe::TextureCall& call) noexcept
 {
@@ -477,9 +538,30 @@ void trace_texture(ID3D12GraphicsCommandList* l, const na::observe::TextureCall&
         trace_append(l, std::move(op));
     } catch (...) {}
 }
-void trace_op(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall& call){
+// cache=true: outside a trace window, an op that writes a presented buffer is kept
+// by list recording, so a list recorded once and executed every frame is still known.
+void trace_op(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall& call,bool cache=false){
     const bool compute=call.kind==na::observe::ShaderKind::Dispatch;
-    na::observe::NativeOperation op;if(!na::observe::ListNativeOperation(l,compute,op,nullptr,true))return;
+    const auto keep=[&](TraceOp&& t){
+        if(!cache){trace_append(l,std::move(t));return;}
+        const auto key=std::make_pair(uint64_t(na::observe::IdOf(l)),na::observe::ListRecording(l));
+        if(!key.first||!key.second)return;
+        std::lock_guard<std::mutex> lock(g_trace.m);
+        auto& c=g_trace.present_cache;
+        for(auto& x:c)if(x.first==key&&x.second.out.size()==t.out.size()&&!t.out.empty()&&x.second.out[0].id==t.out[0].id)return;
+        if(c.size()>=32)c.pop_front();
+        c.emplace_back(key,std::move(t));
+    };
+    na::observe::NativeOperation op;const char* why=nullptr;
+    if(!na::observe::ListNativeOperation(l,compute,op,&why,true)){
+        TraceOp t;
+        if(compute||!trace_inferred(l,t))return;
+        const bool present=trace_is_presented(t.out[0].id);
+        if(cache&&!present)return;
+        trace_note_inferred(why,present);
+        keep(std::move(t));
+        return;
+    }
     TraceOp t;t.compute=compute;t.pso=op.pipeline_id;t.reflected=op.reflection_complete;
     t.direct=l->GetType()==D3D12_COMMAND_LIST_TYPE_DIRECT;
     t.descriptor_slots=static_cast<uint32_t>(op.descriptors.size());
@@ -518,7 +600,16 @@ void trace_op(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall& call){
             !d.view.explicit_view || (rtv.ViewDimension==D3D12_RTV_DIMENSION_TEXTURE2D &&
                 !rtv.Texture2D.MipSlice && !rtv.Texture2D.PlaneSlice),'r'));
     }
-    trace_append(l, std::move(t));
+    if(cache&&!std::any_of(t.out.begin(),t.out.end(),[](const TraceIo& o){return trace_is_presented(o.id);}))return;
+    keep(std::move(t));
+}
+// Outside a trace window: snapshot only draws whose bound target is a presented buffer.
+void trace_present_writer(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall& call){
+    if(call.kind==na::observe::ShaderKind::Dispatch||l->GetType()!=D3D12_COMMAND_LIST_TYPE_DIRECT)return;
+    if(!g_trace.presented_ids[0].load(std::memory_order_relaxed))return;
+    na_object_id rt=0,ds=0;
+    if(!na::observe::ListCurrentTargets(l,&rt,&ds)||!trace_is_presented(rt))return;
+    trace_op(l,call,true);
 }
 void trace_submit(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists)
 {
@@ -530,6 +621,15 @@ void trace_submit(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* cons
         const auto key=std::make_pair(uint64_t(na::observe::IdOf(lists[i])), na::observe::ListRecording(lists[i]));
         const auto it=g_trace.recs.find(key);
         if (it==g_trace.recs.end()) {
+            // A recording made outside this window that writes a presented buffer.
+            bool cached=false;
+            for (const auto& c : g_trace.present_cache) {
+                if (c.first!=key || g_trace.frame.size()>=kTraceOps) continue;
+                g_trace.frame.push_back(c.second);
+                g_trace.frame.back().queue=queue;
+                cached=true;
+            }
+            if (cached) { ++g_trace.cached_used; ++g_trace.traced_lists; continue; }
             ++g_trace.untraced;
             if (g_trace.untraced_lists.size()<6) {
                 NativeTrace::Untraced u;u.id=key.first;u.recording=key.second;u.at=g_trace.frame.size();
@@ -602,11 +702,18 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
     // Index writers in actual submission order. Every lookup asks for the
     // resource contents that existed immediately before the consuming op.
     std::unordered_map<uint64_t,std::vector<size_t>> writers;
+    uint32_t presented_other_queue=0;
     for (size_t i=0;i<ops.size();++i) {
-        if (ops[i].queue!=queue) continue;
+        if (ops[i].queue!=queue) {
+            // Sol: check queue identity. Ordering against another queue is not
+            // known here, so such a writer is reported, never followed.
+            for (const auto& out:ops[i].out) if (out.id==presented) ++presented_other_queue;
+            continue;
+        }
         for (const auto& out:ops[i].out)
             if (out.id && (out.binding!='u' || ops[i].reflected)) writers[out.id].push_back(i);
     }
+    if (presented_other_queue) { ++g_trace.other_queue; add(" presented_writer_other_queue=%u",presented_other_queue); }
     const auto writer=[&](uint64_t id,size_t before) -> size_t {
         const auto found=writers.find(id);
         if (found==writers.end()) return ops.size();
@@ -620,13 +727,20 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
         while (!pending.empty() && visited.size()<128) {
             const auto next=pending.back();
             pending.pop_back();
+            // The scene itself is the goal even when it was written outside the
+            // traced ops (its producer list may precede the trace window).
+            if (scene && next.first==scene) return true;
             const size_t index=writer(next.first,next.second);
             if (index==ops.size() || std::find(visited.begin(),visited.end(),index)!=visited.end()) continue;
-            if (scene && next.first==scene) return true;
             visited.push_back(index);
             const auto& op=ops[index];
             if (op.reflected || op.transfer) for (const auto& in:op.in)
                 if (in.whole && in.w==e.rw && in.h==e.rh) pending.emplace_back(in.id,index);
+            // A blending or partial draw keeps the earlier contents of its target
+            // (p49436: #13960 is last written by blend pso 452): follow that version too.
+            if (op.preserves && std::any_of(op.out.begin(),op.out.end(),[&](const TraceIo& o){
+                    return o.id==next.first && o.binding=='r';}))
+                pending.emplace_back(next.first,index);
         }
         return false;
     };
@@ -652,15 +766,32 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
             pending.push_back({edge.id,index,edge.srgb});
             continue;
         }
+        // Exactly one whole render-size input; any other input must be smaller than
+        // the render size on both axes (p49436 frame 13888: pso 556 also reads
+        // #13990 1146x480/10 on some frames). Its contribution is overwritten by
+        // the DLSS image on those frames; counted as aux so a run can judge it.
+        size_t render_inputs=0, aux_inputs=0, render_at=0;
+        for (size_t k=0;k<op.in.size();++k) {
+            const auto& v=op.in[k];
+            if (v.whole && v.w==e.rw && v.h==e.rh) { ++render_inputs; render_at=k; }
+            else if (v.w<e.rw && v.h<e.rh) ++aux_inputs;
+            else { render_inputs=2; break; }
+        }
         if (op.compute && op.direct && op.reflected && op.uavs==1 && op.out.size()==1 &&
-            op.in.size()==1 && op.gx && op.gy && op.gz==1) {
-            const auto& in=op.in[0];
-            if (in.whole && in.w==e.rw && in.h==e.rh) {
+            render_inputs==1 && op.gx && op.gy && op.gz==1) {
+            const auto& in=op.in[render_at];
+            {
                 char detail[380]{};
                 trace_describe(detail,sizeof detail,op);
                 add(" crossing=%s",detail);
+                if (aux_inputs) { ++g_trace.crossing_aux; add(" crossing_aux=%zu",aux_inputs); }
+                // A same-view 8-bit UNORM resample keeps the encoding its input
+                // has; an 8-bit final image is display-encoded (DLSS runs with
+                // IsHDR clear for UNORM, see is_float_color), and the game's own
+                // conversion to the FP16 swap chain still runs after it.
                 const bool encoded=output->vfmt==DXGI_FORMAT_R16G16B16A16_FLOAT ||
-                    in.vfmt==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || edge.srgb || sdr_present;
+                    in.vfmt==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || edge.srgb || sdr_present ||
+                    (in.vfmt==DXGI_FORMAT_R8G8B8A8_UNORM && output->vfmt==DXGI_FORMAT_R8G8B8A8_UNORM);
                 if (encoded && trace_same_color(in.vfmt,output->vfmt) && traces_scene(in.id,index)) {
                     const NativeCrossing next{op.pso,in.id,output->id,scene,e.rw,e.rh,e.ow,e.oh,
                                               in.vfmt,output->vfmt,op.gx,op.gy,op.gz};
@@ -669,6 +800,20 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
                 } else add(" rejected=colour_or_scene_lineage");
                 continue;
             }
+        }
+        // An op with unreadable bindings (inferred): passed through only when the
+        // recording samples exactly one full-size image already seen written.
+        if (op.inferred) {
+            uint32_t full=0;
+            for (const auto& in:op.in) if (in.whole && in.w==e.ow && in.h==e.oh) ++full;
+            add(" via_inferred=[pso=%llu inputs=%u]",(unsigned long long)op.pso,full);
+            // Not provable: behave as before this op was recorded at all (look
+            // past it to the earlier writer of the same image).
+            if (full!=1) { pending.push_back({edge.id,index,edge.srgb}); continue; }
+            ++g_trace.via_inferred;
+            for (const auto& in:op.in)
+                if (in.whole && in.w==e.ow && in.h==e.oh) pending.push_back({in.id,index,edge.srgb});
+            continue;
         }
         // A composite can read the scene and a separate full-size HUD. Follow
         // both branches and require one unambiguous crossing from the scene.
@@ -687,6 +832,10 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
     }    g_trace.previous=candidate;
     g_trace.learned_pso.store(g_trace.learned.pso,std::memory_order_release);
     add(" overlays=%u learned=%llu",overlays,static_cast<unsigned long long>(g_trace.learned.pso));
+    add(" inferred=%llu inferred_present=%llu cached=%llu via_inferred=%llu aux=%llu other_queue=%llu inferred_reason=\"%s\"",
+        (unsigned long long)g_trace.inferred,(unsigned long long)g_trace.inferred_present,(unsigned long long)g_trace.cached_used,
+        (unsigned long long)g_trace.via_inferred,(unsigned long long)g_trace.crossing_aux,(unsigned long long)g_trace.other_queue,
+        g_trace.inferred_reason);
     if (!candidate.pso) {
         add(" waiting_for_presented_scene_chain");
         // Preserve Opus's downstream diagnostic, with compute candidates first
@@ -4058,25 +4207,39 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
         na::observe::GetLiveSelection(&depth,&scene);
         if (!depth || scene!=learned.scene || extent.rw!=learned.rw || extent.rh!=learned.rh ||
             extent.ow!=learned.ow || extent.oh!=learned.oh || call.args[0]!=learned.gx ||
-            call.args[1]!=learned.gy || call.args[2]!=learned.gz) return {};
+            call.args[1]!=learned.gy || call.args[2]!=learned.gz) {
+            native_reject(g_nb.st_gated,"The learned upscale step ran with another scene, size or dispatch than learned.");
+            return {};
+        }
         na::observe::NativeOperation op;
-        if (!na::observe::ListNativeOperation(l,true,op,nullptr) || !op.reflection_complete ||
-            op.pipeline_id!=learned.pso) return {};
+        const char* why=nullptr;
+        if (!na::observe::ListNativeOperation(l,true,op,&why) || !op.reflection_complete ||
+            op.pipeline_id!=learned.pso) {
+            native_reject(g_nb.snapshot,why?why:"The learned upscale step's bindings could not be read.");
+            return {};
+        }
 
         const na::observe::OperationDescriptor* input=nullptr;
         const na::observe::OperationDescriptor* output=nullptr;
+        // Same rule as trace_analyze: the learned render-size input once, any other
+        // 2D input smaller than the render size on both axes (auxiliary).
         for (const auto& d:op.descriptors) {
             if (!d.used || !d.resource) continue;
             const auto desc=d.resource->GetDesc();
             if (d.view.kind==NA_DESC_SRV && desc.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
-                if (input) return {};
-                input=&d;
+                if (d.view.resource==learned.input) {
+                    if (input && input->view.resource!=d.view.resource) return {};
+                    input=&d;
+                } else if (!(desc.Width<extent.rw && desc.Height<extent.rh)) return {};
             } else if (d.view.kind==NA_DESC_UAV) {
                 if (output) return {};
                 output=&d;
             }
         }
-        if (!input || !output || input->view.resource!=learned.input || output->view.resource!=learned.output) return {};
+        if (!input || !output || input->view.resource!=learned.input || output->view.resource!=learned.output) {
+            native_reject(g_nb.st_no_input,"The learned upscale step reads or writes other images than learned.");
+            return {};
+        }
         const auto& srv=input->view.srv;
         const auto& uav=output->view.uav;
         const auto in_desc=input->resource->GetDesc(), out_desc=output->resource->GetDesc();
@@ -4091,7 +4254,10 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
                 !uav.Texture2D.MipSlice && !uav.Texture2D.PlaneSlice));
         if (!in.whole || !out.whole || in.vfmt!=learned.in_view || out.vfmt!=learned.out_view ||
             in.w!=extent.rw || in.h!=extent.rh || out.w!=extent.ow || out.h!=extent.oh ||
-            typed(in_desc.Format)!=typed(out_desc.Format)) return {};
+            typed(in_desc.Format)!=typed(out_desc.Format)) {
+            native_reject(g_nb.st_no_input,"The learned upscale step's views changed size or format.");
+            return {};
+        }
         auto c=std::make_shared<Candidate>();
         c->color=scene;
         c->depth=depth;
@@ -4110,6 +4276,7 @@ public:
         if(!g_native_reduced.load(std::memory_order_relaxed)){t_native_hint=nullptr;return {};}
         try{
             if(g_trace.armed.load(std::memory_order_relaxed))trace_op(l,call);
+            else if(!g_trace.learned_pso.load(std::memory_order_relaxed))trace_present_writer(l,call);
             if (g_trace.learned_pso.load(std::memory_order_acquire)) return stretch(l,call);
             auto r=hinted(l,call);
             return r;
@@ -5893,6 +6060,11 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
             return;
         }
         ++g_trace.presents;
+        if(const uint64_t id=frame?uint64_t(na::observe::IdOf(frame)):0;id&&!trace_is_presented(id)){
+            g_trace.presented_ids[2].store(g_trace.presented_ids[1].load());
+            g_trace.presented_ids[1].store(g_trace.presented_ids[0].load());
+            g_trace.presented_ids[0].store(id);
+        }
         if(!g_trace.armed.load()){
             // First trace ~2 s after the scene is reduced, then every ~15 s.
             if(g_trace.presents-g_trace.armed_at>=(g_trace.learned_pso.load()?900u:30u)){
