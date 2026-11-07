@@ -223,6 +223,7 @@ int main(int argc,char** argv)
     // at submission (late=1/N in the trace line), and DLSS still reaches the screen.
     const bool native_latebind=native_se5&&argc>1&&std::strstr(argv[1],"latebind")!=nullptr;
     const bool native_rotate=native_latebind&&std::strstr(argv[1],"rotate")!=nullptr;
+    const bool native_layout_change=native_latebind&&std::strstr(argv[1],"layout-change")!=nullptr;
     const bool native_inherited=native_latebind&&std::strstr(argv[1],"inherited")!=nullptr;
     const bool native_close_race=native_latebind&&std::strstr(argv[1],"close-race")!=nullptr;
     const bool nvrhi=argc>1&&std::strcmp(argv[1],"--nvrhi")==0;
@@ -422,6 +423,14 @@ int main(int argc,char** argv)
             na::settings::Get().j2_sharpness.store(0);
         }
         test::ComPtr<ID3D12DescriptorHeap> heap,cpu_heap;
+        test::ComPtr<ID3D12DescriptorHeap> late_rtvs;
+        D3D12_RENDER_TARGET_VIEW_DESC late_view{};
+        late_view.Format=view_format;late_view.ViewDimension=D3D12_RTV_DIMENSION_TEXTURE2D;
+        if(native_layout_change){
+            D3D12_DESCRIPTOR_HEAP_DESC rh{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,1,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
+            REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&rh,IID_PPV_ARGS(&late_rtvs))));
+            dev->CreateRenderTargetView(late.Get(),&late_view,late_rtvs->GetCPUDescriptorHandleForHeapStart());
+        }
         D3D12_DESCRIPTOR_HEAP_DESC hd_native{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,native_se5?16u:native_composite?7u:native_late?6u:2u,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
         REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd_native,IID_PPV_ARGS(&heap))));
         hd_native.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_NONE;REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd_native,IID_PPV_ARGS(&cpu_heap))));
@@ -696,12 +705,13 @@ int main(int argc,char** argv)
         };
         for(unsigned iteration=0;iteration<iterations;++iteration){
             d.WaitIdle();na::j2::OnPresent(d.queue.Get());
-            if(native_rotate && iteration==80){
-                CHECK(late_deliveries>0);
+            if((native_rotate && iteration==80) || (native_layout_change && (iteration==50 || iteration==80))){
+                if(iteration==80)CHECK(late_deliveries>0);
                 // A post-process input is replaced AFTER the route is learned,
                 // between periodic traces. Same shader, destination and extent;
                 // the late descriptor now names the current image, not its old id.
                 late=test::CreateTexture(dev,W,H,format,D3D12_RESOURCE_STATE_COMMON,flags);REQUIRE(late);
+                if(native_layout_change)dev->CreateRenderTargetView(late.Get(),&late_view,late_rtvs->GetCPUDescriptorHandleForHeapStart());
                 const auto descriptor_base=heap->GetCPUDescriptorHandleForHeapStart().ptr;
                 dev->CreateUnorderedAccessView(late.Get(),nullptr,&uv,{descriptor_base+3*increment});
                 for(unsigned at:{0u,4u,8u,11u})dev->CreateShaderResourceView(late.Get(),&sv,{descriptor_base+at*increment});
@@ -767,7 +777,16 @@ int main(int argc,char** argv)
                 target_list->SetComputeRootSignature(native_root.Get());
                 const auto base=heap->GetGPUDescriptorHandleForHeapStart().ptr;
                 if(native_late){
-                    auto write=test::Transition(late.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    if(native_layout_change){
+                        // Match the game's render-target-written post-process input.
+                        // Its identity changes while the learned upscale shader stays.
+                        auto rt=test::Transition(late.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_RENDER_TARGET);
+                        target_list->ResourceBarrier(1,&rt);
+                        auto h=late_rtvs->GetCPUDescriptorHandleForHeapStart();
+                        target_list->OMSetRenderTargets(1,&h,FALSE,nullptr);
+                        target_list->ClearRenderTargetView(h,grey_native,0,nullptr);
+                    }
+                    auto write=test::Transition(late.Get(),native_layout_change?D3D12_RESOURCE_STATE_RENDER_TARGET:D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                     target_list->ResourceBarrier(1,&write);
                     target_list->SetPipelineState(tonemap.Get());
                     target_list->SetComputeRootDescriptorTable(0,{base+2*increment});
@@ -807,7 +826,7 @@ int main(int argc,char** argv)
             // Later native HUD draw: green corner must survive reconstruction.
             D3D12_RESOURCE_BARRIER order{};order.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;order.UAV.pResource=native.Get();target_list->ResourceBarrier(1,&order);
             const float green[]{0,1,0,1};const D3D12_RECT hud_rect{0,0,4,4};
-            if(!native_se5 || native_tail)
+            if(!native_se5 || native_tail || (native_layout_change && iteration>=80))
                 target_list->ClearUnorderedAccessViewFloat(gpu_uav,cpu_heap->GetCPUDescriptorHandleForHeapStart(),native.Get(),green,1,&hud_rect);
             if(native_stale&&late_deliveries>=5&&!stale_from)stale_from=iteration;
             if(native_overwrite){
@@ -966,7 +985,8 @@ static uint64_t seen=0;char tr[2048];uint64_t n=0;na::j2::NativeTraceResult(tr,s
                 if(st.native_deliveries>late_deliveries&&native_replace){late_deliveries=unsigned(st.native_deliveries);continue;}
                 if(st.native_deliveries&&st.native_deliveries==late_deliveries)
                     std::printf("se5 iteration %u: no new delivery: j2 \"%s\" bridge \"%s\"\n",iteration,st.reason,na::j2::GetNativeBridgeStats().reason);
-                if(st.native_deliveries){
+                const bool learning_changed_input=native_layout_change && iteration>=80 && iteration<=84 && st.native_deliveries==late_deliveries;
+                if(st.native_deliveries && !learning_changed_input){
                     CHECK(!native_overwrite && !native_reverse && !native_tail);                    CHECK(st.native_deliveries==++late_deliveries);
                     // The evaluation's own pixels, through J2's normal write-back, the game's HUD,
                     // and the game's explicit UNORM -> FP16 conversion into the presented image.
@@ -982,7 +1002,7 @@ static uint64_t seen=0;char tr[2048];uint64_t n=0;na::j2::NativeTraceResult(tr,s
                     }
                 }else{
                     if(late_deliveries)std::printf("se5 iteration %u: no delivery: j2 \"%s\" bridge \"%s\"\n",iteration,st.reason,na::j2::GetNativeBridgeStats().reason);
-                    CHECK(fake::evals==before_native);
+                    CHECK(fake::evals==before_native+int(late_deliveries));
                     if((native_reverse || native_tail) && final_recorded){
                         const auto world=ReadTexel(d,presented.Get(),OW-1,OH-1);
                         const auto game=ReadTexel(d,native.Get(),OW-1,OH-1);
@@ -1075,7 +1095,11 @@ static uint64_t seen=0;char tr[2048];uint64_t n=0;na::j2::NativeTraceResult(tr,s
                             (unsigned long long)nl.st_late_changed,(unsigned long long)nl.st_late_same,(unsigned long long)nl.st_late_resolved,(unsigned long long)nl.st_late_inline);
                         // Every delivery came through a late-bound route: inline with the input chosen by
                         // this recording's writes, or staged and resolved at submission (never by a stale table).
-                        CHECK(nl.st_late_inline+nl.st_late_resolved>=late_deliveries && nl.st_late_same==0 && nl.st_late_changed==nl.st_late_staged);
+                        CHECK(nl.st_late_inline+nl.st_late_resolved>=late_deliveries && nl.st_late_same==0);
+                        if(native_layout_change){
+                            CHECK(nl.st_late_inline>0);
+                            CHECK(nl.st_late_changed<=nl.st_late_staged && nl.st_late_staged-nl.st_late_changed<=5);
+                        }else CHECK(nl.st_late_changed==nl.st_late_staged);
                     }
                     CHECK(g_pattern_writes>=int(late_deliveries));
                     // Deliveries on frames with the auxiliary input were counted.

@@ -500,6 +500,8 @@ struct TraceOp {
 };
 struct NativeTrace{
     std::mutex m;std::atomic<bool> armed{false};
+    std::atomic<bool> refresh_requested{false};
+    uint64_t refresh_at=0;
     uint32_t frames=0,untraced=0,traced_lists=0;uint64_t ops=0,traces=0,presents=0,armed_at=0;
     // 83b0749 run: presented=1963 never connected, untraced=1 every trace.
     // Which list that is: id/recording, list type, queue type, position among the frame's ops.
@@ -5429,8 +5431,13 @@ int record_deferred_native(ID3D12CommandQueue* queue, ID3D12CommandList* const* 
         if (work.frame!=g.frame || g.inl.valid || g.submitted_frame==g.frame ||
             !g_native_reduced.load(std::memory_order_relaxed) || queue!=g.queue.Get() || !g.dlss_ready)
             return skip("Quality's deferred upscale no longer owns this frame or queue.");
-        if (!na::observe::ListWorkTailUnchanged(lists[i]))
+        if (!na::observe::ListWorkTailUnchanged(lists[i])) {
+            // A formerly separate upscale can move ahead of HUD work, with a
+            // different post-process input. Refresh the existing observation
+            // now; waiting 900 presents leaves the old input list unusable.
+            g_trace.refresh_requested.store(true,std::memory_order_relaxed);
             return skip("Game work follows the upscale inside its recording; there is no list boundary for Quality.");
+        }
         uint64_t depth=0,color=0;
         na::observe::GetLiveSelection(&depth,&color);
         // The producer is chosen now, by actual order: a retained scene recording for this
@@ -7115,6 +7122,7 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
             if(g_trace.armed.load()){g_trace.armed.store(false);g_trace.recs.clear();g_trace.frame.clear();}
             g_trace.previous={};g_trace.learned={};g_trace.learned_inputs.clear();g_trace.learned_pso.store(0);
             g_trace.presents=g_trace.armed_at=0;
+            g_trace.refresh_at=0;g_trace.refresh_requested.store(false,std::memory_order_relaxed);
             return;
         }
         ++g_trace.presents;
@@ -7135,7 +7143,14 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
         }
         if(!g_trace.armed.load()){
             // First trace ~2 s after the scene is reduced, then every ~15 s.
-            if(g_trace.presents-g_trace.armed_at>=(g_trace.learned_pso.load()?g_trace.learned_interval:30u)){
+            // Actual layout failures request one immediate observation. A
+            // persistent unsupported layout gets at most one retry per120
+            // presents, rather than tracing every failed frame.
+            const bool refresh=g_trace.refresh_requested.load(std::memory_order_relaxed) &&
+                (!g_trace.refresh_at || g_trace.presents-g_trace.refresh_at>=120u);
+            if(refresh || g_trace.presents-g_trace.armed_at>=(g_trace.learned_pso.load()?g_trace.learned_interval:30u)){
+                if(refresh)g_trace.refresh_at=g_trace.presents;
+                g_trace.refresh_requested.store(false,std::memory_order_relaxed);
                 g_trace.recs.clear();g_trace.frame.clear();g_trace.frames=0;g_trace.untraced=g_trace.traced_lists=0;g_trace.ops=0;g_trace.untraced_lists.clear();
                 g_trace.late_ops=g_trace.late_tabled=0;
                 g_trace.armed_at=g_trace.presents;g_trace.armed.store(true);
@@ -7146,6 +7161,7 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
         if(++g_trace.frames==1){g_trace.frame.clear();g_trace.untraced=g_trace.traced_lists=0;g_trace.untraced_lists.clear();g_trace.late_ops=g_trace.late_tabled=0;return;}
         g_trace.result[0]=0;
         trace_analyze(queue,frame?uint64_t(na::observe::IdOf(frame)):0,sdr_present);
+        g_trace.refresh_requested.store(false,std::memory_order_relaxed);
         ++g_trace.traces;g_trace.armed.store(false);g_trace.recs.clear();g_trace.frame.clear();
         na::eventlog::Emit("native_trace","%s",g_trace.result);
     }catch(...){g_trace.armed.store(false);}
