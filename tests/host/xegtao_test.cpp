@@ -227,6 +227,7 @@ int main() {
                 auto motion=input(d,l,TW,TH,DXGI_FORMAT_R32G32_FLOAT,mv,2);
                 na::xegtao::Inputs in;in.color=color.texture.Get();in.depth=depth.texture.Get();in.width=TW;in.height=TH;
                 in.color_format=DXGI_FORMAT_R32G32B32A32_FLOAT;in.projection=projection(false);in.clear_depth=1;in.motion=motion.texture.Get();
+                in.frame=frame+1;in.motion_reference_frame=frame;
                 auto f=temporal.Prepare(d.device.Get(),d.queue.Get(),in,o);
                 if(!f&&first_box){NEED(temporal.WaitPrepared(30000));f=temporal.Prepare(d.device.Get(),d.queue.Get(),in,o);}
                 first_box=false;NEED(f);NEED(f->Record(l.list.Get()));auto rb=capture(d,l,f->Color());
@@ -251,8 +252,8 @@ int main() {
     // nothing; a discarded or reordered recording resets to this frame's AO.
     {
         constexpr unsigned TW=96,TH=64;
-        struct Pending{test::List l;Image color,depth,motion;Readback rb;bool ok=false;};
-        const auto scene=[&](na::xegtao::Pass& pass,const na::xegtao::Options& op,unsigned shift,bool record)->std::unique_ptr<Pending>{
+        struct Pending{test::List l;Image color,depth,motion;Readback rb;std::shared_ptr<na::xegtao::Frame> frame;bool ok=false;};
+        const auto scene=[&](na::xegtao::Pass& pass,const na::xegtao::Options& op,unsigned shift,bool record,uint64_t frame=0,uint64_t reference=0,uint64_t epoch=1)->std::unique_ptr<Pending>{
             auto r=std::make_unique<Pending>();if(!r->l.Create(d.device.Get()))return r;
             std::vector<float> c(size_t(TW)*TH*4,4.f),z(size_t(TW)*TH),mv(size_t(TW)*TH*2,0.f);
             for(unsigned y=0;y<TH;++y)for(unsigned x=0;x<TW;++x){
@@ -261,12 +262,14 @@ int main() {
             r->motion=input(d,r->l,TW,TH,DXGI_FORMAT_R32G32_FLOAT,mv,2);
             na::xegtao::Inputs in;in.color=r->color.texture.Get();in.depth=r->depth.texture.Get();in.width=TW;in.height=TH;
             in.color_format=DXGI_FORMAT_R32G32B32A32_FLOAT;in.projection=projection(false);in.clear_depth=1;in.motion=r->motion.texture.Get();
+            in.frame=frame?frame:shift+1;in.motion_reference_frame=reference?reference:shift;in.scene_epoch=epoch;
             auto f=pass.Prepare(d.device.Get(),d.queue.Get(),in,op);
             if(!f&&pass.WaitPrepared(30000))f=pass.Prepare(d.device.Get(),d.queue.Get(),in,op);
             if(!f)return r;
             if(!record){r->ok=true;return r;}
             if(!f->Record(r->l.list.Get()))return r;
-            r->rb=capture(d,r->l,f->Color());r->ok=SUCCEEDED(r->l.list->Close());return r;
+            r->rb=capture(d,r->l,f->Color());r->frame=std::move(f);
+            r->ok=SUCCEEDED(r->l.list->Close());return r;
         };
         const auto execute=[&](Pending& p){ID3D12CommandList* lists[]={p.l.list.Get()};d.queue->ExecuteCommandLists(1,lists);d.WaitIdle();return pixels(p.rb);};
         const auto difference=[](const std::vector<float>& a,const std::vector<float>& b){
@@ -291,6 +294,19 @@ int main() {
         {auto a=scene(history,keep,0,true);REQUIRE(a->ok);auto b=scene(history,keep,1,true);REQUIRE(b->ok);
          const auto out=execute(*b);execute(*a);
          std::printf("XeGTAO history executed out of order vs plain: %.5f\n",difference(out,plain));CHECK(difference(out,plain)<.01f);}
+        // Executed history can still belong to the wrong motion reference.
+        {auto a=scene(history,keep,0,true,10);REQUIRE(a->ok);execute(*a);
+         auto b=scene(history,keep,1,true,12,11);REQUIRE(b->ok);
+         const auto out=execute(*b);
+         std::printf("XeGTAO wrong reference vs plain: %.5f\n",difference(out,plain));
+         CHECK(difference(out,plain)<.01f);}
+        // A gap is safe when motion explicitly spans it and the history did execute.
+        {auto a=scene(history,keep,0,true,20);REQUIRE(a->ok);execute(*a);
+         auto b=scene(history,keep,1,true,22,20);REQUIRE(b->ok);
+         CHECK(difference(execute(*b),plain)>.01f);}
+        {auto a=scene(history,keep,0,true,30);REQUIRE(a->ok);execute(*a);
+         auto b=scene(history,keep,1,true,31,30,2);REQUIRE(b->ok);
+         CHECK(difference(execute(*b),plain)<.01f);}
         CHECK(d.device->GetDeviceRemovedReason()==S_OK);
     }
     CHECK(pass.GetStats().recorded==3);
