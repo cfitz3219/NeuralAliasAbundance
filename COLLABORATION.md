@@ -1,5 +1,17 @@
 # Collaboration agreement — NeuralAlias / NeuralAliasAbundance
 
+## 2026-11-07 — Five standing rules from Fable 5.1's Sniper discovery
+
+Cort explicitly requests these lessons be retained for Astra and Opus/Claude. Credit Fable 5.1 for the native-upscale/late-binding discovery and placement work; Astra's subsequent saved-pixel checks verified the inspected HUD elements. These are implementation priorities, not another approval or review gate.
+
+1. **Trace the picture that reaches the screen before inventing a replacement system.** Work backward from the actual presented image through its contributing operations. Look first for the game's existing scene-upscale and UI-composition boundaries, and reuse them. A same-sized texture, familiar shader or successful DLSS evaluation is not proof that its output reaches the screen. Use existing captures first.
+2. **Use the bindings and ordering the GPU will actually execute.** Recording-time descriptor contents can be placeholders; resolve late-written tables at submission when needed, preserve recording/resource identity and lifetimes, and accommodate rotating input images and different list layouts. An incomplete early snapshot is an acquisition problem, not proof that the game lacks a usable pass. Reuse our existing observation and submission machinery.
+3. **Preserve the game's native HUD by placing scene processing before it.** Where the game upscales the scene and then draws its UI, run DLSS and RCAS at that scene boundary and leave the later UI draws intact. Try this before masks, extraction, replay or unblending. Use those alternatives only when evidence shows the HUD is already mixed into the earlier image. A toggle must change a real, clearly described behavior; do not add a switch that does nothing on the active route.
+4. **Generalize the rendering relationship, not Sniper's identifiers.** Learn the current scene input, upscale output, subsequent composition and screen dependency; never turn process-local shader/resource numbers into compatibility rules. Keep engine-specific resolution control in adapters, separate from shared insertion/HUD preservation. Verify each responsibility separately: making the scene smaller is not proof DLSS reconstructs it, and a native HUD boundary does not provide another game's resolution control.
+5. **Verify visible pixels before declaring a visual feature solved.** Compare matched scene input, DLSS output and final presentation, inspect actual text/icons, and account for where RCAS and each capture occur. Check detail across available quality/sharpening comparisons; counters and full-size viewports alone cannot prove sharp HUD preservation. State which elements/settings the evidence covers without demanding exhaustive new tests. Distinguish the game's HUD from NVIDIA's diagnostic text, which may already be inside DLSS output.
+
+Evidence: `docs/SE5-HUD-PIXEL-VERIFICATION-20261107.md` at commit `8197570` on `astra/se5-dlaa-boundary`; saved local analysis under `local/se5-hud-pixels-20261107/`. Verified inspected ammunition/icons/minimap/aiming marker and menu text, not every possible UI state or universal game compatibility. Preserve this qualification when carrying the lesson forward.
+
 ## 2026-10-25 — Cort's executive override: 90/10 command split (supersedes the Route A / Route B ownership boundary)
 
 Source: Cort, with Argon ("Master Reality Check, 90/10 Opus Takeover", 2026-10-25). Effective immediately:
