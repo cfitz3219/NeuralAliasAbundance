@@ -36,13 +36,13 @@ struct DepthWindow {
         return n;
     }
     // Most frequent nonzero entry; ties go to the most recent.
-    uint64_t Leader(size_t* n_out) const {
+    uint64_t Leader(size_t* n_out, uint64_t excluded=0) const {
         std::map<uint64_t, size_t> n;
-        for (size_t i = 0; i < count; ++i) if (top[i]) ++n[top[i]];
+        for (size_t i = 0; i < count; ++i) if (top[i] && top[i] != excluded) ++n[top[i]];
         uint64_t best = 0; size_t best_n = 0;
         for (size_t k = 0; k < count; ++k) {
             const size_t i = (next + kFrames - 1 - k) % kFrames; // newest first
-            if (!top[i]) continue;
+            if (!top[i] || top[i] == excluded) continue;
             const size_t c = n[top[i]];
             if (c > best_n) { best = top[i]; best_n = c; }
         }
@@ -79,10 +79,16 @@ struct DepthPick {
         leader = w.Leader(&leader_n);
         current_n = depth ? w.Count(depth) : 0;
         if (depth && !current_alive) {
+            const uint64_t retired = depth;
             depth = 0;
             challenger = 0; challenger_streak = absent_streak = 0;
-            // The replacement (the resized scene) may already lead: adopt it now.
-            if (leader && leader_n * 2 >= frames && leader_n >= 2) depth = leader;
+            // Old votes cannot keep a destroyed texture selected or delay
+            // an established replacement. Empty observations still count.
+            leader = w.Leader(&leader_n, retired);
+            const bool majority = leader_n >= 2 && leader_n * 2 >= frames;
+            const bool recent_replacement = leader_n >= 4 && leader_n * 2 >= frames - current_n &&
+                w.top[(w.next + DepthWindow::kFrames - 1) % DepthWindow::kFrames] == leader;
+            if (leader && (majority || recent_replacement)) depth = leader;
             return last = PickReason::retired;
         }
         if (!depth) {

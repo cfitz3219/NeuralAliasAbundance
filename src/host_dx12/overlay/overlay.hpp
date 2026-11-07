@@ -63,6 +63,7 @@ uint64_t PresentsSinceLastEvaluate();
 
 struct Stats {
     uint64_t frames_rendered;
+    uint64_t menu_busy_skips;
     uint64_t presents_seen;
     uint32_t initialized;
     uint32_t core_ready, menu_enabled;
