@@ -111,6 +111,7 @@ struct Scratch {
     // Advanced at Record (never Prepare), under the mutex: recordings of one
     // queue may be recorded on several threads.
     std::mutex history_m;unsigned next=0;uint32_t last_stamp=0,serial=0;float last_jitter[2]{};
+    uint64_t last_frame=0,last_scene_epoch=0;
     bool nvrhi=false;
     ComPtr<ID3D12CommandQueue> queue; // absent => this scratch belongs to only one recording
     uint32_t w=0,h=0;DXGI_FORMAT format=DXGI_FORMAT_UNKNOWN;
@@ -140,6 +141,8 @@ struct Frame::Work {
     bool copy_depth=false;
     unsigned denoise=1;
     bool temporal=false,reset=false;float keep=0,jitter[2]{};
+    uint64_t frame=0,motion_reference_frame=0,scene_epoch=0;
+    ID3D12Resource* composited_visibility=nullptr; // owned by scratch
     ComPtr<ID3D12Resource> input_motion;ID3D12Resource* bound_motion=nullptr;ID3D12Resource* bound_history=nullptr;
     DXGI_FORMAT motion_format=DXGI_FORMAT_UNKNOWN;
     Constants constants;
@@ -173,6 +176,7 @@ Pass::Pass():state_(std::make_unique<State>()){}
 Pass::~Pass()=default;
 ID3D12Resource* Frame::Color()const{return work_->scratch->encoded?work_->scratch->encoded.Get():work_->scratch->color.Get();}
 ID3D12Resource* Frame::Occlusion()const{return work_->denoise==2?work_->scratch->ao.Get():work_->scratch->filtered.Get();}
+ID3D12Resource* Frame::CompositedVisibility()const{return work_->composited_visibility;}
 ID3D12Resource* Frame::ViewDepthForTests()const{return work_->scratch->pyramid.Get();}
 ID3D12Resource* Frame::NormalsForTests()const{return work_->scratch->normals.Get();}
 
@@ -242,6 +246,7 @@ std::shared_ptr<Frame> Pass::Prepare(ID3D12Device* dev,ID3D12CommandQueue* queue
         if(shared)s.scratch=scratch;
     }
     w.scratch=scratch;w.input_color=in.color;w.input_depth=in.depth;
+    w.composited_visibility=nullptr;
     w.copy_depth=in.copy_depth;w.depth_state=in.depth_state;
     if(in.copy_depth){
         auto dd=in.depth->GetDesc();
@@ -292,6 +297,7 @@ std::shared_ptr<Frame> Pass::Prepare(ID3D12Device* dev,ID3D12CommandQueue* queue
     }
     const float keep=std::isfinite(options.temporal)?std::clamp(options.temporal,0.f,.95f):0.f;
     w.temporal=shared&&motion_format!=DXGI_FORMAT_UNKNOWN&&keep>0;w.keep=keep;w.reset=in.reset;
+    w.frame=in.frame;w.motion_reference_frame=in.motion_reference_frame;w.scene_epoch=in.scene_epoch;
     w.jitter[0]=in.jitter_x;w.jitter[1]=in.jitter_y;
     w.input_motion=w.temporal?in.motion:nullptr;w.motion_format=w.temporal?motion_format:DXGI_FORMAT_UNKNOWN;
     if(w.temporal&&!scratch->history[0]){
@@ -379,13 +385,21 @@ bool Frame::Record(ID3D12GraphicsCommandList* l) {
         {   std::lock_guard<std::mutex> lock(s.history_m);
             auto& c=w.constants;parity=s.next;s.next^=1u;
             const uint32_t stamp=++s.serial?s.serial:++s.serial; // 0 = never written
-            c.expected_stamp=w.reset?0u:s.last_stamp;c.own_stamp=stamp;c.stamp_read=parity^1u;c.stamp_write=parity;
-            c.temporal_blend=w.reset||!s.last_stamp?1.f:1.f-w.keep;
+            // The GPU stamp proves execution, while these identities prove
+            // that motion actually points to the image the stamp represents.
+            const bool matches_reference=w.motion_reference_frame &&
+                w.motion_reference_frame<w.frame && s.last_frame==w.motion_reference_frame &&
+                s.last_scene_epoch==w.scene_epoch;
+            c.expected_stamp=!w.reset&&matches_reference?s.last_stamp:0u;
+            c.own_stamp=stamp;c.stamp_read=parity^1u;c.stamp_write=parity;
+            c.temporal_blend=c.expected_stamp?1.f-w.keep:1.f;
+            s.last_frame=w.frame;s.last_scene_epoch=w.scene_epoch;
             c.jitter_delta[0]=s.last_jitter[0]-w.jitter[0];c.jitter_delta[1]=s.last_jitter[1]-w.jitter[1];
             s.last_stamp=stamp;s.last_jitter[0]=w.jitter[0];s.last_jitter[1]=w.jitter[1];
         }
         l->SetComputeRoot32BitConstants(0,sizeof(Constants)/4,&w.constants,0);
         auto* h=s.history[parity].Get();auto* hd=s.history_depth[parity].Get();
+        w.composited_visibility=h;
         move(l,h,Read,Write);move(l,hd,Read,Write);move(l,s.stamp.Get(),Read,Write);dispatch(kTemporal[parity],gx,gy);
         move(l,h,Write,Read);move(l,hd,Write,Read);move(l,s.stamp.Get(),Write,Read);
         move(l,s.color.Get(),Read,Write);dispatch(kCompose[parity],gx,gy);move(l,s.color.Get(),Write,Read);
@@ -393,6 +407,7 @@ bool Frame::Record(ID3D12GraphicsCommandList* l) {
         // A frame without history breaks the chain: a later frame must not
         // pick up the history of a frame from before this one.
         if(s.stamp){std::lock_guard<std::mutex> lock(s.history_m);s.last_stamp=0;}
+        w.composited_visibility=Occlusion();
         move(l,s.color.Get(),Read,Write);dispatch(kComposeDirect,gx,gy);move(l,s.color.Get(),Write,Read);
     }
     if(s.encoded){

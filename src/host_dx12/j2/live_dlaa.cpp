@@ -3983,7 +3983,11 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         ai.color_format=typed(cf);ai.clear_depth=reversed?0.f:1.f;
         ai.jitter_x=static_cast<float>(cam.jitter_px_x);ai.jitter_y=static_cast<float>(cam.jitter_px_y);
         // Temporal AO (edge shimmer while panning): the same motion DLSS gets.
-        ai.motion=g.motion.Get();ai.reset=cam.camera_cut||resize||g.resume_reset;
+        ai.motion=g.motion.Get();
+        ai.frame=g.frame;
+        ai.motion_reference_frame=g.submitted_frame;
+        ai.scene_epoch=pending.selection_version;
+        ai.reset=tracker_restart||cam.camera_cut||resize||!same_epoch;
         const auto column=na::camera::TransposeMatrix(cam.view_proj_current_row);
         if(na::xegtao::FromViewProjection(column.data(),ai.projection))
             ambient=na::xegtao::ScenePass().Prepare(g.device.Get(),g.queue.Get(),ai,na::xegtao::CurrentOptions());
@@ -4109,6 +4113,13 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         cp.depth = g.depth32.Get();
         cp.motion = g.motion.Get();
         cp.output = g.output.Get();
+        if (ambient) {
+            auto* spatial = ambient->Occlusion();
+            cp.extra[cp.extra_count++] = {"ao_spatial", spatial};
+            auto* resolved = ambient->CompositedVisibility();
+            if (resolved && resolved != spatial)
+                cp.extra[cp.extra_count++] = {"ao_temporal", resolved};
+        }
         na::capture::j2::Identity ci;
         ci.present_ordinal = g.frame;
         ci.submission = g.stats.submissions;

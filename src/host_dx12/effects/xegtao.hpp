@@ -30,6 +30,9 @@ struct Inputs {
     // NON_PIXEL_SHADER_RESOURCE, same extent as width x height). Without it
     // the shading is computed from this frame alone, as before.
     ID3D12Resource* motion=nullptr;
+    // Motion maps this frame to motion_reference_frame, which can be older
+    // than the last recorded AO when a scene pass or evaluation was skipped.
+    uint64_t frame=0,motion_reference_frame=0,scene_epoch=0;
     bool reset=false; // camera cut / resize: start the history again
     bool preserve_color_extent=false; // native NGX keeps its original subrect origins
     // Native depth may forbid SRVs. Copy its compatible single-mip surface,
@@ -48,7 +51,8 @@ public:
     ~Frame();
     bool Record(ID3D12GraphicsCommandList*);
     ID3D12Resource* Color() const;
-    ID3D12Resource* Occlusion() const;
+    ID3D12Resource* Occlusion() const; // spatially denoised, before history
+    ID3D12Resource* CompositedVisibility() const; // after Record, read before the next AO pass
     ID3D12Resource* ViewDepthForTests() const;
     ID3D12Resource* NormalsForTests() const;
 private:
