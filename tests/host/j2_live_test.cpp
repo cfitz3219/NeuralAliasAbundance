@@ -168,10 +168,27 @@ ID3D12Device* g_pattern_dev = nullptr;
 test::ComPtr<ID3D12DescriptorHeap> g_pattern_gpu, g_pattern_cpu;
 float g_pattern[4] = {0, 0, 0, 1};
 int g_pattern_writes = 0;
+bool g_verify_input=false;
+test::ComPtr<ID3D12Resource> g_input_probe;
+D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_input_footprint{};
 void WritePattern(ID3D12GraphicsCommandList* l, const std::map<std::string, test::FakeParams::Value>& params)
 {
     auto* out = static_cast<ID3D12Resource*>(fake::P(params, NVSDK_NGX_Parameter_Output));
     if (!out || !g_pattern_dev) return;
+    if(g_verify_input){
+        // Test-only readback of the texel ACTUALLY supplied to NGX. Completion
+        // and mapping happen in the fixture after submission, never in J2.
+        auto* in=static_cast<ID3D12Resource*>(fake::P(params,NVSDK_NGX_Parameter_Color));
+        const auto desc=in->GetDesc();UINT64 bytes=0;
+        g_pattern_dev->GetCopyableFootprints(&desc,0,1,0,&g_input_footprint,nullptr,nullptr,&bytes);
+        if(!g_input_probe)g_input_probe=test::CreateBuffer(g_pattern_dev,bytes,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
+        auto b=test::Transition(in,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_SOURCE);
+        l->ResourceBarrier(1,&b);
+        D3D12_TEXTURE_COPY_LOCATION src{};src.pResource=in;src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        D3D12_TEXTURE_COPY_LOCATION dst{};dst.pResource=g_input_probe.Get();dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;dst.PlacedFootprint=g_input_footprint;
+        const D3D12_BOX pixel{0,0,0,1,1,1};l->CopyTextureRegion(&dst,0,0,0,&src,&pixel);
+        std::swap(b.Transition.StateBefore,b.Transition.StateAfter);l->ResourceBarrier(1,&b);
+    }
     if (!g_pattern_gpu) {
         D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         if (FAILED(g_pattern_dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_pattern_gpu)))) return;
@@ -427,10 +444,11 @@ int main(int argc,char** argv)
         }
         test::ComPtr<ID3D12DescriptorHeap> heap,cpu_heap;
         test::ComPtr<ID3D12DescriptorHeap> late_rtvs;
+        test::ComPtr<ID3D12Resource> alternate_late;
         D3D12_RENDER_TARGET_VIEW_DESC late_view{};
         late_view.Format=view_format;late_view.ViewDimension=D3D12_RTV_DIMENSION_TEXTURE2D;
         if(native_layout_change){
-            D3D12_DESCRIPTOR_HEAP_DESC rh{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,1,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
+            D3D12_DESCRIPTOR_HEAP_DESC rh{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,2,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
             REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&rh,IID_PPV_ARGS(&late_rtvs))));
             dev->CreateRenderTargetView(late.Get(),&late_view,late_rtvs->GetCPUDescriptorHandleForHeapStart());
         }
@@ -679,7 +697,8 @@ int main(int argc,char** argv)
         test::List post;REQUIRE(post.Create(dev));REQUIRE(SUCCEEDED(post.list->Close()));
         na::j2::SetNativeRenderExtent(W,H,OW,OH);na::j2::SetDebugView(native_se5?0:3); // 3: known black depth output, alpha1; SE5: the normal output
         const int before_native=fake::evals;
-        const unsigned iterations=native_se5?100u:native_late?68u:3u;
+        const unsigned iterations=native_layout_change?140u:native_se5?100u:native_late?68u:3u;
+        if(native_layout_change){na::j2::SetNativeTraceIntervalForTests(8);g_verify_input=true;}
         if(native_se5&&!native_bindless&&!native_unseen)na::j2::RequestDeliveryProbe();
         unsigned late_deliveries=0;
         const auto inherited_depth_state=[&](bool enter){
@@ -708,13 +727,19 @@ int main(int argc,char** argv)
         };
         for(unsigned iteration=0;iteration<iterations;++iteration){
             d.WaitIdle();na::j2::OnPresent(d.queue.Get());
-            if((native_rotate && iteration==80) || (native_layout_change && (iteration==50 || iteration==80))){
+            const bool merged_reader=native_layout_change&&iteration>=90&&iteration<120;
+            if((native_rotate && iteration==80) || (native_layout_change && (iteration==50 || iteration>=80))){
                 if(iteration==80)CHECK(late_deliveries>0);
                 // A post-process input is replaced AFTER the route is learned,
                 // between periodic traces. Same shader, destination and extent;
                 // the late descriptor now names the current image, not its old id.
-                late=test::CreateTexture(dev,W,H,format,D3D12_RESOURCE_STATE_COMMON,flags);REQUIRE(late);
-                if(native_layout_change)dev->CreateRenderTargetView(late.Get(),&late_view,late_rtvs->GetCPUDescriptorHandleForHeapStart());
+                if(native_layout_change&&iteration>80)std::swap(late,alternate_late);
+                else{alternate_late=late;late=test::CreateTexture(dev,W,H,format,D3D12_RESOURCE_STATE_COMMON,flags);REQUIRE(late);}
+                if(native_layout_change){
+                    const auto h=late_rtvs->GetCPUDescriptorHandleForHeapStart();
+                    dev->CreateRenderTargetView(late.Get(),&late_view,h);
+                    dev->CreateRenderTargetView(alternate_late.Get(),&late_view,{h.ptr+dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)});
+                }
                 const auto descriptor_base=heap->GetCPUDescriptorHandleForHeapStart().ptr;
                 dev->CreateUnorderedAccessView(late.Get(),nullptr,&uv,{descriptor_base+3*increment});
                 for(unsigned at:{0u,4u,8u,11u})dev->CreateShaderResourceView(late.Get(),&sv,{descriptor_base+at*increment});
@@ -784,6 +809,17 @@ int main(int argc,char** argv)
                 const auto base=heap->GetGPUDescriptorHandleForHeapStart().ptr;
                 if(native_late){
                     if(native_layout_change){
+                        if(iteration>=80){
+                            // Both learned ping-pong images have writes. The
+                            // earlier one is BLUE, so choosing it is detectable
+                            // independently of the fake reconstruction marker.
+                            auto b=test::Transition(alternate_late.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_RENDER_TARGET);
+                            target_list->ResourceBarrier(1,&b);
+                            auto h=late_rtvs->GetCPUDescriptorHandleForHeapStart();h.ptr+=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+                            target_list->OMSetRenderTargets(1,&h,FALSE,nullptr);
+                            const float blue[]{0,0,1,1};target_list->ClearRenderTargetView(h,blue,0,nullptr);
+                            std::swap(b.Transition.StateBefore,b.Transition.StateAfter);target_list->ResourceBarrier(1,&b);
+                        }
                         // Match the game's render-target-written post-process input.
                         // Its identity changes while the learned upscale shader stays.
                         auto rt=test::Transition(late.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -826,13 +862,14 @@ int main(int argc,char** argv)
                     target_list->SetComputeRootSignature(se5_root.Get());
                     target_list->SetPipelineState(se5_upscale.Get());
                     target_list->SetComputeRootDescriptorTable(0,{base+(iteration%2?10u:7u)*increment});
+                    if(native_layout_change&&iteration>=120)target_list->OMSetRenderTargets(0,nullptr,FALSE,nullptr);
                 }else target_list->SetComputeRootDescriptorTable(0,{base});
                 if(!native_session)target_list->Dispatch(12,6,1);
             }
             // Later native HUD draw: green corner must survive reconstruction.
             D3D12_RESOURCE_BARRIER order{};order.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;order.UAV.pResource=native.Get();target_list->ResourceBarrier(1,&order);
             const float green[]{0,1,0,1};const D3D12_RECT hud_rect{0,0,4,4};
-            if(!native_se5 || native_tail || (native_layout_change && iteration>=80))
+            if(!native_se5 || native_tail || (native_layout_change && iteration>=80&&iteration<120))
                 target_list->ClearUnorderedAccessViewFloat(gpu_uav,cpu_heap->GetCPUDescriptorHandleForHeapStart(),native.Get(),green,1,&hud_rect);
             if(native_stale&&late_deliveries>=5&&!stale_from)stale_from=iteration;
             if(native_overwrite){
@@ -849,6 +886,20 @@ int main(int argc,char** argv)
                 auto end_late=test::Transition(late.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
                 target_list->ResourceBarrier(1,&end_late);
                 target_list->ResourceBarrier(2,end_native);
+                if(merged_reader){
+                    // The SAME screen conversion moves into this recording,
+                    // then back to its original separate list at iteration120.
+                    D3D12_RESOURCE_BARRIER b[]{test::Transition(native.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+                        test::Transition(presented.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_RENDER_TARGET)};
+                    target_list->ResourceBarrier(2,b);
+                    ID3D12DescriptorHeap* hh[]{heap.Get()};target_list->SetDescriptorHeaps(1,hh);
+                    target_list->SetGraphicsRootSignature(composite_root.Get());target_list->SetPipelineState(composite.Get());
+                    auto rt=composite_rtv->GetCPUDescriptorHandleForHeapStart();target_list->OMSetRenderTargets(1,&rt,FALSE,nullptr);
+                    const D3D12_VIEWPORT vp{0,0,float(OW),float(OH),0,1};const D3D12_RECT sc{0,0,LONG(OW),LONG(OH)};
+                    target_list->RSSetViewports(1,&vp);target_list->RSSetScissorRects(1,&sc);target_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    target_list->SetGraphicsRootDescriptorTable(0,{heap->GetGPUDescriptorHandleForHeapStart().ptr+6*increment});target_list->DrawInstanced(3,1,0,0);
+                    for(auto& x:b)std::swap(x.Transition.StateBefore,x.Transition.StateAfter);target_list->ResourceBarrier(2,b);
+                }
             }else if(native_late){
                 const auto native_read=native_composite?D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE:D3D12_RESOURCE_STATE_COPY_SOURCE;
                 const auto present_write=native_composite?D3D12_RESOURCE_STATE_RENDER_TARGET:D3D12_RESOURCE_STATE_COPY_DEST;
@@ -916,7 +967,7 @@ int main(int argc,char** argv)
                 }
             }else if(!native_merged&&(native_late||iteration==2))na::j2::Execute(d.queue.Get(),1,native_lists+1,&Forward);            else na::j2::Execute(d.queue.Get(),native_merged?1u:2u,native_lists,&Forward);
             d.WaitIdle();
-            if(native_se5&&iteration>=1){
+            if(native_se5&&iteration>=1&&!merged_reader){
                 if(!final_recorded){
                     // Recorded once, after the first Present (the presented buffer is
                     // known) and long before any trace window; executed every frame.
@@ -999,6 +1050,15 @@ static uint64_t seen=0;char tr[2048];uint64_t n=0;na::j2::NativeTraceResult(tr,s
                     const auto q=[](float v){return std::round(v*255.f)/255.f;};
                     const auto world=ReadTexel(d,presented.Get(),OW-1,OH-1),hud=ReadTexel(d,presented.Get(),1,1);
                     const auto game=ReadTexel(d,native.Get(),OW-1,OH-1);
+                    if(native_layout_change){
+                        if(iteration>=80&&iteration<120)CHECK(hud[0]<.001f&&hud[1]>.999f&&hud[2]<.001f);
+                        void* bytes=nullptr;D3D12_RANGE range{0,8};REQUIRE(SUCCEEDED(g_input_probe->Map(0,&range,&bytes)));
+                        const auto* p=static_cast<const uint8_t*>(bytes);
+                        const float red=g_input_footprint.Footprint.Format==DXGI_FORMAT_R16G16B16A16_FLOAT?Half(reinterpret_cast<const uint16_t*>(p)[0]):float(p[0])/255.f;
+                        const float green_input=g_input_footprint.Footprint.Format==DXGI_FORMAT_R16G16B16A16_FLOAT?Half(reinterpret_cast<const uint16_t*>(p)[1]):float(p[1])/255.f;
+                        D3D12_RANGE none{0,0};g_input_probe->Unmap(0,&none);
+                        CHECK(red>.2f&&green_input>.2f&&std::fabs(red-green_input)<.02f);
+                    }
                     std::printf("se5 iteration %u: pattern %.3f %.3f %.3f native %.3f %.3f %.3f presented %.4f %.4f %.4f hud %.2f %.2f %.2f aux %s\n",iteration,
                         g_pattern[0],g_pattern[1],g_pattern[2],game[0],game[1],game[2],world[0],world[1],world[2],hud[0],hud[1],hud[2],iteration%2?"no":"yes");
                     (void)q;

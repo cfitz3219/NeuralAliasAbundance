@@ -113,3 +113,37 @@ The negative control changed only producer selection back to the older function
 frames missed, with 86 total assertions including image checks. Repaired code was
 restored before the complete build and broad run, which passed that test. The
 counterexample did not ship in a package or run in the game.
+
+## Follow-up: both rotating inputs were written
+
+The f169c14 final-ordering candidate passed CI and automated qualification, but
+own live p43424 exposed another failure: Quality delivered2282 continuous menu
+frames and900 gameplay frames, then periodic tracing remembered both alternating
+post-process images. The old inline rule required exactly one known input to
+have writes, so it stopped after both became known. Final397 gate drops comprise
+357 tail-boundary refusals and40 handoff-change refusals (including the menu
+navigation). NGX, resource-state and submission-order failures remained zero.
+NativeDLAA subsequently delivered4223 settled frames; one boundary change at the
+final pause remains separately counted. Results084203 retain the failed candidate.
+
+The next repair learns whether the execution-resolved consumer input is the
+render target still bound at that operation, requiring two matching traces.
+That observed handoff identifies the current final image independently of how
+many earlier ping-pong images were written. New variants enter the existing
+bounded cache. Logical step identity no longer includes the presenting reader's
+list partition; the actual current tail check still forbids a splice after HUD.
+Existing dimensions, formats, exact states and producer qualification remain.
+This is an observed rendering relationship, not a Sniper pipeline-id rule.
+
+The expanded layout regression writes both alternating inputs, makes the wrong
+one blue, moves the actual screen converter into and out of the recording and
+later removes the RTV binding to exercise the deferred path. It verifies a
+readback of the actual NGX input texel as well as the final reconstructed marker.
+The first repaired test caught a cache omission; fixed without weakening the
+assertions. Final test passed2.31s; restoring only the prior runtime fails196
+assertions. Test-only readbacks are not runtime instrumentation. Final affected
+suite and new live qualification follow separately.
+
+Microsoft's [non-shader-visible descriptor documentation](https://learn.microsoft.com/en-us/windows/win32/direct3d12/non-shader-visible-descriptor-heaps) confirms that RTV/DSV bindings are recorded into the command list at bind time. This supports reading our recorded RTV state despite the later SRV-table rewrite. It does not itself prove that every game's upscale reads that target; the two execution-resolved observations establish that relationship in the active route.
+
+Handoff repair automated receipt:93passed,3unsupported-MSAA16skipped,0failed across96cases (252.77s). Final native-HUD pixel assertion also passes after rebuild (layout case2.33s). This is fake-model GPU routing evidence; next actual game run is still required.
