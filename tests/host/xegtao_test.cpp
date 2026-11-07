@@ -230,7 +230,10 @@ int main() {
                 in.frame=frame+1;in.motion_reference_frame=frame;
                 auto f=temporal.Prepare(d.device.Get(),d.queue.Get(),in,o);
                 if(!f&&first_box){NEED(temporal.WaitPrepared(30000));f=temporal.Prepare(d.device.Get(),d.queue.Get(),in,o);}
-                first_box=false;NEED(f);NEED(f->Record(l.list.Get()));auto rb=capture(d,l,f->Color());
+                first_box=false;NEED(f);NEED(f->Record(l.list.Get()));
+                NEED(f->CompositedVisibility());
+                NEED((f->CompositedVisibility()!=f->Occlusion())==(keep>0));
+                auto rb=capture(d,l,f->Color());
                 NEED(SUCCEEDED(l.list->Close()));ID3D12CommandList* lists[]={l.list.Get()};d.queue->ExecuteCommandLists(1,lists);d.WaitIdle();
                 auto out=pixels(rb);NEED(out.size()==size_t(TW)*TH*4);
                 if(frame>=6&&!previous.empty())for(unsigned y=16;y<50;++y)for(unsigned x=24;x<60;++x){

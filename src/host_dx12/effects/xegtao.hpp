@@ -51,7 +51,8 @@ public:
     ~Frame();
     bool Record(ID3D12GraphicsCommandList*);
     ID3D12Resource* Color() const;
-    ID3D12Resource* Occlusion() const;
+    ID3D12Resource* Occlusion() const; // spatially denoised, before history
+    ID3D12Resource* CompositedVisibility() const; // after Record, read before the next AO pass
     ID3D12Resource* ViewDepthForTests() const;
     ID3D12Resource* NormalsForTests() const;
 private:

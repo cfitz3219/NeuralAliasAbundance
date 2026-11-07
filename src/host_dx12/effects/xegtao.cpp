@@ -142,6 +142,7 @@ struct Frame::Work {
     unsigned denoise=1;
     bool temporal=false,reset=false;float keep=0,jitter[2]{};
     uint64_t frame=0,motion_reference_frame=0,scene_epoch=0;
+    ID3D12Resource* composited_visibility=nullptr; // owned by scratch
     ComPtr<ID3D12Resource> input_motion;ID3D12Resource* bound_motion=nullptr;ID3D12Resource* bound_history=nullptr;
     DXGI_FORMAT motion_format=DXGI_FORMAT_UNKNOWN;
     Constants constants;
@@ -175,6 +176,7 @@ Pass::Pass():state_(std::make_unique<State>()){}
 Pass::~Pass()=default;
 ID3D12Resource* Frame::Color()const{return work_->scratch->encoded?work_->scratch->encoded.Get():work_->scratch->color.Get();}
 ID3D12Resource* Frame::Occlusion()const{return work_->denoise==2?work_->scratch->ao.Get():work_->scratch->filtered.Get();}
+ID3D12Resource* Frame::CompositedVisibility()const{return work_->composited_visibility;}
 ID3D12Resource* Frame::ViewDepthForTests()const{return work_->scratch->pyramid.Get();}
 ID3D12Resource* Frame::NormalsForTests()const{return work_->scratch->normals.Get();}
 
@@ -244,6 +246,7 @@ std::shared_ptr<Frame> Pass::Prepare(ID3D12Device* dev,ID3D12CommandQueue* queue
         if(shared)s.scratch=scratch;
     }
     w.scratch=scratch;w.input_color=in.color;w.input_depth=in.depth;
+    w.composited_visibility=nullptr;
     w.copy_depth=in.copy_depth;w.depth_state=in.depth_state;
     if(in.copy_depth){
         auto dd=in.depth->GetDesc();
@@ -396,6 +399,7 @@ bool Frame::Record(ID3D12GraphicsCommandList* l) {
         }
         l->SetComputeRoot32BitConstants(0,sizeof(Constants)/4,&w.constants,0);
         auto* h=s.history[parity].Get();auto* hd=s.history_depth[parity].Get();
+        w.composited_visibility=h;
         move(l,h,Read,Write);move(l,hd,Read,Write);move(l,s.stamp.Get(),Read,Write);dispatch(kTemporal[parity],gx,gy);
         move(l,h,Write,Read);move(l,hd,Write,Read);move(l,s.stamp.Get(),Write,Read);
         move(l,s.color.Get(),Read,Write);dispatch(kCompose[parity],gx,gy);move(l,s.color.Get(),Write,Read);
@@ -403,6 +407,7 @@ bool Frame::Record(ID3D12GraphicsCommandList* l) {
         // A frame without history breaks the chain: a later frame must not
         // pick up the history of a frame from before this one.
         if(s.stamp){std::lock_guard<std::mutex> lock(s.history_m);s.last_stamp=0;}
+        w.composited_visibility=Occlusion();
         move(l,s.color.Get(),Read,Write);dispatch(kComposeDirect,gx,gy);move(l,s.color.Get(),Write,Read);
     }
     if(s.encoded){
