@@ -4336,6 +4336,7 @@ struct TextureHooks { std::shared_ptr<TextureOperationHook> lane[2]; };
 auto& g_texture_hooks = *new std::shared_ptr<const TextureHooks>();
 std::mutex g_texture_hooks_m;
 std::atomic<DepthClearListener> g_depth_clear_listener{nullptr};
+std::atomic<TextureTraceListener> g_texture_trace_listener{nullptr};
 
 void capture_raster_targets(GL* list, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets,
     BOOL contiguous, const D3D12_CPU_DESCRIPTOR_HANDLE* depth)
@@ -5125,7 +5126,8 @@ struct ListHook<Slot, R(A...)> {
                 }
                 if (!t_host_work && scope.outermost && !scope.ambiguous) {
                     const auto hooks = std::atomic_load_explicit(&g_texture_hooks, std::memory_order_acquire);
-                    if (hooks && (hooks->lane[0] || hooks->lane[1])) {
+                    const auto trace = g_texture_trace_listener.load(std::memory_order_relaxed);
+                    if (trace || (hooks && (hooks->lane[0] || hooks->lane[1]))) {
                         TextureCall call;
                         const auto args = std::forward_as_tuple(a...);
                         if constexpr (Slot == sl::list::ClearRenderTargetView) {
@@ -5155,7 +5157,7 @@ struct ListHook<Slot, R(A...)> {
                         bool replaced = false;
                         for (unsigned i = 0; i < 2; ++i) {
                             entered = i + 1;
-                            if (!hooks->lane[i]) continue;
+                            if (!hooks || !hooks->lane[i]) continue;
                             { HostWorkScope own; saved[i] = hooks->lane[i]->Before(l, call); }
                             if (saved[i].action == ShaderAction::Replaced) { replaced = true; break; }
                         }
@@ -5164,8 +5166,9 @@ struct ListHook<Slot, R(A...)> {
                             if constexpr (Slot == sl::list::CopyResource || Slot == sl::list::CopyTextureRegion || Slot == sl::list::ResolveSubresource)
                                 after_texture_copy(l, call.destination);
                             On<Slot>::run(l, a...);
+                            if (trace) { const HostWorkScope own; trace(l, call); }
                         }
-                        for (unsigned i = entered; i > 0; --i) if (hooks->lane[i - 1]) {
+                        for (unsigned i = entered; i > 0; --i) if (hooks && hooks->lane[i - 1]) {
                             HostWorkScope own; hooks->lane[i - 1]->After(l, call, saved[i - 1]);
                         }
                         return;
@@ -6790,6 +6793,17 @@ bool ListRasterScissors(ID3D12CommandList* list, RasterScissors& out)
     std::memcpy(out.rects, ls->raster_scissors, out.count * sizeof(D3D12_RECT));
     return true;
 }
+na_object_id ListPipelineId(ID3D12CommandList* list)
+{
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id = 0;
+    auto* state = list ? list_state_locked(list, &id) : nullptr;
+    if (!state) return 0;
+    std::lock_guard<std::mutex> bindings(state->bind_m);
+    const auto pipeline = g_objs.find(canon(state->pso));
+    return pipeline == g_objs.end() ? 0 : pipeline->second.id;
+}
+
 bool ListDrawState(ID3D12CommandList* list, DrawInfo& out)
 {
     DrawInfo r;
@@ -6916,6 +6930,7 @@ void SetShaderOperationHook(ShaderLane lane, std::shared_ptr<ShaderOperationHook
         g_shader_hooks_enabled.store(enabled, std::memory_order_release);
     } // old callbacks/resources can be destroyed outside the registration lock
 }
+void SetTextureTraceListener(TextureTraceListener listener) { g_texture_trace_listener.store(listener, std::memory_order_release); }
 void SetDepthClearListener(DepthClearListener listener) { g_depth_clear_listener.store(listener, std::memory_order_release); }
 void SetTextureOperationHook(std::shared_ptr<TextureOperationHook> hook)
 {

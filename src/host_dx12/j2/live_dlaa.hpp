@@ -146,6 +146,7 @@ struct UpscaleTarget {
     // then reads it). Its state between uses is `state`.
     ID3D12Resource* resource = nullptr;
     uint32_t state = 0;
+    bool require_delivery = false;
 };
 void SetUpscaleTarget(const UpscaleTarget& t);
 UpscaleTarget GetUpscaleTarget();
@@ -175,7 +176,7 @@ struct NativeBridgeStats {
 NativeBridgeStats GetNativeBridgeStats();
 // Presented-frame trace while the scene is reduced (diagnostic): call at every Present with
 // the presented image; the walk from it back to the scale crossing is logged (native_trace).
-void NativeTracePresent(ID3D12Resource* frame);
+void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool sdr_present);
 void NativeTraceResult(char* out,size_t n,uint64_t* traces);
 // P4-4 no-slider route (Astra's Layer2, contract agreed on COMMS 2026-11-01): an optional
 // immutable logical -> physical snapshot. Discovery, the camera and every identity stay on the
@@ -236,6 +237,7 @@ void OnPresent(ID3D12CommandQueue* queue);
 void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists, ExecuteFn forward);
 
 struct Stats {
+    uint64_t native_deliveries = 0; // full-output native bridge copies on submitted lists
     // Automatic route selection (route_selector.hpp). route: 0 none, 1 between,
     // 2 inline, 3 interceptor; state: 0 observing, 1 active; mode: 0 auto,
     // 1 forced between, 2 forced inline. placement_consistent = executed frames with

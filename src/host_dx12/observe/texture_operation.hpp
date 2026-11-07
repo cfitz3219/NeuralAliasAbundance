@@ -40,4 +40,7 @@ void SetTextureOperationHook(TextureLane, std::shared_ptr<TextureOperationHook>)
 // clears depth, before it is forwarded, with the view's resource id. Records nothing.
 using DepthClearListener = void (*)(ID3D12GraphicsCommandList*, uint64_t target_id);
 void SetDepthClearListener(DepthClearListener);
+// Called only for a forwarded game texture operation, with the actual call arguments.
+using TextureTraceListener = void (*)(ID3D12GraphicsCommandList*, const TextureCall&) noexcept;
+void SetTextureTraceListener(TextureTraceListener);
 } // namespace na::observe

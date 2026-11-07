@@ -84,6 +84,7 @@ struct Slot {
 
 struct PendingHistory {
     uint64_t native_source=0;
+    bool native_delivery=false;
     na::camera::CameraTracker tracker;
     // The interloper rule after this frame's camera, committed with the tracker: an attempt that
     // never submits (failed DLSS, failed recording) must not teach it a jump or a return.
@@ -105,6 +106,9 @@ struct SceneInput {
     uint32_t color_sub = 0, depth_sub = 0;
     uint32_t color_state=0,depth_state=0;
     bool native_states=false; // exact current-frame producer end states, not historical guesses
+    bool require_current_states=false;
+    uint64_t native_viewport_sample=0;
+    ComPtr<ID3D12Resource> native_depth_snapshot;
     na::camera::Matrix vp{};
     bool reversed = false;
     na::j2::InterloperFilter interlopers; // the rule after judging vp (when judged)
@@ -363,17 +367,6 @@ thread_local uint64_t t_native_color=0,t_native_depth=0;
 // bind. Each examined operation must itself read the scene colour.
 thread_local uint64_t t_native_recording=0;thread_local uint32_t t_native_budget=0;
 constexpr uint32_t kNativeHintOps=24;
-// Stretch finder (2026-11-07, a0fe517 run: candidates=0 for 6.6M examined operations): the
-// game's upscale step need not read the scene colour itself. After this frame's scene exists,
-// the first operation that writes a full-output target from exactly one render-size colour
-// input is the step; DLSS runs on that input and the step reads the full-size DLSS image.
-std::atomic<uint64_t> g_native_ready{0},g_native_used{0}; // scene producer serials (Closing / used)
-thread_local ID3D12GraphicsCommandList* t_stretch_list=nullptr;thread_local uint64_t t_stretch_rec=0; // scene in this recording
-thread_local uint64_t t_stretch_done_rec=0;thread_local uint32_t t_stretch_dispatches=0;thread_local uint64_t t_stretch_dispatch_rec=0;
-thread_local uint32_t t_stretch_sample=0;
-constexpr uint32_t kStretchDispatches=96; // compute snapshots per recording while waiting
-struct RtSize{uint64_t id=0;uint32_t w=0,h=0;};
-thread_local RtSize t_rt_cache[16];thread_local uint32_t t_rt_next=0;
 // Why the bridge did or did not find the game's upscale pass (status + log).
 struct NativeBridgeCounters {
     std::atomic<uint64_t> hints{0},examined{0},not_reading{0},snapshot{0},source_size{0},draw_state{0},viewport{0},
@@ -398,54 +391,150 @@ NativeBridgeCounters& g_nb=*new NativeBridgeCounters;
 // groups, blend/depth, used inputs and outputs with sizes and view formats). At Present
 // the chain is walked BACKWARD from the presented image to the first pass whose input is
 // render size and whose output is full size: the real scale crossing. Diagnostic only.
-struct TraceIo{uint64_t id=0;uint32_t w=0,h=0,fmt=0,vfmt=0;};
-struct TraceOp{bool compute=false;uint64_t pso=0;uint32_t vw=0,vh=0,gx=0,gy=0,gz=0;bool blend=false,depth=false;std::vector<TraceIo> in,out;};
+struct TraceIo {
+    uint64_t id = 0;
+    uint32_t w = 0, h = 0, fmt = 0, vfmt = 0;
+    bool whole = false;
+};
+struct NativeCrossing {
+    uint64_t pso = 0, input = 0, output = 0, scene = 0;
+    uint32_t rw = 0, rh = 0, ow = 0, oh = 0;
+    uint32_t in_view = 0, out_view = 0, gx = 0, gy = 0, gz = 0;
+    bool operator==(const NativeCrossing& b) const {
+        return pso==b.pso&&input==b.input&&output==b.output&&scene==b.scene&&
+            rw==b.rw&&rh==b.rh&&ow==b.ow&&oh==b.oh&&in_view==b.in_view&&out_view==b.out_view&&
+            gx==b.gx&&gy==b.gy&&gz==b.gz;
+    }
+};
+struct TraceOp {
+    bool compute = false, direct = false, transfer = false, preserves = false, reflected = false;
+    bool blend = false, depth = false;
+    uint64_t pso = 0;
+    uint32_t vw = 0, vh = 0, gx = 0, gy = 0, gz = 0, uavs = 0;
+    ID3D12CommandQueue* queue = nullptr;
+    std::vector<TraceIo> in, out;
+};
 struct NativeTrace{
     std::mutex m;std::atomic<bool> armed{false};
     uint32_t frames=0,untraced=0,traced_lists=0;uint64_t ops=0,traces=0,presents=0,armed_at=0;
     std::map<std::pair<uint64_t,uint64_t>,std::vector<TraceOp>> recs;std::vector<TraceOp> frame;
     char result[1800]{};
+    NativeCrossing previous, learned;
+    std::atomic<uint64_t> learned_pso{0};
 };
 NativeTrace& g_trace=*new NativeTrace;
 constexpr uint64_t kTraceOps=60000;
+TraceIo trace_view(ID3D12Resource* resource, uint64_t id, uint32_t view, bool whole)
+{
+    const auto d = resource->GetDesc();
+    return {id, uint32_t(d.Width), d.Height, uint32_t(d.Format), view,
+            whole && d.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            d.DepthOrArraySize==1 && d.MipLevels==1 && d.SampleDesc.Count==1};
+}
+void trace_append(ID3D12GraphicsCommandList* l, TraceOp&& op)
+{
+    const auto key = std::make_pair(uint64_t(na::observe::IdOf(l)), na::observe::ListRecording(l));
+    if (!key.first || !key.second) return;
+    std::lock_guard<std::mutex> lock(g_trace.m);
+    if (!g_trace.armed.load(std::memory_order_relaxed) || g_trace.ops >= kTraceOps) return;
+    ++g_trace.ops;
+    g_trace.recs[key].push_back(std::move(op));
+}
+void trace_texture(ID3D12GraphicsCommandList* l, const na::observe::TextureCall& call) noexcept
+{
+    if (!g_trace.armed.load(std::memory_order_relaxed)) return;
+    try {
+        using na::observe::TextureKind;
+        TraceOp op;
+        if (call.kind == TextureKind::ClearColor) {
+            na::observe::OperationDescriptor target;
+            if (!na::observe::NativeDescriptor(call.target, target) || !target.resource) return;
+            op.out.push_back(trace_view(target.resource.Get(), target.view.resource, uint32_t(target.view.rtv.Format),
+                !target.view.explicit_view || (target.view.rtv.ViewDimension==D3D12_RTV_DIMENSION_TEXTURE2D && target.view.rtv.Texture2D.MipSlice==0)));
+            op.preserves = call.rect_count != 0;
+        } else {
+            if (!call.source || !call.destination) return;
+            const auto source = trace_view(call.source, na::observe::IdOf(call.source), 0, true);
+            const auto dest = trace_view(call.destination, na::observe::IdOf(call.destination), 0, true);
+            if (!dest.id || !dest.whole) return;
+            const bool whole_region = call.kind == TextureKind::CopyRegion &&
+                call.source_location.Type==D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
+                call.destination_location.Type==D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
+                !call.source_location.SubresourceIndex && !call.destination_location.SubresourceIndex &&
+                !call.x && !call.y && !call.z &&
+                (!call.box || (!call.box->left && !call.box->top && !call.box->front &&
+                    call.box->right==source.w && call.box->bottom==source.h && call.box->back==1));
+            op.transfer = source.whole && source.id && source.w==dest.w && source.h==dest.h &&
+                (call.kind==TextureKind::Copy || whole_region);
+            if (op.transfer) op.in.push_back(source);
+            op.out.push_back(dest);
+        }
+        trace_append(l, std::move(op));
+    } catch (...) {}
+}
 void trace_op(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall& call){
     const bool compute=call.kind==na::observe::ShaderKind::Dispatch;
     na::observe::NativeOperation op;if(!na::observe::ListNativeOperation(l,compute,op,nullptr))return;
-    TraceOp t;t.compute=compute;t.pso=op.pipeline_id;
+    TraceOp t;t.compute=compute;t.pso=op.pipeline_id;t.reflected=op.reflection_complete;
+    t.direct=l->GetType()==D3D12_COMMAND_LIST_TYPE_DIRECT;
     if(compute){t.gx=uint32_t(call.args[0]);t.gy=uint32_t(call.args[1]);t.gz=uint32_t(call.args[2]);}
     else{
         if(!op.viewports.empty()){t.vw=uint32_t(op.viewports[0].Width);t.vh=uint32_t(op.viewports[0].Height);}
         na::observe::DrawInfo d;if(na::observe::ListDrawState(l,d)){t.blend=d.blend_mask!=0&&d.blend_mask!=NA_UNKNOWN_U32;t.depth=d.depth_enable==1;}
+        t.preserves=t.blend || t.depth || op.viewports.size()!=1 || op.scissors.size()!=1 ||
+            op.viewports[0].TopLeftX!=0.f || op.viewports[0].TopLeftY!=0.f ||
+            op.scissors[0].left!=0 || op.scissors[0].top!=0 ||
+            op.scissors[0].right<LONG(t.vw) || op.scissors[0].bottom<LONG(t.vh);
     }
-    const auto io=[](const na::observe::OperationDescriptor& d,uint32_t vfmt){
-        const auto r=d.resource->GetDesc();
-        return TraceIo{d.view.resource,uint32_t(r.Width),r.Height,uint32_t(r.Format),vfmt};
-    };
-    for(const auto& d:op.descriptors){
-        if(!d.used||!d.resource||d.resource->GetDesc().Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D)continue;
-        if(d.view.kind==NA_DESC_SRV)t.in.push_back(io(d,d.view.explicit_view?uint32_t(d.view.srv.Format):0));
-        else if(d.view.kind==NA_DESC_UAV)t.out.push_back(io(d,d.view.explicit_view?uint32_t(d.view.uav.Format):0));
+    for (const auto& d : op.descriptors) {
+        if (!d.used || !d.resource) continue;
+        const auto desc = d.resource->GetDesc();
+        if (d.view.kind==NA_DESC_UAV) ++t.uavs;
+        if (desc.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D) continue;
+        if (d.view.kind==NA_DESC_SRV) {
+            const auto& srv = d.view.srv;
+            const bool whole = !d.view.explicit_view || (srv.ViewDimension==D3D12_SRV_DIMENSION_TEXTURE2D &&
+                !srv.Texture2D.MostDetailedMip && !srv.Texture2D.PlaneSlice);
+            t.in.push_back(trace_view(d.resource.Get(), d.view.resource,
+                d.view.explicit_view ? uint32_t(srv.Format) : uint32_t(desc.Format), whole));
+        } else if (d.view.kind==NA_DESC_UAV) {
+            const auto& uav = d.view.uav;
+            const bool whole = !d.view.explicit_view || (uav.ViewDimension==D3D12_UAV_DIMENSION_TEXTURE2D &&
+                !uav.Texture2D.MipSlice && !uav.Texture2D.PlaneSlice);
+            t.out.push_back(trace_view(d.resource.Get(), d.view.resource,
+                d.view.explicit_view ? uint32_t(uav.Format) : uint32_t(desc.Format), whole));
+        }
     }
-    for(const auto& d:op.colors)if(d.resource)t.out.push_back(io(d,d.view.explicit_view?uint32_t(d.view.rtv.Format):0));
-    const auto key=std::make_pair(uint64_t(na::observe::IdOf(l)),uint64_t(na::observe::ListRecording(l)));
-    std::lock_guard<std::mutex> lock(g_trace.m);
-    if(!g_trace.armed.load()||g_trace.ops>=kTraceOps)return;
-    ++g_trace.ops;g_trace.recs[key].push_back(std::move(t));
+    for (const auto& d : op.colors) if (d.resource) {
+        const auto& rtv = d.view.rtv;
+        t.out.push_back(trace_view(d.resource.Get(), d.view.resource,
+            d.view.explicit_view ? uint32_t(rtv.Format) : uint32_t(d.resource->GetDesc().Format),
+            !d.view.explicit_view || (rtv.ViewDimension==D3D12_RTV_DIMENSION_TEXTURE2D &&
+                !rtv.Texture2D.MipSlice && !rtv.Texture2D.PlaneSlice)));
+    }
+    trace_append(l, std::move(t));
 }
-void trace_submit(UINT count,ID3D12CommandList* const* lists){
-    if(!g_trace.armed.load(std::memory_order_relaxed))return;
+void trace_submit(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists)
+{
+    if (!g_trace.armed.load(std::memory_order_relaxed)) return;
     std::lock_guard<std::mutex> lock(g_trace.m);
-    for(UINT i=0;i<count;++i){
-        if(!lists[i])continue;
-        const auto key=std::make_pair(uint64_t(na::observe::IdOf(lists[i])),uint64_t(na::observe::ListRecording(lists[i])));
+    if (!g_trace.armed.load(std::memory_order_relaxed)) return;
+    for (UINT i = 0; i < count; ++i) {
+        if (!lists[i]) continue;
+        const auto key=std::make_pair(uint64_t(na::observe::IdOf(lists[i])), na::observe::ListRecording(lists[i]));
         const auto it=g_trace.recs.find(key);
-        if(it==g_trace.recs.end()){++g_trace.untraced;continue;}
+        if (it==g_trace.recs.end()) { ++g_trace.untraced; continue; }
         ++g_trace.traced_lists;
-        for(auto& t:it->second)g_trace.frame.push_back(t);
+        for (const auto& t : it->second) {
+            if (g_trace.frame.size() >= kTraceOps) return;
+            g_trace.frame.push_back(t);
+            g_trace.frame.back().queue=queue;
+        }
     }
 }
 int trace_describe(char* out,size_t n,const TraceOp& t){
-    int k=t.compute?std::snprintf(out,n,"[cs pso=%llu g=%u,%u,%u",(unsigned long long)t.pso,t.gx,t.gy,t.gz)
+    int k=t.transfer?std::snprintf(out,n,"[copy"):
+        t.compute?std::snprintf(out,n,"[cs pso=%llu g=%u,%u,%u",(unsigned long long)t.pso,t.gx,t.gy,t.gz)
                    :std::snprintf(out,n,"[draw pso=%llu vp=%ux%u%s%s",(unsigned long long)t.pso,t.vw,t.vh,t.blend?" blend":"",t.depth?" depth":"");
     if(k<0)return 0;size_t used=size_t(k);
     const auto list=[&](const char* tag,const std::vector<TraceIo>& v){
@@ -459,51 +548,120 @@ int trace_describe(char* out,size_t n,const TraceOp& t){
     if(used+2<n){out[used++]=']';out[used]=0;}
     return int(used);
 }
-void trace_analyze(uint64_t presented){
-    NativeExtent e;{std::lock_guard<std::mutex> lock(g_up_m);e=g_native_extent;}
-    auto& f=g_trace.frame;char* r=g_trace.result;const size_t n=sizeof g_trace.result;size_t used=0;
-    const auto add=[&](const char* fmt,auto... a){if(used+8<n){const int k=std::snprintf(r+used,n-used,fmt,a...);if(k>0)used=(std::min)(n-1,used+size_t(k));}};
-    add("ops=%zu lists=%u untraced=%u scene=%ux%u output=%ux%u",f.size(),g_trace.traced_lists,g_trace.untraced,e.rw,e.rh,e.ow,e.oh);
-    int at=-1;const char* how="presented";
-    for(int i=int(f.size())-1;i>=0&&at<0;--i)for(const auto& o:f[size_t(i)].out)if(presented&&o.id==presented){at=i;break;}
-    if(at<0){how="last_full_output";for(int i=int(f.size())-1;i>=0&&at<0;--i)for(const auto& o:f[size_t(i)].out)if(o.w==e.ow&&o.h==e.oh){at=i;break;}}
-    if(at<0){add(" chain{none: no traced op writes a full-output target}");return;}
-    add(" from=%s chain{",how);
-    uint64_t last_pso=0;uint32_t repeats=0;
-    for(int step=0;step<1500&&at>=0;++step){
-        const auto& t=f[size_t(at)];
-        // Runs of the same pipeline (UI elements) are summarised, not listed.
-        if(step&&t.pso==last_pso){++repeats;}
-        else{
-            if(repeats){add(" (x%u more)",repeats);repeats=0;}
-            if(used+8<n){used+=size_t(trace_describe(r+used,n-used,t));}
-        }
-        last_pso=t.pso;
-        bool full_out=false,small_in=false;
-        for(const auto& o:t.out)full_out|=o.w==e.ow&&o.h==e.oh;
-        for(const auto& i:t.in)small_in|=i.w==e.rw&&i.h==e.rh;
-        if(full_out&&small_in){add(" <CROSSING op=%d>",at);break;}
-        // Next: the most relevant input written earlier in the frame (same size as this
-        // op's output first, then render size, then any).
-        // 98d13f1 run: the walk started at a blended HUD draw and stopped (its inputs are
-        // icons). A blended or partial draw keeps what was already in its target, so the
-        // previous writer of its own output is followed first; that also walks past UI.
-        int next=-1;
-        const auto writer_of=[&](uint64_t id){for(int j=at-1;j>=0;--j)for(const auto& o:f[size_t(j)].out)if(o.id==id)return j;return -1;};
-        const bool keeps_target=!t.compute&&(t.blend||t.vw!=e.ow||t.vh!=e.oh);
-        if(keeps_target)for(const auto& o:t.out){next=writer_of(o.id);if(next>=0)break;}
-        for(int pass=0;pass<3&&next<0;++pass)for(const auto& i:t.in){
-            const uint32_t ow=t.out.empty()?0:t.out[0].w,oh=t.out.empty()?0:t.out[0].h;
-            const bool pick=pass==0?(i.w==ow&&i.h==oh):pass==1?(i.w==e.rw&&i.h==e.rh):true;
-            if(!pick)continue;
-            next=writer_of(i.id);
-            if(next>=0)break;
-        }
-        if(next<0)for(const auto& o:t.out){next=writer_of(o.id);if(next>=0)break;} // no traced input: the target's earlier writer
-        if(next<0){add(" <inputs not written by a traced op>");break;}
-        if(f[size_t(next)].pso!=t.pso)add(" <-");at=next;
+bool trace_same_color(uint32_t input, uint32_t output)
+{
+    return (output==DXGI_FORMAT_R8G8B8A8_UNORM &&
+        (input==DXGI_FORMAT_R8G8B8A8_UNORM || input==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)) ||
+        (input==DXGI_FORMAT_R16G16B16A16_FLOAT && output==input);
+}
+
+void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_present)
+{
+    NativeExtent e;
+    { std::lock_guard<std::mutex> lock(g_up_m); e=g_native_extent; }
+    uint64_t depth=0, scene=0;
+    na::observe::GetLiveSelection(&depth,&scene);
+    const auto& ops=g_trace.frame;
+    auto* result=g_trace.result;
+    const size_t capacity=sizeof g_trace.result;
+    size_t used=0;
+    const auto add=[&](const char* format,auto... args) {
+        if (used+1>=capacity) return;
+        const int n=std::snprintf(result+used,capacity-used,format,args...);
+        if (n>0) used=(std::min)(capacity-1,used+size_t(n));
+    };
+    add("ops=%zu lists=%u untraced=%u scene=%ux%u output=%ux%u presented=%llu",
+        ops.size(),g_trace.traced_lists,g_trace.untraced,e.rw,e.rh,e.ow,e.oh,
+        static_cast<unsigned long long>(presented));
+
+    // Index writers in actual submission order. Every lookup asks for the
+    // resource contents that existed immediately before the consuming op.
+    std::unordered_map<uint64_t,std::vector<size_t>> writers;
+    for (size_t i=0;i<ops.size();++i) {
+        if (ops[i].queue!=queue) continue;
+        for (const auto& out:ops[i].out) if (out.id) writers[out.id].push_back(i);
     }
-    add("}");
+    const auto writer=[&](uint64_t id,size_t before) -> size_t {
+        const auto found=writers.find(id);
+        if (found==writers.end()) return ops.size();
+        const auto& history=found->second;
+        const auto at=std::lower_bound(history.begin(),history.end(),before);
+        return at==history.begin() ? ops.size() : *std::prev(at);
+    };
+    const auto traces_scene=[&](uint64_t id,size_t before) {
+        std::vector<std::pair<uint64_t,size_t>> pending{{id,before}};
+        std::vector<size_t> visited;
+        while (!pending.empty() && visited.size()<128) {
+            const auto next=pending.back();
+            pending.pop_back();
+            const size_t index=writer(next.first,next.second);
+            if (index==ops.size() || std::find(visited.begin(),visited.end(),index)!=visited.end()) continue;
+            if (scene && next.first==scene) return true;
+            visited.push_back(index);
+            const auto& op=ops[index];
+            for (const auto& in:op.in)
+                if (in.whole && in.w==e.rw && in.h==e.rh) pending.emplace_back(in.id,index);
+        }
+        return false;
+    };
+
+    struct Edge { uint64_t id; size_t before; bool srgb; };
+    std::vector<Edge> pending{{presented,ops.size(),false}};
+    std::vector<std::pair<uint64_t,size_t>> visited;
+    NativeCrossing candidate;
+    bool ambiguous=false;
+    uint32_t overlays=0;
+    while (!pending.empty() && visited.size()<4096) {
+        const Edge edge=pending.back();
+        pending.pop_back();
+        const size_t index=writer(edge.id,edge.before);
+        const auto version=std::make_pair(edge.id,index);
+        if (index>=ops.size() || std::find(visited.begin(),visited.end(),version)!=visited.end()) continue;
+        visited.push_back(version);
+        const auto& op=ops[index];
+        const auto output=std::find_if(op.out.begin(),op.out.end(),[&](const TraceIo& v){return v.id==edge.id;});
+        if (output==op.out.end() || !output->whole || output->w!=e.ow || output->h!=e.oh) continue;
+        if (!op.compute && !op.transfer && op.preserves) {
+            ++overlays;
+            pending.push_back({edge.id,index,edge.srgb});
+            continue;
+        }
+        if (op.compute && op.direct && op.reflected && op.uavs==1 && op.out.size()==1 &&
+            op.in.size()==1 && op.gx && op.gy && op.gz==1) {
+            const auto& in=op.in[0];
+            if (in.whole && in.w==e.rw && in.h==e.rh) {
+                char detail[380]{};
+                trace_describe(detail,sizeof detail,op);
+                add(" crossing=%s",detail);
+                const bool encoded=output->vfmt==DXGI_FORMAT_R16G16B16A16_FLOAT ||
+                    in.vfmt==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || edge.srgb || sdr_present;
+                if (encoded && trace_same_color(in.vfmt,output->vfmt) && traces_scene(in.id,index)) {
+                    const NativeCrossing next{op.pso,in.id,output->id,scene,e.rw,e.rh,e.ow,e.oh,
+                                              in.vfmt,output->vfmt,op.gx,op.gy,op.gz};
+                    if (candidate.pso && !(candidate==next)) ambiguous=true;
+                    else candidate=next;
+                } else add(" rejected=colour_or_scene_lineage");
+                continue;
+            }
+        }
+        // A composite can read the scene and a separate full-size HUD. Follow
+        // both branches and require one unambiguous crossing from the scene.
+        if (!op.transfer && (!op.pso || !op.reflected)) continue;
+        for (const auto& in:op.in)
+            if (in.whole && in.w==e.ow && in.h==e.oh)
+                pending.push_back({in.id,index,edge.srgb || in.vfmt==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB});
+    }
+    if (ambiguous || !pending.empty()) {
+        candidate={};
+        g_trace.learned={};
+        add(" rejected=ambiguous_or_incomplete");
+    } else if (candidate.pso) {
+        if (candidate==g_trace.previous) g_trace.learned=candidate;
+        else if (!(candidate==g_trace.learned)) g_trace.learned={};
+    }    g_trace.previous=candidate;
+    g_trace.learned_pso.store(g_trace.learned.pso,std::memory_order_release);
+    add(" overlays=%u learned=%llu",overlays,static_cast<unsigned long long>(g_trace.learned.pso));
+    if (!candidate.pso) add(" waiting_for_presented_scene_chain");
 }
 void native_reject(std::atomic<uint64_t>& counter,const char* why){
     counter.fetch_add(1,std::memory_order_relaxed);
@@ -2382,7 +2540,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (phys) { color = phys->color; depth = phys->depth; } // logical ids remain the identity
     else {
         color.Attach(na::observe::AcquireResource(color_id));
-        depth.Attach(na::observe::AcquireResource(depth_id));
+        if (saved && saved->native_depth_snapshot) depth=saved->native_depth_snapshot;
+        else depth.Attach(na::observe::AcquireResource(depth_id));
     }
     if (!color || !depth) { reason("Scene resources are not available."); return false; }
     const D3D12_RESOURCE_DESC cd = color->GetDesc(), dd = depth->GetDesc();
@@ -2423,6 +2582,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
                       : na::observe::KnownSubStateInCurrentSubmission(id, sub, st);
     };
     const auto state_of = [&](na_object_id id, uint32_t sub, uint32_t* st) {
+        if (inl && saved && saved->require_current_states) return state_now(id,sub,st);
         if (saved && saved->at_present) { // I1.4: after the whole frame was submitted
             if (!na::observe::KnownSubStateOnQueueNow(g.queue.Get(), id, sub, st)) return false;
             if (id == depth_id) pending.depth_source = 2;
@@ -2455,7 +2615,9 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // picture), so its state at Present is not needed (Cort's 9346113 run: every attempt waited on it).
     const bool skip_color = saved && saved->at_present;
     const bool have_sc = phys ? (sc = phys->color_state, true) : skip_color ? true : state_of(color_id, csub, &sc);
-    bool have_sd = phys ? (sd = phys->depth_state, true) : state_of(depth_id, dsub, &sd);
+    bool have_sd = phys ? (sd = phys->depth_state, true) :
+        saved && saved->native_depth_snapshot ? (sd = D3D12_RESOURCE_STATE_COPY_DEST, true) :
+        state_of(depth_id, dsub, &sd);
     // Never replace missing state provenance with a state learned on old frames.
     // Private completion bookkeeping must preserve the real carried state instead.
     if(have_sd && !pending.depth_source)pending.depth_source=phys?3u:4u;
@@ -2533,8 +2695,12 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         if (dest && up.dest == color_id) refuse_upscale("The upscale destination is the scene colour itself.");
         // The destination may be untouched by the game until after J2's insertion: then the
         // state all submitted work left it in.
-        if (dest && !state_of(up.dest, dsub_out, &sdest) && !na::observe::KnownSubStateOnQueueNow(g.queue.Get(),up.dest, dsub_out, &sdest)) refuse_upscale("Waiting: the upscale destination's state is not established.");
+        if (dest && !state_of(up.dest, dsub_out, &sdest) && (up.require_delivery || !na::observe::KnownSubStateOnQueueNow(g.queue.Get(),up.dest, dsub_out, &sdest))) refuse_upscale("Waiting: the upscale destination's state is not established.");
         }
+    }
+    if (up.require_delivery && !dest) {
+        reason(g.stats.upscale_note[0] ? g.stats.upscale_note : "Waiting for a valid full-output DLSS destination.");
+        return false;
     }
     const bool upscaling = dest != nullptr;
     // Projection window: this frame's scene was drawn into the top-left corner of the
@@ -2729,7 +2895,11 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     bool viewport_sample_known=false;
     if (vpj_mode()) { // the camera is the game's own (no J1 write); the sample is in the viewports
         float vx = 0.f, vy = 0.f;
-        viewport_sample_known=vpj_declared(lists, scene, &vx, &vy);
+        uint32_t sample_frame=0;
+        if (saved && saved->require_current_states && saved->native_viewport_sample) {
+            viewport_sample_known=na::observe::DecodeSceneViewportJitter(saved->native_viewport_sample,&sample_frame,&vx,&vy);
+            if (na::settings::Get().j2_viewport_jitter.load(std::memory_order_relaxed)<0) { vx=-vx; vy=-vy; }
+        } else viewport_sample_known=vpj_declared(lists, scene, &vx, &vy);
         cam.jitter_px_x = vx; cam.jitter_px_y = vy; cam.jitter_known = true;
     }
     if (!held) { // the newest read camera (one per frame: a later attempt in the same frame replaces it)
@@ -3386,7 +3556,7 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
         // scene. The reconstruction lane will inspect its exact destination.
         t_native_hint=l;t_native_color=color_id;t_native_depth=depth_id;
         t_native_recording=na::observe::ListRecording(l);t_native_budget=kNativeHintOps;
-        t_stretch_list=l;t_stretch_rec=t_native_recording;
+
         g_nb.hints.fetch_add(1,std::memory_order_relaxed);return;
     }
     const na::observe::HostWorkScope host; // our commands in the game's list are not the game's
@@ -3664,6 +3834,48 @@ void on_entry(ID3D12GraphicsCommandList* l,const na::j2::InsertionEvent& entry) 
 // observed source->native-destination pass. Reuse record(), its state restore,
 // history commit, capture and per-recording lifetime machinery in both engines.
 class NativeScaleHook final:public na::observe::ShaderOperationHook {
+    struct DepthSnapshot {
+        ComPtr<ID3D12Resource> texture;
+        na::nr::native::RecordingLease writer, reader;
+    };
+    DepthSnapshot snapshots_[kRing+2];
+
+    void snapshot_depth(ID3D12GraphicsCommandList* list, ID3D12Resource* depth,
+                        SceneInput& saved, uint32_t state,
+                        std::vector<ComPtr<ID3D12Resource>>& owned)
+    {
+        if (!g_trace.learned_pso.load(std::memory_order_acquire) || list->GetType()!=D3D12_COMMAND_LIST_TYPE_DIRECT) return;
+        const auto desc=depth->GetDesc();
+        if (desc.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count!=1 ||
+            !na::depth::PlaneZeroCopiesToR32F(desc.Format)) return;
+        const uint32_t mip=saved.depth_sub%(std::max)(1u,uint32_t(desc.MipLevels));
+        const auto w=uint32_t((std::max)(uint64_t{1},desc.Width>>mip));
+        const auto h=(std::max)(1u,desc.Height>>mip);
+        auto* slot=std::find_if(std::begin(snapshots_),std::end(snapshots_),[](const auto& s){
+            return (!s.writer || s.writer.Retired()) && (!s.reader || s.reader.Retired());
+        });
+        if (slot==std::end(snapshots_)) return;
+        if (!slot->texture || slot->texture->GetDesc().Width!=w || slot->texture->GetDesc().Height!=h) {
+            slot->texture.Reset();
+            if (!texture(w,h,DXGI_FORMAT_R32_FLOAT,false,D3D12_RESOURCE_STATE_COPY_DEST,slot->texture)) return;
+        }
+        // Same depth-plane copy J2 already performs. This version runs inside
+        // the owner list, where the game's exact state is established.
+        std::vector<D3D12_RESOURCE_BARRIER> barriers;
+        addsub(barriers,depth,saved.depth_sub,state,D3D12_RESOURCE_STATE_COPY_SOURCE);
+        flush(list,barriers);
+        D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+        src.Type=dst.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.pResource=depth;src.SubresourceIndex=saved.depth_sub;
+        dst.pResource=slot->texture.Get();
+        list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
+        addsub(barriers,depth,saved.depth_sub,D3D12_RESOURCE_STATE_COPY_SOURCE,state);
+        flush(list,barriers);
+        saved.native_depth_snapshot=slot->texture;
+        owned.push_back(slot->texture);
+        slot->writer=saved.native_origin;
+        slot->reader={};
+    }
     struct Candidate {
         uint64_t color=0,depth=0,dest=0,recording=0;uint32_t sub=0;
         ComPtr<ID3D12Resource> source,guide,target;
@@ -3765,95 +3977,78 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
         for(uint32_t k=0;k<st.count;++k)if(st.tables[k].sampler)bind(st.tables[k].param,st.tables[k].handle);
         UINT at=0;for(const auto& t:op.tables){bind(t.param,p.gpu.ptr+UINT64(at)*ring_.inc);at+=t.count;}
     }
-    static bool colour_like(DXGI_FORMAT f){
-        switch(typed(f)){
-        case DXGI_FORMAT_R16G16B16A16_FLOAT:case DXGI_FORMAT_R32G32B32A32_FLOAT:case DXGI_FORMAT_R32G32B32_FLOAT:
-        case DXGI_FORMAT_R11G11B10_FLOAT:case DXGI_FORMAT_R10G10B10A2_UNORM:case DXGI_FORMAT_R8G8B8A8_UNORM:
-        case DXGI_FORMAT_B8G8R8A8_UNORM:case DXGI_FORMAT_R9G9B9E5_SHAREDEXP:case DXGI_FORMAT_R16G16B16A16_UNORM:return true;
-        default:return false;
+    na::observe::ShaderScope stretch(ID3D12GraphicsCommandList* l, const na::observe::ShaderCall& call)
+    {
+        if (call.kind!=na::observe::ShaderKind::Dispatch || call.indirect ||
+            l->GetType()!=D3D12_COMMAND_LIST_TYPE_DIRECT) return {};
+        const uint64_t pso=g_trace.learned_pso.load(std::memory_order_acquire);
+        if (!pso || na::observe::ListPipelineId(l)!=pso) return {};
+        NativeCrossing learned;
+        {
+            std::lock_guard<std::mutex> lock(g_trace.m);
+            learned=g_trace.learned;
         }
-    }
-    bool full_size(uint64_t id,uint32_t ow,uint32_t oh){
-        for(const auto& e:t_rt_cache)if(e.id==id&&id)return e.w==ow&&e.h==oh;
-        ComPtr<ID3D12Resource> r;r.Attach(na::observe::AcquireResource(id));if(!r)return false;
-        const auto d=r->GetDesc();t_rt_cache[t_rt_next++%16]={id,uint32_t(d.Width),d.Height};
-        return d.Width==ow&&d.Height==oh;
-    }
-    // The stretch finder (see g_native_ready): any draw or dispatch after this frame's scene
-    // that writes a full-output target from exactly one render-size colour input.
-    na::observe::ShaderScope stretch(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall& call){
-        const bool compute=call.kind==na::observe::ShaderKind::Dispatch;
-        const uint64_t rec=na::observe::ListRecording(l);
-        if(rec&&rec==t_stretch_done_rec)return {};
-        const bool local=t_stretch_list==l&&t_stretch_rec==rec;
-        const bool waiting=g_native_ready.load(std::memory_order_relaxed)>g_native_used.load(std::memory_order_relaxed);
-        if(!local&&!waiting&&(compute||(++t_stretch_sample&63)!=0))return {};
-        NativeExtent extent;{std::lock_guard<std::mutex> lock(g_up_m);extent=g_native_extent;}
-        if(!extent.ow||!extent.oh||!extent.rw||!extent.rh)return {};
-        if(!local&&!waiting){
-            // Diagnostic only: full-output draws while no scene is waiting (1 in 64 sampled).
-            na::observe::DrawInfo d;if(na::observe::ListDrawState(l,d)&&d.rt&&full_size(d.rt,extent.ow,extent.oh))g_nb.st_ungated_full.fetch_add(1,std::memory_order_relaxed);
-            return {};
-        }
-        g_nb.st_gated.fetch_add(1,std::memory_order_relaxed);
-        na::observe::DrawInfo draw;
-        if(!compute){
-            if(!na::observe::ListDrawState(l,draw)||!draw.rt||!full_size(draw.rt,extent.ow,extent.oh))return {};
-        }else{
-            if(t_stretch_dispatch_rec!=rec){t_stretch_dispatch_rec=rec;t_stretch_dispatches=0;}
-            if(++t_stretch_dispatches>kStretchDispatches){g_nb.st_budget.fetch_add(1,std::memory_order_relaxed);return {};}
-        }
-        na::observe::NativeOperation op;const char* why=nullptr;
-        if(!na::observe::ListNativeOperation(l,compute,op,&why))return {};
-        uint64_t depth=0,color=0;na::observe::GetLiveSelection(&depth,&color);
-        if(!color||!depth)return {};
-        // Full-output destination(s).
-        uint64_t dest=0;ComPtr<ID3D12Resource> dest_res;uint32_t dests=0;D3D12_RESOURCE_DESC dd{};
-        const auto consider_dest=[&](const na::observe::OperationDescriptor& d){
-            if(!d.resource||!d.used)return;const auto td=d.resource->GetDesc();
-            if(td.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||td.Width!=extent.ow||td.Height!=extent.oh)return;
-            if(d.view.resource==dest)return;++dests;dest=d.view.resource;dest_res=d.resource;dd=td;
-        };
-        if(compute){for(const auto& d:op.descriptors)if(d.view.kind==NA_DESC_UAV)consider_dest(d);}
-        else for(const auto& d:op.colors)consider_dest(d);
-        if(!dests)return {};
-        g_nb.st_full.fetch_add(1,std::memory_order_relaxed);
-        // Render-size colour inputs (never the scene depth, never 1-2 channel planes).
-        uint64_t input=0;ComPtr<ID3D12Resource> input_res;uint32_t inputs=0;D3D12_RESOURCE_DESC id{};bool scene=false;
-        for(const auto& d:op.descriptors){
-            if(!d.used||d.view.kind!=NA_DESC_SRV||!d.resource||d.view.resource==depth||d.view.resource==input)continue;
-            const auto td=d.resource->GetDesc();
-            if(td.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||td.Width!=extent.rw||td.Height!=extent.rh||td.DepthOrArraySize!=1||td.SampleDesc.Count!=1)continue;
-            if(!colour_like(td.Format))continue;
-            ++inputs;input=d.view.resource;input_res=d.resource;id=td;scene|=d.view.resource==color;
-        }
-        g_nb.st_examined.fetch_add(1,std::memory_order_relaxed);
-        const uint64_t pso=op.pipeline_id;
-        const auto note=[&](const char* v){g_nb.step(pso,compute,uint32_t(dd.Width),dd.Height,uint32_t(dd.Format),inputs,uint32_t(id.Width),id.Height,uint32_t(id.Format),scene,v);};
-        if(!inputs){note("no_render_input");g_nb.st_no_input.fetch_add(1,std::memory_order_relaxed);return {};}
-        if(inputs>1||dests>1){note(inputs>1?"several_inputs":"several_outputs");g_nb.st_ambiguous.fetch_add(1,std::memory_order_relaxed);return {};}
-        if(!compute){
-            if(!draw.pipeline_known||draw.depth_enable!=0||draw.blend_mask!=0||
-               op.viewports.empty()||op.viewports[0].TopLeftX!=0||op.viewports[0].TopLeftY!=0||
-               op.viewports[0].Width!=float(extent.ow)||op.viewports[0].Height!=float(extent.oh)){
-                note("partial_or_blended");g_nb.st_draw_state.fetch_add(1,std::memory_order_relaxed);return {};}
-        }
-        // Sol 697b223 (e): a first match can be bloom, a reflection or an offscreen
-        // composite. Diagnostic only until the presented-frame trace connects a pass
-        // to the screen (native_trace); nothing is recorded or rebound here.
-        g_nb.st_candidates.fetch_add(1,std::memory_order_relaxed);note("would_match");
-        t_stretch_done_rec=rec;(void)input;(void)input_res;(void)dest_res;
-        return {};
-    }
+        NativeExtent extent;
+        { std::lock_guard<std::mutex> lock(g_up_m); extent=g_native_extent; }
+        uint64_t depth=0,scene=0;
+        na::observe::GetLiveSelection(&depth,&scene);
+        if (!depth || scene!=learned.scene || extent.rw!=learned.rw || extent.rh!=learned.rh ||
+            extent.ow!=learned.ow || extent.oh!=learned.oh || call.args[0]!=learned.gx ||
+            call.args[1]!=learned.gy || call.args[2]!=learned.gz) return {};
+        na::observe::NativeOperation op;
+        if (!na::observe::ListNativeOperation(l,true,op,nullptr) || !op.reflection_complete ||
+            op.pipeline_id!=learned.pso) return {};
 
+        const na::observe::OperationDescriptor* input=nullptr;
+        const na::observe::OperationDescriptor* output=nullptr;
+        for (const auto& d:op.descriptors) {
+            if (!d.used || !d.resource) continue;
+            const auto desc=d.resource->GetDesc();
+            if (d.view.kind==NA_DESC_SRV && desc.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+                if (input) return {};
+                input=&d;
+            } else if (d.view.kind==NA_DESC_UAV) {
+                if (output) return {};
+                output=&d;
+            }
+        }
+        if (!input || !output || input->view.resource!=learned.input || output->view.resource!=learned.output) return {};
+        const auto& srv=input->view.srv;
+        const auto& uav=output->view.uav;
+        const auto in_desc=input->resource->GetDesc(), out_desc=output->resource->GetDesc();
+        const auto in=trace_view(input->resource.Get(),learned.input,
+            input->view.explicit_view?uint32_t(srv.Format):uint32_t(in_desc.Format),
+            !input->view.explicit_view || (srv.ViewDimension==D3D12_SRV_DIMENSION_TEXTURE2D &&
+                !srv.Texture2D.MostDetailedMip && !srv.Texture2D.PlaneSlice &&
+                srv.Shader4ComponentMapping==D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING));
+        const auto out=trace_view(output->resource.Get(),learned.output,
+            output->view.explicit_view?uint32_t(uav.Format):uint32_t(out_desc.Format),
+            !output->view.explicit_view || (uav.ViewDimension==D3D12_UAV_DIMENSION_TEXTURE2D &&
+                !uav.Texture2D.MipSlice && !uav.Texture2D.PlaneSlice));
+        if (!in.whole || !out.whole || in.vfmt!=learned.in_view || out.vfmt!=learned.out_view ||
+            in.w!=extent.rw || in.h!=extent.rh || out.w!=extent.ow || out.h!=extent.oh ||
+            typed(in_desc.Format)!=typed(out_desc.Format)) return {};
+        auto c=std::make_shared<Candidate>();
+        c->color=scene;
+        c->depth=depth;
+        c->recording=op.recording;
+        c->source=input->resource;
+        c->guide.Attach(na::observe::AcquireResource(depth));
+        c->input=in.id;
+        c->dest=out.id;
+        c->target=output->resource;
+        if (!c->guide) return {};
+        g_nb.st_candidates.fetch_add(1,std::memory_order_relaxed);
+        return {na::observe::ShaderAction::Forward,c};
+    }
 public:
     na::observe::ShaderScope Before(ID3D12GraphicsCommandList* l,na::observe::ShaderCall& call) noexcept override {
         if(!g_native_reduced.load(std::memory_order_relaxed)){t_native_hint=nullptr;return {};}
         try{
             if(g_trace.armed.load(std::memory_order_relaxed))trace_op(l,call);
+            if (g_trace.learned_pso.load(std::memory_order_acquire)) return stretch(l,call);
             auto r=hinted(l,call);
-            if(r.state)return r;
-            return stretch(l,call);
+            return r;
         }catch(...){return {};}
     }
     na::observe::ShaderScope hinted(ID3D12GraphicsCommandList* l,na::observe::ShaderCall& call){
@@ -3933,7 +4128,11 @@ public:
             if(!na::observe::RestoreListState(l)){std::lock_guard<std::mutex> lock(g.m);g.latched=true;reason("Stopped: the redirected upscale pass could not restore game state.");}
             return;
         }
-        reconstruct(l,c,nullptr,nullptr);
+        const bool delivered=reconstruct(l,c,nullptr,nullptr);
+        if(c->input) {
+            if(delivered) g_nb.st_recorded.fetch_add(1,std::memory_order_relaxed);
+            else g_nb.st_failed.fetch_add(1,std::memory_order_relaxed);
+        }
     }
     // Records DLSS for this frame at the native upscale pass. op==nullptr: into
     // the pass's own same-format destination, after it. op!=nullptr (F10): into
@@ -3964,18 +4163,21 @@ public:
             if(c->input){
                 if(local){
                     staged.frame=g.frame;staged.depth=depth;
+                    staged.native_viewport_sample=na::observe::ListSceneViewportJitter(l,depth);
                     uint32_t cs=0;
                     if(!na::observe::ListSceneSubresource(l,color,depth,&cs,&staged.depth_sub)){skip("The scene's depth view in this recording cannot be placed.");return false;}
                     staged.has_camera=find_camera(one,0,depth,&staged.vp,&staged.reversed,&staged.interlopers);staged.judged=staged.has_camera;
                     staged.injected=g_injected;staged.jitter[0]=g_injected?g.jit.px[0]:0;staged.jitter[1]=g_injected?g.jit.px[1]:0;
-                }else staged=saved;
-                staged.color=c->input;staged.color_sub=0;
-                if(staged.native_states){
-                    uint32_t st=0;
-                    if(na::observe::ListStateSub(l,c->input,0,&st)!=na::observe::StateLookup::Known&&
-                       !na::observe::KnownSubStateOnQueueNow(g.queue.Get(),c->input,0,&st)){skip("The upscale step's input state is not established.");return false;}
-                    staged.color_state=st;
+                }else {
+                    if (!saved.native_origin.Ready(g.queue.Get())) {
+                        skip("Waiting for the scene producer to submit before the learned upscale pass.");
+                        return false;
+                    }
+                    staged=saved;
                 }
+                staged.color=c->input;staged.color_sub=0;
+                if (staged.native_depth_snapshot) staged.depth_sub=0;
+                staged.require_current_states=true;
                 if(!uav_store(typed(c->source->GetDesc().Format))){skip("The upscale step's input format cannot be written by DLSS.");return false;}
             }
             if(local&&(!g.inline_camera_submitted||(g.jit.valid&&g.jit.applied)))jitter_batch(one,1);
@@ -3984,14 +4186,19 @@ public:
             auto owned=std::make_shared<std::vector<ComPtr<ID3D12Resource>>>();owned->reserve(16);
             *owned={c->source,c->guide,c->target};
             auto lease=na::nr::native::RetainRecording(l,owned);if(!lease)return false;
+            if (staged.native_depth_snapshot) {
+                owned->push_back(staged.native_depth_snapshot);
+                for (auto& snapshot:snapshots_) if (snapshot.texture.Get()==staged.native_depth_snapshot.Get()) snapshot.reader=lease;
+            }
             UpscaleTarget previous;
             UpscaleTarget target{c->dest,c->sub,0,0};
+            target.require_delivery=true;
             if(op){
                 const auto sd=c->source->GetDesc();const auto od=c->other_target->GetDesc();
                 const DXGI_FORMAT f=typed(sd.Format);
                 if(!ensure_full(uint32_t(od.Width),od.Height,f)){skip("The private full-size DLSS image could not be created.");return false;}
                 owned->push_back(full_.tex);
-                target={0,0,0,0,full_.tex.Get(),uint32_t(D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE)};
+                target={0,0,0,0,full_.tex.Get(),uint32_t(D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE),true};
             }
             // Sol 697b223: the redirect is prepared (and can fail) BEFORE DLSS is
             // recorded, so a failure leaves the game's pass and history untouched.
@@ -4008,6 +4215,7 @@ public:
             struct RestoreTarget{UpscaleTarget old;~RestoreTarget(){std::lock_guard<std::mutex> up(g_up_m);g_up=old;}} restore_target{previous};
             const bool ok=record(one,0,depth,in_id,&out,pending,l,&touched,c->input?&staged:local?nullptr:&saved);
             if(!local)pending.native_source=saved.native_serial;
+            pending.native_delivery=ok;
             // The same existing recording lease handles submit, Reset/discard,
             // pooled-list reuse and completion. Include resources allocated by
             // record() even when it only recorded a partial failed attempt.
@@ -4031,7 +4239,7 @@ public:
                 g.inl_redirected=true;
             }
             g_nb.recorded.fetch_add(1,std::memory_order_relaxed);
-            if(!local){uint64_t u=g_native_used.load();while(u<saved.native_serial&&!g_native_used.compare_exchange_weak(u,saved.native_serial)){}}
+
             {std::lock_guard<std::mutex> nb(g_nb.m);std::snprintf(g_nb.reason,sizeof g_nb.reason,"%s",c->input?"DLSS reconstructs at the game's own upscale step (its render-size input).":"DLSS reconstructs at the game's own upscale pass.");}
             g.slot=(slot+1)%kRing;g.inl.list=l;g.inl.rec=c->recording;g.inl.frame=g.frame;g.inl.slot=slot;
             g.inl.writes=na::observe::ListInsertionDecision(l,color).writes;g.inl.color=color;g.inl.history=pending;g.inl.valid=true;g.inl_frame=g.frame;
@@ -4056,10 +4264,12 @@ public:
             if(!g.inline_camera_submitted||(g.jit.valid&&g.jit.applied))jitter_batch(one,1);
             SceneInput saved;saved.frame=g.frame;saved.color=color;saved.depth=depth;
             saved.native_recording=na::observe::ListRecording(l);
+            saved.native_viewport_sample=na::observe::ListSceneViewportJitter(l,depth);
             if(!saved.native_recording)return;
             if(!na::observe::ListSceneSubresource(l,color,depth,&saved.color_sub,&saved.depth_sub))return;
-            saved.native_states=na::observe::ListStateSub(l,color,saved.color_sub,&saved.color_state)==na::observe::StateLookup::Known&&
-                na::observe::ListStateSub(l,depth,saved.depth_sub,&saved.depth_state)==na::observe::StateLookup::Known;
+            const bool depth_known=na::observe::ListStateSub(l,depth,saved.depth_sub,&saved.depth_state)==na::observe::StateLookup::Known;
+            saved.native_states=depth_known &&
+                na::observe::ListStateSub(l,color,saved.color_sub,&saved.color_state)==na::observe::StateLookup::Known;
             saved.has_camera=find_camera(one,0,depth,&saved.vp,&saved.reversed,&saved.interlopers);
             saved.judged=saved.has_camera;
             saved.injected=g_injected;saved.jitter[0]=g_injected?g.jit.px[0]:0;saved.jitter[1]=g_injected?g.jit.px[1]:0;
@@ -4067,8 +4277,9 @@ public:
             ComPtr<ID3D12Resource> image,guide;image.Attach(na::observe::AcquireResource(color));guide.Attach(na::observe::AcquireResource(depth));
             if(!image||!guide)return;*owner={image,guide};
             saved.native_origin=na::nr::native::RetainRecording(l,owner);if(!saved.native_origin)return;
+            if (depth_known) snapshot_depth(l,guide.Get(),saved,saved.depth_state,*owner);
             saved.native_serial=++g.next_native_source;
-            g_native_ready.store(saved.native_serial,std::memory_order_relaxed);
+
             g.native_scene=std::move(saved);
         }catch(...){}
     }
@@ -5581,6 +5792,7 @@ void SetUpscaleTarget(const UpscaleTarget& t) { std::lock_guard<std::mutex> lk(g
 UpscaleTarget GetUpscaleTarget() { std::lock_guard<std::mutex> lk(g_up_m); return g_up; }
 void EnableNativeScaleBridge(bool enabled) {
     g_native_bridge.store(enabled);g_native_reduced.store(false);
+    na::observe::SetTextureTraceListener(enabled?trace_texture:nullptr);
     if(enabled){na::observe::SetOperationSnapshots(true);na::observe::SetRasterStateTracking(true);
         na::observe::SetShaderOperationHook(na::observe::ShaderLane::Reconstruction,std::make_shared<NativeScaleHook>());}
 }
@@ -5607,17 +5819,19 @@ NativeBridgeStats GetNativeBridgeStats() {
     }
     return r;
 }
-void NativeTracePresent(ID3D12Resource* frame) {
+void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool sdr_present) {
     try{
         std::lock_guard<std::mutex> lock(g_trace.m);
         if(!g_native_reduced.load(std::memory_order_relaxed)){
             if(g_trace.armed.load()){g_trace.armed.store(false);g_trace.recs.clear();g_trace.frame.clear();}
+            g_trace.previous={};g_trace.learned={};g_trace.learned_pso.store(0);
+            g_trace.presents=g_trace.armed_at=0;
             return;
         }
         ++g_trace.presents;
         if(!g_trace.armed.load()){
             // First trace ~2 s after the scene is reduced, then every ~15 s.
-            if(g_trace.presents-g_trace.armed_at>=(g_trace.traces?900u:120u)){
+            if(g_trace.presents-g_trace.armed_at>=(g_trace.learned_pso.load()?900u:30u)){
                 g_trace.recs.clear();g_trace.frame.clear();g_trace.frames=0;g_trace.untraced=g_trace.traced_lists=0;g_trace.ops=0;
                 g_trace.armed_at=g_trace.presents;g_trace.armed.store(true);
             }
@@ -5626,7 +5840,7 @@ void NativeTracePresent(ID3D12Resource* frame) {
         // The first frame after arming holds lists recorded before it: start over.
         if(++g_trace.frames==1){g_trace.frame.clear();g_trace.untraced=g_trace.traced_lists=0;return;}
         g_trace.result[0]=0;
-        trace_analyze(frame?uint64_t(na::observe::IdOf(frame)):0);
+        trace_analyze(queue,frame?uint64_t(na::observe::IdOf(frame)):0,sdr_present);
         ++g_trace.traces;g_trace.armed.store(false);g_trace.recs.clear();g_trace.frame.clear();
         na::eventlog::Emit("native_trace","%s",g_trace.result);
     }catch(...){g_trace.armed.store(false);}
@@ -6067,7 +6281,7 @@ void OnPresent(ID3D12CommandQueue* queue)
 void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists, ExecuteFn forward)
 {
     if (forward) g_forward.store(forward, std::memory_order_relaxed);
-    if (lists && count) { try { trace_submit(count, lists); } catch (...) {} }
+    if (lists && count) { try { trace_submit(queue, count, lists); } catch (...) {} }
     if (!na::settings::EffectsReady() || !g.enabled.load(std::memory_order_relaxed) || g.paused.load(std::memory_order_relaxed) || !queue || !lists || !count) {
         forward(queue, count, lists);
         return;
@@ -6247,6 +6461,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         if (g.inl.history.has_interlopers) g.interlopers = g.inl.history.interlopers;
         g.eval_selection_version = g.inl.history.selection_version;
         committed_sources(g.inl.history);
+        if (g.inl.history.native_delivery) ++g.stats.native_deliveries;
         g.submitted_frame = g.frame;
         if (!g.inl.history.keep_reset) g.resume_reset = false;
         if (g.inl.history.cut) ++g.stats.cuts;
