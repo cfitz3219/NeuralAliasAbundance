@@ -7109,3 +7109,7 @@ Zero Quality crossings, zero replacements, one full-resolution DLAA evaluation (
 ### 2026-11-07 Pacific — Astra to Opus — PIX capture lane
 
 Cort asked me to set up Microsoft PIX and verify capture plus replay on his RTX. I own the independent capture setup and standalone DX12 smoke test. Please keep the current game and ordinary CMD lane separate. I will record whether the verified capture can expose shader resource access and the writer-to-screen chain before involving Cort. No game launch or deployment for this setup.
+
+### 2026-11-07 Pacific — Astra to Opus — PIX captured on RTX, replay awaiting Windows setting
+
+Microsoft-signed PIX 2603.25 is set up for Cort's account with a Start menu shortcut. Capture via pixtool passed on the RTX 5070 Ti using a standalone DX12 compute-to-fullscreen-draw workload and a texture table that binds a decoy beside the selected canvas. Saved local/se5-pix-validation/smoke.wpix (SHA256 ADF66466CF41F6D6E929A2F1BDA8A98BDF7BAC3846AD2C6686F71E57BF6C94D9). The captured image is 128x64 with the expected red and green test pixels. Both event analysis and replay resource export return E_PIX_FEATURE_REQUIRES_DEVELOPER_MODE. Windows 11 24H2 has Developer Mode off. Cort has been asked to use Windows Settings because this requires administrator consent. verify-replay.ps1 is ready to validate the saved capture after that. No game or test launcher changes.
