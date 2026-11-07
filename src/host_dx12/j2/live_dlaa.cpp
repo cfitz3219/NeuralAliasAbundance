@@ -120,6 +120,9 @@ struct SceneInput {
     // cannot become a usable producer. Frame remains diagnostic for this path.
     uint64_t native_serial=0,native_recording=0;
     na::nr::native::RecordingLease native_origin;
+    // Between fallback: a not-yet-accepted entry already read this finished image in an
+    // earlier submission, so a DLSS placed now lands after the picture moved on.
+    bool read_before = false;
 };
 
 struct State {
@@ -3802,30 +3805,40 @@ int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
 {
     auto& saved = g.waiting_scene;
     if (saved.frame != g.frame || saved.color != color || saved.depth != depth) saved = {};
+    // The first list of this submission that reads the finished image (any entry after the
+    // final write, accepted or still learning). When a later accepted consumer confirms the
+    // image was final, DLSS goes before THAT list: SE5's menu bursts (every 40 s) hand the
+    // scene to a not-yet-learned entry one list earlier, and DLSS placed at the learned one
+    // came after the picture had already been taken to the screen (watermark missing).
+    int first_read = -1;
     for (UINT i = 0; i < count; ++i) {
         if (!lists[i]) continue;
         std::vector<na::j2::ColorEvent> events;
-        if (!na::observe::ListColorEvents(lists[i], color, events)) { saved = {}; continue; }
+        if (!na::observe::ListColorEvents(lists[i], color, events)) { saved = {}; first_read = -1; continue; }
         bool writes = false, consumed = false;
         uint64_t producer = 0;
         for (const auto& e : events) {
             if (e.write) { writes = true; consumed = false; producer = e.producer; continue; }
             const bool entry = na::j2::IsEntry(e.op);
+            if (entry && !writes && !consumed && saved.frame == g.frame && first_read < 0) first_read = static_cast<int>(i);
             // Inline needs a scene draw in its own recording. A learned entry
             // in a pure post list instead uses this submitted-scene handoff.
-            // Unqualified entries are not evidence of a colour read.
+            // Unqualified entries are not evidence of the final handoff by themselves.
             if (entry ? !g.entries.Accepts(e.raw) : !na::j2::IsConsumer(e.op)) continue;
             if (!writes && !consumed && saved.frame == g.frame) {
                 const auto cls = na::j2::MakeClass(e.raw, g.scene_w, g.scene_h);
                 const auto verdict = g.profile.Judge(cls, saved.producer);
                 using V = na::j2::ConsumerProfile::Verdict;
                 bool recorded = false;
+                const UINT at = first_read >= 0 && static_cast<UINT>(first_read) < i ? static_cast<UINT>(first_read) : i;
                 if(entry || verdict == V::Accepted || verdict == V::AcceptedWithProducer){
                     g.capture_entry=entry?e.raw:na::j2::InsertionEvent{};
-                    recorded=record(lists, 0, depth, color, ours, pending, nullptr, nullptr, &saved, i);
+                    recorded=record(lists, 0, depth, color, ours, pending, nullptr, nullptr, &saved, at);
                     g.capture_entry={};
                 }
                 if (recorded) {
+                    if (at < i) ++g.stats.between_earlier;
+                    if (saved.read_before) ++g.stats.between_late;
                     g.class_fired = !entry;
                     g.fired_mode = entry ? 6 : 5;
                     if(entry){++g.stats.entry_matched;if(g.entries.AcceptedByContext(e.raw))++g.stats.entry_ctx_matched;}
@@ -3834,14 +3847,16 @@ int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
                     g.fired_producer = saved.producer;
                     g.fired_context = 0;
                     saved = {};
-                    return static_cast<int>(i);
+                    return static_cast<int>(at);
                 }
             }
             consumed = true;
             saved = {}; // never insert later after a consumer already carried the image onward
+            first_read = -1;
         }
         if (writes) {
             saved = {};
+            first_read = -1;
             // End-of-list metadata is useful only if its final image has not
             // already been consumed within that recording.
             if (!consumed && na::observe::ListRendersTo(lists[i], color, depth) &&
@@ -3855,6 +3870,7 @@ int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
             }
         }
     }
+    if (first_read >= 0 && saved.frame == g.frame) saved.read_before = true;
     return -1;
 }
 

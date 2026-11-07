@@ -334,6 +334,7 @@ struct Stats {
     uint64_t class_contradictions = 0;   // class-triggered frames followed by more scene content (class demoted)
     uint64_t labelled_frames = 0, unlabelled_frames = 0; // frames that taught the profile / could not (truncated trace)
     uint64_t expired_inline = 0;         // inline recordings never submitted within two frames (released)
+    uint64_t between_earlier = 0, between_late = 0; // between fallback placed before an earlier learning entry / after a read in an earlier submission
     uint64_t between_observed = 0, between_predicted = 0; // between-list placements before an observed reader / after a predicted last scene list
     char class_note[200] = {};            // latest consumer class not accepted (explains a missed frame)
     uint64_t entry_matched=0;

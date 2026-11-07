@@ -1279,15 +1279,16 @@ void write_status_line()
                 (unsigned long long)rj[4], (unsigned long long)rj[5], (unsigned long long)rj[6], (unsigned long long)rj[7],
                 (unsigned long long)rj[8], j2.inline_frame_rejects);
             if (nrej > 0) WriteFile(f, rl, static_cast<DWORD>((std::min)(nrej, static_cast<int>(sizeof rl - 1))), &written, nullptr);
-            char al[700];
+            char al[900];
             const int na2 = snprintf(al, sizeof al,
-                "j2_profile accepted=%u rejected=%u ambiguous=%u entries=%u matched{class=%llu pair=%llu barrier=%llu legacy=%llu} rejected_skips=%llu barrier_vetoes=%llu barrier_ambiguous=%llu contradictions{class=%llu barrier=%llu} labelled=%llu unlabelled=%llu expired=%llu between{observed=%llu predicted=%llu} note=\"%s\"\r\n",
+                "j2_profile accepted=%u rejected=%u ambiguous=%u entries=%u matched{class=%llu pair=%llu barrier=%llu legacy=%llu} rejected_skips=%llu barrier_vetoes=%llu barrier_ambiguous=%llu contradictions{class=%llu barrier=%llu} labelled=%llu unlabelled=%llu expired=%llu between{observed=%llu predicted=%llu earlier=%llu late=%llu} note=\"%s\"\r\n",
                 j2.profile_accepted, j2.profile_rejected, j2.profile_ambiguous, j2.profile_entries,
                 (unsigned long long)j2.class_matched, (unsigned long long)j2.class_pair_matched, (unsigned long long)j2.barrier_matched,
                 (unsigned long long)j2.legacy_matched, (unsigned long long)j2.class_rejected_skips, (unsigned long long)j2.barrier_vetoes,
                 (unsigned long long)j2.barrier_ambiguous_skips, (unsigned long long)j2.class_contradictions, (unsigned long long)j2.barrier_contradictions,
                 (unsigned long long)j2.labelled_frames, (unsigned long long)j2.unlabelled_frames, (unsigned long long)j2.expired_inline,
-                (unsigned long long)j2.between_observed, (unsigned long long)j2.between_predicted, j2.class_note);
+                (unsigned long long)j2.between_observed, (unsigned long long)j2.between_predicted,
+                (unsigned long long)j2.between_earlier, (unsigned long long)j2.between_late, j2.class_note);
             if (na2 > 0) WriteFile(f, al, static_cast<DWORD>((std::min)(na2, static_cast<int>(sizeof al - 1))), &written, nullptr);
             const int en=snprintf(al,sizeof al,"j2_entry keys=%u matched=%llu source=actual_operation rejected{new=%llu learning=%llu middle=%llu} rescued_by_boundary=%llu(writer_differs=%llu memory=%llu shapes=%u) context{keys=%u matched=%llu} rescue_fail{learned=%llu res=%llu writer=%llu occ=%llu tr=%llu cand=%llu dst=%llu pso=%llu pending=%llu} last{%s}\r\n",j2.entry_keys,(unsigned long long)j2.entry_matched,
                 (unsigned long long)j2.entry_unknown,(unsigned long long)j2.entry_learning,(unsigned long long)j2.entry_middle,(unsigned long long)j2.entry_rescued,(unsigned long long)j2.entry_rescued_writer,(unsigned long long)j2.entry_rescued_memory,j2.entry_shapes,j2.entry_ctx_keys,(unsigned long long)j2.entry_ctx_matched,
